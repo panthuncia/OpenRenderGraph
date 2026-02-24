@@ -31,7 +31,10 @@
 
 #include "../Render/Runtime/IStatisticsService.h"
 #include "../Render/Runtime/IUploadService.h"
+#include "../Render/Runtime/IUploadPolicyService.h"
 #include "../Render/Runtime/IReadbackService.h"
 #include "../Render/Runtime/IRenderGraphSettingsService.h"
+#include "../Render/Runtime/BufferUploadPolicy.h"
 #include "../Render/Runtime/UploadServiceAccess.h"
+#include "../Render/Runtime/UploadPolicyServiceAccess.h"
 #include "../Render/Runtime/UploadTypes.h"

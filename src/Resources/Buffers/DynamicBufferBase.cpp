@@ -6,6 +6,7 @@
 #include "Resources/GPUBacking/GpuBufferBacking.h"
 #include "Resources/ExternalBackingResource.h"
 #include "Render/Runtime/UploadServiceAccess.h"
+#include "Render/Runtime/UploadPolicyServiceAccess.h"
 
 BufferBase::BufferBase() = default;
 
@@ -23,7 +24,9 @@ BufferBase::BufferBase(
     }
 }
 
-BufferBase::~BufferBase() = default;
+BufferBase::~BufferBase() {
+    UnregisterUploadPolicyClient();
+}
 
 rhi::Resource BufferBase::GetAPIResource() {
     if (!m_dataBuffer) {
@@ -211,6 +214,54 @@ void BufferBase::SetAllowAlias(bool allowAlias) {
 
 bool BufferBase::IsAliasingAllowed() const {
     return m_allowAlias;
+}
+
+void BufferBase::SetUploadPolicyTag(rg::runtime::UploadPolicyTag tag) {
+    m_uploadPolicyTag = tag;
+    RefreshUploadPolicyRegistration();
+}
+
+rg::runtime::UploadPolicyTag BufferBase::GetUploadPolicyTag() const {
+    return m_uploadPolicyTag;
+}
+
+bool BufferBase::IsUploadPolicyImmediate() const {
+    return m_uploadPolicyTag == rg::runtime::UploadPolicyTag::Immediate;
+}
+
+void BufferBase::EnsureUploadPolicyRegistration() {
+    if (m_uploadPolicyTag == rg::runtime::UploadPolicyTag::Immediate) {
+        return;
+    }
+
+    if (m_uploadPolicyRegistered) {
+        return;
+    }
+
+    if (!rg::runtime::GetActiveUploadPolicyService()) {
+        return;
+    }
+
+    rg::runtime::RegisterUploadPolicyClient(this);
+    m_uploadPolicyRegistered = true;
+}
+
+void BufferBase::RefreshUploadPolicyRegistration() {
+    if (m_uploadPolicyTag == rg::runtime::UploadPolicyTag::Immediate) {
+        UnregisterUploadPolicyClient();
+        return;
+    }
+
+    EnsureUploadPolicyRegistration();
+}
+
+void BufferBase::UnregisterUploadPolicyClient() {
+    if (!m_uploadPolicyRegistered) {
+        return;
+    }
+
+    rg::runtime::UnregisterUploadPolicyClient(this);
+    m_uploadPolicyRegistered = false;
 }
 
 void BufferBase::SetBacking(std::unique_ptr<GpuBufferBacking> backing, uint64_t bufferSize) {

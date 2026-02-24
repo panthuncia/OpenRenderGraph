@@ -10,12 +10,14 @@
 #include "Resources/AliasingPlacement.h"
 #include "Resources/GloballyIndexedResource.h"
 #include "Resources/TrackedAllocation.h"
+#include "Render/Runtime/BufferUploadPolicy.h"
+#include "Render/Runtime/IUploadPolicyService.h"
 
 class GpuBufferBacking;
 
 class BufferView;
 
-class BufferBase : public GloballyIndexedResource {
+class BufferBase : public GloballyIndexedResource, public rg::runtime::IUploadPolicyClient {
 public:
     struct MaterializeOptions {
         std::optional<BufferAliasPlacement> aliasPlacement;
@@ -95,7 +97,16 @@ public:
 
     bool IsAliasingAllowed() const;
 
+    void SetUploadPolicyTag(rg::runtime::UploadPolicyTag tag);
+
+    rg::runtime::UploadPolicyTag GetUploadPolicyTag() const;
+
+    bool IsUploadPolicyImmediate() const;
+
     virtual ~BufferBase();
+
+    void OnUploadPolicyBeginFrame() override {}
+    void OnUploadPolicyFlush() override {}
 
 protected:
     void SetBacking(std::unique_ptr<GpuBufferBacking> backing, uint64_t bufferSize);
@@ -104,6 +115,10 @@ protected:
     void QueueResourceCopyFromOldBacking(uint64_t bytesToCopy);
 
     void ApplyMetadataToBacking(const EntityComponentBundle& bundle);
+
+    void EnsureUploadPolicyRegistration();
+    void RefreshUploadPolicyRegistration();
+    void UnregisterUploadPolicyClient();
 
     virtual void OnBackingMaterialized() {}
 
@@ -118,6 +133,8 @@ protected:
 
 private:
     uint64_t m_backingGeneration = 0;
+    rg::runtime::UploadPolicyTag m_uploadPolicyTag = rg::runtime::UploadPolicyTag::Immediate;
+    bool m_uploadPolicyRegistered = false;
 };
 
 class ViewedDynamicBufferBase : public BufferBase {
