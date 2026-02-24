@@ -8,6 +8,13 @@
 #include "Managers/Singletons/DeviceManager.h"
 #include "Resources/GloballyIndexedResource.h"
 
+// Controls texture SRV mip range behavior:
+// 0: each SRV exposes exactly one mip (legacy behavior)
+// 1: each SRV starting at mip m exposes [m .. lastMip]
+#ifndef ORG_TEXTURE_SRV_INCLUDE_LOWER_MIPS
+#define ORG_TEXTURE_SRV_INCLUDE_LOWER_MIPS 1
+#endif
+
 void DescriptorHeapManager::Initialize() {
     auto device = DeviceManager::GetInstance().GetDevice();
 
@@ -215,6 +222,13 @@ void DescriptorHeapManager::UpdateDescriptorContents(
             const uint32_t srvSlices = (tex->isArray || tex->isCubemap) ? tex->arraySize : 1u;
             for (uint32_t slice = 0; slice < srvSlices; ++slice) {
                 for (uint32_t mip = 0; mip < tex->mipLevels; ++mip) {
+                    const uint32_t mipLevelsForView =
+#if ORG_TEXTURE_SRV_INCLUDE_LOWER_MIPS
+                        tex->mipLevels - mip;
+#else
+                        1u;
+#endif
+
                     rhi::SrvDesc srvDesc{};
                     srvDesc.formatOverride = srvFormat;
 
@@ -222,20 +236,20 @@ void DescriptorHeapManager::UpdateDescriptorContents(
                         if (tex->isArray) {
                             srvDesc.dimension = rhi::SrvDim::TextureCubeArray;
                             srvDesc.cubeArray.mostDetailedMip = mip;
-                            srvDesc.cubeArray.mipLevels = 1;
+                            srvDesc.cubeArray.mipLevels = mipLevelsForView;
                             srvDesc.cubeArray.first2DArrayFace = slice * 6u;
                             srvDesc.cubeArray.numCubes = 1;
                         }
                         else {
                             srvDesc.dimension = rhi::SrvDim::TextureCube;
                             srvDesc.cube.mostDetailedMip = mip;
-                            srvDesc.cube.mipLevels = 1;
+                            srvDesc.cube.mipLevels = mipLevelsForView;
                         }
                     }
                     else if (tex->isArray) {
                         srvDesc.dimension = rhi::SrvDim::Texture2DArray;
                         srvDesc.tex2DArray.mostDetailedMip = mip;
-                        srvDesc.tex2DArray.mipLevels = 1;
+                        srvDesc.tex2DArray.mipLevels = mipLevelsForView;
                         srvDesc.tex2DArray.firstArraySlice = slice;
                         srvDesc.tex2DArray.arraySize = 1;
                         srvDesc.tex2DArray.planeSlice = 0;
@@ -243,7 +257,7 @@ void DescriptorHeapManager::UpdateDescriptorContents(
                     else {
                         srvDesc.dimension = rhi::SrvDim::Texture2D;
                         srvDesc.tex2D.mostDetailedMip = mip;
-                        srvDesc.tex2D.mipLevels = 1;
+                        srvDesc.tex2D.mipLevels = mipLevelsForView;
                         srvDesc.tex2D.planeSlice = 0;
                     }
 
@@ -255,11 +269,18 @@ void DescriptorHeapManager::UpdateDescriptorContents(
             if (tex->createCubemapAsArraySRV && tex->isCubemap) {
                 for (uint32_t slice = 0; slice < 6u; ++slice) {
                     for (uint32_t mip = 0; mip < tex->mipLevels; ++mip) {
+                        const uint32_t mipLevelsForView =
+#if ORG_TEXTURE_SRV_INCLUDE_LOWER_MIPS
+                            tex->mipLevels - mip;
+#else
+                            1u;
+#endif
+
                         rhi::SrvDesc srvDesc{};
                         srvDesc.formatOverride = srvFormat;
                         srvDesc.dimension = rhi::SrvDim::Texture2DArray;
                         srvDesc.tex2DArray.mostDetailedMip = mip;
-                        srvDesc.tex2DArray.mipLevels = 1;
+                        srvDesc.tex2DArray.mipLevels = mipLevelsForView;
                         srvDesc.tex2DArray.firstArraySlice = slice;
                         srvDesc.tex2DArray.arraySize = 1;
                         srvDesc.tex2DArray.planeSlice = 0;
