@@ -857,9 +857,19 @@ public:
 		return *this;
 	}
 
+    RenderPassBuilder& OnGraphicsQueue()& {
+        m_queueSelection = RenderQueueSelection::Graphics;
+        return *this;
+    }
+
     RenderPassBuilder IsGeometryPass() && {
         m_isGeometryPass = true;
 		return std::move(*this);
+    }
+
+    RenderPassBuilder OnGraphicsQueue() && {
+        m_queueSelection = RenderQueueSelection::Graphics;
+        return std::move(*this);
     }
 
 	// LVALUE
@@ -929,6 +939,7 @@ private:
         pass->DeclareResourceUsages(this);
 
         params.isGeometryPass = m_isGeometryPass;
+        params.queueSelection = m_queueSelection;
         params.identifierSet = _declaredIds;
         params.staticResourceRequirements = GatherResourceRequirements();
 
@@ -941,6 +952,7 @@ private:
         params = {};
         _declaredIds.clear();
         m_isGeometryPass = false;
+        m_queueSelection = RenderQueueSelection::Graphics;
 	}
 
     // Shader Resource
@@ -1250,7 +1262,7 @@ private:
             tracker.Apply(rar.range, nullptr, want, dummy);
         }
 
-        // Flatten each tracker’s segments into a ResourceRequirement
+        // Flatten each trackerï¿½s segments into a ResourceRequirement
         std::vector<ResourceRequirement> out;
         out.reserve(trackers.size());  // rough
 
@@ -1280,6 +1292,7 @@ private:
 	std::shared_ptr<RenderPass> pass;
     bool built_ = false;
     bool m_isGeometryPass = false;
+	RenderQueueSelection m_queueSelection = RenderQueueSelection::Graphics;
     std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> _declaredIds;
 
     friend class RenderGraph; // Allow RenderGraph to create instances of this builder
@@ -1377,6 +1390,26 @@ public:
         requires ResourceLike<T>
     ComputePassBuilder WithInternalTransition(T&& resource, ResourceState exitState)&& {
         addInternalTransition(std::forward<T>(resource), exitState);
+        return std::move(*this);
+    }
+
+    ComputePassBuilder& PreferComputeQueue() & {
+        m_queueSelection = ComputeQueueSelection::Compute;
+        return *this;
+    }
+
+    ComputePassBuilder& PreferGraphicsQueue() & {
+        m_queueSelection = ComputeQueueSelection::Graphics;
+        return *this;
+    }
+
+    ComputePassBuilder PreferComputeQueue() && {
+        m_queueSelection = ComputeQueueSelection::Compute;
+        return std::move(*this);
+    }
+
+    ComputePassBuilder PreferGraphicsQueue() && {
+        m_queueSelection = ComputeQueueSelection::Graphics;
         return std::move(*this);
     }
 
@@ -1535,6 +1568,7 @@ private:
         pass->DeclareResourceUsages(this);
 
         params.identifierSet = _declaredIds;
+        params.queueSelection = m_queueSelection;
         params.staticResourceRequirements = GatherResourceRequirements();
 
         graph->AddComputePass(pass, params, passName);
@@ -1545,6 +1579,7 @@ private:
         pass = nullptr;
         params = {};
         _declaredIds.clear();
+        m_queueSelection = ComputeQueueSelection::Compute;
     }
 
     // Shader resource
@@ -1736,7 +1771,7 @@ private:
             tracker.Apply(rar.range, nullptr, want, dummy);
         }
 
-        // Flatten each tracker’s segments into a ResourceRequirement
+        // Flatten each trackerï¿½s segments into a ResourceRequirement
         std::vector<ResourceRequirement> out;
         out.reserve(trackers.size());  // rough
 
@@ -1765,6 +1800,7 @@ private:
     ComputePassParameters     params;
     std::shared_ptr<ComputePass> pass;
     bool built_ = false;
+	ComputeQueueSelection m_queueSelection = ComputeQueueSelection::Compute;
     std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> _declaredIds;
 
 	friend class RenderGraph; // Allow RenderGraph to create instances of this builder

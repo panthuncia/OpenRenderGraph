@@ -1394,8 +1394,7 @@ void rg::alias::RenderGraphAliasingSubsystem::ApplyAliasQueueSynchronization(Ren
 	auto& batches = rg.batches;
 	auto& aliasPlacementRangesByID = rg.aliasPlacementRangesByID;
 	struct QueueUsage {
-		bool usesRender = false;
-		bool usesCompute = false;
+		std::array<bool, static_cast<size_t>(QueueKind::Count)> usesByQueue{};
 	};
 
 	struct RangeOwner {
@@ -1414,9 +1413,8 @@ void rg::alias::RenderGraphAliasingSubsystem::ApplyAliasQueueSynchronization(Ren
 		return overlapStart < overlapEnd;
 	};
 
-	auto markUsage = [](QueueUsage& usage, bool render, bool compute) {
-		usage.usesRender = usage.usesRender || render;
-		usage.usesCompute = usage.usesCompute || compute;
+	auto markUsage = [](QueueUsage& usage, QueueKind queue) {
+		usage.usesByQueue[static_cast<size_t>(queue)] = true;
 	};
 
 	for (size_t batchIndex = 0; batchIndex < batches.size(); ++batchIndex) {
@@ -1428,27 +1426,21 @@ void rg::alias::RenderGraphAliasingSubsystem::ApplyAliasQueueSynchronization(Ren
 		}
 		usageByResourceID.reserve(queuedPassCount);
 
-		auto accumulateFromReqs = [&](const std::vector<ResourceRequirement>& reqs, bool render, bool compute) {
+		auto accumulateFromReqs = [&](const std::vector<ResourceRequirement>& reqs, QueueKind queue) {
 			for (auto const& req : reqs) {
 				const uint64_t resourceID = req.resourceHandleAndRange.resource.GetGlobalResourceID();
 				auto itPlacement = aliasPlacementRangesByID.find(resourceID);
 				if (itPlacement == aliasPlacementRangesByID.end()) {
 					continue;
 				}
-				markUsage(usageByResourceID[resourceID], render, compute);
+				markUsage(usageByResourceID[resourceID], queue);
 			}
 		};
 
-		auto accumulateFromQueuedPass = [&](const RenderGraph::PassBatch::QueuedPass& queuedPass) {
+		auto accumulateFromQueuedPass = [&](const RenderGraph::PassBatch::QueuedPass& queuedPass, QueueKind queue) {
 			std::visit(
 				[&](auto const& pass) {
-					using TPass = std::decay_t<decltype(pass)>;
-					if constexpr (std::is_same_v<TPass, RenderGraph::RenderPassAndResources>) {
-						accumulateFromReqs(pass.resources.frameResourceRequirements, true, false);
-					}
-					else if constexpr (std::is_same_v<TPass, RenderGraph::ComputePassAndResources>) {
-						accumulateFromReqs(pass.resources.frameResourceRequirements, false, true);
-					}
+					accumulateFromReqs(pass.resources.frameResourceRequirements, queue);
 				},
 				queuedPass);
 		};
@@ -1456,7 +1448,7 @@ void rg::alias::RenderGraphAliasingSubsystem::ApplyAliasQueueSynchronization(Ren
 		for (size_t queueIndex = 0; queueIndex < static_cast<size_t>(QueueKind::Count); ++queueIndex) {
 			const auto queue = static_cast<QueueKind>(queueIndex);
 			for (const auto& queuedPass : batch.Passes(queue)) {
-				accumulateFromQueuedPass(queuedPass);
+				accumulateFromQueuedPass(queuedPass, queue);
 			}
 		}
 
@@ -1483,22 +1475,29 @@ void rg::alias::RenderGraphAliasingSubsystem::ApplyAliasQueueSynchronization(Ren
 				}
 
 				auto& prevBatch = batches[prevOwner.batchIndex];
-				if (prevOwner.usage.usesRender && usage.usesCompute) {
-					prevBatch.MarkQueueSignal(RenderGraph::BatchSignalPhase::AfterCompletion, QueueKind::Graphics);
-					batch.AddQueueWait(
-						RenderGraph::BatchWaitPhase::BeforeTransitions,
-						QueueKind::Compute,
-						QueueKind::Graphics,
-						prevBatch.GetQueueSignalFenceValue(RenderGraph::BatchSignalPhase::AfterCompletion, QueueKind::Graphics));
-				}
+				for (size_t prevQueueIndex = 0; prevQueueIndex < static_cast<size_t>(QueueKind::Count); ++prevQueueIndex) {
+					if (!prevOwner.usage.usesByQueue[prevQueueIndex]) {
+						continue;
+					}
 
-				if (prevOwner.usage.usesCompute && usage.usesRender) {
-					prevBatch.MarkQueueSignal(RenderGraph::BatchSignalPhase::AfterCompletion, QueueKind::Compute);
-					batch.AddQueueWait(
-						RenderGraph::BatchWaitPhase::BeforeTransitions,
-						QueueKind::Graphics,
-						QueueKind::Compute,
-						prevBatch.GetQueueSignalFenceValue(RenderGraph::BatchSignalPhase::AfterCompletion, QueueKind::Compute));
+					const auto prevQueue = static_cast<QueueKind>(prevQueueIndex);
+					for (size_t currQueueIndex = 0; currQueueIndex < static_cast<size_t>(QueueKind::Count); ++currQueueIndex) {
+						if (!usage.usesByQueue[currQueueIndex]) {
+							continue;
+						}
+
+						const auto currQueue = static_cast<QueueKind>(currQueueIndex);
+						if (currQueue == prevQueue) {
+							continue;
+						}
+
+						prevBatch.MarkQueueSignal(RenderGraph::BatchSignalPhase::AfterCompletion, prevQueue);
+						batch.AddQueueWait(
+							RenderGraph::BatchWaitPhase::BeforeTransitions,
+							currQueue,
+							prevQueue,
+							prevBatch.GetQueueSignalFenceValue(RenderGraph::BatchSignalPhase::AfterCompletion, prevQueue));
+					}
 				}
 			}
 

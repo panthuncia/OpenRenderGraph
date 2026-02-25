@@ -128,6 +128,9 @@ public:
 		std::string name;
 		std::optional<ExternalInsertPoint> where;
 		std::variant<std::monostate, std::shared_ptr<RenderPass>, std::shared_ptr<ComputePass>> pass;
+		std::optional<RenderQueueSelection> renderQueueSelection;
+		std::optional<ComputeQueueSelection> computeQueueSelection;
+		std::optional<CopyQueueSelection> copyQueueSelection;
 
 		// Optional: if true, the pass will be registered in Get*PassByName().
 		bool registerName = true;
@@ -585,7 +588,7 @@ private:
 	template<typename PassRes>
 	void applySynchronization(
 		QueueKind                         passQueue,
-		QueueKind                         oppositeQueue,
+		QueueKind                         sourceQueue,
 		PassBatch&                        currentBatch,
 		unsigned int                      currentBatchIndex,
 		const PassRes&                    pass, // either ComputePassAndResources or RenderPassAndResources
@@ -594,24 +597,19 @@ private:
 		const std::unordered_map<uint64_t, unsigned int>& oppUsageHist,
 		const std::unordered_set<uint64_t> resourcesTransitionedThisPass)
 	{
-		const bool passIsComputeAgainstGraphics =
-			(passQueue == QueueKind::Compute && oppositeQueue == QueueKind::Graphics);
-		const bool passIsGraphicsAgainstCompute =
-			(passQueue == QueueKind::Graphics && oppositeQueue == QueueKind::Compute);
-
-		if (!passIsComputeAgainstGraphics && !passIsGraphicsAgainstCompute) {
+		if (passQueue == sourceQueue) {
 			return;
 		}
 
-		auto markOppositeCompletionSignal = [&](int batchIndex) {
+		auto markSourceCompletionSignal = [&](int batchIndex) {
 			if (batchIndex < 0) {
 				return;
 			}
-			batches[batchIndex].MarkQueueSignal(BatchSignalPhase::AfterCompletion, oppositeQueue);
+			batches[batchIndex].MarkQueueSignal(BatchSignalPhase::AfterCompletion, sourceQueue);
 		};
 
-		auto oppositeCompletionFence = [&](int batchIndex) -> UINT64 {
-			return batches[batchIndex].GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, oppositeQueue);
+		auto sourceCompletionFence = [&](int batchIndex) -> UINT64 {
+			return batches[batchIndex].GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, sourceQueue);
 		};
 
 		// figure out which two numbers we wait on
@@ -622,20 +620,20 @@ private:
 		if (lastTransBatch != -1) {
 			if (static_cast<unsigned int>(lastTransBatch) == currentBatchIndex) {
 				// same batch, signal & immediate wait
-				currentBatch.MarkQueueSignal(BatchSignalPhase::AfterTransitions, oppositeQueue);
+				currentBatch.MarkQueueSignal(BatchSignalPhase::AfterTransitions, sourceQueue);
 				currentBatch.AddQueueWait(
 					BatchWaitPhase::BeforeExecution,
 					passQueue,
-					oppositeQueue,
-					currentBatch.GetQueueSignalFenceValue(BatchSignalPhase::AfterTransitions, oppositeQueue));
+					sourceQueue,
+					currentBatch.GetQueueSignalFenceValue(BatchSignalPhase::AfterTransitions, sourceQueue));
 			} else {
 				// different batch, signal that batch's completion, then wait before *transition*
-				markOppositeCompletionSignal(lastTransBatch);
+				markSourceCompletionSignal(lastTransBatch);
 				currentBatch.AddQueueWait(
 					BatchWaitPhase::BeforeTransitions,
 					passQueue,
-					oppositeQueue,
-					oppositeCompletionFence(lastTransBatch));
+					sourceQueue,
+					sourceCompletionFence(lastTransBatch));
 			}
 		}
 
@@ -647,22 +645,22 @@ private:
 		}
 #endif
 		if (lastProdBatch != -1) {
-			markOppositeCompletionSignal(lastProdBatch);
+			markSourceCompletionSignal(lastProdBatch);
 			currentBatch.AddQueueWait(
 				BatchWaitPhase::BeforeTransitions,
 				passQueue,
-				oppositeQueue,
-				oppositeCompletionFence(lastProdBatch));
+				sourceQueue,
+				sourceCompletionFence(lastProdBatch));
 		}
 
 		// Handle the "usage" wait
 		if (lastUsageBatch != -1) {
-			markOppositeCompletionSignal(lastUsageBatch);
+			markSourceCompletionSignal(lastUsageBatch);
 			currentBatch.AddQueueWait(
 				BatchWaitPhase::BeforeTransitions,
 				passQueue,
-				oppositeQueue,
-				oppositeCompletionFence(lastUsageBatch));
+				sourceQueue,
+				sourceCompletionFence(lastUsageBatch));
 		}
 	}
 

@@ -46,10 +46,24 @@ std::vector<RenderGraph::Node> RenderGraph::BuildNodes(RenderGraph& rg, std::vec
 	std::vector<Node> nodes;
 	nodes.resize(passes.size());
 
+	auto resolveQueueForPass = [](const AnyPassAndResources& pr) {
+		if (pr.type == PassType::Compute) {
+			const auto& pass = std::get<ComputePassAndResources>(pr.pass);
+			return ResolveQueueKind(pass.resources.queueSelection);
+		}
+
+		if (pr.type == PassType::Render) {
+			const auto& pass = std::get<RenderPassAndResources>(pr.pass);
+			return ResolveQueueKind(pass.resources.queueSelection);
+		}
+
+		return QueueKind::Graphics;
+	};
+
 	for (size_t i = 0; i < passes.size(); ++i) {
 		Node n{};
 		n.passIndex = i;
-		n.queueKind = (passes[i].type == PassType::Compute) ? QueueKind::Compute : QueueKind::Graphics;
+		n.queueKind = resolveQueueForPass(passes[i]);
 		n.originalOrder = static_cast<uint32_t>(i);
 
 		PassView view = GetPassView(passes[i]);
@@ -208,8 +222,8 @@ void RenderGraph::CommitPassToBatch(
 	std::array<std::unordered_map<uint64_t, unsigned int>, static_cast<size_t>(QueueKind::Count)>& batchOfLastQueueProducer,
 	std::array<std::unordered_map<uint64_t, unsigned int>, static_cast<size_t>(QueueKind::Count)>& batchOfLastQueueUsage)
 {
-	const QueueKind passQueue = (pr.type == PassType::Compute) ? QueueKind::Compute : QueueKind::Graphics;
-	const bool isCompute = passQueue == QueueKind::Compute;
+	const QueueKind passQueue = node.queueKind;
+	const bool isCompute = pr.type == PassType::Compute;
 	std::unordered_set<uint64_t> resourcesTransitionedThisPass;
 
 	if (isCompute) {
@@ -244,16 +258,23 @@ void RenderGraph::CommitPassToBatch(
 		// track UAV usage for cross-queue "same batch" rejection
 		queueUAVs[QueueIndex(passQueue)].insert(node.uavIDs.begin(), node.uavIDs.end());
 
-		rg.applySynchronization(
-			passQueue,
-			QueueKind::Graphics,
-			currentBatch,
-			currentBatchIndex,
-			std::get<ComputePassAndResources>(pr.pass),
-			batchOfLastQueueTransition[QueueIndex(QueueKind::Graphics)],
-			batchOfLastQueueProducer[QueueIndex(QueueKind::Graphics)],
-			batchOfLastQueueUsage[QueueIndex(QueueKind::Graphics)],
-			resourcesTransitionedThisPass);
+		for (size_t queueIndex = 0; queueIndex < static_cast<size_t>(QueueKind::Count); ++queueIndex) {
+			const auto sourceQueue = static_cast<QueueKind>(queueIndex);
+			if (sourceQueue == passQueue) {
+				continue;
+			}
+
+			rg.applySynchronization(
+				passQueue,
+				sourceQueue,
+				currentBatch,
+				currentBatchIndex,
+				std::get<ComputePassAndResources>(pr.pass),
+				batchOfLastQueueTransition[QueueIndex(sourceQueue)],
+				batchOfLastQueueProducer[QueueIndex(sourceQueue)],
+				batchOfLastQueueUsage[QueueIndex(sourceQueue)],
+				resourcesTransitionedThisPass);
+		}
 
 	}
 	else {
@@ -287,16 +308,23 @@ void RenderGraph::CommitPassToBatch(
 
 		queueUAVs[QueueIndex(passQueue)].insert(node.uavIDs.begin(), node.uavIDs.end());
 
-		rg.applySynchronization(
-			passQueue,
-			QueueKind::Compute,
-			currentBatch,
-			currentBatchIndex,
-			std::get<RenderPassAndResources>(pr.pass),
-			batchOfLastQueueTransition[QueueIndex(QueueKind::Compute)],
-			batchOfLastQueueProducer[QueueIndex(QueueKind::Compute)],
-			batchOfLastQueueUsage[QueueIndex(QueueKind::Compute)],
-			resourcesTransitionedThisPass);
+		for (size_t queueIndex = 0; queueIndex < static_cast<size_t>(QueueKind::Count); ++queueIndex) {
+			const auto sourceQueue = static_cast<QueueKind>(queueIndex);
+			if (sourceQueue == passQueue) {
+				continue;
+			}
+
+			rg.applySynchronization(
+				passQueue,
+				sourceQueue,
+				currentBatch,
+				currentBatchIndex,
+				std::get<RenderPassAndResources>(pr.pass),
+				batchOfLastQueueTransition[QueueIndex(sourceQueue)],
+				batchOfLastQueueProducer[QueueIndex(sourceQueue)],
+				batchOfLastQueueUsage[QueueIndex(sourceQueue)],
+				resourcesTransitionedThisPass);
+		}
 	}
 }
 
@@ -359,8 +387,10 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 		int bestIdxInReady = -1;
 		double bestScore = -1e300;
 
-		bool batchHasCompute = currentBatch.HasPasses(QueueKind::Compute);
-		bool batchHasRender = currentBatch.HasPasses(QueueKind::Graphics);
+		std::array<bool, static_cast<size_t>(QueueKind::Count)> batchHasQueue{};
+		for (size_t queueIndex = 0; queueIndex < static_cast<size_t>(QueueKind::Count); ++queueIndex) {
+			batchHasQueue[queueIndex] = currentBatch.HasPasses(static_cast<QueueKind>(queueIndex));
+		}
 
 		for (int ri = 0; ri < (int)ready.size(); ++ri) {
 			size_t ni = ready[ri];
@@ -373,18 +403,17 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 
 			PassView view = GetPassView(passes[n.passIndex]);
 			const QueueKind nodeQueue = n.queueKind;
-			const bool nodeIsCompute = nodeQueue == QueueKind::Compute;
 
-			// Extra constraint: disallow Render->Compute deps within same batch
-			if (nodeIsCompute && batchHasRender) {
-				bool hasRenderPredInBatch = false;
+			// Extra constraint: disallow cross-queue deps within same batch.
+			if (batchHasQueue[QueueIndex(nodeQueue)]) {
+				bool hasCrossQueuePredInBatch = false;
 				for (size_t pred : n.in) {
-					if (inBatch[pred] && nodes[pred].queueKind == QueueKind::Graphics) {
-						hasRenderPredInBatch = true;
+					if (inBatch[pred] && nodes[pred].queueKind != nodeQueue) {
+						hasCrossQueuePredInBatch = true;
 						break;
 					}
 				}
-				if (hasRenderPredInBatch) continue;
+				if (hasCrossQueuePredInBatch) continue;
 			}
 
 			std::unordered_set<uint64_t> otherQueueUAVs;
@@ -417,8 +446,7 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 			double score = 3.0 * reuse - 1.0 * fresh;
 
 			// Encourage having both queues represented (more overlap opportunity)
-			if (nodeQueue == QueueKind::Compute && !batchHasCompute) score += 2.0;
-			if (nodeQueue == QueueKind::Graphics && !batchHasRender) score += 2.0;
+			if (!batchHasQueue[QueueIndex(nodeQueue)]) score += 2.0;
 
 			// Tie-break
 			score += 0.05 * double(n.criticality);
@@ -512,7 +540,7 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 
 // Factory for the transition lambda
 void RenderGraph::AddTransition(
-	std::unordered_map<uint64_t, unsigned int>& batchOfLastRenderQueueUsage,
+	std::unordered_map<uint64_t, unsigned int>& batchOfLastGraphicsQueueUsage,
 	unsigned int batchIndex,
 	PassBatch& currentBatch,
 	QueueKind passQueue,
@@ -581,12 +609,12 @@ void RenderGraph::AddTransition(
 			oldSyncHasNonComputeSyncState = true;
 		}
 	}
-	if (passQueue == QueueKind::Compute && oldSyncHasNonComputeSyncState) { // We need to place transitions on render queue
+	if (passQueue != QueueKind::Graphics && oldSyncHasNonComputeSyncState) { // We need to place transitions on graphics queue
 		for (auto& transition : transitions) {
 			// Resource groups will pass through their child ptrs in the transition
 			const auto id = transition.pResource ? transition.pResource->GetGlobalResourceID() : resource.GetGlobalResourceID();
-			unsigned int gfxBatch = batchOfLastRenderQueueUsage[id];
-			batchOfLastRenderQueueUsage[id] = gfxBatch; // Can this cause transition overlaps?
+			unsigned int gfxBatch = batchOfLastGraphicsQueueUsage[id];
+			batchOfLastGraphicsQueueUsage[id] = gfxBatch; // Can this cause transition overlaps?
 			batches[gfxBatch].Transitions(QueueKind::Graphics, BatchTransitionPhase::AfterPasses).push_back(transition);
 		}
 	}
@@ -1070,6 +1098,7 @@ void RenderGraph::CompileStructural() {
 				par.resources.internalTransitions = b.params.internalTransitions;
 				par.resources.identifierSet = b.DeclaredResourceIds();
 				par.resources.isGeometryPass = b.params.isGeometryPass;
+				par.resources.queueSelection = d.renderQueueSelection.value_or(RenderQueueSelection::Graphics);
 				MaterializeReferencedResources(par.resources.staticResourceRequirements, par.resources.internalTransitions);
 			}
  			any.pass = std::move(par);
@@ -1090,6 +1119,7 @@ void RenderGraph::CompileStructural() {
 				par.resources.frameResourceRequirements = par.resources.staticResourceRequirements;
 				par.resources.internalTransitions = b.params.internalTransitions;
 				par.resources.identifierSet = b.DeclaredResourceIds();
+				par.resources.queueSelection = d.computeQueueSelection.value_or(ComputeQueueSelection::Compute);
 				MaterializeReferencedResources(par.resources.staticResourceRequirements, par.resources.internalTransitions);
 			}
  			any.pass = std::move(par);
@@ -1572,6 +1602,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				immediatePassAndResources.pass = p.pass;
 				immediatePassAndResources.resources.staticResourceRequirements = immediateFrameData.requirements;
 				immediatePassAndResources.resources.frameResourceRequirements = immediateFrameData.requirements;
+				immediatePassAndResources.resources.queueSelection = p.resources.queueSelection;
 				immediatePassAndResources.immediateBytecode = std::move(immediateFrameData.bytecode);
 				immediatePassAndResources.immediateKeepAlive = std::move(p.immediateKeepAlive);
 				immediatePassAndResources.run = PassRunMask::Immediate;
@@ -1621,6 +1652,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				immediatePassAndResources.pass = p.pass;
 				immediatePassAndResources.resources.staticResourceRequirements = immediateFrameData.requirements;
 				immediatePassAndResources.resources.frameResourceRequirements = immediateFrameData.requirements;
+				immediatePassAndResources.resources.queueSelection = p.resources.queueSelection;
 				immediatePassAndResources.immediateBytecode = std::move(immediateFrameData.bytecode);
 				immediatePassAndResources.immediateKeepAlive = std::move(p.immediateKeepAlive);
 				immediatePassAndResources.run = PassRunMask::Immediate;
@@ -1680,6 +1712,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 					par.resources.internalTransitions = b.params.internalTransitions;
 					par.resources.identifierSet = b.DeclaredResourceIds();
 					par.resources.isGeometryPass = b.params.isGeometryPass;
+					par.resources.queueSelection = d.renderQueueSelection.value_or(RenderQueueSelection::Graphics);
 				}
 
 				par.pass->SetResourceRegistryView(
@@ -1704,6 +1737,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 					par.resources.frameResourceRequirements = par.resources.staticResourceRequirements;
 					par.resources.internalTransitions = b.params.internalTransitions;
 					par.resources.identifierSet = b.DeclaredResourceIds();
+					par.resources.queueSelection = d.computeQueueSelection.value_or(ComputeQueueSelection::Compute);
 				}
 
 				par.pass->SetResourceRegistryView(
@@ -1989,20 +2023,22 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	for (const auto& pr : m_framePasses) {
 		if (pr.type == PassType::Compute) {
 			auto const& pass = std::get<ComputePassAndResources>(pr.pass);
+			const QueueKind passQueue = ResolveQueueKind(pass.resources.queueSelection);
 			for (auto const& req : pass.resources.frameResourceRequirements) {
-				accumulateCrossFrameWaitForHandle(QueueKind::Compute, req.resourceHandleAndRange.resource);
+				accumulateCrossFrameWaitForHandle(passQueue, req.resourceHandleAndRange.resource);
 			}
 			for (auto const& tr : pass.resources.internalTransitions) {
-				accumulateCrossFrameWaitForHandle(QueueKind::Compute, tr.first.resource);
+				accumulateCrossFrameWaitForHandle(passQueue, tr.first.resource);
 			}
 		}
 		else if (pr.type == PassType::Render) {
 			auto const& pass = std::get<RenderPassAndResources>(pr.pass);
+			const QueueKind passQueue = ResolveQueueKind(pass.resources.queueSelection);
 			for (auto const& req : pass.resources.frameResourceRequirements) {
-				accumulateCrossFrameWaitForHandle(QueueKind::Graphics, req.resourceHandleAndRange.resource);
+				accumulateCrossFrameWaitForHandle(passQueue, req.resourceHandleAndRange.resource);
 			}
 			for (auto const& tr : pass.resources.internalTransitions) {
-				accumulateCrossFrameWaitForHandle(QueueKind::Graphics, tr.first.resource);
+				accumulateCrossFrameWaitForHandle(passQueue, tr.first.resource);
 			}
 		}
 	}

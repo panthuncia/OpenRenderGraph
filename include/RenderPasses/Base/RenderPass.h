@@ -16,6 +16,7 @@
 #include "Render/PassInputs.h"
 #include "Render/PassExecutionContext.h"
 #include "Render/ShaderAPI.h"
+#include "Render/QueueKind.h"
 
 struct RenderPassParameters {
 	std::vector<ResourceHandleAndRange> shaderResources;
@@ -34,6 +35,7 @@ struct RenderPassParameters {
 	std::vector<ResourceRequirement> staticResourceRequirements; // Static resource requirements for the pass
 	std::vector<ResourceRequirement> frameResourceRequirements; // Resource requirements that may change each frame + static ones
 	bool isGeometryPass = false;
+	RenderQueueSelection queueSelection = RenderQueueSelection::Graphics;
 };
 
 class RenderPassBuilder;

@@ -16,6 +16,7 @@
 #include "Render/PassInputs.h"
 #include "Render/PassExecutionContext.h"
 #include "Render/ShaderAPI.h"
+#include "Render/QueueKind.h"
 
 struct ComputePassParameters {
 	std::vector<ResourceHandleAndRange> shaderResources;
@@ -28,6 +29,7 @@ struct ComputePassParameters {
 	std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> identifierSet;
 	std::vector<ResourceRequirement> staticResourceRequirements; // Static resource requirements for the pass
 	std::vector<ResourceRequirement> frameResourceRequirements; // Resource requirements that may change each frame + static ones
+	ComputeQueueSelection queueSelection = ComputeQueueSelection::Compute;
 };
 
 class ComputePassBuilder;
