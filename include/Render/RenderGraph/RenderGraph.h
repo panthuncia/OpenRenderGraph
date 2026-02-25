@@ -197,9 +197,9 @@ public:
 		static constexpr size_t kWaitPhaseCount = static_cast<size_t>(BatchWaitPhase::Count);
 		static constexpr size_t kSignalPhaseCount = static_cast<size_t>(BatchSignalPhase::Count);
 		static constexpr size_t kTransitionPhaseCount = static_cast<size_t>(BatchTransitionPhase::Count);
+		using QueuedPass = std::variant<RenderPassAndResources, ComputePassAndResources>;
 
-		std::vector<RenderPassAndResources> renderPasses;
-		std::vector<ComputePassAndResources> computePasses;
+		std::array<std::vector<QueuedPass>, kQueueCount> queuePasses;
 		//std::unordered_map<uint64_t, ResourceAccessType> resourceAccessTypes; // Desired access types in this batch
 		//std::unordered_map<uint64_t, ResourceLayout> resourceLayouts; // Desired layouts in this batch
 		std::array<std::array<std::vector<ResourceTransition>, kQueueCount>, kTransitionPhaseCount> queueTransitions;
@@ -233,6 +233,18 @@ public:
 
 		static constexpr size_t TransitionPhaseIndex(BatchTransitionPhase phase) noexcept {
 			return static_cast<size_t>(phase);
+		}
+
+		std::vector<QueuedPass>& Passes(QueueKind queue) {
+			return queuePasses[QueueIndex(queue)];
+		}
+
+		const std::vector<QueuedPass>& Passes(QueueKind queue) const {
+			return queuePasses[QueueIndex(queue)];
+		}
+
+		bool HasPasses(QueueKind queue) const {
+			return !Passes(queue).empty();
 		}
 
 		std::vector<ResourceTransition>& Transitions(QueueKind queue, BatchTransitionPhase phase) {

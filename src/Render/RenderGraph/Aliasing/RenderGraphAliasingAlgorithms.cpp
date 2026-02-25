@@ -1422,7 +1422,11 @@ void rg::alias::RenderGraphAliasingSubsystem::ApplyAliasQueueSynchronization(Ren
 	for (size_t batchIndex = 0; batchIndex < batches.size(); ++batchIndex) {
 		auto& batch = batches[batchIndex];
 		std::unordered_map<uint64_t, QueueUsage> usageByResourceID;
-		usageByResourceID.reserve(batch.renderPasses.size() + batch.computePasses.size());
+		size_t queuedPassCount = 0;
+		for (size_t queueIndex = 0; queueIndex < static_cast<size_t>(QueueKind::Count); ++queueIndex) {
+			queuedPassCount += batch.Passes(static_cast<QueueKind>(queueIndex)).size();
+		}
+		usageByResourceID.reserve(queuedPassCount);
 
 		auto accumulateFromReqs = [&](const std::vector<ResourceRequirement>& reqs, bool render, bool compute) {
 			for (auto const& req : reqs) {
@@ -1435,11 +1439,25 @@ void rg::alias::RenderGraphAliasingSubsystem::ApplyAliasQueueSynchronization(Ren
 			}
 		};
 
-		for (auto const& rp : batch.renderPasses) {
-			accumulateFromReqs(rp.resources.frameResourceRequirements, true, false);
-		}
-		for (auto const& cp : batch.computePasses) {
-			accumulateFromReqs(cp.resources.frameResourceRequirements, false, true);
+		auto accumulateFromQueuedPass = [&](const RenderGraph::PassBatch::QueuedPass& queuedPass) {
+			std::visit(
+				[&](auto const& pass) {
+					using TPass = std::decay_t<decltype(pass)>;
+					if constexpr (std::is_same_v<TPass, RenderGraph::RenderPassAndResources>) {
+						accumulateFromReqs(pass.resources.frameResourceRequirements, true, false);
+					}
+					else if constexpr (std::is_same_v<TPass, RenderGraph::ComputePassAndResources>) {
+						accumulateFromReqs(pass.resources.frameResourceRequirements, false, true);
+					}
+				},
+				queuedPass);
+		};
+
+		for (size_t queueIndex = 0; queueIndex < static_cast<size_t>(QueueKind::Count); ++queueIndex) {
+			const auto queue = static_cast<QueueKind>(queueIndex);
+			for (const auto& queuedPass : batch.Passes(queue)) {
+				accumulateFromQueuedPass(queuedPass);
+			}
 		}
 
 		for (auto const& [resourceID, usage] : usageByResourceID) {

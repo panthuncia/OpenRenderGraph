@@ -224,7 +224,7 @@ void RenderGraph::CommitPassToBatch(
 			currentBatch,
 			resourcesTransitionedThisPass);
 
-		currentBatch.computePasses.push_back(pass);
+		currentBatch.Passes(passQueue).emplace_back(pass);
 
 		for (auto& exit : pass.resources.internalTransitions) {
 			std::vector<ResourceTransition> _;
@@ -241,7 +241,7 @@ void RenderGraph::CommitPassToBatch(
 			batchOfLastQueueUsage[QueueIndex(passQueue)][id] = currentBatchIndex;
 		}
 
-		// NEW: track UAV usage for cross-queue "same batch" rejection
+		// track UAV usage for cross-queue "same batch" rejection
 		queueUAVs[QueueIndex(passQueue)].insert(node.uavIDs.begin(), node.uavIDs.end());
 
 		rg.applySynchronization(
@@ -268,7 +268,7 @@ void RenderGraph::CommitPassToBatch(
 			currentBatch,
 			resourcesTransitionedThisPass);
 
-		currentBatch.renderPasses.push_back(pass);
+		currentBatch.Passes(passQueue).emplace_back(pass);
 
 		for (auto& exit : pass.resources.internalTransitions) {
 			std::vector<ResourceTransition> _;
@@ -359,8 +359,8 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 		int bestIdxInReady = -1;
 		double bestScore = -1e300;
 
-		bool batchHasCompute = !currentBatch.computePasses.empty();
-		bool batchHasRender = !currentBatch.renderPasses.empty();
+		bool batchHasCompute = currentBatch.HasPasses(QueueKind::Compute);
+		bool batchHasRender = currentBatch.HasPasses(QueueKind::Graphics);
 
 		for (int ri = 0; ri < (int)ready.size(); ++ri) {
 			size_t ni = ready[ri];
@@ -434,7 +434,11 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 
 		if (bestIdxInReady < 0) {
 			// Nothing ready fits: must end batch
-			if (!currentBatch.computePasses.empty() || !currentBatch.renderPasses.empty()) {
+			bool hasAnyQueuedPasses = false;
+			for (size_t queueIndex = 0; queueIndex < static_cast<size_t>(QueueKind::Count); ++queueIndex) {
+				hasAnyQueuedPasses = hasAnyQueuedPasses || !currentBatch.Passes(static_cast<QueueKind>(queueIndex)).empty();
+			}
+			if (hasAnyQueuedPasses) {
 				closeBatch();
 				continue;
 			}
@@ -494,7 +498,11 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 	}
 
 	// Final batch
-	if (!currentBatch.computePasses.empty() || !currentBatch.renderPasses.empty()) {
+	bool hasAnyQueuedPasses = false;
+	for (size_t queueIndex = 0; queueIndex < static_cast<size_t>(QueueKind::Count); ++queueIndex) {
+		hasAnyQueuedPasses = hasAnyQueuedPasses || !currentBatch.Passes(static_cast<QueueKind>(queueIndex)).empty();
+	}
+	if (hasAnyQueuedPasses) {
 		rg.batches.push_back(std::move(currentBatch));
 	}
 
@@ -2538,8 +2546,7 @@ namespace {
 		}
 	}
 
-	template<typename PassT>
-	void ExecutePasses(std::vector<PassT>& passes,
+	void ExecuteQueuedPasses(std::vector<RenderGraph::PassBatch::QueuedPass>& passes,
 		CommandRecordingManager* crm,
 		rhi::Queue& queue,
 		QueueKind queueKind,
@@ -2551,35 +2558,44 @@ namespace {
 		rg::runtime::IStatisticsService* statisticsService) {
 		std::vector<PassReturn> externalFences;
 		context.commandList = commandList;
-		for (auto& pr : passes) {
-			if (pr.pass->IsInvalidated()) {
-				rhi::debug::Scope scope(commandList, rhi::colors::Mint, pr.name.c_str());
 
-				if (!pr.immediateBytecode.empty()) {
-					rg::imm::Replay(pr.immediateBytecode, commandList);
-				}
+		auto executeOne = [&](auto& pr) {
+			if (!pr.pass->IsInvalidated()) {
+				return;
+			}
 
-				if (statisticsService) {
-					statisticsService->BeginQuery(pr.statisticsIndex, context.frameIndex, queue, commandList);
-				}
-				if ((pr.run & PassRunMask::Immediate) != PassRunMask::None) {
-					rg::imm::Replay(pr.immediateBytecode, commandList); // Replay immediate-mode commands
-				}
+			rhi::debug::Scope scope(commandList, rhi::colors::Mint, pr.name.c_str());
 
-				// Drop immediate-mode keep-alive
-				pr.immediateKeepAlive.reset();
+			if (!pr.immediateBytecode.empty()) {
+				rg::imm::Replay(pr.immediateBytecode, commandList);
+			}
 
-				if ((pr.run & PassRunMask::Retained) != PassRunMask::None) {
-					auto passReturn = pr.pass->Execute(context); // Execute retained-mode commands
-					if (passReturn.fence) {
-						externalFences.push_back(passReturn);
-					}
-				}
-				if (statisticsService) {
-					statisticsService->EndQuery(pr.statisticsIndex, context.frameIndex, queue, commandList);
+			if (statisticsService) {
+				statisticsService->BeginQuery(pr.statisticsIndex, context.frameIndex, queue, commandList);
+			}
+			if ((pr.run & PassRunMask::Immediate) != PassRunMask::None) {
+				rg::imm::Replay(pr.immediateBytecode, commandList);
+			}
+
+			pr.immediateKeepAlive.reset();
+
+			if ((pr.run & PassRunMask::Retained) != PassRunMask::None) {
+				auto passReturn = pr.pass->Execute(context);
+				if (passReturn.fence) {
+					externalFences.push_back(passReturn);
 				}
 			}
+			if (statisticsService) {
+				statisticsService->EndQuery(pr.statisticsIndex, context.frameIndex, queue, commandList);
+			}
+		};
+
+		for (auto& passVariant : passes) {
+			std::visit([&](auto& passEntry) {
+				executeOne(passEntry);
+			}, passVariant);
 		}
+
 		if (statisticsService) {
 			statisticsService->ResolveQueries(context.frameIndex, queue, commandList);
 		}
@@ -2732,6 +2748,9 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 
 	unsigned int batchIndex = 0;
 	for (auto& batch : batches) {
+		auto& graphicsPasses = batch.Passes(QueueKind::Graphics);
+		auto& computePasses = batch.Passes(QueueKind::Compute);
+		auto& copyPasses = batch.Passes(QueueKind::Copy);
 		auto& computePreTransitions = batch.Transitions(QueueKind::Compute, BatchTransitionPhase::BeforePasses);
 		auto& graphicsPreTransitions = batch.Transitions(QueueKind::Graphics, BatchTransitionPhase::BeforePasses);
 		auto& graphicsPostTransitions = batch.Transitions(QueueKind::Graphics, BatchTransitionPhase::AfterPasses);
@@ -2771,6 +2790,17 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 			UINT64 signalValue = currentCopyQueueFenceOffset + batch.GetQueueSignalFenceValue(BatchSignalPhase::AfterTransitions, QueueKind::Copy);
 			crm->Flush(QueueKind::Copy, { true, signalValue });
 		}
+
+		ExecuteQueuedPasses(copyPasses,
+			crm,
+			*copyQueue,
+			QueueKind::Copy,
+			copyCommandList,
+			currentCopyQueueFenceOffset,
+			batch.HasQueueSignal(BatchSignalPhase::AfterCompletion, QueueKind::Copy),
+			batch.GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, QueueKind::Copy),
+			context,
+			statisticsService);
 
 		if (!copyPostTransitions.empty()) {
 			ExecuteTransitions(copyPostTransitions,
@@ -2818,7 +2848,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 			crm->Flush(QueueKind::Compute, { true, signalValue });
 		}
 
-		ExecutePasses(batch.computePasses,
+		ExecuteQueuedPasses(computePasses,
 			crm,
 			*computeQueue,
 			QueueKind::Compute,
@@ -2871,7 +2901,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 		const bool renderCompletionSignal = batch.HasQueueSignal(BatchSignalPhase::AfterCompletion, QueueKind::Graphics);
 		bool signalNow = graphicsPostTransitions.empty() && renderCompletionSignal;
 
-		ExecutePasses(batch.renderPasses,
+		ExecuteQueuedPasses(graphicsPasses,
 			crm,
 			*graphicsQueue,
 			QueueKind::Graphics,

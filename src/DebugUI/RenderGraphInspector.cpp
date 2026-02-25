@@ -187,11 +187,22 @@ static void CollectResourceIds(const std::vector<RenderGraph::PassBatch>& batche
 }
 
 static std::string GetBatchAnchorPassName(const RenderGraph::PassBatch& batch) {
-    if (!batch.renderPasses.empty()) {
-        return batch.renderPasses.back().name;
+    auto queueAnchorPassName = [&](QueueKind queue) -> std::string {
+        const auto& queuedPasses = batch.Passes(queue);
+        if (queuedPasses.empty()) {
+            return {};
+        }
+        return std::visit([](const auto& pass) { return pass.name; }, queuedPasses.back());
+    };
+
+    if (auto name = queueAnchorPassName(QueueKind::Graphics); !name.empty()) {
+        return name;
     }
-    if (!batch.computePasses.empty()) {
-        return batch.computePasses.back().name;
+    if (auto name = queueAnchorPassName(QueueKind::Compute); !name.empty()) {
+        return name;
+    }
+    if (auto name = queueAnchorPassName(QueueKind::Copy); !name.empty()) {
+        return name;
     }
     return {};
 }
@@ -432,9 +443,21 @@ namespace RGInspector {
             // Pass selector (used for memory capture insertion point)
             {
                 std::vector<std::string> passNames;
-                passNames.reserve(batches[s_selectedBatch].computePasses.size() + batches[s_selectedBatch].renderPasses.size());
-                for (auto const& p : batches[s_selectedBatch].computePasses) passNames.push_back(p.name);
-                for (auto const& p : batches[s_selectedBatch].renderPasses)  passNames.push_back(p.name);
+                size_t totalPassCount = 0;
+                for (size_t queueIndex = 0; queueIndex < static_cast<size_t>(QueueKind::Count); ++queueIndex) {
+                    totalPassCount += batches[s_selectedBatch].Passes(static_cast<QueueKind>(queueIndex)).size();
+                }
+                passNames.reserve(totalPassCount);
+
+                auto appendPassNames = [&](QueueKind queue) {
+                    for (auto const& queuedPass : batches[s_selectedBatch].Passes(queue)) {
+                        passNames.push_back(std::visit([](const auto& pass) { return pass.name; }, queuedPass));
+                    }
+                };
+
+                appendPassNames(QueueKind::Compute);
+                appendPassNames(QueueKind::Graphics);
+                appendPassNames(QueueKind::Copy);
 
                 const std::string anchor = GetBatchAnchorPassName(batches[s_selectedBatch]);
                 auto findIndex = [&](const std::string& name) -> int {
@@ -639,7 +662,7 @@ namespace RGInspector {
                 }
                 };
 
-            auto draw_passes = [&](auto const& passesVec, QueueKind qk, int bi, bool isCompute) {
+            auto draw_passes = [&](const std::vector<RenderGraph::PassBatch::QueuedPass>& passesVec, QueueKind qk, int bi) {
                 if (passesVec.empty()) {
                     return;
                 }
@@ -651,8 +674,15 @@ namespace RGInspector {
                 // Does any pass use the selected resource?
                 bool touchesSelected = false;
                 if (s_selectedRes != 0 && passUses) {
-                    for (auto const& pr : passesVec) {
-                        if (passUses(static_cast<const void*>(&pr), s_selectedRes, isCompute)) {
+                    for (auto const& queuedPass : passesVec) {
+                        const bool usesSelected = std::visit(
+                            [&](const auto& pass) {
+                                using TPass = std::decay_t<decltype(pass)>;
+                                constexpr bool passIsCompute = std::is_same_v<TPass, RenderGraph::ComputePassAndResources>;
+                                return passUses(static_cast<const void*>(&pass), s_selectedRes, passIsCompute);
+                            },
+                            queuedPass);
+                        if (usesSelected) {
                             touchesSelected = true;
                             break;
                         }
@@ -680,8 +710,12 @@ namespace RGInspector {
                 if (IsMouseOver(minP, maxP)) {
                     ImGui::BeginTooltip();
                     ImGui::Text("%s Passes (%d)", qk == QueueKind::Graphics ? "Graphics" : (qk == QueueKind::Compute ? "Compute" : "Copy"), static_cast<int>(passesVec.size()));
-                    for (auto const& pr : passesVec) {
-                        ImGui::BulletText("%s", pr.name.c_str());
+                    for (auto const& queuedPass : passesVec) {
+                        std::visit(
+                            [&](const auto& pass) {
+                                ImGui::BulletText("%s", pass.name.c_str());
+                            },
+                            queuedPass);
                     }
                     ImGui::EndTooltip();
                 }
@@ -692,6 +726,7 @@ namespace RGInspector {
 
                 const auto& b = batches[bi];
                 const auto& L = layouts[bi];
+                const auto& copyPreTransitions = b.Transitions(QueueKind::Copy, RenderGraph::BatchTransitionPhase::BeforePasses);
                 const auto& computePreTransitions = b.Transitions(QueueKind::Compute, RenderGraph::BatchTransitionPhase::BeforePasses);
                 const auto& graphicsPreTransitions = b.Transitions(QueueKind::Graphics, RenderGraph::BatchTransitionPhase::BeforePasses);
                 const auto& graphicsPostTransitions = b.Transitions(QueueKind::Graphics, RenderGraph::BatchTransitionPhase::AfterPasses);
@@ -721,21 +756,23 @@ namespace RGInspector {
                     }
                 }
 
+                // Copy lane
+                draw_transitions(copyPreTransitions, QueueKind::Copy, bi, L.t0, L.t1);
+                draw_passes(b.Passes(QueueKind::Copy), QueueKind::Copy, bi);
+
                 // Compute lane
                 draw_transitions(computePreTransitions, QueueKind::Compute, bi, L.t0, L.t1);
-                draw_passes(b.computePasses, QueueKind::Compute, bi, /*isCompute*/true);
+                draw_passes(b.Passes(QueueKind::Compute), QueueKind::Compute, bi);
 
                 // Graphics lane
                 draw_transitions(graphicsPreTransitions, QueueKind::Graphics, bi, L.t0, L.t1);
-                draw_passes(b.renderPasses, QueueKind::Graphics, bi, /*isCompute*/false);
+                draw_passes(b.Passes(QueueKind::Graphics), QueueKind::Graphics, bi);
 
                 if (L.hasEnd) {
                     draw_transitions(graphicsPostTransitions, QueueKind::Graphics, bi, L.e0, L.e1);
                     //ImVec2 tp = ImPlot::PlotToPixels(ImPlotPoint((L.e0 + L.e1) * 0.5, LaneY(QueueKind::Graphics, H, S) + 0.08f * H));
                     //dl->AddText(tp, IM_COL32_BLACK, "End Transitions");
                 }
-
-                // TODO: Copy lane
 
                 // Cross-queue waits/signals (we draw at the left edge of the "execution" in each lane)
                 auto laneYG = LaneY(QueueKind::Graphics, H, S) + H * 0.5f;
