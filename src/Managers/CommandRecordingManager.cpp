@@ -15,6 +15,7 @@ CommandRecordingManager::CommandRecordingManager(const Init& init) {
     { init.copyQ,     init.copyF,     init.copyPool,     rhi::QueueKind::Copy };
 
     m_computeMode = init.computeMode;
+    m_lastSignaledValue.fill(0);
 }
 
 QueueKind CommandRecordingManager::resolve(QueueKind qk) const {
@@ -67,7 +68,9 @@ uint64_t CommandRecordingManager::Flush(QueueKind requested, Signal sig) {
 
         // Decide on signaling
         if (sig.enable) {
-            signaled = sig.value;
+            auto& last = m_lastSignaledValue[static_cast<size_t>(qk)];
+            signaled = (sig.value != 0) ? sig.value : (last + 1);
+            last = signaled;
             bind.queue->Signal({ bind.fence->GetHandle(), signaled});
         }
 

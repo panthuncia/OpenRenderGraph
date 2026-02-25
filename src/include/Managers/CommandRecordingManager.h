@@ -61,6 +61,9 @@ private:
     // One per process; alias compute -> graphics in AliasToGraphics mode dynamically
     std::array<QueueBinding, static_cast<size_t>(QueueKind::Count)> m_bind{};
 
+    // Last value signaled by this manager per logical/effective queue.
+    std::array<uint64_t, static_cast<size_t>(QueueKind::Count)> m_lastSignaledValue{};
+
     // Resolve backing queue for a requested logical QueueKind, given computeMode
     QueueKind resolve(QueueKind qk) const;
 
