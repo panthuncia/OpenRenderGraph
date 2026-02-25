@@ -1500,3 +1500,246 @@ private:
 
 	friend class RenderGraph; // Allow RenderGraph to create instances of this builder
 };
+
+template<typename T>
+concept DerivedCopyPass = std::derived_from<T, CopyPass>;
+
+class CopyPassBuilder : public IPassBuilder {
+public:
+    PassBuilderKind Kind() const noexcept override { return PassBuilderKind::Copy; }
+    IResourceProvider* ResourceProvider() noexcept override { return pass.get(); }
+
+    template<typename... Args>
+        requires ((NotIResourceResolver<Args>) && ...)
+    CopyPassBuilder& WithCopyDest(Args&&... args) & {
+        (addCopyDest(std::forward<Args>(args)), ...);
+        return *this;
+    }
+
+    template<typename... Args>
+        requires ((NotIResourceResolver<Args>) && ...)
+    CopyPassBuilder& WithCopySource(Args&&... args) & {
+        (addCopySource(std::forward<Args>(args)), ...);
+        return *this;
+    }
+
+    template<typename T>
+        requires ResourceLike<T>
+    CopyPassBuilder& WithInternalTransition(T&& resource, ResourceState exitState)& {
+        addInternalTransition(std::forward<T>(resource), exitState);
+        return *this;
+    }
+
+    template<typename... Args>
+        requires ((NotIResourceResolver<Args>) && ...)
+    CopyPassBuilder WithCopyDest(Args&&... args) && {
+        (addCopyDest(std::forward<Args>(args)), ...);
+        return std::move(*this);
+    }
+
+    template<typename... Args>
+        requires ((NotIResourceResolver<Args>) && ...)
+    CopyPassBuilder WithCopySource(Args&&... args) && {
+        (addCopySource(std::forward<Args>(args)), ...);
+        return std::move(*this);
+    }
+
+    template<typename T>
+        requires ResourceLike<T>
+    CopyPassBuilder WithInternalTransition(T&& resource, ResourceState exitState)&& {
+        addInternalTransition(std::forward<T>(resource), exitState);
+        return std::move(*this);
+    }
+
+    template<typename AddCallable>
+    CopyPassBuilder& WithResolver(const IResourceResolver& resolver, AddCallable&& addCallable) & {
+        auto resources = resolver.Resolve();
+        for (auto& resource : resources) {
+            graph->AddResource(resource);
+        }
+        addCallable(resources);
+        return *this;
+    }
+
+    template<typename AddCallable>
+    CopyPassBuilder WithResolver(const IResourceResolver& resolver, AddCallable&& addCallable) && {
+        auto resources = resolver.Resolve();
+        for (auto& resource : resources) {
+            graph->AddResource(resource);
+        }
+        addCallable(resources);
+        return std::move(*this);
+    }
+
+    CopyPassBuilder& PreferCopyQueue() & {
+        m_queueSelection = CopyQueueSelection::Copy;
+        return *this;
+    }
+
+    CopyPassBuilder& PreferGraphicsQueue() & {
+        m_queueSelection = CopyQueueSelection::Graphics;
+        return *this;
+    }
+
+    CopyPassBuilder PreferCopyQueue() && {
+        m_queueSelection = CopyQueueSelection::Copy;
+        return std::move(*this);
+    }
+
+    CopyPassBuilder PreferGraphicsQueue() && {
+        m_queueSelection = CopyQueueSelection::Graphics;
+        return std::move(*this);
+    }
+
+    CopyPassBuilder& WithCopyDest(const IResourceResolver& r)& {
+        return WithResolver(r, [&](auto&& resolved) { addCopyDest(std::forward<decltype(resolved)>(resolved)); });
+    }
+
+    CopyPassBuilder& WithCopySource(const IResourceResolver& r)& {
+        return WithResolver(r, [&](auto&& resolved) { addCopySource(std::forward<decltype(resolved)>(resolved)); });
+    }
+
+    CopyPassBuilder WithCopyDest(const IResourceResolver& r)&& {
+        return std::move(*this).WithResolver(r, [&](auto&& resolved) { addCopyDest(std::forward<decltype(resolved)>(resolved)); });
+    }
+
+    CopyPassBuilder WithCopySource(const IResourceResolver& r)&& {
+        return std::move(*this).WithResolver(r, [&](auto&& resolved) { addCopySource(std::forward<decltype(resolved)>(resolved)); });
+    }
+
+    template<DerivedCopyPass PassT, rg::PassInputs InputsT, typename... StableCtorArgs>
+    void Build(InputsT&& inputs, StableCtorArgs&&... ctorArgs)&
+    {
+        if (!built_)
+        {
+            built_ = true;
+            pass = detail::MakePass<PassT>(
+                std::forward<InputsT>(inputs),
+                std::forward<StableCtorArgs>(ctorArgs)...);
+        }
+
+        pass->SetInputs(std::forward<InputsT>(inputs));
+    }
+
+    template<DerivedCopyPass PassT, rg::PassInputs InputsT, typename... StableCtorArgs>
+    void Build(InputsT&& inputs, StableCtorArgs&&... ctorArgs)&&
+    {
+        if (!built_)
+        {
+            built_ = true;
+            pass = detail::MakePass<PassT>(
+                std::forward<InputsT>(inputs),
+                std::forward<StableCtorArgs>(ctorArgs)...);
+        }
+
+        pass->SetInputs(std::forward<InputsT>(inputs));
+    }
+
+    template<DerivedCopyPass PassT, typename... StableCtorArgs>
+    void Build(StableCtorArgs&&... ctorArgs)&
+    {
+        Build<PassT>(rg::NoInputs{}, std::forward<StableCtorArgs>(ctorArgs)...);
+    }
+
+    template<DerivedCopyPass PassT, typename... StableCtorArgs>
+    void Build(StableCtorArgs&&... ctorArgs)&&
+    {
+        Build<PassT>(rg::NoInputs{}, std::forward<StableCtorArgs>(ctorArgs)...);
+    }
+
+    auto const& DeclaredResourceIds() const { return _declaredIds; }
+
+private:
+    CopyPassBuilder(RenderGraph* g, std::string name)
+        : graph(g), passName(std::move(name)) {}
+
+    CopyPassBuilder(const CopyPassBuilder&) = default;
+    CopyPassBuilder(CopyPassBuilder&&) = default;
+    CopyPassBuilder& operator=(const CopyPassBuilder&) = default;
+    CopyPassBuilder& operator=(CopyPassBuilder&&) = default;
+
+    void Finalize() {
+        if (!built_) return;
+
+        params = {};
+
+        pass->DeclareResourceUsages(this);
+
+        params.identifierSet = _declaredIds;
+        params.queueSelection = m_queueSelection;
+        params.staticResourceRequirements = GatherResourceRequirements();
+
+        graph->AddCopyPass(pass, params, passName);
+    }
+
+    void Reset() override {
+        built_ = false;
+        pass = nullptr;
+        params = {};
+        _declaredIds.clear();
+        m_queueSelection = CopyQueueSelection::Copy;
+    }
+
+    template<typename T>
+        requires ResourceLike<T>
+    CopyPassBuilder& addCopyDest(T&& x) {
+        detail::AppendTrackedResource(graph, _declaredIds, params.copyTargets, std::forward<T>(x));
+        return *this;
+    }
+
+    template<class Range>
+        requires (std::ranges::range<Range>&&
+    ResourceLike<std::ranges::range_value_t<Range>>)
+    CopyPassBuilder& addCopyDest(Range&& xs) {
+        for (auto&& e : xs) {
+            addCopyDest(std::forward<decltype(e)>(e));
+        }
+        return *this;
+    }
+
+    template<typename T>
+        requires ResourceLike<T>
+    CopyPassBuilder& addCopySource(T&& x) {
+        detail::AppendTrackedResource(graph, _declaredIds, params.copySources, std::forward<T>(x));
+        return *this;
+    }
+
+    template<class Range>
+        requires (std::ranges::range<Range>&&
+    ResourceLike<std::ranges::range_value_t<Range>>)
+    CopyPassBuilder& addCopySource(Range&& xs) {
+        for (auto&& e : xs) {
+            addCopySource(std::forward<decltype(e)>(e));
+        }
+        return *this;
+    }
+
+    template<typename T>
+        requires ResourceLike<T>
+    CopyPassBuilder& addInternalTransition(T&& x, ResourceState exitState)& {
+        detail::AppendInternalTransition(graph, _declaredIds, params.internalTransitions, std::forward<T>(x), exitState);
+        return *this;
+    }
+
+    std::vector<ResourceRequirement> GatherResourceRequirements() const {
+        return detail::BuildRequirements(
+            [](rhi::ResourceAccessType access) {
+                if ((access & (rhi::ResourceAccessType::CopySource | rhi::ResourceAccessType::CopyDest)) != 0) {
+                    return rhi::ResourceSyncState::Copy;
+                }
+                return rhi::ResourceSyncState::All;
+            },
+            std::pair{ std::cref(params.copySources), rhi::ResourceAccessType::CopySource },
+            std::pair{ std::cref(params.copyTargets), rhi::ResourceAccessType::CopyDest });
+    }
+
+    RenderGraph* graph;
+    std::string passName;
+    CopyPassParameters params;
+    std::shared_ptr<CopyPass> pass;
+    bool built_ = false;
+    CopyQueueSelection m_queueSelection = CopyQueueSelection::Copy;
+    std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> _declaredIds;
+
+    friend class RenderGraph;
+};

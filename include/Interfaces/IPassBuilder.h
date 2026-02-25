@@ -2,7 +2,7 @@
 
 class IResourceProvider;
 
-enum class PassBuilderKind { Render, Compute };
+enum class PassBuilderKind { Render, Compute, Copy };
 
 struct IPassBuilder {
     virtual ~IPassBuilder() = default;

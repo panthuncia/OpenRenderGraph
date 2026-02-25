@@ -14,6 +14,7 @@
 
 #include "RenderPasses/Base/RenderPass.h"
 #include "RenderPasses/Base/ComputePass.h"
+#include "RenderPasses/Base/CopyPass.h"
 #include "Resources/ResourceStateTracker.h"
 #include "Interfaces/IResourceProvider.h"
 #include "Render/ResourceRegistry.h"
@@ -34,6 +35,7 @@
 class Resource;
 class RenderPassBuilder;
 class ComputePassBuilder;
+class CopyPassBuilder;
 class CommandRecordingManager;
 struct IPassBuilder;
 
@@ -120,14 +122,15 @@ public:
 	enum class PassType {
 		Unknown,
 		Render,
-		Compute
+		Compute,
+		Copy
 	};
 
 	struct ExternalPassDesc {
 		PassType type = PassType::Unknown;
 		std::string name;
 		std::optional<ExternalInsertPoint> where;
-		std::variant<std::monostate, std::shared_ptr<RenderPass>, std::shared_ptr<ComputePass>> pass;
+		std::variant<std::monostate, std::shared_ptr<RenderPass>, std::shared_ptr<ComputePass>, std::shared_ptr<CopyPass>> pass;
 		std::optional<RenderQueueSelection> renderQueueSelection;
 		std::optional<ComputeQueueSelection> computeQueueSelection;
 		std::optional<CopyQueueSelection> copyQueueSelection;
@@ -177,6 +180,17 @@ public:
 		std::shared_ptr<rg::imm::KeepAliveBag> immediateKeepAlive = nullptr; // Keeps alive resources used by immediate execution bytecode
 	};
 
+	struct CopyPassAndResources {
+		std::shared_ptr<CopyPass> pass;
+		CopyPassParameters resources;
+		std::string name;
+		int statisticsIndex = -1;
+
+		PassRunMask run = PassRunMask::Both;
+		std::vector<std::byte> immediateBytecode;
+		std::shared_ptr<rg::imm::KeepAliveBag> immediateKeepAlive = nullptr;
+	};
+
 	enum class BatchWaitPhase : uint8_t {
 		BeforeTransitions = 0,
 		BeforeExecution = 1,
@@ -200,7 +214,7 @@ public:
 		static constexpr size_t kWaitPhaseCount = static_cast<size_t>(BatchWaitPhase::Count);
 		static constexpr size_t kSignalPhaseCount = static_cast<size_t>(BatchSignalPhase::Count);
 		static constexpr size_t kTransitionPhaseCount = static_cast<size_t>(BatchTransitionPhase::Count);
-		using QueuedPass = std::variant<RenderPassAndResources, ComputePassAndResources>;
+		using QueuedPass = std::variant<RenderPassAndResources, ComputePassAndResources, CopyPassAndResources>;
 
 		std::array<std::vector<QueuedPass>, kQueueCount> queuePasses;
 		//std::unordered_map<uint64_t, ResourceAccessType> resourceAccessTypes; // Desired access types in this batch
@@ -320,6 +334,7 @@ public:
 	AutoAliasDebugSnapshot GetAutoAliasDebugSnapshot() const;
 	void AddRenderPass(std::shared_ptr<RenderPass> pass, RenderPassParameters& resources, std::string name = "");
 	void AddComputePass(std::shared_ptr<ComputePass> pass, ComputePassParameters& resources, std::string name = "");
+	void AddCopyPass(std::shared_ptr<CopyPass> pass, CopyPassParameters& resources, std::string name = "");
 	void Update(const UpdateExecutionContext& context, rhi::Device device);
 	void Execute(PassExecutionContext& context);
 	void CompileStructural();
@@ -394,12 +409,13 @@ public:
 
 	ComputePassBuilder& BuildComputePass(std::string const& name);
 	RenderPassBuilder& BuildRenderPass(std::string const& name);
+	CopyPassBuilder& BuildCopyPass(std::string const& name);
 
 private:
 
 	struct AnyPassAndResources {
 		PassType type = PassType::Unknown;
-		std::variant<std::monostate, RenderPassAndResources, ComputePassAndResources> pass;
+		std::variant<std::monostate, RenderPassAndResources, ComputePassAndResources, CopyPassAndResources> pass;
 		std::string name;
 
 		AnyPassAndResources() = default;
@@ -409,6 +425,9 @@ private:
 
 		explicit AnyPassAndResources(ComputePassAndResources const& cp)
 			: type(PassType::Compute), pass(cp) {}
+
+		explicit AnyPassAndResources(CopyPassAndResources const& cp)
+			: type(PassType::Copy), pass(cp) {}
 	};
 
 	struct CompileContext {
@@ -497,10 +516,8 @@ private:
 	std::unordered_map<uint64_t, LastProducerAcrossFrames> m_lastProducerByResourceAcrossFrames;
 	std::unordered_map<uint64_t, std::vector<LastAliasPlacementProducerAcrossFrames>> m_lastAliasPlacementProducersByPoolAcrossFrames;
 	std::array<std::unordered_map<uint64_t, unsigned int>, static_cast<size_t>(QueueKind::Count)> m_compiledLastProducerBatchByResourceByQueue;
-	bool m_hasPendingFrameStartComputeWaitOnRender = false;
-	UINT64 m_pendingFrameStartComputeWaitOnRenderFenceValue = 0;
-	bool m_hasPendingFrameStartRenderWaitOnCompute = false;
-	UINT64 m_pendingFrameStartRenderWaitOnComputeFenceValue = 0;
+	std::array<std::array<bool, static_cast<size_t>(QueueKind::Count)>, static_cast<size_t>(QueueKind::Count)> m_hasPendingFrameStartQueueWait{};
+	std::array<std::array<UINT64, static_cast<size_t>(QueueKind::Count)>, static_cast<size_t>(QueueKind::Count)> m_pendingFrameStartQueueWaitFenceValue{};
 
 	std::unique_ptr<CommandListPool> m_graphicsCommandListPool;
 	std::unique_ptr<CommandListPool> m_computeCommandListPool;
@@ -553,6 +570,7 @@ private:
 
 	void RefreshRetainedDeclarationsForFrame(RenderPassAndResources& p, uint8_t frameIndex);
 	void RefreshRetainedDeclarationsForFrame(ComputePassAndResources& p, uint8_t frameIndex);
+	void RefreshRetainedDeclarationsForFrame(CopyPassAndResources& p, uint8_t frameIndex);
 	void CompileFrame(rhi::Device device, uint8_t frameIndex, const IHostExecutionData* hostData);
 
 	//void ComputeResourceLoops();
@@ -572,6 +590,11 @@ private:
 		std::unordered_set<uint64_t> const& resourcesTransitionedThisPass);
     std::tuple<int, int, int> GetBatchesToWaitOn(const RenderPassAndResources& pass, 
 		const std::unordered_map<uint64_t, unsigned int>& transitionHistory, 
+		const std::unordered_map<uint64_t, unsigned int>& producerHistory,
+		std::unordered_map<uint64_t, unsigned int> const& usageHistory,
+		std::unordered_set<uint64_t> const& resourcesTransitionedThisPass);
+	std::tuple<int, int, int> GetBatchesToWaitOn(const CopyPassAndResources& pass,
+		const std::unordered_map<uint64_t, unsigned int>& transitionHistory,
 		const std::unordered_map<uint64_t, unsigned int>& producerHistory,
 		std::unordered_map<uint64_t, unsigned int> const& usageHistory,
 		std::unordered_set<uint64_t> const& resourcesTransitionedThisPass);
@@ -732,5 +755,6 @@ private:
 
 	friend class RenderPassBuilder;
 	friend class ComputePassBuilder;
+	friend class CopyPassBuilder;
 	friend class rg::alias::RenderGraphAliasingSubsystem;
 };

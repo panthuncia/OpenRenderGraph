@@ -282,6 +282,15 @@ void rg::alias::RenderGraphAliasingSubsystem::AutoAssignAliasingPools(RenderGrap
 				collectHandle(t.first.resource, topoRank, passCrit);
 			}
 		}
+		else if (any.type == RenderGraph::PassType::Copy) {
+			auto const& p = std::get<RenderGraph::CopyPassAndResources>(any.pass);
+			for (auto const& req : p.resources.frameResourceRequirements) {
+				collectHandle(req.resourceHandleAndRange.resource, topoRank, passCrit);
+			}
+			for (auto const& t : p.resources.internalTransitions) {
+				collectHandle(t.first.resource, topoRank, passCrit);
+			}
+		}
 	}
 
 	auto scoreCandidate = [&](const AutoCandidate& c) {
@@ -633,6 +642,15 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph
 		}
 		else if (any.type == RenderGraph::PassType::Compute) {
 			auto const& p = std::get<RenderGraph::ComputePassAndResources>(any.pass);
+			for (auto const& req : p.resources.frameResourceRequirements) {
+				collectHandle(req.resourceHandleAndRange.resource, AccessTypeIsWriteOrCommon(req.state.access));
+			}
+			for (auto const& t : p.resources.internalTransitions) {
+				collectHandle(t.first.resource, true);
+			}
+		}
+		else if (any.type == RenderGraph::PassType::Copy) {
+			auto const& p = std::get<RenderGraph::CopyPassAndResources>(any.pass);
 			for (auto const& req : p.resources.frameResourceRequirements) {
 				collectHandle(req.resourceHandleAndRange.resource, AccessTypeIsWriteOrCommon(req.state.access));
 			}
