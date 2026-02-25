@@ -24,6 +24,66 @@ namespace {
 	constexpr size_t QueueIndex(QueueKind queue) noexcept {
 		return static_cast<size_t>(queue);
 	}
+
+	bool QueueSupportsSyncState(QueueKind queue, rhi::ResourceSyncState state) {
+		switch (queue) {
+		case QueueKind::Graphics:
+			return true;
+		case QueueKind::Compute:
+			return !ResourceSyncStateIsNotComputeSyncState(state);
+		case QueueKind::Copy:
+			switch (state) {
+			case rhi::ResourceSyncState::None:
+			case rhi::ResourceSyncState::All:
+			case rhi::ResourceSyncState::Copy:
+			case rhi::ResourceSyncState::Resolve:
+				return true;
+			default:
+				return false;
+			}
+		default:
+			return false;
+		}
+	}
+
+	bool QueueSupportsAccessType(QueueKind queue, rhi::ResourceAccessType access) {
+		if (queue == QueueKind::Graphics) {
+			return true;
+		}
+
+		if (queue == QueueKind::Compute) {
+			const auto unsupported = rhi::ResourceAccessType::RenderTarget |
+				rhi::ResourceAccessType::DepthRead |
+				rhi::ResourceAccessType::DepthReadWrite;
+			return (access & unsupported) == 0;
+		}
+
+		if (queue == QueueKind::Copy) {
+			const auto supported = rhi::ResourceAccessType::None |
+				rhi::ResourceAccessType::Common |
+				rhi::ResourceAccessType::CopySource |
+				rhi::ResourceAccessType::CopyDest;
+			return (access & ~supported) == 0;
+		}
+
+		return false;
+	}
+
+	bool QueueSupportsTransition(QueueKind queue, const ResourceTransition& transition) {
+		if (!QueueSupportsSyncState(queue, transition.prevSyncState)) {
+			return false;
+		}
+		if (!QueueSupportsSyncState(queue, transition.newSyncState)) {
+			return false;
+		}
+		if (!QueueSupportsAccessType(queue, transition.prevAccessType)) {
+			return false;
+		}
+		if (!QueueSupportsAccessType(queue, transition.newAccessType)) {
+			return false;
+		}
+		return true;
+	}
 }
 
 RenderGraph::PassView RenderGraph::GetPassView(AnyPassAndResources& pr) {
@@ -603,13 +663,14 @@ void RenderGraph::AddTransition(
 
 	currentBatch.passBatchTrackers[resource.GetGlobalResourceID()] = &compileTracker; // We will need to check subsequent passes against this
 
-	bool oldSyncHasNonComputeSyncState = false;
+	bool needsGraphicsQueueForTransitions = false;
 	for (auto& transition : transitions) {
-		if (ResourceSyncStateIsNotComputeSyncState(transition.prevSyncState)) {
-			oldSyncHasNonComputeSyncState = true;
+		if (!QueueSupportsTransition(passQueue, transition)) {
+			needsGraphicsQueueForTransitions = true;
+			break;
 		}
 	}
-	if (passQueue != QueueKind::Graphics && oldSyncHasNonComputeSyncState) { // We need to place transitions on graphics queue
+	if (passQueue != QueueKind::Graphics && needsGraphicsQueueForTransitions) {
 		for (auto& transition : transitions) {
 			// Resource groups will pass through their child ptrs in the transition
 			const auto id = transition.pResource ? transition.pResource->GetGlobalResourceID() : resource.GetGlobalResourceID();
@@ -628,7 +689,7 @@ void RenderGraph::AddTransition(
 void RenderGraph::ProcessResourceRequirements(
 	QueueKind passQueue,
 	std::vector<ResourceRequirement>& resourceRequirements,
-	std::unordered_map<uint64_t, unsigned int>& batchOfLastRenderQueueUsage,
+	std::unordered_map<uint64_t, unsigned int>& batchOfLastGraphicsQueueUsage,
 	std::unordered_map<uint64_t, unsigned int>& producerHistory,
 	unsigned int batchIndex,
 	PassBatch& currentBatch, std::unordered_set<uint64_t>& outTransitionedResourceIDs) {
@@ -642,7 +703,7 @@ void RenderGraph::ProcessResourceRequirements(
 
 		const auto& id = resourceRequirement.resourceHandleAndRange.resource.GetGlobalResourceID();
 
-		AddTransition(batchOfLastRenderQueueUsage, batchIndex, currentBatch, passQueue, resourceRequirement, outTransitionedResourceIDs);
+		AddTransition(batchOfLastGraphicsQueueUsage, batchIndex, currentBatch, passQueue, resourceRequirement, outTransitionedResourceIDs);
 
 		if (AccessTypeIsWriteType(resourceRequirement.state.access)) {
 			producerHistory[id] = batchIndex;

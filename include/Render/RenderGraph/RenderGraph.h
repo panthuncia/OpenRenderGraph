@@ -579,7 +579,7 @@ private:
 	void ProcessResourceRequirements(
 		QueueKind passQueue,
 		std::vector<ResourceRequirement>& resourceRequirements,
-		std::unordered_map<uint64_t, unsigned int>&  batchOfLastRenderQueueUsage,
+		std::unordered_map<uint64_t, unsigned int>&  batchOfLastGraphicsQueueUsage,
 		std::unordered_map<uint64_t, unsigned int>& producerHistory,
 		unsigned int batchIndex,
 		PassBatch& currentBatch,
@@ -665,7 +665,7 @@ private:
 	}
 
 	void AddTransition(
-		std::unordered_map<uint64_t, unsigned int>&  batchOfLastRenderQueueUsage,
+		std::unordered_map<uint64_t, unsigned int>&  batchOfLastGraphicsQueueUsage,
 		unsigned int batchIndex,
 		PassBatch& currentBatch,
 		QueueKind passQueue,
