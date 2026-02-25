@@ -66,7 +66,7 @@ BuildBatchLayouts(const std::vector<RenderGraph::PassBatch>& batches, const RGIn
 }
 
 
-enum class SignalPhase : uint8_t { AfterTransitions, AfterPasses, AfterBatchEndTransitions };
+enum class SignalPhase : uint8_t { AfterTransitions, AfterPasses, AfterPostTransitions };
 
 struct SignalSite {
     int        batchIndex = -1;
@@ -95,7 +95,7 @@ static SignalIndex BuildSignalIndex(const std::vector<RenderGraph::PassBatch>& b
         if (b.HasQueueSignal(RenderGraph::BatchSignalPhase::AfterCompletion, QueueKind::Graphics)) {
             auto phase = b.Transitions(QueueKind::Graphics, RenderGraph::BatchTransitionPhase::AfterPasses).empty()
                 ? SignalPhase::AfterPasses
-                : SignalPhase::AfterBatchEndTransitions;
+                : SignalPhase::AfterPostTransitions;
             idx[{QueueKind::Graphics, b.GetQueueSignalFenceValue(RenderGraph::BatchSignalPhase::AfterCompletion, QueueKind::Graphics)}] =
             { i, QueueKind::Graphics, phase };
         }
@@ -755,7 +755,7 @@ namespace RGInspector {
                     switch (s.phase) {
                     case SignalPhase::AfterTransitions:         return SL.t1;
                     case SignalPhase::AfterPasses:              return SL.p1;
-                    case SignalPhase::AfterBatchEndTransitions: return SL.e1; // only valid if hasEnd=true
+                    case SignalPhase::AfterPostTransitions: return SL.e1; // only valid if hasEnd=true
                     default:                                    return SL.p1;
                     }
                     };

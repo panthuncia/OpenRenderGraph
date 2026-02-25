@@ -498,8 +498,7 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 		rg.batches.push_back(std::move(currentBatch));
 	}
 
-	rg.m_compiledLastRenderProducerBatchByResource = std::move(batchOfLastQueueProducer[QueueIndex(QueueKind::Graphics)]);
-	rg.m_compiledLastComputeProducerBatchByResource = std::move(batchOfLastQueueProducer[QueueIndex(QueueKind::Compute)]);
+	rg.m_compiledLastProducerBatchByResourceByQueue = std::move(batchOfLastQueueProducer);
 }
 
 
@@ -959,8 +958,9 @@ void RenderGraph::ResetForRebuild()
 	compileTrackers.clear();
 	m_lastProducerByResourceAcrossFrames.clear();
 	m_lastAliasPlacementProducersByPoolAcrossFrames.clear();
-	m_compiledLastRenderProducerBatchByResource.clear();
-	m_compiledLastComputeProducerBatchByResource.clear();
+	for (auto& producerMap : m_compiledLastProducerBatchByResourceByQueue) {
+		producerMap.clear();
+	}
 	m_hasPendingFrameStartComputeWaitOnRender = false;
 	m_pendingFrameStartComputeWaitOnRenderFenceValue = 0;
 	m_hasPendingFrameStartRenderWaitOnCompute = false;
@@ -987,8 +987,9 @@ void RenderGraph::ResetForFrame() {
 	compiledResourceGenerationByID.clear();
 	m_aliasingSubsystem.ResetPerFrameState(*this);
 	compileTrackers.clear();
-	m_compiledLastRenderProducerBatchByResource.clear();
-	m_compiledLastComputeProducerBatchByResource.clear();
+	for (auto& producerMap : m_compiledLastProducerBatchByResourceByQueue) {
+		producerMap.clear();
+	}
 	m_hasPendingFrameStartComputeWaitOnRender = false;
 	m_pendingFrameStartComputeWaitOnRenderFenceValue = 0;
 	m_hasPendingFrameStartRenderWaitOnCompute = false;
@@ -2668,26 +2669,20 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 	const UINT64 currentComputeQueueFenceOffset = GetQueueFenceOffset(QueueKind::Compute);
 	const UINT64 currentCopyQueueFenceOffset = GetQueueFenceOffset(QueueKind::Copy);
 
-	for (const auto& [resourceID, producerBatch] : m_compiledLastRenderProducerBatchByResource) {
-		(void)resourceID;
-		if (producerBatch < batches.size()) {
-			batches[producerBatch].MarkQueueSignal(BatchSignalPhase::AfterCompletion, QueueKind::Graphics);
+	auto EffectiveProducerQueue = [&](QueueKind producerQueue) {
+		if (producerQueue == QueueKind::Compute && alias) {
+			return QueueKind::Graphics;
 		}
-	}
+		return producerQueue;
+	};
 
-	if (alias) {
-		for (const auto& [resourceID, producerBatch] : m_compiledLastComputeProducerBatchByResource) {
+	for (size_t queueIndex = 0; queueIndex < static_cast<size_t>(QueueKind::Count); ++queueIndex) {
+		const auto producerQueue = static_cast<QueueKind>(queueIndex);
+		const auto effectiveQueue = EffectiveProducerQueue(producerQueue);
+		for (const auto& [resourceID, producerBatch] : m_compiledLastProducerBatchByResourceByQueue[queueIndex]) {
 			(void)resourceID;
 			if (producerBatch < batches.size()) {
-				batches[producerBatch].MarkQueueSignal(BatchSignalPhase::AfterCompletion, QueueKind::Graphics);
-			}
-		}
-	}
-	else {
-		for (const auto& [resourceID, producerBatch] : m_compiledLastComputeProducerBatchByResource) {
-			(void)resourceID;
-			if (producerBatch < batches.size()) {
-				batches[producerBatch].MarkQueueSignal(BatchSignalPhase::AfterCompletion, QueueKind::Compute);
+				batches[producerBatch].MarkQueueSignal(BatchSignalPhase::AfterCompletion, effectiveQueue);
 			}
 		}
 	}
@@ -2906,44 +2901,18 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 		++batchIndex;
 	}
 
-	for (const auto& [resourceID, producerBatch] : m_compiledLastRenderProducerBatchByResource) {
-		if (producerBatch >= batches.size()) {
-			continue;
-		}
-
-		const uint64_t fenceValue = currentGraphicsQueueFenceOffset + batches[producerBatch].GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, QueueKind::Graphics);
-		LastProducerAcrossFrames producer{
-			.queue = QueueKind::Graphics,
-			.fenceValue = fenceValue,
-		};
-		nextLastProducerByResourceAcrossFrames[resourceID] = producer;
-		publishAliasPlacementProducer(resourceID, producer);
-	}
-
-	if (alias) {
-		for (const auto& [resourceID, producerBatch] : m_compiledLastComputeProducerBatchByResource) {
+	for (size_t queueIndex = 0; queueIndex < static_cast<size_t>(QueueKind::Count); ++queueIndex) {
+		const auto producerQueue = static_cast<QueueKind>(queueIndex);
+		const auto effectiveQueue = EffectiveProducerQueue(producerQueue);
+		for (const auto& [resourceID, producerBatch] : m_compiledLastProducerBatchByResourceByQueue[queueIndex]) {
 			if (producerBatch >= batches.size()) {
 				continue;
 			}
 
-			const uint64_t fenceValue = currentGraphicsQueueFenceOffset + batches[producerBatch].GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, QueueKind::Graphics);
+			const uint64_t fenceValue = GetQueueFenceOffset(effectiveQueue) +
+				batches[producerBatch].GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, effectiveQueue);
 			LastProducerAcrossFrames producer{
-				.queue = QueueKind::Graphics,
-				.fenceValue = fenceValue,
-			};
-			nextLastProducerByResourceAcrossFrames[resourceID] = producer;
-			publishAliasPlacementProducer(resourceID, producer);
-		}
-	}
-	else {
-		for (const auto& [resourceID, producerBatch] : m_compiledLastComputeProducerBatchByResource) {
-			if (producerBatch >= batches.size()) {
-				continue;
-			}
-
-			const uint64_t fenceValue = currentComputeQueueFenceOffset + batches[producerBatch].GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, QueueKind::Compute);
-			LastProducerAcrossFrames producer{
-				.queue = QueueKind::Compute,
+				.queue = effectiveQueue,
 				.fenceValue = fenceValue,
 			};
 			nextLastProducerByResourceAcrossFrames[resourceID] = producer;

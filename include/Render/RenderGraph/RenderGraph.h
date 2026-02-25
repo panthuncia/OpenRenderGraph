@@ -202,7 +202,6 @@ public:
 		std::vector<ComputePassAndResources> computePasses;
 		//std::unordered_map<uint64_t, ResourceAccessType> resourceAccessTypes; // Desired access types in this batch
 		//std::unordered_map<uint64_t, ResourceLayout> resourceLayouts; // Desired layouts in this batch
-		std::unordered_map<uint64_t, QueueKind> transitionQueue; // Queue to transition resources on
 		std::array<std::array<std::vector<ResourceTransition>, kQueueCount>, kTransitionPhaseCount> queueTransitions;
 
 		// Resources that passes in this batch transition internally
@@ -482,8 +481,7 @@ private:
 	std::unordered_map<uint64_t, SymbolicTracker> compileTrackers; // Compile-only symbolic state, decoupled from backing lifetime.
 	std::unordered_map<uint64_t, LastProducerAcrossFrames> m_lastProducerByResourceAcrossFrames;
 	std::unordered_map<uint64_t, std::vector<LastAliasPlacementProducerAcrossFrames>> m_lastAliasPlacementProducersByPoolAcrossFrames;
-	std::unordered_map<uint64_t, unsigned int> m_compiledLastRenderProducerBatchByResource;
-	std::unordered_map<uint64_t, unsigned int> m_compiledLastComputeProducerBatchByResource;
+	std::array<std::unordered_map<uint64_t, unsigned int>, static_cast<size_t>(QueueKind::Count)> m_compiledLastProducerBatchByResourceByQueue;
 	bool m_hasPendingFrameStartComputeWaitOnRender = false;
 	UINT64 m_pendingFrameStartComputeWaitOnRenderFenceValue = 0;
 	bool m_hasPendingFrameStartRenderWaitOnCompute = false;
