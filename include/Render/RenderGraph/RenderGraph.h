@@ -8,6 +8,7 @@
 #include <variant>
 #include <span>
 #include <utility>
+#include <array>
 #include <spdlog/spdlog.h>
 #include <rhi.h>
 
@@ -24,6 +25,7 @@
 #include "Render/Runtime/IReadbackService.h"
 #include "Render/Runtime/IDescriptorService.h"
 #include "Render/Runtime/IRenderGraphSettingsService.h"
+#include "Render/QueueKind.h"
 #include "Resources/PixelBuffer.h"
 #include "Resources/Buffers/Buffer.h"
 #include "Resources/TrackedAllocation.h"
@@ -172,18 +174,12 @@ public:
 		std::shared_ptr<rg::imm::KeepAliveBag> immediateKeepAlive = nullptr; // Keeps alive resources used by immediate execution bytecode
 	};
 
-	enum class CommandQueueType {
-		Graphics,
-		Compute
-	};
-
-
 	struct PassBatch {
 		std::vector<RenderPassAndResources> renderPasses;
 		std::vector<ComputePassAndResources> computePasses;
 		//std::unordered_map<uint64_t, ResourceAccessType> resourceAccessTypes; // Desired access types in this batch
 		//std::unordered_map<uint64_t, ResourceLayout> resourceLayouts; // Desired layouts in this batch
-		std::unordered_map<uint64_t, CommandQueueType> transitionQueue; // Queue to transition resources on
+		std::unordered_map<uint64_t, QueueKind> transitionQueue; // Queue to transition resources on
 		std::vector<ResourceTransition> renderTransitions; // Transitions needed to reach desired states on the render queue
 		std::vector<ResourceTransition> computeTransitions; // Transitions needed to reach desired states on the compute queue
 		std::vector<ResourceTransition> batchEndTransitions; // A special case to deal with resources that need to be used by the compute queue, but are in graphics-queue-only states
@@ -326,7 +322,7 @@ private:
 	};
 
 	struct LastProducerAcrossFrames {
-		CommandQueueType queue = CommandQueueType::Graphics;
+		QueueKind queue = QueueKind::Graphics;
 		uint64_t fenceValue = 0;
 	};
 
@@ -343,7 +339,7 @@ private:
 
 	struct Node {
 		size_t   passIndex = 0;
-		bool     isCompute = false;
+		QueueKind queueKind = QueueKind::Graphics;
 		uint32_t originalOrder = 0;
 
 		// Expanded IDs (aliases + group/child fixpoint)
@@ -480,7 +476,7 @@ private:
 		std::unordered_set<uint64_t> const& resourcesTransitionedThisPass);
 
 	void ProcessResourceRequirements(
-		bool isCompute,
+		QueueKind passQueue,
 		std::vector<ResourceRequirement>& resourceRequirements,
 		std::unordered_map<uint64_t, unsigned int>&  batchOfLastRenderQueueUsage,
 		std::unordered_map<uint64_t, unsigned int>& producerHistory,
@@ -490,7 +486,8 @@ private:
 
 	template<typename PassRes>
 	void applySynchronization(
-		bool                              isComputePass,
+		QueueKind                         passQueue,
+		QueueKind                         oppositeQueue,
 		PassBatch&                        currentBatch,
 		unsigned int                      currentBatchIndex,
 		const PassRes&                    pass, // either ComputePassAndResources or RenderPassAndResources
@@ -499,6 +496,15 @@ private:
 		const std::unordered_map<uint64_t, unsigned int>& oppUsageHist,
 		const std::unordered_set<uint64_t> resourcesTransitionedThisPass)
 	{
+		const bool passIsComputeAgainstGraphics =
+			(passQueue == QueueKind::Compute && oppositeQueue == QueueKind::Graphics);
+		const bool passIsGraphicsAgainstCompute =
+			(passQueue == QueueKind::Graphics && oppositeQueue == QueueKind::Compute);
+
+		if (!passIsComputeAgainstGraphics && !passIsGraphicsAgainstCompute) {
+			return;
+		}
+
 		// figure out which two numbers we wait on
 		auto [lastTransBatch, lastProdBatch, lastUsageBatch] =
 			GetBatchesToWaitOn(pass, oppTransHist, oppProdHist, oppUsageHist, resourcesTransitionedThisPass);
@@ -507,7 +513,7 @@ private:
 		if (lastTransBatch != -1) {
 			if (static_cast<unsigned int>(lastTransBatch) == currentBatchIndex) {
 				// same batch, signal & immediate wait
-				if (isComputePass) {
+				if (passIsComputeAgainstGraphics) {
 					currentBatch.renderTransitionSignal = true;
 					currentBatch.computeQueueWaitOnRenderQueueBeforeExecution = true;
 					currentBatch.computeQueueWaitOnRenderQueueBeforeExecutionFenceValue = 
@@ -520,7 +526,7 @@ private:
 				}
 			} else {
 				// different batch, signal that batch's completion, then wait before *transition*
-				if (isComputePass) {
+					if (passIsComputeAgainstGraphics) {
 					batches[lastTransBatch].renderCompletionSignal = true;
 					currentBatch.computeQueueWaitOnRenderQueueBeforeTransition = true;
 					currentBatch.computeQueueWaitOnRenderQueueBeforeTransitionFenceValue =
@@ -544,7 +550,7 @@ private:
 		}
 #endif
 		if (lastProdBatch != -1) {
-			if (isComputePass) {
+			if (passIsComputeAgainstGraphics) {
 				batches[lastProdBatch].renderCompletionSignal = true;
 				currentBatch.computeQueueWaitOnRenderQueueBeforeTransition = true;
 				currentBatch.computeQueueWaitOnRenderQueueBeforeTransitionFenceValue =
@@ -561,7 +567,7 @@ private:
 
 		// Handle the "usage" wait
 		if (lastUsageBatch != -1) {
-			if (isComputePass) {
+			if (passIsComputeAgainstGraphics) {
 				batches[lastUsageBatch].renderCompletionSignal = true;
 				currentBatch.computeQueueWaitOnRenderQueueBeforeTransition = true;
 				currentBatch.computeQueueWaitOnRenderQueueBeforeTransitionFenceValue =
@@ -581,7 +587,7 @@ private:
 		std::unordered_map<uint64_t, unsigned int>&  batchOfLastRenderQueueUsage,
 		unsigned int batchIndex,
 		PassBatch& currentBatch,
-		bool isComputePass,
+		QueueKind passQueue,
 		const ResourceRequirement& r,
 		std::unordered_set<uint64_t>& outTransitionedResourceIDs);
 
@@ -619,15 +625,11 @@ private:
 		unsigned int currentBatchIndex,
 		PassBatch& currentBatch,
 
-		std::unordered_set<uint64_t>& computeUAVs,
-		std::unordered_set<uint64_t>& renderUAVs,
+		std::array<std::unordered_set<uint64_t>, static_cast<size_t>(QueueKind::Count)>& queueUAVs,
 
-		std::unordered_map<uint64_t, unsigned int>& batchOfLastRenderQueueTransition,
-		std::unordered_map<uint64_t, unsigned int>& batchOfLastComputeQueueTransition,
-		std::unordered_map<uint64_t, unsigned int>& batchOfLastRenderQueueProducer,
-		std::unordered_map<uint64_t, unsigned int>& batchOfLastComputeQueueProducer,
-		std::unordered_map<uint64_t, unsigned int>& batchOfLastRenderQueueUsage,
-		std::unordered_map<uint64_t, unsigned int>& batchOfLastComputeQueueUsage);
+		std::array<std::unordered_map<uint64_t, unsigned int>, static_cast<size_t>(QueueKind::Count)>& batchOfLastQueueTransition,
+		std::array<std::unordered_map<uint64_t, unsigned int>, static_cast<size_t>(QueueKind::Count)>& batchOfLastQueueProducer,
+		std::array<std::unordered_map<uint64_t, unsigned int>, static_cast<size_t>(QueueKind::Count)>& batchOfLastQueueUsage);
 	void AutoScheduleAndBuildBatches(
 		RenderGraph& rg,
 		std::vector<AnyPassAndResources>& passes,
