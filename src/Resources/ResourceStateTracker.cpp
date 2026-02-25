@@ -351,7 +351,7 @@ bool ValidateNoConflictingTransitions(
         return false;
         };
 
-    // Threshold: if totalMips * totalSlices is “reasonable”, do exact cell-marking.
+    // Threshold: if totalMips * totalSlices is "reasonable", do exact cell-marking.
     // Otherwise fall back to per-mip interval sweeping (still exact, but without big O(mips*slices) memory).
     constexpr size_t kMaxDenseCells = 1u << 20; // ~1,048,576
 

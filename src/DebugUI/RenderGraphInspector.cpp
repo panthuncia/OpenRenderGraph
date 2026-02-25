@@ -38,6 +38,8 @@ BuildBatchLayouts(const std::vector<RenderGraph::PassBatch>& batches, const RGIn
     double cursor = 0.0;
     for (int i = 0; i < static_cast<int>(batches.size()); ++i) {
         const auto& b = batches[i];
+        const auto& graphicsPostTransitions =
+            b.Transitions(QueueKind::Graphics, RenderGraph::BatchTransitionPhase::AfterPasses);
         BatchLayout bl;
         bl.baseX = cursor;
 
@@ -47,7 +49,7 @@ BuildBatchLayouts(const std::vector<RenderGraph::PassBatch>& batches, const RGIn
         bl.p0 = bl.t1 + g;
         bl.p1 = bl.p0 + wP;
 
-        bl.hasEnd = !b.batchEndTransitions.empty();
+        bl.hasEnd = !graphicsPostTransitions.empty();
         if (bl.hasEnd) {
             bl.e0 = bl.p1 + g;
             bl.e1 = bl.e0 + wE;
@@ -86,24 +88,24 @@ static SignalIndex BuildSignalIndex(const std::vector<RenderGraph::PassBatch>& b
     for (int i = 0; i < static_cast<int>(batches.size()); ++i) {
         const auto& b = batches[i];
 
-        if (b.renderTransitionSignal) {
-            idx[{QueueKind::Graphics, b.renderTransitionFenceValue}] =
+        if (b.HasQueueSignal(RenderGraph::BatchSignalPhase::AfterTransitions, QueueKind::Graphics)) {
+            idx[{QueueKind::Graphics, b.GetQueueSignalFenceValue(RenderGraph::BatchSignalPhase::AfterTransitions, QueueKind::Graphics)}] =
             { i, QueueKind::Graphics, SignalPhase::AfterTransitions };
         }
-        if (b.renderCompletionSignal) {
-            auto phase = b.batchEndTransitions.empty()
+        if (b.HasQueueSignal(RenderGraph::BatchSignalPhase::AfterCompletion, QueueKind::Graphics)) {
+            auto phase = b.Transitions(QueueKind::Graphics, RenderGraph::BatchTransitionPhase::AfterPasses).empty()
                 ? SignalPhase::AfterPasses
                 : SignalPhase::AfterBatchEndTransitions;
-            idx[{QueueKind::Graphics, b.renderCompletionFenceValue}] =
+            idx[{QueueKind::Graphics, b.GetQueueSignalFenceValue(RenderGraph::BatchSignalPhase::AfterCompletion, QueueKind::Graphics)}] =
             { i, QueueKind::Graphics, phase };
         }
 
-        if (b.computeTransitionSignal) {
-            idx[{QueueKind::Compute, b.computeTransitionFenceValue}] =
+        if (b.HasQueueSignal(RenderGraph::BatchSignalPhase::AfterTransitions, QueueKind::Compute)) {
+            idx[{QueueKind::Compute, b.GetQueueSignalFenceValue(RenderGraph::BatchSignalPhase::AfterTransitions, QueueKind::Compute)}] =
             { i, QueueKind::Compute, SignalPhase::AfterTransitions };
         }
-        if (b.computeCompletionSignal) {
-            idx[{QueueKind::Compute, b.computeCompletionFenceValue}] =
+        if (b.HasQueueSignal(RenderGraph::BatchSignalPhase::AfterCompletion, QueueKind::Compute)) {
+            idx[{QueueKind::Compute, b.GetQueueSignalFenceValue(RenderGraph::BatchSignalPhase::AfterCompletion, QueueKind::Compute)}] =
             { i, QueueKind::Compute, SignalPhase::AfterPasses };
         }
     }
@@ -145,9 +147,13 @@ static void CollectResourceIds(const std::vector<RenderGraph::PassBatch>& batche
                 upsertNamedResource(t.pResource);
             }
             };
-        scan(b.renderTransitions);
-        scan(b.computeTransitions);
-        scan(b.batchEndTransitions);
+        for (size_t phaseIndex = 0; phaseIndex < static_cast<size_t>(RenderGraph::BatchTransitionPhase::Count); ++phaseIndex) {
+            const auto phase = static_cast<RenderGraph::BatchTransitionPhase>(phaseIndex);
+            for (size_t queueIndex = 0; queueIndex < static_cast<size_t>(QueueKind::Count); ++queueIndex) {
+                const auto queue = static_cast<QueueKind>(queueIndex);
+                scan(b.Transitions(queue, phase));
+            }
+        }
 
         // Also add anything the batch knows about:
         for (auto id : b.allResources) outIdToName.emplace(id, std::string{});
@@ -204,9 +210,13 @@ static void CollectBatchResourceIds(const RenderGraph::PassBatch& batch, std::un
             out.insert(t.pResource->GetGlobalResourceID());
         }
     };
-    scan(batch.renderTransitions);
-    scan(batch.computeTransitions);
-    scan(batch.batchEndTransitions);
+    for (size_t phaseIndex = 0; phaseIndex < static_cast<size_t>(RenderGraph::BatchTransitionPhase::Count); ++phaseIndex) {
+        const auto phase = static_cast<RenderGraph::BatchTransitionPhase>(phaseIndex);
+        for (size_t queueIndex = 0; queueIndex < static_cast<size_t>(QueueKind::Count); ++queueIndex) {
+            const auto queue = static_cast<QueueKind>(queueIndex);
+            scan(batch.Transitions(queue, phase));
+        }
+    }
 }
 
 // Colors
@@ -682,6 +692,9 @@ namespace RGInspector {
 
                 const auto& b = batches[bi];
                 const auto& L = layouts[bi];
+                const auto& computePreTransitions = b.Transitions(QueueKind::Compute, RenderGraph::BatchTransitionPhase::BeforePasses);
+                const auto& graphicsPreTransitions = b.Transitions(QueueKind::Graphics, RenderGraph::BatchTransitionPhase::BeforePasses);
+                const auto& graphicsPostTransitions = b.Transitions(QueueKind::Graphics, RenderGraph::BatchTransitionPhase::AfterPasses);
 
                 // Batch hitbox for selection (click anywhere in the batch slot)
                 {
@@ -709,15 +722,15 @@ namespace RGInspector {
                 }
 
                 // Compute lane
-                draw_transitions(b.computeTransitions, QueueKind::Compute, bi, L.t0, L.t1);
+                draw_transitions(computePreTransitions, QueueKind::Compute, bi, L.t0, L.t1);
                 draw_passes(b.computePasses, QueueKind::Compute, bi, /*isCompute*/true);
 
                 // Graphics lane
-                draw_transitions(b.renderTransitions, QueueKind::Graphics, bi, L.t0, L.t1);
+                draw_transitions(graphicsPreTransitions, QueueKind::Graphics, bi, L.t0, L.t1);
                 draw_passes(b.renderPasses, QueueKind::Graphics, bi, /*isCompute*/false);
 
                 if (L.hasEnd) {
-                    draw_transitions(b.batchEndTransitions, QueueKind::Graphics, bi, L.e0, L.e1);
+                    draw_transitions(graphicsPostTransitions, QueueKind::Graphics, bi, L.e0, L.e1);
                     //ImVec2 tp = ImPlot::PlotToPixels(ImPlotPoint((L.e0 + L.e1) * 0.5, LaneY(QueueKind::Graphics, H, S) + 0.08f * H));
                     //dl->AddText(tp, IM_COL32_BLACK, "End Transitions");
                 }
@@ -754,8 +767,8 @@ namespace RGInspector {
                 auto waitX_Passes = [&](int bi)->double { return layouts[bi].p0; };
 
                 // Compute waits on Graphics BEFORE TRANSITIONS
-                if (b.computeQueueWaitOnRenderQueueBeforeTransition) {
-                    uint64_t fv = b.computeQueueWaitOnRenderQueueBeforeTransitionFenceValue;
+                if (b.HasQueueWait(RenderGraph::BatchWaitPhase::BeforeTransitions, QueueKind::Compute, QueueKind::Graphics)) {
+                    uint64_t fv = b.GetQueueWaitFenceValue(RenderGraph::BatchWaitPhase::BeforeTransitions, QueueKind::Compute, QueueKind::Graphics);
                     auto it = sigIdx.find({ QueueKind::Graphics, fv });
                     if (it != sigIdx.end()) {
                         const auto& src = it->second;
@@ -767,8 +780,8 @@ namespace RGInspector {
                 }
 
                 // Compute waits on Graphics BEFORE EXECUTION
-                if (b.computeQueueWaitOnRenderQueueBeforeExecution) {
-                    uint64_t fv = b.computeQueueWaitOnRenderQueueBeforeExecutionFenceValue;
+                if (b.HasQueueWait(RenderGraph::BatchWaitPhase::BeforeExecution, QueueKind::Compute, QueueKind::Graphics)) {
+                    uint64_t fv = b.GetQueueWaitFenceValue(RenderGraph::BatchWaitPhase::BeforeExecution, QueueKind::Compute, QueueKind::Graphics);
                     auto it = sigIdx.find({ QueueKind::Graphics, fv });
                     if (it != sigIdx.end()) {
                         const auto& src = it->second;
@@ -783,8 +796,8 @@ namespace RGInspector {
                 }
 
                 // Graphics waits on Compute BEFORE TRANSITIONS
-                if (b.renderQueueWaitOnComputeQueueBeforeTransition) {
-                    uint64_t fv = b.renderQueueWaitOnComputeQueueBeforeTransitionFenceValue;
+                if (b.HasQueueWait(RenderGraph::BatchWaitPhase::BeforeTransitions, QueueKind::Graphics, QueueKind::Compute)) {
+                    uint64_t fv = b.GetQueueWaitFenceValue(RenderGraph::BatchWaitPhase::BeforeTransitions, QueueKind::Graphics, QueueKind::Compute);
                     auto it = sigIdx.find({ QueueKind::Compute, fv });
                     if (it != sigIdx.end()) {
                         const auto& src = it->second;
@@ -798,8 +811,8 @@ namespace RGInspector {
                 }
 
                 // Graphics waits on Compute BEFORE EXECUTION
-                if (b.renderQueueWaitOnComputeQueueBeforeExecution) {
-                    uint64_t fv = b.renderQueueWaitOnComputeQueueBeforeExecutionFenceValue;
+                if (b.HasQueueWait(RenderGraph::BatchWaitPhase::BeforeExecution, QueueKind::Graphics, QueueKind::Compute)) {
+                    uint64_t fv = b.GetQueueWaitFenceValue(RenderGraph::BatchWaitPhase::BeforeExecution, QueueKind::Graphics, QueueKind::Compute);
                     auto it = sigIdx.find({ QueueKind::Compute, fv });
                     if (it != sigIdx.end()) {
                         const auto& src = it->second;

@@ -322,10 +322,11 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 
 	auto openNewBatch = [&]() -> PassBatch {
 		PassBatch b;
-		b.renderTransitionFenceValue = rg.GetNextGraphicsQueueFenceValue();
-		b.renderCompletionFenceValue = rg.GetNextGraphicsQueueFenceValue();
-		b.computeTransitionFenceValue = rg.GetNextComputeQueueFenceValue();
-		b.computeCompletionFenceValue = rg.GetNextComputeQueueFenceValue();
+		for (size_t queueIndex = 0; queueIndex < static_cast<size_t>(QueueKind::Count); ++queueIndex) {
+			const auto queue = static_cast<QueueKind>(queueIndex);
+			b.SetQueueSignalFenceValue(RenderGraph::BatchSignalPhase::AfterTransitions, queue, rg.GetNextQueueFenceValue(queue));
+			b.SetQueueSignalFenceValue(RenderGraph::BatchSignalPhase::AfterCompletion, queue, rg.GetNextQueueFenceValue(queue));
+		}
 		return b;
 		};
 
@@ -579,21 +580,12 @@ void RenderGraph::AddTransition(
 			const auto id = transition.pResource ? transition.pResource->GetGlobalResourceID() : resource.GetGlobalResourceID();
 			unsigned int gfxBatch = batchOfLastRenderQueueUsage[id];
 			batchOfLastRenderQueueUsage[id] = gfxBatch; // Can this cause transition overlaps?
-			batches[gfxBatch].batchEndTransitions.push_back(transition);
+			batches[gfxBatch].Transitions(QueueKind::Graphics, BatchTransitionPhase::AfterPasses).push_back(transition);
 		}
 	}
 	else {
-		if (passQueue == QueueKind::Compute) {
-			for (auto& transition : transitions) {
-				//context.transHistCompute[transition.pResource->GetGlobalResourceID()] = batchIndex;
-				currentBatch.computeTransitions.push_back(transition);
-			}
-		}
-		else if (passQueue == QueueKind::Graphics) {
-			for (auto& transition : transitions) {
-				//context.transHistRender[transition.pResource->GetGlobalResourceID()] = batchIndex;
-				currentBatch.renderTransitions.push_back(transition);
-			}
+		for (auto& transition : transitions) {
+			currentBatch.Transitions(passQueue, BatchTransitionPhase::BeforePasses).push_back(transition);
 		}
 	}
 }
@@ -1843,24 +1835,6 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	auto usedResourceIDs = CollectFrameResourceIDs();
 	ApplyIdleDematerializationPolicy(usedResourceIDs);
 
-	auto currentBatch = PassBatch();
-	currentBatch.renderTransitionFenceValue = GetNextGraphicsQueueFenceValue();
-	currentBatch.renderCompletionFenceValue = GetNextGraphicsQueueFenceValue();
-	currentBatch.computeTransitionFenceValue = GetNextComputeQueueFenceValue();
-	currentBatch.computeCompletionFenceValue = GetNextComputeQueueFenceValue();
-
-	std::unordered_set<uint64_t> computeUAVs;
-	std::unordered_set<uint64_t> renderUAVs;
-
-	std::unordered_map<uint64_t, unsigned int>  batchOfLastRenderQueueTransition;
-	std::unordered_map<uint64_t, unsigned int>  batchOfLastComputeQueueTransition;
-
-	std::unordered_map<uint64_t, unsigned int>  batchOfLastRenderQueueProducer;
-	std::unordered_map<uint64_t, unsigned int>  batchOfLastComputeQueueProducer;
-
-	std::unordered_map<uint64_t, unsigned int>  batchOfLastRenderQueueUsage;
-	std::unordered_map<uint64_t, unsigned int>  batchOfLastComputeQueueUsage;
-
 	// Convert explicit After(anchorName)->(passName) constraints into node-index edges.
 	std::vector<std::pair<size_t, size_t>> explicitEdges;
 	explicitEdges.reserve(explicitAfterByName.size());
@@ -2045,40 +2019,26 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	// Insert transitions to loop resources back to their initial states
 	//ComputeResourceLoops();
 
-	// Cut out repeat waits on the same fence
-	uint64_t lastRenderWaitFenceValue = 0;
-	uint64_t lastComputeWaitFenceValue = 0;
+	// Cut out repeat waits on the same fence per destination queue.
+	std::array<uint64_t, static_cast<size_t>(QueueKind::Count)> lastWaitFenceByDstQueue{};
 	for (auto& batch : batches) {
-		if (batch.computeQueueWaitOnRenderQueueBeforeTransition) {
-			if (batch.computeQueueWaitOnRenderQueueBeforeTransitionFenceValue <= lastComputeWaitFenceValue) {
-				batch.computeQueueWaitOnRenderQueueBeforeTransition = false;
-			}
-			else {
-				lastComputeWaitFenceValue = batch.computeQueueWaitOnRenderQueueBeforeTransitionFenceValue;
-			}
-		}
-		if (batch.computeQueueWaitOnRenderQueueBeforeExecution) {
-			if (batch.computeQueueWaitOnRenderQueueBeforeExecutionFenceValue <= lastComputeWaitFenceValue) {
-				batch.computeQueueWaitOnRenderQueueBeforeExecution = false;
-			}
-			else {
-				lastComputeWaitFenceValue = batch.computeQueueWaitOnRenderQueueBeforeExecutionFenceValue;
-			}
-		}
-		if (batch.renderQueueWaitOnComputeQueueBeforeTransition) {
-			if (batch.renderQueueWaitOnComputeQueueBeforeTransitionFenceValue <= lastRenderWaitFenceValue) {
-				batch.renderQueueWaitOnComputeQueueBeforeTransition = false;
-			}
-			else {
-				lastRenderWaitFenceValue = batch.renderQueueWaitOnComputeQueueBeforeTransitionFenceValue;
-			}
-		}
-		if (batch.renderQueueWaitOnComputeQueueBeforeExecution) {
-			if (batch.renderQueueWaitOnComputeQueueBeforeExecutionFenceValue <= lastRenderWaitFenceValue) {
-				batch.renderQueueWaitOnComputeQueueBeforeExecution = false;
-			}
-			else {
-				lastRenderWaitFenceValue = batch.renderQueueWaitOnComputeQueueBeforeExecutionFenceValue;
+		for (size_t dstIndex = 0; dstIndex < static_cast<size_t>(QueueKind::Count); ++dstIndex) {
+			const auto dstQueue = static_cast<QueueKind>(dstIndex);
+			for (auto phase : { BatchWaitPhase::BeforeTransitions, BatchWaitPhase::BeforeExecution }) {
+				for (size_t srcIndex = 0; srcIndex < static_cast<size_t>(QueueKind::Count); ++srcIndex) {
+					const auto srcQueue = static_cast<QueueKind>(srcIndex);
+					if (!batch.HasQueueWait(phase, dstQueue, srcQueue)) {
+						continue;
+					}
+
+					const auto waitFence = batch.GetQueueWaitFenceValue(phase, dstQueue, srcQueue);
+					if (waitFence <= lastWaitFenceByDstQueue[dstIndex]) {
+						batch.ClearQueueWait(phase, dstQueue, srcQueue);
+					}
+					else {
+						lastWaitFenceByDstQueue[dstIndex] = waitFence;
+					}
+				}
 			}
 		}
 	}
@@ -2087,24 +2047,102 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	// Sanity checks:
 	// 1. No conflicting resource transitions in a batch
 
-	// Build one vector of transitions per batch
-	for (size_t bi = 0; bi < batches.size(); bi++) {
-		std::vector<ResourceTransition> allTransitions;
-		auto& batch = batches[bi];
-		allTransitions.insert(
-			allTransitions.end(),
-			batch.renderTransitions.begin(),
-			batch.renderTransitions.end());
-		allTransitions.insert(
-			allTransitions.end(),
-			batch.computeTransitions.begin(),
-			batch.computeTransitions.end());
+	auto queueName = [](QueueKind queue) -> const char* {
+		switch (queue) {
+		case QueueKind::Graphics: return "Graphics";
+		case QueueKind::Compute: return "Compute";
+		case QueueKind::Copy: return "Copy";
+		default: return "Unknown";
+		}
+		};
 
-		// Validate
-		TransitionConflict out;
-		if (bool ok = ValidateNoConflictingTransitions(allTransitions, &out); !ok) {
-			spdlog::error("Render graph has conflicting resource transitions!");
-			throw std::runtime_error("Render graph has conflicting resource transitions!");
+	auto phaseName = [](BatchTransitionPhase phase) -> const char* {
+		switch (phase) {
+		case BatchTransitionPhase::BeforePasses: return "BeforePasses";
+		case BatchTransitionPhase::AfterPasses: return "AfterPasses";
+		default: return "Unknown";
+		}
+		};
+
+	auto dumpTransitionsForBatchPhase = [&](size_t batchIndex, const PassBatch& batch, BatchTransitionPhase phase) {
+		for (size_t queueIndex = 0; queueIndex < static_cast<size_t>(QueueKind::Count); ++queueIndex) {
+			const auto queue = static_cast<QueueKind>(queueIndex);
+			const auto& transitions = batch.Transitions(queue, phase);
+			spdlog::error(
+				"RG transition dump: batch={} phase={} queue={} count={}",
+				batchIndex,
+				phaseName(phase),
+				queueName(queue),
+				transitions.size());
+
+			for (size_t ti = 0; ti < transitions.size(); ++ti) {
+				const auto& transition = transitions[ti];
+				if (!transition.pResource) {
+					spdlog::error(
+						"  [{}] resource=<null>",
+						ti);
+					continue;
+				}
+
+				auto prevAccess = rhi::helpers::ResourceAccessMaskToString(transition.prevAccessType);
+				auto newAccess = rhi::helpers::ResourceAccessMaskToString(transition.newAccessType);
+				std::string mipLower = transition.range.mipLower.ToString();
+				std::string mipUpper = transition.range.mipUpper.ToString();
+				std::string sliceLower = transition.range.sliceLower.ToString();
+				std::string sliceUpper = transition.range.sliceUpper.ToString();
+
+				spdlog::error(
+					"  [{}] resource='{}' id={} mip=[{}..{}] slice=[{}..{}] discard={} layout:{}->{} access:{}->{} sync:{}->{}",
+					ti,
+					transition.pResource->GetName(),
+					transition.pResource->GetGlobalResourceID(),
+					mipLower,
+					mipUpper,
+					sliceLower,
+					sliceUpper,
+					transition.discard,
+					rhi::helpers::ResourceLayoutToString(transition.prevLayout),
+					rhi::helpers::ResourceLayoutToString(transition.newLayout),
+					prevAccess,
+					newAccess,
+					rhi::helpers::ResourceSyncToString(transition.prevSyncState),
+					rhi::helpers::ResourceSyncToString(transition.newSyncState));
+			}
+		}
+		};
+
+	// Validate per transition phase.
+	// NOTE: transitions for the same resource can be valid across phases
+	// (e.g. BeforePasses transitions into RT state, then AfterPasses transitions
+	// back for consumers). Flattening phases together produces false positives.
+	for (size_t bi = 0; bi < batches.size(); bi++) {
+		auto& batch = batches[bi];
+		for (size_t phaseIndex = 0; phaseIndex < static_cast<size_t>(BatchTransitionPhase::Count); ++phaseIndex) {
+			std::vector<ResourceTransition> phaseTransitions;
+			const auto phase = static_cast<BatchTransitionPhase>(phaseIndex);
+			for (size_t queueIndex = 0; queueIndex < static_cast<size_t>(QueueKind::Count); ++queueIndex) {
+				const auto queue = static_cast<QueueKind>(queueIndex);
+				const auto& transitions = batch.Transitions(queue, phase);
+				phaseTransitions.insert(phaseTransitions.end(), transitions.begin(), transitions.end());
+			}
+			
+
+			// Validate this phase
+			TransitionConflict out;
+			if (bool ok = ValidateNoConflictingTransitions(phaseTransitions, &out); !ok) {
+				const uint32_t conflictMip = static_cast<uint32_t>(out.mip);
+				const uint32_t conflictSlice = static_cast<uint32_t>(out.slice);
+				spdlog::error(
+					"Render graph has conflicting resource transitions in batch {} phase {} ({}) (resource='{}' mip={} slice={})",
+					bi,
+					phaseIndex,
+					phaseName(phase),
+					out.resource ? out.resource->GetName() : std::string("<null>"),
+					conflictMip,
+					conflictSlice);
+				dumpTransitionsForBatchPhase(bi, batch, phase);
+				throw std::runtime_error("Render graph has conflicting resource transitions!");
+			}
 		}
 	}
 
@@ -2582,26 +2620,58 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 
 	auto graphicsQueue = crm->Queue(QueueKind::Graphics);
 	auto computeQueue = crm->Queue(QueueKind::Compute);
+	auto copyQueue = crm->Queue(QueueKind::Copy);
 
 	const bool alias = (computeQueue == graphicsQueue);
-	auto WaitIfDistinct = [&](rhi::Queue* dstQ, rhi::Timeline& fence, UINT64 val) {
-		if (!alias) dstQ->Wait({ fence.GetHandle(), val });
-		};
+	auto GetQueueFenceTimeline = [&](QueueKind queue) -> rhi::Timeline& {
+		switch (queue) {
+		case QueueKind::Graphics: return m_graphicsQueueFence.Get();
+		case QueueKind::Compute: return m_computeQueueFence.Get();
+		case QueueKind::Copy: return m_copyQueueFence.Get();
+		default: return m_graphicsQueueFence.Get();
+		}
+	};
+	auto GetQueueFenceOffset = [&](QueueKind queue) -> UINT64 {
+		switch (queue) {
+		case QueueKind::Graphics: return m_graphicsQueueFenceValue * context.frameFenceValue;
+		case QueueKind::Compute: return m_computeQueueFenceValue * context.frameFenceValue;
+		case QueueKind::Copy: return m_copyQueueFenceValue * context.frameFenceValue;
+		default: return 0;
+		}
+	};
+	auto QueueHandle = [&](QueueKind queue) -> rhi::Queue* {
+		switch (queue) {
+		case QueueKind::Graphics: return graphicsQueue;
+		case QueueKind::Compute: return computeQueue;
+		case QueueKind::Copy: return copyQueue;
+		default: return graphicsQueue;
+		}
+	};
+	auto QueuesAlias = [&](QueueKind a, QueueKind b) {
+		return QueueHandle(a) == QueueHandle(b);
+	};
+	auto WaitIfDistinct = [&](QueueKind dstQueue, QueueKind srcQueue, UINT64 absoluteFenceValue) {
+		if (QueuesAlias(dstQueue, srcQueue)) {
+			return;
+		}
+		QueueHandle(dstQueue)->Wait({ GetQueueFenceTimeline(srcQueue).GetHandle(), absoluteFenceValue });
+	};
 
 	if (m_hasPendingFrameStartComputeWaitOnRender) {
-		WaitIfDistinct(computeQueue, m_graphicsQueueFence.Get(), m_pendingFrameStartComputeWaitOnRenderFenceValue);
+		WaitIfDistinct(QueueKind::Compute, QueueKind::Graphics, m_pendingFrameStartComputeWaitOnRenderFenceValue);
 	}
 	if (m_hasPendingFrameStartRenderWaitOnCompute) {
-		WaitIfDistinct(graphicsQueue, m_computeQueueFence.Get(), m_pendingFrameStartRenderWaitOnComputeFenceValue);
+		WaitIfDistinct(QueueKind::Graphics, QueueKind::Compute, m_pendingFrameStartRenderWaitOnComputeFenceValue);
 	}
 
-	UINT64 currentGraphicsQueueFenceOffset = m_graphicsQueueFenceValue * context.frameFenceValue;
-	UINT64 currentComputeQueueFenceOffset = m_computeQueueFenceValue * context.frameFenceValue;
+	const UINT64 currentGraphicsQueueFenceOffset = GetQueueFenceOffset(QueueKind::Graphics);
+	const UINT64 currentComputeQueueFenceOffset = GetQueueFenceOffset(QueueKind::Compute);
+	const UINT64 currentCopyQueueFenceOffset = GetQueueFenceOffset(QueueKind::Copy);
 
 	for (const auto& [resourceID, producerBatch] : m_compiledLastRenderProducerBatchByResource) {
 		(void)resourceID;
 		if (producerBatch < batches.size()) {
-			batches[producerBatch].renderCompletionSignal = true;
+			batches[producerBatch].MarkQueueSignal(BatchSignalPhase::AfterCompletion, QueueKind::Graphics);
 		}
 	}
 
@@ -2609,7 +2679,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 		for (const auto& [resourceID, producerBatch] : m_compiledLastComputeProducerBatchByResource) {
 			(void)resourceID;
 			if (producerBatch < batches.size()) {
-				batches[producerBatch].renderCompletionSignal = true;
+				batches[producerBatch].MarkQueueSignal(BatchSignalPhase::AfterCompletion, QueueKind::Graphics);
 			}
 		}
 	}
@@ -2617,7 +2687,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 		for (const auto& [resourceID, producerBatch] : m_compiledLastComputeProducerBatchByResource) {
 			(void)resourceID;
 			if (producerBatch < batches.size()) {
-				batches[producerBatch].computeCompletionSignal = true;
+				batches[producerBatch].MarkQueueSignal(BatchSignalPhase::AfterCompletion, QueueKind::Compute);
 			}
 		}
 	}
@@ -2667,28 +2737,89 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 
 	unsigned int batchIndex = 0;
 	for (auto& batch : batches) {
+		auto& computePreTransitions = batch.Transitions(QueueKind::Compute, BatchTransitionPhase::BeforePasses);
+		auto& graphicsPreTransitions = batch.Transitions(QueueKind::Graphics, BatchTransitionPhase::BeforePasses);
+		auto& graphicsPostTransitions = batch.Transitions(QueueKind::Graphics, BatchTransitionPhase::AfterPasses);
+		auto& copyPreTransitions = batch.Transitions(QueueKind::Copy, BatchTransitionPhase::BeforePasses);
+		auto& copyPostTransitions = batch.Transitions(QueueKind::Copy, BatchTransitionPhase::AfterPasses);
 
-		if (batch.computeQueueWaitOnRenderQueueBeforeTransition) {
-			WaitIfDistinct(computeQueue, m_graphicsQueueFence.Get(),
-				currentGraphicsQueueFenceOffset +
-				batch.computeQueueWaitOnRenderQueueBeforeTransitionFenceValue);
+		for (size_t srcIndex = 0; srcIndex < static_cast<size_t>(QueueKind::Count); ++srcIndex) {
+			const auto srcQueue = static_cast<QueueKind>(srcIndex);
+			if (!batch.HasQueueWait(BatchWaitPhase::BeforeTransitions, QueueKind::Copy, srcQueue)) {
+				continue;
+			}
+			WaitIfDistinct(
+				QueueKind::Copy,
+				srcQueue,
+				GetQueueFenceOffset(srcQueue) + batch.GetQueueWaitFenceValue(BatchWaitPhase::BeforeTransitions, QueueKind::Copy, srcQueue));
+		}
+
+		auto copyCommandList = crm->EnsureOpen(QueueKind::Copy, context.frameIndex);
+
+		ExecuteTransitions(copyPreTransitions,
+			crm,
+			QueueKind::Copy,
+			copyCommandList);
+
+		for (size_t srcIndex = 0; srcIndex < static_cast<size_t>(QueueKind::Count); ++srcIndex) {
+			const auto srcQueue = static_cast<QueueKind>(srcIndex);
+			if (!batch.HasQueueWait(BatchWaitPhase::BeforeExecution, QueueKind::Copy, srcQueue)) {
+				continue;
+			}
+			WaitIfDistinct(
+				QueueKind::Copy,
+				srcQueue,
+				GetQueueFenceOffset(srcQueue) + batch.GetQueueWaitFenceValue(BatchWaitPhase::BeforeExecution, QueueKind::Copy, srcQueue));
+		}
+
+		if (batch.HasQueueSignal(BatchSignalPhase::AfterTransitions, QueueKind::Copy)) {
+			UINT64 signalValue = currentCopyQueueFenceOffset + batch.GetQueueSignalFenceValue(BatchSignalPhase::AfterTransitions, QueueKind::Copy);
+			crm->Flush(QueueKind::Copy, { true, signalValue });
+		}
+
+		if (!copyPostTransitions.empty()) {
+			ExecuteTransitions(copyPostTransitions,
+				crm,
+				QueueKind::Copy,
+				copyCommandList);
+		}
+
+		if (batch.HasQueueSignal(BatchSignalPhase::AfterCompletion, QueueKind::Copy)) {
+			UINT64 signalValue = currentCopyQueueFenceOffset + batch.GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, QueueKind::Copy);
+			crm->Flush(QueueKind::Copy, { true, signalValue });
+		}
+
+		for (size_t srcIndex = 0; srcIndex < static_cast<size_t>(QueueKind::Count); ++srcIndex) {
+			const auto srcQueue = static_cast<QueueKind>(srcIndex);
+			if (!batch.HasQueueWait(BatchWaitPhase::BeforeTransitions, QueueKind::Compute, srcQueue)) {
+				continue;
+			}
+			WaitIfDistinct(
+				QueueKind::Compute,
+				srcQueue,
+				GetQueueFenceOffset(srcQueue) + batch.GetQueueWaitFenceValue(BatchWaitPhase::BeforeTransitions, QueueKind::Compute, srcQueue));
 		}
 
 		auto computeCommandList = crm->EnsureOpen(QueueKind::Compute, context.frameIndex); // TODO: Frame index or frame #?
 
-		ExecuteTransitions(batch.computeTransitions,
+		ExecuteTransitions(computePreTransitions,
 			crm,
 			QueueKind::Compute,
 			computeCommandList);
 
-		if (batch.computeQueueWaitOnRenderQueueBeforeExecution) {
-			WaitIfDistinct(computeQueue, m_graphicsQueueFence.Get(),
-				currentGraphicsQueueFenceOffset +
-				batch.computeQueueWaitOnRenderQueueBeforeExecutionFenceValue);
+		for (size_t srcIndex = 0; srcIndex < static_cast<size_t>(QueueKind::Count); ++srcIndex) {
+			const auto srcQueue = static_cast<QueueKind>(srcIndex);
+			if (!batch.HasQueueWait(BatchWaitPhase::BeforeExecution, QueueKind::Compute, srcQueue)) {
+				continue;
+			}
+			WaitIfDistinct(
+				QueueKind::Compute,
+				srcQueue,
+				GetQueueFenceOffset(srcQueue) + batch.GetQueueWaitFenceValue(BatchWaitPhase::BeforeExecution, QueueKind::Compute, srcQueue));
 		}
 
-		if (batch.computeTransitionSignal && !alias) {
-			UINT64 signalValue = currentComputeQueueFenceOffset + batch.computeTransitionFenceValue;
+		if (batch.HasQueueSignal(BatchSignalPhase::AfterTransitions, QueueKind::Compute) && !alias) {
+			UINT64 signalValue = currentComputeQueueFenceOffset + batch.GetQueueSignalFenceValue(BatchSignalPhase::AfterTransitions, QueueKind::Compute);
 			crm->Flush(QueueKind::Compute, { true, signalValue });
 		}
 
@@ -2698,41 +2829,52 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 			QueueKind::Compute,
 			computeCommandList,
 			currentComputeQueueFenceOffset,
-			batch.computeCompletionSignal,
-			batch.computeCompletionFenceValue,
+			batch.HasQueueSignal(BatchSignalPhase::AfterCompletion, QueueKind::Compute),
+			batch.GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, QueueKind::Compute),
 			context,
 			statisticsService);
 
-		if (batch.computeCompletionSignal && !alias) {
-			UINT64 signalValue = currentComputeQueueFenceOffset + batch.computeCompletionFenceValue;
+		if (batch.HasQueueSignal(BatchSignalPhase::AfterCompletion, QueueKind::Compute) && !alias) {
+			UINT64 signalValue = currentComputeQueueFenceOffset + batch.GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, QueueKind::Compute);
 			crm->Flush(QueueKind::Compute, { true, signalValue });
 		}
 
-		if (batch.renderQueueWaitOnComputeQueueBeforeTransition) {
-			WaitIfDistinct(graphicsQueue, m_computeQueueFence.Get(),
-				currentComputeQueueFenceOffset +
-				batch.renderQueueWaitOnComputeQueueBeforeTransitionFenceValue);
+		for (size_t srcIndex = 0; srcIndex < static_cast<size_t>(QueueKind::Count); ++srcIndex) {
+			const auto srcQueue = static_cast<QueueKind>(srcIndex);
+			if (!batch.HasQueueWait(BatchWaitPhase::BeforeTransitions, QueueKind::Graphics, srcQueue)) {
+				continue;
+			}
+			WaitIfDistinct(
+				QueueKind::Graphics,
+				srcQueue,
+				GetQueueFenceOffset(srcQueue) + batch.GetQueueWaitFenceValue(BatchWaitPhase::BeforeTransitions, QueueKind::Graphics, srcQueue));
 		}
 
 		auto graphicsCommandList = crm->EnsureOpen(QueueKind::Graphics, context.frameIndex);
 
-		ExecuteTransitions(batch.renderTransitions,
+		ExecuteTransitions(graphicsPreTransitions,
 			crm,
 			QueueKind::Graphics,
 			graphicsCommandList);
 
-		if (batch.renderTransitionSignal && !alias) {
-			UINT64 signalValue = currentGraphicsQueueFenceOffset + batch.renderTransitionFenceValue;
+		if (batch.HasQueueSignal(BatchSignalPhase::AfterTransitions, QueueKind::Graphics) && !alias) {
+			UINT64 signalValue = currentGraphicsQueueFenceOffset + batch.GetQueueSignalFenceValue(BatchSignalPhase::AfterTransitions, QueueKind::Graphics);
 			crm->Flush(QueueKind::Graphics, { true, signalValue });
 		}
 
-		if (batch.renderQueueWaitOnComputeQueueBeforeExecution) {
-			WaitIfDistinct(graphicsQueue, m_computeQueueFence.Get(),
-				currentComputeQueueFenceOffset +
-				batch.renderQueueWaitOnComputeQueueBeforeExecutionFenceValue);
+		for (size_t srcIndex = 0; srcIndex < static_cast<size_t>(QueueKind::Count); ++srcIndex) {
+			const auto srcQueue = static_cast<QueueKind>(srcIndex);
+			if (!batch.HasQueueWait(BatchWaitPhase::BeforeExecution, QueueKind::Graphics, srcQueue)) {
+				continue;
+			}
+			WaitIfDistinct(
+				QueueKind::Graphics,
+				srcQueue,
+				GetQueueFenceOffset(srcQueue) + batch.GetQueueWaitFenceValue(BatchWaitPhase::BeforeExecution, QueueKind::Graphics, srcQueue));
 		}
 
-		bool signalNow = batch.batchEndTransitions.size() == 0 && batch.renderCompletionSignal ? true : false;
+		const bool renderCompletionSignal = batch.HasQueueSignal(BatchSignalPhase::AfterCompletion, QueueKind::Graphics);
+		bool signalNow = graphicsPostTransitions.empty() && renderCompletionSignal;
 
 		ExecutePasses(batch.renderPasses,
 			crm,
@@ -2741,23 +2883,23 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 			graphicsCommandList,
 			currentGraphicsQueueFenceOffset,
 			signalNow,
-			batch.renderCompletionFenceValue,
+			batch.GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, QueueKind::Graphics),
 			context,
 			statisticsService);
 
-		if (batch.renderCompletionSignal && signalNow) {
-			UINT64 signalValue = currentGraphicsQueueFenceOffset + batch.renderCompletionFenceValue;
+		if (renderCompletionSignal && signalNow) {
+			UINT64 signalValue = currentGraphicsQueueFenceOffset + batch.GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, QueueKind::Graphics);
 			crm->Flush(QueueKind::Graphics, { true, signalValue });
 		}
 
-		if (batch.batchEndTransitions.size() > 0) {
-			ExecuteTransitions(batch.batchEndTransitions,
+		if (!graphicsPostTransitions.empty()) {
+			ExecuteTransitions(graphicsPostTransitions,
 				crm,
 				QueueKind::Graphics,
 				graphicsCommandList);
 
-			if (batch.renderCompletionSignal) {
-				UINT64 signalValue = currentGraphicsQueueFenceOffset + batch.renderCompletionFenceValue;
+			if (renderCompletionSignal) {
+				UINT64 signalValue = currentGraphicsQueueFenceOffset + batch.GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, QueueKind::Graphics);
 				crm->Flush(QueueKind::Graphics, { true, signalValue });
 			}
 		}
@@ -2769,7 +2911,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 			continue;
 		}
 
-		const uint64_t fenceValue = currentGraphicsQueueFenceOffset + batches[producerBatch].renderCompletionFenceValue;
+		const uint64_t fenceValue = currentGraphicsQueueFenceOffset + batches[producerBatch].GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, QueueKind::Graphics);
 		LastProducerAcrossFrames producer{
 			.queue = QueueKind::Graphics,
 			.fenceValue = fenceValue,
@@ -2784,7 +2926,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 				continue;
 			}
 
-			const uint64_t fenceValue = currentGraphicsQueueFenceOffset + batches[producerBatch].renderCompletionFenceValue;
+			const uint64_t fenceValue = currentGraphicsQueueFenceOffset + batches[producerBatch].GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, QueueKind::Graphics);
 			LastProducerAcrossFrames producer{
 				.queue = QueueKind::Graphics,
 				.fenceValue = fenceValue,
@@ -2799,7 +2941,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 				continue;
 			}
 
-			const uint64_t fenceValue = currentComputeQueueFenceOffset + batches[producerBatch].computeCompletionFenceValue;
+			const uint64_t fenceValue = currentComputeQueueFenceOffset + batches[producerBatch].GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, QueueKind::Compute);
 			LastProducerAcrossFrames producer{
 				.queue = QueueKind::Compute,
 				.fenceValue = fenceValue,
@@ -2814,6 +2956,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 	DeletionManager::GetInstance().ProcessDeletions();
 	crm->Flush(QueueKind::Graphics, { false, 0 });
 	crm->Flush(QueueKind::Compute, { false, 0 });
+	crm->Flush(QueueKind::Copy, { false, 0 });
 	crm->EndFrame();
 }
 
@@ -2887,7 +3030,7 @@ bool RenderGraph::IsNewBatchNeeded(
 //			whole, // covers all mips & slices
 //			pRes.get(),
 //			flushState,    // the state were flushing to
-//			loopBatch.renderTransitions            // collects all transitions
+//			loopBatch.Transitions(QueueKind::Graphics, BatchTransitionPhase::BeforePasses) // collects all transitions
 //		);
 //	}
 //	batches.push_back(std::move(loopBatch));

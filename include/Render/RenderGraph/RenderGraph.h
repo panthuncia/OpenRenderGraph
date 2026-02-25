@@ -174,15 +174,36 @@ public:
 		std::shared_ptr<rg::imm::KeepAliveBag> immediateKeepAlive = nullptr; // Keeps alive resources used by immediate execution bytecode
 	};
 
+	enum class BatchWaitPhase : uint8_t {
+		BeforeTransitions = 0,
+		BeforeExecution = 1,
+		Count
+	};
+
+	enum class BatchSignalPhase : uint8_t {
+		AfterTransitions = 0,
+		AfterCompletion = 1,
+		Count
+	};
+
+	enum class BatchTransitionPhase : uint8_t {
+		BeforePasses = 0,
+		AfterPasses = 1,
+		Count
+	};
+
 	struct PassBatch {
+		static constexpr size_t kQueueCount = static_cast<size_t>(QueueKind::Count);
+		static constexpr size_t kWaitPhaseCount = static_cast<size_t>(BatchWaitPhase::Count);
+		static constexpr size_t kSignalPhaseCount = static_cast<size_t>(BatchSignalPhase::Count);
+		static constexpr size_t kTransitionPhaseCount = static_cast<size_t>(BatchTransitionPhase::Count);
+
 		std::vector<RenderPassAndResources> renderPasses;
 		std::vector<ComputePassAndResources> computePasses;
 		//std::unordered_map<uint64_t, ResourceAccessType> resourceAccessTypes; // Desired access types in this batch
 		//std::unordered_map<uint64_t, ResourceLayout> resourceLayouts; // Desired layouts in this batch
 		std::unordered_map<uint64_t, QueueKind> transitionQueue; // Queue to transition resources on
-		std::vector<ResourceTransition> renderTransitions; // Transitions needed to reach desired states on the render queue
-		std::vector<ResourceTransition> computeTransitions; // Transitions needed to reach desired states on the compute queue
-		std::vector<ResourceTransition> batchEndTransitions; // A special case to deal with resources that need to be used by the compute queue, but are in graphics-queue-only states
+		std::array<std::array<std::vector<ResourceTransition>, kQueueCount>, kTransitionPhaseCount> queueTransitions;
 
 		// Resources that passes in this batch transition internally
 		// Cannot be batched with other passes which use these resources
@@ -190,28 +211,88 @@ public:
 		std::unordered_set<uint64_t> internallyTransitionedResources;
 		std::unordered_set<uint64_t> allResources; // All resources used in this batch, including those that are not transitioned internally
 
-		// For each queue, we need to allow a fence to wait on before transitioning, in case a previous batch is still using a resource
-		// Also, we need to allow a separate fence to wait on before *executing* the batch, in case the compute and render queue use the same resource in this batch
-		bool renderQueueWaitOnComputeQueueBeforeTransition = false;
-		UINT64 renderQueueWaitOnComputeQueueBeforeTransitionFenceValue = 0;
-		bool renderQueueWaitOnComputeQueueBeforeExecution = false;
-		UINT64 renderQueueWaitOnComputeQueueBeforeExecutionFenceValue = 0;
+		// Queue dependencies and signals are modeled as queue-to-queue edges per phase.
+		// queueWaitEnabled[phase][dstQueue][srcQueue] + queueWaitFenceValue[phase][dstQueue][srcQueue]
+		std::array<std::array<std::array<bool, kQueueCount>, kQueueCount>, kWaitPhaseCount> queueWaitEnabled{};
+		std::array<std::array<std::array<UINT64, kQueueCount>, kQueueCount>, kWaitPhaseCount> queueWaitFenceValue{};
 
-		bool computeQueueWaitOnRenderQueueBeforeTransition = false;
-		UINT64 computeQueueWaitOnRenderQueueBeforeTransitionFenceValue = 0;
-		bool computeQueueWaitOnRenderQueueBeforeExecution = false;
-		UINT64 computeQueueWaitOnRenderQueueBeforeExecutionFenceValue = 0;
+		// queueSignalEnabled[phase][queue] + queueSignalFenceValue[phase][queue]
+		std::array<std::array<bool, kQueueCount>, kSignalPhaseCount> queueSignalEnabled{};
+		std::array<std::array<UINT64, kQueueCount>, kSignalPhaseCount> queueSignalFenceValue{};
 
-		// Fences to signal, after transition and after completion, for each queue
-		bool renderTransitionSignal = false;
-		UINT64 renderTransitionFenceValue = 0;
-		bool computeTransitionSignal = false;
-		UINT64 computeTransitionFenceValue = 0;
+		static constexpr size_t QueueIndex(QueueKind queue) noexcept {
+			return static_cast<size_t>(queue);
+		}
 
-		bool renderCompletionSignal = false;
-		UINT64 renderCompletionFenceValue = 0;
-		bool computeCompletionSignal = false;
-		UINT64 computeCompletionFenceValue = 0;
+		static constexpr size_t WaitPhaseIndex(BatchWaitPhase phase) noexcept {
+			return static_cast<size_t>(phase);
+		}
+
+		static constexpr size_t SignalPhaseIndex(BatchSignalPhase phase) noexcept {
+			return static_cast<size_t>(phase);
+		}
+
+		static constexpr size_t TransitionPhaseIndex(BatchTransitionPhase phase) noexcept {
+			return static_cast<size_t>(phase);
+		}
+
+		std::vector<ResourceTransition>& Transitions(QueueKind queue, BatchTransitionPhase phase) {
+			return queueTransitions[TransitionPhaseIndex(phase)][QueueIndex(queue)];
+		}
+
+		const std::vector<ResourceTransition>& Transitions(QueueKind queue, BatchTransitionPhase phase) const {
+			return queueTransitions[TransitionPhaseIndex(phase)][QueueIndex(queue)];
+		}
+
+		bool HasTransitions(QueueKind queue, BatchTransitionPhase phase) const {
+			return !Transitions(queue, phase).empty();
+		}
+
+		void SetQueueSignalFenceValue(BatchSignalPhase phase, QueueKind queue, UINT64 fenceValue) {
+			queueSignalFenceValue[SignalPhaseIndex(phase)][QueueIndex(queue)] = fenceValue;
+		}
+
+		UINT64 GetQueueSignalFenceValue(BatchSignalPhase phase, QueueKind queue) const {
+			return queueSignalFenceValue[SignalPhaseIndex(phase)][QueueIndex(queue)];
+		}
+
+		void MarkQueueSignal(BatchSignalPhase phase, QueueKind queue) {
+			queueSignalEnabled[SignalPhaseIndex(phase)][QueueIndex(queue)] = true;
+		}
+
+		void ClearQueueSignal(BatchSignalPhase phase, QueueKind queue) {
+			queueSignalEnabled[SignalPhaseIndex(phase)][QueueIndex(queue)] = false;
+		}
+
+		bool HasQueueSignal(BatchSignalPhase phase, QueueKind queue) const {
+			return queueSignalEnabled[SignalPhaseIndex(phase)][QueueIndex(queue)];
+		}
+
+		void AddQueueWait(BatchWaitPhase phase, QueueKind dstQueue, QueueKind srcQueue, UINT64 fenceValue) {
+			if (dstQueue == srcQueue) {
+				return;
+			}
+
+			auto& enabled = queueWaitEnabled[WaitPhaseIndex(phase)][QueueIndex(dstQueue)][QueueIndex(srcQueue)];
+			auto& maxFence = queueWaitFenceValue[WaitPhaseIndex(phase)][QueueIndex(dstQueue)][QueueIndex(srcQueue)];
+			enabled = true;
+			if (fenceValue > maxFence) {
+				maxFence = fenceValue;
+			}
+		}
+
+		void ClearQueueWait(BatchWaitPhase phase, QueueKind dstQueue, QueueKind srcQueue) {
+			queueWaitEnabled[WaitPhaseIndex(phase)][QueueIndex(dstQueue)][QueueIndex(srcQueue)] = false;
+			queueWaitFenceValue[WaitPhaseIndex(phase)][QueueIndex(dstQueue)][QueueIndex(srcQueue)] = 0;
+		}
+
+		bool HasQueueWait(BatchWaitPhase phase, QueueKind dstQueue, QueueKind srcQueue) const {
+			return queueWaitEnabled[WaitPhaseIndex(phase)][QueueIndex(dstQueue)][QueueIndex(srcQueue)];
+		}
+
+		UINT64 GetQueueWaitFenceValue(BatchWaitPhase phase, QueueKind dstQueue, QueueKind srcQueue) const {
+			return queueWaitFenceValue[WaitPhaseIndex(phase)][QueueIndex(dstQueue)][QueueIndex(srcQueue)];
+		}
 
 		std::unordered_map<uint64_t, SymbolicTracker*> passBatchTrackers; // Trackers for the resources in this batch
 	};
@@ -429,12 +510,19 @@ private:
 	std::vector<std::unique_ptr<IRenderGraphExtension>> m_extensions;
 
 	UINT64 m_graphicsQueueFenceValue = 0;
-	UINT64 GetNextGraphicsQueueFenceValue() {
-		return m_graphicsQueueFenceValue++;
-	}
 	UINT64 m_computeQueueFenceValue = 0;
-	UINT64 GetNextComputeQueueFenceValue() {
-		return m_computeQueueFenceValue++;
+	UINT64 m_copyQueueFenceValue = 0;
+	UINT64 GetNextQueueFenceValue(QueueKind queue) {
+		switch (queue) {
+		case QueueKind::Graphics:
+			return m_graphicsQueueFenceValue++;
+		case QueueKind::Compute:
+			return m_computeQueueFenceValue++;
+		case QueueKind::Copy:
+			return m_copyQueueFenceValue++;
+		default:
+			return 0;
+		}
 	}
 
 	std::function<bool()> m_getUseAsyncCompute;
@@ -505,6 +593,17 @@ private:
 			return;
 		}
 
+		auto markOppositeCompletionSignal = [&](int batchIndex) {
+			if (batchIndex < 0) {
+				return;
+			}
+			batches[batchIndex].MarkQueueSignal(BatchSignalPhase::AfterCompletion, oppositeQueue);
+		};
+
+		auto oppositeCompletionFence = [&](int batchIndex) -> UINT64 {
+			return batches[batchIndex].GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, oppositeQueue);
+		};
+
 		// figure out which two numbers we wait on
 		auto [lastTransBatch, lastProdBatch, lastUsageBatch] =
 			GetBatchesToWaitOn(pass, oppTransHist, oppProdHist, oppUsageHist, resourcesTransitionedThisPass);
@@ -513,32 +612,20 @@ private:
 		if (lastTransBatch != -1) {
 			if (static_cast<unsigned int>(lastTransBatch) == currentBatchIndex) {
 				// same batch, signal & immediate wait
-				if (passIsComputeAgainstGraphics) {
-					currentBatch.renderTransitionSignal = true;
-					currentBatch.computeQueueWaitOnRenderQueueBeforeExecution = true;
-					currentBatch.computeQueueWaitOnRenderQueueBeforeExecutionFenceValue = 
-						currentBatch.renderTransitionFenceValue;
-				} else {
-					currentBatch.computeTransitionSignal = true;
-					currentBatch.renderQueueWaitOnComputeQueueBeforeExecution = true;
-					currentBatch.renderQueueWaitOnComputeQueueBeforeExecutionFenceValue = 
-						currentBatch.computeTransitionFenceValue;
-				}
+				currentBatch.MarkQueueSignal(BatchSignalPhase::AfterTransitions, oppositeQueue);
+				currentBatch.AddQueueWait(
+					BatchWaitPhase::BeforeExecution,
+					passQueue,
+					oppositeQueue,
+					currentBatch.GetQueueSignalFenceValue(BatchSignalPhase::AfterTransitions, oppositeQueue));
 			} else {
 				// different batch, signal that batch's completion, then wait before *transition*
-					if (passIsComputeAgainstGraphics) {
-					batches[lastTransBatch].renderCompletionSignal = true;
-					currentBatch.computeQueueWaitOnRenderQueueBeforeTransition = true;
-					currentBatch.computeQueueWaitOnRenderQueueBeforeTransitionFenceValue =
-						(std::max)(currentBatch.computeQueueWaitOnRenderQueueBeforeTransitionFenceValue,
-							batches[lastTransBatch].renderCompletionFenceValue);
-				} else {
-					batches[lastTransBatch].computeCompletionSignal = true;
-					currentBatch.renderQueueWaitOnComputeQueueBeforeTransition = true;
-					currentBatch.renderQueueWaitOnComputeQueueBeforeTransitionFenceValue =
-						(std::max)(currentBatch.renderQueueWaitOnComputeQueueBeforeTransitionFenceValue,
-							batches[lastTransBatch].computeCompletionFenceValue);
-				}
+				markOppositeCompletionSignal(lastTransBatch);
+				currentBatch.AddQueueWait(
+					BatchWaitPhase::BeforeTransitions,
+					passQueue,
+					oppositeQueue,
+					oppositeCompletionFence(lastTransBatch));
 			}
 		}
 
@@ -550,36 +637,22 @@ private:
 		}
 #endif
 		if (lastProdBatch != -1) {
-			if (passIsComputeAgainstGraphics) {
-				batches[lastProdBatch].renderCompletionSignal = true;
-				currentBatch.computeQueueWaitOnRenderQueueBeforeTransition = true;
-				currentBatch.computeQueueWaitOnRenderQueueBeforeTransitionFenceValue =
-					(std::max)(currentBatch.computeQueueWaitOnRenderQueueBeforeTransitionFenceValue,
-						batches[lastProdBatch].renderCompletionFenceValue);
-			} else {
-				batches[lastProdBatch].computeCompletionSignal = true;
-				currentBatch.renderQueueWaitOnComputeQueueBeforeTransition = true;
-				currentBatch.renderQueueWaitOnComputeQueueBeforeTransitionFenceValue =
-					(std::max)(currentBatch.renderQueueWaitOnComputeQueueBeforeTransitionFenceValue,
-						batches[lastProdBatch].computeCompletionFenceValue);
-			}
+			markOppositeCompletionSignal(lastProdBatch);
+			currentBatch.AddQueueWait(
+				BatchWaitPhase::BeforeTransitions,
+				passQueue,
+				oppositeQueue,
+				oppositeCompletionFence(lastProdBatch));
 		}
 
 		// Handle the "usage" wait
 		if (lastUsageBatch != -1) {
-			if (passIsComputeAgainstGraphics) {
-				batches[lastUsageBatch].renderCompletionSignal = true;
-				currentBatch.computeQueueWaitOnRenderQueueBeforeTransition = true;
-				currentBatch.computeQueueWaitOnRenderQueueBeforeTransitionFenceValue =
-					(std::max)(currentBatch.computeQueueWaitOnRenderQueueBeforeTransitionFenceValue,
-						batches[lastUsageBatch].renderCompletionFenceValue);
-			} else {
-				batches[lastUsageBatch].computeCompletionSignal = true;
-				currentBatch.renderQueueWaitOnComputeQueueBeforeTransition = true;
-				currentBatch.renderQueueWaitOnComputeQueueBeforeTransitionFenceValue =
-					(std::max)(currentBatch.renderQueueWaitOnComputeQueueBeforeTransitionFenceValue,
-						batches[lastUsageBatch].computeCompletionFenceValue);
-			}
+			markOppositeCompletionSignal(lastUsageBatch);
+			currentBatch.AddQueueWait(
+				BatchWaitPhase::BeforeTransitions,
+				passQueue,
+				oppositeQueue,
+				oppositeCompletionFence(lastUsageBatch));
 		}
 	}
 

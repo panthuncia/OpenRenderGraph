@@ -1466,21 +1466,21 @@ void rg::alias::RenderGraphAliasingSubsystem::ApplyAliasQueueSynchronization(Ren
 
 				auto& prevBatch = batches[prevOwner.batchIndex];
 				if (prevOwner.usage.usesRender && usage.usesCompute) {
-					prevBatch.renderCompletionSignal = true;
-					batch.computeQueueWaitOnRenderQueueBeforeTransition = true;
-					batch.computeQueueWaitOnRenderQueueBeforeTransitionFenceValue =
-						std::max(
-							batch.computeQueueWaitOnRenderQueueBeforeTransitionFenceValue,
-							prevBatch.renderCompletionFenceValue);
+					prevBatch.MarkQueueSignal(RenderGraph::BatchSignalPhase::AfterCompletion, QueueKind::Graphics);
+					batch.AddQueueWait(
+						RenderGraph::BatchWaitPhase::BeforeTransitions,
+						QueueKind::Compute,
+						QueueKind::Graphics,
+						prevBatch.GetQueueSignalFenceValue(RenderGraph::BatchSignalPhase::AfterCompletion, QueueKind::Graphics));
 				}
 
 				if (prevOwner.usage.usesCompute && usage.usesRender) {
-					prevBatch.computeCompletionSignal = true;
-					batch.renderQueueWaitOnComputeQueueBeforeTransition = true;
-					batch.renderQueueWaitOnComputeQueueBeforeTransitionFenceValue =
-						std::max(
-							batch.renderQueueWaitOnComputeQueueBeforeTransitionFenceValue,
-							prevBatch.computeCompletionFenceValue);
+					prevBatch.MarkQueueSignal(RenderGraph::BatchSignalPhase::AfterCompletion, QueueKind::Compute);
+					batch.AddQueueWait(
+						RenderGraph::BatchWaitPhase::BeforeTransitions,
+						QueueKind::Graphics,
+						QueueKind::Compute,
+						prevBatch.GetQueueSignalFenceValue(RenderGraph::BatchSignalPhase::AfterCompletion, QueueKind::Compute));
 				}
 			}
 
