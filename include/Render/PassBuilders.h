@@ -205,57 +205,6 @@ inline ResourceIdentifierAndRange Subresources(const char* r,
 	return Subresources(ResourceIdentifier{ r }, m, s);
 }
 
-//
-//  expandToRanges(...) is a set of overloads that take one of six
-//  input types and return a std::vector<ResourceAndRange> so that we can
-//  unify all the add*() calls into a single template.
-//
-
-// If we already have a ResourceAndRange, just return it in a vector:
-//inline std::vector<ResourceAndRange>
-//expandToRanges(ResourceAndRange const & rar, RenderGraph* graph)
-//{
-//    if (!rar.resource) return {};
-//    return { rar };
-//}
-//
-//// If we have a list of ResourceAndRange, return a vector copy of it:
-//inline std::vector<ResourceAndRange>
-//expandToRanges(std::initializer_list<ResourceAndRange> list, RenderGraph* graph)
-//{
-//    std::vector<ResourceAndRange> out;
-//    out.reserve(list.size());
-//    for (auto const & r : list) {
-//        if (!r.resource) continue;
-//        out.push_back(r);
-//    }
-//    return out;
-//}
-
-// If we have a shared_ptr<Resource>, wrap it in a ResourceAndRange:
-//template<typename U>
-//inline std::enable_if_t<std::is_base_of_v<Resource, U>,
-//    std::vector<ResourceAndRange>>
-//    expandToRanges(std::shared_ptr<U> const& r, RenderGraph* graph)
-//{
-//    if (!r) return {};
-//    std::shared_ptr<Resource> basePtr = r;
-//    return { ResourceAndRange{ basePtr } };
-//}
-
-// If we have an initializer_list of shared_ptr<Resource>:
-//inline std::vector<ResourceAndRange>
-//expandToRanges(std::initializer_list<std::shared_ptr<Resource>> list, RenderGraph* graph)
-//{
-//    std::vector<ResourceAndRange> out;
-//    out.reserve(list.size());
-//    for (auto const & r : list) {
-//        if (!r) continue;
-//        out.push_back(ResourceAndRange{ r });
-//    }
-//    return out;
-//}
-
 // If we have a ResourceIdentifierAndRange, ask the builder to resolve it into an actual ResourceAndRange:
 std::vector<ResourceHandleAndRange> expandToRanges(ResourceIdentifierAndRange const& rir, RenderGraph* graph);
 
@@ -462,7 +411,7 @@ processResourceArguments(std::string_view name, RenderGraph* graph)
 template<class T>
 inline constexpr bool ResourceLike =
 detail::SharedPtrToResource<T> ||
-detail::StringLike<T> || // <-- key change
+detail::StringLike<T> ||
 std::is_same_v<std::remove_cvref_t<T>, ResourceIdentifier> ||
 std::is_same_v<std::remove_cvref_t<T>, ResourcePtrAndRange> ||
 std::is_same_v<std::remove_cvref_t<T>, ResourceIdentifierAndRange> ||
