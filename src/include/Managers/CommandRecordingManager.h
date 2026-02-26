@@ -7,7 +7,7 @@
 
 struct Signal {
     bool     enable = false;
-    uint64_t value = 0; // if 0, manager will pick next monotonic
+    uint64_t value = 0; // if enable and 0, manager will pick next monotonic
 };
 
 enum class ComputeMode : uint8_t { Async, AliasToGraphics };
