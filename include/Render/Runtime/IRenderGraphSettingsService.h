@@ -12,6 +12,7 @@ public:
     virtual bool GetUseAsyncCompute() const = 0;
     virtual uint8_t GetAutoAliasMode() const = 0;
     virtual uint8_t GetAutoAliasPackingStrategy() const = 0;
+    virtual bool GetAutoAliasEnableLogging() const = 0;
     virtual bool GetAutoAliasLogExclusionReasons() const = 0;
     virtual uint32_t GetAutoAliasPoolRetireIdleFrames() const = 0;
     virtual float GetAutoAliasPoolGrowthHeadroom() const = 0;

@@ -282,7 +282,13 @@ void UploadManager::UploadData(const void* data, size_t size, UploadTarget resou
 	page->tailOffset += size;
 
 	uint8_t* mapped = nullptr;
-	page->buffer->GetAPIResource().Map(reinterpret_cast<void**>(&mapped), 0, size);
+	page->buffer->GetAPIResource().Map(reinterpret_cast<void**>(&mapped), 0, size);	
+#if BUILD_TYPE == BUILD_TYPE_DEBUG
+	if (!mapped) {
+		__debugbreak();
+		return;
+	}
+#endif
 	memcpy(mapped + uploadOffset, data, size);
 	page->buffer->GetAPIResource().Unmap(0, 0);
 

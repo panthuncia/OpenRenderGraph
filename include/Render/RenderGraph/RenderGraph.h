@@ -532,6 +532,7 @@ private:
 	rhi::TimelinePtr m_graphicsQueueFence;
 	rhi::TimelinePtr m_computeQueueFence;
 	rhi::TimelinePtr m_copyQueueFence;
+	rhi::TimelinePtr m_readbackFence;
 
 	std::unique_ptr<CommandRecordingManager> m_pCommandRecordingManager;
 
@@ -748,6 +749,7 @@ private:
 	AutoAliasPackingStrategy autoAliasPackingStrategyLastFrame = AutoAliasPackingStrategy::GreedySweepLine;
 	std::function<AutoAliasMode()> m_getAutoAliasMode;
 	std::function<AutoAliasPackingStrategy()> m_getAutoAliasPackingStrategy;
+	std::function<bool()> m_getAutoAliasEnableLogging;
 	std::function<bool()> m_getAutoAliasLogExclusionReasons;
 	std::function<uint32_t()> m_getAutoAliasPoolRetireIdleFrames;
 	std::function<float()> m_getAutoAliasPoolGrowthHeadroom;

@@ -107,6 +107,7 @@ void rg::alias::RenderGraphAliasingSubsystem::AutoAssignAliasingPools(RenderGrap
 	auto& autoAliasPlannerStats = rg.autoAliasPlannerStats;
 	auto& autoAliasModeLastFrame = rg.autoAliasModeLastFrame;
 	auto& m_getAutoAliasMode = rg.m_getAutoAliasMode;
+	auto& m_getAutoAliasEnableLogging = rg.m_getAutoAliasEnableLogging;
 	auto& m_framePasses = rg.m_framePasses;
 	auto& _registry = rg._registry;
 	auto& resourcesByID = rg.resourcesByID;
@@ -118,6 +119,7 @@ void rg::alias::RenderGraphAliasingSubsystem::AutoAssignAliasingPools(RenderGrap
 	autoAliasPlannerStats = {};
 
 	const AutoAliasMode mode = m_getAutoAliasMode ? m_getAutoAliasMode() : AutoAliasMode::Off;
+	const bool aliasLoggingEnabled = m_getAutoAliasEnableLogging ? m_getAutoAliasEnableLogging() : false;
 	autoAliasModeLastFrame = mode;
 	if (mode == AutoAliasMode::Off) {
 		return;
@@ -363,7 +365,7 @@ void rg::alias::RenderGraphAliasingSubsystem::AutoAssignAliasingPools(RenderGrap
 		return a.reason < b.reason;
 		});
 
-	if (autoAliasPlannerStats.candidatesSeen > 0) {
+	if (aliasLoggingEnabled && autoAliasPlannerStats.candidatesSeen > 0) {
 		spdlog::info(
 			"RG auto alias: mode={} candidates={} manual={} auto={} excluded={} candidateMB={:.2f} autoMB={:.2f}",
 			static_cast<uint32_t>(mode),
@@ -433,6 +435,7 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph
 	auto& m_getAutoAliasPoolGrowthHeadroom = rg.m_getAutoAliasPoolGrowthHeadroom;
 	auto& autoAliasPackingStrategyLastFrame = rg.autoAliasPackingStrategyLastFrame;
 	auto& m_getAutoAliasPackingStrategy = rg.m_getAutoAliasPackingStrategy;
+	auto& m_getAutoAliasEnableLogging = rg.m_getAutoAliasEnableLogging;
 	auto& persistentAliasPools = rg.persistentAliasPools;
 	auto& m_framePasses = rg.m_framePasses;
 	auto& _registry = rg._registry;
@@ -460,6 +463,7 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph
 	const AutoAliasPackingStrategy packingStrategy = m_getAutoAliasPackingStrategy
 		? m_getAutoAliasPackingStrategy()
 		: AutoAliasPackingStrategy::GreedySweepLine;
+	const bool aliasLoggingEnabled = m_getAutoAliasEnableLogging ? m_getAutoAliasEnableLogging() : false;
 	const bool packingStrategyChanged = previousPackingStrategy != packingStrategy;
 
 	for (auto& [poolID, poolState] : persistentAliasPools) {
@@ -686,7 +690,7 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph
 		byPool[c.poolID].push_back(c);
 	}
 
-	if (!byPool.empty()) {
+	if (aliasLoggingEnabled && !byPool.empty()) {
 		size_t totalCandidates = 0;
 		for (const auto& [poolID, poolCandidates] : byPool) {
 			(void)poolID;
@@ -1112,7 +1116,7 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph
 			placements = std::move(plannedPlacements);
 			heapSize = plannedHeapSize;
 			poolAlignment = plannedPoolAlignment;
-			if (searchTruncated) {
+			if (aliasLoggingEnabled && searchTruncated) {
 				spdlog::info(
 					"RG alias beam search truncated: pool={} candidates={} resultingRequiredBytes={}",
 					poolID,
@@ -1181,17 +1185,19 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph
 			poolState.alignment = poolAlignment;
 			poolState.generation++;
 
-			spdlog::info(
-				"RG alias pool {}: pool={} capacity={} required={} alignment={} placements={} generation={}",
-				needsInitialAllocation
-					? "allocated"
-					: (shouldShrinkForStrategyChange ? "resized" : "grew"),
-				poolID,
-				newCapacity,
-				heapSize,
-				poolAlignment,
-				placements.size(),
-				poolState.generation);
+			if (aliasLoggingEnabled) {
+				spdlog::info(
+					"RG alias pool {}: pool={} capacity={} required={} alignment={} placements={} generation={}",
+					needsInitialAllocation
+						? "allocated"
+						: (shouldShrinkForStrategyChange ? "resized" : "grew"),
+					poolID,
+					newCapacity,
+					heapSize,
+					poolAlignment,
+					placements.size(),
+					poolState.generation);
+			}
 		}
 
 		poolState.usedThisFrame = true;
@@ -1253,20 +1259,22 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph
 				.endByte = placement.offset + c.sizeBytes,
 			};
 
-			auto itResName = resourcesByID.find(c.resourceID);
-			const std::string resourceName = (itResName != resourcesByID.end() && itResName->second)
-				? itResName->second->GetName()
-				: std::string("<unknown>");
-			spdlog::info(
-				"RG alias bind: pool={} resourceId={} name='{}' kind={} offset={} size={} firstUse={} lastUse={}",
-				poolID,
-				c.resourceID,
-				resourceName,
-				c.kind == Candidate::Kind::Texture ? "texture" : "buffer",
-				placement.offset,
-				c.sizeBytes,
-				c.firstUse,
-				c.lastUse);
+			if (aliasLoggingEnabled) {
+				auto itResName = resourcesByID.find(c.resourceID);
+				const std::string resourceName = (itResName != resourcesByID.end() && itResName->second)
+					? itResName->second->GetName()
+					: std::string("<unknown>");
+				spdlog::info(
+					"RG alias bind: pool={} resourceId={} name='{}' kind={} offset={} size={} firstUse={} lastUse={}",
+					poolID,
+					c.resourceID,
+					resourceName,
+					c.kind == Candidate::Kind::Texture ? "texture" : "buffer",
+					placement.offset,
+					c.sizeBytes,
+					c.firstUse,
+					c.lastUse);
+			}
 
 			const uint64_t newSignature = BuildAliasPlacementSignatureValue(
 				poolID,
@@ -1372,12 +1380,14 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph
 				DeletionManager::GetInstance().MarkForDelete(std::move(poolState.allocation));
 			}
 
-			spdlog::info(
-				"RG alias pool retired: pool={} idleFrames={} capacity={} generation={}",
-				retiredPoolID,
-				idleFrames,
-				poolState.capacityBytes,
-				poolState.generation);
+			if (aliasLoggingEnabled) {
+				spdlog::info(
+					"RG alias pool retired: pool={} idleFrames={} capacity={} generation={}",
+					retiredPoolID,
+					idleFrames,
+					poolState.capacityBytes,
+					poolState.generation);
+			}
 
 			itPool = persistentAliasPools.erase(itPool);
 		}
@@ -1388,7 +1398,7 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph
 		? (autoAliasPlannerStats.pooledIndependentBytes - autoAliasPlannerStats.pooledActualBytes)
 		: 0;
 
-	if (autoAliasPlannerStats.pooledIndependentBytes > 0) {
+	if (aliasLoggingEnabled && autoAliasPlannerStats.pooledIndependentBytes > 0) {
 		const double independentMB = static_cast<double>(autoAliasPlannerStats.pooledIndependentBytes) / (1024.0 * 1024.0);
 		const double pooledMB = static_cast<double>(autoAliasPlannerStats.pooledActualBytes) / (1024.0 * 1024.0);
 		const double pooledReservedMB = static_cast<double>(pooledReservedBytes) / (1024.0 * 1024.0);

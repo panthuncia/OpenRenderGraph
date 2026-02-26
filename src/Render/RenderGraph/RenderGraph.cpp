@@ -2709,7 +2709,12 @@ void RenderGraph::Setup() {
 	auto result = device.CreateTimeline(m_graphicsQueueFence);
 	result = device.CreateTimeline(m_computeQueueFence);
 	result = device.CreateTimeline(m_copyQueueFence);
+	result = device.CreateTimeline(m_readbackFence);
 	result = device.CreateTimeline(m_frameStartSyncFence);
+
+	if (m_readbackService) {
+		m_readbackService->Initialize(rhi::Timeline(m_readbackFence->GetHandle()));
+	}
 
 	m_getUseAsyncCompute = [this]() {
 		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetUseAsyncCompute() : false;
@@ -2725,6 +2730,9 @@ void RenderGraph::Setup() {
 			? m_renderGraphSettingsService->GetAutoAliasPackingStrategy()
 			: static_cast<uint8_t>(AutoAliasPackingStrategy::GreedySweepLine);
 		return static_cast<AutoAliasPackingStrategy>(strategy);
+	};
+	m_getAutoAliasEnableLogging = [this]() {
+		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetAutoAliasEnableLogging() : false;
 	};
 	m_getAutoAliasLogExclusionReasons = [this]() {
 		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetAutoAliasLogExclusionReasons() : false;

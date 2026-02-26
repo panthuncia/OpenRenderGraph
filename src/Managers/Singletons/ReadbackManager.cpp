@@ -1,6 +1,7 @@
 #include "Managers/Singletons/ReadbackManager.h"
 
 #include <cstring>
+#include <spdlog/spdlog.h>
 
 std::unique_ptr<ReadbackManager> ReadbackManager::instance = nullptr;
 bool ReadbackManager::initialized = false;
@@ -55,6 +56,15 @@ uint64_t ReadbackManager::GetNextReadbackFenceValue() {
 
 void ReadbackManager::ProcessReadbackRequests() {
     std::lock_guard<std::mutex> lock(readbackRequestsMutex);
+
+    if (!m_initialized || !m_readbackFence.IsValid()) {
+        if (!m_warnedUninitializedUse) {
+            spdlog::warn("ReadbackManager::ProcessReadbackRequests called before readback fence initialization; deferring {} pending readback captures.", m_readbackCaptureRequests.size());
+            m_warnedUninitializedUse = true;
+        }
+        return;
+    }
+
     const auto completedValue = m_readbackFence.GetCompletedValue();
 
     std::vector<ReadbackCaptureRequest> remainingCaptures;
