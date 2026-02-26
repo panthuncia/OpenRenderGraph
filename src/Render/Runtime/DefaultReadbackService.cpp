@@ -23,6 +23,7 @@ public:
             out.push_back({
                 .passName = std::move(capture.passName),
                 .resource = std::move(capture.resource),
+                .resourceId = capture.resourceId,
                 .range = capture.range,
                 .callback = std::move(capture.callback)
                 });

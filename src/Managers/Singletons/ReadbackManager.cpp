@@ -13,14 +13,17 @@ void ReadbackManager::RequestReadbackCapture(
     ReadbackCaptureCallback callback)
 {
     std::weak_ptr<Resource> weakResource;
+    uint64_t resourceId = 0;
     if (resource) {
         weakResource = resource->weak_from_this();
+        resourceId = resource->GetGlobalResourceID();
     }
 
     std::scoped_lock lock(m_captureQueueMutex);
     m_queuedCaptures.push_back(ReadbackCaptureInfo{
         passName,
         weakResource,
+        resourceId,
         range,
         std::move(callback)
         });

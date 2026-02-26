@@ -2713,7 +2713,7 @@ void RenderGraph::Setup() {
 	result = device.CreateTimeline(m_frameStartSyncFence);
 
 	if (m_readbackService) {
-		m_readbackService->Initialize(rhi::Timeline(m_readbackFence->GetHandle()));
+		m_readbackService->Initialize(m_readbackFence.Get());
 	}
 
 	m_getUseAsyncCompute = [this]() {
