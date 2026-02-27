@@ -487,6 +487,7 @@ private:
 	std::unordered_map<std::string, std::shared_ptr<ComputePass>> computePassesByName;
 	std::unordered_map<std::string, std::shared_ptr<Resource>> resourcesByName;
 	std::unordered_map<uint64_t, std::shared_ptr<Resource>> resourcesByID;
+	std::unordered_map<uint64_t, std::shared_ptr<Resource>> m_transientFrameResourcesByID;
 	std::unordered_map<uint64_t, uint64_t> resourceBackingGenerationByID;
 	std::unordered_map<uint64_t, uint32_t> resourceIdleFrameCounts;
 	std::unordered_map<uint64_t, uint64_t> compiledResourceGenerationByID;

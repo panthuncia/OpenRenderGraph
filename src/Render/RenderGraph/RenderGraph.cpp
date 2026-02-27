@@ -866,28 +866,12 @@ RenderGraph::~RenderGraph() {
 	DeviceManager::GetInstance().Cleanup();
 }
 
-SymbolicTracker& RenderGraph::GetOrCreateCompileTracker(Resource* resource, uint64_t resourceID) {
+SymbolicTracker& RenderGraph::GetOrCreateCompileTracker(Resource* /*resource*/, uint64_t resourceID) {
 	auto it = compileTrackers.find(resourceID);
 	if (it != compileTrackers.end()) {
 		return it->second;
 	}
-
-	SymbolicTracker seed;
-	if (resource) {
-		bool hasLiveBacking = true;
-		if (auto* texture = dynamic_cast<PixelBuffer*>(resource)) {
-			hasLiveBacking = texture->IsMaterialized();
-		}
-		else if (auto* buffer = dynamic_cast<Buffer*>(resource)) {
-			hasLiveBacking = buffer->IsMaterialized();
-		}
-
-		if (hasLiveBacking) {
-			seed = *resource->GetStateTracker();
-		}
-	}
-
-	auto [insertedIt, _] = compileTrackers.emplace(resourceID, std::move(seed));
+	auto [insertedIt, _] = compileTrackers.emplace(resourceID, SymbolicTracker{});
 	return insertedIt->second;
 }
 
@@ -1115,6 +1099,7 @@ void RenderGraph::ResetForRebuild()
 	// Clear resources
 	resourcesByID.clear();
 	resourcesByName.clear();
+	m_transientFrameResourcesByID.clear();
 	resourceBackingGenerationByID.clear();
 	resourceIdleFrameCounts.clear();
 	compiledResourceGenerationByID.clear();
@@ -1151,6 +1136,7 @@ void RenderGraph::ResetForRebuild()
 void RenderGraph::ResetForFrame() {
 	batches.clear();
 	compiledResourceGenerationByID.clear();
+	m_transientFrameResourcesByID.clear();
 	m_aliasingSubsystem.ResetPerFrameState(*this);
 	compileTrackers.clear();
 	for (auto& producerMap : m_compiledLastProducerBatchByResourceByQueue) {
@@ -2575,15 +2561,15 @@ std::tuple<int, int, int> RenderGraph::GetBatchesToWaitOn(
 }
 
 void RenderGraph::MaterializeUnmaterializedResources(const std::unordered_set<uint64_t>* onlyResourceIDs) {
-	for (auto& [id, resource] : resourcesByID) {
+	auto materializeOne = [&](uint64_t id, Resource* resource) {
 		if (onlyResourceIDs && onlyResourceIDs->find(id) == onlyResourceIDs->end()) {
-			continue;
+			return;
 		}
 		if (!resource) {
-			continue;
+			return;
 		}
 
-		auto texture = std::dynamic_pointer_cast<PixelBuffer>(resource);
+		auto texture = dynamic_cast<PixelBuffer*>(resource);
 		if (texture) {
 			if (!texture->IsMaterialized()) {
 				auto itAlias = aliasMaterializeOptionsByID.find(id);
@@ -2623,7 +2609,7 @@ void RenderGraph::MaterializeUnmaterializedResources(const std::unordered_set<ui
 						// Setup-time eager materialization happens before alias planning.
 						// Defer aliased resources until compile-time placement is available.
 						if (!onlyResourceIDs) {
-							continue;
+							return;
 						}
 					}
 					texture->Materialize();
@@ -2631,12 +2617,12 @@ void RenderGraph::MaterializeUnmaterializedResources(const std::unordered_set<ui
 			}
 
 			resourceBackingGenerationByID[id] = texture->GetBackingGeneration();
-			continue;
+			return;
 		}
 
-		auto buffer = std::dynamic_pointer_cast<Buffer>(resource);
+		auto buffer = dynamic_cast<Buffer*>(resource);
 		if (!buffer) {
-			continue;
+			return;
 		}
 
 		if (!buffer->IsMaterialized()) {
@@ -2675,7 +2661,7 @@ void RenderGraph::MaterializeUnmaterializedResources(const std::unordered_set<ui
 					}
 
 					if (!onlyResourceIDs) {
-						continue;
+						return;
 					}
 				}
 				buffer->Materialize();
@@ -2683,6 +2669,64 @@ void RenderGraph::MaterializeUnmaterializedResources(const std::unordered_set<ui
 		}
 
 		resourceBackingGenerationByID[id] = buffer->GetBackingGeneration();
+	};
+
+	for (auto& [id, resource] : resourcesByID) {
+		materializeOne(id, resource.get());
+	}
+
+	for (auto& [id, resource] : m_transientFrameResourcesByID) {
+		if (resourcesByID.contains(id)) {
+			continue;
+		}
+		materializeOne(id, resource.get());
+	}
+
+	auto materializeFromHandle = [&](const ResourceRegistry::RegistryHandle& handle) {
+		const uint64_t id = handle.GetGlobalResourceID();
+		if (onlyResourceIDs && onlyResourceIDs->find(id) == onlyResourceIDs->end()) {
+			return;
+		}
+
+		Resource* resource = nullptr;
+		if (handle.IsEphemeral()) {
+			resource = handle.GetEphemeralPtr();
+		}
+		else {
+			resource = _registry.Resolve(handle);
+		}
+
+		materializeOne(id, resource);
+	};
+
+	for (const auto& pr : m_framePasses) {
+		if (pr.type == PassType::Compute) {
+			auto const& p = std::get<ComputePassAndResources>(pr.pass);
+			for (auto const& req : p.resources.frameResourceRequirements) {
+				materializeFromHandle(req.resourceHandleAndRange.resource);
+			}
+			for (auto const& t : p.resources.internalTransitions) {
+				materializeFromHandle(t.first.resource);
+			}
+		}
+		else if (pr.type == PassType::Render) {
+			auto const& p = std::get<RenderPassAndResources>(pr.pass);
+			for (auto const& req : p.resources.frameResourceRequirements) {
+				materializeFromHandle(req.resourceHandleAndRange.resource);
+			}
+			for (auto const& t : p.resources.internalTransitions) {
+				materializeFromHandle(t.first.resource);
+			}
+		}
+		else if (pr.type == PassType::Copy) {
+			auto const& p = std::get<CopyPassAndResources>(pr.pass);
+			for (auto const& req : p.resources.frameResourceRequirements) {
+				materializeFromHandle(req.resourceHandleAndRange.resource);
+			}
+			for (auto const& t : p.resources.internalTransitions) {
+				materializeFromHandle(t.first.resource);
+			}
+		}
 	}
 }
 
@@ -2842,11 +2886,19 @@ void RenderGraph::AddResource(std::shared_ptr<Resource> resource, bool transitio
 }
 
 std::shared_ptr<Resource> RenderGraph::GetResourceByName(const std::string& name) {
-	return resourcesByName[name];
+	auto it = resourcesByName.find(name);
+	if (it != resourcesByName.end()) {
+		return it->second;
+	}
+	return nullptr;
 }
 
 std::shared_ptr<Resource> RenderGraph::GetResourceByID(const uint64_t id) {
-	return resourcesByID[id];
+	auto it = resourcesByID.find(id);
+	if (it != resourcesByID.end()) {
+		return it->second;
+	}
+	return nullptr;
 }
 std::shared_ptr<RenderPass> RenderGraph::GetRenderPassByName(const std::string& name) {
 	if (renderPassesByName.find(name) != renderPassesByName.end()) {
@@ -2934,10 +2986,6 @@ namespace {
 			}
 
 			rhi::debug::Scope scope(commandList, rhi::colors::Mint, pr.name.c_str());
-
-			if (!pr.immediateBytecode.empty()) {
-				rg::imm::Replay(pr.immediateBytecode, commandList);
-			}
 
 			if (statisticsService) {
 				statisticsService->BeginQuery(pr.statisticsIndex, context.frameIndex, queue, commandList);
@@ -3560,14 +3608,15 @@ ResourceRegistry::RegistryHandle RenderGraph::RequestResourceHandle(Resource* co
 		throw std::runtime_error("Null resource pointer passed to RequestResourceHandle(Resource*)");
 	}
 
-	auto ensureTrackedInGraph = [&]() {
-		if (resourcesByID.contains(pResource->GetGlobalResourceID())) {
+	auto pinTransientForFrame = [&]() {
+		const uint64_t resourceID = pResource->GetGlobalResourceID();
+		if (resourcesByID.contains(resourceID)) {
 			return;
 		}
 
 		auto shared = pResource->weak_from_this().lock();
 		if (shared) {
-			AddResource(std::move(shared));
+			m_transientFrameResourcesByID[resourceID] = std::move(shared);
 		}
 	};
 
@@ -3575,7 +3624,7 @@ ResourceRegistry::RegistryHandle RenderGraph::RequestResourceHandle(Resource* co
 	auto cached = _registry.GetHandleFor(pResource);
 	if (cached.has_value()) {
 		if (_registry.IsValid(cached.value())) {
-			ensureTrackedInGraph();
+			pinTransientForFrame();
 			return cached.value();
 		}
 
@@ -3587,7 +3636,7 @@ ResourceRegistry::RegistryHandle RenderGraph::RequestResourceHandle(Resource* co
 		// Fall through and remint a fresh handle for this live resource pointer.
 		// This can happen if a resource was replaced but an old reverse-map entry remained.
 		const auto reminted = _registry.RegisterAnonymousWeak(pResource->weak_from_this());
-		ensureTrackedInGraph();
+		pinTransientForFrame();
 		return reminted;
 	}
 
@@ -3597,7 +3646,7 @@ ResourceRegistry::RegistryHandle RenderGraph::RequestResourceHandle(Resource* co
 
 	// Register anonymous resource
 	const auto handle = _registry.RegisterAnonymousWeak(pResource->weak_from_this());
-	ensureTrackedInGraph();
+	pinTransientForFrame();
 
 	return handle;
 }
