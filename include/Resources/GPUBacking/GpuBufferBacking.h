@@ -25,7 +25,7 @@ public:
 		const char* name = nullptr) {
 		auto sp = std::unique_ptr<GpuBufferBacking>(new GpuBufferBacking(accessType, bufferSize, owningResourceID, unorderedAccess, name));
 #if BUILD_TYPE == BUILD_DEBUG
-		sp->m_creation = std::stacktrace::current();
+		//sp->m_creation = std::stacktrace::current();
 #endif
 		return sp;
 	}
@@ -39,7 +39,7 @@ public:
 		const char* name = nullptr) {
 		auto sp = std::unique_ptr<GpuBufferBacking>(new GpuBufferBacking(accessType, bufferSize, owningResourceID, unorderedAccess, name, &placement));
 #if BUILD_TYPE == BUILD_DEBUG
-		sp->m_creation = std::stacktrace::current();
+		//sp->m_creation = std::stacktrace::current();
 #endif
 		return sp;
 	}
