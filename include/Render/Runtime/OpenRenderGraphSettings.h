@@ -13,6 +13,7 @@ struct OpenRenderGraphSettings {
     bool useAsyncCompute = true;
     uint8_t autoAliasMode = 2;
     uint8_t autoAliasPackingStrategy = 0;
+    bool autoAliasEnableLogging = false;
     bool autoAliasLogExclusionReasons = false;
     uint32_t autoAliasPoolRetireIdleFrames = 120u;
     float autoAliasPoolGrowthHeadroom = 1.5f;

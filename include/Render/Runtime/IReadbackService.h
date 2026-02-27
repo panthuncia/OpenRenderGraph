@@ -18,6 +18,7 @@ namespace rg::runtime {
 struct ReadbackCaptureInfo {
     std::string passName;
     std::weak_ptr<Resource> resource;
+    uint64_t resourceId = 0;
     RangeSpec range{};
     ReadbackCaptureCallback callback;
 };

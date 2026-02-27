@@ -1,6 +1,7 @@
 #include "Managers/CommandRecordingManager.h"
 
 #include <cassert>
+#include <algorithm>
 
 thread_local CommandRecordingManager::ThreadState CommandRecordingManager::s_tls{};
 
@@ -15,6 +16,13 @@ CommandRecordingManager::CommandRecordingManager(const Init& init) {
     { init.copyQ,     init.copyF,     init.copyPool,     rhi::QueueKind::Copy };
 
     m_computeMode = init.computeMode;
+
+    for (size_t i = 0; i < static_cast<size_t>(QueueKind::Count); ++i) {
+        auto& bind = m_bind[i];
+        if (bind.valid()) {
+            m_lastSignaledValue[i] = bind.fence->GetCompletedValue();
+        }
+    }
 }
 
 QueueKind CommandRecordingManager::resolve(QueueKind qk) const {
@@ -53,8 +61,9 @@ rhi::CommandList CommandRecordingManager::EnsureOpen(QueueKind requested, uint32
 
 uint64_t CommandRecordingManager::Flush(QueueKind requested, Signal sig) {
     const QueueKind qk = resolve(requested);
+    const size_t qkIndex = static_cast<size_t>(qk);
     auto& bind = m_bind[static_cast<size_t>(qk)];
-    auto& ctx = s_tls.ctxs[static_cast<size_t>(qk)];
+    auto& ctx = s_tls.ctxs[qkIndex];
 
     uint64_t signaled = 0;
 
@@ -65,14 +74,25 @@ uint64_t CommandRecordingManager::Flush(QueueKind requested, Signal sig) {
 			bind.queue->Submit({ &ctx.list.Get(), 1 }, {});
         }
 
-        // Decide on signaling
-        if (sig.enable) {
-            signaled = sig.value;
-            bind.queue->Signal({ bind.fence->GetHandle(), signaled});
+        // Decide on signaling.
+        // Dirty command lists that were submitted must be associated with a fence value
+        // so the pool can recycle them safely.
+        const bool mustSignalForRecycle = ctx.dirty;
+        if (sig.enable || mustSignalForRecycle) {
+            if (sig.enable && sig.value != 0) {
+                signaled = sig.value;
+            }
+            else {
+                signaled = ++m_lastSignaledValue[qkIndex];
+            }
+
+            bind.queue->Signal({ bind.fence->GetHandle(), signaled });
+            m_lastSignaledValue[qkIndex] = std::max(m_lastSignaledValue[qkIndex], signaled);
         }
 
-        // Return the pair to the pool tagged with the fence (0 = immediately reusable)
-        uint64_t recycleFence = sig.enable ? signaled : 0;
+        // Return the pair to the pool tagged with the fence.
+        // If not submitted, 0 means immediately reusable.
+        uint64_t recycleFence = ctx.dirty ? signaled : 0;
 
         // Hand back allocator/list to pool
         CommandListPair back;

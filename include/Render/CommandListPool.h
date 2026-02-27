@@ -31,5 +31,4 @@ private:
 
     std::vector<CommandListPair> m_available;
     std::deque<std::pair<uint64_t, CommandListPair>> m_inFlight;
-	std::vector<CommandListPair> m_inFlightNoFence;
 };

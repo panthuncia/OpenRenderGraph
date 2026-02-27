@@ -3,6 +3,7 @@
 #include <vector>
 #include <resource_states.h>
 #include <span>
+#include <string>
 
 class Resource;
 
@@ -35,6 +36,15 @@ struct Bound {
     bool operator!=(Bound const& o) const noexcept {
         return !(*this == o);
     }
+    std::string ToString() const {
+        switch (type) {
+        case BoundType::Exact: return "== " + std::to_string(value);
+        case BoundType::From:  return ">= " + std::to_string(value);
+        case BoundType::UpTo:  return "<= " + std::to_string(value);
+        case BoundType::All:   return "All";
+        default:               return "InvalidBound";
+        }
+	}
 };
 
 struct RangeSpec {

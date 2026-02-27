@@ -7,7 +7,7 @@
 
 struct Signal {
     bool     enable = false;
-    uint64_t value = 0; // if 0, manager will pick next monotonic
+    uint64_t value = 0; // if enable and 0, manager will pick next monotonic
 };
 
 enum class ComputeMode : uint8_t { Async, AliasToGraphics };
@@ -60,6 +60,9 @@ private:
 
     // One per process; alias compute -> graphics in AliasToGraphics mode dynamically
     std::array<QueueBinding, static_cast<size_t>(QueueKind::Count)> m_bind{};
+
+    // Last value signaled by this manager per logical/effective queue.
+    std::array<uint64_t, static_cast<size_t>(QueueKind::Count)> m_lastSignaledValue{};
 
     // Resolve backing queue for a requested logical QueueKind, given computeMode
     QueueKind resolve(QueueKind qk) const;

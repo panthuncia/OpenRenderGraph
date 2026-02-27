@@ -19,6 +19,10 @@ public:
         return GetOpenRenderGraphSettings().autoAliasPackingStrategy;
     }
 
+    bool GetAutoAliasEnableLogging() const override {
+        return GetOpenRenderGraphSettings().autoAliasEnableLogging;
+    }
+
     bool GetAutoAliasLogExclusionReasons() const override {
         return GetOpenRenderGraphSettings().autoAliasLogExclusionReasons;
     }

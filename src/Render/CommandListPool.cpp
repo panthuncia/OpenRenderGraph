@@ -23,15 +23,10 @@ CommandListPair CommandListPool::Request() {
 
 void CommandListPool::Recycle(CommandListPair&& pair, uint64_t fenceValue) {
     if (fenceValue == 0) {
-        m_inFlightNoFence.emplace_back(std::move(pair));
+        pair.allocator->Recycle();
+        m_available.emplace_back(std::move(pair));
     }
     else {
-        if (!m_inFlightNoFence.empty()) {
-            for (auto& p : m_inFlightNoFence) {
-                m_inFlight.emplace_back(fenceValue, std::move(p));
-            }
-            m_inFlightNoFence.clear();
-		}
         m_inFlight.emplace_back(fenceValue, std::move(pair));
     }
 }

@@ -38,6 +38,12 @@ BuildBatchLayouts(const std::vector<RenderGraph::PassBatch>& batches, const RGIn
     double cursor = 0.0;
     for (int i = 0; i < static_cast<int>(batches.size()); ++i) {
         const auto& b = batches[i];
+        bool hasPostTransitions = false;
+        for (size_t queueIndex = 0; queueIndex < static_cast<size_t>(QueueKind::Count); ++queueIndex) {
+            const auto queue = static_cast<QueueKind>(queueIndex);
+            hasPostTransitions = hasPostTransitions ||
+                b.HasTransitions(queue, RenderGraph::BatchTransitionPhase::AfterPasses);
+        }
         BatchLayout bl;
         bl.baseX = cursor;
 
@@ -47,7 +53,7 @@ BuildBatchLayouts(const std::vector<RenderGraph::PassBatch>& batches, const RGIn
         bl.p0 = bl.t1 + g;
         bl.p1 = bl.p0 + wP;
 
-        bl.hasEnd = !b.batchEndTransitions.empty();
+        bl.hasEnd = hasPostTransitions;
         if (bl.hasEnd) {
             bl.e0 = bl.p1 + g;
             bl.e1 = bl.e0 + wE;
@@ -64,7 +70,7 @@ BuildBatchLayouts(const std::vector<RenderGraph::PassBatch>& batches, const RGIn
 }
 
 
-enum class SignalPhase : uint8_t { AfterTransitions, AfterPasses, AfterBatchEndTransitions };
+enum class SignalPhase : uint8_t { AfterTransitions, AfterPasses, AfterPostTransitions };
 
 struct SignalSite {
     int        batchIndex = -1;
@@ -86,25 +92,21 @@ static SignalIndex BuildSignalIndex(const std::vector<RenderGraph::PassBatch>& b
     for (int i = 0; i < static_cast<int>(batches.size()); ++i) {
         const auto& b = batches[i];
 
-        if (b.renderTransitionSignal) {
-            idx[{QueueKind::Graphics, b.renderTransitionFenceValue}] =
-            { i, QueueKind::Graphics, SignalPhase::AfterTransitions };
-        }
-        if (b.renderCompletionSignal) {
-            auto phase = b.batchEndTransitions.empty()
-                ? SignalPhase::AfterPasses
-                : SignalPhase::AfterBatchEndTransitions;
-            idx[{QueueKind::Graphics, b.renderCompletionFenceValue}] =
-            { i, QueueKind::Graphics, phase };
-        }
+        for (size_t queueIndex = 0; queueIndex < static_cast<size_t>(QueueKind::Count); ++queueIndex) {
+            const auto queue = static_cast<QueueKind>(queueIndex);
 
-        if (b.computeTransitionSignal) {
-            idx[{QueueKind::Compute, b.computeTransitionFenceValue}] =
-            { i, QueueKind::Compute, SignalPhase::AfterTransitions };
-        }
-        if (b.computeCompletionSignal) {
-            idx[{QueueKind::Compute, b.computeCompletionFenceValue}] =
-            { i, QueueKind::Compute, SignalPhase::AfterPasses };
+            if (b.HasQueueSignal(RenderGraph::BatchSignalPhase::AfterTransitions, queue)) {
+                idx[{queue, b.GetQueueSignalFenceValue(RenderGraph::BatchSignalPhase::AfterTransitions, queue)}] =
+                { i, queue, SignalPhase::AfterTransitions };
+            }
+
+            if (b.HasQueueSignal(RenderGraph::BatchSignalPhase::AfterCompletion, queue)) {
+                const auto phase = b.HasTransitions(queue, RenderGraph::BatchTransitionPhase::AfterPasses)
+                    ? SignalPhase::AfterPostTransitions
+                    : SignalPhase::AfterPasses;
+                idx[{queue, b.GetQueueSignalFenceValue(RenderGraph::BatchSignalPhase::AfterCompletion, queue)}] =
+                { i, queue, phase };
+            }
         }
     }
     return idx;
@@ -145,9 +147,13 @@ static void CollectResourceIds(const std::vector<RenderGraph::PassBatch>& batche
                 upsertNamedResource(t.pResource);
             }
             };
-        scan(b.renderTransitions);
-        scan(b.computeTransitions);
-        scan(b.batchEndTransitions);
+        for (size_t phaseIndex = 0; phaseIndex < static_cast<size_t>(RenderGraph::BatchTransitionPhase::Count); ++phaseIndex) {
+            const auto phase = static_cast<RenderGraph::BatchTransitionPhase>(phaseIndex);
+            for (size_t queueIndex = 0; queueIndex < static_cast<size_t>(QueueKind::Count); ++queueIndex) {
+                const auto queue = static_cast<QueueKind>(queueIndex);
+                scan(b.Transitions(queue, phase));
+            }
+        }
 
         // Also add anything the batch knows about:
         for (auto id : b.allResources) outIdToName.emplace(id, std::string{});
@@ -181,11 +187,22 @@ static void CollectResourceIds(const std::vector<RenderGraph::PassBatch>& batche
 }
 
 static std::string GetBatchAnchorPassName(const RenderGraph::PassBatch& batch) {
-    if (!batch.renderPasses.empty()) {
-        return batch.renderPasses.back().name;
+    auto queueAnchorPassName = [&](QueueKind queue) -> std::string {
+        const auto& queuedPasses = batch.Passes(queue);
+        if (queuedPasses.empty()) {
+            return {};
+        }
+        return std::visit([](const auto& pass) { return pass.name; }, queuedPasses.back());
+    };
+
+    if (auto name = queueAnchorPassName(QueueKind::Graphics); !name.empty()) {
+        return name;
     }
-    if (!batch.computePasses.empty()) {
-        return batch.computePasses.back().name;
+    if (auto name = queueAnchorPassName(QueueKind::Compute); !name.empty()) {
+        return name;
+    }
+    if (auto name = queueAnchorPassName(QueueKind::Copy); !name.empty()) {
+        return name;
     }
     return {};
 }
@@ -204,9 +221,13 @@ static void CollectBatchResourceIds(const RenderGraph::PassBatch& batch, std::un
             out.insert(t.pResource->GetGlobalResourceID());
         }
     };
-    scan(batch.renderTransitions);
-    scan(batch.computeTransitions);
-    scan(batch.batchEndTransitions);
+    for (size_t phaseIndex = 0; phaseIndex < static_cast<size_t>(RenderGraph::BatchTransitionPhase::Count); ++phaseIndex) {
+        const auto phase = static_cast<RenderGraph::BatchTransitionPhase>(phaseIndex);
+        for (size_t queueIndex = 0; queueIndex < static_cast<size_t>(QueueKind::Count); ++queueIndex) {
+            const auto queue = static_cast<QueueKind>(queueIndex);
+            scan(batch.Transitions(queue, phase));
+        }
+    }
 }
 
 // Colors
@@ -422,9 +443,21 @@ namespace RGInspector {
             // Pass selector (used for memory capture insertion point)
             {
                 std::vector<std::string> passNames;
-                passNames.reserve(batches[s_selectedBatch].computePasses.size() + batches[s_selectedBatch].renderPasses.size());
-                for (auto const& p : batches[s_selectedBatch].computePasses) passNames.push_back(p.name);
-                for (auto const& p : batches[s_selectedBatch].renderPasses)  passNames.push_back(p.name);
+                size_t totalPassCount = 0;
+                for (size_t queueIndex = 0; queueIndex < static_cast<size_t>(QueueKind::Count); ++queueIndex) {
+                    totalPassCount += batches[s_selectedBatch].Passes(static_cast<QueueKind>(queueIndex)).size();
+                }
+                passNames.reserve(totalPassCount);
+
+                auto appendPassNames = [&](QueueKind queue) {
+                    for (auto const& queuedPass : batches[s_selectedBatch].Passes(queue)) {
+                        passNames.push_back(std::visit([](const auto& pass) { return pass.name; }, queuedPass));
+                    }
+                };
+
+                appendPassNames(QueueKind::Compute);
+                appendPassNames(QueueKind::Graphics);
+                appendPassNames(QueueKind::Copy);
 
                 const std::string anchor = GetBatchAnchorPassName(batches[s_selectedBatch]);
                 auto findIndex = [&](const std::string& name) -> int {
@@ -629,7 +662,7 @@ namespace RGInspector {
                 }
                 };
 
-            auto draw_passes = [&](auto const& passesVec, QueueKind qk, int bi, bool isCompute) {
+            auto draw_passes = [&](const std::vector<RenderGraph::PassBatch::QueuedPass>& passesVec, QueueKind qk, int bi) {
                 if (passesVec.empty()) {
                     return;
                 }
@@ -641,8 +674,15 @@ namespace RGInspector {
                 // Does any pass use the selected resource?
                 bool touchesSelected = false;
                 if (s_selectedRes != 0 && passUses) {
-                    for (auto const& pr : passesVec) {
-                        if (passUses(static_cast<const void*>(&pr), s_selectedRes, isCompute)) {
+                    for (auto const& queuedPass : passesVec) {
+                        const bool usesSelected = std::visit(
+                            [&](const auto& pass) {
+                                using TPass = std::decay_t<decltype(pass)>;
+                                constexpr bool passIsCompute = std::is_same_v<TPass, RenderGraph::ComputePassAndResources>;
+                                return passUses(static_cast<const void*>(&pass), s_selectedRes, passIsCompute);
+                            },
+                            queuedPass);
+                        if (usesSelected) {
                             touchesSelected = true;
                             break;
                         }
@@ -670,8 +710,12 @@ namespace RGInspector {
                 if (IsMouseOver(minP, maxP)) {
                     ImGui::BeginTooltip();
                     ImGui::Text("%s Passes (%d)", qk == QueueKind::Graphics ? "Graphics" : (qk == QueueKind::Compute ? "Compute" : "Copy"), static_cast<int>(passesVec.size()));
-                    for (auto const& pr : passesVec) {
-                        ImGui::BulletText("%s", pr.name.c_str());
+                    for (auto const& queuedPass : passesVec) {
+                        std::visit(
+                            [&](const auto& pass) {
+                                ImGui::BulletText("%s", pass.name.c_str());
+                            },
+                            queuedPass);
                     }
                     ImGui::EndTooltip();
                 }
@@ -682,6 +726,12 @@ namespace RGInspector {
 
                 const auto& b = batches[bi];
                 const auto& L = layouts[bi];
+                const auto& copyPreTransitions = b.Transitions(QueueKind::Copy, RenderGraph::BatchTransitionPhase::BeforePasses);
+                const auto& copyPostTransitions = b.Transitions(QueueKind::Copy, RenderGraph::BatchTransitionPhase::AfterPasses);
+                const auto& computePreTransitions = b.Transitions(QueueKind::Compute, RenderGraph::BatchTransitionPhase::BeforePasses);
+                const auto& computePostTransitions = b.Transitions(QueueKind::Compute, RenderGraph::BatchTransitionPhase::AfterPasses);
+                const auto& graphicsPreTransitions = b.Transitions(QueueKind::Graphics, RenderGraph::BatchTransitionPhase::BeforePasses);
+                const auto& graphicsPostTransitions = b.Transitions(QueueKind::Graphics, RenderGraph::BatchTransitionPhase::AfterPasses);
 
                 // Batch hitbox for selection (click anywhere in the batch slot)
                 {
@@ -708,21 +758,25 @@ namespace RGInspector {
                     }
                 }
 
+                // Copy lane
+                draw_transitions(copyPreTransitions, QueueKind::Copy, bi, L.t0, L.t1);
+                draw_passes(b.Passes(QueueKind::Copy), QueueKind::Copy, bi);
+
                 // Compute lane
-                draw_transitions(b.computeTransitions, QueueKind::Compute, bi, L.t0, L.t1);
-                draw_passes(b.computePasses, QueueKind::Compute, bi, /*isCompute*/true);
+                draw_transitions(computePreTransitions, QueueKind::Compute, bi, L.t0, L.t1);
+                draw_passes(b.Passes(QueueKind::Compute), QueueKind::Compute, bi);
 
                 // Graphics lane
-                draw_transitions(b.renderTransitions, QueueKind::Graphics, bi, L.t0, L.t1);
-                draw_passes(b.renderPasses, QueueKind::Graphics, bi, /*isCompute*/false);
+                draw_transitions(graphicsPreTransitions, QueueKind::Graphics, bi, L.t0, L.t1);
+                draw_passes(b.Passes(QueueKind::Graphics), QueueKind::Graphics, bi);
 
                 if (L.hasEnd) {
-                    draw_transitions(b.batchEndTransitions, QueueKind::Graphics, bi, L.e0, L.e1);
+                    draw_transitions(copyPostTransitions, QueueKind::Copy, bi, L.e0, L.e1);
+                    draw_transitions(computePostTransitions, QueueKind::Compute, bi, L.e0, L.e1);
+                    draw_transitions(graphicsPostTransitions, QueueKind::Graphics, bi, L.e0, L.e1);
                     //ImVec2 tp = ImPlot::PlotToPixels(ImPlotPoint((L.e0 + L.e1) * 0.5, LaneY(QueueKind::Graphics, H, S) + 0.08f * H));
                     //dl->AddText(tp, IM_COL32_BLACK, "End Transitions");
                 }
-
-                // TODO: Copy lane
 
                 // Cross-queue waits/signals (we draw at the left edge of the "execution" in each lane)
                 auto laneYG = LaneY(QueueKind::Graphics, H, S) + H * 0.5f;
@@ -742,7 +796,7 @@ namespace RGInspector {
                     switch (s.phase) {
                     case SignalPhase::AfterTransitions:         return SL.t1;
                     case SignalPhase::AfterPasses:              return SL.p1;
-                    case SignalPhase::AfterBatchEndTransitions: return SL.e1; // only valid if hasEnd=true
+                    case SignalPhase::AfterPostTransitions: return SL.e1; // only valid if hasEnd=true
                     default:                                    return SL.p1;
                     }
                     };
@@ -753,61 +807,41 @@ namespace RGInspector {
                 auto waitX_Transitions = [&](int bi)->double { return layouts[bi].t0; };
                 auto waitX_Passes = [&](int bi)->double { return layouts[bi].p0; };
 
-                // Compute waits on Graphics BEFORE TRANSITIONS
-                if (b.computeQueueWaitOnRenderQueueBeforeTransition) {
-                    uint64_t fv = b.computeQueueWaitOnRenderQueueBeforeTransitionFenceValue;
-                    auto it = sigIdx.find({ QueueKind::Graphics, fv });
-                    if (it != sigIdx.end()) {
-                        const auto& src = it->second;
-                        DrawArrowBetweenLanes(dl,
-                            static_cast<float>(siteToX(src)), static_cast<float>(yG),
-                            static_cast<float>(waitX_Transitions(bi)), static_cast<float>(yC),
-                            ColArrowWait(), labelFence(true, fv).c_str());
-                    }
-                }
+                for (size_t dstIndex = 0; dstIndex < static_cast<size_t>(QueueKind::Count); ++dstIndex) {
+                    const auto dstQueue = static_cast<QueueKind>(dstIndex);
+                    for (size_t srcIndex = 0; srcIndex < static_cast<size_t>(QueueKind::Count); ++srcIndex) {
+                        const auto srcQueue = static_cast<QueueKind>(srcIndex);
+                        if (dstQueue == srcQueue) {
+                            continue;
+                        }
 
-                // Compute waits on Graphics BEFORE EXECUTION
-                if (b.computeQueueWaitOnRenderQueueBeforeExecution) {
-                    uint64_t fv = b.computeQueueWaitOnRenderQueueBeforeExecutionFenceValue;
-                    auto it = sigIdx.find({ QueueKind::Graphics, fv });
-                    if (it != sigIdx.end()) {
-                        const auto& src = it->second;
-                        DrawArrowBetweenLanes(dl,
-                            static_cast<float>(siteToX(src)), 
-                            static_cast<float>(yG),
-                            static_cast<float>(waitX_Passes(bi)), 
-                            static_cast<float>(yC),
-                            ColArrowWait(), 
-                            labelFence(true, fv).c_str());
-                    }
-                }
+                        for (size_t phaseIndex = 0; phaseIndex < static_cast<size_t>(RenderGraph::BatchWaitPhase::Count); ++phaseIndex) {
+                            const auto phase = static_cast<RenderGraph::BatchWaitPhase>(phaseIndex);
+                            if (!b.HasQueueWait(phase, dstQueue, srcQueue)) {
+                                continue;
+                            }
 
-                // Graphics waits on Compute BEFORE TRANSITIONS
-                if (b.renderQueueWaitOnComputeQueueBeforeTransition) {
-                    uint64_t fv = b.renderQueueWaitOnComputeQueueBeforeTransitionFenceValue;
-                    auto it = sigIdx.find({ QueueKind::Compute, fv });
-                    if (it != sigIdx.end()) {
-                        const auto& src = it->second;
-                        DrawArrowBetweenLanes(dl,
-                            static_cast<float>(siteToX(src)), 
-                            static_cast<float>(yC),
-                            static_cast<float>(waitX_Transitions(bi)), 
-                            static_cast<float>(yG),
-                            ColArrowWait(), labelFence(true, fv).c_str());
-                    }
-                }
+                            const uint64_t fenceValue = b.GetQueueWaitFenceValue(phase, dstQueue, srcQueue);
+                            auto signalIt = sigIdx.find({ srcQueue, fenceValue });
+                            if (signalIt == sigIdx.end()) {
+                                continue;
+                            }
 
-                // Graphics waits on Compute BEFORE EXECUTION
-                if (b.renderQueueWaitOnComputeQueueBeforeExecution) {
-                    uint64_t fv = b.renderQueueWaitOnComputeQueueBeforeExecutionFenceValue;
-                    auto it = sigIdx.find({ QueueKind::Compute, fv });
-                    if (it != sigIdx.end()) {
-                        const auto& src = it->second;
-                        DrawArrowBetweenLanes(dl,
-                            static_cast<float>(siteToX(src)), static_cast<float>(yC),
-                            static_cast<float>(waitX_Passes(bi)), static_cast<float>(yG),
-                            ColArrowWait(),
-                            labelFence(true, fv).c_str());
+                            const auto& signalSite = signalIt->second;
+                            const double waitX = (phase == RenderGraph::BatchWaitPhase::BeforeTransitions)
+                                ? waitX_Transitions(bi)
+                                : waitX_Passes(bi);
+                            const auto label = labelFence(true, fenceValue);
+
+                            DrawArrowBetweenLanes(
+                                dl,
+                                static_cast<float>(siteToX(signalSite)),
+                                laneCenterY(srcQueue),
+                                static_cast<float>(waitX),
+                                laneCenterY(dstQueue),
+                                ColArrowWait(),
+                                label.c_str());
+                        }
                     }
                 }
             }

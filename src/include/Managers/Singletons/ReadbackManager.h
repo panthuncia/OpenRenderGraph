@@ -13,6 +13,7 @@ class Resource;
 struct ReadbackCaptureInfo {
 	std::string passName;
 	std::weak_ptr<Resource> resource;
+	uint64_t resourceId = 0;
 	RangeSpec range{};
 	ReadbackCaptureCallback callback;
 };
@@ -27,6 +28,8 @@ public:
 
 	void Initialize(rhi::Timeline readbackFence) {
 		m_readbackFence = readbackFence;
+		m_initialized = m_readbackFence.IsValid();
+		m_warnedUninitializedUse = false;
 	}
 
 	void RequestReadbackCapture(
@@ -48,12 +51,17 @@ public:
 	void Cleanup() {
 		m_queuedCaptures.clear();
 		m_readbackCaptureRequests.clear();
+		m_readbackFence.Reset();
+		m_initialized = false;
+		m_warnedUninitializedUse = false;
 	}
 
 private:
 	ReadbackManager() = default;
 
 	rhi::Timeline m_readbackFence;
+	bool m_initialized = false;
+	bool m_warnedUninitializedUse = false;
 	std::mutex readbackRequestsMutex;
 	std::vector<ReadbackCaptureRequest> m_readbackCaptureRequests;
 
