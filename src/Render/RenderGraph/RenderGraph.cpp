@@ -866,12 +866,28 @@ RenderGraph::~RenderGraph() {
 	DeviceManager::GetInstance().Cleanup();
 }
 
-SymbolicTracker& RenderGraph::GetOrCreateCompileTracker(Resource* /*resource*/, uint64_t resourceID) {
+SymbolicTracker& RenderGraph::GetOrCreateCompileTracker(Resource* resource, uint64_t resourceID) {
 	auto it = compileTrackers.find(resourceID);
 	if (it != compileTrackers.end()) {
 		return it->second;
 	}
-	auto [insertedIt, _] = compileTrackers.emplace(resourceID, SymbolicTracker{});
+
+	SymbolicTracker seed{};
+	if (resource) {
+		bool hasLiveBacking = true;
+		if (auto* texture = dynamic_cast<PixelBuffer*>(resource)) {
+			hasLiveBacking = texture->IsMaterialized();
+		}
+		else if (auto* buffer = dynamic_cast<Buffer*>(resource)) {
+			hasLiveBacking = buffer->IsMaterialized();
+		}
+
+		if (hasLiveBacking) {
+			seed = *resource->GetStateTracker();
+		}
+	}
+
+	auto [insertedIt, _] = compileTrackers.emplace(resourceID, std::move(seed));
 	return insertedIt->second;
 }
 
