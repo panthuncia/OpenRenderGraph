@@ -3644,10 +3644,10 @@ ResourceRegistry::RegistryHandle RenderGraph::RequestResourceHandle(Resource* co
 			return cached.value();
 		}
 
-		spdlog::warn(
-			"Stale cached registry handle for resource '{}' (id={}) detected; reminting anonymous handle.",
-			pResource ? pResource->GetName() : std::string("<null>"),
-			pResource ? pResource->GetGlobalResourceID() : 0ull);
+		//spdlog::warn(
+		//	"Stale cached registry handle for resource '{}' (id={}) detected; reminting anonymous handle.",
+		//	pResource ? pResource->GetName() : std::string("<null>"),
+		//	pResource ? pResource->GetGlobalResourceID() : 0ull);
 
 		// Fall through and remint a fresh handle for this live resource pointer.
 		// This can happen if a resource was replaced but an old reverse-map entry remained.
