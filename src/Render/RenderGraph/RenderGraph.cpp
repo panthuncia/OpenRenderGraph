@@ -298,6 +298,7 @@ void RenderGraph::CommitPassToBatch(
 	if (pr.type == PassType::Compute) {
 		auto& pass = std::get<ComputePassAndResources>(pr.pass);
 
+		std::unordered_set<uint64_t> fallbackResourceIDs;
 		rg.ProcessResourceRequirements(
 			passQueue,
 			pass.resources.frameResourceRequirements,
@@ -305,7 +306,38 @@ void RenderGraph::CommitPassToBatch(
 			batchOfLastQueueTransition[QueueIndex(passQueue)],
 			currentBatchIndex,
 			currentBatch,
-			resourcesTransitionedThisPass);
+			resourcesTransitionedThisPass,
+			fallbackResourceIDs);
+
+		// For fallback transitions (delegated to graphics queue in this batch's
+		// BeforePasses), update the graphics transition tracking and add waits so the
+		// graphics queue doesn't start transitioning before prior producers finish.
+		if (!fallbackResourceIDs.empty()) {
+			for (auto& resID : fallbackResourceIDs) {
+				batchOfLastQueueTransition[QueueIndex(QueueKind::Graphics)][resID] = currentBatchIndex;
+			}
+			for (size_t qi = 0; qi < static_cast<size_t>(QueueKind::Count); ++qi) {
+				auto srcQueue = static_cast<QueueKind>(qi);
+				if (srcQueue == QueueKind::Graphics) continue;
+				int latestBatch = -1;
+				for (auto& resID : fallbackResourceIDs) {
+					auto itT = batchOfLastQueueTransition[qi].find(resID);
+					if (itT != batchOfLastQueueTransition[qi].end())
+						latestBatch = std::max(latestBatch, (int)itT->second);
+					auto itU = batchOfLastQueueUsage[qi].find(resID);
+					if (itU != batchOfLastQueueUsage[qi].end())
+						latestBatch = std::max(latestBatch, (int)itU->second);
+				}
+				if (latestBatch >= 0 && static_cast<unsigned int>(latestBatch) != currentBatchIndex) {
+					rg.batches[latestBatch].MarkQueueSignal(BatchSignalPhase::AfterCompletion, srcQueue);
+					currentBatch.AddQueueWait(
+						BatchWaitPhase::BeforeTransitions,
+						QueueKind::Graphics,
+						srcQueue,
+						rg.batches[latestBatch].GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, srcQueue));
+				}
+			}
+		}
 
 		currentBatch.Passes(passQueue).emplace_back(pass);
 
@@ -349,6 +381,7 @@ void RenderGraph::CommitPassToBatch(
 	else if (pr.type == PassType::Render) {
 		auto& pass = std::get<RenderPassAndResources>(pr.pass);
 
+		std::unordered_set<uint64_t> fallbackResourceIDs;
 		rg.ProcessResourceRequirements(
 			passQueue,
 			pass.resources.frameResourceRequirements,
@@ -356,7 +389,37 @@ void RenderGraph::CommitPassToBatch(
 			batchOfLastQueueTransition[QueueIndex(passQueue)],
 			currentBatchIndex,
 			currentBatch,
-			resourcesTransitionedThisPass);
+			resourcesTransitionedThisPass,
+			fallbackResourceIDs);
+
+		// Render passes normally run on the graphics queue, so fallbacks should
+		// be rare here, but handle them for correctness with Compute render passes.
+		if (!fallbackResourceIDs.empty()) {
+			for (auto& resID : fallbackResourceIDs) {
+				batchOfLastQueueTransition[QueueIndex(QueueKind::Graphics)][resID] = currentBatchIndex;
+			}
+			for (size_t qi = 0; qi < static_cast<size_t>(QueueKind::Count); ++qi) {
+				auto srcQueue = static_cast<QueueKind>(qi);
+				if (srcQueue == QueueKind::Graphics) continue;
+				int latestBatch = -1;
+				for (auto& resID : fallbackResourceIDs) {
+					auto itT = batchOfLastQueueTransition[qi].find(resID);
+					if (itT != batchOfLastQueueTransition[qi].end())
+						latestBatch = std::max(latestBatch, (int)itT->second);
+					auto itU = batchOfLastQueueUsage[qi].find(resID);
+					if (itU != batchOfLastQueueUsage[qi].end())
+						latestBatch = std::max(latestBatch, (int)itU->second);
+				}
+				if (latestBatch >= 0 && static_cast<unsigned int>(latestBatch) != currentBatchIndex) {
+					rg.batches[latestBatch].MarkQueueSignal(BatchSignalPhase::AfterCompletion, srcQueue);
+					currentBatch.AddQueueWait(
+						BatchWaitPhase::BeforeTransitions,
+						QueueKind::Graphics,
+						srcQueue,
+						rg.batches[latestBatch].GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, srcQueue));
+				}
+			}
+		}
 
 		currentBatch.Passes(passQueue).emplace_back(pass);
 
@@ -398,6 +461,7 @@ void RenderGraph::CommitPassToBatch(
 	else if (pr.type == PassType::Copy) {
 		auto& pass = std::get<CopyPassAndResources>(pr.pass);
 
+		std::unordered_set<uint64_t> fallbackResourceIDs;
 		rg.ProcessResourceRequirements(
 			passQueue,
 			pass.resources.frameResourceRequirements,
@@ -405,7 +469,38 @@ void RenderGraph::CommitPassToBatch(
 			batchOfLastQueueTransition[QueueIndex(passQueue)],
 			currentBatchIndex,
 			currentBatch,
-			resourcesTransitionedThisPass);
+			resourcesTransitionedThisPass,
+			fallbackResourceIDs);
+
+		// For fallback transitions (delegated to graphics queue in this batch's
+		// BeforePasses), update the graphics transition tracking and add waits so the
+		// graphics queue doesn't start transitioning before prior producers finish.
+		if (!fallbackResourceIDs.empty()) {
+			for (auto& resID : fallbackResourceIDs) {
+				batchOfLastQueueTransition[QueueIndex(QueueKind::Graphics)][resID] = currentBatchIndex;
+			}
+			for (size_t qi = 0; qi < static_cast<size_t>(QueueKind::Count); ++qi) {
+				auto srcQueue = static_cast<QueueKind>(qi);
+				if (srcQueue == QueueKind::Graphics) continue;
+				int latestBatch = -1;
+				for (auto& resID : fallbackResourceIDs) {
+					auto itT = batchOfLastQueueTransition[qi].find(resID);
+					if (itT != batchOfLastQueueTransition[qi].end())
+						latestBatch = std::max(latestBatch, (int)itT->second);
+					auto itU = batchOfLastQueueUsage[qi].find(resID);
+					if (itU != batchOfLastQueueUsage[qi].end())
+						latestBatch = std::max(latestBatch, (int)itU->second);
+				}
+				if (latestBatch >= 0 && static_cast<unsigned int>(latestBatch) != currentBatchIndex) {
+					rg.batches[latestBatch].MarkQueueSignal(BatchSignalPhase::AfterCompletion, srcQueue);
+					currentBatch.AddQueueWait(
+						BatchWaitPhase::BeforeTransitions,
+						QueueKind::Graphics,
+						srcQueue,
+						rg.batches[latestBatch].GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, srcQueue));
+				}
+			}
+		}
 
 		currentBatch.Passes(passQueue).emplace_back(pass);
 
@@ -663,7 +758,8 @@ void RenderGraph::AddTransition(
 	PassBatch& currentBatch,
 	QueueKind passQueue,
 	const ResourceRequirement& r,
-	std::unordered_set<uint64_t>& outTransitionedResourceIDs)
+	std::unordered_set<uint64_t>& outTransitionedResourceIDs,
+	std::unordered_set<uint64_t>& outFallbackResourceIDs)
 {
 
 	auto& resource = r.resourceHandleAndRange.resource;
@@ -729,13 +825,15 @@ void RenderGraph::AddTransition(
 		}
 	}
 	if (passQueue != QueueKind::Graphics && needsGraphicsQueueForTransitions) {
+		// The consuming pass's queue can't support these transitions, so delegate
+		// them to the graphics queue within the *current* batch's BeforePasses phase.
+		// CommitPassToBatch will set up:
+		//   1. BeforeTransitions waits on Graphics for any prior non-graphics producers
+		//   2. AfterTransitions signal on Graphics so the consuming queue can wait
 		for (auto& transition : transitions) {
-			// Resource groups will pass through their child ptrs in the transition
-			const auto id = transition.pResource ? transition.pResource->GetGlobalResourceID() : resource.GetGlobalResourceID();
-			unsigned int gfxBatch = batchOfLastGraphicsQueueUsage[id];
-			batchOfLastGraphicsQueueUsage[id] = gfxBatch; // Can this cause transition overlaps?
-			batches[gfxBatch].Transitions(QueueKind::Graphics, BatchTransitionPhase::AfterPasses).push_back(transition);
+			currentBatch.Transitions(QueueKind::Graphics, BatchTransitionPhase::BeforePasses).push_back(transition);
 		}
+		outFallbackResourceIDs.insert(resource.GetGlobalResourceID());
 	}
 	else {
 		for (auto& transition : transitions) {
@@ -750,7 +848,8 @@ void RenderGraph::ProcessResourceRequirements(
 	std::unordered_map<uint64_t, unsigned int>& batchOfLastGraphicsQueueUsage,
 	std::unordered_map<uint64_t, unsigned int>& producerHistory,
 	unsigned int batchIndex,
-	PassBatch& currentBatch, std::unordered_set<uint64_t>& outTransitionedResourceIDs) {
+	PassBatch& currentBatch, std::unordered_set<uint64_t>& outTransitionedResourceIDs,
+	std::unordered_set<uint64_t>& outFallbackResourceIDs) {
 
 	for (auto& resourceRequirement : resourceRequirements) {
 
@@ -761,7 +860,7 @@ void RenderGraph::ProcessResourceRequirements(
 
 		const auto& id = resourceRequirement.resourceHandleAndRange.resource.GetGlobalResourceID();
 
-		AddTransition(batchOfLastGraphicsQueueUsage, batchIndex, currentBatch, passQueue, resourceRequirement, outTransitionedResourceIDs);
+		AddTransition(batchOfLastGraphicsQueueUsage, batchIndex, currentBatch, passQueue, resourceRequirement, outTransitionedResourceIDs, outFallbackResourceIDs);
 
 		if (AccessTypeIsWriteType(resourceRequirement.state.access)) {
 			producerHistory[id] = batchIndex;
@@ -2936,6 +3035,13 @@ std::shared_ptr<ComputePass> RenderGraph::GetComputePassByName(const std::string
 
 void RenderGraph::Update(const UpdateExecutionContext& context, rhi::Device device) {
 	ResetForFrame();
+
+	// Poll readback completions early so that passes (e.g. CLod streaming)
+	// can react to GPU-produced data from the previous frame immediately,
+	// rather than waiting until post-Present.
+	if (m_readbackService) {
+		m_readbackService->ProcessReadbackRequests();
+	}
 
 	for (auto& pr : m_masterPassList) {	
 		// Resolve into type and update

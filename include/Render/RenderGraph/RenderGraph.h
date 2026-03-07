@@ -608,7 +608,8 @@ private:
 		std::unordered_map<uint64_t, unsigned int>& producerHistory,
 		unsigned int batchIndex,
 		PassBatch& currentBatch,
-		std::unordered_set<uint64_t>& outTransitionedResourceIDs);
+		std::unordered_set<uint64_t>& outTransitionedResourceIDs,
+		std::unordered_set<uint64_t>& outFallbackResourceIDs);
 
 	template<typename PassRes>
 	void applySynchronization(
@@ -695,7 +696,8 @@ private:
 		PassBatch& currentBatch,
 		QueueKind passQueue,
 		const ResourceRequirement& r,
-		std::unordered_set<uint64_t>& outTransitionedResourceIDs);
+		std::unordered_set<uint64_t>& outTransitionedResourceIDs,
+		std::unordered_set<uint64_t>& outFallbackResourceIDs);
 
 	static inline bool IsUAVState(const ResourceState& s) noexcept {
 		return ((s.access & rhi::ResourceAccessType::UnorderedAccess) != 0) ||
