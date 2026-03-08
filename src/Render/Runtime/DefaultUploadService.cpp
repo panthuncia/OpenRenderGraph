@@ -85,6 +85,20 @@ public:
         UploadManager::GetInstance().ProcessDeferredReleases(frameIndex);
     }
 
+    void QueueStreamingUpload(const void* data, size_t size,
+                              std::shared_ptr<Resource> destination,
+                              size_t dstOffset) override {
+        UploadManager::GetInstance().QueueStreamingUpload(data, size, std::move(destination), dstOffset);
+    }
+
+    std::vector<StreamingUploadDescriptor> ConsumeStreamingUploads() override {
+        return UploadManager::GetInstance().ConsumeStreamingUploads();
+    }
+
+    void ResetStreamingPagePool() override {
+        UploadManager::GetInstance().ResetStreamingPagePool();
+    }
+
     void Cleanup() override {
         UploadManager::GetInstance().Cleanup();
     }

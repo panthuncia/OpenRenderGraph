@@ -195,6 +195,10 @@ void GpuTextureBacking::initialize(const TextureDescription& desc,
 
 	size_t subCount = m_mipLevels * m_arraySize;
 
+	if (name) {
+		m_textureHandle.GetResource().SetName(name);
+	}
+
 	RegisterLiveAlloc();
 	UpdateLiveAllocName(name);
 

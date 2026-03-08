@@ -188,15 +188,17 @@ namespace rg::imm {
         void Reset() { bytecode.clear(); requirements.clear(); }
     };
 
+    enum class ImmediatePassKind : uint8_t { Render, Compute, Copy };
+
     // Immediate command list: records bytecode + tracks resource access requirements.
     class ImmediateCommandList {
     public:
-        ImmediateCommandList(bool isRenderPass,
+        ImmediateCommandList(ImmediatePassKind passKind,
             ImmediateDispatch const& dispatch,
             ResolveByIdFn resolveByIdFn,
 			ResolveByPtrFn resolveByPtrFn,
             void* resolveUser)
-            : m_isRenderPass(isRenderPass)
+            : m_passKind(passKind)
             , m_dispatch(dispatch)
             , m_resolveByIdFn(resolveByIdFn)
             , m_resolveByPtrFn(resolveByPtrFn)
@@ -499,7 +501,7 @@ namespace rg::imm {
         }
 
 
-        bool m_isRenderPass = true;
+        ImmediatePassKind m_passKind = ImmediatePassKind::Render;
 
         ImmediateDispatch const& m_dispatch;
         ResolveByIdFn m_resolveByIdFn = nullptr;

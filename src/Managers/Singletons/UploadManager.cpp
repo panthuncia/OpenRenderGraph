@@ -544,4 +544,58 @@ void UploadManager::Cleanup() {
 	m_resourceUpdates.clear();
 	m_textureUpdates.clear();
 	queuedResourceCopies.clear();
+	m_streamingPagePool.Cleanup();
+	{
+		std::lock_guard<std::mutex> lock(m_streamingMutex);
+		m_pendingStreamingUploads.clear();
+	}
+}
+
+// ── Streaming upload (copy-queue) implementation ────────────────────────
+
+void UploadManager::QueueStreamingUpload(
+    const void* data, size_t size,
+    std::shared_ptr<Resource> destination, size_t dstOffset)
+{
+	if (!data || size == 0 || !destination) return;
+
+	// Allocate a dedicated upload buffer for this transfer.
+	// We intentionally do NOT reuse pool pages across frames because with
+	// N frames in flight the GPU from frame M may still be copying from a
+	// page when frame M+1 overwrites it (the old ResetForFrame approach
+	// could not account for this).  A per-upload buffer is cheap for the
+	// small payloads we stream (non-resident bits, etc.) and the
+	// shared_ptr in the StreamingUploadDescriptor keeps the buffer alive
+	// through the ImmediateCommandList keep-alive mechanism until the GPU
+	// copy has completed.
+	auto uploadBuffer = Buffer::CreateShared(rhi::HeapType::Upload, size, /*uav=*/false);
+	uploadBuffer->SetName("StreamingUploadTemp");
+
+	// Map, copy, unmap
+	uint8_t* mapped = nullptr;
+	uploadBuffer->GetAPIResource().Map(reinterpret_cast<void**>(&mapped), 0, size);
+	if (mapped) {
+		std::memcpy(mapped, data, size);
+		uploadBuffer->GetAPIResource().Unmap(0, size);
+	}
+
+	StreamingUploadDescriptor desc;
+	desc.srcUploadBuffer = std::move(uploadBuffer);
+	desc.srcOffset       = 0;
+	desc.dstResource     = std::move(destination);
+	desc.dstOffset       = dstOffset;
+	desc.size            = size;
+
+	{
+		std::lock_guard<std::mutex> lock(m_streamingMutex);
+		m_pendingStreamingUploads.push_back(std::move(desc));
+	}
+}
+
+std::vector<StreamingUploadDescriptor> UploadManager::ConsumeStreamingUploads()
+{
+	std::lock_guard<std::mutex> lock(m_streamingMutex);
+	std::vector<StreamingUploadDescriptor> result;
+	result.swap(m_pendingStreamingUploads);
+	return result;
 }

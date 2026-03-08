@@ -21,6 +21,7 @@ struct ReadbackCaptureInfo {
     uint64_t resourceId = 0;
     RangeSpec range{};
     ReadbackCaptureCallback callback;
+    bool preferCopyQueue = false;
 };
 
 struct ReadbackCaptureToken {
@@ -32,7 +33,7 @@ public:
     virtual ~IReadbackService() = default;
 
     virtual void Initialize(rhi::Timeline readbackFence) = 0;
-    virtual void RequestReadbackCapture(const std::string& passName, Resource* resource, const RangeSpec& range, ReadbackCaptureCallback callback) = 0;
+    virtual void RequestReadbackCapture(const std::string& passName, Resource* resource, const RangeSpec& range, ReadbackCaptureCallback callback, bool preferCopyQueue = false) = 0;
     virtual std::vector<ReadbackCaptureInfo> ConsumeCaptureRequests() = 0;
     virtual ReadbackCaptureToken EnqueueCapture(ReadbackCaptureRequest&& request) = 0;
     virtual void FinalizeCapture(ReadbackCaptureToken token, uint64_t fenceValue) = 0;

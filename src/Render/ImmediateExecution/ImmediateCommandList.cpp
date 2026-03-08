@@ -343,12 +343,33 @@ namespace rg::imm {
     }
 
     ResourceState ImmediateCommandList::MakeState(const rhi::ResourceAccessType access) const {
-        // Match what PassBuilders do (render vs compute sync selection).
-        return ResourceState{
-            access,
-            AccessToLayout(access, /*isRender=*/m_isRenderPass),
-            m_isRenderPass ? RenderSyncFromAccess(access) : ComputeSyncFromAccess(access)
-        };
+        // Match what PassBuilders do (render / compute / copy sync selection).
+        rhi::ResourceSyncState sync;
+        rhi::ResourceLayout layout;
+        switch (m_passKind) {
+        case ImmediatePassKind::Render:
+            sync = RenderSyncFromAccess(access);
+            layout = AccessToLayout(access, /*isRender=*/true);
+            break;
+        case ImmediatePassKind::Compute:
+            sync = ComputeSyncFromAccess(access);
+            layout = AccessToLayout(access, /*isRender=*/false);
+            break;
+        case ImmediatePassKind::Copy:
+            // Copy queue only supports copy-class access; always use Copy sync.
+            if ((access & (rhi::ResourceAccessType::CopySource | rhi::ResourceAccessType::CopyDest)) != rhi::ResourceAccessType(0)) {
+                sync = rhi::ResourceSyncState::Copy;
+            } else {
+                sync = rhi::ResourceSyncState::All;
+            }
+            layout = AccessToLayout(access, /*isRender=*/false);
+            break;
+        default:
+            sync = rhi::ResourceSyncState::All;
+            layout = AccessToLayout(access, /*isRender=*/false);
+            break;
+        }
+        return ResourceState{ access, layout, sync };
     }
 
     void ImmediateCommandList::Track(ResourceRegistry::RegistryHandle handle, const uint64_t rid, const RangeSpec& range, const rhi::ResourceAccessType access) {

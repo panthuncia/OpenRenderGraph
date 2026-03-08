@@ -3,12 +3,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 #include <rhi.h>
 #include <rhi_helpers.h>
 
 #include "Render/ResourceRegistry.h"
 #include "Render/Runtime/UploadTypes.h"
+#include "Render/Runtime/StreamingUploadTypes.h"
 
 class ResourceRegistry;
 class RenderPass;
@@ -54,6 +56,14 @@ public:
 
     virtual void QueueResourceCopy(const std::shared_ptr<Resource>& destination, const std::shared_ptr<Resource>& source, size_t size) = 0;
     virtual void ProcessDeferredReleases(uint8_t frameIndex) = 0;
+
+    // ── Streaming upload (copy-queue path) ──────────────────────────
+    virtual void QueueStreamingUpload(const void* data, size_t size,
+                                      std::shared_ptr<Resource> destination,
+                                      size_t dstOffset = 0) = 0;
+    virtual std::vector<StreamingUploadDescriptor> ConsumeStreamingUploads() = 0;
+    virtual void ResetStreamingPagePool() = 0;
+
     virtual void Cleanup() = 0;
 };
 

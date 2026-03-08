@@ -84,6 +84,36 @@ inline void UploadTextureSubresourcesDispatch(
     throw std::runtime_error("Upload service is not active for TEXTURE_UPLOAD_SUBRESOURCES");
 }
 
+inline void QueueStreamingUploadDispatch(
+    const void* data,
+    size_t size,
+    std::shared_ptr<Resource> destination,
+    size_t dstOffset = 0) {
+    if (auto* service = GetActiveUploadService()) {
+        service->QueueStreamingUpload(data, size, std::move(destination), dstOffset);
+        return;
+    }
+
+    throw std::runtime_error("Upload service is not active for QueueStreamingUpload");
+}
+
+inline std::vector<StreamingUploadDescriptor> ConsumeStreamingUploadsDispatch() {
+    if (auto* service = GetActiveUploadService()) {
+        return service->ConsumeStreamingUploads();
+    }
+
+    throw std::runtime_error("Upload service is not active for ConsumeStreamingUploads");
+}
+
+inline void ResetStreamingPagePoolDispatch() {
+    if (auto* service = GetActiveUploadService()) {
+        service->ResetStreamingPagePool();
+        return;
+    }
+
+    throw std::runtime_error("Upload service is not active for ResetStreamingPagePool");
+}
+
 }
 
 #if BUILD_TYPE == BUILD_TYPE_DEBUG

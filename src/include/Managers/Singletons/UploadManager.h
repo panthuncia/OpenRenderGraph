@@ -3,6 +3,7 @@
 #include <vector>
 #include <memory>
 #include <functional>
+#include <mutex>
 #include <rhi.h>
 #include <thread>
 #include <stacktrace>
@@ -13,6 +14,8 @@
 #include "Resources/Buffers/Buffer.h"
 #include "Render/ImmediateExecution/ImmediateCommandList.h"
 #include "Render/Runtime/UploadTypes.h"
+#include "Render/Runtime/StreamingUploadTypes.h"
+#include "Managers/AsyncCopyPagePool.h"
 
 class Buffer;
 class Resource;
@@ -117,6 +120,25 @@ public:
 	void ProcessDeferredReleases(uint8_t frameIndex);
 	void SetUploadResolveContext(UploadResolveContext ctx) { m_ctx = ctx; }
 	std::shared_ptr<RenderPass> GetUploadPass() const { return m_uploadPass; }
+
+	// ── Streaming upload API (copy-queue path) ──────────────────────────
+	/// Queue a streaming upload that will be executed on the copy queue
+	/// via StreamingUploadPass. The data is copied into a dedicated
+	/// upload-heap page pool (AsyncCopyPagePool) immediately.
+	/// Thread-safe.
+	void QueueStreamingUpload(const void* data, size_t size,
+	                          std::shared_ptr<Resource> destination,
+	                          size_t dstOffset = 0);
+
+	/// Drain all pending streaming uploads. Returns the descriptors to be
+	/// fed into a StreamingUploadPass. Called once per frame by the
+	/// extension that creates the pass.
+	std::vector<StreamingUploadDescriptor> ConsumeStreamingUploads();
+
+	/// Reset the streaming page pool for the next frame. Should be called
+	/// once the GPU is done with the previous frame's streaming uploads.
+	void ResetStreamingPagePool() { m_streamingPagePool.ResetForFrame(); }
+
 	void Cleanup();
 private:
 
@@ -189,6 +211,11 @@ private:
 
 	UploadResolveContext m_ctx{};
 	std::shared_ptr<UploadPass> m_uploadPass;
+
+	// ── Streaming upload (copy-queue) state ─────────────────────────────
+	AsyncCopyPagePool                     m_streamingPagePool;
+	std::mutex                            m_streamingMutex;
+	std::vector<StreamingUploadDescriptor> m_pendingStreamingUploads;
 
 };
 

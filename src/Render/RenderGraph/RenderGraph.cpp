@@ -1864,7 +1864,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			p.resources.frameResourceRequirements = p.resources.staticResourceRequirements;
 
 			ImmediateExecutionContext c{ device,
-				{/*isRenderPass=*/false,
+				{rg::imm::ImmediatePassKind::Compute,
 				m_immediateDispatch,
 				&ResolveByIdThunk,
 				&ResolveByPtrThunk,
@@ -1916,7 +1916,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			p.resources.frameResourceRequirements = p.resources.staticResourceRequirements;
 
 			ImmediateExecutionContext c{ device,
-				{/*isRenderPass=*/true,
+				{rg::imm::ImmediatePassKind::Render,
 				m_immediateDispatch,
 				&ResolveByIdThunk,
 				&ResolveByPtrThunk,
@@ -1966,7 +1966,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			p.resources.frameResourceRequirements = p.resources.staticResourceRequirements;
 
 			ImmediateExecutionContext c{ device,
-				{/*isRenderPass=*/false,
+				{rg::imm::ImmediatePassKind::Copy,
 				m_immediateDispatch,
 				&ResolveByIdThunk,
 				&ResolveByPtrThunk,
@@ -2117,7 +2117,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				p.resources.frameResourceRequirements = p.resources.staticResourceRequirements;
 
 				ImmediateExecutionContext c{ device,
-					{/*isRenderPass=*/false,
+					{rg::imm::ImmediatePassKind::Compute,
 					m_immediateDispatch,
 					&ResolveByIdThunk,
 					&ResolveByPtrThunk,
@@ -2142,7 +2142,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				p.resources.frameResourceRequirements = p.resources.staticResourceRequirements;
 
 				ImmediateExecutionContext c{ device,
-					{/*isRenderPass=*/false,
+					{rg::imm::ImmediatePassKind::Copy,
 					m_immediateDispatch,
 					&ResolveByIdThunk,
 					&ResolveByPtrThunk,
@@ -2167,7 +2167,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				p.resources.frameResourceRequirements = p.resources.staticResourceRequirements;
 
 				ImmediateExecutionContext c{ device,
-					{/*isRenderPass=*/true,
+					{rg::imm::ImmediatePassKind::Render,
 					m_immediateDispatch,
 					&ResolveByIdThunk,
 					&ResolveByPtrThunk,
@@ -3336,6 +3336,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 		if (batch.HasQueueSignal(BatchSignalPhase::AfterTransitions, QueueKind::Copy)) {
 			UINT64 signalValue = currentCopyQueueFenceOffset + batch.GetQueueSignalFenceValue(BatchSignalPhase::AfterTransitions, QueueKind::Copy);
 			crm->Flush(QueueKind::Copy, { true, signalValue });
+			copyCommandList = crm->EnsureOpen(QueueKind::Copy, context.frameIndex);
 		}
 
 		ExecuteQueuedPasses(copyPasses,
@@ -3359,6 +3360,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 		if (batch.HasQueueSignal(BatchSignalPhase::AfterCompletion, QueueKind::Copy)) {
 			UINT64 signalValue = currentCopyQueueFenceOffset + batch.GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, QueueKind::Copy);
 			crm->Flush(QueueKind::Copy, { true, signalValue });
+			// copyCommandList is now stale but not used again this batch
 		}
 
 		for (size_t srcIndex = 0; srcIndex < static_cast<size_t>(QueueKind::Count); ++srcIndex) {
@@ -3393,6 +3395,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 		if (batch.HasQueueSignal(BatchSignalPhase::AfterTransitions, QueueKind::Compute) && !alias) {
 			UINT64 signalValue = currentComputeQueueFenceOffset + batch.GetQueueSignalFenceValue(BatchSignalPhase::AfterTransitions, QueueKind::Compute);
 			crm->Flush(QueueKind::Compute, { true, signalValue });
+			computeCommandList = crm->EnsureOpen(QueueKind::Compute, context.frameIndex);
 		}
 
 		ExecuteQueuedPasses(computePasses,
@@ -3432,6 +3435,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 		if (batch.HasQueueSignal(BatchSignalPhase::AfterTransitions, QueueKind::Graphics) && !alias) {
 			UINT64 signalValue = currentGraphicsQueueFenceOffset + batch.GetQueueSignalFenceValue(BatchSignalPhase::AfterTransitions, QueueKind::Graphics);
 			crm->Flush(QueueKind::Graphics, { true, signalValue });
+			graphicsCommandList = crm->EnsureOpen(QueueKind::Graphics, context.frameIndex);
 		}
 
 		for (size_t srcIndex = 0; srcIndex < static_cast<size_t>(QueueKind::Count); ++srcIndex) {
@@ -3465,6 +3469,8 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 		}
 
 		if (!graphicsPostTransitions.empty()) {
+			// Re-acquire in case the prior Flush closed the old list
+			graphicsCommandList = crm->EnsureOpen(QueueKind::Graphics, context.frameIndex);
 			ExecuteTransitions(graphicsPostTransitions,
 				crm,
 				QueueKind::Graphics,

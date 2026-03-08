@@ -11,8 +11,8 @@ public:
         ReadbackManager::GetInstance().Initialize(readbackFence);
     }
 
-    void RequestReadbackCapture(const std::string& passName, Resource* resource, const RangeSpec& range, ReadbackCaptureCallback callback) override {
-        ReadbackManager::GetInstance().RequestReadbackCapture(passName, resource, range, std::move(callback));
+    void RequestReadbackCapture(const std::string& passName, Resource* resource, const RangeSpec& range, ReadbackCaptureCallback callback, bool preferCopyQueue = false) override {
+        ReadbackManager::GetInstance().RequestReadbackCapture(passName, resource, range, std::move(callback), preferCopyQueue);
     }
 
     std::vector<rg::runtime::ReadbackCaptureInfo> ConsumeCaptureRequests() override {
@@ -25,7 +25,8 @@ public:
                 .resource = std::move(capture.resource),
                 .resourceId = capture.resourceId,
                 .range = capture.range,
-                .callback = std::move(capture.callback)
+                .callback = std::move(capture.callback),
+                .preferCopyQueue = capture.preferCopyQueue
                 });
         }
         return out;

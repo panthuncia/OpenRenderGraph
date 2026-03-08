@@ -16,6 +16,7 @@ struct ReadbackCaptureInfo {
 	uint64_t resourceId = 0;
 	RangeSpec range{};
 	ReadbackCaptureCallback callback;
+	bool preferCopyQueue = false;
 };
 
 struct ReadbackCaptureToken {
@@ -36,7 +37,8 @@ public:
 		const std::string& passName,
 		Resource* resource,
 		const RangeSpec& range,
-		ReadbackCaptureCallback callback);
+		ReadbackCaptureCallback callback,
+		bool preferCopyQueue = false);
 
 	std::vector<ReadbackCaptureInfo> ConsumeCaptureRequests();
 
