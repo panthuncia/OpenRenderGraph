@@ -1,5 +1,7 @@
 #include "Managers/Singletons/UploadManager.h"
 
+#include <unordered_set>
+
 #include <rhi_helpers.h>
 #include <rhi_debug.h>
 
@@ -526,8 +528,20 @@ void UploadManager::QueueResourceCopy(const std::shared_ptr<Resource>& destinati
 
 void UploadManager::ExecuteResourceCopies(uint8_t frameIndex, rg::imm::ImmediateCommandList& commandList) {
 	//rhi::debug::Begin(commandList.Get(), rhi::colors::Amber, "Upload Manager - resource copies");
+
+	// When a DynamicBuffer grows multiple times in the same frame, each growth
+	// queues a ResourceCopy targeting the same (final) buffer.  Only the FIRST
+	// copy — from the original pre-growth buffer — contains valid GPU data.
+	// Subsequent copies are from intermediate buffers whose GPU content is
+	// undefined (never written to).  Executing them would overwrite the valid
+	// data placed by the first copy with garbage.  Keep only the first copy
+	// per destination to avoid this.
+	std::unordered_set<Resource*> seenDestinations;
 	for (auto& copy : queuedResourceCopies) {
-		// Perform the copy
+		auto* dstPtr = copy.destination.get();
+		if (!seenDestinations.insert(dstPtr).second) {
+			continue; // Skip — intermediate buffer has undefined GPU content
+		}
 		commandList.CopyBufferRegion(
 			copy.destination,
 			0,
