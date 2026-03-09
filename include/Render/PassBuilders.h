@@ -718,6 +718,8 @@ public:
             graph->AddResource(resource);
         }
         addCallable(resources);
+        auto v = resolver.GetContentVersion();
+        if (v != 0) resolverSnapshots_.push_back({ resolver.Clone(), v });
         return *this;
     }
 
@@ -728,8 +730,12 @@ public:
             graph->AddResource(resource);
         }
         addCallable(resources);
+        auto v = resolver.GetContentVersion();
+        if (v != 0) resolverSnapshots_.push_back({ resolver.Clone(), v });
         return std::move(*this);
     }
+
+    std::vector<ResolverSnapshot> TakeResolverSnapshots() { return std::move(resolverSnapshots_); }
 
 	// LVALUE overloads for IResourceResolver
     RenderPassBuilder& WithShaderResource(const IResourceResolver& r)& {
@@ -896,7 +902,7 @@ private:
         params.identifierSet = _declaredIds;
         params.staticResourceRequirements = GatherResourceRequirements();
 
-        graph->AddRenderPass(pass, params, passName);
+        graph->AddRenderPass(pass, params, passName, TakeResolverSnapshots());
     }
 
     void Reset() override {
@@ -904,6 +910,7 @@ private:
         pass = nullptr;
         params = {};
         _declaredIds.clear();
+        resolverSnapshots_.clear();
         m_isGeometryPass = false;
         m_queueSelection = RenderQueueSelection::Graphics;
 	}
@@ -1118,6 +1125,7 @@ private:
     bool m_isGeometryPass = false;
 	RenderQueueSelection m_queueSelection = RenderQueueSelection::Graphics;
     std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> _declaredIds;
+    std::vector<ResolverSnapshot> resolverSnapshots_;
 
     friend class RenderGraph; // Allow RenderGraph to create instances of this builder
 };
@@ -1224,6 +1232,8 @@ public:
             graph->AddResource(resource);
         }
         addCallable(resources);
+        auto v = resolver.GetContentVersion();
+        if (v != 0) resolverSnapshots_.push_back({ resolver.Clone(), v });
         return *this;
     }
 
@@ -1234,8 +1244,12 @@ public:
             graph->AddResource(resource);
         }
         addCallable(resources);
+        auto v = resolver.GetContentVersion();
+        if (v != 0) resolverSnapshots_.push_back({ resolver.Clone(), v });
         return std::move(*this);
     }
+
+    std::vector<ResolverSnapshot> TakeResolverSnapshots() { return std::move(resolverSnapshots_); }
 
     ComputePassBuilder& PreferComputeQueue() & {
         m_queueSelection = ComputeQueueSelection::Compute;
@@ -1365,7 +1379,7 @@ private:
         params.queueSelection = m_queueSelection;
         params.staticResourceRequirements = GatherResourceRequirements();
 
-        graph->AddComputePass(pass, params, passName);
+        graph->AddComputePass(pass, params, passName, TakeResolverSnapshots());
     }
 
     void Reset() override {
@@ -1373,6 +1387,7 @@ private:
         pass = nullptr;
         params = {};
         _declaredIds.clear();
+        resolverSnapshots_.clear();
         m_queueSelection = ComputeQueueSelection::Compute;
     }
 
@@ -1497,6 +1512,7 @@ private:
     bool built_ = false;
 	ComputeQueueSelection m_queueSelection = ComputeQueueSelection::Compute;
     std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> _declaredIds;
+    std::vector<ResolverSnapshot> resolverSnapshots_;
 
 	friend class RenderGraph; // Allow RenderGraph to create instances of this builder
 };
@@ -1558,6 +1574,8 @@ public:
             graph->AddResource(resource);
         }
         addCallable(resources);
+        auto v = resolver.GetContentVersion();
+        if (v != 0) resolverSnapshots_.push_back({ resolver.Clone(), v });
         return *this;
     }
 
@@ -1568,8 +1586,12 @@ public:
             graph->AddResource(resource);
         }
         addCallable(resources);
+        auto v = resolver.GetContentVersion();
+        if (v != 0) resolverSnapshots_.push_back({ resolver.Clone(), v });
         return std::move(*this);
     }
+
+    std::vector<ResolverSnapshot> TakeResolverSnapshots() { return std::move(resolverSnapshots_); }
 
     CopyPassBuilder& PreferCopyQueue() & {
         m_queueSelection = CopyQueueSelection::Copy;
@@ -1669,7 +1691,7 @@ private:
         params.queueSelection = m_queueSelection;
         params.staticResourceRequirements = GatherResourceRequirements();
 
-        graph->AddCopyPass(pass, params, passName);
+        graph->AddCopyPass(pass, params, passName, TakeResolverSnapshots());
     }
 
     void Reset() override {
@@ -1677,6 +1699,7 @@ private:
         pass = nullptr;
         params = {};
         _declaredIds.clear();
+        resolverSnapshots_.clear();
         m_queueSelection = CopyQueueSelection::Copy;
     }
 
@@ -1740,6 +1763,7 @@ private:
     bool built_ = false;
     CopyQueueSelection m_queueSelection = CopyQueueSelection::Copy;
     std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> _declaredIds;
+    std::vector<ResolverSnapshot> resolverSnapshots_;
 
     friend class RenderGraph;
 };

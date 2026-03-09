@@ -1751,6 +1751,9 @@ void RenderGraph::RefreshRetainedDeclarationsForFrame(RenderPassAndResources& p,
 	p.resources.identifierSet = b.DeclaredResourceIds();
 	MaterializeReferencedResources(p.resources.staticResourceRequirements, p.resources.internalTransitions);
 
+	// Transfer resolver snapshots for auto-invalidation tracking
+	p.resolverSnapshots = b.TakeResolverSnapshots();
+
 	// Ensure the pass's view matches the refreshed identifier set
 	p.pass->SetResourceRegistryView(
 		std::make_unique<ResourceRegistryView>(_registry, p.resources.identifierSet)
@@ -1773,6 +1776,9 @@ void RenderGraph::RefreshRetainedDeclarationsForFrame(ComputePassAndResources& p
 	p.resources.internalTransitions = b.params.internalTransitions;
 	p.resources.identifierSet = b.DeclaredResourceIds();
 	MaterializeReferencedResources(p.resources.staticResourceRequirements, p.resources.internalTransitions);
+
+	// Transfer resolver snapshots for auto-invalidation tracking
+	p.resolverSnapshots = b.TakeResolverSnapshots();
 
 	p.pass->SetResourceRegistryView(
 		std::make_unique<ResourceRegistryView>(_registry, p.resources.identifierSet)
@@ -1797,6 +1803,9 @@ void RenderGraph::RefreshRetainedDeclarationsForFrame(CopyPassAndResources& p, u
 	p.resources.identifierSet = b.DeclaredResourceIds();
 	MaterializeReferencedResources(p.resources.staticResourceRequirements, p.resources.internalTransitions);
 
+	// Transfer resolver snapshots for auto-invalidation tracking
+	p.resolverSnapshots = b.TakeResolverSnapshots();
+
 	p.pass->SetResourceRegistryView(
 		std::make_unique<ResourceRegistryView>(_registry, p.resources.identifierSet)
 	);
@@ -1812,6 +1821,14 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	m_aliasingSubsystem.ResetPerFrameState(*this);
 
 	auto needsRefresh = [&](auto& p) -> bool {
+		// Check if any stored resolver's content version has changed
+		for (const auto& snap : p.resolverSnapshots) {
+			uint64_t cv = snap.resolver->GetContentVersion();
+			if (cv != 0 && cv != snap.version) {
+				return true;
+			}
+		}
+
 		auto* iFace = dynamic_cast<IDynamicDeclaredResources*>(p.pass.get());
 		if (!iFace) {
 			// if pass doesn't opt-in, assume no change
@@ -2929,46 +2946,49 @@ void RenderGraph::Setup() {
 	}
 }
 
-void RenderGraph::AddRenderPass(std::shared_ptr<RenderPass> pass, RenderPassParameters& resources, std::string name) {
+void RenderGraph::AddRenderPass(std::shared_ptr<RenderPass> pass, RenderPassParameters& resources, std::string name, std::vector<ResolverSnapshot> resolverSnapshots) {
 	RenderPassAndResources passAndResources;
 	passAndResources.pass = pass;
 	passAndResources.resources = resources;
 	passAndResources.name = name;
+	passAndResources.resolverSnapshots = std::move(resolverSnapshots);
 	AnyPassAndResources passAndResourcesAny;
 	passAndResourcesAny.type = PassType::Render;
-	passAndResourcesAny.pass = passAndResources;
+	passAndResourcesAny.pass = std::move(passAndResources);
 	passAndResourcesAny.name = name;
-	m_masterPassList.push_back(passAndResourcesAny);
+	m_masterPassList.push_back(std::move(passAndResourcesAny));
 	if (name != "") {
 		renderPassesByName[name] = pass;
 	}
 }
 
-void RenderGraph::AddComputePass(std::shared_ptr<ComputePass> pass, ComputePassParameters& resources, std::string name) {
+void RenderGraph::AddComputePass(std::shared_ptr<ComputePass> pass, ComputePassParameters& resources, std::string name, std::vector<ResolverSnapshot> resolverSnapshots) {
 	ComputePassAndResources passAndResources;
 	passAndResources.pass = pass;
 	passAndResources.resources = resources;
 	passAndResources.name = name;
+	passAndResources.resolverSnapshots = std::move(resolverSnapshots);
 	AnyPassAndResources passAndResourcesAny;
 	passAndResourcesAny.type = PassType::Compute;
-	passAndResourcesAny.pass = passAndResources;
+	passAndResourcesAny.pass = std::move(passAndResources);
 	passAndResourcesAny.name = name;
-	m_masterPassList.push_back(passAndResourcesAny);
+	m_masterPassList.push_back(std::move(passAndResourcesAny));
 	if (name != "") {
 		computePassesByName[name] = pass;
 	}
 }
 
-void RenderGraph::AddCopyPass(std::shared_ptr<CopyPass> pass, CopyPassParameters& resources, std::string name) {
+void RenderGraph::AddCopyPass(std::shared_ptr<CopyPass> pass, CopyPassParameters& resources, std::string name, std::vector<ResolverSnapshot> resolverSnapshots) {
 	CopyPassAndResources passAndResources;
 	passAndResources.pass = pass;
 	passAndResources.resources = resources;
 	passAndResources.name = name;
+	passAndResources.resolverSnapshots = std::move(resolverSnapshots);
 	AnyPassAndResources passAndResourcesAny;
 	passAndResourcesAny.type = PassType::Copy;
-	passAndResourcesAny.pass = passAndResources;
+	passAndResourcesAny.pass = std::move(passAndResources);
 	passAndResourcesAny.name = name;
-	m_masterPassList.push_back(passAndResourcesAny);
+	m_masterPassList.push_back(std::move(passAndResourcesAny));
 }
 
 void RenderGraph::AddResource(std::shared_ptr<Resource> resource, bool transition) {

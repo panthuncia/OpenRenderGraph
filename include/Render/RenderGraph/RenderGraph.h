@@ -31,6 +31,7 @@
 #include "Resources/Buffers/Buffer.h"
 #include "Resources/TrackedAllocation.h"
 #include "Render/RenderGraph/Aliasing/RenderGraphAliasingSubsystem.h"
+#include "Interfaces/IResourceResolver.h"
 
 class Resource;
 class RenderPassBuilder;
@@ -167,6 +168,7 @@ public:
 		PassRunMask run = PassRunMask::Both; // default behavior
 		std::vector<std::byte> immediateBytecode; // Stores the immediate execution bytecode
 		std::shared_ptr<rg::imm::KeepAliveBag> immediateKeepAlive = nullptr; // Keeps alive resources used by immediate execution bytecode
+		std::vector<ResolverSnapshot> resolverSnapshots; // Versioned resolver snapshots for auto-invalidation
 	};
 
 	struct ComputePassAndResources { // TODO: Same as above
@@ -178,6 +180,7 @@ public:
 		PassRunMask run = PassRunMask::Both;
 		std::vector<std::byte> immediateBytecode; // Stores the immediate execution bytecode
 		std::shared_ptr<rg::imm::KeepAliveBag> immediateKeepAlive = nullptr; // Keeps alive resources used by immediate execution bytecode
+		std::vector<ResolverSnapshot> resolverSnapshots; // Versioned resolver snapshots for auto-invalidation
 	};
 
 	struct CopyPassAndResources {
@@ -189,6 +192,7 @@ public:
 		PassRunMask run = PassRunMask::Both;
 		std::vector<std::byte> immediateBytecode;
 		std::shared_ptr<rg::imm::KeepAliveBag> immediateKeepAlive = nullptr;
+		std::vector<ResolverSnapshot> resolverSnapshots; // Versioned resolver snapshots for auto-invalidation
 	};
 
 	enum class BatchWaitPhase : uint8_t {
@@ -332,9 +336,9 @@ public:
 	using AutoAliasPoolDebug = rg::alias::AutoAliasPoolDebug;
 	using AutoAliasDebugSnapshot = rg::alias::AutoAliasDebugSnapshot;
 	AutoAliasDebugSnapshot GetAutoAliasDebugSnapshot() const;
-	void AddRenderPass(std::shared_ptr<RenderPass> pass, RenderPassParameters& resources, std::string name = "");
-	void AddComputePass(std::shared_ptr<ComputePass> pass, ComputePassParameters& resources, std::string name = "");
-	void AddCopyPass(std::shared_ptr<CopyPass> pass, CopyPassParameters& resources, std::string name = "");
+	void AddRenderPass(std::shared_ptr<RenderPass> pass, RenderPassParameters& resources, std::string name = "", std::vector<ResolverSnapshot> resolverSnapshots = {});
+	void AddComputePass(std::shared_ptr<ComputePass> pass, ComputePassParameters& resources, std::string name = "", std::vector<ResolverSnapshot> resolverSnapshots = {});
+	void AddCopyPass(std::shared_ptr<CopyPass> pass, CopyPassParameters& resources, std::string name = "", std::vector<ResolverSnapshot> resolverSnapshots = {});
 	void Update(const UpdateExecutionContext& context, rhi::Device device);
 	void Execute(PassExecutionContext& context);
 	void CompileStructural();
@@ -422,12 +426,18 @@ private:
 
 		explicit AnyPassAndResources(RenderPassAndResources const& rp)
 			: type(PassType::Render), pass(rp) {}
+		explicit AnyPassAndResources(RenderPassAndResources&& rp)
+			: type(PassType::Render), pass(std::move(rp)) {}
 
 		explicit AnyPassAndResources(ComputePassAndResources const& cp)
 			: type(PassType::Compute), pass(cp) {}
+		explicit AnyPassAndResources(ComputePassAndResources&& cp)
+			: type(PassType::Compute), pass(std::move(cp)) {}
 
 		explicit AnyPassAndResources(CopyPassAndResources const& cp)
 			: type(PassType::Copy), pass(cp) {}
+		explicit AnyPassAndResources(CopyPassAndResources&& cp)
+			: type(PassType::Copy), pass(std::move(cp)) {}
 	};
 
 	struct CompileContext {

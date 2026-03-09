@@ -22,6 +22,7 @@ public:
 		if (!resourcesByID.contains(id)) {
 			resourcesByID[resource->GetGlobalResourceID()] = resource;
 			resources.push_back(resource);
+			++m_contentVersion;
 		}
 	}
 
@@ -32,13 +33,18 @@ public:
 			const auto& sp = it->second;
 			resources.erase(std::remove(resources.begin(), resources.end(), sp), resources.end());
 			resourcesByID.erase(it);
+			++m_contentVersion;
 		}
 	}
 
 	void ClearResources() {
 		resources.clear();
 		resourcesByID.clear();
+		++m_contentVersion;
 	}
+
+	/// Monotonically-increasing version, bumped on every mutation.
+	uint64_t GetContentVersion() const { return m_contentVersion; }
 
 protected:
 
@@ -47,6 +53,7 @@ protected:
 	std::vector<std::shared_ptr<Resource>> resources;
 
 	std::string name = "";
+	uint64_t m_contentVersion = 1;
 
 private:
 
