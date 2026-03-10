@@ -302,8 +302,8 @@ void RenderGraph::CommitPassToBatch(
 		rg.ProcessResourceRequirements(
 			passQueue,
 			pass.resources.frameResourceRequirements,
-			batchOfLastQueueUsage[QueueIndex(QueueKind::Graphics)],
-			batchOfLastQueueTransition[QueueIndex(passQueue)],
+			batchOfLastQueueUsage,
+			batchOfLastQueueTransition,
 			currentBatchIndex,
 			currentBatch,
 			resourcesTransitionedThisPass,
@@ -385,8 +385,8 @@ void RenderGraph::CommitPassToBatch(
 		rg.ProcessResourceRequirements(
 			passQueue,
 			pass.resources.frameResourceRequirements,
-			batchOfLastQueueUsage[QueueIndex(QueueKind::Graphics)],
-			batchOfLastQueueTransition[QueueIndex(passQueue)],
+			batchOfLastQueueUsage,
+			batchOfLastQueueTransition,
 			currentBatchIndex,
 			currentBatch,
 			resourcesTransitionedThisPass,
@@ -465,8 +465,8 @@ void RenderGraph::CommitPassToBatch(
 		rg.ProcessResourceRequirements(
 			passQueue,
 			pass.resources.frameResourceRequirements,
-			batchOfLastQueueUsage[QueueIndex(QueueKind::Graphics)],
-			batchOfLastQueueTransition[QueueIndex(passQueue)],
+			batchOfLastQueueUsage,
+			batchOfLastQueueTransition,
 			currentBatchIndex,
 			currentBatch,
 			resourcesTransitionedThisPass,
@@ -566,6 +566,7 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 		for (size_t queueIndex = 0; queueIndex < static_cast<size_t>(QueueKind::Count); ++queueIndex) {
 			const auto queue = static_cast<QueueKind>(queueIndex);
 			b.SetQueueSignalFenceValue(RenderGraph::BatchSignalPhase::AfterTransitions, queue, rg.GetNextQueueFenceValue(queue));
+			b.SetQueueSignalFenceValue(RenderGraph::BatchSignalPhase::AfterExecution, queue, rg.GetNextQueueFenceValue(queue));
 			b.SetQueueSignalFenceValue(RenderGraph::BatchSignalPhase::AfterCompletion, queue, rg.GetNextQueueFenceValue(queue));
 		}
 		return b;
@@ -747,13 +748,110 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 		rg.batches.push_back(std::move(currentBatch));
 	}
 
+	// Coalesce redundant waits: for each (dstQueue, srcQueue) pair in a batch,
+	// eliminate later-phase waits that are subsumed by earlier-phase waits, and
+	// promote cross-batch fence values to earlier phases when safe.
+	//
+	// GPU execution order within a queue for one batch:
+	//   BeforeTransitions waits → transitions → AfterTransitions signal
+	//   BeforeExecution waits   → passes      → AfterExecution signal
+	//   BeforeAfterPasses waits → post-transitions → AfterCompletion signal
+	//
+	// Fence values on a given queue are monotonically increasing, so a wait for
+	// fence F at an earlier phase automatically satisfies any wait for F' <= F
+	// at a later phase on the same source queue.
+	//
+	// Promoting a fence to an earlier phase is only safe when the signal producing
+	// that fence will fire independently (i.e., it's from a PREVIOUS batch, not the
+	// same batch). Same-batch fences reference signals produced within this batch's
+	// own execution; promoting them to an earlier phase could create circular
+	// cross-queue dependencies (GPU deadlock).
+	for (auto& batch : rg.batches) {
+		for (size_t dst = 0; dst < PassBatch::kQueueCount; ++dst) {
+			for (size_t src = 0; src < PassBatch::kQueueCount; ++src) {
+				if (dst == src) continue;
+
+				int enabledCount = 0;
+				for (size_t phase = 0; phase < PassBatch::kWaitPhaseCount; ++phase) {
+					if (batch.queueWaitEnabled[phase][dst][src]) ++enabledCount;
+				}
+				if (enabledCount <= 1) continue;
+
+				// Helper: true if the fence value matches one of this batch's own
+				// pre-allocated signal fence values for the source queue.
+				auto isSameBatchFence = [&](UINT64 f) -> bool {
+					for (size_t sp = 0; sp < PassBatch::kSignalPhaseCount; ++sp) {
+						if (f == batch.queueSignalFenceValue[sp][src]) return true;
+					}
+					return false;
+				};
+
+				// Step 1: Strict subsumption — remove later-phase waits whose fence
+				// value is <= an earlier enabled phase's fence value.
+				for (size_t i = 0; i < PassBatch::kWaitPhaseCount; ++i) {
+					if (!batch.queueWaitEnabled[i][dst][src]) continue;
+					UINT64 fi = batch.queueWaitFenceValue[i][dst][src];
+					for (size_t j = i + 1; j < PassBatch::kWaitPhaseCount; ++j) {
+						if (!batch.queueWaitEnabled[j][dst][src]) continue;
+						if (batch.queueWaitFenceValue[j][dst][src] <= fi) {
+							batch.queueWaitEnabled[j][dst][src] = false;
+							batch.queueWaitFenceValue[j][dst][src] = 0;
+						}
+					}
+				}
+
+				// Step 2: Promote cross-batch fences to the earliest phase.
+				// Only promote fences that are NOT from the same batch.
+				int earliest = -1;
+				for (size_t phase = 0; phase < PassBatch::kWaitPhaseCount; ++phase) {
+					if (batch.queueWaitEnabled[phase][dst][src]) {
+						earliest = static_cast<int>(phase);
+						break;
+					}
+				}
+				if (earliest < 0) continue;
+
+				for (size_t j = static_cast<size_t>(earliest) + 1; j < PassBatch::kWaitPhaseCount; ++j) {
+					if (!batch.queueWaitEnabled[j][dst][src]) continue;
+					UINT64 fj = batch.queueWaitFenceValue[j][dst][src];
+
+					// Same-batch fences must stay at their original phase to avoid
+					// creating circular cross-queue dependencies.
+					if (isSameBatchFence(fj)) continue;
+
+					// Promote to earliest phase (take the max)
+					if (fj > batch.queueWaitFenceValue[earliest][dst][src]) {
+						batch.queueWaitFenceValue[earliest][dst][src] = fj;
+					}
+					batch.queueWaitEnabled[j][dst][src] = false;
+					batch.queueWaitFenceValue[j][dst][src] = 0;
+				}
+
+				// Step 3: Re-run subsumption — the promoted fence may now
+				// subsume same-batch waits that we couldn't promote.
+				for (size_t i = 0; i < PassBatch::kWaitPhaseCount; ++i) {
+					if (!batch.queueWaitEnabled[i][dst][src]) continue;
+					UINT64 fi = batch.queueWaitFenceValue[i][dst][src];
+					for (size_t j = i + 1; j < PassBatch::kWaitPhaseCount; ++j) {
+						if (!batch.queueWaitEnabled[j][dst][src]) continue;
+						if (batch.queueWaitFenceValue[j][dst][src] <= fi) {
+							batch.queueWaitEnabled[j][dst][src] = false;
+							batch.queueWaitFenceValue[j][dst][src] = 0;
+						}
+					}
+				}
+			}
+		}
+	}
+
 	rg.m_compiledLastProducerBatchByResourceByQueue = std::move(batchOfLastQueueProducer);
 }
 
 
 // Factory for the transition lambda
 void RenderGraph::AddTransition(
-	std::unordered_map<uint64_t, unsigned int>& batchOfLastGraphicsQueueUsage,
+	std::array<std::unordered_map<uint64_t, unsigned int>, static_cast<size_t>(QueueKind::Count)>& batchOfLastQueueUsage,
+	std::array<std::unordered_map<uint64_t, unsigned int>, static_cast<size_t>(QueueKind::Count)>& batchOfLastQueueTransition,
 	unsigned int batchIndex,
 	PassBatch& currentBatch,
 	QueueKind passQueue,
@@ -773,7 +871,9 @@ void RenderGraph::AddTransition(
 	auto pRes = _registry.Resolve(resource); // TODO: Can we get rid of pRes in transitions?
 	auto& compileTracker = GetOrCreateCompileTracker(pRes, resource.GetGlobalResourceID());
 
+	bool isAliasActivation = false;
 	if (aliasActivationPending.find(resource.GetGlobalResourceID()) != aliasActivationPending.end()) {
+		isAliasActivation = true;
 		const bool firstUseIsWrite = AccessTypeIsWriteType(r.state.access);
 		const bool firstUseIsCommon = r.state.access == rhi::ResourceAccessType::Common;
 		// Common counts as write for alias activation, as this is generally used to indicate that the resource will be
@@ -817,6 +917,10 @@ void RenderGraph::AddTransition(
 
 	currentBatch.passBatchTrackers[resource.GetGlobalResourceID()] = &compileTracker; // We will need to check subsequent passes against this
 
+	if (transitions.empty()) {
+		return;
+	}
+
 	bool needsGraphicsQueueForTransitions = false;
 	for (auto& transition : transitions) {
 		if (!QueueSupportsTransition(passQueue, transition)) {
@@ -824,6 +928,69 @@ void RenderGraph::AddTransition(
 			break;
 		}
 	}
+
+	QueueKind transitionQueue = (passQueue != QueueKind::Graphics && needsGraphicsQueueForTransitions)
+		? QueueKind::Graphics : passQueue;
+
+	// Try early placement: move transitions to AfterPasses of the batch where the resource was last used.
+	// This reduces GPU idle time by allowing transitions to overlap with unrelated work on other queues.
+	// Skip alias activations — those must stay in the consuming batch (discard semantics at first use).
+	if (!isAliasActivation) {
+		const uint64_t resourceID = resource.GetGlobalResourceID();
+		int lastUseBatch = -1;
+		for (size_t qi = 0; qi < static_cast<size_t>(QueueKind::Count); ++qi) {
+			auto itU = batchOfLastQueueUsage[qi].find(resourceID);
+			if (itU != batchOfLastQueueUsage[qi].end() && static_cast<int>(itU->second) > lastUseBatch && itU->second < batchIndex)
+				lastUseBatch = static_cast<int>(itU->second);
+			auto itT = batchOfLastQueueTransition[qi].find(resourceID);
+			if (itT != batchOfLastQueueTransition[qi].end() && static_cast<int>(itT->second) > lastUseBatch && itT->second < batchIndex)
+				lastUseBatch = static_cast<int>(itT->second);
+		}
+
+		if (lastUseBatch > 0) { // > 0 to skip batch 0 (placeholder with no fence values)
+			PassBatch& targetBatch = batches[lastUseBatch];
+
+			for (auto& transition : transitions) {
+				targetBatch.Transitions(transitionQueue, BatchTransitionPhase::AfterPasses).push_back(transition);
+			}
+
+			// If the transition queue differs from the queue(s) that last used the resource in the target batch,
+			// the transition queue must wait for those queues to finish before executing AfterPasses transitions.
+			for (size_t qi = 0; qi < static_cast<size_t>(QueueKind::Count); ++qi) {
+				auto lastUseQueue = static_cast<QueueKind>(qi);
+				if (lastUseQueue == transitionQueue) continue;
+
+				bool usedInTargetBatch = false;
+				auto itU = batchOfLastQueueUsage[qi].find(resourceID);
+				if (itU != batchOfLastQueueUsage[qi].end() && itU->second == static_cast<unsigned int>(lastUseBatch))
+					usedInTargetBatch = true;
+				auto itT = batchOfLastQueueTransition[qi].find(resourceID);
+				if (itT != batchOfLastQueueTransition[qi].end() && itT->second == static_cast<unsigned int>(lastUseBatch))
+					usedInTargetBatch = true;
+
+				if (usedInTargetBatch) {
+					targetBatch.MarkQueueSignal(BatchSignalPhase::AfterExecution, lastUseQueue);
+					targetBatch.AddQueueWait(
+						BatchWaitPhase::BeforeAfterPasses,
+						transitionQueue,
+						lastUseQueue,
+						targetBatch.GetQueueSignalFenceValue(BatchSignalPhase::AfterExecution, lastUseQueue));
+				}
+			}
+
+			// Signal AfterCompletion on the transition queue so downstream consumers can wait on it
+			targetBatch.MarkQueueSignal(BatchSignalPhase::AfterCompletion, transitionQueue);
+
+			// Update tracking: the transition is now in the earlier batch
+			batchOfLastQueueTransition[QueueIndex(transitionQueue)][resourceID] = lastUseBatch;
+
+			// Do NOT add to outFallbackResourceIDs — applySynchronization will handle
+			// cross-queue waits based on the updated tracking maps.
+			return;
+		}
+	}
+
+	// Fallback: place in current batch's BeforePasses (existing behavior for first use or alias activations)
 	if (passQueue != QueueKind::Graphics && needsGraphicsQueueForTransitions) {
 		// The consuming pass's queue can't support these transitions, so delegate
 		// them to the graphics queue within the *current* batch's BeforePasses phase.
@@ -845,25 +1012,20 @@ void RenderGraph::AddTransition(
 void RenderGraph::ProcessResourceRequirements(
 	QueueKind passQueue,
 	std::vector<ResourceRequirement>& resourceRequirements,
-	std::unordered_map<uint64_t, unsigned int>& batchOfLastGraphicsQueueUsage,
-	std::unordered_map<uint64_t, unsigned int>& producerHistory,
+	std::array<std::unordered_map<uint64_t, unsigned int>, static_cast<size_t>(QueueKind::Count)>& batchOfLastQueueUsage,
+	std::array<std::unordered_map<uint64_t, unsigned int>, static_cast<size_t>(QueueKind::Count)>& batchOfLastQueueTransition,
 	unsigned int batchIndex,
 	PassBatch& currentBatch, std::unordered_set<uint64_t>& outTransitionedResourceIDs,
 	std::unordered_set<uint64_t>& outFallbackResourceIDs) {
 
 	for (auto& resourceRequirement : resourceRequirements) {
 
-		//if (!resourcesByID.contains(resourceRequirement.resourceHandleAndRange.resource.GetGlobalResourceID())) {
-		//	spdlog::error("Resource referenced by pass is not managed by this graph");
-		//	throw(std::runtime_error("Resource referenced is not managed by this graph"));
-		//}
-
 		const auto& id = resourceRequirement.resourceHandleAndRange.resource.GetGlobalResourceID();
 
-		AddTransition(batchOfLastGraphicsQueueUsage, batchIndex, currentBatch, passQueue, resourceRequirement, outTransitionedResourceIDs, outFallbackResourceIDs);
+		AddTransition(batchOfLastQueueUsage, batchOfLastQueueTransition, batchIndex, currentBatch, passQueue, resourceRequirement, outTransitionedResourceIDs, outFallbackResourceIDs);
 
 		if (AccessTypeIsWriteType(resourceRequirement.state.access)) {
-			producerHistory[id] = batchIndex;
+			batchOfLastQueueTransition[QueueIndex(passQueue)][id] = batchIndex;
 		}
 	}
 }
@@ -3319,6 +3481,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 		auto& computePasses = batch.Passes(QueueKind::Compute);
 		auto& copyPasses = batch.Passes(QueueKind::Copy);
 		auto& computePreTransitions = batch.Transitions(QueueKind::Compute, BatchTransitionPhase::BeforePasses);
+		auto& computePostTransitions = batch.Transitions(QueueKind::Compute, BatchTransitionPhase::AfterPasses);
 		auto& graphicsPreTransitions = batch.Transitions(QueueKind::Graphics, BatchTransitionPhase::BeforePasses);
 		auto& graphicsPostTransitions = batch.Transitions(QueueKind::Graphics, BatchTransitionPhase::AfterPasses);
 		auto& copyPreTransitions = batch.Transitions(QueueKind::Copy, BatchTransitionPhase::BeforePasses);
@@ -3365,10 +3528,27 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 			QueueKind::Copy,
 			copyCommandList,
 			currentCopyQueueFenceOffset,
-			batch.HasQueueSignal(BatchSignalPhase::AfterCompletion, QueueKind::Copy),
+			false,
 			batch.GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, QueueKind::Copy),
 			context,
 			statisticsService);
+
+		if (batch.HasQueueSignal(BatchSignalPhase::AfterExecution, QueueKind::Copy)) {
+			UINT64 signalValue = currentCopyQueueFenceOffset + batch.GetQueueSignalFenceValue(BatchSignalPhase::AfterExecution, QueueKind::Copy);
+			crm->Flush(QueueKind::Copy, { true, signalValue });
+			copyCommandList = crm->EnsureOpen(QueueKind::Copy, context.frameIndex);
+		}
+
+		for (size_t srcIndex = 0; srcIndex < static_cast<size_t>(QueueKind::Count); ++srcIndex) {
+			const auto srcQueue = static_cast<QueueKind>(srcIndex);
+			if (!batch.HasQueueWait(BatchWaitPhase::BeforeAfterPasses, QueueKind::Copy, srcQueue)) {
+				continue;
+			}
+			WaitIfDistinct(
+				QueueKind::Copy,
+				srcQueue,
+				GetQueueFenceOffset(srcQueue) + batch.GetQueueWaitFenceValue(BatchWaitPhase::BeforeAfterPasses, QueueKind::Copy, srcQueue));
+		}
 
 		if (!copyPostTransitions.empty()) {
 			ExecuteTransitions(copyPostTransitions,
@@ -3424,10 +3604,35 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 			QueueKind::Compute,
 			computeCommandList,
 			currentComputeQueueFenceOffset,
-			batch.HasQueueSignal(BatchSignalPhase::AfterCompletion, QueueKind::Compute),
+			false,
 			batch.GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, QueueKind::Compute),
 			context,
 			statisticsService);
+
+		if (batch.HasQueueSignal(BatchSignalPhase::AfterExecution, QueueKind::Compute) && !alias) {
+			UINT64 signalValue = currentComputeQueueFenceOffset + batch.GetQueueSignalFenceValue(BatchSignalPhase::AfterExecution, QueueKind::Compute);
+			crm->Flush(QueueKind::Compute, { true, signalValue });
+			computeCommandList = crm->EnsureOpen(QueueKind::Compute, context.frameIndex);
+		}
+
+		for (size_t srcIndex = 0; srcIndex < static_cast<size_t>(QueueKind::Count); ++srcIndex) {
+			const auto srcQueue = static_cast<QueueKind>(srcIndex);
+			if (!batch.HasQueueWait(BatchWaitPhase::BeforeAfterPasses, QueueKind::Compute, srcQueue)) {
+				continue;
+			}
+			WaitIfDistinct(
+				QueueKind::Compute,
+				srcQueue,
+				GetQueueFenceOffset(srcQueue) + batch.GetQueueWaitFenceValue(BatchWaitPhase::BeforeAfterPasses, QueueKind::Compute, srcQueue));
+		}
+
+		if (!computePostTransitions.empty()) {
+			computeCommandList = crm->EnsureOpen(QueueKind::Compute, context.frameIndex);
+			ExecuteTransitions(computePostTransitions,
+				crm,
+				QueueKind::Compute,
+				computeCommandList);
+		}
 
 		if (batch.HasQueueSignal(BatchSignalPhase::AfterCompletion, QueueKind::Compute) && !alias) {
 			UINT64 signalValue = currentComputeQueueFenceOffset + batch.GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, QueueKind::Compute);
@@ -3470,7 +3675,6 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 		}
 
 		const bool renderCompletionSignal = batch.HasQueueSignal(BatchSignalPhase::AfterCompletion, QueueKind::Graphics);
-		bool signalNow = graphicsPostTransitions.empty() && renderCompletionSignal;
 
 		ExecuteQueuedPasses(graphicsPasses,
 			crm,
@@ -3478,28 +3682,39 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 			QueueKind::Graphics,
 			graphicsCommandList,
 			currentGraphicsQueueFenceOffset,
-			signalNow,
+			false,
 			batch.GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, QueueKind::Graphics),
 			context,
 			statisticsService);
 
-		if (renderCompletionSignal && signalNow) {
-			UINT64 signalValue = currentGraphicsQueueFenceOffset + batch.GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, QueueKind::Graphics);
+		if (batch.HasQueueSignal(BatchSignalPhase::AfterExecution, QueueKind::Graphics)) {
+			UINT64 signalValue = currentGraphicsQueueFenceOffset + batch.GetQueueSignalFenceValue(BatchSignalPhase::AfterExecution, QueueKind::Graphics);
 			crm->Flush(QueueKind::Graphics, { true, signalValue });
+			graphicsCommandList = crm->EnsureOpen(QueueKind::Graphics, context.frameIndex);
+		}
+
+		for (size_t srcIndex = 0; srcIndex < static_cast<size_t>(QueueKind::Count); ++srcIndex) {
+			const auto srcQueue = static_cast<QueueKind>(srcIndex);
+			if (!batch.HasQueueWait(BatchWaitPhase::BeforeAfterPasses, QueueKind::Graphics, srcQueue)) {
+				continue;
+			}
+			WaitIfDistinct(
+				QueueKind::Graphics,
+				srcQueue,
+				GetQueueFenceOffset(srcQueue) + batch.GetQueueWaitFenceValue(BatchWaitPhase::BeforeAfterPasses, QueueKind::Graphics, srcQueue));
 		}
 
 		if (!graphicsPostTransitions.empty()) {
-			// Re-acquire in case the prior Flush closed the old list
 			graphicsCommandList = crm->EnsureOpen(QueueKind::Graphics, context.frameIndex);
 			ExecuteTransitions(graphicsPostTransitions,
 				crm,
 				QueueKind::Graphics,
 				graphicsCommandList);
+		}
 
-			if (renderCompletionSignal) {
-				UINT64 signalValue = currentGraphicsQueueFenceOffset + batch.GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, QueueKind::Graphics);
-				crm->Flush(QueueKind::Graphics, { true, signalValue });
-			}
+		if (renderCompletionSignal) {
+			UINT64 signalValue = currentGraphicsQueueFenceOffset + batch.GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, QueueKind::Graphics);
+			crm->Flush(QueueKind::Graphics, { true, signalValue });
 		}
 		++batchIndex;
 	}

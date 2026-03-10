@@ -198,12 +198,14 @@ public:
 	enum class BatchWaitPhase : uint8_t {
 		BeforeTransitions = 0,
 		BeforeExecution = 1,
+		BeforeAfterPasses = 2,
 		Count
 	};
 
 	enum class BatchSignalPhase : uint8_t {
 		AfterTransitions = 0,
-		AfterCompletion = 1,
+		AfterExecution = 1,
+		AfterCompletion = 2,
 		Count
 	};
 
@@ -614,8 +616,8 @@ private:
 	void ProcessResourceRequirements(
 		QueueKind passQueue,
 		std::vector<ResourceRequirement>& resourceRequirements,
-		std::unordered_map<uint64_t, unsigned int>&  batchOfLastGraphicsQueueUsage,
-		std::unordered_map<uint64_t, unsigned int>& producerHistory,
+		std::array<std::unordered_map<uint64_t, unsigned int>, static_cast<size_t>(QueueKind::Count)>& batchOfLastQueueUsage,
+		std::array<std::unordered_map<uint64_t, unsigned int>, static_cast<size_t>(QueueKind::Count)>& batchOfLastQueueTransition,
 		unsigned int batchIndex,
 		PassBatch& currentBatch,
 		std::unordered_set<uint64_t>& outTransitionedResourceIDs,
@@ -701,7 +703,8 @@ private:
 	}
 
 	void AddTransition(
-		std::unordered_map<uint64_t, unsigned int>&  batchOfLastGraphicsQueueUsage,
+		std::array<std::unordered_map<uint64_t, unsigned int>, static_cast<size_t>(QueueKind::Count)>& batchOfLastQueueUsage,
+		std::array<std::unordered_map<uint64_t, unsigned int>, static_cast<size_t>(QueueKind::Count)>& batchOfLastQueueTransition,
 		unsigned int batchIndex,
 		PassBatch& currentBatch,
 		QueueKind passQueue,
