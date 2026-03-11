@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <algorithm>
+#include <spdlog/spdlog.h>
 
 thread_local CommandRecordingManager::ThreadState CommandRecordingManager::s_tls{};
 
@@ -88,6 +89,18 @@ uint64_t CommandRecordingManager::Flush(QueueKind requested, Signal sig) {
 
             bind.queue->Signal({ bind.fence->GetHandle(), signaled });
             m_lastSignaledValue[qkIndex] = std::max(m_lastSignaledValue[qkIndex], signaled);
+#if BUILD_TYPE == BUILD_TYPE_DEBUG
+            // Detect out-of-order signals at the CRM level.
+            // This fires when the auto-generated recycle signal (GetCompletedValue()+1)
+            // regresses behind an in-flight signal from a prior frame because no batch
+            // explicitly signaled this queue.
+            auto result = bind.fence->GetCompletedValue();
+            (void)result; // GetCompletedValue is informational; the real check is:
+            // If Signal failed at the RHI layer, it would set an error on the device.
+            // Log enough context to diagnose which queue and values are involved.
+            spdlog::trace("CRM::Flush queue={} signaled={} lastTracked={} completed={}",
+                qkIndex, signaled, m_lastSignaledValue[qkIndex], result);
+#endif
         }
 
         // Return the pair to the pool tagged with the fence.

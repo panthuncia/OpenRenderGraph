@@ -44,6 +44,11 @@ public:
     rhi::Timeline* Fence(QueueKind qk) const;
     rhi::Queue* Queue(QueueKind qk) const;
 
+    // Last value signaled by this CRM on the given logical queue (after resolve).
+    uint64_t LastSignaledValue(QueueKind qk) const {
+        return m_lastSignaledValue[static_cast<size_t>(resolve(qk))];
+    }
+
     // For aliasing mode: set at frame begin
     void SetComputeMode(ComputeMode mode) { m_computeMode = mode; }
 
