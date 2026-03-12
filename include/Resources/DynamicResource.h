@@ -37,6 +37,7 @@ public:
         if (resource) {
             return resource->GetEnhancedBarrierGroup(range, prevAccessType, newAccessType, prevLayout, newLayout, prevSyncState, newSyncState);
         }
+        return {};
     }
 
     rhi::Resource GetAPIResource() override {

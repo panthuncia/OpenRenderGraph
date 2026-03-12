@@ -123,7 +123,7 @@ protected:
     virtual void OnBackingMaterialized() {}
 
 	// Engine representation of a GPU buffer- owns a handle to the actual GPU resource.
-    std::unique_ptr<GpuBufferBacking> m_dataBuffer = nullptr;
+    std::unique_ptr<GpuBufferBacking> m_dataBuffer;
     rhi::HeapType m_accessType = rhi::HeapType::DeviceLocal;
     uint64_t m_bufferSize = 0;
     bool m_unorderedAccess = false;
