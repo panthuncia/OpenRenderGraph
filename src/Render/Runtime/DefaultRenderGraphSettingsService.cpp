@@ -34,6 +34,10 @@ public:
     float GetAutoAliasPoolGrowthHeadroom() const override {
         return GetOpenRenderGraphSettings().autoAliasPoolGrowthHeadroom;
     }
+
+    bool GetHeavyDebug() const override {
+        return GetOpenRenderGraphSettings().heavyDebug;
+    }
 };
 }
 

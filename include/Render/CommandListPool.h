@@ -3,6 +3,7 @@
 #include <deque>
 #include <vector>
 #include <cstdint>
+#include <atomic>
 #include <rhi.h>
 
 struct CommandListPair {
@@ -28,6 +29,7 @@ public:
 private:
     rhi::Device m_device;
     rhi::QueueKind m_type;
+    std::atomic<uint64_t> m_nextDebugNameId{ 1 };
 
     std::vector<CommandListPair> m_available;
     std::deque<std::pair<uint64_t, CommandListPair>> m_inFlight;

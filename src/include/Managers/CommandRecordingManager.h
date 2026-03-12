@@ -49,6 +49,15 @@ public:
         return m_lastSignaledValue[static_cast<size_t>(resolve(qk))];
     }
 
+    // Raise the tracked last-signaled value for a queue so that subsequent
+    // auto-generated signals (e.g. cleanup Flush) start above this floor.
+    // Does NOT issue a GPU signal; only adjusts the CRM's bookkeeping.
+    void EnsureMinSignaledValue(QueueKind qk, uint64_t minValue) {
+        const size_t idx = static_cast<size_t>(resolve(qk));
+        if (minValue > m_lastSignaledValue[idx])
+            m_lastSignaledValue[idx] = minValue;
+    }
+
     // For aliasing mode: set at frame begin
     void SetComputeMode(ComputeMode mode) { m_computeMode = mode; }
 

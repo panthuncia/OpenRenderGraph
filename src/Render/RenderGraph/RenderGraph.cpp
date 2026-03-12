@@ -708,6 +708,9 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 					if (--indeg[v] == 0) ready.push_back(v);
 				}
 				--remaining;
+				if (rg.m_getHeavyDebug && rg.m_getHeavyDebug()) {
+					closeBatch();
+				}
 				continue;
 			}
 		}
@@ -737,6 +740,11 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 		}
 
 		--remaining;
+
+		// Heavy-debug: isolate every pass into its own batch.
+		if (rg.m_getHeavyDebug && rg.m_getHeavyDebug()) {
+			closeBatch();
+		}
 	}
 
 	// Final batch
@@ -2709,8 +2717,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 
 	// Validate per transition phase.
 	// NOTE: transitions for the same resource can be valid across phases
-	// (e.g. BeforePasses transitions into RT state, then AfterPasses transitions
-	// back for consumers). Flattening phases together produces false positives.
+	// (e.g. BeforePasses transitions into RT state, then AfterPasses transitions back for consumers).
 	for (size_t bi = 0; bi < batches.size(); bi++) {
 		auto& batch = batches[bi];
 		for (size_t phaseIndex = 0; phaseIndex < static_cast<size_t>(BatchTransitionPhase::Count); ++phaseIndex) {
@@ -2742,7 +2749,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		}
 	}
 
-	// 2. No out-of-order fence signals on any queue.
+	// No out-of-order fence signals on any queue.
 	// For each queue, enabled signals must be strictly monotonically increasing
 	// in execution order: within a batch (AfterTransitions < AfterExecution < AfterCompletion)
 	// and across batches (last signal of batch N < first signal of batch N+1).
@@ -2787,7 +2794,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		}
 	}
 
-	// 3. No wait references a fence value that no signal on that source queue will produce.
+	// No wait references a fence value that no signal on that source queue will produce.
 	{
 		// Collect the set of all signaled fence values per queue.
 		std::array<std::unordered_set<UINT64>, PassBatch::kQueueCount> signaledValues;
@@ -2831,40 +2838,6 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 						}
 					}
 				}
-			}
-		}
-	}
-
-	// 4. Every batch that opens a command list on a queue MUST have at least one
-	// signal enabled on that queue (typically AfterCompletion). If a batch has
-	// transitions or passes on a queue but no signal, the command list will be
-	// left dirty after execution and the final cleanup Flush({false,0}) will
-	// auto-generate a recycling signal from GetCompletedValue()+1, which can
-	// regress behind in-flight signals from prior frames.
-	for (size_t bi = 0; bi < batches.size(); ++bi) {
-		const auto& batch = batches[bi];
-		for (size_t qi = 0; qi < PassBatch::kQueueCount; ++qi) {
-			const auto queue = static_cast<QueueKind>(qi);
-			bool hasWork = batch.HasPasses(queue)
-				|| batch.HasTransitions(queue, BatchTransitionPhase::BeforePasses)
-				|| batch.HasTransitions(queue, BatchTransitionPhase::AfterPasses);
-			if (!hasWork) continue;
-
-			bool hasAnySignal = false;
-			for (size_t sp = 0; sp < PassBatch::kSignalPhaseCount; ++sp) {
-				if (batch.HasQueueSignal(static_cast<BatchSignalPhase>(sp), queue)) {
-					hasAnySignal = true;
-					break;
-				}
-			}
-			if (!hasAnySignal) {
-				spdlog::error(
-					"Batch {} has work on {} queue (passes or transitions) but no "
-					"signal is enabled for that queue. This will leave the command "
-					"list dirty and the final cleanup Flush will auto-signal with a "
-					"stale fence value, causing out-of-order signals.",
-					bi, queueName(queue));
-				throw std::runtime_error("Render graph batch has queue work without a signal!");
 			}
 		}
 	}
@@ -3183,6 +3156,9 @@ void RenderGraph::Setup() {
 	m_getUseAsyncCompute = [this]() {
 		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetUseAsyncCompute() : false;
 	};
+	m_getHeavyDebug = [this]() {
+		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetHeavyDebug() : false;
+	};
 	m_getAutoAliasMode = [this]() {
 		const auto mode = m_renderGraphSettingsService
 			? m_renderGraphSettingsService->GetAutoAliasMode()
@@ -3461,7 +3437,16 @@ namespace {
 			if (!fr.fence.has_value()) {
 				spdlog::warn("Pass returned an external fence without a value. This should not happen.");
 			}
-			else {
+            else {
+				if (fr.fenceValue == 0) {
+					auto h = fr.fence.value().GetHandle();
+					spdlog::error(
+						"SignalExternalFences: pass returned fence (index={}, gen={}) "
+						"with value 0 — this will violate monotonic signal ordering. "
+						"Skipping signal.",
+						h.index, h.generation);
+					continue;
+				}
 #if BUILD_TYPE == BUILD_TYPE_DEBUG
 				// Detect external fences that accidentally use the queue's own fence
 				// timeline. This would cause the CRM's signal tracking to become stale,
@@ -3479,6 +3464,12 @@ namespace {
 					}
 				}
 #endif
+				spdlog::debug(
+					"SignalExternalFences: queue={} signaling timeline(idx={}, gen={}) value={}",
+					static_cast<int>(queueKind),
+					fr.fence.value().GetHandle().index,
+					fr.fence.value().GetHandle().generation,
+					fr.fenceValue);
 				queue.Signal({ fr.fence.value().GetHandle(), fr.fenceValue });
 			}
 		}
@@ -3490,6 +3481,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 	ValidateCompiledResourceGenerations();
 
 	bool useAsyncCompute = m_getUseAsyncCompute();
+	const bool heavyDebug = m_getHeavyDebug ? m_getHeavyDebug() : false;
 	auto& manager = DeviceManager::GetInstance();
 	CommandRecordingManager::Init init{
 		.graphicsQ = &manager.GetGraphicsQueue(),
@@ -3515,6 +3507,11 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 
 	const bool alias = (computeQueue == graphicsQueue);
 	auto GetQueueFenceTimeline = [&](QueueKind queue) -> rhi::Timeline& {
+		// When compute is aliased to graphics, compute work runs on the
+		// graphics queue and signals the graphics fence.  Any wait that
+		// targets the "compute" timeline must therefore use the graphics
+		// fence so it actually gets satisfied.
+		if (alias && queue == QueueKind::Compute) queue = QueueKind::Graphics;
 		switch (queue) {
 		case QueueKind::Graphics: return m_graphicsQueueFence.Get();
 		case QueueKind::Compute: return m_computeQueueFence.Get();
@@ -3522,13 +3519,14 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 		default: return m_graphicsQueueFence.Get();
 		}
 	};
+	// Fence offsets are zero — the per-queue counters already produce globally
+	// unique, monotonically increasing values across all frames, so no
+	// additional multiplication is needed.  The old formula
+	// `counter * frameFenceValue` caused O(n^2) growth that eventually
+	// overflowed UINT64.
 	auto GetQueueFenceOffset = [&](QueueKind queue) -> UINT64 {
-		switch (queue) {
-		case QueueKind::Graphics: return m_graphicsQueueFenceValue * context.frameFenceValue;
-		case QueueKind::Compute: return m_computeQueueFenceValue * context.frameFenceValue;
-		case QueueKind::Copy: return m_copyQueueFenceValue * context.frameFenceValue;
-		default: return 0;
-		}
+		(void)queue;
+		return 0;
 	};
 	auto QueueHandle = [&](QueueKind queue) -> rhi::Queue* {
 		switch (queue) {
@@ -3833,7 +3831,14 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 			QueueKind::Graphics,
 			graphicsCommandList);
 
-		if (batch.HasQueueSignal(BatchSignalPhase::AfterTransitions, QueueKind::Graphics) && !alias) {
+		// The AfterTransitions signal on Graphics historically guarded cross-queue
+		// waits between Graphics and Compute.  When aliased, those waits are no-ops
+		// (same physical queue) so the signal was suppressed.  However the Copy
+		// queue is *never* aliased and may legitimately wait on a Graphics
+		// AfterTransitions signal (e.g. when fallback transitions for a Copy pass
+		// are delegated to the Graphics queue).  We must therefore issue this
+		// signal even in alias mode if it is marked.
+		if (batch.HasQueueSignal(BatchSignalPhase::AfterTransitions, QueueKind::Graphics)) {
 			UINT64 signalValue = currentGraphicsQueueFenceOffset + batch.GetQueueSignalFenceValue(BatchSignalPhase::AfterTransitions, QueueKind::Graphics);
 			crm->Flush(QueueKind::Graphics, { true, signalValue });
 			graphicsCommandList = crm->EnsureOpen(QueueKind::Graphics, context.frameIndex);
@@ -3896,6 +3901,45 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 		}
 
 		SignalExternalFences(*graphicsQueue, QueueKind::Graphics, crm, graphicsExternalFences);
+
+		// Heavy-debug: flush all queues and CPU-wait after every batch so a
+		// DeviceRemoved fault is isolated to the passes in this batch.
+		if (heavyDebug) {
+			crm->Flush(QueueKind::Graphics, { false, 0 });
+			crm->Flush(QueueKind::Compute,  { false, 0 });
+			crm->Flush(QueueKind::Copy,     { false, 0 });
+
+			auto drainQueue = [&](QueueKind qk, const char* queueName) {
+				auto* fence = crm->Fence(qk);
+				if (!fence) return;
+				uint64_t lastVal = crm->LastSignaledValue(qk);
+				if (lastVal == 0) return;
+				auto result = fence->HostWait(lastVal);
+				DeviceManager::GetInstance().GetDevice().CheckDebugMessages();
+				if (rhi::Failed(result)) {
+					std::string passNames;
+					auto collectNames = [&](auto& passes) {
+						for (auto& pv : passes) {
+							std::visit([&](auto& pr) {
+								if (!passNames.empty()) passNames += ", ";
+								passNames += pr.name;
+							}, pv);
+						}
+					};
+					collectNames(batch.Passes(QueueKind::Graphics));
+					collectNames(batch.Passes(QueueKind::Compute));
+					collectNames(batch.Passes(QueueKind::Copy));
+					spdlog::error(
+						"[HeavyDebug] GPU fault after batch {} on {} queue. "
+						"Passes in batch: [{}]",
+						batchIndex, queueName, passNames);
+				}
+			};
+			drainQueue(QueueKind::Graphics, "Graphics");
+			drainQueue(QueueKind::Compute,  "Compute");
+			drainQueue(QueueKind::Copy,     "Copy");
+		}
+
 		++batchIndex;
 	}
 
@@ -3922,22 +3966,14 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 	m_lastAliasPlacementProducersByPoolAcrossFrames = std::move(nextLastAliasPlacementProducersByPoolAcrossFrames);
 	DeletionManager::GetInstance().ProcessDeletions();
 
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
-	// Verify that the CRM's tracked last-signaled value for each queue is at least as
-	// high as the highest explicit signal issued during this frame's batch execution.
-	// If it isn't, the cleanup Flush below would auto-generate a recycling signal from
-	// lastSignaledValue+1, which would regress behind the explicit signals and trigger
-	// an out-of-order signal error in the RHI.
+	// --- Prime the CRM so cleanup Flushes never regress behind batch signals ---
+	// The CRM is created per-frame and initialises m_lastSignaledValue from
+	// GetCompletedValue().  If a queue had work but no batch-scheduled signal
+	// (e.g. a copy pass that only consumes resources), the CRM's tracked value
+	// stays at GetCompletedValue() which can lag behind in-flight signals from
+	// prior frames.  Raising the floor here ensures the auto-generated recycling
+	// signal from Flush is strictly greater than every explicit signal this frame.
 	{
-		auto queueNameDbg = [](QueueKind q) -> const char* {
-			switch (q) {
-			case QueueKind::Graphics: return "Graphics";
-			case QueueKind::Compute:  return "Compute";
-			case QueueKind::Copy:     return "Copy";
-			default: return "Unknown";
-			}
-		};
-		// Compute the highest absolute signal value issued per queue during this frame.
 		std::array<UINT64, static_cast<size_t>(QueueKind::Count)> maxIssuedSignal{};
 		for (const auto& batch : batches) {
 			for (size_t qi = 0; qi < PassBatch::kQueueCount; ++qi) {
@@ -3950,6 +3986,21 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 				}
 			}
 		}
+		for (size_t qi = 0; qi < static_cast<size_t>(QueueKind::Count); ++qi) {
+			if (maxIssuedSignal[qi] > 0) {
+				crm->EnsureMinSignaledValue(static_cast<QueueKind>(qi), maxIssuedSignal[qi]);
+			}
+		}
+
+#if BUILD_TYPE == BUILD_TYPE_DEBUG
+		auto queueNameDbg = [](QueueKind q) -> const char* {
+			switch (q) {
+			case QueueKind::Graphics: return "Graphics";
+			case QueueKind::Compute:  return "Compute";
+			case QueueKind::Copy:     return "Copy";
+			default: return "Unknown";
+			}
+		};
 		for (size_t qi = 0; qi < static_cast<size_t>(QueueKind::Count); ++qi) {
 			auto* crmFence = crm->Fence(static_cast<QueueKind>(qi));
 			if (!crmFence) continue;
@@ -3964,8 +4015,8 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 				throw std::runtime_error("CRM signal tracking is stale — cleanup Flush would produce out-of-order signal!");
 			}
 		}
-	}
 #endif
+	}
 
 	crm->Flush(QueueKind::Graphics, { false, 0 });
 	crm->Flush(QueueKind::Compute, { false, 0 });

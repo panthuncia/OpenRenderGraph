@@ -75,11 +75,19 @@ uint64_t CommandRecordingManager::Flush(QueueKind requested, Signal sig) {
 			bind.queue->Submit({ &ctx.list.Get(), 1 }, {});
         }
 
+		//bind.queue->CheckDebugMessages();
+
         // Decide on signaling.
         // Dirty command lists that were submitted must be associated with a fence value
         // so the pool can recycle them safely.
         const bool mustSignalForRecycle = ctx.dirty;
         if (sig.enable || mustSignalForRecycle) {
+			if (m_lastSignaledValue[qkIndex] == UINT64_MAX) {
+				// Something is wrong
+                spdlog::error("CRM::Flush signal: timeline for queue {} has exhausted its value space! No further command lists can be recorded.",
+                    static_cast<int>(qk));
+                throw std::runtime_error("Timeline value space exhausted");
+            }
             if (sig.enable && sig.value != 0) {
                 signaled = sig.value;
             }
@@ -87,6 +95,12 @@ uint64_t CommandRecordingManager::Flush(QueueKind requested, Signal sig) {
                 signaled = ++m_lastSignaledValue[qkIndex];
             }
 
+            // Diagnostic: log every CRM fence signal so we can trace unexpected values
+            spdlog::debug("CRM::Flush signal: resolvedQueue={} fenceIdx={} fenceGen={} value={}",
+                static_cast<int>(qk),
+                bind.fence->GetHandle().index,
+                bind.fence->GetHandle().generation,
+                signaled);
             bind.queue->Signal({ bind.fence->GetHandle(), signaled });
             m_lastSignaledValue[qkIndex] = std::max(m_lastSignaledValue[qkIndex], signaled);
 #if BUILD_TYPE == BUILD_TYPE_DEBUG

@@ -553,9 +553,9 @@ private:
 
 	std::vector<std::unique_ptr<IRenderGraphExtension>> m_extensions;
 
-	UINT64 m_graphicsQueueFenceValue = 0;
-	UINT64 m_computeQueueFenceValue = 0;
-	UINT64 m_copyQueueFenceValue = 0;
+	UINT64 m_graphicsQueueFenceValue = 1;
+	UINT64 m_computeQueueFenceValue = 1;
+	UINT64 m_copyQueueFenceValue = 1;
 	UINT64 GetNextQueueFenceValue(QueueKind queue) {
 		switch (queue) {
 		case QueueKind::Graphics:
@@ -570,6 +570,7 @@ private:
 	}
 
 	std::function<bool()> m_getUseAsyncCompute;
+	std::function<bool()> m_getHeavyDebug;
 
 	void AddResource(std::shared_ptr<Resource> resource, bool transition = false);
 	void MaterializeUnmaterializedResources(const std::unordered_set<uint64_t>* onlyResourceIDs = nullptr);

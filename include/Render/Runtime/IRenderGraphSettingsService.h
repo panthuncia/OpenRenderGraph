@@ -16,6 +16,7 @@ public:
     virtual bool GetAutoAliasLogExclusionReasons() const = 0;
     virtual uint32_t GetAutoAliasPoolRetireIdleFrames() const = 0;
     virtual float GetAutoAliasPoolGrowthHeadroom() const = 0;
+    virtual bool GetHeavyDebug() const = 0;
 };
 
 std::shared_ptr<IRenderGraphSettingsService> CreateDefaultRenderGraphSettingsService();

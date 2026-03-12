@@ -17,6 +17,7 @@ struct OpenRenderGraphSettings {
     bool autoAliasLogExclusionReasons = false;
     uint32_t autoAliasPoolRetireIdleFrames = 120u;
     float autoAliasPoolGrowthHeadroom = 1.5f;
+    bool heavyDebug = false;
 };
 
 namespace detail {
