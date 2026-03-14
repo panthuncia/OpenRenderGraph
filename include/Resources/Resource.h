@@ -15,9 +15,30 @@ class SymbolicTracker;
 
 class Resource : public std::enable_shared_from_this<Resource> {
 public:
+	struct ECSEntityHandle {
+		flecs::world* world = nullptr;
+		flecs::entity_t id = 0;
+
+		explicit operator bool() const noexcept {
+			return world != nullptr && id != 0;
+		}
+
+		void Disarm() noexcept {
+			world = nullptr;
+			id = 0;
+		}
+
+		flecs::entity ToEntity() const {
+			if (!*this) {
+				return {};
+			}
+			return flecs::entity{ *world, id };
+		}
+	};
+
     struct ECSEntityHooks {
-        std::function<flecs::entity()> createEntity;
-        std::function<void(flecs::entity&)> destroyEntity;
+        std::function<ECSEntityHandle()> createEntity;
+        std::function<void(flecs::world&, flecs::entity_t)> destroyEntity;
         std::function<bool()> isRuntimeAlive;
     };
 
@@ -41,17 +62,21 @@ public:
 		}
 
 		if (s_ecsEntityHooks.isRuntimeAlive && !s_ecsEntityHooks.isRuntimeAlive()) {
+			m_ecsEntity.Disarm();
 			return;
 		}
 
 		if (s_ecsEntityHooks.destroyEntity) {
-			s_ecsEntityHooks.destroyEntity(m_ecsEntity);
+			s_ecsEntityHooks.destroyEntity(*m_ecsEntity.world, m_ecsEntity.id);
+			m_ecsEntity.Disarm();
 			return;
 		}
 
-		if (m_ecsEntity.is_alive()) {
-			m_ecsEntity.destruct();
+		auto entity = m_ecsEntity.ToEntity();
+		if (entity && entity.is_alive()) {
+			entity.destruct();
 		}
+		m_ecsEntity.Disarm();
 	}
 
 
@@ -83,8 +108,8 @@ public:
 	// Optional capability: buffer-like resources can expose a byte size for generic readback/copy operations.
 	// This avoids relying on a specific concrete C++ type (e.g. Buffer vs DynamicBuffer).
 	virtual bool TryGetBufferByteSize(uint64_t& outByteSize) const { (void)outByteSize; return false; }
-	flecs::entity& GetECSEntity() {
-		return m_ecsEntity;
+	flecs::entity GetECSEntity() const {
+		return m_ecsEntity.ToEntity();
 	}
 
 protected:
@@ -102,7 +127,7 @@ private:
     inline static std::atomic<uint64_t> globalResourceCount;
 	inline static ECSEntityHooks s_ecsEntityHooks{};
     uint64_t m_globalResourceID;
-	flecs::entity m_ecsEntity; // For access through ECS queries
+	ECSEntityHandle m_ecsEntity; // For access through ECS queries without dereferencing Flecs during teardown
 
     //friend class RenderGraph;
     friend class ResourceGroup;

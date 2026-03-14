@@ -13,6 +13,13 @@ class DeletionManager {
 public:
 	static DeletionManager& GetInstance();
 
+	bool IsInitialized() const noexcept {
+		return m_numFramesInFlight != 0 &&
+			!m_deletionQueue.empty() &&
+			!m_allocationDeletionQueue.empty() &&
+			!m_trackedAllocationDeletionQueue.empty();
+	}
+
 	void Initialize() {
 		m_numFramesInFlight = rg::runtime::GetOpenRenderGraphSettings().numFramesInFlight;
 		m_deletionQueue.resize(m_numFramesInFlight);
@@ -21,18 +28,31 @@ public:
 	}
 
 	void MarkForDelete(rhi::helpers::AnyObjectPtr ptr) {
+		if (!IsInitialized()) {
+			return;
+		}
 		m_deletionQueue[0].push_back(std::move(ptr));
 	}
 
 	void MarkForDelete(rhi::ma::AllocationPtr ptr) {
+		if (!IsInitialized()) {
+			return;
+		}
 		m_allocationDeletionQueue[0].push_back(std::move(ptr));
 	}
 
 	void MarkForDelete(TrackedHandle&& alloc) {
+		if (!IsInitialized()) {
+			alloc.Reset();
+			return;
+		}
 		m_trackedAllocationDeletionQueue[0].push_back(std::move(alloc));
 	}
 
 	void ProcessDeletions() {
+		if (!IsInitialized()) {
+			return;
+		}
 		m_deletionQueue.back().clear();
 		for (int i = static_cast<int>(m_deletionQueue.size()) - 1; i >= 1; --i) {
 			m_deletionQueue[i].swap(m_deletionQueue[i - 1]);
@@ -51,11 +71,9 @@ public:
 
 	void Cleanup() {
 		m_deletionQueue.clear();
-		m_deletionQueue.resize(m_numFramesInFlight);
 		m_allocationDeletionQueue.clear();
-		m_allocationDeletionQueue.resize(m_numFramesInFlight);
 		m_trackedAllocationDeletionQueue.clear();
-		m_trackedAllocationDeletionQueue.resize(m_numFramesInFlight);
+		m_numFramesInFlight = 0;
 	}
 
 private:

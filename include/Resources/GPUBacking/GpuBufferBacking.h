@@ -5,6 +5,7 @@
 #include <mutex>
 #include <optional>
 #include <stacktrace>
+#include <string>
 #include <unordered_map>
 
 #include <rhi.h>
@@ -81,15 +82,14 @@ private:
 		const char* name = nullptr,
 		const BufferAliasPlacement* aliasPlacement = nullptr);
 
-	void RegisterLiveAlloc();
-	void UnregisterLiveAlloc();
-	void UpdateLiveAllocName(const char* name);
-
 	struct LiveAllocInfo {
 		size_t size = 0;
 		std::string name;
 	};
 
-	inline static std::mutex s_liveMutex;
-	inline static std::unordered_map<const GpuBufferBacking*, LiveAllocInfo> s_liveAllocs;
+	void RegisterLiveAlloc();
+	void UnregisterLiveAlloc();
+	void UpdateLiveAllocName(const char* name);
+	static std::mutex& LiveAllocMutex();
+	static std::unordered_map<const GpuBufferBacking*, LiveAllocInfo>& LiveAllocs();
 };

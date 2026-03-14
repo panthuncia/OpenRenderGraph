@@ -573,6 +573,7 @@ private:
 	std::function<bool()> m_getHeavyDebug;
 
 	void AddResource(std::shared_ptr<Resource> resource, bool transition = false);
+	void ShutdownOwnedState();
 	void MaterializeUnmaterializedResources(const std::unordered_set<uint64_t>* onlyResourceIDs = nullptr);
 	SymbolicTracker& GetOrCreateCompileTracker(Resource* resource, uint64_t resourceID);
 	void MaterializeReferencedResources(

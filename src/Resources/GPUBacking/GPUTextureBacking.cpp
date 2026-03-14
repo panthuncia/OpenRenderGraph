@@ -211,6 +211,16 @@ void GpuTextureBacking::SetName(const char* newName)
 	UpdateLiveAllocName(newName);
 }
 
+std::mutex& GpuTextureBacking::LiveAllocMutex() {
+	static auto* mutex = new std::mutex();
+	return *mutex;
+}
+
+std::unordered_map<const GpuTextureBacking*, GpuTextureBacking::LiveAllocInfo>& GpuTextureBacking::LiveAllocs() {
+	static auto* liveAllocs = new std::unordered_map<const GpuTextureBacking*, LiveAllocInfo>();
+	return *liveAllocs;
+}
+
 rhi::BarrierBatch GpuTextureBacking::GetEnhancedBarrierGroup(RangeSpec range, rhi::ResourceAccessType prevAccessType, rhi::ResourceAccessType newAccessType, rhi::ResourceLayout prevLayout, rhi::ResourceLayout newLayout, rhi::ResourceSyncState prevSyncState, rhi::ResourceSyncState newSyncState) {
 
 	rhi::BarrierBatch batch = {};
@@ -233,33 +243,32 @@ rhi::BarrierBatch GpuTextureBacking::GetEnhancedBarrierGroup(RangeSpec range, rh
 }
 
 void GpuTextureBacking::RegisterLiveAlloc() {
-	std::scoped_lock lock(s_liveMutex);
+	auto& liveAllocs = LiveAllocs();
+	std::scoped_lock lock(LiveAllocMutex());
 	LiveAllocInfo info{};
-	s_liveAllocs[this] = info;
+	liveAllocs[this] = info;
 }
 
 void GpuTextureBacking::UnregisterLiveAlloc() {
-	std::scoped_lock lock(s_liveMutex);
-	if (s_liveAllocs.find(this) == s_liveAllocs.end()) { // If an error occurs here, it means something is being destructed after this global was destroyed.
-		spdlog::warn("GpuBufferBacking being destroyed but not found in live allocations!");
-	}
-	else {
-		s_liveAllocs.erase(this);
-	}
+	auto& liveAllocs = LiveAllocs();
+	std::scoped_lock lock(LiveAllocMutex());
+	liveAllocs.erase(this);
 }
 
 void GpuTextureBacking::UpdateLiveAllocName(const char* name) {
-	std::scoped_lock lock(s_liveMutex);
-	auto it = s_liveAllocs.find(this);
-	if (it != s_liveAllocs.end()) {
+	auto& liveAllocs = LiveAllocs();
+	std::scoped_lock lock(LiveAllocMutex());
+	auto it = liveAllocs.find(this);
+	if (it != liveAllocs.end()) {
 		it->second.name = name ? name : "";
 	}
 }
 
 unsigned int GpuTextureBacking::DumpLiveTextures() {
-	std::scoped_lock lock(s_liveMutex);
-	for (const auto& [ptr, info] : s_liveAllocs) {
+	auto& liveAllocs = LiveAllocs();
+	std::scoped_lock lock(LiveAllocMutex());
+	for (const auto& [ptr, info] : liveAllocs) {
 		spdlog::warn("Live texture still tracked: name='{}'", info.name);
 	}
-	return static_cast<unsigned int>(s_liveAllocs.size());
+	return static_cast<unsigned int>(liveAllocs.size());
 }

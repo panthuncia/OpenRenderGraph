@@ -1130,9 +1130,75 @@ RenderGraph::RenderGraph(rhi::Device device) {
 }
 
 RenderGraph::~RenderGraph() {
-	m_pCommandRecordingManager->ShutdownThreadLocal(); // Clears thread-local storage
+	if (m_pCommandRecordingManager) {
+		m_pCommandRecordingManager->ShutdownThreadLocal(); // Clears thread-local storage
+	}
+	ShutdownOwnedState();
 	DeletionManager::GetInstance().Cleanup();
 	DeviceManager::GetInstance().Cleanup();
+}
+
+void RenderGraph::ShutdownOwnedState() {
+	batches.clear();
+	initialTransitions.clear();
+	trackers.clear();
+	compileTrackers.clear();
+	m_masterPassList.clear();
+	m_framePasses.clear();
+	renderPassesByName.clear();
+	computePassesByName.clear();
+	resourcesByID.clear();
+	resourcesByName.clear();
+	m_transientFrameResourcesByID.clear();
+	resourceBackingGenerationByID.clear();
+	resourceIdleFrameCounts.clear();
+	compiledResourceGenerationByID.clear();
+	aliasMaterializeOptionsByID.clear();
+	aliasPlacementSignatureByID.clear();
+	aliasPlacementRangesByID.clear();
+	aliasPlacementPoolByID.clear();
+	aliasActivationPending.clear();
+	persistentAliasPools.clear();
+	autoAliasPoolByID.clear();
+	m_lastProducerByResourceAcrossFrames.clear();
+	m_lastAliasPlacementProducersByPoolAcrossFrames.clear();
+	for (auto& producerMap : m_compiledLastProducerBatchByResourceByQueue) {
+		producerMap.clear();
+	}
+	for (auto& row : m_hasPendingFrameStartQueueWait) {
+		row.fill(false);
+	}
+	for (auto& row : m_pendingFrameStartQueueWaitFenceValue) {
+		row.fill(0);
+	}
+
+	m_passBuilderOrder.clear();
+	m_passNamesSeenThisReset.clear();
+	m_passBuildersByName.clear();
+	m_extensions.clear();
+	_providerMap.clear();
+	_providers.clear();
+	_resolverMap.clear();
+	_registry = ResourceRegistry();
+
+	m_graphicsCommandListPool.reset();
+	m_computeCommandListPool.reset();
+	m_copyCommandListPool.reset();
+	m_pCommandRecordingManager.reset();
+
+	initialTransitionCommandAllocator.Reset();
+	m_initialTransitionFence.Reset();
+	m_frameStartSyncFence.Reset();
+	m_graphicsQueueFence.Reset();
+	m_computeQueueFence.Reset();
+	m_copyQueueFence.Reset();
+	m_readbackFence.Reset();
+
+	m_statisticsService.reset();
+	m_uploadService.reset();
+	m_readbackService.reset();
+	m_descriptorService.reset();
+	m_renderGraphSettingsService.reset();
 }
 
 SymbolicTracker& RenderGraph::GetOrCreateCompileTracker(Resource* resource, uint64_t resourceID) {

@@ -4,6 +4,8 @@
 #include <stacktrace>
 #include <mutex>
 #include <optional>
+#include <string>
+#include <unordered_map>
 
 #include "Resources/AliasingPlacement.h"
 #include "Resources/TextureDescription.h"
@@ -74,16 +76,15 @@ private:
 		const TextureAliasPlacement* placement,
 		const char* name);
 
-	void RegisterLiveAlloc();
-	void UnregisterLiveAlloc();
-	void UpdateLiveAllocName(const char* name);
-
 	struct LiveAllocInfo {
 		std::string name;
 	};
 
-	inline static std::mutex s_liveMutex;
-	inline static std::unordered_map<const GpuTextureBacking*, LiveAllocInfo> s_liveAllocs;
+	void RegisterLiveAlloc();
+	void UnregisterLiveAlloc();
+	void UpdateLiveAllocName(const char* name);
+	static std::mutex& LiveAllocMutex();
+	static std::unordered_map<const GpuTextureBacking*, LiveAllocInfo>& LiveAllocs();
 
 	unsigned int m_width;
 	unsigned int m_height;
