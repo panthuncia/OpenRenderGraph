@@ -1,4 +1,5 @@
 #include "Render/DescriptorHeap.h"
+#include <mutex>
 
 DescriptorHeap::DescriptorHeap(rhi::Device& device, rhi::DescriptorHeapType type, uint32_t numDescriptors, bool shaderVisible, std::string name)
     : m_type(type), m_shaderVisible(shaderVisible), m_numDescriptorsAllocated(0) {
@@ -19,6 +20,7 @@ rhi::DescriptorHeap DescriptorHeap::GetHeap() {
 }
 
 UINT DescriptorHeap::AllocateDescriptor() {
+    std::lock_guard lock(m_allocationMutex);
     if (!m_freeIndices.empty()) {
         UINT freeIndex = m_freeIndices.front();
         m_freeIndices.pop();
@@ -31,6 +33,7 @@ UINT DescriptorHeap::AllocateDescriptor() {
 }
 
 void DescriptorHeap::ReleaseDescriptor(UINT index) {
+    std::lock_guard lock(m_allocationMutex);
 //#if BUILD_TYPE == BUILD_TYPE_DEBUG
 //    if (index == 0) {
 //		spdlog::error("DescriptorHeap::ReleaseDescriptor: Attempting to release descriptor 0");

@@ -26,6 +26,7 @@
 #include "Render/Runtime/IReadbackService.h"
 #include "Render/Runtime/IDescriptorService.h"
 #include "Render/Runtime/IRenderGraphSettingsService.h"
+#include "Render/Runtime/ITaskService.h"
 #include "Render/QueueKind.h"
 #include "Resources/PixelBuffer.h"
 #include "Resources/Buffers/Buffer.h"
@@ -366,6 +367,9 @@ public:
 	void SetRenderGraphSettingsService(std::shared_ptr<rg::runtime::IRenderGraphSettingsService> service) { m_renderGraphSettingsService = std::move(service); }
 	rg::runtime::IRenderGraphSettingsService* GetRenderGraphSettingsService() { return m_renderGraphSettingsService.get(); }
 	const rg::runtime::IRenderGraphSettingsService* GetRenderGraphSettingsService() const { return m_renderGraphSettingsService.get(); }
+	void SetTaskService(std::shared_ptr<rg::runtime::ITaskService> service) { m_taskService = std::move(service); }
+	rg::runtime::ITaskService* GetTaskService() { return m_taskService.get(); }
+	const rg::runtime::ITaskService* GetTaskService() const { return m_taskService.get(); }
 	//void AllocateResources(PassExecutionContext& context);
 	//void CreateResource(std::wstring name);
 	std::shared_ptr<Resource> GetResourceByName(const std::string& name);
@@ -524,6 +528,7 @@ private:
 	std::shared_ptr<rg::runtime::IReadbackService> m_readbackService;
 	std::shared_ptr<rg::runtime::IDescriptorService> m_descriptorService;
 	std::shared_ptr<rg::runtime::IRenderGraphSettingsService> m_renderGraphSettingsService;
+	std::shared_ptr<rg::runtime::ITaskService> m_taskService;
 	std::unordered_map<uint64_t, SymbolicTracker*> trackers; // Tracks the state of resources in the graph.
 	std::unordered_map<uint64_t, SymbolicTracker> compileTrackers; // Compile-only symbolic state, decoupled from backing lifetime.
 	std::unordered_map<uint64_t, LastProducerAcrossFrames> m_lastProducerByResourceAcrossFrames;
@@ -574,6 +579,18 @@ private:
 
 	void AddResource(std::shared_ptr<Resource> resource, bool transition = false);
 	void ShutdownOwnedState();
+
+	/// Dispatches to the injected ITaskService when available, otherwise runs a serial loop.
+	void ParallelForOptional(std::string_view taskName, size_t itemCount, std::function<void(size_t)> func) {
+		if (m_taskService) {
+			m_taskService->ParallelFor(taskName, itemCount, std::move(func));
+		} else {
+			for (size_t i = 0; i < itemCount; ++i) {
+				func(i);
+			}
+		}
+	}
+
 	void MaterializeUnmaterializedResources(const std::unordered_set<uint64_t>* onlyResourceIDs = nullptr);
 	SymbolicTracker& GetOrCreateCompileTracker(Resource* resource, uint64_t resourceID);
 	void MaterializeReferencedResources(

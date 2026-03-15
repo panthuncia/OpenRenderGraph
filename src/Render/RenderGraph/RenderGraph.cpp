@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <limits>
 #include <numeric>
+#include <optional>
 #include <sstream>
 #include <rhi_helpers.h>
 #include <rhi_debug.h>
@@ -2264,7 +2265,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		}
 	}
 
-	// --- Per-frame extension passes (ephemeral) ---
+	// Per-frame extension passes (ephemeral)
 	// These are injected into the per-frame pass list (not m_masterPassList) so they do not accumulate.
 	std::vector<ExternalPassDesc> frameExt;
 	frameExt.reserve(16);
@@ -3020,12 +3021,13 @@ std::tuple<int, int, int> RenderGraph::GetBatchesToWaitOn(
 }
 
 void RenderGraph::MaterializeUnmaterializedResources(const std::unordered_set<uint64_t>* onlyResourceIDs) {
-	auto materializeOne = [&](uint64_t id, Resource* resource) {
+	// Returns the backing generation if the resource was materialized (or already materialized), or nullopt if skipped.
+	auto materializeOne = [&](uint64_t id, Resource* resource) -> std::optional<uint64_t> {
 		if (onlyResourceIDs && onlyResourceIDs->find(id) == onlyResourceIDs->end()) {
-			return;
+			return std::nullopt;
 		}
 		if (!resource) {
-			return;
+			return std::nullopt;
 		}
 
 		auto texture = dynamic_cast<PixelBuffer*>(resource);
@@ -3068,20 +3070,19 @@ void RenderGraph::MaterializeUnmaterializedResources(const std::unordered_set<ui
 						// Setup-time eager materialization happens before alias planning.
 						// Defer aliased resources until compile-time placement is available.
 						if (!onlyResourceIDs) {
-							return;
+							return std::nullopt;
 						}
 					}
 					texture->Materialize();
 				}
 			}
 
-			resourceBackingGenerationByID[id] = texture->GetBackingGeneration();
-			return;
+			return texture->GetBackingGeneration();
 		}
 
 		auto buffer = dynamic_cast<Buffer*>(resource);
 		if (!buffer) {
-			return;
+			return std::nullopt;
 		}
 
 		if (!buffer->IsMaterialized()) {
@@ -3120,71 +3121,93 @@ void RenderGraph::MaterializeUnmaterializedResources(const std::unordered_set<ui
 					}
 
 					if (!onlyResourceIDs) {
-						return;
+						return std::nullopt;
 					}
 				}
 				buffer->Materialize();
 			}
 		}
 
-		resourceBackingGenerationByID[id] = buffer->GetBackingGeneration();
+		return buffer->GetBackingGeneration();
 	};
 
+	// Collect all unique {id, resource*} items to materialize
+	std::vector<std::pair<uint64_t, Resource*>> items;
+	items.reserve(resourcesByID.size() + m_transientFrameResourcesByID.size());
+	std::unordered_set<uint64_t> seen;
+
 	for (auto& [id, resource] : resourcesByID) {
-		materializeOne(id, resource.get());
+		if (seen.insert(id).second && resource) {
+			items.emplace_back(id, resource.get());
+		}
 	}
 
 	for (auto& [id, resource] : m_transientFrameResourcesByID) {
-		if (resourcesByID.contains(id)) {
-			continue;
+		if (resourcesByID.contains(id)) continue;
+		if (seen.insert(id).second && resource) {
+			items.emplace_back(id, resource.get());
 		}
-		materializeOne(id, resource.get());
 	}
 
-	auto materializeFromHandle = [&](const ResourceRegistry::RegistryHandle& handle) {
+	auto collectFromHandle = [&](const ResourceRegistry::RegistryHandle& handle) {
 		const uint64_t id = handle.GetGlobalResourceID();
-		if (onlyResourceIDs && onlyResourceIDs->find(id) == onlyResourceIDs->end()) {
-			return;
+		if (!seen.insert(id).second) return;
+		Resource* resource = handle.IsEphemeral() ? handle.GetEphemeralPtr() : _registry.Resolve(handle);
+		if (resource) {
+			items.emplace_back(id, resource);
 		}
-
-		Resource* resource = nullptr;
-		if (handle.IsEphemeral()) {
-			resource = handle.GetEphemeralPtr();
-		}
-		else {
-			resource = _registry.Resolve(handle);
-		}
-
-		materializeOne(id, resource);
 	};
 
 	for (const auto& pr : m_framePasses) {
 		if (pr.type == PassType::Compute) {
 			auto const& p = std::get<ComputePassAndResources>(pr.pass);
 			for (auto const& req : p.resources.frameResourceRequirements) {
-				materializeFromHandle(req.resourceHandleAndRange.resource);
+				collectFromHandle(req.resourceHandleAndRange.resource);
 			}
 			for (auto const& t : p.resources.internalTransitions) {
-				materializeFromHandle(t.first.resource);
+				collectFromHandle(t.first.resource);
 			}
 		}
 		else if (pr.type == PassType::Render) {
 			auto const& p = std::get<RenderPassAndResources>(pr.pass);
 			for (auto const& req : p.resources.frameResourceRequirements) {
-				materializeFromHandle(req.resourceHandleAndRange.resource);
+				collectFromHandle(req.resourceHandleAndRange.resource);
 			}
 			for (auto const& t : p.resources.internalTransitions) {
-				materializeFromHandle(t.first.resource);
+				collectFromHandle(t.first.resource);
 			}
 		}
 		else if (pr.type == PassType::Copy) {
 			auto const& p = std::get<CopyPassAndResources>(pr.pass);
 			for (auto const& req : p.resources.frameResourceRequirements) {
-				materializeFromHandle(req.resourceHandleAndRange.resource);
+				collectFromHandle(req.resourceHandleAndRange.resource);
 			}
 			for (auto const& t : p.resources.internalTransitions) {
-				materializeFromHandle(t.first.resource);
+				collectFromHandle(t.first.resource);
 			}
+		}
+	}
+
+	// Parallel materialize phase
+	struct GenerationResult {
+		uint64_t id = 0;
+		uint64_t generation = 0;
+		bool valid = false;
+	};
+	std::vector<GenerationResult> genResults(items.size());
+
+	ParallelForOptional("Materialize", items.size(), [&](size_t i) {
+		auto [id, resource] = items[i];
+		auto gen = materializeOne(id, resource);
+		if (gen.has_value()) {
+			genResults[i] = { id, gen.value(), true };
+		}
+	});
+
+	// Merge generation results
+	for (auto& r : genResults) {
+		if (r.valid) {
+			resourceBackingGenerationByID[r.id] = r.generation;
 		}
 	}
 }
@@ -3252,7 +3275,8 @@ void RenderGraph::Setup() {
 	MaterializeUnmaterializedResources();
 
 	// Run pass setup to collect static resource requirements
-	for (auto& pass : m_masterPassList) {
+	ParallelForOptional("PassSetup", m_masterPassList.size(), [this](size_t i) {
+		auto& pass = m_masterPassList[i];
 		switch (pass.type) {
 		case PassType::Render: {
 			auto& renderPass = std::get<RenderPassAndResources>(pass.pass);
@@ -3273,7 +3297,7 @@ void RenderGraph::Setup() {
 			break;
 		}
 		}
-	}
+	});
 }
 
 void RenderGraph::AddRenderPass(std::shared_ptr<RenderPass> pass, RenderPassParameters& resources, std::string name, std::vector<ResolverSnapshot> resolverSnapshots) {
@@ -4032,7 +4056,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 	m_lastAliasPlacementProducersByPoolAcrossFrames = std::move(nextLastAliasPlacementProducersByPoolAcrossFrames);
 	DeletionManager::GetInstance().ProcessDeletions();
 
-	// --- Prime the CRM so cleanup Flushes never regress behind batch signals ---
+	// Prime the CRM so cleanup Flushes never regress behind batch signals
 	// The CRM is created per-frame and initialises m_lastSignaledValue from
 	// GetCompletedValue().  If a queue had work but no batch-scheduled signal
 	// (e.g. a copy pass that only consumes resources), the CRM's tracked value
