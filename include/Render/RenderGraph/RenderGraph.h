@@ -232,8 +232,9 @@ public:
 		// Resources that passes in this batch transition internally
 		// Cannot be batched with other passes which use these resources
 		// Ideally, would be tracked per-subresource, but that sounds hard to implement
-		std::unordered_set<uint64_t> internallyTransitionedResources;
-		std::unordered_set<uint64_t> allResources; // All resources used in this batch, including those that are not transitioned internally
+		// Kept sorted for O(log N) lookup via binary_search.
+		std::vector<uint64_t> internallyTransitionedResources;
+		std::vector<uint64_t> allResources; // All resources used in this batch, including those that are not transitioned internally
 
 		// Queue dependencies and signals are modeled as queue-to-queue edges per phase.
 		// queueWaitEnabled[phase][dstQueue][srcQueue] + queueWaitFenceValue[phase][dstQueue][srcQueue]
@@ -478,8 +479,8 @@ private:
 		std::vector<uint64_t> uavIDs;
 
 		// For dependency building: per expanded ID, strongest access in this pass.
-		// Write dominates read.
-		std::unordered_map<uint64_t, AccessKind> accessByID;
+		// Write dominates read. Sorted by ID after BuildNodes.
+		std::vector<std::pair<uint64_t, AccessKind>> accessByID;
 
 		// DAG
 		std::vector<size_t> out;
@@ -600,7 +601,7 @@ private:
 	void MaterializeReferencedResources(
 		const std::vector<ResourceRequirement>& resourceRequirements,
 		const std::vector<std::pair<ResourceHandleAndRange, ResourceState>>& internalTransitions);
-	std::unordered_set<uint64_t> CollectFrameResourceIDs() const;
+	void CollectFrameResourceIDs(std::unordered_set<uint64_t>& out) const;
 	void ApplyIdleDematerializationPolicy(const std::unordered_set<uint64_t>& usedResourceIDs);
 	void SnapshotCompiledResourceGenerations(const std::unordered_set<uint64_t>& usedResourceIDs);
 	void ValidateCompiledResourceGenerations() const;
@@ -615,9 +616,9 @@ private:
 		const std::vector<ResourceRequirement>& reqs,
 		const std::vector<std::pair<ResourceHandleAndRange, ResourceState>> passInternalTransitions,
 		const std::unordered_map<uint64_t, SymbolicTracker*>& passBatchTrackers,
-		const std::unordered_set<uint64_t>& currentBatchInternallyTransitionedResources,
-		const std::unordered_set<uint64_t>& currentBatchAllResources,
-		const std::unordered_set<uint64_t>& otherQueueUAVs);
+		const std::vector<uint64_t>& currentBatchInternallyTransitionedResources,
+		const std::vector<uint64_t>& currentBatchAllResources,
+		const std::vector<uint64_t>& otherQueueUAVs);
 	
 
 	std::tuple<int, int, int> GetBatchesToWaitOn(const ComputePassAndResources& pass, 
@@ -644,7 +645,8 @@ private:
 		unsigned int batchIndex,
 		PassBatch& currentBatch,
 		std::unordered_set<uint64_t>& outTransitionedResourceIDs,
-		std::unordered_set<uint64_t>& outFallbackResourceIDs);
+		std::unordered_set<uint64_t>& outFallbackResourceIDs,
+		std::vector<ResourceTransition>& scratchTransitions);
 
 	template<typename PassRes>
 	void applySynchronization(
@@ -733,7 +735,8 @@ private:
 		QueueKind passQueue,
 		const ResourceRequirement& r,
 		std::unordered_set<uint64_t>& outTransitionedResourceIDs,
-		std::unordered_set<uint64_t>& outFallbackResourceIDs);
+		std::unordered_set<uint64_t>& outFallbackResourceIDs,
+		std::vector<ResourceTransition>& scratchTransitions);
 
 	static inline bool IsUAVState(const ResourceState& s) noexcept {
 		return ((s.access & rhi::ResourceAccessType::UnorderedAccess) != 0) ||
@@ -773,7 +776,10 @@ private:
 
 		std::array<std::unordered_map<uint64_t, unsigned int>, static_cast<size_t>(QueueKind::Count)>& batchOfLastQueueTransition,
 		std::array<std::unordered_map<uint64_t, unsigned int>, static_cast<size_t>(QueueKind::Count)>& batchOfLastQueueProducer,
-		std::array<std::unordered_map<uint64_t, unsigned int>, static_cast<size_t>(QueueKind::Count)>& batchOfLastQueueUsage);
+		std::array<std::unordered_map<uint64_t, unsigned int>, static_cast<size_t>(QueueKind::Count)>& batchOfLastQueueUsage,
+		std::unordered_set<uint64_t>& scratchTransitioned,
+		std::unordered_set<uint64_t>& scratchFallback,
+		std::vector<ResourceTransition>& scratchTransitions);
 	void AutoScheduleAndBuildBatches(
 		RenderGraph& rg,
 		std::vector<AnyPassAndResources>& passes,
