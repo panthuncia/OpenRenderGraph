@@ -32,6 +32,7 @@
 #include "Resources/Buffers/Buffer.h"
 #include "Resources/TrackedAllocation.h"
 #include "Render/RenderGraph/Aliasing/RenderGraphAliasingSubsystem.h"
+#include "Render/RenderGraph/ExecutionSchedule.h"
 #include "Interfaces/IResourceResolver.h"
 
 class Resource;
@@ -553,6 +554,9 @@ private:
 	rhi::TimelinePtr m_readbackFence;
 
 	std::unique_ptr<CommandRecordingManager> m_pCommandRecordingManager;
+	ExecutionSchedule m_executionSchedule;
+
+	void BuildExecutionSchedule(bool alias);
 
 	rg::imm::ImmediateDispatch m_immediateDispatch{};
 
@@ -581,8 +585,8 @@ private:
 	void ShutdownOwnedState();
 
 	/// Dispatches to the injected ITaskService when available, otherwise runs a serial loop.
-	void ParallelForOptional(std::string_view taskName, size_t itemCount, std::function<void(size_t)> func) {
-		if (m_taskService) {
+	void ParallelForOptional(std::string_view taskName, size_t itemCount, std::function<void(size_t)> func, bool override = false) {
+		if (m_taskService && !override) {
 			m_taskService->ParallelFor(taskName, itemCount, std::move(func));
 		} else {
 			for (size_t i = 0; i < itemCount; ++i) {
