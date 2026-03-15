@@ -12,6 +12,11 @@
 
 namespace rg::runtime {
 
+struct BulkWriteHandle {
+    uint8_t* data = nullptr;
+    size_t capacity = 0;
+};
+
 enum class UploadPolicyTag : uint8_t {
     Immediate = 0,
     Coalesced = 1,
@@ -87,6 +92,46 @@ public:
         // (for example during scene/resource initialization), and clearing
         // them would drop required uploads before they are ever flushed.
         // Staged data is consumed/cleared in FlushToUploadService().
+    }
+
+    // Pre-sizes the scratch buffer so callers can memcpy into non-overlapping
+    // regions from multiple threads without synchronization.  Must be called
+    // single-threaded before the parallel writes begin.
+    BulkWriteHandle PrepareBulkWrite(size_t currentBufferSize) {
+        if (m_config.tag == UploadPolicyTag::Immediate) {
+            return {};
+        }
+
+        if (m_config.tag == UploadPolicyTag::Coalesced) {
+            if (m_coalescedScratchBytes.size() < currentBufferSize) {
+                m_coalescedScratchBytes.resize(currentBufferSize, 0u);
+            }
+            return { m_coalescedScratchBytes.data(), m_coalescedScratchBytes.size() };
+        }
+
+        // CoalescedRetained
+        if (m_retainedBytes.size() < currentBufferSize) {
+            m_retainedBytes.resize(currentBufferSize, 0u);
+        }
+        return { m_retainedBytes.data(), m_retainedBytes.size() };
+    }
+
+    // Registers a dirty range after parallel writes are complete.
+    // Must be called single-threaded.
+    void CommitBulkRegion(size_t offset, size_t size) {
+        if (m_config.tag == UploadPolicyTag::Immediate || size == 0) {
+            return;
+        }
+
+        if (m_config.tag == UploadPolicyTag::Coalesced) {
+            m_coalescedDirtyRanges.push_back(DirtyRange{ offset, offset + size, nullptr, 0 });
+            ++m_coalescedStagedWrites;
+            m_coalescedStagedBytes += static_cast<uint64_t>(size);
+            return;
+        }
+
+        // CoalescedRetained
+        AddOrMergeDirtyRange(offset, offset + size, nullptr, 0);
     }
 
 #if BUILD_TYPE == BUILD_TYPE_DEBUG
