@@ -21,4 +21,12 @@ struct MemoryBudgetStats {
     bool valid = false;
 };
 
+/// Per-task context for thread-safe query recording.
+/// Each parallel recording task owns one of these; the main thread
+/// merges them after all tasks complete.
+struct QueryRecordingContext {
+    std::vector<uint32_t> recordedIndices;
+    std::vector<std::pair<uint32_t, uint32_t>> pendingRanges;
+};
+
 }

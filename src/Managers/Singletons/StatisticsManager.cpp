@@ -340,6 +340,134 @@ void StatisticsManager::ResolveQueries(
     rec.clear();
 }
 
+void StatisticsManager::BeginQuery(
+    unsigned passIndex,
+    unsigned frameIndex,
+    rhi::Queue& queue,
+    rhi::CommandList& cmd,
+    QueryRecordingContext& ctx)
+{
+    if (!m_timestampPool || passIndex >= m_numPasses || passIndex >= m_queryPoolPassCapacity) return;
+
+    auto queueKind = queue.GetKind();
+    auto tsIt = m_timestampBuffers.find(queueKind);
+    if (tsIt == m_timestampBuffers.end() || !tsIt->second) return;
+
+    const uint32_t frameBase = frameIndex * m_queryPoolPassCapacity;
+    const uint32_t tsIdx = (frameBase + passIndex) * 2u;
+    cmd.WriteTimestamp(m_timestampPool->GetHandle(), tsIdx, rhi::Stage::Top);
+
+    if (m_collectPipelineStatistics && m_isGeometryPass[passIndex]) {
+        const uint32_t psIdx = frameBase + passIndex;
+        cmd.BeginQuery(m_pipelineStatsPool->GetHandle(), psIdx);
+    }
+    ctx.recordedIndices.push_back(tsIdx);
+}
+
+void StatisticsManager::EndQuery(
+    unsigned passIndex,
+    unsigned frameIndex,
+    rhi::Queue& queue,
+    rhi::CommandList& cmd,
+    QueryRecordingContext& ctx)
+{
+    if (!m_timestampPool || passIndex >= m_numPasses || passIndex >= m_queryPoolPassCapacity) return;
+
+    auto queueKind = queue.GetKind();
+    auto tsIt = m_timestampBuffers.find(queueKind);
+    if (tsIt == m_timestampBuffers.end() || !tsIt->second) return;
+
+    const uint32_t frameBase = frameIndex * m_queryPoolPassCapacity;
+    const uint32_t tsIdx = (frameBase + passIndex) * 2u + 1u;
+    cmd.WriteTimestamp(m_timestampPool->GetHandle(), tsIdx, rhi::Stage::Bottom);
+
+    if (m_collectPipelineStatistics && m_isGeometryPass[passIndex]) {
+        const uint32_t psIdx = frameBase + passIndex;
+        cmd.EndQuery(m_pipelineStatsPool->GetHandle(), psIdx);
+    }
+    ctx.recordedIndices.push_back(tsIdx);
+}
+
+void StatisticsManager::ResolveQueries(
+    unsigned frameIndex,
+    rhi::Queue& queue,
+    rhi::CommandList& cmd,
+    QueryRecordingContext& ctx)
+{
+    if (!m_timestampPool || m_timestampQueryInfo.elementSize == 0) return;
+
+    auto queueKind = queue.GetKind();
+    auto tsIt = m_timestampBuffers.find(queueKind);
+    if (tsIt == m_timestampBuffers.end() || !tsIt->second) return;
+    auto psIt = m_meshStatsBuffers.find(queueKind);
+    if (psIt == m_meshStatsBuffers.end() || !psIt->second) return;
+
+    auto& rec = ctx.recordedIndices;
+    if (rec.empty()) return;
+
+    std::sort(rec.begin(), rec.end());
+    std::vector<std::pair<uint32_t, uint32_t>> ranges;
+    uint32_t start = rec[0], prev = rec[0];
+    for (size_t i = 1; i < rec.size(); ++i) {
+        if (rec[i] == prev + 1) {
+            prev = rec[i];
+        } else {
+            ranges.emplace_back(start, prev - start + 1);
+            start = rec[i];
+            prev = rec[i];
+        }
+    }
+    ranges.emplace_back(start, prev - start + 1);
+
+    const uint32_t frameBase = frameIndex * m_queryPoolPassCapacity;
+    const uint64_t tsStride = m_timestampQueryInfo.elementSize;
+    const uint64_t psStride = m_pipelineStatsQueryInfo.elementSize;
+
+    auto& tsBuf = tsIt->second;
+    auto& psBuf = psIt->second;
+
+    for (auto& r : ranges) {
+        cmd.ResolveQueryData(
+            m_timestampPool->GetHandle(),
+            r.first, r.second,
+            tsBuf->GetHandle(),
+            tsStride * uint64_t(r.first)
+        );
+
+        ctx.pendingRanges.push_back(r);
+
+        if (!m_collectPipelineStatistics) continue;
+
+        for (uint32_t idx = r.first; idx < r.first + r.second; idx += 2) {
+            const uint32_t encoded = idx / 2;
+            if (encoded < frameBase) continue;
+            const uint32_t pi = encoded - frameBase;
+            if (pi >= m_numPasses) continue;
+            if (!m_isGeometryPass[pi]) continue;
+
+            const uint32_t psIdx = frameBase + pi;
+            cmd.ResolveQueryData(
+                m_pipelineStatsPool->GetHandle(),
+                psIdx, 1,
+                psBuf->GetHandle(),
+                psStride * uint64_t(psIdx)
+            );
+        }
+    }
+
+    rec.clear();
+}
+
+void StatisticsManager::MergePendingResolves(
+    rhi::QueueKind queueKind,
+    unsigned frameIndex,
+    QueryRecordingContext& ctx)
+{
+    auto& dest = m_pendingResolves[queueKind][frameIndex];
+    dest.insert(dest.end(), ctx.pendingRanges.begin(), ctx.pendingRanges.end());
+    ctx.pendingRanges.clear();
+}
+
 void StatisticsManager::OnFrameComplete(
     unsigned frameIndex,
     rhi::Queue& queue)

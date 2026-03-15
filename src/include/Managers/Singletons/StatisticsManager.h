@@ -10,6 +10,8 @@
 #include <rhi.h>
 #include "Render/Runtime/StatisticsTypes.h"
 
+using QueryRecordingContext = rg::runtime::QueryRecordingContext;
+
 using PassStats = rg::runtime::PassStats;
 using MeshPipelineStats = rg::runtime::MeshPipelineStats;
 
@@ -46,6 +48,12 @@ public:
 	void ResolveQueries(unsigned frameIndex,
 		rhi::Queue& queue,
 		rhi::CommandList& cmdList);
+
+	// Thread-safe overloads that use a per-task recording context.
+	void BeginQuery(unsigned passIndex, unsigned frameIndex, rhi::Queue& queue, rhi::CommandList& cmdList, QueryRecordingContext& ctx);
+	void EndQuery(unsigned passIndex, unsigned frameIndex, rhi::Queue& queue, rhi::CommandList& cmdList, QueryRecordingContext& ctx);
+	void ResolveQueries(unsigned frameIndex, rhi::Queue& queue, rhi::CommandList& cmdList, QueryRecordingContext& ctx);
+	void MergePendingResolves(rhi::QueueKind queueKind, unsigned frameIndex, QueryRecordingContext& ctx);
 
 	void OnFrameComplete(unsigned frameIndex,
 		rhi::Queue& queue);

@@ -43,6 +43,22 @@ public:
         StatisticsManager::GetInstance().ResolveQueries(frameIndex, queue, cmdList);
     }
 
+    void BeginQuery(unsigned passIndex, unsigned frameIndex, rhi::Queue& queue, rhi::CommandList& cmdList, QueryRecordingContext& ctx) override {
+        StatisticsManager::GetInstance().BeginQuery(passIndex, frameIndex, queue, cmdList, ctx);
+    }
+
+    void EndQuery(unsigned passIndex, unsigned frameIndex, rhi::Queue& queue, rhi::CommandList& cmdList, QueryRecordingContext& ctx) override {
+        StatisticsManager::GetInstance().EndQuery(passIndex, frameIndex, queue, cmdList, ctx);
+    }
+
+    void ResolveQueries(unsigned frameIndex, rhi::Queue& queue, rhi::CommandList& cmdList, QueryRecordingContext& ctx) override {
+        StatisticsManager::GetInstance().ResolveQueries(frameIndex, queue, cmdList, ctx);
+    }
+
+    void MergePendingResolves(rhi::QueueKind queueKind, unsigned frameIndex, QueryRecordingContext& ctx) override {
+        StatisticsManager::GetInstance().MergePendingResolves(queueKind, frameIndex, ctx);
+    }
+
     void OnFrameComplete(unsigned frameIndex, rhi::Queue& queue) override {
         StatisticsManager::GetInstance().OnFrameComplete(frameIndex, queue);
     }

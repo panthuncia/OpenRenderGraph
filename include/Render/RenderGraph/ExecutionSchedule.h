@@ -5,6 +5,8 @@
 #include <cstdint>
 #include "Render/CommandListPool.h"
 #include "Render/QueueKind.h"
+#include "Render/Runtime/StatisticsTypes.h"
+#include "RenderPasses/Base/PassReturn.h"
 
 // Describes the command-list layout for one queue within one batch.
 // Computed deterministically from the batch's signal flags.
@@ -18,6 +20,13 @@ struct QueueBatchSchedule {
 	// Pre-allocated CL pairs (indexed 0..numCLs-1).
 	// Filled during the pre-allocation phase of Execute().
 	std::array<CommandListPair, 3> preallocatedCLs;
+
+	// External fences collected during recording (populated by RecordQueueBatch,
+	// consumed by the submission phase).
+	std::vector<PassReturn> externalFences;
+
+	// Per-task statistics recording context for thread-safe parallel recording.
+	rg::runtime::QueryRecordingContext queryRecordingContext;
 };
 
 // Per-batch schedule, one entry per queue kind.
