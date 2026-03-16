@@ -665,13 +665,16 @@ private:
 		}
 
 		auto markSourceCompletionSignal = [&](int batchIndex) {
-			if (batchIndex < 0) {
+			if (batchIndex <= 0) {
 				return;
 			}
 			batches[batchIndex].MarkQueueSignal(BatchSignalPhase::AfterCompletion, sourceQueue);
 		};
 
 		auto sourceCompletionFence = [&](int batchIndex) -> UINT64 {
+			if (batchIndex <= 0) {
+				return 0;
+			}
 			return batches[batchIndex].GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, sourceQueue);
 		};
 
@@ -691,12 +694,15 @@ private:
 					currentBatch.GetQueueSignalFenceValue(BatchSignalPhase::AfterTransitions, sourceQueue));
 			} else {
 				// different batch, signal that batch's completion, then wait before *transition*
-				markSourceCompletionSignal(lastTransBatch);
-				currentBatch.AddQueueWait(
-					BatchWaitPhase::BeforeTransitions,
-					passQueue,
-					sourceQueue,
-					sourceCompletionFence(lastTransBatch));
+				const UINT64 completionFence = sourceCompletionFence(lastTransBatch);
+				if (completionFence != 0) {
+					markSourceCompletionSignal(lastTransBatch);
+					currentBatch.AddQueueWait(
+						BatchWaitPhase::BeforeTransitions,
+						passQueue,
+						sourceQueue,
+						completionFence);
+				}
 			}
 		}
 
@@ -708,22 +714,28 @@ private:
 		}
 #endif
 		if (lastProdBatch != -1) {
-			markSourceCompletionSignal(lastProdBatch);
-			currentBatch.AddQueueWait(
-				BatchWaitPhase::BeforeTransitions,
-				passQueue,
-				sourceQueue,
-				sourceCompletionFence(lastProdBatch));
+			const UINT64 completionFence = sourceCompletionFence(lastProdBatch);
+			if (completionFence != 0) {
+				markSourceCompletionSignal(lastProdBatch);
+				currentBatch.AddQueueWait(
+					BatchWaitPhase::BeforeTransitions,
+					passQueue,
+					sourceQueue,
+					completionFence);
+			}
 		}
 
 		// Handle the "usage" wait
 		if (lastUsageBatch != -1) {
-			markSourceCompletionSignal(lastUsageBatch);
-			currentBatch.AddQueueWait(
-				BatchWaitPhase::BeforeTransitions,
-				passQueue,
-				sourceQueue,
-				sourceCompletionFence(lastUsageBatch));
+			const UINT64 completionFence = sourceCompletionFence(lastUsageBatch);
+			if (completionFence != 0) {
+				markSourceCompletionSignal(lastUsageBatch);
+				currentBatch.AddQueueWait(
+					BatchWaitPhase::BeforeTransitions,
+					passQueue,
+					sourceQueue,
+					completionFence);
+			}
 		}
 	}
 

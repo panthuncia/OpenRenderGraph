@@ -72,7 +72,7 @@ public:
 			return;
 		}
 
-		// Hooks have been reset (shutdown) — the world pointer may be dangling.
+		// Hooks have been reset (shutdown) - the world pointer may be dangling.
 		// Only attempt entity cleanup if hooks are still installed.
 		m_ecsEntity.Disarm();
 	}

@@ -348,7 +348,7 @@ void RenderGraph::CommitPassToBatch(
 					if (itU != batchOfLastQueueUsage[qi].end())
 						latestBatch = std::max(latestBatch, (int)itU->second);
 				}
-				if (latestBatch >= 0 && static_cast<unsigned int>(latestBatch) != currentBatchIndex) {
+				if (latestBatch > 0 && static_cast<unsigned int>(latestBatch) != currentBatchIndex) {
 					rg.batches[latestBatch].MarkQueueSignal(BatchSignalPhase::AfterCompletion, srcQueue);
 					currentBatch.AddQueueWait(
 						BatchWaitPhase::BeforeTransitions,
@@ -432,7 +432,7 @@ void RenderGraph::CommitPassToBatch(
 					if (itU != batchOfLastQueueUsage[qi].end())
 						latestBatch = std::max(latestBatch, (int)itU->second);
 				}
-				if (latestBatch >= 0 && static_cast<unsigned int>(latestBatch) != currentBatchIndex) {
+				if (latestBatch > 0 && static_cast<unsigned int>(latestBatch) != currentBatchIndex) {
 					rg.batches[latestBatch].MarkQueueSignal(BatchSignalPhase::AfterCompletion, srcQueue);
 					currentBatch.AddQueueWait(
 						BatchWaitPhase::BeforeTransitions,
@@ -515,7 +515,7 @@ void RenderGraph::CommitPassToBatch(
 					if (itU != batchOfLastQueueUsage[qi].end())
 						latestBatch = std::max(latestBatch, (int)itU->second);
 				}
-				if (latestBatch >= 0 && static_cast<unsigned int>(latestBatch) != currentBatchIndex) {
+				if (latestBatch > 0 && static_cast<unsigned int>(latestBatch) != currentBatchIndex) {
 					rg.batches[latestBatch].MarkQueueSignal(BatchSignalPhase::AfterCompletion, srcQueue);
 					currentBatch.AddQueueWait(
 						BatchWaitPhase::BeforeTransitions,
@@ -2876,6 +2876,14 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 					if (!batch.HasQueueSignal(phase, queue)) continue;
 
 					UINT64 fenceVal = batch.GetQueueSignalFenceValue(phase, queue);
+					if (fenceVal == 0) {
+						spdlog::error(
+							"Zero-value fence signal on {} queue: "
+							"batch {} phase {} has signal enabled with fence value 0. "
+							"This will produce an invalid timeline signal at execution time.",
+							queueName(queue), bi, signalPhaseName(phase));
+						throw std::runtime_error("Render graph has zero-value fence signal!");
+					}
 					if (lastSignalBatch[qi] >= 0 && fenceVal <= lastSignalValue[qi]) {
 						spdlog::error(
 							"Out-of-order fence signal on {} queue: "
@@ -3615,6 +3623,7 @@ namespace {
 	struct ExecuteQueueBatchArgs {
 		QueueBatchSchedule& sched;
 		RenderGraph::PassBatch& batch;
+		size_t batchIndex;
 		QueueKind queue;
 		rhi::Queue& rhiQueue;
 		rhi::Timeline& fenceTimeline;
@@ -3756,6 +3765,15 @@ namespace {
 				// No explicit signal requested.  Generate a monotonically
 				// increasing recycle value so the pool can safely determine
 				// when the GPU is done with this allocator/list pair.
+				recycleFence = ++args.lastSignaledOnTimeline;
+			}
+			if (recycleFence == 0) {
+				spdlog::error("ExecuteQueueBatch: recycleFence is 0 for batch {} queue {} "
+					"(signalAfterCompletion={}, fenceOffset={}, fenceValue={}). "
+					"Falling back to monotonic signal.",
+					args.batchIndex, (int)queue, sched.signalAfterCompletion, fenceOffset,
+					batch.GetQueueSignalFenceValue(
+						RenderGraph::BatchSignalPhase::AfterCompletion, queue));
 				recycleFence = ++args.lastSignaledOnTimeline;
 			}
 			rhiQueue.Signal({ args.fenceTimeline.GetHandle(), recycleFence });
@@ -3933,6 +3951,17 @@ namespace {
 			} else {
 				recycleFence = ++args.lastSignaledOnTimeline;
 			}
+			// Guard: a zero-value signal violates timeline monotonic ordering.
+			// Fall back to a monotonic recycle value to keep execution alive.
+			if (recycleFence == 0) {
+				spdlog::error(
+					"SubmitQueueBatch: recycleFence is 0 (signalAfterCompletion={}, "
+					"fenceOffset={}, fenceValue={}). Falling back to monotonic signal.",
+					sched.signalAfterCompletion, fenceOffset,
+					batch.GetQueueSignalFenceValue(
+						RenderGraph::BatchSignalPhase::AfterCompletion, queue));
+				recycleFence = ++args.lastSignaledOnTimeline;
+			}
 			rhiQueue.Signal({ args.fenceTimeline.GetHandle(), recycleFence });
 			args.lastSignaledOnTimeline = std::max(args.lastSignaledOnTimeline, recycleFence);
 			args.pool.Recycle(std::move(sched.preallocatedCLs[clIndex]), recycleFence);
@@ -3944,6 +3973,15 @@ namespace {
 void RenderGraph::BuildExecutionSchedule(bool alias) {
 	auto& schedule = m_executionSchedule;
 	schedule.batches.resize(batches.size());
+
+	auto queueName = [](QueueKind queue) -> const char* {
+		switch (queue) {
+		case QueueKind::Graphics: return "Graphics";
+		case QueueKind::Compute:  return "Compute";
+		case QueueKind::Copy:     return "Copy";
+		default: return "Unknown";
+		}
+	};
 
 	for (size_t bi = 0; bi < batches.size(); ++bi) {
 		auto& batch = batches[bi];
@@ -3959,6 +3997,20 @@ void RenderGraph::BuildExecutionSchedule(bool alias) {
 			qs.active = hasPre || hasPasses || hasPost;
 
 			if (!qs.active) {
+				qs.numCLs = 0;
+				continue;
+			}
+
+			// Batch 0 is a dummy sentinel with all-zero fence values.
+			// It should never be active. If it is, something upstream
+			// incorrectly added transitions or passes to it.
+			if (bi == 0) {
+				spdlog::error(
+					"BuildExecutionSchedule: batch 0 (sentinel) is unexpectedly "
+					"active on {} queue (hasPre={}, hasPasses={}, hasPost={}). "
+					"This will produce a zero-value fence signal. Forcing inactive.",
+					queueName(queue), hasPre, hasPasses, hasPost);
+				qs.active = false;
 				qs.numCLs = 0;
 				continue;
 			}
@@ -4077,7 +4129,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 		const auto effectiveQueue = EffectiveProducerQueue(producerQueue);
 		for (const auto& [resourceID, producerBatch] : m_compiledLastProducerBatchByResourceByQueue[queueIndex]) {
 			(void)resourceID;
-			if (producerBatch < batches.size()) {
+			if (producerBatch > 0 && producerBatch < batches.size()) {
 				batches[producerBatch].MarkQueueSignal(BatchSignalPhase::AfterCompletion, effectiveQueue);
 			}
 		}
@@ -4178,6 +4230,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 				ExecuteQueueBatchArgs copyArgs{
 					.sched = copyQS,
 					.batch = batch,
+					.batchIndex = bi,
 					.queue = QueueKind::Copy,
 					.rhiQueue = *copyQueue,
 					.fenceTimeline = m_copyQueueFence.Get(),
@@ -4198,6 +4251,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 				ExecuteQueueBatchArgs computeArgs{
 					.sched = computeQS,
 					.batch = batch,
+					.batchIndex = bi,
 					.queue = QueueKind::Compute,
 					.rhiQueue = *computeQueue,
 					.fenceTimeline = GetQueueFenceTimeline(QueueKind::Compute),
@@ -4218,6 +4272,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 				ExecuteQueueBatchArgs graphicsArgs{
 					.sched = graphicsQS,
 					.batch = batch,
+					.batchIndex = bi,
 					.queue = QueueKind::Graphics,
 					.rhiQueue = *graphicsQueue,
 					.fenceTimeline = m_graphicsQueueFence.Get(),
@@ -4322,7 +4377,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 				.statisticsService = statisticsService,
 			};
 			RecordQueueBatch(args);
-		});
+		}, true);
 
 		// Merge per-task statistics contexts into the shared map
 		// on the main thread, before submission.
@@ -4401,7 +4456,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 		const auto producerQueue = static_cast<QueueKind>(queueIndex);
 		const auto effectiveQueue = EffectiveProducerQueue(producerQueue);
 		for (const auto& [resourceID, producerBatch] : m_compiledLastProducerBatchByResourceByQueue[queueIndex]) {
-			if (producerBatch >= batches.size()) {
+			if (producerBatch == 0 || producerBatch >= batches.size()) {
 				continue;
 			}
 
