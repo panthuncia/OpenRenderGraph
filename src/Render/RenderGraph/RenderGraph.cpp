@@ -1269,6 +1269,65 @@ SymbolicTracker& RenderGraph::GetOrCreateCompileTracker(Resource* resource, uint
 	return insertedIt->second;
 }
 
+void RenderGraph::CaptureCompileTrackersForExecution(const std::unordered_set<uint64_t>& resourceIDs) {
+	trackers.clear();
+	trackers.reserve(resourceIDs.size());
+
+	auto captureTracker = [&](uint64_t resourceID, Resource* resource) {
+		if (!resource) {
+			return;
+		}
+
+		if (!compileTrackers.contains(resourceID)) {
+			return;
+		}
+
+		bool hasLiveBacking = true;
+		if (auto* texture = dynamic_cast<PixelBuffer*>(resource)) {
+			hasLiveBacking = texture->IsMaterialized();
+		}
+		else if (auto* buffer = dynamic_cast<Buffer*>(resource)) {
+			hasLiveBacking = buffer->IsMaterialized();
+		}
+
+		if (!hasLiveBacking) {
+			return;
+		}
+
+		if (auto* tracker = resource->GetStateTracker()) {
+			trackers[resourceID] = tracker;
+		}
+	};
+
+	for (uint64_t resourceID : resourceIDs) {
+		auto itResource = resourcesByID.find(resourceID);
+		if (itResource != resourcesByID.end() && itResource->second) {
+			captureTracker(resourceID, itResource->second.get());
+			continue;
+		}
+
+		auto itTransient = m_transientFrameResourcesByID.find(resourceID);
+		if (itTransient != m_transientFrameResourcesByID.end() && itTransient->second) {
+			captureTracker(resourceID, itTransient->second.get());
+		}
+	}
+}
+
+void RenderGraph::PublishCompiledTrackerStates() {
+	for (const auto& [resourceID, liveTracker] : trackers) {
+		if (!liveTracker) {
+			continue;
+		}
+
+		auto itCompileTracker = compileTrackers.find(resourceID);
+		if (itCompileTracker == compileTrackers.end()) {
+			continue;
+		}
+
+		liveTracker->CopyFrom(itCompileTracker->second);
+	}
+}
+
 void RenderGraph::MaterializeReferencedResources(
 	const std::vector<ResourceRequirement>& resourceRequirements,
 	const std::vector<std::pair<ResourceHandleAndRange, ResourceState>>& internalTransitions)
@@ -2623,6 +2682,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 
 	AutoScheduleAndBuildBatches(*this, m_framePasses, nodes);
 	m_aliasingSubsystem.ApplyAliasQueueSynchronization(*this);
+	CaptureCompileTrackersForExecution(usedResourceIDs);
 
 	for (auto& row : m_hasPendingFrameStartQueueWait) {
 		row.fill(false);
@@ -4493,6 +4553,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 	crm->Flush(QueueKind::Graphics, { false, 0 });
 	crm->Flush(QueueKind::Compute, { false, 0 });
 	crm->Flush(QueueKind::Copy, { false, 0 });
+	PublishCompiledTrackerStates();
 	crm->EndFrame();
 }
 

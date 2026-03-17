@@ -598,6 +598,8 @@ private:
 
 	void MaterializeUnmaterializedResources(const std::unordered_set<uint64_t>* onlyResourceIDs = nullptr);
 	SymbolicTracker& GetOrCreateCompileTracker(Resource* resource, uint64_t resourceID);
+	void CaptureCompileTrackersForExecution(const std::unordered_set<uint64_t>& resourceIDs);
+	void PublishCompiledTrackerStates();
 	void MaterializeReferencedResources(
 		const std::vector<ResourceRequirement>& resourceRequirements,
 		const std::vector<std::pair<ResourceHandleAndRange, ResourceState>>& internalTransitions);

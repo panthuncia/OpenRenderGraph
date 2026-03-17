@@ -117,6 +117,8 @@ public:
     std::vector<Segment> Flatten(ResourceState const& skipState, bool includeSkipState = false) const;
 
     const std::vector<Segment>& GetSegments() const noexcept;
+
+    void CopyFrom(const SymbolicTracker& other);
 };
 
 struct TransitionConflict

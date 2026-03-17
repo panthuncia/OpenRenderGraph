@@ -80,7 +80,7 @@ static uint32_t boundUpper(const Bound &b) {
     switch (b.type) {
     case BoundType::Exact: return b.value;
     case BoundType::UpTo:  return b.value;
-    case BoundType::From:  // “>= value” means no finite upper -> inf
+    case BoundType::From:  // ï¿½>= valueï¿½ means no finite upper -> inf
     case BoundType::All:   return (std::numeric_limits<uint32_t>::max)();
     }
     return (std::numeric_limits<uint32_t>::max)();
@@ -324,6 +324,10 @@ std::vector<Segment> SymbolicTracker::Flatten(ResourceState const& skipState, bo
 
 const std::vector<Segment>& SymbolicTracker::GetSegments() const noexcept {
 	return _segs;
+}
+
+void SymbolicTracker::CopyFrom(const SymbolicTracker& other) {
+	_segs = other._segs;
 }
 
 bool ValidateNoConflictingTransitions(
