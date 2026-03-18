@@ -6,6 +6,7 @@
 #include <spdlog/spdlog.h>
 
 #include "Managers/Singletons/DeviceManager.h"
+#include "Managers/Singletons/DeletionManager.h"
 #include "Render/Runtime/OpenRenderGraphSettings.h"
 
 StatisticsManager& StatisticsManager::GetInstance() {
@@ -164,6 +165,25 @@ void StatisticsManager::SetupQueryHeap() {
     }
 
     m_queryPoolPassCapacity = m_numPasses;
+
+    // Defer destruction of old pools/buffers so the GPU can finish in-flight work.
+    auto& deletionMgr = DeletionManager::GetInstance();
+    if (m_timestampPool) {
+        deletionMgr.MarkForDelete(std::move(m_timestampPool));
+    }
+    if (m_pipelineStatsPool) {
+        deletionMgr.MarkForDelete(std::move(m_pipelineStatsPool));
+    }
+    for (auto& kv : m_timestampBuffers) {
+        if (kv.second) {
+            deletionMgr.MarkForDelete(std::move(kv.second));
+        }
+    }
+    for (auto& kv : m_meshStatsBuffers) {
+        if (kv.second) {
+            deletionMgr.MarkForDelete(std::move(kv.second));
+        }
+    }
 
     // Timestamp heap: 2 queries/pass/frame
 
