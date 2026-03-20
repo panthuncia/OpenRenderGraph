@@ -27,6 +27,7 @@ struct CopyPassParameters {
 	std::vector<ResourceRequirement> staticResourceRequirements;
 	std::vector<ResourceRequirement> frameResourceRequirements;
 	CopyQueueSelection queueSelection = CopyQueueSelection::Copy;
+	std::optional<QueueSlotIndex> queueSlotOverride; // Target a specific queue slot instead of using queueSelection
 };
 
 class CopyPassBuilder;

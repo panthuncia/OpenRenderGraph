@@ -29,10 +29,14 @@ struct QueueBatchSchedule {
 	rg::runtime::QueryRecordingContext queryRecordingContext;
 };
 
-// Per-batch schedule, one entry per queue kind.
+// Per-batch schedule, one entry per queue slot.
 struct BatchSchedule {
-	static constexpr size_t kQueueCount = static_cast<size_t>(QueueKind::Count);
-	std::array<QueueBatchSchedule, kQueueCount> queues{};
+	static constexpr size_t kQueueCount = static_cast<size_t>(QueueKind::Count); // Legacy; prefer queues.size()
+
+	BatchSchedule(size_t queueCount = kQueueCount)
+		: queues(queueCount) {}
+
+	std::vector<QueueBatchSchedule> queues;
 };
 
 // The full pre-computed execution schedule for a frame.

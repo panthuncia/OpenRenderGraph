@@ -30,6 +30,7 @@ struct ComputePassParameters {
 	std::vector<ResourceRequirement> staticResourceRequirements; // Static resource requirements for the pass
 	std::vector<ResourceRequirement> frameResourceRequirements; // Resource requirements that may change each frame + static ones
 	ComputeQueueSelection queueSelection = ComputeQueueSelection::Compute;
+	std::optional<QueueSlotIndex> queueSlotOverride; // Target a specific queue slot instead of using queueSelection
 };
 
 class ComputePassBuilder;

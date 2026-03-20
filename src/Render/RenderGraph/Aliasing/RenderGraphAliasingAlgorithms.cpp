@@ -1421,8 +1421,12 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph
 void rg::alias::RenderGraphAliasingSubsystem::ApplyAliasQueueSynchronization(RenderGraph& rg) const {
 	auto& batches = rg.batches;
 	auto& aliasPlacementRangesByID = rg.aliasPlacementRangesByID;
+	const size_t slotCount = rg.GetQueueRegistry().SlotCount();
+
 	struct QueueUsage {
-		std::array<bool, static_cast<size_t>(QueueKind::Count)> usesByQueue{};
+		std::vector<bool> usesBySlot;
+		QueueUsage() = default;
+		explicit QueueUsage(size_t n) : usesBySlot(n, false) {}
 	};
 
 	struct RangeOwner {
@@ -1441,42 +1445,45 @@ void rg::alias::RenderGraphAliasingSubsystem::ApplyAliasQueueSynchronization(Ren
 		return overlapStart < overlapEnd;
 	};
 
-	auto markUsage = [](QueueUsage& usage, QueueKind queue) {
-		usage.usesByQueue[static_cast<size_t>(queue)] = true;
+	auto markUsage = [](QueueUsage& usage, size_t slot) {
+		usage.usesBySlot[slot] = true;
 	};
 
 	for (size_t batchIndex = 0; batchIndex < batches.size(); ++batchIndex) {
 		auto& batch = batches[batchIndex];
 		std::unordered_map<uint64_t, QueueUsage> usageByResourceID;
 		size_t queuedPassCount = 0;
-		for (size_t queueIndex = 0; queueIndex < static_cast<size_t>(QueueKind::Count); ++queueIndex) {
-			queuedPassCount += batch.Passes(static_cast<QueueKind>(queueIndex)).size();
+		for (size_t qi = 0; qi < batch.QueueCount(); ++qi) {
+			queuedPassCount += batch.Passes(qi).size();
 		}
 		usageByResourceID.reserve(queuedPassCount);
 
-		auto accumulateFromReqs = [&](const std::vector<ResourceRequirement>& reqs, QueueKind queue) {
+		auto accumulateFromReqs = [&](const std::vector<ResourceRequirement>& reqs, size_t slot) {
 			for (auto const& req : reqs) {
 				const uint64_t resourceID = req.resourceHandleAndRange.resource.GetGlobalResourceID();
 				auto itPlacement = aliasPlacementRangesByID.find(resourceID);
 				if (itPlacement == aliasPlacementRangesByID.end()) {
 					continue;
 				}
-				markUsage(usageByResourceID[resourceID], queue);
+				auto& u = usageByResourceID[resourceID];
+				if (u.usesBySlot.empty()) {
+					u.usesBySlot.resize(slotCount, false);
+				}
+				markUsage(u, slot);
 			}
 		};
 
-		auto accumulateFromQueuedPass = [&](const RenderGraph::PassBatch::QueuedPass& queuedPass, QueueKind queue) {
+		auto accumulateFromQueuedPass = [&](const RenderGraph::PassBatch::QueuedPass& queuedPass, size_t slot) {
 			std::visit(
 				[&](auto const& pass) {
-					accumulateFromReqs(pass.resources.frameResourceRequirements, queue);
+					accumulateFromReqs(pass.resources.frameResourceRequirements, slot);
 				},
 				queuedPass);
 		};
 
-		for (size_t queueIndex = 0; queueIndex < static_cast<size_t>(QueueKind::Count); ++queueIndex) {
-			const auto queue = static_cast<QueueKind>(queueIndex);
-			for (const auto& queuedPass : batch.Passes(queue)) {
-				accumulateFromQueuedPass(queuedPass, queue);
+		for (size_t qi = 0; qi < batch.QueueCount(); ++qi) {
+			for (const auto& queuedPass : batch.Passes(qi)) {
+				accumulateFromQueuedPass(queuedPass, qi);
 			}
 		}
 
@@ -1503,28 +1510,26 @@ void rg::alias::RenderGraphAliasingSubsystem::ApplyAliasQueueSynchronization(Ren
 				}
 
 				auto& prevBatch = batches[prevOwner.batchIndex];
-				for (size_t prevQueueIndex = 0; prevQueueIndex < static_cast<size_t>(QueueKind::Count); ++prevQueueIndex) {
-					if (!prevOwner.usage.usesByQueue[prevQueueIndex]) {
+				for (size_t prevSlot = 0; prevSlot < prevOwner.usage.usesBySlot.size(); ++prevSlot) {
+					if (!prevOwner.usage.usesBySlot[prevSlot]) {
 						continue;
 					}
 
-					const auto prevQueue = static_cast<QueueKind>(prevQueueIndex);
-					for (size_t currQueueIndex = 0; currQueueIndex < static_cast<size_t>(QueueKind::Count); ++currQueueIndex) {
-						if (!usage.usesByQueue[currQueueIndex]) {
+					for (size_t currSlot = 0; currSlot < usage.usesBySlot.size(); ++currSlot) {
+						if (!usage.usesBySlot[currSlot]) {
 							continue;
 						}
 
-						const auto currQueue = static_cast<QueueKind>(currQueueIndex);
-						if (currQueue == prevQueue) {
+						if (currSlot == prevSlot) {
 							continue;
 						}
 
-						prevBatch.MarkQueueSignal(RenderGraph::BatchSignalPhase::AfterCompletion, prevQueue);
+						prevBatch.MarkQueueSignal(RenderGraph::BatchSignalPhase::AfterCompletion, prevSlot);
 						batch.AddQueueWait(
 							RenderGraph::BatchWaitPhase::BeforeTransitions,
-							currQueue,
-							prevQueue,
-							prevBatch.GetQueueSignalFenceValue(RenderGraph::BatchSignalPhase::AfterCompletion, prevQueue));
+							currSlot,
+							prevSlot,
+							prevBatch.GetQueueSignalFenceValue(RenderGraph::BatchSignalPhase::AfterCompletion, prevSlot));
 					}
 				}
 			}

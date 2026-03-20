@@ -831,6 +831,16 @@ public:
         return std::move(*this);
     }
 
+    RenderPassBuilder& OnQueue(QueueSlotIndex slot) & {
+        m_queueSlotOverride = slot;
+        return *this;
+    }
+
+    RenderPassBuilder OnQueue(QueueSlotIndex slot) && {
+        m_queueSlotOverride = slot;
+        return std::move(*this);
+    }
+
 	// LVALUE
     template<DerivedRenderPass PassT, rg::PassInputs InputsT, typename... StableCtorArgs>
     void Build(InputsT&& inputs, StableCtorArgs&&... ctorArgs)&
@@ -899,6 +909,7 @@ private:
 
         params.isGeometryPass = m_isGeometryPass;
         params.queueSelection = m_queueSelection;
+        params.queueSlotOverride = m_queueSlotOverride;
         params.identifierSet = _declaredIds;
         params.staticResourceRequirements = GatherResourceRequirements();
 
@@ -913,6 +924,7 @@ private:
         resolverSnapshots_.clear();
         m_isGeometryPass = false;
         m_queueSelection = RenderQueueSelection::Graphics;
+        m_queueSlotOverride = std::nullopt;
 	}
 
     // Shader Resource
@@ -1124,6 +1136,7 @@ private:
     bool built_ = false;
     bool m_isGeometryPass = false;
 	RenderQueueSelection m_queueSelection = RenderQueueSelection::Graphics;
+    std::optional<QueueSlotIndex> m_queueSlotOverride;
     std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> _declaredIds;
     std::vector<ResolverSnapshot> resolverSnapshots_;
 
@@ -1271,6 +1284,16 @@ public:
         return std::move(*this);
     }
 
+    ComputePassBuilder& OnQueue(QueueSlotIndex slot) & {
+        m_queueSlotOverride = slot;
+        return *this;
+    }
+
+    ComputePassBuilder OnQueue(QueueSlotIndex slot) && {
+        m_queueSlotOverride = slot;
+        return std::move(*this);
+    }
+
     // LVALUE overloads for IResourceResolver
     ComputePassBuilder& WithShaderResource(const IResourceResolver& r)& {
 		return WithResolver(r, [&](auto&& resolved) { addShaderResource(std::forward<decltype(resolved)>(resolved)); });
@@ -1377,6 +1400,7 @@ private:
 
         params.identifierSet = _declaredIds;
         params.queueSelection = m_queueSelection;
+        params.queueSlotOverride = m_queueSlotOverride;
         params.staticResourceRequirements = GatherResourceRequirements();
 
         graph->AddComputePass(pass, params, passName, TakeResolverSnapshots());
@@ -1389,6 +1413,7 @@ private:
         _declaredIds.clear();
         resolverSnapshots_.clear();
         m_queueSelection = ComputeQueueSelection::Compute;
+        m_queueSlotOverride = std::nullopt;
     }
 
     // Shader resource
@@ -1511,6 +1536,7 @@ private:
     std::shared_ptr<ComputePass> pass;
     bool built_ = false;
 	ComputeQueueSelection m_queueSelection = ComputeQueueSelection::Compute;
+    std::optional<QueueSlotIndex> m_queueSlotOverride;
     std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> _declaredIds;
     std::vector<ResolverSnapshot> resolverSnapshots_;
 
@@ -1613,6 +1639,16 @@ public:
         return std::move(*this);
     }
 
+    CopyPassBuilder& OnQueue(QueueSlotIndex slot) & {
+        m_queueSlotOverride = slot;
+        return *this;
+    }
+
+    CopyPassBuilder OnQueue(QueueSlotIndex slot) && {
+        m_queueSlotOverride = slot;
+        return std::move(*this);
+    }
+
     CopyPassBuilder& WithCopyDest(const IResourceResolver& r)& {
         return WithResolver(r, [&](auto&& resolved) { addCopyDest(std::forward<decltype(resolved)>(resolved)); });
     }
@@ -1689,6 +1725,7 @@ private:
 
         params.identifierSet = _declaredIds;
         params.queueSelection = m_queueSelection;
+        params.queueSlotOverride = m_queueSlotOverride;
         params.staticResourceRequirements = GatherResourceRequirements();
 
         graph->AddCopyPass(pass, params, passName, TakeResolverSnapshots());
@@ -1701,6 +1738,7 @@ private:
         _declaredIds.clear();
         resolverSnapshots_.clear();
         m_queueSelection = CopyQueueSelection::Copy;
+        m_queueSlotOverride = std::nullopt;
     }
 
     template<typename T>
@@ -1762,6 +1800,7 @@ private:
     std::shared_ptr<CopyPass> pass;
     bool built_ = false;
     CopyQueueSelection m_queueSelection = CopyQueueSelection::Copy;
+    std::optional<QueueSlotIndex> m_queueSlotOverride;
     std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> _declaredIds;
     std::vector<ResolverSnapshot> resolverSnapshots_;
 

@@ -10,8 +10,6 @@ struct Signal {
     uint64_t value = 0; // if enable and 0, manager will pick next monotonic
 };
 
-enum class ComputeMode : uint8_t { Async, AliasToGraphics };
-
 class CommandRecordingManager {
 public:
     struct Init {
@@ -19,15 +17,13 @@ public:
         rhi::Timeline* graphicsF = nullptr;
         CommandListPool* graphicsPool = nullptr; // pool created with DIRECT
 
-        rhi::Queue* computeQ = nullptr; // may be same as graphicsQ
+        rhi::Queue* computeQ = nullptr;
         rhi::Timeline* computeF = nullptr;
         CommandListPool* computePool = nullptr; // pool created with COMPUTE
 
         rhi::Queue* copyQ = nullptr;
         rhi::Timeline* copyF = nullptr;
         CommandListPool* copyPool = nullptr; // pool created with COPY
-
-        ComputeMode computeMode = ComputeMode::Async;
     };
 
     explicit CommandRecordingManager(const Init& init);
@@ -44,22 +40,19 @@ public:
     rhi::Timeline* Fence(QueueKind qk) const;
     rhi::Queue* Queue(QueueKind qk) const;
 
-    // Last value signaled by this CRM on the given logical queue (after resolve).
+    // Last value signaled by this CRM on the given logical queue.
     uint64_t LastSignaledValue(QueueKind qk) const {
-        return m_lastSignaledValue[static_cast<size_t>(resolve(qk))];
+        return m_lastSignaledValue[static_cast<size_t>(qk)];
     }
 
     // Raise the tracked last-signaled value for a queue so that subsequent
     // auto-generated signals (e.g. cleanup Flush) start above this floor.
     // Does NOT issue a GPU signal; only adjusts the CRM's bookkeeping.
     void EnsureMinSignaledValue(QueueKind qk, uint64_t minValue) {
-        const size_t idx = static_cast<size_t>(resolve(qk));
+        const size_t idx = static_cast<size_t>(qk);
         if (minValue > m_lastSignaledValue[idx])
             m_lastSignaledValue[idx] = minValue;
     }
-
-    // For aliasing mode: set at frame begin
-    void SetComputeMode(ComputeMode mode) { m_computeMode = mode; }
 
     void ShutdownThreadLocal();
 
@@ -75,11 +68,8 @@ private:
     // One per process; alias compute -> graphics in AliasToGraphics mode dynamically
     std::array<QueueBinding, static_cast<size_t>(QueueKind::Count)> m_bind{};
 
-    // Last value signaled by this manager per logical/effective queue.
+    // Last value signaled by this manager per logical queue.
     std::array<uint64_t, static_cast<size_t>(QueueKind::Count)> m_lastSignaledValue{};
-
-    // Resolve backing queue for a requested logical QueueKind, given computeMode
-    QueueKind resolve(QueueKind qk) const;
 
     //Per-thread recording state
     struct PerQueueCtx {
@@ -97,5 +87,4 @@ private:
 
     static thread_local ThreadState s_tls;
 
-    ComputeMode m_computeMode = ComputeMode::Async;
 };

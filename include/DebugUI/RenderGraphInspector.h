@@ -28,9 +28,10 @@ struct RGInspectorOptions {
 
 namespace RGInspector {
     void Show(const std::vector<RenderGraph::PassBatch>& batches,
+        const QueueRegistry& registry,
         RGPassUsesResourceFn passUses = nullptr,
-    RGResourceNameByIdFn resourceNameById = nullptr,
-    RGResourcePtrByIdFn resourcePtrById = nullptr,
+        RGResourceNameByIdFn resourceNameById = nullptr,
+        RGResourcePtrByIdFn resourcePtrById = nullptr,
         RGRequestReadbackCaptureFn requestReadbackCapture = nullptr,
         const RGInspectorOptions& opts = {});
 }

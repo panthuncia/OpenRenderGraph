@@ -28,6 +28,7 @@
 #include "Render/Runtime/IRenderGraphSettingsService.h"
 #include "Render/Runtime/ITaskService.h"
 #include "Render/QueueKind.h"
+#include "Render/QueueRegistry.h"
 #include "Resources/PixelBuffer.h"
 #include "Resources/Buffers/Buffer.h"
 #include "Resources/TrackedAllocation.h"
@@ -137,6 +138,7 @@ public:
 		std::optional<RenderQueueSelection> renderQueueSelection;
 		std::optional<ComputeQueueSelection> computeQueueSelection;
 		std::optional<CopyQueueSelection> copyQueueSelection;
+		std::optional<QueueSlotIndex> queueSlotOverride; // Target a specific queue slot, bypassing queue selection
 
 		// Optional: if true, the pass will be registered in Get*PassByName().
 		bool registerName = true;
@@ -218,16 +220,25 @@ public:
 	};
 
 	struct PassBatch {
-		static constexpr size_t kQueueCount = static_cast<size_t>(QueueKind::Count);
+		static constexpr size_t kQueueCount = static_cast<size_t>(QueueKind::Count); // Legacy; prefer QueueCount()
 		static constexpr size_t kWaitPhaseCount = static_cast<size_t>(BatchWaitPhase::Count);
 		static constexpr size_t kSignalPhaseCount = static_cast<size_t>(BatchSignalPhase::Count);
 		static constexpr size_t kTransitionPhaseCount = static_cast<size_t>(BatchTransitionPhase::Count);
 		using QueuedPass = std::variant<RenderPassAndResources, ComputePassAndResources, CopyPassAndResources>;
 
-		std::array<std::vector<QueuedPass>, kQueueCount> queuePasses;
-		//std::unordered_map<uint64_t, ResourceAccessType> resourceAccessTypes; // Desired access types in this batch
-		//std::unordered_map<uint64_t, ResourceLayout> resourceLayouts; // Desired layouts in this batch
-		std::array<std::array<std::vector<ResourceTransition>, kQueueCount>, kTransitionPhaseCount> queueTransitions;
+		PassBatch(size_t queueCount = kQueueCount)
+			: queuePasses(queueCount) {
+			for (auto& v : queueTransitions) v.resize(queueCount);
+			for (auto& p : queueWaitEnabled) p.assign(queueCount, std::vector<uint8_t>(queueCount, 0));
+			for (auto& p : queueWaitFenceValue) p.assign(queueCount, std::vector<UINT64>(queueCount, 0));
+			for (auto& p : queueSignalEnabled) p.assign(queueCount, 0);
+			for (auto& p : queueSignalFenceValue) p.assign(queueCount, 0);
+		}
+
+		size_t QueueCount() const noexcept { return queuePasses.size(); }
+
+		std::vector<std::vector<QueuedPass>> queuePasses;
+		std::array<std::vector<std::vector<ResourceTransition>>, kTransitionPhaseCount> queueTransitions;
 
 		// Resources that passes in this batch transition internally
 		// Cannot be batched with other passes which use these resources
@@ -238,12 +249,12 @@ public:
 
 		// Queue dependencies and signals are modeled as queue-to-queue edges per phase.
 		// queueWaitEnabled[phase][dstQueue][srcQueue] + queueWaitFenceValue[phase][dstQueue][srcQueue]
-		std::array<std::array<std::array<bool, kQueueCount>, kQueueCount>, kWaitPhaseCount> queueWaitEnabled{};
-		std::array<std::array<std::array<UINT64, kQueueCount>, kQueueCount>, kWaitPhaseCount> queueWaitFenceValue{};
+		std::array<std::vector<std::vector<uint8_t>>, kWaitPhaseCount> queueWaitEnabled;
+		std::array<std::vector<std::vector<UINT64>>, kWaitPhaseCount> queueWaitFenceValue;
 
 		// queueSignalEnabled[phase][queue] + queueSignalFenceValue[phase][queue]
-		std::array<std::array<bool, kQueueCount>, kSignalPhaseCount> queueSignalEnabled{};
-		std::array<std::array<UINT64, kQueueCount>, kSignalPhaseCount> queueSignalFenceValue{};
+		std::array<std::vector<uint8_t>, kSignalPhaseCount> queueSignalEnabled;
+		std::array<std::vector<UINT64>, kSignalPhaseCount> queueSignalFenceValue;
 
 		static constexpr size_t QueueIndex(QueueKind queue) noexcept {
 			return static_cast<size_t>(queue);
@@ -329,6 +340,56 @@ public:
 
 		UINT64 GetQueueWaitFenceValue(BatchWaitPhase phase, QueueKind dstQueue, QueueKind srcQueue) const {
 			return queueWaitFenceValue[WaitPhaseIndex(phase)][QueueIndex(dstQueue)][QueueIndex(srcQueue)];
+		}
+
+		// ---- Index-based overloads for N-queue support ----
+
+		std::vector<QueuedPass>& Passes(size_t qi) { return queuePasses[qi]; }
+		const std::vector<QueuedPass>& Passes(size_t qi) const { return queuePasses[qi]; }
+		bool HasPasses(size_t qi) const { return !queuePasses[qi].empty(); }
+
+		std::vector<ResourceTransition>& Transitions(size_t qi, BatchTransitionPhase phase) {
+			return queueTransitions[TransitionPhaseIndex(phase)][qi];
+		}
+		const std::vector<ResourceTransition>& Transitions(size_t qi, BatchTransitionPhase phase) const {
+			return queueTransitions[TransitionPhaseIndex(phase)][qi];
+		}
+		bool HasTransitions(size_t qi, BatchTransitionPhase phase) const {
+			return !queueTransitions[TransitionPhaseIndex(phase)][qi].empty();
+		}
+
+		void SetQueueSignalFenceValue(BatchSignalPhase phase, size_t qi, UINT64 fenceValue) {
+			queueSignalFenceValue[SignalPhaseIndex(phase)][qi] = fenceValue;
+		}
+		UINT64 GetQueueSignalFenceValue(BatchSignalPhase phase, size_t qi) const {
+			return queueSignalFenceValue[SignalPhaseIndex(phase)][qi];
+		}
+		void MarkQueueSignal(BatchSignalPhase phase, size_t qi) {
+			queueSignalEnabled[SignalPhaseIndex(phase)][qi] = 1;
+		}
+		void ClearQueueSignal(BatchSignalPhase phase, size_t qi) {
+			queueSignalEnabled[SignalPhaseIndex(phase)][qi] = 0;
+		}
+		bool HasQueueSignal(BatchSignalPhase phase, size_t qi) const {
+			return queueSignalEnabled[SignalPhaseIndex(phase)][qi] != 0;
+		}
+
+		void AddQueueWait(BatchWaitPhase phase, size_t dst, size_t src, UINT64 fenceValue) {
+			if (dst == src) return;
+			auto& enabled = queueWaitEnabled[WaitPhaseIndex(phase)][dst][src];
+			auto& maxFence = queueWaitFenceValue[WaitPhaseIndex(phase)][dst][src];
+			enabled = 1;
+			if (fenceValue > maxFence) maxFence = fenceValue;
+		}
+		void ClearQueueWait(BatchWaitPhase phase, size_t dst, size_t src) {
+			queueWaitEnabled[WaitPhaseIndex(phase)][dst][src] = 0;
+			queueWaitFenceValue[WaitPhaseIndex(phase)][dst][src] = 0;
+		}
+		bool HasQueueWait(BatchWaitPhase phase, size_t dst, size_t src) const {
+			return queueWaitEnabled[WaitPhaseIndex(phase)][dst][src] != 0;
+		}
+		UINT64 GetQueueWaitFenceValue(BatchWaitPhase phase, size_t dst, size_t src) const {
+			return queueWaitFenceValue[WaitPhaseIndex(phase)][dst][src];
 		}
 
 		std::unordered_map<uint64_t, SymbolicTracker*> passBatchTrackers; // Trackers for the resources in this batch
@@ -423,6 +484,14 @@ public:
 	RenderPassBuilder& BuildRenderPass(std::string const& name);
 	CopyPassBuilder& BuildCopyPass(std::string const& name);
 
+	/// Create a new queue of the given kind and register it with the render graph.
+	/// Must be called after Setup() and before the first Execute().
+	QueueSlotIndex CreateQueue(QueueKind kind, const char* name);
+
+	/// Access the queue registry (read-only).
+	const QueueRegistry& GetQueueRegistry() const noexcept { return m_queueRegistry; }
+	QueueRegistry& GetQueueRegistry() noexcept { return m_queueRegistry; }
+
 private:
 
 	struct AnyPassAndResources {
@@ -454,7 +523,7 @@ private:
 	};
 
 	struct LastProducerAcrossFrames {
-		QueueKind queue = QueueKind::Graphics;
+		size_t queueSlot = 0;
 		uint64_t fenceValue = 0;
 	};
 
@@ -471,7 +540,7 @@ private:
 
 	struct Node {
 		size_t   passIndex = 0;
-		QueueKind queueKind = QueueKind::Graphics;
+		size_t   queueSlot = 0; // Index into QueueRegistry slots
 		uint32_t originalOrder = 0;
 
 		// Expanded IDs (aliases + group/child fixpoint)
@@ -535,13 +604,11 @@ private:
 	std::unordered_map<uint64_t, SymbolicTracker> compileTrackers; // Compile-only symbolic state, decoupled from backing lifetime.
 	std::unordered_map<uint64_t, LastProducerAcrossFrames> m_lastProducerByResourceAcrossFrames;
 	std::unordered_map<uint64_t, std::vector<LastAliasPlacementProducerAcrossFrames>> m_lastAliasPlacementProducersByPoolAcrossFrames;
-	std::array<std::unordered_map<uint64_t, unsigned int>, static_cast<size_t>(QueueKind::Count)> m_compiledLastProducerBatchByResourceByQueue;
-	std::array<std::array<bool, static_cast<size_t>(QueueKind::Count)>, static_cast<size_t>(QueueKind::Count)> m_hasPendingFrameStartQueueWait{};
-	std::array<std::array<UINT64, static_cast<size_t>(QueueKind::Count)>, static_cast<size_t>(QueueKind::Count)> m_pendingFrameStartQueueWaitFenceValue{};
+	std::vector<std::unordered_map<uint64_t, unsigned int>> m_compiledLastProducerBatchByResourceByQueue;
+	std::vector<std::vector<uint8_t>> m_hasPendingFrameStartQueueWait;
+	std::vector<std::vector<UINT64>> m_pendingFrameStartQueueWaitFenceValue;
 
-	std::unique_ptr<CommandListPool> m_graphicsCommandListPool;
-	std::unique_ptr<CommandListPool> m_computeCommandListPool;
-	std::unique_ptr<CommandListPool> m_copyCommandListPool;
+	QueueRegistry m_queueRegistry;
 
 	rhi::CommandAllocatorPtr initialTransitionCommandAllocator;
 	rhi::TimelinePtr m_initialTransitionFence;
@@ -549,34 +616,19 @@ private:
 
 	rhi::TimelinePtr m_frameStartSyncFence; // TODO: Is there a better way of handling waiting for pre-frame things like copying resources?
 
-	rhi::TimelinePtr m_graphicsQueueFence;
-	rhi::TimelinePtr m_computeQueueFence;
-	rhi::TimelinePtr m_copyQueueFence;
 	rhi::TimelinePtr m_readbackFence;
 
 	std::unique_ptr<CommandRecordingManager> m_pCommandRecordingManager;
 	ExecutionSchedule m_executionSchedule;
 
-	void BuildExecutionSchedule(bool alias);
+	void BuildExecutionSchedule();
 
 	rg::imm::ImmediateDispatch m_immediateDispatch{};
 
 	std::vector<std::unique_ptr<IRenderGraphExtension>> m_extensions;
 
-	UINT64 m_graphicsQueueFenceValue = 1;
-	UINT64 m_computeQueueFenceValue = 1;
-	UINT64 m_copyQueueFenceValue = 1;
-	UINT64 GetNextQueueFenceValue(QueueKind queue) {
-		switch (queue) {
-		case QueueKind::Graphics:
-			return m_graphicsQueueFenceValue++;
-		case QueueKind::Compute:
-			return m_computeQueueFenceValue++;
-		case QueueKind::Copy:
-			return m_copyQueueFenceValue++;
-		default:
-			return 0;
-		}
+	UINT64 GetNextQueueFenceValue(size_t queueSlotIndex) {
+		return m_queueRegistry.GetNextFenceValue(static_cast<QueueSlotIndex>(static_cast<uint8_t>(queueSlotIndex)));
 	}
 
 	std::function<bool()> m_getUseAsyncCompute;
@@ -640,10 +692,10 @@ private:
 		std::unordered_set<uint64_t> const& resourcesTransitionedThisPass);
 
 	void ProcessResourceRequirements(
-		QueueKind passQueue,
+		size_t passQueueSlot,
 		std::vector<ResourceRequirement>& resourceRequirements,
-		std::array<std::unordered_map<uint64_t, unsigned int>, static_cast<size_t>(QueueKind::Count)>& batchOfLastQueueUsage,
-		std::array<std::unordered_map<uint64_t, unsigned int>, static_cast<size_t>(QueueKind::Count)>& batchOfLastQueueTransition,
+		std::vector<std::unordered_map<uint64_t, unsigned int>>& batchOfLastQueueUsage,
+		std::vector<std::unordered_map<uint64_t, unsigned int>>& batchOfLastQueueTransition,
 		unsigned int batchIndex,
 		PassBatch& currentBatch,
 		std::unordered_set<uint64_t>& outTransitionedResourceIDs,
@@ -652,8 +704,8 @@ private:
 
 	template<typename PassRes>
 	void applySynchronization(
-		QueueKind                         passQueue,
-		QueueKind                         sourceQueue,
+		size_t                            passQueueSlot,
+		size_t                            sourceQueueSlot,
 		PassBatch&                        currentBatch,
 		unsigned int                      currentBatchIndex,
 		const PassRes&                    pass, // either ComputePassAndResources or RenderPassAndResources
@@ -662,7 +714,7 @@ private:
 		const std::unordered_map<uint64_t, unsigned int>& oppUsageHist,
 		const std::unordered_set<uint64_t> resourcesTransitionedThisPass)
 	{
-		if (passQueue == sourceQueue) {
+		if (passQueueSlot == sourceQueueSlot) {
 			return;
 		}
 
@@ -670,14 +722,14 @@ private:
 			if (batchIndex <= 0) {
 				return;
 			}
-			batches[batchIndex].MarkQueueSignal(BatchSignalPhase::AfterCompletion, sourceQueue);
+			batches[batchIndex].MarkQueueSignal(BatchSignalPhase::AfterCompletion, sourceQueueSlot);
 		};
 
 		auto sourceCompletionFence = [&](int batchIndex) -> UINT64 {
 			if (batchIndex <= 0) {
 				return 0;
 			}
-			return batches[batchIndex].GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, sourceQueue);
+			return batches[batchIndex].GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, sourceQueueSlot);
 		};
 
 		// figure out which two numbers we wait on
@@ -688,12 +740,12 @@ private:
 		if (lastTransBatch != -1) {
 			if (static_cast<unsigned int>(lastTransBatch) == currentBatchIndex) {
 				// same batch, signal & immediate wait
-				currentBatch.MarkQueueSignal(BatchSignalPhase::AfterTransitions, sourceQueue);
+				currentBatch.MarkQueueSignal(BatchSignalPhase::AfterTransitions, sourceQueueSlot);
 				currentBatch.AddQueueWait(
 					BatchWaitPhase::BeforeExecution,
-					passQueue,
-					sourceQueue,
-					currentBatch.GetQueueSignalFenceValue(BatchSignalPhase::AfterTransitions, sourceQueue));
+					passQueueSlot,
+					sourceQueueSlot,
+					currentBatch.GetQueueSignalFenceValue(BatchSignalPhase::AfterTransitions, sourceQueueSlot));
 			} else {
 				// different batch, signal that batch's completion, then wait before *transition*
 				const UINT64 completionFence = sourceCompletionFence(lastTransBatch);
@@ -701,8 +753,8 @@ private:
 					markSourceCompletionSignal(lastTransBatch);
 					currentBatch.AddQueueWait(
 						BatchWaitPhase::BeforeTransitions,
-						passQueue,
-						sourceQueue,
+						passQueueSlot,
+						sourceQueueSlot,
 						completionFence);
 				}
 			}
@@ -721,8 +773,8 @@ private:
 				markSourceCompletionSignal(lastProdBatch);
 				currentBatch.AddQueueWait(
 					BatchWaitPhase::BeforeTransitions,
-					passQueue,
-					sourceQueue,
+					passQueueSlot,
+					sourceQueueSlot,
 					completionFence);
 			}
 		}
@@ -734,19 +786,19 @@ private:
 				markSourceCompletionSignal(lastUsageBatch);
 				currentBatch.AddQueueWait(
 					BatchWaitPhase::BeforeTransitions,
-					passQueue,
-					sourceQueue,
+					passQueueSlot,
+					sourceQueueSlot,
 					completionFence);
 			}
 		}
 	}
 
 	void AddTransition(
-		std::array<std::unordered_map<uint64_t, unsigned int>, static_cast<size_t>(QueueKind::Count)>& batchOfLastQueueUsage,
-		std::array<std::unordered_map<uint64_t, unsigned int>, static_cast<size_t>(QueueKind::Count)>& batchOfLastQueueTransition,
+		std::vector<std::unordered_map<uint64_t, unsigned int>>& batchOfLastQueueUsage,
+		std::vector<std::unordered_map<uint64_t, unsigned int>>& batchOfLastQueueTransition,
 		unsigned int batchIndex,
 		PassBatch& currentBatch,
-		QueueKind passQueue,
+		size_t passQueueSlot,
 		const ResourceRequirement& r,
 		std::unordered_set<uint64_t>& outTransitionedResourceIDs,
 		std::unordered_set<uint64_t>& outFallbackResourceIDs,
@@ -786,11 +838,11 @@ private:
 		unsigned int currentBatchIndex,
 		PassBatch& currentBatch,
 
-		std::array<std::unordered_set<uint64_t>, static_cast<size_t>(QueueKind::Count)>& queueUAVs,
+		std::vector<std::unordered_set<uint64_t>>& queueUAVs,
 
-		std::array<std::unordered_map<uint64_t, unsigned int>, static_cast<size_t>(QueueKind::Count)>& batchOfLastQueueTransition,
-		std::array<std::unordered_map<uint64_t, unsigned int>, static_cast<size_t>(QueueKind::Count)>& batchOfLastQueueProducer,
-		std::array<std::unordered_map<uint64_t, unsigned int>, static_cast<size_t>(QueueKind::Count)>& batchOfLastQueueUsage,
+		std::vector<std::unordered_map<uint64_t, unsigned int>>& batchOfLastQueueTransition,
+		std::vector<std::unordered_map<uint64_t, unsigned int>>& batchOfLastQueueProducer,
+		std::vector<std::unordered_map<uint64_t, unsigned int>>& batchOfLastQueueUsage,
 		std::unordered_set<uint64_t>& scratchTransitioned,
 		std::unordered_set<uint64_t>& scratchFallback,
 		std::vector<ResourceTransition>& scratchTransitions);

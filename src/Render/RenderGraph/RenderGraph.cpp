@@ -118,29 +118,35 @@ std::vector<RenderGraph::Node> RenderGraph::BuildNodes(RenderGraph& rg, std::vec
 	std::vector<Node> nodes;
 	nodes.resize(passes.size());
 
-	auto resolveQueueForPass = [](const AnyPassAndResources& pr) {
+	auto resolveQueueSlotForPass = [](const AnyPassAndResources& pr) -> size_t {
 		if (pr.type == PassType::Compute) {
 			const auto& pass = std::get<ComputePassAndResources>(pr.pass);
-			return ResolveQueueKind(pass.resources.queueSelection);
+			if (pass.resources.queueSlotOverride)
+				return static_cast<size_t>(static_cast<uint8_t>(*pass.resources.queueSlotOverride));
+			return QueueIndex(ResolveQueueKind(pass.resources.queueSelection));
 		}
 
 		if (pr.type == PassType::Render) {
 			const auto& pass = std::get<RenderPassAndResources>(pr.pass);
-			return ResolveQueueKind(pass.resources.queueSelection);
+			if (pass.resources.queueSlotOverride)
+				return static_cast<size_t>(static_cast<uint8_t>(*pass.resources.queueSlotOverride));
+			return QueueIndex(ResolveQueueKind(pass.resources.queueSelection));
 		}
 
 		if (pr.type == PassType::Copy) {
 			const auto& pass = std::get<CopyPassAndResources>(pr.pass);
-			return ResolveQueueKind(pass.resources.queueSelection);
+			if (pass.resources.queueSlotOverride)
+				return static_cast<size_t>(static_cast<uint8_t>(*pass.resources.queueSlotOverride));
+			return QueueIndex(ResolveQueueKind(pass.resources.queueSelection));
 		}
 
-		return QueueKind::Graphics;
+		return QueueIndex(QueueKind::Graphics);
 	};
 
 	for (size_t i = 0; i < passes.size(); ++i) {
 		Node n{};
 		n.passIndex = i;
-		n.queueKind = resolveQueueForPass(passes[i]);
+		n.queueSlot = resolveQueueSlotForPass(passes[i]);
 		n.originalOrder = static_cast<uint32_t>(i);
 
 		PassView view = GetPassView(passes[i]);
@@ -300,16 +306,18 @@ void RenderGraph::CommitPassToBatch(
 	unsigned int currentBatchIndex,
 	PassBatch& currentBatch,
 
-	std::array<std::unordered_set<uint64_t>, static_cast<size_t>(QueueKind::Count)>& queueUAVs,
+	std::vector<std::unordered_set<uint64_t>>& queueUAVs,
 
-	std::array<std::unordered_map<uint64_t, unsigned int>, static_cast<size_t>(QueueKind::Count)>& batchOfLastQueueTransition,
-	std::array<std::unordered_map<uint64_t, unsigned int>, static_cast<size_t>(QueueKind::Count)>& batchOfLastQueueProducer,
-	std::array<std::unordered_map<uint64_t, unsigned int>, static_cast<size_t>(QueueKind::Count)>& batchOfLastQueueUsage,
+	std::vector<std::unordered_map<uint64_t, unsigned int>>& batchOfLastQueueTransition,
+	std::vector<std::unordered_map<uint64_t, unsigned int>>& batchOfLastQueueProducer,
+	std::vector<std::unordered_map<uint64_t, unsigned int>>& batchOfLastQueueUsage,
 	std::unordered_set<uint64_t>& scratchTransitioned,
 	std::unordered_set<uint64_t>& scratchFallback,
 	std::vector<ResourceTransition>& scratchTransitions)
 {
-	const QueueKind passQueue = node.queueKind;
+	const size_t passQueueSlot = node.queueSlot;
+	const size_t queueCount = currentBatch.QueueCount();
+	const size_t gfxSlot = QueueIndex(QueueKind::Graphics);
 	scratchTransitioned.clear();
 	auto& resourcesTransitionedThisPass = scratchTransitioned;
 
@@ -319,7 +327,7 @@ void RenderGraph::CommitPassToBatch(
 		scratchFallback.clear();
 		auto& fallbackResourceIDs = scratchFallback;
 		rg.ProcessResourceRequirements(
-			passQueue,
+			passQueueSlot,
 			pass.resources.frameResourceRequirements,
 			batchOfLastQueueUsage,
 			batchOfLastQueueTransition,
@@ -334,11 +342,10 @@ void RenderGraph::CommitPassToBatch(
 		// graphics queue doesn't start transitioning before prior producers finish.
 		if (!fallbackResourceIDs.empty()) {
 			for (auto& resID : fallbackResourceIDs) {
-				batchOfLastQueueTransition[QueueIndex(QueueKind::Graphics)][resID] = currentBatchIndex;
+				batchOfLastQueueTransition[gfxSlot][resID] = currentBatchIndex;
 			}
-			for (size_t qi = 0; qi < static_cast<size_t>(QueueKind::Count); ++qi) {
-				auto srcQueue = static_cast<QueueKind>(qi);
-				if (srcQueue == QueueKind::Graphics) continue;
+			for (size_t qi = 0; qi < queueCount; ++qi) {
+				if (qi == gfxSlot) continue;
 				int latestBatch = -1;
 				for (auto& resID : fallbackResourceIDs) {
 					auto itT = batchOfLastQueueTransition[qi].find(resID);
@@ -349,17 +356,17 @@ void RenderGraph::CommitPassToBatch(
 						latestBatch = std::max(latestBatch, (int)itU->second);
 				}
 				if (latestBatch > 0 && static_cast<unsigned int>(latestBatch) != currentBatchIndex) {
-					rg.batches[latestBatch].MarkQueueSignal(BatchSignalPhase::AfterCompletion, srcQueue);
+					rg.batches[latestBatch].MarkQueueSignal(BatchSignalPhase::AfterCompletion, qi);
 					currentBatch.AddQueueWait(
 						BatchWaitPhase::BeforeTransitions,
-						QueueKind::Graphics,
-						srcQueue,
-						rg.batches[latestBatch].GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, srcQueue));
+						gfxSlot,
+						qi,
+						rg.batches[latestBatch].GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, qi));
 				}
 			}
 		}
 
-		currentBatch.Passes(passQueue).emplace_back(pass);
+		currentBatch.Passes(passQueueSlot).emplace_back(pass);
 
 		for (auto& exit : pass.resources.internalTransitions) {
 			std::vector<ResourceTransition> _;
@@ -373,27 +380,26 @@ void RenderGraph::CommitPassToBatch(
 		for (auto& req : pass.resources.frameResourceRequirements) {
 			uint64_t id = req.resourceHandleAndRange.resource.GetGlobalResourceID();
 			SortedInsert(currentBatch.allResources, id);
-			batchOfLastQueueUsage[QueueIndex(passQueue)][id] = currentBatchIndex;
+			batchOfLastQueueUsage[passQueueSlot][id] = currentBatchIndex;
 		}
 
 		// track UAV usage for cross-queue "same batch" rejection
-		queueUAVs[QueueIndex(passQueue)].insert(node.uavIDs.begin(), node.uavIDs.end());
+		queueUAVs[passQueueSlot].insert(node.uavIDs.begin(), node.uavIDs.end());
 
-		for (size_t queueIndex = 0; queueIndex < static_cast<size_t>(QueueKind::Count); ++queueIndex) {
-			const auto sourceQueue = static_cast<QueueKind>(queueIndex);
-			if (sourceQueue == passQueue) {
+		for (size_t qi = 0; qi < queueCount; ++qi) {
+			if (qi == passQueueSlot) {
 				continue;
 			}
 
 			rg.applySynchronization(
-				passQueue,
-				sourceQueue,
+				passQueueSlot,
+				qi,
 				currentBatch,
 				currentBatchIndex,
 				std::get<ComputePassAndResources>(pr.pass),
-				batchOfLastQueueTransition[QueueIndex(sourceQueue)],
-				batchOfLastQueueProducer[QueueIndex(sourceQueue)],
-				batchOfLastQueueUsage[QueueIndex(sourceQueue)],
+				batchOfLastQueueTransition[qi],
+				batchOfLastQueueProducer[qi],
+				batchOfLastQueueUsage[qi],
 				resourcesTransitionedThisPass);
 		}
 
@@ -404,7 +410,7 @@ void RenderGraph::CommitPassToBatch(
 		scratchFallback.clear();
 		auto& fallbackResourceIDs = scratchFallback;
 		rg.ProcessResourceRequirements(
-			passQueue,
+			passQueueSlot,
 			pass.resources.frameResourceRequirements,
 			batchOfLastQueueUsage,
 			batchOfLastQueueTransition,
@@ -418,11 +424,10 @@ void RenderGraph::CommitPassToBatch(
 		// be rare here, but handle them for correctness with Compute render passes.
 		if (!fallbackResourceIDs.empty()) {
 			for (auto& resID : fallbackResourceIDs) {
-				batchOfLastQueueTransition[QueueIndex(QueueKind::Graphics)][resID] = currentBatchIndex;
+				batchOfLastQueueTransition[gfxSlot][resID] = currentBatchIndex;
 			}
-			for (size_t qi = 0; qi < static_cast<size_t>(QueueKind::Count); ++qi) {
-				auto srcQueue = static_cast<QueueKind>(qi);
-				if (srcQueue == QueueKind::Graphics) continue;
+			for (size_t qi = 0; qi < queueCount; ++qi) {
+				if (qi == gfxSlot) continue;
 				int latestBatch = -1;
 				for (auto& resID : fallbackResourceIDs) {
 					auto itT = batchOfLastQueueTransition[qi].find(resID);
@@ -433,17 +438,17 @@ void RenderGraph::CommitPassToBatch(
 						latestBatch = std::max(latestBatch, (int)itU->second);
 				}
 				if (latestBatch > 0 && static_cast<unsigned int>(latestBatch) != currentBatchIndex) {
-					rg.batches[latestBatch].MarkQueueSignal(BatchSignalPhase::AfterCompletion, srcQueue);
+					rg.batches[latestBatch].MarkQueueSignal(BatchSignalPhase::AfterCompletion, qi);
 					currentBatch.AddQueueWait(
 						BatchWaitPhase::BeforeTransitions,
-						QueueKind::Graphics,
-						srcQueue,
-						rg.batches[latestBatch].GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, srcQueue));
+						gfxSlot,
+						qi,
+						rg.batches[latestBatch].GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, qi));
 				}
 			}
 		}
 
-		currentBatch.Passes(passQueue).emplace_back(pass);
+		currentBatch.Passes(passQueueSlot).emplace_back(pass);
 
 		for (auto& exit : pass.resources.internalTransitions) {
 			std::vector<ResourceTransition> _;
@@ -457,26 +462,25 @@ void RenderGraph::CommitPassToBatch(
 		for (auto& req : pass.resources.frameResourceRequirements) {
 			uint64_t id = req.resourceHandleAndRange.resource.GetGlobalResourceID();
 			SortedInsert(currentBatch.allResources, id);
-			batchOfLastQueueUsage[QueueIndex(passQueue)][id] = currentBatchIndex;
+			batchOfLastQueueUsage[passQueueSlot][id] = currentBatchIndex;
 		}
 
-		queueUAVs[QueueIndex(passQueue)].insert(node.uavIDs.begin(), node.uavIDs.end());
+		queueUAVs[passQueueSlot].insert(node.uavIDs.begin(), node.uavIDs.end());
 
-		for (size_t queueIndex = 0; queueIndex < static_cast<size_t>(QueueKind::Count); ++queueIndex) {
-			const auto sourceQueue = static_cast<QueueKind>(queueIndex);
-			if (sourceQueue == passQueue) {
+		for (size_t qi = 0; qi < queueCount; ++qi) {
+			if (qi == passQueueSlot) {
 				continue;
 			}
 
 			rg.applySynchronization(
-				passQueue,
-				sourceQueue,
+				passQueueSlot,
+				qi,
 				currentBatch,
 				currentBatchIndex,
 				std::get<RenderPassAndResources>(pr.pass),
-				batchOfLastQueueTransition[QueueIndex(sourceQueue)],
-				batchOfLastQueueProducer[QueueIndex(sourceQueue)],
-				batchOfLastQueueUsage[QueueIndex(sourceQueue)],
+				batchOfLastQueueTransition[qi],
+				batchOfLastQueueProducer[qi],
+				batchOfLastQueueUsage[qi],
 				resourcesTransitionedThisPass);
 		}
 	}
@@ -486,7 +490,7 @@ void RenderGraph::CommitPassToBatch(
 		scratchFallback.clear();
 		auto& fallbackResourceIDs = scratchFallback;
 		rg.ProcessResourceRequirements(
-			passQueue,
+			passQueueSlot,
 			pass.resources.frameResourceRequirements,
 			batchOfLastQueueUsage,
 			batchOfLastQueueTransition,
@@ -501,11 +505,10 @@ void RenderGraph::CommitPassToBatch(
 		// graphics queue doesn't start transitioning before prior producers finish.
 		if (!fallbackResourceIDs.empty()) {
 			for (auto& resID : fallbackResourceIDs) {
-				batchOfLastQueueTransition[QueueIndex(QueueKind::Graphics)][resID] = currentBatchIndex;
+				batchOfLastQueueTransition[gfxSlot][resID] = currentBatchIndex;
 			}
-			for (size_t qi = 0; qi < static_cast<size_t>(QueueKind::Count); ++qi) {
-				auto srcQueue = static_cast<QueueKind>(qi);
-				if (srcQueue == QueueKind::Graphics) continue;
+			for (size_t qi = 0; qi < queueCount; ++qi) {
+				if (qi == gfxSlot) continue;
 				int latestBatch = -1;
 				for (auto& resID : fallbackResourceIDs) {
 					auto itT = batchOfLastQueueTransition[qi].find(resID);
@@ -516,17 +519,17 @@ void RenderGraph::CommitPassToBatch(
 						latestBatch = std::max(latestBatch, (int)itU->second);
 				}
 				if (latestBatch > 0 && static_cast<unsigned int>(latestBatch) != currentBatchIndex) {
-					rg.batches[latestBatch].MarkQueueSignal(BatchSignalPhase::AfterCompletion, srcQueue);
+					rg.batches[latestBatch].MarkQueueSignal(BatchSignalPhase::AfterCompletion, qi);
 					currentBatch.AddQueueWait(
 						BatchWaitPhase::BeforeTransitions,
-						QueueKind::Graphics,
-						srcQueue,
-						rg.batches[latestBatch].GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, srcQueue));
+						gfxSlot,
+						qi,
+						rg.batches[latestBatch].GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, qi));
 				}
 			}
 		}
 
-		currentBatch.Passes(passQueue).emplace_back(pass);
+		currentBatch.Passes(passQueueSlot).emplace_back(pass);
 
 		for (auto& exit : pass.resources.internalTransitions) {
 			std::vector<ResourceTransition> _;
@@ -540,26 +543,25 @@ void RenderGraph::CommitPassToBatch(
 		for (auto& req : pass.resources.frameResourceRequirements) {
 			uint64_t id = req.resourceHandleAndRange.resource.GetGlobalResourceID();
 			SortedInsert(currentBatch.allResources, id);
-			batchOfLastQueueUsage[QueueIndex(passQueue)][id] = currentBatchIndex;
+			batchOfLastQueueUsage[passQueueSlot][id] = currentBatchIndex;
 		}
 
-		queueUAVs[QueueIndex(passQueue)].insert(node.uavIDs.begin(), node.uavIDs.end());
+		queueUAVs[passQueueSlot].insert(node.uavIDs.begin(), node.uavIDs.end());
 
-		for (size_t queueIndex = 0; queueIndex < static_cast<size_t>(QueueKind::Count); ++queueIndex) {
-			const auto sourceQueue = static_cast<QueueKind>(queueIndex);
-			if (sourceQueue == passQueue) {
+		for (size_t qi = 0; qi < queueCount; ++qi) {
+			if (qi == passQueueSlot) {
 				continue;
 			}
 
 			rg.applySynchronization(
-				passQueue,
-				sourceQueue,
+				passQueueSlot,
+				qi,
 				currentBatch,
 				currentBatchIndex,
 				std::get<CopyPassAndResources>(pr.pass),
-				batchOfLastQueueTransition[QueueIndex(sourceQueue)],
-				batchOfLastQueueProducer[QueueIndex(sourceQueue)],
-				batchOfLastQueueUsage[QueueIndex(sourceQueue)],
+				batchOfLastQueueTransition[qi],
+				batchOfLastQueueProducer[qi],
+				batchOfLastQueueUsage[qi],
 				resourcesTransitionedThisPass);
 		}
 	}
@@ -586,12 +588,12 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 	batchMembers.reserve(nodes.size());
 
 	auto openNewBatch = [&]() -> PassBatch {
-		PassBatch b;
-		for (size_t queueIndex = 0; queueIndex < static_cast<size_t>(QueueKind::Count); ++queueIndex) {
-			const auto queue = static_cast<QueueKind>(queueIndex);
-			b.SetQueueSignalFenceValue(RenderGraph::BatchSignalPhase::AfterTransitions, queue, rg.GetNextQueueFenceValue(queue));
-			b.SetQueueSignalFenceValue(RenderGraph::BatchSignalPhase::AfterExecution, queue, rg.GetNextQueueFenceValue(queue));
-			b.SetQueueSignalFenceValue(RenderGraph::BatchSignalPhase::AfterCompletion, queue, rg.GetNextQueueFenceValue(queue));
+		const size_t queueCount = rg.m_queueRegistry.SlotCount();
+		PassBatch b(queueCount);
+		for (size_t qi = 0; qi < queueCount; ++qi) {
+			b.SetQueueSignalFenceValue(RenderGraph::BatchSignalPhase::AfterTransitions, qi, rg.GetNextQueueFenceValue(qi));
+			b.SetQueueSignalFenceValue(RenderGraph::BatchSignalPhase::AfterExecution, qi, rg.GetNextQueueFenceValue(qi));
+			b.SetQueueSignalFenceValue(RenderGraph::BatchSignalPhase::AfterCompletion, qi, rg.GetNextQueueFenceValue(qi));
 		}
 		return b;
 		};
@@ -599,11 +601,13 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 	PassBatch currentBatch = openNewBatch();
 	unsigned int currentBatchIndex = 1; // Start at batch 1- batch 0 is reserved for inserting transitions before first batch
 
-	std::array<std::unordered_set<uint64_t>, static_cast<size_t>(QueueKind::Count)> queueUAVs;
+	const size_t queueCount = rg.m_queueRegistry.SlotCount();
 
-	std::array<std::unordered_map<uint64_t, unsigned int>, static_cast<size_t>(QueueKind::Count)> batchOfLastQueueTransition;
-	std::array<std::unordered_map<uint64_t, unsigned int>, static_cast<size_t>(QueueKind::Count)> batchOfLastQueueProducer;
-	std::array<std::unordered_map<uint64_t, unsigned int>, static_cast<size_t>(QueueKind::Count)> batchOfLastQueueUsage;
+	std::vector<std::unordered_set<uint64_t>> queueUAVs(queueCount);
+
+	std::vector<std::unordered_map<uint64_t, unsigned int>> batchOfLastQueueTransition(queueCount);
+	std::vector<std::unordered_map<uint64_t, unsigned int>> batchOfLastQueueProducer(queueCount);
+	std::vector<std::unordered_map<uint64_t, unsigned int>> batchOfLastQueueUsage(queueCount);
 
 	// Scratch sets reused across CommitPassToBatch calls to avoid per-call allocation
 	std::unordered_set<uint64_t> scratchTransitioned;
@@ -630,14 +634,14 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 		int bestIdxInReady = -1;
 		double bestScore = -1e300;
 
-		std::array<bool, static_cast<size_t>(QueueKind::Count)> batchHasQueue{};
-		for (size_t queueIndex = 0; queueIndex < static_cast<size_t>(QueueKind::Count); ++queueIndex) {
-			batchHasQueue[queueIndex] = currentBatch.HasPasses(static_cast<QueueKind>(queueIndex));
+		std::vector<uint8_t> batchHasQueue(queueCount);
+		for (size_t queueIndex = 0; queueIndex < queueCount; ++queueIndex) {
+			batchHasQueue[queueIndex] = currentBatch.HasPasses(queueIndex);
 		}
 
 		// Precompute the "other queues' UAVs" sorted vector for each queue kind once per iteration,
 		// instead of rebuilding it for every candidate in the ready list.
-		std::array<std::vector<uint64_t>, static_cast<size_t>(QueueKind::Count)> otherQueueUAVsByQueue;
+		std::vector<std::vector<uint64_t>> otherQueueUAVsByQueue(queueCount);
 		for (size_t q = 0; q < queueUAVs.size(); ++q) {
 			auto& merged = otherQueueUAVsByQueue[q];
 			for (size_t other = 0; other < queueUAVs.size(); ++other) {
@@ -658,13 +662,13 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 			auto& n = nodes[ni];
 
 			PassView view = GetPassView(passes[n.passIndex]);
-			const QueueKind nodeQueue = n.queueKind;
+			const size_t nodeQueueSlot = n.queueSlot;
 
 			// Extra constraint: disallow cross-queue deps within same batch.
-			if (batchHasQueue[QueueIndex(nodeQueue)]) {
+			if (batchHasQueue[nodeQueueSlot]) {
 				bool hasCrossQueuePredInBatch = false;
 				for (size_t pred : n.in) {
-					if (inBatch[pred] && nodes[pred].queueKind != nodeQueue) {
+					if (inBatch[pred] && nodes[pred].queueSlot != nodeQueueSlot) {
 						hasCrossQueuePredInBatch = true;
 						break;
 					}
@@ -678,7 +682,7 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 				currentBatch.passBatchTrackers,
 				currentBatch.internallyTransitionedResources,
 				currentBatch.allResources,
-				otherQueueUAVsByQueue[QueueIndex(nodeQueue)]))
+				otherQueueUAVsByQueue[nodeQueueSlot]))
 			{
 				rejectedInBatch[ni] = static_cast<int32_t>(currentBatchIndex);
 				continue;
@@ -694,7 +698,7 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 			double score = 3.0 * reuse - 1.0 * fresh;
 
 			// Encourage having both queues represented (more overlap opportunity)
-			if (!batchHasQueue[QueueIndex(nodeQueue)]) score += 2.0;
+			if (!batchHasQueue[nodeQueueSlot]) score += 2.0;
 
 			// Tie-break
 			score += 0.05 * double(n.criticality);
@@ -711,8 +715,8 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 		if (bestIdxInReady < 0) {
 			// Nothing ready fits: must end batch
 			bool hasAnyQueuedPasses = false;
-			for (size_t queueIndex = 0; queueIndex < static_cast<size_t>(QueueKind::Count); ++queueIndex) {
-				hasAnyQueuedPasses = hasAnyQueuedPasses || !currentBatch.Passes(static_cast<QueueKind>(queueIndex)).empty();
+			for (size_t queueIndex = 0; queueIndex < queueCount; ++queueIndex) {
+				hasAnyQueuedPasses = hasAnyQueuedPasses || !currentBatch.Passes(queueIndex).empty();
 			}
 			if (hasAnyQueuedPasses) {
 				closeBatch();
@@ -789,8 +793,8 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 
 	// Final batch
 	bool hasAnyQueuedPasses = false;
-	for (size_t queueIndex = 0; queueIndex < static_cast<size_t>(QueueKind::Count); ++queueIndex) {
-		hasAnyQueuedPasses = hasAnyQueuedPasses || !currentBatch.Passes(static_cast<QueueKind>(queueIndex)).empty();
+	for (size_t queueIndex = 0; queueIndex < queueCount; ++queueIndex) {
+		hasAnyQueuedPasses = hasAnyQueuedPasses || !currentBatch.Passes(queueIndex).empty();
 	}
 	if (hasAnyQueuedPasses) {
 		rg.batches.push_back(std::move(currentBatch));
@@ -815,8 +819,9 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 	// own execution; promoting them to an earlier phase could create circular
 	// cross-queue dependencies (GPU deadlock).
 	for (auto& batch : rg.batches) {
-		for (size_t dst = 0; dst < PassBatch::kQueueCount; ++dst) {
-			for (size_t src = 0; src < PassBatch::kQueueCount; ++src) {
+		const size_t batchQueueCount = batch.QueueCount();
+		for (size_t dst = 0; dst < batchQueueCount; ++dst) {
+			for (size_t src = 0; src < batchQueueCount; ++src) {
 				if (dst == src) continue;
 
 				int enabledCount = 0;
@@ -898,16 +903,17 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 
 // Factory for the transition lambda
 void RenderGraph::AddTransition(
-	std::array<std::unordered_map<uint64_t, unsigned int>, static_cast<size_t>(QueueKind::Count)>& batchOfLastQueueUsage,
-	std::array<std::unordered_map<uint64_t, unsigned int>, static_cast<size_t>(QueueKind::Count)>& batchOfLastQueueTransition,
+	std::vector<std::unordered_map<uint64_t, unsigned int>>& batchOfLastQueueUsage,
+	std::vector<std::unordered_map<uint64_t, unsigned int>>& batchOfLastQueueTransition,
 	unsigned int batchIndex,
 	PassBatch& currentBatch,
-	QueueKind passQueue,
+	size_t passQueueSlot,
 	const ResourceRequirement& r,
 	std::unordered_set<uint64_t>& outTransitionedResourceIDs,
 	std::unordered_set<uint64_t>& outFallbackResourceIDs,
 	std::vector<ResourceTransition>& scratchTransitions)
 {
+	const QueueKind passQueue = m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(passQueueSlot));
 
 	auto& resource = r.resourceHandleAndRange.resource;
 
@@ -979,8 +985,9 @@ void RenderGraph::AddTransition(
 		}
 	}
 
-	QueueKind transitionQueue = (passQueue != QueueKind::Graphics && needsGraphicsQueueForTransitions)
-		? QueueKind::Graphics : passQueue;
+	const size_t gfxSlot = QueueIndex(QueueKind::Graphics);
+	const size_t transitionSlot = (passQueue != QueueKind::Graphics && needsGraphicsQueueForTransitions)
+		? gfxSlot : passQueueSlot;
 
 	// Try early placement: move transitions to AfterPasses of the batch where the resource was last used.
 	// This reduces GPU idle time by allowing transitions to overlap with unrelated work on other queues.
@@ -988,7 +995,7 @@ void RenderGraph::AddTransition(
 	if (!isAliasActivation) {
 		const uint64_t resourceID = resource.GetGlobalResourceID();
 		int lastUseBatch = -1;
-		for (size_t qi = 0; qi < static_cast<size_t>(QueueKind::Count); ++qi) {
+		for (size_t qi = 0; qi < batchOfLastQueueUsage.size(); ++qi) {
 			auto itU = batchOfLastQueueUsage[qi].find(resourceID);
 			if (itU != batchOfLastQueueUsage[qi].end() && static_cast<int>(itU->second) > lastUseBatch && itU->second < batchIndex)
 				lastUseBatch = static_cast<int>(itU->second);
@@ -1001,14 +1008,13 @@ void RenderGraph::AddTransition(
 			PassBatch& targetBatch = batches[lastUseBatch];
 
 			for (auto& transition : transitions) {
-				targetBatch.Transitions(transitionQueue, BatchTransitionPhase::AfterPasses).push_back(transition);
+				targetBatch.Transitions(transitionSlot, BatchTransitionPhase::AfterPasses).push_back(transition);
 			}
 
 			// If the transition queue differs from the queue(s) that last used the resource in the target batch,
 			// the transition queue must wait for those queues to finish before executing AfterPasses transitions.
-			for (size_t qi = 0; qi < static_cast<size_t>(QueueKind::Count); ++qi) {
-				auto lastUseQueue = static_cast<QueueKind>(qi);
-				if (lastUseQueue == transitionQueue) continue;
+			for (size_t qi = 0; qi < batchOfLastQueueUsage.size(); ++qi) {
+				if (qi == transitionSlot) continue;
 
 				bool usedInTargetBatch = false;
 				auto itU = batchOfLastQueueUsage[qi].find(resourceID);
@@ -1019,20 +1025,20 @@ void RenderGraph::AddTransition(
 					usedInTargetBatch = true;
 
 				if (usedInTargetBatch) {
-					targetBatch.MarkQueueSignal(BatchSignalPhase::AfterExecution, lastUseQueue);
+					targetBatch.MarkQueueSignal(BatchSignalPhase::AfterExecution, qi);
 					targetBatch.AddQueueWait(
 						BatchWaitPhase::BeforeAfterPasses,
-						transitionQueue,
-						lastUseQueue,
-						targetBatch.GetQueueSignalFenceValue(BatchSignalPhase::AfterExecution, lastUseQueue));
+						transitionSlot,
+						qi,
+						targetBatch.GetQueueSignalFenceValue(BatchSignalPhase::AfterExecution, qi));
 				}
 			}
 
 			// Signal AfterCompletion on the transition queue so downstream consumers can wait on it
-			targetBatch.MarkQueueSignal(BatchSignalPhase::AfterCompletion, transitionQueue);
+			targetBatch.MarkQueueSignal(BatchSignalPhase::AfterCompletion, transitionSlot);
 
 			// Update tracking: the transition is now in the earlier batch
-			batchOfLastQueueTransition[QueueIndex(transitionQueue)][resourceID] = lastUseBatch;
+			batchOfLastQueueTransition[transitionSlot][resourceID] = lastUseBatch;
 
 			// Do NOT add to outFallbackResourceIDs- applySynchronization will handle
 			// cross-queue waits based on the updated tracking maps.
@@ -1048,22 +1054,22 @@ void RenderGraph::AddTransition(
 		//   1. BeforeTransitions waits on Graphics for any prior non-graphics producers
 		//   2. AfterTransitions signal on Graphics so the consuming queue can wait
 		for (auto& transition : transitions) {
-			currentBatch.Transitions(QueueKind::Graphics, BatchTransitionPhase::BeforePasses).push_back(transition);
+			currentBatch.Transitions(gfxSlot, BatchTransitionPhase::BeforePasses).push_back(transition);
 		}
 		outFallbackResourceIDs.insert(resource.GetGlobalResourceID());
 	}
 	else {
 		for (auto& transition : transitions) {
-			currentBatch.Transitions(passQueue, BatchTransitionPhase::BeforePasses).push_back(transition);
+			currentBatch.Transitions(passQueueSlot, BatchTransitionPhase::BeforePasses).push_back(transition);
 		}
 	}
 }
 
 void RenderGraph::ProcessResourceRequirements(
-	QueueKind passQueue,
+	size_t passQueueSlot,
 	std::vector<ResourceRequirement>& resourceRequirements,
-	std::array<std::unordered_map<uint64_t, unsigned int>, static_cast<size_t>(QueueKind::Count)>& batchOfLastQueueUsage,
-	std::array<std::unordered_map<uint64_t, unsigned int>, static_cast<size_t>(QueueKind::Count)>& batchOfLastQueueTransition,
+	std::vector<std::unordered_map<uint64_t, unsigned int>>& batchOfLastQueueUsage,
+	std::vector<std::unordered_map<uint64_t, unsigned int>>& batchOfLastQueueTransition,
 	unsigned int batchIndex,
 	PassBatch& currentBatch, std::unordered_set<uint64_t>& outTransitionedResourceIDs,
 	std::unordered_set<uint64_t>& outFallbackResourceIDs,
@@ -1073,10 +1079,10 @@ void RenderGraph::ProcessResourceRequirements(
 
 		const auto& id = resourceRequirement.resourceHandleAndRange.resource.GetGlobalResourceID();
 
-		AddTransition(batchOfLastQueueUsage, batchOfLastQueueTransition, batchIndex, currentBatch, passQueue, resourceRequirement, outTransitionedResourceIDs, outFallbackResourceIDs, scratchTransitions);
+		AddTransition(batchOfLastQueueUsage, batchOfLastQueueTransition, batchIndex, currentBatch, passQueueSlot, resourceRequirement, outTransitionedResourceIDs, outFallbackResourceIDs, scratchTransitions);
 
 		if (AccessTypeIsWriteType(resourceRequirement.state.access)) {
-			batchOfLastQueueTransition[QueueIndex(passQueue)][id] = batchIndex;
+			batchOfLastQueueTransition[passQueueSlot][id] = batchIndex;
 		}
 	}
 }
@@ -1209,10 +1215,10 @@ void RenderGraph::ShutdownOwnedState() {
 		producerMap.clear();
 	}
 	for (auto& row : m_hasPendingFrameStartQueueWait) {
-		row.fill(false);
+		std::fill(row.begin(), row.end(), false);
 	}
 	for (auto& row : m_pendingFrameStartQueueWaitFenceValue) {
-		row.fill(0);
+		std::fill(row.begin(), row.end(), UINT64(0));
 	}
 
 	m_passBuilderOrder.clear();
@@ -1224,17 +1230,12 @@ void RenderGraph::ShutdownOwnedState() {
 	_resolverMap.clear();
 	_registry = ResourceRegistry();
 
-	m_graphicsCommandListPool.reset();
-	m_computeCommandListPool.reset();
-	m_copyCommandListPool.reset();
 	m_pCommandRecordingManager.reset();
+	m_queueRegistry.Clear();
 
 	initialTransitionCommandAllocator.Reset();
 	m_initialTransitionFence.Reset();
 	m_frameStartSyncFence.Reset();
-	m_graphicsQueueFence.Reset();
-	m_computeQueueFence.Reset();
-	m_copyQueueFence.Reset();
 	m_readbackFence.Reset();
 
 	m_statisticsService.reset();
@@ -1546,10 +1547,10 @@ void RenderGraph::ResetForRebuild()
 		producerMap.clear();
 	}
 	for (auto& row : m_hasPendingFrameStartQueueWait) {
-		row.fill(false);
+		std::fill(row.begin(), row.end(), false);
 	}
 	for (auto& row : m_pendingFrameStartQueueWaitFenceValue) {
-		row.fill(0);
+		std::fill(row.begin(), row.end(), UINT64(0));
 	}
 
 	// Clear providers
@@ -1578,10 +1579,10 @@ void RenderGraph::ResetForFrame() {
 		producerMap.clear();
 	}
 	for (auto& row : m_hasPendingFrameStartQueueWait) {
-		row.fill(false);
+		std::fill(row.begin(), row.end(), false);
 	}
 	for (auto& row : m_pendingFrameStartQueueWaitFenceValue) {
-		row.fill(0);
+		std::fill(row.begin(), row.end(), UINT64(0));
 	}
 	// reset pass builders
 	for (auto& [name, builder] : m_passBuildersByName) {
@@ -1652,6 +1653,7 @@ void RenderGraph::CompileStructural() {
 				par.resources.identifierSet = b.DeclaredResourceIds();
 				par.resources.isGeometryPass = b.params.isGeometryPass;
 				par.resources.queueSelection = d.renderQueueSelection.value_or(RenderQueueSelection::Graphics);
+				par.resources.queueSlotOverride = d.queueSlotOverride;
 				MaterializeReferencedResources(par.resources.staticResourceRequirements, par.resources.internalTransitions);
 			}
  			any.pass = std::move(par);
@@ -1673,6 +1675,7 @@ void RenderGraph::CompileStructural() {
 				par.resources.internalTransitions = b.params.internalTransitions;
 				par.resources.identifierSet = b.DeclaredResourceIds();
 				par.resources.queueSelection = d.computeQueueSelection.value_or(ComputeQueueSelection::Compute);
+				par.resources.queueSlotOverride = d.queueSlotOverride;
 				MaterializeReferencedResources(par.resources.staticResourceRequirements, par.resources.internalTransitions);
 			}
  			any.pass = std::move(par);
@@ -1694,6 +1697,7 @@ void RenderGraph::CompileStructural() {
 				par.resources.internalTransitions = b.params.internalTransitions;
 				par.resources.identifierSet = b.DeclaredResourceIds();
 				par.resources.queueSelection = d.copyQueueSelection.value_or(CopyQueueSelection::Copy);
+				par.resources.queueSlotOverride = d.queueSlotOverride;
 				MaterializeReferencedResources(par.resources.staticResourceRequirements, par.resources.internalTransitions);
 			}
 			any.pass = std::move(par);
@@ -2195,7 +2199,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	}
 
 	batches.clear();
-	batches.push_back({}); // Dummy batch 0 for pre-first-pass transitions
+	batches.emplace_back(m_queueRegistry.SlotCount()); // Dummy batch 0 for pre-first-pass transitions
 	m_framePasses.clear(); // Combined retained + immediate-mode passes for this frame
 
 	// Record immediate-mode commands + access for each pass and fold into per-frame requirements
@@ -2393,6 +2397,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 					par.resources.identifierSet = b.DeclaredResourceIds();
 					par.resources.isGeometryPass = b.params.isGeometryPass;
 					par.resources.queueSelection = d.renderQueueSelection.value_or(RenderQueueSelection::Graphics);
+					par.resources.queueSlotOverride = d.queueSlotOverride;
 				}
 
 				par.pass->SetResourceRegistryView(
@@ -2418,6 +2423,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 					par.resources.internalTransitions = b.params.internalTransitions;
 					par.resources.identifierSet = b.DeclaredResourceIds();
 					par.resources.queueSelection = d.computeQueueSelection.value_or(ComputeQueueSelection::Compute);
+					par.resources.queueSlotOverride = d.queueSlotOverride;
 				}
 
 				par.pass->SetResourceRegistryView(
@@ -2443,6 +2449,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 					par.resources.internalTransitions = b.params.internalTransitions;
 					par.resources.identifierSet = b.DeclaredResourceIds();
 					par.resources.queueSelection = d.copyQueueSelection.value_or(CopyQueueSelection::Copy);
+					par.resources.queueSlotOverride = d.queueSlotOverride;
 				}
 
 				par.pass->SetResourceRegistryView(
@@ -2685,26 +2692,26 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	CaptureCompileTrackersForExecution(usedResourceIDs);
 
 	for (auto& row : m_hasPendingFrameStartQueueWait) {
-		row.fill(false);
+		std::fill(row.begin(), row.end(), false);
 	}
 	for (auto& row : m_pendingFrameStartQueueWaitFenceValue) {
-		row.fill(0);
+		std::fill(row.begin(), row.end(), UINT64(0));
 	}
 	uint32_t overlapTriggeredWaitCount = 0;
 	uint64_t overlapSampleCurrentResourceId = 0;
 	uint64_t overlapSamplePreviousResourceId = 0;
 
-	auto markCrossFrameWait = [&](QueueKind dstQueue, QueueKind srcQueue, uint64_t fenceValue) {
-		if (dstQueue == srcQueue) {
+	auto markCrossFrameWait = [&](size_t dstSlot, size_t srcSlot, uint64_t fenceValue) {
+		if (dstSlot == srcSlot) {
 			return;
 		}
-		auto& enabled = m_hasPendingFrameStartQueueWait[QueueIndex(dstQueue)][QueueIndex(srcQueue)];
-		auto& maxFence = m_pendingFrameStartQueueWaitFenceValue[QueueIndex(dstQueue)][QueueIndex(srcQueue)];
+		auto& enabled = m_hasPendingFrameStartQueueWait[dstSlot][srcSlot];
+		auto& maxFence = m_pendingFrameStartQueueWaitFenceValue[dstSlot][srcSlot];
 		enabled = true;
 		maxFence = std::max(maxFence, fenceValue);
 	};
 
-	auto accumulateCrossFrameWaitForHandle = [&](QueueKind passQueue, const ResourceRegistry::RegistryHandle& handle) {
+	auto accumulateCrossFrameWaitForHandle = [&](size_t passQueueSlot, const ResourceRegistry::RegistryHandle& handle) {
 		if (handle.IsEphemeral()) {
 			return;
 		}
@@ -2713,7 +2720,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		for (uint64_t rid : m_aliasingSubsystem.GetSchedulingEquivalentIDs(id, aliasPlacementRangesByID)) {
 			auto it = m_lastProducerByResourceAcrossFrames.find(rid);
 			if (it != m_lastProducerByResourceAcrossFrames.end()) {
-				markCrossFrameWait(passQueue, it->second.queue, it->second.fenceValue);
+				markCrossFrameWait(passQueueSlot, it->second.queueSlot, it->second.fenceValue);
 			}
 
 			auto itCurPlacement = aliasPlacementRangesByID.find(rid);
@@ -2746,7 +2753,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 					continue;
 				}
 
-				markCrossFrameWait(passQueue, prevPlacementProducer.producer.queue, prevPlacementProducer.producer.fenceValue);
+				markCrossFrameWait(passQueueSlot, prevPlacementProducer.producer.queueSlot, prevPlacementProducer.producer.fenceValue);
 				overlapTriggeredWaitCount++;
 				if (overlapSampleCurrentResourceId == 0) {
 					overlapSampleCurrentResourceId = rid;
@@ -2760,12 +2767,14 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		std::visit([&](auto const& passAndResources) {
 			using T = std::decay_t<decltype(passAndResources)>;
 			if constexpr (!std::is_same_v<T, std::monostate>) {
-				const QueueKind passQueue = ResolveQueueKind(passAndResources.resources.queueSelection);
+				const size_t passQueueSlot = passAndResources.resources.queueSlotOverride
+					? static_cast<size_t>(static_cast<uint8_t>(*passAndResources.resources.queueSlotOverride))
+					: QueueIndex(ResolveQueueKind(passAndResources.resources.queueSelection));
 				for (auto const& req : passAndResources.resources.frameResourceRequirements) {
-					accumulateCrossFrameWaitForHandle(passQueue, req.resourceHandleAndRange.resource);
+					accumulateCrossFrameWaitForHandle(passQueueSlot, req.resourceHandleAndRange.resource);
 				}
 				for (auto const& tr : passAndResources.resources.internalTransitions) {
-					accumulateCrossFrameWaitForHandle(passQueue, tr.first.resource);
+					accumulateCrossFrameWaitForHandle(passQueueSlot, tr.first.resource);
 				}
 			}
 		}, pr.pass);
@@ -2783,20 +2792,20 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	//ComputeResourceLoops();
 
 	// Cut out repeat waits on the same fence per destination queue.
-	std::array<uint64_t, static_cast<size_t>(QueueKind::Count)> lastWaitFenceByDstQueue{};
+	const size_t slotCount = m_queueRegistry.SlotCount();
+	std::vector<uint64_t> lastWaitFenceByDstQueue(slotCount, 0);
 	for (auto& batch : batches) {
-		for (size_t dstIndex = 0; dstIndex < static_cast<size_t>(QueueKind::Count); ++dstIndex) {
-			const auto dstQueue = static_cast<QueueKind>(dstIndex);
+		const size_t batchQueueCount = batch.QueueCount();
+		for (size_t dstIndex = 0; dstIndex < batchQueueCount; ++dstIndex) {
 			for (auto phase : { BatchWaitPhase::BeforeTransitions, BatchWaitPhase::BeforeExecution }) {
-				for (size_t srcIndex = 0; srcIndex < static_cast<size_t>(QueueKind::Count); ++srcIndex) {
-					const auto srcQueue = static_cast<QueueKind>(srcIndex);
-					if (!batch.HasQueueWait(phase, dstQueue, srcQueue)) {
+				for (size_t srcIndex = 0; srcIndex < batchQueueCount; ++srcIndex) {
+					if (!batch.HasQueueWait(phase, dstIndex, srcIndex)) {
 						continue;
 					}
 
-					const auto waitFence = batch.GetQueueWaitFenceValue(phase, dstQueue, srcQueue);
+					const auto waitFence = batch.GetQueueWaitFenceValue(phase, dstIndex, srcIndex);
 					if (waitFence <= lastWaitFenceByDstQueue[dstIndex]) {
-						batch.ClearQueueWait(phase, dstQueue, srcQueue);
+						batch.ClearQueueWait(phase, dstIndex, srcIndex);
 					}
 					else {
 						lastWaitFenceByDstQueue[dstIndex] = waitFence;
@@ -2828,14 +2837,13 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		};
 
 	auto dumpTransitionsForBatchPhase = [&](size_t batchIndex, const PassBatch& batch, BatchTransitionPhase phase) {
-		for (size_t queueIndex = 0; queueIndex < static_cast<size_t>(QueueKind::Count); ++queueIndex) {
-			const auto queue = static_cast<QueueKind>(queueIndex);
-			const auto& transitions = batch.Transitions(queue, phase);
+		for (size_t queueIndex = 0; queueIndex < batch.QueueCount(); ++queueIndex) {
+			const auto& transitions = batch.Transitions(queueIndex, phase);
 			spdlog::error(
 				"RG transition dump: batch={} phase={} queue={} count={}",
 				batchIndex,
 				phaseName(phase),
-				queueName(queue),
+				queueIndex < static_cast<size_t>(QueueKind::Count) ? queueName(static_cast<QueueKind>(queueIndex)) : "Dynamic",
 				transitions.size());
 
 			for (size_t ti = 0; ti < transitions.size(); ++ti) {
@@ -2882,9 +2890,8 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		for (size_t phaseIndex = 0; phaseIndex < static_cast<size_t>(BatchTransitionPhase::Count); ++phaseIndex) {
 			std::vector<ResourceTransition> phaseTransitions;
 			const auto phase = static_cast<BatchTransitionPhase>(phaseIndex);
-			for (size_t queueIndex = 0; queueIndex < static_cast<size_t>(QueueKind::Count); ++queueIndex) {
-				const auto queue = static_cast<QueueKind>(queueIndex);
-				const auto& transitions = batch.Transitions(queue, phase);
+			for (size_t queueIndex = 0; queueIndex < batch.QueueCount(); ++queueIndex) {
+				const auto& transitions = batch.Transitions(queueIndex, phase);
 				phaseTransitions.insert(phaseTransitions.end(), transitions.begin(), transitions.end());
 			}
 			
@@ -2922,33 +2929,31 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			}
 		};
 
-		std::array<UINT64, PassBatch::kQueueCount> lastSignalValue{};
-		std::array<int, PassBatch::kQueueCount> lastSignalBatch{};
-		std::array<BatchSignalPhase, PassBatch::kQueueCount> lastSignalPhase{};
-		lastSignalBatch.fill(-1);
+		std::vector<UINT64> lastSignalValue(slotCount, 0);
+		std::vector<int> lastSignalBatch(slotCount, -1);
+		std::vector<BatchSignalPhase> lastSignalPhase(slotCount);
 
 		for (size_t bi = 0; bi < batches.size(); ++bi) {
 			const auto& batch = batches[bi];
-			for (size_t qi = 0; qi < PassBatch::kQueueCount; ++qi) {
-				const auto queue = static_cast<QueueKind>(qi);
+			for (size_t qi = 0; qi < batch.QueueCount(); ++qi) {
 				for (size_t sp = 0; sp < PassBatch::kSignalPhaseCount; ++sp) {
 					const auto phase = static_cast<BatchSignalPhase>(sp);
-					if (!batch.HasQueueSignal(phase, queue)) continue;
+					if (!batch.HasQueueSignal(phase, qi)) continue;
 
-					UINT64 fenceVal = batch.GetQueueSignalFenceValue(phase, queue);
+					UINT64 fenceVal = batch.GetQueueSignalFenceValue(phase, qi);
 					if (fenceVal == 0) {
 						spdlog::error(
-							"Zero-value fence signal on {} queue: "
+							"Zero-value fence signal on queue {}: "
 							"batch {} phase {} has signal enabled with fence value 0. "
 							"This will produce an invalid timeline signal at execution time.",
-							queueName(queue), bi, signalPhaseName(phase));
+							qi, bi, signalPhaseName(phase));
 						throw std::runtime_error("Render graph has zero-value fence signal!");
 					}
 					if (lastSignalBatch[qi] >= 0 && fenceVal <= lastSignalValue[qi]) {
 						spdlog::error(
-							"Out-of-order fence signal on {} queue: "
+							"Out-of-order fence signal on queue {}: "
 							"batch {} phase {} signals fence={}, but batch {} phase {} already signaled fence={}",
-							queueName(queue),
+							qi,
 							bi, signalPhaseName(phase), fenceVal,
 							lastSignalBatch[qi], signalPhaseName(lastSignalPhase[qi]), lastSignalValue[qi]);
 						throw std::runtime_error("Render graph has out-of-order fence signals!");
@@ -2964,13 +2969,12 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	// No wait references a fence value that no signal on that source queue will produce.
 	{
 		// Collect the set of all signaled fence values per queue.
-		std::array<std::unordered_set<UINT64>, PassBatch::kQueueCount> signaledValues;
+		std::vector<std::unordered_set<UINT64>> signaledValues(slotCount);
 		for (const auto& batch : batches) {
-			for (size_t qi = 0; qi < PassBatch::kQueueCount; ++qi) {
-				const auto queue = static_cast<QueueKind>(qi);
+			for (size_t qi = 0; qi < batch.QueueCount(); ++qi) {
 				for (size_t sp = 0; sp < PassBatch::kSignalPhaseCount; ++sp) {
-					if (batch.HasQueueSignal(static_cast<BatchSignalPhase>(sp), queue))
-						signaledValues[qi].insert(batch.GetQueueSignalFenceValue(static_cast<BatchSignalPhase>(sp), queue));
+					if (batch.HasQueueSignal(static_cast<BatchSignalPhase>(sp), qi))
+						signaledValues[qi].insert(batch.GetQueueSignalFenceValue(static_cast<BatchSignalPhase>(sp), qi));
 				}
 			}
 		}
@@ -2988,18 +2992,17 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			const auto& batch = batches[bi];
 			for (size_t wp = 0; wp < PassBatch::kWaitPhaseCount; ++wp) {
 				const auto waitPhase = static_cast<BatchWaitPhase>(wp);
-				for (size_t dst = 0; dst < PassBatch::kQueueCount; ++dst) {
-					const auto dstQueue = static_cast<QueueKind>(dst);
-					for (size_t src = 0; src < PassBatch::kQueueCount; ++src) {
+				for (size_t dst = 0; dst < batch.QueueCount(); ++dst) {
+					for (size_t src = 0; src < batch.QueueCount(); ++src) {
 						if (dst == src) continue;
-						if (!batch.HasQueueWait(waitPhase, dstQueue, static_cast<QueueKind>(src))) continue;
+						if (!batch.HasQueueWait(waitPhase, dst, src)) continue;
 
-						UINT64 waitVal = batch.GetQueueWaitFenceValue(waitPhase, dstQueue, static_cast<QueueKind>(src));
+						UINT64 waitVal = batch.GetQueueWaitFenceValue(waitPhase, dst, src);
 						if (signaledValues[src].find(waitVal) == signaledValues[src].end()) {
 							spdlog::error(
-								"Dangling fence wait: batch {} {} queue waits on {} queue fence={} "
+								"Dangling fence wait: batch {} queue {} waits on queue {} fence={} "
 								"at phase {}, but no signal for that value exists",
-								bi, queueName(dstQueue), queueName(static_cast<QueueKind>(src)),
+								bi, dst, src,
 								waitVal, waitPhaseName(waitPhase));
 							throw std::runtime_error("Render graph has a wait on an unsignaled fence value!");
 						}
@@ -3328,18 +3331,30 @@ void RenderGraph::Setup() {
 
 	auto device = DeviceManager::GetInstance().GetDevice();
 
-	m_graphicsCommandListPool = std::make_unique<CommandListPool>(device, rhi::QueueKind::Graphics);
-	m_computeCommandListPool = std::make_unique<CommandListPool>(device, rhi::QueueKind::Compute);
-	m_copyCommandListPool = std::make_unique<CommandListPool>(device, rhi::QueueKind::Copy);
-
-	auto result = device.CreateTimeline(m_graphicsQueueFence);
-	result = device.CreateTimeline(m_computeQueueFence);
-	result = device.CreateTimeline(m_copyQueueFence);
-	result = device.CreateTimeline(m_readbackFence);
+	auto result = device.CreateTimeline(m_readbackFence);
 	result = device.CreateTimeline(m_frameStartSyncFence);
 
 	if (m_readbackService) {
 		m_readbackService->Initialize(m_readbackFence.Get());
+	}
+
+	// Populate the queue registry with the 3 primary queues.
+	// Each Register() call creates a CommandListPool and Timeline for the slot.
+	{
+		auto& gfxQ = DeviceManager::GetInstance().GetGraphicsQueue();
+		auto& compQ = DeviceManager::GetInstance().GetComputeQueue();
+		auto& copyQ = DeviceManager::GetInstance().GetCopyQueue();
+		m_queueRegistry.Register({ QueueKind::Graphics, 0 }, gfxQ, device);
+		m_queueRegistry.Register({ QueueKind::Compute, 0 }, compQ, device);
+		m_queueRegistry.Register({ QueueKind::Copy,    0 }, copyQ, device);
+	}
+
+	// Size queue-parallel member vectors to match the registry.
+	{
+		const size_t qc = m_queueRegistry.SlotCount();
+		m_compiledLastProducerBatchByResourceByQueue.resize(qc);
+		m_hasPendingFrameStartQueueWait.assign(qc, std::vector<uint8_t>(qc, 0));
+		m_pendingFrameStartQueueWaitFenceValue.assign(qc, std::vector<UINT64>(qc, 0));
 	}
 
 	m_getUseAsyncCompute = [this]() {
@@ -3469,9 +3484,6 @@ void RenderGraph::AddResource(std::shared_ptr<Resource> resource, bool transitio
 	if (auto buffer = std::dynamic_pointer_cast<Buffer>(resource)) {
 		buffer->EnsureVirtualDescriptorSlotsAllocated();
 	}
-	/*if (transition) {
-		initialResourceStates[resource->GetGlobalResourceID()] = initialState;
-	}*/
 }
 
 std::shared_ptr<Resource> RenderGraph::GetResourceByName(const std::string& name) {
@@ -3536,10 +3548,8 @@ void RenderGraph::Update(const UpdateExecutionContext& context, rhi::Device devi
 #define IFDEBUG(x) 
 
 namespace {
-	// -----------------------------------------------------------------------
 	// ExecuteTransitions: applies state-tracker bookkeeping AND records
-	// barriers.  Used only in the serial (non-parallel) fallback path.
-	// -----------------------------------------------------------------------
+	// barriers.  Used only in the non-parallel fallback path.
 	void ExecuteTransitions(std::vector<ResourceTransition>& transitions,
 		CommandRecordingManager* crm,
 		QueueKind queueKind,
@@ -3613,26 +3623,13 @@ namespace {
 		}
 	}
 
-	// -----------------------------------------------------------------------
-	// ApplyTransitions: CPU-side state-tracker bookkeeping only.  Must be
-	// called sequentially on the main thread before parallel recording.
-	// -----------------------------------------------------------------------
-	void ApplyTransitions(std::vector<ResourceTransition>& transitions) {
-		for (auto& transition : transitions) {
-			std::vector<ResourceTransition> dummy;
-			transition.pResource->GetStateTracker()->Apply(
-				transition.range, transition.pResource,
-				{ transition.newAccessType, transition.newLayout, transition.newSyncState }, dummy);
-		}
-	}
-
 	// Signal external fences on the queue. Must be called AFTER the command list
 	// containing the pass work has been flushed (submitted) so the signals fire
 	// after the GPU work they depend on.
 	void SignalExternalFences(
 		rhi::Queue& queue,
 		QueueKind queueKind,
-		CommandRecordingManager* crm,
+		rhi::Timeline* slotFence,
 		std::vector<PassReturn>& externalFences) {
 		if (externalFences.empty()) return;
 		for (auto& fr : externalFences) {
@@ -3651,16 +3648,15 @@ namespace {
 				}
 #if BUILD_TYPE == BUILD_TYPE_DEBUG
 				// Detect external fences that accidentally use the queue's own fence
-				// timeline. This would cause the CRM's signal tracking to become stale,
-				// leading to out-of-order signals on subsequent Flush calls.
-				auto* queueFence = crm->Fence(queueKind);
-				if (queueFence) {
+				// timeline. This would cause signal tracking to become stale,
+				// leading to out-of-order signals. The pass must use a dedicated timeline.
+				if (slotFence) {
 					auto a = fr.fence.value().GetHandle();
-					auto b = queueFence->GetHandle();
+					auto b = slotFence->GetHandle();
 					if (a.index == b.index && a.generation == b.generation) {
 						spdlog::error(
 							"External fence from pass uses the queue's own fence timeline! "
-							"This will cause CRM signal tracking to become stale and produce "
+							"This will cause signal tracking to become stale and produce "
 							"out-of-order signals. The pass must use a dedicated timeline.");
 						throw std::runtime_error("External fence aliases queue fence timeline!");
 					}
@@ -3685,6 +3681,7 @@ namespace {
 		RenderGraph::PassBatch& batch;
 		size_t batchIndex;
 		QueueKind queue;
+		size_t queueSlot;
 		rhi::Queue& rhiQueue;
 		rhi::Timeline& fenceTimeline;
 		CommandListPool& pool;
@@ -3692,58 +3689,52 @@ namespace {
 		PassExecutionContext& context;
 		rg::runtime::IStatisticsService* statisticsService;
 		std::vector<PassReturn>& outExternalFences;
-		// Tracks the highest fence value signaled on this *physical* timeline
-		// this frame.  Shared across all logical queues that alias to the
-		// same physical one (e.g. Compute→Graphics when aliased).  Used to
-		// produce monotonic recycle signals for CLs that don't have an
-		// explicit signal.
 		UINT64& lastSignaledOnTimeline;
 	};
 
 	void ExecuteQueueBatch(
 		ExecuteQueueBatchArgs& args,
-		auto&& WaitIfDistinct)
+		auto&& WaitOnSlot)
 	{
-		auto& sched   = args.sched;
-		auto& batch   = args.batch;
-		auto  queue   = args.queue;
+		auto& sched    = args.sched;
+		auto& batch    = args.batch;
+		auto  queue    = args.queue;
+		auto  qi       = args.queueSlot;
 		auto& rhiQueue = args.rhiQueue;
-		auto& pool    = args.pool;
+		auto& pool     = args.pool;
 		auto  fenceOffset = args.fenceOffset;
 
 		uint8_t clIndex = 0; // index into preallocatedCLs
 
 		// Waits: BeforeTransitions
-		for (size_t srcIndex = 0; srcIndex < static_cast<size_t>(QueueKind::Count); ++srcIndex) {
-			const auto srcQueue = static_cast<QueueKind>(srcIndex);
-			if (!batch.HasQueueWait(RenderGraph::BatchWaitPhase::BeforeTransitions, queue, srcQueue))
+		for (size_t srcIndex = 0; srcIndex < batch.QueueCount(); ++srcIndex) {
+			if (!batch.HasQueueWait(RenderGraph::BatchWaitPhase::BeforeTransitions, qi, srcIndex))
 				continue;
 			UINT64 val = fenceOffset + batch.GetQueueWaitFenceValue(
-				RenderGraph::BatchWaitPhase::BeforeTransitions, queue, srcQueue);
-			WaitIfDistinct(queue, srcQueue, val);
+				RenderGraph::BatchWaitPhase::BeforeTransitions, qi, srcIndex);
+			WaitOnSlot(qi, srcIndex, val);
 		}
 
 		// Open first CL and record pre-transitions
 		auto& cl0 = sched.preallocatedCLs[clIndex];
 		rhi::CommandList commandList = cl0.list.Get();
 
-		auto& preTransitions = batch.Transitions(queue, RenderGraph::BatchTransitionPhase::BeforePasses);
+		auto& preTransitions = batch.Transitions(qi, RenderGraph::BatchTransitionPhase::BeforePasses);
 		ExecuteTransitions(preTransitions, /*crm=*/nullptr, queue, commandList);
 
 		// Waits: BeforeExecution
-		for (size_t srcIndex = 0; srcIndex < static_cast<size_t>(QueueKind::Count); ++srcIndex) {
-			const auto srcQueue = static_cast<QueueKind>(srcIndex);
-			if (!batch.HasQueueWait(RenderGraph::BatchWaitPhase::BeforeExecution, queue, srcQueue))
+		for (size_t srcIndex = 0; srcIndex < batch.QueueCount(); ++srcIndex) {
+			if (!batch.HasQueueWait(RenderGraph::BatchWaitPhase::BeforeExecution, qi, srcIndex))
 				continue;
 			UINT64 val = fenceOffset + batch.GetQueueWaitFenceValue(
-				RenderGraph::BatchWaitPhase::BeforeExecution, queue, srcQueue);
-			WaitIfDistinct(queue, srcQueue, val);
+				RenderGraph::BatchWaitPhase::BeforeExecution, qi, srcIndex);
+			WaitOnSlot(qi, srcIndex, val);
 		}
 
 		// Split after transitions if needed
 		if (sched.splitAfterTransitions) {
 			UINT64 signalValue = fenceOffset + batch.GetQueueSignalFenceValue(
-				RenderGraph::BatchSignalPhase::AfterTransitions, queue);
+				RenderGraph::BatchSignalPhase::AfterTransitions, qi);
 			commandList.End();
 			rhiQueue.Submit({ &commandList, 1 }, {});
 			rhiQueue.Signal({ args.fenceTimeline.GetHandle(), signalValue });
@@ -3775,7 +3766,7 @@ namespace {
 				args.statisticsService->EndQuery(pr.statisticsIndex, args.context.frameIndex, rhiQueue, commandList);
 		};
 
-		for (auto& passVariant : batch.Passes(queue)) {
+		for (auto& passVariant : batch.Passes(qi)) {
 			std::visit([&](auto& passEntry) { executeOne(passEntry); }, passVariant);
 		}
 
@@ -3785,7 +3776,7 @@ namespace {
 		// Split after execution if needed
 		if (sched.splitAfterExecution) {
 			UINT64 signalValue = fenceOffset + batch.GetQueueSignalFenceValue(
-				RenderGraph::BatchSignalPhase::AfterExecution, queue);
+				RenderGraph::BatchSignalPhase::AfterExecution, qi);
 			commandList.End();
 			rhiQueue.Submit({ &commandList, 1 }, {});
 			rhiQueue.Signal({ args.fenceTimeline.GetHandle(), signalValue });
@@ -3798,17 +3789,16 @@ namespace {
 		}
 
 		// Waits: BeforeAfterPasses
-		for (size_t srcIndex = 0; srcIndex < static_cast<size_t>(QueueKind::Count); ++srcIndex) {
-			const auto srcQueue = static_cast<QueueKind>(srcIndex);
-			if (!batch.HasQueueWait(RenderGraph::BatchWaitPhase::BeforeAfterPasses, queue, srcQueue))
+		for (size_t srcIndex = 0; srcIndex < batch.QueueCount(); ++srcIndex) {
+			if (!batch.HasQueueWait(RenderGraph::BatchWaitPhase::BeforeAfterPasses, qi, srcIndex))
 				continue;
 			UINT64 val = fenceOffset + batch.GetQueueWaitFenceValue(
-				RenderGraph::BatchWaitPhase::BeforeAfterPasses, queue, srcQueue);
-			WaitIfDistinct(queue, srcQueue, val);
+				RenderGraph::BatchWaitPhase::BeforeAfterPasses, qi, srcIndex);
+			WaitOnSlot(qi, srcIndex, val);
 		}
 
 		// Record post-transitions
-		auto& postTransitions = batch.Transitions(queue, RenderGraph::BatchTransitionPhase::AfterPasses);
+		auto& postTransitions = batch.Transitions(qi, RenderGraph::BatchTransitionPhase::AfterPasses);
 		if (!postTransitions.empty())
 			ExecuteTransitions(postTransitions, /*crm=*/nullptr, queue, commandList);
 
@@ -3820,20 +3810,17 @@ namespace {
 			UINT64 recycleFence;
 			if (sched.signalAfterCompletion) {
 				recycleFence = fenceOffset + batch.GetQueueSignalFenceValue(
-					RenderGraph::BatchSignalPhase::AfterCompletion, queue);
+					RenderGraph::BatchSignalPhase::AfterCompletion, qi);
 			} else {
-				// No explicit signal requested.  Generate a monotonically
-				// increasing recycle value so the pool can safely determine
-				// when the GPU is done with this allocator/list pair.
 				recycleFence = ++args.lastSignaledOnTimeline;
 			}
 			if (recycleFence == 0) {
-				spdlog::error("ExecuteQueueBatch: recycleFence is 0 for batch {} queue {} "
+				spdlog::error("ExecuteQueueBatch: recycleFence is 0 for batch {} slot {} "
 					"(signalAfterCompletion={}, fenceOffset={}, fenceValue={}). "
 					"Falling back to monotonic signal.",
-					args.batchIndex, (int)queue, sched.signalAfterCompletion, fenceOffset,
+					args.batchIndex, qi, sched.signalAfterCompletion, fenceOffset,
 					batch.GetQueueSignalFenceValue(
-						RenderGraph::BatchSignalPhase::AfterCompletion, queue));
+						RenderGraph::BatchSignalPhase::AfterCompletion, qi));
 				recycleFence = ++args.lastSignaledOnTimeline;
 			}
 			rhiQueue.Signal({ args.fenceTimeline.GetHandle(), recycleFence });
@@ -3849,6 +3836,7 @@ namespace {
 		QueueBatchSchedule& sched;
 		RenderGraph::PassBatch& batch;
 		QueueKind queue;
+		size_t queueSlot;
 		rhi::Queue& rhiQueue;           // needed for statistics Begin/EndQuery
 		PassExecutionContext context;    // COPY: each task gets its own
 		rg::runtime::IStatisticsService* statisticsService;
@@ -3858,12 +3846,13 @@ namespace {
 		auto& sched = args.sched;
 		auto& batch = args.batch;
 		auto  queue = args.queue;
+		auto  qi    = args.queueSlot;
 
 		uint8_t clIndex = 0;
 		rhi::CommandList commandList = sched.preallocatedCLs[clIndex].list.Get();
 
 		// Record pre-transitions
-		auto& preTransitions = batch.Transitions(queue, RenderGraph::BatchTransitionPhase::BeforePasses);
+		auto& preTransitions = batch.Transitions(qi, RenderGraph::BatchTransitionPhase::BeforePasses);
 		RecordTransitionBarriers(preTransitions, commandList);
 
 		// Split after transitions?
@@ -3894,7 +3883,7 @@ namespace {
 				args.statisticsService->EndQuery(pr.statisticsIndex, args.context.frameIndex, args.rhiQueue, commandList, sched.queryRecordingContext);
 		};
 
-		for (auto& passVariant : batch.Passes(queue)) {
+		for (auto& passVariant : batch.Passes(qi)) {
 			std::visit([&](auto& passEntry) { executeOne(passEntry); }, passVariant);
 		}
 
@@ -3909,7 +3898,7 @@ namespace {
 		}
 
 		// Record post-transitions (barriers only).
-		auto& postTransitions = batch.Transitions(queue, RenderGraph::BatchTransitionPhase::AfterPasses);
+		auto& postTransitions = batch.Transitions(qi, RenderGraph::BatchTransitionPhase::AfterPasses);
 		if (!postTransitions.empty())
 			RecordTransitionBarriers(postTransitions, commandList);
 
@@ -3926,6 +3915,7 @@ namespace {
 		QueueBatchSchedule& sched;
 		RenderGraph::PassBatch& batch;
 		QueueKind queue;
+		size_t queueSlot;
 		rhi::Queue& rhiQueue;
 		rhi::Timeline& fenceTimeline;
 		CommandListPool& pool;
@@ -3935,33 +3925,30 @@ namespace {
 
 	void SubmitQueueBatch(
 		SubmitQueueBatchArgs& args,
-		auto&& WaitIfDistinct)
+		auto&& WaitOnSlot)
 	{
 		auto& sched      = args.sched;
 		auto& batch      = args.batch;
 		auto  queue      = args.queue;
+		auto  qi         = args.queueSlot;
 		auto& rhiQueue   = args.rhiQueue;
 		auto  fenceOffset = args.fenceOffset;
 
 		uint8_t clIndex = 0;
 
 		// Waits: BeforeTransitions + BeforeExecution
-		// Both are issued before the first submit, matching the original
-		// GPU queue ordering (they protect the transitions CL).
-		for (size_t srcIndex = 0; srcIndex < static_cast<size_t>(QueueKind::Count); ++srcIndex) {
-			const auto srcQueue = static_cast<QueueKind>(srcIndex);
-			if (batch.HasQueueWait(RenderGraph::BatchWaitPhase::BeforeTransitions, queue, srcQueue)) {
+		for (size_t srcIndex = 0; srcIndex < batch.QueueCount(); ++srcIndex) {
+			if (batch.HasQueueWait(RenderGraph::BatchWaitPhase::BeforeTransitions, qi, srcIndex)) {
 				UINT64 val = fenceOffset + batch.GetQueueWaitFenceValue(
-					RenderGraph::BatchWaitPhase::BeforeTransitions, queue, srcQueue);
-				WaitIfDistinct(queue, srcQueue, val);
+					RenderGraph::BatchWaitPhase::BeforeTransitions, qi, srcIndex);
+				WaitOnSlot(qi, srcIndex, val);
 			}
 		}
-		for (size_t srcIndex = 0; srcIndex < static_cast<size_t>(QueueKind::Count); ++srcIndex) {
-			const auto srcQueue = static_cast<QueueKind>(srcIndex);
-			if (batch.HasQueueWait(RenderGraph::BatchWaitPhase::BeforeExecution, queue, srcQueue)) {
+		for (size_t srcIndex = 0; srcIndex < batch.QueueCount(); ++srcIndex) {
+			if (batch.HasQueueWait(RenderGraph::BatchWaitPhase::BeforeExecution, qi, srcIndex)) {
 				UINT64 val = fenceOffset + batch.GetQueueWaitFenceValue(
-					RenderGraph::BatchWaitPhase::BeforeExecution, queue, srcQueue);
-				WaitIfDistinct(queue, srcQueue, val);
+					RenderGraph::BatchWaitPhase::BeforeExecution, qi, srcIndex);
+				WaitOnSlot(qi, srcIndex, val);
 			}
 		}
 
@@ -3970,7 +3957,7 @@ namespace {
 			rhi::CommandList cl = sched.preallocatedCLs[clIndex].list.Get();
 			rhiQueue.Submit({ &cl, 1 }, {});
 			UINT64 signalValue = fenceOffset + batch.GetQueueSignalFenceValue(
-				RenderGraph::BatchSignalPhase::AfterTransitions, queue);
+				RenderGraph::BatchSignalPhase::AfterTransitions, qi);
 			rhiQueue.Signal({ args.fenceTimeline.GetHandle(), signalValue });
 			args.lastSignaledOnTimeline = std::max(args.lastSignaledOnTimeline, signalValue);
 			args.pool.Recycle(std::move(sched.preallocatedCLs[clIndex]), signalValue);
@@ -3982,20 +3969,19 @@ namespace {
 			rhi::CommandList cl = sched.preallocatedCLs[clIndex].list.Get();
 			rhiQueue.Submit({ &cl, 1 }, {});
 			UINT64 signalValue = fenceOffset + batch.GetQueueSignalFenceValue(
-				RenderGraph::BatchSignalPhase::AfterExecution, queue);
+				RenderGraph::BatchSignalPhase::AfterExecution, qi);
 			rhiQueue.Signal({ args.fenceTimeline.GetHandle(), signalValue });
 			args.lastSignaledOnTimeline = std::max(args.lastSignaledOnTimeline, signalValue);
 			args.pool.Recycle(std::move(sched.preallocatedCLs[clIndex]), signalValue);
 			++clIndex;
 		}
 
-		// Waits: BeforeAfterPasses- protects the final CL (post-transitions).
-		for (size_t srcIndex = 0; srcIndex < static_cast<size_t>(QueueKind::Count); ++srcIndex) {
-			const auto srcQueue = static_cast<QueueKind>(srcIndex);
-			if (batch.HasQueueWait(RenderGraph::BatchWaitPhase::BeforeAfterPasses, queue, srcQueue)) {
+		// Waits: BeforeAfterPasses
+		for (size_t srcIndex = 0; srcIndex < batch.QueueCount(); ++srcIndex) {
+			if (batch.HasQueueWait(RenderGraph::BatchWaitPhase::BeforeAfterPasses, qi, srcIndex)) {
 				UINT64 val = fenceOffset + batch.GetQueueWaitFenceValue(
-					RenderGraph::BatchWaitPhase::BeforeAfterPasses, queue, srcQueue);
-				WaitIfDistinct(queue, srcQueue, val);
+					RenderGraph::BatchWaitPhase::BeforeAfterPasses, qi, srcIndex);
+				WaitOnSlot(qi, srcIndex, val);
 			}
 		}
 
@@ -4007,19 +3993,17 @@ namespace {
 			UINT64 recycleFence;
 			if (sched.signalAfterCompletion) {
 				recycleFence = fenceOffset + batch.GetQueueSignalFenceValue(
-					RenderGraph::BatchSignalPhase::AfterCompletion, queue);
+					RenderGraph::BatchSignalPhase::AfterCompletion, qi);
 			} else {
 				recycleFence = ++args.lastSignaledOnTimeline;
 			}
-			// Guard: a zero-value signal violates timeline monotonic ordering.
-			// Fall back to a monotonic recycle value to keep execution alive.
 			if (recycleFence == 0) {
 				spdlog::error(
 					"SubmitQueueBatch: recycleFence is 0 (signalAfterCompletion={}, "
 					"fenceOffset={}, fenceValue={}). Falling back to monotonic signal.",
 					sched.signalAfterCompletion, fenceOffset,
 					batch.GetQueueSignalFenceValue(
-						RenderGraph::BatchSignalPhase::AfterCompletion, queue));
+						RenderGraph::BatchSignalPhase::AfterCompletion, qi));
 				recycleFence = ++args.lastSignaledOnTimeline;
 			}
 			rhiQueue.Signal({ args.fenceTimeline.GetHandle(), recycleFence });
@@ -4030,30 +4014,20 @@ namespace {
 
 } // namespace
 
-void RenderGraph::BuildExecutionSchedule(bool alias) {
+void RenderGraph::BuildExecutionSchedule() {
 	auto& schedule = m_executionSchedule;
 	schedule.batches.resize(batches.size());
-
-	auto queueName = [](QueueKind queue) -> const char* {
-		switch (queue) {
-		case QueueKind::Graphics: return "Graphics";
-		case QueueKind::Compute:  return "Compute";
-		case QueueKind::Copy:     return "Copy";
-		default: return "Unknown";
-		}
-	};
 
 	for (size_t bi = 0; bi < batches.size(); ++bi) {
 		auto& batch = batches[bi];
 		auto& batchSched = schedule.batches[bi];
 
-		for (size_t qi = 0; qi < static_cast<size_t>(QueueKind::Count); ++qi) {
-			const auto queue = static_cast<QueueKind>(qi);
+		for (size_t qi = 0; qi < batchSched.queues.size(); ++qi) {
 			auto& qs = batchSched.queues[qi];
 
-			bool hasPre  = batch.HasTransitions(queue, BatchTransitionPhase::BeforePasses);
-			bool hasPost = batch.HasTransitions(queue, BatchTransitionPhase::AfterPasses);
-			bool hasPasses = batch.HasPasses(queue);
+			bool hasPre  = batch.HasTransitions(qi, BatchTransitionPhase::BeforePasses);
+			bool hasPost = batch.HasTransitions(qi, BatchTransitionPhase::AfterPasses);
+			bool hasPasses = batch.HasPasses(qi);
 			qs.active = hasPre || hasPasses || hasPost;
 
 			if (!qs.active) {
@@ -4067,24 +4041,20 @@ void RenderGraph::BuildExecutionSchedule(bool alias) {
 			if (bi == 0) {
 				spdlog::error(
 					"BuildExecutionSchedule: batch 0 (sentinel) is unexpectedly "
-					"active on {} queue (hasPre={}, hasPasses={}, hasPost={}). "
+					"active on queue {} (hasPre={}, hasPasses={}, hasPost={}). "
 					"This will produce a zero-value fence signal. Forcing inactive.",
-					queueName(queue), hasPre, hasPasses, hasPost);
+					qi, hasPre, hasPasses, hasPost);
 				qs.active = false;
 				qs.numCLs = 0;
 				continue;
 			}
 
-			// For Compute when aliased, suppress signals (they run on Graphics queue).
-			// Graphics AfterTransitions is always allowed- Copy may need it.
-			bool suppressSignals = (queue == QueueKind::Compute && alias);
-
-			qs.splitAfterTransitions = !suppressSignals &&
-				batch.HasQueueSignal(BatchSignalPhase::AfterTransitions, queue);
-			qs.splitAfterExecution = !suppressSignals &&
-				batch.HasQueueSignal(BatchSignalPhase::AfterExecution, queue);
-			qs.signalAfterCompletion = !suppressSignals &&
-				batch.HasQueueSignal(BatchSignalPhase::AfterCompletion, queue);
+			qs.splitAfterTransitions =
+				batch.HasQueueSignal(BatchSignalPhase::AfterTransitions, qi);
+			qs.splitAfterExecution =
+				batch.HasQueueSignal(BatchSignalPhase::AfterExecution, qi);
+			qs.signalAfterCompletion =
+				batch.HasQueueSignal(BatchSignalPhase::AfterCompletion, qi);
 
 			qs.numCLs = 1
 				+ static_cast<uint8_t>(qs.splitAfterTransitions)
@@ -4096,101 +4066,65 @@ void RenderGraph::BuildExecutionSchedule(bool alias) {
 void RenderGraph::Execute(PassExecutionContext& context) {
 	ValidateCompiledResourceGenerations();
 
-	bool useAsyncCompute = m_getUseAsyncCompute();
 	const bool heavyDebug = m_getHeavyDebug ? m_getHeavyDebug() : false;
 	auto& manager = DeviceManager::GetInstance();
+	const size_t slotCount = m_queueRegistry.SlotCount();
+
+	// Create CRM from the primary queue slots in the registry.
 	CommandRecordingManager::Init init{
 		.graphicsQ = &manager.GetGraphicsQueue(),
-		.graphicsF = &m_graphicsQueueFence.Get(),
-		.graphicsPool = m_graphicsCommandListPool.get(),
+		.graphicsF = &m_queueRegistry.GetFence(static_cast<QueueSlotIndex>(0)),
+		.graphicsPool = m_queueRegistry.GetPool(static_cast<QueueSlotIndex>(0)),
 
-		.computeQ = useAsyncCompute ? &manager.GetComputeQueue() : &manager.GetGraphicsQueue(),
-		.computeF = useAsyncCompute ? &m_computeQueueFence.Get() : &m_graphicsQueueFence.Get(),
-		.computePool = useAsyncCompute ? m_computeCommandListPool.get() : m_graphicsCommandListPool.get(),
+		.computeQ = &manager.GetComputeQueue(),
+		.computeF = &m_queueRegistry.GetFence(static_cast<QueueSlotIndex>(1)),
+		.computePool = m_queueRegistry.GetPool(static_cast<QueueSlotIndex>(1)),
 
 		.copyQ = &manager.GetCopyQueue(),
-		.copyF = &m_copyQueueFence.Get(),
-		.copyPool = m_copyCommandListPool.get(),
-		.computeMode = useAsyncCompute ? ComputeMode::Async : ComputeMode::AliasToGraphics
+		.copyF = &m_queueRegistry.GetFence(static_cast<QueueSlotIndex>(2)),
+		.copyPool = m_queueRegistry.GetPool(static_cast<QueueSlotIndex>(2)),
 	};
 
 	m_pCommandRecordingManager = std::make_unique<CommandRecordingManager>(init);
 	auto crm = m_pCommandRecordingManager.get();
 
-	auto graphicsQueue = crm->Queue(QueueKind::Graphics);
-	auto computeQueue = crm->Queue(QueueKind::Compute);
-	auto copyQueue = crm->Queue(QueueKind::Copy);
-
-	const bool alias = (computeQueue == graphicsQueue);
-	auto GetQueueFenceTimeline = [&](QueueKind queue) -> rhi::Timeline& {
-		// When compute is aliased to graphics, compute work runs on the
-		// graphics queue and signals the graphics fence.  Any wait that
-		// targets the "compute" timeline must therefore use the graphics
-		// fence so it actually gets satisfied.
-		if (alias && queue == QueueKind::Compute) queue = QueueKind::Graphics;
-		switch (queue) {
-		case QueueKind::Graphics: return m_graphicsQueueFence.Get();
-		case QueueKind::Compute: return m_computeQueueFence.Get();
-		case QueueKind::Copy: return m_copyQueueFence.Get();
-		default: return m_graphicsQueueFence.Get();
-		}
+	// Registry-based queue/fence/pool resolution — no aliasing.
+	auto SlotQueue = [&](size_t qi) -> rhi::Queue {
+		return m_queueRegistry.GetQueue(static_cast<QueueSlotIndex>(qi));
 	};
-	// TODO: Is there any remaining use for this?
-	auto GetQueueFenceOffset = [&](QueueKind queue) -> UINT64 {
-		(void)queue;
-		return 0;
+	auto SlotFence = [&](size_t qi) -> rhi::Timeline& {
+		return m_queueRegistry.GetFence(static_cast<QueueSlotIndex>(qi));
 	};
-	auto QueueHandle = [&](QueueKind queue) -> rhi::Queue* {
-		switch (queue) {
-		case QueueKind::Graphics: return graphicsQueue;
-		case QueueKind::Compute: return computeQueue;
-		case QueueKind::Copy: return copyQueue;
-		default: return graphicsQueue;
-		}
-	};
-	auto QueuesAlias = [&](QueueKind a, QueueKind b) {
-		return QueueHandle(a) == QueueHandle(b);
-	};
-	auto WaitIfDistinct = [&](QueueKind dstQueue, QueueKind srcQueue, UINT64 absoluteFenceValue) {
-		if (QueuesAlias(dstQueue, srcQueue)) {
-			return;
-		}
-		QueueHandle(dstQueue)->Wait({ GetQueueFenceTimeline(srcQueue).GetHandle(), absoluteFenceValue });
+	auto SlotPool = [&](size_t qi) -> CommandListPool* {
+		return m_queueRegistry.GetPool(static_cast<QueueSlotIndex>(qi));
 	};
 
-	for (size_t dstIndex = 0; dstIndex < static_cast<size_t>(QueueKind::Count); ++dstIndex) {
-		for (size_t srcIndex = 0; srcIndex < static_cast<size_t>(QueueKind::Count); ++srcIndex) {
-			if (dstIndex == srcIndex) {
-				continue;
-			}
-			if (!m_hasPendingFrameStartQueueWait[dstIndex][srcIndex]) {
-				continue;
-			}
-			WaitIfDistinct(
-				static_cast<QueueKind>(dstIndex),
-				static_cast<QueueKind>(srcIndex),
+	// Wait: every queue is distinct, so waits always execute.
+	auto WaitOnSlot = [&](size_t dstSlot, size_t srcSlot, UINT64 absoluteFenceValue) {
+		if (dstSlot == srcSlot) return;
+		auto dstQ = SlotQueue(dstSlot);
+		dstQ.Wait({ SlotFence(srcSlot).GetHandle(), absoluteFenceValue });
+	};
+
+	// Frame-start waits from previous frame's last-producer tracking.
+	for (size_t dstIndex = 0; dstIndex < slotCount; ++dstIndex) {
+		for (size_t srcIndex = 0; srcIndex < slotCount; ++srcIndex) {
+			if (dstIndex == srcIndex) continue;
+			if (dstIndex >= m_hasPendingFrameStartQueueWait.size() ||
+				srcIndex >= m_hasPendingFrameStartQueueWait[dstIndex].size()) continue;
+			if (!m_hasPendingFrameStartQueueWait[dstIndex][srcIndex]) continue;
+			WaitOnSlot(dstIndex, srcIndex,
 				m_pendingFrameStartQueueWaitFenceValue[dstIndex][srcIndex]);
 		}
 	}
 
-	const UINT64 currentGraphicsQueueFenceOffset = GetQueueFenceOffset(QueueKind::Graphics);
-	const UINT64 currentComputeQueueFenceOffset = GetQueueFenceOffset(QueueKind::Compute);
-	const UINT64 currentCopyQueueFenceOffset = GetQueueFenceOffset(QueueKind::Copy);
-
-	auto EffectiveProducerQueue = [&](QueueKind producerQueue) {
-		if (producerQueue == QueueKind::Compute && alias) {
-			return QueueKind::Graphics;
-		}
-		return producerQueue;
-	};
-
-	for (size_t queueIndex = 0; queueIndex < static_cast<size_t>(QueueKind::Count); ++queueIndex) {
-		const auto producerQueue = static_cast<QueueKind>(queueIndex);
-		const auto effectiveQueue = EffectiveProducerQueue(producerQueue);
+	// Mark completion signals on batches that produced resources tracked across frames.
+	for (size_t queueIndex = 0; queueIndex < slotCount; ++queueIndex) {
+		if (queueIndex >= m_compiledLastProducerBatchByResourceByQueue.size()) continue;
 		for (const auto& [resourceID, producerBatch] : m_compiledLastProducerBatchByResourceByQueue[queueIndex]) {
 			(void)resourceID;
 			if (producerBatch > 0 && producerBatch < batches.size()) {
-				batches[producerBatch].MarkQueueSignal(BatchSignalPhase::AfterCompletion, effectiveQueue);
+				batches[producerBatch].MarkQueueSignal(BatchSignalPhase::AfterCompletion, queueIndex);
 			}
 		}
 	}
@@ -4239,156 +4173,97 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 	auto* statisticsService = m_statisticsService.get();
 
 	// Build the execution schedule and pre-allocate command lists.
-	BuildExecutionSchedule(alias);
+	BuildExecutionSchedule();
 
-	// Resolve pool pointers per logical queue (compute may alias to graphics pool).
-	std::array<CommandListPool*, static_cast<size_t>(QueueKind::Count)> resolvedPools = {
-		m_graphicsCommandListPool.get(),
-		alias ? m_graphicsCommandListPool.get() : m_computeCommandListPool.get(),
-		m_copyCommandListPool.get(),
-	};
-
-	// Pre-allocate all CLs from the main thread
+	// Pre-allocate all CLs from the main thread using registry pools.
 	for (size_t bi = 0; bi < m_executionSchedule.batches.size(); ++bi) {
 		auto& batchSched = m_executionSchedule.batches[bi];
-		for (size_t qi = 0; qi < static_cast<size_t>(QueueKind::Count); ++qi) {
+		for (size_t qi = 0; qi < batchSched.queues.size(); ++qi) {
 			auto& qs = batchSched.queues[qi];
 			for (uint8_t ci = 0; ci < qs.numCLs; ++ci) {
-				qs.preallocatedCLs[ci] = resolvedPools[qi]->Request();
+				qs.preallocatedCLs[ci] = SlotPool(qi)->Request();
 			}
 		}
 	}
 
-	// Per-physical-queue signal tracking for monotonic recycle signals.
-	// Initialised from the current completed value of each fence timeline.
-	// When compute is aliased, Compute and Graphics share the same entry.
-	std::array<UINT64, static_cast<size_t>(QueueKind::Count)> lastSignaledPerPhysicalQueue{};
-	for (size_t qi = 0; qi < static_cast<size_t>(QueueKind::Count); ++qi) {
-		auto* fence = crm->Fence(static_cast<QueueKind>(qi));
-		if (fence) lastSignaledPerPhysicalQueue[qi] = fence->GetCompletedValue();
+	// Per-slot signal tracking for monotonic recycle signals.
+	std::vector<UINT64> lastSignaledPerSlot(slotCount);
+	for (size_t qi = 0; qi < slotCount; ++qi) {
+		lastSignaledPerSlot[qi] = SlotFence(qi).GetCompletedValue();
 	}
-	// Resolve logical queue -> physical queue index for signal tracking.
-	auto ResolvedQueueIndex = [&](QueueKind qk) -> size_t {
-		if (alias && qk == QueueKind::Compute) return static_cast<size_t>(QueueKind::Graphics);
-		return static_cast<size_t>(qk);
-	};
 
 	// Execution, two paths: heavyDebug (serial) or normal (parallel).
 	if (heavyDebug) {
 		// ---- Serial path: record + submit + drain per batch. ----
-		// Uses ExecuteQueueBatch (combined record+submit) for per-batch
-		// fault isolation via GPU drain after each batch.
 		unsigned int batchIndex = 0;
 		for (size_t bi = 0; bi < batches.size(); ++bi) {
 			auto& batch = batches[bi];
 			auto& batchSched = m_executionSchedule.batches[bi];
 
-			// Copy queue
-			auto& copyQS = batchSched.queues[static_cast<size_t>(QueueKind::Copy)];
-			std::vector<PassReturn> copyExternalFences;
-			if (copyQS.active) {
-				ExecuteQueueBatchArgs copyArgs{
-					.sched = copyQS,
+			// Execute each queue slot in order.
+			std::vector<std::vector<PassReturn>> slotExternalFences(slotCount);
+			for (size_t qi = 0; qi < slotCount; ++qi) {
+				auto& qs = batchSched.queues[qi];
+				if (!qs.active) continue;
+				auto rhiQ = SlotQueue(qi);
+				ExecuteQueueBatchArgs args{
+					.sched = qs,
 					.batch = batch,
 					.batchIndex = bi,
-					.queue = QueueKind::Copy,
-					.rhiQueue = *copyQueue,
-					.fenceTimeline = m_copyQueueFence.Get(),
-					.pool = *resolvedPools[static_cast<size_t>(QueueKind::Copy)],
-					.fenceOffset = currentCopyQueueFenceOffset,
+					.queue = m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(qi)),
+					.queueSlot = qi,
+					.rhiQueue = rhiQ,
+					.fenceTimeline = SlotFence(qi),
+					.pool = *SlotPool(qi),
+					.fenceOffset = 0,
 					.context = context,
 					.statisticsService = statisticsService,
-					.outExternalFences = copyExternalFences,
-					.lastSignaledOnTimeline = lastSignaledPerPhysicalQueue[ResolvedQueueIndex(QueueKind::Copy)],
+					.outExternalFences = slotExternalFences[qi],
+					.lastSignaledOnTimeline = lastSignaledPerSlot[qi],
 				};
-				ExecuteQueueBatch(copyArgs, WaitIfDistinct);
+				ExecuteQueueBatch(args, WaitOnSlot);
 			}
 
-			// Compute queue
-			auto& computeQS = batchSched.queues[static_cast<size_t>(QueueKind::Compute)];
-			std::vector<PassReturn> computeExternalFences;
-			if (computeQS.active) {
-				ExecuteQueueBatchArgs computeArgs{
-					.sched = computeQS,
-					.batch = batch,
-					.batchIndex = bi,
-					.queue = QueueKind::Compute,
-					.rhiQueue = *computeQueue,
-					.fenceTimeline = GetQueueFenceTimeline(QueueKind::Compute),
-					.pool = *resolvedPools[static_cast<size_t>(QueueKind::Compute)],
-					.fenceOffset = currentComputeQueueFenceOffset,
-					.context = context,
-					.statisticsService = statisticsService,
-					.outExternalFences = computeExternalFences,
-					.lastSignaledOnTimeline = lastSignaledPerPhysicalQueue[ResolvedQueueIndex(QueueKind::Compute)],
-				};
-				ExecuteQueueBatch(computeArgs, WaitIfDistinct);
+			// Signal external fences AFTER all CLs in this batch are submitted.
+			for (size_t qi = 0; qi < slotCount; ++qi) {
+				if (!slotExternalFences[qi].empty()) {
+					auto rhiQ = SlotQueue(qi);
+					SignalExternalFences(rhiQ, m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(qi)),
+						&SlotFence(qi), slotExternalFences[qi]);
+				}
 			}
 
-			// Graphics queue
-			auto& graphicsQS = batchSched.queues[static_cast<size_t>(QueueKind::Graphics)];
-			std::vector<PassReturn> graphicsExternalFences;
-			if (graphicsQS.active) {
-				ExecuteQueueBatchArgs graphicsArgs{
-					.sched = graphicsQS,
-					.batch = batch,
-					.batchIndex = bi,
-					.queue = QueueKind::Graphics,
-					.rhiQueue = *graphicsQueue,
-					.fenceTimeline = m_graphicsQueueFence.Get(),
-					.pool = *resolvedPools[static_cast<size_t>(QueueKind::Graphics)],
-					.fenceOffset = currentGraphicsQueueFenceOffset,
-					.context = context,
-					.statisticsService = statisticsService,
-					.outExternalFences = graphicsExternalFences,
-					.lastSignaledOnTimeline = lastSignaledPerPhysicalQueue[ResolvedQueueIndex(QueueKind::Graphics)],
-				};
-				ExecuteQueueBatch(graphicsArgs, WaitIfDistinct);
-			}
-
-			// Signal external fences AFTER CLs are submitted.
-			SignalExternalFences(*copyQueue, QueueKind::Copy, crm, copyExternalFences);
-			SignalExternalFences(*computeQueue, QueueKind::Compute, crm, computeExternalFences);
-			SignalExternalFences(*graphicsQueue, QueueKind::Graphics, crm, graphicsExternalFences);
-
-			// Drain all queues and CPU-wait after every batch so a
-			// DeviceRemoved fault is isolated to the passes in this batch.
-			auto drainQueue = [&](QueueKind qk, rhi::Timeline& timeline, const char* queueName) {
-				auto& qs = batchSched.queues[static_cast<size_t>(qk)];
-				if (!qs.active) return;
+			// Drain all queues after every batch.
+			for (size_t qi = 0; qi < slotCount; ++qi) {
+				auto& qs = batchSched.queues[qi];
+				if (!qs.active) continue;
 				UINT64 highestSignal = 0;
 				for (size_t sp = 0; sp < PassBatch::kSignalPhaseCount; ++sp) {
-					if (batch.HasQueueSignal(static_cast<BatchSignalPhase>(sp), qk)) {
-						UINT64 v = batch.GetQueueSignalFenceValue(static_cast<BatchSignalPhase>(sp), qk);
+					if (batch.HasQueueSignal(static_cast<BatchSignalPhase>(sp), qi)) {
+						UINT64 v = batch.GetQueueSignalFenceValue(static_cast<BatchSignalPhase>(sp), qi);
 						if (v > highestSignal) highestSignal = v;
 					}
 				}
-				if (highestSignal == 0) return;
-				auto result = timeline.HostWait(highestSignal);
+				if (highestSignal == 0) continue;
+				auto result = SlotFence(qi).HostWait(highestSignal);
 				DeviceManager::GetInstance().GetDevice().CheckDebugMessages();
 				if (rhi::Failed(result)) {
 					std::string passNames;
-					auto collectNames = [&](auto& passes) {
-						for (auto& pv : passes) {
+					auto collectNames = [&](size_t q) {
+						for (auto& pv : batch.Passes(q)) {
 							std::visit([&](auto& pr) {
 								if (!passNames.empty()) passNames += ", ";
 								passNames += pr.name;
 							}, pv);
 						}
 					};
-					collectNames(batch.Passes(QueueKind::Graphics));
-					collectNames(batch.Passes(QueueKind::Compute));
-					collectNames(batch.Passes(QueueKind::Copy));
+					for (size_t q = 0; q < slotCount; ++q) collectNames(q);
 					spdlog::error(
-						"[HeavyDebug] GPU fault after batch {} on {} queue. "
+						"[HeavyDebug] GPU fault after batch {} on queue slot {}. "
 						"Passes in batch: [{}]",
-						batchIndex, queueName, passNames);
+						batchIndex, qi, passNames);
 				}
-			};
-			drainQueue(QueueKind::Graphics, m_graphicsQueueFence.Get(), "Graphics");
-			drainQueue(QueueKind::Compute,  GetQueueFenceTimeline(QueueKind::Compute), "Compute");
-			drainQueue(QueueKind::Copy,     m_copyQueueFence.Get(), "Copy");
-
+			}
 			++batchIndex;
 		}
 	} else {
@@ -4396,20 +4271,14 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 
 		// Clear per-frame recording state from any previous frame.
 		for (size_t bi = 0; bi < batches.size(); ++bi) {
-			auto& batch = batches[bi];
-			for (size_t qi = 0; qi < static_cast<size_t>(QueueKind::Count); ++qi) {
-				auto& qs = m_executionSchedule.batches[bi].queues[qi];
+			auto& batchSched = m_executionSchedule.batches[bi];
+			for (size_t qi = 0; qi < batchSched.queues.size(); ++qi) {
+				auto& qs = batchSched.queues[qi];
 				qs.externalFences.clear();
 				qs.queryRecordingContext.recordedIndices.clear();
 				qs.queryRecordingContext.pendingRanges.clear();
 			}
 		}
-
-		// Flat parallel recording over all (batch, queue) tasks.
-		// Each task records into its own pre-allocated CLs and its own QueryRecordingContext
-		std::array<rhi::Queue*, static_cast<size_t>(QueueKind::Count)> rhiQueues = {
-			graphicsQueue, computeQueue, copyQueue
-		};
 
 		// Build flat task list: one entry per active (batch, queue) pair.
 		struct RecordTask {
@@ -4417,10 +4286,11 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 			size_t queueIndex;
 		};
 		std::vector<RecordTask> tasks;
-		tasks.reserve(batches.size() * static_cast<size_t>(QueueKind::Count));
+		tasks.reserve(batches.size() * slotCount);
 		for (size_t bi = 0; bi < batches.size(); ++bi) {
-			for (size_t qi = 0; qi < static_cast<size_t>(QueueKind::Count); ++qi) {
-				if (m_executionSchedule.batches[bi].queues[qi].active)
+			auto& batchSched = m_executionSchedule.batches[bi];
+			for (size_t qi = 0; qi < batchSched.queues.size(); ++qi) {
+				if (batchSched.queues[qi].active)
 					tasks.push_back({bi, qi});
 			}
 		}
@@ -4428,102 +4298,79 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 		ParallelForOptional("RecordAllBatches", tasks.size(), [&](size_t taskIdx) {
 			auto& task = tasks[taskIdx];
 			auto& qs = m_executionSchedule.batches[task.batchIndex].queues[task.queueIndex];
+			auto rhiQ = SlotQueue(task.queueIndex);
 			RecordQueueBatchArgs args{
 				.sched = qs,
 				.batch = batches[task.batchIndex],
-				.queue = static_cast<QueueKind>(task.queueIndex),
-				.rhiQueue = *rhiQueues[task.queueIndex],
+				.queue = m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(task.queueIndex)),
+				.queueSlot = task.queueIndex,
+				.rhiQueue = rhiQ,
 				.context = context,
 				.statisticsService = statisticsService,
 			};
 			RecordQueueBatch(args);
 		}, true);
 
-		// Merge per-task statistics contexts into the shared map
-		// on the main thread, before submission.
+		// Merge per-task statistics contexts.
 		if (statisticsService) {
 			for (size_t bi = 0; bi < batches.size(); ++bi) {
-				for (size_t qi = 0; qi < static_cast<size_t>(QueueKind::Count); ++qi) {
-					auto& qs = m_executionSchedule.batches[bi].queues[qi];
+				auto& batchSched = m_executionSchedule.batches[bi];
+				for (size_t qi = 0; qi < batchSched.queues.size(); ++qi) {
+					auto& qs = batchSched.queues[qi];
 					if (!qs.active) continue;
 					if (qs.queryRecordingContext.pendingRanges.empty()) continue;
+					const auto kind = m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(qi));
 					statisticsService->MergePendingResolves(
-						static_cast<rhi::QueueKind>(qi), context.frameIndex,
+						static_cast<rhi::QueueKind>(kind), context.frameIndex,
 						qs.queryRecordingContext);
 				}
 			}
 		}
 
 		// Sequential submission on the main thread.
-		// Copy -> Compute -> Graphics ordering within each batch.
 		for (size_t bi = 0; bi < batches.size(); ++bi) {
 			auto& batch = batches[bi];
 			auto& batchSched = m_executionSchedule.batches[bi];
 
-			auto& copyQS = batchSched.queues[static_cast<size_t>(QueueKind::Copy)];
-			if (copyQS.active) {
-				SubmitQueueBatchArgs copyArgs{
-					.sched = copyQS,
+			for (size_t qi = 0; qi < batchSched.queues.size(); ++qi) {
+				auto& qs = batchSched.queues[qi];
+				if (!qs.active) continue;
+				auto rhiQ = SlotQueue(qi);
+				SubmitQueueBatchArgs args{
+					.sched = qs,
 					.batch = batch,
-					.queue = QueueKind::Copy,
-					.rhiQueue = *copyQueue,
-					.fenceTimeline = m_copyQueueFence.Get(),
-					.pool = *resolvedPools[static_cast<size_t>(QueueKind::Copy)],
-					.fenceOffset = currentCopyQueueFenceOffset,
-					.lastSignaledOnTimeline = lastSignaledPerPhysicalQueue[ResolvedQueueIndex(QueueKind::Copy)],
+					.queue = m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(qi)),
+					.queueSlot = qi,
+					.rhiQueue = rhiQ,
+					.fenceTimeline = SlotFence(qi),
+					.pool = *SlotPool(qi),
+					.fenceOffset = 0,
+					.lastSignaledOnTimeline = lastSignaledPerSlot[qi],
 				};
-				SubmitQueueBatch(copyArgs, WaitIfDistinct);
+				SubmitQueueBatch(args, WaitOnSlot);
 			}
 
-			auto& computeQS = batchSched.queues[static_cast<size_t>(QueueKind::Compute)];
-			if (computeQS.active) {
-				SubmitQueueBatchArgs computeArgs{
-					.sched = computeQS,
-					.batch = batch,
-					.queue = QueueKind::Compute,
-					.rhiQueue = *computeQueue,
-					.fenceTimeline = GetQueueFenceTimeline(QueueKind::Compute),
-					.pool = *resolvedPools[static_cast<size_t>(QueueKind::Compute)],
-					.fenceOffset = currentComputeQueueFenceOffset,
-					.lastSignaledOnTimeline = lastSignaledPerPhysicalQueue[ResolvedQueueIndex(QueueKind::Compute)],
-				};
-				SubmitQueueBatch(computeArgs, WaitIfDistinct);
+			// Signal external fences AFTER all CLs are submitted.
+			for (size_t qi = 0; qi < batchSched.queues.size(); ++qi) {
+				auto& qs = batchSched.queues[qi];
+				if (qs.externalFences.empty()) continue;
+				auto rhiQ = SlotQueue(qi);
+				SignalExternalFences(rhiQ, m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(qi)),
+					&SlotFence(qi), qs.externalFences);
 			}
-
-			auto& graphicsQS = batchSched.queues[static_cast<size_t>(QueueKind::Graphics)];
-			if (graphicsQS.active) {
-				SubmitQueueBatchArgs graphicsArgs{
-					.sched = graphicsQS,
-					.batch = batch,
-					.queue = QueueKind::Graphics,
-					.rhiQueue = *graphicsQueue,
-					.fenceTimeline = m_graphicsQueueFence.Get(),
-					.pool = *resolvedPools[static_cast<size_t>(QueueKind::Graphics)],
-					.fenceOffset = currentGraphicsQueueFenceOffset,
-					.lastSignaledOnTimeline = lastSignaledPerPhysicalQueue[ResolvedQueueIndex(QueueKind::Graphics)],
-				};
-				SubmitQueueBatch(graphicsArgs, WaitIfDistinct);
-			}
-
-			// Signal external fences AFTER CLs are submitted.
-			SignalExternalFences(*copyQueue, QueueKind::Copy, crm, copyQS.externalFences);
-			SignalExternalFences(*computeQueue, QueueKind::Compute, crm, computeQS.externalFences);
-			SignalExternalFences(*graphicsQueue, QueueKind::Graphics, crm, graphicsQS.externalFences);
 		}
 	}
 
-	for (size_t queueIndex = 0; queueIndex < static_cast<size_t>(QueueKind::Count); ++queueIndex) {
-		const auto producerQueue = static_cast<QueueKind>(queueIndex);
-		const auto effectiveQueue = EffectiveProducerQueue(producerQueue);
+	// Update across-frame producer tracking (no aliasing remapping).
+	for (size_t queueIndex = 0; queueIndex < slotCount; ++queueIndex) {
+		if (queueIndex >= m_compiledLastProducerBatchByResourceByQueue.size()) continue;
 		for (const auto& [resourceID, producerBatch] : m_compiledLastProducerBatchByResourceByQueue[queueIndex]) {
-			if (producerBatch == 0 || producerBatch >= batches.size()) {
-				continue;
-			}
+			if (producerBatch == 0 || producerBatch >= batches.size()) continue;
 
-			const uint64_t fenceValue = GetQueueFenceOffset(effectiveQueue) +
-				batches[producerBatch].GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, effectiveQueue);
+			const uint64_t fenceValue =
+				batches[producerBatch].GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, queueIndex);
 			LastProducerAcrossFrames producer{
-				.queue = effectiveQueue,
+				.queueSlot = queueIndex,
 				.fenceValue = fenceValue,
 			};
 			nextLastProducerByResourceAcrossFrames[resourceID] = producer;
@@ -4535,26 +4382,31 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 	m_lastAliasPlacementProducersByPoolAcrossFrames = std::move(nextLastAliasPlacementProducersByPoolAcrossFrames);
 	DeletionManager::GetInstance().ProcessDeletions();
 
-	// Sync CRM signal tracking with the values we signaled directly.
-	// CRM is not used for recording in the schedule-driven path, but its
-	// EndFrame() still calls RecycleCompleted on each pool, and external
-	// code may query LastSignaledValue.  Ensure CRM sees at least as high
-	// as the highest signal we issued on each physical timeline.
-	for (size_t qi = 0; qi < static_cast<size_t>(QueueKind::Count); ++qi) {
-		UINT64 val = lastSignaledPerPhysicalQueue[ResolvedQueueIndex(static_cast<QueueKind>(qi))];
+	// Sync CRM signal tracking with values we signaled directly.
+	// Capped at primary queue count: CRM only tracks the 3 primary queues (Graphics/Compute/Copy).
+	for (size_t qi = 0; qi < std::min(slotCount, static_cast<size_t>(QueueKind::Count)); ++qi) {
+		UINT64 val = lastSignaledPerSlot[qi];
 		if (val > 0) {
 			crm->EnsureMinSignaledValue(static_cast<QueueKind>(qi), val);
 		}
 	}
 
-	// Cleanup Flushes are no-ops (no CRM-managed CLs were opened), but
-	// kept for safety in case external code (e.g. SignalExternalFences)
-	// opens a CRM CL in the future.
 	crm->Flush(QueueKind::Graphics, { false, 0 });
 	crm->Flush(QueueKind::Compute, { false, 0 });
 	crm->Flush(QueueKind::Copy, { false, 0 });
 	PublishCompiledTrackerStates();
 	crm->EndFrame();
+
+	// Recycle completed command lists on registry pools.
+	// CRM::EndFrame() only recycles the old member pools; the registry owns
+	// separate pools that receive Recycle() calls during execution above.
+	for (size_t qi = 0; qi < slotCount; ++qi) {
+		auto* pool = SlotPool(qi);
+		if (pool) {
+			uint64_t completed = SlotFence(qi).GetCompletedValue();
+			pool->RecycleCompleted(completed);
+		}
+	}
 }
 
 bool RenderGraph::IsNewBatchNeeded(
@@ -4856,3 +4708,19 @@ CopyPassBuilder& RenderGraph::BuildCopyPass(std::string const& name) {
 //void RenderGraph::RegisterPassBuilder(ComputePassBuilder&& builder) {
 //	m_passBuildersByName[builder.passName] = std::move(builder);
 //}
+
+QueueSlotIndex RenderGraph::CreateQueue(QueueKind kind, const char* name) {
+	auto device = DeviceManager::GetInstance().GetDevice();
+	rhi::Queue queue;
+	auto result = device.CreateQueue(static_cast<rhi::QueueKind>(kind), name ? name : "UserQueue", queue);
+	if (result != rhi::Result::Ok) {
+		throw std::runtime_error("Failed to create queue");
+	}
+	// Determine instance number: count existing slots of this kind.
+	uint8_t instance = 0;
+	for (size_t i = 0; i < m_queueRegistry.SlotCount(); ++i) {
+		if (m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(static_cast<uint8_t>(i))) == kind)
+			++instance;
+	}
+	return m_queueRegistry.Register({ kind, instance }, queue, device);
+}
