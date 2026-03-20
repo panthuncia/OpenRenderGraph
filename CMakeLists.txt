@@ -92,6 +92,8 @@ add_library(OpenRenderGraph STATIC
 
 add_library(OpenRenderGraph::OpenRenderGraph ALIAS OpenRenderGraph)
 
+target_precompile_headers(OpenRenderGraph PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/pch.h")
+
 set_target_properties(OpenRenderGraph PROPERTIES
     CXX_STANDARD 23
     CXX_STANDARD_REQUIRED ON
