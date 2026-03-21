@@ -897,7 +897,28 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 		}
 	}
 
-	rg.m_compiledLastProducerBatchByResourceByQueue = std::move(batchOfLastQueueProducer);
+	// Build cross-frame producer tracking from the committed batch schedule.
+	// Cross-frame tracking needs to know which queue
+	// wrote each resource and in which batch so the next frame can insert
+	// frame-start waits.
+	{
+		std::vector<std::unordered_map<uint64_t, unsigned int>> crossFrameProducer(queueCount);
+		for (unsigned int bi = 1; bi < static_cast<unsigned int>(rg.batches.size()); ++bi) {
+			auto& batch = rg.batches[bi];
+			for (size_t qi = 0; qi < queueCount; ++qi) {
+				for (auto& passVariant : batch.Passes(qi)) {
+					std::visit([&](const auto& passEntry) {
+						for (auto& req : passEntry.resources.frameResourceRequirements) {
+							if (AccessTypeIsWriteType(req.state.access)) {
+								crossFrameProducer[qi][req.resourceHandleAndRange.resource.GetGlobalResourceID()] = bi;
+							}
+						}
+					}, passVariant);
+				}
+			}
+		}
+		rg.m_compiledLastProducerBatchByResourceByQueue = std::move(crossFrameProducer);
+	}
 }
 
 
@@ -1498,38 +1519,10 @@ void RenderGraph::RegisterExtension(std::unique_ptr<IRenderGraphExtension> ext) 
 
 void RenderGraph::ResetForRebuild()
 {
-
-	//std::vector<IResourceProvider*> _providers;
-	//ResourceRegistry _registry;
-	//std::unordered_map<ResourceIdentifier, IResourceProvider*, ResourceIdentifier::Hasher> _providerMap;
-
-	//std::vector<IPassBuilder*> m_passBuilderOrder;
-	//std::unordered_map<std::string, std::unique_ptr<IPassBuilder>> m_passBuildersByName;
-	//std::unordered_set<std::string> m_passNamesSeenThisReset;
-
-	//std::vector<AnyPassAndResources> passes;
-	//std::unordered_map<std::string, std::shared_ptr<RenderPass>> renderPassesByName;
-	//std::unordered_map<std::string, std::shared_ptr<ComputePass>> computePassesByName;
-	//std::unordered_map<std::string, std::shared_ptr<Resource>> resourcesByName;
-	//std::unordered_map<uint64_t, std::shared_ptr<Resource>> resourcesByID;
-	//std::unordered_map<uint64_t, uint64_t> independantlyManagedResourceToGroup;
-	//std::vector<std::shared_ptr<ResourceGroup>> resourceGroups;
-
-	//std::unordered_map<uint64_t, std::unordered_set<uint64_t>> aliasedResources; // Tracks resources that use the same memory
-	//std::unordered_map<uint64_t, size_t> resourceToAliasGroup;
-	//std::vector<std::vector<uint64_t>>   aliasGroups;
-	//std::vector<std::unordered_map<UINT, uint64_t>> lastActiveSubresourceInAliasGroup;
-
-	//// Sometimes, we have a resource group that has children that are also managed independently by this graph. If so, we need to handle their transitions separately
-	//std::unordered_map<uint64_t, std::vector<uint64_t>> resourcesFromGroupToManageIndependantly;
-
-	//std::unordered_map<uint64_t, ResourceTransition> initialTransitions; // Transitions needed to reach the initial state of the resources before executing the first batch. Executed on graph setup.
-	//std::vector<PassBatch> batches;
-	//std::unordered_map<uint64_t, SymbolicTracker*> trackers; // Tracks the state of resources in the graph.
-
 	// Clear any existing compile state
 	m_masterPassList.clear();
 	batches.clear();
+	m_executionSchedule.batches.clear();
 	trackers.clear();
 
 	// Clear resources
@@ -1552,6 +1545,10 @@ void RenderGraph::ResetForRebuild()
 	for (auto& row : m_pendingFrameStartQueueWaitFenceValue) {
 		std::fill(row.begin(), row.end(), UINT64(0));
 	}
+	m_compiledLastProducerBatchByResourceByQueue.clear();
+	m_hasPendingFrameStartQueueWait.clear();
+	m_pendingFrameStartQueueWaitFenceValue.clear();
+	m_queueRegistry.Clear();
 
 	// Clear providers
 	_providerMap.clear();
@@ -3012,6 +3009,112 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		}
 	}
 
+	// Deadlock detection: check for circular wait-for-signal dependencies within
+	// each batch. Within a batch, queues execute concurrently with this timeline:
+	//   [BeforeTransitions waits] -> transitions -> AfterTransitions signal
+	//   [BeforeExecution waits]   -> passes      -> AfterExecution signal
+	//   [BeforeAfterPasses waits] -> post-trans  -> AfterCompletion signal
+	// A deadlock occurs when queue A waits for a signal that queue B can only
+	// produce after B is blocked waiting for A (or transitively through others).
+	//
+	// Algorithm: fixed-point iteration over per-queue "progress" levels.
+	// progress[q] = maximum signal ordinal q can reach (3 = healthy).
+	//   0 = stuck before transitions (no signals produced)
+	//   1 = AfterTransitions produced, stuck before execution
+	//   2 = AfterExecution produced, stuck before after-passes
+	//   3 = AfterCompletion produced (no deadlock)
+	{
+		constexpr int kWaitBlockLevel[] = { 0, 1, 2 };   // BeforeTransitions, BeforeExecution, BeforeAfterPasses
+		constexpr int kSignalRequired[] = { 1, 2, 3 };   // AfterTransitions, AfterExecution, AfterCompletion
+
+		auto signalPhaseName = [](int sp) -> const char* {
+			switch (sp) {
+			case 0: return "AfterTransitions";
+			case 1: return "AfterExecution";
+			case 2: return "AfterCompletion";
+			default: return "Unknown";
+			}
+		};
+
+		auto waitPhaseName = [](int wp) -> const char* {
+			switch (wp) {
+			case 0: return "BeforeTransitions";
+			case 1: return "BeforeExecution";
+			case 2: return "BeforeAfterPasses";
+			default: return "Unknown";
+			}
+		};
+
+		for (size_t bi = 0; bi < batches.size(); ++bi) {
+			const auto& batch = batches[bi];
+			const size_t qc = batch.QueueCount();
+
+			std::vector<int> progress(qc, 3);
+
+			bool changed = true;
+			while (changed) {
+				changed = false;
+				for (size_t dst = 0; dst < qc; ++dst) {
+					for (size_t wp = 0; wp < PassBatch::kWaitPhaseCount; ++wp) {
+						int blockLevel = kWaitBlockLevel[wp];
+						if (progress[dst] <= blockLevel) continue; // already stuck here or earlier
+
+						for (size_t src = 0; src < qc; ++src) {
+							if (dst == src) continue;
+							if (!batch.queueWaitEnabled[wp][dst][src]) continue;
+
+							UINT64 fv = batch.queueWaitFenceValue[wp][dst][src];
+
+							// Determine which signal phase of src this wait targets.
+							int requiredSrcProgress = -1;
+							for (size_t sp = 0; sp < PassBatch::kSignalPhaseCount; ++sp) {
+								if (fv == batch.queueSignalFenceValue[sp][src]) {
+									requiredSrcProgress = kSignalRequired[sp];
+									break;
+								}
+							}
+							if (requiredSrcProgress < 0) continue; // cross-batch wait, always safe
+
+							if (progress[src] < requiredSrcProgress) {
+								progress[dst] = std::min(progress[dst], blockLevel);
+								changed = true;
+							}
+						}
+					}
+				}
+			}
+
+			for (size_t q = 0; q < qc; ++q) {
+				if (progress[q] >= 3) continue;
+
+				auto kind = m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(static_cast<uint8_t>(q)));
+				auto inst = m_queueRegistry.GetInstance(static_cast<QueueSlotIndex>(static_cast<uint8_t>(q)));
+
+				spdlog::error("DEADLOCK DETECTED: batch {} queue slot {} ({}:{}) stuck at progress {} "
+					"(0=before-transitions, 1=after-transitions, 2=after-execution, 3=healthy)",
+					bi, q, queueName(kind), inst, progress[q]);
+
+				// Log the same-batch waits contributing to the cycle
+				for (size_t wp = 0; wp < PassBatch::kWaitPhaseCount; ++wp) {
+					for (size_t src = 0; src < qc; ++src) {
+						if (q == src || !batch.queueWaitEnabled[wp][q][src]) continue;
+						UINT64 fv = batch.queueWaitFenceValue[wp][q][src];
+						for (size_t sp = 0; sp < PassBatch::kSignalPhaseCount; ++sp) {
+							if (fv == batch.queueSignalFenceValue[sp][src]) {
+								spdlog::error("  slot {} waits at {} for slot {} {} (fence={}), src progress={}",
+									q, waitPhaseName(static_cast<int>(wp)),
+									src, signalPhaseName(static_cast<int>(sp)),
+									fv, progress[src]);
+							}
+						}
+					}
+				}
+
+				throw std::runtime_error("Render graph has a GPU queue deadlock!");
+			}
+		}
+	}
+
 #endif
 }
 
@@ -3350,12 +3453,24 @@ void RenderGraph::Setup() {
 	}
 
 	// Size queue-parallel member vectors to match the registry.
-	{
+	// Done after both primary queue registration and extension initialization
+	// since extensions may create additional queues.
+	auto resizeQueueParallelVectors = [this]() {
 		const size_t qc = m_queueRegistry.SlotCount();
 		m_compiledLastProducerBatchByResourceByQueue.resize(qc);
 		m_hasPendingFrameStartQueueWait.assign(qc, std::vector<uint8_t>(qc, 0));
 		m_pendingFrameStartQueueWaitFenceValue.assign(qc, std::vector<UINT64>(qc, 0));
+	};
+	resizeQueueParallelVectors();
+
+	// Notify extensions that the render graph is set up.
+	// Extensions may create additional queues or allocate resources here.
+	for (auto& ext : m_extensions) {
+		if (ext) ext->Initialize(*this);
 	}
+
+	// Re-size in case extensions added queues.
+	resizeQueueParallelVectors();
 
 	m_getUseAsyncCompute = [this]() {
 		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetUseAsyncCompute() : false;
@@ -4016,7 +4131,12 @@ namespace {
 
 void RenderGraph::BuildExecutionSchedule() {
 	auto& schedule = m_executionSchedule;
-	schedule.batches.resize(batches.size());
+	const size_t qc = m_queueRegistry.SlotCount();
+	schedule.batches.clear();
+	schedule.batches.reserve(batches.size());
+	for (size_t i = 0; i < batches.size(); ++i) {
+		schedule.batches.emplace_back(qc);
+	}
 
 	for (size_t bi = 0; bi < batches.size(); ++bi) {
 		auto& batch = batches[bi];
@@ -4174,6 +4294,152 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 
 	// Build the execution schedule and pre-allocate command lists.
 	BuildExecutionSchedule();
+
+#if BUILD_TYPE == BUILD_TYPE_DEBUG
+	// ---- Post-schedule validation: detect signals that will never fire ----
+	// A signal is "live" only when the queue is active in that batch.
+	// A wait that references a dead signal will deadlock the GPU.
+	{
+		// 1. Collect the set of fence values that will actually be signaled.
+		std::vector<std::unordered_set<UINT64>> liveSignalValues(slotCount);
+		// Also track the highest value each queue will signal this frame so
+		// we can verify frame-start waits from the previous frame.
+		std::vector<UINT64> highestLiveSignal(slotCount, 0);
+
+		for (size_t bi = 0; bi < batches.size(); ++bi) {
+			auto& batch = batches[bi];
+			auto& batchSched = m_executionSchedule.batches[bi];
+
+			for (size_t qi = 0; qi < std::min(batchSched.queues.size(), slotCount); ++qi) {
+				auto& qs = batchSched.queues[qi];
+				if (!qs.active) {
+					// Check: does this inactive queue have signals marked?
+					for (size_t sp = 0; sp < PassBatch::kSignalPhaseCount; ++sp) {
+						if (batch.HasQueueSignal(static_cast<BatchSignalPhase>(sp), qi)) {
+							spdlog::error(
+								"SIGNAL ON INACTIVE QUEUE: batch {} slot {} has {} signal "
+								"enabled (fence={}) but queue is inactive (no passes/transitions). "
+								"This signal will never fire on the GPU!",
+								bi, qi,
+								sp == 0 ? "AfterTransitions" : sp == 1 ? "AfterExecution" : "AfterCompletion",
+								batch.GetQueueSignalFenceValue(static_cast<BatchSignalPhase>(sp), qi));
+						}
+					}
+					continue;
+				}
+
+				// Active queue: record which signals will actually fire.
+				if (qs.splitAfterTransitions) {
+					UINT64 v = batch.GetQueueSignalFenceValue(BatchSignalPhase::AfterTransitions, qi);
+					liveSignalValues[qi].insert(v);
+					highestLiveSignal[qi] = std::max(highestLiveSignal[qi], v);
+				}
+				if (qs.splitAfterExecution) {
+					UINT64 v = batch.GetQueueSignalFenceValue(BatchSignalPhase::AfterExecution, qi);
+					liveSignalValues[qi].insert(v);
+					highestLiveSignal[qi] = std::max(highestLiveSignal[qi], v);
+				}
+				// The final submit always signals. If signalAfterCompletion is true,
+				// it signals the pre-assigned AfterCompletion value. Otherwise, it
+				// signals a monotonic value that won't match any pre-assigned value.
+				if (qs.signalAfterCompletion) {
+					UINT64 v = batch.GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, qi);
+					liveSignalValues[qi].insert(v);
+					highestLiveSignal[qi] = std::max(highestLiveSignal[qi], v);
+				}
+			}
+		}
+
+		// 2. Validate within-frame waits: every wait on an active queue must
+		//    reference a live signal or a value already completed (cross-frame).
+		bool foundDeadWait = false;
+		for (size_t bi = 0; bi < batches.size(); ++bi) {
+			auto& batch = batches[bi];
+			auto& batchSched = m_executionSchedule.batches[bi];
+
+			for (size_t qi = 0; qi < std::min(batchSched.queues.size(), slotCount); ++qi) {
+				if (!batchSched.queues[qi].active) continue;
+
+				for (size_t wp = 0; wp < PassBatch::kWaitPhaseCount; ++wp) {
+					auto waitPhase = static_cast<BatchWaitPhase>(wp);
+					for (size_t src = 0; src < slotCount; ++src) {
+						if (qi == src) continue;
+						if (!batch.HasQueueWait(waitPhase, qi, src)) continue;
+
+						UINT64 fv = batch.GetQueueWaitFenceValue(waitPhase, qi, src);
+
+						// Check if this is a live signal from the current frame.
+						bool isLive = liveSignalValues[src].count(fv) > 0;
+
+						// Check if already completed from a previous frame.
+						UINT64 completedValue = SlotFence(src).GetCompletedValue();
+						bool isAlreadyCompleted = (completedValue >= fv);
+
+						if (!isLive && !isAlreadyCompleted) {
+							spdlog::error(
+								"DEADLOCK: batch {} active slot {} waits at phase {} "
+								"on slot {} fence={}, but that value is not a live signal "
+								"(slot {} may be inactive) and not already completed "
+								"(completed={}). GPU WILL HANG.",
+								bi, qi,
+								wp == 0 ? "BeforeTransitions" : wp == 1 ? "BeforeExecution" : "BeforeAfterPasses",
+								src, fv, src, completedValue);
+							foundDeadWait = true;
+						}
+					}
+				}
+			}
+		}
+
+		// 3. Validate frame-start waits: these reference previous-frame values.
+		for (size_t dst = 0; dst < slotCount; ++dst) {
+			if (dst >= m_hasPendingFrameStartQueueWait.size()) continue;
+			for (size_t src = 0; src < slotCount; ++src) {
+				if (dst == src) continue;
+				if (src >= m_hasPendingFrameStartQueueWait[dst].size()) continue;
+				if (!m_hasPendingFrameStartQueueWait[dst][src]) continue;
+
+				UINT64 fv = m_pendingFrameStartQueueWaitFenceValue[dst][src];
+				UINT64 completedValue = SlotFence(src).GetCompletedValue();
+
+				if (completedValue < fv) {
+					spdlog::warn(
+						"Frame-start wait: slot {} waiting on slot {} fence={}, "
+						"currently completed={}. Delta={}. "
+						"This wait will block until the previous frame's queue "
+						"signals this value.",
+						dst, src, fv, completedValue, fv - completedValue);
+				}
+			}
+		}
+
+		// 4. Log cross-frame producer summary for diagnostics.
+		for (size_t qi = 0; qi < slotCount; ++qi) {
+			if (qi >= m_compiledLastProducerBatchByResourceByQueue.size()) continue;
+			size_t count = m_compiledLastProducerBatchByResourceByQueue[qi].size();
+			if (count > 0) {
+				spdlog::debug(
+					"Cross-frame producer tracking: slot {} has {} resources tracked",
+					qi, count);
+			}
+		}
+
+		if (foundDeadWait) {
+			// Dump the full active/inactive map for debugging.
+			for (size_t bi = 0; bi < batches.size(); ++bi) {
+				auto& batchSched = m_executionSchedule.batches[bi];
+				std::string activeStr;
+				for (size_t qi = 0; qi < std::min(batchSched.queues.size(), slotCount); ++qi) {
+					if (!activeStr.empty()) activeStr += ", ";
+					activeStr += "slot" + std::to_string(qi) + "=" +
+						(batchSched.queues[qi].active ? "ACTIVE" : "inactive");
+				}
+				spdlog::error("  batch {} queue activity: [{}]", bi, activeStr);
+			}
+			__debugbreak();
+		}
+	}
+#endif
 
 	// Pre-allocate all CLs from the main thread using registry pools.
 	for (size_t bi = 0; bi < m_executionSchedule.batches.size(); ++bi) {
@@ -4362,6 +4628,10 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 	}
 
 	// Update across-frame producer tracking (no aliasing remapping).
+	// Only store fence values that were actually signaled during this frame's
+	// execution. If a queue was inactive in a batch (no passes or transitions),
+	// the pre-assigned fence value was never signaled on the GPU. Storing it
+	// would cause next frame's frame-start waits to deadlock.
 	for (size_t queueIndex = 0; queueIndex < slotCount; ++queueIndex) {
 		if (queueIndex >= m_compiledLastProducerBatchByResourceByQueue.size()) continue;
 		for (const auto& [resourceID, producerBatch] : m_compiledLastProducerBatchByResourceByQueue[queueIndex]) {
@@ -4369,6 +4639,17 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 
 			const uint64_t fenceValue =
 				batches[producerBatch].GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, queueIndex);
+
+			// Skip if this fence value was never actually signaled on the GPU.
+			if (fenceValue > lastSignaledPerSlot[queueIndex]) {
+				spdlog::warn(
+					"Cross-frame producer skip: slot {} resource {} batch {} "
+					"fenceValue={} > lastSignaled={}. Queue was likely inactive.",
+					queueIndex, resourceID, producerBatch,
+					fenceValue, lastSignaledPerSlot[queueIndex]);
+				continue;
+			}
+
 			LastProducerAcrossFrames producer{
 				.queueSlot = queueIndex,
 				.fenceValue = fenceValue,

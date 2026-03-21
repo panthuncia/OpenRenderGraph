@@ -148,6 +148,10 @@ public:
 	struct IRenderGraphExtension {
 		virtual ~IRenderGraphExtension() = default;
 
+		// Called once from RenderGraph::Setup() after queue registry is populated.
+		// Extensions can create queues, allocate upload instances, etc.
+		virtual void Initialize(RenderGraph& rg) { (void)rg; }
+
 		// lets systems react to registry recreation without RenderGraph including them
 		virtual void OnRegistryReset(ResourceRegistry* registry) {}
 

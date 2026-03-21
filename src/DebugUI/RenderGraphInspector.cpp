@@ -575,8 +575,8 @@ namespace RGInspector {
                 ImPlotPoint a(-0.25, y - 0.05);
                 ImPlotPoint b(static_cast<double>(batches.size()) + 0.25, y + H + 0.05);
                 DrawBlock(dl, a, b, IM_COL32(245, 245, 245, 32), IM_COL32(0, 0, 0, 32), 0.0f);
-                ImVec2 lp = ImPlot::PlotToPixels(ImPlotPoint(-0.2, y + 0.1));
-                dl->AddText(lp, IM_COL32_BLACK, slotLabels[qi].c_str());
+                ImVec2 lp = ImPlot::PlotToPixels(ImPlotPoint(-0.2, y + H + 0.18f * S));
+                dl->AddText(lp, IM_COL32(255, 255, 255, 255), slotLabels[qi].c_str());
             }
 
             // X grid lines per batch
