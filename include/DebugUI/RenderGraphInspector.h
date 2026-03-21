@@ -6,11 +6,15 @@
 #include <functional>
 #include <cstdint>
 
+#include <imgui.h>
+#include <rhi.h>
+
 #include "Render/RenderGraph/RenderGraph.h"
 #include "Resources/ReadbackRequest.h"
 
 // Return true if the pass uses 'resourceId'.
-using RGPassUsesResourceFn = std::function<bool(const void* passAndResources, uint64_t resourceId, bool isCompute)>;
+// passKind: 0 = RenderPassAndResources, 1 = ComputePassAndResources, 2 = CopyPassAndResources
+using RGPassUsesResourceFn = std::function<bool(const void* passAndResources, uint64_t resourceId, int passKind)>;
 using RGResourceNameByIdFn = std::function<std::string(uint64_t resourceId)>;
 using RGResourcePtrByIdFn = std::function<Resource*(uint64_t resourceId)>;
 using RGRequestReadbackCaptureFn = std::function<void(const std::string&, Resource*, const RangeSpec&, ReadbackCaptureCallback)>;
@@ -24,6 +28,12 @@ struct RGInspectorOptions {
     float blockWidthBatchEnd = 0.20f; // width of batch-end transitions
     float rowHeight = 1.0f;  // ImPlot units
     float laneSpacing = 1.2f;  // extra space between lanes
+
+    // ImGui descriptor heap callbacks for texture preview in MemoryViewWidget.
+    std::function<uint32_t()> imguiAllocDescriptor;
+    std::function<void(uint32_t)> imguiFreeDescriptor;
+    std::function<ImTextureID(uint32_t)> imguiGpuHandle;
+    rhi::DescriptorHeapHandle imguiHeapHandle{};
 };
 
 namespace RGInspector {

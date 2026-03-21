@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <array>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -11,6 +12,7 @@
 #include <vector>
 
 #include <imgui.h>
+#include <rhi.h>
 
 #include "Resources/ReadbackRequest.h"
 #include "Resources/ResourceStateTracker.h"
@@ -22,6 +24,12 @@ namespace ui {
 
     using MemoryViewRequestCaptureFn = std::function<void(const std::string&, Resource*, const RangeSpec&, ReadbackCaptureCallback)>;
 
+    // Callback to allocate/free descriptors from the ImGui shader-visible heap.
+    // Returns a descriptor index.
+    using ImGuiDescriptorAllocFn = std::function<uint32_t()>;
+    using ImGuiDescriptorFreeFn = std::function<void(uint32_t)>;
+    using ImGuiGpuHandleFn = std::function<ImTextureID(uint32_t)>;
+
     class MemoryViewWidget {
     public:
         // Schedules a readback capture and opens the window.
@@ -30,11 +38,25 @@ namespace ui {
         // Draws the window if open.
         void Draw(bool* pOpen);
 
+        // Set callbacks that let the widget allocate ImGui descriptors (from BasicRenderer's Menu).
+        void SetImGuiDescriptorCallbacks(
+            ImGuiDescriptorAllocFn alloc,
+            ImGuiDescriptorFreeFn free,
+            ImGuiGpuHandleFn gpuHandle,
+            rhi::DescriptorHeapHandle heapHandle)
+        {
+            imguiAllocDesc_ = std::move(alloc);
+            imguiFreeDesc_ = std::move(free);
+            imguiGpuHandle_ = std::move(gpuHandle);
+            imguiHeapHandle_ = heapHandle;
+        }
+
     private:
         void DrawBufferView(const ReadbackCaptureResult& r);
-        void DrawTextureViewStub(const ReadbackCaptureResult& r);
+        void DrawTextureView(const ReadbackCaptureResult& r);
         void SaveCurrentResourceLayoutState();
         void LoadResourceLayoutState(uint64_t resourceId);
+        void ReleasePreviewTexture();
 
         struct PendingRequest {
             std::string passName;
@@ -50,7 +72,7 @@ namespace ui {
         bool waiting_ = false;
         std::string status_;
 
-        // UI state
+        // UI state — buffer view
         int bytesPerRow_ = 16;
         std::array<char, 16 * 1024> structInputBuf_{};
         std::string reflectionDiagnostics_;
@@ -79,6 +101,23 @@ namespace ui {
         };
 
         std::unordered_map<uint64_t, ResourceLayoutState> perResourceLayoutState_;
+
+        // UI state - texture view
+        int selectedMip_ = 0;
+        int selectedSlice_ = 0;
+        bool previewDirty_ = true;
+        ImTextureID previewTextureId_ = 0;
+        uint32_t previewDescriptorIndex_ = UINT32_MAX;
+        uint32_t previewWidth_ = 0;
+        uint32_t previewHeight_ = 0;
+        rhi::ResourcePtr previewTexture_;
+        rhi::ResourcePtr previewUploadBuffer_;
+
+        // ImGui descriptor callbacks (set by host app)
+        ImGuiDescriptorAllocFn imguiAllocDesc_;
+        ImGuiDescriptorFreeFn imguiFreeDesc_;
+        ImGuiGpuHandleFn imguiGpuHandle_;
+        rhi::DescriptorHeapHandle imguiHeapHandle_{};
     };
 
 } // namespace ui

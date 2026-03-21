@@ -335,7 +335,7 @@ namespace RGInspector {
         auto layouts = BuildBatchLayouts(batches, opts);
         double totalW = layouts.empty() ? 1.0 : (layouts.back().baseX + layouts.back().width);
 
-        // --- Left panel: resource picker ---
+        // Left panel: resource picker
         static uint64_t s_selectedRes = 0;
         static Resource* s_selectedResPtr = nullptr;
         static int s_selectedBatch = 0;
@@ -343,6 +343,15 @@ namespace RGInspector {
         static std::string s_selectedPassName;
         static bool s_openMemoryView = false;
         static ui::MemoryViewWidget s_memoryView;
+        static bool s_memoryViewCallbacksWired = false;
+        if (!s_memoryViewCallbacksWired && opts.imguiAllocDescriptor) {
+            s_memoryView.SetImGuiDescriptorCallbacks(
+                opts.imguiAllocDescriptor,
+                opts.imguiFreeDescriptor,
+                opts.imguiGpuHandle,
+                opts.imguiHeapHandle);
+            s_memoryViewCallbacksWired = true;
+        }
         static char filterBuf[128] = {};
         std::unordered_map<uint64_t, std::string> idToName;
         std::unordered_map<uint64_t, Resource*> idToPtr;
@@ -687,8 +696,10 @@ namespace RGInspector {
                         const bool usesSelected = std::visit(
                             [&](const auto& pass) {
                                 using TPass = std::decay_t<decltype(pass)>;
-                                constexpr bool passIsCompute = std::is_same_v<TPass, RenderGraph::ComputePassAndResources>;
-                                return passUses(static_cast<const void*>(&pass), s_selectedRes, passIsCompute);
+                                constexpr int passKind =
+                                    std::is_same_v<TPass, RenderGraph::ComputePassAndResources> ? 1 :
+                                    std::is_same_v<TPass, RenderGraph::CopyPassAndResources> ? 2 : 0;
+                                return passUses(static_cast<const void*>(&pass), s_selectedRes, passKind);
                             },
                             queuedPass);
                         if (usesSelected) {
