@@ -3504,7 +3504,9 @@ void RenderGraph::Setup() {
 	};
 	MaterializeUnmaterializedResources();
 
-	// Run pass setup to collect static resource requirements
+	// Pass setup is intentionally serial. Many passes touch shared ECS/flecs world state
+	// and singleton managers during Setup(), and iterating flecs queries from our task
+	// worker threads can corrupt flecs iterator stack state.
 	ParallelForOptional("PassSetup", m_masterPassList.size(), [this](size_t i) {
 		auto& pass = m_masterPassList[i];
 		switch (pass.type) {
@@ -3527,7 +3529,7 @@ void RenderGraph::Setup() {
 			break;
 		}
 		}
-	});
+	}, true);
 }
 
 void RenderGraph::AddRenderPass(std::shared_ptr<RenderPass> pass, RenderPassParameters& resources, std::string name, std::vector<ResolverSnapshot> resolverSnapshots) {

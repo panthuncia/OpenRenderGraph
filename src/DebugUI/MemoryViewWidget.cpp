@@ -461,6 +461,9 @@ namespace ui {
 
         const auto& fp = r.layouts[subresourceIndex];
         ImGui::Text("Subresource %u: %ux%u", subresourceIndex, fp.width, fp.height);
+        if (r.format == rhi::Format::R32G32_UInt) {
+            ImGui::TextDisabled("Preview uses stable false color for packed uint data; cleared pixels are black.");
+        }
 
         if (previewDirty_) {
             previewDirty_ = false;

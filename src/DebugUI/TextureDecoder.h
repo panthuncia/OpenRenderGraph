@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -34,6 +35,25 @@ namespace ui {
     inline uint8_t FloatToByte(float v) {
         if (std::isnan(v)) return 0;
         return static_cast<uint8_t>(std::clamp(v, 0.0f, 1.0f) * 255.0f + 0.5f);
+    }
+
+    inline float UintBitsToFloat(uint32_t bits) {
+        float value = 0.0f;
+        std::memcpy(&value, &bits, sizeof(value));
+        return value;
+    }
+
+    inline uint32_t HashUint32(uint32_t value) {
+        value ^= value >> 16;
+        value *= 0x7feb352du;
+        value ^= value >> 15;
+        value *= 0x846ca68bu;
+        value ^= value >> 16;
+        return value;
+    }
+
+    inline float Saturate(float value) {
+        return std::clamp(value, 0.0f, 1.0f);
     }
 
     // Decode a single subresource from readback data into tightly-packed RGBA8.
@@ -308,6 +328,49 @@ namespace ui {
                     dst[0] = FloatToByte(src[0]);
                     dst[1] = FloatToByte(src[1]);
                     dst[2] = 0;
+                    dst[3] = 255;
+                    src += 2; dst += 4;
+                }
+            }
+            return out;
+
+        // R32G32_UInt
+        // This is commonly used in the renderer for packed visibility data.
+        // Raw integer-to-byte truncation is not readable, so visualize with a
+        // stable hash color from the payload and depth-based brightness.
+        case F::R32G32_UInt:
+            for (uint32_t y = 0; y < h; ++y) {
+                const auto* src = reinterpret_cast<const uint32_t*>(rowSrc(y));
+                if (!src) break;
+                uint8_t* dst = out.data() + static_cast<size_t>(y) * w * 4;
+                for (uint32_t x = 0; x < w; ++x) {
+                    const uint32_t low = src[0];
+                    const uint32_t high = src[1];
+
+                    if (low == 0xFFFFFFFFu && high == 0xFFFFFFFFu) {
+                        dst[0] = 0;
+                        dst[1] = 0;
+                        dst[2] = 0;
+                        dst[3] = 255;
+                        src += 2; dst += 4;
+                        continue;
+                    }
+
+                    const uint32_t hashed = HashUint32(low ^ (high * 0x9E3779B9u));
+                    float brightness = 0.85f;
+
+                    const float depth = UintBitsToFloat(high);
+                    if (std::isfinite(depth) && depth >= 0.0f) {
+                        brightness = 0.30f + 0.70f * (1.0f / (1.0f + depth));
+                    }
+
+                    const float r = ((hashed >> 0) & 0xFFu) / 255.0f;
+                    const float g = ((hashed >> 8) & 0xFFu) / 255.0f;
+                    const float b = ((hashed >> 16) & 0xFFu) / 255.0f;
+
+                    dst[0] = FloatToByte(Saturate(r * brightness));
+                    dst[1] = FloatToByte(Saturate(g * brightness));
+                    dst[2] = FloatToByte(Saturate(b * brightness));
                     dst[3] = 255;
                     src += 2; dst += 4;
                 }
