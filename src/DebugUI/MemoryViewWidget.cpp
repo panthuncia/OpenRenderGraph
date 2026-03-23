@@ -464,6 +464,12 @@ namespace ui {
         if (r.format == rhi::Format::R32G32_UInt) {
             ImGui::TextDisabled("Preview uses stable false color for packed uint data; cleared pixels are black.");
         }
+        else if (r.format == rhi::Format::R32G32B32_Float) {
+            ImGui::TextDisabled("Preview normalizes float3 channels across this subresource for readability.");
+        }
+        else if (r.format == rhi::Format::R32G32B32A32_Float || r.format == rhi::Format::R32G32B32A32_Typeless) {
+            ImGui::TextDisabled("Preview normalizes float4 channels across this subresource for readability; typeless is treated as float.");
+        }
 
         if (previewDirty_) {
             previewDirty_ = false;

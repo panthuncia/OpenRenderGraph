@@ -12,7 +12,7 @@
 
 namespace ui {
 
-    inline float HalfToFloat(uint16_t h) {
+    inline float DecodeHalfToFloat(uint16_t h) {
         const uint16_t sign = (h >> 15) & 0x1;
         const uint16_t exp  = (h >> 10) & 0x1F;
         const uint16_t mant = h & 0x3FF;
@@ -54,6 +54,39 @@ namespace ui {
 
     inline float Saturate(float value) {
         return std::clamp(value, 0.0f, 1.0f);
+    }
+
+    struct FloatPreviewRange {
+        float minValue = std::numeric_limits<float>::infinity();
+        float maxValue = -std::numeric_limits<float>::infinity();
+        bool hasFiniteValue = false;
+    };
+
+    inline void ExtendFloatPreviewRange(FloatPreviewRange& range, float value) {
+        if (!std::isfinite(value)) {
+            return;
+        }
+
+        range.minValue = (std::min)(range.minValue, value);
+        range.maxValue = (std::max)(range.maxValue, value);
+        range.hasFiniteValue = true;
+    }
+
+    inline uint8_t FloatToPreviewByte(float value, const FloatPreviewRange& range) {
+        if (!std::isfinite(value)) {
+            return 0;
+        }
+
+        if (!range.hasFiniteValue) {
+            return FloatToByte(value);
+        }
+
+        const float extent = range.maxValue - range.minValue;
+        if (extent <= 1e-20f) {
+            return FloatToByte(value);
+        }
+
+        return FloatToByte((value - range.minValue) / extent);
     }
 
     // Decode a single subresource from readback data into tightly-packed RGBA8.
@@ -119,10 +152,10 @@ namespace ui {
                 if (!src) break;
                 uint8_t* dst = out.data() + static_cast<size_t>(y) * w * 4;
                 for (uint32_t x = 0; x < w; ++x) {
-                    dst[0] = FloatToByte(HalfToFloat(src[0]));
-                    dst[1] = FloatToByte(HalfToFloat(src[1]));
-                    dst[2] = FloatToByte(HalfToFloat(src[2]));
-                    dst[3] = FloatToByte(HalfToFloat(src[3]));
+                    dst[0] = FloatToByte(DecodeHalfToFloat(src[0]));
+                    dst[1] = FloatToByte(DecodeHalfToFloat(src[1]));
+                    dst[2] = FloatToByte(DecodeHalfToFloat(src[2]));
+                    dst[3] = FloatToByte(DecodeHalfToFloat(src[3]));
                     src += 4; dst += 4;
                 }
             }
@@ -144,37 +177,65 @@ namespace ui {
             }
             return out;
 
-        // R32G32B32A32_Float
+        // R32G32B32A32_Float / Typeless (assume float payload for preview)
         case F::R32G32B32A32_Float:
+        case F::R32G32B32A32_Typeless: {
+            FloatPreviewRange ranges[4];
+            for (uint32_t y = 0; y < h; ++y) {
+                const auto* src = reinterpret_cast<const float*>(rowSrc(y));
+                if (!src) break;
+                for (uint32_t x = 0; x < w; ++x) {
+                    ExtendFloatPreviewRange(ranges[0], src[0]);
+                    ExtendFloatPreviewRange(ranges[1], src[1]);
+                    ExtendFloatPreviewRange(ranges[2], src[2]);
+                    ExtendFloatPreviewRange(ranges[3], src[3]);
+                    src += 4;
+                }
+            }
+
             for (uint32_t y = 0; y < h; ++y) {
                 const auto* src = reinterpret_cast<const float*>(rowSrc(y));
                 if (!src) break;
                 uint8_t* dst = out.data() + static_cast<size_t>(y) * w * 4;
                 for (uint32_t x = 0; x < w; ++x) {
-                    dst[0] = FloatToByte(src[0]);
-                    dst[1] = FloatToByte(src[1]);
-                    dst[2] = FloatToByte(src[2]);
-                    dst[3] = FloatToByte(src[3]);
+                    dst[0] = FloatToPreviewByte(src[0], ranges[0]);
+                    dst[1] = FloatToPreviewByte(src[1], ranges[1]);
+                    dst[2] = FloatToPreviewByte(src[2], ranges[2]);
+                    dst[3] = FloatToPreviewByte(src[3], ranges[3]);
                     src += 4; dst += 4;
                 }
             }
             return out;
+        }
 
         // R32G32B32_Float (96bpp, no alpha)
-        case F::R32G32B32_Float:
+        case F::R32G32B32_Float: {
+            FloatPreviewRange ranges[3];
+            for (uint32_t y = 0; y < h; ++y) {
+                const auto* src = reinterpret_cast<const float*>(rowSrc(y));
+                if (!src) break;
+                for (uint32_t x = 0; x < w; ++x) {
+                    ExtendFloatPreviewRange(ranges[0], src[0]);
+                    ExtendFloatPreviewRange(ranges[1], src[1]);
+                    ExtendFloatPreviewRange(ranges[2], src[2]);
+                    src += 3;
+                }
+            }
+
             for (uint32_t y = 0; y < h; ++y) {
                 const auto* src = reinterpret_cast<const float*>(rowSrc(y));
                 if (!src) break;
                 uint8_t* dst = out.data() + static_cast<size_t>(y) * w * 4;
                 for (uint32_t x = 0; x < w; ++x) {
-                    dst[0] = FloatToByte(src[0]);
-                    dst[1] = FloatToByte(src[1]);
-                    dst[2] = FloatToByte(src[2]);
+                    dst[0] = FloatToPreviewByte(src[0], ranges[0]);
+                    dst[1] = FloatToPreviewByte(src[1], ranges[1]);
+                    dst[2] = FloatToPreviewByte(src[2], ranges[2]);
                     dst[3] = 255;
                     src += 3; dst += 4;
                 }
             }
             return out;
+        }
 
         // R10G10B10A2_UNorm
         case F::R10G10B10A2_UNorm:
@@ -263,7 +324,7 @@ namespace ui {
                 if (!src) break;
                 uint8_t* dst = out.data() + static_cast<size_t>(y) * w * 4;
                 for (uint32_t x = 0; x < w; ++x) {
-                    uint8_t v = FloatToByte(HalfToFloat(src[x]));
+                    uint8_t v = FloatToByte(DecodeHalfToFloat(src[x]));
                     dst[0] = dst[1] = dst[2] = v;
                     dst[3] = 255;
                     dst += 4;
@@ -310,8 +371,8 @@ namespace ui {
                 if (!src) break;
                 uint8_t* dst = out.data() + static_cast<size_t>(y) * w * 4;
                 for (uint32_t x = 0; x < w; ++x) {
-                    dst[0] = FloatToByte(HalfToFloat(src[0]));
-                    dst[1] = FloatToByte(HalfToFloat(src[1]));
+                    dst[0] = FloatToByte(DecodeHalfToFloat(src[0]));
+                    dst[1] = FloatToByte(DecodeHalfToFloat(src[1]));
                     dst[2] = 0;
                     dst[3] = 255;
                     src += 2; dst += 4;
