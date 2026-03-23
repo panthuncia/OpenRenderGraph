@@ -68,14 +68,6 @@ bool UploadManager::TryCoalesceAppend(ResourceUpdate& last, const ResourceUpdate
 
 	last.size += next.size;
 
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
-	// Preserve newest debug provenance.
-	last.file = next.file;
-	last.line = next.line;
-	last.threadID = next.threadID;
-	last.stackSize = next.stackSize;
-	for (uint8_t i = 0; i < next.stackSize && i < ResourceUpdate::MaxStack; ++i) last.stack[i] = next.stack[i];
-#endif
 	return true;
 }
 
@@ -116,15 +108,6 @@ void UploadManager::ApplyLastWriteWins(ResourceUpdate& newUpdate) noexcept
 
 			UnmapUpload(newUpdate.uploadBuffer);
 			UnmapUpload(u.uploadBuffer);
-
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
-			// Keep newest provenance.
-			u.file = newUpdate.file;
-			u.line = newUpdate.line;
-			u.threadID = newUpdate.threadID;
-			u.stackSize = newUpdate.stackSize;
-			for (uint8_t j = 0; j < newUpdate.stackSize && j < ResourceUpdate::MaxStack; ++j) u.stack[j] = newUpdate.stack[j];
-#endif
 
 			newUpdate.active = false;
 			return;
@@ -264,6 +247,8 @@ void UploadManager::UploadData(const void* data, size_t size, UploadTarget resou
 		return;
 	}
 
+	std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
+
 	UploadPage* page = &m_pages[m_activePage];
 
 	// if it won't fit in the rest of this page, open a new page
@@ -315,18 +300,6 @@ void UploadManager::UploadData(const void* data, size_t size, UploadTarget resou
 			break;
 		}
 
-	update.resourceIDOrRegistryIndex = idOrRegistryIndex;
-	update.targetKind = resourceToUpdate.kind;
-	update.file = file;
-	update.line = line;
-	update.frameIndex = (m_numFramesInFlight ? (GetInstance().getNumFramesInFlight()) : 0);
-	update.threadID = std::this_thread::get_id();
-#ifdef _WIN32
-	void* frames[ResourceUpdate::MaxStack];
-	USHORT captured = RtlCaptureStackBackTrace(1, ResourceUpdate::MaxStack, frames, nullptr);
-	update.stackSize = static_cast<uint8_t>(captured);
-	for (USHORT i = 0; i < captured; i++) update.stack[i] = frames[i];
-#endif
 #endif
 	//ApplyLastWriteWins(update); // Too slow
 
@@ -377,6 +350,8 @@ void UploadManager::UploadTextureSubresources(
 {
 	if (!srcSubresources || srcCount == 0) return;
 
+	std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
+
 	rhi::Span<const rhi::helpers::SubresourceData> srcSpan{ srcSubresources, srcCount };
 
 	const auto plan = rhi::helpers::PlanTextureUploadSubresources(
@@ -415,12 +390,6 @@ void UploadManager::UploadTextureSubresources(
 		update.y = 0;
 		update.z = fp.zSlice;
 		update.uploadBuffer = uploadBuffer;
-#ifdef _DEBUG
-		//update.stackTrace = std::stacktrace::current();
-		update.file = file;
-		update.line = line;
-		update.threadID = std::this_thread::get_id();
-#endif
 		m_textureUpdates.push_back(std::move(update));
 	}
 }
@@ -428,6 +397,8 @@ void UploadManager::UploadTextureSubresources(
 
 void UploadManager::ProcessDeferredReleases(uint8_t frameIndex)
 {
+	std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
+
 	// The page where this frame started uploading
 	size_t retiringStart = m_frameStart[frameIndex];
 
@@ -459,10 +430,17 @@ void UploadManager::ProcessDeferredReleases(uint8_t frameIndex)
 }
 
 void UploadManager::ProcessUploads(uint8_t frameIndex, rg::imm::ImmediateCommandList& commandList) {
+	std::vector<ResourceUpdate> resourceUpdates;
+	std::vector<TextureUpdate> textureUpdates;
+	{
+		std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
+		resourceUpdates.swap(m_resourceUpdates);
+		textureUpdates.swap(m_textureUpdates);
+	}
 
 	//rhi::debug::Begin(commandList.Get(), rhi::colors::Amber, "UploadManager::ProcessUploads");
 
-	for (auto& update : m_resourceUpdates) {
+	for (auto& update : resourceUpdates) {
 		if (!update.active || !update.uploadBuffer || update.size == 0) continue;
 		switch(update.resourceToUpdate.kind) {
 		case UploadTarget::Kind::PinnedShared:
@@ -488,7 +466,7 @@ void UploadManager::ProcessUploads(uint8_t frameIndex, rg::imm::ImmediateCommand
 
 	}
 
-	for (auto& texUpdate : m_textureUpdates) {
+	for (auto& texUpdate : textureUpdates) {
 		if (texUpdate.texture.kind == UploadTarget::Kind::PinnedShared) {
 			commandList.CopyBufferToTexture(
 				texUpdate.uploadBuffer,
@@ -514,11 +492,10 @@ void UploadManager::ProcessUploads(uint8_t frameIndex, rg::imm::ImmediateCommand
 		}
 	}
 
-	m_resourceUpdates.clear();
-	m_textureUpdates.clear();
 }
 
 void UploadManager::QueueResourceCopy(const std::shared_ptr<Resource>& destination, const std::shared_ptr<Resource>& source, size_t size) {
+	std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
 	ResourceCopy copy;
 	copy.source = source;
 	copy.destination = destination;
@@ -527,6 +504,11 @@ void UploadManager::QueueResourceCopy(const std::shared_ptr<Resource>& destinati
 }
 
 void UploadManager::ExecuteResourceCopies(uint8_t frameIndex, rg::imm::ImmediateCommandList& commandList) {
+	std::vector<ResourceCopy> resourceCopies;
+	{
+		std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
+		resourceCopies.swap(queuedResourceCopies);
+	}
 	//rhi::debug::Begin(commandList.Get(), rhi::colors::Amber, "Upload Manager - resource copies");
 
 	// When a DynamicBuffer grows multiple times in the same frame, each growth
@@ -537,7 +519,7 @@ void UploadManager::ExecuteResourceCopies(uint8_t frameIndex, rg::imm::Immediate
 	// data placed by the first copy with garbage.  Keep only the first copy
 	// per destination to avoid this.
 	std::unordered_set<Resource*> seenDestinations;
-	for (auto& copy : queuedResourceCopies) {
+	for (auto& copy : resourceCopies) {
 		auto* dstPtr = copy.destination.get();
 		if (!seenDestinations.insert(dstPtr).second) {
 			continue; // Skip — intermediate buffer has undefined GPU content
@@ -549,11 +531,10 @@ void UploadManager::ExecuteResourceCopies(uint8_t frameIndex, rg::imm::Immediate
 			0,
 			copy.size);
 	}
-
-	queuedResourceCopies.clear();
 }
 
 void UploadManager::Cleanup() {
+	std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
 	m_pages.clear();
 	m_resourceUpdates.clear();
 	m_textureUpdates.clear();

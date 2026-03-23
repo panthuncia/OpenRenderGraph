@@ -52,18 +52,6 @@ public:
 		size_t uploadBufferOffset{};
 		size_t dataBufferOffset{};
 		bool active = true;
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
-		std::stacktrace stackTrace;
-		uint64_t resourceIDOrRegistryIndex{};
-		UploadTarget::Kind targetKind{};
-		const char* file{};
-		int line{};
-		uint8_t frameIndex{};
-		std::thread::id threadID;
-		static constexpr int MaxStack = 8;
-		void* stack[MaxStack]{};
-		uint8_t stackSize{};
-#endif
 	};
 
 	class TextureUpdate {
@@ -77,12 +65,6 @@ public:
 		uint32_t y;
 		uint32_t z;
 		std::shared_ptr<Resource> uploadBuffer;
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
-		std::stacktrace stackTrace;
-		const char* file{};
-		int line{};
-		std::thread::id threadID;
-#endif
 	};
 
 	static UploadManager& GetInstance();
@@ -208,6 +190,7 @@ private:
 	std::vector<TextureUpdate> m_textureUpdates;
 
 	std::vector<ResourceCopy> queuedResourceCopies;
+	std::mutex m_uploadQueueMutex;
 
 	UploadResolveContext m_ctx{};
 	std::shared_ptr<UploadPass> m_uploadPass;
