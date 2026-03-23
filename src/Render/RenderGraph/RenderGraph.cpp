@@ -382,6 +382,9 @@ void RenderGraph::CommitPassToBatch(
 			uint64_t id = req.resourceHandleAndRange.resource.GetGlobalResourceID();
 			SortedInsert(currentBatch.allResources, id);
 			batchOfLastQueueUsage[passQueueSlot][id] = currentBatchIndex;
+			if (AccessTypeIsWriteType(req.state.access)) {
+				batchOfLastQueueProducer[passQueueSlot][id] = currentBatchIndex;
+			}
 		}
 
 		// track UAV usage for cross-queue "same batch" rejection
@@ -464,6 +467,9 @@ void RenderGraph::CommitPassToBatch(
 			uint64_t id = req.resourceHandleAndRange.resource.GetGlobalResourceID();
 			SortedInsert(currentBatch.allResources, id);
 			batchOfLastQueueUsage[passQueueSlot][id] = currentBatchIndex;
+			if (AccessTypeIsWriteType(req.state.access)) {
+				batchOfLastQueueProducer[passQueueSlot][id] = currentBatchIndex;
+			}
 		}
 
 		queueUAVs[passQueueSlot].insert(node.uavIDs.begin(), node.uavIDs.end());
@@ -545,6 +551,9 @@ void RenderGraph::CommitPassToBatch(
 			uint64_t id = req.resourceHandleAndRange.resource.GetGlobalResourceID();
 			SortedInsert(currentBatch.allResources, id);
 			batchOfLastQueueUsage[passQueueSlot][id] = currentBatchIndex;
+			if (AccessTypeIsWriteType(req.state.access)) {
+				batchOfLastQueueProducer[passQueueSlot][id] = currentBatchIndex;
+			}
 		}
 
 		queueUAVs[passQueueSlot].insert(node.uavIDs.begin(), node.uavIDs.end());
@@ -4735,11 +4744,41 @@ bool RenderGraph::IsNewBatchNeeded(
 	const std::vector<uint64_t>& currentBatchAllResources,
 	const std::vector<uint64_t>& otherQueueUAVs)
 {
+	auto overlapsAliasedResourceInBatch = [&](uint64_t resourceID) {
+		for (uint64_t equivalentID : m_aliasingSubsystem.GetSchedulingEquivalentIDs(resourceID, aliasPlacementRangesByID)) {
+			if (equivalentID == resourceID) {
+				continue;
+			}
+			if (std::binary_search(currentBatchAllResources.begin(), currentBatchAllResources.end(), equivalentID)) {
+				return true;
+			}
+		}
+		return false;
+	};
+
+	auto overlapsAliasedTransitionInBatch = [&](uint64_t resourceID) {
+		for (uint64_t equivalentID : m_aliasingSubsystem.GetSchedulingEquivalentIDs(resourceID, aliasPlacementRangesByID)) {
+			if (equivalentID == resourceID) {
+				continue;
+			}
+			if (std::binary_search(
+				currentBatchInternallyTransitionedResources.begin(),
+				currentBatchInternallyTransitionedResources.end(),
+				equivalentID)) {
+				return true;
+			}
+		}
+		return false;
+	};
+
 	// For each internally modified resource
 	for (auto const& r : passInternalTransitions) {
 		auto id = r.first.resource.GetGlobalResourceID();
 		// If this resource is used in the current batch, we need a new one
 		if (std::binary_search(currentBatchAllResources.begin(), currentBatchAllResources.end(), id)) {
+			return true;
+		}
+		if (overlapsAliasedResourceInBatch(id)) {
 			return true;
 		}
 	}
@@ -4753,6 +4792,9 @@ bool RenderGraph::IsNewBatchNeeded(
 		if (std::binary_search(currentBatchInternallyTransitionedResources.begin(), currentBatchInternallyTransitionedResources.end(), id)) {
 			return true;
 		}
+		if (overlapsAliasedResourceInBatch(id) || overlapsAliasedTransitionInBatch(id)) {
+			return true;
+		}
 
 		ResourceState wantState{ r.state.access, r.state.layout, r.state.sync };
 
@@ -4763,6 +4805,16 @@ bool RenderGraph::IsNewBatchNeeded(
 				return true;
 		}
 		// first-use in this batch never forces a split.
+
+		// Reusing the same UAV in later passes of the same batch requires a UAV
+		// barrier even when the logical state remains UnorderedAccess. The batch
+		// model only inserts state transitions at batch boundaries, so keep each
+		// same-resource UAV use in its own batch.
+		if (((r.state.access & rhi::ResourceAccessType::UnorderedAccess) != 0
+				|| r.state.layout == rhi::ResourceLayout::UnorderedAccess)
+			&& std::binary_search(currentBatchAllResources.begin(), currentBatchAllResources.end(), id)) {
+			return true;
+		}
 
 		// Cross-queue UAV hazard?
 		if ((r.state.access & rhi::ResourceAccessType::UnorderedAccess)

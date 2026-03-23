@@ -1501,6 +1501,13 @@ void rg::alias::RenderGraphAliasingSubsystem::ApplyAliasQueueSynchronization(Ren
 					continue;
 				}
 
+				// This pass only adds waits against prior batches. Same-batch alias
+				// overlap must be prevented during batch formation instead of
+				// creating a queue wait that points back into the current batch.
+				if (prevOwner.batchIndex == batchIndex) {
+					continue;
+				}
+
 				if (!rangesOverlap(
 					placement.startByte,
 					placement.endByte,
