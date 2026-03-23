@@ -28,6 +28,8 @@ public:
     virtual void EndQuery(unsigned passIndex, unsigned frameIndex, rhi::Queue& queue, rhi::CommandList& cmdList) = 0;
     virtual void ResolveQueries(unsigned frameIndex, rhi::Queue& queue, rhi::CommandList& cmdList) = 0;
     virtual void OnFrameComplete(unsigned frameIndex, rhi::Queue& queue) = 0;
+    virtual void RecordCpuUpdateTime(unsigned passIndex, double milliseconds) = 0;
+    virtual void RecordCpuExecuteTime(unsigned passIndex, double milliseconds) = 0;
 
     // Thread-safe overloads that write to a per-task context instead of shared state.
     virtual void BeginQuery(unsigned passIndex, unsigned frameIndex, rhi::Queue& queue, rhi::CommandList& cmdList, QueryRecordingContext& ctx) = 0;

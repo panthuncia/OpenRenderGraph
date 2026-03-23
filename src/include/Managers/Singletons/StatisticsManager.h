@@ -7,6 +7,7 @@
 #include <utility>
 #include <functional>
 #include <limits>
+#include <mutex>
 #include <rhi.h>
 #include "Render/Runtime/StatisticsTypes.h"
 
@@ -57,6 +58,8 @@ public:
 
 	void OnFrameComplete(unsigned frameIndex,
 		rhi::Queue& queue);
+	void RecordCpuUpdateTime(unsigned passIndex, double milliseconds);
+	void RecordCpuExecuteTime(unsigned passIndex, double milliseconds);
 
 	void ClearAll();
 
@@ -74,9 +77,11 @@ private:
 	~StatisticsManager() = default;
 
 	void EnsureQueueBuffers(rhi::QueueKind queueKind);
+	void RecordCpuTimeSample(unsigned passIndex, double milliseconds, bool isUpdate);
 
 	bool m_collectPipelineStatistics = false;
 	std::function<bool()> m_getCollectPipelineStatistics;
+	std::mutex m_cpuStatsMutex;
 
 	rhi::QueryPoolPtr m_timestampPool;
 	rhi::QueryPoolPtr m_pipelineStatsPool;

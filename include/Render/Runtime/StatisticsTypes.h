@@ -1,12 +1,20 @@
 #pragma once
 
 #include <cstdint>
+#include <utility>
+#include <vector>
 
 namespace rg::runtime {
 
 struct PassStats {
-    double ema = 0.0;
+    double gpuTimeEma = 0.0;
+    double cpuUpdateTimeEma = 0.0;
+    double cpuExecuteTimeEma = 0.0;
     static constexpr double alpha = 0.1;
+
+    double GetCpuTimeEma() const noexcept {
+        return cpuUpdateTimeEma + cpuExecuteTimeEma;
+    }
 };
 
 struct MeshPipelineStats {

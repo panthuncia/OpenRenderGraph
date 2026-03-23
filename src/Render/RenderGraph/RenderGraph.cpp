@@ -2,6 +2,7 @@
 
 #include <span>
 #include <algorithm>
+#include <chrono>
 #include <limits>
 #include <numeric>
 #include <optional>
@@ -2143,9 +2144,6 @@ void RenderGraph::RefreshRetainedDeclarationsForFrame(CopyPassAndResources& p, u
 }
 
 void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHostExecutionData* hostData) {
-	if (m_statisticsService) {
-		m_statisticsService->BeginFrame();
-	}
 	compileTrackers.clear();
 	m_aliasingSubsystem.ResetPerFrameState(*this);
 
@@ -3646,6 +3644,14 @@ void RenderGraph::Update(const UpdateExecutionContext& context, rhi::Device devi
 		m_readbackService->ProcessReadbackRequests();
 	}
 
+	if (m_statisticsService) {
+		m_statisticsService->BeginFrame();
+	}
+
+	auto toMilliseconds = [](auto duration) {
+		return std::chrono::duration<double, std::milli>(duration).count();
+	};
+
 	for (auto& pr : m_masterPassList) {	
 		// Resolve into type and update
 		std::visit([&](auto& obj) {
@@ -3654,7 +3660,22 @@ void RenderGraph::Update(const UpdateExecutionContext& context, rhi::Device devi
 				// no-op
 			}
 			else {
+				if (m_statisticsService && obj.statisticsIndex < 0) {
+					if constexpr (std::is_same_v<T, RenderPassAndResources>) {
+						obj.statisticsIndex = static_cast<int>(m_statisticsService->RegisterPass(obj.name, obj.resources.isGeometryPass));
+					}
+					else {
+						obj.statisticsIndex = static_cast<int>(m_statisticsService->RegisterPass(obj.name, false));
+					}
+				}
+
+				const auto start = std::chrono::steady_clock::now();
 				obj.pass->Update(context);
+				if (m_statisticsService && obj.statisticsIndex >= 0) {
+					m_statisticsService->RecordCpuUpdateTime(
+						static_cast<unsigned>(obj.statisticsIndex),
+						toMilliseconds(std::chrono::steady_clock::now() - start));
+				}
 			}
 			}, pr.pass);
 	}
@@ -3869,7 +3890,9 @@ namespace {
 			if (!pr.pass->IsInvalidated())
 				return;
 			rhi::debug::Scope scope(commandList, rhi::colors::Mint, pr.name.c_str());
-			if (args.statisticsService)
+			const bool hasStatistics = args.statisticsService && pr.statisticsIndex >= 0;
+			const auto cpuStart = std::chrono::steady_clock::now();
+			if (hasStatistics)
 				args.statisticsService->BeginQuery(pr.statisticsIndex, args.context.frameIndex, rhiQueue, commandList);
 			if ((pr.run & PassRunMask::Immediate) != PassRunMask::None)
 				rg::imm::Replay(pr.immediateBytecode, commandList);
@@ -3879,8 +3902,13 @@ namespace {
 				if (passReturn.fence)
 					args.outExternalFences.push_back(passReturn);
 			}
-			if (args.statisticsService)
+			if (hasStatistics)
 				args.statisticsService->EndQuery(pr.statisticsIndex, args.context.frameIndex, rhiQueue, commandList);
+			if (hasStatistics) {
+				args.statisticsService->RecordCpuExecuteTime(
+					static_cast<unsigned>(pr.statisticsIndex),
+					std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - cpuStart).count());
+			}
 		};
 
 		for (auto& passVariant : batch.Passes(qi)) {
@@ -3986,7 +4014,9 @@ namespace {
 			if (!pr.pass->IsInvalidated())
 				return;
 			rhi::debug::Scope scope(commandList, rhi::colors::Mint, pr.name.c_str());
-			if (args.statisticsService)
+			const bool hasStatistics = args.statisticsService && pr.statisticsIndex >= 0;
+			const auto cpuStart = std::chrono::steady_clock::now();
+			if (hasStatistics)
 				args.statisticsService->BeginQuery(pr.statisticsIndex, args.context.frameIndex, args.rhiQueue, commandList, sched.queryRecordingContext);
 			if ((pr.run & PassRunMask::Immediate) != PassRunMask::None)
 				rg::imm::Replay(pr.immediateBytecode, commandList);
@@ -3996,8 +4026,13 @@ namespace {
 				if (passReturn.fence)
 					sched.externalFences.push_back(passReturn);
 			}
-			if (args.statisticsService)
+			if (hasStatistics)
 				args.statisticsService->EndQuery(pr.statisticsIndex, args.context.frameIndex, args.rhiQueue, commandList, sched.queryRecordingContext);
+			if (hasStatistics) {
+				args.statisticsService->RecordCpuExecuteTime(
+					static_cast<unsigned>(pr.statisticsIndex),
+					std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - cpuStart).count());
+			}
 		};
 
 		for (auto& passVariant : batch.Passes(qi)) {

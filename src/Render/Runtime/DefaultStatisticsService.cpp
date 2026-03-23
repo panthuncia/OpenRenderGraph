@@ -63,6 +63,14 @@ public:
         StatisticsManager::GetInstance().OnFrameComplete(frameIndex, queue);
     }
 
+    void RecordCpuUpdateTime(unsigned passIndex, double milliseconds) override {
+        StatisticsManager::GetInstance().RecordCpuUpdateTime(passIndex, milliseconds);
+    }
+
+    void RecordCpuExecuteTime(unsigned passIndex, double milliseconds) override {
+        StatisticsManager::GetInstance().RecordCpuExecuteTime(passIndex, milliseconds);
+    }
+
     const std::vector<std::string>& GetPassNames() const override {
         return StatisticsManager::GetInstance().GetPassNames();
     }

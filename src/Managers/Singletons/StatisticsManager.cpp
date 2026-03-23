@@ -14,6 +14,12 @@ StatisticsManager& StatisticsManager::GetInstance() {
     return inst;
 }
 
+namespace {
+void UpdateEma(double& value, double sample) {
+    value = value * (1.0 - PassStats::alpha) + sample * PassStats::alpha;
+}
+}
+
 void StatisticsManager::Initialize() {
     m_numFramesInFlight = rg::runtime::GetOpenRenderGraphSettings().numFramesInFlight;
 	auto device = DeviceManager::GetInstance().GetDevice();
@@ -79,6 +85,33 @@ void StatisticsManager::BeginFrame() {
         memoryBudgetStats.valid = true;
     }
     m_memoryBudgetStats = memoryBudgetStats;
+}
+
+void StatisticsManager::RecordCpuUpdateTime(unsigned passIndex, double milliseconds) {
+    RecordCpuTimeSample(passIndex, milliseconds, true);
+}
+
+void StatisticsManager::RecordCpuExecuteTime(unsigned passIndex, double milliseconds) {
+    RecordCpuTimeSample(passIndex, milliseconds, false);
+}
+
+void StatisticsManager::RecordCpuTimeSample(unsigned passIndex, double milliseconds, bool isUpdate) {
+    std::scoped_lock lock(m_cpuStatsMutex);
+    if (passIndex >= m_stats.size()) {
+        return;
+    }
+
+    auto& passStats = m_stats[passIndex];
+    if (isUpdate) {
+        UpdateEma(passStats.cpuUpdateTimeEma, milliseconds);
+    }
+    else {
+        UpdateEma(passStats.cpuExecuteTimeEma, milliseconds);
+    }
+
+    if (passIndex < m_passLastDataFrame.size()) {
+        m_passLastDataFrame[passIndex] = m_frameSerial;
+    }
 }
 
 void StatisticsManager::RebuildVisiblePassIndices(uint64_t maxStaleFrames, std::vector<unsigned>& out) const {
@@ -554,7 +587,7 @@ void StatisticsManager::OnFrameComplete(
                 continue;
             }
 
-            m_stats[pi].ema = m_stats[pi].ema * (1.0 - PassStats::alpha) + ms * PassStats::alpha;
+            UpdateEma(m_stats[pi].gpuTimeEma, ms);
             if (pi < m_passLastDataFrame.size()) {
                 m_passLastDataFrame[pi] = m_frameSerial;
             }
@@ -580,8 +613,8 @@ void StatisticsManager::OnFrameComplete(
             psBuf->Unmap(0, 0);
 
             auto& mps = m_meshStatsEma[pi];
-            mps.invocationsEma = mps.invocationsEma * (1.0 - PassStats::alpha) + double(inv) * PassStats::alpha;
-            mps.primitivesEma = mps.primitivesEma * (1.0 - PassStats::alpha) + double(prim) * PassStats::alpha;
+            UpdateEma(mps.invocationsEma, double(inv));
+            UpdateEma(mps.primitivesEma, double(prim));
         }
 
         tsBuf->Unmap(0, 0);
