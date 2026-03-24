@@ -581,6 +581,7 @@ private:
 	std::unordered_map<std::string, std::shared_ptr<Resource>> resourcesByName;
 	std::unordered_map<uint64_t, std::shared_ptr<Resource>> resourcesByID;
 	std::unordered_map<uint64_t, std::shared_ptr<Resource>> m_transientFrameResourcesByID;
+	std::unordered_map<std::string, std::shared_ptr<Resource>> m_transientFrameResourcesByName;
 	std::unordered_map<uint64_t, uint64_t> resourceBackingGenerationByID;
 	std::unordered_map<uint64_t, uint32_t> resourceIdleFrameCounts;
 	std::unordered_map<uint64_t, uint64_t> compiledResourceGenerationByID;
@@ -642,6 +643,8 @@ private:
 	std::function<bool()> m_getHeavyDebug;
 
 	void AddResource(std::shared_ptr<Resource> resource, bool transition = false);
+	void TrackTransientFrameResource(const std::shared_ptr<Resource>& resource);
+	void TrackTransientFrameResource(Resource* resource);
 	void ShutdownOwnedState();
 
 	/// Dispatches to the injected ITaskService when available, otherwise runs a serial loop.

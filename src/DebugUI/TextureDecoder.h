@@ -395,6 +395,40 @@ namespace ui {
             }
             return out;
 
+        // R32_UInt
+        // Used by linked-list head pointer buffers. Visualize empty sentinel as
+        // black and otherwise assign stable false color from the stored index.
+        case F::R32_UInt:
+            for (uint32_t y = 0; y < h; ++y) {
+                const auto* src = reinterpret_cast<const uint32_t*>(rowSrc(y));
+                if (!src) break;
+                uint8_t* dst = out.data() + static_cast<size_t>(y) * w * 4;
+                for (uint32_t x = 0; x < w; ++x) {
+                    const uint32_t value = src[x];
+                    if (value == 0xFFFFFFFFu) {
+                        dst[0] = 0;
+                        dst[1] = 0;
+                        dst[2] = 0;
+                        dst[3] = 255;
+                        dst += 4;
+                        continue;
+                    }
+
+                    const uint32_t hashed = HashUint32(value);
+                    const float r = ((hashed >> 0) & 0xFFu) / 255.0f;
+                    const float g = ((hashed >> 8) & 0xFFu) / 255.0f;
+                    const float b = ((hashed >> 16) & 0xFFu) / 255.0f;
+                    constexpr float brightness = 0.85f;
+
+                    dst[0] = FloatToByte(Saturate(r * brightness));
+                    dst[1] = FloatToByte(Saturate(g * brightness));
+                    dst[2] = FloatToByte(Saturate(b * brightness));
+                    dst[3] = 255;
+                    dst += 4;
+                }
+            }
+            return out;
+
         // R32G32_UInt
         // This is commonly used in the renderer for packed visibility data.
         // Raw integer-to-byte truncation is not readable, so visualize with a

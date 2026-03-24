@@ -1230,6 +1230,7 @@ void RenderGraph::ShutdownOwnedState() {
 	resourcesByID.clear();
 	resourcesByName.clear();
 	m_transientFrameResourcesByID.clear();
+	m_transientFrameResourcesByName.clear();
 	resourceBackingGenerationByID.clear();
 	resourceIdleFrameCounts.clear();
 	compiledResourceGenerationByID.clear();
@@ -1551,6 +1552,7 @@ void RenderGraph::ResetForRebuild()
 	resourcesByID.clear();
 	resourcesByName.clear();
 	m_transientFrameResourcesByID.clear();
+	m_transientFrameResourcesByName.clear();
 	resourceBackingGenerationByID.clear();
 	resourceIdleFrameCounts.clear();
 	compiledResourceGenerationByID.clear();
@@ -1592,6 +1594,7 @@ void RenderGraph::ResetForFrame() {
 	batches.clear();
 	compiledResourceGenerationByID.clear();
 	m_transientFrameResourcesByID.clear();
+	m_transientFrameResourcesByName.clear();
 	m_aliasingSubsystem.ResetPerFrameState(*this);
 	compileTrackers.clear();
 	for (auto& producerMap : m_compiledLastProducerBatchByResourceByQueue) {
@@ -3379,6 +3382,7 @@ void RenderGraph::MaterializeUnmaterializedResources(const std::unordered_set<ui
 		if (!seen.insert(id).second) return;
 		Resource* resource = handle.IsEphemeral() ? handle.GetEphemeralPtr() : _registry.Resolve(handle);
 		if (resource) {
+			TrackTransientFrameResource(resource);
 			items.emplace_back(id, resource);
 		}
 	};
@@ -3622,7 +3626,38 @@ void RenderGraph::AddResource(std::shared_ptr<Resource> resource, bool transitio
 	}
 }
 
+void RenderGraph::TrackTransientFrameResource(const std::shared_ptr<Resource>& resource) {
+	if (!resource) {
+		return;
+	}
+
+	const uint64_t resourceID = resource->GetGlobalResourceID();
+	if (resourcesByID.contains(resourceID)) {
+		return;
+	}
+
+	m_transientFrameResourcesByID[resourceID] = resource;
+	const auto& resourceName = resource->GetName();
+	if (!resourceName.empty()) {
+		m_transientFrameResourcesByName[resourceName] = resource;
+	}
+}
+
+void RenderGraph::TrackTransientFrameResource(Resource* resource) {
+	if (!resource) {
+		return;
+	}
+
+	if (auto shared = resource->weak_from_this().lock()) {
+		TrackTransientFrameResource(shared);
+	}
+}
+
 std::shared_ptr<Resource> RenderGraph::GetResourceByName(const std::string& name) {
+	auto transientIt = m_transientFrameResourcesByName.find(name);
+	if (transientIt != m_transientFrameResourcesByName.end()) {
+		return transientIt->second;
+	}
 	auto it = resourcesByName.find(name);
 	if (it != resourcesByName.end()) {
 		return it->second;
@@ -3631,6 +3666,10 @@ std::shared_ptr<Resource> RenderGraph::GetResourceByName(const std::string& name
 }
 
 std::shared_ptr<Resource> RenderGraph::GetResourceByID(const uint64_t id) {
+	auto transientIt = m_transientFrameResourcesByID.find(id);
+	if (transientIt != m_transientFrameResourcesByID.end()) {
+		return transientIt->second;
+	}
 	auto it = resourcesByID.find(id);
 	if (it != resourcesByID.end()) {
 		return it->second;
@@ -4989,14 +5028,11 @@ ResourceRegistry::RegistryHandle RenderGraph::RequestResourceHandle(Resource* co
 
 	auto pinTransientForFrame = [&]() {
 		const uint64_t resourceID = pResource->GetGlobalResourceID();
-		if (resourcesByID.contains(resourceID)) {
+		if (resourcesByID.contains(resourceID) || m_transientFrameResourcesByID.contains(resourceID)) {
 			return;
 		}
 
-		auto shared = pResource->weak_from_this().lock();
-		if (shared) {
-			m_transientFrameResourcesByID[resourceID] = std::move(shared);
-		}
+		TrackTransientFrameResource(pResource);
 	};
 
 	// If it's already in our registry, return it
