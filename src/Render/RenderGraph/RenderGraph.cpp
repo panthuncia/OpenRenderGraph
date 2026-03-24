@@ -1256,6 +1256,7 @@ void RenderGraph::ShutdownOwnedState() {
 	m_passNamesSeenThisReset.clear();
 	m_passBuildersByName.clear();
 	m_extensions.clear();
+    m_extensionRegistrationIds.clear();
 	_providerMap.clear();
 	_providers.clear();
 	_resolverMap.clear();
@@ -1511,13 +1512,17 @@ void RenderGraph::ValidateCompiledResourceGenerations() const {
 }
 
 
-void RenderGraph::RegisterExtension(std::unique_ptr<IRenderGraphExtension> ext) {
+void RenderGraph::RegisterExtension(std::unique_ptr<IRenderGraphExtension> ext, std::optional<std::string_view> id) {
 	if (!ext) return;
 
 	const auto& incomingType = typeid(*ext);
-	for (const auto& existing : m_extensions) {
-		if (existing && typeid(*existing) == incomingType) {
-			spdlog::error("Duplicate RenderGraph extension registration: {}", incomingType.name());
+    const std::string registrationId = id.has_value()
+        ? std::string(*id)
+        : std::string(incomingType.name());
+
+	for (const auto& existingId : m_extensionRegistrationIds) {
+		if (existingId == registrationId) {
+			spdlog::error("Duplicate RenderGraph extension registration: {}", registrationId);
 			throw std::runtime_error("Duplicate RenderGraph extension registration");
 		}
 	}
@@ -1525,6 +1530,13 @@ void RenderGraph::RegisterExtension(std::unique_ptr<IRenderGraphExtension> ext) 
 	// Let the extension see the current registry immediately.
 	ext->OnRegistryReset(&_registry);
 	m_extensions.push_back(std::move(ext));
+    try {
+        m_extensionRegistrationIds.push_back(registrationId);
+    }
+    catch (...) {
+        m_extensions.pop_back();
+        throw;
+    }
 }
 
 void RenderGraph::ResetForRebuild()

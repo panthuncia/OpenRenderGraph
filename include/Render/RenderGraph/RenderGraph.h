@@ -4,7 +4,9 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <string>
+#include <string_view>
 #include <memory>
+#include <optional>
 #include <variant>
 #include <span>
 #include <utility>
@@ -415,7 +417,7 @@ public:
 	void ResetForFrame();
 	void ResetForRebuild();
 	void Setup();
-	void RegisterExtension(std::unique_ptr<IRenderGraphExtension> ext);
+	void RegisterExtension(std::unique_ptr<IRenderGraphExtension> ext, std::optional<std::string_view> id = std::nullopt);
 	const std::vector<PassBatch>& GetBatches() const { return batches; }
 	rg::memory::SnapshotProvider& GetMemorySnapshotProvider() { return m_memorySnapshotProvider; }
 	const rg::memory::SnapshotProvider& GetMemorySnapshotProvider() const { return m_memorySnapshotProvider; }
@@ -630,6 +632,7 @@ private:
 	rg::imm::ImmediateDispatch m_immediateDispatch{};
 
 	std::vector<std::unique_ptr<IRenderGraphExtension>> m_extensions;
+    std::vector<std::string> m_extensionRegistrationIds;
 
 	UINT64 GetNextQueueFenceValue(size_t queueSlotIndex) {
 		return m_queueRegistry.GetNextFenceValue(static_cast<QueueSlotIndex>(static_cast<uint8_t>(queueSlotIndex)));
