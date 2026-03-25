@@ -1544,9 +1544,20 @@ void RenderGraph::ResetForRebuild()
 {
 	// Clear any existing compile state
 	m_masterPassList.clear();
+	m_framePasses.clear();
 	batches.clear();
 	m_executionSchedule.batches.clear();
 	trackers.clear();
+
+	// Full rebuilds must drop cached pass instances before clearing resources.
+	// Builders reuse pass objects across frames, and many passes capture
+	// resource-owning shared_ptrs through constructor arguments.
+	for (auto& [name, builder] : m_passBuildersByName) {
+		(void)name;
+		if (builder) {
+			builder->Reset();
+		}
+	}
 
 	// Clear resources
 	resourcesByID.clear();
@@ -1573,6 +1584,8 @@ void RenderGraph::ResetForRebuild()
 	m_hasPendingFrameStartQueueWait.clear();
 	m_pendingFrameStartQueueWaitFenceValue.clear();
 	m_queueRegistry.Clear();
+	renderPassesByName.clear();
+	computePassesByName.clear();
 
 	// Clear providers
 	_providerMap.clear();
