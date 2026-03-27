@@ -2812,13 +2812,13 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		}, pr.pass);
 	}
 
-	if (overlapTriggeredWaitCount > 0) {
-		spdlog::info(
-			"RG cross-frame overlap waits: hits={} sampleCurrentResourceId={} samplePreviousResourceId={}",
-			overlapTriggeredWaitCount,
-			overlapSampleCurrentResourceId,
-			overlapSamplePreviousResourceId);
-	}
+	//if (overlapTriggeredWaitCount > 0) {
+	//	spdlog::info(
+	//		"RG cross-frame overlap waits: hits={} sampleCurrentResourceId={} samplePreviousResourceId={}",
+	//		overlapTriggeredWaitCount,
+	//		overlapSampleCurrentResourceId,
+	//		overlapSamplePreviousResourceId);
+	//}
 
 	// Insert transitions to loop resources back to their initial states
 	//ComputeResourceLoops();
