@@ -2,6 +2,7 @@
 
 #include <span>
 #include <algorithm>
+#include <cmath>
 #include <chrono>
 #include <limits>
 #include <numeric>
@@ -119,35 +120,53 @@ std::vector<RenderGraph::Node> RenderGraph::BuildNodes(RenderGraph& rg, std::vec
 	std::vector<Node> nodes;
 	nodes.resize(passes.size());
 
-	auto resolveQueueSlotForPass = [](const AnyPassAndResources& pr) -> size_t {
+	auto resolveCompatibleQueueSlotsForPass = [&rg](const AnyPassAndResources& pr) -> std::vector<size_t> {
+		auto collectSlotsForKind = [&rg](QueueKind kind) {
+			std::vector<size_t> slots;
+			const size_t slotCount = rg.m_queueRegistry.SlotCount();
+			slots.reserve(slotCount);
+			for (size_t slotIndex = 0; slotIndex < slotCount; ++slotIndex) {
+				const auto queueSlotIndex = static_cast<QueueSlotIndex>(static_cast<uint8_t>(slotIndex));
+				if (rg.m_queueRegistry.GetKind(queueSlotIndex) == kind && rg.m_queueRegistry.IsAutoAssignable(queueSlotIndex)) {
+					slots.push_back(slotIndex);
+				}
+			}
+			if (slots.empty()) {
+				slots.push_back(QueueIndex(kind));
+			}
+			return slots;
+		};
+
 		if (pr.type == PassType::Compute) {
 			const auto& pass = std::get<ComputePassAndResources>(pr.pass);
 			if (pass.resources.queueSlotOverride)
-				return static_cast<size_t>(static_cast<uint8_t>(*pass.resources.queueSlotOverride));
-			return QueueIndex(ResolveQueueKind(pass.resources.queueSelection));
+				return std::vector<size_t>{ static_cast<size_t>(static_cast<uint8_t>(*pass.resources.queueSlotOverride)) };
+			return collectSlotsForKind(ResolveQueueKind(pass.resources.queueSelection));
 		}
 
 		if (pr.type == PassType::Render) {
 			const auto& pass = std::get<RenderPassAndResources>(pr.pass);
 			if (pass.resources.queueSlotOverride)
-				return static_cast<size_t>(static_cast<uint8_t>(*pass.resources.queueSlotOverride));
-			return QueueIndex(ResolveQueueKind(pass.resources.queueSelection));
+				return std::vector<size_t>{ static_cast<size_t>(static_cast<uint8_t>(*pass.resources.queueSlotOverride)) };
+			return collectSlotsForKind(ResolveQueueKind(pass.resources.queueSelection));
 		}
 
 		if (pr.type == PassType::Copy) {
 			const auto& pass = std::get<CopyPassAndResources>(pr.pass);
 			if (pass.resources.queueSlotOverride)
-				return static_cast<size_t>(static_cast<uint8_t>(*pass.resources.queueSlotOverride));
-			return QueueIndex(ResolveQueueKind(pass.resources.queueSelection));
+				return std::vector<size_t>{ static_cast<size_t>(static_cast<uint8_t>(*pass.resources.queueSlotOverride)) };
+			return collectSlotsForKind(ResolveQueueKind(pass.resources.queueSelection));
 		}
 
-		return QueueIndex(QueueKind::Graphics);
+		return std::vector<size_t>{ QueueIndex(QueueKind::Graphics) };
 	};
 
 	for (size_t i = 0; i < passes.size(); ++i) {
 		Node n{};
 		n.passIndex = i;
-		n.queueSlot = resolveQueueSlotForPass(passes[i]);
+		n.compatibleQueueSlots = resolveCompatibleQueueSlotsForPass(passes[i]);
+		n.queueSlot = n.compatibleQueueSlots.empty() ? QueueIndex(QueueKind::Graphics) : n.compatibleQueueSlots.front();
+		n.assignedQueueSlot = n.queueSlot;
 		n.originalOrder = static_cast<uint32_t>(i);
 
 		PassView view = GetPassView(passes[i]);
@@ -198,6 +217,233 @@ std::vector<RenderGraph::Node> RenderGraph::BuildNodes(RenderGraph& rg, std::vec
 	}
 
 	return nodes;
+}
+
+std::vector<uint8_t> RenderGraph::PlanActiveQueueSlots(
+	RenderGraph& rg,
+	const std::vector<AnyPassAndResources>& passes,
+	const std::vector<Node>& nodes)
+{
+	const size_t slotCount = rg.m_queueRegistry.SlotCount();
+	std::vector<uint8_t> activeSlots(slotCount, 0);
+	if (slotCount == 0) {
+		return activeSlots;
+	}
+
+	auto passHasExplicitQueuePin = [](const AnyPassAndResources& pr) {
+		return std::visit([](auto const& passEntry) -> bool {
+			using T = std::decay_t<decltype(passEntry)>;
+			if constexpr (std::is_same_v<T, std::monostate>) {
+				return false;
+			}
+			else {
+				return passEntry.resources.queueSlotOverride.has_value();
+			}
+		}, pr.pass);
+	};
+
+	std::vector<uint32_t> indeg(nodes.size());
+	std::vector<uint32_t> level(nodes.size(), 0);
+	std::vector<size_t> ready;
+	ready.reserve(nodes.size());
+	for (size_t i = 0; i < nodes.size(); ++i) {
+		indeg[i] = nodes[i].indegree;
+		if (indeg[i] == 0) {
+			ready.push_back(i);
+		}
+	}
+	for (size_t head = 0; head < ready.size(); ++head) {
+		const size_t u = ready[head];
+		for (size_t v : nodes[u].out) {
+			level[v] = (std::max)(level[v], level[u] + 1);
+			if (--indeg[v] == 0) {
+				ready.push_back(v);
+			}
+		}
+	}
+
+	std::array<std::vector<size_t>, static_cast<size_t>(QueueKind::Count)> slotsByKind;
+	std::array<std::vector<size_t>, static_cast<size_t>(QueueKind::Count)> autoAssignableSlotsByKind;
+	for (size_t slotIndex = 0; slotIndex < slotCount; ++slotIndex) {
+		const auto queueSlotIndex = static_cast<QueueSlotIndex>(static_cast<uint8_t>(slotIndex));
+		const QueueKind kind = rg.m_queueRegistry.GetKind(queueSlotIndex);
+		slotsByKind[QueueIndex(kind)].push_back(slotIndex);
+		if (rg.m_queueRegistry.IsAutoAssignable(queueSlotIndex)) {
+			autoAssignableSlotsByKind[QueueIndex(kind)].push_back(slotIndex);
+		}
+	}
+
+	const bool allowAsyncCompute = rg.m_getUseAsyncCompute ? rg.m_getUseAsyncCompute() : true;
+	const bool enableQueueSchedulingLogging = rg.m_getQueueSchedulingEnableLogging ? rg.m_getQueueSchedulingEnableLogging() : false;
+	const double widthScale = rg.m_getQueueSchedulingWidthScale ? static_cast<double>(rg.m_getQueueSchedulingWidthScale()) : 1.0;
+	const double penaltyBias = rg.m_getQueueSchedulingPenaltyBias ? static_cast<double>(rg.m_getQueueSchedulingPenaltyBias()) : 0.0;
+	const double minPenalty = rg.m_getQueueSchedulingMinPenalty ? static_cast<double>(rg.m_getQueueSchedulingMinPenalty()) : 1.0;
+	const double resourcePressureWeight = rg.m_getQueueSchedulingResourcePressureWeight ? static_cast<double>(rg.m_getQueueSchedulingResourcePressureWeight()) : 1.0;
+	const double uavPressureWeight = rg.m_getQueueSchedulingUavPressureWeight ? static_cast<double>(rg.m_getQueueSchedulingUavPressureWeight()) : 0.5;
+	auto queueKindName = [](QueueKind kind) -> const char* {
+		switch (kind) {
+		case QueueKind::Graphics: return "graphics";
+		case QueueKind::Compute:  return "compute";
+		case QueueKind::Copy:     return "copy";
+		default:                 return "unknown";
+		}
+	};
+
+	for (size_t kindIndex = 0; kindIndex < static_cast<size_t>(QueueKind::Count); ++kindIndex) {
+		const QueueKind kind = static_cast<QueueKind>(kindIndex);
+		auto& slots = slotsByKind[kindIndex];
+		auto& autoAssignableSlots = autoAssignableSlotsByKind[kindIndex];
+		if (slots.empty()) {
+			continue;
+		}
+
+		std::unordered_set<size_t> pinnedSlots;
+		std::unordered_set<uint64_t> uniqueTouchedIDs;
+		std::unordered_map<uint32_t, size_t> widthByLevel;
+		size_t compatibleNodeCount = 0;
+		size_t totalTouched = 0;
+		size_t totalUAV = 0;
+
+		for (size_t nodeIndex = 0; nodeIndex < nodes.size(); ++nodeIndex) {
+			const auto& node = nodes[nodeIndex];
+			bool compatibleWithKind = false;
+			for (size_t slot : node.compatibleQueueSlots) {
+				if (slot < slotCount && rg.m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot))) == kind) {
+					compatibleWithKind = true;
+					break;
+				}
+			}
+			if (!compatibleWithKind) {
+				continue;
+			}
+
+			++compatibleNodeCount;
+			++widthByLevel[level[nodeIndex]];
+			totalTouched += node.touchedIDs.size();
+			totalUAV += node.uavIDs.size();
+			uniqueTouchedIDs.insert(node.touchedIDs.begin(), node.touchedIDs.end());
+
+			if (node.passIndex < passes.size() && passHasExplicitQueuePin(passes[node.passIndex])) {
+				const size_t pinnedSlot = node.compatibleQueueSlots.empty() ? node.queueSlot : node.compatibleQueueSlots.front();
+				if (pinnedSlot < slotCount
+					&& rg.m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(static_cast<uint8_t>(pinnedSlot))) == kind) {
+					pinnedSlots.insert(pinnedSlot);
+				}
+			}
+		}
+
+		if (kind == QueueKind::Graphics) {
+			activeSlots[slots.front()] = 1;
+			for (size_t pinnedSlot : pinnedSlots) {
+				activeSlots[pinnedSlot] = 1;
+			}
+			continue;
+		}
+
+		if (compatibleNodeCount == 0 && pinnedSlots.empty()) {
+			continue;
+		}
+
+		size_t maxLevelWidth = 0;
+		for (const auto& [_, width] : widthByLevel) {
+			maxLevelWidth = (std::max)(maxLevelWidth, width);
+		}
+
+		double resourcePressure = 1.0;
+		if (!uniqueTouchedIDs.empty()) {
+			resourcePressure = static_cast<double>(totalTouched) / static_cast<double>(uniqueTouchedIDs.size());
+		}
+		const double uavPressure = totalTouched == 0 ? 0.0 : static_cast<double>(totalUAV) / static_cast<double>(totalTouched);
+		const double weightedPressure = penaltyBias + resourcePressureWeight * resourcePressure + uavPressureWeight * uavPressure;
+		const double parallelismPenalty = (std::max)(minPenalty, weightedPressure);
+		const double widthToPenaltyRatio = parallelismPenalty > 0.0
+			? ((widthScale * static_cast<double>(maxLevelWidth)) / parallelismPenalty)
+			: 0.0;
+		size_t targetCount = compatibleNodeCount > 0 ? 1u : 0u;
+		if (maxLevelWidth > 0) {
+			targetCount = static_cast<size_t>(std::ceil(widthToPenaltyRatio));
+			targetCount = (std::max)(size_t(1), targetCount);
+		}
+		if (kind == QueueKind::Compute && !allowAsyncCompute) {
+			targetCount = (std::min)(targetCount, size_t(1));
+		}
+		targetCount = (std::min)(targetCount, autoAssignableSlots.size());
+		targetCount = (std::max)(targetCount, pinnedSlots.size());
+
+		for (size_t pinnedSlot : pinnedSlots) {
+			activeSlots[pinnedSlot] = 1;
+		}
+		if (compatibleNodeCount > 0) {
+			if (!autoAssignableSlots.empty()) {
+				activeSlots[autoAssignableSlots.front()] = 1;
+			}
+		}
+
+		size_t activeCount = 0;
+		for (size_t slot : autoAssignableSlots) {
+			activeCount += activeSlots[slot] ? 1u : 0u;
+		}
+
+		for (size_t slot : autoAssignableSlots) {
+			if (activeCount >= targetCount) {
+				break;
+			}
+			if (activeSlots[slot]) {
+				continue;
+			}
+			activeSlots[slot] = 1;
+			++activeCount;
+		}
+
+		if (enableQueueSchedulingLogging) {
+			std::ostringstream activeSlotStream;
+			bool firstActiveSlot = true;
+			for (size_t slot : slots) {
+				if (!activeSlots[slot]) {
+					continue;
+				}
+				if (!firstActiveSlot) {
+					activeSlotStream << ",";
+				}
+				activeSlotStream << slot;
+				firstActiveSlot = false;
+			}
+
+			std::ostringstream pinnedSlotStream;
+			bool firstPinnedSlot = true;
+			for (size_t slot : pinnedSlots) {
+				if (!firstPinnedSlot) {
+					pinnedSlotStream << ",";
+				}
+				pinnedSlotStream << slot;
+				firstPinnedSlot = false;
+			}
+
+			spdlog::info(
+				"RG queue planner [{}]: registered={} autoAssignable={} compatibleNodes={} maxLevelWidth={} resourcePressure={:.2f} uavPressure={:.2f} widthScale={:.2f} penaltyBias={:.2f} minPenalty={:.2f} resourceWeight={:.2f} uavWeight={:.2f} weightedPressure={:.2f} parallelismPenalty={:.2f} widthToPenaltyRatio={:.2f} targetActive={} activeSlots=[{}] pinnedSlots=[{}] asyncComputeAllowed={}",
+				queueKindName(kind),
+				slots.size(),
+				autoAssignableSlots.size(),
+				compatibleNodeCount,
+				maxLevelWidth,
+				resourcePressure,
+				uavPressure,
+				widthScale,
+				penaltyBias,
+				minPenalty,
+				resourcePressureWeight,
+				uavPressureWeight,
+				weightedPressure,
+				parallelismPenalty,
+				widthToPenaltyRatio,
+				targetCount,
+				activeSlotStream.str(),
+				pinnedSlotStream.str(),
+				allowAsyncCompute);
+		}
+	}
+
+	return activeSlots;
 }
 
 bool RenderGraph::AddEdgeDedup(
@@ -316,7 +562,7 @@ void RenderGraph::CommitPassToBatch(
 	std::unordered_set<uint64_t>& scratchFallback,
 	std::vector<ResourceTransition>& scratchTransitions)
 {
-	const size_t passQueueSlot = node.queueSlot;
+	const size_t passQueueSlot = node.assignedQueueSlot.value_or(node.queueSlot);
 	const size_t queueCount = currentBatch.QueueCount();
 	const size_t gfxSlot = QueueIndex(QueueKind::Graphics);
 	scratchTransitioned.clear();
@@ -582,7 +828,13 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 	std::vector<AnyPassAndResources>& passes,
 	std::vector<Node>& nodes)
 {
-	std::vector<int32_t> rejectedInBatch(nodes.size(), -1);
+	struct QueueSchedulingDiagnostics {
+		uint32_t candidateChecks = 0;
+		uint32_t assignedPasses = 0;
+		uint32_t rejectedInactive = 0;
+		uint32_t rejectedCrossQueuePred = 0;
+		uint32_t rejectedBatchNeeded = 0;
+	};
 
 	// Working indegrees
 	std::vector<uint32_t> indeg(nodes.size());
@@ -623,6 +875,19 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 	std::unordered_set<uint64_t> scratchTransitioned;
 	std::unordered_set<uint64_t> scratchFallback;
 	std::vector<ResourceTransition> scratchTransitions;
+	const bool enableQueueSchedulingLogging = rg.m_getQueueSchedulingEnableLogging ? rg.m_getQueueSchedulingEnableLogging() : false;
+	std::vector<QueueSchedulingDiagnostics> queueDiagnostics(queueCount);
+	auto queueKindName = [&rg](size_t queueIndex) -> const char* {
+		if (queueIndex >= rg.m_queueRegistry.SlotCount()) {
+			return "unknown";
+		}
+		switch (rg.m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(static_cast<uint8_t>(queueIndex)))) {
+		case QueueKind::Graphics: return "graphics";
+		case QueueKind::Compute:  return "compute";
+		case QueueKind::Copy:     return "copy";
+		default:                 return "unknown";
+		}
+	};
 
 	auto closeBatch = [&]() {
 		// clear inBatch marks for members
@@ -642,6 +907,7 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 	while (remaining > 0) {
 		// Collect "fits" and pick best by heuristic
 		int bestIdxInReady = -1;
+		size_t bestQueueSlot = 0;
 		double bestScore = -1e300;
 
 		std::vector<uint8_t> batchHasQueue(queueCount);
@@ -665,60 +931,76 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 		for (int ri = 0; ri < (int)ready.size(); ++ri) {
 			size_t ni = ready[ri];
 
-			if (rejectedInBatch[ni] == static_cast<int32_t>(currentBatchIndex)) {
-				continue;
-			}
-
 			auto& n = nodes[ni];
 
 			PassView view = GetPassView(passes[n.passIndex]);
-			const size_t nodeQueueSlot = n.queueSlot;
 
-			// Extra constraint: disallow cross-queue deps within same batch.
-			if (batchHasQueue[nodeQueueSlot]) {
-				bool hasCrossQueuePredInBatch = false;
-				for (size_t pred : n.in) {
-					if (inBatch[pred] && nodes[pred].queueSlot != nodeQueueSlot) {
-						hasCrossQueuePredInBatch = true;
-						break;
+			for (size_t nodeQueueSlot : n.compatibleQueueSlots) {
+				if (nodeQueueSlot >= queueCount) {
+					continue;
+				}
+				queueDiagnostics[nodeQueueSlot].candidateChecks++;
+				if (nodeQueueSlot >= rg.m_activeQueueSlotsThisFrame.size() || !rg.m_activeQueueSlotsThisFrame[nodeQueueSlot]) {
+					queueDiagnostics[nodeQueueSlot].rejectedInactive++;
+					continue;
+				}
+
+				// Extra constraint: disallow cross-queue deps within same batch.
+				if (batchHasQueue[nodeQueueSlot]) {
+					bool hasCrossQueuePredInBatch = false;
+					for (size_t pred : n.in) {
+						if (!inBatch[pred]) {
+							continue;
+						}
+						const size_t predQueueSlot = nodes[pred].assignedQueueSlot.value_or(nodes[pred].queueSlot);
+						if (predQueueSlot != nodeQueueSlot) {
+							hasCrossQueuePredInBatch = true;
+							break;
+						}
+					}
+					if (hasCrossQueuePredInBatch) {
+						queueDiagnostics[nodeQueueSlot].rejectedCrossQueuePred++;
+						continue;
 					}
 				}
-				if (hasCrossQueuePredInBatch) continue;
-			}
 
-			if (rg.IsNewBatchNeeded(
-				*view.reqs,
-				*view.internalTransitions,
-				currentBatch.passBatchTrackers,
-				currentBatch.internallyTransitionedResources,
-				currentBatch.allResources,
-				otherQueueUAVsByQueue[nodeQueueSlot]))
-			{
-				rejectedInBatch[ni] = static_cast<int32_t>(currentBatchIndex);
-				continue;
-			}
+				if (rg.IsNewBatchNeeded(
+					*view.reqs,
+					*view.internalTransitions,
+					currentBatch.passBatchTrackers,
+					currentBatch.internallyTransitionedResources,
+					currentBatch.allResources,
+					otherQueueUAVsByQueue[nodeQueueSlot]))
+				{
+					queueDiagnostics[nodeQueueSlot].rejectedBatchNeeded++;
+					continue;
+				}
 
-			// Score: pack by reusing resources already in batch, and encourage overlap
-			int reuse = 0, fresh = 0;
-			for (uint64_t rid : n.touchedIDs) {
-				if (std::binary_search(currentBatch.allResources.begin(), currentBatch.allResources.end(), rid)) ++reuse;
-				else ++fresh;
-			}
+				// Score: pack by reusing resources already in batch, and encourage overlap
+				int reuse = 0, fresh = 0;
+				for (uint64_t rid : n.touchedIDs) {
+					if (std::binary_search(currentBatch.allResources.begin(), currentBatch.allResources.end(), rid)) ++reuse;
+					else ++fresh;
+				}
 
-			double score = 3.0 * reuse - 1.0 * fresh;
+				double score = 3.0 * reuse - 1.0 * fresh;
 
-			// Encourage having both queues represented (more overlap opportunity)
-			if (!batchHasQueue[nodeQueueSlot]) score += 2.0;
+				// Encourage having more queues represented when legal.
+				if (!batchHasQueue[nodeQueueSlot]) score += 2.0;
+				// Encourage spreading compatible work across less-populated queues.
+				score -= 0.25 * double(currentBatch.Passes(nodeQueueSlot).size());
 
-			// Tie-break
-			score += 0.05 * double(n.criticality);
+				// Tie-break
+				score += 0.05 * double(n.criticality);
 
-			// Deterministic tie-break: prefer earlier original order slightly
-			score += 1e-6 * double(nodes.size() - n.originalOrder);
+				// Deterministic tie-break: prefer earlier original order slightly
+				score += 1e-6 * double(nodes.size() - n.originalOrder);
 
-			if (score > bestScore) {
-				bestScore = score;
-				bestIdxInReady = ri;
+				if (score > bestScore) {
+					bestScore = score;
+					bestIdxInReady = ri;
+					bestQueueSlot = nodeQueueSlot;
+				}
 			}
 		}
 
@@ -737,6 +1019,20 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 				// If this happens, IsNewBatchNeeded is likely too strict on empty batch.
 				size_t ni = ready.front();
 				auto& n = nodes[ni];
+				size_t fallbackSlot = n.queueSlot;
+				for (size_t compatibleSlot : n.compatibleQueueSlots) {
+					if (compatibleSlot < rg.m_activeQueueSlotsThisFrame.size() && rg.m_activeQueueSlotsThisFrame[compatibleSlot]) {
+						fallbackSlot = compatibleSlot;
+						break;
+					}
+				}
+				n.assignedQueueSlot = fallbackSlot;
+				if (n.passIndex < rg.m_assignedQueueSlotsByFramePass.size()) {
+					rg.m_assignedQueueSlotsByFramePass[n.passIndex] = *n.assignedQueueSlot;
+				}
+				if (fallbackSlot < queueDiagnostics.size()) {
+					queueDiagnostics[fallbackSlot].assignedPasses++;
+				}
 				CommitPassToBatch(
 					rg, passes[n.passIndex], n,
 					currentBatchIndex, currentBatch,
@@ -769,6 +1065,13 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 		// Commit chosen pass
 		size_t chosenNodeIndex = ready[bestIdxInReady];
 		auto& chosen = nodes[chosenNodeIndex];
+		chosen.assignedQueueSlot = bestQueueSlot;
+		if (chosen.passIndex < rg.m_assignedQueueSlotsByFramePass.size()) {
+			rg.m_assignedQueueSlotsByFramePass[chosen.passIndex] = bestQueueSlot;
+		}
+		if (bestQueueSlot < queueDiagnostics.size()) {
+			queueDiagnostics[bestQueueSlot].assignedPasses++;
+		}
 
 		CommitPassToBatch(
 			rg, passes[chosen.passIndex], chosen,
@@ -808,6 +1111,22 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 	}
 	if (hasAnyQueuedPasses) {
 		rg.batches.push_back(std::move(currentBatch));
+	}
+
+	if (enableQueueSchedulingLogging) {
+		for (size_t queueIndex = 0; queueIndex < queueDiagnostics.size(); ++queueIndex) {
+			const auto& d = queueDiagnostics[queueIndex];
+			spdlog::info(
+				"RG queue scheduler [slot={} kind={} active={}]: candidateChecks={} assignedPasses={} rejectedInactive={} rejectedCrossQueuePred={} rejectedBatchNeeded={}",
+				queueIndex,
+				queueKindName(queueIndex),
+				(queueIndex < rg.m_activeQueueSlotsThisFrame.size() ? int(rg.m_activeQueueSlotsThisFrame[queueIndex]) : 0),
+				d.candidateChecks,
+				d.assignedPasses,
+				d.rejectedInactive,
+				d.rejectedCrossQueuePred,
+				d.rejectedBatchNeeded);
+		}
 	}
 
 	// Coalesce redundant waits: for each (dstQueue, srcQueue) pair in a batch,
@@ -1225,6 +1544,8 @@ void RenderGraph::ShutdownOwnedState() {
 	compileTrackers.clear();
 	m_masterPassList.clear();
 	m_framePasses.clear();
+	m_assignedQueueSlotsByFramePass.clear();
+	m_activeQueueSlotsThisFrame.clear();
 	renderPassesByName.clear();
 	computePassesByName.clear();
 	resourcesByID.clear();
@@ -1545,6 +1866,8 @@ void RenderGraph::ResetForRebuild()
 	// Clear any existing compile state
 	m_masterPassList.clear();
 	m_framePasses.clear();
+	m_assignedQueueSlotsByFramePass.clear();
+	m_activeQueueSlotsThisFrame.clear();
 	batches.clear();
 	m_executionSchedule.batches.clear();
 	trackers.clear();
@@ -1610,6 +1933,8 @@ void RenderGraph::ResetForFrame() {
 	m_transientFrameResourcesByName.clear();
 	m_aliasingSubsystem.ResetPerFrameState(*this);
 	compileTrackers.clear();
+	m_assignedQueueSlotsByFramePass.clear();
+	m_activeQueueSlotsThisFrame.clear();
 	for (auto& producerMap : m_compiledLastProducerBatchByResourceByQueue) {
 		producerMap.clear();
 	}
@@ -2702,6 +3027,22 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		throw std::runtime_error("Render graph contains a dependency cycle");
 	}
 
+	m_activeQueueSlotsThisFrame = PlanActiveQueueSlots(*this, m_framePasses, nodes);
+	m_assignedQueueSlotsByFramePass.resize(m_framePasses.size());
+	for (auto& node : nodes) {
+		size_t defaultSlot = node.queueSlot;
+		for (size_t compatibleSlot : node.compatibleQueueSlots) {
+			if (compatibleSlot < m_activeQueueSlotsThisFrame.size() && m_activeQueueSlotsThisFrame[compatibleSlot]) {
+				defaultSlot = compatibleSlot;
+				break;
+			}
+		}
+		node.assignedQueueSlot = defaultSlot;
+		if (node.passIndex < m_assignedQueueSlotsByFramePass.size()) {
+			m_assignedQueueSlotsByFramePass[node.passIndex] = defaultSlot;
+		}
+	}
+
 	std::vector<rg::alias::AliasSchedulingNode> aliasNodes;
 	aliasNodes.reserve(nodes.size());
 	for (const auto& node : nodes) {
@@ -2796,12 +3137,16 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	};
 
 	for (const auto& pr : m_framePasses) {
+		const size_t passIndex = static_cast<size_t>(&pr - m_framePasses.data());
 		std::visit([&](auto const& passAndResources) {
 			using T = std::decay_t<decltype(passAndResources)>;
 			if constexpr (!std::is_same_v<T, std::monostate>) {
-				const size_t passQueueSlot = passAndResources.resources.queueSlotOverride
+				const size_t fallbackQueueSlot = passAndResources.resources.queueSlotOverride
 					? static_cast<size_t>(static_cast<uint8_t>(*passAndResources.resources.queueSlotOverride))
 					: QueueIndex(ResolveQueueKind(passAndResources.resources.queueSelection));
+				const size_t passQueueSlot = passIndex < m_assignedQueueSlotsByFramePass.size()
+					? m_assignedQueueSlotsByFramePass[passIndex]
+					: fallbackQueueSlot;
 				for (auto const& req : passAndResources.resources.frameResourceRequirements) {
 					accumulateCrossFrameWaitForHandle(passQueueSlot, req.resourceHandleAndRange.resource);
 				}
@@ -3454,6 +3799,48 @@ void RenderGraph::MaterializeUnmaterializedResources(const std::unordered_set<ui
 	}
 }
 
+void RenderGraph::ResizeQueueParallelVectors() {
+	const size_t qc = m_queueRegistry.SlotCount();
+	m_compiledLastProducerBatchByResourceByQueue.resize(qc);
+	m_hasPendingFrameStartQueueWait.assign(qc, std::vector<uint8_t>(qc, 0));
+	m_pendingFrameStartQueueWaitFenceValue.assign(qc, std::vector<UINT64>(qc, 0));
+}
+
+void RenderGraph::EnsureMinimumAutomaticSchedulingQueues() {
+	auto autoAssignableCountForKind = [this](QueueKind kind) {
+		uint8_t count = 0;
+		for (size_t i = 0; i < m_queueRegistry.SlotCount(); ++i) {
+			const auto slotIndex = static_cast<QueueSlotIndex>(static_cast<uint8_t>(i));
+			if (m_queueRegistry.GetKind(slotIndex) == kind && m_queueRegistry.IsAutoAssignable(slotIndex)) {
+				++count;
+			}
+		}
+		return count;
+	};
+
+	auto queueNamePrefix = [](QueueKind kind) -> const char* {
+		switch (kind) {
+		case QueueKind::Graphics: return "AutoGraphics";
+		case QueueKind::Compute: return "AutoCompute";
+		case QueueKind::Copy: return "AutoCopy";
+		default: return "AutoQueue";
+		}
+	};
+
+	for (size_t kindIndex = 0; kindIndex < static_cast<size_t>(QueueKind::Count); ++kindIndex) {
+		const QueueKind kind = static_cast<QueueKind>(kindIndex);
+		const uint8_t minimumQueueCount = m_minAutomaticSchedulingQueuesByKind[kindIndex];
+		uint8_t currentAutoQueueCount = autoAssignableCountForKind(kind);
+		while (currentAutoQueueCount < minimumQueueCount) {
+			std::string queueName = std::string(queueNamePrefix(kind)) + std::to_string(currentAutoQueueCount);
+			CreateQueue(kind, queueName.c_str(), QueueAutoAssignmentPolicy::AllowAutomaticScheduling);
+			++currentAutoQueueCount;
+		}
+	}
+
+	ResizeQueueParallelVectors();
+}
+
 void RenderGraph::Setup() {
 	DeletionManager::GetInstance().Initialize();
 
@@ -3487,17 +3874,12 @@ void RenderGraph::Setup() {
 		m_queueRegistry.Register({ QueueKind::Compute, 0 }, compQ, device);
 		m_queueRegistry.Register({ QueueKind::Copy,    0 }, copyQ, device);
 	}
+	EnsureMinimumAutomaticSchedulingQueues();
 
 	// Size queue-parallel member vectors to match the registry.
 	// Done after both primary queue registration and extension initialization
 	// since extensions may create additional queues.
-	auto resizeQueueParallelVectors = [this]() {
-		const size_t qc = m_queueRegistry.SlotCount();
-		m_compiledLastProducerBatchByResourceByQueue.resize(qc);
-		m_hasPendingFrameStartQueueWait.assign(qc, std::vector<uint8_t>(qc, 0));
-		m_pendingFrameStartQueueWaitFenceValue.assign(qc, std::vector<UINT64>(qc, 0));
-	};
-	resizeQueueParallelVectors();
+	ResizeQueueParallelVectors();
 
 	// Notify extensions that the render graph is set up.
 	// Extensions may create additional queues or allocate resources here.
@@ -3506,7 +3888,7 @@ void RenderGraph::Setup() {
 	}
 
 	// Re-size in case extensions added queues.
-	resizeQueueParallelVectors();
+	ResizeQueueParallelVectors();
 
 	m_getUseAsyncCompute = [this]() {
 		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetUseAsyncCompute() : false;
@@ -3531,6 +3913,24 @@ void RenderGraph::Setup() {
 	};
 	m_getAutoAliasLogExclusionReasons = [this]() {
 		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetAutoAliasLogExclusionReasons() : false;
+	};
+	m_getQueueSchedulingEnableLogging = [this]() {
+		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetQueueSchedulingEnableLogging() : false;
+	};
+	m_getQueueSchedulingWidthScale = [this]() {
+		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetQueueSchedulingWidthScale() : 1.0f;
+	};
+	m_getQueueSchedulingPenaltyBias = [this]() {
+		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetQueueSchedulingPenaltyBias() : 0.0f;
+	};
+	m_getQueueSchedulingMinPenalty = [this]() {
+		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetQueueSchedulingMinPenalty() : 1.0f;
+	};
+	m_getQueueSchedulingResourcePressureWeight = [this]() {
+		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetQueueSchedulingResourcePressureWeight() : 1.0f;
+	};
+	m_getQueueSchedulingUavPressureWeight = [this]() {
+		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetQueueSchedulingUavPressureWeight() : 0.5f;
 	};
 	m_getAutoAliasPoolRetireIdleFrames = [this]() {
 		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetAutoAliasPoolRetireIdleFrames() : 120u;
@@ -5140,7 +5540,7 @@ CopyPassBuilder& RenderGraph::BuildCopyPass(std::string const& name) {
 //	m_passBuildersByName[builder.passName] = std::move(builder);
 //}
 
-QueueSlotIndex RenderGraph::CreateQueue(QueueKind kind, const char* name) {
+QueueSlotIndex RenderGraph::CreateQueue(QueueKind kind, const char* name, QueueAutoAssignmentPolicy autoAssignmentPolicy) {
 	auto device = DeviceManager::GetInstance().GetDevice();
 	rhi::Queue queue;
 	auto result = device.CreateQueue(static_cast<rhi::QueueKind>(kind), name ? name : "UserQueue", queue);
@@ -5153,5 +5553,15 @@ QueueSlotIndex RenderGraph::CreateQueue(QueueKind kind, const char* name) {
 		if (m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(static_cast<uint8_t>(i))) == kind)
 			++instance;
 	}
-	return m_queueRegistry.Register({ kind, instance }, queue, device);
+	return m_queueRegistry.Register({ kind, instance }, queue, device, autoAssignmentPolicy);
+}
+
+void RenderGraph::SetMinimumAutomaticSchedulingQueues(QueueKind kind, uint8_t count) {
+	const size_t kindIndex = static_cast<size_t>(kind);
+	const uint8_t clampedCount = kind == QueueKind::Graphics ? (std::max)(uint8_t(1), count) : (std::max)(uint8_t(1), count);
+	m_minAutomaticSchedulingQueuesByKind[kindIndex] = clampedCount;
+
+	if (m_queueRegistry.SlotCount() > 0) {
+		EnsureMinimumAutomaticSchedulingQueues();
+	}
 }

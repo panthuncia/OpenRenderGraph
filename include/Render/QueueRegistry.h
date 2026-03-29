@@ -8,6 +8,11 @@
 
 class CommandListPool;
 
+enum class QueueAutoAssignmentPolicy : uint8_t {
+	AllowAutomaticScheduling = 0,
+	ManualOnly = 1,
+};
+
 /// Identifies a logical queue by its kind and instance number.
 struct QueueSlot {
 	QueueKind kind{};
@@ -30,10 +35,12 @@ public:
 	/// Registers a queue slot backed by the given rhi::Queue.
 	/// Creates a CommandListPool and Timeline for the slot.
 	/// Returns the slot index assigned.
-	QueueSlotIndex Register(QueueSlot slot, rhi::Queue queue, rhi::Device& device);
+	QueueSlotIndex Register(QueueSlot slot, rhi::Queue queue, rhi::Device& device,
+		QueueAutoAssignmentPolicy autoAssignmentPolicy = QueueAutoAssignmentPolicy::AllowAutomaticScheduling);
 
 	/// Register a queue slot with an externally-supplied timeline and pool.
-	QueueSlotIndex Register(QueueSlot slot, rhi::Queue queue, rhi::TimelinePtr fence, std::unique_ptr<CommandListPool> pool);
+	QueueSlotIndex Register(QueueSlot slot, rhi::Queue queue, rhi::TimelinePtr fence, std::unique_ptr<CommandListPool> pool,
+		QueueAutoAssignmentPolicy autoAssignmentPolicy = QueueAutoAssignmentPolicy::AllowAutomaticScheduling);
 
 	/// Look up slot index by kind + instance. Returns empty optional if not found.
 	QueueSlotIndex FindSlot(QueueSlot slot) const;
@@ -50,6 +57,8 @@ public:
 	uint8_t        GetInstance(QueueSlotIndex i)  const noexcept { return m_slots[ToUnderlying(i)].instance; }
 	QueueSlot      GetSlot(QueueSlotIndex i)      const noexcept { return { m_slots[ToUnderlying(i)].kind, m_slots[ToUnderlying(i)].instance }; }
 	rhi::Queue     GetQueue(QueueSlotIndex i)     const noexcept { return m_slots[ToUnderlying(i)].queue; }
+	QueueAutoAssignmentPolicy GetAutoAssignmentPolicy(QueueSlotIndex i) const noexcept { return m_slots[ToUnderlying(i)].autoAssignmentPolicy; }
+	bool IsAutoAssignable(QueueSlotIndex i) const noexcept { return GetAutoAssignmentPolicy(i) == QueueAutoAssignmentPolicy::AllowAutomaticScheduling; }
 	rhi::Timeline& GetFence(QueueSlotIndex i)           noexcept { return m_slots[ToUnderlying(i)].fence.Get(); }
 	const rhi::Timeline& GetFence(QueueSlotIndex i) const noexcept { return m_slots[ToUnderlying(i)].fence.Get(); }
 	rhi::TimelinePtr& GetFencePtr(QueueSlotIndex i)     noexcept { return m_slots[ToUnderlying(i)].fence; }
@@ -79,6 +88,7 @@ private:
 		rhi::Queue queue{};
 		rhi::TimelinePtr fence;
 		std::unique_ptr<CommandListPool> pool;
+		QueueAutoAssignmentPolicy autoAssignmentPolicy = QueueAutoAssignmentPolicy::AllowAutomaticScheduling;
 		uint64_t fenceValue = 1;
 	};
 

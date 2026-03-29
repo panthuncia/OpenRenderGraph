@@ -1,16 +1,16 @@
 #include "Render/QueueRegistry.h"
 #include "Render/CommandListPool.h"
 
-QueueSlotIndex QueueRegistry::Register(QueueSlot slot, rhi::Queue queue, rhi::Device& device) {
+QueueSlotIndex QueueRegistry::Register(QueueSlot slot, rhi::Queue queue, rhi::Device& device, QueueAutoAssignmentPolicy autoAssignmentPolicy) {
 	auto pool = std::make_unique<CommandListPool>(device, static_cast<rhi::QueueKind>(slot.kind));
 	rhi::TimelinePtr fence;
 	device.CreateTimeline(fence);
-	return Register(slot, queue, std::move(fence), std::move(pool));
+	return Register(slot, queue, std::move(fence), std::move(pool), autoAssignmentPolicy);
 }
 
-QueueSlotIndex QueueRegistry::Register(QueueSlot slot, rhi::Queue queue, rhi::TimelinePtr fence, std::unique_ptr<CommandListPool> pool) {
+QueueSlotIndex QueueRegistry::Register(QueueSlot slot, rhi::Queue queue, rhi::TimelinePtr fence, std::unique_ptr<CommandListPool> pool, QueueAutoAssignmentPolicy autoAssignmentPolicy) {
 	auto idx = static_cast<QueueSlotIndex>(static_cast<uint8_t>(m_slots.size()));
-	m_slots.push_back({ slot.kind, slot.instance, queue, std::move(fence), std::move(pool), 1 });
+	m_slots.push_back({ slot.kind, slot.instance, queue, std::move(fence), std::move(pool), autoAssignmentPolicy, 1 });
 	return idx;
 }
 

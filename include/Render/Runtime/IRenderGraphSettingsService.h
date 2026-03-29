@@ -14,6 +14,12 @@ public:
     virtual uint8_t GetAutoAliasPackingStrategy() const = 0;
     virtual bool GetAutoAliasEnableLogging() const = 0;
     virtual bool GetAutoAliasLogExclusionReasons() const = 0;
+    virtual bool GetQueueSchedulingEnableLogging() const = 0;
+    virtual float GetQueueSchedulingWidthScale() const = 0;
+    virtual float GetQueueSchedulingPenaltyBias() const = 0;
+    virtual float GetQueueSchedulingMinPenalty() const = 0;
+    virtual float GetQueueSchedulingResourcePressureWeight() const = 0;
+    virtual float GetQueueSchedulingUavPressureWeight() const = 0;
     virtual uint32_t GetAutoAliasPoolRetireIdleFrames() const = 0;
     virtual float GetAutoAliasPoolGrowthHeadroom() const = 0;
     virtual bool GetHeavyDebug() const = 0;

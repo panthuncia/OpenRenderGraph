@@ -492,7 +492,14 @@ public:
 
 	/// Create a new queue of the given kind and register it with the render graph.
 	/// Must be called after Setup() and before the first Execute().
-	QueueSlotIndex CreateQueue(QueueKind kind, const char* name);
+	QueueSlotIndex CreateQueue(
+		QueueKind kind,
+		const char* name,
+		QueueAutoAssignmentPolicy autoAssignmentPolicy = QueueAutoAssignmentPolicy::AllowAutomaticScheduling);
+	void SetMinimumAutomaticSchedulingQueues(QueueKind kind, uint8_t count);
+	uint8_t GetMinimumAutomaticSchedulingQueues(QueueKind kind) const noexcept {
+		return m_minAutomaticSchedulingQueuesByKind[static_cast<size_t>(kind)];
+	}
 
 	/// Access the queue registry (read-only).
 	const QueueRegistry& GetQueueRegistry() const noexcept { return m_queueRegistry; }
@@ -546,7 +553,9 @@ private:
 
 	struct Node {
 		size_t   passIndex = 0;
-		size_t   queueSlot = 0; // Index into QueueRegistry slots
+		size_t   queueSlot = 0; // Default/preferred queue slot for compatibility-preserving fallback
+		std::vector<size_t> compatibleQueueSlots; // All legal queue slots for this pass
+		std::optional<size_t> assignedQueueSlot; // Final slot chosen during frame scheduling
 		uint32_t originalOrder = 0;
 
 		// Expanded IDs (aliases + group/child fixpoint)
@@ -576,6 +585,9 @@ private:
 
 	std::vector<AnyPassAndResources> m_masterPassList;
 	std::vector<AnyPassAndResources> m_framePasses;
+	std::vector<size_t> m_assignedQueueSlotsByFramePass;
+	std::vector<uint8_t> m_activeQueueSlotsThisFrame;
+	std::array<uint8_t, static_cast<size_t>(QueueKind::Count)> m_minAutomaticSchedulingQueuesByKind = { 1, 1, 1 };
 	std::unordered_map<std::string, std::shared_ptr<RenderPass>> renderPassesByName;
 	std::unordered_map<std::string, std::shared_ptr<ComputePass>> computePassesByName;
 	std::unordered_map<std::string, std::shared_ptr<Resource>> resourcesByName;
@@ -629,6 +641,8 @@ private:
 	ExecutionSchedule m_executionSchedule;
 
 	void BuildExecutionSchedule();
+	void ResizeQueueParallelVectors();
+	void EnsureMinimumAutomaticSchedulingQueues();
 
 	rg::imm::ImmediateDispatch m_immediateDispatch{};
 
@@ -836,6 +850,7 @@ private:
 	static bool BuildDependencyGraph(std::vector<Node>& nodes);
 	static bool BuildDependencyGraph(std::vector<Node>& nodes, std::span<const std::pair<size_t, size_t>> explicitEdges);
 	static std::vector<Node> BuildNodes(RenderGraph& rg, std::vector<AnyPassAndResources>& passes);
+	static std::vector<uint8_t> PlanActiveQueueSlots(RenderGraph& rg, const std::vector<AnyPassAndResources>& passes, const std::vector<Node>& nodes);
 	static bool AddEdgeDedup(
 		size_t from, size_t to,
 		std::vector<Node>& nodes,
@@ -872,6 +887,12 @@ private:
 	std::function<AutoAliasPackingStrategy()> m_getAutoAliasPackingStrategy;
 	std::function<bool()> m_getAutoAliasEnableLogging;
 	std::function<bool()> m_getAutoAliasLogExclusionReasons;
+	std::function<bool()> m_getQueueSchedulingEnableLogging;
+	std::function<float()> m_getQueueSchedulingWidthScale;
+	std::function<float()> m_getQueueSchedulingPenaltyBias;
+	std::function<float()> m_getQueueSchedulingMinPenalty;
+	std::function<float()> m_getQueueSchedulingResourcePressureWeight;
+	std::function<float()> m_getQueueSchedulingUavPressureWeight;
 	std::function<uint32_t()> m_getAutoAliasPoolRetireIdleFrames;
 	std::function<float()> m_getAutoAliasPoolGrowthHeadroom;
 	rg::alias::RenderGraphAliasingSubsystem m_aliasingSubsystem;
