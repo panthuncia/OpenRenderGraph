@@ -486,9 +486,23 @@ public:
 		return derivedPtr;
 	}
 
-	ComputePassBuilder& BuildComputePass(std::string const& name);
-	RenderPassBuilder& BuildRenderPass(std::string const& name);
-	CopyPassBuilder& BuildCopyPass(std::string const& name);
+	template<typename PassT, rg::PassInputs InputsT, typename... StableCtorArgs>
+	ComputePassBuilder& BuildComputePass(std::string const& name, InputsT&& inputs, StableCtorArgs&&... ctorArgs);
+
+	template<typename PassT, typename... StableCtorArgs>
+	ComputePassBuilder& BuildComputePass(std::string const& name, StableCtorArgs&&... ctorArgs);
+
+	template<typename PassT, rg::PassInputs InputsT, typename... StableCtorArgs>
+	RenderPassBuilder& BuildRenderPass(std::string const& name, InputsT&& inputs, StableCtorArgs&&... ctorArgs);
+
+	template<typename PassT, typename... StableCtorArgs>
+	RenderPassBuilder& BuildRenderPass(std::string const& name, StableCtorArgs&&... ctorArgs);
+
+	template<typename PassT, rg::PassInputs InputsT, typename... StableCtorArgs>
+	CopyPassBuilder& BuildCopyPass(std::string const& name, InputsT&& inputs, StableCtorArgs&&... ctorArgs);
+
+	template<typename PassT, typename... StableCtorArgs>
+	CopyPassBuilder& BuildCopyPass(std::string const& name, StableCtorArgs&&... ctorArgs);
 
 	/// Create a new queue of the given kind and register it with the render graph.
 	/// Must be called after Setup() and before the first Execute().
@@ -897,8 +911,14 @@ private:
 	std::function<float()> m_getAutoAliasPoolGrowthHeadroom;
 	rg::alias::RenderGraphAliasingSubsystem m_aliasingSubsystem;
 
+	ComputePassBuilder& GetOrCreateComputePassBuilder(std::string const& name);
+	RenderPassBuilder& GetOrCreateRenderPassBuilder(std::string const& name);
+	CopyPassBuilder& GetOrCreateCopyPassBuilder(std::string const& name);
+
 	friend class RenderPassBuilder;
 	friend class ComputePassBuilder;
 	friend class CopyPassBuilder;
 	friend class rg::alias::RenderGraphAliasingSubsystem;
 };
+
+#include "Render/PassBuilders.h"

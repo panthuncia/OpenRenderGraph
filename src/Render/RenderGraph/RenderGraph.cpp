@@ -5512,7 +5512,7 @@ ResourceRegistry::RegistryHandle RenderGraph::RequestResourceHandle(Resource* co
 }
 
 
-ComputePassBuilder& RenderGraph::BuildComputePass(std::string const& name) {
+ComputePassBuilder& RenderGraph::GetOrCreateComputePassBuilder(std::string const& name) {
 	if (auto it = m_passBuildersByName.find(name); it != m_passBuildersByName.end()) {
 		if (m_passNamesSeenThisReset.contains(name)) {
 			throw std::runtime_error("Pass names must be unique.");
@@ -5529,7 +5529,7 @@ ComputePassBuilder& RenderGraph::BuildComputePass(std::string const& name) {
 	m_passBuildersByName.emplace(name, std::move(ptr));
 	return static_cast<ComputePassBuilder&>(*(m_passBuildersByName[name]));
 }
-RenderPassBuilder& RenderGraph::BuildRenderPass(std::string const& name) {
+RenderPassBuilder& RenderGraph::GetOrCreateRenderPassBuilder(std::string const& name) {
 	if (auto it = m_passBuildersByName.find(name); it != m_passBuildersByName.end()) {
 		if (m_passNamesSeenThisReset.contains(name)) {
 			throw std::runtime_error("Pass names must be unique.");
@@ -5547,7 +5547,7 @@ RenderPassBuilder& RenderGraph::BuildRenderPass(std::string const& name) {
 	return static_cast<RenderPassBuilder&>(*(m_passBuildersByName[name]));
 }
 
-CopyPassBuilder& RenderGraph::BuildCopyPass(std::string const& name) {
+CopyPassBuilder& RenderGraph::GetOrCreateCopyPassBuilder(std::string const& name) {
 	if (auto it = m_passBuildersByName.find(name); it != m_passBuildersByName.end()) {
 		if (m_passNamesSeenThisReset.contains(name)) {
 			throw std::runtime_error("Pass names must be unique.");

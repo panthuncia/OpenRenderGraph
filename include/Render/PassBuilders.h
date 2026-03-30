@@ -935,50 +935,6 @@ public:
         return std::move(*this);
     }
 
-	// LVALUE
-    template<DerivedRenderPass PassT, rg::PassInputs InputsT, typename... StableCtorArgs>
-    void Build(InputsT&& inputs, StableCtorArgs&&... ctorArgs)&
-    {
-        if (!built_)
-        {
-            built_ = true;
-            pass = detail::MakePass<PassT>(
-                std::forward<InputsT>(inputs),
-                std::forward<StableCtorArgs>(ctorArgs)...);
-        }
-
-		// rebuild just updates inputs
-        pass->SetInputs(std::forward<InputsT>(inputs));
-    }
-
-    // RVALUE
-    template<DerivedRenderPass PassT, rg::PassInputs InputsT, typename... StableCtorArgs>
-    void Build(InputsT&& inputs, StableCtorArgs&&... ctorArgs)&&
-    {
-        if (!built_)
-        {
-            built_ = true;
-            pass = detail::MakePass<PassT>(
-                std::forward<InputsT>(inputs),
-                std::forward<StableCtorArgs>(ctorArgs)...);
-        }
-
-        pass->SetInputs(std::forward<InputsT>(inputs));
-    }
-
-	// stable-args-only overloads, for convenience
-    template<DerivedRenderPass PassT, typename... StableCtorArgs>
-    void Build(StableCtorArgs&&... ctorArgs)&
-    {
-        Build<PassT>(rg::NoInputs{}, std::forward<StableCtorArgs>(ctorArgs)...);
-    }
-
-    template<DerivedRenderPass PassT, typename... StableCtorArgs>
-    void Build(StableCtorArgs&&... ctorArgs)&&
-    {
-        Build<PassT>(rg::NoInputs{}, std::forward<StableCtorArgs>(ctorArgs)...);
-    }
-
 
     auto const& DeclaredResourceIds() const { return _declaredIds; }
 
@@ -1012,6 +968,26 @@ private:
         params = std::move(state.params);
         _declaredIds = std::move(state.declaredIds);
         resolverSnapshots_ = std::move(state.resolverSnapshots);
+    }
+
+    template<DerivedRenderPass PassT, rg::PassInputs InputsT, typename... StableCtorArgs>
+    void Instantiate(InputsT&& inputs, StableCtorArgs&&... ctorArgs)
+    {
+        if (!built_)
+        {
+            built_ = true;
+            pass = detail::MakePass<PassT>(
+                std::forward<InputsT>(inputs),
+                std::forward<StableCtorArgs>(ctorArgs)...);
+        }
+
+        pass->SetInputs(std::forward<InputsT>(inputs));
+    }
+
+    template<DerivedRenderPass PassT, typename... StableCtorArgs>
+    void Instantiate(StableCtorArgs&&... ctorArgs)
+    {
+        Instantiate<PassT>(rg::NoInputs{}, std::forward<StableCtorArgs>(ctorArgs)...);
     }
 
     void Finalize() {
@@ -1455,50 +1431,6 @@ public:
 		return std::move(*this).WithResolver(r, [&](auto&& resolved) { addLegacyInterop(std::forward<decltype(resolved)>(resolved)); });
     }
 
-    // LVALUE
-    template<DerivedComputePass PassT, rg::PassInputs InputsT, typename... StableCtorArgs>
-    void Build(InputsT&& inputs, StableCtorArgs&&... ctorArgs)&
-    {
-        if (!built_)
-        {
-            built_ = true;
-            pass = detail::MakePass<PassT>(
-                std::forward<InputsT>(inputs),
-                std::forward<StableCtorArgs>(ctorArgs)...);
-        }
-
-        // rebuild just updates inputs
-        pass->SetInputs(std::forward<InputsT>(inputs));
-    }
-
-    // RVALUE
-    template<DerivedComputePass PassT, rg::PassInputs InputsT, typename... StableCtorArgs>
-    void Build(InputsT&& inputs, StableCtorArgs&&... ctorArgs)&&
-    {
-        if (!built_)
-        {
-            built_ = true;
-            pass = detail::MakePass<PassT>(
-                std::forward<InputsT>(inputs),
-                std::forward<StableCtorArgs>(ctorArgs)...);
-        }
-
-        pass->SetInputs(std::forward<InputsT>(inputs));
-    }
-
-    // Stable-args-only convenience
-    template<DerivedComputePass PassT, typename... StableCtorArgs>
-    void Build(StableCtorArgs&&... ctorArgs)&
-    {
-        Build<PassT>(rg::NoInputs{}, std::forward<StableCtorArgs>(ctorArgs)...);
-    }
-
-    template<DerivedComputePass PassT, typename... StableCtorArgs>
-    void Build(StableCtorArgs&&... ctorArgs)&&
-    {
-        Build<PassT>(rg::NoInputs{}, std::forward<StableCtorArgs>(ctorArgs)...);
-    }
-
     auto const& DeclaredResourceIds() const { return _declaredIds; }
 
 private:
@@ -1531,6 +1463,26 @@ private:
         params = std::move(state.params);
         _declaredIds = std::move(state.declaredIds);
         resolverSnapshots_ = std::move(state.resolverSnapshots);
+    }
+
+    template<DerivedComputePass PassT, rg::PassInputs InputsT, typename... StableCtorArgs>
+    void Instantiate(InputsT&& inputs, StableCtorArgs&&... ctorArgs)
+    {
+        if (!built_)
+        {
+            built_ = true;
+            pass = detail::MakePass<PassT>(
+                std::forward<InputsT>(inputs),
+                std::forward<StableCtorArgs>(ctorArgs)...);
+        }
+
+        pass->SetInputs(std::forward<InputsT>(inputs));
+    }
+
+    template<DerivedComputePass PassT, typename... StableCtorArgs>
+    void Instantiate(StableCtorArgs&&... ctorArgs)
+    {
+        Instantiate<PassT>(rg::NoInputs{}, std::forward<StableCtorArgs>(ctorArgs)...);
     }
 
     void Finalize() {
@@ -1816,46 +1768,6 @@ public:
         return std::move(*this).WithResolver(r, [&](auto&& resolved) { addCopySource(std::forward<decltype(resolved)>(resolved)); });
     }
 
-    template<DerivedCopyPass PassT, rg::PassInputs InputsT, typename... StableCtorArgs>
-    void Build(InputsT&& inputs, StableCtorArgs&&... ctorArgs)&
-    {
-        if (!built_)
-        {
-            built_ = true;
-            pass = detail::MakePass<PassT>(
-                std::forward<InputsT>(inputs),
-                std::forward<StableCtorArgs>(ctorArgs)...);
-        }
-
-        pass->SetInputs(std::forward<InputsT>(inputs));
-    }
-
-    template<DerivedCopyPass PassT, rg::PassInputs InputsT, typename... StableCtorArgs>
-    void Build(InputsT&& inputs, StableCtorArgs&&... ctorArgs)&&
-    {
-        if (!built_)
-        {
-            built_ = true;
-            pass = detail::MakePass<PassT>(
-                std::forward<InputsT>(inputs),
-                std::forward<StableCtorArgs>(ctorArgs)...);
-        }
-
-        pass->SetInputs(std::forward<InputsT>(inputs));
-    }
-
-    template<DerivedCopyPass PassT, typename... StableCtorArgs>
-    void Build(StableCtorArgs&&... ctorArgs)&
-    {
-        Build<PassT>(rg::NoInputs{}, std::forward<StableCtorArgs>(ctorArgs)...);
-    }
-
-    template<DerivedCopyPass PassT, typename... StableCtorArgs>
-    void Build(StableCtorArgs&&... ctorArgs)&&
-    {
-        Build<PassT>(rg::NoInputs{}, std::forward<StableCtorArgs>(ctorArgs)...);
-    }
-
     auto const& DeclaredResourceIds() const { return _declaredIds; }
 
 private:
@@ -1885,6 +1797,26 @@ private:
         params = std::move(state.params);
         _declaredIds = std::move(state.declaredIds);
         resolverSnapshots_ = std::move(state.resolverSnapshots);
+    }
+
+    template<DerivedCopyPass PassT, rg::PassInputs InputsT, typename... StableCtorArgs>
+    void Instantiate(InputsT&& inputs, StableCtorArgs&&... ctorArgs)
+    {
+        if (!built_)
+        {
+            built_ = true;
+            pass = detail::MakePass<PassT>(
+                std::forward<InputsT>(inputs),
+                std::forward<StableCtorArgs>(ctorArgs)...);
+        }
+
+        pass->SetInputs(std::forward<InputsT>(inputs));
+    }
+
+    template<DerivedCopyPass PassT, typename... StableCtorArgs>
+    void Instantiate(StableCtorArgs&&... ctorArgs)
+    {
+        Instantiate<PassT>(rg::NoInputs{}, std::forward<StableCtorArgs>(ctorArgs)...);
     }
 
     void Finalize() {
@@ -1983,3 +1915,51 @@ private:
 
     friend class RenderGraph;
 };
+
+template<typename PassT, rg::PassInputs InputsT, typename... StableCtorArgs>
+ComputePassBuilder& RenderGraph::BuildComputePass(std::string const& name, InputsT&& inputs, StableCtorArgs&&... ctorArgs) {
+    static_assert(DerivedComputePass<PassT>);
+    auto& builder = GetOrCreateComputePassBuilder(name);
+    builder.template Instantiate<PassT>(std::forward<InputsT>(inputs), std::forward<StableCtorArgs>(ctorArgs)...);
+    return builder;
+}
+
+template<typename PassT, typename... StableCtorArgs>
+ComputePassBuilder& RenderGraph::BuildComputePass(std::string const& name, StableCtorArgs&&... ctorArgs) {
+    static_assert(DerivedComputePass<PassT>);
+    auto& builder = GetOrCreateComputePassBuilder(name);
+    builder.template Instantiate<PassT>(std::forward<StableCtorArgs>(ctorArgs)...);
+    return builder;
+}
+
+template<typename PassT, rg::PassInputs InputsT, typename... StableCtorArgs>
+RenderPassBuilder& RenderGraph::BuildRenderPass(std::string const& name, InputsT&& inputs, StableCtorArgs&&... ctorArgs) {
+    static_assert(DerivedRenderPass<PassT>);
+    auto& builder = GetOrCreateRenderPassBuilder(name);
+    builder.template Instantiate<PassT>(std::forward<InputsT>(inputs), std::forward<StableCtorArgs>(ctorArgs)...);
+    return builder;
+}
+
+template<typename PassT, typename... StableCtorArgs>
+RenderPassBuilder& RenderGraph::BuildRenderPass(std::string const& name, StableCtorArgs&&... ctorArgs) {
+    static_assert(DerivedRenderPass<PassT>);
+    auto& builder = GetOrCreateRenderPassBuilder(name);
+    builder.template Instantiate<PassT>(std::forward<StableCtorArgs>(ctorArgs)...);
+    return builder;
+}
+
+template<typename PassT, rg::PassInputs InputsT, typename... StableCtorArgs>
+CopyPassBuilder& RenderGraph::BuildCopyPass(std::string const& name, InputsT&& inputs, StableCtorArgs&&... ctorArgs) {
+    static_assert(DerivedCopyPass<PassT>);
+    auto& builder = GetOrCreateCopyPassBuilder(name);
+    builder.template Instantiate<PassT>(std::forward<InputsT>(inputs), std::forward<StableCtorArgs>(ctorArgs)...);
+    return builder;
+}
+
+template<typename PassT, typename... StableCtorArgs>
+CopyPassBuilder& RenderGraph::BuildCopyPass(std::string const& name, StableCtorArgs&&... ctorArgs) {
+    static_assert(DerivedCopyPass<PassT>);
+    auto& builder = GetOrCreateCopyPassBuilder(name);
+    builder.template Instantiate<PassT>(std::forward<StableCtorArgs>(ctorArgs)...);
+    return builder;
+}

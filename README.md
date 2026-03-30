@@ -162,13 +162,11 @@ public:
 Use `BuildRenderPass(...)` / `BuildComputePass(...)` to add pass instances into the graph.
 
 ```cpp
-graph->BuildComputePass("ClearCounter")
-	.Build<ClearCounterPass>(ClearCounterInputs{
+graph->BuildComputePass<ClearCounterPass>("ClearCounter", ClearCounterInputs{
 		.counter = graph->RequestResourceHandle("Builtin::Counters::MyCounter")
 	});
 
-graph->BuildRenderPass("MainLightingPass")
-	.Build<DeferredShadingPass>();
+graph->BuildRenderPass<DeferredShadingPass>("MainLightingPass");
 ```
 
 ### 6) Optional: register graph extensions
