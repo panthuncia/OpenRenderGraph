@@ -190,12 +190,11 @@ public:
 	void GatherStructuralPasses(RenderGraph& rg, std::vector<RenderGraph::ExternalPassDesc>& out) override {
 		(void)rg;
 
-		RenderGraph::ExternalPassDesc desc{};
-		desc.type = RenderGraph::PassType::Compute;
-		desc.name = "MyExtension::SetupPass";
-		desc.where = RenderGraph::ExternalInsertPoint::Begin(/*priority*/10);
-		desc.pass = std::make_shared<MySetupComputePass>();
-		out.push_back(std::move(desc));
+		out.push_back(
+			RenderGraph::ExternalPassDesc::Compute(
+				"MyExtension::SetupPass",
+				std::make_shared<MySetupComputePass>())
+				.At(RenderGraph::ExternalInsertPoint::Begin(/*priority*/10)));
 	}
 
 	void GatherFramePasses(RenderGraph& rg, std::vector<RenderGraph::ExternalPassDesc>& out) override {

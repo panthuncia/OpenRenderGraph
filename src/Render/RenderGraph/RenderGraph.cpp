@@ -129,6 +129,145 @@ namespace {
 	}
 }
 
+
+RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
+	const ExternalPassDesc& d,
+	bool callSetup,
+	bool materializeReferencedResources)
+{
+	AnyPassAndResources any;
+	any.type = d.type;
+	any.name = d.name;
+
+	if (d.type == PassType::Render) {
+		auto rp = std::get<std::shared_ptr<RenderPass>>(d.pass);
+		RenderPassAndResources par;
+		par.pass = std::move(rp);
+		par.name = d.name;
+		{
+			RenderPassBuilder b(this, d.name);
+			b.pass = par.pass;
+			b.built_ = true;
+			b.params = {};
+			b.params.isGeometryPass = d.isGeometryPass;
+			b._declaredIds.clear();
+			par.pass->DeclareResourceUsages(&b);
+			par.resources.staticResourceRequirements = b.GatherResourceRequirements();
+			par.resources.frameResourceRequirements = par.resources.staticResourceRequirements;
+			par.resources.internalTransitions = b.params.internalTransitions;
+			par.resources.identifierSet = b.DeclaredResourceIds();
+			par.resources.autoDescriptorShaderResources = b.params.autoDescriptorShaderResources;
+			par.resources.autoDescriptorUnorderedAccessViews = b.params.autoDescriptorUnorderedAccessViews;
+			par.resources.isGeometryPass = b.params.isGeometryPass;
+			par.resources.preferredQueueKind = ResolveExternalPreferredQueueKind(d);
+			par.resources.pinnedQueueSlot = d.pinnedQueueSlot;
+			if (materializeReferencedResources) {
+				MaterializeReferencedResources(par.resources.staticResourceRequirements, par.resources.internalTransitions);
+			}
+		}
+
+		if (callSetup) {
+			par.pass->SetResourceRegistryView(
+				std::make_unique<ResourceRegistryView>(_registry, par.resources.identifierSet),
+				par.resources.autoDescriptorShaderResources,
+				par.resources.autoDescriptorUnorderedAccessViews);
+			par.pass->Setup();
+		}
+
+		any.pass = std::move(par);
+	}
+	else if (d.type == PassType::Compute) {
+		auto cp = std::get<std::shared_ptr<ComputePass>>(d.pass);
+		ComputePassAndResources par;
+		par.pass = std::move(cp);
+		par.name = d.name;
+		{
+			ComputePassBuilder b(this, d.name);
+			b.pass = par.pass;
+			b.built_ = true;
+			b.params = {};
+			b._declaredIds.clear();
+			par.pass->DeclareResourceUsages(&b);
+			par.resources.staticResourceRequirements = b.GatherResourceRequirements();
+			par.resources.frameResourceRequirements = par.resources.staticResourceRequirements;
+			par.resources.internalTransitions = b.params.internalTransitions;
+			par.resources.identifierSet = b.DeclaredResourceIds();
+			par.resources.autoDescriptorShaderResources = b.params.autoDescriptorShaderResources;
+			par.resources.autoDescriptorConstantBuffers = b.params.autoDescriptorConstantBuffers;
+			par.resources.autoDescriptorUnorderedAccessViews = b.params.autoDescriptorUnorderedAccessViews;
+			par.resources.preferredQueueKind = ResolveExternalPreferredQueueKind(d);
+			par.resources.pinnedQueueSlot = d.pinnedQueueSlot;
+			if (materializeReferencedResources) {
+				MaterializeReferencedResources(par.resources.staticResourceRequirements, par.resources.internalTransitions);
+			}
+		}
+
+		if (callSetup) {
+			par.pass->SetResourceRegistryView(
+				std::make_unique<ResourceRegistryView>(_registry, par.resources.identifierSet),
+				par.resources.autoDescriptorShaderResources,
+				par.resources.autoDescriptorConstantBuffers,
+				par.resources.autoDescriptorUnorderedAccessViews);
+			par.pass->Setup();
+		}
+
+		any.pass = std::move(par);
+	}
+	else if (d.type == PassType::Copy) {
+		auto cp = std::get<std::shared_ptr<CopyPass>>(d.pass);
+		CopyPassAndResources par;
+		par.pass = std::move(cp);
+		par.name = d.name;
+		{
+			CopyPassBuilder b(this, d.name);
+			b.pass = par.pass;
+			b.built_ = true;
+			b.params = {};
+			b._declaredIds.clear();
+			par.pass->DeclareResourceUsages(&b);
+			par.resources.staticResourceRequirements = b.GatherResourceRequirements();
+			par.resources.frameResourceRequirements = par.resources.staticResourceRequirements;
+			par.resources.internalTransitions = b.params.internalTransitions;
+			par.resources.identifierSet = b.DeclaredResourceIds();
+			par.resources.preferredQueueKind = ResolveExternalPreferredQueueKind(d);
+			par.resources.pinnedQueueSlot = d.pinnedQueueSlot;
+			if (materializeReferencedResources) {
+				MaterializeReferencedResources(par.resources.staticResourceRequirements, par.resources.internalTransitions);
+			}
+		}
+
+		if (callSetup) {
+			par.pass->SetResourceRegistryView(
+				std::make_unique<ResourceRegistryView>(_registry, par.resources.identifierSet));
+			par.pass->Setup();
+		}
+
+		any.pass = std::move(par);
+	}
+
+	return any;
+}
+
+void RenderGraph::RegisterExternalPassName(const ExternalPassDesc& d, AnyPassAndResources& any)
+{
+	if (!d.registerName) {
+		return;
+	}
+
+	if (d.type == PassType::Render) {
+		auto& rp = std::get<RenderPassAndResources>(any.pass);
+		if (!d.name.empty()) {
+			renderPassesByName[d.name] = rp.pass;
+		}
+	}
+	else if (d.type == PassType::Compute) {
+		auto& cp = std::get<ComputePassAndResources>(any.pass);
+		if (!d.name.empty()) {
+			computePassesByName[d.name] = cp.pass;
+		}
+	}
+}
+
 RenderGraph::PassView RenderGraph::GetPassView(AnyPassAndResources& pr) {
 	PassView v{};
 	if (pr.type == PassType::Compute) {
@@ -2024,97 +2163,8 @@ void RenderGraph::CompileStructural() {
 	};
 
 	auto makeAny = [&](ExternalPassDesc const& d) -> AnyPassAndResources {
-		AnyPassAndResources any;
-		any.type = d.type;
-		any.name = d.name;
-
-		if (d.type == PassType::Render) {
-			auto rp = std::get<std::shared_ptr<RenderPass>>(d.pass);
-			RenderPassAndResources par;
-			par.pass = std::move(rp);
-			par.name = d.name;
-			{
-				RenderPassBuilder b(this, d.name);
-				b.pass = par.pass;
-				b.built_ = true;
-				b.params = {};
-				b.params.isGeometryPass = d.isGeometryPass;
-				b._declaredIds.clear();
-				par.pass->DeclareResourceUsages(&b);
-				par.resources.staticResourceRequirements = b.GatherResourceRequirements();
-				par.resources.frameResourceRequirements = par.resources.staticResourceRequirements;
-				par.resources.internalTransitions = b.params.internalTransitions;
-				par.resources.identifierSet = b.DeclaredResourceIds();
-				par.resources.autoDescriptorShaderResources = b.params.autoDescriptorShaderResources;
-				par.resources.autoDescriptorUnorderedAccessViews = b.params.autoDescriptorUnorderedAccessViews;
-				par.resources.isGeometryPass = b.params.isGeometryPass;
-				par.resources.preferredQueueKind = ResolveExternalPreferredQueueKind(d);
-				par.resources.pinnedQueueSlot = d.pinnedQueueSlot;
-				MaterializeReferencedResources(par.resources.staticResourceRequirements, par.resources.internalTransitions);
-			}
- 			any.pass = std::move(par);
- 		}
- 		else if (d.type == PassType::Compute) {
- 			auto cp = std::get<std::shared_ptr<ComputePass>>(d.pass);
- 			ComputePassAndResources par;
- 			par.pass = std::move(cp);
- 			par.name = d.name;
-			{
-				ComputePassBuilder b(this, d.name);
-				b.pass = par.pass;
-				b.built_ = true;
-				b.params = {};
-				b._declaredIds.clear();
-				par.pass->DeclareResourceUsages(&b);
-				par.resources.staticResourceRequirements = b.GatherResourceRequirements();
-				par.resources.frameResourceRequirements = par.resources.staticResourceRequirements;
-				par.resources.internalTransitions = b.params.internalTransitions;
-				par.resources.identifierSet = b.DeclaredResourceIds();
-				par.resources.autoDescriptorShaderResources = b.params.autoDescriptorShaderResources;
-				par.resources.autoDescriptorConstantBuffers = b.params.autoDescriptorConstantBuffers;
-				par.resources.autoDescriptorUnorderedAccessViews = b.params.autoDescriptorUnorderedAccessViews;
-				par.resources.preferredQueueKind = ResolveExternalPreferredQueueKind(d);
-				par.resources.pinnedQueueSlot = d.pinnedQueueSlot;
-				MaterializeReferencedResources(par.resources.staticResourceRequirements, par.resources.internalTransitions);
-			}
- 			any.pass = std::move(par);
- 		}
-		else if (d.type == PassType::Copy) {
-			auto cp = std::get<std::shared_ptr<CopyPass>>(d.pass);
-			CopyPassAndResources par;
-			par.pass = std::move(cp);
-			par.name = d.name;
-			{
-				CopyPassBuilder b(this, d.name);
-				b.pass = par.pass;
-				b.built_ = true;
-				b.params = {};
-				b._declaredIds.clear();
-				par.pass->DeclareResourceUsages(&b);
-				par.resources.staticResourceRequirements = b.GatherResourceRequirements();
-				par.resources.frameResourceRequirements = par.resources.staticResourceRequirements;
-				par.resources.internalTransitions = b.params.internalTransitions;
-				par.resources.identifierSet = b.DeclaredResourceIds();
-				par.resources.preferredQueueKind = ResolveExternalPreferredQueueKind(d);
-				par.resources.pinnedQueueSlot = d.pinnedQueueSlot;
-				MaterializeReferencedResources(par.resources.staticResourceRequirements, par.resources.internalTransitions);
-			}
-			any.pass = std::move(par);
-		}
- 		return any;
- 		};
-
-	auto registerName = [&](ExternalPassDesc const& d, AnyPassAndResources& any) {
-		if (!d.registerName) return;
-		if (d.type == PassType::Render) {
-			auto& rp = std::get<RenderPassAndResources>(any.pass);
-			if (!d.name.empty()) renderPassesByName[d.name] = rp.pass;
-		}
-		else if (d.type == PassType::Compute) {
-			auto& cp = std::get<ComputePassAndResources>(any.pass);
-			if (!d.name.empty()) computePassesByName[d.name] = cp.pass;
-		}
-		};
+		return MaterializeExternalPass(d, false, true);
+	};
 
 	// Sentinels (must not collide with real pass names)
 	static constexpr const char* kBeginKey = "__rg_begin__";
@@ -2173,8 +2223,8 @@ void RenderGraph::CompileStructural() {
 			if (std::holds_alternative<std::monostate>(d.pass)) continue;
 
 			ExtItem it;
-			it.pr = makeAny(d);
-			registerName(d, it.pr);
+			it.pr = MaterializeExternalPass(d, false, true);
+			RegisterExternalPassName(d, it.pr);
 
 			it.order = globalOrder++;
 			it.key = !d.name.empty() ? d.name : makeSyntheticKey(it.order);
@@ -2783,104 +2833,6 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	explicitAfterByName.reserve(frameExt.size());
 
 	if (!frameExt.empty()) {
-		auto makeAny = [&](ExternalPassDesc const& d) -> AnyPassAndResources {
-			AnyPassAndResources any;
-			any.type = d.type;
-			any.name = d.name;
-
-			if (d.type == PassType::Render) {
-				auto rp = std::get<std::shared_ptr<RenderPass>>(d.pass);
-				RenderPassAndResources par;
-				par.pass = std::move(rp);
-				par.name = d.name;
-				{
-					RenderPassBuilder b(this, d.name);
-					b.pass = par.pass;
-					b.built_ = true;
-					b.params = {};
-					b._declaredIds.clear();
-					par.pass->DeclareResourceUsages(&b);
-					par.resources.staticResourceRequirements = b.GatherResourceRequirements();
-					par.resources.frameResourceRequirements = par.resources.staticResourceRequirements;
-					par.resources.internalTransitions = b.params.internalTransitions;
-					par.resources.identifierSet = b.DeclaredResourceIds();
-					par.resources.autoDescriptorShaderResources = b.params.autoDescriptorShaderResources;
-					par.resources.autoDescriptorUnorderedAccessViews = b.params.autoDescriptorUnorderedAccessViews;
-					par.resources.isGeometryPass = b.params.isGeometryPass;
-					par.resources.preferredQueueKind = ResolveExternalPreferredQueueKind(d);
-					par.resources.pinnedQueueSlot = d.pinnedQueueSlot;
-				}
-
-				par.pass->SetResourceRegistryView(
-						std::make_unique<ResourceRegistryView>(_registry, par.resources.identifierSet),
-						par.resources.autoDescriptorShaderResources,
-						par.resources.autoDescriptorUnorderedAccessViews
-				);
-				par.pass->Setup();
-				any.pass = std::move(par);
-			}
-			else if (d.type == PassType::Compute) {
-				auto cp = std::get<std::shared_ptr<ComputePass>>(d.pass);
-				ComputePassAndResources par;
-				par.pass = std::move(cp);
-				par.name = d.name;
-				{
-					ComputePassBuilder b(this, d.name);
-					b.pass = par.pass;
-					b.built_ = true;
-					b.params = {};
-					b._declaredIds.clear();
-					par.pass->DeclareResourceUsages(&b);
-					par.resources.staticResourceRequirements = b.GatherResourceRequirements();
-					par.resources.frameResourceRequirements = par.resources.staticResourceRequirements;
-					par.resources.internalTransitions = b.params.internalTransitions;
-					par.resources.identifierSet = b.DeclaredResourceIds();
-					par.resources.autoDescriptorShaderResources = b.params.autoDescriptorShaderResources;
-					par.resources.autoDescriptorConstantBuffers = b.params.autoDescriptorConstantBuffers;
-					par.resources.autoDescriptorUnorderedAccessViews = b.params.autoDescriptorUnorderedAccessViews;
-					par.resources.preferredQueueKind = ResolveExternalPreferredQueueKind(d);
-					par.resources.pinnedQueueSlot = d.pinnedQueueSlot;
-				}
-
-				par.pass->SetResourceRegistryView(
-						std::make_unique<ResourceRegistryView>(_registry, par.resources.identifierSet),
-						par.resources.autoDescriptorShaderResources,
-						par.resources.autoDescriptorConstantBuffers,
-						par.resources.autoDescriptorUnorderedAccessViews
-				);
-				par.pass->Setup();
-				any.pass = std::move(par);
-			}
-			else if (d.type == PassType::Copy) {
-				auto cp = std::get<std::shared_ptr<CopyPass>>(d.pass);
-				CopyPassAndResources par;
-				par.pass = std::move(cp);
-				par.name = d.name;
-				{
-					CopyPassBuilder b(this, d.name);
-					b.pass = par.pass;
-					b.built_ = true;
-					b.params = {};
-					b._declaredIds.clear();
-					par.pass->DeclareResourceUsages(&b);
-					par.resources.staticResourceRequirements = b.GatherResourceRequirements();
-					par.resources.frameResourceRequirements = par.resources.staticResourceRequirements;
-					par.resources.internalTransitions = b.params.internalTransitions;
-					par.resources.identifierSet = b.DeclaredResourceIds();
-					par.resources.preferredQueueKind = ResolveExternalPreferredQueueKind(d);
-					par.resources.pinnedQueueSlot = d.pinnedQueueSlot;
-				}
-
-				par.pass->SetResourceRegistryView(
-					std::make_unique<ResourceRegistryView>(_registry, par.resources.identifierSet)
-				);
-				par.pass->Setup();
-				any.pass = std::move(par);
-			}
-
-			return any;
-		};
-
 		auto recordImmediate = [&](AnyPassAndResources& pr) {
 			if (pr.type == PassType::Compute) {
 				auto& p = std::get<ComputePassAndResources>(pr.pass);
@@ -2986,7 +2938,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				continue;
 			}
 
-			AnyPassAndResources any = makeAny(d);
+			AnyPassAndResources any = MaterializeExternalPass(d, true, false);
 			recordImmediate(any);
 
 			// Default insertion: append

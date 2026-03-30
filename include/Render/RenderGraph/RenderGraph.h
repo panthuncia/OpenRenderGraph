@@ -143,6 +143,80 @@ public:
 		// Optional: if true, the pass will be registered in Get*PassByName().
 		bool registerName = true;
 		bool isGeometryPass = false; // Optional: opts pass into statistics tracking for rasterization
+
+		static ExternalPassDesc Render(std::string name, std::shared_ptr<RenderPass> renderPass) {
+			ExternalPassDesc desc{};
+			desc.type = PassType::Render;
+			desc.name = std::move(name);
+			desc.pass = std::move(renderPass);
+			return desc;
+		}
+
+		static ExternalPassDesc Compute(std::string name, std::shared_ptr<ComputePass> computePass) {
+			ExternalPassDesc desc{};
+			desc.type = PassType::Compute;
+			desc.name = std::move(name);
+			desc.pass = std::move(computePass);
+			return desc;
+		}
+
+		static ExternalPassDesc Copy(std::string name, std::shared_ptr<CopyPass> copyPass) {
+			ExternalPassDesc desc{};
+			desc.type = PassType::Copy;
+			desc.name = std::move(name);
+			desc.pass = std::move(copyPass);
+			return desc;
+		}
+
+		ExternalPassDesc& At(ExternalInsertPoint insertPoint) & {
+			where = std::move(insertPoint);
+			return *this;
+		}
+
+		ExternalPassDesc At(ExternalInsertPoint insertPoint) && {
+			where = std::move(insertPoint);
+			return std::move(*this);
+		}
+
+		ExternalPassDesc& PreferQueue(QueueKind queueKind) & {
+			preferredQueueKind = queueKind;
+			return *this;
+		}
+
+		ExternalPassDesc PreferQueue(QueueKind queueKind) && {
+			preferredQueueKind = queueKind;
+			return std::move(*this);
+		}
+
+		ExternalPassDesc& PinToQueue(QueueSlotIndex queueSlot) & {
+			pinnedQueueSlot = queueSlot;
+			return *this;
+		}
+
+		ExternalPassDesc PinToQueue(QueueSlotIndex queueSlot) && {
+			pinnedQueueSlot = queueSlot;
+			return std::move(*this);
+		}
+
+		ExternalPassDesc& RegisterByName(bool enabled = true) & {
+			registerName = enabled;
+			return *this;
+		}
+
+		ExternalPassDesc RegisterByName(bool enabled = true) && {
+			registerName = enabled;
+			return std::move(*this);
+		}
+
+		ExternalPassDesc& GeometryPass(bool enabled = true) & {
+			isGeometryPass = enabled;
+			return *this;
+		}
+
+		ExternalPassDesc GeometryPass(bool enabled = true) && {
+			isGeometryPass = enabled;
+			return std::move(*this);
+		}
 	};
 
 	struct IRenderGraphExtension {
@@ -700,6 +774,8 @@ private:
 	void RefreshRetainedDeclarationsForFrame(ComputePassAndResources& p, uint8_t frameIndex);
 	void RefreshRetainedDeclarationsForFrame(CopyPassAndResources& p, uint8_t frameIndex);
 	void CompileFrame(rhi::Device device, uint8_t frameIndex, const IHostExecutionData* hostData);
+	AnyPassAndResources MaterializeExternalPass(const ExternalPassDesc& desc, bool callSetup, bool materializeReferencedResources);
+	void RegisterExternalPassName(const ExternalPassDesc& desc, AnyPassAndResources& any);
 
 	//void ComputeResourceLoops();
 	bool IsNewBatchNeeded(
