@@ -28,6 +28,40 @@ namespace {
 		return static_cast<size_t>(queue);
 	}
 
+	constexpr QueueKind DefaultPreferredQueueKind(RenderGraph::PassType type) noexcept {
+		switch (type) {
+		case RenderGraph::PassType::Render:
+			return QueueKind::Graphics;
+		case RenderGraph::PassType::Compute:
+			return QueueKind::Compute;
+		case RenderGraph::PassType::Copy:
+			return QueueKind::Copy;
+		default:
+			return QueueKind::Graphics;
+		}
+	}
+
+	constexpr bool IsPreferredQueueKindCompatible(RenderGraph::PassType type, QueueKind kind) noexcept {
+		switch (type) {
+		case RenderGraph::PassType::Render:
+			return IsQueueKindSupportedByRenderPass(kind);
+		case RenderGraph::PassType::Compute:
+			return IsQueueKindSupportedByComputePass(kind);
+		case RenderGraph::PassType::Copy:
+			return IsQueueKindSupportedByCopyPass(kind);
+		default:
+			return false;
+		}
+	}
+
+	QueueKind ResolveExternalPreferredQueueKind(const RenderGraph::ExternalPassDesc& desc) {
+		const QueueKind preferredQueueKind = desc.preferredQueueKind.value_or(DefaultPreferredQueueKind(desc.type));
+		if (!IsPreferredQueueKindCompatible(desc.type, preferredQueueKind)) {
+			throw std::runtime_error("External pass '" + desc.name + "' requested an incompatible queue kind");
+		}
+		return preferredQueueKind;
+	}
+
 	// Insert into a sorted vector, maintaining sorted order. No-op if already present.
 	inline void SortedInsert(std::vector<uint64_t>& v, uint64_t val) {
 		auto it = std::lower_bound(v.begin(), v.end(), val);
@@ -139,23 +173,23 @@ std::vector<RenderGraph::Node> RenderGraph::BuildNodes(RenderGraph& rg, std::vec
 
 		if (pr.type == PassType::Compute) {
 			const auto& pass = std::get<ComputePassAndResources>(pr.pass);
-			if (pass.resources.queueSlotOverride)
-				return std::vector<size_t>{ static_cast<size_t>(static_cast<uint8_t>(*pass.resources.queueSlotOverride)) };
-			return collectSlotsForKind(ResolveQueueKind(pass.resources.queueSelection));
+			if (pass.resources.pinnedQueueSlot)
+				return std::vector<size_t>{ static_cast<size_t>(static_cast<uint8_t>(*pass.resources.pinnedQueueSlot)) };
+			return collectSlotsForKind(pass.resources.preferredQueueKind);
 		}
 
 		if (pr.type == PassType::Render) {
 			const auto& pass = std::get<RenderPassAndResources>(pr.pass);
-			if (pass.resources.queueSlotOverride)
-				return std::vector<size_t>{ static_cast<size_t>(static_cast<uint8_t>(*pass.resources.queueSlotOverride)) };
-			return collectSlotsForKind(ResolveQueueKind(pass.resources.queueSelection));
+			if (pass.resources.pinnedQueueSlot)
+				return std::vector<size_t>{ static_cast<size_t>(static_cast<uint8_t>(*pass.resources.pinnedQueueSlot)) };
+			return collectSlotsForKind(pass.resources.preferredQueueKind);
 		}
 
 		if (pr.type == PassType::Copy) {
 			const auto& pass = std::get<CopyPassAndResources>(pr.pass);
-			if (pass.resources.queueSlotOverride)
-				return std::vector<size_t>{ static_cast<size_t>(static_cast<uint8_t>(*pass.resources.queueSlotOverride)) };
-			return collectSlotsForKind(ResolveQueueKind(pass.resources.queueSelection));
+			if (pass.resources.pinnedQueueSlot)
+				return std::vector<size_t>{ static_cast<size_t>(static_cast<uint8_t>(*pass.resources.pinnedQueueSlot)) };
+			return collectSlotsForKind(pass.resources.preferredQueueKind);
 		}
 
 		return std::vector<size_t>{ QueueIndex(QueueKind::Graphics) };
@@ -237,7 +271,7 @@ std::vector<uint8_t> RenderGraph::PlanActiveQueueSlots(
 				return false;
 			}
 			else {
-				return passEntry.resources.queueSlotOverride.has_value();
+				return passEntry.resources.pinnedQueueSlot.has_value();
 			}
 		}, pr.pass);
 	};
@@ -2014,8 +2048,8 @@ void RenderGraph::CompileStructural() {
 				par.resources.autoDescriptorShaderResources = b.params.autoDescriptorShaderResources;
 				par.resources.autoDescriptorUnorderedAccessViews = b.params.autoDescriptorUnorderedAccessViews;
 				par.resources.isGeometryPass = b.params.isGeometryPass;
-				par.resources.queueSelection = d.renderQueueSelection.value_or(RenderQueueSelection::Graphics);
-				par.resources.queueSlotOverride = d.queueSlotOverride;
+				par.resources.preferredQueueKind = ResolveExternalPreferredQueueKind(d);
+				par.resources.pinnedQueueSlot = d.pinnedQueueSlot;
 				MaterializeReferencedResources(par.resources.staticResourceRequirements, par.resources.internalTransitions);
 			}
  			any.pass = std::move(par);
@@ -2039,8 +2073,8 @@ void RenderGraph::CompileStructural() {
 				par.resources.autoDescriptorShaderResources = b.params.autoDescriptorShaderResources;
 				par.resources.autoDescriptorConstantBuffers = b.params.autoDescriptorConstantBuffers;
 				par.resources.autoDescriptorUnorderedAccessViews = b.params.autoDescriptorUnorderedAccessViews;
-				par.resources.queueSelection = d.computeQueueSelection.value_or(ComputeQueueSelection::Compute);
-				par.resources.queueSlotOverride = d.queueSlotOverride;
+				par.resources.preferredQueueKind = ResolveExternalPreferredQueueKind(d);
+				par.resources.pinnedQueueSlot = d.pinnedQueueSlot;
 				MaterializeReferencedResources(par.resources.staticResourceRequirements, par.resources.internalTransitions);
 			}
  			any.pass = std::move(par);
@@ -2061,8 +2095,8 @@ void RenderGraph::CompileStructural() {
 				par.resources.frameResourceRequirements = par.resources.staticResourceRequirements;
 				par.resources.internalTransitions = b.params.internalTransitions;
 				par.resources.identifierSet = b.DeclaredResourceIds();
-				par.resources.queueSelection = d.copyQueueSelection.value_or(CopyQueueSelection::Copy);
-				par.resources.queueSlotOverride = d.queueSlotOverride;
+				par.resources.preferredQueueKind = ResolveExternalPreferredQueueKind(d);
+				par.resources.pinnedQueueSlot = d.pinnedQueueSlot;
 				MaterializeReferencedResources(par.resources.staticResourceRequirements, par.resources.internalTransitions);
 			}
 			any.pass = std::move(par);
@@ -2608,7 +2642,8 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				immediatePassAndResources.pass = p.pass;
 				immediatePassAndResources.resources.staticResourceRequirements = immediateFrameData.requirements;
 				immediatePassAndResources.resources.frameResourceRequirements = immediateFrameData.requirements;
-				immediatePassAndResources.resources.queueSelection = p.resources.queueSelection;
+				immediatePassAndResources.resources.preferredQueueKind = p.resources.preferredQueueKind;
+				immediatePassAndResources.resources.pinnedQueueSlot = p.resources.pinnedQueueSlot;
 				immediatePassAndResources.immediateBytecode = std::move(immediateFrameData.bytecode);
 				immediatePassAndResources.immediateKeepAlive = std::move(p.immediateKeepAlive);
 				immediatePassAndResources.run = PassRunMask::Immediate;
@@ -2658,7 +2693,8 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				immediatePassAndResources.pass = p.pass;
 				immediatePassAndResources.resources.staticResourceRequirements = immediateFrameData.requirements;
 				immediatePassAndResources.resources.frameResourceRequirements = immediateFrameData.requirements;
-				immediatePassAndResources.resources.queueSelection = p.resources.queueSelection;
+				immediatePassAndResources.resources.preferredQueueKind = p.resources.preferredQueueKind;
+				immediatePassAndResources.resources.pinnedQueueSlot = p.resources.pinnedQueueSlot;
 				immediatePassAndResources.immediateBytecode = std::move(immediateFrameData.bytecode);
 				immediatePassAndResources.immediateKeepAlive = std::move(p.immediateKeepAlive);
 				immediatePassAndResources.run = PassRunMask::Immediate;
@@ -2708,7 +2744,8 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				immediatePassAndResources.pass = p.pass;
 				immediatePassAndResources.resources.staticResourceRequirements = immediateFrameData.requirements;
 				immediatePassAndResources.resources.frameResourceRequirements = immediateFrameData.requirements;
-				immediatePassAndResources.resources.queueSelection = p.resources.queueSelection;
+				immediatePassAndResources.resources.preferredQueueKind = p.resources.preferredQueueKind;
+				immediatePassAndResources.resources.pinnedQueueSlot = p.resources.pinnedQueueSlot;
 				immediatePassAndResources.immediateBytecode = std::move(immediateFrameData.bytecode);
 				immediatePassAndResources.immediateKeepAlive = std::move(p.immediateKeepAlive);
 				immediatePassAndResources.run = PassRunMask::Immediate;
@@ -2770,8 +2807,8 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 					par.resources.autoDescriptorShaderResources = b.params.autoDescriptorShaderResources;
 					par.resources.autoDescriptorUnorderedAccessViews = b.params.autoDescriptorUnorderedAccessViews;
 					par.resources.isGeometryPass = b.params.isGeometryPass;
-					par.resources.queueSelection = d.renderQueueSelection.value_or(RenderQueueSelection::Graphics);
-					par.resources.queueSlotOverride = d.queueSlotOverride;
+					par.resources.preferredQueueKind = ResolveExternalPreferredQueueKind(d);
+					par.resources.pinnedQueueSlot = d.pinnedQueueSlot;
 				}
 
 				par.pass->SetResourceRegistryView(
@@ -2801,8 +2838,8 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 					par.resources.autoDescriptorShaderResources = b.params.autoDescriptorShaderResources;
 					par.resources.autoDescriptorConstantBuffers = b.params.autoDescriptorConstantBuffers;
 					par.resources.autoDescriptorUnorderedAccessViews = b.params.autoDescriptorUnorderedAccessViews;
-					par.resources.queueSelection = d.computeQueueSelection.value_or(ComputeQueueSelection::Compute);
-					par.resources.queueSlotOverride = d.queueSlotOverride;
+					par.resources.preferredQueueKind = ResolveExternalPreferredQueueKind(d);
+					par.resources.pinnedQueueSlot = d.pinnedQueueSlot;
 				}
 
 				par.pass->SetResourceRegistryView(
@@ -2830,8 +2867,8 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 					par.resources.frameResourceRequirements = par.resources.staticResourceRequirements;
 					par.resources.internalTransitions = b.params.internalTransitions;
 					par.resources.identifierSet = b.DeclaredResourceIds();
-					par.resources.queueSelection = d.copyQueueSelection.value_or(CopyQueueSelection::Copy);
-					par.resources.queueSlotOverride = d.queueSlotOverride;
+					par.resources.preferredQueueKind = ResolveExternalPreferredQueueKind(d);
+					par.resources.pinnedQueueSlot = d.pinnedQueueSlot;
 				}
 
 				par.pass->SetResourceRegistryView(
@@ -3166,9 +3203,9 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		std::visit([&](auto const& passAndResources) {
 			using T = std::decay_t<decltype(passAndResources)>;
 			if constexpr (!std::is_same_v<T, std::monostate>) {
-				const size_t fallbackQueueSlot = passAndResources.resources.queueSlotOverride
-					? static_cast<size_t>(static_cast<uint8_t>(*passAndResources.resources.queueSlotOverride))
-					: QueueIndex(ResolveQueueKind(passAndResources.resources.queueSelection));
+				const size_t fallbackQueueSlot = passAndResources.resources.pinnedQueueSlot
+					? static_cast<size_t>(static_cast<uint8_t>(*passAndResources.resources.pinnedQueueSlot))
+					: QueueIndex(passAndResources.resources.preferredQueueKind);
 				const size_t passQueueSlot = passIndex < m_assignedQueueSlotsByFramePass.size()
 					? m_assignedQueueSlotsByFramePass[passIndex]
 					: fallbackQueueSlot;

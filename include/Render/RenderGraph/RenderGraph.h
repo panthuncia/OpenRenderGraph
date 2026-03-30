@@ -137,10 +137,8 @@ public:
 		std::string name;
 		std::optional<ExternalInsertPoint> where;
 		std::variant<std::monostate, std::shared_ptr<RenderPass>, std::shared_ptr<ComputePass>, std::shared_ptr<CopyPass>> pass;
-		std::optional<RenderQueueSelection> renderQueueSelection;
-		std::optional<ComputeQueueSelection> computeQueueSelection;
-		std::optional<CopyQueueSelection> copyQueueSelection;
-		std::optional<QueueSlotIndex> queueSlotOverride; // Target a specific queue slot, bypassing queue selection
+		std::optional<QueueKind> preferredQueueKind;
+		std::optional<QueueSlotIndex> pinnedQueueSlot; // Target a specific queue slot, bypassing queue preference
 
 		// Optional: if true, the pass will be registered in Get*PassByName().
 		bool registerName = true;

@@ -37,8 +37,8 @@ struct RenderPassParameters {
 	std::vector<ResourceRequirement> staticResourceRequirements; // Static resource requirements for the pass
 	std::vector<ResourceRequirement> frameResourceRequirements; // Resource requirements that may change each frame + static ones
 	bool isGeometryPass = false;
-	RenderQueueSelection queueSelection = RenderQueueSelection::Graphics;
-	std::optional<QueueSlotIndex> queueSlotOverride; // Target a specific queue slot instead of using queueSelection
+	QueueKind preferredQueueKind = QueueKind::Graphics;
+	std::optional<QueueSlotIndex> pinnedQueueSlot; // Target a specific queue slot instead of using preferredQueueKind
 };
 
 class RenderPassBuilder;

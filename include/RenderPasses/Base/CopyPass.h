@@ -26,8 +26,8 @@ struct CopyPassParameters {
 	std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> identifierSet;
 	std::vector<ResourceRequirement> staticResourceRequirements;
 	std::vector<ResourceRequirement> frameResourceRequirements;
-	CopyQueueSelection queueSelection = CopyQueueSelection::Copy;
-	std::optional<QueueSlotIndex> queueSlotOverride; // Target a specific queue slot instead of using queueSelection
+	QueueKind preferredQueueKind = QueueKind::Copy;
+	std::optional<QueueSlotIndex> pinnedQueueSlot; // Target a specific queue slot instead of using preferredQueueKind
 };
 
 class CopyPassBuilder;

@@ -54,7 +54,7 @@ public:
         if (inputs.poolResolver) {
             builder->WithCopyDest(*inputs.poolResolver);
         }
-        builder->PreferCopyQueue();
+        builder->PreferQueue(QueueKind::Copy);
     }
 
     void Setup() override {}

@@ -51,7 +51,7 @@ public:
     void DeclareResourceUsages(CopyPassBuilder* builder) override {
         const auto& inputs = Inputs<ReadbackCopyCaptureInputs>();
         builder->WithCopySource(inputs.target);
-        builder->PreferCopyQueue();
+        builder->PreferQueue(QueueKind::Copy);
     }
 
     void Setup() override {

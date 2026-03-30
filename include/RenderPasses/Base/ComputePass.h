@@ -32,8 +32,8 @@ struct ComputePassParameters {
 	std::vector<AutoDescriptorRegistration> autoDescriptorUnorderedAccessViews;
 	std::vector<ResourceRequirement> staticResourceRequirements; // Static resource requirements for the pass
 	std::vector<ResourceRequirement> frameResourceRequirements; // Resource requirements that may change each frame + static ones
-	ComputeQueueSelection queueSelection = ComputeQueueSelection::Compute;
-	std::optional<QueueSlotIndex> queueSlotOverride; // Target a specific queue slot instead of using queueSelection
+	QueueKind preferredQueueKind = QueueKind::Compute;
+	std::optional<QueueSlotIndex> pinnedQueueSlot; // Target a specific queue slot instead of using preferredQueueKind
 };
 
 class ComputePassBuilder;

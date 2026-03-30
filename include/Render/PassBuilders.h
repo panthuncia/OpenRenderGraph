@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <type_traits>
 #include <memory>
+#include <stdexcept>
 #include <rhi.h>
 
 #include "Render/RenderGraph/RenderGraph.h"
@@ -910,8 +911,11 @@ public:
 		return *this;
 	}
 
-    RenderPassBuilder& OnGraphicsQueue()& {
-        m_queueSelection = RenderQueueSelection::Graphics;
+    RenderPassBuilder& PreferQueue(QueueKind kind)& {
+        if (!IsQueueKindSupportedByRenderPass(kind)) {
+            throw std::invalid_argument("Render passes only support the graphics queue");
+        }
+        m_preferredQueueKind = kind;
         return *this;
     }
 
@@ -920,18 +924,21 @@ public:
 		return std::move(*this);
     }
 
-    RenderPassBuilder OnGraphicsQueue() && {
-        m_queueSelection = RenderQueueSelection::Graphics;
+    RenderPassBuilder PreferQueue(QueueKind kind) && {
+        if (!IsQueueKindSupportedByRenderPass(kind)) {
+            throw std::invalid_argument("Render passes only support the graphics queue");
+        }
+        m_preferredQueueKind = kind;
         return std::move(*this);
     }
 
-    RenderPassBuilder& OnQueue(QueueSlotIndex slot) & {
-        m_queueSlotOverride = slot;
+    RenderPassBuilder& PinToQueue(QueueSlotIndex slot) & {
+        m_pinnedQueueSlot = slot;
         return *this;
     }
 
-    RenderPassBuilder OnQueue(QueueSlotIndex slot) && {
-        m_queueSlotOverride = slot;
+    RenderPassBuilder PinToQueue(QueueSlotIndex slot) && {
+        m_pinnedQueueSlot = slot;
         return std::move(*this);
     }
 
@@ -1004,8 +1011,8 @@ private:
         pass->DeclareResourceUsages(this);
 
         params.isGeometryPass = m_isGeometryPass;
-        params.queueSelection = m_queueSelection;
-        params.queueSlotOverride = m_queueSlotOverride;
+        params.preferredQueueKind = m_preferredQueueKind;
+        params.pinnedQueueSlot = m_pinnedQueueSlot;
         params.identifierSet = _declaredIds;
         params.staticResourceRequirements = GatherResourceRequirements();
 
@@ -1019,8 +1026,8 @@ private:
         _declaredIds.clear();
         resolverSnapshots_.clear();
         m_isGeometryPass = false;
-        m_queueSelection = RenderQueueSelection::Graphics;
-        m_queueSlotOverride = std::nullopt;
+		m_preferredQueueKind = QueueKind::Graphics;
+        m_pinnedQueueSlot = std::nullopt;
 	}
 
     // Shader Resource
@@ -1233,8 +1240,8 @@ private:
 	std::shared_ptr<RenderPass> pass;
     bool built_ = false;
     bool m_isGeometryPass = false;
-	RenderQueueSelection m_queueSelection = RenderQueueSelection::Graphics;
-    std::optional<QueueSlotIndex> m_queueSlotOverride;
+	QueueKind m_preferredQueueKind = QueueKind::Graphics;
+    std::optional<QueueSlotIndex> m_pinnedQueueSlot;
     std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> _declaredIds;
     std::vector<ResolverSnapshot> resolverSnapshots_;
 
@@ -1360,76 +1367,75 @@ public:
         return std::move(*this);
     }
 
-    std::vector<ResolverSnapshot> TakeResolverSnapshots() { return std::move(resolverSnapshots_); }
+        std::vector<ResolverSnapshot> TakeResolverSnapshots() { return std::move(resolverSnapshots_); }
 
-    ComputePassBuilder& PreferComputeQueue() & {
-        m_queueSelection = ComputeQueueSelection::Compute;
-        return *this;
-    }
+        ComputePassBuilder& PreferQueue(QueueKind kind) & {
+                if (!IsQueueKindSupportedByComputePass(kind)) {
+                        throw std::invalid_argument("Compute passes only support graphics or compute queues");
+                }
+                m_preferredQueueKind = kind;
+                return *this;
+        }
 
-    ComputePassBuilder& PreferGraphicsQueue() & {
-        m_queueSelection = ComputeQueueSelection::Graphics;
-        return *this;
-    }
+        ComputePassBuilder PreferQueue(QueueKind kind) && {
+                if (!IsQueueKindSupportedByComputePass(kind)) {
+                        throw std::invalid_argument("Compute passes only support graphics or compute queues");
+                }
+                m_preferredQueueKind = kind;
+                return std::move(*this);
+        }
 
-    ComputePassBuilder PreferComputeQueue() && {
-        m_queueSelection = ComputeQueueSelection::Compute;
-        return std::move(*this);
-    }
+        ComputePassBuilder& PinToQueue(QueueSlotIndex slot) & {
+                m_pinnedQueueSlot = slot;
+                return *this;
+        }
 
-    ComputePassBuilder PreferGraphicsQueue() && {
-        m_queueSelection = ComputeQueueSelection::Graphics;
-        return std::move(*this);
-    }
+        ComputePassBuilder PinToQueue(QueueSlotIndex slot) && {
+                m_pinnedQueueSlot = slot;
+                return std::move(*this);
+        }
 
-    ComputePassBuilder& OnQueue(QueueSlotIndex slot) & {
-        m_queueSlotOverride = slot;
-        return *this;
-    }
-
-    ComputePassBuilder OnQueue(QueueSlotIndex slot) && {
-        m_queueSlotOverride = slot;
-        return std::move(*this);
-    }
-
-    // LVALUE overloads for IResourceResolver
-    ComputePassBuilder& WithShaderResource(const IResourceResolver& r)& {
+        // LVALUE overloads for IResourceResolver
+        ComputePassBuilder& WithShaderResource(const IResourceResolver& r)& {
 		return WithResolver(r, [&](auto&& resolved) { addShaderResource(std::forward<decltype(resolved)>(resolved)); });
-    }
+        }
 
-    ComputePassBuilder& WithConstantBuffer(const IResourceResolver& r)& {
+        ComputePassBuilder& WithConstantBuffer(const IResourceResolver& r)& {
 		return WithResolver(r, [&](auto&& resolved) { addConstantBuffer(std::forward<decltype(resolved)>(resolved)); });
-    }
+        }
 
-    ComputePassBuilder& WithUnorderedAccess(const IResourceResolver& r)& {
+        ComputePassBuilder& WithUnorderedAccess(const IResourceResolver& r)& {
 		return WithResolver(r, [&](auto&& resolved) { addUnorderedAccess(std::forward<decltype(resolved)>(resolved)); });
-    }
+        }
 
-    ComputePassBuilder& WithIndirectArguments(const IResourceResolver& r)& {
+        ComputePassBuilder& WithIndirectArguments(const IResourceResolver& r)& {
 		return WithResolver(r, [&](auto&& resolved) { addIndirectArguments(std::forward<decltype(resolved)>(resolved)); });
-    }
+        }
 
-    ComputePassBuilder& WithLegacyInterop(const IResourceResolver& r)& {
+        ComputePassBuilder& WithLegacyInterop(const IResourceResolver& r)& {
 		return WithResolver(r, [&](auto&& resolved) { addLegacyInterop(std::forward<decltype(resolved)>(resolved)); });
-    }
+        }
 
-    // RVALUE overloads for IResourceResolver
-
-    ComputePassBuilder WithShaderResource(const IResourceResolver& r)&& {
+        // RVALUE overloads for IResourceResolver
+        ComputePassBuilder WithShaderResource(const IResourceResolver& r)&& {
 		return std::move(*this).WithResolver(r, [&](auto&& resolved) { addShaderResource(std::forward<decltype(resolved)>(resolved)); });
-    }
-    ComputePassBuilder WithConstantBuffer(const IResourceResolver& r)&& {
+        }
+
+        ComputePassBuilder WithConstantBuffer(const IResourceResolver& r)&& {
 		return std::move(*this).WithResolver(r, [&](auto&& resolved) { addConstantBuffer(std::forward<decltype(resolved)>(resolved)); });
-    }
-    ComputePassBuilder WithUnorderedAccess(const IResourceResolver& r)&& {
+        }
+
+        ComputePassBuilder WithUnorderedAccess(const IResourceResolver& r)&& {
 		return std::move(*this).WithResolver(r, [&](auto&& resolved) { addUnorderedAccess(std::forward<decltype(resolved)>(resolved)); });
-    }
-    ComputePassBuilder WithIndirectArguments(const IResourceResolver& r)&& {
+        }
+
+        ComputePassBuilder WithIndirectArguments(const IResourceResolver& r)&& {
 		return std::move(*this).WithResolver(r, [&](auto&& resolved) { addIndirectArguments(std::forward<decltype(resolved)>(resolved)); });
-    }
-    ComputePassBuilder WithLegacyInterop(const IResourceResolver& r)&& {
+        }
+
+        ComputePassBuilder WithLegacyInterop(const IResourceResolver& r)&& {
 		return std::move(*this).WithResolver(r, [&](auto&& resolved) { addLegacyInterop(std::forward<decltype(resolved)>(resolved)); });
-    }
+        }
 
     auto const& DeclaredResourceIds() const { return _declaredIds; }
 
@@ -1499,8 +1505,8 @@ private:
         pass->DeclareResourceUsages(this);
 
         params.identifierSet = _declaredIds;
-        params.queueSelection = m_queueSelection;
-        params.queueSlotOverride = m_queueSlotOverride;
+        params.preferredQueueKind = m_preferredQueueKind;
+        params.pinnedQueueSlot = m_pinnedQueueSlot;
         params.staticResourceRequirements = GatherResourceRequirements();
 
         graph->AddComputePass(pass, params, passName, TakeResolverSnapshots());
@@ -1512,8 +1518,8 @@ private:
         params = {};
         _declaredIds.clear();
         resolverSnapshots_.clear();
-        m_queueSelection = ComputeQueueSelection::Compute;
-        m_queueSlotOverride = std::nullopt;
+        m_preferredQueueKind = QueueKind::Compute;
+        m_pinnedQueueSlot = std::nullopt;
     }
 
     // Shader resource
@@ -1638,8 +1644,8 @@ private:
     ComputePassParameters     params;
     std::shared_ptr<ComputePass> pass;
     bool built_ = false;
-	ComputeQueueSelection m_queueSelection = ComputeQueueSelection::Compute;
-    std::optional<QueueSlotIndex> m_queueSlotOverride;
+	QueueKind m_preferredQueueKind = QueueKind::Compute;
+    std::optional<QueueSlotIndex> m_pinnedQueueSlot;
     std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> _declaredIds;
     std::vector<ResolverSnapshot> resolverSnapshots_;
 
@@ -1722,33 +1728,29 @@ public:
 
     std::vector<ResolverSnapshot> TakeResolverSnapshots() { return std::move(resolverSnapshots_); }
 
-    CopyPassBuilder& PreferCopyQueue() & {
-        m_queueSelection = CopyQueueSelection::Copy;
+    CopyPassBuilder& PreferQueue(QueueKind kind) & {
+        if (!IsQueueKindSupportedByCopyPass(kind)) {
+            throw std::invalid_argument("Copy passes only support graphics or copy queues");
+        }
+        m_preferredQueueKind = kind;
         return *this;
     }
 
-    CopyPassBuilder& PreferGraphicsQueue() & {
-        m_queueSelection = CopyQueueSelection::Graphics;
-        return *this;
-    }
-
-    CopyPassBuilder PreferCopyQueue() && {
-        m_queueSelection = CopyQueueSelection::Copy;
+    CopyPassBuilder PreferQueue(QueueKind kind) && {
+        if (!IsQueueKindSupportedByCopyPass(kind)) {
+            throw std::invalid_argument("Copy passes only support graphics or copy queues");
+        }
+        m_preferredQueueKind = kind;
         return std::move(*this);
     }
 
-    CopyPassBuilder PreferGraphicsQueue() && {
-        m_queueSelection = CopyQueueSelection::Graphics;
-        return std::move(*this);
-    }
-
-    CopyPassBuilder& OnQueue(QueueSlotIndex slot) & {
-        m_queueSlotOverride = slot;
+    CopyPassBuilder& PinToQueue(QueueSlotIndex slot) & {
+        m_pinnedQueueSlot = slot;
         return *this;
     }
 
-    CopyPassBuilder OnQueue(QueueSlotIndex slot) && {
-        m_queueSlotOverride = slot;
+    CopyPassBuilder PinToQueue(QueueSlotIndex slot) && {
+        m_pinnedQueueSlot = slot;
         return std::move(*this);
     }
 
@@ -1833,8 +1835,8 @@ private:
         pass->DeclareResourceUsages(this);
 
         params.identifierSet = _declaredIds;
-        params.queueSelection = m_queueSelection;
-        params.queueSlotOverride = m_queueSlotOverride;
+        params.preferredQueueKind = m_preferredQueueKind;
+        params.pinnedQueueSlot = m_pinnedQueueSlot;
         params.staticResourceRequirements = GatherResourceRequirements();
 
         graph->AddCopyPass(pass, params, passName, TakeResolverSnapshots());
@@ -1846,8 +1848,8 @@ private:
         params = {};
         _declaredIds.clear();
         resolverSnapshots_.clear();
-        m_queueSelection = CopyQueueSelection::Copy;
-        m_queueSlotOverride = std::nullopt;
+        m_preferredQueueKind = QueueKind::Copy;
+        m_pinnedQueueSlot = std::nullopt;
     }
 
     template<typename T>
@@ -1908,8 +1910,8 @@ private:
     CopyPassParameters params;
     std::shared_ptr<CopyPass> pass;
     bool built_ = false;
-    CopyQueueSelection m_queueSelection = CopyQueueSelection::Copy;
-    std::optional<QueueSlotIndex> m_queueSlotOverride;
+    QueueKind m_preferredQueueKind = QueueKind::Copy;
+    std::optional<QueueSlotIndex> m_pinnedQueueSlot;
     std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> _declaredIds;
     std::vector<ResolverSnapshot> resolverSnapshots_;
 

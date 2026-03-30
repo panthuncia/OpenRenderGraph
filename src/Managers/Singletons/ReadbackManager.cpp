@@ -11,7 +11,7 @@ void ReadbackManager::RequestReadbackCapture(
     Resource* resource,
     const RangeSpec& range,
     ReadbackCaptureCallback callback,
-    bool preferCopyQueue)
+    QueueKind preferredQueueKind)
 {
     std::weak_ptr<Resource> weakResource;
     uint64_t resourceId = 0;
@@ -27,7 +27,7 @@ void ReadbackManager::RequestReadbackCapture(
         resourceId,
         range,
         std::move(callback),
-        preferCopyQueue
+        preferredQueueKind
         });
 }
 
