@@ -400,49 +400,91 @@ namespace detail
 			&& range.sliceUpper == Bound{ BoundType::All, 0 };
         }
 
-        inline void AppendUniqueIdentifier(std::vector<ResourceIdentifier>& ids, const ResourceIdentifier& id) {
-		if (std::find(ids.begin(), ids.end(), id) == ids.end()) {
-			ids.push_back(id);
-		}
+        inline void AppendUniqueDescriptorRegistration(std::vector<AutoDescriptorRegistration>& registrations, const AutoDescriptorRegistration& registration) {
+        if (std::find(registrations.begin(), registrations.end(), registration) == registrations.end()) {
+            registrations.push_back(registration);
+        }
+        }
+
+        inline bool TryResolveAutoDescriptorRange(const RangeSpec& range, unsigned int& mip, unsigned int& slice) {
+            if (IsWholeRange(range)) {
+                mip = 0;
+                slice = 0;
+                return true;
+            }
+
+            const bool exactMip = range.mipLower.type == BoundType::Exact && range.mipUpper.type == BoundType::Exact;
+            const bool wholeMip = range.mipLower == Bound{ BoundType::All, 0 } && range.mipUpper == Bound{ BoundType::All, 0 };
+            const bool exactSlice = range.sliceLower.type == BoundType::Exact && range.sliceUpper.type == BoundType::Exact;
+            const bool wholeSlice = range.sliceLower == Bound{ BoundType::All, 0 } && range.sliceUpper == Bound{ BoundType::All, 0 };
+
+            if (!(wholeMip || (exactMip && range.mipLower.value == range.mipUpper.value))) {
+                return false;
+            }
+            if (!(wholeSlice || (exactSlice && range.sliceLower.value == range.sliceUpper.value))) {
+                return false;
+            }
+
+            mip = exactMip ? range.mipLower.value : 0;
+            slice = exactSlice ? range.sliceLower.value : 0;
+            return true;
         }
 
         inline bool IsResolverBackedIdentifier(RenderGraph* graph, const ResourceIdentifier& id) {
 		return graph != nullptr && graph->RequestResolver(id, true) != nullptr;
         }
 
-        inline void TrackDefaultDescriptorIdentifier(RenderGraph* graph, std::vector<ResourceIdentifier>& ids, const ResourceIdentifier& id) {
-		if (!IsResolverBackedIdentifier(graph, id)) {
-			AppendUniqueIdentifier(ids, id);
-		}
+        inline void TrackDefaultDescriptorIdentifier(RenderGraph* graph, std::vector<AutoDescriptorRegistration>& registrations, const ResourceIdentifier& id, DescriptorType type) {
+            if (IsResolverBackedIdentifier(graph, id)) {
+                return;
+            }
+
+            DescriptorAccessor accessor{};
+            accessor.type = type;
+            accessor.mip = 0;
+            accessor.slice = 0;
+            AppendUniqueDescriptorRegistration(registrations, AutoDescriptorRegistration{ id, accessor });
         }
 
-        inline void TrackDefaultDescriptorIdentifier(RenderGraph* graph, std::vector<ResourceIdentifier>& ids, const ResourceIdentifierAndRange& idAndRange) {
-		if (IsWholeRange(idAndRange.range) && !IsResolverBackedIdentifier(graph, idAndRange.identifier)) {
-			AppendUniqueIdentifier(ids, idAndRange.identifier);
-		}
+        inline void TrackDefaultDescriptorIdentifier(RenderGraph* graph, std::vector<AutoDescriptorRegistration>& registrations, const ResourceIdentifierAndRange& idAndRange, DescriptorType type) {
+            if (IsResolverBackedIdentifier(graph, idAndRange.identifier)) {
+                return;
+            }
+
+            unsigned int mip = 0;
+            unsigned int slice = 0;
+            if (!TryResolveAutoDescriptorRange(idAndRange.range, mip, slice)) {
+                return;
+            }
+
+            DescriptorAccessor accessor{};
+            accessor.type = type;
+            accessor.mip = mip;
+            accessor.slice = slice;
+            AppendUniqueDescriptorRegistration(registrations, AutoDescriptorRegistration{ idAndRange.identifier, accessor });
         }
 
-        inline void TrackDefaultDescriptorIdentifier(RenderGraph* graph, std::vector<ResourceIdentifier>& ids, const char* id) {
-		TrackDefaultDescriptorIdentifier(graph, ids, ResourceIdentifier{ id });
+        inline void TrackDefaultDescriptorIdentifier(RenderGraph* graph, std::vector<AutoDescriptorRegistration>& registrations, const char* id, DescriptorType type) {
+        TrackDefaultDescriptorIdentifier(graph, registrations, ResourceIdentifier{ id }, type);
         }
 
-        inline void TrackDefaultDescriptorIdentifier(RenderGraph* graph, std::vector<ResourceIdentifier>& ids, std::string_view id) {
-		TrackDefaultDescriptorIdentifier(graph, ids, ResourceIdentifier{ id });
+        inline void TrackDefaultDescriptorIdentifier(RenderGraph* graph, std::vector<AutoDescriptorRegistration>& registrations, std::string_view id, DescriptorType type) {
+        TrackDefaultDescriptorIdentifier(graph, registrations, ResourceIdentifier{ id }, type);
         }
 
         template<class S>
 		requires (StringLike<S> && !std::is_same_v<std::remove_cvref_t<S>, const char*> && !std::is_same_v<std::remove_cvref_t<S>, char*>)
-        inline void TrackDefaultDescriptorIdentifier(RenderGraph* graph, std::vector<ResourceIdentifier>& ids, S&& id) {
-		TrackDefaultDescriptorIdentifier(graph, ids, ResourceIdentifier{ std::string_view{ std::forward<S>(id) } });
+        inline void TrackDefaultDescriptorIdentifier(RenderGraph* graph, std::vector<AutoDescriptorRegistration>& registrations, S&& id, DescriptorType type) {
+        TrackDefaultDescriptorIdentifier(graph, registrations, ResourceIdentifier{ std::string_view{ std::forward<S>(id) } }, type);
 	}
 
         template<typename T>
-        inline void TrackDefaultDescriptorIdentifier(RenderGraph*, std::vector<ResourceIdentifier>&, const std::shared_ptr<T>&) {}
+        inline void TrackDefaultDescriptorIdentifier(RenderGraph*, std::vector<AutoDescriptorRegistration>&, const std::shared_ptr<T>&, DescriptorType) {}
 
-        inline void TrackDefaultDescriptorIdentifier(RenderGraph*, std::vector<ResourceIdentifier>&, const ResourcePtrAndRange&) {}
-        inline void TrackDefaultDescriptorIdentifier(RenderGraph*, std::vector<ResourceIdentifier>&, const ResourceHandleAndRange&) {}
-        inline void TrackDefaultDescriptorIdentifier(RenderGraph*, std::vector<ResourceIdentifier>&, const ResourceResolverAndRange&) {}
-        inline void TrackDefaultDescriptorIdentifier(RenderGraph*, std::vector<ResourceIdentifier>&, const IResourceResolver&) {}
+        inline void TrackDefaultDescriptorIdentifier(RenderGraph*, std::vector<AutoDescriptorRegistration>&, const ResourcePtrAndRange&, DescriptorType) {}
+        inline void TrackDefaultDescriptorIdentifier(RenderGraph*, std::vector<AutoDescriptorRegistration>&, const ResourceHandleAndRange&, DescriptorType) {}
+        inline void TrackDefaultDescriptorIdentifier(RenderGraph*, std::vector<AutoDescriptorRegistration>&, const ResourceResolverAndRange&, DescriptorType) {}
+        inline void TrackDefaultDescriptorIdentifier(RenderGraph*, std::vector<AutoDescriptorRegistration>&, const IResourceResolver&, DescriptorType) {}
 }
 
 template<class S>
@@ -1009,7 +1051,7 @@ private:
 	template<typename T>
         requires ResourceLike<T>
 	RenderPassBuilder& addShaderResource(T&& x) {
-        detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorShaderResources, x);
+    detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorShaderResources, x, DescriptorType::SRV);
         detail::AppendTrackedResource(graph, _declaredIds, params.shaderResources, std::forward<T>(x));
 		return *this;
 	}
@@ -1094,7 +1136,7 @@ private:
 	template<typename T>
         requires ResourceLike<T>
 	RenderPassBuilder& addUnorderedAccess(T&& x) {
-        detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorUnorderedAccessViews, x);
+    detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorUnorderedAccessViews, x, DescriptorType::UAV);
         detail::AppendTrackedResource(graph, _declaredIds, params.unorderedAccessViews, std::forward<T>(x));
 		return *this;
 	}
@@ -1526,7 +1568,7 @@ private:
 	template<typename T>
         requires ResourceLike<T>
 	ComputePassBuilder& addShaderResource(T&& x) {
-        detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorShaderResources, x);
+    detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorShaderResources, x, DescriptorType::SRV);
         detail::AppendTrackedResource(graph, _declaredIds, params.shaderResources, std::forward<T>(x));
 		return *this;
 	}
@@ -1544,7 +1586,7 @@ private:
 	template<typename T>
         requires ResourceLike<T>
 	ComputePassBuilder& addConstantBuffer(T&& x) {
-        detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorConstantBuffers, x);
+    detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorConstantBuffers, x, DescriptorType::CBV);
         detail::AppendTrackedResource(graph, _declaredIds, params.constantBuffers, std::forward<T>(x));
 		return *this;
 	}
@@ -1562,7 +1604,7 @@ private:
 	template<typename T>
         requires ResourceLike<T>
 	ComputePassBuilder& addUnorderedAccess(T&& x) {
-        detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorUnorderedAccessViews, x);
+    detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorUnorderedAccessViews, x, DescriptorType::UAV);
         detail::AppendTrackedResource(graph, _declaredIds, params.unorderedAccessViews, std::forward<T>(x));
 		return *this;
 	}

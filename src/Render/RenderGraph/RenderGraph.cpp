@@ -2011,6 +2011,8 @@ void RenderGraph::CompileStructural() {
 				par.resources.frameResourceRequirements = par.resources.staticResourceRequirements;
 				par.resources.internalTransitions = b.params.internalTransitions;
 				par.resources.identifierSet = b.DeclaredResourceIds();
+				par.resources.autoDescriptorShaderResources = b.params.autoDescriptorShaderResources;
+				par.resources.autoDescriptorUnorderedAccessViews = b.params.autoDescriptorUnorderedAccessViews;
 				par.resources.isGeometryPass = b.params.isGeometryPass;
 				par.resources.queueSelection = d.renderQueueSelection.value_or(RenderQueueSelection::Graphics);
 				par.resources.queueSlotOverride = d.queueSlotOverride;
@@ -2034,6 +2036,9 @@ void RenderGraph::CompileStructural() {
 				par.resources.frameResourceRequirements = par.resources.staticResourceRequirements;
 				par.resources.internalTransitions = b.params.internalTransitions;
 				par.resources.identifierSet = b.DeclaredResourceIds();
+				par.resources.autoDescriptorShaderResources = b.params.autoDescriptorShaderResources;
+				par.resources.autoDescriptorConstantBuffers = b.params.autoDescriptorConstantBuffers;
+				par.resources.autoDescriptorUnorderedAccessViews = b.params.autoDescriptorUnorderedAccessViews;
 				par.resources.queueSelection = d.computeQueueSelection.value_or(ComputeQueueSelection::Compute);
 				par.resources.queueSlotOverride = d.queueSlotOverride;
 				MaterializeReferencedResources(par.resources.staticResourceRequirements, par.resources.internalTransitions);

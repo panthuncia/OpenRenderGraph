@@ -27,9 +27,9 @@ struct ComputePassParameters {
 	std::vector<std::pair<ResourceHandleAndRange, ResourceState>> internalTransitions;
 
 	std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> identifierSet;
-	std::vector<ResourceIdentifier> autoDescriptorShaderResources;
-	std::vector<ResourceIdentifier> autoDescriptorConstantBuffers;
-	std::vector<ResourceIdentifier> autoDescriptorUnorderedAccessViews;
+	std::vector<AutoDescriptorRegistration> autoDescriptorShaderResources;
+	std::vector<AutoDescriptorRegistration> autoDescriptorConstantBuffers;
+	std::vector<AutoDescriptorRegistration> autoDescriptorUnorderedAccessViews;
 	std::vector<ResourceRequirement> staticResourceRequirements; // Static resource requirements for the pass
 	std::vector<ResourceRequirement> frameResourceRequirements; // Resource requirements that may change each frame + static ones
 	ComputeQueueSelection queueSelection = ComputeQueueSelection::Compute;
@@ -49,18 +49,18 @@ public:
 
 	void SetResourceRegistryView(
 		std::shared_ptr<ResourceRegistryView> resourceRegistryView,
-		const std::vector<ResourceIdentifier>& autoDescriptorShaderResources,
-		const std::vector<ResourceIdentifier>& autoDescriptorConstantBuffers,
-		const std::vector<ResourceIdentifier>& autoDescriptorUnorderedAccessViews) {
+		const std::vector<AutoDescriptorRegistration>& autoDescriptorShaderResources,
+		const std::vector<AutoDescriptorRegistration>& autoDescriptorConstantBuffers,
+		const std::vector<AutoDescriptorRegistration>& autoDescriptorUnorderedAccessViews) {
 		SetResourceRegistryView(std::move(resourceRegistryView));
-		for (const auto& resourceId : autoDescriptorShaderResources) {
-			m_resourceDescriptorIndexHelper->RegisterSRV(resourceId, 0, 0);
+		for (const auto& registration : autoDescriptorShaderResources) {
+			m_resourceDescriptorIndexHelper->RegisterDescriptor(registration);
 		}
-		for (const auto& resourceId : autoDescriptorConstantBuffers) {
-			m_resourceDescriptorIndexHelper->RegisterCBV(resourceId);
+		for (const auto& registration : autoDescriptorConstantBuffers) {
+			m_resourceDescriptorIndexHelper->RegisterDescriptor(registration);
 		}
-		for (const auto& resourceId : autoDescriptorUnorderedAccessViews) {
-			m_resourceDescriptorIndexHelper->RegisterUAV(resourceId, 0, 0);
+		for (const auto& registration : autoDescriptorUnorderedAccessViews) {
+			m_resourceDescriptorIndexHelper->RegisterDescriptor(registration);
 		}
 	}
 
