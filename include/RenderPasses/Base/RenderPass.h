@@ -32,6 +32,8 @@ struct RenderPassParameters {
 	std::vector<std::pair<ResourceHandleAndRange, ResourceState>> internalTransitions;
 
 	std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> identifierSet;
+	std::vector<ResourceIdentifier> autoDescriptorShaderResources;
+	std::vector<ResourceIdentifier> autoDescriptorUnorderedAccessViews;
 	std::vector<ResourceRequirement> staticResourceRequirements; // Static resource requirements for the pass
 	std::vector<ResourceRequirement> frameResourceRequirements; // Resource requirements that may change each frame + static ones
 	bool isGeometryPass = false;
@@ -48,6 +50,19 @@ public:
 	void SetResourceRegistryView(std::shared_ptr<ResourceRegistryView> resourceRegistryView) {
 		m_resourceRegistryView = resourceRegistryView;
 		m_resourceDescriptorIndexHelper = std::make_unique<ResourceDescriptorIndexHelper>(resourceRegistryView);
+	}
+
+	void SetResourceRegistryView(
+		std::shared_ptr<ResourceRegistryView> resourceRegistryView,
+		const std::vector<ResourceIdentifier>& autoDescriptorShaderResources,
+		const std::vector<ResourceIdentifier>& autoDescriptorUnorderedAccessViews) {
+		SetResourceRegistryView(std::move(resourceRegistryView));
+		for (const auto& resourceId : autoDescriptorShaderResources) {
+			m_resourceDescriptorIndexHelper->RegisterSRV(resourceId, 0, 0);
+		}
+		for (const auto& resourceId : autoDescriptorUnorderedAccessViews) {
+			m_resourceDescriptorIndexHelper->RegisterUAV(resourceId, 0, 0);
+		}
 	}
 
     virtual void Setup() = 0;

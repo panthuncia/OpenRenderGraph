@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <type_traits>
 #include <memory>
 #include <rhi.h>
@@ -391,6 +392,57 @@ namespace detail
     template<class S>
     concept StringLike =
         std::convertible_to<S, std::string_view>;
+
+        inline bool IsWholeRange(const RangeSpec& range) {
+		return range.mipLower == Bound{ BoundType::All, 0 }
+			&& range.mipUpper == Bound{ BoundType::All, 0 }
+			&& range.sliceLower == Bound{ BoundType::All, 0 }
+			&& range.sliceUpper == Bound{ BoundType::All, 0 };
+        }
+
+        inline void AppendUniqueIdentifier(std::vector<ResourceIdentifier>& ids, const ResourceIdentifier& id) {
+		if (std::find(ids.begin(), ids.end(), id) == ids.end()) {
+			ids.push_back(id);
+		}
+        }
+
+        inline bool IsResolverBackedIdentifier(RenderGraph* graph, const ResourceIdentifier& id) {
+		return graph != nullptr && graph->RequestResolver(id, true) != nullptr;
+        }
+
+        inline void TrackDefaultDescriptorIdentifier(RenderGraph* graph, std::vector<ResourceIdentifier>& ids, const ResourceIdentifier& id) {
+		if (!IsResolverBackedIdentifier(graph, id)) {
+			AppendUniqueIdentifier(ids, id);
+		}
+        }
+
+        inline void TrackDefaultDescriptorIdentifier(RenderGraph* graph, std::vector<ResourceIdentifier>& ids, const ResourceIdentifierAndRange& idAndRange) {
+		if (IsWholeRange(idAndRange.range) && !IsResolverBackedIdentifier(graph, idAndRange.identifier)) {
+			AppendUniqueIdentifier(ids, idAndRange.identifier);
+		}
+        }
+
+        inline void TrackDefaultDescriptorIdentifier(RenderGraph* graph, std::vector<ResourceIdentifier>& ids, const char* id) {
+		TrackDefaultDescriptorIdentifier(graph, ids, ResourceIdentifier{ id });
+        }
+
+        inline void TrackDefaultDescriptorIdentifier(RenderGraph* graph, std::vector<ResourceIdentifier>& ids, std::string_view id) {
+		TrackDefaultDescriptorIdentifier(graph, ids, ResourceIdentifier{ id });
+        }
+
+        template<class S>
+		requires (StringLike<S> && !std::is_same_v<std::remove_cvref_t<S>, const char*> && !std::is_same_v<std::remove_cvref_t<S>, char*>)
+        inline void TrackDefaultDescriptorIdentifier(RenderGraph* graph, std::vector<ResourceIdentifier>& ids, S&& id) {
+		TrackDefaultDescriptorIdentifier(graph, ids, ResourceIdentifier{ std::string_view{ std::forward<S>(id) } });
+	}
+
+        template<typename T>
+        inline void TrackDefaultDescriptorIdentifier(RenderGraph*, std::vector<ResourceIdentifier>&, const std::shared_ptr<T>&) {}
+
+        inline void TrackDefaultDescriptorIdentifier(RenderGraph*, std::vector<ResourceIdentifier>&, const ResourcePtrAndRange&) {}
+        inline void TrackDefaultDescriptorIdentifier(RenderGraph*, std::vector<ResourceIdentifier>&, const ResourceHandleAndRange&) {}
+        inline void TrackDefaultDescriptorIdentifier(RenderGraph*, std::vector<ResourceIdentifier>&, const ResourceResolverAndRange&) {}
+        inline void TrackDefaultDescriptorIdentifier(RenderGraph*, std::vector<ResourceIdentifier>&, const IResourceResolver&) {}
 }
 
 template<class S>
@@ -889,6 +941,12 @@ public:
     auto const& DeclaredResourceIds() const { return _declaredIds; }
 
 private:
+    struct AuthorState {
+        RenderPassParameters params;
+        std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> declaredIds;
+        std::vector<ResolverSnapshot> resolverSnapshots;
+    };
+
     RenderPassBuilder(RenderGraph* g, std::string name)
         : graph(g), passName(std::move(name)) {}
 
@@ -900,10 +958,30 @@ private:
 	RenderPassBuilder& operator=(const RenderPassBuilder&) = default;
 	RenderPassBuilder& operator=(RenderPassBuilder&&) = default;
 
+    AuthorState CaptureAuthorState() && {
+        return {
+            std::move(params),
+            std::move(_declaredIds),
+            std::move(resolverSnapshots_)
+        };
+    }
+
+    void RestoreAuthorState(AuthorState&& state) {
+        params = std::move(state.params);
+        _declaredIds = std::move(state.declaredIds);
+        resolverSnapshots_ = std::move(state.resolverSnapshots);
+    }
+
     void Finalize() {
         if (!built_) return;
 
-        params = {}; // Reset params to clear any resources from previous build
+        auto authorState = std::move(*this).CaptureAuthorState();
+
+        params = {}; // Rebuild pass-declared state from scratch each finalize.
+        _declaredIds.clear();
+        resolverSnapshots_.clear();
+
+        RestoreAuthorState(std::move(authorState));
 
         pass->DeclareResourceUsages(this);
 
@@ -931,6 +1009,7 @@ private:
 	template<typename T>
         requires ResourceLike<T>
 	RenderPassBuilder& addShaderResource(T&& x) {
+        detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorShaderResources, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.shaderResources, std::forward<T>(x));
 		return *this;
 	}
@@ -1015,6 +1094,7 @@ private:
 	template<typename T>
         requires ResourceLike<T>
 	RenderPassBuilder& addUnorderedAccess(T&& x) {
+        detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorUnorderedAccessViews, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.unorderedAccessViews, std::forward<T>(x));
 		return *this;
 	}
@@ -1380,6 +1460,12 @@ public:
     auto const& DeclaredResourceIds() const { return _declaredIds; }
 
 private:
+    struct AuthorState {
+        ComputePassParameters params;
+        std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> declaredIds;
+        std::vector<ResolverSnapshot> resolverSnapshots;
+    };
+
     ComputePassBuilder(RenderGraph* g, std::string name)
         : graph(g), passName(std::move(name)) {}
 
@@ -1391,10 +1477,30 @@ private:
     ComputePassBuilder& operator=(const ComputePassBuilder&) = default;
     ComputePassBuilder& operator=(ComputePassBuilder&&) = default;
 
+    AuthorState CaptureAuthorState() && {
+        return {
+            std::move(params),
+            std::move(_declaredIds),
+            std::move(resolverSnapshots_)
+        };
+    }
+
+    void RestoreAuthorState(AuthorState&& state) {
+        params = std::move(state.params);
+        _declaredIds = std::move(state.declaredIds);
+        resolverSnapshots_ = std::move(state.resolverSnapshots);
+    }
+
     void Finalize() {
         if (!built_) return;
 
-        params = {}; // Reset params to clear any resources from previous build
+        auto authorState = std::move(*this).CaptureAuthorState();
+
+        params = {};
+        _declaredIds.clear();
+        resolverSnapshots_.clear();
+
+        RestoreAuthorState(std::move(authorState));
 
         pass->DeclareResourceUsages(this);
 
@@ -1420,6 +1526,7 @@ private:
 	template<typename T>
         requires ResourceLike<T>
 	ComputePassBuilder& addShaderResource(T&& x) {
+        detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorShaderResources, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.shaderResources, std::forward<T>(x));
 		return *this;
 	}
@@ -1437,6 +1544,7 @@ private:
 	template<typename T>
         requires ResourceLike<T>
 	ComputePassBuilder& addConstantBuffer(T&& x) {
+        detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorConstantBuffers, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.constantBuffers, std::forward<T>(x));
 		return *this;
 	}
@@ -1454,6 +1562,7 @@ private:
 	template<typename T>
         requires ResourceLike<T>
 	ComputePassBuilder& addUnorderedAccess(T&& x) {
+        detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorUnorderedAccessViews, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.unorderedAccessViews, std::forward<T>(x));
 		return *this;
 	}
@@ -1708,6 +1817,12 @@ public:
     auto const& DeclaredResourceIds() const { return _declaredIds; }
 
 private:
+    struct AuthorState {
+        CopyPassParameters params;
+        std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> declaredIds;
+        std::vector<ResolverSnapshot> resolverSnapshots;
+    };
+
     CopyPassBuilder(RenderGraph* g, std::string name)
         : graph(g), passName(std::move(name)) {}
 
@@ -1716,10 +1831,30 @@ private:
     CopyPassBuilder& operator=(const CopyPassBuilder&) = default;
     CopyPassBuilder& operator=(CopyPassBuilder&&) = default;
 
+    AuthorState CaptureAuthorState() && {
+        return {
+            std::move(params),
+            std::move(_declaredIds),
+            std::move(resolverSnapshots_)
+        };
+    }
+
+    void RestoreAuthorState(AuthorState&& state) {
+        params = std::move(state.params);
+        _declaredIds = std::move(state.declaredIds);
+        resolverSnapshots_ = std::move(state.resolverSnapshots);
+    }
+
     void Finalize() {
         if (!built_) return;
 
+        auto authorState = std::move(*this).CaptureAuthorState();
+
         params = {};
+        _declaredIds.clear();
+        resolverSnapshots_.clear();
+
+        RestoreAuthorState(std::move(authorState));
 
         pass->DeclareResourceUsages(this);
 

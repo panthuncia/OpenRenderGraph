@@ -526,6 +526,7 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph
 		uint64_t sizeBytes = 0;
 		uint64_t alignment = 1;
 		size_t firstUse = std::numeric_limits<size_t>::max();
+		size_t firstUsePassIndex = std::numeric_limits<size_t>::max();
 		size_t lastUse = 0;
 		bool firstUseIsWrite = false;
 		bool manualPoolAssigned = false;
@@ -534,9 +535,34 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph
 
 	std::unordered_map<uint64_t, Candidate> candidates;
 	auto device = DeviceManager::GetInstance().GetDevice();
+	auto getPassTypeName = [](RenderGraph::PassType passType) -> const char* {
+		switch (passType) {
+		case RenderGraph::PassType::Render:
+			return "Render";
+		case RenderGraph::PassType::Compute:
+			return "Compute";
+		case RenderGraph::PassType::Copy:
+			return "Copy";
+		default:
+			return "Unknown";
+		}
+	};
+	auto getPassDebugName = [&](size_t passIndex) {
+		if (passIndex >= m_framePasses.size()) {
+			return std::string("<unknown>");
+		}
+
+		const auto& pass = m_framePasses[passIndex];
+		if (!pass.name.empty()) {
+			return pass.name;
+		}
+
+		return std::string(getPassTypeName(pass.type)) + "Pass#" + std::to_string(passIndex);
+	};
 
 	for (size_t passIdx = 0; passIdx < m_framePasses.size(); ++passIdx) {
 		const size_t usageOrder = passTopoRank[passIdx];
+		const auto& any = m_framePasses[passIdx];
 		auto collectHandle = [&](const ResourceRegistry::RegistryHandle& handle, bool isWrite) {
 			if (handle.IsEphemeral()) {
 				return;
@@ -573,9 +599,13 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph
 				c.poolID = poolID.value();
 				if (usageOrder < c.firstUse) {
 					c.firstUse = usageOrder;
+					c.firstUsePassIndex = passIdx;
 					c.firstUseIsWrite = isWrite;
 				}
 				else if (usageOrder == c.firstUse) {
+					if (c.firstUsePassIndex == std::numeric_limits<size_t>::max()) {
+						c.firstUsePassIndex = passIdx;
+					}
 					c.firstUseIsWrite = c.firstUseIsWrite || isWrite;
 				}
 				c.lastUse = std::max(c.lastUse, usageOrder);
@@ -617,9 +647,13 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph
 			c.poolID = poolID.value();
 			if (usageOrder < c.firstUse) {
 				c.firstUse = usageOrder;
+				c.firstUsePassIndex = passIdx;
 				c.firstUseIsWrite = isWrite;
 			}
 			else if (usageOrder == c.firstUse) {
+				if (c.firstUsePassIndex == std::numeric_limits<size_t>::max()) {
+					c.firstUsePassIndex = passIdx;
+				}
 				c.firstUseIsWrite = c.firstUseIsWrite || isWrite;
 			}
 			c.lastUse = std::max(c.lastUse, usageOrder);
@@ -634,7 +668,6 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph
 			}
 		};
 
-		auto const& any = m_framePasses[passIdx];
 		if (any.type == RenderGraph::PassType::Render) {
 			auto const& p = std::get<RenderGraph::RenderPassAndResources>(any.pass);
 			for (auto const& req : p.resources.frameResourceRequirements) {
@@ -676,15 +709,25 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph
 			const std::string resourceName = (itRes != resourcesByID.end() && itRes->second)
 				? itRes->second->GetName()
 				: std::string("<unknown>");
+			const std::string firstUsePassName = getPassDebugName(c.firstUsePassIndex);
+			const char* firstUsePassType =
+				(c.firstUsePassIndex < m_framePasses.size())
+				? getPassTypeName(m_framePasses[c.firstUsePassIndex].type)
+				: "Unknown";
 
-			throw std::runtime_error(
+			std::string message =
 				"Aliasing candidate has first-use READ (explicit alias initialization unavailable). "
 				"resourceId=" + std::to_string(c.resourceID) +
 				" name='" + resourceName + "'" +
 				" poolId=" + std::to_string(c.poolID) +
 				" manualPool=" + std::to_string(c.manualPoolAssigned ? 1 : 0) +
+				" firstUsePassIndex=" + std::to_string(static_cast<uint64_t>(c.firstUsePassIndex)) +
+				" firstUsePassType='" + std::string(firstUsePassType) + "'" +
+				" firstUsePassName='" + firstUsePassName + "'" +
 				" firstUseTopoRank=" + std::to_string(static_cast<uint64_t>(c.firstUse)) +
-				". Resource should either be non-aliased, initialized before first read, or first-used as write.");
+				". Resource should either be non-aliased, initialized before first read, or first-used as write.";
+			spdlog::error(message);
+			throw std::runtime_error(message);
 		}
 
 		byPool[c.poolID].push_back(c);

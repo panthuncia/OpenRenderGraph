@@ -2441,6 +2441,8 @@ void RenderGraph::RefreshRetainedDeclarationsForFrame(RenderPassAndResources& p,
 	p.resources.internalTransitions = b.params.internalTransitions;
 
 	p.resources.identifierSet = b.DeclaredResourceIds();
+	p.resources.autoDescriptorShaderResources = b.params.autoDescriptorShaderResources;
+	p.resources.autoDescriptorUnorderedAccessViews = b.params.autoDescriptorUnorderedAccessViews;
 	MaterializeReferencedResources(p.resources.staticResourceRequirements, p.resources.internalTransitions);
 
 	// Transfer resolver snapshots for auto-invalidation tracking
@@ -2448,7 +2450,9 @@ void RenderGraph::RefreshRetainedDeclarationsForFrame(RenderPassAndResources& p,
 
 	// Ensure the pass's view matches the refreshed identifier set
 	p.pass->SetResourceRegistryView(
-		std::make_unique<ResourceRegistryView>(_registry, p.resources.identifierSet)
+		std::make_unique<ResourceRegistryView>(_registry, p.resources.identifierSet),
+		p.resources.autoDescriptorShaderResources,
+		p.resources.autoDescriptorUnorderedAccessViews
 	);
 	p.pass->Setup();
 }
@@ -2467,13 +2471,19 @@ void RenderGraph::RefreshRetainedDeclarationsForFrame(ComputePassAndResources& p
 	p.resources.staticResourceRequirements = b.GatherResourceRequirements();
 	p.resources.internalTransitions = b.params.internalTransitions;
 	p.resources.identifierSet = b.DeclaredResourceIds();
+	p.resources.autoDescriptorShaderResources = b.params.autoDescriptorShaderResources;
+	p.resources.autoDescriptorConstantBuffers = b.params.autoDescriptorConstantBuffers;
+	p.resources.autoDescriptorUnorderedAccessViews = b.params.autoDescriptorUnorderedAccessViews;
 	MaterializeReferencedResources(p.resources.staticResourceRequirements, p.resources.internalTransitions);
 
 	// Transfer resolver snapshots for auto-invalidation tracking
 	p.resolverSnapshots = b.TakeResolverSnapshots();
 
 	p.pass->SetResourceRegistryView(
-		std::make_unique<ResourceRegistryView>(_registry, p.resources.identifierSet)
+		std::make_unique<ResourceRegistryView>(_registry, p.resources.identifierSet),
+		p.resources.autoDescriptorShaderResources,
+		p.resources.autoDescriptorConstantBuffers,
+		p.resources.autoDescriptorUnorderedAccessViews
 	);
 
 	p.pass->Setup();
@@ -2752,13 +2762,17 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 					par.resources.frameResourceRequirements = par.resources.staticResourceRequirements;
 					par.resources.internalTransitions = b.params.internalTransitions;
 					par.resources.identifierSet = b.DeclaredResourceIds();
+					par.resources.autoDescriptorShaderResources = b.params.autoDescriptorShaderResources;
+					par.resources.autoDescriptorUnorderedAccessViews = b.params.autoDescriptorUnorderedAccessViews;
 					par.resources.isGeometryPass = b.params.isGeometryPass;
 					par.resources.queueSelection = d.renderQueueSelection.value_or(RenderQueueSelection::Graphics);
 					par.resources.queueSlotOverride = d.queueSlotOverride;
 				}
 
 				par.pass->SetResourceRegistryView(
-					std::make_unique<ResourceRegistryView>(_registry, par.resources.identifierSet)
+						std::make_unique<ResourceRegistryView>(_registry, par.resources.identifierSet),
+						par.resources.autoDescriptorShaderResources,
+						par.resources.autoDescriptorUnorderedAccessViews
 				);
 				par.pass->Setup();
 				any.pass = std::move(par);
@@ -2779,12 +2793,18 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 					par.resources.frameResourceRequirements = par.resources.staticResourceRequirements;
 					par.resources.internalTransitions = b.params.internalTransitions;
 					par.resources.identifierSet = b.DeclaredResourceIds();
+					par.resources.autoDescriptorShaderResources = b.params.autoDescriptorShaderResources;
+					par.resources.autoDescriptorConstantBuffers = b.params.autoDescriptorConstantBuffers;
+					par.resources.autoDescriptorUnorderedAccessViews = b.params.autoDescriptorUnorderedAccessViews;
 					par.resources.queueSelection = d.computeQueueSelection.value_or(ComputeQueueSelection::Compute);
 					par.resources.queueSlotOverride = d.queueSlotOverride;
 				}
 
 				par.pass->SetResourceRegistryView(
-					std::make_unique<ResourceRegistryView>(_registry, par.resources.identifierSet)
+						std::make_unique<ResourceRegistryView>(_registry, par.resources.identifierSet),
+						par.resources.autoDescriptorShaderResources,
+						par.resources.autoDescriptorConstantBuffers,
+						par.resources.autoDescriptorUnorderedAccessViews
 				);
 				par.pass->Setup();
 				any.pass = std::move(par);
@@ -3948,13 +3968,20 @@ void RenderGraph::Setup() {
 		switch (pass.type) {
 		case PassType::Render: {
 			auto& renderPass = std::get<RenderPassAndResources>(pass.pass);
-			renderPass.pass->SetResourceRegistryView(std::make_unique<ResourceRegistryView>(_registry, renderPass.resources.identifierSet));
+			renderPass.pass->SetResourceRegistryView(
+				std::make_unique<ResourceRegistryView>(_registry, renderPass.resources.identifierSet),
+				renderPass.resources.autoDescriptorShaderResources,
+				renderPass.resources.autoDescriptorUnorderedAccessViews);
 			renderPass.pass->Setup();
 			break;
 		}
 		case PassType::Compute: {
 			auto& computePass = std::get<ComputePassAndResources>(pass.pass);
-			computePass.pass->SetResourceRegistryView(std::make_unique<ResourceRegistryView>(_registry, computePass.resources.identifierSet));
+			computePass.pass->SetResourceRegistryView(
+				std::make_unique<ResourceRegistryView>(_registry, computePass.resources.identifierSet),
+				computePass.resources.autoDescriptorShaderResources,
+				computePass.resources.autoDescriptorConstantBuffers,
+				computePass.resources.autoDescriptorUnorderedAccessViews);
 			computePass.pass->Setup();
 			break;
 		}
