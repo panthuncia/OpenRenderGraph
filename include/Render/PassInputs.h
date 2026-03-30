@@ -6,10 +6,71 @@
 #include <cassert>
 #include <utility>
 #include <typeindex>
+#include <functional>
+#include <type_traits>
+
+#include <boost/container_hash/hash.hpp>
 
 namespace rg {
 
     using Hash64 = std::uint64_t;
+
+    namespace detail {
+        template<class>
+        inline constexpr bool always_false_v = false;
+    }
+
+    constexpr Hash64 HashCombine(Hash64 seed, Hash64 value) noexcept {
+        seed ^= value + 0x9e3779b97f4a7c15ull + (seed << 6) + (seed >> 2);
+        return seed;
+    }
+
+    template<class T>
+    concept HasAdlHashValue = requires(const T& value) {
+        { HashValue(value) } -> std::convertible_to<Hash64>;
+    };
+
+    template<class T>
+    concept HasStdHash = requires(const T& value) {
+        { std::hash<std::remove_cvref_t<T>>{}(value) } -> std::convertible_to<std::size_t>;
+    };
+
+    template<class T>
+    concept HasBoostHash = requires(const T& value) {
+        { boost::hash<std::remove_cvref_t<T>>{}(value) } -> std::convertible_to<std::size_t>;
+    };
+
+    template<class T>
+    Hash64 FieldHash(const T& value) {
+        using ValueType = std::remove_cvref_t<T>;
+        if constexpr (HasAdlHashValue<ValueType>) {
+            return HashValue(value);
+        }
+        else if constexpr (std::is_enum_v<ValueType>) {
+            return static_cast<Hash64>(static_cast<std::underlying_type_t<ValueType>>(value));
+        }
+        else if constexpr (HasStdHash<ValueType>) {
+            return static_cast<Hash64>(std::hash<ValueType>{}(value));
+        }
+        else if constexpr (HasBoostHash<ValueType>) {
+            return static_cast<Hash64>(boost::hash<ValueType>{}(value));
+        }
+        else {
+            static_assert(detail::always_false_v<ValueType>, "Field type is not hashable for RG_DEFINE_PASS_INPUTS");
+        }
+    }
+
+    template<class T, auto... Members>
+    Hash64 AutoHashMembers(const T& value) {
+        Hash64 seed = 0;
+        ((seed = HashCombine(seed, FieldHash(value.*Members))), ...);
+        return seed;
+    }
+
+    template<class T, auto... Members>
+    bool AutoEqualMembers(const T& a, const T& b) {
+        return (((a.*Members) == (b.*Members)) && ...);
+    }
 
     // ADL hook: user defines `HashValue(const T&) -> Hash64` in T's namespace.
     template<class T>
@@ -19,9 +80,6 @@ namespace rg {
             { a == b } -> std::convertible_to<bool>;
     };
 
-	// Dummy hash type for passes with no inputs.
-    using Hash64 = std::uint64_t;
-
     struct NoInputs {
         friend bool operator==(const NoInputs&, const NoInputs&) = default;
     };
@@ -29,6 +87,10 @@ namespace rg {
     inline Hash64 HashValue(const NoInputs&) noexcept { return 0; }
 
 } // namespace rg
+
+#define RG_DEFINE_PASS_INPUTS(Type, ...) \
+    friend bool operator==(const Type& a, const Type& b) { return ::rg::AutoEqualMembers<Type, __VA_ARGS__>(a, b); } \
+    friend ::rg::Hash64 HashValue(const Type& value) { return ::rg::AutoHashMembers<Type, __VA_ARGS__>(value); }
 
 struct AnyPassInputs {
     const std::type_info* type = nullptr;

@@ -1,25 +1,23 @@
 #pragma once
 #include "Resources/ResourceIdentifier.h"
+#include <cassert>
+#include <functional>
 #include <memory>
 #include <map>
-#include <vector>
-#include <stdexcept>
-#include <functional>
-#include <unordered_map>
 #include <optional>
+#include <stdexcept>
+#include <unordered_map>
+#include <utility>
+#include <variant>
+#include <vector>
 #include <spdlog/spdlog.h>
 
+#include "Render/PassInputs.h"
 #include "Resources/Resource.h"
 #include "Resources/ResourceStateTracker.h"
 #include "Interfaces/IResourceResolver.h"
 
 class Resource;
-
-#pragma once
-#include <cassert>
-#include <memory>
-#include <utility>
-#include <variant>
 
 template <class T>
 class SharedOrWeakPtr
@@ -124,6 +122,12 @@ public:
         uint64_t GetGlobalResourceID() const { return globalResourceIndex; }
         uint32_t GetNumMipLevels() const { return numMipLevels; }
         uint32_t GetArraySize() const { return arraySize; }
+        bool operator==(const RegistryHandle& other) const noexcept {
+            return globalResourceIndex == other.globalResourceIndex;
+        }
+        friend inline rg::Hash64 HashValue(const RegistryHandle& handle) {
+            return static_cast<rg::Hash64>(handle.GetGlobalResourceID());
+        }
 		//SymbolicTracker* GetStateTracker() const { return tracker; }
         // For ephemeral handles that bypass registry storage
         static RegistryHandle MakeEphemeral(Resource* raw) {

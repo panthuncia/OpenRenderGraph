@@ -45,7 +45,7 @@ public:
             }
             // Upload-heap sources don't need to be declared — they are
             // ephemeral resources pinned via the shared_ptr overload of
-            // CopyBufferRegion in ExecuteImmediate.
+            // CopyBufferRegion in RecordImmediateCommands.
         }
         // Declare all pool slab buffers as copy destinations so the render
         // graph knows about them and can schedule transitions correctly,
@@ -59,7 +59,7 @@ public:
 
     void Setup() override {}
 
-    void ExecuteImmediate(ImmediateExecutionContext& context) override {
+    void RecordImmediateCommands(ImmediateExecutionContext& context) override {
         const auto& inputs = Inputs<StreamingUploadInputs>();
         for (const auto& upload : inputs.uploads) {
             if (!upload.dstResource || !upload.srcUploadBuffer || upload.size == 0) {

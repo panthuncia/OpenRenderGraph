@@ -5,6 +5,8 @@
 #include <span>
 #include <string>
 
+#include "Render/PassInputs.h"
+
 class Resource;
 
 struct ResourceState {
@@ -29,10 +31,8 @@ struct Bound {
     BoundType type;
     uint32_t  value;  // only for Exact, From, UpTo
 
-    bool operator==(Bound const& o) const noexcept {
-        return type  == o.type
-            && value == o.value;
-    }
+    RG_DEFINE_PASS_INPUTS(Bound, &Bound::type, &Bound::value);
+
     bool operator!=(Bound const& o) const noexcept {
         return !(*this == o);
     }
@@ -53,6 +53,8 @@ struct RangeSpec {
     Bound mipUpper   = { BoundType::All, 0 };
     Bound sliceLower = { BoundType::All, 0 };
     Bound sliceUpper = { BoundType::All, 0 };
+
+    RG_DEFINE_PASS_INPUTS(RangeSpec, &RangeSpec::mipLower, &RangeSpec::mipUpper, &RangeSpec::sliceLower, &RangeSpec::sliceUpper);
 };
 
 struct SubresourceRange {

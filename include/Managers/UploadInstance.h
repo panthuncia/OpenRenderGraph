@@ -23,7 +23,7 @@ class Buffer;
 // Usage:
 //   1. Create an UploadInstance (one per subsystem / queue that needs uploads).
 //   2. Call UploadData() / UploadTextureSubresources() during the Update phase.
-//   3. Call ProcessUploads() from a pass's ExecuteImmediate() to emit GPU copies.
+//   3. Call ProcessUploads() from a pass's RecordImmediateCommands() to emit GPU copies.
 //   4. Call ProcessDeferredReleases() once per frame (after GPU retire) to reclaim pages.
 class UploadInstance {
 public:
@@ -73,7 +73,7 @@ public:
 	// Execution
 
 	// Emit GPU copy commands for all queued buffer and texture uploads.
-	// Call from a pass's ExecuteImmediate().
+	// Call from a pass's RecordImmediateCommands().
 	void ProcessUploads(uint8_t frameIndex, rg::imm::ImmediateCommandList& commandList);
 
 	// Retire upload-heap pages that are no longer referenced by any in-flight frame.

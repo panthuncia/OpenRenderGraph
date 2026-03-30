@@ -2679,7 +2679,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			};
 
 			// Record immediate-mode commands
-			p.pass->ExecuteImmediate(c);
+			p.pass->RecordImmediateCommands(c);
 
 			auto immediateFrameData = c.list.Finalize();
 			// If there is a conflict between retained and immediate requirements, split the pass
@@ -2730,7 +2730,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				frameIndex,
 				hostData
 			};
-			p.pass->ExecuteImmediate(c);
+			p.pass->RecordImmediateCommands(c);
 			auto immediateFrameData = c.list.Finalize();
 
 			bool conflict = RequirementsConflict(
@@ -2782,7 +2782,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				hostData
 			};
 
-			p.pass->ExecuteImmediate(c);
+			p.pass->RecordImmediateCommands(c);
 			auto immediateFrameData = c.list.Finalize();
 
 			bool conflict = RequirementsConflict(
@@ -2833,7 +2833,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	explicitAfterByName.reserve(frameExt.size());
 
 	if (!frameExt.empty()) {
-		auto recordImmediate = [&](AnyPassAndResources& pr) {
+		auto recordImmediateCommands = [&](AnyPassAndResources& pr) {
 			if (pr.type == PassType::Compute) {
 				auto& p = std::get<ComputePassAndResources>(pr.pass);
 				p.immediateBytecode.clear();
@@ -2849,7 +2849,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 					hostData
 				};
 
-				p.pass->ExecuteImmediate(c);
+				p.pass->RecordImmediateCommands(c);
 				auto immediateFrameData = c.list.Finalize();
 				p.immediateBytecode = std::move(immediateFrameData.bytecode);
 				p.immediateKeepAlive = std::move(immediateFrameData.keepAlive);
@@ -2874,7 +2874,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 					hostData
 				};
 
-				p.pass->ExecuteImmediate(c);
+				p.pass->RecordImmediateCommands(c);
 				auto immediateFrameData = c.list.Finalize();
 				p.immediateBytecode = std::move(immediateFrameData.bytecode);
 				p.immediateKeepAlive = std::move(immediateFrameData.keepAlive);
@@ -2899,7 +2899,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 					hostData
 				};
 
-				p.pass->ExecuteImmediate(c);
+				p.pass->RecordImmediateCommands(c);
 				auto immediateFrameData = c.list.Finalize();
 				p.immediateBytecode = std::move(immediateFrameData.bytecode);
 				p.immediateKeepAlive = std::move(immediateFrameData.keepAlive);
@@ -2911,7 +2911,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			}
 		};
 
-		// Build name->index map for O(1) anchor lookup instead of linear scan
+		// Build name->index map for O(1) anchor lookup
 		std::unordered_map<std::string, size_t> framePassIndexByName;
 		framePassIndexByName.reserve(m_framePasses.size() + frameExt.size());
 		for (size_t i = 0; i < m_framePasses.size(); ++i) {
@@ -2939,7 +2939,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			}
 
 			AnyPassAndResources any = MaterializeExternalPass(d, true, false);
-			recordImmediate(any);
+			recordImmediateCommands(any);
 
 			// Default insertion: append
 			size_t insertPos = m_framePasses.size();

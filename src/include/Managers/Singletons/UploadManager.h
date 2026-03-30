@@ -133,7 +133,7 @@ private:
 
 		}
 
-		void ExecuteImmediate(ImmediateExecutionContext& context) override {
+		void RecordImmediateCommands(ImmediateExecutionContext& context) override {
 			GetInstance().ExecuteResourceCopies(context.frameIndex, context.list);// copies come before uploads to avoid overwriting data
 			GetInstance().ProcessUploads(context.frameIndex, context.list);
 		}
