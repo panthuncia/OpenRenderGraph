@@ -426,6 +426,8 @@ bool AccessTypeIsWriteOrCommon(rhi::ResourceAccessType t) {
 void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph& rg, const std::vector<AliasSchedulingNode>& nodes) const {
 	auto& aliasMaterializeOptionsByID = rg.aliasMaterializeOptionsByID;
 	auto& aliasActivationPending = rg.aliasActivationPending;
+	auto& autoAliasPreviousMode = rg.autoAliasPreviousMode;
+	auto& autoAliasModeLastFrame = rg.autoAliasModeLastFrame;
 	auto& autoAliasPlannerStats = rg.autoAliasPlannerStats;
 	auto& autoAliasPoolDebug = rg.autoAliasPoolDebug;
 	auto& aliasPoolPlanFrameIndex = rg.aliasPoolPlanFrameIndex;
@@ -464,6 +466,7 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph
 		? m_getAutoAliasPackingStrategy()
 		: AutoAliasPackingStrategy::GreedySweepLine;
 	const bool aliasLoggingEnabled = m_getAutoAliasEnableLogging ? m_getAutoAliasEnableLogging() : false;
+	const bool modeChanged = autoAliasPreviousMode != autoAliasModeLastFrame;
 	const bool packingStrategyChanged = previousPackingStrategy != packingStrategy;
 
 	for (auto& [poolID, poolState] : persistentAliasPools) {
@@ -1183,12 +1186,12 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph
 		const bool needsInitialAllocation = !static_cast<bool>(poolState.allocation);
 		const bool needsLargerHeap = heapSize > poolState.capacityBytes;
 		const bool needsHigherAlignment = poolAlignment > poolState.alignment;
-		const bool shouldShrinkForStrategyChange =
-			packingStrategyChanged &&
+		const bool shouldShrinkForModeOrStrategyChange =
+			(modeChanged || packingStrategyChanged) &&
 			!needsInitialAllocation &&
 			poolState.capacityBytes > heapSize;
 
-		if (needsInitialAllocation || needsLargerHeap || needsHigherAlignment || shouldShrinkForStrategyChange) {
+		if (needsInitialAllocation || needsLargerHeap || needsHigherAlignment || shouldShrinkForModeOrStrategyChange) {
 			uint64_t newCapacity = heapSize;
 			if (!needsInitialAllocation && needsLargerHeap && poolState.capacityBytes > 0) {
 				const double grownTarget = static_cast<double>(poolState.capacityBytes) * static_cast<double>(aliasPoolGrowthHeadroom);
@@ -1233,7 +1236,7 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph
 					"RG alias pool {}: pool={} capacity={} required={} alignment={} placements={} generation={}",
 					needsInitialAllocation
 						? "allocated"
-						: (shouldShrinkForStrategyChange ? "resized" : "grew"),
+						: (shouldShrinkForModeOrStrategyChange ? "resized" : "grew"),
 					poolID,
 					newCapacity,
 					heapSize,

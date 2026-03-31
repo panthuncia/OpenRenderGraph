@@ -969,6 +969,7 @@ private:
 	std::vector<AutoAliasReasonCount> autoAliasExclusionReasonSummary;
 	std::vector<AutoAliasPoolDebug> autoAliasPoolDebug;
 	AutoAliasPlannerStats autoAliasPlannerStats;
+	AutoAliasMode autoAliasPreviousMode = AutoAliasMode::Off;
 	AutoAliasMode autoAliasModeLastFrame = AutoAliasMode::Off;
 	AutoAliasPackingStrategy autoAliasPackingStrategyLastFrame = AutoAliasPackingStrategy::GreedySweepLine;
 	std::function<AutoAliasMode()> m_getAutoAliasMode;

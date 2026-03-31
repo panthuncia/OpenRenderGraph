@@ -68,11 +68,13 @@ void rg::alias::RenderGraphAliasingSubsystem::ResetPerFrameState(RenderGraph& re
 	renderGraph.autoAliasExclusionReasonByID.clear();
 	renderGraph.autoAliasExclusionReasonSummary.clear();
 	renderGraph.autoAliasPlannerStats = {};
-	renderGraph.autoAliasModeLastFrame = AutoAliasMode::Off;
+	renderGraph.autoAliasPreviousMode = renderGraph.autoAliasModeLastFrame;
 }
 
 void rg::alias::RenderGraphAliasingSubsystem::ResetPersistentState(RenderGraph& renderGraph) const {
 	ResetPerFrameState(renderGraph);
+	renderGraph.autoAliasPreviousMode = AutoAliasMode::Off;
+	renderGraph.autoAliasModeLastFrame = AutoAliasMode::Off;
 	renderGraph.aliasPlacementSignatureByID.clear();
 	renderGraph.aliasPlacementRangesByID.clear();
 	renderGraph.aliasPlacementPoolByID.clear();
