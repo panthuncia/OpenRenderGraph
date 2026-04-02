@@ -104,6 +104,9 @@ protected:
 	void RegisterUAV(ResourceIdentifier id, unsigned int mip = 0, unsigned int slice = 0) {
 		m_resourceDescriptorIndexHelper->RegisterUAV(id, mip, slice);
 	}
+	void RegisterUAV(UAVViewType type, ResourceIdentifier id, unsigned int mip = 0, unsigned int slice = 0) {
+		m_resourceDescriptorIndexHelper->RegisterUAV(type, id, mip, slice);
+	}
 
 	virtual std::shared_ptr<Resource> ProvideResource(ResourceIdentifier const& key) { return nullptr; }
 	virtual std::vector<ResourceIdentifier> GetSupportedKeys() { return {}; }

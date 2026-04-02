@@ -221,6 +221,7 @@ public:
 
 	struct IRenderGraphExtension {
 		virtual ~IRenderGraphExtension() = default;
+		virtual void PrepareForBuild(RenderGraph& rg) { (void)rg; }
 
 		// Called once from RenderGraph::Setup() after queue registry is populated.
 		// Extensions can create queues, allocate upload instances, etc.
@@ -488,6 +489,7 @@ public:
 	void CompileStructural();
 	void ResetForFrame();
 	void ResetForRebuild();
+	void PrepareExtensionsForBuild();
 	void Setup();
 	void RegisterExtension(std::unique_ptr<IRenderGraphExtension> ext, std::optional<std::string_view> id = std::nullopt);
 	const std::vector<PassBatch>& GetBatches() const { return batches; }

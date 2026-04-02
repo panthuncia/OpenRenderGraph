@@ -1644,7 +1644,8 @@ RenderGraph::RenderGraph(rhi::Device device) {
 				};
 
 			d.GetRTV = +[](RenderGraph* user, ResourceRegistry::RegistryHandle r, RangeSpec range) noexcept -> rhi::DescriptorSlot {
-				auto* gir = dynamic_cast<GloballyIndexedResource*>(user->_registry.Resolve(r));
+				Resource* resource = r.IsEphemeral() ? r.GetEphemeralPtr() : user->_registry.Resolve(r);
+				auto* gir = dynamic_cast<GloballyIndexedResource*>(resource);
 				if (!gir || !gir->HasRTV()) return {};
 
 				uint32_t mip = 0, slice = 0;
@@ -1654,7 +1655,8 @@ RenderGraph::RenderGraph(rhi::Device device) {
 				};
 
 			d.GetDSV = +[](RenderGraph* user, ResourceRegistry::RegistryHandle r, RangeSpec range) noexcept -> rhi::DescriptorSlot {
-				auto* gir = dynamic_cast<GloballyIndexedResource*>(user->_registry.Resolve(r));
+				Resource* resource = r.IsEphemeral() ? r.GetEphemeralPtr() : user->_registry.Resolve(r);
+				auto* gir = dynamic_cast<GloballyIndexedResource*>(resource);
 				if (!gir || !gir->HasDSV()) return {};
 
 				uint32_t mip = 0, slice = 0;
@@ -1664,7 +1666,8 @@ RenderGraph::RenderGraph(rhi::Device device) {
 				};
 
 			d.GetUavClearInfo = +[](RenderGraph* user, ResourceRegistry::RegistryHandle r, RangeSpec range, rhi::UavClearInfo& out) noexcept -> bool {
-				auto* gir = dynamic_cast<GloballyIndexedResource*>(user->_registry.Resolve(r));
+				Resource* resource = r.IsEphemeral() ? r.GetEphemeralPtr() : user->_registry.Resolve(r);
+				auto* gir = dynamic_cast<GloballyIndexedResource*>(resource);
 
 				// DX12 path requires both a shader-visible and CPU-visible UAV descriptor.
 				if (!gir || !gir->HasUAVShaderVisible() || !gir->HasUAVNonShaderVisible()) return false;
@@ -2032,6 +2035,14 @@ void RenderGraph::RegisterExtension(std::unique_ptr<IRenderGraphExtension> ext, 
         m_extensions.pop_back();
         throw;
     }
+}
+
+void RenderGraph::PrepareExtensionsForBuild() {
+	for (auto& ext : m_extensions) {
+		if (ext) {
+			ext->PrepareForBuild(*this);
+		}
+	}
 }
 
 void RenderGraph::ResetForRebuild()
@@ -4389,7 +4400,7 @@ namespace {
 			if (hasStatistics)
 				args.statisticsService->BeginQuery(pr.statisticsIndex, args.context.frameIndex, rhiQueue, commandList);
 			if ((pr.run & PassRunMask::Immediate) != PassRunMask::None)
-				rg::imm::Replay(pr.immediateBytecode, commandList);
+				rg::imm::Replay(pr.immediateBytecode, commandList, *args.context.immediateDispatch);
 			pr.immediateKeepAlive.reset();
 			if ((pr.run & PassRunMask::Retained) != PassRunMask::None) {
 				auto passReturn = pr.pass->Execute(args.context);
@@ -4513,7 +4524,7 @@ namespace {
 			if (hasStatistics)
 				args.statisticsService->BeginQuery(pr.statisticsIndex, args.context.frameIndex, args.rhiQueue, commandList, sched.queryRecordingContext);
 			if ((pr.run & PassRunMask::Immediate) != PassRunMask::None)
-				rg::imm::Replay(pr.immediateBytecode, commandList);
+				rg::imm::Replay(pr.immediateBytecode, commandList, *args.context.immediateDispatch);
 			pr.immediateKeepAlive.reset();
 			if ((pr.run & PassRunMask::Retained) != PassRunMask::None) {
 				auto passReturn = pr.pass->Execute(args.context);
@@ -4716,6 +4727,7 @@ void RenderGraph::BuildExecutionSchedule() {
 
 void RenderGraph::Execute(PassExecutionContext& context) {
 	ValidateCompiledResourceGenerations();
+	context.immediateDispatch = &m_immediateDispatch;
 
 	const bool heavyDebug = m_getHeavyDebug ? m_getHeavyDebug() : false;
 	auto& manager = DeviceManager::GetInstance();

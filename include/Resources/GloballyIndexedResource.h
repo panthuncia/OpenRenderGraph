@@ -16,9 +16,19 @@ enum class SRVViewType : int {
 	Buffer,
 	Texture2D,
 	Texture2DArray,
+	Texture2DArrayFull,
 	TextureCube,
 	TextureCubeArray,
+	TextureCubeArrayFull,
 	NumSRVViewTypes
+};
+
+enum class UAVViewType : int {
+	Invalid = -1,
+	Buffer,
+	Texture2D,
+	Texture2DArrayFull,
+	NumUAVViewTypes
 };
 
 class GloballyIndexedResource : public GloballyIndexedResourceBase
@@ -30,6 +40,7 @@ public:
 			SetName(name);
 		}
 		m_SRVViews.resize(static_cast<unsigned int>(SRVViewType::NumSRVViewTypes));
+		m_UAVViews.resize(static_cast<unsigned int>(UAVViewType::NumUAVViewTypes));
 	};
 
 	void SetSRVView(
@@ -48,6 +59,15 @@ public:
 		m_pUAVShaderVisibleHeap = pUAVHeap;
 		m_UAVShaderVisibleInfos = uavInfos;
 		m_counterOffset = counterOffset;
+	}
+
+	void SetUAVView(
+		UAVViewType type,
+		std::shared_ptr<DescriptorHeap> heap,
+		std::vector<std::vector<ShaderVisibleIndexInfo>> const& infos
+	) {
+		m_UAVViews[static_cast<unsigned int>(type)] = { heap, infos };
+		m_pUAVShaderVisibleHeap = heap;
 	}
 
 	void SetUAVCPUDescriptors(std::shared_ptr<DescriptorHeap> pUAVHeap, const std::vector<std::vector<NonShaderVisibleIndexInfo>>& uavInfos) {
@@ -99,9 +119,14 @@ public:
 	}
 
 	const ShaderVisibleIndexInfo& GetUAVShaderVisibleInfo(unsigned int mip, unsigned int slice = 0) const { return m_UAVShaderVisibleInfos[slice][mip]; }
+	const ShaderVisibleIndexInfo& GetUAVShaderVisibleInfo(UAVViewType type, unsigned int mip, unsigned int slice = 0) const {
+		return m_UAVViews[static_cast<unsigned int>(type)].infos[slice][mip];
+	}
 	size_t GetUAVCounterOffset() const { return m_counterOffset; }
 	unsigned int GetNumUAVMipLevels() const { return static_cast<unsigned int>(m_UAVShaderVisibleInfos[0].size()); }
 	unsigned int GetNumUAVSlices() const { return static_cast<unsigned int>(m_UAVShaderVisibleInfos.size()); }
+	unsigned int GetNumUAVMipLevels(UAVViewType type) const { return static_cast<unsigned int>(m_UAVViews[static_cast<unsigned int>(type)].infos[0].size()); }
+	unsigned int GetNumUAVSlices(UAVViewType type) const { return static_cast<unsigned int>(m_UAVViews[static_cast<unsigned int>(type)].infos.size()); }
 	const NonShaderVisibleIndexInfo& GetUAVNonShaderVisibleInfo(unsigned int mip, unsigned int slice = 0) const { return m_UAVNonShaderVisibleInfos[slice][mip]; }
 	const ShaderVisibleIndexInfo& GetCBVInfo() const { return m_CBVInfo; }
 	const NonShaderVisibleIndexInfo& GetRTVInfo(unsigned int mip, unsigned int slice = 0) const { return m_RTVInfos[slice][mip]; }
@@ -175,6 +200,15 @@ protected:
 					m_pUAVShaderVisibleHeap->ReleaseDescriptor(uavInfo.slot.index);
 				}
 			}
+			for (auto& view : m_UAVViews) {
+				for (auto& uavInfos : view.infos) {
+					for (auto& uavInfo : uavInfos) {
+						m_pUAVShaderVisibleHeap->ReleaseDescriptor(uavInfo.slot.index);
+					}
+				}
+				view.heap.reset();
+				view.infos.clear();
+			}
 		}
 		if (m_pUAVNonShaderVisibleHeap) {
 			for (auto& uavInfos : m_UAVNonShaderVisibleInfos) {
@@ -207,6 +241,8 @@ protected:
 
 		m_pSRVHeap.reset();
 		m_UAVShaderVisibleInfos.clear();
+		m_UAVViews.clear();
+		m_UAVViews.resize(static_cast<unsigned int>(UAVViewType::NumUAVViewTypes));
 		m_UAVNonShaderVisibleInfos.clear();
 		m_pUAVShaderVisibleHeap.reset();
 		m_pUAVNonShaderVisibleHeap.reset();
@@ -224,9 +260,14 @@ private:
 		std::shared_ptr<DescriptorHeap> heap = nullptr;
 		std::vector<std::vector<ShaderVisibleIndexInfo>> infos;
 	};
+	struct UAVView {
+		std::shared_ptr<DescriptorHeap> heap = nullptr;
+		std::vector<std::vector<ShaderVisibleIndexInfo>> infos;
+	};
 	std::vector<SRVView> m_SRVViews;
 	std::shared_ptr<DescriptorHeap> m_pSRVHeap = nullptr;
 	std::vector<std::vector<ShaderVisibleIndexInfo>> m_UAVShaderVisibleInfos;
+	std::vector<UAVView> m_UAVViews;
 	std::vector<std::vector<NonShaderVisibleIndexInfo>> m_UAVNonShaderVisibleInfos;
 	std::shared_ptr<DescriptorHeap> m_pUAVShaderVisibleHeap = nullptr;
 	std::shared_ptr<DescriptorHeap> m_pUAVNonShaderVisibleHeap = nullptr;

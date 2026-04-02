@@ -133,6 +133,13 @@ void DescriptorHeapManager::ReserveDescriptorSlots(
             target.SetDefaultSRVViewType(srvViewType);
             target.SetSRVView(srvViewType, m_cbvSrvUavHeap, makeShaderVisibleGrid(srvSlices, tex->mipLevels, m_cbvSrvUavHeap));
 
+            if (tex->isArray && !tex->isCubemap) {
+                target.SetSRVView(SRVViewType::Texture2DArrayFull, m_cbvSrvUavHeap, makeShaderVisibleGrid(1u, tex->mipLevels, m_cbvSrvUavHeap));
+            }
+            else if (tex->isCubemap && tex->isArray) {
+                target.SetSRVView(SRVViewType::TextureCubeArrayFull, m_cbvSrvUavHeap, makeShaderVisibleGrid(1u, tex->mipLevels, m_cbvSrvUavHeap));
+            }
+
             if (tex->createCubemapAsArraySRV && tex->isCubemap) {
                 target.SetSRVView(SRVViewType::Texture2DArray, m_cbvSrvUavHeap, makeShaderVisibleGrid(6u, tex->mipLevels, m_cbvSrvUavHeap));
             }
@@ -140,6 +147,9 @@ void DescriptorHeapManager::ReserveDescriptorSlots(
 
         if (tex->createUAV) {
             target.SetUAVGPUDescriptors(m_cbvSrvUavHeap, makeShaderVisibleGrid(uavSlices, tex->mipLevels, m_cbvSrvUavHeap));
+            if (tex->isArray || tex->isCubemap) {
+                target.SetUAVView(UAVViewType::Texture2DArrayFull, m_cbvSrvUavHeap, makeShaderVisibleGrid(1u, tex->mipLevels, m_cbvSrvUavHeap));
+            }
         }
 
         if (tex->createNonShaderVisibleUAV) {
@@ -266,6 +276,50 @@ void DescriptorHeapManager::UpdateDescriptorContents(
                 }
             }
 
+            if (tex->isArray && !tex->isCubemap) {
+                for (uint32_t mip = 0; mip < tex->mipLevels; ++mip) {
+                    const uint32_t mipLevelsForView =
+#if ORG_TEXTURE_SRV_INCLUDE_LOWER_MIPS
+                        tex->mipLevels - mip;
+#else
+                        1u;
+#endif
+
+                    rhi::SrvDesc srvDesc{};
+                    srvDesc.formatOverride = srvFormat;
+                    srvDesc.dimension = rhi::SrvDim::Texture2DArray;
+                    srvDesc.tex2DArray.mostDetailedMip = mip;
+                    srvDesc.tex2DArray.mipLevels = mipLevelsForView;
+                    srvDesc.tex2DArray.firstArraySlice = 0u;
+                    srvDesc.tex2DArray.arraySize = tex->arraySize;
+                    srvDesc.tex2DArray.planeSlice = 0u;
+
+                    const auto& slot = target.GetSRVInfo(SRVViewType::Texture2DArrayFull, mip, 0u).slot;
+                    device.CreateShaderResourceView({ slot.heap, slot.index }, apiResource.GetHandle(), srvDesc);
+                }
+            }
+            else if (tex->isCubemap && tex->isArray) {
+                for (uint32_t mip = 0; mip < tex->mipLevels; ++mip) {
+                    const uint32_t mipLevelsForView =
+#if ORG_TEXTURE_SRV_INCLUDE_LOWER_MIPS
+                        tex->mipLevels - mip;
+#else
+                        1u;
+#endif
+
+                    rhi::SrvDesc srvDesc{};
+                    srvDesc.formatOverride = srvFormat;
+                    srvDesc.dimension = rhi::SrvDim::TextureCubeArray;
+                    srvDesc.cubeArray.mostDetailedMip = mip;
+                    srvDesc.cubeArray.mipLevels = mipLevelsForView;
+                    srvDesc.cubeArray.first2DArrayFace = 0u;
+                    srvDesc.cubeArray.numCubes = tex->arraySize;
+
+                    const auto& slot = target.GetSRVInfo(SRVViewType::TextureCubeArrayFull, mip, 0u).slot;
+                    device.CreateShaderResourceView({ slot.heap, slot.index }, apiResource.GetHandle(), srvDesc);
+                }
+            }
+
             if (tex->createCubemapAsArraySRV && tex->isCubemap) {
                 for (uint32_t slice = 0; slice < 6u; ++slice) {
                     for (uint32_t mip = 0; mip < tex->mipLevels; ++mip) {
@@ -315,6 +369,21 @@ void DescriptorHeapManager::UpdateDescriptorContents(
                     }
 
                     const auto& slot = target.GetUAVShaderVisibleInfo(mip, slice).slot;
+                    device.CreateUnorderedAccessView({ slot.heap, slot.index }, apiResource.GetHandle(), uavDesc);
+                }
+            }
+
+            if (tex->isArray || tex->isCubemap) {
+                for (uint32_t mip = 0; mip < tex->mipLevels; ++mip) {
+                    rhi::UavDesc uavDesc{};
+                    uavDesc.formatOverride = uavFormat;
+                    uavDesc.dimension = rhi::UavDim::Texture2DArray;
+                    uavDesc.texture2DArray.mipSlice = mip + tex->uavFirstMip;
+                    uavDesc.texture2DArray.firstArraySlice = 0u;
+                    uavDesc.texture2DArray.arraySize = tex->totalArraySlices;
+                    uavDesc.texture2DArray.planeSlice = 0u;
+
+                    const auto& slot = target.GetUAVShaderVisibleInfo(UAVViewType::Texture2DArrayFull, mip, 0u).slot;
                     device.CreateUnorderedAccessView({ slot.heap, slot.index }, apiResource.GetHandle(), uavDesc);
                 }
             }
