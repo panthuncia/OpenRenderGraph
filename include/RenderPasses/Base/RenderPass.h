@@ -33,6 +33,7 @@ struct RenderPassParameters {
 
 	std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> identifierSet;
 	std::vector<AutoDescriptorRegistration> autoDescriptorShaderResources;
+	std::vector<AutoDescriptorRegistration> autoDescriptorConstantBuffers;
 	std::vector<AutoDescriptorRegistration> autoDescriptorUnorderedAccessViews;
 	std::vector<ResourceRequirement> staticResourceRequirements; // Static resource requirements for the pass
 	std::vector<ResourceRequirement> frameResourceRequirements; // Resource requirements that may change each frame + static ones
@@ -55,9 +56,13 @@ public:
 	void SetResourceRegistryView(
 		std::shared_ptr<ResourceRegistryView> resourceRegistryView,
 		const std::vector<AutoDescriptorRegistration>& autoDescriptorShaderResources,
+		const std::vector<AutoDescriptorRegistration>& autoDescriptorConstantBuffers,
 		const std::vector<AutoDescriptorRegistration>& autoDescriptorUnorderedAccessViews) {
 		SetResourceRegistryView(std::move(resourceRegistryView));
 		for (const auto& registration : autoDescriptorShaderResources) {
+			m_resourceDescriptorIndexHelper->RegisterDescriptor(registration);
+		}
+		for (const auto& registration : autoDescriptorConstantBuffers) {
 			m_resourceDescriptorIndexHelper->RegisterDescriptor(registration);
 		}
 		for (const auto& registration : autoDescriptorUnorderedAccessViews) {
@@ -106,6 +111,9 @@ protected:
 	}
 	void RegisterUAV(UAVViewType type, ResourceIdentifier id, unsigned int mip = 0, unsigned int slice = 0) {
 		m_resourceDescriptorIndexHelper->RegisterUAV(type, id, mip, slice);
+	}
+	void RegisterCBV(ResourceIdentifier id) {
+		m_resourceDescriptorIndexHelper->RegisterCBV(id);
 	}
 
 	virtual std::shared_ptr<Resource> ProvideResource(ResourceIdentifier const& key) { return nullptr; }

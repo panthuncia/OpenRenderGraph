@@ -1102,6 +1102,7 @@ private:
 	template<typename T>
         requires ResourceLike<T>
 	RenderPassBuilder& addConstantBuffer(T&& x) {
+    detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorConstantBuffers, x, DescriptorType::CBV);
         detail::AppendTrackedResource(graph, _declaredIds, params.constantBuffers, std::forward<T>(x));
 		return *this;
 	}

@@ -157,6 +157,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 			par.resources.internalTransitions = b.params.internalTransitions;
 			par.resources.identifierSet = b.DeclaredResourceIds();
 			par.resources.autoDescriptorShaderResources = b.params.autoDescriptorShaderResources;
+			par.resources.autoDescriptorConstantBuffers = b.params.autoDescriptorConstantBuffers;
 			par.resources.autoDescriptorUnorderedAccessViews = b.params.autoDescriptorUnorderedAccessViews;
 			par.resources.isGeometryPass = b.params.isGeometryPass;
 			par.resources.preferredQueueKind = ResolveExternalPreferredQueueKind(d);
@@ -170,6 +171,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 			par.pass->SetResourceRegistryView(
 				std::make_unique<ResourceRegistryView>(_registry, par.resources.identifierSet),
 				par.resources.autoDescriptorShaderResources,
+				par.resources.autoDescriptorConstantBuffers,
 				par.resources.autoDescriptorUnorderedAccessViews);
 			par.pass->Setup();
 		}
@@ -2542,6 +2544,7 @@ void RenderGraph::RefreshRetainedDeclarationsForFrame(RenderPassAndResources& p,
 
 	p.resources.identifierSet = b.DeclaredResourceIds();
 	p.resources.autoDescriptorShaderResources = b.params.autoDescriptorShaderResources;
+	p.resources.autoDescriptorConstantBuffers = b.params.autoDescriptorConstantBuffers;
 	p.resources.autoDescriptorUnorderedAccessViews = b.params.autoDescriptorUnorderedAccessViews;
 	MaterializeReferencedResources(p.resources.staticResourceRequirements, p.resources.internalTransitions);
 
@@ -2552,6 +2555,7 @@ void RenderGraph::RefreshRetainedDeclarationsForFrame(RenderPassAndResources& p,
 	p.pass->SetResourceRegistryView(
 		std::make_unique<ResourceRegistryView>(_registry, p.resources.identifierSet),
 		p.resources.autoDescriptorShaderResources,
+		p.resources.autoDescriptorConstantBuffers,
 		p.resources.autoDescriptorUnorderedAccessViews
 	);
 	p.pass->Setup();
@@ -3976,6 +3980,7 @@ void RenderGraph::Setup() {
 			renderPass.pass->SetResourceRegistryView(
 				std::make_unique<ResourceRegistryView>(_registry, renderPass.resources.identifierSet),
 				renderPass.resources.autoDescriptorShaderResources,
+				renderPass.resources.autoDescriptorConstantBuffers,
 				renderPass.resources.autoDescriptorUnorderedAccessViews);
 			renderPass.pass->Setup();
 			break;
@@ -4452,23 +4457,19 @@ namespace {
 		if (!postTransitions.empty())
 			ExecuteTransitions(postTransitions, /*crm=*/nullptr, queue, commandList);
 
-		// Final submit + optional AfterCompletion signal
+		// Final submit + recycle signal. Active queues always submit a final CL,
+		// so always use the batch's reserved AfterCompletion fence value.
 		{
 			commandList.End();
 			rhiQueue.Submit({ &commandList, 1 }, {});
 
-			UINT64 recycleFence;
-			if (sched.signalAfterCompletion) {
-				recycleFence = fenceOffset + batch.GetQueueSignalFenceValue(
-					RenderGraph::BatchSignalPhase::AfterCompletion, qi);
-			} else {
-				recycleFence = ++args.lastSignaledOnTimeline;
-			}
+			UINT64 recycleFence = fenceOffset + batch.GetQueueSignalFenceValue(
+				RenderGraph::BatchSignalPhase::AfterCompletion, qi);
 			if (recycleFence == 0) {
 				spdlog::error("ExecuteQueueBatch: recycleFence is 0 for batch {} slot {} "
-					"(signalAfterCompletion={}, fenceOffset={}, fenceValue={}). "
+					"(fenceOffset={}, fenceValue={}). "
 					"Falling back to monotonic signal.",
-					args.batchIndex, qi, sched.signalAfterCompletion, fenceOffset,
+					args.batchIndex, qi, fenceOffset,
 					batch.GetQueueSignalFenceValue(
 						RenderGraph::BatchSignalPhase::AfterCompletion, qi));
 				recycleFence = ++args.lastSignaledOnTimeline;
@@ -4642,23 +4643,19 @@ namespace {
 			}
 		}
 
-		// Submit the final CL and signal for recycle.
+		// Submit the final CL and signal for recycle. Active queues always submit
+		// a final CL, so always use the batch's reserved AfterCompletion fence value.
 		{
 			rhi::CommandList cl = sched.preallocatedCLs[clIndex].list.Get();
 			rhiQueue.Submit({ &cl, 1 }, {});
 
-			UINT64 recycleFence;
-			if (sched.signalAfterCompletion) {
-				recycleFence = fenceOffset + batch.GetQueueSignalFenceValue(
-					RenderGraph::BatchSignalPhase::AfterCompletion, qi);
-			} else {
-				recycleFence = ++args.lastSignaledOnTimeline;
-			}
+			UINT64 recycleFence = fenceOffset + batch.GetQueueSignalFenceValue(
+				RenderGraph::BatchSignalPhase::AfterCompletion, qi);
 			if (recycleFence == 0) {
 				spdlog::error(
-					"SubmitQueueBatch: recycleFence is 0 (signalAfterCompletion={}, "
-					"fenceOffset={}, fenceValue={}). Falling back to monotonic signal.",
-					sched.signalAfterCompletion, fenceOffset,
+					"SubmitQueueBatch: recycleFence is 0 (fenceOffset={}, fenceValue={}). "
+					"Falling back to monotonic signal.",
+					fenceOffset,
 					batch.GetQueueSignalFenceValue(
 						RenderGraph::BatchSignalPhase::AfterCompletion, qi));
 				recycleFence = ++args.lastSignaledOnTimeline;
@@ -4882,14 +4879,11 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 					liveSignalValues[qi].insert(v);
 					highestLiveSignal[qi] = std::max(highestLiveSignal[qi], v);
 				}
-				// The final submit always signals. If signalAfterCompletion is true,
-				// it signals the pre-assigned AfterCompletion value. Otherwise, it
-				// signals a monotonic value that won't match any pre-assigned value.
-				if (qs.signalAfterCompletion) {
-					UINT64 v = batch.GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, qi);
-					liveSignalValues[qi].insert(v);
-					highestLiveSignal[qi] = std::max(highestLiveSignal[qi], v);
-				}
+				// The final submit always signals the reserved AfterCompletion value
+				// for every active queue.
+				UINT64 v = batch.GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, qi);
+				liveSignalValues[qi].insert(v);
+				highestLiveSignal[qi] = std::max(highestLiveSignal[qi], v);
 			}
 		}
 
@@ -5053,6 +5047,9 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 						if (v > highestSignal) highestSignal = v;
 					}
 				}
+				highestSignal = std::max(
+					highestSignal,
+					batch.GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, qi));
 				if (highestSignal == 0) continue;
 				auto result = SlotFence(qi).HostWait(highestSignal);
 				DeviceManager::GetInstance().GetDevice().CheckDebugMessages();
