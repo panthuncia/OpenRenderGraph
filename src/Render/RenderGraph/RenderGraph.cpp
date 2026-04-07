@@ -1120,23 +1120,23 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 					continue;
 				}
 
-				// Extra constraint: disallow cross-queue deps within same batch.
-				if (batchHasQueue[nodeQueueSlot]) {
-					bool hasCrossQueuePredInBatch = false;
-					for (size_t pred : n.in) {
-						if (!inBatch[pred]) {
-							continue;
-						}
-						const size_t predQueueSlot = nodes[pred].assignedQueueSlot.value_or(nodes[pred].queueSlot);
-						if (predQueueSlot != nodeQueueSlot) {
-							hasCrossQueuePredInBatch = true;
-							break;
-						}
-					}
-					if (hasCrossQueuePredInBatch) {
-						queueDiagnostics[nodeQueueSlot].rejectedCrossQueuePred++;
+				// Extra constraint: disallow cross-queue deps within the same batch.
+				// A node can only join the current batch on a slot if every in-batch
+				// predecessor is already assigned to that same slot.
+				bool hasCrossQueuePredInBatch = false;
+				for (size_t pred : n.in) {
+					if (!inBatch[pred]) {
 						continue;
 					}
+					const size_t predQueueSlot = nodes[pred].assignedQueueSlot.value_or(nodes[pred].queueSlot);
+					if (predQueueSlot != nodeQueueSlot) {
+						hasCrossQueuePredInBatch = true;
+						break;
+					}
+				}
+				if (hasCrossQueuePredInBatch) {
+					queueDiagnostics[nodeQueueSlot].rejectedCrossQueuePred++;
+					continue;
 				}
 
 				if (rg.IsNewBatchNeeded(

@@ -836,6 +836,12 @@ private:
 			if (batchIndex <= 0) {
 				return;
 			}
+
+			if (static_cast<unsigned int>(batchIndex) == currentBatchIndex) {
+				currentBatch.MarkQueueSignal(BatchSignalPhase::AfterCompletion, sourceQueueSlot);
+				return;
+			}
+
 			batches[batchIndex].MarkQueueSignal(BatchSignalPhase::AfterCompletion, sourceQueueSlot);
 		};
 
@@ -843,6 +849,11 @@ private:
 			if (batchIndex <= 0) {
 				return 0;
 			}
+
+			if (static_cast<unsigned int>(batchIndex) == currentBatchIndex) {
+				return currentBatch.GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, sourceQueueSlot);
+			}
+
 			return batches[batchIndex].GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, sourceQueueSlot);
 		};
 
@@ -875,12 +886,6 @@ private:
 		}
 
 		// Handle the "producer" wait
-#if defined(_DEBUG)
-		if (lastProdBatch == currentBatchIndex) {
-			spdlog::error("Producer batch is the same as current batch");
-			__debugbreak();
-		}
-#endif
 		if (lastProdBatch != -1) {
 			const UINT64 completionFence = sourceCompletionFence(lastProdBatch);
 			if (completionFence != 0) {
