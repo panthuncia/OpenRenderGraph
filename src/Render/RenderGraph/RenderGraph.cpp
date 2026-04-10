@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <cmath>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <numeric>
 #include <optional>
@@ -127,6 +129,67 @@ namespace {
 		}
 		return true;
 	}
+
+	const char* QueueKindToString(QueueKind queue) noexcept {
+		switch (queue) {
+		case QueueKind::Graphics: return "Graphics";
+		case QueueKind::Compute: return "Compute";
+		case QueueKind::Copy: return "Copy";
+		default: return "Unknown";
+		}
+	}
+
+	const char* PassTypeToString(RenderGraph::PassType type) noexcept {
+		switch (type) {
+		case RenderGraph::PassType::Render: return "Render";
+		case RenderGraph::PassType::Compute: return "Compute";
+		case RenderGraph::PassType::Copy: return "Copy";
+		default: return "Unknown";
+		}
+	}
+
+	const char* BatchWaitPhaseToString(RenderGraph::BatchWaitPhase phase) noexcept {
+		switch (phase) {
+		case RenderGraph::BatchWaitPhase::BeforeTransitions: return "BeforeTransitions";
+		case RenderGraph::BatchWaitPhase::BeforeExecution: return "BeforeExecution";
+		case RenderGraph::BatchWaitPhase::BeforeAfterPasses: return "BeforeAfterPasses";
+		default: return "Unknown";
+		}
+	}
+
+	const char* BatchSignalPhaseToString(RenderGraph::BatchSignalPhase phase) noexcept {
+		switch (phase) {
+		case RenderGraph::BatchSignalPhase::AfterTransitions: return "AfterTransitions";
+		case RenderGraph::BatchSignalPhase::AfterExecution: return "AfterExecution";
+		case RenderGraph::BatchSignalPhase::AfterCompletion: return "AfterCompletion";
+		default: return "Unknown";
+		}
+	}
+
+	const char* BatchTransitionPhaseToString(RenderGraph::BatchTransitionPhase phase) noexcept {
+		switch (phase) {
+		case RenderGraph::BatchTransitionPhase::BeforePasses: return "BeforePasses";
+		case RenderGraph::BatchTransitionPhase::AfterPasses: return "AfterPasses";
+		default: return "Unknown";
+		}
+	}
+
+	std::string PassRunMaskToString(PassRunMask mask) {
+		switch (mask) {
+		case PassRunMask::None: return "None";
+		case PassRunMask::Immediate: return "Immediate";
+		case PassRunMask::Retained: return "Retained";
+		case PassRunMask::Both: return "Both";
+		default: return std::to_string(static_cast<unsigned int>(to_u8(mask)));
+		}
+	}
+
+	std::string FormatRangeSpec(const RangeSpec& range) {
+		std::ostringstream oss;
+		oss << "mip=[" << range.mipLower.ToString() << ".." << range.mipUpper.ToString()
+			<< "] slice=[" << range.sliceLower.ToString() << ".." << range.sliceUpper.ToString() << "]";
+		return oss.str();
+	}
 }
 
 
@@ -151,6 +214,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 			b.params = {};
 			b.params.isGeometryPass = d.isGeometryPass;
 			b._declaredIds.clear();
+			EnsureProviderRegistered(par.pass.get());
 			par.pass->DeclareResourceUsages(&b);
 			par.resources.staticResourceRequirements = b.GatherResourceRequirements();
 			par.resources.frameResourceRequirements = par.resources.staticResourceRequirements;
@@ -189,6 +253,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 			b.built_ = true;
 			b.params = {};
 			b._declaredIds.clear();
+			EnsureProviderRegistered(par.pass.get());
 			par.pass->DeclareResourceUsages(&b);
 			par.resources.staticResourceRequirements = b.GatherResourceRequirements();
 			par.resources.frameResourceRequirements = par.resources.staticResourceRequirements;
@@ -226,6 +291,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 			b.built_ = true;
 			b.params = {};
 			b._declaredIds.clear();
+			EnsureProviderRegistered(par.pass.get());
 			par.pass->DeclareResourceUsages(&b);
 			par.resources.staticResourceRequirements = b.GatherResourceRequirements();
 			par.resources.frameResourceRequirements = par.resources.staticResourceRequirements;
@@ -267,6 +333,325 @@ void RenderGraph::RegisterExternalPassName(const ExternalPassDesc& d, AnyPassAnd
 		if (!d.name.empty()) {
 			computePassesByName[d.name] = cp.pass;
 		}
+	}
+}
+
+void RenderGraph::WriteCompiledGraphDebugDump(uint8_t frameIndex, const std::vector<Node>& nodes) const
+{
+	try {
+		auto resourceNameForHandle = [this](const ResourceRegistry::RegistryHandle& handle) -> std::string {
+			if (auto* resource = _registry.Resolve(handle)) {
+				return resource->GetName();
+			}
+			return {};
+		};
+
+		auto resourceLabelForHandle = [&](const ResourceRegistry::RegistryHandle& handle) -> std::string {
+			std::ostringstream oss;
+			oss << "id=" << handle.GetGlobalResourceID();
+			const std::string resourceName = resourceNameForHandle(handle);
+			if (!resourceName.empty()) {
+				oss << " name=\"" << resourceName << "\"";
+			}
+			if (handle.IsEphemeral()) {
+				oss << " handle=ephemeral";
+			}
+			return oss.str();
+		};
+
+		auto queueSlotLabel = [this](size_t queueSlot) -> std::string {
+			std::ostringstream oss;
+			oss << queueSlot << ":" << QueueKindToString(m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(static_cast<uint8_t>(queueSlot))));
+			return oss.str();
+		};
+
+		auto nodeName = [this, &nodes](size_t nodeIndex) -> std::string {
+			if (nodeIndex >= nodes.size()) {
+				return "<invalid-node>";
+			}
+			const auto& node = nodes[nodeIndex];
+			if (node.passIndex < m_framePasses.size() && !m_framePasses[node.passIndex].name.empty()) {
+				return m_framePasses[node.passIndex].name;
+			}
+			return "PassIndex#" + std::to_string(node.passIndex);
+		};
+
+		std::ostringstream dump;
+
+		auto appendPassEntry = [&](size_t passIndex, PassType passType, const auto& passEntry) {
+			const auto& resources = passEntry.resources;
+			const size_t assignedQueueSlot = passIndex < m_assignedQueueSlotsByFramePass.size()
+				? m_assignedQueueSlotsByFramePass[passIndex]
+				: (resources.pinnedQueueSlot.has_value()
+					? static_cast<size_t>(static_cast<uint8_t>(*resources.pinnedQueueSlot))
+					: QueueIndex(resources.preferredQueueKind));
+
+			dump << "[" << passIndex << "] "
+				 << PassTypeToString(passType)
+				 << " name=\"" << passEntry.name << "\""
+				 << " run=" << PassRunMaskToString(passEntry.run)
+				 << " preferred_queue=" << QueueKindToString(resources.preferredQueueKind)
+				 << " assigned_queue=" << queueSlotLabel(assignedQueueSlot);
+			if (resources.pinnedQueueSlot.has_value()) {
+				dump << " pinned_queue=" << static_cast<unsigned int>(static_cast<uint8_t>(*resources.pinnedQueueSlot));
+			}
+			if constexpr (requires { resources.isGeometryPass; }) {
+				dump << " geometry_pass=" << (resources.isGeometryPass ? "true" : "false");
+			}
+			dump << " declared_requirements=" << resources.frameResourceRequirements.size()
+				 << " internal_transitions=" << resources.internalTransitions.size()
+				 << "\n";
+
+			if (!resources.frameResourceRequirements.empty()) {
+				dump << "  requirements:\n";
+				for (const auto& req : resources.frameResourceRequirements) {
+					dump << "    - " << resourceLabelForHandle(req.resourceHandleAndRange.resource)
+						 << " range=" << FormatRangeSpec(req.resourceHandleAndRange.range)
+						 << " access=" << rhi::helpers::ResourceAccessMaskToString(req.state.access)
+						 << " layout=" << rhi::helpers::ResourceLayoutToString(req.state.layout)
+						 << " sync=" << rhi::helpers::ResourceSyncToString(req.state.sync)
+						 << "\n";
+				}
+			}
+
+			if (!resources.internalTransitions.empty()) {
+				dump << "  internal_transitions:\n";
+				for (const auto& internalTransition : resources.internalTransitions) {
+					dump << "    - " << resourceLabelForHandle(internalTransition.first.resource)
+						 << " range=" << FormatRangeSpec(internalTransition.first.range)
+						 << " -> access=" << rhi::helpers::ResourceAccessMaskToString(internalTransition.second.access)
+						 << " layout=" << rhi::helpers::ResourceLayoutToString(internalTransition.second.layout)
+						 << " sync=" << rhi::helpers::ResourceSyncToString(internalTransition.second.sync)
+						 << "\n";
+				}
+			}
+		};
+
+		dump << "RenderGraph Compiled State\n";
+		dump << "frame_index=" << static_cast<unsigned int>(frameIndex) << "\n";
+		dump << "pass_count=" << m_framePasses.size()
+			 << " node_count=" << nodes.size()
+			 << " batch_count=" << batches.size()
+			 << " queue_slot_count=" << m_queueRegistry.SlotCount() << "\n";
+		dump << "active_queue_slots=[";
+		bool firstActive = true;
+		for (size_t queueIndex = 0; queueIndex < m_activeQueueSlotsThisFrame.size(); ++queueIndex) {
+			if (!m_activeQueueSlotsThisFrame[queueIndex]) {
+				continue;
+			}
+			if (!firstActive) {
+				dump << ", ";
+			}
+			firstActive = false;
+			dump << queueSlotLabel(queueIndex);
+		}
+		dump << "]\n\n";
+
+		dump << "[FramePasses]\n";
+		for (size_t passIndex = 0; passIndex < m_framePasses.size(); ++passIndex) {
+			const auto& any = m_framePasses[passIndex];
+			switch (any.type) {
+			case PassType::Render:
+				appendPassEntry(passIndex, any.type, std::get<RenderPassAndResources>(any.pass));
+				break;
+			case PassType::Compute:
+				appendPassEntry(passIndex, any.type, std::get<ComputePassAndResources>(any.pass));
+				break;
+			case PassType::Copy:
+				appendPassEntry(passIndex, any.type, std::get<CopyPassAndResources>(any.pass));
+				break;
+			default:
+				dump << "[" << passIndex << "] Unknown name=\"" << any.name << "\" <unmaterialized>\n";
+				break;
+			}
+		}
+
+		dump << "\n[DependencyNodes]\n";
+		for (size_t nodeIndex = 0; nodeIndex < nodes.size(); ++nodeIndex) {
+			const auto& node = nodes[nodeIndex];
+			dump << "[" << nodeIndex << "]"
+				 << " pass_index=" << node.passIndex
+				 << " name=\"" << nodeName(nodeIndex) << "\""
+				 << " original_order=" << node.originalOrder
+				 << " criticality=" << node.criticality
+				 << " default_queue=" << queueSlotLabel(node.queueSlot)
+				 << " assigned_queue=" << (node.assignedQueueSlot.has_value() ? queueSlotLabel(*node.assignedQueueSlot) : std::string("<unset>"))
+				 << " indegree=" << node.indegree
+				 << "\n";
+
+			if (!node.compatibleQueueSlots.empty()) {
+				dump << "  compatible_queues=[";
+				for (size_t i = 0; i < node.compatibleQueueSlots.size(); ++i) {
+					if (i != 0) {
+						dump << ", ";
+					}
+					dump << queueSlotLabel(node.compatibleQueueSlots[i]);
+				}
+				dump << "]\n";
+			}
+
+			if (!node.in.empty()) {
+				dump << "  in=[";
+				for (size_t i = 0; i < node.in.size(); ++i) {
+					if (i != 0) {
+						dump << ", ";
+					}
+					dump << nodeName(node.in[i]);
+				}
+				dump << "]\n";
+			}
+
+			if (!node.out.empty()) {
+				dump << "  out=[";
+				for (size_t i = 0; i < node.out.size(); ++i) {
+					if (i != 0) {
+						dump << ", ";
+					}
+					dump << nodeName(node.out[i]);
+				}
+				dump << "]\n";
+			}
+
+			if (!node.accessByID.empty()) {
+				dump << "  access_by_id=[";
+				for (size_t i = 0; i < node.accessByID.size(); ++i) {
+					if (i != 0) {
+						dump << ", ";
+					}
+					const auto& [resourceID, accessKind] = node.accessByID[i];
+					dump << resourceID;
+					auto resourceIt = resourcesByID.find(resourceID);
+					if (resourceIt != resourcesByID.end() && resourceIt->second && !resourceIt->second->GetName().empty()) {
+						dump << ":\"" << resourceIt->second->GetName() << "\"";
+					}
+					dump << ":" << (accessKind == AccessKind::Read ? "Read" : "Write");
+				}
+				dump << "]\n";
+			}
+		}
+
+		dump << "\n[Batches]\n";
+		for (size_t batchIndex = 0; batchIndex < batches.size(); ++batchIndex) {
+			const auto& batch = batches[batchIndex];
+			dump << "[" << batchIndex << "] all_resources=" << batch.allResources.size()
+				 << " internally_transitioned_resources=" << batch.internallyTransitionedResources.size()
+				 << "\n";
+
+			for (size_t queueIndex = 0; queueIndex < batch.QueueCount(); ++queueIndex) {
+				const bool hasPasses = batch.HasPasses(queueIndex);
+				const bool hasBeforeTransitions = batch.HasTransitions(queueIndex, BatchTransitionPhase::BeforePasses);
+				const bool hasAfterTransitions = batch.HasTransitions(queueIndex, BatchTransitionPhase::AfterPasses);
+				bool hasWaits = false;
+				bool hasSignals = false;
+				for (size_t sourceQueueIndex = 0; sourceQueueIndex < batch.QueueCount(); ++sourceQueueIndex) {
+					for (size_t waitPhaseIndex = 0; waitPhaseIndex < PassBatch::kWaitPhaseCount; ++waitPhaseIndex) {
+						if (batch.HasQueueWait(static_cast<BatchWaitPhase>(waitPhaseIndex), queueIndex, sourceQueueIndex)) {
+							hasWaits = true;
+						}
+					}
+				}
+				for (size_t signalPhaseIndex = 0; signalPhaseIndex < PassBatch::kSignalPhaseCount; ++signalPhaseIndex) {
+					if (batch.HasQueueSignal(static_cast<BatchSignalPhase>(signalPhaseIndex), queueIndex)) {
+						hasSignals = true;
+					}
+				}
+
+				if (!hasPasses && !hasBeforeTransitions && !hasAfterTransitions && !hasWaits && !hasSignals) {
+					continue;
+				}
+
+				dump << "  queue[" << queueIndex << "]=" << queueSlotLabel(queueIndex) << "\n";
+
+				for (size_t waitPhaseIndex = 0; waitPhaseIndex < PassBatch::kWaitPhaseCount; ++waitPhaseIndex) {
+					const auto waitPhase = static_cast<BatchWaitPhase>(waitPhaseIndex);
+					for (size_t sourceQueueIndex = 0; sourceQueueIndex < batch.QueueCount(); ++sourceQueueIndex) {
+						if (!batch.HasQueueWait(waitPhase, queueIndex, sourceQueueIndex)) {
+							continue;
+						}
+						dump << "    wait phase=" << BatchWaitPhaseToString(waitPhase)
+							 << " src=" << queueSlotLabel(sourceQueueIndex)
+							 << " fence=" << batch.GetQueueWaitFenceValue(waitPhase, queueIndex, sourceQueueIndex)
+							 << "\n";
+					}
+				}
+
+				for (size_t transitionPhaseIndex = 0; transitionPhaseIndex < static_cast<size_t>(BatchTransitionPhase::Count); ++transitionPhaseIndex) {
+					const auto transitionPhase = static_cast<BatchTransitionPhase>(transitionPhaseIndex);
+					const auto& transitions = batch.Transitions(queueIndex, transitionPhase);
+					if (transitions.empty()) {
+						continue;
+					}
+					dump << "    transitions " << BatchTransitionPhaseToString(transitionPhase) << ":\n";
+					for (const auto& transition : transitions) {
+						dump << "      - id=" << (transition.pResource ? transition.pResource->GetGlobalResourceID() : 0ull);
+						if (transition.pResource && !transition.pResource->GetName().empty()) {
+							dump << " name=\"" << transition.pResource->GetName() << "\"";
+						}
+						dump << " range=" << FormatRangeSpec(transition.range)
+							 << " discard=" << (transition.discard ? "true" : "false")
+							 << " layout=" << rhi::helpers::ResourceLayoutToString(transition.prevLayout)
+							 << "->" << rhi::helpers::ResourceLayoutToString(transition.newLayout)
+							 << " access=" << rhi::helpers::ResourceAccessMaskToString(transition.prevAccessType)
+							 << "->" << rhi::helpers::ResourceAccessMaskToString(transition.newAccessType)
+							 << " sync=" << rhi::helpers::ResourceSyncToString(transition.prevSyncState)
+							 << "->" << rhi::helpers::ResourceSyncToString(transition.newSyncState)
+							 << "\n";
+					}
+				}
+
+				if (hasPasses) {
+					dump << "    passes:\n";
+					for (const auto& queuedPass : batch.Passes(queueIndex)) {
+						std::visit([&](const auto& passEntry) {
+							using TQueued = std::decay_t<decltype(passEntry)>;
+							const PassType queuedPassType =
+								std::is_same_v<TQueued, RenderPassAndResources> ? PassType::Render :
+								(std::is_same_v<TQueued, ComputePassAndResources> ? PassType::Compute : PassType::Copy);
+							dump << "      - " << passEntry.name
+								 << " (" << PassTypeToString(queuedPassType)
+								 << ", run=" << PassRunMaskToString(passEntry.run) << ")\n";
+						}, queuedPass);
+					}
+				}
+
+				for (size_t signalPhaseIndex = 0; signalPhaseIndex < PassBatch::kSignalPhaseCount; ++signalPhaseIndex) {
+					const auto signalPhase = static_cast<BatchSignalPhase>(signalPhaseIndex);
+					if (!batch.HasQueueSignal(signalPhase, queueIndex)) {
+						continue;
+					}
+					dump << "    signal phase=" << BatchSignalPhaseToString(signalPhase)
+						 << " fence=" << batch.GetQueueSignalFenceValue(signalPhase, queueIndex)
+						 << "\n";
+				}
+			}
+		}
+
+		namespace fs = std::filesystem;
+		std::error_code fsError;
+		fs::path dumpDir = fs::current_path(fsError);
+		if (fsError) {
+			dumpDir.clear();
+		}
+		dumpDir /= "rendergraph_dumps";
+		fs::create_directories(dumpDir, fsError);
+
+		const fs::path dumpPath = dumpDir / "rendergraph_compiled_state_latest.txt";
+		std::ofstream outFile(dumpPath, std::ios::out | std::ios::trunc);
+		if (!outFile.is_open()) {
+			spdlog::warn("Failed to open render graph debug dump '{}'", dumpPath.string());
+			return;
+		}
+		outFile << dump.str();
+		outFile.close();
+
+		static bool announcedDumpPath = false;
+		if (!announcedDumpPath) {
+			announcedDumpPath = true;
+			spdlog::info("Render graph compiled-state dump will be written to '{}'", dumpPath.string());
+		}
+	}
+	catch (const std::exception& ex) {
+		spdlog::warn("Failed to write render graph compiled-state dump: {}", ex.what());
 	}
 }
 
@@ -352,23 +737,24 @@ std::vector<RenderGraph::Node> RenderGraph::BuildNodes(RenderGraph& rg, std::vec
 			n.accessByID.push_back({rid, k});
 			};
 
+		// Alias placement is computed later in CompileFrame, after the dependency DAG
+		// has already been built. Expanding through the previous frame's alias
+		// placements here can inject stale hazards into the current frame, so node
+		// construction must only reflect the pass's declared resources.
+		// Current-frame alias overlap is handled after BuildAliasPlanAfterDag.
 		// resource requirements
 		for (auto& req : *view.reqs) {
 			uint64_t base = req.resourceHandleAndRange.resource.GetGlobalResourceID();
 			bool write = AccessTypeIsWriteType(req.state.access);
 			bool isUav = IsUAVState(req.state);
 
-			for (uint64_t rid : rg.m_aliasingSubsystem.GetSchedulingEquivalentIDs(base, rg.aliasPlacementRangesByID)) {
-				mark(rid, write ? AccessKind::Write : AccessKind::Read, isUav);
-			}
+			mark(base, write ? AccessKind::Write : AccessKind::Read, isUav);
 		}
 
 		// internal transitions: treat as "write" for scheduling conservatism
 		for (auto& tr : *view.internalTransitions) {
 			uint64_t base = tr.first.resource.GetGlobalResourceID();
-			for (uint64_t rid : rg.m_aliasingSubsystem.GetSchedulingEquivalentIDs(base, rg.aliasPlacementRangesByID)) {
-				mark(rid, AccessKind::Write, /*isUav=*/false);
-			}
+			mark(base, AccessKind::Write, /*isUav=*/false);
 		}
 
 		// Deduplicate touchedIDs
@@ -683,6 +1069,11 @@ bool RenderGraph::BuildDependencyGraph(
 		AddEdgeDedup(e.first, e.second, nodes, edgeSet);
 	}
 
+	return FinalizeDependencyGraph(nodes);
+}
+
+bool RenderGraph::FinalizeDependencyGraph(std::vector<Node>& nodes)
+{
 	// topo + criticality (longest path)
 	std::vector<uint32_t> indeg(nodes.size());
 	for (size_t i = 0; i < nodes.size(); ++i) indeg[i] = nodes[i].indegree;
@@ -709,6 +1100,9 @@ bool RenderGraph::BuildDependencyGraph(
 	}
 
 	// reverse topo DP
+	for (auto& node : nodes) {
+		node.criticality = 0;
+	}
 	for (auto it = topo.rbegin(); it != topo.rend(); ++it) {
 		size_t u = *it;
 		uint32_t best = 0;
@@ -718,6 +1112,122 @@ bool RenderGraph::BuildDependencyGraph(
 	}
 
 	return true;
+}
+
+bool RenderGraph::AddCurrentFrameAliasSchedulingEdges(std::vector<Node>& nodes)
+{
+	if (aliasPlacementRangesByID.empty()) {
+		return true;
+	}
+
+	auto rangesOverlap = [](const rg::alias::AliasPlacementRange& lhs, const rg::alias::AliasPlacementRange& rhs) {
+		const uint64_t overlapStart = (std::max)(lhs.startByte, rhs.startByte);
+		const uint64_t overlapEnd = (std::min)(lhs.endByte, rhs.endByte);
+		return overlapStart < overlapEnd;
+	};
+
+	auto resourceDebugName = [&](uint64_t resourceID) {
+		auto it = resourcesByID.find(resourceID);
+		if (it == resourcesByID.end() || !it->second || it->second->GetName().empty()) {
+			return std::string("<unnamed>");
+		}
+		return it->second->GetName();
+	};
+
+	std::unordered_map<size_t, size_t> nodeIndexByPassIndex;
+	nodeIndexByPassIndex.reserve(nodes.size());
+	for (size_t nodeIndex = 0; nodeIndex < nodes.size(); ++nodeIndex) {
+		nodeIndexByPassIndex[nodes[nodeIndex].passIndex] = nodeIndex;
+	}
+
+	size_t existingEdgeCount = 0;
+	for (const auto& node : nodes) {
+		existingEdgeCount += node.out.size();
+	}
+
+	std::unordered_set<uint64_t> edgeSet;
+	edgeSet.reserve(existingEdgeCount + aliasPlacementRangesByID.size() * 4);
+	for (size_t from = 0; from < nodes.size(); ++from) {
+		for (size_t to : nodes[from].out) {
+			edgeSet.insert((uint64_t(from) << 32) | uint64_t(to));
+		}
+	}
+
+	std::vector<uint64_t> resourceIDs;
+	resourceIDs.reserve(aliasPlacementRangesByID.size());
+	for (const auto& [resourceID, placement] : aliasPlacementRangesByID) {
+		(void)placement;
+		resourceIDs.push_back(resourceID);
+	}
+	std::sort(resourceIDs.begin(), resourceIDs.end());
+
+	for (size_t i = 0; i < resourceIDs.size(); ++i) {
+		const uint64_t lhsResourceID = resourceIDs[i];
+		const auto lhsIt = aliasPlacementRangesByID.find(lhsResourceID);
+		if (lhsIt == aliasPlacementRangesByID.end()) {
+			continue;
+		}
+
+		const auto& lhs = lhsIt->second;
+		if (lhs.firstUsePassIndex == std::numeric_limits<size_t>::max() ||
+			lhs.lastUsePassIndex == std::numeric_limits<size_t>::max()) {
+			continue;
+		}
+
+		for (size_t j = i + 1; j < resourceIDs.size(); ++j) {
+			const uint64_t rhsResourceID = resourceIDs[j];
+			const auto rhsIt = aliasPlacementRangesByID.find(rhsResourceID);
+			if (rhsIt == aliasPlacementRangesByID.end()) {
+				continue;
+			}
+
+			const auto& rhs = rhsIt->second;
+			if (lhs.poolID != rhs.poolID || !rangesOverlap(lhs, rhs)) {
+				continue;
+			}
+			if (rhs.firstUsePassIndex == std::numeric_limits<size_t>::max() ||
+				rhs.lastUsePassIndex == std::numeric_limits<size_t>::max()) {
+				continue;
+			}
+
+			size_t fromPassIndex = std::numeric_limits<size_t>::max();
+			size_t toPassIndex = std::numeric_limits<size_t>::max();
+			if (lhs.lastUse < rhs.firstUse) {
+				fromPassIndex = lhs.lastUsePassIndex;
+				toPassIndex = rhs.firstUsePassIndex;
+			}
+			else if (rhs.lastUse < lhs.firstUse) {
+				fromPassIndex = rhs.lastUsePassIndex;
+				toPassIndex = lhs.firstUsePassIndex;
+			}
+			else {
+				throw std::runtime_error(
+					"Alias plan produced overlapping lifetimes for overlapping placements: resource " +
+					std::to_string(lhsResourceID) + " ('" + resourceDebugName(lhsResourceID) + "') [" +
+					std::to_string(lhs.startByte) + ", " + std::to_string(lhs.endByte) + ") firstUse=" +
+					std::to_string(static_cast<uint64_t>(lhs.firstUse)) + " lastUse=" +
+					std::to_string(static_cast<uint64_t>(lhs.lastUse)) + " and resource " +
+					std::to_string(rhsResourceID) + " ('" + resourceDebugName(rhsResourceID) + "') [" +
+					std::to_string(rhs.startByte) + ", " + std::to_string(rhs.endByte) + ") firstUse=" +
+					std::to_string(static_cast<uint64_t>(rhs.firstUse)) + " lastUse=" +
+					std::to_string(static_cast<uint64_t>(rhs.lastUse)));
+			}
+
+			if (fromPassIndex == toPassIndex) {
+				continue;
+			}
+
+			auto fromNodeIt = nodeIndexByPassIndex.find(fromPassIndex);
+			auto toNodeIt = nodeIndexByPassIndex.find(toPassIndex);
+			if (fromNodeIt == nodeIndexByPassIndex.end() || toNodeIt == nodeIndexByPassIndex.end()) {
+				continue;
+			}
+
+			AddEdgeDedup(fromNodeIt->second, toNodeIt->second, nodes, edgeSet);
+		}
+	}
+
+	return FinalizeDependencyGraph(nodes);
 }
 
 void RenderGraph::CommitPassToBatch(
@@ -2148,7 +2658,7 @@ void RenderGraph::CompileStructural() {
 			empty.push_back(i); // This pass was not built
 			continue;
 		}
-		RegisterProvider(prov);
+		EnsureProviderRegistered(prov);
 	}
 	unsigned int i = 0;
 	for (auto ptr : m_passBuilderOrder) {
@@ -2534,6 +3044,7 @@ void RenderGraph::RefreshRetainedDeclarationsForFrame(RenderPassAndResources& p,
 	b._declaredIds.clear();
 
 	// Let the pass declare based on current per-frame state (queued mip jobs etc.)
+	EnsureProviderRegistered(p.pass.get());
 	p.pass->DeclareResourceUsages(&b);
 
 	// Update the frame view used by scheduling
@@ -2570,6 +3081,7 @@ void RenderGraph::RefreshRetainedDeclarationsForFrame(ComputePassAndResources& p
 	b.params = {};
 	b._declaredIds.clear();
 
+	EnsureProviderRegistered(p.pass.get());
 	p.pass->DeclareResourceUsages(&b);
 
 	p.resources.staticResourceRequirements = b.GatherResourceRequirements();
@@ -2602,6 +3114,7 @@ void RenderGraph::RefreshRetainedDeclarationsForFrame(CopyPassAndResources& p, u
 	b.params = {};
 	b._declaredIds.clear();
 
+	EnsureProviderRegistered(p.pass.get());
 	p.pass->DeclareResourceUsages(&b);
 
 	p.resources.staticResourceRequirements = b.GatherResourceRequirements();
@@ -3056,6 +3569,25 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		throw std::runtime_error("Render graph contains a dependency cycle");
 	}
 
+	std::vector<rg::alias::AliasSchedulingNode> aliasNodes;
+	aliasNodes.reserve(nodes.size());
+	for (const auto& node : nodes) {
+		aliasNodes.push_back(rg::alias::AliasSchedulingNode{
+			.passIndex = node.passIndex,
+			.originalOrder = node.originalOrder,
+			.indegree = node.indegree,
+			.criticality = node.criticality,
+			.out = node.out,
+		});
+	}
+
+	m_aliasingSubsystem.AutoAssignAliasingPools(*this, aliasNodes);
+	m_aliasingSubsystem.BuildAliasPlanAfterDag(*this, aliasNodes);
+	if (!AddCurrentFrameAliasSchedulingEdges(nodes)) {
+		spdlog::error("Render graph alias scheduling introduced a dependency cycle! Render graph compilation failed.");
+		throw std::runtime_error("Render graph alias scheduling introduced a dependency cycle");
+	}
+
 	m_activeQueueSlotsThisFrame = PlanActiveQueueSlots(*this, m_framePasses, nodes);
 	m_assignedQueueSlotsByFramePass.resize(m_framePasses.size());
 	for (auto& node : nodes) {
@@ -3071,21 +3603,6 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			m_assignedQueueSlotsByFramePass[node.passIndex] = defaultSlot;
 		}
 	}
-
-	std::vector<rg::alias::AliasSchedulingNode> aliasNodes;
-	aliasNodes.reserve(nodes.size());
-	for (const auto& node : nodes) {
-		aliasNodes.push_back(rg::alias::AliasSchedulingNode{
-			.passIndex = node.passIndex,
-			.originalOrder = node.originalOrder,
-			.indegree = node.indegree,
-			.criticality = node.criticality,
-			.out = node.out,
-		});
-	}
-
-	m_aliasingSubsystem.AutoAssignAliasingPools(*this, aliasNodes);
-	m_aliasingSubsystem.BuildAliasPlanAfterDag(*this, aliasNodes);
 	MaterializeUnmaterializedResources(&usedResourceIDs);
 	SnapshotCompiledResourceGenerations(usedResourceIDs);
 
@@ -3220,6 +3737,8 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			}
 		}
 	}
+
+	WriteCompiledGraphDebugDump(frameIndex, nodes);
 
 #if BUILD_TYPE == BUILD_TYPE_DEBUG
 	// Sanity checks:
@@ -5322,17 +5841,35 @@ bool RenderGraph::IsNewBatchNeeded(
 }
 
 void RenderGraph::RegisterProvider(IResourceProvider* prov) {
+	EnsureProviderRegistered(prov);
+}
+
+void RenderGraph::EnsureProviderRegistered(IResourceProvider* prov) {
+	if (!prov) {
+		return;
+	}
+
 	auto keys = prov->GetSupportedKeys();
 	for (const auto& key : keys) {
-		if (_providerMap.find(key) != _providerMap.end()) {
+		auto existing = _providerMap.find(key);
+		if (existing != _providerMap.end()) {
+			if (existing->second == prov) {
+				continue;
+			}
 			std::string_view name = key.ToString();
 			throw std::runtime_error("Resource provider already registered for key: " + std::string(name));
 		}
 		_providerMap[key] = prov;
 	}
-	_providers.push_back(prov);
+	if (std::find(_providers.begin(), _providers.end(), prov) == _providers.end()) {
+		_providers.push_back(prov);
+	}
 
 	for (const auto& key : prov->GetSupportedKeys()) {
+		if (_registry.GetHandleFor(key).has_value()) {
+			continue;
+		}
+
 		auto resource = prov->ProvideResource(key);
 		if (resource) {
 			RegisterResource(key, resource, prov);
@@ -5344,6 +5881,10 @@ void RenderGraph::RegisterProvider(IResourceProvider* prov) {
 
 	// Register resolvers from this provider
 	for (const auto& key : prov->GetSupportedResolverKeys()) {
+		if (_resolverMap.contains(key)) {
+			continue;
+		}
+
 		if (const auto resolver = prov->ProvideResolver(key); resolver) {
 			RegisterResolver(key, resolver);
 		}

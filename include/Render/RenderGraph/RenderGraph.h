@@ -521,6 +521,7 @@ public:
 	std::shared_ptr<ComputePass> GetComputePassByName(const std::string& name);
 
 	void RegisterProvider(IResourceProvider* prov);
+	void EnsureProviderRegistered(IResourceProvider* prov);
 	void RegisterResource(ResourceIdentifier id, std::shared_ptr<Resource> resource, IResourceProvider* provider = nullptr);
 
 	std::unordered_map<ResourceIdentifier, std::shared_ptr<IResourceResolver>, ResourceIdentifier::Hasher> _resolverMap;
@@ -776,6 +777,7 @@ private:
 	void RefreshRetainedDeclarationsForFrame(ComputePassAndResources& p, uint8_t frameIndex);
 	void RefreshRetainedDeclarationsForFrame(CopyPassAndResources& p, uint8_t frameIndex);
 	void CompileFrame(rhi::Device device, uint8_t frameIndex, const IHostExecutionData* hostData);
+	void WriteCompiledGraphDebugDump(uint8_t frameIndex, const std::vector<Node>& nodes) const;
 	AnyPassAndResources MaterializeExternalPass(const ExternalPassDesc& desc, bool callSetup, bool materializeReferencedResources);
 	void RegisterExternalPassName(const ExternalPassDesc& desc, AnyPassAndResources& any);
 
@@ -944,12 +946,14 @@ private:
 	static PassView GetPassView(AnyPassAndResources& pr);
 	static bool BuildDependencyGraph(std::vector<Node>& nodes);
 	static bool BuildDependencyGraph(std::vector<Node>& nodes, std::span<const std::pair<size_t, size_t>> explicitEdges);
+	static bool FinalizeDependencyGraph(std::vector<Node>& nodes);
 	static std::vector<Node> BuildNodes(RenderGraph& rg, std::vector<AnyPassAndResources>& passes);
 	static std::vector<uint8_t> PlanActiveQueueSlots(RenderGraph& rg, const std::vector<AnyPassAndResources>& passes, const std::vector<Node>& nodes);
 	static bool AddEdgeDedup(
 		size_t from, size_t to,
 		std::vector<Node>& nodes,
 		std::unordered_set<uint64_t>& edgeSet);
+	bool AddCurrentFrameAliasSchedulingEdges(std::vector<Node>& nodes);
 	void CommitPassToBatch(
 		RenderGraph& rg,
 		AnyPassAndResources& pr,

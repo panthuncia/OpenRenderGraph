@@ -447,8 +447,11 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph
 	auto& aliasPlacementRangesByID = rg.aliasPlacementRangesByID;
 	auto& aliasPlacementSignatureByID = rg.aliasPlacementSignatureByID;
 
+	const auto previousAliasPlacementPoolByID = aliasPlacementPoolByID;
 	aliasMaterializeOptionsByID.clear();
 	aliasActivationPending.clear();
+	aliasPlacementPoolByID.clear();
+	aliasPlacementRangesByID.clear();
 	autoAliasPlannerStats.pooledIndependentBytes = 0;
 	autoAliasPlannerStats.pooledActualBytes = 0;
 	autoAliasPlannerStats.pooledSavedBytes = 0;
@@ -531,6 +534,7 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph
 		size_t firstUse = std::numeric_limits<size_t>::max();
 		size_t firstUsePassIndex = std::numeric_limits<size_t>::max();
 		size_t lastUse = 0;
+		size_t lastUsePassIndex = std::numeric_limits<size_t>::max();
 		bool firstUseIsWrite = false;
 		bool manualPoolAssigned = false;
 		Kind kind = Kind::Texture;
@@ -611,7 +615,10 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph
 					}
 					c.firstUseIsWrite = c.firstUseIsWrite || isWrite;
 				}
-				c.lastUse = std::max(c.lastUse, usageOrder);
+				if (usageOrder >= c.lastUse) {
+					c.lastUse = usageOrder;
+					c.lastUsePassIndex = passIdx;
+				}
 				c.manualPoolAssigned = c.manualPoolAssigned || buffer->GetAliasingPoolHint().has_value();
 
 				if (inserted || c.sizeBytes == 0) {
@@ -659,7 +666,10 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph
 				}
 				c.firstUseIsWrite = c.firstUseIsWrite || isWrite;
 			}
-			c.lastUse = std::max(c.lastUse, usageOrder);
+			if (usageOrder >= c.lastUse) {
+				c.lastUse = usageOrder;
+				c.lastUsePassIndex = passIdx;
+			}
 			c.manualPoolAssigned = c.manualPoolAssigned || texture->GetDescription().aliasingPoolID.has_value();
 
 			if (inserted || c.sizeBytes == 0) {
@@ -1303,6 +1313,10 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph
 				.poolID = poolID,
 				.startByte = placement.offset,
 				.endByte = placement.offset + c.sizeBytes,
+				.firstUse = c.firstUse,
+				.lastUse = c.lastUse,
+				.firstUsePassIndex = c.firstUsePassIndex,
+				.lastUsePassIndex = c.lastUsePassIndex,
 			};
 
 			if (aliasLoggingEnabled) {
@@ -1439,6 +1453,29 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph
 		}
 	}
 
+	for (const auto& [resourceID, previousPoolID] : previousAliasPlacementPoolByID) {
+		(void)previousPoolID;
+		if (aliasPlacementPoolByID.contains(resourceID)) {
+			continue;
+		}
+
+		auto itRes = resourcesByID.find(resourceID);
+		if (itRes != resourcesByID.end() && itRes->second) {
+			auto texture = std::dynamic_pointer_cast<PixelBuffer>(itRes->second);
+			if (texture && texture->IsMaterialized()) {
+				texture->Dematerialize();
+			}
+
+			auto buffer = std::dynamic_pointer_cast<Buffer>(itRes->second);
+			if (buffer && buffer->IsMaterialized()) {
+				buffer->Dematerialize();
+			}
+		}
+
+		aliasPlacementSignatureByID.erase(resourceID);
+		aliasActivationPending.erase(resourceID);
+	}
+
 	autoAliasPlannerStats.pooledSavedBytes =
 		autoAliasPlannerStats.pooledIndependentBytes > autoAliasPlannerStats.pooledActualBytes
 		? (autoAliasPlannerStats.pooledIndependentBytes - autoAliasPlannerStats.pooledActualBytes)
@@ -1519,10 +1556,26 @@ void rg::alias::RenderGraphAliasingSubsystem::ApplyAliasQueueSynchronization(Ren
 			}
 		};
 
+		auto accumulateFromInternalTransitions = [&](const std::vector<std::pair<ResourceHandleAndRange, ResourceState>>& internalTransitions, size_t slot) {
+			for (auto const& transition : internalTransitions) {
+				const uint64_t resourceID = transition.first.resource.GetGlobalResourceID();
+				auto itPlacement = aliasPlacementRangesByID.find(resourceID);
+				if (itPlacement == aliasPlacementRangesByID.end()) {
+					continue;
+				}
+				auto& u = usageByResourceID[resourceID];
+				if (u.usesBySlot.empty()) {
+					u.usesBySlot.resize(slotCount, false);
+				}
+				markUsage(u, slot);
+			}
+		};
+
 		auto accumulateFromQueuedPass = [&](const RenderGraph::PassBatch::QueuedPass& queuedPass, size_t slot) {
 			std::visit(
 				[&](auto const& pass) {
 					accumulateFromReqs(pass.resources.frameResourceRequirements, slot);
+					accumulateFromInternalTransitions(pass.resources.internalTransitions, slot);
 				},
 				queuedPass);
 		};
