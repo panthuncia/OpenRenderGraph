@@ -985,6 +985,7 @@ private:
 	AutoAliasPackingStrategy autoAliasPackingStrategyLastFrame = AutoAliasPackingStrategy::GreedySweepLine;
 	std::function<AutoAliasMode()> m_getAutoAliasMode;
 	std::function<AutoAliasPackingStrategy()> m_getAutoAliasPackingStrategy;
+	std::function<bool()> m_getRenderGraphCompileDumpEnabled;
 	std::function<bool()> m_getAutoAliasEnableLogging;
 	std::function<bool()> m_getAutoAliasLogExclusionReasons;
 	std::function<bool()> m_getQueueSchedulingEnableLogging;

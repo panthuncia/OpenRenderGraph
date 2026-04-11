@@ -11,6 +11,10 @@ public:
         return GetOpenRenderGraphSettings().useAsyncCompute;
     }
 
+    bool GetRenderGraphCompileDumpEnabled() const override {
+        return GetOpenRenderGraphSettings().renderGraphCompileDumpEnabled;
+    }
+
     uint8_t GetAutoAliasMode() const override {
         return GetOpenRenderGraphSettings().autoAliasMode;
     }

@@ -3,6 +3,7 @@
 #include <span>
 #include <algorithm>
 #include <cmath>
+#include <map>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -622,6 +623,52 @@ void RenderGraph::WriteCompiledGraphDebugDump(uint8_t frameIndex, const std::vec
 					dump << "    signal phase=" << BatchSignalPhaseToString(signalPhase)
 						 << " fence=" << batch.GetQueueSignalFenceValue(signalPhase, queueIndex)
 						 << "\n";
+				}
+			}
+		}
+
+		if (!aliasPlacementRangesByID.empty()) {
+			dump << "\n[AliasPlacementRanges]\n";
+
+			// Group placements by pool for readability
+			std::map<uint64_t, std::vector<std::pair<uint64_t, const rg::alias::AliasPlacementRange*>>> byPool;
+			for (const auto& [resourceID, placement] : aliasPlacementRangesByID) {
+				byPool[placement.poolID].emplace_back(resourceID, &placement);
+			}
+
+			for (auto& [poolID, entries] : byPool) {
+				// Sort by startByte within each pool
+				std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) {
+					return a.second->startByte < b.second->startByte;
+				});
+
+				auto poolIt = persistentAliasPools.find(poolID);
+				dump << "pool=" << poolID;
+				if (poolIt != persistentAliasPools.end()) {
+					dump << " capacity=" << poolIt->second.capacityBytes
+						 << " generation=" << poolIt->second.generation;
+				}
+				dump << " resource_count=" << entries.size() << "\n";
+
+				for (const auto& [resourceID, placement] : entries) {
+					dump << "  id=" << resourceID;
+					auto resourceIt = resourcesByID.find(resourceID);
+					if (resourceIt != resourcesByID.end() && resourceIt->second && !resourceIt->second->GetName().empty()) {
+						dump << " name=\"" << resourceIt->second->GetName() << "\"";
+					}
+					dump << " bytes=[" << placement->startByte << ", " << placement->endByte << ")"
+						 << " size=" << (placement->endByte - placement->startByte)
+						 << " firstUse=" << placement->firstUse
+						 << " lastUse=" << placement->lastUse
+						 << " firstUsePass=" << placement->firstUsePassIndex
+						 << " lastUsePass=" << placement->lastUsePassIndex;
+					if (placement->firstUsePassIndex < m_framePasses.size()) {
+						dump << " firstPassName=\"" << m_framePasses[placement->firstUsePassIndex].name << "\"";
+					}
+					if (placement->lastUsePassIndex < m_framePasses.size()) {
+						dump << " lastPassName=\"" << m_framePasses[placement->lastUsePassIndex].name << "\"";
+					}
+					dump << "\n";
 				}
 			}
 		}
@@ -3738,7 +3785,9 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		}
 	}
 
-	WriteCompiledGraphDebugDump(frameIndex, nodes);
+	if (m_getRenderGraphCompileDumpEnabled && m_getRenderGraphCompileDumpEnabled()) {
+		WriteCompiledGraphDebugDump(frameIndex, nodes);
+	}
 
 #if BUILD_TYPE == BUILD_TYPE_DEBUG
 	// Sanity checks:
@@ -4443,6 +4492,9 @@ void RenderGraph::Setup() {
 	};
 	m_getHeavyDebug = [this]() {
 		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetHeavyDebug() : false;
+	};
+	m_getRenderGraphCompileDumpEnabled = [this]() {
+		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetRenderGraphCompileDumpEnabled() : false;
 	};
 	m_getAutoAliasMode = [this]() {
 		const auto mode = m_renderGraphSettingsService

@@ -10,6 +10,7 @@ public:
     virtual ~IRenderGraphSettingsService() = default;
 
     virtual bool GetUseAsyncCompute() const = 0;
+    virtual bool GetRenderGraphCompileDumpEnabled() const = 0;
     virtual uint8_t GetAutoAliasMode() const = 0;
     virtual uint8_t GetAutoAliasPackingStrategy() const = 0;
     virtual bool GetAutoAliasEnableLogging() const = 0;

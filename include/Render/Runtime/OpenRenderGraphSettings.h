@@ -11,6 +11,7 @@ struct OpenRenderGraphSettings {
     bool collectPipelineStatistics = false;
 
     bool useAsyncCompute = true;
+    bool renderGraphCompileDumpEnabled = false;
     uint8_t autoAliasMode = 2;
     uint8_t autoAliasPackingStrategy = 0;
     bool autoAliasEnableLogging = false;
