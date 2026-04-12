@@ -6,6 +6,7 @@
 #include <functional>
 #include <limits>
 #include <sstream>
+#include <tracy/Tracy.hpp>
 #include <tuple>
 
 #include <rhi_helpers.h>
@@ -101,6 +102,7 @@ namespace {
 }
 
 void rg::alias::RenderGraphAliasingSubsystem::AutoAssignAliasingPools(RenderGraph& rg, const std::vector<AliasSchedulingNode>& nodes) const {
+	ZoneScopedN("RenderGraphAliasingSubsystem::AutoAssignAliasingPools");
 	auto& autoAliasPoolByID = rg.autoAliasPoolByID;
 	auto& autoAliasExclusionReasonByID = rg.autoAliasExclusionReasonByID;
 	auto& autoAliasExclusionReasonSummary = rg.autoAliasExclusionReasonSummary;
@@ -424,6 +426,7 @@ bool AccessTypeIsWriteOrCommon(rhi::ResourceAccessType t) {
 }
 
 void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph& rg, const std::vector<AliasSchedulingNode>& nodes) const {
+	ZoneScopedN("RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag");
 	auto& aliasMaterializeOptionsByID = rg.aliasMaterializeOptionsByID;
 	auto& aliasActivationPending = rg.aliasActivationPending;
 	auto& autoAliasPreviousMode = rg.autoAliasPreviousMode;
@@ -1502,6 +1505,7 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph
 }
 
 void rg::alias::RenderGraphAliasingSubsystem::ApplyAliasQueueSynchronization(RenderGraph& rg) const {
+	ZoneScopedN("RenderGraphAliasingSubsystem::ApplyAliasQueueSynchronization");
 	auto& batches = rg.batches;
 	auto& aliasPlacementRangesByID = rg.aliasPlacementRangesByID;
 	const size_t slotCount = rg.GetQueueRegistry().SlotCount();

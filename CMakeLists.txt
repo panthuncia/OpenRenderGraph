@@ -51,6 +51,7 @@ find_package(Boost REQUIRED COMPONENTS container_hash)
 find_package(imgui CONFIG REQUIRED)
 find_package(implot CONFIG REQUIRED)
 find_package(slang CONFIG REQUIRED)
+find_package(Tracy REQUIRED CONFIG)
 
 add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/DebugUI/MemoryIntrospectionWidget.cpp"
@@ -120,6 +121,7 @@ target_link_libraries(OpenRenderGraph
         slang::slang
     PRIVATE
         spdlog::spdlog_header_only
+        Tracy::TracyClient
 )
 
 target_compile_definitions(OpenRenderGraph

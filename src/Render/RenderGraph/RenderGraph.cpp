@@ -11,6 +11,7 @@
 #include <numeric>
 #include <optional>
 #include <sstream>
+#include <tracy/Tracy.hpp>
 #include <rhi_helpers.h>
 #include <rhi_debug.h>
 
@@ -723,6 +724,7 @@ RenderGraph::PassView RenderGraph::GetPassView(AnyPassAndResources& pr) {
 }
 
 std::vector<RenderGraph::Node> RenderGraph::BuildNodes(RenderGraph& rg, std::vector<AnyPassAndResources>& passes) {
+	ZoneScopedN("RenderGraph::BuildNodes");
 
 	std::vector<Node> nodes;
 	nodes.resize(passes.size());
@@ -832,6 +834,7 @@ std::vector<uint8_t> RenderGraph::PlanActiveQueueSlots(
 	const std::vector<AnyPassAndResources>& passes,
 	const std::vector<Node>& nodes)
 {
+	ZoneScopedN("RenderGraph::PlanActiveQueueSlots");
 	const size_t slotCount = rg.m_queueRegistry.SlotCount();
 	std::vector<uint8_t> activeSlots(slotCount, 0);
 	if (slotCount == 0) {
@@ -1079,6 +1082,7 @@ bool RenderGraph::BuildDependencyGraph(
 	std::vector<Node>& nodes,
 	std::span<const std::pair<size_t, size_t>> explicitEdges)
 {
+	ZoneScopedN("RenderGraph::BuildDependencyGraph");
 	std::unordered_map<uint64_t, SeqState> seq;
 	{
 		size_t totalAccesses = 0;
@@ -1163,6 +1167,7 @@ bool RenderGraph::FinalizeDependencyGraph(std::vector<Node>& nodes)
 
 bool RenderGraph::AddCurrentFrameAliasSchedulingEdges(std::vector<Node>& nodes)
 {
+	ZoneScopedN("RenderGraph::AddCurrentFrameAliasSchedulingEdges");
 	if (aliasPlacementRangesByID.empty()) {
 		return true;
 	}
@@ -1560,6 +1565,7 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 	std::vector<AnyPassAndResources>& passes,
 	std::vector<Node>& nodes)
 {
+	ZoneScopedN("RenderGraph::AutoScheduleAndBuildBatches");
 	struct QueueSchedulingDiagnostics {
 		uint32_t candidateChecks = 0;
 		uint32_t assignedPasses = 0;
@@ -2360,6 +2366,7 @@ SymbolicTracker& RenderGraph::GetOrCreateCompileTracker(Resource* resource, uint
 }
 
 void RenderGraph::CaptureCompileTrackersForExecution(const std::unordered_set<uint64_t>& resourceIDs) {
+	ZoneScopedN("RenderGraph::CaptureCompileTrackersForExecution");
 	trackers.clear();
 	trackers.reserve(resourceIDs.size());
 
@@ -2475,6 +2482,7 @@ void RenderGraph::MaterializeReferencedResources(
 }
 
 void RenderGraph::CollectFrameResourceIDs(std::unordered_set<uint64_t>& used) const {
+	ZoneScopedN("RenderGraph::CollectFrameResourceIDs");
 	used.clear();
 	used.reserve(m_framePasses.size() * 4);
 
@@ -2494,6 +2502,7 @@ void RenderGraph::CollectFrameResourceIDs(std::unordered_set<uint64_t>& used) co
 }
 
 void RenderGraph::ApplyIdleDematerializationPolicy(const std::unordered_set<uint64_t>& usedResourceIDs) {
+	ZoneScopedN("RenderGraph::ApplyIdleDematerializationPolicy");
 	for (auto& [id, resource] : resourcesByID) {
 		if (!resource) {
 			continue;
@@ -2670,6 +2679,7 @@ void RenderGraph::ResetForRebuild()
 }
 
 void RenderGraph::ResetForFrame() {
+	ZoneScopedN("RenderGraph::ResetForFrame");
 	batches.clear();
 	compiledResourceGenerationByID.clear();
 	m_transientFrameResourcesByID.clear();
@@ -3080,6 +3090,10 @@ static bool RequirementsConflict(
 
 void RenderGraph::RefreshRetainedDeclarationsForFrame(RenderPassAndResources& p, uint8_t frameIndex)
 {
+	ZoneScopedN("RenderGraph::RefreshRetainedDeclarationsForFrame(Render)");
+	if (!p.name.empty()) {
+		ZoneText(p.name.data(), p.name.size());
+	}
 	RenderPassBuilder b(this, p.name);
 
 	// Make it look like a normal builder enough for any pass code that queries ResourceProvider()
@@ -3121,6 +3135,10 @@ void RenderGraph::RefreshRetainedDeclarationsForFrame(RenderPassAndResources& p,
 
 void RenderGraph::RefreshRetainedDeclarationsForFrame(ComputePassAndResources& p, uint8_t frameIndex)
 {
+	ZoneScopedN("RenderGraph::RefreshRetainedDeclarationsForFrame(Compute)");
+	if (!p.name.empty()) {
+		ZoneText(p.name.data(), p.name.size());
+	}
 	ComputePassBuilder b(this, p.name);
 	b.pass = p.pass;
 	b.built_ = true;
@@ -3154,6 +3172,10 @@ void RenderGraph::RefreshRetainedDeclarationsForFrame(ComputePassAndResources& p
 
 void RenderGraph::RefreshRetainedDeclarationsForFrame(CopyPassAndResources& p, uint8_t frameIndex)
 {
+	ZoneScopedN("RenderGraph::RefreshRetainedDeclarationsForFrame(Copy)");
+	if (!p.name.empty()) {
+		ZoneText(p.name.data(), p.name.size());
+	}
 	CopyPassBuilder b(this, p.name);
 	b.pass = p.pass;
 	b.built_ = true;
@@ -3180,8 +3202,13 @@ void RenderGraph::RefreshRetainedDeclarationsForFrame(CopyPassAndResources& p, u
 }
 
 void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHostExecutionData* hostData) {
-	compileTrackers.clear();
-	m_aliasingSubsystem.ResetPerFrameState(*this);
+	ZoneScopedN("RenderGraph::CompileFrame");
+
+	{
+		ZoneScopedN("RenderGraph::CompileFrame::ResetCompileState");
+		compileTrackers.clear();
+		m_aliasingSubsystem.ResetPerFrameState(*this);
+	}
 
 	auto needsRefresh = [&](auto& p) -> bool {
 		// Check if any stored resolver's content version has changed
@@ -3201,37 +3228,43 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		return iFace->DeclaredResourcesChanged();
 		};
 
-	// First, refresh all retained declarations for this frame
-	for (auto& pr : m_masterPassList) {
-		if (pr.type == PassType::Compute) {
-			auto& p = std::get<ComputePassAndResources>(pr.pass);
-			p.immediateBytecode.clear();
-			p.resources.frameResourceRequirements = {};// p.resources.staticResourceRequirements;
-			if (needsRefresh(p)) {
-				RefreshRetainedDeclarationsForFrame(p, frameIndex);
+	{
+		ZoneScopedN("RenderGraph::CompileFrame::RefreshRetainedDeclarations");
+		// First, refresh all retained declarations for this frame
+		for (auto& pr : m_masterPassList) {
+			if (pr.type == PassType::Compute) {
+				auto& p = std::get<ComputePassAndResources>(pr.pass);
+				p.immediateBytecode.clear();
+				p.resources.frameResourceRequirements = {};// p.resources.staticResourceRequirements;
+				if (needsRefresh(p)) {
+					RefreshRetainedDeclarationsForFrame(p, frameIndex);
+				}
 			}
-		}
-		else if (pr.type == PassType::Render) {
-			auto& p = std::get<RenderPassAndResources>(pr.pass);
-			p.immediateBytecode.clear();
-			p.resources.frameResourceRequirements = {};// p.resources.staticResourceRequirements;
-			if (needsRefresh(p)) {
-				RefreshRetainedDeclarationsForFrame(p, frameIndex);
+			else if (pr.type == PassType::Render) {
+				auto& p = std::get<RenderPassAndResources>(pr.pass);
+				p.immediateBytecode.clear();
+				p.resources.frameResourceRequirements = {};// p.resources.staticResourceRequirements;
+				if (needsRefresh(p)) {
+					RefreshRetainedDeclarationsForFrame(p, frameIndex);
+				}
 			}
-		}
-		else if (pr.type == PassType::Copy) {
-			auto& p = std::get<CopyPassAndResources>(pr.pass);
-			p.immediateBytecode.clear();
-			p.resources.frameResourceRequirements = {};
-			if (needsRefresh(p)) {
-				RefreshRetainedDeclarationsForFrame(p, frameIndex);
+			else if (pr.type == PassType::Copy) {
+				auto& p = std::get<CopyPassAndResources>(pr.pass);
+				p.immediateBytecode.clear();
+				p.resources.frameResourceRequirements = {};
+				if (needsRefresh(p)) {
+					RefreshRetainedDeclarationsForFrame(p, frameIndex);
+				}
 			}
 		}
 	}
 
-	batches.clear();
-	batches.emplace_back(m_queueRegistry.SlotCount()); // Dummy batch 0 for pre-first-pass transitions
-	m_framePasses.clear(); // Combined retained + immediate-mode passes for this frame
+	{
+		ZoneScopedN("RenderGraph::CompileFrame::InitFramePassState");
+		batches.clear();
+		batches.emplace_back(m_queueRegistry.SlotCount()); // Dummy batch 0 for pre-first-pass transitions
+		m_framePasses.clear(); // Combined retained + immediate-mode passes for this frame
+	}
 
 	// Record immediate-mode commands + access for each pass and fold into per-frame requirements
 	for (auto& pr : m_masterPassList) {
@@ -3254,7 +3287,13 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			};
 
 			// Record immediate-mode commands
-			p.pass->RecordImmediateCommands(c);
+			{
+				ZoneScopedN("RenderGraph::CompileFrame::RecordImmediateCommands");
+				if (!p.name.empty()) {
+					ZoneText(p.name.data(), p.name.size());
+				}
+				p.pass->RecordImmediateCommands(c);
+			}
 
 			auto immediateFrameData = c.list.Finalize();
 			// If there is a conflict between retained and immediate requirements, split the pass
@@ -3305,7 +3344,13 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				frameIndex,
 				hostData
 			};
-			p.pass->RecordImmediateCommands(c);
+			{
+				ZoneScopedN("RenderGraph::CompileFrame::RecordImmediateCommands");
+				if (!p.name.empty()) {
+					ZoneText(p.name.data(), p.name.size());
+				}
+				p.pass->RecordImmediateCommands(c);
+			}
 			auto immediateFrameData = c.list.Finalize();
 
 			bool conflict = RequirementsConflict(
@@ -3357,7 +3402,13 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				hostData
 			};
 
-			p.pass->RecordImmediateCommands(c);
+			{
+				ZoneScopedN("RenderGraph::CompileFrame::RecordImmediateCommands");
+				if (!p.name.empty()) {
+					ZoneText(p.name.data(), p.name.size());
+				}
+				p.pass->RecordImmediateCommands(c);
+			}
 			auto immediateFrameData = c.list.Finalize();
 
 			bool conflict = RequirementsConflict(
@@ -3398,9 +3449,12 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	// These are injected into the per-frame pass list (not m_masterPassList) so they do not accumulate.
 	std::vector<ExternalPassDesc> frameExt;
 	frameExt.reserve(16);
-	for (auto& ext : m_extensions) {
-		if (!ext) continue;
-		ext->GatherFramePasses(*this, frameExt);
+	{
+		ZoneScopedN("RenderGraph::CompileFrame::GatherFrameExtensions");
+		for (auto& ext : m_extensions) {
+			if (!ext) continue;
+			ext->GatherFramePasses(*this, frameExt);
+		}
 	}
 
 	// explicit After(anchor) edges (anchorName -> injectedName)
@@ -3424,7 +3478,13 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 					hostData
 				};
 
-				p.pass->RecordImmediateCommands(c);
+				{
+					ZoneScopedN("RenderGraph::CompileFrame::RecordImmediateCommands");
+					if (!p.name.empty()) {
+						ZoneText(p.name.data(), p.name.size());
+					}
+					p.pass->RecordImmediateCommands(c);
+				}
 				auto immediateFrameData = c.list.Finalize();
 				p.immediateBytecode = std::move(immediateFrameData.bytecode);
 				p.immediateKeepAlive = std::move(immediateFrameData.keepAlive);
@@ -3449,7 +3509,13 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 					hostData
 				};
 
-				p.pass->RecordImmediateCommands(c);
+				{
+					ZoneScopedN("RenderGraph::CompileFrame::RecordImmediateCommands");
+					if (!p.name.empty()) {
+						ZoneText(p.name.data(), p.name.size());
+					}
+					p.pass->RecordImmediateCommands(c);
+				}
 				auto immediateFrameData = c.list.Finalize();
 				p.immediateBytecode = std::move(immediateFrameData.bytecode);
 				p.immediateKeepAlive = std::move(immediateFrameData.keepAlive);
@@ -3474,7 +3540,13 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 					hostData
 				};
 
-				p.pass->RecordImmediateCommands(c);
+				{
+					ZoneScopedN("RenderGraph::CompileFrame::RecordImmediateCommands");
+					if (!p.name.empty()) {
+						ZoneText(p.name.data(), p.name.size());
+					}
+					p.pass->RecordImmediateCommands(c);
+				}
 				auto immediateFrameData = c.list.Finalize();
 				p.immediateBytecode = std::move(immediateFrameData.bytecode);
 				p.immediateKeepAlive = std::move(immediateFrameData.keepAlive);
@@ -3552,6 +3624,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	// Register/refresh pass statistics indices for this frame's concrete pass list.
 	// This supports transient passes and per-frame retained/immediate splits.
 	if (m_statisticsService) {
+		ZoneScopedN("RenderGraph::CompileFrame::RegisterStatistics");
 		for (size_t i = 0; i < m_framePasses.size(); ++i) {
 			auto& any = m_framePasses[i];
 			if (any.type == PassType::Render) {
@@ -3584,8 +3657,14 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	}
 
 	std::unordered_set<uint64_t> usedResourceIDs;
-	CollectFrameResourceIDs(usedResourceIDs);
-	ApplyIdleDematerializationPolicy(usedResourceIDs);
+	{
+		ZoneScopedN("RenderGraph::CompileFrame::CollectFrameResourceIDs");
+		CollectFrameResourceIDs(usedResourceIDs);
+	}
+	{
+		ZoneScopedN("RenderGraph::CompileFrame::ApplyIdleDematerializationPolicy");
+		ApplyIdleDematerializationPolicy(usedResourceIDs);
+	}
 
 	// Convert explicit After(anchorName)->(passName) constraints into node-index edges.
 	std::vector<std::pair<size_t, size_t>> explicitEdges;
@@ -3609,11 +3688,18 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		}
 	}
 
-	auto nodes = BuildNodes(*this, m_framePasses);
-	if (!BuildDependencyGraph(nodes, explicitEdges)) {
-		// Cycle detected
-		spdlog::error("Render graph contains a dependency cycle! Render graph compilation failed.");
-		throw std::runtime_error("Render graph contains a dependency cycle");
+	std::vector<Node> nodes;
+	{
+		ZoneScopedN("RenderGraph::CompileFrame::BuildNodes");
+		nodes = BuildNodes(*this, m_framePasses);
+	}
+	{
+		ZoneScopedN("RenderGraph::CompileFrame::BuildDependencyGraph");
+		if (!BuildDependencyGraph(nodes, explicitEdges)) {
+			// Cycle detected
+			spdlog::error("Render graph contains a dependency cycle! Render graph compilation failed.");
+			throw std::runtime_error("Render graph contains a dependency cycle");
+		}
 	}
 
 	std::vector<rg::alias::AliasSchedulingNode> aliasNodes;
@@ -3628,157 +3714,193 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		});
 	}
 
-	m_aliasingSubsystem.AutoAssignAliasingPools(*this, aliasNodes);
-	m_aliasingSubsystem.BuildAliasPlanAfterDag(*this, aliasNodes);
-	if (!AddCurrentFrameAliasSchedulingEdges(nodes)) {
-		spdlog::error("Render graph alias scheduling introduced a dependency cycle! Render graph compilation failed.");
-		throw std::runtime_error("Render graph alias scheduling introduced a dependency cycle");
+	{
+		ZoneScopedN("RenderGraph::CompileFrame::AutoAssignAliasingPools");
+		m_aliasingSubsystem.AutoAssignAliasingPools(*this, aliasNodes);
 	}
-
-	m_activeQueueSlotsThisFrame = PlanActiveQueueSlots(*this, m_framePasses, nodes);
-	m_assignedQueueSlotsByFramePass.resize(m_framePasses.size());
-	for (auto& node : nodes) {
-		size_t defaultSlot = node.queueSlot;
-		for (size_t compatibleSlot : node.compatibleQueueSlots) {
-			if (compatibleSlot < m_activeQueueSlotsThisFrame.size() && m_activeQueueSlotsThisFrame[compatibleSlot]) {
-				defaultSlot = compatibleSlot;
-				break;
-			}
-		}
-		node.assignedQueueSlot = defaultSlot;
-		if (node.passIndex < m_assignedQueueSlotsByFramePass.size()) {
-			m_assignedQueueSlotsByFramePass[node.passIndex] = defaultSlot;
+	{
+		ZoneScopedN("RenderGraph::CompileFrame::BuildAliasPlanAfterDag");
+		m_aliasingSubsystem.BuildAliasPlanAfterDag(*this, aliasNodes);
+	}
+	{
+		ZoneScopedN("RenderGraph::CompileFrame::AddCurrentFrameAliasSchedulingEdges");
+		if (!AddCurrentFrameAliasSchedulingEdges(nodes)) {
+			spdlog::error("Render graph alias scheduling introduced a dependency cycle! Render graph compilation failed.");
+			throw std::runtime_error("Render graph alias scheduling introduced a dependency cycle");
 		}
 	}
-	MaterializeUnmaterializedResources(&usedResourceIDs);
-	SnapshotCompiledResourceGenerations(usedResourceIDs);
 
-	AutoScheduleAndBuildBatches(*this, m_framePasses, nodes);
-	m_aliasingSubsystem.ApplyAliasQueueSynchronization(*this);
-	CaptureCompileTrackersForExecution(usedResourceIDs);
-
-	for (auto& row : m_hasPendingFrameStartQueueWait) {
-		std::fill(row.begin(), row.end(), false);
+	{
+		ZoneScopedN("RenderGraph::CompileFrame::PlanActiveQueueSlots");
+		m_activeQueueSlotsThisFrame = PlanActiveQueueSlots(*this, m_framePasses, nodes);
 	}
-	for (auto& row : m_pendingFrameStartQueueWaitFenceValue) {
-		std::fill(row.begin(), row.end(), UINT64(0));
+	{
+		ZoneScopedN("RenderGraph::CompileFrame::AssignQueueSlots");
+		m_assignedQueueSlotsByFramePass.resize(m_framePasses.size());
+		for (auto& node : nodes) {
+			size_t defaultSlot = node.queueSlot;
+			for (size_t compatibleSlot : node.compatibleQueueSlots) {
+				if (compatibleSlot < m_activeQueueSlotsThisFrame.size() && m_activeQueueSlotsThisFrame[compatibleSlot]) {
+					defaultSlot = compatibleSlot;
+					break;
+				}
+			}
+			node.assignedQueueSlot = defaultSlot;
+			if (node.passIndex < m_assignedQueueSlotsByFramePass.size()) {
+				m_assignedQueueSlotsByFramePass[node.passIndex] = defaultSlot;
+			}
+		}
 	}
-	uint32_t overlapTriggeredWaitCount = 0;
-	uint64_t overlapSampleCurrentResourceId = 0;
-	uint64_t overlapSamplePreviousResourceId = 0;
+	{
+		ZoneScopedN("RenderGraph::CompileFrame::MaterializeUnmaterializedResources");
+		MaterializeUnmaterializedResources(&usedResourceIDs);
+	}
+	{
+		ZoneScopedN("RenderGraph::CompileFrame::SnapshotCompiledResourceGenerations");
+		SnapshotCompiledResourceGenerations(usedResourceIDs);
+	}
 
-	auto markCrossFrameWait = [&](size_t dstSlot, size_t srcSlot, uint64_t fenceValue) {
-		if (dstSlot == srcSlot) {
-			return;
+	{
+		ZoneScopedN("RenderGraph::CompileFrame::AutoScheduleAndBuildBatches");
+		AutoScheduleAndBuildBatches(*this, m_framePasses, nodes);
+	}
+	{
+		ZoneScopedN("RenderGraph::CompileFrame::ApplyAliasQueueSynchronization");
+		m_aliasingSubsystem.ApplyAliasQueueSynchronization(*this);
+	}
+	{
+		ZoneScopedN("RenderGraph::CompileFrame::CaptureCompileTrackersForExecution");
+		CaptureCompileTrackersForExecution(usedResourceIDs);
+	}
+
+	{
+		ZoneScopedN("RenderGraph::CompileFrame::PlanCrossFrameQueueWaits");
+		for (auto& row : m_hasPendingFrameStartQueueWait) {
+			std::fill(row.begin(), row.end(), false);
 		}
-		auto& enabled = m_hasPendingFrameStartQueueWait[dstSlot][srcSlot];
-		auto& maxFence = m_pendingFrameStartQueueWaitFenceValue[dstSlot][srcSlot];
-		enabled = true;
-		maxFence = std::max(maxFence, fenceValue);
-	};
-
-	auto accumulateCrossFrameWaitForHandle = [&](size_t passQueueSlot, const ResourceRegistry::RegistryHandle& handle) {
-		if (handle.IsEphemeral()) {
-			return;
+		for (auto& row : m_pendingFrameStartQueueWaitFenceValue) {
+			std::fill(row.begin(), row.end(), UINT64(0));
 		}
+		uint32_t overlapTriggeredWaitCount = 0;
+		uint64_t overlapSampleCurrentResourceId = 0;
+		uint64_t overlapSamplePreviousResourceId = 0;
 
-		const uint64_t id = handle.GetGlobalResourceID();
-		for (uint64_t rid : m_aliasingSubsystem.GetSchedulingEquivalentIDs(id, aliasPlacementRangesByID)) {
-			auto it = m_lastProducerByResourceAcrossFrames.find(rid);
-			if (it != m_lastProducerByResourceAcrossFrames.end()) {
-				markCrossFrameWait(passQueueSlot, it->second.queueSlot, it->second.fenceValue);
+		auto markCrossFrameWait = [&](size_t dstSlot, size_t srcSlot, uint64_t fenceValue) {
+			if (dstSlot == srcSlot) {
+				return;
+			}
+			auto& enabled = m_hasPendingFrameStartQueueWait[dstSlot][srcSlot];
+			auto& maxFence = m_pendingFrameStartQueueWaitFenceValue[dstSlot][srcSlot];
+			enabled = true;
+			maxFence = std::max(maxFence, fenceValue);
+		};
+
+		auto accumulateCrossFrameWaitForHandle = [&](size_t passQueueSlot, const ResourceRegistry::RegistryHandle& handle) {
+			if (handle.IsEphemeral()) {
+				return;
 			}
 
-			auto itCurPlacement = aliasPlacementRangesByID.find(rid);
-			if (itCurPlacement == aliasPlacementRangesByID.end()) {
-				continue;
-			}
+			const uint64_t id = handle.GetGlobalResourceID();
+			for (uint64_t rid : m_aliasingSubsystem.GetSchedulingEquivalentIDs(id, aliasPlacementRangesByID)) {
+				auto it = m_lastProducerByResourceAcrossFrames.find(rid);
+				if (it != m_lastProducerByResourceAcrossFrames.end()) {
+					markCrossFrameWait(passQueueSlot, it->second.queueSlot, it->second.fenceValue);
+				}
 
-			auto itPoolState = persistentAliasPools.find(itCurPlacement->second.poolID);
-			if (itPoolState == persistentAliasPools.end()) {
-				continue;
-			}
-
-			auto itPrevPool = m_lastAliasPlacementProducersByPoolAcrossFrames.find(itCurPlacement->second.poolID);
-			if (itPrevPool == m_lastAliasPlacementProducersByPoolAcrossFrames.end()) {
-				continue;
-			}
-
-			const uint64_t curStart = itCurPlacement->second.startByte;
-			const uint64_t curEnd = itCurPlacement->second.endByte;
-			const uint64_t curPoolGeneration = itPoolState->second.generation;
-
-			for (const auto& prevPlacementProducer : itPrevPool->second) {
-				if (prevPlacementProducer.poolGeneration != curPoolGeneration) {
+				auto itCurPlacement = aliasPlacementRangesByID.find(rid);
+				if (itCurPlacement == aliasPlacementRangesByID.end()) {
 					continue;
 				}
 
-				const uint64_t overlapStart = std::max(curStart, prevPlacementProducer.startByte);
-				const uint64_t overlapEnd = std::min(curEnd, prevPlacementProducer.endByte);
-				if (overlapStart >= overlapEnd) {
+				auto itPoolState = persistentAliasPools.find(itCurPlacement->second.poolID);
+				if (itPoolState == persistentAliasPools.end()) {
 					continue;
 				}
 
-				markCrossFrameWait(passQueueSlot, prevPlacementProducer.producer.queueSlot, prevPlacementProducer.producer.fenceValue);
-				overlapTriggeredWaitCount++;
-				if (overlapSampleCurrentResourceId == 0) {
-					overlapSampleCurrentResourceId = rid;
-					overlapSamplePreviousResourceId = prevPlacementProducer.resourceID;
+				auto itPrevPool = m_lastAliasPlacementProducersByPoolAcrossFrames.find(itCurPlacement->second.poolID);
+				if (itPrevPool == m_lastAliasPlacementProducersByPoolAcrossFrames.end()) {
+					continue;
+				}
+
+				const uint64_t curStart = itCurPlacement->second.startByte;
+				const uint64_t curEnd = itCurPlacement->second.endByte;
+				const uint64_t curPoolGeneration = itPoolState->second.generation;
+
+				for (const auto& prevPlacementProducer : itPrevPool->second) {
+					if (prevPlacementProducer.poolGeneration != curPoolGeneration) {
+						continue;
+					}
+
+					const uint64_t overlapStart = std::max(curStart, prevPlacementProducer.startByte);
+					const uint64_t overlapEnd = std::min(curEnd, prevPlacementProducer.endByte);
+					if (overlapStart >= overlapEnd) {
+						continue;
+					}
+
+					markCrossFrameWait(passQueueSlot, prevPlacementProducer.producer.queueSlot, prevPlacementProducer.producer.fenceValue);
+					overlapTriggeredWaitCount++;
+					if (overlapSampleCurrentResourceId == 0) {
+						overlapSampleCurrentResourceId = rid;
+						overlapSamplePreviousResourceId = prevPlacementProducer.resourceID;
+					}
 				}
 			}
+		};
+
+		for (const auto& pr : m_framePasses) {
+			const size_t passIndex = static_cast<size_t>(&pr - m_framePasses.data());
+			std::visit([&](auto const& passAndResources) {
+				using T = std::decay_t<decltype(passAndResources)>;
+				if constexpr (!std::is_same_v<T, std::monostate>) {
+					const size_t fallbackQueueSlot = passAndResources.resources.pinnedQueueSlot
+						? static_cast<size_t>(static_cast<uint8_t>(*passAndResources.resources.pinnedQueueSlot))
+						: QueueIndex(passAndResources.resources.preferredQueueKind);
+					const size_t passQueueSlot = passIndex < m_assignedQueueSlotsByFramePass.size()
+						? m_assignedQueueSlotsByFramePass[passIndex]
+						: fallbackQueueSlot;
+					for (auto const& req : passAndResources.resources.frameResourceRequirements) {
+						accumulateCrossFrameWaitForHandle(passQueueSlot, req.resourceHandleAndRange.resource);
+					}
+					for (auto const& tr : passAndResources.resources.internalTransitions) {
+						accumulateCrossFrameWaitForHandle(passQueueSlot, tr.first.resource);
+					}
+				}
+			}, pr.pass);
 		}
-	};
 
-	for (const auto& pr : m_framePasses) {
-		const size_t passIndex = static_cast<size_t>(&pr - m_framePasses.data());
-		std::visit([&](auto const& passAndResources) {
-			using T = std::decay_t<decltype(passAndResources)>;
-			if constexpr (!std::is_same_v<T, std::monostate>) {
-				const size_t fallbackQueueSlot = passAndResources.resources.pinnedQueueSlot
-					? static_cast<size_t>(static_cast<uint8_t>(*passAndResources.resources.pinnedQueueSlot))
-					: QueueIndex(passAndResources.resources.preferredQueueKind);
-				const size_t passQueueSlot = passIndex < m_assignedQueueSlotsByFramePass.size()
-					? m_assignedQueueSlotsByFramePass[passIndex]
-					: fallbackQueueSlot;
-				for (auto const& req : passAndResources.resources.frameResourceRequirements) {
-					accumulateCrossFrameWaitForHandle(passQueueSlot, req.resourceHandleAndRange.resource);
-				}
-				for (auto const& tr : passAndResources.resources.internalTransitions) {
-					accumulateCrossFrameWaitForHandle(passQueueSlot, tr.first.resource);
-				}
-			}
-		}, pr.pass);
+		//if (overlapTriggeredWaitCount > 0) {
+		//	spdlog::info(
+		//		"RG cross-frame overlap waits: hits={} sampleCurrentResourceId={} samplePreviousResourceId={}",
+		//		overlapTriggeredWaitCount,
+		//		overlapSampleCurrentResourceId,
+		//		overlapSamplePreviousResourceId);
+		//}
 	}
-
-	//if (overlapTriggeredWaitCount > 0) {
-	//	spdlog::info(
-	//		"RG cross-frame overlap waits: hits={} sampleCurrentResourceId={} samplePreviousResourceId={}",
-	//		overlapTriggeredWaitCount,
-	//		overlapSampleCurrentResourceId,
-	//		overlapSamplePreviousResourceId);
-	//}
 
 	// Insert transitions to loop resources back to their initial states
 	//ComputeResourceLoops();
 
-	// Cut out repeat waits on the same fence per destination queue.
-	const size_t slotCount = m_queueRegistry.SlotCount();
-	std::vector<uint64_t> lastWaitFenceByDstQueue(slotCount, 0);
-	for (auto& batch : batches) {
-		const size_t batchQueueCount = batch.QueueCount();
-		for (size_t dstIndex = 0; dstIndex < batchQueueCount; ++dstIndex) {
-			for (auto phase : { BatchWaitPhase::BeforeTransitions, BatchWaitPhase::BeforeExecution }) {
-				for (size_t srcIndex = 0; srcIndex < batchQueueCount; ++srcIndex) {
-					if (!batch.HasQueueWait(phase, dstIndex, srcIndex)) {
-						continue;
-					}
+	{
+		ZoneScopedN("RenderGraph::CompileFrame::DeduplicateQueueWaits");
+		// Cut out repeat waits on the same fence per destination queue.
+		const size_t slotCount = m_queueRegistry.SlotCount();
+		std::vector<uint64_t> lastWaitFenceByDstQueue(slotCount, 0);
+		for (auto& batch : batches) {
+			const size_t batchQueueCount = batch.QueueCount();
+			for (size_t dstIndex = 0; dstIndex < batchQueueCount; ++dstIndex) {
+				for (auto phase : { BatchWaitPhase::BeforeTransitions, BatchWaitPhase::BeforeExecution }) {
+					for (size_t srcIndex = 0; srcIndex < batchQueueCount; ++srcIndex) {
+						if (!batch.HasQueueWait(phase, dstIndex, srcIndex)) {
+							continue;
+						}
 
-					const auto waitFence = batch.GetQueueWaitFenceValue(phase, dstIndex, srcIndex);
-					if (waitFence <= lastWaitFenceByDstQueue[dstIndex]) {
-						batch.ClearQueueWait(phase, dstIndex, srcIndex);
-					}
-					else {
-						lastWaitFenceByDstQueue[dstIndex] = waitFence;
+						const auto waitFence = batch.GetQueueWaitFenceValue(phase, dstIndex, srcIndex);
+						if (waitFence <= lastWaitFenceByDstQueue[dstIndex]) {
+							batch.ClearQueueWait(phase, dstIndex, srcIndex);
+						}
+						else {
+							lastWaitFenceByDstQueue[dstIndex] = waitFence;
+						}
 					}
 				}
 			}
@@ -3786,6 +3908,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	}
 
 	if (m_getRenderGraphCompileDumpEnabled && m_getRenderGraphCompileDumpEnabled()) {
+		ZoneScopedN("RenderGraph::CompileFrame::WriteCompiledGraphDebugDump");
 		WriteCompiledGraphDebugDump(frameIndex, nodes);
 	}
 
@@ -4204,6 +4327,7 @@ std::tuple<int, int, int> RenderGraph::GetBatchesToWaitOn(
 }
 
 void RenderGraph::MaterializeUnmaterializedResources(const std::unordered_set<uint64_t>* onlyResourceIDs) {
+	ZoneScopedN("RenderGraph::MaterializeUnmaterializedResources");
 	// Returns the backing generation if the resource was materialized (or already materialized), or nullopt if skipped.
 	auto materializeOne = [&](uint64_t id, Resource* resource) -> std::optional<uint64_t> {
 		if (onlyResourceIDs && onlyResourceIDs->find(id) == onlyResourceIDs->end()) {
@@ -4716,16 +4840,22 @@ std::shared_ptr<ComputePass> RenderGraph::GetComputePassByName(const std::string
 }
 
 void RenderGraph::Update(const UpdateExecutionContext& context, rhi::Device device) {
-	ResetForFrame();
+	ZoneScopedN("RenderGraph::Update");
+	{
+		ZoneScopedN("RenderGraph::Update::ResetForFrame");
+		ResetForFrame();
+	}
 
 	// Poll readback completions early so that passes (e.g. CLod streaming)
 	// can react to GPU-produced data from the previous frame immediately,
 	// rather than waiting until post-Present.
 	if (m_readbackService) {
+		ZoneScopedN("RenderGraph::Update::ProcessReadbacks");
 		m_readbackService->ProcessReadbackRequests();
 	}
 
 	if (m_statisticsService) {
+		ZoneScopedN("RenderGraph::Update::BeginStatisticsFrame");
 		m_statisticsService->BeginFrame();
 	}
 
@@ -4733,35 +4863,46 @@ void RenderGraph::Update(const UpdateExecutionContext& context, rhi::Device devi
 		return std::chrono::duration<double, std::milli>(duration).count();
 	};
 
-	for (auto& pr : m_masterPassList) {	
-		// Resolve into type and update
-		std::visit([&](auto& obj) {
-			using T = std::decay_t<decltype(obj)>;
-			if constexpr (std::is_same_v<T, std::monostate>) {
-				// no-op
-			}
-			else {
-				if (m_statisticsService && obj.statisticsIndex < 0) {
-					if constexpr (std::is_same_v<T, RenderPassAndResources>) {
-						obj.statisticsIndex = static_cast<int>(m_statisticsService->RegisterPass(obj.name, obj.resources.isGeometryPass));
-					}
-					else {
-						obj.statisticsIndex = static_cast<int>(m_statisticsService->RegisterPass(obj.name, false));
-					}
+	{
+		ZoneScopedN("RenderGraph::Update::PassUpdates");
+		for (auto& pr : m_masterPassList) {	
+			// Resolve into type and update
+			std::visit([&](auto& obj) {
+				using T = std::decay_t<decltype(obj)>;
+				if constexpr (std::is_same_v<T, std::monostate>) {
+					// no-op
 				}
+				else {
+					ZoneScopedN("RenderGraph::Update::PassUpdate");
+					if (!obj.name.empty()) {
+						ZoneText(obj.name.data(), obj.name.size());
+					}
 
-				const auto start = std::chrono::steady_clock::now();
-				obj.pass->Update(context);
-				if (m_statisticsService && obj.statisticsIndex >= 0) {
-					m_statisticsService->RecordCpuUpdateTime(
-						static_cast<unsigned>(obj.statisticsIndex),
-						toMilliseconds(std::chrono::steady_clock::now() - start));
+					if (m_statisticsService && obj.statisticsIndex < 0) {
+						if constexpr (std::is_same_v<T, RenderPassAndResources>) {
+							obj.statisticsIndex = static_cast<int>(m_statisticsService->RegisterPass(obj.name, obj.resources.isGeometryPass));
+						}
+						else {
+							obj.statisticsIndex = static_cast<int>(m_statisticsService->RegisterPass(obj.name, false));
+						}
+					}
+
+					const auto start = std::chrono::steady_clock::now();
+					obj.pass->Update(context);
+					if (m_statisticsService && obj.statisticsIndex >= 0) {
+						m_statisticsService->RecordCpuUpdateTime(
+							static_cast<unsigned>(obj.statisticsIndex),
+							toMilliseconds(std::chrono::steady_clock::now() - start));
+					}
 				}
-			}
-			}, pr.pass);
+				}, pr.pass);
+		}
 	}
 
-	CompileFrame(device, context.frameIndex, context.hostData);
+	{
+		ZoneScopedN("RenderGraph::Update::CompileFrame");
+		CompileFrame(device, context.frameIndex, context.hostData);
+	}
 }
 
 #define IFDEBUG(x) 
@@ -4850,6 +4991,7 @@ namespace {
 		QueueKind queueKind,
 		rhi::Timeline* slotFence,
 		std::vector<PassReturn>& externalFences) {
+		ZoneScopedN("RenderGraph::SignalExternalFences");
 		if (externalFences.empty()) return;
 		for (auto& fr : externalFences) {
 			if (!fr.fence.has_value()) {
@@ -4915,6 +5057,7 @@ namespace {
 		ExecuteQueueBatchArgs& args,
 		auto&& WaitOnSlot)
 	{
+		ZoneScopedN("RenderGraph::ExecuteQueueBatch");
 		auto& sched    = args.sched;
 		auto& batch    = args.batch;
 		auto  queue    = args.queue;
@@ -4970,6 +5113,10 @@ namespace {
 		auto executeOne = [&](auto& pr) {
 			if (!pr.pass->IsInvalidated())
 				return;
+			ZoneScopedN("RenderGraph::ExecuteQueueBatch::PassExecute");
+			if (!pr.name.empty()) {
+				ZoneText(pr.name.data(), pr.name.size());
+			}
 			rhi::debug::Scope scope(commandList, rhi::colors::Mint, pr.name.c_str());
 			const bool hasStatistics = args.statisticsService && pr.statisticsIndex >= 0;
 			const auto cpuStart = std::chrono::steady_clock::now();
@@ -5065,6 +5212,7 @@ namespace {
 	};
 
 	void RecordQueueBatch(RecordQueueBatchArgs& args) {
+		ZoneScopedN("RenderGraph::RecordQueueBatch");
 		auto& sched = args.sched;
 		auto& batch = args.batch;
 		auto  queue = args.queue;
@@ -5090,6 +5238,10 @@ namespace {
 		auto executeOne = [&](auto& pr) {
 			if (!pr.pass->IsInvalidated())
 				return;
+			ZoneScopedN("RenderGraph::RecordQueueBatch::PassRecord");
+			if (!pr.name.empty()) {
+				ZoneText(pr.name.data(), pr.name.size());
+			}
 			rhi::debug::Scope scope(commandList, rhi::colors::Mint, pr.name.c_str());
 			const bool hasStatistics = args.statisticsService && pr.statisticsIndex >= 0;
 			const auto cpuStart = std::chrono::steady_clock::now();
@@ -5156,6 +5308,7 @@ namespace {
 		SubmitQueueBatchArgs& args,
 		auto&& WaitOnSlot)
 	{
+		ZoneScopedN("RenderGraph::SubmitQueueBatch");
 		auto& sched      = args.sched;
 		auto& batch      = args.batch;
 		auto  queue      = args.queue;
@@ -5240,6 +5393,7 @@ namespace {
 } // namespace
 
 void RenderGraph::BuildExecutionSchedule() {
+	ZoneScopedN("RenderGraph::BuildExecutionSchedule");
 	auto& schedule = m_executionSchedule;
 	const size_t qc = m_queueRegistry.SlotCount();
 	schedule.batches.clear();
@@ -5294,7 +5448,11 @@ void RenderGraph::BuildExecutionSchedule() {
 }
 
 void RenderGraph::Execute(PassExecutionContext& context) {
-	ValidateCompiledResourceGenerations();
+	ZoneScopedN("RenderGraph::Execute");
+	{
+		ZoneScopedN("RenderGraph::Execute::ValidateCompiledResourceGenerations");
+		ValidateCompiledResourceGenerations();
+	}
 	context.immediateDispatch = &m_immediateDispatch;
 
 	const bool heavyDebug = m_getHeavyDebug ? m_getHeavyDebug() : false;
@@ -5316,7 +5474,10 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 		.copyPool = m_queueRegistry.GetPool(static_cast<QueueSlotIndex>(2)),
 	};
 
-	m_pCommandRecordingManager = std::make_unique<CommandRecordingManager>(init);
+	{
+		ZoneScopedN("RenderGraph::Execute::CreateCommandRecordingManager");
+		m_pCommandRecordingManager = std::make_unique<CommandRecordingManager>(init);
+	}
 	auto crm = m_pCommandRecordingManager.get();
 
 	// Registry-based queue/fence/pool resolution — no aliasing.
@@ -5337,25 +5498,31 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 		dstQ.Wait({ SlotFence(srcSlot).GetHandle(), absoluteFenceValue });
 	};
 
-	// Frame-start waits from previous frame's last-producer tracking.
-	for (size_t dstIndex = 0; dstIndex < slotCount; ++dstIndex) {
-		for (size_t srcIndex = 0; srcIndex < slotCount; ++srcIndex) {
-			if (dstIndex == srcIndex) continue;
-			if (dstIndex >= m_hasPendingFrameStartQueueWait.size() ||
-				srcIndex >= m_hasPendingFrameStartQueueWait[dstIndex].size()) continue;
-			if (!m_hasPendingFrameStartQueueWait[dstIndex][srcIndex]) continue;
-			WaitOnSlot(dstIndex, srcIndex,
-				m_pendingFrameStartQueueWaitFenceValue[dstIndex][srcIndex]);
+	{
+		ZoneScopedN("RenderGraph::Execute::ApplyFrameStartWaits");
+		// Frame-start waits from previous frame's last-producer tracking.
+		for (size_t dstIndex = 0; dstIndex < slotCount; ++dstIndex) {
+			for (size_t srcIndex = 0; srcIndex < slotCount; ++srcIndex) {
+				if (dstIndex == srcIndex) continue;
+				if (dstIndex >= m_hasPendingFrameStartQueueWait.size() ||
+					srcIndex >= m_hasPendingFrameStartQueueWait[dstIndex].size()) continue;
+				if (!m_hasPendingFrameStartQueueWait[dstIndex][srcIndex]) continue;
+				WaitOnSlot(dstIndex, srcIndex,
+					m_pendingFrameStartQueueWaitFenceValue[dstIndex][srcIndex]);
+			}
 		}
 	}
 
-	// Mark completion signals on batches that produced resources tracked across frames.
-	for (size_t queueIndex = 0; queueIndex < slotCount; ++queueIndex) {
-		if (queueIndex >= m_compiledLastProducerBatchByResourceByQueue.size()) continue;
-		for (const auto& [resourceID, producerBatch] : m_compiledLastProducerBatchByResourceByQueue[queueIndex]) {
-			(void)resourceID;
-			if (producerBatch > 0 && producerBatch < batches.size()) {
-				batches[producerBatch].MarkQueueSignal(BatchSignalPhase::AfterCompletion, queueIndex);
+	{
+		ZoneScopedN("RenderGraph::Execute::MarkCompletionSignals");
+		// Mark completion signals on batches that produced resources tracked across frames.
+		for (size_t queueIndex = 0; queueIndex < slotCount; ++queueIndex) {
+			if (queueIndex >= m_compiledLastProducerBatchByResourceByQueue.size()) continue;
+			for (const auto& [resourceID, producerBatch] : m_compiledLastProducerBatchByResourceByQueue[queueIndex]) {
+				(void)resourceID;
+				if (producerBatch > 0 && producerBatch < batches.size()) {
+					batches[producerBatch].MarkQueueSignal(BatchSignalPhase::AfterCompletion, queueIndex);
+				}
 			}
 		}
 	}
@@ -5404,13 +5571,17 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 	auto* statisticsService = m_statisticsService.get();
 
 	// Build the execution schedule and pre-allocate command lists.
-	BuildExecutionSchedule();
+	{
+		ZoneScopedN("RenderGraph::Execute::BuildExecutionSchedule");
+		BuildExecutionSchedule();
+	}
 
 #if BUILD_TYPE == BUILD_TYPE_DEBUG
 	// ---- Post-schedule validation: detect signals that will never fire ----
 	// A signal is "live" only when the queue is active in that batch.
 	// A wait that references a dead signal will deadlock the GPU.
 	{
+		ZoneScopedN("RenderGraph::Execute::DebugScheduleValidation");
 		// 1. Collect the set of fence values that will actually be signaled.
 		std::vector<std::unordered_set<UINT64>> liveSignalValues(slotCount);
 		// Also track the highest value each queue will signal this frame so
@@ -5549,13 +5720,16 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 	}
 #endif
 
-	// Pre-allocate all CLs from the main thread using registry pools.
-	for (size_t bi = 0; bi < m_executionSchedule.batches.size(); ++bi) {
-		auto& batchSched = m_executionSchedule.batches[bi];
-		for (size_t qi = 0; qi < batchSched.queues.size(); ++qi) {
-			auto& qs = batchSched.queues[qi];
-			for (uint8_t ci = 0; ci < qs.numCLs; ++ci) {
-				qs.preallocatedCLs[ci] = SlotPool(qi)->Request();
+	{
+		ZoneScopedN("RenderGraph::Execute::PreallocateCommandLists");
+		// Pre-allocate all CLs from the main thread using registry pools.
+		for (size_t bi = 0; bi < m_executionSchedule.batches.size(); ++bi) {
+			auto& batchSched = m_executionSchedule.batches[bi];
+			for (size_t qi = 0; qi < batchSched.queues.size(); ++qi) {
+				auto& qs = batchSched.queues[qi];
+				for (uint8_t ci = 0; ci < qs.numCLs; ++ci) {
+					qs.preallocatedCLs[ci] = SlotPool(qi)->Request();
+				}
 			}
 		}
 	}
@@ -5568,6 +5742,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 
 	// Execution, two paths: heavyDebug (serial) or normal (parallel).
 	if (heavyDebug) {
+		ZoneScopedN("RenderGraph::Execute::HeavyDebugPath");
 		// ---- Serial path: record + submit + drain per batch. ----
 		unsigned int batchIndex = 0;
 		for (size_t bi = 0; bi < batches.size(); ++bi) {
@@ -5644,16 +5819,20 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 			++batchIndex;
 		}
 	} else {
+		ZoneScopedN("RenderGraph::Execute::ParallelPath");
 		// Parallel recording path
 
 		// Clear per-frame recording state from any previous frame.
-		for (size_t bi = 0; bi < batches.size(); ++bi) {
-			auto& batchSched = m_executionSchedule.batches[bi];
-			for (size_t qi = 0; qi < batchSched.queues.size(); ++qi) {
-				auto& qs = batchSched.queues[qi];
-				qs.externalFences.clear();
-				qs.queryRecordingContext.recordedIndices.clear();
-				qs.queryRecordingContext.pendingRanges.clear();
+		{
+			ZoneScopedN("RenderGraph::Execute::ParallelPath::ResetRecordingState");
+			for (size_t bi = 0; bi < batches.size(); ++bi) {
+				auto& batchSched = m_executionSchedule.batches[bi];
+				for (size_t qi = 0; qi < batchSched.queues.size(); ++qi) {
+					auto& qs = batchSched.queues[qi];
+					qs.externalFences.clear();
+					qs.queryRecordingContext.recordedIndices.clear();
+					qs.queryRecordingContext.pendingRanges.clear();
+				}
 			}
 		}
 
@@ -5663,33 +5842,40 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 			size_t queueIndex;
 		};
 		std::vector<RecordTask> tasks;
-		tasks.reserve(batches.size() * slotCount);
-		for (size_t bi = 0; bi < batches.size(); ++bi) {
-			auto& batchSched = m_executionSchedule.batches[bi];
-			for (size_t qi = 0; qi < batchSched.queues.size(); ++qi) {
-				if (batchSched.queues[qi].active)
-					tasks.push_back({bi, qi});
+		{
+			ZoneScopedN("RenderGraph::Execute::ParallelPath::BuildRecordTasks");
+			tasks.reserve(batches.size() * slotCount);
+			for (size_t bi = 0; bi < batches.size(); ++bi) {
+				auto& batchSched = m_executionSchedule.batches[bi];
+				for (size_t qi = 0; qi < batchSched.queues.size(); ++qi) {
+					if (batchSched.queues[qi].active)
+						tasks.push_back({bi, qi});
+				}
 			}
 		}
 
-		ParallelForOptional("RecordAllBatches", tasks.size(), [&](size_t taskIdx) {
-			auto& task = tasks[taskIdx];
-			auto& qs = m_executionSchedule.batches[task.batchIndex].queues[task.queueIndex];
-			auto rhiQ = SlotQueue(task.queueIndex);
-			RecordQueueBatchArgs args{
-				.sched = qs,
-				.batch = batches[task.batchIndex],
-				.queue = m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(task.queueIndex)),
-				.queueSlot = task.queueIndex,
-				.rhiQueue = rhiQ,
-				.context = context,
-				.statisticsService = statisticsService,
-			};
-			RecordQueueBatch(args);
-		}, true);
+		{
+			ZoneScopedN("RenderGraph::Execute::ParallelPath::RecordAllBatches");
+			ParallelForOptional("RecordAllBatches", tasks.size(), [&](size_t taskIdx) {
+				auto& task = tasks[taskIdx];
+				auto& qs = m_executionSchedule.batches[task.batchIndex].queues[task.queueIndex];
+				auto rhiQ = SlotQueue(task.queueIndex);
+				RecordQueueBatchArgs args{
+					.sched = qs,
+					.batch = batches[task.batchIndex],
+					.queue = m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(task.queueIndex)),
+					.queueSlot = task.queueIndex,
+					.rhiQueue = rhiQ,
+					.context = context,
+					.statisticsService = statisticsService,
+				};
+				RecordQueueBatch(args);
+			}, true);
+		}
 
 		// Merge per-task statistics contexts.
 		if (statisticsService) {
+			ZoneScopedN("RenderGraph::Execute::ParallelPath::MergePendingResolves");
 			for (size_t bi = 0; bi < batches.size(); ++bi) {
 				auto& batchSched = m_executionSchedule.batches[bi];
 				for (size_t qi = 0; qi < batchSched.queues.size(); ++qi) {
@@ -5705,74 +5891,83 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 		}
 
 		// Sequential submission on the main thread.
-		for (size_t bi = 0; bi < batches.size(); ++bi) {
-			auto& batch = batches[bi];
-			auto& batchSched = m_executionSchedule.batches[bi];
+		{
+			ZoneScopedN("RenderGraph::Execute::ParallelPath::SubmitAllBatches");
+			for (size_t bi = 0; bi < batches.size(); ++bi) {
+				auto& batch = batches[bi];
+				auto& batchSched = m_executionSchedule.batches[bi];
 
-			for (size_t qi = 0; qi < batchSched.queues.size(); ++qi) {
-				auto& qs = batchSched.queues[qi];
-				if (!qs.active) continue;
-				auto rhiQ = SlotQueue(qi);
-				SubmitQueueBatchArgs args{
-					.sched = qs,
-					.batch = batch,
-					.queue = m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(qi)),
-					.queueSlot = qi,
-					.rhiQueue = rhiQ,
-					.fenceTimeline = SlotFence(qi),
-					.pool = *SlotPool(qi),
-					.fenceOffset = 0,
-					.lastSignaledOnTimeline = lastSignaledPerSlot[qi],
-				};
-				SubmitQueueBatch(args, WaitOnSlot);
-			}
+				for (size_t qi = 0; qi < batchSched.queues.size(); ++qi) {
+					auto& qs = batchSched.queues[qi];
+					if (!qs.active) continue;
+					auto rhiQ = SlotQueue(qi);
+					SubmitQueueBatchArgs args{
+						.sched = qs,
+						.batch = batch,
+						.queue = m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(qi)),
+						.queueSlot = qi,
+						.rhiQueue = rhiQ,
+						.fenceTimeline = SlotFence(qi),
+						.pool = *SlotPool(qi),
+						.fenceOffset = 0,
+						.lastSignaledOnTimeline = lastSignaledPerSlot[qi],
+					};
+					SubmitQueueBatch(args, WaitOnSlot);
+				}
 
-			// Signal external fences AFTER all CLs are submitted.
-			for (size_t qi = 0; qi < batchSched.queues.size(); ++qi) {
-				auto& qs = batchSched.queues[qi];
-				if (qs.externalFences.empty()) continue;
-				auto rhiQ = SlotQueue(qi);
-				SignalExternalFences(rhiQ, m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(qi)),
-					&SlotFence(qi), qs.externalFences);
+				// Signal external fences AFTER all CLs are submitted.
+				for (size_t qi = 0; qi < batchSched.queues.size(); ++qi) {
+					auto& qs = batchSched.queues[qi];
+					if (qs.externalFences.empty()) continue;
+					auto rhiQ = SlotQueue(qi);
+					SignalExternalFences(rhiQ, m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(qi)),
+						&SlotFence(qi), qs.externalFences);
+				}
 			}
 		}
 	}
 
-	// Update across-frame producer tracking (no aliasing remapping).
-	// Only store fence values that were actually signaled during this frame's
-	// execution. If a queue was inactive in a batch (no passes or transitions),
-	// the pre-assigned fence value was never signaled on the GPU. Storing it
-	// would cause next frame's frame-start waits to deadlock.
-	for (size_t queueIndex = 0; queueIndex < slotCount; ++queueIndex) {
-		if (queueIndex >= m_compiledLastProducerBatchByResourceByQueue.size()) continue;
-		for (const auto& [resourceID, producerBatch] : m_compiledLastProducerBatchByResourceByQueue[queueIndex]) {
-			if (producerBatch == 0 || producerBatch >= batches.size()) continue;
+	{
+		ZoneScopedN("RenderGraph::Execute::UpdateCrossFrameProducerTracking");
+		// Update across-frame producer tracking (no aliasing remapping).
+		// Only store fence values that were actually signaled during this frame's
+		// execution. If a queue was inactive in a batch (no passes or transitions),
+		// the pre-assigned fence value was never signaled on the GPU. Storing it
+		// would cause next frame's frame-start waits to deadlock.
+		for (size_t queueIndex = 0; queueIndex < slotCount; ++queueIndex) {
+			if (queueIndex >= m_compiledLastProducerBatchByResourceByQueue.size()) continue;
+			for (const auto& [resourceID, producerBatch] : m_compiledLastProducerBatchByResourceByQueue[queueIndex]) {
+				if (producerBatch == 0 || producerBatch >= batches.size()) continue;
 
-			const uint64_t fenceValue =
-				batches[producerBatch].GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, queueIndex);
+				const uint64_t fenceValue =
+					batches[producerBatch].GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, queueIndex);
 
-			// Skip if this fence value was never actually signaled on the GPU.
-			if (fenceValue > lastSignaledPerSlot[queueIndex]) {
-				spdlog::warn(
-					"Cross-frame producer skip: slot {} resource {} batch {} "
-					"fenceValue={} > lastSignaled={}. Queue was likely inactive.",
-					queueIndex, resourceID, producerBatch,
-					fenceValue, lastSignaledPerSlot[queueIndex]);
-				continue;
+				// Skip if this fence value was never actually signaled on the GPU.
+				if (fenceValue > lastSignaledPerSlot[queueIndex]) {
+					spdlog::warn(
+						"Cross-frame producer skip: slot {} resource {} batch {} "
+						"fenceValue={} > lastSignaled={}. Queue was likely inactive.",
+						queueIndex, resourceID, producerBatch,
+						fenceValue, lastSignaledPerSlot[queueIndex]);
+					continue;
+				}
+
+				LastProducerAcrossFrames producer{
+					.queueSlot = queueIndex,
+					.fenceValue = fenceValue,
+				};
+				nextLastProducerByResourceAcrossFrames[resourceID] = producer;
+				publishAliasPlacementProducer(resourceID, producer);
 			}
-
-			LastProducerAcrossFrames producer{
-				.queueSlot = queueIndex,
-				.fenceValue = fenceValue,
-			};
-			nextLastProducerByResourceAcrossFrames[resourceID] = producer;
-			publishAliasPlacementProducer(resourceID, producer);
 		}
 	}
 
 	m_lastProducerByResourceAcrossFrames = std::move(nextLastProducerByResourceAcrossFrames);
 	m_lastAliasPlacementProducersByPoolAcrossFrames = std::move(nextLastAliasPlacementProducersByPoolAcrossFrames);
-	DeletionManager::GetInstance().ProcessDeletions();
+	{
+		ZoneScopedN("RenderGraph::Execute::ProcessDeletions");
+		DeletionManager::GetInstance().ProcessDeletions();
+	}
 
 	// Sync CRM signal tracking with values we signaled directly.
 	// Capped at primary queue count: CRM only tracks the 3 primary queues (Graphics/Compute/Copy).
@@ -5783,20 +5978,26 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 		}
 	}
 
-	crm->Flush(QueueKind::Graphics, { false, 0 });
-	crm->Flush(QueueKind::Compute, { false, 0 });
-	crm->Flush(QueueKind::Copy, { false, 0 });
-	PublishCompiledTrackerStates();
-	crm->EndFrame();
+	{
+		ZoneScopedN("RenderGraph::Execute::FinalizeCommandRecording");
+		crm->Flush(QueueKind::Graphics, { false, 0 });
+		crm->Flush(QueueKind::Compute, { false, 0 });
+		crm->Flush(QueueKind::Copy, { false, 0 });
+		PublishCompiledTrackerStates();
+		crm->EndFrame();
+	}
 
-	// Recycle completed command lists on registry pools.
-	// CRM::EndFrame() only recycles the old member pools; the registry owns
-	// separate pools that receive Recycle() calls during execution above.
-	for (size_t qi = 0; qi < slotCount; ++qi) {
-		auto* pool = SlotPool(qi);
-		if (pool) {
-			uint64_t completed = SlotFence(qi).GetCompletedValue();
-			pool->RecycleCompleted(completed);
+	{
+		ZoneScopedN("RenderGraph::Execute::RecycleCompletedCommandLists");
+		// Recycle completed command lists on registry pools.
+		// CRM::EndFrame() only recycles the old member pools; the registry owns
+		// separate pools that receive Recycle() calls during execution above.
+		for (size_t qi = 0; qi < slotCount; ++qi) {
+			auto* pool = SlotPool(qi);
+			if (pool) {
+				uint64_t completed = SlotFence(qi).GetCompletedValue();
+				pool->RecycleCompleted(completed);
+			}
 		}
 	}
 }
