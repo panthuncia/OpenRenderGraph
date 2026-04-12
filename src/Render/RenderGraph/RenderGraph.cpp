@@ -5480,7 +5480,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 	}
 	auto crm = m_pCommandRecordingManager.get();
 
-	// Registry-based queue/fence/pool resolution — no aliasing.
+	// Registry-based queue/fence/pool resolution
 	auto SlotQueue = [&](size_t qi) -> rhi::Queue {
 		return m_queueRegistry.GetQueue(static_cast<QueueSlotIndex>(qi));
 	};
@@ -5491,7 +5491,6 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 		return m_queueRegistry.GetPool(static_cast<QueueSlotIndex>(qi));
 	};
 
-	// Wait: every queue is distinct, so waits always execute.
 	auto WaitOnSlot = [&](size_t dstSlot, size_t srcSlot, UINT64 absoluteFenceValue) {
 		if (dstSlot == srcSlot) return;
 		auto dstQ = SlotQueue(dstSlot);
@@ -5577,7 +5576,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 	}
 
 #if BUILD_TYPE == BUILD_TYPE_DEBUG
-	// ---- Post-schedule validation: detect signals that will never fire ----
+	// Post-schedule validation: detect signals that will never fire
 	// A signal is "live" only when the queue is active in that batch.
 	// A wait that references a dead signal will deadlock the GPU.
 	{
@@ -5722,7 +5721,24 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 
 	{
 		ZoneScopedN("RenderGraph::Execute::PreallocateCommandLists");
-		// Pre-allocate all CLs from the main thread using registry pools.
+		std::vector<size_t> requiredCLsByQueue(slotCount, 0);
+		for (size_t bi = 0; bi < m_executionSchedule.batches.size(); ++bi) {
+			auto& batchSched = m_executionSchedule.batches[bi];
+			for (size_t qi = 0; qi < batchSched.queues.size(); ++qi) {
+				requiredCLsByQueue[qi] += batchSched.queues[qi].numCLs;
+			}
+		}
+
+		for (size_t qi = 0; qi < slotCount; ++qi) {
+			auto* pool = SlotPool(qi);
+			if (!pool) {
+				continue;
+			}
+
+			pool->PrepareForRequests(requiredCLsByQueue[qi], SlotFence(qi).GetCompletedValue());
+		}
+
+		// Pre-allocate all CLs from the main thread using warmed registry pools.
 		for (size_t bi = 0; bi < m_executionSchedule.batches.size(); ++bi) {
 			auto& batchSched = m_executionSchedule.batches[bi];
 			for (size_t qi = 0; qi < batchSched.queues.size(); ++qi) {
@@ -5743,7 +5759,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 	// Execution, two paths: heavyDebug (serial) or normal (parallel).
 	if (heavyDebug) {
 		ZoneScopedN("RenderGraph::Execute::HeavyDebugPath");
-		// ---- Serial path: record + submit + drain per batch. ----
+		// Serial path: record + submit + drain per batch.
 		unsigned int batchIndex = 0;
 		for (size_t bi = 0; bi < batches.size(); ++bi) {
 			auto& batch = batches[bi];
@@ -5870,7 +5886,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 					.statisticsService = statisticsService,
 				};
 				RecordQueueBatch(args);
-			}, true);
+			}, false);
 		}
 
 		// Merge per-task statistics contexts.
