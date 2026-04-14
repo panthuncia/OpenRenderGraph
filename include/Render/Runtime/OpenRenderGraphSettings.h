@@ -12,6 +12,7 @@ struct OpenRenderGraphSettings {
 
     bool useAsyncCompute = true;
     bool renderGraphCompileDumpEnabled = false;
+    bool renderGraphBatchTraceEnabled = false;
     uint8_t autoAliasMode = 2;
     uint8_t autoAliasPackingStrategy = 0;
     bool autoAliasEnableLogging = false;

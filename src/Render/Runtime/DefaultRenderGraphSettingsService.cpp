@@ -15,6 +15,10 @@ public:
         return GetOpenRenderGraphSettings().renderGraphCompileDumpEnabled;
     }
 
+    bool GetRenderGraphBatchTraceEnabled() const override {
+        return GetOpenRenderGraphSettings().renderGraphBatchTraceEnabled;
+    }
+
     uint8_t GetAutoAliasMode() const override {
         return GetOpenRenderGraphSettings().autoAliasMode;
     }

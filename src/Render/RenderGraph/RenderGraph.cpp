@@ -24,10 +24,75 @@
 #include "Managers/CommandRecordingManager.h"
 #include "Interfaces/IHasMemoryMetadata.h"
 #include "Interfaces/IDynamicDeclaredResources.h"
+#include "Resources/DynamicResource.h"
+#include "Resources/ExternalTextureResource.h"
 #include "Resources/PixelBuffer.h"
 #include "Resources/MemoryStatisticsComponents.h"
 
 namespace {
+	Resource* UnwrapDynamicResource(Resource* resource) noexcept {
+		auto* current = resource;
+		while (auto* dynamicResource = dynamic_cast<DynamicResource*>(current)) {
+			auto backing = dynamicResource->GetResource();
+			current = backing.get();
+			if (!current) {
+				break;
+			}
+		}
+		return current;
+	}
+
+	rhi::DescriptorSlot ResolveRTVSlot(Resource* resource, uint32_t mip, uint32_t slice) noexcept {
+		if (!resource) {
+			spdlog::error("RG RTV resolve: resource pointer is null");
+			return {};
+		}
+
+		Resource* originalResource = resource;
+		resource = UnwrapDynamicResource(resource);
+		if (!resource) {
+			spdlog::error(
+				"RG RTV resolve: dynamic resource '{}' id={} unwrapped to null backing",
+				originalResource->GetName(),
+				originalResource->GetGlobalResourceID());
+			return {};
+		}
+
+		if (auto* gir = dynamic_cast<GloballyIndexedResource*>(resource)) {
+			if (!gir->HasRTV()) {
+				spdlog::error(
+					"RG RTV resolve: resource '{}' id={} has no RTV descriptors",
+					resource->GetName(),
+					resource->GetGlobalResourceID());
+				return {};
+			}
+			return gir->GetRTVInfo(mip, slice).slot;
+		}
+
+		if (auto* externalTexture = dynamic_cast<ExternalTextureResource*>(resource)) {
+			if (!externalTexture->HasHandle() || !externalTexture->HasRTVSlot()) {
+				const auto handle = externalTexture->GetHandle();
+				const auto rtvSlot = externalTexture->GetRTVSlot();
+				spdlog::error(
+					"RG RTV resolve: external texture '{}' id={} invalid backbuffer binding. handle=({}, {}) rtv=({}, {})",
+					resource->GetName(),
+					resource->GetGlobalResourceID(),
+					handle.index,
+					handle.generation,
+					rtvSlot.heap.index,
+					rtvSlot.index);
+			}
+			return externalTexture->GetRTVSlot();
+		}
+
+		spdlog::error(
+			"RG RTV resolve: resource '{}' id={} type does not expose RTV descriptors",
+			resource->GetName(),
+			resource->GetGlobalResourceID());
+
+		return {};
+	}
+
 	constexpr size_t QueueIndex(QueueKind queue) noexcept {
 		return static_cast<size_t>(queue);
 	}
@@ -209,6 +274,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 		RenderPassAndResources par;
 		par.pass = std::move(rp);
 		par.name = d.name;
+		par.techniquePath = d.techniquePath;
 		{
 			RenderPassBuilder b(this, d.name);
 			b.pass = par.pass;
@@ -249,6 +315,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 		ComputePassAndResources par;
 		par.pass = std::move(cp);
 		par.name = d.name;
+		par.techniquePath = d.techniquePath;
 		{
 			ComputePassBuilder b(this, d.name);
 			b.pass = par.pass;
@@ -287,6 +354,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 		CopyPassAndResources par;
 		par.pass = std::move(cp);
 		par.name = d.name;
+		par.techniquePath = d.techniquePath;
 		{
 			CopyPassBuilder b(this, d.name);
 			b.pass = par.pass;
@@ -2210,13 +2278,11 @@ RenderGraph::RenderGraph(rhi::Device device) {
 
 			d.GetRTV = +[](RenderGraph* user, ResourceRegistry::RegistryHandle r, RangeSpec range) noexcept -> rhi::DescriptorSlot {
 				Resource* resource = r.IsEphemeral() ? r.GetEphemeralPtr() : user->_registry.Resolve(r);
-				auto* gir = dynamic_cast<GloballyIndexedResource*>(resource);
-				if (!gir || !gir->HasRTV()) return {};
 
 				uint32_t mip = 0, slice = 0;
 				if (!ResolveFirstMipSlice(r, range, mip, slice)) return {};
 
-				return gir->GetRTVInfo(mip, slice).slot;
+				return ResolveRTVSlot(resource, mip, slice);
 				};
 
 			d.GetDSV = +[](RenderGraph* user, ResourceRegistry::RegistryHandle r, RangeSpec range) noexcept -> rhi::DescriptorSlot {
@@ -3633,7 +3699,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 					p.name = "RenderPass#" + std::to_string(i);
 				}
 				any.name = p.name;
-				p.statisticsIndex = static_cast<int>(m_statisticsService->RegisterPass(p.name, p.resources.isGeometryPass));
+				p.statisticsIndex = static_cast<int>(m_statisticsService->RegisterPass(p.name, p.resources.isGeometryPass, p.techniquePath));
 			}
 			else if (any.type == PassType::Compute) {
 				auto& p = std::get<ComputePassAndResources>(any.pass);
@@ -3641,7 +3707,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 					p.name = "ComputePass#" + std::to_string(i);
 				}
 				any.name = p.name;
-				p.statisticsIndex = static_cast<int>(m_statisticsService->RegisterPass(p.name, false));
+				p.statisticsIndex = static_cast<int>(m_statisticsService->RegisterPass(p.name, false, p.techniquePath));
 			}
 			else if (any.type == PassType::Copy) {
 				auto& p = std::get<CopyPassAndResources>(any.pass);
@@ -3649,7 +3715,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 					p.name = "CopyPass#" + std::to_string(i);
 				}
 				any.name = p.name;
-				p.statisticsIndex = static_cast<int>(m_statisticsService->RegisterPass(p.name, false));
+				p.statisticsIndex = static_cast<int>(m_statisticsService->RegisterPass(p.name, false, p.techniquePath));
 			}
 		}
 
@@ -3915,6 +3981,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 #if BUILD_TYPE == BUILD_TYPE_DEBUG
 	// Sanity checks:
 	// 1. No conflicting resource transitions in a batch
+	const size_t slotCount = m_queueRegistry.SlotCount();
 
 	auto queueName = [](QueueKind queue) -> const char* {
 		switch (queue) {
@@ -4620,6 +4687,9 @@ void RenderGraph::Setup() {
 	m_getRenderGraphCompileDumpEnabled = [this]() {
 		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetRenderGraphCompileDumpEnabled() : false;
 	};
+	m_getRenderGraphBatchTraceEnabled = [this]() {
+		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetRenderGraphBatchTraceEnabled() : false;
+	};
 	m_getAutoAliasMode = [this]() {
 		const auto mode = m_renderGraphSettingsService
 			? m_renderGraphSettingsService->GetAutoAliasMode()
@@ -4705,6 +4775,7 @@ void RenderGraph::AddRenderPass(std::shared_ptr<RenderPass> pass, RenderPassPara
 	passAndResources.pass = pass;
 	passAndResources.resources = resources;
 	passAndResources.name = name;
+	passAndResources.techniquePath = GetTechniquePathForPassName(name);
 	passAndResources.resolverSnapshots = std::move(resolverSnapshots);
 	AnyPassAndResources passAndResourcesAny;
 	passAndResourcesAny.type = PassType::Render;
@@ -4721,6 +4792,7 @@ void RenderGraph::AddComputePass(std::shared_ptr<ComputePass> pass, ComputePassP
 	passAndResources.pass = pass;
 	passAndResources.resources = resources;
 	passAndResources.name = name;
+	passAndResources.techniquePath = GetTechniquePathForPassName(name);
 	passAndResources.resolverSnapshots = std::move(resolverSnapshots);
 	AnyPassAndResources passAndResourcesAny;
 	passAndResourcesAny.type = PassType::Compute;
@@ -4737,12 +4809,39 @@ void RenderGraph::AddCopyPass(std::shared_ptr<CopyPass> pass, CopyPassParameters
 	passAndResources.pass = pass;
 	passAndResources.resources = resources;
 	passAndResources.name = name;
+	passAndResources.techniquePath = GetTechniquePathForPassName(name);
 	passAndResources.resolverSnapshots = std::move(resolverSnapshots);
 	AnyPassAndResources passAndResourcesAny;
 	passAndResourcesAny.type = PassType::Copy;
 	passAndResourcesAny.pass = std::move(passAndResources);
 	passAndResourcesAny.name = name;
 	m_masterPassList.push_back(std::move(passAndResourcesAny));
+}
+
+void RenderGraph::SetPassTechnique(std::string passName, std::string techniquePath) {
+	if (passName.empty()) {
+		return;
+	}
+
+	if (techniquePath.empty()) {
+		m_passTechniquePathsByName.erase(passName);
+		return;
+	}
+
+	m_passTechniquePathsByName[std::move(passName)] = std::move(techniquePath);
+}
+
+std::string RenderGraph::GetTechniquePathForPassName(std::string_view passName) const {
+	if (passName.empty()) {
+		return {};
+	}
+
+	auto it = m_passTechniquePathsByName.find(std::string(passName));
+	if (it == m_passTechniquePathsByName.end()) {
+		return {};
+	}
+
+	return it->second;
 }
 
 void RenderGraph::AddResource(std::shared_ptr<Resource> resource, bool transition) {
@@ -4880,10 +4979,10 @@ void RenderGraph::Update(const UpdateExecutionContext& context, rhi::Device devi
 
 					if (m_statisticsService && obj.statisticsIndex < 0) {
 						if constexpr (std::is_same_v<T, RenderPassAndResources>) {
-							obj.statisticsIndex = static_cast<int>(m_statisticsService->RegisterPass(obj.name, obj.resources.isGeometryPass));
+							obj.statisticsIndex = static_cast<int>(m_statisticsService->RegisterPass(obj.name, obj.resources.isGeometryPass, obj.techniquePath));
 						}
 						else {
-							obj.statisticsIndex = static_cast<int>(m_statisticsService->RegisterPass(obj.name, false));
+							obj.statisticsIndex = static_cast<int>(m_statisticsService->RegisterPass(obj.name, false, obj.techniquePath));
 						}
 					}
 
@@ -5051,6 +5150,7 @@ namespace {
 		rg::runtime::IStatisticsService* statisticsService;
 		std::vector<PassReturn>& outExternalFences;
 		UINT64& lastSignaledOnTimeline;
+		bool batchTraceEnabled;
 	};
 
 	void ExecuteQueueBatch(
@@ -5113,29 +5213,66 @@ namespace {
 		auto executeOne = [&](auto& pr) {
 			if (!pr.pass->IsInvalidated())
 				return;
-			ZoneScopedN("RenderGraph::ExecuteQueueBatch::PassExecute");
-			if (!pr.name.empty()) {
-				ZoneText(pr.name.data(), pr.name.size());
+			const std::string_view passName = pr.name.empty() ? std::string_view("<unnamed>") : std::string_view(pr.name);
+			try {
+				ZoneScopedN("RenderGraph::ExecuteQueueBatch::PassExecute");
+				ZoneText(passName.data(), passName.size());
+					if (args.batchTraceEnabled) {
+						spdlog::info(
+							"RenderGraph: frame {} queue {} slot {} batch {} begin pass {}",
+							static_cast<unsigned>(args.context.frameIndex),
+							QueueKindToString(queue),
+							qi,
+							args.batchIndex,
+							passName);
+					}
+				rhi::debug::Scope scope(commandList, rhi::colors::Mint, std::string(passName).c_str());
+				const bool hasStatistics = args.statisticsService && pr.statisticsIndex >= 0;
+				const auto cpuStart = std::chrono::steady_clock::now();
+				if (hasStatistics)
+					args.statisticsService->BeginQuery(pr.statisticsIndex, args.context.frameIndex, rhiQueue, commandList);
+				if ((pr.run & PassRunMask::Immediate) != PassRunMask::None)
+					rg::imm::Replay(pr.immediateBytecode, commandList, *args.context.immediateDispatch);
+				pr.immediateKeepAlive.reset();
+				if ((pr.run & PassRunMask::Retained) != PassRunMask::None) {
+					auto passReturn = pr.pass->Execute(args.context);
+					if (passReturn.fence)
+						args.outExternalFences.push_back(passReturn);
+				}
+				if (hasStatistics)
+					args.statisticsService->EndQuery(pr.statisticsIndex, args.context.frameIndex, rhiQueue, commandList);
+				if (hasStatistics) {
+					args.statisticsService->RecordCpuExecuteTime(
+						static_cast<unsigned>(pr.statisticsIndex),
+						std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - cpuStart).count());
+				}
+					if (args.batchTraceEnabled) {
+						spdlog::info(
+							"RenderGraph: frame {} queue {} slot {} batch {} end pass {}",
+							static_cast<unsigned>(args.context.frameIndex),
+							QueueKindToString(queue),
+							qi,
+							args.batchIndex,
+							passName);
+					}
 			}
-			rhi::debug::Scope scope(commandList, rhi::colors::Mint, pr.name.c_str());
-			const bool hasStatistics = args.statisticsService && pr.statisticsIndex >= 0;
-			const auto cpuStart = std::chrono::steady_clock::now();
-			if (hasStatistics)
-				args.statisticsService->BeginQuery(pr.statisticsIndex, args.context.frameIndex, rhiQueue, commandList);
-			if ((pr.run & PassRunMask::Immediate) != PassRunMask::None)
-				rg::imm::Replay(pr.immediateBytecode, commandList, *args.context.immediateDispatch);
-			pr.immediateKeepAlive.reset();
-			if ((pr.run & PassRunMask::Retained) != PassRunMask::None) {
-				auto passReturn = pr.pass->Execute(args.context);
-				if (passReturn.fence)
-					args.outExternalFences.push_back(passReturn);
+			catch (const std::exception& ex) {
+				std::ostringstream oss;
+				oss << "RenderGraph::ExecuteQueueBatch failed while executing pass '"
+					<< passName
+					<< "' on queue " << QueueKindToString(queue)
+					<< " (slot " << qi << ", batch " << args.batchIndex << "): " << ex.what();
+				spdlog::error(oss.str());
+				throw std::runtime_error(oss.str());
 			}
-			if (hasStatistics)
-				args.statisticsService->EndQuery(pr.statisticsIndex, args.context.frameIndex, rhiQueue, commandList);
-			if (hasStatistics) {
-				args.statisticsService->RecordCpuExecuteTime(
-					static_cast<unsigned>(pr.statisticsIndex),
-					std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - cpuStart).count());
+			catch (...) {
+				std::ostringstream oss;
+				oss << "RenderGraph::ExecuteQueueBatch failed while executing pass '"
+					<< passName
+					<< "' on queue " << QueueKindToString(queue)
+					<< " (slot " << qi << ", batch " << args.batchIndex << ") with a non-standard exception";
+				spdlog::error(oss.str());
+				throw std::runtime_error(oss.str());
 			}
 		};
 
@@ -5209,6 +5346,7 @@ namespace {
 		rhi::Queue& rhiQueue;           // needed for statistics Begin/EndQuery
 		PassExecutionContext context;    // COPY: each task gets its own
 		rg::runtime::IStatisticsService* statisticsService;
+		bool batchTraceEnabled;
 	};
 
 	void RecordQueueBatch(RecordQueueBatchArgs& args) {
@@ -5238,29 +5376,64 @@ namespace {
 		auto executeOne = [&](auto& pr) {
 			if (!pr.pass->IsInvalidated())
 				return;
-			ZoneScopedN("RenderGraph::RecordQueueBatch::PassRecord");
-			if (!pr.name.empty()) {
-				ZoneText(pr.name.data(), pr.name.size());
+			const std::string_view passName = pr.name.empty() ? std::string_view("<unnamed>") : std::string_view(pr.name);
+			try {
+				ZoneScopedN("RenderGraph::RecordQueueBatch::PassRecord");
+				ZoneText(passName.data(), passName.size());
+				if (args.batchTraceEnabled) {
+					spdlog::info(
+						"RenderGraph: frame {} queue {} slot {} begin pass {}",
+						static_cast<unsigned>(args.context.frameIndex),
+						QueueKindToString(queue),
+						qi,
+						passName);
+				}
+				rhi::debug::Scope scope(commandList, rhi::colors::Mint, std::string(passName).c_str());
+				const bool hasStatistics = args.statisticsService && pr.statisticsIndex >= 0;
+				const auto cpuStart = std::chrono::steady_clock::now();
+				if (hasStatistics)
+					args.statisticsService->BeginQuery(pr.statisticsIndex, args.context.frameIndex, args.rhiQueue, commandList, sched.queryRecordingContext);
+				if ((pr.run & PassRunMask::Immediate) != PassRunMask::None)
+					rg::imm::Replay(pr.immediateBytecode, commandList, *args.context.immediateDispatch);
+				pr.immediateKeepAlive.reset();
+				if ((pr.run & PassRunMask::Retained) != PassRunMask::None) {
+					auto passReturn = pr.pass->Execute(args.context);
+					if (passReturn.fence)
+						sched.externalFences.push_back(passReturn);
+				}
+				if (hasStatistics)
+					args.statisticsService->EndQuery(pr.statisticsIndex, args.context.frameIndex, args.rhiQueue, commandList, sched.queryRecordingContext);
+				if (hasStatistics) {
+					args.statisticsService->RecordCpuExecuteTime(
+						static_cast<unsigned>(pr.statisticsIndex),
+						std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - cpuStart).count());
+				}
+				if (args.batchTraceEnabled) {
+					spdlog::info(
+						"RenderGraph: frame {} queue {} slot {} end pass {}",
+						static_cast<unsigned>(args.context.frameIndex),
+						QueueKindToString(queue),
+						qi,
+						passName);
+				}
 			}
-			rhi::debug::Scope scope(commandList, rhi::colors::Mint, pr.name.c_str());
-			const bool hasStatistics = args.statisticsService && pr.statisticsIndex >= 0;
-			const auto cpuStart = std::chrono::steady_clock::now();
-			if (hasStatistics)
-				args.statisticsService->BeginQuery(pr.statisticsIndex, args.context.frameIndex, args.rhiQueue, commandList, sched.queryRecordingContext);
-			if ((pr.run & PassRunMask::Immediate) != PassRunMask::None)
-				rg::imm::Replay(pr.immediateBytecode, commandList, *args.context.immediateDispatch);
-			pr.immediateKeepAlive.reset();
-			if ((pr.run & PassRunMask::Retained) != PassRunMask::None) {
-				auto passReturn = pr.pass->Execute(args.context);
-				if (passReturn.fence)
-					sched.externalFences.push_back(passReturn);
+			catch (const std::exception& ex) {
+				std::ostringstream oss;
+				oss << "RenderGraph::RecordQueueBatch failed while recording pass '"
+					<< passName
+					<< "' on queue " << QueueKindToString(queue)
+					<< " (slot " << qi << "): " << ex.what();
+				spdlog::error(oss.str());
+				throw std::runtime_error(oss.str());
 			}
-			if (hasStatistics)
-				args.statisticsService->EndQuery(pr.statisticsIndex, args.context.frameIndex, args.rhiQueue, commandList, sched.queryRecordingContext);
-			if (hasStatistics) {
-				args.statisticsService->RecordCpuExecuteTime(
-					static_cast<unsigned>(pr.statisticsIndex),
-					std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - cpuStart).count());
+			catch (...) {
+				std::ostringstream oss;
+				oss << "RenderGraph::RecordQueueBatch failed while recording pass '"
+					<< passName
+					<< "' on queue " << QueueKindToString(queue)
+					<< " (slot " << qi << ") with a non-standard exception";
+				spdlog::error(oss.str());
+				throw std::runtime_error(oss.str());
 			}
 		};
 
@@ -5456,6 +5629,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 	context.immediateDispatch = &m_immediateDispatch;
 
 	const bool heavyDebug = m_getHeavyDebug ? m_getHeavyDebug() : false;
+	const bool batchTraceEnabled = m_getRenderGraphBatchTraceEnabled ? m_getRenderGraphBatchTraceEnabled() : false;
 	auto& manager = DeviceManager::GetInstance();
 	const size_t slotCount = m_queueRegistry.SlotCount();
 
@@ -5785,6 +5959,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 					.statisticsService = statisticsService,
 					.outExternalFences = slotExternalFences[qi],
 					.lastSignaledOnTimeline = lastSignaledPerSlot[qi],
+					.batchTraceEnabled = batchTraceEnabled,
 				};
 				ExecuteQueueBatch(args, WaitOnSlot);
 			}
@@ -5876,17 +6051,42 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 				auto& task = tasks[taskIdx];
 				auto& qs = m_executionSchedule.batches[task.batchIndex].queues[task.queueIndex];
 				auto rhiQ = SlotQueue(task.queueIndex);
-				RecordQueueBatchArgs args{
-					.sched = qs,
-					.batch = batches[task.batchIndex],
-					.queue = m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(task.queueIndex)),
-					.queueSlot = task.queueIndex,
-					.rhiQueue = rhiQ,
-					.context = context,
-					.statisticsService = statisticsService,
-				};
-				RecordQueueBatch(args);
-			}, false);
+				const QueueKind queueKind = m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(task.queueIndex));
+				try {
+					RecordQueueBatchArgs args{
+						.sched = qs,
+						.batch = batches[task.batchIndex],
+						.queue = queueKind,
+						.queueSlot = task.queueIndex,
+						.rhiQueue = rhiQ,
+						.context = context,
+						.statisticsService = statisticsService,
+						.batchTraceEnabled = batchTraceEnabled,
+					};
+					RecordQueueBatch(args);
+				}
+				catch (const std::exception& ex) {
+					std::string passNames;
+					for (auto& passVariant : batches[task.batchIndex].Passes(task.queueIndex)) {
+						std::visit([&](auto& passEntry) {
+							if (!passNames.empty()) {
+								passNames += ", ";
+							}
+							passNames += passEntry.name.empty() ? std::string("<unnamed>") : passEntry.name;
+						}, passVariant);
+					}
+
+					std::ostringstream oss;
+					oss << "RenderGraph::Execute parallel recording failed for batch " << task.batchIndex
+						<< ", queue " << QueueKindToString(queueKind)
+						<< " (slot " << task.queueIndex << ")";
+					if (!passNames.empty()) {
+						oss << " with passes [" << passNames << "]";
+					}
+					oss << ": " << ex.what();
+					throw std::runtime_error(oss.str());
+				}
+			}, true);
 		}
 
 		// Merge per-task statistics contexts.

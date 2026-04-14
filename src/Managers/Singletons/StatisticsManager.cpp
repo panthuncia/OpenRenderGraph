@@ -32,6 +32,7 @@ void StatisticsManager::Initialize() {
 void StatisticsManager::RegisterPasses(const std::vector<std::string>& passNames) {
     m_passNames = passNames;
     m_numPasses = static_cast<unsigned>(passNames.size());
+    m_passTechniquePaths.assign(m_numPasses, {});
     m_stats.assign(m_numPasses, {});
     m_isGeometryPass.assign(m_numPasses, false);
     m_meshStatsEma.assign(m_numPasses, {});
@@ -44,12 +45,25 @@ void StatisticsManager::RegisterPasses(const std::vector<std::string>& passNames
     }
 }
 
-unsigned StatisticsManager::RegisterPass(const std::string& passName, bool isGeometryPass) {
+unsigned StatisticsManager::RegisterPass(const std::string& passName, bool isGeometryPass, std::string_view techniquePath) {
     if (!passName.empty()) {
         auto it = m_passNameToIndex.find(passName);
         if (it != m_passNameToIndex.end()) {
             if (isGeometryPass) {
                 m_isGeometryPass[it->second] = true;
+            }
+            if (!techniquePath.empty()) {
+                auto& existingTechniquePath = m_passTechniquePaths[it->second];
+                if (existingTechniquePath.empty()) {
+                    existingTechniquePath.assign(techniquePath);
+                }
+                else if (existingTechniquePath != techniquePath) {
+                    spdlog::warn(
+                        "Pass '{}' was registered with conflicting technique paths '{}' and '{}'. Keeping the first one.",
+                        passName,
+                        existingTechniquePath,
+                        techniquePath);
+                }
             }
             return it->second;
         }
@@ -65,6 +79,7 @@ unsigned StatisticsManager::RegisterPass(const std::string& passName, bool isGeo
     m_passNameToIndex[resolvedName] = index;
 
     m_numPasses = static_cast<unsigned>(m_passNames.size());
+    m_passTechniquePaths.emplace_back(techniquePath);
     m_stats.emplace_back();
     m_isGeometryPass.push_back(isGeometryPass);
     m_meshStatsEma.emplace_back();
@@ -633,6 +648,7 @@ void StatisticsManager::ClearAll() {
     m_timestampBuffers.clear();
     m_meshStatsBuffers.clear();
     m_passNames.clear();
+    m_passTechniquePaths.clear();
     m_stats.clear();
     m_isGeometryPass.clear();
     m_meshStatsEma.clear();

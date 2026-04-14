@@ -65,6 +65,11 @@ public:
     unsigned int GetHeight() const { return m_height; }
 
     void SetHandle(rhi::ResourceHandle handle) { m_handle = handle; }
+    rhi::ResourceHandle GetHandle() const { return m_handle; }
+    bool HasHandle() const { return m_handle.valid(); }
+    void SetRTVSlot(rhi::DescriptorSlot slot) { m_rtvSlot = slot; }
+    bool HasRTVSlot() const { return m_rtvSlot.heap.valid(); }
+    rhi::DescriptorSlot GetRTVSlot() const { return m_rtvSlot; }
 
     // Reset the symbolic tracker to Common state.  Must be called after any
     // out-of-graph barrier (e.g. TransitionForPresent) so the render graph
@@ -79,4 +84,5 @@ private:
     unsigned int          m_height;
     rhi::TextureBarrier   m_barrier{};
     SymbolicTracker       m_stateTracker;
+    rhi::DescriptorSlot   m_rtvSlot{};
 };

@@ -2,6 +2,7 @@
 
 #include <vector>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <cstdint>
 #include <utility>
@@ -24,7 +25,7 @@ public:
 
 	void RegisterPasses(const std::vector<std::string>& passNames);
     
-	unsigned RegisterPass(const std::string& passName, bool isGeometryPass = false);
+	unsigned RegisterPass(const std::string& passName, bool isGeometryPass = false, std::string_view techniquePath = {});
 
 	void BeginFrame();
 
@@ -68,6 +69,7 @@ public:
 	const std::vector<unsigned>& GetVisiblePassIndices(uint64_t maxStaleFrames) const;
 
 	const std::vector<std::string>&        GetPassNames() const { return m_passNames; }
+	const std::vector<std::string>&        GetPassTechniquePaths() const { return m_passTechniquePaths; }
 	const std::vector<PassStats>&          GetPassStats() const { return m_stats; }
 	const std::vector<MeshPipelineStats>&  GetMeshStats() const { return m_meshStatsEma; }
 	rg::runtime::MemoryBudgetStats GetMemoryBudgetStats() const { return m_memoryBudgetStats; }
@@ -109,6 +111,7 @@ private:
 
 	// Per-pass data
 	std::vector<std::string>        m_passNames;
+	std::vector<std::string>        m_passTechniquePaths;
 	std::vector<PassStats>          m_stats;
 	std::vector<bool>               m_isGeometryPass;
 	std::vector<MeshPipelineStats>  m_meshStatsEma;

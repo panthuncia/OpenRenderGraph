@@ -135,6 +135,7 @@ public:
 	struct ExternalPassDesc {
 		PassType type = PassType::Unknown;
 		std::string name;
+		std::string techniquePath;
 		std::optional<ExternalInsertPoint> where;
 		std::variant<std::monostate, std::shared_ptr<RenderPass>, std::shared_ptr<ComputePass>, std::shared_ptr<CopyPass>> pass;
 		std::optional<QueueKind> preferredQueueKind;
@@ -217,6 +218,16 @@ public:
 			isGeometryPass = enabled;
 			return std::move(*this);
 		}
+
+		ExternalPassDesc& Technique(std::string path) & {
+			techniquePath = std::move(path);
+			return *this;
+		}
+
+		ExternalPassDesc Technique(std::string path) && {
+			techniquePath = std::move(path);
+			return std::move(*this);
+		}
 	};
 
 	struct IRenderGraphExtension {
@@ -246,6 +257,7 @@ public:
 		std::shared_ptr<RenderPass> pass;
 		RenderPassParameters resources;
 		std::string name;
+		std::string techniquePath;
 		int statisticsIndex = -1;
 
 		PassRunMask run = PassRunMask::Both; // default behavior
@@ -258,6 +270,7 @@ public:
 		std::shared_ptr<ComputePass> pass;
 		ComputePassParameters resources;
 		std::string name;
+		std::string techniquePath;
 		int statisticsIndex = -1;
 
 		PassRunMask run = PassRunMask::Both;
@@ -270,6 +283,7 @@ public:
 		std::shared_ptr<CopyPass> pass;
 		CopyPassParameters resources;
 		std::string name;
+		std::string techniquePath;
 		int statisticsIndex = -1;
 
 		PassRunMask run = PassRunMask::Both;
@@ -528,6 +542,7 @@ public:
 
 	void RegisterResolver(ResourceIdentifier id, const std::shared_ptr<IResourceResolver>& resolver);
 	std::shared_ptr<IResourceResolver> RequestResolver(ResourceIdentifier const& rid, bool allowFailure = false);
+	void SetPassTechnique(std::string passName, std::string techniquePath);
 
 	std::shared_ptr<Resource> RequestResourcePtr(ResourceIdentifier const& rid, bool allowFailure = false);
 	ResourceRegistry::RegistryHandle RequestResourceHandle(ResourceIdentifier const& rid, bool allowFailure = false);
@@ -595,6 +610,7 @@ public:
 	QueueRegistry& GetQueueRegistry() noexcept { return m_queueRegistry; }
 
 private:
+	std::string GetTechniquePathForPassName(std::string_view passName) const;
 
 	struct AnyPassAndResources {
 		PassType type = PassType::Unknown;
@@ -679,6 +695,7 @@ private:
 	std::array<uint8_t, static_cast<size_t>(QueueKind::Count)> m_minAutomaticSchedulingQueuesByKind = { 1, 1, 1 };
 	std::unordered_map<std::string, std::shared_ptr<RenderPass>> renderPassesByName;
 	std::unordered_map<std::string, std::shared_ptr<ComputePass>> computePassesByName;
+	std::unordered_map<std::string, std::string> m_passTechniquePathsByName;
 	std::unordered_map<std::string, std::shared_ptr<Resource>> resourcesByName;
 	std::unordered_map<uint64_t, std::shared_ptr<Resource>> resourcesByID;
 	std::unordered_map<uint64_t, std::shared_ptr<Resource>> m_transientFrameResourcesByID;
@@ -986,6 +1003,7 @@ private:
 	std::function<AutoAliasMode()> m_getAutoAliasMode;
 	std::function<AutoAliasPackingStrategy()> m_getAutoAliasPackingStrategy;
 	std::function<bool()> m_getRenderGraphCompileDumpEnabled;
+	std::function<bool()> m_getRenderGraphBatchTraceEnabled;
 	std::function<bool()> m_getAutoAliasEnableLogging;
 	std::function<bool()> m_getAutoAliasLogExclusionReasons;
 	std::function<bool()> m_getQueueSchedulingEnableLogging;

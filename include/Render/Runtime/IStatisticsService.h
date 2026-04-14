@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -20,7 +21,7 @@ public:
     virtual void BeginFrame() = 0;
     virtual void ClearAll() = 0;
 
-    virtual unsigned RegisterPass(const std::string& passName, bool isGeometryPass) = 0;
+    virtual unsigned RegisterPass(const std::string& passName, bool isGeometryPass, std::string_view techniquePath = {}) = 0;
     virtual void RegisterQueue(rhi::QueueKind queueKind) = 0;
     virtual void SetupQueryHeap() = 0;
 
@@ -38,6 +39,7 @@ public:
     virtual void MergePendingResolves(rhi::QueueKind queueKind, unsigned frameIndex, QueryRecordingContext& ctx) = 0;
 
     virtual const std::vector<std::string>& GetPassNames() const = 0;
+    virtual const std::vector<std::string>& GetPassTechniquePaths() const = 0;
     virtual const std::vector<PassStats>& GetPassStats() const = 0;
     virtual const std::vector<MeshPipelineStats>& GetMeshStats() const = 0;
     virtual MemoryBudgetStats GetMemoryBudgetStats() const = 0;

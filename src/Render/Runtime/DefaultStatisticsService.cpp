@@ -19,8 +19,8 @@ public:
         StatisticsManager::GetInstance().ClearAll();
     }
 
-    unsigned RegisterPass(const std::string& passName, bool isGeometryPass) override {
-        return StatisticsManager::GetInstance().RegisterPass(passName, isGeometryPass);
+    unsigned RegisterPass(const std::string& passName, bool isGeometryPass, std::string_view techniquePath = {}) override {
+        return StatisticsManager::GetInstance().RegisterPass(passName, isGeometryPass, techniquePath);
     }
 
     void RegisterQueue(rhi::QueueKind queueKind) override {
@@ -73,6 +73,10 @@ public:
 
     const std::vector<std::string>& GetPassNames() const override {
         return StatisticsManager::GetInstance().GetPassNames();
+    }
+
+    const std::vector<std::string>& GetPassTechniquePaths() const override {
+        return StatisticsManager::GetInstance().GetPassTechniquePaths();
     }
 
     const std::vector<PassStats>& GetPassStats() const override {
