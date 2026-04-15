@@ -527,6 +527,12 @@ public:
 	void SetTaskService(std::shared_ptr<rg::runtime::ITaskService> service) { m_taskService = std::move(service); }
 	rg::runtime::ITaskService* GetTaskService() { return m_taskService.get(); }
 	const rg::runtime::ITaskService* GetTaskService() const { return m_taskService.get(); }
+	void SetStructuralMaterializeCheckpointCallback(std::function<void(std::string_view)> callback) {
+		m_structuralMaterializeCheckpointCallback = std::move(callback);
+	}
+	void SetStructuralMaterializeResourceCheckpointCallback(std::function<void(std::string_view, std::string_view)> callback) {
+		m_structuralMaterializeResourceCheckpointCallback = std::move(callback);
+	}
 	//void AllocateResources(PassExecutionContext& context);
 	//void CreateResource(std::wstring name);
 	std::shared_ptr<Resource> GetResourceByName(const std::string& name);
@@ -784,7 +790,8 @@ private:
 	void PublishCompiledTrackerStates();
 	void MaterializeReferencedResources(
 		const std::vector<ResourceRequirement>& resourceRequirements,
-		const std::vector<std::pair<ResourceHandleAndRange, ResourceState>>& internalTransitions);
+		const std::vector<std::pair<ResourceHandleAndRange, ResourceState>>& internalTransitions,
+		std::string_view debugPassName = {});
 	void CollectFrameResourceIDs(std::unordered_set<uint64_t>& out) const;
 	void ApplyIdleDematerializationPolicy(const std::unordered_set<uint64_t>& usedResourceIDs);
 	void SnapshotCompiledResourceGenerations(const std::unordered_set<uint64_t>& usedResourceIDs);
@@ -1014,6 +1021,8 @@ private:
 	std::function<float()> m_getQueueSchedulingUavPressureWeight;
 	std::function<uint32_t()> m_getAutoAliasPoolRetireIdleFrames;
 	std::function<float()> m_getAutoAliasPoolGrowthHeadroom;
+	std::function<void(std::string_view)> m_structuralMaterializeCheckpointCallback;
+	std::function<void(std::string_view, std::string_view)> m_structuralMaterializeResourceCheckpointCallback;
 	rg::alias::RenderGraphAliasingSubsystem m_aliasingSubsystem;
 
 	ComputePassBuilder& GetOrCreateComputePassBuilder(std::string const& name);

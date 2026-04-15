@@ -461,8 +461,24 @@ void DescriptorHeapManager::UpdateDescriptorContents(
     }
 
     if (const auto* buf = std::get_if<ViewRequirements::BufferViews>(&req.views)) {
+        spdlog::info(
+            "DescriptorHeapManager::UpdateDescriptorContents buffer name='{}' id={} cbv={} srv={} uav={} cpuUav={} handle=({}, {})",
+            target.GetName(),
+            target.GetGlobalResourceID(),
+            buf->createCBV,
+            buf->createSRV,
+            buf->createUAV,
+            buf->createNonShaderVisibleUAV,
+            apiResource.GetHandle().index,
+            apiResource.GetHandle().generation);
         if (buf->createCBV) {
             const auto& slot = target.GetCBVInfo().slot;
+            spdlog::info(
+                "DescriptorHeapManager::CreateConstantBufferView name='{}' id={} slot=({}, {})",
+                target.GetName(),
+                target.GetGlobalResourceID(),
+                slot.heap.index,
+                slot.index);
             device.CreateConstantBufferView(
                 { slot.heap, slot.index },
                 apiResource.GetHandle(),
@@ -471,6 +487,12 @@ void DescriptorHeapManager::UpdateDescriptorContents(
 
         if (buf->createSRV) {
             const auto& slot = target.GetSRVInfo(SRVViewType::Buffer, 0, 0).slot;
+            spdlog::info(
+                "DescriptorHeapManager::CreateShaderResourceView(buffer) name='{}' id={} slot=({}, {})",
+                target.GetName(),
+                target.GetGlobalResourceID(),
+                slot.heap.index,
+                slot.index);
             device.CreateShaderResourceView(
                 { slot.heap, slot.index },
                 apiResource.GetHandle(),
@@ -479,6 +501,12 @@ void DescriptorHeapManager::UpdateDescriptorContents(
 
         if (buf->createUAV) {
             const auto& slot = target.GetUAVShaderVisibleInfo(0, 0).slot;
+            spdlog::info(
+                "DescriptorHeapManager::CreateUnorderedAccessView(shader-visible) name='{}' id={} slot=({}, {})",
+                target.GetName(),
+                target.GetGlobalResourceID(),
+                slot.heap.index,
+                slot.index);
             device.CreateUnorderedAccessView(
                 { slot.heap, slot.index },
                 apiResource.GetHandle(),
@@ -487,11 +515,22 @@ void DescriptorHeapManager::UpdateDescriptorContents(
 
         if (buf->createNonShaderVisibleUAV) {
             const auto& slot = target.GetUAVNonShaderVisibleInfo(0, 0).slot;
+            spdlog::info(
+                "DescriptorHeapManager::CreateUnorderedAccessView(cpu-only) name='{}' id={} slot=({}, {})",
+                target.GetName(),
+                target.GetGlobalResourceID(),
+                slot.heap.index,
+                slot.index);
             device.CreateUnorderedAccessView(
                 { slot.heap, slot.index },
                 apiResource.GetHandle(),
                 buf->uavDesc);
         }
+
+        spdlog::info(
+            "DescriptorHeapManager::UpdateDescriptorContents buffer complete name='{}' id={}",
+            target.GetName(),
+            target.GetGlobalResourceID());
 
         return;
     }

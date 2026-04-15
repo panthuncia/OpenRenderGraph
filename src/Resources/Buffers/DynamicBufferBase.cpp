@@ -1,12 +1,98 @@
 #include "Resources/Buffers/DynamicBufferBase.h"
 
 #include <stdexcept>
+#include <string>
+#include <string_view>
 
+#include <spdlog/spdlog.h>
+
+#include "Managers/Singletons/DeviceManager.h"
 #include "Managers/Singletons/DescriptorHeapManager.h"
 #include "Resources/GPUBacking/GpuBufferBacking.h"
 #include "Resources/ExternalBackingResource.h"
 #include "Render/Runtime/UploadServiceAccess.h"
 #include "Render/Runtime/UploadPolicyServiceAccess.h"
+
+namespace {
+    const char* HeapTypeToString(rhi::HeapType heapType) {
+        switch (heapType) {
+        case rhi::HeapType::DeviceLocal:
+            return "DeviceLocal";
+        case rhi::HeapType::Upload:
+            return "Upload";
+        case rhi::HeapType::Readback:
+            return "Readback";
+        case rhi::HeapType::Custom:
+            return "Custom";
+        default:
+            return "Unknown";
+        }
+    }
+
+    const char* BufferViewKindToString(rhi::BufferViewKind kind) {
+        switch (kind) {
+        case rhi::BufferViewKind::Raw:
+            return "Raw";
+        case rhi::BufferViewKind::Structured:
+            return "Structured";
+        case rhi::BufferViewKind::Typed:
+            return "Typed";
+        default:
+            return "Unknown";
+        }
+    }
+
+    bool ShouldProbeVirtualShadowBuffer(std::string_view bufferName) {
+        return bufferName.starts_with("CLod[Shadow] Virtual Shadow ");
+    }
+
+    void ProbeGraphicsCommandListCreation(std::string_view phase) {
+        auto device = DeviceManager::GetInstance().GetDevice();
+        if (!device) {
+            spdlog::info("Buffer materialize command-list probe skipped phase={} deviceValid=false", phase);
+            return;
+        }
+
+        spdlog::info("Buffer materialize command-list probe begin phase={}", phase);
+
+        rhi::CommandAllocatorPtr allocator;
+        const auto allocResult = device.CreateCommandAllocator(rhi::QueueKind::Graphics, allocator);
+        spdlog::info(
+            "Buffer materialize command-list probe phase={} allocator result={} valid={}",
+            phase,
+            static_cast<int>(allocResult),
+            static_cast<bool>(allocator));
+        if (allocResult != rhi::Result::Ok || !allocator) {
+            return;
+        }
+
+        rhi::CommandListPtr list;
+        const auto listResult = device.CreateCommandList(rhi::QueueKind::Graphics, allocator.Get(), list);
+        spdlog::info(
+            "Buffer materialize command-list probe phase={} list result={} valid={}",
+            phase,
+            static_cast<int>(listResult),
+            static_cast<bool>(list));
+        if (listResult != rhi::Result::Ok || !list) {
+            return;
+        }
+
+        list->End();
+        spdlog::info("Buffer materialize command-list probe end phase={}", phase);
+    }
+
+    void ProbeVirtualShadowBufferStep(std::string_view bufferName, std::string_view step) {
+        if (!ShouldProbeVirtualShadowBuffer(bufferName)) {
+            return;
+        }
+
+        std::string phase = "BufferBase::Materialize ";
+        phase += step;
+        phase += " :: ";
+        phase += bufferName;
+        ProbeGraphicsCommandListCreation(phase);
+    }
+}
 
 BufferBase::BufferBase() = default;
 
@@ -124,7 +210,10 @@ void BufferBase::Materialize(const MaterializeOptions* options) {
             m_unorderedAccess);
     }
 
+    ProbeVirtualShadowBufferStep(GetName(), "after backing create");
+
     RefreshDescriptorContents();
+    ProbeVirtualShadowBufferStep(GetName(), "after descriptor refresh");
     ++m_backingGeneration;
     OnBackingMaterialized();
 }
@@ -139,6 +228,22 @@ void BufferBase::Dematerialize() {
 
 void BufferBase::SetDescriptorRequirements(const DescriptorRequirements& requirements) {
     m_descriptorRequirements = requirements;
+    spdlog::info(
+        "BufferBase::SetDescriptorRequirements name='{}' id={} cbv={} srv={} uav={} cpuUav={} cbvBytes={} srvKind={} srvElements={} srvStride={} uavKind={} uavElements={} uavStride={} uavCounterOffset={}",
+        GetName(),
+        GetGlobalResourceID(),
+        requirements.createCBV,
+        requirements.createSRV,
+        requirements.createUAV,
+        requirements.createNonShaderVisibleUAV,
+        requirements.cbvDesc.byteSize,
+        BufferViewKindToString(requirements.srvDesc.buffer.kind),
+        requirements.srvDesc.buffer.numElements,
+        requirements.srvDesc.buffer.structureByteStride,
+        BufferViewKindToString(requirements.uavDesc.buffer.kind),
+        requirements.uavDesc.buffer.numElements,
+        requirements.uavDesc.buffer.structureByteStride,
+        requirements.uavCounterOffset);
 
     EnsureVirtualDescriptorSlotsAllocated();
     if (m_dataBuffer) {
@@ -265,16 +370,40 @@ void BufferBase::UnregisterUploadPolicyClient() {
 }
 
 void BufferBase::SetBacking(std::unique_ptr<GpuBufferBacking> backing, uint64_t bufferSize) {
+    spdlog::info(
+        "BufferBase::SetBacking begin name='{}' id={} oldSize={} newSize={} hadBacking={} hasDescriptors={}",
+        GetName(),
+        GetGlobalResourceID(),
+        m_bufferSize,
+        bufferSize,
+        m_dataBuffer != nullptr,
+        m_descriptorRequirements.has_value());
     m_dataBuffer = std::move(backing);
     m_bufferSize = bufferSize;
+    spdlog::info(
+        "BufferBase::SetBacking refreshing descriptors name='{}' id={}",
+        GetName(),
+        GetGlobalResourceID());
     RefreshDescriptorContents();
     ++m_backingGeneration;
     if (m_dataBuffer) {
         OnBackingMaterialized();
     }
+    spdlog::info(
+        "BufferBase::SetBacking complete name='{}' id={} backingGeneration={}",
+        GetName(),
+        GetGlobalResourceID(),
+        m_backingGeneration);
 }
 
 void BufferBase::CreateAndSetBacking(rhi::HeapType accessType, uint64_t bufferSize, bool unorderedAccess) {
+    spdlog::info(
+        "BufferBase::CreateAndSetBacking name='{}' id={} heapType={} bytes={} unorderedAccess={}",
+        GetName(),
+        GetGlobalResourceID(),
+        HeapTypeToString(accessType),
+        bufferSize,
+        unorderedAccess);
     auto newBacking = GpuBufferBacking::CreateUnique(
         accessType,
         bufferSize,
@@ -300,6 +429,11 @@ void BufferBase::QueueResourceCopyFromOldBacking(uint64_t bytesToCopy) {
     if (!m_dataBuffer) {
         return;
     }
+	spdlog::info(
+		"BufferBase::QueueResourceCopyFromOldBacking name='{}' id={} bytes={} ",
+		GetName(),
+		GetGlobalResourceID(),
+		bytesToCopy);
 
     auto oldBackingResource = ExternalBackingResource::CreateShared(std::move(m_dataBuffer));
     if (auto* uploadService = rg::runtime::GetActiveUploadService()) {
