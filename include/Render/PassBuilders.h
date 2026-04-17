@@ -984,16 +984,13 @@ private:
     {
         if (!built_)
         {
-			spdlog::info("RenderPassBuilder::Instantiate begin pass='{}'", passName);
             built_ = true;
             pass = detail::MakePass<PassT>(
                 std::forward<InputsT>(inputs),
                 std::forward<StableCtorArgs>(ctorArgs)...);
-			spdlog::info("RenderPassBuilder::Instantiate constructed pass='{}' provider={} passPtr={}", passName, static_cast<const void*>(pass.get()), static_cast<const void*>(pass.get()));
         }
 
         pass->SetInputs(std::forward<InputsT>(inputs));
-		spdlog::info("RenderPassBuilder::Instantiate inputs set pass='{}'", passName);
     }
 
     template<DerivedRenderPass PassT, typename... StableCtorArgs>
@@ -1004,7 +1001,6 @@ private:
 
     void Finalize() {
         if (!built_) return;
-		spdlog::info("RenderPassBuilder::Finalize begin pass='{}'", passName);
 
         auto authorState = std::move(*this).CaptureAuthorState();
 
@@ -1015,7 +1011,6 @@ private:
         RestoreAuthorState(std::move(authorState));
 
         pass->DeclareResourceUsages(this);
-        spdlog::info("RenderPassBuilder::Finalize declare complete pass='{}' identifiers={} requirements={}", passName, _declaredIds.size(), GatherResourceRequirements().size());
 
         params.isGeometryPass = m_isGeometryPass;
         params.preferredQueueKind = m_preferredQueueKind;

@@ -50,17 +50,6 @@ public:
         uint64_t counterOffset = layout.counterOffset;
 
         auto buffer = CreateSharedUnmaterialized(accessType, bufferSize, unorderedAccess);
-        spdlog::info(
-            "Buffer::CreateUnmaterializedStructuredBuffer name='{}' id={} numElements={} elementSize={} bytes={} uav={} uavCounter={} cpuUav={} heapType={}",
-            buffer->GetName(),
-            buffer->GetGlobalResourceID(),
-            numElements,
-            elementSize,
-            bufferSize,
-            unorderedAccess,
-            unorderedAccessCounter,
-            createNonShaderVisibleUAV,
-            static_cast<int>(accessType));
 
         buffer->m_structuredParams = StructuredBufferParams{
             .numElements = numElements,

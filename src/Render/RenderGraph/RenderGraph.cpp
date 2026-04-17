@@ -267,11 +267,12 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 {
 	const bool traceLifecycle = m_getRenderGraphBatchTraceEnabled && m_getRenderGraphBatchTraceEnabled();
 	const bool traceStructuralMaterialize = materializeReferencedResources && !callSetup;
+	const bool logStructuralMaterialize = traceStructuralMaterialize && traceLifecycle;
 	AnyPassAndResources any;
 	any.type = d.type;
 	any.name = d.name;
 
-	if (traceStructuralMaterialize) {
+	if (logStructuralMaterialize) {
 		spdlog::info(
 			"RG structural materialize begin pass='{}' type={} preferredQueue={} pinnedQueue={} registerName={}",
 			d.name,
@@ -299,7 +300,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 			}
 			EnsureProviderRegistered(par.pass.get());
 			par.pass->DeclareResourceUsages(&b);
-			if (traceStructuralMaterialize) {
+			if (logStructuralMaterialize) {
 				spdlog::info(
 					"RG structural materialize render pass='{}' declare complete requirements={} transitions={} identifiers={}",
 					d.name,
@@ -321,11 +322,11 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 				if (traceLifecycle) {
 					spdlog::info("RG materialize external render pass '{}' materialize referenced resources begin", d.name);
 				}
-				if (traceStructuralMaterialize) {
+				if (logStructuralMaterialize) {
 					spdlog::info("RG structural materialize render pass='{}' referenced resources begin", d.name);
 				}
 				MaterializeReferencedResources(par.resources.staticResourceRequirements, par.resources.internalTransitions, d.name);
-				if (traceStructuralMaterialize) {
+				if (logStructuralMaterialize) {
 					spdlog::info("RG structural materialize render pass='{}' referenced resources complete", d.name);
 				}
 			}
@@ -365,7 +366,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 			}
 			EnsureProviderRegistered(par.pass.get());
 			par.pass->DeclareResourceUsages(&b);
-			if (traceStructuralMaterialize) {
+			if (logStructuralMaterialize) {
 				spdlog::info(
 					"RG structural materialize compute pass='{}' declare complete requirements={} transitions={} identifiers={}",
 					d.name,
@@ -386,11 +387,11 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 				if (traceLifecycle) {
 					spdlog::info("RG materialize external compute pass '{}' materialize referenced resources begin", d.name);
 				}
-				if (traceStructuralMaterialize) {
+				if (logStructuralMaterialize) {
 					spdlog::info("RG structural materialize compute pass='{}' referenced resources begin", d.name);
 				}
 				MaterializeReferencedResources(par.resources.staticResourceRequirements, par.resources.internalTransitions, d.name);
-				if (traceStructuralMaterialize) {
+				if (logStructuralMaterialize) {
 					spdlog::info("RG structural materialize compute pass='{}' referenced resources complete", d.name);
 				}
 			}
@@ -430,7 +431,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 			}
 			EnsureProviderRegistered(par.pass.get());
 			par.pass->DeclareResourceUsages(&b);
-			if (traceStructuralMaterialize) {
+			if (logStructuralMaterialize) {
 				spdlog::info(
 					"RG structural materialize copy pass='{}' declare complete requirements={} transitions={} identifiers={}",
 					d.name,
@@ -448,11 +449,11 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 				if (traceLifecycle) {
 					spdlog::info("RG materialize external copy pass '{}' materialize referenced resources begin", d.name);
 				}
-				if (traceStructuralMaterialize) {
+				if (logStructuralMaterialize) {
 					spdlog::info("RG structural materialize copy pass='{}' referenced resources begin", d.name);
 				}
 				MaterializeReferencedResources(par.resources.staticResourceRequirements, par.resources.internalTransitions, d.name);
-				if (traceStructuralMaterialize) {
+				if (logStructuralMaterialize) {
 					spdlog::info("RG structural materialize copy pass='{}' referenced resources complete", d.name);
 				}
 			}
@@ -473,8 +474,10 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 		any.pass = std::move(par);
 	}
 
-	if (traceStructuralMaterialize) {
+	if (logStructuralMaterialize) {
 		spdlog::info("RG structural materialize complete pass='{}' type={}", d.name, PassTypeToString(d.type));
+	}
+	if (traceStructuralMaterialize) {
 		if (m_structuralMaterializeCheckpointCallback) {
 			m_structuralMaterializeCheckpointCallback(d.name);
 		}
@@ -3138,7 +3141,9 @@ void RenderGraph::CompileStructural() {
 		for (auto const& a : e.where.after) {
 			auto idxOpt = resolveAnchor(a);
 			if (!idxOpt) {
-				spdlog::warn("External pass '{}' requested After('{}') but anchor not found; ignoring.", e.key, a);
+				if (!a.starts_with("CLodShadow::")) {
+					spdlog::warn("External pass '{}' requested After('{}') but anchor not found; ignoring.", e.key, a);
+				}
 				continue;
 			}
 			addEdge(*idxOpt, passNode);
@@ -6949,12 +6954,9 @@ void RenderGraph::EnsureProviderRegistered(IResourceProvider* prov) {
 	if (!prov) {
 		return;
 	}
-	spdlog::info("RenderGraph::EnsureProviderRegistered begin provider={}", static_cast<const void*>(prov));
 
 	auto keys = prov->GetSupportedKeys();
-	spdlog::info("RenderGraph::EnsureProviderRegistered supported-key-count={} provider={}", keys.size(), static_cast<const void*>(prov));
 	for (const auto& key : keys) {
-		spdlog::info("RenderGraph::EnsureProviderRegistered advertise key='{}' provider={}", key.ToString(), static_cast<const void*>(prov));
 		auto existing = _providerMap.find(key);
 		if (existing != _providerMap.end()) {
 			if (existing->second == prov) {
@@ -6971,14 +6973,11 @@ void RenderGraph::EnsureProviderRegistered(IResourceProvider* prov) {
 
 	for (const auto& key : prov->GetSupportedKeys()) {
 		if (_registry.GetHandleFor(key).has_value()) {
-			spdlog::info("RenderGraph::EnsureProviderRegistered key already registered key='{}' provider={}", key.ToString(), static_cast<const void*>(prov));
 			continue;
 		}
 
-		spdlog::info("RenderGraph::EnsureProviderRegistered requesting resource key='{}' provider={}", key.ToString(), static_cast<const void*>(prov));
 		auto resource = prov->ProvideResource(key);
 		if (resource) {
-			spdlog::info("RenderGraph::EnsureProviderRegistered provided resource key='{}' id={} name='{}' provider={}", key.ToString(), resource->GetGlobalResourceID(), resource->GetName(), static_cast<const void*>(prov));
 			RegisterResource(key, resource, prov);
 		}
 		else {
@@ -6999,7 +6998,6 @@ void RenderGraph::EnsureProviderRegistered(IResourceProvider* prov) {
 			spdlog::warn("Provider returned null resolver for advertised key: {}", key.ToString());
 		}
 	}
-	spdlog::info("RenderGraph::EnsureProviderRegistered complete provider={}", static_cast<const void*>(prov));
 }
 
 void RenderGraph::RegisterResolver(ResourceIdentifier id, const std::shared_ptr<IResourceResolver>& resolver) {
@@ -7029,12 +7027,15 @@ std::shared_ptr<IResourceResolver> RenderGraph::RequestResolver(ResourceIdentifi
 
 void RenderGraph::RegisterResource(ResourceIdentifier id, std::shared_ptr<Resource> resource,
 	IResourceProvider* provider) {
-	spdlog::info(
-		"RenderGraph::RegisterResource key='{}' id={} name='{}' provider={}",
-		id.ToString(),
-		resource ? resource->GetGlobalResourceID() : 0ull,
-		resource ? resource->GetName() : std::string{},
-		static_cast<const void*>(provider));
+	const bool traceLifecycle = m_getRenderGraphBatchTraceEnabled && m_getRenderGraphBatchTraceEnabled();
+	if (traceLifecycle) {
+		spdlog::info(
+			"RenderGraph::RegisterResource key='{}' id={} name='{}' provider={}",
+			id.ToString(),
+			resource ? resource->GetGlobalResourceID() : 0ull,
+			resource ? resource->GetName() : std::string{},
+			static_cast<const void*>(provider));
+	}
 
 	auto key = _registry.RegisterOrUpdate(id, resource);
 	AddResource(resource);
