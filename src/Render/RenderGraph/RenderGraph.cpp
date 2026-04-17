@@ -4181,9 +4181,12 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	{
 		traceCompileStep("DeduplicateQueueWaits");
 		ZoneScopedN("RenderGraph::CompileFrame::DeduplicateQueueWaits");
-		// Cut out repeat waits on the same fence per destination queue.
+		// Cut out repeat waits on the same fence per destination/source queue pair.
+		// Fence values are only comparable within a single source queue timeline.
 		const size_t slotCount = m_queueRegistry.SlotCount();
-		std::vector<uint64_t> lastWaitFenceByDstQueue(slotCount, 0);
+		std::vector<std::vector<uint64_t>> lastWaitFenceByDstSrcQueue(
+			slotCount,
+			std::vector<uint64_t>(slotCount, 0));
 		for (auto& batch : batches) {
 			const size_t batchQueueCount = batch.QueueCount();
 			for (size_t dstIndex = 0; dstIndex < batchQueueCount; ++dstIndex) {
@@ -4194,11 +4197,12 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 						}
 
 						const auto waitFence = batch.GetQueueWaitFenceValue(phase, dstIndex, srcIndex);
-						if (waitFence <= lastWaitFenceByDstQueue[dstIndex]) {
+						auto& lastWaitFence = lastWaitFenceByDstSrcQueue[dstIndex][srcIndex];
+						if (waitFence <= lastWaitFence) {
 							batch.ClearQueueWait(phase, dstIndex, srcIndex);
 						}
 						else {
-							lastWaitFenceByDstQueue[dstIndex] = waitFence;
+							lastWaitFence = waitFence;
 						}
 					}
 				}
