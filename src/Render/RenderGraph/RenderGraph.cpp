@@ -6709,7 +6709,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 					oss << ": " << ex.what();
 					throw std::runtime_error(oss.str());
 				}
-			}, true);
+				}, false); // Toggle to true to force serial recording for easier debugging and validation
 			if (batchTraceEnabled) {
 				spdlog::info("RenderGraph::Execute frame={} record-all-batches complete", static_cast<unsigned>(context.frameIndex));
 			}
