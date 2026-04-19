@@ -35,6 +35,8 @@ struct PassExecutionContext {
 	rhi::Device device;
 	rhi::CommandList commandList;
 	const rg::imm::ImmediateDispatch* immediateDispatch = nullptr;
+	const char* currentPassName = nullptr;
+	const char* currentTechniquePath = nullptr;
 	UINT frameIndex = 0;
 	UINT64 frameFenceValue = 0;
 	float deltaTime = 0.0f;

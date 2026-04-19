@@ -5494,6 +5494,7 @@ namespace {
 			if (!pr.pass->IsInvalidated())
 				return;
 			const std::string_view passName = pr.name.empty() ? std::string_view("<unnamed>") : std::string_view(pr.name);
+			const char* techniquePath = pr.techniquePath.empty() ? nullptr : pr.techniquePath.c_str();
 			try {
 				ZoneScopedN("RenderGraph::ExecuteQueueBatch::PassExecute");
 				ZoneText(passName.data(), passName.size());
@@ -5507,6 +5508,9 @@ namespace {
 							passName);
 					}
 				rhi::debug::Scope scope(commandList, rhi::colors::Mint, std::string(passName).c_str());
+				args.context.currentPassName = passName.data();
+				args.context.currentTechniquePath = techniquePath;
+				(void)rhi::debug::SetInstrumentationContext(commandList, args.context.currentPassName, args.context.currentTechniquePath);
 				const bool hasStatistics = args.statisticsService && pr.statisticsIndex >= 0;
 				const auto cpuStart = std::chrono::steady_clock::now();
 				if (hasStatistics)
@@ -5526,6 +5530,9 @@ namespace {
 						static_cast<unsigned>(pr.statisticsIndex),
 						std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - cpuStart).count());
 				}
+				(void)rhi::debug::SetInstrumentationContext(commandList, nullptr, nullptr);
+				args.context.currentPassName = nullptr;
+				args.context.currentTechniquePath = nullptr;
 					if (args.batchTraceEnabled) {
 						spdlog::info(
 							"RenderGraph: frame {} queue {} slot {} batch {} end pass {}",
@@ -5537,6 +5544,9 @@ namespace {
 					}
 			}
 			catch (const std::exception& ex) {
+				(void)rhi::debug::SetInstrumentationContext(commandList, nullptr, nullptr);
+				args.context.currentPassName = nullptr;
+				args.context.currentTechniquePath = nullptr;
 				std::ostringstream oss;
 				oss << "RenderGraph::ExecuteQueueBatch failed while executing pass '"
 					<< passName
@@ -5680,6 +5690,7 @@ namespace {
 			if (!pr.pass->IsInvalidated())
 				return;
 			const std::string_view passName = pr.name.empty() ? std::string_view("<unnamed>") : std::string_view(pr.name);
+			const char* techniquePath = pr.techniquePath.empty() ? nullptr : pr.techniquePath.c_str();
 			try {
 				ZoneScopedN("RenderGraph::RecordQueueBatch::PassRecord");
 				ZoneText(passName.data(), passName.size());
@@ -5693,6 +5704,9 @@ namespace {
 						passName);
 				}
 				rhi::debug::Scope scope(commandList, rhi::colors::Mint, std::string(passName).c_str());
+				args.context.currentPassName = passName.data();
+				args.context.currentTechniquePath = techniquePath;
+				(void)rhi::debug::SetInstrumentationContext(commandList, args.context.currentPassName, args.context.currentTechniquePath);
 				const bool hasStatistics = args.statisticsService && pr.statisticsIndex >= 0;
 				const auto cpuStart = std::chrono::steady_clock::now();
 				if (hasStatistics)
@@ -5712,6 +5726,9 @@ namespace {
 						static_cast<unsigned>(pr.statisticsIndex),
 						std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - cpuStart).count());
 				}
+				(void)rhi::debug::SetInstrumentationContext(commandList, nullptr, nullptr);
+				args.context.currentPassName = nullptr;
+				args.context.currentTechniquePath = nullptr;
 				if (args.batchTraceEnabled) {
 					spdlog::info(
 						"RenderGraph: frame {} batch {} queue {} slot {} end pass {}",
@@ -5723,6 +5740,9 @@ namespace {
 				}
 			}
 			catch (const std::exception& ex) {
+				(void)rhi::debug::SetInstrumentationContext(commandList, nullptr, nullptr);
+				args.context.currentPassName = nullptr;
+				args.context.currentTechniquePath = nullptr;
 				std::ostringstream oss;
 				oss << "RenderGraph::RecordQueueBatch failed while recording pass '"
 					<< passName
