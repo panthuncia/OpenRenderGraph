@@ -239,6 +239,16 @@ namespace {
 		}
 	}
 
+	const char* AutoAliasModeToString(AutoAliasMode mode) noexcept {
+		switch (mode) {
+		case AutoAliasMode::Off: return "Off";
+		case AutoAliasMode::Conservative: return "Conservative";
+		case AutoAliasMode::Balanced: return "Balanced";
+		case AutoAliasMode::Aggressive: return "Aggressive";
+		default: return "Unknown";
+		}
+	}
+
 	const char* BatchWaitPhaseToString(RenderGraph::BatchWaitPhase phase) noexcept {
 		switch (phase) {
 		case RenderGraph::BatchWaitPhase::BeforeTransitions: return "BeforeTransitions";
@@ -1263,52 +1273,6 @@ std::vector<uint8_t> RenderGraph::PlanActiveQueueSlots(
 			++activeCount;
 		}
 
-		if (enableQueueSchedulingLogging) {
-			std::ostringstream activeSlotStream;
-			bool firstActiveSlot = true;
-			for (size_t slot : slots) {
-				if (!activeSlots[slot]) {
-					continue;
-				}
-				if (!firstActiveSlot) {
-					activeSlotStream << ",";
-				}
-				activeSlotStream << slot;
-				firstActiveSlot = false;
-			}
-
-			std::ostringstream pinnedSlotStream;
-			bool firstPinnedSlot = true;
-			for (size_t slot : pinnedSlots) {
-				if (!firstPinnedSlot) {
-					pinnedSlotStream << ",";
-				}
-				pinnedSlotStream << slot;
-				firstPinnedSlot = false;
-			}
-
-			spdlog::info(
-				"RG queue planner [{}]: registered={} autoAssignable={} compatibleNodes={} maxLevelWidth={} resourcePressure={:.2f} uavPressure={:.2f} widthScale={:.2f} penaltyBias={:.2f} minPenalty={:.2f} resourceWeight={:.2f} uavWeight={:.2f} weightedPressure={:.2f} parallelismPenalty={:.2f} widthToPenaltyRatio={:.2f} targetActive={} activeSlots=[{}] pinnedSlots=[{}] asyncComputeAllowed={}",
-				queueKindName(kind),
-				slots.size(),
-				autoAssignableSlots.size(),
-				compatibleNodeCount,
-				maxLevelWidth,
-				resourcePressure,
-				uavPressure,
-				widthScale,
-				penaltyBias,
-				minPenalty,
-				resourcePressureWeight,
-				uavPressureWeight,
-				weightedPressure,
-				parallelismPenalty,
-				widthToPenaltyRatio,
-				targetCount,
-				activeSlotStream.str(),
-				pinnedSlotStream.str(),
-				allowAsyncCompute);
-		}
 	}
 
 	return activeSlots;
@@ -1823,14 +1787,6 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 	std::vector<Node>& nodes)
 {
 	ZoneScopedN("RenderGraph::AutoScheduleAndBuildBatches");
-	struct QueueSchedulingDiagnostics {
-		uint32_t candidateChecks = 0;
-		uint32_t assignedPasses = 0;
-		uint32_t rejectedInactive = 0;
-		uint32_t rejectedCrossQueuePred = 0;
-		uint32_t rejectedBatchNeeded = 0;
-	};
-
 	// Working indegrees
 	std::vector<uint32_t> indeg(nodes.size());
 	for (size_t i = 0; i < nodes.size(); ++i) indeg[i] = nodes[i].indegree;
@@ -1871,11 +1827,9 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 	std::unordered_set<uint64_t> scratchTransitioned;
 	std::unordered_set<uint64_t> scratchFallback;
 	std::vector<ResourceTransition> scratchTransitions;
-	const bool enableQueueSchedulingLogging = rg.m_getQueueSchedulingEnableLogging ? rg.m_getQueueSchedulingEnableLogging() : false;
 	const double autoGraphicsBias = rg.m_getQueueSchedulingAutoGraphicsBias ? static_cast<double>(rg.m_getQueueSchedulingAutoGraphicsBias()) : 2.5;
 	const double asyncOverlapBonus = rg.m_getQueueSchedulingAsyncOverlapBonus ? static_cast<double>(rg.m_getQueueSchedulingAsyncOverlapBonus()) : 3.0;
 	const double crossQueueHandoffPenalty = rg.m_getQueueSchedulingCrossQueueHandoffPenalty ? static_cast<double>(rg.m_getQueueSchedulingCrossQueueHandoffPenalty()) : 2.0;
-	std::vector<QueueSchedulingDiagnostics> queueDiagnostics(queueCount);
 	auto queueKindName = [&rg](size_t queueIndex) -> const char* {
 		if (queueIndex >= rg.m_queueRegistry.SlotCount()) {
 			return "unknown";
@@ -1959,9 +1913,7 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 				if (nodeQueueSlot >= queueCount) {
 					continue;
 				}
-				queueDiagnostics[nodeQueueSlot].candidateChecks++;
 				if (nodeQueueSlot >= rg.m_activeQueueSlotsThisFrame.size() || !rg.m_activeQueueSlotsThisFrame[nodeQueueSlot]) {
-					queueDiagnostics[nodeQueueSlot].rejectedInactive++;
 					continue;
 				}
 
@@ -1980,7 +1932,6 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 					}
 				}
 				if (hasCrossQueuePredInBatch) {
-					queueDiagnostics[nodeQueueSlot].rejectedCrossQueuePred++;
 					continue;
 				}
 
@@ -1990,9 +1941,11 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 					currentBatch.passBatchTrackers,
 					currentBatch.internallyTransitionedResources,
 					currentBatch.allResources,
-					otherQueueUAVsByQueue[nodeQueueSlot]))
+					otherQueueUAVsByQueue[nodeQueueSlot],
+					passes[n.passIndex].name,
+					currentBatchIndex,
+					nodeQueueSlot))
 				{
-					queueDiagnostics[nodeQueueSlot].rejectedBatchNeeded++;
 					continue;
 				}
 
@@ -2088,9 +2041,6 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 				if (n.passIndex < rg.m_assignedQueueSlotsByFramePass.size()) {
 					rg.m_assignedQueueSlotsByFramePass[n.passIndex] = *n.assignedQueueSlot;
 				}
-				if (fallbackSlot < queueDiagnostics.size()) {
-					queueDiagnostics[fallbackSlot].assignedPasses++;
-				}
 				CommitPassToBatch(
 					rg, passes[n.passIndex], n,
 					currentBatchIndex, currentBatch,
@@ -2127,10 +2077,6 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 		if (chosen.passIndex < rg.m_assignedQueueSlotsByFramePass.size()) {
 			rg.m_assignedQueueSlotsByFramePass[chosen.passIndex] = bestQueueSlot;
 		}
-		if (bestQueueSlot < queueDiagnostics.size()) {
-			queueDiagnostics[bestQueueSlot].assignedPasses++;
-		}
-
 		CommitPassToBatch(
 			rg, passes[chosen.passIndex], chosen,
 			currentBatchIndex, currentBatch,
@@ -2169,22 +2115,6 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 	}
 	if (hasAnyQueuedPasses) {
 		rg.batches.push_back(std::move(currentBatch));
-	}
-
-	if (enableQueueSchedulingLogging) {
-		for (size_t queueIndex = 0; queueIndex < queueDiagnostics.size(); ++queueIndex) {
-			const auto& d = queueDiagnostics[queueIndex];
-			spdlog::info(
-				"RG queue scheduler [slot={} kind={} active={}]: candidateChecks={} assignedPasses={} rejectedInactive={} rejectedCrossQueuePred={} rejectedBatchNeeded={}",
-				queueIndex,
-				queueKindName(queueIndex),
-				(queueIndex < rg.m_activeQueueSlotsThisFrame.size() ? int(rg.m_activeQueueSlotsThisFrame[queueIndex]) : 0),
-				d.candidateChecks,
-				d.assignedPasses,
-				d.rejectedInactive,
-				d.rejectedCrossQueuePred,
-				d.rejectedBatchNeeded);
-		}
 	}
 
 	// Coalesce redundant waits: for each (dstQueue, srcQueue) pair in a batch,
@@ -2345,14 +2275,14 @@ void RenderGraph::AddTransition(
 		if (firstUseIsWrite || firstUseIsCommon) { 
 			const uint64_t id = resource.GetGlobalResourceID();
 			auto itSig = aliasPlacementSignatureByID.find(id);
-			spdlog::info(
-				"RG alias activate: id={} name='{}' signature={} accessAfter={} layoutAfter={} syncAfter={} discard=1",
-				id,
-				pRes ? pRes->GetName() : std::string("<null>"),
-				itSig != aliasPlacementSignatureByID.end() ? itSig->second : 0ull,
-				static_cast<uint32_t>(r.state.access),
-				static_cast<uint32_t>(r.state.layout),
-				static_cast<uint32_t>(r.state.sync));
+			//spdlog::info(
+			//	"RG alias activate: id={} name='{}' signature={} accessAfter={} layoutAfter={} syncAfter={} discard=1",
+			//	id,
+			//	pRes ? pRes->GetName() : std::string("<null>"),
+			//	itSig != aliasPlacementSignatureByID.end() ? itSig->second : 0ull,
+			//	static_cast<uint32_t>(r.state.access),
+			//	static_cast<uint32_t>(r.state.layout),
+			//	static_cast<uint32_t>(r.state.sync));
 			transitions.emplace_back(
 				pRes,
 				r.resourceHandleAndRange.range,
@@ -2617,6 +2547,7 @@ void RenderGraph::ShutdownOwnedState() {
 	aliasMaterializeOptionsByID.clear();
 	aliasPlacementSignatureByID.clear();
 	aliasPlacementRangesByID.clear();
+	schedulingPlacementRangesByID.clear();
 	aliasPlacementPoolByID.clear();
 	aliasActivationPending.clear();
 	persistentAliasPools.clear();
@@ -4251,7 +4182,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			}
 
 			const uint64_t id = handle.GetGlobalResourceID();
-			for (uint64_t rid : m_aliasingSubsystem.GetSchedulingEquivalentIDs(id, aliasPlacementRangesByID)) {
+			for (uint64_t rid : m_aliasingSubsystem.GetSchedulingEquivalentIDs(id, schedulingPlacementRangesByID)) {
 				auto it = m_lastProducerByResourceAcrossFrames.find(rid);
 				if (it != m_lastProducerByResourceAcrossFrames.end()) {
 					markCrossFrameWait(passQueueSlot, it->second.queueSlot, it->second.fenceValue);
@@ -4687,7 +4618,7 @@ std::tuple<int, int, int> RenderGraph::GetBatchesToWaitOn(
 
 	auto processResource = [&](ResourceRegistry::RegistryHandle const& res) {
 		uint64_t id = res.GetGlobalResourceID();
-		for (auto rid : m_aliasingSubsystem.GetSchedulingEquivalentIDs(id, aliasPlacementRangesByID)) {
+		for (auto rid : m_aliasingSubsystem.GetSchedulingEquivalentIDs(id, schedulingPlacementRangesByID)) {
 			auto itT = transitionHistory.find(rid);
 			if (itT != transitionHistory.end())
 				latestTransition = std::max(latestTransition, (int)itT->second);
@@ -4702,7 +4633,7 @@ std::tuple<int, int, int> RenderGraph::GetBatchesToWaitOn(
 		processResource(req.resourceHandleAndRange.resource);
 
 	for (auto& transitionID : resourcesTransitionedThisPass) { // We only need to wait on the latest usage for resources that will be transitioned in this batch
-		for (auto rid : m_aliasingSubsystem.GetSchedulingEquivalentIDs(transitionID, aliasPlacementRangesByID)) {
+		for (auto rid : m_aliasingSubsystem.GetSchedulingEquivalentIDs(transitionID, schedulingPlacementRangesByID)) {
 			if (usageHistory.contains(rid)) {
 				latestUsage = std::max(latestUsage, (int)usageHistory.at(rid));
 			}
@@ -4723,7 +4654,7 @@ std::tuple<int, int, int> RenderGraph::GetBatchesToWaitOn(
 
 	auto processResource = [&](ResourceRegistry::RegistryHandle const& res) {
 		uint64_t id = res.GetGlobalResourceID();
-		for (auto rid : m_aliasingSubsystem.GetSchedulingEquivalentIDs(id, aliasPlacementRangesByID)) {
+		for (auto rid : m_aliasingSubsystem.GetSchedulingEquivalentIDs(id, schedulingPlacementRangesByID)) {
 			auto itT = transitionHistory.find(rid);
 			if (itT != transitionHistory.end())
 				latestTransition = std::max(latestTransition, (int)itT->second);
@@ -4738,7 +4669,7 @@ std::tuple<int, int, int> RenderGraph::GetBatchesToWaitOn(
 		processResource(req.resourceHandleAndRange.resource);
 
 	for (auto& transitionID : resourcesTransitionedThisPass) { // We only need to wait on the latest usage for resources that will be transitioned in this batch
-		for (auto rid : m_aliasingSubsystem.GetSchedulingEquivalentIDs(transitionID, aliasPlacementRangesByID)) {
+		for (auto rid : m_aliasingSubsystem.GetSchedulingEquivalentIDs(transitionID, schedulingPlacementRangesByID)) {
 			if (usageHistory.contains(rid)) {
 				latestUsage = std::max(latestUsage, (int)usageHistory.at(rid));
 			}
@@ -4759,7 +4690,7 @@ std::tuple<int, int, int> RenderGraph::GetBatchesToWaitOn(
 
 	auto processResource = [&](ResourceRegistry::RegistryHandle const& res) {
 		uint64_t id = res.GetGlobalResourceID();
-		for (auto rid : m_aliasingSubsystem.GetSchedulingEquivalentIDs(id, aliasPlacementRangesByID)) {
+		for (auto rid : m_aliasingSubsystem.GetSchedulingEquivalentIDs(id, schedulingPlacementRangesByID)) {
 			auto itT = transitionHistory.find(rid);
 			if (itT != transitionHistory.end())
 				latestTransition = std::max(latestTransition, (int)itT->second);
@@ -4774,7 +4705,7 @@ std::tuple<int, int, int> RenderGraph::GetBatchesToWaitOn(
 		processResource(req.resourceHandleAndRange.resource);
 
 	for (auto& transitionID : resourcesTransitionedThisPass) {
-		for (auto rid : m_aliasingSubsystem.GetSchedulingEquivalentIDs(transitionID, aliasPlacementRangesByID)) {
+		for (auto rid : m_aliasingSubsystem.GetSchedulingEquivalentIDs(transitionID, schedulingPlacementRangesByID)) {
 			if (usageHistory.contains(rid)) {
 				latestUsage = std::max(latestUsage, (int)usageHistory.at(rid));
 			}
@@ -7046,10 +6977,13 @@ bool RenderGraph::IsNewBatchNeeded(
 	const std::unordered_map<uint64_t, SymbolicTracker*>& passBatchTrackers,
 	const std::vector<uint64_t>& currentBatchInternallyTransitionedResources,
 	const std::vector<uint64_t>& currentBatchAllResources,
-	const std::vector<uint64_t>& otherQueueUAVs)
+	const std::vector<uint64_t>& otherQueueUAVs,
+	std::string_view candidatePassName,
+	unsigned int currentBatchIndex,
+	size_t candidateQueueSlot)
 {
 	auto overlapsAliasedResourceInBatch = [&](uint64_t resourceID) {
-		for (uint64_t equivalentID : m_aliasingSubsystem.GetSchedulingEquivalentIDs(resourceID, aliasPlacementRangesByID)) {
+		for (uint64_t equivalentID : m_aliasingSubsystem.GetSchedulingEquivalentIDs(resourceID, schedulingPlacementRangesByID)) {
 			if (equivalentID == resourceID) {
 				continue;
 			}
@@ -7061,7 +6995,7 @@ bool RenderGraph::IsNewBatchNeeded(
 	};
 
 	auto overlapsAliasedTransitionInBatch = [&](uint64_t resourceID) {
-		for (uint64_t equivalentID : m_aliasingSubsystem.GetSchedulingEquivalentIDs(resourceID, aliasPlacementRangesByID)) {
+		for (uint64_t equivalentID : m_aliasingSubsystem.GetSchedulingEquivalentIDs(resourceID, schedulingPlacementRangesByID)) {
 			if (equivalentID == resourceID) {
 				continue;
 			}
@@ -7092,6 +7026,14 @@ bool RenderGraph::IsNewBatchNeeded(
 
 		uint64_t id = r.resourceHandleAndRange.resource.GetGlobalResourceID();
 
+		// Alias activations are emitted in BeforePasses of the consuming batch.
+		// Only reject same-batch merging when that activation would clobber an
+		// aliased-equivalent resource that is already live in the batch.
+		if (aliasActivationPending.find(id) != aliasActivationPending.end()
+			&& (overlapsAliasedResourceInBatch(id) || overlapsAliasedTransitionInBatch(id))) {
+			return true;
+		}
+
 		// If this resource is internally modified in the current batch, we need a new one
 		if (std::binary_search(currentBatchInternallyTransitionedResources.begin(), currentBatchInternallyTransitionedResources.end(), id)) {
 			return true;
@@ -7105,8 +7047,9 @@ bool RenderGraph::IsNewBatchNeeded(
 		// Changing state?
 		auto it = passBatchTrackers.find(id);
 		if (it != passBatchTrackers.end()) {
-			if (it->second->WouldModify(r.resourceHandleAndRange.range, wantState))
+			if (it->second->WouldModify(r.resourceHandleAndRange.range, wantState)) {
 				return true;
+			}
 		}
 		// first-use in this batch never forces a split.
 
@@ -7122,11 +7065,13 @@ bool RenderGraph::IsNewBatchNeeded(
 
 		// Cross-queue UAV hazard?
 		if ((r.state.access & rhi::ResourceAccessType::UnorderedAccess)
-			&& std::binary_search(otherQueueUAVs.begin(), otherQueueUAVs.end(), id))
+			&& std::binary_search(otherQueueUAVs.begin(), otherQueueUAVs.end(), id)) {
 			return true;
+		}
 		if (r.state.layout == rhi::ResourceLayout::UnorderedAccess
-			&& std::binary_search(otherQueueUAVs.begin(), otherQueueUAVs.end(), id))
+			&& std::binary_search(otherQueueUAVs.begin(), otherQueueUAVs.end(), id)) {
 			return true;
+		}
 	}
 	return false;
 }

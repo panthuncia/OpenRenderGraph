@@ -83,6 +83,7 @@ struct AliasPlacementRange {
 	size_t lastUse = 0;
 	size_t firstUsePassIndex = std::numeric_limits<size_t>::max();
 	size_t lastUsePassIndex = std::numeric_limits<size_t>::max();
+	bool dedicatedBacking = false;
 };
 
 struct AliasSchedulingNode {

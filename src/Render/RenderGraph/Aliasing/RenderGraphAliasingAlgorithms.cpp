@@ -99,6 +99,12 @@ namespace {
 		boost::hash_combine(signature, poolGeneration);
 		return static_cast<uint64_t>(signature);
 	}
+
+	uint64_t BuildDedicatedSchedulingPoolID(uint64_t resourceID) {
+		size_t signature = static_cast<size_t>(0xded1ca7e5eed0001ull);
+		boost::hash_combine(signature, resourceID);
+		return static_cast<uint64_t>(signature);
+	}
 }
 
 void rg::alias::RenderGraphAliasingSubsystem::AutoAssignAliasingPools(RenderGraph& rg, const std::vector<AliasSchedulingNode>& nodes) const {
@@ -448,6 +454,7 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph
 	auto& resourcesByID = rg.resourcesByID;
 	auto& aliasPlacementPoolByID = rg.aliasPlacementPoolByID;
 	auto& aliasPlacementRangesByID = rg.aliasPlacementRangesByID;
+	auto& schedulingPlacementRangesByID = rg.schedulingPlacementRangesByID;
 	auto& aliasPlacementSignatureByID = rg.aliasPlacementSignatureByID;
 
 	const auto previousAliasPlacementPoolByID = aliasPlacementPoolByID;
@@ -455,6 +462,7 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph
 	aliasActivationPending.clear();
 	aliasPlacementPoolByID.clear();
 	aliasPlacementRangesByID.clear();
+	schedulingPlacementRangesByID.clear();
 	autoAliasPlannerStats.pooledIndependentBytes = 0;
 	autoAliasPlannerStats.pooledActualBytes = 0;
 	autoAliasPlannerStats.pooledSavedBytes = 0;
@@ -543,7 +551,17 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph
 		Kind kind = Kind::Texture;
 	};
 
+	struct DedicatedSchedulingCandidate {
+		uint64_t resourceID = 0;
+		uint64_t sizeBytes = 0;
+		size_t firstUse = std::numeric_limits<size_t>::max();
+		size_t firstUsePassIndex = std::numeric_limits<size_t>::max();
+		size_t lastUse = 0;
+		size_t lastUsePassIndex = std::numeric_limits<size_t>::max();
+	};
+
 	std::unordered_map<uint64_t, Candidate> candidates;
+	std::unordered_map<uint64_t, DedicatedSchedulingCandidate> dedicatedSchedulingCandidates;
 	auto device = DeviceManager::GetInstance().GetDevice();
 	auto getPassTypeName = [](RenderGraph::PassType passType) -> const char* {
 		switch (passType) {
@@ -573,6 +591,21 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph
 	for (size_t passIdx = 0; passIdx < m_framePasses.size(); ++passIdx) {
 		const size_t usageOrder = passTopoRank[passIdx];
 		const auto& any = m_framePasses[passIdx];
+		auto updateDedicatedSchedulingCandidate = [&](uint64_t resourceID, uint64_t sizeBytes) {
+			auto [it, inserted] = dedicatedSchedulingCandidates.try_emplace(resourceID);
+			(void)inserted;
+			auto& candidate = it->second;
+			candidate.resourceID = resourceID;
+			candidate.sizeBytes = sizeBytes;
+			if (usageOrder < candidate.firstUse) {
+				candidate.firstUse = usageOrder;
+				candidate.firstUsePassIndex = passIdx;
+			}
+			if (usageOrder >= candidate.lastUse) {
+				candidate.lastUse = usageOrder;
+				candidate.lastUsePassIndex = passIdx;
+			}
+		};
 		auto collectHandle = [&](const ResourceRegistry::RegistryHandle& handle, bool isWrite) {
 			if (handle.IsEphemeral()) {
 				return;
@@ -599,6 +632,13 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph
 				}
 
 				if (!poolID.has_value()) {
+					auto resourceDesc = BuildAliasBufferResourceDesc(
+						buffer->GetBufferSize(),
+						buffer->IsUnorderedAccessEnabled(),
+						buffer->GetAccessType());
+					rhi::ResourceAllocationInfo info{};
+					device.GetResourceAllocationInfo(&resourceDesc, 1, &info);
+					updateDedicatedSchedulingCandidate(resourceID, info.sizeInBytes);
 					return;
 				}
 
@@ -650,6 +690,10 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph
 			}
 
 			if (!poolID.has_value()) {
+				auto resourceDesc = BuildAliasTextureResourceDesc(desc);
+				rhi::ResourceAllocationInfo info{};
+				device.GetResourceAllocationInfo(&resourceDesc, 1, &info);
+				updateDedicatedSchedulingCandidate(resourceID, info.sizeInBytes);
 				return;
 			}
 
@@ -1321,6 +1365,7 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph
 				.firstUsePassIndex = c.firstUsePassIndex,
 				.lastUsePassIndex = c.lastUsePassIndex,
 			};
+			schedulingPlacementRangesByID[c.resourceID] = aliasPlacementRangesByID[c.resourceID];
 
 			if (aliasLoggingEnabled) {
 				auto itResName = resourcesByID.find(c.resourceID);
@@ -1391,6 +1436,23 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph
 		}
 
 		autoAliasPoolDebug.push_back(std::move(poolDebug));
+	}
+
+	for (const auto& [resourceID, candidate] : dedicatedSchedulingCandidates) {
+		if (aliasPlacementRangesByID.contains(resourceID)) {
+			continue;
+		}
+
+		schedulingPlacementRangesByID[resourceID] = AliasPlacementRange{
+			.poolID = BuildDedicatedSchedulingPoolID(resourceID),
+			.startByte = 0,
+			.endByte = candidate.sizeBytes,
+			.firstUse = candidate.firstUse,
+			.lastUse = candidate.lastUse,
+			.firstUsePassIndex = candidate.firstUsePassIndex,
+			.lastUsePassIndex = candidate.lastUsePassIndex,
+			.dedicatedBacking = true,
+		};
 	}
 
 	std::sort(autoAliasPoolDebug.begin(), autoAliasPoolDebug.end(), [](const AutoAliasPoolDebug& a, const AutoAliasPoolDebug& b) {

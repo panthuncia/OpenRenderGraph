@@ -728,6 +728,7 @@ private:
 	std::unordered_map<uint64_t, ResourceMaterializeOptions> aliasMaterializeOptionsByID;
 	std::unordered_map<uint64_t, uint64_t> aliasPlacementSignatureByID;
 	std::unordered_map<uint64_t, rg::alias::AliasPlacementRange> aliasPlacementRangesByID;
+	std::unordered_map<uint64_t, rg::alias::AliasPlacementRange> schedulingPlacementRangesByID;
 	std::unordered_map<uint64_t, uint64_t> aliasPlacementPoolByID;
 	std::unordered_set<uint64_t> aliasActivationPending;
 
@@ -827,7 +828,10 @@ private:
 		const std::unordered_map<uint64_t, SymbolicTracker*>& passBatchTrackers,
 		const std::vector<uint64_t>& currentBatchInternallyTransitionedResources,
 		const std::vector<uint64_t>& currentBatchAllResources,
-		const std::vector<uint64_t>& otherQueueUAVs);
+		const std::vector<uint64_t>& otherQueueUAVs,
+		std::string_view candidatePassName,
+		unsigned int currentBatchIndex,
+		size_t candidateQueueSlot);
 	
 
 	std::tuple<int, int, int> GetBatchesToWaitOn(const ComputePassAndResources& pass, 
