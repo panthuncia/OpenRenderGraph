@@ -1370,6 +1370,11 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph
 				}
 			}
 			aliasPlacementSignatureByID[c.resourceID] = newSignature;
+			// Aliased resources need a discard-style activation on first use every frame,
+			// not only when the backing was rematerialized. Otherwise a steady-state
+			// handoff between overlapping resources can reuse heap memory without an
+			// activation barrier.
+			aliasActivationPending.insert(c.resourceID);
 		}
 
 		for (size_t i = 0; i < poolDebug.ranges.size(); ++i) {
