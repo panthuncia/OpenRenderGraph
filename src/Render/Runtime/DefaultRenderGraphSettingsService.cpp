@@ -59,6 +59,18 @@ public:
         return GetOpenRenderGraphSettings().queueSchedulingUavPressureWeight;
     }
 
+    float GetQueueSchedulingAutoGraphicsBias() const override {
+        return GetOpenRenderGraphSettings().queueSchedulingAutoGraphicsBias;
+    }
+
+    float GetQueueSchedulingAsyncOverlapBonus() const override {
+        return GetOpenRenderGraphSettings().queueSchedulingAsyncOverlapBonus;
+    }
+
+    float GetQueueSchedulingCrossQueueHandoffPenalty() const override {
+        return GetOpenRenderGraphSettings().queueSchedulingCrossQueueHandoffPenalty;
+    }
+
     uint32_t GetAutoAliasPoolRetireIdleFrames() const override {
         return GetOpenRenderGraphSettings().autoAliasPoolRetireIdleFrames;
     }

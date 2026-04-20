@@ -27,6 +27,7 @@ struct CopyPassParameters {
 	std::vector<ResourceRequirement> staticResourceRequirements;
 	std::vector<ResourceRequirement> frameResourceRequirements;
 	QueueKind preferredQueueKind = QueueKind::Copy;
+	QueueAssignmentPolicy queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
 	std::optional<QueueSlotIndex> pinnedQueueSlot; // Target a specific queue slot instead of using preferredQueueKind
 };
 

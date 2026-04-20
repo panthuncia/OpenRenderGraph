@@ -22,6 +22,9 @@ public:
     virtual float GetQueueSchedulingMinPenalty() const = 0;
     virtual float GetQueueSchedulingResourcePressureWeight() const = 0;
     virtual float GetQueueSchedulingUavPressureWeight() const = 0;
+    virtual float GetQueueSchedulingAutoGraphicsBias() const = 0;
+    virtual float GetQueueSchedulingAsyncOverlapBonus() const = 0;
+    virtual float GetQueueSchedulingCrossQueueHandoffPenalty() const = 0;
     virtual uint32_t GetAutoAliasPoolRetireIdleFrames() const = 0;
     virtual float GetAutoAliasPoolGrowthHeadroom() const = 0;
     virtual bool GetHeavyDebug() const = 0;

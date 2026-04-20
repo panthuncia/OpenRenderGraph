@@ -918,6 +918,7 @@ public:
             throw std::invalid_argument("Render passes only support the graphics queue");
         }
         m_preferredQueueKind = kind;
+        m_queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
         return *this;
     }
 
@@ -931,6 +932,17 @@ public:
             throw std::invalid_argument("Render passes only support the graphics queue");
         }
         m_preferredQueueKind = kind;
+        m_queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
+		return std::move(*this);
+	}
+
+	RenderPassBuilder& AutomaticQueueAssignment() & {
+		m_queueAssignmentPolicy = QueueAssignmentPolicy::Automatic;
+		return *this;
+	}
+
+	RenderPassBuilder AutomaticQueueAssignment() && {
+		m_queueAssignmentPolicy = QueueAssignmentPolicy::Automatic;
         return std::move(*this);
     }
 
@@ -1014,6 +1026,7 @@ private:
 
         params.isGeometryPass = m_isGeometryPass;
         params.preferredQueueKind = m_preferredQueueKind;
+        params.queueAssignmentPolicy = m_queueAssignmentPolicy;
         params.pinnedQueueSlot = m_pinnedQueueSlot;
         params.identifierSet = _declaredIds;
         params.staticResourceRequirements = GatherResourceRequirements();
@@ -1029,6 +1042,7 @@ private:
         resolverSnapshots_.clear();
         m_isGeometryPass = false;
 		m_preferredQueueKind = QueueKind::Graphics;
+		m_queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
         m_pinnedQueueSlot = std::nullopt;
 	}
 
@@ -1244,6 +1258,7 @@ private:
     bool built_ = false;
     bool m_isGeometryPass = false;
 	QueueKind m_preferredQueueKind = QueueKind::Graphics;
+    QueueAssignmentPolicy m_queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
     std::optional<QueueSlotIndex> m_pinnedQueueSlot;
     std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> _declaredIds;
     std::vector<ResolverSnapshot> resolverSnapshots_;
@@ -1377,6 +1392,7 @@ public:
                         throw std::invalid_argument("Compute passes only support graphics or compute queues");
                 }
                 m_preferredQueueKind = kind;
+            m_queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
                 return *this;
         }
 
@@ -1385,6 +1401,17 @@ public:
                         throw std::invalid_argument("Compute passes only support graphics or compute queues");
                 }
                 m_preferredQueueKind = kind;
+            m_queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
+    				return std::move(*this);
+    		}
+
+    		ComputePassBuilder& AutomaticQueueAssignment() & {
+    				m_queueAssignmentPolicy = QueueAssignmentPolicy::Automatic;
+    				return *this;
+    		}
+
+    		ComputePassBuilder AutomaticQueueAssignment() && {
+    				m_queueAssignmentPolicy = QueueAssignmentPolicy::Automatic;
                 return std::move(*this);
         }
 
@@ -1509,6 +1536,7 @@ private:
 
         params.identifierSet = _declaredIds;
         params.preferredQueueKind = m_preferredQueueKind;
+        params.queueAssignmentPolicy = m_queueAssignmentPolicy;
         params.pinnedQueueSlot = m_pinnedQueueSlot;
         params.staticResourceRequirements = GatherResourceRequirements();
 
@@ -1522,6 +1550,7 @@ private:
         _declaredIds.clear();
         resolverSnapshots_.clear();
         m_preferredQueueKind = QueueKind::Compute;
+		m_queueAssignmentPolicy = QueueAssignmentPolicy::Automatic;
         m_pinnedQueueSlot = std::nullopt;
     }
 
@@ -1648,6 +1677,7 @@ private:
     std::shared_ptr<ComputePass> pass;
     bool built_ = false;
 	QueueKind m_preferredQueueKind = QueueKind::Compute;
+    QueueAssignmentPolicy m_queueAssignmentPolicy = QueueAssignmentPolicy::Automatic;
     std::optional<QueueSlotIndex> m_pinnedQueueSlot;
     std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> _declaredIds;
     std::vector<ResolverSnapshot> resolverSnapshots_;
@@ -1736,6 +1766,7 @@ public:
             throw std::invalid_argument("Copy passes only support graphics or copy queues");
         }
         m_preferredQueueKind = kind;
+        m_queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
         return *this;
     }
 
@@ -1744,6 +1775,17 @@ public:
             throw std::invalid_argument("Copy passes only support graphics or copy queues");
         }
         m_preferredQueueKind = kind;
+        m_queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
+		return std::move(*this);
+	}
+
+	CopyPassBuilder& AutomaticQueueAssignment() & {
+		m_queueAssignmentPolicy = QueueAssignmentPolicy::Automatic;
+		return *this;
+	}
+
+	CopyPassBuilder AutomaticQueueAssignment() && {
+		m_queueAssignmentPolicy = QueueAssignmentPolicy::Automatic;
         return std::move(*this);
     }
 
@@ -1839,6 +1881,7 @@ private:
 
         params.identifierSet = _declaredIds;
         params.preferredQueueKind = m_preferredQueueKind;
+        params.queueAssignmentPolicy = m_queueAssignmentPolicy;
         params.pinnedQueueSlot = m_pinnedQueueSlot;
         params.staticResourceRequirements = GatherResourceRequirements();
 
@@ -1852,6 +1895,7 @@ private:
         _declaredIds.clear();
         resolverSnapshots_.clear();
         m_preferredQueueKind = QueueKind::Copy;
+		m_queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
         m_pinnedQueueSlot = std::nullopt;
     }
 
@@ -1914,6 +1958,7 @@ private:
     std::shared_ptr<CopyPass> pass;
     bool built_ = false;
     QueueKind m_preferredQueueKind = QueueKind::Copy;
+	QueueAssignmentPolicy m_queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
     std::optional<QueueSlotIndex> m_pinnedQueueSlot;
     std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> _declaredIds;
     std::vector<ResolverSnapshot> resolverSnapshots_;

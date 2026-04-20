@@ -110,6 +110,18 @@ namespace {
 		}
 	}
 
+	constexpr QueueAssignmentPolicy DefaultQueueAssignmentPolicy(RenderGraph::PassType type) noexcept {
+		switch (type) {
+		case RenderGraph::PassType::Compute:
+			return QueueAssignmentPolicy::Automatic;
+		case RenderGraph::PassType::Render:
+		case RenderGraph::PassType::Copy:
+		case RenderGraph::PassType::Unknown:
+		default:
+			return QueueAssignmentPolicy::ForcePreferred;
+		}
+	}
+
 	constexpr bool IsPreferredQueueKindCompatible(RenderGraph::PassType type, QueueKind kind) noexcept {
 		switch (type) {
 		case RenderGraph::PassType::Render:
@@ -129,6 +141,18 @@ namespace {
 			throw std::runtime_error("External pass '" + desc.name + "' requested an incompatible queue kind");
 		}
 		return preferredQueueKind;
+	}
+
+	QueueAssignmentPolicy ResolveExternalQueueAssignmentPolicy(const RenderGraph::ExternalPassDesc& desc) {
+		if (desc.queueAssignmentPolicy.has_value()) {
+			return *desc.queueAssignmentPolicy;
+		}
+
+		if (desc.preferredQueueKind.has_value()) {
+			return QueueAssignmentPolicy::ForcePreferred;
+		}
+
+		return DefaultQueueAssignmentPolicy(desc.type);
 	}
 
 	// Insert into a sorted vector, maintaining sorted order. No-op if already present.
@@ -317,6 +341,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 			par.resources.autoDescriptorUnorderedAccessViews = b.params.autoDescriptorUnorderedAccessViews;
 			par.resources.isGeometryPass = b.params.isGeometryPass;
 			par.resources.preferredQueueKind = ResolveExternalPreferredQueueKind(d);
+			par.resources.queueAssignmentPolicy = ResolveExternalQueueAssignmentPolicy(d);
 			par.resources.pinnedQueueSlot = d.pinnedQueueSlot;
 			if (materializeReferencedResources) {
 				if (traceLifecycle) {
@@ -382,6 +407,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 			par.resources.autoDescriptorConstantBuffers = b.params.autoDescriptorConstantBuffers;
 			par.resources.autoDescriptorUnorderedAccessViews = b.params.autoDescriptorUnorderedAccessViews;
 			par.resources.preferredQueueKind = ResolveExternalPreferredQueueKind(d);
+			par.resources.queueAssignmentPolicy = ResolveExternalQueueAssignmentPolicy(d);
 			par.resources.pinnedQueueSlot = d.pinnedQueueSlot;
 			if (materializeReferencedResources) {
 				if (traceLifecycle) {
@@ -444,6 +470,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 			par.resources.internalTransitions = b.params.internalTransitions;
 			par.resources.identifierSet = b.DeclaredResourceIds();
 			par.resources.preferredQueueKind = ResolveExternalPreferredQueueKind(d);
+			par.resources.queueAssignmentPolicy = ResolveExternalQueueAssignmentPolicy(d);
 			par.resources.pinnedQueueSlot = d.pinnedQueueSlot;
 			if (materializeReferencedResources) {
 				if (traceLifecycle) {
@@ -914,10 +941,33 @@ std::vector<RenderGraph::Node> RenderGraph::BuildNodes(RenderGraph& rg, std::vec
 			return slots;
 		};
 
+		auto collectAutomaticSlotsForPassType = [&rg](PassType type) {
+			std::vector<size_t> slots;
+			const size_t slotCount = rg.m_queueRegistry.SlotCount();
+			slots.reserve(slotCount);
+			for (size_t slotIndex = 0; slotIndex < slotCount; ++slotIndex) {
+				const auto queueSlotIndex = static_cast<QueueSlotIndex>(static_cast<uint8_t>(slotIndex));
+				if (!rg.m_queueRegistry.IsAutoAssignable(queueSlotIndex)) {
+					continue;
+				}
+				const QueueKind kind = rg.m_queueRegistry.GetKind(queueSlotIndex);
+				if (IsPreferredQueueKindCompatible(type, kind)) {
+					slots.push_back(slotIndex);
+				}
+			}
+			return slots;
+		};
+
 		if (pr.type == PassType::Compute) {
 			const auto& pass = std::get<ComputePassAndResources>(pr.pass);
 			if (pass.resources.pinnedQueueSlot)
 				return std::vector<size_t>{ static_cast<size_t>(static_cast<uint8_t>(*pass.resources.pinnedQueueSlot)) };
+			if (pass.resources.queueAssignmentPolicy == QueueAssignmentPolicy::Automatic) {
+				auto slots = collectAutomaticSlotsForPassType(pr.type);
+				if (!slots.empty()) {
+					return slots;
+				}
+			}
 			return collectSlotsForKind(pass.resources.preferredQueueKind);
 		}
 
@@ -925,6 +975,12 @@ std::vector<RenderGraph::Node> RenderGraph::BuildNodes(RenderGraph& rg, std::vec
 			const auto& pass = std::get<RenderPassAndResources>(pr.pass);
 			if (pass.resources.pinnedQueueSlot)
 				return std::vector<size_t>{ static_cast<size_t>(static_cast<uint8_t>(*pass.resources.pinnedQueueSlot)) };
+			if (pass.resources.queueAssignmentPolicy == QueueAssignmentPolicy::Automatic) {
+				auto slots = collectAutomaticSlotsForPassType(pr.type);
+				if (!slots.empty()) {
+					return slots;
+				}
+			}
 			return collectSlotsForKind(pass.resources.preferredQueueKind);
 		}
 
@@ -932,6 +988,12 @@ std::vector<RenderGraph::Node> RenderGraph::BuildNodes(RenderGraph& rg, std::vec
 			const auto& pass = std::get<CopyPassAndResources>(pr.pass);
 			if (pass.resources.pinnedQueueSlot)
 				return std::vector<size_t>{ static_cast<size_t>(static_cast<uint8_t>(*pass.resources.pinnedQueueSlot)) };
+			if (pass.resources.queueAssignmentPolicy == QueueAssignmentPolicy::Automatic) {
+				auto slots = collectAutomaticSlotsForPassType(pr.type);
+				if (!slots.empty()) {
+					return slots;
+				}
+			}
 			return collectSlotsForKind(pass.resources.preferredQueueKind);
 		}
 
@@ -942,7 +1004,34 @@ std::vector<RenderGraph::Node> RenderGraph::BuildNodes(RenderGraph& rg, std::vec
 		Node n{};
 		n.passIndex = i;
 		n.compatibleQueueSlots = resolveCompatibleQueueSlotsForPass(passes[i]);
-		n.queueSlot = n.compatibleQueueSlots.empty() ? QueueIndex(QueueKind::Graphics) : n.compatibleQueueSlots.front();
+		n.preferredQueueKind = DefaultPreferredQueueKind(passes[i].type);
+		n.queueAssignmentPolicy = DefaultQueueAssignmentPolicy(passes[i].type);
+		if (passes[i].type == PassType::Render) {
+			const auto& pass = std::get<RenderPassAndResources>(passes[i].pass);
+			n.preferredQueueKind = pass.resources.preferredQueueKind;
+			n.queueAssignmentPolicy = pass.resources.queueAssignmentPolicy;
+		}
+		else if (passes[i].type == PassType::Compute) {
+			const auto& pass = std::get<ComputePassAndResources>(passes[i].pass);
+			n.preferredQueueKind = pass.resources.preferredQueueKind;
+			n.queueAssignmentPolicy = pass.resources.queueAssignmentPolicy;
+		}
+		else if (passes[i].type == PassType::Copy) {
+			const auto& pass = std::get<CopyPassAndResources>(passes[i].pass);
+			n.preferredQueueKind = pass.resources.preferredQueueKind;
+			n.queueAssignmentPolicy = pass.resources.queueAssignmentPolicy;
+		}
+		n.queueSlot = QueueIndex(n.preferredQueueKind);
+		for (size_t slot : n.compatibleQueueSlots) {
+			if (slot < rg.m_queueRegistry.SlotCount()
+				&& rg.m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot))) == n.preferredQueueKind) {
+				n.queueSlot = slot;
+				break;
+			}
+		}
+		if (n.compatibleQueueSlots.empty()) {
+			n.compatibleQueueSlots.push_back(n.queueSlot);
+		}
 		n.assignedQueueSlot = n.queueSlot;
 		n.originalOrder = static_cast<uint32_t>(i);
 
@@ -1770,6 +1859,7 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 	unsigned int currentBatchIndex = 1; // Start at batch 1- batch 0 is reserved for inserting transitions before first batch
 
 	const size_t queueCount = rg.m_queueRegistry.SlotCount();
+	const size_t gfxSlot = QueueIndex(QueueKind::Graphics);
 
 	std::vector<std::unordered_set<uint64_t>> queueUAVs(queueCount);
 
@@ -1782,6 +1872,9 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 	std::unordered_set<uint64_t> scratchFallback;
 	std::vector<ResourceTransition> scratchTransitions;
 	const bool enableQueueSchedulingLogging = rg.m_getQueueSchedulingEnableLogging ? rg.m_getQueueSchedulingEnableLogging() : false;
+	const double autoGraphicsBias = rg.m_getQueueSchedulingAutoGraphicsBias ? static_cast<double>(rg.m_getQueueSchedulingAutoGraphicsBias()) : 2.5;
+	const double asyncOverlapBonus = rg.m_getQueueSchedulingAsyncOverlapBonus ? static_cast<double>(rg.m_getQueueSchedulingAsyncOverlapBonus()) : 3.0;
+	const double crossQueueHandoffPenalty = rg.m_getQueueSchedulingCrossQueueHandoffPenalty ? static_cast<double>(rg.m_getQueueSchedulingCrossQueueHandoffPenalty()) : 2.0;
 	std::vector<QueueSchedulingDiagnostics> queueDiagnostics(queueCount);
 	auto queueKindName = [&rg](size_t queueIndex) -> const char* {
 		if (queueIndex >= rg.m_queueRegistry.SlotCount()) {
@@ -1833,6 +1926,27 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 			std::sort(merged.begin(), merged.end());
 			merged.erase(std::unique(merged.begin(), merged.end()), merged.end());
 		}
+
+		auto nodeSupportsQueueKind = [&rg, queueCount](const Node& node, QueueKind kind) {
+			for (size_t slot : node.compatibleQueueSlots) {
+				if (slot >= queueCount) {
+					continue;
+				}
+				if (rg.m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot))) == kind) {
+					return true;
+				}
+			}
+			return false;
+		};
+
+		size_t readyGraphicsCapableCount = 0;
+		for (size_t ni : ready) {
+			if (nodeSupportsQueueKind(nodes[ni], QueueKind::Graphics)) {
+				++readyGraphicsCapableCount;
+			}
+		}
+
+		const bool batchHasGraphicsWork = gfxSlot < batchHasQueue.size() && batchHasQueue[gfxSlot] != 0;
 
 		for (int ri = 0; ri < (int)ready.size(); ++ri) {
 			size_t ni = ready[ri];
@@ -1898,6 +2012,44 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 
 				// Tie-break
 				score += 0.05 * double(n.criticality);
+
+				if (passes[n.passIndex].type == PassType::Compute
+					&& n.queueAssignmentPolicy == QueueAssignmentPolicy::Automatic) {
+					const QueueKind candidateKind = rg.m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(static_cast<uint8_t>(nodeQueueSlot)));
+					size_t predecessorCrossQueueCount = 0;
+					for (size_t pred : n.in) {
+						const size_t predSlot = nodes[pred].assignedQueueSlot.value_or(nodes[pred].queueSlot);
+						const QueueKind predKind = rg.m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(static_cast<uint8_t>(predSlot)));
+						if (predKind != candidateKind) {
+							++predecessorCrossQueueCount;
+						}
+					}
+
+					size_t successorCrossQueueCount = 0;
+					for (size_t succ : n.out) {
+						if (!nodeSupportsQueueKind(nodes[succ], candidateKind)) {
+							++successorCrossQueueCount;
+						}
+					}
+
+					score -= crossQueueHandoffPenalty * double(predecessorCrossQueueCount + successorCrossQueueCount);
+
+					if (candidateKind == QueueKind::Graphics) {
+						score += autoGraphicsBias;
+					}
+					else if (candidateKind == QueueKind::Compute) {
+						const bool candidateCanAlsoRunOnGraphics = nodeSupportsQueueKind(n, QueueKind::Graphics);
+						const size_t otherReadyGraphicsCandidates = readyGraphicsCapableCount > 0
+							? readyGraphicsCapableCount - (candidateCanAlsoRunOnGraphics ? 1u : 0u)
+							: 0u;
+						if (batchHasGraphicsWork || otherReadyGraphicsCandidates > 0) {
+							score += asyncOverlapBonus;
+						}
+						else {
+							score -= asyncOverlapBonus;
+						}
+					}
+				}
 
 				// Deterministic tie-break: prefer earlier original order slightly
 				score += 1e-6 * double(nodes.size() - n.originalOrder);
@@ -4964,6 +5116,15 @@ void RenderGraph::Setup() {
 	};
 	m_getQueueSchedulingUavPressureWeight = [this]() {
 		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetQueueSchedulingUavPressureWeight() : 0.5f;
+	};
+	m_getQueueSchedulingAutoGraphicsBias = [this]() {
+		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetQueueSchedulingAutoGraphicsBias() : 2.5f;
+	};
+	m_getQueueSchedulingAsyncOverlapBonus = [this]() {
+		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetQueueSchedulingAsyncOverlapBonus() : 3.0f;
+	};
+	m_getQueueSchedulingCrossQueueHandoffPenalty = [this]() {
+		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetQueueSchedulingCrossQueueHandoffPenalty() : 2.0f;
 	};
 	m_getAutoAliasPoolRetireIdleFrames = [this]() {
 		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetAutoAliasPoolRetireIdleFrames() : 120u;

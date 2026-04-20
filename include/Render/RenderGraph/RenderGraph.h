@@ -139,6 +139,7 @@ public:
 		std::optional<ExternalInsertPoint> where;
 		std::variant<std::monostate, std::shared_ptr<RenderPass>, std::shared_ptr<ComputePass>, std::shared_ptr<CopyPass>> pass;
 		std::optional<QueueKind> preferredQueueKind;
+		std::optional<QueueAssignmentPolicy> queueAssignmentPolicy;
 		std::optional<QueueSlotIndex> pinnedQueueSlot; // Target a specific queue slot, bypassing queue preference
 
 		// Optional: if true, the pass will be registered in Get*PassByName().
@@ -181,11 +182,23 @@ public:
 
 		ExternalPassDesc& PreferQueue(QueueKind queueKind) & {
 			preferredQueueKind = queueKind;
+			queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
 			return *this;
 		}
 
 		ExternalPassDesc PreferQueue(QueueKind queueKind) && {
 			preferredQueueKind = queueKind;
+			queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
+			return std::move(*this);
+		}
+
+		ExternalPassDesc& AutomaticQueueAssignment() & {
+			queueAssignmentPolicy = QueueAssignmentPolicy::Automatic;
+			return *this;
+		}
+
+		ExternalPassDesc AutomaticQueueAssignment() && {
+			queueAssignmentPolicy = QueueAssignmentPolicy::Automatic;
 			return std::move(*this);
 		}
 
@@ -665,6 +678,8 @@ private:
 	struct Node {
 		size_t   passIndex = 0;
 		size_t   queueSlot = 0; // Default/preferred queue slot for compatibility-preserving fallback
+		QueueKind preferredQueueKind = QueueKind::Graphics;
+		QueueAssignmentPolicy queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
 		std::vector<size_t> compatibleQueueSlots; // All legal queue slots for this pass
 		std::optional<size_t> assignedQueueSlot; // Final slot chosen during frame scheduling
 		uint32_t originalOrder = 0;
@@ -1019,6 +1034,9 @@ private:
 	std::function<float()> m_getQueueSchedulingMinPenalty;
 	std::function<float()> m_getQueueSchedulingResourcePressureWeight;
 	std::function<float()> m_getQueueSchedulingUavPressureWeight;
+	std::function<float()> m_getQueueSchedulingAutoGraphicsBias;
+	std::function<float()> m_getQueueSchedulingAsyncOverlapBonus;
+	std::function<float()> m_getQueueSchedulingCrossQueueHandoffPenalty;
 	std::function<uint32_t()> m_getAutoAliasPoolRetireIdleFrames;
 	std::function<float()> m_getAutoAliasPoolGrowthHeadroom;
 	std::function<void(std::string_view)> m_structuralMaterializeCheckpointCallback;

@@ -36,7 +36,7 @@ void StatisticsManager::RegisterPasses(const std::vector<std::string>& passNames
     m_stats.assign(m_numPasses, {});
     m_isGeometryPass.assign(m_numPasses, false);
     m_meshStatsEma.assign(m_numPasses, {});
-    m_passLastDataFrame.assign(m_numPasses, kNeverSeenFrame);
+    m_passLastExecutionFrame.assign(m_numPasses, kNeverSeenFrame);
     m_passNameToIndex.clear();
     for (unsigned i = 0; i < m_numPasses; ++i) {
         if (!m_passNames[i].empty()) {
@@ -83,7 +83,7 @@ unsigned StatisticsManager::RegisterPass(const std::string& passName, bool isGeo
     m_stats.emplace_back();
     m_isGeometryPass.push_back(isGeometryPass);
     m_meshStatsEma.emplace_back();
-    m_passLastDataFrame.push_back(kNeverSeenFrame);
+    m_passLastExecutionFrame.push_back(kNeverSeenFrame);
     return index;
 }
 
@@ -122,10 +122,9 @@ void StatisticsManager::RecordCpuTimeSample(unsigned passIndex, double milliseco
     }
     else {
         UpdateEma(passStats.cpuExecuteTimeEma, milliseconds);
-    }
-
-    if (passIndex < m_passLastDataFrame.size()) {
-        m_passLastDataFrame[passIndex] = m_frameSerial;
+        if (passIndex < m_passLastExecutionFrame.size()) {
+            m_passLastExecutionFrame[passIndex] = m_frameSerial;
+        }
     }
 }
 
@@ -136,15 +135,15 @@ void StatisticsManager::RebuildVisiblePassIndices(uint64_t maxStaleFrames, std::
     const bool includeNeverSeen = (maxStaleFrames == (std::numeric_limits<uint64_t>::max)());
 
     for (unsigned i = 0; i < m_passNames.size(); ++i) {
-        const uint64_t lastData = (i < m_passLastDataFrame.size()) ? m_passLastDataFrame[i] : kNeverSeenFrame;
-        if (lastData == kNeverSeenFrame) {
+        const uint64_t lastExecution = (i < m_passLastExecutionFrame.size()) ? m_passLastExecutionFrame[i] : kNeverSeenFrame;
+        if (lastExecution == kNeverSeenFrame) {
             if (includeNeverSeen) {
                 out.push_back(i);
             }
             continue;
         }
 
-        const uint64_t missingFrames = (m_frameSerial >= lastData) ? (m_frameSerial - lastData) : 0;
+        const uint64_t missingFrames = (m_frameSerial >= lastExecution) ? (m_frameSerial - lastExecution) : 0;
         if (missingFrames <= maxStaleFrames) {
             out.push_back(i);
         }
@@ -603,8 +602,8 @@ void StatisticsManager::OnFrameComplete(
             }
 
             UpdateEma(m_stats[pi].gpuTimeEma, ms);
-            if (pi < m_passLastDataFrame.size()) {
-                m_passLastDataFrame[pi] = m_frameSerial;
+            if (pi < m_passLastExecutionFrame.size()) {
+                m_passLastExecutionFrame[pi] = m_frameSerial;
             }
 
             if (!m_collectPipelineStatistics || !m_isGeometryPass[pi]) continue;
@@ -653,7 +652,7 @@ void StatisticsManager::ClearAll() {
     m_isGeometryPass.clear();
     m_meshStatsEma.clear();
     m_passNameToIndex.clear();
-    m_passLastDataFrame.clear();
+    m_passLastExecutionFrame.clear();
     m_visiblePassIndices.clear();
     m_recordedQueries.clear();
     m_pendingResolves.clear();

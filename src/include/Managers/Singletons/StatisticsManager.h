@@ -104,7 +104,7 @@ private:
 	uint64_t  m_frameSerial = 0;
 	static constexpr uint64_t kNeverSeenFrame = (std::numeric_limits<uint64_t>::max)();
 	uint64_t  m_defaultMaxStaleFrames = 240;
-	std::vector<uint64_t> m_passLastDataFrame;
+	std::vector<uint64_t> m_passLastExecutionFrame;
 	mutable std::vector<unsigned> m_visiblePassIndices;
 
 	void RebuildVisiblePassIndices(uint64_t maxStaleFrames, std::vector<unsigned>& out) const;

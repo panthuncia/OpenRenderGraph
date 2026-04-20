@@ -33,6 +33,7 @@ struct ComputePassParameters {
 	std::vector<ResourceRequirement> staticResourceRequirements; // Static resource requirements for the pass
 	std::vector<ResourceRequirement> frameResourceRequirements; // Resource requirements that may change each frame + static ones
 	QueueKind preferredQueueKind = QueueKind::Compute;
+	QueueAssignmentPolicy queueAssignmentPolicy = QueueAssignmentPolicy::Automatic;
 	std::optional<QueueSlotIndex> pinnedQueueSlot; // Target a specific queue slot instead of using preferredQueueKind
 };
 
