@@ -24,9 +24,14 @@ void StatisticsManager::Initialize() {
     m_numFramesInFlight = rg::runtime::GetOpenRenderGraphSettings().numFramesInFlight;
 	auto device = DeviceManager::GetInstance().GetDevice();
 	m_gpuTimestampFreq = device.GetTimestampCalibration(rhi::QueueKind::Graphics).ticksPerSecond;
+    m_getCollectPassStatistics = []() {
+        return rg::runtime::GetOpenRenderGraphSettings().collectPassStatistics;
+    };
     m_getCollectPipelineStatistics = []() {
         return rg::runtime::GetOpenRenderGraphSettings().collectPipelineStatistics;
     };
+    m_collectPassStatistics = m_getCollectPassStatistics();
+    m_collectPipelineStatistics = m_getCollectPipelineStatistics();
 }
 
 void StatisticsManager::RegisterPasses(const std::vector<std::string>& passNames) {
@@ -90,6 +95,10 @@ unsigned StatisticsManager::RegisterPass(const std::string& passName, bool isGeo
 void StatisticsManager::BeginFrame() {
     ++m_frameSerial;
 
+    if (m_getCollectPassStatistics) {
+        m_collectPassStatistics = m_getCollectPassStatistics();
+    }
+
     rg::runtime::MemoryBudgetStats memoryBudgetStats{};
     memoryBudgetStats.sampleFrameSerial = m_frameSerial;
     if (auto* allocator = DeviceManager::GetInstance().GetAllocator()) {
@@ -111,6 +120,10 @@ void StatisticsManager::RecordCpuExecuteTime(unsigned passIndex, double millisec
 }
 
 void StatisticsManager::RecordCpuTimeSample(unsigned passIndex, double milliseconds, bool isUpdate) {
+    if (!m_collectPassStatistics) {
+        return;
+    }
+
     std::scoped_lock lock(m_cpuStatsMutex);
     if (passIndex >= m_stats.size()) {
         return;
@@ -151,11 +164,21 @@ void StatisticsManager::RebuildVisiblePassIndices(uint64_t maxStaleFrames, std::
 }
 
 const std::vector<unsigned>& StatisticsManager::GetVisiblePassIndices() const {
+    if (m_getCollectPassStatistics && !m_getCollectPassStatistics()) {
+        m_visiblePassIndices.clear();
+        return m_visiblePassIndices;
+    }
+
     RebuildVisiblePassIndices(m_defaultMaxStaleFrames, m_visiblePassIndices);
     return m_visiblePassIndices;
 }
 
 const std::vector<unsigned>& StatisticsManager::GetVisiblePassIndices(uint64_t maxStaleFrames) const {
+    if (m_getCollectPassStatistics && !m_getCollectPassStatistics()) {
+        m_visiblePassIndices.clear();
+        return m_visiblePassIndices;
+    }
+
     RebuildVisiblePassIndices(maxStaleFrames, m_visiblePassIndices);
     return m_visiblePassIndices;
 }
@@ -199,8 +222,15 @@ void StatisticsManager::EnsureQueueBuffers(rhi::QueueKind queueKind) {
 
 void StatisticsManager::SetupQueryHeap() {
     auto device = DeviceManager::GetInstance().GetDevice();
+    if (m_getCollectPassStatistics) {
+        m_collectPassStatistics = m_getCollectPassStatistics();
+    }
     if (m_getCollectPipelineStatistics) {
         m_collectPipelineStatistics = m_getCollectPipelineStatistics();
+    }
+
+    if (!m_collectPassStatistics) {
+        return;
     }
 
     if (m_numPasses == 0) {
@@ -282,6 +312,7 @@ void StatisticsManager::BeginQuery(
     rhi::Queue& queue,
     rhi::CommandList& cmd)
 {
+    if (!m_collectPassStatistics) return;
     if (!m_timestampPool || passIndex >= m_numPasses || passIndex >= m_queryPoolPassCapacity) return;
 
     auto queueKind = queue.GetKind();
@@ -308,6 +339,7 @@ void StatisticsManager::EndQuery(
     rhi::Queue& queue,
     rhi::CommandList& cmd)
 {
+    if (!m_collectPassStatistics) return;
     if (!m_timestampPool || passIndex >= m_numPasses || passIndex >= m_queryPoolPassCapacity) return;
 
     auto queueKind = queue.GetKind();
@@ -414,6 +446,7 @@ void StatisticsManager::BeginQuery(
     rhi::CommandList& cmd,
     QueryRecordingContext& ctx)
 {
+    if (!m_collectPassStatistics) return;
     if (!m_timestampPool || passIndex >= m_numPasses || passIndex >= m_queryPoolPassCapacity) return;
 
     auto queueKind = queue.GetKind();
@@ -438,6 +471,7 @@ void StatisticsManager::EndQuery(
     rhi::CommandList& cmd,
     QueryRecordingContext& ctx)
 {
+    if (!m_collectPassStatistics) return;
     if (!m_timestampPool || passIndex >= m_numPasses || passIndex >= m_queryPoolPassCapacity) return;
 
     auto queueKind = queue.GetKind();
@@ -540,6 +574,10 @@ void StatisticsManager::OnFrameComplete(
     rhi::Queue& queue)
 {
 	if (!m_timestampPool || m_timestampQueryInfo.elementSize == 0) return;
+
+    if (m_getCollectPassStatistics) {
+        m_collectPassStatistics = m_getCollectPassStatistics();
+    }
 
     if (m_getCollectPipelineStatistics) {
         m_collectPipelineStatistics = m_getCollectPipelineStatistics();
@@ -660,5 +698,9 @@ void StatisticsManager::ClearAll() {
     m_queryPoolPassCapacity = 0;
     m_unnamedPassCounter = 0;
     m_frameSerial = 0;
+    m_collectPassStatistics = true;
+    m_getCollectPassStatistics = {};
+    m_collectPipelineStatistics = false;
+    m_getCollectPipelineStatistics = {};
     m_memoryBudgetStats = {};
 }

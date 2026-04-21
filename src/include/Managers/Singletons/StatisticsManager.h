@@ -81,6 +81,8 @@ private:
 	void EnsureQueueBuffers(rhi::QueueKind queueKind);
 	void RecordCpuTimeSample(unsigned passIndex, double milliseconds, bool isUpdate);
 
+	bool m_collectPassStatistics = true;
+	std::function<bool()> m_getCollectPassStatistics;
 	bool m_collectPipelineStatistics = false;
 	std::function<bool()> m_getCollectPipelineStatistics;
 	std::mutex m_cpuStatsMutex;

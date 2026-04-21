@@ -8,6 +8,7 @@ namespace rg::runtime {
 
 struct OpenRenderGraphSettings {
     uint8_t numFramesInFlight = 3;
+    bool collectPassStatistics = true;
     bool collectPipelineStatistics = false;
 
     bool useAsyncCompute = true;

@@ -13,6 +13,7 @@
 #include <array>
 #include <spdlog/spdlog.h>
 #include <rhi.h>
+#include <tracy/Tracy.hpp>
 
 #include "RenderPasses/Base/RenderPass.h"
 #include "RenderPasses/Base/ComputePass.h"
@@ -675,12 +676,131 @@ private:
 	
 	enum class AccessKind : uint8_t { Read, Write };
 
+	struct DenseEquivalentResourceSummary {
+		uint64_t resourceID = 0;
+		size_t resourceIndex = 0;
+		std::vector<size_t> equivalentResourceIndices;
+	};
+
+	struct DenseRequirementSummary {
+		ResourceRegistry::RegistryHandle resource;
+		uint64_t resourceID = 0;
+		size_t resourceIndex = 0;
+		RangeSpec range{};
+		ResourceState state{};
+		bool isUAV = false;
+		std::vector<size_t> equivalentResourceIndices;
+	};
+
+	struct FramePassSchedulingSummary {
+		std::vector<DenseRequirementSummary> requirements;
+		std::vector<DenseEquivalentResourceSummary> internalTransitions;
+		std::vector<size_t> requiredResourceIndices;
+		std::vector<size_t> touchedResourceIndices;
+		std::vector<size_t> uavResourceIndices;
+	};
+
+	struct FrameResourceEventSummary {
+		unsigned int latestBatch = 0;
+		unsigned int previousBatch = 0;
+		uint64_t latestQueueMask = 0;
+		uint64_t previousQueueMask = 0;
+	};
+
+	struct BatchBuildState {
+		size_t queueCount = 0;
+		size_t resourceCount = 0;
+		uint32_t nodeEpoch = 1;
+		uint32_t resourceEpoch = 1;
+		uint32_t internalTransitionEpoch = 1;
+		uint32_t otherQueueUAVEpoch = 1;
+		std::vector<uint32_t> nodeEpochByIndex;
+		std::vector<uint32_t> resourceEpochByIndex;
+		std::vector<uint32_t> internalTransitionEpochByIndex;
+		std::vector<uint32_t> otherQueueUAVEpochByOffset;
+
+		void Initialize(size_t nodeCount, size_t inQueueCount, size_t inResourceCount) {
+			queueCount = inQueueCount;
+			resourceCount = inResourceCount;
+			nodeEpoch = 1;
+			resourceEpoch = 1;
+			internalTransitionEpoch = 1;
+			otherQueueUAVEpoch = 1;
+			nodeEpochByIndex.assign(nodeCount, 0);
+			resourceEpochByIndex.assign(resourceCount, 0);
+			internalTransitionEpochByIndex.assign(resourceCount, 0);
+			otherQueueUAVEpochByOffset.assign(queueCount * resourceCount, 0);
+		}
+
+		void ResetForNewBatch() {
+			AdvanceEpoch(nodeEpochByIndex, nodeEpoch);
+			AdvanceEpoch(resourceEpochByIndex, resourceEpoch);
+			AdvanceEpoch(internalTransitionEpochByIndex, internalTransitionEpoch);
+			AdvanceEpoch(otherQueueUAVEpochByOffset, otherQueueUAVEpoch);
+		}
+
+		bool ContainsNode(size_t nodeIndex) const {
+			return nodeIndex < nodeEpochByIndex.size() && nodeEpochByIndex[nodeIndex] == nodeEpoch;
+		}
+
+		void MarkNode(size_t nodeIndex) {
+			if (nodeIndex < nodeEpochByIndex.size()) {
+				nodeEpochByIndex[nodeIndex] = nodeEpoch;
+			}
+		}
+
+		bool ContainsResource(size_t resourceIndex) const {
+			return resourceIndex < resourceEpochByIndex.size() && resourceEpochByIndex[resourceIndex] == resourceEpoch;
+		}
+
+		void MarkResource(size_t resourceIndex) {
+			if (resourceIndex < resourceEpochByIndex.size()) {
+				resourceEpochByIndex[resourceIndex] = resourceEpoch;
+			}
+		}
+
+		bool ContainsInternalTransition(size_t resourceIndex) const {
+			return resourceIndex < internalTransitionEpochByIndex.size()
+				&& internalTransitionEpochByIndex[resourceIndex] == internalTransitionEpoch;
+		}
+
+		void MarkInternalTransition(size_t resourceIndex) {
+			if (resourceIndex < internalTransitionEpochByIndex.size()) {
+				internalTransitionEpochByIndex[resourceIndex] = internalTransitionEpoch;
+			}
+		}
+
+		bool ContainsOtherQueueUAV(size_t queueIndex, size_t resourceIndex) const {
+			if (queueIndex >= queueCount || resourceIndex >= resourceCount) {
+				return false;
+			}
+			return otherQueueUAVEpochByOffset[queueIndex * resourceCount + resourceIndex] == otherQueueUAVEpoch;
+		}
+
+		void MarkOtherQueueUAV(size_t queueIndex, size_t resourceIndex) {
+			if (queueIndex >= queueCount || resourceIndex >= resourceCount) {
+				return;
+			}
+			otherQueueUAVEpochByOffset[queueIndex * resourceCount + resourceIndex] = otherQueueUAVEpoch;
+		}
+
+	private:
+		static void AdvanceEpoch(std::vector<uint32_t>& values, uint32_t& epoch) {
+			++epoch;
+			if (epoch == 0) {
+				std::fill(values.begin(), values.end(), 0);
+				epoch = 1;
+			}
+		}
+	};
+
 	struct Node {
 		size_t   passIndex = 0;
 		size_t   queueSlot = 0; // Default/preferred queue slot for compatibility-preserving fallback
 		QueueKind preferredQueueKind = QueueKind::Graphics;
 		QueueAssignmentPolicy queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
 		std::vector<size_t> compatibleQueueSlots; // All legal queue slots for this pass
+		uint8_t compatibleQueueKindMask = 0;
 		std::optional<size_t> assignedQueueSlot; // Final slot chosen during frame scheduling
 		uint32_t originalOrder = 0;
 
@@ -729,6 +849,14 @@ private:
 	std::unordered_map<uint64_t, uint64_t> aliasPlacementSignatureByID;
 	std::unordered_map<uint64_t, rg::alias::AliasPlacementRange> aliasPlacementRangesByID;
 	std::unordered_map<uint64_t, rg::alias::AliasPlacementRange> schedulingPlacementRangesByID;
+	std::unordered_map<uint64_t, std::vector<uint64_t>> m_schedulingEquivalentIDsCache;
+	std::unordered_map<uint64_t, size_t> m_frameSchedulingResourceIndexByID;
+	size_t m_frameSchedulingResourceCount = 0;
+	std::vector<unsigned int> m_frameQueueLastUsageBatch;
+	std::vector<unsigned int> m_frameQueueLastProducerBatch;
+	std::vector<unsigned int> m_frameQueueLastTransitionBatch;
+	std::vector<FrameResourceEventSummary> m_frameResourceEventSummaries;
+	std::vector<FramePassSchedulingSummary> m_framePassSchedulingSummaries;
 	std::unordered_map<uint64_t, uint64_t> aliasPlacementPoolByID;
 	std::unordered_set<uint64_t> aliasActivationPending;
 
@@ -812,6 +940,21 @@ private:
 	void ApplyIdleDematerializationPolicy(const std::unordered_set<uint64_t>& usedResourceIDs);
 	void SnapshotCompiledResourceGenerations(const std::unordered_set<uint64_t>& usedResourceIDs);
 	void ValidateCompiledResourceGenerations() const;
+	void RebuildSchedulingEquivalentIDCache(const std::unordered_set<uint64_t>& resourceIDs);
+	void RebuildFrameSchedulingResourceIndex(const std::unordered_set<uint64_t>& resourceIDs);
+	void RebuildFramePassSchedulingSummaries();
+	void ClearFrameSchedulingResourceIndex();
+	void ClearFramePassSchedulingSummaries();
+	void ResetFrameQueueBatchHistoryTables();
+	std::optional<size_t> TryGetFrameSchedulingResourceIndex(uint64_t resourceID) const;
+	size_t FrameQueueBatchHistoryOffset(size_t queueSlot, size_t resourceIndex) const;
+	unsigned int GetFrameQueueHistoryValue(const std::vector<unsigned int>& history, size_t queueSlot, size_t resourceIndex) const;
+	void SetFrameQueueHistoryValue(std::vector<unsigned int>& history, size_t queueSlot, size_t resourceIndex, unsigned int batchIndex);
+	void RecordFrameResourceEvent(size_t queueSlot, size_t resourceIndex, unsigned int batchIndex);
+	void RecordFrameQueueUsageBatch(size_t queueSlot, size_t resourceIndex, unsigned int batchIndex);
+	void RecordFrameQueueTransitionBatch(size_t queueSlot, size_t resourceIndex, unsigned int batchIndex);
+	std::pair<unsigned int, uint64_t> GetFrameResourceLastEventBeforeBatch(size_t resourceIndex, unsigned int batchIndex) const;
+	const std::vector<uint64_t>& GetSchedulingEquivalentIDsCached(uint64_t resourceID);
 
 	void RefreshRetainedDeclarationsForFrame(RenderPassAndResources& p, uint8_t frameIndex);
 	void RefreshRetainedDeclarationsForFrame(ComputePassAndResources& p, uint8_t frameIndex);
@@ -823,42 +966,31 @@ private:
 
 	//void ComputeResourceLoops();
 	bool IsNewBatchNeeded(
-		const std::vector<ResourceRequirement>& reqs,
-		const std::vector<std::pair<ResourceHandleAndRange, ResourceState>> passInternalTransitions,
+		const FramePassSchedulingSummary& passSummary,
 		const std::unordered_map<uint64_t, SymbolicTracker*>& passBatchTrackers,
-		const std::vector<uint64_t>& currentBatchInternallyTransitionedResources,
-		const std::vector<uint64_t>& currentBatchAllResources,
-		const std::vector<uint64_t>& otherQueueUAVs,
+		const BatchBuildState& batchBuildState,
 		std::string_view candidatePassName,
 		unsigned int currentBatchIndex,
 		size_t candidateQueueSlot);
 	
 
-	std::tuple<int, int, int> GetBatchesToWaitOn(const ComputePassAndResources& pass, 
-		const std::unordered_map<uint64_t, unsigned int>& transitionHistory, 
-		const std::unordered_map<uint64_t, unsigned int>& producerHistory,
-		std::unordered_map<uint64_t, unsigned int> const& usageHistory,
+	std::tuple<int, int, int> GetBatchesToWaitOn(const ComputePassAndResources& pass,
+		size_t sourceQueueSlot,
 		std::unordered_set<uint64_t> const& resourcesTransitionedThisPass);
-    std::tuple<int, int, int> GetBatchesToWaitOn(const RenderPassAndResources& pass, 
-		const std::unordered_map<uint64_t, unsigned int>& transitionHistory, 
-		const std::unordered_map<uint64_t, unsigned int>& producerHistory,
-		std::unordered_map<uint64_t, unsigned int> const& usageHistory,
+	std::tuple<int, int, int> GetBatchesToWaitOn(const RenderPassAndResources& pass,
+		size_t sourceQueueSlot,
 		std::unordered_set<uint64_t> const& resourcesTransitionedThisPass);
 	std::tuple<int, int, int> GetBatchesToWaitOn(const CopyPassAndResources& pass,
-		const std::unordered_map<uint64_t, unsigned int>& transitionHistory,
-		const std::unordered_map<uint64_t, unsigned int>& producerHistory,
-		std::unordered_map<uint64_t, unsigned int> const& usageHistory,
+		size_t sourceQueueSlot,
 		std::unordered_set<uint64_t> const& resourcesTransitionedThisPass);
 
 	void ProcessResourceRequirements(
 		size_t passQueueSlot,
-		std::vector<ResourceRequirement>& resourceRequirements,
-		std::vector<std::unordered_map<uint64_t, unsigned int>>& batchOfLastQueueUsage,
-		std::vector<std::unordered_map<uint64_t, unsigned int>>& batchOfLastQueueTransition,
+		const std::vector<DenseRequirementSummary>& resourceRequirements,
 		unsigned int batchIndex,
 		PassBatch& currentBatch,
 		std::unordered_set<uint64_t>& outTransitionedResourceIDs,
-		std::unordered_set<uint64_t>& outFallbackResourceIDs,
+		std::unordered_set<size_t>& outFallbackResourceIndices,
 		std::vector<ResourceTransition>& scratchTransitions);
 
 	template<typename PassRes>
@@ -868,11 +1000,12 @@ private:
 		PassBatch&                        currentBatch,
 		unsigned int                      currentBatchIndex,
 		const PassRes&                    pass, // either ComputePassAndResources or RenderPassAndResources
-		const std::unordered_map<uint64_t, unsigned int>& oppTransHist,
-		const std::unordered_map<uint64_t, unsigned int>& oppProdHist,
-		const std::unordered_map<uint64_t, unsigned int>& oppUsageHist,
 		const std::unordered_set<uint64_t> resourcesTransitionedThisPass)
 	{
+		ZoneScopedN("RenderGraph::applySynchronization");
+		if (!pass.name.empty()) {
+			ZoneText(pass.name.data(), pass.name.size());
+		}
 		if (passQueueSlot == sourceQueueSlot) {
 			return;
 		}
@@ -904,7 +1037,7 @@ private:
 
 		// figure out which two numbers we wait on
 		auto [lastTransBatch, lastProdBatch, lastUsageBatch] =
-			GetBatchesToWaitOn(pass, oppTransHist, oppProdHist, oppUsageHist, resourcesTransitionedThisPass);
+			GetBatchesToWaitOn(pass, sourceQueueSlot, resourcesTransitionedThisPass);
 
 		// Handle the "transition" wait
 		if (lastTransBatch != -1) {
@@ -958,14 +1091,12 @@ private:
 	}
 
 	void AddTransition(
-		std::vector<std::unordered_map<uint64_t, unsigned int>>& batchOfLastQueueUsage,
-		std::vector<std::unordered_map<uint64_t, unsigned int>>& batchOfLastQueueTransition,
 		unsigned int batchIndex,
 		PassBatch& currentBatch,
 		size_t passQueueSlot,
-		const ResourceRequirement& r,
+		const DenseRequirementSummary& requirement,
 		std::unordered_set<uint64_t>& outTransitionedResourceIDs,
-		std::unordered_set<uint64_t>& outFallbackResourceIDs,
+		std::unordered_set<size_t>& outFallbackResourceIndices,
 		std::vector<ResourceTransition>& scratchTransitions);
 
 	static inline bool IsUAVState(const ResourceState& s) noexcept {
@@ -1004,14 +1135,8 @@ private:
 
 		unsigned int currentBatchIndex,
 		PassBatch& currentBatch,
-
-		std::vector<std::unordered_set<uint64_t>>& queueUAVs,
-
-		std::vector<std::unordered_map<uint64_t, unsigned int>>& batchOfLastQueueTransition,
-		std::vector<std::unordered_map<uint64_t, unsigned int>>& batchOfLastQueueProducer,
-		std::vector<std::unordered_map<uint64_t, unsigned int>>& batchOfLastQueueUsage,
 		std::unordered_set<uint64_t>& scratchTransitioned,
-		std::unordered_set<uint64_t>& scratchFallback,
+		std::unordered_set<size_t>& scratchFallback,
 		std::vector<ResourceTransition>& scratchTransitions);
 	void AutoScheduleAndBuildBatches(
 		RenderGraph& rg,
