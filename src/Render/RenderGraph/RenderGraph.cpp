@@ -7219,6 +7219,21 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 
 	{
 		ZoneScopedN("RenderGraph::Execute::UpdateCrossFrameProducerTracking");
+		const uint64_t publishSerial = ++m_crossFrameProducerPublishSerial;
+		auto isAnonymousTrackedResource = [&](uint64_t resourceID) {
+			auto itTransient = m_transientFrameResourcesByID.find(resourceID);
+			if (itTransient != m_transientFrameResourcesByID.end() && itTransient->second) {
+				return _registry.IsAnonymous(itTransient->second.get());
+			}
+
+			auto itResource = resourcesByID.find(resourceID);
+			if (itResource != resourcesByID.end() && itResource->second) {
+				return _registry.IsAnonymous(itResource->second.get());
+			}
+
+			return false;
+		};
+
 		// Update across-frame producer tracking (no aliasing remapping).
 		// Only store fence values that were actually signaled during this frame's
 		// execution. If a queue was inactive in a batch (no passes or transitions),
@@ -7245,6 +7260,8 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 				LastProducerAcrossFrames producer{
 					.queueSlot = queueIndex,
 					.fenceValue = fenceValue,
+					.publishSerial = publishSerial,
+					.anonymous = isAnonymousTrackedResource(resourceID),
 				};
 				nextLastProducerByResourceAcrossFrames[resourceID] = producer;
 				publishAliasPlacementProducer(resourceID, producer);
@@ -7254,6 +7271,16 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 
 	{
 		ZoneScopedN("RenderGraph::Execute::PruneCrossFrameProducerTracking");
+		auto isLiveResourceID = [&](uint64_t resourceID) {
+			auto itResource = resourcesByID.find(resourceID);
+			if (itResource != resourcesByID.end() && itResource->second) {
+				return true;
+			}
+
+			auto itTransient = m_transientFrameResourcesByID.find(resourceID);
+			return itTransient != m_transientFrameResourcesByID.end() && itTransient->second;
+		};
+
 		std::unordered_set<uint64_t> liveResourceIDs;
 		liveResourceIDs.reserve(resourcesByID.size() + m_transientFrameResourcesByID.size());
 
@@ -7271,7 +7298,10 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 		std::erase_if(
 			nextLastProducerByResourceAcrossFrames,
 			[&](const auto& entry) {
-				return !liveResourceIDs.contains(entry.first);
+				if (entry.second.anonymous) {
+					return entry.second.publishSerial != m_crossFrameProducerPublishSerial;
+				}
+				return !liveResourceIDs.contains(entry.first) && !isLiveResourceID(entry.first);
 			});
 
 		for (auto itPool = nextLastAliasPlacementProducersByPoolAcrossFrames.begin();
@@ -7280,7 +7310,10 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 			std::erase_if(
 				producers,
 				[&](const LastAliasPlacementProducerAcrossFrames& producer) {
-					return !liveResourceIDs.contains(producer.resourceID);
+					if (producer.producer.anonymous) {
+						return producer.producer.publishSerial != m_crossFrameProducerPublishSerial;
+					}
+					return !liveResourceIDs.contains(producer.resourceID) && !isLiveResourceID(producer.resourceID);
 				});
 
 			if (producers.empty()) {

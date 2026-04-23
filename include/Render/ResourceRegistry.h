@@ -255,6 +255,27 @@ public:
 		return std::nullopt;
     }
 
+    bool IsAnonymous(const RegistryHandle& h) const noexcept {
+        if (h.IsEphemeral()) {
+            return false;
+        }
+        if (h.GetKey().idx >= slots.size()) {
+            return false;
+        }
+
+        const Slot& s = slots[h.GetKey().idx];
+        if (!s.alive) {
+            return false;
+        }
+
+        return s.id.segments.empty();
+    }
+
+    bool IsAnonymous(Resource* res) const noexcept {
+        auto handle = GetHandleFor(res);
+        return handle.has_value() && IsAnonymous(*handle);
+    }
+
     std::optional<RegistryHandle> GetHandleFor(ResourceIdentifier const& id) const {
         auto it = intern.find(id);
         if (it == intern.end()) {

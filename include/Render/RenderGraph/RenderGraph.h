@@ -663,6 +663,8 @@ private:
 	struct LastProducerAcrossFrames {
 		size_t queueSlot = 0;
 		uint64_t fenceValue = 0;
+		uint64_t publishSerial = 0;
+		bool anonymous = false;
 	};
 
 	struct LastAliasPlacementProducerAcrossFrames {
@@ -880,6 +882,7 @@ private:
 	std::unordered_map<uint64_t, LastProducerAcrossFrames> m_lastProducerByResourceAcrossFrames;
 	std::unordered_map<uint64_t, std::vector<LastAliasPlacementProducerAcrossFrames>> m_lastAliasPlacementProducersByPoolAcrossFrames;
 	std::vector<std::unordered_map<uint64_t, unsigned int>> m_compiledLastProducerBatchByResourceByQueue;
+	uint64_t m_crossFrameProducerPublishSerial = 0;
 	std::vector<std::vector<uint8_t>> m_hasPendingFrameStartQueueWait;
 	std::vector<std::vector<UINT64>> m_pendingFrameStartQueueWaitFenceValue;
 
