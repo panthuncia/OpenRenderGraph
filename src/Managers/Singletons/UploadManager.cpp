@@ -4,19 +4,44 @@
 
 #include <rhi_helpers.h>
 #include <rhi_debug.h>
+#include <spdlog/spdlog.h>
 
 #include "Resources/Buffers/Buffer.h"
 #include "Resources/Resource.h"
 #include "Managers/Singletons/DeviceManager.h"
 #include "Render/MemoryIntrospectionAPI.h"
 #include "Render/Runtime/OpenRenderGraphSettings.h"
+namespace {
+	size_t AlignUpSizeT(const size_t v, const size_t a) noexcept {
+		return (v + (a - 1)) & ~(a - 1);
+	}
 
+	void TagUploadManagerPage(const std::shared_ptr<Buffer>& buffer, size_t pageIndex)
+	{
+		if (!buffer) {
+			return;
+		}
+		buffer->SetName("UploadManagerPage_" + std::to_string(pageIndex));
+		rg::memory::SetResourceUsageHint(*buffer, "Upload buffer");
+	}
+
+	void LogUploadManagerPages(const char* reason, size_t pageCount, size_t activePage, size_t pageSize)
+	{
+		spdlog::info(
+			"UploadManager {}: pages={}, activePage={}, reservedBytes={} MiB",
+			reason,
+			pageCount,
+			activePage,
+			(pageCount * pageSize) / (1024ull * 1024ull));
+	}
+}
 void UploadManager::Initialize() {
 	m_numFramesInFlight = rg::runtime::GetOpenRenderGraphSettings().numFramesInFlight;
 
 	m_currentCapacity = 1024 * 1024 * 4; // 4MB
 
 	m_pages.push_back({ Buffer::CreateShared(rhi::HeapType::Upload, kPageSize, false), 0 });
+	TagUploadManagerPage(m_pages.back().buffer, 0);
 
 	// ring buffer pointers
 	m_headOffset = 0;
@@ -29,12 +54,7 @@ void UploadManager::Initialize() {
 
 	m_activePage = 0;
 	m_frameStart.resize(m_numFramesInFlight, 0);
-}
-
-namespace {
-	size_t AlignUpSizeT(const size_t v, const size_t a) noexcept {
-		return (v + (a - 1)) & ~(a - 1);
-	}
+	LogUploadManagerPages("initialize", m_pages.size(), m_activePage, kPageSize);
 }
 
 // Coalescing / last-write-wins helpers (buffers)
@@ -183,8 +203,9 @@ bool UploadManager::AllocateUploadRegion(size_t size, size_t alignment, std::sha
 	if (alignment == 0) alignment = 1;
 	if (m_pages.empty()) {
 		m_pages.push_back({ Buffer::CreateShared(rhi::HeapType::Upload, kPageSize, false), 0 });
-		rg::memory::SetResourceUsageHint(*m_pages.back().buffer, "Upload buffer");
+		TagUploadManagerPage(m_pages.back().buffer, 0);
 		m_activePage = 0;
+		LogUploadManagerPages("recreate-first-page", m_pages.size(), m_activePage, kPageSize);
 	}
 
 	UploadPage* page = &m_pages[m_activePage];
@@ -198,7 +219,8 @@ bool UploadManager::AllocateUploadRegion(size_t size, size_t alignment, std::sha
 			// allocate another fresh page sized to the request (at least kPageSize)
 			size_t allocSize = (std::max)(kPageSize, size);
 			m_pages.push_back({ Buffer::CreateShared(rhi::HeapType::Upload, allocSize, false), 0 });
-			rg::memory::SetResourceUsageHint(*m_pages.back().buffer, "Upload buffer");
+			TagUploadManagerPage(m_pages.back().buffer, m_pages.size() - 1);
+			LogUploadManagerPages("grow", m_pages.size(), m_activePage, kPageSize);
 		}
 		page = &m_pages[m_activePage];
 		page->tailOffset = 0;
@@ -208,7 +230,8 @@ bool UploadManager::AllocateUploadRegion(size_t size, size_t alignment, std::sha
 		if (alignedTail + size > page->buffer->GetSize()) {
 			size_t allocSize = (std::max)(kPageSize, size);
 			m_pages.push_back({ Buffer::CreateShared(rhi::HeapType::Upload, allocSize, false), 0 });
-			rg::memory::SetResourceUsageHint(*m_pages.back().buffer, "Upload buffer");
+			TagUploadManagerPage(m_pages.back().buffer, m_pages.size() - 1);
+			LogUploadManagerPages("grow-dedicated", m_pages.size(), m_activePage, kPageSize);
 			m_activePage = m_pages.size() - 1;
 			page = &m_pages[m_activePage];
 			page->tailOffset = 0;
@@ -259,6 +282,8 @@ void UploadManager::UploadData(const void* data, size_t size, UploadTarget resou
 			size_t allocSize = (std::max)(kPageSize, size);
 			auto device = DeviceManager::GetInstance().GetDevice();
 			m_pages.push_back({ Buffer::CreateShared(rhi::HeapType::Upload, allocSize, false), 0 });
+			TagUploadManagerPage(m_pages.back().buffer, m_pages.size() - 1);
+			LogUploadManagerPages("grow-buffer-upload", m_pages.size(), m_activePage, kPageSize);
 		}
 		page = &m_pages[m_activePage];
 		page->tailOffset = 0;
@@ -422,6 +447,10 @@ void UploadManager::ProcessDeferredReleases(uint8_t frameIndex)
 			for (auto& start : m_frameStart) {
 				start = (start >= eraseCount ? start - eraseCount : 0);
 			}
+			for (size_t i = 0; i < m_pages.size(); ++i) {
+				TagUploadManagerPage(m_pages[i].buffer, i);
+			}
+			LogUploadManagerPages("retire", m_pages.size(), m_activePage, kPageSize);
 		}
 	}
 

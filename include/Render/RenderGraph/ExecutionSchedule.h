@@ -42,4 +42,7 @@ struct BatchSchedule {
 // The full pre-computed execution schedule for a frame.
 struct ExecutionSchedule {
 	std::vector<BatchSchedule> batches;
+	void Reset() {
+		batches.clear();
+	}
 };

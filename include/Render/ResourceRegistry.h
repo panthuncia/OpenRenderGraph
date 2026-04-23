@@ -87,6 +87,7 @@ class ResourceRegistry {
 
     struct Slot {
         SharedOrWeakPtr<Resource> resource;
+        Resource* rawPointer = nullptr;
         uint32_t generation = 1;
         ResourceIdentifier id; // for debug / access checks / reverse mapping
         bool alive = false;
@@ -216,13 +217,15 @@ public:
         // If this slot previously pointed at a different resource pointer,
         // remove its reverse-map entry so stale pointer->handle lookups
         // do not survive replacement.
-        if (s.resource) {
-            resourceToHandle.erase(s.resource.get());
+        if (s.rawPointer) {
+            resourceToHandle.erase(s.rawPointer);
         }
 
         s.resource = res;
+        s.rawPointer = res.get();
         s.generation++; // bump on replacement
         s.alive = true;
+        s.id = id;
 
         RegistryHandle h(key,
             s.generation,
@@ -231,7 +234,7 @@ public:
             res->GetMipLevels(), 
             res->GetArraySize());
 
-        resourceToHandle[s.resource.get()] = h;
+        resourceToHandle[s.rawPointer] = h;
 
         return h;
     }
@@ -263,6 +266,31 @@ public:
         }
         const Slot& s = slots[key.idx];
         return GetHandleFor(s.resource.get());
+    }
+
+    void ReclaimExpiredAnonymous() {
+        for (uint32_t idx = 0; idx < slots.size(); ++idx) {
+            Slot& s = slots[idx];
+            if (!s.alive) {
+                continue;
+            }
+            if (!s.id.segments.empty()) {
+                continue;
+            }
+            if (s.resource) {
+                continue;
+            }
+
+            if (s.rawPointer) {
+                resourceToHandle.erase(s.rawPointer);
+                s.rawPointer = nullptr;
+            }
+
+            s.resource = SharedOrWeakPtr<Resource>{};
+            s.alive = false;
+            ++s.generation;
+            freeList.push_back(idx);
+        }
     }
 
     RegistryHandle MakeHandle(ResourceIdentifier const& id) const {
@@ -357,14 +385,15 @@ private:
         Slot& s = slots[idx];
 
         // If slot previously held a resource, remove reverse mapping.
-        if (s.resource) {
-            resourceToHandle.erase(s.resource.get());
+        if (s.rawPointer) {
+            resourceToHandle.erase(s.rawPointer);
         }
 
         s.resource = std::move(res);
+        s.rawPointer = s.resource.get();
         s.generation++;
         s.alive = true;
-        // s.id left default/empty (debug only)
+        s.id = {};
 
         RegistryHandle h(
             ResourceKey{ idx },
@@ -375,7 +404,7 @@ private:
             s.resource->GetArraySize()
         );
 
-        resourceToHandle[s.resource.get()] = h;
+        resourceToHandle[s.rawPointer] = h;
         return h;
     }
 };

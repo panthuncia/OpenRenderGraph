@@ -331,7 +331,7 @@ public:
 		static constexpr size_t kWaitPhaseCount = static_cast<size_t>(BatchWaitPhase::Count);
 		static constexpr size_t kSignalPhaseCount = static_cast<size_t>(BatchSignalPhase::Count);
 		static constexpr size_t kTransitionPhaseCount = static_cast<size_t>(BatchTransitionPhase::Count);
-		using QueuedPass = std::variant<RenderPassAndResources, ComputePassAndResources, CopyPassAndResources>;
+		using QueuedPass = std::variant<RenderPassAndResources*, ComputePassAndResources*, CopyPassAndResources*>;
 
 		PassBatch(size_t queueCount = kQueueCount)
 			: queuePasses(queueCount) {

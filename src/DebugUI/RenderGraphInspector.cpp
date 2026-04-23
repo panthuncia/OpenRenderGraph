@@ -186,7 +186,7 @@ static std::string GetBatchAnchorPassName(const RenderGraph::PassBatch& batch) {
     for (size_t qi = 0; qi < batch.QueueCount(); ++qi) {
         const auto& queuedPasses = batch.Passes(qi);
         if (!queuedPasses.empty()) {
-            return std::visit([](const auto& pass) { return pass.name; }, queuedPasses.back());
+            return std::visit([](const auto* pass) { return pass->name; }, queuedPasses.back());
         }
     }
     return {};
@@ -454,7 +454,7 @@ namespace RGInspector {
 
                 for (size_t qi = 0; qi < batches[s_selectedBatch].QueueCount(); ++qi) {
                     for (auto const& queuedPass : batches[s_selectedBatch].Passes(qi)) {
-                        passNames.push_back(std::visit([](const auto& pass) { return pass.name; }, queuedPass));
+                        passNames.push_back(std::visit([](const auto* pass) { return pass->name; }, queuedPass));
                     }
                 }
 
@@ -730,8 +730,8 @@ namespace RGInspector {
                     ImGui::Text("%s Passes (%d)", slotLabels[qi].c_str(), static_cast<int>(passesVec.size()));
                     for (auto const& queuedPass : passesVec) {
                         std::visit(
-                            [&](const auto& pass) {
-                                ImGui::BulletText("%s", pass.name.c_str());
+                            [&](const auto* pass) {
+                                ImGui::BulletText("%s", pass->name.c_str());
                             },
                             queuedPass);
                     }

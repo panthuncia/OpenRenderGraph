@@ -5,6 +5,7 @@
 #include <unordered_set>
 
 #include <rhi_helpers.h>
+#include <spdlog/spdlog.h>
 
 #include "Resources/Buffers/Buffer.h"
 #include "Resources/Resource.h"
@@ -15,6 +16,25 @@ namespace {
 	size_t AlignUpSizeT(const size_t v, const size_t a) noexcept {
 		return (v + (a - 1)) & ~(a - 1);
 	}
+
+	void TagUploadInstancePage(const std::shared_ptr<Buffer>& buffer, size_t pageIndex)
+	{
+		if (!buffer) {
+			return;
+		}
+		buffer->SetName("UploadInstancePage_" + std::to_string(pageIndex));
+		rg::memory::SetResourceUsageHint(*buffer, "UploadInstance page");
+	}
+
+	void LogUploadInstancePages(const char* reason, size_t pageCount, size_t activePage, size_t pageSize)
+	{
+		spdlog::info(
+			"UploadInstance {}: pages={}, activePage={}, reservedBytes={} MiB",
+			reason,
+			pageCount,
+			activePage,
+			(pageCount * pageSize) / (1024ull * 1024ull));
+	}
 }
 
 UploadInstance::UploadInstance(uint8_t numFramesInFlight, size_t pageSize)
@@ -22,8 +42,9 @@ UploadInstance::UploadInstance(uint8_t numFramesInFlight, size_t pageSize)
 	, m_numFramesInFlight(numFramesInFlight)
 {
 	m_pages.push_back({ Buffer::CreateShared(rhi::HeapType::Upload, m_pageSize, false), 0 });
-	rg::memory::SetResourceUsageHint(*m_pages.back().buffer, "UploadInstance page");
+	TagUploadInstancePage(m_pages.back().buffer, 0);
 	m_frameStart.assign(m_numFramesInFlight, 0);
+	LogUploadInstancePages("initialize", m_pages.size(), m_activePage, m_pageSize);
 }
 
 // Page allocation
@@ -35,8 +56,9 @@ bool UploadInstance::AllocateUploadRegion(size_t size, size_t alignment,
 	if (alignment == 0) alignment = 1;
 	if (m_pages.empty()) {
 		m_pages.push_back({ Buffer::CreateShared(rhi::HeapType::Upload, m_pageSize, false), 0 });
-		rg::memory::SetResourceUsageHint(*m_pages.back().buffer, "UploadInstance page");
+		TagUploadInstancePage(m_pages.back().buffer, 0);
 		m_activePage = 0;
+		LogUploadInstancePages("recreate-first-page", m_pages.size(), m_activePage, m_pageSize);
 	}
 
 	UploadPage* page = &m_pages[m_activePage];
@@ -47,7 +69,8 @@ bool UploadInstance::AllocateUploadRegion(size_t size, size_t alignment,
 		if (m_activePage >= m_pages.size()) {
 			size_t allocSize = (std::max)(m_pageSize, size);
 			m_pages.push_back({ Buffer::CreateShared(rhi::HeapType::Upload, allocSize, false), 0 });
-			rg::memory::SetResourceUsageHint(*m_pages.back().buffer, "UploadInstance page");
+			TagUploadInstancePage(m_pages.back().buffer, m_pages.size() - 1);
+			LogUploadInstancePages("grow", m_pages.size(), m_activePage, m_pageSize);
 		}
 		page = &m_pages[m_activePage];
 		page->tailOffset = 0;
@@ -56,7 +79,8 @@ bool UploadInstance::AllocateUploadRegion(size_t size, size_t alignment,
 		if (alignedTail + size > page->buffer->GetSize()) {
 			size_t allocSize = (std::max)(m_pageSize, size);
 			m_pages.push_back({ Buffer::CreateShared(rhi::HeapType::Upload, allocSize, false), 0 });
-			rg::memory::SetResourceUsageHint(*m_pages.back().buffer, "UploadInstance page");
+			TagUploadInstancePage(m_pages.back().buffer, m_pages.size() - 1);
+			LogUploadInstancePages("grow-dedicated", m_pages.size(), m_activePage, m_pageSize);
 			m_activePage = m_pages.size() - 1;
 			page = &m_pages[m_activePage];
 			page->tailOffset = 0;
@@ -138,7 +162,8 @@ void UploadInstance::UploadData(const void* data, size_t size, UploadTarget targ
 		if (m_activePage >= m_pages.size()) {
 			size_t allocSize = (std::max)(m_pageSize, size);
 			m_pages.push_back({ Buffer::CreateShared(rhi::HeapType::Upload, allocSize, false), 0 });
-			rg::memory::SetResourceUsageHint(*m_pages.back().buffer, "UploadInstance page");
+			TagUploadInstancePage(m_pages.back().buffer, m_pages.size() - 1);
+			LogUploadInstancePages("grow-buffer-upload", m_pages.size(), m_activePage, m_pageSize);
 		}
 		page = &m_pages[m_activePage];
 		page->tailOffset = 0;
@@ -332,6 +357,10 @@ void UploadInstance::ProcessDeferredReleases(uint8_t frameIndex) {
 			for (auto& start : m_frameStart) {
 				start = (start >= eraseCount ? start - eraseCount : 0);
 			}
+			for (size_t i = 0; i < m_pages.size(); ++i) {
+				TagUploadInstancePage(m_pages[i].buffer, i);
+			}
+			LogUploadInstancePages("retire", m_pages.size(), m_activePage, m_pageSize);
 		}
 	}
 

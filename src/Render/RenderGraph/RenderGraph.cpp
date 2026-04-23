@@ -809,14 +809,14 @@ void RenderGraph::WriteCompiledGraphDebugDump(uint8_t frameIndex, const std::vec
 				if (hasPasses) {
 					dump << "    passes:\n";
 					for (const auto& queuedPass : batch.Passes(queueIndex)) {
-						std::visit([&](const auto& passEntry) {
+						std::visit([&](const auto* passEntry) {
 							using TQueued = std::decay_t<decltype(passEntry)>;
 							const PassType queuedPassType =
-								std::is_same_v<TQueued, RenderPassAndResources> ? PassType::Render :
-								(std::is_same_v<TQueued, ComputePassAndResources> ? PassType::Compute : PassType::Copy);
-							dump << "      - " << passEntry.name
+								std::is_same_v<TQueued, RenderPassAndResources*> ? PassType::Render :
+								(std::is_same_v<TQueued, ComputePassAndResources*> ? PassType::Compute : PassType::Copy);
+							dump << "      - " << passEntry->name
 								 << " (" << PassTypeToString(queuedPassType)
-								 << ", run=" << PassRunMaskToString(passEntry.run) << ")\n";
+								 << ", run=" << PassRunMaskToString(passEntry->run) << ")\n";
 						}, queuedPass);
 					}
 				}
@@ -1599,7 +1599,7 @@ void RenderGraph::CommitPassToBatch(
 				throw std::runtime_error("Unexpected empty pass variant in RenderGraph::CommitPassToBatch");
 			}
 			else {
-				currentBatch.Passes(passQueueSlot).emplace_back(pass);
+				currentBatch.Passes(passQueueSlot).emplace_back(&pass);
 				applyInternalTransitions(pass);
 				recordRequirementHistory();
 
@@ -2051,8 +2051,8 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 			auto& batch = rg.batches[bi];
 			for (size_t qi = 0; qi < queueCount; ++qi) {
 				for (auto& passVariant : batch.Passes(qi)) {
-					std::visit([&](const auto& passEntry) {
-						for (auto& req : passEntry.resources.frameResourceRequirements) {
+					std::visit([&](const auto* passEntry) {
+						for (auto& req : passEntry->resources.frameResourceRequirements) {
 							if (AccessTypeIsWriteType(req.state.access)) {
 								crossFrameProducer[qi][req.resourceHandleAndRange.resource.GetGlobalResourceID()] = bi;
 							}
@@ -3033,6 +3033,7 @@ void RenderGraph::ResetForFrame() {
 	compiledResourceGenerationByID.clear();
 	m_transientFrameResourcesByID.clear();
 	m_transientFrameResourcesByName.clear();
+	_registry.ReclaimExpiredAnonymous();
 	m_aliasingSubsystem.ResetPerFrameState(*this);
 	compileTrackers.clear();
 	m_schedulingEquivalentIDsCache.clear();
@@ -3040,6 +3041,7 @@ void RenderGraph::ResetForFrame() {
 	ClearFramePassSchedulingSummaries();
 	m_assignedQueueSlotsByFramePass.clear();
 	m_activeQueueSlotsThisFrame.clear();
+	m_executionSchedule.Reset();
 	for (auto& producerMap : m_compiledLastProducerBatchByResourceByQueue) {
 		producerMap.clear();
 	}
@@ -5780,7 +5782,7 @@ namespace {
 		};
 
 		for (auto& passVariant : batch.Passes(qi)) {
-			std::visit([&](auto& passEntry) { executeOne(passEntry); }, passVariant);
+			std::visit([&](auto* passEntry) { executeOne(*passEntry); }, passVariant);
 		}
 		if (args.statisticsService)
 			args.statisticsService->ResolveQueries(args.context.frameIndex, rhiQueue, commandList);
@@ -5976,7 +5978,7 @@ namespace {
 		};
 
 		for (auto& passVariant : batch.Passes(qi)) {
-			std::visit([&](auto& passEntry) { executeOne(passEntry); }, passVariant);
+			std::visit([&](auto* passEntry) { executeOne(*passEntry); }, passVariant);
 		}
 		if (args.statisticsService)
 			args.statisticsService->ResolveQueries(args.context.frameIndex, args.rhiQueue, commandList, sched.queryRecordingContext);
@@ -6520,8 +6522,8 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 		spdlog::info("RenderGraph::Execute frame={} marked completion signals", static_cast<unsigned>(context.frameIndex));
 	}
 
-	auto nextLastProducerByResourceAcrossFrames = m_lastProducerByResourceAcrossFrames;
-	auto nextLastAliasPlacementProducersByPoolAcrossFrames = m_lastAliasPlacementProducersByPoolAcrossFrames;
+	auto& nextLastProducerByResourceAcrossFrames = m_lastProducerByResourceAcrossFrames;
+	auto& nextLastAliasPlacementProducersByPoolAcrossFrames = m_lastAliasPlacementProducersByPoolAcrossFrames;
 
 	auto removeResourceFromLastAliasPlacementCache = [&](uint64_t resourceID) {
 		for (auto& [poolID, producers] : nextLastAliasPlacementProducersByPoolAcrossFrames) {
@@ -6852,9 +6854,9 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 					std::string passNames;
 					auto collectNames = [&](size_t q) {
 						for (auto& pv : batch.Passes(q)) {
-							std::visit([&](auto& pr) {
+							std::visit([&](auto* pr) {
 								if (!passNames.empty()) passNames += ", ";
-								passNames += pr.name;
+								passNames += pr->name;
 							}, pv);
 						}
 					};
@@ -6937,11 +6939,11 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 				catch (const std::exception& ex) {
 					std::string passNames;
 					for (auto& passVariant : batches[task.batchIndex].Passes(task.queueIndex)) {
-						std::visit([&](auto& passEntry) {
+						std::visit([&](auto* passEntry) {
 							if (!passNames.empty()) {
 								passNames += ", ";
 							}
-							passNames += passEntry.name.empty() ? std::string("<unnamed>") : passEntry.name;
+							passNames += passEntry->name.empty() ? std::string("<unnamed>") : passEntry->name;
 						}, passVariant);
 					}
 
@@ -7246,6 +7248,46 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 				};
 				nextLastProducerByResourceAcrossFrames[resourceID] = producer;
 				publishAliasPlacementProducer(resourceID, producer);
+			}
+		}
+	}
+
+	{
+		ZoneScopedN("RenderGraph::Execute::PruneCrossFrameProducerTracking");
+		std::unordered_set<uint64_t> liveResourceIDs;
+		liveResourceIDs.reserve(resourcesByID.size() + m_transientFrameResourcesByID.size());
+
+		for (const auto& [resourceID, resource] : resourcesByID) {
+			if (resource) {
+				liveResourceIDs.insert(resourceID);
+			}
+		}
+		for (const auto& [resourceID, resource] : m_transientFrameResourcesByID) {
+			if (resource) {
+				liveResourceIDs.insert(resourceID);
+			}
+		}
+
+		std::erase_if(
+			nextLastProducerByResourceAcrossFrames,
+			[&](const auto& entry) {
+				return !liveResourceIDs.contains(entry.first);
+			});
+
+		for (auto itPool = nextLastAliasPlacementProducersByPoolAcrossFrames.begin();
+			 itPool != nextLastAliasPlacementProducersByPoolAcrossFrames.end();) {
+			auto& producers = itPool->second;
+			std::erase_if(
+				producers,
+				[&](const LastAliasPlacementProducerAcrossFrames& producer) {
+					return !liveResourceIDs.contains(producer.resourceID);
+				});
+
+			if (producers.empty()) {
+				itPool = nextLastAliasPlacementProducersByPoolAcrossFrames.erase(itPool);
+			}
+			else {
+				++itPool;
 			}
 		}
 	}

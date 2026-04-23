@@ -1644,9 +1644,9 @@ void rg::alias::RenderGraphAliasingSubsystem::ApplyAliasQueueSynchronization(Ren
 
 		auto accumulateFromQueuedPass = [&](const RenderGraph::PassBatch::QueuedPass& queuedPass, size_t slot) {
 			std::visit(
-				[&](auto const& pass) {
-					accumulateFromReqs(pass.resources.frameResourceRequirements, slot);
-					accumulateFromInternalTransitions(pass.resources.internalTransitions, slot);
+				[&](auto const* pass) {
+					accumulateFromReqs(pass->resources.frameResourceRequirements, slot);
+					accumulateFromInternalTransitions(pass->resources.internalTransitions, slot);
 				},
 				queuedPass);
 		};
