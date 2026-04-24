@@ -4407,6 +4407,75 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		}
 	}
 
+	{
+		traceCompileStep("PruneUnusedQueueSignals");
+		ZoneScopedN("RenderGraph::CompileFrame::PruneUnusedQueueSignals");
+		const size_t slotCount = m_queueRegistry.SlotCount();
+
+		std::vector<std::unordered_map<UINT64, std::pair<size_t, BatchSignalPhase>>> signalOwnerByQueue(slotCount);
+		for (size_t batchIndex = 0; batchIndex < batches.size(); ++batchIndex) {
+			auto& batch = batches[batchIndex];
+			for (size_t queueIndex = 0; queueIndex < batch.QueueCount(); ++queueIndex) {
+				for (size_t signalPhaseIndex = 0; signalPhaseIndex < PassBatch::kSignalPhaseCount; ++signalPhaseIndex) {
+					const auto signalPhase = static_cast<BatchSignalPhase>(signalPhaseIndex);
+					if (!batch.HasQueueSignal(signalPhase, queueIndex)) {
+						continue;
+					}
+
+					signalOwnerByQueue[queueIndex].emplace(
+						batch.GetQueueSignalFenceValue(signalPhase, queueIndex),
+						std::make_pair(batchIndex, signalPhase));
+				}
+			}
+		}
+
+		std::vector<std::array<std::vector<uint8_t>, PassBatch::kSignalPhaseCount>> requiredSignals(batches.size());
+		for (auto& requiredSignalsByPhase : requiredSignals) {
+			for (auto& requiredSignalsByQueue : requiredSignalsByPhase) {
+				requiredSignalsByQueue.assign(slotCount, 0);
+			}
+		}
+
+		for (size_t batchIndex = 0; batchIndex < batches.size(); ++batchIndex) {
+			auto& batch = batches[batchIndex];
+			for (size_t waitPhaseIndex = 0; waitPhaseIndex < PassBatch::kWaitPhaseCount; ++waitPhaseIndex) {
+				const auto waitPhase = static_cast<BatchWaitPhase>(waitPhaseIndex);
+				for (size_t dstQueueIndex = 0; dstQueueIndex < batch.QueueCount(); ++dstQueueIndex) {
+					for (size_t srcQueueIndex = 0; srcQueueIndex < batch.QueueCount(); ++srcQueueIndex) {
+						if (dstQueueIndex == srcQueueIndex || !batch.HasQueueWait(waitPhase, dstQueueIndex, srcQueueIndex)) {
+							continue;
+						}
+
+						const UINT64 waitFenceValue = batch.GetQueueWaitFenceValue(waitPhase, dstQueueIndex, srcQueueIndex);
+						auto itSignalOwner = signalOwnerByQueue[srcQueueIndex].find(waitFenceValue);
+						if (itSignalOwner == signalOwnerByQueue[srcQueueIndex].end()) {
+							continue;
+						}
+
+						const auto [signalBatchIndex, signalPhase] = itSignalOwner->second;
+						requiredSignals[signalBatchIndex][static_cast<size_t>(signalPhase)][srcQueueIndex] = 1;
+					}
+				}
+			}
+		}
+
+		for (size_t batchIndex = 0; batchIndex < batches.size(); ++batchIndex) {
+			auto& batch = batches[batchIndex];
+			for (size_t queueIndex = 0; queueIndex < batch.QueueCount(); ++queueIndex) {
+				for (size_t signalPhaseIndex = 0; signalPhaseIndex < PassBatch::kSignalPhaseCount; ++signalPhaseIndex) {
+					const auto signalPhase = static_cast<BatchSignalPhase>(signalPhaseIndex);
+					if (!batch.HasQueueSignal(signalPhase, queueIndex)) {
+						continue;
+					}
+
+					if (!requiredSignals[batchIndex][signalPhaseIndex][queueIndex]) {
+						batch.ClearQueueSignal(signalPhase, queueIndex);
+					}
+				}
+			}
+		}
+	}
+
 	if (m_getRenderGraphCompileDumpEnabled && m_getRenderGraphCompileDumpEnabled()) {
 		traceCompileStep("WriteCompiledGraphDebugDump");
 		ZoneScopedN("RenderGraph::CompileFrame::WriteCompiledGraphDebugDump");
@@ -6487,6 +6556,22 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 		dstQ.Wait({ SlotFence(srcSlot).GetHandle(), absoluteFenceValue });
 	};
 
+	auto batchExecutesOnQueue = [](const PassBatch& batch, size_t queueIndex) {
+		return batch.HasTransitions(queueIndex, BatchTransitionPhase::BeforePasses)
+			|| batch.HasPasses(queueIndex)
+			|| batch.HasTransitions(queueIndex, BatchTransitionPhase::AfterPasses);
+	};
+
+	std::vector<unsigned int> lastCrossFrameSignalBatchByQueue(slotCount, 0);
+	for (unsigned int batchIndex = 1; batchIndex < static_cast<unsigned int>(batches.size()); ++batchIndex) {
+		auto& batch = batches[batchIndex];
+		for (size_t queueIndex = 0; queueIndex < slotCount; ++queueIndex) {
+			if (batchExecutesOnQueue(batch, queueIndex)) {
+				lastCrossFrameSignalBatchByQueue[queueIndex] = batchIndex;
+			}
+		}
+	}
+
 	{
 		ZoneScopedN("RenderGraph::Execute::ApplyFrameStartWaits");
 		// Frame-start waits from previous frame's last-producer tracking.
@@ -6507,14 +6592,23 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 
 	{
 		ZoneScopedN("RenderGraph::Execute::MarkCompletionSignals");
-		// Mark completion signals on batches that produced resources tracked across frames.
+		// Cross-frame waits only need a monotonic signal that is guaranteed to fire
+		// after the queue's final work for the frame. Marking every producer batch
+		// forces extra submissions in the parallel path.
 		for (size_t queueIndex = 0; queueIndex < slotCount; ++queueIndex) {
 			if (queueIndex >= m_compiledLastProducerBatchByResourceByQueue.size()) continue;
-			for (const auto& [resourceID, producerBatch] : m_compiledLastProducerBatchByResourceByQueue[queueIndex]) {
-				(void)resourceID;
-				if (producerBatch > 0 && producerBatch < batches.size()) {
-					batches[producerBatch].MarkQueueSignal(BatchSignalPhase::AfterCompletion, queueIndex);
-				}
+			if (m_compiledLastProducerBatchByResourceByQueue[queueIndex].empty()) continue;
+
+			const unsigned int signalBatch = lastCrossFrameSignalBatchByQueue[queueIndex];
+			if (signalBatch > 0 && signalBatch < batches.size()) {
+				batches[signalBatch].MarkQueueSignal(BatchSignalPhase::AfterCompletion, queueIndex);
+			}
+			else {
+				spdlog::warn(
+					"RenderGraph::Execute frame={} queue slot {} has {} cross-frame producers but no active batch to signal.",
+					static_cast<unsigned>(context.frameIndex),
+					queueIndex,
+					m_compiledLastProducerBatchByResourceByQueue[queueIndex].size());
 			}
 		}
 	}
@@ -7235,27 +7329,38 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 		};
 
 		// Update across-frame producer tracking (no aliasing remapping).
-		// Only store fence values that were actually signaled during this frame's
-		// execution. If a queue was inactive in a batch (no passes or transitions),
-		// the pre-assigned fence value was never signaled on the GPU. Storing it
-		// would cause next frame's frame-start waits to deadlock.
+		// Publish the end-of-frame signal for each queue that produced cross-frame
+		// resources. Timeline signals are monotonic, so waiting on a resource's
+		// producer can safely wait for the queue's final signal from the frame.
 		for (size_t queueIndex = 0; queueIndex < slotCount; ++queueIndex) {
 			if (queueIndex >= m_compiledLastProducerBatchByResourceByQueue.size()) continue;
+			if (m_compiledLastProducerBatchByResourceByQueue[queueIndex].empty()) continue;
+
+			const unsigned int signalBatch = lastCrossFrameSignalBatchByQueue[queueIndex];
+			if (signalBatch == 0 || signalBatch >= batches.size()) {
+				spdlog::warn(
+					"Cross-frame producer skip: slot {} has {} tracked resources but no active batch signal.",
+					queueIndex,
+					m_compiledLastProducerBatchByResourceByQueue[queueIndex].size());
+				continue;
+			}
+
+			const uint64_t fenceValue =
+				batches[signalBatch].GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, queueIndex);
+
+			// Skip if this fence value was never actually signaled on the GPU.
+			if (fenceValue > lastSignaledPerSlot[queueIndex]) {
+				spdlog::warn(
+					"Cross-frame producer skip: slot {} signal batch {} fenceValue={} > lastSignaled={}",
+					queueIndex,
+					signalBatch,
+					fenceValue,
+					lastSignaledPerSlot[queueIndex]);
+				continue;
+			}
+
 			for (const auto& [resourceID, producerBatch] : m_compiledLastProducerBatchByResourceByQueue[queueIndex]) {
 				if (producerBatch == 0 || producerBatch >= batches.size()) continue;
-
-				const uint64_t fenceValue =
-					batches[producerBatch].GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, queueIndex);
-
-				// Skip if this fence value was never actually signaled on the GPU.
-				if (fenceValue > lastSignaledPerSlot[queueIndex]) {
-					spdlog::warn(
-						"Cross-frame producer skip: slot {} resource {} batch {} "
-						"fenceValue={} > lastSignaled={}. Queue was likely inactive.",
-						queueIndex, resourceID, producerBatch,
-						fenceValue, lastSignaledPerSlot[queueIndex]);
-					continue;
-				}
 
 				LastProducerAcrossFrames producer{
 					.queueSlot = queueIndex,
