@@ -70,6 +70,14 @@ public:
 	/// Current fence value for a slot (without incrementing).
 	uint64_t GetCurrentFenceValue(QueueSlotIndex i) const noexcept { return m_slots[ToUnderlying(i)].fenceValue; }
 
+	/// Raises the next fence value for a slot if it has fallen behind an externally observed floor.
+	void EnsureNextFenceValueAtLeast(QueueSlotIndex i, uint64_t minValue) noexcept {
+		auto& nextFenceValue = m_slots[ToUnderlying(i)].fenceValue;
+		if (nextFenceValue < minValue) {
+			nextFenceValue = minValue;
+		}
+	}
+
 	/// Find any Graphics-kind queue slot (for transition fallback).
 	QueueSlotIndex FindGraphicsSlot() const noexcept;
 

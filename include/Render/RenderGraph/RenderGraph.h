@@ -990,6 +990,7 @@ private:
 	void ProcessResourceRequirements(
 		size_t passQueueSlot,
 		const std::vector<DenseRequirementSummary>& resourceRequirements,
+		std::string_view passName,
 		unsigned int batchIndex,
 		PassBatch& currentBatch,
 		std::unordered_set<uint64_t>& outTransitionedResourceIDs,
@@ -1097,6 +1098,7 @@ private:
 		unsigned int batchIndex,
 		PassBatch& currentBatch,
 		size_t passQueueSlot,
+		std::string_view passName,
 		const DenseRequirementSummary& requirement,
 		std::unordered_set<uint64_t>& outTransitionedResourceIDs,
 		std::unordered_set<size_t>& outFallbackResourceIndices,

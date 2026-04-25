@@ -19,6 +19,7 @@
 #include "Utilities/ORGUtilities.h"
 #include "Managers/Singletons/DeviceManager.h"
 #include "Managers/Singletons/DeletionManager.h"
+#include "Managers/Singletons/UploadManager.h"
 #include "Render/PassBuilders.h"
 #include "Resources/ResourceGroup.h"
 #include "Managers/CommandRecordingManager.h"
@@ -161,7 +162,7 @@ namespace {
 		if (it == v.end() || *it != val) v.insert(it, val);
 	}
 
-	bool QueueSupportsSyncState(QueueKind queue, rhi::ResourceSyncState state) {
+	bool QueueSupportsSyncState(QueueKind queue, rhi::ResourceSyncState state) { // TODO: Is this actually meaningful?
 		switch (queue) {
 		case QueueKind::Graphics:
 			return true;
@@ -196,9 +197,7 @@ namespace {
 
 		if (queue == QueueKind::Copy) {
 			const auto supported = rhi::ResourceAccessType::None |
-				rhi::ResourceAccessType::Common |
-				rhi::ResourceAccessType::CopySource |
-				rhi::ResourceAccessType::CopyDest;
+				rhi::ResourceAccessType::Common; // Cannot actually transition to copy on a copy queue
 			return (access & ~supported) == 0;
 		}
 
@@ -1531,6 +1530,7 @@ void RenderGraph::CommitPassToBatch(
 	rg.ProcessResourceRequirements(
 		passQueueSlot,
 		passSummary.requirements,
+		pr.name,
 		currentBatchIndex,
 		currentBatch,
 		resourcesTransitionedThisPass,
@@ -2071,6 +2071,7 @@ void RenderGraph::AddTransition(
 	unsigned int batchIndex,
 	PassBatch& currentBatch,
 	size_t passQueueSlot,
+	std::string_view passName,
 	const DenseRequirementSummary& requirement,
 	std::unordered_set<uint64_t>& outTransitionedResourceIDs,
 	std::unordered_set<size_t>& outFallbackResourceIndices,
@@ -2083,7 +2084,36 @@ void RenderGraph::AddTransition(
 
 	// If this triggers, you're probably queueing an operation on an external/ephemeral resource, and then discarding it before the graph can use it.
 	if (!resource.IsEphemeral() && !_registry.IsValid(resource)) {
-		spdlog::error("Invalid resource handle");
+		auto uploadQueueMatch = [&]() -> std::string {
+			if (passName != "Builtin::Uploads") {
+				return {};
+			}
+
+			return UploadManager::GetInstance().DescribeQueuedTargetByGlobalResourceId(resource.GetGlobalResourceID());
+		}();
+		auto resourceName = [&]() -> std::string {
+			auto resourceIt = resourcesByID.find(resource.GetGlobalResourceID());
+			if (resourceIt != resourcesByID.end() && resourceIt->second) {
+				const auto& name = resourceIt->second->GetName();
+				if (!name.empty()) {
+					return name;
+				}
+			}
+			return std::string("<unknown>");
+		}();
+		spdlog::error(
+			"Invalid resource handle in RenderGraph::AddTransition: pass='{}' resourceId={} keyIdx={} generation={} epoch={} resourceName='{}' uploadQueueMatch='{}' range={} access={} layout={} sync={}",
+			passName,
+			resource.GetGlobalResourceID(),
+			resource.GetKey().idx,
+			resource.GetGeneration(),
+			resource.GetEpoch(),
+			resourceName,
+			uploadQueueMatch.empty() ? std::string("<none>") : uploadQueueMatch,
+			FormatRangeSpec(requirement.range),
+			static_cast<uint32_t>(requirement.state.access),
+			static_cast<uint32_t>(requirement.state.layout),
+			static_cast<uint32_t>(requirement.state.sync));
 		throw (std::runtime_error("Invalid resource handle in RenderGraph::AddTransition"));
 	}
 	scratchTransitions.clear();
@@ -2259,6 +2289,7 @@ void RenderGraph::AddTransition(
 void RenderGraph::ProcessResourceRequirements(
 	size_t passQueueSlot,
 	const std::vector<DenseRequirementSummary>& resourceRequirements,
+	std::string_view passName,
 	unsigned int batchIndex,
 	PassBatch& currentBatch, std::unordered_set<uint64_t>& outTransitionedResourceIDs,
 	std::unordered_set<size_t>& outFallbackResourceIndices,
@@ -2266,7 +2297,7 @@ void RenderGraph::ProcessResourceRequirements(
 	ZoneScopedN("RenderGraph::ProcessResourceRequirements");
 
 	for (const auto& resourceRequirement : resourceRequirements) {
-		AddTransition(batchIndex, currentBatch, passQueueSlot, resourceRequirement, outTransitionedResourceIDs, outFallbackResourceIndices, scratchTransitions);
+		AddTransition(batchIndex, currentBatch, passQueueSlot, passName, resourceRequirement, outTransitionedResourceIDs, outFallbackResourceIndices, scratchTransitions);
 
 		if (AccessTypeIsWriteType(resourceRequirement.state.access)) {
 			RecordFrameQueueTransitionBatch(passQueueSlot, resourceRequirement.resourceIndex, batchIndex);
@@ -5571,6 +5602,19 @@ void RenderGraph::Update(const UpdateExecutionContext& context, rhi::Device devi
 #define IFDEBUG(x) 
 
 namespace {
+	bool ResolveNonEmptyTransitionRange(const ResourceTransition& transition, SubresourceRange& outRange)
+	{
+		if (!transition.pResource || !transition.pResource->HasLayout()) {
+			return false;
+		}
+
+		outRange = ResolveRangeSpec(
+			transition.range,
+			transition.pResource->GetMipLevels(),
+			transition.pResource->GetArraySize());
+		return !outRange.isEmpty();
+	}
+
 	// ExecuteTransitions: applies state-tracker bookkeeping AND records
 	// barriers.  Used only in the non-parallel fallback path.
 	void ExecuteTransitions(std::vector<ResourceTransition>& transitions,
@@ -5579,6 +5623,11 @@ namespace {
 		rhi::CommandList& commandList) {
 		rhi::helpers::OwnedBarrierBatch batch;
 		for (auto& transition : transitions) {
+			SubresourceRange resolvedRange{};
+			if (transition.pResource->HasLayout() && !ResolveNonEmptyTransitionRange(transition, resolvedRange)) {
+				continue;
+			}
+
 			std::vector<ResourceTransition> dummy;
 			transition.pResource->GetStateTracker()->Apply(
 				transition.range, transition.pResource,
@@ -5612,8 +5661,10 @@ namespace {
 		for (auto& t : transitions) {
 			if (t.pResource->HasLayout()) {
 				// Texture barrier
-				auto resolvedRange = ResolveRangeSpec(
-					t.range, t.pResource->GetMipLevels(), t.pResource->GetArraySize());
+				SubresourceRange resolvedRange{};
+				if (!ResolveNonEmptyTransitionRange(t, resolvedRange)) {
+					continue;
+				}
 
 				rhi::TextureBarrier tb{};
 				tb.beforeAccess = t.prevAccessType;
@@ -5700,6 +5751,36 @@ namespace {
 
 	// ExecuteQueueBatch: unified per-queue-per-batch execution using pre-allocated
 	// command lists from the execution schedule.
+	void SignalQueueFenceOrThrow(
+		rhi::Queue& queue,
+		rhi::Timeline& timeline,
+		UINT64 value,
+		QueueKind queueKind,
+		size_t queueSlot,
+		size_t batchIndex,
+		std::string_view phase,
+		unsigned frameIndex)
+	{
+		const rhi::Result signalResult = queue.Signal({ timeline.GetHandle(), value });
+		if (signalResult == rhi::Result::Ok) {
+			return;
+		}
+
+		std::ostringstream oss;
+		oss << "RenderGraph: frame " << frameIndex
+			<< " queue signal failed for " << QueueKindToString(queueKind)
+			<< " slot " << queueSlot
+			<< " batch " << batchIndex
+			<< " phase " << phase
+			<< " fence(idx=" << timeline.GetHandle().index
+			<< ", gen=" << timeline.GetHandle().generation
+			<< ") value=" << value
+			<< " completed=" << timeline.GetCompletedValue()
+			<< " result=" << static_cast<uint32_t>(signalResult);
+		spdlog::error(oss.str());
+		throw std::runtime_error(oss.str());
+	}
+
 	struct ExecuteQueueBatchArgs {
 		QueueBatchSchedule& sched;
 		RenderGraph::PassBatch& batch;
@@ -5763,7 +5844,15 @@ namespace {
 				RenderGraph::BatchSignalPhase::AfterTransitions, qi);
 			commandList.End();
 			rhiQueue.Submit({ &commandList, 1 }, {});
-			rhiQueue.Signal({ args.fenceTimeline.GetHandle(), signalValue });
+			SignalQueueFenceOrThrow(
+				rhiQueue,
+				args.fenceTimeline,
+				signalValue,
+				queue,
+				qi,
+				args.batchIndex,
+				"AfterTransitions",
+				static_cast<unsigned>(args.context.frameIndex));
 			args.lastSignaledOnTimeline = std::max(args.lastSignaledOnTimeline, signalValue);
 			pool.Recycle(std::move(cl0), signalValue);
 
@@ -5862,7 +5951,15 @@ namespace {
 				RenderGraph::BatchSignalPhase::AfterExecution, qi);
 			commandList.End();
 			rhiQueue.Submit({ &commandList, 1 }, {});
-			rhiQueue.Signal({ args.fenceTimeline.GetHandle(), signalValue });
+			SignalQueueFenceOrThrow(
+				rhiQueue,
+				args.fenceTimeline,
+				signalValue,
+				queue,
+				qi,
+				args.batchIndex,
+				"AfterExecution",
+				static_cast<unsigned>(args.context.frameIndex));
 			args.lastSignaledOnTimeline = std::max(args.lastSignaledOnTimeline, signalValue);
 			pool.Recycle(std::move(sched.preallocatedCLs[clIndex]), signalValue);
 
@@ -5902,7 +5999,15 @@ namespace {
 						RenderGraph::BatchSignalPhase::AfterCompletion, qi));
 				recycleFence = ++args.lastSignaledOnTimeline;
 			}
-			rhiQueue.Signal({ args.fenceTimeline.GetHandle(), recycleFence });
+			SignalQueueFenceOrThrow(
+				rhiQueue,
+				args.fenceTimeline,
+				recycleFence,
+				queue,
+				qi,
+				args.batchIndex,
+				"AfterCompletion",
+				static_cast<unsigned>(args.context.frameIndex));
 			args.lastSignaledOnTimeline = std::max(args.lastSignaledOnTimeline, recycleFence);
 			pool.Recycle(std::move(sched.preallocatedCLs[clIndex]), recycleFence);
 		}
@@ -6261,7 +6366,15 @@ namespace {
 					signalPhaseName(RenderGraph::BatchSignalPhase::AfterTransitions),
 					signalValue);
 			}
-			rhiQueue.Signal({ args.fenceTimeline.GetHandle(), signalValue });
+			SignalQueueFenceOrThrow(
+				rhiQueue,
+				args.fenceTimeline,
+				signalValue,
+				queue,
+				qi,
+				args.batchIndex,
+				signalPhaseName(RenderGraph::BatchSignalPhase::AfterTransitions),
+				args.frameIndex);
 			if (args.batchTraceEnabled) {
 				spdlog::info(
 					"RenderGraph: frame {} submit batch {} queue {} slot {} end signal phase={} fence={}",
@@ -6314,7 +6427,15 @@ namespace {
 					signalPhaseName(RenderGraph::BatchSignalPhase::AfterExecution),
 					signalValue);
 			}
-			rhiQueue.Signal({ args.fenceTimeline.GetHandle(), signalValue });
+			SignalQueueFenceOrThrow(
+				rhiQueue,
+				args.fenceTimeline,
+				signalValue,
+				queue,
+				qi,
+				args.batchIndex,
+				signalPhaseName(RenderGraph::BatchSignalPhase::AfterExecution),
+				args.frameIndex);
 			if (args.batchTraceEnabled) {
 				spdlog::info(
 					"RenderGraph: frame {} submit batch {} queue {} slot {} end signal phase={} fence={}",
@@ -6413,7 +6534,15 @@ namespace {
 					signalPhaseName(RenderGraph::BatchSignalPhase::AfterCompletion),
 					recycleFence);
 			}
-			rhiQueue.Signal({ args.fenceTimeline.GetHandle(), recycleFence });
+			SignalQueueFenceOrThrow(
+				rhiQueue,
+				args.fenceTimeline,
+				recycleFence,
+				queue,
+				qi,
+				args.batchIndex,
+				signalPhaseName(RenderGraph::BatchSignalPhase::AfterCompletion),
+				args.frameIndex);
 			if (args.batchTraceEnabled) {
 				spdlog::info(
 					"RenderGraph: frame {} submit batch {} queue {} slot {} end signal phase={} fence={}",
@@ -6881,7 +7010,25 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 	// Per-slot signal tracking for monotonic recycle signals.
 	std::vector<UINT64> lastSignaledPerSlot(slotCount);
 	for (size_t qi = 0; qi < slotCount; ++qi) {
-		lastSignaledPerSlot[qi] = SlotFence(qi).GetCompletedValue();
+		const auto slotIndex = static_cast<QueueSlotIndex>(static_cast<uint8_t>(qi));
+		const UINT64 completedFenceValue = SlotFence(qi).GetCompletedValue();
+		UINT64 nextFenceValue = m_queueRegistry.GetCurrentFenceValue(slotIndex);
+		if (completedFenceValue != UINT64_MAX) {
+			const UINT64 minimumNextFenceValue = completedFenceValue + 1;
+			if (nextFenceValue < minimumNextFenceValue) {
+				spdlog::warn(
+					"RenderGraph::Execute frame={} slot={} queue={} nextFenceValue={} lagged completedFenceValue={}; raising next fence to {}",
+					static_cast<unsigned>(context.frameIndex),
+					qi,
+					QueueKindToString(m_queueRegistry.GetKind(slotIndex)),
+					nextFenceValue,
+					completedFenceValue,
+					minimumNextFenceValue);
+				m_queueRegistry.EnsureNextFenceValueAtLeast(slotIndex, minimumNextFenceValue);
+				nextFenceValue = m_queueRegistry.GetCurrentFenceValue(slotIndex);
+			}
+		}
+		lastSignaledPerSlot[qi] = nextFenceValue > 0 ? nextFenceValue - 1 : 0;
 	}
 
 	// Execution, two paths: heavyDebug (serial) or normal (parallel).

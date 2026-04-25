@@ -349,6 +349,39 @@ namespace rg::imm {
             CopyTextureToBuffer(Resolve(texture), mip, slice, Resolve(buffer), footprint, x, y, z);
         }
 
+        // texture and buffer owning overload of CopyTextureToBuffer
+        void CopyTextureToBuffer(const std::shared_ptr<Resource>& texture, const uint32_t mip, const uint32_t slice,
+            const std::shared_ptr<Resource>& buffer,
+            rhi::CopyableFootprint const& footprint,
+            const uint32_t x = 0, const uint32_t y = 0, const uint32_t z = 0)
+        {
+            const auto textureHandle = Resolve(texture.get(), texture); // Pin the ephemeral resource
+            const auto bufferHandle = Resolve(buffer.get(), buffer); // Pin the ephemeral resource
+            CopyTextureToBuffer(textureHandle, mip, slice, bufferHandle, footprint, x, y, z);
+        }
+
+        // Owned texture and handle buffer overload of CopyTextureToBuffer
+        void CopyTextureToBuffer(const std::shared_ptr<Resource>& texture, const uint32_t mip, const uint32_t slice,
+            Resource* buffer,
+            rhi::CopyableFootprint const& footprint,
+            const uint32_t x = 0, const uint32_t y = 0, const uint32_t z = 0)
+        {
+            const auto textureHandle = Resolve(texture.get(), texture); // Pin the ephemeral resource
+            const auto bufferHandle = Resolve(buffer);
+            CopyTextureToBuffer(textureHandle, mip, slice, bufferHandle, footprint, x, y, z);
+        }
+
+        // Handle texture and owned buffer overload of CopyTextureToBuffer
+        void CopyTextureToBuffer(Resource* texture, const uint32_t mip, const uint32_t slice,
+            const std::shared_ptr<Resource>& buffer,
+            rhi::CopyableFootprint const& footprint,
+            const uint32_t x = 0, const uint32_t y = 0, const uint32_t z = 0)
+        {
+            const auto textureHandle = Resolve(texture);
+            const auto bufferHandle = Resolve(buffer.get(), buffer); // Pin the ephemeral resource
+            CopyTextureToBuffer(textureHandle, mip, slice, bufferHandle, footprint, x, y, z);
+        }
+
         void CopyBufferToTexture(ResourceIdentifier const& buffer,
             ResourceIdentifier const& texture, const uint32_t mip, const uint32_t slice,
             rhi::CopyableFootprint const& footprint,

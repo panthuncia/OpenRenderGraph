@@ -214,16 +214,26 @@ public:
         ResourceKey key = InternKey(id);
         Slot& s = slots[key.idx];
 
+        const bool isSameResource = s.alive && s.rawPointer == res.get();
+
         // If this slot previously pointed at a different resource pointer,
         // remove its reverse-map entry so stale pointer->handle lookups
         // do not survive replacement.
-        if (s.rawPointer) {
+        if (s.rawPointer && !isSameResource) {
             resourceToHandle.erase(s.rawPointer);
         }
 
         s.resource = res;
         s.rawPointer = res.get();
-        s.generation++; // bump on replacement
+
+        // Preserve handle stability when the same resource object is re-registered.
+        // Dynamic declaration refreshes routinely re-register stable resources during
+        // CompileFrame, and bumping generation in that case invalidates cached handles
+        // that were still valid for the same underlying object.
+        if (!isSameResource) {
+            s.generation++; // bump on first registration or true replacement
+        }
+
         s.alive = true;
         s.id = id;
 

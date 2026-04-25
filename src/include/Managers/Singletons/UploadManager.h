@@ -1,15 +1,18 @@
 #pragma once
 #include <wrl/client.h>
+#include <atomic>
 #include <vector>
 #include <memory>
 #include <functional>
 #include <mutex>
 #include <rhi.h>
+#include <string>
 #include <thread>
 #include <stacktrace>
 
 #include "rhi_helpers.h"
 #include "Render/ResourceRegistry.h"
+#include "Interfaces/IDynamicDeclaredResources.h"
 #include "RenderPasses/Base/RenderPass.h"
 #include "Resources/Buffers/Buffer.h"
 #include "Render/ImmediateExecution/ImmediateCommandList.h"
@@ -25,6 +28,10 @@ struct ResourceCopy {
 	std::shared_ptr<Resource> source;
 	std::shared_ptr<Resource> destination;
 	size_t size;
+	uint64_t sourceGlobalResourceId = 0;
+	uint64_t destinationGlobalResourceId = 0;
+	std::string sourceDebugName;
+	std::string destinationDebugName;
 };
 
 struct ReleaseRequest {
@@ -52,6 +59,10 @@ public:
 		size_t uploadBufferOffset{};
 		size_t dataBufferOffset{};
 		bool active = true;
+		const char* file = nullptr;
+		int line = 0;
+		uint64_t targetGlobalResourceId = 0;
+		std::string targetDebugName;
 	};
 
 	class TextureUpdate {
@@ -65,6 +76,10 @@ public:
 		uint32_t y;
 		uint32_t z;
 		std::shared_ptr<Resource> uploadBuffer;
+		const char* file = nullptr;
+		int line = 0;
+		uint64_t targetGlobalResourceId = 0;
+		std::string targetDebugName;
 	};
 
 	static UploadManager& GetInstance();
@@ -100,8 +115,9 @@ public:
 	void QueueResourceCopy(const std::shared_ptr<Resource>& destination, const std::shared_ptr<Resource>& source, size_t size);
 	void ExecuteResourceCopies(uint8_t frameIndex, rg::imm::ImmediateCommandList& commandList);
 	void ProcessDeferredReleases(uint8_t frameIndex);
-	void SetUploadResolveContext(UploadResolveContext ctx) { m_ctx = ctx; }
+	void SetUploadResolveContext(UploadResolveContext ctx);
 	std::shared_ptr<RenderPass> GetUploadPass() const { return m_uploadPass; }
+	std::string DescribeQueuedTargetByGlobalResourceId(uint64_t globalResourceId);
 
 	// ── Streaming upload API (copy-queue path) ──────────────────────────
 	/// Queue a streaming upload that will be executed on the copy queue
@@ -124,9 +140,13 @@ public:
 	void Cleanup();
 private:
 
-	class UploadPass : public RenderPass {
+	class UploadPass : public RenderPass, public IDynamicDeclaredResources {
 	public:
 		UploadPass() {
+		}
+
+		void DeclareResourceUsages(RenderPassBuilder* builder) override {
+			GetInstance().DeclareUploadPassResourceUsages(builder);
 		}
 
 		void Setup() override {
@@ -146,11 +166,26 @@ private:
 			// Cleanup if necessary
 		}
 
+		bool DeclaredResourcesChanged() const override {
+			return m_declaredResourcesDirty.exchange(false);
+		}
+
+		void MarkDeclaredResourcesDirty() {
+			m_declaredResourcesDirty.store(true);
+		}
+
+	private:
+		mutable std::atomic_bool m_declaredResourcesDirty = true;
+
 	};
 
 	UploadManager() {
 		m_uploadPass = std::make_shared<UploadPass>();
 	}
+	void MarkUploadPassDirty();
+	void PruneInvalidRegistryHandleUpdatesLocked(const char* reason);
+	void RefreshQueuedTargetTelemetryLocked();
+	void DeclareUploadPassResourceUsages(RenderPassBuilder* builder);
 	bool AllocateUploadRegion(size_t size, size_t alignment, std::shared_ptr<Resource>& outUploadBuffer, size_t& outOffset);
 
 	// Coalescing / last-write-wins helpers

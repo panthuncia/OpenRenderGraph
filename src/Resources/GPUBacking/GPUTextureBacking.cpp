@@ -9,6 +9,32 @@
 #include "Managers/Singletons/DeletionManager.h"
 #include "Resources/MemoryStatisticsComponents.h"
 
+namespace {
+uint16_t ResolveTextureMipLevels(const TextureDescription& desc)
+{
+	if (desc.imageDimensions.empty()) {
+		return 1;
+	}
+
+	const uint32_t totalArraySlices = desc.isCubemap
+		? 6u * desc.arraySize
+		: (desc.isArray ? desc.arraySize : 1u);
+
+	if (totalArraySlices > 0 &&
+		desc.imageDimensions.size() > totalArraySlices &&
+		(desc.imageDimensions.size() % totalArraySlices) == 0)
+	{
+		return static_cast<uint16_t>(desc.imageDimensions.size() / totalArraySlices);
+	}
+
+	if (desc.generateMipMaps) {
+		return rg::util::CalculateMipLevels(desc.imageDimensions[0].width, desc.imageDimensions[0].height);
+	}
+
+	return 1;
+}
+}
+
 GpuTextureBacking::GpuTextureBacking(CreateTag)
 {
 
@@ -62,8 +88,8 @@ void GpuTextureBacking::initialize(const TextureDescription& desc,
 	m_desc = desc;
 	DescriptorHeapManager& rm = DescriptorHeapManager::GetInstance();
 
-	// Determine the number of mip levels
-	uint16_t mipLevels = desc.generateMipMaps ? rg::util::CalculateMipLevels(desc.imageDimensions[0].width, desc.imageDimensions[0].height) : 1;
+	// Honor explicit subresource chains for file-backed textures and caches.
+	uint16_t mipLevels = ResolveTextureMipLevels(desc);
 
 	// Determine the array size
 	uint32_t arraySize = desc.arraySize;
@@ -189,7 +215,7 @@ void GpuTextureBacking::initialize(const TextureDescription& desc,
 
 	m_width = desc.imageDimensions[0].width;
 	m_height = desc.imageDimensions[0].height;
-	m_mipLevels = desc.generateMipMaps ? rg::util::CalculateMipLevels(static_cast<uint16_t>(m_width), static_cast<uint16_t>(m_height)) : 1;
+	m_mipLevels = ResolveTextureMipLevels(desc);
 	m_arraySize = desc.isCubemap ? 6 * desc.arraySize : (desc.isArray ? desc.arraySize : 1);
 	m_format = desc.format;
 
