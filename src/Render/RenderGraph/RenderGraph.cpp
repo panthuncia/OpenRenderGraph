@@ -197,8 +197,42 @@ namespace {
 
 		if (queue == QueueKind::Copy) {
 			const auto supported = rhi::ResourceAccessType::None |
-				rhi::ResourceAccessType::Common; // Cannot actually transition to copy on a copy queue
+				rhi::ResourceAccessType::Common |
+				rhi::ResourceAccessType::CopySource |
+				rhi::ResourceAccessType::CopyDest;
 			return (access & ~supported) == 0;
+		}
+
+		return false;
+	}
+
+	ResourceState NormalizeStateForQueue(QueueKind queue, ResourceState state) {
+		if (queue == QueueKind::Copy) {
+			const auto copyAccess = state.access & (rhi::ResourceAccessType::CopySource | rhi::ResourceAccessType::CopyDest);
+			if (copyAccess != rhi::ResourceAccessType(0)) {
+				// D3D12 enhanced barriers require copy-queue texture usage to stay in COMMON layout.
+				// Preserve copy-class access and sync, but normalize layout away from COPY_SOURCE/COPY_DEST.
+				state.layout = rhi::ResourceLayout::Common;
+				state.sync = rhi::ResourceSyncState::Copy;
+			}
+		}
+
+		return state;
+	}
+
+	bool QueueSupportsLayout(QueueKind queue, rhi::ResourceLayout layout) {
+		if (queue == QueueKind::Graphics) {
+			return true;
+		}
+
+		if (queue == QueueKind::Compute) {
+			return layout != rhi::ResourceLayout::RenderTarget &&
+				layout != rhi::ResourceLayout::DepthReadWrite &&
+				layout != rhi::ResourceLayout::DepthRead;
+		}
+
+		if (queue == QueueKind::Copy) {
+			return layout == rhi::ResourceLayout::Common;
 		}
 
 		return false;
@@ -216,6 +250,14 @@ namespace {
 		}
 		if (!QueueSupportsAccessType(queue, transition.newAccessType)) {
 			return false;
+		}
+		if (transition.pResource->HasLayout()) {
+			if (!QueueSupportsLayout(queue, transition.prevLayout)) {
+				return false;
+			}
+			if (!QueueSupportsLayout(queue, transition.newLayout)) {
+				return false;
+			}
 		}
 		return true;
 	}
@@ -2081,6 +2123,7 @@ void RenderGraph::AddTransition(
 	const QueueKind passQueue = m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(passQueueSlot));
 
 	auto resource = requirement.resource;
+	const ResourceState requiredState = NormalizeStateForQueue(passQueue, requirement.state);
 
 	// If this triggers, you're probably queueing an operation on an external/ephemeral resource, and then discarding it before the graph can use it.
 	if (!resource.IsEphemeral() && !_registry.IsValid(resource)) {
@@ -2111,9 +2154,9 @@ void RenderGraph::AddTransition(
 			resourceName,
 			uploadQueueMatch.empty() ? std::string("<none>") : uploadQueueMatch,
 			FormatRangeSpec(requirement.range),
-			static_cast<uint32_t>(requirement.state.access),
-			static_cast<uint32_t>(requirement.state.layout),
-			static_cast<uint32_t>(requirement.state.sync));
+			static_cast<uint32_t>(requiredState.access),
+			static_cast<uint32_t>(requiredState.layout),
+			static_cast<uint32_t>(requiredState.sync));
 		throw (std::runtime_error("Invalid resource handle in RenderGraph::AddTransition"));
 	}
 	scratchTransitions.clear();
@@ -2146,22 +2189,22 @@ void RenderGraph::AddTransition(
 				pRes,
 				requirement.range,
 				rhi::ResourceAccessType::None,
-				requirement.state.access,
+				requiredState.access,
 				rhi::ResourceLayout::Undefined,
-				requirement.state.layout,
+				requiredState.layout,
 				rhi::ResourceSyncState::None,
-				requirement.state.sync,
+				requiredState.sync,
 				true);
 		}
 		else {
 			throw std::runtime_error("Alias activation requires first use to be a write when explicit initialization is disabled");
 		}
 		std::vector<ResourceTransition> ignored;
-		compileTracker.Apply(requirement.range, pRes, requirement.state, ignored);
+		compileTracker.Apply(requirement.range, pRes, requiredState, ignored);
 		aliasActivationPending.erase(resource.GetGlobalResourceID());
 	}
 	else {
-		compileTracker.Apply(requirement.range, pRes, requirement.state, transitions);
+		compileTracker.Apply(requirement.range, pRes, requiredState, transitions);
 	}
 
 	if (!transitions.empty()) {

@@ -435,10 +435,11 @@ namespace rg::imm {
             // Copy queue only supports copy-class access; always use Copy sync.
             if ((access & (rhi::ResourceAccessType::CopySource | rhi::ResourceAccessType::CopyDest)) != rhi::ResourceAccessType(0)) {
                 sync = rhi::ResourceSyncState::Copy;
+                layout = rhi::ResourceLayout::Common;
             } else {
                 sync = rhi::ResourceSyncState::All;
+                layout = AccessToLayout(access, /*isRender=*/false);
             }
-            layout = AccessToLayout(access, /*isRender=*/false);
             break;
         default:
             sync = rhi::ResourceSyncState::All;
