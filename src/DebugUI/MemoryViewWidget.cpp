@@ -506,6 +506,7 @@ namespace ui {
             texDesc.texture.depthOrLayers = 1;
             texDesc.texture.mipLevels = 1;
             texDesc.texture.sampleCount = 1;
+            texDesc.texture.initialLayout = rhi::ResourceLayout::CopyDest;
 
             auto createResult = device.CreateCommittedResource(texDesc, previewTexture_);
             if (rhi::Failed(createResult) || !previewTexture_) {
@@ -534,6 +535,20 @@ namespace ui {
                 fp.width, fp.height, 1,
                 1, 1,
                 rhi::Span<const rhi::helpers::SubresourceData>(&subData, 1));
+
+            rhi::TextureBarrier previewToSrv{};
+            previewToSrv.texture = previewTexture_->GetHandle();
+            previewToSrv.range = { 0, 1, 0, 1 };
+            previewToSrv.beforeSync = rhi::ResourceSyncState::Copy;
+            previewToSrv.afterSync = rhi::ResourceSyncState::AllShading;
+            previewToSrv.beforeAccess = rhi::ResourceAccessType::CopyDest;
+            previewToSrv.afterAccess = rhi::ResourceAccessType::ShaderResource;
+            previewToSrv.beforeLayout = rhi::ResourceLayout::CopyDest;
+            previewToSrv.afterLayout = rhi::ResourceLayout::ShaderResource;
+
+            rhi::BarrierBatch barrierBatch{};
+            barrierBatch.textures = { &previewToSrv, 1 };
+            cmdList->Barriers(barrierBatch);
 
             cmdList->End();
 

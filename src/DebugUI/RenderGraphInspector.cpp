@@ -695,11 +695,11 @@ namespace RGInspector {
                     for (auto const& queuedPass : passesVec) {
                         const bool usesSelected = std::visit(
                             [&](const auto& pass) {
-                                using TPass = std::decay_t<decltype(pass)>;
+                                using TPass = std::remove_pointer_t<std::decay_t<decltype(pass)>>;
                                 constexpr int passKind =
                                     std::is_same_v<TPass, RenderGraph::ComputePassAndResources> ? 1 :
                                     std::is_same_v<TPass, RenderGraph::CopyPassAndResources> ? 2 : 0;
-                                return passUses(static_cast<const void*>(&pass), s_selectedRes, passKind);
+                                return pass != nullptr && passUses(static_cast<const void*>(pass), s_selectedRes, passKind);
                             },
                             queuedPass);
                         if (usesSelected) {
