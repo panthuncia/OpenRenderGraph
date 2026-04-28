@@ -146,6 +146,7 @@ public:
 		// Optional: if true, the pass will be registered in Get*PassByName().
 		bool registerName = true;
 		bool isGeometryPass = false; // Optional: opts pass into statistics tracking for rasterization
+		bool collectStatistics = true;
 
 		static ExternalPassDesc Render(std::string name, std::shared_ptr<RenderPass> renderPass) {
 			ExternalPassDesc desc{};
@@ -242,6 +243,16 @@ public:
 			techniquePath = std::move(path);
 			return std::move(*this);
 		}
+
+		ExternalPassDesc& CollectStatistics(bool enabled = true) & {
+			collectStatistics = enabled;
+			return *this;
+		}
+
+		ExternalPassDesc CollectStatistics(bool enabled = true) && {
+			collectStatistics = enabled;
+			return std::move(*this);
+		}
 	};
 
 	struct IRenderGraphExtension {
@@ -273,6 +284,7 @@ public:
 		std::string name;
 		std::string techniquePath;
 		int statisticsIndex = -1;
+		bool collectStatistics = true;
 
 		PassRunMask run = PassRunMask::Both; // default behavior
 		std::vector<std::byte> immediateBytecode; // Stores the immediate execution bytecode
@@ -286,6 +298,7 @@ public:
 		std::string name;
 		std::string techniquePath;
 		int statisticsIndex = -1;
+		bool collectStatistics = true;
 
 		PassRunMask run = PassRunMask::Both;
 		std::vector<std::byte> immediateBytecode; // Stores the immediate execution bytecode
@@ -299,6 +312,7 @@ public:
 		std::string name;
 		std::string techniquePath;
 		int statisticsIndex = -1;
+		bool collectStatistics = true;
 
 		PassRunMask run = PassRunMask::Both;
 		std::vector<std::byte> immediateBytecode;

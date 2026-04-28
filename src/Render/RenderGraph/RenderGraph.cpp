@@ -363,6 +363,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 		par.pass = std::move(rp);
 		par.name = d.name;
 		par.techniquePath = d.techniquePath;
+		par.collectStatistics = d.collectStatistics;
 		{
 			RenderPassBuilder b(this, d.name);
 			b.pass = par.pass;
@@ -431,6 +432,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 		par.pass = std::move(cp);
 		par.name = d.name;
 		par.techniquePath = d.techniquePath;
+		par.collectStatistics = d.collectStatistics;
 		{
 			ComputePassBuilder b(this, d.name);
 			b.pass = par.pass;
@@ -497,6 +499,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 		par.pass = std::move(cp);
 		par.name = d.name;
 		par.techniquePath = d.techniquePath;
+		par.collectStatistics = d.collectStatistics;
 		{
 			CopyPassBuilder b(this, d.name);
 			b.pass = par.pass;
@@ -4168,6 +4171,10 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			auto& any = m_framePasses[i];
 			if (any.type == PassType::Render) {
 				auto& p = std::get<RenderPassAndResources>(any.pass);
+				if (!p.collectStatistics) {
+					p.statisticsIndex = -1;
+					continue;
+				}
 				if (p.name.empty()) {
 					p.name = "RenderPass#" + std::to_string(i);
 				}
@@ -4176,6 +4183,10 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			}
 			else if (any.type == PassType::Compute) {
 				auto& p = std::get<ComputePassAndResources>(any.pass);
+				if (!p.collectStatistics) {
+					p.statisticsIndex = -1;
+					continue;
+				}
 				if (p.name.empty()) {
 					p.name = "ComputePass#" + std::to_string(i);
 				}
@@ -4184,6 +4195,10 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			}
 			else if (any.type == PassType::Copy) {
 				auto& p = std::get<CopyPassAndResources>(any.pass);
+				if (!p.collectStatistics) {
+					p.statisticsIndex = -1;
+					continue;
+				}
 				if (p.name.empty()) {
 					p.name = "CopyPass#" + std::to_string(i);
 				}
@@ -5612,7 +5627,10 @@ void RenderGraph::Update(const UpdateExecutionContext& context, rhi::Device devi
 						spdlog::info("RG frame {} pass update '{}' begin", context.frameIndex, obj.name);
 					}
 
-					if (m_statisticsService && obj.statisticsIndex < 0) {
+					if (!obj.collectStatistics) {
+						obj.statisticsIndex = -1;
+					}
+					else if (m_statisticsService && obj.statisticsIndex < 0) {
 						if constexpr (std::is_same_v<T, RenderPassAndResources>) {
 							obj.statisticsIndex = static_cast<int>(m_statisticsService->RegisterPass(obj.name, obj.resources.isGeometryPass, obj.techniquePath));
 						}
