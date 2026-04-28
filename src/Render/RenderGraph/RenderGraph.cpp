@@ -169,15 +169,13 @@ namespace {
 		case QueueKind::Compute:
 			return !ResourceSyncStateIsNotComputeSyncState(state);
 		case QueueKind::Copy:
-			switch (state) {
-			case rhi::ResourceSyncState::None:
-			case rhi::ResourceSyncState::All:
-			case rhi::ResourceSyncState::Copy:
-			case rhi::ResourceSyncState::Resolve:
-				return true;
-			default:
-				return false;
-			}
+			return ResourceSyncStateHasOnly(
+				state,
+				rhi::ResourceSyncState::None
+				| rhi::ResourceSyncState::All
+				| rhi::ResourceSyncState::Copy
+				| rhi::ResourceSyncState::Resolve
+				| rhi::ResourceSyncState::SyncSplit);
 		default:
 			return false;
 		}
@@ -2238,9 +2236,13 @@ void RenderGraph::AddTransition(
 	if (!isAliasActivation) {
 		unsigned int lastUseBatch = 0;
 		uint64_t lastUseQueueMask = 0;
+		bool requiresCrossQueuePlacementCoordination = false;
 		const bool canUseEventSummary = !m_frameResourceEventSummaries.empty();
 		if (canUseEventSummary) {
 			std::tie(lastUseBatch, lastUseQueueMask) = GetFrameResourceLastEventBeforeBatch(requirement.resourceIndex, batchIndex);
+			requiresCrossQueuePlacementCoordination =
+				lastUseQueueMask != 0 &&
+				(lastUseQueueMask & ~(uint64_t{ 1 } << transitionSlot)) != 0;
 		}
 		else {
 			int scannedLastUseBatch = -1;
@@ -2256,49 +2258,27 @@ void RenderGraph::AddTransition(
 			}
 			if (scannedLastUseBatch > 0) {
 				lastUseBatch = static_cast<unsigned int>(scannedLastUseBatch);
-			}
-		}
-
-		if (lastUseBatch > 0) { // > 0 to skip batch 0 (placeholder with no fence values)
-			PassBatch& targetBatch = batches[lastUseBatch];
-
-			for (auto& transition : transitions) {
-				targetBatch.Transitions(transitionSlot, BatchTransitionPhase::AfterPasses).push_back(transition);
-			}
-
-			// If the transition queue differs from the queue(s) that last used the resource in the target batch,
-			// the transition queue must wait for those queues to finish before executing AfterPasses transitions.
-			if (canUseEventSummary) {
 				for (size_t qi = 0; qi < m_queueRegistry.SlotCount(); ++qi) {
-					if (qi == transitionSlot || (lastUseQueueMask & (uint64_t{ 1 } << qi)) == 0) {
+					if (qi == transitionSlot) {
 						continue;
 					}
-
-					targetBatch.MarkQueueSignal(BatchSignalPhase::AfterExecution, qi);
-					targetBatch.AddQueueWait(
-						BatchWaitPhase::BeforeAfterPasses,
-						transitionSlot,
-						qi,
-						targetBatch.GetQueueSignalFenceValue(BatchSignalPhase::AfterExecution, qi));
-				}
-			}
-			else {
-				for (size_t qi = 0; qi < m_queueRegistry.SlotCount(); ++qi) {
-					if (qi == transitionSlot) continue;
 
 					const bool usedInTargetBatch =
 						GetFrameQueueHistoryValue(m_frameQueueLastUsageBatch, qi, requirement.resourceIndex) == lastUseBatch
 						|| GetFrameQueueHistoryValue(m_frameQueueLastTransitionBatch, qi, requirement.resourceIndex) == lastUseBatch;
-
 					if (usedInTargetBatch) {
-						targetBatch.MarkQueueSignal(BatchSignalPhase::AfterExecution, qi);
-						targetBatch.AddQueueWait(
-							BatchWaitPhase::BeforeAfterPasses,
-							transitionSlot,
-							qi,
-							targetBatch.GetQueueSignalFenceValue(BatchSignalPhase::AfterExecution, qi));
+						requiresCrossQueuePlacementCoordination = true;
+						break;
 					}
 				}
+			}
+		}
+
+		if (lastUseBatch > 0 && !requiresCrossQueuePlacementCoordination) { // > 0 to skip batch 0 (placeholder with no fence values)
+			PassBatch& targetBatch = batches[lastUseBatch];
+
+			for (auto& transition : transitions) {
+				targetBatch.Transitions(transitionSlot, BatchTransitionPhase::AfterPasses).push_back(transition);
 			}
 
 			// Signal AfterCompletion on the transition queue so downstream consumers can wait on it

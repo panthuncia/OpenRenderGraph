@@ -1089,7 +1089,10 @@ private:
 		}
 
 		// Handle the "producer" wait
-		if (lastProdBatch != -1) {
+		// Writes are also recorded into the transition history for scheduling.
+		// Only preserve a separate producer wait if it would extend beyond the
+		// transition wait we already emitted.
+		if (lastProdBatch != -1 && lastProdBatch > lastTransBatch) {
 			const UINT64 completionFence = sourceCompletionFence(lastProdBatch);
 			if (completionFence != 0) {
 				markSourceCompletionSignal(lastProdBatch);
