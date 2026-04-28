@@ -1,5 +1,7 @@
 #include "Render/RenderGraph/RenderGraph.h"
 
+#include "DebugUI/MemoryIntrospectionWidget.h"
+
 #include <algorithm>
 #include <boost/functional/hash.hpp>
 #include <cmath>
@@ -24,6 +26,395 @@ RenderGraph::AutoAliasDebugSnapshot RenderGraph::GetAutoAliasDebugSnapshot() con
 		autoAliasPlannerStats,
 		autoAliasExclusionReasonSummary,
 		autoAliasPoolDebug);
+}
+
+namespace {
+	constexpr size_t kInvalidPassIndex = std::numeric_limits<size_t>::max();
+
+	struct FrameGraphMemoryInfo {
+		uint64_t bytes = 0;
+		std::string category;
+	};
+
+	struct BatchPassSpan {
+		size_t firstPassIndex = kInvalidPassIndex;
+		size_t lastPassIndex = kInvalidPassIndex;
+
+		bool IsValid() const {
+			return firstPassIndex != kInvalidPassIndex &&
+				lastPassIndex != kInvalidPassIndex &&
+				firstPassIndex <= lastPassIndex;
+		}
+	};
+
+	struct LiveIntervalRecord {
+		uint64_t resourceID = 0;
+		uint64_t bytes = 0;
+		size_t firstPassIndex = kInvalidPassIndex;
+		size_t lastPassIndex = kInvalidPassIndex;
+		uint64_t poolID = 0;
+		uint64_t startByte = 0;
+		uint64_t endByte = 0;
+		bool pooled = false;
+	};
+
+	const char* FrameGraphMajorCategory(rhi::ResourceType type) {
+		using RT = rhi::ResourceType;
+		switch (type) {
+		case RT::Buffer:                return "Buffers";
+		case RT::Texture1D:             return "Textures";
+		case RT::Texture2D:             return "Textures";
+		case RT::Texture3D:             return "Textures";
+		case RT::AccelerationStructure: return "AccelStructs";
+		default:                        return "Other";
+		}
+	}
+
+	std::unordered_map<uint64_t, FrameGraphMemoryInfo> BuildFrameGraphMemoryIndex(
+		const std::vector<rg::memory::ResourceMemoryRecord>& memoryRecords) {
+		std::unordered_map<uint64_t, FrameGraphMemoryInfo> out;
+		out.reserve(memoryRecords.size());
+
+		for (const auto& record : memoryRecords) {
+			if (record.resourceID == 0) {
+				continue;
+			}
+
+			const char* major = FrameGraphMajorCategory(record.resourceType);
+			const char* usage = !record.usage.empty() ? record.usage.c_str() : "Unspecified";
+
+			out[record.resourceID] = FrameGraphMemoryInfo{
+				.bytes = record.bytes,
+				.category = std::string(major) + "/" + usage,
+			};
+		}
+
+		return out;
+	}
+
+	uint64_t ComputeUnionBytes(std::vector<std::pair<uint64_t, uint64_t>>& ranges) {
+		if (ranges.empty()) {
+			return 0;
+		}
+
+		std::sort(ranges.begin(), ranges.end(), [](const auto& a, const auto& b) {
+			if (a.first != b.first) {
+				return a.first < b.first;
+			}
+			return a.second < b.second;
+		});
+
+		uint64_t total = 0;
+		uint64_t currentStart = ranges.front().first;
+		uint64_t currentEnd = ranges.front().second;
+
+		for (size_t i = 1; i < ranges.size(); ++i) {
+			const auto& range = ranges[i];
+			if (range.second <= range.first) {
+				continue;
+			}
+
+			if (range.first > currentEnd) {
+				total += currentEnd - currentStart;
+				currentStart = range.first;
+				currentEnd = range.second;
+				continue;
+			}
+
+			currentEnd = (std::max)(currentEnd, range.second);
+		}
+
+		total += currentEnd - currentStart;
+		return total;
+	}
+}
+
+void RenderGraph::BuildMemoryIntrospectionFrameGraphSnapshot(
+	ui::FrameGraphSnapshot& out,
+	const std::vector<rg::memory::ResourceMemoryRecord>& memoryRecords) const {
+	out.batches.clear();
+	out.batches.reserve(batches.size());
+
+	const auto memIndex = BuildFrameGraphMemoryIndex(memoryRecords);
+
+	std::unordered_set<uint64_t> uniqueIds;
+	uniqueIds.reserve(2048);
+	std::unordered_map<std::string, uint64_t> catSum;
+	catSum.reserve(64);
+	std::unordered_map<uint64_t, size_t> firstTouchedBatchByResource;
+	std::unordered_map<uint64_t, size_t> lastTouchedBatchByResource;
+	firstTouchedBatchByResource.reserve(memIndex.size());
+	lastTouchedBatchByResource.reserve(memIndex.size());
+	std::vector<BatchPassSpan> batchPassSpans(batches.size());
+
+	std::unordered_map<const void*, size_t> passIndexByAddress;
+	passIndexByAddress.reserve(m_framePasses.size() * 2);
+	for (size_t passIndex = 0; passIndex < m_framePasses.size(); ++passIndex) {
+		const auto& anyPass = m_framePasses[passIndex];
+		if (const auto* renderPass = std::get_if<RenderPassAndResources>(&anyPass.pass)) {
+			passIndexByAddress.emplace(static_cast<const void*>(renderPass), passIndex);
+		}
+		else if (const auto* computePass = std::get_if<ComputePassAndResources>(&anyPass.pass)) {
+			passIndexByAddress.emplace(static_cast<const void*>(computePass), passIndex);
+		}
+		else if (const auto* copyPass = std::get_if<CopyPassAndResources>(&anyPass.pass)) {
+			passIndexByAddress.emplace(static_cast<const void*>(copyPass), passIndex);
+		}
+	}
+
+	for (int batchIndex = 0; batchIndex < static_cast<int>(batches.size()); ++batchIndex) {
+		const auto& batch = batches[batchIndex];
+		auto& batchSpan = batchPassSpans[batchIndex];
+		uniqueIds.clear();
+
+		auto scanTransitions = [&](const std::vector<ResourceTransition>& transitions) {
+			for (const auto& transition : transitions) {
+				if (!transition.pResource) {
+					continue;
+				}
+				uniqueIds.insert(transition.pResource->GetGlobalResourceID());
+			}
+		};
+
+		for (size_t phaseIndex = 0; phaseIndex < static_cast<size_t>(BatchTransitionPhase::Count); ++phaseIndex) {
+			const auto phase = static_cast<BatchTransitionPhase>(phaseIndex);
+			for (size_t queueIndex = 0; queueIndex < static_cast<size_t>(QueueKind::Count); ++queueIndex) {
+				const auto queue = static_cast<QueueKind>(queueIndex);
+				scanTransitions(batch.Transitions(queue, phase));
+			}
+		}
+
+		for (uint64_t id : batch.allResources) {
+			uniqueIds.insert(id);
+		}
+		for (uint64_t id : batch.internallyTransitionedResources) {
+			uniqueIds.insert(id);
+		}
+
+		uint64_t footprintBytes = 0;
+		catSum.clear();
+
+		for (uint64_t id : uniqueIds) {
+			firstTouchedBatchByResource.try_emplace(id, static_cast<size_t>(batchIndex));
+			lastTouchedBatchByResource[id] = static_cast<size_t>(batchIndex);
+
+			auto it = memIndex.find(id);
+			if (it == memIndex.end()) {
+				continue;
+			}
+
+			footprintBytes += it->second.bytes;
+			catSum[it->second.category] += it->second.bytes;
+		}
+
+		ui::FrameGraphBatchRow row{};
+		row.label = "Batch " + std::to_string(batchIndex);
+		row.footprintBytes = footprintBytes;
+		row.peakLiveBytes = footprintBytes;
+		row.peakNaiveLiveBytes = footprintBytes;
+		row.aliasSavingsBytes = 0;
+		row.hasEndTransitions = batch.HasTransitions(QueueKind::Graphics, BatchTransitionPhase::AfterPasses);
+
+		size_t totalPassCount = 0;
+		for (size_t queueIndex = 0; queueIndex < static_cast<size_t>(QueueKind::Count); ++queueIndex) {
+			totalPassCount += batch.Passes(static_cast<QueueKind>(queueIndex)).size();
+		}
+		row.passNames.reserve(totalPassCount);
+		for (size_t queueIndex = 0; queueIndex < static_cast<size_t>(QueueKind::Count); ++queueIndex) {
+			const auto queue = static_cast<QueueKind>(queueIndex);
+			for (const auto& queuedPass : batch.Passes(queue)) {
+				std::visit(
+					[&](const auto* pass) {
+						if (pass != nullptr) {
+							row.passNames.push_back(pass->name);
+							auto itPassIndex = passIndexByAddress.find(static_cast<const void*>(pass));
+							if (itPassIndex != passIndexByAddress.end()) {
+								batchSpan.firstPassIndex = (std::min)(batchSpan.firstPassIndex, itPassIndex->second);
+								batchSpan.lastPassIndex = (std::max)(
+									batchSpan.lastPassIndex == kInvalidPassIndex ? itPassIndex->second : batchSpan.lastPassIndex,
+									itPassIndex->second);
+							}
+						}
+					},
+					queuedPass);
+			}
+		}
+
+		row.categories.reserve(catSum.size());
+		for (const auto& [label, bytes] : catSum) {
+			row.categories.push_back({ label, bytes });
+		}
+		std::sort(row.categories.begin(), row.categories.end(),
+			[](const auto& a, const auto& b) { return a.bytes > b.bytes; });
+
+		out.batches.push_back(std::move(row));
+	}
+
+	if (m_framePasses.empty() || out.batches.empty()) {
+		return;
+	}
+
+	size_t lastResolvedPass = kInvalidPassIndex;
+	for (auto& span : batchPassSpans) {
+		if (span.IsValid()) {
+			lastResolvedPass = span.lastPassIndex;
+			continue;
+		}
+		if (lastResolvedPass != kInvalidPassIndex) {
+			span.firstPassIndex = lastResolvedPass;
+			span.lastPassIndex = lastResolvedPass;
+		}
+	}
+
+	size_t nextResolvedPass = kInvalidPassIndex;
+	for (size_t index = batchPassSpans.size(); index-- > 0;) {
+		auto& span = batchPassSpans[index];
+		if (span.IsValid()) {
+			nextResolvedPass = span.firstPassIndex;
+			continue;
+		}
+		if (nextResolvedPass != kInvalidPassIndex) {
+			span.firstPassIndex = nextResolvedPass;
+			span.lastPassIndex = nextResolvedPass;
+		}
+	}
+
+	std::unordered_map<uint64_t, LiveIntervalRecord> liveIntervals;
+	liveIntervals.reserve(firstTouchedBatchByResource.size() + schedulingPlacementRangesByID.size());
+	const size_t passCount = m_framePasses.size();
+
+	for (const auto& [resourceID, placement] : schedulingPlacementRangesByID) {
+		auto itMem = memIndex.find(resourceID);
+		if (itMem == memIndex.end()) {
+			continue;
+		}
+		if (placement.firstUsePassIndex == kInvalidPassIndex || placement.lastUsePassIndex == kInvalidPassIndex) {
+			continue;
+		}
+		if (placement.firstUsePassIndex >= passCount || placement.lastUsePassIndex >= passCount || placement.firstUsePassIndex > placement.lastUsePassIndex) {
+			continue;
+		}
+
+		const uint64_t endByte = (std::max)(placement.endByte, placement.startByte + itMem->second.bytes);
+		liveIntervals[resourceID] = LiveIntervalRecord{
+			.resourceID = resourceID,
+			.bytes = itMem->second.bytes,
+			.firstPassIndex = placement.firstUsePassIndex,
+			.lastPassIndex = placement.lastUsePassIndex,
+			.poolID = placement.poolID,
+			.startByte = placement.startByte,
+			.endByte = endByte,
+			.pooled = !placement.dedicatedBacking,
+		};
+	}
+
+	for (const auto& [resourceID, firstBatchIndex] : firstTouchedBatchByResource) {
+		if (liveIntervals.contains(resourceID)) {
+			continue;
+		}
+
+		auto itMem = memIndex.find(resourceID);
+		if (itMem == memIndex.end()) {
+			continue;
+		}
+
+		const size_t lastBatchIndex = lastTouchedBatchByResource[resourceID];
+		if (firstBatchIndex >= batchPassSpans.size() || lastBatchIndex >= batchPassSpans.size()) {
+			continue;
+		}
+
+		const BatchPassSpan& firstSpan = batchPassSpans[firstBatchIndex];
+		const BatchPassSpan& lastSpan = batchPassSpans[lastBatchIndex];
+		if (!firstSpan.IsValid() || !lastSpan.IsValid()) {
+			continue;
+		}
+
+		liveIntervals[resourceID] = LiveIntervalRecord{
+			.resourceID = resourceID,
+			.bytes = itMem->second.bytes,
+			.firstPassIndex = firstSpan.firstPassIndex,
+			.lastPassIndex = lastSpan.lastPassIndex,
+			.poolID = 0,
+			.startByte = 0,
+			.endByte = itMem->second.bytes,
+			.pooled = false,
+		};
+	}
+
+	std::vector<std::vector<const LiveIntervalRecord*>> startEvents(passCount);
+	std::vector<std::vector<const LiveIntervalRecord*>> endEvents(passCount);
+	for (const auto& [resourceID, interval] : liveIntervals) {
+		(void)resourceID;
+		if (interval.firstPassIndex >= passCount || interval.lastPassIndex >= passCount || interval.firstPassIndex > interval.lastPassIndex) {
+			continue;
+		}
+		startEvents[interval.firstPassIndex].push_back(&interval);
+		endEvents[interval.lastPassIndex].push_back(&interval);
+	}
+
+	std::unordered_map<uint64_t, const LiveIntervalRecord*> activeIntervals;
+	activeIntervals.reserve(liveIntervals.size());
+	std::vector<uint64_t> naiveLiveBytesByPass(passCount, 0);
+	std::vector<uint64_t> actualLiveBytesByPass(passCount, 0);
+	uint64_t dedicatedLiveBytes = 0;
+	uint64_t naiveLiveBytes = 0;
+
+	for (size_t passIndex = 0; passIndex < passCount; ++passIndex) {
+		for (const LiveIntervalRecord* interval : startEvents[passIndex]) {
+			activeIntervals[interval->resourceID] = interval;
+			naiveLiveBytes += interval->bytes;
+			if (!interval->pooled) {
+				dedicatedLiveBytes += interval->bytes;
+			}
+		}
+
+		naiveLiveBytesByPass[passIndex] = naiveLiveBytes;
+		uint64_t actualLiveBytes = dedicatedLiveBytes;
+		std::unordered_map<uint64_t, std::vector<std::pair<uint64_t, uint64_t>>> poolRanges;
+		poolRanges.reserve(activeIntervals.size());
+		for (const auto& [resourceID, interval] : activeIntervals) {
+			(void)resourceID;
+			if (!interval->pooled) {
+				continue;
+			}
+			poolRanges[interval->poolID].push_back({ interval->startByte, interval->endByte });
+		}
+		for (auto& [poolID, ranges] : poolRanges) {
+			(void)poolID;
+			actualLiveBytes += ComputeUnionBytes(ranges);
+		}
+		actualLiveBytesByPass[passIndex] = actualLiveBytes;
+
+		for (const LiveIntervalRecord* interval : endEvents[passIndex]) {
+			activeIntervals.erase(interval->resourceID);
+			naiveLiveBytes -= interval->bytes;
+			if (!interval->pooled) {
+				dedicatedLiveBytes -= interval->bytes;
+			}
+		}
+	}
+
+	for (size_t batchIndex = 0; batchIndex < out.batches.size(); ++batchIndex) {
+		auto& row = out.batches[batchIndex];
+		const BatchPassSpan& span = batchPassSpans[batchIndex];
+		if (!span.IsValid() || span.firstPassIndex >= passCount || span.lastPassIndex >= passCount) {
+			row.peakLiveBytes = row.footprintBytes;
+			row.peakNaiveLiveBytes = row.footprintBytes;
+			row.aliasSavingsBytes = 0;
+			continue;
+		}
+
+		uint64_t peakActual = 0;
+		uint64_t peakNaive = 0;
+		for (size_t passIndex = span.firstPassIndex; passIndex <= span.lastPassIndex; ++passIndex) {
+			peakActual = (std::max)(peakActual, actualLiveBytesByPass[passIndex]);
+			peakNaive = (std::max)(peakNaive, naiveLiveBytesByPass[passIndex]);
+		}
+
+		row.peakLiveBytes = peakActual;
+		row.peakNaiveLiveBytes = peakNaive;
+		row.aliasSavingsBytes = peakNaive > peakActual ? (peakNaive - peakActual) : 0;
+	}
 }
 
 namespace {

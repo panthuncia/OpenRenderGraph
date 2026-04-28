@@ -46,6 +46,10 @@ class CopyPassBuilder;
 class CommandRecordingManager;
 struct IPassBuilder;
 
+namespace ui {
+	struct FrameGraphSnapshot;
+}
+
 template<typename T>
 concept DerivedResource = std::derived_from<T, Resource>;
 
@@ -523,6 +527,9 @@ public:
 	using AutoAliasPoolDebug = rg::alias::AutoAliasPoolDebug;
 	using AutoAliasDebugSnapshot = rg::alias::AutoAliasDebugSnapshot;
 	AutoAliasDebugSnapshot GetAutoAliasDebugSnapshot() const;
+	void BuildMemoryIntrospectionFrameGraphSnapshot(
+		ui::FrameGraphSnapshot& out,
+		const std::vector<rg::memory::ResourceMemoryRecord>& memoryRecords) const;
 	void AddRenderPass(std::shared_ptr<RenderPass> pass, RenderPassParameters& resources, std::string name = "", std::vector<ResolverSnapshot> resolverSnapshots = {});
 	void AddComputePass(std::shared_ptr<ComputePass> pass, ComputePassParameters& resources, std::string name = "", std::vector<ResolverSnapshot> resolverSnapshots = {});
 	void AddCopyPass(std::shared_ptr<CopyPass> pass, CopyPassParameters& resources, std::string name = "", std::vector<ResolverSnapshot> resolverSnapshots = {});
