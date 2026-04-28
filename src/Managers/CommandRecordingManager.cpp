@@ -16,8 +16,6 @@ CommandRecordingManager::CommandRecordingManager(const Init& init) {
     m_bind[static_cast<size_t>(QueueKind::Copy)] =
     { init.copyQ,     init.copyF,     init.copyPool,     rhi::QueueKind::Copy };
 
-    m_computeMode = init.computeMode;
-
     for (size_t i = 0; i < static_cast<size_t>(QueueKind::Count); ++i) {
         auto& bind = m_bind[i];
         if (bind.valid()) {
@@ -26,14 +24,8 @@ CommandRecordingManager::CommandRecordingManager(const Init& init) {
     }
 }
 
-QueueKind CommandRecordingManager::resolve(QueueKind qk) const {
-    if (qk == QueueKind::Compute && m_computeMode == ComputeMode::AliasToGraphics)
-        return QueueKind::Graphics;
-    return qk;
-}
-
 rhi::CommandList CommandRecordingManager::EnsureOpen(QueueKind requested, uint32_t frameEpoch) {
-    const QueueKind qk = resolve(requested);
+    const QueueKind qk = requested;
     auto& bind = m_bind[static_cast<size_t>(qk)];
     assert(bind.valid() && "Queue/Fence/Pool not initialized for this QueueKind");
 
@@ -61,7 +53,7 @@ rhi::CommandList CommandRecordingManager::EnsureOpen(QueueKind requested, uint32
 }
 
 uint64_t CommandRecordingManager::Flush(QueueKind requested, Signal sig) {
-    const QueueKind qk = resolve(requested);
+    const QueueKind qk = requested;
     const size_t qkIndex = static_cast<size_t>(qk);
     auto& bind = m_bind[static_cast<size_t>(qk)];
     auto& ctx = s_tls.ctxs[qkIndex];
@@ -145,12 +137,10 @@ void CommandRecordingManager::EndFrame() {
 }
 
 rhi::Timeline* CommandRecordingManager::Fence(QueueKind qk) const {
-    qk = const_cast<CommandRecordingManager*>(this)->resolve(qk);
     return m_bind[static_cast<size_t>(qk)].fence;
 }
 
 rhi::Queue* CommandRecordingManager::Queue(QueueKind qk) const {
-    qk = const_cast<CommandRecordingManager*>(this)->resolve(qk);
     return m_bind[static_cast<size_t>(qk)].queue;
 }
 

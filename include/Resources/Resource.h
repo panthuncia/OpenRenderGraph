@@ -72,10 +72,8 @@ public:
 			return;
 		}
 
-		auto entity = m_ecsEntity.ToEntity();
-		if (entity && entity.is_alive()) {
-			entity.destruct();
-		}
+		// Hooks have been reset (shutdown) - the world pointer may be dangling.
+		// Only attempt entity cleanup if hooks are still installed.
 		m_ecsEntity.Disarm();
 	}
 

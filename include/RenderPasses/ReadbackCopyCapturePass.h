@@ -11,29 +11,9 @@
 
 struct ReadbackCopyCaptureInputs {
     ResourceHandleAndRange target;
+
+    RG_DEFINE_PASS_INPUTS(ReadbackCopyCaptureInputs, &ReadbackCopyCaptureInputs::target);
 };
-
-inline rg::Hash64 HashValue(const ReadbackCopyCaptureInputs& i) {
-    std::size_t seed = 0;
-    boost::hash_combine(seed, i.target.resource.GetGlobalResourceID());
-    boost::hash_combine(seed, i.target.range.mipLower.type);
-    boost::hash_combine(seed, i.target.range.mipLower.value);
-    boost::hash_combine(seed, i.target.range.mipUpper.type);
-    boost::hash_combine(seed, i.target.range.mipUpper.value);
-    boost::hash_combine(seed, i.target.range.sliceLower.type);
-    boost::hash_combine(seed, i.target.range.sliceLower.value);
-    boost::hash_combine(seed, i.target.range.sliceUpper.type);
-    boost::hash_combine(seed, i.target.range.sliceUpper.value);
-    return static_cast<rg::Hash64>(seed);
-}
-
-inline bool operator==(const ReadbackCopyCaptureInputs& a, const ReadbackCopyCaptureInputs& b) {
-    return a.target.resource.GetGlobalResourceID() == b.target.resource.GetGlobalResourceID() &&
-           a.target.range.mipLower == b.target.range.mipLower &&
-           a.target.range.mipUpper == b.target.range.mipUpper &&
-           a.target.range.sliceLower == b.target.range.sliceLower &&
-           a.target.range.sliceUpper == b.target.range.sliceUpper;
-}
 
 /// A CopyPass variant of ReadbackCapturePass that runs on the copy queue.
 /// This allows readback copies to overlap with graphics/compute work.
@@ -51,13 +31,13 @@ public:
     void DeclareResourceUsages(CopyPassBuilder* builder) override {
         const auto& inputs = Inputs<ReadbackCopyCaptureInputs>();
         builder->WithCopySource(inputs.target);
-        builder->PreferCopyQueue();
+        builder->PreferQueue(QueueKind::Copy);
     }
 
     void Setup() override {
     }
 
-    void ExecuteImmediate(ImmediateExecutionContext& context) override {
+    void RecordImmediateCommands(ImmediateExecutionContext& context) override {
         const auto& inputs = Inputs<ReadbackCopyCaptureInputs>();
         auto* resource = m_resourceRegistryView->Resolve<Resource>(inputs.target.resource);
         if (!resource) {

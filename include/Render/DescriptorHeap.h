@@ -4,6 +4,7 @@
 #include <rhi.h>
 #include <queue>
 #include <vector>
+#include <mutex>
 
 class DescriptorHeap {
 public:
@@ -27,4 +28,5 @@ private:
     std::queue<UINT> m_freeIndices;
     rhi::DescriptorHeapType m_type;
     bool m_shaderVisible;
+    std::mutex m_allocationMutex;
 };

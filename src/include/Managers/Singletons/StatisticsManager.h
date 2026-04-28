@@ -2,13 +2,17 @@
 
 #include <vector>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <cstdint>
 #include <utility>
 #include <functional>
 #include <limits>
+#include <mutex>
 #include <rhi.h>
 #include "Render/Runtime/StatisticsTypes.h"
+
+using QueryRecordingContext = rg::runtime::QueryRecordingContext;
 
 using PassStats = rg::runtime::PassStats;
 using MeshPipelineStats = rg::runtime::MeshPipelineStats;
@@ -21,7 +25,7 @@ public:
 
 	void RegisterPasses(const std::vector<std::string>& passNames);
     
-	unsigned RegisterPass(const std::string& passName, bool isGeometryPass = false);
+	unsigned RegisterPass(const std::string& passName, bool isGeometryPass = false, std::string_view techniquePath = {});
 
 	void BeginFrame();
 
@@ -47,8 +51,16 @@ public:
 		rhi::Queue& queue,
 		rhi::CommandList& cmdList);
 
+	// Thread-safe overloads that use a per-task recording context.
+	void BeginQuery(unsigned passIndex, unsigned frameIndex, rhi::Queue& queue, rhi::CommandList& cmdList, QueryRecordingContext& ctx);
+	void EndQuery(unsigned passIndex, unsigned frameIndex, rhi::Queue& queue, rhi::CommandList& cmdList, QueryRecordingContext& ctx);
+	void ResolveQueries(unsigned frameIndex, rhi::Queue& queue, rhi::CommandList& cmdList, QueryRecordingContext& ctx);
+	void MergePendingResolves(rhi::QueueKind queueKind, unsigned frameIndex, QueryRecordingContext& ctx);
+
 	void OnFrameComplete(unsigned frameIndex,
 		rhi::Queue& queue);
+	void RecordCpuUpdateTime(unsigned passIndex, double milliseconds);
+	void RecordCpuExecuteTime(unsigned passIndex, double milliseconds);
 
 	void ClearAll();
 
@@ -57,6 +69,7 @@ public:
 	const std::vector<unsigned>& GetVisiblePassIndices(uint64_t maxStaleFrames) const;
 
 	const std::vector<std::string>&        GetPassNames() const { return m_passNames; }
+	const std::vector<std::string>&        GetPassTechniquePaths() const { return m_passTechniquePaths; }
 	const std::vector<PassStats>&          GetPassStats() const { return m_stats; }
 	const std::vector<MeshPipelineStats>&  GetMeshStats() const { return m_meshStatsEma; }
 	rg::runtime::MemoryBudgetStats GetMemoryBudgetStats() const { return m_memoryBudgetStats; }
@@ -66,9 +79,13 @@ private:
 	~StatisticsManager() = default;
 
 	void EnsureQueueBuffers(rhi::QueueKind queueKind);
+	void RecordCpuTimeSample(unsigned passIndex, double milliseconds, bool isUpdate);
 
+	bool m_collectPassStatistics = true;
+	std::function<bool()> m_getCollectPassStatistics;
 	bool m_collectPipelineStatistics = false;
 	std::function<bool()> m_getCollectPipelineStatistics;
+	std::mutex m_cpuStatsMutex;
 
 	rhi::QueryPoolPtr m_timestampPool;
 	rhi::QueryPoolPtr m_pipelineStatsPool;
@@ -89,13 +106,14 @@ private:
 	uint64_t  m_frameSerial = 0;
 	static constexpr uint64_t kNeverSeenFrame = (std::numeric_limits<uint64_t>::max)();
 	uint64_t  m_defaultMaxStaleFrames = 240;
-	std::vector<uint64_t> m_passLastDataFrame;
+	std::vector<uint64_t> m_passLastExecutionFrame;
 	mutable std::vector<unsigned> m_visiblePassIndices;
 
 	void RebuildVisiblePassIndices(uint64_t maxStaleFrames, std::vector<unsigned>& out) const;
 
 	// Per-pass data
 	std::vector<std::string>        m_passNames;
+	std::vector<std::string>        m_passTechniquePaths;
 	std::vector<PassStats>          m_stats;
 	std::vector<bool>               m_isGeometryPass;
 	std::vector<MeshPipelineStats>  m_meshStatsEma;

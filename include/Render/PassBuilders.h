@@ -1,8 +1,12 @@
 #pragma once
 
+#include <algorithm>
 #include <type_traits>
 #include <memory>
+#include <stdexcept>
 #include <rhi.h>
+
+#include <spdlog/spdlog.h>
 
 #include "Render/RenderGraph/RenderGraph.h"
 #include "ResourceRequirements.h"
@@ -391,6 +395,99 @@ namespace detail
     template<class S>
     concept StringLike =
         std::convertible_to<S, std::string_view>;
+
+        inline bool IsWholeRange(const RangeSpec& range) {
+		return range.mipLower == Bound{ BoundType::All, 0 }
+			&& range.mipUpper == Bound{ BoundType::All, 0 }
+			&& range.sliceLower == Bound{ BoundType::All, 0 }
+			&& range.sliceUpper == Bound{ BoundType::All, 0 };
+        }
+
+        inline void AppendUniqueDescriptorRegistration(std::vector<AutoDescriptorRegistration>& registrations, const AutoDescriptorRegistration& registration) {
+        if (std::find(registrations.begin(), registrations.end(), registration) == registrations.end()) {
+            registrations.push_back(registration);
+        }
+        }
+
+        inline bool TryResolveAutoDescriptorRange(const RangeSpec& range, unsigned int& mip, unsigned int& slice) {
+            if (IsWholeRange(range)) {
+                mip = 0;
+                slice = 0;
+                return true;
+            }
+
+            const bool exactMip = range.mipLower.type == BoundType::Exact && range.mipUpper.type == BoundType::Exact;
+            const bool wholeMip = range.mipLower == Bound{ BoundType::All, 0 } && range.mipUpper == Bound{ BoundType::All, 0 };
+            const bool exactSlice = range.sliceLower.type == BoundType::Exact && range.sliceUpper.type == BoundType::Exact;
+            const bool wholeSlice = range.sliceLower == Bound{ BoundType::All, 0 } && range.sliceUpper == Bound{ BoundType::All, 0 };
+
+            if (!(wholeMip || (exactMip && range.mipLower.value == range.mipUpper.value))) {
+                return false;
+            }
+            if (!(wholeSlice || (exactSlice && range.sliceLower.value == range.sliceUpper.value))) {
+                return false;
+            }
+
+            mip = exactMip ? range.mipLower.value : 0;
+            slice = exactSlice ? range.sliceLower.value : 0;
+            return true;
+        }
+
+        inline bool IsResolverBackedIdentifier(RenderGraph* graph, const ResourceIdentifier& id) {
+		return graph != nullptr && graph->RequestResolver(id, true) != nullptr;
+        }
+
+        inline void TrackDefaultDescriptorIdentifier(RenderGraph* graph, std::vector<AutoDescriptorRegistration>& registrations, const ResourceIdentifier& id, DescriptorType type) {
+            if (IsResolverBackedIdentifier(graph, id)) {
+                return;
+            }
+
+            DescriptorAccessor accessor{};
+            accessor.type = type;
+            accessor.mip = 0;
+            accessor.slice = 0;
+            AppendUniqueDescriptorRegistration(registrations, AutoDescriptorRegistration{ id, accessor });
+        }
+
+        inline void TrackDefaultDescriptorIdentifier(RenderGraph* graph, std::vector<AutoDescriptorRegistration>& registrations, const ResourceIdentifierAndRange& idAndRange, DescriptorType type) {
+            if (IsResolverBackedIdentifier(graph, idAndRange.identifier)) {
+                return;
+            }
+
+            unsigned int mip = 0;
+            unsigned int slice = 0;
+            if (!TryResolveAutoDescriptorRange(idAndRange.range, mip, slice)) {
+                return;
+            }
+
+            DescriptorAccessor accessor{};
+            accessor.type = type;
+            accessor.mip = mip;
+            accessor.slice = slice;
+            AppendUniqueDescriptorRegistration(registrations, AutoDescriptorRegistration{ idAndRange.identifier, accessor });
+        }
+
+        inline void TrackDefaultDescriptorIdentifier(RenderGraph* graph, std::vector<AutoDescriptorRegistration>& registrations, const char* id, DescriptorType type) {
+        TrackDefaultDescriptorIdentifier(graph, registrations, ResourceIdentifier{ id }, type);
+        }
+
+        inline void TrackDefaultDescriptorIdentifier(RenderGraph* graph, std::vector<AutoDescriptorRegistration>& registrations, std::string_view id, DescriptorType type) {
+        TrackDefaultDescriptorIdentifier(graph, registrations, ResourceIdentifier{ id }, type);
+        }
+
+        template<class S>
+		requires (StringLike<S> && !std::is_same_v<std::remove_cvref_t<S>, const char*> && !std::is_same_v<std::remove_cvref_t<S>, char*>)
+        inline void TrackDefaultDescriptorIdentifier(RenderGraph* graph, std::vector<AutoDescriptorRegistration>& registrations, S&& id, DescriptorType type) {
+        TrackDefaultDescriptorIdentifier(graph, registrations, ResourceIdentifier{ std::string_view{ std::forward<S>(id) } }, type);
+	}
+
+        template<typename T>
+        inline void TrackDefaultDescriptorIdentifier(RenderGraph*, std::vector<AutoDescriptorRegistration>&, const std::shared_ptr<T>&, DescriptorType) {}
+
+        inline void TrackDefaultDescriptorIdentifier(RenderGraph*, std::vector<AutoDescriptorRegistration>&, const ResourcePtrAndRange&, DescriptorType) {}
+        inline void TrackDefaultDescriptorIdentifier(RenderGraph*, std::vector<AutoDescriptorRegistration>&, const ResourceHandleAndRange&, DescriptorType) {}
+        inline void TrackDefaultDescriptorIdentifier(RenderGraph*, std::vector<AutoDescriptorRegistration>&, const ResourceResolverAndRange&, DescriptorType) {}
+        inline void TrackDefaultDescriptorIdentifier(RenderGraph*, std::vector<AutoDescriptorRegistration>&, const IResourceResolver&, DescriptorType) {}
 }
 
 template<class S>
@@ -816,8 +913,12 @@ public:
 		return *this;
 	}
 
-    RenderPassBuilder& OnGraphicsQueue()& {
-        m_queueSelection = RenderQueueSelection::Graphics;
+    RenderPassBuilder& PreferQueue(QueueKind kind)& {
+        if (!IsQueueKindSupportedByRenderPass(kind)) {
+            throw std::invalid_argument("Render passes only support the graphics queue");
+        }
+        m_preferredQueueKind = kind;
+        m_queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
         return *this;
     }
 
@@ -826,59 +927,45 @@ public:
 		return std::move(*this);
     }
 
-    RenderPassBuilder OnGraphicsQueue() && {
-        m_queueSelection = RenderQueueSelection::Graphics;
+    RenderPassBuilder PreferQueue(QueueKind kind) && {
+        if (!IsQueueKindSupportedByRenderPass(kind)) {
+            throw std::invalid_argument("Render passes only support the graphics queue");
+        }
+        m_preferredQueueKind = kind;
+        m_queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
+		return std::move(*this);
+	}
+
+	RenderPassBuilder& AutomaticQueueAssignment() & {
+		m_queueAssignmentPolicy = QueueAssignmentPolicy::Automatic;
+		return *this;
+	}
+
+	RenderPassBuilder AutomaticQueueAssignment() && {
+		m_queueAssignmentPolicy = QueueAssignmentPolicy::Automatic;
         return std::move(*this);
     }
 
-	// LVALUE
-    template<DerivedRenderPass PassT, rg::PassInputs InputsT, typename... StableCtorArgs>
-    void Build(InputsT&& inputs, StableCtorArgs&&... ctorArgs)&
-    {
-        if (!built_)
-        {
-            built_ = true;
-            pass = detail::MakePass<PassT>(
-                std::forward<InputsT>(inputs),
-                std::forward<StableCtorArgs>(ctorArgs)...);
-        }
-
-		// rebuild just updates inputs
-        pass->SetInputs(std::forward<InputsT>(inputs));
+    RenderPassBuilder& PinToQueue(QueueSlotIndex slot) & {
+        m_pinnedQueueSlot = slot;
+        return *this;
     }
 
-    // RVALUE
-    template<DerivedRenderPass PassT, rg::PassInputs InputsT, typename... StableCtorArgs>
-    void Build(InputsT&& inputs, StableCtorArgs&&... ctorArgs)&&
-    {
-        if (!built_)
-        {
-            built_ = true;
-            pass = detail::MakePass<PassT>(
-                std::forward<InputsT>(inputs),
-                std::forward<StableCtorArgs>(ctorArgs)...);
-        }
-
-        pass->SetInputs(std::forward<InputsT>(inputs));
-    }
-
-	// stable-args-only overloads, for convenience
-    template<DerivedRenderPass PassT, typename... StableCtorArgs>
-    void Build(StableCtorArgs&&... ctorArgs)&
-    {
-        Build<PassT>(rg::NoInputs{}, std::forward<StableCtorArgs>(ctorArgs)...);
-    }
-
-    template<DerivedRenderPass PassT, typename... StableCtorArgs>
-    void Build(StableCtorArgs&&... ctorArgs)&&
-    {
-        Build<PassT>(rg::NoInputs{}, std::forward<StableCtorArgs>(ctorArgs)...);
+    RenderPassBuilder PinToQueue(QueueSlotIndex slot) && {
+        m_pinnedQueueSlot = slot;
+        return std::move(*this);
     }
 
 
     auto const& DeclaredResourceIds() const { return _declaredIds; }
 
 private:
+    struct AuthorState {
+        RenderPassParameters params;
+        std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> declaredIds;
+        std::vector<ResolverSnapshot> resolverSnapshots;
+    };
+
     RenderPassBuilder(RenderGraph* g, std::string name)
         : graph(g), passName(std::move(name)) {}
 
@@ -890,15 +977,57 @@ private:
 	RenderPassBuilder& operator=(const RenderPassBuilder&) = default;
 	RenderPassBuilder& operator=(RenderPassBuilder&&) = default;
 
+    AuthorState CaptureAuthorState() && {
+        return {
+            std::move(params),
+            std::move(_declaredIds),
+            std::move(resolverSnapshots_)
+        };
+    }
+
+    void RestoreAuthorState(AuthorState&& state) {
+        params = std::move(state.params);
+        _declaredIds = std::move(state.declaredIds);
+        resolverSnapshots_ = std::move(state.resolverSnapshots);
+    }
+
+    template<DerivedRenderPass PassT, rg::PassInputs InputsT, typename... StableCtorArgs>
+    void Instantiate(InputsT&& inputs, StableCtorArgs&&... ctorArgs)
+    {
+        if (!built_)
+        {
+            built_ = true;
+            pass = detail::MakePass<PassT>(
+                std::forward<InputsT>(inputs),
+                std::forward<StableCtorArgs>(ctorArgs)...);
+        }
+
+        pass->SetInputs(std::forward<InputsT>(inputs));
+    }
+
+    template<DerivedRenderPass PassT, typename... StableCtorArgs>
+    void Instantiate(StableCtorArgs&&... ctorArgs)
+    {
+        Instantiate<PassT>(rg::NoInputs{}, std::forward<StableCtorArgs>(ctorArgs)...);
+    }
+
     void Finalize() {
         if (!built_) return;
 
-        params = {}; // Reset params to clear any resources from previous build
+        auto authorState = std::move(*this).CaptureAuthorState();
+
+        params = {}; // Rebuild pass-declared state from scratch each finalize.
+        _declaredIds.clear();
+        resolverSnapshots_.clear();
+
+        RestoreAuthorState(std::move(authorState));
 
         pass->DeclareResourceUsages(this);
 
         params.isGeometryPass = m_isGeometryPass;
-        params.queueSelection = m_queueSelection;
+        params.preferredQueueKind = m_preferredQueueKind;
+        params.queueAssignmentPolicy = m_queueAssignmentPolicy;
+        params.pinnedQueueSlot = m_pinnedQueueSlot;
         params.identifierSet = _declaredIds;
         params.staticResourceRequirements = GatherResourceRequirements();
 
@@ -912,13 +1041,16 @@ private:
         _declaredIds.clear();
         resolverSnapshots_.clear();
         m_isGeometryPass = false;
-        m_queueSelection = RenderQueueSelection::Graphics;
+		m_preferredQueueKind = QueueKind::Graphics;
+		m_queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
+        m_pinnedQueueSlot = std::nullopt;
 	}
 
     // Shader Resource
 	template<typename T>
         requires ResourceLike<T>
 	RenderPassBuilder& addShaderResource(T&& x) {
+    detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorShaderResources, x, DescriptorType::SRV);
         detail::AppendTrackedResource(graph, _declaredIds, params.shaderResources, std::forward<T>(x));
 		return *this;
 	}
@@ -986,6 +1118,7 @@ private:
 	template<typename T>
         requires ResourceLike<T>
 	RenderPassBuilder& addConstantBuffer(T&& x) {
+    detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorConstantBuffers, x, DescriptorType::CBV);
         detail::AppendTrackedResource(graph, _declaredIds, params.constantBuffers, std::forward<T>(x));
 		return *this;
 	}
@@ -1003,6 +1136,7 @@ private:
 	template<typename T>
         requires ResourceLike<T>
 	RenderPassBuilder& addUnorderedAccess(T&& x) {
+    detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorUnorderedAccessViews, x, DescriptorType::UAV);
         detail::AppendTrackedResource(graph, _declaredIds, params.unorderedAccessViews, std::forward<T>(x));
 		return *this;
 	}
@@ -1123,7 +1257,9 @@ private:
 	std::shared_ptr<RenderPass> pass;
     bool built_ = false;
     bool m_isGeometryPass = false;
-	RenderQueueSelection m_queueSelection = RenderQueueSelection::Graphics;
+	QueueKind m_preferredQueueKind = QueueKind::Graphics;
+    QueueAssignmentPolicy m_queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
+    std::optional<QueueSlotIndex> m_pinnedQueueSlot;
     std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> _declaredIds;
     std::vector<ResolverSnapshot> resolverSnapshots_;
 
@@ -1249,114 +1385,97 @@ public:
         return std::move(*this);
     }
 
-    std::vector<ResolverSnapshot> TakeResolverSnapshots() { return std::move(resolverSnapshots_); }
+        std::vector<ResolverSnapshot> TakeResolverSnapshots() { return std::move(resolverSnapshots_); }
 
-    ComputePassBuilder& PreferComputeQueue() & {
-        m_queueSelection = ComputeQueueSelection::Compute;
-        return *this;
-    }
+        ComputePassBuilder& PreferQueue(QueueKind kind) & {
+                if (!IsQueueKindSupportedByComputePass(kind)) {
+                        throw std::invalid_argument("Compute passes only support graphics or compute queues");
+                }
+                m_preferredQueueKind = kind;
+            m_queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
+                return *this;
+        }
 
-    ComputePassBuilder& PreferGraphicsQueue() & {
-        m_queueSelection = ComputeQueueSelection::Graphics;
-        return *this;
-    }
+        ComputePassBuilder PreferQueue(QueueKind kind) && {
+                if (!IsQueueKindSupportedByComputePass(kind)) {
+                        throw std::invalid_argument("Compute passes only support graphics or compute queues");
+                }
+                m_preferredQueueKind = kind;
+            m_queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
+    				return std::move(*this);
+    		}
 
-    ComputePassBuilder PreferComputeQueue() && {
-        m_queueSelection = ComputeQueueSelection::Compute;
-        return std::move(*this);
-    }
+    		ComputePassBuilder& AutomaticQueueAssignment() & {
+    				m_queueAssignmentPolicy = QueueAssignmentPolicy::Automatic;
+    				return *this;
+    		}
 
-    ComputePassBuilder PreferGraphicsQueue() && {
-        m_queueSelection = ComputeQueueSelection::Graphics;
-        return std::move(*this);
-    }
+    		ComputePassBuilder AutomaticQueueAssignment() && {
+    				m_queueAssignmentPolicy = QueueAssignmentPolicy::Automatic;
+                return std::move(*this);
+        }
 
-    // LVALUE overloads for IResourceResolver
-    ComputePassBuilder& WithShaderResource(const IResourceResolver& r)& {
+        ComputePassBuilder& PinToQueue(QueueSlotIndex slot) & {
+                m_pinnedQueueSlot = slot;
+                return *this;
+        }
+
+        ComputePassBuilder PinToQueue(QueueSlotIndex slot) && {
+                m_pinnedQueueSlot = slot;
+                return std::move(*this);
+        }
+
+        // LVALUE overloads for IResourceResolver
+        ComputePassBuilder& WithShaderResource(const IResourceResolver& r)& {
 		return WithResolver(r, [&](auto&& resolved) { addShaderResource(std::forward<decltype(resolved)>(resolved)); });
-    }
+        }
 
-    ComputePassBuilder& WithConstantBuffer(const IResourceResolver& r)& {
+        ComputePassBuilder& WithConstantBuffer(const IResourceResolver& r)& {
 		return WithResolver(r, [&](auto&& resolved) { addConstantBuffer(std::forward<decltype(resolved)>(resolved)); });
-    }
+        }
 
-    ComputePassBuilder& WithUnorderedAccess(const IResourceResolver& r)& {
+        ComputePassBuilder& WithUnorderedAccess(const IResourceResolver& r)& {
 		return WithResolver(r, [&](auto&& resolved) { addUnorderedAccess(std::forward<decltype(resolved)>(resolved)); });
-    }
+        }
 
-    ComputePassBuilder& WithIndirectArguments(const IResourceResolver& r)& {
+        ComputePassBuilder& WithIndirectArguments(const IResourceResolver& r)& {
 		return WithResolver(r, [&](auto&& resolved) { addIndirectArguments(std::forward<decltype(resolved)>(resolved)); });
-    }
+        }
 
-    ComputePassBuilder& WithLegacyInterop(const IResourceResolver& r)& {
+        ComputePassBuilder& WithLegacyInterop(const IResourceResolver& r)& {
 		return WithResolver(r, [&](auto&& resolved) { addLegacyInterop(std::forward<decltype(resolved)>(resolved)); });
-    }
+        }
 
-    // RVALUE overloads for IResourceResolver
-
-    ComputePassBuilder WithShaderResource(const IResourceResolver& r)&& {
+        // RVALUE overloads for IResourceResolver
+        ComputePassBuilder WithShaderResource(const IResourceResolver& r)&& {
 		return std::move(*this).WithResolver(r, [&](auto&& resolved) { addShaderResource(std::forward<decltype(resolved)>(resolved)); });
-    }
-    ComputePassBuilder WithConstantBuffer(const IResourceResolver& r)&& {
+        }
+
+        ComputePassBuilder WithConstantBuffer(const IResourceResolver& r)&& {
 		return std::move(*this).WithResolver(r, [&](auto&& resolved) { addConstantBuffer(std::forward<decltype(resolved)>(resolved)); });
-    }
-    ComputePassBuilder WithUnorderedAccess(const IResourceResolver& r)&& {
+        }
+
+        ComputePassBuilder WithUnorderedAccess(const IResourceResolver& r)&& {
 		return std::move(*this).WithResolver(r, [&](auto&& resolved) { addUnorderedAccess(std::forward<decltype(resolved)>(resolved)); });
-    }
-    ComputePassBuilder WithIndirectArguments(const IResourceResolver& r)&& {
+        }
+
+        ComputePassBuilder WithIndirectArguments(const IResourceResolver& r)&& {
 		return std::move(*this).WithResolver(r, [&](auto&& resolved) { addIndirectArguments(std::forward<decltype(resolved)>(resolved)); });
-    }
-    ComputePassBuilder WithLegacyInterop(const IResourceResolver& r)&& {
+        }
+
+        ComputePassBuilder WithLegacyInterop(const IResourceResolver& r)&& {
 		return std::move(*this).WithResolver(r, [&](auto&& resolved) { addLegacyInterop(std::forward<decltype(resolved)>(resolved)); });
-    }
-
-    // LVALUE
-    template<DerivedComputePass PassT, rg::PassInputs InputsT, typename... StableCtorArgs>
-    void Build(InputsT&& inputs, StableCtorArgs&&... ctorArgs)&
-    {
-        if (!built_)
-        {
-            built_ = true;
-            pass = detail::MakePass<PassT>(
-                std::forward<InputsT>(inputs),
-                std::forward<StableCtorArgs>(ctorArgs)...);
         }
-
-        // rebuild just updates inputs
-        pass->SetInputs(std::forward<InputsT>(inputs));
-    }
-
-    // RVALUE
-    template<DerivedComputePass PassT, rg::PassInputs InputsT, typename... StableCtorArgs>
-    void Build(InputsT&& inputs, StableCtorArgs&&... ctorArgs)&&
-    {
-        if (!built_)
-        {
-            built_ = true;
-            pass = detail::MakePass<PassT>(
-                std::forward<InputsT>(inputs),
-                std::forward<StableCtorArgs>(ctorArgs)...);
-        }
-
-        pass->SetInputs(std::forward<InputsT>(inputs));
-    }
-
-    // Stable-args-only convenience
-    template<DerivedComputePass PassT, typename... StableCtorArgs>
-    void Build(StableCtorArgs&&... ctorArgs)&
-    {
-        Build<PassT>(rg::NoInputs{}, std::forward<StableCtorArgs>(ctorArgs)...);
-    }
-
-    template<DerivedComputePass PassT, typename... StableCtorArgs>
-    void Build(StableCtorArgs&&... ctorArgs)&&
-    {
-        Build<PassT>(rg::NoInputs{}, std::forward<StableCtorArgs>(ctorArgs)...);
-    }
 
     auto const& DeclaredResourceIds() const { return _declaredIds; }
 
 private:
+    struct AuthorState {
+        ComputePassParameters params;
+        std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> declaredIds;
+        std::vector<ResolverSnapshot> resolverSnapshots;
+    };
+
     ComputePassBuilder(RenderGraph* g, std::string name)
         : graph(g), passName(std::move(name)) {}
 
@@ -1368,15 +1487,57 @@ private:
     ComputePassBuilder& operator=(const ComputePassBuilder&) = default;
     ComputePassBuilder& operator=(ComputePassBuilder&&) = default;
 
+    AuthorState CaptureAuthorState() && {
+        return {
+            std::move(params),
+            std::move(_declaredIds),
+            std::move(resolverSnapshots_)
+        };
+    }
+
+    void RestoreAuthorState(AuthorState&& state) {
+        params = std::move(state.params);
+        _declaredIds = std::move(state.declaredIds);
+        resolverSnapshots_ = std::move(state.resolverSnapshots);
+    }
+
+    template<DerivedComputePass PassT, rg::PassInputs InputsT, typename... StableCtorArgs>
+    void Instantiate(InputsT&& inputs, StableCtorArgs&&... ctorArgs)
+    {
+        if (!built_)
+        {
+            built_ = true;
+            pass = detail::MakePass<PassT>(
+                std::forward<InputsT>(inputs),
+                std::forward<StableCtorArgs>(ctorArgs)...);
+        }
+
+        pass->SetInputs(std::forward<InputsT>(inputs));
+    }
+
+    template<DerivedComputePass PassT, typename... StableCtorArgs>
+    void Instantiate(StableCtorArgs&&... ctorArgs)
+    {
+        Instantiate<PassT>(rg::NoInputs{}, std::forward<StableCtorArgs>(ctorArgs)...);
+    }
+
     void Finalize() {
         if (!built_) return;
 
-        params = {}; // Reset params to clear any resources from previous build
+        auto authorState = std::move(*this).CaptureAuthorState();
+
+        params = {};
+        _declaredIds.clear();
+        resolverSnapshots_.clear();
+
+        RestoreAuthorState(std::move(authorState));
 
         pass->DeclareResourceUsages(this);
 
         params.identifierSet = _declaredIds;
-        params.queueSelection = m_queueSelection;
+        params.preferredQueueKind = m_preferredQueueKind;
+        params.queueAssignmentPolicy = m_queueAssignmentPolicy;
+        params.pinnedQueueSlot = m_pinnedQueueSlot;
         params.staticResourceRequirements = GatherResourceRequirements();
 
         graph->AddComputePass(pass, params, passName, TakeResolverSnapshots());
@@ -1388,13 +1549,16 @@ private:
         params = {};
         _declaredIds.clear();
         resolverSnapshots_.clear();
-        m_queueSelection = ComputeQueueSelection::Compute;
+        m_preferredQueueKind = QueueKind::Compute;
+		m_queueAssignmentPolicy = QueueAssignmentPolicy::Automatic;
+        m_pinnedQueueSlot = std::nullopt;
     }
 
     // Shader resource
 	template<typename T>
         requires ResourceLike<T>
 	ComputePassBuilder& addShaderResource(T&& x) {
+    detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorShaderResources, x, DescriptorType::SRV);
         detail::AppendTrackedResource(graph, _declaredIds, params.shaderResources, std::forward<T>(x));
 		return *this;
 	}
@@ -1412,6 +1576,7 @@ private:
 	template<typename T>
         requires ResourceLike<T>
 	ComputePassBuilder& addConstantBuffer(T&& x) {
+    detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorConstantBuffers, x, DescriptorType::CBV);
         detail::AppendTrackedResource(graph, _declaredIds, params.constantBuffers, std::forward<T>(x));
 		return *this;
 	}
@@ -1429,6 +1594,7 @@ private:
 	template<typename T>
         requires ResourceLike<T>
 	ComputePassBuilder& addUnorderedAccess(T&& x) {
+    detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorUnorderedAccessViews, x, DescriptorType::UAV);
         detail::AppendTrackedResource(graph, _declaredIds, params.unorderedAccessViews, std::forward<T>(x));
 		return *this;
 	}
@@ -1510,7 +1676,9 @@ private:
     ComputePassParameters     params;
     std::shared_ptr<ComputePass> pass;
     bool built_ = false;
-	ComputeQueueSelection m_queueSelection = ComputeQueueSelection::Compute;
+	QueueKind m_preferredQueueKind = QueueKind::Compute;
+    QueueAssignmentPolicy m_queueAssignmentPolicy = QueueAssignmentPolicy::Automatic;
+    std::optional<QueueSlotIndex> m_pinnedQueueSlot;
     std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> _declaredIds;
     std::vector<ResolverSnapshot> resolverSnapshots_;
 
@@ -1593,23 +1761,41 @@ public:
 
     std::vector<ResolverSnapshot> TakeResolverSnapshots() { return std::move(resolverSnapshots_); }
 
-    CopyPassBuilder& PreferCopyQueue() & {
-        m_queueSelection = CopyQueueSelection::Copy;
+    CopyPassBuilder& PreferQueue(QueueKind kind) & {
+        if (!IsQueueKindSupportedByCopyPass(kind)) {
+            throw std::invalid_argument("Copy passes only support graphics or copy queues");
+        }
+        m_preferredQueueKind = kind;
+        m_queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
         return *this;
     }
 
-    CopyPassBuilder& PreferGraphicsQueue() & {
-        m_queueSelection = CopyQueueSelection::Graphics;
-        return *this;
-    }
+    CopyPassBuilder PreferQueue(QueueKind kind) && {
+        if (!IsQueueKindSupportedByCopyPass(kind)) {
+            throw std::invalid_argument("Copy passes only support graphics or copy queues");
+        }
+        m_preferredQueueKind = kind;
+        m_queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
+		return std::move(*this);
+	}
 
-    CopyPassBuilder PreferCopyQueue() && {
-        m_queueSelection = CopyQueueSelection::Copy;
+	CopyPassBuilder& AutomaticQueueAssignment() & {
+		m_queueAssignmentPolicy = QueueAssignmentPolicy::Automatic;
+		return *this;
+	}
+
+	CopyPassBuilder AutomaticQueueAssignment() && {
+		m_queueAssignmentPolicy = QueueAssignmentPolicy::Automatic;
         return std::move(*this);
     }
 
-    CopyPassBuilder PreferGraphicsQueue() && {
-        m_queueSelection = CopyQueueSelection::Graphics;
+    CopyPassBuilder& PinToQueue(QueueSlotIndex slot) & {
+        m_pinnedQueueSlot = slot;
+        return *this;
+    }
+
+    CopyPassBuilder PinToQueue(QueueSlotIndex slot) && {
+        m_pinnedQueueSlot = slot;
         return std::move(*this);
     }
 
@@ -1629,49 +1815,15 @@ public:
         return std::move(*this).WithResolver(r, [&](auto&& resolved) { addCopySource(std::forward<decltype(resolved)>(resolved)); });
     }
 
-    template<DerivedCopyPass PassT, rg::PassInputs InputsT, typename... StableCtorArgs>
-    void Build(InputsT&& inputs, StableCtorArgs&&... ctorArgs)&
-    {
-        if (!built_)
-        {
-            built_ = true;
-            pass = detail::MakePass<PassT>(
-                std::forward<InputsT>(inputs),
-                std::forward<StableCtorArgs>(ctorArgs)...);
-        }
-
-        pass->SetInputs(std::forward<InputsT>(inputs));
-    }
-
-    template<DerivedCopyPass PassT, rg::PassInputs InputsT, typename... StableCtorArgs>
-    void Build(InputsT&& inputs, StableCtorArgs&&... ctorArgs)&&
-    {
-        if (!built_)
-        {
-            built_ = true;
-            pass = detail::MakePass<PassT>(
-                std::forward<InputsT>(inputs),
-                std::forward<StableCtorArgs>(ctorArgs)...);
-        }
-
-        pass->SetInputs(std::forward<InputsT>(inputs));
-    }
-
-    template<DerivedCopyPass PassT, typename... StableCtorArgs>
-    void Build(StableCtorArgs&&... ctorArgs)&
-    {
-        Build<PassT>(rg::NoInputs{}, std::forward<StableCtorArgs>(ctorArgs)...);
-    }
-
-    template<DerivedCopyPass PassT, typename... StableCtorArgs>
-    void Build(StableCtorArgs&&... ctorArgs)&&
-    {
-        Build<PassT>(rg::NoInputs{}, std::forward<StableCtorArgs>(ctorArgs)...);
-    }
-
     auto const& DeclaredResourceIds() const { return _declaredIds; }
 
 private:
+    struct AuthorState {
+        CopyPassParameters params;
+        std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> declaredIds;
+        std::vector<ResolverSnapshot> resolverSnapshots;
+    };
+
     CopyPassBuilder(RenderGraph* g, std::string name)
         : graph(g), passName(std::move(name)) {}
 
@@ -1680,15 +1832,57 @@ private:
     CopyPassBuilder& operator=(const CopyPassBuilder&) = default;
     CopyPassBuilder& operator=(CopyPassBuilder&&) = default;
 
+    AuthorState CaptureAuthorState() && {
+        return {
+            std::move(params),
+            std::move(_declaredIds),
+            std::move(resolverSnapshots_)
+        };
+    }
+
+    void RestoreAuthorState(AuthorState&& state) {
+        params = std::move(state.params);
+        _declaredIds = std::move(state.declaredIds);
+        resolverSnapshots_ = std::move(state.resolverSnapshots);
+    }
+
+    template<DerivedCopyPass PassT, rg::PassInputs InputsT, typename... StableCtorArgs>
+    void Instantiate(InputsT&& inputs, StableCtorArgs&&... ctorArgs)
+    {
+        if (!built_)
+        {
+            built_ = true;
+            pass = detail::MakePass<PassT>(
+                std::forward<InputsT>(inputs),
+                std::forward<StableCtorArgs>(ctorArgs)...);
+        }
+
+        pass->SetInputs(std::forward<InputsT>(inputs));
+    }
+
+    template<DerivedCopyPass PassT, typename... StableCtorArgs>
+    void Instantiate(StableCtorArgs&&... ctorArgs)
+    {
+        Instantiate<PassT>(rg::NoInputs{}, std::forward<StableCtorArgs>(ctorArgs)...);
+    }
+
     void Finalize() {
         if (!built_) return;
 
+        auto authorState = std::move(*this).CaptureAuthorState();
+
         params = {};
+        _declaredIds.clear();
+        resolverSnapshots_.clear();
+
+        RestoreAuthorState(std::move(authorState));
 
         pass->DeclareResourceUsages(this);
 
         params.identifierSet = _declaredIds;
-        params.queueSelection = m_queueSelection;
+        params.preferredQueueKind = m_preferredQueueKind;
+        params.queueAssignmentPolicy = m_queueAssignmentPolicy;
+        params.pinnedQueueSlot = m_pinnedQueueSlot;
         params.staticResourceRequirements = GatherResourceRequirements();
 
         graph->AddCopyPass(pass, params, passName, TakeResolverSnapshots());
@@ -1700,7 +1894,9 @@ private:
         params = {};
         _declaredIds.clear();
         resolverSnapshots_.clear();
-        m_queueSelection = CopyQueueSelection::Copy;
+        m_preferredQueueKind = QueueKind::Copy;
+		m_queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
+        m_pinnedQueueSlot = std::nullopt;
     }
 
     template<typename T>
@@ -1761,9 +1957,59 @@ private:
     CopyPassParameters params;
     std::shared_ptr<CopyPass> pass;
     bool built_ = false;
-    CopyQueueSelection m_queueSelection = CopyQueueSelection::Copy;
+    QueueKind m_preferredQueueKind = QueueKind::Copy;
+	QueueAssignmentPolicy m_queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
+    std::optional<QueueSlotIndex> m_pinnedQueueSlot;
     std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> _declaredIds;
     std::vector<ResolverSnapshot> resolverSnapshots_;
 
     friend class RenderGraph;
 };
+
+template<typename PassT, rg::PassInputs InputsT, typename... StableCtorArgs>
+ComputePassBuilder& RenderGraph::BuildComputePass(std::string const& name, InputsT&& inputs, StableCtorArgs&&... ctorArgs) {
+    static_assert(DerivedComputePass<PassT>);
+    auto& builder = GetOrCreateComputePassBuilder(name);
+    builder.template Instantiate<PassT>(std::forward<InputsT>(inputs), std::forward<StableCtorArgs>(ctorArgs)...);
+    return builder;
+}
+
+template<typename PassT, typename... StableCtorArgs>
+ComputePassBuilder& RenderGraph::BuildComputePass(std::string const& name, StableCtorArgs&&... ctorArgs) {
+    static_assert(DerivedComputePass<PassT>);
+    auto& builder = GetOrCreateComputePassBuilder(name);
+    builder.template Instantiate<PassT>(std::forward<StableCtorArgs>(ctorArgs)...);
+    return builder;
+}
+
+template<typename PassT, rg::PassInputs InputsT, typename... StableCtorArgs>
+RenderPassBuilder& RenderGraph::BuildRenderPass(std::string const& name, InputsT&& inputs, StableCtorArgs&&... ctorArgs) {
+    static_assert(DerivedRenderPass<PassT>);
+    auto& builder = GetOrCreateRenderPassBuilder(name);
+    builder.template Instantiate<PassT>(std::forward<InputsT>(inputs), std::forward<StableCtorArgs>(ctorArgs)...);
+    return builder;
+}
+
+template<typename PassT, typename... StableCtorArgs>
+RenderPassBuilder& RenderGraph::BuildRenderPass(std::string const& name, StableCtorArgs&&... ctorArgs) {
+    static_assert(DerivedRenderPass<PassT>);
+    auto& builder = GetOrCreateRenderPassBuilder(name);
+    builder.template Instantiate<PassT>(std::forward<StableCtorArgs>(ctorArgs)...);
+    return builder;
+}
+
+template<typename PassT, rg::PassInputs InputsT, typename... StableCtorArgs>
+CopyPassBuilder& RenderGraph::BuildCopyPass(std::string const& name, InputsT&& inputs, StableCtorArgs&&... ctorArgs) {
+    static_assert(DerivedCopyPass<PassT>);
+    auto& builder = GetOrCreateCopyPassBuilder(name);
+    builder.template Instantiate<PassT>(std::forward<InputsT>(inputs), std::forward<StableCtorArgs>(ctorArgs)...);
+    return builder;
+}
+
+template<typename PassT, typename... StableCtorArgs>
+CopyPassBuilder& RenderGraph::BuildCopyPass(std::string const& name, StableCtorArgs&&... ctorArgs) {
+    static_assert(DerivedCopyPass<PassT>);
+    auto& builder = GetOrCreateCopyPassBuilder(name);
+    builder.template Instantiate<PassT>(std::forward<StableCtorArgs>(ctorArgs)...);
+    return builder;
+}

@@ -9,6 +9,10 @@ SubresourceRange ResolveRangeSpec(const RangeSpec& spec,
     const uint32_t totalMips,
     const uint32_t totalSlices)
 {
+	if (totalMips == 0 || totalSlices == 0) {
+		return { 0, 0, 0, 0 };
+	}
+
     // determine firstMip
     uint32_t firstMip = 0;
     switch (spec.mipLower.type) {
@@ -26,6 +30,10 @@ SubresourceRange ResolveRangeSpec(const RangeSpec& spec,
     case BoundType::From:  lastMip = totalMips - 1;            break;
     case BoundType::All:   lastMip = totalMips - 1;            break;
     }
+
+        if (firstMip >= totalMips) {
+		return { 0, 0, 0, 0 };
+	}
 
     // clamp to [0..totalMips-1]
     firstMip = (std::min)(firstMip,  totalMips - 1);
@@ -52,6 +60,10 @@ SubresourceRange ResolveRangeSpec(const RangeSpec& spec,
     case BoundType::From:  lastSlice = totalSlices - 1;            break;
     case BoundType::All:   lastSlice = totalSlices - 1;            break;
     }
+
+        if (firstSlice >= totalSlices) {
+		return { 0, 0, 0, 0 };
+	}
 
     // clamp to [0..totalSlices-1]
     firstSlice = (std::min)(firstSlice, totalSlices - 1);
@@ -80,7 +92,7 @@ static uint32_t boundUpper(const Bound &b) {
     switch (b.type) {
     case BoundType::Exact: return b.value;
     case BoundType::UpTo:  return b.value;
-    case BoundType::From:  // “>= value” means no finite upper -> inf
+    case BoundType::From:  // ï¿½>= valueï¿½ means no finite upper -> inf
     case BoundType::All:   return (std::numeric_limits<uint32_t>::max)();
     }
     return (std::numeric_limits<uint32_t>::max)();
@@ -324,6 +336,10 @@ std::vector<Segment> SymbolicTracker::Flatten(ResourceState const& skipState, bo
 
 const std::vector<Segment>& SymbolicTracker::GetSegments() const noexcept {
 	return _segs;
+}
+
+void SymbolicTracker::CopyFrom(const SymbolicTracker& other) {
+	_segs = other._segs;
 }
 
 bool ValidateNoConflictingTransitions(

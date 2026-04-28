@@ -31,9 +31,30 @@ struct DescriptorAccessor {
 	DescriptorType type; // Type of the descriptor (SRV or UAV)
 	bool hasSRVViewType = false; // Indicates if a specific SRVViewType is set
 	SRVViewType SRVType; // Type of the SRV
+	bool hasUAVViewType = false; // Indicates if a specific UAVViewType is set
+	UAVViewType UAVType; // Type of the UAV
 	unsigned int mip; // Mip level
 	unsigned int slice; // Slice index
 };
+
+inline bool operator==(const DescriptorAccessor& lhs, const DescriptorAccessor& rhs) {
+	return lhs.type == rhs.type
+		&& lhs.hasSRVViewType == rhs.hasSRVViewType
+		&& (!lhs.hasSRVViewType || lhs.SRVType == rhs.SRVType)
+		&& lhs.hasUAVViewType == rhs.hasUAVViewType
+		&& (!lhs.hasUAVViewType || lhs.UAVType == rhs.UAVType)
+		&& lhs.mip == rhs.mip
+		&& lhs.slice == rhs.slice;
+}
+
+struct AutoDescriptorRegistration {
+	ResourceIdentifier resourceId;
+	DescriptorAccessor accessor;
+};
+
+inline bool operator==(const AutoDescriptorRegistration& lhs, const AutoDescriptorRegistration& rhs) {
+	return lhs.resourceId == rhs.resourceId && lhs.accessor == rhs.accessor;
+}
 
 struct ResourceAndAccessor {
 	ResourceIndexOrDynamicResource resource;
@@ -44,6 +65,31 @@ class ResourceDescriptorIndexHelper {
 public:
 	ResourceDescriptorIndexHelper(std::shared_ptr<ResourceRegistryView> registryView) : m_resourceRegistryView(registryView) {
 
+	}
+	void RegisterDescriptor(const AutoDescriptorRegistration& registration) {
+		switch (registration.accessor.type) {
+		case DescriptorType::SRV:
+			if (registration.accessor.hasSRVViewType) {
+				RegisterSRV(registration.accessor.SRVType, registration.resourceId, registration.accessor.mip, registration.accessor.slice);
+			}
+			else {
+				RegisterSRV(registration.resourceId, registration.accessor.mip, registration.accessor.slice);
+			}
+			break;
+		case DescriptorType::UAV:
+			if (registration.accessor.hasUAVViewType) {
+				RegisterUAV(registration.accessor.UAVType, registration.resourceId, registration.accessor.mip, registration.accessor.slice);
+			}
+			else {
+				RegisterUAV(registration.resourceId, registration.accessor.mip, registration.accessor.slice);
+			}
+			break;
+		case DescriptorType::CBV:
+			RegisterCBV(registration.resourceId);
+			break;
+		default:
+			throw std::runtime_error("Unsupported descriptor type");
+		}
 	}
 	void RegisterSRV(SRVViewType type, ResourceIdentifier id, unsigned int mip, unsigned int slice = 0) {
 		DescriptorAccessor accessor;
@@ -74,6 +120,19 @@ public:
 	void RegisterUAV(ResourceIdentifier id, unsigned int mip, unsigned int slice = 0) {
 		DescriptorAccessor accessor;
 		accessor.type = DescriptorType::UAV;
+		accessor.mip = mip;
+		accessor.slice = slice;
+		auto h = m_resourceRegistryView->RequestHandle(id);
+		Resource* res = m_resourceRegistryView->Resolve<Resource>(h);
+
+		auto entry = GetResourceIndexOrDynamicResource(h, res, accessor);
+		m_resourceMap[id.hash] = ResourceAndAccessor{ entry, accessor };
+	}
+	void RegisterUAV(UAVViewType type, ResourceIdentifier id, unsigned int mip, unsigned int slice = 0) {
+		DescriptorAccessor accessor;
+		accessor.type = DescriptorType::UAV;
+		accessor.hasUAVViewType = true;
+		accessor.UAVType = type;
 		accessor.mip = mip;
 		accessor.slice = slice;
 		auto h = m_resourceRegistryView->RequestHandle(id);
@@ -124,6 +183,9 @@ private:
 				return resource->GetSRVInfo(accessor.mip, accessor.slice).slot.index;
 			}
 		case DescriptorType::UAV:
+			if (accessor.hasUAVViewType) {
+				return resource->GetUAVShaderVisibleInfo(accessor.UAVType, accessor.mip, accessor.slice).slot.index;
+			}
 			return resource->GetUAVShaderVisibleInfo(accessor.mip, accessor.slice).slot.index;
 		case DescriptorType::CBV:
 			return resource->GetCBVInfo().slot.index;
@@ -146,6 +208,9 @@ private:
 			}
 
 		case DescriptorType::UAV:
+			if (accessor.hasUAVViewType) {
+				return resource.GetUAVShaderVisibleInfo(accessor.UAVType, accessor.mip, accessor.slice).slot.index;
+			}
 			return resource.GetUAVShaderVisibleInfo(accessor.mip, accessor.slice).slot.index;
 
 		case DescriptorType::CBV:

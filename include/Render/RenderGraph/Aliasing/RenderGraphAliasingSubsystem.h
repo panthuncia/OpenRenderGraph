@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -78,6 +79,11 @@ struct AliasPlacementRange {
 	uint64_t poolID = 0;
 	uint64_t startByte = 0;
 	uint64_t endByte = 0;
+	size_t firstUse = std::numeric_limits<size_t>::max();
+	size_t lastUse = 0;
+	size_t firstUsePassIndex = std::numeric_limits<size_t>::max();
+	size_t lastUsePassIndex = std::numeric_limits<size_t>::max();
+	bool dedicatedBacking = false;
 };
 
 struct AliasSchedulingNode {

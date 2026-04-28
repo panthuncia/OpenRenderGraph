@@ -9,6 +9,30 @@
 #include "Utilities/ORGUtilities.h"
 
 namespace {
+uint16_t ResolveTextureMipLevels(const TextureDescription& desc)
+{
+    if (desc.imageDimensions.empty()) {
+        return 1;
+    }
+
+    const uint32_t totalArraySlices = desc.isCubemap
+        ? 6u * desc.arraySize
+        : (desc.isArray ? desc.arraySize : 1u);
+
+    if (totalArraySlices > 0 &&
+        desc.imageDimensions.size() > totalArraySlices &&
+        (desc.imageDimensions.size() % totalArraySlices) == 0)
+    {
+        return static_cast<uint16_t>(desc.imageDimensions.size() / totalArraySlices);
+    }
+
+    if (desc.generateMipMaps) {
+        return rg::util::CalculateMipLevels(desc.imageDimensions[0].width, desc.imageDimensions[0].height);
+    }
+
+    return 1;
+}
+
 DescriptorHeapManager::ViewRequirements::TextureViews BuildTextureViewRequirements(
     const TextureDescription& desc,
     uint32_t mipLevels,
@@ -171,9 +195,7 @@ void PixelBuffer::EnsureVirtualDescriptorSlotsAllocated() {
     }
 
     auto& rm = DescriptorHeapManager::GetInstance();
-    const uint16_t mipLevels = m_desc.generateMipMaps
-        ? rg::util::CalculateMipLevels(m_desc.imageDimensions[0].width, m_desc.imageDimensions[0].height)
-        : 1;
+    const uint16_t mipLevels = ResolveTextureMipLevels(m_desc);
     const uint32_t arraySize = m_desc.isCubemap
         ? 6u * m_desc.arraySize
         : (m_desc.isArray ? m_desc.arraySize : 1u);

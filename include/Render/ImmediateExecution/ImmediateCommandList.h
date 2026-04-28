@@ -24,9 +24,9 @@ namespace rg::imm {
     using ResolveByIdFn = ResourceRegistry::RegistryHandle(*)(void* user, ResourceIdentifier const& id, bool allowFailure);
 	using ResolveByPtrFn = ResourceRegistry::RegistryHandle(*)(void* user, Resource* res, bool allowFailure);
     
-	// "Dispatch" that lives on RenderGraph so immediate recording can
-    // turn a ResourceHandle into low-level RHI handles/descriptor slots at record time.
-    // Replay then needs only the RHI command list + bytecode stream.
+	// "Dispatch" that lives on RenderGraph so immediate replay can
+    // turn a RegistryHandle into low-level RHI handles/descriptor slots after
+    // frame materialization has completed.
 
     struct ImmediateDispatch {
         RenderGraph* user = nullptr;
@@ -52,20 +52,22 @@ namespace rg::imm {
     };
 
     struct CopyBufferRegionCmd {
-        rhi::ResourceHandle dst{};
+        ResourceRegistry::RegistryHandle dst{};
         uint64_t dstOffset = 0;
-        rhi::ResourceHandle src{};
+        ResourceRegistry::RegistryHandle src{};
         uint64_t srcOffset = 0;
         uint64_t numBytes = 0;
     };
 
     struct ClearRTVCmd {
-        rhi::DescriptorSlot rtv{};
+        ResourceRegistry::RegistryHandle target{};
+        RangeSpec range{};
         rhi::ClearValue clear{};
     };
 
     struct ClearDSVCmd {
-        rhi::DescriptorSlot dsv{};
+        ResourceRegistry::RegistryHandle target{};
+        RangeSpec range{};
         bool clearDepth = true;
         bool clearStencil = false;
         float depth = 1.0f;
@@ -73,26 +75,55 @@ namespace rg::imm {
     };
 
     struct ClearUavFloatCmd {
-        rhi::UavClearInfo  info{};
+        ResourceRegistry::RegistryHandle target{};
+        RangeSpec range{};
         rhi::UavClearFloat value{};
     };
 
     struct ClearUavUintCmd {
-        rhi::UavClearInfo info{};
+        ResourceRegistry::RegistryHandle target{};
+        RangeSpec range{};
         rhi::UavClearUint value{};
     };
 
     struct CopyTextureRegionCmd {
-        rhi::TextureCopyRegion dst{};
-        rhi::TextureCopyRegion src{};
+        ResourceRegistry::RegistryHandle dstTexture{};
+        uint32_t dstMip = 0;
+        uint32_t dstSlice = 0;
+        uint32_t dstX = 0;
+        uint32_t dstY = 0;
+        uint32_t dstZ = 0;
+        ResourceRegistry::RegistryHandle srcTexture{};
+        uint32_t srcMip = 0;
+        uint32_t srcSlice = 0;
+        uint32_t srcX = 0;
+        uint32_t srcY = 0;
+        uint32_t srcZ = 0;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        uint32_t depth = 0;
     };
 
     struct CopyTextureToBufferCmd {
-        rhi::BufferTextureCopyFootprint region{};
+        ResourceRegistry::RegistryHandle texture{};
+        uint32_t mip = 0;
+        uint32_t slice = 0;
+        ResourceRegistry::RegistryHandle buffer{};
+        rhi::CopyableFootprint footprint{};
+        uint32_t x = 0;
+        uint32_t y = 0;
+        uint32_t z = 0;
     };
 
     struct CopyBufferToTextureCmd {
-        rhi::BufferTextureCopyFootprint region{};
+        ResourceRegistry::RegistryHandle buffer{};
+        ResourceRegistry::RegistryHandle texture{};
+        uint32_t mip = 0;
+        uint32_t slice = 0;
+        rhi::CopyableFootprint footprint{};
+        uint32_t x = 0;
+        uint32_t y = 0;
+        uint32_t z = 0;
     };
 
     // Simple aligned POD writer/reader for a bytecode stream.
@@ -152,7 +183,7 @@ namespace rg::imm {
     };
 
     // Replay bytecode into a concrete RHI command list.
-    void Replay(std::vector<std::byte> const& bytecode, rhi::CommandList& cl);
+    void Replay(std::vector<std::byte> const& bytecode, rhi::CommandList& cl, ImmediateDispatch const& dispatch);
 
     struct LifetimePin {
         // type-erased owning payload
@@ -316,6 +347,39 @@ namespace rg::imm {
             const uint32_t x = 0, const uint32_t y = 0, const uint32_t z = 0)
         {
             CopyTextureToBuffer(Resolve(texture), mip, slice, Resolve(buffer), footprint, x, y, z);
+        }
+
+        // texture and buffer owning overload of CopyTextureToBuffer
+        void CopyTextureToBuffer(const std::shared_ptr<Resource>& texture, const uint32_t mip, const uint32_t slice,
+            const std::shared_ptr<Resource>& buffer,
+            rhi::CopyableFootprint const& footprint,
+            const uint32_t x = 0, const uint32_t y = 0, const uint32_t z = 0)
+        {
+            const auto textureHandle = Resolve(texture.get(), texture); // Pin the ephemeral resource
+            const auto bufferHandle = Resolve(buffer.get(), buffer); // Pin the ephemeral resource
+            CopyTextureToBuffer(textureHandle, mip, slice, bufferHandle, footprint, x, y, z);
+        }
+
+        // Owned texture and handle buffer overload of CopyTextureToBuffer
+        void CopyTextureToBuffer(const std::shared_ptr<Resource>& texture, const uint32_t mip, const uint32_t slice,
+            Resource* buffer,
+            rhi::CopyableFootprint const& footprint,
+            const uint32_t x = 0, const uint32_t y = 0, const uint32_t z = 0)
+        {
+            const auto textureHandle = Resolve(texture.get(), texture); // Pin the ephemeral resource
+            const auto bufferHandle = Resolve(buffer);
+            CopyTextureToBuffer(textureHandle, mip, slice, bufferHandle, footprint, x, y, z);
+        }
+
+        // Handle texture and owned buffer overload of CopyTextureToBuffer
+        void CopyTextureToBuffer(Resource* texture, const uint32_t mip, const uint32_t slice,
+            const std::shared_ptr<Resource>& buffer,
+            rhi::CopyableFootprint const& footprint,
+            const uint32_t x = 0, const uint32_t y = 0, const uint32_t z = 0)
+        {
+            const auto textureHandle = Resolve(texture);
+            const auto bufferHandle = Resolve(buffer.get(), buffer); // Pin the ephemeral resource
+            CopyTextureToBuffer(textureHandle, mip, slice, bufferHandle, footprint, x, y, z);
         }
 
         void CopyBufferToTexture(ResourceIdentifier const& buffer,

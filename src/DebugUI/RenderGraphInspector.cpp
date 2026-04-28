@@ -39,10 +39,9 @@ BuildBatchLayouts(const std::vector<RenderGraph::PassBatch>& batches, const RGIn
     for (int i = 0; i < static_cast<int>(batches.size()); ++i) {
         const auto& b = batches[i];
         bool hasPostTransitions = false;
-        for (size_t queueIndex = 0; queueIndex < static_cast<size_t>(QueueKind::Count); ++queueIndex) {
-            const auto queue = static_cast<QueueKind>(queueIndex);
+        for (size_t qi = 0; qi < b.QueueCount(); ++qi) {
             hasPostTransitions = hasPostTransitions ||
-                b.HasTransitions(queue, RenderGraph::BatchTransitionPhase::AfterPasses);
+                b.HasTransitions(qi, RenderGraph::BatchTransitionPhase::AfterPasses);
         }
         BatchLayout bl;
         bl.baseX = cursor;
@@ -74,15 +73,15 @@ enum class SignalPhase : uint8_t { AfterTransitions, AfterPasses, AfterPostTrans
 
 struct SignalSite {
     int        batchIndex = -1;
-    QueueKind  queue = QueueKind::Graphics;
+    size_t     slotIndex = 0;
     SignalPhase phase = SignalPhase::AfterTransitions;
 };
 
-// (QueueKind,fenceValue) -> SignalSite
-using SignalIndexKey = std::pair<QueueKind, uint64_t>;
+// (slotIndex, fenceValue) -> SignalSite
+using SignalIndexKey = std::pair<size_t, uint64_t>;
 struct SignalIndexKeyHash {
     size_t operator()(const SignalIndexKey& k) const noexcept {
-        return static_cast<size_t>(k.first) ^ static_cast<size_t>(k.second * 1469598103934665603ull);
+        return k.first ^ static_cast<size_t>(k.second * 1469598103934665603ull);
     }
 };
 using SignalIndex = std::unordered_map<SignalIndexKey, SignalSite, SignalIndexKeyHash>;
@@ -92,20 +91,18 @@ static SignalIndex BuildSignalIndex(const std::vector<RenderGraph::PassBatch>& b
     for (int i = 0; i < static_cast<int>(batches.size()); ++i) {
         const auto& b = batches[i];
 
-        for (size_t queueIndex = 0; queueIndex < static_cast<size_t>(QueueKind::Count); ++queueIndex) {
-            const auto queue = static_cast<QueueKind>(queueIndex);
-
-            if (b.HasQueueSignal(RenderGraph::BatchSignalPhase::AfterTransitions, queue)) {
-                idx[{queue, b.GetQueueSignalFenceValue(RenderGraph::BatchSignalPhase::AfterTransitions, queue)}] =
-                { i, queue, SignalPhase::AfterTransitions };
+        for (size_t qi = 0; qi < b.QueueCount(); ++qi) {
+            if (b.HasQueueSignal(RenderGraph::BatchSignalPhase::AfterTransitions, qi)) {
+                idx[{qi, b.GetQueueSignalFenceValue(RenderGraph::BatchSignalPhase::AfterTransitions, qi)}] =
+                { i, qi, SignalPhase::AfterTransitions };
             }
 
-            if (b.HasQueueSignal(RenderGraph::BatchSignalPhase::AfterCompletion, queue)) {
-                const auto phase = b.HasTransitions(queue, RenderGraph::BatchTransitionPhase::AfterPasses)
+            if (b.HasQueueSignal(RenderGraph::BatchSignalPhase::AfterCompletion, qi)) {
+                const auto phase = b.HasTransitions(qi, RenderGraph::BatchTransitionPhase::AfterPasses)
                     ? SignalPhase::AfterPostTransitions
                     : SignalPhase::AfterPasses;
-                idx[{queue, b.GetQueueSignalFenceValue(RenderGraph::BatchSignalPhase::AfterCompletion, queue)}] =
-                { i, queue, phase };
+                idx[{qi, b.GetQueueSignalFenceValue(RenderGraph::BatchSignalPhase::AfterCompletion, qi)}] =
+                { i, qi, phase };
             }
         }
     }
@@ -149,9 +146,8 @@ static void CollectResourceIds(const std::vector<RenderGraph::PassBatch>& batche
             };
         for (size_t phaseIndex = 0; phaseIndex < static_cast<size_t>(RenderGraph::BatchTransitionPhase::Count); ++phaseIndex) {
             const auto phase = static_cast<RenderGraph::BatchTransitionPhase>(phaseIndex);
-            for (size_t queueIndex = 0; queueIndex < static_cast<size_t>(QueueKind::Count); ++queueIndex) {
-                const auto queue = static_cast<QueueKind>(queueIndex);
-                scan(b.Transitions(queue, phase));
+            for (size_t qi = 0; qi < b.QueueCount(); ++qi) {
+                scan(b.Transitions(qi, phase));
             }
         }
 
@@ -187,22 +183,11 @@ static void CollectResourceIds(const std::vector<RenderGraph::PassBatch>& batche
 }
 
 static std::string GetBatchAnchorPassName(const RenderGraph::PassBatch& batch) {
-    auto queueAnchorPassName = [&](QueueKind queue) -> std::string {
-        const auto& queuedPasses = batch.Passes(queue);
-        if (queuedPasses.empty()) {
-            return {};
+    for (size_t qi = 0; qi < batch.QueueCount(); ++qi) {
+        const auto& queuedPasses = batch.Passes(qi);
+        if (!queuedPasses.empty()) {
+            return std::visit([](const auto* pass) { return pass->name; }, queuedPasses.back());
         }
-        return std::visit([](const auto& pass) { return pass.name; }, queuedPasses.back());
-    };
-
-    if (auto name = queueAnchorPassName(QueueKind::Graphics); !name.empty()) {
-        return name;
-    }
-    if (auto name = queueAnchorPassName(QueueKind::Compute); !name.empty()) {
-        return name;
-    }
-    if (auto name = queueAnchorPassName(QueueKind::Copy); !name.empty()) {
-        return name;
     }
     return {};
 }
@@ -223,26 +208,29 @@ static void CollectBatchResourceIds(const RenderGraph::PassBatch& batch, std::un
     };
     for (size_t phaseIndex = 0; phaseIndex < static_cast<size_t>(RenderGraph::BatchTransitionPhase::Count); ++phaseIndex) {
         const auto phase = static_cast<RenderGraph::BatchTransitionPhase>(phaseIndex);
-        for (size_t queueIndex = 0; queueIndex < static_cast<size_t>(QueueKind::Count); ++queueIndex) {
-            const auto queue = static_cast<QueueKind>(queueIndex);
-            scan(batch.Transitions(queue, phase));
+        for (size_t qi = 0; qi < batch.QueueCount(); ++qi) {
+            scan(batch.Transitions(qi, phase));
         }
     }
 }
 
 // Colors
-static ImU32 ColPassGraphics() { return IM_COL32(66, 150, 250, 200); }
-static ImU32 ColPassCompute() { return IM_COL32(100, 200, 100, 200); }
-static ImU32 ColPassCopy() { return IM_COL32(200, 200, 100, 200); }
+static ImU32 ColPassForKind(QueueKind kind) {
+    switch (kind) {
+    case QueueKind::Graphics: return IM_COL32(66, 150, 250, 200);
+    case QueueKind::Compute:  return IM_COL32(100, 200, 100, 200);
+    case QueueKind::Copy:     return IM_COL32(200, 200, 100, 200);
+    default:                  return IM_COL32(180, 130, 200, 200);
+    }
+}
 static ImU32 ColTrans() { return IM_COL32(200, 100, 80, 200); }
 static ImU32 ColArrowWait() { return IM_COL32(255, 200, 64, 220); }
 static ImU32 ColHighlight() { return IM_COL32(255, 64, 64, 255); }
 static ImU32 ColBorder() { return IM_COL32(0, 0, 0, 255); }
 
-static float LaneY(QueueKind qk, float rowHeight, float laneSpacing) {
-    // y from top: Graphics (2), Compute (1), Copy(0) to show graphics on top
-    int laneIndex = (qk == QueueKind::Graphics) ? 2 : (qk == QueueKind::Compute ? 1 : 0);
-    return static_cast<float>(laneIndex) * (rowHeight + laneSpacing);
+static float LaneY(size_t slotIndex, size_t totalSlots, float rowHeight, float laneSpacing) {
+    // Slot 0 at top, slot N-1 at bottom (higher Y = higher on screen in ImPlot)
+    return static_cast<float>(totalSlots - 1 - slotIndex) * (rowHeight + laneSpacing);
 }
 
 static void DrawBlock(ImDrawList* dl, const ImPlotPoint& minP, const ImPlotPoint& maxP,
@@ -326,6 +314,7 @@ static void DrawArrowBetweenLanes(ImDrawList* dl,
 namespace RGInspector {
 
     void Show(const std::vector<RenderGraph::PassBatch>& batches,
+        const QueueRegistry& registry,
         RGPassUsesResourceFn passUses,
         RGResourceNameByIdFn resourceNameById,
         RGResourcePtrByIdFn resourcePtrById,
@@ -337,11 +326,16 @@ namespace RGInspector {
             return;
         }
 
+        const size_t numSlots = registry.SlotCount();
+        auto slotKind = [&](size_t qi) -> QueueKind {
+            return registry.GetKind(static_cast<QueueSlotIndex>(static_cast<uint8_t>(qi)));
+        };
+
         SignalIndex sigIdx = BuildSignalIndex(batches);
         auto layouts = BuildBatchLayouts(batches, opts);
         double totalW = layouts.empty() ? 1.0 : (layouts.back().baseX + layouts.back().width);
 
-        // --- Left panel: resource picker ---
+        // Left panel: resource picker
         static uint64_t s_selectedRes = 0;
         static Resource* s_selectedResPtr = nullptr;
         static int s_selectedBatch = 0;
@@ -349,6 +343,15 @@ namespace RGInspector {
         static std::string s_selectedPassName;
         static bool s_openMemoryView = false;
         static ui::MemoryViewWidget s_memoryView;
+        static bool s_memoryViewCallbacksWired = false;
+        if (!s_memoryViewCallbacksWired && opts.imguiAllocDescriptor) {
+            s_memoryView.SetImGuiDescriptorCallbacks(
+                opts.imguiAllocDescriptor,
+                opts.imguiFreeDescriptor,
+                opts.imguiGpuHandle,
+                opts.imguiHeapHandle);
+            s_memoryViewCallbacksWired = true;
+        }
         static char filterBuf[128] = {};
         std::unordered_map<uint64_t, std::string> idToName;
         std::unordered_map<uint64_t, Resource*> idToPtr;
@@ -444,20 +447,16 @@ namespace RGInspector {
             {
                 std::vector<std::string> passNames;
                 size_t totalPassCount = 0;
-                for (size_t queueIndex = 0; queueIndex < static_cast<size_t>(QueueKind::Count); ++queueIndex) {
-                    totalPassCount += batches[s_selectedBatch].Passes(static_cast<QueueKind>(queueIndex)).size();
+                for (size_t qi = 0; qi < batches[s_selectedBatch].QueueCount(); ++qi) {
+                    totalPassCount += batches[s_selectedBatch].Passes(qi).size();
                 }
                 passNames.reserve(totalPassCount);
 
-                auto appendPassNames = [&](QueueKind queue) {
-                    for (auto const& queuedPass : batches[s_selectedBatch].Passes(queue)) {
-                        passNames.push_back(std::visit([](const auto& pass) { return pass.name; }, queuedPass));
+                for (size_t qi = 0; qi < batches[s_selectedBatch].QueueCount(); ++qi) {
+                    for (auto const& queuedPass : batches[s_selectedBatch].Passes(qi)) {
+                        passNames.push_back(std::visit([](const auto* pass) { return pass->name; }, queuedPass));
                     }
-                };
-
-                appendPassNames(QueueKind::Compute);
-                appendPassNames(QueueKind::Graphics);
-                appendPassNames(QueueKind::Copy);
+                }
 
                 const std::string anchor = GetBatchAnchorPassName(batches[s_selectedBatch]);
                 auto findIndex = [&](const std::string& name) -> int {
@@ -546,47 +545,66 @@ namespace RGInspector {
             // Axes: X = batch index [0..N], Y = lanes
             ImPlot::SetupAxes(nullptr, nullptr, ImPlotAxisFlags_NoTickLabels, ImPlotAxisFlags_NoTickLabels);
             ImPlot::SetupAxisLimits(ImAxis_X1, -0.1, totalW + 0.1, ImGuiCond_Always);
-            // Three lanes stacked (Copy at bottom, Compute middle, Graphics top)
             const float H = opts.rowHeight;
             const float S = opts.laneSpacing;
-            ImPlot::SetupAxisLimits(ImAxis_Y1, -S, LaneY(QueueKind::Graphics, H, S) + H + S, ImGuiCond_Always);
+            const float topLaneY = (numSlots > 0) ? LaneY(0, numSlots, H, S) : 0.0f;
+            ImPlot::SetupAxisLimits(ImAxis_Y1, -S, topLaneY + H + S, ImGuiCond_Always);
 
             ImDrawList* dl = ImPlot::GetPlotDrawList();
 
+            // Build per-slot labels
+            std::vector<std::string> slotLabels(numSlots);
+            {
+                std::array<int, static_cast<size_t>(QueueKind::Count)> kindCount{};
+                for (size_t qi = 0; qi < numSlots; ++qi) {
+                    ++kindCount[static_cast<size_t>(slotKind(qi))];
+                }
+                auto kindName = [](QueueKind k) -> const char* {
+                    switch (k) {
+                    case QueueKind::Graphics: return "Graphics";
+                    case QueueKind::Compute:  return "Compute";
+                    case QueueKind::Copy:     return "Copy";
+                    default:                  return "Queue";
+                    }
+                };
+                for (size_t qi = 0; qi < numSlots; ++qi) {
+                    auto kind = slotKind(qi);
+                    auto inst = registry.GetInstance(static_cast<QueueSlotIndex>(static_cast<uint8_t>(qi)));
+                    if (kindCount[static_cast<size_t>(kind)] > 1) {
+                        slotLabels[qi] = std::string(kindName(kind)) + "[" + std::to_string(inst) + "]";
+                    } else {
+                        slotLabels[qi] = kindName(kind);
+                    }
+                }
+            }
+
             // Grid: lane separators + labels
-            auto draw_lane_bg = [&](QueueKind qk, const char* name) {
-                float y = LaneY(qk, H, S);
+            for (size_t qi = 0; qi < numSlots; ++qi) {
+                float y = LaneY(qi, numSlots, H, S);
                 ImPlotPoint a(-0.25, y - 0.05);
                 ImPlotPoint b(static_cast<double>(batches.size()) + 0.25, y + H + 0.05);
                 DrawBlock(dl, a, b, IM_COL32(245, 245, 245, 32), IM_COL32(0, 0, 0, 32), 0.0f);
-                // label on the left
-                ImVec2 lp = ImPlot::PlotToPixels(ImPlotPoint(-0.2, y + 0.1));
-                dl->AddText(lp, IM_COL32_BLACK, name);
-                };
-            draw_lane_bg(QueueKind::Copy, "Copy");
-            draw_lane_bg(QueueKind::Compute, "Compute");
-            draw_lane_bg(QueueKind::Graphics, "Graphics");
+                ImVec2 lp = ImPlot::PlotToPixels(ImPlotPoint(-0.2, y + H + 0.18f * S));
+                dl->AddText(lp, IM_COL32(255, 255, 255, 255), slotLabels[qi].c_str());
+            }
 
             // X grid lines per batch
             for (int i = 0; i <= static_cast<int>(layouts.size()); ++i) {
                 double x = (i == static_cast<int>(layouts.size())) ? totalW : layouts[i].baseX;
                 ImVec2 p0 = ImPlot::PlotToPixels(ImPlotPoint(x, -S));
-                ImVec2 p1 = ImPlot::PlotToPixels(ImPlotPoint(x, LaneY(QueueKind::Graphics, H, S) + H + S));
+                ImVec2 p1 = ImPlot::PlotToPixels(ImPlotPoint(x, topLaneY + H + S));
                 dl->AddLine(p0, p1, IM_COL32(180, 180, 180, 64), (i % 5 == 0) ? 2.0f : 1.0f);
             }
 
-            const float yG = LaneY(QueueKind::Graphics, H, S) + H * 0.5f;
-            const float yC = LaneY(QueueKind::Compute, H, S) + H * 0.5f;
-
             auto draw_transitions = [&](const std::vector<ResourceTransition>& v,
-                QueueKind qk, int batchIndex,
+                size_t qi, int batchIndex,
                 double absX0, double absX1) {
                 if (v.empty()) {
                     return;
                 }
 
                 const bool haveSelection = (s_selectedRes != 0);
-                float y = LaneY(qk, H, S);
+                float y = LaneY(qi, numSlots, H, S);
                 ImPlotPoint minP(absX0, y);
                 ImPlotPoint maxP(absX1, y + H);
 
@@ -662,12 +680,12 @@ namespace RGInspector {
                 }
                 };
 
-            auto draw_passes = [&](const std::vector<RenderGraph::PassBatch::QueuedPass>& passesVec, QueueKind qk, int bi) {
+            auto draw_passes = [&](const std::vector<RenderGraph::PassBatch::QueuedPass>& passesVec, size_t qi, int bi) {
                 if (passesVec.empty()) {
                     return;
                 }
                 const auto& L = layouts[bi];
-                float y = LaneY(qk, H, S);
+                float y = LaneY(qi, numSlots, H, S);
                 ImPlotPoint minP(L.p0, y);
                 ImPlotPoint maxP(L.p1, y + H);
 
@@ -677,9 +695,11 @@ namespace RGInspector {
                     for (auto const& queuedPass : passesVec) {
                         const bool usesSelected = std::visit(
                             [&](const auto& pass) {
-                                using TPass = std::decay_t<decltype(pass)>;
-                                constexpr bool passIsCompute = std::is_same_v<TPass, RenderGraph::ComputePassAndResources>;
-                                return passUses(static_cast<const void*>(&pass), s_selectedRes, passIsCompute);
+                                using TPass = std::remove_pointer_t<std::decay_t<decltype(pass)>>;
+                                constexpr int passKind =
+                                    std::is_same_v<TPass, RenderGraph::ComputePassAndResources> ? 1 :
+                                    std::is_same_v<TPass, RenderGraph::CopyPassAndResources> ? 2 : 0;
+                                return pass != nullptr && passUses(static_cast<const void*>(pass), s_selectedRes, passKind);
                             },
                             queuedPass);
                         if (usesSelected) {
@@ -690,9 +710,7 @@ namespace RGInspector {
                 }
 
                 DrawBlock(dl, minP, maxP,
-                    touchesSelected ? ColHighlight() :
-                    (qk == QueueKind::Graphics ? ColPassGraphics() :
-                        qk == QueueKind::Compute ? ColPassCompute() : ColPassCopy()),
+                    touchesSelected ? ColHighlight() : ColPassForKind(slotKind(qi)),
                     ColBorder());
 
                 // Pass labels (stacked vertically)
@@ -709,11 +727,11 @@ namespace RGInspector {
                 // Tooltip for whole pass block
                 if (IsMouseOver(minP, maxP)) {
                     ImGui::BeginTooltip();
-                    ImGui::Text("%s Passes (%d)", qk == QueueKind::Graphics ? "Graphics" : (qk == QueueKind::Compute ? "Compute" : "Copy"), static_cast<int>(passesVec.size()));
+                    ImGui::Text("%s Passes (%d)", slotLabels[qi].c_str(), static_cast<int>(passesVec.size()));
                     for (auto const& queuedPass : passesVec) {
                         std::visit(
-                            [&](const auto& pass) {
-                                ImGui::BulletText("%s", pass.name.c_str());
+                            [&](const auto* pass) {
+                                ImGui::BulletText("%s", pass->name.c_str());
                             },
                             queuedPass);
                     }
@@ -726,17 +744,11 @@ namespace RGInspector {
 
                 const auto& b = batches[bi];
                 const auto& L = layouts[bi];
-                const auto& copyPreTransitions = b.Transitions(QueueKind::Copy, RenderGraph::BatchTransitionPhase::BeforePasses);
-                const auto& copyPostTransitions = b.Transitions(QueueKind::Copy, RenderGraph::BatchTransitionPhase::AfterPasses);
-                const auto& computePreTransitions = b.Transitions(QueueKind::Compute, RenderGraph::BatchTransitionPhase::BeforePasses);
-                const auto& computePostTransitions = b.Transitions(QueueKind::Compute, RenderGraph::BatchTransitionPhase::AfterPasses);
-                const auto& graphicsPreTransitions = b.Transitions(QueueKind::Graphics, RenderGraph::BatchTransitionPhase::BeforePasses);
-                const auto& graphicsPostTransitions = b.Transitions(QueueKind::Graphics, RenderGraph::BatchTransitionPhase::AfterPasses);
 
                 // Batch hitbox for selection (click anywhere in the batch slot)
                 {
-                    const float yMin = LaneY(QueueKind::Copy, H, S);
-                    const float yMax = LaneY(QueueKind::Graphics, H, S) + H;
+                    const float yMin = (numSlots > 0) ? LaneY(numSlots - 1, numSlots, H, S) : 0.0f;
+                    const float yMax = (numSlots > 0) ? LaneY(0, numSlots, H, S) + H : H;
                     ImPlotPoint hbMin(L.baseX, yMin);
                     ImPlotPoint hbMax(L.baseX + L.width, yMax);
                     if (IsMouseOver(hbMin, hbMax) && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
@@ -758,36 +770,24 @@ namespace RGInspector {
                     }
                 }
 
-                // Copy lane
-                draw_transitions(copyPreTransitions, QueueKind::Copy, bi, L.t0, L.t1);
-                draw_passes(b.Passes(QueueKind::Copy), QueueKind::Copy, bi);
-
-                // Compute lane
-                draw_transitions(computePreTransitions, QueueKind::Compute, bi, L.t0, L.t1);
-                draw_passes(b.Passes(QueueKind::Compute), QueueKind::Compute, bi);
-
-                // Graphics lane
-                draw_transitions(graphicsPreTransitions, QueueKind::Graphics, bi, L.t0, L.t1);
-                draw_passes(b.Passes(QueueKind::Graphics), QueueKind::Graphics, bi);
-
-                if (L.hasEnd) {
-                    draw_transitions(copyPostTransitions, QueueKind::Copy, bi, L.e0, L.e1);
-                    draw_transitions(computePostTransitions, QueueKind::Compute, bi, L.e0, L.e1);
-                    draw_transitions(graphicsPostTransitions, QueueKind::Graphics, bi, L.e0, L.e1);
-                    //ImVec2 tp = ImPlot::PlotToPixels(ImPlotPoint((L.e0 + L.e1) * 0.5, LaneY(QueueKind::Graphics, H, S) + 0.08f * H));
-                    //dl->AddText(tp, IM_COL32_BLACK, "End Transitions");
+                // Draw all queue lanes
+                for (size_t qi = 0; qi < b.QueueCount(); ++qi) {
+                    draw_transitions(b.Transitions(qi, RenderGraph::BatchTransitionPhase::BeforePasses), qi, bi, L.t0, L.t1);
+                    draw_passes(b.Passes(qi), qi, bi);
                 }
 
-                // Cross-queue waits/signals (we draw at the left edge of the "execution" in each lane)
-                auto laneYG = LaneY(QueueKind::Graphics, H, S) + H * 0.5f;
-                auto laneYC = LaneY(QueueKind::Compute, H, S) + H * 0.5f;
+                if (L.hasEnd) {
+                    for (size_t qi = 0; qi < b.QueueCount(); ++qi) {
+                        draw_transitions(b.Transitions(qi, RenderGraph::BatchTransitionPhase::AfterPasses), qi, bi, L.e0, L.e1);
+                    }
+                }
 
+                // Cross-queue waits/signals
                 auto labelFence = [](bool enabled, uint64_t val)->std::string {
                     if (!enabled) {
                         return {};
                     }
                     std::ostringstream o; 
-                	//o << "#" << val; // TODO: Visual overlap. Better way of indicating the fence value in the UI?
                 	return o.str();
                     };
 
@@ -796,33 +796,31 @@ namespace RGInspector {
                     switch (s.phase) {
                     case SignalPhase::AfterTransitions:         return SL.t1;
                     case SignalPhase::AfterPasses:              return SL.p1;
-                    case SignalPhase::AfterPostTransitions: return SL.e1; // only valid if hasEnd=true
+                    case SignalPhase::AfterPostTransitions: return SL.e1;
                     default:                                    return SL.p1;
                     }
                     };
-                auto laneCenterY = [&](QueueKind q)->float {
-                    return (q == QueueKind::Graphics) ? yG : (q == QueueKind::Compute ? yC : (yC - (yG - yC)));
+                auto laneCenterY = [&](size_t qi)->float {
+                    return LaneY(qi, numSlots, H, S) + H * 0.5f;
                     };
 
                 auto waitX_Transitions = [&](int bi)->double { return layouts[bi].t0; };
                 auto waitX_Passes = [&](int bi)->double { return layouts[bi].p0; };
 
-                for (size_t dstIndex = 0; dstIndex < static_cast<size_t>(QueueKind::Count); ++dstIndex) {
-                    const auto dstQueue = static_cast<QueueKind>(dstIndex);
-                    for (size_t srcIndex = 0; srcIndex < static_cast<size_t>(QueueKind::Count); ++srcIndex) {
-                        const auto srcQueue = static_cast<QueueKind>(srcIndex);
-                        if (dstQueue == srcQueue) {
+                for (size_t dstSlot = 0; dstSlot < b.QueueCount(); ++dstSlot) {
+                    for (size_t srcSlot = 0; srcSlot < b.QueueCount(); ++srcSlot) {
+                        if (dstSlot == srcSlot) {
                             continue;
                         }
 
                         for (size_t phaseIndex = 0; phaseIndex < static_cast<size_t>(RenderGraph::BatchWaitPhase::Count); ++phaseIndex) {
                             const auto phase = static_cast<RenderGraph::BatchWaitPhase>(phaseIndex);
-                            if (!b.HasQueueWait(phase, dstQueue, srcQueue)) {
+                            if (!b.HasQueueWait(phase, dstSlot, srcSlot)) {
                                 continue;
                             }
 
-                            const uint64_t fenceValue = b.GetQueueWaitFenceValue(phase, dstQueue, srcQueue);
-                            auto signalIt = sigIdx.find({ srcQueue, fenceValue });
+                            const uint64_t fenceValue = b.GetQueueWaitFenceValue(phase, dstSlot, srcSlot);
+                            auto signalIt = sigIdx.find({ srcSlot, fenceValue });
                             if (signalIt == sigIdx.end()) {
                                 continue;
                             }
@@ -836,9 +834,9 @@ namespace RGInspector {
                             DrawArrowBetweenLanes(
                                 dl,
                                 static_cast<float>(siteToX(signalSite)),
-                                laneCenterY(srcQueue),
+                                laneCenterY(srcSlot),
                                 static_cast<float>(waitX),
-                                laneCenterY(dstQueue),
+                                laneCenterY(dstSlot),
                                 ColArrowWait(),
                                 label.c_str());
                         }

@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #include <rhi.h>
@@ -19,7 +21,7 @@ public:
     virtual void BeginFrame() = 0;
     virtual void ClearAll() = 0;
 
-    virtual unsigned RegisterPass(const std::string& passName, bool isGeometryPass) = 0;
+    virtual unsigned RegisterPass(const std::string& passName, bool isGeometryPass, std::string_view techniquePath = {}) = 0;
     virtual void RegisterQueue(rhi::QueueKind queueKind) = 0;
     virtual void SetupQueryHeap() = 0;
 
@@ -27,8 +29,17 @@ public:
     virtual void EndQuery(unsigned passIndex, unsigned frameIndex, rhi::Queue& queue, rhi::CommandList& cmdList) = 0;
     virtual void ResolveQueries(unsigned frameIndex, rhi::Queue& queue, rhi::CommandList& cmdList) = 0;
     virtual void OnFrameComplete(unsigned frameIndex, rhi::Queue& queue) = 0;
+    virtual void RecordCpuUpdateTime(unsigned passIndex, double milliseconds) = 0;
+    virtual void RecordCpuExecuteTime(unsigned passIndex, double milliseconds) = 0;
+
+    // Thread-safe overloads that write to a per-task context instead of shared state.
+    virtual void BeginQuery(unsigned passIndex, unsigned frameIndex, rhi::Queue& queue, rhi::CommandList& cmdList, QueryRecordingContext& ctx) = 0;
+    virtual void EndQuery(unsigned passIndex, unsigned frameIndex, rhi::Queue& queue, rhi::CommandList& cmdList, QueryRecordingContext& ctx) = 0;
+    virtual void ResolveQueries(unsigned frameIndex, rhi::Queue& queue, rhi::CommandList& cmdList, QueryRecordingContext& ctx) = 0;
+    virtual void MergePendingResolves(rhi::QueueKind queueKind, unsigned frameIndex, QueryRecordingContext& ctx) = 0;
 
     virtual const std::vector<std::string>& GetPassNames() const = 0;
+    virtual const std::vector<std::string>& GetPassTechniquePaths() const = 0;
     virtual const std::vector<PassStats>& GetPassStats() const = 0;
     virtual const std::vector<MeshPipelineStats>& GetMeshStats() const = 0;
     virtual MemoryBudgetStats GetMemoryBudgetStats() const = 0;

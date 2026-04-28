@@ -13,6 +13,8 @@ struct ResourceHandleAndRange {
 	ResourceHandleAndRange(ResourceRegistry::RegistryHandle resource, const RangeSpec& range) : resource(resource), range(range) {}
     ResourceRegistry::RegistryHandle resource;
     RangeSpec range;
+
+	RG_DEFINE_PASS_INPUTS(ResourceHandleAndRange, &ResourceHandleAndRange::resource, &ResourceHandleAndRange::range);
 };
 
 struct ResourcePtrAndRange {

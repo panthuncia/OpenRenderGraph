@@ -32,10 +32,15 @@ struct RenderPassParameters {
 	std::vector<std::pair<ResourceHandleAndRange, ResourceState>> internalTransitions;
 
 	std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> identifierSet;
+	std::vector<AutoDescriptorRegistration> autoDescriptorShaderResources;
+	std::vector<AutoDescriptorRegistration> autoDescriptorConstantBuffers;
+	std::vector<AutoDescriptorRegistration> autoDescriptorUnorderedAccessViews;
 	std::vector<ResourceRequirement> staticResourceRequirements; // Static resource requirements for the pass
 	std::vector<ResourceRequirement> frameResourceRequirements; // Resource requirements that may change each frame + static ones
 	bool isGeometryPass = false;
-	RenderQueueSelection queueSelection = RenderQueueSelection::Graphics;
+	QueueKind preferredQueueKind = QueueKind::Graphics;
+	QueueAssignmentPolicy queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
+	std::optional<QueueSlotIndex> pinnedQueueSlot; // Target a specific queue slot instead of using preferredQueueKind
 };
 
 class RenderPassBuilder;
@@ -49,10 +54,27 @@ public:
 		m_resourceDescriptorIndexHelper = std::make_unique<ResourceDescriptorIndexHelper>(resourceRegistryView);
 	}
 
+	void SetResourceRegistryView(
+		std::shared_ptr<ResourceRegistryView> resourceRegistryView,
+		const std::vector<AutoDescriptorRegistration>& autoDescriptorShaderResources,
+		const std::vector<AutoDescriptorRegistration>& autoDescriptorConstantBuffers,
+		const std::vector<AutoDescriptorRegistration>& autoDescriptorUnorderedAccessViews) {
+		SetResourceRegistryView(std::move(resourceRegistryView));
+		for (const auto& registration : autoDescriptorShaderResources) {
+			m_resourceDescriptorIndexHelper->RegisterDescriptor(registration);
+		}
+		for (const auto& registration : autoDescriptorConstantBuffers) {
+			m_resourceDescriptorIndexHelper->RegisterDescriptor(registration);
+		}
+		for (const auto& registration : autoDescriptorUnorderedAccessViews) {
+			m_resourceDescriptorIndexHelper->RegisterDescriptor(registration);
+		}
+	}
+
     virtual void Setup() = 0;
 
 	virtual void Update(const UpdateExecutionContext& context) {};
-	virtual void ExecuteImmediate(ImmediateExecutionContext& context) {};
+	virtual void RecordImmediateCommands(ImmediateExecutionContext& context) {};
 	virtual PassReturn Execute(PassExecutionContext& context) { return {}; };
     virtual void Cleanup() = 0;
 
@@ -87,6 +109,12 @@ protected:
 	}
 	void RegisterUAV(ResourceIdentifier id, unsigned int mip = 0, unsigned int slice = 0) {
 		m_resourceDescriptorIndexHelper->RegisterUAV(id, mip, slice);
+	}
+	void RegisterUAV(UAVViewType type, ResourceIdentifier id, unsigned int mip = 0, unsigned int slice = 0) {
+		m_resourceDescriptorIndexHelper->RegisterUAV(type, id, mip, slice);
+	}
+	void RegisterCBV(ResourceIdentifier id) {
+		m_resourceDescriptorIndexHelper->RegisterCBV(id);
 	}
 
 	virtual std::shared_ptr<Resource> ProvideResource(ResourceIdentifier const& key) { return nullptr; }

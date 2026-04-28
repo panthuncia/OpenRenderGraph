@@ -11,6 +11,14 @@ public:
         return GetOpenRenderGraphSettings().useAsyncCompute;
     }
 
+    bool GetRenderGraphCompileDumpEnabled() const override {
+        return GetOpenRenderGraphSettings().renderGraphCompileDumpEnabled;
+    }
+
+    bool GetRenderGraphBatchTraceEnabled() const override {
+        return GetOpenRenderGraphSettings().renderGraphBatchTraceEnabled;
+    }
+
     uint8_t GetAutoAliasMode() const override {
         return GetOpenRenderGraphSettings().autoAliasMode;
     }
@@ -25,6 +33,42 @@ public:
 
     bool GetAutoAliasLogExclusionReasons() const override {
         return GetOpenRenderGraphSettings().autoAliasLogExclusionReasons;
+    }
+
+    bool GetQueueSchedulingEnableLogging() const override {
+        return GetOpenRenderGraphSettings().queueSchedulingEnableLogging;
+    }
+
+    float GetQueueSchedulingWidthScale() const override {
+        return GetOpenRenderGraphSettings().queueSchedulingWidthScale;
+    }
+
+    float GetQueueSchedulingPenaltyBias() const override {
+        return GetOpenRenderGraphSettings().queueSchedulingPenaltyBias;
+    }
+
+    float GetQueueSchedulingMinPenalty() const override {
+        return GetOpenRenderGraphSettings().queueSchedulingMinPenalty;
+    }
+
+    float GetQueueSchedulingResourcePressureWeight() const override {
+        return GetOpenRenderGraphSettings().queueSchedulingResourcePressureWeight;
+    }
+
+    float GetQueueSchedulingUavPressureWeight() const override {
+        return GetOpenRenderGraphSettings().queueSchedulingUavPressureWeight;
+    }
+
+    float GetQueueSchedulingAutoGraphicsBias() const override {
+        return GetOpenRenderGraphSettings().queueSchedulingAutoGraphicsBias;
+    }
+
+    float GetQueueSchedulingAsyncOverlapBonus() const override {
+        return GetOpenRenderGraphSettings().queueSchedulingAsyncOverlapBonus;
+    }
+
+    float GetQueueSchedulingCrossQueueHandoffPenalty() const override {
+        return GetOpenRenderGraphSettings().queueSchedulingCrossQueueHandoffPenalty;
     }
 
     uint32_t GetAutoAliasPoolRetireIdleFrames() const override {

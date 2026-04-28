@@ -160,49 +160,125 @@ namespace rg::imm {
 
 	// End of BytecodeReader functions
 
-    void Replay(std::vector<std::byte> const& bytecode, rhi::CommandList& cl) {
+    void Replay(std::vector<std::byte> const& bytecode, rhi::CommandList& cl, ImmediateDispatch const& dispatch) {
         BytecodeReader r(bytecode.data(), bytecode.size());
         while (!r.Empty()) {
             Op op = r.ReadOp();
             switch (op) {
             case Op::CopyBufferRegion: {
                 auto cmd = r.ReadPOD<CopyBufferRegionCmd>();
-                cl.CopyBufferRegion(cmd.dst, cmd.dstOffset, cmd.src, cmd.srcOffset, cmd.numBytes);
+                if (!dispatch.GetResourceHandle) {
+                    throw std::runtime_error("Immediate replay: GetResourceHandle not set");
+                }
+                const auto dst = dispatch.GetResourceHandle(dispatch.user, cmd.dst);
+                const auto src = dispatch.GetResourceHandle(dispatch.user, cmd.src);
+                cl.CopyBufferRegion(dst, cmd.dstOffset, src, cmd.srcOffset, cmd.numBytes);
                 break;
             }
             case Op::ClearRTV: {
                 auto cmd = r.ReadPOD<ClearRTVCmd>();
-                cl.ClearRenderTargetView(cmd.rtv, cmd.clear);
+                if (!dispatch.GetRTV) {
+                    throw std::runtime_error("Immediate replay: GetRTV not set");
+                }
+                const auto rtv = dispatch.GetRTV(dispatch.user, cmd.target, cmd.range);
+                cl.ClearRenderTargetView(rtv, cmd.clear);
                 break;
             }
             case Op::ClearDSV: {
                 auto cmd = r.ReadPOD<ClearDSVCmd>();
-                cl.ClearDepthStencilView(cmd.dsv, cmd.clearDepth, cmd.depth, cmd.clearStencil, cmd.stencil);
+                if (!dispatch.GetDSV) {
+                    throw std::runtime_error("Immediate replay: GetDSV not set");
+                }
+                const auto dsv = dispatch.GetDSV(dispatch.user, cmd.target, cmd.range);
+                cl.ClearDepthStencilView(dsv, cmd.clearDepth, cmd.depth, cmd.clearStencil, cmd.stencil);
                 break;
             }
             case Op::ClearUavFloat: {
                 auto cmd = r.ReadPOD<ClearUavFloatCmd>();
-                cl.ClearUavFloat(cmd.info, cmd.value);
+                if (!dispatch.GetUavClearInfo) {
+                    throw std::runtime_error("Immediate replay: GetUavClearInfo not set");
+                }
+                rhi::UavClearInfo info{};
+                if (!dispatch.GetUavClearInfo(dispatch.user, cmd.target, cmd.range, info)) {
+                    throw std::runtime_error("Immediate replay: GetUavClearInfo failed");
+                }
+                cl.ClearUavFloat(info, cmd.value);
                 break;
             }
             case Op::ClearUavUint: {
                 auto cmd = r.ReadPOD<ClearUavUintCmd>();
-                cl.ClearUavUint(cmd.info, cmd.value);
+                if (!dispatch.GetUavClearInfo) {
+                    throw std::runtime_error("Immediate replay: GetUavClearInfo not set");
+                }
+                rhi::UavClearInfo info{};
+                if (!dispatch.GetUavClearInfo(dispatch.user, cmd.target, cmd.range, info)) {
+                    throw std::runtime_error("Immediate replay: GetUavClearInfo failed");
+                }
+                cl.ClearUavUint(info, cmd.value);
                 break;
             }
             case Op::CopyTextureRegion: {
                 auto cmd = r.ReadPOD<CopyTextureRegionCmd>();
-                cl.CopyTextureRegion(cmd.dst, cmd.src);
+                if (!dispatch.GetResourceHandle) {
+                    throw std::runtime_error("Immediate replay: GetResourceHandle not set");
+                }
+                rhi::TextureCopyRegion dst{};
+                dst.texture = dispatch.GetResourceHandle(dispatch.user, cmd.dstTexture);
+                dst.mip = cmd.dstMip;
+                dst.arraySlice = cmd.dstSlice;
+                dst.x = cmd.dstX;
+                dst.y = cmd.dstY;
+                dst.z = cmd.dstZ;
+                dst.width = cmd.width;
+                dst.height = cmd.height;
+                dst.depth = cmd.depth;
+
+                rhi::TextureCopyRegion src{};
+                src.texture = dispatch.GetResourceHandle(dispatch.user, cmd.srcTexture);
+                src.mip = cmd.srcMip;
+                src.arraySlice = cmd.srcSlice;
+                src.x = cmd.srcX;
+                src.y = cmd.srcY;
+                src.z = cmd.srcZ;
+                src.width = cmd.width;
+                src.height = cmd.height;
+                src.depth = cmd.depth;
+
+                cl.CopyTextureRegion(dst, src);
                 break;
             }
             case Op::CopyTextureToBuffer: {
                 auto cmd = r.ReadPOD<CopyTextureToBufferCmd>();
-                cl.CopyTextureToBuffer(cmd.region);
+                if (!dispatch.GetResourceHandle) {
+                    throw std::runtime_error("Immediate replay: GetResourceHandle not set");
+                }
+                rhi::BufferTextureCopyFootprint region{};
+                region.texture = dispatch.GetResourceHandle(dispatch.user, cmd.texture);
+                region.buffer = dispatch.GetResourceHandle(dispatch.user, cmd.buffer);
+                region.mip = cmd.mip;
+                region.arraySlice = cmd.slice;
+                region.x = cmd.x;
+                region.y = cmd.y;
+                region.z = cmd.z;
+                region.footprint = cmd.footprint;
+                cl.CopyTextureToBuffer(region);
                 break;
             }
             case Op::CopyBufferToTexture: {
                 auto cmd = r.ReadPOD<CopyBufferToTextureCmd>();
-                cl.CopyBufferToTexture(cmd.region);
+                if (!dispatch.GetResourceHandle) {
+                    throw std::runtime_error("Immediate replay: GetResourceHandle not set");
+                }
+                rhi::BufferTextureCopyFootprint region{};
+                region.texture = dispatch.GetResourceHandle(dispatch.user, cmd.texture);
+                region.buffer = dispatch.GetResourceHandle(dispatch.user, cmd.buffer);
+                region.mip = cmd.mip;
+                region.arraySlice = cmd.slice;
+                region.x = cmd.x;
+                region.y = cmd.y;
+                region.z = cmd.z;
+                region.footprint = cmd.footprint;
+                cl.CopyBufferToTexture(region);
                 break;
             }
             default:
@@ -359,10 +435,11 @@ namespace rg::imm {
             // Copy queue only supports copy-class access; always use Copy sync.
             if ((access & (rhi::ResourceAccessType::CopySource | rhi::ResourceAccessType::CopyDest)) != rhi::ResourceAccessType(0)) {
                 sync = rhi::ResourceSyncState::Copy;
+                layout = rhi::ResourceLayout::Common;
             } else {
                 sync = rhi::ResourceSyncState::All;
+                layout = AccessToLayout(access, /*isRender=*/false);
             }
-            layout = AccessToLayout(access, /*isRender=*/false);
             break;
         default:
             sync = rhi::ResourceSyncState::All;
@@ -415,14 +492,10 @@ namespace rg::imm {
     void ImmediateCommandList::CopyBufferRegion(Resolved const& dst, const uint64_t dstOffset,
         Resolved const& src, const uint64_t srcOffset,
         const uint64_t numBytes) {
-        if (!m_dispatch.GetResourceHandle) {
-            throw std::runtime_error("ImmediateDispatch::GetResourceHandle not set");
-        }
-
         CopyBufferRegionCmd cmd;
-        cmd.dst = m_dispatch.GetResourceHandle(m_dispatch.user, dst.handle);
+        cmd.dst = dst.handle;
         cmd.dstOffset = dstOffset;
-        cmd.src = m_dispatch.GetResourceHandle(m_dispatch.user, src.handle);
+        cmd.src = src.handle;
         cmd.srcOffset = srcOffset;
         cmd.numBytes = numBytes;
 
@@ -436,10 +509,6 @@ namespace rg::imm {
 
     void ImmediateCommandList::ClearRTV(Resolved const& target, const float r, const float g, const float b, const float a, const RangeSpec& range)
     {
-        if (!m_dispatch.GetRTV) {
-            throw std::runtime_error("ImmediateDispatch::GetRTV not set");
-        }
-
         rhi::ClearValue cv{};
         cv.type = rhi::ClearValueType::Color;
         cv.rgba[0] = r;
@@ -450,11 +519,9 @@ namespace rg::imm {
         const bool any = ForEachMipSlice(target.handle, range,
             [&](uint32_t /*mip*/, uint32_t /*slice*/, const RangeSpec& exact)
             {
-                const rhi::DescriptorSlot rtv = m_dispatch.GetRTV(m_dispatch.user, target.handle, exact);
-                RequireValidSlot(rtv, "RTV");
-
                 ClearRTVCmd cmd{};
-                cmd.rtv = rtv;
+                cmd.target = target.handle;
+                cmd.range = exact;
                 cmd.clear = cv;
 
                 m_writer.WriteOp(Op::ClearRTV);
@@ -482,11 +549,9 @@ namespace rg::imm {
         const bool any = ForEachMipSlice(target.handle, range,
             [&](uint32_t /*mip*/, uint32_t /*slice*/, const RangeSpec& exact)
             {
-                const rhi::DescriptorSlot dsv = m_dispatch.GetDSV(m_dispatch.user, target.handle, exact);
-                RequireValidSlot(dsv, "DSV");
-
                 ClearDSVCmd cmd{};
-                cmd.dsv = dsv;
+                cmd.target = target.handle;
+                cmd.range = exact;
                 cmd.clearDepth = clearDepth;
                 cmd.clearStencil = clearStencil;
                 cmd.depth = depth;
@@ -503,10 +568,6 @@ namespace rg::imm {
 
     void ImmediateCommandList::ClearUavFloat(Resolved const& target, const float x, const float y, const float z, const float w, const RangeSpec& range)
     {
-        if (!m_dispatch.GetUavClearInfo) {
-            throw std::runtime_error("ImmediateDispatch::GetUavClearInfo not set");
-        }
-
         rhi::UavClearFloat value{};
         value.v[0] = x; value.v[1] = y; value.v[2] = z; value.v[3] = w;
 
@@ -514,15 +575,9 @@ namespace rg::imm {
             [&](uint32_t /*mip*/, uint32_t /*slice*/, const RangeSpec& exact)
             {
                 ClearUavFloatCmd cmd{};
+                cmd.target = target.handle;
+                cmd.range = exact;
                 cmd.value = value;
-
-                if (!m_dispatch.GetUavClearInfo(m_dispatch.user, target.handle, exact, cmd.info)) {
-                    throw std::runtime_error("Immediate clear: GetUavClearInfo failed");
-                }
-
-                if (!cmd.info.shaderVisible.heap.valid() || !cmd.info.cpuVisible.heap.valid()) {
-                    throw std::runtime_error("Immediate clear: invalid UAV descriptor slots");
-                }
 
                 m_writer.WriteOp(Op::ClearUavFloat);
                 m_writer.WritePOD(cmd);
@@ -534,10 +589,6 @@ namespace rg::imm {
 
     void ImmediateCommandList::ClearUavUint(Resolved const& target, const uint32_t x, const uint32_t y, const uint32_t z, const uint32_t w, const RangeSpec& range)
     {
-        if (!m_dispatch.GetUavClearInfo) {
-            throw std::runtime_error("ImmediateDispatch::GetUavClearInfo not set");
-        }
-
         rhi::UavClearUint value{};
         value.v[0] = x; value.v[1] = y; value.v[2] = z; value.v[3] = w;
 
@@ -545,15 +596,9 @@ namespace rg::imm {
             [&](uint32_t /*mip*/, uint32_t /*slice*/, const RangeSpec& exact)
             {
                 ClearUavUintCmd cmd{};
+                cmd.target = target.handle;
+                cmd.range = exact;
                 cmd.value = value;
-
-                if (!m_dispatch.GetUavClearInfo(m_dispatch.user, target.handle, exact, cmd.info)) {
-                    throw std::runtime_error("Immediate clear: GetUavClearInfo failed");
-                }
-
-                if (!cmd.info.shaderVisible.heap.valid() || !cmd.info.cpuVisible.heap.valid()) {
-                    throw std::runtime_error("Immediate clear: invalid UAV descriptor slots");
-                }
 
                 m_writer.WriteOp(Op::ClearUavUint);
                 m_writer.WritePOD(cmd);
@@ -568,26 +613,22 @@ namespace rg::imm {
         Resolved const& src, const uint32_t srcMip, const uint32_t srcSlice, const uint32_t srcX, const uint32_t srcY, const uint32_t srcZ,
         const uint32_t width, const uint32_t height, const uint32_t depth)
     {
-        if (!m_dispatch.GetResourceHandle) {
-            throw std::runtime_error("ImmediateDispatch::GetResourceHandle not set");
-        }
-
         CopyTextureRegionCmd cmd{};
-        cmd.dst.texture = m_dispatch.GetResourceHandle(m_dispatch.user, dst.handle);
-        cmd.dst.mip = dstMip;
-        cmd.dst.arraySlice = dstSlice;
-        cmd.dst.x = dstX; cmd.dst.y = dstY; cmd.dst.z = dstZ;
-        cmd.dst.width = width;
-        cmd.dst.height = height;
-        cmd.dst.depth = depth;
-
-        cmd.src.texture = m_dispatch.GetResourceHandle(m_dispatch.user, src.handle);
-        cmd.src.mip = srcMip;
-        cmd.src.arraySlice = srcSlice;
-        cmd.src.x = srcX; cmd.src.y = srcY; cmd.src.z = srcZ;
-        cmd.src.width = width;
-        cmd.src.height = height;
-        cmd.src.depth = depth;
+        cmd.dstTexture = dst.handle;
+        cmd.dstMip = dstMip;
+        cmd.dstSlice = dstSlice;
+        cmd.dstX = dstX;
+        cmd.dstY = dstY;
+        cmd.dstZ = dstZ;
+        cmd.srcTexture = src.handle;
+        cmd.srcMip = srcMip;
+        cmd.srcSlice = srcSlice;
+        cmd.srcX = srcX;
+        cmd.srcY = srcY;
+        cmd.srcZ = srcZ;
+        cmd.width = width;
+        cmd.height = height;
+        cmd.depth = depth;
 
         m_writer.WriteOp(Op::CopyTextureRegion);
         m_writer.WritePOD(cmd);
@@ -602,17 +643,15 @@ namespace rg::imm {
         rhi::CopyableFootprint const& footprint,
         const uint32_t x, const uint32_t y, const uint32_t z)
     {
-        if (!m_dispatch.GetResourceHandle) {
-            throw std::runtime_error("ImmediateDispatch::GetResourceHandle not set");
-        }
-
         CopyTextureToBufferCmd cmd{};
-        cmd.region.texture = m_dispatch.GetResourceHandle(m_dispatch.user, texture.handle);
-        cmd.region.buffer = m_dispatch.GetResourceHandle(m_dispatch.user, buffer.handle);
-        cmd.region.mip = mip;
-        cmd.region.arraySlice = slice;
-        cmd.region.x = x; cmd.region.y = y; cmd.region.z = z;
-        cmd.region.footprint = footprint;
+        cmd.texture = texture.handle;
+        cmd.mip = mip;
+        cmd.slice = slice;
+        cmd.buffer = buffer.handle;
+        cmd.footprint = footprint;
+        cmd.x = x;
+        cmd.y = y;
+        cmd.z = z;
 
         m_writer.WriteOp(Op::CopyTextureToBuffer);
         m_writer.WritePOD(cmd);
@@ -628,17 +667,15 @@ namespace rg::imm {
         rhi::CopyableFootprint const& footprint,
         const uint32_t x, const uint32_t y, const uint32_t z)
     {
-        if (!m_dispatch.GetResourceHandle) {
-            throw std::runtime_error("ImmediateDispatch::GetResourceHandle not set");
-        }
-
         CopyBufferToTextureCmd cmd{};
-        cmd.region.texture = m_dispatch.GetResourceHandle(m_dispatch.user, texture.handle);
-        cmd.region.buffer = m_dispatch.GetResourceHandle(m_dispatch.user, buffer.handle);
-        cmd.region.mip = mip;
-        cmd.region.arraySlice = slice;
-        cmd.region.x = x; cmd.region.y = y; cmd.region.z = z;
-        cmd.region.footprint = footprint;
+        cmd.buffer = buffer.handle;
+        cmd.texture = texture.handle;
+        cmd.mip = mip;
+        cmd.slice = slice;
+        cmd.footprint = footprint;
+        cmd.x = x;
+        cmd.y = y;
+        cmd.z = z;
 
         m_writer.WriteOp(Op::CopyBufferToTexture);
         m_writer.WritePOD(cmd);

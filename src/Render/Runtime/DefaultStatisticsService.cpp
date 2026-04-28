@@ -19,8 +19,8 @@ public:
         StatisticsManager::GetInstance().ClearAll();
     }
 
-    unsigned RegisterPass(const std::string& passName, bool isGeometryPass) override {
-        return StatisticsManager::GetInstance().RegisterPass(passName, isGeometryPass);
+    unsigned RegisterPass(const std::string& passName, bool isGeometryPass, std::string_view techniquePath = {}) override {
+        return StatisticsManager::GetInstance().RegisterPass(passName, isGeometryPass, techniquePath);
     }
 
     void RegisterQueue(rhi::QueueKind queueKind) override {
@@ -43,12 +43,40 @@ public:
         StatisticsManager::GetInstance().ResolveQueries(frameIndex, queue, cmdList);
     }
 
+    void BeginQuery(unsigned passIndex, unsigned frameIndex, rhi::Queue& queue, rhi::CommandList& cmdList, QueryRecordingContext& ctx) override {
+        StatisticsManager::GetInstance().BeginQuery(passIndex, frameIndex, queue, cmdList, ctx);
+    }
+
+    void EndQuery(unsigned passIndex, unsigned frameIndex, rhi::Queue& queue, rhi::CommandList& cmdList, QueryRecordingContext& ctx) override {
+        StatisticsManager::GetInstance().EndQuery(passIndex, frameIndex, queue, cmdList, ctx);
+    }
+
+    void ResolveQueries(unsigned frameIndex, rhi::Queue& queue, rhi::CommandList& cmdList, QueryRecordingContext& ctx) override {
+        StatisticsManager::GetInstance().ResolveQueries(frameIndex, queue, cmdList, ctx);
+    }
+
+    void MergePendingResolves(rhi::QueueKind queueKind, unsigned frameIndex, QueryRecordingContext& ctx) override {
+        StatisticsManager::GetInstance().MergePendingResolves(queueKind, frameIndex, ctx);
+    }
+
     void OnFrameComplete(unsigned frameIndex, rhi::Queue& queue) override {
         StatisticsManager::GetInstance().OnFrameComplete(frameIndex, queue);
     }
 
+    void RecordCpuUpdateTime(unsigned passIndex, double milliseconds) override {
+        StatisticsManager::GetInstance().RecordCpuUpdateTime(passIndex, milliseconds);
+    }
+
+    void RecordCpuExecuteTime(unsigned passIndex, double milliseconds) override {
+        StatisticsManager::GetInstance().RecordCpuExecuteTime(passIndex, milliseconds);
+    }
+
     const std::vector<std::string>& GetPassNames() const override {
         return StatisticsManager::GetInstance().GetPassNames();
+    }
+
+    const std::vector<std::string>& GetPassTechniquePaths() const override {
+        return StatisticsManager::GetInstance().GetPassTechniquePaths();
     }
 
     const std::vector<PassStats>& GetPassStats() const override {

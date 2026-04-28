@@ -1,12 +1,67 @@
 #include "Resources/Buffers/DynamicBufferBase.h"
 
 #include <stdexcept>
+#include <string>
+#include <string_view>
 
+#include <spdlog/spdlog.h>
+
+#include "Managers/Singletons/DeviceManager.h"
 #include "Managers/Singletons/DescriptorHeapManager.h"
 #include "Resources/GPUBacking/GpuBufferBacking.h"
 #include "Resources/ExternalBackingResource.h"
 #include "Render/Runtime/UploadServiceAccess.h"
 #include "Render/Runtime/UploadPolicyServiceAccess.h"
+
+namespace {
+    const char* HeapTypeToString(rhi::HeapType heapType) {
+        switch (heapType) {
+        case rhi::HeapType::DeviceLocal:
+            return "DeviceLocal";
+        case rhi::HeapType::Upload:
+            return "Upload";
+        case rhi::HeapType::Readback:
+            return "Readback";
+        case rhi::HeapType::Custom:
+            return "Custom";
+        default:
+            return "Unknown";
+        }
+    }
+
+    const char* BufferViewKindToString(rhi::BufferViewKind kind) {
+        switch (kind) {
+        case rhi::BufferViewKind::Raw:
+            return "Raw";
+        case rhi::BufferViewKind::Structured:
+            return "Structured";
+        case rhi::BufferViewKind::Typed:
+            return "Typed";
+        default:
+            return "Unknown";
+        }
+    }
+
+    bool ShouldProbeVirtualShadowBuffer(std::string_view bufferName) {
+        return bufferName.starts_with("CLod[Shadow] Virtual Shadow ");
+    }
+
+    void ProbeGraphicsCommandListCreation(std::string_view phase) {
+        (void)phase;
+    }
+
+    void ProbeVirtualShadowBufferStep(std::string_view bufferName, std::string_view step) {
+        if (!ShouldProbeVirtualShadowBuffer(bufferName)) {
+            return;
+        }
+
+        std::string phase = "BufferBase::Materialize ";
+        phase += step;
+        phase += " :: ";
+        phase += bufferName;
+        ProbeGraphicsCommandListCreation(phase);
+    }
+}
 
 BufferBase::BufferBase() = default;
 
@@ -124,7 +179,10 @@ void BufferBase::Materialize(const MaterializeOptions* options) {
             m_unorderedAccess);
     }
 
+    ProbeVirtualShadowBufferStep(GetName(), "after backing create");
+
     RefreshDescriptorContents();
+    ProbeVirtualShadowBufferStep(GetName(), "after descriptor refresh");
     ++m_backingGeneration;
     OnBackingMaterialized();
 }

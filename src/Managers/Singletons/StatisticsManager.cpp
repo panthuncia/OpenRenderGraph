@@ -6,6 +6,7 @@
 #include <spdlog/spdlog.h>
 
 #include "Managers/Singletons/DeviceManager.h"
+#include "Managers/Singletons/DeletionManager.h"
 #include "Render/Runtime/OpenRenderGraphSettings.h"
 
 StatisticsManager& StatisticsManager::GetInstance() {
@@ -13,22 +14,34 @@ StatisticsManager& StatisticsManager::GetInstance() {
     return inst;
 }
 
+namespace {
+void UpdateEma(double& value, double sample) {
+    value = value * (1.0 - PassStats::alpha) + sample * PassStats::alpha;
+}
+}
+
 void StatisticsManager::Initialize() {
     m_numFramesInFlight = rg::runtime::GetOpenRenderGraphSettings().numFramesInFlight;
 	auto device = DeviceManager::GetInstance().GetDevice();
 	m_gpuTimestampFreq = device.GetTimestampCalibration(rhi::QueueKind::Graphics).ticksPerSecond;
+    m_getCollectPassStatistics = []() {
+        return rg::runtime::GetOpenRenderGraphSettings().collectPassStatistics;
+    };
     m_getCollectPipelineStatistics = []() {
         return rg::runtime::GetOpenRenderGraphSettings().collectPipelineStatistics;
     };
+    m_collectPassStatistics = m_getCollectPassStatistics();
+    m_collectPipelineStatistics = m_getCollectPipelineStatistics();
 }
 
 void StatisticsManager::RegisterPasses(const std::vector<std::string>& passNames) {
     m_passNames = passNames;
     m_numPasses = static_cast<unsigned>(passNames.size());
+    m_passTechniquePaths.assign(m_numPasses, {});
     m_stats.assign(m_numPasses, {});
     m_isGeometryPass.assign(m_numPasses, false);
     m_meshStatsEma.assign(m_numPasses, {});
-    m_passLastDataFrame.assign(m_numPasses, kNeverSeenFrame);
+    m_passLastExecutionFrame.assign(m_numPasses, kNeverSeenFrame);
     m_passNameToIndex.clear();
     for (unsigned i = 0; i < m_numPasses; ++i) {
         if (!m_passNames[i].empty()) {
@@ -37,12 +50,25 @@ void StatisticsManager::RegisterPasses(const std::vector<std::string>& passNames
     }
 }
 
-unsigned StatisticsManager::RegisterPass(const std::string& passName, bool isGeometryPass) {
+unsigned StatisticsManager::RegisterPass(const std::string& passName, bool isGeometryPass, std::string_view techniquePath) {
     if (!passName.empty()) {
         auto it = m_passNameToIndex.find(passName);
         if (it != m_passNameToIndex.end()) {
             if (isGeometryPass) {
                 m_isGeometryPass[it->second] = true;
+            }
+            if (!techniquePath.empty()) {
+                auto& existingTechniquePath = m_passTechniquePaths[it->second];
+                if (existingTechniquePath.empty()) {
+                    existingTechniquePath.assign(techniquePath);
+                }
+                else if (existingTechniquePath != techniquePath) {
+                    spdlog::warn(
+                        "Pass '{}' was registered with conflicting technique paths '{}' and '{}'. Keeping the first one.",
+                        passName,
+                        existingTechniquePath,
+                        techniquePath);
+                }
             }
             return it->second;
         }
@@ -58,15 +84,20 @@ unsigned StatisticsManager::RegisterPass(const std::string& passName, bool isGeo
     m_passNameToIndex[resolvedName] = index;
 
     m_numPasses = static_cast<unsigned>(m_passNames.size());
+    m_passTechniquePaths.emplace_back(techniquePath);
     m_stats.emplace_back();
     m_isGeometryPass.push_back(isGeometryPass);
     m_meshStatsEma.emplace_back();
-    m_passLastDataFrame.push_back(kNeverSeenFrame);
+    m_passLastExecutionFrame.push_back(kNeverSeenFrame);
     return index;
 }
 
 void StatisticsManager::BeginFrame() {
     ++m_frameSerial;
+
+    if (m_getCollectPassStatistics) {
+        m_collectPassStatistics = m_getCollectPassStatistics();
+    }
 
     rg::runtime::MemoryBudgetStats memoryBudgetStats{};
     memoryBudgetStats.sampleFrameSerial = m_frameSerial;
@@ -80,6 +111,36 @@ void StatisticsManager::BeginFrame() {
     m_memoryBudgetStats = memoryBudgetStats;
 }
 
+void StatisticsManager::RecordCpuUpdateTime(unsigned passIndex, double milliseconds) {
+    RecordCpuTimeSample(passIndex, milliseconds, true);
+}
+
+void StatisticsManager::RecordCpuExecuteTime(unsigned passIndex, double milliseconds) {
+    RecordCpuTimeSample(passIndex, milliseconds, false);
+}
+
+void StatisticsManager::RecordCpuTimeSample(unsigned passIndex, double milliseconds, bool isUpdate) {
+    if (!m_collectPassStatistics) {
+        return;
+    }
+
+    std::scoped_lock lock(m_cpuStatsMutex);
+    if (passIndex >= m_stats.size()) {
+        return;
+    }
+
+    auto& passStats = m_stats[passIndex];
+    if (isUpdate) {
+        UpdateEma(passStats.cpuUpdateTimeEma, milliseconds);
+    }
+    else {
+        UpdateEma(passStats.cpuExecuteTimeEma, milliseconds);
+        if (passIndex < m_passLastExecutionFrame.size()) {
+            m_passLastExecutionFrame[passIndex] = m_frameSerial;
+        }
+    }
+}
+
 void StatisticsManager::RebuildVisiblePassIndices(uint64_t maxStaleFrames, std::vector<unsigned>& out) const {
     out.clear();
     out.reserve(m_passNames.size());
@@ -87,15 +148,15 @@ void StatisticsManager::RebuildVisiblePassIndices(uint64_t maxStaleFrames, std::
     const bool includeNeverSeen = (maxStaleFrames == (std::numeric_limits<uint64_t>::max)());
 
     for (unsigned i = 0; i < m_passNames.size(); ++i) {
-        const uint64_t lastData = (i < m_passLastDataFrame.size()) ? m_passLastDataFrame[i] : kNeverSeenFrame;
-        if (lastData == kNeverSeenFrame) {
+        const uint64_t lastExecution = (i < m_passLastExecutionFrame.size()) ? m_passLastExecutionFrame[i] : kNeverSeenFrame;
+        if (lastExecution == kNeverSeenFrame) {
             if (includeNeverSeen) {
                 out.push_back(i);
             }
             continue;
         }
 
-        const uint64_t missingFrames = (m_frameSerial >= lastData) ? (m_frameSerial - lastData) : 0;
+        const uint64_t missingFrames = (m_frameSerial >= lastExecution) ? (m_frameSerial - lastExecution) : 0;
         if (missingFrames <= maxStaleFrames) {
             out.push_back(i);
         }
@@ -103,11 +164,21 @@ void StatisticsManager::RebuildVisiblePassIndices(uint64_t maxStaleFrames, std::
 }
 
 const std::vector<unsigned>& StatisticsManager::GetVisiblePassIndices() const {
+    if (m_getCollectPassStatistics && !m_getCollectPassStatistics()) {
+        m_visiblePassIndices.clear();
+        return m_visiblePassIndices;
+    }
+
     RebuildVisiblePassIndices(m_defaultMaxStaleFrames, m_visiblePassIndices);
     return m_visiblePassIndices;
 }
 
 const std::vector<unsigned>& StatisticsManager::GetVisiblePassIndices(uint64_t maxStaleFrames) const {
+    if (m_getCollectPassStatistics && !m_getCollectPassStatistics()) {
+        m_visiblePassIndices.clear();
+        return m_visiblePassIndices;
+    }
+
     RebuildVisiblePassIndices(maxStaleFrames, m_visiblePassIndices);
     return m_visiblePassIndices;
 }
@@ -151,8 +222,15 @@ void StatisticsManager::EnsureQueueBuffers(rhi::QueueKind queueKind) {
 
 void StatisticsManager::SetupQueryHeap() {
     auto device = DeviceManager::GetInstance().GetDevice();
+    if (m_getCollectPassStatistics) {
+        m_collectPassStatistics = m_getCollectPassStatistics();
+    }
     if (m_getCollectPipelineStatistics) {
         m_collectPipelineStatistics = m_getCollectPipelineStatistics();
+    }
+
+    if (!m_collectPassStatistics) {
+        return;
     }
 
     if (m_numPasses == 0) {
@@ -164,6 +242,25 @@ void StatisticsManager::SetupQueryHeap() {
     }
 
     m_queryPoolPassCapacity = m_numPasses;
+
+    // Defer destruction of old pools/buffers so the GPU can finish in-flight work.
+    auto& deletionMgr = DeletionManager::GetInstance();
+    if (m_timestampPool) {
+        deletionMgr.MarkForDelete(std::move(m_timestampPool));
+    }
+    if (m_pipelineStatsPool) {
+        deletionMgr.MarkForDelete(std::move(m_pipelineStatsPool));
+    }
+    for (auto& kv : m_timestampBuffers) {
+        if (kv.second) {
+            deletionMgr.MarkForDelete(std::move(kv.second));
+        }
+    }
+    for (auto& kv : m_meshStatsBuffers) {
+        if (kv.second) {
+            deletionMgr.MarkForDelete(std::move(kv.second));
+        }
+    }
 
     // Timestamp heap: 2 queries/pass/frame
 
@@ -215,6 +312,7 @@ void StatisticsManager::BeginQuery(
     rhi::Queue& queue,
     rhi::CommandList& cmd)
 {
+    if (!m_collectPassStatistics) return;
     if (!m_timestampPool || passIndex >= m_numPasses || passIndex >= m_queryPoolPassCapacity) return;
 
     auto queueKind = queue.GetKind();
@@ -241,6 +339,7 @@ void StatisticsManager::EndQuery(
     rhi::Queue& queue,
     rhi::CommandList& cmd)
 {
+    if (!m_collectPassStatistics) return;
     if (!m_timestampPool || passIndex >= m_numPasses || passIndex >= m_queryPoolPassCapacity) return;
 
     auto queueKind = queue.GetKind();
@@ -340,11 +439,145 @@ void StatisticsManager::ResolveQueries(
     rec.clear();
 }
 
+void StatisticsManager::BeginQuery(
+    unsigned passIndex,
+    unsigned frameIndex,
+    rhi::Queue& queue,
+    rhi::CommandList& cmd,
+    QueryRecordingContext& ctx)
+{
+    if (!m_collectPassStatistics) return;
+    if (!m_timestampPool || passIndex >= m_numPasses || passIndex >= m_queryPoolPassCapacity) return;
+
+    auto queueKind = queue.GetKind();
+    auto tsIt = m_timestampBuffers.find(queueKind);
+    if (tsIt == m_timestampBuffers.end() || !tsIt->second) return;
+
+    const uint32_t frameBase = frameIndex * m_queryPoolPassCapacity;
+    const uint32_t tsIdx = (frameBase + passIndex) * 2u;
+    cmd.WriteTimestamp(m_timestampPool->GetHandle(), tsIdx, rhi::Stage::Top);
+
+    if (m_collectPipelineStatistics && m_isGeometryPass[passIndex]) {
+        const uint32_t psIdx = frameBase + passIndex;
+        cmd.BeginQuery(m_pipelineStatsPool->GetHandle(), psIdx);
+    }
+    ctx.recordedIndices.push_back(tsIdx);
+}
+
+void StatisticsManager::EndQuery(
+    unsigned passIndex,
+    unsigned frameIndex,
+    rhi::Queue& queue,
+    rhi::CommandList& cmd,
+    QueryRecordingContext& ctx)
+{
+    if (!m_collectPassStatistics) return;
+    if (!m_timestampPool || passIndex >= m_numPasses || passIndex >= m_queryPoolPassCapacity) return;
+
+    auto queueKind = queue.GetKind();
+    auto tsIt = m_timestampBuffers.find(queueKind);
+    if (tsIt == m_timestampBuffers.end() || !tsIt->second) return;
+
+    const uint32_t frameBase = frameIndex * m_queryPoolPassCapacity;
+    const uint32_t tsIdx = (frameBase + passIndex) * 2u + 1u;
+    cmd.WriteTimestamp(m_timestampPool->GetHandle(), tsIdx, rhi::Stage::Bottom);
+
+    if (m_collectPipelineStatistics && m_isGeometryPass[passIndex]) {
+        const uint32_t psIdx = frameBase + passIndex;
+        cmd.EndQuery(m_pipelineStatsPool->GetHandle(), psIdx);
+    }
+    ctx.recordedIndices.push_back(tsIdx);
+}
+
+void StatisticsManager::ResolveQueries(
+    unsigned frameIndex,
+    rhi::Queue& queue,
+    rhi::CommandList& cmd,
+    QueryRecordingContext& ctx)
+{
+    if (!m_timestampPool || m_timestampQueryInfo.elementSize == 0) return;
+
+    auto queueKind = queue.GetKind();
+    auto tsIt = m_timestampBuffers.find(queueKind);
+    if (tsIt == m_timestampBuffers.end() || !tsIt->second) return;
+    auto psIt = m_meshStatsBuffers.find(queueKind);
+    if (psIt == m_meshStatsBuffers.end() || !psIt->second) return;
+
+    auto& rec = ctx.recordedIndices;
+    if (rec.empty()) return;
+
+    std::sort(rec.begin(), rec.end());
+    std::vector<std::pair<uint32_t, uint32_t>> ranges;
+    uint32_t start = rec[0], prev = rec[0];
+    for (size_t i = 1; i < rec.size(); ++i) {
+        if (rec[i] == prev + 1) {
+            prev = rec[i];
+        } else {
+            ranges.emplace_back(start, prev - start + 1);
+            start = rec[i];
+            prev = rec[i];
+        }
+    }
+    ranges.emplace_back(start, prev - start + 1);
+
+    const uint32_t frameBase = frameIndex * m_queryPoolPassCapacity;
+    const uint64_t tsStride = m_timestampQueryInfo.elementSize;
+    const uint64_t psStride = m_pipelineStatsQueryInfo.elementSize;
+
+    auto& tsBuf = tsIt->second;
+    auto& psBuf = psIt->second;
+
+    for (auto& r : ranges) {
+        cmd.ResolveQueryData(
+            m_timestampPool->GetHandle(),
+            r.first, r.second,
+            tsBuf->GetHandle(),
+            tsStride * uint64_t(r.first)
+        );
+
+        ctx.pendingRanges.push_back(r);
+
+        if (!m_collectPipelineStatistics) continue;
+
+        for (uint32_t idx = r.first; idx < r.first + r.second; idx += 2) {
+            const uint32_t encoded = idx / 2;
+            if (encoded < frameBase) continue;
+            const uint32_t pi = encoded - frameBase;
+            if (pi >= m_numPasses) continue;
+            if (!m_isGeometryPass[pi]) continue;
+
+            const uint32_t psIdx = frameBase + pi;
+            cmd.ResolveQueryData(
+                m_pipelineStatsPool->GetHandle(),
+                psIdx, 1,
+                psBuf->GetHandle(),
+                psStride * uint64_t(psIdx)
+            );
+        }
+    }
+
+    rec.clear();
+}
+
+void StatisticsManager::MergePendingResolves(
+    rhi::QueueKind queueKind,
+    unsigned frameIndex,
+    QueryRecordingContext& ctx)
+{
+    auto& dest = m_pendingResolves[queueKind][frameIndex];
+    dest.insert(dest.end(), ctx.pendingRanges.begin(), ctx.pendingRanges.end());
+    ctx.pendingRanges.clear();
+}
+
 void StatisticsManager::OnFrameComplete(
     unsigned frameIndex,
     rhi::Queue& queue)
 {
 	if (!m_timestampPool || m_timestampQueryInfo.elementSize == 0) return;
+
+    if (m_getCollectPassStatistics) {
+        m_collectPassStatistics = m_getCollectPassStatistics();
+    }
 
     if (m_getCollectPipelineStatistics) {
         m_collectPipelineStatistics = m_getCollectPipelineStatistics();
@@ -406,9 +639,9 @@ void StatisticsManager::OnFrameComplete(
                 continue;
             }
 
-            m_stats[pi].ema = m_stats[pi].ema * (1.0 - PassStats::alpha) + ms * PassStats::alpha;
-            if (pi < m_passLastDataFrame.size()) {
-                m_passLastDataFrame[pi] = m_frameSerial;
+            UpdateEma(m_stats[pi].gpuTimeEma, ms);
+            if (pi < m_passLastExecutionFrame.size()) {
+                m_passLastExecutionFrame[pi] = m_frameSerial;
             }
 
             if (!m_collectPipelineStatistics || !m_isGeometryPass[pi]) continue;
@@ -432,8 +665,8 @@ void StatisticsManager::OnFrameComplete(
             psBuf->Unmap(0, 0);
 
             auto& mps = m_meshStatsEma[pi];
-            mps.invocationsEma = mps.invocationsEma * (1.0 - PassStats::alpha) + double(inv) * PassStats::alpha;
-            mps.primitivesEma = mps.primitivesEma * (1.0 - PassStats::alpha) + double(prim) * PassStats::alpha;
+            UpdateEma(mps.invocationsEma, double(inv));
+            UpdateEma(mps.primitivesEma, double(prim));
         }
 
         tsBuf->Unmap(0, 0);
@@ -452,11 +685,12 @@ void StatisticsManager::ClearAll() {
     m_timestampBuffers.clear();
     m_meshStatsBuffers.clear();
     m_passNames.clear();
+    m_passTechniquePaths.clear();
     m_stats.clear();
     m_isGeometryPass.clear();
     m_meshStatsEma.clear();
     m_passNameToIndex.clear();
-    m_passLastDataFrame.clear();
+    m_passLastExecutionFrame.clear();
     m_visiblePassIndices.clear();
     m_recordedQueries.clear();
     m_pendingResolves.clear();
@@ -464,5 +698,9 @@ void StatisticsManager::ClearAll() {
     m_queryPoolPassCapacity = 0;
     m_unnamedPassCounter = 0;
     m_frameSerial = 0;
+    m_collectPassStatistics = true;
+    m_getCollectPassStatistics = {};
+    m_collectPipelineStatistics = false;
+    m_getCollectPipelineStatistics = {};
     m_memoryBudgetStats = {};
 }

@@ -11,31 +11,9 @@
 
 struct ReadbackCaptureInputs {
     ResourceHandleAndRange target;
+
+    RG_DEFINE_PASS_INPUTS(ReadbackCaptureInputs, &ReadbackCaptureInputs::target);
 };
-
-// Hash function
-inline rg::Hash64 HashValue(const ReadbackCaptureInputs& i) {
-    std::size_t seed = 0;
-    boost::hash_combine(seed, i.target.resource.GetGlobalResourceID());
-    boost::hash_combine(seed, i.target.range.mipLower.type);
-    boost::hash_combine(seed, i.target.range.mipLower.value);
-    boost::hash_combine(seed, i.target.range.mipUpper.type);
-    boost::hash_combine(seed, i.target.range.mipUpper.value);
-    boost::hash_combine(seed, i.target.range.sliceLower.type);
-    boost::hash_combine(seed, i.target.range.sliceLower.value);
-    boost::hash_combine(seed, i.target.range.sliceUpper.type);
-    boost::hash_combine(seed, i.target.range.sliceUpper.value);
-    return static_cast<rg::Hash64>(seed);
-}
-
-// Compare function
-inline bool operator==(const ReadbackCaptureInputs& a, const ReadbackCaptureInputs& b) {
-    return a.target.resource.GetGlobalResourceID() == b.target.resource.GetGlobalResourceID() &&
-           a.target.range.mipLower == b.target.range.mipLower &&
-           a.target.range.mipUpper == b.target.range.mipUpper &&
-           a.target.range.sliceLower == b.target.range.sliceLower &&
-           a.target.range.sliceUpper == b.target.range.sliceUpper;
-}
 
 class ReadbackCapturePass final : public RenderPass {
 public:
@@ -56,7 +34,7 @@ public:
     void Setup() override {
     }
 
-    void ExecuteImmediate(ImmediateExecutionContext& context) override {
+    void RecordImmediateCommands(ImmediateExecutionContext& context) override {
         const auto& inputs = Inputs<ReadbackCaptureInputs>();
         auto* resource = m_resourceRegistryView->Resolve<Resource>(inputs.target.resource);
         if (!resource) {

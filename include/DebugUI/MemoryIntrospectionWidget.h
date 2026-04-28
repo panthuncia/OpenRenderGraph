@@ -59,6 +59,9 @@ namespace ui {
     struct FrameGraphBatchRow {
         std::string label;
         uint64_t footprintBytes = 0;  // memory footprint for this batch (lower-bound)
+        uint64_t peakLiveBytes = 0;   // alias-aware peak live bytes across the batch window
+        uint64_t peakNaiveLiveBytes = 0;
+        uint64_t aliasSavingsBytes = 0;
         bool hasEndTransitions = false;
     	std::vector<std::string> passNames;
         std::vector<MemoryCategorySlice> categories;
@@ -108,7 +111,7 @@ namespace ui {
             const FrameGraphSnapshot* frameGraph = nullptr);
 
     private:
-        enum class ViewMode : int { Pie = 0, List = 1, Timeline = 2 };
+        enum class ViewMode : int { Pie = 0, List = 1, Timeline = 2, BatchTimeline = 3 };
         enum class TimelineMode : int { RealTime = 0, FrameGraph = 1 };
 
         struct PieSettings {

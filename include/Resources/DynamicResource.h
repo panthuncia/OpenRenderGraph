@@ -15,6 +15,9 @@ public:
         if (resource) {
             //currentState = resource->GetState();
             name = resource->GetName();
+            m_hasLayout = resource->HasLayout();
+            m_mipLevels = resource->GetMipLevels();
+            m_arraySize = resource->GetArraySize();
         }
     }
 
@@ -27,6 +30,9 @@ public:
         resource = std::move(newResource);
         //currentState = resource->GetState();
         name = resource->GetName();
+        m_hasLayout = resource->HasLayout();
+        m_mipLevels = resource->GetMipLevels();
+        m_arraySize = resource->GetArraySize();
     }
 
     std::shared_ptr<Resource> GetResource() const {

@@ -51,6 +51,7 @@ find_package(Boost REQUIRED COMPONENTS container_hash)
 find_package(imgui CONFIG REQUIRED)
 find_package(implot CONFIG REQUIRED)
 find_package(slang CONFIG REQUIRED)
+find_package(Tracy REQUIRED CONFIG)
 
 add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/DebugUI/MemoryIntrospectionWidget.cpp"
@@ -59,6 +60,7 @@ add_library(OpenRenderGraph STATIC
 
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/DescriptorHeap.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/CommandListPool.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/QueueRegistry.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/ImmediateExecution/ImmediateCommandList.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/MemoryMetadataAdapter.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/MemoryIntrospectionAPI.cpp"
@@ -79,6 +81,7 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Managers/Singletons/DeviceManager.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Managers/Singletons/DescriptorHeapManager.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Managers/Singletons/UploadManager.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Managers/UploadInstance.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Managers/Singletons/ReadbackManager.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Managers/Singletons/StatisticsManager.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/ExternalBackingResource.cpp"
@@ -91,6 +94,8 @@ add_library(OpenRenderGraph STATIC
 )
 
 add_library(OpenRenderGraph::OpenRenderGraph ALIAS OpenRenderGraph)
+
+target_precompile_headers(OpenRenderGraph PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/pch.h")
 
 set_target_properties(OpenRenderGraph PROPERTIES
     CXX_STANDARD 23
@@ -116,6 +121,7 @@ target_link_libraries(OpenRenderGraph
         slang::slang
     PRIVATE
         spdlog::spdlog_header_only
+        Tracy::TracyClient
 )
 
 target_compile_definitions(OpenRenderGraph

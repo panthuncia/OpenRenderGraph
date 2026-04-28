@@ -26,7 +26,9 @@ struct CopyPassParameters {
 	std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> identifierSet;
 	std::vector<ResourceRequirement> staticResourceRequirements;
 	std::vector<ResourceRequirement> frameResourceRequirements;
-	CopyQueueSelection queueSelection = CopyQueueSelection::Copy;
+	QueueKind preferredQueueKind = QueueKind::Copy;
+	QueueAssignmentPolicy queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
+	std::optional<QueueSlotIndex> pinnedQueueSlot; // Target a specific queue slot instead of using preferredQueueKind
 };
 
 class CopyPassBuilder;
@@ -43,7 +45,7 @@ public:
 	virtual void Setup() = 0;
 
 	virtual void Update(const UpdateExecutionContext& context) {};
-	virtual void ExecuteImmediate(ImmediateExecutionContext& context) {};
+	virtual void RecordImmediateCommands(ImmediateExecutionContext& context) {};
 	virtual PassReturn Execute(PassExecutionContext& context) { return {}; };
 	virtual void Cleanup() = 0;
 

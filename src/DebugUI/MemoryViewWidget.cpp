@@ -13,6 +13,11 @@
 
 #include "Resources/Resource.h"
 #include "structFormatHelper.h"
+#include "TextureDecoder.h"
+#include "Managers/Singletons/DeviceManager.h"
+
+#include <rhi_helpers.h>
+#include <spdlog/spdlog.h>
 
 namespace ui {
 
@@ -34,29 +39,7 @@ namespace ui {
 
         static float HalfToFloat(uint16_t h)
         {
-            const uint16_t sign = (h >> 15) & 0x1;
-            const uint16_t exp = (h >> 10) & 0x1F;
-            const uint16_t mant = h & 0x3FF;
-
-            if (exp == 0) {
-                if (mant == 0) {
-                    return sign ? -0.0f : 0.0f;
-                }
-                const float m = static_cast<float>(mant) / 1024.0f;
-                const float v = std::ldexp(m, -14);
-                return sign ? -v : v;
-            }
-
-            if (exp == 31) {
-                if (mant == 0) {
-                    return sign ? -std::numeric_limits<float>::infinity() : std::numeric_limits<float>::infinity();
-                }
-                return std::numeric_limits<float>::quiet_NaN();
-            }
-
-            const float m = 1.0f + (static_cast<float>(mant) / 1024.0f);
-            const float v = std::ldexp(m, static_cast<int>(exp) - 15);
-            return sign ? -v : v;
+            return ui::HalfToFloat(h);
         }
 
         static std::string FormatScalar(
@@ -295,6 +278,10 @@ namespace ui {
 
         if (currentResourceId_ != 0 && currentResourceId_ != req.resourceId) {
             SaveCurrentResourceLayoutState();
+            ReleasePreviewTexture();
+            selectedMip_ = 0;
+            selectedSlice_ = 0;
+            previewDirty_ = true;
         }
         currentResourceId_ = req.resourceId;
         LoadResourceLayoutState(currentResourceId_);
@@ -317,6 +304,7 @@ namespace ui {
                 std::scoped_lock cbLock(mutex_);
                 result_ = std::move(r);
                 waiting_ = false;
+                previewDirty_ = true;
                 status_ = "Readback complete.";
             });
     }
@@ -389,7 +377,7 @@ namespace ui {
 
             if (ImGui::BeginTabItem("Texture")) {
                 if (r.desc.kind == ReadbackResourceKind::Texture) {
-                    DrawTextureViewStub(r);
+                    DrawTextureView(r);
                 }
                 else {
                     ImGui::TextUnformatted("The captured resource is a buffer.");
@@ -403,13 +391,207 @@ namespace ui {
         ImGui::End();
     }
 
-    void MemoryViewWidget::DrawTextureViewStub(const ReadbackCaptureResult& r) {
-        ImGui::TextUnformatted("Texture view is stubbed out for now.");
-        ImGui::Separator();
+    void MemoryViewWidget::ReleasePreviewTexture() {
+        if (previewDescriptorIndex_ != UINT32_MAX && imguiFreeDesc_) {
+            imguiFreeDesc_(previewDescriptorIndex_);
+        }
+        previewDescriptorIndex_ = UINT32_MAX;
+        previewTextureId_ = 0;
+        previewTexture_.Reset();
+        previewUploadBuffer_.Reset();
+        previewWidth_ = 0;
+        previewHeight_ = 0;
+    }
+
+    void MemoryViewWidget::DrawTextureView(const ReadbackCaptureResult& r) {
         ImGui::Text("Format: %d", static_cast<int>(r.format));
         ImGui::Text("Dimensions: %ux%u (depth %u)", r.width, r.height, r.depth);
-        ImGui::Text("Footprints: %d", static_cast<int>(r.layouts.size()));
+        ImGui::Text("Footprints: %zu", r.layouts.size());
         ImGui::Text("Data size: %llu bytes", static_cast<unsigned long long>(r.data.size()));
+
+        if (r.layouts.empty() || r.data.empty()) {
+            ImGui::TextDisabled("No texture data.");
+            return;
+        }
+
+        // Determine mip/slice counts from footprints.
+        // ReadbackCapturePass stores footprints as [slice][mip], so:
+        //   subresourceIndex = slice * mipCount + mip
+        // We need to figure out mipCount. Use the first footprint width progression.
+        uint32_t mipCount = 1;
+        uint32_t sliceCount = 1;
+        {
+            // Heuristic: count how many consecutive footprints have shrinking width
+            // starting from index 0. That gives us mipCount for slice 0.
+            for (uint32_t i = 1; i < static_cast<uint32_t>(r.layouts.size()); ++i) {
+                if (r.layouts[i].width <= r.layouts[i - 1].width) {
+                    mipCount = i + 1;
+                } else {
+                    break;
+                }
+            }
+            if (mipCount > 0) {
+                sliceCount = static_cast<uint32_t>(r.layouts.size()) / mipCount;
+            }
+            if (sliceCount == 0) sliceCount = 1;
+            if (mipCount == 0) mipCount = 1;
+        }
+
+        ImGui::Separator();
+        bool changed = false;
+        if (mipCount > 1) {
+            int maxMip = static_cast<int>(mipCount) - 1;
+            changed |= ImGui::SliderInt("Mip Level", &selectedMip_, 0, maxMip);
+            selectedMip_ = std::clamp(selectedMip_, 0, maxMip);
+        }
+        if (sliceCount > 1) {
+            int maxSlice = static_cast<int>(sliceCount) - 1;
+            changed |= ImGui::SliderInt("Array Slice", &selectedSlice_, 0, maxSlice);
+            selectedSlice_ = std::clamp(selectedSlice_, 0, maxSlice);
+        }
+        if (changed) {
+            previewDirty_ = true;
+        }
+
+        const uint32_t subresourceIndex = static_cast<uint32_t>(selectedSlice_) * mipCount + static_cast<uint32_t>(selectedMip_);
+        if (subresourceIndex >= static_cast<uint32_t>(r.layouts.size())) {
+            ImGui::TextDisabled("Subresource index out of range.");
+            return;
+        }
+
+        const auto& fp = r.layouts[subresourceIndex];
+        ImGui::Text("Subresource %u: %ux%u", subresourceIndex, fp.width, fp.height);
+        if (r.format == rhi::Format::R32_UInt) {
+            ImGui::TextDisabled("Preview uses stable false color for head-pointer indices; empty sentinel pixels are black.");
+        }
+        else if (r.format == rhi::Format::R32G32_UInt) {
+            ImGui::TextDisabled("Preview uses stable false color for packed uint data; cleared pixels are black.");
+        }
+        else if (r.format == rhi::Format::R32G32B32_Float) {
+            ImGui::TextDisabled("Preview normalizes float3 channels across this subresource for readability.");
+        }
+        else if (r.format == rhi::Format::R32G32B32A32_Float || r.format == rhi::Format::R32G32B32A32_Typeless) {
+            ImGui::TextDisabled("Preview normalizes float4 channels across this subresource for readability; typeless is treated as float.");
+        }
+
+        if (previewDirty_) {
+            previewDirty_ = false;
+
+            // Decode to RGBA8
+            auto rgba8 = DecodeSubresourceToRGBA8(r.data.data(), r.data.size(), fp, r.format);
+            if (rgba8.empty()) {
+                ReleasePreviewTexture();
+                ImGui::TextDisabled("Format not supported for preview (%d).", static_cast<int>(r.format));
+                return;
+            }
+
+            // Check if we have descriptor callbacks
+            if (!imguiAllocDesc_ || !imguiFreeDesc_ || !imguiGpuHandle_) {
+                ImGui::TextDisabled("ImGui descriptor callbacks not set.");
+                return;
+            }
+
+            ReleasePreviewTexture();
+
+            auto device = DeviceManager::GetInstance().GetDevice();
+
+            // Create a staging (GPU-local) texture
+            rhi::ResourceDesc texDesc{};
+            texDesc.type = rhi::ResourceType::Texture2D;
+            texDesc.heapType = rhi::HeapType::DeviceLocal;
+            texDesc.debugName = "MemViewPreview";
+            texDesc.texture.format = rhi::Format::R8G8B8A8_UNorm;
+            texDesc.texture.width = fp.width;
+            texDesc.texture.height = fp.height;
+            texDesc.texture.depthOrLayers = 1;
+            texDesc.texture.mipLevels = 1;
+            texDesc.texture.sampleCount = 1;
+            texDesc.texture.initialLayout = rhi::ResourceLayout::CopyDest;
+
+            auto createResult = device.CreateCommittedResource(texDesc, previewTexture_);
+            if (rhi::Failed(createResult) || !previewTexture_) {
+                spdlog::error("MemoryViewWidget: failed to create preview texture.");
+                return;
+            }
+
+            // Upload RGBA8 data via rhi::helpers
+            rhi::CommandAllocatorPtr cmdAlloc;
+            rhi::CommandListPtr cmdList;
+            rhi::TimelinePtr fence;
+            device.CreateCommandAllocator(rhi::QueueKind::Graphics, cmdAlloc);
+            device.CreateCommandList(rhi::QueueKind::Graphics, cmdAlloc.Get(), cmdList);
+            device.CreateTimeline(fence, 0, "MemViewUploadFence");
+
+            rhi::helpers::SubresourceData subData{};
+            subData.pData = rgba8.data();
+            subData.rowPitch = fp.width * 4;
+            subData.slicePitch = fp.width * fp.height * 4;
+
+            previewUploadBuffer_ = rhi::helpers::UpdateTextureSubresources(
+                device,
+                cmdList.Get(),
+                previewTexture_.Get(),
+                rhi::Format::R8G8B8A8_UNorm,
+                fp.width, fp.height, 1,
+                1, 1,
+                rhi::Span<const rhi::helpers::SubresourceData>(&subData, 1));
+
+            rhi::TextureBarrier previewToSrv{};
+            previewToSrv.texture = previewTexture_->GetHandle();
+            previewToSrv.range = { 0, 1, 0, 1 };
+            previewToSrv.beforeSync = rhi::ResourceSyncState::Copy;
+            previewToSrv.afterSync = rhi::ResourceSyncState::AllShading;
+            previewToSrv.beforeAccess = rhi::ResourceAccessType::CopyDest;
+            previewToSrv.afterAccess = rhi::ResourceAccessType::ShaderResource;
+            previewToSrv.beforeLayout = rhi::ResourceLayout::CopyDest;
+            previewToSrv.afterLayout = rhi::ResourceLayout::ShaderResource;
+
+            rhi::BarrierBatch barrierBatch{};
+            barrierBatch.textures = { &previewToSrv, 1 };
+            cmdList->Barriers(barrierBatch);
+
+            cmdList->End();
+
+            auto& clRef = cmdList.Get();
+            auto& queue = DeviceManager::GetInstance().GetGraphicsQueue();
+            queue.Submit(rhi::Span<rhi::CommandList>(&clRef, 1));
+            queue.Signal({ fence->GetHandle(), 1 });
+            fence->HostWait(1);
+
+            // Create SRV in ImGui's descriptor heap
+            previewDescriptorIndex_ = imguiAllocDesc_();
+
+            rhi::SrvDesc srvDesc{};
+            srvDesc.dimension = rhi::SrvDim::Texture2D;
+            srvDesc.formatOverride = rhi::Format::R8G8B8A8_UNorm;
+            srvDesc.tex2D.mipLevels = 1;
+            srvDesc.tex2D.mostDetailedMip = 0;
+
+            rhi::DescriptorSlot slot{ imguiHeapHandle_, previewDescriptorIndex_ };
+            device.CreateShaderResourceView(slot, previewTexture_->GetHandle(), srvDesc);
+
+            previewTextureId_ = imguiGpuHandle_(previewDescriptorIndex_);
+            previewWidth_ = fp.width;
+            previewHeight_ = fp.height;
+        }
+
+        if (previewTextureId_ != 0 && previewWidth_ > 0 && previewHeight_ > 0) {
+            // Scale to fit available region while maintaining aspect ratio
+            ImVec2 avail = ImGui::GetContentRegionAvail();
+            float aspect = static_cast<float>(previewWidth_) / static_cast<float>(previewHeight_);
+            float displayW = avail.x;
+            float displayH = displayW / aspect;
+            if (displayH > avail.y) {
+                displayH = avail.y;
+                displayW = displayH * aspect;
+            }
+            if (displayW < 1.0f) displayW = 1.0f;
+            if (displayH < 1.0f) displayH = 1.0f;
+
+            ImGui::Image(previewTextureId_, ImVec2(displayW, displayH));
+        } else {
+            ImGui::TextDisabled("No preview available.");
+        }
     }
 
     void MemoryViewWidget::DrawBufferView(const ReadbackCaptureResult& r) {

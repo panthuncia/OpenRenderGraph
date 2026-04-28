@@ -79,7 +79,14 @@ namespace ui {
         switch (view_) {
         case ViewMode::Pie:      DrawPieView(localMem); break;
         case ViewMode::List:     DrawListView(localMem); break;
-        case ViewMode::Timeline: DrawTimelineView(*fg, localMem);  break;
+        case ViewMode::Timeline:
+            timelineMode_ = TimelineMode::RealTime;
+            DrawTimelineView(*fg, localMem);
+            break;
+        case ViewMode::BatchTimeline:
+            timelineMode_ = TimelineMode::FrameGraph;
+            DrawTimelineView(*fg, localMem);
+            break;
         }
 
         ImGui::End();
@@ -93,19 +100,8 @@ namespace ui {
         RadioButtonView("Pie", &v, static_cast<int>(ViewMode::Pie));
         RadioButtonView("List", &v, static_cast<int>(ViewMode::List));
         RadioButtonView("Timeline", &v, static_cast<int>(ViewMode::Timeline));
+        RadioButtonView("Batch Timeline", &v, static_cast<int>(ViewMode::BatchTimeline));
         view_ = static_cast<ViewMode>(v);
-
-        ImGui::SameLine();
-        ImGui::TextUnformatted("   ");
-        ImGui::SameLine();
-        if (ImGui::Button("Reset Settings")) {
-            pie_ = {};
-            list_ = {};
-            rt_ = {};
-            fg_ = {};
-            timelineMode_ = TimelineMode::RealTime;
-            selectedBatch_ = -1;
-        }
     }
 
     // ----------------- Dummy data -----------------
@@ -153,12 +149,12 @@ namespace ui {
     FrameGraphSnapshot MemoryIntrospectionWidget::MakeDummyFrameGraph() {
         FrameGraphSnapshot fg;
         fg.batches = {
-            {"Setup",            220ull * 1024 * 1024, false, {"Culling", "Depth Prepass"}},
-            {"GBuffer",          780ull * 1024 * 1024, true,  {"VB Resolve", "GBuffer Resolve"}},
-            {"Lighting",         940ull * 1024 * 1024, true,  {"Tiled Light", "SSAO", "Shadows"}},
-            {"Reflections",      610ull * 1024 * 1024, false, {"SSR", "Denoise"}},
-            {"Post",             520ull * 1024 * 1024, false, {"Bloom", "Tonemap", "TAA"}},
-            {"UI/Compose",       180ull * 1024 * 1024, false, {"UI", "Composite"}},
+            {"Setup",       220ull * 1024 * 1024, 220ull * 1024 * 1024, 220ull * 1024 * 1024, 0,                      false, {"Culling", "Depth Prepass"}},
+            {"GBuffer",     780ull * 1024 * 1024, 720ull * 1024 * 1024, 780ull * 1024 * 1024,  60ull * 1024 * 1024, true,  {"VB Resolve", "GBuffer Resolve"}},
+            {"Lighting",    940ull * 1024 * 1024, 860ull * 1024 * 1024, 940ull * 1024 * 1024,  80ull * 1024 * 1024, true,  {"Tiled Light", "SSAO", "Shadows"}},
+            {"Reflections", 610ull * 1024 * 1024, 540ull * 1024 * 1024, 610ull * 1024 * 1024,  70ull * 1024 * 1024, false, {"SSR", "Denoise"}},
+            {"Post",        520ull * 1024 * 1024, 470ull * 1024 * 1024, 520ull * 1024 * 1024,  50ull * 1024 * 1024, false, {"Bloom", "Tonemap", "TAA"}},
+            {"UI/Compose",  180ull * 1024 * 1024, 180ull * 1024 * 1024, 180ull * 1024 * 1024, 0,                      false, {"UI", "Composite"}},
         };
         return fg;
     }
@@ -389,22 +385,6 @@ namespace ui {
     } // anonymous
 
     void ui::MemoryIntrospectionWidget::DrawPieView(const MemorySnapshot& s) {
-        if (ImGui::CollapsingHeader("Pie Settings", ImGuiTreeNodeFlags_DefaultOpen)) {
-            ImGui::SliderFloat("Min sub-slice % (group into Other)", &pie_.minSlicePct, 0.0f, 10.0f, "%.1f%%");
-            ImGui::SliderFloat("Radius", &pie_.radius, 0.2f, 1.0f, "%.2f");
-
-            ImGui::SeparatorText("Layout");
-            ImGui::SliderFloat("Inner ratio", &pie_.innerRatio, 0.25f, 0.80f, "%.2f");
-            ImGui::Checkbox("Major separators", &pie_.showMajorSeparators);
-            ImGui::SliderFloat("Separator thickness", &pie_.majorSeparatorThickness, 1.0f, 6.0f, "%.1f");
-
-            ImGui::SeparatorText("Height");
-            ImGui::Checkbox("Auto height", &pie_.autoHeight);
-            if (!pie_.autoHeight) {
-                ImGui::SliderFloat("Pie height", &pie_.heightPx, 160.0f, 700.0f, "%.0f px");
-            }
-        }
-
         const uint64_t totalBytes = (s.totalBytes != 0) ? s.totalBytes : ComputeTotalBytes(s);
         ImGui::Text("Total: %s", FormatBytes(totalBytes).c_str());
 
@@ -663,14 +643,6 @@ namespace ui {
     }
 
     void MemoryIntrospectionWidget::DrawListView(const MemorySnapshot& s) {
-        if (ImGui::CollapsingHeader("List Settings", ImGuiTreeNodeFlags_DefaultOpen)) {
-            static const char* sortKeys[] = { "Size", "Name", "Type" };
-            ImGui::Combo("Sort", &list_.sortKey, sortKeys, IM_ARRAYSIZE(sortKeys));
-            ImGui::SameLine();
-            ImGui::Checkbox("Descending", &list_.descending);
-            list_.filter.Draw("Filter (name/type)");
-        }
-
         if (s.resources.empty()) {
             ImGui::TextUnformatted("No per-resource data.");
             return;
@@ -755,49 +727,6 @@ namespace ui {
     // ----------------- Timeline view: Real-time + Frame-graph -----------------
 
     void MemoryIntrospectionWidget::DrawTimelineView(const FrameGraphSnapshot& fg, const MemorySnapshot& ms) {
-        if (ImGui::CollapsingHeader("Timeline Settings", ImGuiTreeNodeFlags_DefaultOpen)) {
-            int m = static_cast<int>(timelineMode_);
-            ImGui::TextUnformatted("Mode:");
-            ImGui::SameLine(); ImGui::RadioButton("Real-time", &m, static_cast<int>(TimelineMode::RealTime));
-            ImGui::SameLine(); ImGui::RadioButton("Frame-graph", &m, static_cast<int>(TimelineMode::FrameGraph));
-            timelineMode_ = static_cast<TimelineMode>(m);
-
-            ImGui::Separator();
-
-            if (timelineMode_ == TimelineMode::RealTime) {
-                ImGui::SliderInt("Max seconds", &rt_.maxSeconds, 1, 60);
-            }
-            else {
-                ImGui::SliderFloat("Bar plot height", &fg_.barPlotHeightPx, 80.0f, 260.0f, "%.0f px");
-                ImGui::Checkbox("Show bar grid", &fg_.showBarGrid);
-
-                ImGui::SeparatorText("Batch slot layout");
-                ImGui::SliderFloat("Lane height", &fg_.laneHeight, 0.4f, 1.4f, "%.2f");
-                ImGui::SliderFloat("Lane pad", &fg_.lanePad, 0.05f, 0.6f, "%.2f");
-
-                const double kMinTransitions = 0.05, kMaxTransitions = 0.40;
-                const double kMinPasses = 0.20, kMaxPasses = 1.20;
-                const double kMinEnd = 0.05, kMaxEnd = 0.50;
-                const double kMinGap = 0.00, kMaxGap = 0.20;
-                const double kMinLeft = 0.00, kMaxLeft = 0.15;
-
-                ImGui::SliderScalar("Transitions width", ImGuiDataType_Double,
-                    &fg_.blockWidthTransitions, &kMinTransitions, &kMaxTransitions, "%.2f");
-                ImGui::SliderScalar("Passes width", ImGuiDataType_Double,
-                    &fg_.blockWidthPasses, &kMinPasses, &kMaxPasses, "%.2f");
-                ImGui::SliderScalar("End width", ImGuiDataType_Double,
-                    &fg_.blockWidthBatchEnd, &kMinEnd, &kMaxEnd, "%.2f");
-                ImGui::SliderScalar("Gap", ImGuiDataType_Double,
-                    &fg_.blockGap, &kMinGap, &kMaxGap, "%.2f");
-                ImGui::SliderScalar("Left inset", ImGuiDataType_Double,
-                    &fg_.blockLeftTransitions, &kMinLeft, &kMaxLeft, "%.2f");
-
-                ImGui::SeparatorText("Tooltip");
-                ImGui::Checkbox("Show pass list", &fg_.showPassListInTooltip);
-                ImGui::SliderInt("Max tooltip passes", &fg_.maxTooltipPasses, 0, 64);
-            }
-        }
-
         if (timelineMode_ == TimelineMode::RealTime) {
             DrawRealTimeTimeline();
         }
@@ -1013,20 +942,20 @@ namespace ui {
         double totalW = 1.0;
         auto layouts = BuildBatchLayouts(fg, fg_, &totalW);
 
-        // Split region vertically: top bars + bottom timeline
-        const ImVec2 avail = ImGui::GetContentRegionAvail();
-        const float topH = std::min(fg_.barPlotHeightPx, std::max(80.0f, avail.y * 0.45f));
-        const float botH = std::max(120.0f, avail.y - topH - 6.0f);
-
-        // Precompute max footprint for axis limits
+        // Precompute max footprint/live total for axis limits
         uint64_t maxBytes = 0;
         for (auto& b : fg.batches) {
             maxBytes = std::max(maxBytes, b.footprintBytes);
+            maxBytes = std::max(maxBytes, b.peakLiveBytes);
+            maxBytes = std::max(maxBytes, b.peakNaiveLiveBytes);
         }
         const double maxY = BytesToMiB(maxBytes);
         const double yPad = (maxY > 0.0) ? (maxY * 0.15) : 1.0;
 
-        ImGui::TextUnformatted("Batch footprint (MiB)");
+        ImGui::TextUnformatted("Stacked bars: touched footprint    Line: peak live total");
+
+        const ImVec2 avail = ImGui::GetContentRegionAvail();
+        const float topH = std::max(120.0f, avail.y - 4.0f);
 
         if (ImPlot::BeginPlot("##BatchFootprints", ImVec2(-1.0f, topH), ImPlotFlags_CanvasOnly)) {
             ImPlot::SetupAxes(nullptr, nullptr,
@@ -1048,10 +977,14 @@ namespace ui {
 
             // Build color mapping from the same categories used by the pie.
             const CatColorLUT colors = BuildCategoryColorLUT(ms);
+            const ImU32 liveLineColor = IM_COL32(32, 32, 32, 255);
+            const ImU32 livePointColor = IM_COL32(255, 230, 120, 255);
 
             int hoveredBatch = -1;
             std::string hoveredCat;
             uint64_t hoveredCatBytes = 0;
+            std::vector<ImVec2> livePoints;
+            livePoints.reserve(fg.batches.size());
 
             for (int i = 0; i < static_cast<int>(fg.batches.size()); ++i) {
                 const auto& b = fg.batches[i];
@@ -1060,9 +993,14 @@ namespace ui {
                 // Hover/click region = whole column
                 const bool overColumn = IsMouseOver(ImPlotPoint(L.baseX, 0.0),
                     ImPlotPoint(L.baseX + L.width, maxY + yPad));
+                if (overColumn && hoveredBatch < 0) {
+                    hoveredBatch = i;
+                }
                 if (overColumn && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
                     selectedBatch_ = i;
                 }
+
+                livePoints.push_back(ImPlot::PlotToPixels(ImPlotPoint(L.baseX + L.width * 0.5, BytesToMiB(b.peakLiveBytes))));
 
                 // Stack segments bottom-up
                 double y0 = 0.0;
@@ -1113,13 +1051,27 @@ namespace ui {
                 // assert/visualize mismatch if y0 != y?
             }
 
+            if (livePoints.size() >= 2) {
+                dl->AddPolyline(livePoints.data(), static_cast<int>(livePoints.size()), liveLineColor, 0, 2.0f);
+            }
+            for (int i = 0; i < static_cast<int>(livePoints.size()); ++i) {
+                const float radius = (hoveredBatch == i || selectedBatch_ == i) ? 5.0f : 4.0f;
+                dl->AddCircleFilled(livePoints[i], radius, livePointColor);
+                dl->AddCircle(livePoints[i], radius, liveLineColor, 0, 1.5f);
+            }
+
 			// Tooltip
             if (ImPlot::IsPlotHovered() && hoveredBatch >= 0) {
                 const auto& b = fg.batches[hoveredBatch];
                 ImGui::BeginTooltip();
                 ImGui::Text("Batch %d: %s", hoveredBatch, b.label.c_str());
                 ImGui::Separator();
-                ImGui::Text("Footprint: %s", FormatBytes(b.footprintBytes).c_str());
+                ImGui::Text("Touched footprint: %s", FormatBytes(b.footprintBytes).c_str());
+                ImGui::Text("Peak live total: %s", FormatBytes(b.peakLiveBytes).c_str());
+                ImGui::Text("Peak naive live: %s", FormatBytes(b.peakNaiveLiveBytes).c_str());
+                if (b.aliasSavingsBytes > 0) {
+                    ImGui::Text("Aliasing savings: %s", FormatBytes(b.aliasSavingsBytes).c_str());
+                }
 
                 if (!hoveredCat.empty()) {
                     ImGui::Separator();
@@ -1129,7 +1081,7 @@ namespace ui {
 
                 // Full breakdown list (like pie legend/tooltip)
                 ImGui::Separator();
-                ImGui::TextUnformatted("Breakdown:");
+                ImGui::TextUnformatted("Touched breakdown:");
                 // show top N to avoid massive tooltip spam
                 int shown = 0;
                 for (auto& s : b.categories) {
@@ -1148,88 +1100,6 @@ namespace ui {
             ImPlot::EndPlot();
         }
 
-        ImGui::Spacing();
-
-        // Bottom plot: single-lane "frame timeline"
-        if (ImPlot::BeginPlot("##FrameGraphTimeline", ImVec2(-1.0f, botH), ImPlotFlags_CanvasOnly)) {
-            ImPlot::SetupAxes(nullptr, nullptr,
-                ImPlotAxisFlags_NoTickLabels | ImPlotAxisFlags_NoLabel,
-                ImPlotAxisFlags_NoTickLabels | ImPlotAxisFlags_NoLabel);
-
-            ImPlot::SetupAxisLimits(ImAxis_X1, -0.1, totalW + 0.1, ImGuiCond_Always);
-
-            const double y0 = 0.0;
-            const double y1 = static_cast<double>(fg_.lanePad) + static_cast<double>(fg_.laneHeight) + static_cast<double>(fg_.lanePad);
-            ImPlot::SetupAxisLimits(ImAxis_Y1, y0, y1, ImGuiCond_Always);
-
-            ImDrawList* dl = ImPlot::GetPlotDrawList();
-
-            // Lane background
-            DrawBlock(dl,
-                ImPlotPoint(-0.25, fg_.lanePad * 0.5),
-                ImPlotPoint(totalW + 0.25, fg_.lanePad + fg_.laneHeight + fg_.lanePad * 0.5),
-                IM_COL32(245, 245, 245, 32),
-                IM_COL32(0, 0, 0, 32),
-                0.0f);
-
-            // Batch boundary lines
-            for (int i = 0; i <= static_cast<int>(layouts.size()); ++i) {
-                double x = (i == static_cast<int>(layouts.size())) ? totalW : layouts[i].baseX;
-                ImVec2 p0 = ImPlot::PlotToPixels(ImPlotPoint(x, y0));
-                ImVec2 p1 = ImPlot::PlotToPixels(ImPlotPoint(x, y1));
-                dl->AddLine(p0, p1, IM_COL32(180, 180, 180, 64), (i % 5 == 0) ? 2.0f : 1.0f);
-            }
-
-            const float laneY = fg_.lanePad;
-            const float H = fg_.laneHeight;
-
-            auto draw_block = [&](double x0b, double x1b, ImU32 fill, bool highlight) {
-                DrawBlock(dl,
-                    ImPlotPoint(x0b, laneY),
-                    ImPlotPoint(x1b, laneY + H),
-                    highlight ? IM_COL32(255, 80, 80, 220) : fill,
-                    IM_COL32(0, 0, 0, 255),
-                    4.0f);
-                };
-
-            for (int bi = 0; bi < static_cast<int>(fg.batches.size()); ++bi) {
-                const auto& b = fg.batches[bi];
-                const auto& L = layouts[bi];
-                const bool sel = (selectedBatch_ == bi);
-
-                draw_block(L.baseX, L.baseX + L.width, IM_COL32(80, 160, 255, 200), sel);
-
-                // Hover tooltip over the whole batch slot
-                ImPlotPoint slotMin(L.baseX, laneY);
-                ImPlotPoint slotMax(L.baseX + L.width, laneY + H);
-                if (IsMouseOver(slotMin, slotMax)) {
-                    if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-                        selectedBatch_ = bi;
-                    }
-
-                    ImGui::BeginTooltip();
-                    ImGui::Text("Batch %d: %s", bi, b.label.c_str());
-                    ImGui::Separator();
-                    ImGui::Text("Footprint: %s", FormatBytes(b.footprintBytes).c_str());
-
-                    if (fg_.showPassListInTooltip && !b.passNames.empty() && fg_.maxTooltipPasses != 0) {
-                        ImGui::Separator();
-                        ImGui::Text("Passes (%d):", static_cast<int>(b.passNames.size()));
-                        const int maxShow = (fg_.maxTooltipPasses < 0) ? static_cast<int>(b.passNames.size())
-                            : std::min(static_cast<int>(b.passNames.size()), fg_.maxTooltipPasses);
-                        for (int i = 0; i < maxShow; ++i) {
-                            ImGui::BulletText("%s", b.passNames[i].c_str());
-                        }
-                        if (static_cast<int>(b.passNames.size()) > maxShow) {
-                            ImGui::TextDisabled("...and %d more", static_cast<int>(b.passNames.size()) - maxShow);
-                        }
-                    }
-                    ImGui::EndTooltip();
-                }
-            }
-
-            ImPlot::EndPlot();
-        }
     }
 
 } // namespace ui

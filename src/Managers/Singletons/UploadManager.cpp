@@ -1,22 +1,103 @@
 #include "Managers/Singletons/UploadManager.h"
 
+#include <sstream>
 #include <unordered_set>
 
 #include <rhi_helpers.h>
 #include <rhi_debug.h>
+#include <spdlog/spdlog.h>
 
 #include "Resources/Buffers/Buffer.h"
 #include "Resources/Resource.h"
 #include "Managers/Singletons/DeviceManager.h"
+#include "Render/PassBuilders.h"
 #include "Render/MemoryIntrospectionAPI.h"
 #include "Render/Runtime/OpenRenderGraphSettings.h"
+namespace {
+	size_t AlignUpSizeT(const size_t v, const size_t a) noexcept {
+		return (v + (a - 1)) & ~(a - 1);
+	}
 
+	RangeSpec SingleSubresourceRange(uint32_t mip, uint32_t slice) noexcept
+	{
+		RangeSpec range;
+		range.mipLower = { BoundType::Exact, mip };
+		range.mipUpper = { BoundType::Exact, mip };
+		range.sliceLower = { BoundType::Exact, slice };
+		range.sliceUpper = { BoundType::Exact, slice };
+		return range;
+	}
+
+	void TagUploadManagerPage(const std::shared_ptr<Buffer>& buffer, size_t pageIndex)
+	{
+		if (!buffer) {
+			return;
+		}
+		buffer->SetName("UploadManagerPage_" + std::to_string(pageIndex));
+		rg::memory::SetResourceUsageHint(*buffer, "Upload buffer");
+	}
+
+	void LogUploadManagerPages(const char* reason, size_t pageCount, size_t activePage, size_t pageSize)
+	{
+		spdlog::info(
+			"UploadManager {}: pages={}, activePage={}, reservedBytes={} MiB",
+			reason,
+			pageCount,
+			activePage,
+			(pageCount * pageSize) / (1024ull * 1024ull));
+	}
+
+	void CaptureResourceCopyTelemetry(ResourceCopy& copy)
+	{
+		copy.sourceGlobalResourceId = copy.source ? copy.source->GetGlobalResourceID() : 0;
+		copy.destinationGlobalResourceId = copy.destination ? copy.destination->GetGlobalResourceID() : 0;
+		copy.sourceDebugName = copy.source ? copy.source->GetName() : std::string{};
+		copy.destinationDebugName = copy.destination ? copy.destination->GetName() : std::string{};
+	}
+
+	const char* UploadTargetKindToString(const UploadManager::UploadTarget& target) noexcept
+	{
+		switch (target.kind) {
+		case UploadManager::UploadTarget::Kind::PinnedShared:
+			return "PinnedShared";
+		case UploadManager::UploadTarget::Kind::RegistryHandle:
+			return "RegistryHandle";
+		default:
+			return "Unknown";
+		}
+	}
+
+	template <typename TUpdate>
+	void CaptureUploadTargetTelemetry(
+		const UploadManager::UploadResolveContext& ctx,
+		const UploadManager::UploadTarget& target,
+		TUpdate& update)
+	{
+		switch (target.kind) {
+		case UploadManager::UploadTarget::Kind::PinnedShared:
+			if (target.pinned) {
+				update.targetGlobalResourceId = target.pinned->GetGlobalResourceID();
+				update.targetDebugName = target.pinned->GetName();
+			}
+			break;
+		case UploadManager::UploadTarget::Kind::RegistryHandle:
+			update.targetGlobalResourceId = target.h.GetGlobalResourceID();
+			if (ctx.registry) {
+				if (auto* resource = ctx.registry->Resolve(target.h)) {
+					update.targetDebugName = resource->GetName();
+				}
+			}
+			break;
+		}
+	}
+}
 void UploadManager::Initialize() {
 	m_numFramesInFlight = rg::runtime::GetOpenRenderGraphSettings().numFramesInFlight;
 
 	m_currentCapacity = 1024 * 1024 * 4; // 4MB
 
 	m_pages.push_back({ Buffer::CreateShared(rhi::HeapType::Upload, kPageSize, false), 0 });
+	TagUploadManagerPage(m_pages.back().buffer, 0);
 
 	// ring buffer pointers
 	m_headOffset = 0;
@@ -29,11 +110,36 @@ void UploadManager::Initialize() {
 
 	m_activePage = 0;
 	m_frameStart.resize(m_numFramesInFlight, 0);
+	LogUploadManagerPages("initialize", m_pages.size(), m_activePage, kPageSize);
 }
 
-namespace {
-	size_t AlignUpSizeT(const size_t v, const size_t a) noexcept {
-		return (v + (a - 1)) & ~(a - 1);
+void UploadManager::SetUploadResolveContext(UploadResolveContext ctx) {
+	std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
+	m_ctx = ctx;
+	MarkUploadPassDirty();
+	RefreshQueuedTargetTelemetryLocked();
+	PruneInvalidRegistryHandleUpdatesLocked("resolve-context-update");
+}
+
+void UploadManager::MarkUploadPassDirty()
+{
+	if (m_uploadPass) {
+		m_uploadPass->MarkDeclaredResourcesDirty();
+	}
+}
+
+void UploadManager::RefreshQueuedTargetTelemetryLocked()
+{
+	for (auto& update : m_resourceUpdates) {
+		CaptureUploadTargetTelemetry(m_ctx, update.resourceToUpdate, update);
+	}
+
+	for (auto& update : m_textureUpdates) {
+		CaptureUploadTargetTelemetry(m_ctx, update.texture, update);
+	}
+
+	for (auto& copy : queuedResourceCopies) {
+		CaptureResourceCopyTelemetry(copy);
 	}
 }
 
@@ -68,14 +174,6 @@ bool UploadManager::TryCoalesceAppend(ResourceUpdate& last, const ResourceUpdate
 
 	last.size += next.size;
 
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
-	// Preserve newest debug provenance.
-	last.file = next.file;
-	last.line = next.line;
-	last.threadID = next.threadID;
-	last.stackSize = next.stackSize;
-	for (uint8_t i = 0; i < next.stackSize && i < ResourceUpdate::MaxStack; ++i) last.stack[i] = next.stack[i];
-#endif
 	return true;
 }
 
@@ -116,15 +214,6 @@ void UploadManager::ApplyLastWriteWins(ResourceUpdate& newUpdate) noexcept
 
 			UnmapUpload(newUpdate.uploadBuffer);
 			UnmapUpload(u.uploadBuffer);
-
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
-			// Keep newest provenance.
-			u.file = newUpdate.file;
-			u.line = newUpdate.line;
-			u.threadID = newUpdate.threadID;
-			u.stackSize = newUpdate.stackSize;
-			for (uint8_t j = 0; j < newUpdate.stackSize && j < ResourceUpdate::MaxStack; ++j) u.stack[j] = newUpdate.stack[j];
-#endif
 
 			newUpdate.active = false;
 			return;
@@ -200,8 +289,9 @@ bool UploadManager::AllocateUploadRegion(size_t size, size_t alignment, std::sha
 	if (alignment == 0) alignment = 1;
 	if (m_pages.empty()) {
 		m_pages.push_back({ Buffer::CreateShared(rhi::HeapType::Upload, kPageSize, false), 0 });
-		rg::memory::SetResourceUsageHint(*m_pages.back().buffer, "Upload buffer");
+		TagUploadManagerPage(m_pages.back().buffer, 0);
 		m_activePage = 0;
+		LogUploadManagerPages("recreate-first-page", m_pages.size(), m_activePage, kPageSize);
 	}
 
 	UploadPage* page = &m_pages[m_activePage];
@@ -215,7 +305,8 @@ bool UploadManager::AllocateUploadRegion(size_t size, size_t alignment, std::sha
 			// allocate another fresh page sized to the request (at least kPageSize)
 			size_t allocSize = (std::max)(kPageSize, size);
 			m_pages.push_back({ Buffer::CreateShared(rhi::HeapType::Upload, allocSize, false), 0 });
-			rg::memory::SetResourceUsageHint(*m_pages.back().buffer, "Upload buffer");
+			TagUploadManagerPage(m_pages.back().buffer, m_pages.size() - 1);
+			LogUploadManagerPages("grow", m_pages.size(), m_activePage, kPageSize);
 		}
 		page = &m_pages[m_activePage];
 		page->tailOffset = 0;
@@ -225,7 +316,8 @@ bool UploadManager::AllocateUploadRegion(size_t size, size_t alignment, std::sha
 		if (alignedTail + size > page->buffer->GetSize()) {
 			size_t allocSize = (std::max)(kPageSize, size);
 			m_pages.push_back({ Buffer::CreateShared(rhi::HeapType::Upload, allocSize, false), 0 });
-			rg::memory::SetResourceUsageHint(*m_pages.back().buffer, "Upload buffer");
+			TagUploadManagerPage(m_pages.back().buffer, m_pages.size() - 1);
+			LogUploadManagerPages("grow-dedicated", m_pages.size(), m_activePage, kPageSize);
 			m_activePage = m_pages.size() - 1;
 			page = &m_pages[m_activePage];
 			page->tailOffset = 0;
@@ -264,6 +356,8 @@ void UploadManager::UploadData(const void* data, size_t size, UploadTarget resou
 		return;
 	}
 
+	std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
+
 	UploadPage* page = &m_pages[m_activePage];
 
 	// if it won't fit in the rest of this page, open a new page
@@ -274,6 +368,8 @@ void UploadManager::UploadData(const void* data, size_t size, UploadTarget resou
 			size_t allocSize = (std::max)(kPageSize, size);
 			auto device = DeviceManager::GetInstance().GetDevice();
 			m_pages.push_back({ Buffer::CreateShared(rhi::HeapType::Upload, allocSize, false), 0 });
+			TagUploadManagerPage(m_pages.back().buffer, m_pages.size() - 1);
+			LogUploadManagerPages("grow-buffer-upload", m_pages.size(), m_activePage, kPageSize);
 		}
 		page = &m_pages[m_activePage];
 		page->tailOffset = 0;
@@ -302,6 +398,12 @@ void UploadManager::UploadData(const void* data, size_t size, UploadTarget resou
 	update.uploadBufferOffset = uploadOffset;
 	update.dataBufferOffset = dataBufferOffset;
 #if BUILD_TYPE == BUILD_TYPE_DEBUG
+	update.file = file;
+	update.line = line;
+#endif
+ 	CaptureUploadTargetTelemetry(m_ctx, update.resourceToUpdate, update);
+	MarkUploadPassDirty();
+#if BUILD_TYPE == BUILD_TYPE_DEBUG
 	//update.stackTrace = std::stacktrace::current();
 	unsigned int idOrRegistryIndex = 0;
 	switch (resourceToUpdate.kind) {
@@ -315,18 +417,6 @@ void UploadManager::UploadData(const void* data, size_t size, UploadTarget resou
 			break;
 		}
 
-	update.resourceIDOrRegistryIndex = idOrRegistryIndex;
-	update.targetKind = resourceToUpdate.kind;
-	update.file = file;
-	update.line = line;
-	update.frameIndex = (m_numFramesInFlight ? (GetInstance().getNumFramesInFlight()) : 0);
-	update.threadID = std::this_thread::get_id();
-#ifdef _WIN32
-	void* frames[ResourceUpdate::MaxStack];
-	USHORT captured = RtlCaptureStackBackTrace(1, ResourceUpdate::MaxStack, frames, nullptr);
-	update.stackSize = static_cast<uint8_t>(captured);
-	for (USHORT i = 0; i < captured; i++) update.stack[i] = frames[i];
-#endif
 #endif
 	//ApplyLastWriteWins(update); // Too slow
 
@@ -377,6 +467,8 @@ void UploadManager::UploadTextureSubresources(
 {
 	if (!srcSubresources || srcCount == 0) return;
 
+	std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
+
 	rhi::Span<const rhi::helpers::SubresourceData> srcSpan{ srcSubresources, srcCount };
 
 	const auto plan = rhi::helpers::PlanTextureUploadSubresources(
@@ -415,12 +507,12 @@ void UploadManager::UploadTextureSubresources(
 		update.y = 0;
 		update.z = fp.zSlice;
 		update.uploadBuffer = uploadBuffer;
-#ifdef _DEBUG
-		//update.stackTrace = std::stacktrace::current();
+#if BUILD_TYPE == BUILD_TYPE_DEBUG
 		update.file = file;
 		update.line = line;
-		update.threadID = std::this_thread::get_id();
 #endif
+		CaptureUploadTargetTelemetry(m_ctx, update.texture, update);
+		MarkUploadPassDirty();
 		m_textureUpdates.push_back(std::move(update));
 	}
 }
@@ -428,6 +520,8 @@ void UploadManager::UploadTextureSubresources(
 
 void UploadManager::ProcessDeferredReleases(uint8_t frameIndex)
 {
+	std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
+
 	// The page where this frame started uploading
 	size_t retiringStart = m_frameStart[frameIndex];
 
@@ -451,6 +545,10 @@ void UploadManager::ProcessDeferredReleases(uint8_t frameIndex)
 			for (auto& start : m_frameStart) {
 				start = (start >= eraseCount ? start - eraseCount : 0);
 			}
+			for (size_t i = 0; i < m_pages.size(); ++i) {
+				TagUploadManagerPage(m_pages[i].buffer, i);
+			}
+			LogUploadManagerPages("retire", m_pages.size(), m_activePage, kPageSize);
 		}
 	}
 
@@ -458,11 +556,205 @@ void UploadManager::ProcessDeferredReleases(uint8_t frameIndex)
 	m_frameStart[frameIndex] = m_activePage;
 }
 
+void UploadManager::PruneInvalidRegistryHandleUpdatesLocked(const char* reason)
+{
+	auto* registry = m_ctx.registry;
+	if (!registry) {
+		return;
+	}
+
+	const auto pruneResourceUpdates = [&](auto& updates, auto&& targetAccessor) {
+		size_t writeIndex = 0;
+		size_t droppedCount = 0;
+		for (size_t readIndex = 0; readIndex < updates.size(); ++readIndex) {
+			auto& update = updates[readIndex];
+			const auto& target = targetAccessor(update);
+			const bool usesRegistryHandle = target.kind == UploadTarget::Kind::RegistryHandle;
+			const bool keep = !usesRegistryHandle || registry->IsValid(target.h);
+			if (!keep) {
+				spdlog::error(
+					"UploadManager: invalid queued registry-handle upload detected during {}: handle idx={} generation={} epoch={} queued at {}:{}",
+					reason ? reason : "upload-processing",
+					target.h.GetKey().idx,
+					target.h.GetGeneration(),
+					target.h.GetEpoch(),
+					update.file ? update.file : "<unknown>",
+					update.line);
+				++droppedCount;
+				continue;
+			}
+
+			if (writeIndex != readIndex) {
+				updates[writeIndex] = std::move(update);
+			}
+			++writeIndex;
+		}
+
+		if (droppedCount > 0) {
+			updates.resize(writeIndex);
+			MarkUploadPassDirty();
+			spdlog::warn(
+				"UploadManager: dropped {} queued registry-handle upload(s) during {} because the destination handle is no longer valid in the active registry.",
+				droppedCount,
+				reason ? reason : "upload-processing");
+#if BUILD_TYPE == BUILD_TYPE_DEBUG
+			throw std::runtime_error("UploadManager: invalid registry handle uploads detected. This likely indicates a bug where uploads are being queued referencing registry handles that have since been released.");
+#endif
+		}
+	};
+
+	pruneResourceUpdates(m_resourceUpdates, [](const ResourceUpdate& update) -> const UploadTarget& {
+		return update.resourceToUpdate;
+	});
+	pruneResourceUpdates(m_textureUpdates, [](const TextureUpdate& update) -> const UploadTarget& {
+		return update.texture;
+	});
+}
+
+void UploadManager::DeclareUploadPassResourceUsages(RenderPassBuilder* builder)
+{
+	if (!builder) {
+		return;
+	}
+
+	std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
+	RefreshQueuedTargetTelemetryLocked();
+	PruneInvalidRegistryHandleUpdatesLocked("upload-pass-declare");
+
+	for (const auto& copy : queuedResourceCopies) {
+		if (copy.source) {
+			builder->WithCopySource(copy.source);
+		}
+		if (copy.destination) {
+			builder->WithCopyDest(copy.destination);
+		}
+	}
+
+	for (const auto& update : m_resourceUpdates) {
+		if (!update.active || !update.uploadBuffer) {
+			continue;
+		}
+
+		builder->WithCopySource(update.uploadBuffer);
+		switch (update.resourceToUpdate.kind) {
+		case UploadTarget::Kind::PinnedShared:
+			if (update.resourceToUpdate.pinned) {
+				builder->WithCopyDest(update.resourceToUpdate.pinned);
+			}
+			break;
+		case UploadTarget::Kind::RegistryHandle:
+			builder->WithCopyDest(ResourceHandleAndRange{ update.resourceToUpdate.h });
+			break;
+		}
+	}
+
+	for (const auto& update : m_textureUpdates) {
+		if (!update.uploadBuffer) {
+			continue;
+		}
+
+		builder->WithCopySource(update.uploadBuffer);
+		const auto range = SingleSubresourceRange(update.mip, update.slice);
+		switch (update.texture.kind) {
+		case UploadTarget::Kind::PinnedShared:
+			if (update.texture.pinned) {
+				builder->WithCopyDest(ResourcePtrAndRange{ update.texture.pinned, range });
+			}
+			break;
+		case UploadTarget::Kind::RegistryHandle:
+			builder->WithCopyDest(ResourceHandleAndRange{ update.texture.h, range });
+			break;
+		}
+	}
+}
+
+std::string UploadManager::DescribeQueuedTargetByGlobalResourceId(uint64_t globalResourceId)
+{
+	if (globalResourceId == 0) {
+		return {};
+	}
+
+	std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
+	RefreshQueuedTargetTelemetryLocked();
+
+	std::ostringstream result;
+	size_t matchCount = 0;
+
+	auto appendMatch = [&](const auto& update, const UploadTarget& target, const char* updateKind) {
+		if (update.targetGlobalResourceId != globalResourceId) {
+			return;
+		}
+
+		if (matchCount++ > 0) {
+			result << " | ";
+		}
+
+		result
+			<< updateKind
+			<< " kind=" << UploadTargetKindToString(target)
+			<< " name='" << (update.targetDebugName.empty() ? std::string("<unknown>") : update.targetDebugName) << "'"
+			<< " queuedAt=" << (update.file ? update.file : "<unknown>") << ":" << update.line;
+
+		if (target.kind == UploadTarget::Kind::RegistryHandle) {
+			result
+				<< " handle[idx=" << target.h.GetKey().idx
+				<< " gen=" << target.h.GetGeneration()
+				<< " epoch=" << target.h.GetEpoch()
+				<< "]";
+		}
+	};
+
+	for (const auto& update : m_resourceUpdates) {
+		appendMatch(update, update.resourceToUpdate, "buffer-upload");
+	}
+
+	for (const auto& update : m_textureUpdates) {
+		appendMatch(update, update.texture, "texture-upload");
+	}
+
+	for (const auto& copy : queuedResourceCopies) {
+		if (copy.destinationGlobalResourceId == globalResourceId) {
+			if (matchCount++ > 0) {
+				result << " | ";
+			}
+			result
+				<< "resource-copy-dest"
+				<< " name='" << (copy.destinationDebugName.empty() ? std::string("<unknown>") : copy.destinationDebugName) << "'"
+				<< " sourceName='" << (copy.sourceDebugName.empty() ? std::string("<unknown>") : copy.sourceDebugName) << "'"
+				<< " bytes=" << copy.size;
+		}
+
+		if (copy.sourceGlobalResourceId == globalResourceId) {
+			if (matchCount++ > 0) {
+				result << " | ";
+			}
+			result
+				<< "resource-copy-source"
+				<< " name='" << (copy.sourceDebugName.empty() ? std::string("<unknown>") : copy.sourceDebugName) << "'"
+				<< " destinationName='" << (copy.destinationDebugName.empty() ? std::string("<unknown>") : copy.destinationDebugName) << "'"
+				<< " bytes=" << copy.size;
+		}
+	}
+
+	return result.str();
+}
+
 void UploadManager::ProcessUploads(uint8_t frameIndex, rg::imm::ImmediateCommandList& commandList) {
+	std::vector<ResourceUpdate> resourceUpdates;
+	std::vector<TextureUpdate> textureUpdates;
+	{
+		std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
+		PruneInvalidRegistryHandleUpdatesLocked("upload-pass-execute");
+		resourceUpdates.swap(m_resourceUpdates);
+		textureUpdates.swap(m_textureUpdates);
+		if (!resourceUpdates.empty() || !textureUpdates.empty()) {
+			MarkUploadPassDirty();
+		}
+	}
 
 	//rhi::debug::Begin(commandList.Get(), rhi::colors::Amber, "UploadManager::ProcessUploads");
 
-	for (auto& update : m_resourceUpdates) {
+	for (auto& update : resourceUpdates) {
 		if (!update.active || !update.uploadBuffer || update.size == 0) continue;
 		switch(update.resourceToUpdate.kind) {
 		case UploadTarget::Kind::PinnedShared:
@@ -488,7 +780,7 @@ void UploadManager::ProcessUploads(uint8_t frameIndex, rg::imm::ImmediateCommand
 
 	}
 
-	for (auto& texUpdate : m_textureUpdates) {
+	for (auto& texUpdate : textureUpdates) {
 		if (texUpdate.texture.kind == UploadTarget::Kind::PinnedShared) {
 			commandList.CopyBufferToTexture(
 				texUpdate.uploadBuffer,
@@ -514,19 +806,28 @@ void UploadManager::ProcessUploads(uint8_t frameIndex, rg::imm::ImmediateCommand
 		}
 	}
 
-	m_resourceUpdates.clear();
-	m_textureUpdates.clear();
 }
 
 void UploadManager::QueueResourceCopy(const std::shared_ptr<Resource>& destination, const std::shared_ptr<Resource>& source, size_t size) {
+	std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
 	ResourceCopy copy;
 	copy.source = source;
 	copy.destination = destination;
 	copy.size = size;
+	CaptureResourceCopyTelemetry(copy);
 	queuedResourceCopies.push_back(copy);
+	MarkUploadPassDirty();
 }
 
 void UploadManager::ExecuteResourceCopies(uint8_t frameIndex, rg::imm::ImmediateCommandList& commandList) {
+	std::vector<ResourceCopy> resourceCopies;
+	{
+		std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
+		resourceCopies.swap(queuedResourceCopies);
+		if (!resourceCopies.empty()) {
+			MarkUploadPassDirty();
+		}
+	}
 	//rhi::debug::Begin(commandList.Get(), rhi::colors::Amber, "Upload Manager - resource copies");
 
 	// When a DynamicBuffer grows multiple times in the same frame, each growth
@@ -537,7 +838,7 @@ void UploadManager::ExecuteResourceCopies(uint8_t frameIndex, rg::imm::Immediate
 	// data placed by the first copy with garbage.  Keep only the first copy
 	// per destination to avoid this.
 	std::unordered_set<Resource*> seenDestinations;
-	for (auto& copy : queuedResourceCopies) {
+	for (auto& copy : resourceCopies) {
 		auto* dstPtr = copy.destination.get();
 		if (!seenDestinations.insert(dstPtr).second) {
 			continue; // Skip — intermediate buffer has undefined GPU content
@@ -549,15 +850,15 @@ void UploadManager::ExecuteResourceCopies(uint8_t frameIndex, rg::imm::Immediate
 			0,
 			copy.size);
 	}
-
-	queuedResourceCopies.clear();
 }
 
 void UploadManager::Cleanup() {
+	std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
 	m_pages.clear();
 	m_resourceUpdates.clear();
 	m_textureUpdates.clear();
 	queuedResourceCopies.clear();
+	MarkUploadPassDirty();
 	m_streamingPagePool.Cleanup();
 	{
 		std::lock_guard<std::mutex> lock(m_streamingMutex);

@@ -7,6 +7,8 @@
 #include <limits>
 #include <vector>
 
+#include <spdlog/spdlog.h>
+
 #include "Resources/Resource.h"
 #include "Resources/Buffers/DynamicBufferBase.h"
 #include "Interfaces/IHasMemoryMetadata.h"

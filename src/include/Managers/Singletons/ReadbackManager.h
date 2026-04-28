@@ -6,6 +6,7 @@
 #include <string>
 #include <rhi.h>
 
+#include "Render/QueueKind.h"
 #include "Resources/ReadbackRequest.h"
 
 class Resource;
@@ -16,7 +17,7 @@ struct ReadbackCaptureInfo {
 	uint64_t resourceId = 0;
 	RangeSpec range{};
 	ReadbackCaptureCallback callback;
-	bool preferCopyQueue = false;
+	QueueKind preferredQueueKind = QueueKind::Graphics;
 };
 
 struct ReadbackCaptureToken {
@@ -38,7 +39,7 @@ public:
 		Resource* resource,
 		const RangeSpec& range,
 		ReadbackCaptureCallback callback,
-		bool preferCopyQueue = false);
+		QueueKind preferredQueueKind = QueueKind::Graphics);
 
 	std::vector<ReadbackCaptureInfo> ConsumeCaptureRequests();
 

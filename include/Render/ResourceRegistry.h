@@ -1,25 +1,23 @@
 #pragma once
 #include "Resources/ResourceIdentifier.h"
+#include <cassert>
+#include <functional>
 #include <memory>
 #include <map>
-#include <vector>
-#include <stdexcept>
-#include <functional>
-#include <unordered_map>
 #include <optional>
+#include <stdexcept>
+#include <unordered_map>
+#include <utility>
+#include <variant>
+#include <vector>
 #include <spdlog/spdlog.h>
 
+#include "Render/PassInputs.h"
 #include "Resources/Resource.h"
 #include "Resources/ResourceStateTracker.h"
 #include "Interfaces/IResourceResolver.h"
 
 class Resource;
-
-#pragma once
-#include <cassert>
-#include <memory>
-#include <utility>
-#include <variant>
 
 template <class T>
 class SharedOrWeakPtr
@@ -89,6 +87,7 @@ class ResourceRegistry {
 
     struct Slot {
         SharedOrWeakPtr<Resource> resource;
+        Resource* rawPointer = nullptr;
         uint32_t generation = 1;
         ResourceIdentifier id; // for debug / access checks / reverse mapping
         bool alive = false;
@@ -124,6 +123,12 @@ public:
         uint64_t GetGlobalResourceID() const { return globalResourceIndex; }
         uint32_t GetNumMipLevels() const { return numMipLevels; }
         uint32_t GetArraySize() const { return arraySize; }
+        bool operator==(const RegistryHandle& other) const noexcept {
+            return globalResourceIndex == other.globalResourceIndex;
+        }
+        friend inline rg::Hash64 HashValue(const RegistryHandle& handle) {
+            return static_cast<rg::Hash64>(handle.GetGlobalResourceID());
+        }
 		//SymbolicTracker* GetStateTracker() const { return tracker; }
         // For ephemeral handles that bypass registry storage
         static RegistryHandle MakeEphemeral(Resource* raw) {
@@ -209,16 +214,28 @@ public:
         ResourceKey key = InternKey(id);
         Slot& s = slots[key.idx];
 
+        const bool isSameResource = s.alive && s.rawPointer == res.get();
+
         // If this slot previously pointed at a different resource pointer,
         // remove its reverse-map entry so stale pointer->handle lookups
         // do not survive replacement.
-        if (s.resource) {
-            resourceToHandle.erase(s.resource.get());
+        if (s.rawPointer && !isSameResource) {
+            resourceToHandle.erase(s.rawPointer);
         }
 
         s.resource = res;
-        s.generation++; // bump on replacement
+        s.rawPointer = res.get();
+
+        // Preserve handle stability when the same resource object is re-registered.
+        // Dynamic declaration refreshes routinely re-register stable resources during
+        // CompileFrame, and bumping generation in that case invalidates cached handles
+        // that were still valid for the same underlying object.
+        if (!isSameResource) {
+            s.generation++; // bump on first registration or true replacement
+        }
+
         s.alive = true;
+        s.id = id;
 
         RegistryHandle h(key,
             s.generation,
@@ -227,7 +244,7 @@ public:
             res->GetMipLevels(), 
             res->GetArraySize());
 
-        resourceToHandle[s.resource.get()] = h;
+        resourceToHandle[s.rawPointer] = h;
 
         return h;
     }
@@ -248,6 +265,27 @@ public:
 		return std::nullopt;
     }
 
+    bool IsAnonymous(const RegistryHandle& h) const noexcept {
+        if (h.IsEphemeral()) {
+            return false;
+        }
+        if (h.GetKey().idx >= slots.size()) {
+            return false;
+        }
+
+        const Slot& s = slots[h.GetKey().idx];
+        if (!s.alive) {
+            return false;
+        }
+
+        return s.id.segments.empty();
+    }
+
+    bool IsAnonymous(Resource* res) const noexcept {
+        auto handle = GetHandleFor(res);
+        return handle.has_value() && IsAnonymous(*handle);
+    }
+
     std::optional<RegistryHandle> GetHandleFor(ResourceIdentifier const& id) const {
         auto it = intern.find(id);
         if (it == intern.end()) {
@@ -259,6 +297,31 @@ public:
         }
         const Slot& s = slots[key.idx];
         return GetHandleFor(s.resource.get());
+    }
+
+    void ReclaimExpiredAnonymous() {
+        for (uint32_t idx = 0; idx < slots.size(); ++idx) {
+            Slot& s = slots[idx];
+            if (!s.alive) {
+                continue;
+            }
+            if (!s.id.segments.empty()) {
+                continue;
+            }
+            if (s.resource) {
+                continue;
+            }
+
+            if (s.rawPointer) {
+                resourceToHandle.erase(s.rawPointer);
+                s.rawPointer = nullptr;
+            }
+
+            s.resource = SharedOrWeakPtr<Resource>{};
+            s.alive = false;
+            ++s.generation;
+            freeList.push_back(idx);
+        }
     }
 
     RegistryHandle MakeHandle(ResourceIdentifier const& id) const {
@@ -353,14 +416,15 @@ private:
         Slot& s = slots[idx];
 
         // If slot previously held a resource, remove reverse mapping.
-        if (s.resource) {
-            resourceToHandle.erase(s.resource.get());
+        if (s.rawPointer) {
+            resourceToHandle.erase(s.rawPointer);
         }
 
         s.resource = std::move(res);
+        s.rawPointer = s.resource.get();
         s.generation++;
         s.alive = true;
-        // s.id left default/empty (debug only)
+        s.id = {};
 
         RegistryHandle h(
             ResourceKey{ idx },
@@ -371,7 +435,7 @@ private:
             s.resource->GetArraySize()
         );
 
-        resourceToHandle[s.resource.get()] = h;
+        resourceToHandle[s.rawPointer] = h;
         return h;
     }
 };
