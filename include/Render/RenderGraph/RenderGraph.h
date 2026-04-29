@@ -985,6 +985,7 @@ private:
 	void RefreshRetainedDeclarationsForFrame(CopyPassAndResources& p, uint8_t frameIndex);
 	void CompileFrame(rhi::Device device, uint8_t frameIndex, const IHostExecutionData* hostData);
 	void WriteCompiledGraphDebugDump(uint8_t frameIndex, const std::vector<Node>& nodes) const;
+	void WriteVramUsageDebugDump(uint8_t frameIndex) const;
 	AnyPassAndResources MaterializeExternalPass(const ExternalPassDesc& desc, bool callSetup, bool materializeReferencedResources);
 	void RegisterExternalPassName(const ExternalPassDesc& desc, AnyPassAndResources& any);
 
@@ -1183,6 +1184,7 @@ private:
 	std::function<AutoAliasMode()> m_getAutoAliasMode;
 	std::function<AutoAliasPackingStrategy()> m_getAutoAliasPackingStrategy;
 	std::function<bool()> m_getRenderGraphCompileDumpEnabled;
+	std::function<bool()> m_getRenderGraphVramDumpEnabled;
 	std::function<bool()> m_getRenderGraphBatchTraceEnabled;
 	std::function<bool()> m_getAutoAliasEnableLogging;
 	std::function<bool()> m_getAutoAliasLogExclusionReasons;

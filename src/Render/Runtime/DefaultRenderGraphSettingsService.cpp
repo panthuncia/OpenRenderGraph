@@ -15,6 +15,10 @@ public:
         return GetOpenRenderGraphSettings().renderGraphCompileDumpEnabled;
     }
 
+    bool GetRenderGraphVramDumpEnabled() const override {
+        return GetOpenRenderGraphSettings().renderGraphVramDumpEnabled;
+    }
+
     bool GetRenderGraphBatchTraceEnabled() const override {
         return GetOpenRenderGraphSettings().renderGraphBatchTraceEnabled;
     }
