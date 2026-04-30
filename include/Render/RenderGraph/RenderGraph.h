@@ -293,6 +293,7 @@ public:
 		PassRunMask run = PassRunMask::Both; // default behavior
 		std::vector<std::byte> immediateBytecode; // Stores the immediate execution bytecode
 		std::shared_ptr<rg::imm::KeepAliveBag> immediateKeepAlive = nullptr; // Keeps alive resources used by immediate execution bytecode
+		std::vector<std::shared_ptr<Resource>> retainedAnonymousKeepAlive; // Keeps retained anonymous handles alive across frames
 		std::vector<ResolverSnapshot> resolverSnapshots; // Versioned resolver snapshots for auto-invalidation
 	};
 
@@ -307,6 +308,7 @@ public:
 		PassRunMask run = PassRunMask::Both;
 		std::vector<std::byte> immediateBytecode; // Stores the immediate execution bytecode
 		std::shared_ptr<rg::imm::KeepAliveBag> immediateKeepAlive = nullptr; // Keeps alive resources used by immediate execution bytecode
+		std::vector<std::shared_ptr<Resource>> retainedAnonymousKeepAlive; // Keeps retained anonymous handles alive across frames
 		std::vector<ResolverSnapshot> resolverSnapshots; // Versioned resolver snapshots for auto-invalidation
 	};
 
@@ -321,6 +323,7 @@ public:
 		PassRunMask run = PassRunMask::Both;
 		std::vector<std::byte> immediateBytecode;
 		std::shared_ptr<rg::imm::KeepAliveBag> immediateKeepAlive = nullptr;
+		std::vector<std::shared_ptr<Resource>> retainedAnonymousKeepAlive; // Keeps retained anonymous handles alive across frames
 		std::vector<ResolverSnapshot> resolverSnapshots; // Versioned resolver snapshots for auto-invalidation
 	};
 
@@ -960,6 +963,9 @@ private:
 		const std::vector<ResourceRequirement>& resourceRequirements,
 		const std::vector<std::pair<ResourceHandleAndRange, ResourceState>>& internalTransitions,
 		std::string_view debugPassName = {});
+	std::vector<std::shared_ptr<Resource>> CaptureRetainedAnonymousKeepAlive(
+		const std::vector<ResourceRequirement>& resourceRequirements,
+		const std::vector<std::pair<ResourceHandleAndRange, ResourceState>>& internalTransitions) const;
 	void CollectFrameResourceIDs(std::unordered_set<uint64_t>& out) const;
 	void ApplyIdleDematerializationPolicy(const std::unordered_set<uint64_t>& usedResourceIDs);
 	void SnapshotCompiledResourceGenerations(const std::unordered_set<uint64_t>& usedResourceIDs);

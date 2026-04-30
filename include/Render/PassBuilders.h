@@ -527,6 +527,33 @@ namespace detail
     template<class...>
     inline constexpr bool dependent_false_v = false;
 
+    template<typename T>
+    inline void MaybeTrackResolverSnapshot(RenderGraph*, std::vector<ResolverSnapshot>&, const T&) {
+    }
+
+    inline void MaybeTrackResolverSnapshot(RenderGraph* graph, std::vector<ResolverSnapshot>& resolverSnapshots, const ResourceIdentifier& id) {
+        if (!graph) {
+            return;
+        }
+        if (auto resolver = graph->RequestResolver(id, true)) {
+            const uint64_t version = resolver->GetContentVersion();
+            if (version != 0) {
+                resolverSnapshots.emplace_back(resolver->Clone(), version);
+            }
+        }
+    }
+
+    inline void MaybeTrackResolverSnapshot(RenderGraph* graph, std::vector<ResolverSnapshot>& resolverSnapshots, const ResourceIdentifierAndRange& id) {
+        MaybeTrackResolverSnapshot(graph, resolverSnapshots, id.identifier);
+    }
+
+    inline void MaybeTrackResolverSnapshot(RenderGraph* graph, std::vector<ResolverSnapshot>& resolverSnapshots, const char* id) {
+        if (!id) {
+            return;
+        }
+        MaybeTrackResolverSnapshot(graph, resolverSnapshots, ResourceIdentifier{ id });
+    }
+
     template<typename IdSet, typename DestVec, typename T>
     inline void AppendTrackedResource(RenderGraph* graph, IdSet& ids, DestVec& dest, T&& value) {
         extractId(ids, std::forward<T>(value));
@@ -1050,6 +1077,7 @@ private:
 	template<typename T>
         requires ResourceLike<T>
 	RenderPassBuilder& addShaderResource(T&& x) {
+    detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
     detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorShaderResources, x, DescriptorType::SRV);
         detail::AppendTrackedResource(graph, _declaredIds, params.shaderResources, std::forward<T>(x));
 		return *this;
@@ -1068,6 +1096,7 @@ private:
     template<typename T>
         requires ResourceLike<T>
     RenderPassBuilder& addRenderTarget(T&& x) {
+        detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.renderTargets, std::forward<T>(x));
 		return *this;
     }
@@ -1085,6 +1114,7 @@ private:
 	template<typename T>
         requires ResourceLike<T>
 	RenderPassBuilder& addDepthReadWrite(T&& x) {
+        detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.depthReadWriteResources, std::forward<T>(x));
 		return *this;
 	}
@@ -1101,6 +1131,7 @@ private:
 	template<typename T>
         requires ResourceLike<T>
 	RenderPassBuilder& addDepthRead(T&& x) {
+        detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.depthReadResources, std::forward<T>(x));
 		return *this;
 	}
@@ -1118,6 +1149,7 @@ private:
 	template<typename T>
         requires ResourceLike<T>
 	RenderPassBuilder& addConstantBuffer(T&& x) {
+    detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
     detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorConstantBuffers, x, DescriptorType::CBV);
         detail::AppendTrackedResource(graph, _declaredIds, params.constantBuffers, std::forward<T>(x));
 		return *this;
@@ -1136,6 +1168,7 @@ private:
 	template<typename T>
         requires ResourceLike<T>
 	RenderPassBuilder& addUnorderedAccess(T&& x) {
+    detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
     detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorUnorderedAccessViews, x, DescriptorType::UAV);
         detail::AppendTrackedResource(graph, _declaredIds, params.unorderedAccessViews, std::forward<T>(x));
 		return *this;
@@ -1154,6 +1187,7 @@ private:
 	template<typename T>
         requires ResourceLike<T>
 	RenderPassBuilder& addCopyDest(T&& x) {
+        detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.copyTargets, std::forward<T>(x));
 		return *this;
 	}
@@ -1171,6 +1205,7 @@ private:
 	template<typename T>
         requires ResourceLike<T>
 	RenderPassBuilder& addCopySource(T&& x) {
+        detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.copySources, std::forward<T>(x));
 		return *this;
 	}
@@ -1188,6 +1223,7 @@ private:
 	template<typename T>
         requires ResourceLike<T>
 	RenderPassBuilder& addIndirectArguments(T&& x) {
+        detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.indirectArgumentBuffers, std::forward<T>(x));
 		return *this;
 	}
@@ -1205,6 +1241,7 @@ private:
     template<typename T>
         requires ResourceLike<T>
     RenderPassBuilder& addLegacyInterop(T&& x) {
+        detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.legacyInteropResources, std::forward<T>(x));
         return *this;
     }
@@ -1221,6 +1258,7 @@ private:
     template<typename T>
         requires ResourceLike<T>
     RenderPassBuilder& addInternalTransition(T&& x, ResourceState exitState)& {
+        detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
         detail::AppendInternalTransition(graph, _declaredIds, params.internalTransitions, std::forward<T>(x), exitState);
         return *this;
     }
@@ -1558,6 +1596,7 @@ private:
 	template<typename T>
         requires ResourceLike<T>
 	ComputePassBuilder& addShaderResource(T&& x) {
+        detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
     detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorShaderResources, x, DescriptorType::SRV);
         detail::AppendTrackedResource(graph, _declaredIds, params.shaderResources, std::forward<T>(x));
 		return *this;
@@ -1576,6 +1615,7 @@ private:
 	template<typename T>
         requires ResourceLike<T>
 	ComputePassBuilder& addConstantBuffer(T&& x) {
+        detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
     detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorConstantBuffers, x, DescriptorType::CBV);
         detail::AppendTrackedResource(graph, _declaredIds, params.constantBuffers, std::forward<T>(x));
 		return *this;
@@ -1594,6 +1634,7 @@ private:
 	template<typename T>
         requires ResourceLike<T>
 	ComputePassBuilder& addUnorderedAccess(T&& x) {
+        detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
     detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorUnorderedAccessViews, x, DescriptorType::UAV);
         detail::AppendTrackedResource(graph, _declaredIds, params.unorderedAccessViews, std::forward<T>(x));
 		return *this;
@@ -1612,6 +1653,7 @@ private:
 	template<typename T>
         requires ResourceLike<T>
 	ComputePassBuilder& addIndirectArguments(T&& x) {
+        detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.indirectArgumentBuffers, std::forward<T>(x));
 		return *this;
 	}
@@ -1629,6 +1671,7 @@ private:
     template<typename T>
         requires ResourceLike<T>
     ComputePassBuilder& addLegacyInterop(T&& x) {
+        detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.legacyInteropResources, std::forward<T>(x));
         return *this;
     }
@@ -1656,6 +1699,7 @@ private:
     template<typename T>
         requires ResourceLike<T>
     ComputePassBuilder& addInternalTransition(T&& x, ResourceState exitState)& {
+        detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
         detail::AppendInternalTransition(graph, _declaredIds, params.internalTransitions, std::forward<T>(x), exitState);
         return *this;
     }
@@ -1902,6 +1946,7 @@ private:
     template<typename T>
         requires ResourceLike<T>
     CopyPassBuilder& addCopyDest(T&& x) {
+        detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.copyTargets, std::forward<T>(x));
         return *this;
     }
@@ -1919,6 +1964,7 @@ private:
     template<typename T>
         requires ResourceLike<T>
     CopyPassBuilder& addCopySource(T&& x) {
+        detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.copySources, std::forward<T>(x));
         return *this;
     }
@@ -1936,6 +1982,7 @@ private:
     template<typename T>
         requires ResourceLike<T>
     CopyPassBuilder& addInternalTransition(T&& x, ResourceState exitState)& {
+        detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
         detail::AppendInternalTransition(graph, _declaredIds, params.internalTransitions, std::forward<T>(x), exitState);
         return *this;
     }

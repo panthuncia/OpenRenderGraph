@@ -5,6 +5,7 @@
 #include <memory>
 #include <map>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
@@ -377,6 +378,38 @@ public:
         if (h.GetKey().idx >= slots.size()) return false;
         const Slot& s = slots[h.GetKey().idx];
         return s.alive && s.resource && s.generation == h.GetGeneration();
+    }
+
+    std::string DescribeHandle(RegistryHandle h) const {
+        std::ostringstream oss;
+        if (h.IsEphemeral()) {
+            oss << "ephemeral ptr=" << static_cast<const void*>(h.GetEphemeralPtr())
+                << " resourceId=" << h.GetGlobalResourceID();
+            return oss.str();
+        }
+
+        oss << "keyIdx=" << h.GetKey().idx
+            << " handleGeneration=" << h.GetGeneration()
+            << " handleEpoch=" << h.GetEpoch()
+            << " handleResourceId=" << h.GetGlobalResourceID();
+
+        if (h.GetKey().idx >= slots.size()) {
+            oss << " slot=<out-of-range>";
+            return oss.str();
+        }
+
+        const Slot& s = slots[h.GetKey().idx];
+        const auto shared = s.resource.lock_shared();
+        oss << " slotAlive=" << (s.alive ? 1 : 0)
+            << " slotGeneration=" << s.generation
+            << " slotId='" << s.id.ToString() << "'"
+            << " slotRawPointer=" << static_cast<const void*>(s.rawPointer)
+            << " slotHasResource=" << (shared ? 1 : 0);
+        if (shared) {
+            oss << " slotResourceId=" << shared->GetGlobalResourceID()
+                << " slotResourceName='" << shared->GetName() << "'";
+        }
+        return oss.str();
     }
 
     // Unchecked: no declared-prefix enforcement. For RenderGraph/internal use.

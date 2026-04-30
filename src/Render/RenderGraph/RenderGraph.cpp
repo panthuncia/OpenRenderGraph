@@ -405,6 +405,9 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 					spdlog::info("RG structural materialize render pass='{}' referenced resources complete", d.name);
 				}
 			}
+			par.retainedAnonymousKeepAlive = CaptureRetainedAnonymousKeepAlive(
+				par.resources.staticResourceRequirements,
+				par.resources.internalTransitions);
 		}
 
 		if (callSetup) {
@@ -472,6 +475,9 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 					spdlog::info("RG structural materialize compute pass='{}' referenced resources complete", d.name);
 				}
 			}
+			par.retainedAnonymousKeepAlive = CaptureRetainedAnonymousKeepAlive(
+				par.resources.staticResourceRequirements,
+				par.resources.internalTransitions);
 		}
 
 		if (callSetup) {
@@ -536,6 +542,9 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 					spdlog::info("RG structural materialize copy pass='{}' referenced resources complete", d.name);
 				}
 			}
+			par.retainedAnonymousKeepAlive = CaptureRetainedAnonymousKeepAlive(
+				par.resources.staticResourceRequirements,
+				par.resources.internalTransitions);
 		}
 
 		if (callSetup) {
@@ -2389,8 +2398,9 @@ void RenderGraph::AddTransition(
 			}
 			return std::string("<unknown>");
 		}();
+		const std::string registryHandleInfo = _registry.DescribeHandle(resource);
 		spdlog::error(
-			"Invalid resource handle in RenderGraph::AddTransition: pass='{}' resourceId={} keyIdx={} generation={} epoch={} resourceName='{}' uploadQueueMatch='{}' range={} access={} layout={} sync={}",
+			"Invalid resource handle in RenderGraph::AddTransition: pass='{}' resourceId={} keyIdx={} generation={} epoch={} resourceName='{}' uploadQueueMatch='{}' registryHandleInfo='{}' range={} access={} layout={} sync={}",
 			passName,
 			resource.GetGlobalResourceID(),
 			resource.GetKey().idx,
@@ -2398,6 +2408,7 @@ void RenderGraph::AddTransition(
 			resource.GetEpoch(),
 			resourceName,
 			uploadQueueMatch.empty() ? std::string("<none>") : uploadQueueMatch,
+			registryHandleInfo,
 			FormatRangeSpec(requirement.range),
 			static_cast<uint32_t>(requiredState.access),
 			static_cast<uint32_t>(requiredState.layout),
@@ -3128,6 +3139,47 @@ void RenderGraph::MaterializeReferencedResources(
 	}
 }
 
+std::vector<std::shared_ptr<Resource>> RenderGraph::CaptureRetainedAnonymousKeepAlive(
+	const std::vector<ResourceRequirement>& resourceRequirements,
+	const std::vector<std::pair<ResourceHandleAndRange, ResourceState>>& internalTransitions) const
+{
+	std::vector<std::shared_ptr<Resource>> keepAlive;
+	std::unordered_set<uint64_t> seenResourceIDs;
+	seenResourceIDs.reserve(resourceRequirements.size() + internalTransitions.size());
+
+	auto maybeCapture = [&](const ResourceRegistry::RegistryHandle& handle) {
+		if (handle.IsEphemeral() || !_registry.IsAnonymous(handle)) {
+			return;
+		}
+
+		const Resource* resource = _registry.Resolve(handle);
+		if (!resource) {
+			return;
+		}
+
+		auto shared = std::const_pointer_cast<Resource>(resource->weak_from_this().lock());
+		if (!shared) {
+			return;
+		}
+
+		if (!seenResourceIDs.insert(shared->GetGlobalResourceID()).second) {
+			return;
+		}
+
+		keepAlive.push_back(std::move(shared));
+	};
+
+	for (const auto& req : resourceRequirements) {
+		maybeCapture(req.resourceHandleAndRange.resource);
+	}
+
+	for (const auto& transition : internalTransitions) {
+		maybeCapture(transition.first.resource);
+	}
+
+	return keepAlive;
+}
+
 void RenderGraph::CollectFrameResourceIDs(std::unordered_set<uint64_t>& used) const {
 	ZoneScopedN("RenderGraph::CollectFrameResourceIDs");
 	used.clear();
@@ -3804,6 +3856,9 @@ void RenderGraph::RefreshRetainedDeclarationsForFrame(RenderPassAndResources& p,
 
 	// Transfer resolver snapshots for auto-invalidation tracking
 	p.resolverSnapshots = b.TakeResolverSnapshots();
+	p.retainedAnonymousKeepAlive = CaptureRetainedAnonymousKeepAlive(
+		p.resources.staticResourceRequirements,
+		p.resources.internalTransitions);
 
 	// Ensure the pass's view matches the refreshed identifier set
 	p.pass->SetResourceRegistryView(
@@ -3857,6 +3912,9 @@ void RenderGraph::RefreshRetainedDeclarationsForFrame(ComputePassAndResources& p
 
 	// Transfer resolver snapshots for auto-invalidation tracking
 	p.resolverSnapshots = b.TakeResolverSnapshots();
+	p.retainedAnonymousKeepAlive = CaptureRetainedAnonymousKeepAlive(
+		p.resources.staticResourceRequirements,
+		p.resources.internalTransitions);
 
 	p.pass->SetResourceRegistryView(
 		std::make_unique<ResourceRegistryView>(_registry, p.resources.identifierSet),
@@ -3907,6 +3965,9 @@ void RenderGraph::RefreshRetainedDeclarationsForFrame(CopyPassAndResources& p, u
 
 	// Transfer resolver snapshots for auto-invalidation tracking
 	p.resolverSnapshots = b.TakeResolverSnapshots();
+	p.retainedAnonymousKeepAlive = CaptureRetainedAnonymousKeepAlive(
+		p.resources.staticResourceRequirements,
+		p.resources.internalTransitions);
 
 	p.pass->SetResourceRegistryView(
 		std::make_unique<ResourceRegistryView>(_registry, p.resources.identifierSet)
@@ -3944,6 +4005,34 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		for (const auto& snap : p.resolverSnapshots) {
 			uint64_t cv = snap.resolver->GetContentVersion();
 			if (cv != 0 && cv != snap.version) {
+				return true;
+			}
+		}
+
+		auto hasInvalidCachedHandle = [&](const auto& resourceHandleAndRange, const char* sourceKind) -> bool {
+			const auto& resource = resourceHandleAndRange.resource;
+			if (resource.IsEphemeral() || _registry.IsValid(resource)) {
+				return false;
+			}
+
+			spdlog::warn(
+				"RG frame {} forcing retained declaration refresh for pass '{}' due to stale cached {} handle: resourceId={} registryHandleInfo='{}'",
+				frameIndex,
+				p.name,
+				sourceKind,
+				resource.GetGlobalResourceID(),
+				_registry.DescribeHandle(resource));
+			return true;
+		};
+
+		for (const auto& req : p.resources.staticResourceRequirements) {
+			if (hasInvalidCachedHandle(req.resourceHandleAndRange, "requirement")) {
+				return true;
+			}
+		}
+
+		for (const auto& transition : p.resources.internalTransitions) {
+			if (hasInvalidCachedHandle(transition.first, "internal-transition")) {
 				return true;
 			}
 		}
@@ -5638,6 +5727,9 @@ void RenderGraph::AddRenderPass(std::shared_ptr<RenderPass> pass, RenderPassPara
 	passAndResources.resources = resources;
 	passAndResources.name = name;
 	passAndResources.techniquePath = GetTechniquePathForPassName(name);
+	passAndResources.retainedAnonymousKeepAlive = CaptureRetainedAnonymousKeepAlive(
+		passAndResources.resources.staticResourceRequirements,
+		passAndResources.resources.internalTransitions);
 	passAndResources.resolverSnapshots = std::move(resolverSnapshots);
 	AnyPassAndResources passAndResourcesAny;
 	passAndResourcesAny.type = PassType::Render;
@@ -5655,6 +5747,9 @@ void RenderGraph::AddComputePass(std::shared_ptr<ComputePass> pass, ComputePassP
 	passAndResources.resources = resources;
 	passAndResources.name = name;
 	passAndResources.techniquePath = GetTechniquePathForPassName(name);
+	passAndResources.retainedAnonymousKeepAlive = CaptureRetainedAnonymousKeepAlive(
+		passAndResources.resources.staticResourceRequirements,
+		passAndResources.resources.internalTransitions);
 	passAndResources.resolverSnapshots = std::move(resolverSnapshots);
 	AnyPassAndResources passAndResourcesAny;
 	passAndResourcesAny.type = PassType::Compute;
@@ -5672,6 +5767,9 @@ void RenderGraph::AddCopyPass(std::shared_ptr<CopyPass> pass, CopyPassParameters
 	passAndResources.resources = resources;
 	passAndResources.name = name;
 	passAndResources.techniquePath = GetTechniquePathForPassName(name);
+	passAndResources.retainedAnonymousKeepAlive = CaptureRetainedAnonymousKeepAlive(
+		passAndResources.resources.staticResourceRequirements,
+		passAndResources.resources.internalTransitions);
 	passAndResources.resolverSnapshots = std::move(resolverSnapshots);
 	AnyPassAndResources passAndResourcesAny;
 	passAndResourcesAny.type = PassType::Copy;
