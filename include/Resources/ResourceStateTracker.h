@@ -114,7 +114,7 @@ public:
         ResourceState newState,
         std::vector<ResourceTransition>& out);
 
-    bool WouldModify(const RangeSpec& want, const ResourceState& newState) const;
+    bool WouldModify(const RangeSpec& want, const ResourceState& newState, bool hasLayout) const;
 
     std::vector<Segment> Flatten(ResourceState const& skipState, bool includeSkipState = false) const;
 

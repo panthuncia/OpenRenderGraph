@@ -330,6 +330,22 @@ namespace {
 			<< "] slice=[" << range.sliceLower.ToString() << ".." << range.sliceUpper.ToString() << "]";
 		return oss.str();
 	}
+
+	bool SubresourceRangesOverlap(const SubresourceRange& lhs, const SubresourceRange& rhs) noexcept {
+		if (lhs.isEmpty() || rhs.isEmpty()) {
+			return false;
+		}
+
+		const uint32_t lhsMipEnd = lhs.firstMip + lhs.mipCount;
+		const uint32_t rhsMipEnd = rhs.firstMip + rhs.mipCount;
+		const uint32_t lhsSliceEnd = lhs.firstSlice + lhs.sliceCount;
+		const uint32_t rhsSliceEnd = rhs.firstSlice + rhs.sliceCount;
+
+		return lhs.firstMip < rhsMipEnd
+			&& rhs.firstMip < lhsMipEnd
+			&& lhs.firstSlice < rhsSliceEnd
+			&& rhs.firstSlice < lhsSliceEnd;
+	}
 }
 
 
@@ -1934,7 +1950,7 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 
 	auto openNewBatch = [&]() -> PassBatch {
 		const size_t queueCount = rg.m_queueRegistry.SlotCount();
-		PassBatch b(queueCount);
+		PassBatch b(queueCount, rg.m_frameSchedulingResourceCount);
 		for (size_t qi = 0; qi < queueCount; ++qi) {
 			b.SetQueueSignalFenceValue(RenderGraph::BatchSignalPhase::AfterTransitions, qi, rg.GetNextQueueFenceValue(qi));
 			b.SetQueueSignalFenceValue(RenderGraph::BatchSignalPhase::AfterExecution, qi, rg.GetNextQueueFenceValue(qi));
@@ -2055,7 +2071,7 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 
 				if (rg.IsNewBatchNeeded(
 					passSummary,
-					currentBatch.passBatchTrackers,
+					currentBatch.passBatchTrackersByResourceIndex,
 					batchBuildState,
 					passes[n.passIndex].name,
 					currentBatchIndex,
@@ -2363,6 +2379,24 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 
 
 // Factory for the transition lambda
+void RenderGraph::AppendBatchTransition(
+	PassBatch& batch,
+	unsigned int batchIndex,
+	size_t queueSlot,
+	BatchTransitionPhase phase,
+	size_t resourceIndex,
+	const ResourceTransition& transition)
+{
+	auto& batchTransitions = batch.Transitions(queueSlot, phase);
+	batchTransitions.push_back(transition);
+	batch.RecordTransitionPosition(
+		queueSlot,
+		phase,
+		resourceIndex,
+		static_cast<uint32_t>(batchTransitions.size() - 1));
+	RecordFrameTransitionPlacementBatch(resourceIndex, batchIndex);
+}
+
 void RenderGraph::AddTransition(
 	unsigned int batchIndex,
 	PassBatch& currentBatch,
@@ -2421,7 +2455,96 @@ void RenderGraph::AddTransition(
 	if (pRes && !pRes->GetName().empty()) {
 		ZoneText(pRes->GetName().data(), pRes->GetName().size());
 	}
+	if (pRes && pRes->HasLayout() && !ValidateResourceLayoutAndAccessType(requiredState.layout, requiredState.access)) {
+		spdlog::error(
+			"Invalid texture state in RenderGraph::AddTransition: pass='{}' resource='{}' id={} range={} access={} layout={} sync={} queue={}.",
+			passName,
+			pRes->GetName(),
+			resource.GetGlobalResourceID(),
+			FormatRangeSpec(requirement.range),
+			rhi::helpers::ResourceAccessMaskToString(requiredState.access),
+			static_cast<uint32_t>(requiredState.layout),
+			static_cast<uint32_t>(requiredState.sync),
+			QueueKindToString(passQueue));
+		throw std::runtime_error("Invalid texture layout/access combination in RenderGraph::AddTransition");
+	}
 	auto& compileTracker = GetOrCreateCompileTracker(pRes, resource.GetGlobalResourceID());
+
+	auto widenLatestCompatibleTransition = [&]() {
+		auto widenInBatch = [&](PassBatch& batch) {
+			bool widened = false;
+			const auto wantedRange = pRes && pRes->HasLayout()
+				? ResolveRangeSpec(requirement.range, pRes->GetMipLevels(), pRes->GetArraySize())
+				: SubresourceRange{ 0, 1, 0, 1 };
+
+			for (size_t queueIndex = 0; queueIndex < batch.QueueCount(); ++queueIndex) {
+				for (size_t phaseIndex = 0; phaseIndex < static_cast<size_t>(BatchTransitionPhase::Count); ++phaseIndex) {
+					if (requirement.resourceIndex >= batch.TransitionIndexedResourceCount()) {
+						continue;
+					}
+
+					auto& batchTransitions = batch.Transitions(queueIndex, static_cast<BatchTransitionPhase>(phaseIndex));
+					for (uint32_t transitionPosition : batch.TransitionPositions(queueIndex, static_cast<BatchTransitionPhase>(phaseIndex), requirement.resourceIndex)) {
+						if (transitionPosition >= batchTransitions.size()) {
+							continue;
+						}
+
+						auto& existingTransition = batchTransitions[transitionPosition];
+						if (existingTransition.pResource != pRes) {
+							continue;
+						}
+
+						if (pRes && pRes->HasLayout()) {
+							const auto existingRange = ResolveRangeSpec(
+								existingTransition.range,
+								pRes->GetMipLevels(),
+								pRes->GetArraySize());
+							if (!SubresourceRangesOverlap(existingRange, wantedRange)) {
+								continue;
+							}
+						}
+
+						const auto combinedAccess = ComposeCompatibleAccessTypes(existingTransition.newAccessType, requiredState.access);
+						if (pRes && pRes->HasLayout()) {
+							if (existingTransition.newLayout != requiredState.layout) {
+								continue;
+							}
+
+							if (!ValidateResourceLayoutAndAccessType(existingTransition.newLayout, combinedAccess)) {
+								continue;
+							}
+						}
+
+						existingTransition.newAccessType = combinedAccess;
+						existingTransition.newSyncState |= requiredState.sync;
+						widened = true;
+					}
+				}
+			}
+
+			return widened;
+		};
+
+		if (widenInBatch(currentBatch)) {
+			return;
+		}
+
+		if (requirement.resourceIndex >= m_frameTransitionPlacementBatchesByResource.size()) {
+			return;
+		}
+
+		const auto& transitionBatchHistory = m_frameTransitionPlacementBatchesByResource[requirement.resourceIndex];
+		for (auto historyIt = transitionBatchHistory.rbegin(); historyIt != transitionBatchHistory.rend(); ++historyIt) {
+			const unsigned int priorBatchIndex = *historyIt;
+			if (priorBatchIndex == 0 || priorBatchIndex >= batchIndex) {
+				continue;
+			}
+
+			if (widenInBatch(batches[priorBatchIndex])) {
+				return;
+			}
+		}
+	};
 
 	bool isAliasActivation = false;
 	if (aliasActivationPending.find(resource.GetGlobalResourceID()) != aliasActivationPending.end()) {
@@ -2461,13 +2584,18 @@ void RenderGraph::AddTransition(
 	}
 	else {
 		compileTracker.Apply(requirement.range, pRes, requiredState, transitions);
+		if (transitions.empty()) {
+			widenLatestCompatibleTransition();
+		}
 	}
 
 	if (!transitions.empty()) {
 		outTransitionedResourceIDs.insert(resource.GetGlobalResourceID());
 	}
 
-	currentBatch.passBatchTrackers[resource.GetGlobalResourceID()] = &compileTracker; // We will need to check subsequent passes against this
+	if (requirement.resourceIndex < currentBatch.passBatchTrackersByResourceIndex.size()) {
+		currentBatch.passBatchTrackersByResourceIndex[requirement.resourceIndex] = &compileTracker;
+	}
 
 	if (transitions.empty()) {
 		return;
@@ -2533,7 +2661,7 @@ void RenderGraph::AddTransition(
 			PassBatch& targetBatch = batches[lastUseBatch];
 
 			for (auto& transition : transitions) {
-				targetBatch.Transitions(transitionSlot, BatchTransitionPhase::AfterPasses).push_back(transition);
+				AppendBatchTransition(targetBatch, lastUseBatch, transitionSlot, BatchTransitionPhase::AfterPasses, requirement.resourceIndex, transition);
 			}
 
 			// Signal AfterCompletion on the transition queue so downstream consumers can wait on it
@@ -2556,13 +2684,13 @@ void RenderGraph::AddTransition(
 		//   1. BeforeTransitions waits on Graphics for any prior non-graphics producers
 		//   2. AfterTransitions signal on Graphics so the consuming queue can wait
 		for (auto& transition : transitions) {
-			currentBatch.Transitions(gfxSlot, BatchTransitionPhase::BeforePasses).push_back(transition);
+			AppendBatchTransition(currentBatch, batchIndex, gfxSlot, BatchTransitionPhase::BeforePasses, requirement.resourceIndex, transition);
 		}
 		outFallbackResourceIndices.insert(requirement.resourceIndex);
 	}
 	else {
 		for (auto& transition : transitions) {
-			currentBatch.Transitions(passQueueSlot, BatchTransitionPhase::BeforePasses).push_back(transition);
+			AppendBatchTransition(currentBatch, batchIndex, passQueueSlot, BatchTransitionPhase::BeforePasses, requirement.resourceIndex, transition);
 		}
 	}
 }
@@ -2869,6 +2997,7 @@ void RenderGraph::ClearFrameSchedulingResourceIndex() {
 	m_frameQueueLastUsageBatch.clear();
 	m_frameQueueLastProducerBatch.clear();
 	m_frameQueueLastTransitionBatch.clear();
+	m_frameTransitionPlacementBatchesByResource.clear();
 	m_frameResourceEventSummaries.clear();
 }
 
@@ -2881,6 +3010,7 @@ void RenderGraph::ResetFrameQueueBatchHistoryTables() {
 	m_frameQueueLastUsageBatch.assign(entryCount, 0);
 	m_frameQueueLastProducerBatch.assign(entryCount, 0);
 	m_frameQueueLastTransitionBatch.assign(entryCount, 0);
+	m_frameTransitionPlacementBatchesByResource.assign(m_frameSchedulingResourceCount, {});
 	if (m_queueRegistry.SlotCount() <= 64) {
 		m_frameResourceEventSummaries.assign(m_frameSchedulingResourceCount, FrameResourceEventSummary{});
 	}
@@ -3048,6 +3178,26 @@ void RenderGraph::RecordFrameResourceEvent(size_t queueSlot, size_t resourceInde
 	if (batchIndex > summary.previousBatch) {
 		summary.previousBatch = batchIndex;
 		summary.previousQueueMask = queueMask;
+	}
+}
+
+void RenderGraph::RecordFrameTransitionPlacementBatch(size_t resourceIndex, unsigned int batchIndex) {
+	if (batchIndex == 0 || resourceIndex >= m_frameTransitionPlacementBatchesByResource.size()) {
+		return;
+	}
+
+	auto& batchHistory = m_frameTransitionPlacementBatchesByResource[resourceIndex];
+	if (batchHistory.empty() || batchHistory.back() < batchIndex) {
+		batchHistory.push_back(batchIndex);
+		return;
+	}
+	if (batchHistory.back() == batchIndex) {
+		return;
+	}
+
+	auto insertIt = std::lower_bound(batchHistory.begin(), batchHistory.end(), batchIndex);
+	if (insertIt == batchHistory.end() || *insertIt != batchIndex) {
+		batchHistory.insert(insertIt, batchIndex);
 	}
 }
 
@@ -4080,7 +4230,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	{
 		ZoneScopedN("RenderGraph::CompileFrame::InitFramePassState");
 		batches.clear();
-		batches.emplace_back(m_queueRegistry.SlotCount()); // Dummy batch 0 for pre-first-pass transitions
+		batches.emplace_back(m_queueRegistry.SlotCount(), m_frameSchedulingResourceCount); // Dummy batch 0 for pre-first-pass transitions
 		m_framePasses.clear(); // Combined retained + immediate-mode passes for this frame
 	}
 
@@ -8016,7 +8166,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 
 bool RenderGraph::IsNewBatchNeeded(
 	const FramePassSchedulingSummary& passSummary,
-	const std::unordered_map<uint64_t, SymbolicTracker*>& passBatchTrackers,
+	const std::vector<SymbolicTracker*>& passBatchTrackersByResourceIndex,
 	const BatchBuildState& batchBuildState,
 	std::string_view candidatePassName,
 	unsigned int currentBatchIndex,
@@ -8057,12 +8207,10 @@ bool RenderGraph::IsNewBatchNeeded(
 
 	// For each subresource requirement in this pass:
 	for (const auto& requirement : passSummary.requirements) {
-		const uint64_t id = requirement.resourceID;
-
 		// Alias activations are emitted in BeforePasses of the consuming batch.
 		// Only reject same-batch merging when that activation would clobber an
 		// aliased-equivalent resource that is already live in the batch.
-		if (aliasActivationPending.find(id) != aliasActivationPending.end()
+		if (aliasActivationPending.find(requirement.resourceID) != aliasActivationPending.end()
 			&& (overlapsAliasedResourceInBatch(requirement) || overlapsAliasedTransitionInBatch(requirement))) {
 			return true;
 		}
@@ -8076,11 +8224,15 @@ bool RenderGraph::IsNewBatchNeeded(
 		}
 
 		ResourceState wantState{ requirement.state.access, requirement.state.layout, requirement.state.sync };
+		Resource* trackedResource = requirement.resource.IsEphemeral()
+			? requirement.resource.GetEphemeralPtr()
+			: _registry.Resolve(requirement.resource);
+		const bool hasLayout = trackedResource && trackedResource->HasLayout();
 
 		// Changing state?
-		auto it = passBatchTrackers.find(id);
-		if (it != passBatchTrackers.end()) {
-			if (it->second->WouldModify(requirement.range, wantState)) {
+		if (requirement.resourceIndex < passBatchTrackersByResourceIndex.size()) {
+			SymbolicTracker* tracker = passBatchTrackersByResourceIndex[requirement.resourceIndex];
+			if (tracker && tracker->WouldModify(requirement.range, wantState, hasLayout)) {
 				return true;
 			}
 		}

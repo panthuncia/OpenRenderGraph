@@ -204,7 +204,13 @@ static Bound unionUpper(const Bound &A, const Bound &B) {
 
 // 4) try to merge two segments; if successful, return the merged Segment
 static std::optional<Segment> tryMerge(Segment const &A, Segment const &B) {
-    if (!(A.state == B.state))
+    auto exactStateEqual = [](const ResourceState& lhs, const ResourceState& rhs) {
+        return lhs.access == rhs.access
+            && lhs.layout == rhs.layout
+            && lhs.sync == rhs.sync;
+    };
+
+    if (!exactStateEqual(A.state, B.state))
         return std::nullopt;
 
     // merge along the mip axis?
@@ -238,6 +244,72 @@ static std::optional<Segment> tryMerge(Segment const &A, Segment const &B) {
     }
 
     return std::nullopt;
+}
+
+static bool tryComposeCompatibleState(
+    const ResourceState& currentState,
+    const ResourceState& requestedState,
+    bool hasLayout,
+    ResourceState& outComposedState)
+{
+    auto shouldPreferDirectQueueLayout = [](const ResourceState& state) {
+        switch (state.layout) {
+        case rhi::ResourceLayout::RenderTarget:
+        case rhi::ResourceLayout::DepthReadWrite:
+        case rhi::ResourceLayout::DepthRead:
+        case rhi::ResourceLayout::DirectCommon:
+        case rhi::ResourceLayout::DirectGenericRead:
+        case rhi::ResourceLayout::DirectUnorderedAccess:
+        case rhi::ResourceLayout::DirectShaderResource:
+        case rhi::ResourceLayout::DirectCopySource:
+        case rhi::ResourceLayout::DirectCopyDest:
+            return true;
+        default:
+            break;
+        }
+
+        return rhi::ResourceSyncStateHasAny(
+            state.sync,
+            rhi::ResourceSyncState::Draw
+            | rhi::ResourceSyncState::IndexInput
+            | rhi::ResourceSyncState::VertexShading
+            | rhi::ResourceSyncState::PixelShading
+            | rhi::ResourceSyncState::DepthStencil
+            | rhi::ResourceSyncState::RenderTarget
+            | rhi::ResourceSyncState::AllShading);
+    };
+
+    if (currentState.access == requestedState.access && currentState.layout == requestedState.layout) {
+        outComposedState = currentState;
+        outComposedState.sync |= requestedState.sync;
+        return true;
+    }
+
+    if (AccessTypeIsWriteType(currentState.access) || AccessTypeIsWriteType(requestedState.access)) {
+        return false;
+    }
+
+    if (hasLayout && currentState.layout != requestedState.layout) {
+        return false;
+    }
+
+    const auto combinedAccess = ComposeCompatibleAccessTypes(currentState.access, requestedState.access);
+    rhi::ResourceLayout composedLayout = currentState.layout;
+    if (hasLayout) {
+        if (!ValidateResourceLayoutAndAccessType(currentState.layout, combinedAccess)) {
+            return false;
+        }
+    }
+    else if (currentState.layout != requestedState.layout) {
+        const bool preferDirectQueueLayout =
+            shouldPreferDirectQueueLayout(currentState) || shouldPreferDirectQueueLayout(requestedState);
+        composedLayout = AccessToLayout(combinedAccess, preferDirectQueueLayout);
+    }
+
+    outComposedState.access = combinedAccess;
+    outComposedState.layout = composedLayout;
+    outComposedState.sync = currentState.sync | requestedState.sync;
+    return true;
 }
 
 static void mergeSymbolic(std::vector<Segment> &segs) {
@@ -280,6 +352,7 @@ void SymbolicTracker::Apply(const RangeSpec& want,
     ResourceState newState,
     std::vector<ResourceTransition>& out)
 {
+    const bool hasLayout = pRes && pRes->HasLayout();
     std::vector<Segment> next;
     for (auto &seg : _segs) {
         auto cut = intersect(seg.rangeSpec, want);
@@ -291,8 +364,11 @@ void SymbolicTracker::Apply(const RangeSpec& want,
             for (auto &rem : subtract(seg.rangeSpec, cut))
                 next.push_back({ rem, seg.state });
 
-            // record a transition over 'cut' if state differs
-            if (!(seg.state == newState)) {
+            ResourceState composedState{};
+            if (tryComposeCompatibleState(seg.state, newState, hasLayout, composedState)) {
+                next.push_back({ cut, composedState });
+            }
+            else {
                 out.push_back({
                     pRes, // resource
                     cut,
@@ -303,23 +379,27 @@ void SymbolicTracker::Apply(const RangeSpec& want,
                     seg.state.sync,
                     newState.sync
                     });
+                next.push_back({ cut, newState });
             }
         }
     }
-
-    // insert the new-state segment
-    next.push_back({ want, newState });
 
     // merge back any adjacent segments with identical state & identical RangeSpec
     mergeSymbolic(next);
     _segs.swap(next);
 }
 
-bool SymbolicTracker::WouldModify(const RangeSpec& want, const ResourceState& newState) const {
+bool SymbolicTracker::WouldModify(const RangeSpec& want, const ResourceState& newState, bool hasLayout) const {
     for (auto const &seg : _segs) {
         auto cut = intersect(seg.rangeSpec, want);
-        if (!isEmpty(cut) && !(seg.state == newState))
+        if (isEmpty(cut)) {
+            continue;
+        }
+
+        ResourceState composedState{};
+        if (!tryComposeCompatibleState(seg.state, newState, hasLayout, composedState)) {
             return true;
+        }
     }
     return false;
 }

@@ -353,10 +353,16 @@ public:
 		static constexpr size_t kSignalPhaseCount = static_cast<size_t>(BatchSignalPhase::Count);
 		static constexpr size_t kTransitionPhaseCount = static_cast<size_t>(BatchTransitionPhase::Count);
 		using QueuedPass = std::variant<RenderPassAndResources*, ComputePassAndResources*, CopyPassAndResources*>;
+		using TransitionPositionList = std::vector<uint32_t>;
+		using TransitionIndexByResource = std::vector<TransitionPositionList>;
 
-		PassBatch(size_t queueCount = kQueueCount)
+		PassBatch(size_t queueCount = kQueueCount, size_t resourceCount = 0)
 			: queuePasses(queueCount) {
 			for (auto& v : queueTransitions) v.resize(queueCount);
+			for (auto& phaseBuckets : transitionPositionsByResource) {
+				phaseBuckets.assign(queueCount, TransitionIndexByResource(resourceCount));
+			}
+			passBatchTrackersByResourceIndex.assign(resourceCount, nullptr);
 			for (auto& p : queueWaitEnabled) p.assign(queueCount, std::vector<uint8_t>(queueCount, 0));
 			for (auto& p : queueWaitFenceValue) p.assign(queueCount, std::vector<UINT64>(queueCount, 0));
 			for (auto& p : queueSignalEnabled) p.assign(queueCount, 0);
@@ -364,9 +370,16 @@ public:
 		}
 
 		size_t QueueCount() const noexcept { return queuePasses.size(); }
+		size_t TransitionIndexedResourceCount() const noexcept {
+			if (transitionPositionsByResource.empty() || transitionPositionsByResource.front().empty()) {
+				return 0;
+			}
+			return transitionPositionsByResource.front().front().size();
+		}
 
 		std::vector<std::vector<QueuedPass>> queuePasses;
 		std::array<std::vector<std::vector<ResourceTransition>>, kTransitionPhaseCount> queueTransitions;
+		std::array<std::vector<TransitionIndexByResource>, kTransitionPhaseCount> transitionPositionsByResource;
 
 		// Resources that passes in this batch transition internally
 		// Cannot be batched with other passes which use these resources
@@ -486,6 +499,29 @@ public:
 			return !queueTransitions[TransitionPhaseIndex(phase)][qi].empty();
 		}
 
+		void ResetTransitionIndexes(size_t resourceCount) {
+			for (auto& phaseBuckets : transitionPositionsByResource) {
+				phaseBuckets.assign(QueueCount(), TransitionIndexByResource(resourceCount));
+			}
+			passBatchTrackersByResourceIndex.assign(resourceCount, nullptr);
+		}
+
+		void RecordTransitionPosition(size_t qi, BatchTransitionPhase phase, size_t resourceIndex, uint32_t transitionIndex) {
+			auto& byResource = transitionPositionsByResource[TransitionPhaseIndex(phase)][qi];
+			if (resourceIndex >= byResource.size()) {
+				return;
+			}
+			byResource[resourceIndex].push_back(transitionIndex);
+		}
+
+		TransitionPositionList& TransitionPositions(size_t qi, BatchTransitionPhase phase, size_t resourceIndex) {
+			return transitionPositionsByResource[TransitionPhaseIndex(phase)][qi][resourceIndex];
+		}
+
+		const TransitionPositionList& TransitionPositions(size_t qi, BatchTransitionPhase phase, size_t resourceIndex) const {
+			return transitionPositionsByResource[TransitionPhaseIndex(phase)][qi][resourceIndex];
+		}
+
 		void SetQueueSignalFenceValue(BatchSignalPhase phase, size_t qi, UINT64 fenceValue) {
 			queueSignalFenceValue[SignalPhaseIndex(phase)][qi] = fenceValue;
 		}
@@ -520,7 +556,7 @@ public:
 			return queueWaitFenceValue[WaitPhaseIndex(phase)][dst][src];
 		}
 
-		std::unordered_map<uint64_t, SymbolicTracker*> passBatchTrackers; // Trackers for the resources in this batch
+		std::vector<SymbolicTracker*> passBatchTrackersByResourceIndex; // Trackers for the resources in this batch, keyed by frame scheduling resource index
 	};
 
 	RenderGraph(rhi::Device device);
@@ -881,6 +917,7 @@ private:
 	std::vector<unsigned int> m_frameQueueLastUsageBatch;
 	std::vector<unsigned int> m_frameQueueLastProducerBatch;
 	std::vector<unsigned int> m_frameQueueLastTransitionBatch;
+	std::vector<std::vector<unsigned int>> m_frameTransitionPlacementBatchesByResource;
 	std::vector<FrameResourceEventSummary> m_frameResourceEventSummaries;
 	std::vector<FramePassSchedulingSummary> m_framePassSchedulingSummaries;
 	std::unordered_map<uint64_t, uint64_t> aliasPlacementPoolByID;
@@ -981,6 +1018,7 @@ private:
 	unsigned int GetFrameQueueHistoryValue(const std::vector<unsigned int>& history, size_t queueSlot, size_t resourceIndex) const;
 	void SetFrameQueueHistoryValue(std::vector<unsigned int>& history, size_t queueSlot, size_t resourceIndex, unsigned int batchIndex);
 	void RecordFrameResourceEvent(size_t queueSlot, size_t resourceIndex, unsigned int batchIndex);
+	void RecordFrameTransitionPlacementBatch(size_t resourceIndex, unsigned int batchIndex);
 	void RecordFrameQueueUsageBatch(size_t queueSlot, size_t resourceIndex, unsigned int batchIndex);
 	void RecordFrameQueueTransitionBatch(size_t queueSlot, size_t resourceIndex, unsigned int batchIndex);
 	std::pair<unsigned int, uint64_t> GetFrameResourceLastEventBeforeBatch(size_t resourceIndex, unsigned int batchIndex) const;
@@ -998,7 +1036,7 @@ private:
 	//void ComputeResourceLoops();
 	bool IsNewBatchNeeded(
 		const FramePassSchedulingSummary& passSummary,
-		const std::unordered_map<uint64_t, SymbolicTracker*>& passBatchTrackers,
+		const std::vector<SymbolicTracker*>& passBatchTrackersByResourceIndex,
 		const BatchBuildState& batchBuildState,
 		std::string_view candidatePassName,
 		unsigned int currentBatchIndex,
@@ -1134,6 +1172,13 @@ private:
 		std::unordered_set<uint64_t>& outTransitionedResourceIDs,
 		std::unordered_set<size_t>& outFallbackResourceIndices,
 		std::vector<ResourceTransition>& scratchTransitions);
+	void AppendBatchTransition(
+		PassBatch& batch,
+		unsigned int batchIndex,
+		size_t queueSlot,
+		BatchTransitionPhase phase,
+		size_t resourceIndex,
+		const ResourceTransition& transition);
 
 	static inline bool IsUAVState(const ResourceState& s) noexcept {
 		return ((s.access & rhi::ResourceAccessType::UnorderedAccess) != 0) ||
