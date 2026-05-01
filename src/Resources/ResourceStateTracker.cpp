@@ -134,42 +134,6 @@ static bool isEmpty(RangeSpec const &r) {
     return false;
 }
 
-// subtract the (assumed nonempty) 'cut' from 'orig', returning up to 4 remainders
-static std::vector<RangeSpec> subtract(RangeSpec orig, RangeSpec cut) {
-    std::vector<RangeSpec> out;
-    // left strip: all mips below cut.mipLower
-    if (boundLower(orig.mipLower) < boundLower(cut.mipLower)) {
-        RangeSpec r = orig;
-        r.mipUpper = { BoundType::UpTo, boundLower(cut.mipLower) - 1 };
-        if (!isEmpty(r)) out.push_back(r);
-    }
-    // right strip: all mips above cut.mipUpper
-    if (boundUpper(orig.mipUpper) > boundUpper(cut.mipUpper)) {
-        RangeSpec r = orig;
-        r.mipLower = { BoundType::From, boundUpper(cut.mipUpper) + 1 };
-        if (!isEmpty(r)) out.push_back(r);
-    }
-    // now the middle in the mip dimension
-    RangeSpec mid = orig;
-    mid.mipLower = maxLower(orig.mipLower, cut.mipLower);
-    mid.mipUpper = minUpper(orig.mipUpper, cut.mipUpper);
-
-    // top strip: slices below cut.sliceLower
-    if (boundLower(orig.sliceLower) < boundLower(cut.sliceLower)) {
-        RangeSpec r = mid;
-        r.sliceUpper = { BoundType::UpTo, boundLower(cut.sliceLower) - 1 };
-        if (!isEmpty(r)) out.push_back(r);
-    }
-    // bottom strip: slices above cut.sliceUpper
-    if (boundUpper(orig.sliceUpper) > boundUpper(cut.sliceUpper)) {
-        RangeSpec r = mid;
-        r.sliceLower = { BoundType::From, boundUpper(cut.sliceUpper) + 1 };
-        if (!isEmpty(r)) out.push_back(r);
-    }
-
-    return out;
-}
-
 static RangeSpec intersect(RangeSpec A, RangeSpec B) {
     return {
         maxLower(A.mipLower,   B.mipLower),
@@ -200,6 +164,76 @@ static Bound unionUpper(const Bound &A, const Bound &B) {
     return up == (std::numeric_limits<uint32_t>::max)()
         ? Bound{BoundType::All, 0}
     : Bound{BoundType::UpTo, uint32_t(up)};
+}
+
+static bool segmentLess(const Segment& L, const Segment& R) {
+    const auto tL = std::make_tuple(
+        boundLower(L.rangeSpec.sliceLower),
+        boundUpper(L.rangeSpec.sliceUpper),
+        boundLower(L.rangeSpec.mipLower),
+        boundUpper(L.rangeSpec.mipUpper));
+    const auto tR = std::make_tuple(
+        boundLower(R.rangeSpec.sliceLower),
+        boundUpper(R.rangeSpec.sliceUpper),
+        boundLower(R.rangeSpec.mipLower),
+        boundUpper(R.rangeSpec.mipUpper));
+    return tL < tR;
+}
+
+static void appendSegmentTrackingOrder(
+    std::vector<Segment>& out,
+    Segment seg,
+    bool& isOrdered)
+{
+    if (isOrdered && !out.empty() && segmentLess(seg, out.back())) {
+        isOrdered = false;
+    }
+
+    out.push_back(std::move(seg));
+}
+
+static void appendSubtractRemainders(
+    const RangeSpec& orig,
+    const RangeSpec& cut,
+    const ResourceState& state,
+    std::vector<Segment>& out,
+    bool& isOrdered)
+{
+    auto appendRange = [&](RangeSpec r) {
+        if (!isEmpty(r)) {
+            appendSegmentTrackingOrder(out, Segment{ std::move(r), state }, isOrdered);
+        }
+    };
+
+    // left strip: all mips below cut.mipLower
+    if (boundLower(orig.mipLower) < boundLower(cut.mipLower)) {
+        RangeSpec r = orig;
+        r.mipUpper = { BoundType::UpTo, boundLower(cut.mipLower) - 1 };
+        appendRange(std::move(r));
+    }
+    // right strip: all mips above cut.mipUpper
+    if (boundUpper(orig.mipUpper) > boundUpper(cut.mipUpper)) {
+        RangeSpec r = orig;
+        r.mipLower = { BoundType::From, boundUpper(cut.mipUpper) + 1 };
+        appendRange(std::move(r));
+    }
+
+    RangeSpec mid = orig;
+    mid.mipLower = maxLower(orig.mipLower, cut.mipLower);
+    mid.mipUpper = minUpper(orig.mipUpper, cut.mipUpper);
+
+    // top strip: slices below cut.sliceLower
+    if (boundLower(orig.sliceLower) < boundLower(cut.sliceLower)) {
+        RangeSpec r = mid;
+        r.sliceUpper = { BoundType::UpTo, boundLower(cut.sliceLower) - 1 };
+        appendRange(std::move(r));
+    }
+    // bottom strip: slices above cut.sliceUpper
+    if (boundUpper(orig.sliceUpper) > boundUpper(cut.sliceUpper)) {
+        RangeSpec r = mid;
+        r.sliceLower = { BoundType::From, boundUpper(cut.sliceUpper) + 1 };
+        appendRange(std::move(r));
+    }
 }
 
 // 4) try to merge two segments; if successful, return the merged Segment
@@ -312,24 +346,10 @@ static bool tryComposeCompatibleState(
     return true;
 }
 
-static void mergeSymbolic(std::vector<Segment> &segs) {
-    // sort by (sliceLower, sliceUpper, mipLower, mipUpper) numeric order
-    std::sort(segs.begin(), segs.end(),
-        [](auto const &L, auto const &R){
-            auto tL = std::make_tuple(
-                boundLower(L.rangeSpec.sliceLower),
-                boundUpper(L.rangeSpec.sliceUpper),
-                boundLower(L.rangeSpec.mipLower),
-                boundUpper(L.rangeSpec.mipUpper)
-            );
-            auto tR = std::make_tuple(
-                boundLower(R.rangeSpec.sliceLower),
-                boundUpper(R.rangeSpec.sliceUpper),
-                boundLower(R.rangeSpec.mipLower),
-                boundUpper(R.rangeSpec.mipUpper)
-            );
-            return tL < tR;
-        });
+static void mergeSymbolic(std::vector<Segment> &segs, bool alreadySorted) {
+    if (!alreadySorted) {
+        std::sort(segs.begin(), segs.end(), segmentLess);
+    }
 
     // sweep & merge
     std::vector<Segment> out;
@@ -354,19 +374,20 @@ void SymbolicTracker::Apply(const RangeSpec& want,
 {
     const bool hasLayout = pRes && pRes->HasLayout();
     std::vector<Segment> next;
+    next.reserve(_segs.size() * 2);
+    bool nextIsOrdered = true;
     for (auto &seg : _segs) {
         auto cut = intersect(seg.rangeSpec, want);
         if (isEmpty(cut)) {
             // no overlap: keep seg as-is
-            next.push_back(seg);
+            appendSegmentTrackingOrder(next, seg, nextIsOrdered);
         } else {
             // split seg by cut
-            for (auto &rem : subtract(seg.rangeSpec, cut))
-                next.push_back({ rem, seg.state });
+            appendSubtractRemainders(seg.rangeSpec, cut, seg.state, next, nextIsOrdered);
 
             ResourceState composedState{};
             if (tryComposeCompatibleState(seg.state, newState, hasLayout, composedState)) {
-                next.push_back({ cut, composedState });
+                appendSegmentTrackingOrder(next, Segment{ cut, composedState }, nextIsOrdered);
             }
             else {
                 out.push_back({
@@ -379,13 +400,13 @@ void SymbolicTracker::Apply(const RangeSpec& want,
                     seg.state.sync,
                     newState.sync
                     });
-                next.push_back({ cut, newState });
+                appendSegmentTrackingOrder(next, Segment{ cut, newState }, nextIsOrdered);
             }
         }
     }
 
     // merge back any adjacent segments with identical state & identical RangeSpec
-    mergeSymbolic(next);
+    mergeSymbolic(next, nextIsOrdered);
     _segs.swap(next);
 }
 

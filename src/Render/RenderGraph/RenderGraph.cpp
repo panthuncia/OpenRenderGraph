@@ -2411,10 +2411,15 @@ void RenderGraph::AddTransition(
 	const QueueKind passQueue = m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(passQueueSlot));
 
 	auto resource = requirement.resource;
-	const ResourceState requiredState = NormalizeStateForQueue(passQueue, requirement.state);
+	const ResourceState requiredState = [&]() {
+		ZoneScopedN("RenderGraph::AddTransition::NormalizeStateForQueue");
+		return NormalizeStateForQueue(passQueue, requirement.state);
+	}();
 
 	// If this triggers, you're probably queueing an operation on an external/ephemeral resource, and then discarding it before the graph can use it.
-	if (!resource.IsEphemeral() && !_registry.IsValid(resource)) {
+	{
+		ZoneScopedN("RenderGraph::AddTransition::ValidateResourceHandle");
+		if (!resource.IsEphemeral() && !_registry.IsValid(resource)) {
 		auto uploadQueueMatch = [&]() -> std::string {
 			if (passName != "Builtin::Uploads") {
 				return {};
@@ -2448,14 +2453,20 @@ void RenderGraph::AddTransition(
 			static_cast<uint32_t>(requiredState.layout),
 			static_cast<uint32_t>(requiredState.sync));
 		throw (std::runtime_error("Invalid resource handle in RenderGraph::AddTransition"));
+		}
 	}
 	scratchTransitions.clear();
 	auto& transitions = scratchTransitions;
-	auto pRes = _registry.Resolve(resource); // TODO: Can we get rid of pRes in transitions?
+	auto pRes = [&]() {
+		ZoneScopedN("RenderGraph::AddTransition::ResolveResource");
+		return _registry.Resolve(resource);
+	}(); // TODO: Can we get rid of pRes in transitions?
 	if (pRes && !pRes->GetName().empty()) {
 		ZoneText(pRes->GetName().data(), pRes->GetName().size());
 	}
-	if (pRes && pRes->HasLayout() && !ValidateResourceLayoutAndAccessType(requiredState.layout, requiredState.access)) {
+	{
+		ZoneScopedN("RenderGraph::AddTransition::ValidateTextureState");
+		if (pRes && pRes->HasLayout() && !ValidateResourceLayoutAndAccessType(requiredState.layout, requiredState.access)) {
 		spdlog::error(
 			"Invalid texture state in RenderGraph::AddTransition: pass='{}' resource='{}' id={} range={} access={} layout={} sync={} queue={}.",
 			passName,
@@ -2467,11 +2478,17 @@ void RenderGraph::AddTransition(
 			static_cast<uint32_t>(requiredState.sync),
 			QueueKindToString(passQueue));
 		throw std::runtime_error("Invalid texture layout/access combination in RenderGraph::AddTransition");
+		}
 	}
-	auto& compileTracker = GetOrCreateCompileTracker(pRes, resource.GetGlobalResourceID());
+	auto& compileTracker = [&]() -> SymbolicTracker& {
+		ZoneScopedN("RenderGraph::AddTransition::GetOrCreateCompileTracker");
+		return GetOrCreateCompileTracker(pRes, resource.GetGlobalResourceID());
+	}();
 
 	auto widenLatestCompatibleTransition = [&]() {
+		ZoneScopedN("RenderGraph::AddTransition::WidenLatestCompatibleTransition");
 		auto widenInBatch = [&](PassBatch& batch) {
+			ZoneScopedN("RenderGraph::AddTransition::WidenInBatch");
 			bool widened = false;
 			const auto wantedRange = pRes && pRes->HasLayout()
 				? ResolveRangeSpec(requirement.range, pRes->GetMipLevels(), pRes->GetArraySize())
@@ -2547,7 +2564,9 @@ void RenderGraph::AddTransition(
 	};
 
 	bool isAliasActivation = false;
-	if (aliasActivationPending.find(resource.GetGlobalResourceID()) != aliasActivationPending.end()) {
+	{
+		ZoneScopedN("RenderGraph::AddTransition::ResolveTransitions");
+		if (aliasActivationPending.find(resource.GetGlobalResourceID()) != aliasActivationPending.end()) {
 		isAliasActivation = true;
 		const bool firstUseIsWrite = AccessTypeIsWriteType(requirement.state.access);
 		const bool firstUseIsCommon = requirement.state.access == rhi::ResourceAccessType::Common;
@@ -2578,23 +2597,33 @@ void RenderGraph::AddTransition(
 		else {
 			throw std::runtime_error("Alias activation requires first use to be a write when explicit initialization is disabled");
 		}
-		std::vector<ResourceTransition> ignored;
-		compileTracker.Apply(requirement.range, pRes, requiredState, ignored);
+		{
+			ZoneScopedN("RenderGraph::AddTransition::AliasActivationApply");
+			std::vector<ResourceTransition> ignored;
+			compileTracker.Apply(requirement.range, pRes, requiredState, ignored);
+		}
 		aliasActivationPending.erase(resource.GetGlobalResourceID());
 	}
 	else {
-		compileTracker.Apply(requirement.range, pRes, requiredState, transitions);
+		{
+			ZoneScopedN("RenderGraph::AddTransition::TrackerApply");
+			compileTracker.Apply(requirement.range, pRes, requiredState, transitions);
+		}
 		if (transitions.empty()) {
 			widenLatestCompatibleTransition();
 		}
 	}
+	}
 
-	if (!transitions.empty()) {
+	{
+		ZoneScopedN("RenderGraph::AddTransition::UpdateBatchTrackerState");
+		if (!transitions.empty()) {
 		outTransitionedResourceIDs.insert(resource.GetGlobalResourceID());
 	}
 
 	if (requirement.resourceIndex < currentBatch.passBatchTrackersByResourceIndex.size()) {
 		currentBatch.passBatchTrackersByResourceIndex[requirement.resourceIndex] = &compileTracker;
+	}
 	}
 
 	if (transitions.empty()) {
@@ -2602,10 +2631,13 @@ void RenderGraph::AddTransition(
 	}
 
 	bool needsGraphicsQueueForTransitions = false;
-	for (auto& transition : transitions) {
-		if (!QueueSupportsTransition(passQueue, transition)) {
-			needsGraphicsQueueForTransitions = true;
-			break;
+	{
+		ZoneScopedN("RenderGraph::AddTransition::CheckQueueTransitionSupport");
+		for (auto& transition : transitions) {
+			if (!QueueSupportsTransition(passQueue, transition)) {
+				needsGraphicsQueueForTransitions = true;
+				break;
+			}
 		}
 	}
 
@@ -2617,17 +2649,20 @@ void RenderGraph::AddTransition(
 	// This reduces GPU idle time by allowing transitions to overlap with unrelated work on other queues.
 	// Skip alias activations - those must stay in the consuming batch (discard semantics at first use).
 	if (!isAliasActivation) {
+		ZoneScopedN("RenderGraph::AddTransition::TryEarlyPlacement");
 		unsigned int lastUseBatch = 0;
 		uint64_t lastUseQueueMask = 0;
 		bool requiresCrossQueuePlacementCoordination = false;
 		const bool canUseEventSummary = !m_frameResourceEventSummaries.empty();
 		if (canUseEventSummary) {
+			ZoneScopedN("RenderGraph::AddTransition::EarlyPlacementEventSummaryLookup");
 			std::tie(lastUseBatch, lastUseQueueMask) = GetFrameResourceLastEventBeforeBatch(requirement.resourceIndex, batchIndex);
 			requiresCrossQueuePlacementCoordination =
 				lastUseQueueMask != 0 &&
 				(lastUseQueueMask & ~(uint64_t{ 1 } << transitionSlot)) != 0;
 		}
 		else {
+			ZoneScopedN("RenderGraph::AddTransition::EarlyPlacementHistoryScan");
 			int scannedLastUseBatch = -1;
 			for (size_t qi = 0; qi < m_queueRegistry.SlotCount(); ++qi) {
 				const unsigned int usageBatch = GetFrameQueueHistoryValue(m_frameQueueLastUsageBatch, qi, requirement.resourceIndex);
@@ -2658,6 +2693,7 @@ void RenderGraph::AddTransition(
 		}
 
 		if (lastUseBatch > 0 && !requiresCrossQueuePlacementCoordination) { // > 0 to skip batch 0 (placeholder with no fence values)
+			ZoneScopedN("RenderGraph::AddTransition::PlaceTransitionsInPriorBatch");
 			PassBatch& targetBatch = batches[lastUseBatch];
 
 			for (auto& transition : transitions) {
@@ -2678,6 +2714,7 @@ void RenderGraph::AddTransition(
 
 	// Fallback: place in current batch's BeforePasses (existing behavior for first use or alias activations)
 	if (passQueue != QueueKind::Graphics && needsGraphicsQueueForTransitions) {
+		ZoneScopedN("RenderGraph::AddTransition::PlaceTransitionsOnGraphicsFallback");
 		// The consuming pass's queue can't support these transitions, so delegate
 		// them to the graphics queue within the *current* batch's BeforePasses phase.
 		// CommitPassToBatch will set up:
@@ -2689,6 +2726,7 @@ void RenderGraph::AddTransition(
 		outFallbackResourceIndices.insert(requirement.resourceIndex);
 	}
 	else {
+		ZoneScopedN("RenderGraph::AddTransition::PlaceTransitionsInCurrentBatch");
 		for (auto& transition : transitions) {
 			AppendBatchTransition(currentBatch, batchIndex, passQueueSlot, BatchTransitionPhase::BeforePasses, requirement.resourceIndex, transition);
 		}
