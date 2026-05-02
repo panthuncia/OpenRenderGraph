@@ -1082,6 +1082,14 @@ private:
 		auto operator<=>(const CachedBarrierSignalRef&) const = default;
 	};
 
+	struct CachedBarrierSignalToken {
+		unsigned int batch = 0;
+		uint16_t queueSlot = 0;
+		BatchSignalPhase phase = BatchSignalPhase::AfterCompletion;
+
+		auto operator<=>(const CachedBarrierSignalToken&) const = default;
+	};
+
 	struct CachedBarrierSignalOp {
 		CachedBarrierSignalRef signal;
 		UINT64 symbolicValue = 0;
@@ -1105,8 +1113,10 @@ private:
 		uint16_t srcQueueSlot = 0;
 		BatchWaitPhase phase = BatchWaitPhase::BeforeTransitions;
 		CachedBarrierSignalRef sourceSignal{};
+		CachedBarrierSignalToken globalSourceSignal{};
 		UINT64 symbolicValue = 0;
 		bool sourceSignalInSegment = false;
+		bool sourceSignalGlobalKnown = false;
 	};
 
 	struct CachedBatchMembership {
@@ -1315,6 +1325,7 @@ private:
 	uint64_t m_crossFrameProducerPublishSerial = 0;
 	std::vector<std::vector<uint8_t>> m_hasPendingFrameStartQueueWait;
 	std::vector<std::vector<UINT64>> m_pendingFrameStartQueueWaitFenceValue;
+	std::vector<UINT64> m_lastSubmittedSignalValueByQueue;
 
 	QueueRegistry m_queueRegistry;
 
@@ -1754,7 +1765,9 @@ private:
 	CachedBarrierSegmentReplay BuildCachedBarrierSegmentReplay(
 		const CompiledSegment& segment) const;
 	std::vector<PassBatch> BuildReplayedSegmentBatches(
-		const CompiledSegment& segment);
+		const CompiledSegment& segment,
+		const std::unordered_map<uint64_t, UINT64>* materializedSignalValuesByToken = nullptr,
+		const std::unordered_set<uint64_t>* materializedEnabledSignalTokens = nullptr);
 	std::vector<PassBatch> BuildReplayedFrameBatches();
 	void ApplyReplayedSegmentCompilerState(const CompiledSegment& segment);
 	void RefreshCompiledSegmentBoundaryMetadataFromReplay();
@@ -1764,7 +1777,7 @@ private:
 		std::vector<Node>& nodes,
 		const ScheduleIR& schedule,
 		unsigned int firstBatchToLower);
-	bool TryMaterializeReplayPrefixAndLowerSuffix(
+	bool TryMaterializeSegmentsWithReplayAndLowering(
 		RenderGraph& rg,
 		std::vector<AnyPassAndResources>& passes,
 		std::vector<Node>& nodes,
@@ -1802,6 +1815,8 @@ private:
 	std::function<bool()> m_getRenderGraphCompileDumpEnabled;
 	std::function<bool()> m_getRenderGraphVramDumpEnabled;
 	std::function<bool()> m_getRenderGraphBatchTraceEnabled;
+	std::function<bool()> m_getRenderGraphDisableCaching;
+	std::function<bool()> m_getRenderGraphQueueSyncTraceEnabled;
 	std::function<bool()> m_getAutoAliasEnableLogging;
 	std::function<bool()> m_getAutoAliasLogExclusionReasons;
 	std::function<bool()> m_getQueueSchedulingEnableLogging;

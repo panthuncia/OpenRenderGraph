@@ -23,6 +23,14 @@ public:
         return GetOpenRenderGraphSettings().renderGraphBatchTraceEnabled;
     }
 
+    bool GetRenderGraphDisableCaching() const override {
+        return GetOpenRenderGraphSettings().renderGraphDisableCaching;
+    }
+
+    bool GetRenderGraphQueueSyncTraceEnabled() const override {
+        return GetOpenRenderGraphSettings().renderGraphQueueSyncTraceEnabled;
+    }
+
     uint8_t GetAutoAliasMode() const override {
         return GetOpenRenderGraphSettings().autoAliasMode;
     }

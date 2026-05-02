@@ -78,6 +78,12 @@ public:
 		}
 	}
 
+	/// Restores the next fence value when rolling back a diagnostic compile path.
+	/// Runtime execution should use GetNextFenceValue/EnsureNextFenceValueAtLeast.
+	void RestoreNextFenceValueForDiagnostics(QueueSlotIndex i, uint64_t value) noexcept {
+		m_slots[ToUnderlying(i)].fenceValue = value;
+	}
+
 	/// Find any Graphics-kind queue slot (for transition fallback).
 	QueueSlotIndex FindGraphicsSlot() const noexcept;
 

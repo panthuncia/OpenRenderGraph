@@ -13,6 +13,8 @@ public:
     virtual bool GetRenderGraphCompileDumpEnabled() const = 0;
     virtual bool GetRenderGraphVramDumpEnabled() const = 0;
     virtual bool GetRenderGraphBatchTraceEnabled() const = 0;
+    virtual bool GetRenderGraphDisableCaching() const = 0;
+    virtual bool GetRenderGraphQueueSyncTraceEnabled() const = 0;
     virtual uint8_t GetAutoAliasMode() const = 0;
     virtual uint8_t GetAutoAliasPackingStrategy() const = 0;
     virtual bool GetAutoAliasEnableLogging() const = 0;
