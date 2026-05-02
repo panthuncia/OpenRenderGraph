@@ -399,6 +399,22 @@ public:
 			allResources.clear();
 		}
 
+		void ResetFrameVolatileStateForReplay(size_t queueCount) {
+			if (queuePasses.size() != queueCount) {
+				ResetForReplay(queueCount);
+				return;
+			}
+			for (auto& q : queuePasses) q.clear();
+			for (auto& p : queueWaitEnabled) {
+				for (auto& row : p) std::fill(row.begin(), row.end(), uint8_t{ 0 });
+			}
+			for (auto& p : queueWaitFenceValue) {
+				for (auto& row : p) std::fill(row.begin(), row.end(), UINT64{ 0 });
+			}
+			for (auto& p : queueSignalEnabled) std::fill(p.begin(), p.end(), uint8_t{ 0 });
+			for (auto& p : queueSignalFenceValue) std::fill(p.begin(), p.end(), UINT64{ 0 });
+		}
+
 		size_t QueueCount() const noexcept { return queuePasses.size(); }
 		size_t TransitionIndexedResourceCount() const noexcept {
 			if (transitionPositionsByResource.empty() || transitionPositionsByResource.front().empty()) {
@@ -1798,6 +1814,12 @@ private:
 		const std::unordered_map<uint64_t, UINT64>* materializedSignalValuesByToken = nullptr,
 		const std::unordered_set<uint64_t>* materializedEnabledSignalTokens = nullptr);
 	void ReplaySegmentIntoFrameBatches(
+		const CompiledSegmentDesc& desc,
+		const CompiledSegment& segment,
+		std::span<const PassBatch::QueuedPass> framePassPointers,
+		std::vector<UINT64>& materializedSignalValuesByToken,
+		std::vector<uint8_t>& materializedEnabledSignalTokens);
+	void PatchReplayedSegmentVolatileFrameBatches(
 		const CompiledSegmentDesc& desc,
 		const CompiledSegment& segment,
 		std::span<const PassBatch::QueuedPass> framePassPointers,
