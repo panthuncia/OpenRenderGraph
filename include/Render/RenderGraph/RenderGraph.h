@@ -767,6 +767,8 @@ private:
 		unsigned int previousBatch = 0;
 		uint64_t latestQueueMask = 0;
 		uint64_t previousQueueMask = 0;
+
+		bool operator==(const FrameResourceEventSummary&) const = default;
 	};
 
 	struct BatchBuildState {
@@ -1043,6 +1045,105 @@ private:
 		BarrierIR barriers;
 	};
 
+	struct CompiledSegmentDesc {
+		struct BoundaryStateEntry {
+			uint64_t resourceID = 0;
+			RangeSpec range{};
+			ResourceState state{};
+			uint64_t aliasSignature = 0;
+		};
+
+		uint64_t id = 0;
+		std::string name;
+		size_t firstPassStreamIndex = 0;
+		size_t passCount = 0;
+		unsigned int firstBatch = 0;
+		unsigned int lastBatch = 0;
+		std::vector<StablePassId> passes;
+		std::vector<uint64_t> touchedResourceIDs;
+		std::vector<BoundaryStateEntry> entryBoundaryStates;
+		std::vector<BoundaryStateEntry> exitBoundaryStates;
+		uint64_t segmentStructureHash = 0;
+		uint64_t passContentHash = 0;
+		uint64_t aliasSignatureHash = 0;
+		uint64_t queueAssignmentHash = 0;
+		uint64_t entryStateHash = 0;
+		uint64_t exitStateHash = 0;
+		uint64_t loweredRequirementCount = 0;
+		ScheduleIR schedule;
+	};
+
+	struct CachedBarrierSignalRef {
+		uint16_t localBatch = 0;
+		uint16_t queueSlot = 0;
+		BatchSignalPhase phase = BatchSignalPhase::AfterCompletion;
+
+		auto operator<=>(const CachedBarrierSignalRef&) const = default;
+	};
+
+	struct CachedBarrierSignalOp {
+		CachedBarrierSignalRef signal;
+		UINT64 symbolicValue = 0;
+		bool enabled = false;
+	};
+
+	struct CachedBarrierTransitionOp {
+		uint16_t localBatch = 0;
+		uint16_t queueSlot = 0;
+		BatchTransitionPhase phase = BatchTransitionPhase::BeforePasses;
+		uint64_t resourceID = 0;
+		RangeSpec range{};
+		ResourceState before{};
+		ResourceState after{};
+		bool discard = false;
+	};
+
+	struct CachedBarrierWaitOp {
+		uint16_t localBatch = 0;
+		uint16_t dstQueueSlot = 0;
+		uint16_t srcQueueSlot = 0;
+		BatchWaitPhase phase = BatchWaitPhase::BeforeTransitions;
+		CachedBarrierSignalRef sourceSignal{};
+		UINT64 symbolicValue = 0;
+		bool sourceSignalInSegment = false;
+	};
+
+	struct CachedBatchMembership {
+		uint16_t localBatch = 0;
+		std::vector<uint64_t> allResources;
+		std::vector<uint64_t> internallyTransitionedResources;
+	};
+
+	struct CachedHistoryEvent {
+		enum class Kind : uint8_t {
+			Usage,
+			Producer,
+			QueueTransition,
+			TransitionPlacement,
+		};
+
+		Kind kind = Kind::Usage;
+		uint16_t localBatch = 0;
+		uint16_t queueSlot = 0;
+		uint64_t resourceID = 0;
+	};
+
+	struct CachedResourceEvent {
+		uint16_t localBatch = 0;
+		uint16_t queueSlot = 0;
+		uint64_t resourceID = 0;
+	};
+
+	struct CachedBarrierSegmentReplay {
+		uint32_t localBatchCount = 0;
+		std::vector<CachedBarrierSignalOp> signals;
+		std::vector<CachedBarrierTransitionOp> transitions;
+		std::vector<CachedBarrierWaitOp> waits;
+		std::vector<CachedBatchMembership> batchMembership;
+		std::vector<CachedHistoryEvent> historyEvents;
+		std::vector<CachedResourceEvent> resourceEvents;
+	};
+
 	struct CompiledSegment {
 		uint64_t id = 0;
 		std::string name;
@@ -1051,6 +1152,9 @@ private:
 		unsigned int firstBatch = 0;
 		unsigned int lastBatch = 0;
 		std::vector<StablePassId> passes;
+		std::vector<uint64_t> touchedResourceIDs;
+		std::vector<CompiledSegmentDesc::BoundaryStateEntry> entryBoundaryStates;
+		std::vector<CompiledSegmentDesc::BoundaryStateEntry> exitBoundaryStates;
 		uint64_t segmentStructureHash = 0;
 		uint64_t passContentHash = 0;
 		uint64_t aliasSignatureHash = 0;
@@ -1064,6 +1168,7 @@ private:
 		std::string barrierReuseReason;
 		ScheduleIR schedule;
 		BarrierIR barriers;
+		CachedBarrierSegmentReplay replay;
 	};
 
 	struct CompileReuseEvent {
@@ -1124,12 +1229,19 @@ private:
 	std::unordered_map<uint64_t, rg::alias::AliasPlacementRange> schedulingPlacementRangesByID;
 	std::unordered_map<uint64_t, std::vector<uint64_t>> m_schedulingEquivalentIDsCache;
 	std::unordered_map<uint64_t, size_t> m_frameSchedulingResourceIndexByID;
+	std::vector<uint64_t> m_frameSchedulingResourceIDsByIndex;
 	size_t m_frameSchedulingResourceCount = 0;
 	std::vector<unsigned int> m_frameQueueLastUsageBatch;
 	std::vector<unsigned int> m_frameQueueLastProducerBatch;
 	std::vector<unsigned int> m_frameQueueLastTransitionBatch;
 	std::vector<std::vector<unsigned int>> m_frameTransitionPlacementBatchesByResource;
 	std::vector<FrameResourceEventSummary> m_frameResourceEventSummaries;
+	struct FrameResourceEventRecord {
+		unsigned int batchIndex = 0;
+		uint16_t queueSlot = 0;
+		uint64_t resourceID = 0;
+	};
+	std::vector<FrameResourceEventRecord> m_frameResourceEventLog;
 	std::vector<FramePassSchedulingSummary> m_framePassSchedulingSummaries;
 	FrameProgram m_compiledFrameProgram;
 	std::unordered_map<uint64_t, ResourceAccessChain> m_resourceAccessChains;
@@ -1473,6 +1585,17 @@ private:
 		std::vector<AnyPassAndResources>& passes,
 		std::vector<Node>& nodes,
 		const BarrierLoweringInput& input);
+	std::vector<CompiledSegmentDesc> BuildCompiledSegmentDescriptorsFromSchedule(
+		const ScheduleIR& schedule) const;
+	CachedBarrierSegmentReplay BuildCachedBarrierSegmentReplay(
+		const CompiledSegment& segment) const;
+	std::vector<PassBatch> BuildReplayedSegmentBatches(
+		const CompiledSegment& segment);
+	std::vector<PassBatch> BuildReplayedFrameBatches();
+	void ValidateReplayedSegmentBatches(
+		const CompiledSegment& segment,
+		const std::vector<PassBatch>& replayedBatches) const;
+	void ValidateCompiledFrameReplay();
 	void FinalizeBatchesFromIR(
 		RenderGraph& rg,
 		std::vector<AnyPassAndResources>& passes,
