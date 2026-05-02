@@ -1798,9 +1798,14 @@ private:
 		const std::unordered_map<uint64_t, UINT64>* materializedSignalValuesByToken = nullptr,
 		const std::unordered_set<uint64_t>* materializedEnabledSignalTokens = nullptr);
 	void ReplaySegmentIntoFrameBatches(
+		const CompiledSegmentDesc& desc,
 		const CompiledSegment& segment,
+		std::span<const PassBatch::QueuedPass> framePassPointers,
 		std::vector<UINT64>& materializedSignalValuesByToken,
 		std::vector<uint8_t>& materializedEnabledSignalTokens);
+	void ApplyReplayedSegmentCompilerState(
+		const CompiledSegmentDesc& desc,
+		const CompiledSegment& segment);
 	std::vector<PassBatch> BuildReplayedFrameBatches();
 	void ApplyReplayedSegmentCompilerState(const CompiledSegment& segment);
 	void RefreshCompiledSegmentBoundaryMetadataFromReplay();
