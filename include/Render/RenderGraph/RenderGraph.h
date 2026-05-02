@@ -883,6 +883,154 @@ private:
 		uint32_t criticality = 0;
 	};
 
+	struct StablePassId {
+		uint64_t value = 0;
+	};
+
+	enum class NormalizedAccessKind : uint8_t {
+		Read,
+		Write
+	};
+
+	struct NormalizedAccess {
+		uint64_t resourceID = 0;
+		size_t resourceIndex = 0;
+		RangeSpec range{};
+		ResourceState state{};
+		NormalizedAccessKind accessKind = NormalizedAccessKind::Read;
+		bool isUAV = false;
+		bool isInternalTransition = false;
+		uint64_t hash = 0;
+	};
+
+	struct PassIR {
+		StablePassId id{};
+		std::string name;
+		PassType type = PassType::Unknown;
+		PassRunMask run = PassRunMask::None;
+		QueueKind preferredQueueKind = QueueKind::Graphics;
+		QueueAssignmentPolicy queuePolicy = QueueAssignmentPolicy::ForcePreferred;
+		std::optional<QueueSlotIndex> pinnedQueueSlot;
+		std::vector<NormalizedAccess> accesses;
+		std::vector<NormalizedAccess> internalTransitions;
+		uint64_t declarationHash = 0;
+		uint64_t immediateHash = 0;
+		uint64_t queuePolicyHash = 0;
+		uint64_t resourceGenerationHash = 0;
+		uint64_t aliasPolicyHash = 0;
+		uint64_t fullHash = 0;
+	};
+
+	struct FrameProgram {
+		std::vector<PassIR> passes;
+		uint64_t structureHash = 0;
+		uint64_t passContentHash = 0;
+		size_t normalizedAccessCount = 0;
+	};
+
+	enum class EdgeKind : uint8_t {
+		Explicit,
+		ResourceHazard,
+		AliasHazard,
+		StructuralOrder
+	};
+
+	struct DependencyEdgeIR {
+		size_t fromPassIndex = 0;
+		size_t toPassIndex = 0;
+		EdgeKind kind = EdgeKind::ResourceHazard;
+		uint64_t resourceID = 0;
+		uint64_t provenanceKey = 0;
+	};
+
+	struct ResourceAccessEvent {
+		size_t passIndex = 0;
+		uint64_t resourceID = 0;
+		AccessKind accessKind = AccessKind::Read;
+		uint64_t stateHash = 0;
+	};
+
+	struct ResourceAccessChain {
+		uint64_t resourceID = 0;
+		std::vector<ResourceAccessEvent> events;
+		std::vector<DependencyEdgeIR> producedEdges;
+		uint64_t chainHash = 0;
+	};
+
+	struct ScheduledPass {
+		size_t nodeIndex = 0;
+		size_t passIndex = 0;
+		size_t queueSlot = 0;
+		unsigned int symbolicBatch = 0;
+	};
+
+	struct SymbolicBatchIR {
+		unsigned int id = 0;
+		std::vector<ScheduledPass> passes;
+		std::vector<uint8_t> queueHasWork;
+	};
+
+	struct ScheduleIR {
+		std::vector<SymbolicBatchIR> batches;
+		std::vector<ScheduledPass> passStream;
+		uint64_t structureHash = 0;
+		uint64_t queueAssignmentHash = 0;
+	};
+
+	struct SymbolicFenceToken {
+		unsigned int batch = 0;
+		size_t queueSlot = 0;
+		BatchSignalPhase phase = BatchSignalPhase::AfterCompletion;
+		UINT64 symbolicValue = 0;
+	};
+
+	struct BarrierIR {
+		std::vector<SymbolicFenceToken> signals;
+		uint64_t transitionHash = 0;
+		uint64_t waitHash = 0;
+	};
+
+	struct BarrierLoweringInput {
+		const ScheduleIR* schedule = nullptr;
+	};
+
+	struct BarrierLoweringOutput {
+		BarrierIR barriers;
+	};
+
+	struct CompiledSegment {
+		uint64_t id = 0;
+		std::string name;
+		size_t firstPassStreamIndex = 0;
+		size_t passCount = 0;
+		unsigned int firstBatch = 0;
+		unsigned int lastBatch = 0;
+		std::vector<StablePassId> passes;
+		uint64_t segmentStructureHash = 0;
+		uint64_t passContentHash = 0;
+		uint64_t aliasSignatureHash = 0;
+		uint64_t queueAssignmentHash = 0;
+		uint64_t entryStateHash = 0;
+		uint64_t exitStateHash = 0;
+		uint64_t cacheKey = 0;
+		bool barrierCacheHit = false;
+		ScheduleIR schedule;
+		BarrierIR barriers;
+	};
+
+	struct CompileCacheStats {
+		uint64_t passIRCount = 0;
+		uint64_t passIRCacheHits = 0;
+		uint64_t passIRCacheMisses = 0;
+		uint64_t scheduleCacheHits = 0;
+		uint64_t scheduleCacheMisses = 0;
+		uint64_t normalizedAccessCount = 0;
+		uint64_t segmentCount = 0;
+		uint64_t barrierSegmentCacheHits = 0;
+		uint64_t barrierSegmentCacheMisses = 0;
+		uint64_t loweredRequirementCount = 0;
+	};
+
 	std::vector<IResourceProvider*> _providers;
 	ResourceRegistry _registry;
 	std::unordered_map<ResourceIdentifier, IResourceProvider*, ResourceIdentifier::Hasher> _providerMap;
@@ -920,6 +1068,16 @@ private:
 	std::vector<std::vector<unsigned int>> m_frameTransitionPlacementBatchesByResource;
 	std::vector<FrameResourceEventSummary> m_frameResourceEventSummaries;
 	std::vector<FramePassSchedulingSummary> m_framePassSchedulingSummaries;
+	FrameProgram m_compiledFrameProgram;
+	std::unordered_map<uint64_t, ResourceAccessChain> m_resourceAccessChains;
+	std::vector<DependencyEdgeIR> m_dependencyEdgeIR;
+	ScheduleIR m_compiledScheduleIR;
+	BarrierIR m_compiledBarrierIR;
+	std::vector<CompiledSegment> m_compiledSegments;
+	std::unordered_map<uint64_t, PassIR> m_cachedPassIRByStableId;
+	std::unordered_map<uint64_t, ScheduleIR> m_cachedScheduleIRByKey;
+	std::unordered_map<uint64_t, CompiledSegment> m_cachedBarrierSegments;
+	CompileCacheStats m_compileCacheStats;
 	std::unordered_map<uint64_t, uint64_t> aliasPlacementPoolByID;
 	std::unordered_set<uint64_t> aliasActivationPending;
 
@@ -1010,6 +1168,10 @@ private:
 	void RebuildSchedulingEquivalentIDCache(const std::unordered_set<uint64_t>& resourceIDs);
 	void RebuildFrameSchedulingResourceIndex(const std::unordered_set<uint64_t>& resourceIDs);
 	void RebuildFramePassSchedulingSummaries();
+	void BuildFrameProgramIR();
+	void BuildResourceAccessChainIR(
+		const std::vector<Node>& nodes,
+		std::span<const std::pair<size_t, size_t>> explicitEdges);
 	void ClearFrameSchedulingResourceIndex();
 	void ClearFramePassSchedulingSummaries();
 	void ResetFrameQueueBatchHistoryTables();
@@ -1219,6 +1381,30 @@ private:
 		std::unordered_set<uint64_t>& scratchTransitioned,
 		std::unordered_set<size_t>& scratchFallback,
 		std::vector<ResourceTransition>& scratchTransitions);
+	void SimulatePassForSchedule(
+		const Node& node,
+		BatchBuildState& batchBuildState,
+		std::vector<SymbolicTracker*>& passBatchTrackersByResourceIndex,
+		std::vector<ResourceTransition>& scratchTransitions);
+	ScheduleIR BuildScheduleIR(
+		RenderGraph& rg,
+		std::vector<AnyPassAndResources>& passes,
+		std::vector<Node>& nodes);
+	BarrierLoweringOutput LowerBarriers(
+		RenderGraph& rg,
+		std::vector<AnyPassAndResources>& passes,
+		std::vector<Node>& nodes,
+		const BarrierLoweringInput& input);
+	void FinalizeBatchesFromIR(
+		RenderGraph& rg,
+		std::vector<AnyPassAndResources>& passes,
+		const ScheduleIR& schedule,
+		const BarrierIR& barriers);
+	void BuildCompiledSegments(
+		const ScheduleIR& schedule,
+		const BarrierIR& barriers);
+	void CoalesceQueueWaits();
+	void BuildCrossFrameProducerTracking(const std::vector<AnyPassAndResources>& passes);
 	void AutoScheduleAndBuildBatches(
 		RenderGraph& rg,
 		std::vector<AnyPassAndResources>& passes,
