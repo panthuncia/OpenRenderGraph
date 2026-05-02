@@ -370,6 +370,35 @@ public:
 			for (auto& p : queueSignalFenceValue) p.assign(queueCount, 0);
 		}
 
+		void ResetForReplay(size_t queueCount) {
+			if (queuePasses.size() != queueCount) {
+				queuePasses.assign(queueCount, {});
+				for (auto& v : queueTransitions) v.assign(queueCount, {});
+				for (auto& p : queueWaitEnabled) p.assign(queueCount, std::vector<uint8_t>(queueCount, 0));
+				for (auto& p : queueWaitFenceValue) p.assign(queueCount, std::vector<UINT64>(queueCount, 0));
+				for (auto& p : queueSignalEnabled) p.assign(queueCount, 0);
+				for (auto& p : queueSignalFenceValue) p.assign(queueCount, 0);
+			}
+			else {
+				for (auto& q : queuePasses) q.clear();
+				for (auto& v : queueTransitions) {
+					for (auto& q : v) q.clear();
+				}
+				for (auto& p : queueWaitEnabled) {
+					for (auto& row : p) std::fill(row.begin(), row.end(), uint8_t{ 0 });
+				}
+				for (auto& p : queueWaitFenceValue) {
+					for (auto& row : p) std::fill(row.begin(), row.end(), UINT64{ 0 });
+				}
+				for (auto& p : queueSignalEnabled) std::fill(p.begin(), p.end(), uint8_t{ 0 });
+				for (auto& p : queueSignalFenceValue) std::fill(p.begin(), p.end(), UINT64{ 0 });
+			}
+			for (auto& phaseBuckets : transitionPositionsByResource) phaseBuckets.clear();
+			passBatchTrackersByResourceIndex.clear();
+			internallyTransitionedResources.clear();
+			allResources.clear();
+		}
+
 		size_t QueueCount() const noexcept { return queuePasses.size(); }
 		size_t TransitionIndexedResourceCount() const noexcept {
 			if (transitionPositionsByResource.empty() || transitionPositionsByResource.front().empty()) {
@@ -1770,8 +1799,8 @@ private:
 		const std::unordered_set<uint64_t>* materializedEnabledSignalTokens = nullptr);
 	void ReplaySegmentIntoFrameBatches(
 		const CompiledSegment& segment,
-		std::unordered_map<uint64_t, UINT64>& materializedSignalValuesByToken,
-		std::unordered_set<uint64_t>& materializedEnabledSignalTokens);
+		std::vector<UINT64>& materializedSignalValuesByToken,
+		std::vector<uint8_t>& materializedEnabledSignalTokens);
 	std::vector<PassBatch> BuildReplayedFrameBatches();
 	void ApplyReplayedSegmentCompilerState(const CompiledSegment& segment);
 	void RefreshCompiledSegmentBoundaryMetadataFromReplay();
