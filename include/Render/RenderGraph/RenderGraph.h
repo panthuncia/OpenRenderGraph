@@ -918,6 +918,9 @@ private:
 		uint64_t queuePolicyHash = 0;
 		uint64_t resourceGenerationHash = 0;
 		uint64_t aliasPolicyHash = 0;
+		uint64_t scheduleHash = 0;
+		uint64_t barrierHash = 0;
+		uint64_t executionHash = 0;
 		uint64_t fullHash = 0;
 	};
 
@@ -925,6 +928,9 @@ private:
 		std::vector<PassIR> passes;
 		uint64_t structureHash = 0;
 		uint64_t passContentHash = 0;
+		uint64_t scheduleContentHash = 0;
+		uint64_t barrierContentHash = 0;
+		uint64_t executionContentHash = 0;
 		size_t normalizedAccessCount = 0;
 	};
 
@@ -977,6 +983,17 @@ private:
 		uint64_t queueAssignmentHash = 0;
 	};
 
+	struct ScheduleCacheKeyParts {
+		uint64_t frameStructureHash = 0;
+		uint64_t frameScheduleHash = 0;
+		uint64_t queueConfigHash = 0;
+		uint64_t activeQueueHash = 0;
+		uint64_t settingsHash = 0;
+		uint64_t nodeTopologyHash = 0;
+		uint64_t dependencyEdgeHash = 0;
+		uint64_t fullHash = 0;
+	};
+
 	struct SymbolicFenceToken {
 		unsigned int batch = 0;
 		size_t queueSlot = 0;
@@ -988,6 +1005,9 @@ private:
 		std::vector<SymbolicFenceToken> signals;
 		uint64_t transitionHash = 0;
 		uint64_t waitHash = 0;
+		uint64_t transitionCount = 0;
+		uint64_t waitCount = 0;
+		uint64_t loweredRequirementCount = 0;
 	};
 
 	struct BarrierLoweringInput {
@@ -1013,9 +1033,20 @@ private:
 		uint64_t entryStateHash = 0;
 		uint64_t exitStateHash = 0;
 		uint64_t cacheKey = 0;
+		uint64_t loweredRequirementCount = 0;
 		bool barrierCacheHit = false;
+		bool barriersReused = false;
+		std::string barrierReuseReason;
 		ScheduleIR schedule;
 		BarrierIR barriers;
+	};
+
+	struct CompileReuseEvent {
+		std::string stage;
+		std::string artifact;
+		bool reused = false;
+		uint64_t key = 0;
+		std::string reason;
 	};
 
 	struct CompileCacheStats {
@@ -1024,10 +1055,14 @@ private:
 		uint64_t passIRCacheMisses = 0;
 		uint64_t scheduleCacheHits = 0;
 		uint64_t scheduleCacheMisses = 0;
+		uint64_t scheduleReusedPassCount = 0;
 		uint64_t normalizedAccessCount = 0;
 		uint64_t segmentCount = 0;
 		uint64_t barrierSegmentCacheHits = 0;
 		uint64_t barrierSegmentCacheMisses = 0;
+		uint64_t barrierSegmentReused = 0;
+		uint64_t barrierSegmentRecompiled = 0;
+		uint64_t barrierSegmentReusableLoweredRequirements = 0;
 		uint64_t loweredRequirementCount = 0;
 	};
 
@@ -1076,8 +1111,11 @@ private:
 	std::vector<CompiledSegment> m_compiledSegments;
 	std::unordered_map<uint64_t, PassIR> m_cachedPassIRByStableId;
 	std::unordered_map<uint64_t, ScheduleIR> m_cachedScheduleIRByKey;
+	std::unordered_map<uint64_t, ScheduleCacheKeyParts> m_cachedScheduleKeyPartsByKey;
+	std::optional<ScheduleCacheKeyParts> m_lastScheduleCacheKeyParts;
 	std::unordered_map<uint64_t, CompiledSegment> m_cachedBarrierSegments;
 	CompileCacheStats m_compileCacheStats;
+	std::vector<CompileReuseEvent> m_compileReuseEvents;
 	std::unordered_map<uint64_t, uint64_t> aliasPlacementPoolByID;
 	std::unordered_set<uint64_t> aliasActivationPending;
 
@@ -1390,6 +1428,17 @@ private:
 		RenderGraph& rg,
 		std::vector<AnyPassAndResources>& passes,
 		std::vector<Node>& nodes);
+	ScheduleCacheKeyParts BuildScheduleCacheKeyParts(const std::vector<Node>& nodes) const;
+	uint64_t BuildScheduleCacheKey(const std::vector<Node>& nodes) const;
+	void ApplyCachedScheduleIR(
+		const ScheduleIR& schedule,
+		std::vector<Node>& nodes);
+	void RecordCompileReuseEvent(
+		std::string stage,
+		std::string artifact,
+		bool reused,
+		uint64_t key,
+		std::string reason);
 	BarrierLoweringOutput LowerBarriers(
 		RenderGraph& rg,
 		std::vector<AnyPassAndResources>& passes,

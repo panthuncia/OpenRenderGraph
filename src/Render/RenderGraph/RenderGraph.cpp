@@ -667,6 +667,13 @@ void RenderGraph::WriteCompiledGraphDebugDump(uint8_t frameIndex, const std::vec
 				 << " run=" << PassRunMaskToString(passEntry.run)
 				 << " preferred_queue=" << QueueKindToString(resources.preferredQueueKind)
 				 << " assigned_queue=" << queueSlotLabel(assignedQueueSlot);
+			if (passIndex < m_compiledFrameProgram.passes.size()) {
+				const auto& passIR = m_compiledFrameProgram.passes[passIndex];
+				dump << " pass_schedule_hash=" << passIR.scheduleHash
+					 << " pass_barrier_hash=" << passIR.barrierHash
+					 << " pass_execution_hash=" << passIR.executionHash
+					 << " pass_full_hash=" << passIR.fullHash;
+			}
 			if (resources.pinnedQueueSlot.has_value()) {
 				dump << " pinned_queue=" << static_cast<unsigned int>(static_cast<uint8_t>(*resources.pinnedQueueSlot));
 			}
@@ -710,16 +717,26 @@ void RenderGraph::WriteCompiledGraphDebugDump(uint8_t frameIndex, const std::vec
 			 << " queue_slot_count=" << m_queueRegistry.SlotCount() << "\n";
 		dump << "frame_program_passes=" << m_compileCacheStats.passIRCount
 			 << " normalized_accesses=" << m_compileCacheStats.normalizedAccessCount
+			 << " frame_schedule_hash=" << m_compiledFrameProgram.scheduleContentHash
+			 << " frame_barrier_hash=" << m_compiledFrameProgram.barrierContentHash
+			 << " frame_execution_hash=" << m_compiledFrameProgram.executionContentHash
+			 << " barrier_transition_count=" << m_compiledBarrierIR.transitionCount
+			 << " barrier_wait_count=" << m_compiledBarrierIR.waitCount
+			 << " barrier_lowered_requirements=" << m_compiledBarrierIR.loweredRequirementCount
 			 << " resource_access_chains=" << m_resourceAccessChains.size()
 			 << " dependency_edge_ir_count=" << m_dependencyEdgeIR.size()
 			 << " pass_ir_cache_hits=" << m_compileCacheStats.passIRCacheHits
 			 << " pass_ir_cache_misses=" << m_compileCacheStats.passIRCacheMisses
 			 << " schedule_cache_hits=" << m_compileCacheStats.scheduleCacheHits
 			 << " schedule_cache_misses=" << m_compileCacheStats.scheduleCacheMisses
+			 << " schedule_reused_passes=" << m_compileCacheStats.scheduleReusedPassCount
 			 << " segments=" << m_compileCacheStats.segmentCount
 			 << " lowered_requirements=" << m_compileCacheStats.loweredRequirementCount
 			 << " barrier_segment_cache_hits=" << m_compileCacheStats.barrierSegmentCacheHits
 			 << " barrier_segment_cache_misses=" << m_compileCacheStats.barrierSegmentCacheMisses
+			 << " barrier_segment_reused=" << m_compileCacheStats.barrierSegmentReused
+			 << " barrier_segment_recompiled=" << m_compileCacheStats.barrierSegmentRecompiled
+			 << " barrier_segment_reusable_lowered_requirements=" << m_compileCacheStats.barrierSegmentReusableLoweredRequirements
 			 << "\n";
 		dump << "active_queue_slots=[";
 		bool firstActive = true;
@@ -734,6 +751,20 @@ void RenderGraph::WriteCompiledGraphDebugDump(uint8_t frameIndex, const std::vec
 			dump << queueSlotLabel(queueIndex);
 		}
 		dump << "]\n\n";
+
+		if (m_lastScheduleCacheKeyParts.has_value()) {
+			const auto& parts = *m_lastScheduleCacheKeyParts;
+			dump << "schedule_key_parts"
+				 << " full=" << parts.fullHash
+				 << " frame_structure=" << parts.frameStructureHash
+				 << " frame_schedule=" << parts.frameScheduleHash
+				 << " queue_config=" << parts.queueConfigHash
+				 << " active_queues=" << parts.activeQueueHash
+				 << " settings=" << parts.settingsHash
+				 << " node_topology=" << parts.nodeTopologyHash
+				 << " dependency_edges=" << parts.dependencyEdgeHash
+				 << "\n\n";
+		}
 
 		dump << "[FramePasses]\n";
 		for (size_t passIndex = 0; passIndex < m_framePasses.size(); ++passIndex) {
@@ -833,9 +864,26 @@ void RenderGraph::WriteCompiledGraphDebugDump(uint8_t frameIndex, const std::vec
 					 << " queue_hash=" << segment.queueAssignmentHash
 					 << " entry_state_hash=" << segment.entryStateHash
 					 << " exit_state_hash=" << segment.exitStateHash
+					 << " lowered_requirements=" << segment.loweredRequirementCount
+					 << " barrier_transition_count=" << segment.barriers.transitionCount
+					 << " barrier_wait_count=" << segment.barriers.waitCount
 					 << " barrier_transition_hash=" << segment.barriers.transitionHash
 					 << " barrier_wait_hash=" << segment.barriers.waitHash
 					 << " cache_hit=" << (segment.barrierCacheHit ? "true" : "false")
+					 << " reused=" << (segment.barriersReused ? "true" : "false")
+					 << " reason=\"" << segment.barrierReuseReason << "\""
+					 << "\n";
+			}
+		}
+
+		if (!m_compileReuseEvents.empty()) {
+			dump << "\n[CompileReuse]\n";
+			for (const auto& event : m_compileReuseEvents) {
+				dump << "- stage=\"" << event.stage << "\""
+					 << " artifact=\"" << event.artifact << "\""
+					 << " reused=" << (event.reused ? "true" : "false")
+					 << " key=" << event.key
+					 << " reason=\"" << event.reason << "\""
 					 << "\n";
 			}
 		}
@@ -1908,6 +1956,9 @@ namespace {
 		if (lower.find("upload") != std::string::npos || lower.find("setup") != std::string::npos) {
 			return "frame-setup";
 		}
+		if (lower.find("readback") != std::string::npos || lower.find("capture") != std::string::npos) {
+			return "readback-tail";
+		}
 		if (lower.find("depth") != std::string::npos || lower.find("visibility") != std::string::npos) {
 			return "depth-visibility";
 		}
@@ -1931,17 +1982,69 @@ namespace {
 		}
 		return "main";
 	}
+
+	template<typename ScheduleCacheKeyPartsT>
+	std::string DescribeScheduleCacheMiss(
+		const ScheduleCacheKeyPartsT& current,
+		const std::optional<ScheduleCacheKeyPartsT>& previous)
+	{
+		if (!previous.has_value()) {
+			return "no cached schedule for dependency/pass/queue signature";
+		}
+
+		const auto& prev = *previous;
+		std::vector<std::string> changed;
+		auto addChanged = [&](std::string_view label, uint64_t before, uint64_t after) {
+			if (before == after) {
+				return;
+			}
+
+			std::ostringstream item;
+			item << label << "(" << before << "->" << after << ")";
+			changed.push_back(item.str());
+		};
+		addChanged("frame-structure", prev.frameStructureHash, current.frameStructureHash);
+		addChanged("frame-schedule", prev.frameScheduleHash, current.frameScheduleHash);
+		addChanged("queue-config", prev.queueConfigHash, current.queueConfigHash);
+		addChanged("active-queues", prev.activeQueueHash, current.activeQueueHash);
+		addChanged("scheduler-settings", prev.settingsHash, current.settingsHash);
+		addChanged("node-topology", prev.nodeTopologyHash, current.nodeTopologyHash);
+		addChanged("dependency-edges", prev.dependencyEdgeHash, current.dependencyEdgeHash);
+
+		if (changed.empty()) {
+			return "no cached schedule for dependency/pass/queue signature; tracked key parts matched previous frame";
+		}
+
+		std::ostringstream oss;
+		oss << "schedule signature changed: ";
+		for (size_t i = 0; i < changed.size(); ++i) {
+			if (i > 0) {
+				oss << ",";
+			}
+			oss << changed[i];
+		}
+		return oss.str();
+	}
 }
 
 void RenderGraph::BuildFrameProgramIR() {
 	ZoneScopedN("RenderGraph::BuildFrameProgramIR");
 	m_compileCacheStats = CompileCacheStats{};
+	m_compileReuseEvents.clear();
 	FrameProgram program{};
 	program.passes.reserve(m_framePasses.size());
 
-	auto appendAccessHash = [](uint64_t seed, const NormalizedAccess& access) {
+	auto appendScheduleAccessHash = [](uint64_t seed, const NormalizedAccess& access) {
 		seed = rg::HashCombine(seed, access.resourceID);
-		seed = rg::HashCombine(seed, static_cast<uint64_t>(access.resourceIndex));
+		seed = rg::HashCombine(seed, HashRangeSpec64(access.range));
+		seed = rg::HashCombine(seed, static_cast<uint64_t>(access.accessKind));
+		seed = rg::HashCombine(seed, access.isUAV ? 1ull : 0ull);
+		seed = rg::HashCombine(seed, access.isInternalTransition ? 1ull : 0ull);
+		return seed;
+	};
+
+	auto appendBarrierAccessHash = [](uint64_t seed, const NormalizedAccess& access) {
+		seed = rg::HashCombine(seed, access.resourceID);
 		seed = rg::HashCombine(seed, HashRangeSpec64(access.range));
 		seed = rg::HashCombine(seed, HashResourceState64(access.state));
 		seed = rg::HashCombine(seed, static_cast<uint64_t>(access.accessKind));
@@ -1991,8 +2094,10 @@ void RenderGraph::BuildFrameProgramIR() {
 				? NormalizedAccessKind::Write
 				: NormalizedAccessKind::Read;
 			access.isUAV = requirement.isUAV;
-			access.hash = appendAccessHash(0, access);
+			access.hash = appendBarrierAccessHash(appendScheduleAccessHash(0, access), access);
 			passIR.accesses.push_back(access);
+			passIR.scheduleHash = appendScheduleAccessHash(passIR.scheduleHash, access);
+			passIR.barrierHash = appendBarrierAccessHash(passIR.barrierHash, access);
 			passIR.declarationHash = rg::HashCombine(passIR.declarationHash, access.hash);
 
 			auto itGeneration = compiledResourceGenerationByID.find(requirement.resourceID);
@@ -2020,10 +2125,22 @@ void RenderGraph::BuildFrameProgramIR() {
 			access.state = transition.second;
 			access.accessKind = NormalizedAccessKind::Write;
 			access.isInternalTransition = true;
-			access.hash = appendAccessHash(0, access);
+			access.hash = appendBarrierAccessHash(appendScheduleAccessHash(0, access), access);
 			passIR.internalTransitions.push_back(access);
+			passIR.scheduleHash = appendScheduleAccessHash(passIR.scheduleHash, access);
+			passIR.barrierHash = appendBarrierAccessHash(passIR.barrierHash, access);
 			passIR.declarationHash = rg::HashCombine(passIR.declarationHash, access.hash);
 		}
+
+		passIR.scheduleHash = rg::HashCombine(passIR.scheduleHash, passIR.id.value);
+		passIR.scheduleHash = rg::HashCombine(passIR.scheduleHash, passIR.queuePolicyHash);
+
+		passIR.barrierHash = rg::HashCombine(passIR.barrierHash, passIR.scheduleHash);
+		passIR.barrierHash = rg::HashCombine(passIR.barrierHash, passIR.aliasPolicyHash);
+
+		passIR.executionHash = passIR.barrierHash;
+		passIR.executionHash = rg::HashCombine(passIR.executionHash, passIR.immediateHash);
+		passIR.executionHash = rg::HashCombine(passIR.executionHash, passIR.resourceGenerationHash);
 
 		passIR.fullHash = passIR.declarationHash;
 		passIR.fullHash = rg::HashCombine(passIR.fullHash, passIR.immediateHash);
@@ -2034,15 +2151,56 @@ void RenderGraph::BuildFrameProgramIR() {
 		auto cacheIt = m_cachedPassIRByStableId.find(passIR.id.value);
 		if (cacheIt != m_cachedPassIRByStableId.end() && cacheIt->second.fullHash == passIR.fullHash) {
 			++m_compileCacheStats.passIRCacheHits;
+			RecordCompileReuseEvent("PassIR", passIR.name, true, passIR.id.value, "stable pass fingerprint matched cached PassIR");
+			passIR = cacheIt->second;
 		}
 		else {
 			++m_compileCacheStats.passIRCacheMisses;
+			std::string reason = "no cached PassIR for stable pass id";
+			if (cacheIt != m_cachedPassIRByStableId.end()) {
+				const PassIR& previous = cacheIt->second;
+				std::vector<std::string> changed;
+				if (previous.scheduleHash != passIR.scheduleHash) changed.push_back("schedule");
+				if (previous.barrierHash != passIR.barrierHash) changed.push_back("barrier");
+				if (previous.executionHash != passIR.executionHash) changed.push_back("execution");
+				if (previous.declarationHash != passIR.declarationHash) changed.push_back("declaration");
+				if (previous.immediateHash != passIR.immediateHash) changed.push_back("immediate");
+				if (previous.queuePolicyHash != passIR.queuePolicyHash) changed.push_back("queue-policy");
+				if (previous.resourceGenerationHash != passIR.resourceGenerationHash) changed.push_back("resource-generation");
+				if (previous.aliasPolicyHash != passIR.aliasPolicyHash) changed.push_back("alias-policy");
+
+				std::ostringstream oss;
+				oss << "PassIR fingerprint changed: ";
+				for (size_t i = 0; i < changed.size(); ++i) {
+					if (i != 0) oss << ",";
+					oss << changed[i];
+				}
+				if (changed.empty()) {
+					oss << "full-hash-only";
+				}
+				reason = oss.str();
+
+				if (previous.scheduleHash != passIR.scheduleHash) {
+					std::ostringstream scheduleReason;
+					scheduleReason << "pass schedule hash changed: "
+						<< previous.scheduleHash << "->" << passIR.scheduleHash
+						<< " declaration=" << previous.declarationHash << "->" << passIR.declarationHash
+						<< " queue_policy=" << previous.queuePolicyHash << "->" << passIR.queuePolicyHash
+						<< " access_count=" << (previous.accesses.size() + previous.internalTransitions.size())
+						<< "->" << (passIR.accesses.size() + passIR.internalTransitions.size());
+					RecordCompileReuseEvent("SchedulePass", passIR.name, false, passIR.id.value, scheduleReason.str());
+				}
+			}
+			RecordCompileReuseEvent("PassIR", passIR.name, false, passIR.id.value, reason);
 			m_cachedPassIRByStableId[passIR.id.value] = passIR;
 		}
 
 		program.normalizedAccessCount += passIR.accesses.size() + passIR.internalTransitions.size();
 		program.structureHash = rg::HashCombine(program.structureHash, passIR.id.value);
 		program.passContentHash = rg::HashCombine(program.passContentHash, passIR.fullHash);
+		program.scheduleContentHash = rg::HashCombine(program.scheduleContentHash, passIR.scheduleHash);
+		program.barrierContentHash = rg::HashCombine(program.barrierContentHash, passIR.barrierHash);
+		program.executionContentHash = rg::HashCombine(program.executionContentHash, passIR.executionHash);
 		program.passes.push_back(std::move(passIR));
 	}
 
@@ -2543,6 +2701,101 @@ RenderGraph::ScheduleIR RenderGraph::BuildScheduleIR(
 	return schedule;
 }
 
+RenderGraph::ScheduleCacheKeyParts RenderGraph::BuildScheduleCacheKeyParts(const std::vector<Node>& nodes) const {
+	ScheduleCacheKeyParts parts{};
+	parts.frameStructureHash = m_compiledFrameProgram.structureHash;
+	parts.frameScheduleHash = m_compiledFrameProgram.scheduleContentHash;
+	parts.queueConfigHash = rg::HashCombine(static_cast<uint64_t>(m_queueRegistry.SlotCount()), static_cast<uint64_t>(m_frameSchedulingResourceCount));
+	parts.settingsHash = rg::HashCombine(0ull, (m_getHeavyDebug && m_getHeavyDebug()) ? 1ull : 0ull);
+	parts.settingsHash = rg::HashCombine(parts.settingsHash, static_cast<uint64_t>((m_getQueueSchedulingAutoGraphicsBias ? m_getQueueSchedulingAutoGraphicsBias() : 2.5f) * 1000.0f));
+	parts.settingsHash = rg::HashCombine(parts.settingsHash, static_cast<uint64_t>((m_getQueueSchedulingAsyncOverlapBonus ? m_getQueueSchedulingAsyncOverlapBonus() : 3.0f) * 1000.0f));
+	parts.settingsHash = rg::HashCombine(parts.settingsHash, static_cast<uint64_t>((m_getQueueSchedulingCrossQueueHandoffPenalty ? m_getQueueSchedulingCrossQueueHandoffPenalty() : 2.0f) * 1000.0f));
+
+	for (size_t queueIndex = 0; queueIndex < m_activeQueueSlotsThisFrame.size(); ++queueIndex) {
+		if (m_activeQueueSlotsThisFrame[queueIndex]) {
+			uint64_t queueHash = rg::HashCombine(static_cast<uint64_t>(queueIndex), 1ull);
+			parts.activeQueueHash = rg::HashCombine(parts.activeQueueHash, queueHash);
+		}
+	}
+
+	for (const auto& node : nodes) {
+		uint64_t nodeHash = rg::HashCombine(static_cast<uint64_t>(node.passIndex), static_cast<uint64_t>(node.originalOrder));
+		nodeHash = rg::HashCombine(nodeHash, static_cast<uint64_t>(node.queueSlot));
+		nodeHash = rg::HashCombine(nodeHash, static_cast<uint64_t>(node.preferredQueueKind));
+		nodeHash = rg::HashCombine(nodeHash, static_cast<uint64_t>(node.queueAssignmentPolicy));
+		nodeHash = rg::HashCombine(nodeHash, static_cast<uint64_t>(node.compatibleQueueKindMask));
+		nodeHash = rg::HashCombine(nodeHash, static_cast<uint64_t>(node.criticality));
+		for (size_t compatibleSlot : node.compatibleQueueSlots) {
+			nodeHash = rg::HashCombine(nodeHash, static_cast<uint64_t>(compatibleSlot));
+		}
+		for (size_t pred : node.in) {
+			nodeHash = rg::HashCombine(nodeHash, rg::HashCombine(0x1ull, static_cast<uint64_t>(pred)));
+		}
+		for (size_t succ : node.out) {
+			nodeHash = rg::HashCombine(nodeHash, rg::HashCombine(0x2ull, static_cast<uint64_t>(succ)));
+		}
+		parts.nodeTopologyHash = rg::HashCombine(parts.nodeTopologyHash, nodeHash);
+	}
+
+	for (const auto& edge : m_dependencyEdgeIR) {
+		parts.dependencyEdgeHash = rg::HashCombine(parts.dependencyEdgeHash, edge.provenanceKey);
+	}
+
+	parts.fullHash = rg::HashCombine(0ull, parts.frameStructureHash);
+	parts.fullHash = rg::HashCombine(parts.fullHash, parts.frameScheduleHash);
+	parts.fullHash = rg::HashCombine(parts.fullHash, parts.queueConfigHash);
+	parts.fullHash = rg::HashCombine(parts.fullHash, parts.activeQueueHash);
+	parts.fullHash = rg::HashCombine(parts.fullHash, parts.settingsHash);
+	parts.fullHash = rg::HashCombine(parts.fullHash, parts.nodeTopologyHash);
+	parts.fullHash = rg::HashCombine(parts.fullHash, parts.dependencyEdgeHash);
+	return parts;
+}
+
+uint64_t RenderGraph::BuildScheduleCacheKey(const std::vector<Node>& nodes) const {
+	return BuildScheduleCacheKeyParts(nodes).fullHash;
+}
+
+void RenderGraph::ApplyCachedScheduleIR(
+	const ScheduleIR& schedule,
+	std::vector<Node>& nodes)
+{
+	ZoneScopedN("RenderGraph::ApplyCachedScheduleIR");
+	m_assignedQueueSlotsByFramePass.assign(m_framePasses.size(), 0);
+
+	for (const auto& scheduled : schedule.passStream) {
+		if (scheduled.nodeIndex >= nodes.size()) {
+			continue;
+		}
+
+		auto& node = nodes[scheduled.nodeIndex];
+		node.assignedQueueSlot = scheduled.queueSlot;
+		if (node.passIndex < m_assignedQueueSlotsByFramePass.size()) {
+			m_assignedQueueSlotsByFramePass[node.passIndex] = scheduled.queueSlot;
+		}
+	}
+}
+
+void RenderGraph::RecordCompileReuseEvent(
+	std::string stage,
+	std::string artifact,
+	bool reused,
+	uint64_t key,
+	std::string reason)
+{
+	constexpr size_t kMaxCompileReuseEvents = 512;
+	if (m_compileReuseEvents.size() >= kMaxCompileReuseEvents) {
+		return;
+	}
+
+	m_compileReuseEvents.push_back(CompileReuseEvent{
+		.stage = std::move(stage),
+		.artifact = std::move(artifact),
+		.reused = reused,
+		.key = key,
+		.reason = std::move(reason),
+	});
+}
+
 RenderGraph::BarrierLoweringOutput RenderGraph::LowerBarriers(
 	RenderGraph& rg,
 	std::vector<AnyPassAndResources>& passes,
@@ -2578,7 +2831,9 @@ RenderGraph::BarrierLoweringOutput RenderGraph::LowerBarriers(
 		PassBatch currentBatch = openSymbolicBatch();
 		for (const auto& scheduled : symbolicBatch.passes) {
 			if (scheduled.passIndex < rg.m_framePassSchedulingSummaries.size()) {
-				rg.m_compileCacheStats.loweredRequirementCount += rg.m_framePassSchedulingSummaries[scheduled.passIndex].requirements.size();
+				const uint64_t requirementCount = static_cast<uint64_t>(rg.m_framePassSchedulingSummaries[scheduled.passIndex].requirements.size());
+				rg.m_compileCacheStats.loweredRequirementCount += requirementCount;
+				output.barriers.loweredRequirementCount += requirementCount;
 			}
 			CommitPassToBatch(
 				rg,
@@ -2605,13 +2860,16 @@ RenderGraph::BarrierLoweringOutput RenderGraph::LowerBarriers(
 				});
 			}
 			for (size_t transitionPhase = 0; transitionPhase < PassBatch::kTransitionPhaseCount; ++transitionPhase) {
+				const uint64_t transitionCount = static_cast<uint64_t>(batch.Transitions(qi, static_cast<BatchTransitionPhase>(transitionPhase)).size());
+				output.barriers.transitionCount += transitionCount;
 				output.barriers.transitionHash = rg::HashCombine(
 					output.barriers.transitionHash,
-					static_cast<uint64_t>(batch.Transitions(qi, static_cast<BatchTransitionPhase>(transitionPhase)).size()));
+					transitionCount);
 			}
 			for (size_t waitPhase = 0; waitPhase < PassBatch::kWaitPhaseCount; ++waitPhase) {
 				for (size_t src = 0; src < batch.QueueCount(); ++src) {
 					if (batch.HasQueueWait(static_cast<BatchWaitPhase>(waitPhase), qi, src)) {
+						++output.barriers.waitCount;
 						output.barriers.waitHash = rg::HashCombine(
 							output.barriers.waitHash,
 							batch.GetQueueWaitFenceValue(static_cast<BatchWaitPhase>(waitPhase), qi, src));
@@ -2661,7 +2919,10 @@ void RenderGraph::BuildCompiledSegments(
 		const std::string_view passName = passIR ? std::string_view(passIR->name) : std::string_view{};
 		const std::string_view nextName = SegmentNameForPass(passName);
 
-		if (!hasCurrent || currentName != nextName) {
+		// Keep segment cuts batch-aligned so barrier summaries are attributed to
+		// one segment instead of being counted once per intra-batch phase change.
+		const bool sameSymbolicBatch = hasCurrent && scheduled.symbolicBatch == current.lastBatch;
+		if (!hasCurrent || (!sameSymbolicBatch && std::string_view(currentName) != nextName)) {
 			if (hasCurrent) {
 				closeSegment(current);
 			}
@@ -2673,6 +2934,9 @@ void RenderGraph::BuildCompiledSegments(
 
 		current.passCount++;
 		current.lastBatch = scheduled.symbolicBatch;
+		if (scheduled.passIndex < m_framePassSchedulingSummaries.size()) {
+			current.loweredRequirementCount += static_cast<uint64_t>(m_framePassSchedulingSummaries[scheduled.passIndex].requirements.size());
+		}
 		current.schedule.passStream.push_back(scheduled);
 		current.schedule.structureHash = rg::HashCombine(current.schedule.structureHash, static_cast<uint64_t>(scheduled.passIndex));
 		current.schedule.queueAssignmentHash = rg::HashCombine(
@@ -2736,13 +3000,16 @@ void RenderGraph::BuildCompiledSegments(
 					});
 				}
 				for (size_t transitionPhase = 0; transitionPhase < PassBatch::kTransitionPhaseCount; ++transitionPhase) {
+					const uint64_t transitionCount = static_cast<uint64_t>(batch.Transitions(qi, static_cast<BatchTransitionPhase>(transitionPhase)).size());
+					segment.barriers.transitionCount += transitionCount;
 					segment.barriers.transitionHash = rg::HashCombine(
 						segment.barriers.transitionHash,
-						static_cast<uint64_t>(batch.Transitions(qi, static_cast<BatchTransitionPhase>(transitionPhase)).size()));
+						transitionCount);
 				}
 				for (size_t waitPhase = 0; waitPhase < PassBatch::kWaitPhaseCount; ++waitPhase) {
 					for (size_t src = 0; src < batch.QueueCount(); ++src) {
 						if (batch.HasQueueWait(static_cast<BatchWaitPhase>(waitPhase), qi, src)) {
+							++segment.barriers.waitCount;
 							segment.barriers.waitHash = rg::HashCombine(
 								segment.barriers.waitHash,
 								batch.GetQueueWaitFenceValue(static_cast<BatchWaitPhase>(waitPhase), qi, src));
@@ -2762,10 +3029,38 @@ void RenderGraph::BuildCompiledSegments(
 		if (cacheIt != m_cachedBarrierSegments.end()) {
 			segment.barrierCacheHit = true;
 			++m_compileCacheStats.barrierSegmentCacheHits;
+			const BarrierIR loweredBarriers = segment.barriers;
+			const BarrierIR& cachedBarriers = cacheIt->second.barriers;
+			const bool barrierSummaryMatches =
+				loweredBarriers.transitionCount == cachedBarriers.transitionCount
+				&& loweredBarriers.waitCount == cachedBarriers.waitCount
+				&& loweredBarriers.loweredRequirementCount == cachedBarriers.loweredRequirementCount
+				&& loweredBarriers.transitionHash == cachedBarriers.transitionHash
+				&& loweredBarriers.waitHash == cachedBarriers.waitHash
+				&& loweredBarriers.signals.size() == cachedBarriers.signals.size();
+			if (barrierSummaryMatches) {
+				segment.barriersReused = true;
+				segment.barriers = cachedBarriers;
+				segment.barrierReuseReason = "symbolic barrier metadata reused from matching segment; concrete PassBatch materialization still reran";
+				++m_compileCacheStats.barrierSegmentReused;
+				m_compileCacheStats.barrierSegmentReusableLoweredRequirements += segment.loweredRequirementCount;
+				RecordCompileReuseEvent("BarrierSegment", segment.name, true, segment.cacheKey, segment.barrierReuseReason);
+			}
+			else {
+				segment.barriersReused = false;
+				segment.barrierReuseReason = "barrier cache key matched but lowered barrier summary changed; cache key is missing an input";
+				cacheIt->second = segment;
+				RecordCompileReuseEvent("BarrierSegment", segment.name, false, segment.cacheKey, segment.barrierReuseReason);
+			}
+			++m_compileCacheStats.barrierSegmentRecompiled;
 		}
 		else {
 			segment.barrierCacheHit = false;
 			++m_compileCacheStats.barrierSegmentCacheMisses;
+			segment.barriersReused = false;
+			segment.barrierReuseReason = "no cached barrier segment for structure/pass/alias/queue/entry-state signature";
+			++m_compileCacheStats.barrierSegmentRecompiled;
+			RecordCompileReuseEvent("BarrierSegment", segment.name, false, segment.cacheKey, segment.barrierReuseReason);
 			m_cachedBarrierSegments.emplace(segment.cacheKey, segment);
 		}
 	}
@@ -2926,17 +3221,24 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 	std::vector<Node>& nodes)
 {
 	ZoneScopedN("RenderGraph::AutoScheduleAndBuildBatches");
-	m_compiledScheduleIR = BuildScheduleIR(rg, passes, nodes);
-	const uint64_t scheduleCacheKey = rg::HashCombine(
-		m_compiledScheduleIR.structureHash,
-		m_compiledScheduleIR.queueAssignmentHash);
-	if (m_cachedScheduleIRByKey.find(scheduleCacheKey) != m_cachedScheduleIRByKey.end()) {
+	const ScheduleCacheKeyParts scheduleCacheKeyParts = BuildScheduleCacheKeyParts(nodes);
+	const uint64_t scheduleCacheKey = scheduleCacheKeyParts.fullHash;
+	auto scheduleCacheIt = m_cachedScheduleIRByKey.find(scheduleCacheKey);
+	if (scheduleCacheIt != m_cachedScheduleIRByKey.end()) {
 		++m_compileCacheStats.scheduleCacheHits;
+		m_compiledScheduleIR = scheduleCacheIt->second;
+		ApplyCachedScheduleIR(m_compiledScheduleIR, nodes);
+		m_compileCacheStats.scheduleReusedPassCount += m_compiledScheduleIR.passStream.size();
+		RecordCompileReuseEvent("ScheduleIR", "frame schedule", true, scheduleCacheKey, "schedule dependency/pass/queue signature matched cached schedule");
 	}
 	else {
 		++m_compileCacheStats.scheduleCacheMisses;
+		RecordCompileReuseEvent("ScheduleIR", "frame schedule", false, scheduleCacheKey, DescribeScheduleCacheMiss(scheduleCacheKeyParts, m_lastScheduleCacheKeyParts));
+		m_compiledScheduleIR = BuildScheduleIR(rg, passes, nodes);
 		m_cachedScheduleIRByKey.emplace(scheduleCacheKey, m_compiledScheduleIR);
+		m_cachedScheduleKeyPartsByKey.emplace(scheduleCacheKey, scheduleCacheKeyParts);
 	}
+	m_lastScheduleCacheKeyParts = scheduleCacheKeyParts;
 	compileTrackers.clear();
 	ResetFrameQueueBatchHistoryTables();
 	BarrierLoweringInput loweringInput{ .schedule = &m_compiledScheduleIR };
@@ -4522,10 +4824,13 @@ void RenderGraph::ResetForRebuild()
 	m_compiledSegments.clear();
 	m_cachedPassIRByStableId.clear();
 	m_cachedScheduleIRByKey.clear();
+	m_cachedScheduleKeyPartsByKey.clear();
+	m_lastScheduleCacheKeyParts.reset();
 	m_cachedBarrierSegments.clear();
 	m_resourceAccessChains.clear();
 	m_dependencyEdgeIR.clear();
 	m_compileCacheStats = CompileCacheStats{};
+	m_compileReuseEvents.clear();
 
 	// Full rebuilds must drop cached pass instances before clearing resources.
 	// Builders reuse pass objects across frames, and many passes capture
@@ -4606,6 +4911,7 @@ void RenderGraph::ResetForFrame() {
 	m_resourceAccessChains.clear();
 	m_dependencyEdgeIR.clear();
 	m_compileCacheStats = CompileCacheStats{};
+	m_compileReuseEvents.clear();
 	for (auto& producerMap : m_compiledLastProducerBatchByResourceByQueue) {
 		producerMap.clear();
 	}
@@ -5835,12 +6141,6 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		RebuildFramePassSchedulingSummaries();
 	}
 	{
-		traceCompileStep("BuildFrameProgramIR");
-		ZoneScopedN("RenderGraph::CompileFrame::BuildFrameProgramIR");
-		BuildFrameProgramIR();
-	}
-
-	{
 		traceCompileStep("PlanActiveQueueSlots");
 		ZoneScopedN("RenderGraph::CompileFrame::PlanActiveQueueSlots");
 		m_activeQueueSlotsThisFrame = PlanActiveQueueSlots(*this, m_framePasses, nodes);
@@ -5872,6 +6172,11 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		traceCompileStep("SnapshotCompiledResourceGenerations");
 		ZoneScopedN("RenderGraph::CompileFrame::SnapshotCompiledResourceGenerations");
 		SnapshotCompiledResourceGenerations(usedResourceIDs);
+	}
+	{
+		traceCompileStep("BuildFrameProgramIR");
+		ZoneScopedN("RenderGraph::CompileFrame::BuildFrameProgramIR");
+		BuildFrameProgramIR();
 	}
 
 	{
