@@ -729,7 +729,10 @@ void RenderGraph::WriteCompiledGraphDebugDump(uint8_t frameIndex, const std::vec
 			 << " pass_ir_cache_misses=" << m_compileCacheStats.passIRCacheMisses
 			 << " schedule_cache_hits=" << m_compileCacheStats.scheduleCacheHits
 			 << " schedule_cache_misses=" << m_compileCacheStats.scheduleCacheMisses
+			 << " schedule_relaxed_cache_hits=" << m_compileCacheStats.scheduleRelaxedCacheHits
 			 << " schedule_reused_passes=" << m_compileCacheStats.scheduleReusedPassCount
+			 << " volatile_schedule_pass_changes=" << m_compileCacheStats.volatileSchedulePassChanges
+			 << " nonvolatile_schedule_pass_changes=" << m_compileCacheStats.nonVolatileSchedulePassChanges
 			 << " segments=" << m_compileCacheStats.segmentCount
 			 << " lowered_requirements=" << m_compileCacheStats.loweredRequirementCount
 			 << " barrier_segment_cache_hits=" << m_compileCacheStats.barrierSegmentCacheHits
@@ -867,6 +870,8 @@ void RenderGraph::WriteCompiledGraphDebugDump(uint8_t frameIndex, const std::vec
 					 << " lowered_requirements=" << segment.loweredRequirementCount
 					 << " barrier_transition_count=" << segment.barriers.transitionCount
 					 << " barrier_wait_count=" << segment.barriers.waitCount
+					 << " barrier_transition_ops=" << segment.barriers.transitions.size()
+					 << " barrier_wait_ops=" << segment.barriers.waits.size()
 					 << " barrier_transition_hash=" << segment.barriers.transitionHash
 					 << " barrier_wait_hash=" << segment.barriers.waitHash
 					 << " cache_hit=" << (segment.barrierCacheHit ? "true" : "false")
@@ -1983,6 +1988,25 @@ namespace {
 		return "main";
 	}
 
+	bool IsVolatileSchedulePassName(std::string_view passName) {
+		// TODO: Replace this manual volatility classification with a declared pass
+		// or resource policy so schedule reuse does not depend on pass-name heuristics.
+		const std::string lower = LowerAscii(passName);
+		return lower.find("readback") != std::string::npos
+			|| lower.find("capture") != std::string::npos;
+	}
+
+	template<typename ScheduleCacheKeyPartsT>
+	uint64_t BuildRelaxedScheduleCacheKey(const ScheduleCacheKeyPartsT& parts) {
+		uint64_t key = rg::HashCombine(0ull, parts.frameStructureHash);
+		key = rg::HashCombine(key, parts.queueConfigHash);
+		key = rg::HashCombine(key, parts.activeQueueHash);
+		key = rg::HashCombine(key, parts.settingsHash);
+		key = rg::HashCombine(key, parts.nodeTopologyHash);
+		key = rg::HashCombine(key, parts.dependencyEdgeHash);
+		return key;
+	}
+
 	template<typename ScheduleCacheKeyPartsT>
 	std::string DescribeScheduleCacheMiss(
 		const ScheduleCacheKeyPartsT& current,
@@ -2181,6 +2205,13 @@ void RenderGraph::BuildFrameProgramIR() {
 				reason = oss.str();
 
 				if (previous.scheduleHash != passIR.scheduleHash) {
+					if (IsVolatileSchedulePassName(passIR.name)) {
+						++m_compileCacheStats.volatileSchedulePassChanges;
+					}
+					else {
+						++m_compileCacheStats.nonVolatileSchedulePassChanges;
+					}
+
 					std::ostringstream scheduleReason;
 					scheduleReason << "pass schedule hash changed: "
 						<< previous.scheduleHash << "->" << passIR.scheduleHash
@@ -2860,19 +2891,45 @@ RenderGraph::BarrierLoweringOutput RenderGraph::LowerBarriers(
 				});
 			}
 			for (size_t transitionPhase = 0; transitionPhase < PassBatch::kTransitionPhaseCount; ++transitionPhase) {
-				const uint64_t transitionCount = static_cast<uint64_t>(batch.Transitions(qi, static_cast<BatchTransitionPhase>(transitionPhase)).size());
+				const auto phase = static_cast<BatchTransitionPhase>(transitionPhase);
+				const auto& transitions = batch.Transitions(qi, phase);
+				const uint64_t transitionCount = static_cast<uint64_t>(transitions.size());
 				output.barriers.transitionCount += transitionCount;
 				output.barriers.transitionHash = rg::HashCombine(
 					output.barriers.transitionHash,
 					transitionCount);
+				for (const auto& transition : transitions) {
+					output.barriers.transitions.push_back(SymbolicTransitionOp{
+						.batch = batchIndex,
+						.queueSlot = qi,
+						.phase = phase,
+						.resourceID = transition.pResource ? transition.pResource->GetGlobalResourceID() : 0ull,
+						.range = transition.range,
+						.prevAccessType = transition.prevAccessType,
+						.newAccessType = transition.newAccessType,
+						.prevLayout = transition.prevLayout,
+						.newLayout = transition.newLayout,
+						.prevSyncState = transition.prevSyncState,
+						.newSyncState = transition.newSyncState,
+						.discard = transition.discard,
+					});
+				}
 			}
 			for (size_t waitPhase = 0; waitPhase < PassBatch::kWaitPhaseCount; ++waitPhase) {
 				for (size_t src = 0; src < batch.QueueCount(); ++src) {
 					if (batch.HasQueueWait(static_cast<BatchWaitPhase>(waitPhase), qi, src)) {
+						const auto phase = static_cast<BatchWaitPhase>(waitPhase);
 						++output.barriers.waitCount;
+						output.barriers.waits.push_back(SymbolicQueueWaitOp{
+							.batch = batchIndex,
+							.dstQueueSlot = qi,
+							.srcQueueSlot = src,
+							.phase = phase,
+							.symbolicValue = batch.GetQueueWaitFenceValue(phase, qi, src),
+						});
 						output.barriers.waitHash = rg::HashCombine(
 							output.barriers.waitHash,
-							batch.GetQueueWaitFenceValue(static_cast<BatchWaitPhase>(waitPhase), qi, src));
+							batch.GetQueueWaitFenceValue(phase, qi, src));
 					}
 				}
 			}
@@ -3000,19 +3057,45 @@ void RenderGraph::BuildCompiledSegments(
 					});
 				}
 				for (size_t transitionPhase = 0; transitionPhase < PassBatch::kTransitionPhaseCount; ++transitionPhase) {
-					const uint64_t transitionCount = static_cast<uint64_t>(batch.Transitions(qi, static_cast<BatchTransitionPhase>(transitionPhase)).size());
+					const auto phase = static_cast<BatchTransitionPhase>(transitionPhase);
+					const auto& transitions = batch.Transitions(qi, phase);
+					const uint64_t transitionCount = static_cast<uint64_t>(transitions.size());
 					segment.barriers.transitionCount += transitionCount;
 					segment.barriers.transitionHash = rg::HashCombine(
 						segment.barriers.transitionHash,
 						transitionCount);
+					for (const auto& transition : transitions) {
+						segment.barriers.transitions.push_back(SymbolicTransitionOp{
+							.batch = batchIndex,
+							.queueSlot = qi,
+							.phase = phase,
+							.resourceID = transition.pResource ? transition.pResource->GetGlobalResourceID() : 0ull,
+							.range = transition.range,
+							.prevAccessType = transition.prevAccessType,
+							.newAccessType = transition.newAccessType,
+							.prevLayout = transition.prevLayout,
+							.newLayout = transition.newLayout,
+							.prevSyncState = transition.prevSyncState,
+							.newSyncState = transition.newSyncState,
+							.discard = transition.discard,
+						});
+					}
 				}
 				for (size_t waitPhase = 0; waitPhase < PassBatch::kWaitPhaseCount; ++waitPhase) {
 					for (size_t src = 0; src < batch.QueueCount(); ++src) {
 						if (batch.HasQueueWait(static_cast<BatchWaitPhase>(waitPhase), qi, src)) {
+							const auto phase = static_cast<BatchWaitPhase>(waitPhase);
 							++segment.barriers.waitCount;
+							segment.barriers.waits.push_back(SymbolicQueueWaitOp{
+								.batch = batchIndex,
+								.dstQueueSlot = qi,
+								.srcQueueSlot = src,
+								.phase = phase,
+								.symbolicValue = batch.GetQueueWaitFenceValue(phase, qi, src),
+							});
 							segment.barriers.waitHash = rg::HashCombine(
 								segment.barriers.waitHash,
-								batch.GetQueueWaitFenceValue(static_cast<BatchWaitPhase>(waitPhase), qi, src));
+								batch.GetQueueWaitFenceValue(phase, qi, src));
 						}
 					}
 				}
@@ -3037,7 +3120,9 @@ void RenderGraph::BuildCompiledSegments(
 				&& loweredBarriers.loweredRequirementCount == cachedBarriers.loweredRequirementCount
 				&& loweredBarriers.transitionHash == cachedBarriers.transitionHash
 				&& loweredBarriers.waitHash == cachedBarriers.waitHash
-				&& loweredBarriers.signals.size() == cachedBarriers.signals.size();
+				&& loweredBarriers.signals.size() == cachedBarriers.signals.size()
+				&& loweredBarriers.transitions.size() == cachedBarriers.transitions.size()
+				&& loweredBarriers.waits.size() == cachedBarriers.waits.size();
 			if (barrierSummaryMatches) {
 				segment.barriersReused = true;
 				segment.barriers = cachedBarriers;
@@ -3223,20 +3308,44 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 	ZoneScopedN("RenderGraph::AutoScheduleAndBuildBatches");
 	const ScheduleCacheKeyParts scheduleCacheKeyParts = BuildScheduleCacheKeyParts(nodes);
 	const uint64_t scheduleCacheKey = scheduleCacheKeyParts.fullHash;
+	const uint64_t relaxedScheduleCacheKey = BuildRelaxedScheduleCacheKey(scheduleCacheKeyParts);
 	auto scheduleCacheIt = m_cachedScheduleIRByKey.find(scheduleCacheKey);
 	if (scheduleCacheIt != m_cachedScheduleIRByKey.end()) {
 		++m_compileCacheStats.scheduleCacheHits;
 		m_compiledScheduleIR = scheduleCacheIt->second;
 		ApplyCachedScheduleIR(m_compiledScheduleIR, nodes);
 		m_compileCacheStats.scheduleReusedPassCount += m_compiledScheduleIR.passStream.size();
+		m_cachedScheduleIRByRelaxedKey.emplace(relaxedScheduleCacheKey, m_compiledScheduleIR);
 		RecordCompileReuseEvent("ScheduleIR", "frame schedule", true, scheduleCacheKey, "schedule dependency/pass/queue signature matched cached schedule");
 	}
 	else {
-		++m_compileCacheStats.scheduleCacheMisses;
-		RecordCompileReuseEvent("ScheduleIR", "frame schedule", false, scheduleCacheKey, DescribeScheduleCacheMiss(scheduleCacheKeyParts, m_lastScheduleCacheKeyParts));
-		m_compiledScheduleIR = BuildScheduleIR(rg, passes, nodes);
-		m_cachedScheduleIRByKey.emplace(scheduleCacheKey, m_compiledScheduleIR);
-		m_cachedScheduleKeyPartsByKey.emplace(scheduleCacheKey, scheduleCacheKeyParts);
+		const bool onlyVolatileScheduleChanged =
+			m_compileCacheStats.volatileSchedulePassChanges > 0
+			&& m_compileCacheStats.nonVolatileSchedulePassChanges == 0;
+		auto relaxedCacheIt = m_cachedScheduleIRByRelaxedKey.find(relaxedScheduleCacheKey);
+		if (onlyVolatileScheduleChanged && relaxedCacheIt != m_cachedScheduleIRByRelaxedKey.end()) {
+			++m_compileCacheStats.scheduleCacheHits;
+			++m_compileCacheStats.scheduleRelaxedCacheHits;
+			m_compiledScheduleIR = relaxedCacheIt->second;
+			ApplyCachedScheduleIR(m_compiledScheduleIR, nodes);
+			m_compileCacheStats.scheduleReusedPassCount += m_compiledScheduleIR.passStream.size();
+			m_cachedScheduleIRByKey.emplace(scheduleCacheKey, m_compiledScheduleIR);
+			m_cachedScheduleKeyPartsByKey.emplace(scheduleCacheKey, scheduleCacheKeyParts);
+			RecordCompileReuseEvent(
+				"ScheduleIR",
+				"frame schedule",
+				true,
+				scheduleCacheKey,
+				"relaxed schedule cache hit: only readback/capture pass schedule hashes changed while topology and dependency edges matched");
+		}
+		else {
+			++m_compileCacheStats.scheduleCacheMisses;
+			RecordCompileReuseEvent("ScheduleIR", "frame schedule", false, scheduleCacheKey, DescribeScheduleCacheMiss(scheduleCacheKeyParts, m_lastScheduleCacheKeyParts));
+			m_compiledScheduleIR = BuildScheduleIR(rg, passes, nodes);
+			m_cachedScheduleIRByKey.emplace(scheduleCacheKey, m_compiledScheduleIR);
+			m_cachedScheduleKeyPartsByKey.emplace(scheduleCacheKey, scheduleCacheKeyParts);
+			m_cachedScheduleIRByRelaxedKey[relaxedScheduleCacheKey] = m_compiledScheduleIR;
+		}
 	}
 	m_lastScheduleCacheKeyParts = scheduleCacheKeyParts;
 	compileTrackers.clear();
@@ -4824,6 +4933,7 @@ void RenderGraph::ResetForRebuild()
 	m_compiledSegments.clear();
 	m_cachedPassIRByStableId.clear();
 	m_cachedScheduleIRByKey.clear();
+	m_cachedScheduleIRByRelaxedKey.clear();
 	m_cachedScheduleKeyPartsByKey.clear();
 	m_lastScheduleCacheKeyParts.reset();
 	m_cachedBarrierSegments.clear();

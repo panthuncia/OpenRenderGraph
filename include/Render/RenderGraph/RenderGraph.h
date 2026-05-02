@@ -1001,8 +1001,33 @@ private:
 		UINT64 symbolicValue = 0;
 	};
 
+	struct SymbolicTransitionOp {
+		unsigned int batch = 0;
+		size_t queueSlot = 0;
+		BatchTransitionPhase phase = BatchTransitionPhase::BeforePasses;
+		uint64_t resourceID = 0;
+		RangeSpec range{};
+		rhi::ResourceAccessType prevAccessType = rhi::ResourceAccessType::None;
+		rhi::ResourceAccessType newAccessType = rhi::ResourceAccessType::None;
+		rhi::ResourceLayout prevLayout = rhi::ResourceLayout::Common;
+		rhi::ResourceLayout newLayout = rhi::ResourceLayout::Common;
+		rhi::ResourceSyncState prevSyncState = rhi::ResourceSyncState::None;
+		rhi::ResourceSyncState newSyncState = rhi::ResourceSyncState::None;
+		bool discard = false;
+	};
+
+	struct SymbolicQueueWaitOp {
+		unsigned int batch = 0;
+		size_t dstQueueSlot = 0;
+		size_t srcQueueSlot = 0;
+		BatchWaitPhase phase = BatchWaitPhase::BeforeTransitions;
+		UINT64 symbolicValue = 0;
+	};
+
 	struct BarrierIR {
 		std::vector<SymbolicFenceToken> signals;
+		std::vector<SymbolicTransitionOp> transitions;
+		std::vector<SymbolicQueueWaitOp> waits;
 		uint64_t transitionHash = 0;
 		uint64_t waitHash = 0;
 		uint64_t transitionCount = 0;
@@ -1055,7 +1080,10 @@ private:
 		uint64_t passIRCacheMisses = 0;
 		uint64_t scheduleCacheHits = 0;
 		uint64_t scheduleCacheMisses = 0;
+		uint64_t scheduleRelaxedCacheHits = 0;
 		uint64_t scheduleReusedPassCount = 0;
+		uint64_t volatileSchedulePassChanges = 0;
+		uint64_t nonVolatileSchedulePassChanges = 0;
 		uint64_t normalizedAccessCount = 0;
 		uint64_t segmentCount = 0;
 		uint64_t barrierSegmentCacheHits = 0;
@@ -1111,6 +1139,7 @@ private:
 	std::vector<CompiledSegment> m_compiledSegments;
 	std::unordered_map<uint64_t, PassIR> m_cachedPassIRByStableId;
 	std::unordered_map<uint64_t, ScheduleIR> m_cachedScheduleIRByKey;
+	std::unordered_map<uint64_t, ScheduleIR> m_cachedScheduleIRByRelaxedKey;
 	std::unordered_map<uint64_t, ScheduleCacheKeyParts> m_cachedScheduleKeyPartsByKey;
 	std::optional<ScheduleCacheKeyParts> m_lastScheduleCacheKeyParts;
 	std::unordered_map<uint64_t, CompiledSegment> m_cachedBarrierSegments;
