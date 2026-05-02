@@ -3028,113 +3028,6 @@ std::vector<RenderGraph::CompiledSegmentDesc> RenderGraph::BuildCompiledSegmentD
 {
 	ZoneScopedN("RenderGraph::BuildCompiledSegmentDescriptorsFromSchedule");
 	std::vector<CompiledSegmentDesc> segments;
-	std::unordered_map<uint64_t, SymbolicTracker> descriptorTrackers;
-	std::vector<ResourceTransition> scratchTransitions;
-
-	auto resolveTrackedResource = [&](ResourceRegistry::RegistryHandle handle, uint64_t resourceID) -> Resource* {
-		if (handle.IsEphemeral()) {
-			return handle.GetEphemeralPtr();
-		}
-
-		auto resourceIt = resourcesByID.find(resourceID);
-		if (resourceIt != resourcesByID.end() && resourceIt->second) {
-			return resourceIt->second.get();
-		}
-
-		auto transientIt = m_transientFrameResourcesByID.find(resourceID);
-		if (transientIt != m_transientFrameResourcesByID.end() && transientIt->second) {
-			return transientIt->second.get();
-		}
-
-		return nullptr;
-	};
-
-	auto getOrCreateDescriptorTracker = [&](Resource* resource, uint64_t resourceID) -> SymbolicTracker& {
-		auto it = descriptorTrackers.find(resourceID);
-		if (it != descriptorTrackers.end()) {
-			return it->second;
-		}
-
-		SymbolicTracker seed{};
-		if (resource) {
-			bool hasLiveBacking = true;
-			if (auto* texture = dynamic_cast<PixelBuffer*>(resource)) {
-				hasLiveBacking = texture->IsMaterialized();
-			}
-			else if (auto* buffer = dynamic_cast<Buffer*>(resource)) {
-				hasLiveBacking = buffer->IsMaterialized();
-			}
-
-			if (hasLiveBacking) {
-				seed = *resource->GetStateTracker();
-			}
-		}
-
-		auto [insertedIt, _] = descriptorTrackers.emplace(resourceID, std::move(seed));
-		return insertedIt->second;
-	};
-
-	auto captureBoundaryStatesFromTrackers = [&](std::span<const CompiledSegmentDesc::BoundaryStateEntry> boundaryStates) {
-		std::vector<CompiledSegmentDesc::BoundaryStateEntry> captured;
-		captured.reserve(boundaryStates.size());
-		for (const auto& boundary : boundaryStates) {
-			Resource* resource = resolveTrackedResource(ResourceRegistry::RegistryHandle{}, boundary.resourceID);
-			auto& tracker = getOrCreateDescriptorTracker(resource, boundary.resourceID);
-			std::vector<Segment> trackedSegments = tracker.Query(boundary.range);
-			if (trackedSegments.empty()) {
-				captured.push_back(boundary);
-				continue;
-			}
-
-			for (const auto& trackedSegment : trackedSegments) {
-				captured.push_back(CompiledSegmentDesc::BoundaryStateEntry{
-					.resourceID = boundary.resourceID,
-					.range = trackedSegment.rangeSpec,
-					.state = trackedSegment.state,
-					.aliasSignature = boundary.aliasSignature,
-				});
-			}
-		}
-
-		return captured;
-	};
-
-	auto simulateScheduledPass = [&](const ScheduledPass& scheduled) {
-		if (scheduled.passIndex >= m_framePassSchedulingSummaries.size()) {
-			return;
-		}
-
-		const size_t passQueueSlot = scheduled.queueSlot;
-		const QueueKind passQueue = m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(passQueueSlot));
-		const auto& passSummary = m_framePassSchedulingSummaries[scheduled.passIndex];
-
-		for (const auto& requirement : passSummary.requirements) {
-			Resource* resource = resolveTrackedResource(requirement.resource, requirement.resourceID);
-			auto& tracker = getOrCreateDescriptorTracker(resource, requirement.resourceID);
-			const ResourceState requiredState = NormalizeStateForQueue(passQueue, requirement.state);
-			scratchTransitions.clear();
-			tracker.Apply(requirement.range, resource, requiredState, scratchTransitions);
-		}
-
-		const auto& anyPass = m_framePasses[scheduled.passIndex];
-		std::visit(
-			[&](const auto& pass) {
-				using PassType = std::decay_t<decltype(pass)>;
-				if constexpr (std::is_same_v<PassType, std::monostate>) {
-					return;
-				}
-				else {
-					for (const auto& exit : pass.resources.internalTransitions) {
-						const uint64_t resourceID = exit.first.resource.GetGlobalResourceID();
-						Resource* resource = resolveTrackedResource(exit.first.resource, resourceID);
-						auto& tracker = getOrCreateDescriptorTracker(resource, resourceID);
-						scratchTransitions.clear();
-						tracker.Apply(exit.first.range, resource, exit.second, scratchTransitions);
-					}
-				}
-			},
-			anyPass.pass);
-	};
 	auto closeSegment = [&](CompiledSegmentDesc& segment) {
 		if (segment.passCount == 0) {
 			return;
@@ -3203,26 +3096,23 @@ std::vector<RenderGraph::CompiledSegmentDesc> RenderGraph::BuildCompiledSegmentD
 		current.passContentHash = rg::HashCombine(current.passContentHash, passIR->barrierHash);
 
 		auto accumulateAccess = [&](const auto& access) {
-			const uint64_t accessStateHash = rg::HashCombine(access.resourceID, HashResourceState64(access.state));
 			const auto aliasIt = aliasPlacementSignatureByID.find(access.resourceID);
 			const uint64_t aliasSignature = aliasIt != aliasPlacementSignatureByID.end() ? aliasIt->second : 0ull;
 			const uint64_t boundaryKey = rg::HashCombine(access.resourceID, HashRangeSpec64(access.range));
 			if (currentSeenResources.insert(access.resourceID).second) {
-				current.entryStateHash = rg::HashCombine(current.entryStateHash, accessStateHash);
 				current.touchedResourceIDs.push_back(access.resourceID);
 			}
 			if (currentSeenBoundaryRanges.insert(boundaryKey).second) {
 				current.entryBoundaryStates.push_back(CompiledSegmentDesc::BoundaryStateEntry{
-					.resourceID = access.resourceID,
-					.range = access.range,
-					.state = access.state,
-					.aliasSignature = aliasSignature,
-				});
-			}
-			current.exitStateHash = rg::HashCombine(current.exitStateHash, accessStateHash);
+			.resourceID = access.resourceID,
+			.range = access.range,
+			.state = access.state,
+			.aliasSignature = aliasSignature,
+		});
+	}
 
-			auto [exitIt, inserted] = currentExitBoundaryIndexByKey.emplace(boundaryKey, current.exitBoundaryStates.size());
-			if (inserted) {
+	auto [exitIt, inserted] = currentExitBoundaryIndexByKey.emplace(boundaryKey, current.exitBoundaryStates.size());
+	if (inserted) {
 				current.exitBoundaryStates.push_back(CompiledSegmentDesc::BoundaryStateEntry{
 					.resourceID = access.resourceID,
 					.range = access.range,
@@ -3254,13 +3144,6 @@ std::vector<RenderGraph::CompiledSegmentDesc> RenderGraph::BuildCompiledSegmentD
 	}
 
 	for (auto& segment : segments) {
-		segment.entryBoundaryStates = captureBoundaryStatesFromTrackers(segment.entryBoundaryStates);
-		for (const auto& scheduled : segment.schedule.passStream) {
-			simulateScheduledPass(scheduled);
-		}
-		segment.exitBoundaryStates = captureBoundaryStatesFromTrackers(segment.exitBoundaryStates);
-		segment.entryStateHash = HashBoundaryStateEntries(segment.entryBoundaryStates);
-		segment.exitStateHash = HashBoundaryStateEntries(segment.exitBoundaryStates);
 		for (const auto& symbolicBatch : schedule.batches) {
 			if (symbolicBatch.id < segment.firstBatch || symbolicBatch.id > segment.lastBatch) {
 				continue;
@@ -3334,6 +3217,7 @@ std::vector<RenderGraph::SegmentPlan> RenderGraph::BuildSegmentPlans(
 	for (const auto& desc : segmentDescs) {
 		const uint64_t cacheKey = ComputeBarrierSegmentCacheKey(desc);
 		const bool cacheHit = m_cachedBarrierSegments.find(cacheKey) != m_cachedBarrierSegments.end();
+		const bool includeDetailedMissReason = m_getRenderGraphCompileDumpEnabled && m_getRenderGraphCompileDumpEnabled();
 		SegmentPlan plan{};
 		plan.kind = cacheHit ? SegmentPlanKind::Replay : SegmentPlanKind::Lower;
 		plan.segmentID = desc.id;
@@ -3346,7 +3230,7 @@ std::vector<RenderGraph::SegmentPlan> RenderGraph::BuildSegmentPlans(
 		plan.loweredRequirementCount = desc.loweredRequirementCount;
 		plan.reason = cacheHit
 			? "cached barrier segment available for current descriptor cache key"
-			: summarizeCompatibleCachedSegments(desc);
+			: (includeDetailedMissReason ? summarizeCompatibleCachedSegments(desc) : std::string{});
 		plans.push_back(std::move(plan));
 	}
 	return plans;
@@ -3917,6 +3801,156 @@ std::vector<RenderGraph::PassBatch> RenderGraph::BuildReplayedSegmentBatches(
 	return replayedBatches;
 }
 
+void RenderGraph::ReplaySegmentIntoFrameBatches(
+	const CompiledSegment& segment,
+	std::unordered_map<uint64_t, UINT64>& materializedSignalValuesByToken,
+	std::unordered_set<uint64_t>& materializedEnabledSignalTokens)
+{
+	ZoneScopedN("RenderGraph::ReplaySegmentIntoFrameBatches");
+	while (batches.size() <= segment.lastBatch) {
+		batches.emplace_back(m_queueRegistry.SlotCount(), m_frameSchedulingResourceCount);
+	}
+	for (uint32_t localBatch = 0; localBatch < segment.replay.localBatchCount; ++localBatch) {
+		const unsigned int globalBatch = segment.firstBatch + localBatch;
+		batches[globalBatch] = PassBatch(m_queueRegistry.SlotCount(), m_frameSchedulingResourceCount);
+	}
+
+	auto makeQueuedPass = [&](AnyPassAndResources& any) -> PassBatch::QueuedPass {
+		return std::visit(
+			[&](auto& pass) -> PassBatch::QueuedPass {
+				using PassT = std::decay_t<decltype(pass)>;
+				if constexpr (std::is_same_v<PassT, std::monostate>) {
+					throw std::runtime_error("Unexpected empty pass variant in RenderGraph::ReplaySegmentIntoFrameBatches");
+				}
+				else {
+					return &pass;
+				}
+			},
+			any.pass);
+	};
+
+	for (const auto& scheduled : segment.schedule.passStream) {
+		if (scheduled.passIndex >= m_framePasses.size()) {
+			continue;
+		}
+		if (scheduled.symbolicBatch < segment.firstBatch || scheduled.symbolicBatch > segment.lastBatch) {
+			continue;
+		}
+		AnyPassAndResources& any = m_framePasses[scheduled.passIndex];
+		PassBatch& batch = batches[scheduled.symbolicBatch];
+		batch.Passes(scheduled.queueSlot).push_back(makeQueuedPass(any));
+	}
+
+	for (const auto& membership : segment.replay.batchMembership) {
+		if (membership.localBatch >= segment.replay.localBatchCount) {
+			continue;
+		}
+		PassBatch& batch = batches[segment.firstBatch + membership.localBatch];
+		batch.allResources = membership.allResources;
+		batch.internallyTransitionedResources = membership.internallyTransitionedResources;
+	}
+
+	for (const auto& signal : segment.replay.signals) {
+		if (signal.signal.localBatch >= segment.replay.localBatchCount) {
+			continue;
+		}
+		PassBatch& batch = batches[segment.firstBatch + signal.signal.localBatch];
+		const size_t queueSlot = static_cast<size_t>(signal.signal.queueSlot);
+		batch.SetQueueSignalFenceValue(signal.signal.phase, queueSlot, signal.symbolicValue);
+		if (signal.enabled) {
+			batch.MarkQueueSignal(signal.signal.phase, queueSlot);
+		}
+	}
+
+	for (const auto& transition : segment.replay.transitions) {
+		if (transition.localBatch >= segment.replay.localBatchCount) {
+			continue;
+		}
+		PassBatch& batch = batches[segment.firstBatch + transition.localBatch];
+		Resource* resource = nullptr;
+		if (auto resourceRef = GetResourceByID(transition.resourceID)) {
+			resource = resourceRef.get();
+		}
+
+		auto resourceIndex = TryGetFrameSchedulingResourceIndex(transition.resourceID);
+		const size_t transitionResourceIndex = resourceIndex.value_or(0);
+		auto& transitions = batch.Transitions(static_cast<size_t>(transition.queueSlot), transition.phase);
+		transitions.emplace_back(
+			resource,
+			transition.range,
+			transition.before.access,
+			transition.after.access,
+			transition.before.layout,
+			transition.after.layout,
+			transition.before.sync,
+			transition.after.sync,
+			transition.discard);
+		if (resourceIndex.has_value()) {
+			batch.RecordTransitionPosition(
+				static_cast<size_t>(transition.queueSlot),
+				transition.phase,
+				transitionResourceIndex,
+				static_cast<uint32_t>(transitions.size() - 1));
+		}
+	}
+
+	std::unordered_map<uint64_t, UINT64> signalValueByRefKey;
+	signalValueByRefKey.reserve(segment.replay.signals.size());
+	auto encodeSignalRef = [](const CachedBarrierSignalRef& signalRef) -> uint64_t {
+		uint64_t key = 0;
+		key = rg::HashCombine(key, static_cast<uint64_t>(signalRef.localBatch));
+		key = rg::HashCombine(key, static_cast<uint64_t>(signalRef.queueSlot));
+		key = rg::HashCombine(key, static_cast<uint64_t>(signalRef.phase));
+		return key;
+	};
+	auto encodeSignalToken = [](const CachedBarrierSignalToken& signalToken) -> uint64_t {
+		uint64_t key = 0;
+		key = rg::HashCombine(key, static_cast<uint64_t>(signalToken.batch));
+		key = rg::HashCombine(key, static_cast<uint64_t>(signalToken.queueSlot));
+		key = rg::HashCombine(key, static_cast<uint64_t>(signalToken.phase));
+		return key;
+	};
+	for (const auto& signal : segment.replay.signals) {
+		signalValueByRefKey[encodeSignalRef(signal.signal)] = signal.symbolicValue;
+	}
+
+	for (const auto& wait : segment.replay.waits) {
+		if (wait.localBatch >= segment.replay.localBatchCount) {
+			continue;
+		}
+
+		UINT64 waitValue = wait.symbolicValue;
+		if (wait.sourceSignalInSegment) {
+			auto signalIt = signalValueByRefKey.find(encodeSignalRef(wait.sourceSignal));
+			if (signalIt == signalValueByRefKey.end()) {
+				continue;
+			}
+			waitValue = signalIt->second;
+		}
+		else if (wait.sourceSignalGlobalKnown) {
+			const uint64_t signalTokenKey = encodeSignalToken(wait.globalSourceSignal);
+			if (!materializedEnabledSignalTokens.contains(signalTokenKey)) {
+				throw std::runtime_error("Segment replay external wait references a disabled materialized signal");
+			}
+			auto signalIt = materializedSignalValuesByToken.find(signalTokenKey);
+			if (signalIt == materializedSignalValuesByToken.end()) {
+				throw std::runtime_error("Segment replay external wait references an unresolved materialized signal");
+			}
+			waitValue = signalIt->second;
+		}
+		else {
+			throw std::runtime_error("Segment replay external wait has no source signal token");
+		}
+
+		PassBatch& batch = batches[segment.firstBatch + wait.localBatch];
+		batch.AddQueueWait(
+			wait.phase,
+			static_cast<size_t>(wait.dstQueueSlot),
+			static_cast<size_t>(wait.srcQueueSlot),
+			waitValue);
+	}
+}
+
 std::vector<RenderGraph::PassBatch> RenderGraph::BuildReplayedFrameBatches()
 {
 	ZoneScopedN("RenderGraph::BuildReplayedFrameBatches");
@@ -4161,9 +4195,6 @@ bool RenderGraph::TryMaterializeSegmentsWithReplayAndLowering(
 	if (segmentDescs.empty()) {
 		return false;
 	}
-	if (m_compileCacheStats.plannedReplaySegmentCount == 0) {
-		return false;
-	}
 
 	rg.batches.clear();
 	rg.batches.emplace_back(rg.m_queueRegistry.SlotCount(), rg.m_frameSchedulingResourceCount);
@@ -4312,12 +4343,6 @@ bool RenderGraph::TryMaterializeSegmentsWithReplayAndLowering(
 		return oss.str();
 	};
 
-	auto ensureBatchSlot = [&](unsigned int batchIndex) {
-		while (rg.batches.size() <= batchIndex) {
-			rg.batches.emplace_back(rg.m_queueRegistry.SlotCount(), rg.m_frameSchedulingResourceCount);
-		}
-	};
-
 	bool replayedAnySegment = false;
 	bool loweredAnySegment = false;
 	std::unordered_map<uint64_t, UINT64> materializedSignalValuesByToken;
@@ -4329,8 +4354,12 @@ bool RenderGraph::TryMaterializeSegmentsWithReplayAndLowering(
 		key = rg::HashCombine(key, static_cast<uint64_t>(phase));
 		return key;
 	};
-	auto registerMaterializedSignals = [&]() {
-		for (unsigned int batchIndex = 0; batchIndex < rg.batches.size(); ++batchIndex) {
+	auto registerMaterializedSignalsForRange = [&](unsigned int firstBatch, unsigned int lastBatch) {
+		if (rg.batches.empty()) {
+			return;
+		}
+		const unsigned int cappedLastBatch = std::min<unsigned int>(lastBatch, static_cast<unsigned int>(rg.batches.size() - 1));
+		for (unsigned int batchIndex = firstBatch; batchIndex <= cappedLastBatch; ++batchIndex) {
 			auto& batch = rg.batches[batchIndex];
 			for (size_t queueSlot = 0; queueSlot < batch.QueueCount(); ++queueSlot) {
 				for (size_t phaseIndex = 0; phaseIndex < PassBatch::kSignalPhaseCount; ++phaseIndex) {
@@ -4368,8 +4397,155 @@ bool RenderGraph::TryMaterializeSegmentsWithReplayAndLowering(
 			}
 			rg.batches[*lastActiveBatch].MarkQueueSignal(BatchSignalPhase::AfterCompletion, queueSlot);
 		}
-		registerMaterializedSignals();
+		registerMaterializedSignalsForRange(desc.firstBatch, desc.lastBatch);
 	};
+	auto refreshReplaySignalEnablesFromBatches = [&](CompiledSegment& segment) {
+		for (auto& signal : segment.replay.signals) {
+			const unsigned int globalBatch = segment.firstBatch + static_cast<unsigned int>(signal.signal.localBatch);
+			if (globalBatch >= rg.batches.size()) {
+				signal.enabled = false;
+				continue;
+			}
+			signal.enabled = rg.batches[globalBatch].HasQueueSignal(
+				signal.signal.phase,
+				static_cast<size_t>(signal.signal.queueSlot));
+		}
+	};
+	const bool validateReplayForDump = m_getRenderGraphCompileDumpEnabled && m_getRenderGraphCompileDumpEnabled();
+	auto extractLoweredCompiledSegment = [&](const CompiledSegmentDesc& desc,
+		std::vector<CompiledSegmentDesc::BoundaryStateEntry> entryBoundaryStates,
+		std::vector<CompiledSegmentDesc::BoundaryStateEntry> exitBoundaryStates,
+		uint64_t entryStateHash) {
+		CompiledSegment segment{};
+		segment.id = desc.id;
+		segment.name = desc.name;
+		segment.firstPassStreamIndex = desc.firstPassStreamIndex;
+		segment.passCount = desc.passCount;
+		segment.firstBatch = desc.firstBatch;
+		segment.lastBatch = desc.lastBatch;
+		segment.passes = desc.passes;
+		segment.touchedResourceIDs = desc.touchedResourceIDs;
+		segment.entryBoundaryStates = std::move(entryBoundaryStates);
+		segment.exitBoundaryStates = std::move(exitBoundaryStates);
+		segment.segmentStructureHash = desc.segmentStructureHash;
+		segment.passContentHash = desc.passContentHash;
+		segment.aliasSignatureHash = desc.aliasSignatureHash;
+		segment.queueAssignmentHash = desc.queueAssignmentHash;
+		segment.entryStateHash = entryStateHash;
+		segment.exitStateHash = HashBoundaryStateEntries(segment.exitBoundaryStates);
+		segment.loweredRequirementCount = desc.loweredRequirementCount;
+		segment.schedule = desc.schedule;
+
+		for (unsigned int batchIndex = segment.firstBatch; batchIndex <= segment.lastBatch && batchIndex < rg.batches.size(); ++batchIndex) {
+			const auto& batch = rg.batches[batchIndex];
+			for (size_t qi = 0; qi < batch.QueueCount(); ++qi) {
+				for (size_t phase = 0; phase < PassBatch::kSignalPhaseCount; ++phase) {
+					segment.barriers.signals.push_back(SymbolicFenceToken{
+						.batch = batchIndex,
+						.queueSlot = qi,
+						.phase = static_cast<BatchSignalPhase>(phase),
+						.symbolicValue = batch.GetQueueSignalFenceValue(static_cast<BatchSignalPhase>(phase), qi),
+					});
+				}
+				for (size_t transitionPhase = 0; transitionPhase < PassBatch::kTransitionPhaseCount; ++transitionPhase) {
+					const auto phase = static_cast<BatchTransitionPhase>(transitionPhase);
+					const auto& transitions = batch.Transitions(qi, phase);
+					const uint64_t transitionCount = static_cast<uint64_t>(transitions.size());
+					segment.barriers.transitionCount += transitionCount;
+					segment.barriers.transitionHash = rg::HashCombine(segment.barriers.transitionHash, transitionCount);
+					for (const auto& transition : transitions) {
+						segment.barriers.transitions.push_back(SymbolicTransitionOp{
+							.batch = batchIndex,
+							.queueSlot = qi,
+							.phase = phase,
+							.resourceID = transition.pResource ? transition.pResource->GetGlobalResourceID() : 0ull,
+							.range = transition.range,
+							.prevAccessType = transition.prevAccessType,
+							.newAccessType = transition.newAccessType,
+							.prevLayout = transition.prevLayout,
+							.newLayout = transition.newLayout,
+							.prevSyncState = transition.prevSyncState,
+							.newSyncState = transition.newSyncState,
+							.discard = transition.discard,
+						});
+					}
+				}
+				for (size_t waitPhase = 0; waitPhase < PassBatch::kWaitPhaseCount; ++waitPhase) {
+					for (size_t src = 0; src < batch.QueueCount(); ++src) {
+						if (!batch.HasQueueWait(static_cast<BatchWaitPhase>(waitPhase), qi, src)) {
+							continue;
+						}
+						const auto phase = static_cast<BatchWaitPhase>(waitPhase);
+						++segment.barriers.waitCount;
+						const UINT64 waitValue = batch.GetQueueWaitFenceValue(phase, qi, src);
+						segment.barriers.waits.push_back(SymbolicQueueWaitOp{
+							.batch = batchIndex,
+							.dstQueueSlot = qi,
+							.srcQueueSlot = src,
+							.phase = phase,
+							.symbolicValue = waitValue,
+						});
+						segment.barriers.waitHash = rg::HashCombine(segment.barriers.waitHash, waitValue);
+					}
+				}
+			}
+		}
+
+		segment.replay = BuildCachedBarrierSegmentReplay(segment);
+		segment.cacheKey = ComputeBarrierSegmentCacheKey(desc, segment.entryStateHash);
+		if (validateReplayForDump) {
+			try {
+				ValidateReplayedSegmentBatches(
+					segment,
+					BuildReplayedSegmentBatches(segment, &materializedSignalValuesByToken, &materializedEnabledSignalTokens));
+			}
+			catch (const std::exception& ex) {
+				RecordCompileReuseEvent("ReplayValidation", segment.name, false, segment.cacheKey, ex.what());
+			}
+		}
+
+		auto cacheIt = m_cachedBarrierSegments.find(segment.cacheKey);
+		if (cacheIt != m_cachedBarrierSegments.end()) {
+			segment.barrierCacheHit = true;
+			++m_compileCacheStats.barrierSegmentCacheHits;
+			const BarrierIR loweredBarriers = segment.barriers;
+			const BarrierIR& cachedBarriers = cacheIt->second.barriers;
+			const bool barrierSummaryMatches =
+				loweredBarriers.transitionCount == cachedBarriers.transitionCount
+				&& loweredBarriers.waitCount == cachedBarriers.waitCount
+				&& loweredBarriers.loweredRequirementCount == cachedBarriers.loweredRequirementCount
+				&& loweredBarriers.transitionHash == cachedBarriers.transitionHash
+				&& loweredBarriers.waitHash == cachedBarriers.waitHash
+				&& loweredBarriers.signals.size() == cachedBarriers.signals.size()
+				&& loweredBarriers.transitions.size() == cachedBarriers.transitions.size()
+				&& loweredBarriers.waits.size() == cachedBarriers.waits.size();
+			if (barrierSummaryMatches) {
+				segment.barriersReused = true;
+				segment.barriers = cachedBarriers;
+				segment.barrierReuseReason = "symbolic barrier metadata reused from matching segment; concrete PassBatch materialization still reran";
+				++m_compileCacheStats.barrierSegmentReused;
+				m_compileCacheStats.barrierSegmentReusableLoweredRequirements += segment.loweredRequirementCount;
+			}
+			else {
+				segment.barriersReused = false;
+				segment.barrierReuseReason = "barrier cache key matched but lowered barrier summary changed; cache key is missing an input";
+			}
+			cacheIt->second = segment;
+			++m_compileCacheStats.barrierSegmentRecompiled;
+		}
+		else {
+			segment.barrierCacheHit = false;
+			++m_compileCacheStats.barrierSegmentCacheMisses;
+			segment.barriersReused = false;
+			segment.barrierReuseReason = "no cached barrier segment for structure/pass/alias/queue/entry-state signature";
+			++m_compileCacheStats.barrierSegmentRecompiled;
+			m_cachedBarrierSegments.emplace(segment.cacheKey, segment);
+		}
+
+		return segment;
+	};
+	m_compiledSegments.clear();
+	m_compiledSegments.reserve(segmentDescs.size());
 
 	for (size_t descIndex = 0; descIndex < segmentDescs.size(); ++descIndex) {
 		const auto& desc = segmentDescs[descIndex];
@@ -4394,7 +4570,7 @@ bool RenderGraph::TryMaterializeSegmentsWithReplayAndLowering(
 			segment.lastBatch = desc.lastBatch;
 			segment.passes = desc.passes;
 			segment.touchedResourceIDs = desc.touchedResourceIDs;
-			segment.entryBoundaryStates = std::move(actualEntryBoundaryStates);
+			segment.entryBoundaryStates = actualEntryBoundaryStates;
 			segment.segmentStructureHash = desc.segmentStructureHash;
 			segment.passContentHash = desc.passContentHash;
 			segment.aliasSignatureHash = desc.aliasSignatureHash;
@@ -4408,39 +4584,38 @@ bool RenderGraph::TryMaterializeSegmentsWithReplayAndLowering(
 			segment.barrierReuseReason = "symbolic barrier metadata reused from matching segment; concrete PassBatch materialization replayed cached segment";
 
 			try {
-				std::vector<PassBatch> replayedSegmentBatches = BuildReplayedSegmentBatches(
+				ReplaySegmentIntoFrameBatches(
 					segment,
-					&materializedSignalValuesByToken,
-					&materializedEnabledSignalTokens);
-				for (size_t localBatch = 0; localBatch < replayedSegmentBatches.size(); ++localBatch) {
-					const unsigned int globalBatch = segment.firstBatch + static_cast<unsigned int>(localBatch);
-					ensureBatchSlot(globalBatch);
-					rg.batches[globalBatch] = std::move(replayedSegmentBatches[localBatch]);
-				}
+					materializedSignalValuesByToken,
+					materializedEnabledSignalTokens);
 				markAndRegisterSegmentBoundarySignals(desc);
+				refreshReplaySignalEnablesFromBatches(segment);
 				ApplyReplayedSegmentCompilerState(segment);
-				std::vector<CompiledSegmentDesc::BoundaryStateEntry> actualExitBoundaryStates = CaptureActualBoundaryStates(segment.exitBoundaryStates);
-				const uint64_t actualExitStateHash = HashBoundaryStateEntries(actualExitBoundaryStates);
-				m_actualExitBoundaryStatesBySegmentId[desc.id] = actualExitBoundaryStates;
-				if (actualExitStateHash != segment.exitStateHash) {
-					std::ostringstream replayMismatchReason;
-					replayMismatchReason
-						<< "replayed segment exit-state mismatch: segment='" << desc.name
-						<< "' batches=[" << desc.firstBatch << "," << desc.lastBatch << "]"
-						<< " cache_key=" << cacheKey
-						<< " expected_exit_hash=" << segment.exitStateHash
-						<< " actual_exit_hash=" << actualExitStateHash
-						<< ' ' << summarizeBoundaryStateDifferences("exit", segment.exitBoundaryStates, actualExitBoundaryStates);
-					if (recordReuseEvents) {
-						RecordCompileReuseEvent("BarrierSegmentReplayExitState", desc.name, false, cacheKey, replayMismatchReason.str());
+				m_actualExitBoundaryStatesBySegmentId[desc.id] = segment.exitBoundaryStates;
+				if (m_getRenderGraphCompileDumpEnabled && m_getRenderGraphCompileDumpEnabled()) {
+					std::vector<CompiledSegmentDesc::BoundaryStateEntry> actualExitBoundaryStates = CaptureActualBoundaryStates(segment.exitBoundaryStates);
+					const uint64_t actualExitStateHash = HashBoundaryStateEntries(actualExitBoundaryStates);
+					if (actualExitStateHash != segment.exitStateHash) {
+						std::ostringstream replayMismatchReason;
+						replayMismatchReason
+							<< "replayed segment exit-state mismatch: segment='" << desc.name
+							<< "' batches=[" << desc.firstBatch << "," << desc.lastBatch << "]"
+							<< " cache_key=" << cacheKey
+							<< " expected_exit_hash=" << segment.exitStateHash
+							<< " actual_exit_hash=" << actualExitStateHash
+							<< ' ' << summarizeBoundaryStateDifferences("exit", segment.exitBoundaryStates, actualExitBoundaryStates);
+						if (recordReuseEvents) {
+							RecordCompileReuseEvent("BarrierSegmentReplayExitState", desc.name, false, cacheKey, replayMismatchReason.str());
+						}
+						spdlog::warn("RenderGraph::TryMaterializeSegmentsWithReplayAndLowering: {}", replayMismatchReason.str());
 					}
-					spdlog::warn("RenderGraph::TryMaterializeSegmentsWithReplayAndLowering: {}", replayMismatchReason.str());
 				}
 				replayedAnySegment = true;
 				++m_compileCacheStats.materializedReplaySegmentCount;
 				if (recordReuseEvents) {
 					RecordCompileReuseEvent("BarrierSegment", segment.name, true, segment.cacheKey, segment.barrierReuseReason);
 				}
+				m_compiledSegments.push_back(std::move(segment));
 				continue;
 			}
 			catch (const std::exception& ex) {
@@ -4474,7 +4649,8 @@ bool RenderGraph::TryMaterializeSegmentsWithReplayAndLowering(
 		AppendLoweredScheduleBatches(rg, passes, nodes, desc.schedule, desc.firstBatch);
 		m_activeLoweringBatchRange.reset();
 		markAndRegisterSegmentBoundarySignals(desc);
-		m_actualExitBoundaryStatesBySegmentId[desc.id] = CaptureActualBoundaryStates(desc.exitBoundaryStates);
+		std::vector<CompiledSegmentDesc::BoundaryStateEntry> actualExitBoundaryStates = CaptureActualBoundaryStates(desc.exitBoundaryStates);
+		m_actualExitBoundaryStatesBySegmentId[desc.id] = actualExitBoundaryStates;
 		loweredAnySegment = true;
 		++m_compileCacheStats.materializedLowerSegmentCount;
 		if (recordReuseEvents) {
@@ -4485,6 +4661,11 @@ bool RenderGraph::TryMaterializeSegmentsWithReplayAndLowering(
 				cacheKey,
 				"lowered this segment with segment-boundary-fenced transition placement; later segments remain eligible for replay");
 		}
+		m_compiledSegments.push_back(extractLoweredCompiledSegment(
+			desc,
+			std::move(actualEntryBoundaryStates),
+			std::move(actualExitBoundaryStates),
+			actualEntryStateHash));
 	}
 
 	if (!replayedAnySegment && !loweredAnySegment) {
@@ -4501,7 +4682,7 @@ bool RenderGraph::TryMaterializeSegmentsWithReplayAndLowering(
 		m_compiledScheduleIR.structureHash,
 		materializationReason);
 
-	BuildCompiledSegments(segmentDescs);
+	m_compileCacheStats.segmentCount = m_compiledSegments.size();
 	m_compiledBarrierIR = BuildBarrierIRFromCompiledSegments(m_compiledSegments);
 	FinalizeBatchesFromIR(rg, passes, m_compiledScheduleIR, m_compiledBarrierIR);
 	if (m_getRenderGraphCompileDumpEnabled && m_getRenderGraphCompileDumpEnabled()) {
