@@ -54,9 +54,9 @@ public:
 	}
 
     virtual uint64_t GetGlobalResourceID() const override {
-        if (resource) {
-            return resource->GetGlobalResourceID();
-        }
+        // Dynamic resources represent a stable logical owner whose backing may
+        // change frame to frame. Returning the backing ID breaks render-graph
+        // caches and replay metadata that need an invariant resource identity.
         return m_globalResourceID;
 	}
 

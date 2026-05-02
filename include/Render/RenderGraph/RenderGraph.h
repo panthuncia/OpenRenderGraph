@@ -11,6 +11,7 @@
 #include <span>
 #include <utility>
 #include <array>
+#include <sstream>
 #include <spdlog/spdlog.h>
 #include <rhi.h>
 #include <tracy/Tracy.hpp>
@@ -1144,6 +1145,24 @@ private:
 		std::vector<CachedResourceEvent> resourceEvents;
 	};
 
+	enum class SegmentPlanKind : uint8_t {
+		Replay,
+		Lower,
+	};
+
+	struct SegmentPlan {
+		SegmentPlanKind kind = SegmentPlanKind::Lower;
+		uint64_t segmentID = 0;
+		std::string name;
+		size_t firstPassStreamIndex = 0;
+		size_t passCount = 0;
+		unsigned int firstBatch = 0;
+		unsigned int lastBatch = 0;
+		uint64_t cacheKey = 0;
+		uint64_t loweredRequirementCount = 0;
+		std::string reason;
+	};
+
 	struct CompiledSegment {
 		uint64_t id = 0;
 		std::string name;
@@ -1196,6 +1215,12 @@ private:
 		uint64_t barrierSegmentReused = 0;
 		uint64_t barrierSegmentRecompiled = 0;
 		uint64_t barrierSegmentReusableLoweredRequirements = 0;
+		uint64_t plannedReplaySegmentCount = 0;
+		uint64_t plannedLowerSegmentCount = 0;
+		uint64_t plannedReplayLoweredRequirements = 0;
+		uint64_t plannedLoweredRequirements = 0;
+		uint64_t materializedReplaySegmentCount = 0;
+		uint64_t materializedLowerSegmentCount = 0;
 		uint64_t loweredRequirementCount = 0;
 	};
 
@@ -1255,6 +1280,9 @@ private:
 	std::unordered_map<uint64_t, ScheduleCacheKeyParts> m_cachedScheduleKeyPartsByKey;
 	std::optional<ScheduleCacheKeyParts> m_lastScheduleCacheKeyParts;
 	std::unordered_map<uint64_t, CompiledSegment> m_cachedBarrierSegments;
+	std::vector<SegmentPlan> m_lastSegmentPlans;
+	std::unordered_map<uint64_t, std::vector<CompiledSegmentDesc::BoundaryStateEntry>> m_actualEntryBoundaryStatesBySegmentId;
+	std::unordered_map<uint64_t, std::vector<CompiledSegmentDesc::BoundaryStateEntry>> m_actualExitBoundaryStatesBySegmentId;
 	CompileCacheStats m_compileCacheStats;
 	std::vector<CompileReuseEvent> m_compileReuseEvents;
 	std::unordered_map<uint64_t, uint64_t> aliasPlacementPoolByID;
@@ -1277,6 +1305,10 @@ private:
 	std::shared_ptr<rg::runtime::ITaskService> m_taskService;
 	std::unordered_map<uint64_t, SymbolicTracker*> trackers; // Tracks the state of resources in the graph.
 	std::unordered_map<uint64_t, SymbolicTracker> compileTrackers; // Compile-only symbolic state, decoupled from backing lifetime.
+	std::optional<std::pair<unsigned int, unsigned int>> m_activeLoweringBatchRange;
+	std::string m_activeMaterializingSegmentName;
+	std::string m_activeMaterializingSegmentMode;
+	std::optional<std::pair<unsigned int, unsigned int>> m_activeMaterializingSegmentBatchRange;
 	std::unordered_map<uint64_t, LastProducerAcrossFrames> m_lastProducerByResourceAcrossFrames;
 	std::unordered_map<uint64_t, std::vector<LastAliasPlacementProducerAcrossFrames>> m_lastAliasPlacementProducersByPoolAcrossFrames;
 	std::vector<std::unordered_map<uint64_t, unsigned int>> m_compiledLastProducerBatchByResourceByQueue;
@@ -1369,7 +1401,7 @@ private:
 	void RefreshRetainedDeclarationsForFrame(ComputePassAndResources& p, uint8_t frameIndex);
 	void RefreshRetainedDeclarationsForFrame(CopyPassAndResources& p, uint8_t frameIndex);
 	void CompileFrame(rhi::Device device, uint8_t frameIndex, const IHostExecutionData* hostData);
-	void WriteCompiledGraphDebugDump(uint8_t frameIndex, const std::vector<Node>& nodes) const;
+	void WriteCompiledGraphDebugDump(uint8_t frameIndex, const std::vector<Node>& nodes, std::string_view dumpVariant = {}) const;
 	void WriteVramUsageDebugDump(uint8_t frameIndex) const;
 	AnyPassAndResources MaterializeExternalPass(const ExternalPassDesc& desc, bool callSetup, bool materializeReferencedResources);
 	void RegisterExternalPassName(const ExternalPassDesc& desc, AnyPassAndResources& any);
@@ -1421,6 +1453,118 @@ private:
 			return;
 		}
 
+		// figure out which two numbers we wait on
+		auto [lastTransBatch, lastProdBatch, lastUsageBatch] =
+			GetBatchesToWaitOn(pass, sourceQueueSlot, resourcesTransitionedThisPass);
+
+		auto describeResourceName = [&](uint64_t resourceID) -> std::string {
+			auto it = resourcesByID.find(resourceID);
+			if (it != resourcesByID.end() && it->second && !it->second->GetName().empty()) {
+				return it->second->GetName();
+			}
+			auto transientIt = m_transientFrameResourcesByID.find(resourceID);
+			if (transientIt != m_transientFrameResourcesByID.end() && transientIt->second && !transientIt->second->GetName().empty()) {
+				return transientIt->second->GetName();
+			}
+			return std::string("<unknown>");
+		};
+
+		auto describeUnmappedBatchContributors = [&](int offendingBatchIndex) -> std::string {
+			std::ostringstream oss;
+			bool wroteAny = false;
+
+			auto appendContributor = [&](const char* origin,
+				uint64_t ownerResourceID,
+				uint64_t equivalentResourceID,
+				size_t resourceIndex,
+				unsigned int transitionBatch,
+				unsigned int producerBatch,
+				unsigned int usageBatch) {
+				if (transitionBatch != static_cast<unsigned int>(offendingBatchIndex)
+					&& producerBatch != static_cast<unsigned int>(offendingBatchIndex)
+					&& usageBatch != static_cast<unsigned int>(offendingBatchIndex)) {
+					return;
+				}
+
+				if (wroteAny) {
+					oss << "; ";
+				}
+				wroteAny = true;
+				oss << origin
+					<< " owner=" << ownerResourceID << "('" << describeResourceName(ownerResourceID) << "')"
+					<< " eq=" << equivalentResourceID
+					<< " idx=" << resourceIndex
+					<< " transition=" << transitionBatch
+					<< " producer=" << producerBatch
+					<< " usage=" << usageBatch;
+			};
+
+			for (const auto& req : pass.resources.frameResourceRequirements) {
+				const uint64_t ownerResourceID = req.resourceHandleAndRange.resource.GetGlobalResourceID();
+				for (uint64_t equivalentResourceID : GetSchedulingEquivalentIDsCached(ownerResourceID)) {
+					auto resourceIndex = TryGetFrameSchedulingResourceIndex(equivalentResourceID);
+					if (!resourceIndex.has_value()) {
+						continue;
+					}
+					appendContributor(
+						"req",
+						ownerResourceID,
+						equivalentResourceID,
+						*resourceIndex,
+						GetFrameQueueHistoryValue(m_frameQueueLastTransitionBatch, sourceQueueSlot, *resourceIndex),
+						GetFrameQueueHistoryValue(m_frameQueueLastProducerBatch, sourceQueueSlot, *resourceIndex),
+						GetFrameQueueHistoryValue(m_frameQueueLastUsageBatch, sourceQueueSlot, *resourceIndex));
+				}
+			}
+
+			for (uint64_t transitionedResourceID : resourcesTransitionedThisPass) {
+				for (uint64_t equivalentResourceID : GetSchedulingEquivalentIDsCached(transitionedResourceID)) {
+					auto resourceIndex = TryGetFrameSchedulingResourceIndex(equivalentResourceID);
+					if (!resourceIndex.has_value()) {
+						continue;
+					}
+					appendContributor(
+						"transitioned",
+						transitionedResourceID,
+						equivalentResourceID,
+						*resourceIndex,
+						GetFrameQueueHistoryValue(m_frameQueueLastTransitionBatch, sourceQueueSlot, *resourceIndex),
+						GetFrameQueueHistoryValue(m_frameQueueLastProducerBatch, sourceQueueSlot, *resourceIndex),
+						GetFrameQueueHistoryValue(m_frameQueueLastUsageBatch, sourceQueueSlot, *resourceIndex));
+				}
+			}
+
+			if (!wroteAny) {
+				oss << "<no matching resource history contributor>";
+			}
+
+			return oss.str();
+		};
+
+		auto logUnmappedBatch = [&](const char* reason, int batchIndex) {
+			const auto activeLoweringRange = m_activeLoweringBatchRange.value_or(std::pair<unsigned int, unsigned int>{ 0u, 0u });
+			const auto activeMaterializingRange = m_activeMaterializingSegmentBatchRange.value_or(std::pair<unsigned int, unsigned int>{ 0u, 0u });
+			spdlog::error(
+				"RenderGraph::applySynchronization: {} references unmapped batch index {} while currentBatchIndex={} and batches.size()={} pass='{}' passQueueSlot={} sourceQueueSlot={} wait_batches=[trans={}, prod={}, usage={}] active_lowering_range=[{},{}] active_segment_mode='{}' active_segment='{}' active_segment_range=[{},{}] contributors={}",
+				reason,
+				batchIndex,
+				currentBatchIndex,
+				batches.size(),
+				pass.name,
+				passQueueSlot,
+				sourceQueueSlot,
+				lastTransBatch,
+				lastProdBatch,
+				lastUsageBatch,
+				activeLoweringRange.first,
+				activeLoweringRange.second,
+				m_activeMaterializingSegmentMode,
+				m_activeMaterializingSegmentName,
+				activeMaterializingRange.first,
+				activeMaterializingRange.second,
+				describeUnmappedBatchContributors(batchIndex));
+		};
+
 		auto markSourceCompletionSignal = [&](int batchIndex) {
 			if (batchIndex <= 0) {
 				return;
@@ -1428,6 +1572,11 @@ private:
 
 			if (static_cast<unsigned int>(batchIndex) == currentBatchIndex) {
 				currentBatch.MarkQueueSignal(BatchSignalPhase::AfterCompletion, sourceQueueSlot);
+				return;
+			}
+
+			if (static_cast<unsigned int>(batchIndex) >= batches.size()) {
+				logUnmappedBatch("source completion signal", batchIndex);
 				return;
 			}
 
@@ -1443,12 +1592,13 @@ private:
 				return currentBatch.GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, sourceQueueSlot);
 			}
 
+			if (static_cast<unsigned int>(batchIndex) >= batches.size()) {
+				logUnmappedBatch("source completion fence", batchIndex);
+				return 0;
+			}
+
 			return batches[batchIndex].GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, sourceQueueSlot);
 		};
-
-		// figure out which two numbers we wait on
-		auto [lastTransBatch, lastProdBatch, lastUsageBatch] =
-			GetBatchesToWaitOn(pass, sourceQueueSlot, resourcesTransitionedThisPass);
 
 		// Handle the "transition" wait
 		if (lastTransBatch != -1) {
@@ -1587,11 +1737,39 @@ private:
 		const BarrierLoweringInput& input);
 	std::vector<CompiledSegmentDesc> BuildCompiledSegmentDescriptorsFromSchedule(
 		const ScheduleIR& schedule) const;
+	std::vector<SegmentPlan> BuildSegmentPlans(
+		const std::vector<CompiledSegmentDesc>& segmentDescs) const;
+	uint64_t ComputeBarrierSegmentCacheKey(const CompiledSegmentDesc& desc) const;
+	uint64_t ComputeBarrierSegmentCacheKey(const CompiledSegmentDesc& desc, uint64_t entryStateHash) const;
+	uint64_t HashBoundaryStateEntries(std::span<const CompiledSegmentDesc::BoundaryStateEntry> boundaryStates) const;
+	std::vector<CompiledSegmentDesc::BoundaryStateEntry> CaptureActualBoundaryStates(
+		std::span<const CompiledSegmentDesc::BoundaryStateEntry> boundaryStates);
+	void ApplyExactBoundaryStates(
+		std::span<const CompiledSegmentDesc::BoundaryStateEntry> boundaryStates);
+	BarrierIR BuildBarrierIRFromCompiledSegments(const std::vector<CompiledSegment>& segments) const;
+	bool TryBuildCompiledSegmentsFromCache(
+		const std::vector<CompiledSegmentDesc>& segmentDescs,
+		std::vector<CompiledSegment>& outSegments,
+		bool recordReuseEvents);
 	CachedBarrierSegmentReplay BuildCachedBarrierSegmentReplay(
 		const CompiledSegment& segment) const;
 	std::vector<PassBatch> BuildReplayedSegmentBatches(
 		const CompiledSegment& segment);
 	std::vector<PassBatch> BuildReplayedFrameBatches();
+	void ApplyReplayedSegmentCompilerState(const CompiledSegment& segment);
+	void RefreshCompiledSegmentBoundaryMetadataFromReplay();
+	void AppendLoweredScheduleBatches(
+		RenderGraph& rg,
+		std::vector<AnyPassAndResources>& passes,
+		std::vector<Node>& nodes,
+		const ScheduleIR& schedule,
+		unsigned int firstBatchToLower);
+	bool TryMaterializeReplayPrefixAndLowerSuffix(
+		RenderGraph& rg,
+		std::vector<AnyPassAndResources>& passes,
+		std::vector<Node>& nodes,
+		const std::vector<CompiledSegmentDesc>& segmentDescs,
+		bool recordReuseEvents);
 	void ValidateReplayedSegmentBatches(
 		const CompiledSegment& segment,
 		const std::vector<PassBatch>& replayedBatches) const;
@@ -1602,14 +1780,14 @@ private:
 		const ScheduleIR& schedule,
 		const BarrierIR& barriers);
 	void BuildCompiledSegments(
-		const ScheduleIR& schedule,
-		const BarrierIR& barriers);
+		const std::vector<CompiledSegmentDesc>& segmentDescs);
 	void CoalesceQueueWaits();
 	void BuildCrossFrameProducerTracking(const std::vector<AnyPassAndResources>& passes);
 	void AutoScheduleAndBuildBatches(
 		RenderGraph& rg,
 		std::vector<AnyPassAndResources>& passes,
-		std::vector<Node>& nodes);
+		std::vector<Node>& nodes,
+		bool forceFullLowerForDiagnostics = false);
 
 	std::unordered_map<uint64_t, uint64_t> autoAliasPoolByID;
 	std::unordered_map<uint64_t, std::string> autoAliasExclusionReasonByID;

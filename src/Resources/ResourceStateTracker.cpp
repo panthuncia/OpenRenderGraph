@@ -425,6 +425,48 @@ bool SymbolicTracker::WouldModify(const RangeSpec& want, const ResourceState& ne
     return false;
 }
 
+std::vector<Segment> SymbolicTracker::Query(const RangeSpec& want) const {
+    std::vector<Segment> result;
+    result.reserve(_segs.size());
+    bool isOrdered = true;
+    for (const auto& seg : _segs) {
+        auto cut = intersect(seg.rangeSpec, want);
+        if (isEmpty(cut)) {
+            continue;
+        }
+
+        appendSegmentTrackingOrder(result, Segment{ cut, seg.state }, isOrdered);
+    }
+
+    mergeSymbolic(result, isOrdered);
+    return result;
+}
+
+void SymbolicTracker::SetExact(const RangeSpec& want, const ResourceState& newState) {
+    std::vector<Segment> next;
+    next.reserve(_segs.size() * 2);
+    bool nextIsOrdered = true;
+    bool wroteAny = false;
+    for (const auto& seg : _segs) {
+        auto cut = intersect(seg.rangeSpec, want);
+        if (isEmpty(cut)) {
+            appendSegmentTrackingOrder(next, seg, nextIsOrdered);
+            continue;
+        }
+
+        appendSubtractRemainders(seg.rangeSpec, cut, seg.state, next, nextIsOrdered);
+        appendSegmentTrackingOrder(next, Segment{ cut, newState }, nextIsOrdered);
+        wroteAny = true;
+    }
+
+    if (!wroteAny) {
+        appendSegmentTrackingOrder(next, Segment{ want, newState }, nextIsOrdered);
+    }
+
+    mergeSymbolic(next, nextIsOrdered);
+    _segs.swap(next);
+}
+
 std::vector<Segment> SymbolicTracker::Flatten(ResourceState const& skipState, bool includeSkipState) const {
     std::vector<Segment> out;
     out.reserve(_segs.size());

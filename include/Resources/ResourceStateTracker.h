@@ -116,6 +116,10 @@ public:
 
     bool WouldModify(const RangeSpec& want, const ResourceState& newState, bool hasLayout) const;
 
+    std::vector<Segment> Query(const RangeSpec& want) const;
+
+    void SetExact(const RangeSpec& want, const ResourceState& newState);
+
     std::vector<Segment> Flatten(ResourceState const& skipState, bool includeSkipState = false) const;
 
     const std::vector<Segment>& GetSegments() const noexcept;
