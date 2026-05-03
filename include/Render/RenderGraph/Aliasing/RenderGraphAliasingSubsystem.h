@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "Render/ResourceRegistry.h"
 #include "Resources/TrackedAllocation.h"
 
 enum class AutoAliasMode : uint8_t;
@@ -94,6 +95,50 @@ struct AliasSchedulingNode {
 	std::vector<size_t> out;
 };
 
+struct FrameAliasResourceInfo {
+	uint64_t resourceID = 0;
+	ResourceRegistry::RegistryHandle handle{};
+
+	enum class Kind : uint8_t {
+		Texture,
+		Buffer,
+		Unsupported
+	};
+	Kind kind = Kind::Unsupported;
+
+	bool aliasAllowed = false;
+	bool deviceLocal = false;
+	bool materialized = false;
+	bool firstUseIsWrite = false;
+	bool everWritten = false;
+
+	uint64_t manualPoolID = 0;
+	bool hasManualPool = false;
+
+	uint64_t autoPoolID = 0;
+	bool hasAutoPool = false;
+
+	uint64_t finalPoolID = 0;
+	bool hasFinalPool = false;
+
+	uint64_t sizeBytes = 0;
+	uint64_t alignment = 1;
+
+	size_t firstUse = std::numeric_limits<size_t>::max();
+	size_t lastUse = 0;
+	size_t firstUsePassIndex = std::numeric_limits<size_t>::max();
+	size_t lastUsePassIndex = std::numeric_limits<size_t>::max();
+
+	uint32_t maxNodeCriticality = 0;
+
+	const char* exclusionReason = nullptr;
+};
+
+struct FrameAliasAnalysis {
+	std::unordered_map<uint64_t, FrameAliasResourceInfo> resourcesByID;
+	uint32_t maxNodeCriticality = 1;
+};
+
 class RenderGraphAliasingSubsystem {
 public:
 	AutoAliasDebugSnapshot BuildDebugSnapshot(
@@ -109,6 +154,10 @@ public:
 
 	void ResetPerFrameState(RenderGraph& rg) const;
 	void ResetPersistentState(RenderGraph& rg) const;
+	FrameAliasAnalysis BuildAliasFrameAnalysis(RenderGraph& rg, const std::vector<AliasSchedulingNode>& nodes) const;
+	void AutoAssignAliasingPoolsFromAnalysis(RenderGraph& rg, FrameAliasAnalysis& analysis) const;
+	void FinalizeAliasPoolsInAnalysis(RenderGraph& rg, FrameAliasAnalysis& analysis) const;
+	void BuildAliasPlanFromAnalysis(RenderGraph& rg, const FrameAliasAnalysis& analysis) const;
 	void AutoAssignAliasingPools(RenderGraph& rg, const std::vector<AliasSchedulingNode>& nodes) const;
 	void BuildAliasPlanAfterDag(RenderGraph& rg, const std::vector<AliasSchedulingNode>& nodes) const;
 	void ApplyAliasQueueSynchronization(RenderGraph& rg) const;

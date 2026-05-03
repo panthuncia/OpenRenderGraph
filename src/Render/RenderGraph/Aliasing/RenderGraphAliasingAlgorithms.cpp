@@ -496,10 +496,229 @@ namespace {
 		boost::hash_combine(signature, resourceID);
 		return static_cast<uint64_t>(signature);
 	}
+
+	struct AliasTopoMetadata {
+		std::vector<size_t> passTopoRank;
+		std::vector<uint32_t> passCriticality;
+		uint32_t maxCriticality = 1;
+		bool valid = false;
+	};
+
+	AliasTopoMetadata BuildAliasTopoMetadata(const std::vector<rg::alias::AliasSchedulingNode>& nodes, size_t passCount) {
+		AliasTopoMetadata metadata{};
+		metadata.passTopoRank.assign(passCount, 0);
+		metadata.passCriticality.assign(passCount, 0);
+
+		std::vector<size_t> indeg(nodes.size(), 0);
+		for (size_t i = 0; i < nodes.size(); ++i) {
+			indeg[i] = nodes[i].indegree;
+		}
+
+		std::vector<size_t> ready;
+		ready.reserve(nodes.size());
+		for (size_t i = 0; i < nodes.size(); ++i) {
+			if (indeg[i] == 0) {
+				ready.push_back(i);
+			}
+		}
+
+		std::vector<size_t> topoOrder;
+		topoOrder.reserve(nodes.size());
+		while (!ready.empty()) {
+			auto bestIt = std::min_element(ready.begin(), ready.end(), [&](size_t a, size_t b) {
+				if (nodes[a].originalOrder != nodes[b].originalOrder) {
+					return nodes[a].originalOrder < nodes[b].originalOrder;
+				}
+				return a < b;
+				});
+			size_t u = *bestIt;
+			ready.erase(bestIt);
+			topoOrder.push_back(u);
+			for (size_t v : nodes[u].out) {
+				if (--indeg[v] == 0) {
+					ready.push_back(v);
+				}
+			}
+		}
+
+		if (topoOrder.size() != nodes.size()) {
+			return metadata;
+		}
+
+		metadata.valid = true;
+		for (size_t rank = 0; rank < topoOrder.size(); ++rank) {
+			const auto& node = nodes[topoOrder[rank]];
+			if (node.passIndex < passCount) {
+				metadata.passTopoRank[node.passIndex] = rank;
+				metadata.passCriticality[node.passIndex] = node.criticality;
+				metadata.maxCriticality = std::max(metadata.maxCriticality, node.criticality);
+			}
+		}
+
+		return metadata;
+	}
+
+	const char* GetPassTypeName(RenderGraph::PassType passType) {
+		switch (passType) {
+		case RenderGraph::PassType::Render:
+			return "Render";
+		case RenderGraph::PassType::Compute:
+			return "Compute";
+		case RenderGraph::PassType::Copy:
+			return "Copy";
+		default:
+			return "Unknown";
+		}
+	}
 }
 
-void rg::alias::RenderGraphAliasingSubsystem::AutoAssignAliasingPools(RenderGraph& rg, const std::vector<AliasSchedulingNode>& nodes) const {
-	ZoneScopedN("RenderGraphAliasingSubsystem::AutoAssignAliasingPools");
+bool AccessTypeIsWriteOrCommon(rhi::ResourceAccessType t);
+
+rg::alias::FrameAliasAnalysis rg::alias::RenderGraphAliasingSubsystem::BuildAliasFrameAnalysis(RenderGraph& rg, const std::vector<AliasSchedulingNode>& nodes) const {
+	ZoneScopedN("RenderGraphAliasingSubsystem::BuildAliasFrameAnalysis");
+	FrameAliasAnalysis analysis{};
+	auto& m_framePasses = rg.m_framePasses;
+	auto& _registry = rg._registry;
+
+	if (nodes.empty() || m_framePasses.empty()) {
+		return analysis;
+	}
+
+	const AliasTopoMetadata topo = BuildAliasTopoMetadata(nodes, m_framePasses.size());
+	if (!topo.valid) {
+		throw std::runtime_error("RenderGraphAliasingSubsystem::BuildAliasFrameAnalysis received non-DAG node data");
+	}
+	analysis.maxNodeCriticality = topo.maxCriticality;
+	analysis.resourcesByID.reserve(1024);
+
+	auto device = DeviceManager::GetInstance().GetDevice();
+	auto collectHandle = [&](const ResourceRegistry::RegistryHandle& handle, bool isWrite, size_t usageOrder, uint32_t passCrit, size_t passIdx) {
+		if (handle.IsEphemeral()) {
+			return;
+		}
+
+		auto* resource = _registry.Resolve(handle);
+		const uint64_t resourceID = handle.GetGlobalResourceID();
+		auto [it, inserted] = analysis.resourcesByID.try_emplace(resourceID);
+		auto& info = it->second;
+		if (inserted) {
+			info.resourceID = resourceID;
+			info.handle = handle;
+		}
+
+		if (usageOrder < info.firstUse) {
+			info.firstUse = usageOrder;
+			info.firstUsePassIndex = passIdx;
+			info.firstUseIsWrite = isWrite;
+		}
+		else if (usageOrder == info.firstUse) {
+			if (info.firstUsePassIndex == std::numeric_limits<size_t>::max()) {
+				info.firstUsePassIndex = passIdx;
+			}
+			info.firstUseIsWrite = info.firstUseIsWrite || isWrite;
+		}
+		if (usageOrder >= info.lastUse) {
+			info.lastUse = usageOrder;
+			info.lastUsePassIndex = passIdx;
+		}
+		info.everWritten = info.everWritten || isWrite;
+		info.maxNodeCriticality = std::max(info.maxNodeCriticality, passCrit);
+
+		if (!resource || (info.kind != FrameAliasResourceInfo::Kind::Unsupported && info.sizeBytes != 0)) {
+			return;
+		}
+
+		if (auto* texture = dynamic_cast<PixelBuffer*>(resource)) {
+			auto const& desc = texture->GetDescription();
+			info.kind = FrameAliasResourceInfo::Kind::Texture;
+			info.aliasAllowed = desc.allowAlias;
+			info.deviceLocal = true;
+			info.materialized = texture->IsMaterialized();
+			if (desc.aliasingPoolID.has_value()) {
+				info.manualPoolID = desc.aliasingPoolID.value();
+				info.hasManualPool = true;
+			}
+			if (!info.aliasAllowed) {
+				info.exclusionReason = "allowAlias is disabled";
+				return;
+			}
+
+			auto resourceDesc = BuildAliasTextureResourceDesc(desc);
+			rhi::ResourceAllocationInfo allocationInfo{};
+			device.GetResourceAllocationInfo(&resourceDesc, 1, &allocationInfo);
+			info.sizeBytes = allocationInfo.sizeInBytes;
+			info.alignment = std::max<uint64_t>(1, allocationInfo.alignment);
+			return;
+		}
+
+		if (auto* buffer = dynamic_cast<Buffer*>(resource)) {
+			info.kind = FrameAliasResourceInfo::Kind::Buffer;
+			info.aliasAllowed = buffer->IsAliasingAllowed();
+			info.deviceLocal = buffer->GetAccessType() == rhi::HeapType::DeviceLocal;
+			info.materialized = buffer->IsMaterialized();
+			if (auto poolHint = buffer->GetAliasingPoolHint(); poolHint.has_value()) {
+				info.manualPoolID = poolHint.value();
+				info.hasManualPool = true;
+			}
+			if (!info.aliasAllowed) {
+				info.exclusionReason = "allowAlias is disabled";
+				return;
+			}
+			if (!info.deviceLocal) {
+				info.exclusionReason = "buffer heap is not DeviceLocal";
+				return;
+			}
+
+			auto resourceDesc = BuildAliasBufferResourceDesc(
+				buffer->GetBufferSize(),
+				buffer->IsUnorderedAccessEnabled(),
+				buffer->GetAccessType());
+			rhi::ResourceAllocationInfo allocationInfo{};
+			device.GetResourceAllocationInfo(&resourceDesc, 1, &allocationInfo);
+			info.sizeBytes = allocationInfo.sizeInBytes;
+			info.alignment = std::max<uint64_t>(1, allocationInfo.alignment);
+		}
+	};
+
+	for (size_t passIdx = 0; passIdx < m_framePasses.size(); ++passIdx) {
+		const auto& any = m_framePasses[passIdx];
+		const size_t usageOrder = topo.passTopoRank[passIdx];
+		const uint32_t passCrit = topo.passCriticality[passIdx];
+
+		if (any.type == RenderGraph::PassType::Render) {
+			auto const& p = std::get<RenderGraph::RenderPassAndResources>(any.pass);
+			for (auto const& req : p.resources.frameResourceRequirements) {
+				collectHandle(req.resourceHandleAndRange.resource, AccessTypeIsWriteOrCommon(req.state.access), usageOrder, passCrit, passIdx);
+			}
+			for (auto const& t : p.resources.internalTransitions) {
+				collectHandle(t.first.resource, true, usageOrder, passCrit, passIdx);
+			}
+		}
+		else if (any.type == RenderGraph::PassType::Compute) {
+			auto const& p = std::get<RenderGraph::ComputePassAndResources>(any.pass);
+			for (auto const& req : p.resources.frameResourceRequirements) {
+				collectHandle(req.resourceHandleAndRange.resource, AccessTypeIsWriteOrCommon(req.state.access), usageOrder, passCrit, passIdx);
+			}
+			for (auto const& t : p.resources.internalTransitions) {
+				collectHandle(t.first.resource, true, usageOrder, passCrit, passIdx);
+			}
+		}
+		else if (any.type == RenderGraph::PassType::Copy) {
+			auto const& p = std::get<RenderGraph::CopyPassAndResources>(any.pass);
+			for (auto const& req : p.resources.frameResourceRequirements) {
+				collectHandle(req.resourceHandleAndRange.resource, AccessTypeIsWriteOrCommon(req.state.access), usageOrder, passCrit, passIdx);
+			}
+			for (auto const& t : p.resources.internalTransitions) {
+				collectHandle(t.first.resource, true, usageOrder, passCrit, passIdx);
+			}
+		}
+	}
+
+	return analysis;
+}
+
+void rg::alias::RenderGraphAliasingSubsystem::AutoAssignAliasingPoolsFromAnalysis(RenderGraph& rg, FrameAliasAnalysis& analysis) const {
+	ZoneScopedN("RenderGraphAliasingSubsystem::AutoAssignAliasingPoolsFromAnalysis");
 	auto& autoAliasPoolByID = rg.autoAliasPoolByID;
 	auto& autoAliasExclusionReasonByID = rg.autoAliasExclusionReasonByID;
 	auto& autoAliasExclusionReasonSummary = rg.autoAliasExclusionReasonSummary;
@@ -507,8 +726,6 @@ void rg::alias::RenderGraphAliasingSubsystem::AutoAssignAliasingPools(RenderGrap
 	auto& autoAliasModeLastFrame = rg.autoAliasModeLastFrame;
 	auto& m_getAutoAliasMode = rg.m_getAutoAliasMode;
 	auto& m_getAutoAliasEnableLogging = rg.m_getAutoAliasEnableLogging;
-	auto& m_framePasses = rg.m_framePasses;
-	auto& _registry = rg._registry;
 	auto& resourcesByID = rg.resourcesByID;
 	auto& m_getAutoAliasLogExclusionReasons = rg.m_getAutoAliasLogExclusionReasons;
 
@@ -524,180 +741,10 @@ void rg::alias::RenderGraphAliasingSubsystem::AutoAssignAliasingPools(RenderGrap
 		return;
 	}
 
-	if (nodes.empty() || m_framePasses.empty()) {
-		return;
-	}
-
-	std::vector<size_t> indeg(nodes.size(), 0);
-	for (size_t i = 0; i < nodes.size(); ++i) {
-		indeg[i] = nodes[i].indegree;
-	}
-
-	std::vector<size_t> ready;
-	ready.reserve(nodes.size());
-	for (size_t i = 0; i < nodes.size(); ++i) {
-		if (indeg[i] == 0) {
-			ready.push_back(i);
-		}
-	}
-
-	std::vector<size_t> topoOrder;
-	topoOrder.reserve(nodes.size());
-	while (!ready.empty()) {
-		auto bestIt = std::min_element(ready.begin(), ready.end(), [&](size_t a, size_t b) {
-			if (nodes[a].originalOrder != nodes[b].originalOrder) {
-				return nodes[a].originalOrder < nodes[b].originalOrder;
-			}
-			return a < b;
-			});
-		size_t u = *bestIt;
-		ready.erase(bestIt);
-		topoOrder.push_back(u);
-		for (size_t v : nodes[u].out) {
-			if (--indeg[v] == 0) {
-				ready.push_back(v);
-			}
-		}
-	}
-
-	if (topoOrder.size() != nodes.size()) {
-		return;
-	}
-
-	std::vector<size_t> passTopoRank(m_framePasses.size(), 0);
-	std::vector<uint32_t> passCriticality(m_framePasses.size(), 0);
-	uint32_t maxCriticality = 1;
-	for (size_t rank = 0; rank < topoOrder.size(); ++rank) {
-		const auto& node = nodes[topoOrder[rank]];
-		if (node.passIndex < passTopoRank.size()) {
-			passTopoRank[node.passIndex] = rank;
-			passCriticality[node.passIndex] = node.criticality;
-			maxCriticality = std::max(maxCriticality, node.criticality);
-		}
-	}
-
-	struct AutoCandidate {
-		uint64_t resourceID = 0;
-		uint64_t sizeBytes = 0;
-		uint64_t alignment = 1;
-		size_t firstUse = std::numeric_limits<size_t>::max();
-		size_t lastUse = 0;
-		bool isMaterializedAtCompile = false;
-		uint32_t maxNodeCriticality = 0;
-		std::optional<uint64_t> manualPool;
-	};
-
-	std::unordered_map<uint64_t, AutoCandidate> candidates;
-	auto device = DeviceManager::GetInstance().GetDevice();
-
-	auto collectHandle = [&](const ResourceRegistry::RegistryHandle& handle, size_t topoRank, uint32_t passCrit) {
-		if (handle.IsEphemeral()) {
-			return;
-		}
-
-		auto* resource = _registry.Resolve(handle);
-		const uint64_t resourceID = handle.GetGlobalResourceID();
-		auto* texture = dynamic_cast<PixelBuffer*>(resource);
-		if (!texture) {
-			auto* buffer = dynamic_cast<Buffer*>(resource);
-			if (!buffer) {
-				return;
-			}
-
-			if (!buffer->IsAliasingAllowed()) {
-				autoAliasExclusionReasonByID.try_emplace(resourceID, "allowAlias is disabled");
-				return;
-			}
-
-			if (buffer->GetAccessType() != rhi::HeapType::DeviceLocal) {
-				autoAliasExclusionReasonByID.try_emplace(resourceID, "buffer heap is not DeviceLocal");
-				return;
-			}
-
-			auto [it, inserted] = candidates.try_emplace(resourceID);
-			auto& candidate = it->second;
-			candidate.resourceID = resourceID;
-			candidate.firstUse = std::min(candidate.firstUse, topoRank);
-			candidate.lastUse = std::max(candidate.lastUse, topoRank);
-			candidate.maxNodeCriticality = std::max(candidate.maxNodeCriticality, passCrit);
-			candidate.isMaterializedAtCompile = candidate.isMaterializedAtCompile || buffer->IsMaterialized();
-			candidate.manualPool = buffer->GetAliasingPoolHint();
-
-			if (inserted || candidate.sizeBytes == 0) {
-				auto resourceDesc = BuildAliasBufferResourceDesc(
-					buffer->GetBufferSize(),
-					buffer->IsUnorderedAccessEnabled(),
-					buffer->GetAccessType());
-				rhi::ResourceAllocationInfo info{};
-				device.GetResourceAllocationInfo(&resourceDesc, 1, &info);
-				candidate.sizeBytes = info.sizeInBytes;
-				candidate.alignment = std::max<uint64_t>(1, info.alignment);
-			}
-			return;
-		}
-
-		auto const& desc = texture->GetDescription();
-		if (!desc.allowAlias) {
-			autoAliasExclusionReasonByID.try_emplace(resourceID, "allowAlias is disabled");
-			return;
-		}
-
-		auto [it, inserted] = candidates.try_emplace(resourceID);
-		auto& candidate = it->second;
-		candidate.resourceID = resourceID;
-		candidate.firstUse = std::min(candidate.firstUse, topoRank);
-		candidate.lastUse = std::max(candidate.lastUse, topoRank);
-		candidate.maxNodeCriticality = std::max(candidate.maxNodeCriticality, passCrit);
-		candidate.isMaterializedAtCompile = candidate.isMaterializedAtCompile || texture->IsMaterialized();
-		candidate.manualPool = desc.aliasingPoolID;
-
-		if (inserted || candidate.sizeBytes == 0) {
-			auto resourceDesc = BuildAliasTextureResourceDesc(desc);
-			rhi::ResourceAllocationInfo info{};
-			device.GetResourceAllocationInfo(&resourceDesc, 1, &info);
-			candidate.sizeBytes = info.sizeInBytes;
-			candidate.alignment = std::max<uint64_t>(1, info.alignment);
-		}
-	};
-
-	for (size_t passIdx = 0; passIdx < m_framePasses.size(); ++passIdx) {
-		const auto& any = m_framePasses[passIdx];
-		const size_t topoRank = passTopoRank[passIdx];
-		const uint32_t passCrit = passCriticality[passIdx];
-
-		if (any.type == RenderGraph::PassType::Render) {
-			auto const& p = std::get<RenderGraph::RenderPassAndResources>(any.pass);
-			for (auto const& req : p.resources.frameResourceRequirements) {
-				collectHandle(req.resourceHandleAndRange.resource, topoRank, passCrit);
-			}
-			for (auto const& t : p.resources.internalTransitions) {
-				collectHandle(t.first.resource, topoRank, passCrit);
-			}
-		}
-		else if (any.type == RenderGraph::PassType::Compute) {
-			auto const& p = std::get<RenderGraph::ComputePassAndResources>(any.pass);
-			for (auto const& req : p.resources.frameResourceRequirements) {
-				collectHandle(req.resourceHandleAndRange.resource, topoRank, passCrit);
-			}
-			for (auto const& t : p.resources.internalTransitions) {
-				collectHandle(t.first.resource, topoRank, passCrit);
-			}
-		}
-		else if (any.type == RenderGraph::PassType::Copy) {
-			auto const& p = std::get<RenderGraph::CopyPassAndResources>(any.pass);
-			for (auto const& req : p.resources.frameResourceRequirements) {
-				collectHandle(req.resourceHandleAndRange.resource, topoRank, passCrit);
-			}
-			for (auto const& t : p.resources.internalTransitions) {
-				collectHandle(t.first.resource, topoRank, passCrit);
-			}
-		}
-	}
-
-	auto scoreCandidate = [&](const AutoCandidate& c) {
+	auto scoreCandidate = [&](const FrameAliasResourceInfo& c) {
 		const float benefitMB = static_cast<float>(c.sizeBytes) / (1024.0f * 1024.0f);
-		const float critNorm = static_cast<float>(c.maxNodeCriticality) / static_cast<float>(maxCriticality);
-		const float materializedPenalty = c.isMaterializedAtCompile ? 1.0f : 0.0f;
+		const float critNorm = static_cast<float>(c.maxNodeCriticality) / static_cast<float>(analysis.maxNodeCriticality);
+		const float materializedPenalty = c.materialized ? 1.0f : 0.0f;
 
 		switch (mode) {
 		case AutoAliasMode::Conservative:
@@ -724,12 +771,19 @@ void rg::alias::RenderGraphAliasingSubsystem::AutoAssignAliasingPools(RenderGrap
 
 	constexpr uint64_t kAutoPoolGlobal = 0xA171000000000000ull;
 
-	for (auto const& [resourceID, c] : candidates) {
+	for (auto& [resourceID, c] : analysis.resourcesByID) {
 		(void)resourceID;
+		if (c.exclusionReason != nullptr) {
+			autoAliasExclusionReasonByID.try_emplace(c.resourceID, c.exclusionReason);
+		}
+		if (c.kind == FrameAliasResourceInfo::Kind::Unsupported || !c.aliasAllowed || !c.deviceLocal) {
+			continue;
+		}
+
 		autoAliasPlannerStats.candidatesSeen++;
 		autoAliasPlannerStats.candidateBytes += c.sizeBytes;
 
-		if (c.manualPool.has_value()) {
+		if (c.hasManualPool) {
 			autoAliasPlannerStats.manuallyAssigned++;
 			continue;
 		}
@@ -742,6 +796,8 @@ void rg::alias::RenderGraphAliasingSubsystem::AutoAssignAliasingPools(RenderGrap
 		}
 
 		autoAliasPoolByID[c.resourceID] = kAutoPoolGlobal;
+		c.autoPoolID = kAutoPoolGlobal;
+		c.hasAutoPool = true;
 		autoAliasPlannerStats.autoAssigned++;
 		autoAliasPlannerStats.autoAssignedBytes += c.sizeBytes;
 	}
@@ -818,12 +874,40 @@ void rg::alias::RenderGraphAliasingSubsystem::AutoAssignAliasingPools(RenderGrap
 	}
 }
 
+void rg::alias::RenderGraphAliasingSubsystem::FinalizeAliasPoolsInAnalysis(RenderGraph& rg, FrameAliasAnalysis& analysis) const {
+	ZoneScopedN("RenderGraphAliasingSubsystem::FinalizeAliasPoolsInAnalysis");
+	for (auto& [resourceID, info] : analysis.resourcesByID) {
+		(void)resourceID;
+		info.hasFinalPool = false;
+		info.finalPoolID = 0;
+		if (info.hasManualPool) {
+			info.finalPoolID = info.manualPoolID;
+			info.hasFinalPool = true;
+			continue;
+		}
+
+		auto itAuto = rg.autoAliasPoolByID.find(info.resourceID);
+		if (itAuto != rg.autoAliasPoolByID.end()) {
+			info.autoPoolID = itAuto->second;
+			info.hasAutoPool = true;
+			info.finalPoolID = itAuto->second;
+			info.hasFinalPool = true;
+		}
+	}
+}
+
+void rg::alias::RenderGraphAliasingSubsystem::AutoAssignAliasingPools(RenderGraph& rg, const std::vector<AliasSchedulingNode>& nodes) const {
+	auto analysis = BuildAliasFrameAnalysis(rg, nodes);
+	AutoAssignAliasingPoolsFromAnalysis(rg, analysis);
+	FinalizeAliasPoolsInAnalysis(rg, analysis);
+}
+
 bool AccessTypeIsWriteOrCommon(rhi::ResourceAccessType t) {
 	return AccessTypeIsWriteType(t) || t == rhi::ResourceAccessType::Common;
 }
 
-void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph& rg, const std::vector<AliasSchedulingNode>& nodes) const {
-	ZoneScopedN("RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag");
+void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderGraph& rg, const FrameAliasAnalysis& analysis) const {
+	ZoneScopedN("RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis");
 	auto& aliasMaterializeOptionsByID = rg.aliasMaterializeOptionsByID;
 	auto& aliasActivationPending = rg.aliasActivationPending;
 	auto& autoAliasPreviousMode = rg.autoAliasPreviousMode;
@@ -840,8 +924,6 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph
 	auto& m_getAutoAliasEnableLogging = rg.m_getAutoAliasEnableLogging;
 	auto& persistentAliasPools = rg.persistentAliasPools;
 	auto& m_framePasses = rg.m_framePasses;
-	auto& _registry = rg._registry;
-	auto& autoAliasPoolByID = rg.autoAliasPoolByID;
 	auto& resourcesByID = rg.resourcesByID;
 	auto& aliasPlacementPoolByID = rg.aliasPlacementPoolByID;
 	auto& aliasPlacementRangesByID = rg.aliasPlacementRangesByID;
@@ -879,50 +961,6 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph
 		poolState.usedThisFrame = false;
 	}
 
-	std::vector<size_t> indeg(nodes.size(), 0);
-	for (size_t i = 0; i < nodes.size(); ++i) {
-		indeg[i] = nodes[i].indegree;
-	}
-
-	std::vector<size_t> ready;
-	ready.reserve(nodes.size());
-	for (size_t i = 0; i < nodes.size(); ++i) {
-		if (indeg[i] == 0) {
-			ready.push_back(i);
-		}
-	}
-
-	std::vector<size_t> topoOrder;
-	topoOrder.reserve(nodes.size());
-	while (!ready.empty()) {
-		auto bestIt = std::min_element(ready.begin(), ready.end(), [&](size_t a, size_t b) {
-			if (nodes[a].originalOrder != nodes[b].originalOrder) {
-				return nodes[a].originalOrder < nodes[b].originalOrder;
-			}
-			return a < b;
-			});
-		size_t u = *bestIt;
-		ready.erase(bestIt);
-		topoOrder.push_back(u);
-		for (size_t v : nodes[u].out) {
-			if (--indeg[v] == 0) {
-				ready.push_back(v);
-			}
-		}
-	}
-
-	if (topoOrder.size() != nodes.size()) {
-		throw std::runtime_error("RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag received non-DAG node data");
-	}
-
-	std::vector<size_t> passTopoRank(m_framePasses.size(), 0);
-	for (size_t rank = 0; rank < topoOrder.size(); ++rank) {
-		const auto& node = nodes[topoOrder[rank]];
-		if (node.passIndex < passTopoRank.size()) {
-			passTopoRank[node.passIndex] = rank;
-		}
-	}
-
 	struct Candidate {
 		enum class Kind : uint8_t {
 			Texture,
@@ -953,19 +991,6 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph
 
 	std::unordered_map<uint64_t, Candidate> candidates;
 	std::unordered_map<uint64_t, DedicatedSchedulingCandidate> dedicatedSchedulingCandidates;
-	auto device = DeviceManager::GetInstance().GetDevice();
-	auto getPassTypeName = [](RenderGraph::PassType passType) -> const char* {
-		switch (passType) {
-		case RenderGraph::PassType::Render:
-			return "Render";
-		case RenderGraph::PassType::Compute:
-			return "Compute";
-		case RenderGraph::PassType::Copy:
-			return "Copy";
-		default:
-			return "Unknown";
-		}
-	};
 	auto getPassDebugName = [&](size_t passIndex) {
 		if (passIndex >= m_framePasses.size()) {
 			return std::string("<unknown>");
@@ -976,181 +1001,43 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph
 			return pass.name;
 		}
 
-		return std::string(getPassTypeName(pass.type)) + "Pass#" + std::to_string(passIndex);
+		return std::string(GetPassTypeName(pass.type)) + "Pass#" + std::to_string(passIndex);
 	};
 
-	for (size_t passIdx = 0; passIdx < m_framePasses.size(); ++passIdx) {
-		const size_t usageOrder = passTopoRank[passIdx];
-		const auto& any = m_framePasses[passIdx];
-		auto updateDedicatedSchedulingCandidate = [&](uint64_t resourceID, uint64_t sizeBytes) {
-			auto [it, inserted] = dedicatedSchedulingCandidates.try_emplace(resourceID);
-			(void)inserted;
-			auto& candidate = it->second;
-			candidate.resourceID = resourceID;
-			candidate.sizeBytes = sizeBytes;
-			if (usageOrder < candidate.firstUse) {
-				candidate.firstUse = usageOrder;
-				candidate.firstUsePassIndex = passIdx;
-			}
-			if (usageOrder >= candidate.lastUse) {
-				candidate.lastUse = usageOrder;
-				candidate.lastUsePassIndex = passIdx;
-			}
-		};
-		auto collectHandle = [&](const ResourceRegistry::RegistryHandle& handle, bool isWrite) {
-			if (handle.IsEphemeral()) {
-				return;
-			}
-			auto* resource = _registry.Resolve(handle);
-			const uint64_t resourceID = handle.GetGlobalResourceID();
-			auto* texture = dynamic_cast<PixelBuffer*>(resource);
-			if (!texture) {
-				auto* buffer = dynamic_cast<Buffer*>(resource);
-				if (!buffer || !buffer->IsAliasingAllowed()) {
-					return;
-				}
-
-				if (buffer->GetAccessType() != rhi::HeapType::DeviceLocal) {
-					return;
-				}
-
-				std::optional<uint64_t> poolID = buffer->GetAliasingPoolHint();
-				if (!poolID.has_value()) {
-					auto itAuto = autoAliasPoolByID.find(resourceID);
-					if (itAuto != autoAliasPoolByID.end()) {
-						poolID = itAuto->second;
-					}
-				}
-
-				if (!poolID.has_value()) {
-					auto resourceDesc = BuildAliasBufferResourceDesc(
-						buffer->GetBufferSize(),
-						buffer->IsUnorderedAccessEnabled(),
-						buffer->GetAccessType());
-					rhi::ResourceAllocationInfo info{};
-					device.GetResourceAllocationInfo(&resourceDesc, 1, &info);
-					updateDedicatedSchedulingCandidate(resourceID, info.sizeInBytes);
-					return;
-				}
-
-				auto [it, inserted] = candidates.try_emplace(resourceID);
-				auto& c = it->second;
-				c.kind = Candidate::Kind::Buffer;
-				c.resourceID = resourceID;
-				c.poolID = poolID.value();
-				if (usageOrder < c.firstUse) {
-					c.firstUse = usageOrder;
-					c.firstUsePassIndex = passIdx;
-					c.firstUseIsWrite = isWrite;
-				}
-				else if (usageOrder == c.firstUse) {
-					if (c.firstUsePassIndex == std::numeric_limits<size_t>::max()) {
-						c.firstUsePassIndex = passIdx;
-					}
-					c.firstUseIsWrite = c.firstUseIsWrite || isWrite;
-				}
-				if (usageOrder >= c.lastUse) {
-					c.lastUse = usageOrder;
-					c.lastUsePassIndex = passIdx;
-				}
-				c.manualPoolAssigned = c.manualPoolAssigned || buffer->GetAliasingPoolHint().has_value();
-
-				if (inserted || c.sizeBytes == 0) {
-					auto resourceDesc = BuildAliasBufferResourceDesc(
-						buffer->GetBufferSize(),
-						buffer->IsUnorderedAccessEnabled(),
-						buffer->GetAccessType());
-					rhi::ResourceAllocationInfo info{};
-					device.GetResourceAllocationInfo(&resourceDesc, 1, &info);
-					c.sizeBytes = info.sizeInBytes;
-					c.alignment = std::max<uint64_t>(1, info.alignment);
-				}
-				return;
-			}
-			auto const& desc = texture->GetDescription();
-			if (!desc.allowAlias) {
-				return;
-			}
-
-			std::optional<uint64_t> poolID = desc.aliasingPoolID;
-			if (!poolID.has_value()) {
-				auto itAuto = autoAliasPoolByID.find(handle.GetGlobalResourceID());
-				if (itAuto != autoAliasPoolByID.end()) {
-					poolID = itAuto->second;
-				}
-			}
-
-			if (!poolID.has_value()) {
-				auto resourceDesc = BuildAliasTextureResourceDesc(desc);
-				rhi::ResourceAllocationInfo info{};
-				device.GetResourceAllocationInfo(&resourceDesc, 1, &info);
-				updateDedicatedSchedulingCandidate(resourceID, info.sizeInBytes);
-				return;
-			}
-
-			auto [it, inserted] = candidates.try_emplace(resourceID);
-			auto& c = it->second;
-			c.kind = Candidate::Kind::Texture;
-			c.resourceID = handle.GetGlobalResourceID();
-			c.poolID = poolID.value();
-			if (usageOrder < c.firstUse) {
-				c.firstUse = usageOrder;
-				c.firstUsePassIndex = passIdx;
-				c.firstUseIsWrite = isWrite;
-			}
-			else if (usageOrder == c.firstUse) {
-				if (c.firstUsePassIndex == std::numeric_limits<size_t>::max()) {
-					c.firstUsePassIndex = passIdx;
-				}
-				c.firstUseIsWrite = c.firstUseIsWrite || isWrite;
-			}
-			if (usageOrder >= c.lastUse) {
-				c.lastUse = usageOrder;
-				c.lastUsePassIndex = passIdx;
-			}
-			c.manualPoolAssigned = c.manualPoolAssigned || texture->GetDescription().aliasingPoolID.has_value();
-
-			if (inserted || c.sizeBytes == 0) {
-				auto resourceDesc = BuildAliasTextureResourceDesc(desc);
-				rhi::ResourceAllocationInfo info{};
-				device.GetResourceAllocationInfo(&resourceDesc, 1, &info);
-				c.sizeBytes = info.sizeInBytes;
-				c.alignment = std::max<uint64_t>(1, info.alignment);
-			}
-		};
-
-		if (any.type == RenderGraph::PassType::Render) {
-			auto const& p = std::get<RenderGraph::RenderPassAndResources>(any.pass);
-			for (auto const& req : p.resources.frameResourceRequirements) {
-				collectHandle(req.resourceHandleAndRange.resource, AccessTypeIsWriteOrCommon(req.state.access));
-			}
-			for (auto const& t : p.resources.internalTransitions) {
-				collectHandle(t.first.resource, true);
-			}
-		}
-		else if (any.type == RenderGraph::PassType::Compute) {
-			auto const& p = std::get<RenderGraph::ComputePassAndResources>(any.pass);
-			for (auto const& req : p.resources.frameResourceRequirements) {
-				collectHandle(req.resourceHandleAndRange.resource, AccessTypeIsWriteOrCommon(req.state.access));
-			}
-			for (auto const& t : p.resources.internalTransitions) {
-				collectHandle(t.first.resource, true);
-			}
-		}
-		else if (any.type == RenderGraph::PassType::Copy) {
-			auto const& p = std::get<RenderGraph::CopyPassAndResources>(any.pass);
-			for (auto const& req : p.resources.frameResourceRequirements) {
-				collectHandle(req.resourceHandleAndRange.resource, AccessTypeIsWriteOrCommon(req.state.access));
-			}
-			for (auto const& t : p.resources.internalTransitions) {
-				collectHandle(t.first.resource, true);
-			}
-		}
-	}
-
 	std::unordered_map<uint64_t, std::vector<Candidate>> byPool;
-	for (auto const& [id, c] : candidates) {
-		(void)id;
+	for (const auto& [resourceID, info] : analysis.resourcesByID) {
+		if (info.kind == FrameAliasResourceInfo::Kind::Unsupported || !info.aliasAllowed || !info.deviceLocal) {
+			continue;
+		}
+		if (info.firstUse == std::numeric_limits<size_t>::max()) {
+			continue;
+		}
+
+		if (!info.hasFinalPool) {
+			dedicatedSchedulingCandidates[resourceID] = DedicatedSchedulingCandidate{
+				.resourceID = resourceID,
+				.sizeBytes = info.sizeBytes,
+				.firstUse = info.firstUse,
+				.firstUsePassIndex = info.firstUsePassIndex,
+				.lastUse = info.lastUse,
+				.lastUsePassIndex = info.lastUsePassIndex,
+			};
+			continue;
+		}
+
+		Candidate c{};
+		c.kind = info.kind == FrameAliasResourceInfo::Kind::Texture ? Candidate::Kind::Texture : Candidate::Kind::Buffer;
+		c.resourceID = resourceID;
+		c.poolID = info.finalPoolID;
+		c.sizeBytes = info.sizeBytes;
+		c.alignment = info.alignment;
+		c.firstUse = info.firstUse;
+		c.firstUsePassIndex = info.firstUsePassIndex;
+		c.lastUse = info.lastUse;
+		c.lastUsePassIndex = info.lastUsePassIndex;
+		c.firstUseIsWrite = info.firstUseIsWrite;
+		c.manualPoolAssigned = info.hasManualPool;
+
 		if (c.firstUse == std::numeric_limits<size_t>::max()) {
 			continue;
 		}
@@ -1163,7 +1050,7 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph
 			const std::string firstUsePassName = getPassDebugName(c.firstUsePassIndex);
 			const char* firstUsePassType =
 				(c.firstUsePassIndex < m_framePasses.size())
-				? getPassTypeName(m_framePasses[c.firstUsePassIndex].type)
+				? GetPassTypeName(m_framePasses[c.firstUsePassIndex].type)
 				: "Unknown";
 
 			std::string message =
@@ -1960,6 +1847,13 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph
 	}
 
 	autoAliasPackingStrategyLastFrame = packingStrategy;
+}
+
+void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph& rg, const std::vector<AliasSchedulingNode>& nodes) const {
+	auto analysis = BuildAliasFrameAnalysis(rg, nodes);
+	AutoAssignAliasingPoolsFromAnalysis(rg, analysis);
+	FinalizeAliasPoolsInAnalysis(rg, analysis);
+	BuildAliasPlanFromAnalysis(rg, analysis);
 }
 
 void rg::alias::RenderGraphAliasingSubsystem::ApplyAliasQueueSynchronization(RenderGraph& rg) const {

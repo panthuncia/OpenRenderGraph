@@ -5118,15 +5118,26 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		});
 	}
 
+	rg::alias::FrameAliasAnalysis aliasAnalysis;
 	{
-		traceCompileStep("AutoAssignAliasingPools");
-		ZoneScopedN("RenderGraph::CompileFrame::AutoAssignAliasingPools");
-		m_aliasingSubsystem.AutoAssignAliasingPools(*this, aliasNodes);
+		traceCompileStep("BuildAliasFrameAnalysis");
+		ZoneScopedN("RenderGraph::CompileFrame::BuildAliasFrameAnalysis");
+		aliasAnalysis = m_aliasingSubsystem.BuildAliasFrameAnalysis(*this, aliasNodes);
 	}
 	{
-		traceCompileStep("BuildAliasPlanAfterDag");
-		ZoneScopedN("RenderGraph::CompileFrame::BuildAliasPlanAfterDag");
-		m_aliasingSubsystem.BuildAliasPlanAfterDag(*this, aliasNodes);
+		traceCompileStep("AutoAssignAliasingPoolsFromAnalysis");
+		ZoneScopedN("RenderGraph::CompileFrame::AutoAssignAliasingPoolsFromAnalysis");
+		m_aliasingSubsystem.AutoAssignAliasingPoolsFromAnalysis(*this, aliasAnalysis);
+	}
+	{
+		traceCompileStep("FinalizeAliasPoolsInAnalysis");
+		ZoneScopedN("RenderGraph::CompileFrame::FinalizeAliasPoolsInAnalysis");
+		m_aliasingSubsystem.FinalizeAliasPoolsInAnalysis(*this, aliasAnalysis);
+	}
+	{
+		traceCompileStep("BuildAliasPlanFromAnalysis");
+		ZoneScopedN("RenderGraph::CompileFrame::BuildAliasPlanFromAnalysis");
+		m_aliasingSubsystem.BuildAliasPlanFromAnalysis(*this, aliasAnalysis);
 	}
 	{
 		traceCompileStep("AddCurrentFrameAliasSchedulingEdges");
