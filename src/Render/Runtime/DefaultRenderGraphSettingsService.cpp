@@ -23,6 +23,10 @@ public:
         return GetOpenRenderGraphSettings().renderGraphBatchTraceEnabled;
     }
 
+    bool GetReadOnlyUniformTransitionElisionEnabled() const override {
+        return GetOpenRenderGraphSettings().readOnlyUniformTransitionElisionEnabled;
+    }
+
     uint8_t GetAutoAliasMode() const override {
         return GetOpenRenderGraphSettings().autoAliasMode;
     }

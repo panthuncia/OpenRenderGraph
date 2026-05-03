@@ -744,7 +744,20 @@ private:
 		Resource* resource = nullptr;
 		SymbolicTracker tracker;
 		bool trackerInitialized = false;
+		bool readOnlyUniformTransitionChecked = false;
 		FastStateShadow fastState{};
+	};
+
+	struct FrameResourceAccessSummary {
+		bool hasWrite = false;
+		bool hasUAV = false;
+		bool hasInternalTransition = false;
+		bool hasAliasActivation = false;
+		bool hasMultipleRequiredStates = false;
+		bool hasNonWholeResourceRange = false;
+		bool readOnlyUniform = false;
+		bool uniformStateInitialized = false;
+		ResourceState uniformState{};
 	};
 
 	struct BatchBuildState {
@@ -892,6 +905,7 @@ private:
 	std::unordered_map<uint64_t, std::vector<uint64_t>> m_schedulingEquivalentIDsCache;
 	std::unordered_map<uint64_t, size_t> m_frameSchedulingResourceIndexByID;
 	size_t m_frameSchedulingResourceCount = 0;
+	std::vector<uint8_t> m_aliasActivationPendingDense;
 	std::vector<unsigned int> m_frameQueueLastUsageBatch;
 	std::vector<unsigned int> m_frameQueueLastProducerBatch;
 	std::vector<unsigned int> m_frameQueueLastTransitionBatch;
@@ -917,6 +931,7 @@ private:
 	std::shared_ptr<rg::runtime::ITaskService> m_taskService;
 	std::unordered_map<uint64_t, SymbolicTracker*> trackers; // Tracks the state of resources in the graph.
 	std::vector<FrameCompileResourceState> m_frameCompileResources; // Compile-only symbolic state, indexed by frame-local resource index.
+	std::vector<FrameResourceAccessSummary> m_frameResourceAccessSummaries;
 	std::unordered_map<uint64_t, LastProducerAcrossFrames> m_lastProducerByResourceAcrossFrames;
 	std::unordered_map<uint64_t, std::vector<LastAliasPlacementProducerAcrossFrames>> m_lastAliasPlacementProducersByPoolAcrossFrames;
 	std::vector<std::unordered_map<uint64_t, unsigned int>> m_compiledLastProducerBatchByResourceByQueue;
@@ -988,6 +1003,7 @@ private:
 	void RebuildFrameSchedulingResourceIndex(const std::unordered_set<uint64_t>& resourceIDs);
 	void RebuildFrameCompileResources();
 	void RebuildFramePassSchedulingSummaries();
+	void RebuildFrameResourceAccessSummaries(const std::vector<Node>& nodes);
 	void ClearFrameSchedulingResourceIndex();
 	void ClearFramePassSchedulingSummaries();
 	void ResetFrameQueueBatchHistoryTables();
@@ -1149,6 +1165,22 @@ private:
 		std::unordered_set<uint64_t>& outTransitionedResourceIDs,
 		std::unordered_set<size_t>& outFallbackResourceIndices,
 		std::vector<ResourceTransition>& scratchTransitions);
+	bool TryAddTransitionFastNoOp(
+		unsigned int batchIndex,
+		PassBatch& currentBatch,
+		size_t passQueueSlot,
+		const DenseRequirementSummary& requirement,
+		ResourceState requiredState);
+	void AddTransitionSlowPath(
+		unsigned int batchIndex,
+		PassBatch& currentBatch,
+		size_t passQueueSlot,
+		std::string_view passName,
+		const DenseRequirementSummary& requirement,
+		ResourceState requiredState,
+		std::unordered_set<uint64_t>& outTransitionedResourceIDs,
+		std::unordered_set<size_t>& outFallbackResourceIndices,
+		std::vector<ResourceTransition>& scratchTransitions);
 
 	struct AddTransitionDebugStats {
 		std::string resourceName;
@@ -1220,6 +1252,7 @@ private:
 	std::function<bool()> m_getRenderGraphCompileDumpEnabled;
 	std::function<bool()> m_getRenderGraphVramDumpEnabled;
 	std::function<bool()> m_getRenderGraphBatchTraceEnabled;
+	std::function<bool()> m_getReadOnlyUniformTransitionElisionEnabled;
 	std::function<bool()> m_getAutoAliasEnableLogging;
 	std::function<bool()> m_getAutoAliasLogExclusionReasons;
 	std::function<bool()> m_getQueueSchedulingEnableLogging;

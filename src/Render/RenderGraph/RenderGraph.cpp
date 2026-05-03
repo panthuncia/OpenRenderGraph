@@ -2477,9 +2477,74 @@ void RenderGraph::AddTransition(
 {
 	ZoneScopedN("RenderGraph::AddTransition");
 	const QueueKind passQueue = m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(passQueueSlot));
+	const ResourceState requiredState = NormalizeStateForQueue(passQueue, requirement.state);
+
+	if (TryAddTransitionFastNoOp(batchIndex, currentBatch, passQueueSlot, requirement, requiredState)) {
+		return;
+	}
+
+	AddTransitionSlowPath(
+		batchIndex,
+		currentBatch,
+		passQueueSlot,
+		passName,
+		requirement,
+		requiredState,
+		outTransitionedResourceIDs,
+		outFallbackResourceIndices,
+		scratchTransitions);
+}
+
+bool RenderGraph::TryAddTransitionFastNoOp(
+	unsigned int batchIndex,
+	PassBatch& currentBatch,
+	size_t passQueueSlot,
+	const DenseRequirementSummary& requirement,
+	ResourceState requiredState)
+{
+	(void)batchIndex;
+	(void)passQueueSlot;
+
+	if (requirement.resourceIndex >= m_frameCompileResources.size()) {
+		return false;
+	}
+	if (requirement.resourceIndex >= m_aliasActivationPendingDense.size()) {
+		return false;
+	}
+	if (m_aliasActivationPendingDense[requirement.resourceIndex] != 0) {
+		return false;
+	}
+
+	auto& entry = m_frameCompileResources[requirement.resourceIndex];
+	if (!entry.fastState.valid || !entry.fastState.wholeResourceOnly) {
+		return false;
+	}
+	if (!IsWholeResourceRange(requirement.range, requirement.resource)) {
+		return false;
+	}
+	if (!StatesExactlyEqual(entry.fastState.state, requiredState)) {
+		return false;
+	}
+
+	currentBatch.passBatchTrackersByResourceIndex[requirement.resourceIndex] = &entry.tracker;
+	return true;
+}
+
+void RenderGraph::AddTransitionSlowPath(
+	unsigned int batchIndex,
+	PassBatch& currentBatch,
+	size_t passQueueSlot,
+	std::string_view passName,
+	const DenseRequirementSummary& requirement,
+	ResourceState requiredState,
+	std::unordered_set<uint64_t>& outTransitionedResourceIDs,
+	std::unordered_set<size_t>& outFallbackResourceIndices,
+	std::vector<ResourceTransition>& scratchTransitions)
+{
+	ZoneScopedN("RenderGraph::AddTransitionSlowPath");
 
 	auto resource = requirement.resource;
-	const ResourceState requiredState = NormalizeStateForQueue(passQueue, requirement.state);
+	const QueueKind passQueue = m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(passQueueSlot));
 
 	// If this triggers, you're probably queueing an operation on an external/ephemeral resource, and then discarding it before the graph can use it.
 	if (!resource.IsEphemeral() && !_registry.IsValid(resource)) {
@@ -2552,7 +2617,7 @@ void RenderGraph::AddTransition(
 	const bool isWholeResourceRequirement = IsWholeResourceRange(requirement.range, resource);
 
 	bool isAliasActivation = false;
-	if (aliasActivationPending.find(resource.GetGlobalResourceID()) != aliasActivationPending.end()) {
+	if (requirement.resourceIndex < m_aliasActivationPendingDense.size() && m_aliasActivationPendingDense[requirement.resourceIndex] != 0) {
 		isAliasActivation = true;
 		const bool firstUseIsWrite = AccessTypeIsWriteType(requirement.state.access);
 		const bool firstUseIsCommon = requirement.state.access == rhi::ResourceAccessType::Common;
@@ -2586,19 +2651,9 @@ void RenderGraph::AddTransition(
 		std::vector<ResourceTransition> ignored;
 		compileTracker.Apply(requirement.range, pRes, requiredState, ignored);
 		aliasActivationPending.erase(resource.GetGlobalResourceID());
+		m_aliasActivationPendingDense[requirement.resourceIndex] = 0;
 	}
 	else {
-		if (fastState.valid
-			&& fastState.wholeResourceOnly
-			&& isWholeResourceRequirement
-			&& StatesExactlyEqual(fastState.state, requiredState)) {
-			currentBatch.passBatchTrackersByResourceIndex[requirement.resourceIndex] = &compileTracker;
-			if (debugStats) {
-				++debugStats->noOpCallCount;
-			}
-			return;
-		}
-
 		compileTracker.Apply(requirement.range, pRes, requiredState, transitions);
 	}
 
@@ -2745,9 +2800,35 @@ void RenderGraph::ProcessResourceRequirements(
 	std::unordered_set<size_t>& outFallbackResourceIndices,
 	std::vector<ResourceTransition>& scratchTransitions) {
 	ZoneScopedN("RenderGraph::ProcessResourceRequirements");
+	const bool enableReadOnlyUniformTransitionElision =
+		m_getReadOnlyUniformTransitionElisionEnabled && m_getReadOnlyUniformTransitionElisionEnabled();
 
 	for (const auto& resourceRequirement : resourceRequirements) {
-		AddTransition(batchIndex, currentBatch, passQueueSlot, passName, resourceRequirement, outTransitionedResourceIDs, outFallbackResourceIndices, scratchTransitions);
+		const bool isReadOnlyUniform =
+			enableReadOnlyUniformTransitionElision
+			&&
+			resourceRequirement.resourceIndex < m_frameResourceAccessSummaries.size()
+			&& m_frameResourceAccessSummaries[resourceRequirement.resourceIndex].readOnlyUniform;
+
+		if (isReadOnlyUniform) {
+			Resource* resource = resourceRequirement.resource.IsEphemeral()
+				? resourceRequirement.resource.GetEphemeralPtr()
+				: _registry.Resolve(resourceRequirement.resource);
+			auto& compileResourceState = GetOrCreateFrameCompileResourceState(
+				resourceRequirement.resourceIndex,
+				resource,
+				resourceRequirement.resourceID);
+			if (!compileResourceState.readOnlyUniformTransitionChecked) {
+				AddTransition(batchIndex, currentBatch, passQueueSlot, passName, resourceRequirement, outTransitionedResourceIDs, outFallbackResourceIndices, scratchTransitions);
+				compileResourceState.readOnlyUniformTransitionChecked = true;
+			}
+			else {
+				currentBatch.passBatchTrackersByResourceIndex[resourceRequirement.resourceIndex] = &compileResourceState.tracker;
+			}
+		}
+		else {
+			AddTransition(batchIndex, currentBatch, passQueueSlot, passName, resourceRequirement, outTransitionedResourceIDs, outFallbackResourceIndices, scratchTransitions);
+		}
 
 		if (AccessTypeIsWriteType(resourceRequirement.state.access)) {
 			RecordFrameQueueTransitionBatch(passQueueSlot, resourceRequirement.resourceIndex, batchIndex);
@@ -3005,6 +3086,7 @@ RenderGraph::FrameCompileResourceState& RenderGraph::GetOrCreateFrameCompileReso
 	if (!entry.trackerInitialized) {
 		entry.tracker = SeedCompileTrackerFromLiveResource(entry.resource);
 		entry.trackerInitialized = true;
+		entry.readOnlyUniformTransitionChecked = false;
 		entry.fastState.valid = TryGetWholeResourceTrackerState(entry.tracker, entry.fastState.state);
 		entry.fastState.wholeResourceOnly = entry.fastState.valid;
 	}
@@ -3028,8 +3110,19 @@ void RenderGraph::RebuildFrameCompileResources() {
 		}
 		entry.tracker = SeedCompileTrackerFromLiveResource(entry.resource);
 		entry.trackerInitialized = true;
+		entry.readOnlyUniformTransitionChecked = false;
 		entry.fastState.valid = TryGetWholeResourceTrackerState(entry.tracker, entry.fastState.state);
 		entry.fastState.wholeResourceOnly = entry.fastState.valid;
+		if (resourceIndex < m_frameResourceAccessSummaries.size()) {
+			const auto& accessSummary = m_frameResourceAccessSummaries[resourceIndex];
+			entry.readOnlyUniformTransitionChecked =
+				accessSummary.readOnlyUniform
+				&& entry.fastState.valid
+				&& entry.fastState.wholeResourceOnly
+				&& entry.resource
+				&& HasLiveCompileResourceBacking(entry.resource)
+				&& StatesExactlyEqual(entry.fastState.state, accessSummary.uniformState);
+		}
 	}
 }
 
@@ -3109,6 +3202,7 @@ void RenderGraph::ClearFrameSchedulingResourceIndex() {
 	m_frameSchedulingResourceIndexByID.clear();
 	m_frameSchedulingResourceCount = 0;
 	m_frameCompileResources.clear();
+	m_aliasActivationPendingDense.clear();
 	m_frameQueueLastUsageBatch.clear();
 	m_frameQueueLastProducerBatch.clear();
 	m_frameQueueLastTransitionBatch.clear();
@@ -3117,6 +3211,7 @@ void RenderGraph::ClearFrameSchedulingResourceIndex() {
 
 void RenderGraph::ClearFramePassSchedulingSummaries() {
 	m_framePassSchedulingSummaries.clear();
+	m_frameResourceAccessSummaries.clear();
 }
 
 void RenderGraph::ResetFrameQueueBatchHistoryTables() {
@@ -3152,6 +3247,14 @@ void RenderGraph::RebuildFrameSchedulingResourceIndex(const std::unordered_set<u
 		}
 	}
 
+	m_aliasActivationPendingDense.assign(m_frameSchedulingResourceCount, 0);
+	for (uint64_t resourceID : aliasActivationPending) {
+		auto resourceIndex = TryGetFrameSchedulingResourceIndex(resourceID);
+		if (resourceIndex.has_value()) {
+			m_aliasActivationPendingDense[*resourceIndex] = 1;
+		}
+	}
+
 	ResetFrameQueueBatchHistoryTables();
 }
 
@@ -3159,6 +3262,7 @@ void RenderGraph::RebuildFramePassSchedulingSummaries() {
 	ZoneScopedN("RenderGraph::RebuildFramePassSchedulingSummaries");
 	m_framePassSchedulingSummaries.clear();
 	m_framePassSchedulingSummaries.resize(m_framePasses.size());
+	m_frameResourceAccessSummaries.assign(m_frameSchedulingResourceCount, FrameResourceAccessSummary{});
 
 	for (size_t passIndex = 0; passIndex < m_framePasses.size(); ++passIndex) {
 		auto& summary = m_framePassSchedulingSummaries[passIndex];
@@ -3185,6 +3289,14 @@ void RenderGraph::RebuildFramePassSchedulingSummaries() {
 				continue;
 			}
 
+			auto& accessSummary = m_frameResourceAccessSummaries[*resourceIndex];
+			accessSummary.hasWrite = accessSummary.hasWrite || AccessTypeIsWriteType(req.state.access);
+			accessSummary.hasUAV = accessSummary.hasUAV || IsUAVState(req.state);
+			accessSummary.hasAliasActivation = accessSummary.hasAliasActivation
+				|| (*resourceIndex < m_aliasActivationPendingDense.size() && m_aliasActivationPendingDense[*resourceIndex] != 0);
+			accessSummary.hasNonWholeResourceRange = accessSummary.hasNonWholeResourceRange
+				|| !IsWholeResourceRange(req.resourceHandleAndRange.range, req.resourceHandleAndRange.resource);
+
 			DenseRequirementSummary denseRequirement{};
 			denseRequirement.resource = req.resourceHandleAndRange.resource;
 			denseRequirement.resourceID = req.resourceHandleAndRange.resource.GetGlobalResourceID();
@@ -3206,6 +3318,8 @@ void RenderGraph::RebuildFramePassSchedulingSummaries() {
 			if (!resourceIndex.has_value()) {
 				continue;
 			}
+
+			m_frameResourceAccessSummaries[*resourceIndex].hasInternalTransition = true;
 
 			DenseEquivalentResourceSummary denseTransition{};
 			denseTransition.resourceID = transition.first.resource.GetGlobalResourceID();
@@ -3229,6 +3343,67 @@ void RenderGraph::RebuildFramePassSchedulingSummaries() {
 		summary.uavResourceIndices.erase(
 			std::unique(summary.uavResourceIndices.begin(), summary.uavResourceIndices.end()),
 			summary.uavResourceIndices.end());
+	}
+}
+
+void RenderGraph::RebuildFrameResourceAccessSummaries(const std::vector<Node>& nodes) {
+	ZoneScopedN("RenderGraph::RebuildFrameResourceAccessSummaries");
+	if (m_frameResourceAccessSummaries.size() != m_frameSchedulingResourceCount) {
+		m_frameResourceAccessSummaries.assign(m_frameSchedulingResourceCount, FrameResourceAccessSummary{});
+	}
+
+	for (auto& accessSummary : m_frameResourceAccessSummaries) {
+		accessSummary.hasMultipleRequiredStates = false;
+		accessSummary.readOnlyUniform = false;
+		accessSummary.uniformStateInitialized = false;
+	}
+
+	for (size_t passIndex = 0; passIndex < m_framePassSchedulingSummaries.size() && passIndex < nodes.size(); ++passIndex) {
+		const auto& passSummary = m_framePassSchedulingSummaries[passIndex];
+		const auto& node = nodes[passIndex];
+
+		std::vector<size_t> activeCompatibleSlots;
+		activeCompatibleSlots.reserve(node.compatibleQueueSlots.size() + 1);
+		for (size_t queueSlot : node.compatibleQueueSlots) {
+			if (queueSlot < m_activeQueueSlotsThisFrame.size() && m_activeQueueSlotsThisFrame[queueSlot]) {
+				activeCompatibleSlots.push_back(queueSlot);
+			}
+		}
+		if (activeCompatibleSlots.empty()) {
+			activeCompatibleSlots.push_back(node.queueSlot);
+		}
+		std::sort(activeCompatibleSlots.begin(), activeCompatibleSlots.end());
+		activeCompatibleSlots.erase(std::unique(activeCompatibleSlots.begin(), activeCompatibleSlots.end()), activeCompatibleSlots.end());
+
+		for (const auto& requirement : passSummary.requirements) {
+			if (requirement.resourceIndex >= m_frameResourceAccessSummaries.size()) {
+				continue;
+			}
+
+			auto& accessSummary = m_frameResourceAccessSummaries[requirement.resourceIndex];
+			for (size_t queueSlot : activeCompatibleSlots) {
+				const QueueKind queueKind = m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(static_cast<uint8_t>(queueSlot)));
+				const ResourceState normalizedState = NormalizeStateForQueue(queueKind, requirement.state);
+				if (!accessSummary.uniformStateInitialized) {
+					accessSummary.uniformState = normalizedState;
+					accessSummary.uniformStateInitialized = true;
+				}
+				else if (!StatesExactlyEqual(accessSummary.uniformState, normalizedState)) {
+					accessSummary.hasMultipleRequiredStates = true;
+				}
+			}
+		}
+	}
+
+	for (auto& accessSummary : m_frameResourceAccessSummaries) {
+		accessSummary.readOnlyUniform =
+			!accessSummary.hasWrite &&
+			!accessSummary.hasUAV &&
+			!accessSummary.hasInternalTransition &&
+			!accessSummary.hasAliasActivation &&
+			!accessSummary.hasNonWholeResourceRange &&
+			!accessSummary.hasMultipleRequiredStates &&
+			accessSummary.uniformStateInitialized;
 	}
 }
 
@@ -4888,6 +5063,13 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		}
 	}
 	{
+		traceCompileStep("RebuildFrameResourceAccessSummaries");
+		ZoneScopedN("RenderGraph::CompileFrame::RebuildFrameResourceAccessSummaries");
+		if (m_getReadOnlyUniformTransitionElisionEnabled && m_getReadOnlyUniformTransitionElisionEnabled()) {
+			RebuildFrameResourceAccessSummaries(nodes);
+		}
+	}
+	{
 		traceCompileStep("MaterializeUnmaterializedResources");
 		ZoneScopedN("RenderGraph::CompileFrame::MaterializeUnmaterializedResources");
 		MaterializeUnmaterializedResources(&usedResourceIDs);
@@ -5864,6 +6046,10 @@ void RenderGraph::Setup() {
 	m_getRenderGraphBatchTraceEnabled = [this]() {
 		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetRenderGraphBatchTraceEnabled() : false;
 	};
+	m_getReadOnlyUniformTransitionElisionEnabled = [this]() {
+		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetReadOnlyUniformTransitionElisionEnabled() : false;
+	};
+
 	m_getAutoAliasMode = [this]() {
 		const auto mode = m_renderGraphSettingsService
 			? m_renderGraphSettingsService->GetAutoAliasMode()
@@ -8312,7 +8498,8 @@ bool RenderGraph::IsNewBatchNeeded(
 		// Alias activations are emitted in BeforePasses of the consuming batch.
 		// Only reject same-batch merging when that activation would clobber an
 		// aliased-equivalent resource that is already live in the batch.
-		if (aliasActivationPending.find(id) != aliasActivationPending.end()
+		if (requirement.resourceIndex < m_aliasActivationPendingDense.size()
+			&& m_aliasActivationPendingDense[requirement.resourceIndex] != 0
 			&& (overlapsAliasedResourceInBatch(requirement) || overlapsAliasedTransitionInBatch(requirement))) {
 			return true;
 		}
