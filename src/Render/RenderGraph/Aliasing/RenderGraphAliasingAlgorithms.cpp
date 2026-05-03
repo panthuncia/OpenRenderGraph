@@ -916,7 +916,12 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 	auto& hasSchedulingPlacementByResourceIndex = rg.m_hasSchedulingPlacementByResourceIndex;
 	auto& aliasPlacementSignatureByID = rg.aliasPlacementSignatureByID;
 
-	const auto previousAliasPlacementPoolByID = aliasPlacementPoolByID;
+	std::vector<uint64_t> previouslyAliasedResourceIDs;
+	previouslyAliasedResourceIDs.reserve(aliasPlacementPoolByID.size());
+	for (const auto& [resourceID, poolID] : aliasPlacementPoolByID) {
+		(void)poolID;
+		previouslyAliasedResourceIDs.push_back(resourceID);
+	}
 	aliasMaterializeOptionsByID.clear();
 	aliasActivationPending.clear();
 	aliasPlacementPoolByID.clear();
@@ -977,6 +982,28 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 			throw std::runtime_error("Alias activation resource index out of range");
 		}
 		aliasActivationPendingByResourceIndex[resourceIndex] = 1;
+	};
+	auto dematerializeResourceForKind = [&](Resource* resource, RGResourceRuntimeKind kind) {
+		if (!resource) {
+			return false;
+		}
+		if (kind == RGResourceRuntimeKind::Texture) {
+			auto* texture = static_cast<PixelBuffer*>(resource);
+			if (texture->IsMaterialized()) {
+				texture->Dematerialize();
+				return true;
+			}
+			return false;
+		}
+		if (kind == RGResourceRuntimeKind::Buffer) {
+			auto* buffer = static_cast<Buffer*>(resource);
+			if (buffer->IsMaterialized()) {
+				buffer->Dematerialize();
+				return true;
+			}
+			return false;
+		}
+		return false;
 	};
 
 	std::vector<AliasResourceIndex> dedicatedSchedulingCandidateIndices;
@@ -1650,30 +1677,16 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 				placement.offset,
 				placement.offset + c.sizeBytes,
 				poolState.generation);
+			const auto itSig = aliasPlacementSignatureByID.find(c.resourceID);
+			const bool signatureChanged = itSig == aliasPlacementSignatureByID.end() || itSig->second != newSignature;
 			auto itRes = resourcesByID.find(c.resourceID);
 			if (itRes != resourcesByID.end()) {
-				auto texture = std::dynamic_pointer_cast<PixelBuffer>(itRes->second);
-				if (texture && texture->IsMaterialized()) {
-					auto itSig = aliasPlacementSignatureByID.find(c.resourceID);
-					if (itSig == aliasPlacementSignatureByID.end() || itSig->second != newSignature) {
-						texture->Dematerialize();
-						markAliasActivationPending(resourceIndex);
-					}
-				}
-				auto buffer = std::dynamic_pointer_cast<Buffer>(itRes->second);
-				if (buffer && buffer->IsMaterialized()) {
-					auto itSig = aliasPlacementSignatureByID.find(c.resourceID);
-					if (itSig == aliasPlacementSignatureByID.end() || itSig->second != newSignature) {
-						buffer->Dematerialize();
-						markAliasActivationPending(resourceIndex);
-					}
-				}
-			}
-			else {
-				auto itSig = aliasPlacementSignatureByID.find(c.resourceID);
-				if (itSig == aliasPlacementSignatureByID.end() || itSig->second != newSignature) {
+				if (signatureChanged && dematerializeResourceForKind(itRes->second.get(), c.kind)) {
 					markAliasActivationPending(resourceIndex);
 				}
+			}
+			else if (signatureChanged) {
+				markAliasActivationPending(resourceIndex);
 			}
 			aliasPlacementSignatureByID[c.resourceID] = newSignature;
 			// Aliased resources need a discard-style activation on first use every frame,
@@ -1776,8 +1789,7 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 		}
 	}
 
-	for (const auto& [resourceID, previousPoolID] : previousAliasPlacementPoolByID) {
-		(void)previousPoolID;
+	for (uint64_t resourceID : previouslyAliasedResourceIDs) {
 		if (aliasPlacementPoolByID.contains(resourceID)) {
 			continue;
 		}
