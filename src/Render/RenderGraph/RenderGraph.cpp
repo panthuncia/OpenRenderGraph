@@ -1293,25 +1293,52 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 		}
 	}
 
-	for (auto& summary : m_framePassAccessSummaries) {
-		auto mark = [&](uint64_t resourceID, AccessKind accessKind, bool isUav) {
-			summary.touchedResourceIDs.push_back(resourceID);
-			if (isUav) {
-				summary.uavResourceIDs.push_back(resourceID);
-			}
+	std::vector<uint32_t> touchedSeen(m_frameDAGResourceCount, 0);
+	std::vector<uint32_t> uavSeen(m_frameDAGResourceCount, 0);
+	std::vector<uint32_t> accessSeen(m_frameDAGResourceCount, 0);
+	std::vector<uint32_t> accessEntryIndexByResource(m_frameDAGResourceCount, 0);
+	uint32_t passGeneration = 0;
+	auto advancePassGeneration = [&]() {
+		++passGeneration;
+		if (passGeneration == 0) {
+			std::fill(touchedSeen.begin(), touchedSeen.end(), 0);
+			std::fill(uavSeen.begin(), uavSeen.end(), 0);
+			std::fill(accessSeen.begin(), accessSeen.end(), 0);
+			passGeneration = 1;
+		}
+	};
 
+	for (auto& summary : m_framePassAccessSummaries) {
+		advancePassGeneration();
+		auto mark = [&](uint64_t resourceID, AccessKind accessKind, bool isUav) {
 			auto dagResourceIt = m_frameDAGResourceIndexByID.find(resourceID);
 			if (dagResourceIt == m_frameDAGResourceIndexByID.end()) {
 				return;
 			}
 
-			const size_t dagResourceIndex = dagResourceIt->second;
+			const uint32_t dagResourceIndex = static_cast<uint32_t>(dagResourceIt->second);
+			if (touchedSeen[dagResourceIndex] != passGeneration) {
+				touchedSeen[dagResourceIndex] = passGeneration;
+				summary.touchedResourceIDs.push_back(resourceID);
+			}
+			if (isUav && uavSeen[dagResourceIndex] != passGeneration) {
+				uavSeen[dagResourceIndex] = passGeneration;
+				summary.uavResourceIDs.push_back(resourceID);
+			}
+
 			if (accessKind == AccessKind::Read
 				&& (dagResourceIndex >= resourcesWrittenThisFrame.size() || !resourcesWrittenThisFrame[dagResourceIndex])) {
 				return;
 			}
 
-			summary.dagAccesses.push_back({ static_cast<uint32_t>(dagResourceIndex), accessKind });
+			if (accessSeen[dagResourceIndex] != passGeneration) {
+				accessSeen[dagResourceIndex] = passGeneration;
+				accessEntryIndexByResource[dagResourceIndex] = static_cast<uint32_t>(summary.dagAccesses.size());
+				summary.dagAccesses.push_back({ dagResourceIndex, accessKind });
+			}
+			else if (accessKind == AccessKind::Write) {
+				summary.dagAccesses[accessEntryIndexByResource[dagResourceIndex]].kind = AccessKind::Write;
+			}
 		};
 
 		if (summary.requirements) {
@@ -1328,28 +1355,6 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 				mark(transition.first.resource.GetGlobalResourceID(), AccessKind::Write, false);
 			}
 		}
-
-		std::sort(summary.touchedResourceIDs.begin(), summary.touchedResourceIDs.end());
-		summary.touchedResourceIDs.erase(
-			std::unique(summary.touchedResourceIDs.begin(), summary.touchedResourceIDs.end()),
-			summary.touchedResourceIDs.end());
-
-		std::sort(summary.uavResourceIDs.begin(), summary.uavResourceIDs.end());
-		summary.uavResourceIDs.erase(
-			std::unique(summary.uavResourceIDs.begin(), summary.uavResourceIDs.end()),
-			summary.uavResourceIDs.end());
-
-		std::sort(summary.dagAccesses.begin(), summary.dagAccesses.end(), [](const auto& a, const auto& b) {
-			if (a.resourceIndex != b.resourceIndex) {
-				return a.resourceIndex < b.resourceIndex;
-			}
-			return a.kind > b.kind;
-		});
-		summary.dagAccesses.erase(
-			std::unique(summary.dagAccesses.begin(), summary.dagAccesses.end(), [](const auto& a, const auto& b) {
-				return a.resourceIndex == b.resourceIndex;
-			}),
-			summary.dagAccesses.end());
 	}
 }
 
@@ -1358,53 +1363,52 @@ std::vector<RenderGraph::Node> RenderGraph::BuildNodes(RenderGraph& rg) {
 
 	std::vector<Node> nodes;
 	nodes.resize(rg.m_framePassAccessSummaries.size());
+	const size_t slotCount = rg.m_queueRegistry.SlotCount();
+	constexpr size_t passTypeCount = static_cast<size_t>(PassType::Copy) + 1;
+	struct QueueCompatibilityCache {
+		std::array<std::vector<size_t>, static_cast<size_t>(QueueKind::Count)> autoAssignableByKind;
+		std::array<std::vector<size_t>, passTypeCount> automaticByPassType;
+		std::array<std::vector<size_t>, static_cast<size_t>(QueueKind::Count)> fallbackByPreferredKind;
+	};
+	QueueCompatibilityCache queueCache{};
+	auto passTypeIndex = [](PassType type) {
+		return static_cast<size_t>(type);
+	};
+	for (size_t slotIndex = 0; slotIndex < slotCount; ++slotIndex) {
+		const auto queueSlotIndex = static_cast<QueueSlotIndex>(static_cast<uint8_t>(slotIndex));
+		const QueueKind kind = rg.m_queueRegistry.GetKind(queueSlotIndex);
+		if (!rg.m_queueRegistry.IsAutoAssignable(queueSlotIndex)) {
+			continue;
+		}
 
-	auto resolveCompatibleQueueSlotsForPass = [&rg](const FramePassStaticAccessSummary& passAccess) -> std::vector<size_t> {
-		auto collectSlotsForKind = [&rg](QueueKind kind) {
-			std::vector<size_t> slots;
-			const size_t slotCount = rg.m_queueRegistry.SlotCount();
-			slots.reserve(slotCount);
-			for (size_t slotIndex = 0; slotIndex < slotCount; ++slotIndex) {
-				const auto queueSlotIndex = static_cast<QueueSlotIndex>(static_cast<uint8_t>(slotIndex));
-				if (rg.m_queueRegistry.GetKind(queueSlotIndex) == kind && rg.m_queueRegistry.IsAutoAssignable(queueSlotIndex)) {
-					slots.push_back(slotIndex);
-				}
+		queueCache.autoAssignableByKind[QueueIndex(kind)].push_back(slotIndex);
+		for (PassType type : { PassType::Render, PassType::Compute, PassType::Copy }) {
+			if (IsPreferredQueueKindCompatible(type, kind)) {
+				queueCache.automaticByPassType[passTypeIndex(type)].push_back(slotIndex);
 			}
-			if (slots.empty()) {
-				slots.push_back(QueueIndex(kind));
-			}
-			return slots;
-		};
+		}
+	}
+	for (size_t kindIndex = 0; kindIndex < static_cast<size_t>(QueueKind::Count); ++kindIndex) {
+		auto& fallbackSlots = queueCache.fallbackByPreferredKind[kindIndex];
+		fallbackSlots = queueCache.autoAssignableByKind[kindIndex];
+		if (fallbackSlots.empty()) {
+			fallbackSlots.push_back(kindIndex);
+		}
+	}
 
-		auto collectAutomaticSlotsForPassType = [&rg](PassType type) {
-			std::vector<size_t> slots;
-			const size_t slotCount = rg.m_queueRegistry.SlotCount();
-			slots.reserve(slotCount);
-			for (size_t slotIndex = 0; slotIndex < slotCount; ++slotIndex) {
-				const auto queueSlotIndex = static_cast<QueueSlotIndex>(static_cast<uint8_t>(slotIndex));
-				if (!rg.m_queueRegistry.IsAutoAssignable(queueSlotIndex)) {
-					continue;
-				}
-				const QueueKind kind = rg.m_queueRegistry.GetKind(queueSlotIndex);
-				if (IsPreferredQueueKindCompatible(type, kind)) {
-					slots.push_back(slotIndex);
-				}
-			}
-			return slots;
-		};
-
+	auto resolveCompatibleQueueSlotsForPass = [&queueCache, &passTypeIndex](const FramePassStaticAccessSummary& passAccess) -> std::vector<size_t> {
 		if (passAccess.pinnedQueueSlot) {
 			return std::vector<size_t>{ static_cast<size_t>(static_cast<uint8_t>(*passAccess.pinnedQueueSlot)) };
 		}
 
 		if (passAccess.queueAssignmentPolicy == QueueAssignmentPolicy::Automatic) {
-			auto slots = collectAutomaticSlotsForPassType(passAccess.type);
+			auto slots = queueCache.automaticByPassType[passTypeIndex(passAccess.type)];
 				if (!slots.empty()) {
 					return slots;
 				}
 		}
 
-		return collectSlotsForKind(passAccess.preferredQueueKind);
+		return queueCache.fallbackByPreferredKind[QueueIndex(passAccess.preferredQueueKind)];
 	};
 
 	for (size_t i = 0; i < rg.m_framePassAccessSummaries.size(); ++i) {
