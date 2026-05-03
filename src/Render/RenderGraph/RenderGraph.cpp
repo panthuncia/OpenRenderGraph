@@ -5168,6 +5168,16 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		RebuildFramePassAccessSummaries();
 	}
 	{
+		traceCompileStep("RebuildFrameSchedulingResourceIndexForAliasing");
+		ZoneScopedN("RenderGraph::CompileFrame::RebuildFrameSchedulingResourceIndexForAliasing");
+		RebuildFrameSchedulingResourceIndex(usedResourceIDs);
+	}
+	{
+		traceCompileStep("RebuildFramePassSchedulingSummariesForAliasing");
+		ZoneScopedN("RenderGraph::CompileFrame::RebuildFramePassSchedulingSummariesForAliasing");
+		RebuildFramePassSchedulingSummaries();
+	}
+	{
 		traceCompileStep("BuildNodes");
 		ZoneScopedN("RenderGraph::CompileFrame::BuildNodes");
 		nodes = BuildNodes(*this);
