@@ -104,7 +104,7 @@ enum class RGResourceRuntimeKind : uint8_t {
 
 struct FrameAliasResourceInfo {
 	uint64_t resourceID = 0;
-	ResourceRegistry::RegistryHandle handle{};
+	size_t resourceIndex = std::numeric_limits<size_t>::max();
 	RGResourceRuntimeKind kind = RGResourceRuntimeKind::Unknown;
 	bool staticInfoInitialized = false;
 
@@ -137,7 +137,8 @@ struct FrameAliasResourceInfo {
 };
 
 struct FrameAliasAnalysis {
-	std::unordered_map<uint64_t, FrameAliasResourceInfo> resourcesByID;
+	std::vector<FrameAliasResourceInfo> infoByResourceIndex;
+	std::vector<uint32_t> candidateResourceIndices;
 	uint32_t maxNodeCriticality = 1;
 };
 
