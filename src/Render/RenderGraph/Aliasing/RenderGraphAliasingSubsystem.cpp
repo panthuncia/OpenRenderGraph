@@ -64,6 +64,11 @@ std::vector<uint64_t> rg::alias::RenderGraphAliasingSubsystem::GetSchedulingEqui
 void rg::alias::RenderGraphAliasingSubsystem::ResetPerFrameState(RenderGraph& renderGraph) const {
 	renderGraph.aliasMaterializeOptionsByID.clear();
 	renderGraph.aliasActivationPending.clear();
+	renderGraph.m_aliasPlacementRangeByResourceIndex.clear();
+	renderGraph.m_hasAliasPlacementByResourceIndex.clear();
+	renderGraph.m_schedulingPlacementRangeByResourceIndex.clear();
+	renderGraph.m_hasSchedulingPlacementByResourceIndex.clear();
+	renderGraph.m_aliasActivationPendingByResourceIndex.clear();
 	renderGraph.autoAliasPoolByID.clear();
 	renderGraph.autoAliasExclusionReasonByID.clear();
 	renderGraph.autoAliasExclusionReasonSummary.clear();

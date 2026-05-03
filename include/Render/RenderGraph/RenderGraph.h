@@ -930,6 +930,10 @@ private:
 	std::unordered_map<uint64_t, uint64_t> aliasPlacementSignatureByID;
 	std::unordered_map<uint64_t, rg::alias::AliasPlacementRange> aliasPlacementRangesByID;
 	std::unordered_map<uint64_t, rg::alias::AliasPlacementRange> schedulingPlacementRangesByID;
+	std::vector<rg::alias::AliasPlacementRange> m_aliasPlacementRangeByResourceIndex;
+	std::vector<uint8_t> m_hasAliasPlacementByResourceIndex;
+	std::vector<rg::alias::AliasPlacementRange> m_schedulingPlacementRangeByResourceIndex;
+	std::vector<uint8_t> m_hasSchedulingPlacementByResourceIndex;
 	std::unordered_map<uint64_t, std::vector<uint64_t>> m_schedulingEquivalentIDsCache;
 	std::unordered_map<uint64_t, size_t> m_frameDAGResourceIndexByID;
 	std::vector<uint64_t> m_frameDAGResourceIDsByIndex;
@@ -937,7 +941,7 @@ private:
 	std::unordered_map<uint64_t, size_t> m_frameSchedulingResourceIndexByID;
 	size_t m_frameSchedulingResourceCount = 0;
 	std::vector<std::vector<size_t>> m_equivalentResourceIndicesByResourceIndex;
-	std::vector<uint8_t> m_aliasActivationPendingDense;
+	std::vector<uint8_t> m_aliasActivationPendingByResourceIndex;
 	std::vector<unsigned int> m_frameQueueLastUsageBatch;
 	std::vector<unsigned int> m_frameQueueLastProducerBatch;
 	std::vector<unsigned int> m_frameQueueLastTransitionBatch;

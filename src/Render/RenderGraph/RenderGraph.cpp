@@ -2600,10 +2600,10 @@ bool RenderGraph::TryAddTransitionFastNoOp(
 	if (requirement.resourceIndex >= m_frameCompileResources.size()) {
 		return false;
 	}
-	if (requirement.resourceIndex >= m_aliasActivationPendingDense.size()) {
+	if (requirement.resourceIndex >= m_aliasActivationPendingByResourceIndex.size()) {
 		return false;
 	}
-	if (m_aliasActivationPendingDense[requirement.resourceIndex] != 0) {
+	if (m_aliasActivationPendingByResourceIndex[requirement.resourceIndex] != 0) {
 		return false;
 	}
 
@@ -2709,7 +2709,7 @@ void RenderGraph::AddTransitionSlowPath(
 	const bool isWholeResourceRequirement = IsWholeResourceRange(requirement.range, resource);
 
 	bool isAliasActivation = false;
-	if (requirement.resourceIndex < m_aliasActivationPendingDense.size() && m_aliasActivationPendingDense[requirement.resourceIndex] != 0) {
+	if (requirement.resourceIndex < m_aliasActivationPendingByResourceIndex.size() && m_aliasActivationPendingByResourceIndex[requirement.resourceIndex] != 0) {
 		isAliasActivation = true;
 		const bool firstUseIsWrite = AccessTypeIsWriteType(requirement.state.access);
 		const bool firstUseIsCommon = requirement.state.access == rhi::ResourceAccessType::Common;
@@ -2743,7 +2743,7 @@ void RenderGraph::AddTransitionSlowPath(
 		std::vector<ResourceTransition> ignored;
 		compileTracker.Apply(requirement.range, pRes, requiredState, ignored);
 		aliasActivationPending.erase(resource.GetGlobalResourceID());
-		m_aliasActivationPendingDense[requirement.resourceIndex] = 0;
+		m_aliasActivationPendingByResourceIndex[requirement.resourceIndex] = 0;
 	}
 	else {
 		compileTracker.Apply(requirement.range, pRes, requiredState, transitions);
@@ -3294,7 +3294,11 @@ void RenderGraph::ClearFrameSchedulingResourceIndex() {
 	m_frameSchedulingResourceIndexByID.clear();
 	m_frameSchedulingResourceCount = 0;
 	m_frameCompileResources.clear();
-	m_aliasActivationPendingDense.clear();
+	m_aliasPlacementRangeByResourceIndex.clear();
+	m_hasAliasPlacementByResourceIndex.clear();
+	m_schedulingPlacementRangeByResourceIndex.clear();
+	m_hasSchedulingPlacementByResourceIndex.clear();
+	m_aliasActivationPendingByResourceIndex.clear();
 	m_frameQueueLastUsageBatch.clear();
 	m_frameQueueLastProducerBatch.clear();
 	m_frameQueueLastTransitionBatch.clear();
@@ -3341,11 +3345,11 @@ void RenderGraph::RebuildFrameSchedulingResourceIndex(const std::unordered_set<u
 
 	RebuildEquivalentResourceIndicesByResourceIndex();
 
-	m_aliasActivationPendingDense.assign(m_frameSchedulingResourceCount, 0);
+	m_aliasActivationPendingByResourceIndex.assign(m_frameSchedulingResourceCount, 0);
 	for (uint64_t resourceID : aliasActivationPending) {
 		auto resourceIndex = TryGetFrameSchedulingResourceIndex(resourceID);
 		if (resourceIndex.has_value()) {
-			m_aliasActivationPendingDense[*resourceIndex] = 1;
+			m_aliasActivationPendingByResourceIndex[*resourceIndex] = 1;
 		}
 	}
 
@@ -3404,7 +3408,7 @@ void RenderGraph::RebuildFramePassSchedulingSummaries() {
 			accessSummary.hasWrite = accessSummary.hasWrite || req.isWrite;
 			accessSummary.hasUAV = accessSummary.hasUAV || req.isUAV;
 			accessSummary.hasAliasActivation = accessSummary.hasAliasActivation
-				|| (*resourceIndex < m_aliasActivationPendingDense.size() && m_aliasActivationPendingDense[*resourceIndex] != 0);
+				|| (*resourceIndex < m_aliasActivationPendingByResourceIndex.size() && m_aliasActivationPendingByResourceIndex[*resourceIndex] != 0);
 			accessSummary.hasNonWholeResourceRange = accessSummary.hasNonWholeResourceRange
 				|| !IsWholeResourceRange(req.range, req.resource);
 
@@ -8643,8 +8647,8 @@ bool RenderGraph::IsNewBatchNeeded(
 		// Alias activations are emitted in BeforePasses of the consuming batch.
 		// Only reject same-batch merging when that activation would clobber an
 		// aliased-equivalent resource that is already live in the batch.
-		if (requirement.resourceIndex < m_aliasActivationPendingDense.size()
-			&& m_aliasActivationPendingDense[requirement.resourceIndex] != 0
+		if (requirement.resourceIndex < m_aliasActivationPendingByResourceIndex.size()
+			&& m_aliasActivationPendingByResourceIndex[requirement.resourceIndex] != 0
 			&& (overlapsAliasedResourceInBatch(requirement) || overlapsAliasedTransitionInBatch(requirement))) {
 			return true;
 		}

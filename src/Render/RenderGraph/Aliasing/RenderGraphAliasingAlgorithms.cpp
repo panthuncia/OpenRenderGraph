@@ -7,6 +7,7 @@
 #include <cmath>
 #include <functional>
 #include <limits>
+#include <queue>
 #include <sstream>
 #include <tracy/Tracy.hpp>
 #include <tuple>
@@ -869,6 +870,7 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 	ZoneScopedN("RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis");
 	auto& aliasMaterializeOptionsByID = rg.aliasMaterializeOptionsByID;
 	auto& aliasActivationPending = rg.aliasActivationPending;
+	auto& aliasActivationPendingByResourceIndex = rg.m_aliasActivationPendingByResourceIndex;
 	auto& autoAliasPreviousMode = rg.autoAliasPreviousMode;
 	auto& autoAliasModeLastFrame = rg.autoAliasModeLastFrame;
 	auto& autoAliasPlannerStats = rg.autoAliasPlannerStats;
@@ -881,12 +883,17 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 	auto& autoAliasPackingStrategyLastFrame = rg.autoAliasPackingStrategyLastFrame;
 	auto& m_getAutoAliasPackingStrategy = rg.m_getAutoAliasPackingStrategy;
 	auto& m_getAutoAliasEnableLogging = rg.m_getAutoAliasEnableLogging;
+	auto& frameSchedulingResourceIndexByID = rg.m_frameSchedulingResourceIndexByID;
 	auto& persistentAliasPools = rg.persistentAliasPools;
 	auto& m_framePasses = rg.m_framePasses;
 	auto& resourcesByID = rg.resourcesByID;
 	auto& aliasPlacementPoolByID = rg.aliasPlacementPoolByID;
 	auto& aliasPlacementRangesByID = rg.aliasPlacementRangesByID;
+	auto& aliasPlacementRangeByResourceIndex = rg.m_aliasPlacementRangeByResourceIndex;
+	auto& hasAliasPlacementByResourceIndex = rg.m_hasAliasPlacementByResourceIndex;
 	auto& schedulingPlacementRangesByID = rg.schedulingPlacementRangesByID;
+	auto& schedulingPlacementRangeByResourceIndex = rg.m_schedulingPlacementRangeByResourceIndex;
+	auto& hasSchedulingPlacementByResourceIndex = rg.m_hasSchedulingPlacementByResourceIndex;
 	auto& aliasPlacementSignatureByID = rg.aliasPlacementSignatureByID;
 
 	const auto previousAliasPlacementPoolByID = aliasPlacementPoolByID;
@@ -895,6 +902,11 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 	aliasPlacementPoolByID.clear();
 	aliasPlacementRangesByID.clear();
 	schedulingPlacementRangesByID.clear();
+	aliasPlacementRangeByResourceIndex.assign(rg.m_frameSchedulingResourceCount, AliasPlacementRange{});
+	hasAliasPlacementByResourceIndex.assign(rg.m_frameSchedulingResourceCount, 0);
+	schedulingPlacementRangeByResourceIndex.assign(rg.m_frameSchedulingResourceCount, AliasPlacementRange{});
+	hasSchedulingPlacementByResourceIndex.assign(rg.m_frameSchedulingResourceCount, 0);
+	aliasActivationPendingByResourceIndex.assign(rg.m_frameSchedulingResourceCount, 0);
 	autoAliasPlannerStats.pooledIndependentBytes = 0;
 	autoAliasPlannerStats.pooledActualBytes = 0;
 	autoAliasPlannerStats.pooledSavedBytes = 0;
@@ -923,6 +935,26 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 	using AliasResourceIndex = uint32_t;
 	auto getInfoByIndex = [&](AliasResourceIndex resourceIndex) -> const FrameAliasResourceInfo& {
 		return analysis.infoByResourceIndex[resourceIndex];
+	};
+	auto setAliasPlacement = [&](AliasResourceIndex resourceIndex, const AliasPlacementRange& placementRange) {
+		if (resourceIndex >= aliasPlacementRangeByResourceIndex.size()) {
+			throw std::runtime_error("Alias placement resource index out of range");
+		}
+		aliasPlacementRangeByResourceIndex[resourceIndex] = placementRange;
+		hasAliasPlacementByResourceIndex[resourceIndex] = 1;
+	};
+	auto setSchedulingPlacement = [&](AliasResourceIndex resourceIndex, const AliasPlacementRange& placementRange) {
+		if (resourceIndex >= schedulingPlacementRangeByResourceIndex.size()) {
+			throw std::runtime_error("Scheduling placement resource index out of range");
+		}
+		schedulingPlacementRangeByResourceIndex[resourceIndex] = placementRange;
+		hasSchedulingPlacementByResourceIndex[resourceIndex] = 1;
+	};
+	auto markAliasActivationPending = [&](AliasResourceIndex resourceIndex) {
+		if (resourceIndex >= aliasActivationPendingByResourceIndex.size()) {
+			throw std::runtime_error("Alias activation resource index out of range");
+		}
+		aliasActivationPendingByResourceIndex[resourceIndex] = 1;
 	};
 
 	std::vector<AliasResourceIndex> dedicatedSchedulingCandidateIndices;
@@ -1022,10 +1054,14 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 			return lhs.resourceID < rhs.resourceID;
 		});
 
-		struct ActiveRange {
+		struct ActiveAllocation {
 			size_t lastUse = 0;
 			uint64_t startByte = 0;
 			uint64_t endByte = 0;
+
+			bool operator>(const ActiveAllocation& rhs) const {
+				return lastUse > rhs.lastUse;
+			}
 		};
 
 		struct FreeRange {
@@ -1041,36 +1077,37 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 			size_t lastUse = 0;
 		};
 
-		auto mergeFreeRanges = [](std::vector<FreeRange>& freeRanges) {
-			if (freeRanges.empty()) {
+		auto insertFreeRangeSortedMerged = [](std::vector<FreeRange>& ranges, FreeRange range) {
+			if (range.endByte <= range.startByte) {
 				return;
 			}
 
-			std::sort(freeRanges.begin(), freeRanges.end(), [](const FreeRange& a, const FreeRange& b) {
-				if (a.startByte != b.startByte) {
-					return a.startByte < b.startByte;
-				}
-				return a.endByte < b.endByte;
-			});
+			auto it = std::lower_bound(
+				ranges.begin(), ranges.end(), range.startByte,
+				[](const FreeRange& lhs, uint64_t startByte) {
+					return lhs.startByte < startByte;
+				});
 
-			size_t writeIndex = 0;
-			for (size_t i = 1; i < freeRanges.size(); ++i) {
-				auto& current = freeRanges[writeIndex];
-				const auto& next = freeRanges[i];
-				if (next.startByte <= current.endByte) {
-					current.endByte = std::max(current.endByte, next.endByte);
-				}
-				else {
-					++writeIndex;
-					freeRanges[writeIndex] = next;
-				}
+			size_t pos = static_cast<size_t>(it - ranges.begin());
+			ranges.insert(it, range);
+
+			if (pos > 0 && ranges[pos - 1].endByte >= ranges[pos].startByte) {
+				ranges[pos - 1].endByte = std::max(ranges[pos - 1].endByte, ranges[pos].endByte);
+				ranges.erase(ranges.begin() + static_cast<std::ptrdiff_t>(pos));
+				--pos;
 			}
 
-			freeRanges.resize(writeIndex + 1);
+			while (pos + 1 < ranges.size() && ranges[pos].endByte >= ranges[pos + 1].startByte) {
+				ranges[pos].endByte = std::max(ranges[pos].endByte, ranges[pos + 1].endByte);
+				ranges.erase(ranges.begin() + static_cast<std::ptrdiff_t>(pos + 1));
+			}
 		};
 
 		auto planWithGreedySweepLine = [&]() {
-			std::vector<ActiveRange> activeRanges;
+			std::priority_queue<
+				ActiveAllocation,
+				std::vector<ActiveAllocation>,
+				std::greater<ActiveAllocation>> activeByEnd;
 			std::vector<FreeRange> freeRanges;
 			std::vector<Placement> plannedPlacements(poolCandidateIndices.size());
 
@@ -1079,21 +1116,14 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 
 			for (size_t candidateIndex = 0; candidateIndex < poolCandidateIndices.size(); ++candidateIndex) {
 				const auto& c = getInfoByIndex(poolCandidateIndices[candidateIndex]);
-				std::vector<ActiveRange> stillActive;
-				stillActive.reserve(activeRanges.size() + 1);
-				for (const auto& active : activeRanges) {
-					if (active.lastUse < c.firstUse) {
-						freeRanges.push_back(FreeRange{
-							.startByte = active.startByte,
-							.endByte = active.endByte,
-							});
-					}
-					else {
-						stillActive.push_back(active);
-					}
+				while (!activeByEnd.empty() && activeByEnd.top().lastUse < c.firstUse) {
+					const auto expired = activeByEnd.top();
+					insertFreeRangeSortedMerged(freeRanges, FreeRange{
+						.startByte = expired.startByte,
+						.endByte = expired.endByte,
+						});
+					activeByEnd.pop();
 				}
-				activeRanges = std::move(stillActive);
-				mergeFreeRanges(freeRanges);
 
 				bool found = false;
 				size_t bestRangeIndex = std::numeric_limits<size_t>::max();
@@ -1123,23 +1153,24 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 					startByte = bestStartByte;
 					const uint64_t endByte = startByte + c.sizeBytes;
 
-					std::vector<FreeRange> replacement;
-					replacement.reserve(2);
-					if (selected.startByte < startByte) {
-						replacement.push_back(FreeRange{
-							.startByte = selected.startByte,
-							.endByte = startByte,
+					if (selected.startByte < startByte && endByte < selected.endByte) {
+						freeRanges[bestRangeIndex].endByte = startByte;
+						freeRanges.insert(
+							freeRanges.begin() + static_cast<std::ptrdiff_t>(bestRangeIndex + 1),
+							FreeRange{
+								.startByte = endByte,
+								.endByte = selected.endByte,
 							});
 					}
-					if (endByte < selected.endByte) {
-						replacement.push_back(FreeRange{
-							.startByte = endByte,
-							.endByte = selected.endByte,
-							});
+					else if (selected.startByte < startByte) {
+						freeRanges[bestRangeIndex].endByte = startByte;
 					}
-
-					freeRanges.erase(freeRanges.begin() + bestRangeIndex);
-					freeRanges.insert(freeRanges.end(), replacement.begin(), replacement.end());
+					else if (endByte < selected.endByte) {
+						freeRanges[bestRangeIndex].startByte = endByte;
+					}
+					else {
+						freeRanges.erase(freeRanges.begin() + static_cast<std::ptrdiff_t>(bestRangeIndex));
+					}
 				}
 				else {
 					startByte = AlignUpU64(heapEnd, c.alignment);
@@ -1150,7 +1181,7 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 				heapEnd = std::max(heapEnd, endByte);
 				poolAlignment = std::max(poolAlignment, c.alignment);
 
-				activeRanges.push_back(ActiveRange{
+				activeByEnd.push(ActiveAllocation{
 					.lastUse = c.lastUse,
 					.startByte = startByte,
 					.endByte = endByte,
@@ -1555,7 +1586,7 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 				aliasMaterializeOptionsByID[c.resourceID] = RenderGraph::ResourceMaterializeOptions(options);
 			}
 			aliasPlacementPoolByID[c.resourceID] = poolID;
-			aliasPlacementRangesByID[c.resourceID] = AliasPlacementRange{
+			const AliasPlacementRange placementRange{
 				.poolID = poolID,
 				.startByte = placement.offset,
 				.endByte = placement.offset + c.sizeBytes,
@@ -1564,7 +1595,8 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 				.firstUsePassIndex = c.firstUsePassIndex,
 				.lastUsePassIndex = c.lastUsePassIndex,
 			};
-			schedulingPlacementRangesByID[c.resourceID] = aliasPlacementRangesByID[c.resourceID];
+			setAliasPlacement(resourceIndex, placementRange);
+			setSchedulingPlacement(resourceIndex, placementRange);
 
 			if (aliasLoggingEnabled) {
 				auto itResName = resourcesByID.find(c.resourceID);
@@ -1595,7 +1627,7 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 					auto itSig = aliasPlacementSignatureByID.find(c.resourceID);
 					if (itSig == aliasPlacementSignatureByID.end() || itSig->second != newSignature) {
 						texture->Dematerialize();
-						aliasActivationPending.insert(c.resourceID);
+						markAliasActivationPending(resourceIndex);
 					}
 				}
 				auto buffer = std::dynamic_pointer_cast<Buffer>(itRes->second);
@@ -1603,14 +1635,14 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 					auto itSig = aliasPlacementSignatureByID.find(c.resourceID);
 					if (itSig == aliasPlacementSignatureByID.end() || itSig->second != newSignature) {
 						buffer->Dematerialize();
-						aliasActivationPending.insert(c.resourceID);
+						markAliasActivationPending(resourceIndex);
 					}
 				}
 			}
 			else {
 				auto itSig = aliasPlacementSignatureByID.find(c.resourceID);
 				if (itSig == aliasPlacementSignatureByID.end() || itSig->second != newSignature) {
-					aliasActivationPending.insert(c.resourceID);
+					markAliasActivationPending(resourceIndex);
 				}
 			}
 			aliasPlacementSignatureByID[c.resourceID] = newSignature;
@@ -1618,7 +1650,7 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 			// not only when the backing was rematerialized. Otherwise a steady-state
 			// handoff between overlapping resources can reuse heap memory without an
 			// activation barrier.
-			aliasActivationPending.insert(c.resourceID);
+			markAliasActivationPending(resourceIndex);
 		}
 
 		for (size_t i = 0; i < poolDebug.ranges.size(); ++i) {
@@ -1640,11 +1672,11 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 	for (AliasResourceIndex resourceIndex : dedicatedSchedulingCandidateIndices) {
 		const auto& info = getInfoByIndex(resourceIndex);
 		const uint64_t resourceID = info.resourceID;
-		if (aliasPlacementRangesByID.contains(resourceID)) {
+		if (resourceIndex < hasAliasPlacementByResourceIndex.size() && hasAliasPlacementByResourceIndex[resourceIndex] != 0) {
 			continue;
 		}
 
-		schedulingPlacementRangesByID[resourceID] = AliasPlacementRange{
+		setSchedulingPlacement(resourceIndex, AliasPlacementRange{
 			.poolID = BuildDedicatedSchedulingPoolID(resourceID),
 			.startByte = 0,
 			.endByte = info.sizeBytes,
@@ -1653,7 +1685,7 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 			.firstUsePassIndex = info.firstUsePassIndex,
 			.lastUsePassIndex = info.lastUsePassIndex,
 			.dedicatedBacking = true,
-		};
+		});
 	}
 
 	std::sort(autoAliasPoolDebug.begin(), autoAliasPoolDebug.end(), [](const AutoAliasPoolDebug& a, const AutoAliasPoolDebug& b) {
@@ -1702,9 +1734,7 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 
 			for (uint64_t resourceID : resourcesToClear) {
 				aliasPlacementPoolByID.erase(resourceID);
-				aliasPlacementRangesByID.erase(resourceID);
 				aliasPlacementSignatureByID.erase(resourceID);
-				aliasActivationPending.erase(resourceID);
 			}
 
 			if (poolState.allocation) {
@@ -1744,7 +1774,21 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 		}
 
 		aliasPlacementSignatureByID.erase(resourceID);
-		aliasActivationPending.erase(resourceID);
+	}
+
+	aliasPlacementRangesByID.reserve(frameSchedulingResourceIndexByID.size());
+	schedulingPlacementRangesByID.reserve(frameSchedulingResourceIndexByID.size());
+	aliasActivationPending.reserve(frameSchedulingResourceIndexByID.size());
+	for (const auto& [resourceID, resourceIndex] : frameSchedulingResourceIndexByID) {
+		if (resourceIndex < hasAliasPlacementByResourceIndex.size() && hasAliasPlacementByResourceIndex[resourceIndex] != 0) {
+			aliasPlacementRangesByID.emplace(resourceID, aliasPlacementRangeByResourceIndex[resourceIndex]);
+		}
+		if (resourceIndex < hasSchedulingPlacementByResourceIndex.size() && hasSchedulingPlacementByResourceIndex[resourceIndex] != 0) {
+			schedulingPlacementRangesByID.emplace(resourceID, schedulingPlacementRangeByResourceIndex[resourceIndex]);
+		}
+		if (resourceIndex < aliasActivationPendingByResourceIndex.size() && aliasActivationPendingByResourceIndex[resourceIndex] != 0) {
+			aliasActivationPending.insert(resourceID);
+		}
 	}
 
 	autoAliasPlannerStats.pooledSavedBytes =
