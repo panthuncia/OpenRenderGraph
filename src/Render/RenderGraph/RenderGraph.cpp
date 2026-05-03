@@ -5207,11 +5207,6 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		m_aliasingSubsystem.AutoAssignAliasingPoolsFromAnalysis(*this, aliasAnalysis);
 	}
 	{
-		traceCompileStep("FinalizeAliasPoolsInAnalysis");
-		ZoneScopedN("RenderGraph::CompileFrame::FinalizeAliasPoolsInAnalysis");
-		m_aliasingSubsystem.FinalizeAliasPoolsInAnalysis(*this, aliasAnalysis);
-	}
-	{
 		traceCompileStep("BuildAliasPlanFromAnalysis");
 		ZoneScopedN("RenderGraph::CompileFrame::BuildAliasPlanFromAnalysis");
 		m_aliasingSubsystem.BuildAliasPlanFromAnalysis(*this, aliasAnalysis);

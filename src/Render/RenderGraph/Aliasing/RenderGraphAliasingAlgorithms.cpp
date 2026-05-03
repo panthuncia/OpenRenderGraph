@@ -707,10 +707,8 @@ void rg::alias::RenderGraphAliasingSubsystem::AutoAssignAliasingPoolsFromAnalysi
 
 	const AutoAliasMode mode = m_getAutoAliasMode ? m_getAutoAliasMode() : AutoAliasMode::Off;
 	const bool aliasLoggingEnabled = m_getAutoAliasEnableLogging ? m_getAutoAliasEnableLogging() : false;
+	const bool autoAliasEnabled = mode != AutoAliasMode::Off;
 	autoAliasModeLastFrame = mode;
-	if (mode == AutoAliasMode::Off) {
-		return;
-	}
 
 	auto scoreCandidate = [&](const FrameAliasResourceInfo& c) {
 		const float benefitMB = static_cast<float>(c.sizeBytes) / (1024.0f * 1024.0f);
@@ -748,10 +746,21 @@ void rg::alias::RenderGraphAliasingSubsystem::AutoAssignAliasingPoolsFromAnalysi
 		}
 
 		auto& c = analysis.infoByResourceIndex[resourceIndex];
+		c.autoPoolID = 0;
+		c.hasAutoPool = false;
+		c.finalPoolID = 0;
+		c.hasFinalPool = false;
 		if (c.exclusionReason != nullptr) {
 			autoAliasExclusionReasonByID.try_emplace(c.resourceID, c.exclusionReason);
 		}
+		if (c.hasManualPool) {
+			c.finalPoolID = c.manualPoolID;
+			c.hasFinalPool = true;
+		}
 		if (c.kind == RGResourceRuntimeKind::Unknown || !c.aliasAllowed || !c.deviceLocal) {
+			continue;
+		}
+		if (!autoAliasEnabled) {
 			continue;
 		}
 
@@ -773,6 +782,8 @@ void rg::alias::RenderGraphAliasingSubsystem::AutoAssignAliasingPoolsFromAnalysi
 		autoAliasPoolByID[c.resourceID] = kAutoPoolGlobal;
 		c.autoPoolID = kAutoPoolGlobal;
 		c.hasAutoPool = true;
+		c.finalPoolID = kAutoPoolGlobal;
+		c.hasFinalPool = true;
 		autoAliasPlannerStats.autoAssigned++;
 		autoAliasPlannerStats.autoAssignedBytes += c.sizeBytes;
 	}
@@ -849,36 +860,9 @@ void rg::alias::RenderGraphAliasingSubsystem::AutoAssignAliasingPoolsFromAnalysi
 	}
 }
 
-void rg::alias::RenderGraphAliasingSubsystem::FinalizeAliasPoolsInAnalysis(RenderGraph& rg, FrameAliasAnalysis& analysis) const {
-	ZoneScopedN("RenderGraphAliasingSubsystem::FinalizeAliasPoolsInAnalysis");
-	for (uint32_t resourceIndex : analysis.candidateResourceIndices) {
-		if (resourceIndex >= analysis.infoByResourceIndex.size()) {
-			continue;
-		}
-
-		auto& info = analysis.infoByResourceIndex[resourceIndex];
-		info.hasFinalPool = false;
-		info.finalPoolID = 0;
-		if (info.hasManualPool) {
-			info.finalPoolID = info.manualPoolID;
-			info.hasFinalPool = true;
-			continue;
-		}
-
-		auto itAuto = rg.autoAliasPoolByID.find(info.resourceID);
-		if (itAuto != rg.autoAliasPoolByID.end()) {
-			info.autoPoolID = itAuto->second;
-			info.hasAutoPool = true;
-			info.finalPoolID = itAuto->second;
-			info.hasFinalPool = true;
-		}
-	}
-}
-
 void rg::alias::RenderGraphAliasingSubsystem::AutoAssignAliasingPools(RenderGraph& rg, const std::vector<AliasSchedulingNode>& nodes) const {
 	auto analysis = BuildAliasFrameAnalysis(rg, nodes);
 	AutoAssignAliasingPoolsFromAnalysis(rg, analysis);
-	FinalizeAliasPoolsInAnalysis(rg, analysis);
 }
 
 bool AccessTypeIsWriteOrCommon(rhi::ResourceAccessType t) {
@@ -1853,7 +1837,6 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph& rg, const std::vector<AliasSchedulingNode>& nodes) const {
 	auto analysis = BuildAliasFrameAnalysis(rg, nodes);
 	AutoAssignAliasingPoolsFromAnalysis(rg, analysis);
-	FinalizeAliasPoolsInAnalysis(rg, analysis);
 	BuildAliasPlanFromAnalysis(rg, analysis);
 }
 
