@@ -731,6 +731,18 @@ private:
 		std::vector<size_t> uavResourceIndices;
 	};
 
+	struct FramePassStaticAccessSummary {
+		const std::vector<ResourceRequirement>* requirements = nullptr;
+		const std::vector<std::pair<ResourceHandleAndRange, ResourceState>>* internalTransitions = nullptr;
+		std::vector<uint64_t> touchedResourceIDs;
+		std::vector<uint64_t> uavResourceIDs;
+		std::vector<NodeAccess> dagAccesses;
+		PassType type = PassType::Unknown;
+		QueueKind preferredQueueKind = QueueKind::Graphics;
+		QueueAssignmentPolicy queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
+		std::optional<QueueSlotIndex> pinnedQueueSlot;
+	};
+
 	struct FrameResourceEventSummary {
 		unsigned int latestBatch = 0;
 		unsigned int previousBatch = 0;
@@ -866,10 +878,6 @@ private:
 		std::vector<uint64_t> touchedIDs;
 		std::vector<uint64_t> uavIDs;
 
-		// For dependency building: per expanded ID, strongest access in this pass.
-		// Write dominates read. Sorted by dense frame-local resource index after BuildNodes.
-		std::vector<NodeAccess> accessByID;
-
 		// DAG
 		std::vector<size_t> out;
 		std::vector<size_t> in;
@@ -918,6 +926,7 @@ private:
 	std::vector<unsigned int> m_frameQueueLastProducerBatch;
 	std::vector<unsigned int> m_frameQueueLastTransitionBatch;
 	std::vector<FrameResourceEventSummary> m_frameResourceEventSummaries;
+	std::vector<FramePassStaticAccessSummary> m_framePassAccessSummaries;
 	std::vector<FramePassSchedulingSummary> m_framePassSchedulingSummaries;
 	std::unordered_map<uint64_t, uint64_t> aliasPlacementPoolByID;
 	std::unordered_set<uint64_t> aliasActivationPending;
@@ -1210,8 +1219,8 @@ private:
 
 	struct PassView {
 		bool isCompute = false;
-		std::vector<ResourceRequirement>* reqs = nullptr;
-		std::vector<std::pair<ResourceHandleAndRange, ResourceState>>* internalTransitions = nullptr;
+		const std::vector<ResourceRequirement>* reqs = nullptr;
+		const std::vector<std::pair<ResourceHandleAndRange, ResourceState>>* internalTransitions = nullptr;
 	};
 
 	struct SeqState {
@@ -1221,11 +1230,12 @@ private:
 
 	using AutoAliasPlannerStats = rg::alias::AutoAliasPlannerStats;
 
-	static PassView GetPassView(AnyPassAndResources& pr);
-	static bool BuildDependencyGraph(std::vector<Node>& nodes);
-	static bool BuildDependencyGraph(std::vector<Node>& nodes, std::span<const std::pair<size_t, size_t>> explicitEdges);
+	static PassView GetPassView(const AnyPassAndResources& pr);
+	void RebuildFramePassAccessSummaries();
+	bool BuildDependencyGraph(std::vector<Node>& nodes);
+	bool BuildDependencyGraph(std::vector<Node>& nodes, std::span<const std::pair<size_t, size_t>> explicitEdges);
 	static bool FinalizeDependencyGraph(std::vector<Node>& nodes);
-	static std::vector<Node> BuildNodes(RenderGraph& rg, std::vector<AnyPassAndResources>& passes);
+	static std::vector<Node> BuildNodes(RenderGraph& rg);
 	static std::vector<uint8_t> PlanActiveQueueSlots(RenderGraph& rg, const std::vector<AnyPassAndResources>& passes, const std::vector<Node>& nodes);
 	static bool AddEdgeDedup(
 		size_t from, size_t to,

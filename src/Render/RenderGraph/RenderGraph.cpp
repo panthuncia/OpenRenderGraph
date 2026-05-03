@@ -774,13 +774,16 @@ void RenderGraph::WriteCompiledGraphDebugDump(uint8_t frameIndex, const std::vec
 				dump << "]\n";
 			}
 
-			if (!node.accessByID.empty()) {
+			const auto* dagAccesses = node.passIndex < m_framePassAccessSummaries.size()
+				? &m_framePassAccessSummaries[node.passIndex].dagAccesses
+				: nullptr;
+			if (dagAccesses && !dagAccesses->empty()) {
 				dump << "  access_by_id=[";
-				for (size_t i = 0; i < node.accessByID.size(); ++i) {
+				for (size_t i = 0; i < dagAccesses->size(); ++i) {
 					if (i != 0) {
 						dump << ", ";
 					}
-					const auto& access = node.accessByID[i];
+					const auto& access = (*dagAccesses)[i];
 					const uint64_t resourceID = access.resourceIndex < m_frameDAGResourceIDsByIndex.size()
 						? m_frameDAGResourceIDsByIndex[access.resourceIndex]
 						: 0;
@@ -1210,33 +1213,153 @@ void RenderGraph::WriteVramUsageDebugDump(uint8_t frameIndex) const
 	}
 }
 
-RenderGraph::PassView RenderGraph::GetPassView(AnyPassAndResources& pr) {
+RenderGraph::PassView RenderGraph::GetPassView(const AnyPassAndResources& pr) {
 	PassView v{};
 	if (pr.type == PassType::Compute) {
-		auto& p = std::get<ComputePassAndResources>(pr.pass);
+		const auto& p = std::get<ComputePassAndResources>(pr.pass);
 		v.reqs = &p.resources.frameResourceRequirements;
 		v.internalTransitions = &p.resources.internalTransitions;
 	}
 	else if (pr.type == PassType::Render) {
-		auto& p = std::get<RenderPassAndResources>(pr.pass);
+		const auto& p = std::get<RenderPassAndResources>(pr.pass);
 		v.reqs = &p.resources.frameResourceRequirements;
 		v.internalTransitions = &p.resources.internalTransitions;
 	}
 	else if (pr.type == PassType::Copy) {
-		auto& p = std::get<CopyPassAndResources>(pr.pass);
+		const auto& p = std::get<CopyPassAndResources>(pr.pass);
 		v.reqs = &p.resources.frameResourceRequirements;
 		v.internalTransitions = &p.resources.internalTransitions;
 	}
 	return v;
 }
 
-std::vector<RenderGraph::Node> RenderGraph::BuildNodes(RenderGraph& rg, std::vector<AnyPassAndResources>& passes) {
+void RenderGraph::RebuildFramePassAccessSummaries() {
+	ZoneScopedN("RenderGraph::RebuildFramePassAccessSummaries");
+	m_framePassAccessSummaries.clear();
+	m_framePassAccessSummaries.resize(m_framePasses.size());
+
+	std::vector<uint8_t> resourcesWrittenThisFrame(m_frameDAGResourceCount, 0);
+
+	for (size_t passIndex = 0; passIndex < m_framePasses.size(); ++passIndex) {
+		const auto& pass = m_framePasses[passIndex];
+		auto& summary = m_framePassAccessSummaries[passIndex];
+		summary = FramePassStaticAccessSummary{};
+		summary.type = pass.type;
+		summary.preferredQueueKind = DefaultPreferredQueueKind(pass.type);
+		summary.queueAssignmentPolicy = DefaultQueueAssignmentPolicy(pass.type);
+
+		PassView view = GetPassView(pass);
+		summary.requirements = view.reqs;
+		summary.internalTransitions = view.internalTransitions;
+
+		if (pass.type == PassType::Render) {
+			const auto& passResources = std::get<RenderPassAndResources>(pass.pass).resources;
+			summary.preferredQueueKind = passResources.preferredQueueKind;
+			summary.queueAssignmentPolicy = passResources.queueAssignmentPolicy;
+			summary.pinnedQueueSlot = passResources.pinnedQueueSlot;
+		}
+		else if (pass.type == PassType::Compute) {
+			const auto& passResources = std::get<ComputePassAndResources>(pass.pass).resources;
+			summary.preferredQueueKind = passResources.preferredQueueKind;
+			summary.queueAssignmentPolicy = passResources.queueAssignmentPolicy;
+			summary.pinnedQueueSlot = passResources.pinnedQueueSlot;
+		}
+		else if (pass.type == PassType::Copy) {
+			const auto& passResources = std::get<CopyPassAndResources>(pass.pass).resources;
+			summary.preferredQueueKind = passResources.preferredQueueKind;
+			summary.queueAssignmentPolicy = passResources.queueAssignmentPolicy;
+			summary.pinnedQueueSlot = passResources.pinnedQueueSlot;
+		}
+
+		if (summary.requirements) {
+			for (const auto& req : *summary.requirements) {
+				if (!AccessTypeIsWriteType(req.state.access)) {
+					continue;
+				}
+				auto dagResourceIt = m_frameDAGResourceIndexByID.find(req.resourceHandleAndRange.resource.GetGlobalResourceID());
+				if (dagResourceIt != m_frameDAGResourceIndexByID.end() && dagResourceIt->second < resourcesWrittenThisFrame.size()) {
+					resourcesWrittenThisFrame[dagResourceIt->second] = 1;
+				}
+			}
+		}
+
+		if (summary.internalTransitions) {
+			for (const auto& transition : *summary.internalTransitions) {
+				auto dagResourceIt = m_frameDAGResourceIndexByID.find(transition.first.resource.GetGlobalResourceID());
+				if (dagResourceIt != m_frameDAGResourceIndexByID.end() && dagResourceIt->second < resourcesWrittenThisFrame.size()) {
+					resourcesWrittenThisFrame[dagResourceIt->second] = 1;
+				}
+			}
+		}
+	}
+
+	for (auto& summary : m_framePassAccessSummaries) {
+		auto mark = [&](uint64_t resourceID, AccessKind accessKind, bool isUav) {
+			summary.touchedResourceIDs.push_back(resourceID);
+			if (isUav) {
+				summary.uavResourceIDs.push_back(resourceID);
+			}
+
+			auto dagResourceIt = m_frameDAGResourceIndexByID.find(resourceID);
+			if (dagResourceIt == m_frameDAGResourceIndexByID.end()) {
+				return;
+			}
+
+			const size_t dagResourceIndex = dagResourceIt->second;
+			if (accessKind == AccessKind::Read
+				&& (dagResourceIndex >= resourcesWrittenThisFrame.size() || !resourcesWrittenThisFrame[dagResourceIndex])) {
+				return;
+			}
+
+			summary.dagAccesses.push_back({ static_cast<uint32_t>(dagResourceIndex), accessKind });
+		};
+
+		if (summary.requirements) {
+			for (const auto& req : *summary.requirements) {
+				mark(
+					req.resourceHandleAndRange.resource.GetGlobalResourceID(),
+					AccessTypeIsWriteType(req.state.access) ? AccessKind::Write : AccessKind::Read,
+					IsUAVState(req.state));
+			}
+		}
+
+		if (summary.internalTransitions) {
+			for (const auto& transition : *summary.internalTransitions) {
+				mark(transition.first.resource.GetGlobalResourceID(), AccessKind::Write, false);
+			}
+		}
+
+		std::sort(summary.touchedResourceIDs.begin(), summary.touchedResourceIDs.end());
+		summary.touchedResourceIDs.erase(
+			std::unique(summary.touchedResourceIDs.begin(), summary.touchedResourceIDs.end()),
+			summary.touchedResourceIDs.end());
+
+		std::sort(summary.uavResourceIDs.begin(), summary.uavResourceIDs.end());
+		summary.uavResourceIDs.erase(
+			std::unique(summary.uavResourceIDs.begin(), summary.uavResourceIDs.end()),
+			summary.uavResourceIDs.end());
+
+		std::sort(summary.dagAccesses.begin(), summary.dagAccesses.end(), [](const auto& a, const auto& b) {
+			if (a.resourceIndex != b.resourceIndex) {
+				return a.resourceIndex < b.resourceIndex;
+			}
+			return a.kind > b.kind;
+		});
+		summary.dagAccesses.erase(
+			std::unique(summary.dagAccesses.begin(), summary.dagAccesses.end(), [](const auto& a, const auto& b) {
+				return a.resourceIndex == b.resourceIndex;
+			}),
+			summary.dagAccesses.end());
+	}
+}
+
+std::vector<RenderGraph::Node> RenderGraph::BuildNodes(RenderGraph& rg) {
 	ZoneScopedN("RenderGraph::BuildNodes");
 
 	std::vector<Node> nodes;
-	nodes.resize(passes.size());
+	nodes.resize(rg.m_framePassAccessSummaries.size());
 
-	auto resolveCompatibleQueueSlotsForPass = [&rg](const AnyPassAndResources& pr) -> std::vector<size_t> {
+	auto resolveCompatibleQueueSlotsForPass = [&rg](const FramePassStaticAccessSummary& passAccess) -> std::vector<size_t> {
 		auto collectSlotsForKind = [&rg](QueueKind kind) {
 			std::vector<size_t> slots;
 			const size_t slotCount = rg.m_queueRegistry.SlotCount();
@@ -1270,52 +1393,25 @@ std::vector<RenderGraph::Node> RenderGraph::BuildNodes(RenderGraph& rg, std::vec
 			return slots;
 		};
 
-		if (pr.type == PassType::Compute) {
-			const auto& pass = std::get<ComputePassAndResources>(pr.pass);
-			if (pass.resources.pinnedQueueSlot)
-				return std::vector<size_t>{ static_cast<size_t>(static_cast<uint8_t>(*pass.resources.pinnedQueueSlot)) };
-			if (pass.resources.queueAssignmentPolicy == QueueAssignmentPolicy::Automatic) {
-				auto slots = collectAutomaticSlotsForPassType(pr.type);
+		if (passAccess.pinnedQueueSlot) {
+			return std::vector<size_t>{ static_cast<size_t>(static_cast<uint8_t>(*passAccess.pinnedQueueSlot)) };
+		}
+
+		if (passAccess.queueAssignmentPolicy == QueueAssignmentPolicy::Automatic) {
+			auto slots = collectAutomaticSlotsForPassType(passAccess.type);
 				if (!slots.empty()) {
 					return slots;
 				}
-			}
-			return collectSlotsForKind(pass.resources.preferredQueueKind);
 		}
 
-		if (pr.type == PassType::Render) {
-			const auto& pass = std::get<RenderPassAndResources>(pr.pass);
-			if (pass.resources.pinnedQueueSlot)
-				return std::vector<size_t>{ static_cast<size_t>(static_cast<uint8_t>(*pass.resources.pinnedQueueSlot)) };
-			if (pass.resources.queueAssignmentPolicy == QueueAssignmentPolicy::Automatic) {
-				auto slots = collectAutomaticSlotsForPassType(pr.type);
-				if (!slots.empty()) {
-					return slots;
-				}
-			}
-			return collectSlotsForKind(pass.resources.preferredQueueKind);
-		}
-
-		if (pr.type == PassType::Copy) {
-			const auto& pass = std::get<CopyPassAndResources>(pr.pass);
-			if (pass.resources.pinnedQueueSlot)
-				return std::vector<size_t>{ static_cast<size_t>(static_cast<uint8_t>(*pass.resources.pinnedQueueSlot)) };
-			if (pass.resources.queueAssignmentPolicy == QueueAssignmentPolicy::Automatic) {
-				auto slots = collectAutomaticSlotsForPassType(pr.type);
-				if (!slots.empty()) {
-					return slots;
-				}
-			}
-			return collectSlotsForKind(pass.resources.preferredQueueKind);
-		}
-
-		return std::vector<size_t>{ QueueIndex(QueueKind::Graphics) };
+		return collectSlotsForKind(passAccess.preferredQueueKind);
 	};
 
-	for (size_t i = 0; i < passes.size(); ++i) {
+	for (size_t i = 0; i < rg.m_framePassAccessSummaries.size(); ++i) {
+		const auto& passAccess = rg.m_framePassAccessSummaries[i];
 		Node n{};
 		n.passIndex = i;
-		n.compatibleQueueSlots = resolveCompatibleQueueSlotsForPass(passes[i]);
+		n.compatibleQueueSlots = resolveCompatibleQueueSlotsForPass(passAccess);
 		for (size_t slot : n.compatibleQueueSlots) {
 			if (slot >= rg.m_queueRegistry.SlotCount()) {
 				continue;
@@ -1323,23 +1419,8 @@ std::vector<RenderGraph::Node> RenderGraph::BuildNodes(RenderGraph& rg, std::vec
 			const QueueKind kind = rg.m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot)));
 			n.compatibleQueueKindMask |= static_cast<uint8_t>(1u << QueueIndex(kind));
 		}
-		n.preferredQueueKind = DefaultPreferredQueueKind(passes[i].type);
-		n.queueAssignmentPolicy = DefaultQueueAssignmentPolicy(passes[i].type);
-		if (passes[i].type == PassType::Render) {
-			const auto& pass = std::get<RenderPassAndResources>(passes[i].pass);
-			n.preferredQueueKind = pass.resources.preferredQueueKind;
-			n.queueAssignmentPolicy = pass.resources.queueAssignmentPolicy;
-		}
-		else if (passes[i].type == PassType::Compute) {
-			const auto& pass = std::get<ComputePassAndResources>(passes[i].pass);
-			n.preferredQueueKind = pass.resources.preferredQueueKind;
-			n.queueAssignmentPolicy = pass.resources.queueAssignmentPolicy;
-		}
-		else if (passes[i].type == PassType::Copy) {
-			const auto& pass = std::get<CopyPassAndResources>(passes[i].pass);
-			n.preferredQueueKind = pass.resources.preferredQueueKind;
-			n.queueAssignmentPolicy = pass.resources.queueAssignmentPolicy;
-		}
+		n.preferredQueueKind = passAccess.preferredQueueKind;
+		n.queueAssignmentPolicy = passAccess.queueAssignmentPolicy;
 		n.queueSlot = QueueIndex(n.preferredQueueKind);
 		for (size_t slot : n.compatibleQueueSlots) {
 			if (slot < rg.m_queueRegistry.SlotCount()
@@ -1353,54 +1434,8 @@ std::vector<RenderGraph::Node> RenderGraph::BuildNodes(RenderGraph& rg, std::vec
 		}
 		n.assignedQueueSlot = n.queueSlot;
 		n.originalOrder = static_cast<uint32_t>(i);
-
-		PassView view = GetPassView(passes[i]);
-
-		auto mark = [&](uint64_t rid, AccessKind k, bool isUav) {
-			n.touchedIDs.push_back(rid);
-			if (isUav) n.uavIDs.push_back(rid);
-			auto dagResourceIt = rg.m_frameDAGResourceIndexByID.find(rid);
-			if (dagResourceIt != rg.m_frameDAGResourceIndexByID.end()) {
-				n.accessByID.push_back({ static_cast<uint32_t>(dagResourceIt->second), k });
-			}
-			};
-
-		// Alias placement is computed later in CompileFrame, after the dependency DAG
-		// has already been built. Expanding through the previous frame's alias
-		// placements here can inject stale hazards into the current frame, so node
-		// construction must only reflect the pass's declared resources.
-		// Current-frame alias overlap is handled after BuildAliasPlanAfterDag.
-		// resource requirements
-		for (auto& req : *view.reqs) {
-			uint64_t base = req.resourceHandleAndRange.resource.GetGlobalResourceID();
-			bool write = AccessTypeIsWriteType(req.state.access);
-			bool isUav = IsUAVState(req.state);
-
-			mark(base, write ? AccessKind::Write : AccessKind::Read, isUav);
-		}
-
-		// internal transitions: treat as "write" for scheduling conservatism
-		for (auto& tr : *view.internalTransitions) {
-			uint64_t base = tr.first.resource.GetGlobalResourceID();
-			mark(base, AccessKind::Write, /*isUav=*/false);
-		}
-
-		// Deduplicate touchedIDs
-		std::sort(n.touchedIDs.begin(), n.touchedIDs.end());
-		n.touchedIDs.erase(std::unique(n.touchedIDs.begin(), n.touchedIDs.end()), n.touchedIDs.end());
-
-		// Deduplicate uavIDs
-		std::sort(n.uavIDs.begin(), n.uavIDs.end());
-		n.uavIDs.erase(std::unique(n.uavIDs.begin(), n.uavIDs.end()), n.uavIDs.end());
-
-		// Deduplicate accessByID: sort by dense resource index, then collapse duplicates keeping Write over Read
-		std::sort(n.accessByID.begin(), n.accessByID.end(), [](auto& a, auto& b) {
-			if (a.resourceIndex != b.resourceIndex) return a.resourceIndex < b.resourceIndex;
-			return a.kind > b.kind; // Write (1) before Read (0)
-		});
-		auto last = std::unique(n.accessByID.begin(), n.accessByID.end(),
-			[](auto& a, auto& b) { return a.resourceIndex == b.resourceIndex; });
-		n.accessByID.erase(last, n.accessByID.end());
+		n.touchedIDs = passAccess.touchedResourceIDs;
+		n.uavIDs = passAccess.uavResourceIDs;
 
 		nodes[i] = std::move(n);
 	}
@@ -1610,23 +1645,7 @@ bool RenderGraph::BuildDependencyGraph(
 	std::span<const std::pair<size_t, size_t>> explicitEdges)
 {
 	ZoneScopedN("RenderGraph::BuildDependencyGraph");
-	size_t dagResourceCount = 0;
-	{
-		for (const auto& node : nodes) {
-			for (const auto& access : node.accessByID) {
-				dagResourceCount = (std::max)(dagResourceCount, size_t(access.resourceIndex) + 1);
-			}
-		}
-	}
-	std::vector<SeqState> seq(dagResourceCount);
-	std::vector<uint8_t> resourcesWrittenThisFrame(dagResourceCount, 0);
-	for (const auto& node : nodes) {
-		for (const auto& access : node.accessByID) {
-			if (access.kind == AccessKind::Write && access.resourceIndex < resourcesWrittenThisFrame.size()) {
-				resourcesWrittenThisFrame[access.resourceIndex] = 1;
-			}
-		}
-	}
+	std::vector<SeqState> seq(m_frameDAGResourceCount);
 
 	std::unordered_set<uint64_t> edgeSet;
 	edgeSet.reserve(nodes.size() * 8);
@@ -1634,13 +1653,15 @@ bool RenderGraph::BuildDependencyGraph(
 	// build deps in ORIGINAL order
 	for (size_t i = 0; i < nodes.size(); ++i) {
 		auto& node = nodes[i];
+		const auto* dagAccesses = node.passIndex < m_framePassAccessSummaries.size()
+			? &m_framePassAccessSummaries[node.passIndex].dagAccesses
+			: nullptr;
+		if (!dagAccesses) {
+			continue;
+		}
 
-		for (auto& access : node.accessByID) {
+		for (const auto& access : *dagAccesses) {
 			if (access.resourceIndex >= seq.size()) {
-				continue;
-			}
-
-			if (access.kind == AccessKind::Read && !resourcesWrittenThisFrame[access.resourceIndex]) {
 				continue;
 			}
 
@@ -3286,12 +3307,12 @@ void RenderGraph::RebuildFrameSchedulingResourceIndex(const std::unordered_set<u
 void RenderGraph::RebuildFramePassSchedulingSummaries() {
 	ZoneScopedN("RenderGraph::RebuildFramePassSchedulingSummaries");
 	m_framePassSchedulingSummaries.clear();
-	m_framePassSchedulingSummaries.resize(m_framePasses.size());
+	m_framePassSchedulingSummaries.resize(m_framePassAccessSummaries.size());
 	m_frameResourceAccessSummaries.assign(m_frameSchedulingResourceCount, FrameResourceAccessSummary{});
 
-	for (size_t passIndex = 0; passIndex < m_framePasses.size(); ++passIndex) {
+	for (size_t passIndex = 0; passIndex < m_framePassAccessSummaries.size(); ++passIndex) {
 		auto& summary = m_framePassSchedulingSummaries[passIndex];
-		PassView view = GetPassView(m_framePasses[passIndex]);
+		const auto& passAccess = m_framePassAccessSummaries[passIndex];
 
 		auto appendEquivalentResourceIndices = [&](uint64_t resourceID, std::vector<size_t>& outIndices) {
 			for (uint64_t equivalentID : GetSchedulingEquivalentIDsCached(resourceID)) {
@@ -3308,7 +3329,8 @@ void RenderGraph::RebuildFramePassSchedulingSummaries() {
 			outIndices.erase(std::unique(outIndices.begin(), outIndices.end()), outIndices.end());
 		};
 
-		for (const auto& req : *view.reqs) {
+		if (passAccess.requirements) {
+		for (const auto& req : *passAccess.requirements) {
 			auto resourceIndex = TryGetFrameSchedulingResourceIndex(req.resourceHandleAndRange.resource.GetGlobalResourceID());
 			if (!resourceIndex.has_value()) {
 				continue;
@@ -3337,8 +3359,10 @@ void RenderGraph::RebuildFramePassSchedulingSummaries() {
 				summary.uavResourceIndices.push_back(*resourceIndex);
 			}
 		}
+		}
 
-		for (const auto& transition : *view.internalTransitions) {
+		if (passAccess.internalTransitions) {
+		for (const auto& transition : *passAccess.internalTransitions) {
 			auto resourceIndex = TryGetFrameSchedulingResourceIndex(transition.first.resource.GetGlobalResourceID());
 			if (!resourceIndex.has_value()) {
 				continue;
@@ -3352,6 +3376,7 @@ void RenderGraph::RebuildFramePassSchedulingSummaries() {
 			appendEquivalentResourceIndices(denseTransition.resourceID, denseTransition.equivalentResourceIndices);
 			summary.internalTransitions.push_back(std::move(denseTransition));
 			summary.touchedResourceIndices.push_back(*resourceIndex);
+		}
 		}
 
 		std::sort(summary.requiredResourceIndices.begin(), summary.requiredResourceIndices.end());
@@ -5013,9 +5038,14 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	}
 	m_frameDAGResourceCount = m_frameDAGResourceIDsByIndex.size();
 	{
+		traceCompileStep("RebuildFramePassAccessSummaries");
+		ZoneScopedN("RenderGraph::CompileFrame::RebuildFramePassAccessSummaries");
+		RebuildFramePassAccessSummaries();
+	}
+	{
 		traceCompileStep("BuildNodes");
 		ZoneScopedN("RenderGraph::CompileFrame::BuildNodes");
-		nodes = BuildNodes(*this, m_framePasses);
+		nodes = BuildNodes(*this);
 	}
 	{
 		traceCompileStep("BuildDependencyGraph");
