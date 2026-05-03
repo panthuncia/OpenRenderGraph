@@ -517,6 +517,54 @@ namespace {
 		return static_cast<uint64_t>(signature);
 	}
 
+	uint64_t BuildAliasPoolPlanningSignature(
+		uint64_t poolID,
+		AutoAliasPackingStrategy packingStrategy,
+		const rg::alias::FrameAliasAnalysis& analysis,
+		const std::vector<uint32_t>& poolCandidateIndices) {
+		size_t signature = static_cast<size_t>(0x7f4a7c15d9e31a01ull);
+		boost::hash_combine(signature, poolID);
+		boost::hash_combine(signature, static_cast<uint8_t>(packingStrategy));
+		boost::hash_combine(signature, poolCandidateIndices.size());
+		for (uint32_t resourceIndex : poolCandidateIndices) {
+			if (resourceIndex >= analysis.infoByResourceIndex.size()) {
+				boost::hash_combine(signature, resourceIndex);
+				continue;
+			}
+
+			const auto& info = analysis.infoByResourceIndex[resourceIndex];
+			boost::hash_combine(signature, info.resourceID);
+			boost::hash_combine(signature, info.sizeBytes);
+			boost::hash_combine(signature, info.alignment);
+			boost::hash_combine(signature, info.firstUse);
+			boost::hash_combine(signature, info.lastUse);
+			boost::hash_combine(signature, info.firstUseIsWrite);
+			boost::hash_combine(signature, static_cast<uint8_t>(info.kind));
+		}
+		return static_cast<uint64_t>(signature);
+	}
+
+	enum class AliasPlanCacheMissReason : uint8_t {
+		None,
+		NoCachedPlan,
+		SignatureChanged,
+		CandidateMismatch,
+	};
+
+	const char* GetAliasPlanCacheMissReasonLabel(AliasPlanCacheMissReason reason) {
+		switch (reason) {
+		case AliasPlanCacheMissReason::NoCachedPlan:
+			return "no cached plan";
+		case AliasPlanCacheMissReason::SignatureChanged:
+			return "signature changed";
+		case AliasPlanCacheMissReason::CandidateMismatch:
+			return "candidate mismatch";
+		case AliasPlanCacheMissReason::None:
+		default:
+			return "";
+		}
+	}
+
 	const char* GetPassTypeName(RenderGraph::PassType passType) {
 		switch (passType) {
 		case RenderGraph::PassType::Render:
@@ -892,6 +940,7 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 	auto& m_framePasses = rg.m_framePasses;
 	auto& resourcesByID = rg.resourcesByID;
 	auto& aliasPlacementPoolByID = rg.aliasPlacementPoolByID;
+	auto& cachedAliasPlanByPoolID = rg.cachedAliasPlanByPoolID;
 	auto& aliasPlacementRangesByID = rg.aliasPlacementRangesByID;
 	auto& aliasPlacementRangeByResourceIndex = rg.m_aliasPlacementRangeByResourceIndex;
 	auto& hasAliasPlacementByResourceIndex = rg.m_hasAliasPlacementByResourceIndex;
@@ -919,6 +968,9 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 	autoAliasPlannerStats.pooledIndependentBytes = 0;
 	autoAliasPlannerStats.pooledActualBytes = 0;
 	autoAliasPlannerStats.pooledSavedBytes = 0;
+	autoAliasPlannerStats.planCacheHits = 0;
+	autoAliasPlannerStats.planCacheMisses = 0;
+	autoAliasPlannerStats.primaryPlanCacheMissReason = nullptr;
 	autoAliasPoolDebug.clear();
 	uint64_t pooledReservedBytes = 0;
 	aliasPoolPlanFrameIndex++;
@@ -935,8 +987,12 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 	const bool aliasLoggingEnabled = m_getAutoAliasEnableLogging ? m_getAutoAliasEnableLogging() : false;
 	const bool buildAliasDebug = aliasLoggingEnabled
 		|| (m_getAutoAliasBuildDebugData && m_getAutoAliasBuildDebugData());
+	const bool collectAliasCacheDebugStats = m_getAutoAliasBuildDebugData && m_getAutoAliasBuildDebugData();
 	const bool modeChanged = autoAliasPreviousMode != autoAliasModeLastFrame;
 	const bool packingStrategyChanged = previousPackingStrategy != packingStrategy;
+	size_t cacheMissNoCachedPlanCount = 0;
+	size_t cacheMissSignatureChangedCount = 0;
+	size_t cacheMissCandidateMismatchCount = 0;
 
 	for (auto& [poolID, poolState] : persistentAliasPools) {
 		(void)poolID;
@@ -1111,6 +1167,12 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 			size_t firstUse = 0;
 			size_t lastUse = 0;
 		};
+
+		const uint64_t planSignature = BuildAliasPoolPlanningSignature(
+			poolID,
+			packingStrategy,
+			analysis,
+			poolCandidateIndices);
 
 		auto insertFreeRangeSortedMerged = [](std::vector<FreeRange>& ranges, FreeRange range) {
 			if (range.endByte <= range.startByte) {
@@ -1470,33 +1532,130 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 		std::vector<Placement> placements;
 		uint64_t heapSize = 0;
 		uint64_t poolAlignment = 1;
-		switch (packingStrategy) {
-		case AutoAliasPackingStrategy::GreedySweepLine: {
-			auto [plannedPlacements, plannedHeapSize, plannedPoolAlignment] = planWithGreedySweepLine();
-			placements = std::move(plannedPlacements);
-			heapSize = plannedHeapSize;
-			poolAlignment = plannedPoolAlignment;
-			break;
+		bool reusedCachedPlan = false;
+		AliasPlanCacheMissReason cacheMissReason = AliasPlanCacheMissReason::None;
+		auto cacheIt = cachedAliasPlanByPoolID.find(poolID);
+		if (cacheIt == cachedAliasPlanByPoolID.end()) {
+			cacheMissReason = AliasPlanCacheMissReason::NoCachedPlan;
 		}
-		case AutoAliasPackingStrategy::BranchAndBound: {
-			auto [plannedPlacements, plannedHeapSize, plannedPoolAlignment, searchTruncated] = planWithBeamSearch();
-			placements = std::move(plannedPlacements);
-			heapSize = plannedHeapSize;
-			poolAlignment = plannedPoolAlignment;
-			if (aliasLoggingEnabled && searchTruncated) {
-				spdlog::info(
-					"RG alias beam search truncated: pool={} candidates={} resultingRequiredBytes={}",
-					poolID,
-					poolCandidateIndices.size(),
-					heapSize);
+		else if (cacheIt->second.signature != planSignature) {
+			cacheMissReason = AliasPlanCacheMissReason::SignatureChanged;
+		}
+		else {
+			const auto& cachedPlan = cacheIt->second;
+			if (cachedPlan.placements.size() == poolCandidateIndices.size()) {
+				bool cacheMatchesCandidates = true;
+				placements.reserve(cachedPlan.placements.size());
+				for (size_t candidateIndex = 0; candidateIndex < cachedPlan.placements.size(); ++candidateIndex) {
+					const auto& cachedPlacement = cachedPlan.placements[candidateIndex];
+					const auto& candidateInfo = getInfoByIndex(poolCandidateIndices[candidateIndex]);
+					if (cachedPlacement.resourceID != candidateInfo.resourceID) {
+						cacheMatchesCandidates = false;
+						break;
+					}
+
+					placements.push_back(Placement{
+						.offset = cachedPlacement.offset,
+						.sizeBytes = cachedPlacement.sizeBytes,
+						.alignment = cachedPlacement.alignment,
+						.firstUse = cachedPlacement.firstUse,
+						.lastUse = cachedPlacement.lastUse,
+					});
+				}
+				if (cacheMatchesCandidates) {
+					heapSize = cachedPlan.requiredBytes;
+					poolAlignment = cachedPlan.poolAlignment;
+					reusedCachedPlan = true;
+				}
+				else {
+					cacheMissReason = AliasPlanCacheMissReason::CandidateMismatch;
+					placements.clear();
+				}
 			}
-			break;
+			else {
+				cacheMissReason = AliasPlanCacheMissReason::CandidateMismatch;
+			}
 		}
-		default:
-			throw std::runtime_error("Unsupported alias packing strategy");
+
+		if (collectAliasCacheDebugStats) {
+			if (reusedCachedPlan) {
+				++autoAliasPlannerStats.planCacheHits;
+			}
+			else {
+				++autoAliasPlannerStats.planCacheMisses;
+				switch (cacheMissReason) {
+				case AliasPlanCacheMissReason::NoCachedPlan:
+					++cacheMissNoCachedPlanCount;
+					break;
+				case AliasPlanCacheMissReason::SignatureChanged:
+					++cacheMissSignatureChangedCount;
+					break;
+				case AliasPlanCacheMissReason::CandidateMismatch:
+					++cacheMissCandidateMismatchCount;
+					break;
+				case AliasPlanCacheMissReason::None:
+				default:
+					break;
+				}
+			}
+		}
+
+		if (!reusedCachedPlan) {
+			switch (packingStrategy) {
+			case AutoAliasPackingStrategy::GreedySweepLine: {
+				auto [plannedPlacements, plannedHeapSize, plannedPoolAlignment] = planWithGreedySweepLine();
+				placements = std::move(plannedPlacements);
+				heapSize = plannedHeapSize;
+				poolAlignment = plannedPoolAlignment;
+				break;
+			}
+			case AutoAliasPackingStrategy::BranchAndBound: {
+				auto [plannedPlacements, plannedHeapSize, plannedPoolAlignment, searchTruncated] = planWithBeamSearch();
+				placements = std::move(plannedPlacements);
+				heapSize = plannedHeapSize;
+				poolAlignment = plannedPoolAlignment;
+				if (aliasLoggingEnabled && searchTruncated) {
+					spdlog::info(
+						"RG alias beam search truncated: pool={} candidates={} resultingRequiredBytes={}",
+						poolID,
+						poolCandidateIndices.size(),
+						heapSize);
+				}
+				break;
+			}
+			default:
+				throw std::runtime_error("Unsupported alias packing strategy");
+			}
+
+			auto& cachedPlan = cachedAliasPlanByPoolID[poolID];
+			cachedPlan.signature = planSignature;
+			cachedPlan.requiredBytes = heapSize;
+			cachedPlan.poolAlignment = poolAlignment;
+			cachedPlan.placements.clear();
+			cachedPlan.placements.reserve(poolCandidateIndices.size());
+			for (size_t candidateIndex = 0; candidateIndex < poolCandidateIndices.size() && candidateIndex < placements.size(); ++candidateIndex) {
+				const auto& candidateInfo = getInfoByIndex(poolCandidateIndices[candidateIndex]);
+				const auto& placement = placements[candidateIndex];
+				cachedPlan.placements.push_back(rg::alias::CachedAliasPoolPlacement{
+					.resourceID = candidateInfo.resourceID,
+					.offset = placement.offset,
+					.sizeBytes = placement.sizeBytes,
+					.alignment = placement.alignment,
+					.firstUse = placement.firstUse,
+					.lastUse = placement.lastUse,
+				});
+			}
+		}
+		else if (aliasLoggingEnabled) {
+			spdlog::info(
+				"RG alias plan cache hit: pool={} candidates={} requiredBytes={}",
+				poolID,
+				poolCandidateIndices.size(),
+				heapSize);
 		}
 
 		if (heapSize == 0) {
+			cachedAliasPlanByPoolID.erase(poolID);
 			continue;
 		}
 		if (buildAliasDebug) {
@@ -1768,6 +1927,7 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 					poolState.capacityBytes,
 					poolState.generation);
 			}
+			cachedAliasPlanByPoolID.erase(retiredPoolID);
 
 			itPool = persistentAliasPools.erase(itPool);
 		}
@@ -1813,6 +1973,23 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 		autoAliasPlannerStats.pooledIndependentBytes > autoAliasPlannerStats.pooledActualBytes
 		? (autoAliasPlannerStats.pooledIndependentBytes - autoAliasPlannerStats.pooledActualBytes)
 		: 0;
+
+	if (collectAliasCacheDebugStats) {
+		size_t primaryMissCount = 0;
+		AliasPlanCacheMissReason primaryMissReason = AliasPlanCacheMissReason::None;
+		auto considerPrimaryMissReason = [&](AliasPlanCacheMissReason reason, size_t count) {
+			if (count > primaryMissCount) {
+				primaryMissCount = count;
+				primaryMissReason = reason;
+			}
+		};
+		considerPrimaryMissReason(AliasPlanCacheMissReason::NoCachedPlan, cacheMissNoCachedPlanCount);
+		considerPrimaryMissReason(AliasPlanCacheMissReason::SignatureChanged, cacheMissSignatureChangedCount);
+		considerPrimaryMissReason(AliasPlanCacheMissReason::CandidateMismatch, cacheMissCandidateMismatchCount);
+		autoAliasPlannerStats.primaryPlanCacheMissReason = primaryMissCount > 0
+			? GetAliasPlanCacheMissReasonLabel(primaryMissReason)
+			: nullptr;
+	}
 
 	if (aliasLoggingEnabled && autoAliasPlannerStats.pooledIndependentBytes > 0) {
 		const double independentMB = static_cast<double>(autoAliasPlannerStats.pooledIndependentBytes) / (1024.0 * 1024.0);

@@ -49,6 +49,9 @@ struct AutoAliasPlannerStats {
 	uint64_t pooledIndependentBytes = 0;
 	uint64_t pooledActualBytes = 0;
 	uint64_t pooledSavedBytes = 0;
+	size_t planCacheHits = 0;
+	size_t planCacheMisses = 0;
+	const char* primaryPlanCacheMissReason = nullptr;
 };
 
 struct AutoAliasDebugSnapshot {
@@ -63,6 +66,9 @@ struct AutoAliasDebugSnapshot {
 	uint64_t pooledIndependentBytes = 0;
 	uint64_t pooledActualBytes = 0;
 	uint64_t pooledSavedBytes = 0;
+	size_t planCacheHits = 0;
+	size_t planCacheMisses = 0;
+	std::string primaryPlanCacheMissReason;
 	std::vector<AutoAliasReasonCount> exclusionReasons;
 	std::vector<AutoAliasPoolDebug> poolDebug;
 };
@@ -74,6 +80,22 @@ struct PersistentAliasPoolState {
 	uint64_t generation = 0;
 	uint64_t lastUsedFrame = 0;
 	bool usedThisFrame = false;
+};
+
+struct CachedAliasPoolPlacement {
+	uint64_t resourceID = 0;
+	uint64_t offset = 0;
+	uint64_t sizeBytes = 0;
+	uint64_t alignment = 1;
+	size_t firstUse = 0;
+	size_t lastUse = 0;
+};
+
+struct CachedAliasPoolPlan {
+	uint64_t signature = 0;
+	uint64_t requiredBytes = 0;
+	uint64_t poolAlignment = 1;
+	std::vector<CachedAliasPoolPlacement> placements;
 };
 
 struct AliasPlacementRange {

@@ -1138,6 +1138,12 @@ void RenderGraph::WriteVramUsageDebugDump(uint8_t frameIndex) const
 			 << " pooled_independent_bytes=" << aliasSnapshot.pooledIndependentBytes
 			 << " pooled_actual_bytes=" << aliasSnapshot.pooledActualBytes
 			 << " pooled_saved_bytes=" << aliasSnapshot.pooledSavedBytes
+			 << " plan_cache_hits=" << aliasSnapshot.planCacheHits
+			 << " plan_cache_misses=" << aliasSnapshot.planCacheMisses;
+		if (!aliasSnapshot.primaryPlanCacheMissReason.empty()) {
+			dump << " primary_plan_cache_miss_reason=\"" << aliasSnapshot.primaryPlanCacheMissReason << "\"";
+		}
+		dump
 			 << "\n";
 
 		if (!aliasSnapshot.exclusionReasons.empty()) {

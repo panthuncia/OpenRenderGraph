@@ -953,6 +953,7 @@ private:
 
 	using PersistentAliasPoolState = rg::alias::PersistentAliasPoolState;
 	std::unordered_map<uint64_t, PersistentAliasPoolState> persistentAliasPools;
+	std::unordered_map<uint64_t, rg::alias::CachedAliasPoolPlan> cachedAliasPlanByPoolID;
 	uint64_t aliasPoolPlanFrameIndex = 0;
 	uint32_t aliasPoolRetireIdleFrames = 120;
 	float aliasPoolGrowthHeadroom = 1.5f;
@@ -1255,6 +1256,7 @@ private:
 	};
 
 	using AutoAliasPlannerStats = rg::alias::AutoAliasPlannerStats;
+	using CachedAliasPoolPlan = rg::alias::CachedAliasPoolPlan;
 
 	static PassView GetPassView(const AnyPassAndResources& pr);
 	void RebuildFramePassAccessSummaries();

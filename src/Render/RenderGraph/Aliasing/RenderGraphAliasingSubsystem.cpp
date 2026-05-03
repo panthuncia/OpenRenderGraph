@@ -24,6 +24,11 @@ rg::alias::AutoAliasDebugSnapshot rg::alias::RenderGraphAliasingSubsystem::Build
 	out.pooledIndependentBytes = plannerStats.pooledIndependentBytes;
 	out.pooledActualBytes = plannerStats.pooledActualBytes;
 	out.pooledSavedBytes = plannerStats.pooledSavedBytes;
+	out.planCacheHits = plannerStats.planCacheHits;
+	out.planCacheMisses = plannerStats.planCacheMisses;
+	out.primaryPlanCacheMissReason = plannerStats.primaryPlanCacheMissReason != nullptr
+		? plannerStats.primaryPlanCacheMissReason
+		: std::string{};
 	out.exclusionReasons = exclusionReasons;
 	out.poolDebug = poolDebug;
 	return out;
@@ -53,6 +58,7 @@ void rg::alias::RenderGraphAliasingSubsystem::ResetPersistentState(RenderGraph& 
 	renderGraph.aliasPlacementRangesByID.clear();
 	renderGraph.schedulingPlacementRangesByID.clear();
 	renderGraph.aliasPlacementPoolByID.clear();
+	renderGraph.cachedAliasPlanByPoolID.clear();
 
 	for (auto& [poolID, poolState] : renderGraph.persistentAliasPools) {
 		(void)poolID;
