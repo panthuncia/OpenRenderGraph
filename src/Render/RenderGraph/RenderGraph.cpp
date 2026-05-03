@@ -1249,8 +1249,12 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 		summary.queueAssignmentPolicy = DefaultQueueAssignmentPolicy(pass.type);
 
 		PassView view = GetPassView(pass);
-		summary.requirements = view.reqs;
-		summary.internalTransitions = view.internalTransitions;
+		if (view.reqs) {
+			summary.requirementSummaries.reserve(view.reqs->size());
+		}
+		if (view.internalTransitions) {
+			summary.internalTransitionSummaries.reserve(view.internalTransitions->size());
+		}
 
 		if (pass.type == PassType::Render) {
 			const auto& passResources = std::get<RenderPassAndResources>(pass.pass).resources;
@@ -1271,21 +1275,43 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 			summary.pinnedQueueSlot = passResources.pinnedQueueSlot;
 		}
 
-		if (summary.requirements) {
-			for (const auto& req : *summary.requirements) {
-				if (!AccessTypeIsWriteType(req.state.access)) {
+		if (view.reqs) {
+			for (const auto& req : *view.reqs) {
+				const auto resource = req.resourceHandleAndRange.resource;
+				const uint64_t resourceID = resource.GetGlobalResourceID();
+				const bool isWrite = AccessTypeIsWriteType(req.state.access);
+				const bool isUAV = IsUAVState(req.state);
+
+				summary.requirementSummaries.push_back(FramePassRequirementStaticSummary{
+					.resource = resource,
+					.resourceID = resourceID,
+					.range = req.resourceHandleAndRange.range,
+					.state = req.state,
+					.isUAV = isUAV,
+					.isWrite = isWrite,
+				});
+
+				if (!isWrite) {
 					continue;
 				}
-				auto dagResourceIt = m_frameDAGResourceIndexByID.find(req.resourceHandleAndRange.resource.GetGlobalResourceID());
+				auto dagResourceIt = m_frameDAGResourceIndexByID.find(resourceID);
 				if (dagResourceIt != m_frameDAGResourceIndexByID.end() && dagResourceIt->second < resourcesWrittenThisFrame.size()) {
 					resourcesWrittenThisFrame[dagResourceIt->second] = 1;
 				}
 			}
 		}
 
-		if (summary.internalTransitions) {
-			for (const auto& transition : *summary.internalTransitions) {
-				auto dagResourceIt = m_frameDAGResourceIndexByID.find(transition.first.resource.GetGlobalResourceID());
+		if (view.internalTransitions) {
+			for (const auto& transition : *view.internalTransitions) {
+				const auto resource = transition.first.resource;
+				const uint64_t resourceID = resource.GetGlobalResourceID();
+
+				summary.internalTransitionSummaries.push_back(FramePassInternalTransitionStaticSummary{
+					.resource = resource,
+					.resourceID = resourceID,
+				});
+
+				auto dagResourceIt = m_frameDAGResourceIndexByID.find(resourceID);
 				if (dagResourceIt != m_frameDAGResourceIndexByID.end() && dagResourceIt->second < resourcesWrittenThisFrame.size()) {
 					resourcesWrittenThisFrame[dagResourceIt->second] = 1;
 				}
@@ -1341,19 +1367,19 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 			}
 		};
 
-		if (summary.requirements) {
-			for (const auto& req : *summary.requirements) {
+		summary.touchedResourceIDs.reserve(summary.requirementSummaries.size() + summary.internalTransitionSummaries.size());
+		summary.uavResourceIDs.reserve(summary.requirementSummaries.size());
+		summary.dagAccesses.reserve(summary.requirementSummaries.size() + summary.internalTransitionSummaries.size());
+
+		for (const auto& req : summary.requirementSummaries) {
 				mark(
-					req.resourceHandleAndRange.resource.GetGlobalResourceID(),
-					AccessTypeIsWriteType(req.state.access) ? AccessKind::Write : AccessKind::Read,
-					IsUAVState(req.state));
-			}
+					req.resourceID,
+					req.isWrite ? AccessKind::Write : AccessKind::Read,
+					req.isUAV);
 		}
 
-		if (summary.internalTransitions) {
-			for (const auto& transition : *summary.internalTransitions) {
-				mark(transition.first.resource.GetGlobalResourceID(), AccessKind::Write, false);
-			}
+		for (const auto& transition : summary.internalTransitionSummaries) {
+			mark(transition.resourceID, AccessKind::Write, false);
 		}
 	}
 }
@@ -3297,6 +3323,8 @@ void RenderGraph::RebuildFrameSchedulingResourceIndex(const std::unordered_set<u
 		}
 	}
 
+	RebuildEquivalentResourceIndicesByResourceIndex();
+
 	m_aliasActivationPendingDense.assign(m_frameSchedulingResourceCount, 0);
 	for (uint64_t resourceID : aliasActivationPending) {
 		auto resourceIndex = TryGetFrameSchedulingResourceIndex(resourceID);
@@ -3308,6 +3336,33 @@ void RenderGraph::RebuildFrameSchedulingResourceIndex(const std::unordered_set<u
 	ResetFrameQueueBatchHistoryTables();
 }
 
+void RenderGraph::RebuildEquivalentResourceIndicesByResourceIndex() {
+	ZoneScopedN("RenderGraph::RebuildEquivalentResourceIndicesByResourceIndex");
+	m_equivalentResourceIndicesByResourceIndex.clear();
+	m_equivalentResourceIndicesByResourceIndex.resize(m_frameSchedulingResourceCount);
+
+	for (const auto& [resourceID, resourceIndex] : m_frameSchedulingResourceIndexByID) {
+		if (resourceIndex >= m_equivalentResourceIndicesByResourceIndex.size()) {
+			continue;
+		}
+
+		auto& equivalentIndices = m_equivalentResourceIndicesByResourceIndex[resourceIndex];
+		for (uint64_t equivalentID : GetSchedulingEquivalentIDsCached(resourceID)) {
+			if (equivalentID == resourceID) {
+				continue;
+			}
+
+			auto equivalentIt = m_frameSchedulingResourceIndexByID.find(equivalentID);
+			if (equivalentIt != m_frameSchedulingResourceIndexByID.end()) {
+				equivalentIndices.push_back(equivalentIt->second);
+			}
+		}
+
+		std::sort(equivalentIndices.begin(), equivalentIndices.end());
+		equivalentIndices.erase(std::unique(equivalentIndices.begin(), equivalentIndices.end()), equivalentIndices.end());
+	}
+}
+
 void RenderGraph::RebuildFramePassSchedulingSummaries() {
 	ZoneScopedN("RenderGraph::RebuildFramePassSchedulingSummaries");
 	m_framePassSchedulingSummaries.clear();
@@ -3317,57 +3372,46 @@ void RenderGraph::RebuildFramePassSchedulingSummaries() {
 	for (size_t passIndex = 0; passIndex < m_framePassAccessSummaries.size(); ++passIndex) {
 		auto& summary = m_framePassSchedulingSummaries[passIndex];
 		const auto& passAccess = m_framePassAccessSummaries[passIndex];
+		summary.requirements.reserve(passAccess.requirementSummaries.size());
+		summary.internalTransitions.reserve(passAccess.internalTransitionSummaries.size());
+		summary.requiredResourceIndices.reserve(passAccess.requirementSummaries.size());
+		summary.touchedResourceIndices.reserve(passAccess.requirementSummaries.size() + passAccess.internalTransitionSummaries.size());
+		summary.uavResourceIndices.reserve(passAccess.requirementSummaries.size());
 
-		auto appendEquivalentResourceIndices = [&](uint64_t resourceID, std::vector<size_t>& outIndices) {
-			for (uint64_t equivalentID : GetSchedulingEquivalentIDsCached(resourceID)) {
-				if (equivalentID == resourceID) {
-					continue;
-				}
-				auto resourceIndex = TryGetFrameSchedulingResourceIndex(equivalentID);
-				if (!resourceIndex.has_value()) {
-					continue;
-				}
-				outIndices.push_back(*resourceIndex);
-			}
-			std::sort(outIndices.begin(), outIndices.end());
-			outIndices.erase(std::unique(outIndices.begin(), outIndices.end()), outIndices.end());
-		};
-
-		if (passAccess.requirements) {
-		for (const auto& req : *passAccess.requirements) {
-			auto resourceIndex = TryGetFrameSchedulingResourceIndex(req.resourceHandleAndRange.resource.GetGlobalResourceID());
+		for (const auto& req : passAccess.requirementSummaries) {
+			auto resourceIndex = TryGetFrameSchedulingResourceIndex(req.resourceID);
 			if (!resourceIndex.has_value()) {
 				continue;
 			}
 
 			auto& accessSummary = m_frameResourceAccessSummaries[*resourceIndex];
-			accessSummary.hasWrite = accessSummary.hasWrite || AccessTypeIsWriteType(req.state.access);
-			accessSummary.hasUAV = accessSummary.hasUAV || IsUAVState(req.state);
+			accessSummary.hasWrite = accessSummary.hasWrite || req.isWrite;
+			accessSummary.hasUAV = accessSummary.hasUAV || req.isUAV;
 			accessSummary.hasAliasActivation = accessSummary.hasAliasActivation
 				|| (*resourceIndex < m_aliasActivationPendingDense.size() && m_aliasActivationPendingDense[*resourceIndex] != 0);
 			accessSummary.hasNonWholeResourceRange = accessSummary.hasNonWholeResourceRange
-				|| !IsWholeResourceRange(req.resourceHandleAndRange.range, req.resourceHandleAndRange.resource);
+				|| !IsWholeResourceRange(req.range, req.resource);
 
 			DenseRequirementSummary denseRequirement{};
-			denseRequirement.resource = req.resourceHandleAndRange.resource;
-			denseRequirement.resourceID = req.resourceHandleAndRange.resource.GetGlobalResourceID();
+			denseRequirement.resource = req.resource;
+			denseRequirement.resourceID = req.resourceID;
 			denseRequirement.resourceIndex = *resourceIndex;
-			denseRequirement.range = req.resourceHandleAndRange.range;
+			denseRequirement.range = req.range;
 			denseRequirement.state = req.state;
-			denseRequirement.isUAV = IsUAVState(req.state);
-			appendEquivalentResourceIndices(denseRequirement.resourceID, denseRequirement.equivalentResourceIndices);
+			denseRequirement.isUAV = req.isUAV;
+			if (*resourceIndex < m_equivalentResourceIndicesByResourceIndex.size()) {
+				denseRequirement.equivalentResourceIndices = &m_equivalentResourceIndicesByResourceIndex[*resourceIndex];
+			}
 			summary.requirements.push_back(std::move(denseRequirement));
 			summary.requiredResourceIndices.push_back(*resourceIndex);
 			summary.touchedResourceIndices.push_back(*resourceIndex);
-			if (IsUAVState(req.state)) {
+			if (req.isUAV) {
 				summary.uavResourceIndices.push_back(*resourceIndex);
 			}
 		}
-		}
 
-		if (passAccess.internalTransitions) {
-		for (const auto& transition : *passAccess.internalTransitions) {
-			auto resourceIndex = TryGetFrameSchedulingResourceIndex(transition.first.resource.GetGlobalResourceID());
+		for (const auto& transition : passAccess.internalTransitionSummaries) {
+			auto resourceIndex = TryGetFrameSchedulingResourceIndex(transition.resourceID);
 			if (!resourceIndex.has_value()) {
 				continue;
 			}
@@ -3375,12 +3419,13 @@ void RenderGraph::RebuildFramePassSchedulingSummaries() {
 			m_frameResourceAccessSummaries[*resourceIndex].hasInternalTransition = true;
 
 			DenseEquivalentResourceSummary denseTransition{};
-			denseTransition.resourceID = transition.first.resource.GetGlobalResourceID();
+			denseTransition.resourceID = transition.resourceID;
 			denseTransition.resourceIndex = *resourceIndex;
-			appendEquivalentResourceIndices(denseTransition.resourceID, denseTransition.equivalentResourceIndices);
+			if (*resourceIndex < m_equivalentResourceIndicesByResourceIndex.size()) {
+				denseTransition.equivalentResourceIndices = &m_equivalentResourceIndicesByResourceIndex[*resourceIndex];
+			}
 			summary.internalTransitions.push_back(std::move(denseTransition));
 			summary.touchedResourceIndices.push_back(*resourceIndex);
-		}
 		}
 
 		std::sort(summary.requiredResourceIndices.begin(), summary.requiredResourceIndices.end());
@@ -8529,7 +8574,10 @@ bool RenderGraph::IsNewBatchNeeded(
 		ZoneText(candidatePassName.data(), candidatePassName.size());
 	}
 	auto overlapsAliasedResourceInBatch = [&](const auto& summaryEntry) {
-		for (size_t equivalentResourceIndex : summaryEntry.equivalentResourceIndices) {
+		if (!summaryEntry.equivalentResourceIndices) {
+			return false;
+		}
+		for (size_t equivalentResourceIndex : *summaryEntry.equivalentResourceIndices) {
 			if (batchBuildState.ContainsResource(equivalentResourceIndex)) {
 				return true;
 			}
@@ -8538,7 +8586,10 @@ bool RenderGraph::IsNewBatchNeeded(
 	};
 
 	auto overlapsAliasedTransitionInBatch = [&](const auto& summaryEntry) {
-		for (size_t equivalentResourceIndex : summaryEntry.equivalentResourceIndices) {
+		if (!summaryEntry.equivalentResourceIndices) {
+			return false;
+		}
+		for (size_t equivalentResourceIndex : *summaryEntry.equivalentResourceIndices) {
 			if (batchBuildState.ContainsInternalTransition(equivalentResourceIndex)) {
 				return true;
 			}

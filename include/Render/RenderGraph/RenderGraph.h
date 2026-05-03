@@ -710,7 +710,7 @@ private:
 	struct DenseEquivalentResourceSummary {
 		uint64_t resourceID = 0;
 		size_t resourceIndex = 0;
-		std::vector<size_t> equivalentResourceIndices;
+		const std::vector<size_t>* equivalentResourceIndices = nullptr;
 	};
 
 	struct DenseRequirementSummary {
@@ -720,7 +720,7 @@ private:
 		RangeSpec range{};
 		ResourceState state{};
 		bool isUAV = false;
-		std::vector<size_t> equivalentResourceIndices;
+		const std::vector<size_t>* equivalentResourceIndices = nullptr;
 	};
 
 	struct FramePassSchedulingSummary {
@@ -731,9 +731,23 @@ private:
 		std::vector<size_t> uavResourceIndices;
 	};
 
+	struct FramePassRequirementStaticSummary {
+		ResourceRegistry::RegistryHandle resource;
+		uint64_t resourceID = 0;
+		RangeSpec range{};
+		ResourceState state{};
+		bool isUAV = false;
+		bool isWrite = false;
+	};
+
+	struct FramePassInternalTransitionStaticSummary {
+		ResourceRegistry::RegistryHandle resource;
+		uint64_t resourceID = 0;
+	};
+
 	struct FramePassStaticAccessSummary {
-		const std::vector<ResourceRequirement>* requirements = nullptr;
-		const std::vector<std::pair<ResourceHandleAndRange, ResourceState>>* internalTransitions = nullptr;
+		std::vector<FramePassRequirementStaticSummary> requirementSummaries;
+		std::vector<FramePassInternalTransitionStaticSummary> internalTransitionSummaries;
 		std::vector<uint64_t> touchedResourceIDs;
 		std::vector<uint64_t> uavResourceIDs;
 		std::vector<NodeAccess> dagAccesses;
@@ -921,6 +935,7 @@ private:
 	size_t m_frameDAGResourceCount = 0;
 	std::unordered_map<uint64_t, size_t> m_frameSchedulingResourceIndexByID;
 	size_t m_frameSchedulingResourceCount = 0;
+	std::vector<std::vector<size_t>> m_equivalentResourceIndicesByResourceIndex;
 	std::vector<uint8_t> m_aliasActivationPendingDense;
 	std::vector<unsigned int> m_frameQueueLastUsageBatch;
 	std::vector<unsigned int> m_frameQueueLastProducerBatch;
@@ -1018,6 +1033,7 @@ private:
 	void ValidateCompiledResourceGenerations() const;
 	void RebuildSchedulingEquivalentIDCache(const std::unordered_set<uint64_t>& resourceIDs);
 	void RebuildFrameSchedulingResourceIndex(const std::unordered_set<uint64_t>& resourceIDs);
+	void RebuildEquivalentResourceIndicesByResourceIndex();
 	void RebuildFrameCompileResources();
 	void RebuildFramePassSchedulingSummaries();
 	void RebuildFrameResourceAccessSummaries(const std::vector<Node>& nodes);
