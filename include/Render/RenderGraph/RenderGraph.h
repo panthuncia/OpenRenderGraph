@@ -45,6 +45,7 @@ class ComputePassBuilder;
 class CopyPassBuilder;
 class CommandRecordingManager;
 struct IPassBuilder;
+struct IDynamicDeclaredResources;
 
 namespace ui {
 	struct FrameGraphSnapshot;
@@ -282,6 +283,17 @@ public:
 		return (uint8_t(m) & uint8_t(f)) != 0;
 	}
 
+	struct RetainedDeclarationCache {
+		bool hasDynamicDeclaredResources = false;
+		IDynamicDeclaredResources* dynamicInterface = nullptr;
+
+		bool containsEphemeralOrAnonymousHandles = false;
+		bool requiresStaleHandleValidation = false;
+
+		uint64_t resolverSnapshotHash = 0;
+		uint64_t declarationGeneration = 0;
+	};
+
 	struct RenderPassAndResources { // TODO: I'm currently copying these a lot; maybe use pointers instead
 		std::shared_ptr<RenderPass> pass;
 		RenderPassParameters resources;
@@ -295,6 +307,7 @@ public:
 		std::shared_ptr<rg::imm::KeepAliveBag> immediateKeepAlive = nullptr; // Keeps alive resources used by immediate execution bytecode
 		std::vector<std::shared_ptr<Resource>> retainedAnonymousKeepAlive; // Keeps retained anonymous handles alive across frames
 		std::vector<ResolverSnapshot> resolverSnapshots; // Versioned resolver snapshots for auto-invalidation
+		RetainedDeclarationCache declarationCache;
 	};
 
 	struct ComputePassAndResources { // TODO: Same as above
@@ -310,6 +323,7 @@ public:
 		std::shared_ptr<rg::imm::KeepAliveBag> immediateKeepAlive = nullptr; // Keeps alive resources used by immediate execution bytecode
 		std::vector<std::shared_ptr<Resource>> retainedAnonymousKeepAlive; // Keeps retained anonymous handles alive across frames
 		std::vector<ResolverSnapshot> resolverSnapshots; // Versioned resolver snapshots for auto-invalidation
+		RetainedDeclarationCache declarationCache;
 	};
 
 	struct CopyPassAndResources {
@@ -325,6 +339,7 @@ public:
 		std::shared_ptr<rg::imm::KeepAliveBag> immediateKeepAlive = nullptr;
 		std::vector<std::shared_ptr<Resource>> retainedAnonymousKeepAlive; // Keeps retained anonymous handles alive across frames
 		std::vector<ResolverSnapshot> resolverSnapshots; // Versioned resolver snapshots for auto-invalidation
+		RetainedDeclarationCache declarationCache;
 	};
 
 	enum class BatchWaitPhase : uint8_t {
@@ -1043,6 +1058,8 @@ private:
 	void RebuildFrameCompileResources();
 	void RebuildFramePassSchedulingSummaries();
 	void RebuildFrameResourceAccessSummaries(const std::vector<Node>& nodes);
+	void ResetCompileFrameState();
+	void ResetStructuralBuildState();
 	void ClearFrameSchedulingResourceIndex();
 	void ClearFramePassSchedulingSummaries();
 	void ResetFrameQueueBatchHistoryTables();

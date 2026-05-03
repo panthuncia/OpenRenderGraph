@@ -102,6 +102,63 @@ namespace {
 	bool IsWholeResourceRange(const RangeSpec& range, ResourceRegistry::RegistryHandle resource);
 	bool TryGetWholeResourceTrackerState(const SymbolicTracker& tracker, ResourceState& outState);
 
+	uint64_t HashCombine64(uint64_t seed, uint64_t value) noexcept {
+		seed ^= value + 0x9e3779b97f4a7c15ull + (seed << 6) + (seed >> 2);
+		return seed;
+	}
+
+	uint64_t HashResolverSnapshots(std::span<const ResolverSnapshot> resolverSnapshots) noexcept {
+		uint64_t hash = resolverSnapshots.size();
+		for (const auto& snapshot : resolverSnapshots) {
+			hash = HashCombine64(hash, snapshot.version);
+		}
+		return hash;
+	}
+
+	struct CachedHandleValidationInfo {
+		bool containsEphemeralOrAnonymousHandles = false;
+		bool requiresStaleHandleValidation = false;
+	};
+
+	template<class PassResourceData>
+	CachedHandleValidationInfo AnalyzeCachedHandleValidation(
+		const ResourceRegistry& registry,
+		const PassResourceData& resources)
+	{
+		CachedHandleValidationInfo info{};
+		auto inspectHandle = [&](const ResourceRegistry::RegistryHandle& handle) {
+			if (handle.IsEphemeral()) {
+				info.containsEphemeralOrAnonymousHandles = true;
+				return;
+			}
+			if (registry.IsAnonymous(handle)) {
+				info.containsEphemeralOrAnonymousHandles = true;
+				info.requiresStaleHandleValidation = true;
+			}
+		};
+
+		for (const auto& req : resources.staticResourceRequirements) {
+			inspectHandle(req.resourceHandleAndRange.resource);
+		}
+		for (const auto& transition : resources.internalTransitions) {
+			inspectHandle(transition.first.resource);
+		}
+		return info;
+	}
+
+	template<class PassAndResources>
+	void UpdateRetainedDeclarationCache(const ResourceRegistry& registry, PassAndResources& passAndResources) {
+		auto* dynamicInterface = dynamic_cast<IDynamicDeclaredResources*>(passAndResources.pass.get());
+		const CachedHandleValidationInfo handleValidation = AnalyzeCachedHandleValidation(registry, passAndResources.resources);
+		auto& declarationCache = passAndResources.declarationCache;
+		declarationCache.hasDynamicDeclaredResources = dynamicInterface != nullptr;
+		declarationCache.dynamicInterface = dynamicInterface;
+		declarationCache.containsEphemeralOrAnonymousHandles = handleValidation.containsEphemeralOrAnonymousHandles;
+		declarationCache.requiresStaleHandleValidation = handleValidation.requiresStaleHandleValidation;
+		declarationCache.resolverSnapshotHash = HashResolverSnapshots(passAndResources.resolverSnapshots);
+		++declarationCache.declarationGeneration;
+	}
+
 	constexpr QueueKind DefaultPreferredQueueKind(RenderGraph::PassType type) noexcept {
 		switch (type) {
 		case RenderGraph::PassType::Render:
@@ -411,6 +468,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 			par.retainedAnonymousKeepAlive = CaptureRetainedAnonymousKeepAlive(
 				par.resources.staticResourceRequirements,
 				par.resources.internalTransitions);
+			UpdateRetainedDeclarationCache(_registry, par);
 		}
 
 		if (callSetup) {
@@ -480,6 +538,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 			par.retainedAnonymousKeepAlive = CaptureRetainedAnonymousKeepAlive(
 				par.resources.staticResourceRequirements,
 				par.resources.internalTransitions);
+			UpdateRetainedDeclarationCache(_registry, par);
 		}
 
 		if (callSetup) {
@@ -546,6 +605,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 			par.retainedAnonymousKeepAlive = CaptureRetainedAnonymousKeepAlive(
 				par.resources.staticResourceRequirements,
 				par.resources.internalTransitions);
+			UpdateRetainedDeclarationCache(_registry, par);
 		}
 
 		if (callSetup) {
@@ -3914,21 +3974,9 @@ void RenderGraph::ResetForRebuild()
 	// Clear any existing compile state
 	m_masterPassList.clear();
 	m_framePasses.clear();
-	m_assignedQueueSlotsByFramePass.clear();
-	m_activeQueueSlotsThisFrame.clear();
-	batches.clear();
-	m_executionSchedule.batches.clear();
 	trackers.clear();
-
-	// Full rebuilds must drop cached pass instances before clearing resources.
-	// Builders reuse pass objects across frames, and many passes capture
-	// resource-owning shared_ptrs through constructor arguments.
-	for (auto& [name, builder] : m_passBuildersByName) {
-		(void)name;
-		if (builder) {
-			builder->Reset();
-		}
-	}
+	ResetCompileFrameState();
+	ResetStructuralBuildState();
 
 	// Clear resources
 	resourcesByID.clear();
@@ -3937,24 +3985,9 @@ void RenderGraph::ResetForRebuild()
 	m_transientFrameResourcesByName.clear();
 	resourceBackingGenerationByID.clear();
 	resourceIdleFrameCounts.clear();
-	compiledResourceGenerationByID.clear();
 	m_aliasingSubsystem.ResetPersistentState(*this);
-	m_frameCompileResources.clear();
-	m_addTransitionDebugStatsByResource.clear();
-	m_schedulingEquivalentIDsCache.clear();
-	ClearFrameSchedulingResourceIndex();
-	ClearFramePassSchedulingSummaries();
 	m_lastProducerByResourceAcrossFrames.clear();
 	m_lastAliasPlacementProducersByPoolAcrossFrames.clear();
-	for (auto& producerMap : m_compiledLastProducerBatchByResourceByQueue) {
-		producerMap.clear();
-	}
-	for (auto& row : m_hasPendingFrameStartQueueWait) {
-		std::fill(row.begin(), row.end(), false);
-	}
-	for (auto& row : m_pendingFrameStartQueueWaitFenceValue) {
-		std::fill(row.begin(), row.end(), UINT64(0));
-	}
 	m_compiledLastProducerBatchByResourceByQueue.clear();
 	m_hasPendingFrameStartQueueWait.clear();
 	m_pendingFrameStartQueueWaitFenceValue.clear();
@@ -3972,20 +4005,13 @@ void RenderGraph::ResetForRebuild()
 	for (auto& ext : m_extensions) {
 		if (ext) ext->OnRegistryReset(&_registry);
 	}
-	// clear pass ordering
-	m_passBuilderOrder.clear();
-	m_passNamesSeenThisReset.clear();
-
 }
 
-void RenderGraph::ResetForFrame() {
-	ZoneScopedN("RenderGraph::ResetForFrame");
+void RenderGraph::ResetCompileFrameState() {
 	batches.clear();
 	compiledResourceGenerationByID.clear();
 	m_transientFrameResourcesByID.clear();
 	m_transientFrameResourcesByName.clear();
-	_registry.ReclaimExpiredAnonymous();
-	m_aliasingSubsystem.ResetPerFrameState(*this);
 	m_frameCompileResources.clear();
 	m_addTransitionDebugStatsByResource.clear();
 	m_schedulingEquivalentIDsCache.clear();
@@ -4003,10 +4029,28 @@ void RenderGraph::ResetForFrame() {
 	for (auto& row : m_pendingFrameStartQueueWaitFenceValue) {
 		std::fill(row.begin(), row.end(), UINT64(0));
 	}
-	// reset pass builders
+}
+
+void RenderGraph::ResetStructuralBuildState() {
+	// Full rebuilds must drop cached pass instances before clearing resources.
+	// Builders reuse pass objects across frames, and many passes capture
+	// resource-owning shared_ptrs through constructor arguments.
 	for (auto& [name, builder] : m_passBuildersByName) {
-		builder->Reset();
+		(void)name;
+		if (builder) {
+			builder->Reset();
+		}
 	}
+
+	m_passBuilderOrder.clear();
+	m_passNamesSeenThisReset.clear();
+}
+
+void RenderGraph::ResetForFrame() {
+	ZoneScopedN("RenderGraph::ResetForFrame");
+	_registry.ReclaimExpiredAnonymous();
+	m_aliasingSubsystem.ResetPerFrameState(*this);
+	ResetCompileFrameState();
 }
 
 void RenderGraph::CompileStructural() {
@@ -4437,9 +4481,10 @@ void RenderGraph::RefreshRetainedDeclarationsForFrame(RenderPassAndResources& p,
 	if (traceLifecycle) {
 		spdlog::info("RG frame {} refresh render pass '{}' declare complete requirements={} transitions={}", frameIndex, p.name, b.GatherResourceRequirements().size(), b.params.internalTransitions.size());
 	}
+	const auto& refreshedRequirements = b.GatherResourceRequirements();
 
 	// Update the frame view used by scheduling
-	p.resources.staticResourceRequirements = b.GatherResourceRequirements();
+	p.resources.staticResourceRequirements = refreshedRequirements;
 	p.resources.mergedFrameRequirementsDirty = true;
 
 	// Internal transitions also affect scheduling
@@ -4459,6 +4504,7 @@ void RenderGraph::RefreshRetainedDeclarationsForFrame(RenderPassAndResources& p,
 	p.retainedAnonymousKeepAlive = CaptureRetainedAnonymousKeepAlive(
 		p.resources.staticResourceRequirements,
 		p.resources.internalTransitions);
+	UpdateRetainedDeclarationCache(_registry, p);
 
 	// Ensure the pass's view matches the refreshed identifier set
 	p.pass->SetResourceRegistryView(
@@ -4498,8 +4544,9 @@ void RenderGraph::RefreshRetainedDeclarationsForFrame(ComputePassAndResources& p
 	if (traceLifecycle) {
 		spdlog::info("RG frame {} refresh compute pass '{}' declare complete requirements={} transitions={}", frameIndex, p.name, b.GatherResourceRequirements().size(), b.params.internalTransitions.size());
 	}
+	const auto& refreshedRequirements = b.GatherResourceRequirements();
 
-	p.resources.staticResourceRequirements = b.GatherResourceRequirements();
+	p.resources.staticResourceRequirements = refreshedRequirements;
 	p.resources.mergedFrameRequirementsDirty = true;
 	p.resources.internalTransitions = b.params.internalTransitions;
 	p.resources.identifierSet = b.DeclaredResourceIds();
@@ -4516,6 +4563,7 @@ void RenderGraph::RefreshRetainedDeclarationsForFrame(ComputePassAndResources& p
 	p.retainedAnonymousKeepAlive = CaptureRetainedAnonymousKeepAlive(
 		p.resources.staticResourceRequirements,
 		p.resources.internalTransitions);
+	UpdateRetainedDeclarationCache(_registry, p);
 
 	p.pass->SetResourceRegistryView(
 		std::make_unique<ResourceRegistryView>(_registry, p.resources.identifierSet),
@@ -4555,8 +4603,9 @@ void RenderGraph::RefreshRetainedDeclarationsForFrame(CopyPassAndResources& p, u
 	if (traceLifecycle) {
 		spdlog::info("RG frame {} refresh copy pass '{}' declare complete requirements={} transitions={}", frameIndex, p.name, b.GatherResourceRequirements().size(), b.params.internalTransitions.size());
 	}
+	const auto& refreshedRequirements = b.GatherResourceRequirements();
 
-	p.resources.staticResourceRequirements = b.GatherResourceRequirements();
+	p.resources.staticResourceRequirements = refreshedRequirements;
 	p.resources.mergedFrameRequirementsDirty = true;
 	p.resources.internalTransitions = b.params.internalTransitions;
 	p.resources.identifierSet = b.DeclaredResourceIds();
@@ -4570,6 +4619,7 @@ void RenderGraph::RefreshRetainedDeclarationsForFrame(CopyPassAndResources& p, u
 	p.retainedAnonymousKeepAlive = CaptureRetainedAnonymousKeepAlive(
 		p.resources.staticResourceRequirements,
 		p.resources.internalTransitions);
+	UpdateRetainedDeclarationCache(_registry, p);
 
 	p.pass->SetResourceRegistryView(
 		std::make_unique<ResourceRegistryView>(_registry, p.resources.identifierSet)
@@ -4627,25 +4677,26 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			return true;
 		};
 
-		for (const auto& req : p.resources.staticResourceRequirements) {
-			if (hasInvalidCachedHandle(req.resourceHandleAndRange, "requirement")) {
-				return true;
-			}
+		if (p.declarationCache.requiresStaleHandleValidation) {
+				for (const auto& req : p.resources.staticResourceRequirements) {
+					if (hasInvalidCachedHandle(req.resourceHandleAndRange, "requirement")) {
+						return true;
+					}
+				}
+
+				for (const auto& transition : p.resources.internalTransitions) {
+					if (hasInvalidCachedHandle(transition.first, "internal-transition")) {
+						return true;
+					}
+				}
 		}
 
-		for (const auto& transition : p.resources.internalTransitions) {
-			if (hasInvalidCachedHandle(transition.first, "internal-transition")) {
-				return true;
-			}
-		}
-
-		auto* iFace = dynamic_cast<IDynamicDeclaredResources*>(p.pass.get());
-		if (!iFace) {
+		if (!p.declarationCache.dynamicInterface) {
 			// if pass doesn't opt-in, assume no change
 			return false;
 		}
 
-		return iFace->DeclaredResourcesChanged();
+		return p.declarationCache.dynamicInterface->DeclaredResourcesChanged();
 		};
 
 	{
@@ -6410,6 +6461,7 @@ void RenderGraph::AddRenderPass(std::shared_ptr<RenderPass> pass, RenderPassPara
 		passAndResources.resources.staticResourceRequirements,
 		passAndResources.resources.internalTransitions);
 	passAndResources.resolverSnapshots = std::move(resolverSnapshots);
+	UpdateRetainedDeclarationCache(_registry, passAndResources);
 	AnyPassAndResources passAndResourcesAny;
 	passAndResourcesAny.type = PassType::Render;
 	passAndResourcesAny.pass = std::move(passAndResources);
@@ -6430,6 +6482,7 @@ void RenderGraph::AddComputePass(std::shared_ptr<ComputePass> pass, ComputePassP
 		passAndResources.resources.staticResourceRequirements,
 		passAndResources.resources.internalTransitions);
 	passAndResources.resolverSnapshots = std::move(resolverSnapshots);
+	UpdateRetainedDeclarationCache(_registry, passAndResources);
 	AnyPassAndResources passAndResourcesAny;
 	passAndResourcesAny.type = PassType::Compute;
 	passAndResourcesAny.pass = std::move(passAndResources);
@@ -6450,6 +6503,7 @@ void RenderGraph::AddCopyPass(std::shared_ptr<CopyPass> pass, CopyPassParameters
 		passAndResources.resources.staticResourceRequirements,
 		passAndResources.resources.internalTransitions);
 	passAndResources.resolverSnapshots = std::move(resolverSnapshots);
+	UpdateRetainedDeclarationCache(_registry, passAndResources);
 	AnyPassAndResources passAndResourcesAny;
 	passAndResourcesAny.type = PassType::Copy;
 	passAndResourcesAny.pass = std::move(passAndResources);
