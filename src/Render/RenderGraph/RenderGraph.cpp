@@ -1605,10 +1605,28 @@ bool RenderGraph::BuildDependencyGraph(
 {
 	ZoneScopedN("RenderGraph::BuildDependencyGraph");
 	std::unordered_map<uint64_t, SeqState> seq;
+	std::unordered_set<uint64_t> resourcesWrittenThisFrame;
 	{
 		size_t totalAccesses = 0;
-		for (const auto& node : nodes) totalAccesses += node.accessByID.size();
+		size_t totalWrites = 0;
+		for (const auto& node : nodes) {
+			totalAccesses += node.accessByID.size();
+			for (const auto& [rid, kind] : node.accessByID) {
+				if (kind == AccessKind::Write) {
+					++totalWrites;
+				}
+			}
+		}
 		seq.reserve(totalAccesses);
+		resourcesWrittenThisFrame.reserve(totalWrites);
+	}
+
+	for (const auto& node : nodes) {
+		for (const auto& [rid, kind] : node.accessByID) {
+			if (kind == AccessKind::Write) {
+				resourcesWrittenThisFrame.insert(rid);
+			}
+		}
 	}
 
 	std::unordered_set<uint64_t> edgeSet;
@@ -1619,6 +1637,10 @@ bool RenderGraph::BuildDependencyGraph(
 		auto& node = nodes[i];
 
 		for (auto& [rid, kind] : node.accessByID) {
+			if (kind == AccessKind::Read && !resourcesWrittenThisFrame.contains(rid)) {
+				continue;
+			}
+
 			auto& s = seq[rid];
 
 			if (kind == AccessKind::Read) {
@@ -5065,9 +5087,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	{
 		traceCompileStep("RebuildFrameResourceAccessSummaries");
 		ZoneScopedN("RenderGraph::CompileFrame::RebuildFrameResourceAccessSummaries");
-		if (m_getReadOnlyUniformTransitionElisionEnabled && m_getReadOnlyUniformTransitionElisionEnabled()) {
-			RebuildFrameResourceAccessSummaries(nodes);
-		}
+		RebuildFrameResourceAccessSummaries(nodes);
 	}
 	{
 		traceCompileStep("MaterializeUnmaterializedResources");
