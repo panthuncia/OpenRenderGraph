@@ -31,7 +31,7 @@ inline bool operator==(const StreamingUploadInputs& a, const StreamingUploadInpu
 
 /// A CopyPass that runs on the copy queue and performs streaming buffer uploads.
 /// Created per-frame by the streaming extension when there are pending uploads.
-class StreamingUploadPass final : public CopyPass {
+class StreamingUploadPass final : public CopyPass, public IHasImmediateModeCommands {
 public:
     explicit StreamingUploadPass(StreamingUploadInputs inputs) {
         SetInputs(std::move(inputs));

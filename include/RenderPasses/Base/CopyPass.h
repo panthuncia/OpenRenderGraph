@@ -47,7 +47,6 @@ public:
 	virtual void Setup() = 0;
 
 	virtual void Update(const UpdateExecutionContext& context) {};
-	virtual void RecordImmediateCommands(ImmediateExecutionContext& context) {};
 	virtual PassReturn Execute(PassExecutionContext& context) { return {}; };
 	virtual void Cleanup() = 0;
 

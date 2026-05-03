@@ -17,7 +17,7 @@ struct ReadbackCopyCaptureInputs {
 
 /// A CopyPass variant of ReadbackCapturePass that runs on the copy queue.
 /// This allows readback copies to overlap with graphics/compute work.
-class ReadbackCopyCapturePass final : public CopyPass {
+class ReadbackCopyCapturePass final : public CopyPass, public IHasImmediateModeCommands {
 public:
     ReadbackCopyCapturePass(
         ReadbackCopyCaptureInputs inputs,

@@ -31,6 +31,11 @@ struct ImmediateExecutionContext {
 	const IHostExecutionData* hostData = nullptr;
 };
 
+struct IHasImmediateModeCommands {
+	virtual ~IHasImmediateModeCommands() = default;
+	virtual void RecordImmediateCommands(ImmediateExecutionContext& context) = 0;
+};
+
 struct PassExecutionContext {
 	rhi::Device device;
 	rhi::CommandList commandList;

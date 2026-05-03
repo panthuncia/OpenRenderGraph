@@ -15,7 +15,7 @@ struct ReadbackCaptureInputs {
     RG_DEFINE_PASS_INPUTS(ReadbackCaptureInputs, &ReadbackCaptureInputs::target);
 };
 
-class ReadbackCapturePass final : public RenderPass {
+class ReadbackCapturePass final : public RenderPass, public IHasImmediateModeCommands {
 public:
     ReadbackCapturePass(
         ReadbackCaptureInputs inputs,

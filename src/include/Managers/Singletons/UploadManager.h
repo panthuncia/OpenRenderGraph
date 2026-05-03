@@ -140,7 +140,7 @@ public:
 	void Cleanup();
 private:
 
-	class UploadPass : public RenderPass, public IDynamicDeclaredResources {
+	class UploadPass : public RenderPass, public IDynamicDeclaredResources, public IHasImmediateModeCommands {
 	public:
 		UploadPass() {
 		}

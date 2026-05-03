@@ -4654,24 +4654,18 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		for (auto& pr : m_masterPassList) {
 			if (pr.type == PassType::Compute) {
 				auto& p = std::get<ComputePassAndResources>(pr.pass);
-				p.immediateBytecode.clear();
-				ClearImmediateFrameRequirements(p.resources);
 				if (needsRefresh(p)) {
 					RefreshRetainedDeclarationsForFrame(p, frameIndex);
 				}
 			}
 			else if (pr.type == PassType::Render) {
 				auto& p = std::get<RenderPassAndResources>(pr.pass);
-				p.immediateBytecode.clear();
-				ClearImmediateFrameRequirements(p.resources);
 				if (needsRefresh(p)) {
 					RefreshRetainedDeclarationsForFrame(p, frameIndex);
 				}
 			}
 			else if (pr.type == PassType::Copy) {
 				auto& p = std::get<CopyPassAndResources>(pr.pass);
-				p.immediateBytecode.clear();
-				ClearImmediateFrameRequirements(p.resources);
 				if (needsRefresh(p)) {
 					RefreshRetainedDeclarationsForFrame(p, frameIndex);
 				}
@@ -4710,6 +4704,9 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		this},
 		frameIndex,
 		hostData };
+	auto getImmediateModeCommands = [](auto* pass) -> IHasImmediateModeCommands* {
+		return dynamic_cast<IHasImmediateModeCommands*>(pass);
+	};
 	auto prepareImmediateContext = [&](ImmediateExecutionContext& context) -> ImmediateExecutionContext& {
 		context.frameIndex = frameIndex;
 		context.hostData = hostData;
@@ -4722,8 +4719,14 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 
 		if (pr.type == PassType::Compute) {
 			auto& p = std::get<ComputePassAndResources>(pr.pass);
+			auto* immediateModeCommands = getImmediateModeCommands(p.pass.get());
+			if (!immediateModeCommands) {
+				p.run = PassRunMask::Retained;
+				m_framePasses.push_back(pr);
+				continue;
+			}
 
-			// reset per-frame
+			// reset per-frame only for passes that actually record immediate work
 			p.immediateBytecode.clear();
 			p.immediateKeepAlive.reset();
 			ClearImmediateFrameRequirements(p.resources);
@@ -4739,7 +4742,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				if (traceLifecycle) {
 					spdlog::info("RG frame {} compute pass '{}' RecordImmediateCommands begin", frameIndex, p.name);
 				}
-				p.pass->RecordImmediateCommands(c);
+				immediateModeCommands->RecordImmediateCommands(c);
 				if (traceLifecycle) {
 					spdlog::info("RG frame {} compute pass '{}' RecordImmediateCommands complete", frameIndex, p.name);
 				}
@@ -4783,6 +4786,12 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		}
 		else if (pr.type == PassType::Render) {
 			auto& p = std::get<RenderPassAndResources>(pr.pass);
+			auto* immediateModeCommands = getImmediateModeCommands(p.pass.get());
+			if (!immediateModeCommands) {
+				p.run = PassRunMask::Retained;
+				m_framePasses.push_back(pr);
+				continue;
+			}
 
 			p.immediateBytecode.clear();
 			p.immediateKeepAlive.reset();
@@ -4797,7 +4806,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				if (traceLifecycle) {
 					spdlog::info("RG frame {} render pass '{}' RecordImmediateCommands begin", frameIndex, p.name);
 				}
-				p.pass->RecordImmediateCommands(c);
+				immediateModeCommands->RecordImmediateCommands(c);
 				if (traceLifecycle) {
 					spdlog::info("RG frame {} render pass '{}' RecordImmediateCommands complete", frameIndex, p.name);
 				}
@@ -4840,6 +4849,12 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		}
 		else if (pr.type == PassType::Copy) {
 			auto& p = std::get<CopyPassAndResources>(pr.pass);
+			auto* immediateModeCommands = getImmediateModeCommands(p.pass.get());
+			if (!immediateModeCommands) {
+				p.run = PassRunMask::Retained;
+				m_framePasses.push_back(pr);
+				continue;
+			}
 
 			p.immediateBytecode.clear();
 			p.immediateKeepAlive.reset();
@@ -4855,7 +4870,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				if (traceLifecycle) {
 					spdlog::info("RG frame {} copy pass '{}' RecordImmediateCommands begin", frameIndex, p.name);
 				}
-				p.pass->RecordImmediateCommands(c);
+				immediateModeCommands->RecordImmediateCommands(c);
 				if (traceLifecycle) {
 					spdlog::info("RG frame {} copy pass '{}' RecordImmediateCommands complete", frameIndex, p.name);
 				}
@@ -4918,6 +4933,11 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		auto recordImmediateCommands = [&](AnyPassAndResources& pr) {
 			if (pr.type == PassType::Compute) {
 				auto& p = std::get<ComputePassAndResources>(pr.pass);
+				auto* immediateModeCommands = getImmediateModeCommands(p.pass.get());
+				if (!immediateModeCommands) {
+					p.run = PassRunMask::Retained;
+					return;
+				}
 				p.immediateBytecode.clear();
 				p.immediateKeepAlive.reset();
 				ClearImmediateFrameRequirements(p.resources);
@@ -4932,7 +4952,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 					if (traceLifecycle) {
 						spdlog::info("RG frame {} compute pass '{}' RecordImmediateCommands begin", frameIndex, p.name);
 					}
-					p.pass->RecordImmediateCommands(c);
+					immediateModeCommands->RecordImmediateCommands(c);
 					if (traceLifecycle) {
 						spdlog::info("RG frame {} compute pass '{}' RecordImmediateCommands complete", frameIndex, p.name);
 					}
@@ -4949,6 +4969,11 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			}
 			else if (pr.type == PassType::Copy) {
 				auto& p = std::get<CopyPassAndResources>(pr.pass);
+				auto* immediateModeCommands = getImmediateModeCommands(p.pass.get());
+				if (!immediateModeCommands) {
+					p.run = PassRunMask::Retained;
+					return;
+				}
 				p.immediateBytecode.clear();
 				p.immediateKeepAlive.reset();
 				ClearImmediateFrameRequirements(p.resources);
@@ -4963,7 +4988,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 					if (traceLifecycle) {
 						spdlog::info("RG frame {} copy pass '{}' RecordImmediateCommands begin", frameIndex, p.name);
 					}
-					p.pass->RecordImmediateCommands(c);
+					immediateModeCommands->RecordImmediateCommands(c);
 					if (traceLifecycle) {
 						spdlog::info("RG frame {} copy pass '{}' RecordImmediateCommands complete", frameIndex, p.name);
 					}
@@ -4980,6 +5005,11 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			}
 			else {
 				auto& p = std::get<RenderPassAndResources>(pr.pass);
+				auto* immediateModeCommands = getImmediateModeCommands(p.pass.get());
+				if (!immediateModeCommands) {
+					p.run = PassRunMask::Retained;
+					return;
+				}
 				p.immediateBytecode.clear();
 				p.immediateKeepAlive.reset();
 				ClearImmediateFrameRequirements(p.resources);
@@ -4994,7 +5024,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 					if (traceLifecycle) {
 						spdlog::info("RG frame {} render pass '{}' RecordImmediateCommands begin", frameIndex, p.name);
 					}
-					p.pass->RecordImmediateCommands(c);
+					immediateModeCommands->RecordImmediateCommands(c);
 					if (traceLifecycle) {
 						spdlog::info("RG frame {} render pass '{}' RecordImmediateCommands complete", frameIndex, p.name);
 					}
