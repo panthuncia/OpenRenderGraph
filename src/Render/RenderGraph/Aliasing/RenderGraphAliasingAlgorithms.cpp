@@ -535,18 +535,88 @@ rg::alias::FrameAliasAnalysis rg::alias::RenderGraphAliasingSubsystem::BuildAlia
 	analysis.resourcesByID.reserve(1024);
 
 	auto device = DeviceManager::GetInstance().GetDevice();
+	auto initializeStaticInfo = [&](FrameAliasResourceInfo& info, const ResourceRegistry::RegistryHandle& handle) {
+		auto* resource = _registry.Resolve(handle);
+		if (!resource) {
+			return;
+		}
+
+		info.handle = handle;
+
+		if (auto* texture = dynamic_cast<PixelBuffer*>(resource)) {
+			auto const& desc = texture->GetDescription();
+			info.kind = RGResourceRuntimeKind::Texture;
+			info.aliasAllowed = desc.allowAlias;
+			info.deviceLocal = true;
+			info.materialized = texture->IsMaterialized();
+			if (desc.aliasingPoolID.has_value()) {
+				info.manualPoolID = desc.aliasingPoolID.value();
+				info.hasManualPool = true;
+			}
+			if (!info.aliasAllowed) {
+				info.exclusionReason = "allowAlias is disabled";
+				info.staticInfoInitialized = true;
+				return;
+			}
+
+			auto resourceDesc = BuildAliasTextureResourceDesc(desc);
+			rhi::ResourceAllocationInfo allocationInfo{};
+			device.GetResourceAllocationInfo(&resourceDesc, 1, &allocationInfo);
+			info.sizeBytes = allocationInfo.sizeInBytes;
+			info.alignment = std::max<uint64_t>(1, allocationInfo.alignment);
+			info.staticInfoInitialized = true;
+			return;
+		}
+
+		if (auto* buffer = dynamic_cast<Buffer*>(resource)) {
+			info.kind = RGResourceRuntimeKind::Buffer;
+			info.aliasAllowed = buffer->IsAliasingAllowed();
+			info.deviceLocal = buffer->GetAccessType() == rhi::HeapType::DeviceLocal;
+			info.materialized = buffer->IsMaterialized();
+			if (auto poolHint = buffer->GetAliasingPoolHint(); poolHint.has_value()) {
+				info.manualPoolID = poolHint.value();
+				info.hasManualPool = true;
+			}
+			if (!info.aliasAllowed) {
+				info.exclusionReason = "allowAlias is disabled";
+				info.staticInfoInitialized = true;
+				return;
+			}
+			if (!info.deviceLocal) {
+				info.exclusionReason = "buffer heap is not DeviceLocal";
+				info.staticInfoInitialized = true;
+				return;
+			}
+
+			auto resourceDesc = BuildAliasBufferResourceDesc(
+				buffer->GetBufferSize(),
+				buffer->IsUnorderedAccessEnabled(),
+				buffer->GetAccessType());
+			rhi::ResourceAllocationInfo allocationInfo{};
+			device.GetResourceAllocationInfo(&resourceDesc, 1, &allocationInfo);
+			info.sizeBytes = allocationInfo.sizeInBytes;
+			info.alignment = std::max<uint64_t>(1, allocationInfo.alignment);
+			info.staticInfoInitialized = true;
+			return;
+		}
+
+		info.exclusionReason = "unsupported resource type";
+		info.staticInfoInitialized = true;
+	};
 	auto collectHandle = [&](const ResourceRegistry::RegistryHandle& handle, bool isWrite, size_t usageOrder, uint32_t passCrit, size_t passIdx) {
 		if (handle.IsEphemeral()) {
 			return;
 		}
 
-		auto* resource = _registry.Resolve(handle);
 		const uint64_t resourceID = handle.GetGlobalResourceID();
 		auto [it, inserted] = analysis.resourcesByID.try_emplace(resourceID);
 		auto& info = it->second;
 		if (inserted) {
 			info.resourceID = resourceID;
 			info.handle = handle;
+		}
+		if (!info.staticInfoInitialized) {
+			initializeStaticInfo(info, handle);
 		}
 
 		if (usageOrder < info.firstUse) {
@@ -566,61 +636,6 @@ rg::alias::FrameAliasAnalysis rg::alias::RenderGraphAliasingSubsystem::BuildAlia
 		}
 		info.everWritten = info.everWritten || isWrite;
 		info.maxNodeCriticality = std::max(info.maxNodeCriticality, passCrit);
-
-		if (!resource || (info.kind != FrameAliasResourceInfo::Kind::Unsupported && info.sizeBytes != 0)) {
-			return;
-		}
-
-		if (auto* texture = dynamic_cast<PixelBuffer*>(resource)) {
-			auto const& desc = texture->GetDescription();
-			info.kind = FrameAliasResourceInfo::Kind::Texture;
-			info.aliasAllowed = desc.allowAlias;
-			info.deviceLocal = true;
-			info.materialized = texture->IsMaterialized();
-			if (desc.aliasingPoolID.has_value()) {
-				info.manualPoolID = desc.aliasingPoolID.value();
-				info.hasManualPool = true;
-			}
-			if (!info.aliasAllowed) {
-				info.exclusionReason = "allowAlias is disabled";
-				return;
-			}
-
-			auto resourceDesc = BuildAliasTextureResourceDesc(desc);
-			rhi::ResourceAllocationInfo allocationInfo{};
-			device.GetResourceAllocationInfo(&resourceDesc, 1, &allocationInfo);
-			info.sizeBytes = allocationInfo.sizeInBytes;
-			info.alignment = std::max<uint64_t>(1, allocationInfo.alignment);
-			return;
-		}
-
-		if (auto* buffer = dynamic_cast<Buffer*>(resource)) {
-			info.kind = FrameAliasResourceInfo::Kind::Buffer;
-			info.aliasAllowed = buffer->IsAliasingAllowed();
-			info.deviceLocal = buffer->GetAccessType() == rhi::HeapType::DeviceLocal;
-			info.materialized = buffer->IsMaterialized();
-			if (auto poolHint = buffer->GetAliasingPoolHint(); poolHint.has_value()) {
-				info.manualPoolID = poolHint.value();
-				info.hasManualPool = true;
-			}
-			if (!info.aliasAllowed) {
-				info.exclusionReason = "allowAlias is disabled";
-				return;
-			}
-			if (!info.deviceLocal) {
-				info.exclusionReason = "buffer heap is not DeviceLocal";
-				return;
-			}
-
-			auto resourceDesc = BuildAliasBufferResourceDesc(
-				buffer->GetBufferSize(),
-				buffer->IsUnorderedAccessEnabled(),
-				buffer->GetAccessType());
-			rhi::ResourceAllocationInfo allocationInfo{};
-			device.GetResourceAllocationInfo(&resourceDesc, 1, &allocationInfo);
-			info.sizeBytes = allocationInfo.sizeInBytes;
-			info.alignment = std::max<uint64_t>(1, allocationInfo.alignment);
-		}
 	};
 
 	for (size_t passIdx = 0; passIdx < m_framePasses.size(); ++passIdx) {
@@ -719,7 +734,7 @@ void rg::alias::RenderGraphAliasingSubsystem::AutoAssignAliasingPoolsFromAnalysi
 		if (c.exclusionReason != nullptr) {
 			autoAliasExclusionReasonByID.try_emplace(c.resourceID, c.exclusionReason);
 		}
-		if (c.kind == FrameAliasResourceInfo::Kind::Unsupported || !c.aliasAllowed || !c.deviceLocal) {
+		if (c.kind == RGResourceRuntimeKind::Unknown || !c.aliasAllowed || !c.deviceLocal) {
 			continue;
 		}
 
@@ -949,7 +964,7 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 
 	std::unordered_map<uint64_t, std::vector<Candidate>> byPool;
 	for (const auto& [resourceID, info] : analysis.resourcesByID) {
-		if (info.kind == FrameAliasResourceInfo::Kind::Unsupported || !info.aliasAllowed || !info.deviceLocal) {
+		if (info.kind == RGResourceRuntimeKind::Unknown || !info.aliasAllowed || !info.deviceLocal) {
 			continue;
 		}
 		if (info.firstUse == std::numeric_limits<size_t>::max()) {
@@ -969,7 +984,7 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 		}
 
 		Candidate c{};
-		c.kind = info.kind == FrameAliasResourceInfo::Kind::Texture ? Candidate::Kind::Texture : Candidate::Kind::Buffer;
+		c.kind = info.kind == RGResourceRuntimeKind::Texture ? Candidate::Kind::Texture : Candidate::Kind::Buffer;
 		c.resourceID = resourceID;
 		c.poolID = info.finalPoolID;
 		c.sizeBytes = info.sizeBytes;

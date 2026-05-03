@@ -96,16 +96,17 @@ struct AliasSchedulingNode {
 	std::vector<size_t> out;
 };
 
+enum class RGResourceRuntimeKind : uint8_t {
+	Unknown,
+	Texture,
+	Buffer,
+};
+
 struct FrameAliasResourceInfo {
 	uint64_t resourceID = 0;
 	ResourceRegistry::RegistryHandle handle{};
-
-	enum class Kind : uint8_t {
-		Texture,
-		Buffer,
-		Unsupported
-	};
-	Kind kind = Kind::Unsupported;
+	RGResourceRuntimeKind kind = RGResourceRuntimeKind::Unknown;
+	bool staticInfoInitialized = false;
 
 	bool aliasAllowed = false;
 	bool deviceLocal = false;
