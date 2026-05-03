@@ -5092,24 +5092,56 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			}
 		};
 
-		// Build name->index map for O(1) anchor lookup
-		std::unordered_map<std::string, size_t> framePassIndexByName;
-		framePassIndexByName.reserve(m_framePasses.size() + frameExt.size());
-		for (size_t i = 0; i < m_framePasses.size(); ++i) {
-			if (!m_framePasses[i].name.empty()) {
-				framePassIndexByName[m_framePasses[i].name] = i;
+		std::vector<AnyPassAndResources> baseFramePasses = std::move(m_framePasses);
+		m_framePasses.clear();
+
+		std::unordered_map<std::string, size_t> baseFramePassIndexByName;
+		baseFramePassIndexByName.reserve(baseFramePasses.size() + frameExt.size());
+		for (size_t i = 0; i < baseFramePasses.size(); ++i) {
+			if (!baseFramePasses[i].name.empty()) {
+				baseFramePassIndexByName[baseFramePasses[i].name] = i;
 			}
 		}
 
-		auto findPassIndexByName = [&](const std::string& name) -> std::optional<size_t> {
-			if (name.empty()) return std::nullopt;
-			auto it = framePassIndexByName.find(name);
-			if (it != framePassIndexByName.end()) return it->second;
-			return std::nullopt;
+		struct PendingFrameInsert {
+			AnyPassAndResources pass;
+			size_t slotIndex = 0;
+			size_t nextInsertIndex = (std::numeric_limits<size_t>::max)();
 		};
 
-		std::unordered_map<std::string, uint32_t> insertedAfterCount;
-		insertedAfterCount.reserve(frameExt.size());
+		const size_t invalidInsertIndex = (std::numeric_limits<size_t>::max)();
+		std::vector<PendingFrameInsert> pendingFrameInserts;
+		pendingFrameInserts.reserve(frameExt.size());
+		std::vector<size_t> slotHeadByIndex(baseFramePasses.size() + 1, invalidInsertIndex);
+		std::vector<size_t> slotTailByIndex(baseFramePasses.size() + 1, invalidInsertIndex);
+		std::unordered_map<std::string, size_t> pendingInsertIndexByName;
+		pendingInsertIndexByName.reserve(frameExt.size());
+		std::unordered_map<std::string, size_t> pendingInsertTailByAnchorName;
+		pendingInsertTailByAnchorName.reserve(frameExt.size());
+
+		auto appendPendingToSlot = [&](size_t pendingIndex, size_t slotIndex) {
+			auto& pending = pendingFrameInserts[pendingIndex];
+			pending.slotIndex = slotIndex;
+			pending.nextInsertIndex = invalidInsertIndex;
+			if (slotHeadByIndex[slotIndex] == invalidInsertIndex) {
+				slotHeadByIndex[slotIndex] = pendingIndex;
+			}
+			else {
+				pendingFrameInserts[slotTailByIndex[slotIndex]].nextInsertIndex = pendingIndex;
+			}
+			slotTailByIndex[slotIndex] = pendingIndex;
+		};
+
+		auto insertPendingAfter = [&](size_t pendingIndex, size_t previousPendingIndex) {
+			auto& pending = pendingFrameInserts[pendingIndex];
+			auto& previous = pendingFrameInserts[previousPendingIndex];
+			pending.slotIndex = previous.slotIndex;
+			pending.nextInsertIndex = previous.nextInsertIndex;
+			previous.nextInsertIndex = pendingIndex;
+			if (slotTailByIndex[pending.slotIndex] == previousPendingIndex) {
+				slotTailByIndex[pending.slotIndex] = pendingIndex;
+			}
+		};
 
 		for (auto& d : frameExt) {
 			if (d.type == PassType::Unknown) continue;
@@ -5121,38 +5153,67 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 
 			AnyPassAndResources any = MaterializeExternalPass(d, true, false);
 			recordImmediateCommands(any);
+			const std::string insertedPassName = any.name;
+			const size_t pendingIndex = pendingFrameInserts.size();
+			pendingFrameInserts.push_back(PendingFrameInsert{ .pass = std::move(any) });
 
-			// Default insertion: append
-			size_t insertPos = m_framePasses.size();
 			std::string anchorName;
+			bool insertedRelativeToAnchor = false;
 
 			if (d.where.has_value()) {
 				for (auto const& a : d.where->after) {
-					auto idxOpt = findPassIndexByName(a);
-					if (idxOpt.has_value()) {
+					auto tailIt = pendingInsertTailByAnchorName.find(a);
+					if (tailIt != pendingInsertTailByAnchorName.end()) {
 						anchorName = a;
-						uint32_t offset = insertedAfterCount[anchorName]++;
-						insertPos = std::min(*idxOpt + 1 + (size_t)offset, m_framePasses.size());
+						insertPendingAfter(pendingIndex, tailIt->second);
+						insertedRelativeToAnchor = true;
+						break;
+					}
+
+					auto pendingAnchorIt = pendingInsertIndexByName.find(a);
+					if (pendingAnchorIt != pendingInsertIndexByName.end()) {
+						anchorName = a;
+						insertPendingAfter(pendingIndex, pendingAnchorIt->second);
+						insertedRelativeToAnchor = true;
+						break;
+					}
+
+					auto baseAnchorIt = baseFramePassIndexByName.find(a);
+					if (baseAnchorIt != baseFramePassIndexByName.end()) {
+						anchorName = a;
+						appendPendingToSlot(pendingIndex, baseAnchorIt->second + 1);
+						insertedRelativeToAnchor = true;
 						break;
 					}
 				}
 			}
 
+			if (!insertedRelativeToAnchor) {
+				appendPendingToSlot(pendingIndex, baseFramePasses.size());
+			}
+
 			if (!anchorName.empty()) {
-				explicitAfterByName.push_back({ anchorName, any.name });
+				explicitAfterByName.push_back({ anchorName, insertedPassName });
+				pendingInsertTailByAnchorName[anchorName] = pendingIndex;
 			}
 
-			// Update indices in the map for entries at or after the insertion point
-			for (auto& [name, idx] : framePassIndexByName) {
-				if (idx >= insertPos) ++idx;
+			if (!insertedPassName.empty()) {
+				pendingInsertIndexByName[insertedPassName] = pendingIndex;
 			}
-			// Add the new pass to the map before inserting (insertPos is its index)
-			if (!any.name.empty()) {
-				framePassIndexByName[any.name] = insertPos;
-			}
-
-			m_framePasses.insert(m_framePasses.begin() + insertPos, std::move(any));
 		}
+
+		m_framePasses.reserve(baseFramePasses.size() + pendingFrameInserts.size());
+		auto appendSlot = [&](size_t slotIndex) {
+			for (size_t pendingIndex = slotHeadByIndex[slotIndex]; pendingIndex != invalidInsertIndex; pendingIndex = pendingFrameInserts[pendingIndex].nextInsertIndex) {
+				m_framePasses.push_back(std::move(pendingFrameInserts[pendingIndex].pass));
+			}
+		};
+
+		for (size_t i = 0; i < baseFramePasses.size(); ++i) {
+			appendSlot(i);
+			m_framePasses.push_back(std::move(baseFramePasses[i]));
+		}
+		appendSlot(baseFramePasses.size());
 	}
 
 	// Register/refresh pass statistics indices for this frame's concrete pass list.
