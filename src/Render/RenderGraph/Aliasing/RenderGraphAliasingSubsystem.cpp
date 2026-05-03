@@ -29,38 +29,6 @@ rg::alias::AutoAliasDebugSnapshot rg::alias::RenderGraphAliasingSubsystem::Build
 	return out;
 }
 
-std::vector<uint64_t> rg::alias::RenderGraphAliasingSubsystem::GetSchedulingEquivalentIDs(
-	uint64_t resourceID,
-	const std::unordered_map<uint64_t, rg::alias::AliasPlacementRange>& aliasPlacementRangesByID) const
-{
-	auto it = aliasPlacementRangesByID.find(resourceID);
-	if (it == aliasPlacementRangesByID.end()) {
-		return { resourceID };
-	}
-
-	const rg::alias::AliasPlacementRange& placement = it->second;
-	std::vector<uint64_t> out;
-	out.reserve(8);
-
-	for (const auto& [id, otherPlacement] : aliasPlacementRangesByID) {
-		if (otherPlacement.poolID != placement.poolID) {
-			continue;
-		}
-
-		const uint64_t overlapStart = (std::max)(placement.startByte, otherPlacement.startByte);
-		const uint64_t overlapEnd = (std::min)(placement.endByte, otherPlacement.endByte);
-		if (overlapStart < overlapEnd) {
-			out.push_back(id);
-		}
-	}
-
-	if (out.empty()) {
-		out.push_back(resourceID);
-	}
-
-	return out;
-}
-
 void rg::alias::RenderGraphAliasingSubsystem::ResetPerFrameState(RenderGraph& renderGraph) const {
 	renderGraph.aliasMaterializeOptionsByID.clear();
 	renderGraph.aliasActivationPending.clear();

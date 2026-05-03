@@ -281,31 +281,36 @@ void RenderGraph::BuildMemoryIntrospectionFrameGraphSnapshot(
 	}
 
 	std::unordered_map<uint64_t, LiveIntervalRecord> liveIntervals;
-	liveIntervals.reserve(firstTouchedBatchByResource.size() + schedulingPlacementRangesByID.size());
+	const auto& frameSchedulingResourceIndexByID = this->m_frameSchedulingResourceIndexByID;
+	liveIntervals.reserve(firstTouchedBatchByResource.size() + frameSchedulingResourceIndexByID.size());
 	const size_t passCount = m_framePasses.size();
 
-	for (const auto& [resourceID, placement] : schedulingPlacementRangesByID) {
+	for (const auto& [resourceID, resourceIndex] : frameSchedulingResourceIndexByID) {
+		const auto* placement = this->TryGetSchedulingPlacementRangeByResourceIndex(resourceIndex);
+		if (!placement) {
+			continue;
+		}
 		auto itMem = memIndex.find(resourceID);
 		if (itMem == memIndex.end()) {
 			continue;
 		}
-		if (placement.firstUsePassIndex == kInvalidPassIndex || placement.lastUsePassIndex == kInvalidPassIndex) {
+		if (placement->firstUsePassIndex == kInvalidPassIndex || placement->lastUsePassIndex == kInvalidPassIndex) {
 			continue;
 		}
-		if (placement.firstUsePassIndex >= passCount || placement.lastUsePassIndex >= passCount || placement.firstUsePassIndex > placement.lastUsePassIndex) {
+		if (placement->firstUsePassIndex >= passCount || placement->lastUsePassIndex >= passCount || placement->firstUsePassIndex > placement->lastUsePassIndex) {
 			continue;
 		}
 
-		const uint64_t endByte = (std::max)(placement.endByte, placement.startByte + itMem->second.bytes);
+		const uint64_t endByte = (std::max)(placement->endByte, placement->startByte + itMem->second.bytes);
 		liveIntervals[resourceID] = LiveIntervalRecord{
 			.resourceID = resourceID,
 			.bytes = itMem->second.bytes,
-			.firstPassIndex = placement.firstUsePassIndex,
-			.lastPassIndex = placement.lastUsePassIndex,
-			.poolID = placement.poolID,
-			.startByte = placement.startByte,
+			.firstPassIndex = placement->firstUsePassIndex,
+			.lastPassIndex = placement->lastUsePassIndex,
+			.poolID = placement->poolID,
+			.startByte = placement->startByte,
 			.endByte = endByte,
-			.pooled = !placement.dedicatedBacking,
+			.pooled = !placement->dedicatedBacking,
 		};
 	}
 
@@ -1826,7 +1831,6 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph
 void rg::alias::RenderGraphAliasingSubsystem::ApplyAliasQueueSynchronization(RenderGraph& rg) const {
 	ZoneScopedN("RenderGraphAliasingSubsystem::ApplyAliasQueueSynchronization");
 	auto& batches = rg.batches;
-	auto& aliasPlacementRangesByID = rg.aliasPlacementRangesByID;
 	const size_t slotCount = rg.GetQueueRegistry().SlotCount();
 
 	struct QueueUsage {
@@ -1867,8 +1871,7 @@ void rg::alias::RenderGraphAliasingSubsystem::ApplyAliasQueueSynchronization(Ren
 		auto accumulateFromReqs = [&](const std::vector<ResourceRequirement>& reqs, size_t slot) {
 			for (auto const& req : reqs) {
 				const uint64_t resourceID = req.resourceHandleAndRange.resource.GetGlobalResourceID();
-				auto itPlacement = aliasPlacementRangesByID.find(resourceID);
-				if (itPlacement == aliasPlacementRangesByID.end()) {
+				if (!rg.TryGetAliasPlacementRange(resourceID)) {
 					continue;
 				}
 				auto& u = usageByResourceID[resourceID];
@@ -1882,8 +1885,7 @@ void rg::alias::RenderGraphAliasingSubsystem::ApplyAliasQueueSynchronization(Ren
 		auto accumulateFromInternalTransitions = [&](const std::vector<std::pair<ResourceHandleAndRange, ResourceState>>& internalTransitions, size_t slot) {
 			for (auto const& transition : internalTransitions) {
 				const uint64_t resourceID = transition.first.resource.GetGlobalResourceID();
-				auto itPlacement = aliasPlacementRangesByID.find(resourceID);
-				if (itPlacement == aliasPlacementRangesByID.end()) {
+				if (!rg.TryGetAliasPlacementRange(resourceID)) {
 					continue;
 				}
 				auto& u = usageByResourceID[resourceID];
@@ -1910,13 +1912,12 @@ void rg::alias::RenderGraphAliasingSubsystem::ApplyAliasQueueSynchronization(Ren
 		}
 
 		for (auto const& [resourceID, usage] : usageByResourceID) {
-			auto placementIt = aliasPlacementRangesByID.find(resourceID);
-			if (placementIt == aliasPlacementRangesByID.end()) {
+			const auto* placement = rg.TryGetAliasPlacementRange(resourceID);
+			if (!placement) {
 				continue;
 			}
 
-			const auto& placement = placementIt->second;
-			auto& previousOwners = lastOwnerByPool[placement.poolID];
+			auto& previousOwners = lastOwnerByPool[placement->poolID];
 
 			for (const auto& prevOwner : previousOwners) {
 				if (prevOwner.resourceID == resourceID) {
@@ -1931,8 +1932,8 @@ void rg::alias::RenderGraphAliasingSubsystem::ApplyAliasQueueSynchronization(Ren
 				}
 
 				if (!rangesOverlap(
-					placement.startByte,
-					placement.endByte,
+					placement->startByte,
+					placement->endByte,
 					prevOwner.startByte,
 					prevOwner.endByte)) {
 					continue;
@@ -1968,18 +1969,16 @@ void rg::alias::RenderGraphAliasingSubsystem::ApplyAliasQueueSynchronization(Ren
 					previousOwners.begin(),
 					previousOwners.end(),
 					[&](const RangeOwner& owner) {
-						return rangesOverlap(
-							placement.startByte,
-							placement.endByte,
-							owner.startByte,
-							owner.endByte);
+						const uint64_t overlapStart = std::max(placement->startByte, owner.startByte);
+						const uint64_t overlapEnd = std::min(placement->endByte, owner.endByte);
+						return overlapStart < overlapEnd;
 					}),
 				previousOwners.end());
 
 			previousOwners.push_back(RangeOwner{
 				.resourceID = resourceID,
-				.startByte = placement.startByte,
-				.endByte = placement.endByte,
+				.startByte = placement->startByte,
+				.endByte = placement->endByte,
 				.batchIndex = batchIndex,
 				.usage = usage,
 			});

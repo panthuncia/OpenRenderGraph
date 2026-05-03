@@ -1046,6 +1046,11 @@ private:
 	void ClearFramePassSchedulingSummaries();
 	void ResetFrameQueueBatchHistoryTables();
 	std::optional<size_t> TryGetFrameSchedulingResourceIndex(uint64_t resourceID) const;
+	const rg::alias::AliasPlacementRange* TryGetAliasPlacementRangeByResourceIndex(size_t resourceIndex) const;
+	const rg::alias::AliasPlacementRange* TryGetAliasPlacementRange(uint64_t resourceID) const;
+	const rg::alias::AliasPlacementRange* TryGetSchedulingPlacementRangeByResourceIndex(size_t resourceIndex) const;
+	const rg::alias::AliasPlacementRange* TryGetSchedulingPlacementRange(uint64_t resourceID) const;
+	std::vector<uint64_t> BuildSchedulingEquivalentIDs(uint64_t resourceID) const;
 	size_t FrameQueueBatchHistoryOffset(size_t queueSlot, size_t resourceIndex) const;
 	unsigned int GetFrameQueueHistoryValue(const std::vector<unsigned int>& history, size_t queueSlot, size_t resourceIndex) const;
 	void SetFrameQueueHistoryValue(std::vector<unsigned int>& history, size_t queueSlot, size_t resourceIndex, unsigned int batchIndex);

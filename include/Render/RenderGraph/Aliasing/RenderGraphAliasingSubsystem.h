@@ -151,9 +151,6 @@ public:
 		const std::vector<AutoAliasReasonCount>& exclusionReasons,
 		const std::vector<AutoAliasPoolDebug>& poolDebug) const;
 
-	std::vector<uint64_t> GetSchedulingEquivalentIDs(
-		uint64_t resourceID,
-		const std::unordered_map<uint64_t, AliasPlacementRange>& aliasPlacementRangesByID) const;
 
 	void ResetPerFrameState(RenderGraph& rg) const;
 	void ResetPersistentState(RenderGraph& rg) const;

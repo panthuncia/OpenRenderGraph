@@ -1781,10 +1781,6 @@ bool RenderGraph::FinalizeDependencyGraph(std::vector<Node>& nodes)
 bool RenderGraph::AddCurrentFrameAliasSchedulingEdges(std::vector<Node>& nodes)
 {
 	ZoneScopedN("RenderGraph::AddCurrentFrameAliasSchedulingEdges");
-	if (aliasPlacementRangesByID.empty()) {
-		return true;
-	}
-
 	auto rangesOverlap = [](const rg::alias::AliasPlacementRange& lhs, const rg::alias::AliasPlacementRange& rhs) {
 		const uint64_t overlapStart = (std::max)(lhs.startByte, rhs.startByte);
 		const uint64_t overlapEnd = (std::min)(lhs.endByte, rhs.endByte);
@@ -1810,72 +1806,72 @@ bool RenderGraph::AddCurrentFrameAliasSchedulingEdges(std::vector<Node>& nodes)
 		existingEdgeCount += node.out.size();
 	}
 
+	std::vector<uint64_t> resourceIDs;
+	resourceIDs.reserve(aliasPlacementPoolByID.size());
+	for (const auto& [resourceID, resourceIndex] : m_frameSchedulingResourceIndexByID) {
+		if (TryGetAliasPlacementRangeByResourceIndex(resourceIndex)) {
+			resourceIDs.push_back(resourceID);
+		}
+	}
+	if (resourceIDs.empty()) {
+		return true;
+	}
+	std::sort(resourceIDs.begin(), resourceIDs.end());
+
 	std::unordered_set<uint64_t> edgeSet;
-	edgeSet.reserve(existingEdgeCount + aliasPlacementRangesByID.size() * 4);
+	edgeSet.reserve(existingEdgeCount + resourceIDs.size() * 4);
 	for (size_t from = 0; from < nodes.size(); ++from) {
 		for (size_t to : nodes[from].out) {
 			edgeSet.insert((uint64_t(from) << 32) | uint64_t(to));
 		}
 	}
 
-	std::vector<uint64_t> resourceIDs;
-	resourceIDs.reserve(aliasPlacementRangesByID.size());
-	for (const auto& [resourceID, placement] : aliasPlacementRangesByID) {
-		(void)placement;
-		resourceIDs.push_back(resourceID);
-	}
-	std::sort(resourceIDs.begin(), resourceIDs.end());
-
 	for (size_t i = 0; i < resourceIDs.size(); ++i) {
 		const uint64_t lhsResourceID = resourceIDs[i];
-		const auto lhsIt = aliasPlacementRangesByID.find(lhsResourceID);
-		if (lhsIt == aliasPlacementRangesByID.end()) {
+		const auto* lhs = TryGetAliasPlacementRange(lhsResourceID);
+		if (!lhs) {
 			continue;
 		}
-
-		const auto& lhs = lhsIt->second;
-		if (lhs.firstUsePassIndex == std::numeric_limits<size_t>::max() ||
-			lhs.lastUsePassIndex == std::numeric_limits<size_t>::max()) {
+		if (lhs->firstUsePassIndex == std::numeric_limits<size_t>::max() ||
+			lhs->lastUsePassIndex == std::numeric_limits<size_t>::max()) {
 			continue;
 		}
 
 		for (size_t j = i + 1; j < resourceIDs.size(); ++j) {
 			const uint64_t rhsResourceID = resourceIDs[j];
-			const auto rhsIt = aliasPlacementRangesByID.find(rhsResourceID);
-			if (rhsIt == aliasPlacementRangesByID.end()) {
+			const auto* rhs = TryGetAliasPlacementRange(rhsResourceID);
+			if (!rhs) {
 				continue;
 			}
-
-			const auto& rhs = rhsIt->second;
-			if (lhs.poolID != rhs.poolID || !rangesOverlap(lhs, rhs)) {
+			if (lhs->poolID != rhs->poolID || !rangesOverlap(*lhs, *rhs)) {
 				continue;
 			}
-			if (rhs.firstUsePassIndex == std::numeric_limits<size_t>::max() ||
-				rhs.lastUsePassIndex == std::numeric_limits<size_t>::max()) {
+			if (rhs->firstUsePassIndex == std::numeric_limits<size_t>::max() ||
+				rhs->lastUsePassIndex == std::numeric_limits<size_t>::max()) {
 				continue;
 			}
 
 			size_t fromPassIndex = std::numeric_limits<size_t>::max();
 			size_t toPassIndex = std::numeric_limits<size_t>::max();
-			if (lhs.lastUse < rhs.firstUse) {
-				fromPassIndex = lhs.lastUsePassIndex;
-				toPassIndex = rhs.firstUsePassIndex;
+			if (lhs->lastUse < rhs->firstUse) {
+				fromPassIndex = lhs->lastUsePassIndex;
+				toPassIndex = rhs->firstUsePassIndex;
 			}
-			else if (rhs.lastUse < lhs.firstUse) {
-				fromPassIndex = rhs.lastUsePassIndex;
-				toPassIndex = lhs.firstUsePassIndex;
+			else if (rhs->lastUse < lhs->firstUse) {
+				fromPassIndex = rhs->lastUsePassIndex;
+				toPassIndex = lhs->firstUsePassIndex;
 			}
 			else {
 				throw std::runtime_error(
 					"Alias plan produced overlapping lifetimes for overlapping placements: resource " +
 					std::to_string(lhsResourceID) + " ('" + resourceDebugName(lhsResourceID) + "') [" +
-					std::to_string(lhs.startByte) + ", " + std::to_string(lhs.endByte) + ") firstUse=" +
-					std::to_string(static_cast<uint64_t>(lhs.firstUse)) + " lastUse=" +
-					std::to_string(static_cast<uint64_t>(lhs.lastUse)) + " and resource " +
+					std::to_string((*lhs).startByte) + ", " + std::to_string((*lhs).endByte) + ") firstUse=" +
+					std::to_string(static_cast<uint64_t>((*lhs).firstUse)) + " lastUse=" +
+					std::to_string(static_cast<uint64_t>((*lhs).lastUse)) + " and resource " +
 					std::to_string(rhsResourceID) + " ('" + resourceDebugName(rhsResourceID) + "') [" +
-					std::to_string(rhs.startByte) + ", " + std::to_string(rhs.endByte) + ") firstUse=" +
-					std::to_string(static_cast<uint64_t>(rhs.firstUse)) + " lastUse=" +
-					std::to_string(static_cast<uint64_t>(rhs.lastUse)));
+					std::to_string((*rhs).startByte) + ", " + std::to_string((*rhs).endByte) + ") firstUse=" +
+					std::to_string(static_cast<uint64_t>((*rhs).firstUse)) + " lastUse=" +
+					std::to_string(static_cast<uint64_t>((*rhs).lastUse)));
 			}
 
 			if (fromPassIndex == toPassIndex) {
@@ -3271,9 +3267,7 @@ void RenderGraph::RebuildSchedulingEquivalentIDCache(const std::unordered_set<ui
 	m_schedulingEquivalentIDsCache.reserve(resourceIDs.size());
 
 	for (uint64_t resourceID : resourceIDs) {
-		m_schedulingEquivalentIDsCache.emplace(
-			resourceID,
-			m_aliasingSubsystem.GetSchedulingEquivalentIDs(resourceID, schedulingPlacementRangesByID));
+		m_schedulingEquivalentIDsCache.emplace(resourceID, BuildSchedulingEquivalentIDs(resourceID));
 	}
 }
 
@@ -3283,9 +3277,7 @@ const std::vector<uint64_t>& RenderGraph::GetSchedulingEquivalentIDsCached(uint6
 		return it->second;
 	}
 
-	auto [insertedIt, inserted] = m_schedulingEquivalentIDsCache.emplace(
-		resourceID,
-		m_aliasingSubsystem.GetSchedulingEquivalentIDs(resourceID, schedulingPlacementRangesByID));
+	auto [insertedIt, inserted] = m_schedulingEquivalentIDsCache.emplace(resourceID, BuildSchedulingEquivalentIDs(resourceID));
 	(void)inserted;
 	return insertedIt->second;
 }
@@ -3532,6 +3524,70 @@ std::optional<size_t> RenderGraph::TryGetFrameSchedulingResourceIndex(uint64_t r
 		return std::nullopt;
 	}
 	return it->second;
+}
+
+const rg::alias::AliasPlacementRange* RenderGraph::TryGetAliasPlacementRangeByResourceIndex(size_t resourceIndex) const {
+	if (resourceIndex >= m_hasAliasPlacementByResourceIndex.size() || resourceIndex >= m_aliasPlacementRangeByResourceIndex.size()) {
+		return nullptr;
+	}
+	if (m_hasAliasPlacementByResourceIndex[resourceIndex] == 0) {
+		return nullptr;
+	}
+	return &m_aliasPlacementRangeByResourceIndex[resourceIndex];
+}
+
+const rg::alias::AliasPlacementRange* RenderGraph::TryGetAliasPlacementRange(uint64_t resourceID) const {
+	auto resourceIndex = TryGetFrameSchedulingResourceIndex(resourceID);
+	if (!resourceIndex.has_value()) {
+		return nullptr;
+	}
+	return TryGetAliasPlacementRangeByResourceIndex(*resourceIndex);
+}
+
+const rg::alias::AliasPlacementRange* RenderGraph::TryGetSchedulingPlacementRangeByResourceIndex(size_t resourceIndex) const {
+	if (resourceIndex >= m_hasSchedulingPlacementByResourceIndex.size() || resourceIndex >= m_schedulingPlacementRangeByResourceIndex.size()) {
+		return nullptr;
+	}
+	if (m_hasSchedulingPlacementByResourceIndex[resourceIndex] == 0) {
+		return nullptr;
+	}
+	return &m_schedulingPlacementRangeByResourceIndex[resourceIndex];
+}
+
+const rg::alias::AliasPlacementRange* RenderGraph::TryGetSchedulingPlacementRange(uint64_t resourceID) const {
+	auto resourceIndex = TryGetFrameSchedulingResourceIndex(resourceID);
+	if (!resourceIndex.has_value()) {
+		return nullptr;
+	}
+	return TryGetSchedulingPlacementRangeByResourceIndex(*resourceIndex);
+}
+
+std::vector<uint64_t> RenderGraph::BuildSchedulingEquivalentIDs(uint64_t resourceID) const {
+	const auto* placement = TryGetSchedulingPlacementRange(resourceID);
+	if (!placement) {
+		return { resourceID };
+	}
+
+	std::vector<uint64_t> out;
+	out.reserve(8);
+	for (const auto& [candidateID, candidateIndex] : m_frameSchedulingResourceIndexByID) {
+		const auto* otherPlacement = TryGetSchedulingPlacementRangeByResourceIndex(candidateIndex);
+		if (!otherPlacement || otherPlacement->poolID != placement->poolID) {
+			continue;
+		}
+
+		const uint64_t overlapStart = (std::max)(placement->startByte, otherPlacement->startByte);
+		const uint64_t overlapEnd = (std::min)(placement->endByte, otherPlacement->endByte);
+		if (overlapStart < overlapEnd) {
+			out.push_back(candidateID);
+		}
+	}
+
+	if (out.empty()) {
+		out.push_back(resourceID);
+	}
+
+	return out;
 }
 
 size_t RenderGraph::FrameQueueBatchHistoryOffset(size_t queueSlot, size_t resourceIndex) const {
@@ -5279,23 +5335,23 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 					markCrossFrameWait(passQueueSlot, it->second.queueSlot, it->second.fenceValue);
 				}
 
-				auto itCurPlacement = aliasPlacementRangesByID.find(rid);
-				if (itCurPlacement == aliasPlacementRangesByID.end()) {
+				const auto* placement = TryGetAliasPlacementRange(rid);
+				if (!placement) {
 					continue;
 				}
 
-				auto itPoolState = persistentAliasPools.find(itCurPlacement->second.poolID);
+				auto itPoolState = persistentAliasPools.find(placement->poolID);
 				if (itPoolState == persistentAliasPools.end()) {
 					continue;
 				}
 
-				auto itPrevPool = m_lastAliasPlacementProducersByPoolAcrossFrames.find(itCurPlacement->second.poolID);
+				auto itPrevPool = m_lastAliasPlacementProducersByPoolAcrossFrames.find(placement->poolID);
 				if (itPrevPool == m_lastAliasPlacementProducersByPoolAcrossFrames.end()) {
 					continue;
 				}
 
-				const uint64_t curStart = itCurPlacement->second.startByte;
-				const uint64_t curEnd = itCurPlacement->second.endByte;
+				const uint64_t curStart = placement->startByte;
+				const uint64_t curEnd = placement->endByte;
 				const uint64_t curPoolGeneration = itPoolState->second.generation;
 
 				for (const auto& prevPlacementProducer : itPrevPool->second) {
@@ -7735,23 +7791,23 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 	auto publishAliasPlacementProducer = [&](uint64_t resourceID, LastProducerAcrossFrames producer) {
 		removeResourceFromLastAliasPlacementCache(resourceID);
 
-		auto itPlacement = aliasPlacementRangesByID.find(resourceID);
-		if (itPlacement == aliasPlacementRangesByID.end()) {
+		const auto* placement = TryGetAliasPlacementRange(resourceID);
+		if (!placement) {
 			return;
 		}
 
-		auto itPoolState = persistentAliasPools.find(itPlacement->second.poolID);
+		auto itPoolState = persistentAliasPools.find(placement->poolID);
 		if (itPoolState == persistentAliasPools.end()) {
 			return;
 		}
 
-		nextLastAliasPlacementProducersByPoolAcrossFrames[itPlacement->second.poolID].push_back(
+		nextLastAliasPlacementProducersByPoolAcrossFrames[placement->poolID].push_back(
 			LastAliasPlacementProducerAcrossFrames{
 				.resourceID = resourceID,
-				.poolID = itPlacement->second.poolID,
+				.poolID = placement->poolID,
 				.poolGeneration = itPoolState->second.generation,
-				.startByte = itPlacement->second.startByte,
-				.endByte = itPlacement->second.endByte,
+				.startByte = placement->startByte,
+				.endByte = placement->endByte,
 				.producer = producer,
 			});
 	};
