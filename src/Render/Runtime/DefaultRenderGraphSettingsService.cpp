@@ -43,6 +43,10 @@ public:
         return GetOpenRenderGraphSettings().autoAliasLogExclusionReasons;
     }
 
+    bool GetAutoAliasBuildDebugData() const override {
+        return GetOpenRenderGraphSettings().autoAliasBuildDebugData;
+    }
+
     bool GetQueueSchedulingEnableLogging() const override {
         return GetOpenRenderGraphSettings().queueSchedulingEnableLogging;
     }

@@ -6267,6 +6267,9 @@ void RenderGraph::Setup() {
 	m_getAutoAliasLogExclusionReasons = [this]() {
 		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetAutoAliasLogExclusionReasons() : false;
 	};
+	m_getAutoAliasBuildDebugData = [this]() {
+		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetAutoAliasBuildDebugData() : false;
+	};
 	m_getQueueSchedulingEnableLogging = [this]() {
 		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetQueueSchedulingEnableLogging() : false;
 	};

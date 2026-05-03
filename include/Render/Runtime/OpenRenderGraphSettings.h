@@ -20,6 +20,7 @@ struct OpenRenderGraphSettings {
     uint8_t autoAliasPackingStrategy = 0;
     bool autoAliasEnableLogging = false;
     bool autoAliasLogExclusionReasons = false;
+    bool autoAliasBuildDebugData = false;
     bool queueSchedulingEnableLogging = false;
     float queueSchedulingWidthScale = 1.0f;
     float queueSchedulingPenaltyBias = 0.0f;

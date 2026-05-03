@@ -1299,6 +1299,7 @@ private:
 	std::function<bool()> m_getReadOnlyUniformTransitionElisionEnabled;
 	std::function<bool()> m_getAutoAliasEnableLogging;
 	std::function<bool()> m_getAutoAliasLogExclusionReasons;
+	std::function<bool()> m_getAutoAliasBuildDebugData;
 	std::function<bool()> m_getQueueSchedulingEnableLogging;
 	std::function<float()> m_getQueueSchedulingWidthScale;
 	std::function<float()> m_getQueueSchedulingPenaltyBias;

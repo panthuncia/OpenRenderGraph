@@ -31,6 +31,20 @@ RenderGraph::AutoAliasDebugSnapshot RenderGraph::GetAutoAliasDebugSnapshot() con
 
 namespace {
 	constexpr size_t kInvalidPassIndex = std::numeric_limits<size_t>::max();
+	void MarkDebugOverlappingRanges(std::vector<RenderGraph::AutoAliasPoolRangeDebug>& ranges) {
+		for (size_t i = 0; i < ranges.size(); ++i) {
+			for (size_t j = i + 1; j < ranges.size(); ++j) {
+				auto& a = ranges[i];
+				auto& b = ranges[j];
+				const uint64_t overlapStart = std::max(a.startByte, b.startByte);
+				const uint64_t overlapEnd = std::min(a.endByte, b.endByte);
+				if (overlapStart < overlapEnd) {
+					a.overlapsByteRange = true;
+					b.overlapsByteRange = true;
+				}
+			}
+		}
+	}
 
 	struct FrameGraphMemoryInfo {
 		uint64_t bytes = 0;
@@ -888,6 +902,7 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 	auto& autoAliasPackingStrategyLastFrame = rg.autoAliasPackingStrategyLastFrame;
 	auto& m_getAutoAliasPackingStrategy = rg.m_getAutoAliasPackingStrategy;
 	auto& m_getAutoAliasEnableLogging = rg.m_getAutoAliasEnableLogging;
+	auto& m_getAutoAliasBuildDebugData = rg.m_getAutoAliasBuildDebugData;
 	auto& frameSchedulingResourceIndexByID = rg.m_frameSchedulingResourceIndexByID;
 	auto& persistentAliasPools = rg.persistentAliasPools;
 	auto& m_framePasses = rg.m_framePasses;
@@ -929,6 +944,8 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 		? m_getAutoAliasPackingStrategy()
 		: AutoAliasPackingStrategy::GreedySweepLine;
 	const bool aliasLoggingEnabled = m_getAutoAliasEnableLogging ? m_getAutoAliasEnableLogging() : false;
+	const bool buildAliasDebug = aliasLoggingEnabled
+		|| (m_getAutoAliasBuildDebugData && m_getAutoAliasBuildDebugData());
 	const bool modeChanged = autoAliasPreviousMode != autoAliasModeLastFrame;
 	const bool packingStrategyChanged = previousPackingStrategy != packingStrategy;
 
@@ -1037,7 +1054,9 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 
 	for (auto& [poolID, poolCandidateIndices] : candidateResourceIndicesByPool) {
 		AutoAliasPoolDebug poolDebug{};
-		poolDebug.poolID = poolID;
+		if (buildAliasDebug) {
+			poolDebug.poolID = poolID;
+		}
 
 		uint64_t poolIndependentBytes = 0;
 		for (AliasResourceIndex resourceIndex : poolCandidateIndices) {
@@ -1469,7 +1488,9 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 		if (heapSize == 0) {
 			continue;
 		}
-		poolDebug.requiredBytes = heapSize;
+		if (buildAliasDebug) {
+			poolDebug.requiredBytes = heapSize;
+		}
 
 		autoAliasPlannerStats.pooledIndependentBytes += poolIndependentBytes;
 
@@ -1541,7 +1562,9 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 		poolState.lastUsedFrame = aliasPoolPlanFrameIndex;
 		autoAliasPlannerStats.pooledActualBytes += heapSize;
 		pooledReservedBytes += poolState.capacityBytes;
-		poolDebug.reservedBytes = poolState.capacityBytes;
+		if (buildAliasDebug) {
+			poolDebug.reservedBytes = poolState.capacityBytes;
+		}
 
 		auto* allocation = poolState.allocation.GetAllocation();
 		if (!allocation) {
@@ -1556,21 +1579,23 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 			}
 			const auto& placement = placements[candidateIndex];
 
-			auto itResDebug = resourcesByID.find(c.resourceID);
-			const std::string resourceNameDebug = (itResDebug != resourcesByID.end() && itResDebug->second)
-				? itResDebug->second->GetName()
-				: std::string("<unknown>");
+			if (buildAliasDebug) {
+				auto itResDebug = resourcesByID.find(c.resourceID);
+				const std::string resourceNameDebug = (itResDebug != resourcesByID.end() && itResDebug->second)
+					? itResDebug->second->GetName()
+					: std::string("<unknown>");
 
-			poolDebug.ranges.push_back(AutoAliasPoolRangeDebug{
-				.resourceID = c.resourceID,
-				.resourceName = resourceNameDebug,
-				.startByte = placement.offset,
-				.endByte = placement.offset + c.sizeBytes,
-				.sizeBytes = c.sizeBytes,
-				.firstUse = c.firstUse,
-				.lastUse = c.lastUse,
-				.overlapsByteRange = false
-				});
+				poolDebug.ranges.push_back(AutoAliasPoolRangeDebug{
+					.resourceID = c.resourceID,
+					.resourceName = resourceNameDebug,
+					.startByte = placement.offset,
+					.endByte = placement.offset + c.sizeBytes,
+					.sizeBytes = c.sizeBytes,
+					.firstUse = c.firstUse,
+					.lastUse = c.lastUse,
+					.overlapsByteRange = false
+					});
+			}
 
 			if (c.kind == RGResourceRuntimeKind::Texture) {
 				PixelBuffer::MaterializeOptions options{};
@@ -1658,20 +1683,10 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 			markAliasActivationPending(resourceIndex);
 		}
 
-		for (size_t i = 0; i < poolDebug.ranges.size(); ++i) {
-			for (size_t j = i + 1; j < poolDebug.ranges.size(); ++j) {
-				auto& a = poolDebug.ranges[i];
-				auto& b = poolDebug.ranges[j];
-				const uint64_t overlapStart = std::max(a.startByte, b.startByte);
-				const uint64_t overlapEnd = std::min(a.endByte, b.endByte);
-				if (overlapStart < overlapEnd) {
-					a.overlapsByteRange = true;
-					b.overlapsByteRange = true;
-				}
-			}
+		if (buildAliasDebug) {
+			MarkDebugOverlappingRanges(poolDebug.ranges);
+			autoAliasPoolDebug.push_back(std::move(poolDebug));
 		}
-
-		autoAliasPoolDebug.push_back(std::move(poolDebug));
 	}
 
 	for (AliasResourceIndex resourceIndex : dedicatedSchedulingCandidateIndices) {
@@ -1693,9 +1708,11 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 		});
 	}
 
-	std::sort(autoAliasPoolDebug.begin(), autoAliasPoolDebug.end(), [](const AutoAliasPoolDebug& a, const AutoAliasPoolDebug& b) {
-		return a.poolID < b.poolID;
-		});
+	if (buildAliasDebug) {
+		std::sort(autoAliasPoolDebug.begin(), autoAliasPoolDebug.end(), [](const AutoAliasPoolDebug& a, const AutoAliasPoolDebug& b) {
+			return a.poolID < b.poolID;
+			});
+	}
 
 	if (aliasPoolRetireIdleFrames > 0) {
 		for (auto itPool = persistentAliasPools.begin(); itPool != persistentAliasPools.end(); ) {
