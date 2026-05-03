@@ -387,7 +387,6 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 					b.DeclaredResourceIds().size());
 			}
 			par.resources.staticResourceRequirements = b.GatherResourceRequirements();
-			par.resources.frameResourceRequirements = par.resources.staticResourceRequirements;
 			par.resources.internalTransitions = b.params.internalTransitions;
 			par.resources.identifierSet = b.DeclaredResourceIds();
 			par.resources.autoDescriptorShaderResources = b.params.autoDescriptorShaderResources;
@@ -458,7 +457,6 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 					b.DeclaredResourceIds().size());
 			}
 			par.resources.staticResourceRequirements = b.GatherResourceRequirements();
-			par.resources.frameResourceRequirements = par.resources.staticResourceRequirements;
 			par.resources.internalTransitions = b.params.internalTransitions;
 			par.resources.identifierSet = b.DeclaredResourceIds();
 			par.resources.autoDescriptorShaderResources = b.params.autoDescriptorShaderResources;
@@ -528,7 +526,6 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 					b.DeclaredResourceIds().size());
 			}
 			par.resources.staticResourceRequirements = b.GatherResourceRequirements();
-			par.resources.frameResourceRequirements = par.resources.staticResourceRequirements;
 			par.resources.internalTransitions = b.params.internalTransitions;
 			par.resources.identifierSet = b.DeclaredResourceIds();
 			par.resources.preferredQueueKind = ResolveExternalPreferredQueueKind(d);
@@ -660,13 +657,14 @@ void RenderGraph::WriteCompiledGraphDebugDump(uint8_t frameIndex, const std::vec
 			if constexpr (requires { resources.isGeometryPass; }) {
 				dump << " geometry_pass=" << (resources.isGeometryPass ? "true" : "false");
 			}
-			dump << " declared_requirements=" << resources.frameResourceRequirements.size()
+			dump << " declared_requirements=" << GetFrameRequirementCount(resources)
 				 << " internal_transitions=" << resources.internalTransitions.size()
 				 << "\n";
 
-			if (!resources.frameResourceRequirements.empty()) {
+			const auto frameRequirements = GetFrameRequirementsSpan(resources);
+			if (!frameRequirements.empty()) {
 				dump << "  requirements:\n";
-				for (const auto& req : resources.frameResourceRequirements) {
+				for (const auto& req : frameRequirements) {
 					dump << "    - " << resourceLabelForHandle(req.resourceHandleAndRange.resource)
 						 << " range=" << FormatRangeSpec(req.resourceHandleAndRange.range)
 						 << " access=" << rhi::helpers::ResourceAccessMaskToString(req.state.access)
@@ -1223,17 +1221,17 @@ RenderGraph::PassView RenderGraph::GetPassView(const AnyPassAndResources& pr) {
 	PassView v{};
 	if (pr.type == PassType::Compute) {
 		const auto& p = std::get<ComputePassAndResources>(pr.pass);
-		v.reqs = &p.resources.frameResourceRequirements;
+		v.reqs = GetFrameRequirementsSpan(p.resources);
 		v.internalTransitions = &p.resources.internalTransitions;
 	}
 	else if (pr.type == PassType::Render) {
 		const auto& p = std::get<RenderPassAndResources>(pr.pass);
-		v.reqs = &p.resources.frameResourceRequirements;
+		v.reqs = GetFrameRequirementsSpan(p.resources);
 		v.internalTransitions = &p.resources.internalTransitions;
 	}
 	else if (pr.type == PassType::Copy) {
 		const auto& p = std::get<CopyPassAndResources>(pr.pass);
-		v.reqs = &p.resources.frameResourceRequirements;
+		v.reqs = GetFrameRequirementsSpan(p.resources);
 		v.internalTransitions = &p.resources.internalTransitions;
 	}
 	return v;
@@ -1255,8 +1253,8 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 		summary.queueAssignmentPolicy = DefaultQueueAssignmentPolicy(pass.type);
 
 		PassView view = GetPassView(pass);
-		if (view.reqs) {
-			summary.requirementSummaries.reserve(view.reqs->size());
+		if (!view.reqs.empty()) {
+			summary.requirementSummaries.reserve(view.reqs.size());
 		}
 		if (view.internalTransitions) {
 			summary.internalTransitionSummaries.reserve(view.internalTransitions->size());
@@ -1281,8 +1279,8 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 			summary.pinnedQueueSlot = passResources.pinnedQueueSlot;
 		}
 
-		if (view.reqs) {
-			for (const auto& req : *view.reqs) {
+		if (!view.reqs.empty()) {
+			for (const auto& req : view.reqs) {
 				const auto resource = req.resourceHandleAndRange.resource;
 				const uint64_t resourceID = resource.GetGlobalResourceID();
 				const bool isWrite = AccessTypeIsWriteType(req.state.access);
@@ -2467,11 +2465,11 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 			for (size_t qi = 0; qi < queueCount; ++qi) {
 				for (auto& passVariant : batch.Passes(qi)) {
 					std::visit([&](const auto* passEntry) {
-						for (auto& req : passEntry->resources.frameResourceRequirements) {
+						ForEachFrameRequirement(passEntry->resources, [&](const auto& req) {
 							if (AccessTypeIsWriteType(req.state.access)) {
 								crossFrameProducer[qi][req.resourceHandleAndRange.resource.GetGlobalResourceID()] = bi;
 							}
-						}
+						});
 					}, passVariant);
 				}
 			}
@@ -3788,9 +3786,9 @@ void RenderGraph::CollectFrameResourceIDs(std::unordered_set<uint64_t>& used) co
 		std::visit([&](auto const& passAndResources) {
 			using T = std::decay_t<decltype(passAndResources)>;
 			if constexpr (!std::is_same_v<T, std::monostate>) {
-				for (auto const& req : passAndResources.resources.frameResourceRequirements) {
+				ForEachFrameRequirement(passAndResources.resources, [&](const auto& req) {
 					used.insert(req.resourceHandleAndRange.resource.GetGlobalResourceID());
-				}
+				});
 				for (auto const& t : passAndResources.resources.internalTransitions) {
 					used.insert(t.first.resource.GetGlobalResourceID());
 				}
@@ -4379,8 +4377,8 @@ static bool Overlap(SubresourceRange a, SubresourceRange b) {
 }
 
 static bool RequirementsConflict(
-	std::vector<ResourceRequirement> const& retained,
-	std::vector<ResourceRequirement> const& immediate)
+	std::span<const ResourceRequirement> retained,
+	std::span<const ResourceRequirement> immediate)
 {
 	if (retained.empty() || immediate.empty()) return false;
 
@@ -4442,6 +4440,7 @@ void RenderGraph::RefreshRetainedDeclarationsForFrame(RenderPassAndResources& p,
 
 	// Update the frame view used by scheduling
 	p.resources.staticResourceRequirements = b.GatherResourceRequirements();
+	p.resources.mergedFrameRequirementsDirty = true;
 
 	// Internal transitions also affect scheduling
 	p.resources.internalTransitions = b.params.internalTransitions;
@@ -4501,6 +4500,7 @@ void RenderGraph::RefreshRetainedDeclarationsForFrame(ComputePassAndResources& p
 	}
 
 	p.resources.staticResourceRequirements = b.GatherResourceRequirements();
+	p.resources.mergedFrameRequirementsDirty = true;
 	p.resources.internalTransitions = b.params.internalTransitions;
 	p.resources.identifierSet = b.DeclaredResourceIds();
 	p.resources.autoDescriptorShaderResources = b.params.autoDescriptorShaderResources;
@@ -4557,6 +4557,7 @@ void RenderGraph::RefreshRetainedDeclarationsForFrame(CopyPassAndResources& p, u
 	}
 
 	p.resources.staticResourceRequirements = b.GatherResourceRequirements();
+	p.resources.mergedFrameRequirementsDirty = true;
 	p.resources.internalTransitions = b.params.internalTransitions;
 	p.resources.identifierSet = b.DeclaredResourceIds();
 	if (traceLifecycle) {
@@ -4654,7 +4655,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			if (pr.type == PassType::Compute) {
 				auto& p = std::get<ComputePassAndResources>(pr.pass);
 				p.immediateBytecode.clear();
-				p.resources.frameResourceRequirements = {};// p.resources.staticResourceRequirements;
+				ClearImmediateFrameRequirements(p.resources);
 				if (needsRefresh(p)) {
 					RefreshRetainedDeclarationsForFrame(p, frameIndex);
 				}
@@ -4662,7 +4663,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			else if (pr.type == PassType::Render) {
 				auto& p = std::get<RenderPassAndResources>(pr.pass);
 				p.immediateBytecode.clear();
-				p.resources.frameResourceRequirements = {};// p.resources.staticResourceRequirements;
+				ClearImmediateFrameRequirements(p.resources);
 				if (needsRefresh(p)) {
 					RefreshRetainedDeclarationsForFrame(p, frameIndex);
 				}
@@ -4670,7 +4671,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			else if (pr.type == PassType::Copy) {
 				auto& p = std::get<CopyPassAndResources>(pr.pass);
 				p.immediateBytecode.clear();
-				p.resources.frameResourceRequirements = {};
+				ClearImmediateFrameRequirements(p.resources);
 				if (needsRefresh(p)) {
 					RefreshRetainedDeclarationsForFrame(p, frameIndex);
 				}
@@ -4685,6 +4686,37 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		m_framePasses.clear(); // Combined retained + immediate-mode passes for this frame
 	}
 
+	ImmediateExecutionContext renderImmediateContext{ device,
+		{rg::imm::ImmediatePassKind::Render,
+		m_immediateDispatch,
+		&ResolveByIdThunk,
+		&ResolveByPtrThunk,
+		this},
+		frameIndex,
+		hostData };
+	ImmediateExecutionContext computeImmediateContext{ device,
+		{rg::imm::ImmediatePassKind::Compute,
+		m_immediateDispatch,
+		&ResolveByIdThunk,
+		&ResolveByPtrThunk,
+		this},
+		frameIndex,
+		hostData };
+	ImmediateExecutionContext copyImmediateContext{ device,
+		{rg::imm::ImmediatePassKind::Copy,
+		m_immediateDispatch,
+		&ResolveByIdThunk,
+		&ResolveByPtrThunk,
+		this},
+		frameIndex,
+		hostData };
+	auto prepareImmediateContext = [&](ImmediateExecutionContext& context) -> ImmediateExecutionContext& {
+		context.frameIndex = frameIndex;
+		context.hostData = hostData;
+		context.list.Reset();
+		return context;
+	};
+
 	// Record immediate-mode commands + access for each pass and fold into per-frame requirements
 	for (auto& pr : m_masterPassList) {
 
@@ -4693,17 +4725,10 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 
 			// reset per-frame
 			p.immediateBytecode.clear();
-			p.resources.frameResourceRequirements = p.resources.staticResourceRequirements;
+			p.immediateKeepAlive.reset();
+			ClearImmediateFrameRequirements(p.resources);
 
-			ImmediateExecutionContext c{ device,
-				{rg::imm::ImmediatePassKind::Compute,
-				m_immediateDispatch,
-				&ResolveByIdThunk,
-				&ResolveByPtrThunk,
-				this},
-				frameIndex,
-				hostData
-			};
+			auto& c = prepareImmediateContext(computeImmediateContext);
 
 			// Record immediate-mode commands
 			{
@@ -4720,21 +4745,26 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				}
 			}
 
+			if (!c.list.HasRecordedWork()) {
+				p.run = PassRunMask::Retained;
+				m_framePasses.push_back(pr);
+				continue;
+			}
+
 			auto immediateFrameData = c.list.Finalize();
 			// If there is a conflict between retained and immediate requirements, split the pass
 			bool conflict = RequirementsConflict(
-				p.resources.frameResourceRequirements,   // baseline retained for this frame
+				p.resources.staticResourceRequirements,
 				immediateFrameData.requirements);
 			if (conflict) {
 				// Create new PassAndResources for the immediate requirements
 				ComputePassAndResources immediatePassAndResources;
 				immediatePassAndResources.pass = p.pass;
-				immediatePassAndResources.resources.staticResourceRequirements = immediateFrameData.requirements;
-				immediatePassAndResources.resources.frameResourceRequirements = immediateFrameData.requirements;
+				SetImmediateFrameRequirements(immediatePassAndResources.resources, std::move(immediateFrameData.requirements));
 				immediatePassAndResources.resources.preferredQueueKind = p.resources.preferredQueueKind;
 				immediatePassAndResources.resources.pinnedQueueSlot = p.resources.pinnedQueueSlot;
 				immediatePassAndResources.immediateBytecode = std::move(immediateFrameData.bytecode);
-				immediatePassAndResources.immediateKeepAlive = std::move(p.immediateKeepAlive);
+				immediatePassAndResources.immediateKeepAlive = std::move(immediateFrameData.keepAlive);
 				immediatePassAndResources.run = PassRunMask::Immediate;
 				AnyPassAndResources immediateAnyPassAndResources;
 				immediateAnyPassAndResources.type = PassType::Compute;
@@ -4746,10 +4776,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			else {
 				p.immediateBytecode = std::move(immediateFrameData.bytecode);
 				p.immediateKeepAlive = std::move(immediateFrameData.keepAlive);
-				p.resources.frameResourceRequirements.insert(
-					p.resources.frameResourceRequirements.end(),
-					immediateFrameData.requirements.begin(),
-					immediateFrameData.requirements.end());
+				SetImmediateFrameRequirements(p.resources, std::move(immediateFrameData.requirements));
 				p.run = p.immediateBytecode.empty() ? PassRunMask::Retained : PassRunMask::Both;
 				m_framePasses.push_back(pr);
 			}
@@ -4758,17 +4785,10 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			auto& p = std::get<RenderPassAndResources>(pr.pass);
 
 			p.immediateBytecode.clear();
-			p.resources.frameResourceRequirements = p.resources.staticResourceRequirements;
+			p.immediateKeepAlive.reset();
+			ClearImmediateFrameRequirements(p.resources);
 
-			ImmediateExecutionContext c{ device,
-				{rg::imm::ImmediatePassKind::Render,
-				m_immediateDispatch,
-				&ResolveByIdThunk,
-				&ResolveByPtrThunk,
-				this},
-				frameIndex,
-				hostData
-			};
+			auto& c = prepareImmediateContext(renderImmediateContext);
 			{
 				ZoneScopedN("RenderGraph::CompileFrame::RecordImmediateCommands");
 				if (!p.name.empty()) {
@@ -4782,22 +4802,26 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 					spdlog::info("RG frame {} render pass '{}' RecordImmediateCommands complete", frameIndex, p.name);
 				}
 			}
+			if (!c.list.HasRecordedWork()) {
+				p.run = PassRunMask::Retained;
+				m_framePasses.push_back(pr);
+				continue;
+			}
 			auto immediateFrameData = c.list.Finalize();
 
 			bool conflict = RequirementsConflict(
-				p.resources.frameResourceRequirements,   // baseline retained for this frame
+				p.resources.staticResourceRequirements,
 				immediateFrameData.requirements);
 
 			if (conflict) {
 				// Create new PassAndResources for the immediate requirements
 				RenderPassAndResources immediatePassAndResources;
 				immediatePassAndResources.pass = p.pass;
-				immediatePassAndResources.resources.staticResourceRequirements = immediateFrameData.requirements;
-				immediatePassAndResources.resources.frameResourceRequirements = immediateFrameData.requirements;
+				SetImmediateFrameRequirements(immediatePassAndResources.resources, std::move(immediateFrameData.requirements));
 				immediatePassAndResources.resources.preferredQueueKind = p.resources.preferredQueueKind;
 				immediatePassAndResources.resources.pinnedQueueSlot = p.resources.pinnedQueueSlot;
 				immediatePassAndResources.immediateBytecode = std::move(immediateFrameData.bytecode);
-				immediatePassAndResources.immediateKeepAlive = std::move(p.immediateKeepAlive);
+				immediatePassAndResources.immediateKeepAlive = std::move(immediateFrameData.keepAlive);
 				immediatePassAndResources.run = PassRunMask::Immediate;
 				AnyPassAndResources immediateAnyPassAndResources;
 				immediateAnyPassAndResources.type = PassType::Render;
@@ -4809,10 +4833,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			else {
 				p.immediateBytecode = std::move(immediateFrameData.bytecode);
 				p.immediateKeepAlive = std::move(immediateFrameData.keepAlive);
-				p.resources.frameResourceRequirements.insert(
-					p.resources.frameResourceRequirements.end(),
-					immediateFrameData.requirements.begin(),
-					immediateFrameData.requirements.end());
+				SetImmediateFrameRequirements(p.resources, std::move(immediateFrameData.requirements));
 				p.run = p.immediateBytecode.empty() ? PassRunMask::Retained : PassRunMask::Both;
 				m_framePasses.push_back(pr);
 			}
@@ -4821,17 +4842,10 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			auto& p = std::get<CopyPassAndResources>(pr.pass);
 
 			p.immediateBytecode.clear();
-			p.resources.frameResourceRequirements = p.resources.staticResourceRequirements;
+			p.immediateKeepAlive.reset();
+			ClearImmediateFrameRequirements(p.resources);
 
-			ImmediateExecutionContext c{ device,
-				{rg::imm::ImmediatePassKind::Copy,
-				m_immediateDispatch,
-				&ResolveByIdThunk,
-				&ResolveByPtrThunk,
-				this},
-				frameIndex,
-				hostData
-			};
+			auto& c = prepareImmediateContext(copyImmediateContext);
 
 			{
 				ZoneScopedN("RenderGraph::CompileFrame::RecordImmediateCommands");
@@ -4846,21 +4860,25 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 					spdlog::info("RG frame {} copy pass '{}' RecordImmediateCommands complete", frameIndex, p.name);
 				}
 			}
+			if (!c.list.HasRecordedWork()) {
+				p.run = PassRunMask::Retained;
+				m_framePasses.push_back(pr);
+				continue;
+			}
 			auto immediateFrameData = c.list.Finalize();
 
 			bool conflict = RequirementsConflict(
-				p.resources.frameResourceRequirements,
+				p.resources.staticResourceRequirements,
 				immediateFrameData.requirements);
 
 			if (conflict) {
 				CopyPassAndResources immediatePassAndResources;
 				immediatePassAndResources.pass = p.pass;
-				immediatePassAndResources.resources.staticResourceRequirements = immediateFrameData.requirements;
-				immediatePassAndResources.resources.frameResourceRequirements = immediateFrameData.requirements;
+				SetImmediateFrameRequirements(immediatePassAndResources.resources, std::move(immediateFrameData.requirements));
 				immediatePassAndResources.resources.preferredQueueKind = p.resources.preferredQueueKind;
 				immediatePassAndResources.resources.pinnedQueueSlot = p.resources.pinnedQueueSlot;
 				immediatePassAndResources.immediateBytecode = std::move(immediateFrameData.bytecode);
-				immediatePassAndResources.immediateKeepAlive = std::move(p.immediateKeepAlive);
+				immediatePassAndResources.immediateKeepAlive = std::move(immediateFrameData.keepAlive);
 				immediatePassAndResources.run = PassRunMask::Immediate;
 				AnyPassAndResources immediateAnyPassAndResources;
 				immediateAnyPassAndResources.type = PassType::Copy;
@@ -4872,10 +4890,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			else {
 				p.immediateBytecode = std::move(immediateFrameData.bytecode);
 				p.immediateKeepAlive = std::move(immediateFrameData.keepAlive);
-				p.resources.frameResourceRequirements.insert(
-					p.resources.frameResourceRequirements.end(),
-					immediateFrameData.requirements.begin(),
-					immediateFrameData.requirements.end());
+				SetImmediateFrameRequirements(p.resources, std::move(immediateFrameData.requirements));
 				p.run = p.immediateBytecode.empty() ? PassRunMask::Retained : PassRunMask::Both;
 				m_framePasses.push_back(pr);
 			}
@@ -4904,17 +4919,10 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			if (pr.type == PassType::Compute) {
 				auto& p = std::get<ComputePassAndResources>(pr.pass);
 				p.immediateBytecode.clear();
-				p.resources.frameResourceRequirements = p.resources.staticResourceRequirements;
+				p.immediateKeepAlive.reset();
+				ClearImmediateFrameRequirements(p.resources);
 
-				ImmediateExecutionContext c{ device,
-					{rg::imm::ImmediatePassKind::Compute,
-					m_immediateDispatch,
-					&ResolveByIdThunk,
-					&ResolveByPtrThunk,
-					this},
-					frameIndex,
-					hostData
-				};
+				auto& c = prepareImmediateContext(computeImmediateContext);
 
 				{
 					ZoneScopedN("RenderGraph::CompileFrame::RecordImmediateCommands");
@@ -4929,29 +4937,23 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 						spdlog::info("RG frame {} compute pass '{}' RecordImmediateCommands complete", frameIndex, p.name);
 					}
 				}
+				if (!c.list.HasRecordedWork()) {
+					p.run = PassRunMask::Retained;
+					return;
+				}
 				auto immediateFrameData = c.list.Finalize();
 				p.immediateBytecode = std::move(immediateFrameData.bytecode);
 				p.immediateKeepAlive = std::move(immediateFrameData.keepAlive);
-				p.resources.frameResourceRequirements.insert(
-					p.resources.frameResourceRequirements.end(),
-					immediateFrameData.requirements.begin(),
-					immediateFrameData.requirements.end());
+				SetImmediateFrameRequirements(p.resources, std::move(immediateFrameData.requirements));
 				p.run = p.immediateBytecode.empty() ? PassRunMask::Retained : PassRunMask::Both;
 			}
 			else if (pr.type == PassType::Copy) {
 				auto& p = std::get<CopyPassAndResources>(pr.pass);
 				p.immediateBytecode.clear();
-				p.resources.frameResourceRequirements = p.resources.staticResourceRequirements;
+				p.immediateKeepAlive.reset();
+				ClearImmediateFrameRequirements(p.resources);
 
-				ImmediateExecutionContext c{ device,
-					{rg::imm::ImmediatePassKind::Copy,
-					m_immediateDispatch,
-					&ResolveByIdThunk,
-					&ResolveByPtrThunk,
-					this},
-					frameIndex,
-					hostData
-				};
+				auto& c = prepareImmediateContext(copyImmediateContext);
 
 				{
 					ZoneScopedN("RenderGraph::CompileFrame::RecordImmediateCommands");
@@ -4966,29 +4968,23 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 						spdlog::info("RG frame {} copy pass '{}' RecordImmediateCommands complete", frameIndex, p.name);
 					}
 				}
+				if (!c.list.HasRecordedWork()) {
+					p.run = PassRunMask::Retained;
+					return;
+				}
 				auto immediateFrameData = c.list.Finalize();
 				p.immediateBytecode = std::move(immediateFrameData.bytecode);
 				p.immediateKeepAlive = std::move(immediateFrameData.keepAlive);
-				p.resources.frameResourceRequirements.insert(
-					p.resources.frameResourceRequirements.end(),
-					immediateFrameData.requirements.begin(),
-					immediateFrameData.requirements.end());
+				SetImmediateFrameRequirements(p.resources, std::move(immediateFrameData.requirements));
 				p.run = p.immediateBytecode.empty() ? PassRunMask::Retained : PassRunMask::Both;
 			}
 			else {
 				auto& p = std::get<RenderPassAndResources>(pr.pass);
 				p.immediateBytecode.clear();
-				p.resources.frameResourceRequirements = p.resources.staticResourceRequirements;
+				p.immediateKeepAlive.reset();
+				ClearImmediateFrameRequirements(p.resources);
 
-				ImmediateExecutionContext c{ device,
-					{rg::imm::ImmediatePassKind::Render,
-					m_immediateDispatch,
-					&ResolveByIdThunk,
-					&ResolveByPtrThunk,
-					this},
-					frameIndex,
-					hostData
-				};
+				auto& c = prepareImmediateContext(renderImmediateContext);
 
 				{
 					ZoneScopedN("RenderGraph::CompileFrame::RecordImmediateCommands");
@@ -5003,13 +4999,14 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 						spdlog::info("RG frame {} render pass '{}' RecordImmediateCommands complete", frameIndex, p.name);
 					}
 				}
+				if (!c.list.HasRecordedWork()) {
+					p.run = PassRunMask::Retained;
+					return;
+				}
 				auto immediateFrameData = c.list.Finalize();
 				p.immediateBytecode = std::move(immediateFrameData.bytecode);
 				p.immediateKeepAlive = std::move(immediateFrameData.keepAlive);
-				p.resources.frameResourceRequirements.insert(
-					p.resources.frameResourceRequirements.end(),
-					immediateFrameData.requirements.begin(),
-					immediateFrameData.requirements.end());
+				SetImmediateFrameRequirements(p.resources, std::move(immediateFrameData.requirements));
 				p.run = p.immediateBytecode.empty() ? PassRunMask::Retained : PassRunMask::Both;
 			}
 		};
@@ -5397,9 +5394,9 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 					const size_t passQueueSlot = passIndex < m_assignedQueueSlotsByFramePass.size()
 						? m_assignedQueueSlotsByFramePass[passIndex]
 						: fallbackQueueSlot;
-					for (auto const& req : passAndResources.resources.frameResourceRequirements) {
+					ForEachFrameRequirement(passAndResources.resources, [&](const auto& req) {
 						accumulateCrossFrameWaitForHandle(passQueueSlot, req.resourceHandleAndRange.resource);
-					}
+					});
 					for (auto const& tr : passAndResources.resources.internalTransitions) {
 						accumulateCrossFrameWaitForHandle(passQueueSlot, tr.first.resource);
 					}
@@ -5862,8 +5859,9 @@ std::tuple<int, int, int> RenderGraph::GetBatchesToWaitOn(
 		}
 		};
 
-	for (auto const& req : pass.resources.frameResourceRequirements)
+	ForEachFrameRequirement(pass.resources, [&](const auto& req) {
 		processResource(req.resourceHandleAndRange.resource);
+	});
 
 	for (auto& transitionID : resourcesTransitionedThisPass) { // We only need to wait on the latest usage for resources that will be transitioned in this batch
 		for (auto rid : GetSchedulingEquivalentIDsCached(transitionID)) {
@@ -5901,8 +5899,9 @@ std::tuple<int, int, int> RenderGraph::GetBatchesToWaitOn(
 		}
 		};
 
-	for (auto const& req : pass.resources.frameResourceRequirements)
+	ForEachFrameRequirement(pass.resources, [&](const auto& req) {
 		processResource(req.resourceHandleAndRange.resource);
+	});
 
 	for (auto& transitionID : resourcesTransitionedThisPass) { // We only need to wait on the latest usage for resources that will be transitioned in this batch
 		for (auto rid : GetSchedulingEquivalentIDsCached(transitionID)) {
@@ -5940,8 +5939,9 @@ std::tuple<int, int, int> RenderGraph::GetBatchesToWaitOn(
 		}
 		};
 
-	for (auto const& req : pass.resources.frameResourceRequirements)
+	ForEachFrameRequirement(pass.resources, [&](const auto& req) {
 		processResource(req.resourceHandleAndRange.resource);
+	});
 
 	for (auto& transitionID : resourcesTransitionedThisPass) {
 		for (auto rid : GetSchedulingEquivalentIDsCached(transitionID)) {
@@ -6099,27 +6099,27 @@ void RenderGraph::MaterializeUnmaterializedResources(const std::unordered_set<ui
 	for (const auto& pr : m_framePasses) {
 		if (pr.type == PassType::Compute) {
 			auto const& p = std::get<ComputePassAndResources>(pr.pass);
-			for (auto const& req : p.resources.frameResourceRequirements) {
+			ForEachFrameRequirement(p.resources, [&](const auto& req) {
 				collectFromHandle(req.resourceHandleAndRange.resource);
-			}
+			});
 			for (auto const& t : p.resources.internalTransitions) {
 				collectFromHandle(t.first.resource);
 			}
 		}
 		else if (pr.type == PassType::Render) {
 			auto const& p = std::get<RenderPassAndResources>(pr.pass);
-			for (auto const& req : p.resources.frameResourceRequirements) {
+			ForEachFrameRequirement(p.resources, [&](const auto& req) {
 				collectFromHandle(req.resourceHandleAndRange.resource);
-			}
+			});
 			for (auto const& t : p.resources.internalTransitions) {
 				collectFromHandle(t.first.resource);
 			}
 		}
 		else if (pr.type == PassType::Copy) {
 			auto const& p = std::get<CopyPassAndResources>(pr.pass);
-			for (auto const& req : p.resources.frameResourceRequirements) {
+			ForEachFrameRequirement(p.resources, [&](const auto& req) {
 				collectFromHandle(req.resourceHandleAndRange.resource);
-			}
+			});
 			for (auto const& t : p.resources.internalTransitions) {
 				collectFromHandle(t.first.resource);
 			}

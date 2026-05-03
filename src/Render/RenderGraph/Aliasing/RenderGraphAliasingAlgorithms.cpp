@@ -2057,7 +2057,7 @@ void rg::alias::RenderGraphAliasingSubsystem::ApplyAliasQueueSynchronization(Ren
 		}
 		usageByResourceID.reserve(queuedPassCount);
 
-		auto accumulateFromReqs = [&](const std::vector<ResourceRequirement>& reqs, size_t slot) {
+		auto accumulateFromReqs = [&](std::span<const ResourceRequirement> reqs, size_t slot) {
 			for (auto const& req : reqs) {
 				const uint64_t resourceID = req.resourceHandleAndRange.resource.GetGlobalResourceID();
 				if (!rg.TryGetAliasPlacementRange(resourceID)) {
@@ -2088,7 +2088,7 @@ void rg::alias::RenderGraphAliasingSubsystem::ApplyAliasQueueSynchronization(Ren
 		auto accumulateFromQueuedPass = [&](const RenderGraph::PassBatch::QueuedPass& queuedPass, size_t slot) {
 			std::visit(
 				[&](auto const* pass) {
-					accumulateFromReqs(pass->resources.frameResourceRequirements, slot);
+					accumulateFromReqs(GetFrameRequirementsSpan(pass->resources), slot);
 					accumulateFromInternalTransitions(pass->resources.internalTransitions, slot);
 				},
 				queuedPass);

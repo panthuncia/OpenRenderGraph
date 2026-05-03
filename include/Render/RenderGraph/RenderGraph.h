@@ -1246,7 +1246,7 @@ private:
 
 	struct PassView {
 		bool isCompute = false;
-		const std::vector<ResourceRequirement>* reqs = nullptr;
+		std::span<const ResourceRequirement> reqs{};
 		const std::vector<std::pair<ResourceHandleAndRange, ResourceState>>* internalTransitions = nullptr;
 	};
 
