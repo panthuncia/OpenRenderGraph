@@ -98,6 +98,10 @@ namespace {
 		return static_cast<size_t>(queue);
 	}
 
+	bool StatesExactlyEqual(const ResourceState& lhs, const ResourceState& rhs);
+	bool IsWholeResourceRange(const RangeSpec& range, ResourceRegistry::RegistryHandle resource);
+	bool TryGetWholeResourceTrackerState(const SymbolicTracker& tracker, ResourceState& outState);
+
 	constexpr QueueKind DefaultPreferredQueueKind(RenderGraph::PassType type) noexcept {
 		switch (type) {
 		case RenderGraph::PassType::Render:
@@ -1883,6 +1887,15 @@ void RenderGraph::CommitPassToBatch(
 				denseTransition.resourceID);
 			pRes = compileResourceState.resource ? compileResourceState.resource : pRes;
 			compileResourceState.tracker.Apply(exit.first.range, pRes, exit.second, ignoredTransitions);
+			if (IsWholeResourceRange(exit.first.range, exit.first.resource)) {
+				compileResourceState.fastState.valid = true;
+				compileResourceState.fastState.wholeResourceOnly = true;
+				compileResourceState.fastState.state = exit.second;
+			}
+			else {
+				compileResourceState.fastState.valid = false;
+				compileResourceState.fastState.wholeResourceOnly = false;
+			}
 			SortedInsert(currentBatch.internallyTransitionedResources, denseTransition.resourceID);
 		}
 	};
@@ -2509,6 +2522,7 @@ void RenderGraph::AddTransition(
 	auto* pRes = resource.IsEphemeral() ? resource.GetEphemeralPtr() : _registry.Resolve(resource); // TODO: Can we get rid of pRes in transitions?
 	auto& compileResourceState = GetOrCreateFrameCompileResourceState(requirement.resourceIndex, pRes, resource.GetGlobalResourceID());
 	pRes = compileResourceState.resource ? compileResourceState.resource : pRes;
+	auto& fastState = compileResourceState.fastState;
 	if (pRes && !pRes->GetName().empty()) {
 		ZoneText(pRes->GetName().data(), pRes->GetName().size());
 	}
@@ -2535,6 +2549,7 @@ void RenderGraph::AddTransition(
 		++debugStats->callCount;
 	}
 	auto& compileTracker = compileResourceState.tracker;
+	const bool isWholeResourceRequirement = IsWholeResourceRange(requirement.range, resource);
 
 	bool isAliasActivation = false;
 	if (aliasActivationPending.find(resource.GetGlobalResourceID()) != aliasActivationPending.end()) {
@@ -2573,7 +2588,28 @@ void RenderGraph::AddTransition(
 		aliasActivationPending.erase(resource.GetGlobalResourceID());
 	}
 	else {
+		if (fastState.valid
+			&& fastState.wholeResourceOnly
+			&& isWholeResourceRequirement
+			&& StatesExactlyEqual(fastState.state, requiredState)) {
+			currentBatch.passBatchTrackersByResourceIndex[requirement.resourceIndex] = &compileTracker;
+			if (debugStats) {
+				++debugStats->noOpCallCount;
+			}
+			return;
+		}
+
 		compileTracker.Apply(requirement.range, pRes, requiredState, transitions);
+	}
+
+	if (isWholeResourceRequirement) {
+		fastState.valid = true;
+		fastState.wholeResourceOnly = true;
+		fastState.state = requiredState;
+	}
+	else {
+		fastState.valid = false;
+		fastState.wholeResourceOnly = false;
 	}
 
 	if (debugStats) {
@@ -2901,6 +2937,45 @@ bool HasLiveCompileResourceBacking(Resource* resource) {
 	return true;
 }
 
+bool StatesExactlyEqual(const ResourceState& lhs, const ResourceState& rhs) {
+	return lhs.access == rhs.access
+		&& lhs.layout == rhs.layout
+		&& lhs.sync == rhs.sync;
+}
+
+bool IsWholeResourceRange(const RangeSpec& range, ResourceRegistry::RegistryHandle resource) {
+	const uint32_t totalMips = resource.GetNumMipLevels();
+	const uint32_t totalSlices = resource.GetArraySize();
+	if (totalMips == 0 || totalSlices == 0) {
+		return false;
+	}
+
+	const SubresourceRange resolved = ResolveRangeSpec(range, totalMips, totalSlices);
+	return !resolved.isEmpty()
+		&& resolved.firstMip == 0
+		&& resolved.mipCount == totalMips
+		&& resolved.firstSlice == 0
+		&& resolved.sliceCount == totalSlices;
+}
+
+bool TryGetWholeResourceTrackerState(const SymbolicTracker& tracker, ResourceState& outState) {
+	const auto& segments = tracker.GetSegments();
+	if (segments.size() != 1) {
+		return false;
+	}
+
+	const auto& segment = segments.front();
+	if (segment.rangeSpec.mipLower.type != BoundType::All
+		|| segment.rangeSpec.mipUpper.type != BoundType::All
+		|| segment.rangeSpec.sliceLower.type != BoundType::All
+		|| segment.rangeSpec.sliceUpper.type != BoundType::All) {
+		return false;
+	}
+
+	outState = segment.state;
+	return true;
+}
+
 SymbolicTracker SeedCompileTrackerFromLiveResource(Resource* resource) {
 	SymbolicTracker seed{};
 	if (HasLiveCompileResourceBacking(resource)) {
@@ -2930,6 +3005,8 @@ RenderGraph::FrameCompileResourceState& RenderGraph::GetOrCreateFrameCompileReso
 	if (!entry.trackerInitialized) {
 		entry.tracker = SeedCompileTrackerFromLiveResource(entry.resource);
 		entry.trackerInitialized = true;
+		entry.fastState.valid = TryGetWholeResourceTrackerState(entry.tracker, entry.fastState.state);
+		entry.fastState.wholeResourceOnly = entry.fastState.valid;
 	}
 	return entry;
 }
@@ -2951,6 +3028,8 @@ void RenderGraph::RebuildFrameCompileResources() {
 		}
 		entry.tracker = SeedCompileTrackerFromLiveResource(entry.resource);
 		entry.trackerInitialized = true;
+		entry.fastState.valid = TryGetWholeResourceTrackerState(entry.tracker, entry.fastState.state);
+		entry.fastState.wholeResourceOnly = entry.fastState.valid;
 	}
 }
 

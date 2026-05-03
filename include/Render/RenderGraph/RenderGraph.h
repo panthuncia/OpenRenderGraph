@@ -734,10 +734,17 @@ private:
 	};
 
 	struct FrameCompileResourceState {
+		struct FastStateShadow {
+			bool valid = false;
+			bool wholeResourceOnly = false;
+			ResourceState state{};
+		};
+
 		uint64_t resourceID = 0;
 		Resource* resource = nullptr;
 		SymbolicTracker tracker;
 		bool trackerInitialized = false;
+		FastStateShadow fastState{};
 	};
 
 	struct BatchBuildState {
