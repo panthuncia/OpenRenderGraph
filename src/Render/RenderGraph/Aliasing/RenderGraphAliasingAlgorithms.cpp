@@ -497,67 +497,6 @@ namespace {
 		return static_cast<uint64_t>(signature);
 	}
 
-	struct AliasTopoMetadata {
-		std::vector<size_t> passTopoRank;
-		std::vector<uint32_t> passCriticality;
-		uint32_t maxCriticality = 1;
-		bool valid = false;
-	};
-
-	AliasTopoMetadata BuildAliasTopoMetadata(const std::vector<rg::alias::AliasSchedulingNode>& nodes, size_t passCount) {
-		AliasTopoMetadata metadata{};
-		metadata.passTopoRank.assign(passCount, 0);
-		metadata.passCriticality.assign(passCount, 0);
-
-		std::vector<size_t> indeg(nodes.size(), 0);
-		for (size_t i = 0; i < nodes.size(); ++i) {
-			indeg[i] = nodes[i].indegree;
-		}
-
-		std::vector<size_t> ready;
-		ready.reserve(nodes.size());
-		for (size_t i = 0; i < nodes.size(); ++i) {
-			if (indeg[i] == 0) {
-				ready.push_back(i);
-			}
-		}
-
-		std::vector<size_t> topoOrder;
-		topoOrder.reserve(nodes.size());
-		while (!ready.empty()) {
-			auto bestIt = std::min_element(ready.begin(), ready.end(), [&](size_t a, size_t b) {
-				if (nodes[a].originalOrder != nodes[b].originalOrder) {
-					return nodes[a].originalOrder < nodes[b].originalOrder;
-				}
-				return a < b;
-				});
-			size_t u = *bestIt;
-			ready.erase(bestIt);
-			topoOrder.push_back(u);
-			for (size_t v : nodes[u].out) {
-				if (--indeg[v] == 0) {
-					ready.push_back(v);
-				}
-			}
-		}
-
-		if (topoOrder.size() != nodes.size()) {
-			return metadata;
-		}
-
-		metadata.valid = true;
-		for (size_t rank = 0; rank < topoOrder.size(); ++rank) {
-			const auto& node = nodes[topoOrder[rank]];
-			if (node.passIndex < passCount) {
-				metadata.passTopoRank[node.passIndex] = rank;
-				metadata.passCriticality[node.passIndex] = node.criticality;
-				metadata.maxCriticality = std::max(metadata.maxCriticality, node.criticality);
-			}
-		}
-
-		return metadata;
-	}
-
 	const char* GetPassTypeName(RenderGraph::PassType passType) {
 		switch (passType) {
 		case RenderGraph::PassType::Render:
@@ -584,11 +523,15 @@ rg::alias::FrameAliasAnalysis rg::alias::RenderGraphAliasingSubsystem::BuildAlia
 		return analysis;
 	}
 
-	const AliasTopoMetadata topo = BuildAliasTopoMetadata(nodes, m_framePasses.size());
-	if (!topo.valid) {
-		throw std::runtime_error("RenderGraphAliasingSubsystem::BuildAliasFrameAnalysis received non-DAG node data");
+	std::vector<size_t> passTopoRank(m_framePasses.size(), 0);
+	std::vector<uint32_t> passCriticality(m_framePasses.size(), 0);
+	for (const auto& node : nodes) {
+		if (node.passIndex < m_framePasses.size()) {
+			passTopoRank[node.passIndex] = node.topoRank;
+			passCriticality[node.passIndex] = node.criticality;
+			analysis.maxNodeCriticality = std::max(analysis.maxNodeCriticality, node.criticality);
+		}
 	}
-	analysis.maxNodeCriticality = topo.maxCriticality;
 	analysis.resourcesByID.reserve(1024);
 
 	auto device = DeviceManager::GetInstance().GetDevice();
@@ -682,8 +625,8 @@ rg::alias::FrameAliasAnalysis rg::alias::RenderGraphAliasingSubsystem::BuildAlia
 
 	for (size_t passIdx = 0; passIdx < m_framePasses.size(); ++passIdx) {
 		const auto& any = m_framePasses[passIdx];
-		const size_t usageOrder = topo.passTopoRank[passIdx];
-		const uint32_t passCrit = topo.passCriticality[passIdx];
+		const size_t usageOrder = passTopoRank[passIdx];
+		const uint32_t passCrit = passCriticality[passIdx];
 
 		if (any.type == RenderGraph::PassType::Render) {
 			auto const& p = std::get<RenderGraph::RenderPassAndResources>(any.pass);

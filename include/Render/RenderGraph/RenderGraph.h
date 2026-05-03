@@ -887,6 +887,7 @@ private:
 		uint8_t compatibleQueueKindMask = 0;
 		std::optional<size_t> assignedQueueSlot; // Final slot chosen during frame scheduling
 		uint32_t originalOrder = 0;
+		size_t topoRank = 0;
 
 		// Expanded IDs (aliases + group/child fixpoint)
 		std::vector<uint64_t> touchedIDs;

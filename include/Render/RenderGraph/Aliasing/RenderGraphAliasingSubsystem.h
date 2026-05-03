@@ -90,6 +90,7 @@ struct AliasPlacementRange {
 struct AliasSchedulingNode {
 	size_t passIndex = 0;
 	uint32_t originalOrder = 0;
+	size_t topoRank = 0;
 	uint32_t indegree = 0;
 	uint32_t criticality = 0;
 	std::vector<size_t> out;

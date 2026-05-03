@@ -1726,25 +1726,41 @@ bool RenderGraph::FinalizeDependencyGraph(std::vector<Node>& nodes)
 	std::vector<uint32_t> indeg(nodes.size());
 	for (size_t i = 0; i < nodes.size(); ++i) indeg[i] = nodes[i].indegree;
 
-	std::vector<size_t> q;
-	q.reserve(nodes.size());
-	for (size_t i = 0; i < nodes.size(); ++i)
-		if (indeg[i] == 0) q.push_back(i);
+	auto originalOrderLess = [&](size_t lhs, size_t rhs) {
+		if (nodes[lhs].originalOrder != nodes[rhs].originalOrder) {
+			return nodes[lhs].originalOrder > nodes[rhs].originalOrder;
+		}
+		return lhs > rhs;
+	};
+
+	std::priority_queue<size_t, std::vector<size_t>, decltype(originalOrderLess)> ready(originalOrderLess);
+	for (size_t i = 0; i < nodes.size(); ++i) {
+		if (indeg[i] == 0) {
+			ready.push(i);
+		}
+	}
 
 	std::vector<size_t> topo;
 	topo.reserve(nodes.size());
 
-	for (size_t head = 0; head < q.size(); ++head) {
-		size_t u = q[head];
+	while (!ready.empty()) {
+		size_t u = ready.top();
+		ready.pop();
 		topo.push_back(u);
 		for (size_t v : nodes[u].out) {
-			if (--indeg[v] == 0) q.push_back(v);
+			if (--indeg[v] == 0) {
+				ready.push(v);
+			}
 		}
 	}
 
 	if (topo.size() != nodes.size()) {
 		// cycle: invalid graph
 		return false;
+	}
+
+	for (size_t rank = 0; rank < topo.size(); ++rank) {
+		nodes[topo[rank]].topoRank = rank;
 	}
 
 	// reverse topo DP
@@ -5112,6 +5128,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		aliasNodes.push_back(rg::alias::AliasSchedulingNode{
 			.passIndex = node.passIndex,
 			.originalOrder = node.originalOrder,
+			.topoRank = node.topoRank,
 			.indegree = node.indegree,
 			.criticality = node.criticality,
 			.out = node.out,
