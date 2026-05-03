@@ -702,6 +702,11 @@ private:
 	
 	enum class AccessKind : uint8_t { Read, Write };
 
+	struct NodeAccess {
+		uint32_t resourceIndex = 0;
+		AccessKind kind = AccessKind::Read;
+	};
+
 	struct DenseEquivalentResourceSummary {
 		uint64_t resourceID = 0;
 		size_t resourceIndex = 0;
@@ -862,8 +867,8 @@ private:
 		std::vector<uint64_t> uavIDs;
 
 		// For dependency building: per expanded ID, strongest access in this pass.
-		// Write dominates read. Sorted by ID after BuildNodes.
-		std::vector<std::pair<uint64_t, AccessKind>> accessByID;
+		// Write dominates read. Sorted by dense frame-local resource index after BuildNodes.
+		std::vector<NodeAccess> accessByID;
 
 		// DAG
 		std::vector<size_t> out;
@@ -903,6 +908,9 @@ private:
 	std::unordered_map<uint64_t, rg::alias::AliasPlacementRange> aliasPlacementRangesByID;
 	std::unordered_map<uint64_t, rg::alias::AliasPlacementRange> schedulingPlacementRangesByID;
 	std::unordered_map<uint64_t, std::vector<uint64_t>> m_schedulingEquivalentIDsCache;
+	std::unordered_map<uint64_t, size_t> m_frameDAGResourceIndexByID;
+	std::vector<uint64_t> m_frameDAGResourceIDsByIndex;
+	size_t m_frameDAGResourceCount = 0;
 	std::unordered_map<uint64_t, size_t> m_frameSchedulingResourceIndexByID;
 	size_t m_frameSchedulingResourceCount = 0;
 	std::vector<uint8_t> m_aliasActivationPendingDense;

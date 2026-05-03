@@ -780,13 +780,16 @@ void RenderGraph::WriteCompiledGraphDebugDump(uint8_t frameIndex, const std::vec
 					if (i != 0) {
 						dump << ", ";
 					}
-					const auto& [resourceID, accessKind] = node.accessByID[i];
+					const auto& access = node.accessByID[i];
+					const uint64_t resourceID = access.resourceIndex < m_frameDAGResourceIDsByIndex.size()
+						? m_frameDAGResourceIDsByIndex[access.resourceIndex]
+						: 0;
 					dump << resourceID;
 					auto resourceIt = resourcesByID.find(resourceID);
 					if (resourceIt != resourcesByID.end() && resourceIt->second && !resourceIt->second->GetName().empty()) {
 						dump << ":\"" << resourceIt->second->GetName() << "\"";
 					}
-					dump << ":" << (accessKind == AccessKind::Read ? "Read" : "Write");
+					dump << ":" << (access.kind == AccessKind::Read ? "Read" : "Write");
 				}
 				dump << "]\n";
 			}
@@ -1356,7 +1359,10 @@ std::vector<RenderGraph::Node> RenderGraph::BuildNodes(RenderGraph& rg, std::vec
 		auto mark = [&](uint64_t rid, AccessKind k, bool isUav) {
 			n.touchedIDs.push_back(rid);
 			if (isUav) n.uavIDs.push_back(rid);
-			n.accessByID.push_back({rid, k});
+			auto dagResourceIt = rg.m_frameDAGResourceIndexByID.find(rid);
+			if (dagResourceIt != rg.m_frameDAGResourceIndexByID.end()) {
+				n.accessByID.push_back({ static_cast<uint32_t>(dagResourceIt->second), k });
+			}
 			};
 
 		// Alias placement is computed later in CompileFrame, after the dependency DAG
@@ -1387,13 +1393,13 @@ std::vector<RenderGraph::Node> RenderGraph::BuildNodes(RenderGraph& rg, std::vec
 		std::sort(n.uavIDs.begin(), n.uavIDs.end());
 		n.uavIDs.erase(std::unique(n.uavIDs.begin(), n.uavIDs.end()), n.uavIDs.end());
 
-		// Deduplicate accessByID: sort by ID, then collapse duplicates keeping Write over Read
+		// Deduplicate accessByID: sort by dense resource index, then collapse duplicates keeping Write over Read
 		std::sort(n.accessByID.begin(), n.accessByID.end(), [](auto& a, auto& b) {
-			if (a.first != b.first) return a.first < b.first;
-			return a.second > b.second; // Write (1) before Read (0)
+			if (a.resourceIndex != b.resourceIndex) return a.resourceIndex < b.resourceIndex;
+			return a.kind > b.kind; // Write (1) before Read (0)
 		});
 		auto last = std::unique(n.accessByID.begin(), n.accessByID.end(),
-			[](auto& a, auto& b) { return a.first == b.first; });
+			[](auto& a, auto& b) { return a.resourceIndex == b.resourceIndex; });
 		n.accessByID.erase(last, n.accessByID.end());
 
 		nodes[i] = std::move(n);
@@ -1604,27 +1610,20 @@ bool RenderGraph::BuildDependencyGraph(
 	std::span<const std::pair<size_t, size_t>> explicitEdges)
 {
 	ZoneScopedN("RenderGraph::BuildDependencyGraph");
-	std::unordered_map<uint64_t, SeqState> seq;
-	std::unordered_set<uint64_t> resourcesWrittenThisFrame;
+	size_t dagResourceCount = 0;
 	{
-		size_t totalAccesses = 0;
-		size_t totalWrites = 0;
 		for (const auto& node : nodes) {
-			totalAccesses += node.accessByID.size();
-			for (const auto& [rid, kind] : node.accessByID) {
-				if (kind == AccessKind::Write) {
-					++totalWrites;
-				}
+			for (const auto& access : node.accessByID) {
+				dagResourceCount = (std::max)(dagResourceCount, size_t(access.resourceIndex) + 1);
 			}
 		}
-		seq.reserve(totalAccesses);
-		resourcesWrittenThisFrame.reserve(totalWrites);
 	}
-
+	std::vector<SeqState> seq(dagResourceCount);
+	std::vector<uint8_t> resourcesWrittenThisFrame(dagResourceCount, 0);
 	for (const auto& node : nodes) {
-		for (const auto& [rid, kind] : node.accessByID) {
-			if (kind == AccessKind::Write) {
-				resourcesWrittenThisFrame.insert(rid);
+		for (const auto& access : node.accessByID) {
+			if (access.kind == AccessKind::Write && access.resourceIndex < resourcesWrittenThisFrame.size()) {
+				resourcesWrittenThisFrame[access.resourceIndex] = 1;
 			}
 		}
 	}
@@ -1636,14 +1635,18 @@ bool RenderGraph::BuildDependencyGraph(
 	for (size_t i = 0; i < nodes.size(); ++i) {
 		auto& node = nodes[i];
 
-		for (auto& [rid, kind] : node.accessByID) {
-			if (kind == AccessKind::Read && !resourcesWrittenThisFrame.contains(rid)) {
+		for (auto& access : node.accessByID) {
+			if (access.resourceIndex >= seq.size()) {
 				continue;
 			}
 
-			auto& s = seq[rid];
+			if (access.kind == AccessKind::Read && !resourcesWrittenThisFrame[access.resourceIndex]) {
+				continue;
+			}
 
-			if (kind == AccessKind::Read) {
+			auto& s = seq[access.resourceIndex];
+
+			if (access.kind == AccessKind::Read) {
 				if (s.lastWriter) AddEdgeDedup(*s.lastWriter, i, nodes, edgeSet);
 				s.readsSinceWrite.push_back(i);
 			}
@@ -5000,6 +5003,15 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	}
 
 	std::vector<Node> nodes;
+	m_frameDAGResourceIndexByID.clear();
+	m_frameDAGResourceIDsByIndex.clear();
+	m_frameDAGResourceIndexByID.reserve(usedResourceIDs.size());
+	m_frameDAGResourceIDsByIndex.reserve(usedResourceIDs.size());
+	for (uint64_t resourceID : usedResourceIDs) {
+		m_frameDAGResourceIndexByID.emplace(resourceID, m_frameDAGResourceIDsByIndex.size());
+		m_frameDAGResourceIDsByIndex.push_back(resourceID);
+	}
+	m_frameDAGResourceCount = m_frameDAGResourceIDsByIndex.size();
 	{
 		traceCompileStep("BuildNodes");
 		ZoneScopedN("RenderGraph::CompileFrame::BuildNodes");
