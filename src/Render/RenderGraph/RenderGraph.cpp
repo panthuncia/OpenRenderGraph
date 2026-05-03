@@ -1867,12 +1867,23 @@ void RenderGraph::CommitPassToBatch(
 	};
 
 	auto applyInternalTransitions = [&](const auto& pass) {
-		for (const auto& exit : pass.resources.internalTransitions) {
+		const auto& denseTransitions = passSummary.internalTransitions;
+		if (pass.resources.internalTransitions.size() != denseTransitions.size()) {
+			throw std::runtime_error("Frame pass summary internal transition count mismatch");
+		}
+
+		for (size_t transitionIndex = 0; transitionIndex < denseTransitions.size(); ++transitionIndex) {
+			const auto& exit = pass.resources.internalTransitions[transitionIndex];
+			const auto& denseTransition = denseTransitions[transitionIndex];
 			std::vector<ResourceTransition> ignoredTransitions;
-			auto pRes = _registry.Resolve(exit.first.resource);
-			auto& compileTracker = GetOrCreateCompileTracker(pRes, exit.first.resource.GetGlobalResourceID());
-			compileTracker.Apply(exit.first.range, nullptr, exit.second, ignoredTransitions);
-			SortedInsert(currentBatch.internallyTransitionedResources, exit.first.resource.GetGlobalResourceID());
+			auto* pRes = exit.first.resource.IsEphemeral() ? exit.first.resource.GetEphemeralPtr() : _registry.Resolve(exit.first.resource);
+			auto& compileResourceState = GetOrCreateFrameCompileResourceState(
+				denseTransition.resourceIndex,
+				pRes,
+				denseTransition.resourceID);
+			pRes = compileResourceState.resource ? compileResourceState.resource : pRes;
+			compileResourceState.tracker.Apply(exit.first.range, pRes, exit.second, ignoredTransitions);
+			SortedInsert(currentBatch.internallyTransitionedResources, denseTransition.resourceID);
 		}
 	};
 
@@ -1935,6 +1946,7 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 	auto openNewBatch = [&]() -> PassBatch {
 		const size_t queueCount = rg.m_queueRegistry.SlotCount();
 		PassBatch b(queueCount);
+		b.passBatchTrackersByResourceIndex.assign(rg.m_frameSchedulingResourceCount, nullptr);
 		for (size_t qi = 0; qi < queueCount; ++qi) {
 			b.SetQueueSignalFenceValue(RenderGraph::BatchSignalPhase::AfterTransitions, qi, rg.GetNextQueueFenceValue(qi));
 			b.SetQueueSignalFenceValue(RenderGraph::BatchSignalPhase::AfterExecution, qi, rg.GetNextQueueFenceValue(qi));
@@ -2055,7 +2067,7 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 
 				if (rg.IsNewBatchNeeded(
 					passSummary,
-					currentBatch.passBatchTrackers,
+					currentBatch.passBatchTrackersByResourceIndex,
 					batchBuildState,
 					passes[n.passIndex].name,
 					currentBatchIndex,
@@ -2359,10 +2371,87 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 		}
 		rg.m_compiledLastProducerBatchByResourceByQueue = std::move(crossFrameProducer);
 	}
+
+	if (rg.m_getRenderGraphBatchTraceEnabled && rg.m_getRenderGraphBatchTraceEnabled()) {
+		rg.LogAddTransitionDebugSummary();
+	}
 }
 
 
 // Factory for the transition lambda
+void RenderGraph::LogAddTransitionDebugSummary() const
+{
+	if (m_addTransitionDebugStatsByResource.empty()) {
+		return;
+	}
+
+	size_t totalCalls = 0;
+	size_t totalNoOpCalls = 0;
+	size_t totalEmittedTransitions = 0;
+	size_t totalEarlyPlacedTransitions = 0;
+	size_t totalBeforePassTransitions = 0;
+	size_t totalGraphicsFallbackTransitions = 0;
+	size_t totalAliasActivationTransitions = 0;
+
+	std::vector<std::pair<uint64_t, const AddTransitionDebugStats*>> ranked;
+	ranked.reserve(m_addTransitionDebugStatsByResource.size());
+
+	for (const auto& [resourceID, stats] : m_addTransitionDebugStatsByResource) {
+		totalCalls += stats.callCount;
+		totalNoOpCalls += stats.noOpCallCount;
+		totalEmittedTransitions += stats.emittedTransitionCount;
+		totalEarlyPlacedTransitions += stats.earlyPlacedTransitionCount;
+		totalBeforePassTransitions += stats.beforePassTransitionCount;
+		totalGraphicsFallbackTransitions += stats.graphicsFallbackTransitionCount;
+		totalAliasActivationTransitions += stats.aliasActivationTransitionCount;
+		ranked.emplace_back(resourceID, &stats);
+	}
+
+	std::sort(
+		ranked.begin(),
+		ranked.end(),
+		[](const auto& lhs, const auto& rhs) {
+			if (lhs.second->callCount != rhs.second->callCount) {
+				return lhs.second->callCount > rhs.second->callCount;
+			}
+			if (lhs.second->emittedTransitionCount != rhs.second->emittedTransitionCount) {
+				return lhs.second->emittedTransitionCount > rhs.second->emittedTransitionCount;
+			}
+			return lhs.first < rhs.first;
+		});
+
+	spdlog::info(
+		"RG AddTransition summary: resources={} calls={} noOpCalls={} emittedTransitions={} earlyPlacedTransitions={} beforePassTransitions={} graphicsFallbackTransitions={} aliasActivationTransitions={}",
+		ranked.size(),
+		totalCalls,
+		totalNoOpCalls,
+		totalEmittedTransitions,
+		totalEarlyPlacedTransitions,
+		totalBeforePassTransitions,
+		totalGraphicsFallbackTransitions,
+		totalAliasActivationTransitions);
+
+	constexpr size_t kMaxLoggedResources = 12;
+	const size_t resourcesToLog = std::min(kMaxLoggedResources, ranked.size());
+	for (size_t index = 0; index < resourcesToLog; ++index) {
+		const uint64_t resourceID = ranked[index].first;
+		const AddTransitionDebugStats& stats = *ranked[index].second;
+		const std::string_view resourceName = stats.resourceName.empty() ? std::string_view("<unknown>") : std::string_view(stats.resourceName);
+		spdlog::info(
+			"RG AddTransition top[{}]: resource='{}' id={} calls={} noOpCalls={} emittedTransitions={} earlyPlacedTransitions={} beforePassTransitions={} graphicsFallbackTransitions={} aliasActivationTransitions={}",
+			index,
+			resourceName,
+			resourceID,
+			stats.callCount,
+			stats.noOpCallCount,
+			stats.emittedTransitionCount,
+			stats.earlyPlacedTransitionCount,
+			stats.beforePassTransitionCount,
+			stats.graphicsFallbackTransitionCount,
+			stats.aliasActivationTransitionCount);
+	}
+}
+
 void RenderGraph::AddTransition(
 	unsigned int batchIndex,
 	PassBatch& currentBatch,
@@ -2417,11 +2506,35 @@ void RenderGraph::AddTransition(
 	}
 	scratchTransitions.clear();
 	auto& transitions = scratchTransitions;
-	auto pRes = _registry.Resolve(resource); // TODO: Can we get rid of pRes in transitions?
+	auto* pRes = resource.IsEphemeral() ? resource.GetEphemeralPtr() : _registry.Resolve(resource); // TODO: Can we get rid of pRes in transitions?
+	auto& compileResourceState = GetOrCreateFrameCompileResourceState(requirement.resourceIndex, pRes, resource.GetGlobalResourceID());
+	pRes = compileResourceState.resource ? compileResourceState.resource : pRes;
 	if (pRes && !pRes->GetName().empty()) {
 		ZoneText(pRes->GetName().data(), pRes->GetName().size());
 	}
-	auto& compileTracker = GetOrCreateCompileTracker(pRes, resource.GetGlobalResourceID());
+	AddTransitionDebugStats* debugStats = nullptr;
+	if (m_getRenderGraphBatchTraceEnabled && m_getRenderGraphBatchTraceEnabled()) {
+		auto [it, inserted] = m_addTransitionDebugStatsByResource.try_emplace(resource.GetGlobalResourceID());
+		(void)inserted;
+		debugStats = &it->second;
+		if (debugStats->resourceName.empty() || debugStats->resourceName == "<unknown>") {
+			if (pRes && !pRes->GetName().empty()) {
+				debugStats->resourceName = pRes->GetName();
+			}
+			else if (auto resourceIt = resourcesByID.find(resource.GetGlobalResourceID());
+				resourceIt != resourcesByID.end() && resourceIt->second && !resourceIt->second->GetName().empty()) {
+				debugStats->resourceName = resourceIt->second->GetName();
+			}
+			else if (resource.IsEphemeral()) {
+				debugStats->resourceName = "<ephemeral>";
+			}
+			else {
+				debugStats->resourceName = "<unknown>";
+			}
+		}
+		++debugStats->callCount;
+	}
+	auto& compileTracker = compileResourceState.tracker;
 
 	bool isAliasActivation = false;
 	if (aliasActivationPending.find(resource.GetGlobalResourceID()) != aliasActivationPending.end()) {
@@ -2463,13 +2576,23 @@ void RenderGraph::AddTransition(
 		compileTracker.Apply(requirement.range, pRes, requiredState, transitions);
 	}
 
+	if (debugStats) {
+		debugStats->emittedTransitionCount += transitions.size();
+		if (isAliasActivation) {
+			debugStats->aliasActivationTransitionCount += transitions.size();
+		}
+	}
+
 	if (!transitions.empty()) {
 		outTransitionedResourceIDs.insert(resource.GetGlobalResourceID());
 	}
 
-	currentBatch.passBatchTrackers[resource.GetGlobalResourceID()] = &compileTracker; // We will need to check subsequent passes against this
+	currentBatch.passBatchTrackersByResourceIndex[requirement.resourceIndex] = &compileTracker; // We will need to check subsequent passes against this
 
 	if (transitions.empty()) {
+		if (debugStats) {
+			++debugStats->noOpCallCount;
+		}
 		return;
 	}
 
@@ -2535,6 +2658,9 @@ void RenderGraph::AddTransition(
 			for (auto& transition : transitions) {
 				targetBatch.Transitions(transitionSlot, BatchTransitionPhase::AfterPasses).push_back(transition);
 			}
+			if (debugStats) {
+				debugStats->earlyPlacedTransitionCount += transitions.size();
+			}
 
 			// Signal AfterCompletion on the transition queue so downstream consumers can wait on it
 			targetBatch.MarkQueueSignal(BatchSignalPhase::AfterCompletion, transitionSlot);
@@ -2558,11 +2684,18 @@ void RenderGraph::AddTransition(
 		for (auto& transition : transitions) {
 			currentBatch.Transitions(gfxSlot, BatchTransitionPhase::BeforePasses).push_back(transition);
 		}
+		if (debugStats) {
+			debugStats->beforePassTransitionCount += transitions.size();
+			debugStats->graphicsFallbackTransitionCount += transitions.size();
+		}
 		outFallbackResourceIndices.insert(requirement.resourceIndex);
 	}
 	else {
 		for (auto& transition : transitions) {
 			currentBatch.Transitions(passQueueSlot, BatchTransitionPhase::BeforePasses).push_back(transition);
+		}
+		if (debugStats) {
+			debugStats->beforePassTransitionCount += transitions.size();
 		}
 	}
 }
@@ -2691,7 +2824,8 @@ void RenderGraph::ShutdownOwnedState() {
 	batches.clear();
 	initialTransitions.clear();
 	trackers.clear();
-	compileTrackers.clear();
+	m_frameCompileResources.clear();
+	m_addTransitionDebugStatsByResource.clear();
 	m_masterPassList.clear();
 	m_framePasses.clear();
 	m_assignedQueueSlotsByFramePass.clear();
@@ -2752,30 +2886,72 @@ void RenderGraph::ShutdownOwnedState() {
 	m_descriptorService.reset();
 	m_renderGraphSettingsService.reset();
 }
-
-SymbolicTracker& RenderGraph::GetOrCreateCompileTracker(Resource* resource, uint64_t resourceID) {
-	auto it = compileTrackers.find(resourceID);
-	if (it != compileTrackers.end()) {
-		return it->second;
+namespace {
+bool HasLiveCompileResourceBacking(Resource* resource) {
+	if (!resource) {
+		return false;
 	}
 
+	if (auto* texture = dynamic_cast<PixelBuffer*>(resource)) {
+		return texture->IsMaterialized();
+	}
+	if (auto* buffer = dynamic_cast<Buffer*>(resource)) {
+		return buffer->IsMaterialized();
+	}
+	return true;
+}
+
+SymbolicTracker SeedCompileTrackerFromLiveResource(Resource* resource) {
 	SymbolicTracker seed{};
-	if (resource) {
-		bool hasLiveBacking = true;
-		if (auto* texture = dynamic_cast<PixelBuffer*>(resource)) {
-			hasLiveBacking = texture->IsMaterialized();
-		}
-		else if (auto* buffer = dynamic_cast<Buffer*>(resource)) {
-			hasLiveBacking = buffer->IsMaterialized();
-		}
-
-		if (hasLiveBacking) {
-			seed = *resource->GetStateTracker();
+	if (HasLiveCompileResourceBacking(resource)) {
+		if (auto* tracker = resource->GetStateTracker()) {
+			seed = *tracker;
 		}
 	}
+	return seed;
+}
+}
 
-	auto [insertedIt, _] = compileTrackers.emplace(resourceID, std::move(seed));
-	return insertedIt->second;
+RenderGraph::FrameCompileResourceState& RenderGraph::GetOrCreateFrameCompileResourceState(size_t resourceIndex, Resource* resource, uint64_t resourceID) {
+	if (resourceIndex >= m_frameCompileResources.size()) {
+		throw std::runtime_error("Frame compile resource index out of range");
+	}
+
+	auto& entry = m_frameCompileResources[resourceIndex];
+	entry.resourceID = resourceID;
+	if (!entry.resource) {
+		if (resource) {
+			entry.resource = resource;
+		}
+		else if (auto shared = GetResourceByID(resourceID)) {
+			entry.resource = shared.get();
+		}
+	}
+	if (!entry.trackerInitialized) {
+		entry.tracker = SeedCompileTrackerFromLiveResource(entry.resource);
+		entry.trackerInitialized = true;
+	}
+	return entry;
+}
+
+void RenderGraph::RebuildFrameCompileResources() {
+	ZoneScopedN("RenderGraph::RebuildFrameCompileResources");
+	m_frameCompileResources.clear();
+	m_frameCompileResources.resize(m_frameSchedulingResourceCount);
+
+	for (const auto& [resourceID, resourceIndex] : m_frameSchedulingResourceIndexByID) {
+		if (resourceIndex >= m_frameCompileResources.size()) {
+			continue;
+		}
+
+		auto& entry = m_frameCompileResources[resourceIndex];
+		entry.resourceID = resourceID;
+		if (auto resource = GetResourceByID(resourceID)) {
+			entry.resource = resource.get();
+		}
+		entry.tracker = SeedCompileTrackerFromLiveResource(entry.resource);
+		entry.trackerInitialized = true;
+	}
 }
 
 void RenderGraph::CaptureCompileTrackersForExecution(const std::unordered_set<uint64_t>& resourceIDs) {
@@ -2783,24 +2959,15 @@ void RenderGraph::CaptureCompileTrackersForExecution(const std::unordered_set<ui
 	trackers.clear();
 	trackers.reserve(resourceIDs.size());
 
-	auto captureTracker = [&](uint64_t resourceID, Resource* resource) {
-		if (!resource) {
+	auto captureTracker = [&](uint64_t resourceID) {
+		auto resourceIndex = TryGetFrameSchedulingResourceIndex(resourceID);
+		if (!resourceIndex.has_value()) {
 			return;
 		}
 
-		if (!compileTrackers.contains(resourceID)) {
-			return;
-		}
-
-		bool hasLiveBacking = true;
-		if (auto* texture = dynamic_cast<PixelBuffer*>(resource)) {
-			hasLiveBacking = texture->IsMaterialized();
-		}
-		else if (auto* buffer = dynamic_cast<Buffer*>(resource)) {
-			hasLiveBacking = buffer->IsMaterialized();
-		}
-
-		if (!hasLiveBacking) {
+		auto& compileResourceState = GetOrCreateFrameCompileResourceState(*resourceIndex, nullptr, resourceID);
+		Resource* resource = compileResourceState.resource;
+		if (!resource || !compileResourceState.trackerInitialized || !HasLiveCompileResourceBacking(resource)) {
 			return;
 		}
 
@@ -2810,16 +2977,7 @@ void RenderGraph::CaptureCompileTrackersForExecution(const std::unordered_set<ui
 	};
 
 	for (uint64_t resourceID : resourceIDs) {
-		auto itResource = resourcesByID.find(resourceID);
-		if (itResource != resourcesByID.end() && itResource->second) {
-			captureTracker(resourceID, itResource->second.get());
-			continue;
-		}
-
-		auto itTransient = m_transientFrameResourcesByID.find(resourceID);
-		if (itTransient != m_transientFrameResourcesByID.end() && itTransient->second) {
-			captureTracker(resourceID, itTransient->second.get());
-		}
+		captureTracker(resourceID);
 	}
 }
 
@@ -2829,12 +2987,17 @@ void RenderGraph::PublishCompiledTrackerStates() {
 			continue;
 		}
 
-		auto itCompileTracker = compileTrackers.find(resourceID);
-		if (itCompileTracker == compileTrackers.end()) {
+		auto resourceIndex = TryGetFrameSchedulingResourceIndex(resourceID);
+		if (!resourceIndex.has_value() || *resourceIndex >= m_frameCompileResources.size()) {
 			continue;
 		}
 
-		liveTracker->CopyFrom(itCompileTracker->second);
+		const auto& compileResourceState = m_frameCompileResources[*resourceIndex];
+		if (!compileResourceState.trackerInitialized) {
+			continue;
+		}
+
+		liveTracker->CopyFrom(compileResourceState.tracker);
 	}
 }
 
@@ -2866,6 +3029,7 @@ const std::vector<uint64_t>& RenderGraph::GetSchedulingEquivalentIDsCached(uint6
 void RenderGraph::ClearFrameSchedulingResourceIndex() {
 	m_frameSchedulingResourceIndexByID.clear();
 	m_frameSchedulingResourceCount = 0;
+	m_frameCompileResources.clear();
 	m_frameQueueLastUsageBatch.clear();
 	m_frameQueueLastProducerBatch.clear();
 	m_frameQueueLastTransitionBatch.clear();
@@ -3342,7 +3506,8 @@ void RenderGraph::ResetForRebuild()
 	resourceIdleFrameCounts.clear();
 	compiledResourceGenerationByID.clear();
 	m_aliasingSubsystem.ResetPersistentState(*this);
-	compileTrackers.clear();
+	m_frameCompileResources.clear();
+	m_addTransitionDebugStatsByResource.clear();
 	m_schedulingEquivalentIDsCache.clear();
 	ClearFrameSchedulingResourceIndex();
 	ClearFramePassSchedulingSummaries();
@@ -3388,7 +3553,8 @@ void RenderGraph::ResetForFrame() {
 	m_transientFrameResourcesByName.clear();
 	_registry.ReclaimExpiredAnonymous();
 	m_aliasingSubsystem.ResetPerFrameState(*this);
-	compileTrackers.clear();
+	m_frameCompileResources.clear();
+	m_addTransitionDebugStatsByResource.clear();
 	m_schedulingEquivalentIDsCache.clear();
 	ClearFrameSchedulingResourceIndex();
 	ClearFramePassSchedulingSummaries();
@@ -3995,7 +4161,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	{
 		traceCompileStep("ResetCompileState");
 		ZoneScopedN("RenderGraph::CompileFrame::ResetCompileState");
-		compileTrackers.clear();
+		m_frameCompileResources.clear();
 		m_schedulingEquivalentIDsCache.clear();
 		m_aliasingSubsystem.ResetPerFrameState(*this);
 	}
@@ -4646,6 +4812,11 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		traceCompileStep("MaterializeUnmaterializedResources");
 		ZoneScopedN("RenderGraph::CompileFrame::MaterializeUnmaterializedResources");
 		MaterializeUnmaterializedResources(&usedResourceIDs);
+	}
+	{
+		traceCompileStep("RebuildFrameCompileResources");
+		ZoneScopedN("RenderGraph::CompileFrame::RebuildFrameCompileResources");
+		RebuildFrameCompileResources();
 	}
 	{
 		traceCompileStep("SnapshotCompiledResourceGenerations");
@@ -8016,7 +8187,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 
 bool RenderGraph::IsNewBatchNeeded(
 	const FramePassSchedulingSummary& passSummary,
-	const std::unordered_map<uint64_t, SymbolicTracker*>& passBatchTrackers,
+	const std::vector<SymbolicTracker*>& passBatchTrackersByResourceIndex,
 	const BatchBuildState& batchBuildState,
 	std::string_view candidatePassName,
 	unsigned int currentBatchIndex,
@@ -8078,11 +8249,12 @@ bool RenderGraph::IsNewBatchNeeded(
 		ResourceState wantState{ requirement.state.access, requirement.state.layout, requirement.state.sync };
 
 		// Changing state?
-		auto it = passBatchTrackers.find(id);
-		if (it != passBatchTrackers.end()) {
-			if (it->second->WouldModify(requirement.range, wantState)) {
-				return true;
-			}
+		SymbolicTracker* tracker = nullptr;
+		if (requirement.resourceIndex < passBatchTrackersByResourceIndex.size()) {
+			tracker = passBatchTrackersByResourceIndex[requirement.resourceIndex];
+		}
+		if (tracker && tracker->WouldModify(requirement.range, wantState)) {
+			return true;
 		}
 		// first-use in this batch never forces a split.
 

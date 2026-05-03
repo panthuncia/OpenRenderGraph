@@ -520,7 +520,7 @@ public:
 			return queueWaitFenceValue[WaitPhaseIndex(phase)][dst][src];
 		}
 
-		std::unordered_map<uint64_t, SymbolicTracker*> passBatchTrackers; // Trackers for the resources in this batch
+		std::vector<SymbolicTracker*> passBatchTrackersByResourceIndex; // Trackers for the resources in this batch
 	};
 
 	RenderGraph(rhi::Device device);
@@ -733,6 +733,13 @@ private:
 		uint64_t previousQueueMask = 0;
 	};
 
+	struct FrameCompileResourceState {
+		uint64_t resourceID = 0;
+		Resource* resource = nullptr;
+		SymbolicTracker tracker;
+		bool trackerInitialized = false;
+	};
+
 	struct BatchBuildState {
 		size_t queueCount = 0;
 		size_t resourceCount = 0;
@@ -902,7 +909,7 @@ private:
 	std::shared_ptr<rg::runtime::IRenderGraphSettingsService> m_renderGraphSettingsService;
 	std::shared_ptr<rg::runtime::ITaskService> m_taskService;
 	std::unordered_map<uint64_t, SymbolicTracker*> trackers; // Tracks the state of resources in the graph.
-	std::unordered_map<uint64_t, SymbolicTracker> compileTrackers; // Compile-only symbolic state, decoupled from backing lifetime.
+	std::vector<FrameCompileResourceState> m_frameCompileResources; // Compile-only symbolic state, indexed by frame-local resource index.
 	std::unordered_map<uint64_t, LastProducerAcrossFrames> m_lastProducerByResourceAcrossFrames;
 	std::unordered_map<uint64_t, std::vector<LastAliasPlacementProducerAcrossFrames>> m_lastAliasPlacementProducersByPoolAcrossFrames;
 	std::vector<std::unordered_map<uint64_t, unsigned int>> m_compiledLastProducerBatchByResourceByQueue;
@@ -956,7 +963,7 @@ private:
 	}
 
 	void MaterializeUnmaterializedResources(const std::unordered_set<uint64_t>* onlyResourceIDs = nullptr);
-	SymbolicTracker& GetOrCreateCompileTracker(Resource* resource, uint64_t resourceID);
+	FrameCompileResourceState& GetOrCreateFrameCompileResourceState(size_t resourceIndex, Resource* resource, uint64_t resourceID);
 	void CaptureCompileTrackersForExecution(const std::unordered_set<uint64_t>& resourceIDs);
 	void PublishCompiledTrackerStates();
 	void MaterializeReferencedResources(
@@ -972,6 +979,7 @@ private:
 	void ValidateCompiledResourceGenerations() const;
 	void RebuildSchedulingEquivalentIDCache(const std::unordered_set<uint64_t>& resourceIDs);
 	void RebuildFrameSchedulingResourceIndex(const std::unordered_set<uint64_t>& resourceIDs);
+	void RebuildFrameCompileResources();
 	void RebuildFramePassSchedulingSummaries();
 	void ClearFrameSchedulingResourceIndex();
 	void ClearFramePassSchedulingSummaries();
@@ -998,7 +1006,7 @@ private:
 	//void ComputeResourceLoops();
 	bool IsNewBatchNeeded(
 		const FramePassSchedulingSummary& passSummary,
-		const std::unordered_map<uint64_t, SymbolicTracker*>& passBatchTrackers,
+		const std::vector<SymbolicTracker*>& passBatchTrackersByResourceIndex,
 		const BatchBuildState& batchBuildState,
 		std::string_view candidatePassName,
 		unsigned int currentBatchIndex,
@@ -1135,6 +1143,19 @@ private:
 		std::unordered_set<size_t>& outFallbackResourceIndices,
 		std::vector<ResourceTransition>& scratchTransitions);
 
+	struct AddTransitionDebugStats {
+		std::string resourceName;
+		size_t callCount = 0;
+		size_t noOpCallCount = 0;
+		size_t emittedTransitionCount = 0;
+		size_t earlyPlacedTransitionCount = 0;
+		size_t beforePassTransitionCount = 0;
+		size_t graphicsFallbackTransitionCount = 0;
+		size_t aliasActivationTransitionCount = 0;
+	};
+
+	void LogAddTransitionDebugSummary() const;
+
 	static inline bool IsUAVState(const ResourceState& s) noexcept {
 		return ((s.access & rhi::ResourceAccessType::UnorderedAccess) != 0) ||
 			(s.layout == rhi::ResourceLayout::UnorderedAccess);
@@ -1203,6 +1224,7 @@ private:
 	std::function<float()> m_getQueueSchedulingAutoGraphicsBias;
 	std::function<float()> m_getQueueSchedulingAsyncOverlapBonus;
 	std::function<float()> m_getQueueSchedulingCrossQueueHandoffPenalty;
+	std::unordered_map<uint64_t, AddTransitionDebugStats> m_addTransitionDebugStatsByResource;
 	std::function<uint32_t()> m_getAutoAliasPoolRetireIdleFrames;
 	std::function<float()> m_getAutoAliasPoolGrowthHeadroom;
 	std::function<void(std::string_view)> m_structuralMaterializeCheckpointCallback;
