@@ -8922,11 +8922,6 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 
 	m_lastProducerByResourceAcrossFrames = std::move(nextLastProducerByResourceAcrossFrames);
 	m_lastAliasPlacementProducersByPoolAcrossFrames = std::move(nextLastAliasPlacementProducersByPoolAcrossFrames);
-	{
-		ZoneScopedN("RenderGraph::Execute::ProcessDeletions");
-		DeletionManager::GetInstance().ProcessDeletions();
-	}
-
 	// Sync CRM signal tracking with values we signaled directly.
 	// Capped at primary queue count: CRM only tracks the 3 primary queues (Graphics/Compute/Copy).
 	for (size_t qi = 0; qi < std::min(slotCount, static_cast<size_t>(QueueKind::Count)); ++qi) {

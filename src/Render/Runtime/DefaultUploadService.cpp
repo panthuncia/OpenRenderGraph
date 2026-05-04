@@ -1,5 +1,6 @@
 #include "Render/Runtime/IUploadService.h"
 
+#include "Managers/Singletons/DeletionManager.h"
 #include "Managers/Singletons/UploadManager.h"
 
 namespace rg::runtime {
@@ -83,6 +84,7 @@ public:
 
     void ProcessDeferredReleases(uint8_t frameIndex) override {
         UploadManager::GetInstance().ProcessDeferredReleases(frameIndex);
+        DeletionManager::GetInstance().ProcessDeletions();
     }
 
     void QueueStreamingUpload(const void* data, size_t size,
