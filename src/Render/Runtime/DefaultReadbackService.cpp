@@ -7,8 +7,8 @@ namespace rg::runtime {
 namespace {
 class DefaultReadbackService final : public IReadbackService {
 public:
-    void Initialize(rhi::Timeline readbackFence) override {
-        ReadbackManager::GetInstance().Initialize(readbackFence);
+    void Initialize(rhi::Timeline graphicsReadbackFence, rhi::Timeline copyReadbackFence) override {
+        ReadbackManager::GetInstance().Initialize(graphicsReadbackFence, copyReadbackFence);
     }
 
     void RequestReadbackCapture(const std::string& passName, Resource* resource, const RangeSpec& range, ReadbackCaptureCallback callback, QueueKind preferredQueueKind = QueueKind::Graphics) override {
@@ -37,16 +37,16 @@ public:
         return { token.id };
     }
 
-    void FinalizeCapture(rg::runtime::ReadbackCaptureToken token, uint64_t fenceValue) override {
-        ReadbackManager::GetInstance().FinalizeCapture({ token.id }, fenceValue);
+    void FinalizeCapture(rg::runtime::ReadbackCaptureToken token, QueueKind queueKind, std::shared_ptr<rhi::TimelinePtr> signalFenceOwner, uint64_t fenceValue) override {
+        ReadbackManager::GetInstance().FinalizeCapture({ token.id }, queueKind, std::move(signalFenceOwner), fenceValue);
     }
 
-    uint64_t GetNextReadbackFenceValue() override {
-        return ReadbackManager::GetInstance().GetNextReadbackFenceValue();
+    uint64_t GetNextReadbackFenceValue(QueueKind queueKind) override {
+        return ReadbackManager::GetInstance().GetNextReadbackFenceValue(queueKind);
     }
 
-    rhi::Timeline GetReadbackFence() const override {
-        return ReadbackManager::GetInstance().GetReadbackFence();
+    rhi::Timeline GetReadbackFence(QueueKind queueKind) const override {
+        return ReadbackManager::GetInstance().GetReadbackFence(queueKind);
     }
 
     void ProcessReadbackRequests() override {

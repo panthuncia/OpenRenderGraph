@@ -1002,6 +1002,7 @@ private:
 	rhi::TimelinePtr m_frameStartSyncFence; // TODO: Is there a better way of handling waiting for pre-frame things like copying resources?
 
 	rhi::TimelinePtr m_readbackFence;
+	rhi::TimelinePtr m_copyReadbackFence;
 
 	std::unique_ptr<CommandRecordingManager> m_pCommandRecordingManager;
 	ExecutionSchedule m_executionSchedule;

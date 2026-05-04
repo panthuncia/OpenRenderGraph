@@ -46,10 +46,12 @@ ReadbackCaptureToken ReadbackManager::EnqueueCapture(ReadbackCaptureRequest&& re
     return { token };
 }
 
-void ReadbackManager::FinalizeCapture(ReadbackCaptureToken token, uint64_t fenceValue) {
+void ReadbackManager::FinalizeCapture(ReadbackCaptureToken token, QueueKind queueKind, std::shared_ptr<rhi::TimelinePtr> signalFenceOwner, uint64_t fenceValue) {
     std::lock_guard<std::mutex> lock(readbackRequestsMutex);
     for (auto& request : m_readbackCaptureRequests) {
         if (request.token == token.id) {
+            request.signalQueueKind = NormalizeQueueKind(queueKind);
+            request.signalFenceOwner = std::move(signalFenceOwner);
             request.fenceValue = fenceValue;
             return;
         }
@@ -61,22 +63,26 @@ void ReadbackManager::FinalizeCapture(ReadbackCaptureToken token, uint64_t fence
         m_readbackCaptureRequests.size());
 }
 
-uint64_t ReadbackManager::GetNextReadbackFenceValue() {
-    return ++m_captureFenceValue;
+rhi::Timeline ReadbackManager::GetReadbackFence(QueueKind queueKind) const {
+    return ResolveReadbackFence(queueKind);
+}
+
+uint64_t ReadbackManager::GetNextReadbackFenceValue(QueueKind queueKind) {
+    return NormalizeQueueKind(queueKind) == QueueKind::Copy
+        ? m_captureFenceValueCopy.fetch_add(1, std::memory_order_relaxed) + 1
+        : m_captureFenceValueGraphics.fetch_add(1, std::memory_order_relaxed) + 1;
 }
 
 void ReadbackManager::ProcessReadbackRequests() {
     std::lock_guard<std::mutex> lock(readbackRequestsMutex);
 
-    if (!m_initialized || !m_readbackFence.IsValid()) {
+    if (!m_initialized) {
         if (!m_warnedUninitializedUse) {
             spdlog::warn("ReadbackManager::ProcessReadbackRequests called before readback fence initialization; deferring {} pending readback captures.", m_readbackCaptureRequests.size());
             m_warnedUninitializedUse = true;
         }
         return;
     }
-
-    const auto completedValue = m_readbackFence.GetCompletedValue();
 
     std::vector<ReadbackCaptureRequest> remainingCaptures;
     remainingCaptures.reserve(m_readbackCaptureRequests.size());
@@ -89,6 +95,23 @@ void ReadbackManager::ProcessReadbackRequests() {
             continue;
         }
 
+        rhi::Timeline requestFence;
+        if (request.signalFenceOwner && *request.signalFenceOwner) {
+            requestFence = request.signalFenceOwner->Get();
+        }
+        else {
+            requestFence = ResolveReadbackFence(request.signalQueueKind);
+            if (!requestFence.IsValid()) {
+                spdlog::warn(
+                    "ReadbackManager dropping capture token {} for resource {} because queue {} has no initialized readback fence.",
+                    request.token,
+                    request.desc.resourceId,
+                    static_cast<int>(request.signalQueueKind));
+                continue;
+            }
+        }
+
+        const auto completedValue = requestFence.GetCompletedValue();
         if (completedValue >= request.fenceValue) {
             void* mappedData = nullptr;
             request.readbackBuffer->GetAPIResource().Map(&mappedData);

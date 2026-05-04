@@ -133,10 +133,13 @@ public:
             return {};
         }
 
-        const uint64_t fenceValue = m_readbackService->GetNextReadbackFenceValue();
-        m_readbackService->FinalizeCapture(m_pendingToken, fenceValue);
+        auto signalFenceOwner = std::make_shared<rhi::TimelinePtr>();
+        context.device.CreateTimeline(*signalFenceOwner);
+        const rhi::Timeline signalFence = signalFenceOwner->Get();
+        constexpr uint64_t fenceValue = 1;
+        m_readbackService->FinalizeCapture(m_pendingToken, QueueKind::Graphics, signalFenceOwner, fenceValue);
         m_hasPendingToken = false;
-        return { m_readbackService->GetReadbackFence(), fenceValue };
+        return { signalFence, fenceValue };
     }
 
     void Cleanup() override {

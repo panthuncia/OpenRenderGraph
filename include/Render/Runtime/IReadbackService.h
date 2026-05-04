@@ -33,13 +33,13 @@ class IReadbackService {
 public:
     virtual ~IReadbackService() = default;
 
-    virtual void Initialize(rhi::Timeline readbackFence) = 0;
+    virtual void Initialize(rhi::Timeline graphicsReadbackFence, rhi::Timeline copyReadbackFence) = 0;
     virtual void RequestReadbackCapture(const std::string& passName, Resource* resource, const RangeSpec& range, ReadbackCaptureCallback callback, QueueKind preferredQueueKind = QueueKind::Graphics) = 0;
     virtual std::vector<ReadbackCaptureInfo> ConsumeCaptureRequests() = 0;
     virtual ReadbackCaptureToken EnqueueCapture(ReadbackCaptureRequest&& request) = 0;
-    virtual void FinalizeCapture(ReadbackCaptureToken token, uint64_t fenceValue) = 0;
-    virtual uint64_t GetNextReadbackFenceValue() = 0;
-    virtual rhi::Timeline GetReadbackFence() const = 0;
+    virtual void FinalizeCapture(ReadbackCaptureToken token, QueueKind queueKind, std::shared_ptr<rhi::TimelinePtr> signalFenceOwner, uint64_t fenceValue) = 0;
+    virtual uint64_t GetNextReadbackFenceValue(QueueKind queueKind) = 0;
+    virtual rhi::Timeline GetReadbackFence(QueueKind queueKind) const = 0;
     virtual void ProcessReadbackRequests() = 0;
     virtual void Cleanup() = 0;
 };

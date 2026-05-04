@@ -233,10 +233,6 @@ struct TrackedEntityToken {
                 if (s_hooks.destroyEntity) {
 					s_hooks.destroyEntity(*resolvedWorld, resolvedId);
                 }
-                else {
-					flecs::entity e{ *resolvedWorld, resolvedId };
-					if (e.is_alive()) e.destruct();
-                }
             }
         }
         Disarm();

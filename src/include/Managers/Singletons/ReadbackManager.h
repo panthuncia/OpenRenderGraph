@@ -28,9 +28,10 @@ class ReadbackManager {
 public:
 	static ReadbackManager& GetInstance();
 
-	void Initialize(rhi::Timeline readbackFence) {
-		m_readbackFence = readbackFence;
-		m_initialized = m_readbackFence.IsValid();
+	void Initialize(rhi::Timeline graphicsReadbackFence, rhi::Timeline copyReadbackFence) {
+		m_graphicsReadbackFence = graphicsReadbackFence;
+		m_copyReadbackFence = copyReadbackFence;
+		m_initialized = m_graphicsReadbackFence.IsValid() || m_copyReadbackFence.IsValid();
 		m_warnedUninitializedUse = false;
 	}
 
@@ -44,25 +45,37 @@ public:
 	std::vector<ReadbackCaptureInfo> ConsumeCaptureRequests();
 
 	ReadbackCaptureToken EnqueueCapture(ReadbackCaptureRequest&& request);
-	void FinalizeCapture(ReadbackCaptureToken token, uint64_t fenceValue);
+	void FinalizeCapture(ReadbackCaptureToken token, QueueKind queueKind, std::shared_ptr<rhi::TimelinePtr> signalFenceOwner, uint64_t fenceValue);
 
-	uint64_t GetNextReadbackFenceValue();
-	rhi::Timeline GetReadbackFence() const { return m_readbackFence; }
+	uint64_t GetNextReadbackFenceValue(QueueKind queueKind);
+	rhi::Timeline GetReadbackFence(QueueKind queueKind) const;
 
 	void ProcessReadbackRequests();
 
 	void Cleanup() {
 		m_queuedCaptures.clear();
 		m_readbackCaptureRequests.clear();
-		m_readbackFence.Reset();
+		m_graphicsReadbackFence.Reset();
+		m_copyReadbackFence.Reset();
 		m_initialized = false;
 		m_warnedUninitializedUse = false;
+		m_captureFenceValueGraphics.store(0, std::memory_order_relaxed);
+		m_captureFenceValueCopy.store(0, std::memory_order_relaxed);
 	}
 
 private:
 	ReadbackManager() = default;
 
-	rhi::Timeline m_readbackFence;
+	static QueueKind NormalizeQueueKind(QueueKind queueKind) {
+		return queueKind == QueueKind::Copy ? QueueKind::Copy : QueueKind::Graphics;
+	}
+
+	rhi::Timeline ResolveReadbackFence(QueueKind queueKind) const {
+		return NormalizeQueueKind(queueKind) == QueueKind::Copy ? m_copyReadbackFence : m_graphicsReadbackFence;
+	}
+
+	rhi::Timeline m_graphicsReadbackFence;
+	rhi::Timeline m_copyReadbackFence;
 	bool m_initialized = false;
 	bool m_warnedUninitializedUse = false;
 	std::mutex readbackRequestsMutex;
@@ -71,7 +84,8 @@ private:
 	std::mutex m_captureQueueMutex;
 	std::vector<ReadbackCaptureInfo> m_queuedCaptures;
 	std::atomic<uint64_t> m_captureTokenCounter = 0;
-	std::atomic<uint64_t> m_captureFenceValue = 0;
+	std::atomic<uint64_t> m_captureFenceValueGraphics = 0;
+	std::atomic<uint64_t> m_captureFenceValueCopy = 0;
 
 	// Static pointer to hold the instance
 	static std::unique_ptr<ReadbackManager> instance;

@@ -7,6 +7,7 @@
 #include <memory>
 #include <cstddef>
 
+#include "Render/QueueKind.h"
 #include "Resources/Resource.h"
 #include "Resources/ResourceStateTracker.h"
 
@@ -46,6 +47,7 @@ struct ReadbackCaptureRequest {
     uint64_t token = 0;
     ReadbackCaptureDesc desc;
     std::shared_ptr<Resource> readbackBuffer;
+    std::shared_ptr<rhi::TimelinePtr> signalFenceOwner;
     std::vector<rhi::CopyableFootprint> layouts;
     uint64_t totalSize = 0;
     rhi::Format format = rhi::Format::Unknown;
@@ -53,5 +55,6 @@ struct ReadbackCaptureRequest {
     uint32_t height = 0;
     uint32_t depth = 0;
     ReadbackCaptureCallback callback;
+    QueueKind signalQueueKind = QueueKind::Graphics;
     uint64_t fenceValue = 0;
 };

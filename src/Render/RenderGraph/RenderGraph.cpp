@@ -3148,6 +3148,7 @@ void RenderGraph::ShutdownOwnedState() {
 	m_initialTransitionFence.Reset();
 	m_frameStartSyncFence.Reset();
 	m_readbackFence.Reset();
+	m_copyReadbackFence.Reset();
 
 	m_statisticsService.reset();
 	m_uploadService.reset();
@@ -6351,10 +6352,11 @@ void RenderGraph::Setup() {
 	auto device = DeviceManager::GetInstance().GetDevice();
 
 	auto result = device.CreateTimeline(m_readbackFence);
+	result = device.CreateTimeline(m_copyReadbackFence);
 	result = device.CreateTimeline(m_frameStartSyncFence);
 
 	if (m_readbackService) {
-		m_readbackService->Initialize(m_readbackFence.Get());
+		m_readbackService->Initialize(m_readbackFence.Get(), m_copyReadbackFence.Get());
 	}
 
 	// Populate the queue registry with the 3 primary queues.
@@ -6883,12 +6885,98 @@ namespace {
 	}
 
 	// Signal external fences on the queue. Must be called AFTER the command list
+	struct ExternalFenceSignalKey {
+		uint32_t index = 0;
+		uint32_t generation = 0;
+		uint64_t value = 0;
+
+		bool operator==(const ExternalFenceSignalKey& other) const noexcept {
+			return index == other.index && generation == other.generation && value == other.value;
+		}
+	};
+
+	struct ExternalFenceSignalKeyHash {
+		size_t operator()(const ExternalFenceSignalKey& key) const noexcept {
+			size_t seed = static_cast<size_t>(key.index);
+			seed ^= static_cast<size_t>(key.generation) + 0x9e3779b9u + (seed << 6) + (seed >> 2);
+			seed ^= static_cast<size_t>(key.value) + 0x9e3779b9u + (seed << 6) + (seed >> 2);
+			seed ^= static_cast<size_t>(key.value >> 32) + 0x9e3779b9u + (seed << 6) + (seed >> 2);
+			return seed;
+		}
+	};
+
+	struct ExternalFenceSignalOrigin {
+		QueueKind queueKind = QueueKind::Graphics;
+		size_t queueSlot = 0;
+		size_t batchIndex = 0;
+		std::string passName;
+	};
+
+	void LogQueuedExternalFence(
+		unsigned frameIndex,
+		QueueKind queueKind,
+		size_t queueSlot,
+		size_t batchIndex,
+		std::string_view passName,
+		std::unordered_map<ExternalFenceSignalKey, ExternalFenceSignalOrigin, ExternalFenceSignalKeyHash>& queuedSignals,
+		const PassReturn& passReturn)
+	{
+		if (!passReturn.fence.has_value()) {
+			return;
+		}
+
+		auto handle = passReturn.fence->GetHandle();
+		ExternalFenceSignalKey key{
+			.index = handle.index,
+			.generation = handle.generation,
+			.value = passReturn.fenceValue,
+		};
+		auto [it, inserted] = queuedSignals.emplace(
+			key,
+			ExternalFenceSignalOrigin{
+				.queueKind = queueKind,
+				.queueSlot = queueSlot,
+				.batchIndex = batchIndex,
+				.passName = std::string(passName),
+			});
+		if (!inserted) {
+			spdlog::error(
+				"RenderGraph: duplicate external fence queue detected in frame {} for timeline(idx={}, gen={}) value={}. Previous pass='{}' queue={} slot={} batch={}; current pass='{}' queue={} slot={} batch={}",
+				frameIndex,
+				handle.index,
+				handle.generation,
+				passReturn.fenceValue,
+				it->second.passName,
+				QueueKindToString(it->second.queueKind),
+				it->second.queueSlot,
+				it->second.batchIndex,
+				passName,
+				QueueKindToString(queueKind),
+				queueSlot,
+				batchIndex);
+		}
+		spdlog::info(
+			"RenderGraph: frame {} queued external fence from pass '{}' on queue {} slot {} batch {} timeline(idx={}, gen={}) value={}",
+			frameIndex,
+			passName,
+			QueueKindToString(queueKind),
+			queueSlot,
+			batchIndex,
+			handle.index,
+			handle.generation,
+			passReturn.fenceValue);
+	}
+
 	// containing the pass work has been flushed (submitted) so the signals fire
 	// after the GPU work they depend on.
 	void SignalExternalFences(
 		rhi::Queue& queue,
 		QueueKind queueKind,
 		rhi::Timeline* slotFence,
+		size_t queueSlot,
+		size_t batchIndex,
+		unsigned frameIndex,
+		std::unordered_map<ExternalFenceSignalKey, ExternalFenceSignalOrigin, ExternalFenceSignalKeyHash>& seenSignals,
 		std::vector<PassReturn>& externalFences) {
 		ZoneScopedN("RenderGraph::SignalExternalFences");
 		if (externalFences.empty()) return;
@@ -6922,11 +7010,43 @@ namespace {
 					}
 				}
 #endif
+				auto handle = fr.fence.value().GetHandle();
+				ExternalFenceSignalKey key{
+					.index = handle.index,
+					.generation = handle.generation,
+					.value = fr.fenceValue,
+				};
+				auto [it, inserted] = seenSignals.emplace(
+					key,
+					ExternalFenceSignalOrigin{
+						.queueKind = queueKind,
+						.queueSlot = queueSlot,
+						.batchIndex = batchIndex,
+						.passName = std::string{},
+					});
+				if (!inserted) {
+					spdlog::error(
+						"SignalExternalFences: duplicate external signal detected in frame {} for timeline(idx={}, gen={}) value={}. Previous signal queue={} slot={} batch={}; current queue={} slot={} batch={}",
+						frameIndex,
+						handle.index,
+						handle.generation,
+						fr.fenceValue,
+						QueueKindToString(it->second.queueKind),
+						it->second.queueSlot,
+						it->second.batchIndex,
+						QueueKindToString(queueKind),
+						queueSlot,
+						batchIndex);
+					continue;
+				}
 				spdlog::debug(
-					"SignalExternalFences: queue={} signaling timeline(idx={}, gen={}) value={}",
+					"SignalExternalFences: frame={} queue={} slot={} batch={} signaling timeline(idx={}, gen={}) value={}",
+					frameIndex,
 					static_cast<int>(queueKind),
-					fr.fence.value().GetHandle().index,
-					fr.fence.value().GetHandle().generation,
+					queueSlot,
+					batchIndex,
+					handle.index,
+					handle.generation,
 					fr.fenceValue);
 				queue.Signal({ fr.fence.value().GetHandle(), fr.fenceValue });
 			}
@@ -6979,6 +7099,7 @@ namespace {
 		PassExecutionContext& context;
 		rg::runtime::IStatisticsService* statisticsService;
 		std::vector<PassReturn>& outExternalFences;
+		std::unordered_map<ExternalFenceSignalKey, ExternalFenceSignalOrigin, ExternalFenceSignalKeyHash>& queuedExternalFenceOrigins;
 		UINT64& lastSignaledOnTimeline;
 		bool batchTraceEnabled;
 	};
@@ -7078,8 +7199,18 @@ namespace {
 				pr.immediateKeepAlive.reset();
 				if ((pr.run & PassRunMask::Retained) != PassRunMask::None) {
 					auto passReturn = pr.pass->Execute(args.context);
-					if (passReturn.fence)
+					// In batch trace, do some fence debug
+					if (args.batchTraceEnabled && passReturn.fence) {
+						LogQueuedExternalFence(
+							static_cast<unsigned>(args.context.frameIndex),
+							queue,
+							qi,
+							args.batchIndex,
+							passName,
+							args.queuedExternalFenceOrigins,
+							passReturn);
 						args.outExternalFences.push_back(passReturn);
+					}
 				}
 				if (hasStatistics)
 					args.statisticsService->EndQuery(pr.statisticsIndex, args.context.frameIndex, rhiQueue, commandList);
@@ -7210,6 +7341,7 @@ namespace {
 		rhi::Queue& rhiQueue;           // needed for statistics Begin/EndQuery
 		PassExecutionContext context;    // COPY: each task gets its own
 		rg::runtime::IStatisticsService* statisticsService;
+		std::unordered_map<ExternalFenceSignalKey, ExternalFenceSignalOrigin, ExternalFenceSignalKeyHash>& queuedExternalFenceOrigins;
 		bool batchTraceEnabled;
 	};
 
@@ -7290,8 +7422,17 @@ namespace {
 				pr.immediateKeepAlive.reset();
 				if ((pr.run & PassRunMask::Retained) != PassRunMask::None) {
 					auto passReturn = pr.pass->Execute(args.context);
-					if (passReturn.fence)
+					if (passReturn.fence) {
+						LogQueuedExternalFence(
+							static_cast<unsigned>(args.context.frameIndex),
+							queue,
+							qi,
+							args.batchIndex,
+							passName,
+							args.queuedExternalFenceOrigins,
+							passReturn);
 						sched.externalFences.push_back(passReturn);
+					}
 				}
 				if (hasStatistics)
 					args.statisticsService->EndQuery(pr.statisticsIndex, args.context.frameIndex, args.rhiQueue, commandList, sched.queryRecordingContext);
@@ -8194,6 +8335,10 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 
 	// Per-slot signal tracking for monotonic recycle signals.
 	std::vector<UINT64> lastSignaledPerSlot(slotCount);
+	std::unordered_map<ExternalFenceSignalKey, ExternalFenceSignalOrigin, ExternalFenceSignalKeyHash> seenExternalFenceSignalsThisFrame;
+	seenExternalFenceSignalsThisFrame.reserve(32);
+	std::unordered_map<ExternalFenceSignalKey, ExternalFenceSignalOrigin, ExternalFenceSignalKeyHash> queuedExternalFenceOriginsThisFrame;
+	queuedExternalFenceOriginsThisFrame.reserve(32);
 	for (size_t qi = 0; qi < slotCount; ++qi) {
 		const auto slotIndex = static_cast<QueueSlotIndex>(static_cast<uint8_t>(qi));
 		const UINT64 completedFenceValue = SlotFence(qi).GetCompletedValue();
@@ -8244,6 +8389,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 					.context = context,
 					.statisticsService = statisticsService,
 					.outExternalFences = slotExternalFences[qi],
+					.queuedExternalFenceOrigins = queuedExternalFenceOriginsThisFrame,
 					.lastSignaledOnTimeline = lastSignaledPerSlot[qi],
 					.batchTraceEnabled = batchTraceEnabled,
 				};
@@ -8254,8 +8400,15 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 			for (size_t qi = 0; qi < slotCount; ++qi) {
 				if (!slotExternalFences[qi].empty()) {
 					auto rhiQ = SlotQueue(qi);
-					SignalExternalFences(rhiQ, m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(qi)),
-						&SlotFence(qi), slotExternalFences[qi]);
+					SignalExternalFences(
+						rhiQ,
+						m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(qi)),
+						&SlotFence(qi),
+						qi,
+						bi,
+						static_cast<unsigned>(context.frameIndex),
+						seenExternalFenceSignalsThisFrame,
+						slotExternalFences[qi]);
 				}
 			}
 
@@ -8358,6 +8511,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 						.rhiQueue = rhiQ,
 						.context = context,
 						.statisticsService = statisticsService,
+						.queuedExternalFenceOrigins = queuedExternalFenceOriginsThisFrame,
 						.batchTraceEnabled = batchTraceEnabled,
 					};
 					RecordQueueBatch(args);
@@ -8535,6 +8689,10 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 					rhiQueue,
 					m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(queueIndex)),
 					&SlotFence(queueIndex),
+					queueIndex,
+					batchIndex,
+					static_cast<unsigned>(context.frameIndex),
+					seenExternalFenceSignalsThisFrame,
 					externalFences);
 			};
 
