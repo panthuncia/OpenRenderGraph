@@ -541,6 +541,7 @@ public:
 	RenderGraph(rhi::Device device);
 	~RenderGraph();
 	using AutoAliasReasonCount = rg::alias::AutoAliasReasonCount;
+	using AutoAliasExcludedResourceDebug = rg::alias::AutoAliasExcludedResourceDebug;
 	using AutoAliasPoolRangeDebug = rg::alias::AutoAliasPoolRangeDebug;
 	using AutoAliasPoolDebug = rg::alias::AutoAliasPoolDebug;
 	using AutoAliasDebugSnapshot = rg::alias::AutoAliasDebugSnapshot;
@@ -1305,6 +1306,7 @@ private:
 	std::unordered_map<uint64_t, uint64_t> autoAliasPoolByID;
 	std::unordered_map<uint64_t, std::string> autoAliasExclusionReasonByID;
 	std::vector<AutoAliasReasonCount> autoAliasExclusionReasonSummary;
+	std::vector<AutoAliasExcludedResourceDebug> autoAliasExcludedResources;
 	std::vector<AutoAliasPoolDebug> autoAliasPoolDebug;
 	AutoAliasPlannerStats autoAliasPlannerStats;
 	AutoAliasMode autoAliasPreviousMode = AutoAliasMode::Off;

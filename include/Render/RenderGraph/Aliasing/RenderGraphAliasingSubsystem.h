@@ -21,6 +21,13 @@ struct AutoAliasReasonCount {
 	size_t count = 0;
 };
 
+struct AutoAliasExcludedResourceDebug {
+	uint64_t resourceID = 0;
+	std::string resourceName;
+	uint64_t sizeBytes = 0;
+	std::string reason;
+};
+
 struct AutoAliasPoolRangeDebug {
 	uint64_t resourceID = 0;
 	std::string resourceName;
@@ -70,6 +77,7 @@ struct AutoAliasDebugSnapshot {
 	size_t planCacheMisses = 0;
 	std::string primaryPlanCacheMissReason;
 	std::vector<AutoAliasReasonCount> exclusionReasons;
+	std::vector<AutoAliasExcludedResourceDebug> excludedResources;
 	std::vector<AutoAliasPoolDebug> poolDebug;
 };
 
@@ -129,6 +137,7 @@ struct FrameAliasResourceInfo {
 	size_t resourceIndex = std::numeric_limits<size_t>::max();
 	RGResourceRuntimeKind kind = RGResourceRuntimeKind::Unknown;
 	bool staticInfoInitialized = false;
+	std::string debugName;
 
 	bool aliasAllowed = false;
 	bool deviceLocal = false;
@@ -171,6 +180,7 @@ public:
 		AutoAliasPackingStrategy packingStrategy,
 		const AutoAliasPlannerStats& plannerStats,
 		const std::vector<AutoAliasReasonCount>& exclusionReasons,
+		const std::vector<AutoAliasExcludedResourceDebug>& excludedResources,
 		const std::vector<AutoAliasPoolDebug>& poolDebug) const;
 
 

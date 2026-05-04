@@ -10,6 +10,7 @@ rg::alias::AutoAliasDebugSnapshot rg::alias::RenderGraphAliasingSubsystem::Build
 	AutoAliasPackingStrategy packingStrategy,
 	const rg::alias::AutoAliasPlannerStats& plannerStats,
 	const std::vector<rg::alias::AutoAliasReasonCount>& exclusionReasons,
+	const std::vector<rg::alias::AutoAliasExcludedResourceDebug>& excludedResources,
 	const std::vector<rg::alias::AutoAliasPoolDebug>& poolDebug) const
 {
 	rg::alias::AutoAliasDebugSnapshot out{};
@@ -30,6 +31,7 @@ rg::alias::AutoAliasDebugSnapshot rg::alias::RenderGraphAliasingSubsystem::Build
 		? plannerStats.primaryPlanCacheMissReason
 		: std::string{};
 	out.exclusionReasons = exclusionReasons;
+	out.excludedResources = excludedResources;
 	out.poolDebug = poolDebug;
 	return out;
 }
@@ -45,6 +47,7 @@ void rg::alias::RenderGraphAliasingSubsystem::ResetPerFrameState(RenderGraph& re
 	renderGraph.autoAliasPoolByID.clear();
 	renderGraph.autoAliasExclusionReasonByID.clear();
 	renderGraph.autoAliasExclusionReasonSummary.clear();
+	renderGraph.autoAliasExcludedResources.clear();
 	renderGraph.schedulingPlacementRangesByID.clear();
 	renderGraph.autoAliasPlannerStats = {};
 	renderGraph.autoAliasPreviousMode = renderGraph.autoAliasModeLastFrame;

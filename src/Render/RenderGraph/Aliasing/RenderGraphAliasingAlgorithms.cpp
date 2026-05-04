@@ -26,6 +26,7 @@ RenderGraph::AutoAliasDebugSnapshot RenderGraph::GetAutoAliasDebugSnapshot() con
 		autoAliasPackingStrategyLastFrame,
 		autoAliasPlannerStats,
 		autoAliasExclusionReasonSummary,
+		autoAliasExcludedResources,
 		autoAliasPoolDebug);
 }
 
@@ -619,6 +620,10 @@ rg::alias::FrameAliasAnalysis rg::alias::RenderGraphAliasingSubsystem::BuildAlia
 			return;
 		}
 
+		if (!resource->GetName().empty()) {
+			info.debugName = resource->GetName();
+		}
+
 		if (auto* texture = dynamic_cast<PixelBuffer*>(resource)) {
 			auto const& desc = texture->GetDescription();
 			info.kind = RGResourceRuntimeKind::Texture;
@@ -629,17 +634,18 @@ rg::alias::FrameAliasAnalysis rg::alias::RenderGraphAliasingSubsystem::BuildAlia
 				info.manualPoolID = desc.aliasingPoolID.value();
 				info.hasManualPool = true;
 			}
-			if (!info.aliasAllowed) {
-				info.exclusionReason = "allowAlias is disabled";
-				info.staticInfoInitialized = true;
-				return;
-			}
 
 			auto resourceDesc = BuildAliasTextureResourceDesc(desc);
 			rhi::ResourceAllocationInfo allocationInfo{};
 			device.GetResourceAllocationInfo(&resourceDesc, 1, &allocationInfo);
 			info.sizeBytes = allocationInfo.sizeInBytes;
 			info.alignment = std::max<uint64_t>(1, allocationInfo.alignment);
+
+			if (!info.aliasAllowed) {
+				info.exclusionReason = "allowAlias is disabled";
+				info.staticInfoInitialized = true;
+				return;
+			}
 			info.staticInfoInitialized = true;
 			return;
 		}
@@ -653,6 +659,16 @@ rg::alias::FrameAliasAnalysis rg::alias::RenderGraphAliasingSubsystem::BuildAlia
 				info.manualPoolID = poolHint.value();
 				info.hasManualPool = true;
 			}
+
+			auto resourceDesc = BuildAliasBufferResourceDesc(
+				buffer->GetBufferSize(),
+				buffer->IsUnorderedAccessEnabled(),
+				buffer->GetAccessType());
+			rhi::ResourceAllocationInfo allocationInfo{};
+			device.GetResourceAllocationInfo(&resourceDesc, 1, &allocationInfo);
+			info.sizeBytes = allocationInfo.sizeInBytes;
+			info.alignment = std::max<uint64_t>(1, allocationInfo.alignment);
+
 			if (!info.aliasAllowed) {
 				info.exclusionReason = "allowAlias is disabled";
 				info.staticInfoInitialized = true;
@@ -663,15 +679,6 @@ rg::alias::FrameAliasAnalysis rg::alias::RenderGraphAliasingSubsystem::BuildAlia
 				info.staticInfoInitialized = true;
 				return;
 			}
-
-			auto resourceDesc = BuildAliasBufferResourceDesc(
-				buffer->GetBufferSize(),
-				buffer->IsUnorderedAccessEnabled(),
-				buffer->GetAccessType());
-			rhi::ResourceAllocationInfo allocationInfo{};
-			device.GetResourceAllocationInfo(&resourceDesc, 1, &allocationInfo);
-			info.sizeBytes = allocationInfo.sizeInBytes;
-			info.alignment = std::max<uint64_t>(1, allocationInfo.alignment);
 			info.staticInfoInitialized = true;
 			return;
 		}
@@ -741,6 +748,7 @@ void rg::alias::RenderGraphAliasingSubsystem::AutoAssignAliasingPoolsFromAnalysi
 	auto& autoAliasPoolByID = rg.autoAliasPoolByID;
 	auto& autoAliasExclusionReasonByID = rg.autoAliasExclusionReasonByID;
 	auto& autoAliasExclusionReasonSummary = rg.autoAliasExclusionReasonSummary;
+	auto& autoAliasExcludedResources = rg.autoAliasExcludedResources;
 	auto& autoAliasPlannerStats = rg.autoAliasPlannerStats;
 	auto& autoAliasModeLastFrame = rg.autoAliasModeLastFrame;
 	auto& m_getAutoAliasMode = rg.m_getAutoAliasMode;
@@ -751,6 +759,7 @@ void rg::alias::RenderGraphAliasingSubsystem::AutoAssignAliasingPoolsFromAnalysi
 	autoAliasPoolByID.clear();
 	autoAliasExclusionReasonByID.clear();
 	autoAliasExclusionReasonSummary.clear();
+	autoAliasExcludedResources.clear();
 	autoAliasPlannerStats = {};
 
 	const AutoAliasMode mode = m_getAutoAliasMode ? m_getAutoAliasMode() : AutoAliasMode::Off;
@@ -788,6 +797,30 @@ void rg::alias::RenderGraphAliasingSubsystem::AutoAssignAliasingPoolsFromAnalysi
 
 	constexpr uint64_t kAutoPoolGlobal = 0xA171000000000000ull;
 
+	auto appendExcludedResource = [&](const FrameAliasResourceInfo& resourceInfo, const char* reason) {
+		if (resourceInfo.resourceID == 0 || reason == nullptr) {
+			return;
+		}
+
+		std::string resourceName = resourceInfo.debugName;
+		if (resourceName.empty()) {
+			auto resourceIt = resourcesByID.find(resourceInfo.resourceID);
+			if (resourceIt != resourcesByID.end() && resourceIt->second && !resourceIt->second->GetName().empty()) {
+				resourceName = resourceIt->second->GetName();
+			}
+		}
+		if (resourceName.empty()) {
+			resourceName = "<unknown>";
+		}
+
+		autoAliasExcludedResources.push_back(AutoAliasExcludedResourceDebug{
+			.resourceID = resourceInfo.resourceID,
+			.resourceName = resourceName,
+			.sizeBytes = resourceInfo.sizeBytes,
+			.reason = reason,
+		});
+	};
+
 	for (uint32_t resourceIndex : analysis.candidateResourceIndices) {
 		if (resourceIndex >= analysis.infoByResourceIndex.size()) {
 			continue;
@@ -800,6 +833,7 @@ void rg::alias::RenderGraphAliasingSubsystem::AutoAssignAliasingPoolsFromAnalysi
 		c.hasFinalPool = false;
 		if (c.exclusionReason != nullptr) {
 			autoAliasExclusionReasonByID.try_emplace(c.resourceID, c.exclusionReason);
+			appendExcludedResource(c, c.exclusionReason);
 		}
 		if (c.hasManualPool) {
 			c.finalPoolID = c.manualPoolID;
@@ -824,6 +858,7 @@ void rg::alias::RenderGraphAliasingSubsystem::AutoAssignAliasingPoolsFromAnalysi
 		if (score < inclusionThreshold) {
 			autoAliasPlannerStats.excluded++;
 			autoAliasExclusionReasonByID[c.resourceID] = "score below threshold";
+			appendExcludedResource(c, "score below threshold");
 			continue;
 		}
 
@@ -852,6 +887,15 @@ void rg::alias::RenderGraphAliasingSubsystem::AutoAssignAliasingPoolsFromAnalysi
 			return a.count > b.count;
 		}
 		return a.reason < b.reason;
+		});
+	std::sort(autoAliasExcludedResources.begin(), autoAliasExcludedResources.end(), [](const AutoAliasExcludedResourceDebug& a, const AutoAliasExcludedResourceDebug& b) {
+		if (a.sizeBytes != b.sizeBytes) {
+			return a.sizeBytes > b.sizeBytes;
+		}
+		if (a.resourceName != b.resourceName) {
+			return a.resourceName < b.resourceName;
+		}
+		return a.resourceID < b.resourceID;
 		});
 
 	if (aliasLoggingEnabled && autoAliasPlannerStats.candidatesSeen > 0) {
