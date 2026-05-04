@@ -67,11 +67,20 @@ void DescriptorHeapManager::AssignDescriptorSlots(
     rhi::Resource& apiResource,
     const ViewRequirements& req)
 {
-    ReserveDescriptorSlots(target, req);
-    UpdateDescriptorContents(target, apiResource, req);
+    std::scoped_lock lock(m_descriptorMutationMutex);
+    ReserveDescriptorSlotsUnlocked(target, req);
+    UpdateDescriptorContentsUnlocked(target, apiResource, req);
 }
 
 void DescriptorHeapManager::ReserveDescriptorSlots(
+    GloballyIndexedResource& target,
+    const ViewRequirements& req)
+{
+    std::scoped_lock lock(m_descriptorMutationMutex);
+    ReserveDescriptorSlotsUnlocked(target, req);
+}
+
+void DescriptorHeapManager::ReserveDescriptorSlotsUnlocked(
     GloballyIndexedResource& target,
     const ViewRequirements& req)
 {
@@ -204,6 +213,15 @@ void DescriptorHeapManager::ReserveDescriptorSlots(
 }
 
 void DescriptorHeapManager::UpdateDescriptorContents(
+    GloballyIndexedResource& target,
+    rhi::Resource& apiResource,
+    const ViewRequirements& req)
+{
+    std::scoped_lock lock(m_descriptorMutationMutex);
+    UpdateDescriptorContentsUnlocked(target, apiResource, req);
+}
+
+void DescriptorHeapManager::UpdateDescriptorContentsUnlocked(
     GloballyIndexedResource& target,
     rhi::Resource& apiResource,
     const ViewRequirements& req)
@@ -515,6 +533,8 @@ rhi::DescriptorHeap DescriptorHeapManager::GetSamplerDescriptorHeap() const {
 }
 
 UINT DescriptorHeapManager::CreateIndexedSampler(const rhi::SamplerDesc& samplerDesc) {
+    std::scoped_lock lock(m_descriptorMutationMutex);
+
     if (!m_samplerHeap) {
         spdlog::error("DescriptorHeapManager::CreateIndexedSampler called before DescriptorHeapManager::Initialize");
         throw std::runtime_error("DescriptorHeapManager::CreateIndexedSampler called before DescriptorHeapManager::Initialize");

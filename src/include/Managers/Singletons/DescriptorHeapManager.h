@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
 #include <variant>
 #include <vector>
 
@@ -50,9 +51,19 @@ public:
 private:
 	DescriptorHeapManager() = default;
 
+	void ReserveDescriptorSlotsUnlocked(
+		GloballyIndexedResource& target,
+		const ViewRequirements& req);
+
+	void UpdateDescriptorContentsUnlocked(
+		GloballyIndexedResource& target,
+		rhi::Resource& apiResource,
+		const ViewRequirements& req);
+
 	std::shared_ptr<DescriptorHeap> m_cbvSrvUavHeap;
 	std::shared_ptr<DescriptorHeap> m_samplerHeap;
 	std::shared_ptr<DescriptorHeap> m_rtvHeap;
 	std::shared_ptr<DescriptorHeap> m_dsvHeap;
 	std::shared_ptr<DescriptorHeap> m_nonShaderVisibleHeap;
+	std::mutex m_descriptorMutationMutex;
 };

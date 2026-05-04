@@ -4,6 +4,7 @@
 #include <vector>
 #include <memory>
 #include <functional>
+#include <mutex>
 
 #include <resource_states.h>
 #include <rhi.h>
@@ -16,29 +17,119 @@ class SymbolicTracker;
 class Resource : public std::enable_shared_from_this<Resource> {
 public:
 	struct ECSEntityHandle {
+		struct DeferredState {
+			mutable std::mutex mutex;
+			flecs::world* world = nullptr;
+			flecs::entity_t id = 0;
+			bool destroyRequested = false;
+			bool destroyed = false;
+		};
+
 		flecs::world* world = nullptr;
 		flecs::entity_t id = 0;
+		std::shared_ptr<DeferredState> deferredState;
+
+		static ECSEntityHandle CreateDeferred() {
+			ECSEntityHandle handle;
+			handle.deferredState = std::make_shared<DeferredState>();
+			return handle;
+		}
 
 		explicit operator bool() const noexcept {
-			return world != nullptr && id != 0;
+			if (world != nullptr && id != 0) {
+				return true;
+			}
+			if (!deferredState) {
+				return false;
+			}
+
+			std::scoped_lock lock(deferredState->mutex);
+			return deferredState->world != nullptr && deferredState->id != 0 && !deferredState->destroyed;
 		}
 
 		void Disarm() noexcept {
 			world = nullptr;
 			id = 0;
+			if (deferredState) {
+				std::scoped_lock lock(deferredState->mutex);
+				deferredState->world = nullptr;
+				deferredState->id = 0;
+				deferredState->destroyed = true;
+			}
+		}
+
+		bool RequestDestroy() const noexcept {
+			if (!deferredState) {
+				return world != nullptr && id != 0;
+			}
+
+			std::scoped_lock lock(deferredState->mutex);
+			deferredState->destroyRequested = true;
+			return deferredState->world != nullptr && deferredState->id != 0 && !deferredState->destroyed;
+		}
+
+		bool Resolve(flecs::world& resolvedWorld, flecs::entity_t resolvedId) const noexcept {
+			if (!deferredState) {
+				return false;
+			}
+
+			std::scoped_lock lock(deferredState->mutex);
+			if (deferredState->destroyRequested || deferredState->destroyed) {
+				deferredState->world = nullptr;
+				deferredState->id = 0;
+				deferredState->destroyed = true;
+				return false;
+			}
+
+			deferredState->world = &resolvedWorld;
+			deferredState->id = resolvedId;
+			return true;
+		}
+
+		bool TryGetResolved(flecs::world*& outWorld, flecs::entity_t& outId) const noexcept {
+			if (world != nullptr && id != 0) {
+				outWorld = world;
+				outId = id;
+				return true;
+			}
+			if (!deferredState) {
+				return false;
+			}
+
+			std::scoped_lock lock(deferredState->mutex);
+			if (deferredState->world == nullptr || deferredState->id == 0 || deferredState->destroyed) {
+				return false;
+			}
+
+			outWorld = deferredState->world;
+			outId = deferredState->id;
+			return true;
+		}
+
+		void MarkDestroyed() const noexcept {
+			if (!deferredState) {
+				return;
+			}
+
+			std::scoped_lock lock(deferredState->mutex);
+			deferredState->world = nullptr;
+			deferredState->id = 0;
+			deferredState->destroyed = true;
 		}
 
 		flecs::entity ToEntity() const {
-			if (!*this) {
+			flecs::world* resolvedWorld = nullptr;
+			flecs::entity_t resolvedId = 0;
+			if (!TryGetResolved(resolvedWorld, resolvedId)) {
 				return {};
 			}
-			return flecs::entity{ *world, id };
+			return flecs::entity{ *resolvedWorld, resolvedId };
 		}
 	};
 
     struct ECSEntityHooks {
         std::function<ECSEntityHandle()> createEntity;
-        std::function<void(flecs::world&, flecs::entity_t)> destroyEntity;
+		std::function<void(const ECSEntityHandle&)> destroyEntity;
         std::function<bool()> isRuntimeAlive;
     };
 
@@ -67,7 +158,7 @@ public:
 		}
 
 		if (s_ecsEntityHooks.destroyEntity) {
-			s_ecsEntityHooks.destroyEntity(*m_ecsEntity.world, m_ecsEntity.id);
+			s_ecsEntityHooks.destroyEntity(m_ecsEntity);
 			m_ecsEntity.Disarm();
 			return;
 		}

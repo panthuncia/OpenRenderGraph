@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
 #include <optional>
 
 #include <rhi_helpers.h>
@@ -126,7 +127,8 @@ public:
 private:
     PixelBuffer(const TextureDescription& desc, bool materialize);
 
-    void EnsureMaterialized(const char* operation) const;
+    void EnsureMaterializedLocked(const char* operation) const;
+    void EnsureVirtualDescriptorSlotsAllocatedLocked();
 
     void ApplyMetadataComponentBundle(const EntityComponentBundle& bundle) override;
 
@@ -138,4 +140,5 @@ private:
     uint32_t m_internalWidth = 0; // Internal width, used for padding textures to power of two
     uint32_t m_internalHeight = 0; // Internal height, used for padding textures to power of two
     rhi::ClearValue m_clearValue;
+    mutable std::mutex m_materializationMutex;
 };

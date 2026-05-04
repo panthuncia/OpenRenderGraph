@@ -103,7 +103,8 @@ PixelBuffer::PixelBuffer(const TextureDescription& desc, bool materialize)
 PixelBuffer::~PixelBuffer() = default;
 
 rhi::Resource PixelBuffer::GetAPIResource() {
-    EnsureMaterialized("GetAPIResource");
+    std::scoped_lock lock(m_materializationMutex);
+    EnsureMaterializedLocked("GetAPIResource");
     return m_backing->GetAPIResource();
 }
 
@@ -116,19 +117,22 @@ rhi::BarrierBatch PixelBuffer::GetEnhancedBarrierGroup(
     rhi::ResourceSyncState prevSyncState,
     rhi::ResourceSyncState newSyncState)
 {
-    EnsureMaterialized("GetEnhancedBarrierGroup");
+    std::scoped_lock lock(m_materializationMutex);
+    EnsureMaterializedLocked("GetEnhancedBarrierGroup");
     return m_backing->GetEnhancedBarrierGroup(
         range, prevAccessType, newAccessType, prevLayout, newLayout, prevSyncState, newSyncState
     );
 }
 
 void PixelBuffer::OnSetName() {
+    std::scoped_lock lock(m_materializationMutex);
     if (m_backing) {
         m_backing->SetName(name.c_str());
     }
 }
 
 void PixelBuffer::ApplyMetadataComponentBundle(const EntityComponentBundle& bundle) const {
+    std::scoped_lock lock(m_materializationMutex);
     if (!m_backing) {
         return;
     }
@@ -136,16 +140,18 @@ void PixelBuffer::ApplyMetadataComponentBundle(const EntityComponentBundle& bund
 }
 
 SymbolicTracker* PixelBuffer::GetStateTracker() {
-    EnsureMaterialized("GetStateTracker");
+    std::scoped_lock lock(m_materializationMutex);
+    EnsureMaterializedLocked("GetStateTracker");
     return m_backing->GetStateTracker();
 }
 
 void PixelBuffer::Materialize(const MaterializeOptions* options) {
+    std::scoped_lock lock(m_materializationMutex);
     if (m_backing) {
         return;
     }
 
-    EnsureVirtualDescriptorSlotsAllocated();
+    EnsureVirtualDescriptorSlotsAllocatedLocked();
 
     auto newDesc = m_desc;
     if (m_desc.padInternalResolution) {
@@ -181,6 +187,7 @@ void PixelBuffer::Materialize(const MaterializeOptions* options) {
 }
 
 void PixelBuffer::Dematerialize() {
+    std::scoped_lock lock(m_materializationMutex);
     if (!m_backing) {
         return;
     }
@@ -190,6 +197,11 @@ void PixelBuffer::Dematerialize() {
 }
 
 void PixelBuffer::EnsureVirtualDescriptorSlotsAllocated() {
+    std::scoped_lock lock(m_materializationMutex);
+    EnsureVirtualDescriptorSlotsAllocatedLocked();
+}
+
+void PixelBuffer::EnsureVirtualDescriptorSlotsAllocatedLocked() {
     if (HasAnyDescriptorSlots()) {
         return;
     }
@@ -205,7 +217,7 @@ void PixelBuffer::EnsureVirtualDescriptorSlotsAllocated() {
     rm.ReserveDescriptorSlots(*this, views);
 }
 
-void PixelBuffer::EnsureMaterialized(const char* operation) const {
+void PixelBuffer::EnsureMaterializedLocked(const char* operation) const {
     if (m_backing) {
         return;
     }
@@ -213,6 +225,7 @@ void PixelBuffer::EnsureMaterialized(const char* operation) const {
 }
 
 void PixelBuffer::ApplyMetadataComponentBundle(const EntityComponentBundle& bundle) {
+    std::scoped_lock lock(m_materializationMutex);
     if (m_backing) {
         m_backing->ApplyMetadataComponentBundle(bundle);
     }
