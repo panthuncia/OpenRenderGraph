@@ -45,6 +45,7 @@ class ComputePassBuilder;
 class CopyPassBuilder;
 class CommandRecordingManager;
 struct IPassBuilder;
+struct IDynamicDeclaredResources;
 
 namespace ui {
 	struct FrameGraphSnapshot;
@@ -282,6 +283,17 @@ public:
 		return (uint8_t(m) & uint8_t(f)) != 0;
 	}
 
+	struct RetainedDeclarationCache {
+		bool hasDynamicDeclaredResources = false;
+		IDynamicDeclaredResources* dynamicInterface = nullptr;
+
+		bool containsEphemeralOrAnonymousHandles = false;
+		bool requiresStaleHandleValidation = false;
+
+		uint64_t resolverSnapshotHash = 0;
+		uint64_t declarationGeneration = 0;
+	};
+
 	struct RenderPassAndResources { // TODO: I'm currently copying these a lot; maybe use pointers instead
 		std::shared_ptr<RenderPass> pass;
 		RenderPassParameters resources;
@@ -295,6 +307,7 @@ public:
 		std::shared_ptr<rg::imm::KeepAliveBag> immediateKeepAlive = nullptr; // Keeps alive resources used by immediate execution bytecode
 		std::vector<std::shared_ptr<Resource>> retainedAnonymousKeepAlive; // Keeps retained anonymous handles alive across frames
 		std::vector<ResolverSnapshot> resolverSnapshots; // Versioned resolver snapshots for auto-invalidation
+		RetainedDeclarationCache declarationCache;
 	};
 
 	struct ComputePassAndResources { // TODO: Same as above
@@ -310,6 +323,7 @@ public:
 		std::shared_ptr<rg::imm::KeepAliveBag> immediateKeepAlive = nullptr; // Keeps alive resources used by immediate execution bytecode
 		std::vector<std::shared_ptr<Resource>> retainedAnonymousKeepAlive; // Keeps retained anonymous handles alive across frames
 		std::vector<ResolverSnapshot> resolverSnapshots; // Versioned resolver snapshots for auto-invalidation
+		RetainedDeclarationCache declarationCache;
 	};
 
 	struct CopyPassAndResources {
@@ -325,6 +339,7 @@ public:
 		std::shared_ptr<rg::imm::KeepAliveBag> immediateKeepAlive = nullptr;
 		std::vector<std::shared_ptr<Resource>> retainedAnonymousKeepAlive; // Keeps retained anonymous handles alive across frames
 		std::vector<ResolverSnapshot> resolverSnapshots; // Versioned resolver snapshots for auto-invalidation
+		RetainedDeclarationCache declarationCache;
 	};
 
 	enum class BatchWaitPhase : uint8_t {
@@ -520,12 +535,13 @@ public:
 			return queueWaitFenceValue[WaitPhaseIndex(phase)][dst][src];
 		}
 
-		std::unordered_map<uint64_t, SymbolicTracker*> passBatchTrackers; // Trackers for the resources in this batch
+		std::vector<SymbolicTracker*> passBatchTrackersByResourceIndex; // Trackers for the resources in this batch
 	};
 
 	RenderGraph(rhi::Device device);
 	~RenderGraph();
 	using AutoAliasReasonCount = rg::alias::AutoAliasReasonCount;
+	using AutoAliasExcludedResourceDebug = rg::alias::AutoAliasExcludedResourceDebug;
 	using AutoAliasPoolRangeDebug = rg::alias::AutoAliasPoolRangeDebug;
 	using AutoAliasPoolDebug = rg::alias::AutoAliasPoolDebug;
 	using AutoAliasDebugSnapshot = rg::alias::AutoAliasDebugSnapshot;
@@ -702,10 +718,15 @@ private:
 	
 	enum class AccessKind : uint8_t { Read, Write };
 
+	struct NodeAccess {
+		uint32_t resourceIndex = 0;
+		AccessKind kind = AccessKind::Read;
+	};
+
 	struct DenseEquivalentResourceSummary {
 		uint64_t resourceID = 0;
 		size_t resourceIndex = 0;
-		std::vector<size_t> equivalentResourceIndices;
+		const std::vector<size_t>* equivalentResourceIndices = nullptr;
 	};
 
 	struct DenseRequirementSummary {
@@ -715,7 +736,7 @@ private:
 		RangeSpec range{};
 		ResourceState state{};
 		bool isUAV = false;
-		std::vector<size_t> equivalentResourceIndices;
+		const std::vector<size_t>* equivalentResourceIndices = nullptr;
 	};
 
 	struct FramePassSchedulingSummary {
@@ -726,11 +747,64 @@ private:
 		std::vector<size_t> uavResourceIndices;
 	};
 
+	struct FramePassRequirementStaticSummary {
+		ResourceRegistry::RegistryHandle resource;
+		uint64_t resourceID = 0;
+		RangeSpec range{};
+		ResourceState state{};
+		bool isUAV = false;
+		bool isWrite = false;
+	};
+
+	struct FramePassInternalTransitionStaticSummary {
+		ResourceRegistry::RegistryHandle resource;
+		uint64_t resourceID = 0;
+	};
+
+	struct FramePassStaticAccessSummary {
+		std::vector<FramePassRequirementStaticSummary> requirementSummaries;
+		std::vector<FramePassInternalTransitionStaticSummary> internalTransitionSummaries;
+		std::vector<uint64_t> touchedResourceIDs;
+		std::vector<uint64_t> uavResourceIDs;
+		std::vector<NodeAccess> dagAccesses;
+		PassType type = PassType::Unknown;
+		QueueKind preferredQueueKind = QueueKind::Graphics;
+		QueueAssignmentPolicy queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
+		std::optional<QueueSlotIndex> pinnedQueueSlot;
+	};
+
 	struct FrameResourceEventSummary {
 		unsigned int latestBatch = 0;
 		unsigned int previousBatch = 0;
 		uint64_t latestQueueMask = 0;
 		uint64_t previousQueueMask = 0;
+	};
+
+	struct FrameCompileResourceState {
+		struct FastStateShadow {
+			bool valid = false;
+			bool wholeResourceOnly = false;
+			ResourceState state{};
+		};
+
+		uint64_t resourceID = 0;
+		Resource* resource = nullptr;
+		SymbolicTracker tracker;
+		bool trackerInitialized = false;
+		bool readOnlyUniformTransitionChecked = false;
+		FastStateShadow fastState{};
+	};
+
+	struct FrameResourceAccessSummary {
+		bool hasWrite = false;
+		bool hasUAV = false;
+		bool hasInternalTransition = false;
+		bool hasAliasActivation = false;
+		bool hasMultipleRequiredStates = false;
+		bool hasNonWholeResourceRange = false;
+		bool readOnlyUniform = false;
+		bool uniformStateInitialized = false;
+		ResourceState uniformState{};
 	};
 
 	struct BatchBuildState {
@@ -829,14 +903,11 @@ private:
 		uint8_t compatibleQueueKindMask = 0;
 		std::optional<size_t> assignedQueueSlot; // Final slot chosen during frame scheduling
 		uint32_t originalOrder = 0;
+		size_t topoRank = 0;
 
 		// Expanded IDs (aliases + group/child fixpoint)
 		std::vector<uint64_t> touchedIDs;
 		std::vector<uint64_t> uavIDs;
-
-		// For dependency building: per expanded ID, strongest access in this pass.
-		// Write dominates read. Sorted by ID after BuildNodes.
-		std::vector<std::pair<uint64_t, AccessKind>> accessByID;
 
 		// DAG
 		std::vector<size_t> out;
@@ -875,19 +946,30 @@ private:
 	std::unordered_map<uint64_t, uint64_t> aliasPlacementSignatureByID;
 	std::unordered_map<uint64_t, rg::alias::AliasPlacementRange> aliasPlacementRangesByID;
 	std::unordered_map<uint64_t, rg::alias::AliasPlacementRange> schedulingPlacementRangesByID;
+	std::vector<rg::alias::AliasPlacementRange> m_aliasPlacementRangeByResourceIndex;
+	std::vector<uint8_t> m_hasAliasPlacementByResourceIndex;
+	std::vector<rg::alias::AliasPlacementRange> m_schedulingPlacementRangeByResourceIndex;
+	std::vector<uint8_t> m_hasSchedulingPlacementByResourceIndex;
 	std::unordered_map<uint64_t, std::vector<uint64_t>> m_schedulingEquivalentIDsCache;
+	std::unordered_map<uint64_t, size_t> m_frameDAGResourceIndexByID;
+	std::vector<uint64_t> m_frameDAGResourceIDsByIndex;
+	size_t m_frameDAGResourceCount = 0;
 	std::unordered_map<uint64_t, size_t> m_frameSchedulingResourceIndexByID;
 	size_t m_frameSchedulingResourceCount = 0;
+	std::vector<std::vector<size_t>> m_equivalentResourceIndicesByResourceIndex;
+	std::vector<uint8_t> m_aliasActivationPendingByResourceIndex;
 	std::vector<unsigned int> m_frameQueueLastUsageBatch;
 	std::vector<unsigned int> m_frameQueueLastProducerBatch;
 	std::vector<unsigned int> m_frameQueueLastTransitionBatch;
 	std::vector<FrameResourceEventSummary> m_frameResourceEventSummaries;
+	std::vector<FramePassStaticAccessSummary> m_framePassAccessSummaries;
 	std::vector<FramePassSchedulingSummary> m_framePassSchedulingSummaries;
 	std::unordered_map<uint64_t, uint64_t> aliasPlacementPoolByID;
 	std::unordered_set<uint64_t> aliasActivationPending;
 
 	using PersistentAliasPoolState = rg::alias::PersistentAliasPoolState;
 	std::unordered_map<uint64_t, PersistentAliasPoolState> persistentAliasPools;
+	std::unordered_map<uint64_t, rg::alias::CachedAliasPoolPlan> cachedAliasPlanByPoolID;
 	uint64_t aliasPoolPlanFrameIndex = 0;
 	uint32_t aliasPoolRetireIdleFrames = 120;
 	float aliasPoolGrowthHeadroom = 1.5f;
@@ -902,7 +984,8 @@ private:
 	std::shared_ptr<rg::runtime::IRenderGraphSettingsService> m_renderGraphSettingsService;
 	std::shared_ptr<rg::runtime::ITaskService> m_taskService;
 	std::unordered_map<uint64_t, SymbolicTracker*> trackers; // Tracks the state of resources in the graph.
-	std::unordered_map<uint64_t, SymbolicTracker> compileTrackers; // Compile-only symbolic state, decoupled from backing lifetime.
+	std::vector<FrameCompileResourceState> m_frameCompileResources; // Compile-only symbolic state, indexed by frame-local resource index.
+	std::vector<FrameResourceAccessSummary> m_frameResourceAccessSummaries;
 	std::unordered_map<uint64_t, LastProducerAcrossFrames> m_lastProducerByResourceAcrossFrames;
 	std::unordered_map<uint64_t, std::vector<LastAliasPlacementProducerAcrossFrames>> m_lastAliasPlacementProducersByPoolAcrossFrames;
 	std::vector<std::unordered_map<uint64_t, unsigned int>> m_compiledLastProducerBatchByResourceByQueue;
@@ -956,7 +1039,7 @@ private:
 	}
 
 	void MaterializeUnmaterializedResources(const std::unordered_set<uint64_t>* onlyResourceIDs = nullptr);
-	SymbolicTracker& GetOrCreateCompileTracker(Resource* resource, uint64_t resourceID);
+	FrameCompileResourceState& GetOrCreateFrameCompileResourceState(size_t resourceIndex, Resource* resource, uint64_t resourceID);
 	void CaptureCompileTrackersForExecution(const std::unordered_set<uint64_t>& resourceIDs);
 	void PublishCompiledTrackerStates();
 	void MaterializeReferencedResources(
@@ -972,11 +1055,21 @@ private:
 	void ValidateCompiledResourceGenerations() const;
 	void RebuildSchedulingEquivalentIDCache(const std::unordered_set<uint64_t>& resourceIDs);
 	void RebuildFrameSchedulingResourceIndex(const std::unordered_set<uint64_t>& resourceIDs);
+	void RebuildEquivalentResourceIndicesByResourceIndex();
+	void RebuildFrameCompileResources();
 	void RebuildFramePassSchedulingSummaries();
+	void RebuildFrameResourceAccessSummaries(const std::vector<Node>& nodes);
+	void ResetCompileFrameState();
+	void ResetStructuralBuildState();
 	void ClearFrameSchedulingResourceIndex();
 	void ClearFramePassSchedulingSummaries();
 	void ResetFrameQueueBatchHistoryTables();
 	std::optional<size_t> TryGetFrameSchedulingResourceIndex(uint64_t resourceID) const;
+	const rg::alias::AliasPlacementRange* TryGetAliasPlacementRangeByResourceIndex(size_t resourceIndex) const;
+	const rg::alias::AliasPlacementRange* TryGetAliasPlacementRange(uint64_t resourceID) const;
+	const rg::alias::AliasPlacementRange* TryGetSchedulingPlacementRangeByResourceIndex(size_t resourceIndex) const;
+	const rg::alias::AliasPlacementRange* TryGetSchedulingPlacementRange(uint64_t resourceID) const;
+	std::vector<uint64_t> BuildSchedulingEquivalentIDs(uint64_t resourceID) const;
 	size_t FrameQueueBatchHistoryOffset(size_t queueSlot, size_t resourceIndex) const;
 	unsigned int GetFrameQueueHistoryValue(const std::vector<unsigned int>& history, size_t queueSlot, size_t resourceIndex) const;
 	void SetFrameQueueHistoryValue(std::vector<unsigned int>& history, size_t queueSlot, size_t resourceIndex, unsigned int batchIndex);
@@ -998,7 +1091,7 @@ private:
 	//void ComputeResourceLoops();
 	bool IsNewBatchNeeded(
 		const FramePassSchedulingSummary& passSummary,
-		const std::unordered_map<uint64_t, SymbolicTracker*>& passBatchTrackers,
+		const std::vector<SymbolicTracker*>& passBatchTrackersByResourceIndex,
 		const BatchBuildState& batchBuildState,
 		std::string_view candidatePassName,
 		unsigned int currentBatchIndex,
@@ -1134,6 +1227,35 @@ private:
 		std::unordered_set<uint64_t>& outTransitionedResourceIDs,
 		std::unordered_set<size_t>& outFallbackResourceIndices,
 		std::vector<ResourceTransition>& scratchTransitions);
+	bool TryAddTransitionFastNoOp(
+		unsigned int batchIndex,
+		PassBatch& currentBatch,
+		size_t passQueueSlot,
+		const DenseRequirementSummary& requirement,
+		ResourceState requiredState);
+	void AddTransitionSlowPath(
+		unsigned int batchIndex,
+		PassBatch& currentBatch,
+		size_t passQueueSlot,
+		std::string_view passName,
+		const DenseRequirementSummary& requirement,
+		ResourceState requiredState,
+		std::unordered_set<uint64_t>& outTransitionedResourceIDs,
+		std::unordered_set<size_t>& outFallbackResourceIndices,
+		std::vector<ResourceTransition>& scratchTransitions);
+
+	struct AddTransitionDebugStats {
+		std::string resourceName;
+		size_t callCount = 0;
+		size_t noOpCallCount = 0;
+		size_t emittedTransitionCount = 0;
+		size_t earlyPlacedTransitionCount = 0;
+		size_t beforePassTransitionCount = 0;
+		size_t graphicsFallbackTransitionCount = 0;
+		size_t aliasActivationTransitionCount = 0;
+	};
+
+	void LogAddTransitionDebugSummary() const;
 
 	static inline bool IsUAVState(const ResourceState& s) noexcept {
 		return ((s.access & rhi::ResourceAccessType::UnorderedAccess) != 0) ||
@@ -1142,8 +1264,8 @@ private:
 
 	struct PassView {
 		bool isCompute = false;
-		std::vector<ResourceRequirement>* reqs = nullptr;
-		std::vector<std::pair<ResourceHandleAndRange, ResourceState>>* internalTransitions = nullptr;
+		std::span<const ResourceRequirement> reqs{};
+		const std::vector<std::pair<ResourceHandleAndRange, ResourceState>>* internalTransitions = nullptr;
 	};
 
 	struct SeqState {
@@ -1152,12 +1274,14 @@ private:
 	};
 
 	using AutoAliasPlannerStats = rg::alias::AutoAliasPlannerStats;
+	using CachedAliasPoolPlan = rg::alias::CachedAliasPoolPlan;
 
-	static PassView GetPassView(AnyPassAndResources& pr);
-	static bool BuildDependencyGraph(std::vector<Node>& nodes);
-	static bool BuildDependencyGraph(std::vector<Node>& nodes, std::span<const std::pair<size_t, size_t>> explicitEdges);
+	static PassView GetPassView(const AnyPassAndResources& pr);
+	void RebuildFramePassAccessSummaries();
+	bool BuildDependencyGraph(std::vector<Node>& nodes);
+	bool BuildDependencyGraph(std::vector<Node>& nodes, std::span<const std::pair<size_t, size_t>> explicitEdges);
 	static bool FinalizeDependencyGraph(std::vector<Node>& nodes);
-	static std::vector<Node> BuildNodes(RenderGraph& rg, std::vector<AnyPassAndResources>& passes);
+	static std::vector<Node> BuildNodes(RenderGraph& rg);
 	static std::vector<uint8_t> PlanActiveQueueSlots(RenderGraph& rg, const std::vector<AnyPassAndResources>& passes, const std::vector<Node>& nodes);
 	static bool AddEdgeDedup(
 		size_t from, size_t to,
@@ -1182,6 +1306,7 @@ private:
 	std::unordered_map<uint64_t, uint64_t> autoAliasPoolByID;
 	std::unordered_map<uint64_t, std::string> autoAliasExclusionReasonByID;
 	std::vector<AutoAliasReasonCount> autoAliasExclusionReasonSummary;
+	std::vector<AutoAliasExcludedResourceDebug> autoAliasExcludedResources;
 	std::vector<AutoAliasPoolDebug> autoAliasPoolDebug;
 	AutoAliasPlannerStats autoAliasPlannerStats;
 	AutoAliasMode autoAliasPreviousMode = AutoAliasMode::Off;
@@ -1192,8 +1317,10 @@ private:
 	std::function<bool()> m_getRenderGraphCompileDumpEnabled;
 	std::function<bool()> m_getRenderGraphVramDumpEnabled;
 	std::function<bool()> m_getRenderGraphBatchTraceEnabled;
+	std::function<bool()> m_getReadOnlyUniformTransitionElisionEnabled;
 	std::function<bool()> m_getAutoAliasEnableLogging;
 	std::function<bool()> m_getAutoAliasLogExclusionReasons;
+	std::function<bool()> m_getAutoAliasBuildDebugData;
 	std::function<bool()> m_getQueueSchedulingEnableLogging;
 	std::function<float()> m_getQueueSchedulingWidthScale;
 	std::function<float()> m_getQueueSchedulingPenaltyBias;
@@ -1203,6 +1330,7 @@ private:
 	std::function<float()> m_getQueueSchedulingAutoGraphicsBias;
 	std::function<float()> m_getQueueSchedulingAsyncOverlapBonus;
 	std::function<float()> m_getQueueSchedulingCrossQueueHandoffPenalty;
+	std::unordered_map<uint64_t, AddTransitionDebugStats> m_addTransitionDebugStatsByResource;
 	std::function<uint32_t()> m_getAutoAliasPoolRetireIdleFrames;
 	std::function<float()> m_getAutoAliasPoolGrowthHeadroom;
 	std::function<void(std::string_view)> m_structuralMaterializeCheckpointCallback;

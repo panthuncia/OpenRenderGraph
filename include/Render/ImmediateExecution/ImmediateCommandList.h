@@ -212,11 +212,14 @@ namespace rg::imm {
     };
 
     struct FrameData {
-        FrameData() : keepAlive(std::make_unique<KeepAliveBag>()) {}
         std::vector<std::byte> bytecode;                 // replay payload
         std::vector<ResourceRequirement> requirements;   // merged segments
 		std::unique_ptr<KeepAliveBag> keepAlive; // Keeps owned resource wrappers alive for the frame. Only used by UploadManager, currently
-        void Reset() { bytecode.clear(); requirements.clear(); }
+        void Reset() {
+			bytecode.clear();
+			requirements.clear();
+			keepAlive.reset();
+		}
     };
 
     enum class ImmediatePassKind : uint8_t { Render, Compute, Copy };
@@ -234,11 +237,14 @@ namespace rg::imm {
             , m_resolveByIdFn(resolveByIdFn)
             , m_resolveByPtrFn(resolveByPtrFn)
             , m_resolveUser(resolveUser)
-			, m_keepAlive(std::make_unique<KeepAliveBag>())
         {
         }
 
         void Reset();
+
+		bool HasRecordedWork() const noexcept {
+			return !m_writer.data.empty();
+		}
 
         // API: resources can be ResourceIdentifier or Resource*
 

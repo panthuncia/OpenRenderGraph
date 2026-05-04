@@ -2,6 +2,7 @@
 
 #include <directx/d3d12.h>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <functional>
 
@@ -80,6 +81,7 @@ private:
 	rhi::Queue m_computeQueue;
 	rhi::Queue m_copyQueue;
 	rhi::ma::Allocator* m_allocator = nullptr;
+	mutable std::mutex m_resourceCreationMutex;
 	inline static TrackingHooks s_trackingHooks{};
 
 };

@@ -293,12 +293,21 @@ namespace rg::imm {
         m_writer.Reset();
         m_handles.clear();
         m_access.clear();
+        if (m_keepAlive) {
+            m_keepAlive->pins.clear();
+        }
     }
 
     FrameData ImmediateCommandList::Finalize() {
         FrameData out;
-        out.bytecode = m_writer.data;
-        out.keepAlive = std::move(m_keepAlive);
+        if (!HasRecordedWork()) {
+            return out;
+        }
+
+        out.bytecode = std::move(m_writer.data);
+        if (m_keepAlive && !m_keepAlive->pins.empty()) {
+            out.keepAlive = std::move(m_keepAlive);
+        }
 
         out.requirements.reserve(64);
 
@@ -412,6 +421,9 @@ namespace rg::imm {
         m_handles[rid] = handle;
 
         if (keepAlive) {
+            if (!m_keepAlive) {
+                m_keepAlive = std::make_unique<KeepAliveBag>();
+            }
             m_keepAlive->pinShared(keepAlive);
         }
 

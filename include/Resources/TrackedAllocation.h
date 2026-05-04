@@ -1,6 +1,7 @@
 #pragma once
 
 #include <functional>
+#include <mutex>
 #include <variant>
 
 #include <flecs.h>
@@ -37,8 +38,19 @@ struct EntityComponentBundle {
 
 struct TrackedEntityToken {
     struct Hooks {
+        std::function<TrackedEntityToken(flecs::entity existing)> createEntity;
         std::function<bool()> isRuntimeAlive;
+        std::function<bool()> isMainThread;
         std::function<void(flecs::world&, flecs::entity_t)> destroyEntity;
+    };
+
+    struct DeferredState {
+        mutable std::mutex mutex;
+        flecs::world* world = nullptr;
+        flecs::entity_t id = 0;
+        std::vector<std::function<void(flecs::entity)>> pendingOps;
+        bool destroyRequested = false;
+        bool destroyed = false;
     };
 
     static void SetHooks(Hooks hooks) {
@@ -51,13 +63,28 @@ struct TrackedEntityToken {
 
     flecs::world* world = nullptr;
     flecs::entity_t id = 0;
+    std::shared_ptr<DeferredState> deferredState;
 
     TrackedEntityToken() = default;
     TrackedEntityToken(flecs::world& w, flecs::entity_t e) noexcept : world(&w), id(e) {}
 
+    static TrackedEntityToken CreateFromHooks(flecs::entity existing = {}) {
+        if (s_hooks.createEntity) {
+            return s_hooks.createEntity(existing);
+        }
+        return {};
+    }
+
+    static TrackedEntityToken CreateDeferred() {
+        TrackedEntityToken token;
+        token.deferredState = std::make_shared<DeferredState>();
+        return token;
+    }
+
     TrackedEntityToken(TrackedEntityToken&& o) noexcept
         : world(std::exchange(o.world, nullptr))
-        , id(std::exchange(o.id, 0)) {
+        , id(std::exchange(o.id, 0))
+        , deferredState(std::move(o.deferredState)) {
     }
 
     TrackedEntityToken& operator=(TrackedEntityToken&& o) noexcept {
@@ -65,6 +92,7 @@ struct TrackedEntityToken {
             Reset();
             world = std::exchange(o.world, nullptr);
             id = std::exchange(o.id, 0);
+            deferredState = std::move(o.deferredState);
         }
         return *this;
     }
@@ -75,27 +103,140 @@ struct TrackedEntityToken {
     ~TrackedEntityToken() { Reset(); }
 
     void ApplyAttachBundle(const EntityComponentBundle& bundle) const noexcept {
+        if (deferredState) {
+            flecs::world* resolvedWorld = nullptr;
+            flecs::entity_t resolvedId = 0;
+            bool applyImmediately = false;
+            {
+                std::scoped_lock lock(deferredState->mutex);
+                if (deferredState->destroyRequested || deferredState->destroyed) {
+                    return;
+                }
+
+                if (deferredState->world && deferredState->id && s_hooks.isMainThread && s_hooks.isMainThread()) {
+                    resolvedWorld = deferredState->world;
+                    resolvedId = deferredState->id;
+                    applyImmediately = true;
+                }
+                else {
+                    deferredState->pendingOps.insert(
+                        deferredState->pendingOps.end(),
+                        bundle.ops.begin(),
+                        bundle.ops.end());
+                }
+            }
+
+            if (applyImmediately) {
+                auto e = flecs::entity{ *resolvedWorld, resolvedId };
+                bundle.ApplyTo(e);
+            }
+            return;
+        }
+
         if (world && id) {
 			auto e = flecs::entity{ *world, id };
 			bundle.ApplyTo(e);
         }
     }
 
-    void Disarm() noexcept { world = nullptr; id = 0; }
+    void Disarm() noexcept {
+        world = nullptr;
+        id = 0;
+        if (deferredState) {
+            std::scoped_lock lock(deferredState->mutex);
+            deferredState->world = nullptr;
+            deferredState->id = 0;
+            deferredState->destroyed = true;
+            deferredState->pendingOps.clear();
+        }
+    }
+
+    bool RequestDestroy() const noexcept {
+        if (!deferredState) {
+            return world && id;
+        }
+
+        std::scoped_lock lock(deferredState->mutex);
+        deferredState->destroyRequested = true;
+        deferredState->pendingOps.clear();
+        return deferredState->world && deferredState->id && !deferredState->destroyed;
+    }
+
+    bool Resolve(flecs::world& resolvedWorld, flecs::entity_t resolvedId, std::vector<std::function<void(flecs::entity)>>& outPendingOps, bool& outDestroyRequested) const noexcept {
+        if (!deferredState) {
+            outPendingOps.clear();
+            outDestroyRequested = false;
+            return false;
+        }
+
+        std::scoped_lock lock(deferredState->mutex);
+        outPendingOps = std::move(deferredState->pendingOps);
+        deferredState->pendingOps.clear();
+        outDestroyRequested = deferredState->destroyRequested;
+        if (deferredState->destroyed || deferredState->destroyRequested) {
+            deferredState->world = nullptr;
+            deferredState->id = 0;
+            deferredState->destroyed = true;
+            outPendingOps.clear();
+            return false;
+        }
+
+        deferredState->world = &resolvedWorld;
+        deferredState->id = resolvedId;
+        return true;
+    }
+
+    bool TryGetResolved(flecs::world*& outWorld, flecs::entity_t& outId) const noexcept {
+        if (world && id) {
+            outWorld = world;
+            outId = id;
+            return true;
+        }
+        if (!deferredState) {
+            return false;
+        }
+
+        std::scoped_lock lock(deferredState->mutex);
+        if (!deferredState->world || !deferredState->id || deferredState->destroyed) {
+            return false;
+        }
+
+        outWorld = deferredState->world;
+        outId = deferredState->id;
+        return true;
+    }
+
+    void MarkDestroyed() const noexcept {
+        if (!deferredState) {
+            return;
+        }
+
+        std::scoped_lock lock(deferredState->mutex);
+        deferredState->world = nullptr;
+        deferredState->id = 0;
+        deferredState->destroyed = true;
+        deferredState->pendingOps.clear();
+    }
 
     void Reset() noexcept {
-        if (world && id) {
+        flecs::world* resolvedWorld = nullptr;
+        flecs::entity_t resolvedId = 0;
+        const bool hasResolvedEntity = TryGetResolved(resolvedWorld, resolvedId);
+        if (hasResolvedEntity || deferredState) {
             if (s_hooks.isRuntimeAlive && !s_hooks.isRuntimeAlive()) {
                 Disarm();
                 return;
             }
 
-            if (s_hooks.destroyEntity) {
-                s_hooks.destroyEntity(*world, id);
-            }
-            else {
-                flecs::entity e{ *world, id };
-                if (e.is_alive()) e.destruct();
+            RequestDestroy();
+            if (hasResolvedEntity) {
+                if (s_hooks.destroyEntity) {
+					s_hooks.destroyEntity(*resolvedWorld, resolvedId);
+                }
+                else {
+					flecs::entity e{ *resolvedWorld, resolvedId };
+					if (e.is_alive()) e.destruct();
+                }
             }
         }
         Disarm();

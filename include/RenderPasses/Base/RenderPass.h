@@ -36,7 +36,9 @@ struct RenderPassParameters {
 	std::vector<AutoDescriptorRegistration> autoDescriptorConstantBuffers;
 	std::vector<AutoDescriptorRegistration> autoDescriptorUnorderedAccessViews;
 	std::vector<ResourceRequirement> staticResourceRequirements; // Static resource requirements for the pass
-	std::vector<ResourceRequirement> frameResourceRequirements; // Resource requirements that may change each frame + static ones
+	std::vector<ResourceRequirement> frameResourceRequirements; // Immediate-mode requirements recorded for this frame
+	mutable std::vector<ResourceRequirement> mergedFrameResourceRequirements; // Lazily built static + immediate requirements when a contiguous view is needed
+	mutable bool mergedFrameRequirementsDirty = false;
 	bool isGeometryPass = false;
 	QueueKind preferredQueueKind = QueueKind::Graphics;
 	QueueAssignmentPolicy queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
@@ -74,7 +76,6 @@ public:
     virtual void Setup() = 0;
 
 	virtual void Update(const UpdateExecutionContext& context) {};
-	virtual void RecordImmediateCommands(ImmediateExecutionContext& context) {};
 	virtual PassReturn Execute(PassExecutionContext& context) { return {}; };
     virtual void Cleanup() = 0;
 

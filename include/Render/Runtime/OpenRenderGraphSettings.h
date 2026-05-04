@@ -15,10 +15,12 @@ struct OpenRenderGraphSettings {
     bool renderGraphCompileDumpEnabled = false;
     bool renderGraphVramDumpEnabled = false;
     bool renderGraphBatchTraceEnabled = false;
+    bool readOnlyUniformTransitionElisionEnabled = false;
     uint8_t autoAliasMode = 2;
     uint8_t autoAliasPackingStrategy = 0;
     bool autoAliasEnableLogging = false;
     bool autoAliasLogExclusionReasons = false;
+    bool autoAliasBuildDebugData = false;
     bool queueSchedulingEnableLogging = false;
     float queueSchedulingWidthScale = 1.0f;
     float queueSchedulingPenaltyBias = 0.0f;

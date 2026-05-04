@@ -23,6 +23,10 @@ public:
         return GetOpenRenderGraphSettings().renderGraphBatchTraceEnabled;
     }
 
+    bool GetReadOnlyUniformTransitionElisionEnabled() const override {
+        return GetOpenRenderGraphSettings().readOnlyUniformTransitionElisionEnabled;
+    }
+
     uint8_t GetAutoAliasMode() const override {
         return GetOpenRenderGraphSettings().autoAliasMode;
     }
@@ -37,6 +41,10 @@ public:
 
     bool GetAutoAliasLogExclusionReasons() const override {
         return GetOpenRenderGraphSettings().autoAliasLogExclusionReasons;
+    }
+
+    bool GetAutoAliasBuildDebugData() const override {
+        return GetOpenRenderGraphSettings().autoAliasBuildDebugData;
     }
 
     bool GetQueueSchedulingEnableLogging() const override {

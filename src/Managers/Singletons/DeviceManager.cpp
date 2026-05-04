@@ -20,6 +20,8 @@ rhi::Result DeviceManager::CreateResourceTracked(
     TrackedHandle& outAllocation,
     std::optional<AllocationTrackDesc> trackDesc) const noexcept
 {
+    std::scoped_lock lock(m_resourceCreationMutex);
+
     rhi::ma::AllocationPtr alloc;
     const auto result = m_allocator->CreateResource(
         &allocDesc,
@@ -63,6 +65,8 @@ rhi::Result DeviceManager::CreateAliasingResourceTracked(
     TrackedHandle& outResource,
     std::optional<AllocationTrackDesc> trackDesc) const noexcept
 {
+    std::scoped_lock lock(m_resourceCreationMutex);
+
     rhi::ResourcePtr res;
     const auto result = m_allocator->CreateAliasingResource(
         &allocation,
@@ -102,6 +106,8 @@ rhi::Result DeviceManager::AllocateMemoryTracked(
     TrackedHandle& outAllocation,
     std::optional<AllocationTrackDesc> trackDesc) const noexcept
 {
+    std::scoped_lock lock(m_resourceCreationMutex);
+
     rhi::ma::AllocationPtr alloc;
     const auto result = m_allocator->AllocateMemory(allocDesc, allocationInfo, alloc);
 
@@ -131,6 +137,10 @@ rhi::Result DeviceManager::AllocateMemoryTracked(
 void DeviceManager::Initialize(rhi::Device device) {
     if (!s_trackingHooks.createTrackingToken) {
         s_trackingHooks.createTrackingToken = [](flecs::entity existing) {
+            if (auto token = TrackedEntityToken::CreateFromHooks(existing); token.world || token.id || token.deferredState) {
+                return token;
+            }
+
             auto& world = ECSManager::GetInstance().GetWorld();
             flecs::entity entity = existing;
             if (!entity.is_alive()) {
