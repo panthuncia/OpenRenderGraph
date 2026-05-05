@@ -42,6 +42,7 @@ public:
 	}
 
 	void SetName(const char* newName);
+	bool HasValidResource() const;
 	// Debug helper: dumps any live textures that haven't been destroyed yet.
 	static unsigned int DumpLiveTextures();
 

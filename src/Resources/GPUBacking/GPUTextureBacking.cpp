@@ -8,6 +8,7 @@
 #include "Managers/Singletons/UploadManager.h"
 #include "Managers/Singletons/DeletionManager.h"
 #include "Resources/MemoryStatisticsComponents.h"
+#include <rhi_interop.h>
 
 namespace {
 uint16_t ResolveTextureMipLevels(const TextureDescription& desc)
@@ -221,7 +222,7 @@ void GpuTextureBacking::initialize(const TextureDescription& desc,
 
 	size_t subCount = m_mipLevels * m_arraySize;
 
-	if (name) {
+	if (name && HasValidResource()) {
 		m_textureHandle.GetResource().SetName(name);
 	}
 
@@ -232,9 +233,28 @@ void GpuTextureBacking::initialize(const TextureDescription& desc,
 
 void GpuTextureBacking::SetName(const char* newName)
 {
+	if (!newName || !HasValidResource()) {
+		return;
+	}
 	m_textureHandle.ApplyComponentBundle(EntityComponentBundle().Set<MemoryStatisticsComponents::ResourceName>({ newName }));
 	m_textureHandle.GetResource().SetName(newName);
 	UpdateLiveAllocName(newName);
+}
+
+bool GpuTextureBacking::HasValidResource() const
+{
+	if (!m_textureHandle) {
+		return false;
+	}
+
+	auto& resource = const_cast<TrackedHandle&>(m_textureHandle).GetResource();
+	if (!resource.IsValid()) {
+		return false;
+	}
+
+	rhi::D3D12ResourceInfo resourceInfo{};
+	return rhi::QueryNativeResource(resource, rhi::RHI_IID_D3D12_RESOURCE, &resourceInfo, sizeof(resourceInfo)) &&
+		resourceInfo.resource != nullptr;
 }
 
 std::mutex& GpuTextureBacking::LiveAllocMutex() {

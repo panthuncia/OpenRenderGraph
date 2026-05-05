@@ -126,9 +126,14 @@ rhi::BarrierBatch PixelBuffer::GetEnhancedBarrierGroup(
 
 void PixelBuffer::OnSetName() {
     std::scoped_lock lock(m_materializationMutex);
-    if (m_backing) {
+    if (m_backing && m_backing->HasValidResource()) {
         m_backing->SetName(name.c_str());
     }
+}
+
+bool PixelBuffer::HasValidBackingResource() const {
+    std::scoped_lock lock(m_materializationMutex);
+    return m_backing && m_backing->HasValidResource();
 }
 
 void PixelBuffer::ApplyMetadataComponentBundle(const EntityComponentBundle& bundle) const {

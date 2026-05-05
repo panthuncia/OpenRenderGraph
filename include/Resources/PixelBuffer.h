@@ -78,6 +78,8 @@ public:
         return m_backing != nullptr;
     }
 
+    bool HasValidBackingResource() const;
+
     uint64_t GetBackingGeneration() const {
         return m_backingGeneration;
     }
