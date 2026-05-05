@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <mutex>
 #include <vector>
 
 #include <rhi_allocator.h>
@@ -13,14 +14,13 @@ class DeletionManager {
 public:
 	static DeletionManager& GetInstance();
 
-	bool IsInitialized() const noexcept {
-		return m_numFramesInFlight != 0 &&
-			!m_deletionQueue.empty() &&
-			!m_allocationDeletionQueue.empty() &&
-			!m_trackedAllocationDeletionQueue.empty();
+	bool IsInitialized() const {
+		std::scoped_lock lock(m_mutex);
+		return IsInitializedUnlocked();
 	}
 
 	void Initialize() {
+		std::scoped_lock lock(m_mutex);
 		m_numFramesInFlight = rg::runtime::GetOpenRenderGraphSettings().numFramesInFlight;
 		m_deletionQueue.resize(m_numFramesInFlight);
 		m_allocationDeletionQueue.resize(m_numFramesInFlight);
@@ -28,21 +28,24 @@ public:
 	}
 
 	void MarkForDelete(rhi::helpers::AnyObjectPtr ptr) {
-		if (!IsInitialized()) {
+		std::scoped_lock lock(m_mutex);
+		if (!IsInitializedUnlocked()) {
 			return;
 		}
 		m_deletionQueue[0].push_back(std::move(ptr));
 	}
 
 	void MarkForDelete(rhi::ma::AllocationPtr ptr) {
-		if (!IsInitialized()) {
+		std::scoped_lock lock(m_mutex);
+		if (!IsInitializedUnlocked()) {
 			return;
 		}
 		m_allocationDeletionQueue[0].push_back(std::move(ptr));
 	}
 
 	void MarkForDelete(TrackedHandle&& alloc) {
-		if (!IsInitialized()) {
+		std::scoped_lock lock(m_mutex);
+		if (!IsInitializedUnlocked()) {
 			alloc.Reset();
 			return;
 		}
@@ -50,7 +53,8 @@ public:
 	}
 
 	void ProcessDeletions() {
-		if (!IsInitialized()) {
+		std::scoped_lock lock(m_mutex);
+		if (!IsInitializedUnlocked()) {
 			return;
 		}
 		m_deletionQueue.back().clear();
@@ -70,7 +74,8 @@ public:
 	}
 
 	void DrainAll() {
-		if (!IsInitialized()) {
+		std::scoped_lock lock(m_mutex);
+		if (!IsInitializedUnlocked()) {
 			return;
 		}
 
@@ -86,6 +91,7 @@ public:
 	}
 
 	void Cleanup() {
+		std::scoped_lock lock(m_mutex);
 		m_deletionQueue.clear();
 		m_allocationDeletionQueue.clear();
 		m_trackedAllocationDeletionQueue.clear();
@@ -96,6 +102,14 @@ private:
 	uint8_t m_numFramesInFlight = 0;
 	DeletionManager() = default;
 
+	bool IsInitializedUnlocked() const noexcept {
+		return m_numFramesInFlight != 0 &&
+			!m_deletionQueue.empty() &&
+			!m_allocationDeletionQueue.empty() &&
+			!m_trackedAllocationDeletionQueue.empty();
+	}
+
+	mutable std::mutex m_mutex;
 	std::vector<std::vector<rhi::helpers::AnyObjectPtr>> m_deletionQueue;
 	std::vector<std::vector<rhi::ma::AllocationPtr>> m_allocationDeletionQueue;
 	std::vector<std::vector<TrackedHandle>> m_trackedAllocationDeletionQueue;
