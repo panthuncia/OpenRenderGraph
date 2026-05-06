@@ -85,14 +85,16 @@ BufferBase::~BufferBase() {
 
 rhi::Resource BufferBase::GetAPIResource() {
     if (!m_dataBuffer) {
-        throw std::runtime_error("Buffer resource is not materialized");
+		std::ostringstream err = std::ostringstream() << "Buffer resource '" << GetName() << "' is not materialized";
+        throw std::runtime_error(err.str());
     }
     return m_dataBuffer->GetAPIResource();
 }
 
 SymbolicTracker* BufferBase::GetStateTracker() {
     if (!m_dataBuffer) {
-        throw std::runtime_error("Buffer resource is not materialized");
+        std::ostringstream err = std::ostringstream() << "Buffer resource '" << GetName() << "' is not materialized";
+        throw std::runtime_error(err.str());
     }
     return m_dataBuffer->GetStateTracker();
 }
@@ -107,7 +109,8 @@ rhi::BarrierBatch BufferBase::GetEnhancedBarrierGroup(
     rhi::ResourceSyncState newSyncState)
 {
     if (!m_dataBuffer) {
-        throw std::runtime_error("Buffer resource is not materialized");
+        std::ostringstream err = std::ostringstream() << "Buffer resource '" << GetName() << "' is not materialized";
+        throw std::runtime_error(err.str());
     }
     return m_dataBuffer->GetEnhancedBarrierGroup(
         range,
