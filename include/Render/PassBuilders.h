@@ -8,6 +8,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include "Render/FeatureDomainRegistry.h"
 #include "Render/RenderGraph/RenderGraph.h"
 #include "ResourceRequirements.h"
 #include "Resources/ResourceStateTracker.h"
@@ -374,6 +375,57 @@ namespace detail {
     inline void extractId(auto& out, std::initializer_list<T> list) {
         for (auto const& e : list) extractId(out, e);
     }
+
+    inline void TrackFeatureDomainActivation(
+        std::unordered_set<FeatureDomainIdentifier, FeatureDomainIdentifier::Hasher>& activeDomains,
+        const ResourceIdentifier& id)
+    {
+        auto domain = FeatureDomainRegistry::Get().FindResourceDomain(id);
+        if (domain.has_value()) {
+            activeDomains.insert(*domain);
+        }
+    }
+
+    inline void TrackFeatureDomainActivation(
+        std::unordered_set<FeatureDomainIdentifier, FeatureDomainIdentifier::Hasher>& activeDomains,
+        const ResourceIdentifierAndRange& idAndRange)
+    {
+        TrackFeatureDomainActivation(activeDomains, idAndRange.identifier);
+    }
+
+    inline void TrackFeatureDomainActivation(
+        std::unordered_set<FeatureDomainIdentifier, FeatureDomainIdentifier::Hasher>& activeDomains,
+        const char* id)
+    {
+        if (!id) {
+            return;
+        }
+        TrackFeatureDomainActivation(activeDomains, ResourceIdentifier{ id });
+    }
+
+    inline void TrackFeatureDomainActivation(
+        std::unordered_set<FeatureDomainIdentifier, FeatureDomainIdentifier::Hasher>& activeDomains,
+        std::string_view id)
+    {
+        TrackFeatureDomainActivation(activeDomains, ResourceIdentifier{ id });
+    }
+
+    template<class S>
+        requires (std::convertible_to<S, std::string_view> && !std::is_same_v<std::remove_cvref_t<S>, const char*> && !std::is_same_v<std::remove_cvref_t<S>, char*>)
+    inline void TrackFeatureDomainActivation(
+        std::unordered_set<FeatureDomainIdentifier, FeatureDomainIdentifier::Hasher>& activeDomains,
+        S&& id)
+    {
+        TrackFeatureDomainActivation(activeDomains, ResourceIdentifier{ std::string_view{ std::forward<S>(id) } });
+    }
+
+    template<typename T>
+    inline void TrackFeatureDomainActivation(std::unordered_set<FeatureDomainIdentifier, FeatureDomainIdentifier::Hasher>&, const std::shared_ptr<T>&) {}
+
+    inline void TrackFeatureDomainActivation(std::unordered_set<FeatureDomainIdentifier, FeatureDomainIdentifier::Hasher>&, const ResourcePtrAndRange&) {}
+    inline void TrackFeatureDomainActivation(std::unordered_set<FeatureDomainIdentifier, FeatureDomainIdentifier::Hasher>&, const ResourceHandleAndRange&) {}
+    inline void TrackFeatureDomainActivation(std::unordered_set<FeatureDomainIdentifier, FeatureDomainIdentifier::Hasher>&, const ResourceResolverAndRange&) {}
+    inline void TrackFeatureDomainActivation(std::unordered_set<FeatureDomainIdentifier, FeatureDomainIdentifier::Hasher>&, const IResourceResolver&) {}
 }
 
 
@@ -758,6 +810,12 @@ public:
         return *this;
     }
 
+    template<typename... Args>
+    RenderPassBuilder& WithActiveFeatureDomain(Args&&... args) & {
+        (addActiveFeatureDomain(std::forward<Args>(args)), ...);
+        return *this;
+    }
+
     // Second set, callable on temporaries
     template<typename... Args>
         requires ((NotIResourceResolver<Args>) && ...)
@@ -832,6 +890,12 @@ public:
         requires ResourceLike<T>
     RenderPassBuilder WithInternalTransition(T&& resource, ResourceState exitState)&& {
         addInternalTransition(std::forward<T>(resource), exitState);
+        return std::move(*this);
+    }
+
+    template<typename... Args>
+    RenderPassBuilder WithActiveFeatureDomain(Args&&... args) && {
+        (addActiveFeatureDomain(std::forward<Args>(args)), ...);
         return std::move(*this);
     }
 
@@ -1079,6 +1143,7 @@ private:
 	RenderPassBuilder& addShaderResource(T&& x) {
     detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
     detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorShaderResources, x, DescriptorType::SRV);
+        detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.shaderResources, std::forward<T>(x));
 		return *this;
 	}
@@ -1097,6 +1162,7 @@ private:
         requires ResourceLike<T>
     RenderPassBuilder& addRenderTarget(T&& x) {
         detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
+        detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.renderTargets, std::forward<T>(x));
 		return *this;
     }
@@ -1115,6 +1181,7 @@ private:
         requires ResourceLike<T>
 	RenderPassBuilder& addDepthReadWrite(T&& x) {
         detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
+    detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.depthReadWriteResources, std::forward<T>(x));
 		return *this;
 	}
@@ -1132,6 +1199,7 @@ private:
         requires ResourceLike<T>
 	RenderPassBuilder& addDepthRead(T&& x) {
         detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
+    detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.depthReadResources, std::forward<T>(x));
 		return *this;
 	}
@@ -1151,6 +1219,7 @@ private:
 	RenderPassBuilder& addConstantBuffer(T&& x) {
     detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
     detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorConstantBuffers, x, DescriptorType::CBV);
+        detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.constantBuffers, std::forward<T>(x));
 		return *this;
 	}
@@ -1170,6 +1239,7 @@ private:
 	RenderPassBuilder& addUnorderedAccess(T&& x) {
     detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
     detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorUnorderedAccessViews, x, DescriptorType::UAV);
+        detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.unorderedAccessViews, std::forward<T>(x));
 		return *this;
 	}
@@ -1188,6 +1258,7 @@ private:
         requires ResourceLike<T>
 	RenderPassBuilder& addCopyDest(T&& x) {
         detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
+    detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.copyTargets, std::forward<T>(x));
 		return *this;
 	}
@@ -1206,6 +1277,7 @@ private:
         requires ResourceLike<T>
 	RenderPassBuilder& addCopySource(T&& x) {
         detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
+    detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.copySources, std::forward<T>(x));
 		return *this;
 	}
@@ -1224,6 +1296,7 @@ private:
         requires ResourceLike<T>
 	RenderPassBuilder& addIndirectArguments(T&& x) {
         detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
+    detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.indirectArgumentBuffers, std::forward<T>(x));
 		return *this;
 	}
@@ -1242,6 +1315,7 @@ private:
         requires ResourceLike<T>
     RenderPassBuilder& addLegacyInterop(T&& x) {
         detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
+        detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.legacyInteropResources, std::forward<T>(x));
         return *this;
     }
@@ -1259,8 +1333,33 @@ private:
         requires ResourceLike<T>
     RenderPassBuilder& addInternalTransition(T&& x, ResourceState exitState)& {
         detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
+        detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
         detail::AppendInternalTransition(graph, _declaredIds, params.internalTransitions, std::forward<T>(x), exitState);
         return *this;
+    }
+
+    void addActiveFeatureDomain(const FeatureDomainIdentifier& domain) {
+        params.activeFeatureDomains.insert(domain);
+    }
+
+    void addActiveFeatureDomain(FeatureDomainIdentifier&& domain) {
+        params.activeFeatureDomains.insert(std::move(domain));
+    }
+
+    void addActiveFeatureDomain(const char* domain) {
+        if (domain) {
+            params.activeFeatureDomains.insert(FeatureDomainIdentifier{ domain });
+        }
+    }
+
+    void addActiveFeatureDomain(std::string_view domain) {
+        params.activeFeatureDomains.insert(FeatureDomainIdentifier{ domain });
+    }
+
+    template<class S>
+        requires (detail::StringLike<S> && !std::is_same_v<std::remove_cvref_t<S>, const char*> && !std::is_same_v<std::remove_cvref_t<S>, char*>)
+    void addActiveFeatureDomain(S&& domain) {
+        params.activeFeatureDomains.insert(FeatureDomainIdentifier{ std::string_view{ std::forward<S>(domain) } });
     }
 
 	template <class Range>
@@ -1356,6 +1455,12 @@ public:
         return *this;
     }
 
+    template<typename... Args>
+    ComputePassBuilder& WithActiveFeatureDomain(Args&&... args) & {
+        (addActiveFeatureDomain(std::forward<Args>(args)), ...);
+        return *this;
+    }
+
     // Second set, callable on temporaries
     template<typename... Args>
         requires ((NotIResourceResolver<Args>) && ...)
@@ -1396,6 +1501,12 @@ public:
         requires ResourceLike<T>
     ComputePassBuilder WithInternalTransition(T&& resource, ResourceState exitState)&& {
         addInternalTransition(std::forward<T>(resource), exitState);
+        return std::move(*this);
+    }
+
+    template<typename... Args>
+    ComputePassBuilder WithActiveFeatureDomain(Args&&... args) && {
+        (addActiveFeatureDomain(std::forward<Args>(args)), ...);
         return std::move(*this);
     }
 
@@ -1598,6 +1709,7 @@ private:
 	ComputePassBuilder& addShaderResource(T&& x) {
         detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
     detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorShaderResources, x, DescriptorType::SRV);
+        detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.shaderResources, std::forward<T>(x));
 		return *this;
 	}
@@ -1617,6 +1729,7 @@ private:
 	ComputePassBuilder& addConstantBuffer(T&& x) {
         detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
     detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorConstantBuffers, x, DescriptorType::CBV);
+        detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.constantBuffers, std::forward<T>(x));
 		return *this;
 	}
@@ -1636,6 +1749,7 @@ private:
 	ComputePassBuilder& addUnorderedAccess(T&& x) {
         detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
     detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorUnorderedAccessViews, x, DescriptorType::UAV);
+        detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.unorderedAccessViews, std::forward<T>(x));
 		return *this;
 	}
@@ -1654,6 +1768,7 @@ private:
         requires ResourceLike<T>
 	ComputePassBuilder& addIndirectArguments(T&& x) {
         detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
+    detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.indirectArgumentBuffers, std::forward<T>(x));
 		return *this;
 	}
@@ -1672,6 +1787,7 @@ private:
         requires ResourceLike<T>
     ComputePassBuilder& addLegacyInterop(T&& x) {
         detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
+        detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.legacyInteropResources, std::forward<T>(x));
         return *this;
     }
@@ -1700,8 +1816,33 @@ private:
         requires ResourceLike<T>
     ComputePassBuilder& addInternalTransition(T&& x, ResourceState exitState)& {
         detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
+        detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
         detail::AppendInternalTransition(graph, _declaredIds, params.internalTransitions, std::forward<T>(x), exitState);
         return *this;
+    }
+
+    void addActiveFeatureDomain(const FeatureDomainIdentifier& domain) {
+        params.activeFeatureDomains.insert(domain);
+    }
+
+    void addActiveFeatureDomain(FeatureDomainIdentifier&& domain) {
+        params.activeFeatureDomains.insert(std::move(domain));
+    }
+
+    void addActiveFeatureDomain(const char* domain) {
+        if (domain) {
+            params.activeFeatureDomains.insert(FeatureDomainIdentifier{ domain });
+        }
+    }
+
+    void addActiveFeatureDomain(std::string_view domain) {
+        params.activeFeatureDomains.insert(FeatureDomainIdentifier{ domain });
+    }
+
+    template<class S>
+        requires (detail::StringLike<S> && !std::is_same_v<std::remove_cvref_t<S>, const char*> && !std::is_same_v<std::remove_cvref_t<S>, char*>)
+    void addActiveFeatureDomain(S&& domain) {
+        params.activeFeatureDomains.insert(FeatureDomainIdentifier{ std::string_view{ std::forward<S>(domain) } });
     }
 
     std::vector<ResourceRequirement> GatherResourceRequirements() const {

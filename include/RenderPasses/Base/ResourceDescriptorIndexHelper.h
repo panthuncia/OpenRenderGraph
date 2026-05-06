@@ -1,9 +1,11 @@
 #pragma once
 
-#include <unordered_map>
 #include <memory>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "Resources/DynamicResource.h"
+#include "Render/FeatureDomainRegistry.h"
 #include "Render/ResourceRegistry.h"
 
 class ResourceIndexOrDynamicResource {
@@ -63,7 +65,11 @@ struct ResourceAndAccessor {
 
 class ResourceDescriptorIndexHelper {
 public:
-	ResourceDescriptorIndexHelper(std::shared_ptr<ResourceRegistryView> registryView) : m_resourceRegistryView(registryView) {
+	ResourceDescriptorIndexHelper(
+		std::shared_ptr<ResourceRegistryView> registryView,
+		std::unordered_set<FeatureDomainIdentifier, FeatureDomainIdentifier::Hasher> activeFeatureDomains = {})
+		: m_resourceRegistryView(std::move(registryView)),
+		  m_activeFeatureDomains(std::move(activeFeatureDomains)) {
 
 	}
 	void RegisterDescriptor(const AutoDescriptorRegistration& registration) {
@@ -156,6 +162,9 @@ public:
 			if (allowFail) {
 				return (std::numeric_limits<unsigned int>().max)(); // Return max value if the resource is not found and allowFail is true
 			}
+			if (name && ShouldAllowMissingForInactiveFeature(ResourceIdentifier{ *name })) {
+				return (std::numeric_limits<unsigned int>().max)();
+			}
 			std::string resourceName = name ? *name : "Unknown";
 			throw std::runtime_error("Resource "+ resourceName +" not found!");
 		}
@@ -167,11 +176,21 @@ public:
 			return resourceAndAccessor.resource.index;
 		}
 	}
-	unsigned int GetResourceDescriptorIndex(const ResourceIdentifier& id, bool allowFail = true) {
-		return GetResourceDescriptorIndex(id.hash, allowFail);
+	unsigned int GetResourceDescriptorIndex(const ResourceIdentifier& id, bool allowFail = true) const {
+		return GetResourceDescriptorIndex(id.hash, allowFail, &id.name);
+	}
+
+	void SetActiveFeatureDomains(std::unordered_set<FeatureDomainIdentifier, FeatureDomainIdentifier::Hasher> activeFeatureDomains) {
+		m_activeFeatureDomains = std::move(activeFeatureDomains);
 	}
 private:
 	std::unordered_map<size_t, ResourceAndAccessor> m_resourceMap; // Maps resource identifiers to descriptor indices
+	std::unordered_set<FeatureDomainIdentifier, FeatureDomainIdentifier::Hasher> m_activeFeatureDomains;
+
+	bool ShouldAllowMissingForInactiveFeature(const ResourceIdentifier& id) const {
+		auto domain = FeatureDomainRegistry::Get().FindResourceDomain(id);
+		return domain.has_value() && !m_activeFeatureDomains.contains(*domain);
+	}
 
 	unsigned int AccessGloballyIndexedResource(const std::shared_ptr<GloballyIndexedResource> resource, const DescriptorAccessor& accessor) const {
 		switch (accessor.type) {

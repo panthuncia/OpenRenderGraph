@@ -449,6 +449,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 			par.resources.autoDescriptorShaderResources = b.params.autoDescriptorShaderResources;
 			par.resources.autoDescriptorConstantBuffers = b.params.autoDescriptorConstantBuffers;
 			par.resources.autoDescriptorUnorderedAccessViews = b.params.autoDescriptorUnorderedAccessViews;
+			par.resources.activeFeatureDomains = b.params.activeFeatureDomains;
 			par.resources.isGeometryPass = b.params.isGeometryPass;
 			par.resources.preferredQueueKind = ResolveExternalPreferredQueueKind(d);
 			par.resources.queueAssignmentPolicy = ResolveExternalQueueAssignmentPolicy(d);
@@ -474,6 +475,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 		if (callSetup) {
 			par.pass->SetResourceRegistryView(
 				std::make_unique<ResourceRegistryView>(_registry, par.resources.identifierSet),
+				par.resources.activeFeatureDomains,
 				par.resources.autoDescriptorShaderResources,
 				par.resources.autoDescriptorConstantBuffers,
 				par.resources.autoDescriptorUnorderedAccessViews);
@@ -520,6 +522,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 			par.resources.autoDescriptorShaderResources = b.params.autoDescriptorShaderResources;
 			par.resources.autoDescriptorConstantBuffers = b.params.autoDescriptorConstantBuffers;
 			par.resources.autoDescriptorUnorderedAccessViews = b.params.autoDescriptorUnorderedAccessViews;
+			par.resources.activeFeatureDomains = b.params.activeFeatureDomains;
 			par.resources.preferredQueueKind = ResolveExternalPreferredQueueKind(d);
 			par.resources.queueAssignmentPolicy = ResolveExternalQueueAssignmentPolicy(d);
 			par.resources.pinnedQueueSlot = d.pinnedQueueSlot;
@@ -544,6 +547,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 		if (callSetup) {
 			par.pass->SetResourceRegistryView(
 				std::make_unique<ResourceRegistryView>(_registry, par.resources.identifierSet),
+				par.resources.activeFeatureDomains,
 				par.resources.autoDescriptorShaderResources,
 				par.resources.autoDescriptorConstantBuffers,
 				par.resources.autoDescriptorUnorderedAccessViews);
@@ -4495,6 +4499,7 @@ void RenderGraph::RefreshRetainedDeclarationsForFrame(RenderPassAndResources& p,
 	p.resources.autoDescriptorShaderResources = b.params.autoDescriptorShaderResources;
 	p.resources.autoDescriptorConstantBuffers = b.params.autoDescriptorConstantBuffers;
 	p.resources.autoDescriptorUnorderedAccessViews = b.params.autoDescriptorUnorderedAccessViews;
+	p.resources.activeFeatureDomains = b.params.activeFeatureDomains;
 	if (traceLifecycle) {
 		spdlog::info("RG frame {} refresh render pass '{}' materialize referenced resources begin", frameIndex, p.name);
 	}
@@ -4510,6 +4515,7 @@ void RenderGraph::RefreshRetainedDeclarationsForFrame(RenderPassAndResources& p,
 	// Ensure the pass's view matches the refreshed identifier set
 	p.pass->SetResourceRegistryView(
 		std::make_unique<ResourceRegistryView>(_registry, p.resources.identifierSet),
+		p.resources.activeFeatureDomains,
 		p.resources.autoDescriptorShaderResources,
 		p.resources.autoDescriptorConstantBuffers,
 		p.resources.autoDescriptorUnorderedAccessViews
@@ -4554,6 +4560,7 @@ void RenderGraph::RefreshRetainedDeclarationsForFrame(ComputePassAndResources& p
 	p.resources.autoDescriptorShaderResources = b.params.autoDescriptorShaderResources;
 	p.resources.autoDescriptorConstantBuffers = b.params.autoDescriptorConstantBuffers;
 	p.resources.autoDescriptorUnorderedAccessViews = b.params.autoDescriptorUnorderedAccessViews;
+	p.resources.activeFeatureDomains = b.params.activeFeatureDomains;
 	if (traceLifecycle) {
 		spdlog::info("RG frame {} refresh compute pass '{}' materialize referenced resources begin", frameIndex, p.name);
 	}
@@ -4568,6 +4575,7 @@ void RenderGraph::RefreshRetainedDeclarationsForFrame(ComputePassAndResources& p
 
 	p.pass->SetResourceRegistryView(
 		std::make_unique<ResourceRegistryView>(_registry, p.resources.identifierSet),
+		p.resources.activeFeatureDomains,
 		p.resources.autoDescriptorShaderResources,
 		p.resources.autoDescriptorConstantBuffers,
 		p.resources.autoDescriptorUnorderedAccessViews
@@ -6473,6 +6481,7 @@ void RenderGraph::Setup() {
 			}
 			renderPass.pass->SetResourceRegistryView(
 				std::make_unique<ResourceRegistryView>(_registry, renderPass.resources.identifierSet),
+				renderPass.resources.activeFeatureDomains,
 				renderPass.resources.autoDescriptorShaderResources,
 				renderPass.resources.autoDescriptorConstantBuffers,
 				renderPass.resources.autoDescriptorUnorderedAccessViews);
@@ -6489,6 +6498,7 @@ void RenderGraph::Setup() {
 			}
 			computePass.pass->SetResourceRegistryView(
 				std::make_unique<ResourceRegistryView>(_registry, computePass.resources.identifierSet),
+				computePass.resources.activeFeatureDomains,
 				computePass.resources.autoDescriptorShaderResources,
 				computePass.resources.autoDescriptorConstantBuffers,
 				computePass.resources.autoDescriptorUnorderedAccessViews);

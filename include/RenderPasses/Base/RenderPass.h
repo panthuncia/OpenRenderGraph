@@ -15,6 +15,7 @@
 #include "interfaces/IResourceProvider.h"
 #include "Render/PassInputs.h"
 #include "Render/PassExecutionContext.h"
+#include "Render/FeatureDomainRegistry.h"
 #include "Render/ShaderAPI.h"
 #include "Render/QueueKind.h"
 
@@ -35,6 +36,7 @@ struct RenderPassParameters {
 	std::vector<AutoDescriptorRegistration> autoDescriptorShaderResources;
 	std::vector<AutoDescriptorRegistration> autoDescriptorConstantBuffers;
 	std::vector<AutoDescriptorRegistration> autoDescriptorUnorderedAccessViews;
+	std::unordered_set<FeatureDomainIdentifier, FeatureDomainIdentifier::Hasher> activeFeatureDomains;
 	std::vector<ResourceRequirement> staticResourceRequirements; // Static resource requirements for the pass
 	std::vector<ResourceRequirement> frameResourceRequirements; // Immediate-mode requirements recorded for this frame
 	mutable std::vector<ResourceRequirement> mergedFrameResourceRequirements; // Lazily built static + immediate requirements when a contiguous view is needed
@@ -51,17 +53,20 @@ class RenderPass : public IResourceProvider, public RenderGraphPassBase {
 public:
     virtual ~RenderPass() = default;
 
-	void SetResourceRegistryView(std::shared_ptr<ResourceRegistryView> resourceRegistryView) {
+	void SetResourceRegistryView(
+		std::shared_ptr<ResourceRegistryView> resourceRegistryView,
+		std::unordered_set<FeatureDomainIdentifier, FeatureDomainIdentifier::Hasher> activeFeatureDomains = {}) {
 		m_resourceRegistryView = resourceRegistryView;
-		m_resourceDescriptorIndexHelper = std::make_unique<ResourceDescriptorIndexHelper>(resourceRegistryView);
+		m_resourceDescriptorIndexHelper = std::make_unique<ResourceDescriptorIndexHelper>(resourceRegistryView, std::move(activeFeatureDomains));
 	}
 
 	void SetResourceRegistryView(
 		std::shared_ptr<ResourceRegistryView> resourceRegistryView,
+		const std::unordered_set<FeatureDomainIdentifier, FeatureDomainIdentifier::Hasher>& activeFeatureDomains,
 		const std::vector<AutoDescriptorRegistration>& autoDescriptorShaderResources,
 		const std::vector<AutoDescriptorRegistration>& autoDescriptorConstantBuffers,
 		const std::vector<AutoDescriptorRegistration>& autoDescriptorUnorderedAccessViews) {
-		SetResourceRegistryView(std::move(resourceRegistryView));
+		SetResourceRegistryView(std::move(resourceRegistryView), activeFeatureDomains);
 		for (const auto& registration : autoDescriptorShaderResources) {
 			m_resourceDescriptorIndexHelper->RegisterDescriptor(registration);
 		}
@@ -90,11 +95,11 @@ protected:
 		unsigned int indices[rg::shaderapi::kNumResourceDescriptorIndicesRootConstants] = {};
 		int i = 0;
 		for (auto& binding : resources.mandatoryResourceDescriptorSlots) {
-			indices[i] = m_resourceDescriptorIndexHelper->GetResourceDescriptorIndex(binding.hash, false, &binding.name);
+			indices[i] = m_resourceDescriptorIndexHelper->GetResourceDescriptorIndex(binding, false);
 			i++;
 		}
 		for (auto& binding : resources.optionalResourceDescriptorSlots) {
-			indices[i] = m_resourceDescriptorIndexHelper->GetResourceDescriptorIndex(binding.hash, true, &binding.name);
+			indices[i] = m_resourceDescriptorIndexHelper->GetResourceDescriptorIndex(binding, true);
 			i++;
 		}
 		if (i > 0) {
