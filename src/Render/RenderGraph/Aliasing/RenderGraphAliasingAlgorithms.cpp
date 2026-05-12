@@ -474,6 +474,10 @@ namespace {
 			}
 		};
 
+		if (desc.isCubemap) {
+			textureDesc.resourceFlags |= rhi::ResourceFlags::RF_TextureCubeCompatible;
+		}
+
 		if (desc.hasRTV) {
 			textureDesc.resourceFlags |= rhi::ResourceFlags::RF_AllowRenderTarget;
 		}

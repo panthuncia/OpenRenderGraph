@@ -7433,14 +7433,16 @@ namespace {
 				if ((pr.run & PassRunMask::Retained) != PassRunMask::None) {
 					auto passReturn = pr.pass->Execute(args.context);
 					if (passReturn.fence) {
-						LogQueuedExternalFence(
-							static_cast<unsigned>(args.context.frameIndex),
-							queue,
-							qi,
-							args.batchIndex,
-							passName,
-							args.queuedExternalFenceOrigins,
-							passReturn);
+						if (args.batchTraceEnabled) {
+							LogQueuedExternalFence(
+								static_cast<unsigned>(args.context.frameIndex),
+								queue,
+								qi,
+								args.batchIndex,
+								passName,
+								args.queuedExternalFenceOrigins,
+								passReturn);
+						}
 						sched.externalFences.push_back(passReturn);
 					}
 				}
