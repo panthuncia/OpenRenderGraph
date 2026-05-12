@@ -71,9 +71,8 @@ public:
     bool HasRTVSlot() const { return m_rtvSlot.heap.valid(); }
     rhi::DescriptorSlot GetRTVSlot() const { return m_rtvSlot; }
 
-    // Reset the symbolic tracker to Common state.  Must be called after any
-    // out-of-graph barrier (e.g. TransitionForPresent) so the render graph
-    // knows the true GPU state on the next frame.
+    // Reset the symbolic tracker to Common state after the underlying external
+    // handle changes, such as swapchain resize/recreation.
     void ResetToCommon() {
         m_stateTracker = SymbolicTracker{};
     }

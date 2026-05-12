@@ -770,6 +770,13 @@ public:
 
     template<typename... Args>
         requires ((NotIResourceResolver<Args>) && ...)
+    RenderPassBuilder& WithPresent(Args&&... args) & {
+        (addPresent(std::forward<Args>(args)), ...);
+        return *this;
+    }
+
+    template<typename... Args>
+        requires ((NotIResourceResolver<Args>) && ...)
     RenderPassBuilder& WithDepthRead(Args&&... args) & {
         (addDepthRead(std::forward<Args>(args)), ...);
         return *this;
@@ -863,6 +870,13 @@ public:
         requires ((NotIResourceResolver<Args>) && ...)
     RenderPassBuilder WithRenderTargetClear(Args&&... args) && {
         (addRenderTargetClear(std::forward<Args>(args)), ...);
+        return std::move(*this);
+    }
+
+    template<typename... Args>
+        requires ((NotIResourceResolver<Args>) && ...)
+    RenderPassBuilder WithPresent(Args&&... args) && {
+        (addPresent(std::forward<Args>(args)), ...);
         return std::move(*this);
     }
 
@@ -980,6 +994,10 @@ public:
         return WithResolver(r, [&](auto&& resolved) { addRenderTargetClear(std::forward<decltype(resolved)>(resolved)); });
     }
 
+    RenderPassBuilder& WithPresent(const IResourceResolver& r)& {
+        return WithResolver(r, [&](auto&& resolved) { addPresent(std::forward<decltype(resolved)>(resolved)); });
+    }
+
     RenderPassBuilder& WithDepthReadWrite(const IResourceResolver& r)& {
 		return WithResolver(r, [&](auto&& resolved) { addDepthReadWrite(std::forward<decltype(resolved)>(resolved)); });
     }
@@ -1027,6 +1045,9 @@ public:
         RenderPassBuilder WithRenderTargetClear(const IResourceResolver& r)&& {
                 return std::move(*this).WithResolver(r, [&](auto&& resolved) { addRenderTargetClear(std::forward<decltype(resolved)>(resolved)); });
         }
+    RenderPassBuilder WithPresent(const IResourceResolver& r)&& {
+        return std::move(*this).WithResolver(r, [&](auto&& resolved) { addPresent(std::forward<decltype(resolved)>(resolved)); });
+    }
     RenderPassBuilder WithDepthReadWrite(const IResourceResolver& r)&& {
 		return std::move(*this).WithResolver(r, [&](auto&& resolved) { addDepthReadWrite(std::forward<decltype(resolved)>(resolved)); });
     }
@@ -1403,6 +1424,25 @@ private:
 		return *this;
 	}
 
+    template<typename T>
+        requires ResourceLike<T>
+    RenderPassBuilder& addPresent(T&& x) {
+        detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
+        detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
+        detail::AppendTrackedResource(graph, _declaredIds, params.presentResources, std::forward<T>(x));
+        return *this;
+    }
+
+	template <class Range>
+		requires (std::ranges::range<Range>&&
+    ResourceLike<std::ranges::range_value_t<Range>>)
+    RenderPassBuilder& addPresent(Range&& xs) {
+        for (auto&& e : xs) {
+            addPresent(std::forward<decltype(e)>(e));
+        }
+        return *this;
+    }
+
     // Legacy interop resources
     template<typename T>
         requires ResourceLike<T>
@@ -1479,6 +1519,7 @@ private:
             std::pair{ std::cref(params.copySources), rhi::ResourceAccessType::CopySource },
             std::pair{ std::cref(params.copyTargets), rhi::ResourceAccessType::CopyDest },
             std::pair{ std::cref(params.indirectArgumentBuffers), rhi::ResourceAccessType::IndirectArgument },
+                std::pair{ std::cref(params.presentResources), rhi::ResourceAccessType::Present },
             std::pair{ std::cref(params.legacyInteropResources), rhi::ResourceAccessType::Common });
     }
 
