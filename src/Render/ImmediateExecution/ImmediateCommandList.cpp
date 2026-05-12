@@ -574,7 +574,7 @@ namespace rg::imm {
             });
 
         if (any) {
-            Track(target.handle, target.handle.GetGlobalResourceID(), range, rhi::ResourceAccessType::DepthReadWrite);
+            Track(target.handle, target.handle.GetGlobalResourceID(), range, rhi::ResourceAccessType::DepthStencilClear);
         }
     }
 

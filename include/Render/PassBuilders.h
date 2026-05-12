@@ -763,6 +763,13 @@ public:
 
     template<typename... Args>
         requires ((NotIResourceResolver<Args>) && ...)
+    RenderPassBuilder& WithDepthStencilClear(Args&&... args) & {
+        (addDepthStencilClear(std::forward<Args>(args)), ...);
+        return *this;
+    }
+
+    template<typename... Args>
+        requires ((NotIResourceResolver<Args>) && ...)
     RenderPassBuilder& WithConstantBuffer(Args&&... args) & {
         (addConstantBuffer(std::forward<Args>(args)), ...);
         return *this;
@@ -835,6 +842,13 @@ public:
         requires ((NotIResourceResolver<Args>) && ...)
     RenderPassBuilder WithDepthReadWrite(Args&&... args) && {
         (addDepthReadWrite(std::forward<Args>(args)), ...);
+        return std::move(*this);
+    }
+
+    template<typename... Args>
+        requires ((NotIResourceResolver<Args>) && ...)
+    RenderPassBuilder WithDepthStencilClear(Args&&... args) && {
+        (addDepthStencilClear(std::forward<Args>(args)), ...);
         return std::move(*this);
     }
 
@@ -938,6 +952,10 @@ public:
 		return WithResolver(r, [&](auto&& resolved) { addDepthReadWrite(std::forward<decltype(resolved)>(resolved)); });
     }
 
+        RenderPassBuilder& WithDepthStencilClear(const IResourceResolver& r)& {
+		return WithResolver(r, [&](auto&& resolved) { addDepthStencilClear(std::forward<decltype(resolved)>(resolved)); });
+        }
+
     RenderPassBuilder& WithDepthRead(const IResourceResolver& r)& {
 		return WithResolver(r, [&](auto&& resolved) { addDepthRead(std::forward<decltype(resolved)>(resolved)); });
     }
@@ -977,6 +995,10 @@ public:
     RenderPassBuilder WithDepthReadWrite(const IResourceResolver& r)&& {
 		return std::move(*this).WithResolver(r, [&](auto&& resolved) { addDepthReadWrite(std::forward<decltype(resolved)>(resolved)); });
     }
+
+        RenderPassBuilder WithDepthStencilClear(const IResourceResolver& r)&& {
+		return std::move(*this).WithResolver(r, [&](auto&& resolved) { addDepthStencilClear(std::forward<decltype(resolved)>(resolved)); });
+        }
     RenderPassBuilder WithDepthRead(const IResourceResolver& r)&& {
 		return std::move(*this).WithResolver(r, [&](auto&& resolved) { addDepthRead(std::forward<decltype(resolved)>(resolved)); });
     }
@@ -1196,6 +1218,24 @@ private:
 	}
 
 	template<typename T>
+    requires ResourceLike<T>
+	RenderPassBuilder& addDepthStencilClear(T&& x) {
+    detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
+    detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
+    detail::AppendTrackedResource(graph, _declaredIds, params.depthStencilClearResources, std::forward<T>(x));
+		return *this;
+	}
+	template<class Range>
+		requires (std::ranges::range<Range>&&
+	ResourceLike<std::ranges::range_value_t<Range>>)
+    RenderPassBuilder& addDepthStencilClear(Range&& xs) {
+    for (auto&& e : xs) {
+        addDepthStencilClear(std::forward<decltype(e)>(e));
+    }
+    return *this;
+	}
+
+	template<typename T>
         requires ResourceLike<T>
 	RenderPassBuilder& addDepthRead(T&& x) {
         detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
@@ -1380,6 +1420,7 @@ private:
             std::pair{ std::cref(params.renderTargets), rhi::ResourceAccessType::RenderTarget },
             std::pair{ std::cref(params.depthReadResources), rhi::ResourceAccessType::DepthRead },
             std::pair{ std::cref(params.depthReadWriteResources), rhi::ResourceAccessType::DepthReadWrite },
+            std::pair{ std::cref(params.depthStencilClearResources), rhi::ResourceAccessType::DepthStencilClear },
             std::pair{ std::cref(params.unorderedAccessViews), rhi::ResourceAccessType::UnorderedAccess },
             std::pair{ std::cref(params.copySources), rhi::ResourceAccessType::CopySource },
             std::pair{ std::cref(params.copyTargets), rhi::ResourceAccessType::CopyDest },

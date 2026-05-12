@@ -24,6 +24,7 @@ struct RenderPassParameters {
     std::vector<ResourceHandleAndRange> renderTargets;
     std::vector<ResourceHandleAndRange> depthReadResources;
 	std::vector<ResourceHandleAndRange> depthReadWriteResources;
+	std::vector<ResourceHandleAndRange> depthStencilClearResources;
 	std::vector<ResourceHandleAndRange> constantBuffers;
 	std::vector<ResourceHandleAndRange> unorderedAccessViews;
 	std::vector<ResourceHandleAndRange> copyTargets;
