@@ -6838,10 +6838,14 @@ namespace {
 				transition.prevLayout, transition.newLayout,
 				transition.prevSyncState, transition.newSyncState);
 			const size_t textureStart = batch.textures.size();
+			const size_t bufferStart = batch.buffers.size();
 			batch.Append(bg);
 			if (transition.discard) {
 				for (size_t i = textureStart; i < batch.textures.size(); ++i) {
 					batch.textures[i].discard = true;
+				}
+				for (size_t i = bufferStart; i < batch.buffers.size(); ++i) {
+					batch.buffers[i].discard = true;
 				}
 			}
 		}
@@ -6889,6 +6893,7 @@ namespace {
 				bb.afterSync    = t.newSyncState;
 				bb.beforeAccess = t.prevAccessType;
 				bb.afterAccess  = t.newAccessType;
+				bb.discard      = t.discard;
 				batch.buffers.push_back(bb);
 			}
 		}

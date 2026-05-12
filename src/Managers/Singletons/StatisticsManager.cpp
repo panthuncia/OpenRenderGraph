@@ -323,11 +323,13 @@ void StatisticsManager::BeginQuery(
 
     // Timestamp "begin" marker = write a timestamp at index 2*N
     const uint32_t tsIdx = (frameBase + passIndex) * 2u;
+    cmd.ResetQueries(m_timestampPool->GetHandle(), tsIdx, 1);
     cmd.WriteTimestamp(m_timestampPool->GetHandle(), tsIdx, rhi::Stage::Top); // RHI: EndQuery on a Timestamp pool writes a timestamp
 
     // Begin pipeline stats for geometry passes
     if (m_collectPipelineStatistics && m_isGeometryPass[passIndex]) {
         const uint32_t psIdx = frameBase + passIndex;
+        cmd.ResetQueries(m_pipelineStatsPool->GetHandle(), psIdx, 1);
         cmd.BeginQuery(m_pipelineStatsPool->GetHandle(), psIdx);
     }
     m_recordedQueries[queueKind][frameIndex].push_back(tsIdx);
@@ -350,7 +352,8 @@ void StatisticsManager::EndQuery(
 
     // Timestamp "end" marker = write a timestamp at index 2*N + 1
     const uint32_t tsIdx = (frameBase + passIndex) * 2u + 1u;
-	cmd.WriteTimestamp(m_timestampPool->GetHandle(), tsIdx, rhi::Stage::Bottom); // RHI: EndQuery on a Timestamp pool writes a timestamp
+    cmd.ResetQueries(m_timestampPool->GetHandle(), tsIdx, 1);
+    cmd.WriteTimestamp(m_timestampPool->GetHandle(), tsIdx, rhi::Stage::Bottom); // RHI: EndQuery on a Timestamp pool writes a timestamp
 
     // End pipeline stats for geometry passes
     if (m_collectPipelineStatistics && m_isGeometryPass[passIndex]) {
@@ -455,10 +458,12 @@ void StatisticsManager::BeginQuery(
 
     const uint32_t frameBase = frameIndex * m_queryPoolPassCapacity;
     const uint32_t tsIdx = (frameBase + passIndex) * 2u;
+    cmd.ResetQueries(m_timestampPool->GetHandle(), tsIdx, 1);
     cmd.WriteTimestamp(m_timestampPool->GetHandle(), tsIdx, rhi::Stage::Top);
 
     if (m_collectPipelineStatistics && m_isGeometryPass[passIndex]) {
         const uint32_t psIdx = frameBase + passIndex;
+        cmd.ResetQueries(m_pipelineStatsPool->GetHandle(), psIdx, 1);
         cmd.BeginQuery(m_pipelineStatsPool->GetHandle(), psIdx);
     }
     ctx.recordedIndices.push_back(tsIdx);
@@ -480,6 +485,7 @@ void StatisticsManager::EndQuery(
 
     const uint32_t frameBase = frameIndex * m_queryPoolPassCapacity;
     const uint32_t tsIdx = (frameBase + passIndex) * 2u + 1u;
+    cmd.ResetQueries(m_timestampPool->GetHandle(), tsIdx, 1);
     cmd.WriteTimestamp(m_timestampPool->GetHandle(), tsIdx, rhi::Stage::Bottom);
 
     if (m_collectPipelineStatistics && m_isGeometryPass[passIndex]) {
