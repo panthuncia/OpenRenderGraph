@@ -671,11 +671,11 @@ namespace detail
         }
 
         std::vector<ResourceRequirement> out;
-        out.reserve(trackers.size());
+        out.reserve(entries.size());
 
         for (auto& [id, tracker] : trackers) {
             auto pRes = handleMap[id];
-            for (auto const& seg : tracker.GetSegments()) {
+            for (auto const& seg : tracker.Flatten(initialState)) {
                 ResourceHandleAndRange rr(pRes);
                 rr.range = seg.rangeSpec;
 
@@ -683,6 +683,20 @@ namespace detail
                 req.state = seg.state;
                 out.push_back(std::move(req));
             }
+        }
+
+        for (auto& [rar, access] : entries) {
+            if (access != rhi::ResourceAccessType::Common) {
+                continue;
+            }
+
+            ResourceRequirement req(rar);
+            req.state = ResourceState{
+                access,
+                AccessToLayout(access, /*directQueue=*/true),
+                syncFunction(access)
+            };
+            out.push_back(std::move(req));
         }
 
         return out;
@@ -744,6 +758,13 @@ public:
         requires ((NotIResourceResolver<Args>) && ...)
     RenderPassBuilder& WithRenderTarget(Args&&... args) & {
         (addRenderTarget(std::forward<Args>(args)), ...);
+        return *this;
+    }
+
+    template<typename... Args>
+        requires ((NotIResourceResolver<Args>) && ...)
+    RenderPassBuilder& WithRenderTargetClear(Args&&... args) & {
+        (addRenderTargetClear(std::forward<Args>(args)), ...);
         return *this;
     }
 
@@ -835,6 +856,13 @@ public:
         requires ((NotIResourceResolver<Args>) && ...)
     RenderPassBuilder WithRenderTarget(Args&&... args) && {
         (addRenderTarget(std::forward<Args>(args)), ...);
+        return std::move(*this);
+    }
+
+    template<typename... Args>
+        requires ((NotIResourceResolver<Args>) && ...)
+    RenderPassBuilder WithRenderTargetClear(Args&&... args) && {
+        (addRenderTargetClear(std::forward<Args>(args)), ...);
         return std::move(*this);
     }
 
@@ -948,6 +976,10 @@ public:
         return WithResolver(r, [&](auto&& resolved) { addRenderTarget(std::forward<decltype(resolved)>(resolved)); });
 	}
 
+    RenderPassBuilder& WithRenderTargetClear(const IResourceResolver& r)& {
+        return WithResolver(r, [&](auto&& resolved) { addRenderTargetClear(std::forward<decltype(resolved)>(resolved)); });
+    }
+
     RenderPassBuilder& WithDepthReadWrite(const IResourceResolver& r)& {
 		return WithResolver(r, [&](auto&& resolved) { addDepthReadWrite(std::forward<decltype(resolved)>(resolved)); });
     }
@@ -992,6 +1024,9 @@ public:
     RenderPassBuilder WithRenderTarget(const IResourceResolver& r)&& {
 		return std::move(*this).WithResolver(r, [&](auto&& resolved) { addRenderTarget(std::forward<decltype(resolved)>(resolved)); });
     }
+        RenderPassBuilder WithRenderTargetClear(const IResourceResolver& r)&& {
+                return std::move(*this).WithResolver(r, [&](auto&& resolved) { addRenderTargetClear(std::forward<decltype(resolved)>(resolved)); });
+        }
     RenderPassBuilder WithDepthReadWrite(const IResourceResolver& r)&& {
 		return std::move(*this).WithResolver(r, [&](auto&& resolved) { addDepthReadWrite(std::forward<decltype(resolved)>(resolved)); });
     }
@@ -1197,6 +1232,24 @@ private:
 		}
 		return *this;
 	}
+
+    template<typename T>
+        requires ResourceLike<T>
+    RenderPassBuilder& addRenderTargetClear(T&& x) {
+        detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
+        detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
+        detail::AppendTrackedResource(graph, _declaredIds, params.renderTargetClearResources, std::forward<T>(x));
+        return *this;
+    }
+    template<class Range>
+        requires (std::ranges::range<Range>&&
+    ResourceLike<std::ranges::range_value_t<Range>>)
+        RenderPassBuilder& addRenderTargetClear(Range&& xs) {
+        for (auto&& e : xs) {
+            addRenderTargetClear(std::forward<decltype(e)>(e));
+        }
+        return *this;
+    }
 
     // Depth target
 	template<typename T>
@@ -1418,6 +1471,7 @@ private:
             std::pair{ std::cref(params.shaderResources), rhi::ResourceAccessType::ShaderResource },
             std::pair{ std::cref(params.constantBuffers), rhi::ResourceAccessType::ConstantBuffer },
             std::pair{ std::cref(params.renderTargets), rhi::ResourceAccessType::RenderTarget },
+            std::pair{ std::cref(params.renderTargetClearResources), rhi::ResourceAccessType::RenderTargetClear },
             std::pair{ std::cref(params.depthReadResources), rhi::ResourceAccessType::DepthRead },
             std::pair{ std::cref(params.depthReadWriteResources), rhi::ResourceAccessType::DepthReadWrite },
             std::pair{ std::cref(params.depthStencilClearResources), rhi::ResourceAccessType::DepthStencilClear },

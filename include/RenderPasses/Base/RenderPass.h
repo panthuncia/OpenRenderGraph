@@ -22,6 +22,7 @@
 struct RenderPassParameters {
 	std::vector<ResourceHandleAndRange> shaderResources;
     std::vector<ResourceHandleAndRange> renderTargets;
+	std::vector<ResourceHandleAndRange> renderTargetClearResources;
     std::vector<ResourceHandleAndRange> depthReadResources;
 	std::vector<ResourceHandleAndRange> depthReadWriteResources;
 	std::vector<ResourceHandleAndRange> depthStencilClearResources;

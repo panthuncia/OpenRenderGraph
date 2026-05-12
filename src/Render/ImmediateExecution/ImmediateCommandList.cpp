@@ -541,7 +541,7 @@ namespace rg::imm {
             });
 
         if (any) {
-            Track(target.handle, target.handle.GetGlobalResourceID(), range, rhi::ResourceAccessType::RenderTarget);
+            Track(target.handle, target.handle.GetGlobalResourceID(), range, rhi::ResourceAccessType::RenderTargetClear);
         }
     }
 

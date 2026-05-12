@@ -249,6 +249,7 @@ namespace {
 
 		if (queue == QueueKind::Compute) {
 			const auto unsupported = rhi::ResourceAccessType::RenderTarget |
+				rhi::ResourceAccessType::RenderTargetClear |
 				rhi::ResourceAccessType::DepthRead |
 				rhi::ResourceAccessType::DepthReadWrite |
 				rhi::ResourceAccessType::DepthStencilClear;
@@ -287,6 +288,7 @@ namespace {
 
 		if (queue == QueueKind::Compute) {
 			return layout != rhi::ResourceLayout::RenderTarget &&
+				layout != rhi::ResourceLayout::RenderTargetClear &&
 				layout != rhi::ResourceLayout::DepthReadWrite &&
 				layout != rhi::ResourceLayout::DepthStencilClear &&
 				layout != rhi::ResourceLayout::DepthRead;
