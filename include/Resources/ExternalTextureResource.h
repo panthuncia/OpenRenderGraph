@@ -22,6 +22,7 @@ public:
         m_hasLayout = true;
         m_mipLevels = 1;
         m_arraySize = 1;
+        ResetToUndefined();
     }
 
     rhi::Resource GetAPIResource() override {
@@ -71,8 +72,22 @@ public:
     bool HasRTVSlot() const { return m_rtvSlot.heap.valid(); }
     rhi::DescriptorSlot GetRTVSlot() const { return m_rtvSlot; }
 
-    // Reset the symbolic tracker to Common state after the underlying external
+    // Reset the symbolic tracker to Undefined after the underlying external
     // handle changes, such as swapchain resize/recreation.
+    void ResetToUndefined() {
+        RangeSpec wholeRange;
+        wholeRange.mipLower = { BoundType::All, 0 };
+        wholeRange.mipUpper = { BoundType::All, 0 };
+        wholeRange.sliceLower = { BoundType::All, 0 };
+        wholeRange.sliceUpper = { BoundType::All, 0 };
+        m_stateTracker = SymbolicTracker(
+            wholeRange,
+            ResourceState{
+                rhi::ResourceAccessType::None,
+                rhi::ResourceLayout::Undefined,
+                rhi::ResourceSyncState::None });
+    }
+
     void ResetToCommon() {
         m_stateTracker = SymbolicTracker{};
     }

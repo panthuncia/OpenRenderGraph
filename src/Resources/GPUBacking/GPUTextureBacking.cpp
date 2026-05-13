@@ -140,7 +140,7 @@ void GpuTextureBacking::initialize(const TextureDescription& desc,
 			.depthOrLayers = static_cast<uint16_t>(desc.isCubemap ? 6 * arraySize : arraySize),
 			.mipLevels = mipLevels,
 			.sampleCount = 1,
-			.initialLayout = rhi::ResourceLayout::Common,
+			.initialLayout = rhi::ResourceLayout::Undefined,
 			.optimizedClear = clearValue
 		}
 	};
@@ -222,6 +222,17 @@ void GpuTextureBacking::initialize(const TextureDescription& desc,
 	m_mipLevels = ResolveTextureMipLevels(desc);
 	m_arraySize = desc.isCubemap ? 6 * desc.arraySize : (desc.isArray ? desc.arraySize : 1);
 	m_format = desc.format;
+	RangeSpec wholeRange;
+	wholeRange.mipLower = { BoundType::All, 0 };
+	wholeRange.mipUpper = { BoundType::All, 0 };
+	wholeRange.sliceLower = { BoundType::All, 0 };
+	wholeRange.sliceUpper = { BoundType::All, 0 };
+	m_stateTracker = SymbolicTracker(
+		wholeRange,
+		ResourceState{
+			rhi::ResourceAccessType::None,
+			rhi::ResourceLayout::Undefined,
+			rhi::ResourceSyncState::None });
 
 	size_t subCount = m_mipLevels * m_arraySize;
 

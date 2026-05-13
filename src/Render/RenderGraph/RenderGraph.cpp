@@ -3219,6 +3219,20 @@ bool TryGetWholeResourceTrackerState(const SymbolicTracker& tracker, ResourceSta
 }
 
 SymbolicTracker SeedCompileTrackerFromLiveResource(Resource* resource) {
+    if (auto* texture = dynamic_cast<PixelBuffer*>(resource); texture && !texture->IsMaterialized()) {
+        RangeSpec wholeRange;
+        wholeRange.mipLower = { BoundType::All, 0 };
+        wholeRange.mipUpper = { BoundType::All, 0 };
+        wholeRange.sliceLower = { BoundType::All, 0 };
+        wholeRange.sliceUpper = { BoundType::All, 0 };
+        return SymbolicTracker(
+            wholeRange,
+            ResourceState{
+                rhi::ResourceAccessType::None,
+                rhi::ResourceLayout::Undefined,
+                rhi::ResourceSyncState::None });
+    }
+
 	SymbolicTracker seed{};
 	if (HasLiveCompileResourceBacking(resource)) {
 		if (auto* tracker = resource->GetStateTracker()) {
