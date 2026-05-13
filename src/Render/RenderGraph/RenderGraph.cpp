@@ -2786,6 +2786,14 @@ void RenderGraph::AddTransitionSlowPath(
 		if (firstUseIsWrite || firstUseIsCommon) { 
 			const uint64_t id = resource.GetGlobalResourceID();
 			auto itSig = aliasPlacementSignatureByID.find(id);
+			ResourceState activationBeforeState{
+				rhi::ResourceAccessType::None,
+				rhi::ResourceLayout::Undefined,
+				rhi::ResourceSyncState::None };
+			ResourceState trackedBeforeState{};
+			if (TryGetWholeResourceTrackerState(compileTracker, trackedBeforeState)) {
+				activationBeforeState = trackedBeforeState;
+			}
 			//spdlog::info(
 			//	"RG alias activate: id={} name='{}' signature={} accessAfter={} layoutAfter={} syncAfter={} discard=1",
 			//	id,
@@ -2797,11 +2805,11 @@ void RenderGraph::AddTransitionSlowPath(
 			transitions.emplace_back(
 				pRes,
 				requirement.range,
-				rhi::ResourceAccessType::None,
+				activationBeforeState.access,
 				requiredState.access,
-				rhi::ResourceLayout::Undefined,
+				activationBeforeState.layout,
 				requiredState.layout,
-				rhi::ResourceSyncState::None,
+				activationBeforeState.sync,
 				requiredState.sync,
 				true);
 		}
