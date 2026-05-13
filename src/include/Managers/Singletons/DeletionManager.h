@@ -22,9 +22,10 @@ public:
 	void Initialize() {
 		std::scoped_lock lock(m_mutex);
 		m_numFramesInFlight = rg::runtime::GetOpenRenderGraphSettings().numFramesInFlight;
-		m_deletionQueue.resize(m_numFramesInFlight);
-		m_allocationDeletionQueue.resize(m_numFramesInFlight);
-		m_trackedAllocationDeletionQueue.resize(m_numFramesInFlight);
+		const size_t retirementSlotCount = static_cast<size_t>(m_numFramesInFlight) + 1u;
+		m_deletionQueue.resize(retirementSlotCount);
+		m_allocationDeletionQueue.resize(retirementSlotCount);
+		m_trackedAllocationDeletionQueue.resize(retirementSlotCount);
 	}
 
 	void MarkForDelete(rhi::helpers::AnyObjectPtr ptr) {
