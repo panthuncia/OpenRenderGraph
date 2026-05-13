@@ -150,6 +150,18 @@ void DeviceManager::Initialize(rhi::Device device) {
         };
     }
 
+    if (m_allocator && m_device && m_device.Get().impl == device.impl) {
+        m_graphicsQueue = m_device->GetQueue(rhi::QueueKind::Graphics);
+        m_computeQueue = m_device->GetQueue(rhi::QueueKind::Compute);
+        m_copyQueue = m_device->GetQueue(rhi::QueueKind::Copy);
+        return;
+    }
+
+    if (m_allocator) {
+        spdlog::warn("OpenRenderGraph DeviceManager was reinitialized with a different device before cleanup; cleaning up the previous allocator first.");
+        Cleanup();
+    }
+
     m_device = rhi::DevicePtr(device, nullptr, nullptr);
     m_graphicsQueue = m_device->GetQueue(rhi::QueueKind::Graphics);
     m_computeQueue = m_device->GetQueue(rhi::QueueKind::Compute);
@@ -161,6 +173,13 @@ void DeviceManager::Initialize(rhi::Device device) {
 }
 
 void DeviceManager::Cleanup() {
+    if (!m_allocator) {
+        m_graphicsQueue.Reset();
+        m_computeQueue.Reset();
+        m_copyQueue.Reset();
+        m_device.Reset();
+        return;
+    }
 
     char* json = nullptr;
     m_allocator->BuildStatsString(&json, TRUE);

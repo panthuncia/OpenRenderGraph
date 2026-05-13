@@ -548,6 +548,7 @@ public:
 
 	RenderGraph(rhi::Device device);
 	~RenderGraph();
+	static void ShutdownRuntime();
 	using AutoAliasReasonCount = rg::alias::AutoAliasReasonCount;
 	using AutoAliasExcludedResourceDebug = rg::alias::AutoAliasExcludedResourceDebug;
 	using AutoAliasPoolRangeDebug = rg::alias::AutoAliasPoolRangeDebug;

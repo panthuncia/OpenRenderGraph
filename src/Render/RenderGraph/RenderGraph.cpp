@@ -3101,6 +3101,10 @@ RenderGraph::~RenderGraph() {
 		m_pCommandRecordingManager->ShutdownThreadLocal(); // Clears thread-local storage
 	}
 	ShutdownOwnedState();
+}
+
+void RenderGraph::ShutdownRuntime() {
+	DeletionManager::GetInstance().DrainAll();
 	DeletionManager::GetInstance().Cleanup();
 	DeviceManager::GetInstance().Cleanup();
 }
