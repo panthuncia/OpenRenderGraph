@@ -23,6 +23,7 @@ struct ComputePassParameters {
 	std::vector<ResourceHandleAndRange> shaderResources;
 	std::vector<ResourceHandleAndRange> constantBuffers;
 	std::vector<ResourceHandleAndRange> unorderedAccessViews;
+	std::vector<ResourceHandleAndRange> unorderedAccessClearViews;
 	std::vector<ResourceHandleAndRange> indirectArgumentBuffers;
 	std::vector<ResourceHandleAndRange> legacyInteropResources;
 	std::vector<std::pair<ResourceHandleAndRange, ResourceState>> internalTransitions;

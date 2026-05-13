@@ -538,6 +538,14 @@ public:
 		std::vector<SymbolicTracker*> passBatchTrackersByResourceIndex; // Trackers for the resources in this batch
 	};
 
+	struct PresentDependency {
+		rhi::Queue queue;
+		rhi::TimelinePoint wait{};
+		QueueSlotIndex queueSlot{};
+		uint64_t batchIndex = 0;
+		bool valid = false;
+	};
+
 	RenderGraph(rhi::Device device);
 	~RenderGraph();
 	using AutoAliasReasonCount = rg::alias::AutoAliasReasonCount;
@@ -561,6 +569,7 @@ public:
 	void Setup();
 	void RegisterExtension(std::unique_ptr<IRenderGraphExtension> ext, std::optional<std::string_view> id = std::nullopt);
 	const std::vector<PassBatch>& GetBatches() const { return batches; }
+	std::optional<PresentDependency> GetLastPresentDependency() const noexcept { return m_lastPresentDependency; }
 	rg::memory::SnapshotProvider& GetMemorySnapshotProvider() { return m_memorySnapshotProvider; }
 	const rg::memory::SnapshotProvider& GetMemorySnapshotProvider() const { return m_memorySnapshotProvider; }
 	void SetStatisticsService(std::shared_ptr<rg::runtime::IStatisticsService> service) { m_statisticsService = std::move(service); }
@@ -994,6 +1003,7 @@ private:
 	std::vector<std::vector<UINT64>> m_pendingFrameStartQueueWaitFenceValue;
 
 	QueueRegistry m_queueRegistry;
+	std::optional<PresentDependency> m_lastPresentDependency;
 
 	rhi::CommandAllocatorPtr initialTransitionCommandAllocator;
 	rhi::TimelinePtr m_initialTransitionFence;

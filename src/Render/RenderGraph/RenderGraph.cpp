@@ -7972,6 +7972,7 @@ void RenderGraph::BuildExecutionSchedule() {
 
 void RenderGraph::Execute(PassExecutionContext& context) {
 	ZoneScopedN("RenderGraph::Execute");
+	m_lastPresentDependency.reset();
 	{
 		ZoneScopedN("RenderGraph::Execute::ValidateCompiledResourceGenerations");
 		ValidateCompiledResourceGenerations();
@@ -8820,6 +8821,44 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 				spdlog::info("RenderGraph::Execute frame={} submit-all-batches complete", static_cast<unsigned>(context.frameIndex));
 			}
 		}
+	}
+
+	auto passDeclaresPresent = [](const PassBatch::QueuedPass& queuedPass) -> bool {
+		return std::visit([](auto* passAndResources) -> bool {
+			using PassPtr = std::decay_t<decltype(passAndResources)>;
+			if constexpr (std::is_same_v<PassPtr, RenderPassAndResources*>) {
+				return passAndResources && !passAndResources->resources.presentResources.empty();
+			} else {
+				return false;
+			}
+		}, queuedPass);
+	};
+
+	for (size_t bi = 0; bi < batches.size(); ++bi) {
+		const auto& batch = batches[bi];
+		for (size_t qi = 0; qi < batch.QueueCount(); ++qi) {
+			const auto& queuedPasses = batch.queuePasses[qi];
+			if (std::any_of(queuedPasses.begin(), queuedPasses.end(), passDeclaresPresent)) {
+				const auto queueSlot = static_cast<QueueSlotIndex>(static_cast<uint8_t>(qi));
+				m_lastPresentDependency = PresentDependency{
+					.queue = SlotQueue(qi),
+					.wait = { SlotFence(qi).GetHandle(), lastSignaledPerSlot[qi] },
+					.queueSlot = queueSlot,
+					.batchIndex = bi,
+					.valid = lastSignaledPerSlot[qi] != 0,
+				};
+			}
+		}
+	}
+	if (batchTraceEnabled && m_lastPresentDependency) {
+		const size_t queueIndex = static_cast<size_t>(static_cast<uint8_t>(m_lastPresentDependency->queueSlot));
+		spdlog::info(
+			"RenderGraph::Execute frame={} present dependency batch={} queue={} slot={} fence={}",
+			static_cast<unsigned>(context.frameIndex),
+			m_lastPresentDependency->batchIndex,
+			QueueKindToString(m_queueRegistry.GetKind(m_lastPresentDependency->queueSlot)),
+			queueIndex,
+			m_lastPresentDependency->wait.value);
 	}
 
 	{

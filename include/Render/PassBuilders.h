@@ -812,6 +812,13 @@ public:
 
     template<typename... Args>
         requires ((NotIResourceResolver<Args>) && ...)
+    RenderPassBuilder& WithUnorderedAccessClear(Args&&... args) & {
+        (addUnorderedAccessClear(std::forward<Args>(args)), ...);
+        return *this;
+    }
+
+    template<typename... Args>
+        requires ((NotIResourceResolver<Args>) && ...)
     RenderPassBuilder& WithCopyDest(Args&&... args) & {
         (addCopyDest(std::forward<Args>(args)), ...);
         return *this;
@@ -912,6 +919,13 @@ public:
         requires ((NotIResourceResolver<Args>) && ...)
     RenderPassBuilder WithUnorderedAccess(Args&&... args) && {
         (addUnorderedAccess(std::forward<Args>(args)), ...);
+        return std::move(*this);
+    }
+
+    template<typename... Args>
+        requires ((NotIResourceResolver<Args>) && ...)
+    RenderPassBuilder WithUnorderedAccessClear(Args&&... args) && {
+        (addUnorderedAccessClear(std::forward<Args>(args)), ...);
         return std::move(*this);
     }
 
@@ -1018,6 +1032,10 @@ public:
         return WithResolver(r, [&](auto&& resolved) { addUnorderedAccess(std::forward<decltype(resolved)>(resolved)); });
 	}
 
+    RenderPassBuilder& WithUnorderedAccessClear(const IResourceResolver& r)& {
+        return WithResolver(r, [&](auto&& resolved) { addUnorderedAccessClear(std::forward<decltype(resolved)>(resolved)); });
+	}
+
     RenderPassBuilder& WithCopyDest(const IResourceResolver& r)& {
 		return WithResolver(r, [&](auto&& resolved) { addCopyDest(std::forward<decltype(resolved)>(resolved)); });
     }
@@ -1064,6 +1082,9 @@ public:
     RenderPassBuilder WithUnorderedAccess(const IResourceResolver& r)&& {
 		return std::move(*this).WithResolver(r, [&](auto&& resolved) { addUnorderedAccess(std::forward<decltype(resolved)>(resolved)); });
     }
+        RenderPassBuilder WithUnorderedAccessClear(const IResourceResolver& r)&& {
+		return std::move(*this).WithResolver(r, [&](auto&& resolved) { addUnorderedAccessClear(std::forward<decltype(resolved)>(resolved)); });
+        }
     RenderPassBuilder WithCopyDest(const IResourceResolver& r)&& {
 		return std::move(*this).WithResolver(r, [&](auto&& resolved) { addCopyDest(std::forward<decltype(resolved)>(resolved)); });
     }
@@ -1367,6 +1388,25 @@ private:
 		return *this;
 	}
 
+    template<typename T>
+        requires ResourceLike<T>
+    RenderPassBuilder& addUnorderedAccessClear(T&& x) {
+        detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
+        detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorUnorderedAccessViews, x, DescriptorType::UAV);
+        detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
+        detail::AppendTrackedResource(graph, _declaredIds, params.unorderedAccessClearViews, std::forward<T>(x));
+        return *this;
+    }
+    template<class Range>
+        requires (std::ranges::range<Range>&&
+    ResourceLike<std::ranges::range_value_t<Range>>)
+    RenderPassBuilder& addUnorderedAccessClear(Range&& xs) {
+        for (auto&& e : xs) {
+            addUnorderedAccessClear(std::forward<decltype(e)>(e));
+        }
+        return *this;
+    }
+
     // Copy destination
 	template<typename T>
         requires ResourceLike<T>
@@ -1516,6 +1556,7 @@ private:
             std::pair{ std::cref(params.depthReadWriteResources), rhi::ResourceAccessType::DepthReadWrite },
             std::pair{ std::cref(params.depthStencilClearResources), rhi::ResourceAccessType::DepthStencilClear },
             std::pair{ std::cref(params.unorderedAccessViews), rhi::ResourceAccessType::UnorderedAccess },
+            std::pair{ std::cref(params.unorderedAccessClearViews), rhi::ResourceAccessType::UnorderedAccessClear },
             std::pair{ std::cref(params.copySources), rhi::ResourceAccessType::CopySource },
             std::pair{ std::cref(params.copyTargets), rhi::ResourceAccessType::CopyDest },
             std::pair{ std::cref(params.indirectArgumentBuffers), rhi::ResourceAccessType::IndirectArgument },
@@ -1572,6 +1613,13 @@ public:
 
     template<typename... Args>
         requires ((NotIResourceResolver<Args>) && ...)
+    ComputePassBuilder& WithUnorderedAccessClear(Args&&... args) & {
+        (addUnorderedAccessClear(std::forward<Args>(args)), ...);
+        return *this;
+    }
+
+    template<typename... Args>
+        requires ((NotIResourceResolver<Args>) && ...)
     ComputePassBuilder& WithIndirectArguments(Args&&... args) & {
         (addIndirectArguments(std::forward<Args>(args)), ...);
         return *this;
@@ -1616,6 +1664,13 @@ public:
         requires ((NotIResourceResolver<Args>) && ...)
     ComputePassBuilder WithUnorderedAccess(Args&&... args) && {
         (addUnorderedAccess(std::forward<Args>(args)), ...);
+        return std::move(*this);
+    }
+
+    template<typename... Args>
+        requires ((NotIResourceResolver<Args>) && ...)
+    ComputePassBuilder WithUnorderedAccessClear(Args&&... args) && {
+        (addUnorderedAccessClear(std::forward<Args>(args)), ...);
         return std::move(*this);
     }
 
@@ -1723,6 +1778,10 @@ public:
 		return WithResolver(r, [&](auto&& resolved) { addUnorderedAccess(std::forward<decltype(resolved)>(resolved)); });
         }
 
+        ComputePassBuilder& WithUnorderedAccessClear(const IResourceResolver& r)& {
+		return WithResolver(r, [&](auto&& resolved) { addUnorderedAccessClear(std::forward<decltype(resolved)>(resolved)); });
+        }
+
         ComputePassBuilder& WithIndirectArguments(const IResourceResolver& r)& {
 		return WithResolver(r, [&](auto&& resolved) { addIndirectArguments(std::forward<decltype(resolved)>(resolved)); });
         }
@@ -1742,6 +1801,10 @@ public:
 
         ComputePassBuilder WithUnorderedAccess(const IResourceResolver& r)&& {
 		return std::move(*this).WithResolver(r, [&](auto&& resolved) { addUnorderedAccess(std::forward<decltype(resolved)>(resolved)); });
+        }
+
+        ComputePassBuilder WithUnorderedAccessClear(const IResourceResolver& r)&& {
+		return std::move(*this).WithResolver(r, [&](auto&& resolved) { addUnorderedAccessClear(std::forward<decltype(resolved)>(resolved)); });
         }
 
         ComputePassBuilder WithIndirectArguments(const IResourceResolver& r)&& {
@@ -1899,6 +1962,25 @@ private:
         return *this;
 	}
 
+    template<typename T>
+        requires ResourceLike<T>
+    ComputePassBuilder& addUnorderedAccessClear(T&& x) {
+        detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
+        detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorUnorderedAccessViews, x, DescriptorType::UAV);
+        detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
+        detail::AppendTrackedResource(graph, _declaredIds, params.unorderedAccessClearViews, std::forward<T>(x));
+        return *this;
+    }
+    template<class Range>
+        requires (std::ranges::range<Range>&&
+    ResourceLike<std::ranges::range_value_t<Range>>)
+    ComputePassBuilder& addUnorderedAccessClear(Range&& xs) {
+        for (auto&& e : xs) {
+            addUnorderedAccessClear(std::forward<decltype(e)>(e));
+        }
+        return *this;
+    }
+
 	// Indirect arguments
 	template<typename T>
         requires ResourceLike<T>
@@ -1987,6 +2069,7 @@ private:
             std::pair{ std::cref(params.shaderResources), rhi::ResourceAccessType::ShaderResource },
             std::pair{ std::cref(params.constantBuffers), rhi::ResourceAccessType::ConstantBuffer },
             std::pair{ std::cref(params.unorderedAccessViews), rhi::ResourceAccessType::UnorderedAccess },
+            std::pair{ std::cref(params.unorderedAccessClearViews), rhi::ResourceAccessType::UnorderedAccessClear },
             std::pair{ std::cref(params.indirectArgumentBuffers), rhi::ResourceAccessType::IndirectArgument },
             std::pair{ std::cref(params.legacyInteropResources), rhi::ResourceAccessType::Common });
     }

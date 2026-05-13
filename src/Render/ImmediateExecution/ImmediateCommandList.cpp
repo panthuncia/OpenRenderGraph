@@ -132,6 +132,27 @@ namespace rg::imm {
             return out;
         }
 
+        static inline rhi::TextureSubresourceRange ToRhiRange(const RangeSpec& range, uint32_t totalMips, uint32_t totalSlices)
+        {
+            const SubresourceRange resolved = ResolveRangeSpec(range, totalMips, totalSlices);
+            return rhi::TextureSubresourceRange{
+                .baseMip = resolved.firstMip,
+                .mipCount = resolved.mipCount,
+                .baseLayer = resolved.firstSlice,
+                .layerCount = resolved.sliceCount
+            };
+        }
+
+        static inline rhi::TextureSubresourceRange ExactRhiRange(uint32_t mip, uint32_t slice)
+        {
+            return rhi::TextureSubresourceRange{
+                .baseMip = mip,
+                .mipCount = 1,
+                .baseLayer = slice,
+                .layerCount = 1
+            };
+        }
+
     } // anonymous namespace
 
 
@@ -162,6 +183,52 @@ namespace rg::imm {
 
     void Replay(std::vector<std::byte> const& bytecode, rhi::CommandList& cl, ImmediateDispatch const& dispatch) {
         BytecodeReader r(bytecode.data(), bytecode.size());
+        std::vector<rhi::ResourceHandle> writtenBuffers;
+        std::vector<rhi::ResourceHandle> writtenTextures;
+
+        auto sameHandle = [](const rhi::ResourceHandle& lhs, const rhi::ResourceHandle& rhs) noexcept {
+            return lhs.index == rhs.index && lhs.generation == rhs.generation;
+        };
+        auto markWritten = [&](std::vector<rhi::ResourceHandle>& written, rhi::ResourceHandle handle) {
+            if (std::none_of(written.begin(), written.end(), [&](const rhi::ResourceHandle& existing) { return sameHandle(existing, handle); })) {
+                written.push_back(handle);
+            }
+        };
+        auto wasWritten = [&](const std::vector<rhi::ResourceHandle>& written, rhi::ResourceHandle handle) {
+            return std::any_of(written.begin(), written.end(), [&](const rhi::ResourceHandle& existing) { return sameHandle(existing, handle); });
+        };
+        auto barrierRepeatedBufferWrite = [&](rhi::ResourceHandle buffer, rhi::ResourceAccessType access, rhi::ResourceSyncState sync) {
+            if (wasWritten(writtenBuffers, buffer)) {
+                rhi::BufferBarrier barrier{};
+                barrier.buffer = buffer;
+                barrier.beforeSync = sync;
+                barrier.afterSync = sync;
+                barrier.beforeAccess = access;
+                barrier.afterAccess = access;
+                rhi::BarrierBatch batch{};
+                batch.buffers = { &barrier, 1 };
+                cl.Barriers(batch);
+            }
+            markWritten(writtenBuffers, buffer);
+        };
+        auto barrierRepeatedTextureWrite = [&](rhi::ResourceHandle texture, rhi::TextureSubresourceRange range, rhi::ResourceAccessType access, rhi::ResourceLayout layout, rhi::ResourceSyncState sync) {
+            if (wasWritten(writtenTextures, texture)) {
+                rhi::TextureBarrier barrier{};
+                barrier.texture = texture;
+                barrier.range = range;
+                barrier.beforeSync = sync;
+                barrier.afterSync = sync;
+                barrier.beforeAccess = access;
+                barrier.afterAccess = access;
+                barrier.beforeLayout = layout;
+                barrier.afterLayout = layout;
+                rhi::BarrierBatch batch{};
+                batch.textures = { &barrier, 1 };
+                cl.Barriers(batch);
+            }
+            markWritten(writtenTextures, texture);
+        };
+
         while (!r.Empty()) {
             Op op = r.ReadOp();
             switch (op) {
@@ -172,6 +239,7 @@ namespace rg::imm {
                 }
                 const auto dst = dispatch.GetResourceHandle(dispatch.user, cmd.dst);
                 const auto src = dispatch.GetResourceHandle(dispatch.user, cmd.src);
+                barrierRepeatedBufferWrite(dst, rhi::ResourceAccessType::CopyDest, rhi::ResourceSyncState::Copy);
                 cl.CopyBufferRegion(dst, cmd.dstOffset, src, cmd.srcOffset, cmd.numBytes);
                 break;
             }
@@ -180,7 +248,12 @@ namespace rg::imm {
                 if (!dispatch.GetRTV) {
                     throw std::runtime_error("Immediate replay: GetRTV not set");
                 }
+                if (!dispatch.GetResourceHandle) {
+                    throw std::runtime_error("Immediate replay: GetResourceHandle not set");
+                }
+                const auto target = dispatch.GetResourceHandle(dispatch.user, cmd.target);
                 const auto rtv = dispatch.GetRTV(dispatch.user, cmd.target, cmd.range);
+                barrierRepeatedTextureWrite(target, ToRhiRange(cmd.range, cmd.target.GetNumMipLevels(), cmd.target.GetArraySize()), rhi::ResourceAccessType::RenderTargetClear, rhi::ResourceLayout::RenderTargetClear, rhi::ResourceSyncState::RenderTarget);
                 cl.ClearRenderTargetView(rtv, cmd.clear);
                 break;
             }
@@ -189,7 +262,12 @@ namespace rg::imm {
                 if (!dispatch.GetDSV) {
                     throw std::runtime_error("Immediate replay: GetDSV not set");
                 }
+                if (!dispatch.GetResourceHandle) {
+                    throw std::runtime_error("Immediate replay: GetResourceHandle not set");
+                }
+                const auto target = dispatch.GetResourceHandle(dispatch.user, cmd.target);
                 const auto dsv = dispatch.GetDSV(dispatch.user, cmd.target, cmd.range);
+                barrierRepeatedTextureWrite(target, ToRhiRange(cmd.range, cmd.target.GetNumMipLevels(), cmd.target.GetArraySize()), rhi::ResourceAccessType::DepthStencilClear, rhi::ResourceLayout::DepthStencilClear, rhi::ResourceSyncState::DepthStencil);
                 cl.ClearDepthStencilView(dsv, cmd.clearDepth, cmd.depth, cmd.clearStencil, cmd.stencil);
                 break;
             }
@@ -202,6 +280,16 @@ namespace rg::imm {
                 if (!dispatch.GetUavClearInfo(dispatch.user, cmd.target, cmd.range, info)) {
                     throw std::runtime_error("Immediate replay: GetUavClearInfo failed");
                 }
+                if (!dispatch.GetResourceHandle) {
+                    throw std::runtime_error("Immediate replay: GetResourceHandle not set");
+                }
+                const auto target = dispatch.GetResourceHandle(dispatch.user, cmd.target);
+                if (info.resource.IsTexture()) {
+                    barrierRepeatedTextureWrite(target, ToRhiRange(cmd.range, cmd.target.GetNumMipLevels(), cmd.target.GetArraySize()), rhi::ResourceAccessType::UnorderedAccessClear, rhi::ResourceLayout::UnorderedAccess, rhi::ResourceSyncState::ClearUnorderedAccessView);
+                }
+                else {
+                    barrierRepeatedBufferWrite(target, rhi::ResourceAccessType::UnorderedAccessClear, rhi::ResourceSyncState::ClearUnorderedAccessView);
+                }
                 cl.ClearUavFloat(info, cmd.value);
                 break;
             }
@@ -213,6 +301,16 @@ namespace rg::imm {
                 rhi::UavClearInfo info{};
                 if (!dispatch.GetUavClearInfo(dispatch.user, cmd.target, cmd.range, info)) {
                     throw std::runtime_error("Immediate replay: GetUavClearInfo failed");
+                }
+                if (!dispatch.GetResourceHandle) {
+                    throw std::runtime_error("Immediate replay: GetResourceHandle not set");
+                }
+                const auto target = dispatch.GetResourceHandle(dispatch.user, cmd.target);
+                if (info.resource.IsTexture()) {
+                    barrierRepeatedTextureWrite(target, ToRhiRange(cmd.range, cmd.target.GetNumMipLevels(), cmd.target.GetArraySize()), rhi::ResourceAccessType::UnorderedAccessClear, rhi::ResourceLayout::UnorderedAccess, rhi::ResourceSyncState::ClearUnorderedAccessView);
+                }
+                else {
+                    barrierRepeatedBufferWrite(target, rhi::ResourceAccessType::UnorderedAccessClear, rhi::ResourceSyncState::ClearUnorderedAccessView);
                 }
                 cl.ClearUavUint(info, cmd.value);
                 break;
@@ -244,6 +342,7 @@ namespace rg::imm {
                 src.height = cmd.height;
                 src.depth = cmd.depth;
 
+                barrierRepeatedTextureWrite(dst.texture, ExactRhiRange(cmd.dstMip, cmd.dstSlice), rhi::ResourceAccessType::CopyDest, rhi::ResourceLayout::CopyDest, rhi::ResourceSyncState::Copy);
                 cl.CopyTextureRegion(dst, src);
                 break;
             }
@@ -261,6 +360,7 @@ namespace rg::imm {
                 region.y = cmd.y;
                 region.z = cmd.z;
                 region.footprint = cmd.footprint;
+                barrierRepeatedBufferWrite(region.buffer, rhi::ResourceAccessType::CopyDest, rhi::ResourceSyncState::Copy);
                 cl.CopyTextureToBuffer(region);
                 break;
             }
@@ -278,6 +378,7 @@ namespace rg::imm {
                 region.y = cmd.y;
                 region.z = cmd.z;
                 region.footprint = cmd.footprint;
+                barrierRepeatedTextureWrite(region.texture, ExactRhiRange(cmd.mip, cmd.slice), rhi::ResourceAccessType::CopyDest, rhi::ResourceLayout::CopyDest, rhi::ResourceSyncState::Copy);
                 cl.CopyBufferToTexture(region);
                 break;
             }
@@ -596,7 +697,7 @@ namespace rg::imm {
             });
 
         if (any)
-            Track(target.handle, target.handle.GetGlobalResourceID(), range, rhi::ResourceAccessType::UnorderedAccess);
+            Track(target.handle, target.handle.GetGlobalResourceID(), range, rhi::ResourceAccessType::UnorderedAccessClear);
     }
 
     void ImmediateCommandList::ClearUavUint(Resolved const& target, const uint32_t x, const uint32_t y, const uint32_t z, const uint32_t w, const RangeSpec& range)
@@ -617,7 +718,7 @@ namespace rg::imm {
             });
 
         if (any)
-            Track(target.handle, target.handle.GetGlobalResourceID(), range, rhi::ResourceAccessType::UnorderedAccess);
+            Track(target.handle, target.handle.GetGlobalResourceID(), range, rhi::ResourceAccessType::UnorderedAccessClear);
     }
 
     void ImmediateCommandList::CopyTextureRegion(

@@ -28,6 +28,7 @@ struct RenderPassParameters {
 	std::vector<ResourceHandleAndRange> depthStencilClearResources;
 	std::vector<ResourceHandleAndRange> constantBuffers;
 	std::vector<ResourceHandleAndRange> unorderedAccessViews;
+	std::vector<ResourceHandleAndRange> unorderedAccessClearViews;
 	std::vector<ResourceHandleAndRange> copyTargets;
 	std::vector<ResourceHandleAndRange> copySources;
 	std::vector<ResourceHandleAndRange> indirectArgumentBuffers;
