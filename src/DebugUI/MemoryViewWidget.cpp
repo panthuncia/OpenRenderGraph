@@ -499,6 +499,7 @@ namespace ui {
             rhi::ResourceDesc texDesc{};
             texDesc.type = rhi::ResourceType::Texture2D;
             texDesc.heapType = rhi::HeapType::DeviceLocal;
+            texDesc.resourceFlags = rhi::ResourceFlags::RF_None;
             texDesc.debugName = "MemViewPreview";
             texDesc.texture.format = rhi::Format::R8G8B8A8_UNorm;
             texDesc.texture.width = fp.width;
@@ -506,7 +507,7 @@ namespace ui {
             texDesc.texture.depthOrLayers = 1;
             texDesc.texture.mipLevels = 1;
             texDesc.texture.sampleCount = 1;
-            texDesc.texture.initialLayout = rhi::ResourceLayout::CopyDest;
+            texDesc.texture.initialLayout = rhi::ResourceLayout::Undefined;
 
             auto createResult = device.CreateCommittedResource(texDesc, previewTexture_);
             if (rhi::Failed(createResult) || !previewTexture_) {
@@ -521,6 +522,21 @@ namespace ui {
             device.CreateCommandAllocator(rhi::QueueKind::Graphics, cmdAlloc);
             device.CreateCommandList(rhi::QueueKind::Graphics, cmdAlloc.Get(), cmdList);
             device.CreateTimeline(fence, 0, "MemViewUploadFence");
+
+            rhi::TextureBarrier previewToCopyDest{};
+            previewToCopyDest.texture = previewTexture_->GetHandle();
+            previewToCopyDest.range = { 0, 1, 0, 1 };
+            previewToCopyDest.beforeSync = rhi::ResourceSyncState::None;
+            previewToCopyDest.afterSync = rhi::ResourceSyncState::Copy;
+            previewToCopyDest.beforeAccess = rhi::ResourceAccessType::None;
+            previewToCopyDest.afterAccess = rhi::ResourceAccessType::CopyDest;
+            previewToCopyDest.beforeLayout = rhi::ResourceLayout::Undefined;
+            previewToCopyDest.afterLayout = rhi::ResourceLayout::CopyDest;
+            previewToCopyDest.discard = true;
+
+            rhi::BarrierBatch copyDestBarrierBatch{};
+            copyDestBarrierBatch.textures = { &previewToCopyDest, 1 };
+            cmdList->Barriers(copyDestBarrierBatch);
 
             rhi::helpers::SubresourceData subData{};
             subData.pData = rgba8.data();
