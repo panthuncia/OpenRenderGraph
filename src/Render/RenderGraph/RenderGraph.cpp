@@ -20,6 +20,7 @@
 #include "Managers/Singletons/DeviceManager.h"
 #include "Managers/Singletons/DeletionManager.h"
 #include "Managers/Singletons/UploadManager.h"
+#include "Managers/Singletons/StatisticsManager.h"
 #include "Render/PassBuilders.h"
 #include "Resources/ResourceGroup.h"
 #include "Managers/CommandRecordingManager.h"
@@ -3104,6 +3105,7 @@ RenderGraph::~RenderGraph() {
 }
 
 void RenderGraph::ShutdownRuntime() {
+	StatisticsManager::GetInstance().ClearAll();
 	DeletionManager::GetInstance().DrainAll();
 	DeletionManager::GetInstance().Cleanup();
 	DeviceManager::GetInstance().Cleanup();
