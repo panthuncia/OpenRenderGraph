@@ -1,16 +1,16 @@
 #include "Render/QueueRegistry.h"
 #include "Render/CommandListPool.h"
 
-QueueSlotIndex QueueRegistry::Register(QueueSlot slot, rhi::Queue queue, rhi::Device& device, QueueAutoAssignmentPolicy autoAssignmentPolicy) {
+QueueSlotIndex QueueRegistry::Register(QueueSlot slot, rhi::Queue queue, rhi::Device& device, QueueAutoAssignmentPolicy autoAssignmentPolicy, bool ownsQueue) {
 	auto pool = std::make_unique<CommandListPool>(device, static_cast<rhi::QueueKind>(slot.kind));
 	rhi::TimelinePtr fence;
 	device.CreateTimeline(fence);
-	return Register(slot, queue, std::move(fence), std::move(pool), autoAssignmentPolicy);
+	return Register(slot, queue, std::move(fence), std::move(pool), autoAssignmentPolicy, ownsQueue, ownsQueue ? device : rhi::Device{});
 }
 
-QueueSlotIndex QueueRegistry::Register(QueueSlot slot, rhi::Queue queue, rhi::TimelinePtr fence, std::unique_ptr<CommandListPool> pool, QueueAutoAssignmentPolicy autoAssignmentPolicy) {
+QueueSlotIndex QueueRegistry::Register(QueueSlot slot, rhi::Queue queue, rhi::TimelinePtr fence, std::unique_ptr<CommandListPool> pool, QueueAutoAssignmentPolicy autoAssignmentPolicy, bool ownsQueue, rhi::Device device) {
 	auto idx = static_cast<QueueSlotIndex>(static_cast<uint8_t>(m_slots.size()));
-	m_slots.push_back({ slot.kind, slot.instance, queue, std::move(fence), std::move(pool), autoAssignmentPolicy, 1 });
+	m_slots.push_back({ slot.kind, slot.instance, queue, ownsQueue ? device : rhi::Device{}, std::move(fence), std::move(pool), autoAssignmentPolicy, ownsQueue, 1 });
 	return idx;
 }
 
@@ -38,5 +38,10 @@ QueueSlotIndex QueueRegistry::FindGraphicsSlot() const noexcept {
 }
 
 void QueueRegistry::Clear() {
+	for (auto& slot : m_slots) {
+		if (slot.ownsQueue && slot.device && slot.queue) {
+			slot.device.DestroyQueue(slot.queue.GetQueueHandle());
+		}
+	}
 	m_slots.clear();
 }

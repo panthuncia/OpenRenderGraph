@@ -74,13 +74,17 @@ uint64_t CommandRecordingManager::Flush(QueueKind requested, Signal sig) {
         // so the pool can recycle them safely.
         const bool mustSignalForRecycle = ctx.dirty;
         if (sig.enable || mustSignalForRecycle) {
-			if (m_lastSignaledValue[qkIndex] == UINT64_MAX) {
+			if (m_lastSignaledValue[qkIndex] >= UINT64_MAX - 1 && !(sig.enable && sig.value != 0)) {
 				// Something is wrong
                 spdlog::error("CRM::Flush signal: timeline for queue {} has exhausted its value space! No further command lists can be recorded.",
                     static_cast<int>(qk));
                 throw std::runtime_error("Timeline value space exhausted");
             }
             if (sig.enable && sig.value != 0) {
+                if (sig.value == UINT64_MAX) {
+                    spdlog::error("CRM::Flush signal: explicit signal for queue {} requested terminal value UINT64_MAX", static_cast<int>(qk));
+                    throw std::runtime_error("Timeline signal value UINT64_MAX is invalid");
+                }
                 signaled = sig.value;
             }
             else {
@@ -93,7 +97,17 @@ uint64_t CommandRecordingManager::Flush(QueueKind requested, Signal sig) {
                 bind.fence->GetHandle().index,
                 bind.fence->GetHandle().generation,
                 signaled);
-            bind.queue->Signal({ bind.fence->GetHandle(), signaled });
+            const rhi::Result signalResult = bind.queue->Signal({ bind.fence->GetHandle(), signaled });
+            if (signalResult != rhi::Result::Ok) {
+                spdlog::error(
+                    "CRM::Flush signal failed: queue={} timeline(idx={}, gen={}) value={} result={}",
+                    static_cast<int>(qk),
+                    bind.fence->GetHandle().index,
+                    bind.fence->GetHandle().generation,
+                    signaled,
+                    rhi::ResultName(signalResult));
+                throw std::runtime_error("CommandRecordingManager queue signal failed");
+            }
             m_lastSignaledValue[qkIndex] = std::max(m_lastSignaledValue[qkIndex], signaled);
 #if BUILD_TYPE == BUILD_TYPE_DEBUG
             // Detect out-of-order signals at the CRM level.

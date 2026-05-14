@@ -4008,6 +4008,11 @@ void RenderGraph::PrepareExtensionsForBuild() {
 
 void RenderGraph::ResetForRebuild()
 {
+	if (m_pCommandRecordingManager) {
+		m_pCommandRecordingManager->ShutdownThreadLocal();
+		m_pCommandRecordingManager.reset();
+	}
+
 	// Clear any existing compile state
 	m_masterPassList.clear();
 	m_framePasses.clear();
@@ -6367,8 +6372,17 @@ void RenderGraph::EnsureMinimumAutomaticSchedulingQueues() {
 		uint8_t currentAutoQueueCount = autoAssignableCountForKind(kind);
 		while (currentAutoQueueCount < minimumQueueCount) {
 			std::string queueName = std::string(queueNamePrefix(kind)) + std::to_string(currentAutoQueueCount);
+			const uint8_t previousAutoQueueCount = currentAutoQueueCount;
 			CreateQueue(kind, queueName.c_str(), QueueAutoAssignmentPolicy::AllowAutomaticScheduling);
-			++currentAutoQueueCount;
+			currentAutoQueueCount = autoAssignableCountForKind(kind);
+			if (currentAutoQueueCount <= previousAutoQueueCount) {
+				spdlog::warn(
+					"RenderGraph: requested {} automatic queues for kind {}, but the RHI did not provide a distinct native queue; using {} queue(s).",
+					minimumQueueCount,
+					static_cast<int>(kind),
+					currentAutoQueueCount);
+				break;
+			}
 		}
 	}
 
@@ -7041,6 +7055,13 @@ namespace {
 						h.index, h.generation);
 					continue;
 				}
+				if (fr.fenceValue == UINT64_MAX) {
+					auto h = fr.fence.value().GetHandle();
+					spdlog::error(
+						"SignalExternalFences: pass returned fence (index={}, gen={}) with terminal value UINT64_MAX. Skipping signal.",
+						h.index, h.generation);
+					continue;
+				}
 #if BUILD_TYPE == BUILD_TYPE_DEBUG
 				// Detect external fences that accidentally use the queue's own fence
 				// timeline. This would cause signal tracking to become stale,
@@ -7095,7 +7116,15 @@ namespace {
 					handle.index,
 					handle.generation,
 					fr.fenceValue);
-				queue.Signal({ fr.fence.value().GetHandle(), fr.fenceValue });
+				const rhi::Result signalResult = queue.Signal({ fr.fence.value().GetHandle(), fr.fenceValue });
+				if (signalResult != rhi::Result::Ok) {
+					throw std::runtime_error(fmt::format(
+						"SignalExternalFences failed for timeline(idx={}, gen={}) value={} result={}",
+						handle.index,
+						handle.generation,
+						fr.fenceValue,
+						rhi::ResultName(signalResult)));
+				}
 			}
 		}
 		externalFences.clear();
@@ -7113,6 +7142,20 @@ namespace {
 		std::string_view phase,
 		unsigned frameIndex)
 	{
+		if (value == 0 || value == UINT64_MAX) {
+			std::ostringstream oss;
+			oss << "RenderGraph: frame " << frameIndex
+				<< " rejected invalid queue signal value for " << QueueKindToString(queueKind)
+				<< " slot " << queueSlot
+				<< " batch " << batchIndex
+				<< " phase " << phase
+				<< " fence(idx=" << timeline.GetHandle().index
+				<< ", gen=" << timeline.GetHandle().generation
+				<< ") value=" << value
+				<< " completed=" << timeline.GetCompletedValue();
+			spdlog::error(oss.str());
+			throw std::runtime_error(oss.str());
+		}
 		const rhi::Result signalResult = queue.Signal({ timeline.GetHandle(), value });
 		if (signalResult == rhi::Result::Ok) {
 			return;
@@ -8057,8 +8100,32 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 
 	auto WaitOnSlot = [&](size_t dstSlot, size_t srcSlot, UINT64 absoluteFenceValue) {
 		if (dstSlot == srcSlot) return;
+		if (absoluteFenceValue == 0 || absoluteFenceValue == UINT64_MAX) {
+			throw std::runtime_error(fmt::format(
+				"WaitOnSlot rejected invalid fence value: dstSlot={} srcSlot={} value={}",
+				dstSlot,
+				srcSlot,
+				absoluteFenceValue));
+		}
+		const UINT64 completedFenceValue = SlotFence(srcSlot).GetCompletedValue();
+		if (completedFenceValue == UINT64_MAX) {
+			throw std::runtime_error(fmt::format(
+				"WaitOnSlot detected poisoned queue timeline before wait: dstSlot={} srcSlot={} requestedFence={} completed=UINT64_MAX",
+				dstSlot,
+				srcSlot,
+				absoluteFenceValue));
+		}
 		auto dstQ = SlotQueue(dstSlot);
-		dstQ.Wait({ SlotFence(srcSlot).GetHandle(), absoluteFenceValue });
+		const rhi::Result waitResult = dstQ.Wait({ SlotFence(srcSlot).GetHandle(), absoluteFenceValue });
+		if (waitResult != rhi::Result::Ok) {
+			throw std::runtime_error(fmt::format(
+				"WaitOnSlot failed: dstSlot={} srcSlot={} fence={} completed={} result={}",
+				dstSlot,
+				srcSlot,
+				absoluteFenceValue,
+				completedFenceValue,
+				rhi::ResultName(waitResult)));
+		}
 	};
 
 	auto batchExecutesOnQueue = [](const PassBatch& batch, size_t queueIndex) {
@@ -8701,7 +8768,22 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 						queueIndex,
 						batchIndex,
 						reason);
+					if (lastSignaledPerSlot[queueIndex] == UINT64_MAX) {
+						throw std::runtime_error(fmt::format(
+							"RenderGraph::Execute cannot allocate fallback signal for slot {} batch {} reason {} because lastSignaled is UINT64_MAX",
+							queueIndex,
+							batchIndex,
+							reason));
+					}
 					signalValue = lastSignaledPerSlot[queueIndex] + 1;
+				}
+
+				if (signalValue == UINT64_MAX) {
+					throw std::runtime_error(fmt::format(
+						"RenderGraph::Execute rejected terminal queue signal value: slot={} batch={} reason={}",
+						queueIndex,
+						batchIndex,
+						reason));
 				}
 
 				if (batchTraceEnabled) {
@@ -8716,7 +8798,16 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 						pending.submittedPairsAwaitingRecycle.size());
 				}
 
-				rhiQueue.Signal({ fenceTimeline.GetHandle(), signalValue });
+				const rhi::Result signalResult = rhiQueue.Signal({ fenceTimeline.GetHandle(), signalValue });
+				if (signalResult != rhi::Result::Ok) {
+					throw std::runtime_error(fmt::format(
+						"RenderGraph::Execute queue signal failed: slot={} batch={} reason={} value={} result={}",
+						queueIndex,
+						batchIndex,
+						reason,
+						signalValue,
+						rhi::ResultName(signalResult)));
+				}
 				lastSignaledPerSlot[queueIndex] = std::max(lastSignaledPerSlot[queueIndex], signalValue);
 
 				if (pool) {
@@ -8843,6 +8934,12 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 				}
 				const QueueKind queueKind = m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(qi));
 				ZoneText(QueueKindToString(queueKind), std::strlen(QueueKindToString(queueKind)));
+				if (lastSignaledPerSlot[qi] >= UINT64_MAX - 1) {
+					throw std::runtime_error(fmt::format(
+						"RenderGraph::Execute cannot allocate end-of-frame recycle signal for slot {} because lastSignaled={}",
+						qi,
+						lastSignaledPerSlot[qi]));
+				}
 				signalAndRecycleQueue(qi, batches.size(), lastSignaledPerSlot[qi] + 1, "EndOfFrameRecycle");
 			}
 			if (batchTraceEnabled) {
@@ -9430,15 +9527,20 @@ QueueSlotIndex RenderGraph::CreateQueue(QueueKind kind, const char* name, QueueA
 	rhi::Queue queue;
 	auto result = device.CreateQueue(static_cast<rhi::QueueKind>(kind), name ? name : "UserQueue", queue);
 	if (result != rhi::Result::Ok) {
-		throw std::runtime_error("Failed to create queue");
+		throw std::runtime_error(fmt::format(
+			"Failed to create queue '{}' for kind {}: {}",
+			name ? name : "UserQueue",
+			static_cast<int>(kind),
+			rhi::ResultName(result)));
 	}
+
 	// Determine instance number: count existing slots of this kind.
 	uint8_t instance = 0;
 	for (size_t i = 0; i < m_queueRegistry.SlotCount(); ++i) {
 		if (m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(static_cast<uint8_t>(i))) == kind)
 			++instance;
 	}
-	return m_queueRegistry.Register({ kind, instance }, queue, device, autoAssignmentPolicy);
+	return m_queueRegistry.Register({ kind, instance }, queue, device, autoAssignmentPolicy, true);
 }
 
 void RenderGraph::SetMinimumAutomaticSchedulingQueues(QueueKind kind, uint8_t count) {

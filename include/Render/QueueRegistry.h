@@ -36,11 +36,14 @@ public:
 	/// Creates a CommandListPool and Timeline for the slot.
 	/// Returns the slot index assigned.
 	QueueSlotIndex Register(QueueSlot slot, rhi::Queue queue, rhi::Device& device,
-		QueueAutoAssignmentPolicy autoAssignmentPolicy = QueueAutoAssignmentPolicy::AllowAutomaticScheduling);
+		QueueAutoAssignmentPolicy autoAssignmentPolicy = QueueAutoAssignmentPolicy::AllowAutomaticScheduling,
+		bool ownsQueue = false);
 
 	/// Register a queue slot with an externally-supplied timeline and pool.
 	QueueSlotIndex Register(QueueSlot slot, rhi::Queue queue, rhi::TimelinePtr fence, std::unique_ptr<CommandListPool> pool,
-		QueueAutoAssignmentPolicy autoAssignmentPolicy = QueueAutoAssignmentPolicy::AllowAutomaticScheduling);
+		QueueAutoAssignmentPolicy autoAssignmentPolicy = QueueAutoAssignmentPolicy::AllowAutomaticScheduling,
+		bool ownsQueue = false,
+		rhi::Device device = {});
 
 	/// Look up slot index by kind + instance. Returns empty optional if not found.
 	QueueSlotIndex FindSlot(QueueSlot slot) const;
@@ -94,9 +97,11 @@ private:
 		QueueKind kind{};
 		uint8_t instance{};
 		rhi::Queue queue{};
+		rhi::Device device{};
 		rhi::TimelinePtr fence;
 		std::unique_ptr<CommandListPool> pool;
 		QueueAutoAssignmentPolicy autoAssignmentPolicy = QueueAutoAssignmentPolicy::AllowAutomaticScheduling;
+		bool ownsQueue = false;
 		uint64_t fenceValue = 1;
 	};
 
