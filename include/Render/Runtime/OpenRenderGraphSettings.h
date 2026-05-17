@@ -6,6 +6,19 @@
 
 namespace rg::runtime {
 
+enum class RenderGraphRegionMode : uint8_t {
+    Disabled = 0,
+    ExtractOnly,
+    ValidateOnly,
+    ShadowReplay,
+    ReplayAuthoritative,
+};
+
+enum class TransitionPlacementMode : uint8_t {
+    InlineEarlyPlacement = 0,
+    CanonicalThenOptimize,
+};
+
 struct OpenRenderGraphSettings {
     uint8_t numFramesInFlight = 3;
     bool collectPassStatistics = true;
@@ -32,6 +45,11 @@ struct OpenRenderGraphSettings {
     float queueSchedulingCrossQueueHandoffPenalty = 2.0f;
     uint32_t autoAliasPoolRetireIdleFrames = 120u;
     float autoAliasPoolGrowthHeadroom = 1.5f;
+    RenderGraphRegionMode renderGraphRegionMode = RenderGraphRegionMode::Disabled;
+    TransitionPlacementMode transitionPlacementMode = TransitionPlacementMode::InlineEarlyPlacement;
+    uint32_t renderGraphRegionMinPassCount = 4u;
+    bool renderGraphRegionDiagnosticsEnabled = false;
+    bool renderGraphRegionShadowStrictBatchMatch = false;
     bool heavyDebug = false;
 };
 
@@ -61,6 +79,7 @@ inline void SetOpenRenderGraphSettings(const OpenRenderGraphSettings& settings) 
     state.settings.queueSchedulingCrossQueueHandoffPenalty = (std::max)(0.0f, state.settings.queueSchedulingCrossQueueHandoffPenalty);
     state.settings.autoAliasPoolRetireIdleFrames = (std::max)(1u, state.settings.autoAliasPoolRetireIdleFrames);
     state.settings.autoAliasPoolGrowthHeadroom = (std::max)(1.0f, state.settings.autoAliasPoolGrowthHeadroom);
+    state.settings.renderGraphRegionMinPassCount = (std::max)(1u, state.settings.renderGraphRegionMinPassCount);
 }
 
 inline OpenRenderGraphSettings GetOpenRenderGraphSettings() {

@@ -292,6 +292,7 @@ public:
 
 		uint64_t resolverSnapshotHash = 0;
 		uint64_t declarationGeneration = 0;
+		uint64_t declarationFingerprint = 0;
 	};
 
 	struct RenderPassAndResources { // TODO: I'm currently copying these a lot; maybe use pointers instead
@@ -831,6 +832,122 @@ private:
 		ResourceState uniformState{};
 	};
 
+	enum class RegionRejectReason : uint8_t {
+		QueueSlotChange = 0,
+		PassCountBelowThreshold,
+		ImmediateWork,
+		FrameExtensionPass,
+		DeclarationRefreshedThisFrame,
+		InteriorIncomingEdge,
+		InteriorOutgoingEdge,
+		AliasActivation,
+		AliasPlacementInstability,
+		CrossQueueSync,
+		GraphicsFallbackTransition,
+		UnsupportedSubresourceState,
+		BatchHazardBoundary,
+		Count
+	};
+
+	struct ScheduledRegion {
+		uint32_t firstTraceIndex = 0;
+		uint32_t lastTraceIndex = 0;
+		uint32_t firstPassIndex = 0;
+		uint32_t lastPassIndex = 0;
+		uint32_t firstBatchIndex = 0;
+		uint32_t lastBatchIndex = 0;
+		uint16_t queueSlot = 0;
+		uint32_t passCount = 0;
+		uint32_t requirementCount = 0;
+		uint32_t batchCount = 0;
+		uint32_t transitionCount = 0;
+		uint32_t boundaryInputEdgeCount = 0;
+		uint32_t boundaryOutputEdgeCount = 0;
+		uint32_t crossQueueBoundaryInputEdgeCount = 0;
+		uint32_t crossQueueBoundaryOutputEdgeCount = 0;
+		uint32_t boundarySyncCount = 0;
+		uint32_t sameBatchPrefixPassCount = 0;
+		uint32_t sameBatchSuffixPassCount = 0;
+		uint32_t sameBatchInterleavedPassCount = 0;
+		uint32_t crossQueueBoundaryPassCount = 0;
+		uint32_t crossQueueTransitionCount = 0;
+	};
+
+	struct RegionCacheStats {
+		uint64_t framesSinceRegionBuild = 0;
+		uint64_t candidateRegionCount = 0;
+		uint64_t acceptedRegionCount = 0;
+		uint64_t rejectedRegionCount = 0;
+		uint64_t coveredPassCount = 0;
+		uint64_t coveredRequirementCount = 0;
+		uint64_t coveredBatchCount = 0;
+		uint64_t coveredTransitionCount = 0;
+		uint64_t largestRegionPassCount = 0;
+		uint64_t largestRegionRequirementCount = 0;
+		uint64_t estimatedSavedAddTransitionCalls = 0;
+		uint64_t estimatedSavedIsNewBatchNeededCalls = 0;
+		uint64_t boundaryInputEdgeCount = 0;
+		uint64_t boundaryOutputEdgeCount = 0;
+		uint64_t crossQueueBoundaryInputEdgeCount = 0;
+		uint64_t crossQueueBoundaryOutputEdgeCount = 0;
+		uint64_t boundarySyncCount = 0;
+		uint64_t sameBatchPrefixPassCount = 0;
+		uint64_t sameBatchSuffixPassCount = 0;
+		uint64_t sameBatchInterleavedPassCount = 0;
+		uint64_t crossQueueBoundaryPassCount = 0;
+		uint64_t crossQueueTransitionCount = 0;
+		std::array<uint64_t, static_cast<size_t>(RegionRejectReason::Count)> rejectedByReason{};
+	};
+
+	struct CachedScheduleRegion {
+		ScheduledRegion schedule;
+	};
+
+	struct RenderGraphRegionCache {
+		uint64_t structuralGeneration = 0;
+		uint64_t lastAuthoritativeCompileFingerprint = 0;
+		std::vector<CachedScheduleRegion> regions;
+		RegionCacheStats stats;
+	};
+
+	struct SchedulingDecisionTrace {
+		uint32_t nodeIndex = 0;
+		uint32_t passIndex = 0;
+		uint32_t batchIndex = 0;
+		uint16_t assignedQueueSlot = 0;
+		bool closedBatchBefore = false;
+		uint32_t readySetSize = 0;
+		uint32_t candidateChecks = 0;
+		uint32_t isNewBatchNeededChecks = 0;
+		bool fallbackCommit = false;
+	};
+
+	struct TransitionPlacementCandidate {
+		uint32_t transitionId = 0;
+		uint32_t consumerBatch = 0;
+		uint16_t consumerQueueSlot = 0;
+		uint16_t transitionQueueSlot = 0;
+		size_t resourceIndex = 0;
+		uint64_t resourceID = 0;
+		uint32_t lastUseBatch = 0;
+		uint64_t lastUseQueueMask = 0;
+		bool isAliasActivation = false;
+		bool needsGraphicsFallback = false;
+		bool requiresCrossQueuePlacementCoordination = false;
+		ResourceTransition transition;
+	};
+
+	struct TransitionPlacementStats {
+		uint64_t candidateCount = 0;
+		uint64_t emittedTransitionCount = 0;
+		uint64_t canonicalBeforePassCount = 0;
+		uint64_t inlineEarlyPlacedCount = 0;
+		uint64_t graphicsFallbackCount = 0;
+		uint64_t aliasActivationCount = 0;
+		uint64_t oldInlineEarlyEligibleCount = 0;
+		uint64_t crossQueueCoordinationBlockedCount = 0;
+	};
+
 	struct BatchBuildState {
 		size_t queueCount = 0;
 		size_t resourceCount = 0;
@@ -952,6 +1069,10 @@ private:
 
 	std::vector<AnyPassAndResources> m_masterPassList;
 	std::vector<AnyPassAndResources> m_framePasses;
+	std::vector<uint8_t> m_framePassIsFrameExtension;
+	std::vector<uint8_t> m_framePassDeclarationRefreshedThisFrame;
+	uint64_t m_frameDeclarationRefreshRequestedCount = 0;
+	uint64_t m_frameDeclarationRefreshEquivalentCount = 0;
 	std::vector<size_t> m_assignedQueueSlotsByFramePass;
 	std::vector<uint8_t> m_activeQueueSlotsThisFrame;
 	std::array<uint8_t, static_cast<size_t>(QueueKind::Count)> m_minAutomaticSchedulingQueuesByKind = { 1, 1, 1 };
@@ -1010,6 +1131,13 @@ private:
 	std::unordered_map<uint64_t, SymbolicTracker*> trackers; // Tracks the state of resources in the graph.
 	std::vector<FrameCompileResourceState> m_frameCompileResources; // Compile-only symbolic state, indexed by frame-local resource index.
 	std::vector<FrameResourceAccessSummary> m_frameResourceAccessSummaries;
+	RenderGraphRegionCache m_regionCache;
+	RegionCacheStats m_lastRegionStats;
+	std::vector<ScheduledRegion> m_lastExtractedRegions;
+	std::vector<std::string> m_lastRegionCandidateDiagnostics;
+	std::vector<SchedulingDecisionTrace> m_schedulingDecisionTrace;
+	std::vector<TransitionPlacementCandidate> m_transitionPlacementCandidates;
+	TransitionPlacementStats m_transitionPlacementStats;
 	std::unordered_map<uint64_t, LastProducerAcrossFrames> m_lastProducerByResourceAcrossFrames;
 	std::unordered_map<uint64_t, std::vector<LastAliasPlacementProducerAcrossFrames>> m_lastAliasPlacementProducersByPoolAcrossFrames;
 	std::vector<std::unordered_map<uint64_t, unsigned int>> m_compiledLastProducerBatchByResourceByQueue;
@@ -1105,12 +1233,26 @@ private:
 	std::pair<unsigned int, uint64_t> GetFrameResourceLastEventBeforeBatch(size_t resourceIndex, unsigned int batchIndex) const;
 	const std::vector<uint64_t>& GetSchedulingEquivalentIDsCached(uint64_t resourceID);
 
-	void RefreshRetainedDeclarationsForFrame(RenderPassAndResources& p, uint8_t frameIndex);
-	void RefreshRetainedDeclarationsForFrame(ComputePassAndResources& p, uint8_t frameIndex);
-	void RefreshRetainedDeclarationsForFrame(CopyPassAndResources& p, uint8_t frameIndex);
+	bool RefreshRetainedDeclarationsForFrame(RenderPassAndResources& p, uint8_t frameIndex);
+	bool RefreshRetainedDeclarationsForFrame(ComputePassAndResources& p, uint8_t frameIndex);
+	bool RefreshRetainedDeclarationsForFrame(CopyPassAndResources& p, uint8_t frameIndex);
 	void CompileFrame(rhi::Device device, uint8_t frameIndex, const IHostExecutionData* hostData);
 	void WriteCompiledGraphDebugDump(uint8_t frameIndex, const std::vector<Node>& nodes) const;
 	void WriteVramUsageDebugDump(uint8_t frameIndex) const;
+	void CoalesceQueueWaitsAndSignals(std::vector<PassBatch>& batchesToCoalesce) const;
+	void ExtractScheduleRegionsFromAuthoritativeCompile(
+		const std::vector<Node>& nodes,
+		const std::vector<AnyPassAndResources>& framePasses,
+		const std::vector<PassBatch>& compiledBatches,
+		std::vector<ScheduledRegion>& outRegions,
+		RegionCacheStats& outStats,
+		std::vector<std::string>& outCandidateDiagnostics) const;
+	bool ValidateSchedulingDecisionTrace(
+		const std::vector<Node>& nodes,
+		const std::vector<AnyPassAndResources>& framePasses,
+		const std::vector<PassBatch>& compiledBatches,
+		std::string& outSummary) const;
+	void LogRegionCompileSummary(uint8_t frameIndex, const std::vector<Node>& nodes);
 	AnyPassAndResources MaterializeExternalPass(const ExternalPassDesc& desc, bool callSetup, bool materializeReferencedResources);
 	void RegisterExternalPassName(const ExternalPassDesc& desc, AnyPassAndResources& any);
 
@@ -1356,6 +1498,11 @@ private:
 	std::function<float()> m_getQueueSchedulingAutoGraphicsBias;
 	std::function<float()> m_getQueueSchedulingAsyncOverlapBonus;
 	std::function<float()> m_getQueueSchedulingCrossQueueHandoffPenalty;
+	std::function<rg::runtime::RenderGraphRegionMode()> m_getRenderGraphRegionMode;
+	std::function<rg::runtime::TransitionPlacementMode()> m_getTransitionPlacementMode;
+	std::function<uint32_t()> m_getRenderGraphRegionMinPassCount;
+	std::function<bool()> m_getRenderGraphRegionDiagnosticsEnabled;
+	std::function<bool()> m_getRenderGraphRegionShadowStrictBatchMatch;
 	std::unordered_map<uint64_t, AddTransitionDebugStats> m_addTransitionDebugStatsByResource;
 	std::function<uint32_t()> m_getAutoAliasPoolRetireIdleFrames;
 	std::function<float()> m_getAutoAliasPoolGrowthHeadroom;

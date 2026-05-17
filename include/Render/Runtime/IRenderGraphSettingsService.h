@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <memory>
 
+#include "Render/Runtime/OpenRenderGraphSettings.h"
+
 namespace rg::runtime {
 
 class IRenderGraphSettingsService {
@@ -30,6 +32,11 @@ public:
     virtual float GetQueueSchedulingCrossQueueHandoffPenalty() const = 0;
     virtual uint32_t GetAutoAliasPoolRetireIdleFrames() const = 0;
     virtual float GetAutoAliasPoolGrowthHeadroom() const = 0;
+    virtual RenderGraphRegionMode GetRenderGraphRegionMode() const = 0;
+    virtual TransitionPlacementMode GetTransitionPlacementMode() const = 0;
+    virtual uint32_t GetRenderGraphRegionMinPassCount() const = 0;
+    virtual bool GetRenderGraphRegionDiagnosticsEnabled() const = 0;
+    virtual bool GetRenderGraphRegionShadowStrictBatchMatch() const = 0;
     virtual bool GetHeavyDebug() const = 0;
 };
 

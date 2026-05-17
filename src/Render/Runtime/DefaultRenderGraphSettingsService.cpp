@@ -91,6 +91,26 @@ public:
         return GetOpenRenderGraphSettings().autoAliasPoolGrowthHeadroom;
     }
 
+    RenderGraphRegionMode GetRenderGraphRegionMode() const override {
+        return GetOpenRenderGraphSettings().renderGraphRegionMode;
+    }
+
+    TransitionPlacementMode GetTransitionPlacementMode() const override {
+        return GetOpenRenderGraphSettings().transitionPlacementMode;
+    }
+
+    uint32_t GetRenderGraphRegionMinPassCount() const override {
+        return GetOpenRenderGraphSettings().renderGraphRegionMinPassCount;
+    }
+
+    bool GetRenderGraphRegionDiagnosticsEnabled() const override {
+        return GetOpenRenderGraphSettings().renderGraphRegionDiagnosticsEnabled;
+    }
+
+    bool GetRenderGraphRegionShadowStrictBatchMatch() const override {
+        return GetOpenRenderGraphSettings().renderGraphRegionShadowStrictBatchMatch;
+    }
+
     bool GetHeavyDebug() const override {
         return GetOpenRenderGraphSettings().heavyDebug;
     }

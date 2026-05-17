@@ -147,6 +147,58 @@ namespace {
 		return info;
 	}
 
+	uint64_t HashBoundForDeclaration(uint64_t seed, const Bound& bound) noexcept {
+		seed = HashCombine64(seed, static_cast<uint64_t>(bound.type));
+		seed = HashCombine64(seed, bound.value);
+		return seed;
+	}
+
+	uint64_t HashRangeForDeclaration(uint64_t seed, const RangeSpec& range) noexcept {
+		seed = HashBoundForDeclaration(seed, range.mipLower);
+		seed = HashBoundForDeclaration(seed, range.mipUpper);
+		seed = HashBoundForDeclaration(seed, range.sliceLower);
+		seed = HashBoundForDeclaration(seed, range.sliceUpper);
+		return seed;
+	}
+
+	uint64_t HashStateForDeclaration(uint64_t seed, const ResourceState& state) noexcept {
+		seed = HashCombine64(seed, static_cast<uint64_t>(state.access));
+		seed = HashCombine64(seed, static_cast<uint64_t>(state.layout));
+		seed = HashCombine64(seed, static_cast<uint64_t>(state.sync));
+		return seed;
+	}
+
+	template<class PassResourceData>
+	uint64_t HashPassDeclaration(const PassResourceData& resources, std::span<const ResolverSnapshot> resolverSnapshots) {
+		std::vector<uint64_t> entries;
+		entries.reserve(resources.staticResourceRequirements.size() + resources.internalTransitions.size());
+
+		for (const auto& req : resources.staticResourceRequirements) {
+			uint64_t entry = 0x7265717569726501ull;
+			entry = HashCombine64(entry, req.resourceHandleAndRange.resource.GetGlobalResourceID());
+			entry = HashRangeForDeclaration(entry, req.resourceHandleAndRange.range);
+			entry = HashStateForDeclaration(entry, req.state);
+			entries.push_back(entry);
+		}
+
+		for (const auto& transition : resources.internalTransitions) {
+			uint64_t entry = 0x7472616e73697401ull;
+			entry = HashCombine64(entry, transition.first.resource.GetGlobalResourceID());
+			entry = HashRangeForDeclaration(entry, transition.first.range);
+			entry = HashStateForDeclaration(entry, transition.second);
+			entries.push_back(entry);
+		}
+
+		std::sort(entries.begin(), entries.end());
+		uint64_t hash = 0xd1ec1a6a710f0001ull;
+		hash = HashCombine64(hash, entries.size());
+		for (const uint64_t entry : entries) {
+			hash = HashCombine64(hash, entry);
+		}
+		hash = HashCombine64(hash, HashResolverSnapshots(resolverSnapshots));
+		return hash;
+	}
+
 	template<class PassAndResources>
 	void UpdateRetainedDeclarationCache(const ResourceRegistry& registry, PassAndResources& passAndResources) {
 		auto* dynamicInterface = dynamic_cast<IDynamicDeclaredResources*>(passAndResources.pass.get());
@@ -157,6 +209,7 @@ namespace {
 		declarationCache.containsEphemeralOrAnonymousHandles = handleValidation.containsEphemeralOrAnonymousHandles;
 		declarationCache.requiresStaleHandleValidation = handleValidation.requiresStaleHandleValidation;
 		declarationCache.resolverSnapshotHash = HashResolverSnapshots(passAndResources.resolverSnapshots);
+		declarationCache.declarationFingerprint = HashPassDeclaration(passAndResources.resources, passAndResources.resolverSnapshots);
 		++declarationCache.declarationGeneration;
 	}
 
@@ -376,6 +429,25 @@ namespace {
 		switch (phase) {
 		case RenderGraph::BatchTransitionPhase::BeforePasses: return "BeforePasses";
 		case RenderGraph::BatchTransitionPhase::AfterPasses: return "AfterPasses";
+		default: return "Unknown";
+		}
+	}
+
+	const char* RenderGraphRegionModeToString(rg::runtime::RenderGraphRegionMode mode) noexcept {
+		switch (mode) {
+		case rg::runtime::RenderGraphRegionMode::Disabled: return "Disabled";
+		case rg::runtime::RenderGraphRegionMode::ExtractOnly: return "ExtractOnly";
+		case rg::runtime::RenderGraphRegionMode::ValidateOnly: return "ValidateOnly";
+		case rg::runtime::RenderGraphRegionMode::ShadowReplay: return "ShadowReplay";
+		case rg::runtime::RenderGraphRegionMode::ReplayAuthoritative: return "ReplayAuthoritative";
+		default: return "Unknown";
+		}
+	}
+
+	const char* TransitionPlacementModeToString(rg::runtime::TransitionPlacementMode mode) noexcept {
+		switch (mode) {
+		case rg::runtime::TransitionPlacementMode::InlineEarlyPlacement: return "InlineEarlyPlacement";
+		case rg::runtime::TransitionPlacementMode::CanonicalThenOptimize: return "CanonicalThenOptimize";
 		default: return "Unknown";
 		}
 	}
@@ -2187,12 +2259,16 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 	};
 
 	size_t remaining = nodes.size();
+	bool closedBatchBeforeNextCommit = false;
 
 	while (remaining > 0) {
 		// Collect "fits" and pick best by heuristic
 		int bestIdxInReady = -1;
 		size_t bestQueueSlot = 0;
 		double bestScore = -1e300;
+		uint32_t candidateChecks = 0;
+		uint32_t isNewBatchNeededChecks = 0;
+		const uint32_t readySetSizeBeforeEvaluate = static_cast<uint32_t>(ready.size());
 		{
 			ZoneScopedN("RenderGraph::AutoScheduleAndBuildBatches::EvaluateCandidates");
 
@@ -2217,6 +2293,7 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 			const auto& passSummary = rg.m_framePassSchedulingSummaries[n.passIndex];
 
 			for (size_t nodeQueueSlot : n.compatibleQueueSlots) {
+				++candidateChecks;
 				if (nodeQueueSlot >= queueCount) {
 					continue;
 				}
@@ -2242,6 +2319,7 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 					continue;
 				}
 
+				++isNewBatchNeededChecks;
 				if (rg.IsNewBatchNeeded(
 					passSummary,
 					currentBatch.passBatchTrackersByResourceIndex,
@@ -2329,6 +2407,7 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 			}
 			if (hasAnyQueuedPasses) {
 				closeBatch();
+				closedBatchBeforeNextCommit = true;
 				continue;
 			}
 			else {
@@ -2351,6 +2430,18 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 				if (n.passIndex < rg.m_assignedQueueSlotsByFramePass.size()) {
 					rg.m_assignedQueueSlotsByFramePass[n.passIndex] = *n.assignedQueueSlot;
 				}
+				rg.m_schedulingDecisionTrace.push_back(SchedulingDecisionTrace{
+					.nodeIndex = static_cast<uint32_t>(ni),
+					.passIndex = static_cast<uint32_t>(n.passIndex),
+					.batchIndex = currentBatchIndex,
+					.assignedQueueSlot = static_cast<uint16_t>(fallbackSlot),
+					.closedBatchBefore = closedBatchBeforeNextCommit,
+					.readySetSize = readySetSizeBeforeEvaluate,
+					.candidateChecks = candidateChecks,
+					.isNewBatchNeededChecks = isNewBatchNeededChecks,
+					.fallbackCommit = true,
+				});
+				closedBatchBeforeNextCommit = false;
 				CommitPassToBatch(
 					rg, passes[n.passIndex], n,
 					currentBatchIndex, currentBatch,
@@ -2388,6 +2479,18 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 			if (chosen.passIndex < rg.m_assignedQueueSlotsByFramePass.size()) {
 				rg.m_assignedQueueSlotsByFramePass[chosen.passIndex] = bestQueueSlot;
 			}
+			rg.m_schedulingDecisionTrace.push_back(SchedulingDecisionTrace{
+				.nodeIndex = static_cast<uint32_t>(chosenNodeIndex),
+				.passIndex = static_cast<uint32_t>(chosen.passIndex),
+				.batchIndex = currentBatchIndex,
+				.assignedQueueSlot = static_cast<uint16_t>(bestQueueSlot),
+				.closedBatchBefore = closedBatchBeforeNextCommit,
+				.readySetSize = readySetSizeBeforeEvaluate,
+				.candidateChecks = candidateChecks,
+				.isNewBatchNeededChecks = isNewBatchNeededChecks,
+				.fallbackCommit = false,
+			});
+			closedBatchBeforeNextCommit = false;
 			CommitPassToBatch(
 				rg, passes[chosen.passIndex], chosen,
 				currentBatchIndex, currentBatch,
@@ -2425,104 +2528,9 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 		rg.batches.push_back(std::move(currentBatch));
 	}
 
-	// Coalesce redundant waits: for each (dstQueue, srcQueue) pair in a batch,
-	// eliminate later-phase waits that are subsumed by earlier-phase waits, and
-	// promote cross-batch fence values to earlier phases when safe.
-	//
-	// GPU execution order within a queue for one batch:
-	//   BeforeTransitions waits -> transitions -> AfterTransitions signal
-	//   BeforeExecution waits   -> passes      -> AfterExecution signal
-	//   BeforeAfterPasses waits -> post-transitions -> AfterCompletion signal
-	//
-	// Fence values on a given queue are monotonically increasing, so a wait for
-	// fence F at an earlier phase automatically satisfies any wait for F' <= F
-	// at a later phase on the same source queue.
-	//
-	// Promoting a fence to an earlier phase is only safe when the signal producing
-	// that fence will fire independently (i.e., it's from a PREVIOUS batch, not the
-	// same batch). Same-batch fences reference signals produced within this batch's
-	// own execution; promoting them to an earlier phase could create circular
-	// cross-queue dependencies (GPU deadlock).
 	{
 		ZoneScopedN("RenderGraph::AutoScheduleAndBuildBatches::CoalesceQueueWaits");
-		for (auto& batch : rg.batches) {
-			const size_t batchQueueCount = batch.QueueCount();
-			for (size_t dst = 0; dst < batchQueueCount; ++dst) {
-				for (size_t src = 0; src < batchQueueCount; ++src) {
-					if (dst == src) continue;
-
-				int enabledCount = 0;
-				for (size_t phase = 0; phase < PassBatch::kWaitPhaseCount; ++phase) {
-					if (batch.queueWaitEnabled[phase][dst][src]) ++enabledCount;
-				}
-				if (enabledCount <= 1) continue;
-
-				// Helper: true if the fence value matches one of this batch's own
-				// pre-allocated signal fence values for the source queue.
-				auto isSameBatchFence = [&](UINT64 f) -> bool {
-					for (size_t sp = 0; sp < PassBatch::kSignalPhaseCount; ++sp) {
-						if (f == batch.queueSignalFenceValue[sp][src]) return true;
-					}
-					return false;
-				};
-
-				// Step 1: Strict subsumption - remove later-phase waits whose fence
-				// value is <= an earlier enabled phase's fence value.
-				for (size_t i = 0; i < PassBatch::kWaitPhaseCount; ++i) {
-					if (!batch.queueWaitEnabled[i][dst][src]) continue;
-					UINT64 fi = batch.queueWaitFenceValue[i][dst][src];
-					for (size_t j = i + 1; j < PassBatch::kWaitPhaseCount; ++j) {
-						if (!batch.queueWaitEnabled[j][dst][src]) continue;
-						if (batch.queueWaitFenceValue[j][dst][src] <= fi) {
-							batch.queueWaitEnabled[j][dst][src] = false;
-							batch.queueWaitFenceValue[j][dst][src] = 0;
-						}
-					}
-				}
-
-				// Step 2: Promote cross-batch fences to the earliest phase.
-				// Only promote fences that are NOT from the same batch.
-				int earliest = -1;
-				for (size_t phase = 0; phase < PassBatch::kWaitPhaseCount; ++phase) {
-					if (batch.queueWaitEnabled[phase][dst][src]) {
-						earliest = static_cast<int>(phase);
-						break;
-					}
-				}
-				if (earliest < 0) continue;
-
-				for (size_t j = static_cast<size_t>(earliest) + 1; j < PassBatch::kWaitPhaseCount; ++j) {
-					if (!batch.queueWaitEnabled[j][dst][src]) continue;
-					UINT64 fj = batch.queueWaitFenceValue[j][dst][src];
-
-					// Same-batch fences must stay at their original phase to avoid
-					// creating circular cross-queue dependencies.
-					if (isSameBatchFence(fj)) continue;
-
-					// Promote to earliest phase (take the max)
-					if (fj > batch.queueWaitFenceValue[earliest][dst][src]) {
-						batch.queueWaitFenceValue[earliest][dst][src] = fj;
-					}
-					batch.queueWaitEnabled[j][dst][src] = false;
-					batch.queueWaitFenceValue[j][dst][src] = 0;
-				}
-
-				// Step 3: Re-run subsumption - the promoted fence may now
-				// subsume same-batch waits that we couldn't promote.
-				for (size_t i = 0; i < PassBatch::kWaitPhaseCount; ++i) {
-					if (!batch.queueWaitEnabled[i][dst][src]) continue;
-					UINT64 fi = batch.queueWaitFenceValue[i][dst][src];
-					for (size_t j = i + 1; j < PassBatch::kWaitPhaseCount; ++j) {
-						if (!batch.queueWaitEnabled[j][dst][src]) continue;
-						if (batch.queueWaitFenceValue[j][dst][src] <= fi) {
-							batch.queueWaitEnabled[j][dst][src] = false;
-							batch.queueWaitFenceValue[j][dst][src] = 0;
-						}
-					}
-				}
-				}
-			}
-		}
+		rg.CoalesceQueueWaitsAndSignals(rg.batches);
 	}
 
 	// Build cross-frame producer tracking from the committed batch schedule.
@@ -2626,6 +2634,77 @@ void RenderGraph::LogAddTransitionDebugSummary() const
 			stats.beforePassTransitionCount,
 			stats.graphicsFallbackTransitionCount,
 			stats.aliasActivationTransitionCount);
+	}
+}
+
+void RenderGraph::CoalesceQueueWaitsAndSignals(std::vector<PassBatch>& batchesToCoalesce) const
+{
+	// Coalesce redundant waits while preserving same-batch fence phase ordering.
+	for (auto& batch : batchesToCoalesce) {
+		const size_t batchQueueCount = batch.QueueCount();
+		for (size_t dst = 0; dst < batchQueueCount; ++dst) {
+			for (size_t src = 0; src < batchQueueCount; ++src) {
+				if (dst == src) continue;
+
+				int enabledCount = 0;
+				for (size_t phase = 0; phase < PassBatch::kWaitPhaseCount; ++phase) {
+					if (batch.queueWaitEnabled[phase][dst][src]) ++enabledCount;
+				}
+				if (enabledCount <= 1) continue;
+
+				auto isSameBatchFence = [&](UINT64 f) -> bool {
+					for (size_t sp = 0; sp < PassBatch::kSignalPhaseCount; ++sp) {
+						if (f == batch.queueSignalFenceValue[sp][src]) return true;
+					}
+					return false;
+				};
+
+				for (size_t i = 0; i < PassBatch::kWaitPhaseCount; ++i) {
+					if (!batch.queueWaitEnabled[i][dst][src]) continue;
+					UINT64 fi = batch.queueWaitFenceValue[i][dst][src];
+					for (size_t j = i + 1; j < PassBatch::kWaitPhaseCount; ++j) {
+						if (!batch.queueWaitEnabled[j][dst][src]) continue;
+						if (batch.queueWaitFenceValue[j][dst][src] <= fi) {
+							batch.queueWaitEnabled[j][dst][src] = false;
+							batch.queueWaitFenceValue[j][dst][src] = 0;
+						}
+					}
+				}
+
+				int earliest = -1;
+				for (size_t phase = 0; phase < PassBatch::kWaitPhaseCount; ++phase) {
+					if (batch.queueWaitEnabled[phase][dst][src]) {
+						earliest = static_cast<int>(phase);
+						break;
+					}
+				}
+				if (earliest < 0) continue;
+
+				for (size_t j = static_cast<size_t>(earliest) + 1; j < PassBatch::kWaitPhaseCount; ++j) {
+					if (!batch.queueWaitEnabled[j][dst][src]) continue;
+					UINT64 fj = batch.queueWaitFenceValue[j][dst][src];
+					if (isSameBatchFence(fj)) continue;
+
+					if (fj > batch.queueWaitFenceValue[earliest][dst][src]) {
+						batch.queueWaitFenceValue[earliest][dst][src] = fj;
+					}
+					batch.queueWaitEnabled[j][dst][src] = false;
+					batch.queueWaitFenceValue[j][dst][src] = 0;
+				}
+
+				for (size_t i = 0; i < PassBatch::kWaitPhaseCount; ++i) {
+					if (!batch.queueWaitEnabled[i][dst][src]) continue;
+					UINT64 fi = batch.queueWaitFenceValue[i][dst][src];
+					for (size_t j = i + 1; j < PassBatch::kWaitPhaseCount; ++j) {
+						if (!batch.queueWaitEnabled[j][dst][src]) continue;
+						if (batch.queueWaitFenceValue[j][dst][src] <= fi) {
+							batch.queueWaitEnabled[j][dst][src] = false;
+							batch.queueWaitFenceValue[j][dst][src] = 0;
+						}
+					}
+				}
+			}
+		}
 	}
 }
 
@@ -2871,13 +2950,10 @@ void RenderGraph::AddTransitionSlowPath(
 	const size_t transitionSlot = (passQueue != QueueKind::Graphics && needsGraphicsQueueForTransitions)
 		? gfxSlot : passQueueSlot;
 
-	// Try early placement: move transitions to AfterPasses of the batch where the resource was last used.
-	// This reduces GPU idle time by allowing transitions to overlap with unrelated work on other queues.
-	// Skip alias activations - those must stay in the consuming batch (discard semantics at first use).
+	unsigned int lastUseBatch = 0;
+	uint64_t lastUseQueueMask = 0;
+	bool requiresCrossQueuePlacementCoordination = false;
 	if (!isAliasActivation) {
-		unsigned int lastUseBatch = 0;
-		uint64_t lastUseQueueMask = 0;
-		bool requiresCrossQueuePlacementCoordination = false;
 		const bool canUseEventSummary = !m_frameResourceEventSummaries.empty();
 		if (canUseEventSummary) {
 			std::tie(lastUseBatch, lastUseQueueMask) = GetFrameResourceLastEventBeforeBatch(requirement.resourceIndex, batchIndex);
@@ -2914,7 +2990,69 @@ void RenderGraph::AddTransitionSlowPath(
 				}
 			}
 		}
+	}
 
+	m_transitionPlacementStats.candidateCount += transitions.size();
+	m_transitionPlacementStats.emittedTransitionCount += transitions.size();
+	if (isAliasActivation) {
+		m_transitionPlacementStats.aliasActivationCount += transitions.size();
+	}
+	if (needsGraphicsQueueForTransitions) {
+		m_transitionPlacementStats.graphicsFallbackCount += transitions.size();
+	}
+	if (lastUseBatch > 0 && !requiresCrossQueuePlacementCoordination && !isAliasActivation) {
+		m_transitionPlacementStats.oldInlineEarlyEligibleCount += transitions.size();
+	}
+	else if (requiresCrossQueuePlacementCoordination) {
+		m_transitionPlacementStats.crossQueueCoordinationBlockedCount += transitions.size();
+	}
+	for (const auto& transition : transitions) {
+		m_transitionPlacementCandidates.push_back(TransitionPlacementCandidate{
+			.transitionId = static_cast<uint32_t>(m_transitionPlacementCandidates.size()),
+			.consumerBatch = batchIndex,
+			.consumerQueueSlot = static_cast<uint16_t>(passQueueSlot),
+			.transitionQueueSlot = static_cast<uint16_t>(transitionSlot),
+			.resourceIndex = requirement.resourceIndex,
+			.resourceID = resource.GetGlobalResourceID(),
+			.lastUseBatch = lastUseBatch,
+			.lastUseQueueMask = lastUseQueueMask,
+			.isAliasActivation = isAliasActivation,
+			.needsGraphicsFallback = needsGraphicsQueueForTransitions,
+			.requiresCrossQueuePlacementCoordination = requiresCrossQueuePlacementCoordination,
+			.transition = transition,
+		});
+	}
+
+	const auto transitionPlacementMode = m_getTransitionPlacementMode
+		? m_getTransitionPlacementMode()
+		: rg::runtime::TransitionPlacementMode::InlineEarlyPlacement;
+	if (transitionPlacementMode == rg::runtime::TransitionPlacementMode::CanonicalThenOptimize) {
+		if (passQueue != QueueKind::Graphics && needsGraphicsQueueForTransitions) {
+			for (auto& transition : transitions) {
+				currentBatch.Transitions(gfxSlot, BatchTransitionPhase::BeforePasses).push_back(transition);
+			}
+			if (debugStats) {
+				debugStats->beforePassTransitionCount += transitions.size();
+				debugStats->graphicsFallbackTransitionCount += transitions.size();
+			}
+			outFallbackResourceIndices.insert(requirement.resourceIndex);
+		}
+		else {
+			for (auto& transition : transitions) {
+				currentBatch.Transitions(passQueueSlot, BatchTransitionPhase::BeforePasses).push_back(transition);
+			}
+			if (debugStats) {
+				debugStats->beforePassTransitionCount += transitions.size();
+			}
+		}
+		m_transitionPlacementStats.canonicalBeforePassCount += transitions.size();
+		return;
+	}
+
+	// Try early placement: move transitions to AfterPasses of the batch where the resource was last used.
+	// This reduces GPU idle time by allowing transitions to overlap with unrelated work on other queues.
+	// Skip alias activations - those must stay in the consuming batch (discard semantics at first use).
+	if (!isAliasActivation) {
 		if (lastUseBatch > 0 && !requiresCrossQueuePlacementCoordination) { // > 0 to skip batch 0 (placeholder with no fence values)
 			PassBatch& targetBatch = batches[lastUseBatch];
 
@@ -2924,6 +3062,7 @@ void RenderGraph::AddTransitionSlowPath(
 			if (debugStats) {
 				debugStats->earlyPlacedTransitionCount += transitions.size();
 			}
+			m_transitionPlacementStats.inlineEarlyPlacedCount += transitions.size();
 
 			// Signal AfterCompletion on the transition queue so downstream consumers can wait on it
 			targetBatch.MarkQueueSignal(BatchSignalPhase::AfterCompletion, transitionSlot);
@@ -2961,6 +3100,7 @@ void RenderGraph::AddTransitionSlowPath(
 			debugStats->beforePassTransitionCount += transitions.size();
 		}
 	}
+	m_transitionPlacementStats.canonicalBeforePassCount += transitions.size();
 }
 
 void RenderGraph::ProcessResourceRequirements(
@@ -3122,6 +3262,8 @@ void RenderGraph::ShutdownOwnedState() {
 	m_addTransitionDebugStatsByResource.clear();
 	m_masterPassList.clear();
 	m_framePasses.clear();
+	m_framePassIsFrameExtension.clear();
+	m_framePassDeclarationRefreshedThisFrame.clear();
 	m_assignedQueueSlotsByFramePass.clear();
 	m_activeQueueSlotsThisFrame.clear();
 	renderPassesByName.clear();
@@ -3138,6 +3280,12 @@ void RenderGraph::ShutdownOwnedState() {
 	aliasPlacementRangesByID.clear();
 	schedulingPlacementRangesByID.clear();
 	m_schedulingEquivalentIDsCache.clear();
+	m_regionCache = {};
+	m_lastRegionStats = {};
+	m_lastExtractedRegions.clear();
+	m_schedulingDecisionTrace.clear();
+	m_transitionPlacementCandidates.clear();
+	m_transitionPlacementStats = {};
 	ClearFrameSchedulingResourceIndex();
 	ClearFramePassSchedulingSummaries();
 	aliasPlacementPoolByID.clear();
@@ -3619,6 +3767,901 @@ void RenderGraph::RebuildFrameResourceAccessSummaries(const std::vector<Node>& n
 			!accessSummary.hasNonWholeResourceRange &&
 			!accessSummary.hasMultipleRequiredStates &&
 			accessSummary.uniformStateInitialized;
+	}
+}
+
+bool RenderGraph::ValidateSchedulingDecisionTrace(
+	const std::vector<Node>& nodes,
+	const std::vector<AnyPassAndResources>& framePasses,
+	const std::vector<PassBatch>& compiledBatches,
+	std::string& outSummary) const
+{
+	size_t invalidEntries = 0;
+	size_t missingBatchMembership = 0;
+	size_t duplicatePasses = 0;
+	std::vector<uint8_t> seen(framePasses.size(), 0);
+
+	auto passPointerForIndex = [&](size_t passIndex) -> const void* {
+		if (passIndex >= framePasses.size()) {
+			return nullptr;
+		}
+
+		return std::visit(
+			[](const auto& passEntry) -> const void* {
+				using T = std::decay_t<decltype(passEntry)>;
+				if constexpr (std::is_same_v<T, std::monostate>) {
+					return nullptr;
+				}
+				else {
+					return static_cast<const void*>(&passEntry);
+				}
+			},
+			framePasses[passIndex].pass);
+	};
+
+	for (const auto& trace : m_schedulingDecisionTrace) {
+		if (trace.nodeIndex >= nodes.size()
+			|| trace.passIndex >= framePasses.size()
+			|| trace.batchIndex >= compiledBatches.size()
+			|| trace.assignedQueueSlot >= compiledBatches[trace.batchIndex].QueueCount()) {
+			++invalidEntries;
+			continue;
+		}
+
+		if (seen[trace.passIndex] != 0) {
+			++duplicatePasses;
+		}
+		seen[trace.passIndex] = 1;
+
+		const void* expectedPassPointer = passPointerForIndex(trace.passIndex);
+		bool foundInBatch = false;
+		for (const auto& queuedPass : compiledBatches[trace.batchIndex].Passes(trace.assignedQueueSlot)) {
+			std::visit(
+				[&](const auto* passEntry) {
+					if (static_cast<const void*>(passEntry) == expectedPassPointer) {
+						foundInBatch = true;
+					}
+				},
+				queuedPass);
+			if (foundInBatch) {
+				break;
+			}
+		}
+
+		if (!foundInBatch) {
+			++missingBatchMembership;
+		}
+	}
+
+	size_t missingPasses = 0;
+	for (uint8_t value : seen) {
+		if (value == 0) {
+			++missingPasses;
+		}
+	}
+
+	std::ostringstream summary;
+	summary << "trace_entries=" << m_schedulingDecisionTrace.size()
+		<< " passes=" << framePasses.size()
+		<< " invalid=" << invalidEntries
+		<< " duplicate_passes=" << duplicatePasses
+		<< " missing_passes=" << missingPasses
+		<< " missing_batch_membership=" << missingBatchMembership;
+	outSummary = summary.str();
+
+	return m_schedulingDecisionTrace.size() == framePasses.size()
+		&& invalidEntries == 0
+		&& duplicatePasses == 0
+		&& missingPasses == 0
+		&& missingBatchMembership == 0;
+}
+
+void RenderGraph::ExtractScheduleRegionsFromAuthoritativeCompile(
+	const std::vector<Node>& nodes,
+	const std::vector<AnyPassAndResources>& framePasses,
+	const std::vector<PassBatch>& compiledBatches,
+	std::vector<ScheduledRegion>& outRegions,
+	RegionCacheStats& outStats,
+	std::vector<std::string>& outCandidateDiagnostics) const
+{
+	ZoneScopedN("RenderGraph::ExtractScheduleRegionsFromAuthoritativeCompile");
+	outRegions.clear();
+	outStats = {};
+	outCandidateDiagnostics.clear();
+
+	const uint32_t minPassCount = m_getRenderGraphRegionMinPassCount
+		? std::max(1u, m_getRenderGraphRegionMinPassCount())
+		: 4u;
+
+	std::unordered_map<const void*, size_t> passIndexByPointer;
+	passIndexByPointer.reserve(framePasses.size());
+	for (size_t passIndex = 0; passIndex < framePasses.size(); ++passIndex) {
+		std::visit(
+			[&](const auto& passEntry) {
+				using T = std::decay_t<decltype(passEntry)>;
+				if constexpr (!std::is_same_v<T, std::monostate>) {
+					passIndexByPointer.emplace(static_cast<const void*>(&passEntry), passIndex);
+				}
+			},
+			framePasses[passIndex].pass);
+	}
+
+	auto reject = [&](RegionRejectReason reason) {
+		++outStats.rejectedRegionCount;
+		++outStats.rejectedByReason[static_cast<size_t>(reason)];
+	};
+
+	auto rejectReasonName = [](RegionRejectReason reason) noexcept -> const char* {
+		switch (reason) {
+		case RegionRejectReason::QueueSlotChange: return "queue_change";
+		case RegionRejectReason::PassCountBelowThreshold: return "pass_count_below_threshold";
+		case RegionRejectReason::ImmediateWork: return "immediate_work";
+		case RegionRejectReason::FrameExtensionPass: return "frame_extension_pass";
+		case RegionRejectReason::DeclarationRefreshedThisFrame: return "declaration_refreshed";
+		case RegionRejectReason::InteriorIncomingEdge: return "interior_incoming_edge";
+		case RegionRejectReason::InteriorOutgoingEdge: return "interior_outgoing_edge";
+		case RegionRejectReason::AliasActivation: return "alias_activation";
+		case RegionRejectReason::AliasPlacementInstability: return "alias_placement_instability";
+		case RegionRejectReason::CrossQueueSync: return "cross_queue_sync";
+		case RegionRejectReason::GraphicsFallbackTransition: return "graphics_fallback_transition";
+		case RegionRejectReason::UnsupportedSubresourceState: return "unsupported_subresource_state";
+		case RegionRejectReason::BatchHazardBoundary: return "batch_hazard_boundary";
+		case RegionRejectReason::Count: return "accepted";
+		default: return "unknown";
+		}
+	};
+
+	auto shortPassName = [&](uint32_t passIndex) {
+		if (passIndex >= framePasses.size()) {
+			return std::string("<invalid>");
+		}
+		std::string name = framePasses[passIndex].name.empty()
+			? std::string("<unnamed>")
+			: framePasses[passIndex].name;
+		constexpr size_t kMaxPassNameChars = 48;
+		if (name.size() > kMaxPassNameChars) {
+			name.resize(kMaxPassNameChars - 3);
+			name += "...";
+		}
+		return name;
+	};
+
+	auto appendCandidateDiagnostic = [&](
+		size_t candidateIndex,
+		size_t startTrace,
+		size_t endTrace,
+		uint16_t queueSlot,
+		uint32_t firstPassIndex,
+		uint32_t lastPassIndex,
+		uint32_t firstBatchIndex,
+		uint32_t lastBatchIndex,
+		uint32_t requirementCount,
+		uint32_t isNewBatchNeededChecks,
+		uint32_t boundaryInputEdges,
+		uint32_t boundaryOutputEdges,
+		uint32_t crossQueueBoundaryInputEdges,
+		uint32_t crossQueueBoundaryOutputEdges,
+		uint32_t boundarySyncCount,
+		uint32_t sameBatchPrefixPasses,
+		uint32_t sameBatchSuffixPasses,
+		uint32_t sameBatchInterleavedPasses,
+		uint32_t crossQueueBoundaryPasses,
+		uint32_t crossQueueTransitions,
+		RegionRejectReason reason,
+		const std::string& detail) {
+		std::ostringstream line;
+		line << "#" << candidateIndex
+			<< " traces=" << startTrace << "-" << (endTrace > startTrace ? endTrace - 1 : startTrace)
+			<< " queue=" << queueSlot
+			<< " passes=" << (endTrace - startTrace)
+			<< " batches=";
+		if (firstBatchIndex == std::numeric_limits<uint32_t>::max()) {
+			line << "<none>";
+		}
+		else {
+			line << firstBatchIndex << "-" << lastBatchIndex;
+		}
+		line << " requirements=" << requirementCount
+			<< " is_new_batch_checks=" << isNewBatchNeededChecks
+			<< " boundary_inputs=" << boundaryInputEdges
+			<< " boundary_outputs=" << boundaryOutputEdges
+			<< " cross_queue_boundary_inputs=" << crossQueueBoundaryInputEdges
+			<< " cross_queue_boundary_outputs=" << crossQueueBoundaryOutputEdges
+			<< " boundary_syncs=" << boundarySyncCount
+			<< " same_batch_prefix_passes=" << sameBatchPrefixPasses
+			<< " same_batch_suffix_passes=" << sameBatchSuffixPasses
+			<< " same_batch_interleaved_passes=" << sameBatchInterleavedPasses
+			<< " cross_queue_boundary_passes=" << crossQueueBoundaryPasses
+			<< " cross_queue_transitions=" << crossQueueTransitions
+			<< " first=\"" << shortPassName(firstPassIndex) << "\""
+			<< " last=\"" << shortPassName(lastPassIndex) << "\""
+			<< " result=" << rejectReasonName(reason);
+		if (!detail.empty()) {
+			line << " detail=" << detail;
+		}
+		outCandidateDiagnostics.push_back(line.str());
+	};
+
+	auto passHasImmediateWork = [](const AnyPassAndResources& any) {
+		return std::visit(
+			[](const auto& passEntry) -> bool {
+				using T = std::decay_t<decltype(passEntry)>;
+				if constexpr (std::is_same_v<T, std::monostate>) {
+					return true;
+				}
+				else {
+					return passEntry.run != PassRunMask::Retained || !passEntry.immediateBytecode.empty();
+				}
+			},
+			any.pass);
+	};
+
+	auto countPassRequirements = [&](size_t passIndex) -> uint32_t {
+		if (passIndex >= m_framePassSchedulingSummaries.size()) {
+			return 0;
+		}
+		return static_cast<uint32_t>(m_framePassSchedulingSummaries[passIndex].requirements.size());
+	};
+
+	auto passHasUnsupportedRequirement = [&](size_t passIndex, RegionRejectReason& outReason) -> bool {
+		if (passIndex >= m_framePassSchedulingSummaries.size()) {
+			outReason = RegionRejectReason::UnsupportedSubresourceState;
+			return true;
+		}
+
+		for (const auto& requirement : m_framePassSchedulingSummaries[passIndex].requirements) {
+			if (requirement.resourceIndex < m_frameResourceAccessSummaries.size()
+				&& m_frameResourceAccessSummaries[requirement.resourceIndex].hasAliasActivation) {
+				outReason = RegionRejectReason::AliasActivation;
+				return true;
+			}
+			const auto* schedulingPlacement = TryGetSchedulingPlacementRange(requirement.resourceID);
+			if (schedulingPlacement != nullptr && !schedulingPlacement->dedicatedBacking) {
+				outReason = RegionRejectReason::AliasPlacementInstability;
+				return true;
+			}
+		}
+		return false;
+	};
+
+	auto passForcesCandidateSplit = [&](size_t passIndex, RegionRejectReason& outReason) -> bool {
+		if (passIndex >= framePasses.size()) {
+			outReason = RegionRejectReason::ImmediateWork;
+			return true;
+		}
+		if (passHasImmediateWork(framePasses[passIndex])) {
+			outReason = RegionRejectReason::ImmediateWork;
+			return true;
+		}
+		return false;
+	};
+
+	auto countBatchCrossQueueSync = [](const PassBatch& batch) {
+		uint32_t count = 0;
+		for (size_t dst = 0; dst < batch.QueueCount(); ++dst) {
+			for (size_t src = 0; src < batch.QueueCount(); ++src) {
+				if (dst == src) {
+					continue;
+				}
+				for (size_t phaseIndex = 0; phaseIndex < PassBatch::kWaitPhaseCount; ++phaseIndex) {
+					if (batch.HasQueueWait(static_cast<BatchWaitPhase>(phaseIndex), dst, src)) {
+						++count;
+					}
+				}
+			}
+		}
+		for (size_t queueIndex = 0; queueIndex < batch.QueueCount(); ++queueIndex) {
+			for (size_t phaseIndex = 0; phaseIndex < PassBatch::kSignalPhaseCount; ++phaseIndex) {
+				if (batch.HasQueueSignal(static_cast<BatchSignalPhase>(phaseIndex), queueIndex)) {
+					++count;
+				}
+			}
+		}
+		return count;
+	};
+
+	auto countBatchTransitions = [](const PassBatch& batch) {
+		uint32_t count = 0;
+		for (size_t queueIndex = 0; queueIndex < batch.QueueCount(); ++queueIndex) {
+			for (size_t phaseIndex = 0; phaseIndex < static_cast<size_t>(BatchTransitionPhase::Count); ++phaseIndex) {
+				count += static_cast<uint32_t>(batch.Transitions(queueIndex, static_cast<BatchTransitionPhase>(phaseIndex)).size());
+			}
+		}
+		return count;
+	};
+
+	std::vector<size_t> traceIndexByNodeIndex(nodes.size(), std::numeric_limits<size_t>::max());
+	std::vector<size_t> traceIndexByPassIndex(framePasses.size(), std::numeric_limits<size_t>::max());
+	for (size_t traceIndex = 0; traceIndex < m_schedulingDecisionTrace.size(); ++traceIndex) {
+		const auto& trace = m_schedulingDecisionTrace[traceIndex];
+		if (trace.nodeIndex < traceIndexByNodeIndex.size()) {
+			traceIndexByNodeIndex[trace.nodeIndex] = traceIndex;
+		}
+		if (trace.passIndex < traceIndexByPassIndex.size()) {
+			traceIndexByPassIndex[trace.passIndex] = traceIndex;
+		}
+	}
+
+	size_t start = 0;
+	while (start < m_schedulingDecisionTrace.size()) {
+		const uint16_t queueSlot = m_schedulingDecisionTrace[start].assignedQueueSlot;
+		RegionRejectReason startSplitReason = RegionRejectReason::Count;
+		const bool startForcesSplit = passForcesCandidateSplit(m_schedulingDecisionTrace[start].passIndex, startSplitReason);
+		size_t end = start + 1;
+		if (!startForcesSplit) {
+			while (end < m_schedulingDecisionTrace.size()
+				&& m_schedulingDecisionTrace[end].assignedQueueSlot == queueSlot) {
+				RegionRejectReason nextSplitReason = RegionRejectReason::Count;
+				if (passForcesCandidateSplit(m_schedulingDecisionTrace[end].passIndex, nextSplitReason)) {
+					break;
+				}
+				++end;
+			}
+		}
+
+		++outStats.candidateRegionCount;
+		const size_t candidateIndex = outStats.candidateRegionCount;
+		RegionRejectReason rejectReason = RegionRejectReason::Count;
+		std::string rejectDetail;
+		if (startForcesSplit) {
+			rejectReason = startSplitReason;
+			rejectDetail = "pass=\"" + shortPassName(m_schedulingDecisionTrace[start].passIndex) + "\" split_before_region";
+		}
+		else if (end - start < minPassCount) {
+			rejectReason = RegionRejectReason::PassCountBelowThreshold;
+			std::ostringstream detail;
+			detail << "candidate_passes=" << (end - start) << " min_passes=" << minPassCount;
+			rejectDetail = detail.str();
+		}
+
+		std::unordered_set<size_t> regionNodeIndices;
+		std::unordered_set<size_t> regionPassIndices;
+		regionNodeIndices.reserve(end - start);
+		regionPassIndices.reserve(end - start);
+
+		uint32_t requirementCount = 0;
+		uint32_t isNewBatchNeededChecks = 0;
+		uint32_t firstPassIndex = std::numeric_limits<uint32_t>::max();
+		uint32_t lastPassIndex = 0;
+		uint32_t firstBatchIndex = std::numeric_limits<uint32_t>::max();
+		uint32_t lastBatchIndex = 0;
+		uint32_t boundaryInputEdges = 0;
+		uint32_t boundaryOutputEdges = 0;
+		uint32_t crossQueueBoundaryInputEdges = 0;
+		uint32_t crossQueueBoundaryOutputEdges = 0;
+		uint32_t boundarySyncCount = 0;
+		uint32_t sameBatchPrefixPasses = 0;
+		uint32_t sameBatchSuffixPasses = 0;
+		uint32_t sameBatchInterleavedPasses = 0;
+		uint32_t crossQueueBoundaryPasses = 0;
+		uint32_t crossQueueTransitions = 0;
+
+		for (size_t traceIndex = start; traceIndex < end; ++traceIndex) {
+			const auto& trace = m_schedulingDecisionTrace[traceIndex];
+			regionNodeIndices.insert(trace.nodeIndex);
+			regionPassIndices.insert(trace.passIndex);
+			requirementCount += countPassRequirements(trace.passIndex);
+			isNewBatchNeededChecks += trace.isNewBatchNeededChecks;
+			firstPassIndex = std::min(firstPassIndex, trace.passIndex);
+			lastPassIndex = std::max(lastPassIndex, trace.passIndex);
+			firstBatchIndex = std::min(firstBatchIndex, trace.batchIndex);
+			lastBatchIndex = std::max(lastBatchIndex, trace.batchIndex);
+
+			if (rejectReason == RegionRejectReason::Count && trace.passIndex < framePasses.size()) {
+				if (passHasImmediateWork(framePasses[trace.passIndex])) {
+					rejectReason = RegionRejectReason::ImmediateWork;
+					rejectDetail = "pass=\"" + shortPassName(trace.passIndex) + "\"";
+				}
+				else if (trace.passIndex < m_framePassIsFrameExtension.size()
+					&& m_framePassIsFrameExtension[trace.passIndex] != 0) {
+					rejectReason = RegionRejectReason::FrameExtensionPass;
+					rejectDetail = "pass=\"" + shortPassName(trace.passIndex) + "\"";
+				}
+				else if (trace.passIndex < m_framePassDeclarationRefreshedThisFrame.size()
+					&& m_framePassDeclarationRefreshedThisFrame[trace.passIndex] != 0) {
+					rejectReason = RegionRejectReason::DeclarationRefreshedThisFrame;
+					rejectDetail = "pass=\"" + shortPassName(trace.passIndex) + "\"";
+				}
+				else {
+					RegionRejectReason requirementRejectReason = RegionRejectReason::Count;
+					if (passHasUnsupportedRequirement(trace.passIndex, requirementRejectReason)) {
+						rejectReason = requirementRejectReason;
+						rejectDetail = "pass=\"" + shortPassName(trace.passIndex) + "\"";
+					}
+				}
+			}
+		}
+
+		if (rejectReason == RegionRejectReason::Count) {
+			for (size_t traceIndex = start; traceIndex < end; ++traceIndex) {
+				const auto& trace = m_schedulingDecisionTrace[traceIndex];
+				if (trace.nodeIndex >= nodes.size()) {
+					rejectReason = RegionRejectReason::InteriorIncomingEdge;
+					rejectDetail = "trace=" + std::to_string(traceIndex) + " node_index_out_of_range";
+					break;
+				}
+
+				const auto& node = nodes[trace.nodeIndex];
+				for (size_t pred : node.in) {
+					if (!regionNodeIndices.contains(pred)) {
+						if (pred >= traceIndexByNodeIndex.size()
+							|| traceIndexByNodeIndex[pred] == std::numeric_limits<size_t>::max()) {
+							rejectReason = RegionRejectReason::InteriorIncomingEdge;
+							std::ostringstream detail;
+							detail << "pass=\"" << shortPassName(trace.passIndex) << "\""
+								<< " node=" << trace.nodeIndex
+								<< " outside_pred=" << pred
+								<< " missing_trace";
+							rejectDetail = detail.str();
+							break;
+						}
+						const size_t predTraceIndex = traceIndexByNodeIndex[pred];
+						const auto& predTrace = m_schedulingDecisionTrace[predTraceIndex];
+						if (predTraceIndex >= start) {
+							rejectReason = RegionRejectReason::InteriorIncomingEdge;
+							std::ostringstream detail;
+							detail << "pass=\"" << shortPassName(trace.passIndex) << "\""
+								<< " node=" << trace.nodeIndex
+								<< " outside_pred=" << pred
+								<< " pred_trace=" << predTraceIndex
+								<< " pred_queue=" << predTrace.assignedQueueSlot
+								<< " expected_before=" << start
+								<< " region_queue=" << queueSlot;
+							rejectDetail = detail.str();
+							break;
+						}
+						++boundaryInputEdges;
+						if (predTrace.assignedQueueSlot != queueSlot) {
+							++crossQueueBoundaryInputEdges;
+						}
+					}
+				}
+				if (rejectReason != RegionRejectReason::Count) {
+					break;
+				}
+				for (size_t succ : node.out) {
+					if (!regionNodeIndices.contains(succ)) {
+						if (succ >= traceIndexByNodeIndex.size()
+							|| traceIndexByNodeIndex[succ] == std::numeric_limits<size_t>::max()) {
+							rejectReason = RegionRejectReason::InteriorOutgoingEdge;
+							std::ostringstream detail;
+							detail << "pass=\"" << shortPassName(trace.passIndex) << "\""
+								<< " node=" << trace.nodeIndex
+								<< " outside_succ=" << succ
+								<< " missing_trace";
+							rejectDetail = detail.str();
+							break;
+						}
+						const size_t succTraceIndex = traceIndexByNodeIndex[succ];
+						const auto& succTrace = m_schedulingDecisionTrace[succTraceIndex];
+						if (succTraceIndex < end) {
+							rejectReason = RegionRejectReason::InteriorOutgoingEdge;
+							std::ostringstream detail;
+							detail << "pass=\"" << shortPassName(trace.passIndex) << "\""
+								<< " node=" << trace.nodeIndex
+								<< " outside_succ=" << succ
+								<< " succ_trace=" << succTraceIndex
+								<< " succ_queue=" << succTrace.assignedQueueSlot
+								<< " expected_after_or_at=" << end
+								<< " region_queue=" << queueSlot;
+							rejectDetail = detail.str();
+							break;
+						}
+						++boundaryOutputEdges;
+						if (succTrace.assignedQueueSlot != queueSlot) {
+							++crossQueueBoundaryOutputEdges;
+						}
+					}
+				}
+				if (rejectReason != RegionRejectReason::Count) {
+					break;
+				}
+			}
+		}
+
+		uint32_t transitionCount = 0;
+		if (rejectReason == RegionRejectReason::Count) {
+			for (uint32_t batchIndex = firstBatchIndex; batchIndex <= lastBatchIndex; ++batchIndex) {
+				if (batchIndex >= compiledBatches.size()) {
+					rejectReason = RegionRejectReason::BatchHazardBoundary;
+					rejectDetail = "batch=" + std::to_string(batchIndex) + " out_of_range";
+					break;
+				}
+
+				const auto& batch = compiledBatches[batchIndex];
+				boundarySyncCount += countBatchCrossQueueSync(batch);
+
+				for (size_t qi = 0; qi < batch.QueueCount(); ++qi) {
+					for (size_t phaseIndex = 0; phaseIndex < static_cast<size_t>(BatchTransitionPhase::Count); ++phaseIndex) {
+						if (qi != queueSlot && batch.HasTransitions(qi, static_cast<BatchTransitionPhase>(phaseIndex))) {
+							crossQueueTransitions += static_cast<uint32_t>(
+								batch.Transitions(qi, static_cast<BatchTransitionPhase>(phaseIndex)).size());
+						}
+					}
+				}
+
+				for (size_t qi = 0; qi < batch.QueueCount(); ++qi) {
+					for (const auto& queuedPass : batch.Passes(qi)) {
+					bool belongsToRegion = false;
+					size_t queuedPassTraceIndex = std::numeric_limits<size_t>::max();
+					size_t queuedPassIndex = std::numeric_limits<size_t>::max();
+					std::visit(
+						[&](const auto* passEntry) {
+							auto it = passIndexByPointer.find(static_cast<const void*>(passEntry));
+							if (it == passIndexByPointer.end()) {
+								return;
+							}
+							queuedPassIndex = it->second;
+							belongsToRegion = regionPassIndices.contains(it->second);
+							if (it->second < traceIndexByPassIndex.size()) {
+								queuedPassTraceIndex = traceIndexByPassIndex[it->second];
+							}
+						},
+						queuedPass);
+					if (!belongsToRegion) {
+						if (queuedPassTraceIndex == std::numeric_limits<size_t>::max()) {
+							rejectReason = RegionRejectReason::BatchHazardBoundary;
+							std::ostringstream detail;
+							detail << "batch=" << batchIndex
+								<< " queue=" << qi
+								<< " contains_untraced_pass_outside_candidate";
+							rejectDetail = detail.str();
+							break;
+						}
+						if (queuedPassTraceIndex < start) {
+							++sameBatchPrefixPasses;
+							if (qi != queueSlot) {
+								++crossQueueBoundaryPasses;
+							}
+							continue;
+						}
+						if (queuedPassTraceIndex >= end) {
+							++sameBatchSuffixPasses;
+							if (qi != queueSlot) {
+								++crossQueueBoundaryPasses;
+							}
+							continue;
+						}
+						++sameBatchInterleavedPasses;
+						rejectReason = RegionRejectReason::BatchHazardBoundary;
+						std::ostringstream detail;
+						detail << "batch=" << batchIndex
+							<< " queue=" << qi
+							<< " contains_interleaved_pass_outside_candidate"
+							<< " pass=\"" << shortPassName(static_cast<uint32_t>(queuedPassIndex)) << "\""
+							<< " pass_trace=" << queuedPassTraceIndex
+							<< " candidate_traces=" << start << "-" << (end > start ? end - 1 : start);
+						rejectDetail = detail.str();
+						break;
+					}
+				}
+				if (rejectReason != RegionRejectReason::Count) {
+					break;
+				}
+				}
+				if (rejectReason != RegionRejectReason::Count) {
+					break;
+				}
+				transitionCount += countBatchTransitions(batch);
+			}
+		}
+
+		if (rejectReason != RegionRejectReason::Count) {
+			appendCandidateDiagnostic(
+				candidateIndex,
+				start,
+				end,
+				queueSlot,
+				firstPassIndex,
+				lastPassIndex,
+				firstBatchIndex,
+				lastBatchIndex,
+				requirementCount,
+				isNewBatchNeededChecks,
+				boundaryInputEdges,
+				boundaryOutputEdges,
+				crossQueueBoundaryInputEdges,
+				crossQueueBoundaryOutputEdges,
+				boundarySyncCount,
+				sameBatchPrefixPasses,
+				sameBatchSuffixPasses,
+				sameBatchInterleavedPasses,
+				crossQueueBoundaryPasses,
+				crossQueueTransitions,
+				rejectReason,
+				rejectDetail);
+			reject(rejectReason);
+			start = end;
+			continue;
+		}
+
+		ScheduledRegion region{};
+		region.firstTraceIndex = static_cast<uint32_t>(start);
+		region.lastTraceIndex = static_cast<uint32_t>(end - 1);
+		region.firstPassIndex = firstPassIndex;
+		region.lastPassIndex = lastPassIndex;
+		region.firstBatchIndex = firstBatchIndex;
+		region.lastBatchIndex = lastBatchIndex;
+		region.queueSlot = queueSlot;
+		region.passCount = static_cast<uint32_t>(end - start);
+		region.requirementCount = requirementCount;
+		region.batchCount = lastBatchIndex >= firstBatchIndex ? (lastBatchIndex - firstBatchIndex + 1) : 0;
+		region.transitionCount = transitionCount;
+		region.boundaryInputEdgeCount = boundaryInputEdges;
+		region.boundaryOutputEdgeCount = boundaryOutputEdges;
+		region.crossQueueBoundaryInputEdgeCount = crossQueueBoundaryInputEdges;
+		region.crossQueueBoundaryOutputEdgeCount = crossQueueBoundaryOutputEdges;
+		region.boundarySyncCount = boundarySyncCount;
+		region.sameBatchPrefixPassCount = sameBatchPrefixPasses;
+		region.sameBatchSuffixPassCount = sameBatchSuffixPasses;
+		region.sameBatchInterleavedPassCount = sameBatchInterleavedPasses;
+		region.crossQueueBoundaryPassCount = crossQueueBoundaryPasses;
+		region.crossQueueTransitionCount = crossQueueTransitions;
+		outRegions.push_back(region);
+
+		++outStats.acceptedRegionCount;
+		outStats.coveredPassCount += region.passCount;
+		outStats.coveredRequirementCount += region.requirementCount;
+		outStats.coveredBatchCount += region.batchCount;
+		outStats.coveredTransitionCount += region.transitionCount;
+		outStats.largestRegionPassCount = std::max<uint64_t>(outStats.largestRegionPassCount, region.passCount);
+		outStats.largestRegionRequirementCount = std::max<uint64_t>(outStats.largestRegionRequirementCount, region.requirementCount);
+		outStats.estimatedSavedAddTransitionCalls += region.requirementCount;
+		outStats.estimatedSavedIsNewBatchNeededCalls += isNewBatchNeededChecks;
+		outStats.boundaryInputEdgeCount += region.boundaryInputEdgeCount;
+		outStats.boundaryOutputEdgeCount += region.boundaryOutputEdgeCount;
+		outStats.crossQueueBoundaryInputEdgeCount += region.crossQueueBoundaryInputEdgeCount;
+		outStats.crossQueueBoundaryOutputEdgeCount += region.crossQueueBoundaryOutputEdgeCount;
+		outStats.boundarySyncCount += region.boundarySyncCount;
+		outStats.sameBatchPrefixPassCount += region.sameBatchPrefixPassCount;
+		outStats.sameBatchSuffixPassCount += region.sameBatchSuffixPassCount;
+		outStats.sameBatchInterleavedPassCount += region.sameBatchInterleavedPassCount;
+		outStats.crossQueueBoundaryPassCount += region.crossQueueBoundaryPassCount;
+		outStats.crossQueueTransitionCount += region.crossQueueTransitionCount;
+		appendCandidateDiagnostic(
+			candidateIndex,
+			start,
+			end,
+			queueSlot,
+			firstPassIndex,
+			lastPassIndex,
+			firstBatchIndex,
+			lastBatchIndex,
+			requirementCount,
+			isNewBatchNeededChecks,
+			boundaryInputEdges,
+			boundaryOutputEdges,
+			crossQueueBoundaryInputEdges,
+			crossQueueBoundaryOutputEdges,
+			boundarySyncCount,
+			sameBatchPrefixPasses,
+			sameBatchSuffixPasses,
+			sameBatchInterleavedPasses,
+			crossQueueBoundaryPasses,
+			crossQueueTransitions,
+			RegionRejectReason::Count,
+			{});
+		start = end;
+	}
+}
+
+void RenderGraph::LogRegionCompileSummary(uint8_t frameIndex, const std::vector<Node>& nodes) {
+	const auto regionMode = m_getRenderGraphRegionMode
+		? m_getRenderGraphRegionMode()
+		: rg::runtime::RenderGraphRegionMode::Disabled;
+	const auto transitionPlacementMode = m_getTransitionPlacementMode
+		? m_getTransitionPlacementMode()
+		: rg::runtime::TransitionPlacementMode::InlineEarlyPlacement;
+	const bool diagnosticsEnabled = m_getRenderGraphRegionDiagnosticsEnabled && m_getRenderGraphRegionDiagnosticsEnabled();
+	if (regionMode == rg::runtime::RenderGraphRegionMode::Disabled
+		&& transitionPlacementMode == rg::runtime::TransitionPlacementMode::InlineEarlyPlacement
+		&& !diagnosticsEnabled) {
+		return;
+	}
+
+	std::string traceSummary;
+	const bool traceValid = ValidateSchedulingDecisionTrace(nodes, m_framePasses, batches, traceSummary);
+	spdlog::info(
+		"RG compile validation M1.1 frame={} status={}\n  {}",
+		static_cast<unsigned int>(frameIndex),
+		traceValid ? "ok" : "failed",
+		traceSummary);
+
+	auto hashState = [](uint64_t seed, const ResourceState& state) {
+		seed = HashCombine64(seed, static_cast<uint64_t>(state.access));
+		seed = HashCombine64(seed, static_cast<uint64_t>(state.layout));
+		seed = HashCombine64(seed, static_cast<uint64_t>(state.sync));
+		return seed;
+	};
+	auto hashBound = [](uint64_t seed, const auto& bound) {
+		seed = HashCombine64(seed, static_cast<uint64_t>(bound.type));
+		seed = HashCombine64(seed, static_cast<uint64_t>(bound.value));
+		return seed;
+	};
+	auto hashRange = [&](uint64_t seed, const RangeSpec& range) {
+		seed = hashBound(seed, range.mipLower);
+		seed = hashBound(seed, range.mipUpper);
+		seed = hashBound(seed, range.sliceLower);
+		seed = hashBound(seed, range.sliceUpper);
+		return seed;
+	};
+	uint64_t finalTrackerFingerprint = 0xcbf29ce484222325ull;
+	size_t initializedTrackerCount = 0;
+	size_t trackerSegmentCount = 0;
+	for (const auto& compileResource : m_frameCompileResources) {
+		finalTrackerFingerprint = HashCombine64(finalTrackerFingerprint, compileResource.resourceID);
+		finalTrackerFingerprint = HashCombine64(finalTrackerFingerprint, compileResource.trackerInitialized ? 1ull : 0ull);
+		if (!compileResource.trackerInitialized) {
+			continue;
+		}
+		++initializedTrackerCount;
+		const auto& segments = compileResource.tracker.GetSegments();
+		trackerSegmentCount += segments.size();
+		finalTrackerFingerprint = HashCombine64(finalTrackerFingerprint, segments.size());
+		for (const auto& segment : segments) {
+			finalTrackerFingerprint = hashRange(finalTrackerFingerprint, segment.rangeSpec);
+			finalTrackerFingerprint = hashState(finalTrackerFingerprint, segment.state);
+		}
+	}
+	uint64_t emittedTransitionFingerprint = 0x84222325cbf29ce4ull;
+	size_t emittedTransitionCount = 0;
+	for (const auto& batch : batches) {
+		for (size_t queueIndex = 0; queueIndex < batch.QueueCount(); ++queueIndex) {
+			for (size_t phaseIndex = 0; phaseIndex < static_cast<size_t>(BatchTransitionPhase::Count); ++phaseIndex) {
+				const auto phase = static_cast<BatchTransitionPhase>(phaseIndex);
+				for (const auto& transition : batch.Transitions(queueIndex, phase)) {
+					++emittedTransitionCount;
+					emittedTransitionFingerprint = HashCombine64(emittedTransitionFingerprint, queueIndex);
+					emittedTransitionFingerprint = HashCombine64(emittedTransitionFingerprint, phaseIndex);
+					emittedTransitionFingerprint = HashCombine64(emittedTransitionFingerprint, transition.pResource ? transition.pResource->GetGlobalResourceID() : 0ull);
+					emittedTransitionFingerprint = hashRange(emittedTransitionFingerprint, transition.range);
+					emittedTransitionFingerprint = HashCombine64(emittedTransitionFingerprint, static_cast<uint64_t>(transition.prevAccessType));
+					emittedTransitionFingerprint = HashCombine64(emittedTransitionFingerprint, static_cast<uint64_t>(transition.newAccessType));
+					emittedTransitionFingerprint = HashCombine64(emittedTransitionFingerprint, static_cast<uint64_t>(transition.prevLayout));
+					emittedTransitionFingerprint = HashCombine64(emittedTransitionFingerprint, static_cast<uint64_t>(transition.newLayout));
+					emittedTransitionFingerprint = HashCombine64(emittedTransitionFingerprint, static_cast<uint64_t>(transition.prevSyncState));
+					emittedTransitionFingerprint = HashCombine64(emittedTransitionFingerprint, static_cast<uint64_t>(transition.newSyncState));
+					emittedTransitionFingerprint = HashCombine64(emittedTransitionFingerprint, transition.discard ? 1ull : 0ull);
+				}
+			}
+		}
+	}
+
+	spdlog::info(
+		"RG compile validation M2 frame={} status=observed\n"
+		"  transition_mode={}\n"
+		"  candidates={} emitted={} old_inline_eligible={} inline_early_placed={} consumer_before_pass={}\n"
+		"  graphics_fallback={} alias_activation={} cross_queue_coordination_blocked={}\n"
+		"  placement_candidates_recorded={}\n"
+		"  final_tracker_fingerprint=0x{:016x} initialized_trackers={} tracker_segments={}\n"
+		"  emitted_transition_fingerprint=0x{:016x} emitted_transitions_in_batches={}",
+		static_cast<unsigned int>(frameIndex),
+		TransitionPlacementModeToString(transitionPlacementMode),
+		m_transitionPlacementStats.candidateCount,
+		m_transitionPlacementStats.emittedTransitionCount,
+		m_transitionPlacementStats.oldInlineEarlyEligibleCount,
+		m_transitionPlacementStats.inlineEarlyPlacedCount,
+		m_transitionPlacementStats.canonicalBeforePassCount,
+		m_transitionPlacementStats.graphicsFallbackCount,
+		m_transitionPlacementStats.aliasActivationCount,
+		m_transitionPlacementStats.crossQueueCoordinationBlockedCount,
+		m_transitionPlacementCandidates.size(),
+		finalTrackerFingerprint,
+		initializedTrackerCount,
+		trackerSegmentCount,
+		emittedTransitionFingerprint,
+		emittedTransitionCount);
+
+	spdlog::info(
+		"RG compile validation M2.1 frame={} status=active\n"
+		"  queue_wait_cleanup=CoalesceQueueWaitsAndSignals\n"
+		"  call_site=AutoScheduleAndBuildBatches",
+		static_cast<unsigned int>(frameIndex));
+
+	if (static_cast<uint8_t>(regionMode) >= static_cast<uint8_t>(rg::runtime::RenderGraphRegionMode::ExtractOnly)) {
+		ExtractScheduleRegionsFromAuthoritativeCompile(
+			nodes,
+			m_framePasses,
+			batches,
+			m_lastExtractedRegions,
+			m_lastRegionStats,
+			m_lastRegionCandidateDiagnostics);
+		m_regionCache.regions.clear();
+		m_regionCache.regions.reserve(m_lastExtractedRegions.size());
+		for (const auto& region : m_lastExtractedRegions) {
+			m_regionCache.regions.push_back(CachedScheduleRegion{ .schedule = region });
+		}
+		m_regionCache.stats = m_lastRegionStats;
+
+		auto rejectReasonName = [](RegionRejectReason reason) noexcept -> const char* {
+			switch (reason) {
+			case RegionRejectReason::QueueSlotChange: return "queue_change";
+			case RegionRejectReason::PassCountBelowThreshold: return "pass_count_below_threshold";
+			case RegionRejectReason::ImmediateWork: return "immediate_work";
+			case RegionRejectReason::FrameExtensionPass: return "frame_extension_pass";
+			case RegionRejectReason::DeclarationRefreshedThisFrame: return "declaration_refreshed";
+			case RegionRejectReason::InteriorIncomingEdge: return "interior_incoming_edge";
+			case RegionRejectReason::InteriorOutgoingEdge: return "interior_outgoing_edge";
+			case RegionRejectReason::AliasActivation: return "alias_activation";
+			case RegionRejectReason::AliasPlacementInstability: return "alias_placement_instability";
+			case RegionRejectReason::CrossQueueSync: return "cross_queue_sync";
+			case RegionRejectReason::GraphicsFallbackTransition: return "graphics_fallback_transition";
+			case RegionRejectReason::UnsupportedSubresourceState: return "unsupported_subresource_state";
+			case RegionRejectReason::BatchHazardBoundary: return "batch_hazard_boundary";
+			default: return "unknown";
+			}
+		};
+
+		std::ostringstream rejectSummary;
+		bool firstReject = true;
+		for (size_t reasonIndex = 0; reasonIndex < static_cast<size_t>(RegionRejectReason::Count); ++reasonIndex) {
+			const uint64_t count = m_lastRegionStats.rejectedByReason[reasonIndex];
+			if (count == 0) {
+				continue;
+			}
+			if (!firstReject) {
+				rejectSummary << ",";
+			}
+			firstReject = false;
+			rejectSummary << rejectReasonName(static_cast<RegionRejectReason>(reasonIndex)) << "=" << count;
+		}
+		if (firstReject) {
+			rejectSummary << "none";
+		}
+
+		spdlog::info(
+			"RG compile validation M1 frame={} status=observed\n"
+			"  region_mode={} transition_mode={}\n"
+			"  candidates={} accepted={} rejected={} rejects=[{}]\n"
+			"  declarations: refresh_requested={} equivalent_refreshes={} changed_refreshes={}\n"
+			"  boundaries: inputs={} outputs={} cross_queue_inputs={} cross_queue_outputs={} syncs={}\n"
+			"  partial_batches: prefix_passes={} suffix_passes={} interleaved_passes={} cross_queue_boundary_passes={} cross_queue_transitions={}\n"
+			"  coverage: passes={}/{} requirements={} batches={}/{} transitions={}\n"
+			"  largest: passes={} requirements={}\n"
+			"  estimated_saved: AddTransition={} IsNewBatchNeeded={}",
+			static_cast<unsigned int>(frameIndex),
+			RenderGraphRegionModeToString(regionMode),
+			TransitionPlacementModeToString(transitionPlacementMode),
+			m_lastRegionStats.candidateRegionCount,
+			m_lastRegionStats.acceptedRegionCount,
+			m_lastRegionStats.rejectedRegionCount,
+			rejectSummary.str(),
+			m_frameDeclarationRefreshRequestedCount,
+			m_frameDeclarationRefreshEquivalentCount,
+			m_frameDeclarationRefreshRequestedCount - m_frameDeclarationRefreshEquivalentCount,
+			m_lastRegionStats.boundaryInputEdgeCount,
+			m_lastRegionStats.boundaryOutputEdgeCount,
+			m_lastRegionStats.crossQueueBoundaryInputEdgeCount,
+			m_lastRegionStats.crossQueueBoundaryOutputEdgeCount,
+			m_lastRegionStats.boundarySyncCount,
+			m_lastRegionStats.sameBatchPrefixPassCount,
+			m_lastRegionStats.sameBatchSuffixPassCount,
+			m_lastRegionStats.sameBatchInterleavedPassCount,
+			m_lastRegionStats.crossQueueBoundaryPassCount,
+			m_lastRegionStats.crossQueueTransitionCount,
+			m_lastRegionStats.coveredPassCount,
+			m_framePasses.size(),
+			m_lastRegionStats.coveredRequirementCount,
+			m_lastRegionStats.coveredBatchCount,
+			batches.size(),
+			m_lastRegionStats.coveredTransitionCount,
+			m_lastRegionStats.largestRegionPassCount,
+			m_lastRegionStats.largestRegionRequirementCount,
+			m_lastRegionStats.estimatedSavedAddTransitionCalls,
+			m_lastRegionStats.estimatedSavedIsNewBatchNeededCalls);
+
+		if (!m_lastRegionCandidateDiagnostics.empty()) {
+			std::ostringstream candidateSummary;
+			for (const auto& line : m_lastRegionCandidateDiagnostics) {
+				candidateSummary << "\n  " << line;
+			}
+			spdlog::info(
+				"RG compile validation M1 candidates frame={} shown={}/{}{}",
+				static_cast<unsigned int>(frameIndex),
+				m_lastRegionCandidateDiagnostics.size(),
+				m_lastRegionStats.candidateRegionCount,
+				candidateSummary.str());
+		}
 	}
 }
 
@@ -4500,10 +5543,11 @@ static bool RequirementsConflict(
 }
 
 
-void RenderGraph::RefreshRetainedDeclarationsForFrame(RenderPassAndResources& p, uint8_t frameIndex)
+bool RenderGraph::RefreshRetainedDeclarationsForFrame(RenderPassAndResources& p, uint8_t frameIndex)
 {
 	ZoneScopedN("RenderGraph::RefreshRetainedDeclarationsForFrame(Render)");
 	const bool traceLifecycle = m_getRenderGraphBatchTraceEnabled && m_getRenderGraphBatchTraceEnabled();
+	const uint64_t previousDeclarationFingerprint = p.declarationCache.declarationFingerprint;
 	if (!p.name.empty()) {
 		ZoneText(p.name.data(), p.name.size());
 	}
@@ -4567,12 +5611,14 @@ void RenderGraph::RefreshRetainedDeclarationsForFrame(RenderPassAndResources& p,
 	if (traceLifecycle) {
 		spdlog::info("RG frame {} refresh render pass '{}' setup complete", frameIndex, p.name);
 	}
+	return previousDeclarationFingerprint != p.declarationCache.declarationFingerprint;
 }
 
-void RenderGraph::RefreshRetainedDeclarationsForFrame(ComputePassAndResources& p, uint8_t frameIndex)
+bool RenderGraph::RefreshRetainedDeclarationsForFrame(ComputePassAndResources& p, uint8_t frameIndex)
 {
 	ZoneScopedN("RenderGraph::RefreshRetainedDeclarationsForFrame(Compute)");
 	const bool traceLifecycle = m_getRenderGraphBatchTraceEnabled && m_getRenderGraphBatchTraceEnabled();
+	const uint64_t previousDeclarationFingerprint = p.declarationCache.declarationFingerprint;
 	if (!p.name.empty()) {
 		ZoneText(p.name.data(), p.name.size());
 	}
@@ -4628,12 +5674,14 @@ void RenderGraph::RefreshRetainedDeclarationsForFrame(ComputePassAndResources& p
 	if (traceLifecycle) {
 		spdlog::info("RG frame {} refresh compute pass '{}' setup complete", frameIndex, p.name);
 	}
+	return previousDeclarationFingerprint != p.declarationCache.declarationFingerprint;
 }
 
-void RenderGraph::RefreshRetainedDeclarationsForFrame(CopyPassAndResources& p, uint8_t frameIndex)
+bool RenderGraph::RefreshRetainedDeclarationsForFrame(CopyPassAndResources& p, uint8_t frameIndex)
 {
 	ZoneScopedN("RenderGraph::RefreshRetainedDeclarationsForFrame(Copy)");
 	const bool traceLifecycle = m_getRenderGraphBatchTraceEnabled && m_getRenderGraphBatchTraceEnabled();
+	const uint64_t previousDeclarationFingerprint = p.declarationCache.declarationFingerprint;
 	if (!p.name.empty()) {
 		ZoneText(p.name.data(), p.name.size());
 	}
@@ -4681,6 +5729,7 @@ void RenderGraph::RefreshRetainedDeclarationsForFrame(CopyPassAndResources& p, u
 	if (traceLifecycle) {
 		spdlog::info("RG frame {} refresh copy pass '{}' setup complete", frameIndex, p.name);
 	}
+	return previousDeclarationFingerprint != p.declarationCache.declarationFingerprint;
 }
 
 void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHostExecutionData* hostData) {
@@ -4698,6 +5747,14 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		ZoneScopedN("RenderGraph::CompileFrame::ResetCompileState");
 		m_frameCompileResources.clear();
 		m_schedulingEquivalentIDsCache.clear();
+		m_lastRegionStats = {};
+		m_lastExtractedRegions.clear();
+		m_lastRegionCandidateDiagnostics.clear();
+		m_schedulingDecisionTrace.clear();
+		m_transitionPlacementCandidates.clear();
+		m_transitionPlacementStats = {};
+		m_frameDeclarationRefreshRequestedCount = 0;
+		m_frameDeclarationRefreshEquivalentCount = 0;
 		m_aliasingSubsystem.ResetPerFrameState(*this);
 	}
 
@@ -4748,6 +5805,8 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		return p.declarationCache.dynamicInterface->DeclaredResourcesChanged();
 		};
 
+	std::unordered_set<std::string> declarationRefreshedPassNames;
+	std::unordered_set<std::string> frameExtensionPassNames;
 	{
 		ZoneScopedN("RenderGraph::CompileFrame::RefreshRetainedDeclarations");
 		// First, refresh all retained declarations for this frame
@@ -4755,19 +5814,40 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			if (pr.type == PassType::Compute) {
 				auto& p = std::get<ComputePassAndResources>(pr.pass);
 				if (needsRefresh(p)) {
-					RefreshRetainedDeclarationsForFrame(p, frameIndex);
+					++m_frameDeclarationRefreshRequestedCount;
+					const bool declarationActuallyChanged = RefreshRetainedDeclarationsForFrame(p, frameIndex);
+					if (!declarationActuallyChanged) {
+						++m_frameDeclarationRefreshEquivalentCount;
+					}
+					if (declarationActuallyChanged && !p.name.empty()) {
+						declarationRefreshedPassNames.insert(p.name);
+					}
 				}
 			}
 			else if (pr.type == PassType::Render) {
 				auto& p = std::get<RenderPassAndResources>(pr.pass);
 				if (needsRefresh(p)) {
-					RefreshRetainedDeclarationsForFrame(p, frameIndex);
+					++m_frameDeclarationRefreshRequestedCount;
+					const bool declarationActuallyChanged = RefreshRetainedDeclarationsForFrame(p, frameIndex);
+					if (!declarationActuallyChanged) {
+						++m_frameDeclarationRefreshEquivalentCount;
+					}
+					if (declarationActuallyChanged && !p.name.empty()) {
+						declarationRefreshedPassNames.insert(p.name);
+					}
 				}
 			}
 			else if (pr.type == PassType::Copy) {
 				auto& p = std::get<CopyPassAndResources>(pr.pass);
 				if (needsRefresh(p)) {
-					RefreshRetainedDeclarationsForFrame(p, frameIndex);
+					++m_frameDeclarationRefreshRequestedCount;
+					const bool declarationActuallyChanged = RefreshRetainedDeclarationsForFrame(p, frameIndex);
+					if (!declarationActuallyChanged) {
+						++m_frameDeclarationRefreshEquivalentCount;
+					}
+					if (declarationActuallyChanged && !p.name.empty()) {
+						declarationRefreshedPassNames.insert(p.name);
+					}
 				}
 			}
 		}
@@ -4778,6 +5858,8 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		batches.clear();
 		batches.emplace_back(m_queueRegistry.SlotCount()); // Dummy batch 0 for pre-first-pass transitions
 		m_framePasses.clear(); // Combined retained + immediate-mode passes for this frame
+		m_framePassIsFrameExtension.clear();
+		m_framePassDeclarationRefreshedThisFrame.clear();
 	}
 
 	ImmediateExecutionContext renderImmediateContext{ device,
@@ -5203,6 +6285,9 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			AnyPassAndResources any = MaterializeExternalPass(d, true, false);
 			recordImmediateCommands(any);
 			const std::string insertedPassName = any.name;
+			if (!insertedPassName.empty()) {
+				frameExtensionPassNames.insert(insertedPassName);
+			}
 			const size_t pendingIndex = pendingFrameInserts.size();
 			pendingFrameInserts.push_back(PendingFrameInsert{ .pass = std::move(any) });
 
@@ -5263,6 +6348,16 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			m_framePasses.push_back(std::move(baseFramePasses[i]));
 		}
 		appendSlot(baseFramePasses.size());
+	}
+
+	m_framePassIsFrameExtension.assign(m_framePasses.size(), 0);
+	m_framePassDeclarationRefreshedThisFrame.assign(m_framePasses.size(), 0);
+	for (size_t passIndex = 0; passIndex < m_framePasses.size(); ++passIndex) {
+		const auto& passName = m_framePasses[passIndex].name;
+		if (!passName.empty()) {
+			m_framePassIsFrameExtension[passIndex] = frameExtensionPassNames.contains(passName) ? 1 : 0;
+			m_framePassDeclarationRefreshedThisFrame[passIndex] = declarationRefreshedPassNames.contains(passName) ? 1 : 0;
+		}
 	}
 
 	// Register/refresh pass statistics indices for this frame's concrete pass list.
@@ -5706,6 +6801,12 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				}
 			}
 		}
+	}
+
+	{
+		traceCompileStep("RegionCompileSummary");
+		ZoneScopedN("RenderGraph::CompileFrame::RegionCompileSummary");
+		LogRegionCompileSummary(frameIndex, nodes);
 	}
 
 	if (m_getRenderGraphCompileDumpEnabled && m_getRenderGraphCompileDumpEnabled()) {
@@ -6508,6 +7609,25 @@ void RenderGraph::Setup() {
 	};
 	m_getQueueSchedulingCrossQueueHandoffPenalty = [this]() {
 		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetQueueSchedulingCrossQueueHandoffPenalty() : 2.0f;
+	};
+	m_getRenderGraphRegionMode = [this]() {
+		return m_renderGraphSettingsService
+			? m_renderGraphSettingsService->GetRenderGraphRegionMode()
+			: rg::runtime::RenderGraphRegionMode::Disabled;
+	};
+	m_getTransitionPlacementMode = [this]() {
+		return m_renderGraphSettingsService
+			? m_renderGraphSettingsService->GetTransitionPlacementMode()
+			: rg::runtime::TransitionPlacementMode::InlineEarlyPlacement;
+	};
+	m_getRenderGraphRegionMinPassCount = [this]() {
+		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetRenderGraphRegionMinPassCount() : 4u;
+	};
+	m_getRenderGraphRegionDiagnosticsEnabled = [this]() {
+		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetRenderGraphRegionDiagnosticsEnabled() : false;
+	};
+	m_getRenderGraphRegionShadowStrictBatchMatch = [this]() {
+		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetRenderGraphRegionShadowStrictBatchMatch() : false;
 	};
 	m_getAutoAliasPoolRetireIdleFrames = [this]() {
 		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetAutoAliasPoolRetireIdleFrames() : 120u;
