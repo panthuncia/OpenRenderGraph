@@ -22,6 +22,7 @@ struct CopyPassParameters {
 	std::vector<ResourceHandleAndRange> copyTargets;
 	std::vector<ResourceHandleAndRange> copySources;
 	std::vector<std::pair<ResourceHandleAndRange, ResourceState>> internalTransitions;
+	std::vector<ExternalTimelinePoint> externalWaitsBeforeTransitions;
 
 	std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> identifierSet;
 	std::vector<ResourceRequirement> staticResourceRequirements;

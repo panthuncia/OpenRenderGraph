@@ -1146,6 +1146,15 @@ public:
         return std::move(*this);
     }
 
+	RenderPassBuilder& WithExternalWaitBeforeTransitions(rhi::Timeline timeline, uint64_t value) & {
+		params.externalWaitsBeforeTransitions.push_back({ timeline, value });
+		return *this;
+	}
+
+	RenderPassBuilder WithExternalWaitBeforeTransitions(rhi::Timeline timeline, uint64_t value) && {
+		params.externalWaitsBeforeTransitions.push_back({ timeline, value });
+		return std::move(*this);
+	}
 
     auto const& DeclaredResourceIds() const { return _declaredIds; }
 
@@ -1765,6 +1774,16 @@ public:
                 return std::move(*this);
         }
 
+		ComputePassBuilder& WithExternalWaitBeforeTransitions(rhi::Timeline timeline, uint64_t value) & {
+			params.externalWaitsBeforeTransitions.push_back({ timeline, value });
+			return *this;
+		}
+
+		ComputePassBuilder WithExternalWaitBeforeTransitions(rhi::Timeline timeline, uint64_t value) && {
+			params.externalWaitsBeforeTransitions.push_back({ timeline, value });
+			return std::move(*this);
+		}
+
         // LVALUE overloads for IResourceResolver
         ComputePassBuilder& WithShaderResource(const IResourceResolver& r)& {
 		return WithResolver(r, [&](auto&& resolved) { addShaderResource(std::forward<decltype(resolved)>(resolved)); });
@@ -2202,6 +2221,16 @@ public:
         m_pinnedQueueSlot = slot;
         return std::move(*this);
     }
+
+	CopyPassBuilder& WithExternalWaitBeforeTransitions(rhi::Timeline timeline, uint64_t value) & {
+		params.externalWaitsBeforeTransitions.push_back({ timeline, value });
+		return *this;
+	}
+
+	CopyPassBuilder WithExternalWaitBeforeTransitions(rhi::Timeline timeline, uint64_t value) && {
+		params.externalWaitsBeforeTransitions.push_back({ timeline, value });
+		return std::move(*this);
+	}
 
     CopyPassBuilder& WithCopyDest(const IResourceResolver& r)& {
         return WithResolver(r, [&](auto&& resolved) { addCopyDest(std::forward<decltype(resolved)>(resolved)); });

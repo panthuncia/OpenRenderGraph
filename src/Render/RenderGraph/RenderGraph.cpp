@@ -2081,6 +2081,9 @@ void RenderGraph::CommitPassToBatch(
 			}
 			else {
 				currentBatch.Passes(passQueueSlot).emplace_back(&pass);
+				for (const auto& wait : pass.resources.externalWaitsBeforeTransitions) {
+					currentBatch.AddExternalWaitBeforeTransitions(passQueueSlot, wait);
+				}
 				applyInternalTransitions(pass);
 				recordRequirementHistory();
 
@@ -6982,6 +6985,9 @@ namespace {
 		std::unordered_map<ExternalFenceSignalKey, ExternalFenceSignalOrigin, ExternalFenceSignalKeyHash>& queuedSignals,
 		const PassReturn& passReturn)
 	{
+		if (!passReturn.fence.has_value() && passReturn.externalSignalsAfterCompletion.empty()) {
+			return;
+		}
 		if (!passReturn.fence.has_value()) {
 			return;
 		}
@@ -7042,8 +7048,30 @@ namespace {
 		ZoneScopedN("RenderGraph::SignalExternalFences");
 		if (externalFences.empty()) return;
 		for (auto& fr : externalFences) {
+			if (!fr.externalSignalsAfterCompletion.empty()) {
+				for (const auto& signal : fr.externalSignalsAfterCompletion) {
+					if (!signal.timeline.IsValid()) {
+						spdlog::warn("Pass returned an invalid external signal timeline. Skipping signal.");
+						continue;
+					}
+					PassReturn singleSignal{};
+					singleSignal.fence = signal.timeline;
+					singleSignal.fenceValue = signal.value;
+					std::vector<PassReturn> nested;
+					nested.push_back(std::move(singleSignal));
+					SignalExternalFences(
+						queue,
+						queueKind,
+						slotFence,
+						queueSlot,
+						batchIndex,
+						frameIndex,
+						seenSignals,
+						nested);
+				}
+			}
 			if (!fr.fence.has_value()) {
-				spdlog::warn("Pass returned an external fence without a value. This should not happen.");
+				continue;
 			}
             else {
 				if (fr.fenceValue == 0) {
@@ -7176,6 +7204,36 @@ namespace {
 		throw std::runtime_error(oss.str());
 	}
 
+	void WaitExternalFencesBeforeTransitions(
+		rhi::Queue queue,
+		const RenderGraph::PassBatch& batch,
+		size_t queueSlot,
+		size_t batchIndex,
+		unsigned frameIndex)
+	{
+		const auto& waits = batch.ExternalWaitsBeforeTransitions(queueSlot);
+		for (const auto& wait : waits) {
+			if (!wait.timeline.IsValid() || wait.value == 0 || wait.value == UINT64_MAX) {
+				spdlog::error(
+					"RenderGraph: frame {} rejected invalid external wait on queue slot {} batch {} value={}",
+					frameIndex,
+					queueSlot,
+					batchIndex,
+					wait.value);
+				throw std::runtime_error("RenderGraph external wait was invalid");
+			}
+			const rhi::Result waitResult = queue.Wait({ wait.timeline.GetHandle(), wait.value });
+			if (waitResult != rhi::Result::Ok) {
+				throw std::runtime_error(fmt::format(
+					"RenderGraph external wait failed: queueSlot={} batch={} value={} result={}",
+					queueSlot,
+					batchIndex,
+					wait.value,
+					rhi::ResultName(waitResult)));
+			}
+		}
+	}
+
 	struct ExecuteQueueBatchArgs {
 		QueueBatchSchedule& sched;
 		RenderGraph::PassBatch& batch;
@@ -7210,6 +7268,12 @@ namespace {
 		uint8_t clIndex = 0; // index into preallocatedCLs
 
 		// Waits: BeforeTransitions
+		WaitExternalFencesBeforeTransitions(
+			rhiQueue,
+			batch,
+			qi,
+			args.batchIndex,
+			static_cast<unsigned>(args.context.frameIndex));
 		for (size_t srcIndex = 0; srcIndex < batch.QueueCount(); ++srcIndex) {
 			if (!batch.HasQueueWait(RenderGraph::BatchWaitPhase::BeforeTransitions, qi, srcIndex))
 				continue;
@@ -7290,7 +7354,7 @@ namespace {
 				if ((pr.run & PassRunMask::Retained) != PassRunMask::None) {
 					auto passReturn = pr.pass->Execute(args.context);
 					// In batch trace, do some fence debug
-					if (args.batchTraceEnabled && passReturn.fence) {
+					if (args.batchTraceEnabled && (passReturn.fence || !passReturn.externalSignalsAfterCompletion.empty())) {
 						LogQueuedExternalFence(
 							static_cast<unsigned>(args.context.frameIndex),
 							queue,
@@ -7299,6 +7363,8 @@ namespace {
 							passName,
 							args.queuedExternalFenceOrigins,
 							passReturn);
+					}
+					if (passReturn.fence || !passReturn.externalSignalsAfterCompletion.empty()) {
 						args.outExternalFences.push_back(passReturn);
 					}
 				}
@@ -7512,7 +7578,7 @@ namespace {
 				pr.immediateKeepAlive.reset();
 				if ((pr.run & PassRunMask::Retained) != PassRunMask::None) {
 					auto passReturn = pr.pass->Execute(args.context);
-					if (passReturn.fence) {
+					if (passReturn.fence || !passReturn.externalSignalsAfterCompletion.empty()) {
 						if (args.batchTraceEnabled) {
 							LogQueuedExternalFence(
 								static_cast<unsigned>(args.context.frameIndex),
@@ -8701,6 +8767,9 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 			std::vector<PendingQueueSubmission> pendingSubmissions(slotCount);
 
 			auto batchHasWaitsForQueue = [&](const PassBatch& batch, size_t queueIndex) {
+				if (!batch.ExternalWaitsBeforeTransitions(queueIndex).empty()) {
+					return true;
+				}
 				for (size_t waitPhaseIndex = 0; waitPhaseIndex < PassBatch::kWaitPhaseCount; ++waitPhaseIndex) {
 					const auto waitPhase = static_cast<BatchWaitPhase>(waitPhaseIndex);
 					for (size_t srcIndex = 0; srcIndex < batch.QueueCount(); ++srcIndex) {
@@ -8844,7 +8913,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 				pending.pendingPairs.push_back(std::move(pair));
 			};
 
-			auto applyBatchWaitPhase = [&](const PassBatch& batch, size_t queueIndex, BatchWaitPhase waitPhase) {
+			auto applyBatchWaitPhase = [&](const PassBatch& batch, size_t batchIndex, size_t queueIndex, BatchWaitPhase waitPhase) {
 				const char* waitPhaseLabel = "Unknown";
 				switch (waitPhase) {
 				case BatchWaitPhase::BeforeTransitions:
@@ -8861,6 +8930,14 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 				}
 				ZoneScopedN("RenderGraph::Execute::ParallelPath::ApplyBatchWaitPhase");
 				ZoneText(waitPhaseLabel, std::strlen(waitPhaseLabel));
+				if (waitPhase == BatchWaitPhase::BeforeTransitions) {
+					WaitExternalFencesBeforeTransitions(
+						SlotQueue(queueIndex),
+						batch,
+						queueIndex,
+						batchIndex,
+						static_cast<unsigned>(context.frameIndex));
+				}
 				for (size_t srcIndex = 0; srcIndex < batch.QueueCount(); ++srcIndex) {
 					if (!batch.HasQueueWait(waitPhase, queueIndex, srcIndex)) {
 						continue;
@@ -8887,7 +8964,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 
 					uint8_t clIndex = 0;
 
-					applyBatchWaitPhase(batch, qi, BatchWaitPhase::BeforeTransitions);
+					applyBatchWaitPhase(batch, bi, qi, BatchWaitPhase::BeforeTransitions);
 
 					if (qs.splitAfterTransitions) {
 						queueRecordedCommandList(qi, std::move(qs.preallocatedCLs[clIndex]));
@@ -8899,7 +8976,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 						++clIndex;
 					}
 
-					applyBatchWaitPhase(batch, qi, BatchWaitPhase::BeforeExecution);
+					applyBatchWaitPhase(batch, bi, qi, BatchWaitPhase::BeforeExecution);
 
 					if (qs.splitAfterExecution) {
 						queueRecordedCommandList(qi, std::move(qs.preallocatedCLs[clIndex]));
@@ -8911,7 +8988,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 						++clIndex;
 					}
 
-					applyBatchWaitPhase(batch, qi, BatchWaitPhase::BeforeAfterPasses);
+					applyBatchWaitPhase(batch, bi, qi, BatchWaitPhase::BeforeAfterPasses);
 					queueRecordedCommandList(qi, std::move(qs.preallocatedCLs[clIndex]));
 
 					if (qs.signalAfterCompletion) {
