@@ -4034,21 +4034,14 @@ void RenderGraph::ExtractScheduleRegionsFromAuthoritativeCompile(
 		return static_cast<uint32_t>(m_framePassSchedulingSummaries[passIndex].requirements.size());
 	};
 
-	auto passHasUnsupportedRequirement = [&](size_t passIndex, RegionRejectReason& outReason) -> bool {
+	auto passHasAliasActivation = [&](size_t passIndex) -> bool {
 		if (passIndex >= m_framePassSchedulingSummaries.size()) {
-			outReason = RegionRejectReason::UnsupportedSubresourceState;
-			return true;
+			return false;
 		}
 
 		for (const auto& requirement : m_framePassSchedulingSummaries[passIndex].requirements) {
 			if (requirement.resourceIndex < m_frameResourceAccessSummaries.size()
 				&& m_frameResourceAccessSummaries[requirement.resourceIndex].hasAliasActivation) {
-				outReason = RegionRejectReason::AliasActivation;
-				return true;
-			}
-			const auto* schedulingPlacement = TryGetSchedulingPlacementRange(requirement.resourceID);
-			if (schedulingPlacement != nullptr && !schedulingPlacement->dedicatedBacking) {
-				outReason = RegionRejectReason::AliasPlacementInstability;
 				return true;
 			}
 		}
@@ -4192,13 +4185,6 @@ void RenderGraph::ExtractScheduleRegionsFromAuthoritativeCompile(
 					&& m_framePassDeclarationRefreshedThisFrame[trace.passIndex] != 0) {
 					rejectReason = RegionRejectReason::DeclarationRefreshedThisFrame;
 					rejectDetail = "pass=\"" + shortPassName(trace.passIndex) + "\"";
-				}
-				else {
-					RegionRejectReason requirementRejectReason = RegionRejectReason::Count;
-					if (passHasUnsupportedRequirement(trace.passIndex, requirementRejectReason)) {
-						rejectReason = requirementRejectReason;
-						rejectDetail = "pass=\"" + shortPassName(trace.passIndex) + "\"";
-					}
 				}
 			}
 		}
@@ -4531,6 +4517,18 @@ void RenderGraph::ExtractReplaySegmentsFromAuthoritativeCompile(
 			},
 			any.pass);
 	};
+	auto passHasAliasActivation = [&](size_t passIndex) -> bool {
+		if (passIndex >= m_framePassSchedulingSummaries.size()) {
+			return false;
+		}
+		for (const auto& requirement : m_framePassSchedulingSummaries[passIndex].requirements) {
+			if (requirement.resourceIndex < m_frameResourceAccessSummaries.size()
+				&& m_frameResourceAccessSummaries[requirement.resourceIndex].hasAliasActivation) {
+				return true;
+			}
+		}
+		return false;
+	};
 	auto replayTemplateResourceID = [](Resource* resource) {
 		struct Result {
 			uint64_t logicalID = 0;
@@ -4672,7 +4670,6 @@ void RenderGraph::ExtractReplaySegmentsFromAuthoritativeCompile(
 			segment.identity.passSequenceHash = HashCombine64(segment.identity.passSequenceHash, static_cast<uint64_t>(pass.type));
 			segment.fingerprint.declarationHash = HashCombine64(segment.fingerprint.declarationHash, passDeclarationFingerprint(pass));
 			segment.fingerprint.queueHash = HashCombine64(segment.fingerprint.queueHash, trace.assignedQueueSlot);
-			segment.fingerprint.queueHash = HashCombine64(segment.fingerprint.queueHash, trace.batchIndex);
 
 			if (trace.passIndex < m_framePassSchedulingSummaries.size()) {
 				const auto& passSummary = m_framePassSchedulingSummaries[trace.passIndex];
@@ -5702,32 +5699,43 @@ void RenderGraph::LogRegionCompileSummary(uint8_t frameIndex, const std::vector<
 			m_lastExtractedRegions,
 			m_lastRegionStats,
 			m_lastRegionCandidateDiagnostics);
-		m_regionCache.regions.clear();
-		m_regionCache.regions.reserve(m_lastExtractedRegions.size());
-		for (const auto& region : m_lastExtractedRegions) {
-			m_regionCache.regions.push_back(CachedScheduleRegion{ .schedule = region });
+		const bool preserveAuthoritativeReplayCache =
+			static_cast<uint8_t>(regionMode) >= static_cast<uint8_t>(rg::runtime::RenderGraphRegionMode::ReplayAuthoritative);
+		if (!preserveAuthoritativeReplayCache) {
+			m_regionCache.regions.clear();
+			m_regionCache.regions.reserve(m_lastExtractedRegions.size());
+			for (const auto& region : m_lastExtractedRegions) {
+				m_regionCache.regions.push_back(CachedScheduleRegion{ .schedule = region });
+			}
+			m_regionCache.stats = m_lastRegionStats;
 		}
-		m_regionCache.stats = m_lastRegionStats;
+		std::vector<CachedReplaySegment> diagnosticReplaySegments;
 		ExtractReplaySegmentsFromAuthoritativeCompile(
 			nodes,
 			m_framePasses,
 			batches,
 			m_lastExtractedRegions,
-			m_regionCache.replaySegments);
+			diagnosticReplaySegments);
+		if (!preserveAuthoritativeReplayCache) {
+			m_regionCache.replaySegments = diagnosticReplaySegments;
+		}
+		const auto& replaySegmentsForDiagnostics = preserveAuthoritativeReplayCache
+			? diagnosticReplaySegments
+			: m_regionCache.replaySegments;
 		const ReplaySegmentValidationStats segmentValidation = ValidateCachedSegmentsAgainstCurrentFrame(
 			previousReplaySegments,
-			m_regionCache.replaySegments);
+			replaySegmentsForDiagnostics);
 		const ReplaySegmentVerificationReport semanticVerification = VerifyAuthoritativeScheduleSemantics(
 			nodes,
 			m_framePasses,
 			batches);
 		const ReplaySegmentVerificationReport replayMetadataVerification = VerifyReplayScheduleSemanticCorrectness(
-			m_regionCache.replaySegments);
+			replaySegmentsForDiagnostics);
 		ReplaySegmentVerificationReport shadowReplayVerification{};
 		if (static_cast<uint8_t>(regionMode) >= static_cast<uint8_t>(rg::runtime::RenderGraphRegionMode::ShadowReplay)) {
 			shadowReplayVerification = BuildShadowReplayScheduleFromCachedSegments(
 				previousReplaySegments,
-				m_regionCache.replaySegments);
+				replaySegmentsForDiagnostics);
 		}
 		const ReplayAuthoritativeReadinessReport authoritativeReplayReadiness =
 			static_cast<uint8_t>(regionMode) >= static_cast<uint8_t>(rg::runtime::RenderGraphRegionMode::ShadowReplay)
@@ -5820,7 +5828,7 @@ void RenderGraph::LogRegionCompileSummary(uint8_t frameIndex, const std::vector<
 		uint64_t segmentSignalTemplateCount = 0;
 		uint64_t tier1EligibleCount = 0;
 		uint64_t segmentFingerprint = 0x7265706c61790001ull;
-		for (const auto& segment : m_regionCache.replaySegments) {
+		for (const auto& segment : replaySegmentsForDiagnostics) {
 			segmentInputCount += segment.contract.inputRequirements.size();
 			segmentOutputCount += segment.contract.outputStates.size();
 			segmentBoundaryEdgeCount += segment.contract.boundaryEdges.size();
@@ -5892,7 +5900,7 @@ void RenderGraph::LogRegionCompileSummary(uint8_t frameIndex, const std::vector<
 			"  contracts: inputs={} outputs={}\n"
 			"  templates: batches={} queued_passes={} transitions={} waits={} signals={}",
 			static_cast<unsigned int>(frameIndex),
-			m_regionCache.replaySegments.size(),
+			replaySegmentsForDiagnostics.size(),
 			tier1EligibleCount,
 			segmentFingerprint,
 			segmentBoundaryEdgeCount,
@@ -5969,7 +5977,7 @@ void RenderGraph::LogRegionCompileSummary(uint8_t frameIndex, const std::vector<
 				static_cast<unsigned int>(frameIndex),
 				shadowReplayVerification.valid ? "ok" : "failed",
 				shadowReplayVerification.matchedSegments,
-				m_regionCache.replaySegments.size(),
+				replaySegmentsForDiagnostics.size(),
 				shadowReplayVerification.replayedPasses,
 				shadowReplayVerification.dynamicGapPasses,
 				shadowReplayVerification.checkedRequirements,
@@ -7928,6 +7936,8 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		SnapshotCompiledResourceGenerations(usedResourceIDs);
 	}
 
+	const std::unordered_set<uint64_t> aliasActivationPendingBeforeAuthoritativeCompile = aliasActivationPending;
+	const std::vector<uint8_t> aliasActivationPendingByResourceIndexBeforeAuthoritativeCompile = m_aliasActivationPendingByResourceIndex;
 	{
 		traceCompileStep("AutoScheduleAndBuildBatches");
 		ZoneScopedN("RenderGraph::CompileFrame::AutoScheduleAndBuildBatches");
@@ -7971,6 +7981,14 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			const ReplaySegmentValidationStats validation = ValidateCachedSegmentsAgainstCurrentFrame(
 				previousReplaySegments,
 				currentReplaySegments);
+			m_regionCache.regions.clear();
+			m_regionCache.regions.reserve(replayRegions.size());
+			for (const auto& region : replayRegions) {
+				m_regionCache.regions.push_back(CachedScheduleRegion{ .schedule = region });
+			}
+			m_regionCache.stats = replayRegionStats;
+			m_regionCache.replaySegments = currentReplaySegments;
+
 			std::unordered_map<uint64_t, const CachedReplaySegment*> previousByPassSequence;
 			previousByPassSequence.reserve(previousReplaySegments.size());
 			for (const auto& segment : previousReplaySegments) {
@@ -8339,6 +8357,8 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 
 			if (haveStableCachedSegments) {
 				m_lastAuthoritativeReplayAttempted = true;
+				aliasActivationPending = aliasActivationPendingBeforeAuthoritativeCompile;
+				m_aliasActivationPendingByResourceIndex = aliasActivationPendingByResourceIndexBeforeAuthoritativeCompile;
 				ReplaySegmentVerificationReport replayReport = ReplayCurrentFrameSegmentsAsAuthoritative(
 					currentReplaySegments,
 					authoritativeTrace,
@@ -8363,6 +8383,8 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 					m_transitionPlacementStats = {};
 					ResetFrameQueueBatchHistoryTables();
 					RebuildFrameCompileResources();
+					aliasActivationPending = aliasActivationPendingBeforeAuthoritativeCompile;
+					m_aliasActivationPendingByResourceIndex = aliasActivationPendingByResourceIndexBeforeAuthoritativeCompile;
 					AutoScheduleAndBuildBatches(*this, m_framePasses, nodes);
 				}
 			}
