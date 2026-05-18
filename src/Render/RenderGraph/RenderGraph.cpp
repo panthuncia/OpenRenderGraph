@@ -4927,9 +4927,7 @@ void RenderGraph::ExtractReplaySegmentsFromAuthoritativeCompile(
 			}
 		}
 
-		segment.tier1Eligible = region.crossQueueTransitionCount == 0
-			&& region.sameBatchInterleavedPassCount == 0
-			&& region.crossQueueBoundaryPassCount == 0;
+		segment.tier1Eligible = region.sameBatchInterleavedPassCount == 0;
 		for (uint32_t traceIndex = region.firstTraceIndex; traceIndex <= region.lastTraceIndex && traceIndex < m_schedulingDecisionTrace.size(); ++traceIndex) {
 			const auto& trace = m_schedulingDecisionTrace[traceIndex];
 			if (trace.passIndex >= framePasses.size()) {
@@ -5127,6 +5125,474 @@ RenderGraph::ReplaySegmentValidationStats RenderGraph::ValidateCachedSegmentsAga
 		}
 	}
 
+	return stats;
+}
+
+RenderGraph::ReplaySegmentCacheKey RenderGraph::BuildReplaySegmentCacheKey(const CachedReplaySegment& segment) const
+{
+	return ReplaySegmentCacheKey{
+		.passSequenceHash = segment.identity.passSequenceHash,
+		.passCount = segment.identity.passCount,
+	};
+}
+
+RenderGraph::ReplaySegmentVariantKey RenderGraph::BuildReplaySegmentVariantKey(const CachedReplaySegment& segment) const
+{
+	uint64_t hardBoundaryHash = 0x736567626f756e64ull;
+	hardBoundaryHash = HashCombine64(hardBoundaryHash, segment.schedule.boundaryInputEdgeCount);
+	hardBoundaryHash = HashCombine64(hardBoundaryHash, segment.schedule.boundaryOutputEdgeCount);
+	hardBoundaryHash = HashCombine64(hardBoundaryHash, segment.schedule.crossQueueBoundaryInputEdgeCount);
+	hardBoundaryHash = HashCombine64(hardBoundaryHash, segment.schedule.crossQueueBoundaryOutputEdgeCount);
+	hardBoundaryHash = HashCombine64(hardBoundaryHash, segment.schedule.sameBatchPrefixPassCount);
+	hardBoundaryHash = HashCombine64(hardBoundaryHash, segment.schedule.sameBatchSuffixPassCount);
+	hardBoundaryHash = HashCombine64(hardBoundaryHash, segment.schedule.sameBatchInterleavedPassCount);
+	hardBoundaryHash = HashCombine64(hardBoundaryHash, segment.schedule.crossQueueBoundaryPassCount);
+	hardBoundaryHash = HashCombine64(hardBoundaryHash, segment.schedule.crossQueueTransitionCount);
+	for (const auto& edge : segment.contract.boundaryEdges) {
+		hardBoundaryHash = HashCombine64(hardBoundaryHash, edge.insideNode);
+		hardBoundaryHash = HashCombine64(hardBoundaryHash, edge.outsideNode);
+		hardBoundaryHash = HashCombine64(hardBoundaryHash, edge.insideQueueSlot);
+		hardBoundaryHash = HashCombine64(hardBoundaryHash, edge.outsideQueueSlot);
+		hardBoundaryHash = HashCombine64(hardBoundaryHash, edge.incoming ? 1ull : 0ull);
+		hardBoundaryHash = HashCombine64(hardBoundaryHash, edge.crossQueue ? 1ull : 0ull);
+	}
+
+	uint64_t hardTemplateHash = 0x736567746d706864ull;
+	hardTemplateHash = HashCombine64(hardTemplateHash, segment.templateStats.batchCount);
+	hardTemplateHash = HashCombine64(hardTemplateHash, segment.templateStats.partialBatchCount);
+	hardTemplateHash = HashCombine64(hardTemplateHash, segment.templateStats.queuedPassCount);
+	hardTemplateHash = HashCombine64(hardTemplateHash, segment.templateStats.transitionCount);
+	hardTemplateHash = HashCombine64(hardTemplateHash, segment.templateStats.passOrderHash);
+	hardTemplateHash = HashCombine64(hardTemplateHash, segment.templateStats.transitionShapeHash);
+	for (const auto& batchTemplate : segment.batchTemplates) {
+		hardTemplateHash = HashCombine64(hardTemplateHash, batchTemplate.partialBatch ? 1ull : 0ull);
+		hardTemplateHash = HashCombine64(hardTemplateHash, batchTemplate.queuedPasses.size());
+		hardTemplateHash = HashCombine64(hardTemplateHash, batchTemplate.transitions.size());
+		for (const auto& queuedPass : batchTemplate.queuedPasses) {
+			hardTemplateHash = HashCombine64(hardTemplateHash, queuedPass.originalFramePassIndexAtExtraction);
+			hardTemplateHash = HashCombine64(hardTemplateHash, queuedPass.queueSlot);
+			hardTemplateHash = HashCombine64(hardTemplateHash, static_cast<uint64_t>(queuedPass.type));
+		}
+	}
+
+	return ReplaySegmentVariantKey{
+		.declarationHash = segment.fingerprint.declarationHash,
+		.accessHash = segment.fingerprint.accessHash,
+		.queueHash = segment.fingerprint.queueHash,
+		.aliasHash = segment.fingerprint.aliasHash,
+		.hardBoundaryHash = hardBoundaryHash,
+		.hardTemplateHash = hardTemplateHash,
+	};
+}
+
+bool RenderGraph::ReplaySegmentBoundaryEdgesMatch(const CachedReplaySegment& cached, const CachedReplaySegment& current) const
+{
+	if (cached.contract.boundaryEdges.size() != current.contract.boundaryEdges.size()) {
+		return false;
+	}
+	for (size_t edgeIndex = 0; edgeIndex < cached.contract.boundaryEdges.size(); ++edgeIndex) {
+		const auto& lhs = cached.contract.boundaryEdges[edgeIndex];
+		const auto& rhs = current.contract.boundaryEdges[edgeIndex];
+		if (lhs.insideNode != rhs.insideNode
+			|| lhs.outsideNode != rhs.outsideNode
+			|| lhs.insideQueueSlot != rhs.insideQueueSlot
+			|| lhs.outsideQueueSlot != rhs.outsideQueueSlot
+			|| lhs.incoming != rhs.incoming
+			|| lhs.crossQueue != rhs.crossQueue) {
+			return false;
+		}
+	}
+	return cached.schedule.boundaryInputEdgeCount == current.schedule.boundaryInputEdgeCount
+		&& cached.schedule.boundaryOutputEdgeCount == current.schedule.boundaryOutputEdgeCount
+		&& cached.schedule.crossQueueBoundaryInputEdgeCount == current.schedule.crossQueueBoundaryInputEdgeCount
+		&& cached.schedule.crossQueueBoundaryOutputEdgeCount == current.schedule.crossQueueBoundaryOutputEdgeCount
+		&& cached.schedule.sameBatchPrefixPassCount == current.schedule.sameBatchPrefixPassCount
+		&& cached.schedule.sameBatchSuffixPassCount == current.schedule.sameBatchSuffixPassCount
+		&& cached.schedule.sameBatchInterleavedPassCount == current.schedule.sameBatchInterleavedPassCount
+		&& cached.schedule.crossQueueBoundaryPassCount == current.schedule.crossQueueBoundaryPassCount
+		&& cached.schedule.crossQueueTransitionCount == current.schedule.crossQueueTransitionCount;
+}
+
+bool RenderGraph::ReplaySegmentHardTemplateMatches(const CachedReplaySegment& cached, const CachedReplaySegment& current) const
+{
+	if (cached.templateStats.batchCount != current.templateStats.batchCount
+		|| cached.templateStats.partialBatchCount != current.templateStats.partialBatchCount
+		|| cached.templateStats.queuedPassCount != current.templateStats.queuedPassCount
+		|| cached.templateStats.transitionCount != current.templateStats.transitionCount
+		|| cached.templateStats.passOrderHash != current.templateStats.passOrderHash
+		|| cached.templateStats.transitionShapeHash != current.templateStats.transitionShapeHash
+		|| cached.batchTemplates.size() != current.batchTemplates.size()) {
+		return false;
+	}
+	for (size_t batchIndex = 0; batchIndex < cached.batchTemplates.size(); ++batchIndex) {
+		const auto& lhsBatch = cached.batchTemplates[batchIndex];
+		const auto& rhsBatch = current.batchTemplates[batchIndex];
+		if (lhsBatch.partialBatch != rhsBatch.partialBatch
+			|| lhsBatch.queuedPasses.size() != rhsBatch.queuedPasses.size()
+			|| lhsBatch.transitions.size() != rhsBatch.transitions.size()) {
+			return false;
+		}
+		for (size_t passIndex = 0; passIndex < lhsBatch.queuedPasses.size(); ++passIndex) {
+			const auto& lhs = lhsBatch.queuedPasses[passIndex];
+			const auto& rhs = rhsBatch.queuedPasses[passIndex];
+			if (lhs.originalFramePassIndexAtExtraction != rhs.originalFramePassIndexAtExtraction
+				|| lhs.queueSlot != rhs.queueSlot
+				|| lhs.type != rhs.type) {
+				return false;
+			}
+		}
+		for (size_t transitionIndex = 0; transitionIndex < lhsBatch.transitions.size(); ++transitionIndex) {
+			const auto& lhs = lhsBatch.transitions[transitionIndex];
+			const auto& rhs = rhsBatch.transitions[transitionIndex];
+			if (lhs.resourceID != rhs.resourceID
+				|| lhs.range.mipLower != rhs.range.mipLower
+				|| lhs.range.mipUpper != rhs.range.mipUpper
+				|| lhs.range.sliceLower != rhs.range.sliceLower
+				|| lhs.range.sliceUpper != rhs.range.sliceUpper
+				|| lhs.after != rhs.after
+				|| lhs.queueSlot != rhs.queueSlot
+				|| lhs.phase != rhs.phase
+				|| lhs.discard != rhs.discard
+				|| lhs.dynamicResource != rhs.dynamicResource) {
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+bool RenderGraph::ReplaySegmentSyncShapeDiverged(const CachedReplaySegment& cached, const CachedReplaySegment& current) const
+{
+	return cached.contract.boundarySyncs.size() != current.contract.boundarySyncs.size()
+		|| cached.templateStats.waitCount != current.templateStats.waitCount
+		|| cached.templateStats.signalCount != current.templateStats.signalCount
+		|| cached.templateStats.syncShapeHash != current.templateStats.syncShapeHash;
+}
+
+bool RenderGraph::ReplaySegmentHardReplayMatches(const CachedReplaySegment& cached, const CachedReplaySegment& current) const
+{
+	return cached.fingerprint.declarationHash == current.fingerprint.declarationHash
+		&& cached.fingerprint.accessHash == current.fingerprint.accessHash
+		&& cached.fingerprint.queueHash == current.fingerprint.queueHash
+		&& cached.fingerprint.aliasHash == current.fingerprint.aliasHash
+		&& ReplaySegmentBoundaryEdgesMatch(cached, current)
+		&& ReplaySegmentHardTemplateMatches(cached, current);
+}
+
+std::string RenderGraph::FormatReplaySegmentBoundaryDiff(const CachedReplaySegment& cached, const CachedReplaySegment& current) const
+{
+	auto boundaryCounts = [](const CachedReplaySegment& segment) {
+		struct Counts {
+			uint64_t incoming = 0;
+			uint64_t outgoing = 0;
+			uint64_t crossQueueIncoming = 0;
+			uint64_t crossQueueOutgoing = 0;
+		};
+		Counts counts{};
+		for (const auto& edge : segment.contract.boundaryEdges) {
+			if (edge.incoming) {
+				++counts.incoming;
+				counts.crossQueueIncoming += edge.crossQueue ? 1ull : 0ull;
+			}
+			else {
+				++counts.outgoing;
+				counts.crossQueueOutgoing += edge.crossQueue ? 1ull : 0ull;
+			}
+		}
+		return counts;
+	};
+
+	std::ostringstream oss;
+	const auto cachedCounts = boundaryCounts(cached);
+	const auto currentCounts = boundaryCounts(current);
+	oss << "edges=" << cached.contract.boundaryEdges.size() << "->" << current.contract.boundaryEdges.size()
+		<< " incoming=" << cachedCounts.incoming << "->" << currentCounts.incoming
+		<< " outgoing=" << cachedCounts.outgoing << "->" << currentCounts.outgoing
+		<< " cross_in=" << cachedCounts.crossQueueIncoming << "->" << currentCounts.crossQueueIncoming
+		<< " cross_out=" << cachedCounts.crossQueueOutgoing << "->" << currentCounts.crossQueueOutgoing
+		<< " syncs=" << cached.contract.boundarySyncs.size() << "->" << current.contract.boundarySyncs.size()
+		<< " region_counts={in:" << cached.schedule.boundaryInputEdgeCount << "->" << current.schedule.boundaryInputEdgeCount
+		<< ",out:" << cached.schedule.boundaryOutputEdgeCount << "->" << current.schedule.boundaryOutputEdgeCount
+		<< ",cross_in:" << cached.schedule.crossQueueBoundaryInputEdgeCount << "->" << current.schedule.crossQueueBoundaryInputEdgeCount
+		<< ",cross_out:" << cached.schedule.crossQueueBoundaryOutputEdgeCount << "->" << current.schedule.crossQueueBoundaryOutputEdgeCount
+		<< ",prefix:" << cached.schedule.sameBatchPrefixPassCount << "->" << current.schedule.sameBatchPrefixPassCount
+		<< ",suffix:" << cached.schedule.sameBatchSuffixPassCount << "->" << current.schedule.sameBatchSuffixPassCount
+		<< ",cross_trans:" << cached.schedule.crossQueueTransitionCount << "->" << current.schedule.crossQueueTransitionCount
+		<< "}";
+	const size_t edgeCount = std::min(cached.contract.boundaryEdges.size(), current.contract.boundaryEdges.size());
+	for (size_t edgeIndex = 0; edgeIndex < edgeCount; ++edgeIndex) {
+		const auto& lhs = cached.contract.boundaryEdges[edgeIndex];
+		const auto& rhs = current.contract.boundaryEdges[edgeIndex];
+		if (lhs.insideNode == rhs.insideNode
+			&& lhs.outsideNode == rhs.outsideNode
+			&& lhs.insideTraceIndex == rhs.insideTraceIndex
+			&& lhs.outsideTraceIndex == rhs.outsideTraceIndex
+			&& lhs.insideQueueSlot == rhs.insideQueueSlot
+			&& lhs.outsideQueueSlot == rhs.outsideQueueSlot
+			&& lhs.incoming == rhs.incoming
+			&& lhs.crossQueue == rhs.crossQueue) {
+			continue;
+		}
+		oss << " first_edge_diff=index=" << edgeIndex
+			<< " inside_node=" << lhs.insideNode << "->" << rhs.insideNode
+			<< " outside_node=" << lhs.outsideNode << "->" << rhs.outsideNode
+			<< " inside_trace=" << lhs.insideTraceIndex << "->" << rhs.insideTraceIndex
+			<< " outside_trace=" << lhs.outsideTraceIndex << "->" << rhs.outsideTraceIndex
+			<< " inside_queue=" << lhs.insideQueueSlot << "->" << rhs.insideQueueSlot
+			<< " outside_queue=" << lhs.outsideQueueSlot << "->" << rhs.outsideQueueSlot
+			<< " incoming=" << lhs.incoming << "->" << rhs.incoming
+			<< " cross_queue=" << lhs.crossQueue << "->" << rhs.crossQueue;
+		break;
+	}
+	return oss.str();
+}
+
+std::string RenderGraph::FormatReplaySegmentTemplateDiff(const CachedReplaySegment& cached, const CachedReplaySegment& current) const
+{
+	std::ostringstream oss;
+	oss << "batches=" << cached.templateStats.batchCount << "->" << current.templateStats.batchCount
+		<< " partial=" << cached.templateStats.partialBatchCount << "->" << current.templateStats.partialBatchCount
+		<< " queued_passes=" << cached.templateStats.queuedPassCount << "->" << current.templateStats.queuedPassCount
+		<< " transitions=" << cached.templateStats.transitionCount << "->" << current.templateStats.transitionCount
+		<< " waits=" << cached.templateStats.waitCount << "->" << current.templateStats.waitCount
+		<< " signals=" << cached.templateStats.signalCount << "->" << current.templateStats.signalCount
+		<< " pass_order=0x" << std::hex << cached.templateStats.passOrderHash << "->0x" << current.templateStats.passOrderHash
+		<< " transition_shape=0x" << cached.templateStats.transitionShapeHash << "->0x" << current.templateStats.transitionShapeHash
+		<< " sync_shape=0x" << cached.templateStats.syncShapeHash << "->0x" << current.templateStats.syncShapeHash << std::dec;
+	const size_t batchCount = std::min(cached.batchTemplates.size(), current.batchTemplates.size());
+	for (size_t batchIndex = 0; batchIndex < batchCount; ++batchIndex) {
+		const auto& lhsBatch = cached.batchTemplates[batchIndex];
+		const auto& rhsBatch = current.batchTemplates[batchIndex];
+		if (lhsBatch.partialBatch != rhsBatch.partialBatch
+			|| lhsBatch.queuedPasses.size() != rhsBatch.queuedPasses.size()
+			|| lhsBatch.transitions.size() != rhsBatch.transitions.size()
+			|| lhsBatch.waits.size() != rhsBatch.waits.size()
+			|| lhsBatch.signals.size() != rhsBatch.signals.size()) {
+			oss << " first_batch_shape_diff=local_batch=" << batchIndex
+				<< " original=" << lhsBatch.originalBatchIndexAtExtraction << "->" << rhsBatch.originalBatchIndexAtExtraction
+				<< " partial=" << lhsBatch.partialBatch << "->" << rhsBatch.partialBatch
+				<< " queued=" << lhsBatch.queuedPasses.size() << "->" << rhsBatch.queuedPasses.size()
+				<< " transitions=" << lhsBatch.transitions.size() << "->" << rhsBatch.transitions.size()
+				<< " waits=" << lhsBatch.waits.size() << "->" << rhsBatch.waits.size()
+				<< " signals=" << lhsBatch.signals.size() << "->" << rhsBatch.signals.size();
+			return oss.str();
+		}
+		for (size_t transitionIndex = 0; transitionIndex < lhsBatch.transitions.size(); ++transitionIndex) {
+			const auto& lhs = lhsBatch.transitions[transitionIndex];
+			const auto& rhs = rhsBatch.transitions[transitionIndex];
+			if (lhs.resourceID == rhs.resourceID
+				&& lhs.range.mipLower == rhs.range.mipLower
+				&& lhs.range.mipUpper == rhs.range.mipUpper
+				&& lhs.range.sliceLower == rhs.range.sliceLower
+				&& lhs.range.sliceUpper == rhs.range.sliceUpper
+				&& lhs.after == rhs.after
+				&& lhs.queueSlot == rhs.queueSlot
+				&& lhs.phase == rhs.phase
+				&& lhs.discard == rhs.discard
+				&& lhs.dynamicResource == rhs.dynamicResource) {
+				continue;
+			}
+			oss << " first_transition_diff=local_batch=" << batchIndex
+				<< " transition=" << transitionIndex
+				<< " resource=" << lhs.resourceID << "->" << rhs.resourceID
+				<< " dynamic=" << lhs.dynamicResource << "->" << rhs.dynamicResource
+				<< " backing=" << lhs.backingResourceID << "->" << rhs.backingResourceID
+				<< " queue=" << lhs.queueSlot << "->" << rhs.queueSlot
+				<< " phase=" << static_cast<uint32_t>(lhs.phase) << "->" << static_cast<uint32_t>(rhs.phase)
+				<< " discard=" << lhs.discard << "->" << rhs.discard
+				<< " range=\"" << FormatRangeSpec(lhs.range) << "\"->\"" << FormatRangeSpec(rhs.range) << "\"";
+			return oss.str();
+		}
+	}
+	if (cached.batchTemplates.size() != current.batchTemplates.size()) {
+		oss << " batch_template_count=" << cached.batchTemplates.size() << "->" << current.batchTemplates.size();
+	}
+	return oss.str();
+}
+
+RenderGraph::ReplaySegmentLookupResult RenderGraph::LookupCachedReplaySegmentVariant(
+	const CachedReplaySegment& currentSegment,
+	uint64_t frameIndex)
+{
+	ReplaySegmentLookupResult result{};
+	const ReplaySegmentCacheKey key = BuildReplaySegmentCacheKey(currentSegment);
+	const ReplaySegmentVariantKey currentVariantKey = BuildReplaySegmentVariantKey(currentSegment);
+	ReplaySegmentCacheEntry* entry = nullptr;
+	for (auto& candidateEntry : m_regionCache.replaySegmentEntries) {
+		if (candidateEntry.key.passSequenceHash == key.passSequenceHash
+			&& candidateEntry.key.passCount == key.passCount) {
+			entry = &candidateEntry;
+			break;
+		}
+	}
+	if (entry == nullptr) {
+		std::ostringstream oss;
+		oss << "missing_cache_entry pass_sequence=0x" << std::hex << key.passSequenceHash
+			<< " pass_count=" << std::dec << key.passCount;
+		result.missReason = oss.str();
+		return result;
+	}
+
+	CachedReplaySegmentVariant* bestVariant = nullptr;
+	for (auto& variant : entry->variants) {
+		if (variant.variantKey.declarationHash != currentVariantKey.declarationHash
+			|| variant.variantKey.accessHash != currentVariantKey.accessHash
+			|| variant.variantKey.queueHash != currentVariantKey.queueHash
+			|| variant.variantKey.aliasHash != currentVariantKey.aliasHash
+			|| variant.variantKey.hardBoundaryHash != currentVariantKey.hardBoundaryHash
+			|| variant.variantKey.hardTemplateHash != currentVariantKey.hardTemplateHash
+			|| !ReplaySegmentHardReplayMatches(variant.segment, currentSegment)) {
+			continue;
+		}
+		if (bestVariant == nullptr
+			|| variant.lastSeenFrame > bestVariant->lastSeenFrame
+			|| (variant.lastSeenFrame == bestVariant->lastSeenFrame && variant.hitCount > bestVariant->hitCount)) {
+			bestVariant = &variant;
+		}
+	}
+
+	if (bestVariant != nullptr) {
+		++bestVariant->hitCount;
+		result.variant = bestVariant;
+		result.syncShapeDiverged = ReplaySegmentSyncShapeDiverged(bestVariant->segment, currentSegment);
+		result.variantAgeFrames = frameIndex >= bestVariant->lastSeenFrame ? frameIndex - bestVariant->lastSeenFrame : 0;
+		return result;
+	}
+
+	const CachedReplaySegmentVariant* newestVariant = nullptr;
+	for (const auto& variant : entry->variants) {
+		if (newestVariant == nullptr || variant.lastSeenFrame > newestVariant->lastSeenFrame) {
+			newestVariant = &variant;
+		}
+	}
+	if (newestVariant != nullptr) {
+		std::ostringstream oss;
+		oss << "no_matching_variant pass_sequence=0x" << std::hex << key.passSequenceHash
+			<< " declaration=0x" << newestVariant->variantKey.declarationHash << "->0x" << currentVariantKey.declarationHash
+			<< " access=0x" << newestVariant->variantKey.accessHash << "->0x" << currentVariantKey.accessHash
+			<< " queue=0x" << newestVariant->variantKey.queueHash << "->0x" << currentVariantKey.queueHash
+			<< " alias=0x" << newestVariant->variantKey.aliasHash << "->0x" << currentVariantKey.aliasHash
+			<< " boundary=0x" << newestVariant->variantKey.hardBoundaryHash << "->0x" << currentVariantKey.hardBoundaryHash
+			<< " template=0x" << newestVariant->variantKey.hardTemplateHash << "->0x" << currentVariantKey.hardTemplateHash;
+		result.missReason = oss.str();
+		result.boundaryDiff = FormatReplaySegmentBoundaryDiff(newestVariant->segment, currentSegment);
+		result.templateDiff = FormatReplaySegmentTemplateDiff(newestVariant->segment, currentSegment);
+	}
+	return result;
+}
+
+RenderGraph::ReplaySegmentCacheUpdateStats RenderGraph::SummarizeReplaySegmentVariantCache() const
+{
+	ReplaySegmentCacheUpdateStats stats{};
+	stats.entries = m_regionCache.replaySegmentEntries.size();
+	for (const auto& entry : m_regionCache.replaySegmentEntries) {
+		stats.variants += entry.variants.size();
+	}
+	return stats;
+}
+
+void RenderGraph::EvictOldReplaySegmentVariants(uint64_t frameIndex, ReplaySegmentCacheUpdateStats& stats)
+{
+	constexpr uint64_t kMaxReplaySegmentVariantAgeFrames = 240;
+	constexpr size_t kMaxReplaySegmentVariantsPerKey = 4;
+	constexpr size_t kMaxReplaySegmentCacheEntries = 256;
+
+	for (auto& entry : m_regionCache.replaySegmentEntries) {
+		const auto oldSize = entry.variants.size();
+		entry.variants.erase(
+			std::remove_if(entry.variants.begin(), entry.variants.end(), [&](const CachedReplaySegmentVariant& variant) {
+				return frameIndex > variant.lastSeenFrame
+					&& frameIndex - variant.lastSeenFrame > kMaxReplaySegmentVariantAgeFrames;
+			}),
+			entry.variants.end());
+		stats.evicted += oldSize - entry.variants.size();
+		if (entry.variants.size() > kMaxReplaySegmentVariantsPerKey) {
+			std::sort(entry.variants.begin(), entry.variants.end(), [](const auto& lhs, const auto& rhs) {
+				if (lhs.lastSeenFrame != rhs.lastSeenFrame) {
+					return lhs.lastSeenFrame > rhs.lastSeenFrame;
+				}
+				return lhs.hitCount > rhs.hitCount;
+			});
+			stats.evicted += entry.variants.size() - kMaxReplaySegmentVariantsPerKey;
+			entry.variants.resize(kMaxReplaySegmentVariantsPerKey);
+		}
+	}
+
+	m_regionCache.replaySegmentEntries.erase(
+		std::remove_if(m_regionCache.replaySegmentEntries.begin(), m_regionCache.replaySegmentEntries.end(), [](const ReplaySegmentCacheEntry& entry) {
+			return entry.variants.empty();
+		}),
+		m_regionCache.replaySegmentEntries.end());
+
+	if (m_regionCache.replaySegmentEntries.size() > kMaxReplaySegmentCacheEntries) {
+		std::sort(m_regionCache.replaySegmentEntries.begin(), m_regionCache.replaySegmentEntries.end(), [](const auto& lhs, const auto& rhs) {
+			auto newestSeen = [](const ReplaySegmentCacheEntry& entry) {
+				uint64_t newest = 0;
+				for (const auto& variant : entry.variants) {
+					newest = std::max(newest, variant.lastSeenFrame);
+				}
+				return newest;
+			};
+			return newestSeen(lhs) > newestSeen(rhs);
+		});
+		stats.evicted += m_regionCache.replaySegmentEntries.size() - kMaxReplaySegmentCacheEntries;
+		m_regionCache.replaySegmentEntries.resize(kMaxReplaySegmentCacheEntries);
+	}
+}
+
+RenderGraph::ReplaySegmentCacheUpdateStats RenderGraph::InsertOrRefreshReplaySegmentVariants(
+	std::span<const CachedReplaySegment> currentSegments,
+	uint64_t frameIndex)
+{
+	ReplaySegmentCacheUpdateStats stats{};
+	for (const auto& segment : currentSegments) {
+		if (!segment.tier1Eligible || segment.batchTemplates.empty()) {
+			continue;
+		}
+		const ReplaySegmentCacheKey key = BuildReplaySegmentCacheKey(segment);
+		const ReplaySegmentVariantKey variantKey = BuildReplaySegmentVariantKey(segment);
+		auto entryIt = std::find_if(m_regionCache.replaySegmentEntries.begin(), m_regionCache.replaySegmentEntries.end(), [&](const ReplaySegmentCacheEntry& entry) {
+			return entry.key.passSequenceHash == key.passSequenceHash && entry.key.passCount == key.passCount;
+		});
+		if (entryIt == m_regionCache.replaySegmentEntries.end()) {
+			entryIt = m_regionCache.replaySegmentEntries.insert(
+				m_regionCache.replaySegmentEntries.end(),
+				ReplaySegmentCacheEntry{ .key = key });
+		}
+
+		auto variantIt = std::find_if(entryIt->variants.begin(), entryIt->variants.end(), [&](const CachedReplaySegmentVariant& variant) {
+			return variant.variantKey.declarationHash == variantKey.declarationHash
+				&& variant.variantKey.accessHash == variantKey.accessHash
+				&& variant.variantKey.queueHash == variantKey.queueHash
+				&& variant.variantKey.aliasHash == variantKey.aliasHash
+				&& variant.variantKey.hardBoundaryHash == variantKey.hardBoundaryHash
+				&& variant.variantKey.hardTemplateHash == variantKey.hardTemplateHash
+				&& ReplaySegmentHardReplayMatches(variant.segment, segment);
+		});
+		if (variantIt == entryIt->variants.end()) {
+			entryIt->variants.push_back(CachedReplaySegmentVariant{
+				.segment = segment,
+				.variantKey = variantKey,
+				.firstSeenFrame = frameIndex,
+				.lastSeenFrame = frameIndex,
+				.hitCount = 0,
+				.seenCount = 1,
+			});
+			++stats.inserted;
+		}
+		else {
+			variantIt->segment = segment;
+			variantIt->variantKey = variantKey;
+			variantIt->lastSeenFrame = frameIndex;
+			++variantIt->seenCount;
+			++stats.refreshed;
+		}
+	}
+
+	EvictOldReplaySegmentVariants(frameIndex, stats);
+	const ReplaySegmentCacheUpdateStats summary = SummarizeReplaySegmentVariantCache();
+	stats.entries = summary.entries;
+	stats.variants = summary.variants;
 	return stats;
 }
 
@@ -5692,16 +6158,16 @@ void RenderGraph::LogRegionCompileSummary(uint8_t frameIndex, const std::vector<
 
 	if (static_cast<uint8_t>(regionMode) >= static_cast<uint8_t>(rg::runtime::RenderGraphRegionMode::ExtractOnly)) {
 		const std::vector<CachedReplaySegment> previousReplaySegments = m_regionCache.replaySegments;
-		ExtractScheduleRegionsFromAuthoritativeCompile(
-			nodes,
-			m_framePasses,
-			batches,
-			m_lastExtractedRegions,
-			m_lastRegionStats,
-			m_lastRegionCandidateDiagnostics);
 		const bool preserveAuthoritativeReplayCache =
 			static_cast<uint8_t>(regionMode) >= static_cast<uint8_t>(rg::runtime::RenderGraphRegionMode::ReplayAuthoritative);
-		if (!preserveAuthoritativeReplayCache) {
+		if (!preserveAuthoritativeReplayCache || !m_lastAuthoritativeReplayAttempted) {
+			ExtractScheduleRegionsFromAuthoritativeCompile(
+				nodes,
+				m_framePasses,
+				batches,
+				m_lastExtractedRegions,
+				m_lastRegionStats,
+				m_lastRegionCandidateDiagnostics);
 			m_regionCache.regions.clear();
 			m_regionCache.regions.reserve(m_lastExtractedRegions.size());
 			for (const auto& region : m_lastExtractedRegions) {
@@ -5710,13 +6176,16 @@ void RenderGraph::LogRegionCompileSummary(uint8_t frameIndex, const std::vector<
 			m_regionCache.stats = m_lastRegionStats;
 		}
 		std::vector<CachedReplaySegment> diagnosticReplaySegments;
-		ExtractReplaySegmentsFromAuthoritativeCompile(
-			nodes,
-			m_framePasses,
-			batches,
-			m_lastExtractedRegions,
-			diagnosticReplaySegments);
-		if (!preserveAuthoritativeReplayCache) {
+		if (preserveAuthoritativeReplayCache && m_lastAuthoritativeReplayAttempted) {
+			diagnosticReplaySegments = m_regionCache.replaySegments;
+		}
+		else {
+			ExtractReplaySegmentsFromAuthoritativeCompile(
+				nodes,
+				m_framePasses,
+				batches,
+				m_lastExtractedRegions,
+				diagnosticReplaySegments);
 			m_regionCache.replaySegments = diagnosticReplaySegments;
 		}
 		const auto& replaySegmentsForDiagnostics = preserveAuthoritativeReplayCache
@@ -7958,6 +8427,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			traceCompileStep("ReplayCurrentFrameSegmentsAsAuthoritative");
 			ZoneScopedN("RenderGraph::CompileFrame::ReplayCurrentFrameSegmentsAsAuthoritative");
 
+			const uint64_t replayCacheFrameSerial = ++m_regionCache.replaySegmentFrameSerial;
 			const std::vector<SchedulingDecisionTrace> authoritativeTrace = m_schedulingDecisionTrace;
 			const std::vector<CachedReplaySegment> previousReplaySegments = m_regionCache.replaySegments;
 			std::vector<ScheduledRegion> replayRegions;
@@ -7977,6 +8447,9 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				batches,
 				replayRegions,
 				currentReplaySegments);
+			m_lastExtractedRegions = replayRegions;
+			m_lastRegionStats = replayRegionStats;
+			m_lastRegionCandidateDiagnostics = replayCandidateDiagnostics;
 
 			const ReplaySegmentValidationStats validation = ValidateCachedSegmentsAgainstCurrentFrame(
 				previousReplaySegments,
@@ -8000,7 +8473,10 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			uint64_t replaySelectionHits = 0;
 			uint64_t replaySelectionMisses = 0;
 			uint64_t replayAllowedSyncShapeDivergences = 0;
+			uint64_t replayOlderVariantHits = 0;
+			uint64_t replayOldestVariantHitAge = 0;
 			std::string firstReplaySelectionMiss;
+			std::string firstReplayOlderVariantHit;
 			std::string firstReplaySelectionBoundaryDiff;
 			std::string firstReplaySelectionTemplateDiff;
 			auto boundaryEdgesReplayMatch = [](const CachedReplaySegment& previous, const CachedReplaySegment& current) {
@@ -8276,66 +8752,69 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				}
 				return oss.str();
 			};
+			std::vector<CachedReplaySegment> selectedReplaySegments;
+			selectedReplaySegments.reserve(currentReplaySegments.size());
 			for (const auto& currentSegment : currentReplaySegments) {
 				if (!currentSegment.tier1Eligible) {
 					continue;
 				}
 				++replaySelectedSegments;
 				replaySelectedPasses += currentSegment.schedule.passCount;
-				auto previousIt = previousByPassSequence.find(currentSegment.identity.passSequenceHash);
-				if (previousIt == previousByPassSequence.end()) {
+				ReplaySegmentLookupResult lookup = LookupCachedReplaySegmentVariant(currentSegment, replayCacheFrameSerial);
+				if (lookup.variant == nullptr) {
 					++replaySelectionMisses;
 					if (firstReplaySelectionMiss.empty()) {
-						std::ostringstream oss;
-						oss << "current_segment_missing_previous pass_sequence=0x" << std::hex
-							<< currentSegment.identity.passSequenceHash
-							<< " structural=0x" << currentSegment.identity.structuralPositionHash;
-						firstReplaySelectionMiss = oss.str();
+						firstReplaySelectionMiss = lookup.missReason;
+						firstReplaySelectionBoundaryDiff = lookup.boundaryDiff;
+						firstReplaySelectionTemplateDiff = lookup.templateDiff;
 					}
 					continue;
 				}
-				if (!segmentReplayMatch(*previousIt->second, currentSegment)) {
-					++replaySelectionMisses;
-					if (firstReplaySelectionMiss.empty()) {
-						std::ostringstream oss;
-						oss << "current_segment_invalidated pass_sequence=0x" << std::hex
-							<< currentSegment.identity.passSequenceHash
-							<< " structural=0x" << currentSegment.identity.structuralPositionHash
-							<< " declaration=" << previousIt->second->fingerprint.declarationHash << "->" << currentSegment.fingerprint.declarationHash
-							<< " access=" << previousIt->second->fingerprint.accessHash << "->" << currentSegment.fingerprint.accessHash
-							<< " queue=" << previousIt->second->fingerprint.queueHash << "->" << currentSegment.fingerprint.queueHash
-							<< " alias=" << previousIt->second->fingerprint.aliasHash << "->" << currentSegment.fingerprint.aliasHash
-							<< " boundary=" << previousIt->second->fingerprint.boundaryHash << "->" << currentSegment.fingerprint.boundaryHash
-							<< " template=" << previousIt->second->fingerprint.templateShapeHash << "->" << currentSegment.fingerprint.templateShapeHash;
-						firstReplaySelectionMiss = oss.str();
-						firstReplaySelectionBoundaryDiff = formatBoundaryDiff(*previousIt->second, currentSegment);
-						firstReplaySelectionTemplateDiff = formatTemplateDiff(*previousIt->second, currentSegment);
-					}
-					continue;
-				}
-				if (syncShapeDiverged(*previousIt->second, currentSegment)) {
+				if (lookup.syncShapeDiverged) {
 					++replayAllowedSyncShapeDivergences;
 					if (firstReplaySelectionBoundaryDiff.empty()) {
-						firstReplaySelectionBoundaryDiff = formatBoundaryDiff(*previousIt->second, currentSegment);
+						firstReplaySelectionBoundaryDiff = FormatReplaySegmentBoundaryDiff(lookup.variant->segment, currentSegment);
 					}
 					if (firstReplaySelectionTemplateDiff.empty()) {
-						firstReplaySelectionTemplateDiff = formatTemplateDiff(*previousIt->second, currentSegment);
+						firstReplaySelectionTemplateDiff = FormatReplaySegmentTemplateDiff(lookup.variant->segment, currentSegment);
 					}
 				}
+				if (lookup.variantAgeFrames > 1) {
+					++replayOlderVariantHits;
+					replayOldestVariantHitAge = std::max(replayOldestVariantHitAge, lookup.variantAgeFrames);
+					if (firstReplayOlderVariantHit.empty()) {
+						std::ostringstream oss;
+						oss << "pass_sequence=0x" << std::hex << currentSegment.identity.passSequenceHash
+							<< " age=" << std::dec << lookup.variantAgeFrames
+							<< " seen=" << lookup.variant->seenCount
+							<< " hits=" << lookup.variant->hitCount;
+						firstReplayOlderVariantHit = oss.str();
+					}
+				}
+				CachedReplaySegment replaySegment = lookup.variant->segment;
+				replaySegment.schedule = currentSegment.schedule;
+				replaySegment.identity = currentSegment.identity;
+				selectedReplaySegments.push_back(std::move(replaySegment));
 				++replaySelectionHits;
 			}
-			const bool haveStableCachedSegments =
-				!previousReplaySegments.empty()
-				&& replaySelectedSegments != 0
-				&& replaySelectionMisses == 0
-				&& replaySelectionHits == replaySelectedSegments;
+			ReplaySegmentCacheUpdateStats cacheUpdateStats = InsertOrRefreshReplaySegmentVariants(
+				currentReplaySegments,
+				replayCacheFrameSerial);
+			cacheUpdateStats.lookupHits = replaySelectionHits;
+			cacheUpdateStats.lookupMisses = replaySelectionMisses;
+			cacheUpdateStats.olderVariantHits = replayOlderVariantHits;
+			cacheUpdateStats.oldestHitAge = replayOldestVariantHitAge;
+			cacheUpdateStats.firstMiss = firstReplaySelectionMiss;
+			cacheUpdateStats.firstOlderHit = firstReplayOlderVariantHit;
+			const bool haveStableCachedSegments = replaySelectionHits != 0 && !selectedReplaySegments.empty();
 
 			spdlog::info(
 				"RG compile validation R8 pre_replay_gate frame={} status={}\n"
 				"  previous_segments={} current_segments={} validation_hits={} validation_misses={}\n"
-				"  selected_segments={} selected_passes={} selected_hits={} selected_misses={}\n"
-				"  stale_previous_misses_allowed={} allowed_sync_shape_divergences={} first_validation_miss=\"{}\"\n"
+				"  selected_segments={} selected_passes={} selected_hits={} selected_misses={} partial_replay={}\n"
+				"  stale_previous_misses_allowed={} allowed_sync_shape_divergences={} older_variant_hits={} oldest_hit_age={} first_validation_miss=\"{}\"\n"
 				"  first_selection_miss=\"{}\"\n"
+				"  first_older_variant_hit=\"{}\"\n"
 				"  first_selection_boundary_diff=\"{}\"\n"
 				"  first_selection_template_diff=\"{}\"",
 				static_cast<unsigned int>(frameIndex),
@@ -8348,19 +8827,42 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				replaySelectedPasses,
 				replaySelectionHits,
 				replaySelectionMisses,
+				replaySelectionMisses != 0 ? 1 : 0,
 				validation.misses > replaySelectionMisses ? validation.misses - replaySelectionMisses : 0,
 				replayAllowedSyncShapeDivergences,
+				replayOlderVariantHits,
+				replayOldestVariantHitAge,
 				validation.firstMissDetail,
 				firstReplaySelectionMiss,
+				firstReplayOlderVariantHit,
 				firstReplaySelectionBoundaryDiff,
 				firstReplaySelectionTemplateDiff);
+
+			spdlog::info(
+				"RG compile validation R8 segment_cache frame={} status=observed\n"
+				"  entries={} variants={} inserted={} refreshed={} evicted={} max_variants_per_key=4\n"
+				"  lookup_hits={} lookup_misses={} older_variant_hits={} oldest_hit_age={}\n"
+				"  first_miss=\"{}\"\n"
+				"  first_older_hit=\"{}\"",
+				static_cast<unsigned int>(frameIndex),
+				cacheUpdateStats.entries,
+				cacheUpdateStats.variants,
+				cacheUpdateStats.inserted,
+				cacheUpdateStats.refreshed,
+				cacheUpdateStats.evicted,
+				cacheUpdateStats.lookupHits,
+				cacheUpdateStats.lookupMisses,
+				cacheUpdateStats.olderVariantHits,
+				cacheUpdateStats.oldestHitAge,
+				cacheUpdateStats.firstMiss,
+				cacheUpdateStats.firstOlderHit);
 
 			if (haveStableCachedSegments) {
 				m_lastAuthoritativeReplayAttempted = true;
 				aliasActivationPending = aliasActivationPendingBeforeAuthoritativeCompile;
 				m_aliasActivationPendingByResourceIndex = aliasActivationPendingByResourceIndexBeforeAuthoritativeCompile;
 				ReplaySegmentVerificationReport replayReport = ReplayCurrentFrameSegmentsAsAuthoritative(
-					currentReplaySegments,
+					selectedReplaySegments,
 					authoritativeTrace,
 					m_framePasses,
 					nodes);
@@ -8387,10 +8889,24 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 					m_aliasActivationPendingByResourceIndex = aliasActivationPendingByResourceIndexBeforeAuthoritativeCompile;
 					AutoScheduleAndBuildBatches(*this, m_framePasses, nodes);
 				}
+				spdlog::info(
+					"RG compile validation R8 partial_replay frame={} status={}\n"
+					"  replayed_segments={} replayed_passes={} dynamic_gap_passes={} compiled_gap_segments={} compiled_gap_passes={}\n"
+					"  inserted_input_transitions={} verifier_status={} first_failure=\"{}\"",
+					static_cast<unsigned int>(frameIndex),
+					m_lastAuthoritativeReplaySucceeded ? "ok" : "fallback_full_compile",
+					replayReport.matchedSegments,
+					replayReport.replayedPasses,
+					replayReport.dynamicGapPasses,
+					replayReport.dynamicGapPasses,
+					replayReport.dynamicGapPasses,
+					replayReport.insertedInputTransitions,
+					semanticReport.valid ? "ok" : "failed",
+					m_lastAuthoritativeReplayFailure);
 			}
 			else {
-				if (previousReplaySegments.empty()) {
-					m_lastAuthoritativeReplayFailure = "no_previous_cached_segments";
+				if (m_regionCache.replaySegmentEntries.empty()) {
+					m_lastAuthoritativeReplayFailure = "no_cached_segment_variants";
 				}
 				else if (replaySelectedSegments == 0) {
 					m_lastAuthoritativeReplayFailure = "no_tier1_segments_selected";

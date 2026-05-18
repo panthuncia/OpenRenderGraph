@@ -1099,11 +1099,64 @@ private:
 		std::string firstTransitionShapeDiffDetail;
 	};
 
+	struct ReplaySegmentCacheKey {
+		uint64_t passSequenceHash = 0;
+		uint32_t passCount = 0;
+	};
+
+	struct ReplaySegmentVariantKey {
+		uint64_t declarationHash = 0;
+		uint64_t accessHash = 0;
+		uint64_t queueHash = 0;
+		uint64_t aliasHash = 0;
+		uint64_t hardBoundaryHash = 0;
+		uint64_t hardTemplateHash = 0;
+	};
+
+	struct CachedReplaySegmentVariant {
+		CachedReplaySegment segment;
+		ReplaySegmentVariantKey variantKey;
+		uint64_t firstSeenFrame = 0;
+		uint64_t lastSeenFrame = 0;
+		uint64_t hitCount = 0;
+		uint64_t seenCount = 0;
+	};
+
+	struct ReplaySegmentCacheEntry {
+		ReplaySegmentCacheKey key;
+		std::vector<CachedReplaySegmentVariant> variants;
+	};
+
+	struct ReplaySegmentLookupResult {
+		const CachedReplaySegmentVariant* variant = nullptr;
+		bool syncShapeDiverged = false;
+		uint64_t variantAgeFrames = 0;
+		std::string missReason;
+		std::string boundaryDiff;
+		std::string templateDiff;
+	};
+
+	struct ReplaySegmentCacheUpdateStats {
+		uint64_t entries = 0;
+		uint64_t variants = 0;
+		uint64_t inserted = 0;
+		uint64_t refreshed = 0;
+		uint64_t evicted = 0;
+		uint64_t lookupHits = 0;
+		uint64_t lookupMisses = 0;
+		uint64_t olderVariantHits = 0;
+		uint64_t oldestHitAge = 0;
+		std::string firstMiss;
+		std::string firstOlderHit;
+	};
+
 	struct RenderGraphRegionCache {
 		uint64_t structuralGeneration = 0;
 		uint64_t lastAuthoritativeCompileFingerprint = 0;
+		uint64_t replaySegmentFrameSerial = 0;
 		std::vector<CachedScheduleRegion> regions;
 		std::vector<CachedReplaySegment> replaySegments;
+		std::vector<ReplaySegmentCacheEntry> replaySegmentEntries;
 		RegionCacheStats stats;
 	};
 
@@ -1459,6 +1512,22 @@ private:
 	ReplaySegmentValidationStats ValidateCachedSegmentsAgainstCurrentFrame(
 		std::span<const CachedReplaySegment> previousSegments,
 		std::span<const CachedReplaySegment> currentSegments) const;
+	ReplaySegmentCacheKey BuildReplaySegmentCacheKey(const CachedReplaySegment& segment) const;
+	ReplaySegmentVariantKey BuildReplaySegmentVariantKey(const CachedReplaySegment& segment) const;
+	ReplaySegmentLookupResult LookupCachedReplaySegmentVariant(
+		const CachedReplaySegment& currentSegment,
+		uint64_t frameIndex);
+	ReplaySegmentCacheUpdateStats InsertOrRefreshReplaySegmentVariants(
+		std::span<const CachedReplaySegment> currentSegments,
+		uint64_t frameIndex);
+	ReplaySegmentCacheUpdateStats SummarizeReplaySegmentVariantCache() const;
+	void EvictOldReplaySegmentVariants(uint64_t frameIndex, ReplaySegmentCacheUpdateStats& stats);
+	bool ReplaySegmentBoundaryEdgesMatch(const CachedReplaySegment& cached, const CachedReplaySegment& current) const;
+	bool ReplaySegmentHardTemplateMatches(const CachedReplaySegment& cached, const CachedReplaySegment& current) const;
+	bool ReplaySegmentSyncShapeDiverged(const CachedReplaySegment& cached, const CachedReplaySegment& current) const;
+	bool ReplaySegmentHardReplayMatches(const CachedReplaySegment& cached, const CachedReplaySegment& current) const;
+	std::string FormatReplaySegmentBoundaryDiff(const CachedReplaySegment& cached, const CachedReplaySegment& current) const;
+	std::string FormatReplaySegmentTemplateDiff(const CachedReplaySegment& cached, const CachedReplaySegment& current) const;
 	ReplaySegmentVerificationReport VerifyAuthoritativeScheduleSemantics(
 		const std::vector<Node>& nodes,
 		const std::vector<AnyPassAndResources>& framePasses,
