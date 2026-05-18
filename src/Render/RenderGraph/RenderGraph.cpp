@@ -6727,9 +6727,7 @@ void RenderGraph::LogRegionCompileSummary(uint8_t frameIndex, const std::vector<
 		? m_getTransitionPlacementMode()
 		: rg::runtime::TransitionPlacementMode::InlineEarlyPlacement;
 	const bool diagnosticsEnabled = m_getRenderGraphRegionDiagnosticsEnabled && m_getRenderGraphRegionDiagnosticsEnabled();
-	if (regionMode == rg::runtime::RenderGraphRegionMode::Disabled
-		&& transitionPlacementMode == rg::runtime::TransitionPlacementMode::InlineEarlyPlacement
-		&& !diagnosticsEnabled) {
+	if (!diagnosticsEnabled) {
 		return;
 	}
 
@@ -9083,22 +9081,165 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 
 	const std::unordered_set<uint64_t> aliasActivationPendingBeforeAuthoritativeCompile = aliasActivationPending;
 	const std::vector<uint8_t> aliasActivationPendingByResourceIndexBeforeAuthoritativeCompile = m_aliasActivationPendingByResourceIndex;
+	const auto regionMode = m_getRenderGraphRegionMode
+		? m_getRenderGraphRegionMode()
+		: rg::runtime::RenderGraphRegionMode::Disabled;
+	const bool regionDiagnosticsEnabled = m_getRenderGraphRegionDiagnosticsEnabled && m_getRenderGraphRegionDiagnosticsEnabled();
+	const bool wantsAuthoritativeReplay =
+		static_cast<uint8_t>(regionMode) >= static_cast<uint8_t>(rg::runtime::RenderGraphRegionMode::ReplayAuthoritative);
+
+	m_lastAuthoritativeReplayAttempted = false;
+	m_lastAuthoritativeReplaySucceeded = false;
+	m_lastAuthoritativeReplaySegments = 0;
+	m_lastAuthoritativeReplayPasses = 0;
+	m_lastAuthoritativeReplayDynamicGapPasses = 0;
+	m_lastAuthoritativeReplayFailure.clear();
+
+	bool fastReplaySucceeded = false;
+	if (wantsAuthoritativeReplay
+		&& !regionDiagnosticsEnabled
+		&& !m_regionCache.replaySegments.empty()
+		&& !m_regionCache.replaySegmentEntries.empty()) {
+		traceCompileStep("ReplayCurrentFrameSegmentsFromCache");
+		ZoneScopedN("RenderGraph::CompileFrame::ReplayCurrentFrameSegmentsFromCache");
+
+		auto buildLightweightTrace = [&]() {
+			std::vector<SchedulingDecisionTrace> trace;
+			trace.reserve(nodes.size());
+			std::vector<uint32_t> pendingPredecessors(nodes.size(), 0);
+			std::vector<uint8_t> scheduled(nodes.size(), 0);
+			std::vector<uint32_t> ready;
+			ready.reserve(nodes.size());
+			for (uint32_t nodeIndex = 0; nodeIndex < nodes.size(); ++nodeIndex) {
+				pendingPredecessors[nodeIndex] = static_cast<uint32_t>(nodes[nodeIndex].in.size());
+				if (pendingPredecessors[nodeIndex] == 0) {
+					ready.push_back(nodeIndex);
+				}
+			}
+
+			auto orderReady = [&]() {
+				std::sort(ready.begin(), ready.end(), [&](uint32_t lhs, uint32_t rhs) {
+					if (nodes[lhs].originalOrder != nodes[rhs].originalOrder) {
+						return nodes[lhs].originalOrder > nodes[rhs].originalOrder;
+					}
+					return lhs > rhs;
+				});
+			};
+			orderReady();
+
+			while (!ready.empty()) {
+				const uint32_t nodeIndex = ready.back();
+				ready.pop_back();
+				if (nodeIndex >= nodes.size() || scheduled[nodeIndex]) {
+					continue;
+				}
+				scheduled[nodeIndex] = 1;
+				auto& node = nodes[nodeIndex];
+				const uint16_t assignedQueueSlot = static_cast<uint16_t>(node.assignedQueueSlot.value_or(node.queueSlot));
+				trace.push_back(SchedulingDecisionTrace{
+					.nodeIndex = nodeIndex,
+					.passIndex = static_cast<uint32_t>(node.passIndex),
+					.batchIndex = static_cast<uint32_t>(trace.size() + 1),
+					.assignedQueueSlot = assignedQueueSlot,
+					.closedBatchBefore = true,
+					.readySetSize = static_cast<uint32_t>(ready.size() + 1),
+					.candidateChecks = 0,
+					.isNewBatchNeededChecks = 0,
+					.fallbackCommit = false,
+				});
+				for (size_t succ : node.out) {
+					if (succ >= pendingPredecessors.size()) {
+						continue;
+					}
+					if (pendingPredecessors[succ] > 0) {
+						--pendingPredecessors[succ];
+					}
+					if (pendingPredecessors[succ] == 0) {
+						ready.push_back(static_cast<uint32_t>(succ));
+					}
+				}
+				orderReady();
+			}
+			return trace;
+		};
+
+		auto hashTracePassSequence = [&](const std::vector<SchedulingDecisionTrace>& trace, const CachedReplaySegment& segment) {
+			uint64_t hash = 0x7365677061737301ull;
+			for (uint32_t traceIndex = segment.schedule.firstTraceIndex;
+				traceIndex <= segment.schedule.lastTraceIndex && traceIndex < trace.size();
+				++traceIndex) {
+				const auto& entry = trace[traceIndex];
+				if (entry.passIndex >= m_framePasses.size()) {
+					return 0ull;
+				}
+				const auto& pass = m_framePasses[entry.passIndex];
+				hash = HashCombine64(hash, entry.passIndex);
+				hash = HashCombine64(hash, HashString64(pass.name));
+				hash = HashCombine64(hash, static_cast<uint64_t>(pass.type));
+			}
+			return hash;
+		};
+
+		const uint64_t replayCacheFrameSerial = ++m_regionCache.replaySegmentFrameSerial;
+		const std::vector<SchedulingDecisionTrace> replayTrace = buildLightweightTrace();
+		std::vector<CachedReplaySegment> selectedReplaySegments;
+		selectedReplaySegments.reserve(m_regionCache.replaySegments.size());
+		for (const auto& segment : m_regionCache.replaySegments) {
+			if (!segment.tier1Eligible || segment.batchTemplates.empty()) {
+				continue;
+			}
+			if (segment.schedule.lastTraceIndex >= replayTrace.size()) {
+				continue;
+			}
+			if (hashTracePassSequence(replayTrace, segment) != segment.identity.passSequenceHash) {
+				continue;
+			}
+			ReplaySegmentLookupResult lookup = LookupCachedReplaySegmentVariant(segment, replayCacheFrameSerial);
+			if (lookup.variant == nullptr) {
+				continue;
+			}
+			selectedReplaySegments.push_back(lookup.variant->segment);
+		}
+
+		if (!selectedReplaySegments.empty()) {
+			m_lastAuthoritativeReplayAttempted = true;
+			aliasActivationPending = aliasActivationPendingBeforeAuthoritativeCompile;
+			m_aliasActivationPendingByResourceIndex = aliasActivationPendingByResourceIndexBeforeAuthoritativeCompile;
+			ReplaySegmentVerificationReport replayReport = ReplayCurrentFrameSegmentsAsAuthoritative(
+				selectedReplaySegments,
+				replayTrace,
+				m_framePasses,
+				nodes);
+			m_lastAuthoritativeReplaySegments = replayReport.matchedSegments;
+			m_lastAuthoritativeReplayPasses = replayReport.replayedPasses;
+			m_lastAuthoritativeReplayDynamicGapPasses = replayReport.dynamicGapPasses;
+			fastReplaySucceeded = replayReport.valid && replayReport.matchedSegments != 0;
+			m_lastAuthoritativeReplaySucceeded = fastReplaySucceeded;
+			if (!fastReplaySucceeded) {
+				m_lastAuthoritativeReplayFailure = replayReport.firstFailure.empty()
+					? "fast_replay_failed"
+					: replayReport.firstFailure;
+				batches.clear();
+				batches.emplace_back(m_queueRegistry.SlotCount());
+				m_schedulingDecisionTrace.clear();
+				m_transitionPlacementCandidates.clear();
+				m_transitionPlacementStats = {};
+				ResetFrameQueueBatchHistoryTables();
+				RebuildFrameCompileResources();
+				aliasActivationPending = aliasActivationPendingBeforeAuthoritativeCompile;
+				m_aliasActivationPendingByResourceIndex = aliasActivationPendingByResourceIndexBeforeAuthoritativeCompile;
+			}
+		}
+	}
+
+	if (!fastReplaySucceeded)
 	{
 		traceCompileStep("AutoScheduleAndBuildBatches");
 		ZoneScopedN("RenderGraph::CompileFrame::AutoScheduleAndBuildBatches");
 		AutoScheduleAndBuildBatches(*this, m_framePasses, nodes);
 	}
+	if (!fastReplaySucceeded)
 	{
-		const auto regionMode = m_getRenderGraphRegionMode
-			? m_getRenderGraphRegionMode()
-			: rg::runtime::RenderGraphRegionMode::Disabled;
-		m_lastAuthoritativeReplayAttempted = false;
-		m_lastAuthoritativeReplaySucceeded = false;
-		m_lastAuthoritativeReplaySegments = 0;
-		m_lastAuthoritativeReplayPasses = 0;
-		m_lastAuthoritativeReplayDynamicGapPasses = 0;
-		m_lastAuthoritativeReplayFailure.clear();
-
 		if (static_cast<uint8_t>(regionMode) >= static_cast<uint8_t>(rg::runtime::RenderGraphRegionMode::ReplayAuthoritative)) {
 			traceCompileStep("ReplayCurrentFrameSegmentsAsAuthoritative");
 			ZoneScopedN("RenderGraph::CompileFrame::ReplayCurrentFrameSegmentsAsAuthoritative");
@@ -9131,7 +9272,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			m_lastRegionCandidateDiagnostics = replayCandidateDiagnostics;
 
 			ReplaySegmentValidationStats validation{};
-			{
+			if (regionDiagnosticsEnabled) {
 				ZoneScopedN("RenderGraph::Replay::ValidatePreviousSegments");
 				validation = ValidateCachedSegmentsAgainstCurrentFrame(
 					previousReplaySegments,
@@ -9145,6 +9286,10 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			m_regionCache.stats = replayRegionStats;
 			m_regionCache.replaySegments = currentReplaySegments;
 
+			if (!regionDiagnosticsEnabled) {
+				InsertOrRefreshReplaySegmentVariants(currentReplaySegments, replayCacheFrameSerial);
+			}
+			else {
 			std::unordered_map<uint64_t, const CachedReplaySegment*> previousByPassSequence;
 			previousByPassSequence.reserve(previousReplaySegments.size());
 			for (const auto& segment : previousReplaySegments) {
@@ -9493,54 +9638,56 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			cacheUpdateStats.firstOlderHit = firstReplayOlderVariantHit;
 			const bool haveStableCachedSegments = replaySelectionHits != 0 && !selectedReplaySegments.empty();
 
-			spdlog::info(
-				"RG compile validation R8 pre_replay_gate frame={} status={}\n"
-				"  previous_segments={} current_segments={} validation_hits={} validation_misses={}\n"
-				"  selected_segments={} selected_passes={} selected_hits={} selected_misses={} partial_replay={}\n"
-				"  stale_previous_misses_allowed={} allowed_sync_shape_divergences={} older_variant_hits={} oldest_hit_age={} first_validation_miss=\"{}\"\n"
-				"  first_selection_miss=\"{}\"\n"
-				"  first_older_variant_hit=\"{}\"\n"
-				"  first_selection_boundary_diff=\"{}\"\n"
-				"  first_selection_template_diff=\"{}\"",
-				static_cast<unsigned int>(frameIndex),
-				haveStableCachedSegments ? "ok" : "blocked",
-				validation.previousSegmentCount,
-				validation.currentSegmentCount,
-				validation.hits,
-				validation.misses,
-				replaySelectedSegments,
-				replaySelectedPasses,
-				replaySelectionHits,
-				replaySelectionMisses,
-				replaySelectionMisses != 0 ? 1 : 0,
-				validation.misses > replaySelectionMisses ? validation.misses - replaySelectionMisses : 0,
-				replayAllowedSyncShapeDivergences,
-				replayOlderVariantHits,
-				replayOldestVariantHitAge,
-				validation.firstMissDetail,
-				firstReplaySelectionMiss,
-				firstReplayOlderVariantHit,
-				firstReplaySelectionBoundaryDiff,
-				firstReplaySelectionTemplateDiff);
+			if (regionDiagnosticsEnabled) {
+				spdlog::info(
+					"RG compile validation R8 pre_replay_gate frame={} status={}\n"
+					"  previous_segments={} current_segments={} validation_hits={} validation_misses={}\n"
+					"  selected_segments={} selected_passes={} selected_hits={} selected_misses={} partial_replay={}\n"
+					"  stale_previous_misses_allowed={} allowed_sync_shape_divergences={} older_variant_hits={} oldest_hit_age={} first_validation_miss=\"{}\"\n"
+					"  first_selection_miss=\"{}\"\n"
+					"  first_older_variant_hit=\"{}\"\n"
+					"  first_selection_boundary_diff=\"{}\"\n"
+					"  first_selection_template_diff=\"{}\"",
+					static_cast<unsigned int>(frameIndex),
+					haveStableCachedSegments ? "ok" : "blocked",
+					validation.previousSegmentCount,
+					validation.currentSegmentCount,
+					validation.hits,
+					validation.misses,
+					replaySelectedSegments,
+					replaySelectedPasses,
+					replaySelectionHits,
+					replaySelectionMisses,
+					replaySelectionMisses != 0 ? 1 : 0,
+					validation.misses > replaySelectionMisses ? validation.misses - replaySelectionMisses : 0,
+					replayAllowedSyncShapeDivergences,
+					replayOlderVariantHits,
+					replayOldestVariantHitAge,
+					validation.firstMissDetail,
+					firstReplaySelectionMiss,
+					firstReplayOlderVariantHit,
+					firstReplaySelectionBoundaryDiff,
+					firstReplaySelectionTemplateDiff);
 
-			spdlog::info(
-				"RG compile validation R8 segment_cache frame={} status=observed\n"
-				"  entries={} variants={} inserted={} refreshed={} evicted={} max_variants_per_key=4\n"
-				"  lookup_hits={} lookup_misses={} older_variant_hits={} oldest_hit_age={}\n"
-				"  first_miss=\"{}\"\n"
-				"  first_older_hit=\"{}\"",
-				static_cast<unsigned int>(frameIndex),
-				cacheUpdateStats.entries,
-				cacheUpdateStats.variants,
-				cacheUpdateStats.inserted,
-				cacheUpdateStats.refreshed,
-				cacheUpdateStats.evicted,
-				cacheUpdateStats.lookupHits,
-				cacheUpdateStats.lookupMisses,
-				cacheUpdateStats.olderVariantHits,
-				cacheUpdateStats.oldestHitAge,
-				cacheUpdateStats.firstMiss,
-				cacheUpdateStats.firstOlderHit);
+				spdlog::info(
+					"RG compile validation R8 segment_cache frame={} status=observed\n"
+					"  entries={} variants={} inserted={} refreshed={} evicted={} max_variants_per_key=4\n"
+					"  lookup_hits={} lookup_misses={} older_variant_hits={} oldest_hit_age={}\n"
+					"  first_miss=\"{}\"\n"
+					"  first_older_hit=\"{}\"",
+					static_cast<unsigned int>(frameIndex),
+					cacheUpdateStats.entries,
+					cacheUpdateStats.variants,
+					cacheUpdateStats.inserted,
+					cacheUpdateStats.refreshed,
+					cacheUpdateStats.evicted,
+					cacheUpdateStats.lookupHits,
+					cacheUpdateStats.lookupMisses,
+					cacheUpdateStats.olderVariantHits,
+					cacheUpdateStats.oldestHitAge,
+					cacheUpdateStats.firstMiss,
+					cacheUpdateStats.firstOlderHit);
+			}
 
 			if (haveStableCachedSegments) {
 				m_lastAuthoritativeReplayAttempted = true;
@@ -9552,6 +9699,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 					m_framePasses,
 					nodes);
 				ReplaySegmentVerificationReport semanticReport = replayReport.valid
+					&& regionDiagnosticsEnabled
 					? VerifyAuthoritativeScheduleSemantics(nodes, m_framePasses, batches)
 					: replayReport;
 				m_lastAuthoritativeReplaySegments = replayReport.matchedSegments;
@@ -9574,29 +9722,31 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 					m_aliasActivationPendingByResourceIndex = aliasActivationPendingByResourceIndexBeforeAuthoritativeCompile;
 					AutoScheduleAndBuildBatches(*this, m_framePasses, nodes);
 				}
-				spdlog::info(
-					"RG compile validation R8 partial_replay frame={} status={}\n"
-					"  replayed_segments={} replayed_passes={} dynamic_gap_passes={} compiled_gap_segments={} compiled_gap_passes={}\n"
-					"  transition_replay: add_transition_calls_saved={} template_batches={} repaired_batches={} recomputed_batches={} replayed_transitions={} recomputed_transition_calls={}\n"
-					"  inserted_input_transitions={} verifier_status={} first_failure=\"{}\" first_recompute_reason=\"{}\" top_transition_noise=\"{}\"",
-					static_cast<unsigned int>(frameIndex),
-					m_lastAuthoritativeReplaySucceeded ? "ok" : "fallback_full_compile",
-					replayReport.matchedSegments,
-					replayReport.replayedPasses,
-					replayReport.dynamicGapPasses,
-					replayReport.dynamicGapPasses,
-					replayReport.dynamicGapPasses,
-					replayReport.addTransitionCallsSaved,
-					replayReport.templateReplayedBatches,
-					replayReport.repairedBatches,
-					replayReport.recomputedBatches,
-					replayReport.replayedInternalTransitions,
-					replayReport.recomputedTransitionCalls,
-					replayReport.insertedInputTransitions,
-					semanticReport.valid ? "ok" : "failed",
-					m_lastAuthoritativeReplayFailure,
-					replayReport.firstRecomputeReason,
-					replayReport.topTransitionNoise);
+				if (regionDiagnosticsEnabled) {
+					spdlog::info(
+						"RG compile validation R8 partial_replay frame={} status={}\n"
+						"  replayed_segments={} replayed_passes={} dynamic_gap_passes={} compiled_gap_segments={} compiled_gap_passes={}\n"
+						"  transition_replay: add_transition_calls_saved={} template_batches={} repaired_batches={} recomputed_batches={} replayed_transitions={} recomputed_transition_calls={}\n"
+						"  inserted_input_transitions={} verifier_status={} first_failure=\"{}\" first_recompute_reason=\"{}\" top_transition_noise=\"{}\"",
+						static_cast<unsigned int>(frameIndex),
+						m_lastAuthoritativeReplaySucceeded ? "ok" : "fallback_full_compile",
+						replayReport.matchedSegments,
+						replayReport.replayedPasses,
+						replayReport.dynamicGapPasses,
+						replayReport.dynamicGapPasses,
+						replayReport.dynamicGapPasses,
+						replayReport.addTransitionCallsSaved,
+						replayReport.templateReplayedBatches,
+						replayReport.repairedBatches,
+						replayReport.recomputedBatches,
+						replayReport.replayedInternalTransitions,
+						replayReport.recomputedTransitionCalls,
+						replayReport.insertedInputTransitions,
+						semanticReport.valid ? "ok" : "failed",
+						m_lastAuthoritativeReplayFailure,
+						replayReport.firstRecomputeReason,
+						replayReport.topTransitionNoise);
+				}
 			}
 			else {
 				if (m_regionCache.replaySegmentEntries.empty()) {
@@ -9611,6 +9761,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				else {
 					m_lastAuthoritativeReplayFailure = "selected_cached_segments_not_fully_valid";
 				}
+			}
 			}
 		}
 	}
