@@ -903,10 +903,166 @@ private:
 		ScheduledRegion schedule;
 	};
 
+	enum class ReplaySegmentInvalidationReason : uint8_t {
+		None = 0,
+		PassSequenceChanged,
+		DeclarationChanged,
+		AccessChanged,
+		QueueAssignmentChanged,
+		AliasPlacementChanged,
+		BoundaryChanged,
+		TemplateShapeChanged,
+		ImmediateWorkInserted,
+		FrameExtensionInserted,
+		UnsupportedAliasActivation,
+		BatchInterleavingChanged,
+		Count
+	};
+
+	struct ReplaySegmentIdentity {
+		uint64_t passSequenceHash = 0;
+		uint64_t structuralPositionHash = 0;
+		uint32_t passCount = 0;
+	};
+
+	struct ReplaySegmentFingerprint {
+		uint64_t declarationHash = 0;
+		uint64_t accessHash = 0;
+		uint64_t queueHash = 0;
+		uint64_t aliasHash = 0;
+		uint64_t boundaryHash = 0;
+		uint64_t templateShapeHash = 0;
+	};
+
+	struct ReplaySegmentInputRequirement {
+		uint64_t resourceID = 0;
+		RangeSpec range{};
+		ResourceState requiredState{};
+		uint16_t queueSlot = 0;
+		bool wholeResource = false;
+		bool aliasActivation = false;
+		bool readOnlyUniformWeakRequirement = false;
+	};
+
+	struct ReplaySegmentOutputState {
+		uint64_t resourceID = 0;
+		RangeSpec range{};
+		ResourceState finalState{};
+		bool wholeResource = false;
+		bool validFastState = false;
+	};
+
+	struct ReplaySegmentBoundaryEdge {
+		uint32_t insideNode = 0;
+		uint32_t outsideNode = 0;
+		uint32_t insideTraceIndex = 0;
+		uint32_t outsideTraceIndex = 0;
+		uint16_t insideQueueSlot = 0;
+		uint16_t outsideQueueSlot = 0;
+		bool incoming = false;
+		bool crossQueue = false;
+	};
+
+	struct ReplaySegmentBoundarySync {
+		uint16_t dstQueue = 0;
+		uint16_t srcQueue = 0;
+		BatchWaitPhase waitPhase = BatchWaitPhase::BeforeTransitions;
+		BatchSignalPhase signalPhase = BatchSignalPhase::AfterCompletion;
+		uint32_t batchIndex = 0;
+		bool internalOnly = false;
+	};
+
+	struct ReplaySegmentQueueUsageSummary {
+		uint64_t resourceID = 0;
+		uint16_t queueSlot = 0;
+		uint32_t firstLocalBatch = 0;
+		uint32_t lastLocalBatch = 0;
+		bool read = false;
+		bool write = false;
+		bool transition = false;
+		bool producer = false;
+	};
+
+	struct ReplaySegmentQueuedPassTemplate {
+		uint32_t localPassOrdinal = 0;
+		uint32_t originalFramePassIndexAtExtraction = 0;
+		uint16_t queueSlot = 0;
+		PassType type = PassType::Unknown;
+	};
+
+	struct ReplaySegmentTransitionTemplate {
+		uint64_t resourceID = 0;
+		RangeSpec range{};
+		ResourceState before{};
+		ResourceState after{};
+		bool discard = false;
+		uint16_t queueSlot = 0;
+		BatchTransitionPhase phase = BatchTransitionPhase::BeforePasses;
+	};
+
+	struct ReplaySegmentWaitTemplate {
+		uint16_t dstQueue = 0;
+		uint16_t srcQueue = 0;
+		BatchWaitPhase phase = BatchWaitPhase::BeforeTransitions;
+	};
+
+	struct ReplaySegmentSignalTemplate {
+		uint16_t queueSlot = 0;
+		BatchSignalPhase phase = BatchSignalPhase::AfterCompletion;
+	};
+
+	struct ReplaySegmentBatchTemplate {
+		uint32_t localBatchIndex = 0;
+		uint32_t originalBatchIndexAtExtraction = 0;
+		bool partialBatch = false;
+		std::vector<ReplaySegmentQueuedPassTemplate> queuedPasses;
+		std::vector<ReplaySegmentTransitionTemplate> transitions;
+		std::vector<ReplaySegmentWaitTemplate> waits;
+		std::vector<ReplaySegmentSignalTemplate> signals;
+		std::vector<uint64_t> allResources;
+		std::vector<uint64_t> internallyTransitionedResources;
+	};
+
+	struct ReplaySegmentContract {
+		std::vector<ReplaySegmentInputRequirement> inputRequirements;
+		std::vector<ReplaySegmentOutputState> outputStates;
+		std::vector<ReplaySegmentBoundaryEdge> boundaryEdges;
+		std::vector<ReplaySegmentBoundarySync> boundarySyncs;
+		std::vector<ReplaySegmentQueueUsageSummary> queueUsage;
+	};
+
+	struct ReplaySegmentVerificationReport {
+		bool valid = true;
+		uint64_t checkedPasses = 0;
+		uint64_t checkedEdges = 0;
+		uint64_t checkedRequirements = 0;
+		uint64_t checkedQueueSyncs = 0;
+		uint64_t failures = 0;
+		std::string firstFailure;
+	};
+
+	struct CachedReplaySegment {
+		ScheduledRegion schedule;
+		ReplaySegmentIdentity identity;
+		ReplaySegmentFingerprint fingerprint;
+		ReplaySegmentContract contract;
+		std::vector<ReplaySegmentBatchTemplate> batchTemplates;
+		bool tier1Eligible = false;
+	};
+
+	struct ReplaySegmentValidationStats {
+		uint64_t currentSegmentCount = 0;
+		uint64_t previousSegmentCount = 0;
+		uint64_t hits = 0;
+		uint64_t misses = 0;
+		std::array<uint64_t, static_cast<size_t>(ReplaySegmentInvalidationReason::Count)> missesByReason{};
+	};
+
 	struct RenderGraphRegionCache {
 		uint64_t structuralGeneration = 0;
 		uint64_t lastAuthoritativeCompileFingerprint = 0;
 		std::vector<CachedScheduleRegion> regions;
+		std::vector<CachedReplaySegment> replaySegments;
 		RegionCacheStats stats;
 	};
 
@@ -1247,6 +1403,24 @@ private:
 		std::vector<ScheduledRegion>& outRegions,
 		RegionCacheStats& outStats,
 		std::vector<std::string>& outCandidateDiagnostics) const;
+	void ExtractReplaySegmentsFromAuthoritativeCompile(
+		const std::vector<Node>& nodes,
+		const std::vector<AnyPassAndResources>& framePasses,
+		const std::vector<PassBatch>& compiledBatches,
+		std::span<const ScheduledRegion> regions,
+		std::vector<CachedReplaySegment>& outSegments) const;
+	ReplaySegmentValidationStats ValidateCachedSegmentsAgainstCurrentFrame(
+		std::span<const CachedReplaySegment> previousSegments,
+		std::span<const CachedReplaySegment> currentSegments) const;
+	ReplaySegmentVerificationReport VerifyAuthoritativeScheduleSemantics(
+		const std::vector<Node>& nodes,
+		const std::vector<AnyPassAndResources>& framePasses,
+		const std::vector<PassBatch>& compiledBatches) const;
+	ReplaySegmentVerificationReport BuildShadowReplayScheduleFromCachedSegments(
+		std::span<const CachedReplaySegment> previousSegments,
+		std::span<const CachedReplaySegment> currentSegments) const;
+	ReplaySegmentVerificationReport VerifyReplayScheduleSemanticCorrectness(
+		std::span<const CachedReplaySegment> replaySegments) const;
 	bool ValidateSchedulingDecisionTrace(
 		const std::vector<Node>& nodes,
 		const std::vector<AnyPassAndResources>& framePasses,
