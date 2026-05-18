@@ -227,6 +227,8 @@ static ImU32 ColTrans() { return IM_COL32(200, 100, 80, 200); }
 static ImU32 ColArrowWait() { return IM_COL32(255, 200, 64, 220); }
 static ImU32 ColHighlight() { return IM_COL32(255, 64, 64, 255); }
 static ImU32 ColBorder() { return IM_COL32(0, 0, 0, 255); }
+static ImU32 ColCachedOverlay() { return IM_COL32(60, 220, 100, 58); }
+static ImU32 ColUncachedOverlay() { return IM_COL32(240, 70, 70, 48); }
 
 static float LaneY(size_t slotIndex, size_t totalSlots, float rowHeight, float laneSpacing) {
     // Slot 0 at top, slot N-1 at bottom (higher Y = higher on screen in ImPlot)
@@ -342,6 +344,7 @@ namespace RGInspector {
         static int s_filterBatchResources = -1; // -1 = show all resources
         static std::string s_selectedPassName;
         static bool s_openMemoryView = false;
+        static bool s_showCacheRegions = false;
         static ui::MemoryViewWidget s_memoryView;
         static bool s_memoryViewCallbacksWired = false;
         if (!s_memoryViewCallbacksWired && opts.imguiAllocDescriptor) {
@@ -541,6 +544,9 @@ namespace RGInspector {
 
         // --- Right panel: plot ---
         ImGui::BeginGroup();
+        ImGui::Checkbox("Show Cached Regions", &s_showCacheRegions);
+        ImGui::SameLine();
+        ImGui::TextDisabled("green = cached replay, red = dynamic/uncached");
         if (ImPlot::BeginPlot("##RGPlot", ImVec2(-1, -1), ImPlotFlags_CanvasOnly)) {
             // Axes: X = batch index [0..N], Y = lanes
             ImPlot::SetupAxes(nullptr, nullptr, ImPlotAxisFlags_NoTickLabels, ImPlotAxisFlags_NoTickLabels);
@@ -594,6 +600,33 @@ namespace RGInspector {
                 ImVec2 p0 = ImPlot::PlotToPixels(ImPlotPoint(x, -S));
                 ImVec2 p1 = ImPlot::PlotToPixels(ImPlotPoint(x, topLaneY + H + S));
                 dl->AddLine(p0, p1, IM_COL32(180, 180, 180, 64), (i % 5 == 0) ? 2.0f : 1.0f);
+            }
+
+            if (s_showCacheRegions && opts.cacheOverlayProvider) {
+                const std::vector<RGCacheOverlayRange> overlayRanges = opts.cacheOverlayProvider();
+                const float yMin = (numSlots > 0) ? LaneY(numSlots - 1, numSlots, H, S) : 0.0f;
+                const float yMax = (numSlots > 0) ? LaneY(0, numSlots, H, S) + H : H;
+                for (const auto& range : overlayRanges) {
+                    if (range.firstBatch >= layouts.size()) {
+                        continue;
+                    }
+                    const uint32_t lastBatch = std::min<uint32_t>(range.lastBatch, static_cast<uint32_t>(layouts.size() - 1));
+                    if (lastBatch < range.firstBatch) {
+                        continue;
+                    }
+                    const double x0 = layouts[range.firstBatch].baseX;
+                    const double x1 = layouts[lastBatch].baseX + layouts[lastBatch].width;
+                    ImVec2 a = ImPlot::PlotToPixels(ImPlotPoint(x0, yMin));
+                    ImVec2 b = ImPlot::PlotToPixels(ImPlotPoint(x1, yMax));
+                    if (a.x > b.x) {
+                        std::swap(a.x, b.x);
+                    }
+                    if (a.y > b.y) {
+                        std::swap(a.y, b.y);
+                    }
+                    dl->AddRectFilled(a, b, range.cached ? ColCachedOverlay() : ColUncachedOverlay(), 0.0f);
+                    dl->AddRect(a, b, range.cached ? IM_COL32(60, 220, 100, 120) : IM_COL32(240, 70, 70, 110), 0.0f, 0, 1.5f);
+                }
             }
 
             auto draw_transitions = [&](const std::vector<ResourceTransition>& v,

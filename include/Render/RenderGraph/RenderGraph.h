@@ -51,6 +51,12 @@ namespace ui {
 	struct FrameGraphSnapshot;
 }
 
+struct RGCacheOverlayRange {
+	uint32_t firstBatch = 0;
+	uint32_t lastBatch = 0;
+	bool cached = false;
+};
+
 template<typename T>
 concept DerivedResource = std::derived_from<T, Resource>;
 
@@ -588,6 +594,7 @@ public:
 	std::optional<PresentDependency> GetLastPresentDependency() const noexcept { return m_lastPresentDependency; }
 	rg::memory::SnapshotProvider& GetMemorySnapshotProvider() { return m_memorySnapshotProvider; }
 	const rg::memory::SnapshotProvider& GetMemorySnapshotProvider() const { return m_memorySnapshotProvider; }
+	std::vector<RGCacheOverlayRange> BuildReplayCacheOverlayRanges() const;
 	void SetStatisticsService(std::shared_ptr<rg::runtime::IStatisticsService> service) { m_statisticsService = std::move(service); }
 	rg::runtime::IStatisticsService* GetStatisticsService() { return m_statisticsService.get(); }
 	const rg::runtime::IStatisticsService* GetStatisticsService() const { return m_statisticsService.get(); }
@@ -936,7 +943,9 @@ private:
 	};
 
 	struct ReplaySegmentInputRequirement {
+		ResourceRegistry::RegistryHandle resource;
 		uint64_t resourceID = 0;
+		size_t resourceIndexAtExtraction = 0;
 		RangeSpec range{};
 		ResourceState requiredState{};
 		uint16_t queueSlot = 0;
@@ -1046,6 +1055,14 @@ private:
 		uint64_t dynamicGapPasses = 0;
 		uint64_t insertedInputTransitions = 0;
 		uint64_t extraInputTransitionsAllowed = 0;
+		uint64_t addTransitionCallsSaved = 0;
+		uint64_t templateReplayedBatches = 0;
+		uint64_t repairedBatches = 0;
+		uint64_t recomputedBatches = 0;
+		uint64_t replayedInternalTransitions = 0;
+		uint64_t recomputedTransitionCalls = 0;
+		std::string firstRecomputeReason;
+		std::string topTransitionNoise;
 		std::string firstFailure;
 	};
 
