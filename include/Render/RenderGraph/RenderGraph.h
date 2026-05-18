@@ -912,6 +912,7 @@ private:
 		AliasPlacementChanged,
 		BoundaryChanged,
 		TemplateShapeChanged,
+		TemplateStateChanged,
 		ImmediateWorkInserted,
 		FrameExtensionInserted,
 		UnsupportedAliasActivation,
@@ -992,12 +993,14 @@ private:
 
 	struct ReplaySegmentTransitionTemplate {
 		uint64_t resourceID = 0;
+		uint64_t backingResourceID = 0;
 		RangeSpec range{};
 		ResourceState before{};
 		ResourceState after{};
 		bool discard = false;
 		uint16_t queueSlot = 0;
 		BatchTransitionPhase phase = BatchTransitionPhase::BeforePasses;
+		bool dynamicResource = false;
 	};
 
 	struct ReplaySegmentWaitTemplate {
@@ -1038,7 +1041,35 @@ private:
 		uint64_t checkedRequirements = 0;
 		uint64_t checkedQueueSyncs = 0;
 		uint64_t failures = 0;
+		uint64_t matchedSegments = 0;
+		uint64_t replayedPasses = 0;
+		uint64_t dynamicGapPasses = 0;
+		uint64_t insertedInputTransitions = 0;
+		uint64_t extraInputTransitionsAllowed = 0;
 		std::string firstFailure;
+	};
+
+	struct ReplayAuthoritativeReadinessReport {
+		bool ready = false;
+		uint64_t matchedSegments = 0;
+		uint64_t replayablePasses = 0;
+		uint64_t dynamicGapPasses = 0;
+		uint64_t insertedInputTransitions = 0;
+		uint64_t blockers = 0;
+		std::string blockerSummary;
+	};
+
+	struct ReplaySegmentTemplateStats {
+		uint32_t batchCount = 0;
+		uint32_t partialBatchCount = 0;
+		uint32_t queuedPassCount = 0;
+		uint32_t transitionCount = 0;
+		uint32_t waitCount = 0;
+		uint32_t signalCount = 0;
+		uint64_t passOrderHash = 0;
+		uint64_t transitionShapeHash = 0;
+		uint64_t transitionStateHash = 0;
+		uint64_t syncShapeHash = 0;
 	};
 
 	struct CachedReplaySegment {
@@ -1047,6 +1078,7 @@ private:
 		ReplaySegmentFingerprint fingerprint;
 		ReplaySegmentContract contract;
 		std::vector<ReplaySegmentBatchTemplate> batchTemplates;
+		ReplaySegmentTemplateStats templateStats;
 		bool tier1Eligible = false;
 	};
 
@@ -1055,7 +1087,16 @@ private:
 		uint64_t previousSegmentCount = 0;
 		uint64_t hits = 0;
 		uint64_t misses = 0;
+		uint64_t templateStateDivergencesAllowed = 0;
+		uint64_t transitionShapeResourceDiffs = 0;
+		uint64_t transitionShapeRangeDiffs = 0;
+		uint64_t transitionShapeAfterStateDiffs = 0;
+		uint64_t transitionShapeQueueDiffs = 0;
+		uint64_t transitionShapePhaseDiffs = 0;
+		uint64_t transitionShapeDiscardDiffs = 0;
 		std::array<uint64_t, static_cast<size_t>(ReplaySegmentInvalidationReason::Count)> missesByReason{};
+		std::string firstMissDetail;
+		std::string firstTransitionShapeDiffDetail;
 	};
 
 	struct RenderGraphRegionCache {
@@ -1294,6 +1335,12 @@ private:
 	std::vector<SchedulingDecisionTrace> m_schedulingDecisionTrace;
 	std::vector<TransitionPlacementCandidate> m_transitionPlacementCandidates;
 	TransitionPlacementStats m_transitionPlacementStats;
+	bool m_lastAuthoritativeReplayAttempted = false;
+	bool m_lastAuthoritativeReplaySucceeded = false;
+	uint64_t m_lastAuthoritativeReplaySegments = 0;
+	uint64_t m_lastAuthoritativeReplayPasses = 0;
+	uint64_t m_lastAuthoritativeReplayDynamicGapPasses = 0;
+	std::string m_lastAuthoritativeReplayFailure;
 	std::unordered_map<uint64_t, LastProducerAcrossFrames> m_lastProducerByResourceAcrossFrames;
 	std::unordered_map<uint64_t, std::vector<LastAliasPlacementProducerAcrossFrames>> m_lastAliasPlacementProducersByPoolAcrossFrames;
 	std::vector<std::unordered_map<uint64_t, unsigned int>> m_compiledLastProducerBatchByResourceByQueue;
@@ -1421,6 +1468,16 @@ private:
 		std::span<const CachedReplaySegment> currentSegments) const;
 	ReplaySegmentVerificationReport VerifyReplayScheduleSemanticCorrectness(
 		std::span<const CachedReplaySegment> replaySegments) const;
+	ReplayAuthoritativeReadinessReport CheckReplayAuthoritativeReadiness(
+		const ReplaySegmentValidationStats& validation,
+		const ReplaySegmentVerificationReport& semanticVerification,
+		const ReplaySegmentVerificationReport& replayMetadataVerification,
+		const ReplaySegmentVerificationReport& shadowReplayVerification) const;
+	ReplaySegmentVerificationReport ReplayCurrentFrameSegmentsAsAuthoritative(
+		std::span<const CachedReplaySegment> replaySegments,
+		std::span<const SchedulingDecisionTrace> authoritativeTrace,
+		std::vector<AnyPassAndResources>& framePasses,
+		std::vector<Node>& nodes);
 	bool ValidateSchedulingDecisionTrace(
 		const std::vector<Node>& nodes,
 		const std::vector<AnyPassAndResources>& framePasses,

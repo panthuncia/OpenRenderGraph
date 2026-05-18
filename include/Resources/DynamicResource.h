@@ -60,6 +60,10 @@ public:
         return m_globalResourceID;
 	}
 
+    uint64_t GetDynamicWrapperGlobalResourceID() const {
+        return Resource::GetGlobalResourceID();
+    }
+
     SymbolicTracker* GetStateTracker() override {
         return resource->GetStateTracker();
     }
