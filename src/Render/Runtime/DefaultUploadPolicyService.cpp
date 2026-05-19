@@ -15,6 +15,7 @@ public:
     void Cleanup() override {
         std::scoped_lock lock(m_mutex);
         m_clients.clear();
+        m_dirtyClients.clear();
         m_stats = {};
     }
 
@@ -25,6 +26,9 @@ public:
 
         std::scoped_lock lock(m_mutex);
         m_clients.insert(client);
+        if (client->HasPendingUploadPolicyWork()) {
+            m_dirtyClients.insert(client);
+        }
         m_stats.registeredClients = static_cast<uint64_t>(m_clients.size());
     }
 
@@ -35,7 +39,19 @@ public:
 
         std::scoped_lock lock(m_mutex);
         m_clients.erase(client);
+        m_dirtyClients.erase(client);
         m_stats.registeredClients = static_cast<uint64_t>(m_clients.size());
+    }
+
+    void MarkClientDirty(IUploadPolicyClient* client) override {
+        if (!client) {
+            return;
+        }
+
+        std::scoped_lock lock(m_mutex);
+        if (m_clients.find(client) != m_clients.end()) {
+            m_dirtyClients.insert(client);
+        }
     }
 
     void BeginFrame() override {
@@ -52,10 +68,13 @@ public:
     }
 
     void FlushAll() override {
-        auto clients = SnapshotClients();
+        auto clients = SnapshotDirtyClients();
         for (auto* client : clients) {
-            if (client) {
+            if (client && client->HasPendingUploadPolicyWork()) {
                 client->OnUploadPolicyFlush();
+                if (client->HasPendingUploadPolicyWork()) {
+                    MarkClientDirty(client);
+                }
             }
         }
 
@@ -80,8 +99,20 @@ private:
         return out;
     }
 
+    std::vector<IUploadPolicyClient*> SnapshotDirtyClients() {
+        std::scoped_lock lock(m_mutex);
+        std::vector<IUploadPolicyClient*> out;
+        out.reserve(m_dirtyClients.size());
+        for (auto* client : m_dirtyClients) {
+            out.push_back(client);
+        }
+        m_dirtyClients.clear();
+        return out;
+    }
+
     mutable std::mutex m_mutex;
     std::unordered_set<IUploadPolicyClient*> m_clients;
+    std::unordered_set<IUploadPolicyClient*> m_dirtyClients;
     UploadPolicyServiceStats m_stats{};
 };
 

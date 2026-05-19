@@ -107,6 +107,7 @@ public:
 
     void OnUploadPolicyBeginFrame() override {}
     void OnUploadPolicyFlush() override {}
+    bool HasPendingUploadPolicyWork() const override { return false; }
 
 protected:
     void SetBacking(std::unique_ptr<GpuBufferBacking> backing, uint64_t bufferSize);
@@ -117,6 +118,7 @@ protected:
     void ApplyMetadataToBacking(const EntityComponentBundle& bundle);
 
     void EnsureUploadPolicyRegistration();
+    void MarkUploadPolicyDirty();
     void RefreshUploadPolicyRegistration();
     void UnregisterUploadPolicyClient();
 

@@ -307,6 +307,15 @@ void BufferBase::EnsureUploadPolicyRegistration() {
     m_uploadPolicyRegistered = true;
 }
 
+void BufferBase::MarkUploadPolicyDirty() {
+    if (m_uploadPolicyTag == rg::runtime::UploadPolicyTag::Immediate) {
+        return;
+    }
+
+    EnsureUploadPolicyRegistration();
+    rg::runtime::MarkUploadPolicyClientDirty(this);
+}
+
 void BufferBase::RefreshUploadPolicyRegistration() {
     if (m_uploadPolicyTag == rg::runtime::UploadPolicyTag::Immediate) {
         UnregisterUploadPolicyClient();

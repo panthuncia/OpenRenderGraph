@@ -60,6 +60,11 @@ public:
         else {
             m_retainedBytes.clear();
             m_retainedDirtyRanges.clear();
+            m_retainedDirtyRangesSorted = true;
+            m_retainedStagedWrites = 0;
+            m_retainedStagedBytes = 0;
+            m_retainedOverlapEvents = 0;
+            m_retainedOverlapBytes = 0;
         }
         m_coalescedDirtyRanges.clear();
         m_coalescedStagedWrites = 0;
@@ -190,7 +195,7 @@ public:
             stats.stagedWrites = m_coalescedStagedWrites;
             stats.stagedBytes = m_coalescedStagedBytes;
 
-            auto coalesced = CoalesceDirtyRanges(std::move(m_coalescedDirtyRanges));
+            auto coalesced = CoalesceDirtyRanges(std::move(m_coalescedDirtyRanges), false);
             for (const auto& range : coalesced) {
                 const size_t uploadSize = range.end - range.begin;
                 if (uploadSize == 0) {
@@ -224,8 +229,12 @@ public:
             return;
         }
 
-        stats.stagedWrites = static_cast<uint64_t>(m_retainedDirtyRanges.size());
-        auto mergedDirty = CoalesceDirtyRanges(m_retainedDirtyRanges);
+        stats.stagedWrites = m_retainedStagedWrites;
+        stats.stagedBytes = m_retainedStagedBytes;
+        stats.overlapEvents = m_retainedOverlapEvents;
+        stats.overlapBytes = m_retainedOverlapBytes;
+
+        auto mergedDirty = CoalesceDirtyRanges(std::move(m_retainedDirtyRanges), m_retainedDirtyRangesSorted);
         for (const auto& range : mergedDirty) {
             const size_t uploadSize = range.end - range.begin;
             if (uploadSize == 0) {
@@ -247,18 +256,34 @@ public:
                 target,
                 range.begin);
 #endif
-            stats.stagedBytes += static_cast<uint64_t>(uploadSize);
             ++stats.flushedWrites;
             stats.flushedBytes += static_cast<uint64_t>(uploadSize);
         }
 
         stats.mergedWrites = stats.stagedWrites > stats.flushedWrites ? (stats.stagedWrites - stats.flushedWrites) : 0;
         m_retainedDirtyRanges.clear();
+        m_retainedDirtyRangesSorted = true;
+        m_retainedStagedWrites = 0;
+        m_retainedStagedBytes = 0;
+        m_retainedOverlapEvents = 0;
+        m_retainedOverlapBytes = 0;
         m_lastFlushStats = stats;
     }
 
     BufferUploadPolicyStats GetLastFlushStats() const {
         return m_lastFlushStats;
+    }
+
+    bool HasPendingWork() const {
+        if (m_config.tag == UploadPolicyTag::Immediate) {
+            return false;
+        }
+
+        if (m_config.tag == UploadPolicyTag::Coalesced) {
+            return !m_coalescedDirtyRanges.empty();
+        }
+
+        return !m_retainedDirtyRanges.empty();
     }
 
 private:
@@ -269,14 +294,16 @@ private:
         int line = 0;
     };
 
-    static std::vector<DirtyRange> CoalesceDirtyRanges(std::vector<DirtyRange> ranges) {
+    static std::vector<DirtyRange> CoalesceDirtyRanges(std::vector<DirtyRange> ranges, bool alreadySorted) {
         if (ranges.empty()) {
             return ranges;
         }
 
-        std::sort(ranges.begin(), ranges.end(), [](const DirtyRange& lhs, const DirtyRange& rhs) {
-            return lhs.begin < rhs.begin;
-        });
+        if (!alreadySorted) {
+            std::sort(ranges.begin(), ranges.end(), [](const DirtyRange& lhs, const DirtyRange& rhs) {
+                return lhs.begin < rhs.begin;
+            });
+        }
 
         std::vector<DirtyRange> merged;
         merged.reserve(ranges.size());
@@ -299,23 +326,37 @@ private:
 
     void AddOrMergeDirtyRange(size_t begin, size_t end, const char* file, int line) {
         DirtyRange incoming{ begin, end, file, line };
-        std::vector<DirtyRange> updated;
-        updated.reserve(m_retainedDirtyRanges.size() + 1);
+        ++m_retainedStagedWrites;
+        m_retainedStagedBytes += static_cast<uint64_t>(end - begin);
 
-        for (const auto& range : m_retainedDirtyRanges) {
-            if (range.end < incoming.begin || range.begin > incoming.end) {
-                updated.push_back(range);
-                continue;
-            }
-
-            incoming.begin = std::min(incoming.begin, range.begin);
-            incoming.end = std::max(incoming.end, range.end);
-            incoming.file = file;
-            incoming.line = line;
+        if (m_retainedDirtyRanges.empty()) {
+            m_retainedDirtyRanges.push_back(incoming);
+            return;
         }
 
-        updated.push_back(incoming);
-        m_retainedDirtyRanges = std::move(updated);
+        auto& tail = m_retainedDirtyRanges.back();
+        if (incoming.begin <= tail.end && incoming.end >= tail.begin) {
+            const size_t overlapBegin = std::max(incoming.begin, tail.begin);
+            const size_t overlapEnd = std::min(incoming.end, tail.end);
+            if (overlapBegin < overlapEnd) {
+                ++m_retainedOverlapEvents;
+                m_retainedOverlapBytes += static_cast<uint64_t>(overlapEnd - overlapBegin);
+            }
+
+            tail.begin = std::min(tail.begin, incoming.begin);
+            tail.end = std::max(tail.end, incoming.end);
+            tail.file = file;
+            tail.line = line;
+            return;
+        }
+
+        if (incoming.begin >= tail.end) {
+            m_retainedDirtyRanges.push_back(incoming);
+            return;
+        }
+
+        m_retainedDirtyRanges.push_back(incoming);
+        m_retainedDirtyRangesSorted = false;
     }
 
     UploadPolicyConfig m_config{};
@@ -325,6 +366,11 @@ private:
     uint64_t m_coalescedStagedBytes = 0;
     std::vector<uint8_t> m_retainedBytes;
     std::vector<DirtyRange> m_retainedDirtyRanges;
+    bool m_retainedDirtyRangesSorted = true;
+    uint64_t m_retainedStagedWrites = 0;
+    uint64_t m_retainedStagedBytes = 0;
+    uint64_t m_retainedOverlapEvents = 0;
+    uint64_t m_retainedOverlapBytes = 0;
     BufferUploadPolicyStats m_lastFlushStats{};
 };
 

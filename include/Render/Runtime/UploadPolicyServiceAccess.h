@@ -37,6 +37,16 @@ inline void UnregisterUploadPolicyClient(IUploadPolicyClient* client) {
     }
 }
 
+inline void MarkUploadPolicyClientDirty(IUploadPolicyClient* client) {
+    if (!client) {
+        return;
+    }
+
+    if (auto* service = GetActiveUploadPolicyService()) {
+        service->MarkClientDirty(client);
+    }
+}
+
 inline void BeginUploadPolicyFrame() {
     if (auto* service = GetActiveUploadPolicyService()) {
         service->BeginFrame();

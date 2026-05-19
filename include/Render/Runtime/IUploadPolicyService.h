@@ -10,6 +10,7 @@ public:
     virtual ~IUploadPolicyClient() = default;
     virtual void OnUploadPolicyBeginFrame() = 0;
     virtual void OnUploadPolicyFlush() = 0;
+    virtual bool HasPendingUploadPolicyWork() const { return false; }
 };
 
 struct UploadPolicyServiceStats {
@@ -27,6 +28,7 @@ public:
 
     virtual void RegisterClient(IUploadPolicyClient* client) = 0;
     virtual void UnregisterClient(IUploadPolicyClient* client) = 0;
+    virtual void MarkClientDirty(IUploadPolicyClient* client) = 0;
 
     virtual void BeginFrame() = 0;
     virtual void FlushAll() = 0;
