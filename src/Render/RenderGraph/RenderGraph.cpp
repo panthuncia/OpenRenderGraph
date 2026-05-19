@@ -1393,6 +1393,15 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 	m_framePassAccessSummaries.resize(m_framePasses.size());
 
 	std::vector<uint8_t> resourcesWrittenThisFrame(m_frameDAGResourceCount, 0);
+	auto schedulingResourceIDForHandle = [&](const ResourceRegistry::RegistryHandle& handle) {
+		Resource* resource = handle.IsEphemeral()
+			? handle.GetEphemeralPtr()
+			: _registry.Resolve(handle);
+		if (auto* dynamicResource = dynamic_cast<DynamicResource*>(resource)) {
+			return dynamicResource->GetDynamicWrapperGlobalResourceID();
+		}
+		return handle.GetGlobalResourceID();
+	};
 
 	for (size_t passIndex = 0; passIndex < m_framePasses.size(); ++passIndex) {
 		const auto& pass = m_framePasses[passIndex];
@@ -1432,7 +1441,7 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 		if (!view.reqs.empty()) {
 			for (const auto& req : view.reqs) {
 				const auto resource = req.resourceHandleAndRange.resource;
-				const uint64_t resourceID = resource.GetGlobalResourceID();
+				const uint64_t resourceID = schedulingResourceIDForHandle(resource);
 				const bool isWrite = AccessTypeIsWriteType(req.state.access);
 				const bool isUAV = IsUAVState(req.state);
 
@@ -1458,7 +1467,7 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 		if (view.internalTransitions) {
 			for (const auto& transition : *view.internalTransitions) {
 				const auto resource = transition.first.resource;
-				const uint64_t resourceID = resource.GetGlobalResourceID();
+				const uint64_t resourceID = schedulingResourceIDForHandle(resource);
 
 				summary.internalTransitionSummaries.push_back(FramePassInternalTransitionStaticSummary{
 					.resource = resource,
@@ -2881,7 +2890,7 @@ void RenderGraph::AddTransitionSlowPath(
 	scratchTransitions.clear();
 	auto& transitions = scratchTransitions;
 	auto* pRes = resource.IsEphemeral() ? resource.GetEphemeralPtr() : _registry.Resolve(resource); // TODO: Can we get rid of pRes in transitions?
-	auto& compileResourceState = GetOrCreateFrameCompileResourceState(requirement.resourceIndex, pRes, resource.GetGlobalResourceID());
+	auto& compileResourceState = GetOrCreateFrameCompileResourceState(requirement.resourceIndex, pRes, requirement.resourceID);
 	pRes = compileResourceState.resource ? compileResourceState.resource : pRes;
 	auto& fastState = compileResourceState.fastState;
 	if (pRes && !pRes->GetName().empty()) {
@@ -2889,14 +2898,14 @@ void RenderGraph::AddTransitionSlowPath(
 	}
 	AddTransitionDebugStats* debugStats = nullptr;
 	if (m_getRenderGraphBatchTraceEnabled && m_getRenderGraphBatchTraceEnabled()) {
-		auto [it, inserted] = m_addTransitionDebugStatsByResource.try_emplace(resource.GetGlobalResourceID());
+		auto [it, inserted] = m_addTransitionDebugStatsByResource.try_emplace(requirement.resourceID);
 		(void)inserted;
 		debugStats = &it->second;
 		if (debugStats->resourceName.empty() || debugStats->resourceName == "<unknown>") {
 			if (pRes && !pRes->GetName().empty()) {
 				debugStats->resourceName = pRes->GetName();
 			}
-			else if (auto resourceIt = resourcesByID.find(resource.GetGlobalResourceID());
+			else if (auto resourceIt = resourcesByID.find(requirement.resourceID);
 				resourceIt != resourcesByID.end() && resourceIt->second && !resourceIt->second->GetName().empty()) {
 				debugStats->resourceName = resourceIt->second->GetName();
 			}
@@ -2920,7 +2929,7 @@ void RenderGraph::AddTransitionSlowPath(
 		// Common counts as write for alias activation, as this is generally used to indicate that the resource will be
 		// transitioned internally by an external system that still uses legacy barriers. Don't abuse this.
 		if (firstUseIsWrite || firstUseIsCommon) { 
-			const uint64_t id = resource.GetGlobalResourceID();
+			const uint64_t id = requirement.resourceID;
 			auto itSig = aliasPlacementSignatureByID.find(id);
 			ResourceState activationBeforeState{
 				rhi::ResourceAccessType::None,
@@ -2962,7 +2971,7 @@ void RenderGraph::AddTransitionSlowPath(
 		}
 		std::vector<ResourceTransition> ignored;
 		compileTracker.Apply(requirement.range, pRes, requiredState, ignored);
-		aliasActivationPending.erase(resource.GetGlobalResourceID());
+		aliasActivationPending.erase(requirement.resourceID);
 		m_aliasActivationPendingByResourceIndex[requirement.resourceIndex] = 0;
 	}
 	else {
@@ -2987,7 +2996,7 @@ void RenderGraph::AddTransitionSlowPath(
 	}
 
 	if (!transitions.empty()) {
-		outTransitionedResourceIDs.insert(resource.GetGlobalResourceID());
+		outTransitionedResourceIDs.insert(requirement.resourceID);
 	}
 
 	currentBatch.passBatchTrackersByResourceIndex[requirement.resourceIndex] = &compileTracker; // We will need to check subsequent passes against this
@@ -3332,6 +3341,7 @@ void RenderGraph::ShutdownOwnedState() {
 	resourcesByID.clear();
 	resourcesByName.clear();
 	m_transientFrameResourcesByID.clear();
+	m_dynamicResourcesByStableID.clear();
 	m_transientFrameResourcesByName.clear();
 	resourceBackingGenerationByID.clear();
 	resourceIdleFrameCounts.clear();
@@ -3499,8 +3509,24 @@ void RenderGraph::RebuildFrameCompileResources() {
 	m_frameCompileResources.clear();
 	m_frameCompileResources.resize(m_frameSchedulingResourceCount);
 
+	std::vector<uint64_t> preferredDynamicStableIDByIndex(m_frameSchedulingResourceCount, 0);
+	for (const auto& [stableID, resource] : m_dynamicResourcesByStableID) {
+		if (!resource) {
+			continue;
+		}
+		auto resourceIndex = TryGetFrameSchedulingResourceIndex(stableID);
+		if (resourceIndex.has_value() && *resourceIndex < preferredDynamicStableIDByIndex.size()) {
+			preferredDynamicStableIDByIndex[*resourceIndex] = stableID;
+		}
+	}
+
 	for (const auto& [resourceID, resourceIndex] : m_frameSchedulingResourceIndexByID) {
 		if (resourceIndex >= m_frameCompileResources.size()) {
+			continue;
+		}
+		if (resourceIndex < preferredDynamicStableIDByIndex.size()
+			&& preferredDynamicStableIDByIndex[resourceIndex] != 0
+			&& preferredDynamicStableIDByIndex[resourceIndex] != resourceID) {
 			continue;
 		}
 
@@ -3645,6 +3671,21 @@ void RenderGraph::RebuildFrameSchedulingResourceIndex(const std::unordered_set<u
 		registerResourceID(resourceID);
 		for (uint64_t equivalentID : GetSchedulingEquivalentIDsCached(resourceID)) {
 			registerResourceID(equivalentID);
+		}
+	}
+
+	for (const auto& [stableID, resource] : m_dynamicResourcesByStableID) {
+		if (!resource) {
+			continue;
+		}
+		const uint64_t backingID = resource->GetGlobalResourceID();
+		auto stableIt = m_frameSchedulingResourceIndexByID.find(stableID);
+		auto backingIt = m_frameSchedulingResourceIndexByID.find(backingID);
+		if (stableIt != m_frameSchedulingResourceIndexByID.end()) {
+			m_frameSchedulingResourceIndexByID[backingID] = stableIt->second;
+		}
+		else if (backingIt != m_frameSchedulingResourceIndexByID.end()) {
+			m_frameSchedulingResourceIndexByID[stableID] = backingIt->second;
 		}
 	}
 
@@ -5643,7 +5684,7 @@ void RenderGraph::EvictOldReplaySegmentVariants(uint64_t frameIndex, ReplaySegme
 {
 	ZoneScopedN("RenderGraph::EvictOldReplaySegmentVariants");
 	constexpr uint64_t kMaxReplaySegmentVariantAgeFrames = 240;
-	constexpr size_t kMaxReplaySegmentVariantsPerKey = 4;
+	constexpr size_t kMaxReplaySegmentVariantsPerKey = 16;
 	constexpr size_t kMaxReplaySegmentCacheEntries = 256;
 
 	for (auto& entry : m_regionCache.replaySegmentEntries) {
@@ -5657,10 +5698,12 @@ void RenderGraph::EvictOldReplaySegmentVariants(uint64_t frameIndex, ReplaySegme
 		stats.evicted += oldSize - entry.variants.size();
 		if (entry.variants.size() > kMaxReplaySegmentVariantsPerKey) {
 			std::sort(entry.variants.begin(), entry.variants.end(), [](const auto& lhs, const auto& rhs) {
-				if (lhs.lastSeenFrame != rhs.lastSeenFrame) {
-					return lhs.lastSeenFrame > rhs.lastSeenFrame;
+				const uint64_t lhsUseScore = lhs.hitCount + lhs.seenCount;
+				const uint64_t rhsUseScore = rhs.hitCount + rhs.seenCount;
+				if (lhsUseScore != rhsUseScore) {
+					return lhsUseScore > rhsUseScore;
 				}
-				return lhs.hitCount > rhs.hitCount;
+				return lhs.lastSeenFrame > rhs.lastSeenFrame;
 			});
 			stats.evicted += entry.variants.size() - kMaxReplaySegmentVariantsPerKey;
 			entry.variants.resize(kMaxReplaySegmentVariantsPerKey);
@@ -6141,7 +6184,12 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 	ResetFrameQueueBatchHistoryTables();
 	RebuildFrameCompileResources();
 
-	auto resolveTemplateResource = [&](uint64_t resourceID, uint64_t backingResourceID) -> Resource* {
+	auto resolveTemplateResource = [&](uint64_t resourceID, uint64_t backingResourceID, bool dynamicResource) -> Resource* {
+		if (dynamicResource && resourceID != 0) {
+			if (auto resource = GetResourceByID(resourceID)) {
+				return resource.get();
+			}
+		}
 		if (backingResourceID != 0) {
 			if (auto resource = GetResourceByID(backingResourceID)) {
 				return resource.get();
@@ -6155,7 +6203,17 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 		return nullptr;
 	};
 
-	auto resolveTemplateResourceIndex = [&](uint64_t resourceID, uint64_t backingResourceID) -> std::optional<size_t> {
+	auto resolveTemplateResourceIndex = [&](uint64_t resourceID, uint64_t backingResourceID, bool dynamicResource) -> std::optional<size_t> {
+		if (dynamicResource && resourceID != 0) {
+			if (auto resourceIndex = TryGetFrameSchedulingResourceIndex(resourceID)) {
+				return resourceIndex;
+			}
+			if (auto resource = resolveTemplateResource(resourceID, backingResourceID, true)) {
+				if (auto resourceIndex = TryGetFrameSchedulingResourceIndex(resource->GetGlobalResourceID())) {
+					return resourceIndex;
+				}
+			}
+		}
 		if (auto resourceIndex = TryGetFrameSchedulingResourceIndex(resourceID)) {
 			return resourceIndex;
 		}
@@ -6231,7 +6289,7 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 			if (!resourceIndex) {
 				continue;
 			}
-			Resource* resource = resolveTemplateResource(output.resourceID, 0);
+			Resource* resource = resolveTemplateResource(output.resourceID, 0, false);
 			auto* tracker = applyTrackerState(*resourceIndex, output.resourceID, resource, output.range, output.finalState);
 			(void)tracker;
 			auto& compileResourceState = m_frameCompileResources[*resourceIndex];
@@ -6295,7 +6353,7 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 				? input.resource.GetEphemeralPtr()
 				: _registry.Resolve(input.resource);
 			if (resource == nullptr) {
-				resource = resolveTemplateResource(input.resourceID, 0);
+				resource = resolveTemplateResource(input.resourceID, 0, false);
 			}
 
 			const QueueKind queueKind = m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(input.queueSlot));
@@ -6406,10 +6464,10 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 			if (transitionTemplate.queueSlot >= queueCount) {
 				return recomputeTemplateBatch(batchTemplate, "template_transition_queue_out_of_range");
 			}
-			if (resolveTemplateResource(transitionTemplate.resourceID, transitionTemplate.backingResourceID) == nullptr) {
+			if (resolveTemplateResource(transitionTemplate.resourceID, transitionTemplate.backingResourceID, transitionTemplate.dynamicResource) == nullptr) {
 				return recomputeTemplateBatch(batchTemplate, "template_transition_resource_missing");
 			}
-			if (!resolveTemplateResourceIndex(transitionTemplate.resourceID, transitionTemplate.backingResourceID)) {
+			if (!resolveTemplateResourceIndex(transitionTemplate.resourceID, transitionTemplate.backingResourceID, transitionTemplate.dynamicResource)) {
 				return recomputeTemplateBatch(batchTemplate, "template_transition_resource_index_missing");
 			}
 		}
@@ -6441,8 +6499,8 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 			ZoneScopedN("RenderGraph::Replay::ApplyTemplateTransitions");
 			std::vector<ResourceTransition> replayProbeTransitions;
 			for (const auto& transitionTemplate : batchTemplate.transitions) {
-				Resource* resource = resolveTemplateResource(transitionTemplate.resourceID, transitionTemplate.backingResourceID);
-				auto resourceIndex = resolveTemplateResourceIndex(transitionTemplate.resourceID, transitionTemplate.backingResourceID);
+				Resource* resource = resolveTemplateResource(transitionTemplate.resourceID, transitionTemplate.backingResourceID, transitionTemplate.dynamicResource);
+				auto resourceIndex = resolveTemplateResourceIndex(transitionTemplate.resourceID, transitionTemplate.backingResourceID, transitionTemplate.dynamicResource);
 				auto& compileResourceState = GetOrCreateFrameCompileResourceState(
 					*resourceIndex,
 					resource,
@@ -6554,7 +6612,7 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 						? requirement.resource.GetEphemeralPtr()
 						: _registry.Resolve(requirement.resource);
 					if (resource == nullptr) {
-						resource = resolveTemplateResource(requirement.resourceID, 0);
+						resource = resolveTemplateResource(requirement.resourceID, 0, false);
 					}
 					const ResourceState requiredState = NormalizeStateForQueue(passQueue, requirement.state);
 					batch.passBatchTrackersByResourceIndex[requirement.resourceIndex] =
@@ -6862,11 +6920,11 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 					setReason("template_transition_queue_out_of_range");
 					return false;
 				}
-				if (resolveTemplateResource(transitionTemplate.resourceID, transitionTemplate.backingResourceID) == nullptr) {
+				if (resolveTemplateResource(transitionTemplate.resourceID, transitionTemplate.backingResourceID, transitionTemplate.dynamicResource) == nullptr) {
 					setReason("template_transition_resource_missing" + describeTemplateTransition(transitionTemplate));
 					return false;
 				}
-				if (!resolveTemplateResourceIndex(transitionTemplate.resourceID, transitionTemplate.backingResourceID)) {
+				if (!resolveTemplateResourceIndex(transitionTemplate.resourceID, transitionTemplate.backingResourceID, transitionTemplate.dynamicResource)) {
 					setReason("template_transition_resource_index_missing" + describeTemplateTransition(transitionTemplate));
 					return false;
 				}
@@ -8214,15 +8272,29 @@ void RenderGraph::CollectFrameResourceIDs(std::unordered_set<uint64_t>& used) co
 	used.clear();
 	used.reserve(m_framePasses.size() * 4);
 
+	auto insertHandleResourceIDs = [&](const ResourceRegistry::RegistryHandle& handle) {
+		used.insert(handle.GetGlobalResourceID());
+		Resource* resource = handle.IsEphemeral()
+			? handle.GetEphemeralPtr()
+			: const_cast<Resource*>(_registry.Resolve(handle));
+		if (auto* dynamicResource = dynamic_cast<DynamicResource*>(resource)) {
+			used.insert(dynamicResource->GetDynamicWrapperGlobalResourceID());
+			used.insert(dynamicResource->GetGlobalResourceID());
+			if (auto backing = dynamicResource->GetResource()) {
+				used.insert(backing->GetGlobalResourceID());
+			}
+		}
+	};
+
 	for (auto const& pr : m_framePasses) {
 		std::visit([&](auto const& passAndResources) {
 			using T = std::decay_t<decltype(passAndResources)>;
 			if constexpr (!std::is_same_v<T, std::monostate>) {
 				ForEachFrameRequirement(passAndResources.resources, [&](const auto& req) {
-					used.insert(req.resourceHandleAndRange.resource.GetGlobalResourceID());
+					insertHandleResourceIDs(req.resourceHandleAndRange.resource);
 				});
 				for (auto const& t : passAndResources.resources.internalTransitions) {
-					used.insert(t.first.resource.GetGlobalResourceID());
+					insertHandleResourceIDs(t.first.resource);
 				}
 			}
 		}, pr.pass);
@@ -8359,6 +8431,7 @@ void RenderGraph::ResetForRebuild()
 	resourcesByID.clear();
 	resourcesByName.clear();
 	m_transientFrameResourcesByID.clear();
+	m_dynamicResourcesByStableID.clear();
 	m_transientFrameResourcesByName.clear();
 	resourceBackingGenerationByID.clear();
 	resourceIdleFrameCounts.clear();
@@ -10488,7 +10561,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 
 				spdlog::info(
 					"RG compile validation R8 segment_cache frame={} status=observed\n"
-					"  entries={} variants={} inserted={} refreshed={} evicted={} max_variants_per_key=4\n"
+					"  entries={} variants={} inserted={} refreshed={} evicted={} max_variants_per_key=16\n"
 					"  lookup_hits={} lookup_misses={} older_variant_hits={} oldest_hit_age={}\n"
 					"  first_miss=\"{}\"\n"
 					"  first_older_hit=\"{}\"",
@@ -11811,7 +11884,11 @@ std::string RenderGraph::GetTechniquePathForPassName(std::string_view passName) 
 }
 
 void RenderGraph::AddResource(std::shared_ptr<Resource> resource, bool transition) {
-	if (resourcesByID.contains(resource->GetGlobalResourceID())) {
+	const uint64_t resourceID = resource->GetGlobalResourceID();
+	if (auto dynamicResource = std::dynamic_pointer_cast<DynamicResource>(resource)) {
+		m_dynamicResourcesByStableID[dynamicResource->GetDynamicWrapperGlobalResourceID()] = resource;
+	}
+	if (resourcesByID.contains(resourceID)) {
 		return; // Resource already added
 	}
 	auto& name = resource->GetName();
@@ -11827,7 +11904,7 @@ void RenderGraph::AddResource(std::shared_ptr<Resource> resource, bool transitio
 #endif
 
 	resourcesByName[name] = resource;
-	resourcesByID[resource->GetGlobalResourceID()] = resource;
+	resourcesByID[resourceID] = resource;
 	if (traceLifecycle) {
 		const char* resourceType = "Resource";
 		if (std::dynamic_pointer_cast<PixelBuffer>(resource)) {
@@ -11840,7 +11917,7 @@ void RenderGraph::AddResource(std::shared_ptr<Resource> resource, bool transitio
 			"RenderGraph::AddResource type={} name='{}' id={} transition={}",
 			resourceType,
 			name,
-			resource->GetGlobalResourceID(),
+			resourceID,
 			transition);
 	}
 
@@ -11858,6 +11935,9 @@ void RenderGraph::TrackTransientFrameResource(const std::shared_ptr<Resource>& r
 	}
 
 	const uint64_t resourceID = resource->GetGlobalResourceID();
+	if (auto dynamicResource = std::dynamic_pointer_cast<DynamicResource>(resource)) {
+		m_dynamicResourcesByStableID[dynamicResource->GetDynamicWrapperGlobalResourceID()] = resource;
+	}
 	if (resourcesByID.contains(resourceID)) {
 		return;
 	}
@@ -11895,6 +11975,10 @@ std::shared_ptr<Resource> RenderGraph::GetResourceByID(const uint64_t id) {
 	auto transientIt = m_transientFrameResourcesByID.find(id);
 	if (transientIt != m_transientFrameResourcesByID.end()) {
 		return transientIt->second;
+	}
+	auto dynamicIt = m_dynamicResourcesByStableID.find(id);
+	if (dynamicIt != m_dynamicResourcesByStableID.end()) {
+		return dynamicIt->second;
 	}
 	auto it = resourcesByID.find(id);
 	if (it != resourcesByID.end()) {
@@ -14626,6 +14710,9 @@ void RenderGraph::RegisterResolver(ResourceIdentifier id, const std::shared_ptr<
 	for (const auto& resource : resolver->Resolve()) {
 		if (resource) {
 			resourcesByID[resource->GetGlobalResourceID()] = resource;
+			if (auto dynamicResource = std::dynamic_pointer_cast<DynamicResource>(resource)) {
+				m_dynamicResourcesByStableID[dynamicResource->GetDynamicWrapperGlobalResourceID()] = resource;
+			}
 			// Anonymous registration
 			_registry.RegisterAnonymous(resource);
 		}
