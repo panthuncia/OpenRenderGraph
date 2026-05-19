@@ -2251,11 +2251,36 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 
 	auto closeBatch = [&]() {
 		ZoneScopedN("RenderGraph::AutoScheduleAndBuildBatches::CloseBatch");
+		bool hasAnyQueuedPasses = false;
+		for (size_t queueIndex = 0; queueIndex < queueCount; ++queueIndex) {
+			hasAnyQueuedPasses = hasAnyQueuedPasses || !currentBatch.Passes(queueIndex).empty();
+		}
+		if (!hasAnyQueuedPasses) {
+			return;
+		}
 		rg.batches.push_back(std::move(currentBatch));
 		currentBatch = openNewBatch();
 		batchBuildState.ResetForNewBatch();
 		++currentBatchIndex;
 		};
+
+	auto passHasImmediateWork = [](const AnyPassAndResources& any) {
+		return std::visit(
+			[](const auto& passEntry) -> bool {
+				using T = std::decay_t<decltype(passEntry)>;
+				if constexpr (std::is_same_v<T, std::monostate>) {
+					return true;
+				}
+				else {
+					return passEntry.run != PassRunMask::Retained || !passEntry.immediateBytecode.empty();
+				}
+			},
+			any.pass);
+	};
+
+	auto passForcesBatchIsolation = [&](size_t passIndex) {
+		return passIndex >= passes.size() || passHasImmediateWork(passes[passIndex]);
+	};
 
 	auto updateBatchMembershipForCommittedPass = [&](const Node& committedNode) {
 		const auto& passSummary = rg.m_framePassSchedulingSummaries[committedNode.passIndex];
@@ -2448,6 +2473,11 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 				if (n.passIndex < rg.m_assignedQueueSlotsByFramePass.size()) {
 					rg.m_assignedQueueSlotsByFramePass[n.passIndex] = *n.assignedQueueSlot;
 				}
+				const bool isolateBatch = passForcesBatchIsolation(n.passIndex);
+				if (isolateBatch) {
+					closeBatch();
+					closedBatchBeforeNextCommit = true;
+				}
 				rg.m_schedulingDecisionTrace.push_back(SchedulingDecisionTrace{
 					.nodeIndex = static_cast<uint32_t>(ni),
 					.passIndex = static_cast<uint32_t>(n.passIndex),
@@ -2469,6 +2499,10 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 				updateBatchMembershipForCommittedPass(n);
 
 				batchBuildState.MarkNode(ni);
+				if (isolateBatch) {
+					closeBatch();
+					closedBatchBeforeNextCommit = true;
+				}
 
 				// Pop from ready
 				ready[0] = ready.back();
@@ -2497,6 +2531,11 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 			if (chosen.passIndex < rg.m_assignedQueueSlotsByFramePass.size()) {
 				rg.m_assignedQueueSlotsByFramePass[chosen.passIndex] = bestQueueSlot;
 			}
+			const bool isolateBatch = passForcesBatchIsolation(chosen.passIndex);
+			if (isolateBatch) {
+				closeBatch();
+				closedBatchBeforeNextCommit = true;
+			}
 			rg.m_schedulingDecisionTrace.push_back(SchedulingDecisionTrace{
 				.nodeIndex = static_cast<uint32_t>(chosenNodeIndex),
 				.passIndex = static_cast<uint32_t>(chosen.passIndex),
@@ -2516,6 +2555,10 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 				scratchFallback,
 				scratchTransitions);
 			updateBatchMembershipForCommittedPass(chosen);
+			if (isolateBatch) {
+				closeBatch();
+				closedBatchBeforeNextCommit = true;
+			}
 		}
 
 		batchBuildState.MarkNode(chosenNodeIndex);
@@ -4150,6 +4193,11 @@ void RenderGraph::ExtractScheduleRegionsFromAuthoritativeCompile(
 			outReason = RegionRejectReason::ImmediateWork;
 			return true;
 		}
+		if (passIndex < m_framePassIsFrameExtension.size()
+			&& m_framePassIsFrameExtension[passIndex] != 0) {
+			outReason = RegionRejectReason::FrameExtensionPass;
+			return true;
+		}
 		return false;
 	};
 
@@ -5683,52 +5731,121 @@ RenderGraph::ReplaySegmentCacheUpdateStats RenderGraph::SummarizeReplaySegmentVa
 void RenderGraph::EvictOldReplaySegmentVariants(uint64_t frameIndex, ReplaySegmentCacheUpdateStats& stats)
 {
 	ZoneScopedN("RenderGraph::EvictOldReplaySegmentVariants");
-	constexpr uint64_t kMaxReplaySegmentVariantAgeFrames = 240;
-	constexpr size_t kMaxReplaySegmentVariantsPerKey = 16;
-	constexpr size_t kMaxReplaySegmentCacheEntries = 256;
+	const uint64_t maxVariantAgeFrames = m_renderGraphSettingsService
+		? static_cast<uint64_t>(m_renderGraphSettingsService->GetRenderGraphReplaySegmentCacheMaxAgeFrames())
+		: 0ull;
+	const size_t maxVariantsPerKey = m_renderGraphSettingsService
+		? static_cast<size_t>(m_renderGraphSettingsService->GetRenderGraphReplaySegmentCacheMaxVariantsPerKey())
+		: 32ull;
+	const size_t maxCacheEntries = m_renderGraphSettingsService
+		? static_cast<size_t>(m_renderGraphSettingsService->GetRenderGraphReplaySegmentCacheMaxEntries())
+		: 256ull;
+	const size_t maxTotalVariants = m_renderGraphSettingsService
+		? static_cast<size_t>(m_renderGraphSettingsService->GetRenderGraphReplaySegmentCacheMaxVariants())
+		: 128ull;
+	const size_t effectiveMaxVariantsPerKey = (std::max)(size_t{ 1 }, maxVariantsPerKey);
+	const size_t effectiveMaxCacheEntries = (std::max)(size_t{ 1 }, maxCacheEntries);
+	const size_t effectiveMaxTotalVariants = (std::max)(size_t{ 1 }, maxTotalVariants);
+
+	auto variantUseScore = [](const CachedReplaySegmentVariant& variant) {
+		return variant.hitCount + variant.seenCount;
+	};
+	auto newestSeen = [](const ReplaySegmentCacheEntry& entry) {
+		uint64_t newest = 0;
+		for (const auto& variant : entry.variants) {
+			newest = (std::max)(newest, variant.lastSeenFrame);
+		}
+		return newest;
+	};
+	auto totalVariantCount = [&]() {
+		size_t total = 0;
+		for (const auto& entry : m_regionCache.replaySegmentEntries) {
+			total += entry.variants.size();
+		}
+		return total;
+	};
+	auto eraseEmptyEntries = [&]() {
+		m_regionCache.replaySegmentEntries.erase(
+			std::remove_if(m_regionCache.replaySegmentEntries.begin(), m_regionCache.replaySegmentEntries.end(), [](const ReplaySegmentCacheEntry& entry) {
+				return entry.variants.empty();
+			}),
+			m_regionCache.replaySegmentEntries.end());
+	};
+	auto evictOldestVariant = [&]() -> bool {
+		size_t bestEntryIndex = std::numeric_limits<size_t>::max();
+		size_t bestVariantIndex = std::numeric_limits<size_t>::max();
+		for (size_t entryIndex = 0; entryIndex < m_regionCache.replaySegmentEntries.size(); ++entryIndex) {
+			const auto& entry = m_regionCache.replaySegmentEntries[entryIndex];
+			for (size_t variantIndex = 0; variantIndex < entry.variants.size(); ++variantIndex) {
+				const auto& candidate = entry.variants[variantIndex];
+				if (bestEntryIndex == std::numeric_limits<size_t>::max()) {
+					bestEntryIndex = entryIndex;
+					bestVariantIndex = variantIndex;
+					continue;
+				}
+				const auto& best = m_regionCache.replaySegmentEntries[bestEntryIndex].variants[bestVariantIndex];
+				if (candidate.lastSeenFrame != best.lastSeenFrame) {
+					if (candidate.lastSeenFrame < best.lastSeenFrame) {
+						bestEntryIndex = entryIndex;
+						bestVariantIndex = variantIndex;
+					}
+					continue;
+				}
+				if (variantUseScore(candidate) < variantUseScore(best)) {
+					bestEntryIndex = entryIndex;
+					bestVariantIndex = variantIndex;
+				}
+			}
+		}
+		if (bestEntryIndex == std::numeric_limits<size_t>::max()) {
+			return false;
+		}
+		auto& variants = m_regionCache.replaySegmentEntries[bestEntryIndex].variants;
+		variants.erase(variants.begin() + static_cast<std::ptrdiff_t>(bestVariantIndex));
+		++stats.evicted;
+		return true;
+	};
 
 	for (auto& entry : m_regionCache.replaySegmentEntries) {
-		const auto oldSize = entry.variants.size();
-		entry.variants.erase(
-			std::remove_if(entry.variants.begin(), entry.variants.end(), [&](const CachedReplaySegmentVariant& variant) {
-				return frameIndex > variant.lastSeenFrame
-					&& frameIndex - variant.lastSeenFrame > kMaxReplaySegmentVariantAgeFrames;
-			}),
-			entry.variants.end());
-		stats.evicted += oldSize - entry.variants.size();
-		if (entry.variants.size() > kMaxReplaySegmentVariantsPerKey) {
+		if (maxVariantAgeFrames > 0) {
+			const auto oldSize = entry.variants.size();
+			entry.variants.erase(
+				std::remove_if(entry.variants.begin(), entry.variants.end(), [&](const CachedReplaySegmentVariant& variant) {
+					return frameIndex > variant.lastSeenFrame
+						&& frameIndex - variant.lastSeenFrame > maxVariantAgeFrames;
+				}),
+				entry.variants.end());
+			stats.evicted += oldSize - entry.variants.size();
+		}
+		if (entry.variants.size() > effectiveMaxVariantsPerKey) {
 			std::sort(entry.variants.begin(), entry.variants.end(), [](const auto& lhs, const auto& rhs) {
-				const uint64_t lhsUseScore = lhs.hitCount + lhs.seenCount;
-				const uint64_t rhsUseScore = rhs.hitCount + rhs.seenCount;
-				if (lhsUseScore != rhsUseScore) {
-					return lhsUseScore > rhsUseScore;
+				if (lhs.lastSeenFrame != rhs.lastSeenFrame) {
+					return lhs.lastSeenFrame > rhs.lastSeenFrame;
 				}
-				return lhs.lastSeenFrame > rhs.lastSeenFrame;
+				return lhs.hitCount + lhs.seenCount > rhs.hitCount + rhs.seenCount;
 			});
-			stats.evicted += entry.variants.size() - kMaxReplaySegmentVariantsPerKey;
-			entry.variants.resize(kMaxReplaySegmentVariantsPerKey);
+			stats.evicted += entry.variants.size() - effectiveMaxVariantsPerKey;
+			entry.variants.resize(effectiveMaxVariantsPerKey);
 		}
 	}
 
-	m_regionCache.replaySegmentEntries.erase(
-		std::remove_if(m_regionCache.replaySegmentEntries.begin(), m_regionCache.replaySegmentEntries.end(), [](const ReplaySegmentCacheEntry& entry) {
-			return entry.variants.empty();
-		}),
-		m_regionCache.replaySegmentEntries.end());
+	eraseEmptyEntries();
 
-	if (m_regionCache.replaySegmentEntries.size() > kMaxReplaySegmentCacheEntries) {
-		std::sort(m_regionCache.replaySegmentEntries.begin(), m_regionCache.replaySegmentEntries.end(), [](const auto& lhs, const auto& rhs) {
-			auto newestSeen = [](const ReplaySegmentCacheEntry& entry) {
-				uint64_t newest = 0;
-				for (const auto& variant : entry.variants) {
-					newest = std::max(newest, variant.lastSeenFrame);
-				}
-				return newest;
-			};
-			return newestSeen(lhs) > newestSeen(rhs);
+	while (totalVariantCount() > effectiveMaxTotalVariants && evictOldestVariant()) {
+		eraseEmptyEntries();
+	}
+
+	if (m_regionCache.replaySegmentEntries.size() > effectiveMaxCacheEntries) {
+		std::sort(m_regionCache.replaySegmentEntries.begin(), m_regionCache.replaySegmentEntries.end(), [&](const auto& lhs, const auto& rhs) {
+			const uint64_t lhsNewestSeen = newestSeen(lhs);
+			const uint64_t rhsNewestSeen = newestSeen(rhs);
+			if (lhsNewestSeen != rhsNewestSeen) {
+				return lhsNewestSeen > rhsNewestSeen;
+			}
+			return lhs.variants.size() > rhs.variants.size();
 		});
-		stats.evicted += m_regionCache.replaySegmentEntries.size() - kMaxReplaySegmentCacheEntries;
-		m_regionCache.replaySegmentEntries.resize(kMaxReplaySegmentCacheEntries);
+		stats.evicted += m_regionCache.replaySegmentEntries.size() - effectiveMaxCacheEntries;
+		m_regionCache.replaySegmentEntries.resize(effectiveMaxCacheEntries);
 	}
 }
 
@@ -6809,6 +6926,24 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 		currentBatchIndex = static_cast<unsigned int>(batches.size());
 	};
 
+	auto passHasImmediateWork = [](const AnyPassAndResources& any) {
+		return std::visit(
+			[](const auto& passEntry) -> bool {
+				using T = std::decay_t<decltype(passEntry)>;
+				if constexpr (std::is_same_v<T, std::monostate>) {
+					return true;
+				}
+				else {
+					return passEntry.run != PassRunMask::Retained || !passEntry.immediateBytecode.empty();
+				}
+			},
+			any.pass);
+	};
+
+	auto passForcesBatchIsolation = [&](size_t passIndex) {
+		return passIndex >= framePasses.size() || passHasImmediateWork(framePasses[passIndex]);
+	};
+
 	auto updateBatchMembershipForCommittedPass = [&](const Node& committedNode) {
 		const auto& passSummary = m_framePassSchedulingSummaries[committedNode.passIndex];
 		for (size_t resourceIndex : passSummary.requiredResourceIndices) {
@@ -6944,6 +7079,45 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 					setReason("template_pass_out_of_range");
 					return false;
 				}
+			}
+		}
+		return true;
+	};
+	auto segmentTemplateWaitSourcesAvailable = [&](const CachedReplaySegment& segment, std::string* outReason) {
+		auto setReason = [&](std::string reason) {
+			if (outReason && outReason->empty()) {
+				*outReason = std::move(reason);
+			}
+		};
+		std::vector<uint8_t> sourceSignalAvailable(queueCount, 0);
+		for (size_t queueIndex = 0; queueIndex < queueCount; ++queueIndex) {
+			sourceSignalAvailable[queueIndex] = latestSignalFenceByQueue[queueIndex] != 0 ? 1 : 0;
+		}
+		for (size_t batchIndex = 0; batchIndex < segment.batchTemplates.size(); ++batchIndex) {
+			const auto& batchTemplate = segment.batchTemplates[batchIndex];
+			for (const auto& wait : batchTemplate.waits) {
+				if (wait.dstQueue >= queueCount || wait.srcQueue >= queueCount) {
+					setReason("template_wait_queue_out_of_range");
+					return false;
+				}
+				if (!sourceSignalAvailable[wait.srcQueue]) {
+					std::ostringstream oss;
+					oss << "template_wait_missing_source_signal_dependency"
+						<< " local_batch=" << batchIndex
+						<< " original_batch=" << batchTemplate.originalBatchIndexAtExtraction
+						<< " dst_queue=" << wait.dstQueue
+						<< " src_queue=" << wait.srcQueue
+						<< " phase=" << static_cast<uint32_t>(wait.phase);
+					setReason(oss.str());
+					return false;
+				}
+			}
+			for (const auto& signal : batchTemplate.signals) {
+				if (signal.queueSlot >= queueCount) {
+					setReason("template_signal_queue_out_of_range");
+					return false;
+				}
+				sourceSignalAvailable[signal.queueSlot] = 1;
 			}
 		}
 		return true;
@@ -7115,6 +7289,16 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 			lastSegmentReadinessFailure.clear();
 
 			closeCurrentBatch();
+			std::string waitDependencyFailure;
+			if (!segmentTemplateWaitSourcesAvailable(*segmentIt->second, &waitDependencyFailure)) {
+				replayRejectedSegmentFirstNodes.insert(firstNodeIndex);
+				if (firstReadinessFailureThisAttempt.empty()) {
+					firstReadinessFailureThisAttempt = waitDependencyFailure.empty()
+						? "segment_template_wait_dependency_unavailable"
+						: waitDependencyFailure;
+				}
+				continue;
+			}
 			if (!commitSegment(*segmentIt->second)) {
 				return false;
 			}
@@ -7359,6 +7543,11 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 			if (!framePasses[chosen.passIndex].name.empty()) {
 				ZoneText(framePasses[chosen.passIndex].name.data(), framePasses[chosen.passIndex].name.size());
 			}
+			const bool isolateBatch = passForcesBatchIsolation(chosen.passIndex);
+			if (isolateBatch) {
+				closeCurrentBatch();
+				closedBatchBeforeNextCommit = true;
+			}
 			applyPendingSegmentInputWaits(currentBatch);
 			chosen.assignedQueueSlot = bestQueueSlot;
 			if (chosen.passIndex < m_assignedQueueSlotsByFramePass.size()) {
@@ -7386,6 +7575,10 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 				scratchFallback,
 				scratchTransitions);
 			updateBatchMembershipForCommittedPass(chosen);
+			if (isolateBatch) {
+				closeCurrentBatch();
+				closedBatchBeforeNextCommit = true;
+			}
 		}
 
 		batchBuildState.MarkNode(chosenNodeIndex);
@@ -10561,7 +10754,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 
 				spdlog::info(
 					"RG compile validation R8 segment_cache frame={} status=observed\n"
-					"  entries={} variants={} inserted={} refreshed={} evicted={} max_variants_per_key=16\n"
+					"  entries={} variants={} inserted={} refreshed={} evicted={} max_entries={} max_variants={} max_variants_per_key={} max_age_frames={}\n"
 					"  lookup_hits={} lookup_misses={} older_variant_hits={} oldest_hit_age={}\n"
 					"  first_miss=\"{}\"\n"
 					"  first_older_hit=\"{}\"",
@@ -10571,6 +10764,10 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 					cacheUpdateStats.inserted,
 					cacheUpdateStats.refreshed,
 					cacheUpdateStats.evicted,
+					m_renderGraphSettingsService ? m_renderGraphSettingsService->GetRenderGraphReplaySegmentCacheMaxEntries() : 256u,
+					m_renderGraphSettingsService ? m_renderGraphSettingsService->GetRenderGraphReplaySegmentCacheMaxVariants() : 128u,
+					m_renderGraphSettingsService ? m_renderGraphSettingsService->GetRenderGraphReplaySegmentCacheMaxVariantsPerKey() : 32u,
+					m_renderGraphSettingsService ? m_renderGraphSettingsService->GetRenderGraphReplaySegmentCacheMaxAgeFrames() : 0u,
 					cacheUpdateStats.lookupHits,
 					cacheUpdateStats.lookupMisses,
 					cacheUpdateStats.olderVariantHits,

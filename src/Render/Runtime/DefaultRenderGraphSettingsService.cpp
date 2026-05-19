@@ -115,6 +115,22 @@ public:
         return GetOpenRenderGraphSettings().renderGraphRegionShadowStrictBatchMatch;
     }
 
+    uint32_t GetRenderGraphReplaySegmentCacheMaxEntries() const override {
+        return GetOpenRenderGraphSettings().renderGraphReplaySegmentCacheMaxEntries;
+    }
+
+    uint32_t GetRenderGraphReplaySegmentCacheMaxVariants() const override {
+        return GetOpenRenderGraphSettings().renderGraphReplaySegmentCacheMaxVariants;
+    }
+
+    uint32_t GetRenderGraphReplaySegmentCacheMaxVariantsPerKey() const override {
+        return GetOpenRenderGraphSettings().renderGraphReplaySegmentCacheMaxVariantsPerKey;
+    }
+
+    uint32_t GetRenderGraphReplaySegmentCacheMaxAgeFrames() const override {
+        return GetOpenRenderGraphSettings().renderGraphReplaySegmentCacheMaxAgeFrames;
+    }
+
     bool GetHeavyDebug() const override {
         return GetOpenRenderGraphSettings().heavyDebug;
     }

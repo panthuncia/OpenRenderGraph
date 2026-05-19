@@ -38,6 +38,10 @@ public:
     virtual uint32_t GetRenderGraphRegionMinPassCount() const = 0;
     virtual bool GetRenderGraphRegionDiagnosticsEnabled() const = 0;
     virtual bool GetRenderGraphRegionShadowStrictBatchMatch() const = 0;
+    virtual uint32_t GetRenderGraphReplaySegmentCacheMaxEntries() const = 0;
+    virtual uint32_t GetRenderGraphReplaySegmentCacheMaxVariants() const = 0;
+    virtual uint32_t GetRenderGraphReplaySegmentCacheMaxVariantsPerKey() const = 0;
+    virtual uint32_t GetRenderGraphReplaySegmentCacheMaxAgeFrames() const = 0;
     virtual bool GetHeavyDebug() const = 0;
 };
 
