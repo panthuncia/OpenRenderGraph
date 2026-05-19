@@ -5277,10 +5277,6 @@ RenderGraph::ReplaySegmentValidationStats RenderGraph::ValidateCachedSegmentsAga
 			reason = ReplaySegmentInvalidationReason::QueueAssignmentChanged;
 			detail = "queue_hash";
 		}
-		else if (previous.fingerprint.aliasHash != current.fingerprint.aliasHash) {
-			reason = ReplaySegmentInvalidationReason::AliasPlacementChanged;
-			detail = "alias_hash";
-		}
 		else if (previous.fingerprint.boundaryHash != current.fingerprint.boundaryHash) {
 			reason = ReplaySegmentInvalidationReason::BoundaryChanged;
 			detail = "boundary_hash";
@@ -5414,6 +5410,8 @@ RenderGraph::ReplaySegmentVariantKey RenderGraph::BuildReplaySegmentVariantKey(c
 		.declarationHash = segment.fingerprint.declarationHash,
 		.accessHash = segment.fingerprint.accessHash,
 		.queueHash = segment.fingerprint.queueHash,
+		// Kept for diagnostics, but replay lookup intentionally does not require equality here.
+		// Alias pool placement can churn while the boundary and transition template remain replayable.
 		.aliasHash = segment.fingerprint.aliasHash,
 		.hardBoundaryHash = hardBoundaryHash,
 		.hardTemplateHash = hardTemplateHash,
@@ -5509,7 +5507,6 @@ bool RenderGraph::ReplaySegmentHardReplayMatches(const CachedReplaySegment& cach
 	return cached.fingerprint.declarationHash == current.fingerprint.declarationHash
 		&& cached.fingerprint.accessHash == current.fingerprint.accessHash
 		&& cached.fingerprint.queueHash == current.fingerprint.queueHash
-		&& cached.fingerprint.aliasHash == current.fingerprint.aliasHash
 		&& ReplaySegmentBoundaryEdgesMatch(cached, current)
 		&& ReplaySegmentHardTemplateMatches(cached, current);
 }
@@ -5674,7 +5671,6 @@ RenderGraph::ReplaySegmentLookupResult RenderGraph::LookupCachedReplaySegmentVar
 		if (variant.variantKey.declarationHash != currentVariantKey.declarationHash
 			|| variant.variantKey.accessHash != currentVariantKey.accessHash
 			|| variant.variantKey.queueHash != currentVariantKey.queueHash
-			|| variant.variantKey.aliasHash != currentVariantKey.aliasHash
 			|| variant.variantKey.hardBoundaryHash != currentVariantKey.hardBoundaryHash
 			|| variant.variantKey.hardTemplateHash != currentVariantKey.hardTemplateHash
 			|| !ReplaySegmentHardReplayMatches(variant.segment, currentSegment)) {
@@ -5874,7 +5870,6 @@ RenderGraph::ReplaySegmentCacheUpdateStats RenderGraph::InsertOrRefreshReplaySeg
 			return variant.variantKey.declarationHash == variantKey.declarationHash
 				&& variant.variantKey.accessHash == variantKey.accessHash
 				&& variant.variantKey.queueHash == variantKey.queueHash
-				&& variant.variantKey.aliasHash == variantKey.aliasHash
 				&& variant.variantKey.hardBoundaryHash == variantKey.hardBoundaryHash
 				&& variant.variantKey.hardTemplateHash == variantKey.hardTemplateHash
 				&& ReplaySegmentHardReplayMatches(variant.segment, segment);
@@ -6183,7 +6178,6 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::BuildShadowReplaySched
 		if (previous.fingerprint.declarationHash != current.fingerprint.declarationHash
 			|| previous.fingerprint.accessHash != current.fingerprint.accessHash
 			|| previous.fingerprint.queueHash != current.fingerprint.queueHash
-			|| previous.fingerprint.aliasHash != current.fingerprint.aliasHash
 			|| previous.fingerprint.boundaryHash != current.fingerprint.boundaryHash
 			|| previous.fingerprint.templateShapeHash != current.fingerprint.templateShapeHash) {
 			continue;
@@ -8023,7 +8017,6 @@ void RenderGraph::LogRegionCompileSummary(uint8_t frameIndex, const std::vector<
 			segmentFingerprint = HashCombine64(segmentFingerprint, segment.fingerprint.declarationHash);
 			segmentFingerprint = HashCombine64(segmentFingerprint, segment.fingerprint.accessHash);
 			segmentFingerprint = HashCombine64(segmentFingerprint, segment.fingerprint.queueHash);
-			segmentFingerprint = HashCombine64(segmentFingerprint, segment.fingerprint.aliasHash);
 			segmentFingerprint = HashCombine64(segmentFingerprint, segment.fingerprint.boundaryHash);
 			segmentFingerprint = HashCombine64(segmentFingerprint, segment.fingerprint.templateShapeHash);
 			for (const auto& batchTemplate : segment.batchTemplates) {
@@ -10471,7 +10464,6 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				return previous.fingerprint.declarationHash == current.fingerprint.declarationHash
 					&& previous.fingerprint.accessHash == current.fingerprint.accessHash
 					&& previous.fingerprint.queueHash == current.fingerprint.queueHash
-					&& previous.fingerprint.aliasHash == current.fingerprint.aliasHash
 					&& boundaryEdgesReplayMatch(previous, current)
 					&& hardTemplateReplayMatch(previous, current);
 			};
