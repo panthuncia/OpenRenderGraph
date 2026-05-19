@@ -28,6 +28,7 @@ struct OpenRenderGraphSettings {
     bool renderGraphCompileDumpEnabled = false;
     bool renderGraphVramDumpEnabled = false;
     bool renderGraphBatchTraceEnabled = false;
+    bool renderGraphLightweightCompileSummaryEnabled = false;
     bool readOnlyUniformTransitionElisionEnabled = false;
     uint8_t autoAliasMode = 2;
     uint8_t autoAliasPackingStrategy = 0;

@@ -23,6 +23,10 @@ public:
         return GetOpenRenderGraphSettings().renderGraphBatchTraceEnabled;
     }
 
+    bool GetRenderGraphLightweightCompileSummaryEnabled() const override {
+        return GetOpenRenderGraphSettings().renderGraphLightweightCompileSummaryEnabled;
+    }
+
     bool GetReadOnlyUniformTransitionElisionEnabled() const override {
         return GetOpenRenderGraphSettings().readOnlyUniformTransitionElisionEnabled;
     }

@@ -951,6 +951,8 @@ private:
 		uint16_t queueSlot = 0;
 		bool wholeResource = false;
 		bool aliasActivation = false;
+		bool transitionBeforeState = false;
+		bool transitionDiscard = false;
 		bool readOnlyUniformWeakRequirement = false;
 	};
 
@@ -1432,8 +1434,10 @@ private:
 
 	std::unique_ptr<CommandRecordingManager> m_pCommandRecordingManager;
 	ExecutionSchedule m_executionSchedule;
+	std::unordered_map<uint64_t, uint64_t> m_lastExternalSignalValueByTimeline;
 
 	void BuildExecutionSchedule();
+	void AssignQueueSignalFenceValuesInSubmissionOrder(std::vector<PassBatch>& batchesToAssign);
 	void ResizeQueueParallelVectors();
 	void EnsureMinimumAutomaticSchedulingQueues();
 
@@ -1802,6 +1806,7 @@ private:
 	std::function<bool()> m_getRenderGraphCompileDumpEnabled;
 	std::function<bool()> m_getRenderGraphVramDumpEnabled;
 	std::function<bool()> m_getRenderGraphBatchTraceEnabled;
+	std::function<bool()> m_getRenderGraphLightweightCompileSummaryEnabled;
 	std::function<bool()> m_getReadOnlyUniformTransitionElisionEnabled;
 	std::function<bool()> m_getAutoAliasEnableLogging;
 	std::function<bool()> m_getAutoAliasLogExclusionReasons;
