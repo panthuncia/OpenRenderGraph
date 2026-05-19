@@ -55,6 +55,7 @@ struct OpenRenderGraphSettings {
     uint32_t renderGraphReplaySegmentCacheMaxVariants = 128u;
     uint32_t renderGraphReplaySegmentCacheMaxVariantsPerKey = 32u;
     uint32_t renderGraphReplaySegmentCacheMaxAgeFrames = 0u;
+    bool renderGraphReplayRelaxAliasPlacement = true;
     bool heavyDebug = false;
 };
 

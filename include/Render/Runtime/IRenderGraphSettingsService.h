@@ -42,6 +42,7 @@ public:
     virtual uint32_t GetRenderGraphReplaySegmentCacheMaxVariants() const = 0;
     virtual uint32_t GetRenderGraphReplaySegmentCacheMaxVariantsPerKey() const = 0;
     virtual uint32_t GetRenderGraphReplaySegmentCacheMaxAgeFrames() const = 0;
+    virtual bool GetRenderGraphReplayRelaxAliasPlacement() const = 0;
     virtual bool GetHeavyDebug() const = 0;
 };
 

@@ -785,7 +785,31 @@ void RenderGraph::WriteCompiledGraphDebugDump(uint8_t frameIndex, const std::vec
 			return "PassIndex#" + std::to_string(node.passIndex);
 		};
 
+		auto passNameForIndex = [this](uint32_t passIndex) -> std::string {
+			if (passIndex < m_framePasses.size() && !m_framePasses[passIndex].name.empty()) {
+				return m_framePasses[passIndex].name;
+			}
+			return "PassIndex#" + std::to_string(passIndex);
+		};
+
+		auto resourceLabelForID = [&](uint64_t resourceID) -> std::string {
+			std::ostringstream oss;
+			oss << "id=" << resourceID;
+			auto resourceIt = resourcesByID.find(resourceID);
+			if (resourceIt != resourcesByID.end() && resourceIt->second && !resourceIt->second->GetName().empty()) {
+				oss << " name=\"" << resourceIt->second->GetName() << "\"";
+			}
+			return oss.str();
+		};
+
 		std::ostringstream dump;
+
+		auto appendState = [&](const char* prefix, const ResourceState& state) {
+			dump << prefix
+				 << "access=" << rhi::helpers::ResourceAccessMaskToString(state.access)
+				 << " layout=" << rhi::helpers::ResourceLayoutToString(state.layout)
+				 << " sync=" << rhi::helpers::ResourceSyncToString(state.sync);
+		};
 
 		auto appendPassEntry = [&](size_t passIndex, PassType passType, const auto& passEntry) {
 			const auto& resources = passEntry.resources;
@@ -856,6 +880,111 @@ void RenderGraph::WriteCompiledGraphDebugDump(uint8_t frameIndex, const std::vec
 			dump << queueSlotLabel(queueIndex);
 		}
 		dump << "]\n\n";
+
+		const bool regionDiagnosticsEnabled = m_renderGraphSettingsService
+			? m_renderGraphSettingsService->GetRenderGraphRegionDiagnosticsEnabled()
+			: false;
+		const bool relaxAliasPlacement = m_renderGraphSettingsService
+			? m_renderGraphSettingsService->GetRenderGraphReplayRelaxAliasPlacement()
+			: true;
+
+		dump << "[ReplayDiagnostics]\n";
+		dump << "attempted=" << (m_lastAuthoritativeReplayAttempted ? "true" : "false")
+			 << " succeeded=" << (m_lastAuthoritativeReplaySucceeded ? "true" : "false")
+			 << " segments=" << m_lastAuthoritativeReplaySegments
+			 << " replayed_passes=" << m_lastAuthoritativeReplayPasses
+			 << " dynamic_gap_passes=" << m_lastAuthoritativeReplayDynamicGapPasses
+			 << " region_diagnostics_enabled=" << (regionDiagnosticsEnabled ? "true" : "false")
+			 << " relax_alias_placement=" << (relaxAliasPlacement ? "true" : "false")
+			 << " failure=\"" << m_lastAuthoritativeReplayFailure << "\"\n";
+		dump << "cached_replay_segments=" << m_regionCache.replaySegments.size() << "\n";
+		for (size_t segmentIndex = 0; segmentIndex < m_regionCache.replaySegments.size(); ++segmentIndex) {
+			const auto& segment = m_regionCache.replaySegments[segmentIndex];
+			dump << "  segment[" << segmentIndex << "]"
+				 << " tier1=" << (segment.tier1Eligible ? "true" : "false")
+				 << " traces=" << segment.schedule.firstTraceIndex << "-" << segment.schedule.lastTraceIndex
+				 << " passes=" << segment.schedule.passCount
+				 << " batches=" << segment.schedule.batchCount
+				 << " requirements=" << segment.schedule.requirementCount
+				 << " first=\"" << passNameForIndex(segment.schedule.firstPassIndex) << "\""
+				 << " last=\"" << passNameForIndex(segment.schedule.lastPassIndex) << "\""
+				 << " identity={pass_sequence=0x" << std::hex << segment.identity.passSequenceHash
+				 << " structural=0x" << segment.identity.structuralPositionHash << std::dec
+				 << " pass_count=" << segment.identity.passCount << "}"
+				 << " fingerprints={decl=0x" << std::hex << segment.fingerprint.declarationHash
+				 << " access=0x" << segment.fingerprint.accessHash
+				 << " queue=0x" << segment.fingerprint.queueHash
+				 << " alias=0x" << segment.fingerprint.aliasHash
+				 << " boundary=0x" << segment.fingerprint.boundaryHash
+				 << " template=0x" << segment.fingerprint.templateShapeHash << std::dec << "}\n";
+			dump << "    contract inputs=" << segment.contract.inputRequirements.size()
+				 << " outputs=" << segment.contract.outputStates.size()
+				 << " boundary_edges=" << segment.contract.boundaryEdges.size()
+				 << " boundary_syncs=" << segment.contract.boundarySyncs.size() << "\n";
+			for (size_t inputIndex = 0; inputIndex < segment.contract.inputRequirements.size(); ++inputIndex) {
+				const auto& input = segment.contract.inputRequirements[inputIndex];
+				dump << "      input[" << inputIndex << "] " << resourceLabelForID(input.resourceID)
+					 << " queue=" << queueSlotLabel(input.queueSlot)
+					 << " range=" << FormatRangeSpec(input.range)
+					 << " whole=" << (input.wholeResource ? "true" : "false")
+					 << " alias_activation=" << (input.aliasActivation ? "true" : "false")
+					 << " transition_before=" << (input.transitionBeforeState ? "true" : "false")
+					 << " transition_discard=" << (input.transitionDiscard ? "true" : "false")
+					 << " weak_read=" << (input.readOnlyUniformWeakRequirement ? "true" : "false")
+					 << " ";
+				appendState("required_", input.requiredState);
+				dump << "\n";
+			}
+			for (size_t batchTemplateIndex = 0; batchTemplateIndex < segment.batchTemplates.size(); ++batchTemplateIndex) {
+				const auto& batchTemplate = segment.batchTemplates[batchTemplateIndex];
+				dump << "      template_batch[" << batchTemplateIndex << "]"
+					 << " local=" << batchTemplate.localBatchIndex
+					 << " original=" << batchTemplate.originalBatchIndexAtExtraction
+					 << " partial=" << (batchTemplate.partialBatch ? "true" : "false")
+					 << " queued_passes=" << batchTemplate.queuedPasses.size()
+					 << " transitions=" << batchTemplate.transitions.size()
+					 << " waits=" << batchTemplate.waits.size()
+					 << " signals=" << batchTemplate.signals.size() << "\n";
+				if (!batchTemplate.queuedPasses.empty()) {
+					dump << "        passes=[";
+					for (size_t queuedIndex = 0; queuedIndex < batchTemplate.queuedPasses.size(); ++queuedIndex) {
+						if (queuedIndex != 0) {
+							dump << ", ";
+						}
+						const auto& queuedPass = batchTemplate.queuedPasses[queuedIndex];
+						dump << passNameForIndex(queuedPass.originalFramePassIndexAtExtraction)
+							 << "@" << queueSlotLabel(queuedPass.queueSlot);
+					}
+					dump << "]\n";
+				}
+				for (size_t transitionIndex = 0; transitionIndex < batchTemplate.transitions.size(); ++transitionIndex) {
+					const auto& transition = batchTemplate.transitions[transitionIndex];
+					dump << "        transition[" << transitionIndex << "] "
+						 << resourceLabelForID(transition.resourceID)
+						 << " backing_id=" << transition.backingResourceID
+						 << " dynamic=" << (transition.dynamicResource ? "true" : "false")
+						 << " queue=" << queueSlotLabel(transition.queueSlot)
+						 << " phase=" << BatchTransitionPhaseToString(transition.phase)
+						 << " discard=" << (transition.discard ? "true" : "false")
+						 << " range=" << FormatRangeSpec(transition.range)
+						 << " ";
+					appendState("before_", transition.before);
+					dump << " ";
+					appendState("after_", transition.after);
+					dump << "\n";
+				}
+				for (const auto& wait : batchTemplate.waits) {
+					dump << "        wait phase=" << BatchWaitPhaseToString(wait.phase)
+						 << " dst=" << queueSlotLabel(wait.dstQueue)
+						 << " src=" << queueSlotLabel(wait.srcQueue) << "\n";
+				}
+				for (const auto& signal : batchTemplate.signals) {
+					dump << "        signal phase=" << BatchSignalPhaseToString(signal.phase)
+						 << " queue=" << queueSlotLabel(signal.queueSlot) << "\n";
+				}
+			}
+		}
+		dump << "\n";
 
 		dump << "[FramePasses]\n";
 		for (size_t passIndex = 0; passIndex < m_framePasses.size(); ++passIndex) {
@@ -5263,6 +5392,9 @@ RenderGraph::ReplaySegmentValidationStats RenderGraph::ValidateCachedSegmentsAga
 			continue;
 		}
 		const auto& current = *it->second;
+		const bool relaxAliasPlacement = m_renderGraphSettingsService
+			? m_renderGraphSettingsService->GetRenderGraphReplayRelaxAliasPlacement()
+			: true;
 		ReplaySegmentInvalidationReason reason = ReplaySegmentInvalidationReason::None;
 		std::string detail;
 		if (previous.fingerprint.declarationHash != current.fingerprint.declarationHash) {
@@ -5276,6 +5408,10 @@ RenderGraph::ReplaySegmentValidationStats RenderGraph::ValidateCachedSegmentsAga
 		else if (previous.fingerprint.queueHash != current.fingerprint.queueHash) {
 			reason = ReplaySegmentInvalidationReason::QueueAssignmentChanged;
 			detail = "queue_hash";
+		}
+		else if (!relaxAliasPlacement && previous.fingerprint.aliasHash != current.fingerprint.aliasHash) {
+			reason = ReplaySegmentInvalidationReason::AliasPlacementChanged;
+			detail = "alias_hash";
 		}
 		else if (previous.fingerprint.boundaryHash != current.fingerprint.boundaryHash) {
 			reason = ReplaySegmentInvalidationReason::BoundaryChanged;
@@ -5504,9 +5640,13 @@ bool RenderGraph::ReplaySegmentSyncShapeDiverged(const CachedReplaySegment& cach
 bool RenderGraph::ReplaySegmentHardReplayMatches(const CachedReplaySegment& cached, const CachedReplaySegment& current) const
 {
 	ZoneScopedN("RenderGraph::ReplaySegmentHardReplayMatches");
+	const bool relaxAliasPlacement = m_renderGraphSettingsService
+		? m_renderGraphSettingsService->GetRenderGraphReplayRelaxAliasPlacement()
+		: true;
 	return cached.fingerprint.declarationHash == current.fingerprint.declarationHash
 		&& cached.fingerprint.accessHash == current.fingerprint.accessHash
 		&& cached.fingerprint.queueHash == current.fingerprint.queueHash
+		&& (relaxAliasPlacement || cached.fingerprint.aliasHash == current.fingerprint.aliasHash)
 		&& ReplaySegmentBoundaryEdgesMatch(cached, current)
 		&& ReplaySegmentHardTemplateMatches(cached, current);
 }
@@ -5667,10 +5807,14 @@ RenderGraph::ReplaySegmentLookupResult RenderGraph::LookupCachedReplaySegmentVar
 	}
 
 	CachedReplaySegmentVariant* bestVariant = nullptr;
+	const bool relaxAliasPlacement = m_renderGraphSettingsService
+		? m_renderGraphSettingsService->GetRenderGraphReplayRelaxAliasPlacement()
+		: true;
 	for (auto& variant : entry->variants) {
 		if (variant.variantKey.declarationHash != currentVariantKey.declarationHash
 			|| variant.variantKey.accessHash != currentVariantKey.accessHash
 			|| variant.variantKey.queueHash != currentVariantKey.queueHash
+			|| (!relaxAliasPlacement && variant.variantKey.aliasHash != currentVariantKey.aliasHash)
 			|| variant.variantKey.hardBoundaryHash != currentVariantKey.hardBoundaryHash
 			|| variant.variantKey.hardTemplateHash != currentVariantKey.hardTemplateHash
 			|| !ReplaySegmentHardReplayMatches(variant.segment, currentSegment)) {
@@ -5857,6 +6001,9 @@ RenderGraph::ReplaySegmentCacheUpdateStats RenderGraph::InsertOrRefreshReplaySeg
 		}
 		const ReplaySegmentCacheKey key = BuildReplaySegmentCacheKey(segment);
 		const ReplaySegmentVariantKey variantKey = BuildReplaySegmentVariantKey(segment);
+		const bool relaxAliasPlacement = m_renderGraphSettingsService
+			? m_renderGraphSettingsService->GetRenderGraphReplayRelaxAliasPlacement()
+			: true;
 		auto entryIt = std::find_if(m_regionCache.replaySegmentEntries.begin(), m_regionCache.replaySegmentEntries.end(), [&](const ReplaySegmentCacheEntry& entry) {
 			return entry.key.passSequenceHash == key.passSequenceHash && entry.key.passCount == key.passCount;
 		});
@@ -5870,6 +6017,7 @@ RenderGraph::ReplaySegmentCacheUpdateStats RenderGraph::InsertOrRefreshReplaySeg
 			return variant.variantKey.declarationHash == variantKey.declarationHash
 				&& variant.variantKey.accessHash == variantKey.accessHash
 				&& variant.variantKey.queueHash == variantKey.queueHash
+				&& (relaxAliasPlacement || variant.variantKey.aliasHash == variantKey.aliasHash)
 				&& variant.variantKey.hardBoundaryHash == variantKey.hardBoundaryHash
 				&& variant.variantKey.hardTemplateHash == variantKey.hardTemplateHash
 				&& ReplaySegmentHardReplayMatches(variant.segment, segment);
@@ -6169,6 +6317,9 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::BuildShadowReplaySched
 	}
 
 	std::vector<uint8_t> passCovered(m_framePasses.size(), 0);
+	const bool relaxAliasPlacement = m_renderGraphSettingsService
+		? m_renderGraphSettingsService->GetRenderGraphReplayRelaxAliasPlacement()
+		: true;
 	for (const auto& current : currentSegments) {
 		auto previousIt = previousByPassSequence.find(current.identity.passSequenceHash);
 		if (previousIt == previousByPassSequence.end()) {
@@ -6178,6 +6329,7 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::BuildShadowReplaySched
 		if (previous.fingerprint.declarationHash != current.fingerprint.declarationHash
 			|| previous.fingerprint.accessHash != current.fingerprint.accessHash
 			|| previous.fingerprint.queueHash != current.fingerprint.queueHash
+			|| (!relaxAliasPlacement && previous.fingerprint.aliasHash != current.fingerprint.aliasHash)
 			|| previous.fingerprint.boundaryHash != current.fingerprint.boundaryHash
 			|| previous.fingerprint.templateShapeHash != current.fingerprint.templateShapeHash) {
 			continue;
@@ -6617,6 +6769,13 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 					resource,
 					resource ? resource->GetGlobalResourceID() : transitionTemplate.resourceID);
 				resource = compileResourceState.resource ? compileResourceState.resource : resource;
+				ResourceState emittedBeforeState = transitionTemplate.before;
+				if (transitionTemplate.discard) {
+					ResourceState liveBeforeState{};
+					if (TryGetWholeResourceTrackerState(compileResourceState.tracker, liveBeforeState)) {
+						emittedBeforeState = liveBeforeState;
+					}
+				}
 
 				if (!transitionTemplate.discard) {
 					SymbolicTracker probeTracker = compileResourceState.tracker;
@@ -6662,11 +6821,11 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 				ResourceTransition transition(
 					resource,
 					transitionTemplate.range,
-					transitionTemplate.before.access,
+					emittedBeforeState.access,
 					transitionTemplate.after.access,
-					transitionTemplate.before.layout,
+					emittedBeforeState.layout,
 					transitionTemplate.after.layout,
-					transitionTemplate.before.sync,
+					emittedBeforeState.sync,
 					transitionTemplate.after.sync,
 					transitionTemplate.discard);
 				batch.Transitions(transitionTemplate.queueSlot, transitionTemplate.phase).push_back(transition);
@@ -8004,6 +8163,9 @@ void RenderGraph::LogRegionCompileSummary(uint8_t frameIndex, const std::vector<
 		uint64_t segmentSignalTemplateCount = 0;
 		uint64_t tier1EligibleCount = 0;
 		uint64_t segmentFingerprint = 0x7265706c61790001ull;
+		const bool relaxAliasPlacementForDiagnostics = m_renderGraphSettingsService
+			? m_renderGraphSettingsService->GetRenderGraphReplayRelaxAliasPlacement()
+			: true;
 		for (const auto& segment : replaySegmentsForDiagnostics) {
 			segmentInputCount += segment.contract.inputRequirements.size();
 			segmentOutputCount += segment.contract.outputStates.size();
@@ -8017,6 +8179,9 @@ void RenderGraph::LogRegionCompileSummary(uint8_t frameIndex, const std::vector<
 			segmentFingerprint = HashCombine64(segmentFingerprint, segment.fingerprint.declarationHash);
 			segmentFingerprint = HashCombine64(segmentFingerprint, segment.fingerprint.accessHash);
 			segmentFingerprint = HashCombine64(segmentFingerprint, segment.fingerprint.queueHash);
+			if (!relaxAliasPlacementForDiagnostics) {
+				segmentFingerprint = HashCombine64(segmentFingerprint, segment.fingerprint.aliasHash);
+			}
 			segmentFingerprint = HashCombine64(segmentFingerprint, segment.fingerprint.boundaryHash);
 			segmentFingerprint = HashCombine64(segmentFingerprint, segment.fingerprint.templateShapeHash);
 			for (const auto& batchTemplate : segment.batchTemplates) {
@@ -10268,6 +10433,17 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				}
 				continue;
 			}
+			if (lookup.variant->segment.fingerprint.aliasHash != segment.fingerprint.aliasHash) {
+				++lightweightReplaySelectionSkippedLookupMiss;
+				if (lightweightReplayFirstMiss.empty()) {
+					std::ostringstream oss;
+					oss << "fast_replay_alias_hash_mismatch pass_sequence=0x" << std::hex << segment.identity.passSequenceHash
+						<< " alias=0x" << lookup.variant->segment.fingerprint.aliasHash
+						<< "->0x" << segment.fingerprint.aliasHash;
+					lightweightReplayFirstMiss = oss.str();
+				}
+				continue;
+			}
 			selectedReplaySegments.push_back(lookup.variant->segment);
 		}
 		lightweightReplaySelectedSegments = selectedReplaySegments.size();
@@ -10461,9 +10637,13 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 					|| previous.templateStats.syncShapeHash != current.templateStats.syncShapeHash;
 			};
 			auto segmentReplayMatch = [&](const CachedReplaySegment& previous, const CachedReplaySegment& current) {
+				const bool relaxAliasPlacement = m_renderGraphSettingsService
+					? m_renderGraphSettingsService->GetRenderGraphReplayRelaxAliasPlacement()
+					: true;
 				return previous.fingerprint.declarationHash == current.fingerprint.declarationHash
 					&& previous.fingerprint.accessHash == current.fingerprint.accessHash
 					&& previous.fingerprint.queueHash == current.fingerprint.queueHash
+					&& (relaxAliasPlacement || previous.fingerprint.aliasHash == current.fingerprint.aliasHash)
 					&& boundaryEdgesReplayMatch(previous, current)
 					&& hardTemplateReplayMatch(previous, current);
 			};

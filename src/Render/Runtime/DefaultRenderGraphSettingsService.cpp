@@ -131,6 +131,10 @@ public:
         return GetOpenRenderGraphSettings().renderGraphReplaySegmentCacheMaxAgeFrames;
     }
 
+    bool GetRenderGraphReplayRelaxAliasPlacement() const override {
+        return GetOpenRenderGraphSettings().renderGraphReplayRelaxAliasPlacement;
+    }
+
     bool GetHeavyDebug() const override {
         return GetOpenRenderGraphSettings().heavyDebug;
     }
