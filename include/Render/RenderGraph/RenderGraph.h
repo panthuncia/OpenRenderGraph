@@ -1824,6 +1824,7 @@ private:
 	std::function<rg::runtime::RenderGraphRegionMode()> m_getRenderGraphRegionMode;
 	std::function<rg::runtime::TransitionPlacementMode()> m_getTransitionPlacementMode;
 	std::function<uint32_t()> m_getRenderGraphRegionMinPassCount;
+	std::function<uint32_t()> m_getRenderGraphRegionMaxPassCount;
 	std::function<bool()> m_getRenderGraphRegionDiagnosticsEnabled;
 	std::function<bool()> m_getRenderGraphRegionShadowStrictBatchMatch;
 	std::unordered_map<uint64_t, AddTransitionDebugStats> m_addTransitionDebugStatsByResource;

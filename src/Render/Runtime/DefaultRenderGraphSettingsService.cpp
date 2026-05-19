@@ -107,6 +107,10 @@ public:
         return GetOpenRenderGraphSettings().renderGraphRegionMinPassCount;
     }
 
+    uint32_t GetRenderGraphRegionMaxPassCount() const override {
+        return GetOpenRenderGraphSettings().renderGraphRegionMaxPassCount;
+    }
+
     bool GetRenderGraphRegionDiagnosticsEnabled() const override {
         return GetOpenRenderGraphSettings().renderGraphRegionDiagnosticsEnabled;
     }

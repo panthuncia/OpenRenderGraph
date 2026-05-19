@@ -4146,6 +4146,12 @@ void RenderGraph::ExtractScheduleRegionsFromAuthoritativeCompile(
 	const uint32_t minPassCount = m_getRenderGraphRegionMinPassCount
 		? std::max(1u, m_getRenderGraphRegionMinPassCount())
 		: 4u;
+	const uint32_t requestedMaxPassCount = m_getRenderGraphRegionMaxPassCount
+		? m_getRenderGraphRegionMaxPassCount()
+		: 0u;
+	const uint32_t maxPassCount = requestedMaxPassCount == 0u
+		? 0u
+		: std::max(minPassCount, requestedMaxPassCount);
 
 	std::unordered_map<const void*, size_t> passIndexByPointer;
 	passIndexByPointer.reserve(framePasses.size());
@@ -4384,6 +4390,7 @@ void RenderGraph::ExtractScheduleRegionsFromAuthoritativeCompile(
 		size_t end = start + 1;
 		if (!startForcesSplit) {
 			while (end < m_schedulingDecisionTrace.size()
+				&& (maxPassCount == 0u || end - start < maxPassCount)
 				&& m_schedulingDecisionTrace[end].assignedQueueSlot == queueSlot) {
 				RegionRejectReason nextSplitReason = RegionRejectReason::Count;
 				if (passForcesCandidateSplit(m_schedulingDecisionTrace[end].passIndex, nextSplitReason)) {
@@ -10433,7 +10440,10 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				}
 				continue;
 			}
-			if (lookup.variant->segment.fingerprint.aliasHash != segment.fingerprint.aliasHash) {
+			const bool relaxAliasPlacement = m_renderGraphSettingsService
+				? m_renderGraphSettingsService->GetRenderGraphReplayRelaxAliasPlacement()
+				: true;
+			if (!relaxAliasPlacement && lookup.variant->segment.fingerprint.aliasHash != segment.fingerprint.aliasHash) {
 				++lightweightReplaySelectionSkippedLookupMiss;
 				if (lightweightReplayFirstMiss.empty()) {
 					std::ostringstream oss;
@@ -12095,6 +12105,9 @@ void RenderGraph::Setup() {
 	};
 	m_getRenderGraphRegionMinPassCount = [this]() {
 		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetRenderGraphRegionMinPassCount() : 4u;
+	};
+	m_getRenderGraphRegionMaxPassCount = [this]() {
+		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetRenderGraphRegionMaxPassCount() : 0u;
 	};
 	m_getRenderGraphRegionDiagnosticsEnabled = [this]() {
 		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetRenderGraphRegionDiagnosticsEnabled() : false;

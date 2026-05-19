@@ -49,6 +49,7 @@ struct OpenRenderGraphSettings {
     RenderGraphRegionMode renderGraphRegionMode = RenderGraphRegionMode::Disabled;
     TransitionPlacementMode transitionPlacementMode = TransitionPlacementMode::InlineEarlyPlacement;
     uint32_t renderGraphRegionMinPassCount = 4u;
+    uint32_t renderGraphRegionMaxPassCount = 0u;
     bool renderGraphRegionDiagnosticsEnabled = false;
     bool renderGraphRegionShadowStrictBatchMatch = false;
     uint32_t renderGraphReplaySegmentCacheMaxEntries = 256u;
@@ -86,6 +87,9 @@ inline void SetOpenRenderGraphSettings(const OpenRenderGraphSettings& settings) 
     state.settings.autoAliasPoolRetireIdleFrames = (std::max)(1u, state.settings.autoAliasPoolRetireIdleFrames);
     state.settings.autoAliasPoolGrowthHeadroom = (std::max)(1.0f, state.settings.autoAliasPoolGrowthHeadroom);
     state.settings.renderGraphRegionMinPassCount = (std::max)(1u, state.settings.renderGraphRegionMinPassCount);
+    if (state.settings.renderGraphRegionMaxPassCount != 0u) {
+        state.settings.renderGraphRegionMaxPassCount = (std::max)(1u, state.settings.renderGraphRegionMaxPassCount);
+    }
     state.settings.renderGraphReplaySegmentCacheMaxEntries = (std::max)(1u, state.settings.renderGraphReplaySegmentCacheMaxEntries);
     state.settings.renderGraphReplaySegmentCacheMaxVariants = (std::max)(1u, state.settings.renderGraphReplaySegmentCacheMaxVariants);
     state.settings.renderGraphReplaySegmentCacheMaxVariantsPerKey = (std::max)(1u, state.settings.renderGraphReplaySegmentCacheMaxVariantsPerKey);

@@ -36,6 +36,7 @@ public:
     virtual RenderGraphRegionMode GetRenderGraphRegionMode() const = 0;
     virtual TransitionPlacementMode GetTransitionPlacementMode() const = 0;
     virtual uint32_t GetRenderGraphRegionMinPassCount() const = 0;
+    virtual uint32_t GetRenderGraphRegionMaxPassCount() const = 0;
     virtual bool GetRenderGraphRegionDiagnosticsEnabled() const = 0;
     virtual bool GetRenderGraphRegionShadowStrictBatchMatch() const = 0;
     virtual uint32_t GetRenderGraphReplaySegmentCacheMaxEntries() const = 0;
