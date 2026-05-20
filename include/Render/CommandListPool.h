@@ -1,7 +1,10 @@
 #pragma once
 
 #include <cstddef>
+#include <condition_variable>
 #include <deque>
+#include <mutex>
+#include <thread>
 #include <vector>
 #include <cstdint>
 #include <atomic>
@@ -21,9 +24,13 @@ public:
         size_t createdThisFrame = 0;
         size_t reusedThisFrame = 0;
         size_t preparedDeficit = 0;
+        size_t enqueuedForBackgroundResetThisFrame = 0;
+        size_t backgroundResetCompletedThisFrame = 0;
+        size_t backgroundResetPendingCount = 0;
     };
 
     CommandListPool(rhi::Device& device, rhi::QueueKind type);
+    ~CommandListPool();
 
     // Acquire a command allocator / list pair ready for recording
     CommandListPair Request();
@@ -32,25 +39,37 @@ public:
     // for immediate Request() calls.
     void PrepareForRequests(size_t requiredCount, uint64_t completedFenceValue);
 
-    // Recycle a pair after execution. If fenceValue is 0 the pair becomes
-    // immediately available. Otherwise it will be returned to the available
-    // pool once RecycleCompleted is called with a sufficiently large fence value.
+    // Recycle a pair after execution. If fenceValue is 0 the pair is queued for
+    // background reset immediately. Otherwise it will be queued once
+    // RecycleCompleted is called with a sufficiently large fence value.
     void Recycle(CommandListPair&& pair, uint64_t fenceValue);
 
-    // Return any completed command lists to the available pool.
+    // Queue any completed command lists for background reset.
     void RecycleCompleted(uint64_t completedFenceValue);
 
-    const Diagnostics& GetDiagnostics() const noexcept { return m_diagnostics; }
+    Diagnostics GetDiagnostics() const {
+        std::lock_guard lock(m_mutex);
+        return m_diagnostics;
+    }
 
 private:
     void PreparePairForReuse(CommandListPair& pair);
     CommandListPair CreateReadyPair();
+    void BackgroundResetMain();
+    void UpdateDiagnosticsCountsLocked();
 
     rhi::Device m_device;
     rhi::QueueKind m_type;
     std::atomic<uint64_t> m_nextDebugNameId{ 1 };
     Diagnostics m_diagnostics{};
 
+    mutable std::mutex m_mutex;
+    std::condition_variable m_backgroundResetCv;
+    std::thread m_backgroundResetThread;
+    bool m_stopBackgroundReset = false;
+    size_t m_backgroundResetActiveCount = 0;
+
     std::vector<CommandListPair> m_available;
     std::deque<std::pair<uint64_t, CommandListPair>> m_inFlight;
+    std::vector<CommandListPair> m_pendingBackgroundReset;
 };
