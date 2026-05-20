@@ -6429,9 +6429,28 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 
 	std::unordered_map<uint32_t, uint32_t> nodeIndexByPassIndex;
 	nodeIndexByPassIndex.reserve(nodes.size());
+	constexpr uint32_t kInvalidReplayNodeIndex = std::numeric_limits<uint32_t>::max();
+	std::vector<uint32_t> nodeIndexByPassIndexDense(framePasses.size(), kInvalidReplayNodeIndex);
 	for (uint32_t nodeIndex = 0; nodeIndex < nodes.size(); ++nodeIndex) {
-		nodeIndexByPassIndex.emplace(static_cast<uint32_t>(nodes[nodeIndex].passIndex), nodeIndex);
+		const auto passIndex = static_cast<uint32_t>(nodes[nodeIndex].passIndex);
+		nodeIndexByPassIndex.emplace(passIndex, nodeIndex);
+		if (passIndex < nodeIndexByPassIndexDense.size()) {
+			nodeIndexByPassIndexDense[passIndex] = nodeIndex;
+		}
 	}
+	auto tryGetReplayNodeIndex = [&](uint32_t passIndex) -> std::optional<uint32_t> {
+		if (passIndex < nodeIndexByPassIndexDense.size()) {
+			const uint32_t nodeIndex = nodeIndexByPassIndexDense[passIndex];
+			if (nodeIndex != kInvalidReplayNodeIndex) {
+				return nodeIndex;
+			}
+		}
+		auto nodeIt = nodeIndexByPassIndex.find(passIndex);
+		if (nodeIt == nodeIndexByPassIndex.end()) {
+			return std::nullopt;
+		}
+		return nodeIt->second;
+	};
 
 	std::unordered_set<uint64_t> scratchTransitioned;
 	std::unordered_set<size_t> scratchFallback;
@@ -6439,6 +6458,30 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 	std::vector<ResourceTransition> ignoredTransitions;
 	std::vector<uint64_t> latestSignalFenceByQueue(queueCount, 0);
 	std::vector<std::pair<uint16_t, uint16_t>> pendingSegmentInputWaits;
+
+	struct TemplateResourceLookupKey {
+		uint64_t resourceID = 0;
+		uint64_t backingResourceID = 0;
+		bool dynamicResource = false;
+
+		bool operator==(const TemplateResourceLookupKey& other) const noexcept {
+			return resourceID == other.resourceID
+				&& backingResourceID == other.backingResourceID
+				&& dynamicResource == other.dynamicResource;
+		}
+	};
+	struct TemplateResourceLookupKeyHash {
+		size_t operator()(const TemplateResourceLookupKey& key) const noexcept {
+			size_t h = std::hash<uint64_t>{}(key.resourceID);
+			h ^= std::hash<uint64_t>{}(key.backingResourceID) + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+			h ^= std::hash<bool>{}(key.dynamicResource) + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+			return h;
+		}
+	};
+	std::unordered_map<TemplateResourceLookupKey, Resource*, TemplateResourceLookupKeyHash> templateResourceCache;
+	std::unordered_map<TemplateResourceLookupKey, std::optional<size_t>, TemplateResourceLookupKeyHash> templateResourceIndexCache;
+	templateResourceCache.reserve(256);
+	templateResourceIndexCache.reserve(256);
 
 	auto setFirstRecomputeReason = [&](std::string reason) {
 		if (report.firstRecomputeReason.empty()) {
@@ -6455,42 +6498,59 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 	RebuildFrameCompileResources();
 
 	auto resolveTemplateResource = [&](uint64_t resourceID, uint64_t backingResourceID, bool dynamicResource) -> Resource* {
+		const TemplateResourceLookupKey key{ resourceID, backingResourceID, dynamicResource };
+		if (auto cacheIt = templateResourceCache.find(key); cacheIt != templateResourceCache.end()) {
+			return cacheIt->second;
+		}
+		Resource* resolved = nullptr;
 		if (dynamicResource && resourceID != 0) {
 			if (auto resource = GetResourceByID(resourceID)) {
-				return resource.get();
+				resolved = resource.get();
 			}
 		}
-		if (backingResourceID != 0) {
+		if (resolved == nullptr && backingResourceID != 0) {
 			if (auto resource = GetResourceByID(backingResourceID)) {
-				return resource.get();
+				resolved = resource.get();
 			}
 		}
-		if (resourceID != 0) {
+		if (resolved == nullptr && resourceID != 0) {
 			if (auto resource = GetResourceByID(resourceID)) {
-				return resource.get();
+				resolved = resource.get();
 			}
 		}
-		return nullptr;
+		templateResourceCache.emplace(key, resolved);
+		return resolved;
 	};
 
 	auto resolveTemplateResourceIndex = [&](uint64_t resourceID, uint64_t backingResourceID, bool dynamicResource) -> std::optional<size_t> {
+		const TemplateResourceLookupKey key{ resourceID, backingResourceID, dynamicResource };
+		if (auto cacheIt = templateResourceIndexCache.find(key); cacheIt != templateResourceIndexCache.end()) {
+			return cacheIt->second;
+		}
+		std::optional<size_t> resolvedIndex;
 		if (dynamicResource && resourceID != 0) {
 			if (auto resourceIndex = TryGetFrameSchedulingResourceIndex(resourceID)) {
-				return resourceIndex;
+				resolvedIndex = resourceIndex;
 			}
-			if (auto resource = resolveTemplateResource(resourceID, backingResourceID, true)) {
-				if (auto resourceIndex = TryGetFrameSchedulingResourceIndex(resource->GetGlobalResourceID())) {
-					return resourceIndex;
+			if (!resolvedIndex) {
+				auto* resource = resolveTemplateResource(resourceID, backingResourceID, true);
+				if (resource != nullptr) {
+					if (auto resourceIndex = TryGetFrameSchedulingResourceIndex(resource->GetGlobalResourceID())) {
+						resolvedIndex = resourceIndex;
+					}
 				}
 			}
 		}
-		if (auto resourceIndex = TryGetFrameSchedulingResourceIndex(resourceID)) {
-			return resourceIndex;
+		if (!resolvedIndex) {
+			if (auto resourceIndex = TryGetFrameSchedulingResourceIndex(resourceID)) {
+				resolvedIndex = resourceIndex;
+			}
 		}
-		if (backingResourceID != 0) {
-			return TryGetFrameSchedulingResourceIndex(backingResourceID);
+		if (!resolvedIndex && backingResourceID != 0) {
+			resolvedIndex = TryGetFrameSchedulingResourceIndex(backingResourceID);
 		}
-		return std::nullopt;
+		templateResourceIndexCache.emplace(key, resolvedIndex);
+		return resolvedIndex;
 	};
 
 	auto isExplicitWholeResourceRange = [](const RangeSpec& range) {
@@ -6571,6 +6631,13 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 		}
 		return true;
 	};
+
+	struct ResolvedReplayTransitionTemplate {
+		const ReplaySegmentTransitionTemplate* transition = nullptr;
+		Resource* resource = nullptr;
+		size_t resourceIndex = 0;
+	};
+	std::vector<ResolvedReplayTransitionTemplate> resolvedReplayTransitions;
 
 	auto ensureSegmentInputs = [&](const CachedReplaySegment& segment) -> bool {
 		ZoneScopedN("RenderGraph::Replay::EnsureSegmentInputs");
@@ -6718,10 +6785,13 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 
 	auto commitTemplateBatch = [&](const CachedReplaySegment& segment, const ReplaySegmentBatchTemplate& batchTemplate) -> bool {
 		ZoneScopedN("RenderGraph::Replay::CommitTemplateBatch");
+		ZoneValue(batchTemplate.queuedPasses.size());
 		if (batchTemplate.queuedPasses.empty()) {
 			return true;
 		}
 
+		resolvedReplayTransitions.clear();
+		resolvedReplayTransitions.reserve(batchTemplate.transitions.size());
 		for (const auto& wait : batchTemplate.waits) {
 			if (wait.dstQueue >= queueCount || wait.srcQueue >= queueCount) {
 				return recomputeTemplateBatch(batchTemplate, "template_wait_queue_out_of_range");
@@ -6734,12 +6804,19 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 			if (transitionTemplate.queueSlot >= queueCount) {
 				return recomputeTemplateBatch(batchTemplate, "template_transition_queue_out_of_range");
 			}
-			if (resolveTemplateResource(transitionTemplate.resourceID, transitionTemplate.backingResourceID, transitionTemplate.dynamicResource) == nullptr) {
+			Resource* resource = resolveTemplateResource(transitionTemplate.resourceID, transitionTemplate.backingResourceID, transitionTemplate.dynamicResource);
+			if (resource == nullptr) {
 				return recomputeTemplateBatch(batchTemplate, "template_transition_resource_missing");
 			}
-			if (!resolveTemplateResourceIndex(transitionTemplate.resourceID, transitionTemplate.backingResourceID, transitionTemplate.dynamicResource)) {
+			auto resourceIndex = resolveTemplateResourceIndex(transitionTemplate.resourceID, transitionTemplate.backingResourceID, transitionTemplate.dynamicResource);
+			if (!resourceIndex) {
 				return recomputeTemplateBatch(batchTemplate, "template_transition_resource_index_missing");
 			}
+			resolvedReplayTransitions.push_back(ResolvedReplayTransitionTemplate{
+				.transition = &transitionTemplate,
+				.resource = resource,
+				.resourceIndex = *resourceIndex,
+			});
 		}
 		for (const auto& signal : batchTemplate.signals) {
 			if (signal.queueSlot >= queueCount) {
@@ -6768,11 +6845,11 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 		{
 			ZoneScopedN("RenderGraph::Replay::ApplyTemplateTransitions");
 			std::vector<ResourceTransition> replayProbeTransitions;
-			for (const auto& transitionTemplate : batchTemplate.transitions) {
-				Resource* resource = resolveTemplateResource(transitionTemplate.resourceID, transitionTemplate.backingResourceID, transitionTemplate.dynamicResource);
-				auto resourceIndex = resolveTemplateResourceIndex(transitionTemplate.resourceID, transitionTemplate.backingResourceID, transitionTemplate.dynamicResource);
+			for (const auto& resolvedTransition : resolvedReplayTransitions) {
+				const auto& transitionTemplate = *resolvedTransition.transition;
+				Resource* resource = resolvedTransition.resource;
 				auto& compileResourceState = GetOrCreateFrameCompileResourceState(
-					*resourceIndex,
+					resolvedTransition.resourceIndex,
 					resource,
 					resource ? resource->GetGlobalResourceID() : transitionTemplate.resourceID);
 				resource = compileResourceState.resource ? compileResourceState.resource : resource;
@@ -6793,7 +6870,7 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 						transitionTemplate.after,
 						replayProbeTransitions);
 					if (replayProbeTransitions.empty()) {
-						batch.passBatchTrackersByResourceIndex[*resourceIndex] = &compileResourceState.tracker;
+						batch.passBatchTrackersByResourceIndex[resolvedTransition.resourceIndex] = &compileResourceState.tracker;
 						continue;
 					}
 					const auto& generated = replayProbeTransitions.front();
@@ -6836,15 +6913,15 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 					transitionTemplate.after.sync,
 					transitionTemplate.discard);
 				batch.Transitions(transitionTemplate.queueSlot, transitionTemplate.phase).push_back(transition);
-				RecordFrameQueueTransitionBatch(transitionTemplate.queueSlot, *resourceIndex, batchIndex);
-				batch.passBatchTrackersByResourceIndex[*resourceIndex] =
-					applyTrackerState(*resourceIndex, resource->GetGlobalResourceID(), resource, transitionTemplate.range, transitionTemplate.after);
+				RecordFrameQueueTransitionBatch(transitionTemplate.queueSlot, resolvedTransition.resourceIndex, batchIndex);
+				batch.passBatchTrackersByResourceIndex[resolvedTransition.resourceIndex] =
+					applyTrackerState(resolvedTransition.resourceIndex, resource->GetGlobalResourceID(), resource, transitionTemplate.range, transitionTemplate.after);
 				const bool transitionCanActivateAlias = AccessTypeIsWriteType(transitionTemplate.after.access)
 					|| transitionTemplate.after.access == rhi::ResourceAccessType::Common;
 				if (transitionTemplate.discard
 					&& transitionCanActivateAlias
-					&& *resourceIndex < m_aliasActivationPendingByResourceIndex.size()) {
-					m_aliasActivationPendingByResourceIndex[*resourceIndex] = 0;
+					&& resolvedTransition.resourceIndex < m_aliasActivationPendingByResourceIndex.size()) {
+					m_aliasActivationPendingByResourceIndex[resolvedTransition.resourceIndex] = 0;
 					aliasActivationPending.erase(resource->GetGlobalResourceID());
 				}
 				++report.replayedInternalTransitions;
@@ -6854,20 +6931,20 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 		bool batchHasPasses = false;
 		for (const auto& queuedPass : batchTemplate.queuedPasses) {
 			const uint32_t passIndex = queuedPass.originalFramePassIndexAtExtraction;
-			auto nodeIt = nodeIndexByPassIndex.find(passIndex);
-			if (nodeIt == nodeIndexByPassIndex.end()) {
+			auto nodeIndex = tryGetReplayNodeIndex(passIndex);
+			if (!nodeIndex) {
 				return recomputeTemplateBatch(batchTemplate, "template_pass_missing_current_node");
 			}
 			if (passIndex >= framePasses.size() || queuedPass.queueSlot >= queueCount) {
 				return recomputeTemplateBatch(batchTemplate, "template_pass_out_of_range");
 			}
-			auto& node = nodes[nodeIt->second];
+			auto& node = nodes[*nodeIndex];
 			node.assignedQueueSlot = queuedPass.queueSlot;
 			if (node.passIndex < m_assignedQueueSlotsByFramePass.size()) {
 				m_assignedQueueSlotsByFramePass[node.passIndex] = queuedPass.queueSlot;
 			}
 			m_schedulingDecisionTrace.push_back(SchedulingDecisionTrace{
-				.nodeIndex = nodeIt->second,
+				.nodeIndex = *nodeIndex,
 				.passIndex = passIndex,
 				.batchIndex = batchIndex,
 				.assignedQueueSlot = queuedPass.queueSlot,
@@ -6985,16 +7062,15 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 		bool validSegmentNodeSet = true;
 		for (const auto& batchTemplate : segment.batchTemplates) {
 			for (const auto& queuedPass : batchTemplate.queuedPasses) {
-				auto nodeIt = nodeIndexByPassIndex.find(queuedPass.originalFramePassIndexAtExtraction);
-				if (nodeIt == nodeIndexByPassIndex.end()) {
+				auto nodeIndex = tryGetReplayNodeIndex(queuedPass.originalFramePassIndexAtExtraction);
+				if (!nodeIndex) {
 					validSegmentNodeSet = false;
 					break;
 				}
-				const uint32_t nodeIndex = nodeIt->second;
-				segmentNodes.push_back(nodeIndex);
+				segmentNodes.push_back(*nodeIndex);
 				if (firstNodeIndex == std::numeric_limits<uint32_t>::max()
-					|| nodes[nodeIndex].originalOrder < nodes[firstNodeIndex].originalOrder) {
-					firstNodeIndex = nodeIndex;
+					|| nodes[*nodeIndex].originalOrder < nodes[firstNodeIndex].originalOrder) {
+					firstNodeIndex = *nodeIndex;
 				}
 			}
 			if (!validSegmentNodeSet) {
@@ -7156,10 +7232,10 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 				}
 				return true;
 			}
-			auto firstUseNodeIt = nodeIndexByPassIndex.find(static_cast<uint32_t>(placement->firstUsePassIndex));
-			if (firstUseNodeIt == nodeIndexByPassIndex.end()
-				|| firstUseNodeIt->second >= scheduled.size()
-				|| !scheduled[firstUseNodeIt->second]) {
+			auto firstUseNodeIndex = tryGetReplayNodeIndex(static_cast<uint32_t>(placement->firstUsePassIndex));
+			if (!firstUseNodeIndex
+				|| *firstUseNodeIndex >= scheduled.size()
+				|| !scheduled[*firstUseNodeIndex]) {
 				if (outReason && outReason->empty()) {
 					std::ostringstream oss;
 					oss << "alias_activation_read_before_first_write read_pass=\"" << framePasses[passIndex].name
@@ -7231,7 +7307,7 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 				}
 			}
 			for (const auto& queuedPass : batchTemplate.queuedPasses) {
-				if (nodeIndexByPassIndex.find(queuedPass.originalFramePassIndexAtExtraction) == nodeIndexByPassIndex.end()) {
+				if (!tryGetReplayNodeIndex(queuedPass.originalFramePassIndexAtExtraction)) {
 					setReason("template_pass_missing_current_node");
 					return false;
 				}
@@ -7361,8 +7437,8 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 					setReason(oss.str());
 					return false;
 				}
-				auto firstUseNodeIt = nodeIndexByPassIndex.find(static_cast<uint32_t>(placement->firstUsePassIndex));
-				if (firstUseNodeIt == nodeIndexByPassIndex.end()) {
+				auto firstUseNodeIndex = tryGetReplayNodeIndex(static_cast<uint32_t>(placement->firstUsePassIndex));
+				if (!firstUseNodeIndex) {
 					std::ostringstream oss;
 					oss << "segment_alias_first_write_node_missing read_pass=\"" << framePasses[passIndex].name
 						<< "\" first_write_pass=\"" << (placement->firstUsePassIndex < framePasses.size() ? framePasses[placement->firstUsePassIndex].name : std::string("<unknown>"))
@@ -7370,14 +7446,13 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 					setReason(oss.str());
 					return false;
 				}
-				const uint32_t firstUseNodeIndex = firstUseNodeIt->second;
-				if (firstUseNodeIndex >= scheduled.size()) {
+				if (*firstUseNodeIndex >= scheduled.size()) {
 					std::ostringstream oss;
-					oss << "segment_alias_first_write_node_out_of_range node=" << firstUseNodeIndex;
+					oss << "segment_alias_first_write_node_out_of_range node=" << *firstUseNodeIndex;
 					setReason(oss.str());
 					return false;
 				}
-				if (!scheduled[firstUseNodeIndex] && segmentNodeSet.find(firstUseNodeIndex) == segmentNodeSet.end()) {
+				if (!scheduled[*firstUseNodeIndex] && segmentNodeSet.find(*firstUseNodeIndex) == segmentNodeSet.end()) {
 					std::ostringstream oss;
 					oss << "segment_alias_read_before_first_write read_pass=\"" << framePasses[passIndex].name
 						<< "\" first_write_pass=\"" << (placement->firstUsePassIndex < framePasses.size() ? framePasses[placement->firstUsePassIndex].name : std::string("<unknown>"))
