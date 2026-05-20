@@ -4881,7 +4881,6 @@ void RenderGraph::ExtractReplaySegmentsFromAuthoritativeCompile(
 	auto addOutputState = [](std::vector<ReplaySegmentOutputState>& outputs, ReplaySegmentOutputState output) {
 		auto it = std::find_if(outputs.begin(), outputs.end(), [&](const ReplaySegmentOutputState& existing) {
 			return existing.resourceID == output.resourceID
-				&& existing.finalState == output.finalState
 				&& existing.range.mipLower == output.range.mipLower
 				&& existing.range.mipUpper == output.range.mipUpper
 				&& existing.range.sliceLower == output.range.sliceLower
@@ -4889,6 +4888,9 @@ void RenderGraph::ExtractReplaySegmentsFromAuthoritativeCompile(
 		});
 		if (it == outputs.end()) {
 			outputs.push_back(output);
+		}
+		else {
+			*it = output;
 		}
 	};
 	auto addQueueUsage = [](std::vector<ReplaySegmentQueueUsageSummary>& summaries, ReplaySegmentQueueUsageSummary usage) {
@@ -4939,7 +4941,6 @@ void RenderGraph::ExtractReplaySegmentsFromAuthoritativeCompile(
 
 		std::unordered_set<size_t> regionNodeIndices;
 		std::unordered_set<size_t> regionPassIndices;
-		std::unordered_set<uint64_t> outputResourceIDs;
 		regionNodeIndices.reserve(region.passCount);
 		regionPassIndices.reserve(region.passCount);
 
@@ -4969,17 +4970,6 @@ void RenderGraph::ExtractReplaySegmentsFromAuthoritativeCompile(
 					segment.fingerprint.accessHash = hashState(segment.fingerprint.accessHash, requirement.state);
 
 					const bool isWrite = AccessTypeIsWriteType(requirement.state.access);
-					if (isWrite) {
-						outputResourceIDs.insert(requirement.resourceID);
-						addOutputState(segment.contract.outputStates, ReplaySegmentOutputState{
-							.resourceID = requirement.resourceID,
-							.range = requirement.range,
-							.finalState = requirement.state,
-							.wholeResource = IsWholeResourceRange(requirement.range, requirement.resource),
-							.validFastState = requirement.resourceIndex < m_frameCompileResources.size()
-								&& m_frameCompileResources[requirement.resourceIndex].fastState.valid,
-						});
-					}
 					addQueueUsage(segment.contract.queueUsage, ReplaySegmentQueueUsageSummary{
 						.resourceID = requirement.resourceID,
 						.queueSlot = static_cast<uint16_t>(trace.assignedQueueSlot),
@@ -5000,7 +4990,6 @@ void RenderGraph::ExtractReplaySegmentsFromAuthoritativeCompile(
 					}
 				}
 				for (const auto& transition : passSummary.internalTransitions) {
-					outputResourceIDs.insert(transition.resourceID);
 					segment.fingerprint.accessHash = HashCombine64(segment.fingerprint.accessHash, 0x7472616e736974ull);
 					segment.fingerprint.accessHash = HashCombine64(segment.fingerprint.accessHash, transition.resourceID);
 					addQueueUsage(segment.contract.queueUsage, ReplaySegmentQueueUsageSummary{
@@ -5131,14 +5120,15 @@ void RenderGraph::ExtractReplaySegmentsFromAuthoritativeCompile(
 
 							if (it->second < m_framePassSchedulingSummaries.size()) {
 								const auto& passSummary = m_framePassSchedulingSummaries[it->second];
+								const QueueKind queueKind = m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(queueIndex));
 								for (const auto& requirement : passSummary.requirements) {
-									const QueueKind queueKind = m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(queueIndex));
+									const ResourceState normalizedState = NormalizeStateForQueue(queueKind, requirement.state);
 									addInputRequirement(segment.contract.inputRequirements, ReplaySegmentInputRequirement{
 										.resource = requirement.resource,
 										.resourceID = requirement.resourceID,
 										.resourceIndexAtExtraction = requirement.resourceIndex,
 										.range = requirement.range,
-										.requiredState = NormalizeStateForQueue(queueKind, requirement.state),
+										.requiredState = normalizedState,
 										.queueSlot = static_cast<uint16_t>(queueIndex),
 										.wholeResource = IsWholeResourceRange(requirement.range, requirement.resource),
 										.aliasActivation = requirement.resourceIndex < m_frameResourceAccessSummaries.size()
@@ -5148,6 +5138,27 @@ void RenderGraph::ExtractReplaySegmentsFromAuthoritativeCompile(
 										.readOnlyUniformWeakRequirement = requirement.resourceIndex < m_frameResourceAccessSummaries.size()
 											&& m_frameResourceAccessSummaries[requirement.resourceIndex].readOnlyUniform,
 									});
+									addOutputState(segment.contract.outputStates, ReplaySegmentOutputState{
+										.resourceID = requirement.resourceID,
+										.range = requirement.range,
+										.finalState = normalizedState,
+										.wholeResource = IsWholeResourceRange(requirement.range, requirement.resource),
+										.validFastState = IsWholeResourceRange(requirement.range, requirement.resource),
+									});
+								}
+								const auto& denseTransitions = passSummary.internalTransitions;
+								if (passEntry->resources.internalTransitions.size() == denseTransitions.size()) {
+									for (size_t transitionIndex = 0; transitionIndex < denseTransitions.size(); ++transitionIndex) {
+										const auto& exit = passEntry->resources.internalTransitions[transitionIndex];
+										const auto& denseTransition = denseTransitions[transitionIndex];
+										addOutputState(segment.contract.outputStates, ReplaySegmentOutputState{
+											.resourceID = denseTransition.resourceID,
+											.range = exit.first.range,
+											.finalState = exit.second,
+											.wholeResource = IsWholeResourceRange(exit.first.range, exit.first.resource),
+											.validFastState = IsWholeResourceRange(exit.first.range, exit.first.resource),
+										});
+									}
 								}
 							}
 						},
@@ -5161,6 +5172,13 @@ void RenderGraph::ExtractReplaySegmentsFromAuthoritativeCompile(
 							addExpectedTransitionInput(transition);
 						}
 						const auto transitionResourceID = replayTemplateResourceID(transition.pResource);
+						addOutputState(segment.contract.outputStates, ReplaySegmentOutputState{
+							.resourceID = transitionResourceID.logicalID,
+							.range = transition.range,
+							.finalState = ResourceState{ transition.newAccessType, transition.newLayout, transition.newSyncState },
+							.wholeResource = rangeSpecIsAll(transition.range),
+							.validFastState = rangeSpecIsAll(transition.range),
+						});
 						batchTemplate.transitions.push_back(ReplaySegmentTransitionTemplate{
 							.resourceID = transitionResourceID.logicalID,
 							.backingResourceID = transitionResourceID.backingID,
@@ -5242,29 +5260,6 @@ void RenderGraph::ExtractReplaySegmentsFromAuthoritativeCompile(
 			segment.fingerprint.templateShapeHash = HashCombine64(segment.fingerprint.templateShapeHash, segment.templateStats.transitionShapeHash);
 			segment.fingerprint.templateShapeHash = HashCombine64(segment.fingerprint.templateShapeHash, segment.templateStats.syncShapeHash);
 			segment.batchTemplates.push_back(std::move(batchTemplate));
-		}
-
-		for (uint64_t resourceID : outputResourceIDs) {
-			auto resourceIndex = TryGetFrameSchedulingResourceIndex(resourceID);
-			if (!resourceIndex.has_value() || *resourceIndex >= m_frameCompileResources.size()) {
-				continue;
-			}
-			const auto& compileResource = m_frameCompileResources[*resourceIndex];
-			if (!compileResource.trackerInitialized) {
-				continue;
-			}
-			for (const auto& trackerSegment : compileResource.tracker.GetSegments()) {
-				addOutputState(segment.contract.outputStates, ReplaySegmentOutputState{
-					.resourceID = resourceID,
-					.range = trackerSegment.rangeSpec,
-					.finalState = trackerSegment.state,
-					.wholeResource = trackerSegment.rangeSpec.mipLower.type == BoundType::All
-						&& trackerSegment.rangeSpec.mipUpper.type == BoundType::All
-						&& trackerSegment.rangeSpec.sliceLower.type == BoundType::All
-						&& trackerSegment.rangeSpec.sliceUpper.type == BoundType::All,
-					.validFastState = compileResource.fastState.valid,
-				});
-			}
 		}
 
 		segment.tier1Eligible = region.sameBatchInterleavedPassCount == 0;
@@ -6632,13 +6627,6 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 		return true;
 	};
 
-	struct ResolvedReplayTransitionTemplate {
-		const ReplaySegmentTransitionTemplate* transition = nullptr;
-		Resource* resource = nullptr;
-		size_t resourceIndex = 0;
-	};
-	std::vector<ResolvedReplayTransitionTemplate> resolvedReplayTransitions;
-
 	auto ensureSegmentInputs = [&](const CachedReplaySegment& segment) -> bool {
 		ZoneScopedN("RenderGraph::Replay::EnsureSegmentInputs");
 		pendingSegmentInputWaits.clear();
@@ -6664,6 +6652,14 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 		};
 
 		for (const auto& input : segment.contract.inputRequirements) {
+			// Only transition the segment boundary states that were captured from
+			// concrete cached transitions. Per-pass requirements can include later
+			// overlapping states from inside the segment; applying them at segment
+			// entry rewrites resources before the cached batch sequence reaches
+			// the pass that actually needs that state.
+			if (!input.transitionBeforeState) {
+				continue;
+			}
 			if (input.queueSlot >= queueCount) {
 				report.valid = false;
 				++report.failures;
@@ -6783,125 +6779,81 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 		return true;
 	};
 
-	auto commitTemplateBatch = [&](const CachedReplaySegment& segment, const ReplaySegmentBatchTemplate& batchTemplate) -> bool {
-		ZoneScopedN("RenderGraph::Replay::CommitTemplateBatch");
-		ZoneValue(batchTemplate.queuedPasses.size());
-		if (batchTemplate.queuedPasses.empty()) {
-			return true;
+	auto commitSegment = [&](const CachedReplaySegment& segment) -> bool {
+		ZoneScopedN("RenderGraph::Replay::CommitCachedSegment");
+		++report.matchedSegments;
+		if (!ensureSegmentInputs(segment)) {
+			return false;
 		}
 
-		resolvedReplayTransitions.clear();
-		resolvedReplayTransitions.reserve(batchTemplate.transitions.size());
-		for (const auto& wait : batchTemplate.waits) {
-			if (wait.dstQueue >= queueCount || wait.srcQueue >= queueCount) {
-				return recomputeTemplateBatch(batchTemplate, "template_wait_queue_out_of_range");
-			}
-			if (latestSignalFenceByQueue[wait.srcQueue] == 0) {
-				return recomputeTemplateBatch(batchTemplate, "template_wait_missing_source_signal");
-			}
-		}
-		for (const auto& transitionTemplate : batchTemplate.transitions) {
-			if (transitionTemplate.queueSlot >= queueCount) {
-				return recomputeTemplateBatch(batchTemplate, "template_transition_queue_out_of_range");
-			}
-			Resource* resource = resolveTemplateResource(transitionTemplate.resourceID, transitionTemplate.backingResourceID, transitionTemplate.dynamicResource);
-			if (resource == nullptr) {
-				return recomputeTemplateBatch(batchTemplate, "template_transition_resource_missing");
-			}
-			auto resourceIndex = resolveTemplateResourceIndex(transitionTemplate.resourceID, transitionTemplate.backingResourceID, transitionTemplate.dynamicResource);
-			if (!resourceIndex) {
-				return recomputeTemplateBatch(batchTemplate, "template_transition_resource_index_missing");
-			}
-			resolvedReplayTransitions.push_back(ResolvedReplayTransitionTemplate{
-				.transition = &transitionTemplate,
-				.resource = resource,
-				.resourceIndex = *resourceIndex,
-			});
-		}
-		for (const auto& signal : batchTemplate.signals) {
-			if (signal.queueSlot >= queueCount) {
-				return recomputeTemplateBatch(batchTemplate, "template_signal_queue_out_of_range");
-			}
-		}
+		const unsigned int replayBatchBaseIndex = static_cast<unsigned int>(batches.size());
+		std::vector<unsigned int> committedBatchIndexByLocal(segment.batchTemplates.size(), 0);
 
-		PassBatch batch = openNewBatch();
-		const unsigned int batchIndex = static_cast<unsigned int>(batches.size());
-
-		batch.allResources = batchTemplate.allResources;
-		batch.internallyTransitionedResources = batchTemplate.internallyTransitionedResources;
-
-		for (const auto& [dstQueue, srcQueue] : pendingSegmentInputWaits) {
-			if (dstQueue < queueCount && srcQueue < queueCount && latestSignalFenceByQueue[srcQueue] != 0) {
-				batch.AddQueueWait(BatchWaitPhase::BeforeTransitions, dstQueue, srcQueue, latestSignalFenceByQueue[srcQueue]);
+		for (const auto& batchTemplate : segment.batchTemplates) {
+			ZoneScopedN("RenderGraph::Replay::MaterializeCachedBatch");
+			ZoneValue(batchTemplate.queuedPasses.size());
+			if (batchTemplate.queuedPasses.empty()) {
+				continue;
 			}
-		}
-		pendingSegmentInputWaits.clear();
 
-		for (const auto& wait : batchTemplate.waits) {
-			const uint64_t sourceFence = latestSignalFenceByQueue[wait.srcQueue];
-			batch.AddQueueWait(wait.phase, wait.dstQueue, wait.srcQueue, sourceFence);
-		}
+			for (const auto& wait : batchTemplate.waits) {
+				if (wait.dstQueue >= queueCount || wait.srcQueue >= queueCount) {
+					return recomputeTemplateBatch(batchTemplate, "template_wait_queue_out_of_range");
+				}
+				if (latestSignalFenceByQueue[wait.srcQueue] == 0) {
+					return recomputeTemplateBatch(batchTemplate, "template_wait_missing_source_signal");
+				}
+			}
+			for (const auto& signal : batchTemplate.signals) {
+				if (signal.queueSlot >= queueCount) {
+					return recomputeTemplateBatch(batchTemplate, "template_signal_queue_out_of_range");
+				}
+			}
 
-		{
-			ZoneScopedN("RenderGraph::Replay::ApplyTemplateTransitions");
-			std::vector<ResourceTransition> replayProbeTransitions;
-			for (const auto& resolvedTransition : resolvedReplayTransitions) {
-				const auto& transitionTemplate = *resolvedTransition.transition;
-				Resource* resource = resolvedTransition.resource;
-				auto& compileResourceState = GetOrCreateFrameCompileResourceState(
-					resolvedTransition.resourceIndex,
-					resource,
-					resource ? resource->GetGlobalResourceID() : transitionTemplate.resourceID);
-				resource = compileResourceState.resource ? compileResourceState.resource : resource;
+			PassBatch batch = openNewBatch();
+			const unsigned int batchIndex = static_cast<unsigned int>(batches.size());
+			if (batchTemplate.localBatchIndex < committedBatchIndexByLocal.size()) {
+				committedBatchIndexByLocal[batchTemplate.localBatchIndex] = batchIndex;
+			}
+
+			batch.allResources = batchTemplate.allResources;
+			batch.internallyTransitionedResources = batchTemplate.internallyTransitionedResources;
+
+			for (const auto& [dstQueue, srcQueue] : pendingSegmentInputWaits) {
+				if (dstQueue < queueCount && srcQueue < queueCount && latestSignalFenceByQueue[srcQueue] != 0) {
+					batch.AddQueueWait(BatchWaitPhase::BeforeTransitions, dstQueue, srcQueue, latestSignalFenceByQueue[srcQueue]);
+				}
+			}
+			pendingSegmentInputWaits.clear();
+
+			for (const auto& wait : batchTemplate.waits) {
+				const uint64_t sourceFence = latestSignalFenceByQueue[wait.srcQueue];
+				batch.AddQueueWait(wait.phase, wait.dstQueue, wait.srcQueue, sourceFence);
+			}
+
+			for (const auto& transitionTemplate : batchTemplate.transitions) {
+				if (transitionTemplate.queueSlot >= queueCount) {
+					return recomputeTemplateBatch(batchTemplate, "template_transition_queue_out_of_range");
+				}
+				Resource* resource = resolveTemplateResource(transitionTemplate.resourceID, transitionTemplate.backingResourceID, transitionTemplate.dynamicResource);
+				if (resource == nullptr) {
+					return recomputeTemplateBatch(batchTemplate, "template_transition_resource_missing");
+				}
+				auto resourceIndex = resolveTemplateResourceIndex(transitionTemplate.resourceID, transitionTemplate.backingResourceID, transitionTemplate.dynamicResource);
+				if (!resourceIndex) {
+					return recomputeTemplateBatch(batchTemplate, "template_transition_resource_index_missing");
+				}
 				ResourceState emittedBeforeState = transitionTemplate.before;
 				if (transitionTemplate.discard) {
+					auto& compileResourceState = GetOrCreateFrameCompileResourceState(
+						*resourceIndex,
+						resource,
+						resource ? resource->GetGlobalResourceID() : transitionTemplate.resourceID);
 					ResourceState liveBeforeState{};
 					if (TryGetWholeResourceTrackerState(compileResourceState.tracker, liveBeforeState)) {
 						emittedBeforeState = liveBeforeState;
 					}
 				}
-
-				if (!transitionTemplate.discard) {
-					SymbolicTracker probeTracker = compileResourceState.tracker;
-					replayProbeTransitions.clear();
-					probeTracker.Apply(
-						transitionTemplate.range,
-						resource,
-						transitionTemplate.after,
-						replayProbeTransitions);
-					if (replayProbeTransitions.empty()) {
-						batch.passBatchTrackersByResourceIndex[resolvedTransition.resourceIndex] = &compileResourceState.tracker;
-						continue;
-					}
-					const auto& generated = replayProbeTransitions.front();
-					const bool generatedMatchesTemplate =
-						replayProbeTransitions.size() == 1
-						&& generated.pResource == resource
-						&& generated.range.mipLower == transitionTemplate.range.mipLower
-						&& generated.range.mipUpper == transitionTemplate.range.mipUpper
-						&& generated.range.sliceLower == transitionTemplate.range.sliceLower
-						&& generated.range.sliceUpper == transitionTemplate.range.sliceUpper
-						&& generated.prevAccessType == transitionTemplate.before.access
-						&& generated.newAccessType == transitionTemplate.after.access
-						&& generated.prevLayout == transitionTemplate.before.layout
-						&& generated.newLayout == transitionTemplate.after.layout
-						&& generated.prevSyncState == transitionTemplate.before.sync
-						&& generated.newSyncState == transitionTemplate.after.sync;
-					if (!generatedMatchesTemplate) {
-						std::ostringstream reason;
-						reason << "template_transition_before_state_mismatch"
-							<< " resource_id=" << transitionTemplate.resourceID
-							<< " backing_id=" << transitionTemplate.backingResourceID
-							<< " range=" << FormatRangeSpec(transitionTemplate.range)
-							<< " expected=" << static_cast<uint32_t>(transitionTemplate.before.layout)
-							<< "->" << static_cast<uint32_t>(transitionTemplate.after.layout)
-							<< " generated_count=" << replayProbeTransitions.size()
-							<< " generated_first=" << static_cast<uint32_t>(generated.prevLayout)
-							<< "->" << static_cast<uint32_t>(generated.newLayout);
-						return recomputeTemplateBatch(batchTemplate, reason.str());
-					}
-				}
-
 				ResourceTransition transition(
 					resource,
 					transitionTemplate.range,
@@ -6913,137 +6865,107 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 					transitionTemplate.after.sync,
 					transitionTemplate.discard);
 				batch.Transitions(transitionTemplate.queueSlot, transitionTemplate.phase).push_back(transition);
-				RecordFrameQueueTransitionBatch(transitionTemplate.queueSlot, resolvedTransition.resourceIndex, batchIndex);
-				batch.passBatchTrackersByResourceIndex[resolvedTransition.resourceIndex] =
-					applyTrackerState(resolvedTransition.resourceIndex, resource->GetGlobalResourceID(), resource, transitionTemplate.range, transitionTemplate.after);
+				RecordFrameQueueTransitionBatch(transitionTemplate.queueSlot, *resourceIndex, batchIndex);
 				const bool transitionCanActivateAlias = AccessTypeIsWriteType(transitionTemplate.after.access)
 					|| transitionTemplate.after.access == rhi::ResourceAccessType::Common;
 				if (transitionTemplate.discard
 					&& transitionCanActivateAlias
-					&& resolvedTransition.resourceIndex < m_aliasActivationPendingByResourceIndex.size()) {
-					m_aliasActivationPendingByResourceIndex[resolvedTransition.resourceIndex] = 0;
+					&& *resourceIndex < m_aliasActivationPendingByResourceIndex.size()) {
+					m_aliasActivationPendingByResourceIndex[*resourceIndex] = 0;
 					aliasActivationPending.erase(resource->GetGlobalResourceID());
 				}
-				++report.replayedInternalTransitions;
 			}
-		}
+			report.replayedInternalTransitions += batchTemplate.transitions.size();
 
-		bool batchHasPasses = false;
-		for (const auto& queuedPass : batchTemplate.queuedPasses) {
-			const uint32_t passIndex = queuedPass.originalFramePassIndexAtExtraction;
-			auto nodeIndex = tryGetReplayNodeIndex(passIndex);
-			if (!nodeIndex) {
-				return recomputeTemplateBatch(batchTemplate, "template_pass_missing_current_node");
-			}
-			if (passIndex >= framePasses.size() || queuedPass.queueSlot >= queueCount) {
-				return recomputeTemplateBatch(batchTemplate, "template_pass_out_of_range");
-			}
-			auto& node = nodes[*nodeIndex];
-			node.assignedQueueSlot = queuedPass.queueSlot;
-			if (node.passIndex < m_assignedQueueSlotsByFramePass.size()) {
-				m_assignedQueueSlotsByFramePass[node.passIndex] = queuedPass.queueSlot;
-			}
-			m_schedulingDecisionTrace.push_back(SchedulingDecisionTrace{
-				.nodeIndex = *nodeIndex,
-				.passIndex = passIndex,
-				.batchIndex = batchIndex,
-				.assignedQueueSlot = queuedPass.queueSlot,
-				.closedBatchBefore = !batchHasPasses,
-				.readySetSize = 0,
-				.candidateChecks = 0,
-				.isNewBatchNeededChecks = 0,
-				.fallbackCommit = false,
-			});
-			if (!appendPassPointer(batch, queuedPass.queueSlot, framePasses[passIndex])) {
-				return recomputeTemplateBatch(batchTemplate, "template_pass_empty_variant");
-			}
-
-			if (passIndex < m_framePassSchedulingSummaries.size()) {
-				const auto& passSummary = m_framePassSchedulingSummaries[passIndex];
-				const QueueKind passQueue = m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(queuedPass.queueSlot));
-				for (const auto& requirement : passSummary.requirements) {
-					Resource* resource = requirement.resource.IsEphemeral()
-						? requirement.resource.GetEphemeralPtr()
-						: _registry.Resolve(requirement.resource);
-					if (resource == nullptr) {
-						resource = resolveTemplateResource(requirement.resourceID, 0, false);
-					}
-					const ResourceState requiredState = NormalizeStateForQueue(passQueue, requirement.state);
-					batch.passBatchTrackersByResourceIndex[requirement.resourceIndex] =
-						applyTrackerState(requirement.resourceIndex, requirement.resourceID, resource, requirement.range, requiredState);
-					SortedInsert(batch.allResources, requirement.resourceID);
-					RecordFrameQueueUsageBatch(queuedPass.queueSlot, requirement.resourceIndex, batchIndex);
-					if (AccessTypeIsWriteType(requirement.state.access)) {
-						SetFrameQueueHistoryValue(m_frameQueueLastProducerBatch, queuedPass.queueSlot, requirement.resourceIndex, batchIndex);
-						if (queuedPass.queueSlot < m_compiledLastProducerBatchByResourceByQueue.size()) {
-							m_compiledLastProducerBatchByResourceByQueue[queuedPass.queueSlot][requirement.resourceID] = batchIndex;
-						}
-					}
-					const bool requirementCanActivateAlias = AccessTypeIsWriteType(requirement.state.access)
-						|| requirement.state.access == rhi::ResourceAccessType::Common;
-					if (requirementCanActivateAlias && requirement.resourceIndex < m_aliasActivationPendingByResourceIndex.size()) {
-						m_aliasActivationPendingByResourceIndex[requirement.resourceIndex] = 0;
-						aliasActivationPending.erase(requirement.resourceID);
-					}
+			bool batchHasPasses = false;
+			for (const auto& queuedPass : batchTemplate.queuedPasses) {
+				const uint32_t passIndex = queuedPass.originalFramePassIndexAtExtraction;
+				auto nodeIndex = tryGetReplayNodeIndex(passIndex);
+				if (!nodeIndex) {
+					return recomputeTemplateBatch(batchTemplate, "template_pass_missing_current_node");
+				}
+				if (passIndex >= framePasses.size() || queuedPass.queueSlot >= queueCount) {
+					return recomputeTemplateBatch(batchTemplate, "template_pass_out_of_range");
 				}
 
-				std::visit(
-					[&](auto& pass) {
-						using PassTypeT = std::decay_t<decltype(pass)>;
-						if constexpr (!std::is_same_v<PassTypeT, std::monostate>) {
-							const auto& denseTransitions = passSummary.internalTransitions;
-							if (pass.resources.internalTransitions.size() == denseTransitions.size()) {
-								for (size_t transitionIndex = 0; transitionIndex < denseTransitions.size(); ++transitionIndex) {
-									const auto& exit = pass.resources.internalTransitions[transitionIndex];
-									const auto& denseTransition = denseTransitions[transitionIndex];
-									Resource* resource = exit.first.resource.IsEphemeral()
-										? exit.first.resource.GetEphemeralPtr()
-										: _registry.Resolve(exit.first.resource);
-									batch.passBatchTrackersByResourceIndex[denseTransition.resourceIndex] =
-										applyTrackerState(denseTransition.resourceIndex, denseTransition.resourceID, resource, exit.first.range, exit.second);
-									SortedInsert(batch.internallyTransitionedResources, denseTransition.resourceID);
-								}
-							}
-						}
-					},
-					framePasses[passIndex].pass);
-				report.addTransitionCallsSaved += passSummary.requirements.size();
+				auto& node = nodes[*nodeIndex];
+				node.assignedQueueSlot = queuedPass.queueSlot;
+				if (node.passIndex < m_assignedQueueSlotsByFramePass.size()) {
+					m_assignedQueueSlotsByFramePass[node.passIndex] = queuedPass.queueSlot;
+				}
+				m_schedulingDecisionTrace.push_back(SchedulingDecisionTrace{
+					.nodeIndex = *nodeIndex,
+					.passIndex = passIndex,
+					.batchIndex = batchIndex,
+					.assignedQueueSlot = queuedPass.queueSlot,
+					.closedBatchBefore = !batchHasPasses,
+					.readySetSize = 0,
+					.candidateChecks = 0,
+					.isNewBatchNeededChecks = 0,
+					.fallbackCommit = false,
+				});
+				if (!appendPassPointer(batch, queuedPass.queueSlot, framePasses[passIndex])) {
+					return recomputeTemplateBatch(batchTemplate, "template_pass_empty_variant");
+				}
+				if (passIndex < m_framePassSchedulingSummaries.size()) {
+					report.addTransitionCallsSaved += m_framePassSchedulingSummaries[passIndex].requirements.size();
+				}
+				batchHasPasses = true;
+				++report.checkedPasses;
+				++report.replayedPasses;
 			}
 
-			batchHasPasses = true;
-			++report.checkedPasses;
-			++report.replayedPasses;
+			for (const auto& signal : batchTemplate.signals) {
+				batch.MarkQueueSignal(signal.phase, signal.queueSlot);
+				latestSignalFenceByQueue[signal.queueSlot] = batch.GetQueueSignalFenceValue(signal.phase, signal.queueSlot);
+			}
+
+			if (batchHasPasses) {
+				batches.push_back(std::move(batch));
+				++report.templateReplayedBatches;
+			}
 		}
 
-		for (const auto& signal : batchTemplate.signals) {
-			batch.MarkQueueSignal(signal.phase, signal.queueSlot);
-			latestSignalFenceByQueue[signal.queueSlot] = batch.GetQueueSignalFenceValue(signal.phase, signal.queueSlot);
+		auto committedBatchIndexForLocal = [&](uint32_t localBatchIndex) -> unsigned int {
+			if (localBatchIndex < committedBatchIndexByLocal.size() && committedBatchIndexByLocal[localBatchIndex] != 0) {
+				return committedBatchIndexByLocal[localBatchIndex];
+			}
+			return replayBatchBaseIndex + localBatchIndex;
+		};
+
+		{
+			ZoneScopedN("RenderGraph::Replay::ApplySegmentQueueUsage");
+			for (const auto& usage : segment.contract.queueUsage) {
+				if (usage.queueSlot >= queueCount) {
+					continue;
+				}
+				auto resourceIndex = resolveTemplateResourceIndex(usage.resourceID, 0, false);
+				if (!resourceIndex) {
+					continue;
+				}
+				const unsigned int batchIndex = committedBatchIndexForLocal(usage.lastLocalBatch);
+				if (usage.read || usage.write) {
+					RecordFrameQueueUsageBatch(usage.queueSlot, *resourceIndex, batchIndex);
+				}
+				if (usage.transition) {
+					RecordFrameQueueTransitionBatch(usage.queueSlot, *resourceIndex, batchIndex);
+				}
+				if (usage.producer) {
+					SetFrameQueueHistoryValue(m_frameQueueLastProducerBatch, usage.queueSlot, *resourceIndex, batchIndex);
+					if (usage.queueSlot < m_compiledLastProducerBatchByResourceByQueue.size()) {
+						m_compiledLastProducerBatchByResourceByQueue[usage.queueSlot][usage.resourceID] = batchIndex;
+					}
+					if (*resourceIndex < m_aliasActivationPendingByResourceIndex.size()) {
+						m_aliasActivationPendingByResourceIndex[*resourceIndex] = 0;
+					}
+					aliasActivationPending.erase(usage.resourceID);
+				}
+			}
 		}
 
-		if (batchHasPasses) {
-			batches.push_back(std::move(batch));
-			++report.templateReplayedBatches;
-		}
-		(void)segment;
-		return true;
-	};
-
-	auto commitSegment = [&](const CachedReplaySegment& segment) -> bool {
-		ZoneScopedN("RenderGraph::Replay::CommitCachedSegment");
-		++report.matchedSegments;
-		if (!ensureSegmentInputs(segment)) {
+		if (!applySegmentOutputStates(segment)) {
 			return false;
 		}
-		for (const auto& batchTemplate : segment.batchTemplates) {
-			if (!commitTemplateBatch(segment, batchTemplate)) {
-				return false;
-			}
-		}
-		// The template batches above replay the segment's transitions and pass requirements
-		// in schedule order, which leaves the compile trackers in the segment's true exit
-		// state. The contract outputStates are a boundary summary, not an ordered final
-		// tracker log; applying them here can incorrectly rewind resources that were written
-		// and later transitioned/read inside the same segment.
 		return true;
 	};
 
@@ -7268,17 +7190,6 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 	};
 
 	std::string lastSegmentReadinessFailure;
-	auto describeTemplateTransition = [&](const ReplaySegmentTransitionTemplate& transitionTemplate) {
-		std::ostringstream oss;
-		oss << " resource_id=" << transitionTemplate.resourceID
-			<< " backing_id=" << transitionTemplate.backingResourceID
-			<< " dynamic=" << (transitionTemplate.dynamicResource ? 1 : 0)
-			<< " queue=" << transitionTemplate.queueSlot
-			<< " phase=" << static_cast<uint32_t>(transitionTemplate.phase)
-			<< " discard=" << (transitionTemplate.discard ? 1 : 0)
-			<< " range=" << FormatRangeSpec(transitionTemplate.range);
-		return oss.str();
-	};
 	auto segmentReplayPreflight = [&](const CachedReplaySegment& segment, std::string* outReason) {
 		auto setReason = [&](std::string reason) {
 			if (outReason && outReason->empty()) {
@@ -7286,20 +7197,6 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 			}
 		};
 		for (const auto& batchTemplate : segment.batchTemplates) {
-			for (const auto& transitionTemplate : batchTemplate.transitions) {
-				if (transitionTemplate.queueSlot >= queueCount) {
-					setReason("template_transition_queue_out_of_range");
-					return false;
-				}
-				if (resolveTemplateResource(transitionTemplate.resourceID, transitionTemplate.backingResourceID, transitionTemplate.dynamicResource) == nullptr) {
-					setReason("template_transition_resource_missing" + describeTemplateTransition(transitionTemplate));
-					return false;
-				}
-				if (!resolveTemplateResourceIndex(transitionTemplate.resourceID, transitionTemplate.backingResourceID, transitionTemplate.dynamicResource)) {
-					setReason("template_transition_resource_index_missing" + describeTemplateTransition(transitionTemplate));
-					return false;
-				}
-			}
 			for (const auto& signal : batchTemplate.signals) {
 				if (signal.queueSlot >= queueCount) {
 					setReason("template_signal_queue_out_of_range");
