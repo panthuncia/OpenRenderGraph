@@ -6691,7 +6691,19 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 
 			const QueueKind queueKind = m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(input.queueSlot));
 			const ResourceState requiredState = NormalizeStateForQueue(queueKind, input.requiredState);
+			const bool requiredStateIsNoAccess =
+				requiredState.access == rhi::ResourceAccessType::None
+				&& requiredState.layout == rhi::ResourceLayout::Undefined
+				&& requiredState.sync == rhi::ResourceSyncState::None;
 			auto& compileResourceState = GetOrCreateFrameCompileResourceState(*resourceIndex, resource, input.resourceID);
+			if (requiredStateIsNoAccess) {
+				// NONE/UNDEFINED/NONE is a template before-state marker, not a
+				// usable segment boundary state. Emitting a ReplaySegmentInput
+				// barrier to it would produce SyncAfter=None, after which D3D12
+				// forbids later access in the same ExecuteCommandLists scope.
+				inputBatch.passBatchTrackersByResourceIndex[*resourceIndex] = &compileResourceState.tracker;
+				continue;
+			}
 			if (!compileResourceState.tracker.WouldModify(input.range, requiredState)) {
 				inputBatch.passBatchTrackersByResourceIndex[*resourceIndex] = &compileResourceState.tracker;
 				continue;
