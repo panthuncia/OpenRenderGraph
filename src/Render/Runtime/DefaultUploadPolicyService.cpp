@@ -4,6 +4,8 @@
 #include <unordered_set>
 #include <vector>
 
+#include <tracy/Tracy.hpp>
+
 namespace rg::runtime {
 
 namespace {
@@ -68,10 +70,28 @@ public:
     }
 
     void FlushAll() override {
+        ZoneScopedN("DefaultUploadPolicyService::FlushAll");
         auto clients = SnapshotDirtyClients();
+        uint64_t flushedClients = 0;
+        uint64_t flushedWrites = 0;
+        uint64_t flushedBytes = 0;
+
         for (auto* client : clients) {
             if (client && client->HasPendingUploadPolicyWork()) {
-                client->OnUploadPolicyFlush();
+                {
+                    ZoneScopedN("DefaultUploadPolicyService::FlushClient");
+                    const auto debugName = client->GetUploadPolicyDebugName();
+                    if (!debugName.empty()) {
+                        ZoneText(debugName.data(), debugName.size());
+                    }
+                    client->OnUploadPolicyFlush();
+                    const auto clientWrites = client->GetUploadPolicyLastFlushWrites();
+                    const auto clientBytes = client->GetUploadPolicyLastFlushBytes();
+                    ZoneValue(clientBytes);
+                    flushedWrites += clientWrites;
+                    flushedBytes += clientBytes;
+                    ++flushedClients;
+                }
                 if (client->HasPendingUploadPolicyWork()) {
                     MarkClientDirty(client);
                 }
@@ -81,6 +101,9 @@ public:
         std::scoped_lock lock(m_mutex);
         ++m_stats.flushCalls;
         m_stats.registeredClients = static_cast<uint64_t>(m_clients.size());
+        m_stats.dirtyClientsFlushed = flushedClients;
+        m_stats.flushedWrites = flushedWrites;
+        m_stats.flushedBytes = flushedBytes;
     }
 
     UploadPolicyServiceStats GetStats() const override {

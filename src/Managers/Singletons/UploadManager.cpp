@@ -6,6 +6,7 @@
 #include <rhi_helpers.h>
 #include <rhi_debug.h>
 #include <spdlog/spdlog.h>
+#include <tracy/Tracy.hpp>
 
 #include "Resources/Buffers/Buffer.h"
 #include "Resources/Resource.h"
@@ -520,6 +521,7 @@ void UploadManager::UploadTextureSubresources(
 
 void UploadManager::ProcessDeferredReleases(uint8_t frameIndex)
 {
+	ZoneScopedN("UploadManager::ProcessDeferredReleases");
 	std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
 
 	// The page where this frame started uploading
@@ -537,6 +539,12 @@ void UploadManager::ProcessDeferredReleases(uint8_t frameIndex)
 	if (minStart > 0) {
 		// clamp so we don't delete our last page
 		size_t eraseCount = (std::min)(minStart, m_pages.size() - 1);
+		// Upload bursts can allocate many large pages in one frame. Retiring
+		// them all a few frames later destroys many 256 MiB buffers at once.
+		// Bound retirement work; pooled high-water memory is cheaper than a
+		// multi-ms frame spike.
+		eraseCount = (std::min)(eraseCount, size_t{ 1 });
+		ZoneValue(eraseCount);
 		if (eraseCount > 0) {
 			m_pages.erase(m_pages.begin(), m_pages.begin() + eraseCount);
 
@@ -544,9 +552,6 @@ void UploadManager::ProcessDeferredReleases(uint8_t frameIndex)
 			m_activePage -= eraseCount;
 			for (auto& start : m_frameStart) {
 				start = (start >= eraseCount ? start - eraseCount : 0);
-			}
-			for (size_t i = 0; i < m_pages.size(); ++i) {
-				TagUploadManagerPage(m_pages[i].buffer, i);
 			}
 			LogUploadManagerPages("retire", m_pages.size(), m_activePage, kPageSize);
 		}

@@ -6,6 +6,7 @@
 
 #include <rhi_helpers.h>
 #include <spdlog/spdlog.h>
+#include <tracy/Tracy.hpp>
 
 #include "Resources/Buffers/Buffer.h"
 #include "Resources/Resource.h"
@@ -341,6 +342,7 @@ void UploadInstance::ProcessUploads(uint8_t frameIndex, rg::imm::ImmediateComman
 // Page retirement
 
 void UploadInstance::ProcessDeferredReleases(uint8_t frameIndex) {
+	ZoneScopedN("UploadInstance::ProcessDeferredReleases");
 	size_t retiringStart = m_frameStart[frameIndex];
 
 	size_t minStart = retiringStart;
@@ -351,14 +353,13 @@ void UploadInstance::ProcessDeferredReleases(uint8_t frameIndex) {
 
 	if (minStart > 0) {
 		size_t eraseCount = (std::min)(minStart, m_pages.size() - 1);
+		eraseCount = (std::min)(eraseCount, size_t{ 1 });
+		ZoneValue(eraseCount);
 		if (eraseCount > 0) {
 			m_pages.erase(m_pages.begin(), m_pages.begin() + static_cast<ptrdiff_t>(eraseCount));
 			m_activePage -= eraseCount;
 			for (auto& start : m_frameStart) {
 				start = (start >= eraseCount ? start - eraseCount : 0);
-			}
-			for (size_t i = 0; i < m_pages.size(); ++i) {
-				TagUploadInstancePage(m_pages[i].buffer, i);
 			}
 			LogUploadInstancePages("retire", m_pages.size(), m_activePage, m_pageSize);
 		}

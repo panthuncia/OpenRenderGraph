@@ -108,6 +108,7 @@ public:
     void OnUploadPolicyBeginFrame() override {}
     void OnUploadPolicyFlush() override {}
     bool HasPendingUploadPolicyWork() const override { return false; }
+    std::string GetUploadPolicyDebugName() const override { return GetName(); }
 
 protected:
     void SetBacking(std::unique_ptr<GpuBufferBacking> backing, uint64_t bufferSize);
