@@ -19,6 +19,7 @@
 #include "Render/Runtime/UploadTypes.h"
 #include "Render/Runtime/StreamingUploadTypes.h"
 #include "Managers/AsyncCopyPagePool.h"
+#include "Managers/UploadInstance.h"
 
 class Buffer;
 class Resource;
@@ -34,53 +35,10 @@ struct ResourceCopy {
 	std::string destinationDebugName;
 };
 
-struct ReleaseRequest {
-	size_t size;
-	uint64_t offset;
-};
-
-struct UploadPage {
-	std::shared_ptr<Buffer> buffer;
-	size_t                  tailOffset = 0;
-};
-
-
 class UploadManager {
 public:
 	using UploadResolveContext = rg::runtime::UploadResolveContext;
 	using UploadTarget = rg::runtime::UploadTarget;
-
-	class ResourceUpdate {
-	public:
-		ResourceUpdate() = default;
-		size_t size{};
-		UploadTarget resourceToUpdate{};
-		std::shared_ptr<Resource> uploadBuffer;
-		size_t uploadBufferOffset{};
-		size_t dataBufferOffset{};
-		bool active = true;
-		const char* file = nullptr;
-		int line = 0;
-		uint64_t targetGlobalResourceId = 0;
-		std::string targetDebugName;
-	};
-
-	class TextureUpdate {
-	public:
-		TextureUpdate() = default;
-		UploadTarget texture;
-		uint32_t mip;
-		uint32_t slice;
-		rhi::CopyableFootprint footprint;
-		uint32_t x;
-		uint32_t y;
-		uint32_t z;
-		std::shared_ptr<Resource> uploadBuffer;
-		const char* file = nullptr;
-		int line = 0;
-		uint64_t targetGlobalResourceId = 0;
-		std::string targetDebugName;
-	};
 
 	static UploadManager& GetInstance();
 	void Initialize();
@@ -183,52 +141,20 @@ private:
 		m_uploadPass = std::make_shared<UploadPass>();
 	}
 	void MarkUploadPassDirty();
-	void PruneInvalidRegistryHandleUpdatesLocked(const char* reason);
-	void RefreshQueuedTargetTelemetryLocked();
 	void DeclareUploadPassResourceUsages(RenderPassBuilder* builder);
-	bool AllocateUploadRegion(size_t size, size_t alignment, std::shared_ptr<Resource>& outUploadBuffer, size_t& outOffset);
-
-	// Coalescing / last-write-wins helpers
-	static bool RangesOverlap(size_t a0, size_t a1, size_t b0, size_t b1) noexcept;
-	static bool RangeContains(size_t outer0, size_t outer1, size_t inner0, size_t inner1) noexcept;
-
-	static bool TryCoalesceAppend(ResourceUpdate& last, const ResourceUpdate& next) noexcept;
-
-	// Mutates newUpdate (may expand into a union update); may mark old updates inactive; may deactivate newUpdate if patched into an older containing update.
-	void ApplyLastWriteWins(ResourceUpdate& newUpdate) noexcept;
-
-	static void MapUpload(const std::shared_ptr<Resource>& uploadBuffer, size_t mapSize, uint8_t** outMapped) noexcept;
-	static void UnmapUpload(const std::shared_ptr<Resource>& uploadBuffer) noexcept;
-
-	//Resource* ResolveTarget(const UploadTarget& t) {
-	//	if (t.kind == UploadTarget::Kind::PinnedShared) return t.pinned.get();
-
-	//	// Registry handle
-	//	if (!m_ctx.registry) throw std::runtime_error("UploadManager has no registry context this frame");
-	//	return m_ctx.registry->Resolve(t.h); // or view->Resolve(h)
-	//}
-
-	size_t                 m_currentCapacity = 0;
-	size_t                 m_headOffset = 0;   // oldest in flight allocation
-	size_t                 m_tailOffset = 0;   // where next allocation comes from
-	std::vector<UploadPage>    m_pages;
-	size_t                     m_activePage = 0;
-	static constexpr size_t    kPageSize = 256 * 1024 * 1024; // 256 MB
-	static constexpr size_t    kMaxPageSize = 4294967296; // 4 GB
-	static constexpr size_t	   maxSingleUploadSize = 4294967296; // 4 GB
-	std::vector<size_t>           m_frameStart;      // size = numFramesInFlight
+	void CaptureResourceCopyTelemetry(ResourceCopy& copy);
+	void RefreshQueuedCopyTelemetryLocked();
+	bool IsUploadTargetValid(const UploadTarget& target, const char* reason, const char* file, int line);
+	void CaptureUploadTargetTelemetry(const UploadTarget& target, uint64_t& outId, std::string& outName);
 
 	uint8_t m_numFramesInFlight = 0;
-
-	std::function<uint8_t()> getNumFramesInFlight;
-	std::vector<ResourceUpdate> m_resourceUpdates;
-	std::vector<TextureUpdate> m_textureUpdates;
 
 	std::vector<ResourceCopy> queuedResourceCopies;
 	std::mutex m_uploadQueueMutex;
 
 	UploadResolveContext m_ctx{};
 	std::shared_ptr<UploadPass> m_uploadPass;
+	std::unique_ptr<UploadInstance> m_uploadInstance;
 
 	// ── Streaming upload (copy-queue) state ─────────────────────────────
 	AsyncCopyPagePool                     m_streamingPagePool;

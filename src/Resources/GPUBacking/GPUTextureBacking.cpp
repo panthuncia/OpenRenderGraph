@@ -267,9 +267,14 @@ bool GpuTextureBacking::HasValidResource() const
 	}
 
 	rhi::D3D12ResourceInfo resourceInfo{};
-	return true;
-	return rhi::QueryNativeResource(resource, rhi::RHI_IID_D3D12_RESOURCE, &resourceInfo, sizeof(resourceInfo)) &&
-		resourceInfo.resource != nullptr;
+	if (rhi::QueryNativeResource(resource, rhi::RHI_IID_D3D12_RESOURCE, &resourceInfo, sizeof(resourceInfo)) &&
+		resourceInfo.resource != nullptr) {
+		return true;
+	}
+
+	rhi::VulkanResourceInfo vkResourceInfo{};
+	return rhi::QueryNativeResource(resource, rhi::RHI_IID_VK_RESOURCE, &vkResourceInfo, sizeof(vkResourceInfo)) &&
+		vkResourceInfo.resource != nullptr;
 }
 
 std::mutex& GpuTextureBacking::LiveAllocMutex() {

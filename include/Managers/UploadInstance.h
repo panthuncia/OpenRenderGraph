@@ -2,8 +2,16 @@
 
 #include <vector>
 #include <memory>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <unordered_set>
 
 #include <rhi.h>
 #include <rhi_helpers.h>
@@ -30,10 +38,68 @@ public:
 	using UploadTarget        = rg::runtime::UploadTarget;
 	using UploadResolveContext = rg::runtime::UploadResolveContext;
 
+	static constexpr size_t kDefaultPageSize = 16 * 1024 * 1024; // 16 MB
+	static constexpr size_t kDefaultPreallocateCapacity = 128 * 1024 * 1024; // 128 MB
+
+	struct Config {
+		uint8_t numFramesInFlight = 3;
+		size_t pageSizeBytes = kDefaultPageSize;
+		size_t preallocateCapacityBytes = kDefaultPreallocateCapacity;
+		std::string debugName = "UploadInstance";
+		std::string pageNamePrefix = "UploadInstancePage";
+		std::string usageHint = "UploadInstance page";
+	};
+
+	struct ResourceUpdate {
+		size_t size{};
+		UploadTarget resourceToUpdate{};
+		std::shared_ptr<Resource> uploadBuffer;
+		size_t uploadBufferOffset{};
+		size_t dataBufferOffset{};
+		bool active = true;
+#if BUILD_TYPE == BUILD_TYPE_DEBUG
+		const char* file{};
+		int line{};
+		static constexpr int MaxStack = 8;
+		void* stack[MaxStack]{};
+		uint8_t stackSize{};
+#endif
+		uint64_t targetGlobalResourceId = 0;
+		std::string targetDebugName;
+	};
+
+	struct TextureUpdate {
+		UploadTarget texture;
+		uint32_t mip{};
+		uint32_t slice{};
+		rhi::CopyableFootprint footprint{};
+		uint32_t x{};
+		uint32_t y{};
+		uint32_t z{};
+		std::shared_ptr<Resource> uploadBuffer;
+#if BUILD_TYPE == BUILD_TYPE_DEBUG
+		const char* file{};
+		int line{};
+#endif
+		uint64_t targetGlobalResourceId = 0;
+		std::string targetDebugName;
+	};
+
+	using PendingWorkChangedCallback = std::function<void()>;
+	using TargetTelemetryCallback = std::function<void(const UploadTarget&, uint64_t&, std::string&)>;
+	using InvalidRegistryHandleCallback = std::function<bool(const UploadTarget&, const char* reason, const char* file, int line)>;
+
 	// Construct an upload instance.
 	// @param numFramesInFlight  Number of frames in flight for page retirement.
-	// @param pageSize           Size of each upload-heap page in bytes (default 256 MB).
+	// @param pageSize           Size of each upload-heap page in bytes (default 16 MB).
 	explicit UploadInstance(uint8_t numFramesInFlight, size_t pageSize = kDefaultPageSize);
+	explicit UploadInstance(Config config);
+	~UploadInstance();
+
+	UploadInstance(const UploadInstance&) = delete;
+	UploadInstance& operator=(const UploadInstance&) = delete;
+	UploadInstance(UploadInstance&&) = delete;
+	UploadInstance& operator=(UploadInstance&&) = delete;
 
 	// Buffer uploads
 #if BUILD_TYPE == BUILD_TYPE_DEBUG
@@ -82,7 +148,10 @@ public:
 
 	// Configuration
 
-	void SetResolveContext(UploadResolveContext ctx) { m_ctx = ctx; }
+	void SetResolveContext(UploadResolveContext ctx);
+	void SetPendingWorkChangedCallback(PendingWorkChangedCallback callback);
+	void SetTargetTelemetryCallback(TargetTelemetryCallback callback);
+	void SetInvalidRegistryHandleCallback(InvalidRegistryHandleCallback callback);
 
 	// Returns true if there are any pending buffer or texture uploads.
 	bool HasPendingWork() const;
@@ -90,12 +159,13 @@ public:
 	// Collect the destination resources that pending uploads will write to.
 	// Call during DeclareResourceUsages to declare copy targets.
 	void CollectPendingDestinations(std::vector<std::shared_ptr<Resource>>& out) const;
+	void DeclarePendingUploadResourceUsages(
+		const std::function<void(const std::shared_ptr<Resource>&)>& copySource,
+		const std::function<void(const UploadTarget&, uint32_t mip, uint32_t slice)>& copyDest);
+
+	std::string DescribeQueuedTargetByGlobalResourceId(uint64_t globalResourceId);
 
 	void Cleanup();
-
-	// Constants
-
-	static constexpr size_t kDefaultPageSize = 256 * 1024 * 1024; // 256 MB
 
 private:
 	// Nested types
@@ -103,38 +173,12 @@ private:
 	struct UploadPage {
 		std::shared_ptr<Buffer> buffer;
 		size_t                  tailOffset = 0;
+		size_t                  capacity = 0;
+		size_t                  index = 0;
+		bool                    dedicated = false;
+		bool                    tagged = false;
 	};
-
-	struct ResourceUpdate {
-		size_t size{};
-		UploadTarget resourceToUpdate{};
-		std::shared_ptr<Resource> uploadBuffer;
-		size_t uploadBufferOffset{};
-		size_t dataBufferOffset{};
-		bool active = true;
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
-		const char* file{};
-		int line{};
-		static constexpr int MaxStack = 8;
-		void* stack[MaxStack]{};
-		uint8_t stackSize{};
-#endif
-	};
-
-	struct TextureUpdate {
-		UploadTarget texture;
-		uint32_t mip{};
-		uint32_t slice{};
-		rhi::CopyableFootprint footprint{};
-		uint32_t x{};
-		uint32_t y{};
-		uint32_t z{};
-		std::shared_ptr<Resource> uploadBuffer;
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
-		const char* file{};
-		int line{};
-#endif
-	};
+	using UploadPagePtr = std::shared_ptr<UploadPage>;
 
 	// Internal helpers
 
@@ -146,17 +190,54 @@ private:
 	static void MapUpload(const std::shared_ptr<Resource>& uploadBuffer, size_t mapSize,
 	                       uint8_t** outMapped) noexcept;
 	static void UnmapUpload(const std::shared_ptr<Resource>& uploadBuffer) noexcept;
+	void MarkPendingWorkChangedLocked();
+	void CaptureTargetTelemetryLocked(const UploadTarget& target, uint64_t& outId, std::string& outName);
+	void RefreshQueuedTargetTelemetryLocked();
+	void PruneInvalidRegistryHandleUpdatesLocked(const char* reason);
+	UploadPagePtr CreatePage(size_t size, bool dedicated);
+	void TagPage(const UploadPagePtr& page);
+	UploadPagePtr AcquirePageLocked(size_t minSize, bool dedicated);
+	void TrackPageForCurrentFrameLocked(const UploadPagePtr& page);
+	void StartWorker();
+	void StopWorker();
+	void WorkerMain();
+	void RequestWorkerPagesLocked();
+	size_t NormalPageCountForBytes(size_t bytes) const noexcept;
+	size_t WarmTargetPageCountLocked() const noexcept;
+	size_t AvailableReusableNormalPagesLocked() const noexcept;
 
 	// State
 
 	size_t                     m_pageSize;
-	std::vector<UploadPage>    m_pages;
-	size_t                     m_activePage = 0;
-	std::vector<size_t>        m_frameStart;
+	size_t                     m_preallocateCapacityBytes = kDefaultPreallocateCapacity;
+	std::string                m_debugName = "UploadInstance";
+	std::string                m_pageNamePrefix = "UploadInstancePage";
+	std::string                m_usageHint = "UploadInstance page";
+
+	std::deque<UploadPagePtr>  m_freePages;
+	std::deque<UploadPagePtr>  m_readyPages;
+	std::vector<UploadPagePtr> m_openPages;
+	std::unordered_set<UploadPage*> m_openPageSet;
+	std::vector<std::vector<UploadPagePtr>> m_framePages;
+	UploadPagePtr             m_activePage;
+	std::atomic_size_t         m_nextPageIndex = 0;
 	uint8_t                    m_numFramesInFlight;
+	size_t                     m_currentFrameUploadBytes = 0;
+	std::vector<size_t>        m_recentFrameBytes;
+	size_t                     m_recentFrameCursor = 0;
 
 	std::vector<ResourceUpdate>  m_resourceUpdates;
 	std::vector<TextureUpdate>   m_textureUpdates;
 
 	UploadResolveContext m_ctx{};
+	PendingWorkChangedCallback m_pendingWorkChanged;
+	TargetTelemetryCallback m_targetTelemetry;
+	InvalidRegistryHandleCallback m_invalidRegistryHandle;
+
+	mutable std::mutex m_uploadQueueMutex;
+	std::mutex m_workerMutex;
+	std::condition_variable m_workerCV;
+	std::thread m_workerThread;
+	bool m_workerQuit = false;
+	size_t m_workerRequestedPages = 0;
 };
