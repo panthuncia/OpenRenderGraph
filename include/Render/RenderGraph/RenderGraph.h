@@ -1337,6 +1337,7 @@ private:
 	std::unordered_set<std::string> m_passNamesSeenThisReset;
 
 	std::vector<AnyPassAndResources> m_masterPassList;
+	std::vector<std::pair<std::string, std::string>> m_structuralExplicitAfterByName;
 	std::vector<AnyPassAndResources> m_framePasses;
 	std::vector<uint8_t> m_framePassIsFrameExtension;
 	std::vector<uint8_t> m_framePassDeclarationRefreshedThisFrame;

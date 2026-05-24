@@ -4873,6 +4873,23 @@ void RenderGraph::ExtractReplaySegmentsFromAuthoritativeCompile(
 			framePasses[passIndex].pass);
 	}
 
+	std::unordered_map<uint32_t, size_t> transitionOwnerRegionByBatch;
+	transitionOwnerRegionByBatch.reserve(regions.size() * 2);
+	for (size_t regionIndex = 0; regionIndex < regions.size(); ++regionIndex) {
+		const auto& region = regions[regionIndex];
+		if (region.firstBatchIndex == std::numeric_limits<uint32_t>::max()) {
+			continue;
+		}
+		for (uint32_t batchIndex = region.firstBatchIndex;
+			batchIndex <= region.lastBatchIndex && batchIndex < compiledBatches.size();
+			++batchIndex) {
+			transitionOwnerRegionByBatch.emplace(batchIndex, regionIndex);
+			if (batchIndex == std::numeric_limits<uint32_t>::max()) {
+				break;
+			}
+		}
+	}
+
 	std::vector<size_t> traceIndexByNodeIndex(nodes.size(), std::numeric_limits<size_t>::max());
 	for (size_t traceIndex = 0; traceIndex < m_schedulingDecisionTrace.size(); ++traceIndex) {
 		const auto& trace = m_schedulingDecisionTrace[traceIndex];
@@ -4909,21 +4926,13 @@ void RenderGraph::ExtractReplaySegmentsFromAuthoritativeCompile(
 			inputs.push_back(input);
 		}
 	};
-	auto addOutputState = [](std::vector<ReplaySegmentOutputState>& outputs, ReplaySegmentOutputState output) {
-		auto it = std::find_if(outputs.begin(), outputs.end(), [&](const ReplaySegmentOutputState& existing) {
-			return existing.resourceID == output.resourceID
-				&& existing.range.mipLower == output.range.mipLower
-				&& existing.range.mipUpper == output.range.mipUpper
-				&& existing.range.sliceLower == output.range.sliceLower
-				&& existing.range.sliceUpper == output.range.sliceUpper;
-		});
-		if (it == outputs.end()) {
-			outputs.push_back(output);
-		}
-		else {
-			*it = output;
-		}
+	struct ReplaySegmentOutputAccumulator {
+		ResourceRegistry::RegistryHandle handle{};
+		Resource* resource = nullptr;
+		SymbolicTracker tracker{};
+		bool initialized = false;
 	};
+	std::vector<ResourceTransition> outputAccumulatorScratch;
 	auto addQueueUsage = [](std::vector<ReplaySegmentQueueUsageSummary>& summaries, ReplaySegmentQueueUsageSummary usage) {
 		auto it = std::find_if(summaries.begin(), summaries.end(), [&](const ReplaySegmentQueueUsageSummary& existing) {
 			return existing.resourceID == usage.resourceID && existing.queueSlot == usage.queueSlot;
@@ -4940,7 +4949,8 @@ void RenderGraph::ExtractReplaySegmentsFromAuthoritativeCompile(
 		it->producer = it->producer || usage.producer;
 	};
 
-	for (const ScheduledRegion& region : regions) {
+	for (size_t regionIndex = 0; regionIndex < regions.size(); ++regionIndex) {
+		const ScheduledRegion& region = regions[regionIndex];
 		CachedReplaySegment segment{};
 		segment.schedule = region;
 		segment.identity.passCount = region.passCount;
@@ -4956,6 +4966,7 @@ void RenderGraph::ExtractReplaySegmentsFromAuthoritativeCompile(
 		segment.templateStats.transitionShapeHash = 0x7365677473687001ull;
 		segment.templateStats.transitionStateHash = 0x7365677473746101ull;
 		segment.templateStats.syncShapeHash = 0x73656773796e6301ull;
+		std::unordered_map<uint64_t, ReplaySegmentOutputAccumulator> outputAccumulators;
 
 		segment.identity.structuralPositionHash = HashCombine64(segment.identity.structuralPositionHash, region.firstTraceIndex);
 		segment.identity.structuralPositionHash = HashCombine64(segment.identity.structuralPositionHash, region.lastTraceIndex);
@@ -4974,6 +4985,65 @@ void RenderGraph::ExtractReplaySegmentsFromAuthoritativeCompile(
 		std::unordered_set<size_t> regionPassIndices;
 		regionNodeIndices.reserve(region.passCount);
 		regionPassIndices.reserve(region.passCount);
+		outputAccumulators.reserve(region.passCount * 2);
+
+		auto addOutputState = [&](uint64_t resourceID, const RangeSpec& range, const ResourceState& finalState, ResourceRegistry::RegistryHandle handle, Resource* resource) {
+			if (resource == nullptr && handle.IsEphemeral()) {
+				resource = handle.GetEphemeralPtr();
+			}
+			auto& accumulator = outputAccumulators[resourceID];
+			if (!accumulator.initialized) {
+				accumulator.handle = handle;
+				accumulator.resource = resource;
+				accumulator.tracker = SymbolicTracker(range, finalState);
+				accumulator.initialized = true;
+				return;
+			}
+			if (accumulator.resource == nullptr) {
+				accumulator.resource = resource;
+			}
+			if (accumulator.handle.IsEphemeral() && !handle.IsEphemeral()) {
+				accumulator.handle = handle;
+			}
+			outputAccumulatorScratch.clear();
+			accumulator.tracker.Apply(range, accumulator.resource, finalState, outputAccumulatorScratch);
+		};
+		auto materializeOutputStates = [&]() {
+			segment.contract.outputStates.clear();
+			for (const auto& [resourceID, accumulator] : outputAccumulators) {
+				if (!accumulator.initialized) {
+					continue;
+				}
+				for (const auto& exitSegment : accumulator.tracker.GetSegments()) {
+					const bool wholeResource = IsWholeResourceRange(exitSegment.rangeSpec, accumulator.handle);
+					segment.contract.outputStates.push_back(ReplaySegmentOutputState{
+						.resourceID = resourceID,
+						.range = exitSegment.rangeSpec,
+						.finalState = exitSegment.state,
+						.wholeResource = wholeResource,
+						.validFastState = wholeResource,
+					});
+				}
+			}
+			auto boundKey = [](const Bound& bound) {
+				return std::pair<uint32_t, uint32_t>{ static_cast<uint32_t>(bound.type), bound.value };
+			};
+			std::sort(segment.contract.outputStates.begin(), segment.contract.outputStates.end(), [&](const auto& lhs, const auto& rhs) {
+				return std::tuple{
+					lhs.resourceID,
+					boundKey(lhs.range.sliceLower),
+					boundKey(lhs.range.sliceUpper),
+					boundKey(lhs.range.mipLower),
+					boundKey(lhs.range.mipUpper),
+				} < std::tuple{
+					rhs.resourceID,
+					boundKey(rhs.range.sliceLower),
+					boundKey(rhs.range.sliceUpper),
+					boundKey(rhs.range.mipLower),
+					boundKey(rhs.range.mipUpper),
+				};
+			});
+		};
 
 		for (uint32_t traceIndex = region.firstTraceIndex; traceIndex <= region.lastTraceIndex && traceIndex < m_schedulingDecisionTrace.size(); ++traceIndex) {
 			const auto& trace = m_schedulingDecisionTrace[traceIndex];
@@ -5086,9 +5156,27 @@ void RenderGraph::ExtractReplaySegmentsFromAuthoritativeCompile(
 			ReplaySegmentBatchTemplate batchTemplate{};
 			batchTemplate.localBatchIndex = batchIndex - region.firstBatchIndex;
 			batchTemplate.originalBatchIndexAtExtraction = batchIndex;
-			batchTemplate.partialBatch = region.sameBatchPrefixPassCount != 0 || region.sameBatchSuffixPassCount != 0 || region.crossQueueBoundaryPassCount != 0;
+			batchTemplate.partialBatch = false;
 			batchTemplate.allResources = batch.allResources;
 			batchTemplate.internallyTransitionedResources = batch.internallyTransitionedResources;
+
+			for (size_t queueIndex = 0; queueIndex < batch.QueueCount(); ++queueIndex) {
+				for (const auto& queuedPass : batch.Passes(queueIndex)) {
+					std::visit(
+						[&](const auto* passEntry) {
+							auto it = passIndexByPointer.find(static_cast<const void*>(passEntry));
+							if (it == passIndexByPointer.end() || !regionPassIndices.contains(it->second)) {
+								batchTemplate.partialBatch = true;
+							}
+						},
+						queuedPass);
+				}
+			}
+
+			const auto ownerIt = transitionOwnerRegionByBatch.find(batchIndex);
+			const bool ownsBatchTransitions = ownerIt == transitionOwnerRegionByBatch.end()
+				|| ownerIt->second == regionIndex
+				|| !batchTemplate.partialBatch;
 
 			for (size_t queueIndex = 0; queueIndex < batch.QueueCount(); ++queueIndex) {
 				auto addExpectedTransitionInput = [&](const ResourceTransition& transition) {
@@ -5127,8 +5215,10 @@ void RenderGraph::ExtractReplaySegmentsFromAuthoritativeCompile(
 					});
 				};
 
-				for (const auto& transition : batch.Transitions(queueIndex, BatchTransitionPhase::BeforePasses)) {
-					addExpectedTransitionInput(transition);
+				if (ownsBatchTransitions) {
+					for (const auto& transition : batch.Transitions(queueIndex, BatchTransitionPhase::BeforePasses)) {
+						addExpectedTransitionInput(transition);
+					}
 				}
 
 				for (const auto& queuedPass : batch.Passes(queueIndex)) {
@@ -5169,26 +5259,20 @@ void RenderGraph::ExtractReplaySegmentsFromAuthoritativeCompile(
 										.readOnlyUniformWeakRequirement = requirement.resourceIndex < m_frameResourceAccessSummaries.size()
 											&& m_frameResourceAccessSummaries[requirement.resourceIndex].readOnlyUniform,
 									});
-									addOutputState(segment.contract.outputStates, ReplaySegmentOutputState{
-										.resourceID = requirement.resourceID,
-										.range = requirement.range,
-										.finalState = normalizedState,
-										.wholeResource = IsWholeResourceRange(requirement.range, requirement.resource),
-										.validFastState = IsWholeResourceRange(requirement.range, requirement.resource),
-									});
+									Resource* requirementResource = requirement.resource.IsEphemeral()
+										? requirement.resource.GetEphemeralPtr()
+										: const_cast<Resource*>(_registry.Resolve(requirement.resource));
+									addOutputState(requirement.resourceID, requirement.range, normalizedState, requirement.resource, requirementResource);
 								}
 								const auto& denseTransitions = passSummary.internalTransitions;
 								if (passEntry->resources.internalTransitions.size() == denseTransitions.size()) {
 									for (size_t transitionIndex = 0; transitionIndex < denseTransitions.size(); ++transitionIndex) {
 										const auto& exit = passEntry->resources.internalTransitions[transitionIndex];
 										const auto& denseTransition = denseTransitions[transitionIndex];
-										addOutputState(segment.contract.outputStates, ReplaySegmentOutputState{
-											.resourceID = denseTransition.resourceID,
-											.range = exit.first.range,
-											.finalState = exit.second,
-											.wholeResource = IsWholeResourceRange(exit.first.range, exit.first.resource),
-											.validFastState = IsWholeResourceRange(exit.first.range, exit.first.resource),
-										});
+										Resource* transitionResource = exit.first.resource.IsEphemeral()
+											? exit.first.resource.GetEphemeralPtr()
+											: const_cast<Resource*>(_registry.Resolve(exit.first.resource));
+										addOutputState(denseTransition.resourceID, exit.first.range, exit.second, exit.first.resource, transitionResource);
 									}
 								}
 							}
@@ -5198,18 +5282,29 @@ void RenderGraph::ExtractReplaySegmentsFromAuthoritativeCompile(
 
 				for (size_t phaseIndex = 0; phaseIndex < static_cast<size_t>(BatchTransitionPhase::Count); ++phaseIndex) {
 					const auto phase = static_cast<BatchTransitionPhase>(phaseIndex);
+					if (!ownsBatchTransitions) {
+						continue;
+					}
 					for (const auto& transition : batch.Transitions(queueIndex, phase)) {
 						if (phase == BatchTransitionPhase::AfterPasses) {
 							addExpectedTransitionInput(transition);
 						}
 						const auto transitionResourceID = replayTemplateResourceID(transition.pResource);
-						addOutputState(segment.contract.outputStates, ReplaySegmentOutputState{
-							.resourceID = transitionResourceID.logicalID,
-							.range = transition.range,
-							.finalState = ResourceState{ transition.newAccessType, transition.newLayout, transition.newSyncState },
-							.wholeResource = rangeSpecIsAll(transition.range),
-							.validFastState = rangeSpecIsAll(transition.range),
-						});
+						if (transition.pResource != nullptr) {
+							ResourceRegistry::RegistryHandle transitionHandle{};
+							if (auto cachedHandle = _registry.GetHandleFor(transition.pResource)) {
+								transitionHandle = *cachedHandle;
+							}
+							else {
+								transitionHandle = ResourceRegistry::RegistryHandle::MakeEphemeral(transition.pResource);
+							}
+							addOutputState(
+								transitionResourceID.logicalID,
+								transition.range,
+								ResourceState{ transition.newAccessType, transition.newLayout, transition.newSyncState },
+								transitionHandle,
+								transition.pResource);
+						}
 						batchTemplate.transitions.push_back(ReplaySegmentTransitionTemplate{
 							.resourceID = transitionResourceID.logicalID,
 							.backingResourceID = transitionResourceID.backingID,
@@ -5240,10 +5335,28 @@ void RenderGraph::ExtractReplaySegmentsFromAuthoritativeCompile(
 					}
 				}
 
+				auto queueHasTemplateWork = [&](size_t candidateQueueIndex) {
+					for (const auto& queuedPass : batchTemplate.queuedPasses) {
+						if (queuedPass.queueSlot == candidateQueueIndex) {
+							return true;
+						}
+					}
+					for (const auto& transitionTemplate : batchTemplate.transitions) {
+						if (transitionTemplate.queueSlot == candidateQueueIndex) {
+							return true;
+						}
+					}
+					return false;
+				};
+				const bool queueOwnsTemplateWork = queueHasTemplateWork(queueIndex);
+
 				for (size_t waitPhaseIndex = 0; waitPhaseIndex < PassBatch::kWaitPhaseCount; ++waitPhaseIndex) {
 					const auto waitPhase = static_cast<BatchWaitPhase>(waitPhaseIndex);
 					for (size_t src = 0; src < batch.QueueCount(); ++src) {
 						if (!batch.HasQueueWait(waitPhase, queueIndex, src)) {
+							continue;
+						}
+						if (!queueOwnsTemplateWork) {
 							continue;
 						}
 						batchTemplate.waits.push_back(ReplaySegmentWaitTemplate{
@@ -5270,6 +5383,9 @@ void RenderGraph::ExtractReplaySegmentsFromAuthoritativeCompile(
 					if (!batch.HasQueueSignal(signalPhase, queueIndex)) {
 						continue;
 					}
+					if (!queueOwnsTemplateWork) {
+						continue;
+					}
 					batchTemplate.signals.push_back(ReplaySegmentSignalTemplate{
 						.queueSlot = static_cast<uint16_t>(queueIndex),
 						.phase = signalPhase,
@@ -5292,6 +5408,8 @@ void RenderGraph::ExtractReplaySegmentsFromAuthoritativeCompile(
 			segment.fingerprint.templateShapeHash = HashCombine64(segment.fingerprint.templateShapeHash, segment.templateStats.syncShapeHash);
 			segment.batchTemplates.push_back(std::move(batchTemplate));
 		}
+
+		materializeOutputStates();
 
 		segment.tier1Eligible = region.sameBatchInterleavedPassCount == 0;
 		for (uint32_t traceIndex = region.firstTraceIndex; traceIndex <= region.lastTraceIndex && traceIndex < m_schedulingDecisionTrace.size(); ++traceIndex) {
@@ -5562,9 +5680,12 @@ RenderGraph::ReplaySegmentVariantKey RenderGraph::BuildReplaySegmentVariantKey(c
 			hardTemplateHash = HashCombine64(hardTemplateHash, static_cast<uint64_t>(queuedPass.type));
 		}
 		for (const auto& transition : batchTemplate.transitions) {
-			// The authoritative replay path replays the current pass sequence and regenerates concrete transitions.
-			// Treat transition resource IDs as diagnostic data here so transient/upload resource ID churn does not
-			// create an unbounded set of otherwise identical cache variants.
+			// Stable graph resources are part of the replay contract. Dynamic wrappers
+			// may legitimately rotate backing resources, so keep those relaxed.
+			if (!transition.dynamicResource) {
+				hardTemplateHash = HashCombine64(hardTemplateHash, transition.resourceID);
+				hardTemplateHash = HashCombine64(hardTemplateHash, transition.backingResourceID);
+			}
 			hardTemplateHash = hashRange(hardTemplateHash, transition.range);
 			hardTemplateHash = hashState(hardTemplateHash, transition.before);
 			hardTemplateHash = hashState(hardTemplateHash, transition.after);
@@ -5645,6 +5766,10 @@ bool RenderGraph::ReplaySegmentHardTemplateMatches(const CachedReplaySegment& ca
 		for (size_t transitionIndex = 0; transitionIndex < lhsBatch.transitions.size(); ++transitionIndex) {
 			const auto& lhs = lhsBatch.transitions[transitionIndex];
 			const auto& rhs = rhsBatch.transitions[transitionIndex];
+			if ((!lhs.dynamicResource || !rhs.dynamicResource)
+				&& (lhs.resourceID != rhs.resourceID || lhs.backingResourceID != rhs.backingResourceID)) {
+				return false;
+			}
 			if (lhs.range.mipLower != rhs.range.mipLower
 				|| lhs.range.mipUpper != rhs.range.mipUpper
 				|| lhs.range.sliceLower != rhs.range.sliceLower
@@ -7239,6 +7364,58 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 				*outReason = std::move(reason);
 			}
 		};
+		std::unordered_set<uint64_t> internallyTransitionedResourceIDs;
+		for (const auto& batchTemplate : segment.batchTemplates) {
+			for (const auto& transition : batchTemplate.transitions) {
+				internallyTransitionedResourceIDs.insert(transition.resourceID);
+			}
+		}
+		for (const auto& input : segment.contract.inputRequirements) {
+			if (input.queueSlot >= queueCount) {
+				setReason("segment_input_queue_out_of_range");
+				return false;
+			}
+			const auto resourceIndex = resolveTemplateResourceIndex(input.resourceID, 0, false);
+			if (!resourceIndex || *resourceIndex >= m_frameCompileResources.size()) {
+				setReason("segment_input_resource_index_missing");
+				return false;
+			}
+			Resource* resource = input.resource.IsEphemeral()
+				? input.resource.GetEphemeralPtr()
+				: _registry.Resolve(input.resource);
+			if (resource == nullptr) {
+				resource = resolveTemplateResource(input.resourceID, 0, false);
+			}
+			if (resource == nullptr) {
+				setReason("segment_input_resource_missing");
+				return false;
+			}
+			const auto& compileResourceState = m_frameCompileResources[*resourceIndex];
+			if (!compileResourceState.trackerInitialized) {
+				setReason("segment_input_tracker_uninitialized");
+				return false;
+			}
+			if (input.transitionDiscard) {
+				continue;
+			}
+			const bool validateAsBoundaryInput = input.transitionBeforeState
+				|| internallyTransitionedResourceIDs.find(input.resourceID) == internallyTransitionedResourceIDs.end();
+			if (!validateAsBoundaryInput) {
+				continue;
+			}
+			const QueueKind queueKind = m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(input.queueSlot));
+			const ResourceState requiredState = NormalizeStateForQueue(queueKind, input.requiredState);
+			if (compileResourceState.tracker.WouldModify(input.range, requiredState)) {
+				std::ostringstream oss;
+				oss << (input.transitionBeforeState
+						? "segment_input_before_state_stale"
+						: "segment_input_boundary_state_stale")
+					<< " resource_id=" << input.resourceID
+					<< " queue=" << input.queueSlot;
+				setReason(oss.str());
+				return false;
+			}
+		}
 		for (const auto& batchTemplate : segment.batchTemplates) {
 			for (const auto& signal : batchTemplate.signals) {
 				if (signal.queueSlot >= queueCount) {
@@ -7253,6 +7430,20 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 				}
 				if (queuedPass.originalFramePassIndexAtExtraction >= framePasses.size() || queuedPass.queueSlot >= queueCount) {
 					setReason("template_pass_out_of_range");
+					return false;
+				}
+			}
+			for (const auto& transition : batchTemplate.transitions) {
+				if (transition.queueSlot >= queueCount) {
+					setReason("template_transition_queue_out_of_range");
+					return false;
+				}
+				if (resolveTemplateResource(transition.resourceID, transition.backingResourceID, transition.dynamicResource) == nullptr) {
+					setReason("template_transition_resource_missing");
+					return false;
+				}
+				if (!resolveTemplateResourceIndex(transition.resourceID, transition.backingResourceID, transition.dynamicResource)) {
+					setReason("template_transition_resource_index_missing");
 					return false;
 				}
 			}
@@ -8794,6 +8985,14 @@ void RenderGraph::ResetForRebuild()
 		m_pCommandRecordingManager.reset();
 	}
 
+	++m_regionCache.structuralGeneration;
+	m_lastAuthoritativeReplayAttempted = false;
+	m_lastAuthoritativeReplaySucceeded = false;
+	m_lastAuthoritativeReplaySegments = 0;
+	m_lastAuthoritativeReplayPasses = 0;
+	m_lastAuthoritativeReplayDynamicGapPasses = 0;
+	m_lastAuthoritativeReplayFailure.clear();
+
 	// Clear any existing compile state
 	m_masterPassList.clear();
 	m_framePasses.clear();
@@ -8949,6 +9148,7 @@ void RenderGraph::CompileStructural() {
 	// Keep base passes
 	auto base = std::move(m_masterPassList);
 	m_masterPassList.clear();
+	m_structuralExplicitAfterByName.clear();
 
 	// Gather extension passes into ExtItem list
 	std::vector<ExtItem> extItems;
@@ -9148,6 +9348,9 @@ void RenderGraph::CompileStructural() {
 				continue;
 			}
 			addEdge(*idxOpt, passNode);
+			if (a != kBeginKey && a != kAfterBaseKey && a != kEndKey && a != kFirstBaseKey) {
+				m_structuralExplicitAfterByName.push_back({ a, e.key });
+			}
 			anyConstraint = true;
 		}
 
@@ -9159,6 +9362,9 @@ void RenderGraph::CompileStructural() {
 				continue;
 			}
 			addEdge(passNode, *idxOpt);
+			if (b != kBeginKey && b != kAfterBaseKey && b != kEndKey && b != kFirstBaseKey) {
+				m_structuralExplicitAfterByName.push_back({ e.key, b });
+			}
 			anyConstraint = true;
 		}
 	}
@@ -9844,8 +10050,8 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	}
 
 	// explicit After(anchor) edges (anchorName -> injectedName)
-	std::vector<std::pair<std::string, std::string>> explicitAfterByName;
-	explicitAfterByName.reserve(frameExt.size());
+	std::vector<std::pair<std::string, std::string>> explicitAfterByName = m_structuralExplicitAfterByName;
+	explicitAfterByName.reserve(m_structuralExplicitAfterByName.size() + frameExt.size());
 
 	if (!frameExt.empty()) {
 		auto recordImmediateCommands = [&](AnyPassAndResources& pr) {
@@ -10506,6 +10712,39 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				RebuildFrameCompileResources();
 				aliasActivationPending = aliasActivationPendingBeforeAuthoritativeCompile;
 				m_aliasActivationPendingByResourceIndex = aliasActivationPendingByResourceIndexBeforeAuthoritativeCompile;
+			}
+			else {
+				std::vector<ScheduledRegion> replayRegions;
+				RegionCacheStats replayRegionStats;
+				std::vector<std::string> replayCandidateDiagnostics;
+				std::vector<CachedReplaySegment> currentReplaySegments;
+				{
+					ZoneScopedN("RenderGraph::Replay::HarvestSuccessfulReplaySegments");
+					ExtractScheduleRegionsFromAuthoritativeCompile(
+						nodes,
+						m_framePasses,
+						batches,
+						replayRegions,
+						replayRegionStats,
+						replayCandidateDiagnostics);
+					ExtractReplaySegmentsFromAuthoritativeCompile(
+						nodes,
+						m_framePasses,
+						batches,
+						replayRegions,
+						currentReplaySegments);
+				}
+				m_lastExtractedRegions = replayRegions;
+				m_lastRegionStats = replayRegionStats;
+				m_lastRegionCandidateDiagnostics = replayCandidateDiagnostics;
+				m_regionCache.regions.clear();
+				m_regionCache.regions.reserve(replayRegions.size());
+				for (const auto& region : replayRegions) {
+					m_regionCache.regions.push_back(CachedScheduleRegion{ .schedule = region });
+				}
+				m_regionCache.stats = replayRegionStats;
+				m_regionCache.replaySegments = currentReplaySegments;
+				InsertOrRefreshReplaySegmentVariants(currentReplaySegments, replayCacheFrameSerial);
 			}
 		}
 	}
@@ -14605,6 +14844,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 				slotSignalIt->second = std::max(slotSignalIt->second, signalValue);
 
 				if (pool) {
+					ZoneScopedN("RenderGraph::Execute::ParallelPath::SignalAndRecycleQueue::RecyclePairs");
 					for (auto& pair : pending.submittedPairsAwaitingRecycle) {
 						pool->Recycle(std::move(pair), signalValue);
 					}
@@ -14690,9 +14930,10 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 					}
 
 					uint8_t clIndex = 0;
-
-					applyBatchWaitPhase(batch, bi, qi, BatchWaitPhase::BeforeTransitions);
-
+					{
+						ZoneScopedN("RenderGraph::Execute::ParallelPath::SubmitBatch::ApplyBeforeTransitionWaits");
+						applyBatchWaitPhase(batch, bi, qi, BatchWaitPhase::BeforeTransitions);
+					}
 					if (qs.splitAfterTransitions) {
 						queueRecordedCommandList(qi, std::move(qs.preallocatedCLs[clIndex]));
 						signalAndRecycleQueue(
@@ -14706,6 +14947,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 					applyBatchWaitPhase(batch, bi, qi, BatchWaitPhase::BeforeExecution);
 
 					if (qs.splitAfterExecution) {
+						ZoneScopedN("RenderGraph::Execute::ParallelPath::SubmitBatch::ApplyAfterExecutionWaits");
 						queueRecordedCommandList(qi, std::move(qs.preallocatedCLs[clIndex]));
 						signalAndRecycleQueue(
 							qi,
@@ -14715,10 +14957,13 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 						++clIndex;
 					}
 
-					applyBatchWaitPhase(batch, bi, qi, BatchWaitPhase::BeforeAfterPasses);
-					queueRecordedCommandList(qi, std::move(qs.preallocatedCLs[clIndex]));
-
+					{
+						ZoneScopedN("RenderGraph::Execute::ParallelPath::SubmitBatch::ApplyBeforeAfterPassesWaits");
+						applyBatchWaitPhase(batch, bi, qi, BatchWaitPhase::BeforeAfterPasses);
+						queueRecordedCommandList(qi, std::move(qs.preallocatedCLs[clIndex]));
+					}
 					if (qs.signalAfterCompletion) {
+						ZoneScopedN("RenderGraph::Execute::ParallelPath::SubmitBatch::SignalAfterCompletion");
 						signalAndRecycleQueue(
 							qi,
 							bi,
@@ -14726,7 +14971,10 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 							"AfterCompletion");
 					}
 
-					flushExternalFencesForQueue(qi, bi, qs.externalFences);
+					{
+						ZoneScopedN("RenderGraph::Execute::ParallelPath::SubmitBatch::FlushExternalFences");
+						flushExternalFencesForQueue(qi, bi, qs.externalFences);
+					}
 				}
 			}
 
