@@ -138,6 +138,7 @@ bool PixelBuffer::HasValidBackingResource() const {
 
 void PixelBuffer::ApplyMetadataComponentBundle(const EntityComponentBundle& bundle) const {
     std::scoped_lock lock(m_materializationMutex);
+    m_metadataBundles.emplace_back(bundle);
     if (!m_backing) {
         return;
     }
@@ -188,6 +189,10 @@ void PixelBuffer::Materialize(const MaterializeOptions* options) {
         );
     }
 
+    for (const auto& bundle : m_metadataBundles) {
+        m_backing->ApplyMetadataComponentBundle(bundle);
+    }
+
     ++m_backingGeneration;
 }
 
@@ -231,6 +236,7 @@ void PixelBuffer::EnsureMaterializedLocked(const char* operation) const {
 
 void PixelBuffer::ApplyMetadataComponentBundle(const EntityComponentBundle& bundle) {
     std::scoped_lock lock(m_materializationMutex);
+    m_metadataBundles.emplace_back(bundle);
     if (m_backing) {
         m_backing->ApplyMetadataComponentBundle(bundle);
     }

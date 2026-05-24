@@ -49,6 +49,10 @@ private:
 
 std::shared_ptr<IMemorySnapshotProvider> CreateECSMemorySnapshotProvider() {
     auto& world = ECSManager::GetInstance().GetWorld();
+    return CreateECSMemorySnapshotProvider(world);
+}
+
+std::shared_ptr<IMemorySnapshotProvider> CreateECSMemorySnapshotProvider(flecs::world& world) {
     return std::make_shared<ECSMemorySnapshotProvider>(world);
 }
 

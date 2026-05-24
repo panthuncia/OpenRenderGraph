@@ -3,6 +3,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <vector>
 
 #include <rhi_helpers.h>
 
@@ -136,6 +137,7 @@ private:
 
     std::unique_ptr<GpuTextureBacking> m_backing;
 	TextureDescription m_desc;
+    mutable std::vector<EntityComponentBundle> m_metadataBundles;
     uint64_t m_backingGeneration = 0;
     bool m_allowIdleDematerialization = false;
     uint32_t m_idleDematerializationThreshold = 1;

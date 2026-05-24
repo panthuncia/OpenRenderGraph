@@ -986,6 +986,37 @@ void RenderGraph::WriteCompiledGraphDebugDump(uint8_t frameIndex, const std::vec
 		}
 		dump << "\n";
 
+		dump << "[CrossFrameQueueWaits]\n";
+		bool wroteFrameStartWait = false;
+		for (size_t dstIndex = 0; dstIndex < m_hasPendingFrameStartQueueWait.size(); ++dstIndex) {
+			for (size_t srcIndex = 0; srcIndex < m_hasPendingFrameStartQueueWait[dstIndex].size(); ++srcIndex) {
+				if (dstIndex == srcIndex || !m_hasPendingFrameStartQueueWait[dstIndex][srcIndex]) {
+					continue;
+				}
+				wroteFrameStartWait = true;
+				dump << "  wait dst=" << queueSlotLabel(dstIndex)
+					 << " src=" << queueSlotLabel(srcIndex)
+					 << " fence=" << m_pendingFrameStartQueueWaitFenceValue[dstIndex][srcIndex]
+					 << "\n";
+			}
+		}
+		if (!wroteFrameStartWait) {
+			dump << "  none\n";
+		}
+		dump << "  last_producers=" << m_lastProducerByResourceAcrossFrames.size()
+			 << " alias_pools=" << m_lastAliasPlacementProducersByPoolAcrossFrames.size()
+			 << "\n";
+		for (size_t queueIndex = 0; queueIndex < m_compiledLastProducerBatchByResourceByQueue.size(); ++queueIndex) {
+			const auto& producers = m_compiledLastProducerBatchByResourceByQueue[queueIndex];
+			if (producers.empty()) {
+				continue;
+			}
+			dump << "  current_frame_producers queue=" << queueSlotLabel(queueIndex)
+				 << " resources=" << producers.size()
+				 << "\n";
+		}
+		dump << "\n";
+
 		dump << "[FramePasses]\n";
 		for (size_t passIndex = 0; passIndex < m_framePasses.size(); ++passIndex) {
 			const auto& any = m_framePasses[passIndex];
@@ -14877,8 +14908,6 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 		}
 	}
 
-	m_lastProducerByResourceAcrossFrames = std::move(nextLastProducerByResourceAcrossFrames);
-	m_lastAliasPlacementProducersByPoolAcrossFrames = std::move(nextLastAliasPlacementProducersByPoolAcrossFrames);
 	// Sync CRM signal tracking with values we signaled directly.
 	// Capped at primary queue count: CRM only tracks the 3 primary queues (Graphics/Compute/Copy).
 	for (size_t qi = 0; qi < std::min(slotCount, static_cast<size_t>(QueueKind::Count)); ++qi) {

@@ -1745,6 +1745,7 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 			trackDesc.attach
 				.Set<MemoryStatisticsComponents::ResourceName>({ "RenderGraph Alias Pool" })
 				.Set<MemoryStatisticsComponents::ResourceType>({ rhi::ResourceType::Unknown })
+				.Set<MemoryStatisticsComponents::ResourceUsage>({ "RenderGraph alias pools" })
 				.Set<MemoryStatisticsComponents::AliasingPool>({ poolID });
 
 			const auto allocResult = DeviceManager::GetInstance().AllocateMemoryTracked(allocDesc, allocInfo, newAliasPool, trackDesc);
