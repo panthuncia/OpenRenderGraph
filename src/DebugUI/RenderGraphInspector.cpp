@@ -688,7 +688,9 @@ namespace RGInspector {
                             auto prevAccess = rhi::helpers::ResourceAccessMaskToString(t.prevAccessType);
 							auto newAccess = rhi::helpers::ResourceAccessMaskToString(t.newAccessType);
                             ImGui::BulletText("Access : %s -> %s", prevAccess.c_str(), newAccess.c_str());
-                            ImGui::BulletText("Sync   : %s -> %s",rhi::helpers::ResourceSyncToString(t.prevSyncState), rhi::helpers::ResourceSyncToString(t.newSyncState));
+                            auto prevSync = rhi::helpers::ResourceSyncToString(t.prevSyncState);
+                            auto newSync = rhi::helpers::ResourceSyncToString(t.newSyncState);
+                            ImGui::BulletText("Sync   : %s -> %s", prevSync.c_str(), newSync.c_str());
                             ImGui::Separator();
                             };
 

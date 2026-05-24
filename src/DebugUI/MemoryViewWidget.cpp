@@ -39,7 +39,7 @@ namespace ui {
 
         static float HalfToFloat(uint16_t h)
         {
-            return ui::HalfToFloat(h);
+            return DecodeHalfToFloat(h);
         }
 
         static std::string FormatScalar(

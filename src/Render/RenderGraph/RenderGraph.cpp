@@ -8754,7 +8754,8 @@ void RenderGraph::ValidateCompiledResourceGenerations() const {
 void RenderGraph::RegisterExtension(std::unique_ptr<IRenderGraphExtension> ext, std::optional<std::string_view> id) {
 	if (!ext) return;
 
-	const auto& incomingType = typeid(*ext);
+    auto* extPtr = ext.get();
+	const auto& incomingType = typeid(*extPtr);
     const std::string registrationId = id.has_value()
         ? std::string(*id)
         : std::string(incomingType.name());
@@ -15059,8 +15060,8 @@ void RenderGraph::EnsureProviderRegistered(IResourceProvider* prov) {
 			if (existing->second == prov) {
 				continue;
 			}
-			std::string_view name = key.ToString();
-			throw std::runtime_error("Resource provider already registered for key: " + std::string(name));
+			std::string name = key.ToString();
+			throw std::runtime_error("Resource provider already registered for key: " + name);
 		}
 		_providerMap[key] = prov;
 	}

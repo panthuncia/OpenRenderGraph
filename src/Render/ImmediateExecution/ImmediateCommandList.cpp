@@ -268,7 +268,7 @@ namespace rg::imm {
                 const auto target = dispatch.GetResourceHandle(dispatch.user, cmd.target);
                 const auto dsv = dispatch.GetDSV(dispatch.user, cmd.target, cmd.range);
                 barrierRepeatedTextureWrite(target, ToRhiRange(cmd.range, cmd.target.GetNumMipLevels(), cmd.target.GetArraySize()), rhi::ResourceAccessType::DepthStencilClear, rhi::ResourceLayout::DepthStencilClear, rhi::ResourceSyncState::DepthStencil);
-                cl.ClearDepthStencilView(dsv, cmd.clearDepth, cmd.depth, cmd.clearStencil, cmd.stencil);
+                cl.ClearDepthStencilView(dsv, cmd.clearDepth, cmd.clearStencil, cmd.depth, cmd.stencil);
                 break;
             }
             case Op::ClearUavFloat: {
