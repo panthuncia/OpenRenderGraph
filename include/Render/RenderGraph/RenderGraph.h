@@ -299,6 +299,8 @@ public:
 		uint64_t resolverSnapshotHash = 0;
 		uint64_t declarationGeneration = 0;
 		uint64_t declarationFingerprint = 0;
+		uint64_t staticAccessCacheKey = 0;
+		uint64_t retainedAccessCacheKey = 0;
 	};
 
 	struct RenderPassAndResources { // TODO: I'm currently copying these a lot; maybe use pointers instead
@@ -1352,6 +1354,7 @@ private:
 	std::unordered_set<std::string> m_passNamesSeenThisReset;
 
 	std::vector<AnyPassAndResources> m_masterPassList;
+	std::vector<size_t> m_retainedDeclarationRefreshCandidateMasterIndices;
 	std::vector<std::pair<std::string, std::string>> m_structuralExplicitAfterByName;
 	std::vector<AnyPassAndResources> m_framePasses;
 	std::vector<uint8_t> m_framePassIsFrameExtension;
@@ -1460,6 +1463,8 @@ private:
 	void AssignQueueSignalFenceValuesInSubmissionOrder(std::vector<PassBatch>& batchesToAssign);
 	void ResizeQueueParallelVectors();
 	void EnsureMinimumAutomaticSchedulingQueues();
+	static bool RetainedDeclarationMayNeedRefresh(const AnyPassAndResources& pass);
+	void RebuildRetainedDeclarationRefreshCandidates();
 
 	rg::imm::ImmediateDispatch m_immediateDispatch{};
 

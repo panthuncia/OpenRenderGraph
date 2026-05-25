@@ -210,7 +210,77 @@ namespace {
 	}
 
 	template<class PassAndResources>
-	void UpdateRetainedDeclarationCache(const ResourceRegistry& registry, PassAndResources& passAndResources) {
+	uint64_t BuildStaticPassAccessCacheKey(RenderGraph::PassType type, std::string_view name, const PassAndResources& passAndResources) {
+		uint64_t key = 0xa11ce55acce55001ull;
+		key = HashCombine64(key, static_cast<uint64_t>(type));
+		key = HashCombine64(key, HashString64(name));
+		key = HashCombine64(key, reinterpret_cast<uintptr_t>(passAndResources.pass.get()));
+		key = HashCombine64(key, static_cast<uint64_t>(passAndResources.run));
+		key = HashCombine64(key, static_cast<uint64_t>(passAndResources.resources.preferredQueueKind));
+		key = HashCombine64(key, static_cast<uint64_t>(passAndResources.resources.queueAssignmentPolicy));
+		key = HashCombine64(key, passAndResources.resources.pinnedQueueSlot
+			? static_cast<uint64_t>(static_cast<uint8_t>(*passAndResources.resources.pinnedQueueSlot)) + 1ull
+			: 0ull);
+		key = HashCombine64(key, 0x57a71c5a77cacc01ull);
+		key = HashCombine64(key, passAndResources.declarationCache.declarationGeneration);
+		key = HashCombine64(key, passAndResources.declarationCache.declarationFingerprint);
+		return key;
+	}
+
+	template<class PassAndResources>
+	uint64_t BuildRetainedPassAccessCacheKey(
+		const ResourceRegistry& registry,
+		RenderGraph::PassType type,
+		std::string_view name,
+		const PassAndResources& passAndResources)
+	{
+		auto hashHandleAndRange = [&](uint64_t seed, const ResourceHandleAndRange& handleAndRange) {
+			seed = HashCombine64(seed, handleAndRange.resource.GetGlobalResourceID());
+			Resource* resource = handleAndRange.resource.IsEphemeral()
+				? handleAndRange.resource.GetEphemeralPtr()
+				: const_cast<Resource*>(registry.Resolve(handleAndRange.resource));
+			if (auto* dynamicResource = dynamic_cast<DynamicResource*>(resource)) {
+				seed = HashCombine64(seed, dynamicResource->GetDynamicWrapperGlobalResourceID());
+				if (auto backing = dynamicResource->GetResource()) {
+					seed = HashCombine64(seed, backing->GetGlobalResourceID());
+				}
+			}
+			return HashRangeForDeclaration(seed, handleAndRange.range);
+		};
+
+		uint64_t key = 0xa11ce55acce55001ull;
+		key = HashCombine64(key, static_cast<uint64_t>(type));
+		key = HashCombine64(key, HashString64(name));
+		key = HashCombine64(key, reinterpret_cast<uintptr_t>(passAndResources.pass.get()));
+		key = HashCombine64(key, static_cast<uint64_t>(passAndResources.run));
+		key = HashCombine64(key, static_cast<uint64_t>(passAndResources.resources.preferredQueueKind));
+		key = HashCombine64(key, static_cast<uint64_t>(passAndResources.resources.queueAssignmentPolicy));
+		key = HashCombine64(key, passAndResources.resources.pinnedQueueSlot
+			? static_cast<uint64_t>(static_cast<uint8_t>(*passAndResources.resources.pinnedQueueSlot)) + 1ull
+			: 0ull);
+		key = HashCombine64(key, passAndResources.declarationCache.declarationFingerprint);
+
+		uint64_t requirementsHash = 0xf12e5e71f12e5e71ull;
+		auto reqs = GetFrameRequirementsSpan(passAndResources.resources);
+		requirementsHash = HashCombine64(requirementsHash, reqs.size());
+		for (const auto& req : reqs) {
+			uint64_t entry = 0x7265717569726501ull;
+			entry = hashHandleAndRange(entry, req.resourceHandleAndRange);
+			entry = HashStateForDeclaration(entry, req.state);
+			requirementsHash = HashCombine64(requirementsHash, entry);
+		}
+		requirementsHash = HashCombine64(requirementsHash, passAndResources.resources.internalTransitions.size());
+		for (const auto& transition : passAndResources.resources.internalTransitions) {
+			uint64_t entry = 0x7472616e73697401ull;
+			entry = hashHandleAndRange(entry, transition.first);
+			entry = HashStateForDeclaration(entry, transition.second);
+			requirementsHash = HashCombine64(requirementsHash, entry);
+		}
+		return HashCombine64(key, requirementsHash);
+	}
+
+	template<class PassAndResources>
+	void UpdateRetainedDeclarationCache(const ResourceRegistry& registry, RenderGraph::PassType type, std::string_view name, PassAndResources& passAndResources) {
 		auto* dynamicInterface = dynamic_cast<IDynamicDeclaredResources*>(passAndResources.pass.get());
 		const CachedHandleValidationInfo handleValidation = AnalyzeCachedHandleValidation(registry, passAndResources.resources);
 		auto& declarationCache = passAndResources.declarationCache;
@@ -221,6 +291,15 @@ namespace {
 		declarationCache.resolverSnapshotHash = HashResolverSnapshots(passAndResources.resolverSnapshots);
 		declarationCache.declarationFingerprint = HashPassDeclaration(passAndResources.resources, passAndResources.resolverSnapshots);
 		++declarationCache.declarationGeneration;
+		const bool fullyStaticDeclaration = declarationCache.dynamicInterface == nullptr
+			&& passAndResources.resolverSnapshots.empty()
+			&& !declarationCache.requiresStaleHandleValidation;
+		declarationCache.staticAccessCacheKey = fullyStaticDeclaration
+			? BuildStaticPassAccessCacheKey(type, name, passAndResources)
+			: 0;
+		declarationCache.retainedAccessCacheKey = passAndResources.resources.frameResourceRequirements.empty()
+			? BuildRetainedPassAccessCacheKey(registry, type, name, passAndResources)
+			: 0;
 	}
 
 	constexpr QueueKind DefaultPreferredQueueKind(RenderGraph::PassType type) noexcept {
@@ -556,7 +635,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 			par.retainedAnonymousKeepAlive = CaptureRetainedAnonymousKeepAlive(
 				par.resources.staticResourceRequirements,
 				par.resources.internalTransitions);
-			UpdateRetainedDeclarationCache(_registry, par);
+			UpdateRetainedDeclarationCache(_registry, PassType::Render, par.name, par);
 		}
 
 		if (callSetup) {
@@ -628,7 +707,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 			par.retainedAnonymousKeepAlive = CaptureRetainedAnonymousKeepAlive(
 				par.resources.staticResourceRequirements,
 				par.resources.internalTransitions);
-			UpdateRetainedDeclarationCache(_registry, par);
+			UpdateRetainedDeclarationCache(_registry, PassType::Compute, par.name, par);
 		}
 
 		if (callSetup) {
@@ -696,7 +775,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 			par.retainedAnonymousKeepAlive = CaptureRetainedAnonymousKeepAlive(
 				par.resources.staticResourceRequirements,
 				par.resources.internalTransitions);
-			UpdateRetainedDeclarationCache(_registry, par);
+			UpdateRetainedDeclarationCache(_registry, PassType::Copy, par.name, par);
 		}
 
 		if (callSetup) {
@@ -1560,9 +1639,13 @@ RenderGraph::PassView RenderGraph::GetPassView(const AnyPassAndResources& pr) {
 
 void RenderGraph::RebuildFramePassAccessSummaries(std::unordered_set<uint64_t>& outUsedResourceIDs) {
 	ZoneScopedN("RenderGraph::RebuildFramePassAccessSummaries");
-	outUsedResourceIDs.clear();
-	m_framePassAccessSummaries.clear();
-	m_framePassAccessSummaries.resize(m_framePasses.size());
+	ZoneValue(m_framePasses.size());
+	{
+		ZoneScopedN("RGPassAccess::Initialize");
+		outUsedResourceIDs.clear();
+		m_framePassAccessSummaries.clear();
+		m_framePassAccessSummaries.resize(m_framePasses.size());
+	}
 
 	auto schedulingResourceIDForHandle = [&](const ResourceRegistry::RegistryHandle& handle) {
 		Resource* resource = handle.IsEphemeral()
@@ -1602,6 +1685,13 @@ void RenderGraph::RebuildFramePassAccessSummaries(std::unordered_set<uint64_t>& 
 		return HashRangeForDeclaration(seed, handleAndRange.range);
 	};
 
+	auto retainedDeclarationFullyStatic = [](const auto& passAndResources) {
+		const auto& cache = passAndResources.declarationCache;
+		return cache.dynamicInterface == nullptr
+			&& passAndResources.resolverSnapshots.empty()
+			&& !cache.requiresStaleHandleValidation;
+	};
+
 	auto buildPassAccessKey = [&](const AnyPassAndResources& pass) {
 		uint64_t key = 0xa11ce55acce55001ull;
 		key = HashCombine64(key, static_cast<uint64_t>(pass.type));
@@ -1617,35 +1707,70 @@ void RenderGraph::RebuildFramePassAccessSummaries(std::unordered_set<uint64_t>& 
 				key = HashCombine64(key, passAndResources.resources.pinnedQueueSlot
 					? static_cast<uint64_t>(static_cast<uint8_t>(*passAndResources.resources.pinnedQueueSlot)) + 1ull
 					: 0ull);
-				key = HashCombine64(key, passAndResources.declarationCache.declarationFingerprint);
+				if (retainedDeclarationFullyStatic(passAndResources)) {
+					key = HashCombine64(key, 0x57a71c5a77cacc01ull);
+					key = HashCombine64(key, passAndResources.declarationCache.declarationGeneration);
+					key = HashCombine64(key, passAndResources.declarationCache.declarationFingerprint);
+				}
+				else {
+					key = HashCombine64(key, passAndResources.declarationCache.declarationFingerprint);
 
-				uint64_t requirementsHash = 0xf12e5e71f12e5e71ull;
-				auto reqs = GetFrameRequirementsSpan(passAndResources.resources);
-				requirementsHash = HashCombine64(requirementsHash, reqs.size());
-				for (const auto& req : reqs) {
-					uint64_t entry = 0x7265717569726501ull;
-					entry = hashHandleAndRange(entry, req.resourceHandleAndRange);
-					entry = HashStateForDeclaration(entry, req.state);
-					requirementsHash = HashCombine64(requirementsHash, entry);
+					uint64_t requirementsHash = 0xf12e5e71f12e5e71ull;
+					auto reqs = GetFrameRequirementsSpan(passAndResources.resources);
+					requirementsHash = HashCombine64(requirementsHash, reqs.size());
+					for (const auto& req : reqs) {
+						uint64_t entry = 0x7265717569726501ull;
+						entry = hashHandleAndRange(entry, req.resourceHandleAndRange);
+						entry = HashStateForDeclaration(entry, req.state);
+						requirementsHash = HashCombine64(requirementsHash, entry);
+					}
+					requirementsHash = HashCombine64(requirementsHash, passAndResources.resources.internalTransitions.size());
+					for (const auto& transition : passAndResources.resources.internalTransitions) {
+						uint64_t entry = 0x7472616e73697401ull;
+						entry = hashHandleAndRange(entry, transition.first);
+						entry = HashStateForDeclaration(entry, transition.second);
+						requirementsHash = HashCombine64(requirementsHash, entry);
+					}
+					key = HashCombine64(key, requirementsHash);
 				}
-				requirementsHash = HashCombine64(requirementsHash, passAndResources.resources.internalTransitions.size());
-				for (const auto& transition : passAndResources.resources.internalTransitions) {
-					uint64_t entry = 0x7472616e73697401ull;
-					entry = hashHandleAndRange(entry, transition.first);
-					entry = HashStateForDeclaration(entry, transition.second);
-					requirementsHash = HashCombine64(requirementsHash, entry);
-				}
-				key = HashCombine64(key, requirementsHash);
 			}
 		}, pass.pass);
 
 		return key;
 	};
 
+	auto tryGetPrecomputedStaticPassAccessKey = [](const AnyPassAndResources& pass) -> uint64_t {
+		return std::visit(
+			[](auto const& passAndResources) -> uint64_t {
+				using T = std::decay_t<decltype(passAndResources)>;
+				if constexpr (std::is_same_v<T, std::monostate>) {
+					return 0;
+				}
+				else {
+					return passAndResources.declarationCache.staticAccessCacheKey;
+				}
+			},
+			pass.pass);
+	};
+	auto tryGetPrecomputedRetainedPassAccessKey = [](const AnyPassAndResources& pass) -> uint64_t {
+		return std::visit(
+			[](auto const& passAndResources) -> uint64_t {
+				using T = std::decay_t<decltype(passAndResources)>;
+				if constexpr (std::is_same_v<T, std::monostate>) {
+					return 0;
+				}
+				else {
+					return passAndResources.declarationCache.retainedAccessCacheKey;
+				}
+			},
+			pass.pass);
+	};
+
 	struct PassAccessWorkItem {
 		uint64_t cacheKey = 0;
 		bool cacheable = false;
 		bool cacheHit = false;
+		const CachedFramePassAccessSummary* cachedSummary = nullptr;
 		FramePassStaticAccessSummary summary;
 		std::vector<uint64_t> usedResourceIDs;
 	};
@@ -1668,19 +1793,78 @@ void RenderGraph::RebuildFramePassAccessSummaries(std::unordered_set<uint64_t>& 
 
 	std::vector<PassAccessWorkItem> workItems(m_framePasses.size());
 	size_t estimatedUsedResourceIDCount = 0;
-	for (size_t passIndex = 0; passIndex < m_framePasses.size(); ++passIndex) {
-		auto& workItem = workItems[passIndex];
-		workItem.cacheable = passAccessSummaryCacheable(passIndex, m_framePasses[passIndex]);
-		workItem.cacheKey = buildPassAccessKey(m_framePasses[passIndex]);
-		auto cacheIt = workItem.cacheable
-			? m_framePassAccessSummaryCache.find(workItem.cacheKey)
-			: m_framePassAccessSummaryCache.end();
-		if (workItem.cacheable && cacheIt != m_framePassAccessSummaryCache.end()) {
-			workItem.cacheHit = true;
-			workItem.summary = cacheIt->second.summary;
-			workItem.usedResourceIDs = cacheIt->second.usedResourceIDs;
-			estimatedUsedResourceIDCount += workItem.usedResourceIDs.size();
+	{
+		ZoneScopedN("RGPassAccess::BuildKeysAndLoadCacheHits");
+		uint64_t cacheablePassCount = 0;
+		uint64_t staticPrecomputedKeyCount = 0;
+		uint64_t dynamicKeyBuildCount = 0;
+		uint64_t cacheHitCount = 0;
+		uint64_t cacheMissCount = 0;
+		uint64_t nonCacheablePassCount = 0;
+		uint64_t retainedPrecomputedKeyCount = 0;
+		uint64_t estimatedCacheHitResourceIDs = 0;
+		uint64_t estimatedCacheHitRequirements = 0;
+		uint64_t estimatedCacheHitTransitions = 0;
+		for (size_t passIndex = 0; passIndex < m_framePasses.size(); ++passIndex) {
+			auto& workItem = workItems[passIndex];
+			{
+				ZoneScopedN("RGPassAccess::CheckCacheable");
+				workItem.cacheable = passAccessSummaryCacheable(passIndex, m_framePasses[passIndex]);
+			}
+			if (workItem.cacheable) {
+				++cacheablePassCount;
+				{
+					ZoneScopedN("RGPassAccess::TryPrecomputedStaticKey");
+					workItem.cacheKey = tryGetPrecomputedStaticPassAccessKey(m_framePasses[passIndex]);
+				}
+				if (workItem.cacheKey == 0) {
+					ZoneScopedN("RGPassAccess::TryPrecomputedRetainedKey");
+					workItem.cacheKey = tryGetPrecomputedRetainedPassAccessKey(m_framePasses[passIndex]);
+					if (workItem.cacheKey != 0) {
+						++retainedPrecomputedKeyCount;
+					}
+				}
+				else {
+					++staticPrecomputedKeyCount;
+				}
+				if (workItem.cacheKey == 0) {
+					++dynamicKeyBuildCount;
+					ZoneScopedN("RGPassAccess::BuildDynamicAccessKey");
+					workItem.cacheKey = buildPassAccessKey(m_framePasses[passIndex]);
+				}
+			}
+			else {
+				++nonCacheablePassCount;
+				workItem.cacheKey = 0;
+			}
+			if (workItem.cacheable) {
+				ZoneScopedN("RGPassAccess::LookupAccessSummaryCache");
+				auto cacheIt = m_framePassAccessSummaryCache.find(workItem.cacheKey);
+				if (cacheIt != m_framePassAccessSummaryCache.end()) {
+					workItem.cacheHit = true;
+					workItem.cachedSummary = &cacheIt->second;
+					estimatedUsedResourceIDCount += cacheIt->second.usedResourceIDs.size();
+					estimatedCacheHitResourceIDs += cacheIt->second.usedResourceIDs.size();
+					estimatedCacheHitRequirements += cacheIt->second.summary.requirementSummaries.size();
+					estimatedCacheHitTransitions += cacheIt->second.summary.internalTransitionSummaries.size();
+					++cacheHitCount;
+				}
+				else {
+					++cacheMissCount;
+				}
+			}
 		}
+		ZoneValue(cacheablePassCount);
+		TracyPlot("RGPassAccess.CacheablePasses", static_cast<int64_t>(cacheablePassCount));
+		TracyPlot("RGPassAccess.NonCacheablePasses", static_cast<int64_t>(nonCacheablePassCount));
+		TracyPlot("RGPassAccess.StaticPrecomputedKeys", static_cast<int64_t>(staticPrecomputedKeyCount));
+		TracyPlot("RGPassAccess.RetainedPrecomputedKeys", static_cast<int64_t>(retainedPrecomputedKeyCount));
+		TracyPlot("RGPassAccess.DynamicKeyBuilds", static_cast<int64_t>(dynamicKeyBuildCount));
+		TracyPlot("RGPassAccess.CacheHits", static_cast<int64_t>(cacheHitCount));
+		TracyPlot("RGPassAccess.CacheMisses", static_cast<int64_t>(cacheMissCount));
+		TracyPlot("RGPassAccess.CacheHitResourceIDs", static_cast<int64_t>(estimatedCacheHitResourceIDs));
+		TracyPlot("RGPassAccess.CacheHitRequirements", static_cast<int64_t>(estimatedCacheHitRequirements));
+		TracyPlot("RGPassAccess.CacheHitTransitions", static_cast<int64_t>(estimatedCacheHitTransitions));
 	}
 
 	auto buildPassSummary = [&](size_t passIndex) {
@@ -1688,6 +1872,8 @@ void RenderGraph::RebuildFramePassAccessSummaries(std::unordered_set<uint64_t>& 
 		if (workItem.cacheHit) {
 			return;
 		}
+		ZoneScopedN("RGPassAccess::BuildCacheMissSummary");
+		ZoneValue(passIndex);
 
 		const auto& pass = m_framePasses[passIndex];
 		auto& summary = workItem.summary;
@@ -1762,121 +1948,157 @@ void RenderGraph::RebuildFramePassAccessSummaries(std::unordered_set<uint64_t>& 
 			workItem.usedResourceIDs.end());
 	};
 
-	ParallelForOptional("RGPrecompilePassAccess", workItems.size(), buildPassSummary);
-
-	for (size_t passIndex = 0; passIndex < workItems.size(); ++passIndex) {
-		auto& workItem = workItems[passIndex];
-		if (workItem.cacheable && !workItem.cacheHit) {
-			m_framePassAccessSummaryCache[workItem.cacheKey] = CachedFramePassAccessSummary{
-				.key = workItem.cacheKey,
-				.summary = workItem.summary,
-				.usedResourceIDs = workItem.usedResourceIDs,
-			};
-			estimatedUsedResourceIDCount += workItem.usedResourceIDs.size();
-		}
-		m_framePassAccessSummaries[passIndex] = std::move(workItem.summary);
+	{
+		ZoneScopedN("RGPassAccess::ParallelBuildCacheMisses");
+		ParallelForOptional("RGPrecompilePassAccess", workItems.size(), buildPassSummary);
 	}
 
-	outUsedResourceIDs.reserve(estimatedUsedResourceIDCount);
-	for (const auto& workItem : workItems) {
-		for (uint64_t resourceID : workItem.usedResourceIDs) {
+	{
+		ZoneScopedN("RGPassAccess::PublishSummariesAndCacheMisses");
+		for (size_t passIndex = 0; passIndex < workItems.size(); ++passIndex) {
+			auto& workItem = workItems[passIndex];
+			if (workItem.cacheable && !workItem.cacheHit) {
+				m_framePassAccessSummaryCache[workItem.cacheKey] = CachedFramePassAccessSummary{
+					.key = workItem.cacheKey,
+					.summary = workItem.summary,
+					.usedResourceIDs = workItem.usedResourceIDs,
+				};
+				estimatedUsedResourceIDCount += workItem.usedResourceIDs.size();
+			}
+			m_framePassAccessSummaries[passIndex] = workItem.cacheHit && workItem.cachedSummary
+				? workItem.cachedSummary->summary
+				: std::move(workItem.summary);
+		}
+	}
+
+	{
+		ZoneScopedN("RGPassAccess::MergeUsedResourceIDs");
+		std::vector<uint64_t> flattenedResourceIDs;
+		flattenedResourceIDs.reserve(estimatedUsedResourceIDCount);
+		for (const auto& workItem : workItems) {
+			const auto& usedResourceIDs = workItem.cacheHit && workItem.cachedSummary
+				? workItem.cachedSummary->usedResourceIDs
+				: workItem.usedResourceIDs;
+			flattenedResourceIDs.insert(flattenedResourceIDs.end(), usedResourceIDs.begin(), usedResourceIDs.end());
+		}
+		std::sort(flattenedResourceIDs.begin(), flattenedResourceIDs.end());
+		flattenedResourceIDs.erase(
+			std::unique(flattenedResourceIDs.begin(), flattenedResourceIDs.end()),
+			flattenedResourceIDs.end());
+
+		outUsedResourceIDs.clear();
+		outUsedResourceIDs.reserve(flattenedResourceIDs.size());
+		for (uint64_t resourceID : flattenedResourceIDs) {
 			outUsedResourceIDs.insert(resourceID);
 		}
-	}
 
-	m_frameDAGResourceIndexByID.clear();
-	m_frameDAGResourceIDsByIndex.clear();
-	m_frameDAGResourceIndexByID.reserve(outUsedResourceIDs.size());
-	m_frameDAGResourceIDsByIndex.reserve(outUsedResourceIDs.size());
-	std::vector<uint64_t> sortedResourceIDs(outUsedResourceIDs.begin(), outUsedResourceIDs.end());
-	std::sort(sortedResourceIDs.begin(), sortedResourceIDs.end());
-	for (uint64_t resourceID : sortedResourceIDs) {
-		m_frameDAGResourceIndexByID.emplace(resourceID, m_frameDAGResourceIDsByIndex.size());
-		m_frameDAGResourceIDsByIndex.push_back(resourceID);
+		{
+			ZoneScopedN("RGPassAccess::BuildDAGResourceIndex");
+			m_frameDAGResourceIndexByID.clear();
+			m_frameDAGResourceIDsByIndex = std::move(flattenedResourceIDs);
+			m_frameDAGResourceIndexByID.reserve(m_frameDAGResourceIDsByIndex.size());
+			for (size_t resourceIndex = 0; resourceIndex < m_frameDAGResourceIDsByIndex.size(); ++resourceIndex) {
+				m_frameDAGResourceIndexByID.emplace(m_frameDAGResourceIDsByIndex[resourceIndex], resourceIndex);
+			}
+			m_frameDAGResourceCount = m_frameDAGResourceIDsByIndex.size();
+		}
 	}
-	m_frameDAGResourceCount = m_frameDAGResourceIDsByIndex.size();
 
 	std::vector<uint8_t> resourcesWrittenThisFrame(m_frameDAGResourceCount, 0);
-	for (const auto& summary : m_framePassAccessSummaries) {
-		for (const auto& req : summary.requirementSummaries) {
-			if (!req.isWrite) {
-				continue;
+	{
+		ZoneScopedN("RGPassAccess::MarkWrittenDAGResources");
+		for (const auto& summary : m_framePassAccessSummaries) {
+			for (const auto& req : summary.requirementSummaries) {
+				if (!req.isWrite) {
+					continue;
+				}
+				auto dagResourceIt = m_frameDAGResourceIndexByID.find(req.resourceID);
+				if (dagResourceIt != m_frameDAGResourceIndexByID.end() && dagResourceIt->second < resourcesWrittenThisFrame.size()) {
+					resourcesWrittenThisFrame[dagResourceIt->second] = 1;
+				}
 			}
-			auto dagResourceIt = m_frameDAGResourceIndexByID.find(req.resourceID);
-			if (dagResourceIt != m_frameDAGResourceIndexByID.end() && dagResourceIt->second < resourcesWrittenThisFrame.size()) {
-				resourcesWrittenThisFrame[dagResourceIt->second] = 1;
-			}
-		}
-		for (const auto& transition : summary.internalTransitionSummaries) {
-			auto dagResourceIt = m_frameDAGResourceIndexByID.find(transition.resourceID);
-			if (dagResourceIt != m_frameDAGResourceIndexByID.end() && dagResourceIt->second < resourcesWrittenThisFrame.size()) {
-				resourcesWrittenThisFrame[dagResourceIt->second] = 1;
+			for (const auto& transition : summary.internalTransitionSummaries) {
+				auto dagResourceIt = m_frameDAGResourceIndexByID.find(transition.resourceID);
+				if (dagResourceIt != m_frameDAGResourceIndexByID.end() && dagResourceIt->second < resourcesWrittenThisFrame.size()) {
+					resourcesWrittenThisFrame[dagResourceIt->second] = 1;
+				}
 			}
 		}
 	}
 
-	std::vector<uint32_t> touchedSeen(m_frameDAGResourceCount, 0);
-	std::vector<uint32_t> uavSeen(m_frameDAGResourceCount, 0);
-	std::vector<uint32_t> accessSeen(m_frameDAGResourceCount, 0);
-	std::vector<uint32_t> accessEntryIndexByResource(m_frameDAGResourceCount, 0);
-	uint32_t passGeneration = 0;
-	auto advancePassGeneration = [&]() {
-		++passGeneration;
-		if (passGeneration == 0) {
-			std::fill(touchedSeen.begin(), touchedSeen.end(), 0);
-			std::fill(uavSeen.begin(), uavSeen.end(), 0);
-			std::fill(accessSeen.begin(), accessSeen.end(), 0);
-			passGeneration = 1;
-		}
-	};
+	{
+		ZoneScopedN("RGPassAccess::FinalizePerPassAccessLists");
+		const auto& dagResourceIndexByID = m_frameDAGResourceIndexByID;
+		ParallelForOptional("RGFinalizePassAccessLists", m_framePassAccessSummaries.size(), [&](size_t passIndex) {
+			auto& summary = m_framePassAccessSummaries[passIndex];
+			summary.touchedResourceIDs.clear();
+			summary.uavResourceIDs.clear();
+			summary.dagAccesses.clear();
 
-	for (auto& summary : m_framePassAccessSummaries) {
-		advancePassGeneration();
-		auto mark = [&](uint64_t resourceID, AccessKind accessKind, bool isUav) {
-			auto dagResourceIt = m_frameDAGResourceIndexByID.find(resourceID);
-			if (dagResourceIt == m_frameDAGResourceIndexByID.end()) {
-				return;
-			}
+			std::vector<uint32_t> touchedSeen;
+			std::vector<uint32_t> uavSeen;
+			std::vector<std::pair<uint32_t, uint32_t>> accessEntryIndexByResource;
+			touchedSeen.reserve(summary.requirementSummaries.size() + summary.internalTransitionSummaries.size());
+			uavSeen.reserve(summary.requirementSummaries.size());
+			accessEntryIndexByResource.reserve(summary.requirementSummaries.size() + summary.internalTransitionSummaries.size());
 
-			const uint32_t dagResourceIndex = static_cast<uint32_t>(dagResourceIt->second);
-			if (touchedSeen[dagResourceIndex] != passGeneration) {
-				touchedSeen[dagResourceIndex] = passGeneration;
-				summary.touchedResourceIDs.push_back(resourceID);
-			}
-			if (isUav && uavSeen[dagResourceIndex] != passGeneration) {
-				uavSeen[dagResourceIndex] = passGeneration;
-				summary.uavResourceIDs.push_back(resourceID);
-			}
+			auto containsIndex = [](const std::vector<uint32_t>& indices, uint32_t candidate) {
+				return std::find(indices.begin(), indices.end(), candidate) != indices.end();
+			};
+			auto findAccessEntry = [](const std::vector<std::pair<uint32_t, uint32_t>>& entries, uint32_t resourceIndex) -> const std::pair<uint32_t, uint32_t>* {
+				auto it = std::find_if(entries.begin(), entries.end(), [&](const auto& entry) {
+					return entry.first == resourceIndex;
+				});
+				return it == entries.end() ? nullptr : &*it;
+			};
 
-			if (accessKind == AccessKind::Read
-				&& (dagResourceIndex >= resourcesWrittenThisFrame.size() || !resourcesWrittenThisFrame[dagResourceIndex])) {
-				return;
-			}
+			auto mark = [&](uint64_t resourceID, AccessKind accessKind, bool isUav) {
+				auto dagResourceIt = dagResourceIndexByID.find(resourceID);
+				if (dagResourceIt == dagResourceIndexByID.end()) {
+					return;
+				}
 
-			if (accessSeen[dagResourceIndex] != passGeneration) {
-				accessSeen[dagResourceIndex] = passGeneration;
-				accessEntryIndexByResource[dagResourceIndex] = static_cast<uint32_t>(summary.dagAccesses.size());
-				summary.dagAccesses.push_back({ dagResourceIndex, accessKind });
-			}
-			else if (accessKind == AccessKind::Write) {
-				summary.dagAccesses[accessEntryIndexByResource[dagResourceIndex]].kind = AccessKind::Write;
-			}
-		};
+				const uint32_t dagResourceIndex = static_cast<uint32_t>(dagResourceIt->second);
+				if (!containsIndex(touchedSeen, dagResourceIndex)) {
+					touchedSeen.push_back(dagResourceIndex);
+					summary.touchedResourceIDs.push_back(resourceID);
+				}
+				if (isUav && !containsIndex(uavSeen, dagResourceIndex)) {
+					uavSeen.push_back(dagResourceIndex);
+					summary.uavResourceIDs.push_back(resourceID);
+				}
 
-		summary.touchedResourceIDs.reserve(summary.requirementSummaries.size() + summary.internalTransitionSummaries.size());
-		summary.uavResourceIDs.reserve(summary.requirementSummaries.size());
-		summary.dagAccesses.reserve(summary.requirementSummaries.size() + summary.internalTransitionSummaries.size());
+				if (accessKind == AccessKind::Read
+					&& (dagResourceIndex >= resourcesWrittenThisFrame.size() || !resourcesWrittenThisFrame[dagResourceIndex])) {
+					return;
+				}
 
-		for (const auto& req : summary.requirementSummaries) {
+				if (const auto* accessEntry = findAccessEntry(accessEntryIndexByResource, dagResourceIndex)) {
+					if (accessKind == AccessKind::Write) {
+						summary.dagAccesses[accessEntry->second].kind = AccessKind::Write;
+					}
+				}
+				else {
+					accessEntryIndexByResource.push_back({ dagResourceIndex, static_cast<uint32_t>(summary.dagAccesses.size()) });
+					summary.dagAccesses.push_back({ dagResourceIndex, accessKind });
+				}
+			};
+
+			summary.touchedResourceIDs.reserve(summary.requirementSummaries.size() + summary.internalTransitionSummaries.size());
+			summary.uavResourceIDs.reserve(summary.requirementSummaries.size());
+			summary.dagAccesses.reserve(summary.requirementSummaries.size() + summary.internalTransitionSummaries.size());
+
+			for (const auto& req : summary.requirementSummaries) {
 				mark(
 					req.resourceID,
 					req.isWrite ? AccessKind::Write : AccessKind::Read,
 					req.isUAV);
-		}
+			}
 
-		for (const auto& transition : summary.internalTransitionSummaries) {
-			mark(transition.resourceID, AccessKind::Write, false);
-		}
+			for (const auto& transition : summary.internalTransitionSummaries) {
+				mark(transition.resourceID, AccessKind::Write, false);
+			}
+		});
 	}
 }
 
@@ -3707,6 +3929,7 @@ void RenderGraph::ShutdownOwnedState() {
 	m_frameCompileResources.clear();
 	m_addTransitionDebugStatsByResource.clear();
 	m_masterPassList.clear();
+	m_retainedDeclarationRefreshCandidateMasterIndices.clear();
 	m_framePasses.clear();
 	m_framePassIsFrameExtension.clear();
 	m_framePassDeclarationRefreshedThisFrame.clear();
@@ -4118,14 +4341,27 @@ void RenderGraph::RebuildFramePassSchedulingSummaries() {
 	m_framePassSchedulingSummaries.resize(m_framePassAccessSummaries.size());
 	m_frameResourceAccessSummaries.assign(m_frameSchedulingResourceCount, FrameResourceAccessSummary{});
 
-	for (size_t passIndex = 0; passIndex < m_framePassAccessSummaries.size(); ++passIndex) {
+	struct ResourceAccessContribution {
+		size_t resourceIndex = 0;
+		bool hasWrite = false;
+		bool hasUAV = false;
+		bool hasInternalTransition = false;
+		bool hasAliasActivation = false;
+		bool hasNonWholeResourceRange = false;
+	};
+
+	std::vector<std::vector<ResourceAccessContribution>> resourceContributionsByPass(m_framePassAccessSummaries.size());
+
+	auto buildPassSchedulingSummary = [&](size_t passIndex) {
 		auto& summary = m_framePassSchedulingSummaries[passIndex];
 		const auto& passAccess = m_framePassAccessSummaries[passIndex];
+		auto& resourceContributions = resourceContributionsByPass[passIndex];
 		summary.requirements.reserve(passAccess.requirementSummaries.size());
 		summary.internalTransitions.reserve(passAccess.internalTransitionSummaries.size());
 		summary.requiredResourceIndices.reserve(passAccess.requirementSummaries.size());
 		summary.touchedResourceIndices.reserve(passAccess.requirementSummaries.size() + passAccess.internalTransitionSummaries.size());
 		summary.uavResourceIndices.reserve(passAccess.requirementSummaries.size());
+		resourceContributions.reserve(passAccess.requirementSummaries.size() + passAccess.internalTransitionSummaries.size());
 
 		for (const auto& req : passAccess.requirementSummaries) {
 			auto resourceIndex = TryGetFrameSchedulingResourceIndex(req.resourceID);
@@ -4133,13 +4369,14 @@ void RenderGraph::RebuildFramePassSchedulingSummaries() {
 				continue;
 			}
 
-			auto& accessSummary = m_frameResourceAccessSummaries[*resourceIndex];
-			accessSummary.hasWrite = accessSummary.hasWrite || req.isWrite;
-			accessSummary.hasUAV = accessSummary.hasUAV || req.isUAV;
-			accessSummary.hasAliasActivation = accessSummary.hasAliasActivation
-				|| (*resourceIndex < m_aliasActivationPendingByResourceIndex.size() && m_aliasActivationPendingByResourceIndex[*resourceIndex] != 0);
-			accessSummary.hasNonWholeResourceRange = accessSummary.hasNonWholeResourceRange
-				|| !IsWholeResourceRange(req.range, req.resource);
+			resourceContributions.push_back(ResourceAccessContribution{
+				.resourceIndex = *resourceIndex,
+				.hasWrite = req.isWrite,
+				.hasUAV = req.isUAV,
+				.hasAliasActivation = *resourceIndex < m_aliasActivationPendingByResourceIndex.size()
+					&& m_aliasActivationPendingByResourceIndex[*resourceIndex] != 0,
+				.hasNonWholeResourceRange = !IsWholeResourceRange(req.range, req.resource),
+			});
 
 			DenseRequirementSummary denseRequirement{};
 			denseRequirement.resource = req.resource;
@@ -4165,7 +4402,10 @@ void RenderGraph::RebuildFramePassSchedulingSummaries() {
 				continue;
 			}
 
-			m_frameResourceAccessSummaries[*resourceIndex].hasInternalTransition = true;
+			resourceContributions.push_back(ResourceAccessContribution{
+				.resourceIndex = *resourceIndex,
+				.hasInternalTransition = true,
+			});
 
 			DenseEquivalentResourceSummary denseTransition{};
 			denseTransition.resourceID = transition.resourceID;
@@ -4191,6 +4431,26 @@ void RenderGraph::RebuildFramePassSchedulingSummaries() {
 		summary.uavResourceIndices.erase(
 			std::unique(summary.uavResourceIndices.begin(), summary.uavResourceIndices.end()),
 			summary.uavResourceIndices.end());
+	};
+
+	ParallelForOptional(
+		"RGPrecompilePassScheduling",
+		m_framePassAccessSummaries.size(),
+		buildPassSchedulingSummary);
+
+	for (const auto& resourceContributions : resourceContributionsByPass) {
+		for (const auto& contribution : resourceContributions) {
+			if (contribution.resourceIndex >= m_frameResourceAccessSummaries.size()) {
+				continue;
+			}
+
+			auto& accessSummary = m_frameResourceAccessSummaries[contribution.resourceIndex];
+			accessSummary.hasWrite = accessSummary.hasWrite || contribution.hasWrite;
+			accessSummary.hasUAV = accessSummary.hasUAV || contribution.hasUAV;
+			accessSummary.hasInternalTransition = accessSummary.hasInternalTransition || contribution.hasInternalTransition;
+			accessSummary.hasAliasActivation = accessSummary.hasAliasActivation || contribution.hasAliasActivation;
+			accessSummary.hasNonWholeResourceRange = accessSummary.hasNonWholeResourceRange || contribution.hasNonWholeResourceRange;
+		}
 	}
 }
 
@@ -9387,6 +9647,7 @@ void RenderGraph::ResetForRebuild()
 
 	// Clear any existing compile state
 	m_masterPassList.clear();
+	m_retainedDeclarationRefreshCandidateMasterIndices.clear();
 	m_framePasses.clear();
 	trackers.clear();
 	ResetCompileFrameState();
@@ -9460,6 +9721,7 @@ void RenderGraph::ResetStructuralBuildState() {
 	m_passBuilderOrder.clear();
 	m_passNamesSeenThisReset.clear();
 	m_framePassAccessSummaryCache.clear();
+	m_retainedDeclarationRefreshCandidateMasterIndices.clear();
 }
 
 void RenderGraph::ResetForFrame() {
@@ -9823,6 +10085,7 @@ void RenderGraph::CompileStructural() {
 		}
 		m_masterPassList.push_back(std::move(nodes[u].pass));
 	}
+	RebuildRetainedDeclarationRefreshCandidates();
 }
 
 
@@ -9929,7 +10192,7 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(RenderPassAndResources& p,
 	p.retainedAnonymousKeepAlive = CaptureRetainedAnonymousKeepAlive(
 		p.resources.staticResourceRequirements,
 		p.resources.internalTransitions);
-	UpdateRetainedDeclarationCache(_registry, p);
+	UpdateRetainedDeclarationCache(_registry, PassType::Render, p.name, p);
 
 	// Ensure the pass's view matches the refreshed identifier set
 	p.pass->SetResourceRegistryView(
@@ -9992,7 +10255,7 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(ComputePassAndResources& p
 	p.retainedAnonymousKeepAlive = CaptureRetainedAnonymousKeepAlive(
 		p.resources.staticResourceRequirements,
 		p.resources.internalTransitions);
-	UpdateRetainedDeclarationCache(_registry, p);
+	UpdateRetainedDeclarationCache(_registry, PassType::Compute, p.name, p);
 
 	p.pass->SetResourceRegistryView(
 		std::make_unique<ResourceRegistryView>(_registry, p.resources.identifierSet),
@@ -10051,7 +10314,7 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(CopyPassAndResources& p, u
 	p.retainedAnonymousKeepAlive = CaptureRetainedAnonymousKeepAlive(
 		p.resources.staticResourceRequirements,
 		p.resources.internalTransitions);
-	UpdateRetainedDeclarationCache(_registry, p);
+	UpdateRetainedDeclarationCache(_registry, PassType::Copy, p.name, p);
 
 	p.pass->SetResourceRegistryView(
 		std::make_unique<ResourceRegistryView>(_registry, p.resources.identifierSet)
@@ -10145,7 +10408,11 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	{
 		ZoneScopedN("RenderGraph::CompileFrame::RefreshRetainedDeclarations");
 		// First, refresh all retained declarations for this frame
-		for (auto& pr : m_masterPassList) {
+		for (size_t candidateIndex : m_retainedDeclarationRefreshCandidateMasterIndices) {
+			if (candidateIndex >= m_masterPassList.size()) {
+				continue;
+			}
+			auto& pr = m_masterPassList[candidateIndex];
 			if (pr.type == PassType::Compute) {
 				auto& p = std::get<ComputePassAndResources>(pr.pass);
 				if (needsRefresh(p)) {
@@ -10186,6 +10453,15 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				}
 			}
 		}
+		m_retainedDeclarationRefreshCandidateMasterIndices.erase(
+			std::remove_if(
+				m_retainedDeclarationRefreshCandidateMasterIndices.begin(),
+				m_retainedDeclarationRefreshCandidateMasterIndices.end(),
+				[&](size_t candidateIndex) {
+					return candidateIndex >= m_masterPassList.size()
+						|| !RetainedDeclarationMayNeedRefresh(m_masterPassList[candidateIndex]);
+				}),
+			m_retainedDeclarationRefreshCandidateMasterIndices.end());
 	}
 
 	{
@@ -12688,6 +12964,36 @@ void RenderGraph::EnsureMinimumAutomaticSchedulingQueues() {
 	ResizeQueueParallelVectors();
 }
 
+bool RenderGraph::RetainedDeclarationMayNeedRefresh(const AnyPassAndResources& pass)
+{
+	return std::visit(
+		[](const auto& passAndResources) -> bool {
+			using T = std::decay_t<decltype(passAndResources)>;
+			if constexpr (std::is_same_v<T, std::monostate>) {
+				return false;
+			}
+			else {
+				const auto& cache = passAndResources.declarationCache;
+				return cache.dynamicInterface != nullptr
+					|| !passAndResources.resolverSnapshots.empty()
+					|| cache.requiresStaleHandleValidation;
+			}
+		},
+		pass.pass);
+}
+
+void RenderGraph::RebuildRetainedDeclarationRefreshCandidates()
+{
+	ZoneScopedN("RenderGraph::RebuildRetainedDeclarationRefreshCandidates");
+	m_retainedDeclarationRefreshCandidateMasterIndices.clear();
+	m_retainedDeclarationRefreshCandidateMasterIndices.reserve(m_masterPassList.size());
+	for (size_t passIndex = 0; passIndex < m_masterPassList.size(); ++passIndex) {
+		if (RetainedDeclarationMayNeedRefresh(m_masterPassList[passIndex])) {
+			m_retainedDeclarationRefreshCandidateMasterIndices.push_back(passIndex);
+		}
+	}
+}
+
 void RenderGraph::Setup() {
 	DeletionManager::GetInstance().Initialize();
 
@@ -12904,12 +13210,16 @@ void RenderGraph::AddRenderPass(std::shared_ptr<RenderPass> pass, RenderPassPara
 		passAndResources.resources.staticResourceRequirements,
 		passAndResources.resources.internalTransitions);
 	passAndResources.resolverSnapshots = std::move(resolverSnapshots);
-	UpdateRetainedDeclarationCache(_registry, passAndResources);
+	UpdateRetainedDeclarationCache(_registry, PassType::Render, passAndResources.name, passAndResources);
 	AnyPassAndResources passAndResourcesAny;
 	passAndResourcesAny.type = PassType::Render;
 	passAndResourcesAny.pass = std::move(passAndResources);
 	passAndResourcesAny.name = name;
+	const bool mayNeedRefresh = RetainedDeclarationMayNeedRefresh(passAndResourcesAny);
 	m_masterPassList.push_back(std::move(passAndResourcesAny));
+	if (mayNeedRefresh) {
+		m_retainedDeclarationRefreshCandidateMasterIndices.push_back(m_masterPassList.size() - 1);
+	}
 	if (name != "") {
 		renderPassesByName[name] = pass;
 	}
@@ -12925,12 +13235,16 @@ void RenderGraph::AddComputePass(std::shared_ptr<ComputePass> pass, ComputePassP
 		passAndResources.resources.staticResourceRequirements,
 		passAndResources.resources.internalTransitions);
 	passAndResources.resolverSnapshots = std::move(resolverSnapshots);
-	UpdateRetainedDeclarationCache(_registry, passAndResources);
+	UpdateRetainedDeclarationCache(_registry, PassType::Compute, passAndResources.name, passAndResources);
 	AnyPassAndResources passAndResourcesAny;
 	passAndResourcesAny.type = PassType::Compute;
 	passAndResourcesAny.pass = std::move(passAndResources);
 	passAndResourcesAny.name = name;
+	const bool mayNeedRefresh = RetainedDeclarationMayNeedRefresh(passAndResourcesAny);
 	m_masterPassList.push_back(std::move(passAndResourcesAny));
+	if (mayNeedRefresh) {
+		m_retainedDeclarationRefreshCandidateMasterIndices.push_back(m_masterPassList.size() - 1);
+	}
 	if (name != "") {
 		computePassesByName[name] = pass;
 	}
@@ -12946,12 +13260,16 @@ void RenderGraph::AddCopyPass(std::shared_ptr<CopyPass> pass, CopyPassParameters
 		passAndResources.resources.staticResourceRequirements,
 		passAndResources.resources.internalTransitions);
 	passAndResources.resolverSnapshots = std::move(resolverSnapshots);
-	UpdateRetainedDeclarationCache(_registry, passAndResources);
+	UpdateRetainedDeclarationCache(_registry, PassType::Copy, passAndResources.name, passAndResources);
 	AnyPassAndResources passAndResourcesAny;
 	passAndResourcesAny.type = PassType::Copy;
 	passAndResourcesAny.pass = std::move(passAndResources);
 	passAndResourcesAny.name = name;
+	const bool mayNeedRefresh = RetainedDeclarationMayNeedRefresh(passAndResourcesAny);
 	m_masterPassList.push_back(std::move(passAndResourcesAny));
+	if (mayNeedRefresh) {
+		m_retainedDeclarationRefreshCandidateMasterIndices.push_back(m_masterPassList.size() - 1);
+	}
 }
 
 void RenderGraph::SetPassTechnique(std::string passName, std::string techniquePath) {
