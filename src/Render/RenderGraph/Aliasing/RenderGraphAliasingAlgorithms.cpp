@@ -500,6 +500,85 @@ namespace {
 		return desc;
 	}
 
+	uint64_t HashAliasValue(uint64_t seed, uint64_t value) {
+		boost::hash_combine(seed, value);
+		return seed;
+	}
+
+	uint64_t BuildAliasTextureStaticSignature(const TextureDescription& desc, uint64_t backingGeneration, bool materialized) {
+		uint64_t signature = 0xa11a57a71c5e0001ull;
+		signature = HashAliasValue(signature, backingGeneration);
+		signature = HashAliasValue(signature, materialized ? 1ull : 0ull);
+		signature = HashAliasValue(signature, static_cast<uint64_t>(desc.format));
+		signature = HashAliasValue(signature, desc.channels);
+		signature = HashAliasValue(signature, desc.isCubemap ? 1ull : 0ull);
+		signature = HashAliasValue(signature, desc.isArray ? 1ull : 0ull);
+		signature = HashAliasValue(signature, desc.arraySize);
+		signature = HashAliasValue(signature, desc.hasRTV ? 1ull : 0ull);
+		signature = HashAliasValue(signature, static_cast<uint64_t>(desc.rtvFormat));
+		signature = HashAliasValue(signature, desc.hasDSV ? 1ull : 0ull);
+		signature = HashAliasValue(signature, static_cast<uint64_t>(desc.dsvFormat));
+		signature = HashAliasValue(signature, desc.hasUAV ? 1ull : 0ull);
+		signature = HashAliasValue(signature, static_cast<uint64_t>(desc.uavFormat));
+		signature = HashAliasValue(signature, desc.allowAlias ? 1ull : 0ull);
+		signature = HashAliasValue(signature, desc.aliasingPoolID.value_or(0ull));
+		signature = HashAliasValue(signature, desc.aliasingPoolID.has_value() ? 1ull : 0ull);
+		signature = HashAliasValue(signature, desc.imageDimensions.size());
+		for (const auto& dim : desc.imageDimensions) {
+			signature = HashAliasValue(signature, dim.width);
+			signature = HashAliasValue(signature, dim.height);
+			signature = HashAliasValue(signature, dim.rowPitch);
+			signature = HashAliasValue(signature, dim.slicePitch);
+		}
+		return signature;
+	}
+
+	uint64_t BuildAliasBufferStaticSignature(const BufferBase& buffer) {
+		uint64_t signature = 0xa11a57a7b0f00001ull;
+		signature = HashAliasValue(signature, buffer.GetBackingGeneration());
+		signature = HashAliasValue(signature, buffer.IsMaterialized() ? 1ull : 0ull);
+		signature = HashAliasValue(signature, buffer.GetBufferSize());
+		signature = HashAliasValue(signature, buffer.IsUnorderedAccessEnabled() ? 1ull : 0ull);
+		signature = HashAliasValue(signature, static_cast<uint64_t>(buffer.GetAccessType()));
+		signature = HashAliasValue(signature, buffer.IsAliasingAllowed() ? 1ull : 0ull);
+		const auto poolHint = buffer.GetAliasingPoolHint();
+		signature = HashAliasValue(signature, poolHint.value_or(0ull));
+		signature = HashAliasValue(signature, poolHint.has_value() ? 1ull : 0ull);
+		return signature;
+	}
+
+	void ApplyCachedAliasStaticInfo(
+		rg::alias::FrameAliasResourceInfo& info,
+		const rg::alias::CachedAliasStaticResourceInfo& cachedInfo) {
+		info.kind = cachedInfo.kind;
+		info.aliasAllowed = cachedInfo.aliasAllowed;
+		info.deviceLocal = cachedInfo.deviceLocal;
+		info.materialized = cachedInfo.materialized;
+		info.manualPoolID = cachedInfo.manualPoolID;
+		info.hasManualPool = cachedInfo.hasManualPool;
+		info.sizeBytes = cachedInfo.sizeBytes;
+		info.alignment = cachedInfo.alignment;
+		info.debugName = cachedInfo.debugName;
+		info.exclusionReason = cachedInfo.exclusionReason;
+		info.staticInfoInitialized = true;
+	}
+
+	rg::alias::CachedAliasStaticResourceInfo BuildCachedAliasStaticInfo(const rg::alias::FrameAliasResourceInfo& info, uint64_t signature) {
+		return rg::alias::CachedAliasStaticResourceInfo{
+			.signature = signature,
+			.kind = info.kind,
+			.aliasAllowed = info.aliasAllowed,
+			.deviceLocal = info.deviceLocal,
+			.materialized = info.materialized,
+			.manualPoolID = info.manualPoolID,
+			.hasManualPool = info.hasManualPool,
+			.sizeBytes = info.sizeBytes,
+			.alignment = info.alignment,
+			.debugName = info.debugName,
+			.exclusionReason = info.exclusionReason,
+		};
+	}
+
 	uint64_t AlignUpU64(uint64_t value, uint64_t alignment) {
 		if (alignment == 0) {
 			return value;
@@ -590,9 +669,10 @@ rg::alias::FrameAliasAnalysis rg::alias::RenderGraphAliasingSubsystem::BuildAlia
 	ZoneScopedN("RenderGraphAliasingSubsystem::BuildAliasFrameAnalysis");
 	FrameAliasAnalysis analysis{};
 	auto& m_framePasses = rg.m_framePasses;
-	auto& m_framePassSchedulingSummaries = rg.m_framePassSchedulingSummaries;
+	auto& m_framePassAccessSummaries = rg.m_framePassAccessSummaries;
 	auto& resourcesByID = rg.resourcesByID;
 	auto& _registry = rg._registry;
+	auto& staticInfoCache = rg.m_aliasStaticInfoCacheByResourceID;
 
 	if (nodes.empty() || m_framePasses.empty()) {
 		return analysis;
@@ -624,12 +704,20 @@ rg::alias::FrameAliasAnalysis rg::alias::RenderGraphAliasingSubsystem::BuildAlia
 			return;
 		}
 
+		uint64_t staticSignature = 0;
 		if (!resource->GetName().empty()) {
 			info.debugName = resource->GetName();
 		}
 
 		if (auto* texture = dynamic_cast<PixelBuffer*>(resource)) {
 			auto const& desc = texture->GetDescription();
+			staticSignature = BuildAliasTextureStaticSignature(desc, texture->GetBackingGeneration(), texture->IsMaterialized());
+			auto cacheIt = staticInfoCache.find(resourceID);
+			if (cacheIt != staticInfoCache.end() && cacheIt->second.signature == staticSignature) {
+				ApplyCachedAliasStaticInfo(info, cacheIt->second);
+				return;
+			}
+
 			info.kind = RGResourceRuntimeKind::Texture;
 			info.aliasAllowed = desc.allowAlias;
 			info.deviceLocal = true;
@@ -648,13 +736,22 @@ rg::alias::FrameAliasAnalysis rg::alias::RenderGraphAliasingSubsystem::BuildAlia
 			if (!info.aliasAllowed) {
 				info.exclusionReason = "allowAlias is disabled";
 				info.staticInfoInitialized = true;
+				staticInfoCache[resourceID] = BuildCachedAliasStaticInfo(info, staticSignature);
 				return;
 			}
 			info.staticInfoInitialized = true;
+			staticInfoCache[resourceID] = BuildCachedAliasStaticInfo(info, staticSignature);
 			return;
 		}
 
 		if (auto* buffer = dynamic_cast<Buffer*>(resource)) {
+			staticSignature = BuildAliasBufferStaticSignature(*buffer);
+			auto cacheIt = staticInfoCache.find(resourceID);
+			if (cacheIt != staticInfoCache.end() && cacheIt->second.signature == staticSignature) {
+				ApplyCachedAliasStaticInfo(info, cacheIt->second);
+				return;
+			}
+
 			info.kind = RGResourceRuntimeKind::Buffer;
 			info.aliasAllowed = buffer->IsAliasingAllowed();
 			info.deviceLocal = buffer->GetAccessType() == rhi::HeapType::DeviceLocal;
@@ -676,19 +773,23 @@ rg::alias::FrameAliasAnalysis rg::alias::RenderGraphAliasingSubsystem::BuildAlia
 			if (!info.aliasAllowed) {
 				info.exclusionReason = "allowAlias is disabled";
 				info.staticInfoInitialized = true;
+				staticInfoCache[resourceID] = BuildCachedAliasStaticInfo(info, staticSignature);
 				return;
 			}
 			if (!info.deviceLocal) {
 				info.exclusionReason = "buffer heap is not DeviceLocal";
 				info.staticInfoInitialized = true;
+				staticInfoCache[resourceID] = BuildCachedAliasStaticInfo(info, staticSignature);
 				return;
 			}
 			info.staticInfoInitialized = true;
+			staticInfoCache[resourceID] = BuildCachedAliasStaticInfo(info, staticSignature);
 			return;
 		}
 
 		info.exclusionReason = "unsupported resource type";
 		info.staticInfoInitialized = true;
+		staticInfoCache[resourceID] = BuildCachedAliasStaticInfo(info, 0x51a71c5e00000000ull);
 	};
 	auto collectResource = [&](size_t resourceIndex, uint64_t resourceID, const ResourceRegistry::RegistryHandle* handle, bool isWrite, size_t usageOrder, uint32_t passCrit, size_t passIdx) {
 		if (resourceIndex >= analysis.infoByResourceIndex.size()) {
@@ -728,19 +829,27 @@ rg::alias::FrameAliasAnalysis rg::alias::RenderGraphAliasingSubsystem::BuildAlia
 	};
 
 	for (size_t passIdx = 0; passIdx < m_framePasses.size(); ++passIdx) {
-		if (passIdx >= m_framePassSchedulingSummaries.size()) {
+		if (passIdx >= m_framePassAccessSummaries.size()) {
 			continue;
 		}
 
-		const auto& passSummary = m_framePassSchedulingSummaries[passIdx];
+		const auto& passSummary = m_framePassAccessSummaries[passIdx];
 		const size_t usageOrder = passTopoRank[passIdx];
 		const uint32_t passCrit = passCriticality[passIdx];
 
-		for (const auto& req : passSummary.requirements) {
-			collectResource(req.resourceIndex, req.resourceID, &req.resource, AccessTypeIsWriteOrCommon(req.state.access), usageOrder, passCrit, passIdx);
+		for (const auto& req : passSummary.requirementSummaries) {
+			auto resourceIndex = rg.TryGetFrameSchedulingResourceIndex(req.resourceID);
+			if (!resourceIndex.has_value()) {
+				continue;
+			}
+			collectResource(*resourceIndex, req.resourceID, &req.resource, AccessTypeIsWriteOrCommon(req.state.access), usageOrder, passCrit, passIdx);
 		}
-		for (const auto& transition : passSummary.internalTransitions) {
-			collectResource(transition.resourceIndex, transition.resourceID, nullptr, true, usageOrder, passCrit, passIdx);
+		for (const auto& transition : passSummary.internalTransitionSummaries) {
+			auto resourceIndex = rg.TryGetFrameSchedulingResourceIndex(transition.resourceID);
+			if (!resourceIndex.has_value()) {
+				continue;
+			}
+			collectResource(*resourceIndex, transition.resourceID, nullptr, true, usageOrder, passCrit, passIdx);
 		}
 	}
 

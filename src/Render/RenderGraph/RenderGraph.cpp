@@ -1558,12 +1558,12 @@ RenderGraph::PassView RenderGraph::GetPassView(const AnyPassAndResources& pr) {
 	return v;
 }
 
-void RenderGraph::RebuildFramePassAccessSummaries() {
+void RenderGraph::RebuildFramePassAccessSummaries(std::unordered_set<uint64_t>& outUsedResourceIDs) {
 	ZoneScopedN("RenderGraph::RebuildFramePassAccessSummaries");
+	outUsedResourceIDs.clear();
 	m_framePassAccessSummaries.clear();
 	m_framePassAccessSummaries.resize(m_framePasses.size());
 
-	std::vector<uint8_t> resourcesWrittenThisFrame(m_frameDAGResourceCount, 0);
 	auto schedulingResourceIDForHandle = [&](const ResourceRegistry::RegistryHandle& handle) {
 		Resource* resource = handle.IsEphemeral()
 			? handle.GetEphemeralPtr()
@@ -1574,9 +1574,123 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 		return handle.GetGlobalResourceID();
 	};
 
+	auto appendHandleResourceIDs = [&](std::vector<uint64_t>& out, const ResourceRegistry::RegistryHandle& handle) {
+		out.push_back(handle.GetGlobalResourceID());
+		Resource* resource = handle.IsEphemeral()
+			? handle.GetEphemeralPtr()
+			: _registry.Resolve(handle);
+		if (auto* dynamicResource = dynamic_cast<DynamicResource*>(resource)) {
+			out.push_back(dynamicResource->GetDynamicWrapperGlobalResourceID());
+			out.push_back(dynamicResource->GetGlobalResourceID());
+			if (auto backing = dynamicResource->GetResource()) {
+				out.push_back(backing->GetGlobalResourceID());
+			}
+		}
+	};
+
+	auto hashHandleAndRange = [&](uint64_t seed, const ResourceHandleAndRange& handleAndRange) {
+		seed = HashCombine64(seed, handleAndRange.resource.GetGlobalResourceID());
+		Resource* resource = handleAndRange.resource.IsEphemeral()
+			? handleAndRange.resource.GetEphemeralPtr()
+			: _registry.Resolve(handleAndRange.resource);
+		if (auto* dynamicResource = dynamic_cast<DynamicResource*>(resource)) {
+			seed = HashCombine64(seed, dynamicResource->GetDynamicWrapperGlobalResourceID());
+			if (auto backing = dynamicResource->GetResource()) {
+				seed = HashCombine64(seed, backing->GetGlobalResourceID());
+			}
+		}
+		return HashRangeForDeclaration(seed, handleAndRange.range);
+	};
+
+	auto buildPassAccessKey = [&](const AnyPassAndResources& pass) {
+		uint64_t key = 0xa11ce55acce55001ull;
+		key = HashCombine64(key, static_cast<uint64_t>(pass.type));
+		key = HashCombine64(key, HashString64(pass.name));
+
+		std::visit([&](auto const& passAndResources) {
+			using T = std::decay_t<decltype(passAndResources)>;
+			if constexpr (!std::is_same_v<T, std::monostate>) {
+				key = HashCombine64(key, reinterpret_cast<uintptr_t>(passAndResources.pass.get()));
+				key = HashCombine64(key, static_cast<uint64_t>(passAndResources.run));
+				key = HashCombine64(key, static_cast<uint64_t>(passAndResources.resources.preferredQueueKind));
+				key = HashCombine64(key, static_cast<uint64_t>(passAndResources.resources.queueAssignmentPolicy));
+				key = HashCombine64(key, passAndResources.resources.pinnedQueueSlot
+					? static_cast<uint64_t>(static_cast<uint8_t>(*passAndResources.resources.pinnedQueueSlot)) + 1ull
+					: 0ull);
+				key = HashCombine64(key, passAndResources.declarationCache.declarationFingerprint);
+
+				uint64_t requirementsHash = 0xf12e5e71f12e5e71ull;
+				auto reqs = GetFrameRequirementsSpan(passAndResources.resources);
+				requirementsHash = HashCombine64(requirementsHash, reqs.size());
+				for (const auto& req : reqs) {
+					uint64_t entry = 0x7265717569726501ull;
+					entry = hashHandleAndRange(entry, req.resourceHandleAndRange);
+					entry = HashStateForDeclaration(entry, req.state);
+					requirementsHash = HashCombine64(requirementsHash, entry);
+				}
+				requirementsHash = HashCombine64(requirementsHash, passAndResources.resources.internalTransitions.size());
+				for (const auto& transition : passAndResources.resources.internalTransitions) {
+					uint64_t entry = 0x7472616e73697401ull;
+					entry = hashHandleAndRange(entry, transition.first);
+					entry = HashStateForDeclaration(entry, transition.second);
+					requirementsHash = HashCombine64(requirementsHash, entry);
+				}
+				key = HashCombine64(key, requirementsHash);
+			}
+		}, pass.pass);
+
+		return key;
+	};
+
+	struct PassAccessWorkItem {
+		uint64_t cacheKey = 0;
+		bool cacheable = false;
+		bool cacheHit = false;
+		FramePassStaticAccessSummary summary;
+		std::vector<uint64_t> usedResourceIDs;
+	};
+
+	auto passAccessSummaryCacheable = [&](size_t passIndex, const AnyPassAndResources& pass) {
+		if (passIndex < m_framePassIsFrameExtension.size() && m_framePassIsFrameExtension[passIndex] != 0) {
+			return false;
+		}
+
+		bool cacheable = true;
+		std::visit([&](auto const& passAndResources) {
+			using T = std::decay_t<decltype(passAndResources)>;
+			if constexpr (!std::is_same_v<T, std::monostate>) {
+				cacheable = passAndResources.resources.frameResourceRequirements.empty()
+					&& passAndResources.run == PassRunMask::Retained;
+			}
+		}, pass.pass);
+		return cacheable;
+	};
+
+	std::vector<PassAccessWorkItem> workItems(m_framePasses.size());
+	size_t estimatedUsedResourceIDCount = 0;
 	for (size_t passIndex = 0; passIndex < m_framePasses.size(); ++passIndex) {
+		auto& workItem = workItems[passIndex];
+		workItem.cacheable = passAccessSummaryCacheable(passIndex, m_framePasses[passIndex]);
+		workItem.cacheKey = buildPassAccessKey(m_framePasses[passIndex]);
+		auto cacheIt = workItem.cacheable
+			? m_framePassAccessSummaryCache.find(workItem.cacheKey)
+			: m_framePassAccessSummaryCache.end();
+		if (workItem.cacheable && cacheIt != m_framePassAccessSummaryCache.end()) {
+			workItem.cacheHit = true;
+			workItem.summary = cacheIt->second.summary;
+			workItem.usedResourceIDs = cacheIt->second.usedResourceIDs;
+			estimatedUsedResourceIDCount += workItem.usedResourceIDs.size();
+		}
+	}
+
+	auto buildPassSummary = [&](size_t passIndex) {
+		auto& workItem = workItems[passIndex];
+		if (workItem.cacheHit) {
+			return;
+		}
+
 		const auto& pass = m_framePasses[passIndex];
-		auto& summary = m_framePassAccessSummaries[passIndex];
+		auto& summary = workItem.summary;
 		summary = FramePassStaticAccessSummary{};
 		summary.type = pass.type;
 		summary.preferredQueueKind = DefaultPreferredQueueKind(pass.type);
@@ -1610,11 +1724,13 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 		}
 
 		if (!view.reqs.empty()) {
+			workItem.usedResourceIDs.reserve((view.reqs.size() + (view.internalTransitions ? view.internalTransitions->size() : 0)) * 4);
 			for (const auto& req : view.reqs) {
 				const auto resource = req.resourceHandleAndRange.resource;
 				const uint64_t resourceID = schedulingResourceIDForHandle(resource);
 				const bool isWrite = AccessTypeIsWriteType(req.state.access);
 				const bool isUAV = IsUAVState(req.state);
+				appendHandleResourceIDs(workItem.usedResourceIDs, resource);
 
 				summary.requirementSummaries.push_back(FramePassRequirementStaticSummary{
 					.resource = resource,
@@ -1624,14 +1740,6 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 					.isUAV = isUAV,
 					.isWrite = isWrite,
 				});
-
-				if (!isWrite) {
-					continue;
-				}
-				auto dagResourceIt = m_frameDAGResourceIndexByID.find(resourceID);
-				if (dagResourceIt != m_frameDAGResourceIndexByID.end() && dagResourceIt->second < resourcesWrittenThisFrame.size()) {
-					resourcesWrittenThisFrame[dagResourceIt->second] = 1;
-				}
 			}
 		}
 
@@ -1639,16 +1747,70 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 			for (const auto& transition : *view.internalTransitions) {
 				const auto resource = transition.first.resource;
 				const uint64_t resourceID = schedulingResourceIDForHandle(resource);
+				appendHandleResourceIDs(workItem.usedResourceIDs, resource);
 
 				summary.internalTransitionSummaries.push_back(FramePassInternalTransitionStaticSummary{
 					.resource = resource,
 					.resourceID = resourceID,
 				});
+			}
+		}
 
-				auto dagResourceIt = m_frameDAGResourceIndexByID.find(resourceID);
-				if (dagResourceIt != m_frameDAGResourceIndexByID.end() && dagResourceIt->second < resourcesWrittenThisFrame.size()) {
-					resourcesWrittenThisFrame[dagResourceIt->second] = 1;
-				}
+		std::sort(workItem.usedResourceIDs.begin(), workItem.usedResourceIDs.end());
+		workItem.usedResourceIDs.erase(
+			std::unique(workItem.usedResourceIDs.begin(), workItem.usedResourceIDs.end()),
+			workItem.usedResourceIDs.end());
+	};
+
+	ParallelForOptional("RGPrecompilePassAccess", workItems.size(), buildPassSummary);
+
+	for (size_t passIndex = 0; passIndex < workItems.size(); ++passIndex) {
+		auto& workItem = workItems[passIndex];
+		if (workItem.cacheable && !workItem.cacheHit) {
+			m_framePassAccessSummaryCache[workItem.cacheKey] = CachedFramePassAccessSummary{
+				.key = workItem.cacheKey,
+				.summary = workItem.summary,
+				.usedResourceIDs = workItem.usedResourceIDs,
+			};
+			estimatedUsedResourceIDCount += workItem.usedResourceIDs.size();
+		}
+		m_framePassAccessSummaries[passIndex] = std::move(workItem.summary);
+	}
+
+	outUsedResourceIDs.reserve(estimatedUsedResourceIDCount);
+	for (const auto& workItem : workItems) {
+		for (uint64_t resourceID : workItem.usedResourceIDs) {
+			outUsedResourceIDs.insert(resourceID);
+		}
+	}
+
+	m_frameDAGResourceIndexByID.clear();
+	m_frameDAGResourceIDsByIndex.clear();
+	m_frameDAGResourceIndexByID.reserve(outUsedResourceIDs.size());
+	m_frameDAGResourceIDsByIndex.reserve(outUsedResourceIDs.size());
+	std::vector<uint64_t> sortedResourceIDs(outUsedResourceIDs.begin(), outUsedResourceIDs.end());
+	std::sort(sortedResourceIDs.begin(), sortedResourceIDs.end());
+	for (uint64_t resourceID : sortedResourceIDs) {
+		m_frameDAGResourceIndexByID.emplace(resourceID, m_frameDAGResourceIDsByIndex.size());
+		m_frameDAGResourceIDsByIndex.push_back(resourceID);
+	}
+	m_frameDAGResourceCount = m_frameDAGResourceIDsByIndex.size();
+
+	std::vector<uint8_t> resourcesWrittenThisFrame(m_frameDAGResourceCount, 0);
+	for (const auto& summary : m_framePassAccessSummaries) {
+		for (const auto& req : summary.requirementSummaries) {
+			if (!req.isWrite) {
+				continue;
+			}
+			auto dagResourceIt = m_frameDAGResourceIndexByID.find(req.resourceID);
+			if (dagResourceIt != m_frameDAGResourceIndexByID.end() && dagResourceIt->second < resourcesWrittenThisFrame.size()) {
+				resourcesWrittenThisFrame[dagResourceIt->second] = 1;
+			}
+		}
+		for (const auto& transition : summary.internalTransitionSummaries) {
+			auto dagResourceIt = m_frameDAGResourceIndexByID.find(transition.resourceID);
+			if (dagResourceIt != m_frameDAGResourceIndexByID.end() && dagResourceIt->second < resourcesWrittenThisFrame.size()) {
+				resourcesWrittenThisFrame[dagResourceIt->second] = 1;
 			}
 		}
 	}
@@ -3548,6 +3710,7 @@ void RenderGraph::ShutdownOwnedState() {
 	m_framePasses.clear();
 	m_framePassIsFrameExtension.clear();
 	m_framePassDeclarationRefreshedThisFrame.clear();
+	m_framePassAccessSummaryCache.clear();
 	m_assignedQueueSlotsByFramePass.clear();
 	m_activeQueueSlotsThisFrame.clear();
 	renderPassesByName.clear();
@@ -3565,6 +3728,7 @@ void RenderGraph::ShutdownOwnedState() {
 	aliasPlacementRangesByID.clear();
 	schedulingPlacementRangesByID.clear();
 	m_schedulingEquivalentIDsCache.clear();
+	m_aliasStaticInfoCacheByResourceID.clear();
 	m_regionCache = {};
 	m_lastRegionStats = {};
 	m_lastExtractedRegions.clear();
@@ -3881,9 +4045,14 @@ void RenderGraph::RebuildFrameSchedulingResourceIndex(const std::unordered_set<u
 		}
 	};
 
-	for (uint64_t resourceID : resourceIDs) {
+	std::vector<uint64_t> sortedResourceIDs(resourceIDs.begin(), resourceIDs.end());
+	std::sort(sortedResourceIDs.begin(), sortedResourceIDs.end());
+	for (uint64_t resourceID : sortedResourceIDs) {
 		registerResourceID(resourceID);
-		for (uint64_t equivalentID : GetSchedulingEquivalentIDsCached(resourceID)) {
+		auto equivalentIDs = GetSchedulingEquivalentIDsCached(resourceID);
+		std::vector<uint64_t> sortedEquivalentIDs(equivalentIDs.begin(), equivalentIDs.end());
+		std::sort(sortedEquivalentIDs.begin(), sortedEquivalentIDs.end());
+		for (uint64_t equivalentID : sortedEquivalentIDs) {
 			registerResourceID(equivalentID);
 		}
 	}
@@ -4180,6 +4349,31 @@ void RenderGraph::ExtractScheduleRegionsFromAuthoritativeCompile(
 	RegionCacheStats& outStats,
 	std::vector<std::string>& outCandidateDiagnostics) const
 {
+	const TraceScanRange fullTraceRange{
+		.firstTraceIndex = 0,
+		.lastTraceIndex = m_schedulingDecisionTrace.empty()
+			? 0u
+			: static_cast<uint32_t>(m_schedulingDecisionTrace.size() - 1),
+	};
+	ExtractScheduleRegionsFromAuthoritativeCompile(
+		nodes,
+		framePasses,
+		compiledBatches,
+		m_schedulingDecisionTrace.empty() ? std::span<const TraceScanRange>{} : std::span<const TraceScanRange>(&fullTraceRange, 1),
+		outRegions,
+		outStats,
+		outCandidateDiagnostics);
+}
+
+void RenderGraph::ExtractScheduleRegionsFromAuthoritativeCompile(
+	const std::vector<Node>& nodes,
+	const std::vector<AnyPassAndResources>& framePasses,
+	const std::vector<PassBatch>& compiledBatches,
+	std::span<const TraceScanRange> traceRanges,
+	std::vector<ScheduledRegion>& outRegions,
+	RegionCacheStats& outStats,
+	std::vector<std::string>& outCandidateDiagnostics) const
+{
 	ZoneScopedN("RenderGraph::ExtractScheduleRegionsFromAuthoritativeCompile");
 	outRegions.clear();
 	outStats = {};
@@ -4424,14 +4618,22 @@ void RenderGraph::ExtractScheduleRegionsFromAuthoritativeCompile(
 		}
 	}
 
-	size_t start = 0;
-	while (start < m_schedulingDecisionTrace.size()) {
+	for (const TraceScanRange& scanRange : traceRanges) {
+		if (m_schedulingDecisionTrace.empty() || scanRange.firstTraceIndex >= m_schedulingDecisionTrace.size()) {
+			continue;
+		}
+		const size_t rangeBegin = scanRange.firstTraceIndex;
+		const size_t rangeEnd = std::min<size_t>(
+			static_cast<size_t>(scanRange.lastTraceIndex) + 1,
+			m_schedulingDecisionTrace.size());
+		size_t start = rangeBegin;
+		while (start < rangeEnd) {
 		const uint16_t queueSlot = m_schedulingDecisionTrace[start].assignedQueueSlot;
 		RegionRejectReason startSplitReason = RegionRejectReason::Count;
 		const bool startForcesSplit = passForcesCandidateSplit(m_schedulingDecisionTrace[start].passIndex, startSplitReason);
 		size_t end = start + 1;
 		if (!startForcesSplit) {
-			while (end < m_schedulingDecisionTrace.size()
+			while (end < rangeEnd
 				&& (maxPassCount == 0u || end - start < maxPassCount)
 				&& m_schedulingDecisionTrace[end].assignedQueueSlot == queueSlot) {
 				RegionRejectReason nextSplitReason = RegionRejectReason::Count;
@@ -4778,6 +4980,7 @@ void RenderGraph::ExtractScheduleRegionsFromAuthoritativeCompile(
 			RegionRejectReason::Count,
 			{});
 		start = end;
+		}
 	}
 }
 
@@ -5443,6 +5646,95 @@ void RenderGraph::ExtractReplaySegmentsFromAuthoritativeCompile(
 	}
 }
 
+RenderGraph::CachedReplaySegment RenderGraph::RemapCachedReplaySegmentToCurrentFrame(
+	const CachedReplaySegment& segment,
+	const std::vector<PassBatch>& compiledBatches) const
+{
+	ZoneScopedN("RenderGraph::RemapCachedReplaySegmentToCurrentFrame");
+	CachedReplaySegment remapped = segment;
+	ScheduledRegion& region = remapped.schedule;
+
+	uint32_t firstTraceIndex = std::numeric_limits<uint32_t>::max();
+	uint32_t lastTraceIndex = 0;
+	uint32_t firstPassIndex = std::numeric_limits<uint32_t>::max();
+	uint32_t lastPassIndex = 0;
+	uint32_t firstBatchIndex = std::numeric_limits<uint32_t>::max();
+	uint32_t lastBatchIndex = 0;
+	uint32_t passCount = 0;
+	uint32_t requirementCount = 0;
+
+	std::unordered_map<uint32_t, const SchedulingDecisionTrace*> traceByPassIndex;
+	traceByPassIndex.reserve(m_schedulingDecisionTrace.size());
+	for (const auto& trace : m_schedulingDecisionTrace) {
+		traceByPassIndex.emplace(trace.passIndex, &trace);
+	}
+
+	for (const auto& batchTemplate : remapped.batchTemplates) {
+		for (const auto& queuedPass : batchTemplate.queuedPasses) {
+			auto traceIt = traceByPassIndex.find(queuedPass.originalFramePassIndexAtExtraction);
+			if (traceIt == traceByPassIndex.end()) {
+				continue;
+			}
+			const SchedulingDecisionTrace& trace = *traceIt->second;
+			const uint32_t traceIndex = static_cast<uint32_t>(traceIt->second - m_schedulingDecisionTrace.data());
+			firstTraceIndex = std::min(firstTraceIndex, traceIndex);
+			lastTraceIndex = std::max(lastTraceIndex, traceIndex);
+			firstPassIndex = std::min(firstPassIndex, trace.passIndex);
+			lastPassIndex = std::max(lastPassIndex, trace.passIndex);
+			firstBatchIndex = std::min(firstBatchIndex, trace.batchIndex);
+			lastBatchIndex = std::max(lastBatchIndex, trace.batchIndex);
+			if (trace.passIndex < m_framePassSchedulingSummaries.size()) {
+				requirementCount += static_cast<uint32_t>(m_framePassSchedulingSummaries[trace.passIndex].requirements.size());
+			}
+			++passCount;
+		}
+	}
+
+	if (passCount == 0 || firstTraceIndex == std::numeric_limits<uint32_t>::max()) {
+		return remapped;
+	}
+
+	auto countBatchTransitions = [](const PassBatch& batch) {
+		uint32_t count = 0;
+		for (size_t queueIndex = 0; queueIndex < batch.QueueCount(); ++queueIndex) {
+			for (size_t phaseIndex = 0; phaseIndex < static_cast<size_t>(BatchTransitionPhase::Count); ++phaseIndex) {
+				count += static_cast<uint32_t>(batch.Transitions(queueIndex, static_cast<BatchTransitionPhase>(phaseIndex)).size());
+			}
+		}
+		return count;
+	};
+
+	uint32_t transitionCount = 0;
+	if (firstBatchIndex != std::numeric_limits<uint32_t>::max()) {
+		for (uint32_t batchIndex = firstBatchIndex; batchIndex <= lastBatchIndex && batchIndex < compiledBatches.size(); ++batchIndex) {
+			transitionCount += countBatchTransitions(compiledBatches[batchIndex]);
+		}
+	}
+
+	region.firstTraceIndex = firstTraceIndex;
+	region.lastTraceIndex = lastTraceIndex;
+	region.firstPassIndex = firstPassIndex;
+	region.lastPassIndex = lastPassIndex;
+	region.firstBatchIndex = firstBatchIndex;
+	region.lastBatchIndex = lastBatchIndex;
+	region.queueSlot = m_schedulingDecisionTrace[firstTraceIndex].assignedQueueSlot;
+	region.passCount = passCount;
+	region.requirementCount = requirementCount;
+	region.batchCount = firstBatchIndex != std::numeric_limits<uint32_t>::max() && lastBatchIndex >= firstBatchIndex
+		? (lastBatchIndex - firstBatchIndex + 1)
+		: 0;
+	region.transitionCount = transitionCount;
+
+	remapped.identity.passCount = passCount;
+	remapped.identity.structuralPositionHash = 0x736567706f730001ull;
+	remapped.identity.structuralPositionHash = HashCombine64(remapped.identity.structuralPositionHash, region.firstTraceIndex);
+	remapped.identity.structuralPositionHash = HashCombine64(remapped.identity.structuralPositionHash, region.lastTraceIndex);
+	remapped.identity.structuralPositionHash = HashCombine64(remapped.identity.structuralPositionHash, region.queueSlot);
+	remapped.identity.structuralPositionHash = HashCombine64(remapped.identity.structuralPositionHash, region.passCount);
+
+	return remapped;
+}
+
 RenderGraph::ReplaySegmentValidationStats RenderGraph::ValidateCachedSegmentsAgainstCurrentFrame(
 	std::span<const CachedReplaySegment> previousSegments,
 	std::span<const CachedReplaySegment> currentSegments) const
@@ -5997,10 +6289,13 @@ RenderGraph::ReplaySegmentLookupResult RenderGraph::LookupCachedReplaySegmentVar
 	}
 
 	if (bestVariant != nullptr) {
+		const uint64_t variantAgeFrames = frameIndex >= bestVariant->lastSeenFrame ? frameIndex - bestVariant->lastSeenFrame : 0;
 		++bestVariant->hitCount;
+		++bestVariant->seenCount;
+		bestVariant->lastSeenFrame = frameIndex;
 		result.variant = bestVariant;
 		result.syncShapeDiverged = ReplaySegmentSyncShapeDiverged(bestVariant->segment, currentSegment);
-		result.variantAgeFrames = frameIndex >= bestVariant->lastSeenFrame ? frameIndex - bestVariant->lastSeenFrame : 0;
+		result.variantAgeFrames = variantAgeFrames;
 		return result;
 	}
 
@@ -7163,10 +7458,14 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 
 	std::unordered_map<uint32_t, const CachedReplaySegment*> segmentByFirstNode;
 	segmentByFirstNode.reserve(replaySegments.size());
+	std::unordered_map<const CachedReplaySegment*, size_t> replaySegmentIndexByPointer;
+	replaySegmentIndexByPointer.reserve(replaySegments.size());
 	std::vector<std::vector<uint32_t>> segmentNodesByFirstNode(nodes.size());
 	std::unordered_map<uint32_t, uint32_t> segmentFirstNodeByNode;
 	segmentFirstNodeByNode.reserve(nodes.size());
-	for (const auto& segment : replaySegments) {
+	for (size_t replaySegmentIndex = 0; replaySegmentIndex < replaySegments.size(); ++replaySegmentIndex) {
+		const auto& segment = replaySegments[replaySegmentIndex];
+		replaySegmentIndexByPointer.emplace(&segment, replaySegmentIndex);
 		if (!segment.tier1Eligible || segment.batchTemplates.empty()) {
 			continue;
 		}
@@ -7737,6 +8036,10 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 			if (!commitSegment(*segmentIt->second)) {
 				return false;
 			}
+			if (auto replaySegmentIndexIt = replaySegmentIndexByPointer.find(segmentIt->second);
+				replaySegmentIndexIt != replaySegmentIndexByPointer.end()) {
+				report.reusedReplaySegmentIndices.push_back(replaySegmentIndexIt->second);
+			}
 			batchBuildState.ResetForNewBatch();
 			currentBatchIndex = static_cast<unsigned int>(batches.size());
 			closedBatchBeforeNextCommit = true;
@@ -8072,6 +8375,23 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 				}
 			}
 		}
+	}
+	report.rejectedReplaySegments = replayRejectedSegmentFirstNodes.size();
+	report.dynamicTraceRanges.clear();
+	for (uint32_t traceIndex = 0; traceIndex < m_schedulingDecisionTrace.size();) {
+		if (!m_schedulingDecisionTrace[traceIndex].fallbackCommit) {
+			++traceIndex;
+			continue;
+		}
+		const uint32_t firstTraceIndex = traceIndex;
+		while (traceIndex < m_schedulingDecisionTrace.size()
+			&& m_schedulingDecisionTrace[traceIndex].fallbackCommit) {
+			++traceIndex;
+		}
+		report.dynamicTraceRanges.push_back(TraceScanRange{
+			.firstTraceIndex = firstTraceIndex,
+			.lastTraceIndex = traceIndex - 1,
+		});
 	}
 	return report;
 }
@@ -8713,6 +9033,8 @@ std::vector<uint64_t> RenderGraph::BuildSchedulingEquivalentIDs(uint64_t resourc
 	if (out.empty()) {
 		out.push_back(resourceID);
 	}
+	std::sort(out.begin(), out.end());
+	out.erase(std::unique(out.begin(), out.end()), out.end());
 
 	return out;
 }
@@ -9137,6 +9459,7 @@ void RenderGraph::ResetStructuralBuildState() {
 
 	m_passBuilderOrder.clear();
 	m_passNamesSeenThisReset.clear();
+	m_framePassAccessSummaryCache.clear();
 }
 
 void RenderGraph::ResetForFrame() {
@@ -10427,16 +10750,6 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	}
 
 	std::unordered_set<uint64_t> usedResourceIDs;
-	{
-		traceCompileStep("CollectFrameResourceIDs");
-		ZoneScopedN("RenderGraph::CompileFrame::CollectFrameResourceIDs");
-		CollectFrameResourceIDs(usedResourceIDs);
-	}
-	{
-		traceCompileStep("ApplyIdleDematerializationPolicy");
-		ZoneScopedN("RenderGraph::CompileFrame::ApplyIdleDematerializationPolicy");
-		ApplyIdleDematerializationPolicy(usedResourceIDs);
-	}
 
 	// Convert explicit After(anchorName)->(passName) constraints into node-index edges.
 	std::vector<std::pair<size_t, size_t>> explicitEdges;
@@ -10461,29 +10774,25 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	}
 
 	std::vector<Node> nodes;
-	m_frameDAGResourceIndexByID.clear();
-	m_frameDAGResourceIDsByIndex.clear();
-	m_frameDAGResourceIndexByID.reserve(usedResourceIDs.size());
-	m_frameDAGResourceIDsByIndex.reserve(usedResourceIDs.size());
-	for (uint64_t resourceID : usedResourceIDs) {
-		m_frameDAGResourceIndexByID.emplace(resourceID, m_frameDAGResourceIDsByIndex.size());
-		m_frameDAGResourceIDsByIndex.push_back(resourceID);
-	}
-	m_frameDAGResourceCount = m_frameDAGResourceIDsByIndex.size();
 	{
 		traceCompileStep("RebuildFramePassAccessSummaries");
 		ZoneScopedN("RenderGraph::CompileFrame::RebuildFramePassAccessSummaries");
-		RebuildFramePassAccessSummaries();
+		RebuildFramePassAccessSummaries(usedResourceIDs);
 	}
 	{
-		traceCompileStep("RebuildFrameSchedulingResourceIndexForAliasing");
-		ZoneScopedN("RenderGraph::CompileFrame::RebuildFrameSchedulingResourceIndexForAliasing");
+		traceCompileStep("ApplyIdleDematerializationPolicy");
+		ZoneScopedN("RenderGraph::CompileFrame::ApplyIdleDematerializationPolicy");
+		ApplyIdleDematerializationPolicy(usedResourceIDs);
+	}
+	{
+		traceCompileStep("RebuildSchedulingEquivalentIDCacheBeforeAliasing");
+		ZoneScopedN("RenderGraph::CompileFrame::RebuildSchedulingEquivalentIDCacheBeforeAliasing");
+		RebuildSchedulingEquivalentIDCache(usedResourceIDs);
+	}
+	{
+		traceCompileStep("RebuildFrameSchedulingResourceIndex");
+		ZoneScopedN("RenderGraph::CompileFrame::RebuildFrameSchedulingResourceIndex");
 		RebuildFrameSchedulingResourceIndex(usedResourceIDs);
-	}
-	{
-		traceCompileStep("RebuildFramePassSchedulingSummariesForAliasing");
-		ZoneScopedN("RenderGraph::CompileFrame::RebuildFramePassSchedulingSummariesForAliasing");
-		RebuildFramePassSchedulingSummaries();
 	}
 	{
 		traceCompileStep("BuildNodes");
@@ -10543,9 +10852,10 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		RebuildSchedulingEquivalentIDCache(usedResourceIDs);
 	}
 	{
-		traceCompileStep("RebuildFrameSchedulingResourceIndex");
-		ZoneScopedN("RenderGraph::CompileFrame::RebuildFrameSchedulingResourceIndex");
-		RebuildFrameSchedulingResourceIndex(usedResourceIDs);
+		traceCompileStep("RebuildEquivalentResourceIndicesByResourceIndex");
+		ZoneScopedN("RenderGraph::CompileFrame::RebuildEquivalentResourceIndicesByResourceIndex");
+		RebuildEquivalentResourceIndicesByResourceIndex();
+		ResetFrameQueueBatchHistoryTables();
 	}
 	{
 		traceCompileStep("RebuildFramePassSchedulingSummaries");
@@ -10792,26 +11102,92 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				m_aliasActivationPendingByResourceIndex = aliasActivationPendingByResourceIndexBeforeAuthoritativeCompile;
 			}
 			else {
+				auto addRegionStats = [](RegionCacheStats& stats, const ScheduledRegion& region) {
+					++stats.candidateRegionCount;
+					++stats.acceptedRegionCount;
+					stats.coveredPassCount += region.passCount;
+					stats.coveredRequirementCount += region.requirementCount;
+					stats.coveredBatchCount += region.batchCount;
+					stats.coveredTransitionCount += region.transitionCount;
+					stats.largestRegionPassCount = std::max<uint64_t>(
+						stats.largestRegionPassCount,
+						region.passCount);
+					stats.largestRegionRequirementCount = std::max<uint64_t>(
+						stats.largestRegionRequirementCount,
+						region.requirementCount);
+					stats.estimatedSavedAddTransitionCalls += region.requirementCount;
+					stats.boundaryInputEdgeCount += region.boundaryInputEdgeCount;
+					stats.boundaryOutputEdgeCount += region.boundaryOutputEdgeCount;
+					stats.crossQueueBoundaryInputEdgeCount += region.crossQueueBoundaryInputEdgeCount;
+					stats.crossQueueBoundaryOutputEdgeCount += region.crossQueueBoundaryOutputEdgeCount;
+					stats.boundarySyncCount += region.boundarySyncCount;
+					stats.sameBatchPrefixPassCount += region.sameBatchPrefixPassCount;
+					stats.sameBatchSuffixPassCount += region.sameBatchSuffixPassCount;
+					stats.sameBatchInterleavedPassCount += region.sameBatchInterleavedPassCount;
+					stats.crossQueueBoundaryPassCount += region.crossQueueBoundaryPassCount;
+					stats.crossQueueTransitionCount += region.crossQueueTransitionCount;
+				};
+
+				std::vector<CachedReplaySegment> reusedReplaySegments;
+				reusedReplaySegments.reserve(replayReport.reusedReplaySegmentIndices.size());
+				for (size_t replaySegmentIndex : replayReport.reusedReplaySegmentIndices) {
+					if (replaySegmentIndex >= selectedReplaySegments.size()) {
+						continue;
+					}
+					reusedReplaySegments.push_back(RemapCachedReplaySegmentToCurrentFrame(
+						selectedReplaySegments[replaySegmentIndex],
+						batches));
+				}
+
 				std::vector<ScheduledRegion> replayRegions;
 				RegionCacheStats replayRegionStats;
 				std::vector<std::string> replayCandidateDiagnostics;
 				std::vector<CachedReplaySegment> currentReplaySegments;
+				std::vector<CachedReplaySegment> newlyExtractedReplaySegments;
+				replayRegions.reserve(reusedReplaySegments.size() + replayReport.dynamicTraceRanges.size());
+				currentReplaySegments.reserve(reusedReplaySegments.size() + replayReport.dynamicTraceRanges.size());
+
 				{
-					ZoneScopedN("RenderGraph::Replay::HarvestSuccessfulReplaySegments");
-					ExtractScheduleRegionsFromAuthoritativeCompile(
-						nodes,
-						m_framePasses,
-						batches,
-						replayRegions,
-						replayRegionStats,
-						replayCandidateDiagnostics);
-					ExtractReplaySegmentsFromAuthoritativeCompile(
-						nodes,
-						m_framePasses,
-						batches,
-						replayRegions,
-						currentReplaySegments);
+					ZoneScopedN("RenderGraph::Replay::HarvestDynamicReplayGaps");
+					std::vector<ScheduledRegion> dynamicReplayRegions;
+					RegionCacheStats dynamicReplayRegionStats;
+					if (!replayReport.dynamicTraceRanges.empty()) {
+						ExtractScheduleRegionsFromAuthoritativeCompile(
+							nodes,
+							m_framePasses,
+							batches,
+							replayReport.dynamicTraceRanges,
+							dynamicReplayRegions,
+							dynamicReplayRegionStats,
+							replayCandidateDiagnostics);
+						ExtractReplaySegmentsFromAuthoritativeCompile(
+							nodes,
+							m_framePasses,
+							batches,
+							dynamicReplayRegions,
+							newlyExtractedReplaySegments);
+					}
+					replayRegionStats = dynamicReplayRegionStats;
+					replayRegions = std::move(dynamicReplayRegions);
 				}
+
+				for (const auto& segment : reusedReplaySegments) {
+					replayRegions.push_back(segment.schedule);
+					currentReplaySegments.push_back(segment);
+					addRegionStats(replayRegionStats, segment.schedule);
+				}
+				currentReplaySegments.insert(
+					currentReplaySegments.end(),
+					newlyExtractedReplaySegments.begin(),
+					newlyExtractedReplaySegments.end());
+
+				std::sort(replayRegions.begin(), replayRegions.end(), [](const ScheduledRegion& lhs, const ScheduledRegion& rhs) {
+					return lhs.firstTraceIndex < rhs.firstTraceIndex;
+				});
+				std::sort(currentReplaySegments.begin(), currentReplaySegments.end(), [](const CachedReplaySegment& lhs, const CachedReplaySegment& rhs) {
+					return lhs.schedule.firstTraceIndex < rhs.schedule.firstTraceIndex;
+				});
+
 				m_lastExtractedRegions = replayRegions;
 				m_lastRegionStats = replayRegionStats;
 				m_lastRegionCandidateDiagnostics = replayCandidateDiagnostics;
@@ -10822,7 +11198,11 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				}
 				m_regionCache.stats = replayRegionStats;
 				m_regionCache.replaySegments = currentReplaySegments;
-				InsertOrRefreshReplaySegmentVariants(currentReplaySegments, replayCacheFrameSerial);
+				if (!newlyExtractedReplaySegments.empty()) {
+					InsertOrRefreshReplaySegmentVariants(newlyExtractedReplaySegments, replayCacheFrameSerial);
+				}
+				ReplaySegmentCacheUpdateStats replayCacheMaintenanceStats{};
+				EvictOldReplaySegmentVariants(replayCacheFrameSerial, replayCacheMaintenanceStats);
 			}
 		}
 	}

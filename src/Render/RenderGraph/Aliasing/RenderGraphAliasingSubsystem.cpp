@@ -62,6 +62,7 @@ void rg::alias::RenderGraphAliasingSubsystem::ResetPersistentState(RenderGraph& 
 	renderGraph.schedulingPlacementRangesByID.clear();
 	renderGraph.aliasPlacementPoolByID.clear();
 	renderGraph.cachedAliasPlanByPoolID.clear();
+	renderGraph.m_aliasStaticInfoCacheByResourceID.clear();
 
 	for (auto& [poolID, poolState] : renderGraph.persistentAliasPools) {
 		(void)poolID;

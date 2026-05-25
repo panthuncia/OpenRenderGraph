@@ -805,6 +805,12 @@ private:
 		std::optional<QueueSlotIndex> pinnedQueueSlot;
 	};
 
+	struct CachedFramePassAccessSummary {
+		uint64_t key = 0;
+		FramePassStaticAccessSummary summary;
+		std::vector<uint64_t> usedResourceIDs;
+	};
+
 	struct FrameResourceEventSummary {
 		unsigned int latestBatch = 0;
 		unsigned int previousBatch = 0;
@@ -1046,6 +1052,11 @@ private:
 		std::vector<ReplaySegmentQueueUsageSummary> queueUsage;
 	};
 
+	struct TraceScanRange {
+		uint32_t firstTraceIndex = 0;
+		uint32_t lastTraceIndex = 0;
+	};
+
 	struct ReplaySegmentVerificationReport {
 		bool valid = true;
 		uint64_t checkedPasses = 0;
@@ -1064,6 +1075,9 @@ private:
 		uint64_t recomputedBatches = 0;
 		uint64_t replayedInternalTransitions = 0;
 		uint64_t recomputedTransitionCalls = 0;
+		uint64_t rejectedReplaySegments = 0;
+		std::vector<size_t> reusedReplaySegmentIndices;
+		std::vector<TraceScanRange> dynamicTraceRanges;
 		std::string firstRecomputeReason;
 		std::string topTransitionNoise;
 		std::string firstFailure;
@@ -1381,6 +1395,8 @@ private:
 	std::vector<FrameResourceEventSummary> m_frameResourceEventSummaries;
 	std::vector<FramePassStaticAccessSummary> m_framePassAccessSummaries;
 	std::vector<FramePassSchedulingSummary> m_framePassSchedulingSummaries;
+	std::unordered_map<uint64_t, CachedFramePassAccessSummary> m_framePassAccessSummaryCache;
+	std::unordered_map<uint64_t, rg::alias::CachedAliasStaticResourceInfo> m_aliasStaticInfoCacheByResourceID;
 	std::unordered_map<uint64_t, uint64_t> aliasPlacementPoolByID;
 	std::unordered_set<uint64_t> aliasActivationPending;
 
@@ -1528,12 +1544,23 @@ private:
 		std::vector<ScheduledRegion>& outRegions,
 		RegionCacheStats& outStats,
 		std::vector<std::string>& outCandidateDiagnostics) const;
+	void ExtractScheduleRegionsFromAuthoritativeCompile(
+		const std::vector<Node>& nodes,
+		const std::vector<AnyPassAndResources>& framePasses,
+		const std::vector<PassBatch>& compiledBatches,
+		std::span<const TraceScanRange> traceRanges,
+		std::vector<ScheduledRegion>& outRegions,
+		RegionCacheStats& outStats,
+		std::vector<std::string>& outCandidateDiagnostics) const;
 	void ExtractReplaySegmentsFromAuthoritativeCompile(
 		const std::vector<Node>& nodes,
 		const std::vector<AnyPassAndResources>& framePasses,
 		const std::vector<PassBatch>& compiledBatches,
 		std::span<const ScheduledRegion> regions,
 		std::vector<CachedReplaySegment>& outSegments) const;
+	CachedReplaySegment RemapCachedReplaySegmentToCurrentFrame(
+		const CachedReplaySegment& segment,
+		const std::vector<PassBatch>& compiledBatches) const;
 	ReplaySegmentValidationStats ValidateCachedSegmentsAgainstCurrentFrame(
 		std::span<const CachedReplaySegment> previousSegments,
 		std::span<const CachedReplaySegment> currentSegments) const;
@@ -1770,7 +1797,7 @@ private:
 	using CachedAliasPoolPlan = rg::alias::CachedAliasPoolPlan;
 
 	static PassView GetPassView(const AnyPassAndResources& pr);
-	void RebuildFramePassAccessSummaries();
+	void RebuildFramePassAccessSummaries(std::unordered_set<uint64_t>& outUsedResourceIDs);
 	bool BuildDependencyGraph(std::vector<Node>& nodes);
 	bool BuildDependencyGraph(std::vector<Node>& nodes, std::span<const std::pair<size_t, size_t>> explicitEdges);
 	static bool FinalizeDependencyGraph(std::vector<Node>& nodes);

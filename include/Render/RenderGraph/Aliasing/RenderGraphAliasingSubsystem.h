@@ -173,6 +173,20 @@ struct FrameAliasAnalysis {
 	uint32_t maxNodeCriticality = 1;
 };
 
+struct CachedAliasStaticResourceInfo {
+	uint64_t signature = 0;
+	RGResourceRuntimeKind kind = RGResourceRuntimeKind::Unknown;
+	bool aliasAllowed = false;
+	bool deviceLocal = false;
+	bool materialized = false;
+	uint64_t manualPoolID = 0;
+	bool hasManualPool = false;
+	uint64_t sizeBytes = 0;
+	uint64_t alignment = 1;
+	std::string debugName;
+	const char* exclusionReason = nullptr;
+};
+
 class RenderGraphAliasingSubsystem {
 public:
 	AutoAliasDebugSnapshot BuildDebugSnapshot(
