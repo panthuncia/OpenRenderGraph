@@ -1263,7 +1263,7 @@ void RenderGraph::WriteCompiledGraphDebugDump(uint8_t frameIndex, const std::vec
 
 		std::mt19937 gen(rd());
 
-		std::uniform_int_distribution<> distr(1, 1);
+		std::uniform_int_distribution<> distr(2, 2);
 
 		
 		std::string nameStr = "rendergraph_compiled_state_" + std::to_string(distr(gen));
@@ -7509,6 +7509,54 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 		}
 		return true;
 	};
+	auto markSegmentBoundaryWaitSources = [&](const CachedReplaySegment& segment) {
+		std::unordered_set<size_t> resourceIndices;
+		resourceIndices.reserve(segment.contract.inputRequirements.size() + segment.contract.queueUsage.size());
+		for (const auto& input : segment.contract.inputRequirements) {
+			if (auto resourceIndex = resolveTemplateResourceIndex(input.resourceID, 0, false)) {
+				resourceIndices.insert(*resourceIndex);
+			}
+		}
+		for (const auto& usage : segment.contract.queueUsage) {
+			if (auto resourceIndex = resolveTemplateResourceIndex(usage.resourceID, 0, false)) {
+				resourceIndices.insert(*resourceIndex);
+			}
+		}
+
+		auto markSourceSignal = [&](size_t srcQueue, unsigned int sourceBatchIndex) {
+			if (srcQueue >= queueCount || sourceBatchIndex == 0) {
+				return;
+			}
+			if (sourceBatchIndex >= batches.size()) {
+				return;
+			}
+			batches[sourceBatchIndex].MarkQueueSignal(BatchSignalPhase::AfterCompletion, srcQueue);
+			latestSignalFenceByQueue[srcQueue] = std::max(
+				latestSignalFenceByQueue[srcQueue],
+				batches[sourceBatchIndex].GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, srcQueue));
+		};
+
+		for (const auto& batchTemplate : segment.batchTemplates) {
+			for (const auto& wait : batchTemplate.waits) {
+				if (wait.srcQueue >= queueCount) {
+					continue;
+				}
+				unsigned int latestSourceBatch = 0;
+				for (size_t resourceIndex : resourceIndices) {
+					latestSourceBatch = std::max(
+						latestSourceBatch,
+						GetFrameQueueHistoryValue(m_frameQueueLastTransitionBatch, wait.srcQueue, resourceIndex));
+					latestSourceBatch = std::max(
+						latestSourceBatch,
+						GetFrameQueueHistoryValue(m_frameQueueLastProducerBatch, wait.srcQueue, resourceIndex));
+					latestSourceBatch = std::max(
+						latestSourceBatch,
+						GetFrameQueueHistoryValue(m_frameQueueLastUsageBatch, wait.srcQueue, resourceIndex));
+				}
+				markSourceSignal(wait.srcQueue, latestSourceBatch);
+			}
+		}
+	};
 	auto segmentHasPriorActivationWrite = [&](const CachedReplaySegment& segment, uint64_t resourceID, size_t beforePassIndex) {
 		for (const auto& batchTemplate : segment.batchTemplates) {
 			for (const auto& queuedPass : batchTemplate.queuedPasses) {
@@ -7675,6 +7723,7 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 			lastSegmentReadinessFailure.clear();
 
 			closeCurrentBatch();
+			markSegmentBoundaryWaitSources(*segmentIt->second);
 			std::string waitDependencyFailure;
 			if (!segmentTemplateWaitSourcesAvailable(*segmentIt->second, &waitDependencyFailure)) {
 				replayRejectedSegmentFirstNodes.insert(firstNodeIndex);
