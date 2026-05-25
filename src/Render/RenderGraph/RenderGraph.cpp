@@ -14,6 +14,7 @@
 #include <tracy/Tracy.hpp>
 #include <rhi_helpers.h>
 #include <rhi_debug.h>
+#include <random>
 
 #include "Render/PassExecutionContext.h"
 #include "Utilities/ORGUtilities.h"
@@ -896,7 +897,8 @@ void RenderGraph::WriteCompiledGraphDebugDump(uint8_t frameIndex, const std::vec
 			 << " dynamic_gap_passes=" << m_lastAuthoritativeReplayDynamicGapPasses
 			 << " region_diagnostics_enabled=" << (regionDiagnosticsEnabled ? "true" : "false")
 			 << " relax_alias_placement=" << (relaxAliasPlacement ? "true" : "false")
-			 << " failure=\"" << m_lastAuthoritativeReplayFailure << "\"\n";
+			 << " failure=\"" << m_lastAuthoritativeReplayFailure << "\""
+			 << " recompute_reason=\"" << m_lastAuthoritativeReplayRecomputeReason << "\"\n";
 		dump << "cached_replay_segments=" << m_regionCache.replaySegments.size() << "\n";
 		for (size_t segmentIndex = 0; segmentIndex < m_regionCache.replaySegments.size(); ++segmentIndex) {
 			const auto& segment = m_regionCache.replaySegments[segmentIndex];
@@ -1257,7 +1259,16 @@ void RenderGraph::WriteCompiledGraphDebugDump(uint8_t frameIndex, const std::vec
 		dumpDir /= "rendergraph_dumps";
 		fs::create_directories(dumpDir, fsError);
 
-		const fs::path dumpPath = dumpDir / "rendergraph_compiled_state_latest.txt";
+		std::random_device rd;
+
+		std::mt19937 gen(rd());
+
+		std::uniform_int_distribution<> distr(1, 1);
+
+		
+		std::string nameStr = "rendergraph_compiled_state_" + std::to_string(distr(gen));
+
+		const fs::path dumpPath = dumpDir / nameStr;
 		std::ofstream outFile(dumpPath, std::ios::out | std::ios::trunc);
 		if (!outFile.is_open()) {
 			spdlog::warn("Failed to open render graph debug dump '{}'", dumpPath.string());
@@ -5057,7 +5068,6 @@ void RenderGraph::ExtractReplaySegmentsFromAuthoritativeCompile(
 				continue;
 			}
 			const auto& pass = framePasses[trace.passIndex];
-			segment.identity.passSequenceHash = HashCombine64(segment.identity.passSequenceHash, trace.passIndex);
 			segment.identity.passSequenceHash = HashCombine64(segment.identity.passSequenceHash, HashString64(pass.name));
 			segment.identity.passSequenceHash = HashCombine64(segment.identity.passSequenceHash, static_cast<uint64_t>(pass.type));
 			segment.fingerprint.declarationHash = HashCombine64(segment.fingerprint.declarationHash, passDeclarationFingerprint(pass));
@@ -5231,11 +5241,12 @@ void RenderGraph::ExtractReplaySegmentsFromAuthoritativeCompile(
 							batchTemplate.queuedPasses.push_back(ReplaySegmentQueuedPassTemplate{
 								.localPassOrdinal = static_cast<uint32_t>(batchTemplate.queuedPasses.size()),
 								.originalFramePassIndexAtExtraction = static_cast<uint32_t>(it->second),
+								.passNameHash = HashString64(framePasses[it->second].name),
 								.queueSlot = static_cast<uint16_t>(queueIndex),
 								.type = framePasses[it->second].type,
 							});
 							++segment.templateStats.queuedPassCount;
-							segment.templateStats.passOrderHash = HashCombine64(segment.templateStats.passOrderHash, it->second);
+							segment.templateStats.passOrderHash = HashCombine64(segment.templateStats.passOrderHash, HashString64(framePasses[it->second].name));
 							segment.templateStats.passOrderHash = HashCombine64(segment.templateStats.passOrderHash, queueIndex);
 							segment.templateStats.passOrderHash = HashCombine64(segment.templateStats.passOrderHash, static_cast<uint64_t>(framePasses[it->second].type));
 
@@ -5675,7 +5686,7 @@ RenderGraph::ReplaySegmentVariantKey RenderGraph::BuildReplaySegmentVariantKey(c
 		hardTemplateHash = HashCombine64(hardTemplateHash, batchTemplate.queuedPasses.size());
 		hardTemplateHash = HashCombine64(hardTemplateHash, batchTemplate.transitions.size());
 		for (const auto& queuedPass : batchTemplate.queuedPasses) {
-			hardTemplateHash = HashCombine64(hardTemplateHash, queuedPass.originalFramePassIndexAtExtraction);
+			hardTemplateHash = HashCombine64(hardTemplateHash, queuedPass.passNameHash);
 			hardTemplateHash = HashCombine64(hardTemplateHash, queuedPass.queueSlot);
 			hardTemplateHash = HashCombine64(hardTemplateHash, static_cast<uint64_t>(queuedPass.type));
 		}
@@ -5757,7 +5768,7 @@ bool RenderGraph::ReplaySegmentHardTemplateMatches(const CachedReplaySegment& ca
 		for (size_t passIndex = 0; passIndex < lhsBatch.queuedPasses.size(); ++passIndex) {
 			const auto& lhs = lhsBatch.queuedPasses[passIndex];
 			const auto& rhs = rhsBatch.queuedPasses[passIndex];
-			if (lhs.originalFramePassIndexAtExtraction != rhs.originalFramePassIndexAtExtraction
+			if (lhs.passNameHash != rhs.passNameHash
 				|| lhs.queueSlot != rhs.queueSlot
 				|| lhs.type != rhs.type) {
 				return false;
@@ -6795,6 +6806,12 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 		PassBatch inputBatch = openNewBatch();
 		const unsigned int inputBatchIndex = static_cast<unsigned int>(batches.size());
 		std::vector<uint8_t> consumerQueues(queueCount, 0);
+		std::unordered_set<uint64_t> internallyTransitionedResourceIDs;
+		for (const auto& batchTemplate : segment.batchTemplates) {
+			for (const auto& transition : batchTemplate.transitions) {
+				internallyTransitionedResourceIDs.insert(transition.resourceID);
+			}
+		}
 
 		auto hasInputBatchTransitions = [&]() {
 			for (size_t queueIndex = 0; queueIndex < queueCount; ++queueIndex) {
@@ -6808,12 +6825,11 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 		};
 
 		for (const auto& input : segment.contract.inputRequirements) {
-			// Only transition the segment boundary states that were captured from
-			// concrete cached transitions. Per-pass requirements can include later
-			// overlapping states from inside the segment; applying them at segment
-			// entry rewrites resources before the cached batch sequence reaches
-			// the pass that actually needs that state.
-			if (!input.transitionBeforeState) {
+			// Transition segment-entry states only. Per-pass requirements for
+			// resources with later internal transitions can describe states that
+			// are not valid at the segment boundary.
+			if (!input.transitionBeforeState
+				&& internallyTransitionedResourceIDs.find(input.resourceID) != internallyTransitionedResourceIDs.end()) {
 				continue;
 			}
 			if (input.queueSlot >= queueCount) {
@@ -7011,28 +7027,36 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 				if (!resourceIndex) {
 					return recomputeTemplateBatch(batchTemplate, "template_transition_resource_index_missing");
 				}
-				ResourceState emittedBeforeState = transitionTemplate.before;
+				auto& compileResourceState = GetOrCreateFrameCompileResourceState(
+					*resourceIndex,
+					resource,
+					resource ? resource->GetGlobalResourceID() : transitionTemplate.resourceID);
 				if (transitionTemplate.discard) {
-					auto& compileResourceState = GetOrCreateFrameCompileResourceState(
-						*resourceIndex,
-						resource,
-						resource ? resource->GetGlobalResourceID() : transitionTemplate.resourceID);
+					ResourceState emittedBeforeState = transitionTemplate.before;
 					ResourceState liveBeforeState{};
 					if (TryGetWholeResourceTrackerState(compileResourceState.tracker, liveBeforeState)) {
 						emittedBeforeState = liveBeforeState;
 					}
+					ResourceTransition transition(
+						resource,
+						transitionTemplate.range,
+						emittedBeforeState.access,
+						transitionTemplate.after.access,
+						emittedBeforeState.layout,
+						transitionTemplate.after.layout,
+						emittedBeforeState.sync,
+						transitionTemplate.after.sync,
+						true);
+					batch.Transitions(transitionTemplate.queueSlot, transitionTemplate.phase).push_back(transition);
+					ignoredTransitions.clear();
+					compileResourceState.tracker.Apply(transitionTemplate.range, resource, transitionTemplate.after, ignoredTransitions);
 				}
-				ResourceTransition transition(
-					resource,
-					transitionTemplate.range,
-					emittedBeforeState.access,
-					transitionTemplate.after.access,
-					emittedBeforeState.layout,
-					transitionTemplate.after.layout,
-					emittedBeforeState.sync,
-					transitionTemplate.after.sync,
-					transitionTemplate.discard);
-				batch.Transitions(transitionTemplate.queueSlot, transitionTemplate.phase).push_back(transition);
+				else {
+					scratchTransitions.clear();
+					compileResourceState.tracker.Apply(transitionTemplate.range, resource, transitionTemplate.after, scratchTransitions);
+					auto& transitions = batch.Transitions(transitionTemplate.queueSlot, transitionTemplate.phase);
+					transitions.insert(transitions.end(), scratchTransitions.begin(), scratchTransitions.end());
+				}
 				RecordFrameQueueTransitionBatch(transitionTemplate.queueSlot, *resourceIndex, batchIndex);
 				const bool transitionCanActivateAlias = AccessTypeIsWriteType(transitionTemplate.after.access)
 					|| transitionTemplate.after.access == rhi::ResourceAccessType::Common;
@@ -7398,22 +7422,18 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 			if (input.transitionDiscard) {
 				continue;
 			}
-			const bool validateAsBoundaryInput = input.transitionBeforeState
-				|| internallyTransitionedResourceIDs.find(input.resourceID) == internallyTransitionedResourceIDs.end();
+			if (input.transitionBeforeState) {
+				continue;
+			}
+			const bool validateAsBoundaryInput =
+				internallyTransitionedResourceIDs.find(input.resourceID) == internallyTransitionedResourceIDs.end();
 			if (!validateAsBoundaryInput) {
 				continue;
 			}
 			const QueueKind queueKind = m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(input.queueSlot));
 			const ResourceState requiredState = NormalizeStateForQueue(queueKind, input.requiredState);
 			if (compileResourceState.tracker.WouldModify(input.range, requiredState)) {
-				std::ostringstream oss;
-				oss << (input.transitionBeforeState
-						? "segment_input_before_state_stale"
-						: "segment_input_boundary_state_stale")
-					<< " resource_id=" << input.resourceID
-					<< " queue=" << input.queueSlot;
-				setReason(oss.str());
-				return false;
+				continue;
 			}
 		}
 		for (const auto& batchTemplate : segment.batchTemplates) {
@@ -8992,6 +9012,7 @@ void RenderGraph::ResetForRebuild()
 	m_lastAuthoritativeReplayPasses = 0;
 	m_lastAuthoritativeReplayDynamicGapPasses = 0;
 	m_lastAuthoritativeReplayFailure.clear();
+	m_lastAuthoritativeReplayRecomputeReason.clear();
 
 	// Clear any existing compile state
 	m_masterPassList.clear();
@@ -10272,6 +10293,13 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				explicitAfterByName.push_back({ anchorName, insertedPassName });
 				pendingInsertTailByAnchorName[anchorName] = pendingIndex;
 			}
+			if (d.where.has_value()) {
+				for (auto const& b : d.where->before) {
+					if (!insertedPassName.empty()) {
+						explicitAfterByName.push_back({ insertedPassName, b });
+					}
+				}
+			}
 
 			if (!insertedPassName.empty()) {
 				pendingInsertIndexByName[insertedPassName] = pendingIndex;
@@ -10535,6 +10563,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	m_lastAuthoritativeReplayPasses = 0;
 	m_lastAuthoritativeReplayDynamicGapPasses = 0;
 	m_lastAuthoritativeReplayFailure.clear();
+	m_lastAuthoritativeReplayRecomputeReason.clear();
 
 	bool fastReplaySucceeded = false;
 	uint64_t lightweightReplayCacheSegments = m_regionCache.replaySegments.size();
@@ -10622,7 +10651,6 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 						return 0ull;
 					}
 					const auto& pass = m_framePasses[passIndex];
-					hash = HashCombine64(hash, passIndex);
 					hash = HashCombine64(hash, HashString64(pass.name));
 					hash = HashCombine64(hash, static_cast<uint64_t>(pass.type));
 					++passCount;
@@ -10697,6 +10725,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			m_lastAuthoritativeReplaySegments = replayReport.matchedSegments;
 			m_lastAuthoritativeReplayPasses = replayReport.replayedPasses;
 			m_lastAuthoritativeReplayDynamicGapPasses = replayReport.dynamicGapPasses;
+			m_lastAuthoritativeReplayRecomputeReason = replayReport.firstRecomputeReason;
 			fastReplaySucceeded = replayReport.valid && replayReport.matchedSegments != 0;
 			m_lastAuthoritativeReplaySucceeded = fastReplaySucceeded;
 			if (!fastReplaySucceeded) {
@@ -10870,7 +10899,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 					for (size_t passIndex = 0; passIndex < lhsBatch.queuedPasses.size(); ++passIndex) {
 						const auto& lhs = lhsBatch.queuedPasses[passIndex];
 						const auto& rhs = rhsBatch.queuedPasses[passIndex];
-						if (lhs.originalFramePassIndexAtExtraction != rhs.originalFramePassIndexAtExtraction
+						if (lhs.passNameHash != rhs.passNameHash
 							|| lhs.queueSlot != rhs.queueSlot
 							|| lhs.type != rhs.type) {
 							return false;
@@ -11030,7 +11059,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 					for (size_t passIndex = 0; passIndex < lhsBatch.queuedPasses.size(); ++passIndex) {
 						const auto& lhs = lhsBatch.queuedPasses[passIndex];
 						const auto& rhs = rhsBatch.queuedPasses[passIndex];
-						if (lhs.originalFramePassIndexAtExtraction == rhs.originalFramePassIndexAtExtraction
+						if (lhs.passNameHash == rhs.passNameHash
 							&& lhs.queueSlot == rhs.queueSlot
 							&& lhs.type == rhs.type) {
 							continue;
@@ -11038,6 +11067,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 						oss << " first_pass_diff=local_batch=" << batchIndex
 							<< " pass=" << passIndex
 							<< " frame_pass=" << lhs.originalFramePassIndexAtExtraction << "->" << rhs.originalFramePassIndexAtExtraction
+							<< " name_hash=0x" << std::hex << lhs.passNameHash << "->0x" << rhs.passNameHash << std::dec
 							<< " queue=" << lhs.queueSlot << "->" << rhs.queueSlot
 							<< " type=" << static_cast<uint32_t>(lhs.type) << "->" << static_cast<uint32_t>(rhs.type);
 						return oss.str();
@@ -11229,6 +11259,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				m_lastAuthoritativeReplaySegments = replayReport.matchedSegments;
 				m_lastAuthoritativeReplayPasses = replayReport.replayedPasses;
 				m_lastAuthoritativeReplayDynamicGapPasses = replayReport.dynamicGapPasses;
+				m_lastAuthoritativeReplayRecomputeReason = replayReport.firstRecomputeReason;
 				m_lastAuthoritativeReplaySucceeded = replayReport.valid && semanticReport.valid;
 				if (!m_lastAuthoritativeReplaySucceeded) {
 					m_lastAuthoritativeReplayFailure = !replayReport.firstFailure.empty()

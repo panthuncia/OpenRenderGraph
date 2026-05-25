@@ -998,6 +998,7 @@ private:
 	struct ReplaySegmentQueuedPassTemplate {
 		uint32_t localPassOrdinal = 0;
 		uint32_t originalFramePassIndexAtExtraction = 0;
+		uint64_t passNameHash = 0;
 		uint16_t queueSlot = 0;
 		PassType type = PassType::Unknown;
 	};
@@ -1415,6 +1416,7 @@ private:
 	uint64_t m_lastAuthoritativeReplayPasses = 0;
 	uint64_t m_lastAuthoritativeReplayDynamicGapPasses = 0;
 	std::string m_lastAuthoritativeReplayFailure;
+	std::string m_lastAuthoritativeReplayRecomputeReason;
 	std::unordered_map<uint64_t, LastProducerAcrossFrames> m_lastProducerByResourceAcrossFrames;
 	std::unordered_map<uint64_t, std::vector<LastAliasPlacementProducerAcrossFrames>> m_lastAliasPlacementProducersByPoolAcrossFrames;
 	std::vector<std::unordered_map<uint64_t, unsigned int>> m_compiledLastProducerBatchByResourceByQueue;
