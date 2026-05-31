@@ -33,9 +33,10 @@ struct TextureDescription {
     rhi::Format srvFormat = rhi::Format::Unknown;
 	bool hasNonShaderVisibleUAV = false;
 
-    bool generateMipMaps = false;
+	bool generateMipMaps = false;
 	bool allowAlias = false;
     std::optional<uint64_t> aliasingPoolID;
+	rhi::ResourceLayout initialLayout = rhi::ResourceLayout::Undefined;
 
 	float clearColor[4] = { 0.0f, 0.0f, 0.0f, 1.0f }; // default RGBA clear color
 	float depthClearValue = 1.0f; // default depth clear value
