@@ -42,6 +42,17 @@ bool ExternalBackingResource::TryGetBufferByteSize(uint64_t& outByteSize) const 
     return true;
 }
 
+bool ExternalBackingResource::IsMaterialized() const {
+    return m_impl && m_impl->backing != nullptr;
+}
+
+uint64_t ExternalBackingResource::GetBackingGeneration() const {
+    return IsMaterialized() ? 1u : 0u;
+}
+
+void ExternalBackingResource::EnsureVirtualDescriptorSlotsAllocated() {
+}
+
 ExternalBackingResource::ExternalBackingResource(std::unique_ptr<GpuBufferBacking> backing)
     : m_impl(std::make_unique<Impl>(std::move(backing)))
 {

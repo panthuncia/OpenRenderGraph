@@ -68,6 +68,10 @@ public:
     void SetHandle(rhi::ResourceHandle handle) { m_handle = handle; }
     rhi::ResourceHandle GetHandle() const { return m_handle; }
     bool HasHandle() const { return m_handle.valid(); }
+    void SetDimensions(unsigned int width, unsigned int height) {
+        m_width = width;
+        m_height = height;
+    }
     void SetRTVSlot(rhi::DescriptorSlot slot) { m_rtvSlot = slot; }
     bool HasRTVSlot() const { return m_rtvSlot.heap.valid(); }
     rhi::DescriptorSlot GetRTVSlot() const { return m_rtvSlot; }

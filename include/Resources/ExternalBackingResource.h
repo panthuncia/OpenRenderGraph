@@ -4,11 +4,12 @@
 #include <string>
 #include <rhi.h>
 
+#include "Resources/BackedResource.h"
 #include "Resources/Resource.h"
 
 class GpuBufferBacking;
 
-class ExternalBackingResource final : public Resource {
+class ExternalBackingResource final : public Resource, public BackedResource {
 public:
     static std::shared_ptr<ExternalBackingResource> CreateShared(std::unique_ptr<GpuBufferBacking> backing);
 
@@ -22,6 +23,12 @@ public:
     SymbolicTracker* GetStateTracker() override;
 
     bool TryGetBufferByteSize(uint64_t& outByteSize) const override;
+
+    bool IsMaterialized() const override;
+
+    uint64_t GetBackingGeneration() const override;
+
+    void EnsureVirtualDescriptorSlotsAllocated() override;
 
     ~ExternalBackingResource() override;
 

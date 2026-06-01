@@ -291,10 +291,6 @@ bool BufferBase::IsUploadPolicyImmediate() const {
 }
 
 void BufferBase::EnsureUploadPolicyRegistration() {
-    if (m_uploadPolicyTag == rg::runtime::UploadPolicyTag::Immediate) {
-        return;
-    }
-
     if (m_uploadPolicyRegistered) {
         return;
     }
@@ -308,20 +304,11 @@ void BufferBase::EnsureUploadPolicyRegistration() {
 }
 
 void BufferBase::MarkUploadPolicyDirty() {
-    if (m_uploadPolicyTag == rg::runtime::UploadPolicyTag::Immediate) {
-        return;
-    }
-
     EnsureUploadPolicyRegistration();
     rg::runtime::MarkUploadPolicyClientDirty(this);
 }
 
 void BufferBase::RefreshUploadPolicyRegistration() {
-    if (m_uploadPolicyTag == rg::runtime::UploadPolicyTag::Immediate) {
-        UnregisterUploadPolicyClient();
-        return;
-    }
-
     EnsureUploadPolicyRegistration();
 }
 

@@ -17,7 +17,7 @@
 #include "Managers/Singletons/DeviceManager.h"
 #include "Managers/Singletons/DeletionManager.h"
 #include "Resources/PixelBuffer.h"
-#include "Resources/Buffers/Buffer.h"
+#include "Resources/Buffers/DynamicBufferBase.h"
 #include "Resources/MemoryStatisticsComponents.h"
 
 RenderGraph::AutoAliasDebugSnapshot RenderGraph::GetAutoAliasDebugSnapshot() const {
@@ -744,7 +744,7 @@ rg::alias::FrameAliasAnalysis rg::alias::RenderGraphAliasingSubsystem::BuildAlia
 			return;
 		}
 
-		if (auto* buffer = dynamic_cast<Buffer*>(resource)) {
+		if (auto* buffer = dynamic_cast<BufferBase*>(resource)) {
 			staticSignature = BuildAliasBufferStaticSignature(*buffer);
 			auto cacheIt = staticInfoCache.find(resourceID);
 			if (cacheIt != staticInfoCache.end() && cacheIt->second.signature == staticSignature) {
@@ -2061,7 +2061,7 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 						texture->Dematerialize();
 					}
 
-					auto buffer = std::dynamic_pointer_cast<Buffer>(itRes->second);
+					auto buffer = std::dynamic_pointer_cast<BufferBase>(itRes->second);
 					if (buffer && buffer->IsMaterialized()) {
 						buffer->Dematerialize();
 					}
@@ -2103,7 +2103,7 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 				texture->Dematerialize();
 			}
 
-			auto buffer = std::dynamic_pointer_cast<Buffer>(itRes->second);
+			auto buffer = std::dynamic_pointer_cast<BufferBase>(itRes->second);
 			if (buffer && buffer->IsMaterialized()) {
 				buffer->Dematerialize();
 			}

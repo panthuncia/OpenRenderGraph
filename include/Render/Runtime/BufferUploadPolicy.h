@@ -42,22 +42,12 @@ public:
     BufferUploadPolicyState() = default;
 
     void SetPolicy(const UploadPolicyConfig& config, size_t currentBufferSize) {
-        m_config = config;
-        if (m_config.tag == UploadPolicyTag::Coalesced || m_config.tag == UploadPolicyTag::CoalescedRetained) {
-            if (m_coalescedScratchBytes.size() != currentBufferSize) {
-                m_coalescedScratchBytes.resize(currentBufferSize, 0u);
-            }
-        }
-        else {
-            m_coalescedScratchBytes.clear();
-        }
-
-        if (m_config.tag == UploadPolicyTag::CoalescedRetained) {
-            if (m_retainedBytes.size() != currentBufferSize) {
-                m_retainedBytes.resize(currentBufferSize, 0u);
-            }
-        }
-        else {
+        m_config.tag = config.tag == UploadPolicyTag::Coalesced
+            ? UploadPolicyTag::Immediate
+            : config.tag;
+        if (m_config.tag == UploadPolicyTag::CoalescedRetained && m_retainedBytes.size() != currentBufferSize) {
+            m_retainedBytes.resize(currentBufferSize, 0u);
+        } else if (m_config.tag != UploadPolicyTag::CoalescedRetained) {
             m_retainedBytes.clear();
             m_retainedDirtyRanges.clear();
             m_retainedDirtyRangesSorted = true;
@@ -66,9 +56,6 @@ public:
             m_retainedOverlapEvents = 0;
             m_retainedOverlapBytes = 0;
         }
-        m_coalescedDirtyRanges.clear();
-        m_coalescedStagedWrites = 0;
-        m_coalescedStagedBytes = 0;
     }
 
     UploadPolicyConfig GetPolicy() const {
@@ -80,15 +67,11 @@ public:
     }
 
     void OnBufferResized(size_t newSize) {
-        if (m_config.tag == UploadPolicyTag::Coalesced || m_config.tag == UploadPolicyTag::CoalescedRetained) {
-            m_coalescedScratchBytes.resize(newSize, 0u);
-        }
-
         if (m_config.tag == UploadPolicyTag::CoalescedRetained) {
             m_retainedBytes.resize(newSize, 0u);
-            // Preserve pending retained dirty ranges across grows so writes staged
-            // before a resize are not dropped prior to FlushToUploadService().
         }
+        // Preserve pending dirty ranges across grows so writes staged before a
+        // resize are not dropped prior to FlushToUploadService().
     }
 
     void BeginFrame() {
@@ -99,22 +82,13 @@ public:
         // Staged data is consumed/cleared in FlushToUploadService().
     }
 
-    // Pre-sizes the scratch buffer so callers can memcpy into non-overlapping
+    // Pre-sizes the retained CPU mirror so callers can memcpy into non-overlapping
     // regions from multiple threads without synchronization.  Must be called
     // single-threaded before the parallel writes begin.
     BulkWriteHandle PrepareBulkWrite(size_t currentBufferSize) {
-        if (m_config.tag == UploadPolicyTag::Immediate) {
-            return {};
+        if (m_config.tag != UploadPolicyTag::CoalescedRetained) {
+            throw std::runtime_error("Bulk writes require a retained buffer upload policy");
         }
-
-        if (m_config.tag == UploadPolicyTag::Coalesced) {
-            if (m_coalescedScratchBytes.size() < currentBufferSize) {
-                m_coalescedScratchBytes.resize(currentBufferSize, 0u);
-            }
-            return { m_coalescedScratchBytes.data(), m_coalescedScratchBytes.size() };
-        }
-
-        // CoalescedRetained
         if (m_retainedBytes.size() < currentBufferSize) {
             m_retainedBytes.resize(currentBufferSize, 0u);
         }
@@ -124,18 +98,12 @@ public:
     // Registers a dirty range after parallel writes are complete.
     // Must be called single-threaded.
     void CommitBulkRegion(size_t offset, size_t size) {
-        if (m_config.tag == UploadPolicyTag::Immediate || size == 0) {
+        if (m_config.tag != UploadPolicyTag::CoalescedRetained) {
             return;
         }
-
-        if (m_config.tag == UploadPolicyTag::Coalesced) {
-            m_coalescedDirtyRanges.push_back(DirtyRange{ offset, offset + size, nullptr, 0 });
-            ++m_coalescedStagedWrites;
-            m_coalescedStagedBytes += static_cast<uint64_t>(size);
+        if (size == 0) {
             return;
         }
-
-        // CoalescedRetained
         AddOrMergeDirtyRange(offset, offset + size, nullptr, 0);
     }
 
@@ -146,28 +114,16 @@ public:
         const char* file = nullptr;
         int line = 0;
 #endif
-        if (m_config.tag == UploadPolicyTag::Immediate) {
-            return false;
-        }
-
         if (!data || size == 0) {
             return true;
         }
 
-        if (offset + size > currentBufferSize) {
-            throw std::runtime_error("Upload policy write is out of bounds for target buffer");
+        if (m_config.tag == UploadPolicyTag::Immediate) {
+            return false;
         }
 
-        if (m_config.tag == UploadPolicyTag::Coalesced) {
-            if (m_coalescedScratchBytes.size() != currentBufferSize) {
-                m_coalescedScratchBytes.resize(currentBufferSize, 0u);
-            }
-
-            std::memcpy(m_coalescedScratchBytes.data() + static_cast<std::ptrdiff_t>(offset), data, size);
-            m_coalescedDirtyRanges.push_back(DirtyRange{ offset, offset + size, file, line });
-            ++m_coalescedStagedWrites;
-            m_coalescedStagedBytes += static_cast<uint64_t>(size);
-            return true;
+        if (offset + size > currentBufferSize) {
+            throw std::runtime_error("Upload policy write is out of bounds for target buffer");
         }
 
         if (m_retainedBytes.size() != currentBufferSize) {
@@ -180,53 +136,15 @@ public:
     }
 
     void FlushToUploadService(UploadTarget target) {
-        BufferUploadPolicyStats stats{};
-        if (m_config.tag == UploadPolicyTag::Immediate) {
-            m_lastFlushStats = stats;
+        if (m_config.tag != UploadPolicyTag::CoalescedRetained) {
+            m_lastFlushStats = {};
             return;
         }
 
+        BufferUploadPolicyStats stats{};
         auto* uploadService = GetActiveUploadService();
         if (!uploadService) {
             throw std::runtime_error("Upload service is not active while flushing upload policies");
-        }
-
-        if (m_config.tag == UploadPolicyTag::Coalesced) {
-            stats.stagedWrites = m_coalescedStagedWrites;
-            stats.stagedBytes = m_coalescedStagedBytes;
-
-            auto coalesced = CoalesceDirtyRanges(std::move(m_coalescedDirtyRanges), false);
-            for (const auto& range : coalesced) {
-                const size_t uploadSize = range.end - range.begin;
-                if (uploadSize == 0) {
-                    continue;
-                }
-
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
-                uploadService->UploadData(
-                    m_coalescedScratchBytes.data() + static_cast<std::ptrdiff_t>(range.begin),
-                    uploadSize,
-                    target,
-                    range.begin,
-                    range.file,
-                    range.line);
-#else
-                uploadService->UploadData(
-                    m_coalescedScratchBytes.data() + static_cast<std::ptrdiff_t>(range.begin),
-                    uploadSize,
-                    target,
-                    range.begin);
-#endif
-                ++stats.flushedWrites;
-                stats.flushedBytes += static_cast<uint64_t>(uploadSize);
-            }
-
-            stats.mergedWrites = stats.stagedWrites > stats.flushedWrites ? (stats.stagedWrites - stats.flushedWrites) : 0;
-            m_coalescedDirtyRanges.clear();
-            m_coalescedStagedWrites = 0;
-            m_coalescedStagedBytes = 0;
-            m_lastFlushStats = stats;
-            return;
         }
 
         stats.stagedWrites = m_retainedStagedWrites;
@@ -275,15 +193,30 @@ public:
     }
 
     bool HasPendingWork() const {
-        if (m_config.tag == UploadPolicyTag::Immediate) {
+        if (m_config.tag != UploadPolicyTag::CoalescedRetained) {
             return false;
         }
+        return !m_retainedDirtyRanges.empty();
+    }
 
-        if (m_config.tag == UploadPolicyTag::Coalesced) {
-            return !m_coalescedDirtyRanges.empty();
+    bool RetainExternalWrite(const void* data, size_t size, size_t offset, size_t currentBufferSize) {
+        if (m_config.tag != UploadPolicyTag::CoalescedRetained) {
+            return false;
+        }
+        if (!data || size == 0) {
+            return true;
         }
 
-        return !m_retainedDirtyRanges.empty();
+        if (offset + size > currentBufferSize) {
+            throw std::runtime_error("External retained upload write is out of bounds for target buffer");
+        }
+
+        if (m_retainedBytes.size() != currentBufferSize) {
+            m_retainedBytes.resize(currentBufferSize, 0u);
+        }
+
+        std::memcpy(m_retainedBytes.data() + static_cast<std::ptrdiff_t>(offset), data, size);
+        return true;
     }
 
 private:
@@ -360,10 +293,6 @@ private:
     }
 
     UploadPolicyConfig m_config{};
-    std::vector<uint8_t> m_coalescedScratchBytes;
-    std::vector<DirtyRange> m_coalescedDirtyRanges;
-    uint64_t m_coalescedStagedWrites = 0;
-    uint64_t m_coalescedStagedBytes = 0;
     std::vector<uint8_t> m_retainedBytes;
     std::vector<DirtyRange> m_retainedDirtyRanges;
     bool m_retainedDirtyRangesSorted = true;

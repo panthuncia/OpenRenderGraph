@@ -8,6 +8,7 @@
 #include <rhi.h>
 
 #include "Resources/AliasingPlacement.h"
+#include "Resources/BackedResource.h"
 #include "Resources/GloballyIndexedResource.h"
 #include "Resources/TrackedAllocation.h"
 #include "Render/Runtime/BufferUploadPolicy.h"
@@ -17,7 +18,7 @@ class GpuBufferBacking;
 
 class BufferView;
 
-class BufferBase : public GloballyIndexedResource, public rg::runtime::IUploadPolicyClient {
+class BufferBase : public GloballyIndexedResource, public BackedResource, public rg::runtime::IUploadPolicyClient {
 public:
     struct MaterializeOptions {
         std::optional<BufferAliasPlacement> aliasPlacement;
@@ -65,7 +66,7 @@ public:
         bool unorderedAccess = false)
     ;
 
-    bool IsMaterialized() const;
+    bool IsMaterialized() const override;
 
     uint64_t GetBufferSize() const;
 
@@ -73,7 +74,7 @@ public:
 
     bool IsUnorderedAccessEnabled() const;
 
-    uint64_t GetBackingGeneration() const;
+    uint64_t GetBackingGeneration() const override;
 
     void Materialize(const MaterializeOptions* options = nullptr);
 
@@ -83,7 +84,7 @@ public:
 
     bool HasDescriptorRequirements() const;
 
-    void EnsureVirtualDescriptorSlotsAllocated();
+    void EnsureVirtualDescriptorSlotsAllocated() override;
 
     void RefreshDescriptorContents();
 

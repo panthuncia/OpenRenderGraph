@@ -8,6 +8,7 @@
 #include <rhi_helpers.h>
 
 #include "Resources/AliasingPlacement.h"
+#include "Resources/BackedResource.h"
 #include "Resources/GloballyIndexedResource.h"
 #include "Resources/TextureDescription.h"
 #include "Resources/MemoryStatisticsComponents.h"
@@ -15,7 +16,7 @@
 
 class GpuTextureBacking;
 
-class PixelBuffer : public GloballyIndexedResource, public IHasMemoryMetadata {
+class PixelBuffer : public GloballyIndexedResource, public BackedResource, public IHasMemoryMetadata {
 public:
     struct MaterializeOptions {
         std::optional<TextureAliasPlacement> aliasPlacement;
@@ -75,13 +76,13 @@ public:
 
     SymbolicTracker* GetStateTracker() override;
 
-    bool IsMaterialized() const {
+    bool IsMaterialized() const override {
         return m_backing != nullptr;
     }
 
     bool HasValidBackingResource() const;
 
-    uint64_t GetBackingGeneration() const {
+    uint64_t GetBackingGeneration() const override {
         return m_backingGeneration;
     }
 
@@ -123,7 +124,7 @@ public:
 
     void Dematerialize();
 
-    void EnsureVirtualDescriptorSlotsAllocated();
+    void EnsureVirtualDescriptorSlotsAllocated() override;
 
     ~PixelBuffer() override;
 

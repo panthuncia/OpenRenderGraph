@@ -30,6 +30,7 @@
 #include "Interfaces/IDynamicDeclaredResources.h"
 #include "Resources/DynamicResource.h"
 #include "Resources/ExternalTextureResource.h"
+#include "Resources/BackedResource.h"
 #include "Resources/PixelBuffer.h"
 #include "Resources/Buffers/DynamicBufferBase.h"
 #include "Resources/MemoryStatisticsComponents.h"
@@ -45,6 +46,10 @@ namespace {
 			}
 		}
 		return current;
+	}
+
+	BackedResource* TryGetBackedResource(Resource* resource) noexcept {
+		return dynamic_cast<BackedResource*>(UnwrapDynamicResource(resource));
 	}
 
 	const char* CommandListPhaseName(const QueueBatchSchedule& schedule, uint8_t commandListIndex) noexcept {
@@ -4060,11 +4065,8 @@ bool HasLiveCompileResourceBacking(Resource* resource) {
 		return false;
 	}
 
-	if (auto* texture = dynamic_cast<PixelBuffer*>(resource)) {
-		return texture->IsMaterialized();
-	}
-	if (auto* buffer = dynamic_cast<Buffer*>(resource)) {
-		return buffer->IsMaterialized();
+	if (auto* backedResource = TryGetBackedResource(resource)) {
+		return backedResource->IsMaterialized();
 	}
 	return true;
 }
@@ -4226,11 +4228,8 @@ void RenderGraph::CaptureCompileTrackersForExecution(const std::unordered_set<ui
 
 		if (resource->GetStateTracker()) {
 			uint64_t backingGeneration = 0u;
-			if (auto* buffer = dynamic_cast<BufferBase*>(resource)) {
-				backingGeneration = buffer->GetBackingGeneration();
-			}
-			else if (auto* pixelBuffer = dynamic_cast<PixelBuffer*>(resource)) {
-				backingGeneration = pixelBuffer->GetBackingGeneration();
+			if (auto* backedResource = TryGetBackedResource(resource)) {
+				backingGeneration = backedResource->GetBackingGeneration();
 			}
 			trackers[resourceID] = CapturedTrackerResource{ .backingGeneration = backingGeneration };
 		}
@@ -4259,11 +4258,8 @@ void RenderGraph::PublishCompiledTrackerStates() {
 		}
 
 		uint64_t currentBackingGeneration = 0u;
-		if (auto* buffer = dynamic_cast<BufferBase*>(resource)) {
-			currentBackingGeneration = buffer->GetBackingGeneration();
-		}
-		else if (auto* pixelBuffer = dynamic_cast<PixelBuffer*>(resource)) {
-			currentBackingGeneration = pixelBuffer->GetBackingGeneration();
+		if (auto* backedResource = TryGetBackedResource(resource)) {
+			currentBackingGeneration = backedResource->GetBackingGeneration();
 		}
 		if (captured.backingGeneration != 0u
 			&& currentBackingGeneration != 0u
@@ -9475,6 +9471,10 @@ void RenderGraph::MaterializeReferencedResources(
 		if (!resource) {
 			return;
 		}
+		resource = UnwrapDynamicResource(resource);
+		if (!resource) {
+			return;
+		}
 
 		auto texture = dynamic_cast<PixelBuffer*>(resource);
 		if (texture) {
@@ -9497,7 +9497,7 @@ void RenderGraph::MaterializeReferencedResources(
 			return;
 		}
 
-		auto buffer = dynamic_cast<Buffer*>(resource);
+		auto buffer = dynamic_cast<BufferBase*>(resource);
 		if (buffer) {
 			if (buffer->IsMaterialized()) {
 				return;
@@ -9636,15 +9636,9 @@ void RenderGraph::SnapshotCompiledResourceGenerations(const std::unordered_set<u
 			continue;
 		}
 
-		auto texture = std::dynamic_pointer_cast<PixelBuffer>(it->second);
-		if (texture) {
-			compiledResourceGenerationByID[id] = texture->GetBackingGeneration();
-			continue;
-		}
-
-		auto buffer = std::dynamic_pointer_cast<Buffer>(it->second);
-		if (buffer) {
-			compiledResourceGenerationByID[id] = buffer->GetBackingGeneration();
+		auto* backedResource = TryGetBackedResource(it->second.get());
+		if (backedResource) {
+			compiledResourceGenerationByID[id] = backedResource->GetBackingGeneration();
 		}
 	}
 }
@@ -9656,18 +9650,9 @@ void RenderGraph::ValidateCompiledResourceGenerations() const {
 			continue;
 		}
 
-		auto texture = std::dynamic_pointer_cast<PixelBuffer>(it->second);
-		if (texture) {
-			const uint64_t currentGeneration = texture->GetBackingGeneration();
-			if (currentGeneration != compiledGeneration) {
-				throw std::runtime_error("Resource backing generation changed after compile and before execute. Resource ID: " + std::to_string(id));
-			}
-			continue;
-		}
-
-		auto buffer = std::dynamic_pointer_cast<Buffer>(it->second);
-		if (buffer) {
-			const uint64_t currentGeneration = buffer->GetBackingGeneration();
+		auto* backedResource = TryGetBackedResource(it->second.get());
+		if (backedResource) {
+			const uint64_t currentGeneration = backedResource->GetBackingGeneration();
 			if (currentGeneration != compiledGeneration) {
 				throw std::runtime_error("Resource backing generation changed after compile and before execute. Resource ID: " + std::to_string(id));
 			}
@@ -12812,6 +12797,10 @@ void RenderGraph::MaterializeUnmaterializedResources(const std::unordered_set<ui
 		if (!resource) {
 			return std::nullopt;
 		}
+		resource = UnwrapDynamicResource(resource);
+		if (!resource) {
+			return std::nullopt;
+		}
 
 		auto texture = dynamic_cast<PixelBuffer*>(resource);
 		if (texture) {
@@ -12863,7 +12852,7 @@ void RenderGraph::MaterializeUnmaterializedResources(const std::unordered_set<ui
 			return texture->GetBackingGeneration();
 		}
 
-		auto buffer = dynamic_cast<Buffer*>(resource);
+		auto buffer = dynamic_cast<BufferBase*>(resource);
 		if (!buffer) {
 			return std::nullopt;
 		}
@@ -13408,7 +13397,7 @@ void RenderGraph::AddResource(std::shared_ptr<Resource> resource, bool transitio
 		if (std::dynamic_pointer_cast<PixelBuffer>(resource)) {
 			resourceType = "PixelBuffer";
 		}
-		else if (std::dynamic_pointer_cast<Buffer>(resource)) {
+		else if (std::dynamic_pointer_cast<BufferBase>(resource)) {
 			resourceType = "Buffer";
 		}
 		spdlog::info(
@@ -13419,11 +13408,8 @@ void RenderGraph::AddResource(std::shared_ptr<Resource> resource, bool transitio
 			transition);
 	}
 
-	if (auto texture = std::dynamic_pointer_cast<PixelBuffer>(resource)) {
-		texture->EnsureVirtualDescriptorSlotsAllocated();
-	}
-	if (auto buffer = std::dynamic_pointer_cast<Buffer>(resource)) {
-		buffer->EnsureVirtualDescriptorSlotsAllocated();
+	if (auto* backedResource = TryGetBackedResource(resource.get())) {
+		backedResource->EnsureVirtualDescriptorSlotsAllocated();
 	}
 }
 
