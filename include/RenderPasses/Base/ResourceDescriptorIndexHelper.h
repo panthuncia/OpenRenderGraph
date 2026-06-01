@@ -184,11 +184,19 @@ public:
 			m_lastResolvedDescriptorIndices.emplace(hash, resolvedIndex);
 		}
 		else if (lastIt->second != resolvedIndex) {
-			spdlog::warn(
-				"ResourceDescriptorIndexHelper: descriptor index changed for '{}' old={} new={}; using refreshed bind-time index",
-				name ? *name : std::string("Unknown"),
-				lastIt->second,
-				resolvedIndex);
+			if (m_loggedDescriptorIndexChanges.insert(hash).second) {
+				spdlog::debug(
+					"ResourceDescriptorIndexHelper: descriptor index changed for '{}' old={} new={}; using refreshed bind-time index. Further changes for this resource are logged at trace.",
+					name ? *name : std::string("Unknown"),
+					lastIt->second,
+					resolvedIndex);
+			} else {
+				spdlog::trace(
+					"ResourceDescriptorIndexHelper: descriptor index changed for '{}' old={} new={}; using refreshed bind-time index",
+					name ? *name : std::string("Unknown"),
+					lastIt->second,
+					resolvedIndex);
+			}
 			lastIt->second = resolvedIndex;
 		}
 
@@ -205,6 +213,7 @@ private:
 	std::unordered_map<size_t, ResourceAndAccessor> m_resourceMap; // Maps resource identifiers to descriptor indices
 	std::unordered_set<FeatureDomainIdentifier, FeatureDomainIdentifier::Hasher> m_activeFeatureDomains;
 	mutable std::unordered_map<size_t, unsigned int> m_lastResolvedDescriptorIndices;
+	mutable std::unordered_set<size_t> m_loggedDescriptorIndexChanges;
 
 	bool ShouldAllowMissingForInactiveFeature(const ResourceIdentifier& id) const {
 		auto domain = FeatureDomainRegistry::Get().FindResourceDomain(id);
