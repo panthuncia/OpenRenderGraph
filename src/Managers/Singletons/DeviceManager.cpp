@@ -166,6 +166,9 @@ void DeviceManager::Initialize(rhi::Device device) {
     m_graphicsQueue = m_device->GetQueue(rhi::QueueKind::Graphics);
     m_computeQueue = m_device->GetQueue(rhi::QueueKind::Compute);
     m_copyQueue = m_device->GetQueue(rhi::QueueKind::Copy);
+    m_graphicsQueue.SetName("ORG Primary Graphics Queue");
+    m_computeQueue.SetName("ORG Primary Compute Queue");
+    m_copyQueue.SetName("ORG Primary Copy Queue");
 
     rhi::ma::AllocatorDesc desc;
     desc.device = m_device.Get();

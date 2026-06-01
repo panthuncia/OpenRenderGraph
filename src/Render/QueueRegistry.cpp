@@ -1,6 +1,19 @@
 #include "Render/QueueRegistry.h"
 #include "Render/CommandListPool.h"
 
+#include <string>
+
+namespace {
+	const char* QueueKindDebugName(QueueKind kind) noexcept {
+		switch (kind) {
+		case QueueKind::Graphics: return "Graphics";
+		case QueueKind::Compute: return "Compute";
+		case QueueKind::Copy: return "Copy";
+		default: return "Unknown";
+		}
+	}
+}
+
 QueueSlotIndex QueueRegistry::Register(QueueSlot slot, rhi::Queue queue, rhi::Device& device, QueueAutoAssignmentPolicy autoAssignmentPolicy, bool ownsQueue) {
 	auto pool = std::make_unique<CommandListPool>(device, static_cast<rhi::QueueKind>(slot.kind));
 	rhi::TimelinePtr fence;
@@ -10,6 +23,15 @@ QueueSlotIndex QueueRegistry::Register(QueueSlot slot, rhi::Queue queue, rhi::De
 
 QueueSlotIndex QueueRegistry::Register(QueueSlot slot, rhi::Queue queue, rhi::TimelinePtr fence, std::unique_ptr<CommandListPool> pool, QueueAutoAssignmentPolicy autoAssignmentPolicy, bool ownsQueue, rhi::Device device) {
 	auto idx = static_cast<QueueSlotIndex>(static_cast<uint8_t>(m_slots.size()));
+	const std::string queueName = "ORG QueueSlot " + std::to_string(static_cast<uint8_t>(idx)) +
+		" " + QueueKindDebugName(slot.kind) + ":" + std::to_string(slot.instance);
+	if (queue) {
+		queue.SetName(queueName.c_str());
+	}
+	if (fence) {
+		const std::string fenceName = queueName + " Fence";
+		fence->SetName(fenceName.c_str());
+	}
 	m_slots.push_back({ slot.kind, slot.instance, queue, ownsQueue ? device : rhi::Device{}, std::move(fence), std::move(pool), autoAssignmentPolicy, ownsQueue, 1 });
 	return idx;
 }

@@ -1419,7 +1419,10 @@ private:
 	std::shared_ptr<rg::runtime::IDescriptorService> m_descriptorService;
 	std::shared_ptr<rg::runtime::IRenderGraphSettingsService> m_renderGraphSettingsService;
 	std::shared_ptr<rg::runtime::ITaskService> m_taskService;
-	std::unordered_map<uint64_t, SymbolicTracker*> trackers; // Tracks the state of resources in the graph.
+	struct CapturedTrackerResource {
+		uint64_t backingGeneration = 0;
+	};
+	std::unordered_map<uint64_t, CapturedTrackerResource> trackers; // Resources whose live state trackers receive compiled states after execution.
 	std::vector<FrameCompileResourceState> m_frameCompileResources; // Compile-only symbolic state, indexed by frame-local resource index.
 	std::vector<FrameResourceAccessSummary> m_frameResourceAccessSummaries;
 	RenderGraphRegionCache m_regionCache;

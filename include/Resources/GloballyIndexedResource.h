@@ -179,65 +179,56 @@ public:
 protected:
 	virtual void OnSetName() override {}
 
-	void ReleaseDescriptorSlots() {
-		// Release SRV, UAV, and CBV
-		for (auto& view : m_SRVViews) {
-			if (view.heap == nullptr) {
-				continue;
+	std::vector<std::pair<std::shared_ptr<DescriptorHeap>, UINT>> DetachDescriptorSlotsForDeferredRelease() {
+		std::vector<std::pair<std::shared_ptr<DescriptorHeap>, UINT>> slots;
+
+		auto collectShaderVisibleGrid = [&slots](const std::shared_ptr<DescriptorHeap>& heap, auto& infos) {
+			if (!heap) {
+				return;
 			}
-			for (auto& srvInfos : view.infos) {
-				for (auto& srvInfo : srvInfos) {
-					view.heap->ReleaseDescriptor(srvInfo.slot.index);
+			for (auto& sliceInfos : infos) {
+				for (auto& info : sliceInfos) {
+					if (info.slot.heap.valid()) {
+						slots.emplace_back(heap, info.slot.index);
+					}
 				}
 			}
+		};
+
+		auto collectNonShaderVisibleGrid = [&slots](const std::shared_ptr<DescriptorHeap>& heap, auto& infos) {
+			if (!heap) {
+				return;
+			}
+			for (auto& sliceInfos : infos) {
+				for (auto& info : sliceInfos) {
+					if (info.slot.heap.valid()) {
+						slots.emplace_back(heap, info.slot.index);
+					}
+				}
+			}
+		};
+
+		for (auto& view : m_SRVViews) {
+			collectShaderVisibleGrid(view.heap, view.infos);
 			view.heap.reset();
 			view.infos.clear();
 		}
 
-		if (m_pUAVShaderVisibleHeap) {
-			for (auto& uavInfos : m_UAVShaderVisibleInfos) {
-				for (auto& uavInfo : uavInfos) {
-					m_pUAVShaderVisibleHeap->ReleaseDescriptor(uavInfo.slot.index);
-				}
-			}
-			for (auto& view : m_UAVViews) {
-				for (auto& uavInfos : view.infos) {
-					for (auto& uavInfo : uavInfos) {
-						m_pUAVShaderVisibleHeap->ReleaseDescriptor(uavInfo.slot.index);
-					}
-				}
-				view.heap.reset();
-				view.infos.clear();
-			}
-		}
-		if (m_pUAVNonShaderVisibleHeap) {
-			for (auto& uavInfos : m_UAVNonShaderVisibleInfos) {
-				for (auto& uavInfo : uavInfos) {
-					// Release the non-shader visible UAVs
-					m_pUAVNonShaderVisibleHeap->ReleaseDescriptor(uavInfo.slot.index);
-				}
-			}
-		}
-		if (m_pCBVHeap) {
-			m_pCBVHeap->ReleaseDescriptor(m_CBVInfo.slot.index);
+		collectShaderVisibleGrid(m_pUAVShaderVisibleHeap, m_UAVShaderVisibleInfos);
+		for (auto& view : m_UAVViews) {
+			collectShaderVisibleGrid(view.heap, view.infos);
+			view.heap.reset();
+			view.infos.clear();
 		}
 
-		// Release RTVs and DSVs
-		if (m_pRTVHeap) {
-			for (auto& rtvInfos : m_RTVInfos) {
-				for (auto& rtvInfo : rtvInfos) {
-					m_pRTVHeap->ReleaseDescriptor(rtvInfo.slot.index);
-				}
-			}
+		collectNonShaderVisibleGrid(m_pUAVNonShaderVisibleHeap, m_UAVNonShaderVisibleInfos);
+
+		if (m_pCBVHeap && m_CBVInfo.slot.heap.valid()) {
+			slots.emplace_back(m_pCBVHeap, m_CBVInfo.slot.index);
 		}
 
-		if (m_pDSVHeap) {
-			for (auto& dsvInfos : m_DSVInfos) {
-				for (auto& dsvInfo : dsvInfos) {
-					m_pDSVHeap->ReleaseDescriptor(dsvInfo.slot.index);
-				}
-			}
-		}
+		collectNonShaderVisibleGrid(m_pRTVHeap, m_RTVInfos);
+		collectNonShaderVisibleGrid(m_pDSVHeap, m_DSVInfos);
 
 		m_pSRVHeap.reset();
 		m_UAVShaderVisibleInfos.clear();
@@ -254,6 +245,18 @@ protected:
 		m_pDSVHeap.reset();
 		m_counterOffset = 0;
 		m_primaryViewType = SRVViewType::Invalid;
+
+		return slots;
+	}
+
+	void ReleaseDescriptorSlots() {
+		auto slots = DetachDescriptorSlotsForDeferredRelease();
+		for (auto& [heap, index] : slots) {
+			if (!heap) {
+				continue;
+			}
+			heap->ReleaseDescriptor(index);
+		}
 	}
 private:
 	struct SRVView {
@@ -290,4 +293,5 @@ private:
 	}
 
 	friend class DynamicGloballyIndexedResource;
+	friend class BufferBase;
 };

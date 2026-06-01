@@ -1,5 +1,6 @@
 #include "Managers/Singletons/DescriptorHeapManager.h"
 
+#include <algorithm>
 #include <stdexcept>
 
 #include <spdlog/spdlog.h>
@@ -7,6 +8,7 @@
 
 #include "Managers/Singletons/DeviceManager.h"
 #include "Resources/GloballyIndexedResource.h"
+#include "Render/Runtime/OpenRenderGraphSettings.h"
 
 // Controls texture SRV mip range behavior:
 // 0: each SRV exposes exactly one mip (legacy behavior)
@@ -17,6 +19,8 @@
 
 void DescriptorHeapManager::Initialize() {
     auto device = DeviceManager::GetInstance().GetDevice();
+    m_deferredReleases.clear();
+    m_latestQueueFenceSnapshot.clear();
 
     m_cbvSrvUavHeap = std::make_shared<DescriptorHeap>(
         device,
@@ -55,11 +59,95 @@ void DescriptorHeapManager::Initialize() {
 }
 
 void DescriptorHeapManager::Cleanup() {
+    {
+        std::scoped_lock lock(m_descriptorMutationMutex);
+        for (auto& release : m_deferredReleases) {
+            for (auto& [heap, index] : release.descriptorSlots) {
+                if (heap) {
+                    heap->ReleaseDescriptor(index);
+                }
+            }
+        }
+        m_deferredReleases.clear();
+        m_latestQueueFenceSnapshot.clear();
+    }
     m_cbvSrvUavHeap.reset();
     m_samplerHeap.reset();
     m_rtvHeap.reset();
     m_dsvHeap.reset();
     m_nonShaderVisibleHeap.reset();
+}
+
+void DescriptorHeapManager::RetireDescriptorSlots(std::vector<std::pair<std::shared_ptr<DescriptorHeap>, UINT>> slots) {
+    if (slots.empty()) {
+        return;
+    }
+
+    std::scoped_lock lock(m_descriptorMutationMutex);
+    DeferredRelease release{};
+    release.requiredFences = m_latestQueueFenceSnapshot;
+    release.descriptorSlots = std::move(slots);
+    m_deferredReleases.push_back(std::move(release));
+}
+
+void DescriptorHeapManager::RetireBufferBacking(std::unique_ptr<GpuBufferBacking> backing) {
+    if (!backing) {
+        return;
+    }
+
+    std::scoped_lock lock(m_descriptorMutationMutex);
+    DeferredRelease release{};
+    release.requiredFences = m_latestQueueFenceSnapshot;
+    release.bufferBackings.push_back(std::move(backing));
+    m_deferredReleases.push_back(std::move(release));
+}
+
+void DescriptorHeapManager::PublishQueueFenceSnapshot(std::vector<QueueFenceSnapshotPoint> fenceSnapshot) {
+    std::scoped_lock lock(m_descriptorMutationMutex);
+    fenceSnapshot.erase(
+        std::remove_if(
+            fenceSnapshot.begin(),
+            fenceSnapshot.end(),
+            [](const QueueFenceSnapshotPoint& point) {
+                return !point.timeline.IsValid() || point.value == 0 || point.value == UINT64_MAX;
+            }),
+        fenceSnapshot.end());
+    m_latestQueueFenceSnapshot = std::move(fenceSnapshot);
+}
+
+void DescriptorHeapManager::ProcessDeferredReleases(uint8_t frameIndex) {
+    (void)frameIndex;
+    std::scoped_lock lock(m_descriptorMutationMutex);
+
+    auto releaseIsSafe = [](DeferredRelease& release) {
+        for (auto& point : release.requiredFences) {
+            if (!point.timeline.IsValid()) {
+                return false;
+            }
+            const uint64_t completed = point.timeline.GetCompletedValue();
+            if (completed == UINT64_MAX || completed < point.value) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    for (size_t i = 0; i < m_deferredReleases.size();) {
+        auto& release = m_deferredReleases[i];
+        if (!releaseIsSafe(release)) {
+            ++i;
+            continue;
+        }
+
+        for (auto& [heap, index] : release.descriptorSlots) {
+            if (heap) {
+                heap->ReleaseDescriptor(index);
+            }
+        }
+
+        release = std::move(m_deferredReleases.back());
+        m_deferredReleases.pop_back();
+    }
 }
 
 void DescriptorHeapManager::AssignDescriptorSlots(

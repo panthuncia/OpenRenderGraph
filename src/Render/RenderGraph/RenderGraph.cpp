@@ -20,6 +20,7 @@
 #include "Utilities/ORGUtilities.h"
 #include "Managers/Singletons/DeviceManager.h"
 #include "Managers/Singletons/DeletionManager.h"
+#include "Managers/Singletons/DescriptorHeapManager.h"
 #include "Managers/Singletons/UploadManager.h"
 #include "Managers/Singletons/StatisticsManager.h"
 #include "Render/PassBuilders.h"
@@ -30,6 +31,7 @@
 #include "Resources/DynamicResource.h"
 #include "Resources/ExternalTextureResource.h"
 #include "Resources/PixelBuffer.h"
+#include "Resources/Buffers/DynamicBufferBase.h"
 #include "Resources/MemoryStatisticsComponents.h"
 
 namespace {
@@ -43,6 +45,57 @@ namespace {
 			}
 		}
 		return current;
+	}
+
+	const char* CommandListPhaseName(const QueueBatchSchedule& schedule, uint8_t commandListIndex) noexcept {
+		if (!schedule.splitAfterTransitions && !schedule.splitAfterExecution) {
+			return "WholeBatch";
+		}
+
+		uint8_t index = 0;
+		if (schedule.splitAfterTransitions) {
+			if (commandListIndex == index) {
+				return "BeforePasses";
+			}
+			++index;
+		}
+
+		if (schedule.splitAfterExecution) {
+			if (commandListIndex == index) {
+				return "Passes";
+			}
+			++index;
+		}
+
+		return "AfterPasses";
+	}
+
+	const char* DebugQueueKindName(QueueKind queue) noexcept {
+		switch (queue) {
+		case QueueKind::Graphics: return "Graphics";
+		case QueueKind::Compute: return "Compute";
+		case QueueKind::Copy: return "Copy";
+		default: return "Unknown";
+		}
+	}
+
+	std::string MakeRenderGraphCommandListName(
+		unsigned frameIndex,
+		size_t batchIndex,
+		size_t queueSlot,
+		QueueKind queue,
+		const QueueBatchSchedule& schedule,
+		uint8_t commandListIndex)
+	{
+		std::ostringstream oss;
+		oss << "ORG frame=" << frameIndex
+			<< " batch=" << batchIndex
+			<< " queue=" << DebugQueueKindName(queue)
+			<< " slot=" << queueSlot
+			<< " cl=" << static_cast<unsigned>(commandListIndex)
+			<< "/" << static_cast<unsigned>(schedule.numCLs)
+			<< " phase=" << CommandListPhaseName(schedule, commandListIndex);
+		return oss.str();
 	}
 
 	rhi::DescriptorSlot ResolveRTVSlot(Resource* resource, uint32_t mip, uint32_t slice) noexcept {
@@ -4171,8 +4224,15 @@ void RenderGraph::CaptureCompileTrackersForExecution(const std::unordered_set<ui
 			return;
 		}
 
-		if (auto* tracker = resource->GetStateTracker()) {
-			trackers[resourceID] = tracker;
+		if (resource->GetStateTracker()) {
+			uint64_t backingGeneration = 0u;
+			if (auto* buffer = dynamic_cast<BufferBase*>(resource)) {
+				backingGeneration = buffer->GetBackingGeneration();
+			}
+			else if (auto* pixelBuffer = dynamic_cast<PixelBuffer*>(resource)) {
+				backingGeneration = pixelBuffer->GetBackingGeneration();
+			}
+			trackers[resourceID] = CapturedTrackerResource{ .backingGeneration = backingGeneration };
 		}
 	};
 
@@ -4182,21 +4242,44 @@ void RenderGraph::CaptureCompileTrackersForExecution(const std::unordered_set<ui
 }
 
 void RenderGraph::PublishCompiledTrackerStates() {
-	for (const auto& [resourceID, liveTracker] : trackers) {
-		if (!liveTracker) {
-			continue;
-		}
-
+	for (const auto& [resourceID, captured] : trackers) {
 		auto resourceIndex = TryGetFrameSchedulingResourceIndex(resourceID);
 		if (!resourceIndex.has_value() || *resourceIndex >= m_frameCompileResources.size()) {
 			continue;
 		}
 
-		const auto& compileResourceState = m_frameCompileResources[*resourceIndex];
+		auto& compileResourceState = m_frameCompileResources[*resourceIndex];
 		if (!compileResourceState.trackerInitialized) {
 			continue;
 		}
 
+		Resource* resource = compileResourceState.resource;
+		if (!resource || !HasLiveCompileResourceBacking(resource)) {
+			continue;
+		}
+
+		uint64_t currentBackingGeneration = 0u;
+		if (auto* buffer = dynamic_cast<BufferBase*>(resource)) {
+			currentBackingGeneration = buffer->GetBackingGeneration();
+		}
+		else if (auto* pixelBuffer = dynamic_cast<PixelBuffer*>(resource)) {
+			currentBackingGeneration = pixelBuffer->GetBackingGeneration();
+		}
+		if (captured.backingGeneration != 0u
+			&& currentBackingGeneration != 0u
+			&& captured.backingGeneration != currentBackingGeneration) {
+			spdlog::warn(
+				"RenderGraph: resource '{}' id={} backing changed during execution; publishing compiled state to current tracker capturedGeneration={} currentGeneration={}",
+				resource->GetName(),
+				resourceID,
+				captured.backingGeneration,
+				currentBackingGeneration);
+		}
+
+		auto* liveTracker = resource->GetStateTracker();
+		if (!liveTracker) {
+			continue;
+		}
 		liveTracker->CopyFrom(compileResourceState.tracker);
 	}
 }
@@ -15233,6 +15316,17 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 							qs.numCLs);
 					}
 					qs.preallocatedCLs[ci] = SlotPool(qi)->Request();
+					if (qs.preallocatedCLs[ci].list) {
+						const auto queueKind = m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(qi));
+						const auto debugName = MakeRenderGraphCommandListName(
+							static_cast<unsigned>(context.frameIndex),
+							bi,
+							qi,
+							queueKind,
+							qs,
+							ci);
+						qs.preallocatedCLs[ci].list->SetName(debugName.c_str());
+					}
 					if (batchTraceEnabled) {
 						spdlog::info(
 							"RenderGraph::Execute frame={} acquired CL batch={} slot={} clIndex={} of {}",
@@ -15954,6 +16048,23 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 		crm->Flush(QueueKind::Copy, { false, 0 });
 		PublishCompiledTrackerStates();
 		crm->EndFrame();
+	}
+
+	{
+		ZoneScopedN("RenderGraph::Execute::PublishDescriptorRetirementFences");
+		std::vector<DescriptorHeapManager::QueueFenceSnapshotPoint> fenceSnapshot;
+		fenceSnapshot.reserve(slotCount);
+		for (size_t qi = 0; qi < slotCount; ++qi) {
+			const UINT64 value = lastSignaledPerSlot[qi];
+			if (value == 0 || value == UINT64_MAX) {
+				continue;
+			}
+			fenceSnapshot.push_back(DescriptorHeapManager::QueueFenceSnapshotPoint{
+				.timeline = SlotFence(qi),
+				.value = value,
+			});
+		}
+		DescriptorHeapManager::GetInstance().PublishQueueFenceSnapshot(std::move(fenceSnapshot));
 	}
 
 	{

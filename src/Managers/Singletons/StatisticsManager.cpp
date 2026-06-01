@@ -619,17 +619,40 @@ void StatisticsManager::OnFrameComplete(
         };
 
     for (const auto& r : pending) {
+        if (r.second < 2u) {
+            continue;
+        }
+
         // Map just the timestamp byte range we resolved this frame
         const uint64_t tsMapOffset = tsStride * uint64_t(r.first);
         const uint64_t tsMapSize = tsStride * uint64_t(r.second);
 
         void* tsPtrVoid = nullptr;
         tsBuf->Map(&tsPtrVoid, tsMapOffset, tsMapSize);
+        if (tsPtrVoid == nullptr) {
+            spdlog::warn(
+                "StatisticsManager::OnFrameComplete: timestamp readback Map returned null queue={} frameIndex={} firstQuery={} queryCount={}",
+                static_cast<int>(queueKind),
+                frameIndex,
+                r.first,
+                r.second);
+            continue;
+        }
         const uint8_t* tsBase = static_cast<const uint8_t*>(tsPtrVoid);
 
         for (uint32_t idx = r.first; idx < r.first + r.second; idx += 2) {
             const uint32_t local0 = (idx - r.first);
             const uint32_t local1 = local0 + 1;
+            if (local1 >= r.second) {
+                spdlog::warn(
+                    "StatisticsManager::OnFrameComplete: skipping incomplete timestamp pair queue={} frameIndex={} firstQuery={} queryCount={} localBegin={}",
+                    static_cast<int>(queueKind),
+                    frameIndex,
+                    r.first,
+                    r.second,
+                    local0);
+                break;
+            }
 
             // Read the two timestamps (each element starts at localIndex * tsStride)
             const uint64_t t0 = readU64At(tsBase, uint64_t(local0) * tsStride);
@@ -657,6 +680,15 @@ void StatisticsManager::OnFrameComplete(
             const uint64_t psOffset = psStride * uint64_t(psIdx);
             void* psPtrVoid = nullptr;
             psBuf->Map(&psPtrVoid, psOffset, psStride);
+            if (psPtrVoid == nullptr) {
+                spdlog::warn(
+                    "StatisticsManager::OnFrameComplete: pipeline-stat readback Map returned null queue={} frameIndex={} passIndex={} queryIndex={}",
+                    static_cast<int>(queueKind),
+                    frameIndex,
+                    pi,
+                    psIdx);
+                continue;
+            }
 
             const uint8_t* psBase = static_cast<const uint8_t*>(psPtrVoid);
 

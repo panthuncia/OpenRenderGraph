@@ -4,6 +4,8 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include <spdlog/spdlog.h>
+
 #include "Resources/DynamicResource.h"
 #include "Render/FeatureDomainRegistry.h"
 #include "Render/ResourceRegistry.h"
@@ -169,12 +171,28 @@ public:
 			throw std::runtime_error("Resource "+ resourceName +" not found!");
 		}
 		const auto& resourceAndAccessor = it->second;
+		unsigned int resolvedIndex = 0;
 		if (resourceAndAccessor.resource.isDynamic) {
-			return AccessDynamicGloballyIndexedResource(resourceAndAccessor.resource.handle, resourceAndAccessor.accessor);
+			resolvedIndex = AccessResourceByHandle(resourceAndAccessor.resource.handle, resourceAndAccessor.accessor);
 		}
 		else {
-			return resourceAndAccessor.resource.index;
+			resolvedIndex = resourceAndAccessor.resource.index;
 		}
+
+		auto lastIt = m_lastResolvedDescriptorIndices.find(hash);
+		if (lastIt == m_lastResolvedDescriptorIndices.end()) {
+			m_lastResolvedDescriptorIndices.emplace(hash, resolvedIndex);
+		}
+		else if (lastIt->second != resolvedIndex) {
+			spdlog::warn(
+				"ResourceDescriptorIndexHelper: descriptor index changed for '{}' old={} new={}; using refreshed bind-time index",
+				name ? *name : std::string("Unknown"),
+				lastIt->second,
+				resolvedIndex);
+			lastIt->second = resolvedIndex;
+		}
+
+		return resolvedIndex;
 	}
 	unsigned int GetResourceDescriptorIndex(const ResourceIdentifier& id, bool allowFail = true) const {
 		return GetResourceDescriptorIndex(id.hash, allowFail, &id.name);
@@ -186,6 +204,7 @@ public:
 private:
 	std::unordered_map<size_t, ResourceAndAccessor> m_resourceMap; // Maps resource identifiers to descriptor indices
 	std::unordered_set<FeatureDomainIdentifier, FeatureDomainIdentifier::Hasher> m_activeFeatureDomains;
+	mutable std::unordered_map<size_t, unsigned int> m_lastResolvedDescriptorIndices;
 
 	bool ShouldAllowMissingForInactiveFeature(const ResourceIdentifier& id) const {
 		auto domain = FeatureDomainRegistry::Get().FindResourceDomain(id);
@@ -246,29 +265,31 @@ private:
 	template<class T>
 	static T* PtrFrom(const std::shared_ptr<T>& p) noexcept { return p.get(); }
 
-	unsigned int AccessDynamicGloballyIndexedResource(
+	unsigned int AccessResourceByHandle(
 		const ResourceRegistry::RegistryHandle& h,
 		const DescriptorAccessor& accessor) const
 	{
-		// Prefer a Resolve<T>() on the view; otherwise use Resolve() + dynamic_cast.
 		Resource* base = m_resourceRegistryView->Resolve<Resource>(h);
 		if (!base) {
-			throw std::runtime_error("Dynamic resource handle no longer resolves");
+			throw std::runtime_error("Resource descriptor handle no longer resolves");
 		}
 
-		auto* dyn = dynamic_cast<DynamicGloballyIndexedResource*>(base);
-		if (!dyn) {
-			throw std::runtime_error("Handle does not resolve to DynamicGloballyIndexedResource");
+		if (auto* dyn = dynamic_cast<DynamicGloballyIndexedResource*>(base)) {
+			auto backing = dyn->GetResource();
+			auto* gi = PtrFrom(backing);
+			if (!gi) {
+				throw std::runtime_error("Dynamic resource has null backing resource");
+			}
+
+			return AccessGloballyIndexedResource(*gi, accessor);
 		}
 
-		// backing may change frame-to-frame
-		auto backing = dyn->GetResource();
-		auto* gi = PtrFrom(backing);
-		if (!gi) {
-			throw std::runtime_error("Dynamic resource has null backing resource");
+		if (auto* gi = dynamic_cast<GloballyIndexedResource*>(base)) {
+			return AccessGloballyIndexedResource(*gi, accessor);
 		}
 
-		return AccessGloballyIndexedResource(*gi, accessor);
+		throw std::runtime_error(
+			"Resource descriptor handle does not resolve to a GloballyIndexedResource or DynamicGloballyIndexedResource");
 	}
 
 
@@ -281,14 +302,13 @@ private:
 			throw std::runtime_error("Resource is null");
 		}
 
-		if (dynamic_cast<DynamicGloballyIndexedResource*>(resource)) {
-			// Store the handle so we can re-resolve later.
+		if (dynamic_cast<DynamicGloballyIndexedResource*>(resource) ||
+			dynamic_cast<GloballyIndexedResource*>(resource)) {
+			// Descriptor slots for ordinary globally indexed resources can change
+			// when dynamic buffers grow. Re-resolve by handle at bind time so
+			// long-lived passes do not keep stale descriptor root constants until
+			// the next render-graph rebuild.
 			return ResourceIndexOrDynamicResource::Dynamic(h);
-		}
-
-		if (auto* gi = dynamic_cast<GloballyIndexedResource*>(resource)) {
-			const unsigned idx = AccessGloballyIndexedResource(*gi, accessor);
-			return ResourceIndexOrDynamicResource::Static(idx);
 		}
 
 		throw std::runtime_error(

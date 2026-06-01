@@ -9,6 +9,7 @@
 
 #include "Render/DescriptorHeap.h"
 #include "Render/Runtime/DescriptorServiceTypes.h"
+#include "Resources/GPUBacking/GpuBufferBacking.h"
 
 class GloballyIndexedResource;
 
@@ -38,6 +39,15 @@ public:
 		rhi::Resource& apiResource,
 		const ViewRequirements& req);
 
+	void RetireDescriptorSlots(std::vector<std::pair<std::shared_ptr<DescriptorHeap>, UINT>> slots);
+	void RetireBufferBacking(std::unique_ptr<GpuBufferBacking> backing);
+	struct QueueFenceSnapshotPoint {
+		rhi::Timeline timeline;
+		uint64_t value = 0;
+	};
+	void PublishQueueFenceSnapshot(std::vector<QueueFenceSnapshotPoint> fenceSnapshot);
+	void ProcessDeferredReleases(uint8_t frameIndex);
+
 	rhi::DescriptorHeap GetSRVDescriptorHeap() const;
 	rhi::DescriptorHeap GetSamplerDescriptorHeap() const;
 	UINT CreateIndexedSampler(const rhi::SamplerDesc& samplerDesc);
@@ -65,5 +75,12 @@ private:
 	std::shared_ptr<DescriptorHeap> m_rtvHeap;
 	std::shared_ptr<DescriptorHeap> m_dsvHeap;
 	std::shared_ptr<DescriptorHeap> m_nonShaderVisibleHeap;
+	struct DeferredRelease {
+		std::vector<std::pair<std::shared_ptr<DescriptorHeap>, UINT>> descriptorSlots;
+		std::vector<std::unique_ptr<GpuBufferBacking>> bufferBackings;
+		std::vector<QueueFenceSnapshotPoint> requiredFences;
+	};
+	std::vector<DeferredRelease> m_deferredReleases;
+	std::vector<QueueFenceSnapshotPoint> m_latestQueueFenceSnapshot;
 	std::mutex m_descriptorMutationMutex;
 };

@@ -335,6 +335,12 @@ void BufferBase::UnregisterUploadPolicyClient() {
 }
 
 void BufferBase::SetBacking(std::unique_ptr<GpuBufferBacking> backing, uint64_t bufferSize) {
+    if (m_dataBuffer) {
+        if (HasAnyDescriptorSlots()) {
+            DescriptorHeapManager::GetInstance().RetireDescriptorSlots(DetachDescriptorSlotsForDeferredRelease());
+        }
+        DescriptorHeapManager::GetInstance().RetireBufferBacking(std::move(m_dataBuffer));
+    }
     m_dataBuffer = std::move(backing);
     m_bufferSize = bufferSize;
     RefreshDescriptorContents();
