@@ -14973,33 +14973,42 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 		return m_queueRegistry.GetPool(static_cast<QueueSlotIndex>(qi));
 	};
 
-	auto WaitOnSlot = [&](size_t dstSlot, size_t srcSlot, UINT64 absoluteFenceValue) {
+	auto WaitOnSlot = [&](size_t dstSlot, size_t srcSlot, UINT64 absoluteFenceValue, std::string_view reason = {}) {
 		if (dstSlot == srcSlot) return;
 		if (absoluteFenceValue == 0 || absoluteFenceValue == UINT64_MAX) {
 			throw std::runtime_error(fmt::format(
-				"WaitOnSlot rejected invalid fence value: dstSlot={} srcSlot={} value={}",
+				"WaitOnSlot rejected invalid fence value: dstSlot={} srcSlot={} value={} reason='{}'",
 				dstSlot,
 				srcSlot,
-				absoluteFenceValue));
+				absoluteFenceValue,
+				reason));
 		}
-		const UINT64 completedFenceValue = SlotFence(srcSlot).GetCompletedValue();
+		auto& srcFence = SlotFence(srcSlot);
+		const auto srcFenceHandle = srcFence.GetHandle();
+		const UINT64 completedFenceValue = srcFence.GetCompletedValue();
 		if (completedFenceValue == UINT64_MAX) {
 			throw std::runtime_error(fmt::format(
-				"WaitOnSlot detected poisoned queue timeline before wait: dstSlot={} srcSlot={} requestedFence={} completed=UINT64_MAX",
+				"WaitOnSlot detected poisoned queue timeline before wait: dstSlot={} srcSlot={} requestedFence={} completed=UINT64_MAX timeline(idx={}, gen={}) reason='{}'",
 				dstSlot,
 				srcSlot,
-				absoluteFenceValue));
+				absoluteFenceValue,
+				srcFenceHandle.index,
+				srcFenceHandle.generation,
+				reason));
 		}
 		auto dstQ = SlotQueue(dstSlot);
-		const rhi::Result waitResult = dstQ.Wait({ SlotFence(srcSlot).GetHandle(), absoluteFenceValue });
+		const rhi::Result waitResult = dstQ.Wait({ srcFenceHandle, absoluteFenceValue });
 		if (waitResult != rhi::Result::Ok) {
 			throw std::runtime_error(fmt::format(
-				"WaitOnSlot failed: dstSlot={} srcSlot={} fence={} completed={} result={}",
+				"WaitOnSlot failed: dstSlot={} srcSlot={} fence={} completed={} timeline(idx={}, gen={}) result={} reason='{}'",
 				dstSlot,
 				srcSlot,
 				absoluteFenceValue,
 				completedFenceValue,
-				rhi::ResultName(waitResult)));
+				srcFenceHandle.index,
+				srcFenceHandle.generation,
+				rhi::ResultName(waitResult),
+				reason));
 		}
 	};
 
@@ -15029,7 +15038,8 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 					srcIndex >= m_hasPendingFrameStartQueueWait[dstIndex].size()) continue;
 				if (!m_hasPendingFrameStartQueueWait[dstIndex][srcIndex]) continue;
 				WaitOnSlot(dstIndex, srcIndex,
-					m_pendingFrameStartQueueWaitFenceValue[dstIndex][srcIndex]);
+					m_pendingFrameStartQueueWaitFenceValue[dstIndex][srcIndex],
+					fmt::format("FrameStart dst={} src={}", dstIndex, srcIndex));
 			}
 		}
 	}
@@ -15781,7 +15791,17 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 					if (!batch.HasQueueWait(waitPhase, queueIndex, srcIndex)) {
 						continue;
 					}
-					WaitOnSlot(queueIndex, srcIndex, batch.GetQueueWaitFenceValue(waitPhase, queueIndex, srcIndex));
+					WaitOnSlot(
+						queueIndex,
+						srcIndex,
+						batch.GetQueueWaitFenceValue(waitPhase, queueIndex, srcIndex),
+						fmt::format(
+							"BatchWait frame={} batch={} phase={} dstQueue={} srcQueue={}",
+							static_cast<unsigned>(context.frameIndex),
+							batchIndex,
+							waitPhaseLabel,
+							queueIndex,
+							srcIndex));
 				}
 			};
 
