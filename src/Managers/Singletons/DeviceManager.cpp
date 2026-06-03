@@ -185,8 +185,8 @@ void DeviceManager::Cleanup() {
     }
 
     char* json = nullptr;
-    m_allocator->BuildStatsString(&json, TRUE);
-	spdlog::info("Allocator Stats: {}", json);
+    m_allocator->BuildStatsString(&json, FALSE);
+	spdlog::debug("Allocator Stats: {}", json);
     auto numLiveBuffers = GpuBufferBacking::DumpLiveBuffers();
     auto numLiveTextures = GpuTextureBacking::DumpLiveTextures();
     m_allocator->FreeStatsString(json);
