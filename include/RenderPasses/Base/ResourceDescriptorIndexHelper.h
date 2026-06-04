@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <sstream>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -172,11 +173,26 @@ public:
 		}
 		const auto& resourceAndAccessor = it->second;
 		unsigned int resolvedIndex = 0;
-		if (resourceAndAccessor.resource.isDynamic) {
-			resolvedIndex = AccessResourceByHandle(resourceAndAccessor.resource.handle, resourceAndAccessor.accessor);
+		try {
+			if (resourceAndAccessor.resource.isDynamic) {
+				resolvedIndex = AccessResourceByHandle(resourceAndAccessor.resource.handle, resourceAndAccessor.accessor);
+			}
+			else {
+				resolvedIndex = resourceAndAccessor.resource.index;
+			}
 		}
-		else {
-			resolvedIndex = resourceAndAccessor.resource.index;
+		catch (const std::exception& e) {
+			const std::string resourceName = name ? *name : "Unknown";
+			std::ostringstream message;
+			message << "Failed to resolve descriptor index for resource '"
+				<< resourceName
+				<< "' hash="
+				<< hash
+				<< " accessor="
+				<< DescriptorAccessorToString(resourceAndAccessor.accessor)
+				<< ": "
+				<< e.what();
+			throw std::runtime_error(message.str());
 		}
 
 		auto lastIt = m_lastResolvedDescriptorIndices.find(hash);
@@ -214,6 +230,33 @@ private:
 	std::unordered_set<FeatureDomainIdentifier, FeatureDomainIdentifier::Hasher> m_activeFeatureDomains;
 	mutable std::unordered_map<size_t, unsigned int> m_lastResolvedDescriptorIndices;
 	mutable std::unordered_set<size_t> m_loggedDescriptorIndexChanges;
+
+	static std::string DescriptorAccessorToString(const DescriptorAccessor& accessor) {
+		std::ostringstream stream;
+		switch (accessor.type) {
+		case DescriptorType::SRV:
+			stream << "SRV";
+			if (accessor.hasSRVViewType) {
+				stream << "(viewType=" << static_cast<unsigned int>(accessor.SRVType) << ")";
+			}
+			stream << "[mip=" << accessor.mip << ", slice=" << accessor.slice << "]";
+			break;
+		case DescriptorType::UAV:
+			stream << "UAV";
+			if (accessor.hasUAVViewType) {
+				stream << "(viewType=" << static_cast<unsigned int>(accessor.UAVType) << ")";
+			}
+			stream << "[mip=" << accessor.mip << ", slice=" << accessor.slice << "]";
+			break;
+		case DescriptorType::CBV:
+			stream << "CBV";
+			break;
+		default:
+			stream << "Unknown";
+			break;
+		}
+		return stream.str();
+	}
 
 	bool ShouldAllowMissingForInactiveFeature(const ResourceIdentifier& id) const {
 		auto domain = FeatureDomainRegistry::Get().FindResourceDomain(id);
