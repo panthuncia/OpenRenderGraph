@@ -10231,49 +10231,79 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(RenderPassAndResources& p,
 	b._declaredIds.clear();
 
 	// Let the pass declare based on current per-frame state (queued mip jobs etc.)
-	EnsureProviderRegistered(p.pass.get());
-	p.pass->DeclareResourceUsages(&b);
+	{
+		ZoneScopedN("RenderGraph::RefreshRetainedDeclarationsForFrame(Render)::EnsureProviderRegistered");
+		EnsureProviderRegistered(p.pass.get());
+	}
+	{
+		ZoneScopedN("RenderGraph::RefreshRetainedDeclarationsForFrame(Render)::DeclareResourceUsages");
+		if (!p.name.empty()) {
+			ZoneText(p.name.data(), p.name.size());
+		}
+		p.pass->DeclareResourceUsages(&b);
+	}
 	if (traceLifecycle) {
 		spdlog::info("RG frame {} refresh render pass '{}' declare complete requirements={} transitions={}", frameIndex, p.name, b.GatherResourceRequirements().size(), b.params.internalTransitions.size());
 	}
 	const auto& refreshedRequirements = b.GatherResourceRequirements();
+	TracyPlot("ORG.RefreshRetained.Render.Requirements", static_cast<int64_t>(refreshedRequirements.size()));
+	TracyPlot("ORG.RefreshRetained.Render.InternalTransitions", static_cast<int64_t>(b.params.internalTransitions.size()));
+	TracyPlot("ORG.RefreshRetained.Render.DeclaredIds", static_cast<int64_t>(b.DeclaredResourceIds().size()));
 
 	// Update the frame view used by scheduling
-	p.resources.staticResourceRequirements = refreshedRequirements;
-	p.resources.mergedFrameRequirementsDirty = true;
+	{
+		ZoneScopedN("RenderGraph::RefreshRetainedDeclarationsForFrame(Render)::StoreRequirements");
+		p.resources.staticResourceRequirements = refreshedRequirements;
+		p.resources.mergedFrameRequirementsDirty = true;
 
-	// Internal transitions also affect scheduling
-	p.resources.internalTransitions = b.params.internalTransitions;
+		// Internal transitions also affect scheduling
+		p.resources.internalTransitions = b.params.internalTransitions;
 
-	p.resources.identifierSet = b.DeclaredResourceIds();
-	p.resources.autoDescriptorShaderResources = b.params.autoDescriptorShaderResources;
-	p.resources.autoDescriptorConstantBuffers = b.params.autoDescriptorConstantBuffers;
-	p.resources.autoDescriptorUnorderedAccessViews = b.params.autoDescriptorUnorderedAccessViews;
-	p.resources.activeFeatureDomains = b.params.activeFeatureDomains;
+		p.resources.identifierSet = b.DeclaredResourceIds();
+		p.resources.autoDescriptorShaderResources = b.params.autoDescriptorShaderResources;
+		p.resources.autoDescriptorConstantBuffers = b.params.autoDescriptorConstantBuffers;
+		p.resources.autoDescriptorUnorderedAccessViews = b.params.autoDescriptorUnorderedAccessViews;
+		p.resources.activeFeatureDomains = b.params.activeFeatureDomains;
+	}
 	if (traceLifecycle) {
 		spdlog::info("RG frame {} refresh render pass '{}' materialize referenced resources begin", frameIndex, p.name);
 	}
-	MaterializeReferencedResources(p.resources.staticResourceRequirements, p.resources.internalTransitions);
+	{
+		ZoneScopedN("RenderGraph::RefreshRetainedDeclarationsForFrame(Render)::MaterializeReferencedResources");
+		MaterializeReferencedResources(p.resources.staticResourceRequirements, p.resources.internalTransitions);
+	}
 
 	// Transfer resolver snapshots for auto-invalidation tracking
-	p.resolverSnapshots = b.TakeResolverSnapshots();
-	p.retainedAnonymousKeepAlive = CaptureRetainedAnonymousKeepAlive(
-		p.resources.staticResourceRequirements,
-		p.resources.internalTransitions);
-	UpdateRetainedDeclarationCache(_registry, PassType::Render, p.name, p);
+	{
+		ZoneScopedN("RenderGraph::RefreshRetainedDeclarationsForFrame(Render)::CaptureResolverSnapshots");
+		p.resolverSnapshots = b.TakeResolverSnapshots();
+		p.retainedAnonymousKeepAlive = CaptureRetainedAnonymousKeepAlive(
+			p.resources.staticResourceRequirements,
+			p.resources.internalTransitions);
+	}
+	{
+		ZoneScopedN("RenderGraph::RefreshRetainedDeclarationsForFrame(Render)::UpdateRetainedDeclarationCache");
+		UpdateRetainedDeclarationCache(_registry, PassType::Render, p.name, p);
+	}
 
 	// Ensure the pass's view matches the refreshed identifier set
-	p.pass->SetResourceRegistryView(
-		std::make_unique<ResourceRegistryView>(_registry, p.resources.identifierSet),
-		p.resources.activeFeatureDomains,
-		p.resources.autoDescriptorShaderResources,
-		p.resources.autoDescriptorConstantBuffers,
-		p.resources.autoDescriptorUnorderedAccessViews
-	);
+	{
+		ZoneScopedN("RenderGraph::RefreshRetainedDeclarationsForFrame(Render)::SetResourceRegistryView");
+		p.pass->SetResourceRegistryView(
+			std::make_unique<ResourceRegistryView>(_registry, p.resources.identifierSet),
+			p.resources.activeFeatureDomains,
+			p.resources.autoDescriptorShaderResources,
+			p.resources.autoDescriptorConstantBuffers,
+			p.resources.autoDescriptorUnorderedAccessViews
+		);
+	}
 	if (traceLifecycle) {
 		spdlog::info("RG frame {} refresh render pass '{}' setup begin", frameIndex, p.name);
 	}
-	p.pass->Setup();
+	{
+		ZoneScopedN("RenderGraph::RefreshRetainedDeclarationsForFrame(Render)::Setup");
+		p.pass->Setup();
+	}
 	if (traceLifecycle) {
 		spdlog::info("RG frame {} refresh render pass '{}' setup complete", frameIndex, p.name);
 	}
@@ -10298,45 +10328,75 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(ComputePassAndResources& p
 	b.params = {};
 	b._declaredIds.clear();
 
-	EnsureProviderRegistered(p.pass.get());
-	p.pass->DeclareResourceUsages(&b);
+	{
+		ZoneScopedN("RenderGraph::RefreshRetainedDeclarationsForFrame(Compute)::EnsureProviderRegistered");
+		EnsureProviderRegistered(p.pass.get());
+	}
+	{
+		ZoneScopedN("RenderGraph::RefreshRetainedDeclarationsForFrame(Compute)::DeclareResourceUsages");
+		if (!p.name.empty()) {
+			ZoneText(p.name.data(), p.name.size());
+		}
+		p.pass->DeclareResourceUsages(&b);
+	}
 	if (traceLifecycle) {
 		spdlog::info("RG frame {} refresh compute pass '{}' declare complete requirements={} transitions={}", frameIndex, p.name, b.GatherResourceRequirements().size(), b.params.internalTransitions.size());
 	}
 	const auto& refreshedRequirements = b.GatherResourceRequirements();
+	TracyPlot("ORG.RefreshRetained.Compute.Requirements", static_cast<int64_t>(refreshedRequirements.size()));
+	TracyPlot("ORG.RefreshRetained.Compute.InternalTransitions", static_cast<int64_t>(b.params.internalTransitions.size()));
+	TracyPlot("ORG.RefreshRetained.Compute.DeclaredIds", static_cast<int64_t>(b.DeclaredResourceIds().size()));
 
-	p.resources.staticResourceRequirements = refreshedRequirements;
-	p.resources.mergedFrameRequirementsDirty = true;
-	p.resources.internalTransitions = b.params.internalTransitions;
-	p.resources.identifierSet = b.DeclaredResourceIds();
-	p.resources.autoDescriptorShaderResources = b.params.autoDescriptorShaderResources;
-	p.resources.autoDescriptorConstantBuffers = b.params.autoDescriptorConstantBuffers;
-	p.resources.autoDescriptorUnorderedAccessViews = b.params.autoDescriptorUnorderedAccessViews;
-	p.resources.activeFeatureDomains = b.params.activeFeatureDomains;
+	{
+		ZoneScopedN("RenderGraph::RefreshRetainedDeclarationsForFrame(Compute)::StoreRequirements");
+		p.resources.staticResourceRequirements = refreshedRequirements;
+		p.resources.mergedFrameRequirementsDirty = true;
+		p.resources.internalTransitions = b.params.internalTransitions;
+		p.resources.identifierSet = b.DeclaredResourceIds();
+		p.resources.autoDescriptorShaderResources = b.params.autoDescriptorShaderResources;
+		p.resources.autoDescriptorConstantBuffers = b.params.autoDescriptorConstantBuffers;
+		p.resources.autoDescriptorUnorderedAccessViews = b.params.autoDescriptorUnorderedAccessViews;
+		p.resources.activeFeatureDomains = b.params.activeFeatureDomains;
+	}
 	if (traceLifecycle) {
 		spdlog::info("RG frame {} refresh compute pass '{}' materialize referenced resources begin", frameIndex, p.name);
 	}
-	MaterializeReferencedResources(p.resources.staticResourceRequirements, p.resources.internalTransitions);
+	{
+		ZoneScopedN("RenderGraph::RefreshRetainedDeclarationsForFrame(Compute)::MaterializeReferencedResources");
+		MaterializeReferencedResources(p.resources.staticResourceRequirements, p.resources.internalTransitions);
+	}
 
 	// Transfer resolver snapshots for auto-invalidation tracking
-	p.resolverSnapshots = b.TakeResolverSnapshots();
-	p.retainedAnonymousKeepAlive = CaptureRetainedAnonymousKeepAlive(
-		p.resources.staticResourceRequirements,
-		p.resources.internalTransitions);
-	UpdateRetainedDeclarationCache(_registry, PassType::Compute, p.name, p);
+	{
+		ZoneScopedN("RenderGraph::RefreshRetainedDeclarationsForFrame(Compute)::CaptureResolverSnapshots");
+		p.resolverSnapshots = b.TakeResolverSnapshots();
+		p.retainedAnonymousKeepAlive = CaptureRetainedAnonymousKeepAlive(
+			p.resources.staticResourceRequirements,
+			p.resources.internalTransitions);
+	}
+	{
+		ZoneScopedN("RenderGraph::RefreshRetainedDeclarationsForFrame(Compute)::UpdateRetainedDeclarationCache");
+		UpdateRetainedDeclarationCache(_registry, PassType::Compute, p.name, p);
+	}
 
-	p.pass->SetResourceRegistryView(
-		std::make_unique<ResourceRegistryView>(_registry, p.resources.identifierSet),
-		p.resources.activeFeatureDomains,
-		p.resources.autoDescriptorShaderResources,
-		p.resources.autoDescriptorConstantBuffers,
-		p.resources.autoDescriptorUnorderedAccessViews
-	);
+	{
+		ZoneScopedN("RenderGraph::RefreshRetainedDeclarationsForFrame(Compute)::SetResourceRegistryView");
+		p.pass->SetResourceRegistryView(
+			std::make_unique<ResourceRegistryView>(_registry, p.resources.identifierSet),
+			p.resources.activeFeatureDomains,
+			p.resources.autoDescriptorShaderResources,
+			p.resources.autoDescriptorConstantBuffers,
+			p.resources.autoDescriptorUnorderedAccessViews
+		);
+	}
 	if (traceLifecycle) {
 		spdlog::info("RG frame {} refresh compute pass '{}' setup begin", frameIndex, p.name);
 	}
 
-	p.pass->Setup();
+	{
+		ZoneScopedN("RenderGraph::RefreshRetainedDeclarationsForFrame(Compute)::Setup");
+		p.pass->Setup();
+	}
 	if (traceLifecycle) {
 		spdlog::info("RG frame {} refresh compute pass '{}' setup complete", frameIndex, p.name);
 	}
@@ -10361,37 +10421,67 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(CopyPassAndResources& p, u
 	b.params = {};
 	b._declaredIds.clear();
 
-	EnsureProviderRegistered(p.pass.get());
-	p.pass->DeclareResourceUsages(&b);
+	{
+		ZoneScopedN("RenderGraph::RefreshRetainedDeclarationsForFrame(Copy)::EnsureProviderRegistered");
+		EnsureProviderRegistered(p.pass.get());
+	}
+	{
+		ZoneScopedN("RenderGraph::RefreshRetainedDeclarationsForFrame(Copy)::DeclareResourceUsages");
+		if (!p.name.empty()) {
+			ZoneText(p.name.data(), p.name.size());
+		}
+		p.pass->DeclareResourceUsages(&b);
+	}
 	if (traceLifecycle) {
 		spdlog::info("RG frame {} refresh copy pass '{}' declare complete requirements={} transitions={}", frameIndex, p.name, b.GatherResourceRequirements().size(), b.params.internalTransitions.size());
 	}
 	const auto& refreshedRequirements = b.GatherResourceRequirements();
+	TracyPlot("ORG.RefreshRetained.Copy.Requirements", static_cast<int64_t>(refreshedRequirements.size()));
+	TracyPlot("ORG.RefreshRetained.Copy.InternalTransitions", static_cast<int64_t>(b.params.internalTransitions.size()));
+	TracyPlot("ORG.RefreshRetained.Copy.DeclaredIds", static_cast<int64_t>(b.DeclaredResourceIds().size()));
 
-	p.resources.staticResourceRequirements = refreshedRequirements;
-	p.resources.mergedFrameRequirementsDirty = true;
-	p.resources.internalTransitions = b.params.internalTransitions;
-	p.resources.identifierSet = b.DeclaredResourceIds();
+	{
+		ZoneScopedN("RenderGraph::RefreshRetainedDeclarationsForFrame(Copy)::StoreRequirements");
+		p.resources.staticResourceRequirements = refreshedRequirements;
+		p.resources.mergedFrameRequirementsDirty = true;
+		p.resources.internalTransitions = b.params.internalTransitions;
+		p.resources.identifierSet = b.DeclaredResourceIds();
+	}
 	if (traceLifecycle) {
 		spdlog::info("RG frame {} refresh copy pass '{}' materialize referenced resources begin", frameIndex, p.name);
 	}
-	MaterializeReferencedResources(p.resources.staticResourceRequirements, p.resources.internalTransitions);
+	{
+		ZoneScopedN("RenderGraph::RefreshRetainedDeclarationsForFrame(Copy)::MaterializeReferencedResources");
+		MaterializeReferencedResources(p.resources.staticResourceRequirements, p.resources.internalTransitions);
+	}
 
 	// Transfer resolver snapshots for auto-invalidation tracking
-	p.resolverSnapshots = b.TakeResolverSnapshots();
-	p.retainedAnonymousKeepAlive = CaptureRetainedAnonymousKeepAlive(
-		p.resources.staticResourceRequirements,
-		p.resources.internalTransitions);
-	UpdateRetainedDeclarationCache(_registry, PassType::Copy, p.name, p);
+	{
+		ZoneScopedN("RenderGraph::RefreshRetainedDeclarationsForFrame(Copy)::CaptureResolverSnapshots");
+		p.resolverSnapshots = b.TakeResolverSnapshots();
+		p.retainedAnonymousKeepAlive = CaptureRetainedAnonymousKeepAlive(
+			p.resources.staticResourceRequirements,
+			p.resources.internalTransitions);
+	}
+	{
+		ZoneScopedN("RenderGraph::RefreshRetainedDeclarationsForFrame(Copy)::UpdateRetainedDeclarationCache");
+		UpdateRetainedDeclarationCache(_registry, PassType::Copy, p.name, p);
+	}
 
-	p.pass->SetResourceRegistryView(
-		std::make_unique<ResourceRegistryView>(_registry, p.resources.identifierSet)
-	);
+	{
+		ZoneScopedN("RenderGraph::RefreshRetainedDeclarationsForFrame(Copy)::SetResourceRegistryView");
+		p.pass->SetResourceRegistryView(
+			std::make_unique<ResourceRegistryView>(_registry, p.resources.identifierSet)
+		);
+	}
 	if (traceLifecycle) {
 		spdlog::info("RG frame {} refresh copy pass '{}' setup begin", frameIndex, p.name);
 	}
 
-	p.pass->Setup();
+	{
+		ZoneScopedN("RenderGraph::RefreshRetainedDeclarationsForFrame(Copy)::Setup");
+		p.pass->Setup();
+	}
 	if (traceLifecycle) {
 		spdlog::info("RG frame {} refresh copy pass '{}' setup complete", frameIndex, p.name);
 	}
@@ -10425,11 +10515,20 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	}
 
 	auto needsRefresh = [&](auto& p) -> bool {
+		ZoneScopedN("RenderGraph::CompileFrame::RefreshRetainedDeclarations::NeedsRefresh");
+		if (!p.name.empty()) {
+			ZoneText(p.name.data(), p.name.size());
+		}
 		// Check if any stored resolver's content version has changed
-		for (const auto& snap : p.resolverSnapshots) {
-			uint64_t cv = snap.resolver->GetContentVersion();
-			if (cv != 0 && cv != snap.version) {
-				return true;
+		{
+			ZoneScopedN("RenderGraph::CompileFrame::RefreshRetainedDeclarations::NeedsRefresh::ResolverSnapshots");
+			TracyPlot("ORG.RefreshRetained.ResolverSnapshots", static_cast<int64_t>(p.resolverSnapshots.size()));
+			for (const auto& snap : p.resolverSnapshots) {
+				uint64_t cv = snap.resolver->GetContentVersion();
+				if (cv != 0 && cv != snap.version) {
+					ZoneScopedN("RenderGraph::CompileFrame::RefreshRetainedDeclarations::NeedsRefresh::ResolverChanged");
+					return true;
+				}
 			}
 		}
 
@@ -10450,6 +10549,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		};
 
 		if (p.declarationCache.requiresStaleHandleValidation) {
+			ZoneScopedN("RenderGraph::CompileFrame::RefreshRetainedDeclarations::NeedsRefresh::StaleHandleValidation");
 				for (const auto& req : p.resources.staticResourceRequirements) {
 					if (hasInvalidCachedHandle(req.resourceHandleAndRange, "requirement")) {
 						return true;
@@ -10468,26 +10568,63 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			return false;
 		}
 
-		return p.declarationCache.dynamicInterface->DeclaredResourcesChanged();
+		{
+			ZoneScopedN("RenderGraph::CompileFrame::RefreshRetainedDeclarations::NeedsRefresh::DeclaredResourcesChanged");
+			const std::string dynamicZoneName = p.name.empty()
+				? std::string("RG::DeclaredResourcesChanged::<unnamed>")
+				: std::string("RG::DeclaredResourcesChanged::") + p.name;
+			ZoneNamedN(dynamicDeclaredResourcesChangedZone, "RenderGraph::DeclaredResourcesChanged", true);
+			ZoneNameV(dynamicDeclaredResourcesChangedZone, dynamicZoneName.c_str(), dynamicZoneName.size());
+			if (!p.name.empty()) {
+				ZoneTextV(dynamicDeclaredResourcesChangedZone, p.name.data(), p.name.size());
+			}
+			const bool changed = p.declarationCache.dynamicInterface->DeclaredResourcesChanged();
+			TracyPlot("ORG.RefreshRetained.DynamicDeclaredResourcesChanged", static_cast<int64_t>(changed ? 1 : 0));
+			return changed;
+		}
 		};
 
 	std::unordered_set<std::string> declarationRefreshedPassNames;
 	std::unordered_set<std::string> frameExtensionPassNames;
 	{
 		ZoneScopedN("RenderGraph::CompileFrame::RefreshRetainedDeclarations");
+		TracyPlot("ORG.RefreshRetained.Candidates", static_cast<int64_t>(m_retainedDeclarationRefreshCandidateMasterIndices.size()));
+		size_t refreshCandidateCount = 0;
+		size_t refreshNeededCount = 0;
+		size_t renderRefreshCount = 0;
+		size_t computeRefreshCount = 0;
+		size_t copyRefreshCount = 0;
+		size_t changedRefreshCount = 0;
+		size_t equivalentRefreshCount = 0;
 		// First, refresh all retained declarations for this frame
 		for (size_t candidateIndex : m_retainedDeclarationRefreshCandidateMasterIndices) {
+			ZoneScopedN("RenderGraph::CompileFrame::RefreshRetainedDeclarations::Candidate");
+			ZoneValue(static_cast<uint64_t>(candidateIndex));
+			++refreshCandidateCount;
 			if (candidateIndex >= m_masterPassList.size()) {
 				continue;
 			}
 			auto& pr = m_masterPassList[candidateIndex];
 			if (pr.type == PassType::Compute) {
 				auto& p = std::get<ComputePassAndResources>(pr.pass);
+				if (!p.name.empty()) {
+					ZoneText(p.name.data(), p.name.size());
+				}
 				if (needsRefresh(p)) {
+					ZoneScopedN("RenderGraph::CompileFrame::RefreshRetainedDeclarations::RefreshComputePass");
+					if (!p.name.empty()) {
+						ZoneText(p.name.data(), p.name.size());
+					}
+					++refreshNeededCount;
+					++computeRefreshCount;
 					++m_frameDeclarationRefreshRequestedCount;
 					const bool declarationActuallyChanged = RefreshRetainedDeclarationsForFrame(p, frameIndex);
 					if (!declarationActuallyChanged) {
 						++m_frameDeclarationRefreshEquivalentCount;
+						++equivalentRefreshCount;
+					}
+					else {
+						++changedRefreshCount;
 					}
 					if (declarationActuallyChanged && !p.name.empty()) {
 						declarationRefreshedPassNames.insert(p.name);
@@ -10496,11 +10633,24 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			}
 			else if (pr.type == PassType::Render) {
 				auto& p = std::get<RenderPassAndResources>(pr.pass);
+				if (!p.name.empty()) {
+					ZoneText(p.name.data(), p.name.size());
+				}
 				if (needsRefresh(p)) {
+					ZoneScopedN("RenderGraph::CompileFrame::RefreshRetainedDeclarations::RefreshRenderPass");
+					if (!p.name.empty()) {
+						ZoneText(p.name.data(), p.name.size());
+					}
+					++refreshNeededCount;
+					++renderRefreshCount;
 					++m_frameDeclarationRefreshRequestedCount;
 					const bool declarationActuallyChanged = RefreshRetainedDeclarationsForFrame(p, frameIndex);
 					if (!declarationActuallyChanged) {
 						++m_frameDeclarationRefreshEquivalentCount;
+						++equivalentRefreshCount;
+					}
+					else {
+						++changedRefreshCount;
 					}
 					if (declarationActuallyChanged && !p.name.empty()) {
 						declarationRefreshedPassNames.insert(p.name);
@@ -10509,11 +10659,24 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			}
 			else if (pr.type == PassType::Copy) {
 				auto& p = std::get<CopyPassAndResources>(pr.pass);
+				if (!p.name.empty()) {
+					ZoneText(p.name.data(), p.name.size());
+				}
 				if (needsRefresh(p)) {
+					ZoneScopedN("RenderGraph::CompileFrame::RefreshRetainedDeclarations::RefreshCopyPass");
+					if (!p.name.empty()) {
+						ZoneText(p.name.data(), p.name.size());
+					}
+					++refreshNeededCount;
+					++copyRefreshCount;
 					++m_frameDeclarationRefreshRequestedCount;
 					const bool declarationActuallyChanged = RefreshRetainedDeclarationsForFrame(p, frameIndex);
 					if (!declarationActuallyChanged) {
 						++m_frameDeclarationRefreshEquivalentCount;
+						++equivalentRefreshCount;
+					}
+					else {
+						++changedRefreshCount;
 					}
 					if (declarationActuallyChanged && !p.name.empty()) {
 						declarationRefreshedPassNames.insert(p.name);
@@ -10521,15 +10684,25 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				}
 			}
 		}
-		m_retainedDeclarationRefreshCandidateMasterIndices.erase(
-			std::remove_if(
-				m_retainedDeclarationRefreshCandidateMasterIndices.begin(),
-				m_retainedDeclarationRefreshCandidateMasterIndices.end(),
-				[&](size_t candidateIndex) {
-					return candidateIndex >= m_masterPassList.size()
-						|| !RetainedDeclarationMayNeedRefresh(m_masterPassList[candidateIndex]);
-				}),
-			m_retainedDeclarationRefreshCandidateMasterIndices.end());
+		{
+			ZoneScopedN("RenderGraph::CompileFrame::RefreshRetainedDeclarations::PruneCandidateList");
+			m_retainedDeclarationRefreshCandidateMasterIndices.erase(
+				std::remove_if(
+					m_retainedDeclarationRefreshCandidateMasterIndices.begin(),
+					m_retainedDeclarationRefreshCandidateMasterIndices.end(),
+					[&](size_t candidateIndex) {
+						return candidateIndex >= m_masterPassList.size()
+							|| !RetainedDeclarationMayNeedRefresh(m_masterPassList[candidateIndex]);
+					}),
+				m_retainedDeclarationRefreshCandidateMasterIndices.end());
+		}
+		TracyPlot("ORG.RefreshRetained.CandidatesChecked", static_cast<int64_t>(refreshCandidateCount));
+		TracyPlot("ORG.RefreshRetained.RefreshNeeded", static_cast<int64_t>(refreshNeededCount));
+		TracyPlot("ORG.RefreshRetained.RefreshRender", static_cast<int64_t>(renderRefreshCount));
+		TracyPlot("ORG.RefreshRetained.RefreshCompute", static_cast<int64_t>(computeRefreshCount));
+		TracyPlot("ORG.RefreshRetained.RefreshCopy", static_cast<int64_t>(copyRefreshCount));
+		TracyPlot("ORG.RefreshRetained.RefreshChanged", static_cast<int64_t>(changedRefreshCount));
+		TracyPlot("ORG.RefreshRetained.RefreshEquivalent", static_cast<int64_t>(equivalentRefreshCount));
 	}
 
 	{
