@@ -9653,8 +9653,15 @@ void RenderGraph::ValidateCompiledResourceGenerations() const {
 		auto* backedResource = TryGetBackedResource(it->second.get());
 		if (backedResource) {
 			const uint64_t currentGeneration = backedResource->GetBackingGeneration();
-			if (currentGeneration != compiledGeneration) {
-				throw std::runtime_error("Resource backing generation changed after compile and before execute. Resource ID: " + std::to_string(id));
+			if (compiledGeneration != 0u &&
+				currentGeneration != 0u &&
+				currentGeneration != compiledGeneration) {
+				throw std::runtime_error(fmt::format(
+					"Resource backing generation changed after compile and before execute. Resource ID: {} name='{}' compiledGeneration={} currentGeneration={}",
+					id,
+					it->second->GetName(),
+					compiledGeneration,
+					currentGeneration));
 			}
 		}
 	}

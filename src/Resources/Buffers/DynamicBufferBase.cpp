@@ -1,8 +1,10 @@
 #include "Resources/Buffers/DynamicBufferBase.h"
 
 #include <stdexcept>
+#include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 
 #include <spdlog/spdlog.h>
 
@@ -14,6 +16,8 @@
 #include "Render/Runtime/UploadPolicyServiceAccess.h"
 
 namespace {
+    thread_local uint32_t g_backingMutationScopeDepth = 0;
+
     const char* HeapTypeToString(rhi::HeapType heapType) {
         switch (heapType) {
         case rhi::HeapType::DeviceLocal:
@@ -64,6 +68,22 @@ namespace {
 }
 
 BufferBase::BufferBase() = default;
+
+BufferBase::ScopedBackingMutation::ScopedBackingMutation()
+    : m_active(true)
+{
+    ++g_backingMutationScopeDepth;
+}
+
+BufferBase::ScopedBackingMutation::~ScopedBackingMutation() {
+    if (m_active && g_backingMutationScopeDepth > 0u) {
+        --g_backingMutationScopeDepth;
+    }
+}
+
+bool BufferBase::IsBackingMutationAllowedOnThisThread() {
+    return g_backingMutationScopeDepth > 0u;
+}
 
 BufferBase::BufferBase(
     rhi::HeapType accessType,
@@ -322,6 +342,25 @@ void BufferBase::UnregisterUploadPolicyClient() {
 }
 
 void BufferBase::SetBacking(std::unique_ptr<GpuBufferBacking> backing, uint64_t bufferSize) {
+    if (m_dataBuffer && !IsBackingMutationAllowedOnThisThread()) {
+        std::ostringstream threadId;
+        threadId << std::this_thread::get_id();
+        std::ostringstream message;
+        message
+            << "GPU buffer backing replacement outside frame-boundary mutation scope: resource='"
+            << GetName()
+            << "' id=" << GetGlobalResourceID()
+            << " oldSize=" << m_bufferSize
+            << " newSize=" << bufferSize
+            << " backingGeneration=" << m_backingGeneration
+            << " thread=" << threadId.str();
+        spdlog::critical("{}", message.str());
+        spdlog::apply_all([](const std::shared_ptr<spdlog::logger>& logger) {
+            logger->flush();
+        });
+        throw std::runtime_error(message.str());
+    }
+
     if (m_dataBuffer) {
         if (HasAnyDescriptorSlots()) {
             DescriptorHeapManager::GetInstance().RetireDescriptorSlots(DetachDescriptorSlotsForDeferredRelease());

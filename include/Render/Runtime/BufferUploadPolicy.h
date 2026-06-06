@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -15,6 +16,7 @@ namespace rg::runtime {
 struct BulkWriteHandle {
     uint8_t* data = nullptr;
     size_t capacity = 0;
+    std::shared_ptr<void> lock;
 };
 
 enum class UploadPolicyTag : uint8_t {

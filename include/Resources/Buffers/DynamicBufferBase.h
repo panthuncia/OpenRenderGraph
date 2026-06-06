@@ -20,6 +20,18 @@ class BufferView;
 
 class BufferBase : public GloballyIndexedResource, public BackedResource, public rg::runtime::IUploadPolicyClient {
 public:
+    class ScopedBackingMutation {
+    public:
+        ScopedBackingMutation();
+        ~ScopedBackingMutation();
+
+        ScopedBackingMutation(const ScopedBackingMutation&) = delete;
+        ScopedBackingMutation& operator=(const ScopedBackingMutation&) = delete;
+
+    private:
+        bool m_active = false;
+    };
+
     struct MaterializeOptions {
         std::optional<BufferAliasPlacement> aliasPlacement;
     };
@@ -103,6 +115,7 @@ public:
     rg::runtime::UploadPolicyTag GetUploadPolicyTag() const;
 
     bool IsUploadPolicyImmediate() const;
+    static bool IsBackingMutationAllowedOnThisThread();
 
     virtual ~BufferBase();
 
