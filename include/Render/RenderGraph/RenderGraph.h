@@ -1537,6 +1537,9 @@ private:
 	void RecordFrameQueueTransitionBatch(size_t queueSlot, size_t resourceIndex, unsigned int batchIndex);
 	std::pair<unsigned int, uint64_t> GetFrameResourceLastEventBeforeBatch(size_t resourceIndex, unsigned int batchIndex) const;
 	const std::vector<uint64_t>& GetSchedulingEquivalentIDsCached(uint64_t resourceID);
+	void UpdateRetainedDeclarationCache(PassType type, std::string_view name, RenderPassAndResources& passAndResources);
+	void UpdateRetainedDeclarationCache(PassType type, std::string_view name, ComputePassAndResources& passAndResources);
+	void UpdateRetainedDeclarationCache(PassType type, std::string_view name, CopyPassAndResources& passAndResources);
 
 	bool RefreshRetainedDeclarationsForFrame(RenderPassAndResources& p, uint8_t frameIndex);
 	bool RefreshRetainedDeclarationsForFrame(ComputePassAndResources& p, uint8_t frameIndex);
