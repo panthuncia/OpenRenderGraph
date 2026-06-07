@@ -324,6 +324,38 @@ bool SymbolicTracker::WouldModify(const RangeSpec& want, const ResourceState& ne
     return false;
 }
 
+bool SymbolicTracker::WouldModifyWholeResourceFast(const ResourceState& newState) const noexcept {
+    return _segs.size() != 1 || !(_segs.front().state == newState);
+}
+
+bool SymbolicTracker::ApplyWholeResourceFast(
+    const RangeSpec& wholeRange,
+    Resource* pRes,
+    ResourceState newState,
+    std::vector<ResourceTransition>& out)
+{
+    if (_segs.size() != 1) {
+        return false;
+    }
+
+    auto& segment = _segs.front();
+    if (!(segment.state == newState)) {
+        out.push_back({
+            pRes,
+            wholeRange,
+            segment.state.access,
+            newState.access,
+            segment.state.layout,
+            newState.layout,
+            segment.state.sync,
+            newState.sync
+        });
+        segment.state = newState;
+    }
+    segment.rangeSpec = wholeRange;
+    return true;
+}
+
 std::vector<Segment> SymbolicTracker::Flatten(ResourceState const& skipState, bool includeSkipState) const {
     std::vector<Segment> out;
     out.reserve(_segs.size());

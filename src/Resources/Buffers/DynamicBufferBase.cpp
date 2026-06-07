@@ -1,10 +1,13 @@
 #include "Resources/Buffers/DynamicBufferBase.h"
 
+#include <algorithm>
 #include <stdexcept>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 #include <spdlog/spdlog.h>
 
@@ -17,6 +20,8 @@
 
 namespace {
     thread_local uint32_t g_backingMutationScopeDepth = 0;
+    std::mutex g_deferredBackingResizeClientsMutex;
+    std::vector<IDeferredBackingResizeClient*> g_deferredBackingResizeClients;
 
     const char* HeapTypeToString(rhi::HeapType heapType) {
         switch (heapType) {
@@ -65,6 +70,51 @@ namespace {
         phase += bufferName;
         ProbeGraphicsCommandListCreation(phase);
     }
+}
+
+void RegisterDeferredBackingResizeClient(IDeferredBackingResizeClient* client) {
+    if (client == nullptr) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_deferredBackingResizeClientsMutex);
+    if (std::find(g_deferredBackingResizeClients.begin(), g_deferredBackingResizeClients.end(), client) == g_deferredBackingResizeClients.end()) {
+        g_deferredBackingResizeClients.push_back(client);
+    }
+}
+
+void UnregisterDeferredBackingResizeClient(IDeferredBackingResizeClient* client) {
+    if (client == nullptr) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_deferredBackingResizeClientsMutex);
+    g_deferredBackingResizeClients.erase(
+        std::remove(g_deferredBackingResizeClients.begin(), g_deferredBackingResizeClients.end(), client),
+        g_deferredBackingResizeClients.end());
+}
+
+uint32_t PublishReadyDeferredBackingResizes(bool wait) {
+    if (!BufferBase::IsBackingMutationAllowedOnThisThread()) {
+        return 0u;
+    }
+
+    std::vector<IDeferredBackingResizeClient*> clients;
+    {
+        std::lock_guard<std::mutex> lock(g_deferredBackingResizeClientsMutex);
+        clients = g_deferredBackingResizeClients;
+    }
+
+    uint32_t published = 0u;
+    for (auto* client : clients) {
+        if (client == nullptr || !client->HasPendingBackingResize()) {
+            continue;
+        }
+        if (client->PublishPendingBackingResize(wait)) {
+            ++published;
+        }
+    }
+    return published;
 }
 
 BufferBase::BufferBase() = default;

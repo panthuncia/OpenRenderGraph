@@ -37,6 +37,7 @@
 #include "Resources/TrackedAllocation.h"
 #include "Render/RenderGraph/Aliasing/RenderGraphAliasingSubsystem.h"
 #include "Render/RenderGraph/ExecutionSchedule.h"
+#include "Render/RenderGraph/RenderGraphCompileProfile.h"
 #include "Interfaces/IResourceResolver.h"
 
 class Resource;
@@ -108,6 +109,7 @@ enum class AutoAliasPackingStrategy : uint8_t {
 
 class RenderGraph {
 public:
+	friend class rg::profile::ScopedCompileProfileStep;
 
 	enum class ExternalInsertKind : uint8_t { Begin, End, Before, After };
 
@@ -615,6 +617,10 @@ public:
 	void SetTaskService(std::shared_ptr<rg::runtime::ITaskService> service) { m_taskService = std::move(service); }
 	rg::runtime::ITaskService* GetTaskService() { return m_taskService.get(); }
 	const rg::runtime::ITaskService* GetTaskService() const { return m_taskService.get(); }
+	void SetCompileProfileSink(std::shared_ptr<rg::profile::ICompileProfileSink> sink);
+	void SetCompileProfileEnabled(bool enabled) noexcept;
+	bool GetCompileProfileEnabled() const noexcept { return m_compileProfileEnabled; }
+	const rg::profile::CompileProfileFrame& GetLastCompileProfileFrame() const noexcept { return m_lastCompileProfileFrame; }
 	void SetStructuralMaterializeCheckpointCallback(std::function<void(std::string_view)> callback) {
 		m_structuralMaterializeCheckpointCallback = std::move(callback);
 	}
@@ -770,6 +776,7 @@ private:
 		RangeSpec range{};
 		ResourceState state{};
 		bool isUAV = false;
+		bool isWholeResource = false;
 		const std::vector<size_t>* equivalentResourceIndices = nullptr;
 	};
 
@@ -1234,6 +1241,55 @@ private:
 		uint64_t crossQueueCoordinationBlockedCount = 0;
 	};
 
+	struct FrameEpochSet {
+		uint32_t epoch = 1;
+		std::vector<uint32_t> epochs;
+		std::vector<size_t> values;
+
+		void Initialize(size_t count) {
+			epoch = 1;
+			epochs.assign(count, 0);
+			values.clear();
+		}
+
+		void Clear() {
+			values.clear();
+			++epoch;
+			if (epoch == 0) {
+				std::fill(epochs.begin(), epochs.end(), 0);
+				epoch = 1;
+			}
+		}
+
+		void Reserve(size_t count) {
+			values.reserve(count);
+		}
+
+		bool Empty() const noexcept {
+			return values.empty();
+		}
+
+		bool Insert(size_t index) {
+			if (index >= epochs.size()) {
+				return false;
+			}
+			if (epochs[index] == epoch) {
+				return false;
+			}
+			epochs[index] = epoch;
+			values.push_back(index);
+			return true;
+		}
+
+		bool Contains(size_t index) const {
+			return index < epochs.size() && epochs[index] == epoch;
+		}
+
+		const std::vector<size_t>& Values() const noexcept {
+			return values;
+		}
+	};
+
 	struct BatchBuildState {
 		size_t queueCount = 0;
 		size_t resourceCount = 0;
@@ -1419,6 +1475,14 @@ private:
 	std::shared_ptr<rg::runtime::IDescriptorService> m_descriptorService;
 	std::shared_ptr<rg::runtime::IRenderGraphSettingsService> m_renderGraphSettingsService;
 	std::shared_ptr<rg::runtime::ITaskService> m_taskService;
+	std::shared_ptr<rg::profile::ICompileProfileSink> m_compileProfileSink;
+	rg::profile::CompileProfileFrame m_activeCompileProfileFrame;
+	rg::profile::CompileProfileFrame m_lastCompileProfileFrame;
+	uint64_t m_compileProfileSerial = 0;
+	uint64_t m_compileProfileFrameStartedAtNs = 0;
+	uint64_t m_lastMaterializeCandidateCount = 0;
+	bool m_compileProfileEnabled = false;
+	bool m_compileProfileFrameActive = false;
 	struct CapturedTrackerResource {
 		uint64_t backingGeneration = 0;
 	};
@@ -1488,10 +1552,15 @@ private:
 
 	/// Dispatches to the injected ITaskService when available, otherwise runs a serial loop.
 	void ParallelForOptional(std::string_view taskName, size_t itemCount, std::function<void(size_t)> func, bool override = false) {
+		const auto allocationContext = rg::profile::GetCurrentAllocationContext();
 		if (m_taskService && !override) {
-			m_taskService->ParallelFor(taskName, itemCount, std::move(func));
+			m_taskService->ParallelFor(taskName, itemCount, [allocationContext, func = std::move(func)](size_t index) mutable {
+				rg::profile::ScopedAllocationContext scopedContext(allocationContext);
+				func(index);
+			});
 		} else {
 			for (size_t i = 0; i < itemCount; ++i) {
+				rg::profile::ScopedAllocationContext scopedContext(allocationContext);
 				func(i);
 			}
 		}
@@ -1545,6 +1614,14 @@ private:
 	bool RefreshRetainedDeclarationsForFrame(ComputePassAndResources& p, uint8_t frameIndex);
 	bool RefreshRetainedDeclarationsForFrame(CopyPassAndResources& p, uint8_t frameIndex);
 	void CompileFrame(rhi::Device device, uint8_t frameIndex, const IHostExecutionData* hostData);
+	void BeginCompileProfileFrame(uint8_t frameIndex);
+	void EndCompileProfileFrame();
+	uint32_t BeginCompileProfileStep(const char* stepName);
+	void EndCompileProfileStep(uint32_t stepIndex, uint64_t durationNs);
+	rg::profile::CompileProfileFrame* ActiveCompileProfileFrame() noexcept {
+		return m_compileProfileFrameActive ? std::addressof(m_activeCompileProfileFrame) : nullptr;
+	}
+	void RecordCompileProfileCounters(const std::vector<Node>& nodes, const std::unordered_set<uint64_t>& usedResourceIDs);
 	void WriteCompiledGraphDebugDump(uint8_t frameIndex, const std::vector<Node>& nodes) const;
 	void WriteVramUsageDebugDump(uint8_t frameIndex) const;
 	void CoalesceQueueWaitsAndSignals(std::vector<PassBatch>& batchesToCoalesce) const;
@@ -1631,13 +1708,13 @@ private:
 
 	std::tuple<int, int, int> GetBatchesToWaitOn(const ComputePassAndResources& pass,
 		size_t sourceQueueSlot,
-		std::unordered_set<uint64_t> const& resourcesTransitionedThisPass);
+		const FrameEpochSet& resourcesTransitionedThisPass);
 	std::tuple<int, int, int> GetBatchesToWaitOn(const RenderPassAndResources& pass,
 		size_t sourceQueueSlot,
-		std::unordered_set<uint64_t> const& resourcesTransitionedThisPass);
+		const FrameEpochSet& resourcesTransitionedThisPass);
 	std::tuple<int, int, int> GetBatchesToWaitOn(const CopyPassAndResources& pass,
 		size_t sourceQueueSlot,
-		std::unordered_set<uint64_t> const& resourcesTransitionedThisPass);
+		const FrameEpochSet& resourcesTransitionedThisPass);
 
 	void ProcessResourceRequirements(
 		size_t passQueueSlot,
@@ -1645,8 +1722,8 @@ private:
 		std::string_view passName,
 		unsigned int batchIndex,
 		PassBatch& currentBatch,
-		std::unordered_set<uint64_t>& outTransitionedResourceIDs,
-		std::unordered_set<size_t>& outFallbackResourceIndices,
+		FrameEpochSet& outTransitionedResourceIndices,
+		FrameEpochSet& outFallbackResourceIndices,
 		std::vector<ResourceTransition>& scratchTransitions);
 
 	template<typename PassRes>
@@ -1656,7 +1733,7 @@ private:
 		PassBatch&                        currentBatch,
 		unsigned int                      currentBatchIndex,
 		const PassRes&                    pass, // either ComputePassAndResources or RenderPassAndResources
-		const std::unordered_set<uint64_t> resourcesTransitionedThisPass)
+		const FrameEpochSet&              resourcesTransitionedThisPass)
 	{
 		ZoneScopedN("RenderGraph::applySynchronization");
 		if (!pass.name.empty()) {
@@ -1755,8 +1832,8 @@ private:
 		size_t passQueueSlot,
 		std::string_view passName,
 		const DenseRequirementSummary& requirement,
-		std::unordered_set<uint64_t>& outTransitionedResourceIDs,
-		std::unordered_set<size_t>& outFallbackResourceIndices,
+		FrameEpochSet& outTransitionedResourceIndices,
+		FrameEpochSet& outFallbackResourceIndices,
 		std::vector<ResourceTransition>& scratchTransitions);
 	bool TryAddTransitionFastNoOp(
 		unsigned int batchIndex,
@@ -1771,8 +1848,8 @@ private:
 		std::string_view passName,
 		const DenseRequirementSummary& requirement,
 		ResourceState requiredState,
-		std::unordered_set<uint64_t>& outTransitionedResourceIDs,
-		std::unordered_set<size_t>& outFallbackResourceIndices,
+		FrameEpochSet& outTransitionedResourceIndices,
+		FrameEpochSet& outFallbackResourceIndices,
 		std::vector<ResourceTransition>& scratchTransitions);
 
 	struct AddTransitionDebugStats {
@@ -1826,8 +1903,8 @@ private:
 
 		unsigned int currentBatchIndex,
 		PassBatch& currentBatch,
-		std::unordered_set<uint64_t>& scratchTransitioned,
-		std::unordered_set<size_t>& scratchFallback,
+		FrameEpochSet& scratchTransitioned,
+		FrameEpochSet& scratchFallback,
 		std::vector<ResourceTransition>& scratchTransitions);
 	void AutoScheduleAndBuildBatches(
 		RenderGraph& rg,

@@ -604,6 +604,10 @@ void RenderGraph::RebuildFramePassAccessSummaries(std::unordered_set<uint64_t>& 
 	};
 
 	auto passAccessSummaryCacheable = [&](size_t passIndex, const AnyPassAndResources& pass) {
+		(void)passIndex;
+		(void)pass;
+		return false;
+#if 0
 		if (passIndex < m_framePassIsFrameExtension.size() && m_framePassIsFrameExtension[passIndex] != 0) {
 			return false;
 		}
@@ -617,6 +621,7 @@ void RenderGraph::RebuildFramePassAccessSummaries(std::unordered_set<uint64_t>& 
 			}
 		}, pass.pass);
 		return cacheable;
+#endif
 	};
 
 	std::vector<PassAccessWorkItem> workItems(m_framePasses.size());
@@ -863,22 +868,17 @@ void RenderGraph::RebuildFramePassAccessSummaries(std::unordered_set<uint64_t>& 
 			summary.uavResourceIDs.clear();
 			summary.dagAccesses.clear();
 
-			std::vector<uint32_t> touchedSeen;
-			std::vector<uint32_t> uavSeen;
-			std::vector<std::pair<uint32_t, uint32_t>> accessEntryIndexByResource;
-			touchedSeen.reserve(summary.requirementSummaries.size() + summary.internalTransitionSummaries.size());
-			uavSeen.reserve(summary.requirementSummaries.size());
-			accessEntryIndexByResource.reserve(summary.requirementSummaries.size() + summary.internalTransitionSummaries.size());
+			struct AccessRecord {
+				uint32_t dagResourceIndex = 0;
+				uint64_t resourceID = 0;
+				bool touched = false;
+				bool uav = false;
+				bool contributesToDag = false;
+				bool write = false;
+			};
 
-			auto containsIndex = [](const std::vector<uint32_t>& indices, uint32_t candidate) {
-				return std::find(indices.begin(), indices.end(), candidate) != indices.end();
-			};
-			auto findAccessEntry = [](const std::vector<std::pair<uint32_t, uint32_t>>& entries, uint32_t resourceIndex) -> const std::pair<uint32_t, uint32_t>* {
-				auto it = std::find_if(entries.begin(), entries.end(), [&](const auto& entry) {
-					return entry.first == resourceIndex;
-				});
-				return it == entries.end() ? nullptr : &*it;
-			};
+			std::vector<AccessRecord> records;
+			records.reserve(summary.requirementSummaries.size() + summary.internalTransitionSummaries.size());
 
 			auto mark = [&](uint64_t resourceID, AccessKind accessKind, bool isUav) {
 				auto dagResourceIt = dagResourceIndexByID.find(resourceID);
@@ -887,29 +887,15 @@ void RenderGraph::RebuildFramePassAccessSummaries(std::unordered_set<uint64_t>& 
 				}
 
 				const uint32_t dagResourceIndex = static_cast<uint32_t>(dagResourceIt->second);
-				if (!containsIndex(touchedSeen, dagResourceIndex)) {
-					touchedSeen.push_back(dagResourceIndex);
-					summary.touchedResourceIDs.push_back(resourceID);
-				}
-				if (isUav && !containsIndex(uavSeen, dagResourceIndex)) {
-					uavSeen.push_back(dagResourceIndex);
-					summary.uavResourceIDs.push_back(resourceID);
-				}
-
-				if (accessKind == AccessKind::Read
-					&& (dagResourceIndex >= resourcesWrittenThisFrame.size() || !resourcesWrittenThisFrame[dagResourceIndex])) {
-					return;
-				}
-
-				if (const auto* accessEntry = findAccessEntry(accessEntryIndexByResource, dagResourceIndex)) {
-					if (accessKind == AccessKind::Write) {
-						summary.dagAccesses[accessEntry->second].kind = AccessKind::Write;
-					}
-				}
-				else {
-					accessEntryIndexByResource.push_back({ dagResourceIndex, static_cast<uint32_t>(summary.dagAccesses.size()) });
-					summary.dagAccesses.push_back({ dagResourceIndex, accessKind });
-				}
+				records.push_back(AccessRecord{
+					.dagResourceIndex = dagResourceIndex,
+					.resourceID = resourceID,
+					.touched = true,
+					.uav = isUav,
+					.contributesToDag = accessKind == AccessKind::Write
+						|| (dagResourceIndex < resourcesWrittenThisFrame.size() && resourcesWrittenThisFrame[dagResourceIndex] != 0),
+					.write = accessKind == AccessKind::Write,
+				});
 			};
 
 			summary.touchedResourceIDs.reserve(summary.requirementSummaries.size() + summary.internalTransitionSummaries.size());
@@ -926,6 +912,42 @@ void RenderGraph::RebuildFramePassAccessSummaries(std::unordered_set<uint64_t>& 
 			for (const auto& transition : summary.internalTransitionSummaries) {
 				mark(transition.resourceID, AccessKind::Write, false);
 			}
+
+			std::sort(records.begin(), records.end(), [](const AccessRecord& lhs, const AccessRecord& rhs) {
+				if (lhs.dagResourceIndex != rhs.dagResourceIndex) {
+					return lhs.dagResourceIndex < rhs.dagResourceIndex;
+				}
+				return lhs.resourceID < rhs.resourceID;
+			});
+
+			for (size_t begin = 0; begin < records.size();) {
+				size_t end = begin + 1;
+				while (end < records.size() && records[end].dagResourceIndex == records[begin].dagResourceIndex) {
+					++end;
+				}
+
+				bool hasUav = false;
+				bool contributesToDag = false;
+				bool hasWrite = false;
+				for (size_t i = begin; i < end; ++i) {
+					hasUav = hasUav || records[i].uav;
+					contributesToDag = contributesToDag || records[i].contributesToDag;
+					hasWrite = hasWrite || records[i].write;
+				}
+
+				summary.touchedResourceIDs.push_back(records[begin].resourceID);
+				if (hasUav) {
+					summary.uavResourceIDs.push_back(records[begin].resourceID);
+				}
+				if (contributesToDag) {
+					summary.dagAccesses.push_back(NodeAccess{
+						.resourceIndex = records[begin].dagResourceIndex,
+						.kind = hasWrite ? AccessKind::Write : AccessKind::Read,
+					});
+				}
+
+				begin = end;
+			}
 		});
 	}
 }
@@ -934,6 +956,13 @@ void RenderGraph::RebuildSchedulingEquivalentIDCache(const std::unordered_set<ui
 	ZoneScopedN("RenderGraph::RebuildSchedulingEquivalentIDCache");
 	m_schedulingEquivalentIDsCache.clear();
 	m_schedulingEquivalentIDsCache.reserve(resourceIDs.size());
+
+	if (schedulingPlacementRangesByID.empty()) {
+		for (uint64_t resourceID : resourceIDs) {
+			m_schedulingEquivalentIDsCache.emplace(resourceID, std::vector<uint64_t>{ resourceID });
+		}
+		return;
+	}
 
 	for (uint64_t resourceID : resourceIDs) {
 		m_schedulingEquivalentIDsCache.emplace(resourceID, BuildSchedulingEquivalentIDs(resourceID));
@@ -3519,8 +3548,10 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 		return nodeIt->second;
 	};
 
-	std::unordered_set<uint64_t> scratchTransitioned;
-	std::unordered_set<size_t> scratchFallback;
+	FrameEpochSet scratchTransitioned;
+	scratchTransitioned.Initialize(m_frameSchedulingResourceCount);
+	FrameEpochSet scratchFallback;
+	scratchFallback.Initialize(m_frameSchedulingResourceCount);
 	std::vector<ResourceTransition> scratchTransitions;
 	std::vector<ResourceTransition> ignoredTransitions;
 	std::vector<uint64_t> latestSignalFenceByQueue(queueCount, 0);
@@ -3702,8 +3733,8 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 	auto ensureSegmentInputs = [&](const CachedReplaySegment& segment) -> bool {
 		ZoneScopedN("RenderGraph::Replay::EnsureSegmentInputs");
 		pendingSegmentInputWaits.clear();
-		scratchTransitioned.clear();
-		scratchFallback.clear();
+		scratchTransitioned.Clear();
+		scratchFallback.Clear();
 		if (segment.contract.inputRequirements.empty()) {
 			return true;
 		}
@@ -3819,6 +3850,7 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 				.range = input.range,
 				.state = input.requiredState,
 				.isUAV = IsUAVState(input.requiredState),
+				.isWholeResource = IsWholeResourceRange(input.range, input.resource),
 				.equivalentResourceIndices = nullptr,
 			};
 			AddTransition(
@@ -5008,10 +5040,24 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 
 void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHostExecutionData* hostData) {
 	ZoneScopedN("RenderGraph::CompileFrame");
+	BeginCompileProfileFrame(frameIndex);
+	auto endCompileProfileFrame = [this](RenderGraph* graph) {
+		if (graph) {
+			graph->EndCompileProfileFrame();
+		}
+	};
+	std::unique_ptr<RenderGraph, decltype(endCompileProfileFrame)> compileProfileFrameGuard(this, endCompileProfileFrame);
+	std::optional<rg::profile::ScopedCompileProfileStep> activeCompileProfileStep;
 	const bool traceLifecycle = m_getRenderGraphBatchTraceEnabled && m_getRenderGraphBatchTraceEnabled();
 	auto traceCompileStep = [&](const char* step) {
+		activeCompileProfileStep.reset();
 		if (traceLifecycle) {
 			spdlog::info("RG frame {} compile step: {}", frameIndex, step);
+		}
+		if (m_compileProfileFrameActive
+			&& std::string_view(step) != "begin"
+			&& std::string_view(step) != "complete") {
+			activeCompileProfileStep.emplace(*this, step);
 		}
 	};
 	traceCompileStep("begin");
@@ -5844,42 +5890,84 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		}
 	}
 
-	std::vector<rg::alias::AliasSchedulingNode> aliasNodes;
-	aliasNodes.reserve(nodes.size());
-	for (const auto& node : nodes) {
-		aliasNodes.push_back(rg::alias::AliasSchedulingNode{
-			.passIndex = node.passIndex,
-			.originalOrder = node.originalOrder,
-			.topoRank = node.topoRank,
-			.indegree = node.indegree,
-			.criticality = node.criticality,
-			.out = node.out,
-		});
-	}
-
-	rg::alias::FrameAliasAnalysis aliasAnalysis;
-	{
-		traceCompileStep("BuildAliasFrameAnalysis");
-		ZoneScopedN("RenderGraph::CompileFrame::BuildAliasFrameAnalysis");
-		aliasAnalysis = m_aliasingSubsystem.BuildAliasFrameAnalysis(*this, aliasNodes);
-	}
-	{
-		traceCompileStep("AutoAssignAliasingPoolsFromAnalysis");
-		ZoneScopedN("RenderGraph::CompileFrame::AutoAssignAliasingPoolsFromAnalysis");
-		m_aliasingSubsystem.AutoAssignAliasingPoolsFromAnalysis(*this, aliasAnalysis);
-	}
-	{
-		traceCompileStep("BuildAliasPlanFromAnalysis");
-		ZoneScopedN("RenderGraph::CompileFrame::BuildAliasPlanFromAnalysis");
-		m_aliasingSubsystem.BuildAliasPlanFromAnalysis(*this, aliasAnalysis);
-	}
-	{
-		traceCompileStep("AddCurrentFrameAliasSchedulingEdges");
-		ZoneScopedN("RenderGraph::CompileFrame::AddCurrentFrameAliasSchedulingEdges");
-		if (!AddCurrentFrameAliasSchedulingEdges(nodes)) {
-			spdlog::error("Render graph alias scheduling introduced a dependency cycle! Render graph compilation failed.");
-			throw std::runtime_error("Render graph alias scheduling introduced a dependency cycle");
+	const AutoAliasMode autoAliasMode = m_getAutoAliasMode ? m_getAutoAliasMode() : AutoAliasMode::Off;
+	auto hasManualAliasPoolThisFrame = [&]() {
+		for (uint64_t resourceID : usedResourceIDs) {
+			Resource* resource = nullptr;
+			if (auto it = resourcesByID.find(resourceID); it != resourcesByID.end() && it->second) {
+				resource = it->second.get();
+			}
+			else if (auto it = m_transientFrameResourcesByID.find(resourceID); it != m_transientFrameResourcesByID.end() && it->second) {
+				resource = it->second.get();
+			}
+			resource = UnwrapDynamicResource(resource);
+			if (auto* texture = dynamic_cast<PixelBuffer*>(resource)) {
+				if (texture->GetDescription().allowAlias && texture->GetDescription().aliasingPoolID.has_value()) {
+					return true;
+				}
+			}
+			else if (auto* buffer = dynamic_cast<BufferBase*>(resource)) {
+				if (buffer->IsAliasingAllowed() && buffer->GetAliasingPoolHint().has_value()) {
+					return true;
+				}
+			}
 		}
+		return false;
+	};
+	const bool needsAliasCompile = autoAliasMode != AutoAliasMode::Off || hasManualAliasPoolThisFrame();
+	if (needsAliasCompile) {
+		std::vector<rg::alias::AliasSchedulingNode> aliasNodes;
+		aliasNodes.reserve(nodes.size());
+		for (const auto& node : nodes) {
+			aliasNodes.push_back(rg::alias::AliasSchedulingNode{
+				.passIndex = node.passIndex,
+				.originalOrder = node.originalOrder,
+				.topoRank = node.topoRank,
+				.indegree = node.indegree,
+				.criticality = node.criticality,
+				.out = node.out,
+			});
+		}
+
+		rg::alias::FrameAliasAnalysis aliasAnalysis;
+		{
+			traceCompileStep("BuildAliasFrameAnalysis");
+			ZoneScopedN("RenderGraph::CompileFrame::BuildAliasFrameAnalysis");
+			aliasAnalysis = m_aliasingSubsystem.BuildAliasFrameAnalysis(*this, aliasNodes);
+		}
+		{
+			traceCompileStep("AutoAssignAliasingPoolsFromAnalysis");
+			ZoneScopedN("RenderGraph::CompileFrame::AutoAssignAliasingPoolsFromAnalysis");
+			m_aliasingSubsystem.AutoAssignAliasingPoolsFromAnalysis(*this, aliasAnalysis);
+		}
+		{
+			traceCompileStep("BuildAliasPlanFromAnalysis");
+			ZoneScopedN("RenderGraph::CompileFrame::BuildAliasPlanFromAnalysis");
+			m_aliasingSubsystem.BuildAliasPlanFromAnalysis(*this, aliasAnalysis);
+		}
+		{
+			traceCompileStep("AddCurrentFrameAliasSchedulingEdges");
+			ZoneScopedN("RenderGraph::CompileFrame::AddCurrentFrameAliasSchedulingEdges");
+			if (!AddCurrentFrameAliasSchedulingEdges(nodes)) {
+				spdlog::error("Render graph alias scheduling introduced a dependency cycle! Render graph compilation failed.");
+				throw std::runtime_error("Render graph alias scheduling introduced a dependency cycle");
+			}
+		}
+	}
+	else {
+		traceCompileStep("SkipAliasCompile");
+		ZoneScopedN("RenderGraph::CompileFrame::SkipAliasCompile");
+		aliasMaterializeOptionsByID.clear();
+		aliasActivationPending.clear();
+		aliasPlacementPoolByID.clear();
+		aliasPlacementRangesByID.clear();
+		schedulingPlacementRangesByID.clear();
+		autoAliasPoolByID.clear();
+		m_aliasPlacementRangeByResourceIndex.assign(m_frameSchedulingResourceCount, rg::alias::AliasPlacementRange{});
+		m_hasAliasPlacementByResourceIndex.assign(m_frameSchedulingResourceCount, 0);
+		m_schedulingPlacementRangeByResourceIndex.assign(m_frameSchedulingResourceCount, rg::alias::AliasPlacementRange{});
+		m_hasSchedulingPlacementByResourceIndex.assign(m_frameSchedulingResourceCount, 0);
+		m_aliasActivationPendingByResourceIndex.assign(m_frameSchedulingResourceCount, 0);
 	}
 	{
 		traceCompileStep("RebuildSchedulingEquivalentIDCache");
@@ -5948,8 +6036,8 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		? m_getRenderGraphRegionMode()
 		: rg::runtime::RenderGraphRegionMode::Disabled;
 	const bool regionDiagnosticsEnabled = m_getRenderGraphRegionDiagnosticsEnabled && m_getRenderGraphRegionDiagnosticsEnabled();
-	const bool wantsAuthoritativeReplay =
-		static_cast<uint8_t>(regionMode) >= static_cast<uint8_t>(rg::runtime::RenderGraphRegionMode::ReplayAuthoritative);
+	const bool wantsAuthoritativeReplay = false;
+	(void)regionMode;
 
 	m_lastAuthoritativeReplayAttempted = false;
 	m_lastAuthoritativeReplaySucceeded = false;
@@ -6250,7 +6338,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	}
 	if (!fastReplaySucceeded)
 	{
-		if (static_cast<uint8_t>(regionMode) >= static_cast<uint8_t>(rg::runtime::RenderGraphRegionMode::ReplayAuthoritative)) {
+		if (wantsAuthoritativeReplay) {
 			traceCompileStep("ReplayCurrentFrameSegmentsAsAuthoritative");
 			ZoneScopedN("RenderGraph::CompileFrame::ReplayCurrentFrameSegmentsAsAuthoritative");
 
@@ -7049,6 +7137,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		ZoneScopedN("RenderGraph::CompileFrame::WriteVramUsageDebugDump");
 		WriteVramUsageDebugDump(frameIndex);
 	}
+	RecordCompileProfileCounters(nodes, usedResourceIDs);
 	traceCompileStep("complete");
 
 #if BUILD_TYPE == BUILD_TYPE_DEBUG

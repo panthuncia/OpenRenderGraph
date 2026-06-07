@@ -1804,8 +1804,14 @@ bool RenderGraph::BuildDependencyGraph(
 	ZoneScopedN("RenderGraph::BuildDependencyGraph");
 	std::vector<SeqState> seq(m_frameDAGResourceCount);
 
-	std::unordered_set<uint64_t> edgeSet;
-	edgeSet.reserve(nodes.size() * 8);
+	std::vector<uint64_t> edgeKeys;
+	edgeKeys.reserve(nodes.size() * 8);
+	auto addEdgeCandidate = [&](size_t from, size_t to) {
+		if (from == to) {
+			return;
+		}
+		edgeKeys.push_back((uint64_t(from) << 32) | uint64_t(to));
+	};
 
 	// build deps in ORIGINAL order
 	for (size_t i = 0; i < nodes.size(); ++i) {
@@ -1825,13 +1831,13 @@ bool RenderGraph::BuildDependencyGraph(
 			auto& s = seq[access.resourceIndex];
 
 			if (access.kind == AccessKind::Read) {
-				if (s.lastWriter) AddEdgeDedup(*s.lastWriter, i, nodes, edgeSet);
+				if (s.lastWriter) addEdgeCandidate(*s.lastWriter, i);
 				s.readsSinceWrite.push_back(i);
 			}
 			else { // Write
-				if (s.lastWriter) AddEdgeDedup(*s.lastWriter, i, nodes, edgeSet);
+				if (s.lastWriter) addEdgeCandidate(*s.lastWriter, i);
 				for (size_t r : s.readsSinceWrite)
-					AddEdgeDedup(r, i, nodes, edgeSet);
+					addEdgeCandidate(r, i);
 				s.readsSinceWrite.clear();
 				s.lastWriter = i;
 			}
@@ -1841,7 +1847,17 @@ bool RenderGraph::BuildDependencyGraph(
 	// Apply explicit edges (e.g. "After(passName)")
 	for (auto const& e : explicitEdges) {
 		if (e.first >= nodes.size() || e.second >= nodes.size()) continue;
-		AddEdgeDedup(e.first, e.second, nodes, edgeSet);
+		addEdgeCandidate(e.first, e.second);
+	}
+
+	std::sort(edgeKeys.begin(), edgeKeys.end());
+	edgeKeys.erase(std::unique(edgeKeys.begin(), edgeKeys.end()), edgeKeys.end());
+	for (uint64_t key : edgeKeys) {
+		const size_t from = static_cast<size_t>(key >> 32);
+		const size_t to = static_cast<size_t>(key & 0xffffffffull);
+		nodes[from].out.push_back(to);
+		nodes[to].in.push_back(from);
+		nodes[to].indegree++;
 	}
 
 	return FinalizeDependencyGraph(nodes);
@@ -2025,8 +2041,8 @@ void RenderGraph::CommitPassToBatch(
 
 	unsigned int currentBatchIndex,
 	PassBatch& currentBatch,
-	std::unordered_set<uint64_t>& scratchTransitioned,
-	std::unordered_set<size_t>& scratchFallback,
+	RenderGraph::FrameEpochSet& scratchTransitioned,
+	RenderGraph::FrameEpochSet& scratchFallback,
 	std::vector<ResourceTransition>& scratchTransitions)
 {
 	ZoneScopedN("RenderGraph::CommitPassToBatch");
@@ -2037,11 +2053,14 @@ void RenderGraph::CommitPassToBatch(
 	const size_t queueCount = currentBatch.QueueCount();
 	const size_t gfxSlot = QueueIndex(QueueKind::Graphics);
 	const auto& passSummary = rg.m_framePassSchedulingSummaries[node.passIndex];
-	scratchTransitioned.clear();
+	scratchTransitioned.Clear();
+	scratchTransitioned.Reserve(passSummary.requirements.size());
 	auto& resourcesTransitionedThisPass = scratchTransitioned;
 
-	scratchFallback.clear();
+	scratchFallback.Clear();
+	scratchFallback.Reserve(passSummary.requirements.size());
 	auto& fallbackResourceIndices = scratchFallback;
+	scratchTransitions.reserve(1);
 	rg.ProcessResourceRequirements(
 		passQueueSlot,
 		passSummary.requirements,
@@ -2055,11 +2074,11 @@ void RenderGraph::CommitPassToBatch(
 	// For fallback transitions delegated to the graphics queue in this batch's
 	// BeforePasses, update graphics transition tracking and wait on prior producers.
 	auto handleFallbackTransitions = [&]() {
-		if (fallbackResourceIndices.empty()) {
+		if (fallbackResourceIndices.Empty()) {
 			return;
 		}
 
-		for (size_t resourceIndex : fallbackResourceIndices) {
+		for (size_t resourceIndex : fallbackResourceIndices.Values()) {
 			rg.RecordFrameQueueTransitionBatch(gfxSlot, resourceIndex, currentBatchIndex);
 		}
 
@@ -2069,7 +2088,7 @@ void RenderGraph::CommitPassToBatch(
 			}
 
 			int latestBatch = -1;
-			for (size_t resourceIndex : fallbackResourceIndices) {
+			for (size_t resourceIndex : fallbackResourceIndices.Values()) {
 				latestBatch = std::max(latestBatch, static_cast<int>(GetFrameQueueHistoryValue(m_frameQueueLastTransitionBatch, qi, resourceIndex)));
 				latestBatch = std::max(latestBatch, static_cast<int>(GetFrameQueueHistoryValue(m_frameQueueLastUsageBatch, qi, resourceIndex)));
 			}
@@ -2085,6 +2104,7 @@ void RenderGraph::CommitPassToBatch(
 		}
 	};
 
+	std::vector<ResourceTransition> ignoredInternalTransitions;
 	auto applyInternalTransitions = [&](const auto& pass) {
 		const auto& denseTransitions = passSummary.internalTransitions;
 		if (pass.resources.internalTransitions.size() != denseTransitions.size()) {
@@ -2094,14 +2114,14 @@ void RenderGraph::CommitPassToBatch(
 		for (size_t transitionIndex = 0; transitionIndex < denseTransitions.size(); ++transitionIndex) {
 			const auto& exit = pass.resources.internalTransitions[transitionIndex];
 			const auto& denseTransition = denseTransitions[transitionIndex];
-			std::vector<ResourceTransition> ignoredTransitions;
+			ignoredInternalTransitions.clear();
 			auto* pRes = exit.first.resource.IsEphemeral() ? exit.first.resource.GetEphemeralPtr() : _registry.Resolve(exit.first.resource);
 			auto& compileResourceState = GetOrCreateFrameCompileResourceState(
 				denseTransition.resourceIndex,
 				pRes,
 				denseTransition.resourceID);
 			pRes = compileResourceState.resource ? compileResourceState.resource : pRes;
-			compileResourceState.tracker.Apply(exit.first.range, pRes, exit.second, ignoredTransitions);
+			compileResourceState.tracker.Apply(exit.first.range, pRes, exit.second, ignoredInternalTransitions);
 			if (IsWholeResourceRange(exit.first.range, exit.first.resource)) {
 				compileResourceState.fastState.valid = true;
 				compileResourceState.fastState.wholeResourceOnly = true;
@@ -2177,7 +2197,6 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 	auto openNewBatch = [&]() -> PassBatch {
 		const size_t queueCount = rg.m_queueRegistry.SlotCount();
 		PassBatch b(queueCount);
-		b.passBatchTrackersByResourceIndex.assign(rg.m_frameSchedulingResourceCount, nullptr);
 		for (size_t qi = 0; qi < queueCount; ++qi) {
 			b.SetQueueSignalFenceValue(RenderGraph::BatchSignalPhase::AfterTransitions, qi, rg.GetNextQueueFenceValue(qi));
 			b.SetQueueSignalFenceValue(RenderGraph::BatchSignalPhase::AfterExecution, qi, rg.GetNextQueueFenceValue(qi));
@@ -2195,8 +2214,10 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 	batchBuildState.Initialize(nodes.size(), queueCount, rg.m_frameSchedulingResourceCount);
 
 	// Scratch sets reused across CommitPassToBatch calls to avoid per-call allocation
-	std::unordered_set<uint64_t> scratchTransitioned;
-	std::unordered_set<size_t> scratchFallback;
+	FrameEpochSet scratchTransitioned;
+	scratchTransitioned.Initialize(rg.m_frameSchedulingResourceCount);
+	FrameEpochSet scratchFallback;
+	scratchFallback.Initialize(rg.m_frameSchedulingResourceCount);
 	std::vector<ResourceTransition> scratchTransitions;
 	const double autoGraphicsBias = rg.m_getQueueSchedulingAutoGraphicsBias ? static_cast<double>(rg.m_getQueueSchedulingAutoGraphicsBias()) : 2.5;
 	const double asyncOverlapBonus = rg.m_getQueueSchedulingAsyncOverlapBonus ? static_cast<double>(rg.m_getQueueSchedulingAsyncOverlapBonus()) : 3.0;
@@ -2783,8 +2804,8 @@ void RenderGraph::AddTransition(
 	size_t passQueueSlot,
 	std::string_view passName,
 	const DenseRequirementSummary& requirement,
-	std::unordered_set<uint64_t>& outTransitionedResourceIDs,
-	std::unordered_set<size_t>& outFallbackResourceIndices,
+	FrameEpochSet& outTransitionedResourceIndices,
+	FrameEpochSet& outFallbackResourceIndices,
 	std::vector<ResourceTransition>& scratchTransitions)
 {
 	ZoneScopedN("RenderGraph::AddTransition");
@@ -2802,7 +2823,7 @@ void RenderGraph::AddTransition(
 		passName,
 		requirement,
 		requiredState,
-		outTransitionedResourceIDs,
+		outTransitionedResourceIndices,
 		outFallbackResourceIndices,
 		scratchTransitions);
 }
@@ -2831,13 +2852,16 @@ bool RenderGraph::TryAddTransitionFastNoOp(
 	if (!entry.fastState.valid || !entry.fastState.wholeResourceOnly) {
 		return false;
 	}
-	if (!IsWholeResourceRange(requirement.range, requirement.resource)) {
+	if (!requirement.isWholeResource) {
 		return false;
 	}
 	if (!StatesExactlyEqual(entry.fastState.state, requiredState)) {
 		return false;
 	}
 
+	if (requirement.resourceIndex >= currentBatch.passBatchTrackersByResourceIndex.size()) {
+		currentBatch.passBatchTrackersByResourceIndex.resize(m_frameSchedulingResourceCount, nullptr);
+	}
 	currentBatch.passBatchTrackersByResourceIndex[requirement.resourceIndex] = &entry.tracker;
 	return true;
 }
@@ -2849,8 +2873,8 @@ void RenderGraph::AddTransitionSlowPath(
 	std::string_view passName,
 	const DenseRequirementSummary& requirement,
 	ResourceState requiredState,
-	std::unordered_set<uint64_t>& outTransitionedResourceIDs,
-	std::unordered_set<size_t>& outFallbackResourceIndices,
+	RenderGraph::FrameEpochSet& outTransitionedResourceIndices,
+	RenderGraph::FrameEpochSet& outFallbackResourceIndices,
 	std::vector<ResourceTransition>& scratchTransitions)
 {
 	ZoneScopedN("RenderGraph::AddTransitionSlowPath");
@@ -2926,7 +2950,7 @@ void RenderGraph::AddTransitionSlowPath(
 		++debugStats->callCount;
 	}
 	auto& compileTracker = compileResourceState.tracker;
-	const bool isWholeResourceRequirement = IsWholeResourceRange(requirement.range, resource);
+	const bool isWholeResourceRequirement = requirement.isWholeResource;
 
 	bool isAliasActivation = false;
 	if (requirement.resourceIndex < m_aliasActivationPendingByResourceIndex.size() && m_aliasActivationPendingByResourceIndex[requirement.resourceIndex] != 0) {
@@ -2982,7 +3006,14 @@ void RenderGraph::AddTransitionSlowPath(
 		m_aliasActivationPendingByResourceIndex[requirement.resourceIndex] = 0;
 	}
 	else {
-		compileTracker.Apply(requirement.range, pRes, requiredState, transitions);
+		if (isWholeResourceRequirement && fastState.wholeResourceOnly) {
+			if (!compileTracker.ApplyWholeResourceFast(requirement.range, pRes, requiredState, transitions)) {
+				compileTracker.Apply(requirement.range, pRes, requiredState, transitions);
+			}
+		}
+		else {
+			compileTracker.Apply(requirement.range, pRes, requiredState, transitions);
+		}
 	}
 
 	if (isWholeResourceRequirement) {
@@ -3003,9 +3034,12 @@ void RenderGraph::AddTransitionSlowPath(
 	}
 
 	if (!transitions.empty()) {
-		outTransitionedResourceIDs.insert(requirement.resourceID);
+		outTransitionedResourceIndices.Insert(requirement.resourceIndex);
 	}
 
+	if (requirement.resourceIndex >= currentBatch.passBatchTrackersByResourceIndex.size()) {
+		currentBatch.passBatchTrackersByResourceIndex.resize(m_frameSchedulingResourceCount, nullptr);
+	}
 	currentBatch.passBatchTrackersByResourceIndex[requirement.resourceIndex] = &compileTracker; // We will need to check subsequent passes against this
 
 	if (transitions.empty()) {
@@ -3112,7 +3146,7 @@ void RenderGraph::AddTransitionSlowPath(
 				debugStats->beforePassTransitionCount += transitions.size();
 				debugStats->graphicsFallbackTransitionCount += transitions.size();
 			}
-			outFallbackResourceIndices.insert(requirement.resourceIndex);
+			outFallbackResourceIndices.Insert(requirement.resourceIndex);
 		}
 		else {
 			for (auto& transition : transitions) {
@@ -3167,7 +3201,7 @@ void RenderGraph::AddTransitionSlowPath(
 			debugStats->beforePassTransitionCount += transitions.size();
 			debugStats->graphicsFallbackTransitionCount += transitions.size();
 		}
-		outFallbackResourceIndices.insert(requirement.resourceIndex);
+		outFallbackResourceIndices.Insert(requirement.resourceIndex);
 	}
 	else {
 		for (auto& transition : transitions) {
@@ -3185,8 +3219,9 @@ void RenderGraph::ProcessResourceRequirements(
 	const std::vector<DenseRequirementSummary>& resourceRequirements,
 	std::string_view passName,
 	unsigned int batchIndex,
-	PassBatch& currentBatch, std::unordered_set<uint64_t>& outTransitionedResourceIDs,
-	std::unordered_set<size_t>& outFallbackResourceIndices,
+	PassBatch& currentBatch,
+	FrameEpochSet& outTransitionedResourceIndices,
+	FrameEpochSet& outFallbackResourceIndices,
 	std::vector<ResourceTransition>& scratchTransitions) {
 	ZoneScopedN("RenderGraph::ProcessResourceRequirements");
 	const bool enableReadOnlyUniformTransitionElision =
@@ -3208,15 +3243,18 @@ void RenderGraph::ProcessResourceRequirements(
 				resource,
 				resourceRequirement.resourceID);
 			if (!compileResourceState.readOnlyUniformTransitionChecked) {
-				AddTransition(batchIndex, currentBatch, passQueueSlot, passName, resourceRequirement, outTransitionedResourceIDs, outFallbackResourceIndices, scratchTransitions);
+				AddTransition(batchIndex, currentBatch, passQueueSlot, passName, resourceRequirement, outTransitionedResourceIndices, outFallbackResourceIndices, scratchTransitions);
 				compileResourceState.readOnlyUniformTransitionChecked = true;
 			}
 			else {
+				if (resourceRequirement.resourceIndex >= currentBatch.passBatchTrackersByResourceIndex.size()) {
+					currentBatch.passBatchTrackersByResourceIndex.resize(m_frameSchedulingResourceCount, nullptr);
+				}
 				currentBatch.passBatchTrackersByResourceIndex[resourceRequirement.resourceIndex] = &compileResourceState.tracker;
 			}
 		}
 		else {
-			AddTransition(batchIndex, currentBatch, passQueueSlot, passName, resourceRequirement, outTransitionedResourceIDs, outFallbackResourceIndices, scratchTransitions);
+			AddTransition(batchIndex, currentBatch, passQueueSlot, passName, resourceRequirement, outTransitionedResourceIndices, outFallbackResourceIndices, scratchTransitions);
 		}
 
 		if (AccessTypeIsWriteType(resourceRequirement.state.access)) {
@@ -3409,6 +3447,138 @@ void RenderGraph::ShutdownOwnedState() {
 	m_readbackService.reset();
 	m_descriptorService.reset();
 	m_renderGraphSettingsService.reset();
+}
+
+namespace {
+uint64_t CompileProfileNowNs() noexcept {
+	const auto now = std::chrono::steady_clock::now().time_since_epoch();
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
+}
+}
+
+void RenderGraph::SetCompileProfileSink(std::shared_ptr<rg::profile::ICompileProfileSink> sink) {
+	m_compileProfileSink = std::move(sink);
+}
+
+void RenderGraph::SetCompileProfileEnabled(bool enabled) noexcept {
+	m_compileProfileEnabled = enabled;
+	if (!enabled) {
+		m_compileProfileFrameActive = false;
+	}
+}
+
+void RenderGraph::BeginCompileProfileFrame(uint8_t frameIndex) {
+	if (!m_compileProfileEnabled) {
+		m_compileProfileFrameActive = false;
+		return;
+	}
+
+	m_activeCompileProfileFrame.Reset(frameIndex, ++m_compileProfileSerial);
+	m_compileProfileFrameStartedAtNs = CompileProfileNowNs();
+	m_lastMaterializeCandidateCount = 0;
+	m_compileProfileFrameActive = true;
+}
+
+void RenderGraph::EndCompileProfileFrame() {
+	if (!m_compileProfileFrameActive) {
+		return;
+	}
+
+	m_activeCompileProfileFrame.totalDurationNs.store(
+		CompileProfileNowNs() - m_compileProfileFrameStartedAtNs,
+		std::memory_order_relaxed);
+
+	TracyPlot("ORG.CompileProfile.TotalNs", static_cast<int64_t>(m_activeCompileProfileFrame.totalDurationNs.load(std::memory_order_relaxed)));
+	TracyPlot("ORG.CompileProfile.PassCount", static_cast<int64_t>(m_activeCompileProfileFrame.passCount));
+	TracyPlot("ORG.CompileProfile.ResourceCount", static_cast<int64_t>(m_activeCompileProfileFrame.resourceCount));
+	TracyPlot("ORG.CompileProfile.RequirementCount", static_cast<int64_t>(m_activeCompileProfileFrame.requirementCount));
+	TracyPlot("ORG.CompileProfile.DagEdgeCount", static_cast<int64_t>(m_activeCompileProfileFrame.dagEdgeCount));
+	TracyPlot("ORG.CompileProfile.BatchCount", static_cast<int64_t>(m_activeCompileProfileFrame.batchCount));
+	TracyPlot("ORG.CompileProfile.TransitionCount", static_cast<int64_t>(m_activeCompileProfileFrame.transitionCount));
+	TracyPlot("ORG.CompileProfile.QueueWaitCount", static_cast<int64_t>(m_activeCompileProfileFrame.queueWaitCount));
+	TracyPlot("ORG.CompileProfile.QueueSignalCount", static_cast<int64_t>(m_activeCompileProfileFrame.queueSignalCount));
+	TracyPlot("ORG.CompileProfile.AliasPlacementCount", static_cast<int64_t>(m_activeCompileProfileFrame.aliasPlacementCount));
+	TracyPlot("ORG.CompileProfile.MaterializationCandidateCount", static_cast<int64_t>(m_activeCompileProfileFrame.materializationCandidateCount));
+	TracyPlot("ORG.CompileProfile.AllocatedBytes", static_cast<int64_t>([&]() {
+		uint64_t total = 0;
+		for (const auto& step : m_activeCompileProfileFrame.steps) {
+			total += step.allocations.allocatedBytes.load(std::memory_order_relaxed);
+		}
+		return total;
+	}()));
+	TracyPlot("ORG.CompileProfile.PeakLiveAllocationBytes", static_cast<int64_t>(m_activeCompileProfileFrame.peakLiveAllocationBytes.load(std::memory_order_relaxed)));
+
+	m_lastCompileProfileFrame = m_activeCompileProfileFrame;
+	if (m_compileProfileSink) {
+		m_compileProfileSink->OnCompileProfileFrame(m_lastCompileProfileFrame);
+	}
+	m_compileProfileFrameActive = false;
+}
+
+uint32_t RenderGraph::BeginCompileProfileStep(const char* stepName) {
+	if (!m_compileProfileFrameActive || !stepName || !*stepName) {
+		return UINT32_MAX;
+	}
+	m_activeCompileProfileFrame.steps.emplace_back(stepName);
+	return static_cast<uint32_t>(m_activeCompileProfileFrame.steps.size() - 1);
+}
+
+void RenderGraph::EndCompileProfileStep(uint32_t stepIndex, uint64_t durationNs) {
+	if (!m_compileProfileFrameActive || stepIndex >= m_activeCompileProfileFrame.steps.size()) {
+		return;
+	}
+	m_activeCompileProfileFrame.steps[stepIndex].durationNs.store(durationNs, std::memory_order_relaxed);
+}
+
+void RenderGraph::RecordCompileProfileCounters(const std::vector<Node>& nodes, const std::unordered_set<uint64_t>& usedResourceIDs) {
+	if (!m_compileProfileFrameActive) {
+		return;
+	}
+
+	uint64_t requirementCount = 0;
+	for (const auto& summary : m_framePassSchedulingSummaries) {
+		requirementCount += summary.requirements.size();
+	}
+
+	uint64_t dagEdgeCount = 0;
+	for (const auto& node : nodes) {
+		dagEdgeCount += node.out.size();
+	}
+
+	uint64_t transitionCount = 0;
+	uint64_t queueWaitCount = 0;
+	uint64_t queueSignalCount = 0;
+	for (const auto& batch : batches) {
+		const size_t queueCount = batch.QueueCount();
+		for (size_t queueIndex = 0; queueIndex < queueCount; ++queueIndex) {
+			for (size_t phaseIndex = 0; phaseIndex < PassBatch::kTransitionPhaseCount; ++phaseIndex) {
+				transitionCount += batch.queueTransitions[phaseIndex][queueIndex].size();
+			}
+			for (size_t phaseIndex = 0; phaseIndex < PassBatch::kSignalPhaseCount; ++phaseIndex) {
+				if (batch.queueSignalEnabled[phaseIndex][queueIndex]) {
+					++queueSignalCount;
+				}
+			}
+			for (size_t waitPhaseIndex = 0; waitPhaseIndex < PassBatch::kWaitPhaseCount; ++waitPhaseIndex) {
+				for (size_t srcIndex = 0; srcIndex < queueCount; ++srcIndex) {
+					if (batch.queueWaitEnabled[waitPhaseIndex][queueIndex][srcIndex]) {
+						++queueWaitCount;
+					}
+				}
+			}
+		}
+	}
+
+	m_activeCompileProfileFrame.passCount = m_framePasses.size();
+	m_activeCompileProfileFrame.resourceCount = m_frameSchedulingResourceCount != 0 ? m_frameSchedulingResourceCount : usedResourceIDs.size();
+	m_activeCompileProfileFrame.requirementCount = requirementCount;
+	m_activeCompileProfileFrame.dagEdgeCount = dagEdgeCount;
+	m_activeCompileProfileFrame.batchCount = batches.size();
+	m_activeCompileProfileFrame.transitionCount = transitionCount;
+	m_activeCompileProfileFrame.queueWaitCount = queueWaitCount;
+	m_activeCompileProfileFrame.queueSignalCount = queueSignalCount;
+	m_activeCompileProfileFrame.aliasPlacementCount = aliasPlacementRangesByID.size();
+	m_activeCompileProfileFrame.materializationCandidateCount = m_lastMaterializeCandidateCount;
 }
 namespace {
 bool HasLiveCompileResourceBacking(Resource* resource) {
@@ -3794,6 +3964,7 @@ void RenderGraph::RebuildFramePassSchedulingSummaries() {
 			denseRequirement.range = req.range;
 			denseRequirement.state = req.state;
 			denseRequirement.isUAV = req.isUAV;
+			denseRequirement.isWholeResource = IsWholeResourceRange(req.range, req.resource);
 			if (*resourceIndex < m_equivalentResourceIndicesByResourceIndex.size()) {
 				denseRequirement.equivalentResourceIndices = &m_equivalentResourceIndicesByResourceIndex[*resourceIndex];
 			}
@@ -5204,7 +5375,7 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(CopyPassAndResources& p, u
 std::tuple<int, int, int> RenderGraph::GetBatchesToWaitOn(
 	const ComputePassAndResources& pass,
 	size_t sourceQueueSlot,
-	std::unordered_set<uint64_t> const& resourcesTransitionedThisPass)
+	const FrameEpochSet& resourcesTransitionedThisPass)
 {
 	ZoneScopedN("RenderGraph::GetBatchesToWaitOn(Compute)");
 	if (!pass.name.empty()) {
@@ -5228,13 +5399,12 @@ std::tuple<int, int, int> RenderGraph::GetBatchesToWaitOn(
 		processResource(req.resourceHandleAndRange.resource);
 	});
 
-	for (auto& transitionID : resourcesTransitionedThisPass) { // We only need to wait on the latest usage for resources that will be transitioned in this batch
-		for (auto rid : GetSchedulingEquivalentIDsCached(transitionID)) {
-			auto resourceIndex = TryGetFrameSchedulingResourceIndex(rid);
-			if (!resourceIndex.has_value()) {
-				continue;
+	for (size_t resourceIndex : resourcesTransitionedThisPass.Values()) { // We only need to wait on the latest usage for resources that will be transitioned in this batch
+		latestUsage = std::max(latestUsage, (int)GetFrameQueueHistoryValue(m_frameQueueLastUsageBatch, sourceQueueSlot, resourceIndex));
+		if (resourceIndex < m_equivalentResourceIndicesByResourceIndex.size()) {
+			for (size_t equivalentResourceIndex : m_equivalentResourceIndicesByResourceIndex[resourceIndex]) {
+				latestUsage = std::max(latestUsage, (int)GetFrameQueueHistoryValue(m_frameQueueLastUsageBatch, sourceQueueSlot, equivalentResourceIndex));
 			}
-			latestUsage = std::max(latestUsage, (int)GetFrameQueueHistoryValue(m_frameQueueLastUsageBatch, sourceQueueSlot, *resourceIndex));
 		}
 	}
 
@@ -5244,7 +5414,7 @@ std::tuple<int, int, int> RenderGraph::GetBatchesToWaitOn(
 std::tuple<int, int, int> RenderGraph::GetBatchesToWaitOn(
 	const RenderPassAndResources& pass,
 	size_t sourceQueueSlot,
-	std::unordered_set<uint64_t> const& resourcesTransitionedThisPass)
+	const FrameEpochSet& resourcesTransitionedThisPass)
 {
 	ZoneScopedN("RenderGraph::GetBatchesToWaitOn(Render)");
 	if (!pass.name.empty()) {
@@ -5268,13 +5438,12 @@ std::tuple<int, int, int> RenderGraph::GetBatchesToWaitOn(
 		processResource(req.resourceHandleAndRange.resource);
 	});
 
-	for (auto& transitionID : resourcesTransitionedThisPass) { // We only need to wait on the latest usage for resources that will be transitioned in this batch
-		for (auto rid : GetSchedulingEquivalentIDsCached(transitionID)) {
-			auto resourceIndex = TryGetFrameSchedulingResourceIndex(rid);
-			if (!resourceIndex.has_value()) {
-				continue;
+	for (size_t resourceIndex : resourcesTransitionedThisPass.Values()) { // We only need to wait on the latest usage for resources that will be transitioned in this batch
+		latestUsage = std::max(latestUsage, (int)GetFrameQueueHistoryValue(m_frameQueueLastUsageBatch, sourceQueueSlot, resourceIndex));
+		if (resourceIndex < m_equivalentResourceIndicesByResourceIndex.size()) {
+			for (size_t equivalentResourceIndex : m_equivalentResourceIndicesByResourceIndex[resourceIndex]) {
+				latestUsage = std::max(latestUsage, (int)GetFrameQueueHistoryValue(m_frameQueueLastUsageBatch, sourceQueueSlot, equivalentResourceIndex));
 			}
-			latestUsage = std::max(latestUsage, (int)GetFrameQueueHistoryValue(m_frameQueueLastUsageBatch, sourceQueueSlot, *resourceIndex));
 		}
 	}
 
@@ -5284,7 +5453,7 @@ std::tuple<int, int, int> RenderGraph::GetBatchesToWaitOn(
 std::tuple<int, int, int> RenderGraph::GetBatchesToWaitOn(
 	const CopyPassAndResources& pass,
 	size_t sourceQueueSlot,
-	std::unordered_set<uint64_t> const& resourcesTransitionedThisPass)
+	const FrameEpochSet& resourcesTransitionedThisPass)
 {
 	ZoneScopedN("RenderGraph::GetBatchesToWaitOn(Copy)");
 	if (!pass.name.empty()) {
@@ -5308,13 +5477,12 @@ std::tuple<int, int, int> RenderGraph::GetBatchesToWaitOn(
 		processResource(req.resourceHandleAndRange.resource);
 	});
 
-	for (auto& transitionID : resourcesTransitionedThisPass) {
-		for (auto rid : GetSchedulingEquivalentIDsCached(transitionID)) {
-			auto resourceIndex = TryGetFrameSchedulingResourceIndex(rid);
-			if (!resourceIndex.has_value()) {
-				continue;
+	for (size_t resourceIndex : resourcesTransitionedThisPass.Values()) {
+		latestUsage = std::max(latestUsage, (int)GetFrameQueueHistoryValue(m_frameQueueLastUsageBatch, sourceQueueSlot, resourceIndex));
+		if (resourceIndex < m_equivalentResourceIndicesByResourceIndex.size()) {
+			for (size_t equivalentResourceIndex : m_equivalentResourceIndicesByResourceIndex[resourceIndex]) {
+				latestUsage = std::max(latestUsage, (int)GetFrameQueueHistoryValue(m_frameQueueLastUsageBatch, sourceQueueSlot, equivalentResourceIndex));
 			}
-			latestUsage = std::max(latestUsage, (int)GetFrameQueueHistoryValue(m_frameQueueLastUsageBatch, sourceQueueSlot, *resourceIndex));
 		}
 	}
 
@@ -5439,24 +5607,47 @@ void RenderGraph::MaterializeUnmaterializedResources(const std::unordered_set<ui
 
 	// Collect all unique {id, resource*} items to materialize
 	std::vector<std::pair<uint64_t, Resource*>> items;
-	items.reserve(resourcesByID.size() + m_transientFrameResourcesByID.size());
+	items.reserve(onlyResourceIDs ? onlyResourceIDs->size() : resourcesByID.size() + m_transientFrameResourcesByID.size());
 	std::unordered_set<uint64_t> seen;
 
-	for (auto& [id, resource] : resourcesByID) {
-		if (seen.insert(id).second && resource) {
-			items.emplace_back(id, resource.get());
+	if (onlyResourceIDs) {
+		seen.reserve(onlyResourceIDs->size() * 2);
+		for (uint64_t id : *onlyResourceIDs) {
+			if (!seen.insert(id).second) {
+				continue;
+			}
+			if (auto it = resourcesByID.find(id); it != resourcesByID.end() && it->second) {
+				items.emplace_back(id, it->second.get());
+				continue;
+			}
+			if (auto it = m_transientFrameResourcesByID.find(id); it != m_transientFrameResourcesByID.end() && it->second) {
+				items.emplace_back(id, it->second.get());
+				continue;
+			}
+			seen.erase(id);
 		}
 	}
+	else {
+		seen.reserve(items.capacity());
+		for (auto& [id, resource] : resourcesByID) {
+			if (seen.insert(id).second && resource) {
+				items.emplace_back(id, resource.get());
+			}
+		}
 
-	for (auto& [id, resource] : m_transientFrameResourcesByID) {
-		if (resourcesByID.contains(id)) continue;
-		if (seen.insert(id).second && resource) {
-			items.emplace_back(id, resource.get());
+		for (auto& [id, resource] : m_transientFrameResourcesByID) {
+			if (resourcesByID.contains(id)) continue;
+			if (seen.insert(id).second && resource) {
+				items.emplace_back(id, resource.get());
+			}
 		}
 	}
 
 	auto collectFromHandle = [&](const ResourceRegistry::RegistryHandle& handle) {
 		const uint64_t id = handle.GetGlobalResourceID();
+		if (onlyResourceIDs && onlyResourceIDs->find(id) == onlyResourceIDs->end()) {
+			return;
+		}
 		if (!seen.insert(id).second) return;
 		Resource* resource = handle.IsEphemeral() ? handle.GetEphemeralPtr() : _registry.Resolve(handle);
 		if (resource) {
@@ -5496,6 +5687,7 @@ void RenderGraph::MaterializeUnmaterializedResources(const std::unordered_set<ui
 	}
 
 	// Parallel materialize phase
+	m_lastMaterializeCandidateCount = items.size();
 	struct GenerationResult {
 		uint64_t id = 0;
 		uint64_t generation = 0;
@@ -8700,7 +8892,9 @@ bool RenderGraph::IsNewBatchNeeded(
 		if (requirement.resourceIndex < passBatchTrackersByResourceIndex.size()) {
 			tracker = passBatchTrackersByResourceIndex[requirement.resourceIndex];
 		}
-		if (tracker && tracker->WouldModify(requirement.range, wantState)) {
+		if (tracker && (requirement.isWholeResource
+			? tracker->WouldModifyWholeResourceFast(wantState)
+			: tracker->WouldModify(requirement.range, wantState))) {
 			return true;
 		}
 		// first-use in this batch never forces a split.

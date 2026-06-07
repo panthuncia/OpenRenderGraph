@@ -115,6 +115,11 @@ public:
         std::vector<ResourceTransition>& out);
 
     bool WouldModify(const RangeSpec& want, const ResourceState& newState) const;
+    bool WouldModifyWholeResourceFast(const ResourceState& newState) const noexcept;
+    bool ApplyWholeResourceFast(const RangeSpec& wholeRange,
+        Resource* pRes,
+        ResourceState newState,
+        std::vector<ResourceTransition>& out);
 
     std::vector<Segment> Flatten(ResourceState const& skipState, bool includeSkipState = false) const;
 

@@ -18,6 +18,18 @@ class GpuBufferBacking;
 
 class BufferView;
 
+class IDeferredBackingResizeClient {
+public:
+    virtual ~IDeferredBackingResizeClient() = default;
+    virtual bool PublishPendingBackingResize(bool wait) = 0;
+    virtual bool HasPendingBackingResize() const = 0;
+    virtual std::string GetDeferredBackingResizeDebugName() const = 0;
+};
+
+void RegisterDeferredBackingResizeClient(IDeferredBackingResizeClient* client);
+void UnregisterDeferredBackingResizeClient(IDeferredBackingResizeClient* client);
+uint32_t PublishReadyDeferredBackingResizes(bool wait = false);
+
 class BufferBase : public GloballyIndexedResource, public BackedResource, public rg::runtime::IUploadPolicyClient {
 public:
     class ScopedBackingMutation {
