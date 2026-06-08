@@ -1125,6 +1125,7 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 	ZoneScopedN("RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis");
 	auto& aliasMaterializeOptionsByID = rg.aliasMaterializeOptionsByID;
 	auto& aliasMaterializeOptionsByResourceIndex = rg.m_aliasMaterializeOptionsByResourceIndex;
+	auto& aliasMaterializeResourceIDs = rg.m_aliasMaterializeResourceIDs;
 	auto& aliasActivationPending = rg.aliasActivationPending;
 	auto& aliasActivationPendingByResourceIndex = rg.m_aliasActivationPendingByResourceIndex;
 	auto& autoAliasPreviousMode = rg.autoAliasPreviousMode;
@@ -1162,6 +1163,10 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 		previouslyAliasedResourceIDs.push_back(resourceID);
 	}
 	aliasMaterializeOptionsByID.clear();
+	aliasMaterializeResourceIDs.clear();
+	if (aliasMaterializeResourceIDs.capacity() < analysis.candidateResourceIndices.size()) {
+		aliasMaterializeResourceIDs.reserve(analysis.candidateResourceIndices.size());
+	}
 	aliasActivationPending.clear();
 	aliasPlacementPoolByID.clear();
 	aliasPlacementRangesByID.clear();
@@ -1208,6 +1213,9 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 	size_t cacheMissNoCachedPlanCount = 0;
 	size_t cacheMissSignatureChangedCount = 0;
 	size_t cacheMissCandidateMismatchCount = 0;
+	auto markMaterializationRequired = [&](uint64_t resourceID) {
+		aliasMaterializeResourceIDs.push_back(resourceID);
+	};
 
 	for (auto& [poolID, poolState] : persistentAliasPools) {
 		(void)poolID;
@@ -2007,6 +2015,7 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 					aliasMaterializeOptionsByID[c.resourceID] = RenderGraph::ResourceMaterializeOptions(options);
 				}
 			}
+			markMaterializationRequired(c.resourceID);
 			aliasPlacementPoolByID[c.resourceID] = poolID;
 			const AliasPlacementRange placementRange{
 				.poolID = poolID,
@@ -2123,11 +2132,13 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 					auto texture = std::dynamic_pointer_cast<PixelBuffer>(itRes->second);
 					if (texture && texture->IsMaterialized()) {
 						texture->Dematerialize();
+						markMaterializationRequired(resourceID);
 					}
 
 					auto buffer = std::dynamic_pointer_cast<BufferBase>(itRes->second);
 					if (buffer && buffer->IsMaterialized()) {
 						buffer->Dematerialize();
+						markMaterializationRequired(resourceID);
 					}
 				}
 			}
@@ -2165,11 +2176,13 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 			auto texture = std::dynamic_pointer_cast<PixelBuffer>(itRes->second);
 			if (texture && texture->IsMaterialized()) {
 				texture->Dematerialize();
+				markMaterializationRequired(resourceID);
 			}
 
 			auto buffer = std::dynamic_pointer_cast<BufferBase>(itRes->second);
 			if (buffer && buffer->IsMaterialized()) {
 				buffer->Dematerialize();
+				markMaterializationRequired(resourceID);
 			}
 		}
 

@@ -608,6 +608,11 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 			m_frameDAGResourceIDsByIndex = m_compileScratchResourceIDs;
 			m_frameDAGResourceIndexByID.clear();
 			m_frameDAGResourceCount = m_frameDAGResourceIDsByIndex.size();
+			m_frameDAGResourcePtrByIndex.assign(m_frameDAGResourceCount, nullptr);
+			m_frameDAGUnmaterializedResourceIndices.clear();
+			if (m_frameDAGUnmaterializedResourceIndices.capacity() < m_frameDAGResourceCount) {
+				m_frameDAGUnmaterializedResourceIndices.reserve(m_frameDAGResourceCount);
+			}
 		}
 
 		auto findDenseDAGResourceIndex = [&](uint64_t resourceID) -> std::optional<size_t> {
@@ -620,18 +625,35 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 
 		{
 			ZoneScopedN("RGPassAccess::AssignDenseDAGIndices");
+			auto captureDenseResourcePtr = [&](uint32_t dagResourceIndex, const ResourceRegistry::RegistryHandle& resource) {
+				if (dagResourceIndex == UINT32_MAX
+					|| dagResourceIndex >= m_frameDAGResourcePtrByIndex.size()
+					|| m_frameDAGResourcePtrByIndex[dagResourceIndex] != nullptr) {
+					return;
+				}
+				Resource* resolvedResource = resource.IsEphemeral()
+					? resource.GetEphemeralPtr()
+					: _registry.Resolve(resource);
+				m_frameDAGResourcePtrByIndex[dagResourceIndex] = resolvedResource;
+				if (auto* backedResource = TryGetBackedResource(resolvedResource);
+					backedResource && !backedResource->IsMaterialized()) {
+					m_frameDAGUnmaterializedResourceIndices.push_back(dagResourceIndex);
+				}
+			};
 			for (auto& summary : m_framePassAccessSummaries) {
 				for (auto& req : summary.requirementSummaries) {
 					auto dagResourceIndex = findDenseDAGResourceIndex(req.resourceID);
 					req.dagResourceIndex = dagResourceIndex.has_value()
 						? static_cast<uint32_t>(*dagResourceIndex)
 						: UINT32_MAX;
+					captureDenseResourcePtr(req.dagResourceIndex, req.resource);
 				}
 				for (auto& transition : summary.internalTransitionSummaries) {
 					auto dagResourceIndex = findDenseDAGResourceIndex(transition.resourceID);
 					transition.dagResourceIndex = dagResourceIndex.has_value()
 						? static_cast<uint32_t>(*dagResourceIndex)
 						: UINT32_MAX;
+					captureDenseResourcePtr(transition.dagResourceIndex, transition.resource);
 				}
 			}
 		}
@@ -1067,6 +1089,46 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 				m_frameDAGResourceIndexByID.emplace(m_frameDAGResourceIDsByIndex[resourceIndex], resourceIndex);
 			}
 			m_frameDAGResourceCount = m_frameDAGResourceIDsByIndex.size();
+			m_frameDAGResourcePtrByIndex.assign(m_frameDAGResourceCount, nullptr);
+			m_frameDAGUnmaterializedResourceIndices.clear();
+			if (m_frameDAGUnmaterializedResourceIndices.capacity() < m_frameDAGResourceCount) {
+				m_frameDAGUnmaterializedResourceIndices.reserve(m_frameDAGResourceCount);
+			}
+		}
+	}
+
+	{
+		ZoneScopedN("RGPassAccess::AssignDenseDAGIndicesAndPtrs");
+		auto captureDenseResourcePtr = [&](uint32_t dagResourceIndex, const ResourceRegistry::RegistryHandle& resource) {
+			if (dagResourceIndex == UINT32_MAX
+				|| dagResourceIndex >= m_frameDAGResourcePtrByIndex.size()
+				|| m_frameDAGResourcePtrByIndex[dagResourceIndex] != nullptr) {
+				return;
+			}
+			Resource* resolvedResource = resource.IsEphemeral()
+				? resource.GetEphemeralPtr()
+				: _registry.Resolve(resource);
+			m_frameDAGResourcePtrByIndex[dagResourceIndex] = resolvedResource;
+			if (auto* backedResource = TryGetBackedResource(resolvedResource);
+				backedResource && !backedResource->IsMaterialized()) {
+				m_frameDAGUnmaterializedResourceIndices.push_back(dagResourceIndex);
+			}
+		};
+		for (auto& summary : m_framePassAccessSummaries) {
+			for (auto& req : summary.requirementSummaries) {
+				auto dagResourceIt = m_frameDAGResourceIndexByID.find(req.resourceID);
+				req.dagResourceIndex = dagResourceIt != m_frameDAGResourceIndexByID.end()
+					? static_cast<uint32_t>(dagResourceIt->second)
+					: UINT32_MAX;
+				captureDenseResourcePtr(req.dagResourceIndex, req.resource);
+			}
+			for (auto& transition : summary.internalTransitionSummaries) {
+				auto dagResourceIt = m_frameDAGResourceIndexByID.find(transition.resourceID);
+				transition.dagResourceIndex = dagResourceIt != m_frameDAGResourceIndexByID.end()
+					? static_cast<uint32_t>(dagResourceIt->second)
+					: UINT32_MAX;
+				captureDenseResourcePtr(transition.dagResourceIndex, transition.resource);
+			}
 		}
 	}
 
@@ -5675,28 +5737,30 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	};
 
 	traceCompileStep("BuildFramePassList");
-	size_t baseFramePassWriteIndex = 0;
-	auto appendBaseFramePass = [&](const AnyPassAndResources& pass) {
-		if (baseFramePassWriteIndex < m_baseFramePasses.size()) {
-			m_baseFramePasses[baseFramePassWriteIndex] = pass;
-		}
-		else {
-			m_baseFramePasses.push_back(pass);
-		}
-		++baseFramePassWriteIndex;
-	};
-	auto appendBaseFramePassMove = [&](AnyPassAndResources&& pass) {
-		if (baseFramePassWriteIndex < m_baseFramePasses.size()) {
-			m_baseFramePasses[baseFramePassWriteIndex] = std::move(pass);
-		}
-		else {
-			m_baseFramePasses.push_back(std::move(pass));
-		}
-		++baseFramePassWriteIndex;
-	};
+	{
+		ZoneScopedN("RenderGraph::CompileFrame::BuildFramePassList");
+		size_t baseFramePassWriteIndex = 0;
+		auto appendBaseFramePass = [&](const AnyPassAndResources& pass) {
+			if (baseFramePassWriteIndex < m_baseFramePasses.size()) {
+				m_baseFramePasses[baseFramePassWriteIndex] = pass;
+			}
+			else {
+				m_baseFramePasses.push_back(pass);
+			}
+			++baseFramePassWriteIndex;
+		};
+		auto appendBaseFramePassMove = [&](AnyPassAndResources&& pass) {
+			if (baseFramePassWriteIndex < m_baseFramePasses.size()) {
+				m_baseFramePasses[baseFramePassWriteIndex] = std::move(pass);
+			}
+			else {
+				m_baseFramePasses.push_back(std::move(pass));
+			}
+			++baseFramePassWriteIndex;
+		};
 
-	// Record immediate-mode commands + access for each pass and fold into per-frame requirements
-	for (auto& pr : m_masterPassList) {
+		// Record immediate-mode commands + access for each pass and fold into per-frame requirements
+		for (auto& pr : m_masterPassList) {
 
 		if (pr.type == PassType::Compute) {
 			auto& p = std::get<ComputePassAndResources>(pr.pass);
@@ -5891,9 +5955,10 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				appendBaseFramePass(pr);
 			}
 		}
-	}
-	if (baseFramePassWriteIndex < m_baseFramePasses.size()) {
-		m_baseFramePasses.resize(baseFramePassWriteIndex);
+		}
+		if (baseFramePassWriteIndex < m_baseFramePasses.size()) {
+			m_baseFramePasses.resize(baseFramePassWriteIndex);
+		}
 	}
 
 	// Per-frame extension passes (ephemeral)
@@ -5910,10 +5975,15 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	}
 
 	// explicit After(anchor) edges (anchorName -> injectedName)
-	std::vector<std::pair<std::string, std::string>> explicitAfterByName = m_structuralExplicitAfterByName;
-	explicitAfterByName.reserve(m_structuralExplicitAfterByName.size() + frameExt.size());
+	std::vector<std::pair<std::string, std::string>> explicitAfterByName;
+	{
+		ZoneScopedN("RenderGraph::CompileFrame::CopyStructuralExplicitEdges");
+		explicitAfterByName = m_structuralExplicitAfterByName;
+		explicitAfterByName.reserve(m_structuralExplicitAfterByName.size() + frameExt.size());
+	}
 
 	if (!frameExt.empty()) {
+		ZoneScopedN("RenderGraph::CompileFrame::IntegrateFrameExtensions");
 		auto recordImmediateCommands = [&](AnyPassAndResources& pr) {
 			if (pr.type == PassType::Compute) {
 				auto& p = std::get<ComputePassAndResources>(pr.pass);
@@ -6028,10 +6098,13 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		const auto& baseFramePasses = m_baseFramePasses;
 
 		std::unordered_map<std::string, size_t> baseFramePassIndexByName;
-		baseFramePassIndexByName.reserve(baseFramePasses.size() + frameExt.size());
-		for (size_t i = 0; i < baseFramePasses.size(); ++i) {
-			if (!baseFramePasses[i].name.empty()) {
-				baseFramePassIndexByName[baseFramePasses[i].name] = i;
+		{
+			ZoneScopedN("RenderGraph::CompileFrame::BuildBaseFramePassIndex");
+			baseFramePassIndexByName.reserve(baseFramePasses.size() + frameExt.size());
+			for (size_t i = 0; i < baseFramePasses.size(); ++i) {
+				if (!baseFramePasses[i].name.empty()) {
+					baseFramePassIndexByName[baseFramePasses[i].name] = i;
+				}
 			}
 		}
 
@@ -6075,113 +6148,120 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			}
 		};
 
-		for (auto& d : frameExt) {
-			if (d.type == PassType::Unknown) continue;
-			if (std::holds_alternative<std::monostate>(d.pass)) continue;
-			if (d.name.empty()) {
-				spdlog::warn("Frame extension emitted a pass with empty name; skipping.");
-				continue;
-			}
+		{
+			ZoneScopedN("RenderGraph::CompileFrame::MaterializeFrameExtensions");
+			for (auto& d : frameExt) {
+				if (d.type == PassType::Unknown) continue;
+				if (std::holds_alternative<std::monostate>(d.pass)) continue;
+				if (d.name.empty()) {
+					spdlog::warn("Frame extension emitted a pass with empty name; skipping.");
+					continue;
+				}
 
-			AnyPassAndResources any = MaterializeExternalPass(d, true, false);
-			recordImmediateCommands(any);
-			const std::string insertedPassName = any.name;
-			if (!insertedPassName.empty()) {
-				frameExtensionPassNames.insert(insertedPassName);
-			}
-			const size_t pendingIndex = pendingFrameInserts.size();
-			pendingFrameInserts.push_back(PendingFrameInsert{ .pass = std::move(any) });
+				AnyPassAndResources any = MaterializeExternalPass(d, true, false);
+				recordImmediateCommands(any);
+				const std::string insertedPassName = any.name;
+				if (!insertedPassName.empty()) {
+					frameExtensionPassNames.insert(insertedPassName);
+				}
+				const size_t pendingIndex = pendingFrameInserts.size();
+				pendingFrameInserts.push_back(PendingFrameInsert{ .pass = std::move(any) });
 
-			std::string anchorName;
-			bool insertedRelativeToAnchor = false;
+				std::string anchorName;
+				bool insertedRelativeToAnchor = false;
 
-			if (d.where.has_value()) {
-				for (auto const& a : d.where->after) {
-					auto tailIt = pendingInsertTailByAnchorName.find(a);
-					if (tailIt != pendingInsertTailByAnchorName.end()) {
-						anchorName = a;
-						insertPendingAfter(pendingIndex, tailIt->second);
-						insertedRelativeToAnchor = true;
-						break;
-					}
+				if (d.where.has_value()) {
+					for (auto const& a : d.where->after) {
+						auto tailIt = pendingInsertTailByAnchorName.find(a);
+						if (tailIt != pendingInsertTailByAnchorName.end()) {
+							anchorName = a;
+							insertPendingAfter(pendingIndex, tailIt->second);
+							insertedRelativeToAnchor = true;
+							break;
+						}
 
-					auto pendingAnchorIt = pendingInsertIndexByName.find(a);
-					if (pendingAnchorIt != pendingInsertIndexByName.end()) {
-						anchorName = a;
-						insertPendingAfter(pendingIndex, pendingAnchorIt->second);
-						insertedRelativeToAnchor = true;
-						break;
-					}
+						auto pendingAnchorIt = pendingInsertIndexByName.find(a);
+						if (pendingAnchorIt != pendingInsertIndexByName.end()) {
+							anchorName = a;
+							insertPendingAfter(pendingIndex, pendingAnchorIt->second);
+							insertedRelativeToAnchor = true;
+							break;
+						}
 
-					auto baseAnchorIt = baseFramePassIndexByName.find(a);
-					if (baseAnchorIt != baseFramePassIndexByName.end()) {
-						anchorName = a;
-						appendPendingToSlot(pendingIndex, baseAnchorIt->second + 1);
-						insertedRelativeToAnchor = true;
-						break;
+						auto baseAnchorIt = baseFramePassIndexByName.find(a);
+						if (baseAnchorIt != baseFramePassIndexByName.end()) {
+							anchorName = a;
+							appendPendingToSlot(pendingIndex, baseAnchorIt->second + 1);
+							insertedRelativeToAnchor = true;
+							break;
+						}
 					}
 				}
-			}
 
-			if (!insertedRelativeToAnchor) {
-				appendPendingToSlot(pendingIndex, baseFramePasses.size());
-			}
+				if (!insertedRelativeToAnchor) {
+					appendPendingToSlot(pendingIndex, baseFramePasses.size());
+				}
 
-			if (!anchorName.empty()) {
-				explicitAfterByName.push_back({ anchorName, insertedPassName });
-				pendingInsertTailByAnchorName[anchorName] = pendingIndex;
-			}
-			if (d.where.has_value()) {
-				for (auto const& b : d.where->before) {
-					if (!insertedPassName.empty()) {
-						explicitAfterByName.push_back({ insertedPassName, b });
+				if (!anchorName.empty()) {
+					explicitAfterByName.push_back({ anchorName, insertedPassName });
+					pendingInsertTailByAnchorName[anchorName] = pendingIndex;
+				}
+				if (d.where.has_value()) {
+					for (auto const& b : d.where->before) {
+						if (!insertedPassName.empty()) {
+							explicitAfterByName.push_back({ insertedPassName, b });
+						}
 					}
 				}
-			}
 
-			if (!insertedPassName.empty()) {
-				pendingInsertIndexByName[insertedPassName] = pendingIndex;
+				if (!insertedPassName.empty()) {
+					pendingInsertIndexByName[insertedPassName] = pendingIndex;
+				}
 			}
 		}
 
-		if (m_framePasses.capacity() < baseFramePasses.size() + pendingFrameInserts.size()) {
-			m_framePasses.reserve(baseFramePasses.size() + pendingFrameInserts.size());
-		}
-		size_t finalFramePassWriteIndex = 0;
-		auto appendFinalFramePass = [&](const AnyPassAndResources& pass) {
+		{
+			ZoneScopedN("RenderGraph::CompileFrame::AssembleFramePassList");
+			if (m_framePasses.capacity() < baseFramePasses.size() + pendingFrameInserts.size()) {
+				m_framePasses.reserve(baseFramePasses.size() + pendingFrameInserts.size());
+			}
+			size_t finalFramePassWriteIndex = 0;
+			auto appendFinalFramePass = [&](const AnyPassAndResources& pass) {
+				if (finalFramePassWriteIndex < m_framePasses.size()) {
+					m_framePasses[finalFramePassWriteIndex] = pass;
+				}
+				else {
+					m_framePasses.push_back(pass);
+				}
+				++finalFramePassWriteIndex;
+			};
+			auto appendFinalFramePassMove = [&](AnyPassAndResources&& pass) {
+				if (finalFramePassWriteIndex < m_framePasses.size()) {
+					m_framePasses[finalFramePassWriteIndex] = std::move(pass);
+				}
+				else {
+					m_framePasses.push_back(std::move(pass));
+				}
+				++finalFramePassWriteIndex;
+			};
+			auto appendSlot = [&](size_t slotIndex) {
+				for (size_t pendingIndex = slotHeadByIndex[slotIndex]; pendingIndex != invalidInsertIndex; pendingIndex = pendingFrameInserts[pendingIndex].nextInsertIndex) {
+					appendFinalFramePassMove(std::move(pendingFrameInserts[pendingIndex].pass));
+				}
+			};
+
+			for (size_t i = 0; i < baseFramePasses.size(); ++i) {
+				appendSlot(i);
+				appendFinalFramePass(baseFramePasses[i]);
+			}
+			appendSlot(baseFramePasses.size());
 			if (finalFramePassWriteIndex < m_framePasses.size()) {
-				m_framePasses[finalFramePassWriteIndex] = pass;
+				m_framePasses.resize(finalFramePassWriteIndex);
 			}
-			else {
-				m_framePasses.push_back(pass);
-			}
-			++finalFramePassWriteIndex;
-		};
-		auto appendFinalFramePassMove = [&](AnyPassAndResources&& pass) {
-			if (finalFramePassWriteIndex < m_framePasses.size()) {
-				m_framePasses[finalFramePassWriteIndex] = std::move(pass);
-			}
-			else {
-				m_framePasses.push_back(std::move(pass));
-			}
-			++finalFramePassWriteIndex;
-		};
-		auto appendSlot = [&](size_t slotIndex) {
-			for (size_t pendingIndex = slotHeadByIndex[slotIndex]; pendingIndex != invalidInsertIndex; pendingIndex = pendingFrameInserts[pendingIndex].nextInsertIndex) {
-				appendFinalFramePassMove(std::move(pendingFrameInserts[pendingIndex].pass));
-			}
-		};
-
-		for (size_t i = 0; i < baseFramePasses.size(); ++i) {
-			appendSlot(i);
-			appendFinalFramePass(baseFramePasses[i]);
-		}
-		appendSlot(baseFramePasses.size());
-		if (finalFramePassWriteIndex < m_framePasses.size()) {
-			m_framePasses.resize(finalFramePassWriteIndex);
 		}
 	}
 	else {
+		ZoneScopedN("RenderGraph::CompileFrame::CopyBaseFramePasses");
 		if (m_framePasses.capacity() < m_baseFramePasses.size()) {
 			m_framePasses.reserve(m_baseFramePasses.size());
 		}
@@ -6200,13 +6280,16 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		}
 	}
 
-	m_framePassIsFrameExtension.assign(m_framePasses.size(), 0);
-	m_framePassDeclarationRefreshedThisFrame.assign(m_framePasses.size(), 0);
-	for (size_t passIndex = 0; passIndex < m_framePasses.size(); ++passIndex) {
-		const auto& passName = m_framePasses[passIndex].name;
-		if (!passName.empty()) {
-			m_framePassIsFrameExtension[passIndex] = frameExtensionPassNames.contains(passName) ? 1 : 0;
-			m_framePassDeclarationRefreshedThisFrame[passIndex] = declarationRefreshedPassNames.contains(passName) ? 1 : 0;
+	{
+		ZoneScopedN("RenderGraph::CompileFrame::ClassifyFramePasses");
+		m_framePassIsFrameExtension.assign(m_framePasses.size(), 0);
+		m_framePassDeclarationRefreshedThisFrame.assign(m_framePasses.size(), 0);
+		for (size_t passIndex = 0; passIndex < m_framePasses.size(); ++passIndex) {
+			const auto& passName = m_framePasses[passIndex].name;
+			if (!passName.empty()) {
+				m_framePassIsFrameExtension[passIndex] = frameExtensionPassNames.contains(passName) ? 1 : 0;
+				m_framePassDeclarationRefreshedThisFrame[passIndex] = declarationRefreshedPassNames.contains(passName) ? 1 : 0;
+			}
 		}
 	}
 
@@ -6259,23 +6342,26 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 
 	// Convert explicit After(anchorName)->(passName) constraints into node-index edges.
 	std::vector<std::pair<size_t, size_t>> explicitEdges;
-	explicitEdges.reserve(explicitAfterByName.size());
-	if (!explicitAfterByName.empty()) {
-		std::unordered_map<std::string, size_t> nameToIndex;
-		nameToIndex.reserve(m_framePasses.size());
-		for (size_t i = 0; i < m_framePasses.size(); ++i) {
-			if (!m_framePasses[i].name.empty()) {
-				nameToIndex[m_framePasses[i].name] = i;
+	{
+		ZoneScopedN("RenderGraph::CompileFrame::BuildExplicitEdges");
+		explicitEdges.reserve(explicitAfterByName.size());
+		if (!explicitAfterByName.empty()) {
+			std::unordered_map<std::string, size_t> nameToIndex;
+			nameToIndex.reserve(m_framePasses.size());
+			for (size_t i = 0; i < m_framePasses.size(); ++i) {
+				if (!m_framePasses[i].name.empty()) {
+					nameToIndex[m_framePasses[i].name] = i;
+				}
 			}
-		}
-		for (auto const& e : explicitAfterByName) {
-			auto itA = nameToIndex.find(e.first);
-			auto itB = nameToIndex.find(e.second);
-			if (itA == nameToIndex.end() || itB == nameToIndex.end()) {
-				spdlog::warn("Explicit After edge dropped (anchor='{}', pass='{}'): name not found in frame pass list.", e.first, e.second);
-				continue;
+			for (auto const& e : explicitAfterByName) {
+				auto itA = nameToIndex.find(e.first);
+				auto itB = nameToIndex.find(e.second);
+				if (itA == nameToIndex.end() || itB == nameToIndex.end()) {
+					spdlog::warn("Explicit After edge dropped (anchor='{}', pass='{}'): name not found in frame pass list.", e.first, e.second);
+					continue;
+				}
+				explicitEdges.push_back({ itA->second, itB->second });
 			}
-			explicitEdges.push_back({ itA->second, itB->second });
 		}
 	}
 
@@ -6385,6 +6471,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		ZoneScopedN("RenderGraph::CompileFrame::SkipAliasCompile");
 		aliasMaterializeOptionsByID.clear();
 		m_aliasMaterializeOptionsByResourceIndex.clear();
+		m_aliasMaterializeResourceIDs.clear();
 		aliasActivationPending.clear();
 		aliasPlacementPoolByID.clear();
 		aliasPlacementRangesByID.clear();

@@ -1506,6 +1506,7 @@ private:
 	using ResourceMaterializeOptions = std::variant<PixelBuffer::MaterializeOptions, BufferBase::MaterializeOptions>;
 	std::unordered_map<uint64_t, ResourceMaterializeOptions> aliasMaterializeOptionsByID;
 	std::vector<std::optional<ResourceMaterializeOptions>> m_aliasMaterializeOptionsByResourceIndex;
+	std::vector<uint64_t> m_aliasMaterializeResourceIDs;
 	std::unordered_map<uint64_t, uint64_t> aliasPlacementSignatureByID;
 	std::unordered_map<uint64_t, rg::alias::AliasPlacementRange> aliasPlacementRangesByID;
 	std::unordered_map<uint64_t, rg::alias::AliasPlacementRange> schedulingPlacementRangesByID;
@@ -1522,6 +1523,8 @@ private:
 	std::vector<SchedulingEquivalentIDRange> m_schedulingEquivalentIDRangeByResourceIndex;
 	std::unordered_map<uint64_t, size_t> m_frameDAGResourceIndexByID;
 	std::vector<uint64_t> m_frameDAGResourceIDsByIndex;
+	std::vector<Resource*> m_frameDAGResourcePtrByIndex;
+	std::vector<uint32_t> m_frameDAGUnmaterializedResourceIndices;
 	size_t m_frameDAGResourceCount = 0;
 	std::unordered_map<uint64_t, size_t> m_frameSchedulingResourceIndexByID;
 	std::vector<std::pair<uint64_t, size_t>> m_frameSchedulingResourceIndexEntries;
@@ -1545,7 +1548,6 @@ private:
 	uint32_t m_compileScratchAccessEpoch = 1;
 	std::vector<size_t> m_compileScratchRefreshNeededMasterIndices;
 	std::vector<std::pair<uint64_t, Resource*>> m_materializeScratchItems;
-	std::vector<uint8_t> m_materializeScratchQueuedByDenseResourceIndex;
 	std::vector<MaterializeGenerationResult> m_materializeScratchGenerationResults;
 	std::vector<FramePassSchedulingSummary> m_framePassSchedulingSummaries;
 	std::unordered_map<uint64_t, CachedFramePassAccessSummary> m_framePassAccessSummaryCache;

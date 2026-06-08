@@ -39,6 +39,7 @@ rg::alias::AutoAliasDebugSnapshot rg::alias::RenderGraphAliasingSubsystem::Build
 void rg::alias::RenderGraphAliasingSubsystem::ResetPerFrameState(RenderGraph& renderGraph) const {
 	renderGraph.aliasMaterializeOptionsByID.clear();
 	renderGraph.m_aliasMaterializeOptionsByResourceIndex.clear();
+	renderGraph.m_aliasMaterializeResourceIDs.clear();
 	renderGraph.aliasActivationPending.clear();
 	renderGraph.m_aliasPlacementRangeByResourceIndex.clear();
 	renderGraph.m_hasAliasPlacementByResourceIndex.clear();

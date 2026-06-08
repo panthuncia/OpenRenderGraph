@@ -3569,6 +3569,7 @@ void RenderGraph::ShutdownOwnedState() {
 	compiledResourceGenerationByID.clear();
 	aliasMaterializeOptionsByID.clear();
 	m_aliasMaterializeOptionsByResourceIndex.clear();
+	m_aliasMaterializeResourceIDs.clear();
 	aliasPlacementSignatureByID.clear();
 	aliasPlacementRangesByID.clear();
 	schedulingPlacementRangesByID.clear();
@@ -4202,8 +4203,12 @@ void RenderGraph::RebuildFrameSchedulingResourceIndex(std::span<const uint64_t> 
 
 void RenderGraph::RebuildEquivalentResourceIndicesByResourceIndex() {
 	ZoneScopedN("RenderGraph::RebuildEquivalentResourceIndicesByResourceIndex");
-	m_equivalentResourceIndicesByResourceIndex.clear();
-	m_equivalentResourceIndicesByResourceIndex.resize(m_frameSchedulingResourceCount);
+	if (m_equivalentResourceIndicesByResourceIndex.size() != m_frameSchedulingResourceCount) {
+		m_equivalentResourceIndicesByResourceIndex.resize(m_frameSchedulingResourceCount);
+	}
+	for (auto& equivalentIndices : m_equivalentResourceIndicesByResourceIndex) {
+		equivalentIndices.clear();
+	}
 	const bool hasSchedulingPlacements = std::any_of(
 		m_hasSchedulingPlacementByResourceIndex.begin(),
 		m_hasSchedulingPlacementByResourceIndex.end(),
@@ -5982,31 +5987,17 @@ void RenderGraph::MaterializeUnmaterializedResources(std::span<const uint64_t> o
 	auto& items = m_materializeScratchItems;
 	items.clear();
 	if (limitToResourceIDs) {
-		if (items.capacity() < m_frameDAGResourceIDsByIndex.size()) {
-			items.reserve(m_frameDAGResourceIDsByIndex.size());
+		const size_t candidateCapacity = m_frameDAGUnmaterializedResourceIndices.size() + m_aliasMaterializeResourceIDs.size();
+		if (items.capacity() < candidateCapacity) {
+			items.reserve(candidateCapacity);
 		}
-		if (m_materializeScratchQueuedByDenseResourceIndex.size() < m_frameDAGResourceIDsByIndex.size()) {
-			m_materializeScratchQueuedByDenseResourceIndex.resize(m_frameDAGResourceIDsByIndex.size(), 0);
-		}
-		std::fill(
-			m_materializeScratchQueuedByDenseResourceIndex.begin(),
-			m_materializeScratchQueuedByDenseResourceIndex.begin() + m_frameDAGResourceIDsByIndex.size(),
-			uint8_t{ 0 });
 	}
 
-	auto findDenseMaterializeResourceIndex = [&](uint64_t id) -> std::optional<size_t> {
-		auto it = std::lower_bound(m_frameDAGResourceIDsByIndex.begin(), m_frameDAGResourceIDsByIndex.end(), id);
-		if (it == m_frameDAGResourceIDsByIndex.end() || *it != id) {
-			return std::nullopt;
-		}
-		return static_cast<size_t>(it - m_frameDAGResourceIDsByIndex.begin());
-	};
-
 	auto skipIfAlreadyMaterialized = [&](uint64_t id, Resource* resource) {
-		if (!resource || tryGetAliasMaterializeOptions(id) != nullptr) {
+		if (!resource) {
 			return false;
 		}
-		auto* backedResource = TryGetBackedResource(resource);
+		auto* backedResource = TryGetBackedResource(UnwrapDynamicResource(resource));
 		if (!backedResource) {
 			return true;
 		}
@@ -6016,53 +6007,54 @@ void RenderGraph::MaterializeUnmaterializedResources(std::span<const uint64_t> o
 		return true;
 	};
 
-	auto markDenseMaterializeResourceResolved = [&](uint64_t id) {
-		if (!limitToResourceIDs) {
+	auto resolveMaterializeResourceByID = [&](uint64_t id) -> Resource* {
+		if (auto it = resourcesByID.find(id); it != resourcesByID.end() && it->second) {
+			return it->second.get();
+		}
+		if (auto it = m_transientFrameResourcesByID.find(id); it != m_transientFrameResourcesByID.end() && it->second) {
+			return it->second.get();
+		}
+		return nullptr;
+	};
+
+	auto queueLimitedMaterializeCandidate = [&](uint64_t id, Resource* resource) {
+		if (limitToResourceIDs && !std::binary_search(onlyResourceIDs.begin(), onlyResourceIDs.end(), id)) {
 			return;
 		}
-		auto denseIndex = findDenseMaterializeResourceIndex(id);
-		if (denseIndex.has_value()) {
-			m_materializeScratchQueuedByDenseResourceIndex[*denseIndex] = 1;
-		}
-	};
-
-	auto tryQueueDenseMaterializeItem = [&](uint64_t id, Resource* resource) -> bool {
 		if (!resource) {
-			return false;
+			return;
 		}
-		auto denseIndex = findDenseMaterializeResourceIndex(id);
-		if (!denseIndex.has_value()) {
-			return false;
-		}
-		if (m_materializeScratchQueuedByDenseResourceIndex[*denseIndex] != 0) {
-			return false;
-		}
-		m_materializeScratchQueuedByDenseResourceIndex[*denseIndex] = 1;
 		if (skipIfAlreadyMaterialized(id, resource)) {
-			return false;
+			return;
 		}
+		for (const auto& item : items) {
+			if (item.first == id) {
+				return;
+			}
+		}
+		TrackTransientFrameResource(resource);
 		items.emplace_back(id, resource);
-		return true;
 	};
-	std::unordered_set<uint64_t> fallbackSeen;
 
 	if (limitToResourceIDs) {
-		for (uint64_t id : onlyResourceIDs) {
-			if (auto it = resourcesByID.find(id); it != resourcesByID.end() && it->second) {
-				tryQueueDenseMaterializeItem(id, it->second.get());
+		for (uint32_t resourceIndex : m_frameDAGUnmaterializedResourceIndices) {
+			if (resourceIndex >= m_frameDAGResourceIDsByIndex.size()
+				|| resourceIndex >= m_frameDAGResourcePtrByIndex.size()) {
 				continue;
 			}
-			if (auto it = m_transientFrameResourcesByID.find(id); it != m_transientFrameResourcesByID.end() && it->second) {
-				tryQueueDenseMaterializeItem(id, it->second.get());
+			Resource* resource = m_frameDAGResourcePtrByIndex[resourceIndex];
+			if (!resource) {
 				continue;
 			}
-			if (auto it = m_dynamicResourcesByStableID.find(id); it != m_dynamicResourcesByStableID.end() && it->second) {
-				tryQueueDenseMaterializeItem(id, it->second.get());
-				continue;
-			}
+			const uint64_t id = m_frameDAGResourceIDsByIndex[resourceIndex];
+			queueLimitedMaterializeCandidate(id, resource);
+		}
+		for (uint64_t resourceID : m_aliasMaterializeResourceIDs) {
+			queueLimitedMaterializeCandidate(resourceID, resolveMaterializeResourceByID(resourceID));
 		}
 	}
 	else {
+		std::unordered_set<uint64_t> fallbackSeen;
 		auto& seen = fallbackSeen;
 		items.reserve(resourcesByID.size() + m_transientFrameResourcesByID.size());
 		seen.reserve(items.capacity());
@@ -6078,48 +6070,19 @@ void RenderGraph::MaterializeUnmaterializedResources(std::span<const uint64_t> o
 				items.emplace_back(id, resource.get());
 			}
 		}
-	}
 
-	auto collectFromHandle = [&](const ResourceRegistry::RegistryHandle& handle) {
-		const uint64_t id = handle.GetGlobalResourceID();
-		if (limitToResourceIDs) {
-			auto denseIndex = findDenseMaterializeResourceIndex(id);
-			if (!denseIndex.has_value()
-				|| m_materializeScratchQueuedByDenseResourceIndex[*denseIndex] != 0) {
+		auto collectFromHandle = [&](const ResourceRegistry::RegistryHandle& handle) {
+			const uint64_t id = handle.GetGlobalResourceID();
+			if (!fallbackSeen.insert(id).second) {
 				return;
 			}
-		}
-		if (!limitToResourceIDs && !fallbackSeen.insert(id).second) {
-			return;
-		}
-		Resource* resource = handle.IsEphemeral() ? handle.GetEphemeralPtr() : _registry.Resolve(handle);
-		if (resource) {
-			if (limitToResourceIDs) {
-				if (tryQueueDenseMaterializeItem(id, resource)) {
-					TrackTransientFrameResource(resource);
-				}
-			}
-			else {
+			Resource* resource = handle.IsEphemeral() ? handle.GetEphemeralPtr() : _registry.Resolve(handle);
+			if (resource) {
 				TrackTransientFrameResource(resource);
 				items.emplace_back(id, resource);
 			}
-		}
-		else {
-			markDenseMaterializeResourceResolved(id);
-		}
-	};
+		};
 
-	if (limitToResourceIDs) {
-		for (const auto& summary : m_framePassAccessSummaries) {
-			for (const auto& req : summary.requirementSummaries) {
-				collectFromHandle(req.resource);
-			}
-			for (const auto& transition : summary.internalTransitionSummaries) {
-				collectFromHandle(transition.resource);
-			}
-		}
-	}
-	else {
 		for (const auto& pr : m_framePasses) {
 			if (pr.type == PassType::Compute) {
 				auto const& p = std::get<ComputePassAndResources>(pr.pass);
