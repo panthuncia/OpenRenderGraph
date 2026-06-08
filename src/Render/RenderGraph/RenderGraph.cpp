@@ -4182,6 +4182,17 @@ void RenderGraph::RebuildFrameSchedulingResourceIndex(std::span<const uint64_t> 
 		[](const auto& lhs, const auto& rhs) {
 			return lhs.first < rhs.first;
 		});
+	if (m_frameSchedulingResourceIDByIndex.size() != m_frameSchedulingResourceCount) {
+		m_frameSchedulingResourceIDByIndex.assign(m_frameSchedulingResourceCount, 0);
+	}
+	else {
+		std::fill(m_frameSchedulingResourceIDByIndex.begin(), m_frameSchedulingResourceIDByIndex.end(), 0);
+	}
+	for (const auto& [resourceID, resourceIndex] : m_frameSchedulingResourceIndexEntries) {
+		if (resourceIndex < m_frameSchedulingResourceIDByIndex.size()) {
+			m_frameSchedulingResourceIDByIndex[resourceIndex] = resourceID;
+		}
+	}
 
 	size_t lookupSize = 1;
 	const size_t minLookupSize = (std::max)(size_t{ 2 }, m_frameSchedulingResourceIndexEntries.size() * 2);

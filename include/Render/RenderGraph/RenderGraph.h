@@ -1591,6 +1591,7 @@ private:
 	std::vector<std::pair<uint64_t, size_t>> m_frameSchedulingResourceIndexEntries;
 	std::vector<FrameResourceIndexLookupEntry> m_frameSchedulingResourceIndexLookup;
 	size_t m_frameSchedulingResourceCount = 0;
+	std::vector<uint64_t> m_frameSchedulingResourceIDByIndex;
 	std::vector<std::vector<size_t>> m_equivalentResourceIndicesByResourceIndex;
 	std::vector<uint8_t> m_aliasActivationPendingByResourceIndex;
 	std::vector<unsigned int> m_frameQueueLastUsageBatch;

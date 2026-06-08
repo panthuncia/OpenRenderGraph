@@ -7486,42 +7486,67 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			maxFence = std::max(maxFence, fenceValue);
 		};
 
-		auto shouldProcessFirstUse = [&](const ResourceRegistry::RegistryHandle& handle) {
-			if (handle.IsEphemeral()) {
+		const auto shouldProcessFirstUse = [&](size_t resourceIndex) {
+			if (resourceIndex >= m_crossFrameFirstUseResourceEpochs.size()) {
 				return false;
 			}
+			if (resourceIndex >= m_equivalentResourceIndicesByResourceIndex.size()) {
+				// Fallback to the non-aliased behavior if cached-equivalent indices are not available yet.
+				if (m_crossFrameFirstUseResourceEpochs[resourceIndex] == firstUseEpoch) {
+					return false;
+				}
+				m_crossFrameFirstUseResourceEpochs[resourceIndex] = firstUseEpoch;
+				return true;
+			}
 
-			const uint64_t id = handle.GetGlobalResourceID();
-			const auto& equivalentIDs = GetSchedulingEquivalentIDsCached(id);
-			bool hasNewEquivalent = false;
-			for (uint64_t rid : equivalentIDs) {
-				const auto resourceIndex = TryGetFrameSchedulingResourceIndex(rid);
-				if (resourceIndex.has_value()
-					&& *resourceIndex < m_crossFrameFirstUseResourceEpochs.size()
-					&& m_crossFrameFirstUseResourceEpochs[*resourceIndex] != firstUseEpoch) {
-					hasNewEquivalent = true;
-					break;
+			const bool hasAliasPlacement = resourceIndex < m_hasAliasPlacementByResourceIndex.size()
+				&& m_hasAliasPlacementByResourceIndex[resourceIndex] != 0;
+			if (!hasAliasPlacement) {
+				if (m_crossFrameFirstUseResourceEpochs[resourceIndex] == firstUseEpoch) {
+					return false;
+				}
+				m_crossFrameFirstUseResourceEpochs[resourceIndex] = firstUseEpoch;
+				return true;
+			}
+
+			bool hasNewEquivalent = m_crossFrameFirstUseResourceEpochs[resourceIndex] != firstUseEpoch;
+			if (!hasNewEquivalent) {
+				for (size_t equivalentResourceIndex : m_equivalentResourceIndicesByResourceIndex[resourceIndex]) {
+					if (equivalentResourceIndex < m_crossFrameFirstUseResourceEpochs.size()
+						&& m_crossFrameFirstUseResourceEpochs[equivalentResourceIndex] != firstUseEpoch) {
+						hasNewEquivalent = true;
+						break;
+					}
 				}
 			}
 			if (!hasNewEquivalent) {
 				return false;
 			}
-			for (uint64_t rid : equivalentIDs) {
-				const auto resourceIndex = TryGetFrameSchedulingResourceIndex(rid);
-				if (resourceIndex.has_value() && *resourceIndex < m_crossFrameFirstUseResourceEpochs.size()) {
-					m_crossFrameFirstUseResourceEpochs[*resourceIndex] = firstUseEpoch;
+
+			m_crossFrameFirstUseResourceEpochs[resourceIndex] = firstUseEpoch;
+			for (size_t equivalentResourceIndex : m_equivalentResourceIndicesByResourceIndex[resourceIndex]) {
+				if (equivalentResourceIndex < m_crossFrameFirstUseResourceEpochs.size()) {
+					m_crossFrameFirstUseResourceEpochs[equivalentResourceIndex] = firstUseEpoch;
 				}
 			}
 			return true;
 		};
 
-		auto accumulateCrossFrameWaitForHandle = [&](size_t passQueueSlot, const ResourceRegistry::RegistryHandle& handle, std::string_view passName) {
-			if (handle.IsEphemeral()) {
+		auto accumulateCrossFrameWaitForHandle = [&](
+			size_t passQueueSlot,
+			size_t resourceIndex,
+			std::string_view passName,
+			uint64_t originalResourceID) {
+			if (resourceIndex >= m_frameSchedulingResourceIDByIndex.size()) {
 				return;
 			}
 
-			const uint64_t id = handle.GetGlobalResourceID();
-			for (uint64_t rid : GetSchedulingEquivalentIDsCached(id)) {
+			const auto processCandidateResource = [&](size_t candidateResourceIndex, bool hasAliasPlacement) {
+				if (candidateResourceIndex >= m_frameSchedulingResourceIDByIndex.size()) {
+					return;
+				}
+
+				const uint64_t rid = m_frameSchedulingResourceIDByIndex[candidateResourceIndex];
 				auto it = m_lastProducerByResourceAcrossFrames.find(rid);
 				if (it != m_lastProducerByResourceAcrossFrames.end()) {
 					markCrossFrameWait(passQueueSlot, it->second.queueSlot, it->second.fenceValue);
@@ -7530,7 +7555,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 						spdlog::warn(
 							"RG PlanCrossFrameQueueWaits graphics<-copy sample: source=last_producer pass='{}' originalResource={} matchedResource={} resourceName='{}' producerFence={} producerPublishSerial={} anonymous={}",
 							passName,
-							id,
+							originalResourceID,
 							rid,
 							resourceDebugName(rid),
 							it->second.fenceValue,
@@ -7538,24 +7563,26 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 							it->second.anonymous);
 					}
 				}
-
-				const auto* placement = TryGetAliasPlacementRange(rid);
-				if (!placement) {
-					continue;
+				if (!hasAliasPlacement) {
+					return;
+				}
+				if (candidateResourceIndex >= m_aliasPlacementRangeByResourceIndex.size()) {
+					return;
 				}
 
-				auto itPoolState = persistentAliasPools.find(placement->poolID);
+				const auto& placement = m_aliasPlacementRangeByResourceIndex[candidateResourceIndex];
+				auto itPoolState = persistentAliasPools.find(placement.poolID);
 				if (itPoolState == persistentAliasPools.end()) {
-					continue;
+					return;
 				}
 
-				auto itPrevPool = m_lastAliasPlacementProducersByPoolAcrossFrames.find(placement->poolID);
+				auto itPrevPool = m_lastAliasPlacementProducersByPoolAcrossFrames.find(placement.poolID);
 				if (itPrevPool == m_lastAliasPlacementProducersByPoolAcrossFrames.end()) {
-					continue;
+					return;
 				}
 
-				const uint64_t curStart = placement->startByte;
-				const uint64_t curEnd = placement->endByte;
+				const uint64_t curStart = placement.startByte;
+				const uint64_t curEnd = placement.endByte;
 				const uint64_t curPoolGeneration = itPoolState->second.generation;
 
 				for (const auto& prevPlacementProducer : itPrevPool->second) {
@@ -7579,7 +7606,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 							resourceDebugName(rid),
 							prevPlacementProducer.resourceID,
 							resourceDebugName(prevPlacementProducer.resourceID),
-							placement->poolID,
+							placement.poolID,
 							overlapStart,
 							overlapEnd,
 							prevPlacementProducer.producer.fenceValue,
@@ -7591,6 +7618,18 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 						overlapSampleCurrentResourceId = rid;
 						overlapSamplePreviousResourceId = prevPlacementProducer.resourceID;
 					}
+				}
+			};
+
+			const bool hasAliasPlacement = resourceIndex < m_hasAliasPlacementByResourceIndex.size()
+				&& m_hasAliasPlacementByResourceIndex[resourceIndex] != 0;
+			processCandidateResource(resourceIndex, hasAliasPlacement);
+			if (resourceIndex < m_equivalentResourceIndicesByResourceIndex.size()) {
+				const auto& equivalentResourceIndices = m_equivalentResourceIndicesByResourceIndex[resourceIndex];
+				for (size_t equivalentResourceIndex : equivalentResourceIndices) {
+					const bool candidateHasAliasPlacement = equivalentResourceIndex < m_hasAliasPlacementByResourceIndex.size()
+						&& m_hasAliasPlacementByResourceIndex[equivalentResourceIndex] != 0;
+					processCandidateResource(equivalentResourceIndex, candidateHasAliasPlacement);
 				}
 			}
 		};
@@ -7605,13 +7644,37 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 						}
 						const std::string_view passName = passEntry->name;
 						ForEachFrameRequirement(passEntry->resources, [&](const auto& req) {
-							if (shouldProcessFirstUse(req.resourceHandleAndRange.resource)) {
-								accumulateCrossFrameWaitForHandle(queueIndex, req.resourceHandleAndRange.resource, passName);
+							const auto& handle = req.resourceHandleAndRange.resource;
+							if (handle.IsEphemeral()) {
+								return;
+							}
+							const auto resourceIndex = TryGetFrameSchedulingResourceIndex(handle.GetGlobalResourceID());
+							if (!resourceIndex.has_value()) {
+								return;
+							}
+							if (shouldProcessFirstUse(*resourceIndex)) {
+								accumulateCrossFrameWaitForHandle(
+									queueIndex,
+									*resourceIndex,
+									passName,
+									handle.GetGlobalResourceID());
 							}
 						});
 						for (auto const& tr : passEntry->resources.internalTransitions) {
-							if (shouldProcessFirstUse(tr.first.resource)) {
-								accumulateCrossFrameWaitForHandle(queueIndex, tr.first.resource, passName);
+							const auto& handle = tr.first.resource;
+							if (handle.IsEphemeral()) {
+								return;
+							}
+							const auto resourceIndex = TryGetFrameSchedulingResourceIndex(handle.GetGlobalResourceID());
+							if (!resourceIndex.has_value()) {
+								return;
+							}
+							if (shouldProcessFirstUse(*resourceIndex)) {
+								accumulateCrossFrameWaitForHandle(
+									queueIndex,
+									*resourceIndex,
+									passName,
+									handle.GetGlobalResourceID());
 							}
 						}
 					}, passVariant);
