@@ -897,6 +897,12 @@ private:
 		ResourceState uniformState{};
 	};
 
+	struct MaterializeGenerationResult {
+		uint64_t id = 0;
+		uint64_t generation = 0;
+		bool valid = false;
+	};
+
 	enum class RegionRejectReason : uint8_t {
 		QueueSlotChange = 0,
 		PassCountBelowThreshold,
@@ -1461,6 +1467,7 @@ private:
 	std::vector<AnyPassAndResources> m_masterPassList;
 	std::vector<size_t> m_retainedDeclarationRefreshCandidateMasterIndices;
 	std::vector<std::pair<std::string, std::string>> m_structuralExplicitAfterByName;
+	std::vector<AnyPassAndResources> m_baseFramePasses;
 	std::vector<AnyPassAndResources> m_framePasses;
 	std::vector<uint8_t> m_framePassIsFrameExtension;
 	std::vector<uint8_t> m_framePassDeclarationRefreshedThisFrame;
@@ -1512,6 +1519,10 @@ private:
 	std::vector<uint32_t> m_compileScratchAccessDagEpochs;
 	std::vector<uint32_t> m_compileScratchAccessOrder;
 	uint32_t m_compileScratchAccessEpoch = 1;
+	std::vector<size_t> m_compileScratchRefreshNeededMasterIndices;
+	std::vector<std::pair<uint64_t, Resource*>> m_materializeScratchItems;
+	std::vector<uint8_t> m_materializeScratchQueuedByDenseResourceIndex;
+	std::vector<MaterializeGenerationResult> m_materializeScratchGenerationResults;
 	std::vector<FramePassSchedulingSummary> m_framePassSchedulingSummaries;
 	std::unordered_map<uint64_t, CachedFramePassAccessSummary> m_framePassAccessSummaryCache;
 	std::unordered_map<uint64_t, rg::alias::CachedAliasStaticResourceInfo> m_aliasStaticInfoCacheByResourceID;
@@ -1544,9 +1555,10 @@ private:
 	bool m_compileProfileEnabled = false;
 	bool m_compileProfileFrameActive = false;
 	struct CapturedTrackerResource {
+		uint64_t resourceID = 0;
 		uint64_t backingGeneration = 0;
 	};
-	std::unordered_map<uint64_t, CapturedTrackerResource> trackers; // Resources whose live state trackers receive compiled states after execution.
+	std::vector<CapturedTrackerResource> trackers; // Resources whose live state trackers receive compiled states after execution.
 	std::vector<FrameCompileResourceState> m_frameCompileResources; // Compile-only symbolic state, indexed by frame-local resource index.
 	std::vector<FrameResourceAccessSummary> m_frameResourceAccessSummaries;
 	RenderGraphRegionCache m_regionCache;
@@ -1626,9 +1638,9 @@ private:
 		}
 	}
 
-	void MaterializeUnmaterializedResources(const std::unordered_set<uint64_t>* onlyResourceIDs = nullptr);
+	void MaterializeUnmaterializedResources(std::span<const uint64_t> onlyResourceIDs = {});
 	FrameCompileResourceState& GetOrCreateFrameCompileResourceState(size_t resourceIndex, Resource* resource, uint64_t resourceID);
-	void CaptureCompileTrackersForExecution(const std::unordered_set<uint64_t>& resourceIDs);
+	void CaptureCompileTrackersForExecution(std::span<const uint64_t> resourceIDs);
 	void PublishCompiledTrackerStates();
 	void MaterializeReferencedResources(
 		const std::vector<ResourceRequirement>& resourceRequirements,
@@ -1638,11 +1650,11 @@ private:
 		const std::vector<ResourceRequirement>& resourceRequirements,
 		const std::vector<std::pair<ResourceHandleAndRange, ResourceState>>& internalTransitions) const;
 	void CollectFrameResourceIDs(std::unordered_set<uint64_t>& out) const;
-	void ApplyIdleDematerializationPolicy(const std::unordered_set<uint64_t>& usedResourceIDs);
-	void SnapshotCompiledResourceGenerations(const std::unordered_set<uint64_t>& usedResourceIDs);
+	void ApplyIdleDematerializationPolicy(std::span<const uint64_t> usedResourceIDs);
+	void SnapshotCompiledResourceGenerations(std::span<const uint64_t> usedResourceIDs);
 	void ValidateCompiledResourceGenerations() const;
-	void RebuildSchedulingEquivalentIDCache(const std::unordered_set<uint64_t>& resourceIDs);
-	void RebuildFrameSchedulingResourceIndex(const std::unordered_set<uint64_t>& resourceIDs);
+	void RebuildSchedulingEquivalentIDCache(std::span<const uint64_t> resourceIDs);
+	void RebuildFrameSchedulingResourceIndex(std::span<const uint64_t> resourceIDs);
 	void RebuildEquivalentResourceIndicesByResourceIndex();
 	void RebuildFrameCompileResources();
 	void RebuildFramePassSchedulingSummaries();
@@ -1682,7 +1694,7 @@ private:
 	rg::profile::CompileProfileFrame* ActiveCompileProfileFrame() noexcept {
 		return m_compileProfileFrameActive ? std::addressof(m_activeCompileProfileFrame) : nullptr;
 	}
-	void RecordCompileProfileCounters(const std::vector<Node>& nodes, const std::unordered_set<uint64_t>& usedResourceIDs);
+	void RecordCompileProfileCounters(const std::vector<Node>& nodes, std::span<const uint64_t> usedResourceIDs);
 	void WriteCompiledGraphDebugDump(uint8_t frameIndex, const std::vector<Node>& nodes) const;
 	void WriteVramUsageDebugDump(uint8_t frameIndex) const;
 	void CoalesceQueueWaitsAndSignals(std::vector<PassBatch>& batchesToCoalesce) const;
@@ -1946,7 +1958,7 @@ private:
 	using CachedAliasPoolPlan = rg::alias::CachedAliasPoolPlan;
 
 	static PassView GetPassView(const AnyPassAndResources& pr);
-	void RebuildFramePassAccessSummaries(std::unordered_set<uint64_t>& outUsedResourceIDs);
+	void RebuildFramePassAccessSummaries();
 	bool BuildDependencyGraph(std::vector<Node>& nodes);
 	bool BuildDependencyGraph(std::vector<Node>& nodes, std::span<const std::pair<size_t, size_t>> explicitEdges);
 	static bool FinalizeDependencyGraph(std::vector<Node>& nodes);

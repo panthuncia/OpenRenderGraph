@@ -3535,7 +3535,7 @@ void RenderGraph::EndCompileProfileStep(uint32_t stepIndex, uint64_t durationNs)
 	m_activeCompileProfileFrame.steps[stepIndex].durationNs.store(durationNs, std::memory_order_relaxed);
 }
 
-void RenderGraph::RecordCompileProfileCounters(const std::vector<Node>& nodes, const std::unordered_set<uint64_t>& usedResourceIDs) {
+void RenderGraph::RecordCompileProfileCounters(const std::vector<Node>& nodes, std::span<const uint64_t> usedResourceIDs) {
 	if (!m_compileProfileFrameActive) {
 		return;
 	}
@@ -3735,10 +3735,12 @@ void RenderGraph::RebuildFrameCompileResources() {
 	}
 }
 
-void RenderGraph::CaptureCompileTrackersForExecution(const std::unordered_set<uint64_t>& resourceIDs) {
+void RenderGraph::CaptureCompileTrackersForExecution(std::span<const uint64_t> resourceIDs) {
 	ZoneScopedN("RenderGraph::CaptureCompileTrackersForExecution");
 	trackers.clear();
-	trackers.reserve(resourceIDs.size());
+	if (trackers.capacity() < resourceIDs.size()) {
+		trackers.reserve(resourceIDs.size());
+	}
 
 	auto captureTracker = [&](uint64_t resourceID) {
 		auto resourceIndex = TryGetFrameSchedulingResourceIndex(resourceID);
@@ -3757,7 +3759,10 @@ void RenderGraph::CaptureCompileTrackersForExecution(const std::unordered_set<ui
 			if (auto* backedResource = TryGetBackedResource(resource)) {
 				backingGeneration = backedResource->GetBackingGeneration();
 			}
-			trackers[resourceID] = CapturedTrackerResource{ .backingGeneration = backingGeneration };
+			trackers.push_back(CapturedTrackerResource{
+				.resourceID = resourceID,
+				.backingGeneration = backingGeneration,
+			});
 		}
 	};
 
@@ -3767,7 +3772,8 @@ void RenderGraph::CaptureCompileTrackersForExecution(const std::unordered_set<ui
 }
 
 void RenderGraph::PublishCompiledTrackerStates() {
-	for (const auto& [resourceID, captured] : trackers) {
+	for (const auto& captured : trackers) {
+		const uint64_t resourceID = captured.resourceID;
 		auto resourceIndex = TryGetFrameSchedulingResourceIndex(resourceID);
 		if (!resourceIndex.has_value() || *resourceIndex >= m_frameCompileResources.size()) {
 			continue;
@@ -3851,7 +3857,7 @@ void RenderGraph::ResetFrameQueueBatchHistoryTables() {
 	}
 }
 
-void RenderGraph::RebuildFrameSchedulingResourceIndex(const std::unordered_set<uint64_t>& resourceIDs) {
+void RenderGraph::RebuildFrameSchedulingResourceIndex(std::span<const uint64_t> resourceIDs) {
 	ZoneScopedN("RenderGraph::RebuildFrameSchedulingResourceIndex");
 	m_frameSchedulingResourceIndexByID.clear();
 	m_frameSchedulingResourceIndexEntries.clear();
@@ -4570,8 +4576,11 @@ void RenderGraph::CollectFrameResourceIDs(std::unordered_set<uint64_t>& used) co
 	}
 }
 
-void RenderGraph::ApplyIdleDematerializationPolicy(const std::unordered_set<uint64_t>& usedResourceIDs) {
+void RenderGraph::ApplyIdleDematerializationPolicy(std::span<const uint64_t> usedResourceIDs) {
 	ZoneScopedN("RenderGraph::ApplyIdleDematerializationPolicy");
+	auto isResourceUsed = [&](uint64_t id) {
+		return std::binary_search(usedResourceIDs.begin(), usedResourceIDs.end(), id);
+	};
 	for (auto& [id, resource] : resourcesByID) {
 		if (!resource) {
 			continue;
@@ -4582,7 +4591,7 @@ void RenderGraph::ApplyIdleDematerializationPolicy(const std::unordered_set<uint
 			continue;
 		}
 
-		if (usedResourceIDs.find(id) != usedResourceIDs.end()) {
+		if (isResourceUsed(id)) {
 			resourceIdleFrameCounts[id] = 0;
 			continue;
 		}
@@ -4597,7 +4606,7 @@ void RenderGraph::ApplyIdleDematerializationPolicy(const std::unordered_set<uint
 	}
 }
 
-void RenderGraph::SnapshotCompiledResourceGenerations(const std::unordered_set<uint64_t>& usedResourceIDs) {
+void RenderGraph::SnapshotCompiledResourceGenerations(std::span<const uint64_t> usedResourceIDs) {
 	compiledResourceGenerationByID.clear();
 	compiledResourceGenerationByID.reserve(usedResourceIDs.size());
 
@@ -5584,11 +5593,12 @@ std::tuple<int, int, int> RenderGraph::GetBatchesToWaitOn(
 	return { latestTransition, latestProducer, latestUsage };
 }
 
-void RenderGraph::MaterializeUnmaterializedResources(const std::unordered_set<uint64_t>* onlyResourceIDs) {
+void RenderGraph::MaterializeUnmaterializedResources(std::span<const uint64_t> onlyResourceIDs) {
 	ZoneScopedN("RenderGraph::MaterializeUnmaterializedResources");
+	const bool limitToResourceIDs = !onlyResourceIDs.empty();
 	// Returns the backing generation if the resource was materialized (or already materialized), or nullopt if skipped.
 	auto materializeOne = [&](uint64_t id, Resource* resource) -> std::optional<uint64_t> {
-		if (onlyResourceIDs && onlyResourceIDs->find(id) == onlyResourceIDs->end()) {
+		if (limitToResourceIDs && !std::binary_search(onlyResourceIDs.begin(), onlyResourceIDs.end(), id)) {
 			return std::nullopt;
 		}
 		if (!resource) {
@@ -5624,12 +5634,12 @@ void RenderGraph::MaterializeUnmaterializedResources(const std::unordered_set<ui
 						const bool hasAutoAliasPool = autoAliasPoolByID.find(id) != autoAliasPoolByID.end();
 						const bool aliasPlacementRequiredThisFrame = hasManualAliasPool || hasAutoAliasPool;
 
-						if (onlyResourceIDs && aliasPlacementRequiredThisFrame) {
+						if (limitToResourceIDs && aliasPlacementRequiredThisFrame) {
 							throw std::runtime_error(
 								"Aliasing placement missing for used aliased resource during frame materialization. Resource ID: " + std::to_string(id));
 						}
 
-						if (onlyResourceIDs && !aliasPlacementRequiredThisFrame) {
+						if (limitToResourceIDs && !aliasPlacementRequiredThisFrame) {
 							spdlog::debug(
 								"RG alias fallback materialize: id={} name='{}' allowAlias=1 but no pool assignment this frame; materializing standalone",
 								id,
@@ -5638,7 +5648,7 @@ void RenderGraph::MaterializeUnmaterializedResources(const std::unordered_set<ui
 
 						// Setup-time eager materialization happens before alias planning.
 						// Defer aliased resources until compile-time placement is available.
-						if (!onlyResourceIDs) {
+						if (!limitToResourceIDs) {
 							return std::nullopt;
 						}
 					}
@@ -5677,19 +5687,19 @@ void RenderGraph::MaterializeUnmaterializedResources(const std::unordered_set<ui
 					const bool hasAutoAliasPool = autoAliasPoolByID.find(id) != autoAliasPoolByID.end();
 					const bool aliasPlacementRequiredThisFrame = hasManualAliasPool || hasAutoAliasPool;
 
-					if (onlyResourceIDs && aliasPlacementRequiredThisFrame) {
+					if (limitToResourceIDs && aliasPlacementRequiredThisFrame) {
 						throw std::runtime_error(
 							"Aliasing placement missing for used aliased buffer during frame materialization. Resource ID: " + std::to_string(id));
 					}
 
-					if (onlyResourceIDs && !aliasPlacementRequiredThisFrame) {
+					if (limitToResourceIDs && !aliasPlacementRequiredThisFrame) {
 						spdlog::debug(
 							"RG alias fallback materialize (buffer): id={} name='{}' allowAlias=1 but no pool assignment this frame; materializing standalone",
 							id,
 							resource->GetName());
 					}
 
-					if (!onlyResourceIDs) {
+					if (!limitToResourceIDs) {
 						return std::nullopt;
 					}
 				}
@@ -5700,33 +5710,83 @@ void RenderGraph::MaterializeUnmaterializedResources(const std::unordered_set<ui
 		return buffer->GetBackingGeneration();
 	};
 
-	// Collect all unique {id, resource*} items to materialize
-	std::vector<std::pair<uint64_t, Resource*>> items;
-	items.reserve(onlyResourceIDs ? onlyResourceIDs->size() : resourcesByID.size() + m_transientFrameResourcesByID.size());
-	std::unordered_set<uint64_t> seen;
+	// Collect all unique {id, resource*} items to materialize.
+	auto& items = m_materializeScratchItems;
+	items.clear();
+	if (limitToResourceIDs) {
+		if (items.capacity() < m_frameDAGResourceIDsByIndex.size()) {
+			items.reserve(m_frameDAGResourceIDsByIndex.size());
+		}
+		if (m_materializeScratchQueuedByDenseResourceIndex.size() < m_frameDAGResourceIDsByIndex.size()) {
+			m_materializeScratchQueuedByDenseResourceIndex.resize(m_frameDAGResourceIDsByIndex.size(), 0);
+		}
+		std::fill(
+			m_materializeScratchQueuedByDenseResourceIndex.begin(),
+			m_materializeScratchQueuedByDenseResourceIndex.begin() + m_frameDAGResourceIDsByIndex.size(),
+			uint8_t{ 0 });
+	}
 
-	if (onlyResourceIDs) {
-		seen.reserve(onlyResourceIDs->size() * 2);
-		for (uint64_t id : *onlyResourceIDs) {
-			if (!seen.insert(id).second) {
-				continue;
-			}
+	auto findDenseMaterializeResourceIndex = [&](uint64_t id) -> std::optional<size_t> {
+		auto it = std::lower_bound(m_frameDAGResourceIDsByIndex.begin(), m_frameDAGResourceIDsByIndex.end(), id);
+		if (it == m_frameDAGResourceIDsByIndex.end() || *it != id) {
+			return std::nullopt;
+		}
+		return static_cast<size_t>(it - m_frameDAGResourceIDsByIndex.begin());
+	};
+
+	auto skipIfAlreadyMaterialized = [&](uint64_t id, Resource* resource) {
+		if (!resource || aliasMaterializeOptionsByID.find(id) != aliasMaterializeOptionsByID.end()) {
+			return false;
+		}
+		auto* backedResource = TryGetBackedResource(resource);
+		if (!backedResource) {
+			return true;
+		}
+		if (!backedResource->IsMaterialized()) {
+			return false;
+		}
+		return true;
+	};
+
+	auto tryQueueDenseMaterializeItem = [&](uint64_t id, Resource* resource) -> bool {
+		if (!resource) {
+			return false;
+		}
+		if (skipIfAlreadyMaterialized(id, resource)) {
+			return false;
+		}
+		auto denseIndex = findDenseMaterializeResourceIndex(id);
+		if (!denseIndex.has_value()) {
+			return false;
+		}
+		if (m_materializeScratchQueuedByDenseResourceIndex[*denseIndex] != 0) {
+			return false;
+		}
+		m_materializeScratchQueuedByDenseResourceIndex[*denseIndex] = 1;
+		items.emplace_back(id, resource);
+		return true;
+	};
+	std::unordered_set<uint64_t> fallbackSeen;
+
+	if (limitToResourceIDs) {
+		for (uint64_t id : onlyResourceIDs) {
 			if (auto it = resourcesByID.find(id); it != resourcesByID.end() && it->second) {
-				items.emplace_back(id, it->second.get());
+				tryQueueDenseMaterializeItem(id, it->second.get());
 				continue;
 			}
 			if (auto it = m_transientFrameResourcesByID.find(id); it != m_transientFrameResourcesByID.end() && it->second) {
-				items.emplace_back(id, it->second.get());
+				tryQueueDenseMaterializeItem(id, it->second.get());
 				continue;
 			}
 			if (auto it = m_dynamicResourcesByStableID.find(id); it != m_dynamicResourcesByStableID.end() && it->second) {
-				items.emplace_back(id, it->second.get());
+				tryQueueDenseMaterializeItem(id, it->second.get());
 				continue;
 			}
-			seen.erase(id);
 		}
 	}
 	else {
+		auto& seen = fallbackSeen;
+		items.reserve(resourcesByID.size() + m_transientFrameResourcesByID.size());
 		seen.reserve(items.capacity());
 		for (auto& [id, resource] : resourcesByID) {
 			if (seen.insert(id).second && resource) {
@@ -5744,18 +5804,27 @@ void RenderGraph::MaterializeUnmaterializedResources(const std::unordered_set<ui
 
 	auto collectFromHandle = [&](const ResourceRegistry::RegistryHandle& handle) {
 		const uint64_t id = handle.GetGlobalResourceID();
-		if (onlyResourceIDs && onlyResourceIDs->find(id) == onlyResourceIDs->end()) {
+		if (limitToResourceIDs && !findDenseMaterializeResourceIndex(id).has_value()) {
 			return;
 		}
-		if (!seen.insert(id).second) return;
+		if (!limitToResourceIDs && !fallbackSeen.insert(id).second) {
+			return;
+		}
 		Resource* resource = handle.IsEphemeral() ? handle.GetEphemeralPtr() : _registry.Resolve(handle);
 		if (resource) {
-			TrackTransientFrameResource(resource);
-			items.emplace_back(id, resource);
+			if (limitToResourceIDs) {
+				if (tryQueueDenseMaterializeItem(id, resource)) {
+					TrackTransientFrameResource(resource);
+				}
+			}
+			else {
+				TrackTransientFrameResource(resource);
+				items.emplace_back(id, resource);
+			}
 		}
 	};
 
-	if (onlyResourceIDs) {
+	if (limitToResourceIDs) {
 		for (const auto& summary : m_framePassAccessSummaries) {
 			for (const auto& req : summary.requirementSummaries) {
 				collectFromHandle(req.resource);
@@ -5799,12 +5868,8 @@ void RenderGraph::MaterializeUnmaterializedResources(const std::unordered_set<ui
 
 	// Parallel materialize phase
 	m_lastMaterializeCandidateCount = items.size();
-	struct GenerationResult {
-		uint64_t id = 0;
-		uint64_t generation = 0;
-		bool valid = false;
-	};
-	std::vector<GenerationResult> genResults(items.size());
+	auto& genResults = m_materializeScratchGenerationResults;
+	genResults.assign(items.size(), MaterializeGenerationResult{});
 
 	ParallelForOptional("Materialize", items.size(), [&](size_t i) {
 		auto [id, resource] = items[i];
