@@ -36,6 +36,17 @@
 #include "Resources/MemoryStatisticsComponents.h"
 
 namespace {
+	constexpr uint64_t kFrameDAGResourceIndexEmptyKey = std::numeric_limits<uint64_t>::max();
+
+	uint64_t MixFrameDAGResourceID(uint64_t value) noexcept {
+		value ^= value >> 33;
+		value *= 0xff51afd7ed558ccdull;
+		value ^= value >> 33;
+		value *= 0xc4ceb9fe1a85ec53ull;
+		value ^= value >> 33;
+		return value;
+	}
+
 	Resource* UnwrapDynamicResource(Resource* resource) noexcept {
 		auto* current = resource;
 		while (auto* dynamicResource = dynamic_cast<DynamicResource*>(current)) {
@@ -4820,7 +4831,22 @@ void RenderGraph::CollectFrameResourceIDs(std::unordered_set<uint64_t>& used) co
 void RenderGraph::ApplyIdleDematerializationPolicy(std::span<const uint64_t> usedResourceIDs) {
 	ZoneScopedN("RenderGraph::ApplyIdleDematerializationPolicy");
 	auto isResourceUsed = [&](uint64_t id) {
-		return std::binary_search(usedResourceIDs.begin(), usedResourceIDs.end(), id);
+		if (id == kFrameDAGResourceIndexEmptyKey || m_frameDAGResourceIndexHashKeys.empty()) {
+			return std::find(usedResourceIDs.begin(), usedResourceIDs.end(), id) != usedResourceIDs.end();
+		}
+
+		const size_t hashMask = m_frameDAGResourceIndexHashKeys.size() - 1;
+		size_t hashSlot = static_cast<size_t>(MixFrameDAGResourceID(id)) & hashMask;
+		for (;;) {
+			const uint64_t key = m_frameDAGResourceIndexHashKeys[hashSlot];
+			if (key == id) {
+				return true;
+			}
+			if (key == kFrameDAGResourceIndexEmptyKey) {
+				return false;
+			}
+			hashSlot = (hashSlot + 1) & hashMask;
+		}
 	};
 	for (auto& [id, resource] : resourcesByID) {
 		if (!resource) {
@@ -5873,9 +5899,6 @@ void RenderGraph::MaterializeUnmaterializedResources(std::span<const uint64_t> o
 
 	// Returns the backing generation if the resource was materialized (or already materialized), or nullopt if skipped.
 	auto materializeOne = [&](uint64_t id, Resource* resource) -> std::optional<uint64_t> {
-		if (limitToResourceIDs && !std::binary_search(onlyResourceIDs.begin(), onlyResourceIDs.end(), id)) {
-			return std::nullopt;
-		}
 		if (!resource) {
 			return std::nullopt;
 		}
@@ -5987,7 +6010,7 @@ void RenderGraph::MaterializeUnmaterializedResources(std::span<const uint64_t> o
 	auto& items = m_materializeScratchItems;
 	items.clear();
 	if (limitToResourceIDs) {
-		const size_t candidateCapacity = m_frameDAGUnmaterializedResourceIndices.size() + m_aliasMaterializeResourceIDs.size();
+		const size_t candidateCapacity = m_frameDAGResourceIDsByIndex.size() + m_aliasMaterializeResourceIDs.size();
 		if (items.capacity() < candidateCapacity) {
 			items.reserve(candidateCapacity);
 		}
@@ -6014,13 +6037,16 @@ void RenderGraph::MaterializeUnmaterializedResources(std::span<const uint64_t> o
 		if (auto it = m_transientFrameResourcesByID.find(id); it != m_transientFrameResourcesByID.end() && it->second) {
 			return it->second.get();
 		}
+		const size_t count = (std::min)(m_frameDAGResourceIDsByIndex.size(), m_frameDAGResourcePtrByIndex.size());
+		for (size_t resourceIndex = 0; resourceIndex < count; ++resourceIndex) {
+			if (m_frameDAGResourceIDsByIndex[resourceIndex] == id) {
+				return m_frameDAGResourcePtrByIndex[resourceIndex];
+			}
+		}
 		return nullptr;
 	};
 
 	auto queueLimitedMaterializeCandidate = [&](uint64_t id, Resource* resource) {
-		if (limitToResourceIDs && !std::binary_search(onlyResourceIDs.begin(), onlyResourceIDs.end(), id)) {
-			return;
-		}
 		if (!resource) {
 			return;
 		}

@@ -860,11 +860,12 @@ rg::alias::FrameAliasAnalysis& rg::alias::RenderGraphAliasingSubsystem::BuildAli
 		const uint32_t passCrit = node.criticality;
 
 		for (const auto& req : passSummary.requirementSummaries) {
-			if (req.dagResourceIndex == UINT32_MAX) {
+			auto resourceIndex = rg.TryGetFrameSchedulingResourceIndex(req.resourceID);
+			if (!resourceIndex) {
 				continue;
 			}
 			collectResource(
-				req.dagResourceIndex,
+				*resourceIndex,
 				req.resourceID,
 				&req.resource,
 				AccessTypeIsWriteOrCommon(req.state.access),
@@ -873,11 +874,12 @@ rg::alias::FrameAliasAnalysis& rg::alias::RenderGraphAliasingSubsystem::BuildAli
 				passIdx);
 		}
 		for (const auto& transition : passSummary.internalTransitionSummaries) {
-			if (transition.dagResourceIndex == UINT32_MAX) {
+			auto resourceIndex = rg.TryGetFrameSchedulingResourceIndex(transition.resourceID);
+			if (!resourceIndex) {
 				continue;
 			}
 			collectResource(
-				transition.dagResourceIndex,
+				*resourceIndex,
 				transition.resourceID,
 				nullptr,
 				true,

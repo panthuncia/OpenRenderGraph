@@ -627,29 +627,10 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 			if (m_frameDAGResourceIDsByIndex.capacity() < resourceIDCount) {
 				m_frameDAGResourceIDsByIndex.reserve(resourceIDCount);
 			}
-			m_frameDAGResourceIDsByIndex.clear();
 			{
-				ZoneScopedN("RGPassAccess::BuildDenseResourceIndex::FlattenIDs");
-				for (const auto& summary : m_framePassAccessSummaries) {
-					m_frameDAGResourceIDsByIndex.insert(
-						m_frameDAGResourceIDsByIndex.end(),
-						summary.touchedResourceIDs.begin(),
-						summary.touchedResourceIDs.end());
-				}
-			}
-			{
-				ZoneScopedN("RGPassAccess::BuildDenseResourceIndex::SortUniqueIDs");
-				std::sort(m_frameDAGResourceIDsByIndex.begin(), m_frameDAGResourceIDsByIndex.end());
-				m_frameDAGResourceIDsByIndex.erase(
-					std::unique(m_frameDAGResourceIDsByIndex.begin(), m_frameDAGResourceIDsByIndex.end()),
-					m_frameDAGResourceIDsByIndex.end());
-			}
-
-			m_frameDAGResourceCount = m_frameDAGResourceIDsByIndex.size();
-			{
-				ZoneScopedN("RGPassAccess::BuildDenseResourceIndex::BuildFlatIDLookup");
+				ZoneScopedN("RGPassAccess::BuildDenseResourceIndex::BuildFlatUniqueIndex");
 				size_t hashCapacity = 1;
-				while (hashCapacity < m_frameDAGResourceCount * 2) {
+				while (hashCapacity < resourceIDCount * 2) {
 					hashCapacity <<= 1;
 				}
 				if (m_frameDAGResourceIndexHashKeys.size() != hashCapacity) {
@@ -663,17 +644,29 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 						kFrameDAGResourceIndexEmptyKey);
 				}
 
+				m_frameDAGResourceIDsByIndex.clear();
 				const size_t hashMask = hashCapacity - 1;
-				for (size_t resourceIndex = 0; resourceIndex < m_frameDAGResourceIDsByIndex.size(); ++resourceIndex) {
-					const uint64_t resourceID = m_frameDAGResourceIDsByIndex[resourceIndex];
-					size_t hashSlot = static_cast<size_t>(MixFrameDAGResourceID(resourceID)) & hashMask;
-					while (m_frameDAGResourceIndexHashKeys[hashSlot] != kFrameDAGResourceIndexEmptyKey) {
-						hashSlot = (hashSlot + 1) & hashMask;
+				for (const auto& summary : m_framePassAccessSummaries) {
+					for (uint64_t resourceID : summary.touchedResourceIDs) {
+						size_t hashSlot = static_cast<size_t>(MixFrameDAGResourceID(resourceID)) & hashMask;
+						for (;;) {
+							const uint64_t key = m_frameDAGResourceIndexHashKeys[hashSlot];
+							if (key == resourceID) {
+								break;
+							}
+							if (key == kFrameDAGResourceIndexEmptyKey) {
+								const uint32_t resourceIndex = static_cast<uint32_t>(m_frameDAGResourceIDsByIndex.size());
+								m_frameDAGResourceIndexHashKeys[hashSlot] = resourceID;
+								m_frameDAGResourceIndexHashValues[hashSlot] = resourceIndex;
+								m_frameDAGResourceIDsByIndex.push_back(resourceID);
+								break;
+							}
+							hashSlot = (hashSlot + 1) & hashMask;
+						}
 					}
-					m_frameDAGResourceIndexHashKeys[hashSlot] = resourceID;
-					m_frameDAGResourceIndexHashValues[hashSlot] = static_cast<uint32_t>(resourceIndex);
 				}
 			}
+			m_frameDAGResourceCount = m_frameDAGResourceIDsByIndex.size();
 			{
 				ZoneScopedN("RGPassAccess::BuildDenseResourceIndex::ResetResourcePtrs");
 				m_frameDAGResourcePtrByIndex.assign(m_frameDAGResourceCount, nullptr);
