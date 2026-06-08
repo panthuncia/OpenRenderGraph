@@ -1602,7 +1602,7 @@ std::vector<RenderGraph::Node> RenderGraph::BuildNodes(RenderGraph& rg) {
 
 void RenderGraph::PlanActiveQueueSlots(
 	RenderGraph& rg,
-	const std::vector<AnyPassAndResources>& passes,
+	const RenderGraph::FramePassList& passes,
 	const std::vector<Node>& nodes)
 {
 	ZoneScopedN("RenderGraph::PlanActiveQueueSlots");
@@ -2302,7 +2302,7 @@ void RenderGraph::CommitPassToBatch(
 
 void RenderGraph::AutoScheduleAndBuildBatches(
 	RenderGraph& rg,
-	std::vector<AnyPassAndResources>& passes,
+	RenderGraph::FramePassList& passes,
 	std::vector<Node>& nodes)
 {
 	ZoneScopedN("RenderGraph::AutoScheduleAndBuildBatches");
@@ -4430,7 +4430,7 @@ void RenderGraph::RebuildFrameResourceAccessSummaries(const std::vector<Node>& n
 
 bool RenderGraph::ValidateSchedulingDecisionTrace(
 	const std::vector<Node>& nodes,
-	const std::vector<AnyPassAndResources>& framePasses,
+	const RenderGraph::FramePassList& framePasses,
 	const std::vector<PassBatch>& compiledBatches,
 	std::string& outSummary) const
 {
@@ -8838,12 +8838,18 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 						pending.pendingCommandLists.size());
 				}
 
-				rhiQueue.Submit({ pending.pendingCommandLists.data(), static_cast<uint32_t>(pending.pendingCommandLists.size()) }, {});
-				for (auto& pair : pending.pendingPairs) {
-					pending.submittedPairsAwaitingRecycle.push_back(std::move(pair));
+				{
+					ZoneScopedN("RenderGraph::Execute::ParallelPath::SubmitPendingWithoutSignal::RHI Submit");
+					rhiQueue.Submit({ pending.pendingCommandLists.data(), static_cast<uint32_t>(pending.pendingCommandLists.size()) }, {});
 				}
-				pending.pendingPairs.clear();
-				pending.pendingCommandLists.clear();
+				{
+					ZoneScopedN("RenderGraph::Execute::ParallelPath::SubmitPendingWithoutSignal::TrackPairs");
+					for (auto& pair : pending.pendingPairs) {
+						pending.submittedPairsAwaitingRecycle.push_back(std::move(pair));
+					}
+					pending.pendingPairs.clear();
+					pending.pendingCommandLists.clear();
+				}
 			};
 
 			auto signalAndRecycleQueue = [&](size_t queueIndex, size_t batchIndex, UINT64 signalValue, const char* reason) {

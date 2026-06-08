@@ -778,6 +778,60 @@ private:
 			: type(PassType::Copy), pass(std::move(cp)) {}
 	};
 
+	struct FramePassList {
+		struct iterator {
+			using base_iterator = std::vector<AnyPassAndResources*>::iterator;
+			using iterator_category = std::random_access_iterator_tag;
+			using difference_type = base_iterator::difference_type;
+			using value_type = AnyPassAndResources;
+			using reference = AnyPassAndResources&;
+			using pointer = AnyPassAndResources*;
+
+			base_iterator it{};
+			reference operator*() const { return **it; }
+			pointer operator->() const { return *it; }
+			iterator& operator++() { ++it; return *this; }
+			iterator operator++(int) { iterator tmp = *this; ++it; return tmp; }
+			bool operator==(const iterator& other) const { return it == other.it; }
+			bool operator!=(const iterator& other) const { return it != other.it; }
+		};
+
+		struct const_iterator {
+			using base_iterator = std::vector<AnyPassAndResources*>::const_iterator;
+			using iterator_category = std::random_access_iterator_tag;
+			using difference_type = base_iterator::difference_type;
+			using value_type = const AnyPassAndResources;
+			using reference = const AnyPassAndResources&;
+			using pointer = const AnyPassAndResources*;
+
+			base_iterator it{};
+			reference operator*() const { return **it; }
+			pointer operator->() const { return *it; }
+			const_iterator& operator++() { ++it; return *this; }
+			const_iterator operator++(int) { const_iterator tmp = *this; ++it; return tmp; }
+			bool operator==(const const_iterator& other) const { return it == other.it; }
+			bool operator!=(const const_iterator& other) const { return it != other.it; }
+		};
+
+		void clear() noexcept { entries.clear(); }
+		void reserve(size_t count) { entries.reserve(count); }
+		size_t capacity() const noexcept { return entries.capacity(); }
+		size_t size() const noexcept { return entries.size(); }
+		bool empty() const noexcept { return entries.empty(); }
+		void push_back(AnyPassAndResources& pass) { entries.push_back(std::addressof(pass)); }
+		void push_back(AnyPassAndResources* pass) { entries.push_back(pass); }
+		AnyPassAndResources& operator[](size_t index) noexcept { return *entries[index]; }
+		const AnyPassAndResources& operator[](size_t index) const noexcept { return *entries[index]; }
+		iterator begin() noexcept { return iterator{ entries.begin() }; }
+		iterator end() noexcept { return iterator{ entries.end() }; }
+		const_iterator begin() const noexcept { return const_iterator{ entries.begin() }; }
+		const_iterator end() const noexcept { return const_iterator{ entries.end() }; }
+		const_iterator cbegin() const noexcept { return const_iterator{ entries.cbegin() }; }
+		const_iterator cend() const noexcept { return const_iterator{ entries.cend() }; }
+
+		std::vector<AnyPassAndResources*> entries;
+	};
+
 	struct CompileContext {
 		std::unordered_map<uint64_t, unsigned int> usageHistCompute;
 		std::unordered_map<uint64_t, unsigned int> usageHistRender;
@@ -1483,8 +1537,10 @@ private:
 	std::vector<AnyPassAndResources> m_masterPassList;
 	std::vector<size_t> m_retainedDeclarationRefreshCandidateMasterIndices;
 	std::vector<std::pair<std::string, std::string>> m_structuralExplicitAfterByName;
-	std::vector<AnyPassAndResources> m_baseFramePasses;
-	std::vector<AnyPassAndResources> m_framePasses;
+	std::vector<AnyPassAndResources*> m_baseFramePassRefs;
+	std::vector<AnyPassAndResources> m_frameGeneratedPasses;
+	std::vector<AnyPassAndResources> m_frameExtensionPasses;
+	FramePassList m_framePasses;
 	std::vector<uint8_t> m_framePassIsFrameExtension;
 	std::vector<uint8_t> m_framePassDeclarationRefreshedThisFrame;
 	uint64_t m_frameDeclarationRefreshRequestedCount = 0;
@@ -1759,14 +1815,14 @@ private:
 	void CoalesceQueueWaitsAndSignals(std::vector<PassBatch>& batchesToCoalesce) const;
 	void ExtractScheduleRegionsFromAuthoritativeCompile(
 		const std::vector<Node>& nodes,
-		const std::vector<AnyPassAndResources>& framePasses,
+		const FramePassList& framePasses,
 		const std::vector<PassBatch>& compiledBatches,
 		std::vector<ScheduledRegion>& outRegions,
 		RegionCacheStats& outStats,
 		std::vector<std::string>& outCandidateDiagnostics) const;
 	void ExtractScheduleRegionsFromAuthoritativeCompile(
 		const std::vector<Node>& nodes,
-		const std::vector<AnyPassAndResources>& framePasses,
+		const FramePassList& framePasses,
 		const std::vector<PassBatch>& compiledBatches,
 		std::span<const TraceScanRange> traceRanges,
 		std::vector<ScheduledRegion>& outRegions,
@@ -1774,7 +1830,7 @@ private:
 		std::vector<std::string>& outCandidateDiagnostics) const;
 	void ExtractReplaySegmentsFromAuthoritativeCompile(
 		const std::vector<Node>& nodes,
-		const std::vector<AnyPassAndResources>& framePasses,
+		const FramePassList& framePasses,
 		const std::vector<PassBatch>& compiledBatches,
 		std::span<const ScheduledRegion> regions,
 		std::vector<CachedReplaySegment>& outSegments) const;
@@ -1802,7 +1858,7 @@ private:
 	std::string FormatReplaySegmentTemplateDiff(const CachedReplaySegment& cached, const CachedReplaySegment& current) const;
 	ReplaySegmentVerificationReport VerifyAuthoritativeScheduleSemantics(
 		const std::vector<Node>& nodes,
-		const std::vector<AnyPassAndResources>& framePasses,
+		const FramePassList& framePasses,
 		const std::vector<PassBatch>& compiledBatches) const;
 	ReplaySegmentVerificationReport BuildShadowReplayScheduleFromCachedSegments(
 		std::span<const CachedReplaySegment> previousSegments,
@@ -1817,11 +1873,11 @@ private:
 	ReplaySegmentVerificationReport ReplayCurrentFrameSegmentsAsAuthoritative(
 		std::span<const CachedReplaySegment> replaySegments,
 		std::span<const SchedulingDecisionTrace> authoritativeTrace,
-		std::vector<AnyPassAndResources>& framePasses,
+		FramePassList& framePasses,
 		std::vector<Node>& nodes);
 	bool ValidateSchedulingDecisionTrace(
 		const std::vector<Node>& nodes,
-		const std::vector<AnyPassAndResources>& framePasses,
+		const FramePassList& framePasses,
 		const std::vector<PassBatch>& compiledBatches,
 		std::string& outSummary) const;
 	void LogRegionCompileSummary(uint8_t frameIndex, const std::vector<Node>& nodes);
@@ -2026,7 +2082,7 @@ private:
 	bool BuildDependencyGraph(std::vector<Node>& nodes, std::span<const std::pair<size_t, size_t>> explicitEdges);
 	static bool FinalizeDependencyGraph(std::vector<Node>& nodes);
 	static std::vector<Node> BuildNodes(RenderGraph& rg);
-	static void PlanActiveQueueSlots(RenderGraph& rg, const std::vector<AnyPassAndResources>& passes, const std::vector<Node>& nodes);
+	static void PlanActiveQueueSlots(RenderGraph& rg, const FramePassList& passes, const std::vector<Node>& nodes);
 	static bool AddEdgeDedup(
 		size_t from, size_t to,
 		std::vector<Node>& nodes,
@@ -2045,7 +2101,7 @@ private:
 		std::vector<ResourceTransition>& scratchTransitions);
 	void AutoScheduleAndBuildBatches(
 		RenderGraph& rg,
-		std::vector<AnyPassAndResources>& passes,
+		FramePassList& passes,
 		std::vector<Node>& nodes);
 
 	std::unordered_map<uint64_t, uint64_t> autoAliasPoolByID;

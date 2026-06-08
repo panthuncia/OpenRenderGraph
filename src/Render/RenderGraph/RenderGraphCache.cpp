@@ -1358,7 +1358,7 @@ std::span<const uint64_t> RenderGraph::GetSchedulingEquivalentIDsCached(uint64_t
 
 void RenderGraph::ExtractScheduleRegionsFromAuthoritativeCompile(
 	const std::vector<Node>& nodes,
-	const std::vector<AnyPassAndResources>& framePasses,
+	const RenderGraph::FramePassList& framePasses,
 	const std::vector<PassBatch>& compiledBatches,
 	std::vector<ScheduledRegion>& outRegions,
 	RegionCacheStats& outStats,
@@ -1382,7 +1382,7 @@ void RenderGraph::ExtractScheduleRegionsFromAuthoritativeCompile(
 
 void RenderGraph::ExtractScheduleRegionsFromAuthoritativeCompile(
 	const std::vector<Node>& nodes,
-	const std::vector<AnyPassAndResources>& framePasses,
+	const RenderGraph::FramePassList& framePasses,
 	const std::vector<PassBatch>& compiledBatches,
 	std::span<const TraceScanRange> traceRanges,
 	std::vector<ScheduledRegion>& outRegions,
@@ -2001,7 +2001,7 @@ void RenderGraph::ExtractScheduleRegionsFromAuthoritativeCompile(
 
 void RenderGraph::ExtractReplaySegmentsFromAuthoritativeCompile(
 	const std::vector<Node>& nodes,
-	const std::vector<AnyPassAndResources>& framePasses,
+	const RenderGraph::FramePassList& framePasses,
 	const std::vector<PassBatch>& compiledBatches,
 	std::span<const ScheduledRegion> regions,
 	std::vector<CachedReplaySegment>& outSegments) const
@@ -3530,7 +3530,7 @@ RenderGraph::ReplaySegmentCacheUpdateStats RenderGraph::InsertOrRefreshReplaySeg
 
 RenderGraph::ReplaySegmentVerificationReport RenderGraph::VerifyAuthoritativeScheduleSemantics(
 	const std::vector<Node>& nodes,
-	const std::vector<AnyPassAndResources>& framePasses,
+	const RenderGraph::FramePassList& framePasses,
 	const std::vector<PassBatch>& compiledBatches) const
 {
 	ZoneScopedN("RenderGraph::VerifyAuthoritativeScheduleSemantics");
@@ -3880,7 +3880,7 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::VerifyReplayScheduleSe
 RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegmentsAsAuthoritative(
 	std::span<const CachedReplaySegment> replaySegments,
 	std::span<const SchedulingDecisionTrace> authoritativeTrace,
-	std::vector<AnyPassAndResources>& framePasses,
+	RenderGraph::FramePassList& framePasses,
 	std::vector<Node>& nodes)
 {
 	ZoneScopedN("RenderGraph::ReplayCurrentFrameSegmentsAsAuthoritative");
@@ -5695,9 +5695,15 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			m_reusablePassBatches.swap(batches);
 		}
 		batches.push_back(AcquireReusablePassBatch(m_queueRegistry.SlotCount())); // Dummy batch 0 for pre-first-pass transitions
-		if (m_baseFramePasses.capacity() < m_masterPassList.size()) {
-			m_baseFramePasses.reserve(m_masterPassList.size());
+		if (m_baseFramePassRefs.capacity() < m_masterPassList.size()) {
+			m_baseFramePassRefs.reserve(m_masterPassList.size());
 		}
+		if (m_frameGeneratedPasses.capacity() < m_masterPassList.size()) {
+			m_frameGeneratedPasses.reserve(m_masterPassList.size());
+		}
+		m_baseFramePassRefs.clear();
+		m_frameGeneratedPasses.clear();
+		m_frameExtensionPasses.clear();
 		m_framePassIsFrameExtension.clear();
 		m_framePassDeclarationRefreshedThisFrame.clear();
 	}
@@ -5739,24 +5745,12 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	traceCompileStep("BuildFramePassList");
 	{
 		ZoneScopedN("RenderGraph::CompileFrame::BuildFramePassList");
-		size_t baseFramePassWriteIndex = 0;
-		auto appendBaseFramePass = [&](const AnyPassAndResources& pass) {
-			if (baseFramePassWriteIndex < m_baseFramePasses.size()) {
-				m_baseFramePasses[baseFramePassWriteIndex] = pass;
-			}
-			else {
-				m_baseFramePasses.push_back(pass);
-			}
-			++baseFramePassWriteIndex;
+		auto appendBaseFramePassRef = [&](AnyPassAndResources& pass) {
+			m_baseFramePassRefs.push_back(std::addressof(pass));
 		};
 		auto appendBaseFramePassMove = [&](AnyPassAndResources&& pass) {
-			if (baseFramePassWriteIndex < m_baseFramePasses.size()) {
-				m_baseFramePasses[baseFramePassWriteIndex] = std::move(pass);
-			}
-			else {
-				m_baseFramePasses.push_back(std::move(pass));
-			}
-			++baseFramePassWriteIndex;
+			m_frameGeneratedPasses.emplace_back(std::move(pass));
+			m_baseFramePassRefs.push_back(std::addressof(m_frameGeneratedPasses.back()));
 		};
 
 		// Record immediate-mode commands + access for each pass and fold into per-frame requirements
@@ -5767,7 +5761,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			auto* immediateModeCommands = getImmediateModeCommands(p.pass.get());
 			if (!immediateModeCommands) {
 				p.run = PassRunMask::Retained;
-				appendBaseFramePass(pr);
+				appendBaseFramePassRef(pr);
 				continue;
 			}
 
@@ -5795,7 +5789,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 
 			if (!c.list.HasRecordedWork()) {
 				p.run = PassRunMask::Retained;
-				appendBaseFramePass(pr);
+				appendBaseFramePassRef(pr);
 				continue;
 			}
 
@@ -5819,14 +5813,14 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				immediateAnyPassAndResources.pass = immediatePassAndResources;
 				appendBaseFramePassMove(std::move(immediateAnyPassAndResources));
 				p.run = PassRunMask::Retained;
-				appendBaseFramePass(pr); // Retained pass
+				appendBaseFramePassRef(pr); // Retained pass
 			}
 			else {
 				p.immediateBytecode = std::move(immediateFrameData.bytecode);
 				p.immediateKeepAlive = std::move(immediateFrameData.keepAlive);
 				SetImmediateFrameRequirements(p.resources, std::move(immediateFrameData.requirements));
 				p.run = p.immediateBytecode.empty() ? PassRunMask::Retained : PassRunMask::Both;
-				appendBaseFramePass(pr);
+				appendBaseFramePassRef(pr);
 			}
 		}
 		else if (pr.type == PassType::Render) {
@@ -5834,7 +5828,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			auto* immediateModeCommands = getImmediateModeCommands(p.pass.get());
 			if (!immediateModeCommands) {
 				p.run = PassRunMask::Retained;
-				appendBaseFramePass(pr);
+				appendBaseFramePassRef(pr);
 				continue;
 			}
 
@@ -5858,7 +5852,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			}
 			if (!c.list.HasRecordedWork()) {
 				p.run = PassRunMask::Retained;
-				appendBaseFramePass(pr);
+				appendBaseFramePassRef(pr);
 				continue;
 			}
 			auto immediateFrameData = c.list.Finalize();
@@ -5882,14 +5876,14 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				immediateAnyPassAndResources.pass = immediatePassAndResources;
 				appendBaseFramePassMove(std::move(immediateAnyPassAndResources));
 				p.run = PassRunMask::Retained;
-				appendBaseFramePass(pr); // Retained pass
+				appendBaseFramePassRef(pr); // Retained pass
 			}
 			else {
 				p.immediateBytecode = std::move(immediateFrameData.bytecode);
 				p.immediateKeepAlive = std::move(immediateFrameData.keepAlive);
 				SetImmediateFrameRequirements(p.resources, std::move(immediateFrameData.requirements));
 				p.run = p.immediateBytecode.empty() ? PassRunMask::Retained : PassRunMask::Both;
-				appendBaseFramePass(pr);
+				appendBaseFramePassRef(pr);
 			}
 		}
 		else if (pr.type == PassType::Copy) {
@@ -5897,7 +5891,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			auto* immediateModeCommands = getImmediateModeCommands(p.pass.get());
 			if (!immediateModeCommands) {
 				p.run = PassRunMask::Retained;
-				appendBaseFramePass(pr);
+				appendBaseFramePassRef(pr);
 				continue;
 			}
 
@@ -5922,7 +5916,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			}
 			if (!c.list.HasRecordedWork()) {
 				p.run = PassRunMask::Retained;
-				appendBaseFramePass(pr);
+				appendBaseFramePassRef(pr);
 				continue;
 			}
 			auto immediateFrameData = c.list.Finalize();
@@ -5945,19 +5939,16 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				immediateAnyPassAndResources.pass = immediatePassAndResources;
 				appendBaseFramePassMove(std::move(immediateAnyPassAndResources));
 				p.run = PassRunMask::Retained;
-				appendBaseFramePass(pr);
+				appendBaseFramePassRef(pr);
 			}
 			else {
 				p.immediateBytecode = std::move(immediateFrameData.bytecode);
 				p.immediateKeepAlive = std::move(immediateFrameData.keepAlive);
 				SetImmediateFrameRequirements(p.resources, std::move(immediateFrameData.requirements));
 				p.run = p.immediateBytecode.empty() ? PassRunMask::Retained : PassRunMask::Both;
-				appendBaseFramePass(pr);
+				appendBaseFramePassRef(pr);
 			}
 		}
-		}
-		if (baseFramePassWriteIndex < m_baseFramePasses.size()) {
-			m_baseFramePasses.resize(baseFramePassWriteIndex);
 		}
 	}
 
@@ -6097,7 +6088,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			}
 		};
 
-		const auto& baseFramePasses = m_baseFramePasses;
+		const auto& baseFramePasses = m_baseFramePassRefs;
 
 		std::unordered_map<std::string_view, size_t> baseFramePassIndexByName;
 		{
@@ -6105,14 +6096,15 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			ZoneScopedN("RenderGraph::CompileFrame::BuildBaseFramePassIndex");
 			baseFramePassIndexByName.reserve(baseFramePasses.size() + frameExt.size());
 			for (size_t i = 0; i < baseFramePasses.size(); ++i) {
-				if (!baseFramePasses[i].name.empty()) {
-					baseFramePassIndexByName[baseFramePasses[i].name] = i;
+				const AnyPassAndResources* basePass = baseFramePasses[i];
+				if (basePass && !basePass->name.empty()) {
+					baseFramePassIndexByName[basePass->name] = i;
 				}
 			}
 		}
 
 		struct PendingFrameInsert {
-			AnyPassAndResources pass;
+			AnyPassAndResources* pass = nullptr;
 			size_t slotIndex = 0;
 			size_t nextInsertIndex = (std::numeric_limits<size_t>::max)();
 		};
@@ -6126,6 +6118,9 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		pendingInsertIndexByName.reserve(frameExt.size());
 		std::unordered_map<std::string_view, size_t> pendingInsertTailByAnchorName;
 		pendingInsertTailByAnchorName.reserve(frameExt.size());
+		if (m_frameExtensionPasses.capacity() < frameExt.size()) {
+			m_frameExtensionPasses.reserve(frameExt.size());
+		}
 
 		auto appendPendingToSlot = [&](size_t pendingIndex, size_t slotIndex) {
 			auto& pending = pendingFrameInserts[pendingIndex];
@@ -6168,8 +6163,9 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				if (!insertedPassName.empty()) {
 					frameExtensionPassNames.insert(insertedPassName);
 				}
+				m_frameExtensionPasses.emplace_back(std::move(any));
 				const size_t pendingIndex = pendingFrameInserts.size();
-				pendingFrameInserts.push_back(PendingFrameInsert{ .pass = std::move(any) });
+				pendingFrameInserts.push_back(PendingFrameInsert{ .pass = std::addressof(m_frameExtensionPasses.back()) });
 
 				std::string_view anchorName;
 				bool insertedRelativeToAnchor = false;
@@ -6230,45 +6226,35 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			if (m_framePasses.capacity() < baseFramePasses.size() + pendingFrameInserts.size()) {
 				m_framePasses.reserve(baseFramePasses.size() + pendingFrameInserts.size());
 			}
-			size_t finalFramePassWriteIndex = 0;
-			auto appendFinalFramePass = [&](const AnyPassAndResources& pass) {
-				if (finalFramePassWriteIndex < m_framePasses.size()) {
-					m_framePasses[finalFramePassWriteIndex] = pass;
-				}
-				else {
-					m_framePasses.push_back(pass);
-				}
-				++finalFramePassWriteIndex;
-			};
-			auto appendFinalFramePassMove = [&](AnyPassAndResources&& pass) {
-				if (finalFramePassWriteIndex < m_framePasses.size()) {
-					m_framePasses[finalFramePassWriteIndex] = std::move(pass);
-				}
-				else {
-					m_framePasses.push_back(std::move(pass));
-				}
-				++finalFramePassWriteIndex;
-			};
+			m_framePasses.clear();
 			auto appendSlot = [&](size_t slotIndex) {
 				for (size_t pendingIndex = slotHeadByIndex[slotIndex]; pendingIndex != invalidInsertIndex; pendingIndex = pendingFrameInserts[pendingIndex].nextInsertIndex) {
-					appendFinalFramePassMove(std::move(pendingFrameInserts[pendingIndex].pass));
+					m_framePasses.push_back(pendingFrameInserts[pendingIndex].pass);
 				}
 			};
 
 			for (size_t i = 0; i < baseFramePasses.size(); ++i) {
 				appendSlot(i);
-				appendFinalFramePass(baseFramePasses[i]);
+				if (baseFramePasses[i]) {
+					m_framePasses.push_back(baseFramePasses[i]);
+				}
 			}
 			appendSlot(baseFramePasses.size());
-			if (finalFramePassWriteIndex < m_framePasses.size()) {
-				m_framePasses.resize(finalFramePassWriteIndex);
-			}
 		}
 	}
 	else {
-		traceCompileStep("ActivateBaseFramePasses");
-		ZoneScopedN("RenderGraph::CompileFrame::ActivateBaseFramePasses");
-		m_framePasses.swap(m_baseFramePasses);
+		traceCompileStep("AssembleFramePassList");
+		ZoneScopedN("RenderGraph::CompileFrame::AssembleFramePassList");
+		if (m_framePasses.capacity() < m_baseFramePassRefs.size()) {
+			m_framePasses.reserve(m_baseFramePassRefs.size());
+		}
+		m_framePasses.clear();
+		for (AnyPassAndResources* pass : m_baseFramePassRefs) {
+			if (!pass) {
+				continue;
+			}
+			m_framePasses.push_back(pass);
+		}
 	}
 
 	{
