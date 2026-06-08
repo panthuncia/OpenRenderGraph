@@ -2292,19 +2292,29 @@ void RenderGraph::CommitPassToBatch(
 				}
 				applyInternalTransitions(pass);
 				recordRequirementHistory();
+				const bool hasQueueCrossing = (queueCount > 1);
+				if (hasQueueCrossing) {
+					rg.GetBatchesToWaitOn(
+						pass.name,
+						0,
+						passSummary,
+						resourcesTransitionedThisPass);
+				}
 
 				for (size_t qi = 0; qi < queueCount; ++qi) {
 					if (qi == passQueueSlot) {
 						continue;
 					}
 
-					rg.applySynchronization(
+					rg.ApplySynchronizationImpl(
 						passQueueSlot,
 						qi,
 						currentBatch,
 						currentBatchIndex,
-						pass,
-						resourcesTransitionedThisPass);
+						pass.name,
+						qi < queueCount ? rg.m_waitCacheLatestTransitionByQueue[qi] : -1,
+						qi < queueCount ? rg.m_waitCacheLatestProducerByQueue[qi] : -1,
+						qi < queueCount ? rg.m_waitCacheLatestUsageByQueue[qi] : -1);
 				}
 			}
 		},
@@ -4266,6 +4276,7 @@ void RenderGraph::RebuildFramePassSchedulingSummaries() {
 		summary.requirements.clear();
 		summary.internalTransitions.clear();
 		summary.requiredResourceIndices.clear();
+		summary.waitDependencyResourceIndices.clear();
 		summary.touchedResourceIndices.clear();
 		summary.uavResourceIndices.clear();
 		if (summary.requirements.capacity() < passAccess.requirementSummaries.size()) {
@@ -4276,6 +4287,9 @@ void RenderGraph::RebuildFramePassSchedulingSummaries() {
 		}
 		if (summary.requiredResourceIndices.capacity() < passAccess.requirementSummaries.size()) {
 			summary.requiredResourceIndices.reserve(passAccess.requirementSummaries.size());
+		}
+		if (summary.waitDependencyResourceIndices.capacity() < passAccess.requirementSummaries.size()) {
+			summary.waitDependencyResourceIndices.reserve(passAccess.requirementSummaries.size());
 		}
 		const size_t touchedResourceCapacity = passAccess.requirementSummaries.size() + passAccess.internalTransitionSummaries.size();
 		if (summary.touchedResourceIndices.capacity() < touchedResourceCapacity) {
@@ -4331,6 +4345,26 @@ void RenderGraph::RebuildFramePassSchedulingSummaries() {
 		summary.requiredResourceIndices.erase(
 			std::unique(summary.requiredResourceIndices.begin(), summary.requiredResourceIndices.end()),
 			summary.requiredResourceIndices.end());
+
+		summary.waitDependencyResourceIndices.reserve(summary.requiredResourceIndices.size());
+		for (size_t resourceIndex : summary.requiredResourceIndices) {
+			summary.waitDependencyResourceIndices.push_back(resourceIndex);
+		}
+		for (size_t resourceIndex : summary.requiredResourceIndices) {
+			if (resourceIndex >= m_equivalentResourceIndicesByResourceIndex.size()) {
+				continue;
+			}
+			const auto& equivalents = m_equivalentResourceIndicesByResourceIndex[resourceIndex];
+			for (size_t equivalentResourceIndex : equivalents) {
+				summary.waitDependencyResourceIndices.push_back(equivalentResourceIndex);
+			}
+		}
+		if (summary.waitDependencyResourceIndices.size() > 1) {
+			std::sort(summary.waitDependencyResourceIndices.begin(), summary.waitDependencyResourceIndices.end());
+			summary.waitDependencyResourceIndices.erase(
+				std::unique(summary.waitDependencyResourceIndices.begin(), summary.waitDependencyResourceIndices.end()),
+				summary.waitDependencyResourceIndices.end());
+		}
 
 		std::sort(summary.touchedResourceIndices.begin(), summary.touchedResourceIndices.end());
 		summary.touchedResourceIndices.erase(
@@ -5764,120 +5798,111 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(CopyPassAndResources& p, u
 }
 
 std::tuple<int, int, int> RenderGraph::GetBatchesToWaitOn(
-	const ComputePassAndResources& pass,
+	std::string_view passName,
 	size_t sourceQueueSlot,
+	const FramePassSchedulingSummary& passSummary,
 	const FrameEpochSet& resourcesTransitionedThisPass)
 {
-	ZoneScopedN("RenderGraph::GetBatchesToWaitOn(Compute)");
-	if (!pass.name.empty()) {
-		ZoneText(pass.name.data(), pass.name.size());
+	ZoneScopedN("RenderGraph::GetBatchesToWaitOn");
+	if (!passName.empty()) {
+		ZoneText(passName.data(), passName.size());
 	}
-	int latestTransition = -1, latestProducer = -1, latestUsage = -1;
 
-	auto processResource = [&](ResourceRegistry::RegistryHandle const& res) {
-		uint64_t id = res.GetGlobalResourceID();
-		for (auto rid : GetSchedulingEquivalentIDsCached(id)) {
-			auto resourceIndex = TryGetFrameSchedulingResourceIndex(rid);
-			if (!resourceIndex.has_value()) {
+	const size_t queueCount = m_queueRegistry.SlotCount();
+	const size_t resourceCount = m_frameSchedulingResourceCount;
+	if (m_waitCachePassSummary != &passSummary
+		|| m_waitCacheTransitionedResources != &resourcesTransitionedThisPass
+		|| m_waitCacheTransitionedEpoch != resourcesTransitionedThisPass.epoch
+		|| m_waitCacheQueueCount != queueCount) {
+		if (m_waitCacheLatestTransitionByQueue.size() < queueCount) {
+			m_waitCacheLatestTransitionByQueue.resize(queueCount, -1);
+		}
+		if (m_waitCacheLatestProducerByQueue.size() < queueCount) {
+			m_waitCacheLatestProducerByQueue.resize(queueCount, -1);
+		}
+		if (m_waitCacheLatestUsageByQueue.size() < queueCount) {
+			m_waitCacheLatestUsageByQueue.resize(queueCount, -1);
+		}
+
+		for (size_t queueSlot = 0; queueSlot < queueCount; ++queueSlot) {
+			m_waitCacheLatestTransitionByQueue[queueSlot] = -1;
+			m_waitCacheLatestProducerByQueue[queueSlot] = -1;
+			m_waitCacheLatestUsageByQueue[queueSlot] = -1;
+		}
+
+		for (size_t queueSlot = 0; queueSlot < queueCount; ++queueSlot) {
+			const size_t transitionRowOffset = queueSlot * resourceCount;
+			const size_t producerRowOffset = queueSlot * resourceCount;
+			const auto* transitionRow = transitionRowOffset < m_frameQueueLastTransitionBatch.size()
+				? &m_frameQueueLastTransitionBatch[transitionRowOffset]
+				: nullptr;
+			const auto* producerRow = producerRowOffset < m_frameQueueLastProducerBatch.size()
+				? &m_frameQueueLastProducerBatch[producerRowOffset]
+				: nullptr;
+			if (!transitionRow && !producerRow) {
 				continue;
 			}
-			latestTransition = std::max(latestTransition, (int)GetFrameQueueHistoryValue(m_frameQueueLastTransitionBatch, sourceQueueSlot, *resourceIndex));
-			latestProducer = std::max(latestProducer, (int)GetFrameQueueHistoryValue(m_frameQueueLastProducerBatch, sourceQueueSlot, *resourceIndex));
-		}
-		};
 
-	ForEachFrameRequirement(pass.resources, [&](const auto& req) {
-		processResource(req.resourceHandleAndRange.resource);
-	});
-
-	for (size_t resourceIndex : resourcesTransitionedThisPass.Values()) { // We only need to wait on the latest usage for resources that will be transitioned in this batch
-		latestUsage = std::max(latestUsage, (int)GetFrameQueueHistoryValue(m_frameQueueLastUsageBatch, sourceQueueSlot, resourceIndex));
-		if (resourceIndex < m_equivalentResourceIndicesByResourceIndex.size()) {
-			for (size_t equivalentResourceIndex : m_equivalentResourceIndicesByResourceIndex[resourceIndex]) {
-				latestUsage = std::max(latestUsage, (int)GetFrameQueueHistoryValue(m_frameQueueLastUsageBatch, sourceQueueSlot, equivalentResourceIndex));
+			for (size_t resourceIndex : passSummary.waitDependencyResourceIndices) {
+				if (resourceIndex >= resourceCount) {
+					continue;
+				}
+				if (transitionRow) {
+					const int transitionBatch = static_cast<int>(transitionRow[resourceIndex]);
+					m_waitCacheLatestTransitionByQueue[queueSlot] = (std::max)(
+						m_waitCacheLatestTransitionByQueue[queueSlot],
+						transitionBatch);
+				}
+				if (producerRow) {
+					const int producerBatch = static_cast<int>(producerRow[resourceIndex]);
+					m_waitCacheLatestProducerByQueue[queueSlot] = (std::max)(
+						m_waitCacheLatestProducerByQueue[queueSlot],
+						producerBatch);
+				}
 			}
 		}
-	}
 
-	return { latestTransition, latestProducer, latestUsage };
-}
+		const auto processUsageResourceForWaits = [&](size_t resourceIndex) {
+			if (resourceIndex >= resourceCount) {
+				return;
+			}
+			for (size_t queueSlot = 0; queueSlot < queueCount; ++queueSlot) {
+				const size_t usageRowOffset = queueSlot * resourceCount + resourceIndex;
+				if (usageRowOffset >= m_frameQueueLastUsageBatch.size()) {
+					continue;
+				}
+				const int usageBatch = static_cast<int>(m_frameQueueLastUsageBatch[usageRowOffset]);
+				m_waitCacheLatestUsageByQueue[queueSlot] = (std::max)(
+					m_waitCacheLatestUsageByQueue[queueSlot],
+					usageBatch);
+			}
+		};
 
-std::tuple<int, int, int> RenderGraph::GetBatchesToWaitOn(
-	const RenderPassAndResources& pass,
-	size_t sourceQueueSlot,
-	const FrameEpochSet& resourcesTransitionedThisPass)
-{
-	ZoneScopedN("RenderGraph::GetBatchesToWaitOn(Render)");
-	if (!pass.name.empty()) {
-		ZoneText(pass.name.data(), pass.name.size());
-	}
-	int latestTransition = -1, latestProducer = -1, latestUsage = -1;
-
-	auto processResource = [&](ResourceRegistry::RegistryHandle const& res) {
-		uint64_t id = res.GetGlobalResourceID();
-		for (auto rid : GetSchedulingEquivalentIDsCached(id)) {
-			auto resourceIndex = TryGetFrameSchedulingResourceIndex(rid);
-			if (!resourceIndex.has_value()) {
+		for (size_t resourceIndex : resourcesTransitionedThisPass.Values()) {
+			processUsageResourceForWaits(resourceIndex);
+			if (resourceIndex >= m_equivalentResourceIndicesByResourceIndex.size()) {
 				continue;
 			}
-			latestTransition = std::max(latestTransition, (int)GetFrameQueueHistoryValue(m_frameQueueLastTransitionBatch, sourceQueueSlot, *resourceIndex));
-			latestProducer = std::max(latestProducer, (int)GetFrameQueueHistoryValue(m_frameQueueLastProducerBatch, sourceQueueSlot, *resourceIndex));
-		}
-		};
-
-	ForEachFrameRequirement(pass.resources, [&](const auto& req) {
-		processResource(req.resourceHandleAndRange.resource);
-	});
-
-	for (size_t resourceIndex : resourcesTransitionedThisPass.Values()) { // We only need to wait on the latest usage for resources that will be transitioned in this batch
-		latestUsage = std::max(latestUsage, (int)GetFrameQueueHistoryValue(m_frameQueueLastUsageBatch, sourceQueueSlot, resourceIndex));
-		if (resourceIndex < m_equivalentResourceIndicesByResourceIndex.size()) {
 			for (size_t equivalentResourceIndex : m_equivalentResourceIndicesByResourceIndex[resourceIndex]) {
-				latestUsage = std::max(latestUsage, (int)GetFrameQueueHistoryValue(m_frameQueueLastUsageBatch, sourceQueueSlot, equivalentResourceIndex));
+				processUsageResourceForWaits(equivalentResourceIndex);
 			}
 		}
+
+		m_waitCachePassSummary = &passSummary;
+		m_waitCacheTransitionedResources = &resourcesTransitionedThisPass;
+		m_waitCacheTransitionedEpoch = resourcesTransitionedThisPass.epoch;
+		m_waitCacheQueueCount = queueCount;
 	}
 
-	return { latestTransition, latestProducer, latestUsage };
-}
-
-std::tuple<int, int, int> RenderGraph::GetBatchesToWaitOn(
-	const CopyPassAndResources& pass,
-	size_t sourceQueueSlot,
-	const FrameEpochSet& resourcesTransitionedThisPass)
-{
-	ZoneScopedN("RenderGraph::GetBatchesToWaitOn(Copy)");
-	if (!pass.name.empty()) {
-		ZoneText(pass.name.data(), pass.name.size());
-	}
-	int latestTransition = -1, latestProducer = -1, latestUsage = -1;
-
-	auto processResource = [&](ResourceRegistry::RegistryHandle const& res) {
-		uint64_t id = res.GetGlobalResourceID();
-		for (auto rid : GetSchedulingEquivalentIDsCached(id)) {
-			auto resourceIndex = TryGetFrameSchedulingResourceIndex(rid);
-			if (!resourceIndex.has_value()) {
-				continue;
-			}
-			latestTransition = std::max(latestTransition, (int)GetFrameQueueHistoryValue(m_frameQueueLastTransitionBatch, sourceQueueSlot, *resourceIndex));
-			latestProducer = std::max(latestProducer, (int)GetFrameQueueHistoryValue(m_frameQueueLastProducerBatch, sourceQueueSlot, *resourceIndex));
-		}
-		};
-
-	ForEachFrameRequirement(pass.resources, [&](const auto& req) {
-		processResource(req.resourceHandleAndRange.resource);
-	});
-
-	for (size_t resourceIndex : resourcesTransitionedThisPass.Values()) {
-		latestUsage = std::max(latestUsage, (int)GetFrameQueueHistoryValue(m_frameQueueLastUsageBatch, sourceQueueSlot, resourceIndex));
-		if (resourceIndex < m_equivalentResourceIndicesByResourceIndex.size()) {
-			for (size_t equivalentResourceIndex : m_equivalentResourceIndicesByResourceIndex[resourceIndex]) {
-				latestUsage = std::max(latestUsage, (int)GetFrameQueueHistoryValue(m_frameQueueLastUsageBatch, sourceQueueSlot, equivalentResourceIndex));
-			}
-		}
+	if (sourceQueueSlot >= queueCount) {
+		return { -1, -1, -1 };
 	}
 
-	return { latestTransition, latestProducer, latestUsage };
+	return {
+		m_waitCacheLatestTransitionByQueue[sourceQueueSlot],
+		m_waitCacheLatestProducerByQueue[sourceQueueSlot],
+		m_waitCacheLatestUsageByQueue[sourceQueueSlot]
+	};
 }
 
 void RenderGraph::MaterializeUnmaterializedResources(std::span<const uint64_t> onlyResourceIDs) {

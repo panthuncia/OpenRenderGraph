@@ -881,6 +881,7 @@ private:
 		std::vector<DenseRequirementSummary> requirements;
 		std::vector<DenseEquivalentResourceSummary> internalTransitions;
 		std::vector<size_t> requiredResourceIndices;
+		std::vector<size_t> waitDependencyResourceIndices;
 		std::vector<size_t> touchedResourceIndices;
 		std::vector<size_t> uavResourceIndices;
 	};
@@ -1654,6 +1655,13 @@ private:
 	std::vector<ResourceTransition> m_autoScheduleScratchTransitions;
 	std::vector<uint32_t> m_autoScheduleIndeg;
 	std::vector<size_t> m_autoScheduleReady;
+	const FramePassSchedulingSummary* m_waitCachePassSummary = nullptr;
+	const FrameEpochSet* m_waitCacheTransitionedResources = nullptr;
+	uint32_t m_waitCacheTransitionedEpoch = 0;
+	size_t m_waitCacheQueueCount = 0;
+	std::vector<int> m_waitCacheLatestTransitionByQueue;
+	std::vector<int> m_waitCacheLatestProducerByQueue;
+	std::vector<int> m_waitCacheLatestUsageByQueue;
 	std::vector<uint32_t> m_planActiveIndeg;
 	std::vector<uint32_t> m_planActiveLevel;
 	std::vector<size_t> m_planActiveReady;
@@ -1898,14 +1906,10 @@ private:
 		size_t candidateQueueSlot);
 	
 
-	std::tuple<int, int, int> GetBatchesToWaitOn(const ComputePassAndResources& pass,
+	std::tuple<int, int, int> GetBatchesToWaitOn(
+		std::string_view passName,
 		size_t sourceQueueSlot,
-		const FrameEpochSet& resourcesTransitionedThisPass);
-	std::tuple<int, int, int> GetBatchesToWaitOn(const RenderPassAndResources& pass,
-		size_t sourceQueueSlot,
-		const FrameEpochSet& resourcesTransitionedThisPass);
-	std::tuple<int, int, int> GetBatchesToWaitOn(const CopyPassAndResources& pass,
-		size_t sourceQueueSlot,
+		const FramePassSchedulingSummary& passSummary,
 		const FrameEpochSet& resourcesTransitionedThisPass);
 
 	void ProcessResourceRequirements(
@@ -1925,11 +1929,43 @@ private:
 		PassBatch&                        currentBatch,
 		unsigned int                      currentBatchIndex,
 		const PassRes&                    pass, // either ComputePassAndResources or RenderPassAndResources
+		const FramePassSchedulingSummary&  passSummary,
 		const FrameEpochSet&              resourcesTransitionedThisPass)
 	{
 		ZoneScopedN("RenderGraph::applySynchronization");
 		if (!pass.name.empty()) {
 			ZoneText(pass.name.data(), pass.name.size());
+		}
+		if (passQueueSlot == sourceQueueSlot) {
+			return;
+		}
+		auto [lastTransBatch, lastProdBatch, lastUsageBatch] =
+			GetBatchesToWaitOn(pass.name, sourceQueueSlot, passSummary, resourcesTransitionedThisPass);
+
+		ApplySynchronizationImpl(
+			passQueueSlot,
+			sourceQueueSlot,
+			currentBatch,
+			currentBatchIndex,
+			pass.name,
+			lastTransBatch,
+			lastProdBatch,
+			lastUsageBatch);
+	}
+
+	void ApplySynchronizationImpl(
+		size_t                            passQueueSlot,
+		size_t                            sourceQueueSlot,
+		PassBatch&                        currentBatch,
+		unsigned int                      currentBatchIndex,
+		std::string_view                  passName,
+		int                               lastTransBatch,
+		int                               lastProdBatch,
+		int                               lastUsageBatch)
+	{
+		ZoneScopedN("RenderGraph::ApplySynchronizationImpl");
+		if (!passName.empty()) {
+			ZoneText(passName.data(), passName.size());
 		}
 		if (passQueueSlot == sourceQueueSlot) {
 			return;
@@ -1959,10 +1995,6 @@ private:
 
 			return batches[batchIndex].GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, sourceQueueSlot);
 		};
-
-		// figure out which two numbers we wait on
-		auto [lastTransBatch, lastProdBatch, lastUsageBatch] =
-			GetBatchesToWaitOn(pass, sourceQueueSlot, resourcesTransitionedThisPass);
 
 		// Handle the "transition" wait
 		if (lastTransBatch != -1) {
