@@ -5977,12 +5977,14 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	// explicit After(anchor) edges (anchorName -> injectedName)
 	std::vector<std::pair<std::string, std::string>> explicitAfterByName;
 	{
+		traceCompileStep("CopyStructuralExplicitEdges");
 		ZoneScopedN("RenderGraph::CompileFrame::CopyStructuralExplicitEdges");
 		explicitAfterByName = m_structuralExplicitAfterByName;
 		explicitAfterByName.reserve(m_structuralExplicitAfterByName.size() + frameExt.size());
 	}
 
 	if (!frameExt.empty()) {
+		traceCompileStep("IntegrateFrameExtensions");
 		ZoneScopedN("RenderGraph::CompileFrame::IntegrateFrameExtensions");
 		auto recordImmediateCommands = [&](AnyPassAndResources& pr) {
 			if (pr.type == PassType::Compute) {
@@ -6097,8 +6099,9 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 
 		const auto& baseFramePasses = m_baseFramePasses;
 
-		std::unordered_map<std::string, size_t> baseFramePassIndexByName;
+		std::unordered_map<std::string_view, size_t> baseFramePassIndexByName;
 		{
+			traceCompileStep("BuildBaseFramePassIndex");
 			ZoneScopedN("RenderGraph::CompileFrame::BuildBaseFramePassIndex");
 			baseFramePassIndexByName.reserve(baseFramePasses.size() + frameExt.size());
 			for (size_t i = 0; i < baseFramePasses.size(); ++i) {
@@ -6119,9 +6122,9 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		pendingFrameInserts.reserve(frameExt.size());
 		std::vector<size_t> slotHeadByIndex(baseFramePasses.size() + 1, invalidInsertIndex);
 		std::vector<size_t> slotTailByIndex(baseFramePasses.size() + 1, invalidInsertIndex);
-		std::unordered_map<std::string, size_t> pendingInsertIndexByName;
+		std::unordered_map<std::string_view, size_t> pendingInsertIndexByName;
 		pendingInsertIndexByName.reserve(frameExt.size());
-		std::unordered_map<std::string, size_t> pendingInsertTailByAnchorName;
+		std::unordered_map<std::string_view, size_t> pendingInsertTailByAnchorName;
 		pendingInsertTailByAnchorName.reserve(frameExt.size());
 
 		auto appendPendingToSlot = [&](size_t pendingIndex, size_t slotIndex) {
@@ -6149,6 +6152,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		};
 
 		{
+			traceCompileStep("MaterializeFrameExtensions");
 			ZoneScopedN("RenderGraph::CompileFrame::MaterializeFrameExtensions");
 			for (auto& d : frameExt) {
 				if (d.type == PassType::Unknown) continue;
@@ -6167,7 +6171,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				const size_t pendingIndex = pendingFrameInserts.size();
 				pendingFrameInserts.push_back(PendingFrameInsert{ .pass = std::move(any) });
 
-				std::string anchorName;
+				std::string_view anchorName;
 				bool insertedRelativeToAnchor = false;
 
 				if (d.where.has_value()) {
@@ -6203,7 +6207,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				}
 
 				if (!anchorName.empty()) {
-					explicitAfterByName.push_back({ anchorName, insertedPassName });
+					explicitAfterByName.emplace_back(std::string(anchorName), insertedPassName);
 					pendingInsertTailByAnchorName[anchorName] = pendingIndex;
 				}
 				if (d.where.has_value()) {
@@ -6221,6 +6225,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		}
 
 		{
+			traceCompileStep("AssembleFramePassList");
 			ZoneScopedN("RenderGraph::CompileFrame::AssembleFramePassList");
 			if (m_framePasses.capacity() < baseFramePasses.size() + pendingFrameInserts.size()) {
 				m_framePasses.reserve(baseFramePasses.size() + pendingFrameInserts.size());
@@ -6261,26 +6266,13 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		}
 	}
 	else {
-		ZoneScopedN("RenderGraph::CompileFrame::CopyBaseFramePasses");
-		if (m_framePasses.capacity() < m_baseFramePasses.size()) {
-			m_framePasses.reserve(m_baseFramePasses.size());
-		}
-		size_t finalFramePassWriteIndex = 0;
-		for (const auto& pass : m_baseFramePasses) {
-			if (finalFramePassWriteIndex < m_framePasses.size()) {
-				m_framePasses[finalFramePassWriteIndex] = pass;
-			}
-			else {
-				m_framePasses.push_back(pass);
-			}
-			++finalFramePassWriteIndex;
-		}
-		if (finalFramePassWriteIndex < m_framePasses.size()) {
-			m_framePasses.resize(finalFramePassWriteIndex);
-		}
+		traceCompileStep("ActivateBaseFramePasses");
+		ZoneScopedN("RenderGraph::CompileFrame::ActivateBaseFramePasses");
+		m_framePasses.swap(m_baseFramePasses);
 	}
 
 	{
+		traceCompileStep("ClassifyFramePasses");
 		ZoneScopedN("RenderGraph::CompileFrame::ClassifyFramePasses");
 		m_framePassIsFrameExtension.assign(m_framePasses.size(), 0);
 		m_framePassDeclarationRefreshedThisFrame.assign(m_framePasses.size(), 0);
@@ -6296,6 +6288,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	// Register/refresh pass statistics indices for this frame's concrete pass list.
 	// This supports transient passes and per-frame retained/immediate splits.
 	if (m_statisticsService) {
+		traceCompileStep("RegisterStatistics");
 		ZoneScopedN("RenderGraph::CompileFrame::RegisterStatistics");
 		for (size_t i = 0; i < m_framePasses.size(); ++i) {
 			auto& any = m_framePasses[i];
@@ -6343,10 +6336,11 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	// Convert explicit After(anchorName)->(passName) constraints into node-index edges.
 	std::vector<std::pair<size_t, size_t>> explicitEdges;
 	{
+		traceCompileStep("BuildExplicitEdges");
 		ZoneScopedN("RenderGraph::CompileFrame::BuildExplicitEdges");
 		explicitEdges.reserve(explicitAfterByName.size());
 		if (!explicitAfterByName.empty()) {
-			std::unordered_map<std::string, size_t> nameToIndex;
+			std::unordered_map<std::string_view, size_t> nameToIndex;
 			nameToIndex.reserve(m_framePasses.size());
 			for (size_t i = 0; i < m_framePasses.size(); ++i) {
 				if (!m_framePasses[i].name.empty()) {
@@ -6354,8 +6348,8 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				}
 			}
 			for (auto const& e : explicitAfterByName) {
-				auto itA = nameToIndex.find(e.first);
-				auto itB = nameToIndex.find(e.second);
+				auto itA = nameToIndex.find(std::string_view(e.first));
+				auto itB = nameToIndex.find(std::string_view(e.second));
 				if (itA == nameToIndex.end() || itB == nameToIndex.end()) {
 					spdlog::warn("Explicit After edge dropped (anchor='{}', pass='{}'): name not found in frame pass list.", e.first, e.second);
 					continue;

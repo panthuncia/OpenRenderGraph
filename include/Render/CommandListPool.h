@@ -27,6 +27,8 @@ public:
         size_t enqueuedForBackgroundResetThisFrame = 0;
         size_t backgroundResetCompletedThisFrame = 0;
         size_t backgroundResetPendingCount = 0;
+        size_t totalOwnedCount = 0;
+        size_t warmTargetCount = 0;
     };
 
     CommandListPool(rhi::Device& device, rhi::QueueKind type);
@@ -68,6 +70,8 @@ private:
     std::thread m_backgroundResetThread;
     bool m_stopBackgroundReset = false;
     size_t m_backgroundResetActiveCount = 0;
+    size_t m_highWaterRequestedCount = 0;
+    size_t m_warmTargetCount = 0;
 
     std::vector<CommandListPair> m_available;
     std::deque<std::pair<uint64_t, CommandListPair>> m_inFlight;

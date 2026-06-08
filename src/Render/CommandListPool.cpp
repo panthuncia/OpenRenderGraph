@@ -6,6 +6,9 @@
 #include <tracy/Tracy.hpp>
 
 namespace {
+    constexpr size_t kWarmFramesInFlight = 4;
+    constexpr size_t kWarmSlackCommandLists = 4;
+
     const char* QueueKindDebugName(rhi::QueueKind type) noexcept {
         switch (type) {
         case rhi::QueueKind::Graphics: return "Graphics";
@@ -42,6 +45,8 @@ void CommandListPool::UpdateDiagnosticsCountsLocked() {
     m_diagnostics.availableCount = m_available.size();
     m_diagnostics.inFlightCount = m_inFlight.size();
     m_diagnostics.backgroundResetPendingCount = m_pendingBackgroundReset.size() + m_backgroundResetActiveCount;
+    m_diagnostics.totalOwnedCount = m_available.size() + m_inFlight.size() + m_pendingBackgroundReset.size() + m_backgroundResetActiveCount;
+    m_diagnostics.warmTargetCount = m_warmTargetCount;
 }
 
 CommandListPair CommandListPool::CreateReadyPair() {
@@ -98,12 +103,29 @@ void CommandListPool::PrepareForRequests(size_t requiredCount, uint64_t complete
     RecycleCompleted(completedFenceValue);
 
     size_t deficit = 0;
+    size_t availableBeforeWarm = 0;
+    size_t totalOwnedBeforeWarm = 0;
+    size_t warmTargetCount = 0;
     {
         std::lock_guard lock(m_mutex);
-        if (m_available.size() < requiredCount) {
-            deficit = requiredCount - m_available.size();
+        m_highWaterRequestedCount = std::max(m_highWaterRequestedCount, requiredCount);
+        warmTargetCount = (m_highWaterRequestedCount * kWarmFramesInFlight) + kWarmSlackCommandLists;
+        m_warmTargetCount = warmTargetCount;
+        availableBeforeWarm = m_available.size();
+        totalOwnedBeforeWarm = m_available.size()
+            + m_inFlight.size()
+            + m_pendingBackgroundReset.size()
+            + m_backgroundResetActiveCount;
+        const size_t requiredAvailableDeficit = requiredCount > m_available.size()
+            ? requiredCount - m_available.size()
+            : 0;
+        const size_t warmOwnedDeficit = warmTargetCount > totalOwnedBeforeWarm
+            ? warmTargetCount - totalOwnedBeforeWarm
+            : 0;
+        deficit = std::max(requiredAvailableDeficit, warmOwnedDeficit);
+        if (deficit > 0) {
             m_diagnostics.preparedDeficit = deficit;
-            m_available.reserve(requiredCount);
+            m_available.reserve(m_available.size() + deficit);
         }
     }
 
@@ -127,13 +149,21 @@ void CommandListPool::PrepareForRequests(size_t requiredCount, uint64_t complete
         }
 
         spdlog::debug(
-            "CommandListPool::PrepareForRequests queue={} required={} availableBeforeWarm={} created={} inFlight={}",
+            "CommandListPool::PrepareForRequests queue={} required={} availableBeforeWarm={} totalOwnedBeforeWarm={} warmTarget={} created={} inFlight={}",
             QueueKindDebugName(m_type),
             requiredCount,
-            requiredCount - deficit,
+            availableBeforeWarm,
+            totalOwnedBeforeWarm,
+            warmTargetCount,
             deficit,
             inFlightCount);
     }
+
+    TracyPlot("ORG.CommandListPool.Prepare.Required", static_cast<int64_t>(requiredCount));
+    TracyPlot("ORG.CommandListPool.Prepare.Created", static_cast<int64_t>(deficit));
+    TracyPlot("ORG.CommandListPool.Prepare.AvailableBeforeWarm", static_cast<int64_t>(availableBeforeWarm));
+    TracyPlot("ORG.CommandListPool.Prepare.TotalOwnedBeforeWarm", static_cast<int64_t>(totalOwnedBeforeWarm));
+    TracyPlot("ORG.CommandListPool.Prepare.WarmTarget", static_cast<int64_t>(warmTargetCount));
 
     {
         std::lock_guard lock(m_mutex);
