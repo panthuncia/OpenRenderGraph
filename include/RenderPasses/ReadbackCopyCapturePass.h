@@ -1,6 +1,7 @@
 #pragma once
 
 #include <boost/container_hash/hash.hpp>
+#include <tracy/Tracy.hpp>
 
 #include "RenderPasses/Base/CopyPass.h"
 #include "Render/Runtime/IReadbackService.h"
@@ -22,9 +23,11 @@ public:
     ReadbackCopyCapturePass(
         ReadbackCopyCaptureInputs inputs,
         ReadbackCaptureCallback callback,
-        rg::runtime::IReadbackService* readbackService)
+        rg::runtime::IReadbackService* readbackService,
+        std::string debugCaptureName = {})
         : m_callback(std::move(callback)),
-        m_readbackService(readbackService) {
+        m_readbackService(readbackService),
+        m_debugCaptureName(std::move(debugCaptureName)) {
         SetInputs(inputs);
     }
 
@@ -38,6 +41,11 @@ public:
     }
 
     void RecordImmediateCommands(ImmediateExecutionContext& context) override {
+        ZoneScopedN("ReadbackCopyCapturePass::RecordImmediateCommands");
+        if (!m_debugCaptureName.empty()) {
+            ZoneText(m_debugCaptureName.c_str(), m_debugCaptureName.size());
+        }
+
         const auto& inputs = Inputs<ReadbackCopyCaptureInputs>();
         auto* resource = m_resourceRegistryView->Resolve<Resource>(inputs.target.resource);
         if (!resource) {
@@ -73,8 +81,13 @@ public:
 
             auto info = context.device.GetCopyableFootprints(fr, footprints.data(), static_cast<uint32_t>(footprints.size()));
 
-            auto readbackBuffer = Buffer::CreateShared(rhi::HeapType::Readback, info.totalBytes);
-            readbackBuffer->SetName("ReadbackCopyCaptureBuffer");
+            auto readbackBuffer = m_readbackService
+                ? m_readbackService->AcquireReadbackBuffer(info.totalBytes, "ReadbackCopyCaptureBuffer")
+                : std::static_pointer_cast<Resource>(Buffer::CreateShared(rhi::HeapType::Readback, info.totalBytes));
+            if (!readbackBuffer) {
+                return;
+            }
+            TracyPlot("Readback.CaptureRequestedBytes", static_cast<int64_t>(info.totalBytes));
 
             for (uint32_t slice = 0; slice < sr.sliceCount; ++slice) {
                 for (uint32_t mip = 0; mip < sr.mipCount; ++mip) {
@@ -85,7 +98,7 @@ public:
                         texture,
                         sr.firstMip + mip,
                         sr.firstSlice + slice,
-                        readbackBuffer.get(),
+                        readbackBuffer,
                         fp,
                         0,
                         0,
@@ -107,10 +120,15 @@ public:
             if (!resource->TryGetBufferByteSize(byteSize) || byteSize == 0) {
                 throw std::runtime_error("ReadbackCopyCapturePass: resource is not a texture and does not expose a buffer byte size for readback.");
             }
-            auto readbackBuffer = Buffer::CreateShared(rhi::HeapType::Readback, byteSize);
-            readbackBuffer->SetName("ReadbackCopyCaptureBuffer");
+            auto readbackBuffer = m_readbackService
+                ? m_readbackService->AcquireReadbackBuffer(byteSize, "ReadbackCopyCaptureBuffer")
+                : std::static_pointer_cast<Resource>(Buffer::CreateShared(rhi::HeapType::Readback, byteSize));
+            if (!readbackBuffer) {
+                return;
+            }
+            TracyPlot("Readback.CaptureRequestedBytes", static_cast<int64_t>(byteSize));
 
-            context.list.CopyBufferRegion(readbackBuffer.get(), 0, resource, 0, byteSize);
+            context.list.CopyBufferRegion(readbackBuffer, 0, resource, 0, byteSize);
 
             request.desc.kind = ReadbackResourceKind::Buffer;
             request.readbackBuffer = readbackBuffer;
@@ -136,11 +154,14 @@ public:
             return {};
         }
 
-        auto signalFenceOwner = std::make_shared<rhi::TimelinePtr>();
-        context.device.CreateTimeline(*signalFenceOwner);
-        const rhi::Timeline signalFence = signalFenceOwner->Get();
-        constexpr uint64_t fenceValue = 1;
-        m_readbackService->FinalizeCapture(m_pendingToken, QueueKind::Copy, signalFenceOwner, fenceValue);
+        const rhi::Timeline signalFence = m_readbackService->GetReadbackFence(QueueKind::Copy);
+        if (!signalFence.IsValid()) {
+            m_hasPendingToken = false;
+            return {};
+        }
+
+        const uint64_t fenceValue = m_readbackService->GetNextReadbackFenceValue(QueueKind::Copy);
+        m_readbackService->FinalizeCapture(m_pendingToken, QueueKind::Copy, nullptr, fenceValue);
         m_hasPendingToken = false;
         return { signalFence, fenceValue };
     }
@@ -152,5 +173,6 @@ private:
     ReadbackCaptureCallback m_callback;
     rg::runtime::ReadbackCaptureToken m_pendingToken{};
     rg::runtime::IReadbackService* m_readbackService = nullptr; // non-owning
+    std::string m_debugCaptureName;
     bool m_hasPendingToken = false;
 };

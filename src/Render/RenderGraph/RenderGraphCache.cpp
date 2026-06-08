@@ -7,6 +7,8 @@
 #include <numeric>
 #include <optional>
 #include <sstream>
+#include <unordered_map>
+#include <unordered_set>
 #include <tracy/Tracy.hpp>
 
 #include "Interfaces/IDynamicDeclaredResources.h"
@@ -7212,6 +7214,29 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		uint32_t overlapTriggeredWaitCount = 0;
 		uint64_t overlapSampleCurrentResourceId = 0;
 		uint64_t overlapSamplePreviousResourceId = 0;
+		bool loggedGraphicsWaitOnCopySample = false;
+		std::unordered_map<const void*, std::string_view> passNameByEntry;
+		passNameByEntry.reserve(m_framePasses.size());
+		for (const auto& pr : m_framePasses) {
+			std::visit([&](auto const& passAndResources) {
+				using T = std::decay_t<decltype(passAndResources)>;
+				if constexpr (!std::is_same_v<T, std::monostate>) {
+					passNameByEntry.emplace(static_cast<const void*>(&passAndResources), std::string_view(pr.name));
+				}
+			}, pr.pass);
+		}
+		std::unordered_set<uint64_t> firstUseSeenResourceIDs;
+		firstUseSeenResourceIDs.reserve(std::max<size_t>(usedResourceIDs.size() * 2, 64));
+
+		auto resourceDebugName = [&](uint64_t resourceID) -> std::string {
+			if (auto it = resourcesByID.find(resourceID); it != resourcesByID.end() && it->second) {
+				return it->second->GetName();
+			}
+			if (auto it = m_transientFrameResourcesByID.find(resourceID); it != m_transientFrameResourcesByID.end() && it->second) {
+				return it->second->GetName();
+			}
+			return {};
+		};
 
 		auto markCrossFrameWait = [&](size_t dstSlot, size_t srcSlot, uint64_t fenceValue) {
 			if (dstSlot == srcSlot) {
@@ -7223,7 +7248,30 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			maxFence = std::max(maxFence, fenceValue);
 		};
 
-		auto accumulateCrossFrameWaitForHandle = [&](size_t passQueueSlot, const ResourceRegistry::RegistryHandle& handle) {
+		auto shouldProcessFirstUse = [&](const ResourceRegistry::RegistryHandle& handle) {
+			if (handle.IsEphemeral()) {
+				return false;
+			}
+
+			const uint64_t id = handle.GetGlobalResourceID();
+			const auto& equivalentIDs = GetSchedulingEquivalentIDsCached(id);
+			bool hasNewEquivalent = false;
+			for (uint64_t rid : equivalentIDs) {
+				if (firstUseSeenResourceIDs.find(rid) == firstUseSeenResourceIDs.end()) {
+					hasNewEquivalent = true;
+					break;
+				}
+			}
+			if (!hasNewEquivalent) {
+				return false;
+			}
+			for (uint64_t rid : equivalentIDs) {
+				firstUseSeenResourceIDs.insert(rid);
+			}
+			return true;
+		};
+
+		auto accumulateCrossFrameWaitForHandle = [&](size_t passQueueSlot, const ResourceRegistry::RegistryHandle& handle, std::string_view passName) {
 			if (handle.IsEphemeral()) {
 				return;
 			}
@@ -7233,6 +7281,18 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				auto it = m_lastProducerByResourceAcrossFrames.find(rid);
 				if (it != m_lastProducerByResourceAcrossFrames.end()) {
 					markCrossFrameWait(passQueueSlot, it->second.queueSlot, it->second.fenceValue);
+					if (!loggedGraphicsWaitOnCopySample && passQueueSlot == 0 && it->second.queueSlot == 2) {
+						loggedGraphicsWaitOnCopySample = true;
+						spdlog::warn(
+							"RG PlanCrossFrameQueueWaits graphics<-copy sample: source=last_producer pass='{}' originalResource={} matchedResource={} resourceName='{}' producerFence={} producerPublishSerial={} anonymous={}",
+							passName,
+							id,
+							rid,
+							resourceDebugName(rid),
+							it->second.fenceValue,
+							it->second.publishSerial,
+							it->second.anonymous);
+					}
 				}
 
 				const auto* placement = TryGetAliasPlacementRange(rid);
@@ -7266,6 +7326,22 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 					}
 
 					markCrossFrameWait(passQueueSlot, prevPlacementProducer.producer.queueSlot, prevPlacementProducer.producer.fenceValue);
+					if (!loggedGraphicsWaitOnCopySample && passQueueSlot == 0 && prevPlacementProducer.producer.queueSlot == 2) {
+						loggedGraphicsWaitOnCopySample = true;
+						spdlog::warn(
+							"RG PlanCrossFrameQueueWaits graphics<-copy sample: source=alias_overlap pass='{}' currentResource={} currentName='{}' previousResource={} previousName='{}' pool={} overlap=[{}, {}) producerFence={} producerPublishSerial={} anonymous={}",
+							passName,
+							rid,
+							resourceDebugName(rid),
+							prevPlacementProducer.resourceID,
+							resourceDebugName(prevPlacementProducer.resourceID),
+							placement->poolID,
+							overlapStart,
+							overlapEnd,
+							prevPlacementProducer.producer.fenceValue,
+							prevPlacementProducer.producer.publishSerial,
+							prevPlacementProducer.producer.anonymous);
+					}
 					overlapTriggeredWaitCount++;
 					if (overlapSampleCurrentResourceId == 0) {
 						overlapSampleCurrentResourceId = rid;
@@ -7275,25 +7351,31 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			}
 		};
 
-		for (const auto& pr : m_framePasses) {
-			const size_t passIndex = static_cast<size_t>(&pr - m_framePasses.data());
-			std::visit([&](auto const& passAndResources) {
-				using T = std::decay_t<decltype(passAndResources)>;
-				if constexpr (!std::is_same_v<T, std::monostate>) {
-					const size_t fallbackQueueSlot = passAndResources.resources.pinnedQueueSlot
-						? static_cast<size_t>(static_cast<uint8_t>(*passAndResources.resources.pinnedQueueSlot))
-						: QueueIndex(passAndResources.resources.preferredQueueKind);
-					const size_t passQueueSlot = passIndex < m_assignedQueueSlotsByFramePass.size()
-						? m_assignedQueueSlotsByFramePass[passIndex]
-						: fallbackQueueSlot;
-					ForEachFrameRequirement(passAndResources.resources, [&](const auto& req) {
-						accumulateCrossFrameWaitForHandle(passQueueSlot, req.resourceHandleAndRange.resource);
-					});
-					for (auto const& tr : passAndResources.resources.internalTransitions) {
-						accumulateCrossFrameWaitForHandle(passQueueSlot, tr.first.resource);
-					}
+		for (size_t batchIndex = 0; batchIndex < batches.size(); ++batchIndex) {
+			const auto& batch = batches[batchIndex];
+			for (size_t queueIndex = 0; queueIndex < batch.QueueCount(); ++queueIndex) {
+				for (const auto& passVariant : batch.Passes(queueIndex)) {
+					std::visit([&](const auto* passEntry) {
+						if (!passEntry) {
+							return;
+						}
+						std::string_view passName;
+						if (auto it = passNameByEntry.find(static_cast<const void*>(passEntry)); it != passNameByEntry.end()) {
+							passName = it->second;
+						}
+						ForEachFrameRequirement(passEntry->resources, [&](const auto& req) {
+							if (shouldProcessFirstUse(req.resourceHandleAndRange.resource)) {
+								accumulateCrossFrameWaitForHandle(queueIndex, req.resourceHandleAndRange.resource, passName);
+							}
+						});
+						for (auto const& tr : passEntry->resources.internalTransitions) {
+							if (shouldProcessFirstUse(tr.first.resource)) {
+								accumulateCrossFrameWaitForHandle(queueIndex, tr.first.resource, passName);
+							}
+						}
+					}, passVariant);
 				}
-			}, pr.pass);
+			}
 		}
 
 		//if (overlapTriggeredWaitCount > 0) {

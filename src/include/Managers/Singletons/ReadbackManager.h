@@ -1,9 +1,11 @@
 #pragma once
+#include <condition_variable>
 #include <memory>
 #include <vector>
 #include <atomic>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <rhi.h>
 
 #include "Render/QueueKind.h"
@@ -27,8 +29,10 @@ struct ReadbackCaptureToken {
 class ReadbackManager {
 public:
 	static ReadbackManager& GetInstance();
+	~ReadbackManager();
 
 	void Initialize(rhi::Timeline graphicsReadbackFence, rhi::Timeline copyReadbackFence) {
+		EnsureReleaseWorker();
 		m_graphicsReadbackFence = graphicsReadbackFence;
 		m_copyReadbackFence = copyReadbackFence;
 		m_initialized = m_graphicsReadbackFence.IsValid() || m_copyReadbackFence.IsValid();
@@ -44,6 +48,7 @@ public:
 
 	std::vector<ReadbackCaptureInfo> ConsumeCaptureRequests();
 
+	std::shared_ptr<Resource> AcquireReadbackBuffer(uint64_t byteSize, const char* debugName);
 	ReadbackCaptureToken EnqueueCapture(ReadbackCaptureRequest&& request);
 	void FinalizeCapture(ReadbackCaptureToken token, QueueKind queueKind, std::shared_ptr<rhi::TimelinePtr> signalFenceOwner, uint64_t fenceValue);
 
@@ -61,10 +66,22 @@ public:
 		m_warnedUninitializedUse = false;
 		m_captureFenceValueGraphics.store(0, std::memory_order_relaxed);
 		m_captureFenceValueCopy.store(0, std::memory_order_relaxed);
+		StopReleaseWorker();
+		{
+			std::lock_guard lock(m_readbackBufferPoolMutex);
+			m_readbackBufferPool.clear();
+			m_readbackBufferPoolBytes = 0;
+		}
 	}
 
 private:
 	ReadbackManager() = default;
+
+	void EnsureReleaseWorker();
+	void StopReleaseWorker();
+	void QueueDeferredRelease(std::vector<ReadbackCaptureRequest>&& requests);
+	void ReleaseWorkerMain();
+	void RecycleReadbackBuffer(std::shared_ptr<Resource>&& buffer);
 
 	static QueueKind NormalizeQueueKind(QueueKind queueKind) {
 		return queueKind == QueueKind::Copy ? QueueKind::Copy : QueueKind::Graphics;
@@ -86,6 +103,16 @@ private:
 	std::atomic<uint64_t> m_captureTokenCounter = 0;
 	std::atomic<uint64_t> m_captureFenceValueGraphics = 0;
 	std::atomic<uint64_t> m_captureFenceValueCopy = 0;
+
+	std::mutex m_releaseQueueMutex;
+	std::condition_variable m_releaseQueueCV;
+	std::vector<ReadbackCaptureRequest> m_deferredReleaseRequests;
+	std::thread m_releaseThread;
+	bool m_releaseThreadQuit = false;
+
+	std::mutex m_readbackBufferPoolMutex;
+	std::vector<std::shared_ptr<Resource>> m_readbackBufferPool;
+	uint64_t m_readbackBufferPoolBytes = 0;
 
 	// Static pointer to hold the instance
 	static std::unique_ptr<ReadbackManager> instance;

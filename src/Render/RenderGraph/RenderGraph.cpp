@@ -7863,6 +7863,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 
 	auto WaitOnSlot = [&](size_t dstSlot, size_t srcSlot, UINT64 absoluteFenceValue, std::string_view reason = {}) {
 		if (dstSlot == srcSlot) return;
+		ZoneScopedN("RenderGraph::Execute::FrameStartWaitOnSlot");
 		if (absoluteFenceValue == 0 || absoluteFenceValue == UINT64_MAX) {
 			throw std::runtime_error(fmt::format(
 				"WaitOnSlot rejected invalid fence value: dstSlot={} srcSlot={} value={} reason='{}'",
@@ -7873,7 +7874,27 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 		}
 		auto& srcFence = SlotFence(srcSlot);
 		const auto srcFenceHandle = srcFence.GetHandle();
-		const UINT64 completedFenceValue = srcFence.GetCompletedValue();
+		const auto waitBegin = std::chrono::steady_clock::now();
+		UINT64 completedFenceValue = 0;
+		{
+			ZoneScopedN("RenderGraph::Execute::FrameStartWaitOnSlot::GetCompletedValue");
+			completedFenceValue = srcFence.GetCompletedValue();
+		}
+		const uint64_t pendingDelta = completedFenceValue < absoluteFenceValue
+			? absoluteFenceValue - completedFenceValue
+			: 0;
+		ZoneValue(pendingDelta);
+		const std::string waitText = fmt::format(
+			"frame={} dstSlot={} srcSlot={} fence={} completed={} delta={} reason='{}'",
+			static_cast<unsigned>(context.frameIndex),
+			dstSlot,
+			srcSlot,
+			absoluteFenceValue,
+			completedFenceValue,
+			pendingDelta,
+			reason);
+		ZoneText(waitText.c_str(), waitText.size());
+		TracyPlot("RG.FrameStartWait.PendingDelta", static_cast<int64_t>(std::min<uint64_t>(pendingDelta, static_cast<uint64_t>(INT64_MAX))));
 		if (completedFenceValue == UINT64_MAX) {
 			throw std::runtime_error(fmt::format(
 				"WaitOnSlot detected poisoned queue timeline before wait: dstSlot={} srcSlot={} requestedFence={} completed=UINT64_MAX timeline(idx={}, gen={}) reason='{}'",
@@ -7884,8 +7905,35 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 				srcFenceHandle.generation,
 				reason));
 		}
+		if (completedFenceValue >= absoluteFenceValue) {
+			TracyPlot("RG.FrameStartWait.AlreadyCompleted", int64_t{ 1 });
+			return;
+		}
+		TracyPlot("RG.FrameStartWait.AlreadyCompleted", int64_t{ 0 });
+
 		auto dstQ = SlotQueue(dstSlot);
-		const rhi::Result waitResult = dstQ.Wait({ srcFenceHandle, absoluteFenceValue });
+		rhi::Result waitResult = rhi::Result::Ok;
+		{
+			ZoneScopedN("RenderGraph::Execute::FrameStartWaitOnSlot::QueueWait");
+			waitResult = dstQ.Wait({ srcFenceHandle, absoluteFenceValue });
+		}
+		const auto waitElapsedUs = std::chrono::duration_cast<std::chrono::microseconds>(
+			std::chrono::steady_clock::now() - waitBegin).count();
+		TracyPlot("RG.FrameStartWait.ElapsedUs", static_cast<int64_t>(waitElapsedUs));
+		if (waitElapsedUs >= 1000) {
+			spdlog::warn(
+				"RenderGraph frame-start wait slow: frame={} dstSlot={} srcSlot={} fence={} completedBefore={} delta={} elapsed_us={} timeline(idx={}, gen={}) reason='{}'",
+				static_cast<unsigned>(context.frameIndex),
+				dstSlot,
+				srcSlot,
+				absoluteFenceValue,
+				completedFenceValue,
+				pendingDelta,
+				waitElapsedUs,
+				srcFenceHandle.index,
+				srcFenceHandle.generation,
+				reason);
+		}
 		if (waitResult != rhi::Result::Ok) {
 			throw std::runtime_error(fmt::format(
 				"WaitOnSlot failed: dstSlot={} srcSlot={} fence={} completed={} timeline(idx={}, gen={}) result={} reason='{}'",

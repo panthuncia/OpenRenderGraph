@@ -32,6 +32,10 @@ public:
         return out;
     }
 
+    std::shared_ptr<Resource> AcquireReadbackBuffer(uint64_t byteSize, const char* debugName) override {
+        return ReadbackManager::GetInstance().AcquireReadbackBuffer(byteSize, debugName);
+    }
+
     rg::runtime::ReadbackCaptureToken EnqueueCapture(ReadbackCaptureRequest&& request) override {
         auto token = ReadbackManager::GetInstance().EnqueueCapture(std::move(request));
         return { token.id };

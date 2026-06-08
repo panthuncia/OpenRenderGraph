@@ -36,6 +36,7 @@ public:
     virtual void Initialize(rhi::Timeline graphicsReadbackFence, rhi::Timeline copyReadbackFence) = 0;
     virtual void RequestReadbackCapture(const std::string& passName, Resource* resource, const RangeSpec& range, ReadbackCaptureCallback callback, QueueKind preferredQueueKind = QueueKind::Graphics) = 0;
     virtual std::vector<ReadbackCaptureInfo> ConsumeCaptureRequests() = 0;
+    virtual std::shared_ptr<Resource> AcquireReadbackBuffer(uint64_t byteSize, const char* debugName) = 0;
     virtual ReadbackCaptureToken EnqueueCapture(ReadbackCaptureRequest&& request) = 0;
     virtual void FinalizeCapture(ReadbackCaptureToken token, QueueKind queueKind, std::shared_ptr<rhi::TimelinePtr> signalFenceOwner, uint64_t fenceValue) = 0;
     virtual uint64_t GetNextReadbackFenceValue(QueueKind queueKind) = 0;
