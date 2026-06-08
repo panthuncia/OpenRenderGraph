@@ -296,11 +296,11 @@ void RenderGraph::BuildMemoryIntrospectionFrameGraphSnapshot(
 	}
 
 	std::unordered_map<uint64_t, LiveIntervalRecord> liveIntervals;
-	const auto& frameSchedulingResourceIndexByID = this->m_frameSchedulingResourceIndexByID;
-	liveIntervals.reserve(firstTouchedBatchByResource.size() + frameSchedulingResourceIndexByID.size());
+	const auto& frameSchedulingResourceIndexEntries = this->m_frameSchedulingResourceIndexEntries;
+	liveIntervals.reserve(firstTouchedBatchByResource.size() + frameSchedulingResourceIndexEntries.size());
 	const size_t passCount = m_framePasses.size();
 
-	for (const auto& [resourceID, resourceIndex] : frameSchedulingResourceIndexByID) {
+	for (const auto& [resourceID, resourceIndex] : frameSchedulingResourceIndexEntries) {
 		const auto* placement = this->TryGetSchedulingPlacementRangeByResourceIndex(resourceIndex);
 		if (!placement) {
 			continue;
@@ -866,6 +866,7 @@ void rg::alias::RenderGraphAliasingSubsystem::AutoAssignAliasingPoolsFromAnalysi
 	auto& autoAliasModeLastFrame = rg.autoAliasModeLastFrame;
 	auto& m_getAutoAliasMode = rg.m_getAutoAliasMode;
 	auto& m_getAutoAliasEnableLogging = rg.m_getAutoAliasEnableLogging;
+	auto& m_getAutoAliasBuildDebugData = rg.m_getAutoAliasBuildDebugData;
 	auto& resourcesByID = rg.resourcesByID;
 	auto& m_getAutoAliasLogExclusionReasons = rg.m_getAutoAliasLogExclusionReasons;
 
@@ -877,6 +878,8 @@ void rg::alias::RenderGraphAliasingSubsystem::AutoAssignAliasingPoolsFromAnalysi
 
 	const AutoAliasMode mode = m_getAutoAliasMode ? m_getAutoAliasMode() : AutoAliasMode::Off;
 	const bool aliasLoggingEnabled = m_getAutoAliasEnableLogging ? m_getAutoAliasEnableLogging() : false;
+	const bool buildAliasDebug = aliasLoggingEnabled
+		|| (m_getAutoAliasBuildDebugData && m_getAutoAliasBuildDebugData());
 	const bool autoAliasEnabled = mode != AutoAliasMode::Off;
 	autoAliasModeLastFrame = mode;
 
@@ -911,6 +914,9 @@ void rg::alias::RenderGraphAliasingSubsystem::AutoAssignAliasingPoolsFromAnalysi
 	constexpr uint64_t kAutoPoolGlobal = 0xA171000000000000ull;
 
 	auto appendExcludedResource = [&](const FrameAliasResourceInfo& resourceInfo, const char* reason) {
+		if (!buildAliasDebug) {
+			return;
+		}
 		if (resourceInfo.resourceID == 0 || reason == nullptr) {
 			return;
 		}
@@ -945,7 +951,9 @@ void rg::alias::RenderGraphAliasingSubsystem::AutoAssignAliasingPoolsFromAnalysi
 		c.finalPoolID = 0;
 		c.hasFinalPool = false;
 		if (c.exclusionReason != nullptr) {
-			autoAliasExclusionReasonByID.try_emplace(c.resourceID, c.exclusionReason);
+			if (buildAliasDebug) {
+				autoAliasExclusionReasonByID.try_emplace(c.resourceID, c.exclusionReason);
+			}
 			appendExcludedResource(c, c.exclusionReason);
 		}
 		if (c.hasManualPool) {
@@ -970,7 +978,9 @@ void rg::alias::RenderGraphAliasingSubsystem::AutoAssignAliasingPoolsFromAnalysi
 		const float score = scoreCandidate(c);
 		if (score < inclusionThreshold) {
 			autoAliasPlannerStats.excluded++;
-			autoAliasExclusionReasonByID[c.resourceID] = "score below threshold";
+			if (buildAliasDebug) {
+				autoAliasExclusionReasonByID[c.resourceID] = "score below threshold";
+			}
 			appendExcludedResource(c, "score below threshold");
 			continue;
 		}
@@ -985,31 +995,32 @@ void rg::alias::RenderGraphAliasingSubsystem::AutoAssignAliasingPoolsFromAnalysi
 	}
 
 	std::unordered_map<std::string, size_t> exclusionReasonCounts;
-	exclusionReasonCounts.reserve(autoAliasExclusionReasonByID.size());
-	for (const auto& [id, reason] : autoAliasExclusionReasonByID) {
-		(void)id;
-		exclusionReasonCounts[reason]++;
+	if (buildAliasDebug) {
+		exclusionReasonCounts.reserve(autoAliasExclusionReasonByID.size());
+		for (const auto& [id, reason] : autoAliasExclusionReasonByID) {
+			(void)id;
+			exclusionReasonCounts[reason]++;
+		}
+		autoAliasExclusionReasonSummary.reserve(exclusionReasonCounts.size());
+		for (const auto& [reason, count] : exclusionReasonCounts) {
+			autoAliasExclusionReasonSummary.push_back(AutoAliasReasonCount{ .reason = reason, .count = count });
+		}
+		std::sort(autoAliasExclusionReasonSummary.begin(), autoAliasExclusionReasonSummary.end(), [](const AutoAliasReasonCount& a, const AutoAliasReasonCount& b) {
+			if (a.count != b.count) {
+				return a.count > b.count;
+			}
+			return a.reason < b.reason;
+			});
+		std::sort(autoAliasExcludedResources.begin(), autoAliasExcludedResources.end(), [](const AutoAliasExcludedResourceDebug& a, const AutoAliasExcludedResourceDebug& b) {
+			if (a.sizeBytes != b.sizeBytes) {
+				return a.sizeBytes > b.sizeBytes;
+			}
+			if (a.resourceName != b.resourceName) {
+				return a.resourceName < b.resourceName;
+			}
+			return a.resourceID < b.resourceID;
+			});
 	}
-	autoAliasExclusionReasonSummary.clear();
-	autoAliasExclusionReasonSummary.reserve(exclusionReasonCounts.size());
-	for (const auto& [reason, count] : exclusionReasonCounts) {
-		autoAliasExclusionReasonSummary.push_back(AutoAliasReasonCount{ .reason = reason, .count = count });
-	}
-	std::sort(autoAliasExclusionReasonSummary.begin(), autoAliasExclusionReasonSummary.end(), [](const AutoAliasReasonCount& a, const AutoAliasReasonCount& b) {
-		if (a.count != b.count) {
-			return a.count > b.count;
-		}
-		return a.reason < b.reason;
-		});
-	std::sort(autoAliasExcludedResources.begin(), autoAliasExcludedResources.end(), [](const AutoAliasExcludedResourceDebug& a, const AutoAliasExcludedResourceDebug& b) {
-		if (a.sizeBytes != b.sizeBytes) {
-			return a.sizeBytes > b.sizeBytes;
-		}
-		if (a.resourceName != b.resourceName) {
-			return a.resourceName < b.resourceName;
-		}
-		return a.resourceID < b.resourceID;
-		});
 
 	if (aliasLoggingEnabled && autoAliasPlannerStats.candidatesSeen > 0) {
 		spdlog::info(
@@ -1092,7 +1103,7 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 	auto& m_getAutoAliasPackingStrategy = rg.m_getAutoAliasPackingStrategy;
 	auto& m_getAutoAliasEnableLogging = rg.m_getAutoAliasEnableLogging;
 	auto& m_getAutoAliasBuildDebugData = rg.m_getAutoAliasBuildDebugData;
-	auto& frameSchedulingResourceIndexByID = rg.m_frameSchedulingResourceIndexByID;
+	auto& frameSchedulingResourceIndexEntries = rg.m_frameSchedulingResourceIndexEntries;
 	auto& persistentAliasPools = rg.persistentAliasPools;
 	auto& m_framePasses = rg.m_framePasses;
 	auto& resourcesByID = rg.resourcesByID;
@@ -2112,10 +2123,25 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 		aliasPlacementSignatureByID.erase(resourceID);
 	}
 
-	aliasPlacementRangesByID.reserve(frameSchedulingResourceIndexByID.size());
-	schedulingPlacementRangesByID.reserve(frameSchedulingResourceIndexByID.size());
-	aliasActivationPending.reserve(frameSchedulingResourceIndexByID.size());
-	for (const auto& [resourceID, resourceIndex] : frameSchedulingResourceIndexByID) {
+	size_t aliasPlacementCount = 0;
+	size_t schedulingPlacementCount = 0;
+	size_t aliasActivationPendingCount = 0;
+	for (const auto& [resourceID, resourceIndex] : frameSchedulingResourceIndexEntries) {
+		(void)resourceID;
+		if (resourceIndex < hasAliasPlacementByResourceIndex.size() && hasAliasPlacementByResourceIndex[resourceIndex] != 0) {
+			++aliasPlacementCount;
+		}
+		if (resourceIndex < hasSchedulingPlacementByResourceIndex.size() && hasSchedulingPlacementByResourceIndex[resourceIndex] != 0) {
+			++schedulingPlacementCount;
+		}
+		if (resourceIndex < aliasActivationPendingByResourceIndex.size() && aliasActivationPendingByResourceIndex[resourceIndex] != 0) {
+			++aliasActivationPendingCount;
+		}
+	}
+	aliasPlacementRangesByID.reserve(aliasPlacementCount);
+	schedulingPlacementRangesByID.reserve(schedulingPlacementCount);
+	aliasActivationPending.reserve(aliasActivationPendingCount);
+	for (const auto& [resourceID, resourceIndex] : frameSchedulingResourceIndexEntries) {
 		if (resourceIndex < hasAliasPlacementByResourceIndex.size() && hasAliasPlacementByResourceIndex[resourceIndex] != 0) {
 			aliasPlacementRangesByID.emplace(resourceID, aliasPlacementRangeByResourceIndex[resourceIndex]);
 		}

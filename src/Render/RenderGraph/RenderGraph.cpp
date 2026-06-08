@@ -1951,7 +1951,7 @@ bool RenderGraph::AddCurrentFrameAliasSchedulingEdges(std::vector<Node>& nodes)
 
 	std::vector<uint64_t> resourceIDs;
 	resourceIDs.reserve(aliasPlacementPoolByID.size());
-	for (const auto& [resourceID, resourceIndex] : m_frameSchedulingResourceIndexByID) {
+	for (const auto& [resourceID, resourceIndex] : m_frameSchedulingResourceIndexEntries) {
 		if (TryGetAliasPlacementRangeByResourceIndex(resourceIndex)) {
 			resourceIDs.push_back(resourceID);
 		}
@@ -2196,7 +2196,7 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 
 	auto openNewBatch = [&]() -> PassBatch {
 		const size_t queueCount = rg.m_queueRegistry.SlotCount();
-		PassBatch b(queueCount);
+		PassBatch b = rg.AcquireReusablePassBatch(queueCount);
 		for (size_t qi = 0; qi < queueCount; ++qi) {
 			b.SetQueueSignalFenceValue(RenderGraph::BatchSignalPhase::AfterTransitions, qi, rg.GetNextQueueFenceValue(qi));
 			b.SetQueueSignalFenceValue(RenderGraph::BatchSignalPhase::AfterExecution, qi, rg.GetNextQueueFenceValue(qi));
@@ -2219,6 +2219,8 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 	FrameEpochSet scratchFallback;
 	scratchFallback.Initialize(rg.m_frameSchedulingResourceCount);
 	std::vector<ResourceTransition> scratchTransitions;
+	scratchTransitions.reserve(16);
+	rg.m_schedulingDecisionTrace.reserve(nodes.size());
 	const double autoGraphicsBias = rg.m_getQueueSchedulingAutoGraphicsBias ? static_cast<double>(rg.m_getQueueSchedulingAutoGraphicsBias()) : 2.5;
 	const double asyncOverlapBonus = rg.m_getQueueSchedulingAsyncOverlapBonus ? static_cast<double>(rg.m_getQueueSchedulingAsyncOverlapBonus()) : 3.0;
 	const double crossQueueHandoffPenalty = rg.m_getQueueSchedulingCrossQueueHandoffPenalty ? static_cast<double>(rg.m_getQueueSchedulingCrossQueueHandoffPenalty()) : 2.0;
@@ -2300,7 +2302,7 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 		{
 			ZoneScopedN("RenderGraph::AutoScheduleAndBuildBatches::EvaluateCandidates");
 
-		std::vector<uint8_t> batchHasQueue(queueCount);
+		std::array<uint8_t, 64> batchHasQueue{};
 		for (size_t queueIndex = 0; queueIndex < queueCount; ++queueIndex) {
 			batchHasQueue[queueIndex] = currentBatch.HasPasses(queueIndex);
 		}
@@ -2312,7 +2314,7 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 			}
 		}
 
-		const bool batchHasGraphicsWork = gfxSlot < batchHasQueue.size() && batchHasQueue[gfxSlot] != 0;
+		const bool batchHasGraphicsWork = gfxSlot < queueCount && batchHasQueue[gfxSlot] != 0;
 
 		for (int ri = 0; ri < (int)ready.size(); ++ri) {
 			size_t ni = ready[ri];
@@ -2585,22 +2587,24 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 	// frame-start waits.
 	{
 		ZoneScopedN("RenderGraph::AutoScheduleAndBuildBatches::BuildCrossFrameProducerTracking");
-		std::vector<std::unordered_map<uint64_t, unsigned int>> crossFrameProducer(queueCount);
-		for (unsigned int bi = 1; bi < static_cast<unsigned int>(rg.batches.size()); ++bi) {
-			auto& batch = rg.batches[bi];
-			for (size_t qi = 0; qi < queueCount; ++qi) {
-				for (auto& passVariant : batch.Passes(qi)) {
-					std::visit([&](const auto* passEntry) {
-						ForEachFrameRequirement(passEntry->resources, [&](const auto& req) {
-							if (AccessTypeIsWriteType(req.state.access)) {
-								crossFrameProducer[qi][req.resourceHandleAndRange.resource.GetGlobalResourceID()] = bi;
-							}
-						});
-					}, passVariant);
+		rg.m_compiledLastProducerBatchByResourceByQueue.resize(queueCount);
+		for (auto& producerMap : rg.m_compiledLastProducerBatchByResourceByQueue) {
+			producerMap.clear();
+		}
+		for (const auto& decision : rg.m_schedulingDecisionTrace) {
+			const size_t queueSlot = decision.assignedQueueSlot;
+			if (queueSlot >= rg.m_compiledLastProducerBatchByResourceByQueue.size()
+				|| decision.passIndex >= rg.m_framePassSchedulingSummaries.size()) {
+				continue;
+			}
+			auto& producerMap = rg.m_compiledLastProducerBatchByResourceByQueue[queueSlot];
+			const auto& passSummary = rg.m_framePassSchedulingSummaries[decision.passIndex];
+			for (const auto& req : passSummary.requirements) {
+				if (AccessTypeIsWriteType(req.state.access)) {
+					producerMap[req.resource.GetGlobalResourceID()] = decision.batchIndex;
 				}
 			}
 		}
-		rg.m_compiledLastProducerBatchByResourceByQueue = std::move(crossFrameProducer);
 	}
 
 	if (rg.m_getRenderGraphBatchTraceEnabled && rg.m_getRenderGraphBatchTraceEnabled()) {
@@ -3371,6 +3375,7 @@ void RenderGraph::ShutdownRuntime() {
 
 void RenderGraph::ShutdownOwnedState() {
 	batches.clear();
+	m_reusablePassBatches.clear();
 	initialTransitions.clear();
 	trackers.clear();
 	m_frameCompileResources.clear();
@@ -3697,7 +3702,7 @@ void RenderGraph::RebuildFrameCompileResources() {
 		}
 	}
 
-	for (const auto& [resourceID, resourceIndex] : m_frameSchedulingResourceIndexByID) {
+	for (const auto& [resourceID, resourceIndex] : m_frameSchedulingResourceIndexEntries) {
 		if (resourceIndex >= m_frameCompileResources.size()) {
 			continue;
 		}
@@ -3803,6 +3808,8 @@ void RenderGraph::PublishCompiledTrackerStates() {
 
 void RenderGraph::ClearFrameSchedulingResourceIndex() {
 	m_frameSchedulingResourceIndexByID.clear();
+	m_frameSchedulingResourceIndexEntries.clear();
+	m_frameSchedulingResourceIndexLookup.clear();
 	m_frameSchedulingResourceCount = 0;
 	m_frameCompileResources.clear();
 	m_aliasPlacementRangeByResourceIndex.clear();
@@ -3821,6 +3828,16 @@ void RenderGraph::ClearFramePassSchedulingSummaries() {
 	m_frameResourceAccessSummaries.clear();
 }
 
+RenderGraph::PassBatch RenderGraph::AcquireReusablePassBatch(size_t queueCount) {
+	if (m_reusablePassBatches.empty()) {
+		return PassBatch(queueCount);
+	}
+	PassBatch batch = std::move(m_reusablePassBatches.back());
+	m_reusablePassBatches.pop_back();
+	batch.Reset(queueCount);
+	return batch;
+}
+
 void RenderGraph::ResetFrameQueueBatchHistoryTables() {
 	const size_t entryCount = m_queueRegistry.SlotCount() * m_frameSchedulingResourceCount;
 	m_frameQueueLastUsageBatch.assign(entryCount, 0);
@@ -3837,41 +3854,99 @@ void RenderGraph::ResetFrameQueueBatchHistoryTables() {
 void RenderGraph::RebuildFrameSchedulingResourceIndex(const std::unordered_set<uint64_t>& resourceIDs) {
 	ZoneScopedN("RenderGraph::RebuildFrameSchedulingResourceIndex");
 	m_frameSchedulingResourceIndexByID.clear();
-	m_frameSchedulingResourceIndexByID.reserve(resourceIDs.size() * 2);
+	m_frameSchedulingResourceIndexEntries.clear();
 	m_frameSchedulingResourceCount = 0;
-
-	auto registerResourceID = [&](uint64_t resourceID) {
-		auto [_, inserted] = m_frameSchedulingResourceIndexByID.emplace(resourceID, m_frameSchedulingResourceCount);
-		if (inserted) {
-			++m_frameSchedulingResourceCount;
-		}
-	};
 
 	std::vector<uint64_t> sortedResourceIDs(resourceIDs.begin(), resourceIDs.end());
 	std::sort(sortedResourceIDs.begin(), sortedResourceIDs.end());
-	for (uint64_t resourceID : sortedResourceIDs) {
-		registerResourceID(resourceID);
-		auto equivalentIDs = GetSchedulingEquivalentIDsCached(resourceID);
-		std::vector<uint64_t> sortedEquivalentIDs(equivalentIDs.begin(), equivalentIDs.end());
-		std::sort(sortedEquivalentIDs.begin(), sortedEquivalentIDs.end());
-		for (uint64_t equivalentID : sortedEquivalentIDs) {
-			registerResourceID(equivalentID);
+	sortedResourceIDs.erase(std::unique(sortedResourceIDs.begin(), sortedResourceIDs.end()), sortedResourceIDs.end());
+	if (sortedResourceIDs.capacity() < resourceIDs.size() * 2) {
+		sortedResourceIDs.reserve(resourceIDs.size() * 2);
+	}
+	const size_t baseResourceIDCount = sortedResourceIDs.size();
+	for (size_t index = 0; index < baseResourceIDCount; ++index) {
+		const uint64_t resourceID = sortedResourceIDs[index];
+		const auto& equivalentIDs = GetSchedulingEquivalentIDsCached(resourceID);
+		if (equivalentIDs.size() <= 1) {
+			if (!equivalentIDs.empty() && equivalentIDs.front() != resourceID) {
+				sortedResourceIDs.push_back(equivalentIDs.front());
+			}
+			continue;
+		}
+		for (uint64_t equivalentID : equivalentIDs) {
+			sortedResourceIDs.push_back(equivalentID);
 		}
 	}
+	std::sort(sortedResourceIDs.begin(), sortedResourceIDs.end());
+	sortedResourceIDs.erase(std::unique(sortedResourceIDs.begin(), sortedResourceIDs.end()), sortedResourceIDs.end());
+
+	m_frameSchedulingResourceIndexEntries.reserve(sortedResourceIDs.size() + m_dynamicResourcesByStableID.size());
+	for (uint64_t resourceID : sortedResourceIDs) {
+		m_frameSchedulingResourceIndexEntries.emplace_back(resourceID, m_frameSchedulingResourceCount++);
+	}
+
+	auto findEntry = [&](uint64_t resourceID) {
+		return std::lower_bound(
+			m_frameSchedulingResourceIndexEntries.begin(),
+			m_frameSchedulingResourceIndexEntries.end(),
+			resourceID,
+			[](const auto& entry, uint64_t value) {
+				return entry.first < value;
+			});
+	};
 
 	for (const auto& [stableID, resource] : m_dynamicResourcesByStableID) {
 		if (!resource) {
 			continue;
 		}
 		const uint64_t backingID = resource->GetGlobalResourceID();
-		auto stableIt = m_frameSchedulingResourceIndexByID.find(stableID);
-		auto backingIt = m_frameSchedulingResourceIndexByID.find(backingID);
-		if (stableIt != m_frameSchedulingResourceIndexByID.end()) {
-			m_frameSchedulingResourceIndexByID[backingID] = stableIt->second;
+		auto stableIt = findEntry(stableID);
+		const bool hasStable = stableIt != m_frameSchedulingResourceIndexEntries.end() && stableIt->first == stableID;
+		auto backingIt = findEntry(backingID);
+		const bool hasBacking = backingIt != m_frameSchedulingResourceIndexEntries.end() && backingIt->first == backingID;
+		if (hasStable) {
+			if (hasBacking) {
+				backingIt->second = stableIt->second;
+			}
+			else {
+				m_frameSchedulingResourceIndexEntries.emplace_back(backingID, stableIt->second);
+			}
 		}
-		else if (backingIt != m_frameSchedulingResourceIndexByID.end()) {
-			m_frameSchedulingResourceIndexByID[stableID] = backingIt->second;
+		else if (hasBacking) {
+			m_frameSchedulingResourceIndexEntries.emplace_back(stableID, backingIt->second);
 		}
+	}
+	std::sort(
+		m_frameSchedulingResourceIndexEntries.begin(),
+		m_frameSchedulingResourceIndexEntries.end(),
+		[](const auto& lhs, const auto& rhs) {
+			return lhs.first < rhs.first;
+		});
+
+	size_t lookupSize = 1;
+	const size_t minLookupSize = (std::max)(size_t{ 2 }, m_frameSchedulingResourceIndexEntries.size() * 2);
+	while (lookupSize < minLookupSize) {
+		lookupSize <<= 1;
+	}
+	if (m_frameSchedulingResourceIndexLookup.size() != lookupSize) {
+		m_frameSchedulingResourceIndexLookup.resize(lookupSize);
+	}
+	for (auto& entry : m_frameSchedulingResourceIndexLookup) {
+		entry.occupied = 0;
+	}
+	const size_t lookupMask = lookupSize - 1;
+	auto insertLookupEntry = [&](uint64_t resourceID, size_t resourceIndex) {
+		size_t slot = (std::hash<uint64_t>{}(resourceID) * 11400714819323198485ull) & lookupMask;
+		while (m_frameSchedulingResourceIndexLookup[slot].occupied != 0) {
+			slot = (slot + 1) & lookupMask;
+		}
+		auto& lookupEntry = m_frameSchedulingResourceIndexLookup[slot];
+		lookupEntry.resourceID = resourceID;
+		lookupEntry.resourceIndex = resourceIndex;
+		lookupEntry.occupied = 1;
+	};
+	for (const auto& [resourceID, resourceIndex] : m_frameSchedulingResourceIndexEntries) {
+		insertLookupEntry(resourceID, resourceIndex);
 	}
 
 	RebuildEquivalentResourceIndicesByResourceIndex();
@@ -3891,8 +3966,11 @@ void RenderGraph::RebuildEquivalentResourceIndicesByResourceIndex() {
 	ZoneScopedN("RenderGraph::RebuildEquivalentResourceIndicesByResourceIndex");
 	m_equivalentResourceIndicesByResourceIndex.clear();
 	m_equivalentResourceIndicesByResourceIndex.resize(m_frameSchedulingResourceCount);
+	if (schedulingPlacementRangesByID.empty()) {
+		return;
+	}
 
-	for (const auto& [resourceID, resourceIndex] : m_frameSchedulingResourceIndexByID) {
+	for (const auto& [resourceID, resourceIndex] : m_frameSchedulingResourceIndexEntries) {
 		if (resourceIndex >= m_equivalentResourceIndicesByResourceIndex.size()) {
 			continue;
 		}
@@ -3903,9 +3981,9 @@ void RenderGraph::RebuildEquivalentResourceIndicesByResourceIndex() {
 				continue;
 			}
 
-			auto equivalentIt = m_frameSchedulingResourceIndexByID.find(equivalentID);
-			if (equivalentIt != m_frameSchedulingResourceIndexByID.end()) {
-				equivalentIndices.push_back(equivalentIt->second);
+			auto equivalentIndex = TryGetFrameSchedulingResourceIndex(equivalentID);
+			if (equivalentIndex.has_value()) {
+				equivalentIndices.push_back(*equivalentIndex);
 			}
 		}
 
@@ -3916,31 +3994,38 @@ void RenderGraph::RebuildEquivalentResourceIndicesByResourceIndex() {
 
 void RenderGraph::RebuildFramePassSchedulingSummaries() {
 	ZoneScopedN("RenderGraph::RebuildFramePassSchedulingSummaries");
-	m_framePassSchedulingSummaries.clear();
 	m_framePassSchedulingSummaries.resize(m_framePassAccessSummaries.size());
-	m_frameResourceAccessSummaries.assign(m_frameSchedulingResourceCount, FrameResourceAccessSummary{});
-
-	struct ResourceAccessContribution {
-		size_t resourceIndex = 0;
-		bool hasWrite = false;
-		bool hasUAV = false;
-		bool hasInternalTransition = false;
-		bool hasAliasActivation = false;
-		bool hasNonWholeResourceRange = false;
-	};
-
-	std::vector<std::vector<ResourceAccessContribution>> resourceContributionsByPass(m_framePassAccessSummaries.size());
+	if (m_frameResourceAccessSummaries.size() != m_frameSchedulingResourceCount) {
+		m_frameResourceAccessSummaries.assign(m_frameSchedulingResourceCount, FrameResourceAccessSummary{});
+	}
+	else {
+		std::fill(m_frameResourceAccessSummaries.begin(), m_frameResourceAccessSummaries.end(), FrameResourceAccessSummary{});
+	}
 
 	auto buildPassSchedulingSummary = [&](size_t passIndex) {
 		auto& summary = m_framePassSchedulingSummaries[passIndex];
 		const auto& passAccess = m_framePassAccessSummaries[passIndex];
-		auto& resourceContributions = resourceContributionsByPass[passIndex];
-		summary.requirements.reserve(passAccess.requirementSummaries.size());
-		summary.internalTransitions.reserve(passAccess.internalTransitionSummaries.size());
-		summary.requiredResourceIndices.reserve(passAccess.requirementSummaries.size());
-		summary.touchedResourceIndices.reserve(passAccess.requirementSummaries.size() + passAccess.internalTransitionSummaries.size());
-		summary.uavResourceIndices.reserve(passAccess.requirementSummaries.size());
-		resourceContributions.reserve(passAccess.requirementSummaries.size() + passAccess.internalTransitionSummaries.size());
+		summary.requirements.clear();
+		summary.internalTransitions.clear();
+		summary.requiredResourceIndices.clear();
+		summary.touchedResourceIndices.clear();
+		summary.uavResourceIndices.clear();
+		if (summary.requirements.capacity() < passAccess.requirementSummaries.size()) {
+			summary.requirements.reserve(passAccess.requirementSummaries.size());
+		}
+		if (summary.internalTransitions.capacity() < passAccess.internalTransitionSummaries.size()) {
+			summary.internalTransitions.reserve(passAccess.internalTransitionSummaries.size());
+		}
+		if (summary.requiredResourceIndices.capacity() < passAccess.requirementSummaries.size()) {
+			summary.requiredResourceIndices.reserve(passAccess.requirementSummaries.size());
+		}
+		const size_t touchedResourceCapacity = passAccess.requirementSummaries.size() + passAccess.internalTransitionSummaries.size();
+		if (summary.touchedResourceIndices.capacity() < touchedResourceCapacity) {
+			summary.touchedResourceIndices.reserve(touchedResourceCapacity);
+		}
+		if (summary.uavResourceIndices.capacity() < passAccess.requirementSummaries.size()) {
+			summary.uavResourceIndices.reserve(passAccess.requirementSummaries.size());
+		}
 
 		for (const auto& req : passAccess.requirementSummaries) {
 			auto resourceIndex = TryGetFrameSchedulingResourceIndex(req.resourceID);
@@ -3948,15 +4033,7 @@ void RenderGraph::RebuildFramePassSchedulingSummaries() {
 				continue;
 			}
 
-			resourceContributions.push_back(ResourceAccessContribution{
-				.resourceIndex = *resourceIndex,
-				.hasWrite = req.isWrite,
-				.hasUAV = req.isUAV,
-				.hasAliasActivation = *resourceIndex < m_aliasActivationPendingByResourceIndex.size()
-					&& m_aliasActivationPendingByResourceIndex[*resourceIndex] != 0,
-				.hasNonWholeResourceRange = !IsWholeResourceRange(req.range, req.resource),
-			});
-
+			const bool isWholeResource = IsWholeResourceRange(req.range, req.resource);
 			DenseRequirementSummary denseRequirement{};
 			denseRequirement.resource = req.resource;
 			denseRequirement.resourceID = req.resourceID;
@@ -3964,7 +4041,7 @@ void RenderGraph::RebuildFramePassSchedulingSummaries() {
 			denseRequirement.range = req.range;
 			denseRequirement.state = req.state;
 			denseRequirement.isUAV = req.isUAV;
-			denseRequirement.isWholeResource = IsWholeResourceRange(req.range, req.resource);
+			denseRequirement.isWholeResource = isWholeResource;
 			if (*resourceIndex < m_equivalentResourceIndicesByResourceIndex.size()) {
 				denseRequirement.equivalentResourceIndices = &m_equivalentResourceIndicesByResourceIndex[*resourceIndex];
 			}
@@ -3981,11 +4058,6 @@ void RenderGraph::RebuildFramePassSchedulingSummaries() {
 			if (!resourceIndex.has_value()) {
 				continue;
 			}
-
-			resourceContributions.push_back(ResourceAccessContribution{
-				.resourceIndex = *resourceIndex,
-				.hasInternalTransition = true,
-			});
 
 			DenseEquivalentResourceSummary denseTransition{};
 			denseTransition.resourceID = transition.resourceID;
@@ -4018,18 +4090,23 @@ void RenderGraph::RebuildFramePassSchedulingSummaries() {
 		m_framePassAccessSummaries.size(),
 		buildPassSchedulingSummary);
 
-	for (const auto& resourceContributions : resourceContributionsByPass) {
-		for (const auto& contribution : resourceContributions) {
-			if (contribution.resourceIndex >= m_frameResourceAccessSummaries.size()) {
+	for (const auto& passSummary : m_framePassSchedulingSummaries) {
+		for (const auto& req : passSummary.requirements) {
+			if (req.resourceIndex >= m_frameResourceAccessSummaries.size()) {
 				continue;
 			}
-
-			auto& accessSummary = m_frameResourceAccessSummaries[contribution.resourceIndex];
-			accessSummary.hasWrite = accessSummary.hasWrite || contribution.hasWrite;
-			accessSummary.hasUAV = accessSummary.hasUAV || contribution.hasUAV;
-			accessSummary.hasInternalTransition = accessSummary.hasInternalTransition || contribution.hasInternalTransition;
-			accessSummary.hasAliasActivation = accessSummary.hasAliasActivation || contribution.hasAliasActivation;
-			accessSummary.hasNonWholeResourceRange = accessSummary.hasNonWholeResourceRange || contribution.hasNonWholeResourceRange;
+			auto& accessSummary = m_frameResourceAccessSummaries[req.resourceIndex];
+			accessSummary.hasWrite = accessSummary.hasWrite || AccessTypeIsWriteType(req.state.access);
+			accessSummary.hasUAV = accessSummary.hasUAV || req.isUAV;
+			accessSummary.hasAliasActivation = accessSummary.hasAliasActivation
+				|| (req.resourceIndex < m_aliasActivationPendingByResourceIndex.size()
+					&& m_aliasActivationPendingByResourceIndex[req.resourceIndex] != 0);
+			accessSummary.hasNonWholeResourceRange = accessSummary.hasNonWholeResourceRange || !req.isWholeResource;
+		}
+		for (const auto& transition : passSummary.internalTransitions) {
+			if (transition.resourceIndex < m_frameResourceAccessSummaries.size()) {
+				m_frameResourceAccessSummaries[transition.resourceIndex].hasInternalTransition = true;
+			}
 		}
 	}
 }
@@ -4050,18 +4127,26 @@ void RenderGraph::RebuildFrameResourceAccessSummaries(const std::vector<Node>& n
 		const auto& passSummary = m_framePassSchedulingSummaries[passIndex];
 		const auto& node = nodes[passIndex];
 
-		std::vector<size_t> activeCompatibleSlots;
-		activeCompatibleSlots.reserve(node.compatibleQueueSlots.size() + 1);
+		std::array<size_t, 64> activeCompatibleSlots{};
+		size_t activeCompatibleSlotCount = 0;
+		auto appendActiveCompatibleSlot = [&](size_t queueSlot) {
+			for (size_t index = 0; index < activeCompatibleSlotCount; ++index) {
+				if (activeCompatibleSlots[index] == queueSlot) {
+					return;
+				}
+			}
+			if (activeCompatibleSlotCount < activeCompatibleSlots.size()) {
+				activeCompatibleSlots[activeCompatibleSlotCount++] = queueSlot;
+			}
+		};
 		for (size_t queueSlot : node.compatibleQueueSlots) {
 			if (queueSlot < m_activeQueueSlotsThisFrame.size() && m_activeQueueSlotsThisFrame[queueSlot]) {
-				activeCompatibleSlots.push_back(queueSlot);
+				appendActiveCompatibleSlot(queueSlot);
 			}
 		}
-		if (activeCompatibleSlots.empty()) {
-			activeCompatibleSlots.push_back(node.queueSlot);
+		if (activeCompatibleSlotCount == 0) {
+			appendActiveCompatibleSlot(node.queueSlot);
 		}
-		std::sort(activeCompatibleSlots.begin(), activeCompatibleSlots.end());
-		activeCompatibleSlots.erase(std::unique(activeCompatibleSlots.begin(), activeCompatibleSlots.end()), activeCompatibleSlots.end());
 
 		for (const auto& requirement : passSummary.requirements) {
 			if (requirement.resourceIndex >= m_frameResourceAccessSummaries.size()) {
@@ -4069,7 +4154,8 @@ void RenderGraph::RebuildFrameResourceAccessSummaries(const std::vector<Node>& n
 			}
 
 			auto& accessSummary = m_frameResourceAccessSummaries[requirement.resourceIndex];
-			for (size_t queueSlot : activeCompatibleSlots) {
+			for (size_t slotIndex = 0; slotIndex < activeCompatibleSlotCount; ++slotIndex) {
+				const size_t queueSlot = activeCompatibleSlots[slotIndex];
 				const QueueKind queueKind = m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(static_cast<uint8_t>(queueSlot)));
 				const ResourceState normalizedState = NormalizeStateForQueue(queueKind, requirement.state);
 				if (!accessSummary.uniformStateInitialized) {
@@ -4182,11 +4268,19 @@ bool RenderGraph::ValidateSchedulingDecisionTrace(
 }
 
 std::optional<size_t> RenderGraph::TryGetFrameSchedulingResourceIndex(uint64_t resourceID) const {
-	auto it = m_frameSchedulingResourceIndexByID.find(resourceID);
-	if (it == m_frameSchedulingResourceIndexByID.end()) {
+	if (m_frameSchedulingResourceIndexLookup.empty()) {
 		return std::nullopt;
 	}
-	return it->second;
+	const size_t lookupMask = m_frameSchedulingResourceIndexLookup.size() - 1;
+	size_t slot = (std::hash<uint64_t>{}(resourceID) * 11400714819323198485ull) & lookupMask;
+	while (m_frameSchedulingResourceIndexLookup[slot].occupied != 0) {
+		const auto& entry = m_frameSchedulingResourceIndexLookup[slot];
+		if (entry.resourceID == resourceID) {
+			return entry.resourceIndex;
+		}
+		slot = (slot + 1) & lookupMask;
+	}
+	return std::nullopt;
 }
 
 const rg::alias::AliasPlacementRange* RenderGraph::TryGetAliasPlacementRangeByResourceIndex(size_t resourceIndex) const {
@@ -4233,7 +4327,7 @@ std::vector<uint64_t> RenderGraph::BuildSchedulingEquivalentIDs(uint64_t resourc
 
 	std::vector<uint64_t> out;
 	out.reserve(8);
-	for (const auto& [candidateID, candidateIndex] : m_frameSchedulingResourceIndexByID) {
+	for (const auto& [candidateID, candidateIndex] : m_frameSchedulingResourceIndexEntries) {
 		const auto* otherPlacement = TryGetSchedulingPlacementRangeByResourceIndex(candidateIndex);
 		if (!otherPlacement || otherPlacement->poolID != placement->poolID) {
 			continue;
@@ -4636,7 +4730,8 @@ void RenderGraph::ResetForRebuild()
 }
 
 void RenderGraph::ResetCompileFrameState() {
-	batches.clear();
+	m_reusablePassBatches.clear();
+	m_reusablePassBatches.swap(batches);
 	compiledResourceGenerationByID.clear();
 	m_transientFrameResourcesByID.clear();
 	m_transientFrameResourcesByName.clear();
@@ -5624,6 +5719,10 @@ void RenderGraph::MaterializeUnmaterializedResources(const std::unordered_set<ui
 				items.emplace_back(id, it->second.get());
 				continue;
 			}
+			if (auto it = m_dynamicResourcesByStableID.find(id); it != m_dynamicResourcesByStableID.end() && it->second) {
+				items.emplace_back(id, it->second.get());
+				continue;
+			}
 			seen.erase(id);
 		}
 	}
@@ -5656,32 +5755,44 @@ void RenderGraph::MaterializeUnmaterializedResources(const std::unordered_set<ui
 		}
 	};
 
-	for (const auto& pr : m_framePasses) {
-		if (pr.type == PassType::Compute) {
-			auto const& p = std::get<ComputePassAndResources>(pr.pass);
-			ForEachFrameRequirement(p.resources, [&](const auto& req) {
-				collectFromHandle(req.resourceHandleAndRange.resource);
-			});
-			for (auto const& t : p.resources.internalTransitions) {
-				collectFromHandle(t.first.resource);
+	if (onlyResourceIDs) {
+		for (const auto& summary : m_framePassAccessSummaries) {
+			for (const auto& req : summary.requirementSummaries) {
+				collectFromHandle(req.resource);
+			}
+			for (const auto& transition : summary.internalTransitionSummaries) {
+				collectFromHandle(transition.resource);
 			}
 		}
-		else if (pr.type == PassType::Render) {
-			auto const& p = std::get<RenderPassAndResources>(pr.pass);
-			ForEachFrameRequirement(p.resources, [&](const auto& req) {
-				collectFromHandle(req.resourceHandleAndRange.resource);
-			});
-			for (auto const& t : p.resources.internalTransitions) {
-				collectFromHandle(t.first.resource);
+	}
+	else {
+		for (const auto& pr : m_framePasses) {
+			if (pr.type == PassType::Compute) {
+				auto const& p = std::get<ComputePassAndResources>(pr.pass);
+				ForEachFrameRequirement(p.resources, [&](const auto& req) {
+					collectFromHandle(req.resourceHandleAndRange.resource);
+				});
+				for (auto const& t : p.resources.internalTransitions) {
+					collectFromHandle(t.first.resource);
+				}
 			}
-		}
-		else if (pr.type == PassType::Copy) {
-			auto const& p = std::get<CopyPassAndResources>(pr.pass);
-			ForEachFrameRequirement(p.resources, [&](const auto& req) {
-				collectFromHandle(req.resourceHandleAndRange.resource);
-			});
-			for (auto const& t : p.resources.internalTransitions) {
-				collectFromHandle(t.first.resource);
+			else if (pr.type == PassType::Render) {
+				auto const& p = std::get<RenderPassAndResources>(pr.pass);
+				ForEachFrameRequirement(p.resources, [&](const auto& req) {
+					collectFromHandle(req.resourceHandleAndRange.resource);
+				});
+				for (auto const& t : p.resources.internalTransitions) {
+					collectFromHandle(t.first.resource);
+				}
+			}
+			else if (pr.type == PassType::Copy) {
+				auto const& p = std::get<CopyPassAndResources>(pr.pass);
+				ForEachFrameRequirement(p.resources, [&](const auto& req) {
+					collectFromHandle(req.resourceHandleAndRange.resource);
+				});
+				for (auto const& t : p.resources.internalTransitions) {
+					collectFromHandle(t.first.resource);
+				}
 			}
 		}
 	}

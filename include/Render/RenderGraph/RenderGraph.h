@@ -11,6 +11,7 @@
 #include <span>
 #include <utility>
 #include <array>
+#include <algorithm>
 #include <spdlog/spdlog.h>
 #include <rhi.h>
 #include <tracy/Tracy.hpp>
@@ -388,6 +389,48 @@ public:
 			for (auto& p : queueWaitFenceValue) p.assign(queueCount, std::vector<UINT64>(queueCount, 0));
 			for (auto& p : queueSignalEnabled) p.assign(queueCount, 0);
 			for (auto& p : queueSignalFenceValue) p.assign(queueCount, 0);
+		}
+
+		void Reset(size_t queueCount = kQueueCount) {
+			queuePasses.resize(queueCount);
+			for (auto& passes : queuePasses) {
+				passes.clear();
+			}
+			for (auto& transitionsByQueue : queueTransitions) {
+				transitionsByQueue.resize(queueCount);
+				for (auto& transitions : transitionsByQueue) {
+					transitions.clear();
+				}
+			}
+			externalWaitsBeforeTransitions.resize(queueCount);
+			for (auto& waits : externalWaitsBeforeTransitions) {
+				waits.clear();
+			}
+			for (auto& waitsByDestination : queueWaitEnabled) {
+				waitsByDestination.resize(queueCount);
+				for (auto& waitsBySource : waitsByDestination) {
+					waitsBySource.resize(queueCount);
+					std::fill(waitsBySource.begin(), waitsBySource.end(), uint8_t{ 0 });
+				}
+			}
+			for (auto& waitsByDestination : queueWaitFenceValue) {
+				waitsByDestination.resize(queueCount);
+				for (auto& waitsBySource : waitsByDestination) {
+					waitsBySource.resize(queueCount);
+					std::fill(waitsBySource.begin(), waitsBySource.end(), UINT64{ 0 });
+				}
+			}
+			for (auto& signalEnabled : queueSignalEnabled) {
+				signalEnabled.resize(queueCount);
+				std::fill(signalEnabled.begin(), signalEnabled.end(), uint8_t{ 0 });
+			}
+			for (auto& signalFenceValue : queueSignalFenceValue) {
+				signalFenceValue.resize(queueCount);
+				std::fill(signalFenceValue.begin(), signalFenceValue.end(), UINT64{ 0 });
+			}
+			internallyTransitionedResources.clear();
+			allResources.clear();
+			passBatchTrackersByResourceIndex.clear();
 		}
 
 		size_t QueueCount() const noexcept { return queuePasses.size(); }
@@ -1290,6 +1333,12 @@ private:
 		}
 	};
 
+	struct FrameResourceIndexLookupEntry {
+		uint64_t resourceID = 0;
+		size_t resourceIndex = 0;
+		uint8_t occupied = 0;
+	};
+
 	struct BatchBuildState {
 		size_t queueCount = 0;
 		size_t resourceCount = 0;
@@ -1445,6 +1494,8 @@ private:
 	std::vector<uint64_t> m_frameDAGResourceIDsByIndex;
 	size_t m_frameDAGResourceCount = 0;
 	std::unordered_map<uint64_t, size_t> m_frameSchedulingResourceIndexByID;
+	std::vector<std::pair<uint64_t, size_t>> m_frameSchedulingResourceIndexEntries;
+	std::vector<FrameResourceIndexLookupEntry> m_frameSchedulingResourceIndexLookup;
 	size_t m_frameSchedulingResourceCount = 0;
 	std::vector<std::vector<size_t>> m_equivalentResourceIndicesByResourceIndex;
 	std::vector<uint8_t> m_aliasActivationPendingByResourceIndex;
@@ -1453,6 +1504,14 @@ private:
 	std::vector<unsigned int> m_frameQueueLastTransitionBatch;
 	std::vector<FrameResourceEventSummary> m_frameResourceEventSummaries;
 	std::vector<FramePassStaticAccessSummary> m_framePassAccessSummaries;
+	std::vector<uint64_t> m_compileScratchResourceIDs;
+	std::vector<uint8_t> m_compileScratchResourcesWritten;
+	std::vector<uint32_t> m_compileScratchAccessEpochs;
+	std::vector<uint32_t> m_compileScratchAccessWriteEpochs;
+	std::vector<uint32_t> m_compileScratchAccessUavEpochs;
+	std::vector<uint32_t> m_compileScratchAccessDagEpochs;
+	std::vector<uint32_t> m_compileScratchAccessOrder;
+	uint32_t m_compileScratchAccessEpoch = 1;
 	std::vector<FramePassSchedulingSummary> m_framePassSchedulingSummaries;
 	std::unordered_map<uint64_t, CachedFramePassAccessSummary> m_framePassAccessSummaryCache;
 	std::unordered_map<uint64_t, rg::alias::CachedAliasStaticResourceInfo> m_aliasStaticInfoCacheByResourceID;
@@ -1468,6 +1527,7 @@ private:
 
 	std::unordered_map<uint64_t, ResourceTransition> initialTransitions; // Transitions needed to reach the initial state of the resources before executing the first batch. Executed on graph setup.
 	std::vector<PassBatch> batches;
+	std::vector<PassBatch> m_reusablePassBatches;
 	rg::memory::SnapshotProvider m_memorySnapshotProvider;
 	std::shared_ptr<rg::runtime::IStatisticsService> m_statisticsService;
 	std::shared_ptr<rg::runtime::IUploadService> m_uploadService;
@@ -1591,6 +1651,7 @@ private:
 	void ResetStructuralBuildState();
 	void ClearFrameSchedulingResourceIndex();
 	void ClearFramePassSchedulingSummaries();
+	PassBatch AcquireReusablePassBatch(size_t queueCount);
 	void ResetFrameQueueBatchHistoryTables();
 	std::optional<size_t> TryGetFrameSchedulingResourceIndex(uint64_t resourceID) const;
 	const rg::alias::AliasPlacementRange* TryGetAliasPlacementRangeByResourceIndex(size_t resourceIndex) const;

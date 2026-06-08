@@ -471,7 +471,6 @@ void RenderGraph::RebuildFramePassAccessSummaries(std::unordered_set<uint64_t>& 
 	{
 		ZoneScopedN("RGPassAccess::Initialize");
 		outUsedResourceIDs.clear();
-		m_framePassAccessSummaries.clear();
 		m_framePassAccessSummaries.resize(m_framePasses.size());
 	}
 
@@ -498,6 +497,211 @@ void RenderGraph::RebuildFramePassAccessSummaries(std::unordered_set<uint64_t>& 
 			}
 		}
 	};
+
+	{
+		ZoneScopedN("RGPassAccess::DenseFullRebuild");
+		m_compileScratchResourceIDs.clear();
+
+		{
+			ZoneScopedN("RGPassAccess::BuildDenseSummaries");
+			for (size_t passIndex = 0; passIndex < m_framePasses.size(); ++passIndex) {
+				const auto& pass = m_framePasses[passIndex];
+				auto& summary = m_framePassAccessSummaries[passIndex];
+				summary.requirementSummaries.clear();
+				summary.internalTransitionSummaries.clear();
+				summary.touchedResourceIDs.clear();
+				summary.uavResourceIDs.clear();
+				summary.dagAccesses.clear();
+				summary.type = pass.type;
+				summary.preferredQueueKind = DefaultPreferredQueueKind(pass.type);
+				summary.queueAssignmentPolicy = DefaultQueueAssignmentPolicy(pass.type);
+				summary.pinnedQueueSlot.reset();
+
+				PassView view = GetPassView(pass);
+				if (summary.requirementSummaries.capacity() < view.reqs.size()) {
+					summary.requirementSummaries.reserve(view.reqs.size());
+				}
+				const size_t internalTransitionCount = view.internalTransitions ? view.internalTransitions->size() : 0;
+				if (summary.internalTransitionSummaries.capacity() < internalTransitionCount) {
+					summary.internalTransitionSummaries.reserve(internalTransitionCount);
+				}
+
+				if (pass.type == PassType::Render) {
+					const auto& passResources = std::get<RenderPassAndResources>(pass.pass).resources;
+					summary.preferredQueueKind = passResources.preferredQueueKind;
+					summary.queueAssignmentPolicy = passResources.queueAssignmentPolicy;
+					summary.pinnedQueueSlot = passResources.pinnedQueueSlot;
+				}
+				else if (pass.type == PassType::Compute) {
+					const auto& passResources = std::get<ComputePassAndResources>(pass.pass).resources;
+					summary.preferredQueueKind = passResources.preferredQueueKind;
+					summary.queueAssignmentPolicy = passResources.queueAssignmentPolicy;
+					summary.pinnedQueueSlot = passResources.pinnedQueueSlot;
+				}
+				else if (pass.type == PassType::Copy) {
+					const auto& passResources = std::get<CopyPassAndResources>(pass.pass).resources;
+					summary.preferredQueueKind = passResources.preferredQueueKind;
+					summary.queueAssignmentPolicy = passResources.queueAssignmentPolicy;
+					summary.pinnedQueueSlot = passResources.pinnedQueueSlot;
+				}
+
+				for (const auto& req : view.reqs) {
+					const auto resource = req.resourceHandleAndRange.resource;
+					const uint64_t resourceID = schedulingResourceIDForHandle(resource);
+					appendHandleResourceIDs(m_compileScratchResourceIDs, resource);
+					summary.requirementSummaries.push_back(FramePassRequirementStaticSummary{
+						.resource = resource,
+						.resourceID = resourceID,
+						.range = req.resourceHandleAndRange.range,
+						.state = req.state,
+						.isUAV = IsUAVState(req.state),
+						.isWrite = AccessTypeIsWriteType(req.state.access),
+					});
+				}
+
+				if (view.internalTransitions) {
+					for (const auto& transition : *view.internalTransitions) {
+						const auto resource = transition.first.resource;
+						appendHandleResourceIDs(m_compileScratchResourceIDs, resource);
+						summary.internalTransitionSummaries.push_back(FramePassInternalTransitionStaticSummary{
+							.resource = resource,
+							.resourceID = schedulingResourceIDForHandle(resource),
+						});
+					}
+				}
+			}
+		}
+
+		{
+			ZoneScopedN("RGPassAccess::BuildDenseResourceIndex");
+			std::sort(m_compileScratchResourceIDs.begin(), m_compileScratchResourceIDs.end());
+			m_compileScratchResourceIDs.erase(
+				std::unique(m_compileScratchResourceIDs.begin(), m_compileScratchResourceIDs.end()),
+				m_compileScratchResourceIDs.end());
+
+			outUsedResourceIDs.reserve(m_compileScratchResourceIDs.size());
+			for (uint64_t resourceID : m_compileScratchResourceIDs) {
+				outUsedResourceIDs.insert(resourceID);
+			}
+
+			m_frameDAGResourceIDsByIndex = m_compileScratchResourceIDs;
+			m_frameDAGResourceIndexByID.clear();
+			m_frameDAGResourceCount = m_frameDAGResourceIDsByIndex.size();
+		}
+
+		auto findDenseDAGResourceIndex = [&](uint64_t resourceID) -> std::optional<size_t> {
+			auto it = std::lower_bound(m_frameDAGResourceIDsByIndex.begin(), m_frameDAGResourceIDsByIndex.end(), resourceID);
+			if (it == m_frameDAGResourceIDsByIndex.end() || *it != resourceID) {
+				return std::nullopt;
+			}
+			return static_cast<size_t>(it - m_frameDAGResourceIDsByIndex.begin());
+		};
+
+		{
+			ZoneScopedN("RGPassAccess::MarkWrittenDAGResourcesDense");
+			m_compileScratchResourcesWritten.assign(m_frameDAGResourceCount, uint8_t{ 0 });
+			for (const auto& summary : m_framePassAccessSummaries) {
+				for (const auto& req : summary.requirementSummaries) {
+					if (!req.isWrite) {
+						continue;
+					}
+					auto dagResourceIndex = findDenseDAGResourceIndex(req.resourceID);
+					if (dagResourceIndex.has_value()) {
+						m_compileScratchResourcesWritten[*dagResourceIndex] = 1;
+					}
+				}
+				for (const auto& transition : summary.internalTransitionSummaries) {
+					auto dagResourceIndex = findDenseDAGResourceIndex(transition.resourceID);
+					if (dagResourceIndex.has_value()) {
+						m_compileScratchResourcesWritten[*dagResourceIndex] = 1;
+					}
+				}
+			}
+		}
+
+		{
+			ZoneScopedN("RGPassAccess::FinalizeDensePassAccessLists");
+			const auto ensureEpochScratch = [&]() {
+				if (m_compileScratchAccessEpochs.size() < m_frameDAGResourceCount) {
+					m_compileScratchAccessEpochs.resize(m_frameDAGResourceCount, 0);
+					m_compileScratchAccessWriteEpochs.resize(m_frameDAGResourceCount, 0);
+					m_compileScratchAccessUavEpochs.resize(m_frameDAGResourceCount, 0);
+					m_compileScratchAccessDagEpochs.resize(m_frameDAGResourceCount, 0);
+				}
+				if (m_compileScratchAccessEpoch == std::numeric_limits<uint32_t>::max()) {
+					std::fill(m_compileScratchAccessEpochs.begin(), m_compileScratchAccessEpochs.end(), 0);
+					std::fill(m_compileScratchAccessWriteEpochs.begin(), m_compileScratchAccessWriteEpochs.end(), 0);
+					std::fill(m_compileScratchAccessUavEpochs.begin(), m_compileScratchAccessUavEpochs.end(), 0);
+					std::fill(m_compileScratchAccessDagEpochs.begin(), m_compileScratchAccessDagEpochs.end(), 0);
+					m_compileScratchAccessEpoch = 1;
+				}
+			};
+			ensureEpochScratch();
+
+			for (auto& summary : m_framePassAccessSummaries) {
+				summary.touchedResourceIDs.clear();
+				summary.uavResourceIDs.clear();
+				summary.dagAccesses.clear();
+				m_compileScratchAccessOrder.clear();
+
+				const uint32_t epoch = m_compileScratchAccessEpoch++;
+				auto mark = [&](uint64_t resourceID, AccessKind accessKind, bool isUav) {
+					auto denseDAGResourceIndex = findDenseDAGResourceIndex(resourceID);
+					if (!denseDAGResourceIndex.has_value()) {
+						return;
+					}
+
+					const uint32_t dagResourceIndex = static_cast<uint32_t>(*denseDAGResourceIndex);
+					if (m_compileScratchAccessEpochs[dagResourceIndex] != epoch) {
+						m_compileScratchAccessEpochs[dagResourceIndex] = epoch;
+						m_compileScratchAccessOrder.push_back(dagResourceIndex);
+					}
+					if (isUav) {
+						m_compileScratchAccessUavEpochs[dagResourceIndex] = epoch;
+					}
+					if (accessKind == AccessKind::Write) {
+						m_compileScratchAccessWriteEpochs[dagResourceIndex] = epoch;
+						m_compileScratchAccessDagEpochs[dagResourceIndex] = epoch;
+					}
+					else if (dagResourceIndex < m_compileScratchResourcesWritten.size()
+						&& m_compileScratchResourcesWritten[dagResourceIndex] != 0) {
+						m_compileScratchAccessDagEpochs[dagResourceIndex] = epoch;
+					}
+				};
+
+				for (const auto& req : summary.requirementSummaries) {
+					mark(req.resourceID, req.isWrite ? AccessKind::Write : AccessKind::Read, req.isUAV);
+				}
+				for (const auto& transition : summary.internalTransitionSummaries) {
+					mark(transition.resourceID, AccessKind::Write, false);
+				}
+
+				std::sort(m_compileScratchAccessOrder.begin(), m_compileScratchAccessOrder.end());
+				if (summary.touchedResourceIDs.capacity() < m_compileScratchAccessOrder.size()) {
+					summary.touchedResourceIDs.reserve(m_compileScratchAccessOrder.size());
+				}
+				if (summary.dagAccesses.capacity() < m_compileScratchAccessOrder.size()) {
+					summary.dagAccesses.reserve(m_compileScratchAccessOrder.size());
+				}
+
+				for (uint32_t dagResourceIndex : m_compileScratchAccessOrder) {
+					const uint64_t resourceID = m_frameDAGResourceIDsByIndex[dagResourceIndex];
+					summary.touchedResourceIDs.push_back(resourceID);
+					if (m_compileScratchAccessUavEpochs[dagResourceIndex] == epoch) {
+						summary.uavResourceIDs.push_back(resourceID);
+					}
+					if (m_compileScratchAccessDagEpochs[dagResourceIndex] == epoch) {
+						summary.dagAccesses.push_back(NodeAccess{
+							.resourceIndex = dagResourceIndex,
+							.kind = m_compileScratchAccessWriteEpochs[dagResourceIndex] == epoch ? AccessKind::Write : AccessKind::Read,
+						});
+					}
+				}
+			}
+		}
+
+		return;
+	}
 
 	auto hashHandleAndRange = [&](uint64_t seed, const ResourceHandleAndRange& handleAndRange) {
 		seed = HashCombine64(seed, handleAndRange.resource.GetGlobalResourceID());
@@ -955,16 +1159,16 @@ void RenderGraph::RebuildFramePassAccessSummaries(std::unordered_set<uint64_t>& 
 void RenderGraph::RebuildSchedulingEquivalentIDCache(const std::unordered_set<uint64_t>& resourceIDs) {
 	ZoneScopedN("RenderGraph::RebuildSchedulingEquivalentIDCache");
 	m_schedulingEquivalentIDsCache.clear();
-	m_schedulingEquivalentIDsCache.reserve(resourceIDs.size());
 
 	if (schedulingPlacementRangesByID.empty()) {
-		for (uint64_t resourceID : resourceIDs) {
-			m_schedulingEquivalentIDsCache.emplace(resourceID, std::vector<uint64_t>{ resourceID });
-		}
 		return;
 	}
 
+	m_schedulingEquivalentIDsCache.reserve((std::min)(resourceIDs.size(), schedulingPlacementRangesByID.size() * 2));
 	for (uint64_t resourceID : resourceIDs) {
+		if (!TryGetSchedulingPlacementRange(resourceID)) {
+			continue;
+		}
 		m_schedulingEquivalentIDsCache.emplace(resourceID, BuildSchedulingEquivalentIDs(resourceID));
 	}
 }
@@ -973,6 +1177,13 @@ const std::vector<uint64_t>& RenderGraph::GetSchedulingEquivalentIDsCached(uint6
 	auto it = m_schedulingEquivalentIDsCache.find(resourceID);
 	if (it != m_schedulingEquivalentIDsCache.end()) {
 		return it->second;
+	}
+
+	if (!TryGetSchedulingPlacementRange(resourceID)) {
+		thread_local std::vector<uint64_t> identityEquivalentIDs;
+		identityEquivalentIDs.clear();
+		identityEquivalentIDs.push_back(resourceID);
+		return identityEquivalentIDs;
 	}
 
 	auto [insertedIt, inserted] = m_schedulingEquivalentIDsCache.emplace(resourceID, BuildSchedulingEquivalentIDs(resourceID));
@@ -5063,21 +5274,39 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	traceCompileStep("begin");
 
 	{
-		traceCompileStep("ResetCompileState");
-		ZoneScopedN("RenderGraph::CompileFrame::ResetCompileState");
+		traceCompileStep("ResetCompileFrameScratch");
+		ZoneScopedN("RenderGraph::CompileFrame::ResetCompileFrameScratch");
 		m_frameCompileResources.clear();
 		m_schedulingEquivalentIDsCache.clear();
+	}
+	{
+		traceCompileStep("ResetCompileRegionScratch");
+		ZoneScopedN("RenderGraph::CompileFrame::ResetCompileRegionScratch");
 		m_lastRegionStats = {};
 		m_lastExtractedRegions.clear();
 		m_lastRegionCandidateDiagnostics.clear();
+	}
+	{
+		traceCompileStep("ResetCompileSchedulingScratch");
+		ZoneScopedN("RenderGraph::CompileFrame::ResetCompileSchedulingScratch");
 		m_schedulingDecisionTrace.clear();
 		m_transitionPlacementCandidates.clear();
 		m_transitionPlacementStats = {};
+	}
+	{
+		traceCompileStep("ResetCompileCounters");
+		ZoneScopedN("RenderGraph::CompileFrame::ResetCompileCounters");
 		m_frameDeclarationRefreshRequestedCount = 0;
 		m_frameDeclarationRefreshEquivalentCount = 0;
-		m_aliasingSubsystem.ResetPerFrameState(*this);
+	}
+	{
+		traceCompileStep("ResetCompileAliasingScratch");
+		ZoneScopedN("RenderGraph::CompileFrame::ResetCompileAliasingScratch");
+		autoAliasPlannerStats = {};
+		autoAliasPreviousMode = autoAliasModeLastFrame;
 	}
 
+	traceCompileStep("RefreshRetainedDeclarations");
 	auto needsRefresh = [&](auto& p) -> bool {
 		ZoneScopedN("RenderGraph::CompileFrame::RefreshRetainedDeclarations::NeedsRefresh");
 		if (!p.name.empty()) {
@@ -5271,8 +5500,11 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 
 	{
 		ZoneScopedN("RenderGraph::CompileFrame::InitFramePassState");
-		batches.clear();
-		batches.emplace_back(m_queueRegistry.SlotCount()); // Dummy batch 0 for pre-first-pass transitions
+		if (!batches.empty()) {
+			m_reusablePassBatches.clear();
+			m_reusablePassBatches.swap(batches);
+		}
+		batches.push_back(AcquireReusablePassBatch(m_queueRegistry.SlotCount())); // Dummy batch 0 for pre-first-pass transitions
 		m_framePasses.clear(); // Combined retained + immediate-mode passes for this frame
 		m_framePassIsFrameExtension.clear();
 		m_framePassDeclarationRefreshedThisFrame.clear();
@@ -5963,6 +6195,9 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		aliasPlacementRangesByID.clear();
 		schedulingPlacementRangesByID.clear();
 		autoAliasPoolByID.clear();
+		autoAliasExclusionReasonByID.clear();
+		autoAliasExclusionReasonSummary.clear();
+		autoAliasExcludedResources.clear();
 		m_aliasPlacementRangeByResourceIndex.assign(m_frameSchedulingResourceCount, rg::alias::AliasPlacementRange{});
 		m_hasAliasPlacementByResourceIndex.assign(m_frameSchedulingResourceCount, 0);
 		m_schedulingPlacementRangeByResourceIndex.assign(m_frameSchedulingResourceCount, rg::alias::AliasPlacementRange{});
