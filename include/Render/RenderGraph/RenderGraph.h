@@ -887,6 +887,7 @@ private:
 
 	struct FramePassRequirementStaticSummary {
 		ResourceRegistry::RegistryHandle resource;
+		Resource* resolvedResource = nullptr;
 		uint64_t resourceID = 0;
 		uint32_t dagResourceIndex = UINT32_MAX;
 		RangeSpec range{};
@@ -897,6 +898,7 @@ private:
 
 	struct FramePassInternalTransitionStaticSummary {
 		ResourceRegistry::RegistryHandle resource;
+		Resource* resolvedResource = nullptr;
 		uint64_t resourceID = 0;
 		uint32_t dagResourceIndex = UINT32_MAX;
 	};
@@ -1579,6 +1581,8 @@ private:
 	std::vector<SchedulingEquivalentIDRange> m_schedulingEquivalentIDRangeByResourceIndex;
 	std::unordered_map<uint64_t, size_t> m_frameDAGResourceIndexByID;
 	std::vector<uint64_t> m_frameDAGResourceIDsByIndex;
+	std::vector<uint64_t> m_frameDAGResourceIndexHashKeys;
+	std::vector<uint32_t> m_frameDAGResourceIndexHashValues;
 	std::vector<Resource*> m_frameDAGResourcePtrByIndex;
 	std::vector<uint32_t> m_frameDAGUnmaterializedResourceIndices;
 	size_t m_frameDAGResourceCount = 0;

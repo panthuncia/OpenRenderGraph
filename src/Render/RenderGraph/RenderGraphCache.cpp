@@ -18,6 +18,17 @@
 #include "Resources/ExternalTextureResource.h"
 
 namespace {
+	constexpr uint64_t kFrameDAGResourceIndexEmptyKey = std::numeric_limits<uint64_t>::max();
+
+	uint64_t MixFrameDAGResourceID(uint64_t value) noexcept {
+		value ^= value >> 33;
+		value *= 0xff51afd7ed558ccdull;
+		value ^= value >> 33;
+		value *= 0xc4ceb9fe1a85ec53ull;
+		value ^= value >> 33;
+		return value;
+	}
+
 	constexpr size_t QueueIndex(QueueKind queue) noexcept {
 		return static_cast<size_t>(queue);
 	}
@@ -527,7 +538,7 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 
 		{
 			ZoneScopedN("RGPassAccess::BuildDenseSummaries");
-			for (size_t passIndex = 0; passIndex < m_framePasses.size(); ++passIndex) {
+			ParallelForOptional("RGPassAccessBuildDenseSummaries", m_framePasses.size(), [&](size_t passIndex) {
 				const auto& pass = m_framePasses[passIndex];
 				auto& summary = m_framePassAccessSummaries[passIndex];
 				summary.requirementSummaries.clear();
@@ -547,6 +558,10 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 				const size_t internalTransitionCount = view.internalTransitions ? view.internalTransitions->size() : 0;
 				if (summary.internalTransitionSummaries.capacity() < internalTransitionCount) {
 					summary.internalTransitionSummaries.reserve(internalTransitionCount);
+				}
+				const size_t estimatedResourceIDCount = (view.reqs.size() + internalTransitionCount) * 4;
+				if (summary.touchedResourceIDs.capacity() < estimatedResourceIDCount) {
+					summary.touchedResourceIDs.reserve(estimatedResourceIDCount);
 				}
 
 				if (pass.type == PassType::Render) {
@@ -571,9 +586,10 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 				for (const auto& req : view.reqs) {
 					const auto resource = req.resourceHandleAndRange.resource;
 					Resource* resolvedResource = resolveHandleResource(resource);
-					const uint64_t resourceID = appendHandleResourceIDsResolved(m_compileScratchResourceIDs, resource, resolvedResource);
+					const uint64_t resourceID = appendHandleResourceIDsResolved(summary.touchedResourceIDs, resource, resolvedResource);
 					summary.requirementSummaries.push_back(FramePassRequirementStaticSummary{
 						.resource = resource,
+						.resolvedResource = resolvedResource,
 						.resourceID = resourceID,
 						.dagResourceIndex = UINT32_MAX,
 						.range = req.resourceHandleAndRange.range,
@@ -587,53 +603,114 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 					for (const auto& transition : *view.internalTransitions) {
 						const auto resource = transition.first.resource;
 						Resource* resolvedResource = resolveHandleResource(resource);
-						const uint64_t resourceID = appendHandleResourceIDsResolved(m_compileScratchResourceIDs, resource, resolvedResource);
+						const uint64_t resourceID = appendHandleResourceIDsResolved(summary.touchedResourceIDs, resource, resolvedResource);
 						summary.internalTransitionSummaries.push_back(FramePassInternalTransitionStaticSummary{
 							.resource = resource,
+							.resolvedResource = resolvedResource,
 							.resourceID = resourceID,
 							.dagResourceIndex = UINT32_MAX,
 						});
 					}
 				}
-			}
+			});
 		}
 
 		{
 			ZoneScopedN("RGPassAccess::BuildDenseResourceIndex");
-			std::sort(m_compileScratchResourceIDs.begin(), m_compileScratchResourceIDs.end());
-			m_compileScratchResourceIDs.erase(
-				std::unique(m_compileScratchResourceIDs.begin(), m_compileScratchResourceIDs.end()),
-				m_compileScratchResourceIDs.end());
+			size_t resourceIDCount = 0;
+			{
+				ZoneScopedN("RGPassAccess::BuildDenseResourceIndex::CountIDs");
+				for (const auto& summary : m_framePassAccessSummaries) {
+					resourceIDCount += summary.touchedResourceIDs.size();
+				}
+			}
+			if (m_frameDAGResourceIDsByIndex.capacity() < resourceIDCount) {
+				m_frameDAGResourceIDsByIndex.reserve(resourceIDCount);
+			}
+			m_frameDAGResourceIDsByIndex.clear();
+			{
+				ZoneScopedN("RGPassAccess::BuildDenseResourceIndex::FlattenIDs");
+				for (const auto& summary : m_framePassAccessSummaries) {
+					m_frameDAGResourceIDsByIndex.insert(
+						m_frameDAGResourceIDsByIndex.end(),
+						summary.touchedResourceIDs.begin(),
+						summary.touchedResourceIDs.end());
+				}
+			}
+			{
+				ZoneScopedN("RGPassAccess::BuildDenseResourceIndex::SortUniqueIDs");
+				std::sort(m_frameDAGResourceIDsByIndex.begin(), m_frameDAGResourceIDsByIndex.end());
+				m_frameDAGResourceIDsByIndex.erase(
+					std::unique(m_frameDAGResourceIDsByIndex.begin(), m_frameDAGResourceIDsByIndex.end()),
+					m_frameDAGResourceIDsByIndex.end());
+			}
 
-			m_frameDAGResourceIDsByIndex = m_compileScratchResourceIDs;
-			m_frameDAGResourceIndexByID.clear();
 			m_frameDAGResourceCount = m_frameDAGResourceIDsByIndex.size();
-			m_frameDAGResourcePtrByIndex.assign(m_frameDAGResourceCount, nullptr);
-			m_frameDAGUnmaterializedResourceIndices.clear();
-			if (m_frameDAGUnmaterializedResourceIndices.capacity() < m_frameDAGResourceCount) {
-				m_frameDAGUnmaterializedResourceIndices.reserve(m_frameDAGResourceCount);
+			{
+				ZoneScopedN("RGPassAccess::BuildDenseResourceIndex::BuildFlatIDLookup");
+				size_t hashCapacity = 1;
+				while (hashCapacity < m_frameDAGResourceCount * 2) {
+					hashCapacity <<= 1;
+				}
+				if (m_frameDAGResourceIndexHashKeys.size() != hashCapacity) {
+					m_frameDAGResourceIndexHashKeys.assign(hashCapacity, kFrameDAGResourceIndexEmptyKey);
+					m_frameDAGResourceIndexHashValues.resize(hashCapacity);
+				}
+				else {
+					std::fill(
+						m_frameDAGResourceIndexHashKeys.begin(),
+						m_frameDAGResourceIndexHashKeys.end(),
+						kFrameDAGResourceIndexEmptyKey);
+				}
+
+				const size_t hashMask = hashCapacity - 1;
+				for (size_t resourceIndex = 0; resourceIndex < m_frameDAGResourceIDsByIndex.size(); ++resourceIndex) {
+					const uint64_t resourceID = m_frameDAGResourceIDsByIndex[resourceIndex];
+					size_t hashSlot = static_cast<size_t>(MixFrameDAGResourceID(resourceID)) & hashMask;
+					while (m_frameDAGResourceIndexHashKeys[hashSlot] != kFrameDAGResourceIndexEmptyKey) {
+						hashSlot = (hashSlot + 1) & hashMask;
+					}
+					m_frameDAGResourceIndexHashKeys[hashSlot] = resourceID;
+					m_frameDAGResourceIndexHashValues[hashSlot] = static_cast<uint32_t>(resourceIndex);
+				}
+			}
+			{
+				ZoneScopedN("RGPassAccess::BuildDenseResourceIndex::ResetResourcePtrs");
+				m_frameDAGResourcePtrByIndex.assign(m_frameDAGResourceCount, nullptr);
+				m_frameDAGUnmaterializedResourceIndices.clear();
+				if (m_frameDAGUnmaterializedResourceIndices.capacity() < m_frameDAGResourceCount) {
+					m_frameDAGUnmaterializedResourceIndices.reserve(m_frameDAGResourceCount);
+				}
 			}
 		}
 
-		auto findDenseDAGResourceIndex = [&](uint64_t resourceID) -> std::optional<size_t> {
-			auto it = std::lower_bound(m_frameDAGResourceIDsByIndex.begin(), m_frameDAGResourceIDsByIndex.end(), resourceID);
-			if (it == m_frameDAGResourceIDsByIndex.end() || *it != resourceID) {
-				return std::nullopt;
+		auto findDenseDAGResourceIndex = [&](uint64_t resourceID) -> uint32_t {
+			if (m_frameDAGResourceIndexHashKeys.empty() || resourceID == kFrameDAGResourceIndexEmptyKey) {
+				return UINT32_MAX;
 			}
-			return static_cast<size_t>(it - m_frameDAGResourceIDsByIndex.begin());
+
+			const size_t hashMask = m_frameDAGResourceIndexHashKeys.size() - 1;
+			size_t hashSlot = static_cast<size_t>(MixFrameDAGResourceID(resourceID)) & hashMask;
+			for (;;) {
+				const uint64_t key = m_frameDAGResourceIndexHashKeys[hashSlot];
+				if (key == resourceID) {
+					return m_frameDAGResourceIndexHashValues[hashSlot];
+				}
+				if (key == kFrameDAGResourceIndexEmptyKey) {
+					return UINT32_MAX;
+				}
+				hashSlot = (hashSlot + 1) & hashMask;
+			}
 		};
 
 		{
 			ZoneScopedN("RGPassAccess::AssignDenseDAGIndices");
-			auto captureDenseResourcePtr = [&](uint32_t dagResourceIndex, const ResourceRegistry::RegistryHandle& resource) {
+			auto captureDenseResourcePtr = [&](uint32_t dagResourceIndex, Resource* resolvedResource) {
 				if (dagResourceIndex == UINT32_MAX
 					|| dagResourceIndex >= m_frameDAGResourcePtrByIndex.size()
 					|| m_frameDAGResourcePtrByIndex[dagResourceIndex] != nullptr) {
 					return;
 				}
-				Resource* resolvedResource = resource.IsEphemeral()
-					? resource.GetEphemeralPtr()
-					: _registry.Resolve(resource);
 				m_frameDAGResourcePtrByIndex[dagResourceIndex] = resolvedResource;
 				if (auto* backedResource = TryGetBackedResource(resolvedResource);
 					backedResource && !backedResource->IsMaterialized()) {
@@ -642,18 +719,12 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 			};
 			for (auto& summary : m_framePassAccessSummaries) {
 				for (auto& req : summary.requirementSummaries) {
-					auto dagResourceIndex = findDenseDAGResourceIndex(req.resourceID);
-					req.dagResourceIndex = dagResourceIndex.has_value()
-						? static_cast<uint32_t>(*dagResourceIndex)
-						: UINT32_MAX;
-					captureDenseResourcePtr(req.dagResourceIndex, req.resource);
+					req.dagResourceIndex = findDenseDAGResourceIndex(req.resourceID);
+					captureDenseResourcePtr(req.dagResourceIndex, req.resolvedResource);
 				}
 				for (auto& transition : summary.internalTransitionSummaries) {
-					auto dagResourceIndex = findDenseDAGResourceIndex(transition.resourceID);
-					transition.dagResourceIndex = dagResourceIndex.has_value()
-						? static_cast<uint32_t>(*dagResourceIndex)
-						: UINT32_MAX;
-					captureDenseResourcePtr(transition.dagResourceIndex, transition.resource);
+					transition.dagResourceIndex = findDenseDAGResourceIndex(transition.resourceID);
+					captureDenseResourcePtr(transition.dagResourceIndex, transition.resolvedResource);
 				}
 			}
 		}
@@ -733,7 +804,6 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 					mark(transition.dagResourceIndex, AccessKind::Write, false);
 				}
 
-				std::sort(m_compileScratchAccessOrder.begin(), m_compileScratchAccessOrder.end());
 				if (summary.touchedResourceIDs.capacity() < m_compileScratchAccessOrder.size()) {
 					summary.touchedResourceIDs.reserve(m_compileScratchAccessOrder.size());
 				}
