@@ -1,6 +1,10 @@
 #pragma once
 
+#include <condition_variable>
+#include <exception>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -17,6 +21,48 @@
 class GpuBufferBacking;
 
 class BufferView;
+
+struct AsyncBufferBackingResizeRequest {
+    uint64_t resourceID = 0;
+    rhi::HeapType heapType = rhi::HeapType::DeviceLocal;
+    uint64_t byteSize = 0;
+    bool unorderedAccess = false;
+    std::string debugName;
+};
+
+struct AsyncBufferBackingResizeResult {
+    std::unique_ptr<GpuBufferBacking> backing;
+    uint64_t byteSize = 0;
+    uint64_t requestToken = 0;
+    std::exception_ptr exception;
+};
+
+using AsyncBufferBackingResizeScheduler = std::function<void(std::string, std::function<void()>&&)>;
+
+void SetAsyncBufferBackingResizeScheduler(AsyncBufferBackingResizeScheduler scheduler);
+
+class AsyncBufferBackingResizeState {
+public:
+    AsyncBufferBackingResizeState();
+    ~AsyncBufferBackingResizeState();
+
+    AsyncBufferBackingResizeState(const AsyncBufferBackingResizeState&) = delete;
+    AsyncBufferBackingResizeState& operator=(const AsyncBufferBackingResizeState&) = delete;
+    AsyncBufferBackingResizeState(AsyncBufferBackingResizeState&&) noexcept = default;
+    AsyncBufferBackingResizeState& operator=(AsyncBufferBackingResizeState&&) noexcept = default;
+
+    void Request(const AsyncBufferBackingResizeRequest& request);
+    std::optional<AsyncBufferBackingResizeResult> ConsumeReady(bool wait);
+    bool HasPending() const;
+    uint64_t DesiredByteSize() const;
+
+private:
+    struct SharedState;
+
+    static void Schedule(std::shared_ptr<SharedState> state, AsyncBufferBackingResizeRequest request, uint64_t token);
+
+    std::shared_ptr<SharedState> m_state;
+};
 
 class IDeferredBackingResizeClient {
 public:

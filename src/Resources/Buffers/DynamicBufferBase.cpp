@@ -1,8 +1,12 @@
 #include "Resources/Buffers/DynamicBufferBase.h"
 
 #include <algorithm>
+#include <condition_variable>
+#include <exception>
+#include <functional>
 #include <stdexcept>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -10,6 +14,7 @@
 #include <vector>
 
 #include <spdlog/spdlog.h>
+#include <tracy/Tracy.hpp>
 
 #include "Managers/Singletons/DeviceManager.h"
 #include "Managers/Singletons/DescriptorHeapManager.h"
@@ -22,6 +27,8 @@ namespace {
     thread_local uint32_t g_backingMutationScopeDepth = 0;
     std::mutex g_deferredBackingResizeClientsMutex;
     std::vector<IDeferredBackingResizeClient*> g_deferredBackingResizeClients;
+    std::mutex g_asyncResizeSchedulerMutex;
+    AsyncBufferBackingResizeScheduler g_asyncResizeScheduler;
 
     const char* HeapTypeToString(rhi::HeapType heapType) {
         switch (heapType) {
@@ -70,6 +77,216 @@ namespace {
         phase += bufferName;
         ProbeGraphicsCommandListCreation(phase);
     }
+}
+
+struct AsyncBufferBackingResizeState::SharedState {
+    mutable std::mutex mutex;
+    std::condition_variable cv;
+    AsyncBufferBackingResizeRequest lastRequest;
+    AsyncBufferBackingResizeResult readyResult;
+    uint64_t desiredByteSize = 0;
+    uint64_t inFlightByteSize = 0;
+    uint64_t inFlightToken = 0;
+    uint64_t nextToken = 0;
+    bool inFlight = false;
+    bool readyValid = false;
+};
+
+void SetAsyncBufferBackingResizeScheduler(AsyncBufferBackingResizeScheduler scheduler) {
+    std::lock_guard<std::mutex> lock(g_asyncResizeSchedulerMutex);
+    g_asyncResizeScheduler = std::move(scheduler);
+}
+
+AsyncBufferBackingResizeState::AsyncBufferBackingResizeState()
+    : m_state(std::make_shared<SharedState>())
+{
+}
+
+AsyncBufferBackingResizeState::~AsyncBufferBackingResizeState() = default;
+
+void AsyncBufferBackingResizeState::Request(const AsyncBufferBackingResizeRequest& request) {
+    ZoneScopedN("AsyncBufferBackingResizeState::Request");
+    if (request.byteSize == 0) {
+        return;
+    }
+
+    auto state = m_state;
+    AsyncBufferBackingResizeRequest scheduleRequest;
+    uint64_t scheduleToken = 0;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (request.byteSize > state->desiredByteSize) {
+            state->desiredByteSize = request.byteSize;
+        }
+
+        state->lastRequest = request;
+        state->lastRequest.byteSize = state->desiredByteSize;
+
+        if (state->readyValid) {
+            const bool readyFailed = static_cast<bool>(state->readyResult.exception);
+            const bool readyTooSmall = !readyFailed && state->readyResult.byteSize < state->desiredByteSize;
+            if (readyFailed || readyTooSmall) {
+                TracyPlot("AsyncBufferBackingResize.StaleReadyBytes", static_cast<int64_t>(state->readyResult.byteSize));
+                state->readyResult = {};
+                state->readyValid = false;
+            }
+        }
+
+        if (state->inFlight || state->readyValid) {
+            TracyPlot("AsyncBufferBackingResize.CoalescedDesiredBytes", static_cast<int64_t>(state->desiredByteSize));
+            return;
+        }
+
+        scheduleToken = ++state->nextToken;
+        state->inFlight = true;
+        state->inFlightToken = scheduleToken;
+        state->inFlightByteSize = state->desiredByteSize;
+        scheduleRequest = state->lastRequest;
+        scheduleRequest.byteSize = state->desiredByteSize;
+    }
+
+    Schedule(std::move(state), std::move(scheduleRequest), scheduleToken);
+}
+
+std::optional<AsyncBufferBackingResizeResult> AsyncBufferBackingResizeState::ConsumeReady(bool wait) {
+    ZoneScopedN("AsyncBufferBackingResizeState::ConsumeReady");
+    auto state = m_state;
+
+    for (;;) {
+        AsyncBufferBackingResizeRequest scheduleRequest;
+        uint64_t scheduleToken = 0;
+        {
+            std::unique_lock<std::mutex> lock(state->mutex);
+            if (wait) {
+                ZoneScopedN("AsyncBufferBackingResizeState::ConsumeReady::Wait");
+                state->cv.wait(lock, [&]() {
+                    return state->readyValid || !state->inFlight;
+                });
+            } else if (!state->readyValid) {
+                TracyPlot("AsyncBufferBackingResize.Ready", int64_t{ 0 });
+                return std::nullopt;
+            }
+
+            if (!state->readyValid) {
+                TracyPlot("AsyncBufferBackingResize.Ready", int64_t{ 0 });
+                return std::nullopt;
+            }
+
+            auto result = std::move(state->readyResult);
+            state->readyResult = {};
+            state->readyValid = false;
+            TracyPlot("AsyncBufferBackingResize.Ready", int64_t{ 1 });
+
+            if (result.exception) {
+                state->desiredByteSize = 0;
+                state->inFlightByteSize = 0;
+                return result;
+            }
+
+            if (result.byteSize >= state->desiredByteSize) {
+                state->desiredByteSize = result.byteSize;
+                state->inFlightByteSize = 0;
+                return result;
+            }
+
+            TracyPlot("AsyncBufferBackingResize.StaleResultBytes", static_cast<int64_t>(result.byteSize));
+            if (!state->inFlight) {
+                scheduleToken = ++state->nextToken;
+                state->inFlight = true;
+                state->inFlightToken = scheduleToken;
+                state->inFlightByteSize = state->desiredByteSize;
+                scheduleRequest = state->lastRequest;
+                scheduleRequest.byteSize = state->desiredByteSize;
+            }
+        }
+
+        if (scheduleToken != 0) {
+            Schedule(std::move(state), std::move(scheduleRequest), scheduleToken);
+            state = m_state;
+        }
+
+        if (!wait) {
+            return std::nullopt;
+        }
+    }
+}
+
+bool AsyncBufferBackingResizeState::HasPending() const {
+    auto state = m_state;
+    std::lock_guard<std::mutex> lock(state->mutex);
+    return state->inFlight || state->readyValid;
+}
+
+uint64_t AsyncBufferBackingResizeState::DesiredByteSize() const {
+    auto state = m_state;
+    std::lock_guard<std::mutex> lock(state->mutex);
+    return state->desiredByteSize;
+}
+
+void AsyncBufferBackingResizeState::Schedule(
+    std::shared_ptr<SharedState> state,
+    AsyncBufferBackingResizeRequest request,
+    uint64_t token)
+{
+    ZoneScopedN("AsyncBufferBackingResizeState::Schedule");
+    TracyPlot("AsyncBufferBackingResize.ScheduledBytes", static_cast<int64_t>(request.byteSize));
+
+    auto task = [state = std::move(state), request = std::move(request), token]() mutable {
+        ZoneScopedN("AsyncBufferBackingResizeState::WorkerCreateBacking");
+        AsyncBufferBackingResizeResult result;
+        result.byteSize = request.byteSize;
+        result.requestToken = token;
+        try {
+            spdlog::debug(
+                "Async buffer backing resize '{}' id={} create begin bytes={} token={}",
+                request.debugName,
+                request.resourceID,
+                request.byteSize,
+                token);
+            result.backing = GpuBufferBacking::CreateUnique(
+                request.heapType,
+                request.byteSize,
+                request.resourceID,
+                request.unorderedAccess,
+                request.debugName.empty() ? nullptr : request.debugName.c_str());
+            spdlog::debug(
+                "Async buffer backing resize '{}' id={} create complete bytes={} token={}",
+                request.debugName,
+                request.resourceID,
+                request.byteSize,
+                token);
+        }
+        catch (...) {
+            result.exception = std::current_exception();
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (token == state->inFlightToken) {
+                state->readyResult = std::move(result);
+                state->readyValid = true;
+                state->inFlight = false;
+                state->inFlightByteSize = 0;
+            }
+        }
+        state->cv.notify_all();
+    };
+
+    AsyncBufferBackingResizeScheduler scheduler;
+    {
+        std::lock_guard<std::mutex> lock(g_asyncResizeSchedulerMutex);
+        scheduler = g_asyncResizeScheduler;
+    }
+
+    const auto taskName = request.debugName.empty()
+        ? std::string("AsyncBufferBackingResize")
+        : std::string("AsyncBufferBackingResize::") + request.debugName;
+    if (scheduler) {
+        scheduler(taskName, std::move(task));
+        return;
+    }
+
+    std::thread(std::move(task)).detach();
 }
 
 void RegisterDeferredBackingResizeClient(IDeferredBackingResizeClient* client) {
