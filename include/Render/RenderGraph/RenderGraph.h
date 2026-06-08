@@ -1505,6 +1505,7 @@ private:
 	std::unordered_map<uint64_t, uint64_t> compiledResourceGenerationByID;
 	using ResourceMaterializeOptions = std::variant<PixelBuffer::MaterializeOptions, BufferBase::MaterializeOptions>;
 	std::unordered_map<uint64_t, ResourceMaterializeOptions> aliasMaterializeOptionsByID;
+	std::vector<std::optional<ResourceMaterializeOptions>> m_aliasMaterializeOptionsByResourceIndex;
 	std::unordered_map<uint64_t, uint64_t> aliasPlacementSignatureByID;
 	std::unordered_map<uint64_t, rg::alias::AliasPlacementRange> aliasPlacementRangesByID;
 	std::unordered_map<uint64_t, rg::alias::AliasPlacementRange> schedulingPlacementRangesByID;
@@ -1513,6 +1514,12 @@ private:
 	std::vector<rg::alias::AliasPlacementRange> m_schedulingPlacementRangeByResourceIndex;
 	std::vector<uint8_t> m_hasSchedulingPlacementByResourceIndex;
 	std::unordered_map<uint64_t, std::vector<uint64_t>> m_schedulingEquivalentIDsCache;
+	struct SchedulingEquivalentIDRange {
+		uint32_t offset = 0;
+		uint32_t count = 0;
+	};
+	std::vector<uint64_t> m_schedulingEquivalentIDFlat;
+	std::vector<SchedulingEquivalentIDRange> m_schedulingEquivalentIDRangeByResourceIndex;
 	std::unordered_map<uint64_t, size_t> m_frameDAGResourceIndexByID;
 	std::vector<uint64_t> m_frameDAGResourceIDsByIndex;
 	size_t m_frameDAGResourceCount = 0;
@@ -1543,6 +1550,7 @@ private:
 	std::vector<FramePassSchedulingSummary> m_framePassSchedulingSummaries;
 	std::unordered_map<uint64_t, CachedFramePassAccessSummary> m_framePassAccessSummaryCache;
 	std::unordered_map<uint64_t, rg::alias::CachedAliasStaticResourceInfo> m_aliasStaticInfoCacheByResourceID;
+	rg::alias::FrameAliasAnalysis m_aliasFrameAnalysisScratch;
 	std::unordered_map<uint64_t, uint64_t> aliasPlacementPoolByID;
 	std::unordered_set<uint64_t> aliasActivationPending;
 
@@ -1590,6 +1598,24 @@ private:
 	std::vector<size_t> m_planActiveWidthByLevel;
 	std::vector<uint32_t> m_planActiveTouchedResourceEpochs;
 	uint32_t m_planActiveTouchedResourceEpoch = 1;
+	std::vector<size_t> m_aliasSchedulingNodeIndexByPassIndex;
+	std::vector<uint64_t> m_aliasSchedulingResourceIDs;
+	std::vector<uint64_t> m_aliasSchedulingExistingEdgeKeys;
+	std::vector<uint64_t> m_aliasSchedulingProposedEdgeKeys;
+	struct AliasQueueSyncUsage {
+		uint64_t resourceID = 0;
+		uint64_t queueMask = 0;
+	};
+	struct AliasQueueSyncOwner {
+		uint64_t resourceID = 0;
+		uint64_t poolID = 0;
+		uint64_t startByte = 0;
+		uint64_t endByte = 0;
+		size_t batchIndex = 0;
+		uint64_t queueMask = 0;
+	};
+	std::vector<AliasQueueSyncUsage> m_aliasQueueSyncBatchUsageScratch;
+	std::vector<AliasQueueSyncOwner> m_aliasQueueSyncOwnersScratch;
 	std::vector<uint32_t> m_crossFrameFirstUseResourceEpochs;
 	uint32_t m_crossFrameFirstUseResourceEpoch = 1;
 	RenderGraphRegionCache m_regionCache;
@@ -1709,7 +1735,7 @@ private:
 	void RecordFrameQueueUsageBatch(size_t queueSlot, size_t resourceIndex, unsigned int batchIndex);
 	void RecordFrameQueueTransitionBatch(size_t queueSlot, size_t resourceIndex, unsigned int batchIndex);
 	std::pair<unsigned int, uint64_t> GetFrameResourceLastEventBeforeBatch(size_t resourceIndex, unsigned int batchIndex) const;
-	const std::vector<uint64_t>& GetSchedulingEquivalentIDsCached(uint64_t resourceID);
+	std::span<const uint64_t> GetSchedulingEquivalentIDsCached(uint64_t resourceID);
 	void UpdateRetainedDeclarationCache(PassType type, std::string_view name, RenderPassAndResources& passAndResources);
 	void UpdateRetainedDeclarationCache(PassType type, std::string_view name, ComputePassAndResources& passAndResources);
 	void UpdateRetainedDeclarationCache(PassType type, std::string_view name, CopyPassAndResources& passAndResources);

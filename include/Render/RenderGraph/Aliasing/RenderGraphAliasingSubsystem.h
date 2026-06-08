@@ -200,7 +200,7 @@ public:
 
 	void ResetPerFrameState(RenderGraph& rg) const;
 	void ResetPersistentState(RenderGraph& rg) const;
-	FrameAliasAnalysis BuildAliasFrameAnalysis(RenderGraph& rg, const std::vector<AliasSchedulingNode>& nodes) const;
+	FrameAliasAnalysis& BuildAliasFrameAnalysis(RenderGraph& rg, const std::vector<AliasSchedulingNode>& nodes) const;
 	void AutoAssignAliasingPoolsFromAnalysis(RenderGraph& rg, FrameAliasAnalysis& analysis) const;
 	void BuildAliasPlanFromAnalysis(RenderGraph& rg, const FrameAliasAnalysis& analysis) const;
 	void AutoAssignAliasingPools(RenderGraph& rg, const std::vector<AliasSchedulingNode>& nodes) const;

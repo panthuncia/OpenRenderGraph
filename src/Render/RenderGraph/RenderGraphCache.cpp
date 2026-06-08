@@ -2,6 +2,7 @@
 
 #include <span>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 #include <numeric>
@@ -1187,36 +1188,110 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 void RenderGraph::RebuildSchedulingEquivalentIDCache(std::span<const uint64_t> resourceIDs) {
 	ZoneScopedN("RenderGraph::RebuildSchedulingEquivalentIDCache");
 	m_schedulingEquivalentIDsCache.clear();
-
-	if (schedulingPlacementRangesByID.empty()) {
-		return;
+	m_schedulingEquivalentIDFlat.clear();
+	if (m_schedulingEquivalentIDRangeByResourceIndex.size() != m_frameSchedulingResourceCount) {
+		m_schedulingEquivalentIDRangeByResourceIndex.resize(m_frameSchedulingResourceCount);
+	}
+	for (size_t i = 0; i < m_frameSchedulingResourceCount; ++i) {
+		m_schedulingEquivalentIDRangeByResourceIndex[i] = SchedulingEquivalentIDRange{};
 	}
 
-	m_schedulingEquivalentIDsCache.reserve((std::min)(resourceIDs.size(), schedulingPlacementRangesByID.size() * 2));
+	size_t schedulingPlacementCount = 0;
+	for (uint8_t hasPlacement : m_hasSchedulingPlacementByResourceIndex) {
+		schedulingPlacementCount += hasPlacement != 0 ? 1ull : 0ull;
+	}
+	if (schedulingPlacementCount == 0) {
+		return;
+	}
+	const size_t targetFlatCapacity = schedulingPlacementCount * schedulingPlacementCount;
+	if (m_schedulingEquivalentIDFlat.capacity() < targetFlatCapacity) {
+		m_schedulingEquivalentIDFlat.reserve(targetFlatCapacity);
+	}
+
+	auto buildEquivalentIDsInto = [&](size_t resourceIndex, uint64_t resourceID) {
+		const auto* placement = TryGetSchedulingPlacementRangeByResourceIndex(resourceIndex);
+		if (!placement) {
+			return;
+		}
+
+		const uint32_t offset = static_cast<uint32_t>(m_schedulingEquivalentIDFlat.size());
+		for (const auto& [candidateID, candidateIndex] : m_frameSchedulingResourceIndexEntries) {
+			const auto* otherPlacement = TryGetSchedulingPlacementRangeByResourceIndex(candidateIndex);
+			if (!otherPlacement || otherPlacement->poolID != placement->poolID) {
+				continue;
+			}
+
+			const uint64_t overlapStart = (std::max)(placement->startByte, otherPlacement->startByte);
+			const uint64_t overlapEnd = (std::min)(placement->endByte, otherPlacement->endByte);
+			if (overlapStart < overlapEnd) {
+				m_schedulingEquivalentIDFlat.push_back(candidateID);
+			}
+		}
+
+		if (m_schedulingEquivalentIDFlat.size() == offset) {
+			m_schedulingEquivalentIDFlat.push_back(resourceID);
+		}
+		auto beginIt = m_schedulingEquivalentIDFlat.begin() + static_cast<std::ptrdiff_t>(offset);
+		auto endIt = m_schedulingEquivalentIDFlat.end();
+		std::sort(beginIt, endIt);
+		const auto uniqueEnd = std::unique(beginIt, endIt);
+		m_schedulingEquivalentIDFlat.erase(uniqueEnd, endIt);
+		m_schedulingEquivalentIDRangeByResourceIndex[resourceIndex] = SchedulingEquivalentIDRange{
+			.offset = offset,
+			.count = static_cast<uint32_t>(m_schedulingEquivalentIDFlat.size() - offset),
+		};
+	};
+
 	for (uint64_t resourceID : resourceIDs) {
-		if (!TryGetSchedulingPlacementRange(resourceID)) {
+		auto resourceIndex = TryGetFrameSchedulingResourceIndex(resourceID);
+		if (!resourceIndex.has_value()
+			|| *resourceIndex >= m_schedulingEquivalentIDRangeByResourceIndex.size()
+			|| !TryGetSchedulingPlacementRangeByResourceIndex(*resourceIndex)) {
 			continue;
 		}
-		m_schedulingEquivalentIDsCache.emplace(resourceID, BuildSchedulingEquivalentIDs(resourceID));
+		buildEquivalentIDsInto(*resourceIndex, resourceID);
 	}
 }
 
-const std::vector<uint64_t>& RenderGraph::GetSchedulingEquivalentIDsCached(uint64_t resourceID) {
-	auto it = m_schedulingEquivalentIDsCache.find(resourceID);
-	if (it != m_schedulingEquivalentIDsCache.end()) {
-		return it->second;
+std::span<const uint64_t> RenderGraph::GetSchedulingEquivalentIDsCached(uint64_t resourceID) {
+	auto resourceIndex = TryGetFrameSchedulingResourceIndex(resourceID);
+	if (resourceIndex.has_value() && *resourceIndex < m_schedulingEquivalentIDRangeByResourceIndex.size()) {
+		const auto range = m_schedulingEquivalentIDRangeByResourceIndex[*resourceIndex];
+		if (range.count != 0 && static_cast<size_t>(range.offset) + range.count <= m_schedulingEquivalentIDFlat.size()) {
+			return std::span<const uint64_t>(
+				m_schedulingEquivalentIDFlat.data() + range.offset,
+				range.count);
+		}
 	}
 
 	if (!TryGetSchedulingPlacementRange(resourceID)) {
-		thread_local std::vector<uint64_t> identityEquivalentIDs;
-		identityEquivalentIDs.clear();
-		identityEquivalentIDs.push_back(resourceID);
-		return identityEquivalentIDs;
+		thread_local std::array<uint64_t, 1> identityEquivalentIDs;
+		identityEquivalentIDs[0] = resourceID;
+		return std::span<const uint64_t>(identityEquivalentIDs.data(), identityEquivalentIDs.size());
 	}
 
-	auto [insertedIt, inserted] = m_schedulingEquivalentIDsCache.emplace(resourceID, BuildSchedulingEquivalentIDs(resourceID));
-	(void)inserted;
-	return insertedIt->second;
+	thread_local std::vector<uint64_t> fallbackEquivalentIDs;
+	if (resourceIndex.has_value()) {
+		if (m_schedulingEquivalentIDRangeByResourceIndex.size() <= *resourceIndex) {
+			m_schedulingEquivalentIDRangeByResourceIndex.resize(*resourceIndex + 1);
+		}
+		fallbackEquivalentIDs = BuildSchedulingEquivalentIDs(resourceID);
+		const uint32_t offset = static_cast<uint32_t>(m_schedulingEquivalentIDFlat.size());
+		m_schedulingEquivalentIDFlat.insert(
+			m_schedulingEquivalentIDFlat.end(),
+			fallbackEquivalentIDs.begin(),
+			fallbackEquivalentIDs.end());
+		m_schedulingEquivalentIDRangeByResourceIndex[*resourceIndex] = SchedulingEquivalentIDRange{
+			.offset = offset,
+			.count = static_cast<uint32_t>(fallbackEquivalentIDs.size()),
+		};
+		return std::span<const uint64_t>(
+			m_schedulingEquivalentIDFlat.data() + offset,
+			fallbackEquivalentIDs.size());
+	}
+
+	fallbackEquivalentIDs = BuildSchedulingEquivalentIDs(resourceID);
+	return std::span<const uint64_t>(fallbackEquivalentIDs.data(), fallbackEquivalentIDs.size());
 }
 
 void RenderGraph::ExtractScheduleRegionsFromAuthoritativeCompile(
@@ -6280,21 +6355,21 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			});
 		}
 
-		rg::alias::FrameAliasAnalysis aliasAnalysis;
+		rg::alias::FrameAliasAnalysis* aliasAnalysis = nullptr;
 		{
 			traceCompileStep("BuildAliasFrameAnalysis");
 			ZoneScopedN("RenderGraph::CompileFrame::BuildAliasFrameAnalysis");
-			aliasAnalysis = m_aliasingSubsystem.BuildAliasFrameAnalysis(*this, aliasNodes);
+			aliasAnalysis = &m_aliasingSubsystem.BuildAliasFrameAnalysis(*this, aliasNodes);
 		}
 		{
 			traceCompileStep("AutoAssignAliasingPoolsFromAnalysis");
 			ZoneScopedN("RenderGraph::CompileFrame::AutoAssignAliasingPoolsFromAnalysis");
-			m_aliasingSubsystem.AutoAssignAliasingPoolsFromAnalysis(*this, aliasAnalysis);
+			m_aliasingSubsystem.AutoAssignAliasingPoolsFromAnalysis(*this, *aliasAnalysis);
 		}
 		{
 			traceCompileStep("BuildAliasPlanFromAnalysis");
 			ZoneScopedN("RenderGraph::CompileFrame::BuildAliasPlanFromAnalysis");
-			m_aliasingSubsystem.BuildAliasPlanFromAnalysis(*this, aliasAnalysis);
+			m_aliasingSubsystem.BuildAliasPlanFromAnalysis(*this, *aliasAnalysis);
 		}
 		{
 			traceCompileStep("AddCurrentFrameAliasSchedulingEdges");
@@ -6309,6 +6384,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		traceCompileStep("SkipAliasCompile");
 		ZoneScopedN("RenderGraph::CompileFrame::SkipAliasCompile");
 		aliasMaterializeOptionsByID.clear();
+		m_aliasMaterializeOptionsByResourceIndex.clear();
 		aliasActivationPending.clear();
 		aliasPlacementPoolByID.clear();
 		aliasPlacementRangesByID.clear();

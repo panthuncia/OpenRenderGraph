@@ -2009,10 +2009,18 @@ bool RenderGraph::AddCurrentFrameAliasSchedulingEdges(std::vector<Node>& nodes)
 		return it->second->GetName();
 	};
 
-	std::unordered_map<size_t, size_t> nodeIndexByPassIndex;
-	nodeIndexByPassIndex.reserve(nodes.size());
+	auto& nodeIndexByPassIndex = m_aliasSchedulingNodeIndexByPassIndex;
+	if (nodeIndexByPassIndex.size() != m_framePasses.size()) {
+		nodeIndexByPassIndex.assign(m_framePasses.size(), SIZE_MAX);
+	}
+	else {
+		std::fill(nodeIndexByPassIndex.begin(), nodeIndexByPassIndex.end(), SIZE_MAX);
+	}
 	for (size_t nodeIndex = 0; nodeIndex < nodes.size(); ++nodeIndex) {
-		nodeIndexByPassIndex[nodes[nodeIndex].passIndex] = nodeIndex;
+		const size_t passIndex = nodes[nodeIndex].passIndex;
+		if (passIndex < nodeIndexByPassIndex.size()) {
+			nodeIndexByPassIndex[passIndex] = nodeIndex;
+		}
 	}
 
 	size_t existingEdgeCount = 0;
@@ -2020,8 +2028,11 @@ bool RenderGraph::AddCurrentFrameAliasSchedulingEdges(std::vector<Node>& nodes)
 		existingEdgeCount += node.out.size();
 	}
 
-	std::vector<uint64_t> resourceIDs;
-	resourceIDs.reserve(aliasPlacementPoolByID.size());
+	auto& resourceIDs = m_aliasSchedulingResourceIDs;
+	resourceIDs.clear();
+	if (resourceIDs.capacity() < aliasPlacementPoolByID.size()) {
+		resourceIDs.reserve(aliasPlacementPoolByID.size());
+	}
 	for (const auto& [resourceID, resourceIndex] : m_frameSchedulingResourceIndexEntries) {
 		if (TryGetAliasPlacementRangeByResourceIndex(resourceIndex)) {
 			resourceIDs.push_back(resourceID);
@@ -2032,12 +2043,26 @@ bool RenderGraph::AddCurrentFrameAliasSchedulingEdges(std::vector<Node>& nodes)
 	}
 	std::sort(resourceIDs.begin(), resourceIDs.end());
 
-	std::unordered_set<uint64_t> edgeSet;
-	edgeSet.reserve(existingEdgeCount + resourceIDs.size() * 4);
+	auto& existingEdgeKeys = m_aliasSchedulingExistingEdgeKeys;
+	existingEdgeKeys.clear();
+	if (existingEdgeKeys.capacity() < existingEdgeCount) {
+		existingEdgeKeys.reserve(existingEdgeCount);
+	}
 	for (size_t from = 0; from < nodes.size(); ++from) {
 		for (size_t to : nodes[from].out) {
-			edgeSet.insert((uint64_t(from) << 32) | uint64_t(to));
+			existingEdgeKeys.push_back((uint64_t(from) << 32) | uint64_t(to));
 		}
+	}
+	std::sort(existingEdgeKeys.begin(), existingEdgeKeys.end());
+	existingEdgeKeys.erase(std::unique(existingEdgeKeys.begin(), existingEdgeKeys.end()), existingEdgeKeys.end());
+
+	auto& proposedEdgeKeys = m_aliasSchedulingProposedEdgeKeys;
+	proposedEdgeKeys.clear();
+	const size_t maxAliasPairs = resourceIDs.size() > 1
+		? (resourceIDs.size() * (resourceIDs.size() - 1)) / 2
+		: 0;
+	if (proposedEdgeKeys.capacity() < maxAliasPairs) {
+		proposedEdgeKeys.reserve(maxAliasPairs);
 	}
 
 	for (size_t i = 0; i < resourceIDs.size(); ++i) {
@@ -2092,13 +2117,34 @@ bool RenderGraph::AddCurrentFrameAliasSchedulingEdges(std::vector<Node>& nodes)
 				continue;
 			}
 
-			auto fromNodeIt = nodeIndexByPassIndex.find(fromPassIndex);
-			auto toNodeIt = nodeIndexByPassIndex.find(toPassIndex);
-			if (fromNodeIt == nodeIndexByPassIndex.end() || toNodeIt == nodeIndexByPassIndex.end()) {
+			if (fromPassIndex >= nodeIndexByPassIndex.size() || toPassIndex >= nodeIndexByPassIndex.size()) {
+				continue;
+			}
+			const size_t fromNodeIndex = nodeIndexByPassIndex[fromPassIndex];
+			const size_t toNodeIndex = nodeIndexByPassIndex[toPassIndex];
+			if (fromNodeIndex == SIZE_MAX || toNodeIndex == SIZE_MAX) {
 				continue;
 			}
 
-			AddEdgeDedup(fromNodeIt->second, toNodeIt->second, nodes, edgeSet);
+			proposedEdgeKeys.push_back((uint64_t(fromNodeIndex) << 32) | uint64_t(toNodeIndex));
+		}
+	}
+
+	if (!proposedEdgeKeys.empty()) {
+		std::sort(proposedEdgeKeys.begin(), proposedEdgeKeys.end());
+		proposedEdgeKeys.erase(std::unique(proposedEdgeKeys.begin(), proposedEdgeKeys.end()), proposedEdgeKeys.end());
+		for (uint64_t key : proposedEdgeKeys) {
+			if (std::binary_search(existingEdgeKeys.begin(), existingEdgeKeys.end(), key)) {
+				continue;
+			}
+			const size_t from = static_cast<size_t>(key >> 32);
+			const size_t to = static_cast<size_t>(key & 0xffffffffull);
+			if (from >= nodes.size() || to >= nodes.size()) {
+				continue;
+			}
+			nodes[from].out.push_back(to);
+			nodes[to].in.push_back(from);
+			nodes[to].indegree++;
 		}
 	}
 
@@ -3522,10 +3568,13 @@ void RenderGraph::ShutdownOwnedState() {
 	resourceIdleFrameCounts.clear();
 	compiledResourceGenerationByID.clear();
 	aliasMaterializeOptionsByID.clear();
+	m_aliasMaterializeOptionsByResourceIndex.clear();
 	aliasPlacementSignatureByID.clear();
 	aliasPlacementRangesByID.clear();
 	schedulingPlacementRangesByID.clear();
 	m_schedulingEquivalentIDsCache.clear();
+	m_schedulingEquivalentIDFlat.clear();
+	m_schedulingEquivalentIDRangeByResourceIndex.clear();
 	m_aliasStaticInfoCacheByResourceID.clear();
 	m_regionCache = {};
 	m_lastRegionStats = {};
@@ -3705,7 +3754,10 @@ void RenderGraph::RecordCompileProfileCounters(const std::vector<Node>& nodes, s
 	m_activeCompileProfileFrame.transitionCount = transitionCount;
 	m_activeCompileProfileFrame.queueWaitCount = queueWaitCount;
 	m_activeCompileProfileFrame.queueSignalCount = queueSignalCount;
-	m_activeCompileProfileFrame.aliasPlacementCount = aliasPlacementRangesByID.size();
+	m_activeCompileProfileFrame.aliasPlacementCount = static_cast<uint64_t>(std::count_if(
+		m_hasAliasPlacementByResourceIndex.begin(),
+		m_hasAliasPlacementByResourceIndex.end(),
+		[](uint8_t hasPlacement) { return hasPlacement != 0; }));
 	m_activeCompileProfileFrame.materializationCandidateCount = m_lastMaterializeCandidateCount;
 }
 namespace {
@@ -4152,7 +4204,11 @@ void RenderGraph::RebuildEquivalentResourceIndicesByResourceIndex() {
 	ZoneScopedN("RenderGraph::RebuildEquivalentResourceIndicesByResourceIndex");
 	m_equivalentResourceIndicesByResourceIndex.clear();
 	m_equivalentResourceIndicesByResourceIndex.resize(m_frameSchedulingResourceCount);
-	if (schedulingPlacementRangesByID.empty()) {
+	const bool hasSchedulingPlacements = std::any_of(
+		m_hasSchedulingPlacementByResourceIndex.begin(),
+		m_hasSchedulingPlacementByResourceIndex.end(),
+		[](uint8_t hasPlacement) { return hasPlacement != 0; });
+	if (!hasSchedulingPlacements) {
 		return;
 	}
 
@@ -5796,6 +5852,20 @@ std::tuple<int, int, int> RenderGraph::GetBatchesToWaitOn(
 void RenderGraph::MaterializeUnmaterializedResources(std::span<const uint64_t> onlyResourceIDs) {
 	ZoneScopedN("RenderGraph::MaterializeUnmaterializedResources");
 	const bool limitToResourceIDs = !onlyResourceIDs.empty();
+	auto tryGetAliasMaterializeOptions = [&](uint64_t id) -> ResourceMaterializeOptions* {
+		auto resourceIndex = TryGetFrameSchedulingResourceIndex(id);
+		if (resourceIndex.has_value()
+			&& *resourceIndex < m_aliasMaterializeOptionsByResourceIndex.size()
+			&& m_aliasMaterializeOptionsByResourceIndex[*resourceIndex].has_value()) {
+			return &m_aliasMaterializeOptionsByResourceIndex[*resourceIndex].value();
+		}
+
+		auto itAlias = aliasMaterializeOptionsByID.find(id);
+		return itAlias != aliasMaterializeOptionsByID.end()
+			? &itAlias->second
+			: nullptr;
+	};
+
 	// Returns the backing generation if the resource was materialized (or already materialized), or nullopt if skipped.
 	auto materializeOne = [&](uint64_t id, Resource* resource) -> std::optional<uint64_t> {
 		if (limitToResourceIDs && !std::binary_search(onlyResourceIDs.begin(), onlyResourceIDs.end(), id)) {
@@ -5812,10 +5882,9 @@ void RenderGraph::MaterializeUnmaterializedResources(std::span<const uint64_t> o
 		auto texture = dynamic_cast<PixelBuffer*>(resource);
 		if (texture) {
 			if (!texture->IsMaterialized()) {
-				auto itAlias = aliasMaterializeOptionsByID.find(id);
-				if (itAlias != aliasMaterializeOptionsByID.end()) {
-					if (std::holds_alternative<PixelBuffer::MaterializeOptions>(itAlias->second)) {
-						auto& options = std::get<PixelBuffer::MaterializeOptions>(itAlias->second);
+				if (auto* aliasOptions = tryGetAliasMaterializeOptions(id)) {
+					if (std::holds_alternative<PixelBuffer::MaterializeOptions>(*aliasOptions)) {
+						auto& options = std::get<PixelBuffer::MaterializeOptions>(*aliasOptions);
 						if (options.aliasPlacement.has_value()) {
 							const auto& ap = options.aliasPlacement.value();
 							spdlog::info(
@@ -5831,8 +5900,8 @@ void RenderGraph::MaterializeUnmaterializedResources(std::span<const uint64_t> o
 				else {
 					if (texture->GetDescription().allowAlias) {
 						const bool hasManualAliasPool = texture->GetDescription().aliasingPoolID.has_value();
-						const bool hasAutoAliasPool = autoAliasPoolByID.find(id) != autoAliasPoolByID.end();
-						const bool aliasPlacementRequiredThisFrame = hasManualAliasPool || hasAutoAliasPool;
+						const bool hasFrameAliasPlacement = TryGetAliasPlacementRange(id) != nullptr;
+						const bool aliasPlacementRequiredThisFrame = hasManualAliasPool || hasFrameAliasPlacement;
 
 						if (limitToResourceIDs && aliasPlacementRequiredThisFrame) {
 							throw std::runtime_error(
@@ -5865,10 +5934,9 @@ void RenderGraph::MaterializeUnmaterializedResources(std::span<const uint64_t> o
 		}
 
 		if (!buffer->IsMaterialized()) {
-			auto itAlias = aliasMaterializeOptionsByID.find(id);
-			if (itAlias != aliasMaterializeOptionsByID.end()) {
-				if (std::holds_alternative<BufferBase::MaterializeOptions>(itAlias->second)) {
-					auto& options = std::get<BufferBase::MaterializeOptions>(itAlias->second);
+			if (auto* aliasOptions = tryGetAliasMaterializeOptions(id)) {
+				if (std::holds_alternative<BufferBase::MaterializeOptions>(*aliasOptions)) {
+					auto& options = std::get<BufferBase::MaterializeOptions>(*aliasOptions);
 					if (options.aliasPlacement.has_value()) {
 						const auto& ap = options.aliasPlacement.value();
 						spdlog::info(
@@ -5884,8 +5952,8 @@ void RenderGraph::MaterializeUnmaterializedResources(std::span<const uint64_t> o
 			else {
 				if (buffer->IsAliasingAllowed()) {
 					const bool hasManualAliasPool = buffer->GetAliasingPoolHint().has_value();
-					const bool hasAutoAliasPool = autoAliasPoolByID.find(id) != autoAliasPoolByID.end();
-					const bool aliasPlacementRequiredThisFrame = hasManualAliasPool || hasAutoAliasPool;
+					const bool hasFrameAliasPlacement = TryGetAliasPlacementRange(id) != nullptr;
+					const bool aliasPlacementRequiredThisFrame = hasManualAliasPool || hasFrameAliasPlacement;
 
 					if (limitToResourceIDs && aliasPlacementRequiredThisFrame) {
 						throw std::runtime_error(
@@ -5935,7 +6003,7 @@ void RenderGraph::MaterializeUnmaterializedResources(std::span<const uint64_t> o
 	};
 
 	auto skipIfAlreadyMaterialized = [&](uint64_t id, Resource* resource) {
-		if (!resource || aliasMaterializeOptionsByID.find(id) != aliasMaterializeOptionsByID.end()) {
+		if (!resource || tryGetAliasMaterializeOptions(id) != nullptr) {
 			return false;
 		}
 		auto* backedResource = TryGetBackedResource(resource);

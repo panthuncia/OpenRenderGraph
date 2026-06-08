@@ -38,6 +38,7 @@ rg::alias::AutoAliasDebugSnapshot rg::alias::RenderGraphAliasingSubsystem::Build
 
 void rg::alias::RenderGraphAliasingSubsystem::ResetPerFrameState(RenderGraph& renderGraph) const {
 	renderGraph.aliasMaterializeOptionsByID.clear();
+	renderGraph.m_aliasMaterializeOptionsByResourceIndex.clear();
 	renderGraph.aliasActivationPending.clear();
 	renderGraph.m_aliasPlacementRangeByResourceIndex.clear();
 	renderGraph.m_hasAliasPlacementByResourceIndex.clear();
@@ -49,6 +50,8 @@ void rg::alias::RenderGraphAliasingSubsystem::ResetPerFrameState(RenderGraph& re
 	renderGraph.autoAliasExclusionReasonSummary.clear();
 	renderGraph.autoAliasExcludedResources.clear();
 	renderGraph.schedulingPlacementRangesByID.clear();
+	renderGraph.m_schedulingEquivalentIDFlat.clear();
+	renderGraph.m_schedulingEquivalentIDRangeByResourceIndex.clear();
 	renderGraph.autoAliasPlannerStats = {};
 	renderGraph.autoAliasPreviousMode = renderGraph.autoAliasModeLastFrame;
 }
