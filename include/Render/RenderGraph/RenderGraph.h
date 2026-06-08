@@ -834,6 +834,7 @@ private:
 	struct FramePassRequirementStaticSummary {
 		ResourceRegistry::RegistryHandle resource;
 		uint64_t resourceID = 0;
+		uint32_t dagResourceIndex = UINT32_MAX;
 		RangeSpec range{};
 		ResourceState state{};
 		bool isUAV = false;
@@ -843,6 +844,7 @@ private:
 	struct FramePassInternalTransitionStaticSummary {
 		ResourceRegistry::RegistryHandle resource;
 		uint64_t resourceID = 0;
+		uint32_t dagResourceIndex = UINT32_MAX;
 	};
 
 	struct FramePassStaticAccessSummary {
@@ -879,7 +881,7 @@ private:
 
 		uint64_t resourceID = 0;
 		Resource* resource = nullptr;
-		SymbolicTracker tracker;
+		std::optional<SymbolicTracker> tracker;
 		bool trackerInitialized = false;
 		bool readOnlyUniformTransitionChecked = false;
 		FastStateShadow fastState{};
@@ -1297,7 +1299,12 @@ private:
 
 		void Initialize(size_t count) {
 			epoch = 1;
-			epochs.assign(count, 0);
+			if (epochs.size() != count) {
+				epochs.assign(count, 0);
+			}
+			else {
+				std::fill(epochs.begin(), epochs.end(), 0);
+			}
 			values.clear();
 		}
 
@@ -1364,10 +1371,10 @@ private:
 			resourceEpoch = 1;
 			internalTransitionEpoch = 1;
 			otherQueueUAVEpoch = 1;
-			nodeEpochByIndex.assign(nodeCount, 0);
-			resourceEpochByIndex.assign(resourceCount, 0);
-			internalTransitionEpochByIndex.assign(resourceCount, 0);
-			otherQueueUAVEpochByOffset.assign(queueCount * resourceCount, 0);
+			AssignOrClear(nodeEpochByIndex, nodeCount);
+			AssignOrClear(resourceEpochByIndex, resourceCount);
+			AssignOrClear(internalTransitionEpochByIndex, resourceCount);
+			AssignOrClear(otherQueueUAVEpochByOffset, queueCount * resourceCount);
 		}
 
 		void ResetForNewBatch() {
@@ -1423,6 +1430,15 @@ private:
 		}
 
 	private:
+		static void AssignOrClear(std::vector<uint32_t>& values, size_t count) {
+			if (values.size() != count) {
+				values.assign(count, 0);
+			}
+			else {
+				std::fill(values.begin(), values.end(), 0);
+			}
+		}
+
 		static void AdvanceEpoch(std::vector<uint32_t>& values, uint32_t& epoch) {
 			++epoch;
 			if (epoch == 0) {
@@ -1444,8 +1460,8 @@ private:
 		size_t topoRank = 0;
 
 		// Expanded IDs (aliases + group/child fixpoint)
-		std::vector<uint64_t> touchedIDs;
-		std::vector<uint64_t> uavIDs;
+		const std::vector<uint64_t>* touchedIDs = nullptr;
+		const std::vector<uint64_t>* uavIDs = nullptr;
 
 		// DAG
 		std::vector<size_t> out;
@@ -1518,6 +1534,7 @@ private:
 	std::vector<uint32_t> m_compileScratchAccessUavEpochs;
 	std::vector<uint32_t> m_compileScratchAccessDagEpochs;
 	std::vector<uint32_t> m_compileScratchAccessOrder;
+	std::vector<uint64_t> m_compileScratchPreferredDynamicStableIDByIndex;
 	uint32_t m_compileScratchAccessEpoch = 1;
 	std::vector<size_t> m_compileScratchRefreshNeededMasterIndices;
 	std::vector<std::pair<uint64_t, Resource*>> m_materializeScratchItems;
@@ -1561,6 +1578,20 @@ private:
 	std::vector<CapturedTrackerResource> trackers; // Resources whose live state trackers receive compiled states after execution.
 	std::vector<FrameCompileResourceState> m_frameCompileResources; // Compile-only symbolic state, indexed by frame-local resource index.
 	std::vector<FrameResourceAccessSummary> m_frameResourceAccessSummaries;
+	BatchBuildState m_autoScheduleBatchBuildState;
+	FrameEpochSet m_autoScheduleScratchTransitioned;
+	FrameEpochSet m_autoScheduleScratchFallback;
+	std::vector<ResourceTransition> m_autoScheduleScratchTransitions;
+	std::vector<uint32_t> m_autoScheduleIndeg;
+	std::vector<size_t> m_autoScheduleReady;
+	std::vector<uint32_t> m_planActiveIndeg;
+	std::vector<uint32_t> m_planActiveLevel;
+	std::vector<size_t> m_planActiveReady;
+	std::vector<size_t> m_planActiveWidthByLevel;
+	std::vector<uint32_t> m_planActiveTouchedResourceEpochs;
+	uint32_t m_planActiveTouchedResourceEpoch = 1;
+	std::vector<uint32_t> m_crossFrameFirstUseResourceEpochs;
+	uint32_t m_crossFrameFirstUseResourceEpoch = 1;
 	RenderGraphRegionCache m_regionCache;
 	RegionCacheStats m_lastRegionStats;
 	std::vector<ScheduledRegion> m_lastExtractedRegions;
@@ -1914,6 +1945,10 @@ private:
 		size_t passQueueSlot,
 		const DenseRequirementSummary& requirement,
 		ResourceState requiredState);
+	bool TryAddTransitionTrackedNoOp(
+		PassBatch& currentBatch,
+		const DenseRequirementSummary& requirement,
+		ResourceState requiredState);
 	void AddTransitionSlowPath(
 		unsigned int batchIndex,
 		PassBatch& currentBatch,
@@ -1963,7 +1998,7 @@ private:
 	bool BuildDependencyGraph(std::vector<Node>& nodes, std::span<const std::pair<size_t, size_t>> explicitEdges);
 	static bool FinalizeDependencyGraph(std::vector<Node>& nodes);
 	static std::vector<Node> BuildNodes(RenderGraph& rg);
-	static std::vector<uint8_t> PlanActiveQueueSlots(RenderGraph& rg, const std::vector<AnyPassAndResources>& passes, const std::vector<Node>& nodes);
+	static void PlanActiveQueueSlots(RenderGraph& rg, const std::vector<AnyPassAndResources>& passes, const std::vector<Node>& nodes);
 	static bool AddEdgeDedup(
 		size_t from, size_t to,
 		std::vector<Node>& nodes,
@@ -1976,6 +2011,7 @@ private:
 
 		unsigned int currentBatchIndex,
 		PassBatch& currentBatch,
+		BatchBuildState& batchBuildState,
 		FrameEpochSet& scratchTransitioned,
 		FrameEpochSet& scratchFallback,
 		std::vector<ResourceTransition>& scratchTransitions);
@@ -2004,6 +2040,7 @@ private:
 	std::function<bool()> m_getAutoAliasLogExclusionReasons;
 	std::function<bool()> m_getAutoAliasBuildDebugData;
 	std::function<bool()> m_getQueueSchedulingEnableLogging;
+	std::function<rg::runtime::QueueSchedulingSelectionPolicy()> m_getQueueSchedulingSelectionPolicy;
 	std::function<float()> m_getQueueSchedulingWidthScale;
 	std::function<float()> m_getQueueSchedulingPenaltyBias;
 	std::function<float()> m_getQueueSchedulingMinPenalty;

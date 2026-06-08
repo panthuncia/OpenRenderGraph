@@ -23,6 +23,7 @@ public:
     virtual bool GetAutoAliasLogExclusionReasons() const = 0;
     virtual bool GetAutoAliasBuildDebugData() const = 0;
     virtual bool GetQueueSchedulingEnableLogging() const = 0;
+    virtual QueueSchedulingSelectionPolicy GetQueueSchedulingSelectionPolicy() const = 0;
     virtual float GetQueueSchedulingWidthScale() const = 0;
     virtual float GetQueueSchedulingPenaltyBias() const = 0;
     virtual float GetQueueSchedulingMinPenalty() const = 0;

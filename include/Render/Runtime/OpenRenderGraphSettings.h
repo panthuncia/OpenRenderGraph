@@ -19,6 +19,11 @@ enum class TransitionPlacementMode : uint8_t {
     CanonicalThenOptimize,
 };
 
+enum class QueueSchedulingSelectionPolicy : uint8_t {
+    FirstFit = 0,
+    Scored = 1,
+};
+
 struct OpenRenderGraphSettings {
     uint8_t numFramesInFlight = 3;
     bool collectPassStatistics = true;
@@ -36,6 +41,7 @@ struct OpenRenderGraphSettings {
     bool autoAliasLogExclusionReasons = false;
     bool autoAliasBuildDebugData = false;
     bool queueSchedulingEnableLogging = false;
+    QueueSchedulingSelectionPolicy queueSchedulingSelectionPolicy = QueueSchedulingSelectionPolicy::FirstFit;
     float queueSchedulingWidthScale = 1.0f;
     float queueSchedulingPenaltyBias = 0.0f;
     float queueSchedulingMinPenalty = 1.0f;
@@ -78,6 +84,9 @@ inline void SetOpenRenderGraphSettings(const OpenRenderGraphSettings& settings) 
     state.settings = settings;
     state.settings.numFramesInFlight = (std::max)(uint8_t{ 1 }, state.settings.numFramesInFlight);
     state.settings.queueSchedulingWidthScale = (std::max)(0.0f, state.settings.queueSchedulingWidthScale);
+    if (static_cast<uint8_t>(state.settings.queueSchedulingSelectionPolicy) > static_cast<uint8_t>(QueueSchedulingSelectionPolicy::Scored)) {
+        state.settings.queueSchedulingSelectionPolicy = QueueSchedulingSelectionPolicy::FirstFit;
+    }
     state.settings.queueSchedulingMinPenalty = (std::max)(0.0f, state.settings.queueSchedulingMinPenalty);
     state.settings.queueSchedulingResourcePressureWeight = (std::max)(0.0f, state.settings.queueSchedulingResourcePressureWeight);
     state.settings.queueSchedulingUavPressureWeight = (std::max)(0.0f, state.settings.queueSchedulingUavPressureWeight);

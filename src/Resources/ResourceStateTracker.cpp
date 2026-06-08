@@ -1,6 +1,7 @@
 #include "Resources/ResourceStateTracker.h"
 #include <optional>
 #include <algorithm>
+#include <array>
 #include <unordered_map>
 
 #include "Resources/Resource.h"
@@ -135,19 +136,25 @@ static bool isEmpty(RangeSpec const &r) {
 }
 
 // subtract the (assumed nonempty) 'cut' from 'orig', returning up to 4 remainders
-static std::vector<RangeSpec> subtract(RangeSpec orig, RangeSpec cut) {
-    std::vector<RangeSpec> out;
+static size_t subtract(RangeSpec orig, RangeSpec cut, std::array<RangeSpec, 4>& out) {
+    size_t count = 0;
+    auto pushIfNonEmpty = [&](const RangeSpec& range) {
+        if (!isEmpty(range) && count < out.size()) {
+            out[count++] = range;
+        }
+    };
+
     // left strip: all mips below cut.mipLower
     if (boundLower(orig.mipLower) < boundLower(cut.mipLower)) {
         RangeSpec r = orig;
         r.mipUpper = { BoundType::UpTo, boundLower(cut.mipLower) - 1 };
-        if (!isEmpty(r)) out.push_back(r);
+        pushIfNonEmpty(r);
     }
     // right strip: all mips above cut.mipUpper
     if (boundUpper(orig.mipUpper) > boundUpper(cut.mipUpper)) {
         RangeSpec r = orig;
         r.mipLower = { BoundType::From, boundUpper(cut.mipUpper) + 1 };
-        if (!isEmpty(r)) out.push_back(r);
+        pushIfNonEmpty(r);
     }
     // now the middle in the mip dimension
     RangeSpec mid = orig;
@@ -158,16 +165,16 @@ static std::vector<RangeSpec> subtract(RangeSpec orig, RangeSpec cut) {
     if (boundLower(orig.sliceLower) < boundLower(cut.sliceLower)) {
         RangeSpec r = mid;
         r.sliceUpper = { BoundType::UpTo, boundLower(cut.sliceLower) - 1 };
-        if (!isEmpty(r)) out.push_back(r);
+        pushIfNonEmpty(r);
     }
     // bottom strip: slices above cut.sliceUpper
     if (boundUpper(orig.sliceUpper) > boundUpper(cut.sliceUpper)) {
         RangeSpec r = mid;
         r.sliceLower = { BoundType::From, boundUpper(cut.sliceUpper) + 1 };
-        if (!isEmpty(r)) out.push_back(r);
+        pushIfNonEmpty(r);
     }
 
-    return out;
+    return count;
 }
 
 static RangeSpec intersect(RangeSpec A, RangeSpec B) {
@@ -280,7 +287,12 @@ void SymbolicTracker::Apply(const RangeSpec& want,
     ResourceState newState,
     std::vector<ResourceTransition>& out)
 {
-    std::vector<Segment> next;
+    thread_local std::vector<Segment> next;
+    next.clear();
+    if (next.capacity() < _segs.size() + 4) {
+        next.reserve(_segs.size() + 4);
+    }
+    std::array<RangeSpec, 4> remainders{};
     for (auto &seg : _segs) {
         auto cut = intersect(seg.rangeSpec, want);
         if (isEmpty(cut)) {
@@ -288,8 +300,10 @@ void SymbolicTracker::Apply(const RangeSpec& want,
             next.push_back(seg);
         } else {
             // split seg by cut
-            for (auto &rem : subtract(seg.rangeSpec, cut))
-                next.push_back({ rem, seg.state });
+            const size_t remainderCount = subtract(seg.rangeSpec, cut, remainders);
+            for (size_t remainderIndex = 0; remainderIndex < remainderCount; ++remainderIndex) {
+                next.push_back({ remainders[remainderIndex], seg.state });
+            }
 
             // record a transition over 'cut' if state differs
             if (!(seg.state == newState)) {
@@ -368,6 +382,11 @@ std::vector<Segment> SymbolicTracker::Flatten(ResourceState const& skipState, bo
 
 const std::vector<Segment>& SymbolicTracker::GetSegments() const noexcept {
 	return _segs;
+}
+
+void SymbolicTracker::Reset(const RangeSpec& whole, const ResourceState& init) {
+	_segs.clear();
+	_segs.push_back({ whole, init });
 }
 
 void SymbolicTracker::CopyFrom(const SymbolicTracker& other) {

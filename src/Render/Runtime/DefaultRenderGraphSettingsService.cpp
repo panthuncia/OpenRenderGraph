@@ -55,6 +55,10 @@ public:
         return GetOpenRenderGraphSettings().queueSchedulingEnableLogging;
     }
 
+    QueueSchedulingSelectionPolicy GetQueueSchedulingSelectionPolicy() const override {
+        return GetOpenRenderGraphSettings().queueSchedulingSelectionPolicy;
+    }
+
     float GetQueueSchedulingWidthScale() const override {
         return GetOpenRenderGraphSettings().queueSchedulingWidthScale;
     }

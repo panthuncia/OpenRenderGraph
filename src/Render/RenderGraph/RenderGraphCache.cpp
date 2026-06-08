@@ -475,6 +475,12 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 		m_framePassAccessSummaries.resize(m_framePasses.size());
 	}
 
+	auto resolveHandleResource = [&](const ResourceRegistry::RegistryHandle& handle) -> Resource* {
+		return handle.IsEphemeral()
+			? handle.GetEphemeralPtr()
+			: _registry.Resolve(handle);
+	};
+
 	auto schedulingResourceIDForHandle = [&](const ResourceRegistry::RegistryHandle& handle) {
 		Resource* resource = handle.IsEphemeral()
 			? handle.GetEphemeralPtr()
@@ -497,6 +503,21 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 				out.push_back(backing->GetGlobalResourceID());
 			}
 		}
+	};
+
+	auto appendHandleResourceIDsResolved = [&](std::vector<uint64_t>& out, const ResourceRegistry::RegistryHandle& handle, Resource* resource) {
+		const uint64_t handleID = handle.GetGlobalResourceID();
+		out.push_back(handleID);
+		if (auto* dynamicResource = dynamic_cast<DynamicResource*>(resource)) {
+			const uint64_t stableID = dynamicResource->GetDynamicWrapperGlobalResourceID();
+			out.push_back(stableID);
+			out.push_back(dynamicResource->GetGlobalResourceID());
+			if (auto backing = dynamicResource->GetResource()) {
+				out.push_back(backing->GetGlobalResourceID());
+			}
+			return stableID;
+		}
+		return handleID;
 	};
 
 	{
@@ -548,11 +569,12 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 
 				for (const auto& req : view.reqs) {
 					const auto resource = req.resourceHandleAndRange.resource;
-					const uint64_t resourceID = schedulingResourceIDForHandle(resource);
-					appendHandleResourceIDs(m_compileScratchResourceIDs, resource);
+					Resource* resolvedResource = resolveHandleResource(resource);
+					const uint64_t resourceID = appendHandleResourceIDsResolved(m_compileScratchResourceIDs, resource, resolvedResource);
 					summary.requirementSummaries.push_back(FramePassRequirementStaticSummary{
 						.resource = resource,
 						.resourceID = resourceID,
+						.dagResourceIndex = UINT32_MAX,
 						.range = req.resourceHandleAndRange.range,
 						.state = req.state,
 						.isUAV = IsUAVState(req.state),
@@ -563,10 +585,12 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 				if (view.internalTransitions) {
 					for (const auto& transition : *view.internalTransitions) {
 						const auto resource = transition.first.resource;
-						appendHandleResourceIDs(m_compileScratchResourceIDs, resource);
+						Resource* resolvedResource = resolveHandleResource(resource);
+						const uint64_t resourceID = appendHandleResourceIDsResolved(m_compileScratchResourceIDs, resource, resolvedResource);
 						summary.internalTransitionSummaries.push_back(FramePassInternalTransitionStaticSummary{
 							.resource = resource,
-							.resourceID = schedulingResourceIDForHandle(resource),
+							.resourceID = resourceID,
+							.dagResourceIndex = UINT32_MAX,
 						});
 					}
 				}
@@ -594,6 +618,24 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 		};
 
 		{
+			ZoneScopedN("RGPassAccess::AssignDenseDAGIndices");
+			for (auto& summary : m_framePassAccessSummaries) {
+				for (auto& req : summary.requirementSummaries) {
+					auto dagResourceIndex = findDenseDAGResourceIndex(req.resourceID);
+					req.dagResourceIndex = dagResourceIndex.has_value()
+						? static_cast<uint32_t>(*dagResourceIndex)
+						: UINT32_MAX;
+				}
+				for (auto& transition : summary.internalTransitionSummaries) {
+					auto dagResourceIndex = findDenseDAGResourceIndex(transition.resourceID);
+					transition.dagResourceIndex = dagResourceIndex.has_value()
+						? static_cast<uint32_t>(*dagResourceIndex)
+						: UINT32_MAX;
+				}
+			}
+		}
+
+		{
 			ZoneScopedN("RGPassAccess::MarkWrittenDAGResourcesDense");
 			m_compileScratchResourcesWritten.assign(m_frameDAGResourceCount, uint8_t{ 0 });
 			for (const auto& summary : m_framePassAccessSummaries) {
@@ -601,15 +643,13 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 					if (!req.isWrite) {
 						continue;
 					}
-					auto dagResourceIndex = findDenseDAGResourceIndex(req.resourceID);
-					if (dagResourceIndex.has_value()) {
-						m_compileScratchResourcesWritten[*dagResourceIndex] = 1;
+					if (req.dagResourceIndex != UINT32_MAX && req.dagResourceIndex < m_compileScratchResourcesWritten.size()) {
+						m_compileScratchResourcesWritten[req.dagResourceIndex] = 1;
 					}
 				}
 				for (const auto& transition : summary.internalTransitionSummaries) {
-					auto dagResourceIndex = findDenseDAGResourceIndex(transition.resourceID);
-					if (dagResourceIndex.has_value()) {
-						m_compileScratchResourcesWritten[*dagResourceIndex] = 1;
+					if (transition.dagResourceIndex != UINT32_MAX && transition.dagResourceIndex < m_compileScratchResourcesWritten.size()) {
+						m_compileScratchResourcesWritten[transition.dagResourceIndex] = 1;
 					}
 				}
 			}
@@ -641,13 +681,11 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 				m_compileScratchAccessOrder.clear();
 
 				const uint32_t epoch = m_compileScratchAccessEpoch++;
-				auto mark = [&](uint64_t resourceID, AccessKind accessKind, bool isUav) {
-					auto denseDAGResourceIndex = findDenseDAGResourceIndex(resourceID);
-					if (!denseDAGResourceIndex.has_value()) {
+				auto mark = [&](uint32_t dagResourceIndex, AccessKind accessKind, bool isUav) {
+					if (dagResourceIndex == UINT32_MAX || dagResourceIndex >= m_frameDAGResourceIDsByIndex.size()) {
 						return;
 					}
 
-					const uint32_t dagResourceIndex = static_cast<uint32_t>(*denseDAGResourceIndex);
 					if (m_compileScratchAccessEpochs[dagResourceIndex] != epoch) {
 						m_compileScratchAccessEpochs[dagResourceIndex] = epoch;
 						m_compileScratchAccessOrder.push_back(dagResourceIndex);
@@ -666,10 +704,10 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 				};
 
 				for (const auto& req : summary.requirementSummaries) {
-					mark(req.resourceID, req.isWrite ? AccessKind::Write : AccessKind::Read, req.isUAV);
+					mark(req.dagResourceIndex, req.isWrite ? AccessKind::Write : AccessKind::Read, req.isUAV);
 				}
 				for (const auto& transition : summary.internalTransitionSummaries) {
-					mark(transition.resourceID, AccessKind::Write, false);
+					mark(transition.dagResourceIndex, AccessKind::Write, false);
 				}
 
 				std::sort(m_compileScratchAccessOrder.begin(), m_compileScratchAccessOrder.end());
@@ -3863,7 +3901,7 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 		auto& compileResourceState = GetOrCreateFrameCompileResourceState(resourceIndex, resource, resourceID);
 		resource = compileResourceState.resource ? compileResourceState.resource : resource;
 		ignoredTransitions.clear();
-		compileResourceState.tracker.Apply(range, resource, state, ignoredTransitions);
+		compileResourceState.tracker->Apply(range, resource, state, ignoredTransitions);
 		if (resource && isExplicitWholeResourceRange(range)) {
 			compileResourceState.fastState.valid = true;
 			compileResourceState.fastState.wholeResourceOnly = true;
@@ -3873,7 +3911,7 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 			compileResourceState.fastState.valid = false;
 			compileResourceState.fastState.wholeResourceOnly = false;
 		}
-		return &compileResourceState.tracker;
+		return &*compileResourceState.tracker;
 	};
 
 	auto appendPassPointer = [&](PassBatch& batch, uint16_t queueSlot, AnyPassAndResources& passAndResources) -> bool {
@@ -4010,11 +4048,11 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 				// usable segment boundary state. Emitting a ReplaySegmentInput
 				// barrier to it would produce SyncAfter=None, after which D3D12
 				// forbids later access in the same ExecuteCommandLists scope.
-				inputBatch.passBatchTrackersByResourceIndex[*resourceIndex] = &compileResourceState.tracker;
+				inputBatch.passBatchTrackersByResourceIndex[*resourceIndex] = &*compileResourceState.tracker;
 				continue;
 			}
-			if (!compileResourceState.tracker.WouldModify(input.range, requiredState)) {
-				inputBatch.passBatchTrackersByResourceIndex[*resourceIndex] = &compileResourceState.tracker;
+			if (!compileResourceState.tracker->WouldModify(input.range, requiredState)) {
+				inputBatch.passBatchTrackersByResourceIndex[*resourceIndex] = &*compileResourceState.tracker;
 				continue;
 			}
 			const bool aliasActivationPendingForInput =
@@ -4027,7 +4065,7 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 					// A cached discard transition is the segment's alias activation point.
 					// Do not synthesize a ReplaySegmentInput transition to its before-state;
 					// that turns an internal first-write into an invalid boundary read/use.
-					inputBatch.passBatchTrackersByResourceIndex[*resourceIndex] = &compileResourceState.tracker;
+					inputBatch.passBatchTrackersByResourceIndex[*resourceIndex] = &*compileResourceState.tracker;
 					continue;
 				}
 				if (!inputCanActivateAlias) {
@@ -4172,7 +4210,7 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 				if (transitionTemplate.discard) {
 					ResourceState emittedBeforeState = transitionTemplate.before;
 					ResourceState liveBeforeState{};
-					if (TryGetWholeResourceTrackerState(compileResourceState.tracker, liveBeforeState)) {
+					if (TryGetWholeResourceTrackerState(*compileResourceState.tracker, liveBeforeState)) {
 						emittedBeforeState = liveBeforeState;
 					}
 					ResourceTransition transition(
@@ -4187,11 +4225,11 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 						true);
 					batch.Transitions(transitionTemplate.queueSlot, transitionTemplate.phase).push_back(transition);
 					ignoredTransitions.clear();
-					compileResourceState.tracker.Apply(transitionTemplate.range, resource, transitionTemplate.after, ignoredTransitions);
+					compileResourceState.tracker->Apply(transitionTemplate.range, resource, transitionTemplate.after, ignoredTransitions);
 				}
 				else {
 					scratchTransitions.clear();
-					compileResourceState.tracker.Apply(transitionTemplate.range, resource, transitionTemplate.after, scratchTransitions);
+					compileResourceState.tracker->Apply(transitionTemplate.range, resource, transitionTemplate.after, scratchTransitions);
 					auto& transitions = batch.Transitions(transitionTemplate.queueSlot, transitionTemplate.phase);
 					transitions.insert(transitions.end(), scratchTransitions.begin(), scratchTransitions.end());
 				}
@@ -4438,9 +4476,6 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 
 	auto updateBatchMembershipForCommittedPass = [&](const Node& committedNode) {
 		const auto& passSummary = m_framePassSchedulingSummaries[committedNode.passIndex];
-		for (size_t resourceIndex : passSummary.requiredResourceIndices) {
-			batchBuildState.MarkResource(resourceIndex);
-		}
 		for (const auto& transition : passSummary.internalTransitions) {
 			batchBuildState.MarkInternalTransition(transition.resourceIndex);
 		}
@@ -4557,7 +4592,7 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 				return false;
 			}
 			const auto& compileResourceState = m_frameCompileResources[*resourceIndex];
-			if (!compileResourceState.trackerInitialized) {
+			if (!compileResourceState.trackerInitialized || !compileResourceState.tracker.has_value()) {
 				setReason("segment_input_tracker_uninitialized");
 				return false;
 			}
@@ -4574,7 +4609,7 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 			}
 			const QueueKind queueKind = m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(input.queueSlot));
 			const ResourceState requiredState = NormalizeStateForQueue(queueKind, input.requiredState);
-			if (compileResourceState.tracker.WouldModify(input.range, requiredState)) {
+			if (compileResourceState.tracker->WouldModify(input.range, requiredState)) {
 				continue;
 			}
 		}
@@ -5152,6 +5187,7 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 				chosen,
 				currentBatchIndex,
 				currentBatch,
+				batchBuildState,
 				scratchTransitioned,
 				scratchFallback,
 				scratchTransitions);
@@ -5266,7 +5302,6 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	{
 		traceCompileStep("ResetCompileFrameScratch");
 		ZoneScopedN("RenderGraph::CompileFrame::ResetCompileFrameScratch");
-		m_frameCompileResources.clear();
 		m_schedulingEquivalentIDsCache.clear();
 	}
 	{
@@ -6308,7 +6343,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	{
 		traceCompileStep("PlanActiveQueueSlots");
 		ZoneScopedN("RenderGraph::CompileFrame::PlanActiveQueueSlots");
-		m_activeQueueSlotsThisFrame = PlanActiveQueueSlots(*this, m_framePasses, nodes);
+		PlanActiveQueueSlots(*this, m_framePasses, nodes);
 	}
 	{
 		traceCompileStep("AssignQueueSlots");
@@ -7215,18 +7250,15 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		uint64_t overlapSampleCurrentResourceId = 0;
 		uint64_t overlapSamplePreviousResourceId = 0;
 		bool loggedGraphicsWaitOnCopySample = false;
-		std::unordered_map<const void*, std::string_view> passNameByEntry;
-		passNameByEntry.reserve(m_framePasses.size());
-		for (const auto& pr : m_framePasses) {
-			std::visit([&](auto const& passAndResources) {
-				using T = std::decay_t<decltype(passAndResources)>;
-				if constexpr (!std::is_same_v<T, std::monostate>) {
-					passNameByEntry.emplace(static_cast<const void*>(&passAndResources), std::string_view(pr.name));
-				}
-			}, pr.pass);
+		if (m_crossFrameFirstUseResourceEpochs.size() != m_frameSchedulingResourceCount) {
+			m_crossFrameFirstUseResourceEpochs.assign(m_frameSchedulingResourceCount, 0);
+			m_crossFrameFirstUseResourceEpoch = 1;
 		}
-		std::unordered_set<uint64_t> firstUseSeenResourceIDs;
-		firstUseSeenResourceIDs.reserve(std::max<size_t>(usedResourceIDs.size() * 2, 64));
+		const uint32_t firstUseEpoch = m_crossFrameFirstUseResourceEpoch++;
+		if (m_crossFrameFirstUseResourceEpoch == 0) {
+			std::fill(m_crossFrameFirstUseResourceEpochs.begin(), m_crossFrameFirstUseResourceEpochs.end(), 0);
+			m_crossFrameFirstUseResourceEpoch = 2;
+		}
 
 		auto resourceDebugName = [&](uint64_t resourceID) -> std::string {
 			if (auto it = resourcesByID.find(resourceID); it != resourcesByID.end() && it->second) {
@@ -7257,7 +7289,10 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			const auto& equivalentIDs = GetSchedulingEquivalentIDsCached(id);
 			bool hasNewEquivalent = false;
 			for (uint64_t rid : equivalentIDs) {
-				if (firstUseSeenResourceIDs.find(rid) == firstUseSeenResourceIDs.end()) {
+				const auto resourceIndex = TryGetFrameSchedulingResourceIndex(rid);
+				if (resourceIndex.has_value()
+					&& *resourceIndex < m_crossFrameFirstUseResourceEpochs.size()
+					&& m_crossFrameFirstUseResourceEpochs[*resourceIndex] != firstUseEpoch) {
 					hasNewEquivalent = true;
 					break;
 				}
@@ -7266,7 +7301,10 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				return false;
 			}
 			for (uint64_t rid : equivalentIDs) {
-				firstUseSeenResourceIDs.insert(rid);
+				const auto resourceIndex = TryGetFrameSchedulingResourceIndex(rid);
+				if (resourceIndex.has_value() && *resourceIndex < m_crossFrameFirstUseResourceEpochs.size()) {
+					m_crossFrameFirstUseResourceEpochs[*resourceIndex] = firstUseEpoch;
+				}
 			}
 			return true;
 		};
@@ -7359,10 +7397,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 						if (!passEntry) {
 							return;
 						}
-						std::string_view passName;
-						if (auto it = passNameByEntry.find(static_cast<const void*>(passEntry)); it != passNameByEntry.end()) {
-							passName = it->second;
-						}
+						const std::string_view passName = passEntry->name;
 						ForEachFrameRequirement(passEntry->resources, [&](const auto& req) {
 							if (shouldProcessFirstUse(req.resourceHandleAndRange.resource)) {
 								accumulateCrossFrameWaitForHandle(queueIndex, req.resourceHandleAndRange.resource, passName);
@@ -8007,11 +8042,11 @@ void RenderGraph::LogRegionCompileSummary(uint8_t frameIndex, const std::vector<
 	for (const auto& compileResource : m_frameCompileResources) {
 		finalTrackerFingerprint = HashCombine64(finalTrackerFingerprint, compileResource.resourceID);
 		finalTrackerFingerprint = HashCombine64(finalTrackerFingerprint, compileResource.trackerInitialized ? 1ull : 0ull);
-		if (!compileResource.trackerInitialized) {
+		if (!compileResource.trackerInitialized || !compileResource.tracker.has_value()) {
 			continue;
 		}
 		++initializedTrackerCount;
-		const auto& segments = compileResource.tracker.GetSegments();
+		const auto& segments = compileResource.tracker->GetSegments();
 		trackerSegmentCount += segments.size();
 		finalTrackerFingerprint = HashCombine64(finalTrackerFingerprint, segments.size());
 		for (const auto& segment : segments) {

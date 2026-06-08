@@ -108,6 +108,8 @@ public:
         _segs.push_back({ whole, init });
     }
 
+    void Reset(const RangeSpec& whole, const ResourceState& init);
+
     // apply a new requirement and emit transitions
     void Apply(const RangeSpec& want,
         Resource* pRes,
