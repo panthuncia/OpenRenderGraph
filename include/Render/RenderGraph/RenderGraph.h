@@ -293,11 +293,18 @@ public:
 	}
 
 	struct RetainedDeclarationCache {
+		struct AnonymousSlotValidationEntry {
+			uint32_t anonymousSlot = 0;
+			uint32_t handleIndex = 0;
+		};
+
 		bool hasDynamicDeclaredResources = false;
 		IDynamicDeclaredResources* dynamicInterface = nullptr;
 
 		bool containsEphemeralOrAnonymousHandles = false;
 		bool requiresStaleHandleValidation = false;
+		std::vector<AnonymousSlotValidationEntry> staleHandleValidationStaticRequirementAnonymousEntries;
+		std::vector<AnonymousSlotValidationEntry> staleHandleValidationInternalTransitionAnonymousEntries;
 
 		uint64_t resolverSnapshotHash = 0;
 		uint64_t declarationGeneration = 0;
@@ -1650,6 +1657,7 @@ private:
 	std::vector<CapturedTrackerResource> trackers; // Resources whose live state trackers receive compiled states after execution.
 	std::vector<FrameCompileResourceState> m_frameCompileResources; // Compile-only symbolic state, indexed by frame-local resource index.
 	std::vector<FrameResourceAccessSummary> m_frameResourceAccessSummaries;
+	std::vector<uint32_t> m_anonymousSlotChangesThisFrame;
 	BatchBuildState m_autoScheduleBatchBuildState;
 	FrameEpochSet m_autoScheduleScratchTransitioned;
 	FrameEpochSet m_autoScheduleScratchFallback;

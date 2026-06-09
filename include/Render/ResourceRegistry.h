@@ -7,6 +7,7 @@
 #include <optional>
 #include <sstream>
 #include <stdexcept>
+#include <algorithm>
 #include <unordered_map>
 #include <utility>
 #include <variant>
@@ -321,8 +322,23 @@ public:
             s.resource = SharedOrWeakPtr<Resource>{};
             s.alive = false;
             ++s.generation;
+            m_anonymousSlotChanges.push_back(idx);
             freeList.push_back(idx);
         }
+    }
+
+    void TakeAnonymousSlotChanges(std::vector<uint32_t>& out) {
+        if (!out.empty()) {
+            out.clear();
+        }
+        if (m_anonymousSlotChanges.empty()) {
+            return;
+        }
+
+        out = std::move(m_anonymousSlotChanges);
+        m_anonymousSlotChanges.clear();
+        std::sort(out.begin(), out.end());
+        out.erase(std::unique(out.begin(), out.end()), out.end());
     }
 
     RegistryHandle MakeHandle(ResourceIdentifier const& id) const {
@@ -437,6 +453,7 @@ public:
 
 private:
     uint64_t m_epoch = 0;
+    std::vector<uint32_t> m_anonymousSlotChanges;
     std::unordered_map<Resource*, RegistryHandle> resourceToHandle;
 	static constexpr uint32_t kEphemeralSlotIndex = UINT32_MAX;
     std::unordered_map<ResourceIdentifier, std::shared_ptr<IResourceResolver>, ResourceIdentifier::Hasher> m_resolvers;
@@ -458,6 +475,7 @@ private:
         s.generation++;
         s.alive = true;
         s.id = {};
+        m_anonymousSlotChanges.push_back(idx);
 
         RegistryHandle h(
             ResourceKey{ idx },

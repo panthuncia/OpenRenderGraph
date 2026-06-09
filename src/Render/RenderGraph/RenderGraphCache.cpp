@@ -85,6 +85,8 @@ namespace {
 	struct CachedHandleValidationInfo {
 		bool containsEphemeralOrAnonymousHandles = false;
 		bool requiresStaleHandleValidation = false;
+		std::vector<RenderGraph::RetainedDeclarationCache::AnonymousSlotValidationEntry> staticRequirementAnonymousEntries;
+		std::vector<RenderGraph::RetainedDeclarationCache::AnonymousSlotValidationEntry> internalTransitionAnonymousEntries;
 	};
 
 	template<class PassResourceData>
@@ -93,7 +95,7 @@ namespace {
 		const PassResourceData& resources)
 	{
 		CachedHandleValidationInfo info{};
-		auto inspectHandle = [&](const ResourceRegistry::RegistryHandle& handle) {
+		auto inspectHandle = [&](const ResourceRegistry::RegistryHandle& handle, uint32_t index, bool internalTransition) {
 			if (handle.IsEphemeral()) {
 				info.containsEphemeralOrAnonymousHandles = true;
 				return;
@@ -101,15 +103,41 @@ namespace {
 			if (registry.IsAnonymous(handle)) {
 				info.containsEphemeralOrAnonymousHandles = true;
 				info.requiresStaleHandleValidation = true;
+				RenderGraph::RetainedDeclarationCache::AnonymousSlotValidationEntry entry{
+					handle.GetKey().idx,
+					index
+				};
+				if (internalTransition) {
+					info.internalTransitionAnonymousEntries.push_back(entry);
+				} else {
+					info.staticRequirementAnonymousEntries.push_back(entry);
+				}
 			}
 		};
 
-		for (const auto& req : resources.staticResourceRequirements) {
-			inspectHandle(req.resourceHandleAndRange.resource);
+		for (uint32_t i = 0; i < resources.staticResourceRequirements.size(); ++i) {
+			inspectHandle(resources.staticResourceRequirements[i].resourceHandleAndRange.resource, i, false);
 		}
-		for (const auto& transition : resources.internalTransitions) {
-			inspectHandle(transition.first.resource);
+		for (uint32_t i = 0; i < resources.internalTransitions.size(); ++i) {
+			inspectHandle(resources.internalTransitions[i].first.resource, i, true);
 		}
+
+		auto dedupeBySlot = [](auto& entries) {
+			std::sort(entries.begin(), entries.end(), [](const auto& lhs, const auto& rhs) {
+				if (lhs.anonymousSlot != rhs.anonymousSlot) {
+					return lhs.anonymousSlot < rhs.anonymousSlot;
+				}
+				return lhs.handleIndex < rhs.handleIndex;
+			});
+			entries.erase(
+				std::unique(entries.begin(), entries.end(),
+					[](const auto& lhs, const auto& rhs) {
+						return lhs.anonymousSlot == rhs.anonymousSlot && lhs.handleIndex == rhs.handleIndex;
+					}),
+				entries.end());
+		};
+		dedupeBySlot(info.staticRequirementAnonymousEntries);
+		dedupeBySlot(info.internalTransitionAnonymousEntries);
 		return info;
 	}
 
@@ -249,6 +277,8 @@ namespace {
 		declarationCache.dynamicInterface = dynamicInterface;
 		declarationCache.containsEphemeralOrAnonymousHandles = handleValidation.containsEphemeralOrAnonymousHandles;
 		declarationCache.requiresStaleHandleValidation = handleValidation.requiresStaleHandleValidation;
+		declarationCache.staleHandleValidationStaticRequirementAnonymousEntries = std::move(handleValidation.staticRequirementAnonymousEntries);
+		declarationCache.staleHandleValidationInternalTransitionAnonymousEntries = std::move(handleValidation.internalTransitionAnonymousEntries);
 		declarationCache.resolverSnapshotHash = HashResolverSnapshots(passAndResources.resolverSnapshots);
 		declarationCache.declarationFingerprint = HashPassDeclaration(passAndResources.resources, passAndResources.resolverSnapshots);
 		++declarationCache.declarationGeneration;
@@ -5532,6 +5562,13 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	}
 
 	traceCompileStep("RefreshRetainedDeclarations");
+	{
+		traceCompileStep("RefreshRetainedDeclarations::AnonymousSlotChanges");
+		ZoneScopedN("RenderGraph::CompileFrame::RefreshRetainedDeclarations::AnonymousSlotChanges");
+		_registry.TakeAnonymousSlotChanges(m_anonymousSlotChangesThisFrame);
+		TracyPlot("ORG.RefreshRetained.AnonymousSlotChanges", static_cast<int64_t>(m_anonymousSlotChangesThisFrame.size()));
+	}
+	using AnonymousSlotValidationEntry = RenderGraph::RetainedDeclarationCache::AnonymousSlotValidationEntry;
 	auto needsRefresh = [&](auto& p) -> bool {
 		ZoneScopedN("RenderGraph::CompileFrame::RefreshRetainedDeclarations::NeedsRefresh");
 		if (!p.name.empty()) {
@@ -5550,35 +5587,129 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			}
 		}
 
-		auto hasInvalidCachedHandle = [&](const auto& resourceHandleAndRange, const char* sourceKind) -> bool {
-			const auto& resource = resourceHandleAndRange.resource;
-			if (resource.IsEphemeral() || _registry.IsValid(resource)) {
-				return false;
-			}
-
-			spdlog::warn(
-				"RG frame {} forcing retained declaration refresh for pass '{}' due to stale cached {} handle: resourceId={} registryHandleInfo='{}'",
-				frameIndex,
-				p.name,
-				sourceKind,
-				resource.GetGlobalResourceID(),
-				_registry.DescribeHandle(resource));
-			return true;
-		};
-
 		if (p.declarationCache.requiresStaleHandleValidation) {
 			ZoneScopedN("RenderGraph::CompileFrame::RefreshRetainedDeclarations::NeedsRefresh::StaleHandleValidation");
-				for (const auto& req : p.resources.staticResourceRequirements) {
-					if (hasInvalidCachedHandle(req.resourceHandleAndRange, "requirement")) {
-						return true;
+			if (!m_anonymousSlotChangesThisFrame.empty()) {
+				const auto& staticEntries = p.declarationCache.staleHandleValidationStaticRequirementAnonymousEntries;
+				const auto& transitionEntries = p.declarationCache.staleHandleValidationInternalTransitionAnonymousEntries;
+				if (!staticEntries.empty()) {
+					const bool iterateSmallBySlot = m_anonymousSlotChangesThisFrame.size() < staticEntries.size();
+					if (iterateSmallBySlot) {
+						for (const uint32_t anonymousSlot : m_anonymousSlotChangesThisFrame) {
+							auto it = std::lower_bound(staticEntries.begin(), staticEntries.end(), anonymousSlot,
+								[](const AnonymousSlotValidationEntry& entry, uint32_t slot) { return entry.anonymousSlot < slot; });
+							if (it == staticEntries.end() || it->anonymousSlot != anonymousSlot) {
+								continue;
+							}
+							if (it->handleIndex >= p.resources.staticResourceRequirements.size()) {
+								continue;
+							}
+							const auto& resourceHandle = p.resources.staticResourceRequirements[it->handleIndex].resourceHandleAndRange.resource;
+							if (resourceHandle.IsEphemeral() || _registry.IsValid(resourceHandle)) {
+								continue;
+							}
+							spdlog::warn(
+								"RG frame {} forcing retained declaration refresh for pass '{}' due to stale cached {} handle: resourceId={} registryHandleInfo='{}'",
+								frameIndex,
+								p.name,
+								"requirement",
+								resourceHandle.GetGlobalResourceID(),
+								_registry.DescribeHandle(resourceHandle));
+							return true;
+						}
+					}
+					else {
+						size_t i = 0;
+						size_t j = 0;
+						while (i < staticEntries.size() && j < m_anonymousSlotChangesThisFrame.size()) {
+							const uint32_t staticSlot = staticEntries[i].anonymousSlot;
+							const uint32_t changedSlot = m_anonymousSlotChangesThisFrame[j];
+							if (staticSlot == changedSlot) {
+								if (staticEntries[i].handleIndex < p.resources.staticResourceRequirements.size()) {
+									const auto& resourceHandle = p.resources.staticResourceRequirements[staticEntries[i].handleIndex].resourceHandleAndRange.resource;
+									if (!resourceHandle.IsEphemeral() && !_registry.IsValid(resourceHandle)) {
+										spdlog::warn(
+											"RG frame {} forcing retained declaration refresh for pass '{}' due to stale cached {} handle: resourceId={} registryHandleInfo='{}'",
+											frameIndex,
+											p.name,
+											"requirement",
+											resourceHandle.GetGlobalResourceID(),
+											_registry.DescribeHandle(resourceHandle));
+										return true;
+									}
+								}
+								++i;
+								++j;
+							}
+							else if (staticSlot < changedSlot) {
+								++i;
+							}
+							else {
+								++j;
+							}
+						}
 					}
 				}
 
-				for (const auto& transition : p.resources.internalTransitions) {
-					if (hasInvalidCachedHandle(transition.first, "internal-transition")) {
-						return true;
+				if (!transitionEntries.empty()) {
+					const bool iterateSmallBySlot = m_anonymousSlotChangesThisFrame.size() < transitionEntries.size();
+					if (iterateSmallBySlot) {
+						for (const uint32_t anonymousSlot : m_anonymousSlotChangesThisFrame) {
+							auto it = std::lower_bound(transitionEntries.begin(), transitionEntries.end(), anonymousSlot,
+								[](const AnonymousSlotValidationEntry& entry, uint32_t slot) { return entry.anonymousSlot < slot; });
+							if (it == transitionEntries.end() || it->anonymousSlot != anonymousSlot) {
+								continue;
+							}
+							if (it->handleIndex >= p.resources.internalTransitions.size()) {
+								continue;
+							}
+							const auto& resourceHandle = p.resources.internalTransitions[it->handleIndex].first.resource;
+							if (resourceHandle.IsEphemeral() || _registry.IsValid(resourceHandle)) {
+								continue;
+							}
+							spdlog::warn(
+								"RG frame {} forcing retained declaration refresh for pass '{}' due to stale cached {} handle: resourceId={} registryHandleInfo='{}'",
+								frameIndex,
+								p.name,
+								"internal-transition",
+								resourceHandle.GetGlobalResourceID(),
+								_registry.DescribeHandle(resourceHandle));
+							return true;
+						}
+					}
+					else {
+						size_t i = 0;
+						size_t j = 0;
+						while (i < transitionEntries.size() && j < m_anonymousSlotChangesThisFrame.size()) {
+							const uint32_t transitionSlot = transitionEntries[i].anonymousSlot;
+							const uint32_t changedSlot = m_anonymousSlotChangesThisFrame[j];
+							if (transitionSlot == changedSlot) {
+								if (transitionEntries[i].handleIndex < p.resources.internalTransitions.size()) {
+									const auto& resourceHandle = p.resources.internalTransitions[transitionEntries[i].handleIndex].first.resource;
+									if (!resourceHandle.IsEphemeral() && !_registry.IsValid(resourceHandle)) {
+										spdlog::warn(
+											"RG frame {} forcing retained declaration refresh for pass '{}' due to stale cached {} handle: resourceId={} registryHandleInfo='{}'",
+											frameIndex,
+											p.name,
+											"internal-transition",
+											resourceHandle.GetGlobalResourceID(),
+											_registry.DescribeHandle(resourceHandle));
+										return true;
+									}
+								}
+								++i;
+								++j;
+							}
+							else if (transitionSlot < changedSlot) {
+								++i;
+							}
+							else {
+								++j;
+							}
+						}
 					}
 				}
+			}
 		}
 
 		if (!p.declarationCache.dynamicInterface) {
