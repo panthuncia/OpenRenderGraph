@@ -228,6 +228,10 @@ private:
 
 	std::vector<ResourceUpdate>  m_resourceUpdates;
 	std::vector<TextureUpdate>   m_textureUpdates;
+	std::vector<uint64_t>        m_declarePendingUploadSourceBits;
+	std::vector<size_t>          m_declarePendingUploadSourceMarkedWords;
+	std::vector<uint64_t>        m_declarePendingUploadBufferDestBits;
+	std::vector<size_t>          m_declarePendingUploadBufferDestMarkedWords;
 
 	UploadResolveContext m_ctx{};
 	PendingWorkChangedCallback m_pendingWorkChanged;

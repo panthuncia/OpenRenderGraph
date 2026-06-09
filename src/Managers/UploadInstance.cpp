@@ -621,20 +621,77 @@ void UploadInstance::DeclarePendingUploadResourceUsages(
 	RefreshQueuedTargetTelemetryLocked();
 	PruneInvalidRegistryHandleUpdatesLocked("upload-pass-declare");
 
+	auto clearBitsetWords = [](const std::vector<size_t>& touchedWords, std::vector<uint64_t>& bitset) {
+		for (const size_t word : touchedWords) {
+			bitset[word] = 0;
+		}
+	};
+
+	auto dedupByGlobalResource = [](std::vector<uint64_t>& bitset, std::vector<size_t>& touched, uint64_t resourceId) -> bool {
+		const size_t wordIndex = static_cast<size_t>(resourceId >> 6);
+		const uint64_t bitMask = 1ull << (resourceId & 63);
+
+		if (wordIndex >= bitset.size()) {
+			bitset.resize(wordIndex + 1, 0);
+		}
+
+		if ((bitset[wordIndex] & bitMask) != 0) {
+			return false;
+		}
+
+		bitset[wordIndex] |= bitMask;
+		touched.push_back(wordIndex);
+		return true;
+	};
+
+	m_declarePendingUploadSourceMarkedWords.clear();
+	m_declarePendingUploadBufferDestMarkedWords.clear();
+
 	for (const auto& update : m_resourceUpdates) {
 		if (!update.active || !update.uploadBuffer) {
 			continue;
 		}
-		copySource(update.uploadBuffer);
-		copyDest(update.resourceToUpdate, UINT32_MAX, UINT32_MAX);
+
+		uint64_t sourceResourceId = update.uploadBuffer->GetGlobalResourceID();
+		if (dedupByGlobalResource(
+			m_declarePendingUploadSourceBits,
+			m_declarePendingUploadSourceMarkedWords,
+			sourceResourceId)) {
+			copySource(update.uploadBuffer);
+		}
+
+		uint64_t destResourceId = 0;
+		if (update.resourceToUpdate.kind == UploadTarget::Kind::PinnedShared && update.resourceToUpdate.pinned) {
+			destResourceId = update.resourceToUpdate.pinned->GetGlobalResourceID();
+		}
+		else if (update.resourceToUpdate.kind == UploadTarget::Kind::RegistryHandle) {
+			destResourceId = update.resourceToUpdate.h.GetGlobalResourceID();
+		}
+
+		if (dedupByGlobalResource(
+			m_declarePendingUploadBufferDestBits,
+			m_declarePendingUploadBufferDestMarkedWords,
+			destResourceId)) {
+			copyDest(update.resourceToUpdate, UINT32_MAX, UINT32_MAX);
+		}
 	}
 	for (const auto& update : m_textureUpdates) {
 		if (!update.uploadBuffer) {
 			continue;
 		}
-		copySource(update.uploadBuffer);
+
+		uint64_t sourceResourceId = update.uploadBuffer->GetGlobalResourceID();
+		if (dedupByGlobalResource(
+			m_declarePendingUploadSourceBits,
+			m_declarePendingUploadSourceMarkedWords,
+			sourceResourceId)) {
+			copySource(update.uploadBuffer);
+		}
 		copyDest(update.texture, update.mip, update.slice);
 	}
+
+	clearBitsetWords(m_declarePendingUploadSourceMarkedWords, m_declarePendingUploadSourceBits);
+	clearBitsetWords(m_declarePendingUploadBufferDestMarkedWords, m_declarePendingUploadBufferDestBits);
 }
 
 std::string UploadInstance::DescribeQueuedTargetByGlobalResourceId(uint64_t globalResourceId) {
