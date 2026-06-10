@@ -55,6 +55,10 @@ endif()
 find_package(implot CONFIG REQUIRED)
 find_package(slang CONFIG REQUIRED)
 find_package(Tracy REQUIRED CONFIG)
+if(COMMAND basicrenderer_use_release_library_for_debug)
+    basicrenderer_use_release_library_for_debug(fmt::fmt)
+    basicrenderer_use_release_library_for_debug(Tracy::TracyClient)
+endif()
 
 add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/DebugUI/MemoryIntrospectionWidget.cpp"
