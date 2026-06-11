@@ -42,7 +42,7 @@ public:
         rhi::ResourceLayout prevLayout, 
         rhi::ResourceLayout newLayout, 
         rhi::ResourceSyncState prevSyncState, 
-        rhi::ResourceSyncState newSyncState)
+        rhi::ResourceSyncState newSyncState) override
 	;
 
 	rhi::Format GetFormat() const {

@@ -71,8 +71,8 @@ public:
 	ResourceDescriptorIndexHelper(
 		std::shared_ptr<ResourceRegistryView> registryView,
 		std::unordered_set<FeatureDomainIdentifier, FeatureDomainIdentifier::Hasher> activeFeatureDomains = {})
-		: m_resourceRegistryView(std::move(registryView)),
-		  m_activeFeatureDomains(std::move(activeFeatureDomains)) {
+		: m_activeFeatureDomains(std::move(activeFeatureDomains)),
+		  m_resourceRegistryView(std::move(registryView)) {
 
 	}
 	void RegisterDescriptor(const AutoDescriptorRegistration& registration) {
