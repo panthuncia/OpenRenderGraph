@@ -7,7 +7,7 @@
 #include <flecs.h>
 #include <rhi_allocator.h>
 
-#include "resources/ResourceIdentifier.h"
+#include "Resources/ResourceIdentifier.h"
 
 struct EntityComponentBundle {
     std::vector<std::function<void(flecs::entity)>> ops;

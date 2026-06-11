@@ -74,7 +74,7 @@ SubresourceRange ResolveRangeSpec(const RangeSpec& spec,
 struct ResourceTransition {
     ResourceTransition() = default;
     ResourceTransition(Resource* pResource, RangeSpec range, rhi::ResourceAccessType prevAccessType, rhi::ResourceAccessType newAccessType, rhi::ResourceLayout prevLayout, rhi::ResourceLayout newLayout, rhi::ResourceSyncState prevSyncState, rhi::ResourceSyncState newSyncState, bool discard = false)
-        : range(range), pResource(pResource), prevAccessType(prevAccessType), newAccessType(newAccessType), prevLayout(prevLayout), newLayout(newLayout), prevSyncState(prevSyncState), newSyncState(newSyncState), discard(discard) {
+        : pResource(pResource), range(range), prevAccessType(prevAccessType), newAccessType(newAccessType), prevLayout(prevLayout), newLayout(newLayout), prevSyncState(prevSyncState), newSyncState(newSyncState), discard(discard) {
     }
     Resource* pResource;
     RangeSpec range;

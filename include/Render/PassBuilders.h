@@ -1210,7 +1210,7 @@ private:
         Instantiate<PassT>(rg::NoInputs{}, std::forward<StableCtorArgs>(ctorArgs)...);
     }
 
-    void Finalize() {
+    void Finalize() override {
         if (!built_) return;
 
         auto authorState = std::move(*this).CaptureAuthorState();
@@ -1888,7 +1888,7 @@ private:
         Instantiate<PassT>(rg::NoInputs{}, std::forward<StableCtorArgs>(ctorArgs)...);
     }
 
-    void Finalize() {
+    void Finalize() override {
         if (!built_) return;
 
         auto authorState = std::move(*this).CaptureAuthorState();
@@ -2299,7 +2299,7 @@ private:
         Instantiate<PassT>(rg::NoInputs{}, std::forward<StableCtorArgs>(ctorArgs)...);
     }
 
-    void Finalize() {
+    void Finalize() override {
         if (!built_) return;
 
         auto authorState = std::move(*this).CaptureAuthorState();

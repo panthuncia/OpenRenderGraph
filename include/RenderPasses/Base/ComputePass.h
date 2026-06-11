@@ -12,7 +12,7 @@
 #include "Render/ResourceRegistry.h"
 #include "ResourceDescriptorIndexHelper.h"
 #include "Render/PipelineState.h"
-#include "interfaces/IResourceProvider.h"
+#include "Interfaces/IResourceProvider.h"
 #include "Render/PassInputs.h"
 #include "Render/PassExecutionContext.h"
 #include "Render/FeatureDomainRegistry.h"
