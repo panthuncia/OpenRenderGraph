@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <typeindex>
 #include <rhi.h>
 #include <DirectXMath.h>
@@ -22,6 +23,7 @@ struct UpdateExecutionContext {
 	UINT64 frameFenceValue = 0;
 	float deltaTime = 0.0f;
 	const IHostExecutionData* hostData = nullptr;
+	std::function<void()> beforeCompileFrame;
 };
 
 struct ImmediateExecutionContext {

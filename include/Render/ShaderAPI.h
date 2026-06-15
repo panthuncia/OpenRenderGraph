@@ -7,5 +7,5 @@ namespace rg::shaderapi {
 	inline constexpr uint32_t kNumResourceDescriptorIndicesRootConstants = 64;
 
 	inline constexpr uint32_t kIndirectCommandSignatureRootParameter = 6;
-	inline constexpr uint32_t kNumIndirectCommandSignatureRootConstants = 4;
+	inline constexpr uint32_t kNumIndirectCommandSignatureRootConstants = 5;
 }

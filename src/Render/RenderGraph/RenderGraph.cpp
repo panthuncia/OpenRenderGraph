@@ -6779,6 +6779,11 @@ void RenderGraph::Update(const UpdateExecutionContext& context, rhi::Device devi
 		}
 	}
 
+	if (context.beforeCompileFrame) {
+		ZoneScopedN("RenderGraph::Update::BeforeCompileFrame");
+		context.beforeCompileFrame();
+	}
+
 	{
 		ZoneScopedN("RenderGraph::Update::CompileFrame");
 		CompileFrame(device, context.frameIndex, context.hostData);
