@@ -277,6 +277,9 @@ public:
 		// Extensions can create queues, allocate upload instances, etc.
 		virtual void Initialize(RenderGraph& rg) { (void)rg; }
 
+		// Called before renderer teardown waits on/destroys graph-owned work.
+		virtual void Shutdown(RenderGraph& rg) { (void)rg; }
+
 		// lets systems react to registry recreation without RenderGraph including them
 		virtual void OnRegistryReset(ResourceRegistry* registry) {}
 
@@ -642,6 +645,7 @@ public:
 	void ResetForFrame();
 	void ResetForRebuild();
 	void PrepareExtensionsForBuild();
+	void ShutdownExtensions();
 	void Setup();
 	void RegisterExtension(std::unique_ptr<IRenderGraphExtension> ext, std::optional<std::string_view> id = std::nullopt);
 	const std::vector<PassBatch>& GetBatches() const { return batches; }

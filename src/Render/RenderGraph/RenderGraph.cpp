@@ -5,6 +5,7 @@
 #include <cmath>
 #include <map>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -37,6 +38,21 @@
 
 namespace {
 	constexpr uint64_t kFrameDAGResourceIndexEmptyKey = std::numeric_limits<uint64_t>::max();
+
+	bool SarpClodImportDebugLoggingEnabled()
+	{
+		static const bool enabled = [] {
+			char* value = nullptr;
+			size_t length = 0;
+			if (_dupenv_s(&value, &length, "SARP_DEBUG_CLOD_IMPORT") != 0 || value == nullptr) {
+				return false;
+			}
+			const bool result = length > 1 && value[0] != '0';
+			std::free(value);
+			return result;
+		}();
+		return enabled;
+	}
 
 	uint64_t MixFrameDAGResourceID(uint64_t value) noexcept {
 		value ^= value >> 33;
@@ -4996,6 +5012,14 @@ void RenderGraph::PrepareExtensionsForBuild() {
 	}
 }
 
+void RenderGraph::ShutdownExtensions() {
+	for (auto& ext : m_extensions) {
+		if (ext) {
+			ext->Shutdown(*this);
+		}
+	}
+}
+
 void RenderGraph::ResetForRebuild()
 {
 	if (m_pCommandRecordingManager) {
@@ -7157,6 +7181,18 @@ namespace {
 					handle.index,
 					handle.generation,
 					fr.fenceValue);
+				if (SarpClodImportDebugLoggingEnabled()) {
+					spdlog::info(
+						"SARPDBG SignalExternalFences frame={} queue={} slot={} batch={} timeline(idx={}, gen={}) value={} completedBefore={}",
+						frameIndex,
+						QueueKindToString(queueKind),
+						queueSlot,
+						batchIndex,
+						handle.index,
+						handle.generation,
+						fr.fenceValue,
+						fr.fence.value().GetCompletedValue());
+				}
 				const rhi::Result signalResult = queue.Signal({ fr.fence.value().GetHandle(), fr.fenceValue });
 				if (signalResult != rhi::Result::Ok) {
 					spdlog::warn(
