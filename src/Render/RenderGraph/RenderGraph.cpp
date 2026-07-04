@@ -7401,6 +7401,9 @@ namespace {
 				args.context.currentPassName = passName.data();
 				args.context.currentTechniquePath = techniquePath;
 				(void)rhi::debug::SetInstrumentationContext(commandList, args.context.currentPassName, args.context.currentTechniquePath);
+				if (args.context.beginGpuPassRange) {
+					args.context.beginGpuPassRange(commandList, rhiQueue, QueueKindToString(queue), args.context.currentPassName);
+				}
 				const bool hasStatistics = args.statisticsService && pr.statisticsIndex >= 0;
 				const auto cpuStart = std::chrono::steady_clock::now();
 				if (hasStatistics)
@@ -7432,6 +7435,9 @@ namespace {
 						static_cast<unsigned>(pr.statisticsIndex),
 						std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - cpuStart).count());
 				}
+				if (args.context.endGpuPassRange) {
+					args.context.endGpuPassRange(commandList, rhiQueue);
+				}
 				(void)rhi::debug::SetInstrumentationContext(commandList, nullptr, nullptr);
 				args.context.currentPassName = nullptr;
 				args.context.currentTechniquePath = nullptr;
@@ -7446,6 +7452,9 @@ namespace {
 					}
 			}
 			catch (const std::exception& ex) {
+				if (args.context.endGpuPassRange) {
+					args.context.endGpuPassRange(commandList, rhiQueue);
+				}
 				(void)rhi::debug::SetInstrumentationContext(commandList, nullptr, nullptr);
 				args.context.currentPassName = nullptr;
 				args.context.currentTechniquePath = nullptr;
@@ -7458,6 +7467,12 @@ namespace {
 				throw std::runtime_error(oss.str());
 			}
 			catch (...) {
+				if (args.context.endGpuPassRange) {
+					args.context.endGpuPassRange(commandList, rhiQueue);
+				}
+				(void)rhi::debug::SetInstrumentationContext(commandList, nullptr, nullptr);
+				args.context.currentPassName = nullptr;
+				args.context.currentTechniquePath = nullptr;
 				std::ostringstream oss;
 				oss << "RenderGraph::ExecuteQueueBatch failed while executing pass '"
 					<< passName
@@ -7626,6 +7641,9 @@ namespace {
 				args.context.currentPassName = passName.data();
 				args.context.currentTechniquePath = techniquePath;
 				(void)rhi::debug::SetInstrumentationContext(commandList, args.context.currentPassName, args.context.currentTechniquePath);
+				if (args.context.beginGpuPassRange) {
+					args.context.beginGpuPassRange(commandList, args.rhiQueue, QueueKindToString(queue), args.context.currentPassName);
+				}
 				const bool hasStatistics = args.statisticsService && pr.statisticsIndex >= 0;
 				const auto cpuStart = std::chrono::steady_clock::now();
 				if (hasStatistics)
@@ -7656,6 +7674,9 @@ namespace {
 						static_cast<unsigned>(pr.statisticsIndex),
 						std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - cpuStart).count());
 				}
+				if (args.context.endGpuPassRange) {
+					args.context.endGpuPassRange(commandList, args.rhiQueue);
+				}
 				(void)rhi::debug::SetInstrumentationContext(commandList, nullptr, nullptr);
 				args.context.currentPassName = nullptr;
 				args.context.currentTechniquePath = nullptr;
@@ -7670,6 +7691,9 @@ namespace {
 				}
 			}
 			catch (const std::exception& ex) {
+				if (args.context.endGpuPassRange) {
+					args.context.endGpuPassRange(commandList, args.rhiQueue);
+				}
 				(void)rhi::debug::SetInstrumentationContext(commandList, nullptr, nullptr);
 				args.context.currentPassName = nullptr;
 				args.context.currentTechniquePath = nullptr;
@@ -7682,6 +7706,12 @@ namespace {
 				throw std::runtime_error(oss.str());
 			}
 			catch (...) {
+				if (args.context.endGpuPassRange) {
+					args.context.endGpuPassRange(commandList, args.rhiQueue);
+				}
+				(void)rhi::debug::SetInstrumentationContext(commandList, nullptr, nullptr);
+				args.context.currentPassName = nullptr;
+				args.context.currentTechniquePath = nullptr;
 				std::ostringstream oss;
 				oss << "RenderGraph::RecordQueueBatch failed while recording pass '"
 					<< passName

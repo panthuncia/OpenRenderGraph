@@ -42,6 +42,8 @@ struct PassExecutionContext {
 	rhi::Device device;
 	rhi::CommandList commandList;
 	const rg::imm::ImmediateDispatch* immediateDispatch = nullptr;
+	std::function<void(rhi::CommandList, rhi::Queue, const char*, const char*)> beginGpuPassRange;
+	std::function<void(rhi::CommandList, rhi::Queue)> endGpuPassRange;
 	const char* currentPassName = nullptr;
 	const char* currentTechniquePath = nullptr;
 	UINT frameIndex = 0;
