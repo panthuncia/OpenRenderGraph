@@ -27,7 +27,13 @@ uint16_t ResolveTextureMipLevels(const TextureDescription& desc)
     }
 
     if (desc.generateMipMaps) {
-        return rg::util::CalculateMipLevels(desc.imageDimensions[0].width, desc.imageDimensions[0].height);
+        uint32_t width = desc.imageDimensions[0].width;
+        uint32_t height = desc.imageDimensions[0].height;
+        if (desc.padInternalResolution) {
+            width = (std::max)(1u, static_cast<uint32_t>(std::pow(2, std::ceil(std::log2(width)))));
+            height = (std::max)(1u, static_cast<uint32_t>(std::pow(2, std::ceil(std::log2(height)))));
+        }
+        return rg::util::CalculateMipLevels(width, height);
     }
 
     return 1;
@@ -161,7 +167,7 @@ void PixelBuffer::Materialize(const MaterializeOptions* options) {
 
     auto newDesc = m_desc;
     if (m_desc.padInternalResolution) {
-        for (auto& dim : m_desc.imageDimensions) {
+        for (auto& dim : newDesc.imageDimensions) {
             dim.width = (std::max)(1u, static_cast<unsigned int>(std::pow(2, std::ceil(std::log2(dim.width)))));
             dim.height = (std::max)(1u, static_cast<unsigned int>(std::pow(2, std::ceil(std::log2(dim.height)))));
         }

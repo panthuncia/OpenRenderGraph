@@ -12,6 +12,7 @@
 #include "Resources/GPUBacking/GpuBufferBacking.h"
 
 class GloballyIndexedResource;
+class Resource;
 
 class DescriptorHeapManager {
 public:
@@ -40,6 +41,7 @@ public:
 		const ViewRequirements& req);
 
 	void RetireDescriptorSlots(std::vector<std::pair<std::shared_ptr<DescriptorHeap>, UINT>> slots);
+	void RetireResource(std::shared_ptr<Resource> resource);
 	void RetireBufferBacking(std::unique_ptr<GpuBufferBacking> backing);
 	struct QueueFenceSnapshotPoint {
 		rhi::Timeline timeline;
@@ -78,6 +80,7 @@ private:
 	struct DeferredRelease {
 		std::vector<std::pair<std::shared_ptr<DescriptorHeap>, UINT>> descriptorSlots;
 		std::vector<std::unique_ptr<GpuBufferBacking>> bufferBackings;
+		std::vector<std::shared_ptr<Resource>> resources;
 		std::vector<QueueFenceSnapshotPoint> requiredFences;
 	};
 	std::vector<DeferredRelease> m_deferredReleases;

@@ -172,7 +172,14 @@ void GpuTextureBacking::initialize(const TextureDescription& desc,
 	allocationBundle
 		.Set<MemoryStatisticsComponents::MemSizeBytes>({ allocInfo.sizeInBytes })
 		.Set<MemoryStatisticsComponents::ResourceType>({ rhi::ResourceType::Texture2D })
-		.Set<MemoryStatisticsComponents::ResourceID>({ owningResourceID });
+		.Set<MemoryStatisticsComponents::ResourceID>({ owningResourceID })
+		.Set<MemoryStatisticsComponents::TextureShape>({
+			desc.imageDimensions[0].width,
+			desc.imageDimensions[0].height,
+			ResolveTextureMipLevels(desc),
+			desc.isCubemap ? 6u * desc.arraySize : (desc.isArray ? desc.arraySize : 1u),
+			desc.format,
+			placement != nullptr });
 	if (desc.aliasingPoolID.has_value()) {
 		allocationBundle.Set<MemoryStatisticsComponents::AliasingPool>({ desc.aliasingPoolID });
 	}

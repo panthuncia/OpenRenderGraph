@@ -41,6 +41,7 @@ struct TrackedEntityToken {
         std::function<TrackedEntityToken(flecs::entity existing)> createEntity;
         std::function<bool()> isRuntimeAlive;
         std::function<bool()> isMainThread;
+        std::function<void(flecs::entity_t, EntityComponentBundle)> enqueueAttachBundle;
         std::function<void(flecs::world&, flecs::entity_t)> destroyEntity;
     };
 
@@ -113,10 +114,10 @@ struct TrackedEntityToken {
                     return;
                 }
 
-                if (deferredState->world && deferredState->id && s_hooks.isMainThread && s_hooks.isMainThread()) {
+                if (deferredState->world && deferredState->id) {
                     resolvedWorld = deferredState->world;
                     resolvedId = deferredState->id;
-                    applyImmediately = true;
+                    applyImmediately = s_hooks.isMainThread && s_hooks.isMainThread();
                 }
                 else {
                     deferredState->pendingOps.insert(
@@ -129,6 +130,9 @@ struct TrackedEntityToken {
             if (applyImmediately) {
                 auto e = flecs::entity{ *resolvedWorld, resolvedId };
                 bundle.ApplyTo(e);
+            }
+            else if (resolvedWorld && resolvedId && s_hooks.enqueueAttachBundle) {
+                s_hooks.enqueueAttachBundle(resolvedId, bundle);
             }
             return;
         }
@@ -163,26 +167,35 @@ struct TrackedEntityToken {
     }
 
     bool Resolve(flecs::world& resolvedWorld, flecs::entity_t resolvedId, std::vector<std::function<void(flecs::entity)>>& outPendingOps, bool& outDestroyRequested) const noexcept {
-        if (!deferredState) {
+        return ResolveDeferredState(deferredState, resolvedWorld, resolvedId, outPendingOps, outDestroyRequested);
+    }
+
+    static bool ResolveDeferredState(
+        const std::shared_ptr<DeferredState>& state,
+        flecs::world& resolvedWorld,
+        flecs::entity_t resolvedId,
+        std::vector<std::function<void(flecs::entity)>>& outPendingOps,
+        bool& outDestroyRequested) noexcept {
+        if (!state) {
             outPendingOps.clear();
             outDestroyRequested = false;
             return false;
         }
 
-        std::scoped_lock lock(deferredState->mutex);
-        outPendingOps = std::move(deferredState->pendingOps);
-        deferredState->pendingOps.clear();
-        outDestroyRequested = deferredState->destroyRequested;
-        if (deferredState->destroyed || deferredState->destroyRequested) {
-            deferredState->world = nullptr;
-            deferredState->id = 0;
-            deferredState->destroyed = true;
+        std::scoped_lock lock(state->mutex);
+        outPendingOps = std::move(state->pendingOps);
+        state->pendingOps.clear();
+        outDestroyRequested = state->destroyRequested;
+        if (state->destroyed || state->destroyRequested) {
+            state->world = nullptr;
+            state->id = 0;
+            state->destroyed = true;
             outPendingOps.clear();
             return false;
         }
 
-        deferredState->world = &resolvedWorld;
-        deferredState->id = resolvedId;
+        state->world = &resolvedWorld;
+        state->id = resolvedId;
         return true;
     }
 
@@ -207,15 +220,19 @@ struct TrackedEntityToken {
     }
 
     void MarkDestroyed() const noexcept {
-        if (!deferredState) {
+        MarkDeferredStateDestroyed(deferredState);
+    }
+
+    static void MarkDeferredStateDestroyed(const std::shared_ptr<DeferredState>& state) noexcept {
+        if (!state) {
             return;
         }
 
-        std::scoped_lock lock(deferredState->mutex);
-        deferredState->world = nullptr;
-        deferredState->id = 0;
-        deferredState->destroyed = true;
-        deferredState->pendingOps.clear();
+        std::scoped_lock lock(state->mutex);
+        state->world = nullptr;
+        state->id = 0;
+        state->destroyed = true;
+        state->pendingOps.clear();
     }
 
     void Reset() noexcept {

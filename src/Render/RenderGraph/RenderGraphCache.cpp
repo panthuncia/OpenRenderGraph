@@ -6570,6 +6570,110 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		traceCompileStep("BuildDependencyGraph");
 		ZoneScopedN("RenderGraph::CompileFrame::BuildDependencyGraph");
 		if (!BuildDependencyGraph(nodes, explicitEdges)) {
+			auto passNameForNode = [&](size_t nodeIndex) -> std::string_view {
+				if (nodeIndex >= nodes.size()) {
+					return "<invalid-node>";
+				}
+				const size_t passIndex = nodes[nodeIndex].passIndex;
+				if (passIndex >= m_framePasses.size()) {
+					return "<invalid-pass>";
+				}
+				const auto& name = m_framePasses[passIndex].name;
+				return name.empty() ? "<unnamed-pass>" : std::string_view(name);
+			};
+
+			std::vector<uint8_t> color(nodes.size(), 0u);
+			std::vector<size_t> stack;
+			std::vector<size_t> cycle;
+			auto dfs = [&](auto&& self, size_t nodeIndex) -> bool {
+				color[nodeIndex] = 1u;
+				stack.push_back(nodeIndex);
+				for (size_t succ : nodes[nodeIndex].out) {
+					if (succ >= nodes.size()) {
+						continue;
+					}
+					if (color[succ] == 0u) {
+						if (self(self, succ)) {
+							return true;
+						}
+						continue;
+					}
+					if (color[succ] == 1u) {
+						auto it = std::find(stack.begin(), stack.end(), succ);
+						if (it != stack.end()) {
+							cycle.assign(it, stack.end());
+							cycle.push_back(succ);
+							return true;
+						}
+					}
+				}
+				stack.pop_back();
+				color[nodeIndex] = 2u;
+				return false;
+			};
+
+			for (size_t nodeIndex = 0; nodeIndex < nodes.size() && cycle.empty(); ++nodeIndex) {
+				if (color[nodeIndex] == 0u && dfs(dfs, nodeIndex)) {
+					break;
+				}
+			}
+
+			if (!cycle.empty()) {
+				std::ostringstream oss;
+				for (size_t i = 0; i < cycle.size(); ++i) {
+					if (i != 0u) {
+						oss << " -> ";
+					}
+					oss << "[" << cycle[i] << ":" << passNameForNode(cycle[i]) << "]";
+				}
+				spdlog::error("Render graph dependency cycle path: {}", oss.str());
+
+				for (size_t nodeIndex : cycle) {
+					if (nodeIndex >= nodes.size()) {
+						continue;
+					}
+					std::ostringstream pred;
+					for (size_t i = 0; i < nodes[nodeIndex].in.size(); ++i) {
+						if (i != 0u) {
+							pred << ", ";
+						}
+						pred << nodes[nodeIndex].in[i] << ":" << passNameForNode(nodes[nodeIndex].in[i]);
+					}
+					std::ostringstream succ;
+					for (size_t i = 0; i < nodes[nodeIndex].out.size(); ++i) {
+						if (i != 0u) {
+							succ << ", ";
+						}
+						succ << nodes[nodeIndex].out[i] << ":" << passNameForNode(nodes[nodeIndex].out[i]);
+					}
+					spdlog::error(
+						"Render graph cycle node {} pass='{}' passIndex={} originalOrder={} indegree={} queueSlot={} preferredQueue={} preds=[{}] succs=[{}]",
+						nodeIndex,
+						passNameForNode(nodeIndex),
+						nodes[nodeIndex].passIndex,
+						nodes[nodeIndex].originalOrder,
+						nodes[nodeIndex].indegree,
+						nodes[nodeIndex].queueSlot,
+						static_cast<uint32_t>(nodes[nodeIndex].preferredQueueKind),
+						pred.str(),
+						succ.str());
+				}
+			}
+			else {
+				spdlog::error("Render graph dependency cycle reconstruction failed; dumping nodes with nonzero indegree.");
+				for (size_t nodeIndex = 0; nodeIndex < nodes.size(); ++nodeIndex) {
+					if (nodes[nodeIndex].indegree == 0u) {
+						continue;
+					}
+					spdlog::error(
+						"Render graph blocked node {} pass='{}' passIndex={} originalOrder={} indegree={}",
+						nodeIndex,
+						passNameForNode(nodeIndex),
+						nodes[nodeIndex].passIndex,
+						nodes[nodeIndex].originalOrder,
+						nodes[nodeIndex].indegree);
+				}
+			}
 			// Cycle detected
 			spdlog::error("Render graph contains a dependency cycle! Render graph compilation failed.");
 			throw std::runtime_error("Render graph contains a dependency cycle");

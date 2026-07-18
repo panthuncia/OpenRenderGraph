@@ -1,6 +1,7 @@
 #include "Managers/UploadInstance.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <sstream>
 
@@ -16,6 +17,24 @@
 namespace {
 	size_t AlignUpSizeT(const size_t v, const size_t a) noexcept {
 		return (v + (a - 1)) & ~(a - 1);
+	}
+
+	bool UploadTelemetryLoggingEnabled() {
+		static const bool enabled = [] {
+			for (const char* name : {
+				"SARP_UPLOAD_TELEMETRY_LOG",
+				"SARP_TEXTURE_STREAMING_TRANSITION_LOG" }) {
+				char* value = nullptr;
+				size_t valueLength = 0;
+				const bool isSet =
+					_dupenv_s(&value, &valueLength, name) == 0 &&
+					value != nullptr && value[0] != '\0' && value[0] != '0';
+				std::free(value);
+				if (isSet) return true;
+			}
+			return false;
+		}();
+		return enabled;
 	}
 }
 
@@ -259,6 +278,7 @@ bool UploadInstance::TryCoalesceAppend(ResourceUpdate& last, const ResourceUpdat
 	if (last.uploadBufferOffset + last.size != next.uploadBufferOffset) return false;
 
 	last.size += next.size;
+	last.lastSequence = next.lastSequence;
 #if BUILD_TYPE == BUILD_TYPE_DEBUG
 	last.file = next.file;
 	last.line = next.line;
@@ -396,12 +416,17 @@ void UploadInstance::UploadData(const void* data, size_t size, UploadTarget targ
 	UnmapUpload(uploadBuffer);
 
 	std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
+	update.firstSequence = ++m_lastUploadSequence;
+	update.lastSequence = update.firstSequence;
 	for (int i = static_cast<int>(m_resourceUpdates.size()) - 1; i >= 0; --i) {
 		auto& last = m_resourceUpdates[static_cast<size_t>(i)];
 		if (!last.active) {
 			continue;
 		}
-		if (TryCoalesceAppend(last, update)) {
+		// A captured batch boundary is immutable: extending a sealed update
+		// would move its earlier bytes past the cutoff without moving the fence
+		// that was assigned to them.
+		if (last.lastSequence > m_lastSealedUploadSequence && TryCoalesceAppend(last, update)) {
 			MarkPendingWorkChangedLocked();
 			return;
 		}
@@ -481,27 +506,117 @@ void UploadInstance::UploadTextureSubresources(
 		update.line = line;
 #endif
 		CaptureTargetTelemetryLocked(update.texture, update.targetGlobalResourceId, update.targetDebugName);
+		update.sequence = ++m_lastUploadSequence;
 		m_textureUpdates.push_back(std::move(update));
 	}
 	MarkPendingWorkChangedLocked();
 }
 
 void UploadInstance::ProcessUploads(uint8_t frameIndex, rg::imm::ImmediateCommandList& commandList) {
-	(void)frameIndex;
+	ProcessUploadsThrough(frameIndex, commandList, UINT64_MAX);
+}
 
+void UploadInstance::ProcessUploadsThrough(
+	uint8_t frameIndex,
+	rg::imm::ImmediateCommandList& commandList,
+	uint64_t sequenceInclusive) {
 	std::vector<ResourceUpdate> resourceUpdates;
 	std::vector<TextureUpdate> textureUpdates;
 	UploadResolveContext ctx;
 	{
 		std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
 		PruneInvalidRegistryHandleUpdatesLocked("upload-pass-execute");
-		resourceUpdates.swap(m_resourceUpdates);
-		textureUpdates.swap(m_textureUpdates);
+		resourceUpdates.reserve(m_resourceUpdates.size());
+		textureUpdates.reserve(m_textureUpdates.size());
+		std::vector<ResourceUpdate> remainingResourceUpdates;
+		std::vector<TextureUpdate> remainingTextureUpdates;
+		remainingResourceUpdates.reserve(m_resourceUpdates.size());
+		remainingTextureUpdates.reserve(m_textureUpdates.size());
+
+		for (auto& update : m_resourceUpdates) {
+			if (update.lastSequence <= sequenceInclusive) {
+				resourceUpdates.push_back(std::move(update));
+			} else {
+				remainingResourceUpdates.push_back(std::move(update));
+			}
+		}
+		m_resourceUpdates = std::move(remainingResourceUpdates);
+
+		for (auto& update : m_textureUpdates) {
+			if (update.sequence <= sequenceInclusive) {
+				textureUpdates.push_back(std::move(update));
+			} else {
+				remainingTextureUpdates.push_back(std::move(update));
+			}
+		}
+		m_textureUpdates = std::move(remainingTextureUpdates);
+
+		// Upload pages must retire relative to the frame that records their last
+		// copy, not the frame in which CPU staging happened. A bounded batch can
+		// remain queued for several frames while declarations are refreshed; the
+		// old allocation-time retirement would recycle and overwrite its staging
+		// memory before CopyBufferRegion was recorded.
+		std::unordered_set<Resource*> remainingUploadBuffers;
+		remainingUploadBuffers.reserve(m_resourceUpdates.size() + m_textureUpdates.size());
+		for (const auto& update : m_resourceUpdates) {
+			if (update.uploadBuffer) remainingUploadBuffers.insert(update.uploadBuffer.get());
+		}
+		for (const auto& update : m_textureUpdates) {
+			if (update.uploadBuffer) remainingUploadBuffers.insert(update.uploadBuffer.get());
+		}
+
+		std::unordered_set<Resource*> completedUploadBuffers;
+		completedUploadBuffers.reserve(resourceUpdates.size() + textureUpdates.size());
+		for (const auto& update : resourceUpdates) {
+			if (update.uploadBuffer && !remainingUploadBuffers.contains(update.uploadBuffer.get())) {
+				completedUploadBuffers.insert(update.uploadBuffer.get());
+			}
+		}
+		for (const auto& update : textureUpdates) {
+			if (update.uploadBuffer && !remainingUploadBuffers.contains(update.uploadBuffer.get())) {
+				completedUploadBuffers.insert(update.uploadBuffer.get());
+			}
+		}
+
+		if (!completedUploadBuffers.empty() && m_numFramesInFlight != 0) {
+			std::vector<UploadPagePtr> completedPages;
+			auto extractCompletedPages = [&](std::vector<UploadPagePtr>& pages) {
+				for (size_t i = 0; i < pages.size();) {
+					auto& page = pages[i];
+					if (page && page->buffer && completedUploadBuffers.contains(page->buffer.get())) {
+						completedPages.push_back(std::move(page));
+						pages[i] = std::move(pages.back());
+						pages.pop_back();
+						continue;
+					}
+					++i;
+				}
+			};
+			extractCompletedPages(m_openPages);
+			for (auto& pages : m_framePages) extractCompletedPages(pages);
+			for (const auto& page : completedPages) {
+				if (page) m_openPageSet.erase(page.get());
+			}
+
+			auto& submissionPages = m_framePages[frameIndex % m_numFramesInFlight];
+			std::unordered_set<UploadPage*> alreadyScheduled;
+			alreadyScheduled.reserve(submissionPages.size() + completedPages.size());
+			for (const auto& page : submissionPages) {
+				if (page) alreadyScheduled.insert(page.get());
+			}
+			for (auto& page : completedPages) {
+				if (page && alreadyScheduled.insert(page.get()).second) {
+					submissionPages.push_back(std::move(page));
+				}
+			}
+		}
 		ctx = m_ctx;
 		if (!resourceUpdates.empty() || !textureUpdates.empty()) {
 			MarkPendingWorkChangedLocked();
 		}
 	}
+
+	RecordProcessedUploadTelemetry(resourceUpdates, textureUpdates);
 
 	for (auto& update : resourceUpdates) {
 		if (!update.active || !update.uploadBuffer || update.size == 0) continue;
@@ -550,6 +665,113 @@ void UploadInstance::ProcessUploads(uint8_t frameIndex, rg::imm::ImmediateComman
 	}
 }
 
+void UploadInstance::RecordProcessedUploadTelemetry(
+	const std::vector<ResourceUpdate>& resourceUpdates,
+	const std::vector<TextureUpdate>& textureUpdates)
+{
+	if (!UploadTelemetryLoggingEnabled()) return;
+
+	auto targetKey = [](uint64_t resourceID, const std::string& name) {
+		return !name.empty()
+			? name
+			: std::string("resource:") + std::to_string(resourceID);
+	};
+
+	for (const auto& update : resourceUpdates) {
+		if (!update.active || update.size == 0u) continue;
+		auto& target = m_uploadTelemetryTargets[targetKey(update.targetGlobalResourceId, update.targetDebugName)];
+		++target.bufferWrites;
+		target.bytes += update.size;
+		++m_uploadTelemetryBufferWrites;
+		m_uploadTelemetryBytes += update.size;
+	}
+
+	struct TextureSubresourceKey {
+		uint64_t resourceID = 0;
+		uint32_t mip = 0;
+		uint32_t slice = 0;
+		uint32_t z = 0;
+		bool operator==(const TextureSubresourceKey&) const = default;
+	};
+	struct TextureSubresourceHash {
+		size_t operator()(const TextureSubresourceKey& key) const noexcept {
+			size_t h = std::hash<uint64_t>{}(key.resourceID);
+			h ^= static_cast<size_t>(key.mip) * 0x9e3779b1u;
+			h ^= static_cast<size_t>(key.slice) * 0x85ebca6bu;
+			h ^= static_cast<size_t>(key.z) * 0xc2b2ae35u;
+			return h;
+		}
+	};
+	std::unordered_set<TextureSubresourceKey, TextureSubresourceHash> textureSubresources;
+	textureSubresources.reserve(textureUpdates.size());
+	for (const auto& update : textureUpdates) {
+		const uint64_t bytes =
+			static_cast<uint64_t>(update.footprint.rowPitch) *
+			static_cast<uint64_t>(update.footprint.height) *
+			static_cast<uint64_t>((std::max)(update.footprint.depth, 1u));
+		auto& target = m_uploadTelemetryTargets[targetKey(update.targetGlobalResourceId, update.targetDebugName)];
+		++target.textureWrites;
+		target.bytes += bytes;
+		++m_uploadTelemetryTextureWrites;
+		m_uploadTelemetryBytes += bytes;
+		if (!textureSubresources.insert({update.targetGlobalResourceId, update.mip, update.slice, update.z}).second) {
+			++m_uploadTelemetryDuplicateTextureSubresources;
+		}
+	}
+
+	const auto now = std::chrono::steady_clock::now();
+	if (m_uploadTelemetryLastLog.time_since_epoch().count() == 0) {
+		m_uploadTelemetryLastLog = now;
+		return;
+	}
+	if (now - m_uploadTelemetryLastLog < std::chrono::seconds(1)) return;
+
+	std::vector<std::pair<std::string, UploadTelemetryTarget>> targets(
+		m_uploadTelemetryTargets.begin(), m_uploadTelemetryTargets.end());
+	std::sort(targets.begin(), targets.end(), [](const auto& lhs, const auto& rhs) {
+		return lhs.second.bytes > rhs.second.bytes;
+	});
+	spdlog::info(
+		"UploadTelemetry summary: instance='{}' bufferWrites={} textureWrites={} bytes={} duplicateTextureSubresources={} targets={}",
+		m_debugName,
+		m_uploadTelemetryBufferWrites,
+		m_uploadTelemetryTextureWrites,
+		m_uploadTelemetryBytes,
+		m_uploadTelemetryDuplicateTextureSubresources,
+		targets.size());
+	const size_t topCount = (std::min)(targets.size(), size_t{12});
+	for (size_t i = 0; i < topCount; ++i) {
+		spdlog::info(
+			"UploadTelemetry target: rank={} name='{}' bytes={} bufferWrites={} textureWrites={}",
+			i + 1u,
+			targets[i].first,
+			targets[i].second.bytes,
+			targets[i].second.bufferWrites,
+			targets[i].second.textureWrites);
+	}
+	std::sort(targets.begin(), targets.end(), [](const auto& lhs, const auto& rhs) {
+		const uint64_t lhsWrites = lhs.second.bufferWrites + lhs.second.textureWrites;
+		const uint64_t rhsWrites = rhs.second.bufferWrites + rhs.second.textureWrites;
+		return lhsWrites != rhsWrites ? lhsWrites > rhsWrites : lhs.second.bytes > rhs.second.bytes;
+	});
+	for (size_t i = 0; i < topCount; ++i) {
+		spdlog::info(
+			"UploadTelemetry commands: rank={} name='{}' writes={} bytes={} bufferWrites={} textureWrites={}",
+			i + 1u,
+			targets[i].first,
+			targets[i].second.bufferWrites + targets[i].second.textureWrites,
+			targets[i].second.bytes,
+			targets[i].second.bufferWrites,
+			targets[i].second.textureWrites);
+	}
+	m_uploadTelemetryTargets.clear();
+	m_uploadTelemetryBufferWrites = 0;
+	m_uploadTelemetryTextureWrites = 0;
+	m_uploadTelemetryBytes = 0;
+	m_uploadTelemetryDuplicateTextureSubresources = 0;
+	m_uploadTelemetryLastLog = now;
+}
+
 void UploadInstance::ProcessDeferredReleases(uint8_t frameIndex) {
 	ZoneScopedN("UploadInstance::ProcessDeferredReleases");
 	std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
@@ -559,8 +781,21 @@ void UploadInstance::ProcessDeferredReleases(uint8_t frameIndex) {
 	frameIndex %= m_numFramesInFlight;
 
 	auto& retiringPages = m_framePages[frameIndex];
+	std::unordered_set<Resource*> pendingUploadBuffers;
+	pendingUploadBuffers.reserve(m_resourceUpdates.size() + m_textureUpdates.size());
+	for (const auto& update : m_resourceUpdates) {
+		if (update.uploadBuffer) pendingUploadBuffers.insert(update.uploadBuffer.get());
+	}
+	for (const auto& update : m_textureUpdates) {
+		if (update.uploadBuffer) pendingUploadBuffers.insert(update.uploadBuffer.get());
+	}
 	for (auto& page : retiringPages) {
 		if (!page) {
+			continue;
+		}
+		if (page->buffer && pendingUploadBuffers.contains(page->buffer.get())) {
+			// Keep staging memory alive while any bounded batch still references it.
+			TrackPageForCurrentFrameLocked(page);
 			continue;
 		}
 		page->tailOffset = 0;
@@ -593,18 +828,31 @@ bool UploadInstance::HasPendingWork() const {
 	return !m_resourceUpdates.empty() || !m_textureUpdates.empty();
 }
 
+uint64_t UploadInstance::CapturePendingUploadSequence() {
+	std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
+	m_lastSealedUploadSequence = m_lastUploadSequence;
+	return m_lastSealedUploadSequence;
+}
+
 void UploadInstance::CollectPendingDestinations(std::vector<std::shared_ptr<Resource>>& out) const {
+	CollectPendingDestinationsThrough(UINT64_MAX, out);
+}
+
+void UploadInstance::CollectPendingDestinationsThrough(
+	uint64_t sequenceInclusive,
+	std::vector<std::shared_ptr<Resource>>& out) const {
 	std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
 	std::unordered_set<Resource*> seen;
-	for (auto& u : m_resourceUpdates) {
-		if (!u.active) continue;
+	for (const auto& u : m_resourceUpdates) {
+		if (!u.active || u.lastSequence > sequenceInclusive) continue;
 		if (u.resourceToUpdate.kind == UploadTarget::Kind::PinnedShared) {
 			if (u.resourceToUpdate.pinned && seen.insert(u.resourceToUpdate.pinned.get()).second) {
 				out.push_back(u.resourceToUpdate.pinned);
 			}
 		}
 	}
-	for (auto& t : m_textureUpdates) {
+	for (const auto& t : m_textureUpdates) {
+		if (t.sequence > sequenceInclusive) continue;
 		if (t.texture.kind == UploadTarget::Kind::PinnedShared) {
 			if (t.texture.pinned && seen.insert(t.texture.pinned.get()).second) {
 				out.push_back(t.texture.pinned);

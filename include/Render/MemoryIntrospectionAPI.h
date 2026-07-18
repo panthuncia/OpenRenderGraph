@@ -17,6 +17,12 @@ struct ResourceMemoryRecord {
     std::string resourceName;
     std::string usage;
     std::string identifier;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t mipLevels = 0;
+    uint32_t arraySize = 0;
+    rhi::Format format = rhi::Format::Unknown;
+    bool aliased = false;
 };
 
 class IMemorySnapshotProvider {
@@ -38,6 +44,10 @@ private:
 
 inline void SetResourceUsageHint(IHasMemoryMetadata& resource, std::string usage) {
     resource.SetMemoryUsageHint(std::move(usage));
+}
+
+inline void SetResourceMemoryIdentifier(IHasMemoryMetadata& resource, std::string identifier) {
+    resource.SetMemoryIdentifier(std::move(identifier));
 }
 
 }

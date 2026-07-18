@@ -6,12 +6,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <condition_variable>
+#include <chrono>
 #include <deque>
 #include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_set>
+#include <unordered_map>
 
 #include <rhi.h>
 #include <rhi_helpers.h>
@@ -57,6 +59,8 @@ public:
 		size_t uploadBufferOffset{};
 		size_t dataBufferOffset{};
 		bool active = true;
+		uint64_t firstSequence = 0;
+		uint64_t lastSequence = 0;
 #if BUILD_TYPE == BUILD_TYPE_DEBUG
 		const char* file{};
 		int line{};
@@ -77,6 +81,7 @@ public:
 		uint32_t y{};
 		uint32_t z{};
 		std::shared_ptr<Resource> uploadBuffer;
+		uint64_t sequence = 0;
 #if BUILD_TYPE == BUILD_TYPE_DEBUG
 		const char* file{};
 		int line{};
@@ -141,6 +146,7 @@ public:
 	// Emit GPU copy commands for all queued buffer and texture uploads.
 	// Call from a pass's RecordImmediateCommands().
 	void ProcessUploads(uint8_t frameIndex, rg::imm::ImmediateCommandList& commandList);
+	void ProcessUploadsThrough(uint8_t frameIndex, rg::imm::ImmediateCommandList& commandList, uint64_t sequenceInclusive);
 
 	// Retire upload-heap pages that are no longer referenced by any in-flight frame.
 	// Call once per frame after the GPU has finished with the retiring frame.
@@ -155,10 +161,12 @@ public:
 
 	// Returns true if there are any pending buffer or texture uploads.
 	bool HasPendingWork() const;
+	uint64_t CapturePendingUploadSequence();
 
 	// Collect the destination resources that pending uploads will write to.
 	// Call during DeclareResourceUsages to declare copy targets.
 	void CollectPendingDestinations(std::vector<std::shared_ptr<Resource>>& out) const;
+	void CollectPendingDestinationsThrough(uint64_t sequenceInclusive, std::vector<std::shared_ptr<Resource>>& out) const;
 	void DeclarePendingUploadResourceUsages(
 		const std::function<void(const std::shared_ptr<Resource>&)>& copySource,
 		const std::function<void(const UploadTarget&, uint32_t mip, uint32_t slice)>& copyDest);
@@ -202,6 +210,9 @@ private:
 	void StopWorker();
 	void WorkerMain();
 	void RequestWorkerPagesLocked();
+	void RecordProcessedUploadTelemetry(
+		const std::vector<ResourceUpdate>& resourceUpdates,
+		const std::vector<TextureUpdate>& textureUpdates);
 	size_t NormalPageCountForBytes(size_t bytes) const noexcept;
 	size_t WarmTargetPageCountLocked() const noexcept;
 	size_t AvailableReusableNormalPagesLocked() const noexcept;
@@ -228,10 +239,23 @@ private:
 
 	std::vector<ResourceUpdate>  m_resourceUpdates;
 	std::vector<TextureUpdate>   m_textureUpdates;
+	uint64_t                     m_lastUploadSequence = 0;
+	uint64_t                     m_lastSealedUploadSequence = 0;
 	std::vector<uint64_t>        m_declarePendingUploadSourceBits;
 	std::vector<size_t>          m_declarePendingUploadSourceMarkedWords;
 	std::vector<uint64_t>        m_declarePendingUploadBufferDestBits;
 	std::vector<size_t>          m_declarePendingUploadBufferDestMarkedWords;
+	struct UploadTelemetryTarget {
+		uint64_t bufferWrites = 0;
+		uint64_t textureWrites = 0;
+		uint64_t bytes = 0;
+	};
+	std::unordered_map<std::string, UploadTelemetryTarget> m_uploadTelemetryTargets;
+	std::chrono::steady_clock::time_point m_uploadTelemetryLastLog{};
+	uint64_t m_uploadTelemetryBufferWrites = 0;
+	uint64_t m_uploadTelemetryTextureWrites = 0;
+	uint64_t m_uploadTelemetryBytes = 0;
+	uint64_t m_uploadTelemetryDuplicateTextureSubresources = 0;
 
 	UploadResolveContext m_ctx{};
 	PendingWorkChangedCallback m_pendingWorkChanged;

@@ -4051,8 +4051,15 @@ void RenderGraph::PublishCompiledTrackerStates() {
 			continue;
 		}
 
-		Resource* resource = compileResourceState.resource;
-		if (!resource || !HasLiveCompileResourceBacking(resource)) {
+		// Compilation stores a non-owning pointer for hot-path access, but scene
+		// publication may replace the registered resource before execution ends.
+		// Reacquire ownership before dereferencing it and do not publish a state
+		// compiled for a different resource object that reused the same ID.
+		auto liveResource = GetResourceByID(resourceID);
+		Resource* resource = liveResource.get();
+		if (!resource
+			|| resource != compileResourceState.resource
+			|| !HasLiveCompileResourceBacking(resource)) {
 			continue;
 		}
 

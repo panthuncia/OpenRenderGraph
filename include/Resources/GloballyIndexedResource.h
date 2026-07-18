@@ -5,6 +5,11 @@
 #include "spdlog/spdlog.h"
 #include "Resources/HeapIndexInfo.h"
 
+// Implemented by DescriptorHeapManager.cpp. Keeping this small bridge here
+// avoids coupling every globally indexed resource to the singleton header.
+void RetireDescriptorSlotsForDeferredRelease(
+	std::vector<std::pair<std::shared_ptr<DescriptorHeap>, UINT>> slots);
+
 class GloballyIndexedResourceBase : public Resource {
 public:
 	GloballyIndexedResourceBase() : Resource() {};
@@ -174,7 +179,7 @@ public:
 	}
 
 	virtual ~GloballyIndexedResource() {
-		ReleaseDescriptorSlots();
+		RetireDescriptorSlotsForDeferredRelease(DetachDescriptorSlotsForDeferredRelease());
 	};
 protected:
 	virtual void OnSetName() override {}

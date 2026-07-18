@@ -1,6 +1,7 @@
 #include "Managers/Singletons/StatisticsManager.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <rhi_helpers.h>
 #include <spdlog/spdlog.h>
@@ -17,6 +18,43 @@ StatisticsManager& StatisticsManager::GetInstance() {
 namespace {
 void UpdateEma(double& value, double sample) {
     value = value * (1.0 - PassStats::alpha) + sample * PassStats::alpha;
+}
+
+bool MemoryIntrospectionLoggingEnabled() {
+    static const bool enabled = [] {
+        char* value = nullptr;
+        size_t valueLength = 0;
+        const bool result = _dupenv_s(&value, &valueLength, "SARP_MEMORY_INTROSPECTION_LOG") == 0 &&
+            value != nullptr && valueLength > 1 && value[0] != '0';
+        std::free(value);
+        return result;
+    }();
+    return enabled;
+}
+
+void LogMemoryIntrospectionAccounting(
+    uint64_t frameSerial,
+    const rhi::ma::Budget& localBudget)
+{
+    // Keep the benchmark log readable while still sampling growth during loading.
+    if (!MemoryIntrospectionLoggingEnabled() || (frameSerial != 1 && frameSerial % 120 != 0)) {
+        return;
+    }
+
+    spdlog::info(
+        "Memory diagnostics allocator: frame={} dxgi_usage={} dxgi_budget={} "
+        "allocator_blocks={} allocator_allocations={} dxgi_minus_allocator_blocks={} "
+        "allocator_block_count={} allocator_allocation_count={}",
+        frameSerial,
+        localBudget.usageBytes,
+        localBudget.budgetBytes,
+        localBudget.stats.blockBytes,
+        localBudget.stats.allocationBytes,
+        localBudget.usageBytes > localBudget.stats.blockBytes
+            ? localBudget.usageBytes - localBudget.stats.blockBytes
+            : 0,
+        localBudget.stats.blockCount,
+        localBudget.stats.allocationCount);
 }
 }
 
@@ -107,6 +145,7 @@ void StatisticsManager::BeginFrame() {
         memoryBudgetStats.usageBytes = localBudget.usageBytes;
         memoryBudgetStats.budgetBytes = localBudget.budgetBytes;
         memoryBudgetStats.valid = true;
+        LogMemoryIntrospectionAccounting(m_frameSerial, localBudget);
     }
     m_memoryBudgetStats = memoryBudgetStats;
 }

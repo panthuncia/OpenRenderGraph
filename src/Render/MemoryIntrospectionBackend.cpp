@@ -37,6 +37,14 @@ public:
             if (auto ident = e.try_get<ResourceIdentifier>()) {
                 row.identifier = ident->name;
             }
+            if (auto shape = e.try_get<MemoryStatisticsComponents::TextureShape>()) {
+                row.width = shape->width;
+                row.height = shape->height;
+                row.mipLevels = shape->mipLevels;
+                row.arraySize = shape->arraySize;
+                row.format = shape->format;
+                row.aliased = shape->aliased;
+            }
 
             out.push_back(std::move(row));
             });

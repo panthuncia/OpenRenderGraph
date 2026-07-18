@@ -31,4 +31,13 @@ namespace MemoryStatisticsComponents
 	struct ResourceUsage {
 		std::string usage;
 	};
+
+	struct TextureShape {
+		uint32_t width = 0;
+		uint32_t height = 0;
+		uint32_t mipLevels = 0;
+		uint32_t arraySize = 0;
+		rhi::Format format = rhi::Format::Unknown;
+		bool aliased = false;
+	};
 }
