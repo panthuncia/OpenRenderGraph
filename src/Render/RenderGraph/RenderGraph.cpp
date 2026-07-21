@@ -1215,6 +1215,8 @@ void RenderGraph::WriteCompiledGraphDebugDump(uint8_t frameIndex, const std::vec
 					}
 					dump << " bytes=[" << placement->startByte << ", " << placement->endByte << ")"
 						 << " size=" << (placement->endByte - placement->startByte)
+						 << " overlaps=" << (placement->overlapsByteRange ? 1 : 0)
+						 << " activationReason=" << static_cast<uint32_t>(placement->activationReasonBits)
 						 << " firstUse=" << placement->firstUse
 						 << " lastUse=" << placement->lastUse
 						 << " firstUsePass=" << placement->firstUsePassIndex
@@ -3028,7 +3030,7 @@ bool RenderGraph::TryAddTransitionFastNoOp(
 	if (requirement.resourceIndex >= m_aliasActivationPendingByResourceIndex.size()) {
 		return false;
 	}
-	if (m_aliasActivationPendingByResourceIndex[requirement.resourceIndex] != 0) {
+	if (m_aliasActivationPendingByResourceIndex[requirement.resourceIndex] != rg::alias::AliasActivationReason::None) {
 		return false;
 	}
 
@@ -3057,7 +3059,7 @@ bool RenderGraph::TryAddTransitionTrackedNoOp(
 	if (requirement.resourceIndex >= m_aliasActivationPendingByResourceIndex.size()) {
 		return false;
 	}
-	if (m_aliasActivationPendingByResourceIndex[requirement.resourceIndex] != 0) {
+	if (m_aliasActivationPendingByResourceIndex[requirement.resourceIndex] != rg::alias::AliasActivationReason::None) {
 		return false;
 	}
 
@@ -3162,39 +3164,39 @@ void RenderGraph::AddTransitionSlowPath(
 	const bool isWholeResourceRequirement = requirement.isWholeResource;
 
 	bool isAliasActivation = false;
-	if (requirement.resourceIndex < m_aliasActivationPendingByResourceIndex.size() && m_aliasActivationPendingByResourceIndex[requirement.resourceIndex] != 0) {
+	if (requirement.resourceIndex < m_aliasActivationPendingByResourceIndex.size() && m_aliasActivationPendingByResourceIndex[requirement.resourceIndex] != rg::alias::AliasActivationReason::None) {
 		isAliasActivation = true;
+		const auto activationReason = m_aliasActivationPendingByResourceIndex[requirement.resourceIndex];
 		const bool firstUseIsWrite = AccessTypeIsWriteType(requirement.state.access);
 		const bool firstUseIsCommon = requirement.state.access == rhi::ResourceAccessType::Common;
 		// Common counts as write for alias activation, as this is generally used to indicate that the resource will be
 		// transitioned internally by an external system that still uses legacy barriers. Don't abuse this.
 		if (firstUseIsWrite || firstUseIsCommon) { 
-			ResourceState activationBeforeState{
+			const bool isTexture = pRes && pRes->HasLayout();
+			const RangeSpec wholeResourceRange{};
+			const ResourceState activationBeforeState{
 				rhi::ResourceAccessType::None,
-				rhi::ResourceLayout::Undefined,
+				isTexture ? rhi::ResourceLayout::Undefined : rhi::ResourceLayout::Common,
 				rhi::ResourceSyncState::None };
-			ResourceState trackedBeforeState{};
-			if (TryGetWholeResourceTrackerState(compileTracker, trackedBeforeState)) {
-				activationBeforeState = trackedBeforeState;
-			}
-			//spdlog::info(
-			//	"RG alias activate: id={} name='{}' signature={} accessAfter={} layoutAfter={} syncAfter={} discard=1",
-			//	id,
-			//	pRes ? pRes->GetName() : std::string("<null>"),
-			//	itSig != aliasPlacementSignatureByID.end() ? itSig->second : 0ull,
-			//	static_cast<uint32_t>(r.state.access),
-			//	static_cast<uint32_t>(r.state.layout),
-			//	static_cast<uint32_t>(r.state.sync));
 			transitions.emplace_back(
 				pRes,
-				requirement.range,
+				wholeResourceRange,
 				activationBeforeState.access,
 				requiredState.access,
 				activationBeforeState.layout,
 				requiredState.layout,
 				activationBeforeState.sync,
 				requiredState.sync,
-				true);
+				isTexture);
+			if (m_getRenderGraphCompileDumpEnabled && m_getRenderGraphCompileDumpEnabled()) {
+				spdlog::debug(
+					"RG alias activation: resource='{}' reason={} wholeResource=1 discard={} beforeLayout={} afterLayout={}",
+					pRes ? pRes->GetName() : std::string("<null>"),
+					static_cast<uint32_t>(activationReason),
+					isTexture ? 1 : 0,
+					static_cast<uint32_t>(activationBeforeState.layout),
+					static_cast<uint32_t>(requiredState.layout));
+			}
 		}
 		else {
 			const auto* placement = TryGetAliasPlacementRange(requirement.resourceID);
@@ -3208,9 +3210,9 @@ void RenderGraph::AddTransitionSlowPath(
 			throw std::runtime_error("Alias activation requires first use to be a write when explicit initialization is disabled");
 		}
 		std::vector<ResourceTransition> ignored;
-		compileTracker.Apply(requirement.range, pRes, requiredState, ignored);
+		compileTracker.Apply(RangeSpec{}, pRes, requiredState, ignored);
 		aliasActivationPending.erase(requirement.resourceID);
-		m_aliasActivationPendingByResourceIndex[requirement.resourceIndex] = 0;
+		m_aliasActivationPendingByResourceIndex[requirement.resourceIndex] = rg::alias::AliasActivationReason::None;
 	}
 	else {
 		if (isWholeResourceRequirement && fastState.wholeResourceOnly) {
@@ -4245,11 +4247,11 @@ void RenderGraph::RebuildFrameSchedulingResourceIndex(std::span<const uint64_t> 
 
 	RebuildEquivalentResourceIndicesByResourceIndex();
 
-	m_aliasActivationPendingByResourceIndex.assign(m_frameSchedulingResourceCount, 0);
-	for (uint64_t resourceID : aliasActivationPending) {
+	m_aliasActivationPendingByResourceIndex.assign(m_frameSchedulingResourceCount, rg::alias::AliasActivationReason::None);
+	for (const auto& [resourceID, reason] : aliasActivationPending) {
 		auto resourceIndex = TryGetFrameSchedulingResourceIndex(resourceID);
 		if (resourceIndex.has_value()) {
-			m_aliasActivationPendingByResourceIndex[*resourceIndex] = 1;
+			m_aliasActivationPendingByResourceIndex[*resourceIndex] = reason;
 		}
 	}
 
@@ -4426,7 +4428,7 @@ void RenderGraph::RebuildFramePassSchedulingSummaries() {
 			accessSummary.hasUAV = accessSummary.hasUAV || req.isUAV;
 			accessSummary.hasAliasActivation = accessSummary.hasAliasActivation
 				|| (req.resourceIndex < m_aliasActivationPendingByResourceIndex.size()
-					&& m_aliasActivationPendingByResourceIndex[req.resourceIndex] != 0);
+					&& m_aliasActivationPendingByResourceIndex[req.resourceIndex] != rg::alias::AliasActivationReason::None);
 			accessSummary.hasNonWholeResourceRange = accessSummary.hasNonWholeResourceRange || !req.isWholeResource;
 		}
 		for (const auto& transition : passSummary.internalTransitions) {
@@ -5027,6 +5029,12 @@ void RenderGraph::ShutdownExtensions() {
 	}
 }
 
+void RenderGraph::ClearExtensions() {
+	ShutdownExtensions();
+	m_extensions.clear();
+	m_extensionRegistrationIds.clear();
+}
+
 void RenderGraph::ResetForRebuild()
 {
 	if (m_pCommandRecordingManager) {
@@ -5059,7 +5067,18 @@ void RenderGraph::ResetForRebuild()
 	m_transientFrameResourcesByName.clear();
 	resourceBackingGenerationByID.clear();
 	resourceIdleFrameCounts.clear();
+	// Alias pools are deliberately persistent allocations. A full structural
+	// rebuild invalidates placements and cached plans, but it does not make a
+	// compatible pool allocation unsafe to reuse once the caller has stalled the
+	// GPU. Keeping the allocation avoids overlapping two very large pool
+	// generations during runtime pipeline replacement.
+	auto preservedAliasPools = std::move(persistentAliasPools);
 	m_aliasingSubsystem.ResetPersistentState(*this);
+	persistentAliasPools = std::move(preservedAliasPools);
+	for (auto& [poolID, poolState] : persistentAliasPools) {
+		(void)poolID;
+		poolState.usedThisFrame = false;
+	}
 	m_lastProducerByResourceAcrossFrames.clear();
 	m_lastAliasPlacementProducersByPoolAcrossFrames.clear();
 	m_compiledLastProducerBatchByResourceByQueue.clear();
@@ -9499,7 +9518,7 @@ bool RenderGraph::IsNewBatchNeeded(
 		// Only reject same-batch merging when that activation would clobber an
 		// aliased-equivalent resource that is already live in the batch.
 		if (requirement.resourceIndex < m_aliasActivationPendingByResourceIndex.size()
-			&& m_aliasActivationPendingByResourceIndex[requirement.resourceIndex] != 0
+			&& m_aliasActivationPendingByResourceIndex[requirement.resourceIndex] != rg::alias::AliasActivationReason::None
 			&& (overlapsAliasedResourceInBatch(requirement) || overlapsAliasedTransitionInBatch(requirement))) {
 			return true;
 		}

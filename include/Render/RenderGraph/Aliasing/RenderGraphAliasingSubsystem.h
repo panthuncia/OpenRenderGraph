@@ -115,7 +115,23 @@ struct AliasPlacementRange {
 	size_t firstUsePassIndex = std::numeric_limits<size_t>::max();
 	size_t lastUsePassIndex = std::numeric_limits<size_t>::max();
 	bool dedicatedBacking = false;
+	bool overlapsByteRange = false;
+	uint8_t activationReasonBits = 0;
 };
+
+enum class AliasActivationReason : uint8_t {
+	None = 0,
+	NewPlacement = 1u << 0,
+	OverlapHandoff = 1u << 1,
+};
+
+constexpr AliasActivationReason operator|(AliasActivationReason lhs, AliasActivationReason rhs) {
+	return static_cast<AliasActivationReason>(static_cast<uint8_t>(lhs) | static_cast<uint8_t>(rhs));
+}
+
+constexpr bool HasAliasActivationReason(AliasActivationReason value, AliasActivationReason reason) {
+	return (static_cast<uint8_t>(value) & static_cast<uint8_t>(reason)) != 0;
+}
 
 struct AliasSchedulingNode {
 	size_t passIndex = 0;

@@ -189,6 +189,36 @@ void DescriptorHeapManager::ProcessDeferredReleases(uint8_t frameIndex) {
     readyReleases.clear();
 }
 
+void DescriptorHeapManager::DrainDeferredReleasesAfterDeviceIdle() {
+    // Timeline values stored by this manager are deliberately non-owning. Once
+    // the device is idle they are no longer needed for safety, and they must be
+    // discarded before a render-graph rebuild destroys the timelines owned by
+    // QueueRegistry.
+    std::vector<DeferredRelease> releases;
+    for (;;) {
+        {
+            std::scoped_lock lock(m_descriptorMutationMutex);
+            m_latestQueueFenceSnapshot.clear();
+            if (m_deferredReleases.empty()) {
+                break;
+            }
+            releases.swap(m_deferredReleases);
+        }
+
+        for (auto& release : releases) {
+            for (auto& [heap, index] : release.descriptorSlots) {
+                if (heap) {
+                    heap->ReleaseDescriptor(index);
+                }
+            }
+        }
+
+        // Destroying deferred resources can enqueue one final wave of their
+        // descriptor slots. Loop until that wave has also been released.
+        releases.clear();
+    }
+}
+
 void DescriptorHeapManager::AssignDescriptorSlots(
     GloballyIndexedResource& target,
     rhi::Resource& apiResource,

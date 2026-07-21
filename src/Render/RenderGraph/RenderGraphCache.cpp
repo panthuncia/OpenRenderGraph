@@ -2409,6 +2409,8 @@ void RenderGraph::ExtractReplaySegmentsFromAuthoritativeCompile(
 						segment.fingerprint.aliasHash = HashCombine64(segment.fingerprint.aliasHash, aliasRange->startByte);
 						segment.fingerprint.aliasHash = HashCombine64(segment.fingerprint.aliasHash, aliasRange->endByte);
 						segment.fingerprint.aliasHash = HashCombine64(segment.fingerprint.aliasHash, aliasRange->dedicatedBacking ? 1ull : 0ull);
+						segment.fingerprint.aliasHash = HashCombine64(segment.fingerprint.aliasHash, aliasRange->overlapsByteRange ? 1ull : 0ull);
+						segment.fingerprint.aliasHash = HashCombine64(segment.fingerprint.aliasHash, aliasRange->activationReasonBits);
 					}
 				}
 				for (const auto& transition : passSummary.internalTransitions) {
@@ -4287,7 +4289,7 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 			}
 			const bool aliasActivationPendingForInput =
 				*resourceIndex < m_aliasActivationPendingByResourceIndex.size()
-				&& m_aliasActivationPendingByResourceIndex[*resourceIndex] != 0;
+				&& m_aliasActivationPendingByResourceIndex[*resourceIndex] != rg::alias::AliasActivationReason::None;
 			if (aliasActivationPendingForInput) {
 				const bool inputCanActivateAlias = AccessTypeIsWriteType(requiredState.access)
 					|| requiredState.access == rhi::ResourceAccessType::Common;
@@ -4469,7 +4471,7 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 				if (transitionTemplate.discard
 					&& transitionCanActivateAlias
 					&& *resourceIndex < m_aliasActivationPendingByResourceIndex.size()) {
-					m_aliasActivationPendingByResourceIndex[*resourceIndex] = 0;
+					m_aliasActivationPendingByResourceIndex[*resourceIndex] = rg::alias::AliasActivationReason::None;
 					aliasActivationPending.erase(resource->GetGlobalResourceID());
 				}
 			}
@@ -4554,7 +4556,7 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 						m_compiledLastProducerBatchByResourceByQueue[usage.queueSlot][usage.resourceID] = batchIndex;
 					}
 					if (*resourceIndex < m_aliasActivationPendingByResourceIndex.size()) {
-						m_aliasActivationPendingByResourceIndex[*resourceIndex] = 0;
+						m_aliasActivationPendingByResourceIndex[*resourceIndex] = rg::alias::AliasActivationReason::None;
 					}
 					aliasActivationPending.erase(usage.resourceID);
 				}
@@ -4733,7 +4735,7 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 		const auto& passSummary = m_framePassSchedulingSummaries[passIndex];
 		for (const auto& requirement : passSummary.requirements) {
 			if (requirement.resourceIndex >= m_aliasActivationPendingByResourceIndex.size()
-				|| m_aliasActivationPendingByResourceIndex[requirement.resourceIndex] == 0) {
+				|| m_aliasActivationPendingByResourceIndex[requirement.resourceIndex] == rg::alias::AliasActivationReason::None) {
 				continue;
 			}
 			const bool firstUseCanActivate = AccessTypeIsWriteType(requirement.state.access)
@@ -5022,7 +5024,7 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 			const auto& passSummary = m_framePassSchedulingSummaries[passIndex];
 			for (const auto& requirement : passSummary.requirements) {
 				if (requirement.resourceIndex >= m_aliasActivationPendingByResourceIndex.size()
-					|| m_aliasActivationPendingByResourceIndex[requirement.resourceIndex] == 0) {
+					|| m_aliasActivationPendingByResourceIndex[requirement.resourceIndex] == rg::alias::AliasActivationReason::None) {
 					continue;
 				}
 				const bool firstUseCanActivate = AccessTypeIsWriteType(requirement.state.access)
@@ -6762,7 +6764,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		m_hasAliasPlacementByResourceIndex.assign(m_frameSchedulingResourceCount, 0);
 		m_schedulingPlacementRangeByResourceIndex.assign(m_frameSchedulingResourceCount, rg::alias::AliasPlacementRange{});
 		m_hasSchedulingPlacementByResourceIndex.assign(m_frameSchedulingResourceCount, 0);
-		m_aliasActivationPendingByResourceIndex.assign(m_frameSchedulingResourceCount, 0);
+		m_aliasActivationPendingByResourceIndex.assign(m_frameSchedulingResourceCount, rg::alias::AliasActivationReason::None);
 	}
 	{
 		traceCompileStep("RebuildSchedulingEquivalentIDCache");
@@ -6825,8 +6827,8 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		SnapshotCompiledResourceGenerations(usedResourceIDs);
 	}
 
-	const std::unordered_set<uint64_t> aliasActivationPendingBeforeAuthoritativeCompile = aliasActivationPending;
-	const std::vector<uint8_t> aliasActivationPendingByResourceIndexBeforeAuthoritativeCompile = m_aliasActivationPendingByResourceIndex;
+	const std::unordered_map<uint64_t, rg::alias::AliasActivationReason> aliasActivationPendingBeforeAuthoritativeCompile = aliasActivationPending;
+	const std::vector<rg::alias::AliasActivationReason> aliasActivationPendingByResourceIndexBeforeAuthoritativeCompile = m_aliasActivationPendingByResourceIndex;
 	const auto regionMode = m_getRenderGraphRegionMode
 		? m_getRenderGraphRegionMode()
 		: rg::runtime::RenderGraphRegionMode::Disabled;

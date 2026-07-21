@@ -7,6 +7,7 @@
 #include <cmath>
 #include <functional>
 #include <limits>
+#include <numeric>
 #include <queue>
 #include <sstream>
 #include <tracy/Tracy.hpp>
@@ -1010,6 +1011,15 @@ void rg::alias::RenderGraphAliasingSubsystem::AutoAssignAliasingPoolsFromAnalysi
 			autoAliasPlannerStats.manuallyAssigned++;
 			continue;
 		}
+		if (!c.firstUseIsWrite) {
+			c.exclusionReason = "first use is read";
+			autoAliasPlannerStats.excluded++;
+			if (buildAliasDebug) {
+				autoAliasExclusionReasonByID[c.resourceID] = c.exclusionReason;
+			}
+			appendExcludedResource(c, c.exclusionReason);
+			continue;
+		}
 
 		const float score = scoreCandidate(c);
 		if (score < inclusionThreshold) {
@@ -1177,7 +1187,7 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 	hasAliasPlacementByResourceIndex.assign(rg.m_frameSchedulingResourceCount, 0);
 	schedulingPlacementRangeByResourceIndex.assign(rg.m_frameSchedulingResourceCount, AliasPlacementRange{});
 	hasSchedulingPlacementByResourceIndex.assign(rg.m_frameSchedulingResourceCount, 0);
-	aliasActivationPendingByResourceIndex.assign(rg.m_frameSchedulingResourceCount, 0);
+	aliasActivationPendingByResourceIndex.assign(rg.m_frameSchedulingResourceCount, AliasActivationReason::None);
 	if (aliasMaterializeOptionsByResourceIndex.size() != rg.m_frameSchedulingResourceCount) {
 		aliasMaterializeOptionsByResourceIndex.resize(rg.m_frameSchedulingResourceCount);
 	}
@@ -1242,11 +1252,14 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 		schedulingPlacementRangeByResourceIndex[resourceIndex] = placementRange;
 		hasSchedulingPlacementByResourceIndex[resourceIndex] = 1;
 	};
-	auto markAliasActivationPending = [&](AliasResourceIndex resourceIndex) {
+	auto markAliasActivationPending = [&](AliasResourceIndex resourceIndex, AliasActivationReason reason) {
 		if (resourceIndex >= aliasActivationPendingByResourceIndex.size()) {
 			throw std::runtime_error("Alias activation resource index out of range");
 		}
-		aliasActivationPendingByResourceIndex[resourceIndex] = 1;
+		const auto combined = aliasActivationPendingByResourceIndex[resourceIndex] | reason;
+		aliasActivationPendingByResourceIndex[resourceIndex] = combined;
+		const uint64_t resourceID = getInfoByIndex(resourceIndex).resourceID;
+		aliasActivationPending[resourceID] = combined;
 	};
 	auto dematerializeResourceForKind = [&](Resource* resource, RGResourceRuntimeKind kind) {
 		if (!resource) {
@@ -1883,6 +1896,33 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 			cachedAliasPlanByPoolID.erase(poolID);
 			continue;
 		}
+
+		// Physical overlap, rather than pool membership, determines whether an
+		// occupant needs a discard activation on every frame. Sweep placements in
+		// byte order and mark both sides of every intersecting interval.
+		std::vector<uint8_t> overlapsPlacement(poolCandidateIndices.size(), 0);
+		std::vector<size_t> placementOrder(poolCandidateIndices.size());
+		std::iota(placementOrder.begin(), placementOrder.end(), 0);
+		std::sort(placementOrder.begin(), placementOrder.end(), [&](size_t lhs, size_t rhs) {
+			if (placements[lhs].offset != placements[rhs].offset) {
+				return placements[lhs].offset < placements[rhs].offset;
+			}
+			return placements[lhs].sizeBytes > placements[rhs].sizeBytes;
+		});
+		std::vector<size_t> activePlacementIndices;
+		for (size_t candidateIndex : placementOrder) {
+			const uint64_t start = placements[candidateIndex].offset;
+			activePlacementIndices.erase(
+				std::remove_if(activePlacementIndices.begin(), activePlacementIndices.end(), [&](size_t activeIndex) {
+					return placements[activeIndex].offset + placements[activeIndex].sizeBytes <= start;
+				}),
+				activePlacementIndices.end());
+			for (size_t activeIndex : activePlacementIndices) {
+				overlapsPlacement[candidateIndex] = 1;
+				overlapsPlacement[activeIndex] = 1;
+			}
+			activePlacementIndices.push_back(candidateIndex);
+		}
 		if (buildAliasDebug) {
 			poolDebug.requiredBytes = heapSize;
 		}
@@ -1989,7 +2029,7 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 					.sizeBytes = c.sizeBytes,
 					.firstUse = c.firstUse,
 					.lastUse = c.lastUse,
-					.overlapsByteRange = false
+					.overlapsByteRange = overlapsPlacement[candidateIndex] != 0
 					});
 			}
 
@@ -2027,6 +2067,7 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 				.lastUse = c.lastUse,
 				.firstUsePassIndex = c.firstUsePassIndex,
 				.lastUsePassIndex = c.lastUsePassIndex,
+				.overlapsByteRange = overlapsPlacement[candidateIndex] != 0,
 			};
 			setAliasPlacement(resourceIndex, placementRange);
 			setSchedulingPlacement(resourceIndex, placementRange);
@@ -2056,20 +2097,18 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 			const auto itSig = aliasPlacementSignatureByID.find(c.resourceID);
 			const bool signatureChanged = itSig == aliasPlacementSignatureByID.end() || itSig->second != newSignature;
 			auto itRes = resourcesByID.find(c.resourceID);
-			if (itRes != resourcesByID.end()) {
-				if (signatureChanged && dematerializeResourceForKind(itRes->second.get(), c.kind)) {
-					markAliasActivationPending(resourceIndex);
+			if (signatureChanged) {
+				if (itRes != resourcesByID.end()) {
+					dematerializeResourceForKind(itRes->second.get(), c.kind);
 				}
-			}
-			else if (signatureChanged) {
-				markAliasActivationPending(resourceIndex);
+				markAliasActivationPending(resourceIndex, AliasActivationReason::NewPlacement);
 			}
 			aliasPlacementSignatureByID[c.resourceID] = newSignature;
-			// Aliased resources need a discard-style activation on first use every frame,
-			// not only when the backing was rematerialized. Otherwise a steady-state
-			// handoff between overlapping resources can reuse heap memory without an
-			// activation barrier.
-			markAliasActivationPending(resourceIndex);
+			if (overlapsPlacement[candidateIndex] != 0) {
+				markAliasActivationPending(resourceIndex, AliasActivationReason::OverlapHandoff);
+			}
+			aliasPlacementRangeByResourceIndex[resourceIndex].activationReasonBits =
+				static_cast<uint8_t>(aliasActivationPendingByResourceIndex[resourceIndex]);
 		}
 
 		if (buildAliasDebug) {
@@ -2202,7 +2241,7 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 		if (resourceIndex < hasSchedulingPlacementByResourceIndex.size() && hasSchedulingPlacementByResourceIndex[resourceIndex] != 0) {
 			++schedulingPlacementCount;
 		}
-		if (resourceIndex < aliasActivationPendingByResourceIndex.size() && aliasActivationPendingByResourceIndex[resourceIndex] != 0) {
+		if (resourceIndex < aliasActivationPendingByResourceIndex.size() && aliasActivationPendingByResourceIndex[resourceIndex] != AliasActivationReason::None) {
 			++aliasActivationPendingCount;
 		}
 	}
@@ -2370,19 +2409,27 @@ void rg::alias::RenderGraphAliasingSubsystem::ApplyAliasQueueSynchronization(Ren
 					continue;
 				}
 
-				// This pass only adds waits against prior batches. Same-batch alias
-				// overlap must be prevented during batch formation instead of
-				// creating a queue wait that points back into the current batch.
-				if (prevOwner.batchIndex == batchIndex) {
-					continue;
-				}
-
 				if (!rangesOverlap(
 					placement->startByte,
 					placement->endByte,
 					prevOwner.startByte,
 					prevOwner.endByte)) {
 					continue;
+				}
+
+				// A wait cannot make two occupants in the same command-list batch
+				// safe: activation must begin only after the previous occupant's
+				// batch has completed. Batch formation is responsible for splitting
+				// this case, so fail compilation if that invariant regresses.
+				if (prevOwner.batchIndex == batchIndex) {
+					const std::string message =
+						"Overlapping alias occupants were scheduled in the same batch. poolId="
+						+ std::to_string(placement->poolID)
+						+ " previousResourceId=" + std::to_string(prevOwner.resourceID)
+						+ " currentResourceId=" + std::to_string(resourceID)
+						+ " batchIndex=" + std::to_string(batchIndex);
+					spdlog::error(message);
+					throw std::runtime_error(message);
 				}
 
 				auto& prevBatch = batches[prevOwner.batchIndex];

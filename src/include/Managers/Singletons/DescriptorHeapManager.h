@@ -49,6 +49,10 @@ public:
 	};
 	void PublishQueueFenceSnapshot(std::vector<QueueFenceSnapshotPoint> fenceSnapshot);
 	void ProcessDeferredReleases(uint8_t frameIndex);
+	// The caller must have waited for the device to become idle. Releases every
+	// pending object and forgets queue-fence snapshots before their owning queue
+	// registry destroys and recreates its timelines.
+	void DrainDeferredReleasesAfterDeviceIdle();
 
 	rhi::DescriptorHeap GetSRVDescriptorHeap() const;
 	rhi::DescriptorHeap GetSamplerDescriptorHeap() const;

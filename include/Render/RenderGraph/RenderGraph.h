@@ -646,6 +646,7 @@ public:
 	void ResetForRebuild();
 	void PrepareExtensionsForBuild();
 	void ShutdownExtensions();
+	void ClearExtensions();
 	void Setup();
 	void RegisterExtension(std::unique_ptr<IRenderGraphExtension> ext, std::optional<std::string_view> id = std::nullopt);
 	const std::vector<PassBatch>& GetBatches() const { return batches; }
@@ -1604,7 +1605,7 @@ private:
 	size_t m_frameSchedulingResourceCount = 0;
 	std::vector<uint64_t> m_frameSchedulingResourceIDByIndex;
 	std::vector<std::vector<size_t>> m_equivalentResourceIndicesByResourceIndex;
-	std::vector<uint8_t> m_aliasActivationPendingByResourceIndex;
+	std::vector<rg::alias::AliasActivationReason> m_aliasActivationPendingByResourceIndex;
 	std::vector<unsigned int> m_frameQueueLastUsageBatch;
 	std::vector<unsigned int> m_frameQueueLastProducerBatch;
 	std::vector<unsigned int> m_frameQueueLastTransitionBatch;
@@ -1627,7 +1628,7 @@ private:
 	std::unordered_map<uint64_t, rg::alias::CachedAliasStaticResourceInfo> m_aliasStaticInfoCacheByResourceID;
 	rg::alias::FrameAliasAnalysis m_aliasFrameAnalysisScratch;
 	std::unordered_map<uint64_t, uint64_t> aliasPlacementPoolByID;
-	std::unordered_set<uint64_t> aliasActivationPending;
+	std::unordered_map<uint64_t, rg::alias::AliasActivationReason> aliasActivationPending;
 
 	using PersistentAliasPoolState = rg::alias::PersistentAliasPoolState;
 	std::unordered_map<uint64_t, PersistentAliasPoolState> persistentAliasPools;
