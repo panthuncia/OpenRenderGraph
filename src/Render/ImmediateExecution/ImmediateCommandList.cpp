@@ -378,7 +378,7 @@ namespace rg::imm {
                 region.y = cmd.y;
                 region.z = cmd.z;
                 region.footprint = cmd.footprint;
-                barrierRepeatedTextureWrite(region.texture, ExactRhiRange(cmd.mip, cmd.slice), rhi::ResourceAccessType::CopyDest, rhi::ResourceLayout::CopyDest, rhi::ResourceSyncState::Copy);
+				barrierRepeatedTextureWrite(region.texture, ExactRhiRange(cmd.mip, cmd.slice), rhi::ResourceAccessType::CopyDest, rhi::ResourceLayout::CopyDest, rhi::ResourceSyncState::Copy);
                 cl.CopyBufferToTexture(region);
                 break;
             }

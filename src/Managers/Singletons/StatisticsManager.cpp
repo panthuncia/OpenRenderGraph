@@ -708,6 +708,8 @@ void StatisticsManager::OnFrameComplete(
             }
 
             UpdateEma(m_stats[pi].gpuTimeEma, ms);
+            m_stats[pi].gpuTimeMs = ms;
+            m_stats[pi].gpuSampleSerial = m_frameSerial;
             if (pi < m_passLastExecutionFrame.size()) {
                 m_passLastExecutionFrame[pi] = m_frameSerial;
             }

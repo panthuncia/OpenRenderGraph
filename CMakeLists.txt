@@ -128,9 +128,9 @@ target_link_libraries(OpenRenderGraph
         imgui::imgui
         implot::implot
         slang::slang
+        Tracy::TracyClient
     PRIVATE
         spdlog::spdlog_header_only
-        Tracy::TracyClient
 )
 
 target_compile_definitions(OpenRenderGraph

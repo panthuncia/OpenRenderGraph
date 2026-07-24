@@ -5999,15 +5999,6 @@ void RenderGraph::MaterializeUnmaterializedResources(std::span<const uint64_t> o
 				if (auto* aliasOptions = tryGetAliasMaterializeOptions(id)) {
 					if (std::holds_alternative<PixelBuffer::MaterializeOptions>(*aliasOptions)) {
 						auto& options = std::get<PixelBuffer::MaterializeOptions>(*aliasOptions);
-						if (options.aliasPlacement.has_value()) {
-							const auto& ap = options.aliasPlacement.value();
-							spdlog::info(
-								"RG alias materialize: id={} name='{}' pool={} offset={}",
-								id,
-								resource->GetName(),
-								ap.poolID.has_value() ? ap.poolID.value() : 0ull,
-								ap.offset);
-						}
 						texture->Materialize(&options);
 					}
 				}
@@ -6051,15 +6042,6 @@ void RenderGraph::MaterializeUnmaterializedResources(std::span<const uint64_t> o
 			if (auto* aliasOptions = tryGetAliasMaterializeOptions(id)) {
 				if (std::holds_alternative<BufferBase::MaterializeOptions>(*aliasOptions)) {
 					auto& options = std::get<BufferBase::MaterializeOptions>(*aliasOptions);
-					if (options.aliasPlacement.has_value()) {
-						const auto& ap = options.aliasPlacement.value();
-						spdlog::info(
-							"RG alias materialize (buffer): id={} name='{}' pool={} offset={}",
-							id,
-							resource->GetName(),
-							ap.poolID.has_value() ? ap.poolID.value() : 0ull,
-							ap.offset);
-					}
 					buffer->Materialize(&options);
 				}
 			}

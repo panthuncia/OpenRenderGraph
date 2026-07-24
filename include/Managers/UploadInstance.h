@@ -195,9 +195,11 @@ private:
 
 	static bool TryCoalesceAppend(ResourceUpdate& last, const ResourceUpdate& next) noexcept;
 
-	static void MapUpload(const std::shared_ptr<Resource>& uploadBuffer, size_t mapSize,
-	                       uint8_t** outMapped) noexcept;
-	static void UnmapUpload(const std::shared_ptr<Resource>& uploadBuffer) noexcept;
+	static void MapUpload(const std::shared_ptr<Resource>& uploadBuffer, uint8_t** outMapped) noexcept;
+	static void UnmapUpload(
+		const std::shared_ptr<Resource>& uploadBuffer,
+		size_t writeOffset,
+		size_t writeSize) noexcept;
 	void MarkPendingWorkChangedLocked();
 	void CaptureTargetTelemetryLocked(const UploadTarget& target, uint64_t& outId, std::string& outName);
 	void RefreshQueuedTargetTelemetryLocked();

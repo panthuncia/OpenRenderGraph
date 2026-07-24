@@ -290,17 +290,22 @@ bool UploadInstance::TryCoalesceAppend(ResourceUpdate& last, const ResourceUpdat
 	return true;
 }
 
-void UploadInstance::MapUpload(const std::shared_ptr<Resource>& uploadBuffer, size_t mapSize,
-                               uint8_t** outMapped) noexcept {
+void UploadInstance::MapUpload(const std::shared_ptr<Resource>& uploadBuffer, uint8_t** outMapped) noexcept {
 	if (!outMapped) return;
 	*outMapped = nullptr;
 	if (!uploadBuffer) return;
-	uploadBuffer->GetAPIResource().Map(reinterpret_cast<void**>(outMapped), 0, mapSize);
+	// Upload pages are write-only from the CPU. An empty read range avoids an
+	// unnecessary GPU-to-CPU synchronization hint; UnmapUpload reports the
+	// exact bytes written below.
+	uploadBuffer->GetAPIResource().Map(reinterpret_cast<void**>(outMapped), 0, 0);
 }
 
-void UploadInstance::UnmapUpload(const std::shared_ptr<Resource>& uploadBuffer) noexcept {
+void UploadInstance::UnmapUpload(
+	const std::shared_ptr<Resource>& uploadBuffer,
+	size_t writeOffset,
+	size_t writeSize) noexcept {
 	if (!uploadBuffer) return;
-	uploadBuffer->GetAPIResource().Unmap(0, 0);
+	uploadBuffer->GetAPIResource().Unmap(writeOffset, writeSize);
 }
 
 void UploadInstance::MarkPendingWorkChangedLocked() {
@@ -400,40 +405,44 @@ void UploadInstance::UploadData(const void* data, size_t size, UploadTarget targ
 #endif
 #endif
 		CaptureTargetTelemetryLocked(update.resourceToUpdate, update.targetGlobalResourceId, update.targetDebugName);
-	}
 
-	uint8_t* mapped = nullptr;
-	MapUpload(uploadBuffer, uploadOffset + size, &mapped);
+		// Keep the reservation visible to ProcessUploads for the entire staging
+		// write.  Previously the queue lock was dropped between allocation and
+		// enqueue.  A concurrent ProcessUploads could then conclude that this
+		// page had no remaining updates, retire it, and allow it to be recycled
+		// while the CPU was still writing the reserved region.
+		uint8_t* mapped = nullptr;
+		MapUpload(uploadBuffer, &mapped);
 #if BUILD_TYPE == BUILD_TYPE_DEBUG
-	if (!mapped) {
-		__debugbreak();
-		return;
-	}
-#endif
-	if (mapped) {
-		std::memcpy(mapped + uploadOffset, data, size);
-	}
-	UnmapUpload(uploadBuffer);
-
-	std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
-	update.firstSequence = ++m_lastUploadSequence;
-	update.lastSequence = update.firstSequence;
-	for (int i = static_cast<int>(m_resourceUpdates.size()) - 1; i >= 0; --i) {
-		auto& last = m_resourceUpdates[static_cast<size_t>(i)];
-		if (!last.active) {
-			continue;
-		}
-		// A captured batch boundary is immutable: extending a sealed update
-		// would move its earlier bytes past the cutoff without moving the fence
-		// that was assigned to them.
-		if (last.lastSequence > m_lastSealedUploadSequence && TryCoalesceAppend(last, update)) {
-			MarkPendingWorkChangedLocked();
+		if (!mapped) {
+			__debugbreak();
 			return;
 		}
-		break;
+#endif
+		if (mapped) {
+			std::memcpy(mapped + uploadOffset, data, size);
+		}
+		UnmapUpload(uploadBuffer, uploadOffset, size);
+
+		update.firstSequence = ++m_lastUploadSequence;
+		update.lastSequence = update.firstSequence;
+		for (int i = static_cast<int>(m_resourceUpdates.size()) - 1; i >= 0; --i) {
+			auto& last = m_resourceUpdates[static_cast<size_t>(i)];
+			if (!last.active) {
+				continue;
+			}
+			// A captured batch boundary is immutable: extending a sealed update
+			// would move its earlier bytes past the cutoff without moving the fence
+			// that was assigned to them.
+			if (last.lastSequence > m_lastSealedUploadSequence && TryCoalesceAppend(last, update)) {
+				MarkPendingWorkChangedLocked();
+				return;
+			}
+			break;
+		}
+		m_resourceUpdates.push_back(std::move(update));
+		MarkPendingWorkChangedLocked();
 	}
-	m_resourceUpdates.push_back(std::move(update));
-	MarkPendingWorkChangedLocked();
 }
 
 #if BUILD_TYPE == BUILD_TYPE_DEBUG
@@ -474,42 +483,44 @@ void UploadInstance::UploadTextureSubresources(
 	{
 		std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
 		AllocateUploadRegion(static_cast<size_t>(plan.totalSize), /*alignment*/512, uploadBuffer, uploadBaseOffset);
-	}
 
-	uint8_t* mapped = nullptr;
-	MapUpload(uploadBuffer, uploadBaseOffset + static_cast<size_t>(plan.totalSize), &mapped);
-	if (mapped) {
-		rhi::helpers::WriteTextureUploadSubresources(plan, srcSpan, mapped, static_cast<uint64_t>(uploadBaseOffset));
-	}
-	UnmapUpload(uploadBuffer);
+		// Allocation, staging, and enqueue form one ownership transaction.  In
+		// particular, ProcessUploads must not be able to retire this page while
+		// its newly reserved region is not represented in m_textureUpdates yet.
+		uint8_t* mapped = nullptr;
+		MapUpload(uploadBuffer, &mapped);
+		if (mapped) {
+			rhi::helpers::WriteTextureUploadSubresources(plan, srcSpan, mapped, static_cast<uint64_t>(uploadBaseOffset));
+		}
+		UnmapUpload(uploadBuffer, uploadBaseOffset, static_cast<size_t>(plan.totalSize));
 
-	std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
-	for (const auto& fp : plan.footprints) {
-		rhi::CopyableFootprint copyFootprint;
-		copyFootprint.offset = static_cast<uint64_t>(uploadBaseOffset) + fp.offset;
-		copyFootprint.rowPitch = fp.rowPitch;
-		copyFootprint.width = fp.width;
-		copyFootprint.height = fp.height;
-		copyFootprint.depth = fp.depth;
+		for (const auto& fp : plan.footprints) {
+			rhi::CopyableFootprint copyFootprint;
+			copyFootprint.offset = static_cast<uint64_t>(uploadBaseOffset) + fp.offset;
+			copyFootprint.rowPitch = fp.rowPitch;
+			copyFootprint.width = fp.width;
+			copyFootprint.height = fp.height;
+			copyFootprint.depth = fp.depth;
 
-		TextureUpdate update;
-		update.texture = target;
-		update.mip = fp.mip;
-		update.slice = fp.arraySlice;
-		update.footprint = copyFootprint;
-		update.x = 0;
-		update.y = 0;
-		update.z = fp.zSlice;
-		update.uploadBuffer = uploadBuffer;
+			TextureUpdate update;
+			update.texture = target;
+			update.mip = fp.mip;
+			update.slice = fp.arraySlice;
+			update.footprint = copyFootprint;
+			update.x = 0;
+			update.y = 0;
+			update.z = fp.zSlice;
+			update.uploadBuffer = uploadBuffer;
 #if BUILD_TYPE == BUILD_TYPE_DEBUG
-		update.file = file;
-		update.line = line;
+			update.file = file;
+			update.line = line;
 #endif
-		CaptureTargetTelemetryLocked(update.texture, update.targetGlobalResourceId, update.targetDebugName);
-		update.sequence = ++m_lastUploadSequence;
-		m_textureUpdates.push_back(std::move(update));
+			CaptureTargetTelemetryLocked(update.texture, update.targetGlobalResourceId, update.targetDebugName);
+			update.sequence = ++m_lastUploadSequence;
+			m_textureUpdates.push_back(std::move(update));
+		}
+		MarkPendingWorkChangedLocked();
 	}
-	MarkPendingWorkChangedLocked();
 }
 
 void UploadInstance::ProcessUploads(uint8_t frameIndex, rg::imm::ImmediateCommandList& commandList) {

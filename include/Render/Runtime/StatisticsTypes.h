@@ -8,6 +8,8 @@ namespace rg::runtime {
 
 struct PassStats {
     double gpuTimeEma = 0.0;
+    double gpuTimeMs = 0.0;
+    uint64_t gpuSampleSerial = 0;
     double cpuUpdateTimeEma = 0.0;
     double cpuExecuteTimeEma = 0.0;
     static constexpr double alpha = 0.1;
