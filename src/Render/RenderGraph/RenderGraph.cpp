@@ -7409,6 +7409,7 @@ namespace {
 				args.context.currentPassName = passName.data();
 				args.context.currentTechniquePath = techniquePath;
 				(void)rhi::debug::SetInstrumentationContext(commandList, args.context.currentPassName, args.context.currentTechniquePath);
+				(void)commandList.BeginTracyGpuZone(rhiQueue, args.context.currentPassName);
 				if (args.context.beginGpuPassRange) {
 					args.context.beginGpuPassRange(commandList, rhiQueue, QueueKindToString(queue), args.context.currentPassName);
 				}
@@ -7446,6 +7447,7 @@ namespace {
 				if (args.context.endGpuPassRange) {
 					args.context.endGpuPassRange(commandList, rhiQueue);
 				}
+				commandList.EndTracyGpuZone();
 				(void)rhi::debug::SetInstrumentationContext(commandList, nullptr, nullptr);
 				args.context.currentPassName = nullptr;
 				args.context.currentTechniquePath = nullptr;
@@ -7463,6 +7465,7 @@ namespace {
 				if (args.context.endGpuPassRange) {
 					args.context.endGpuPassRange(commandList, rhiQueue);
 				}
+				commandList.EndTracyGpuZone();
 				(void)rhi::debug::SetInstrumentationContext(commandList, nullptr, nullptr);
 				args.context.currentPassName = nullptr;
 				args.context.currentTechniquePath = nullptr;
@@ -7478,6 +7481,7 @@ namespace {
 				if (args.context.endGpuPassRange) {
 					args.context.endGpuPassRange(commandList, rhiQueue);
 				}
+				commandList.EndTracyGpuZone();
 				(void)rhi::debug::SetInstrumentationContext(commandList, nullptr, nullptr);
 				args.context.currentPassName = nullptr;
 				args.context.currentTechniquePath = nullptr;
@@ -7649,6 +7653,7 @@ namespace {
 				args.context.currentPassName = passName.data();
 				args.context.currentTechniquePath = techniquePath;
 				(void)rhi::debug::SetInstrumentationContext(commandList, args.context.currentPassName, args.context.currentTechniquePath);
+				(void)commandList.BeginTracyGpuZone(args.rhiQueue, args.context.currentPassName);
 				if (args.context.beginGpuPassRange) {
 					args.context.beginGpuPassRange(commandList, args.rhiQueue, QueueKindToString(queue), args.context.currentPassName);
 				}
@@ -7685,6 +7690,7 @@ namespace {
 				if (args.context.endGpuPassRange) {
 					args.context.endGpuPassRange(commandList, args.rhiQueue);
 				}
+				commandList.EndTracyGpuZone();
 				(void)rhi::debug::SetInstrumentationContext(commandList, nullptr, nullptr);
 				args.context.currentPassName = nullptr;
 				args.context.currentTechniquePath = nullptr;
@@ -7702,6 +7708,7 @@ namespace {
 				if (args.context.endGpuPassRange) {
 					args.context.endGpuPassRange(commandList, args.rhiQueue);
 				}
+				commandList.EndTracyGpuZone();
 				(void)rhi::debug::SetInstrumentationContext(commandList, nullptr, nullptr);
 				args.context.currentPassName = nullptr;
 				args.context.currentTechniquePath = nullptr;
@@ -7717,6 +7724,7 @@ namespace {
 				if (args.context.endGpuPassRange) {
 					args.context.endGpuPassRange(commandList, args.rhiQueue);
 				}
+				commandList.EndTracyGpuZone();
 				(void)rhi::debug::SetInstrumentationContext(commandList, nullptr, nullptr);
 				args.context.currentPassName = nullptr;
 				args.context.currentTechniquePath = nullptr;
@@ -8686,6 +8694,26 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 	}
 	if (batchTraceEnabled) {
 		spdlog::info("RenderGraph::Execute frame={} preallocated command lists", static_cast<unsigned>(context.frameIndex));
+	}
+
+	// Advance each Tracy queue context exactly once per graph execution.  Vulkan
+	// records query collection/reset commands into the first submitted command
+	// list for that queue; D3D12 uses the same call as its per-frame resolve point.
+	for (size_t qi = 0; qi < slotCount; ++qi) {
+		for (auto& batchSchedule : m_executionSchedule.batches) {
+			if (qi >= batchSchedule.queues.size()) {
+				continue;
+			}
+			auto& queueSchedule = batchSchedule.queues[qi];
+			if (!queueSchedule.active || queueSchedule.numCLs == 0 ||
+				!queueSchedule.preallocatedCLs[0].list) {
+				continue;
+			}
+			auto queue = SlotQueue(qi);
+			auto firstCommandList = queueSchedule.preallocatedCLs[0].list.Get();
+			queue.TracyGpuFrameBegin(firstCommandList);
+			break;
+		}
 	}
 
 	// Per-slot signal tracking for monotonic recycle signals.

@@ -2,6 +2,7 @@
 #include "Render/CommandListPool.h"
 
 #include <string>
+#include <spdlog/spdlog.h>
 
 namespace {
 	const char* QueueKindDebugName(QueueKind kind) noexcept {
@@ -27,6 +28,13 @@ QueueSlotIndex QueueRegistry::Register(QueueSlot slot, rhi::Queue queue, rhi::Ti
 		" " + QueueKindDebugName(slot.kind) + ":" + std::to_string(slot.instance);
 	if (queue) {
 		queue.SetName(queueName.c_str());
+		const rhi::Result tracyResult = queue.InitializeTracyGpuContext(queueName.c_str());
+		if (tracyResult != rhi::Result::Ok && tracyResult != rhi::Result::Unsupported) {
+			spdlog::warn(
+				"Failed to initialize Tracy GPU profiling for '{}': {}",
+				queueName,
+				rhi::ResultName(tracyResult));
+		}
 	}
 	if (fence) {
 		const std::string fenceName = queueName + " Fence";

@@ -1,5 +1,14 @@
 # OpenRenderGraph
 
+When BasicRHI is built with `BASICRHI_ENABLE_TRACY_GPU_PROFILING`, every
+registered queue slot receives its own named Tracy GPU context. Render-graph
+passes are emitted as GPU zones on the queue that executes them, so Tracy shows
+graphics, compute, copy, and additional same-kind queue instances as separate
+timelines aligned with the CPU capture. Parallel command-list recording workers
+do not create additional GPU rows; pass metadata is ordered when the recorded
+command lists are submitted, so concurrent recording cannot corrupt Tracy's GPU
+zone nesting. No application-side pass callbacks are required.
+
 OpenRenderGraph (ORG) is a powerful rendering/GPU-compute framework, built around a render graph.
 
 ORG provides a pass-oriented API for building frame pipelines, tracking resource state/transitions, handling queue synchronization, planning automatic resource aliasing on eligible resources, and executing graphics/compute work with explicit resource usage contracts.
