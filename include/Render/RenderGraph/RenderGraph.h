@@ -1717,8 +1717,14 @@ private:
 	std::string m_lastAuthoritativeReplayFailure;
 	std::string m_lastAuthoritativeReplayRecomputeReason;
 	std::unordered_map<uint64_t, LastProducerAcrossFrames> m_lastProducerByResourceAcrossFrames;
+	// A write in a later frame must wait for every queue that accessed the
+	// resource in the prior frame, including read-only consumers and barriers.
+	// Keep one completion point per resource/queue; producer-only tracking is
+	// sufficient for reads, but cannot cover cross-frame write-after-read.
+	std::unordered_map<uint64_t, std::vector<LastProducerAcrossFrames>> m_lastAccessByResourceAcrossFrames;
 	std::unordered_map<uint64_t, std::vector<LastAliasPlacementProducerAcrossFrames>> m_lastAliasPlacementProducersByPoolAcrossFrames;
 	std::vector<std::unordered_map<uint64_t, unsigned int>> m_compiledLastProducerBatchByResourceByQueue;
+	std::vector<std::unordered_map<uint64_t, unsigned int>> m_compiledLastAccessBatchByResourceByQueue;
 	uint64_t m_crossFrameProducerPublishSerial = 0;
 	std::vector<std::vector<uint8_t>> m_hasPendingFrameStartQueueWait;
 	std::vector<std::vector<UINT64>> m_pendingFrameStartQueueWaitFenceValue;

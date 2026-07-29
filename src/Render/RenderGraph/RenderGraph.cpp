@@ -986,6 +986,7 @@ void RenderGraph::WriteCompiledGraphDebugDump(uint8_t frameIndex, const std::vec
 			dump << "  none\n";
 		}
 		dump << "  last_producers=" << m_lastProducerByResourceAcrossFrames.size()
+			 << " last_accesses=" << m_lastAccessByResourceAcrossFrames.size()
 			 << " alias_pools=" << m_lastAliasPlacementProducersByPoolAcrossFrames.size()
 			 << "\n";
 		for (size_t queueIndex = 0; queueIndex < m_compiledLastProducerBatchByResourceByQueue.size(); ++queueIndex) {
@@ -996,6 +997,14 @@ void RenderGraph::WriteCompiledGraphDebugDump(uint8_t frameIndex, const std::vec
 			dump << "  current_frame_producers queue=" << queueSlotLabel(queueIndex)
 				 << " resources=" << producers.size()
 				 << "\n";
+		}
+		for (size_t queueIndex = 0; queueIndex < m_compiledLastAccessBatchByResourceByQueue.size(); ++queueIndex) {
+			const auto& accesses = m_compiledLastAccessBatchByResourceByQueue[queueIndex];
+			if (!accesses.empty()) {
+				dump << "  current_frame_accesses queue=" << queueSlotLabel(queueIndex)
+					 << " resources=" << accesses.size()
+					 << "\n";
+			}
 		}
 		dump << "\n";
 
@@ -2761,15 +2770,18 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 		rg.CoalesceQueueWaitsAndSignals(rg.batches);
 	}
 
-	// Build cross-frame producer tracking from the committed batch schedule.
-	// Cross-frame tracking needs to know which queue
-	// wrote each resource and in which batch so the next frame can insert
-	// frame-start waits.
+	// Build cross-frame producer and access tracking from the committed batch
+	// schedule. Producers protect next-frame reads. All accesses are also
+	// retained because a next-frame write must wait for prior readers.
 	{
 		ZoneScopedN("RenderGraph::CompileFrame::AutoScheduleAndBuildBatches::BuildCrossFrameProducerTracking");
 		rg.m_compiledLastProducerBatchByResourceByQueue.resize(queueCount);
+		rg.m_compiledLastAccessBatchByResourceByQueue.resize(queueCount);
 		for (auto& producerMap : rg.m_compiledLastProducerBatchByResourceByQueue) {
 			producerMap.clear();
+		}
+		for (auto& accessMap : rg.m_compiledLastAccessBatchByResourceByQueue) {
+			accessMap.clear();
 		}
 		for (const auto& decision : rg.m_schedulingDecisionTrace) {
 			const size_t queueSlot = decision.assignedQueueSlot;
@@ -2778,8 +2790,10 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 				continue;
 			}
 			auto& producerMap = rg.m_compiledLastProducerBatchByResourceByQueue[queueSlot];
+			auto& accessMap = rg.m_compiledLastAccessBatchByResourceByQueue[queueSlot];
 			const auto& passSummary = rg.m_framePassSchedulingSummaries[decision.passIndex];
 			for (const auto& req : passSummary.requirements) {
+				accessMap[req.resource.GetGlobalResourceID()] = decision.batchIndex;
 				if (AccessTypeIsWriteType(req.state.access)) {
 					producerMap[req.resource.GetGlobalResourceID()] = decision.batchIndex;
 				}
@@ -2949,7 +2963,16 @@ void RenderGraph::AssignQueueSignalFenceValuesInSubmissionOrder(std::vector<Pass
 		for (size_t qi = 0; qi < queueCount; ++qi) {
 			for (size_t phaseIndex = 0; phaseIndex < PassBatch::kSignalPhaseCount; ++phaseIndex) {
 				const auto phase = static_cast<BatchSignalPhase>(phaseIndex);
-				if (!batch.HasQueueSignal(phase, qi)) {
+				// Every active batch signals its reserved completion fence for
+				// command-list recycling, even if it is not a graph dependency.
+				// Reassign that value too, otherwise a newly assigned dependency
+				// signal can jump ahead of a stale completion value.
+				const bool activeCompletion =
+					phase == BatchSignalPhase::AfterCompletion
+					&& (batch.HasTransitions(qi, BatchTransitionPhase::BeforePasses)
+						|| batch.HasPasses(qi)
+						|| batch.HasTransitions(qi, BatchTransitionPhase::AfterPasses));
+				if (!batch.HasQueueSignal(phase, qi) && !activeCompletion) {
 					continue;
 				}
 
@@ -3629,9 +3652,13 @@ void RenderGraph::ShutdownOwnedState() {
 	persistentAliasPools.clear();
 	autoAliasPoolByID.clear();
 	m_lastProducerByResourceAcrossFrames.clear();
+	m_lastAccessByResourceAcrossFrames.clear();
 	m_lastAliasPlacementProducersByPoolAcrossFrames.clear();
 	for (auto& producerMap : m_compiledLastProducerBatchByResourceByQueue) {
 		producerMap.clear();
+	}
+	for (auto& accessMap : m_compiledLastAccessBatchByResourceByQueue) {
+		accessMap.clear();
 	}
 	for (auto& row : m_hasPendingFrameStartQueueWait) {
 		std::fill(row.begin(), row.end(), false);
@@ -5080,8 +5107,10 @@ void RenderGraph::ResetForRebuild()
 		poolState.usedThisFrame = false;
 	}
 	m_lastProducerByResourceAcrossFrames.clear();
+	m_lastAccessByResourceAcrossFrames.clear();
 	m_lastAliasPlacementProducersByPoolAcrossFrames.clear();
 	m_compiledLastProducerBatchByResourceByQueue.clear();
+	m_compiledLastAccessBatchByResourceByQueue.clear();
 	m_hasPendingFrameStartQueueWait.clear();
 	m_pendingFrameStartQueueWaitFenceValue.clear();
 	m_queueRegistry.Clear();
@@ -5126,6 +5155,9 @@ void RenderGraph::ResetCompileFrameState() {
 		ZoneScopedN("RenderGraph::ResetCompileFrameState::QueueHistory");
 		for (auto& producerMap : m_compiledLastProducerBatchByResourceByQueue) {
 			producerMap.clear();
+		}
+		for (auto& accessMap : m_compiledLastAccessBatchByResourceByQueue) {
+			accessMap.clear();
 		}
 		for (auto& row : m_hasPendingFrameStartQueueWait) {
 			std::fill(row.begin(), row.end(), false);
@@ -6236,6 +6268,7 @@ void RenderGraph::MaterializeUnmaterializedResources(std::span<const uint64_t> o
 void RenderGraph::ResizeQueueParallelVectors() {
 	const size_t qc = m_queueRegistry.SlotCount();
 	m_compiledLastProducerBatchByResourceByQueue.resize(qc);
+	m_compiledLastAccessBatchByResourceByQueue.resize(qc);
 	m_hasPendingFrameStartQueueWait.assign(qc, std::vector<uint8_t>(qc, 0));
 	m_pendingFrameStartQueueWaitFenceValue.assign(qc, std::vector<UINT64>(qc, 0));
 }
@@ -8395,8 +8428,13 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 		// after the queue's final work for the frame. Marking every producer batch
 		// forces extra submissions in the parallel path.
 		for (size_t queueIndex = 0; queueIndex < slotCount; ++queueIndex) {
-			if (queueIndex >= m_compiledLastProducerBatchByResourceByQueue.size()) continue;
-			if (m_compiledLastProducerBatchByResourceByQueue[queueIndex].empty()) continue;
+			const bool hasProducers =
+				queueIndex < m_compiledLastProducerBatchByResourceByQueue.size()
+				&& !m_compiledLastProducerBatchByResourceByQueue[queueIndex].empty();
+			const bool hasAccesses =
+				queueIndex < m_compiledLastAccessBatchByResourceByQueue.size()
+				&& !m_compiledLastAccessBatchByResourceByQueue[queueIndex].empty();
+			if (!hasProducers && !hasAccesses) continue;
 
 			const unsigned int signalBatch = lastCrossFrameSignalBatchByQueue[queueIndex];
 			if (signalBatch > 0 && signalBatch < batches.size()) {
@@ -8407,7 +8445,8 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 					"RenderGraph::Execute frame={} queue slot {} has {} cross-frame producers but no active batch to signal.",
 					static_cast<unsigned>(context.frameIndex),
 					queueIndex,
-					m_compiledLastProducerBatchByResourceByQueue[queueIndex].size());
+					(hasProducers ? m_compiledLastProducerBatchByResourceByQueue[queueIndex].size() : 0)
+						+ (hasAccesses ? m_compiledLastAccessBatchByResourceByQueue[queueIndex].size() : 0));
 			}
 		}
 	}
@@ -8424,6 +8463,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 	}
 
 	auto& nextLastProducerByResourceAcrossFrames = m_lastProducerByResourceAcrossFrames;
+	auto& nextLastAccessByResourceAcrossFrames = m_lastAccessByResourceAcrossFrames;
 	auto& nextLastAliasPlacementProducersByPoolAcrossFrames = m_lastAliasPlacementProducersByPoolAcrossFrames;
 
 	auto removeResourceFromLastAliasPlacementCache = [&](uint64_t resourceID) {
@@ -9315,20 +9355,25 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 			return false;
 		};
 
-		// Update across-frame producer tracking (no aliasing remapping).
-		// Publish the end-of-frame signal for each queue that produced cross-frame
-		// resources. Timeline signals are monotonic, so waiting on a resource's
-		// producer can safely wait for the queue's final signal from the frame.
+		// Publish the end-of-frame signal for each queue that accessed a tracked
+		// resource. Producers protect later reads; all accesses protect later
+		// writes from prior read-only consumers and state transitions.
 		for (size_t queueIndex = 0; queueIndex < slotCount; ++queueIndex) {
-			if (queueIndex >= m_compiledLastProducerBatchByResourceByQueue.size()) continue;
-			if (m_compiledLastProducerBatchByResourceByQueue[queueIndex].empty()) continue;
+			const bool hasProducers =
+				queueIndex < m_compiledLastProducerBatchByResourceByQueue.size()
+				&& !m_compiledLastProducerBatchByResourceByQueue[queueIndex].empty();
+			const bool hasAccesses =
+				queueIndex < m_compiledLastAccessBatchByResourceByQueue.size()
+				&& !m_compiledLastAccessBatchByResourceByQueue[queueIndex].empty();
+			if (!hasProducers && !hasAccesses) continue;
 
 			const unsigned int signalBatch = lastCrossFrameSignalBatchByQueue[queueIndex];
 			if (signalBatch == 0 || signalBatch >= batches.size()) {
 				spdlog::warn(
 					"Cross-frame producer skip: slot {} has {} tracked resources but no active batch signal.",
 					queueIndex,
-					m_compiledLastProducerBatchByResourceByQueue[queueIndex].size());
+					(hasProducers ? m_compiledLastProducerBatchByResourceByQueue[queueIndex].size() : 0)
+						+ (hasAccesses ? m_compiledLastAccessBatchByResourceByQueue[queueIndex].size() : 0));
 				continue;
 			}
 
@@ -9346,6 +9391,35 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 				continue;
 			}
 
+			if (hasAccesses) {
+				for (const auto& [resourceID, accessBatch] : m_compiledLastAccessBatchByResourceByQueue[queueIndex]) {
+					if (accessBatch == 0 || accessBatch >= batches.size()) continue;
+
+					LastProducerAcrossFrames access{
+						.queueSlot = queueIndex,
+						.fenceValue = fenceValue,
+						.publishSerial = publishSerial,
+						.anonymous = isAnonymousTrackedResource(resourceID),
+					};
+					auto& accesses = nextLastAccessByResourceAcrossFrames[resourceID];
+					auto existing = std::find_if(
+						accesses.begin(),
+						accesses.end(),
+						[&](const LastProducerAcrossFrames& prior) {
+							return prior.queueSlot == queueIndex;
+						});
+					if (existing != accesses.end()) {
+						*existing = access;
+					}
+					else {
+						accesses.push_back(access);
+					}
+				}
+			}
+
+			if (!hasProducers) {
+				continue;
+			}
 			for (const auto& [resourceID, producerBatch] : m_compiledLastProducerBatchByResourceByQueue[queueIndex]) {
 				if (producerBatch == 0 || producerBatch >= batches.size()) continue;
 
@@ -9394,6 +9468,21 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 					return entry.second.publishSerial != m_crossFrameProducerPublishSerial;
 				}
 				return !liveResourceIDs.contains(entry.first) && !isLiveResourceID(entry.first);
+			});
+
+		std::erase_if(
+			nextLastAccessByResourceAcrossFrames,
+			[&](auto& entry) {
+				auto& accesses = entry.second;
+				std::erase_if(
+					accesses,
+					[&](const LastProducerAcrossFrames& access) {
+						if (access.anonymous) {
+							return access.publishSerial != m_crossFrameProducerPublishSerial;
+						}
+						return !liveResourceIDs.contains(entry.first) && !isLiveResourceID(entry.first);
+					});
+				return accesses.empty();
 			});
 
 		for (auto itPool = nextLastAliasPlacementProducersByPoolAcrossFrames.begin();

@@ -5450,12 +5450,14 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 	CoalesceQueueWaitsAndSignals(batches);
 
 	std::vector<std::unordered_map<uint64_t, unsigned int>> crossFrameProducer(queueCount);
+	std::vector<std::unordered_map<uint64_t, unsigned int>> crossFrameAccess(queueCount);
 	for (unsigned int batchIndex = 1; batchIndex < static_cast<unsigned int>(batches.size()); ++batchIndex) {
 		auto& batch = batches[batchIndex];
 		for (size_t queueIndex = 0; queueIndex < queueCount; ++queueIndex) {
 			for (auto& passVariant : batch.Passes(queueIndex)) {
 				std::visit([&](const auto* passEntry) {
 					ForEachFrameRequirement(passEntry->resources, [&](const auto& req) {
+						crossFrameAccess[queueIndex][req.resourceHandleAndRange.resource.GetGlobalResourceID()] = batchIndex;
 						if (AccessTypeIsWriteType(req.state.access)) {
 							crossFrameProducer[queueIndex][req.resourceHandleAndRange.resource.GetGlobalResourceID()] = batchIndex;
 						}
@@ -5465,6 +5467,7 @@ RenderGraph::ReplaySegmentVerificationReport RenderGraph::ReplayCurrentFrameSegm
 		}
 	}
 	m_compiledLastProducerBatchByResourceByQueue = std::move(crossFrameProducer);
+	m_compiledLastAccessBatchByResourceByQueue = std::move(crossFrameAccess);
 
 	report.checkedRequirements = 0;
 	for (const auto& trace : m_schedulingDecisionTrace) {
@@ -7773,7 +7776,8 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			size_t passQueueSlot,
 			size_t resourceIndex,
 			std::string_view passName,
-			uint64_t originalResourceID) {
+			uint64_t originalResourceID,
+			bool waitForPriorAccesses) {
 			if (resourceIndex >= m_frameSchedulingResourceIDByIndex.size()) {
 				return;
 			}
@@ -7784,6 +7788,29 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				}
 
 				const uint64_t rid = m_frameSchedulingResourceIDByIndex[candidateResourceIndex];
+				if (waitForPriorAccesses) {
+					if (auto accessIt = m_lastAccessByResourceAcrossFrames.find(rid);
+						accessIt != m_lastAccessByResourceAcrossFrames.end()) {
+						for (const auto& priorAccess : accessIt->second) {
+							markCrossFrameWait(
+								passQueueSlot,
+								priorAccess.queueSlot,
+								priorAccess.fenceValue);
+							if (passQueueSlot != priorAccess.queueSlot
+								&& m_getRenderGraphBatchTraceEnabled
+								&& m_getRenderGraphBatchTraceEnabled()) {
+								spdlog::info(
+									"RG cross-frame write-after-read wait: pass='{}' resource={} name='{}' dstSlot={} srcSlot={} fence={}",
+									passName,
+									rid,
+									resourceDebugName(rid),
+									passQueueSlot,
+									priorAccess.queueSlot,
+									priorAccess.fenceValue);
+							}
+						}
+					}
+				}
 				auto it = m_lastProducerByResourceAcrossFrames.find(rid);
 				if (it != m_lastProducerByResourceAcrossFrames.end()) {
 					markCrossFrameWait(passQueueSlot, it->second.queueSlot, it->second.fenceValue);
@@ -7871,6 +7898,22 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			}
 		};
 
+		std::vector<uint8_t> processedFirstWrite(m_frameSchedulingResourceCount, 0);
+		const auto shouldProcessFirstWrite = [&](size_t resourceIndex) {
+			if (resourceIndex >= processedFirstWrite.size() || processedFirstWrite[resourceIndex]) {
+				return false;
+			}
+			processedFirstWrite[resourceIndex] = 1;
+			if (resourceIndex < m_equivalentResourceIndicesByResourceIndex.size()) {
+				for (size_t equivalentResourceIndex : m_equivalentResourceIndicesByResourceIndex[resourceIndex]) {
+					if (equivalentResourceIndex < processedFirstWrite.size()) {
+						processedFirstWrite[equivalentResourceIndex] = 1;
+					}
+				}
+			}
+			return true;
+		};
+
 		for (size_t batchIndex = 0; batchIndex < batches.size(); ++batchIndex) {
 			const auto& batch = batches[batchIndex];
 			for (size_t queueIndex = 0; queueIndex < batch.QueueCount(); ++queueIndex) {
@@ -7894,7 +7937,17 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 									queueIndex,
 									*resourceIndex,
 									passName,
-									handle.GetGlobalResourceID());
+									handle.GetGlobalResourceID(),
+									false);
+							}
+							if (AccessTypeIsWriteType(req.state.access)
+								&& shouldProcessFirstWrite(*resourceIndex)) {
+								accumulateCrossFrameWaitForHandle(
+									queueIndex,
+									*resourceIndex,
+									passName,
+									handle.GetGlobalResourceID(),
+									true);
 							}
 						});
 						for (auto const& tr : passEntry->resources.internalTransitions) {
@@ -7911,7 +7964,8 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 									queueIndex,
 									*resourceIndex,
 									passName,
-									handle.GetGlobalResourceID());
+									handle.GetGlobalResourceID(),
+									false);
 							}
 						}
 					}, passVariant);
