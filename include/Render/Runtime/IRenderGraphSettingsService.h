@@ -34,17 +34,7 @@ public:
     virtual float GetQueueSchedulingCrossQueueHandoffPenalty() const = 0;
     virtual uint32_t GetAutoAliasPoolRetireIdleFrames() const = 0;
     virtual float GetAutoAliasPoolGrowthHeadroom() const = 0;
-    virtual RenderGraphRegionMode GetRenderGraphRegionMode() const = 0;
     virtual TransitionPlacementMode GetTransitionPlacementMode() const = 0;
-    virtual uint32_t GetRenderGraphRegionMinPassCount() const = 0;
-    virtual uint32_t GetRenderGraphRegionMaxPassCount() const = 0;
-    virtual bool GetRenderGraphRegionDiagnosticsEnabled() const = 0;
-    virtual bool GetRenderGraphRegionShadowStrictBatchMatch() const = 0;
-    virtual uint32_t GetRenderGraphReplaySegmentCacheMaxEntries() const = 0;
-    virtual uint32_t GetRenderGraphReplaySegmentCacheMaxVariants() const = 0;
-    virtual uint32_t GetRenderGraphReplaySegmentCacheMaxVariantsPerKey() const = 0;
-    virtual uint32_t GetRenderGraphReplaySegmentCacheMaxAgeFrames() const = 0;
-    virtual bool GetRenderGraphReplayRelaxAliasPlacement() const = 0;
     virtual bool GetHeavyDebug() const = 0;
 };
 

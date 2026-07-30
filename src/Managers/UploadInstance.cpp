@@ -7,7 +7,7 @@
 
 #include <rhi_helpers.h>
 #include <spdlog/spdlog.h>
-#include <tracy/Tracy.hpp>
+#include <BasicTelemetry/Tracy.h>
 
 #include "Resources/Buffers/Buffer.h"
 #include "Resources/Resource.h"
@@ -784,7 +784,7 @@ void UploadInstance::RecordProcessedUploadTelemetry(
 }
 
 void UploadInstance::ProcessDeferredReleases(uint8_t frameIndex) {
-	ZoneScopedN("UploadInstance::ProcessDeferredReleases");
+	BT_ZONE_SCOPE("UploadInstance::ProcessDeferredReleases");
 	std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
 	if (m_numFramesInFlight == 0) {
 		return;

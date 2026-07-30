@@ -19,8 +19,6 @@ using RGResourceNameByIdFn = std::function<std::string(uint64_t resourceId)>;
 using RGResourcePtrByIdFn = std::function<Resource*(uint64_t resourceId)>;
 using RGRequestReadbackCaptureFn = std::function<void(const std::string&, Resource*, const RangeSpec&, ReadbackCaptureCallback)>;
 
-using RGCacheOverlayProviderFn = std::function<std::vector<RGCacheOverlayRange>()>;
-
 struct RGInspectorOptions {
     // Horizontal placement within a batch (x spans [batch, batch+1])
     float blockLeftTransitions = 0.05f; // transitions start offset
@@ -37,8 +35,6 @@ struct RGInspectorOptions {
     std::function<ImTextureID(uint32_t)> imguiGpuHandle;
     rhi::DescriptorHeapHandle imguiHeapHandle{};
 
-    // Called only while the inspector's cache overlay toggle is enabled.
-    RGCacheOverlayProviderFn cacheOverlayProvider;
 };
 
 namespace RGInspector {

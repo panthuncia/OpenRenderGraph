@@ -1,7 +1,7 @@
 #pragma once
 
 #include <boost/container_hash/hash.hpp>
-#include <tracy/Tracy.hpp>
+#include <BasicTelemetry/Tracy.h>
 
 #include "RenderPasses/Base/CopyPass.h"
 #include "Render/Runtime/IReadbackService.h"
@@ -41,9 +41,9 @@ public:
     }
 
     void RecordImmediateCommands(ImmediateExecutionContext& context) override {
-        ZoneScopedN("ReadbackCopyCapturePass::RecordImmediateCommands");
+        BT_ZONE_SCOPE("ReadbackCopyCapturePass::RecordImmediateCommands");
         if (!m_debugCaptureName.empty()) {
-            ZoneText(m_debugCaptureName.c_str(), m_debugCaptureName.size());
+            BT_ZONE_TEXT(m_debugCaptureName.c_str(), m_debugCaptureName.size());
         }
 
         const auto& inputs = Inputs<ReadbackCopyCaptureInputs>();
@@ -87,7 +87,7 @@ public:
             if (!readbackBuffer) {
                 return;
             }
-            TracyPlot("Readback.CaptureRequestedBytes", static_cast<int64_t>(info.totalBytes));
+            BT_PLOT("Readback.CaptureRequestedBytes", static_cast<int64_t>(info.totalBytes));
 
             for (uint32_t slice = 0; slice < sr.sliceCount; ++slice) {
                 for (uint32_t mip = 0; mip < sr.mipCount; ++mip) {
@@ -126,7 +126,7 @@ public:
             if (!readbackBuffer) {
                 return;
             }
-            TracyPlot("Readback.CaptureRequestedBytes", static_cast<int64_t>(byteSize));
+            BT_PLOT("Readback.CaptureRequestedBytes", static_cast<int64_t>(byteSize));
 
             context.list.CopyBufferRegion(readbackBuffer, 0, resource, 0, byteSize);
 

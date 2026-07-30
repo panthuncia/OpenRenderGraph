@@ -4,7 +4,7 @@
 #include <unordered_set>
 #include <vector>
 
-#include <tracy/Tracy.hpp>
+#include <BasicTelemetry/Tracy.h>
 
 namespace rg::runtime {
 
@@ -70,7 +70,7 @@ public:
     }
 
     void FlushAll() override {
-        ZoneScopedN("DefaultUploadPolicyService::FlushAll");
+        BT_ZONE_SCOPE("DefaultUploadPolicyService::FlushAll");
         auto clients = SnapshotDirtyClients();
         uint64_t flushedClients = 0;
         uint64_t flushedWrites = 0;
@@ -79,15 +79,15 @@ public:
         for (auto* client : clients) {
             if (client && client->HasPendingUploadPolicyWork()) {
                 {
-                    ZoneScopedN("DefaultUploadPolicyService::FlushClient");
+                    BT_ZONE_SCOPE("DefaultUploadPolicyService::FlushClient");
                     const auto debugName = client->GetUploadPolicyDebugName();
                     if (!debugName.empty()) {
-                        ZoneText(debugName.data(), debugName.size());
+                        BT_ZONE_TEXT(debugName.data(), debugName.size());
                     }
                     client->OnUploadPolicyFlush();
                     const auto clientWrites = client->GetUploadPolicyLastFlushWrites();
                     const auto clientBytes = client->GetUploadPolicyLastFlushBytes();
-                    ZoneValue(clientBytes);
+                    BT_ZONE_VALUE(clientBytes);
                     flushedWrites += clientWrites;
                     flushedBytes += clientBytes;
                     ++flushedClients;

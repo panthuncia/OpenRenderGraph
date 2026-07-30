@@ -4,7 +4,7 @@
 #include <cstring>
 #include <iterator>
 #include <spdlog/spdlog.h>
-#include <tracy/Tracy.hpp>
+#include <BasicTelemetry/Tracy.h>
 
 #include "Resources/Buffers/Buffer.h"
 
@@ -58,7 +58,7 @@ void ReadbackManager::QueueDeferredRelease(std::vector<ReadbackCaptureRequest>&&
 
     EnsureReleaseWorker();
     {
-        ZoneScopedN("ReadbackManager::ProcessReadbackRequests::QueueDeferredRelease");
+        BT_ZONE_SCOPE("ReadbackManager::ProcessReadbackRequests::QueueDeferredRelease");
         std::lock_guard lock(m_releaseQueueMutex);
         m_deferredReleaseRequests.insert(
             m_deferredReleaseRequests.end(),
@@ -85,24 +85,24 @@ void ReadbackManager::ReleaseWorkerMain() {
         }
 
         {
-            ZoneScopedN("ReadbackManager::DeferredReleaseWorker::ReleaseRequests");
-            ZoneValue(releaseBatch.size());
+            BT_ZONE_SCOPE("ReadbackManager::DeferredReleaseWorker::ReleaseRequests");
+            BT_ZONE_VALUE(releaseBatch.size());
             releaseBatch.clear();
         }
     }
 }
 
 std::shared_ptr<Resource> ReadbackManager::AcquireReadbackBuffer(uint64_t byteSize, const char* debugName) {
-    ZoneScopedN("ReadbackManager::AcquireReadbackBuffer");
-    ZoneValue(byteSize);
-    TracyPlot("Readback.AcquireBufferBytes", static_cast<int64_t>(byteSize));
+    BT_ZONE_SCOPE("ReadbackManager::AcquireReadbackBuffer");
+    BT_ZONE_VALUE(byteSize);
+    BT_PLOT("Readback.AcquireBufferBytes", static_cast<int64_t>(byteSize));
 
     if (byteSize == 0) {
         return nullptr;
     }
 
     {
-        ZoneScopedN("ReadbackManager::AcquireReadbackBuffer::PoolLookup");
+        BT_ZONE_SCOPE("ReadbackManager::AcquireReadbackBuffer::PoolLookup");
         std::lock_guard lock(m_readbackBufferPoolMutex);
 
         size_t bestIndex = m_readbackBufferPool.size();
@@ -131,15 +131,15 @@ std::shared_ptr<Resource> ReadbackManager::AcquireReadbackBuffer(uint64_t byteSi
             if (debugName) {
                 buffer->SetName(debugName);
             }
-            TracyPlot("Readback.BufferPoolHits", int64_t{1});
-            TracyPlot("Readback.BufferPoolBytes", static_cast<int64_t>(m_readbackBufferPoolBytes));
+            BT_PLOT("Readback.BufferPoolHits", int64_t{1});
+            BT_PLOT("Readback.BufferPoolBytes", static_cast<int64_t>(m_readbackBufferPoolBytes));
             return buffer;
         }
     }
 
-    TracyPlot("Readback.BufferPoolHits", int64_t{0});
+    BT_PLOT("Readback.BufferPoolHits", int64_t{0});
     {
-        ZoneScopedN("ReadbackManager::AcquireReadbackBuffer::Create");
+        BT_ZONE_SCOPE("ReadbackManager::AcquireReadbackBuffer::Create");
         auto buffer = Buffer::CreateShared(rhi::HeapType::Readback, byteSize);
         if (debugName) {
             buffer->SetName(debugName);
@@ -149,7 +149,7 @@ std::shared_ptr<Resource> ReadbackManager::AcquireReadbackBuffer(uint64_t byteSi
 }
 
 void ReadbackManager::RecycleReadbackBuffer(std::shared_ptr<Resource>&& buffer) {
-    ZoneScopedN("ReadbackManager::RecycleReadbackBuffer");
+    BT_ZONE_SCOPE("ReadbackManager::RecycleReadbackBuffer");
     if (!buffer) {
         return;
     }
@@ -159,19 +159,19 @@ void ReadbackManager::RecycleReadbackBuffer(std::shared_ptr<Resource>&& buffer) 
         return;
     }
 
-    ZoneValue(byteSize);
+    BT_ZONE_VALUE(byteSize);
     std::lock_guard lock(m_readbackBufferPoolMutex);
     if (m_readbackBufferPool.size() >= kReadbackBufferPoolMaxBuffers ||
         m_readbackBufferPoolBytes + byteSize > kReadbackBufferPoolMaxBytes) {
-        TracyPlot("Readback.BufferPoolDrops", int64_t{1});
+        BT_PLOT("Readback.BufferPoolDrops", int64_t{1});
         return;
     }
 
     m_readbackBufferPoolBytes += byteSize;
     m_readbackBufferPool.push_back(std::move(buffer));
-    TracyPlot("Readback.BufferPoolDrops", int64_t{0});
-    TracyPlot("Readback.BufferPoolSize", static_cast<int64_t>(m_readbackBufferPool.size()));
-    TracyPlot("Readback.BufferPoolBytes", static_cast<int64_t>(m_readbackBufferPoolBytes));
+    BT_PLOT("Readback.BufferPoolDrops", int64_t{0});
+    BT_PLOT("Readback.BufferPoolSize", static_cast<int64_t>(m_readbackBufferPool.size()));
+    BT_PLOT("Readback.BufferPoolBytes", static_cast<int64_t>(m_readbackBufferPoolBytes));
 }
 
 void ReadbackManager::RequestReadbackCapture(
@@ -181,8 +181,8 @@ void ReadbackManager::RequestReadbackCapture(
     ReadbackCaptureCallback callback,
     QueueKind preferredQueueKind)
 {
-    ZoneScopedN("ReadbackManager::RequestReadbackCapture");
-    ZoneText(passName.c_str(), passName.size());
+    BT_ZONE_SCOPE("ReadbackManager::RequestReadbackCapture");
+    BT_ZONE_TEXT(passName.c_str(), passName.size());
 
     std::weak_ptr<Resource> weakResource;
     uint64_t resourceId = 0;
@@ -200,7 +200,7 @@ void ReadbackManager::RequestReadbackCapture(
         std::move(callback),
         preferredQueueKind
         });
-    TracyPlot("Readback.QueuedCaptures", static_cast<int64_t>(m_queuedCaptures.size()));
+    BT_PLOT("Readback.QueuedCaptures", static_cast<int64_t>(m_queuedCaptures.size()));
 }
 
 std::vector<ReadbackCaptureInfo> ReadbackManager::ConsumeCaptureRequests() {
@@ -246,16 +246,16 @@ uint64_t ReadbackManager::GetNextReadbackFenceValue(QueueKind queueKind) {
 }
 
 void ReadbackManager::ProcessReadbackRequests() {
-    ZoneScopedN("ReadbackManager::ProcessReadbackRequests");
+    BT_ZONE_SCOPE("ReadbackManager::ProcessReadbackRequests");
     std::vector<ReadbackCaptureRequest> pendingCaptures;
     {
-        ZoneScopedN("ReadbackManager::ProcessReadbackRequests::AcquirePendingLock");
+        BT_ZONE_SCOPE("ReadbackManager::ProcessReadbackRequests::AcquirePendingLock");
         std::lock_guard<std::mutex> lock(readbackRequestsMutex);
         pendingCaptures.swap(m_readbackCaptureRequests);
     }
 
-    ZoneValue(pendingCaptures.size());
-    TracyPlot("Readback.PendingCaptures", static_cast<int64_t>(pendingCaptures.size()));
+    BT_ZONE_VALUE(pendingCaptures.size());
+    BT_PLOT("Readback.PendingCaptures", static_cast<int64_t>(pendingCaptures.size()));
 
     if (!m_initialized) {
         if (!m_warnedUninitializedUse) {
@@ -263,7 +263,7 @@ void ReadbackManager::ProcessReadbackRequests() {
             m_warnedUninitializedUse = true;
         }
         if (!pendingCaptures.empty()) {
-            ZoneScopedN("ReadbackManager::ProcessReadbackRequests::RestoreUninitializedPending");
+            BT_ZONE_SCOPE("ReadbackManager::ProcessReadbackRequests::RestoreUninitializedPending");
             std::lock_guard<std::mutex> lock(readbackRequestsMutex);
             if (m_readbackCaptureRequests.empty()) {
                 m_readbackCaptureRequests = std::move(pendingCaptures);
@@ -289,8 +289,8 @@ void ReadbackManager::ProcessReadbackRequests() {
     uint64_t cachedGraphicsCompletedValue = 0;
     uint64_t cachedCopyCompletedValue = 0;
     for (auto& request : pendingCaptures) {
-        ZoneScopedN("ReadbackManager::ProcessReadbackRequests::Request");
-        ZoneValue(request.totalSize);
+        BT_ZONE_SCOPE("ReadbackManager::ProcessReadbackRequests::Request");
+        BT_ZONE_VALUE(request.totalSize);
         char requestText[128]{};
         std::snprintf(
             requestText,
@@ -299,7 +299,7 @@ void ReadbackManager::ProcessReadbackRequests() {
             static_cast<unsigned long long>(request.token),
             static_cast<unsigned long long>(request.desc.resourceId),
             static_cast<unsigned long long>(request.totalSize));
-        ZoneText(requestText, std::strlen(requestText));
+        BT_ZONE_TEXT(requestText, std::strlen(requestText));
 
         if (request.fenceValue == 0) {
             spdlog::warn(
@@ -312,7 +312,7 @@ void ReadbackManager::ProcessReadbackRequests() {
         rhi::Timeline requestFence;
         uint64_t completedValue = 0;
         {
-            ZoneScopedN("ReadbackManager::ProcessReadbackRequests::GetCompletedValue");
+            BT_ZONE_SCOPE("ReadbackManager::ProcessReadbackRequests::GetCompletedValue");
             if (request.signalFenceOwner && *request.signalFenceOwner) {
                 requestFence = request.signalFenceOwner->Get();
                 completedValue = requestFence.GetCompletedValue();
@@ -361,13 +361,13 @@ void ReadbackManager::ProcessReadbackRequests() {
 
             void* mappedData = nullptr;
             {
-                ZoneScopedN("ReadbackManager::ProcessReadbackRequests::Map");
+                BT_ZONE_SCOPE("ReadbackManager::ProcessReadbackRequests::Map");
                 request.readbackBuffer->GetAPIResource().Map(&mappedData);
             }
 
             ReadbackCaptureResult result{};
             {
-                ZoneScopedN("ReadbackManager::ProcessReadbackRequests::PrepareResult");
+                BT_ZONE_SCOPE("ReadbackManager::ProcessReadbackRequests::PrepareResult");
                 result.desc = request.desc;
                 result.layouts = request.layouts;
                 result.format = request.format;
@@ -378,17 +378,17 @@ void ReadbackManager::ProcessReadbackRequests() {
             }
 
             {
-                ZoneScopedN("ReadbackManager::ProcessReadbackRequests::CopyBytes");
+                BT_ZONE_SCOPE("ReadbackManager::ProcessReadbackRequests::CopyBytes");
                 std::memcpy(result.data.data(), mappedData, request.totalSize);
             }
             {
-                ZoneScopedN("ReadbackManager::ProcessReadbackRequests::Unmap");
+                BT_ZONE_SCOPE("ReadbackManager::ProcessReadbackRequests::Unmap");
                 request.readbackBuffer->GetAPIResource().Unmap(0, 0);
             }
 
             if (request.callback) {
                 ++callbackCount;
-                ZoneScopedN("ReadbackManager::ProcessReadbackRequests::Callback");
+                BT_ZONE_SCOPE("ReadbackManager::ProcessReadbackRequests::Callback");
                 request.callback(std::move(result));
             }
 
@@ -403,7 +403,7 @@ void ReadbackManager::ProcessReadbackRequests() {
     }
 
     {
-        ZoneScopedN("ReadbackManager::ProcessReadbackRequests::MergeRemaining");
+        BT_ZONE_SCOPE("ReadbackManager::ProcessReadbackRequests::MergeRemaining");
         std::lock_guard<std::mutex> lock(readbackRequestsMutex);
         if (m_readbackCaptureRequests.empty()) {
             m_readbackCaptureRequests = std::move(remainingCaptures);
@@ -418,11 +418,11 @@ void ReadbackManager::ProcessReadbackRequests() {
     }
 
     {
-        ZoneScopedN("ReadbackManager::ProcessReadbackRequests::DeferCompletedRelease");
+        BT_ZONE_SCOPE("ReadbackManager::ProcessReadbackRequests::DeferCompletedRelease");
         QueueDeferredRelease(std::move(pendingCaptures));
     }
 
-    TracyPlot("Readback.CompletedCaptures", static_cast<int64_t>(completedCaptureCount));
-    TracyPlot("Readback.CompletedBytes", static_cast<int64_t>(completedBytes));
-    TracyPlot("Readback.Callbacks", static_cast<int64_t>(callbackCount));
+    BT_PLOT("Readback.CompletedCaptures", static_cast<int64_t>(completedCaptureCount));
+    BT_PLOT("Readback.CompletedBytes", static_cast<int64_t>(completedBytes));
+    BT_PLOT("Readback.Callbacks", static_cast<int64_t>(callbackCount));
 }

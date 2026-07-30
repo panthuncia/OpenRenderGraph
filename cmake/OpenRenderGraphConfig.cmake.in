@@ -3,6 +3,7 @@
 include(CMakeFindDependencyMacro)
 
 find_dependency(BasicRHI CONFIG REQUIRED)
+find_dependency(BasicTelemetry CONFIG REQUIRED)
 find_dependency(spdlog CONFIG REQUIRED)
 find_dependency(flecs CONFIG REQUIRED)
 find_dependency(Boost REQUIRED COMPONENTS container_hash)

@@ -14,7 +14,7 @@
 #include <vector>
 
 #include <spdlog/spdlog.h>
-#include <tracy/Tracy.hpp>
+#include <BasicTelemetry/Tracy.h>
 
 #include "Managers/Singletons/DeviceManager.h"
 #include "Managers/Singletons/DescriptorHeapManager.h"
@@ -105,7 +105,7 @@ AsyncBufferBackingResizeState::AsyncBufferBackingResizeState()
 AsyncBufferBackingResizeState::~AsyncBufferBackingResizeState() = default;
 
 void AsyncBufferBackingResizeState::Request(const AsyncBufferBackingResizeRequest& request) {
-    ZoneScopedN("AsyncBufferBackingResizeState::Request");
+    BT_ZONE_SCOPE("AsyncBufferBackingResizeState::Request");
     if (request.byteSize == 0) {
         return;
     }
@@ -126,14 +126,14 @@ void AsyncBufferBackingResizeState::Request(const AsyncBufferBackingResizeReques
             const bool readyFailed = static_cast<bool>(state->readyResult.exception);
             const bool readyTooSmall = !readyFailed && state->readyResult.byteSize < state->desiredByteSize;
             if (readyFailed || readyTooSmall) {
-                TracyPlot("AsyncBufferBackingResize.StaleReadyBytes", static_cast<int64_t>(state->readyResult.byteSize));
+                BT_PLOT("AsyncBufferBackingResize.StaleReadyBytes", static_cast<int64_t>(state->readyResult.byteSize));
                 state->readyResult = {};
                 state->readyValid = false;
             }
         }
 
         if (state->inFlight || state->readyValid) {
-            TracyPlot("AsyncBufferBackingResize.CoalescedDesiredBytes", static_cast<int64_t>(state->desiredByteSize));
+            BT_PLOT("AsyncBufferBackingResize.CoalescedDesiredBytes", static_cast<int64_t>(state->desiredByteSize));
             return;
         }
 
@@ -149,7 +149,7 @@ void AsyncBufferBackingResizeState::Request(const AsyncBufferBackingResizeReques
 }
 
 std::optional<AsyncBufferBackingResizeResult> AsyncBufferBackingResizeState::ConsumeReady(bool wait) {
-    ZoneScopedN("AsyncBufferBackingResizeState::ConsumeReady");
+    BT_ZONE_SCOPE("AsyncBufferBackingResizeState::ConsumeReady");
     auto state = m_state;
 
     for (;;) {
@@ -158,24 +158,24 @@ std::optional<AsyncBufferBackingResizeResult> AsyncBufferBackingResizeState::Con
         {
             std::unique_lock<std::mutex> lock(state->mutex);
             if (wait) {
-                ZoneScopedN("AsyncBufferBackingResizeState::ConsumeReady::Wait");
+                BT_ZONE_SCOPE("AsyncBufferBackingResizeState::ConsumeReady::Wait");
                 state->cv.wait(lock, [&]() {
                     return state->readyValid || !state->inFlight;
                 });
             } else if (!state->readyValid) {
-                TracyPlot("AsyncBufferBackingResize.Ready", int64_t{ 0 });
+                BT_PLOT("AsyncBufferBackingResize.Ready", int64_t{ 0 });
                 return std::nullopt;
             }
 
             if (!state->readyValid) {
-                TracyPlot("AsyncBufferBackingResize.Ready", int64_t{ 0 });
+                BT_PLOT("AsyncBufferBackingResize.Ready", int64_t{ 0 });
                 return std::nullopt;
             }
 
             auto result = std::move(state->readyResult);
             state->readyResult = {};
             state->readyValid = false;
-            TracyPlot("AsyncBufferBackingResize.Ready", int64_t{ 1 });
+            BT_PLOT("AsyncBufferBackingResize.Ready", int64_t{ 1 });
 
             if (result.exception) {
                 state->desiredByteSize = 0;
@@ -189,7 +189,7 @@ std::optional<AsyncBufferBackingResizeResult> AsyncBufferBackingResizeState::Con
                 return result;
             }
 
-            TracyPlot("AsyncBufferBackingResize.StaleResultBytes", static_cast<int64_t>(result.byteSize));
+            BT_PLOT("AsyncBufferBackingResize.StaleResultBytes", static_cast<int64_t>(result.byteSize));
             if (!state->inFlight) {
                 scheduleToken = ++state->nextToken;
                 state->inFlight = true;
@@ -228,11 +228,11 @@ void AsyncBufferBackingResizeState::Schedule(
     AsyncBufferBackingResizeRequest request,
     uint64_t token)
 {
-    ZoneScopedN("AsyncBufferBackingResizeState::Schedule");
-    TracyPlot("AsyncBufferBackingResize.ScheduledBytes", static_cast<int64_t>(request.byteSize));
+    BT_ZONE_SCOPE("AsyncBufferBackingResizeState::Schedule");
+    BT_PLOT("AsyncBufferBackingResize.ScheduledBytes", static_cast<int64_t>(request.byteSize));
 
     auto task = [state = std::move(state), request = std::move(request), token]() mutable {
-        ZoneScopedN("AsyncBufferBackingResizeState::WorkerCreateBacking");
+        BT_ZONE_SCOPE("AsyncBufferBackingResizeState::WorkerCreateBacking");
         AsyncBufferBackingResizeResult result;
         result.byteSize = request.byteSize;
         result.requestToken = token;

@@ -99,48 +99,8 @@ public:
         return GetOpenRenderGraphSettings().autoAliasPoolGrowthHeadroom;
     }
 
-    RenderGraphRegionMode GetRenderGraphRegionMode() const override {
-        return GetOpenRenderGraphSettings().renderGraphRegionMode;
-    }
-
     TransitionPlacementMode GetTransitionPlacementMode() const override {
         return GetOpenRenderGraphSettings().transitionPlacementMode;
-    }
-
-    uint32_t GetRenderGraphRegionMinPassCount() const override {
-        return GetOpenRenderGraphSettings().renderGraphRegionMinPassCount;
-    }
-
-    uint32_t GetRenderGraphRegionMaxPassCount() const override {
-        return GetOpenRenderGraphSettings().renderGraphRegionMaxPassCount;
-    }
-
-    bool GetRenderGraphRegionDiagnosticsEnabled() const override {
-        return GetOpenRenderGraphSettings().renderGraphRegionDiagnosticsEnabled;
-    }
-
-    bool GetRenderGraphRegionShadowStrictBatchMatch() const override {
-        return GetOpenRenderGraphSettings().renderGraphRegionShadowStrictBatchMatch;
-    }
-
-    uint32_t GetRenderGraphReplaySegmentCacheMaxEntries() const override {
-        return GetOpenRenderGraphSettings().renderGraphReplaySegmentCacheMaxEntries;
-    }
-
-    uint32_t GetRenderGraphReplaySegmentCacheMaxVariants() const override {
-        return GetOpenRenderGraphSettings().renderGraphReplaySegmentCacheMaxVariants;
-    }
-
-    uint32_t GetRenderGraphReplaySegmentCacheMaxVariantsPerKey() const override {
-        return GetOpenRenderGraphSettings().renderGraphReplaySegmentCacheMaxVariantsPerKey;
-    }
-
-    uint32_t GetRenderGraphReplaySegmentCacheMaxAgeFrames() const override {
-        return GetOpenRenderGraphSettings().renderGraphReplaySegmentCacheMaxAgeFrames;
-    }
-
-    bool GetRenderGraphReplayRelaxAliasPlacement() const override {
-        return GetOpenRenderGraphSettings().renderGraphReplayRelaxAliasPlacement;
     }
 
     bool GetHeavyDebug() const override {

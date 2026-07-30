@@ -173,6 +173,9 @@ public:
     virtual void SetName(const std::string& newName) { this->name = newName; OnSetName(); }
 	virtual rhi::Resource GetAPIResource() = 0;
     virtual uint64_t GetGlobalResourceID() const { return m_globalResourceID; }
+	// Identity used by render-graph scheduling. Dynamic wrappers override this so
+	// dependency identity remains stable when their backing resource changes.
+	virtual uint64_t GetSchedulingResourceID() const { return GetGlobalResourceID(); }
     virtual rhi::BarrierBatch GetEnhancedBarrierGroup(RangeSpec range, rhi::ResourceAccessType prevAccessType, rhi::ResourceAccessType newAccessType, rhi::ResourceLayout prevLayout, rhi::ResourceLayout newLayout, rhi::ResourceSyncState prevSyncState, rhi::ResourceSyncState newSyncState) = 0;
 	bool HasLayout() const { return m_hasLayout; }
 	void AddAliasedResource(Resource* resource) {

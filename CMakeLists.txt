@@ -45,6 +45,20 @@ if(NOT TARGET BasicRHI::BasicRHI)
     message(FATAL_ERROR "OpenRenderGraph requires BasicRHI::BasicRHI. Install BasicRHI package or provide BasicRHI as submodule.")
 endif()
 
+find_package(BasicTelemetry CONFIG QUIET)
+if(NOT TARGET BasicTelemetry::Core AND OPENRENDERGRAPH_ENABLE_SUBMODULE_FALLBACK)
+    if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/../BasicTelemetry/CMakeLists.txt")
+        set(BASICTELEMETRY_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+        set(BASICTELEMETRY_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+        add_subdirectory(
+            "${CMAKE_CURRENT_LIST_DIR}/../BasicTelemetry"
+            "${CMAKE_BINARY_DIR}/_deps/BasicTelemetry")
+    endif()
+endif()
+if(NOT TARGET BasicTelemetry::Core OR NOT TARGET BasicTelemetry::Tracy)
+    message(FATAL_ERROR "OpenRenderGraph requires BasicTelemetry::Core and BasicTelemetry::Tracy.")
+endif()
+
 find_package(spdlog CONFIG REQUIRED)
 find_package(flecs CONFIG REQUIRED)
 find_package(Boost REQUIRED COMPONENTS container_hash)
@@ -54,10 +68,8 @@ if(TARGET imgui::imgui)
 endif()
 find_package(implot CONFIG REQUIRED)
 find_package(slang CONFIG REQUIRED)
-find_package(Tracy REQUIRED CONFIG)
 if(COMMAND basicrenderer_use_release_library_for_debug)
     basicrenderer_use_release_library_for_debug(fmt::fmt)
-    basicrenderer_use_release_library_for_debug(Tracy::TracyClient)
 endif()
 
 add_library(OpenRenderGraph STATIC
@@ -82,7 +94,7 @@ add_library(OpenRenderGraph STATIC
     
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PassBuilders.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraph.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraphCache.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraphCompile.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraphCompileProfile.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/Aliasing/RenderGraphAliasingSubsystem.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/Aliasing/RenderGraphAliasingAlgorithms.cpp"
@@ -123,12 +135,13 @@ target_include_directories(OpenRenderGraph
 target_link_libraries(OpenRenderGraph
     PUBLIC
         BasicRHI::BasicRHI
+        BasicTelemetry::Core
+        BasicTelemetry::Tracy
         flecs::flecs
         Boost::container_hash
         imgui::imgui
         implot::implot
         slang::slang
-        Tracy::TracyClient
     PRIVATE
         spdlog::spdlog_header_only
 )

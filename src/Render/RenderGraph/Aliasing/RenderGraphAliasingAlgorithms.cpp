@@ -10,7 +10,7 @@
 #include <numeric>
 #include <queue>
 #include <sstream>
-#include <tracy/Tracy.hpp>
+#include <BasicTelemetry/Tracy.h>
 #include <tuple>
 
 #include <rhi_helpers.h>
@@ -667,7 +667,7 @@ namespace {
 bool AccessTypeIsWriteOrCommon(rhi::ResourceAccessType t);
 
 rg::alias::FrameAliasAnalysis& rg::alias::RenderGraphAliasingSubsystem::BuildAliasFrameAnalysis(RenderGraph& rg, const std::vector<AliasSchedulingNode>& nodes) const {
-	ZoneScopedN("RenderGraphAliasingSubsystem::BuildAliasFrameAnalysis");
+	BT_ZONE_SCOPE("RenderGraphAliasingSubsystem::BuildAliasFrameAnalysis");
 	FrameAliasAnalysis& analysis = rg.m_aliasFrameAnalysisScratch;
 	analysis.maxNodeCriticality = 1;
 	analysis.candidateResourceIndices.clear();
@@ -894,7 +894,7 @@ rg::alias::FrameAliasAnalysis& rg::alias::RenderGraphAliasingSubsystem::BuildAli
 }
 
 void rg::alias::RenderGraphAliasingSubsystem::AutoAssignAliasingPoolsFromAnalysis(RenderGraph& rg, FrameAliasAnalysis& analysis) const {
-	ZoneScopedN("RenderGraphAliasingSubsystem::AutoAssignAliasingPoolsFromAnalysis");
+	BT_ZONE_SCOPE("RenderGraphAliasingSubsystem::AutoAssignAliasingPoolsFromAnalysis");
 	auto& autoAliasPoolByID = rg.autoAliasPoolByID;
 	auto& autoAliasExclusionReasonByID = rg.autoAliasExclusionReasonByID;
 	auto& autoAliasExclusionReasonSummary = rg.autoAliasExclusionReasonSummary;
@@ -1134,7 +1134,7 @@ bool AccessTypeIsWriteOrCommon(rhi::ResourceAccessType t) {
 }
 
 void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderGraph& rg, const FrameAliasAnalysis& analysis) const {
-	ZoneScopedN("RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis");
+	BT_ZONE_SCOPE("RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis");
 	auto& aliasMaterializeOptionsByID = rg.aliasMaterializeOptionsByID;
 	auto& aliasMaterializeOptionsByResourceIndex = rg.m_aliasMaterializeOptionsByResourceIndex;
 	auto& aliasMaterializeResourceIDs = rg.m_aliasMaterializeResourceIDs;
@@ -2308,7 +2308,7 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph
 }
 
 void rg::alias::RenderGraphAliasingSubsystem::ApplyAliasQueueSynchronization(RenderGraph& rg) const {
-	ZoneScopedN("RenderGraphAliasingSubsystem::ApplyAliasQueueSynchronization");
+	BT_ZONE_SCOPE("RenderGraphAliasingSubsystem::ApplyAliasQueueSynchronization");
 	auto& batches = rg.batches;
 	const size_t slotCount = std::min<size_t>(rg.GetQueueRegistry().SlotCount(), 64);
 	auto& batchUsage = rg.m_aliasQueueSyncBatchUsageScratch;

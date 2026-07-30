@@ -14,7 +14,7 @@
 #include <algorithm>
 #include <spdlog/spdlog.h>
 #include <rhi.h>
-#include <tracy/Tracy.hpp>
+#include <BasicTelemetry/Tracy.h>
 
 #include "RenderPasses/Base/RenderPass.h"
 #include "RenderPasses/Base/ComputePass.h"
@@ -52,12 +52,6 @@ struct IDynamicDeclaredResources;
 namespace ui {
 	struct FrameGraphSnapshot;
 }
-
-struct RGCacheOverlayRange {
-	uint32_t firstBatch = 0;
-	uint32_t lastBatch = 0;
-	bool cached = false;
-};
 
 template<typename T>
 concept DerivedResource = std::derived_from<T, Resource>;
@@ -110,8 +104,6 @@ enum class AutoAliasPackingStrategy : uint8_t {
 
 class RenderGraph {
 public:
-	friend class rg::profile::ScopedCompileProfileStep;
-
 	enum class ExternalInsertKind : uint8_t { Begin, End, Before, After };
 
 	struct ExternalInsertPoint {
@@ -653,7 +645,6 @@ public:
 	std::optional<PresentDependency> GetLastPresentDependency() const noexcept { return m_lastPresentDependency; }
 	rg::memory::SnapshotProvider& GetMemorySnapshotProvider() { return m_memorySnapshotProvider; }
 	const rg::memory::SnapshotProvider& GetMemorySnapshotProvider() const { return m_memorySnapshotProvider; }
-	std::vector<RGCacheOverlayRange> BuildReplayCacheOverlayRanges() const;
 	void SetStatisticsService(std::shared_ptr<rg::runtime::IStatisticsService> service) { m_statisticsService = std::move(service); }
 	rg::runtime::IStatisticsService* GetStatisticsService() { return m_statisticsService.get(); }
 	const rg::runtime::IStatisticsService* GetStatisticsService() const { return m_statisticsService.get(); }
@@ -672,10 +663,8 @@ public:
 	void SetTaskService(std::shared_ptr<rg::runtime::ITaskService> service) { m_taskService = std::move(service); }
 	rg::runtime::ITaskService* GetTaskService() { return m_taskService.get(); }
 	const rg::runtime::ITaskService* GetTaskService() const { return m_taskService.get(); }
-	void SetCompileProfileSink(std::shared_ptr<rg::profile::ICompileProfileSink> sink);
 	void SetCompileProfileEnabled(bool enabled) noexcept;
 	bool GetCompileProfileEnabled() const noexcept { return m_compileProfileEnabled; }
-	const rg::profile::CompileProfileFrame& GetLastCompileProfileFrame() const noexcept { return m_lastCompileProfileFrame; }
 	void SetStructuralMaterializeCheckpointCallback(std::function<void(std::string_view)> callback) {
 		m_structuralMaterializeCheckpointCallback = std::move(callback);
 	}
@@ -974,354 +963,6 @@ private:
 		bool valid = false;
 	};
 
-	enum class RegionRejectReason : uint8_t {
-		QueueSlotChange = 0,
-		PassCountBelowThreshold,
-		ImmediateWork,
-		FrameExtensionPass,
-		DeclarationRefreshedThisFrame,
-		InteriorIncomingEdge,
-		InteriorOutgoingEdge,
-		AliasActivation,
-		AliasPlacementInstability,
-		CrossQueueSync,
-		GraphicsFallbackTransition,
-		UnsupportedSubresourceState,
-		BatchHazardBoundary,
-		Count
-	};
-
-	struct ScheduledRegion {
-		uint32_t firstTraceIndex = 0;
-		uint32_t lastTraceIndex = 0;
-		uint32_t firstPassIndex = 0;
-		uint32_t lastPassIndex = 0;
-		uint32_t firstBatchIndex = 0;
-		uint32_t lastBatchIndex = 0;
-		uint16_t queueSlot = 0;
-		uint32_t passCount = 0;
-		uint32_t requirementCount = 0;
-		uint32_t batchCount = 0;
-		uint32_t transitionCount = 0;
-		uint32_t boundaryInputEdgeCount = 0;
-		uint32_t boundaryOutputEdgeCount = 0;
-		uint32_t crossQueueBoundaryInputEdgeCount = 0;
-		uint32_t crossQueueBoundaryOutputEdgeCount = 0;
-		uint32_t boundarySyncCount = 0;
-		uint32_t sameBatchPrefixPassCount = 0;
-		uint32_t sameBatchSuffixPassCount = 0;
-		uint32_t sameBatchInterleavedPassCount = 0;
-		uint32_t crossQueueBoundaryPassCount = 0;
-		uint32_t crossQueueTransitionCount = 0;
-	};
-
-	struct RegionCacheStats {
-		uint64_t framesSinceRegionBuild = 0;
-		uint64_t candidateRegionCount = 0;
-		uint64_t acceptedRegionCount = 0;
-		uint64_t rejectedRegionCount = 0;
-		uint64_t coveredPassCount = 0;
-		uint64_t coveredRequirementCount = 0;
-		uint64_t coveredBatchCount = 0;
-		uint64_t coveredTransitionCount = 0;
-		uint64_t largestRegionPassCount = 0;
-		uint64_t largestRegionRequirementCount = 0;
-		uint64_t estimatedSavedAddTransitionCalls = 0;
-		uint64_t estimatedSavedIsNewBatchNeededCalls = 0;
-		uint64_t boundaryInputEdgeCount = 0;
-		uint64_t boundaryOutputEdgeCount = 0;
-		uint64_t crossQueueBoundaryInputEdgeCount = 0;
-		uint64_t crossQueueBoundaryOutputEdgeCount = 0;
-		uint64_t boundarySyncCount = 0;
-		uint64_t sameBatchPrefixPassCount = 0;
-		uint64_t sameBatchSuffixPassCount = 0;
-		uint64_t sameBatchInterleavedPassCount = 0;
-		uint64_t crossQueueBoundaryPassCount = 0;
-		uint64_t crossQueueTransitionCount = 0;
-		std::array<uint64_t, static_cast<size_t>(RegionRejectReason::Count)> rejectedByReason{};
-	};
-
-	struct CachedScheduleRegion {
-		ScheduledRegion schedule;
-	};
-
-	enum class ReplaySegmentInvalidationReason : uint8_t {
-		None = 0,
-		PassSequenceChanged,
-		DeclarationChanged,
-		AccessChanged,
-		QueueAssignmentChanged,
-		AliasPlacementChanged,
-		BoundaryChanged,
-		TemplateShapeChanged,
-		TemplateStateChanged,
-		ImmediateWorkInserted,
-		FrameExtensionInserted,
-		UnsupportedAliasActivation,
-		BatchInterleavingChanged,
-		Count
-	};
-
-	struct ReplaySegmentIdentity {
-		uint64_t passSequenceHash = 0;
-		uint64_t structuralPositionHash = 0;
-		uint32_t passCount = 0;
-	};
-
-	struct ReplaySegmentFingerprint {
-		uint64_t declarationHash = 0;
-		uint64_t accessHash = 0;
-		uint64_t queueHash = 0;
-		uint64_t aliasHash = 0;
-		uint64_t boundaryHash = 0;
-		uint64_t templateShapeHash = 0;
-	};
-
-	struct ReplaySegmentInputRequirement {
-		ResourceRegistry::RegistryHandle resource;
-		uint64_t resourceID = 0;
-		size_t resourceIndexAtExtraction = 0;
-		RangeSpec range{};
-		ResourceState requiredState{};
-		uint16_t queueSlot = 0;
-		bool wholeResource = false;
-		bool aliasActivation = false;
-		bool transitionBeforeState = false;
-		bool transitionDiscard = false;
-		bool readOnlyUniformWeakRequirement = false;
-	};
-
-	struct ReplaySegmentOutputState {
-		uint64_t resourceID = 0;
-		RangeSpec range{};
-		ResourceState finalState{};
-		bool wholeResource = false;
-		bool validFastState = false;
-	};
-
-	struct ReplaySegmentBoundaryEdge {
-		uint32_t insideNode = 0;
-		uint32_t outsideNode = 0;
-		uint32_t insideTraceIndex = 0;
-		uint32_t outsideTraceIndex = 0;
-		uint16_t insideQueueSlot = 0;
-		uint16_t outsideQueueSlot = 0;
-		bool incoming = false;
-		bool crossQueue = false;
-	};
-
-	struct ReplaySegmentBoundarySync {
-		uint16_t dstQueue = 0;
-		uint16_t srcQueue = 0;
-		BatchWaitPhase waitPhase = BatchWaitPhase::BeforeTransitions;
-		BatchSignalPhase signalPhase = BatchSignalPhase::AfterCompletion;
-		uint32_t batchIndex = 0;
-		bool internalOnly = false;
-	};
-
-	struct ReplaySegmentQueueUsageSummary {
-		uint64_t resourceID = 0;
-		uint16_t queueSlot = 0;
-		uint32_t firstLocalBatch = 0;
-		uint32_t lastLocalBatch = 0;
-		bool read = false;
-		bool write = false;
-		bool transition = false;
-		bool producer = false;
-	};
-
-	struct ReplaySegmentQueuedPassTemplate {
-		uint32_t localPassOrdinal = 0;
-		uint32_t originalFramePassIndexAtExtraction = 0;
-		uint64_t passNameHash = 0;
-		uint16_t queueSlot = 0;
-		PassType type = PassType::Unknown;
-	};
-
-	struct ReplaySegmentTransitionTemplate {
-		uint64_t resourceID = 0;
-		uint64_t backingResourceID = 0;
-		RangeSpec range{};
-		ResourceState before{};
-		ResourceState after{};
-		bool discard = false;
-		uint16_t queueSlot = 0;
-		BatchTransitionPhase phase = BatchTransitionPhase::BeforePasses;
-		bool dynamicResource = false;
-	};
-
-	struct ReplaySegmentWaitTemplate {
-		uint16_t dstQueue = 0;
-		uint16_t srcQueue = 0;
-		BatchWaitPhase phase = BatchWaitPhase::BeforeTransitions;
-	};
-
-	struct ReplaySegmentSignalTemplate {
-		uint16_t queueSlot = 0;
-		BatchSignalPhase phase = BatchSignalPhase::AfterCompletion;
-	};
-
-	struct ReplaySegmentBatchTemplate {
-		uint32_t localBatchIndex = 0;
-		uint32_t originalBatchIndexAtExtraction = 0;
-		bool partialBatch = false;
-		std::vector<ReplaySegmentQueuedPassTemplate> queuedPasses;
-		std::vector<ReplaySegmentTransitionTemplate> transitions;
-		std::vector<ReplaySegmentWaitTemplate> waits;
-		std::vector<ReplaySegmentSignalTemplate> signals;
-		std::vector<uint64_t> allResources;
-		std::vector<uint64_t> internallyTransitionedResources;
-	};
-
-	struct ReplaySegmentContract {
-		std::vector<ReplaySegmentInputRequirement> inputRequirements;
-		std::vector<ReplaySegmentOutputState> outputStates;
-		std::vector<ReplaySegmentBoundaryEdge> boundaryEdges;
-		std::vector<ReplaySegmentBoundarySync> boundarySyncs;
-		std::vector<ReplaySegmentQueueUsageSummary> queueUsage;
-	};
-
-	struct TraceScanRange {
-		uint32_t firstTraceIndex = 0;
-		uint32_t lastTraceIndex = 0;
-	};
-
-	struct ReplaySegmentVerificationReport {
-		bool valid = true;
-		uint64_t checkedPasses = 0;
-		uint64_t checkedEdges = 0;
-		uint64_t checkedRequirements = 0;
-		uint64_t checkedQueueSyncs = 0;
-		uint64_t failures = 0;
-		uint64_t matchedSegments = 0;
-		uint64_t replayedPasses = 0;
-		uint64_t dynamicGapPasses = 0;
-		uint64_t insertedInputTransitions = 0;
-		uint64_t extraInputTransitionsAllowed = 0;
-		uint64_t addTransitionCallsSaved = 0;
-		uint64_t templateReplayedBatches = 0;
-		uint64_t repairedBatches = 0;
-		uint64_t recomputedBatches = 0;
-		uint64_t replayedInternalTransitions = 0;
-		uint64_t recomputedTransitionCalls = 0;
-		uint64_t rejectedReplaySegments = 0;
-		std::vector<size_t> reusedReplaySegmentIndices;
-		std::vector<TraceScanRange> dynamicTraceRanges;
-		std::string firstRecomputeReason;
-		std::string topTransitionNoise;
-		std::string firstFailure;
-	};
-
-	struct ReplayAuthoritativeReadinessReport {
-		bool ready = false;
-		uint64_t matchedSegments = 0;
-		uint64_t replayablePasses = 0;
-		uint64_t dynamicGapPasses = 0;
-		uint64_t insertedInputTransitions = 0;
-		uint64_t blockers = 0;
-		std::string blockerSummary;
-	};
-
-	struct ReplaySegmentTemplateStats {
-		uint32_t batchCount = 0;
-		uint32_t partialBatchCount = 0;
-		uint32_t queuedPassCount = 0;
-		uint32_t transitionCount = 0;
-		uint32_t waitCount = 0;
-		uint32_t signalCount = 0;
-		uint64_t passOrderHash = 0;
-		uint64_t transitionShapeHash = 0;
-		uint64_t transitionStateHash = 0;
-		uint64_t syncShapeHash = 0;
-	};
-
-	struct CachedReplaySegment {
-		ScheduledRegion schedule;
-		ReplaySegmentIdentity identity;
-		ReplaySegmentFingerprint fingerprint;
-		ReplaySegmentContract contract;
-		std::vector<ReplaySegmentBatchTemplate> batchTemplates;
-		ReplaySegmentTemplateStats templateStats;
-		bool tier1Eligible = false;
-	};
-
-	struct ReplaySegmentValidationStats {
-		uint64_t currentSegmentCount = 0;
-		uint64_t previousSegmentCount = 0;
-		uint64_t hits = 0;
-		uint64_t misses = 0;
-		uint64_t templateStateDivergencesAllowed = 0;
-		uint64_t transitionShapeResourceDiffs = 0;
-		uint64_t transitionShapeRangeDiffs = 0;
-		uint64_t transitionShapeAfterStateDiffs = 0;
-		uint64_t transitionShapeQueueDiffs = 0;
-		uint64_t transitionShapePhaseDiffs = 0;
-		uint64_t transitionShapeDiscardDiffs = 0;
-		std::array<uint64_t, static_cast<size_t>(ReplaySegmentInvalidationReason::Count)> missesByReason{};
-		std::string firstMissDetail;
-		std::string firstTransitionShapeDiffDetail;
-	};
-
-	struct ReplaySegmentCacheKey {
-		uint64_t passSequenceHash = 0;
-		uint32_t passCount = 0;
-	};
-
-	struct ReplaySegmentVariantKey {
-		uint64_t declarationHash = 0;
-		uint64_t accessHash = 0;
-		uint64_t queueHash = 0;
-		uint64_t aliasHash = 0;
-		uint64_t hardBoundaryHash = 0;
-		uint64_t hardTemplateHash = 0;
-	};
-
-	struct CachedReplaySegmentVariant {
-		CachedReplaySegment segment;
-		ReplaySegmentVariantKey variantKey;
-		uint64_t firstSeenFrame = 0;
-		uint64_t lastSeenFrame = 0;
-		uint64_t hitCount = 0;
-		uint64_t seenCount = 0;
-	};
-
-	struct ReplaySegmentCacheEntry {
-		ReplaySegmentCacheKey key;
-		std::vector<CachedReplaySegmentVariant> variants;
-	};
-
-	struct ReplaySegmentLookupResult {
-		const CachedReplaySegmentVariant* variant = nullptr;
-		bool syncShapeDiverged = false;
-		uint64_t variantAgeFrames = 0;
-		std::string missReason;
-		std::string boundaryDiff;
-		std::string templateDiff;
-	};
-
-	struct ReplaySegmentCacheUpdateStats {
-		uint64_t entries = 0;
-		uint64_t variants = 0;
-		uint64_t inserted = 0;
-		uint64_t refreshed = 0;
-		uint64_t evicted = 0;
-		uint64_t lookupHits = 0;
-		uint64_t lookupMisses = 0;
-		uint64_t olderVariantHits = 0;
-		uint64_t oldestHitAge = 0;
-		std::string firstMiss;
-		std::string firstOlderHit;
-	};
-
-	struct RenderGraphRegionCache {
-		uint64_t structuralGeneration = 0;
-		uint64_t lastAuthoritativeCompileFingerprint = 0;
-		uint64_t replaySegmentFrameSerial = 0;
-		std::vector<CachedScheduleRegion> regions;
-		std::vector<CachedReplaySegment> replaySegments;
-		std::vector<ReplaySegmentCacheEntry> replaySegmentEntries;
-		RegionCacheStats stats;
-	};
 
 	struct SchedulingDecisionTrace {
 		uint32_t nodeIndex = 0;
@@ -1517,29 +1158,11 @@ private:
 		}
 	};
 
-	struct Node {
-		size_t   passIndex = 0;
-		size_t   queueSlot = 0; // Default/preferred queue slot for compatibility-preserving fallback
-		QueueKind preferredQueueKind = QueueKind::Graphics;
-		QueueAssignmentPolicy queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
-		std::vector<size_t> compatibleQueueSlots; // All legal queue slots for this pass
-		uint8_t compatibleQueueKindMask = 0;
-		std::optional<size_t> assignedQueueSlot; // Final slot chosen during frame scheduling
-		uint32_t originalOrder = 0;
-		size_t topoRank = 0;
-
-		// Expanded IDs (aliases + group/child fixpoint)
-		const std::vector<uint64_t>* touchedIDs = nullptr;
-		const std::vector<uint64_t>* uavIDs = nullptr;
-
-		// DAG
-		std::vector<size_t> out;
-		std::vector<size_t> in;
-		uint32_t indegree = 0;
-
-		// Longest-path-to-sink (for tie-breaking)
-		uint32_t criticality = 0;
-	};
+	// Compiler implementation data deliberately lives outside this public header.
+	// This keeps compiler algorithm/layout changes from rebuilding all ORG clients.
+	struct Node;
+	struct CompilerState;
+	std::unique_ptr<CompilerState> m_compilerState;
 
 	std::vector<IResourceProvider*> _providers;
 	ResourceRegistry _registry;
@@ -1557,7 +1180,6 @@ private:
 	std::vector<AnyPassAndResources> m_frameExtensionPasses;
 	FramePassList m_framePasses;
 	std::vector<uint8_t> m_framePassIsFrameExtension;
-	std::vector<uint8_t> m_framePassDeclarationRefreshedThisFrame;
 	uint64_t m_frameDeclarationRefreshRequestedCount = 0;
 	uint64_t m_frameDeclarationRefreshEquivalentCount = 0;
 	std::vector<size_t> m_assignedQueueSlotsByFramePass;
@@ -1611,16 +1233,6 @@ private:
 	std::vector<unsigned int> m_frameQueueLastTransitionBatch;
 	std::vector<FrameResourceEventSummary> m_frameResourceEventSummaries;
 	std::vector<FramePassStaticAccessSummary> m_framePassAccessSummaries;
-	std::vector<uint64_t> m_compileScratchResourceIDs;
-	std::vector<uint8_t> m_compileScratchResourcesWritten;
-	std::vector<uint32_t> m_compileScratchAccessEpochs;
-	std::vector<uint32_t> m_compileScratchAccessWriteEpochs;
-	std::vector<uint32_t> m_compileScratchAccessUavEpochs;
-	std::vector<uint32_t> m_compileScratchAccessDagEpochs;
-	std::vector<uint32_t> m_compileScratchAccessOrder;
-	std::vector<uint64_t> m_compileScratchPreferredDynamicStableIDByIndex;
-	uint32_t m_compileScratchAccessEpoch = 1;
-	std::vector<size_t> m_compileScratchRefreshNeededMasterIndices;
 	std::vector<std::pair<uint64_t, Resource*>> m_materializeScratchItems;
 	std::vector<MaterializeGenerationResult> m_materializeScratchGenerationResults;
 	std::vector<FramePassSchedulingSummary> m_framePassSchedulingSummaries;
@@ -1647,14 +1259,10 @@ private:
 	std::shared_ptr<rg::runtime::IDescriptorService> m_descriptorService;
 	std::shared_ptr<rg::runtime::IRenderGraphSettingsService> m_renderGraphSettingsService;
 	std::shared_ptr<rg::runtime::ITaskService> m_taskService;
-	std::shared_ptr<rg::profile::ICompileProfileSink> m_compileProfileSink;
-	rg::profile::CompileProfileFrame m_activeCompileProfileFrame;
-	rg::profile::CompileProfileFrame m_lastCompileProfileFrame;
-	uint64_t m_compileProfileSerial = 0;
+	std::optional<basic_telemetry::Frame> m_compileProfileFrame;
 	uint64_t m_compileProfileFrameStartedAtNs = 0;
 	uint64_t m_lastMaterializeCandidateCount = 0;
 	bool m_compileProfileEnabled = false;
-	bool m_compileProfileFrameActive = false;
 	struct CapturedTrackerResource {
 		uint64_t resourceID = 0;
 		uint64_t backingGeneration = 0;
@@ -1702,20 +1310,9 @@ private:
 	std::vector<AliasQueueSyncOwner> m_aliasQueueSyncOwnersScratch;
 	std::vector<uint32_t> m_crossFrameFirstUseResourceEpochs;
 	uint32_t m_crossFrameFirstUseResourceEpoch = 1;
-	RenderGraphRegionCache m_regionCache;
-	RegionCacheStats m_lastRegionStats;
-	std::vector<ScheduledRegion> m_lastExtractedRegions;
-	std::vector<std::string> m_lastRegionCandidateDiagnostics;
 	std::vector<SchedulingDecisionTrace> m_schedulingDecisionTrace;
 	std::vector<TransitionPlacementCandidate> m_transitionPlacementCandidates;
 	TransitionPlacementStats m_transitionPlacementStats;
-	bool m_lastAuthoritativeReplayAttempted = false;
-	bool m_lastAuthoritativeReplaySucceeded = false;
-	uint64_t m_lastAuthoritativeReplaySegments = 0;
-	uint64_t m_lastAuthoritativeReplayPasses = 0;
-	uint64_t m_lastAuthoritativeReplayDynamicGapPasses = 0;
-	std::string m_lastAuthoritativeReplayFailure;
-	std::string m_lastAuthoritativeReplayRecomputeReason;
 	std::unordered_map<uint64_t, LastProducerAcrossFrames> m_lastProducerByResourceAcrossFrames;
 	// A write in a later frame must wait for every queue that accessed the
 	// resource in the prior frame, including read-only consumers and barriers.
@@ -1771,15 +1368,15 @@ private:
 
 	/// Dispatches to the injected ITaskService when available, otherwise runs a serial loop.
 	void ParallelForOptional(std::string_view taskName, size_t itemCount, std::function<void(size_t)> func, bool override = false) {
-		const auto allocationContext = rg::profile::GetCurrentAllocationContext();
+		const auto telemetryContext = basic_telemetry::CaptureCurrentContext();
 		if (m_taskService && !override) {
-			m_taskService->ParallelFor(taskName, itemCount, [allocationContext, func = std::move(func)](size_t index) mutable {
-				rg::profile::ScopedAllocationContext scopedContext(allocationContext);
+			m_taskService->ParallelFor(taskName, itemCount, [telemetryContext, func = std::move(func)](size_t index) mutable {
+				basic_telemetry::ContextBinding scopedContext(telemetryContext);
 				func(index);
 			});
 		} else {
 			for (size_t i = 0; i < itemCount; ++i) {
-				rg::profile::ScopedAllocationContext scopedContext(allocationContext);
+				basic_telemetry::ContextBinding scopedContext(telemetryContext);
 				func(i);
 			}
 		}
@@ -1836,77 +1433,10 @@ private:
 	void CompileFrame(rhi::Device device, uint8_t frameIndex, const IHostExecutionData* hostData);
 	void BeginCompileProfileFrame(uint8_t frameIndex);
 	void EndCompileProfileFrame();
-	uint32_t BeginCompileProfileStep(const char* stepName);
-	void EndCompileProfileStep(uint32_t stepIndex, uint64_t durationNs);
-	rg::profile::CompileProfileFrame* ActiveCompileProfileFrame() noexcept {
-		return m_compileProfileFrameActive ? std::addressof(m_activeCompileProfileFrame) : nullptr;
-	}
 	void RecordCompileProfileCounters(const std::vector<Node>& nodes, std::span<const uint64_t> usedResourceIDs);
 	void WriteCompiledGraphDebugDump(uint8_t frameIndex, const std::vector<Node>& nodes) const;
 	void WriteVramUsageDebugDump(uint8_t frameIndex) const;
 	void CoalesceQueueWaitsAndSignals(std::vector<PassBatch>& batchesToCoalesce) const;
-	void ExtractScheduleRegionsFromAuthoritativeCompile(
-		const std::vector<Node>& nodes,
-		const FramePassList& framePasses,
-		const std::vector<PassBatch>& compiledBatches,
-		std::vector<ScheduledRegion>& outRegions,
-		RegionCacheStats& outStats,
-		std::vector<std::string>& outCandidateDiagnostics) const;
-	void ExtractScheduleRegionsFromAuthoritativeCompile(
-		const std::vector<Node>& nodes,
-		const FramePassList& framePasses,
-		const std::vector<PassBatch>& compiledBatches,
-		std::span<const TraceScanRange> traceRanges,
-		std::vector<ScheduledRegion>& outRegions,
-		RegionCacheStats& outStats,
-		std::vector<std::string>& outCandidateDiagnostics) const;
-	void ExtractReplaySegmentsFromAuthoritativeCompile(
-		const std::vector<Node>& nodes,
-		const FramePassList& framePasses,
-		const std::vector<PassBatch>& compiledBatches,
-		std::span<const ScheduledRegion> regions,
-		std::vector<CachedReplaySegment>& outSegments) const;
-	CachedReplaySegment RemapCachedReplaySegmentToCurrentFrame(
-		const CachedReplaySegment& segment,
-		const std::vector<PassBatch>& compiledBatches) const;
-	ReplaySegmentValidationStats ValidateCachedSegmentsAgainstCurrentFrame(
-		std::span<const CachedReplaySegment> previousSegments,
-		std::span<const CachedReplaySegment> currentSegments) const;
-	ReplaySegmentCacheKey BuildReplaySegmentCacheKey(const CachedReplaySegment& segment) const;
-	ReplaySegmentVariantKey BuildReplaySegmentVariantKey(const CachedReplaySegment& segment) const;
-	ReplaySegmentLookupResult LookupCachedReplaySegmentVariant(
-		const CachedReplaySegment& currentSegment,
-		uint64_t frameIndex);
-	ReplaySegmentCacheUpdateStats InsertOrRefreshReplaySegmentVariants(
-		std::span<const CachedReplaySegment> currentSegments,
-		uint64_t frameIndex);
-	ReplaySegmentCacheUpdateStats SummarizeReplaySegmentVariantCache() const;
-	void EvictOldReplaySegmentVariants(uint64_t frameIndex, ReplaySegmentCacheUpdateStats& stats);
-	bool ReplaySegmentBoundaryEdgesMatch(const CachedReplaySegment& cached, const CachedReplaySegment& current) const;
-	bool ReplaySegmentHardTemplateMatches(const CachedReplaySegment& cached, const CachedReplaySegment& current) const;
-	bool ReplaySegmentSyncShapeDiverged(const CachedReplaySegment& cached, const CachedReplaySegment& current) const;
-	bool ReplaySegmentHardReplayMatches(const CachedReplaySegment& cached, const CachedReplaySegment& current) const;
-	std::string FormatReplaySegmentBoundaryDiff(const CachedReplaySegment& cached, const CachedReplaySegment& current) const;
-	std::string FormatReplaySegmentTemplateDiff(const CachedReplaySegment& cached, const CachedReplaySegment& current) const;
-	ReplaySegmentVerificationReport VerifyAuthoritativeScheduleSemantics(
-		const std::vector<Node>& nodes,
-		const FramePassList& framePasses,
-		const std::vector<PassBatch>& compiledBatches) const;
-	ReplaySegmentVerificationReport BuildShadowReplayScheduleFromCachedSegments(
-		std::span<const CachedReplaySegment> previousSegments,
-		std::span<const CachedReplaySegment> currentSegments) const;
-	ReplaySegmentVerificationReport VerifyReplayScheduleSemanticCorrectness(
-		std::span<const CachedReplaySegment> replaySegments) const;
-	ReplayAuthoritativeReadinessReport CheckReplayAuthoritativeReadiness(
-		const ReplaySegmentValidationStats& validation,
-		const ReplaySegmentVerificationReport& semanticVerification,
-		const ReplaySegmentVerificationReport& replayMetadataVerification,
-		const ReplaySegmentVerificationReport& shadowReplayVerification) const;
-	ReplaySegmentVerificationReport ReplayCurrentFrameSegmentsAsAuthoritative(
-		std::span<const CachedReplaySegment> replaySegments,
-		std::span<const SchedulingDecisionTrace> authoritativeTrace,
-		FramePassList& framePasses,
-		std::vector<Node>& nodes);
 	bool ValidateSchedulingDecisionTrace(
 		const std::vector<Node>& nodes,
 		const FramePassList& framePasses,
@@ -1952,9 +1482,9 @@ private:
 		const FramePassSchedulingSummary&  passSummary,
 		const FrameEpochSet&              resourcesTransitionedThisPass)
 	{
-		ZoneScopedN("RenderGraph::applySynchronization");
+		BT_ZONE_SCOPE("RenderGraph::applySynchronization");
 		if (!pass.name.empty()) {
-			ZoneText(pass.name.data(), pass.name.size());
+			BT_ZONE_TEXT(pass.name.data(), pass.name.size());
 		}
 		if (passQueueSlot == sourceQueueSlot) {
 			return;
@@ -1983,9 +1513,9 @@ private:
 		int                               lastProdBatch,
 		int                               lastUsageBatch)
 	{
-		ZoneScopedN("RenderGraph::ApplySynchronizationImpl");
+		BT_ZONE_SCOPE("RenderGraph::ApplySynchronizationImpl");
 		if (!passName.empty()) {
-			ZoneText(passName.data(), passName.size());
+			BT_ZONE_TEXT(passName.data(), passName.size());
 		}
 		if (passQueueSlot == sourceQueueSlot) {
 			return;
@@ -2124,11 +1654,6 @@ private:
 		const std::vector<std::pair<ResourceHandleAndRange, ResourceState>>* internalTransitions = nullptr;
 	};
 
-	struct SeqState {
-		std::optional<size_t> lastWriter;
-		std::vector<size_t>   readsSinceWrite;
-	};
-
 	using AutoAliasPlannerStats = rg::alias::AutoAliasPlannerStats;
 	using CachedAliasPoolPlan = rg::alias::CachedAliasPoolPlan;
 
@@ -2136,8 +1661,8 @@ private:
 	void RebuildFramePassAccessSummaries();
 	bool BuildDependencyGraph(std::vector<Node>& nodes);
 	bool BuildDependencyGraph(std::vector<Node>& nodes, std::span<const std::pair<size_t, size_t>> explicitEdges);
-	static bool FinalizeDependencyGraph(std::vector<Node>& nodes);
-	static std::vector<Node> BuildNodes(RenderGraph& rg);
+	bool FinalizeDependencyGraph(std::vector<Node>& nodes);
+	static void BuildNodes(RenderGraph& rg, std::vector<Node>& nodes);
 	static void PlanActiveQueueSlots(RenderGraph& rg, const FramePassList& passes, const std::vector<Node>& nodes);
 	static bool AddEdgeDedup(
 		size_t from, size_t to,
@@ -2189,12 +1714,7 @@ private:
 	std::function<float()> m_getQueueSchedulingAutoGraphicsBias;
 	std::function<float()> m_getQueueSchedulingAsyncOverlapBonus;
 	std::function<float()> m_getQueueSchedulingCrossQueueHandoffPenalty;
-	std::function<rg::runtime::RenderGraphRegionMode()> m_getRenderGraphRegionMode;
 	std::function<rg::runtime::TransitionPlacementMode()> m_getTransitionPlacementMode;
-	std::function<uint32_t()> m_getRenderGraphRegionMinPassCount;
-	std::function<uint32_t()> m_getRenderGraphRegionMaxPassCount;
-	std::function<bool()> m_getRenderGraphRegionDiagnosticsEnabled;
-	std::function<bool()> m_getRenderGraphRegionShadowStrictBatchMatch;
 	std::unordered_map<uint64_t, AddTransitionDebugStats> m_addTransitionDebugStatsByResource;
 	std::function<uint32_t()> m_getAutoAliasPoolRetireIdleFrames;
 	std::function<float()> m_getAutoAliasPoolGrowthHeadroom;

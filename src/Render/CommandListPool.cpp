@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <string>
 #include <spdlog/spdlog.h>
-#include <tracy/Tracy.hpp>
+#include <BasicTelemetry/Tracy.h>
 
 namespace {
     constexpr size_t kWarmFramesInFlight = 4;
@@ -36,7 +36,7 @@ CommandListPool::~CommandListPool() {
 }
 
 void CommandListPool::PreparePairForReuse(CommandListPair& pair) {
-    ZoneScopedN("CommandListPool::PreparePairForReuse");
+    BT_ZONE_SCOPE("CommandListPool::PreparePairForReuse");
     pair.allocator->Recycle();
     pair.list->Recycle(pair.allocator.Get());
 }
@@ -50,7 +50,7 @@ void CommandListPool::UpdateDiagnosticsCountsLocked() {
 }
 
 CommandListPair CommandListPool::CreateReadyPair() {
-    ZoneScopedN("CommandListPool::CreateReadyPair");
+    BT_ZONE_SCOPE("CommandListPool::CreateReadyPair");
     CommandListPair pair;
 	auto result = m_device.CreateCommandAllocator(m_type, pair.allocator);
 	result = m_device.CreateCommandList(m_type, pair.allocator.Get(), pair.list);
@@ -66,7 +66,7 @@ CommandListPair CommandListPool::CreateReadyPair() {
 }
 
 CommandListPair CommandListPool::Request() {
-    ZoneScopedN("CommandListPool::Request");
+    BT_ZONE_SCOPE("CommandListPool::Request");
     {
         std::lock_guard lock(m_mutex);
         if (!m_available.empty()) {
@@ -88,7 +88,7 @@ CommandListPair CommandListPool::Request() {
 }
 
 void CommandListPool::PrepareForRequests(size_t requiredCount, uint64_t completedFenceValue) {
-    ZoneScopedN("CommandListPool::PrepareForRequests");
+    BT_ZONE_SCOPE("CommandListPool::PrepareForRequests");
     {
         std::lock_guard lock(m_mutex);
         m_diagnostics.lastRequestedCount = requiredCount;
@@ -159,11 +159,11 @@ void CommandListPool::PrepareForRequests(size_t requiredCount, uint64_t complete
             inFlightCount);
     }
 
-    TracyPlot("ORG.CommandListPool.Prepare.Required", static_cast<int64_t>(requiredCount));
-    TracyPlot("ORG.CommandListPool.Prepare.Created", static_cast<int64_t>(deficit));
-    TracyPlot("ORG.CommandListPool.Prepare.AvailableBeforeWarm", static_cast<int64_t>(availableBeforeWarm));
-    TracyPlot("ORG.CommandListPool.Prepare.TotalOwnedBeforeWarm", static_cast<int64_t>(totalOwnedBeforeWarm));
-    TracyPlot("ORG.CommandListPool.Prepare.WarmTarget", static_cast<int64_t>(warmTargetCount));
+    BT_PLOT("ORG.CommandListPool.Prepare.Required", static_cast<int64_t>(requiredCount));
+    BT_PLOT("ORG.CommandListPool.Prepare.Created", static_cast<int64_t>(deficit));
+    BT_PLOT("ORG.CommandListPool.Prepare.AvailableBeforeWarm", static_cast<int64_t>(availableBeforeWarm));
+    BT_PLOT("ORG.CommandListPool.Prepare.TotalOwnedBeforeWarm", static_cast<int64_t>(totalOwnedBeforeWarm));
+    BT_PLOT("ORG.CommandListPool.Prepare.WarmTarget", static_cast<int64_t>(warmTargetCount));
 
     {
         std::lock_guard lock(m_mutex);
@@ -172,7 +172,7 @@ void CommandListPool::PrepareForRequests(size_t requiredCount, uint64_t complete
 }
 
 void CommandListPool::Recycle(CommandListPair&& pair, uint64_t fenceValue) {
-    ZoneScopedN("CommandListPool::Recycle");
+    BT_ZONE_SCOPE("CommandListPool::Recycle");
     bool notifyBackgroundReset = false;
     if (fenceValue == 0) {
         {
@@ -195,7 +195,7 @@ void CommandListPool::Recycle(CommandListPair&& pair, uint64_t fenceValue) {
 }
 
 void CommandListPool::RecycleCompleted(uint64_t completedFenceValue) {
-    ZoneScopedN("CommandListPool::RecycleCompleted");
+    BT_ZONE_SCOPE("CommandListPool::RecycleCompleted");
     size_t movedCount = 0;
     {
         std::lock_guard lock(m_mutex);
@@ -235,7 +235,7 @@ void CommandListPool::BackgroundResetMain() {
         }
 
         {
-            ZoneScopedN("CommandListPool::BackgroundResetMain::ResetPairs");
+            BT_ZONE_SCOPE("CommandListPool::BackgroundResetMain::ResetPairs");
             for (auto& pair : local) {
                 PreparePairForReuse(pair);
             }
