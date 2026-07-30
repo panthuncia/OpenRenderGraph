@@ -432,7 +432,13 @@ public:
 			}
 			internallyTransitionedResources.clear();
 			allResources.clear();
-			passBatchTrackersByResourceIndex.clear();
+			if (passBatchTrackerEpoch == std::numeric_limits<uint32_t>::max()) {
+				std::fill(passBatchTrackerEpochsByResourceIndex.begin(), passBatchTrackerEpochsByResourceIndex.end(), 0);
+				passBatchTrackerEpoch = 1;
+			}
+			else {
+				++passBatchTrackerEpoch;
+			}
 		}
 
 		size_t QueueCount() const noexcept { return queuePasses.size(); }
@@ -605,7 +611,25 @@ public:
 			return queueWaitFenceValue[WaitPhaseIndex(phase)][dst][src];
 		}
 
+		void SetPassBatchTracker(size_t resourceIndex, size_t resourceCount, SymbolicTracker* tracker) {
+			if (passBatchTrackersByResourceIndex.size() < resourceCount) {
+				passBatchTrackersByResourceIndex.resize(resourceCount);
+				passBatchTrackerEpochsByResourceIndex.resize(resourceCount, 0);
+			}
+			passBatchTrackersByResourceIndex[resourceIndex] = tracker;
+			passBatchTrackerEpochsByResourceIndex[resourceIndex] = passBatchTrackerEpoch;
+		}
+
+		SymbolicTracker* GetPassBatchTracker(size_t resourceIndex) const {
+			return resourceIndex < passBatchTrackerEpochsByResourceIndex.size()
+				&& passBatchTrackerEpochsByResourceIndex[resourceIndex] == passBatchTrackerEpoch
+				? passBatchTrackersByResourceIndex[resourceIndex]
+				: nullptr;
+		}
+
 		std::vector<SymbolicTracker*> passBatchTrackersByResourceIndex; // Trackers for the resources in this batch
+		std::vector<uint32_t> passBatchTrackerEpochsByResourceIndex;
+		uint32_t passBatchTrackerEpoch = 1;
 	};
 
 	struct PresentDependency {
@@ -1214,7 +1238,6 @@ private:
 	};
 	std::vector<uint64_t> m_schedulingEquivalentIDFlat;
 	std::vector<SchedulingEquivalentIDRange> m_schedulingEquivalentIDRangeByResourceIndex;
-	std::unordered_map<uint64_t, size_t> m_frameDAGResourceIndexByID;
 	std::vector<uint64_t> m_frameDAGResourceIDsByIndex;
 	std::vector<uint64_t> m_frameDAGResourceIndexHashKeys;
 	std::vector<uint32_t> m_frameDAGResourceIndexHashValues;
@@ -1320,8 +1343,6 @@ private:
 	// sufficient for reads, but cannot cover cross-frame write-after-read.
 	std::unordered_map<uint64_t, std::vector<LastProducerAcrossFrames>> m_lastAccessByResourceAcrossFrames;
 	std::unordered_map<uint64_t, std::vector<LastAliasPlacementProducerAcrossFrames>> m_lastAliasPlacementProducersByPoolAcrossFrames;
-	std::vector<std::unordered_map<uint64_t, unsigned int>> m_compiledLastProducerBatchByResourceByQueue;
-	std::vector<std::unordered_map<uint64_t, unsigned int>> m_compiledLastAccessBatchByResourceByQueue;
 	uint64_t m_crossFrameProducerPublishSerial = 0;
 	std::vector<std::vector<uint8_t>> m_hasPendingFrameStartQueueWait;
 	std::vector<std::vector<UINT64>> m_pendingFrameStartQueueWaitFenceValue;
@@ -1449,7 +1470,7 @@ private:
 	//void ComputeResourceLoops();
 	bool IsNewBatchNeeded(
 		const FramePassSchedulingSummary& passSummary,
-		const std::vector<SymbolicTracker*>& passBatchTrackersByResourceIndex,
+		const PassBatch& currentBatch,
 		const BatchBuildState& batchBuildState,
 		std::string_view candidatePassName,
 		unsigned int currentBatchIndex,

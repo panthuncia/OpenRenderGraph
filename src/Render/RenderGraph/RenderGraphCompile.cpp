@@ -557,8 +557,104 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 		compiler.resourceIDs.clear();
 
 		{
+			BT_ZONE_SCOPE("RGPassAccess::InitializeDenseResourceIndex");
+			size_t hashCapacity = m_frameDAGResourceIndexHashKeys.size();
+			if (hashCapacity == 0) {
+				hashCapacity = 1024;
+				m_frameDAGResourceIndexHashKeys.resize(hashCapacity);
+				m_frameDAGResourceIndexHashValues.resize(hashCapacity);
+			}
+			std::fill(
+				m_frameDAGResourceIndexHashKeys.begin(),
+				m_frameDAGResourceIndexHashKeys.end(),
+				kFrameDAGResourceIndexEmptyKey);
+			m_frameDAGResourceIDsByIndex.clear();
+			m_frameDAGResourcePtrByIndex.clear();
+			m_frameDAGUnmaterializedResourceIndices.clear();
+			compiler.resourcesWritten.clear();
+		}
+
+		auto growDenseResourceIndex = [&]() {
+			const size_t newCapacity = m_frameDAGResourceIndexHashKeys.size() * 2;
+			m_frameDAGResourceIndexHashKeys.assign(newCapacity, kFrameDAGResourceIndexEmptyKey);
+			m_frameDAGResourceIndexHashValues.resize(newCapacity);
+			const size_t hashMask = newCapacity - 1;
+			for (uint32_t resourceIndex = 0;
+				resourceIndex < static_cast<uint32_t>(m_frameDAGResourceIDsByIndex.size());
+				++resourceIndex) {
+				const uint64_t resourceID = m_frameDAGResourceIDsByIndex[resourceIndex];
+				size_t hashSlot = static_cast<size_t>(MixFrameDAGResourceID(resourceID)) & hashMask;
+				while (m_frameDAGResourceIndexHashKeys[hashSlot] != kFrameDAGResourceIndexEmptyKey) {
+					hashSlot = (hashSlot + 1) & hashMask;
+				}
+				m_frameDAGResourceIndexHashKeys[hashSlot] = resourceID;
+				m_frameDAGResourceIndexHashValues[hashSlot] = resourceIndex;
+			}
+		};
+
+		auto insertDenseResourceID = [&](uint64_t resourceID) -> uint32_t {
+			if (resourceID == kFrameDAGResourceIndexEmptyKey) {
+				return UINT32_MAX;
+			}
+			if ((m_frameDAGResourceIDsByIndex.size() + 1) * 2
+				>= m_frameDAGResourceIndexHashKeys.size()) {
+				growDenseResourceIndex();
+			}
+
+			const size_t hashMask = m_frameDAGResourceIndexHashKeys.size() - 1;
+			size_t hashSlot = static_cast<size_t>(MixFrameDAGResourceID(resourceID)) & hashMask;
+			for (;;) {
+				const uint64_t key = m_frameDAGResourceIndexHashKeys[hashSlot];
+				if (key == resourceID) {
+					return m_frameDAGResourceIndexHashValues[hashSlot];
+				}
+				if (key == kFrameDAGResourceIndexEmptyKey) {
+					const uint32_t resourceIndex = static_cast<uint32_t>(m_frameDAGResourceIDsByIndex.size());
+					m_frameDAGResourceIndexHashKeys[hashSlot] = resourceID;
+					m_frameDAGResourceIndexHashValues[hashSlot] = resourceIndex;
+					m_frameDAGResourceIDsByIndex.push_back(resourceID);
+					m_frameDAGResourcePtrByIndex.push_back(nullptr);
+					compiler.resourcesWritten.push_back(0);
+					return resourceIndex;
+				}
+				hashSlot = (hashSlot + 1) & hashMask;
+			}
+		};
+
+		auto registerDenseHandleResource = [&](const ResourceRegistry::RegistryHandle& handle, Resource* resource) {
+			const uint64_t handleID = handle.GetGlobalResourceID();
+			const uint32_t handleIndex = insertDenseResourceID(handleID);
+			if (!resource) {
+				return std::pair<uint64_t, uint32_t>{ handleID, handleIndex };
+			}
+
+			const uint64_t stableID = resource->GetSchedulingResourceID();
+			const uint32_t stableIndex = stableID == handleID
+				? handleIndex
+				: insertDenseResourceID(stableID);
+			const uint64_t currentID = resource->GetGlobalResourceID();
+			if (currentID != handleID && currentID != stableID) {
+				insertDenseResourceID(currentID);
+			}
+			return std::pair<uint64_t, uint32_t>{ stableID, stableIndex };
+		};
+
+		auto captureDenseResourcePtr = [&](uint32_t dagResourceIndex, Resource* resolvedResource) {
+			if (dagResourceIndex == UINT32_MAX
+				|| dagResourceIndex >= m_frameDAGResourcePtrByIndex.size()
+				|| m_frameDAGResourcePtrByIndex[dagResourceIndex] != nullptr) {
+				return;
+			}
+			m_frameDAGResourcePtrByIndex[dagResourceIndex] = resolvedResource;
+			if (auto* backedResource = TryGetBackedResource(resolvedResource);
+				backedResource && !backedResource->IsMaterialized()) {
+				m_frameDAGUnmaterializedResourceIndices.push_back(dagResourceIndex);
+			}
+		};
+
+		{
 			BT_ZONE_SCOPE("RGPassAccess::BuildDenseSummaries");
-			ParallelForOptional("RGPassAccessBuildDenseSummaries", m_framePasses.size(), [&](size_t passIndex) {
+			for (size_t passIndex = 0; passIndex < m_framePasses.size(); ++passIndex) {
 				const auto& pass = m_framePasses[passIndex];
 				auto& summary = m_framePassAccessSummaries[passIndex];
 				summary.requirementSummaries.clear();
@@ -579,11 +675,6 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 				if (summary.internalTransitionSummaries.capacity() < internalTransitionCount) {
 					summary.internalTransitionSummaries.reserve(internalTransitionCount);
 				}
-				const size_t estimatedResourceIDCount = (view.reqs.size() + internalTransitionCount) * 4;
-				if (summary.touchedResourceIDs.capacity() < estimatedResourceIDCount) {
-					summary.touchedResourceIDs.reserve(estimatedResourceIDCount);
-				}
-
 				if (pass.type == PassType::Render) {
 					const auto& passResources = std::get<RenderPassAndResources>(pass.pass).resources;
 					summary.preferredQueueKind = passResources.preferredQueueKind;
@@ -606,16 +697,22 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 				for (const auto& req : view.reqs) {
 					const auto resource = req.resourceHandleAndRange.resource;
 					Resource* resolvedResource = resolveHandleResource(resource);
-					const uint64_t resourceID = appendHandleResourceIDsResolved(summary.touchedResourceIDs, resource, resolvedResource);
+					const auto [resourceID, dagResourceIndex] =
+						registerDenseHandleResource(resource, resolvedResource);
+					captureDenseResourcePtr(dagResourceIndex, resolvedResource);
+					const bool isWrite = AccessTypeIsWriteType(req.state.access);
+					if (isWrite && dagResourceIndex < compiler.resourcesWritten.size()) {
+						compiler.resourcesWritten[dagResourceIndex] = 1;
+					}
 					summary.requirementSummaries.push_back(FramePassRequirementStaticSummary{
 						.resource = resource,
 						.resolvedResource = resolvedResource,
 						.resourceID = resourceID,
-						.dagResourceIndex = UINT32_MAX,
+						.dagResourceIndex = dagResourceIndex,
 						.range = req.resourceHandleAndRange.range,
 						.state = req.state,
 						.isUAV = IsUAVState(req.state),
-						.isWrite = AccessTypeIsWriteType(req.state.access),
+						.isWrite = isWrite,
 					});
 				}
 
@@ -623,144 +720,24 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 					for (const auto& transition : *view.internalTransitions) {
 						const auto resource = transition.first.resource;
 						Resource* resolvedResource = resolveHandleResource(resource);
-						const uint64_t resourceID = appendHandleResourceIDsResolved(summary.touchedResourceIDs, resource, resolvedResource);
+						const auto [resourceID, dagResourceIndex] =
+							registerDenseHandleResource(resource, resolvedResource);
+						captureDenseResourcePtr(dagResourceIndex, resolvedResource);
+						if (dagResourceIndex < compiler.resourcesWritten.size()) {
+							compiler.resourcesWritten[dagResourceIndex] = 1;
+						}
 						summary.internalTransitionSummaries.push_back(FramePassInternalTransitionStaticSummary{
 							.resource = resource,
 							.resolvedResource = resolvedResource,
 							.resourceID = resourceID,
-							.dagResourceIndex = UINT32_MAX,
+							.dagResourceIndex = dagResourceIndex,
 						});
 					}
 				}
-			});
-		}
-
-		{
-			BT_ZONE_SCOPE("RGPassAccess::BuildDenseResourceIndex");
-			size_t resourceIDCount = 0;
-			{
-				BT_ZONE_SCOPE("RGPassAccess::BuildDenseResourceIndex::CountIDs");
-				for (const auto& summary : m_framePassAccessSummaries) {
-					resourceIDCount += summary.touchedResourceIDs.size();
-				}
-			}
-			if (m_frameDAGResourceIDsByIndex.capacity() < resourceIDCount) {
-				m_frameDAGResourceIDsByIndex.reserve(resourceIDCount);
-			}
-			{
-				BT_ZONE_SCOPE("RGPassAccess::BuildDenseResourceIndex::BuildFlatUniqueIndex");
-				size_t hashCapacity = 1;
-				while (hashCapacity < resourceIDCount * 2) {
-					hashCapacity <<= 1;
-				}
-				if (m_frameDAGResourceIndexHashKeys.size() != hashCapacity) {
-					m_frameDAGResourceIndexHashKeys.assign(hashCapacity, kFrameDAGResourceIndexEmptyKey);
-					m_frameDAGResourceIndexHashValues.resize(hashCapacity);
-				}
-				else {
-					std::fill(
-						m_frameDAGResourceIndexHashKeys.begin(),
-						m_frameDAGResourceIndexHashKeys.end(),
-						kFrameDAGResourceIndexEmptyKey);
-				}
-
-				m_frameDAGResourceIDsByIndex.clear();
-				const size_t hashMask = hashCapacity - 1;
-				for (const auto& summary : m_framePassAccessSummaries) {
-					for (uint64_t resourceID : summary.touchedResourceIDs) {
-						size_t hashSlot = static_cast<size_t>(MixFrameDAGResourceID(resourceID)) & hashMask;
-						for (;;) {
-							const uint64_t key = m_frameDAGResourceIndexHashKeys[hashSlot];
-							if (key == resourceID) {
-								break;
-							}
-							if (key == kFrameDAGResourceIndexEmptyKey) {
-								const uint32_t resourceIndex = static_cast<uint32_t>(m_frameDAGResourceIDsByIndex.size());
-								m_frameDAGResourceIndexHashKeys[hashSlot] = resourceID;
-								m_frameDAGResourceIndexHashValues[hashSlot] = resourceIndex;
-								m_frameDAGResourceIDsByIndex.push_back(resourceID);
-								break;
-							}
-							hashSlot = (hashSlot + 1) & hashMask;
-						}
-					}
-				}
-			}
-			m_frameDAGResourceCount = m_frameDAGResourceIDsByIndex.size();
-			{
-				BT_ZONE_SCOPE("RGPassAccess::BuildDenseResourceIndex::ResetResourcePtrs");
-				m_frameDAGResourcePtrByIndex.assign(m_frameDAGResourceCount, nullptr);
-				m_frameDAGUnmaterializedResourceIndices.clear();
-				if (m_frameDAGUnmaterializedResourceIndices.capacity() < m_frameDAGResourceCount) {
-					m_frameDAGUnmaterializedResourceIndices.reserve(m_frameDAGResourceCount);
-				}
 			}
 		}
 
-		auto findDenseDAGResourceIndex = [&](uint64_t resourceID) -> uint32_t {
-			if (m_frameDAGResourceIndexHashKeys.empty() || resourceID == kFrameDAGResourceIndexEmptyKey) {
-				return UINT32_MAX;
-			}
-
-			const size_t hashMask = m_frameDAGResourceIndexHashKeys.size() - 1;
-			size_t hashSlot = static_cast<size_t>(MixFrameDAGResourceID(resourceID)) & hashMask;
-			for (;;) {
-				const uint64_t key = m_frameDAGResourceIndexHashKeys[hashSlot];
-				if (key == resourceID) {
-					return m_frameDAGResourceIndexHashValues[hashSlot];
-				}
-				if (key == kFrameDAGResourceIndexEmptyKey) {
-					return UINT32_MAX;
-				}
-				hashSlot = (hashSlot + 1) & hashMask;
-			}
-		};
-
-		{
-			BT_ZONE_SCOPE("RGPassAccess::AssignDenseDAGIndices");
-			auto captureDenseResourcePtr = [&](uint32_t dagResourceIndex, Resource* resolvedResource) {
-				if (dagResourceIndex == UINT32_MAX
-					|| dagResourceIndex >= m_frameDAGResourcePtrByIndex.size()
-					|| m_frameDAGResourcePtrByIndex[dagResourceIndex] != nullptr) {
-					return;
-				}
-				m_frameDAGResourcePtrByIndex[dagResourceIndex] = resolvedResource;
-				if (auto* backedResource = TryGetBackedResource(resolvedResource);
-					backedResource && !backedResource->IsMaterialized()) {
-					m_frameDAGUnmaterializedResourceIndices.push_back(dagResourceIndex);
-				}
-			};
-			for (auto& summary : m_framePassAccessSummaries) {
-				for (auto& req : summary.requirementSummaries) {
-					req.dagResourceIndex = findDenseDAGResourceIndex(req.resourceID);
-					captureDenseResourcePtr(req.dagResourceIndex, req.resolvedResource);
-				}
-				for (auto& transition : summary.internalTransitionSummaries) {
-					transition.dagResourceIndex = findDenseDAGResourceIndex(transition.resourceID);
-					captureDenseResourcePtr(transition.dagResourceIndex, transition.resolvedResource);
-				}
-			}
-		}
-
-		{
-			BT_ZONE_SCOPE("RGPassAccess::MarkWrittenDAGResourcesDense");
-			compiler.resourcesWritten.assign(m_frameDAGResourceCount, uint8_t{ 0 });
-			for (const auto& summary : m_framePassAccessSummaries) {
-				for (const auto& req : summary.requirementSummaries) {
-					if (!req.isWrite) {
-						continue;
-					}
-					if (req.dagResourceIndex != UINT32_MAX && req.dagResourceIndex < compiler.resourcesWritten.size()) {
-						compiler.resourcesWritten[req.dagResourceIndex] = 1;
-					}
-				}
-				for (const auto& transition : summary.internalTransitionSummaries) {
-					if (transition.dagResourceIndex != UINT32_MAX && transition.dagResourceIndex < compiler.resourcesWritten.size()) {
-						compiler.resourcesWritten[transition.dagResourceIndex] = 1;
-					}
-				}
-			}
-		}
+		m_frameDAGResourceCount = m_frameDAGResourceIDsByIndex.size();
 
 		{
 			BT_ZONE_SCOPE("RGPassAccess::FinalizeDensePassAccessLists");
@@ -1165,12 +1142,7 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 
 		{
 			BT_ZONE_SCOPE("RGPassAccess::BuildDAGResourceIndex");
-			m_frameDAGResourceIndexByID.clear();
 			m_frameDAGResourceIDsByIndex = std::move(flattenedResourceIDs);
-			m_frameDAGResourceIndexByID.reserve(m_frameDAGResourceIDsByIndex.size());
-			for (size_t resourceIndex = 0; resourceIndex < m_frameDAGResourceIDsByIndex.size(); ++resourceIndex) {
-				m_frameDAGResourceIndexByID.emplace(m_frameDAGResourceIDsByIndex[resourceIndex], resourceIndex);
-			}
 			m_frameDAGResourceCount = m_frameDAGResourceIDsByIndex.size();
 			m_frameDAGResourcePtrByIndex.assign(m_frameDAGResourceCount, nullptr);
 			m_frameDAGUnmaterializedResourceIndices.clear();
@@ -1182,6 +1154,15 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 
 	{
 		BT_ZONE_SCOPE("RGPassAccess::AssignDenseDAGIndicesAndPtrs");
+		auto findDAGResourceIndex = [&](uint64_t resourceID) {
+			const auto it = std::lower_bound(
+				m_frameDAGResourceIDsByIndex.begin(),
+				m_frameDAGResourceIDsByIndex.end(),
+				resourceID);
+			return it != m_frameDAGResourceIDsByIndex.end() && *it == resourceID
+				? static_cast<uint32_t>(it - m_frameDAGResourceIDsByIndex.begin())
+				: UINT32_MAX;
+		};
 		auto captureDenseResourcePtr = [&](uint32_t dagResourceIndex, const ResourceRegistry::RegistryHandle& resource) {
 			if (dagResourceIndex == UINT32_MAX
 				|| dagResourceIndex >= m_frameDAGResourcePtrByIndex.size()
@@ -1199,17 +1180,11 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 		};
 		for (auto& summary : m_framePassAccessSummaries) {
 			for (auto& req : summary.requirementSummaries) {
-				auto dagResourceIt = m_frameDAGResourceIndexByID.find(req.resourceID);
-				req.dagResourceIndex = dagResourceIt != m_frameDAGResourceIndexByID.end()
-					? static_cast<uint32_t>(dagResourceIt->second)
-					: UINT32_MAX;
+				req.dagResourceIndex = findDAGResourceIndex(req.resourceID);
 				captureDenseResourcePtr(req.dagResourceIndex, req.resource);
 			}
 			for (auto& transition : summary.internalTransitionSummaries) {
-				auto dagResourceIt = m_frameDAGResourceIndexByID.find(transition.resourceID);
-				transition.dagResourceIndex = dagResourceIt != m_frameDAGResourceIndexByID.end()
-					? static_cast<uint32_t>(dagResourceIt->second)
-					: UINT32_MAX;
+				transition.dagResourceIndex = findDAGResourceIndex(transition.resourceID);
 				captureDenseResourcePtr(transition.dagResourceIndex, transition.resource);
 			}
 		}
@@ -1223,15 +1198,13 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 				if (!req.isWrite) {
 					continue;
 				}
-				auto dagResourceIt = m_frameDAGResourceIndexByID.find(req.resourceID);
-				if (dagResourceIt != m_frameDAGResourceIndexByID.end() && dagResourceIt->second < resourcesWrittenThisFrame.size()) {
-					resourcesWrittenThisFrame[dagResourceIt->second] = 1;
+				if (req.dagResourceIndex < resourcesWrittenThisFrame.size()) {
+					resourcesWrittenThisFrame[req.dagResourceIndex] = 1;
 				}
 			}
 			for (const auto& transition : summary.internalTransitionSummaries) {
-				auto dagResourceIt = m_frameDAGResourceIndexByID.find(transition.resourceID);
-				if (dagResourceIt != m_frameDAGResourceIndexByID.end() && dagResourceIt->second < resourcesWrittenThisFrame.size()) {
-					resourcesWrittenThisFrame[dagResourceIt->second] = 1;
+				if (transition.dagResourceIndex < resourcesWrittenThisFrame.size()) {
+					resourcesWrittenThisFrame[transition.dagResourceIndex] = 1;
 				}
 			}
 		}
@@ -1239,7 +1212,6 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 
 	{
 		BT_ZONE_SCOPE("RGPassAccess::FinalizePerPassAccessLists");
-		const auto& dagResourceIndexByID = m_frameDAGResourceIndexByID;
 		ParallelForOptional("RGFinalizePassAccessLists", m_framePassAccessSummaries.size(), [&](size_t passIndex) {
 			auto& summary = m_framePassAccessSummaries[passIndex];
 			summary.touchedResourceIDs.clear();
@@ -1258,13 +1230,11 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 			std::vector<AccessRecord> records;
 			records.reserve(summary.requirementSummaries.size() + summary.internalTransitionSummaries.size());
 
-			auto mark = [&](uint64_t resourceID, AccessKind accessKind, bool isUav) {
-				auto dagResourceIt = dagResourceIndexByID.find(resourceID);
-				if (dagResourceIt == dagResourceIndexByID.end()) {
+			auto mark = [&](uint32_t dagResourceIndex, uint64_t resourceID, AccessKind accessKind, bool isUav) {
+				if (dagResourceIndex == UINT32_MAX) {
 					return;
 				}
 
-				const uint32_t dagResourceIndex = static_cast<uint32_t>(dagResourceIt->second);
 				records.push_back(AccessRecord{
 					.dagResourceIndex = dagResourceIndex,
 					.resourceID = resourceID,
@@ -1282,13 +1252,14 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 
 			for (const auto& req : summary.requirementSummaries) {
 				mark(
+					req.dagResourceIndex,
 					req.resourceID,
 					req.isWrite ? AccessKind::Write : AccessKind::Read,
 					req.isUAV);
 			}
 
 			for (const auto& transition : summary.internalTransitionSummaries) {
-				mark(transition.resourceID, AccessKind::Write, false);
+				mark(transition.dagResourceIndex, transition.resourceID, AccessKind::Write, false);
 			}
 
 			std::sort(records.begin(), records.end(), [](const AccessRecord& lhs, const AccessRecord& rhs) {
@@ -1332,25 +1303,43 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 
 void RenderGraph::RebuildSchedulingEquivalentIDCache(std::span<const uint64_t> resourceIDs) {
 	BT_ZONE_SCOPE("RenderGraph::RebuildSchedulingEquivalentIDCache");
-	m_schedulingEquivalentIDsCache.clear();
-	m_schedulingEquivalentIDFlat.clear();
-	if (m_schedulingEquivalentIDRangeByResourceIndex.size() != m_frameSchedulingResourceCount) {
-		m_schedulingEquivalentIDRangeByResourceIndex.resize(m_frameSchedulingResourceCount);
-	}
-	for (size_t i = 0; i < m_frameSchedulingResourceCount; ++i) {
-		m_schedulingEquivalentIDRangeByResourceIndex[i] = SchedulingEquivalentIDRange{};
+	{
+		BT_ZONE_SCOPE("RenderGraph::RebuildSchedulingEquivalentIDCache::Reset");
+		m_schedulingEquivalentIDsCache.clear();
+		m_schedulingEquivalentIDFlat.clear();
+		if (m_schedulingEquivalentIDRangeByResourceIndex.size() != m_frameSchedulingResourceCount) {
+			m_schedulingEquivalentIDRangeByResourceIndex.resize(m_frameSchedulingResourceCount);
+		}
+		for (size_t i = 0; i < m_frameSchedulingResourceCount; ++i) {
+			m_schedulingEquivalentIDRangeByResourceIndex[i] = SchedulingEquivalentIDRange{};
+		}
 	}
 
-	size_t schedulingPlacementCount = 0;
-	for (uint8_t hasPlacement : m_hasSchedulingPlacementByResourceIndex) {
-		schedulingPlacementCount += hasPlacement != 0 ? 1ull : 0ull;
-	}
-	if (schedulingPlacementCount == 0) {
-		return;
-	}
-	const size_t targetFlatCapacity = schedulingPlacementCount * schedulingPlacementCount;
-	if (m_schedulingEquivalentIDFlat.capacity() < targetFlatCapacity) {
-		m_schedulingEquivalentIDFlat.reserve(targetFlatCapacity);
+	auto& placedResources = m_compilerState->schedulingPlacedResources;
+	{
+		BT_ZONE_SCOPE("RenderGraph::RebuildSchedulingEquivalentIDCache::CountAndReserve");
+		placedResources.clear();
+		placedResources.reserve(m_frameSchedulingResourceIndexEntries.size());
+		for (const auto& [resourceID, resourceIndex] : m_frameSchedulingResourceIndexEntries) {
+			if (resourceIndex >= m_hasSchedulingPlacementByResourceIndex.size()
+				|| !m_hasSchedulingPlacementByResourceIndex[resourceIndex]) {
+				continue;
+			}
+			const auto& placement = m_schedulingPlacementRangeByResourceIndex[resourceIndex];
+			placedResources.push_back(CompilerState::SchedulingPlacedResource{
+				.poolID = placement.poolID,
+				.resourceID = resourceID,
+				.startByte = placement.startByte,
+				.endByte = placement.endByte,
+			});
+		}
+		if (placedResources.empty()) {
+			return;
+		}
+		std::sort(placedResources.begin(), placedResources.end(), [](const auto& lhs, const auto& rhs) {
+			return lhs.poolID != rhs.poolID ? lhs.poolID < rhs.poolID : lhs.resourceID < rhs.resourceID;
+		});
+		m_schedulingEquivalentIDFlat.reserve(placedResources.size());
 	}
 
 	auto buildEquivalentIDsInto = [&](size_t resourceIndex, uint64_t resourceID) {
@@ -1360,41 +1349,47 @@ void RenderGraph::RebuildSchedulingEquivalentIDCache(std::span<const uint64_t> r
 		}
 
 		const uint32_t offset = static_cast<uint32_t>(m_schedulingEquivalentIDFlat.size());
-		for (const auto& [candidateID, candidateIndex] : m_frameSchedulingResourceIndexEntries) {
-			const auto* otherPlacement = TryGetSchedulingPlacementRangeByResourceIndex(candidateIndex);
-			if (!otherPlacement || otherPlacement->poolID != placement->poolID) {
-				continue;
-			}
-
-			const uint64_t overlapStart = (std::max)(placement->startByte, otherPlacement->startByte);
-			const uint64_t overlapEnd = (std::min)(placement->endByte, otherPlacement->endByte);
+		const auto poolBegin = std::lower_bound(
+			placedResources.begin(),
+			placedResources.end(),
+			placement->poolID,
+			[](const auto& candidate, uint64_t poolID) { return candidate.poolID < poolID; });
+		const auto poolEnd = std::upper_bound(
+			poolBegin,
+			placedResources.end(),
+			placement->poolID,
+			[](uint64_t poolID, const auto& candidate) { return poolID < candidate.poolID; });
+		for (auto candidate = poolBegin; candidate != poolEnd; ++candidate) {
+			const uint64_t overlapStart = (std::max)(placement->startByte, candidate->startByte);
+			const uint64_t overlapEnd = (std::min)(placement->endByte, candidate->endByte);
 			if (overlapStart < overlapEnd) {
-				m_schedulingEquivalentIDFlat.push_back(candidateID);
+				if (m_schedulingEquivalentIDFlat.size() == offset
+					|| m_schedulingEquivalentIDFlat.back() != candidate->resourceID) {
+					m_schedulingEquivalentIDFlat.push_back(candidate->resourceID);
+				}
 			}
 		}
 
 		if (m_schedulingEquivalentIDFlat.size() == offset) {
 			m_schedulingEquivalentIDFlat.push_back(resourceID);
 		}
-		auto beginIt = m_schedulingEquivalentIDFlat.begin() + static_cast<std::ptrdiff_t>(offset);
-		auto endIt = m_schedulingEquivalentIDFlat.end();
-		std::sort(beginIt, endIt);
-		const auto uniqueEnd = std::unique(beginIt, endIt);
-		m_schedulingEquivalentIDFlat.erase(uniqueEnd, endIt);
 		m_schedulingEquivalentIDRangeByResourceIndex[resourceIndex] = SchedulingEquivalentIDRange{
 			.offset = offset,
 			.count = static_cast<uint32_t>(m_schedulingEquivalentIDFlat.size() - offset),
 		};
 	};
 
-	for (uint64_t resourceID : resourceIDs) {
-		auto resourceIndex = TryGetFrameSchedulingResourceIndex(resourceID);
-		if (!resourceIndex.has_value()
-			|| *resourceIndex >= m_schedulingEquivalentIDRangeByResourceIndex.size()
-			|| !TryGetSchedulingPlacementRangeByResourceIndex(*resourceIndex)) {
-			continue;
+	{
+		BT_ZONE_SCOPE("RenderGraph::RebuildSchedulingEquivalentIDCache::BuildRanges");
+		for (uint64_t resourceID : resourceIDs) {
+			auto resourceIndex = TryGetFrameSchedulingResourceIndex(resourceID);
+			if (!resourceIndex.has_value()
+				|| *resourceIndex >= m_schedulingEquivalentIDRangeByResourceIndex.size()
+				|| !TryGetSchedulingPlacementRangeByResourceIndex(*resourceIndex)) {
+				continue;
+			}
+			buildEquivalentIDsInto(*resourceIndex, resourceID);
 		}
-		buildEquivalentIDsInto(*resourceIndex, resourceID);
 	}
 }
 
@@ -1496,26 +1491,22 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		BT_PLOT("ORG.RefreshRetained.AnonymousSlotChanges", static_cast<int64_t>(m_anonymousSlotChangesThisFrame.size()));
 	}
 	using AnonymousSlotValidationEntry = RenderGraph::RetainedDeclarationCache::AnonymousSlotValidationEntry;
+	size_t resolverSnapshotCheckCount = 0;
+	size_t dynamicDeclarationCheckCount = 0;
+	size_t dynamicDeclarationChangedCount = 0;
 	auto needsRefresh = [&](auto& p) -> bool {
-		BT_ZONE_SCOPE("RenderGraph::CompileFrame::RefreshRetainedDeclarations::NeedsRefresh");
-		if (!p.name.empty()) {
-			BT_ZONE_TEXT(p.name.data(), p.name.size());
-		}
 		// Check if any stored resolver's content version has changed
 		{
-			BT_ZONE_SCOPE("RenderGraph::CompileFrame::RefreshRetainedDeclarations::NeedsRefresh::ResolverSnapshots");
-			BT_PLOT("ORG.RefreshRetained.ResolverSnapshots", static_cast<int64_t>(p.resolverSnapshots.size()));
+			resolverSnapshotCheckCount += p.resolverSnapshots.size();
 			for (const auto& snap : p.resolverSnapshots) {
 				uint64_t cv = snap.resolver->GetContentVersion();
 				if (cv != 0 && cv != snap.version) {
-					BT_ZONE_SCOPE("RenderGraph::CompileFrame::RefreshRetainedDeclarations::NeedsRefresh::ResolverChanged");
 					return true;
 				}
 			}
 		}
 
 		if (p.declarationCache.requiresStaleHandleValidation) {
-			BT_ZONE_SCOPE("RenderGraph::CompileFrame::RefreshRetainedDeclarations::NeedsRefresh::StaleHandleValidation");
 			if (!m_anonymousSlotChangesThisFrame.empty()) {
 				const auto& staticEntries = p.declarationCache.staleHandleValidationStaticRequirementAnonymousEntries;
 				const auto& transitionEntries = p.declarationCache.staleHandleValidationInternalTransitionAnonymousEntries;
@@ -1646,16 +1637,12 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 
 		{
 			BT_ZONE_SCOPE("RenderGraph::CompileFrame::RefreshRetainedDeclarations::NeedsRefresh::DeclaredResourcesChanged");
-			const std::string dynamicZoneName = p.name.empty()
-				? std::string("RG::DeclaredResourcesChanged::<unnamed>")
-				: std::string("RG::DeclaredResourcesChanged::") + p.name;
-			BT_ZONE_NAMED(dynamicDeclaredResourcesChangedZone, "RenderGraph::DeclaredResourcesChanged");
-			BT_ZONE_NAME_NAMED(dynamicDeclaredResourcesChangedZone, dynamicZoneName.c_str(), dynamicZoneName.size());
 			if (!p.name.empty()) {
 				BT_ZONE_TEXT(p.name.data(), p.name.size());
 			}
+			++dynamicDeclarationCheckCount;
 			const bool changed = p.declarationCache.dynamicInterface->DeclaredResourcesChanged();
-			BT_PLOT("ORG.RefreshRetained.DynamicDeclaredResourcesChanged", static_cast<int64_t>(changed ? 1 : 0));
+			dynamicDeclarationChangedCount += changed ? 1ull : 0ull;
 			return changed;
 		}
 		};
@@ -1678,8 +1665,6 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		BT_ZONE_SCOPE("RenderGraph::CompileFrame::RefreshRetainedDeclarations::CheckCandidates");
 		BT_PLOT("ORG.RefreshRetained.Candidates", static_cast<int64_t>(m_retainedDeclarationRefreshCandidateMasterIndices.size()));
 		for (size_t candidateIndex : m_retainedDeclarationRefreshCandidateMasterIndices) {
-			BT_ZONE_SCOPE("RenderGraph::CompileFrame::RefreshRetainedDeclarations::Candidate");
-			BT_ZONE_VALUE(static_cast<uint64_t>(candidateIndex));
 			++refreshCandidateCount;
 			if (candidateIndex >= m_masterPassList.size()) {
 				continue;
@@ -1687,9 +1672,6 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			auto& pr = m_masterPassList[candidateIndex];
 			if (pr.type == PassType::Compute) {
 				auto& p = std::get<ComputePassAndResources>(pr.pass);
-				if (!p.name.empty()) {
-					BT_ZONE_TEXT(p.name.data(), p.name.size());
-				}
 				if (needsRefresh(p)) {
 					++refreshNeededCount;
 					refreshNeededMasterIndices.push_back(candidateIndex);
@@ -1697,9 +1679,6 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			}
 			else if (pr.type == PassType::Render) {
 				auto& p = std::get<RenderPassAndResources>(pr.pass);
-				if (!p.name.empty()) {
-					BT_ZONE_TEXT(p.name.data(), p.name.size());
-				}
 				if (needsRefresh(p)) {
 					++refreshNeededCount;
 					refreshNeededMasterIndices.push_back(candidateIndex);
@@ -1707,9 +1686,6 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			}
 			else if (pr.type == PassType::Copy) {
 				auto& p = std::get<CopyPassAndResources>(pr.pass);
-				if (!p.name.empty()) {
-					BT_ZONE_TEXT(p.name.data(), p.name.size());
-				}
 				if (needsRefresh(p)) {
 					++refreshNeededCount;
 					refreshNeededMasterIndices.push_back(candidateIndex);
@@ -1718,6 +1694,9 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		}
 		BT_PLOT("ORG.RefreshRetained.CandidatesChecked", static_cast<int64_t>(refreshCandidateCount));
 		BT_PLOT("ORG.RefreshRetained.RefreshNeeded", static_cast<int64_t>(refreshNeededCount));
+		BT_PLOT("ORG.RefreshRetained.ResolverSnapshots", static_cast<int64_t>(resolverSnapshotCheckCount));
+		BT_PLOT("ORG.RefreshRetained.DynamicDeclarationChecks", static_cast<int64_t>(dynamicDeclarationCheckCount));
+		BT_PLOT("ORG.RefreshRetained.DynamicDeclaredResourcesChanged", static_cast<int64_t>(dynamicDeclarationChangedCount));
 	}
 	{
 		traceCompileStep("RefreshRetainedDeclarationApply");

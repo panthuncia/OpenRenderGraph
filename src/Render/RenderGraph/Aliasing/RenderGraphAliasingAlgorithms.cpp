@@ -1,4 +1,5 @@
 #include "Render/RenderGraph/RenderGraph.h"
+#include "../RenderGraphCompilerState.h"
 
 #include "DebugUI/MemoryIntrospectionWidget.h"
 
@@ -861,12 +862,15 @@ rg::alias::FrameAliasAnalysis& rg::alias::RenderGraphAliasingSubsystem::BuildAli
 		const uint32_t passCrit = node.criticality;
 
 		for (const auto& req : passSummary.requirementSummaries) {
-			auto resourceIndex = rg.TryGetFrameSchedulingResourceIndex(req.resourceID);
-			if (!resourceIndex) {
+			const size_t resourceIndex =
+				req.dagResourceIndex < rg.m_compilerState->schedulingResourceIndexByDagResourceIndex.size()
+				? rg.m_compilerState->schedulingResourceIndexByDagResourceIndex[req.dagResourceIndex]
+				: SIZE_MAX;
+			if (resourceIndex == SIZE_MAX) {
 				continue;
 			}
 			collectResource(
-				*resourceIndex,
+				resourceIndex,
 				req.resourceID,
 				&req.resource,
 				AccessTypeIsWriteOrCommon(req.state.access),
@@ -875,12 +879,15 @@ rg::alias::FrameAliasAnalysis& rg::alias::RenderGraphAliasingSubsystem::BuildAli
 				passIdx);
 		}
 		for (const auto& transition : passSummary.internalTransitionSummaries) {
-			auto resourceIndex = rg.TryGetFrameSchedulingResourceIndex(transition.resourceID);
-			if (!resourceIndex) {
+			const size_t resourceIndex =
+				transition.dagResourceIndex < rg.m_compilerState->schedulingResourceIndexByDagResourceIndex.size()
+				? rg.m_compilerState->schedulingResourceIndexByDagResourceIndex[transition.dagResourceIndex]
+				: SIZE_MAX;
+			if (resourceIndex == SIZE_MAX) {
 				continue;
 			}
 			collectResource(
-				*resourceIndex,
+				resourceIndex,
 				transition.resourceID,
 				nullptr,
 				true,

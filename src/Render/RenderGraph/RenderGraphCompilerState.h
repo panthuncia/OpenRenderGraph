@@ -45,7 +45,28 @@ struct RenderGraph::CompilerState {
 	std::vector<uint32_t> accessUavEpochs;
 	std::vector<uint32_t> accessDagEpochs;
 	std::vector<uint32_t> accessOrder;
+	std::vector<uint32_t> schedulingSummaryResourceEpochs;
+	std::vector<uint32_t> schedulingSummaryUAVEpochs;
+	uint32_t schedulingSummaryEpoch = 1;
+	std::vector<size_t> schedulingResourceIndexByDagResourceIndex;
+	struct SchedulingPlacedResource {
+		uint64_t poolID = 0;
+		uint64_t resourceID = 0;
+		uint64_t startByte = 0;
+		uint64_t endByte = 0;
+	};
+	std::vector<SchedulingPlacedResource> schedulingPlacedResources;
 	std::vector<uint64_t> preferredDynamicStableIDByIndex;
+	std::vector<uint64_t> compileTrackerBackingGenerationByIndex;
+	std::vector<uint8_t> compileTrackerPublishableByIndex;
+	struct CompiledResourceBatch {
+		uint64_t resourceID = 0;
+		unsigned int batchIndex = 0;
+	};
+	std::vector<std::vector<CompiledResourceBatch>> compiledLastProducerBatchByResourceByQueue;
+	std::vector<std::vector<CompiledResourceBatch>> compiledLastAccessBatchByResourceByQueue;
+	std::vector<CompiledResourceBatch> denseCompiledProducerBatchByQueueResource;
+	std::vector<CompiledResourceBatch> denseCompiledAccessBatchByQueueResource;
 	uint32_t accessEpoch = 1;
 	std::vector<size_t> refreshNeededMasterIndices;
 
