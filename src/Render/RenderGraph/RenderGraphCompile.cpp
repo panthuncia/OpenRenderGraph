@@ -3136,7 +3136,15 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		BT_ZONE_SCOPE("RenderGraph::CompileFrame::PruneUnusedQueueSignals");
 		const size_t slotCount = m_queueRegistry.SlotCount();
 
-		std::vector<std::unordered_map<UINT64, std::pair<size_t, BatchSignalPhase>>> signalOwnerByQueue(slotCount);
+		struct SignalOwner {
+			UINT64 fenceValue = 0;
+			size_t batchIndex = 0;
+			BatchSignalPhase phase = BatchSignalPhase::AfterTransitions;
+		};
+		std::vector<std::vector<SignalOwner>> signalOwnersByQueue(slotCount);
+		for (auto& owners : signalOwnersByQueue) {
+			owners.reserve(batches.size() * PassBatch::kSignalPhaseCount / (std::max)(slotCount, size_t{ 1 }));
+		}
 		for (size_t batchIndex = 0; batchIndex < batches.size(); ++batchIndex) {
 			auto& batch = batches[batchIndex];
 			for (size_t queueIndex = 0; queueIndex < batch.QueueCount(); ++queueIndex) {
@@ -3146,19 +3154,26 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 						continue;
 					}
 
-					signalOwnerByQueue[queueIndex].emplace(
-						batch.GetQueueSignalFenceValue(signalPhase, queueIndex),
-						std::make_pair(batchIndex, signalPhase));
+					signalOwnersByQueue[queueIndex].push_back(SignalOwner{
+						.fenceValue = batch.GetQueueSignalFenceValue(signalPhase, queueIndex),
+						.batchIndex = batchIndex,
+						.phase = signalPhase,
+					});
 				}
 			}
 		}
-
-		std::vector<std::array<std::vector<uint8_t>, PassBatch::kSignalPhaseCount>> requiredSignals(batches.size());
-		for (auto& requiredSignalsByPhase : requiredSignals) {
-			for (auto& requiredSignalsByQueue : requiredSignalsByPhase) {
-				requiredSignalsByQueue.assign(slotCount, 0);
-			}
+		for (auto& owners : signalOwnersByQueue) {
+			std::sort(owners.begin(), owners.end(), [](const SignalOwner& lhs, const SignalOwner& rhs) {
+				return lhs.fenceValue < rhs.fenceValue;
+			});
 		}
+
+		const auto requiredSignalIndex = [slotCount](size_t batchIndex, size_t phaseIndex, size_t queueIndex) {
+			return (batchIndex * PassBatch::kSignalPhaseCount + phaseIndex) * slotCount + queueIndex;
+		};
+		std::vector<uint8_t> requiredSignals(
+			batches.size() * PassBatch::kSignalPhaseCount * slotCount,
+			0);
 
 		for (size_t batchIndex = 0; batchIndex < batches.size(); ++batchIndex) {
 			auto& batch = batches[batchIndex];
@@ -3171,13 +3186,18 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 						}
 
 						const UINT64 waitFenceValue = batch.GetQueueWaitFenceValue(waitPhase, dstQueueIndex, srcQueueIndex);
-						auto itSignalOwner = signalOwnerByQueue[srcQueueIndex].find(waitFenceValue);
-						if (itSignalOwner == signalOwnerByQueue[srcQueueIndex].end()) {
+						const auto& owners = signalOwnersByQueue[srcQueueIndex];
+						auto itSignalOwner = std::lower_bound(
+							owners.begin(), owners.end(), waitFenceValue,
+							[](const SignalOwner& owner, UINT64 value) { return owner.fenceValue < value; });
+						if (itSignalOwner == owners.end() || itSignalOwner->fenceValue != waitFenceValue) {
 							continue;
 						}
 
-						const auto [signalBatchIndex, signalPhase] = itSignalOwner->second;
-						requiredSignals[signalBatchIndex][static_cast<size_t>(signalPhase)][srcQueueIndex] = 1;
+						requiredSignals[requiredSignalIndex(
+							itSignalOwner->batchIndex,
+							static_cast<size_t>(itSignalOwner->phase),
+							srcQueueIndex)] = 1;
 					}
 				}
 			}
@@ -3192,7 +3212,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 						continue;
 					}
 
-					if (!requiredSignals[batchIndex][signalPhaseIndex][queueIndex]) {
+					if (!requiredSignals[requiredSignalIndex(batchIndex, signalPhaseIndex, queueIndex)]) {
 						batch.ClearQueueSignal(signalPhase, queueIndex);
 					}
 				}

@@ -2707,6 +2707,7 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 				denseAccesses[denseIndex] = {
 					.resourceID = req.resource.GetGlobalResourceID(),
 					.batchIndex = decision.batchIndex,
+					.anonymous = rg._registry.IsAnonymous(req.resource),
 				};
 				if (AccessTypeIsWriteType(req.state.access)) {
 					denseProducers[denseIndex] = denseAccesses[denseIndex];
@@ -6548,6 +6549,14 @@ std::string RenderGraph::GetTechniquePathForPassName(std::string_view passName) 
 }
 
 void RenderGraph::AddResource(std::shared_ptr<Resource> resource, bool transition) {
+	if (!resource) {
+		throw std::invalid_argument("RenderGraph::AddResource received a null resource");
+	}
+	if (!resource->IsRenderGraphManaged()) {
+		throw std::runtime_error(
+			"RenderGraph::AddResource rejected externally managed shader resource '" +
+			resource->GetName() + "' (id=" + std::to_string(resource->GetGlobalResourceID()) + ")");
+	}
 	const uint64_t resourceID = resource->GetGlobalResourceID();
 	if (auto dynamicResource = std::dynamic_pointer_cast<DynamicResource>(resource)) {
 		m_dynamicResourcesByStableID[dynamicResource->GetDynamicWrapperGlobalResourceID()] = resource;
@@ -7238,6 +7247,7 @@ namespace {
 		std::vector<PassReturn>& outExternalFences;
 		std::unordered_map<ExternalFenceSignalKey, ExternalFenceSignalOrigin, ExternalFenceSignalKeyHash>& queuedExternalFenceOrigins;
 		UINT64& lastSignaledOnTimeline;
+		UINT64& greatestActuallySignaledOnTimeline;
 		bool batchTraceEnabled;
 	};
 
@@ -7302,6 +7312,8 @@ namespace {
 				args.batchIndex,
 				"AfterTransitions",
 				static_cast<unsigned>(args.context.frameIndex));
+			args.greatestActuallySignaledOnTimeline =
+				std::max(args.greatestActuallySignaledOnTimeline, signalValue);
 			args.lastSignaledOnTimeline = std::max(args.lastSignaledOnTimeline, signalValue);
 			pool.Recycle(std::move(cl0), signalValue);
 
@@ -7329,7 +7341,7 @@ namespace {
 							args.batchIndex,
 							passName);
 					}
-				rhi::debug::Scope scope(commandList, rhi::colors::Mint, std::string(passName).c_str());
+				rhi::debug::Scope scope(commandList, rhi::colors::Mint, passName.data());
 				args.context.currentPassName = passName.data();
 				args.context.currentTechniquePath = techniquePath;
 				(void)rhi::debug::SetInstrumentationContext(commandList, args.context.currentPassName, args.context.currentTechniquePath);
@@ -7440,6 +7452,8 @@ namespace {
 				args.batchIndex,
 				"AfterExecution",
 				static_cast<unsigned>(args.context.frameIndex));
+			args.greatestActuallySignaledOnTimeline =
+				std::max(args.greatestActuallySignaledOnTimeline, signalValue);
 			args.lastSignaledOnTimeline = std::max(args.lastSignaledOnTimeline, signalValue);
 			pool.Recycle(std::move(sched.preallocatedCLs[clIndex]), signalValue);
 
@@ -7488,6 +7502,8 @@ namespace {
 				args.batchIndex,
 				"AfterCompletion",
 				static_cast<unsigned>(args.context.frameIndex));
+			args.greatestActuallySignaledOnTimeline =
+				std::max(args.greatestActuallySignaledOnTimeline, recycleFence);
 			args.lastSignaledOnTimeline = std::max(args.lastSignaledOnTimeline, recycleFence);
 			pool.Recycle(std::move(sched.preallocatedCLs[clIndex]), recycleFence);
 		}
@@ -7573,7 +7589,7 @@ namespace {
 						qi,
 						passName);
 				}
-				rhi::debug::Scope scope(commandList, rhi::colors::Mint, std::string(passName).c_str());
+				rhi::debug::Scope scope(commandList, rhi::colors::Mint, passName.data());
 				args.context.currentPassName = passName.data();
 				args.context.currentTechniquePath = techniquePath;
 				(void)rhi::debug::SetInstrumentationContext(commandList, args.context.currentPassName, args.context.currentTechniquePath);
@@ -8372,12 +8388,13 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 	};
 
 	auto publishAliasPlacementProducer = [&](uint64_t resourceID, LastProducerAcrossFrames producer) {
-		removeResourceFromLastAliasPlacementCache(resourceID);
-
 		const auto* placement = TryGetAliasPlacementRange(resourceID);
 		if (!placement) {
 			return;
 		}
+		// Most tracked producers are not alias placements. Do not scan every
+		// persistent alias-pool producer list for those ordinary resources.
+		removeResourceFromLastAliasPlacementCache(resourceID);
 
 		auto itPoolState = persistentAliasPools.find(placement->poolID);
 		if (itPoolState == persistentAliasPools.end()) {
@@ -8599,7 +8616,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 							qs.numCLs);
 					}
 					qs.preallocatedCLs[ci] = SlotPool(qi)->Request();
-					if (qs.preallocatedCLs[ci].list) {
+					if (qs.preallocatedCLs[ci].list && (heavyDebug || batchTraceEnabled)) {
 						const auto queueKind = m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(qi));
 						const auto debugName = MakeRenderGraphCommandListName(
 							static_cast<unsigned>(context.frameIndex),
@@ -8649,6 +8666,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 
 	// Per-slot signal tracking for monotonic recycle signals.
 	std::vector<UINT64> lastSignaledPerSlot(slotCount);
+	std::vector<UINT64> greatestActuallySignaledPerSlot(slotCount);
 	std::vector<uint64_t> queueSlotFenceTimelineKeys(slotCount);
 	std::unordered_map<ExternalFenceSignalKey, ExternalFenceSignalOrigin, ExternalFenceSignalKeyHash> seenExternalFenceSignalsThisFrame;
 	seenExternalFenceSignalsThisFrame.reserve(32);
@@ -8707,6 +8725,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 					.outExternalFences = slotExternalFences[qi],
 					.queuedExternalFenceOrigins = queuedExternalFenceOriginsThisFrame,
 					.lastSignaledOnTimeline = lastSignaledPerSlot[qi],
+					.greatestActuallySignaledOnTimeline = greatestActuallySignaledPerSlot[qi],
 					.batchTraceEnabled = batchTraceEnabled,
 				};
 				ExecuteQueueBatch(args, WaitOnSlot);
@@ -9019,6 +9038,8 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 						rhi::ResultName(signalResult)));
 				}
 				lastSignaledPerSlot[queueIndex] = std::max(lastSignaledPerSlot[queueIndex], signalValue);
+				greatestActuallySignaledPerSlot[queueIndex] =
+					std::max(greatestActuallySignaledPerSlot[queueIndex], signalValue);
 				auto [slotSignalIt, insertedSlotSignal] = m_lastExternalSignalValueByTimeline.try_emplace(
 					PackTimelineSignalKey(fenceTimeline.GetHandle()),
 					0);
@@ -9232,20 +9253,6 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 	{
 		BT_ZONE_SCOPE("RenderGraph::Execute::UpdateCrossFrameProducerTracking");
 		const uint64_t publishSerial = ++m_crossFrameProducerPublishSerial;
-		auto isAnonymousTrackedResource = [&](uint64_t resourceID) {
-			auto itTransient = m_transientFrameResourcesByID.find(resourceID);
-			if (itTransient != m_transientFrameResourcesByID.end() && itTransient->second) {
-				return _registry.IsAnonymous(itTransient->second.get());
-			}
-
-			auto itResource = resourcesByID.find(resourceID);
-			if (itResource != resourcesByID.end() && itResource->second) {
-				return _registry.IsAnonymous(itResource->second.get());
-			}
-
-			return false;
-		};
-
 		// Publish the end-of-frame signal for each queue that accessed a tracked
 		// resource. Producers protect later reads; all accesses protect later
 		// writes from prior read-only consumers and state transitions.
@@ -9283,14 +9290,16 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 			}
 
 			if (hasAccesses) {
-				for (const auto& [resourceID, accessBatch] : m_compilerState->compiledLastAccessBatchByResourceByQueue[queueIndex]) {
+				for (const auto& accessEntry : m_compilerState->compiledLastAccessBatchByResourceByQueue[queueIndex]) {
+					const uint64_t resourceID = accessEntry.resourceID;
+					const unsigned int accessBatch = accessEntry.batchIndex;
 					if (accessBatch == 0 || accessBatch >= batches.size()) continue;
 
 					LastProducerAcrossFrames access{
 						.queueSlot = queueIndex,
 						.fenceValue = fenceValue,
 						.publishSerial = publishSerial,
-						.anonymous = isAnonymousTrackedResource(resourceID),
+						.anonymous = accessEntry.anonymous,
 					};
 					auto& accesses = nextLastAccessByResourceAcrossFrames[resourceID];
 					auto existing = std::find_if(
@@ -9311,14 +9320,16 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 			if (!hasProducers) {
 				continue;
 			}
-			for (const auto& [resourceID, producerBatch] : m_compilerState->compiledLastProducerBatchByResourceByQueue[queueIndex]) {
+			for (const auto& producerEntry : m_compilerState->compiledLastProducerBatchByResourceByQueue[queueIndex]) {
+				const uint64_t resourceID = producerEntry.resourceID;
+				const unsigned int producerBatch = producerEntry.batchIndex;
 				if (producerBatch == 0 || producerBatch >= batches.size()) continue;
 
 				LastProducerAcrossFrames producer{
 					.queueSlot = queueIndex,
 					.fenceValue = fenceValue,
 					.publishSerial = publishSerial,
-					.anonymous = isAnonymousTrackedResource(resourceID),
+					.anonymous = producerEntry.anonymous,
 				};
 				nextLastProducerByResourceAcrossFrames[resourceID] = producer;
 				publishAliasPlacementProducer(resourceID, producer);
@@ -9338,27 +9349,13 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 			return itTransient != m_transientFrameResourcesByID.end() && itTransient->second;
 		};
 
-		std::unordered_set<uint64_t> liveResourceIDs;
-		liveResourceIDs.reserve(resourcesByID.size() + m_transientFrameResourcesByID.size());
-
-		for (const auto& [resourceID, resource] : resourcesByID) {
-			if (resource) {
-				liveResourceIDs.insert(resourceID);
-			}
-		}
-		for (const auto& [resourceID, resource] : m_transientFrameResourcesByID) {
-			if (resource) {
-				liveResourceIDs.insert(resourceID);
-			}
-		}
-
 		std::erase_if(
 			nextLastProducerByResourceAcrossFrames,
 			[&](const auto& entry) {
 				if (entry.second.anonymous) {
 					return entry.second.publishSerial != m_crossFrameProducerPublishSerial;
 				}
-				return !liveResourceIDs.contains(entry.first) && !isLiveResourceID(entry.first);
+				return !isLiveResourceID(entry.first);
 			});
 
 		std::erase_if(
@@ -9371,7 +9368,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 						if (access.anonymous) {
 							return access.publishSerial != m_crossFrameProducerPublishSerial;
 						}
-						return !liveResourceIDs.contains(entry.first) && !isLiveResourceID(entry.first);
+						return !isLiveResourceID(entry.first);
 					});
 				return accesses.empty();
 			});
@@ -9385,7 +9382,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 					if (producer.producer.anonymous) {
 						return producer.producer.publishSerial != m_crossFrameProducerPublishSerial;
 					}
-					return !liveResourceIDs.contains(producer.resourceID) && !isLiveResourceID(producer.resourceID);
+					return !isLiveResourceID(producer.resourceID);
 				});
 
 			if (producers.empty()) {
@@ -9423,7 +9420,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 		std::vector<DescriptorHeapManager::QueueFenceSnapshotPoint> fenceSnapshot;
 		fenceSnapshot.reserve(slotCount);
 		for (size_t qi = 0; qi < slotCount; ++qi) {
-			const UINT64 value = lastSignaledPerSlot[qi];
+			const UINT64 value = greatestActuallySignaledPerSlot[qi];
 			if (value == 0 || value == UINT64_MAX) {
 				continue;
 			}

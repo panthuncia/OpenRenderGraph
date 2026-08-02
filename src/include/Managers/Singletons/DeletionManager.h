@@ -12,6 +12,12 @@
 
 class DeletionManager {
 public:
+	struct Stats {
+		uint64_t objectCount = 0;
+		uint64_t allocationCount = 0;
+		uint64_t trackedAllocationCount = 0;
+	};
+
 	static DeletionManager& GetInstance();
 
 	bool IsInitialized() const {
@@ -72,6 +78,21 @@ public:
 		for (int i = static_cast<int>(m_trackedAllocationDeletionQueue.size()) - 1; i >= 1; --i) {
 			m_trackedAllocationDeletionQueue[i].swap(m_trackedAllocationDeletionQueue[i - 1]);
 		}
+	}
+
+	Stats GetStats() const {
+		std::scoped_lock lock(m_mutex);
+		Stats stats{};
+		for (const auto& queue : m_deletionQueue) {
+			stats.objectCount += queue.size();
+		}
+		for (const auto& queue : m_allocationDeletionQueue) {
+			stats.allocationCount += queue.size();
+		}
+		for (const auto& queue : m_trackedAllocationDeletionQueue) {
+			stats.trackedAllocationCount += queue.size();
+		}
+		return stats;
 	}
 
 	void DrainAll() {

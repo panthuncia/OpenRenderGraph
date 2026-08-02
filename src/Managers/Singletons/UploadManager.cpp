@@ -167,6 +167,12 @@ void UploadManager::UploadTextureSubresources(
 	uint32_t srcCount)
 #endif
 {
+	if (target.kind == UploadTarget::Kind::PinnedShared && target.pinned &&
+		!target.pinned->IsRenderGraphManaged()) {
+		throw std::runtime_error(
+			"UploadManager::UploadTextureSubresources rejected an externally managed immutable shader resource ('" +
+			target.pinned->GetName() + "'). Use its external transfer service.");
+	}
 	if (!m_uploadInstance) {
 		Initialize();
 	}

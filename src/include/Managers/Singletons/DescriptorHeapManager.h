@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <mutex>
+#include <unordered_set>
 #include <variant>
 #include <vector>
 
@@ -47,8 +48,20 @@ public:
 		rhi::Timeline timeline;
 		uint64_t value = 0;
 	};
+	struct DeferredReleaseStats {
+		uint64_t releaseCount = 0;
+		uint64_t descriptorSlotCount = 0;
+		uint64_t bufferBackingCount = 0;
+		uint64_t resourceCount = 0;
+		uint64_t blockedReleaseCount = 0;
+		uint64_t invalidTimelineCount = 0;
+		uint64_t deviceErrorTimelineCount = 0;
+		uint64_t incompleteTimelineCount = 0;
+		std::vector<uint64_t> resourceIDs;
+	};
 	void PublishQueueFenceSnapshot(std::vector<QueueFenceSnapshotPoint> fenceSnapshot);
 	void ProcessDeferredReleases(uint8_t frameIndex);
+	DeferredReleaseStats GetDeferredReleaseStats();
 	// The caller must have waited for the device to become idle. Releases every
 	// pending object and forgets queue-fence snapshots before their owning queue
 	// registry destroys and recreates its timelines.
@@ -88,6 +101,7 @@ private:
 		std::vector<QueueFenceSnapshotPoint> requiredFences;
 	};
 	std::vector<DeferredRelease> m_deferredReleases;
+	std::unordered_set<const Resource*> m_deferredResourcePointers;
 	std::vector<QueueFenceSnapshotPoint> m_latestQueueFenceSnapshot;
 	std::mutex m_descriptorMutationMutex;
 };

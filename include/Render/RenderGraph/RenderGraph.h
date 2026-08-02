@@ -669,6 +669,7 @@ public:
 	std::optional<PresentDependency> GetLastPresentDependency() const noexcept { return m_lastPresentDependency; }
 	rg::memory::SnapshotProvider& GetMemorySnapshotProvider() { return m_memorySnapshotProvider; }
 	const rg::memory::SnapshotProvider& GetMemorySnapshotProvider() const { return m_memorySnapshotProvider; }
+	void WriteVramUsageDebugDumpNow(uint8_t frameIndex) const { WriteVramUsageDebugDump(frameIndex); }
 	void SetStatisticsService(std::shared_ptr<rg::runtime::IStatisticsService> service) { m_statisticsService = std::move(service); }
 	rg::runtime::IStatisticsService* GetStatisticsService() { return m_statisticsService.get(); }
 	const rg::runtime::IStatisticsService* GetStatisticsService() const { return m_statisticsService.get(); }

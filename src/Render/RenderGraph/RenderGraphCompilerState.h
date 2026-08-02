@@ -62,6 +62,7 @@ struct RenderGraph::CompilerState {
 	struct CompiledResourceBatch {
 		uint64_t resourceID = 0;
 		unsigned int batchIndex = 0;
+		bool anonymous = false;
 	};
 	std::vector<std::vector<CompiledResourceBatch>> compiledLastProducerBatchByResourceByQueue;
 	std::vector<std::vector<CompiledResourceBatch>> compiledLastAccessBatchByResourceByQueue;

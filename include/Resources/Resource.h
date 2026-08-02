@@ -16,6 +16,10 @@ class SymbolicTracker;
 
 class Resource : public std::enable_shared_from_this<Resource> {
 public:
+	enum class GraphOwnership : uint8_t {
+		GraphManaged = 0,
+		ExternalImmutableShaderResource,
+	};
 	struct ECSEntityHandle {
 		struct DeferredState {
 			mutable std::mutex mutex;
@@ -176,6 +180,9 @@ public:
 	// Identity used by render-graph scheduling. Dynamic wrappers override this so
 	// dependency identity remains stable when their backing resource changes.
 	virtual uint64_t GetSchedulingResourceID() const { return GetGlobalResourceID(); }
+	GraphOwnership GetGraphOwnership() const noexcept { return m_graphOwnership; }
+	void SetGraphOwnership(GraphOwnership ownership) noexcept { m_graphOwnership = ownership; }
+	bool IsRenderGraphManaged() const noexcept { return m_graphOwnership == GraphOwnership::GraphManaged; }
     virtual rhi::BarrierBatch GetEnhancedBarrierGroup(RangeSpec range, rhi::ResourceAccessType prevAccessType, rhi::ResourceAccessType newAccessType, rhi::ResourceLayout prevLayout, rhi::ResourceLayout newLayout, rhi::ResourceSyncState prevSyncState, rhi::ResourceSyncState newSyncState) = 0;
 	bool HasLayout() const { return m_hasLayout; }
 	void AddAliasedResource(Resource* resource) {
@@ -219,6 +226,7 @@ private:
     inline static std::atomic<uint64_t> globalResourceCount;
 	inline static ECSEntityHooks s_ecsEntityHooks{};
     uint64_t m_globalResourceID;
+	GraphOwnership m_graphOwnership = GraphOwnership::GraphManaged;
 	ECSEntityHandle m_ecsEntity; // For access through ECS queries without dereferencing Flecs during teardown
 
     //friend class RenderGraph;
