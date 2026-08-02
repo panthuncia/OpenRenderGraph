@@ -421,6 +421,41 @@ namespace rg::imm {
             if (itH == m_handles.end())
                 continue;
 
+            // Buffer copies and the common single-subresource texture case do not
+            // need the general rectangle merger.  Immediate upload/readback passes
+            // touch many such resources, and constructing two hash tables plus a
+            // scratch vector for each one was the dominant per-frame materialization
+            // allocation cost.
+            if (acc.totalMips == 1u && acc.perMip.size() == 1u && acc.perMip.front().size() == 1u) {
+                const auto& interval = acc.perMip.front().front();
+                ResourceRequirement rr{ itH->second };
+                rr.resourceHandleAndRange.range = RectToRangeSpec(
+                    Rect{ 0u, 0u, interval.lo, interval.hi },
+                    acc.totalMips,
+                    acc.totalSlices);
+                rr.state = acc.state;
+                out.requirements.push_back(std::move(rr));
+                continue;
+            }
+
+            const bool coversWholeResource =
+                acc.totalMips != 0u && acc.totalSlices != 0u &&
+                acc.perMip.size() == acc.totalMips &&
+                std::all_of(acc.perMip.begin(), acc.perMip.end(), [&](const auto& intervals) {
+                    return intervals.size() == 1u && intervals.front().lo == 0u &&
+                        intervals.front().hi + 1u == acc.totalSlices;
+                });
+            if (coversWholeResource) {
+                ResourceRequirement rr{ itH->second };
+                rr.resourceHandleAndRange.range = RectToRangeSpec(
+                    Rect{ 0u, acc.totalMips - 1u, 0u, acc.totalSlices - 1u },
+                    acc.totalMips,
+                    acc.totalSlices);
+                rr.state = acc.state;
+                out.requirements.push_back(std::move(rr));
+                continue;
+            }
+
             // Build rectangles by extending identical slice-intervals across consecutive mips.
             std::unordered_map<uint64_t, Rect> open; // key=(sl0,sl1)
             open.reserve(64);

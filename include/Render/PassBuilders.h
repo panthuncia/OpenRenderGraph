@@ -633,16 +633,47 @@ namespace detail
     inline std::vector<ResourceRequirement> BuildRequirements(SyncFunction&& syncFunction, Sources&&... sources) {
         std::vector<std::pair<ResourceHandleAndRange, rhi::ResourceAccessType>> entries;
         entries.reserve((std::get<0>(sources).get().size() + ... + 0ull));
+		bool canUseUniqueResourceFastPath = true;
 
         auto append = [&](auto&& src) {
             auto const& list = std::get<0>(src).get();
             auto access = std::get<1>(src);
             for (auto const& rr : list) {
+				if (access == rhi::ResourceAccessType::Common) {
+					canUseUniqueResourceFastPath = false;
+				}
+				else if (canUseUniqueResourceFastPath) {
+					const uint64_t resourceID = rr.resource.GetGlobalResourceID();
+					canUseUniqueResourceFastPath = std::none_of(
+						entries.begin(), entries.end(),
+						[resourceID](const auto& entry) {
+							return entry.first.resource.GetGlobalResourceID() == resourceID;
+						});
+				}
                 entries.emplace_back(rr, access);
             }
         };
 
         (append(std::forward<Sources>(sources)), ...);
+
+		// Dynamic upload/readback declarations overwhelmingly contain one range per
+		// resource.  The symbolic tracker is only needed when multiple declarations
+		// for the same resource must be merged.  Avoid two hash tables, one tracker
+		// per resource, and temporary transition vectors for the unique case.
+		if (canUseUniqueResourceFastPath) {
+			std::vector<ResourceRequirement> out;
+			out.reserve(entries.size());
+			for (const auto& [resourceAndRange, access] : entries) {
+				ResourceRequirement requirement(resourceAndRange);
+				requirement.state = ResourceState{
+					access,
+					AccessToLayout(access, /*directQueue=*/true),
+					syncFunction(access)
+				};
+				out.push_back(std::move(requirement));
+			}
+			return out;
+		}
 
         constexpr ResourceState initialState{
             rhi::ResourceAccessType::Common,

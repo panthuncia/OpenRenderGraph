@@ -210,59 +210,6 @@ void UploadManager::ProcessDeferredReleases(uint8_t frameIndex)
 	}
 }
 
-void UploadManager::DeclareUploadPassResourceUsages(RenderPassBuilder* builder)
-{
-	if (!builder) {
-		return;
-	}
-
-	{
-		std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
-		RefreshQueuedCopyTelemetryLocked();
-		for (const auto& copy : queuedResourceCopies) {
-			if (copy.source) {
-				builder->WithCopySource(copy.source);
-			}
-			if (copy.destination) {
-				builder->WithCopyDest(copy.destination);
-			}
-		}
-	}
-
-	if (!m_uploadInstance) {
-		return;
-	}
-
-	m_uploadInstance->DeclarePendingUploadResourceUsages(
-		[builder](const std::shared_ptr<Resource>& source) {
-			if (source) {
-				builder->WithCopySource(source);
-			}
-		},
-		[builder](const UploadTarget& target, uint32_t mip, uint32_t slice) {
-			const bool isBuffer = mip == UINT32_MAX && slice == UINT32_MAX;
-			switch (target.kind) {
-			case UploadTarget::Kind::PinnedShared:
-				if (!target.pinned) {
-					return;
-				}
-				if (isBuffer) {
-					builder->WithCopyDest(target.pinned);
-				} else {
-					builder->WithCopyDest(ResourcePtrAndRange{ target.pinned, SingleSubresourceRange(mip, slice) });
-				}
-				break;
-			case UploadTarget::Kind::RegistryHandle:
-				if (isBuffer) {
-					builder->WithCopyDest(ResourceHandleAndRange{ target.h });
-				} else {
-					builder->WithCopyDest(ResourceHandleAndRange{ target.h, SingleSubresourceRange(mip, slice) });
-				}
-				break;
-			}
-		});
-}
-
 std::string UploadManager::DescribeQueuedTargetByGlobalResourceId(uint64_t globalResourceId)
 {
 	if (globalResourceId == 0) {

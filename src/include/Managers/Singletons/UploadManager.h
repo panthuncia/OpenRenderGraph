@@ -104,7 +104,7 @@ private:
 		}
 
 		void DeclareResourceUsages(RenderPassBuilder* builder) override {
-			GetInstance().DeclareUploadPassResourceUsages(builder);
+			(void)builder;
 		}
 
 		void Setup() override {
@@ -128,6 +128,9 @@ private:
 			return m_declaredResourcesDirty.exchange(false);
 		}
 
+		bool RequiresPassRebindAfterDeclarationRefresh() const noexcept override { return false; }
+		bool DeclarationsProvidedByImmediateCommands() const noexcept override { return true; }
+
 		void MarkDeclaredResourcesDirty() {
 			m_declaredResourcesDirty.store(true);
 		}
@@ -141,7 +144,6 @@ private:
 		m_uploadPass = std::make_shared<UploadPass>();
 	}
 	void MarkUploadPassDirty();
-	void DeclareUploadPassResourceUsages(RenderPassBuilder* builder);
 	void CaptureResourceCopyTelemetry(ResourceCopy& copy);
 	void RefreshQueuedCopyTelemetryLocked();
 	bool IsUploadTargetValid(const UploadTarget& target, const char* reason, const char* file, int line);

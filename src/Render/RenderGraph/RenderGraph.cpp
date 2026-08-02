@@ -3535,6 +3535,15 @@ void RenderGraph::ShutdownOwnedState() {
 	m_masterPassList.clear();
 	m_compilerState->immediateModePassPointers.clear();
 	m_compilerState->immediateModeInterfaces.clear();
+	m_compilerState->densePassAccessKeys.clear();
+	m_compilerState->frameExtensions.clear();
+	m_compilerState->frameExtensionPassNames.clear();
+	m_compilerState->frameExplicitAfterByName.clear();
+	m_compilerState->pendingFrameInserts.clear();
+	m_compilerState->frameInsertSlotHeads.clear();
+	m_compilerState->frameInsertSlotTails.clear();
+	m_compilerState->pendingInsertIndexByName.clear();
+	m_compilerState->pendingInsertTailByAnchorName.clear();
 	m_retainedDeclarationRefreshCandidateMasterIndices.clear();
 	m_framePasses.clear();
 	m_framePassIsFrameExtension.clear();
@@ -5087,6 +5096,7 @@ void RenderGraph::ResetStructuralBuildState() {
 	m_passBuilderOrder.clear();
 	m_passNamesSeenThisReset.clear();
 	m_framePassAccessSummaryCache.clear();
+	m_compilerState->densePassAccessKeys.clear();
 	m_retainedDeclarationRefreshCandidateMasterIndices.clear();
 }
 
@@ -5556,7 +5566,7 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(RenderPassAndResources& p,
 	if (traceLifecycle) {
 		spdlog::info("RG frame {} refresh render pass '{}' declare complete requirements={} transitions={}", frameIndex, p.name, b.GatherResourceRequirements().size(), b.params.internalTransitions.size());
 	}
-	const auto& refreshedRequirements = b.GatherResourceRequirements();
+	auto refreshedRequirements = b.GatherResourceRequirements();
 	BT_PLOT("ORG.RefreshRetained.Render.Requirements", static_cast<int64_t>(refreshedRequirements.size()));
 	BT_PLOT("ORG.RefreshRetained.Render.InternalTransitions", static_cast<int64_t>(b.params.internalTransitions.size()));
 	BT_PLOT("ORG.RefreshRetained.Render.DeclaredIds", static_cast<int64_t>(b.DeclaredResourceIds().size()));
@@ -5564,17 +5574,17 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(RenderPassAndResources& p,
 	// Update the frame view used by scheduling
 	{
 		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Render)::StoreRequirements");
-		p.resources.staticResourceRequirements = refreshedRequirements;
+		p.resources.staticResourceRequirements = std::move(refreshedRequirements);
 		p.resources.mergedFrameRequirementsDirty = true;
 
 		// Internal transitions also affect scheduling
-		p.resources.internalTransitions = b.params.internalTransitions;
+		p.resources.internalTransitions = std::move(b.params.internalTransitions);
 
-		p.resources.identifierSet = b.DeclaredResourceIds();
-		p.resources.autoDescriptorShaderResources = b.params.autoDescriptorShaderResources;
-		p.resources.autoDescriptorConstantBuffers = b.params.autoDescriptorConstantBuffers;
-		p.resources.autoDescriptorUnorderedAccessViews = b.params.autoDescriptorUnorderedAccessViews;
-		p.resources.activeFeatureDomains = b.params.activeFeatureDomains;
+		p.resources.identifierSet = std::move(b._declaredIds);
+		p.resources.autoDescriptorShaderResources = std::move(b.params.autoDescriptorShaderResources);
+		p.resources.autoDescriptorConstantBuffers = std::move(b.params.autoDescriptorConstantBuffers);
+		p.resources.autoDescriptorUnorderedAccessViews = std::move(b.params.autoDescriptorUnorderedAccessViews);
+		p.resources.activeFeatureDomains = std::move(b.params.activeFeatureDomains);
 	}
 	if (traceLifecycle) {
 		spdlog::info("RG frame {} refresh render pass '{}' materialize referenced resources begin", frameIndex, p.name);
@@ -5597,8 +5607,12 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(RenderPassAndResources& p,
 		UpdateRetainedDeclarationCache(PassType::Render, p.name, p);
 	}
 
-	// Ensure the pass's view matches the refreshed identifier set
-	{
+	const bool requiresPassRebind = !p.declarationCache.dynamicInterface ||
+		p.declarationCache.dynamicInterface->RequiresPassRebindAfterDeclarationRefresh();
+	// Only retained passes that resolve through their view or perform declaration-
+	// dependent setup need these execution helpers rebuilt. Immediate-only upload
+	// and readback passes consume the resources captured in their bytecode.
+	if (requiresPassRebind) {
 		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Render)::SetResourceRegistryView");
 		p.pass->SetResourceRegistryView(
 			std::make_unique<ResourceRegistryView>(_registry, p.resources.identifierSet),
@@ -5611,7 +5625,7 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(RenderPassAndResources& p,
 	if (traceLifecycle) {
 		spdlog::info("RG frame {} refresh render pass '{}' setup begin", frameIndex, p.name);
 	}
-	{
+	if (requiresPassRebind) {
 		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Render)::Setup");
 		p.pass->Setup();
 	}
@@ -5653,21 +5667,21 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(ComputePassAndResources& p
 	if (traceLifecycle) {
 		spdlog::info("RG frame {} refresh compute pass '{}' declare complete requirements={} transitions={}", frameIndex, p.name, b.GatherResourceRequirements().size(), b.params.internalTransitions.size());
 	}
-	const auto& refreshedRequirements = b.GatherResourceRequirements();
+	auto refreshedRequirements = b.GatherResourceRequirements();
 	BT_PLOT("ORG.RefreshRetained.Compute.Requirements", static_cast<int64_t>(refreshedRequirements.size()));
 	BT_PLOT("ORG.RefreshRetained.Compute.InternalTransitions", static_cast<int64_t>(b.params.internalTransitions.size()));
 	BT_PLOT("ORG.RefreshRetained.Compute.DeclaredIds", static_cast<int64_t>(b.DeclaredResourceIds().size()));
 
 	{
 		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Compute)::StoreRequirements");
-		p.resources.staticResourceRequirements = refreshedRequirements;
+		p.resources.staticResourceRequirements = std::move(refreshedRequirements);
 		p.resources.mergedFrameRequirementsDirty = true;
-		p.resources.internalTransitions = b.params.internalTransitions;
-		p.resources.identifierSet = b.DeclaredResourceIds();
-		p.resources.autoDescriptorShaderResources = b.params.autoDescriptorShaderResources;
-		p.resources.autoDescriptorConstantBuffers = b.params.autoDescriptorConstantBuffers;
-		p.resources.autoDescriptorUnorderedAccessViews = b.params.autoDescriptorUnorderedAccessViews;
-		p.resources.activeFeatureDomains = b.params.activeFeatureDomains;
+		p.resources.internalTransitions = std::move(b.params.internalTransitions);
+		p.resources.identifierSet = std::move(b._declaredIds);
+		p.resources.autoDescriptorShaderResources = std::move(b.params.autoDescriptorShaderResources);
+		p.resources.autoDescriptorConstantBuffers = std::move(b.params.autoDescriptorConstantBuffers);
+		p.resources.autoDescriptorUnorderedAccessViews = std::move(b.params.autoDescriptorUnorderedAccessViews);
+		p.resources.activeFeatureDomains = std::move(b.params.activeFeatureDomains);
 	}
 	if (traceLifecycle) {
 		spdlog::info("RG frame {} refresh compute pass '{}' materialize referenced resources begin", frameIndex, p.name);
@@ -5690,7 +5704,9 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(ComputePassAndResources& p
 		UpdateRetainedDeclarationCache(PassType::Compute, p.name, p);
 	}
 
-	{
+	const bool requiresPassRebind = !p.declarationCache.dynamicInterface ||
+		p.declarationCache.dynamicInterface->RequiresPassRebindAfterDeclarationRefresh();
+	if (requiresPassRebind) {
 		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Compute)::SetResourceRegistryView");
 		p.pass->SetResourceRegistryView(
 			std::make_unique<ResourceRegistryView>(_registry, p.resources.identifierSet),
@@ -5704,7 +5720,7 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(ComputePassAndResources& p
 		spdlog::info("RG frame {} refresh compute pass '{}' setup begin", frameIndex, p.name);
 	}
 
-	{
+	if (requiresPassRebind) {
 		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Compute)::Setup");
 		p.pass->Setup();
 	}
@@ -5746,17 +5762,17 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(CopyPassAndResources& p, u
 	if (traceLifecycle) {
 		spdlog::info("RG frame {} refresh copy pass '{}' declare complete requirements={} transitions={}", frameIndex, p.name, b.GatherResourceRequirements().size(), b.params.internalTransitions.size());
 	}
-	const auto& refreshedRequirements = b.GatherResourceRequirements();
+	auto refreshedRequirements = b.GatherResourceRequirements();
 	BT_PLOT("ORG.RefreshRetained.Copy.Requirements", static_cast<int64_t>(refreshedRequirements.size()));
 	BT_PLOT("ORG.RefreshRetained.Copy.InternalTransitions", static_cast<int64_t>(b.params.internalTransitions.size()));
 	BT_PLOT("ORG.RefreshRetained.Copy.DeclaredIds", static_cast<int64_t>(b.DeclaredResourceIds().size()));
 
 	{
 		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Copy)::StoreRequirements");
-		p.resources.staticResourceRequirements = refreshedRequirements;
+		p.resources.staticResourceRequirements = std::move(refreshedRequirements);
 		p.resources.mergedFrameRequirementsDirty = true;
-		p.resources.internalTransitions = b.params.internalTransitions;
-		p.resources.identifierSet = b.DeclaredResourceIds();
+		p.resources.internalTransitions = std::move(b.params.internalTransitions);
+		p.resources.identifierSet = std::move(b._declaredIds);
 	}
 	if (traceLifecycle) {
 		spdlog::info("RG frame {} refresh copy pass '{}' materialize referenced resources begin", frameIndex, p.name);
@@ -5779,7 +5795,9 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(CopyPassAndResources& p, u
 		UpdateRetainedDeclarationCache(PassType::Copy, p.name, p);
 	}
 
-	{
+	const bool requiresPassRebind = !p.declarationCache.dynamicInterface ||
+		p.declarationCache.dynamicInterface->RequiresPassRebindAfterDeclarationRefresh();
+	if (requiresPassRebind) {
 		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Copy)::SetResourceRegistryView");
 		p.pass->SetResourceRegistryView(
 			std::make_unique<ResourceRegistryView>(_registry, p.resources.identifierSet)
@@ -5789,7 +5807,7 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(CopyPassAndResources& p, u
 		spdlog::info("RG frame {} refresh copy pass '{}' setup begin", frameIndex, p.name);
 	}
 
-	{
+	if (requiresPassRebind) {
 		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Copy)::Setup");
 		p.pass->Setup();
 	}

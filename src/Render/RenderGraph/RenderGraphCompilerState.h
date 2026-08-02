@@ -39,6 +39,7 @@ struct RenderGraph::CompilerState {
 	std::vector<size_t> dependencyReadyHeap;
 
 	std::vector<uint64_t> resourceIDs;
+	std::vector<uint64_t> densePassAccessKeys;
 	std::vector<uint8_t> resourcesWritten;
 	std::vector<uint32_t> accessEpochs;
 	std::vector<uint32_t> accessWriteEpochs;
@@ -70,6 +71,20 @@ struct RenderGraph::CompilerState {
 	std::vector<CompiledResourceBatch> denseCompiledAccessBatchByQueueResource;
 	uint32_t accessEpoch = 1;
 	std::vector<size_t> refreshNeededMasterIndices;
+
+	struct PendingFrameInsert {
+		AnyPassAndResources* pass = nullptr;
+		size_t slotIndex = 0;
+		size_t nextInsertIndex = std::numeric_limits<size_t>::max();
+	};
+	std::vector<ExternalPassDesc> frameExtensions;
+	std::unordered_set<std::string> frameExtensionPassNames;
+	std::vector<std::pair<std::string, std::string>> frameExplicitAfterByName;
+	std::vector<PendingFrameInsert> pendingFrameInserts;
+	std::vector<size_t> frameInsertSlotHeads;
+	std::vector<size_t> frameInsertSlotTails;
+	std::unordered_map<std::string_view, size_t> pendingInsertIndexByName;
+	std::unordered_map<std::string_view, size_t> pendingInsertTailByAnchorName;
 
 	std::vector<const void*> immediateModePassPointers;
 	std::vector<IHasImmediateModeCommands*> immediateModeInterfaces;

@@ -555,6 +555,7 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 	{
 		BT_ZONE_SCOPE("RGPassAccess::DenseFullRebuild");
 		compiler.resourceIDs.clear();
+		compiler.densePassAccessKeys.resize(m_framePasses.size(), 0);
 
 		{
 			BT_ZONE_SCOPE("RGPassAccess::InitializeDenseResourceIndex");
@@ -657,41 +658,94 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 			for (size_t passIndex = 0; passIndex < m_framePasses.size(); ++passIndex) {
 				const auto& pass = m_framePasses[passIndex];
 				auto& summary = m_framePassAccessSummaries[passIndex];
-				summary.requirementSummaries.clear();
-				summary.internalTransitionSummaries.clear();
-				summary.touchedResourceIDs.clear();
-				summary.uavResourceIDs.clear();
-				summary.dagAccesses.clear();
-				summary.type = pass.type;
-				summary.preferredQueueKind = DefaultPreferredQueueKind(pass.type);
-				summary.queueAssignmentPolicy = DefaultQueueAssignmentPolicy(pass.type);
-				summary.pinnedQueueSlot.reset();
+				uint64_t accessKey = 0;
+				if (passIndex >= m_framePassIsFrameExtension.size()
+					|| m_framePassIsFrameExtension[passIndex] == 0) {
+					accessKey = std::visit([](const auto& passAndResources) -> uint64_t {
+						using T = std::decay_t<decltype(passAndResources)>;
+						if constexpr (std::is_same_v<T, std::monostate>) {
+							return 0;
+						}
+						else {
+							if (passAndResources.run != PassRunMask::Retained
+								|| !passAndResources.resources.frameResourceRequirements.empty()) {
+								return 0;
+							}
+							const uint64_t declarationKey = passAndResources.declarationCache.staticAccessCacheKey != 0
+								? passAndResources.declarationCache.staticAccessCacheKey
+								: passAndResources.declarationCache.retainedAccessCacheKey;
+							return declarationKey == 0
+								? 0
+								: HashCombine64(declarationKey, reinterpret_cast<uintptr_t>(passAndResources.pass.get()));
+						}
+					}, pass.pass);
+				}
+				const bool reuseSummary = accessKey != 0
+					&& compiler.densePassAccessKeys[passIndex] == accessKey
+					&& summary.type == pass.type;
+				compiler.densePassAccessKeys[passIndex] = accessKey;
+
+				if (!reuseSummary) {
+					summary.requirementSummaries.clear();
+					summary.internalTransitionSummaries.clear();
+					summary.touchedResourceIDs.clear();
+					summary.uavResourceIDs.clear();
+					summary.dagAccesses.clear();
+					summary.type = pass.type;
+					summary.preferredQueueKind = DefaultPreferredQueueKind(pass.type);
+					summary.queueAssignmentPolicy = DefaultQueueAssignmentPolicy(pass.type);
+					summary.pinnedQueueSlot.reset();
+				}
 
 				PassView view = GetPassView(pass);
-				if (summary.requirementSummaries.capacity() < view.reqs.size()) {
+				if (!reuseSummary && summary.requirementSummaries.capacity() < view.reqs.size()) {
 					summary.requirementSummaries.reserve(view.reqs.size());
 				}
 				const size_t internalTransitionCount = view.internalTransitions ? view.internalTransitions->size() : 0;
-				if (summary.internalTransitionSummaries.capacity() < internalTransitionCount) {
+				if (!reuseSummary && summary.internalTransitionSummaries.capacity() < internalTransitionCount) {
 					summary.internalTransitionSummaries.reserve(internalTransitionCount);
 				}
-				if (pass.type == PassType::Render) {
+				if (!reuseSummary && pass.type == PassType::Render) {
 					const auto& passResources = std::get<RenderPassAndResources>(pass.pass).resources;
 					summary.preferredQueueKind = passResources.preferredQueueKind;
 					summary.queueAssignmentPolicy = passResources.queueAssignmentPolicy;
 					summary.pinnedQueueSlot = passResources.pinnedQueueSlot;
 				}
-				else if (pass.type == PassType::Compute) {
+				else if (!reuseSummary && pass.type == PassType::Compute) {
 					const auto& passResources = std::get<ComputePassAndResources>(pass.pass).resources;
 					summary.preferredQueueKind = passResources.preferredQueueKind;
 					summary.queueAssignmentPolicy = passResources.queueAssignmentPolicy;
 					summary.pinnedQueueSlot = passResources.pinnedQueueSlot;
 				}
-				else if (pass.type == PassType::Copy) {
+				else if (!reuseSummary && pass.type == PassType::Copy) {
 					const auto& passResources = std::get<CopyPassAndResources>(pass.pass).resources;
 					summary.preferredQueueKind = passResources.preferredQueueKind;
 					summary.queueAssignmentPolicy = passResources.queueAssignmentPolicy;
 					summary.pinnedQueueSlot = passResources.pinnedQueueSlot;
+				}
+
+				if (reuseSummary) {
+					for (auto& req : summary.requirementSummaries) {
+						const auto [resourceID, dagResourceIndex] =
+							registerDenseHandleResource(req.resource, req.resolvedResource);
+						req.resourceID = resourceID;
+						req.dagResourceIndex = dagResourceIndex;
+						captureDenseResourcePtr(dagResourceIndex, req.resolvedResource);
+						if (req.isWrite && dagResourceIndex < compiler.resourcesWritten.size()) {
+							compiler.resourcesWritten[dagResourceIndex] = 1;
+						}
+					}
+					for (auto& transition : summary.internalTransitionSummaries) {
+						const auto [resourceID, dagResourceIndex] =
+							registerDenseHandleResource(transition.resource, transition.resolvedResource);
+						transition.resourceID = resourceID;
+						transition.dagResourceIndex = dagResourceIndex;
+						captureDenseResourcePtr(dagResourceIndex, transition.resolvedResource);
+						if (dagResourceIndex < compiler.resourcesWritten.size()) {
+							compiler.resourcesWritten[dagResourceIndex] = 1;
+						}
+					}
+					continue;
 				}
 
 				for (const auto& req : view.reqs) {
@@ -1483,6 +1537,25 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		autoAliasPreviousMode = autoAliasModeLastFrame;
 	}
 
+	// Gather frame work before retained declarations and immediate command recording.
+	// Frame hooks are allowed to publish work to retained structural passes (notably
+	// streaming uploads).  Gathering here lets those passes consume that work in their
+	// normal structural slot instead of requiring a duplicate late-upload frame pass.
+	auto& frameExt = m_compilerState->frameExtensions;
+	frameExt.clear();
+	if (frameExt.capacity() < 16) {
+		frameExt.reserve(16);
+	}
+	{
+		traceCompileStep("GatherFrameExtensions");
+		BT_ZONE_SCOPE("RenderGraph::CompileFrame::GatherFrameExtensions");
+		for (auto& ext : m_extensions) {
+			if (!ext) continue;
+			ext->GatherFramePasses(*this, frameExt);
+		}
+	}
+	BT_PLOT("ORG.FrameExtensions.EmittedPasses", static_cast<int64_t>(frameExt.size()));
+
 	traceCompileStep("RefreshRetainedDeclarations");
 	{
 		traceCompileStep("RefreshRetainedDeclarations::AnonymousSlotChanges");
@@ -1643,11 +1716,13 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			++dynamicDeclarationCheckCount;
 			const bool changed = p.declarationCache.dynamicInterface->DeclaredResourcesChanged();
 			dynamicDeclarationChangedCount += changed ? 1ull : 0ull;
-			return changed;
+			return changed &&
+				!p.declarationCache.dynamicInterface->DeclarationsProvidedByImmediateCommands();
 		}
 		};
 
-	std::unordered_set<std::string> frameExtensionPassNames;
+	auto& frameExtensionPassNames = m_compilerState->frameExtensionPassNames;
+	frameExtensionPassNames.clear();
 	auto& refreshNeededMasterIndices = m_compilerState->refreshNeededMasterIndices;
 	refreshNeededMasterIndices.clear();
 	if (refreshNeededMasterIndices.capacity() < m_retainedDeclarationRefreshCandidateMasterIndices.size()) {
@@ -2059,25 +2134,14 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		}
 	}
 
-	// Per-frame extension passes (ephemeral)
+	// Materialize the genuinely ephemeral passes gathered before structural refresh.
 	// These are injected into the per-frame pass list (not m_masterPassList) so they do not accumulate.
-	std::vector<ExternalPassDesc> frameExt;
-	frameExt.reserve(16);
-	{
-		traceCompileStep("GatherFrameExtensions");
-		BT_ZONE_SCOPE("RenderGraph::CompileFrame::GatherFrameExtensions");
-		for (auto& ext : m_extensions) {
-			if (!ext) continue;
-			ext->GatherFramePasses(*this, frameExt);
-		}
-	}
-
 	// explicit After(anchor) edges (anchorName -> injectedName)
-	std::vector<std::pair<std::string, std::string>> explicitAfterByName;
+	auto& explicitAfterByName = m_compilerState->frameExplicitAfterByName;
 	{
 		traceCompileStep("CopyStructuralExplicitEdges");
 		BT_ZONE_SCOPE("RenderGraph::CompileFrame::CopyStructuralExplicitEdges");
-		explicitAfterByName = m_structuralExplicitAfterByName;
+		explicitAfterByName.assign(m_structuralExplicitAfterByName.begin(), m_structuralExplicitAfterByName.end());
 		explicitAfterByName.reserve(m_structuralExplicitAfterByName.size() + frameExt.size());
 	}
 
@@ -2197,33 +2261,19 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 
 		const auto& baseFramePasses = m_baseFramePassRefs;
 
-		std::unordered_map<std::string_view, size_t> baseFramePassIndexByName;
-		{
-			traceCompileStep("BuildBaseFramePassIndex");
-			BT_ZONE_SCOPE("RenderGraph::CompileFrame::BuildBaseFramePassIndex");
-			baseFramePassIndexByName.reserve(baseFramePasses.size() + frameExt.size());
-			for (size_t i = 0; i < baseFramePasses.size(); ++i) {
-				const AnyPassAndResources* basePass = baseFramePasses[i];
-				if (basePass && !basePass->name.empty()) {
-					baseFramePassIndexByName[basePass->name] = i;
-				}
-			}
-		}
-
-		struct PendingFrameInsert {
-			AnyPassAndResources* pass = nullptr;
-			size_t slotIndex = 0;
-			size_t nextInsertIndex = (std::numeric_limits<size_t>::max)();
-		};
-
 		const size_t invalidInsertIndex = (std::numeric_limits<size_t>::max)();
-		std::vector<PendingFrameInsert> pendingFrameInserts;
+		auto& pendingFrameInserts = m_compilerState->pendingFrameInserts;
+		pendingFrameInserts.clear();
 		pendingFrameInserts.reserve(frameExt.size());
-		std::vector<size_t> slotHeadByIndex(baseFramePasses.size() + 1, invalidInsertIndex);
-		std::vector<size_t> slotTailByIndex(baseFramePasses.size() + 1, invalidInsertIndex);
-		std::unordered_map<std::string_view, size_t> pendingInsertIndexByName;
+		auto& slotHeadByIndex = m_compilerState->frameInsertSlotHeads;
+		auto& slotTailByIndex = m_compilerState->frameInsertSlotTails;
+		slotHeadByIndex.assign(baseFramePasses.size() + 1, invalidInsertIndex);
+		slotTailByIndex.assign(baseFramePasses.size() + 1, invalidInsertIndex);
+		auto& pendingInsertIndexByName = m_compilerState->pendingInsertIndexByName;
+		pendingInsertIndexByName.clear();
 		pendingInsertIndexByName.reserve(frameExt.size());
-		std::unordered_map<std::string_view, size_t> pendingInsertTailByAnchorName;
+		auto& pendingInsertTailByAnchorName = m_compilerState->pendingInsertTailByAnchorName;
+		pendingInsertTailByAnchorName.clear();
 		pendingInsertTailByAnchorName.reserve(frameExt.size());
 		if (m_frameExtensionPasses.capacity() < frameExt.size()) {
 			m_frameExtensionPasses.reserve(frameExt.size());
@@ -2272,7 +2322,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				}
 				m_frameExtensionPasses.emplace_back(std::move(any));
 				const size_t pendingIndex = pendingFrameInserts.size();
-				pendingFrameInserts.push_back(PendingFrameInsert{ .pass = std::addressof(m_frameExtensionPasses.back()) });
+				pendingFrameInserts.push_back(CompilerState::PendingFrameInsert{ .pass = std::addressof(m_frameExtensionPasses.back()) });
 
 				std::string_view anchorName;
 				bool insertedRelativeToAnchor = false;
@@ -2295,10 +2345,14 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 							break;
 						}
 
-						auto baseAnchorIt = baseFramePassIndexByName.find(a);
-						if (baseAnchorIt != baseFramePassIndexByName.end()) {
+						auto baseAnchorIt = std::find_if(baseFramePasses.begin(), baseFramePasses.end(), [&](const AnyPassAndResources* basePass) {
+							return basePass && basePass->name == a;
+						});
+						if (baseAnchorIt != baseFramePasses.end()) {
 							anchorName = a;
-							appendPendingToSlot(pendingIndex, baseAnchorIt->second + 1);
+							appendPendingToSlot(
+								pendingIndex,
+								static_cast<size_t>(baseAnchorIt - baseFramePasses.begin()) + 1);
 							insertedRelativeToAnchor = true;
 							break;
 						}
@@ -2393,7 +2447,9 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 					p.name = "RenderPass#" + std::to_string(i);
 				}
 				any.name = p.name;
-				p.statisticsIndex = static_cast<int>(m_statisticsService->RegisterPass(p.name, p.resources.isGeometryPass, p.techniquePath));
+				if (p.statisticsIndex < 0) {
+					p.statisticsIndex = static_cast<int>(m_statisticsService->RegisterPass(p.name, p.resources.isGeometryPass, p.techniquePath));
+				}
 			}
 			else if (any.type == PassType::Compute) {
 				auto& p = std::get<ComputePassAndResources>(any.pass);
@@ -2405,7 +2461,9 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 					p.name = "ComputePass#" + std::to_string(i);
 				}
 				any.name = p.name;
-				p.statisticsIndex = static_cast<int>(m_statisticsService->RegisterPass(p.name, false, p.techniquePath));
+				if (p.statisticsIndex < 0) {
+					p.statisticsIndex = static_cast<int>(m_statisticsService->RegisterPass(p.name, false, p.techniquePath));
+				}
 			}
 			else if (any.type == PassType::Copy) {
 				auto& p = std::get<CopyPassAndResources>(any.pass);
@@ -2417,7 +2475,9 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 					p.name = "CopyPass#" + std::to_string(i);
 				}
 				any.name = p.name;
-				p.statisticsIndex = static_cast<int>(m_statisticsService->RegisterPass(p.name, false, p.techniquePath));
+				if (p.statisticsIndex < 0) {
+					p.statisticsIndex = static_cast<int>(m_statisticsService->RegisterPass(p.name, false, p.techniquePath));
+				}
 			}
 		}
 

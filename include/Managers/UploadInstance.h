@@ -167,9 +167,6 @@ public:
 	// Call during DeclareResourceUsages to declare copy targets.
 	void CollectPendingDestinations(std::vector<std::shared_ptr<Resource>>& out) const;
 	void CollectPendingDestinationsThrough(uint64_t sequenceInclusive, std::vector<std::shared_ptr<Resource>>& out) const;
-	void DeclarePendingUploadResourceUsages(
-		const std::function<void(const std::shared_ptr<Resource>&)>& copySource,
-		const std::function<void(const UploadTarget&, uint32_t mip, uint32_t slice)>& copyDest);
 
 	std::string DescribeQueuedTargetByGlobalResourceId(uint64_t globalResourceId);
 
@@ -243,10 +240,6 @@ private:
 	std::vector<TextureUpdate>   m_textureUpdates;
 	uint64_t                     m_lastUploadSequence = 0;
 	uint64_t                     m_lastSealedUploadSequence = 0;
-	std::vector<uint64_t>        m_declarePendingUploadSourceBits;
-	std::vector<size_t>          m_declarePendingUploadSourceMarkedWords;
-	std::vector<uint64_t>        m_declarePendingUploadBufferDestBits;
-	std::vector<size_t>          m_declarePendingUploadBufferDestMarkedWords;
 	struct UploadTelemetryTarget {
 		uint64_t bufferWrites = 0;
 		uint64_t textureWrites = 0;
