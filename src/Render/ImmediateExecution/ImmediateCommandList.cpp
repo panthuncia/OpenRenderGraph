@@ -392,6 +392,7 @@ namespace rg::imm {
 
     void ImmediateCommandList::Reset() {
         m_writer.Reset();
+		m_requirements.clear();
         m_handles.clear();
         m_access.clear();
         if (m_keepAlive) {
@@ -399,18 +400,27 @@ namespace rg::imm {
         }
     }
 
+	void ImmediateCommandList::Reset(FrameData&& recycled) {
+		m_writer.data = std::move(recycled.bytecode);
+		m_requirements = std::move(recycled.requirements);
+		m_keepAlive = std::move(recycled.keepAlive);
+		Reset();
+	}
+
     FrameData ImmediateCommandList::Finalize() {
         FrameData out;
-        if (!HasRecordedWork()) {
-            return out;
-        }
-
         out.bytecode = std::move(m_writer.data);
+		out.requirements = std::move(m_requirements);
         if (m_keepAlive && !m_keepAlive->pins.empty()) {
             out.keepAlive = std::move(m_keepAlive);
         }
+		if (out.bytecode.empty()) {
+			return out;
+		}
 
-        out.requirements.reserve(64);
+		if (out.requirements.capacity() < 64) {
+			out.requirements.reserve(64);
+		}
 
         for (auto& [rid, acc] : m_access)
         {

@@ -909,6 +909,7 @@ private:
 		std::vector<size_t> requiredResourceIndices;
 		std::vector<size_t> waitDependencyResourceIndices;
 		std::vector<size_t> touchedResourceIndices;
+		std::vector<size_t> writtenResourceIndices;
 		std::vector<size_t> uavResourceIndices;
 	};
 
@@ -1220,7 +1221,7 @@ private:
 	std::unordered_map<std::string, std::shared_ptr<Resource>> m_transientFrameResourcesByName;
 	std::unordered_map<uint64_t, uint64_t> resourceBackingGenerationByID;
 	std::unordered_map<uint64_t, uint32_t> resourceIdleFrameCounts;
-	std::unordered_map<uint64_t, uint64_t> compiledResourceGenerationByID;
+	std::vector<std::pair<uint64_t, uint64_t>> compiledResourceGenerations;
 	using ResourceMaterializeOptions = std::variant<PixelBuffer::MaterializeOptions, BufferBase::MaterializeOptions>;
 	std::unordered_map<uint64_t, ResourceMaterializeOptions> aliasMaterializeOptionsByID;
 	std::vector<std::optional<ResourceMaterializeOptions>> m_aliasMaterializeOptionsByResourceIndex;
@@ -1535,10 +1536,7 @@ private:
 		int                               lastProdBatch,
 		int                               lastUsageBatch)
 	{
-		BT_ZONE_SCOPE("RenderGraph::ApplySynchronizationImpl");
-		if (!passName.empty()) {
-			BT_ZONE_TEXT(passName.data(), passName.size());
-		}
+		(void)passName;
 		if (passQueueSlot == sourceQueueSlot) {
 			return;
 		}

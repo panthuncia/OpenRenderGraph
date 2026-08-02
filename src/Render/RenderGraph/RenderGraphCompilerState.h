@@ -47,6 +47,7 @@ struct RenderGraph::CompilerState {
 	std::vector<uint32_t> accessDagEpochs;
 	std::vector<uint32_t> accessOrder;
 	std::vector<uint32_t> schedulingSummaryResourceEpochs;
+	std::vector<uint32_t> schedulingSummaryWriteEpochs;
 	std::vector<uint32_t> schedulingSummaryUAVEpochs;
 	uint32_t schedulingSummaryEpoch = 1;
 	std::vector<size_t> schedulingResourceIndexByDagResourceIndex;
@@ -80,6 +81,8 @@ struct RenderGraph::CompilerState {
 	std::vector<ExternalPassDesc> frameExtensions;
 	std::unordered_set<std::string> frameExtensionPassNames;
 	std::vector<std::pair<std::string, std::string>> frameExplicitAfterByName;
+	std::vector<std::pair<std::string_view, size_t>> explicitPassNameIndices;
+	std::vector<std::pair<size_t, size_t>> explicitEdges;
 	std::vector<PendingFrameInsert> pendingFrameInserts;
 	std::vector<size_t> frameInsertSlotHeads;
 	std::vector<size_t> frameInsertSlotTails;

@@ -1916,7 +1916,20 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		}
 		return m_compilerState->immediateModeInterfaces[masterPassIndex];
 	};
-	auto prepareImmediateContext = [&](ImmediateExecutionContext& context) -> ImmediateExecutionContext& {
+	auto prepareImmediateContext = [&](ImmediateExecutionContext& context, auto& pass) -> ImmediateExecutionContext& {
+		context.frameIndex = frameIndex;
+		context.hostData = hostData;
+		rg::imm::FrameData recycled{
+			std::move(pass.immediateBytecode),
+			std::move(pass.resources.frameResourceRequirements),
+			{}
+		};
+		pass.immediateKeepAlive.reset();
+		pass.resources.mergedFrameRequirementsDirty = true;
+		context.list.Reset(std::move(recycled));
+		return context;
+	};
+	auto prepareFreshImmediateContext = [&](ImmediateExecutionContext& context) -> ImmediateExecutionContext& {
 		context.frameIndex = frameIndex;
 		context.hostData = hostData;
 		context.list.Reset();
@@ -1947,12 +1960,8 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				continue;
 			}
 
-			// reset per-frame only for passes that actually record immediate work
-			p.immediateBytecode.clear();
-			p.immediateKeepAlive.reset();
-			ClearImmediateFrameRequirements(p.resources);
-
-			auto& c = prepareImmediateContext(computeImmediateContext);
+			// Re-record into the storage retained by this pass from the previous frame.
+			auto& c = prepareImmediateContext(computeImmediateContext, p);
 
 			// Record immediate-mode commands
 			{
@@ -1969,13 +1978,16 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				}
 			}
 
-			if (!c.list.HasRecordedWork()) {
+			const bool hasRecordedWork = c.list.HasRecordedWork();
+			auto immediateFrameData = c.list.Finalize();
+			if (!hasRecordedWork) {
+				p.immediateBytecode = std::move(immediateFrameData.bytecode);
+				p.immediateKeepAlive = std::move(immediateFrameData.keepAlive);
+				SetImmediateFrameRequirements(p.resources, std::move(immediateFrameData.requirements));
 				p.run = PassRunMask::Retained;
 				appendBaseFramePassRef(pr);
 				continue;
 			}
-
-			auto immediateFrameData = c.list.Finalize();
 			// If there is a conflict between retained and immediate requirements, split the pass
 			bool conflict = RequirementsConflict(
 				p.resources.staticResourceRequirements,
@@ -2014,11 +2026,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				continue;
 			}
 
-			p.immediateBytecode.clear();
-			p.immediateKeepAlive.reset();
-			ClearImmediateFrameRequirements(p.resources);
-
-			auto& c = prepareImmediateContext(renderImmediateContext);
+			auto& c = prepareImmediateContext(renderImmediateContext, p);
 			{
 				BT_ZONE_SCOPE("RenderGraph::CompileFrame::RecordImmediateCommands");
 				if (!p.name.empty()) {
@@ -2032,12 +2040,16 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 					spdlog::info("RG frame {} render pass '{}' RecordImmediateCommands complete", frameIndex, p.name);
 				}
 			}
-			if (!c.list.HasRecordedWork()) {
+			const bool hasRecordedWork = c.list.HasRecordedWork();
+			auto immediateFrameData = c.list.Finalize();
+			if (!hasRecordedWork) {
+				p.immediateBytecode = std::move(immediateFrameData.bytecode);
+				p.immediateKeepAlive = std::move(immediateFrameData.keepAlive);
+				SetImmediateFrameRequirements(p.resources, std::move(immediateFrameData.requirements));
 				p.run = PassRunMask::Retained;
 				appendBaseFramePassRef(pr);
 				continue;
 			}
-			auto immediateFrameData = c.list.Finalize();
 
 			bool conflict = RequirementsConflict(
 				p.resources.staticResourceRequirements,
@@ -2077,11 +2089,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				continue;
 			}
 
-			p.immediateBytecode.clear();
-			p.immediateKeepAlive.reset();
-			ClearImmediateFrameRequirements(p.resources);
-
-			auto& c = prepareImmediateContext(copyImmediateContext);
+			auto& c = prepareImmediateContext(copyImmediateContext, p);
 
 			{
 				BT_ZONE_SCOPE("RenderGraph::CompileFrame::RecordImmediateCommands");
@@ -2096,12 +2104,16 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 					spdlog::info("RG frame {} copy pass '{}' RecordImmediateCommands complete", frameIndex, p.name);
 				}
 			}
-			if (!c.list.HasRecordedWork()) {
+			const bool hasRecordedWork = c.list.HasRecordedWork();
+			auto immediateFrameData = c.list.Finalize();
+			if (!hasRecordedWork) {
+				p.immediateBytecode = std::move(immediateFrameData.bytecode);
+				p.immediateKeepAlive = std::move(immediateFrameData.keepAlive);
+				SetImmediateFrameRequirements(p.resources, std::move(immediateFrameData.requirements));
 				p.run = PassRunMask::Retained;
 				appendBaseFramePassRef(pr);
 				continue;
 			}
-			auto immediateFrameData = c.list.Finalize();
 
 			bool conflict = RequirementsConflict(
 				p.resources.staticResourceRequirements,
@@ -2160,7 +2172,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				p.immediateKeepAlive.reset();
 				ClearImmediateFrameRequirements(p.resources);
 
-				auto& c = prepareImmediateContext(computeImmediateContext);
+				auto& c = prepareFreshImmediateContext(computeImmediateContext);
 
 				{
 					BT_ZONE_SCOPE("RenderGraph::CompileFrame::RecordImmediateCommands");
@@ -2196,7 +2208,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				p.immediateKeepAlive.reset();
 				ClearImmediateFrameRequirements(p.resources);
 
-				auto& c = prepareImmediateContext(copyImmediateContext);
+				auto& c = prepareFreshImmediateContext(copyImmediateContext);
 
 				{
 					BT_ZONE_SCOPE("RenderGraph::CompileFrame::RecordImmediateCommands");
@@ -2232,7 +2244,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				p.immediateKeepAlive.reset();
 				ClearImmediateFrameRequirements(p.resources);
 
-				auto& c = prepareImmediateContext(renderImmediateContext);
+				auto& c = prepareFreshImmediateContext(renderImmediateContext);
 
 				{
 					BT_ZONE_SCOPE("RenderGraph::CompileFrame::RecordImmediateCommands");
@@ -2485,27 +2497,44 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	}
 
 	// Convert explicit After(anchorName)->(passName) constraints into node-index edges.
-	std::vector<std::pair<size_t, size_t>> explicitEdges;
+	auto& explicitEdges = m_compilerState->explicitEdges;
 	{
 		traceCompileStep("BuildExplicitEdges");
 		BT_ZONE_SCOPE("RenderGraph::CompileFrame::BuildExplicitEdges");
-		explicitEdges.reserve(explicitAfterByName.size());
+		explicitEdges.clear();
+		if (explicitEdges.capacity() < explicitAfterByName.size()) {
+			explicitEdges.reserve(explicitAfterByName.size());
+		}
 		if (!explicitAfterByName.empty()) {
-			std::unordered_map<std::string_view, size_t> nameToIndex;
-			nameToIndex.reserve(m_framePasses.size());
+			auto& nameToIndex = m_compilerState->explicitPassNameIndices;
+			nameToIndex.clear();
+			if (nameToIndex.capacity() < m_framePasses.size()) {
+				nameToIndex.reserve(m_framePasses.size());
+			}
 			for (size_t i = 0; i < m_framePasses.size(); ++i) {
 				if (!m_framePasses[i].name.empty()) {
-					nameToIndex[m_framePasses[i].name] = i;
+					nameToIndex.emplace_back(m_framePasses[i].name, i);
 				}
 			}
+			std::sort(nameToIndex.begin(), nameToIndex.end(), [](const auto& lhs, const auto& rhs) {
+				return lhs.first < rhs.first;
+			});
+			auto findPassIndex = [&](std::string_view name) -> std::optional<size_t> {
+				auto it = std::lower_bound(nameToIndex.begin(), nameToIndex.end(), name,
+					[](const auto& entry, std::string_view value) { return entry.first < value; });
+				if (it == nameToIndex.end() || it->first != name) {
+					return std::nullopt;
+				}
+				return it->second;
+			};
 			for (auto const& e : explicitAfterByName) {
-				auto itA = nameToIndex.find(std::string_view(e.first));
-				auto itB = nameToIndex.find(std::string_view(e.second));
-				if (itA == nameToIndex.end() || itB == nameToIndex.end()) {
+				auto anchorIndex = findPassIndex(e.first);
+				auto passIndex = findPassIndex(e.second);
+				if (!anchorIndex || !passIndex) {
 					spdlog::warn("Explicit After edge dropped (anchor='{}', pass='{}'): name not found in frame pass list.", e.first, e.second);
 					continue;
 				}
-				explicitEdges.push_back({ itA->second, itB->second });
+				explicitEdges.emplace_back(*anchorIndex, *passIndex);
 			}
 		}
 	}

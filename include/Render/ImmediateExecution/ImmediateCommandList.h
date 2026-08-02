@@ -241,6 +241,10 @@ namespace rg::imm {
         }
 
         void Reset();
+		// Reuse the owning storage emitted for this pass on the previous frame.
+		// Immediate pass recording is rebuilt every frame, but its typical bytecode
+		// and requirement cardinality is stable.
+		void Reset(FrameData&& recycled);
 
 		bool HasRecordedWork() const noexcept {
 			return !m_writer.data.empty();
@@ -580,6 +584,7 @@ namespace rg::imm {
         void* m_resolveUser = nullptr;
 
         BytecodeWriter m_writer;
+		std::vector<ResourceRequirement> m_requirements;
 
 
 		// Keep-alive for ephemeral resources only valid during this command list's execution
