@@ -32,6 +32,7 @@ struct RenderPassParameters {
 	std::vector<ResourceHandleAndRange> copyTargets;
 	std::vector<ResourceHandleAndRange> copySources;
 	std::vector<ResourceHandleAndRange> indirectArgumentBuffers;
+	std::vector<ResourceHandleAndRange> indexBuffers;
 	std::vector<ResourceHandleAndRange> presentResources;
 	std::vector<ResourceHandleAndRange> legacyInteropResources;
 	std::vector<std::pair<ResourceHandleAndRange, ResourceState>> internalTransitions;

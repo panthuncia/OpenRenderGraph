@@ -871,6 +871,13 @@ public:
 
     template<typename... Args>
         requires ((NotIResourceResolver<Args>) && ...)
+    RenderPassBuilder& WithIndexBuffer(Args&&... args) & {
+        (addIndexBuffer(std::forward<Args>(args)), ...);
+        return *this;
+    }
+
+    template<typename... Args>
+        requires ((NotIResourceResolver<Args>) && ...)
     RenderPassBuilder& WithLegacyInterop(Args&&... args)& {
         (addLegacyInterop(std::forward<Args>(args)), ...);
         return *this;
@@ -977,6 +984,13 @@ public:
         requires ((NotIResourceResolver<Args>) && ...)
     RenderPassBuilder WithIndirectArguments(Args&&... args) && {
         (addIndirectArguments(std::forward<Args>(args)), ...);
+        return std::move(*this);
+    }
+
+    template<typename... Args>
+        requires ((NotIResourceResolver<Args>) && ...)
+    RenderPassBuilder WithIndexBuffer(Args&&... args) && {
+        (addIndexBuffer(std::forward<Args>(args)), ...);
         return std::move(*this);
     }
 
@@ -1494,6 +1508,15 @@ private:
         detail::AppendTrackedResource(graph, _declaredIds, params.indirectArgumentBuffers, std::forward<T>(x));
 		return *this;
 	}
+
+    template<typename T>
+        requires ResourceLike<T>
+    RenderPassBuilder& addIndexBuffer(T&& x) {
+        detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
+        detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
+        detail::AppendTrackedResource(graph, _declaredIds, params.indexBuffers, std::forward<T>(x));
+        return *this;
+    }
 	template <class Range>
 		requires (std::ranges::range<Range>&&
     ResourceLike<std::ranges::range_value_t<Range>>)
@@ -1600,6 +1623,7 @@ private:
             std::pair{ std::cref(params.copySources), rhi::ResourceAccessType::CopySource },
             std::pair{ std::cref(params.copyTargets), rhi::ResourceAccessType::CopyDest },
             std::pair{ std::cref(params.indirectArgumentBuffers), rhi::ResourceAccessType::IndirectArgument },
+            std::pair{ std::cref(params.indexBuffers), rhi::ResourceAccessType::IndexBuffer },
                 std::pair{ std::cref(params.presentResources), rhi::ResourceAccessType::Present },
             std::pair{ std::cref(params.legacyInteropResources), rhi::ResourceAccessType::Common });
     }
