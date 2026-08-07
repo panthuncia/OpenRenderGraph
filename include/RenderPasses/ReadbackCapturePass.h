@@ -10,6 +10,9 @@
 #include "Resources/PixelBuffer.h"
 #include "Resources/ResourceStateTracker.h"
 
+
+namespace org {
+
 struct ReadbackCaptureInputs {
     ResourceHandleAndRange target;
 
@@ -21,7 +24,7 @@ public:
     ReadbackCapturePass(
         ReadbackCaptureInputs inputs,
         ReadbackCaptureCallback callback,
-        rg::runtime::IReadbackService* readbackService,
+        org::runtime::IReadbackService* readbackService,
         std::string debugCaptureName = {})
         : m_callback(std::move(callback)),
         m_readbackService(readbackService),
@@ -168,8 +171,11 @@ public:
 
 private:
     ReadbackCaptureCallback m_callback;
-    rg::runtime::ReadbackCaptureToken m_pendingToken{};
-    rg::runtime::IReadbackService* m_readbackService = nullptr; // non-owning
+    org::runtime::ReadbackCaptureToken m_pendingToken{};
+    org::runtime::IReadbackService* m_readbackService = nullptr; // non-owning
     std::string m_debugCaptureName;
     bool m_hasPendingToken = false;
 };
+
+
+} // namespace org

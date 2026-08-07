@@ -5,7 +5,7 @@
 
 #include "Render/Runtime/OpenRenderGraphSettings.h"
 
-namespace rg::runtime {
+namespace org::runtime {
 
 class IRenderGraphSettingsService {
 public:

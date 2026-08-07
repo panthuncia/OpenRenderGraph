@@ -11,7 +11,10 @@
 #include "Interfaces/IResourceResolver.h"
 #include "Resources/Resource.h"
 
+
 /// Inputs for the StreamingUploadPass. Contains all pending uploads to process.
+namespace org {
+
 struct StreamingUploadInputs {
     std::vector<StreamingUploadDescriptor> uploads;
     /// Optional resolver for additional resources that are copy destinations
@@ -20,9 +23,9 @@ struct StreamingUploadInputs {
     std::unique_ptr<IResourceResolver> poolResolver;
 };
 
-inline rg::Hash64 HashValue(const StreamingUploadInputs& i) {
+inline org::Hash64 HashValue(const StreamingUploadInputs& i) {
     // Ephemeral per-frame pass; hash by upload count for differentiation
-    return static_cast<rg::Hash64>(i.uploads.size());
+    return static_cast<org::Hash64>(i.uploads.size());
 }
 
 inline bool operator==(const StreamingUploadInputs& a, const StreamingUploadInputs& b) {
@@ -78,3 +81,6 @@ public:
 
     void Cleanup() override {}
 };
+
+
+} // namespace org

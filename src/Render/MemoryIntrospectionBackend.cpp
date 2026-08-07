@@ -5,7 +5,7 @@
 #include "Resources/MemoryStatisticsComponents.h"
 #include "Resources/ResourceIdentifier.h"
 
-namespace rg::memory {
+namespace org::memory {
 
 namespace {
 class ECSMemorySnapshotProvider final : public IMemorySnapshotProvider {

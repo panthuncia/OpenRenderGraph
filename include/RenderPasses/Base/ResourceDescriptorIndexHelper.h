@@ -11,6 +11,9 @@
 #include "Render/FeatureDomainRegistry.h"
 #include "Render/ResourceRegistry.h"
 
+
+namespace org {
+
 class ResourceIndexOrDynamicResource {
 public:
 	bool isDynamic = false;
@@ -370,3 +373,6 @@ private:
 
 	std::shared_ptr<ResourceRegistryView> m_resourceRegistryView;
 };
+
+
+} // namespace org

@@ -19,6 +19,9 @@
 #include <rhi_helpers.h>
 #include <spdlog/spdlog.h>
 
+
+namespace org {
+
 namespace ui {
 
     namespace {
@@ -884,3 +887,6 @@ namespace ui {
     }
 
 } // namespace ui
+
+
+} // namespace org

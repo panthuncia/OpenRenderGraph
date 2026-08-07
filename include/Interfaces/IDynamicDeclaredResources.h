@@ -1,5 +1,7 @@
 #pragma once
 
+namespace org {
+
 struct IDynamicDeclaredResources {
 	virtual bool DeclaredResourcesChanged() const = 0;
 
@@ -13,3 +15,5 @@ struct IDynamicDeclaredResources {
 	virtual bool DeclarationsProvidedByImmediateCommands() const noexcept { return false; }
 	virtual ~IDynamicDeclaredResources() = default;
 };
+
+} // namespace org

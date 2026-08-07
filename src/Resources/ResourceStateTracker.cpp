@@ -6,6 +6,9 @@
 
 #include "Resources/Resource.h"
 
+
+namespace org {
+
 SubresourceRange ResolveRangeSpec(const RangeSpec& spec,
     const uint32_t totalMips,
     const uint32_t totalSlices)
@@ -529,3 +532,6 @@ bool ValidateNoConflictingTransitions(
 
     return true;
 }
+
+
+} // namespace org

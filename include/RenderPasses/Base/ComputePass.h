@@ -19,6 +19,9 @@
 #include "Render/ShaderAPI.h"
 #include "Render/QueueKind.h"
 
+
+namespace org {
+
 struct ComputePassParameters {
 	std::vector<ResourceHandleAndRange> shaderResources;
 	std::vector<ResourceHandleAndRange> constantBuffers;
@@ -88,7 +91,7 @@ protected:
 	virtual void DeclareResourceUsages(ComputePassBuilder* builder) {};
 
 	void BindResourceDescriptorIndices(rhi::CommandList& commandList, const PipelineResources& resources) {
-		unsigned int indices[rg::shaderapi::kNumResourceDescriptorIndicesRootConstants] = {};
+		unsigned int indices[org::shaderapi::kNumResourceDescriptorIndicesRootConstants] = {};
 		int i = 0;
 		for (auto& binding : resources.mandatoryResourceDescriptorSlots) {
 			indices[i] = m_resourceDescriptorIndexHelper->GetResourceDescriptorIndex(binding, false);
@@ -99,7 +102,7 @@ protected:
 			i++;
 		}
 		if (i > 0) {
-			commandList.PushConstants(rhi::ShaderStage::Compute, 0, rg::shaderapi::kResourceDescriptorIndicesRootParameter, 0, i, indices);
+			commandList.PushConstants(rhi::ShaderStage::Compute, 0, org::shaderapi::kResourceDescriptorIndicesRootParameter, 0, i, indices);
 		}
 	}
 
@@ -127,3 +130,6 @@ protected:
 	friend class ComputePassBuilder;
 	friend class RenderGraph;
 };
+
+
+} // namespace org

@@ -41,6 +41,8 @@
 #include "Render/RenderGraph/RenderGraphCompileProfile.h"
 #include "Interfaces/IResourceResolver.h"
 
+namespace org {
+
 class Resource;
 class RenderPassBuilder;
 class ComputePassBuilder;
@@ -318,7 +320,7 @@ public:
 
 		PassRunMask run = PassRunMask::Both; // default behavior
 		std::vector<std::byte> immediateBytecode; // Stores the immediate execution bytecode
-		std::shared_ptr<rg::imm::KeepAliveBag> immediateKeepAlive = nullptr; // Keeps alive resources used by immediate execution bytecode
+		std::shared_ptr<org::imm::KeepAliveBag> immediateKeepAlive = nullptr; // Keeps alive resources used by immediate execution bytecode
 		std::vector<std::shared_ptr<Resource>> retainedAnonymousKeepAlive; // Keeps retained anonymous handles alive across frames
 		std::vector<ResolverSnapshot> resolverSnapshots; // Versioned resolver snapshots for auto-invalidation
 		RetainedDeclarationCache declarationCache;
@@ -334,7 +336,7 @@ public:
 
 		PassRunMask run = PassRunMask::Both;
 		std::vector<std::byte> immediateBytecode; // Stores the immediate execution bytecode
-		std::shared_ptr<rg::imm::KeepAliveBag> immediateKeepAlive = nullptr; // Keeps alive resources used by immediate execution bytecode
+		std::shared_ptr<org::imm::KeepAliveBag> immediateKeepAlive = nullptr; // Keeps alive resources used by immediate execution bytecode
 		std::vector<std::shared_ptr<Resource>> retainedAnonymousKeepAlive; // Keeps retained anonymous handles alive across frames
 		std::vector<ResolverSnapshot> resolverSnapshots; // Versioned resolver snapshots for auto-invalidation
 		RetainedDeclarationCache declarationCache;
@@ -350,7 +352,7 @@ public:
 
 		PassRunMask run = PassRunMask::Both;
 		std::vector<std::byte> immediateBytecode;
-		std::shared_ptr<rg::imm::KeepAliveBag> immediateKeepAlive = nullptr;
+		std::shared_ptr<org::imm::KeepAliveBag> immediateKeepAlive = nullptr;
 		std::vector<std::shared_ptr<Resource>> retainedAnonymousKeepAlive; // Keeps retained anonymous handles alive across frames
 		std::vector<ResolverSnapshot> resolverSnapshots; // Versioned resolver snapshots for auto-invalidation
 		RetainedDeclarationCache declarationCache;
@@ -643,15 +645,15 @@ public:
 	RenderGraph(rhi::Device device);
 	~RenderGraph();
 	static void ShutdownRuntime();
-	using AutoAliasReasonCount = rg::alias::AutoAliasReasonCount;
-	using AutoAliasExcludedResourceDebug = rg::alias::AutoAliasExcludedResourceDebug;
-	using AutoAliasPoolRangeDebug = rg::alias::AutoAliasPoolRangeDebug;
-	using AutoAliasPoolDebug = rg::alias::AutoAliasPoolDebug;
-	using AutoAliasDebugSnapshot = rg::alias::AutoAliasDebugSnapshot;
+	using AutoAliasReasonCount = org::alias::AutoAliasReasonCount;
+	using AutoAliasExcludedResourceDebug = org::alias::AutoAliasExcludedResourceDebug;
+	using AutoAliasPoolRangeDebug = org::alias::AutoAliasPoolRangeDebug;
+	using AutoAliasPoolDebug = org::alias::AutoAliasPoolDebug;
+	using AutoAliasDebugSnapshot = org::alias::AutoAliasDebugSnapshot;
 	AutoAliasDebugSnapshot GetAutoAliasDebugSnapshot() const;
 	void BuildMemoryIntrospectionFrameGraphSnapshot(
 		ui::FrameGraphSnapshot& out,
-		const std::vector<rg::memory::ResourceMemoryRecord>& memoryRecords) const;
+		const std::vector<org::memory::ResourceMemoryRecord>& memoryRecords) const;
 	void AddRenderPass(std::shared_ptr<RenderPass> pass, RenderPassParameters& resources, std::string name = "", std::vector<ResolverSnapshot> resolverSnapshots = {});
 	void AddComputePass(std::shared_ptr<ComputePass> pass, ComputePassParameters& resources, std::string name = "", std::vector<ResolverSnapshot> resolverSnapshots = {});
 	void AddCopyPass(std::shared_ptr<CopyPass> pass, CopyPassParameters& resources, std::string name = "", std::vector<ResolverSnapshot> resolverSnapshots = {});
@@ -667,27 +669,27 @@ public:
 	void RegisterExtension(std::unique_ptr<IRenderGraphExtension> ext, std::optional<std::string_view> id = std::nullopt);
 	const std::vector<PassBatch>& GetBatches() const { return batches; }
 	std::optional<PresentDependency> GetLastPresentDependency() const noexcept { return m_lastPresentDependency; }
-	rg::memory::SnapshotProvider& GetMemorySnapshotProvider() { return m_memorySnapshotProvider; }
-	const rg::memory::SnapshotProvider& GetMemorySnapshotProvider() const { return m_memorySnapshotProvider; }
+	org::memory::SnapshotProvider& GetMemorySnapshotProvider() { return m_memorySnapshotProvider; }
+	const org::memory::SnapshotProvider& GetMemorySnapshotProvider() const { return m_memorySnapshotProvider; }
 	void WriteVramUsageDebugDumpNow(uint8_t frameIndex) const { WriteVramUsageDebugDump(frameIndex); }
-	void SetStatisticsService(std::shared_ptr<rg::runtime::IStatisticsService> service) { m_statisticsService = std::move(service); }
-	rg::runtime::IStatisticsService* GetStatisticsService() { return m_statisticsService.get(); }
-	const rg::runtime::IStatisticsService* GetStatisticsService() const { return m_statisticsService.get(); }
-	void SetUploadService(std::shared_ptr<rg::runtime::IUploadService> service) { m_uploadService = std::move(service); }
-	rg::runtime::IUploadService* GetUploadService() { return m_uploadService.get(); }
-	const rg::runtime::IUploadService* GetUploadService() const { return m_uploadService.get(); }
-	void SetReadbackService(std::shared_ptr<rg::runtime::IReadbackService> service) { m_readbackService = std::move(service); }
-	rg::runtime::IReadbackService* GetReadbackService() { return m_readbackService.get(); }
-	const rg::runtime::IReadbackService* GetReadbackService() const { return m_readbackService.get(); }
-	void SetDescriptorService(std::shared_ptr<rg::runtime::IDescriptorService> service) { m_descriptorService = std::move(service); }
-	rg::runtime::IDescriptorService* GetDescriptorService() { return m_descriptorService.get(); }
-	const rg::runtime::IDescriptorService* GetDescriptorService() const { return m_descriptorService.get(); }
-	void SetRenderGraphSettingsService(std::shared_ptr<rg::runtime::IRenderGraphSettingsService> service) { m_renderGraphSettingsService = std::move(service); }
-	rg::runtime::IRenderGraphSettingsService* GetRenderGraphSettingsService() { return m_renderGraphSettingsService.get(); }
-	const rg::runtime::IRenderGraphSettingsService* GetRenderGraphSettingsService() const { return m_renderGraphSettingsService.get(); }
-	void SetTaskService(std::shared_ptr<rg::runtime::ITaskService> service) { m_taskService = std::move(service); }
-	rg::runtime::ITaskService* GetTaskService() { return m_taskService.get(); }
-	const rg::runtime::ITaskService* GetTaskService() const { return m_taskService.get(); }
+	void SetStatisticsService(std::shared_ptr<org::runtime::IStatisticsService> service) { m_statisticsService = std::move(service); }
+	org::runtime::IStatisticsService* GetStatisticsService() { return m_statisticsService.get(); }
+	const org::runtime::IStatisticsService* GetStatisticsService() const { return m_statisticsService.get(); }
+	void SetUploadService(std::shared_ptr<org::runtime::IUploadService> service) { m_uploadService = std::move(service); }
+	org::runtime::IUploadService* GetUploadService() { return m_uploadService.get(); }
+	const org::runtime::IUploadService* GetUploadService() const { return m_uploadService.get(); }
+	void SetReadbackService(std::shared_ptr<org::runtime::IReadbackService> service) { m_readbackService = std::move(service); }
+	org::runtime::IReadbackService* GetReadbackService() { return m_readbackService.get(); }
+	const org::runtime::IReadbackService* GetReadbackService() const { return m_readbackService.get(); }
+	void SetDescriptorService(std::shared_ptr<org::runtime::IDescriptorService> service) { m_descriptorService = std::move(service); }
+	org::runtime::IDescriptorService* GetDescriptorService() { return m_descriptorService.get(); }
+	const org::runtime::IDescriptorService* GetDescriptorService() const { return m_descriptorService.get(); }
+	void SetRenderGraphSettingsService(std::shared_ptr<org::runtime::IRenderGraphSettingsService> service) { m_renderGraphSettingsService = std::move(service); }
+	org::runtime::IRenderGraphSettingsService* GetRenderGraphSettingsService() { return m_renderGraphSettingsService.get(); }
+	const org::runtime::IRenderGraphSettingsService* GetRenderGraphSettingsService() const { return m_renderGraphSettingsService.get(); }
+	void SetTaskService(std::shared_ptr<org::runtime::ITaskService> service) { m_taskService = std::move(service); }
+	org::runtime::ITaskService* GetTaskService() { return m_taskService.get(); }
+	const org::runtime::ITaskService* GetTaskService() const { return m_taskService.get(); }
 	void SetCompileProfileEnabled(bool enabled) noexcept;
 	bool GetCompileProfileEnabled() const noexcept { return m_compileProfileEnabled; }
 	void SetStructuralMaterializeCheckpointCallback(std::function<void(std::string_view)> callback) {
@@ -745,19 +747,19 @@ public:
 		return derivedPtr;
 	}
 
-	template<typename PassT, rg::PassInputs InputsT, typename... StableCtorArgs>
+	template<typename PassT, org::PassInputs InputsT, typename... StableCtorArgs>
 	ComputePassBuilder& BuildComputePass(std::string const& name, InputsT&& inputs, StableCtorArgs&&... ctorArgs);
 
 	template<typename PassT, typename... StableCtorArgs>
 	ComputePassBuilder& BuildComputePass(std::string const& name, StableCtorArgs&&... ctorArgs);
 
-	template<typename PassT, rg::PassInputs InputsT, typename... StableCtorArgs>
+	template<typename PassT, org::PassInputs InputsT, typename... StableCtorArgs>
 	RenderPassBuilder& BuildRenderPass(std::string const& name, InputsT&& inputs, StableCtorArgs&&... ctorArgs);
 
 	template<typename PassT, typename... StableCtorArgs>
 	RenderPassBuilder& BuildRenderPass(std::string const& name, StableCtorArgs&&... ctorArgs);
 
-	template<typename PassT, rg::PassInputs InputsT, typename... StableCtorArgs>
+	template<typename PassT, org::PassInputs InputsT, typename... StableCtorArgs>
 	CopyPassBuilder& BuildCopyPass(std::string const& name, InputsT&& inputs, StableCtorArgs&&... ctorArgs);
 
 	template<typename PassT, typename... StableCtorArgs>
@@ -1227,11 +1229,11 @@ private:
 	std::vector<std::optional<ResourceMaterializeOptions>> m_aliasMaterializeOptionsByResourceIndex;
 	std::vector<uint64_t> m_aliasMaterializeResourceIDs;
 	std::unordered_map<uint64_t, uint64_t> aliasPlacementSignatureByID;
-	std::unordered_map<uint64_t, rg::alias::AliasPlacementRange> aliasPlacementRangesByID;
-	std::unordered_map<uint64_t, rg::alias::AliasPlacementRange> schedulingPlacementRangesByID;
-	std::vector<rg::alias::AliasPlacementRange> m_aliasPlacementRangeByResourceIndex;
+	std::unordered_map<uint64_t, org::alias::AliasPlacementRange> aliasPlacementRangesByID;
+	std::unordered_map<uint64_t, org::alias::AliasPlacementRange> schedulingPlacementRangesByID;
+	std::vector<org::alias::AliasPlacementRange> m_aliasPlacementRangeByResourceIndex;
 	std::vector<uint8_t> m_hasAliasPlacementByResourceIndex;
-	std::vector<rg::alias::AliasPlacementRange> m_schedulingPlacementRangeByResourceIndex;
+	std::vector<org::alias::AliasPlacementRange> m_schedulingPlacementRangeByResourceIndex;
 	std::vector<uint8_t> m_hasSchedulingPlacementByResourceIndex;
 	std::unordered_map<uint64_t, std::vector<uint64_t>> m_schedulingEquivalentIDsCache;
 	struct SchedulingEquivalentIDRange {
@@ -1252,7 +1254,7 @@ private:
 	size_t m_frameSchedulingResourceCount = 0;
 	std::vector<uint64_t> m_frameSchedulingResourceIDByIndex;
 	std::vector<std::vector<size_t>> m_equivalentResourceIndicesByResourceIndex;
-	std::vector<rg::alias::AliasActivationReason> m_aliasActivationPendingByResourceIndex;
+	std::vector<org::alias::AliasActivationReason> m_aliasActivationPendingByResourceIndex;
 	std::vector<unsigned int> m_frameQueueLastUsageBatch;
 	std::vector<unsigned int> m_frameQueueLastProducerBatch;
 	std::vector<unsigned int> m_frameQueueLastTransitionBatch;
@@ -1262,14 +1264,14 @@ private:
 	std::vector<MaterializeGenerationResult> m_materializeScratchGenerationResults;
 	std::vector<FramePassSchedulingSummary> m_framePassSchedulingSummaries;
 	std::unordered_map<uint64_t, CachedFramePassAccessSummary> m_framePassAccessSummaryCache;
-	std::unordered_map<uint64_t, rg::alias::CachedAliasStaticResourceInfo> m_aliasStaticInfoCacheByResourceID;
-	rg::alias::FrameAliasAnalysis m_aliasFrameAnalysisScratch;
+	std::unordered_map<uint64_t, org::alias::CachedAliasStaticResourceInfo> m_aliasStaticInfoCacheByResourceID;
+	org::alias::FrameAliasAnalysis m_aliasFrameAnalysisScratch;
 	std::unordered_map<uint64_t, uint64_t> aliasPlacementPoolByID;
-	std::unordered_map<uint64_t, rg::alias::AliasActivationReason> aliasActivationPending;
+	std::unordered_map<uint64_t, org::alias::AliasActivationReason> aliasActivationPending;
 
-	using PersistentAliasPoolState = rg::alias::PersistentAliasPoolState;
+	using PersistentAliasPoolState = org::alias::PersistentAliasPoolState;
 	std::unordered_map<uint64_t, PersistentAliasPoolState> persistentAliasPools;
-	std::unordered_map<uint64_t, rg::alias::CachedAliasPoolPlan> cachedAliasPlanByPoolID;
+	std::unordered_map<uint64_t, org::alias::CachedAliasPoolPlan> cachedAliasPlanByPoolID;
 	uint64_t aliasPoolPlanFrameIndex = 0;
 	uint32_t aliasPoolRetireIdleFrames = 120;
 	float aliasPoolGrowthHeadroom = 1.5f;
@@ -1277,13 +1279,13 @@ private:
 	std::unordered_map<uint64_t, ResourceTransition> initialTransitions; // Transitions needed to reach the initial state of the resources before executing the first batch. Executed on graph setup.
 	std::vector<PassBatch> batches;
 	std::vector<PassBatch> m_reusablePassBatches;
-	rg::memory::SnapshotProvider m_memorySnapshotProvider;
-	std::shared_ptr<rg::runtime::IStatisticsService> m_statisticsService;
-	std::shared_ptr<rg::runtime::IUploadService> m_uploadService;
-	std::shared_ptr<rg::runtime::IReadbackService> m_readbackService;
-	std::shared_ptr<rg::runtime::IDescriptorService> m_descriptorService;
-	std::shared_ptr<rg::runtime::IRenderGraphSettingsService> m_renderGraphSettingsService;
-	std::shared_ptr<rg::runtime::ITaskService> m_taskService;
+	org::memory::SnapshotProvider m_memorySnapshotProvider;
+	std::shared_ptr<org::runtime::IStatisticsService> m_statisticsService;
+	std::shared_ptr<org::runtime::IUploadService> m_uploadService;
+	std::shared_ptr<org::runtime::IReadbackService> m_readbackService;
+	std::shared_ptr<org::runtime::IDescriptorService> m_descriptorService;
+	std::shared_ptr<org::runtime::IRenderGraphSettingsService> m_renderGraphSettingsService;
+	std::shared_ptr<org::runtime::ITaskService> m_taskService;
 	std::optional<basic_telemetry::Frame> m_compileProfileFrame;
 	uint64_t m_compileProfileFrameStartedAtNs = 0;
 	uint64_t m_lastMaterializeCandidateCount = 0;
@@ -1372,7 +1374,7 @@ private:
 	static bool RetainedDeclarationMayNeedRefresh(const AnyPassAndResources& pass);
 	void RebuildRetainedDeclarationRefreshCandidates();
 
-	rg::imm::ImmediateDispatch m_immediateDispatch{};
+	org::imm::ImmediateDispatch m_immediateDispatch{};
 
 	std::vector<std::unique_ptr<IRenderGraphExtension>> m_extensions;
     std::vector<std::string> m_extensionRegistrationIds;
@@ -1433,10 +1435,10 @@ private:
 	PassBatch AcquireReusablePassBatch(size_t queueCount);
 	void ResetFrameQueueBatchHistoryTables();
 	std::optional<size_t> TryGetFrameSchedulingResourceIndex(uint64_t resourceID) const;
-	const rg::alias::AliasPlacementRange* TryGetAliasPlacementRangeByResourceIndex(size_t resourceIndex) const;
-	const rg::alias::AliasPlacementRange* TryGetAliasPlacementRange(uint64_t resourceID) const;
-	const rg::alias::AliasPlacementRange* TryGetSchedulingPlacementRangeByResourceIndex(size_t resourceIndex) const;
-	const rg::alias::AliasPlacementRange* TryGetSchedulingPlacementRange(uint64_t resourceID) const;
+	const org::alias::AliasPlacementRange* TryGetAliasPlacementRangeByResourceIndex(size_t resourceIndex) const;
+	const org::alias::AliasPlacementRange* TryGetAliasPlacementRange(uint64_t resourceID) const;
+	const org::alias::AliasPlacementRange* TryGetSchedulingPlacementRangeByResourceIndex(size_t resourceIndex) const;
+	const org::alias::AliasPlacementRange* TryGetSchedulingPlacementRange(uint64_t resourceID) const;
 	std::vector<uint64_t> BuildSchedulingEquivalentIDs(uint64_t resourceID) const;
 	size_t FrameQueueBatchHistoryOffset(size_t queueSlot, size_t resourceIndex) const;
 	unsigned int GetFrameQueueHistoryValue(const std::vector<unsigned int>& history, size_t queueSlot, size_t resourceIndex) const;
@@ -1674,8 +1676,8 @@ private:
 		const std::vector<std::pair<ResourceHandleAndRange, ResourceState>>* internalTransitions = nullptr;
 	};
 
-	using AutoAliasPlannerStats = rg::alias::AutoAliasPlannerStats;
-	using CachedAliasPoolPlan = rg::alias::CachedAliasPoolPlan;
+	using AutoAliasPlannerStats = org::alias::AutoAliasPlannerStats;
+	using CachedAliasPoolPlan = org::alias::CachedAliasPoolPlan;
 
 	static PassView GetPassView(const AnyPassAndResources& pr);
 	void RebuildFramePassAccessSummaries();
@@ -1725,7 +1727,7 @@ private:
 	std::function<bool()> m_getAutoAliasLogExclusionReasons;
 	std::function<bool()> m_getAutoAliasBuildDebugData;
 	std::function<bool()> m_getQueueSchedulingEnableLogging;
-	std::function<rg::runtime::QueueSchedulingSelectionPolicy()> m_getQueueSchedulingSelectionPolicy;
+	std::function<org::runtime::QueueSchedulingSelectionPolicy()> m_getQueueSchedulingSelectionPolicy;
 	std::function<float()> m_getQueueSchedulingWidthScale;
 	std::function<float()> m_getQueueSchedulingPenaltyBias;
 	std::function<float()> m_getQueueSchedulingMinPenalty;
@@ -1734,13 +1736,13 @@ private:
 	std::function<float()> m_getQueueSchedulingAutoGraphicsBias;
 	std::function<float()> m_getQueueSchedulingAsyncOverlapBonus;
 	std::function<float()> m_getQueueSchedulingCrossQueueHandoffPenalty;
-	std::function<rg::runtime::TransitionPlacementMode()> m_getTransitionPlacementMode;
+	std::function<org::runtime::TransitionPlacementMode()> m_getTransitionPlacementMode;
 	std::unordered_map<uint64_t, AddTransitionDebugStats> m_addTransitionDebugStatsByResource;
 	std::function<uint32_t()> m_getAutoAliasPoolRetireIdleFrames;
 	std::function<float()> m_getAutoAliasPoolGrowthHeadroom;
 	std::function<void(std::string_view)> m_structuralMaterializeCheckpointCallback;
 	std::function<void(std::string_view, std::string_view)> m_structuralMaterializeResourceCheckpointCallback;
-	rg::alias::RenderGraphAliasingSubsystem m_aliasingSubsystem;
+	org::alias::RenderGraphAliasingSubsystem m_aliasingSubsystem;
 
 	ComputePassBuilder& GetOrCreateComputePassBuilder(std::string const& name);
 	RenderPassBuilder& GetOrCreateRenderPassBuilder(std::string const& name);
@@ -1749,7 +1751,9 @@ private:
 	friend class RenderPassBuilder;
 	friend class ComputePassBuilder;
 	friend class CopyPassBuilder;
-	friend class rg::alias::RenderGraphAliasingSubsystem;
+	friend class org::alias::RenderGraphAliasingSubsystem;
 };
+
+} // namespace org
 
 #include "Render/PassBuilders.h"

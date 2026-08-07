@@ -8,6 +8,9 @@
 #include "Resources/Resource.h"
 #include "Resources/GloballyIndexedResource.h"
 
+
+namespace org {
+
 class ResourceGroup {
 public:
     ResourceGroup(const std::string& groupName) : name(groupName) {
@@ -66,3 +69,6 @@ private:
 	}
 
 };
+
+
+} // namespace org

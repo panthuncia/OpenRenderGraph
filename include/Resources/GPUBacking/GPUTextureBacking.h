@@ -11,6 +11,9 @@
 #include "Resources/TextureDescription.h"
 #include "Resources/TrackedAllocation.h"
 
+
+namespace org {
+
 class GpuTextureBacking {
 public:
 	// Don't use this.
@@ -103,3 +106,6 @@ private:
 
 	SymbolicTracker m_stateTracker;
 };
+
+
+} // namespace org

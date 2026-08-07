@@ -4,7 +4,7 @@
 #include <utility>
 #include <vector>
 
-namespace rg::runtime {
+namespace org::runtime {
 
 struct PassStats {
     double gpuTimeEma = 0.0;

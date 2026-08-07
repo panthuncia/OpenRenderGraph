@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <mutex>
 
-namespace rg::runtime {
+namespace org::runtime {
 
 enum class TransitionPlacementMode : uint8_t {
     InlineEarlyPlacement = 0,

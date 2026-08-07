@@ -4,7 +4,7 @@
 #include <memory>
 #include <string>
 
-namespace rg::runtime {
+namespace org::runtime {
 
 class IUploadPolicyClient {
 public:

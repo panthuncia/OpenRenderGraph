@@ -21,6 +21,8 @@
 #include "Managers/AsyncCopyPagePool.h"
 #include "Managers/UploadInstance.h"
 
+namespace org {
+
 class Buffer;
 class Resource;
 class ExternalBackingResource;
@@ -37,8 +39,8 @@ struct ResourceCopy {
 
 class UploadManager {
 public:
-	using UploadResolveContext = rg::runtime::UploadResolveContext;
-	using UploadTarget = rg::runtime::UploadTarget;
+	using UploadResolveContext = org::runtime::UploadResolveContext;
+	using UploadTarget = org::runtime::UploadTarget;
 
 	static UploadManager& GetInstance();
 	void Initialize();
@@ -69,9 +71,9 @@ public:
 		const rhi::helpers::SubresourceData* srcSubresources,
 		uint32_t srcCount);
 #endif	
-	void ProcessUploads(uint8_t frameIndex, rg::imm::ImmediateCommandList& commandList);
+	void ProcessUploads(uint8_t frameIndex, org::imm::ImmediateCommandList& commandList);
 	void QueueResourceCopy(const std::shared_ptr<Resource>& destination, const std::shared_ptr<Resource>& source, size_t size);
-	void ExecuteResourceCopies(uint8_t frameIndex, rg::imm::ImmediateCommandList& commandList);
+	void ExecuteResourceCopies(uint8_t frameIndex, org::imm::ImmediateCommandList& commandList);
 	void ProcessDeferredReleases(uint8_t frameIndex);
 	void SetUploadResolveContext(UploadResolveContext ctx);
 	std::shared_ptr<RenderPass> GetUploadPass() const { return m_uploadPass; }
@@ -169,5 +171,7 @@ inline UploadManager& UploadManager::GetInstance() {
 	static UploadManager instance;
 	return instance;
 }
+
+} // namespace org
 
 #include "Render/Runtime/UploadServiceAccess.h"

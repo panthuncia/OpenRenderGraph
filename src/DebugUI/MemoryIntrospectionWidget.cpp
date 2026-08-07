@@ -3,6 +3,9 @@
 #include <cmath>
 #include <unordered_map>
 
+
+namespace org {
+
 namespace ui {
 
     static bool RadioButtonView(const char* label, int* v, int buttonValue) {
@@ -1103,3 +1106,6 @@ namespace ui {
     }
 
 } // namespace ui
+
+
+} // namespace org

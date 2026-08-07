@@ -2,7 +2,7 @@
 
 #include "Render/Runtime/IUploadPolicyService.h"
 
-namespace rg::runtime {
+namespace org::runtime {
 
 inline IUploadPolicyService*& UploadPolicyServiceSlot() {
     static IUploadPolicyService* service = nullptr;

@@ -2,11 +2,11 @@
 
 #include "Render/ResourceRegistry.h"
 
-namespace rg::imm {
+namespace org::imm {
 
     namespace {
 
-        using Interval = rg::imm::ImmediateCommandList::SliceInterval;
+        using Interval = org::imm::ImmediateCommandList::SliceInterval;
 
         static inline void InsertAndUnionInterval(std::vector<Interval>& v, uint32_t lo, uint32_t hi)
         {
@@ -842,4 +842,4 @@ namespace rg::imm {
         Track(buffer.handle, buffer.handle.GetGlobalResourceID(), whole, rhi::ResourceAccessType::CopySource);
         Track(texture.handle, texture.handle.GetGlobalResourceID(), MakeExactMipSlice(mip, slice), rhi::ResourceAccessType::CopyDest);
     }
-} // namespace rg::imm
+} // namespace org::imm

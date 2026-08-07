@@ -18,6 +18,9 @@
 #include "Render/Runtime/BufferUploadPolicy.h"
 #include "Render/Runtime/IUploadPolicyService.h"
 
+
+namespace org {
+
 class GpuBufferBacking;
 
 class BufferView;
@@ -76,7 +79,7 @@ void RegisterDeferredBackingResizeClient(IDeferredBackingResizeClient* client);
 void UnregisterDeferredBackingResizeClient(IDeferredBackingResizeClient* client);
 uint32_t PublishReadyDeferredBackingResizes(bool wait = false);
 
-class BufferBase : public GloballyIndexedResource, public BackedResource, public rg::runtime::IUploadPolicyClient {
+class BufferBase : public GloballyIndexedResource, public BackedResource, public org::runtime::IUploadPolicyClient {
 public:
     class ScopedBackingMutation {
     public:
@@ -168,9 +171,9 @@ public:
 
     bool IsAliasingAllowed() const;
 
-    void SetUploadPolicyTag(rg::runtime::UploadPolicyTag tag);
+    void SetUploadPolicyTag(org::runtime::UploadPolicyTag tag);
 
-    rg::runtime::UploadPolicyTag GetUploadPolicyTag() const;
+    org::runtime::UploadPolicyTag GetUploadPolicyTag() const;
 
     bool IsUploadPolicyImmediate() const;
     static bool IsBackingMutationAllowedOnThisThread();
@@ -208,7 +211,7 @@ protected:
 
 private:
     uint64_t m_backingGeneration = 0;
-    rg::runtime::UploadPolicyTag m_uploadPolicyTag = rg::runtime::UploadPolicyTag::Immediate;
+    org::runtime::UploadPolicyTag m_uploadPolicyTag = org::runtime::UploadPolicyTag::Immediate;
     bool m_uploadPolicyRegistered = false;
 };
 
@@ -233,3 +236,6 @@ public:
 protected:
     std::vector<BufferView*> m_dirtyViews;
 };
+
+
+} // namespace org

@@ -12,6 +12,9 @@
 
 #include "Resources/ResourceStateTracker.h"
 
+
+namespace org {
+
 class SymbolicTracker;
 
 class Resource : public std::enable_shared_from_this<Resource> {
@@ -237,3 +240,6 @@ private:
     friend class DynamicBuffer;
     friend class UploadManager; // Kinda a hack, for deduplicating transition lists
 };
+
+
+} // namespace org

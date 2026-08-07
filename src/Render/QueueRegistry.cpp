@@ -4,6 +4,9 @@
 #include <string>
 #include <spdlog/spdlog.h>
 
+
+namespace org {
+
 namespace {
 	const char* QueueKindDebugName(QueueKind kind) noexcept {
 		switch (kind) {
@@ -75,3 +78,6 @@ void QueueRegistry::Clear() {
 	}
 	m_slots.clear();
 }
+
+
+} // namespace org

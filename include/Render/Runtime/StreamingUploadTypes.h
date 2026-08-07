@@ -4,6 +4,9 @@
 #include <memory>
 #include <cstddef>
 
+
+namespace org {
+
 class Resource;
 
 /// Descriptor for a single streaming upload operation.
@@ -16,3 +19,6 @@ struct StreamingUploadDescriptor {
     size_t dstOffset = 0;
     size_t size = 0;
 };
+
+
+} // namespace org

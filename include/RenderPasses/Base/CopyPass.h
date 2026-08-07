@@ -18,6 +18,9 @@
 #include "Render/ShaderAPI.h"
 #include "Render/QueueKind.h"
 
+
+namespace org {
+
 struct CopyPassParameters {
 	std::vector<ResourceHandleAndRange> copyTargets;
 	std::vector<ResourceHandleAndRange> copySources;
@@ -66,3 +69,6 @@ protected:
 	friend class CopyPassBuilder;
 	friend class RenderGraph;
 };
+
+
+} // namespace org

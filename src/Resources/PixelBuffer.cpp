@@ -8,6 +8,9 @@
 #include "Resources/GPUBacking/GPUTextureBacking.h"
 #include "Utilities/ORGUtilities.h"
 
+
+namespace org {
+
 namespace {
 uint16_t ResolveTextureMipLevels(const TextureDescription& desc)
 {
@@ -33,7 +36,7 @@ uint16_t ResolveTextureMipLevels(const TextureDescription& desc)
             width = (std::max)(1u, static_cast<uint32_t>(std::pow(2, std::ceil(std::log2(width)))));
             height = (std::max)(1u, static_cast<uint32_t>(std::pow(2, std::ceil(std::log2(height)))));
         }
-        return rg::util::CalculateMipLevels(width, height);
+        return org::util::CalculateMipLevels(width, height);
     }
 
     return 1;
@@ -247,3 +250,6 @@ void PixelBuffer::ApplyMetadataComponentBundle(const EntityComponentBundle& bund
         m_backing->ApplyMetadataComponentBundle(bundle);
     }
 }
+
+
+} // namespace org

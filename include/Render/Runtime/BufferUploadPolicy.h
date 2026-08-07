@@ -10,7 +10,7 @@
 
 #include "Render/Runtime/UploadServiceAccess.h"
 
-namespace rg::runtime {
+namespace org::runtime {
 
 struct BulkWriteHandle {
     uint8_t* data = nullptr;

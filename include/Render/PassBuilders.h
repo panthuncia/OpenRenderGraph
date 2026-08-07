@@ -17,7 +17,10 @@
 #include "Interfaces/IPassBuilder.h"
 #include "Interfaces/IResourceResolver.h"
 
+
 // Tag for a contiguous mip-range [first..first+count)
+namespace org {
+
 struct Mip {
 	Mip(uint32_t first, uint32_t count) : first(first), count(count) {}
     uint32_t first, count;
@@ -1235,7 +1238,7 @@ private:
         resolverSnapshots_ = std::move(state.resolverSnapshots);
     }
 
-    template<DerivedRenderPass PassT, rg::PassInputs InputsT, typename... StableCtorArgs>
+    template<DerivedRenderPass PassT, org::PassInputs InputsT, typename... StableCtorArgs>
     void Instantiate(InputsT&& inputs, StableCtorArgs&&... ctorArgs)
     {
         if (!built_)
@@ -1252,7 +1255,7 @@ private:
     template<DerivedRenderPass PassT, typename... StableCtorArgs>
     void Instantiate(StableCtorArgs&&... ctorArgs)
     {
-        Instantiate<PassT>(rg::NoInputs{}, std::forward<StableCtorArgs>(ctorArgs)...);
+        Instantiate<PassT>(org::NoInputs{}, std::forward<StableCtorArgs>(ctorArgs)...);
     }
 
     void Finalize() override {
@@ -1923,7 +1926,7 @@ private:
         resolverSnapshots_ = std::move(state.resolverSnapshots);
     }
 
-    template<DerivedComputePass PassT, rg::PassInputs InputsT, typename... StableCtorArgs>
+    template<DerivedComputePass PassT, org::PassInputs InputsT, typename... StableCtorArgs>
     void Instantiate(InputsT&& inputs, StableCtorArgs&&... ctorArgs)
     {
         if (!built_)
@@ -1940,7 +1943,7 @@ private:
     template<DerivedComputePass PassT, typename... StableCtorArgs>
     void Instantiate(StableCtorArgs&&... ctorArgs)
     {
-        Instantiate<PassT>(rg::NoInputs{}, std::forward<StableCtorArgs>(ctorArgs)...);
+        Instantiate<PassT>(org::NoInputs{}, std::forward<StableCtorArgs>(ctorArgs)...);
     }
 
     void Finalize() override {
@@ -2334,7 +2337,7 @@ private:
         resolverSnapshots_ = std::move(state.resolverSnapshots);
     }
 
-    template<DerivedCopyPass PassT, rg::PassInputs InputsT, typename... StableCtorArgs>
+    template<DerivedCopyPass PassT, org::PassInputs InputsT, typename... StableCtorArgs>
     void Instantiate(InputsT&& inputs, StableCtorArgs&&... ctorArgs)
     {
         if (!built_)
@@ -2351,7 +2354,7 @@ private:
     template<DerivedCopyPass PassT, typename... StableCtorArgs>
     void Instantiate(StableCtorArgs&&... ctorArgs)
     {
-        Instantiate<PassT>(rg::NoInputs{}, std::forward<StableCtorArgs>(ctorArgs)...);
+        Instantiate<PassT>(org::NoInputs{}, std::forward<StableCtorArgs>(ctorArgs)...);
     }
 
     void Finalize() override {
@@ -2457,7 +2460,7 @@ private:
     friend class RenderGraph;
 };
 
-template<typename PassT, rg::PassInputs InputsT, typename... StableCtorArgs>
+template<typename PassT, org::PassInputs InputsT, typename... StableCtorArgs>
 ComputePassBuilder& RenderGraph::BuildComputePass(std::string const& name, InputsT&& inputs, StableCtorArgs&&... ctorArgs) {
     static_assert(DerivedComputePass<PassT>);
     auto& builder = GetOrCreateComputePassBuilder(name);
@@ -2473,7 +2476,7 @@ ComputePassBuilder& RenderGraph::BuildComputePass(std::string const& name, Stabl
     return builder;
 }
 
-template<typename PassT, rg::PassInputs InputsT, typename... StableCtorArgs>
+template<typename PassT, org::PassInputs InputsT, typename... StableCtorArgs>
 RenderPassBuilder& RenderGraph::BuildRenderPass(std::string const& name, InputsT&& inputs, StableCtorArgs&&... ctorArgs) {
     static_assert(DerivedRenderPass<PassT>);
     auto& builder = GetOrCreateRenderPassBuilder(name);
@@ -2489,7 +2492,7 @@ RenderPassBuilder& RenderGraph::BuildRenderPass(std::string const& name, StableC
     return builder;
 }
 
-template<typename PassT, rg::PassInputs InputsT, typename... StableCtorArgs>
+template<typename PassT, org::PassInputs InputsT, typename... StableCtorArgs>
 CopyPassBuilder& RenderGraph::BuildCopyPass(std::string const& name, InputsT&& inputs, StableCtorArgs&&... ctorArgs) {
     static_assert(DerivedCopyPass<PassT>);
     auto& builder = GetOrCreateCopyPassBuilder(name);
@@ -2504,3 +2507,6 @@ CopyPassBuilder& RenderGraph::BuildCopyPass(std::string const& name, StableCtorA
     builder.template Instantiate<PassT>(std::forward<StableCtorArgs>(ctorArgs)...);
     return builder;
 }
+
+
+} // namespace org

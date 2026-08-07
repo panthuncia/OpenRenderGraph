@@ -14,8 +14,11 @@
 #include "Resources/AliasingPlacement.h"
 #include "Resources/TrackedAllocation.h"
 
+
 // Represents the GPU-side backing storage for a buffer resource.
 // Should only be owned by logical resources (Resource or derived classes).
+namespace org {
+
 class GpuBufferBacking {
 public:
 	static std::unique_ptr<GpuBufferBacking> CreateUnique(
@@ -93,3 +96,6 @@ private:
 	static std::mutex& LiveAllocMutex();
 	static std::unordered_map<const GpuBufferBacking*, LiveAllocInfo>& LiveAllocs();
 };
+
+
+} // namespace org

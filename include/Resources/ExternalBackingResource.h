@@ -7,6 +7,9 @@
 #include "Resources/BackedResource.h"
 #include "Resources/Resource.h"
 
+
+namespace org {
+
 class GpuBufferBacking;
 
 class ExternalBackingResource final : public Resource, public BackedResource {
@@ -39,3 +42,6 @@ private:
 
     std::unique_ptr<Impl> m_impl;
 };
+
+
+} // namespace org

@@ -5,15 +5,18 @@
 #include "Render/RenderGraph/RenderGraph.h"
 #include "Managers/Singletons/DeletionManager.h"
 
-rg::alias::AutoAliasDebugSnapshot rg::alias::RenderGraphAliasingSubsystem::BuildDebugSnapshot(
+
+namespace org {
+
+org::alias::AutoAliasDebugSnapshot org::alias::RenderGraphAliasingSubsystem::BuildDebugSnapshot(
 	AutoAliasMode mode,
 	AutoAliasPackingStrategy packingStrategy,
-	const rg::alias::AutoAliasPlannerStats& plannerStats,
-	const std::vector<rg::alias::AutoAliasReasonCount>& exclusionReasons,
-	const std::vector<rg::alias::AutoAliasExcludedResourceDebug>& excludedResources,
-	const std::vector<rg::alias::AutoAliasPoolDebug>& poolDebug) const
+	const org::alias::AutoAliasPlannerStats& plannerStats,
+	const std::vector<org::alias::AutoAliasReasonCount>& exclusionReasons,
+	const std::vector<org::alias::AutoAliasExcludedResourceDebug>& excludedResources,
+	const std::vector<org::alias::AutoAliasPoolDebug>& poolDebug) const
 {
-	rg::alias::AutoAliasDebugSnapshot out{};
+	org::alias::AutoAliasDebugSnapshot out{};
 	out.mode = mode;
 	out.packingStrategy = packingStrategy;
 	out.candidatesSeen = plannerStats.candidatesSeen;
@@ -36,7 +39,7 @@ rg::alias::AutoAliasDebugSnapshot rg::alias::RenderGraphAliasingSubsystem::Build
 	return out;
 }
 
-void rg::alias::RenderGraphAliasingSubsystem::ResetPerFrameState(RenderGraph& renderGraph) const {
+void org::alias::RenderGraphAliasingSubsystem::ResetPerFrameState(RenderGraph& renderGraph) const {
 	renderGraph.aliasMaterializeOptionsByID.clear();
 	renderGraph.m_aliasMaterializeOptionsByResourceIndex.clear();
 	renderGraph.m_aliasMaterializeResourceIDs.clear();
@@ -57,7 +60,7 @@ void rg::alias::RenderGraphAliasingSubsystem::ResetPerFrameState(RenderGraph& re
 	renderGraph.autoAliasPreviousMode = renderGraph.autoAliasModeLastFrame;
 }
 
-void rg::alias::RenderGraphAliasingSubsystem::ResetPersistentState(RenderGraph& renderGraph) const {
+void org::alias::RenderGraphAliasingSubsystem::ResetPersistentState(RenderGraph& renderGraph) const {
 	ResetPerFrameState(renderGraph);
 	renderGraph.autoAliasPreviousMode = AutoAliasMode::Off;
 	renderGraph.autoAliasModeLastFrame = AutoAliasMode::Off;
@@ -77,3 +80,6 @@ void rg::alias::RenderGraphAliasingSubsystem::ResetPersistentState(RenderGraph& 
 	renderGraph.persistentAliasPools.clear();
 	renderGraph.aliasPoolPlanFrameIndex = 0;
 }
+
+
+} // namespace org

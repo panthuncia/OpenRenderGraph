@@ -1,6 +1,6 @@
 #include "Render/MemoryIntrospectionAPI.h"
 
-namespace rg::memory {
+namespace org::memory {
 
 void SnapshotProvider::SetProvider(std::shared_ptr<IMemorySnapshotProvider> provider) {
     std::scoped_lock lock(m_providerMutex);

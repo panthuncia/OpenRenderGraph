@@ -8,8 +8,11 @@
 #include "Render/Runtime/StatisticsTypes.h"
 #include "RenderPasses/Base/PassReturn.h"
 
+
 // Describes the command-list layout for one queue within one batch.
 // Computed deterministically from the batch's signal flags.
+namespace org {
+
 struct QueueBatchSchedule {
 	bool active = false;              // queue has transitions or passes in this batch
 	uint8_t numCLs = 0;              // 0..3, computed from signal flags
@@ -26,7 +29,7 @@ struct QueueBatchSchedule {
 	std::vector<PassReturn> externalFences;
 
 	// Per-task statistics recording context for thread-safe parallel recording.
-	rg::runtime::QueryRecordingContext queryRecordingContext;
+	org::runtime::QueryRecordingContext queryRecordingContext;
 };
 
 // Per-batch schedule, one entry per queue slot.
@@ -46,3 +49,6 @@ struct ExecutionSchedule {
 		batches.clear();
 	}
 };
+
+
+} // namespace org

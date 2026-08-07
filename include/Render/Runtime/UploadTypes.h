@@ -4,9 +4,9 @@
 
 #include "Render/ResourceRegistry.h"
 
-class Resource;
+namespace org { class Resource; }
 
-namespace rg::runtime {
+namespace org::runtime {
 
 struct UploadResolveContext {
     ResourceRegistry* registry = nullptr;

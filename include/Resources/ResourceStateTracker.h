@@ -7,6 +7,9 @@
 
 #include "Render/PassInputs.h"
 
+
+namespace org {
+
 class Resource;
 
 struct ResourceState {
@@ -146,3 +149,6 @@ struct TransitionConflict
 bool ValidateNoConflictingTransitions(
     std::span<const ResourceTransition> transitions,
     TransitionConflict* outFirstConflict = nullptr);
+
+
+} // namespace org

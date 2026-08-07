@@ -14,6 +14,9 @@
 #include "Render/MemoryIntrospectionAPI.h"
 #include "Render/ImmediateExecution/ImmediateCommandList.h"
 
+
+namespace org {
+
 namespace {
 	size_t AlignUpSizeT(const size_t v, const size_t a) noexcept {
 		return (v + (a - 1)) & ~(a - 1);
@@ -119,7 +122,7 @@ UploadInstance::UploadPagePtr UploadInstance::CreatePage(size_t size, bool dedic
 void UploadInstance::TagPage(const UploadPagePtr& page) {
 	if (page && page->buffer && !page->tagged) {
 		page->buffer->SetName(m_pageNamePrefix + "_" + std::to_string(page->index));
-		rg::memory::SetResourceUsageHint(*page->buffer, m_usageHint);
+		org::memory::SetResourceUsageHint(*page->buffer, m_usageHint);
 		page->tagged = true;
 	}
 }
@@ -523,13 +526,13 @@ void UploadInstance::UploadTextureSubresources(
 	}
 }
 
-void UploadInstance::ProcessUploads(uint8_t frameIndex, rg::imm::ImmediateCommandList& commandList) {
+void UploadInstance::ProcessUploads(uint8_t frameIndex, org::imm::ImmediateCommandList& commandList) {
 	ProcessUploadsThrough(frameIndex, commandList, UINT64_MAX);
 }
 
 void UploadInstance::ProcessUploadsThrough(
 	uint8_t frameIndex,
-	rg::imm::ImmediateCommandList& commandList,
+	org::imm::ImmediateCommandList& commandList,
 	uint64_t sequenceInclusive) {
 	std::vector<ResourceUpdate> resourceUpdates;
 	std::vector<TextureUpdate> textureUpdates;
@@ -928,3 +931,6 @@ void UploadInstance::Cleanup() {
 	m_textureUpdates.clear();
 	m_currentFrameUploadBytes = 0;
 }
+
+
+} // namespace org

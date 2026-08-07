@@ -2,7 +2,7 @@
 
 #include "Render/Runtime/OpenRenderGraphSettings.h"
 
-namespace rg::runtime {
+namespace org::runtime {
 
 namespace {
 class DefaultRenderGraphSettingsService final : public IRenderGraphSettingsService {

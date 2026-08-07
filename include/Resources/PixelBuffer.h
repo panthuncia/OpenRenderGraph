@@ -14,6 +14,9 @@
 #include "Resources/MemoryStatisticsComponents.h"
 #include "Interfaces/IHasMemoryMetadata.h"
 
+
+namespace org {
+
 class GpuTextureBacking;
 
 class PixelBuffer : public GloballyIndexedResource, public BackedResource, public IHasMemoryMetadata {
@@ -147,3 +150,6 @@ private:
     rhi::ClearValue m_clearValue;
     mutable std::mutex m_materializationMutex;
 };
+
+
+} // namespace org

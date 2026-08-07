@@ -10,6 +10,9 @@
 #include "Managers/Singletons/DeletionManager.h"
 #include "Render/Runtime/OpenRenderGraphSettings.h"
 
+
+namespace org {
+
 StatisticsManager& StatisticsManager::GetInstance() {
     static StatisticsManager inst;
     return inst;
@@ -59,14 +62,14 @@ void LogMemoryIntrospectionAccounting(
 }
 
 void StatisticsManager::Initialize() {
-    m_numFramesInFlight = rg::runtime::GetOpenRenderGraphSettings().numFramesInFlight;
+    m_numFramesInFlight = org::runtime::GetOpenRenderGraphSettings().numFramesInFlight;
 	auto device = DeviceManager::GetInstance().GetDevice();
 	m_gpuTimestampFreq = device.GetTimestampCalibration(rhi::QueueKind::Graphics).ticksPerSecond;
     m_getCollectPassStatistics = []() {
-        return rg::runtime::GetOpenRenderGraphSettings().collectPassStatistics;
+        return org::runtime::GetOpenRenderGraphSettings().collectPassStatistics;
     };
     m_getCollectPipelineStatistics = []() {
-        return rg::runtime::GetOpenRenderGraphSettings().collectPipelineStatistics;
+        return org::runtime::GetOpenRenderGraphSettings().collectPipelineStatistics;
     };
     m_collectPassStatistics = m_getCollectPassStatistics();
     m_collectPipelineStatistics = m_getCollectPipelineStatistics();
@@ -137,7 +140,7 @@ void StatisticsManager::BeginFrame() {
         m_collectPassStatistics = m_getCollectPassStatistics();
     }
 
-    rg::runtime::MemoryBudgetStats memoryBudgetStats{};
+    org::runtime::MemoryBudgetStats memoryBudgetStats{};
     memoryBudgetStats.sampleFrameSerial = m_frameSerial;
     if (auto* allocator = DeviceManager::GetInstance().GetAllocator()) {
         rhi::ma::Budget localBudget{};
@@ -783,3 +786,6 @@ void StatisticsManager::ClearAll() {
     m_getCollectPipelineStatistics = {};
     m_memoryBudgetStats = {};
 }
+
+
+} // namespace org

@@ -131,6 +131,8 @@ namespace rhi {
 
 }
 
+namespace org {
+
 class Sampler {
 public:
         static std::shared_ptr<Sampler> CreateSampler(rhi::SamplerDesc samplerDesc);
@@ -160,3 +162,5 @@ private:
 	static std::shared_ptr<Sampler> m_defaultShadowSampler;
 	static std::unordered_map<rhi::SamplerDesc, std::shared_ptr<Sampler>, rhi::SamplerDescHash, rhi::SamplerDescEq> m_samplerCache;
 };
+
+} // namespace org

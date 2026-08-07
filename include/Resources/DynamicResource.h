@@ -8,6 +8,9 @@
 #include "Resources/Resource.h"
 #include "Resources/GloballyIndexedResource.h"
 
+
+namespace org {
+
 class DynamicResource : public Resource {
 public:
     DynamicResource(std::shared_ptr<Resource> initialResource)
@@ -133,3 +136,6 @@ protected:
 private:
     std::shared_ptr<GloballyIndexedResource> m_resource; // actual resource
 };
+
+
+} // namespace org

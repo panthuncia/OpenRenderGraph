@@ -20,7 +20,10 @@
 
 #include "Render/Runtime/UploadTypes.h"
 
-namespace rg::imm { class ImmediateCommandList; }
+namespace org::imm { class ImmediateCommandList; }
+
+namespace org {
+
 class Resource;
 class Buffer;
 
@@ -37,8 +40,8 @@ class Buffer;
 //   4. Call ProcessDeferredReleases() once per frame (after GPU retire) to reclaim pages.
 class UploadInstance {
 public:
-	using UploadTarget        = rg::runtime::UploadTarget;
-	using UploadResolveContext = rg::runtime::UploadResolveContext;
+	using UploadTarget        = org::runtime::UploadTarget;
+	using UploadResolveContext = org::runtime::UploadResolveContext;
 
 	static constexpr size_t kDefaultPageSize = 16 * 1024 * 1024; // 16 MB
 	static constexpr size_t kDefaultPreallocateCapacity = 128 * 1024 * 1024; // 128 MB
@@ -145,8 +148,8 @@ public:
 
 	// Emit GPU copy commands for all queued buffer and texture uploads.
 	// Call from a pass's RecordImmediateCommands().
-	void ProcessUploads(uint8_t frameIndex, rg::imm::ImmediateCommandList& commandList);
-	void ProcessUploadsThrough(uint8_t frameIndex, rg::imm::ImmediateCommandList& commandList, uint64_t sequenceInclusive);
+	void ProcessUploads(uint8_t frameIndex, org::imm::ImmediateCommandList& commandList);
+	void ProcessUploadsThrough(uint8_t frameIndex, org::imm::ImmediateCommandList& commandList, uint64_t sequenceInclusive);
 
 	// Retire upload-heap pages that are no longer referenced by any in-flight frame.
 	// Call once per frame after the GPU has finished with the retiring frame.
@@ -264,3 +267,5 @@ private:
 	bool m_workerQuit = false;
 	size_t m_workerRequestedPages = 0;
 };
+
+} // namespace org

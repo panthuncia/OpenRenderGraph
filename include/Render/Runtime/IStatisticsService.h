@@ -11,7 +11,7 @@
 
 #include "Render/Runtime/StatisticsTypes.h"
 
-namespace rg::runtime {
+namespace org::runtime {
 
 class IStatisticsService {
 public:

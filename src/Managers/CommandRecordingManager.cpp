@@ -4,6 +4,9 @@
 #include <algorithm>
 #include <spdlog/spdlog.h>
 
+
+namespace org {
+
 thread_local CommandRecordingManager::ThreadState CommandRecordingManager::s_tls{};
 
 CommandRecordingManager::CommandRecordingManager(const Init& init) {
@@ -170,3 +173,6 @@ void CommandRecordingManager::ShutdownThreadLocal() {
 
     tls.cachedEpoch = ~0u;
 }
+
+
+} // namespace org

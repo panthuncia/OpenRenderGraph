@@ -23,6 +23,9 @@
 #include "Render/Runtime/UploadServiceAccess.h"
 #include "Render/Runtime/UploadPolicyServiceAccess.h"
 
+
+namespace org {
+
 namespace {
     thread_local uint32_t g_backingMutationScopeDepth = 0;
     std::mutex g_deferredBackingResizeClientsMutex;
@@ -564,17 +567,17 @@ bool BufferBase::IsAliasingAllowed() const {
     return m_allowAlias;
 }
 
-void BufferBase::SetUploadPolicyTag(rg::runtime::UploadPolicyTag tag) {
+void BufferBase::SetUploadPolicyTag(org::runtime::UploadPolicyTag tag) {
     m_uploadPolicyTag = tag;
     RefreshUploadPolicyRegistration();
 }
 
-rg::runtime::UploadPolicyTag BufferBase::GetUploadPolicyTag() const {
+org::runtime::UploadPolicyTag BufferBase::GetUploadPolicyTag() const {
     return m_uploadPolicyTag;
 }
 
 bool BufferBase::IsUploadPolicyImmediate() const {
-    return m_uploadPolicyTag == rg::runtime::UploadPolicyTag::Immediate;
+    return m_uploadPolicyTag == org::runtime::UploadPolicyTag::Immediate;
 }
 
 void BufferBase::EnsureUploadPolicyRegistration() {
@@ -582,17 +585,17 @@ void BufferBase::EnsureUploadPolicyRegistration() {
         return;
     }
 
-    if (!rg::runtime::GetActiveUploadPolicyService()) {
+    if (!org::runtime::GetActiveUploadPolicyService()) {
         return;
     }
 
-    rg::runtime::RegisterUploadPolicyClient(this);
+    org::runtime::RegisterUploadPolicyClient(this);
     m_uploadPolicyRegistered = true;
 }
 
 void BufferBase::MarkUploadPolicyDirty() {
     EnsureUploadPolicyRegistration();
-    rg::runtime::MarkUploadPolicyClientDirty(this);
+    org::runtime::MarkUploadPolicyClientDirty(this);
 }
 
 void BufferBase::RefreshUploadPolicyRegistration() {
@@ -604,7 +607,7 @@ void BufferBase::UnregisterUploadPolicyClient() {
         return;
     }
 
-    rg::runtime::UnregisterUploadPolicyClient(this);
+    org::runtime::UnregisterUploadPolicyClient(this);
     m_uploadPolicyRegistered = false;
 }
 
@@ -671,7 +674,7 @@ void BufferBase::QueueResourceCopyFromOldBacking(uint64_t bytesToCopy) {
     }
 
     auto oldBackingResource = ExternalBackingResource::CreateShared(std::move(m_dataBuffer));
-    if (auto* uploadService = rg::runtime::GetActiveUploadService()) {
+    if (auto* uploadService = org::runtime::GetActiveUploadService()) {
         uploadService->QueueResourceCopy(shared_from_this(), oldBackingResource, bytesToCopy);
     }
 }
@@ -681,3 +684,6 @@ void BufferBase::ApplyMetadataToBacking(const EntityComponentBundle& bundle) {
         m_dataBuffer->ApplyMetadataComponentBundle(bundle);
     }
 }
+
+
+} // namespace org

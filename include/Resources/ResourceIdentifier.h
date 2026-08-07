@@ -7,6 +7,8 @@
 
 #include "Resources/ResourceStateTracker.h"
 
+namespace org {
+
 template<typename T> struct ReflectNamespaceTag {};
 
 struct ResourceIdentifier {
@@ -70,14 +72,18 @@ struct ResourceIdentifier {
     };
 };
 
+} // namespace org
+
 namespace std {
     template<>
-    struct hash<ResourceIdentifier> {
-        size_t operator()(ResourceIdentifier const& id) const noexcept {
-            return ResourceIdentifier::Hasher{}(id);
+    struct hash<org::ResourceIdentifier> {
+        size_t operator()(org::ResourceIdentifier const& id) const noexcept {
+            return org::ResourceIdentifier::Hasher{}(id);
         }
     };
 }
+
+namespace org {
 
 struct ResourceIdentifierAndRange {
     ResourceIdentifierAndRange(const ResourceIdentifier& resource) : identifier(resource) {
@@ -87,3 +93,5 @@ struct ResourceIdentifierAndRange {
     ResourceIdentifier identifier;
     RangeSpec range;
 };
+
+} // namespace org

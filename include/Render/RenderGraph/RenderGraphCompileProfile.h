@@ -4,7 +4,7 @@
 
 #include <optional>
 
-namespace rg::profile
+namespace org::profile
 {
 class ScopedCompileProfileStep
 {

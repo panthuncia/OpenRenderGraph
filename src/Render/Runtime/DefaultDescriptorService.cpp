@@ -2,7 +2,7 @@
 
 #include "Managers/Singletons/DescriptorHeapManager.h"
 
-namespace rg::runtime {
+namespace org::runtime {
 
 namespace {
 class DefaultDescriptorService final : public IDescriptorService {
@@ -53,4 +53,4 @@ std::shared_ptr<IDescriptorService> CreateDefaultDescriptorService() {
     return std::make_shared<DefaultDescriptorService>();
 }
 
-} // namespace rg::runtime
+} // namespace org::runtime

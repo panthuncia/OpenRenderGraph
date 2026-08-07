@@ -10,6 +10,9 @@
 #include <rhi_allocator.h>
 #include "Resources/TrackedAllocation.h"
 
+
+namespace org {
+
 class DeviceManager {
 public:
 	struct TrackingHooks {
@@ -90,3 +93,6 @@ inline DeviceManager& DeviceManager::GetInstance() {
 	static DeviceManager instance;
 	return instance;
 }
+
+
+} // namespace org

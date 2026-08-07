@@ -1,5 +1,8 @@
 #include "Render/PassBuilders.h"
 
+
+namespace org {
+
 std::vector<ResourceHandleAndRange>
 expandToRanges(ResourceIdentifierAndRange const & rir, RenderGraph* graph)
 {
@@ -10,3 +13,6 @@ expandToRanges(ResourceIdentifierAndRange const & rir, RenderGraph* graph)
     actualRAR.range    = rir.range;
     return { actualRAR };
 }
+
+
+} // namespace org

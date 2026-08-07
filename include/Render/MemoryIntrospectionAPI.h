@@ -8,7 +8,7 @@
 
 #include "Interfaces/IHasMemoryMetadata.h"
 
-namespace rg::memory {
+namespace org::memory {
 
 struct ResourceMemoryRecord {
     uint64_t resourceID = 0;

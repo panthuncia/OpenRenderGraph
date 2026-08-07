@@ -19,6 +19,9 @@
 #include "Resources/ResourceStateTracker.h"
 #include "Interfaces/IResourceResolver.h"
 
+
+namespace org {
+
 class Resource;
 
 template <class T>
@@ -128,8 +131,8 @@ public:
         bool operator==(const RegistryHandle& other) const noexcept {
             return globalResourceIndex == other.globalResourceIndex;
         }
-        friend inline rg::Hash64 HashValue(const RegistryHandle& handle) {
-            return static_cast<rg::Hash64>(handle.GetGlobalResourceID());
+        friend inline org::Hash64 HashValue(const RegistryHandle& handle) {
+            return static_cast<org::Hash64>(handle.GetGlobalResourceID());
         }
 		//SymbolicTracker* GetStateTracker() const { return tracker; }
         // For ephemeral handles that bypass registry storage
@@ -598,3 +601,6 @@ public:
         return false;
     }
 };
+
+
+} // namespace org

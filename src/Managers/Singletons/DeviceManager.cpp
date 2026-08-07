@@ -12,6 +12,9 @@
 #include "Resources/GPUBacking/GPUTextureBacking.h"
 #include "Render/Runtime/OpenRenderGraphSettings.h"
 
+
+namespace org {
+
 rhi::Result DeviceManager::CreateResourceTracked(
     const rhi::ma::AllocationDesc& allocDesc,
     const rhi::ResourceDesc& resourceDesc,
@@ -290,8 +293,8 @@ void LogBreadcrumbs(const D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT& breadcrumbs) {
         std::wstring commandQueueName = pNode->pCommandQueueDebugNameW ? pNode->pCommandQueueDebugNameW : L"<unnamed>";
 
         spdlog::info("--- AutoBreadcrumb Node ---");
-        spdlog::info("Command List: {}", rg::util::ws2s(commandListName));
-        spdlog::info("Command Queue: {}", rg::util::ws2s(commandQueueName));
+        spdlog::info("Command List: {}", org::util::ws2s(commandListName));
+        spdlog::info("Command Queue: {}", org::util::ws2s(commandQueueName));
         spdlog::info("Breadcrumb Count: {}", pNode->BreadcrumbCount);
         spdlog::info("Operations:");
 
@@ -325,7 +328,7 @@ void LogPageFaults(const D3D12_DRED_PAGE_FAULT_OUTPUT& pageFault) {
             const char* allocTypeStr = DredAllocationTypeToString(current->AllocationType);
             spdlog::info("[{}] ObjectName: {}, AllocationType: {}",
                 nodeType,
-                rg::util::ws2s(objName),
+                org::util::ws2s(objName),
                 allocTypeStr
             );
             current = current->pNext;
@@ -335,3 +338,6 @@ void LogPageFaults(const D3D12_DRED_PAGE_FAULT_OUTPUT& pageFault) {
     LogAllocationNodes(pageFault.pHeadExistingAllocationNode, "ExistingAllocation");
     LogAllocationNodes(pageFault.pHeadRecentFreedAllocationNode, "RecentFreedAllocation");
 }
+
+
+} // namespace org

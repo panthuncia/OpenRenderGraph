@@ -6,6 +6,7 @@ include(GNUInstallDirs)
 
 option(OPENRENDERGRAPH_ENABLE_SUBMODULE_FALLBACK "Allow fallback to in-tree BasicRHI when package is unavailable" ON)
 option(OPENRENDERGRAPH_FORWARD_BASICRHI_DEP_OPTIONS "Forward BasicRHI PIX/Streamline options when adding BasicRHI subdirectory" ON)
+option(OPENRENDERGRAPH_ENABLE_DEBUG_UI "Build the optional ImGui/ImPlot/Slang inspector" OFF)
 
 set(OPENRENDERGRAPH_BASICRHI_ENABLE_STREAMLINE "" CACHE STRING "Override BASICRHI_ENABLE_STREAMLINE for submodule fallback (ON/OFF). Empty keeps BasicRHI default.")
 set(OPENRENDERGRAPH_BASICRHI_ENABLE_PIX "" CACHE STRING "Override BASICRHI_ENABLE_PIX for submodule fallback (ON/OFF). Empty keeps BasicRHI default.")
@@ -62,21 +63,13 @@ endif()
 find_package(spdlog CONFIG REQUIRED)
 find_package(flecs CONFIG REQUIRED)
 find_package(Boost REQUIRED COMPONENTS container_hash)
-find_package(imgui CONFIG REQUIRED)
-if(TARGET imgui::imgui)
-    set_property(TARGET imgui::imgui PROPERTY INTERFACE_LINK_LIBRARIES "")
-endif()
-find_package(implot CONFIG REQUIRED)
-find_package(slang CONFIG REQUIRED)
-if(COMMAND basicrenderer_use_release_library_for_debug)
-    basicrenderer_use_release_library_for_debug(fmt::fmt)
+if(OPENRENDERGRAPH_ENABLE_DEBUG_UI)
+    find_package(imgui CONFIG REQUIRED)
+    find_package(implot CONFIG REQUIRED)
+    find_package(slang CONFIG REQUIRED)
 endif()
 
 add_library(OpenRenderGraph STATIC
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/DebugUI/MemoryIntrospectionWidget.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/DebugUI/MemoryViewWidget.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/DebugUI/RenderGraphInspector.cpp"
-
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/DescriptorHeap.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/CommandListPool.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/QueueRegistry.cpp"
@@ -139,12 +132,24 @@ target_link_libraries(OpenRenderGraph
         BasicTelemetry::Tracy
         flecs::flecs
         Boost::container_hash
-        imgui::imgui
-        implot::implot
-        slang::slang
     PRIVATE
-        spdlog::spdlog_header_only
+        spdlog::spdlog
 )
+
+if(OPENRENDERGRAPH_ENABLE_DEBUG_UI)
+    add_library(OpenRenderGraphDebugUI STATIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/DebugUI/MemoryIntrospectionWidget.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/DebugUI/MemoryViewWidget.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/DebugUI/RenderGraphInspector.cpp")
+    add_library(OpenRenderGraph::DebugUI ALIAS OpenRenderGraphDebugUI)
+    target_compile_features(OpenRenderGraphDebugUI PUBLIC cxx_std_23)
+    target_include_directories(OpenRenderGraphDebugUI PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+        PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_link_libraries(OpenRenderGraphDebugUI PUBLIC OpenRenderGraph::OpenRenderGraph
+        imgui::imgui implot::implot slang::slang)
+endif()
 
 target_compile_definitions(OpenRenderGraph
     PUBLIC
@@ -155,6 +160,7 @@ target_compile_definitions(OpenRenderGraph
         $<$<CONFIG:Release>:BUILD_TYPE=BUILD_TYPE_RELEASE>
         $<$<CONFIG:RelWithDebInfo>:BUILD_TYPE=BUILD_TYPE_RELEASE_DEBUG>
 )
+target_compile_definitions(OpenRenderGraph PRIVATE NOMINMAX)
 
 if (MSVC)
     target_compile_options(OpenRenderGraph PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)

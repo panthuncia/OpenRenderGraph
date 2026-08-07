@@ -12,10 +12,13 @@
 #include <rhi.h>
 #include "Render/Runtime/StatisticsTypes.h"
 
-using QueryRecordingContext = rg::runtime::QueryRecordingContext;
 
-using PassStats = rg::runtime::PassStats;
-using MeshPipelineStats = rg::runtime::MeshPipelineStats;
+namespace org {
+
+using QueryRecordingContext = org::runtime::QueryRecordingContext;
+
+using PassStats = org::runtime::PassStats;
+using MeshPipelineStats = org::runtime::MeshPipelineStats;
 
 class StatisticsManager {
 public:
@@ -72,7 +75,7 @@ public:
 	const std::vector<std::string>&        GetPassTechniquePaths() const { return m_passTechniquePaths; }
 	const std::vector<PassStats>&          GetPassStats() const { return m_stats; }
 	const std::vector<MeshPipelineStats>&  GetMeshStats() const { return m_meshStatsEma; }
-	rg::runtime::MemoryBudgetStats GetMemoryBudgetStats() const { return m_memoryBudgetStats; }
+	org::runtime::MemoryBudgetStats GetMemoryBudgetStats() const { return m_memoryBudgetStats; }
 
 private:
 	StatisticsManager() = default;
@@ -117,7 +120,7 @@ private:
 	std::vector<PassStats>          m_stats;
 	std::vector<bool>               m_isGeometryPass;
 	std::vector<MeshPipelineStats>  m_meshStatsEma;
-	rg::runtime::MemoryBudgetStats m_memoryBudgetStats{};
+	org::runtime::MemoryBudgetStats m_memoryBudgetStats{};
 
 	// Recording helpers per queue/frame
 	std::unordered_map<rhi::QueueKind,
@@ -125,3 +128,6 @@ private:
 	std::unordered_map<rhi::QueueKind,
 		std::unordered_map<unsigned, std::vector<std::pair<unsigned,unsigned>>>> m_pendingResolves;
 };
+
+
+} // namespace org

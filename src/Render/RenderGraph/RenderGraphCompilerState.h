@@ -2,9 +2,12 @@
 
 #include "Render/RenderGraph/RenderGraph.h"
 
+
 // Private compiler representation. Keep compiler-only data here rather than in
 // RenderGraph's installed public header so compile algorithm changes have a
 // narrow incremental-build footprint.
+namespace org {
+
 struct RenderGraph::Node {
 	size_t passIndex = 0;
 	size_t queueSlot = 0;
@@ -102,3 +105,6 @@ struct RenderGraph::CompilerState {
 	bool readOnlyUniformTransitionElisionEnabled = false;
 	std::vector<ResourceTransition> ignoredInternalTransitions;
 };
+
+
+} // namespace org

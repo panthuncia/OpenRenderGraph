@@ -15,9 +15,9 @@
 #include "Resources/Resource.h"
 #include "Resources/GloballyIndexedResource.h"
 
-class RenderGraph;
+namespace org { class RenderGraph; }
 
-namespace rg::imm {
+namespace org::imm {
 
     // RenderGraph provides these thunks so the immediate list can resolve identifiers
     // without going through the pass's restricted registry view.

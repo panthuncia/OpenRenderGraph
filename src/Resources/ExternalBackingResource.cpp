@@ -2,6 +2,9 @@
 
 #include "Resources/GPUBacking/GpuBufferBacking.h"
 
+
+namespace org {
+
 struct ExternalBackingResource::Impl {
     explicit Impl(std::unique_ptr<GpuBufferBacking> inBacking)
         : backing(std::move(inBacking)) {
@@ -62,3 +65,6 @@ ExternalBackingResource::ExternalBackingResource(std::unique_ptr<GpuBufferBackin
 }
 
 ExternalBackingResource::~ExternalBackingResource() = default;
+
+
+} // namespace org

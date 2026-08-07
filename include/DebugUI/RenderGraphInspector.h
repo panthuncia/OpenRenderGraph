@@ -12,8 +12,11 @@
 #include "Render/RenderGraph/RenderGraph.h"
 #include "Resources/ReadbackRequest.h"
 
+
 // Return true if the pass uses 'resourceId'.
 // passKind: 0 = RenderPassAndResources, 1 = ComputePassAndResources, 2 = CopyPassAndResources
+namespace org {
+
 using RGPassUsesResourceFn = std::function<bool(const void* passAndResources, uint64_t resourceId, int passKind)>;
 using RGResourceNameByIdFn = std::function<std::string(uint64_t resourceId)>;
 using RGResourcePtrByIdFn = std::function<Resource*(uint64_t resourceId)>;
@@ -46,3 +49,6 @@ namespace RGInspector {
         RGRequestReadbackCaptureFn requestReadbackCapture = nullptr,
         const RGInspectorOptions& opts = {});
 }
+
+
+} // namespace org

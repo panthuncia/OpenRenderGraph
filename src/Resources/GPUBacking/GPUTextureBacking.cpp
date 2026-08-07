@@ -10,6 +10,9 @@
 #include "Resources/MemoryStatisticsComponents.h"
 #include <rhi_interop.h>
 
+
+namespace org {
+
 namespace {
 uint16_t ResolveTextureMipLevels(const TextureDescription& desc)
 {
@@ -29,7 +32,7 @@ uint16_t ResolveTextureMipLevels(const TextureDescription& desc)
 	}
 
 	if (desc.generateMipMaps) {
-		return rg::util::CalculateMipLevels(desc.imageDimensions[0].width, desc.imageDimensions[0].height);
+		return org::util::CalculateMipLevels(desc.imageDimensions[0].width, desc.imageDimensions[0].height);
 	}
 
 	return 1;
@@ -346,3 +349,6 @@ unsigned int GpuTextureBacking::DumpLiveTextures() {
 	}
 	return static_cast<unsigned int>(liveAllocs.size());
 }
+
+
+} // namespace org

@@ -1,6 +1,6 @@
 #pragma once
 
-namespace rg::util {
+namespace org::util {
 
     inline std::wstring s2ws(const std::string_view& utf8)
     {

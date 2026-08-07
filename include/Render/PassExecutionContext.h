@@ -8,6 +8,9 @@
 
 #include "Render/ImmediateExecution/ImmediateCommandList.h"
 
+
+namespace org {
+
 struct IHostExecutionData {
 	virtual ~IHostExecutionData() = default;
 	virtual const void* TryGet(std::type_index t) const noexcept = 0;
@@ -28,7 +31,7 @@ struct UpdateExecutionContext {
 
 struct ImmediateExecutionContext {
 	rhi::Device device;
-	rg::imm::ImmediateCommandList list;
+	org::imm::ImmediateCommandList list;
 	UINT frameIndex = 0;
 	const IHostExecutionData* hostData = nullptr;
 };
@@ -41,7 +44,7 @@ struct IHasImmediateModeCommands {
 struct PassExecutionContext {
 	rhi::Device device;
 	rhi::CommandList commandList;
-	const rg::imm::ImmediateDispatch* immediateDispatch = nullptr;
+	const org::imm::ImmediateDispatch* immediateDispatch = nullptr;
 	std::function<void(rhi::CommandList, rhi::Queue, const char*, const char*)> beginGpuPassRange;
 	std::function<void(rhi::CommandList, rhi::Queue)> endGpuPassRange;
 	const char* currentPassName = nullptr;
@@ -51,3 +54,6 @@ struct PassExecutionContext {
 	float deltaTime = 0.0f;
 	const IHostExecutionData* hostData = nullptr;
 };
+
+
+} // namespace org

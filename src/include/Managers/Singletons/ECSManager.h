@@ -2,6 +2,9 @@
 
 #include <flecs.h>
 
+
+namespace org {
+
 class ECSManager {
 public:
 	static ECSManager& GetInstance();
@@ -27,3 +30,6 @@ inline ECSManager& ECSManager::GetInstance() {
 	static ECSManager instance;
 	return instance;
 }
+
+
+} // namespace org

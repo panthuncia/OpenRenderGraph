@@ -3,6 +3,9 @@
 #include <cstdint>
 #include <optional>
 
+
+namespace org {
+
 enum class QueueKind : uint8_t { Graphics = 0, Compute = 1, Copy = 2, Count };
 
 enum class QueueAssignmentPolicy : uint8_t {
@@ -24,3 +27,6 @@ constexpr bool IsQueueKindSupportedByComputePass(QueueKind kind) noexcept {
 constexpr bool IsQueueKindSupportedByCopyPass(QueueKind kind) noexcept {
 	return kind == QueueKind::Graphics || kind == QueueKind::Copy;
 }
+
+
+} // namespace org

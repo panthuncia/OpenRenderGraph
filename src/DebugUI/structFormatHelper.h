@@ -12,6 +12,9 @@
 #include <string_view>
 #include <vector>
 
+
+namespace org {
+
 struct SlangReflectedField
 {
     std::string path;      // e.g. "Camera.viewProjection" or "Camera.clippingPlanes[3].plane"
@@ -646,3 +649,6 @@ inline SlangResult ReflectStructLayoutWithSlang(
     if (outDiagnostics) *outDiagnostics = diagnostics;
     return SLANG_OK;
 }
+
+
+} // namespace org

@@ -9,6 +9,10 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include "Render/FrameGraphSnapshot.h"
+
+
+namespace org {
 
 namespace ui {
 
@@ -36,40 +40,6 @@ namespace ui {
     static inline double BytesToMiB(uint64_t bytes) {
         return (double)bytes / (1024.0 * 1024.0);
     }
-
-    struct MemoryCategorySlice {
-        std::string label;
-        uint64_t bytes = 0;
-    };
-
-    struct MemoryResourceRow {
-        std::string name;
-        std::string type;
-        uint64_t bytes = 0;
-        uint64_t uid = 0;
-    };
-
-    struct MemorySnapshot {
-        std::vector<MemoryCategorySlice> categories;
-        std::vector<MemoryResourceRow>   resources;
-        uint64_t totalBytes = 0;
-    };
-
-    // Frame-graph timeline input
-    struct FrameGraphBatchRow {
-        std::string label;
-        uint64_t footprintBytes = 0;  // memory footprint for this batch (lower-bound)
-        uint64_t peakLiveBytes = 0;   // alias-aware peak live bytes across the batch window
-        uint64_t peakNaiveLiveBytes = 0;
-        uint64_t aliasSavingsBytes = 0;
-        bool hasEndTransitions = false;
-    	std::vector<std::string> passNames;
-        std::vector<MemoryCategorySlice> categories;
-    };
-
-    struct FrameGraphSnapshot {
-        std::vector<FrameGraphBatchRow> batches;
-    };
 
     // Simple ring buffer for real-time timeline
     template <size_t N>
@@ -217,3 +187,6 @@ namespace ui {
     };
 
 } // namespace ui
+
+
+} // namespace org

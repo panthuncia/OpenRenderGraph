@@ -6,6 +6,9 @@
 
 #include "rhi.h"
 
+
+namespace org {
+
 namespace MemoryStatisticsComponents
 {
 	struct MemSizeBytes {
@@ -41,3 +44,6 @@ namespace MemoryStatisticsComponents
 		bool aliased = false;
 	};
 }
+
+
+} // namespace org

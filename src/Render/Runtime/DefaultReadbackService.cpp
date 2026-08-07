@@ -2,7 +2,7 @@
 
 #include "Managers/Singletons/ReadbackManager.h"
 
-namespace rg::runtime {
+namespace org::runtime {
 
 namespace {
 class DefaultReadbackService final : public IReadbackService {
@@ -15,9 +15,9 @@ public:
         ReadbackManager::GetInstance().RequestReadbackCapture(passName, resource, range, std::move(callback), preferredQueueKind);
     }
 
-    std::vector<rg::runtime::ReadbackCaptureInfo> ConsumeCaptureRequests() override {
+    std::vector<org::runtime::ReadbackCaptureInfo> ConsumeCaptureRequests() override {
         auto captures = ReadbackManager::GetInstance().ConsumeCaptureRequests();
-        std::vector<rg::runtime::ReadbackCaptureInfo> out;
+        std::vector<org::runtime::ReadbackCaptureInfo> out;
         out.reserve(captures.size());
         for (auto& capture : captures) {
             out.push_back({
@@ -36,12 +36,12 @@ public:
         return ReadbackManager::GetInstance().AcquireReadbackBuffer(byteSize, debugName);
     }
 
-    rg::runtime::ReadbackCaptureToken EnqueueCapture(ReadbackCaptureRequest&& request) override {
+    org::runtime::ReadbackCaptureToken EnqueueCapture(ReadbackCaptureRequest&& request) override {
         auto token = ReadbackManager::GetInstance().EnqueueCapture(std::move(request));
         return { token.id };
     }
 
-    void FinalizeCapture(rg::runtime::ReadbackCaptureToken token, QueueKind queueKind, std::shared_ptr<rhi::TimelinePtr> signalFenceOwner, uint64_t fenceValue) override {
+    void FinalizeCapture(org::runtime::ReadbackCaptureToken token, QueueKind queueKind, std::shared_ptr<rhi::TimelinePtr> signalFenceOwner, uint64_t fenceValue) override {
         ReadbackManager::GetInstance().FinalizeCapture({ token.id }, queueKind, std::move(signalFenceOwner), fenceValue);
     }
 

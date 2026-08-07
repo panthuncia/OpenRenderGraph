@@ -4,7 +4,7 @@
 
 #include "Render/Runtime/IDescriptorService.h"
 
-namespace rg::runtime {
+namespace org::runtime {
 
 inline IDescriptorService*& DescriptorServiceSlot() {
     static IDescriptorService* service = nullptr;
@@ -43,4 +43,4 @@ inline rhi::DescriptorHeap GetActiveSamplerDescriptorHeap() {
     return service->GetSamplerDescriptorHeap();
 }
 
-} // namespace rg::runtime
+} // namespace org::runtime

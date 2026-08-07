@@ -10,6 +10,9 @@
 #include <atomic>
 #include <rhi.h>
 
+
+namespace org {
+
 struct CommandListPair {
     rhi::CommandAllocatorPtr allocator;
     rhi::CommandListPtr list;
@@ -77,3 +80,6 @@ private:
     std::deque<std::pair<uint64_t, CommandListPair>> m_inFlight;
     std::vector<CommandListPair> m_pendingBackgroundReset;
 };
+
+
+} // namespace org

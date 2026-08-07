@@ -6,6 +6,9 @@
 #include <rhi.h>
 #include "QueueKind.h"
 
+
+namespace org {
+
 class CommandListPool;
 
 enum class QueueAutoAssignmentPolicy : uint8_t {
@@ -107,3 +110,6 @@ private:
 
 	std::vector<SlotEntry> m_slots;
 };
+
+
+} // namespace org

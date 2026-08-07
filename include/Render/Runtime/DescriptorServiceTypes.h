@@ -5,7 +5,7 @@
 
 #include <rhi.h>
 
-namespace rg::runtime {
+namespace org::runtime {
 
 struct DescriptorViewRequirements {
     struct TextureViews {
@@ -47,4 +47,4 @@ struct DescriptorViewRequirements {
     std::variant<TextureViews, BufferViews> views;
 };
 
-} // namespace rg::runtime
+} // namespace org::runtime

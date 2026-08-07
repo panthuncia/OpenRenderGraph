@@ -6,10 +6,13 @@
 #include "Resources/Resource.h"
 #include "Resources/ResourceStateTracker.h"
 
+
 // Resource wrapper around an externally-owned texture (e.g. a
 // swapchain image).  Does NOT allocate or free the underlying GPU resource;
 // the caller retains ownership.  Provides the SymbolicTracker and barrier
 // generation the render-graph needs for automatic state tracking.
+namespace org {
+
 class ExternalTextureResource : public Resource {
 public:
     ExternalTextureResource(rhi::ResourceHandle handle,
@@ -104,3 +107,6 @@ private:
     SymbolicTracker       m_stateTracker;
     rhi::DescriptorSlot   m_rtvSlot{};
 };
+
+
+} // namespace org

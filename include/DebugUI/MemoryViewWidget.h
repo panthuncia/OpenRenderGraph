@@ -17,6 +17,9 @@
 #include "Resources/ReadbackRequest.h"
 #include "Resources/ResourceStateTracker.h"
 
+
+namespace org {
+
 class Resource;
 struct LayoutNode;
 
@@ -121,3 +124,6 @@ namespace ui {
     };
 
 } // namespace ui
+
+
+} // namespace org

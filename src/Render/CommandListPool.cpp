@@ -5,6 +5,9 @@
 #include <spdlog/spdlog.h>
 #include <BasicTelemetry/Tracy.h>
 
+
+namespace org {
+
 namespace {
     constexpr size_t kWarmFramesInFlight = 4;
     constexpr size_t kWarmSlackCommandLists = 4;
@@ -253,3 +256,6 @@ void CommandListPool::BackgroundResetMain() {
         }
     }
 }
+
+
+} // namespace org

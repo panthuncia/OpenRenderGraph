@@ -9,6 +9,9 @@
 
 #include "Render/QueueKind.h"
 
+
+namespace org {
+
 struct BatchLayout {
     // Absolute X (plot coords) for this batch
     double baseX = 0.0;  // left edge of the batch slot
@@ -859,3 +862,6 @@ namespace RGInspector {
     }
 
 } // namespace RGInspector
+
+
+} // namespace org

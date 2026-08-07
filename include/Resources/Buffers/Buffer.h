@@ -13,6 +13,9 @@
 #include "Resources/Buffers/DynamicBufferBase.h"
 #include "Interfaces/IHasMemoryMetadata.h"
 
+
+namespace org {
+
 using Microsoft::WRL::ComPtr;
 
 class Buffer : public BufferBase, public IHasMemoryMetadata {
@@ -310,3 +313,6 @@ private:
     std::optional<StructuredBufferParams> m_structuredParams;
     std::vector<EntityComponentBundle> m_metadataBundles;
 };
+
+
+} // namespace org

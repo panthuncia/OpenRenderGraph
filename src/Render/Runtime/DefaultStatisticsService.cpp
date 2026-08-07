@@ -2,7 +2,7 @@
 
 #include "Managers/Singletons/StatisticsManager.h"
 
-namespace rg::runtime {
+namespace org::runtime {
 
 namespace {
 class DefaultStatisticsService final : public IStatisticsService {

@@ -9,6 +9,9 @@
 #include "Render/PassBuilders.h"
 #include "Render/Runtime/OpenRenderGraphSettings.h"
 
+
+namespace org {
+
 namespace {
 	RangeSpec SingleSubresourceRange(uint32_t mip, uint32_t slice) noexcept
 	{
@@ -22,7 +25,7 @@ namespace {
 }
 
 void UploadManager::Initialize() {
-	m_numFramesInFlight = rg::runtime::GetOpenRenderGraphSettings().numFramesInFlight;
+	m_numFramesInFlight = org::runtime::GetOpenRenderGraphSettings().numFramesInFlight;
 
 	UploadInstance::Config config;
 	config.numFramesInFlight = m_numFramesInFlight;
@@ -256,7 +259,7 @@ std::string UploadManager::DescribeQueuedTargetByGlobalResourceId(uint64_t globa
 	return result.str();
 }
 
-void UploadManager::ProcessUploads(uint8_t frameIndex, rg::imm::ImmediateCommandList& commandList) {
+void UploadManager::ProcessUploads(uint8_t frameIndex, org::imm::ImmediateCommandList& commandList) {
 	if (m_uploadInstance) {
 		m_uploadInstance->ProcessUploads(frameIndex, commandList);
 	}
@@ -273,7 +276,7 @@ void UploadManager::QueueResourceCopy(const std::shared_ptr<Resource>& destinati
 	MarkUploadPassDirty();
 }
 
-void UploadManager::ExecuteResourceCopies(uint8_t frameIndex, rg::imm::ImmediateCommandList& commandList) {
+void UploadManager::ExecuteResourceCopies(uint8_t frameIndex, org::imm::ImmediateCommandList& commandList) {
 	(void)frameIndex;
 	std::vector<ResourceCopy> resourceCopies;
 	{
@@ -354,3 +357,6 @@ std::vector<StreamingUploadDescriptor> UploadManager::ConsumeStreamingUploads()
 	result.swap(m_pendingStreamingUploads);
 	return result;
 }
+
+
+} // namespace org

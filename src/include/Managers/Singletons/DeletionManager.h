@@ -10,6 +10,9 @@
 #include "Render/Runtime/OpenRenderGraphSettings.h"
 #include "Resources/TrackedAllocation.h"
 
+
+namespace org {
+
 class DeletionManager {
 public:
 	struct Stats {
@@ -27,7 +30,7 @@ public:
 
 	void Initialize() {
 		std::scoped_lock lock(m_mutex);
-		m_numFramesInFlight = rg::runtime::GetOpenRenderGraphSettings().numFramesInFlight;
+		m_numFramesInFlight = org::runtime::GetOpenRenderGraphSettings().numFramesInFlight;
 		const size_t retirementSlotCount = static_cast<size_t>(m_numFramesInFlight) + 1u;
 		m_deletionQueue.resize(retirementSlotCount);
 		m_allocationDeletionQueue.resize(retirementSlotCount);
@@ -141,3 +144,6 @@ inline DeletionManager& DeletionManager::GetInstance() {
 	static DeletionManager instance;
 	return instance;
 }
+
+
+} // namespace org

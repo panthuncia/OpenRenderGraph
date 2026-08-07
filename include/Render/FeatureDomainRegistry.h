@@ -9,6 +9,8 @@
 
 #include "Resources/ResourceIdentifier.h"
 
+namespace org {
+
 struct FeatureDomainIdentifier {
     std::vector<std::string> segments;
     size_t hash = 0;
@@ -59,14 +61,18 @@ struct FeatureDomainIdentifier {
     };
 };
 
+} // namespace org
+
 namespace std {
     template<>
-    struct hash<FeatureDomainIdentifier> {
-        size_t operator()(const FeatureDomainIdentifier& id) const noexcept {
-            return FeatureDomainIdentifier::Hasher{}(id);
+    struct hash<org::FeatureDomainIdentifier> {
+        size_t operator()(const org::FeatureDomainIdentifier& id) const noexcept {
+            return org::FeatureDomainIdentifier::Hasher{}(id);
         }
     };
 }
+
+namespace org {
 
 class FeatureDomainRegistry {
 public:
@@ -128,3 +134,5 @@ private:
     mutable std::mutex m_mutex;
     std::vector<ResourceDomainMapping> m_resourceDomainMappings;
 };
+
+} // namespace org

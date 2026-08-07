@@ -5,6 +5,9 @@
 #include "Render/CommandListPool.h"
 #include "Render/QueueKind.h"
 
+
+namespace org {
+
 struct Signal {
     bool     enable = false;
     uint64_t value = 0; // if enable and 0, manager will pick next monotonic
@@ -88,3 +91,6 @@ private:
     static thread_local ThreadState s_tls;
 
 };
+
+
+} // namespace org

@@ -5,6 +5,9 @@
 #include <cstdint>
 #include <vector>
 
+
+namespace org {
+
 struct ExternalTimelinePoint {
 	rhi::Timeline timeline;
 	uint64_t value = 0;
@@ -23,3 +26,6 @@ struct PassReturn {
 	uint64_t fenceValue = 0;
 	std::vector<ExternalTimelinePoint> externalSignalsAfterCompletion;
 };
+
+
+} // namespace org

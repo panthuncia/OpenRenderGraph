@@ -3,6 +3,9 @@
 #include <optional>
 #include <rhi_allocator.h>
 
+
+namespace org {
+
 struct TextureAliasPlacement {
 	rhi::ma::Allocation* allocation = nullptr;
 	uint64_t offset = 0;
@@ -14,3 +17,6 @@ struct BufferAliasPlacement {
 	uint64_t offset = 0;
 	std::optional<uint64_t> poolID;
 };
+
+
+} // namespace org

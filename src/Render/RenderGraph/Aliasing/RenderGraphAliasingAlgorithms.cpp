@@ -1,7 +1,7 @@
 #include "Render/RenderGraph/RenderGraph.h"
 #include "../RenderGraphCompilerState.h"
+#include "Render/FrameGraphSnapshot.h"
 
-#include "DebugUI/MemoryIntrospectionWidget.h"
 
 #include <algorithm>
 #include <boost/functional/hash.hpp>
@@ -21,6 +21,9 @@
 #include "Resources/PixelBuffer.h"
 #include "Resources/Buffers/DynamicBufferBase.h"
 #include "Resources/MemoryStatisticsComponents.h"
+
+
+namespace org {
 
 RenderGraph::AutoAliasDebugSnapshot RenderGraph::GetAutoAliasDebugSnapshot() const {
 	return m_aliasingSubsystem.BuildDebugSnapshot(
@@ -89,7 +92,7 @@ namespace {
 	}
 
 	std::unordered_map<uint64_t, FrameGraphMemoryInfo> BuildFrameGraphMemoryIndex(
-		const std::vector<rg::memory::ResourceMemoryRecord>& memoryRecords) {
+		const std::vector<org::memory::ResourceMemoryRecord>& memoryRecords) {
 		std::unordered_map<uint64_t, FrameGraphMemoryInfo> out;
 		out.reserve(memoryRecords.size());
 
@@ -149,7 +152,7 @@ namespace {
 
 void RenderGraph::BuildMemoryIntrospectionFrameGraphSnapshot(
 	ui::FrameGraphSnapshot& out,
-	const std::vector<rg::memory::ResourceMemoryRecord>& memoryRecords) const {
+	const std::vector<org::memory::ResourceMemoryRecord>& memoryRecords) const {
 	out.batches.clear();
 	out.batches.reserve(batches.size());
 
@@ -550,8 +553,8 @@ namespace {
 	}
 
 	void ApplyCachedAliasStaticInfo(
-		rg::alias::FrameAliasResourceInfo& info,
-		const rg::alias::CachedAliasStaticResourceInfo& cachedInfo) {
+		org::alias::FrameAliasResourceInfo& info,
+		const org::alias::CachedAliasStaticResourceInfo& cachedInfo) {
 		info.kind = cachedInfo.kind;
 		info.aliasAllowed = cachedInfo.aliasAllowed;
 		info.deviceLocal = cachedInfo.deviceLocal;
@@ -565,8 +568,8 @@ namespace {
 		info.staticInfoInitialized = true;
 	}
 
-	rg::alias::CachedAliasStaticResourceInfo BuildCachedAliasStaticInfo(const rg::alias::FrameAliasResourceInfo& info, uint64_t signature) {
-		return rg::alias::CachedAliasStaticResourceInfo{
+	org::alias::CachedAliasStaticResourceInfo BuildCachedAliasStaticInfo(const org::alias::FrameAliasResourceInfo& info, uint64_t signature) {
+		return org::alias::CachedAliasStaticResourceInfo{
 			.signature = signature,
 			.kind = info.kind,
 			.aliasAllowed = info.aliasAllowed,
@@ -606,7 +609,7 @@ namespace {
 	uint64_t BuildAliasPoolPlanningSignature(
 		uint64_t poolID,
 		AutoAliasPackingStrategy packingStrategy,
-		const rg::alias::FrameAliasAnalysis& analysis,
+		const org::alias::FrameAliasAnalysis& analysis,
 		const std::vector<uint32_t>& poolCandidateIndices) {
 		size_t signature = static_cast<size_t>(0x7f4a7c15d9e31a01ull);
 		boost::hash_combine(signature, poolID);
@@ -667,7 +670,7 @@ namespace {
 
 bool AccessTypeIsWriteOrCommon(rhi::ResourceAccessType t);
 
-rg::alias::FrameAliasAnalysis& rg::alias::RenderGraphAliasingSubsystem::BuildAliasFrameAnalysis(RenderGraph& rg, const std::vector<AliasSchedulingNode>& nodes) const {
+org::alias::FrameAliasAnalysis& org::alias::RenderGraphAliasingSubsystem::BuildAliasFrameAnalysis(RenderGraph& rg, const std::vector<AliasSchedulingNode>& nodes) const {
 	BT_ZONE_SCOPE("RenderGraphAliasingSubsystem::BuildAliasFrameAnalysis");
 	FrameAliasAnalysis& analysis = rg.m_aliasFrameAnalysisScratch;
 	analysis.maxNodeCriticality = 1;
@@ -900,7 +903,7 @@ rg::alias::FrameAliasAnalysis& rg::alias::RenderGraphAliasingSubsystem::BuildAli
 	return analysis;
 }
 
-void rg::alias::RenderGraphAliasingSubsystem::AutoAssignAliasingPoolsFromAnalysis(RenderGraph& rg, FrameAliasAnalysis& analysis) const {
+void org::alias::RenderGraphAliasingSubsystem::AutoAssignAliasingPoolsFromAnalysis(RenderGraph& rg, FrameAliasAnalysis& analysis) const {
 	BT_ZONE_SCOPE("RenderGraphAliasingSubsystem::AutoAssignAliasingPoolsFromAnalysis");
 	auto& autoAliasPoolByID = rg.autoAliasPoolByID;
 	auto& autoAliasExclusionReasonByID = rg.autoAliasExclusionReasonByID;
@@ -1131,7 +1134,7 @@ void rg::alias::RenderGraphAliasingSubsystem::AutoAssignAliasingPoolsFromAnalysi
 	}
 }
 
-void rg::alias::RenderGraphAliasingSubsystem::AutoAssignAliasingPools(RenderGraph& rg, const std::vector<AliasSchedulingNode>& nodes) const {
+void org::alias::RenderGraphAliasingSubsystem::AutoAssignAliasingPools(RenderGraph& rg, const std::vector<AliasSchedulingNode>& nodes) const {
 	auto& analysis = BuildAliasFrameAnalysis(rg, nodes);
 	AutoAssignAliasingPoolsFromAnalysis(rg, analysis);
 }
@@ -1140,7 +1143,7 @@ bool AccessTypeIsWriteOrCommon(rhi::ResourceAccessType t) {
 	return AccessTypeIsWriteType(t) || t == rhi::ResourceAccessType::Common;
 }
 
-void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderGraph& rg, const FrameAliasAnalysis& analysis) const {
+void org::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderGraph& rg, const FrameAliasAnalysis& analysis) const {
 	BT_ZONE_SCOPE("RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis");
 	auto& aliasMaterializeOptionsByID = rg.aliasMaterializeOptionsByID;
 	auto& aliasMaterializeOptionsByResourceIndex = rg.m_aliasMaterializeOptionsByResourceIndex;
@@ -1881,7 +1884,7 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 			for (size_t candidateIndex = 0; candidateIndex < poolCandidateIndices.size() && candidateIndex < placements.size(); ++candidateIndex) {
 				const auto& candidateInfo = getInfoByIndex(poolCandidateIndices[candidateIndex]);
 				const auto& placement = placements[candidateIndex];
-				cachedPlan.placements.push_back(rg::alias::CachedAliasPoolPlacement{
+				cachedPlan.placements.push_back(org::alias::CachedAliasPoolPlacement{
 					.resourceID = candidateInfo.resourceID,
 					.offset = placement.offset,
 					.sizeBytes = placement.sizeBytes,
@@ -2308,13 +2311,13 @@ void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(RenderG
 	autoAliasPackingStrategyLastFrame = packingStrategy;
 }
 
-void rg::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph& rg, const std::vector<AliasSchedulingNode>& nodes) const {
+void org::alias::RenderGraphAliasingSubsystem::BuildAliasPlanAfterDag(RenderGraph& rg, const std::vector<AliasSchedulingNode>& nodes) const {
 	auto& analysis = BuildAliasFrameAnalysis(rg, nodes);
 	AutoAssignAliasingPoolsFromAnalysis(rg, analysis);
 	BuildAliasPlanFromAnalysis(rg, analysis);
 }
 
-void rg::alias::RenderGraphAliasingSubsystem::ApplyAliasQueueSynchronization(RenderGraph& rg) const {
+void org::alias::RenderGraphAliasingSubsystem::ApplyAliasQueueSynchronization(RenderGraph& rg) const {
 	BT_ZONE_SCOPE("RenderGraphAliasingSubsystem::ApplyAliasQueueSynchronization");
 	auto& batches = rg.batches;
 	const size_t slotCount = std::min<size_t>(rg.GetQueueRegistry().SlotCount(), 64);
@@ -2490,3 +2493,5 @@ void rg::alias::RenderGraphAliasingSubsystem::ApplyAliasQueueSynchronization(Ren
 	}
 }
 
+
+} // namespace org

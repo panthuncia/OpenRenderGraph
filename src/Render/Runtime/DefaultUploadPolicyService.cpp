@@ -6,7 +6,7 @@
 
 #include <BasicTelemetry/Tracy.h>
 
-namespace rg::runtime {
+namespace org::runtime {
 
 namespace {
 

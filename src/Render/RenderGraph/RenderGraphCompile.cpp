@@ -18,6 +18,9 @@
 #include "Resources/BackedResource.h"
 #include "Resources/ExternalTextureResource.h"
 
+
+namespace org {
+
 namespace {
 	constexpr uint64_t kFrameDAGResourceIndexEmptyKey = std::numeric_limits<uint64_t>::max();
 
@@ -407,10 +410,10 @@ namespace {
 		return state;
 	}
 
-	const char* TransitionPlacementModeToString(rg::runtime::TransitionPlacementMode mode) noexcept {
+	const char* TransitionPlacementModeToString(org::runtime::TransitionPlacementMode mode) noexcept {
 		switch (mode) {
-		case rg::runtime::TransitionPlacementMode::InlineEarlyPlacement: return "InlineEarlyPlacement";
-		case rg::runtime::TransitionPlacementMode::CanonicalThenOptimize: return "CanonicalThenOptimize";
+		case org::runtime::TransitionPlacementMode::InlineEarlyPlacement: return "InlineEarlyPlacement";
+		case org::runtime::TransitionPlacementMode::CanonicalThenOptimize: return "CanonicalThenOptimize";
 		default: return "Unknown";
 		}
 	}
@@ -1497,7 +1500,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		}
 	};
 	std::unique_ptr<RenderGraph, decltype(endCompileProfileFrame)> compileProfileFrameGuard(this, endCompileProfileFrame);
-	std::optional<rg::profile::ScopedCompileProfileStep> activeCompileProfileStep;
+	std::optional<org::profile::ScopedCompileProfileStep> activeCompileProfileStep;
 	const bool traceLifecycle = m_getRenderGraphBatchTraceEnabled && m_getRenderGraphBatchTraceEnabled();
 	auto traceCompileStep = [&](const char* step) {
 		activeCompileProfileStep.reset();
@@ -1880,7 +1883,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	}
 
 	ImmediateExecutionContext renderImmediateContext{ device,
-		{rg::imm::ImmediatePassKind::Render,
+		{org::imm::ImmediatePassKind::Render,
 		m_immediateDispatch,
 		&ResolveByIdThunk,
 		&ResolveByPtrThunk,
@@ -1888,7 +1891,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		frameIndex,
 		hostData };
 	ImmediateExecutionContext computeImmediateContext{ device,
-		{rg::imm::ImmediatePassKind::Compute,
+		{org::imm::ImmediatePassKind::Compute,
 		m_immediateDispatch,
 		&ResolveByIdThunk,
 		&ResolveByPtrThunk,
@@ -1896,7 +1899,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		frameIndex,
 		hostData };
 	ImmediateExecutionContext copyImmediateContext{ device,
-		{rg::imm::ImmediatePassKind::Copy,
+		{org::imm::ImmediatePassKind::Copy,
 		m_immediateDispatch,
 		&ResolveByIdThunk,
 		&ResolveByPtrThunk,
@@ -1919,7 +1922,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	auto prepareImmediateContext = [&](ImmediateExecutionContext& context, auto& pass) -> ImmediateExecutionContext& {
 		context.frameIndex = frameIndex;
 		context.hostData = hostData;
-		rg::imm::FrameData recycled{
+		org::imm::FrameData recycled{
 			std::move(pass.immediateBytecode),
 			std::move(pass.resources.frameResourceRequirements),
 			{}
@@ -2706,10 +2709,10 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	};
 	const bool needsAliasCompile = autoAliasMode != AutoAliasMode::Off || hasManualAliasPoolThisFrame();
 	if (needsAliasCompile) {
-		std::vector<rg::alias::AliasSchedulingNode> aliasNodes;
+		std::vector<org::alias::AliasSchedulingNode> aliasNodes;
 		aliasNodes.reserve(nodes.size());
 		for (const auto& node : nodes) {
-			aliasNodes.push_back(rg::alias::AliasSchedulingNode{
+			aliasNodes.push_back(org::alias::AliasSchedulingNode{
 				.passIndex = node.passIndex,
 				.originalOrder = node.originalOrder,
 				.topoRank = node.topoRank,
@@ -2719,7 +2722,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			});
 		}
 
-		rg::alias::FrameAliasAnalysis* aliasAnalysis = nullptr;
+		org::alias::FrameAliasAnalysis* aliasAnalysis = nullptr;
 		{
 			traceCompileStep("BuildAliasFrameAnalysis");
 			BT_ZONE_SCOPE("RenderGraph::CompileFrame::BuildAliasFrameAnalysis");
@@ -2758,11 +2761,11 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		autoAliasExclusionReasonByID.clear();
 		autoAliasExclusionReasonSummary.clear();
 		autoAliasExcludedResources.clear();
-		m_aliasPlacementRangeByResourceIndex.assign(m_frameSchedulingResourceCount, rg::alias::AliasPlacementRange{});
+		m_aliasPlacementRangeByResourceIndex.assign(m_frameSchedulingResourceCount, org::alias::AliasPlacementRange{});
 		m_hasAliasPlacementByResourceIndex.assign(m_frameSchedulingResourceCount, 0);
-		m_schedulingPlacementRangeByResourceIndex.assign(m_frameSchedulingResourceCount, rg::alias::AliasPlacementRange{});
+		m_schedulingPlacementRangeByResourceIndex.assign(m_frameSchedulingResourceCount, org::alias::AliasPlacementRange{});
 		m_hasSchedulingPlacementByResourceIndex.assign(m_frameSchedulingResourceCount, 0);
-		m_aliasActivationPendingByResourceIndex.assign(m_frameSchedulingResourceCount, rg::alias::AliasActivationReason::None);
+		m_aliasActivationPendingByResourceIndex.assign(m_frameSchedulingResourceCount, org::alias::AliasActivationReason::None);
 	}
 	{
 		traceCompileStep("RebuildSchedulingEquivalentIDCache");
@@ -3636,3 +3639,5 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 #endif
 }
 
+
+} // namespace org

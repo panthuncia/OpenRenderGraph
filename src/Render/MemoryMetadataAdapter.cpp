@@ -3,6 +3,9 @@
 #include "Resources/MemoryStatisticsComponents.h"
 #include "Resources/ResourceIdentifier.h"
 
+
+namespace org {
+
 void IHasMemoryMetadata::SetMemoryUsageHint(std::string usage) {
     EntityComponentBundle bundle;
     bundle.Set<MemoryStatisticsComponents::ResourceUsage>({ std::move(usage) });
@@ -14,3 +17,6 @@ void IHasMemoryMetadata::SetMemoryIdentifier(std::string identifier) {
     bundle.Set<ResourceIdentifier>({ std::move(identifier) });
     ApplyMetadataComponentBundle(bundle);
 }
+
+
+} // namespace org

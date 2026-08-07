@@ -6,9 +6,9 @@
 
 #include "Render/Runtime/DescriptorServiceTypes.h"
 
-class GloballyIndexedResource;
+namespace org { class GloballyIndexedResource; }
 
-namespace rg::runtime {
+namespace org::runtime {
 
 class IDescriptorService {
 public:
@@ -38,4 +38,4 @@ public:
 
 std::shared_ptr<IDescriptorService> CreateDefaultDescriptorService();
 
-} // namespace rg::runtime
+} // namespace org::runtime

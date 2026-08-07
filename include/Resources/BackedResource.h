@@ -2,8 +2,11 @@
 
 #include <cstdint>
 
+
 // Graph-facing contract for resources whose API handle is backed by a concrete GPU allocation.
 // RenderGraph should depend on this capability instead of specific resource subclasses.
+namespace org {
+
 class BackedResource {
 public:
     virtual ~BackedResource() = default;
@@ -12,3 +15,6 @@ public:
     virtual uint64_t GetBackingGeneration() const = 0;
     virtual void EnsureVirtualDescriptorSlotsAllocated() = 0;
 };
+
+
+} // namespace org

@@ -10,6 +10,9 @@
 
 #include "Resources/ResourceIdentifier.h"
 
+
+namespace org {
+
 struct PipelineResources {
 	std::vector<ResourceIdentifier> mandatoryResourceDescriptorSlots;
 	std::vector<ResourceIdentifier> optionalResourceDescriptorSlots;
@@ -126,3 +129,6 @@ private:
 
 	std::shared_ptr<PipelineStateSlot> m_slot;
 };
+
+
+} // namespace org

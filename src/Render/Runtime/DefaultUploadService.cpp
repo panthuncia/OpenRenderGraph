@@ -3,7 +3,7 @@
 #include "Managers/Singletons/DeletionManager.h"
 #include "Managers/Singletons/UploadManager.h"
 
-namespace rg::runtime {
+namespace org::runtime {
 
 namespace {
 class DefaultUploadService final : public IUploadService {

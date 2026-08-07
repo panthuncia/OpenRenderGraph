@@ -7,11 +7,14 @@
 
 #include "Resources/Buffers/Buffer.h"
 
+
 /// A dedicated pool of Upload-heap buffers for async copy-queue streaming uploads.
 /// Separate from UploadManager's pages to avoid thread-safety contention.
 ///
 /// Uses a simple per-frame bump allocator: each frame gets a clean slate of
 /// tail offsets (pages are reused across frames once retired).
+namespace org {
+
 class AsyncCopyPagePool {
 public:
     struct Allocation {
@@ -94,3 +97,6 @@ private:
     size_t m_activePage = 0;
     std::mutex m_mutex;
 };
+
+
+} // namespace org

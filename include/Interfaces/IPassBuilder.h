@@ -1,5 +1,7 @@
 #pragma once
 
+namespace org {
+
 class IResourceProvider;
 
 enum class PassBuilderKind { Render, Compute, Copy };
@@ -13,3 +15,5 @@ struct IPassBuilder {
     virtual void Finalize() = 0;
     virtual void Reset() = 0;
 };
+
+} // namespace org

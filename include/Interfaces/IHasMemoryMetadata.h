@@ -4,6 +4,9 @@
 
 #include "Resources/TrackedAllocation.h"
 
+
+namespace org {
+
 class IHasMemoryMetadata {
 	public:
 	virtual ~IHasMemoryMetadata() = default;
@@ -13,3 +16,6 @@ private:
 	virtual void ApplyMetadataComponentBundle(const EntityComponentBundle& bundle) = 0;
 	friend class RenderGraph;
 };
+
+
+} // namespace org

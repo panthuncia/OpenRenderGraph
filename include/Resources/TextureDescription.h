@@ -4,6 +4,9 @@
 
 #include <rhi.h>
 
+
+namespace org {
+
 struct ImageDimensions {
     uint32_t width = 0;
     uint32_t height = 0;
@@ -43,3 +46,6 @@ struct TextureDescription {
 
     bool padInternalResolution = false; // If true, the texture will be padded to the next power of two resolution
 };
+
+
+} // namespace org

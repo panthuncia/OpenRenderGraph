@@ -6,7 +6,7 @@
 
 #include "Render/Runtime/IUploadService.h"
 
-namespace rg::runtime {
+namespace org::runtime {
 
 inline IUploadService*& UploadServiceSlot() {
     static IUploadService* service = nullptr;
@@ -118,12 +118,12 @@ inline void ResetStreamingPagePoolDispatch() {
 
 #if BUILD_TYPE == BUILD_TYPE_DEBUG
 #define BUFFER_UPLOAD(data,size,res,offset) \
-    rg::runtime::UploadBufferDataDispatch((data),(size),(res),(offset),__FILE__,__LINE__)
+    org::runtime::UploadBufferDataDispatch((data),(size),(res),(offset),__FILE__,__LINE__)
 #define TEXTURE_UPLOAD_SUBRESOURCES(dstTexture,fmt,baseWidth,baseHeight,depthOrLayers,mipLevels,arraySize,srcSubresources,srcCount) \
-	rg::runtime::UploadTextureSubresourcesDispatch((dstTexture),(fmt),(baseWidth),(baseHeight),(depthOrLayers),(mipLevels),(arraySize),(srcSubresources),(srcCount),__FILE__,__LINE__)
+	org::runtime::UploadTextureSubresourcesDispatch((dstTexture),(fmt),(baseWidth),(baseHeight),(depthOrLayers),(mipLevels),(arraySize),(srcSubresources),(srcCount),__FILE__,__LINE__)
 #else
 #define BUFFER_UPLOAD(data,size,res,offset) \
-    rg::runtime::UploadBufferDataDispatch((data),(size),(res),(offset),nullptr,0)
+    org::runtime::UploadBufferDataDispatch((data),(size),(res),(offset),nullptr,0)
 #define TEXTURE_UPLOAD_SUBRESOURCES(dstTexture,fmt,baseWidth,baseHeight,depthOrLayers,mipLevels,arraySize,srcSubresources,srcCount) \
-	rg::runtime::UploadTextureSubresourcesDispatch((dstTexture),(fmt),(baseWidth),(baseHeight),(depthOrLayers),(mipLevels),(arraySize),(srcSubresources),(srcCount),nullptr,0)
+	org::runtime::UploadTextureSubresourcesDispatch((dstTexture),(fmt),(baseWidth),(baseHeight),(depthOrLayers),(mipLevels),(arraySize),(srcSubresources),(srcCount),nullptr,0)
 #endif

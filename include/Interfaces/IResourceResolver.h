@@ -5,6 +5,9 @@
 
 #include "Resources/ResourceStateTracker.h"
 
+
+namespace org {
+
 class IResourceResolver {
 	public:
 	virtual ~IResourceResolver() = default;
@@ -84,3 +87,6 @@ struct ResolverSnapshot {
         return *this;
     }
 };
+
+
+} // namespace org

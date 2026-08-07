@@ -10,6 +10,9 @@
 #include <rhi.h>
 #include <spdlog/spdlog.h>
 
+
+namespace org {
+
 namespace ui {
 
     inline float DecodeHalfToFloat(uint16_t h) {
@@ -479,3 +482,6 @@ namespace ui {
     }
 
 } // namespace ui
+
+
+} // namespace org

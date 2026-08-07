@@ -37,6 +37,9 @@
 #include "Resources/Buffers/DynamicBufferBase.h"
 #include "Resources/MemoryStatisticsComponents.h"
 
+
+namespace org {
+
 namespace {
 	constexpr uint64_t kFrameDAGResourceIndexEmptyKey = std::numeric_limits<uint64_t>::max();
 
@@ -424,10 +427,10 @@ namespace {
 		}
 	}
 
-	const char* TransitionPlacementModeToString(rg::runtime::TransitionPlacementMode mode) noexcept {
+	const char* TransitionPlacementModeToString(org::runtime::TransitionPlacementMode mode) noexcept {
 		switch (mode) {
-		case rg::runtime::TransitionPlacementMode::InlineEarlyPlacement: return "InlineEarlyPlacement";
-		case rg::runtime::TransitionPlacementMode::CanonicalThenOptimize: return "CanonicalThenOptimize";
+		case org::runtime::TransitionPlacementMode::InlineEarlyPlacement: return "InlineEarlyPlacement";
+		case org::runtime::TransitionPlacementMode::CanonicalThenOptimize: return "CanonicalThenOptimize";
 		default: return "Unknown";
 		}
 	}
@@ -1081,7 +1084,7 @@ void RenderGraph::WriteCompiledGraphDebugDump(uint8_t frameIndex, const std::vec
 			dump << "\n[AliasPlacementRanges]\n";
 
 			// Group placements by pool for readability
-			std::map<uint64_t, std::vector<std::pair<uint64_t, const rg::alias::AliasPlacementRange*>>> byPool;
+			std::map<uint64_t, std::vector<std::pair<uint64_t, const org::alias::AliasPlacementRange*>>> byPool;
 			for (const auto& [resourceID, placement] : aliasPlacementRangesByID) {
 				byPool[placement.poolID].emplace_back(resourceID, &placement);
 			}
@@ -1210,7 +1213,7 @@ void RenderGraph::WriteVramUsageDebugDump(uint8_t frameIndex) const
 				: (100.0 * static_cast<double>(bytes) / static_cast<double>(totalBytes));
 		};
 
-		std::vector<rg::memory::ResourceMemoryRecord> memoryRecords;
+		std::vector<org::memory::ResourceMemoryRecord> memoryRecords;
 		m_memorySnapshotProvider.BuildSnapshot(memoryRecords);
 
 		std::unordered_map<std::string, DumpCategoryRow> categoriesByLabel;
@@ -1240,7 +1243,7 @@ void RenderGraph::WriteVramUsageDebugDump(uint8_t frameIndex) const
 			return a.label < b.label;
 		});
 
-		std::vector<const rg::memory::ResourceMemoryRecord*> resources;
+		std::vector<const org::memory::ResourceMemoryRecord*> resources;
 		resources.reserve(memoryRecords.size());
 		for (const auto& record : memoryRecords) {
 			resources.push_back(&record);
@@ -1950,7 +1953,7 @@ bool RenderGraph::FinalizeDependencyGraph(std::vector<Node>& nodes)
 bool RenderGraph::AddCurrentFrameAliasSchedulingEdges(std::vector<Node>& nodes)
 {
 	BT_ZONE_SCOPE("RenderGraph::AddCurrentFrameAliasSchedulingEdges");
-	auto rangesOverlap = [](const rg::alias::AliasPlacementRange& lhs, const rg::alias::AliasPlacementRange& rhs) {
+	auto rangesOverlap = [](const org::alias::AliasPlacementRange& lhs, const org::alias::AliasPlacementRange& rhs) {
 		const uint64_t overlapStart = (std::max)(lhs.startByte, rhs.startByte);
 		const uint64_t overlapEnd = (std::min)(lhs.endByte, rhs.endByte);
 		return overlapStart < overlapEnd;
@@ -2306,8 +2309,8 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 	const size_t gfxSlot = QueueIndex(QueueKind::Graphics);
 	const auto selectionPolicy = rg.m_getQueueSchedulingSelectionPolicy
 		? rg.m_getQueueSchedulingSelectionPolicy()
-		: rg::runtime::QueueSchedulingSelectionPolicy::FirstFit;
-	const bool useScoredScheduling = selectionPolicy == rg::runtime::QueueSchedulingSelectionPolicy::Scored;
+		: org::runtime::QueueSchedulingSelectionPolicy::FirstFit;
+	const bool useScoredScheduling = selectionPolicy == org::runtime::QueueSchedulingSelectionPolicy::Scored;
 	BatchBuildState& batchBuildState = rg.m_autoScheduleBatchBuildState;
 	batchBuildState.Initialize(nodes.size(), queueCount, rg.m_frameSchedulingResourceCount);
 
@@ -3003,7 +3006,7 @@ bool RenderGraph::TryAddTransitionFastNoOp(
 	if (requirement.resourceIndex >= m_aliasActivationPendingByResourceIndex.size()) {
 		return false;
 	}
-	if (m_aliasActivationPendingByResourceIndex[requirement.resourceIndex] != rg::alias::AliasActivationReason::None) {
+	if (m_aliasActivationPendingByResourceIndex[requirement.resourceIndex] != org::alias::AliasActivationReason::None) {
 		return false;
 	}
 
@@ -3044,7 +3047,7 @@ bool RenderGraph::TryAddTransitionTrackedNoOp(
 	if (requirement.resourceIndex >= m_aliasActivationPendingByResourceIndex.size()) {
 		return false;
 	}
-	if (m_aliasActivationPendingByResourceIndex[requirement.resourceIndex] != rg::alias::AliasActivationReason::None) {
+	if (m_aliasActivationPendingByResourceIndex[requirement.resourceIndex] != org::alias::AliasActivationReason::None) {
 		return false;
 	}
 
@@ -3149,7 +3152,7 @@ void RenderGraph::AddTransitionSlowPath(
 	const bool isWholeResourceRequirement = requirement.isWholeResource;
 
 	bool isAliasActivation = false;
-	if (requirement.resourceIndex < m_aliasActivationPendingByResourceIndex.size() && m_aliasActivationPendingByResourceIndex[requirement.resourceIndex] != rg::alias::AliasActivationReason::None) {
+	if (requirement.resourceIndex < m_aliasActivationPendingByResourceIndex.size() && m_aliasActivationPendingByResourceIndex[requirement.resourceIndex] != org::alias::AliasActivationReason::None) {
 		isAliasActivation = true;
 		const auto activationReason = m_aliasActivationPendingByResourceIndex[requirement.resourceIndex];
 		const bool firstUseIsWrite = AccessTypeIsWriteType(requirement.state.access);
@@ -3197,7 +3200,7 @@ void RenderGraph::AddTransitionSlowPath(
 		std::vector<ResourceTransition> ignored;
 		compileTracker.Apply(RangeSpec{}, pRes, requiredState, ignored);
 		aliasActivationPending.erase(requirement.resourceID);
-		m_aliasActivationPendingByResourceIndex[requirement.resourceIndex] = rg::alias::AliasActivationReason::None;
+		m_aliasActivationPendingByResourceIndex[requirement.resourceIndex] = org::alias::AliasActivationReason::None;
 	}
 	else {
 		if (isWholeResourceRequirement && fastState.wholeResourceOnly) {
@@ -3313,8 +3316,8 @@ void RenderGraph::AddTransitionSlowPath(
 	}
 	const auto transitionPlacementMode = m_getTransitionPlacementMode
 		? m_getTransitionPlacementMode()
-		: rg::runtime::TransitionPlacementMode::InlineEarlyPlacement;
-	if (transitionPlacementMode == rg::runtime::TransitionPlacementMode::CanonicalThenOptimize) {
+		: org::runtime::TransitionPlacementMode::InlineEarlyPlacement;
+	if (transitionPlacementMode == org::runtime::TransitionPlacementMode::CanonicalThenOptimize) {
 		if (passQueue != QueueKind::Graphics && needsGraphicsQueueForTransitions) {
 			for (auto& transition : transitions) {
 				currentBatch.Transitions(gfxSlot, BatchTransitionPhase::BeforePasses).push_back(transition);
@@ -3458,9 +3461,9 @@ RenderGraph::RenderGraph(rhi::Device device)
 	: m_compilerState(std::make_unique<CompilerState>()) {
 	DeviceManager::GetInstance().Initialize(device);
 
-	auto MakeDefaultImmediateDispatch = [&]() noexcept -> rg::imm::ImmediateDispatch
+	auto MakeDefaultImmediateDispatch = [&]() noexcept -> org::imm::ImmediateDispatch
 		{
-			rg::imm::ImmediateDispatch d{};
+			org::imm::ImmediateDispatch d{};
 			d.user = this;
 
 			d.GetResourceHandle = [](RenderGraph* user, ResourceRegistry::RegistryHandle r) noexcept -> rhi::ResourceHandle {
@@ -3517,19 +3520,19 @@ RenderGraph::RenderGraph(rhi::Device device)
 
 	m_immediateDispatch = MakeDefaultImmediateDispatch();
 	if (!m_statisticsService) {
-		m_statisticsService = rg::runtime::CreateDefaultStatisticsService();
+		m_statisticsService = org::runtime::CreateDefaultStatisticsService();
 	}
 	if (!m_uploadService) {
-		m_uploadService = rg::runtime::CreateDefaultUploadService();
+		m_uploadService = org::runtime::CreateDefaultUploadService();
 	}
 	if (!m_readbackService) {
-		m_readbackService = rg::runtime::CreateDefaultReadbackService();
+		m_readbackService = org::runtime::CreateDefaultReadbackService();
 	}
 	if (!m_descriptorService) {
-		m_descriptorService = rg::runtime::CreateDefaultDescriptorService();
+		m_descriptorService = org::runtime::CreateDefaultDescriptorService();
 	}
 	if (!m_renderGraphSettingsService) {
-		m_renderGraphSettingsService = rg::runtime::CreateDefaultRenderGraphSettingsService();
+		m_renderGraphSettingsService = org::runtime::CreateDefaultRenderGraphSettingsService();
 	}
 }
 
@@ -4207,7 +4210,7 @@ void RenderGraph::RebuildFrameSchedulingResourceIndex(std::span<const uint64_t> 
 		}
 	}
 
-	m_aliasActivationPendingByResourceIndex.assign(m_frameSchedulingResourceCount, rg::alias::AliasActivationReason::None);
+	m_aliasActivationPendingByResourceIndex.assign(m_frameSchedulingResourceCount, org::alias::AliasActivationReason::None);
 	for (const auto& [resourceID, reason] : aliasActivationPending) {
 		auto resourceIndex = TryGetFrameSchedulingResourceIndex(resourceID);
 		if (resourceIndex.has_value()) {
@@ -4354,7 +4357,7 @@ void RenderGraph::RebuildFramePassSchedulingSummaries() {
 			accessSummary.hasUAV = accessSummary.hasUAV || req.isUAV;
 			accessSummary.hasAliasActivation = accessSummary.hasAliasActivation
 				|| (resourceIndex < m_aliasActivationPendingByResourceIndex.size()
-					&& m_aliasActivationPendingByResourceIndex[resourceIndex] != rg::alias::AliasActivationReason::None);
+					&& m_aliasActivationPendingByResourceIndex[resourceIndex] != org::alias::AliasActivationReason::None);
 			accessSummary.hasNonWholeResourceRange = accessSummary.hasNonWholeResourceRange || !isWholeResource;
 		}
 
@@ -4592,7 +4595,7 @@ std::optional<size_t> RenderGraph::TryGetFrameSchedulingResourceIndex(uint64_t r
 	return std::nullopt;
 }
 
-const rg::alias::AliasPlacementRange* RenderGraph::TryGetAliasPlacementRangeByResourceIndex(size_t resourceIndex) const {
+const org::alias::AliasPlacementRange* RenderGraph::TryGetAliasPlacementRangeByResourceIndex(size_t resourceIndex) const {
 	if (resourceIndex >= m_hasAliasPlacementByResourceIndex.size() || resourceIndex >= m_aliasPlacementRangeByResourceIndex.size()) {
 		return nullptr;
 	}
@@ -4602,7 +4605,7 @@ const rg::alias::AliasPlacementRange* RenderGraph::TryGetAliasPlacementRangeByRe
 	return &m_aliasPlacementRangeByResourceIndex[resourceIndex];
 }
 
-const rg::alias::AliasPlacementRange* RenderGraph::TryGetAliasPlacementRange(uint64_t resourceID) const {
+const org::alias::AliasPlacementRange* RenderGraph::TryGetAliasPlacementRange(uint64_t resourceID) const {
 	auto resourceIndex = TryGetFrameSchedulingResourceIndex(resourceID);
 	if (!resourceIndex.has_value()) {
 		return nullptr;
@@ -4610,7 +4613,7 @@ const rg::alias::AliasPlacementRange* RenderGraph::TryGetAliasPlacementRange(uin
 	return TryGetAliasPlacementRangeByResourceIndex(*resourceIndex);
 }
 
-const rg::alias::AliasPlacementRange* RenderGraph::TryGetSchedulingPlacementRangeByResourceIndex(size_t resourceIndex) const {
+const org::alias::AliasPlacementRange* RenderGraph::TryGetSchedulingPlacementRangeByResourceIndex(size_t resourceIndex) const {
 	if (resourceIndex >= m_hasSchedulingPlacementByResourceIndex.size() || resourceIndex >= m_schedulingPlacementRangeByResourceIndex.size()) {
 		return nullptr;
 	}
@@ -4620,7 +4623,7 @@ const rg::alias::AliasPlacementRange* RenderGraph::TryGetSchedulingPlacementRang
 	return &m_schedulingPlacementRangeByResourceIndex[resourceIndex];
 }
 
-const rg::alias::AliasPlacementRange* RenderGraph::TryGetSchedulingPlacementRange(uint64_t resourceID) const {
+const org::alias::AliasPlacementRange* RenderGraph::TryGetSchedulingPlacementRange(uint64_t resourceID) const {
 	auto resourceIndex = TryGetFrameSchedulingResourceIndex(resourceID);
 	if (!resourceIndex.has_value()) {
 		return nullptr;
@@ -6406,7 +6409,7 @@ void RenderGraph::Setup() {
 	m_getQueueSchedulingSelectionPolicy = [this]() {
 		return m_renderGraphSettingsService
 			? m_renderGraphSettingsService->GetQueueSchedulingSelectionPolicy()
-			: rg::runtime::QueueSchedulingSelectionPolicy::FirstFit;
+			: org::runtime::QueueSchedulingSelectionPolicy::FirstFit;
 	};
 	m_getQueueSchedulingWidthScale = [this]() {
 		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetQueueSchedulingWidthScale() : 1.0f;
@@ -6435,7 +6438,7 @@ void RenderGraph::Setup() {
 	m_getTransitionPlacementMode = [this]() {
 		return m_renderGraphSettingsService
 			? m_renderGraphSettingsService->GetTransitionPlacementMode()
-			: rg::runtime::TransitionPlacementMode::InlineEarlyPlacement;
+			: org::runtime::TransitionPlacementMode::InlineEarlyPlacement;
 	};
 	m_getAutoAliasPoolRetireIdleFrames = [this]() {
 		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetAutoAliasPoolRetireIdleFrames() : 120u;
@@ -7294,7 +7297,7 @@ namespace {
 		CommandListPool& pool;
 		UINT64 fenceOffset;             // always 0 currently
 		PassExecutionContext& context;
-		rg::runtime::IStatisticsService* statisticsService;
+		org::runtime::IStatisticsService* statisticsService;
 		std::vector<PassReturn>& outExternalFences;
 		std::unordered_map<ExternalFenceSignalKey, ExternalFenceSignalOrigin, ExternalFenceSignalKeyHash>& queuedExternalFenceOrigins;
 		UINT64& lastSignaledOnTimeline;
@@ -7405,7 +7408,7 @@ namespace {
 				if (hasStatistics)
 					args.statisticsService->BeginQuery(pr.statisticsIndex, args.context.frameIndex, rhiQueue, commandList);
 				if ((pr.run & PassRunMask::Immediate) != PassRunMask::None)
-					rg::imm::Replay(pr.immediateBytecode, commandList, *args.context.immediateDispatch);
+					org::imm::Replay(pr.immediateBytecode, commandList, *args.context.immediateDispatch);
 				pr.immediateKeepAlive.reset();
 				if ((pr.run & PassRunMask::Retained) != PassRunMask::None) {
 					auto passReturn = pr.pass->Execute(args.context);
@@ -7571,7 +7574,7 @@ namespace {
 		size_t queueSlot;
 		rhi::Queue& rhiQueue;           // needed for statistics Begin/EndQuery
 		PassExecutionContext context;    // COPY: each task gets its own
-		rg::runtime::IStatisticsService* statisticsService;
+		org::runtime::IStatisticsService* statisticsService;
 		std::unordered_map<ExternalFenceSignalKey, ExternalFenceSignalOrigin, ExternalFenceSignalKeyHash>& queuedExternalFenceOrigins;
 		bool batchTraceEnabled;
 	};
@@ -7653,7 +7656,7 @@ namespace {
 				if (hasStatistics)
 					args.statisticsService->BeginQuery(pr.statisticsIndex, args.context.frameIndex, args.rhiQueue, commandList, sched.queryRecordingContext);
 				if ((pr.run & PassRunMask::Immediate) != PassRunMask::None)
-					rg::imm::Replay(pr.immediateBytecode, commandList, *args.context.immediateDispatch);
+					org::imm::Replay(pr.immediateBytecode, commandList, *args.context.immediateDispatch);
 				pr.immediateKeepAlive.reset();
 				if ((pr.run & PassRunMask::Retained) != PassRunMask::None) {
 					auto passReturn = pr.pass->Execute(args.context);
@@ -9543,7 +9546,7 @@ bool RenderGraph::IsNewBatchNeeded(
 		// Only reject same-batch merging when that activation would clobber an
 		// aliased-equivalent resource that is already live in the batch.
 		if (requirement.resourceIndex < m_aliasActivationPendingByResourceIndex.size()
-			&& m_aliasActivationPendingByResourceIndex[requirement.resourceIndex] != rg::alias::AliasActivationReason::None
+			&& m_aliasActivationPendingByResourceIndex[requirement.resourceIndex] != org::alias::AliasActivationReason::None
 			&& (overlapsAliasedResource || overlapsAliasedTransition)) {
 			return true;
 		}
@@ -9912,3 +9915,6 @@ void RenderGraph::SetMinimumAutomaticSchedulingQueues(QueueKind kind, uint8_t co
 		EnsureMinimumAutomaticSchedulingQueues();
 	}
 }
+
+
+} // namespace org

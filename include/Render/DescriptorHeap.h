@@ -6,6 +6,9 @@
 #include <vector>
 #include <mutex>
 
+
+namespace org {
+
 class DescriptorHeap {
 public:
     DescriptorHeap(rhi::Device& device, rhi::DescriptorHeapType type, uint32_t numDescriptors, bool shaderVisible = false, std::string name = "Descriptor Heap");
@@ -30,3 +33,6 @@ private:
     bool m_shaderVisible;
     std::mutex m_allocationMutex;
 };
+
+
+} // namespace org

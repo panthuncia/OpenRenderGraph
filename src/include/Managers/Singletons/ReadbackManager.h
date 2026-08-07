@@ -11,6 +11,9 @@
 #include "Render/QueueKind.h"
 #include "Resources/ReadbackRequest.h"
 
+
+namespace org {
+
 class Resource;
 
 struct ReadbackCaptureInfo {
@@ -127,3 +130,6 @@ inline ReadbackManager& ReadbackManager::GetInstance() {
 	}
 	return *instance;
 }
+
+
+} // namespace org

@@ -12,11 +12,13 @@
 #include "Render/Runtime/UploadTypes.h"
 #include "Render/Runtime/StreamingUploadTypes.h"
 
+namespace org {
 class ResourceRegistry;
 class RenderPass;
 class Resource;
+}
 
-namespace rg::runtime {
+namespace org::runtime {
 
 class IUploadService {
 public:

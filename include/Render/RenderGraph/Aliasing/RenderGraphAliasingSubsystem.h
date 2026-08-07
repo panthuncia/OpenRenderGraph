@@ -10,11 +10,13 @@
 #include "Render/ResourceRegistry.h"
 #include "Resources/TrackedAllocation.h"
 
+namespace org {
 enum class AutoAliasMode : uint8_t;
 enum class AutoAliasPackingStrategy : uint8_t;
 class RenderGraph;
+}
 
-namespace rg::alias {
+namespace org::alias {
 
 struct AutoAliasReasonCount {
 	std::string reason;
@@ -224,4 +226,4 @@ public:
 	void ApplyAliasQueueSynchronization(RenderGraph& rg) const;
 };
 
-} // namespace rg::alias
+} // namespace org::alias

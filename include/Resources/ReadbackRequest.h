@@ -11,6 +11,9 @@
 #include "Resources/Resource.h"
 #include "Resources/ResourceStateTracker.h"
 
+
+namespace org {
+
 struct ReadbackRequest {
     std::shared_ptr<Resource> readbackBuffer;
     std::vector<rhi::CopyableFootprint> layouts;
@@ -58,3 +61,6 @@ struct ReadbackCaptureRequest {
     QueueKind signalQueueKind = QueueKind::Graphics;
     uint64_t fenceValue = 0;
 };
+
+
+} // namespace org

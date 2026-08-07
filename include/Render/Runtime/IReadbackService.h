@@ -11,10 +11,12 @@
 #include "Render/QueueKind.h"
 #include "Resources/ReadbackRequest.h"
 
+namespace org {
 class RenderPass;
 class Resource;
+}
 
-namespace rg::runtime {
+namespace org::runtime {
 
 struct ReadbackCaptureInfo {
     std::string passName;

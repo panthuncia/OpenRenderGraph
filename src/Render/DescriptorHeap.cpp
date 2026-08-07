@@ -1,6 +1,9 @@
 #include "Render/DescriptorHeap.h"
 #include <mutex>
 
+
+namespace org {
+
 DescriptorHeap::DescriptorHeap(rhi::Device& device, rhi::DescriptorHeapType type, uint32_t numDescriptors, bool shaderVisible, std::string name)
     : m_type(type), m_shaderVisible(shaderVisible), m_numDescriptorsAllocated(0) {
 
@@ -46,3 +49,6 @@ void DescriptorHeap::ReleaseDescriptor(UINT index) {
 //#endif
     m_freeIndices.push(index);
 }
+
+
+} // namespace org

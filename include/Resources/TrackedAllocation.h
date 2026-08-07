@@ -9,6 +9,9 @@
 
 #include "Resources/ResourceIdentifier.h"
 
+
+namespace org {
+
 struct EntityComponentBundle {
     std::vector<std::function<void(flecs::entity)>> ops;
 
@@ -357,3 +360,6 @@ struct AllocationTrackDesc {
 	// Arbitrary attachments
     EntityComponentBundle attach;
 };
+
+
+} // namespace org

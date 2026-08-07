@@ -11,9 +11,12 @@
 #include "Resources/Resource.h"
 #include "Render/Runtime/OpenRenderGraphSettings.h"
 
+
 // Controls texture SRV mip range behavior:
 // 0: each SRV exposes exactly one mip (legacy behavior)
 // 1: each SRV starting at mip m exposes [m .. lastMip]
+namespace org {
+
 #ifndef ORG_TEXTURE_SRV_INCLUDE_LOWER_MIPS
 #define ORG_TEXTURE_SRV_INCLUDE_LOWER_MIPS 1
 #endif
@@ -775,3 +778,6 @@ UINT DescriptorHeapManager::CreateIndexedSampler(const rhi::SamplerDesc& sampler
     device.CreateSampler({ m_samplerHeap->GetHeap().GetHandle(), index }, samplerDesc);
     return index;
 }
+
+
+} // namespace org

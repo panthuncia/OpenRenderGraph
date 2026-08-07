@@ -5,6 +5,9 @@
 #include "Resources/ResourceIdentifier.h"
 #include "Interfaces/IResourceResolver.h"
 
+
+namespace org {
+
 class Resource;
 class IResourceProvider {
 public:
@@ -14,3 +17,6 @@ public:
     virtual std::shared_ptr<IResourceResolver> ProvideResolver(ResourceIdentifier const& key) { return nullptr; }
     virtual std::vector<ResourceIdentifier> GetSupportedResolverKeys() { return {}; }
 };
+
+
+} // namespace org

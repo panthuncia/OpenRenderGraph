@@ -12,12 +12,15 @@
 #include "Render/Runtime/DescriptorServiceTypes.h"
 #include "Resources/GPUBacking/GpuBufferBacking.h"
 
+
+namespace org {
+
 class GloballyIndexedResource;
 class Resource;
 
 class DescriptorHeapManager {
 public:
-	using ViewRequirements = rg::runtime::DescriptorViewRequirements;
+	using ViewRequirements = org::runtime::DescriptorViewRequirements;
 
 	static DescriptorHeapManager& GetInstance() {
 		static DescriptorHeapManager instance;
@@ -105,3 +108,6 @@ private:
 	std::vector<QueueFenceSnapshotPoint> m_latestQueueFenceSnapshot;
 	std::mutex m_descriptorMutationMutex;
 };
+
+
+} // namespace org

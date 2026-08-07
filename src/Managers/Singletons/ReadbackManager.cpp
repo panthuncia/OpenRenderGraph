@@ -8,6 +8,9 @@
 
 #include "Resources/Buffers/Buffer.h"
 
+
+namespace org {
+
 std::unique_ptr<ReadbackManager> ReadbackManager::instance = nullptr;
 bool ReadbackManager::initialized = false;
 
@@ -426,3 +429,6 @@ void ReadbackManager::ProcessReadbackRequests() {
     BT_PLOT("Readback.CompletedBytes", static_cast<int64_t>(completedBytes));
     BT_PLOT("Readback.Callbacks", static_cast<int64_t>(callbackCount));
 }
+
+
+} // namespace org

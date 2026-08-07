@@ -7,6 +7,9 @@
 #include "Resources/ResourceStateTracker.h"
 #include "Render/ResourceRegistry.h"
 
+
+namespace org {
+
 class Resource;
 
 struct ResourceHandleAndRange {
@@ -89,3 +92,6 @@ std::span<const ResourceRequirement> GetFrameRequirementsSpan(const PassResource
 	}
 	return resources.mergedFrameResourceRequirements;
 }
+
+
+} // namespace org

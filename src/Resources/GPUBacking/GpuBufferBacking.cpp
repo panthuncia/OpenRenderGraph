@@ -8,6 +8,9 @@
 #include "Managers/Singletons/DeletionManager.h"
 #include "Resources/MemoryStatisticsComponents.h"
 
+
+namespace org {
+
 GpuBufferBacking::GpuBufferBacking(
 	const rhi::HeapType accessType,
 	const uint64_t bufferSize,
@@ -149,3 +152,6 @@ unsigned int GpuBufferBacking::DumpLiveBuffers() {
     }
 	return static_cast<unsigned int>(liveAllocs.size());
 }
+
+
+} // namespace org

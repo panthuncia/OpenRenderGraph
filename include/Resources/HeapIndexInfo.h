@@ -1,6 +1,9 @@
 #pragma once
 #include <rhi.h>
 
+
+namespace org {
+
 struct ShaderVisibleIndexInfo {
 	rhi::DescriptorSlot slot;
 };
@@ -8,3 +11,6 @@ struct ShaderVisibleIndexInfo {
 struct NonShaderVisibleIndexInfo {
 	rhi::DescriptorSlot slot;
 };
+
+
+} // namespace org
