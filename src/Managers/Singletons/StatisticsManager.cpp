@@ -361,7 +361,7 @@ void StatisticsManager::BeginQuery(
     auto tsIt = m_timestampBuffers.find(queueKind);
     if (tsIt == m_timestampBuffers.end() || !tsIt->second) return;
 
-    const uint32_t frameBase = frameIndex * m_queryPoolPassCapacity;
+    const uint32_t frameBase = (frameIndex % (std::max)(1u, m_numFramesInFlight)) * m_queryPoolPassCapacity;
 
     // Timestamp "begin" marker = write a timestamp at index 2*N
     const uint32_t tsIdx = (frameBase + passIndex) * 2u;
@@ -390,7 +390,7 @@ void StatisticsManager::EndQuery(
     auto tsIt = m_timestampBuffers.find(queueKind);
     if (tsIt == m_timestampBuffers.end() || !tsIt->second) return;
 
-    const uint32_t frameBase = frameIndex * m_queryPoolPassCapacity;
+    const uint32_t frameBase = (frameIndex % (std::max)(1u, m_numFramesInFlight)) * m_queryPoolPassCapacity;
 
     // Timestamp "end" marker = write a timestamp at index 2*N + 1
     const uint32_t tsIdx = (frameBase + passIndex) * 2u + 1u;
@@ -410,6 +410,7 @@ void StatisticsManager::ResolveQueries(
     rhi::Queue& queue,
     rhi::CommandList& cmd)
 {
+    if (!m_collectPassStatistics) return;
     if (!m_timestampPool || m_timestampQueryInfo.elementSize == 0) return;
 
     auto queueKind = queue.GetKind();
@@ -437,7 +438,7 @@ void StatisticsManager::ResolveQueries(
     }
     ranges.emplace_back(start, prev - start + 1);
 
-    const uint32_t frameBase = frameIndex * m_queryPoolPassCapacity;
+    const uint32_t frameBase = (frameIndex % (std::max)(1u, m_numFramesInFlight)) * m_queryPoolPassCapacity;
     const uint64_t tsStride = m_timestampQueryInfo.elementSize; // usually 8
     const uint64_t psStride = m_pipelineStatsQueryInfo.elementSize; // backend-dependent
 
@@ -498,7 +499,7 @@ void StatisticsManager::BeginQuery(
     auto tsIt = m_timestampBuffers.find(queueKind);
     if (tsIt == m_timestampBuffers.end() || !tsIt->second) return;
 
-    const uint32_t frameBase = frameIndex * m_queryPoolPassCapacity;
+    const uint32_t frameBase = (frameIndex % (std::max)(1u, m_numFramesInFlight)) * m_queryPoolPassCapacity;
     const uint32_t tsIdx = (frameBase + passIndex) * 2u;
     cmd.ResetQueries(m_timestampPool->GetHandle(), tsIdx, 1);
     cmd.WriteTimestamp(m_timestampPool->GetHandle(), tsIdx, rhi::Stage::Top);
@@ -525,7 +526,7 @@ void StatisticsManager::EndQuery(
     auto tsIt = m_timestampBuffers.find(queueKind);
     if (tsIt == m_timestampBuffers.end() || !tsIt->second) return;
 
-    const uint32_t frameBase = frameIndex * m_queryPoolPassCapacity;
+    const uint32_t frameBase = (frameIndex % (std::max)(1u, m_numFramesInFlight)) * m_queryPoolPassCapacity;
     const uint32_t tsIdx = (frameBase + passIndex) * 2u + 1u;
     cmd.ResetQueries(m_timestampPool->GetHandle(), tsIdx, 1);
     cmd.WriteTimestamp(m_timestampPool->GetHandle(), tsIdx, rhi::Stage::Bottom);
@@ -543,6 +544,7 @@ void StatisticsManager::ResolveQueries(
     rhi::CommandList& cmd,
     QueryRecordingContext& ctx)
 {
+    if (!m_collectPassStatistics) return;
     if (!m_timestampPool || m_timestampQueryInfo.elementSize == 0) return;
 
     auto queueKind = queue.GetKind();
@@ -568,7 +570,7 @@ void StatisticsManager::ResolveQueries(
     }
     ranges.emplace_back(start, prev - start + 1);
 
-    const uint32_t frameBase = frameIndex * m_queryPoolPassCapacity;
+    const uint32_t frameBase = (frameIndex % (std::max)(1u, m_numFramesInFlight)) * m_queryPoolPassCapacity;
     const uint64_t tsStride = m_timestampQueryInfo.elementSize;
     const uint64_t psStride = m_pipelineStatsQueryInfo.elementSize;
 
@@ -630,6 +632,7 @@ void StatisticsManager::OnFrameComplete(
     if (m_getCollectPipelineStatistics) {
         m_collectPipelineStatistics = m_getCollectPipelineStatistics();
     }
+	if (!m_collectPassStatistics) return;
 	auto queueKind = queue.GetKind();
 	auto tsIt = m_timestampBuffers.find(queueKind);
 	auto psIt = m_meshStatsBuffers.find(queueKind);
@@ -643,7 +646,7 @@ void StatisticsManager::OnFrameComplete(
 
     const uint64_t tsStride = m_timestampQueryInfo.elementSize; // usually 8
     const uint64_t psStride = m_pipelineStatsQueryInfo.elementSize; // backend-specific
-    const uint32_t frameBase = frameIndex * m_queryPoolPassCapacity;
+    const uint32_t frameBase = (frameIndex % (std::max)(1u, m_numFramesInFlight)) * m_queryPoolPassCapacity;
     const double   toMs = 1000.0 / double(m_gpuTimestampFreq);
 
     auto readU64At = [](const uint8_t* base, uint64_t byteOffset) -> uint64_t {

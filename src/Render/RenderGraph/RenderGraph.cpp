@@ -2123,8 +2123,32 @@ void RenderGraph::CommitPassToBatch(
 {
 	const size_t passQueueSlot = node.assignedQueueSlot.value_or(node.queueSlot);
 	const size_t queueCount = currentBatch.QueueCount();
+	if (passQueueSlot >= queueCount) {
+		spdlog::error("RG invalid queue slot while committing pass index={} name='{}': slot={} queueCount={} preferred={} assigned={}",
+			node.passIndex, pr.name, passQueueSlot, queueCount, node.queueSlot,
+			node.assignedQueueSlot ? std::to_string(*node.assignedQueueSlot) : std::string("none"));
+		throw std::runtime_error("RenderGraph assigned a pass to an unregistered queue slot");
+	}
+	if (node.passIndex >= rg.m_framePassSchedulingSummaries.size()) {
+		spdlog::error("RG invalid scheduling summary index {} for pass '{}' (summaryCount={})",
+			node.passIndex, pr.name, rg.m_framePassSchedulingSummaries.size());
+		throw std::runtime_error("RenderGraph node references a missing pass scheduling summary");
+	}
 	const size_t gfxSlot = QueueIndex(QueueKind::Graphics);
 	const auto& passSummary = rg.m_framePassSchedulingSummaries[node.passIndex];
+	if (rg.m_getRenderGraphBatchTraceEnabled && rg.m_getRenderGraphBatchTraceEnabled()) {
+		const size_t concreteRequirementCount = std::visit([](const auto& pass) -> size_t {
+			using Pass = std::decay_t<decltype(pass)>;
+			if constexpr (std::is_same_v<Pass, std::monostate>) return 0;
+			else return GetFrameRequirementCount(pass.resources);
+		}, pr.pass);
+		spdlog::info("RG commit pass index={} name='{}' type={} variant={} queueSlot={}/{} summaryRequirements={} concreteRequirements={}",
+			node.passIndex, pr.name, static_cast<int>(pr.type), pr.pass.index(), passQueueSlot, queueCount,
+			passSummary.requirements.size(), concreteRequirementCount);
+		if (passSummary.requirements.size() != concreteRequirementCount) {
+			throw std::runtime_error("RenderGraph pass scheduling summary does not match concrete requirements");
+		}
+	}
 	scratchTransitioned.Clear();
 	scratchTransitioned.Reserve(passSummary.requirements.size());
 	auto& resourcesTransitionedThisPass = scratchTransitioned;
@@ -2685,6 +2709,50 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 	}
 	if (hasAnyQueuedPasses) {
 		rg.batches.push_back(std::move(currentBatch));
+	}
+
+	// The dependency DAG is authoritative for execution ordering, including
+	// explicit After/Before constraints that do not mention a resource.  The
+	// resource synchronization path in CommitPassToBatch cannot see those
+	// resource-less edges, so materialize every cross-queue DAG edge as a queue
+	// signal/wait here, once final batch and queue assignments are known.
+	// Without this, submission may legally coalesce work from one queue across
+	// intervening batches and execute A,C,B for an explicit A->B->C chain.
+	{
+		std::vector<const SchedulingDecisionTrace*> placementByNode(nodes.size(), nullptr);
+		for (const auto& decision : rg.m_schedulingDecisionTrace) {
+			if (decision.nodeIndex < placementByNode.size()) {
+				placementByNode[decision.nodeIndex] = &decision;
+			}
+		}
+
+		for (size_t sourceNode = 0; sourceNode < nodes.size(); ++sourceNode) {
+			const auto* source = placementByNode[sourceNode];
+			if (!source || source->batchIndex >= rg.batches.size()) {
+				continue;
+			}
+			for (size_t destinationNode : nodes[sourceNode].out) {
+				if (destinationNode >= placementByNode.size()) {
+					continue;
+				}
+				const auto* destination = placementByNode[destinationNode];
+				if (!destination || destination->batchIndex >= rg.batches.size()
+					|| source->assignedQueueSlot == destination->assignedQueueSlot) {
+					continue;
+				}
+
+				auto& sourceBatch = rg.batches[source->batchIndex];
+				auto& destinationBatch = rg.batches[destination->batchIndex];
+				sourceBatch.MarkQueueSignal(BatchSignalPhase::AfterCompletion, source->assignedQueueSlot);
+				destinationBatch.AddQueueWait(
+					BatchWaitPhase::BeforeExecution,
+					destination->assignedQueueSlot,
+					source->assignedQueueSlot,
+					sourceBatch.GetQueueSignalFenceValue(
+						BatchSignalPhase::AfterCompletion,
+						source->assignedQueueSlot));
+			}
+		}
 	}
 
 	{
@@ -5066,7 +5134,8 @@ void RenderGraph::ResetForRebuild()
 	m_compilerState->compiledLastAccessBatchByResourceByQueue.clear();
 	m_hasPendingFrameStartQueueWait.clear();
 	m_pendingFrameStartQueueWaitFenceValue.clear();
-	m_queueRegistry.Clear();
+	// Queue slots, their command-list pools, and timelines are runtime-owned and
+	// survive structural graph generations. They are released only at shutdown.
 	renderPassesByName.clear();
 	computePassesByName.clear();
 
@@ -6316,6 +6385,7 @@ void RenderGraph::Setup() {
 	// Setup the statistics manager
 	if (m_statisticsService) {
 		m_statisticsService->ClearAll();
+		m_statisticsService->Initialize();
 	}
 	auto& manager = DeviceManager::GetInstance();
 	if (m_statisticsService) {

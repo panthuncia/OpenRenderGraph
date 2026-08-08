@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <string>
+#include <stdexcept>
 #include <spdlog/spdlog.h>
 #include <BasicTelemetry/Tracy.h>
 
@@ -54,10 +55,18 @@ void CommandListPool::UpdateDiagnosticsCountsLocked() {
 
 CommandListPair CommandListPool::CreateReadyPair() {
     BT_ZONE_SCOPE("CommandListPool::CreateReadyPair");
+	if (!m_device) {
+		throw std::runtime_error("CommandListPool lost its RHI device");
+	}
     CommandListPair pair;
 	auto result = m_device.CreateCommandAllocator(m_type, pair.allocator);
+	if (!rhi::IsOk(result) || !pair.allocator) {
+		throw std::runtime_error(std::string("Failed to create ORG command allocator: ") + rhi::ResultName(result));
+	}
 	result = m_device.CreateCommandList(m_type, pair.allocator.Get(), pair.list);
-    (void)result;
+	if (!rhi::IsOk(result) || !pair.list) {
+		throw std::runtime_error(std::string("Failed to create ORG command list: ") + rhi::ResultName(result));
+	}
 
     const uint64_t nameId = m_nextDebugNameId.fetch_add(1, std::memory_order_relaxed);
     std::string debugName = std::string("ORG ") + QueueKindDebugName(m_type) + " CommandList #" + std::to_string(nameId);
