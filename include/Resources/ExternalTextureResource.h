@@ -1,26 +1,21 @@
 #pragma once
 
+#include <memory>
 #include <rhi.h>
 #include <resource_states.h>
 
 #include "Resources/Resource.h"
 #include "Resources/ResourceStateTracker.h"
+#include "Resources/TextureDescription.h"
 
-
-// Resource wrapper around an externally-owned texture (e.g. a
-// swapchain image).  Does NOT allocate or free the underlying GPU resource;
-// the caller retains ownership.  Provides the SymbolicTracker and barrier
-// generation the render-graph needs for automatic state tracking.
 namespace org {
 
+// Graph wrapper for an externally allocated texture. The legacy handle constructor remains
+// non-owning; CreateShared retains an imported BasicRHI resource for generation-safe interop.
 class ExternalTextureResource : public Resource {
 public:
-    ExternalTextureResource(rhi::ResourceHandle handle,
-                            unsigned int width,
-                            unsigned int height)
-        : m_handle(handle)
-        , m_width(width)
-        , m_height(height)
+    ExternalTextureResource(rhi::ResourceHandle handle, unsigned int width, unsigned int height)
+        : m_handle(handle), m_width(width), m_height(height)
     {
         m_hasLayout = true;
         m_mipLevels = 1;
@@ -28,85 +23,49 @@ public:
         ResetToUndefined();
     }
 
+    static std::shared_ptr<ExternalTextureResource> CreateShared(
+        rhi::ResourcePtr resource, const TextureDescription& description);
+
     rhi::Resource GetAPIResource() override {
-        // Returns a thin Resource wrapper.  impl/vt are null (not a managed
-        // resource) but the handle is valid for barrier and copy operations.
-        return rhi::Resource(m_handle, /*isTexture=*/true);
+        return m_resource ? m_resource.Get() : rhi::Resource(m_handle, true);
     }
 
     rhi::BarrierBatch GetEnhancedBarrierGroup(
         RangeSpec range,
-        rhi::ResourceAccessType prevAccessType,
-        rhi::ResourceAccessType newAccessType,
-        rhi::ResourceLayout prevLayout,
-        rhi::ResourceLayout newLayout,
-        rhi::ResourceSyncState prevSyncState,
-        rhi::ResourceSyncState newSyncState) override
-    {
-        auto resolvedRange = ResolveRangeSpec(range, m_mipLevels, m_arraySize);
+        rhi::ResourceAccessType previousAccess,
+        rhi::ResourceAccessType nextAccess,
+        rhi::ResourceLayout previousLayout,
+        rhi::ResourceLayout nextLayout,
+        rhi::ResourceSyncState previousSync,
+        rhi::ResourceSyncState nextSync) override;
 
-        m_barrier.afterAccess  = newAccessType;
-        m_barrier.beforeAccess = prevAccessType;
-        m_barrier.afterLayout  = newLayout;
-        m_barrier.beforeLayout = prevLayout;
-        m_barrier.afterSync    = newSyncState;
-        m_barrier.beforeSync   = prevSyncState;
-        m_barrier.discard      = false;
-        m_barrier.range        = { resolvedRange.firstMip, resolvedRange.mipCount,
-                                   resolvedRange.firstSlice, resolvedRange.sliceCount };
-        m_barrier.texture      = m_handle;
-
-        rhi::BarrierBatch batch{};
-        batch.textures = { &m_barrier };
-        return batch;
-    }
-
-    SymbolicTracker* GetStateTracker() override {
-        return &m_stateTracker;
-    }
-
-    unsigned int GetWidth()  const { return m_width; }
+    SymbolicTracker* GetStateTracker() override { return &m_stateTracker; }
+    unsigned int GetWidth() const { return m_width; }
     unsigned int GetHeight() const { return m_height; }
 
     void SetHandle(rhi::ResourceHandle handle) { m_handle = handle; }
     rhi::ResourceHandle GetHandle() const { return m_handle; }
     bool HasHandle() const { return m_handle.valid(); }
-    void SetDimensions(unsigned int width, unsigned int height) {
-        m_width = width;
-        m_height = height;
-    }
+    void SetDimensions(unsigned int width, unsigned int height) { m_width = width; m_height = height; }
     void SetRTVSlot(rhi::DescriptorSlot slot) { m_rtvSlot = slot; }
     bool HasRTVSlot() const { return m_rtvSlot.heap.valid(); }
     rhi::DescriptorSlot GetRTVSlot() const { return m_rtvSlot; }
 
-    // Reset the symbolic tracker to Undefined after the underlying external
-    // handle changes, such as swapchain resize/recreation.
-    void ResetToUndefined() {
-        RangeSpec wholeRange;
-        wholeRange.mipLower = { BoundType::All, 0 };
-        wholeRange.mipUpper = { BoundType::All, 0 };
-        wholeRange.sliceLower = { BoundType::All, 0 };
-        wholeRange.sliceUpper = { BoundType::All, 0 };
-        m_stateTracker = SymbolicTracker(
-            wholeRange,
-            ResourceState{
-                rhi::ResourceAccessType::None,
-                rhi::ResourceLayout::Undefined,
-                rhi::ResourceSyncState::None });
-    }
-
-    void ResetToCommon() {
-        m_stateTracker = SymbolicTracker{};
-    }
+    void ResetToUndefined();
+    void ResetToCommon();
 
 private:
-    rhi::ResourceHandle   m_handle;
-    unsigned int          m_width;
-    unsigned int          m_height;
-    rhi::TextureBarrier   m_barrier{};
-    SymbolicTracker       m_stateTracker;
-    rhi::DescriptorSlot   m_rtvSlot{};
+    rhi::ResourcePtr m_resource;
+    rhi::ResourceHandle m_handle{};
+    unsigned int m_width{};
+    unsigned int m_height{};
+    rhi::TextureBarrier m_barrier{};
+    SymbolicTracker m_stateTracker;
+    rhi::DescriptorSlot m_rtvSlot{};
+    // D3D11 shared textures are exposed by D3D12 with
+    // RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS. Enhanced barriers may change
+    // their access and sync scopes, but their layout must remain COMMON.
+    bool m_commonLayoutOnly{};
 };
-
 
 } // namespace org

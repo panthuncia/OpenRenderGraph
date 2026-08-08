@@ -17,7 +17,8 @@ GpuBufferBacking::GpuBufferBacking(
 	uint64_t owningResourceID,
 	const bool unorderedAccess,
     const char* name,
-    const BufferAliasPlacement* aliasPlacement) {
+    const BufferAliasPlacement* aliasPlacement,
+    const bool shared) {
     m_accessType = accessType;
 
     rhi::ResourceDesc desc = rhi::helpers::ResourceDesc::Buffer(bufferSize);
@@ -25,6 +26,9 @@ GpuBufferBacking::GpuBufferBacking(
         desc.resourceFlags |= rhi::ResourceFlags::RF_AllowUnorderedAccess;
     }
     desc.heapType = accessType;
+	if (shared) {
+		desc.heapFlags = rhi::HeapFlags::Shared;
+	}
     auto device = DeviceManager::GetInstance().GetDevice();
 
     rhi::ResourceAllocationInfo allocInfo;
@@ -61,6 +65,13 @@ GpuBufferBacking::GpuBufferBacking(
     else {
         rhi::ma::AllocationDesc allocationDesc;
         allocationDesc.heapType = accessType;
+		if (shared) {
+			// D3D12 can only create a cross-process/API handle for committed resources
+			// (or heaps), not for an individual placed resource. D3D11 needs a resource
+			// handle, so shared graph buffers must not come from the allocator's pools.
+			allocationDesc.flags |= rhi::ma::AllocationFlagCommitted;
+			allocationDesc.extraHeapFlags = rhi::HeapFlags::Shared;
+		}
         const auto result = DeviceManager::GetInstance().CreateResourceTracked(
             allocationDesc,
             desc,

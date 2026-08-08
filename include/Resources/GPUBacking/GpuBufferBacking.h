@@ -26,8 +26,9 @@ public:
 		uint64_t bufferSize,
 		uint64_t owningResourceID,
 		bool unorderedAccess = false,
-		const char* name = nullptr) {
-		auto sp = std::unique_ptr<GpuBufferBacking>(new GpuBufferBacking(accessType, bufferSize, owningResourceID, unorderedAccess, name));
+		const char* name = nullptr,
+		bool shared = false) {
+		auto sp = std::unique_ptr<GpuBufferBacking>(new GpuBufferBacking(accessType, bufferSize, owningResourceID, unorderedAccess, name, nullptr, shared));
 #if BUILD_TYPE == BUILD_DEBUG
 		//sp->m_creation = std::stacktrace::current();
 #endif
@@ -41,7 +42,7 @@ public:
 		const BufferAliasPlacement& placement,
 		bool unorderedAccess = false,
 		const char* name = nullptr) {
-		auto sp = std::unique_ptr<GpuBufferBacking>(new GpuBufferBacking(accessType, bufferSize, owningResourceID, unorderedAccess, name, &placement));
+		auto sp = std::unique_ptr<GpuBufferBacking>(new GpuBufferBacking(accessType, bufferSize, owningResourceID, unorderedAccess, name, &placement, false));
 #if BUILD_TYPE == BUILD_DEBUG
 		//sp->m_creation = std::stacktrace::current();
 #endif
@@ -83,7 +84,8 @@ private:
 		uint64_t owningResourceID,
 		bool unorderedAccess = false,
 		const char* name = nullptr,
-		const BufferAliasPlacement* aliasPlacement = nullptr);
+		const BufferAliasPlacement* aliasPlacement = nullptr,
+		bool shared = false);
 
 	struct LiveAllocInfo {
 		size_t size = 0;

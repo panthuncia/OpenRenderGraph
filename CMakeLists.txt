@@ -100,6 +100,7 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Managers/Singletons/ReadbackManager.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Managers/Singletons/StatisticsManager.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/ExternalBackingResource.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/ExternalTextureResource.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/PixelBuffer.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/Buffers/Buffer.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/Buffers/DynamicBufferBase.cpp"

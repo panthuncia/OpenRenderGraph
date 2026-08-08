@@ -6944,24 +6944,23 @@ namespace {
 
 		for (auto& t : transitions) {
 			if (t.pResource->HasLayout()) {
-				// Texture barrier
 				SubresourceRange resolvedRange{};
 				if (!ResolveNonEmptyTransitionRange(t, resolvedRange)) {
 					continue;
 				}
-
-				rhi::TextureBarrier tb{};
-				tb.beforeAccess = t.prevAccessType;
-				tb.afterAccess  = t.newAccessType;
-				tb.beforeLayout = t.prevLayout;
-				tb.afterLayout  = t.newLayout;
-				tb.beforeSync   = t.prevSyncState;
-				tb.afterSync    = t.newSyncState;
-				tb.discard      = t.discard;
-				tb.range = { resolvedRange.firstMip, resolvedRange.mipCount,
-				             resolvedRange.firstSlice, resolvedRange.sliceCount };
-				tb.texture = t.pResource->GetAPIResource().GetHandle();
-				batch.textures.push_back(tb);
+				// Let the resource encode backend/import-specific constraints. In
+				// particular, cross-API simultaneous-access textures must retain
+				// COMMON layout even while their access and synchronization scopes
+				// change. The old parallel path bypassed this virtual contract.
+				const size_t textureStart = batch.textures.size();
+				const size_t bufferStart = batch.buffers.size();
+				batch.Append(t.pResource->GetEnhancedBarrierGroup(
+					t.range, t.prevAccessType, t.newAccessType,
+					t.prevLayout, t.newLayout, t.prevSyncState, t.newSyncState));
+				if (t.discard) {
+					for (size_t i = textureStart; i < batch.textures.size(); ++i) batch.textures[i].discard = true;
+					for (size_t i = bufferStart; i < batch.buffers.size(); ++i) batch.buffers[i].discard = true;
+				}
 			} else {
 				// Buffer barrier
 				rhi::BufferBarrier bb{};
