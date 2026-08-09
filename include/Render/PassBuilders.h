@@ -1203,6 +1203,8 @@ public:
 		params.externalWaitsBeforeTransitions.push_back({ timeline, value });
 		return std::move(*this);
 	}
+	RenderPassBuilder& WithExternalWaitBindingBeforeTransitions(ExternalTimelineBinding binding) & { params.externalWaitBindingsBeforeTransitions.push_back(binding); return *this; }
+	RenderPassBuilder WithExternalWaitBindingBeforeTransitions(ExternalTimelineBinding binding) && { params.externalWaitBindingsBeforeTransitions.push_back(binding); return std::move(*this); }
 
     auto const& DeclaredResourceIds() const { return _declaredIds; }
 
@@ -1841,6 +1843,8 @@ public:
 			params.externalWaitsBeforeTransitions.push_back({ timeline, value });
 			return std::move(*this);
 		}
+		ComputePassBuilder& WithExternalWaitBindingBeforeTransitions(ExternalTimelineBinding binding) & { params.externalWaitBindingsBeforeTransitions.push_back(binding); return *this; }
+		ComputePassBuilder WithExternalWaitBindingBeforeTransitions(ExternalTimelineBinding binding) && { params.externalWaitBindingsBeforeTransitions.push_back(binding); return std::move(*this); }
 
         // LVALUE overloads for IResourceResolver
         ComputePassBuilder& WithShaderResource(const IResourceResolver& r)& {
@@ -2289,6 +2293,8 @@ public:
 		params.externalWaitsBeforeTransitions.push_back({ timeline, value });
 		return std::move(*this);
 	}
+	CopyPassBuilder& WithExternalWaitBindingBeforeTransitions(ExternalTimelineBinding binding) & { params.externalWaitBindingsBeforeTransitions.push_back(binding); return *this; }
+	CopyPassBuilder WithExternalWaitBindingBeforeTransitions(ExternalTimelineBinding binding) && { params.externalWaitBindingsBeforeTransitions.push_back(binding); return std::move(*this); }
 
     CopyPassBuilder& WithCopyDest(const IResourceResolver& r)& {
         return WithResolver(r, [&](auto&& resolved) { addCopyDest(std::forward<decltype(resolved)>(resolved)); });

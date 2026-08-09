@@ -31,6 +31,7 @@ struct ComputePassParameters {
 	std::vector<ResourceHandleAndRange> legacyInteropResources;
 	std::vector<std::pair<ResourceHandleAndRange, ResourceState>> internalTransitions;
 	std::vector<ExternalTimelinePoint> externalWaitsBeforeTransitions;
+	std::vector<ExternalTimelineBinding> externalWaitBindingsBeforeTransitions;
 
 	std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> identifierSet;
 	std::vector<AutoDescriptorRegistration> autoDescriptorShaderResources;

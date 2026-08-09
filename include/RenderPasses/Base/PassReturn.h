@@ -13,6 +13,14 @@ struct ExternalTimelinePoint {
 	uint64_t value = 0;
 };
 
+using ExternalTimelineBinding = uint32_t;
+inline constexpr ExternalTimelineBinding InvalidExternalTimelineBinding = 0;
+
+struct ExternalTimelineBindingValue {
+	ExternalTimelineBinding binding = InvalidExternalTimelineBinding;
+	ExternalTimelinePoint point{};
+};
+
 enum class ExternalSignalPhase : uint8_t {
 	AfterCompletion,
 };

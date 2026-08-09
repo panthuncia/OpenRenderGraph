@@ -389,6 +389,7 @@ public:
 			: queuePasses(queueCount) {
 			for (auto& v : queueTransitions) v.resize(queueCount);
 			externalWaitsBeforeTransitions.resize(queueCount);
+			externalWaitBindingsBeforeTransitions.resize(queueCount);
 			for (auto& p : queueWaitEnabled) p.assign(queueCount, std::vector<uint8_t>(queueCount, 0));
 			for (auto& p : queueWaitFenceValue) p.assign(queueCount, std::vector<UINT64>(queueCount, 0));
 			for (auto& p : queueSignalEnabled) p.assign(queueCount, 0);
@@ -410,6 +411,8 @@ public:
 			for (auto& waits : externalWaitsBeforeTransitions) {
 				waits.clear();
 			}
+			externalWaitBindingsBeforeTransitions.resize(queueCount);
+			for (auto& bindings : externalWaitBindingsBeforeTransitions) bindings.clear();
 			for (auto& waitsByDestination : queueWaitEnabled) {
 				waitsByDestination.resize(queueCount);
 				for (auto& waitsBySource : waitsByDestination) {
@@ -448,6 +451,7 @@ public:
 		std::vector<std::vector<QueuedPass>> queuePasses;
 		std::array<std::vector<std::vector<ResourceTransition>>, kTransitionPhaseCount> queueTransitions;
 		std::vector<std::vector<ExternalTimelinePoint>> externalWaitsBeforeTransitions;
+		std::vector<std::vector<ExternalTimelineBinding>> externalWaitBindingsBeforeTransitions;
 
 		// Resources that passes in this batch transition internally
 		// Cannot be batched with other passes which use these resources
@@ -567,6 +571,17 @@ public:
 		const std::vector<ExternalTimelinePoint>& ExternalWaitsBeforeTransitions(size_t qi) const {
 			static const std::vector<ExternalTimelinePoint> empty;
 			return qi < externalWaitsBeforeTransitions.size() ? externalWaitsBeforeTransitions[qi] : empty;
+		}
+
+		void AddExternalWaitBindingBeforeTransitions(size_t qi, ExternalTimelineBinding binding) {
+			if (binding == InvalidExternalTimelineBinding) throw std::invalid_argument("Invalid external timeline binding");
+			if (qi >= externalWaitBindingsBeforeTransitions.size()) externalWaitBindingsBeforeTransitions.resize(qi + 1);
+			auto& bindings = externalWaitBindingsBeforeTransitions[qi];
+			if (std::find(bindings.begin(), bindings.end(), binding) == bindings.end()) bindings.push_back(binding);
+		}
+		const std::vector<ExternalTimelineBinding>& ExternalWaitBindingsBeforeTransitions(size_t qi) const {
+			static const std::vector<ExternalTimelineBinding> empty;
+			return qi < externalWaitBindingsBeforeTransitions.size() ? externalWaitBindingsBeforeTransitions[qi] : empty;
 		}
 
 		std::vector<ResourceTransition>& Transitions(size_t qi, BatchTransitionPhase phase) {

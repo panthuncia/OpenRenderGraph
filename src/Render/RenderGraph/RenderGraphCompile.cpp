@@ -187,6 +187,17 @@ namespace {
 			entries.push_back(entry);
 		}
 
+		for (const auto& wait : resources.externalWaitsBeforeTransitions) {
+			uint64_t entry = 0x6578747761697401ull;
+			entry = HashCombine64(entry, wait.timeline.GetHandle().index);
+			entry = HashCombine64(entry, wait.timeline.GetHandle().generation);
+			entry = HashCombine64(entry, wait.value);
+			entries.push_back(entry);
+		}
+		for (const auto binding : resources.externalWaitBindingsBeforeTransitions) {
+			entries.push_back(HashCombine64(0x65787462696e6401ull, binding));
+		}
+
 		std::sort(entries.begin(), entries.end());
 		uint64_t hash = 0xd1ec1a6a710f0001ull;
 		hash = HashCombine64(hash, entries.size());

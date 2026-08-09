@@ -7,6 +7,7 @@
 #include <DirectXMath.h>
 
 #include "Render/ImmediateExecution/ImmediateCommandList.h"
+#include "RenderPasses/Base/PassReturn.h"
 
 
 namespace org {
@@ -53,6 +54,9 @@ struct PassExecutionContext {
 	UINT64 frameFenceValue = 0;
 	float deltaTime = 0.0f;
 	const IHostExecutionData* hostData = nullptr;
+	// Values for structurally placed external-wait bindings. Bindings determine
+	// the consuming batch/queue at compile time; timeline values remain per-frame.
+	std::vector<ExternalTimelineBindingValue> externalTimelineBindings;
 };
 
 

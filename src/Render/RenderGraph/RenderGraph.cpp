@@ -510,6 +510,8 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 			par.resources.autoDescriptorConstantBuffers = b.params.autoDescriptorConstantBuffers;
 			par.resources.autoDescriptorUnorderedAccessViews = b.params.autoDescriptorUnorderedAccessViews;
 			par.resources.activeFeatureDomains = b.params.activeFeatureDomains;
+			par.resources.externalWaitsBeforeTransitions = b.params.externalWaitsBeforeTransitions;
+			par.resources.externalWaitBindingsBeforeTransitions = b.params.externalWaitBindingsBeforeTransitions;
 			par.resources.isGeometryPass = b.params.isGeometryPass;
 			par.resources.preferredQueueKind = ResolveExternalPreferredQueueKind(d);
 			par.resources.queueAssignmentPolicy = ResolveExternalQueueAssignmentPolicy(d);
@@ -583,6 +585,8 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 			par.resources.autoDescriptorConstantBuffers = b.params.autoDescriptorConstantBuffers;
 			par.resources.autoDescriptorUnorderedAccessViews = b.params.autoDescriptorUnorderedAccessViews;
 			par.resources.activeFeatureDomains = b.params.activeFeatureDomains;
+			par.resources.externalWaitsBeforeTransitions = b.params.externalWaitsBeforeTransitions;
+			par.resources.externalWaitBindingsBeforeTransitions = b.params.externalWaitBindingsBeforeTransitions;
 			par.resources.preferredQueueKind = ResolveExternalPreferredQueueKind(d);
 			par.resources.queueAssignmentPolicy = ResolveExternalQueueAssignmentPolicy(d);
 			par.resources.pinnedQueueSlot = d.pinnedQueueSlot;
@@ -651,6 +655,8 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 			par.resources.staticResourceRequirements = b.GatherResourceRequirements();
 			par.resources.internalTransitions = b.params.internalTransitions;
 			par.resources.identifierSet = b.DeclaredResourceIds();
+			par.resources.externalWaitsBeforeTransitions = b.params.externalWaitsBeforeTransitions;
+			par.resources.externalWaitBindingsBeforeTransitions = b.params.externalWaitBindingsBeforeTransitions;
 			par.resources.preferredQueueKind = ResolveExternalPreferredQueueKind(d);
 			par.resources.queueAssignmentPolicy = ResolveExternalQueueAssignmentPolicy(d);
 			par.resources.pinnedQueueSlot = d.pinnedQueueSlot;
@@ -2257,6 +2263,9 @@ void RenderGraph::CommitPassToBatch(
 				for (const auto& wait : pass.resources.externalWaitsBeforeTransitions) {
 					currentBatch.AddExternalWaitBeforeTransitions(passQueueSlot, wait);
 				}
+				for (const auto binding : pass.resources.externalWaitBindingsBeforeTransitions) {
+					currentBatch.AddExternalWaitBindingBeforeTransitions(passQueueSlot, binding);
+				}
 				applyInternalTransitions(pass);
 				recordRequirementHistory();
 				const bool hasQueueCrossing = (queueCount > 1);
@@ -2380,7 +2389,12 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 	};
 
 	auto passForcesBatchIsolation = [&](size_t passIndex) {
-		return passIndex >= passes.size() || passHasImmediateWork(passes[passIndex]);
+		if (passIndex >= passes.size() || passHasImmediateWork(passes[passIndex])) return true;
+		return std::visit([](const auto& entry) {
+			using T = std::decay_t<decltype(entry)>;
+			if constexpr (std::is_same_v<T, std::monostate>) return false;
+			else return !entry.resources.externalWaitBindingsBeforeTransitions.empty();
+		}, passes[passIndex].pass);
 	};
 
 	auto updateBatchMembershipForCommittedPass = [&](const Node& committedNode) {
@@ -5693,6 +5707,8 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(RenderPassAndResources& p,
 		p.resources.autoDescriptorConstantBuffers = std::move(b.params.autoDescriptorConstantBuffers);
 		p.resources.autoDescriptorUnorderedAccessViews = std::move(b.params.autoDescriptorUnorderedAccessViews);
 		p.resources.activeFeatureDomains = std::move(b.params.activeFeatureDomains);
+		p.resources.externalWaitsBeforeTransitions = std::move(b.params.externalWaitsBeforeTransitions);
+		p.resources.externalWaitBindingsBeforeTransitions = std::move(b.params.externalWaitBindingsBeforeTransitions);
 	}
 	if (traceLifecycle) {
 		spdlog::info("RG frame {} refresh render pass '{}' materialize referenced resources begin", frameIndex, p.name);
@@ -5790,6 +5806,8 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(ComputePassAndResources& p
 		p.resources.autoDescriptorConstantBuffers = std::move(b.params.autoDescriptorConstantBuffers);
 		p.resources.autoDescriptorUnorderedAccessViews = std::move(b.params.autoDescriptorUnorderedAccessViews);
 		p.resources.activeFeatureDomains = std::move(b.params.activeFeatureDomains);
+		p.resources.externalWaitsBeforeTransitions = std::move(b.params.externalWaitsBeforeTransitions);
+		p.resources.externalWaitBindingsBeforeTransitions = std::move(b.params.externalWaitBindingsBeforeTransitions);
 	}
 	if (traceLifecycle) {
 		spdlog::info("RG frame {} refresh compute pass '{}' materialize referenced resources begin", frameIndex, p.name);
@@ -5881,6 +5899,8 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(CopyPassAndResources& p, u
 		p.resources.mergedFrameRequirementsDirty = true;
 		p.resources.internalTransitions = std::move(b.params.internalTransitions);
 		p.resources.identifierSet = std::move(b._declaredIds);
+		p.resources.externalWaitsBeforeTransitions = std::move(b.params.externalWaitsBeforeTransitions);
+		p.resources.externalWaitBindingsBeforeTransitions = std::move(b.params.externalWaitBindingsBeforeTransitions);
 	}
 	if (traceLifecycle) {
 		spdlog::info("RG frame {} refresh copy pass '{}' materialize referenced resources begin", frameIndex, p.name);
@@ -7330,7 +7350,8 @@ namespace {
 		const RenderGraph::PassBatch& batch,
 		size_t queueSlot,
 		size_t batchIndex,
-		unsigned frameIndex)
+		unsigned frameIndex,
+		const std::vector<ExternalTimelineBindingValue>& bindingValues)
 	{
 		const auto& waits = batch.ExternalWaitsBeforeTransitions(queueSlot);
 		for (const auto& wait : waits) {
@@ -7352,6 +7373,14 @@ namespace {
 					wait.value,
 					rhi::ResultName(waitResult)));
 			}
+		}
+		for (const auto binding : batch.ExternalWaitBindingsBeforeTransitions(queueSlot)) {
+			const auto value = std::find_if(bindingValues.begin(), bindingValues.end(),
+				[binding](const auto& candidate) { return candidate.binding == binding; });
+			if (value == bindingValues.end() || !value->point.timeline.IsValid() || value->point.value == 0 || value->point.value == UINT64_MAX)
+				throw std::runtime_error("RenderGraph external wait binding was missing or invalid");
+			if (queue.Wait({ value->point.timeline.GetHandle(), value->point.value }) != rhi::Result::Ok)
+				throw std::runtime_error("RenderGraph external wait binding failed");
 		}
 	}
 
@@ -7395,7 +7424,8 @@ namespace {
 			batch,
 			qi,
 			args.batchIndex,
-			static_cast<unsigned>(args.context.frameIndex));
+			static_cast<unsigned>(args.context.frameIndex),
+			args.context.externalTimelineBindings);
 		for (size_t srcIndex = 0; srcIndex < batch.QueueCount(); ++srcIndex) {
 			if (!batch.HasQueueWait(RenderGraph::BatchWaitPhase::BeforeTransitions, qi, srcIndex))
 				continue;
@@ -9228,7 +9258,8 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 						batch,
 						queueIndex,
 						batchIndex,
-						static_cast<unsigned>(context.frameIndex));
+						static_cast<unsigned>(context.frameIndex),
+						context.externalTimelineBindings);
 				}
 				for (size_t srcIndex = 0; srcIndex < batch.QueueCount(); ++srcIndex) {
 					if (!batch.HasQueueWait(waitPhase, queueIndex, srcIndex)) {
