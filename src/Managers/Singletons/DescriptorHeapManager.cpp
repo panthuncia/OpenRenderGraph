@@ -27,7 +27,10 @@ void RetireDescriptorSlotsForDeferredRelease(
 }
 
 void DescriptorHeapManager::Initialize() {
-    auto device = DeviceManager::GetInstance().GetDevice();
+	if (m_cbvSrvUavHeap) {
+		return;
+	}
+	auto device = DeviceManager::GetInstance().GetDevice();
     m_deferredReleases.clear();
     m_deferredResourcePointers.clear();
     m_latestQueueFenceSnapshot.clear();
@@ -128,6 +131,18 @@ void DescriptorHeapManager::RetireResource(std::shared_ptr<Resource> resource) {
     DeferredRelease release{};
     release.requiredFences = m_latestQueueFenceSnapshot;
     release.resources.push_back(std::move(resource));
+    m_deferredReleases.push_back(std::move(release));
+}
+
+void DescriptorHeapManager::RetireNativeResource(rhi::ResourcePtr resource) {
+    if (!resource) {
+        return;
+    }
+
+    std::scoped_lock lock(m_descriptorMutationMutex);
+    DeferredRelease release{};
+    release.requiredFences = m_latestQueueFenceSnapshot;
+    release.nativeResources.push_back(std::move(resource));
     m_deferredReleases.push_back(std::move(release));
 }
 
@@ -777,6 +792,47 @@ UINT DescriptorHeapManager::CreateIndexedSampler(const rhi::SamplerDesc& sampler
     UINT index = m_samplerHeap->AllocateDescriptor();
     device.CreateSampler({ m_samplerHeap->GetHeap().GetHandle(), index }, samplerDesc);
     return index;
+}
+
+rhi::DescriptorSlot DescriptorHeapManager::AllocateDescriptorSlot(
+	rhi::DescriptorHeapType type, bool shaderVisible) {
+	std::scoped_lock lock(m_descriptorMutationMutex);
+	std::shared_ptr<DescriptorHeap> heap;
+	switch (type) {
+	case rhi::DescriptorHeapType::CbvSrvUav:
+		heap = shaderVisible ? m_cbvSrvUavHeap : m_nonShaderVisibleHeap; break;
+	case rhi::DescriptorHeapType::RTV:
+		if (shaderVisible) throw std::invalid_argument("RTV heaps cannot be shader visible");
+		heap = m_rtvHeap; break;
+	case rhi::DescriptorHeapType::DSV:
+		if (shaderVisible) throw std::invalid_argument("DSV heaps cannot be shader visible");
+		heap = m_dsvHeap; break;
+	case rhi::DescriptorHeapType::Sampler:
+		if (!shaderVisible) throw std::invalid_argument("ORG exposes only its shader-visible sampler heap");
+		heap = m_samplerHeap; break;
+	default: throw std::invalid_argument("Unknown descriptor heap type");
+	}
+	if (!heap) throw std::runtime_error("Descriptor service is not initialized");
+	return { heap->GetHeap().GetHandle(), heap->AllocateDescriptor() };
+}
+
+void DescriptorHeapManager::RetireDescriptorSlot(rhi::DescriptorSlot slot) {
+	if (!slot.heap.valid()) return;
+	std::shared_ptr<DescriptorHeap> heap;
+	{
+		std::scoped_lock lock(m_descriptorMutationMutex);
+		const std::shared_ptr<DescriptorHeap> candidates[]{ m_cbvSrvUavHeap, m_nonShaderVisibleHeap,
+			m_rtvHeap, m_dsvHeap, m_samplerHeap };
+		for (const auto& candidate : candidates) {
+			if (!candidate) continue;
+			const auto handle = candidate->GetHeap().GetHandle();
+			if (handle.index == slot.heap.index && handle.generation == slot.heap.generation) {
+				heap = candidate; break;
+			}
+		}
+	}
+	if (!heap) throw std::invalid_argument("Descriptor slot does not belong to ORG");
+	RetireDescriptorSlots({ { std::move(heap), slot.index } });
 }
 
 

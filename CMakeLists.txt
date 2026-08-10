@@ -1,12 +1,14 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(OpenRenderGraph VERSION 1.0.0 LANGUAGES CXX)
+project(OpenRenderGraph VERSION 1.0.0 LANGUAGES C CXX)
 
 include(GNUInstallDirs)
 
 option(OPENRENDERGRAPH_ENABLE_SUBMODULE_FALLBACK "Allow fallback to in-tree BasicRHI when package is unavailable" ON)
 option(OPENRENDERGRAPH_FORWARD_BASICRHI_DEP_OPTIONS "Forward BasicRHI PIX/Streamline options when adding BasicRHI subdirectory" ON)
 option(OPENRENDERGRAPH_ENABLE_DEBUG_UI "Build the optional ImGui/ImPlot/Slang inspector" OFF)
+option(OPENRENDERGRAPH_ENABLE_D3D11_INTEROP "Build the optional Windows D3D11/D3D12 interop library" OFF)
+option(OPENRENDERGRAPH_BUILD_TESTS "Build OpenRenderGraph tests" OFF)
 
 set(OPENRENDERGRAPH_BASICRHI_ENABLE_STREAMLINE "" CACHE STRING "Override BASICRHI_ENABLE_STREAMLINE for submodule fallback (ON/OFF). Empty keeps BasicRHI default.")
 set(OPENRENDERGRAPH_BASICRHI_ENABLE_PIX "" CACHE STRING "Override BASICRHI_ENABLE_PIX for submodule fallback (ON/OFF). Empty keeps BasicRHI default.")
@@ -70,6 +72,10 @@ if(OPENRENDERGRAPH_ENABLE_DEBUG_UI)
 endif()
 
 add_library(OpenRenderGraph STATIC
+	"${CMAKE_CURRENT_SOURCE_DIR}/src/Contributor/ContributorRegistry.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/src/Contributor/ExtensionRegistry.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/src/Contributor/ContributorGraphHost.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/src/Contributor/ContributorRuntime.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/DescriptorHeap.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/CommandListPool.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/QueueRegistry.cpp"
@@ -100,6 +106,7 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Managers/Singletons/ReadbackManager.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Managers/Singletons/StatisticsManager.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/ExternalBackingResource.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/ExternalBufferResource.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/ExternalTextureResource.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/PixelBuffer.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/Buffers/Buffer.cpp"
@@ -166,6 +173,46 @@ target_compile_definitions(OpenRenderGraph PRIVATE NOMINMAX)
 
 if (MSVC)
     target_compile_options(OpenRenderGraph PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
+endif()
+
+if(OPENRENDERGRAPH_BUILD_TESTS)
+    enable_testing()
+    add_executable(OpenRenderGraphExternalResourceTests tests/ExternalResourceTests.cpp)
+    if(MSVC)
+        target_compile_options(OpenRenderGraphExternalResourceTests PRIVATE /utf-8)
+    endif()
+    target_link_libraries(OpenRenderGraphExternalResourceTests PRIVATE OpenRenderGraph BasicRHI::BasicRHI d3d12 dxgi)
+    add_test(NAME OpenRenderGraphExternalResourceTests COMMAND OpenRenderGraphExternalResourceTests)
+    add_executable(OpenRenderGraphContributorHeaderC tests/ContributorHeaderCompile.c)
+    set_target_properties(OpenRenderGraphContributorHeaderC PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
+    target_include_directories(OpenRenderGraphContributorHeaderC PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    add_test(NAME OpenRenderGraphContributorHeaderC COMMAND OpenRenderGraphContributorHeaderC)
+    add_executable(OpenRenderGraphContributorRegistryTests tests/ContributorRegistryTests.cpp)
+    target_compile_features(OpenRenderGraphContributorRegistryTests PRIVATE cxx_std_23)
+    target_link_libraries(OpenRenderGraphContributorRegistryTests PRIVATE OpenRenderGraph)
+    add_test(NAME OpenRenderGraphContributorRegistryTests COMMAND OpenRenderGraphContributorRegistryTests)
+endif()
+
+if(OPENRENDERGRAPH_ENABLE_D3D11_INTEROP)
+    if(NOT WIN32)
+        message(FATAL_ERROR "OPENRENDERGRAPH_ENABLE_D3D11_INTEROP is only supported on Windows")
+    endif()
+    if(NOT TARGET Microsoft::CppWinRT)
+        find_package(cppwinrt CONFIG REQUIRED)
+    endif()
+    add_library(OpenRenderGraphD3D11Interop STATIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/Interop/D3D11Interop.cpp")
+    add_library(OpenRenderGraph::D3D11Interop ALIAS OpenRenderGraphD3D11Interop)
+    target_compile_features(OpenRenderGraphD3D11Interop PUBLIC cxx_std_23)
+    target_compile_definitions(OpenRenderGraphD3D11Interop PRIVATE NOMINMAX)
+    target_include_directories(OpenRenderGraphD3D11Interop PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+    target_link_libraries(OpenRenderGraphD3D11Interop PUBLIC BasicRHI::BasicRHI
+        PRIVATE Microsoft::CppWinRT d3d11 d3d12 dxgi)
+    install(TARGETS OpenRenderGraphD3D11Interop EXPORT OpenRenderGraphTargets
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 endif()
 
 install(TARGETS OpenRenderGraph

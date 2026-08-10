@@ -1,6 +1,7 @@
 #include <Render/Runtime/RuntimeDevice.h>
 
 #include "Managers/Singletons/DeviceManager.h"
+#include "Managers/Singletons/DescriptorHeapManager.h"
 #include "Managers/Singletons/ECSManager.h"
 #include "Resources/TrackedAllocation.h"
 #include "Resources/MemoryStatisticsComponents.h"
@@ -39,10 +40,15 @@ void InitializeRuntimeDevice(rhi::Device device)
 	};
 	TrackedEntityToken::SetHooks(std::move(hooks));
 	DeviceManager::GetInstance().Initialize(device);
+	// Descriptor arenas are runtime-wide. Candidate graphs overlap while an old
+	// generation is still in flight, so initializing them per graph would
+	// invalidate descriptors owned by the retiring generation.
+	DescriptorHeapManager::GetInstance().Initialize();
 }
 
 void ShutdownRuntimeDevice() noexcept
 {
+	DescriptorHeapManager::GetInstance().Cleanup();
 	DeviceManager::GetInstance().Cleanup();
 	TrackedEntityToken::ResetHooks();
 }

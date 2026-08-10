@@ -7,7 +7,7 @@
 namespace org::runtime {
 
 inline IDescriptorService*& DescriptorServiceSlot() {
-    static IDescriptorService* service = nullptr;
+    static thread_local IDescriptorService* service = nullptr;
     return service;
 }
 

@@ -104,6 +104,7 @@ void GpuTextureBacking::initialize(const TextureDescription& desc,
 	// Create the texture resource description
 	auto width = desc.imageDimensions[0].width;
 	auto height = desc.imageDimensions[0].height;
+	if (desc.type == rhi::ResourceType::Texture1D) height = 1;
 	if (desc.padInternalResolution) { // Pad the width and height to the next power of two
 		width = std::max(1u, static_cast<unsigned int>(std::pow(2, std::ceil(std::log2(width)))));
 		height = std::max(1u, static_cast<unsigned int>(std::pow(2, std::ceil(std::log2(height)))));
@@ -135,14 +136,15 @@ void GpuTextureBacking::initialize(const TextureDescription& desc,
 	}
 
 	rhi::ResourceDesc textureDesc{
-		.type = rhi::ResourceType::Texture2D,
+		.type = desc.type,
 		.texture = {
 			.format = desc.format,
 			.width = static_cast<uint32_t>(width),
 			.height = static_cast<uint32_t>(height),
-			.depthOrLayers = static_cast<uint16_t>(desc.isCubemap ? 6 * arraySize : arraySize),
+			.depthOrLayers = static_cast<uint16_t>(desc.type == rhi::ResourceType::Texture3D ?
+				desc.depth : (desc.isCubemap ? 6 * arraySize : arraySize)),
 			.mipLevels = mipLevels,
-			.sampleCount = 1,
+			.sampleCount = desc.sampleCount,
 			.initialLayout = desc.initialLayout,
 			.optimizedClear = clearValue
 		}
@@ -174,7 +176,7 @@ void GpuTextureBacking::initialize(const TextureDescription& desc,
 
 	allocationBundle
 		.Set<MemoryStatisticsComponents::MemSizeBytes>({ allocInfo.sizeInBytes })
-		.Set<MemoryStatisticsComponents::ResourceType>({ rhi::ResourceType::Texture2D })
+		.Set<MemoryStatisticsComponents::ResourceType>({ desc.type })
 		.Set<MemoryStatisticsComponents::ResourceID>({ owningResourceID })
 		.Set<MemoryStatisticsComponents::TextureShape>({
 			desc.imageDimensions[0].width,
@@ -230,7 +232,8 @@ void GpuTextureBacking::initialize(const TextureDescription& desc,
 	m_width = desc.imageDimensions[0].width;
 	m_height = desc.imageDimensions[0].height;
 	m_mipLevels = ResolveTextureMipLevels(desc);
-	m_arraySize = desc.isCubemap ? 6 * desc.arraySize : (desc.isArray ? desc.arraySize : 1);
+	m_arraySize = desc.type == rhi::ResourceType::Texture3D ? 1u :
+		(desc.isCubemap ? 6 * desc.arraySize : (desc.isArray ? desc.arraySize : 1));
 	m_format = desc.format;
 	RangeSpec wholeRange;
 	wholeRange.mipLower = { BoundType::All, 0 };

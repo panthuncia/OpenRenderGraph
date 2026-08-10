@@ -9,7 +9,7 @@
 namespace org::runtime {
 
 inline IUploadService*& UploadServiceSlot() {
-    static IUploadService* service = nullptr;
+    static thread_local IUploadService* service = nullptr;
     return service;
 }
 

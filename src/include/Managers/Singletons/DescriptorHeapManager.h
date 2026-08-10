@@ -46,6 +46,9 @@ public:
 
 	void RetireDescriptorSlots(std::vector<std::pair<std::shared_ptr<DescriptorHeap>, UINT>> slots);
 	void RetireResource(std::shared_ptr<Resource> resource);
+	// Retain a replaced imported backing until every queue represented by the
+	// latest graph fence snapshot has finished using it.
+	void RetireNativeResource(rhi::ResourcePtr resource);
 	void RetireBufferBacking(std::unique_ptr<GpuBufferBacking> backing);
 	struct QueueFenceSnapshotPoint {
 		rhi::Timeline timeline;
@@ -73,6 +76,8 @@ public:
 	rhi::DescriptorHeap GetSRVDescriptorHeap() const;
 	rhi::DescriptorHeap GetSamplerDescriptorHeap() const;
 	UINT CreateIndexedSampler(const rhi::SamplerDesc& samplerDesc);
+	rhi::DescriptorSlot AllocateDescriptorSlot(rhi::DescriptorHeapType type, bool shaderVisible);
+	void RetireDescriptorSlot(rhi::DescriptorSlot slot);
 
 	const std::shared_ptr<DescriptorHeap>& GetCBVSRVUAVHeap() const { return m_cbvSrvUavHeap; }
 	const std::shared_ptr<DescriptorHeap>& GetSamplerHeap() const { return m_samplerHeap; }
@@ -101,6 +106,7 @@ private:
 		std::vector<std::pair<std::shared_ptr<DescriptorHeap>, UINT>> descriptorSlots;
 		std::vector<std::unique_ptr<GpuBufferBacking>> bufferBackings;
 		std::vector<std::shared_ptr<Resource>> resources;
+		std::vector<rhi::ResourcePtr> nativeResources;
 		std::vector<QueueFenceSnapshotPoint> requiredFences;
 	};
 	std::vector<DeferredRelease> m_deferredReleases;

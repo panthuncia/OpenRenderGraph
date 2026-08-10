@@ -4,7 +4,7 @@
 #include <rhi.h>
 #include <resource_states.h>
 
-#include "Resources/Resource.h"
+#include "Resources/GloballyIndexedResource.h"
 #include "Resources/ResourceStateTracker.h"
 #include "Resources/TextureDescription.h"
 
@@ -12,7 +12,7 @@ namespace org {
 
 // Graph wrapper for an externally allocated texture. The legacy handle constructor remains
 // non-owning; CreateShared retains an imported BasicRHI resource for generation-safe interop.
-class ExternalTextureResource : public Resource {
+class ExternalTextureResource : public GloballyIndexedResource {
 public:
     ExternalTextureResource(rhi::ResourceHandle handle, unsigned int width, unsigned int height)
         : m_handle(handle), m_width(width), m_height(height)
@@ -24,7 +24,15 @@ public:
     }
 
     static std::shared_ptr<ExternalTextureResource> CreateShared(
-        rhi::ResourcePtr resource, const TextureDescription& description);
+        rhi::ResourcePtr resource, const TextureDescription& description,
+        bool commonLayoutOnly = true);
+
+    // Replace only the native backing of an existing graph resource. Returns
+    // false when the new description would change the structural graph and
+    // therefore requires a new graph generation.
+    bool RefreshShared(rhi::ResourcePtr resource, const TextureDescription& description,
+        bool commonLayoutOnly = true);
+    bool IsStructurallyCompatible(const TextureDescription& description) const noexcept;
 
     rhi::Resource GetAPIResource() override {
         return m_resource ? m_resource.Get() : rhi::Resource(m_handle, true);
@@ -53,6 +61,7 @@ public:
 
     void ResetToUndefined();
     void ResetToCommon();
+	void ResetState(ResourceState state);
 
 private:
     rhi::ResourcePtr m_resource;
@@ -66,6 +75,7 @@ private:
     // RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS. Enhanced barriers may change
     // their access and sync scopes, but their layout must remain COMMON.
     bool m_commonLayoutOnly{};
+    TextureDescription m_description{};
 };
 
 } // namespace org

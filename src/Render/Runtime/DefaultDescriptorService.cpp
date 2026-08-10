@@ -43,6 +43,26 @@ public:
         return DescriptorHeapManager::GetInstance().GetSamplerDescriptorHeap();
     }
 
+	rhi::DescriptorHeap GetRTVDescriptorHeap() const override {
+		return DescriptorHeapManager::GetInstance().GetRTVHeap()->GetHeap();
+	}
+
+	rhi::DescriptorHeap GetDSVDescriptorHeap() const override {
+		return DescriptorHeapManager::GetInstance().GetDSVHeap()->GetHeap();
+	}
+
+	rhi::DescriptorHeap GetNonShaderVisibleDescriptorHeap() const override {
+		return DescriptorHeapManager::GetInstance().GetNonShaderVisibleHeap()->GetHeap();
+	}
+
+	rhi::DescriptorSlot AllocateDescriptorSlot(rhi::DescriptorHeapType type, bool shaderVisible) override {
+		return DescriptorHeapManager::GetInstance().AllocateDescriptorSlot(type, shaderVisible);
+	}
+
+	void RetireDescriptorSlot(rhi::DescriptorSlot slot) override {
+		DescriptorHeapManager::GetInstance().RetireDescriptorSlot(slot);
+	}
+
     UINT CreateIndexedSampler(const rhi::SamplerDesc& samplerDesc) override {
         return DescriptorHeapManager::GetInstance().CreateIndexedSampler(samplerDesc);
     }
