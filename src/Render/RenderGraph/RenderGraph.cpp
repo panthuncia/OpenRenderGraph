@@ -6586,6 +6586,13 @@ void RenderGraph::SetPassTechnique(std::string passName, std::string techniquePa
 	m_passTechniquePathsByName[std::move(passName)] = std::move(techniquePath);
 }
 
+void RenderGraph::AddExplicitPassDependency(std::string beforePass, std::string afterPass) {
+	if (beforePass.empty() || afterPass.empty() || beforePass == afterPass) {
+		return;
+	}
+	m_structuralExplicitAfterByName.emplace_back(std::move(beforePass), std::move(afterPass));
+}
+
 std::string RenderGraph::GetTechniquePathForPassName(std::string_view passName) const {
 	if (passName.empty()) {
 		return {};

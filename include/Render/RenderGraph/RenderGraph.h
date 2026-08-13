@@ -712,6 +712,9 @@ public:
 	void RegisterResolver(ResourceIdentifier id, const std::shared_ptr<IResourceResolver>& resolver);
 	std::shared_ptr<IResourceResolver> RequestResolver(ResourceIdentifier const& rid, bool allowFailure = false);
 	void SetPassTechnique(std::string passName, std::string techniquePath);
+	// Adds a structural ordering edge from `beforePass` to `afterPass`.
+	// Both passes must exist when the graph is compiled.
+	void AddExplicitPassDependency(std::string beforePass, std::string afterPass);
 
 	std::shared_ptr<Resource> RequestResourcePtr(ResourceIdentifier const& rid, bool allowFailure = false);
 	ResourceRegistry::RegistryHandle RequestResourceHandle(ResourceIdentifier const& rid, bool allowFailure = false);
