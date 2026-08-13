@@ -6,9 +6,11 @@
 #include <memory>
 #include <vector>
 
-class RenderGraph;
+namespace org
+{
+    class RenderGraph;
 
-namespace rg::external
+namespace external
 {
     class ContributorRuntime
     {
@@ -32,4 +34,5 @@ namespace rg::external
         struct Impl;
         std::unique_ptr<Impl> m_impl;
     };
+}
 }
