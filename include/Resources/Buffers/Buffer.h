@@ -316,3 +316,7 @@ private:
 
 
 } // namespace org
+
+using org::Buffer;
+using org::BufferBase;
+using namespace org;

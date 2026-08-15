@@ -143,7 +143,7 @@ target_link_libraries(OpenRenderGraph
         flecs::flecs
         Boost::container_hash
     PRIVATE
-        spdlog::spdlog
+        spdlog::spdlog_header_only
 )
 
 if(OPENRENDERGRAPH_ENABLE_DEBUG_UI)
@@ -156,7 +156,12 @@ if(OPENRENDERGRAPH_ENABLE_DEBUG_UI)
     target_include_directories(OpenRenderGraphDebugUI PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
-        PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../BasicRenderer/include")
+    if(MSVC)
+        target_compile_options(OpenRenderGraphDebugUI PRIVATE /utf-8)
+    endif()
     target_link_libraries(OpenRenderGraphDebugUI PUBLIC OpenRenderGraph::OpenRenderGraph
         imgui::imgui implot::implot slang::slang)
 endif()

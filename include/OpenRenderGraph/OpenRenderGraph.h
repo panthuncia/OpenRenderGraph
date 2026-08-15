@@ -40,4 +40,30 @@
 #include "../Render/Runtime/UploadPolicyServiceAccess.h"
 #include "../Render/Runtime/UploadTypes.h"
 
-
+// Transitional aliases for downstream code that has not yet qualified the
+// OpenRenderGraph public API after its move into namespace org.
+using namespace org;
+using org::AsyncBufferBackingResizeState;
+using org::Buffer;
+using org::BufferBase;
+using org::CopyPass;
+using org::ComputePass;
+using org::ComputePassBuilder;
+using org::DescriptorHeap;
+using org::DynamicGloballyIndexedResource;
+using org::DynamicResource;
+using org::EntityComponentBundle;
+using org::GloballyIndexedResource;
+using org::GpuBufferBacking;
+using org::IDeferredBackingResizeClient;
+using org::IHasMemoryMetadata;
+using org::IDynamicDeclaredResources;
+using org::PipelineResources;
+using org::PipelineState;
+using org::PipelineStatePayload;
+using org::PixelBuffer;
+using org::RenderGraph;
+using org::RenderPass;
+using org::Resource;
+using org::TextureDescription;
+using org::ViewedDynamicBufferBase;

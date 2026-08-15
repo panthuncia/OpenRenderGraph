@@ -572,7 +572,7 @@ namespace ui {
             cmdList->End();
 
             auto& clRef = cmdList.Get();
-            auto& queue = DeviceManager::GetInstance().GetGraphicsQueue();
+            auto queue = DeviceManager::GetInstance().GetGraphicsQueue();
             queue.Submit(rhi::Span<rhi::CommandList>(&clRef, 1));
             queue.Signal({ fence->GetHandle(), 1 });
             fence->HostWait(1);

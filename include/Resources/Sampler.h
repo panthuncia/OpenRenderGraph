@@ -164,3 +164,5 @@ private:
 };
 
 } // namespace org
+
+using org::Sampler;
