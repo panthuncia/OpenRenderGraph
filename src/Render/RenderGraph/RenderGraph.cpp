@@ -5242,6 +5242,8 @@ void RenderGraph::CompileStructural() {
 	// Register resource providers from pass builders
 
 	std::vector<unsigned int> empty;
+	{
+	BT_ZONE_SCOPE("RenderGraph::CompileStructural::FinalizeBasePasses");
 	// Go backwards to build skip list
 	for (int i = static_cast<int>(m_passBuilderOrder.size()) - 1; i >= 0; i--) {
 		auto ptr = m_passBuilderOrder[i];
@@ -5260,6 +5262,7 @@ void RenderGraph::CompileStructural() {
 		}
 		ptr->Finalize();
 		i++;
+	}
 	}
 
 	batches.clear();
@@ -5325,6 +5328,8 @@ void RenderGraph::CompileStructural() {
 		return "__rg_ext_" + std::to_string(n);
 		};
 
+	{
+	BT_ZONE_SCOPE("RenderGraph::CompileStructural::GatherAndMaterializeExtensions");
 	for (int ei = 0; ei < (int)m_extensions.size(); ++ei) {
 		auto& ext = m_extensions[ei];
 		if (!ext) continue;
@@ -5334,7 +5339,23 @@ void RenderGraph::CompileStructural() {
 		if (m_getRenderGraphBatchTraceEnabled && m_getRenderGraphBatchTraceEnabled()) {
 			spdlog::info("RG gather structural extension {} begin", ei);
 		}
-		ext->GatherStructuralPasses(*this, local);
+		{
+			BT_ZONE_SCOPE("RenderGraph::CompileStructural::GatherExtensionPasses");
+			const auto gatherBegin = std::chrono::steady_clock::now();
+			ext->GatherStructuralPasses(*this, local);
+			const auto gatherMs = std::chrono::duration<double, std::milli>(
+				std::chrono::steady_clock::now() - gatherBegin).count();
+			if (gatherMs >= 10.0) {
+				const std::string_view extensionId = static_cast<std::size_t>(ei) < m_extensionRegistrationIds.size()
+					? std::string_view{ m_extensionRegistrationIds[static_cast<std::size_t>(ei)] }
+					: std::string_view{ "unknown" };
+				spdlog::info(
+					"RenderGraph structural extension gather: id='{}' elapsed_ms={:.3f} passes={}",
+					extensionId,
+					gatherMs,
+					local.size());
+			}
+		}
 		if (m_getRenderGraphBatchTraceEnabled && m_getRenderGraphBatchTraceEnabled()) {
 			spdlog::info("RG gather structural extension {} complete localPassCount={}", ei, local.size());
 		}
@@ -5343,6 +5364,8 @@ void RenderGraph::CompileStructural() {
 		int localOrder = 0;
 
 		for (auto& d : local) {
+			BT_ZONE_SCOPE("RenderGraph::CompileStructural::MaterializeExtensionPass");
+			BT_ZONE_TEXT(d.name.data(), d.name.size());
 			if (d.type == PassType::Unknown) continue;
 			if (std::holds_alternative<std::monostate>(d.pass)) continue;
 
@@ -5387,7 +5410,9 @@ void RenderGraph::CompileStructural() {
 			prevKey = extItems.back().key;
 		}
 	}
+	}
 
+	BT_ZONE_SCOPE("RenderGraph::CompileStructural::OrderPasses");
 	// Build nodes list: sentinels + base + externals
 	std::vector<MergeNode> nodes;
 	nodes.reserve(2 + base.size() + extItems.size());
