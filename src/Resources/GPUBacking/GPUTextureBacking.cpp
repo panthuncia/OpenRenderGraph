@@ -307,17 +307,18 @@ rhi::BarrierBatch GpuTextureBacking::GetEnhancedBarrierGroup(RangeSpec range, rh
 
 	auto resolvedRange = ResolveRangeSpec(range, m_mipLevels, m_arraySize);
 
-	m_barrier.afterAccess = newAccessType;
-	m_barrier.beforeAccess = prevAccessType;
-	m_barrier.afterLayout = newLayout;
-	m_barrier.beforeLayout = prevLayout;
-	m_barrier.afterSync = newSyncState;
-	m_barrier.beforeSync = prevSyncState;
-	m_barrier.discard = false;
-	m_barrier.range = { resolvedRange.firstMip, resolvedRange.mipCount, resolvedRange.firstSlice, resolvedRange.sliceCount };
-	m_barrier.texture = m_textureHandle.GetResource().GetHandle();
+	thread_local rhi::TextureBarrier barrier{};
+	barrier.afterAccess = newAccessType;
+	barrier.beforeAccess = prevAccessType;
+	barrier.afterLayout = newLayout;
+	barrier.beforeLayout = prevLayout;
+	barrier.afterSync = newSyncState;
+	barrier.beforeSync = prevSyncState;
+	barrier.discard = false;
+	barrier.range = { resolvedRange.firstMip, resolvedRange.mipCount, resolvedRange.firstSlice, resolvedRange.sliceCount };
+	barrier.texture = m_textureHandle.GetResource().GetHandle();
 
-	batch.textures = { &m_barrier };
+	batch.textures = { &barrier };
 
 	return batch;
 }

@@ -111,17 +111,18 @@ rhi::BarrierBatch ExternalTextureResource::GetEnhancedBarrierGroup(
     rhi::ResourceSyncState nextSync)
 {
     const auto resolved = ResolveRangeSpec(range, m_mipLevels, m_arraySize);
-    m_barrier.beforeAccess = previousAccess;
-    m_barrier.afterAccess = nextAccess;
-    m_barrier.beforeLayout = m_commonLayoutOnly ? rhi::ResourceLayout::Common : previousLayout;
-    m_barrier.afterLayout = m_commonLayoutOnly ? rhi::ResourceLayout::Common : nextLayout;
-    m_barrier.beforeSync = previousSync;
-    m_barrier.afterSync = nextSync;
-    m_barrier.discard = false;
-    m_barrier.range = { resolved.firstMip, resolved.mipCount, resolved.firstSlice, resolved.sliceCount };
-    m_barrier.texture = m_handle;
+    thread_local rhi::TextureBarrier barrier{};
+    barrier.beforeAccess = previousAccess;
+    barrier.afterAccess = nextAccess;
+    barrier.beforeLayout = m_commonLayoutOnly ? rhi::ResourceLayout::Common : previousLayout;
+    barrier.afterLayout = m_commonLayoutOnly ? rhi::ResourceLayout::Common : nextLayout;
+    barrier.beforeSync = previousSync;
+    barrier.afterSync = nextSync;
+    barrier.discard = false;
+    barrier.range = { resolved.firstMip, resolved.mipCount, resolved.firstSlice, resolved.sliceCount };
+    barrier.texture = m_handle;
     rhi::BarrierBatch batch{};
-    batch.textures = { &m_barrier };
+    batch.textures = { &barrier };
     return batch;
 }
 

@@ -60,7 +60,8 @@ rhi::BarrierBatch ExternalBufferResource::GetEnhancedBarrierGroup(RangeSpec,
 	rhi::ResourceLayout, rhi::ResourceLayout,
 	rhi::ResourceSyncState previousSync, rhi::ResourceSyncState nextSync)
 {
-	m_barrier = {
+	thread_local rhi::BufferBarrier barrier{};
+	barrier = {
 		.buffer = m_resource.Get().GetHandle(),
 		.offset = 0,
 		.size = UINT64_MAX,
@@ -70,7 +71,7 @@ rhi::BarrierBatch ExternalBufferResource::GetEnhancedBarrierGroup(RangeSpec,
 		.afterAccess = nextAccess
 	};
 	rhi::BarrierBatch result{};
-	result.buffers = { &m_barrier };
+	result.buffers = { &barrier };
 	return result;
 }
 

@@ -1259,6 +1259,13 @@ private:
 	std::unordered_map<uint64_t, std::shared_ptr<Resource>> m_dynamicResourcesByStableID;
 	std::unordered_map<std::string, std::shared_ptr<Resource>> m_transientFrameResourcesByName;
 	std::unordered_map<uint64_t, uint64_t> resourceBackingGenerationByID;
+	struct LogicalExternalOwner {
+		uint64_t backingGeneration = 0;
+		BackendInstanceId backend = BackendInstanceId::Primary;
+	};
+	// API ownership is independent of each representation's resource state and
+	// must survive frame compilation while the backing allocation is unchanged.
+	std::unordered_map<uint64_t, LogicalExternalOwner> m_logicalExternalOwners;
 	std::unordered_map<uint64_t, uint32_t> resourceIdleFrameCounts;
 	std::vector<std::pair<uint64_t, uint64_t>> compiledResourceGenerations;
 	using ResourceMaterializeOptions = std::variant<PixelBuffer::MaterializeOptions, BufferBase::MaterializeOptions>;

@@ -107,7 +107,8 @@ void GpuBufferBacking::SetName(const char* name)
 rhi::BarrierBatch GpuBufferBacking::GetEnhancedBarrierGroup(RangeSpec range, rhi::ResourceAccessType prevAccessType, rhi::ResourceAccessType newAccessType, rhi::ResourceLayout prevLayout, rhi::ResourceLayout newLayout, rhi::ResourceSyncState prevSyncState, rhi::ResourceSyncState newSyncState) {
 
 	rhi::BarrierBatch batch = {};
-	m_barrier = rhi::BufferBarrier{
+	thread_local rhi::BufferBarrier barrier{};
+	barrier = rhi::BufferBarrier{
 	   .buffer = GetAPIResource().GetHandle(),
 	   .offset = 0,
 	   .size = UINT64_MAX,
@@ -116,7 +117,7 @@ rhi::BarrierBatch GpuBufferBacking::GetEnhancedBarrierGroup(RangeSpec range, rhi
 	   .beforeAccess = prevAccessType,
 	   .afterAccess = newAccessType
 	};
-	batch.buffers = { &m_barrier };
+	batch.buffers = { &barrier };
 
 	return batch;
 }

@@ -6585,6 +6585,10 @@ void RenderGraph::PlanMultiBackendOwnershipTransfers() {
 		ResourceState state{};
 	};
 	std::unordered_map<Resource*, LastUse> lastUses;
+	auto backingGeneration = [](Resource* resource) -> uint64_t {
+		if (auto* backed = dynamic_cast<BackedResource*>(resource)) return backed->GetBackingGeneration();
+		return 0;
+	};
 
 	auto visitPass = [&](auto* passEntry, BackendInstanceId backend) {
 		passEntry->externalAcquires.clear();
@@ -6604,6 +6608,18 @@ void RenderGraph::PlanMultiBackendOwnershipTransfers() {
 				return;
 			}
 			auto previous = lastUses.find(resource);
+			if (previous == lastUses.end()) {
+				const auto id = resource->GetGlobalResourceID();
+				const auto generation = backingGeneration(resource);
+				auto persisted = m_logicalExternalOwners.find(id);
+				if (persisted != m_logicalExternalOwners.end()
+					&& persisted->second.backingGeneration == generation) {
+					previous = lastUses.emplace(resource, LastUse{ persisted->second.backend, nullptr, {} }).first;
+				}
+				else if (persisted != m_logicalExternalOwners.end()) {
+					m_logicalExternalOwners.erase(persisted);
+				}
+			}
 			if (previous == lastUses.end() && backend != canonicalD3D12) {
 				passEntry->externalAcquires.push_back({ resource, requirement.state });
 				spdlog::debug("RenderGraph planned initial external texture acquire: resource='{}' toBackend={} consumer='{}'",
@@ -6628,6 +6644,12 @@ void RenderGraph::PlanMultiBackendOwnershipTransfers() {
 				std::visit([&](auto* passEntry) { visitPass(passEntry, backend); }, passVariant);
 			}
 		}
+	}
+
+	for (const auto& [resource, lastUse] : lastUses) {
+		m_logicalExternalOwners[resource->GetGlobalResourceID()] = {
+			backingGeneration(resource), lastUse.backend
+		};
 	}
 
 	// Transition compilation historically followed one logical tracker.  At an
@@ -6778,18 +6800,6 @@ void RenderGraph::Setup() {
 			m_queueRegistry.Register({ QueueKind::Compute, 0, peer.id, peer.backend }, peerDevice.GetQueue(rhi::QueueKind::Compute), peerDevice);
 			m_queueRegistry.Register({ QueueKind::Copy, 0, peer.id, peer.backend }, peerDevice.GetQueue(rhi::QueueKind::Copy), peerDevice);
 		}
-		if (m_backendDevices.size() > 1) {
-			rhi::Device d3d12Device{};
-			rhi::Device vulkanDevice{};
-			for (const auto& entry : m_backendDevices) {
-				if (entry.backend == rhi::Backend::D3D12) d3d12Device = entry.device;
-				if (entry.backend == rhi::Backend::Vulkan) vulkanDevice = entry.device;
-			}
-			const auto interopResult = m_queueRegistry.EnableD3D12VulkanInterop(d3d12Device, vulkanDevice);
-			if (rhi::Failed(interopResult)) {
-				throw std::runtime_error(std::string("RenderGraph failed to initialize multi-RHI queue timelines: ") + rhi::ResultName(interopResult));
-			}
-		}
 	}
 	EnsureMinimumAutomaticSchedulingQueues();
 
@@ -6802,6 +6812,22 @@ void RenderGraph::Setup() {
 	// Extensions may create additional queues or allocate resources here.
 	for (auto& ext : m_extensions) {
 		if (ext) ext->Initialize(*this);
+	}
+
+	// Queue extensions and the automatic scheduler can add slots after the
+	// primary queues. Every slot must receive a destination-local imported
+	// timeline before any cross-device dependency is compiled.
+	if (m_backendDevices.size() > 1) {
+		rhi::Device d3d12Device{};
+		rhi::Device vulkanDevice{};
+		for (const auto& entry : m_backendDevices) {
+			if (entry.backend == rhi::Backend::D3D12) d3d12Device = entry.device;
+			if (entry.backend == rhi::Backend::Vulkan) vulkanDevice = entry.device;
+		}
+		const auto interopResult = m_queueRegistry.EnableD3D12VulkanInterop(d3d12Device, vulkanDevice);
+		if (rhi::Failed(interopResult)) {
+			throw std::runtime_error(std::string("RenderGraph failed to initialize multi-RHI queue timelines: ") + rhi::ResultName(interopResult));
+		}
 	}
 
 	// Re-size in case extensions added queues.
