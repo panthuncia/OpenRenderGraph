@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <vector>
 #include <memory>
+#include <string>
+#include <string_view>
 #include <rhi.h>
 #include "QueueKind.h"
 
@@ -42,13 +44,19 @@ public:
 	/// Returns the slot index assigned.
 	QueueSlotIndex Register(QueueSlot slot, rhi::Queue queue, rhi::Device& device,
 		QueueAutoAssignmentPolicy autoAssignmentPolicy = QueueAutoAssignmentPolicy::AllowAutomaticScheduling,
-		bool ownsQueue = false);
+		bool ownsQueue = false,
+		std::string_view logicalName = {});
 
 	/// Register a queue slot with an externally-supplied timeline and pool.
 	QueueSlotIndex Register(QueueSlot slot, rhi::Queue queue, rhi::TimelinePtr fence, std::unique_ptr<CommandListPool> pool,
 		QueueAutoAssignmentPolicy autoAssignmentPolicy = QueueAutoAssignmentPolicy::AllowAutomaticScheduling,
 		bool ownsQueue = false,
-		rhi::Device device = {});
+		rhi::Device device = {},
+		std::string_view logicalName = {});
+
+	/// Returns a persistent, graph-owned queue registered under this logical name.
+	/// Named queues survive structural graph rebuilds, so callers must reuse them.
+	QueueSlotIndex FindNamedOwnedSlot(QueueKind kind, std::string_view logicalName) const noexcept;
 
 	/// Look up slot index by kind + instance. Returns empty optional if not found.
 	QueueSlotIndex FindSlot(QueueSlot slot) const;
@@ -76,7 +84,15 @@ public:
 	CommandListPool* GetPool(QueueSlotIndex i)    const noexcept { return m_slots[ToUnderlying(i)].pool.get(); }
 	rhi::Timeline& GetFenceForConsumer(QueueSlotIndex source, QueueSlotIndex consumer) noexcept {
 		auto& entry = m_slots[ToUnderlying(source)];
-		return GetBackend(source) == GetBackend(consumer) || !entry.peerFence ? entry.fence.Get() : entry.peerFence.Get();
+		// Slots on the same device instance always consume the source's local
+		// timeline. Backend metadata is diagnostic and must not turn a same-device
+		// wait into an external-handle lookup if a custom slot was incompletely
+		// described.
+		return GetBackendInstance(source) == GetBackendInstance(consumer)
+			|| GetBackend(source) == GetBackend(consumer)
+			|| !entry.peerFence
+			? entry.fence.Get()
+			: entry.peerFence.Get();
 	}
 
 	/// Replaces backend-local slot fences with two API representations of the
@@ -122,6 +138,7 @@ private:
 		std::unique_ptr<CommandListPool> pool;
 		QueueAutoAssignmentPolicy autoAssignmentPolicy = QueueAutoAssignmentPolicy::AllowAutomaticScheduling;
 		bool ownsQueue = false;
+		std::string logicalName;
 		uint64_t fenceValue = 1;
 	};
 

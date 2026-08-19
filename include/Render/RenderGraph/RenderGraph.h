@@ -313,6 +313,10 @@ public:
 	struct ExternalOwnershipBarrier {
 		Resource* resource = nullptr;
 		ResourceState state{};
+		RangeSpec range{};
+		// Imported Vulkan images begin in UNDEFINED until their first ownership
+		// acquire. Later API handoffs are released through COMMON/GENERAL.
+		bool initialFromUndefined = false;
 	};
 
 	struct RenderPassAndResources { // TODO: I'm currently copying these a lot; maybe use pointers instead

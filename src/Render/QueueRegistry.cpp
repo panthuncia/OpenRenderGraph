@@ -23,14 +23,14 @@ namespace {
 	}
 }
 
-QueueSlotIndex QueueRegistry::Register(QueueSlot slot, rhi::Queue queue, rhi::Device& device, QueueAutoAssignmentPolicy autoAssignmentPolicy, bool ownsQueue) {
+QueueSlotIndex QueueRegistry::Register(QueueSlot slot, rhi::Queue queue, rhi::Device& device, QueueAutoAssignmentPolicy autoAssignmentPolicy, bool ownsQueue, std::string_view logicalName) {
 	auto pool = std::make_unique<CommandListPool>(device, static_cast<rhi::QueueKind>(slot.kind));
 	rhi::TimelinePtr fence;
 	device.CreateTimeline(fence);
-	return Register(slot, queue, std::move(fence), std::move(pool), autoAssignmentPolicy, ownsQueue, ownsQueue ? device : rhi::Device{});
+	return Register(slot, queue, std::move(fence), std::move(pool), autoAssignmentPolicy, ownsQueue, ownsQueue ? device : rhi::Device{}, logicalName);
 }
 
-QueueSlotIndex QueueRegistry::Register(QueueSlot slot, rhi::Queue queue, rhi::TimelinePtr fence, std::unique_ptr<CommandListPool> pool, QueueAutoAssignmentPolicy autoAssignmentPolicy, bool ownsQueue, rhi::Device device) {
+QueueSlotIndex QueueRegistry::Register(QueueSlot slot, rhi::Queue queue, rhi::TimelinePtr fence, std::unique_ptr<CommandListPool> pool, QueueAutoAssignmentPolicy autoAssignmentPolicy, bool ownsQueue, rhi::Device device, std::string_view logicalName) {
 	auto idx = static_cast<QueueSlotIndex>(static_cast<uint8_t>(m_slots.size()));
 	const std::string queueName = "ORG QueueSlot " + std::to_string(static_cast<uint8_t>(idx)) +
 		" backend=" + std::to_string(static_cast<uint8_t>(slot.backendInstance)) +
@@ -49,8 +49,19 @@ QueueSlotIndex QueueRegistry::Register(QueueSlot slot, rhi::Queue queue, rhi::Ti
 		const std::string fenceName = queueName + " Fence";
 		fence->SetName(fenceName.c_str());
 	}
-	m_slots.push_back({ slot.kind, slot.instance, slot.backendInstance, slot.backend, queue, device, std::move(fence), {}, std::move(pool), autoAssignmentPolicy, ownsQueue, 1 });
+	m_slots.push_back({ slot.kind, slot.instance, slot.backendInstance, slot.backend, queue, device, std::move(fence), {}, std::move(pool), autoAssignmentPolicy, ownsQueue, std::string(logicalName), 1 });
 	return idx;
+}
+
+QueueSlotIndex QueueRegistry::FindNamedOwnedSlot(QueueKind kind, std::string_view logicalName) const noexcept {
+	if (logicalName.empty()) return static_cast<QueueSlotIndex>(0xFF);
+	for (size_t i = 0; i < m_slots.size(); ++i) {
+		const auto& slot = m_slots[i];
+		if (slot.ownsQueue && slot.kind == kind && slot.logicalName == logicalName) {
+			return static_cast<QueueSlotIndex>(static_cast<uint8_t>(i));
+		}
+	}
+	return static_cast<QueueSlotIndex>(0xFF);
 }
 
 rhi::Result QueueRegistry::EnableD3D12VulkanInterop(rhi::Device d3d12Device, rhi::Device vulkanDevice) {

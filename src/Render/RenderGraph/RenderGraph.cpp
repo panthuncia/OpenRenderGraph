@@ -5607,7 +5607,9 @@ void RenderGraph::CompileStructural() {
 		for (auto const& b : e.where.before) {
 			auto idxOpt = resolveAnchor(b);
 			if (!idxOpt) {
-				spdlog::warn("External pass '{}' requested Before('{}') but anchor not found; ignoring.", e.key, b);
+				if (!e.key.starts_with("CLodShadow::")) {
+					spdlog::warn("External pass '{}' requested Before('{}') but anchor not found; ignoring.", e.key, b);
+				}
 				continue;
 			}
 			addEdge(passNode, *idxOpt);
@@ -5617,9 +5619,11 @@ void RenderGraph::CompileStructural() {
 			anyConstraint = true;
 		}
 	}
+	spdlog::info("RenderGraph structural merge: external constraints complete passes={} edges={}", extItems.size(), edgeSet.size());
 
 	// Extension chaining edges: prev -> next (if keepExtensionOrder on the *next* pass)
 	for (auto& [ei, v] : extOrder) {
+		spdlog::info("RenderGraph structural merge: chaining extension={} passes={}", ei, v.size());
 		for (size_t j = 1; j < v.size(); ++j) {
 			// Find the extItems entry for this node to check keepExtensionOrder
 			// (We can check by key because keys are unique.)
@@ -5636,8 +5640,10 @@ void RenderGraph::CompileStructural() {
 			if (keep) addEdge(prevNode, nextNode);
 		}
 	}
+	spdlog::info("RenderGraph structural merge: extension chaining complete edges={}", edgeSet.size());
 
 	// Topological sort (stable by priority then order)
+	spdlog::info("RenderGraph structural merge: sorting {} nodes", nodes.size());
 	std::vector<uint32_t> indeg(nodes.size());
 	for (size_t n = 0; n < nodes.size(); ++n) indeg[n] = nodes[n].indeg;
 
@@ -5669,6 +5675,7 @@ void RenderGraph::CompileStructural() {
 		throw std::runtime_error("RenderGraph structural merge cycle");
 	}
 
+	spdlog::info("RenderGraph structural merge: topological sort complete nodes={}", topo.size());
 	// Emit final m_masterPassList in topo order (skip sentinels)
 	m_masterPassList.clear();
 	m_compilerState->immediateModePassPointers.clear();
@@ -5681,7 +5688,9 @@ void RenderGraph::CompileStructural() {
 		}
 		m_masterPassList.push_back(std::move(nodes[u].pass));
 	}
+	spdlog::info("RenderGraph structural merge: emitted {} passes; rebuilding retained declarations", m_masterPassList.size());
 	RebuildRetainedDeclarationRefreshCandidates();
+	spdlog::info("RenderGraph structural merge: compile complete");
 }
 
 
@@ -6416,7 +6425,6 @@ void RenderGraph::MaterializeMultiBackendRepresentations() {
 			if (resourceIndex < uses.size()) uses[resourceIndex][instanceIndex] = 1;
 		}
 	}
-
 	BackendDeviceEntry* d3d12 = nullptr;
 	BackendDeviceEntry* vulkan = nullptr;
 	for (auto& entry : m_backendDevices) {
@@ -6459,6 +6467,9 @@ void RenderGraph::MaterializeMultiBackendRepresentations() {
 			throw std::runtime_error("Multi-RHI resource '" + resource->GetName() + "' has no supported device-local buffer/2D texture representation");
 		}
 		desc.heapFlags |= rhi::HeapFlags::Shared;
+		spdlog::info("RenderGraph materializing multi-RHI representation: index={} id={} name='{}' type={} flags=0x{:X}",
+			resourceIndex, resource->GetGlobalResourceID(), resource->GetName(), static_cast<uint32_t>(desc.type),
+			static_cast<uint32_t>(desc.resourceFlags));
 		rhi::ResourcePtr d3Resource;
 		rhi::ResourcePtr vkResource;
 		if (desc.type == rhi::ResourceType::Texture2D &&
@@ -6582,7 +6593,7 @@ void RenderGraph::PlanMultiBackendOwnershipTransfers() {
 	struct LastUse {
 		BackendInstanceId backend = BackendInstanceId::Primary;
 		std::vector<ExternalOwnershipBarrier>* releases = nullptr;
-		ResourceState state{};
+		SymbolicTracker tracker{};
 	};
 	std::unordered_map<Resource*, LastUse> lastUses;
 	auto backingGeneration = [](Resource* resource) -> uint64_t {
@@ -6593,7 +6604,6 @@ void RenderGraph::PlanMultiBackendOwnershipTransfers() {
 	auto visitPass = [&](auto* passEntry, BackendInstanceId backend) {
 		passEntry->externalAcquires.clear();
 		passEntry->externalReleases.clear();
-		std::unordered_set<Resource*> seen;
 		ForEachFrameRequirement(passEntry->resources, [&](const auto& requirement) {
 			const auto handle = requirement.resourceHandleAndRange.resource;
 			Resource* resource = handle.IsEphemeral() ? handle.GetEphemeralPtr() : _registry.Resolve(handle);
@@ -6604,7 +6614,7 @@ void RenderGraph::PlanMultiBackendOwnershipTransfers() {
 				for (const auto& device : m_backendDevices) representationCount += resource->HasAPIRepresentation(device.id) ? 1u : 0u;
 				hasMultipleRepresentations = representationCount > 1;
 			}
-			if (!resource || !hasMultipleRepresentations || !seen.insert(resource).second) {
+			if (!resource || !hasMultipleRepresentations) {
 				return;
 			}
 			auto previous = lastUses.find(resource);
@@ -6614,26 +6624,48 @@ void RenderGraph::PlanMultiBackendOwnershipTransfers() {
 				auto persisted = m_logicalExternalOwners.find(id);
 				if (persisted != m_logicalExternalOwners.end()
 					&& persisted->second.backingGeneration == generation) {
-					previous = lastUses.emplace(resource, LastUse{ persisted->second.backend, nullptr, {} }).first;
+					LastUse restored{};
+					restored.backend = persisted->second.backend;
+					if (auto* tracker = resource->GetStateTracker(restored.backend)) restored.tracker.CopyFrom(*tracker);
+					previous = lastUses.emplace(resource, std::move(restored)).first;
 				}
 				else if (persisted != m_logicalExternalOwners.end()) {
 					m_logicalExternalOwners.erase(persisted);
 				}
 			}
 			if (previous == lastUses.end() && backend != canonicalD3D12) {
-				passEntry->externalAcquires.push_back({ resource, requirement.state });
+				passEntry->externalAcquires.push_back({ resource, requirement.state, {}, true });
+				LastUse initial{};
+				initial.backend = backend;
+				initial.releases = &passEntry->externalReleases;
+				initial.tracker.Reset({}, { rhi::ResourceAccessType::Common, rhi::ResourceLayout::Common, rhi::ResourceSyncState::All });
+				previous = lastUses.emplace(resource, std::move(initial)).first;
 				spdlog::debug("RenderGraph planned initial external texture acquire: resource='{}' toBackend={} consumer='{}'",
 					resource->GetName(), static_cast<uint32_t>(backend), passEntry->name);
 			}
 			else if (previous != lastUses.end() && previous->second.backend != backend) {
 				if (previous->second.releases) {
-					previous->second.releases->push_back({ resource, previous->second.state });
+					for (const auto& segment : previous->second.tracker.GetSegments()) {
+						previous->second.releases->push_back({ resource, segment.state, segment.rangeSpec, false });
+					}
 				}
-				passEntry->externalAcquires.push_back({ resource, requirement.state });
+				passEntry->externalAcquires.push_back({ resource, requirement.state, {}, false });
+				previous->second.backend = backend;
+				previous->second.tracker.Reset({}, { rhi::ResourceAccessType::Common, rhi::ResourceLayout::Common, rhi::ResourceSyncState::All });
 				spdlog::debug("RenderGraph planned external texture ownership transfer: resource='{}' fromBackend={} toBackend={} consumer='{}'",
 					resource->GetName(), static_cast<uint32_t>(previous->second.backend), static_cast<uint32_t>(backend), passEntry->name);
 			}
-			lastUses[resource] = { backend, &passEntry->externalReleases, requirement.state };
+			if (previous == lastUses.end()) {
+				LastUse initial{};
+				initial.backend = backend;
+				initial.releases = &passEntry->externalReleases;
+				if (auto* tracker = resource->GetStateTracker(backend)) initial.tracker.CopyFrom(*tracker);
+				previous = lastUses.emplace(resource, std::move(initial)).first;
+			}
+			previous->second.backend = backend;
+			previous->second.releases = &passEntry->externalReleases;
+			std::vector<ResourceTransition> ignored;
+			previous->second.tracker.Apply(requirement.resourceHandleAndRange.range, resource, requirement.state, ignored);
 		});
 	};
 
@@ -6652,10 +6684,11 @@ void RenderGraph::PlanMultiBackendOwnershipTransfers() {
 		};
 	}
 
-	// Transition compilation historically followed one logical tracker.  At an
-	// API handoff the destination representation instead starts from the
-	// externally released COMMON state.  Rebase its generated pre-transition so
-	// it never inherits the source API's layout.
+	// Transition compilation historically followed one logical tracker. At an
+	// API handoff the destination representation starts from the externally
+	// acquired COMMON state. Rebase its generated pre-transition so it never
+	// inherits the source API's layout. The acquire is recorded before these
+	// transitions in RecordQueueBatch.
 	for (auto& batch : batches) {
 		for (size_t queueIndex = 0; queueIndex < m_queueRegistry.SlotCount(); ++queueIndex) {
 			std::unordered_set<Resource*> acquired;
@@ -7823,7 +7856,12 @@ namespace {
 				continue;
 			UINT64 val = fenceOffset + batch.GetQueueWaitFenceValue(
 				RenderGraph::BatchWaitPhase::BeforeTransitions, qi, srcIndex);
-			WaitOnSlot(qi, srcIndex, val);
+			if (args.batchTraceEnabled) {
+				spdlog::info(
+					"RenderGraph: frame {} batch {} slot {} enqueue wait phase=BeforeTransitions srcSlot={} value={}",
+					static_cast<unsigned>(args.context.frameIndex), args.batchIndex, qi, srcIndex, val);
+			}
+			WaitOnSlot(qi, srcIndex, val, fmt::format("batch={} phase=BeforeTransitions", args.batchIndex));
 		}
 
 		// Open first CL and record pre-transitions
@@ -7839,7 +7877,12 @@ namespace {
 				continue;
 			UINT64 val = fenceOffset + batch.GetQueueWaitFenceValue(
 				RenderGraph::BatchWaitPhase::BeforeExecution, qi, srcIndex);
-			WaitOnSlot(qi, srcIndex, val);
+			if (args.batchTraceEnabled) {
+				spdlog::info(
+					"RenderGraph: frame {} batch {} slot {} enqueue wait phase=BeforeExecution srcSlot={} value={}",
+					static_cast<unsigned>(args.context.frameIndex), args.batchIndex, qi, srcIndex, val);
+			}
+			WaitOnSlot(qi, srcIndex, val, fmt::format("batch={} phase=BeforeExecution", args.batchIndex));
 		}
 
 		// Split after transitions if needed
@@ -8013,7 +8056,12 @@ namespace {
 				continue;
 			UINT64 val = fenceOffset + batch.GetQueueWaitFenceValue(
 				RenderGraph::BatchWaitPhase::BeforeAfterPasses, qi, srcIndex);
-			WaitOnSlot(qi, srcIndex, val);
+			if (args.batchTraceEnabled) {
+				spdlog::info(
+					"RenderGraph: frame {} batch {} slot {} enqueue wait phase=BeforeAfterPasses srcSlot={} value={}",
+					static_cast<unsigned>(args.context.frameIndex), args.batchIndex, qi, srcIndex, val);
+			}
+			WaitOnSlot(qi, srcIndex, val, fmt::format("batch={} phase=BeforeAfterPasses", args.batchIndex));
 		}
 
 		// Record post-transitions
@@ -8083,13 +8131,23 @@ namespace {
 			if (entry.resource->HasLayout()) {
 				rhi::TextureBarrier barrier{};
 				barrier.texture = apiResource.GetHandle();
-				barrier.range = { 0, entry.resource->GetMipLevels(), 0, entry.resource->GetArraySize() };
-				barrier.beforeSync = entry.state.sync;
-				barrier.afterSync = acquire ? entry.state.sync : rhi::ResourceSyncState::All;
-				barrier.beforeAccess = entry.state.access;
-				barrier.afterAccess = acquire ? entry.state.access : rhi::ResourceAccessType::Common;
-				barrier.beforeLayout = entry.state.layout;
-				barrier.afterLayout = acquire ? entry.state.layout : rhi::ResourceLayout::Common;
+				const auto resolvedRange = ResolveRangeSpec(
+					entry.range,
+					entry.resource->GetMipLevels(),
+					entry.resource->GetArraySize());
+				barrier.range = {
+					resolvedRange.firstMip,
+					resolvedRange.mipCount,
+					resolvedRange.firstSlice,
+					resolvedRange.sliceCount };
+				barrier.beforeSync = acquire ? rhi::ResourceSyncState::All : entry.state.sync;
+				barrier.afterSync = rhi::ResourceSyncState::All;
+				barrier.beforeAccess = acquire ? rhi::ResourceAccessType::Common : entry.state.access;
+				barrier.afterAccess = rhi::ResourceAccessType::Common;
+				barrier.beforeLayout = acquire
+					? (entry.initialFromUndefined ? rhi::ResourceLayout::Undefined : rhi::ResourceLayout::Common)
+					: entry.state.layout;
+				barrier.afterLayout = rhi::ResourceLayout::Common;
 				barrier.externalOwnership = acquire
 					? rhi::TextureBarrier::ExternalOwnership::Acquire
 					: rhi::TextureBarrier::ExternalOwnership::Release;
@@ -8098,10 +8156,10 @@ namespace {
 			else {
 				rhi::BufferBarrier barrier{};
 				barrier.buffer = apiResource.GetHandle();
-				barrier.beforeSync = entry.state.sync;
-				barrier.afterSync = acquire ? entry.state.sync : rhi::ResourceSyncState::All;
-				barrier.beforeAccess = entry.state.access;
-				barrier.afterAccess = acquire ? entry.state.access : rhi::ResourceAccessType::Common;
+				barrier.beforeSync = acquire ? rhi::ResourceSyncState::All : entry.state.sync;
+				barrier.afterSync = rhi::ResourceSyncState::All;
+				barrier.beforeAccess = acquire ? rhi::ResourceAccessType::Common : entry.state.access;
+				barrier.afterAccess = rhi::ResourceAccessType::Common;
 				barrier.externalOwnership = acquire
 					? rhi::BufferBarrier::ExternalOwnership::Acquire
 					: rhi::BufferBarrier::ExternalOwnership::Release;
@@ -8134,6 +8192,19 @@ namespace {
 
 		uint8_t clIndex = 0;
 		rhi::CommandList commandList = sched.preallocatedCLs[clIndex].list.Get();
+
+		// Ownership must be acquired before any ordinary layout/access transition
+		// touches the destination representation. Acquiring at pass execution time
+		// was too late because pre-transitions are recorded first.
+		for (auto& passVariant : batch.Passes(qi)) {
+			std::visit([&](auto* passEntry) {
+				RecordExternalOwnershipBarriers(
+					passEntry->externalAcquires,
+					args.context.backendInstance,
+					true,
+					commandList);
+			}, passVariant);
+		}
 
 		// Record pre-transitions
 		auto& preTransitions = batch.Transitions(qi, RenderGraph::BatchTransitionPhase::BeforePasses);
@@ -8176,7 +8247,6 @@ namespace {
 						passName);
 				}
 				rhi::debug::Scope scope(commandList, rhi::colors::Mint, passName.data());
-				RecordExternalOwnershipBarriers(pr.externalAcquires, args.context.backendInstance, true, commandList);
 				args.context.currentPassName = passName.data();
 				args.context.currentTechniquePath = techniquePath;
 				(void)rhi::debug::SetInstrumentationContext(commandList, args.context.currentPassName, args.context.currentTechniquePath);
@@ -9349,6 +9419,16 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 			for (size_t qi = 0; qi < slotCount; ++qi) {
 				auto& qs = batchSched.queues[qi];
 				if (!qs.active) continue;
+				std::string passNames;
+				auto collectNames = [&](size_t q) {
+					for (auto& pv : batch.Passes(q)) {
+						std::visit([&](auto* pr) {
+							if (!passNames.empty()) passNames += ", ";
+							passNames += pr->name;
+						}, pv);
+					}
+				};
+				for (size_t q = 0; q < slotCount; ++q) collectNames(q);
 				UINT64 highestSignal = 0;
 				for (size_t sp = 0; sp < PassBatch::kSignalPhaseCount; ++sp) {
 					if (batch.HasQueueSignal(static_cast<BatchSignalPhase>(sp), qi)) {
@@ -9360,24 +9440,33 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 					highestSignal,
 					batch.GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, qi));
 				if (highestSignal == 0) continue;
-				auto result = SlotFence(qi).HostWait(highestSignal);
+				const UINT64 completedBeforeWait = SlotFence(qi).GetCompletedValue();
+				spdlog::info(
+					"[HeavyDebug] drain begin frame={} batch={} queueSlot={} queue={} target={} completed={} passes=[{}]",
+					static_cast<unsigned>(context.frameIndex),
+					batchIndex,
+					qi,
+					QueueKindToString(m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(static_cast<uint8_t>(qi)))),
+					highestSignal,
+					completedBeforeWait,
+					passNames);
+				// Heavy debug is a fault-isolation mode. Do not wait forever: a
+				// missing GPU signal must leave an actionable batch/pass diagnostic.
+				auto result = SlotFence(qi).HostWait(highestSignal, 30000);
 				DeviceManager::GetInstance().GetDevice().CheckDebugMessages();
 				if (rhi::Failed(result)) {
-					std::string passNames;
-					auto collectNames = [&](size_t q) {
-						for (auto& pv : batch.Passes(q)) {
-							std::visit([&](auto* pr) {
-								if (!passNames.empty()) passNames += ", ";
-								passNames += pr->name;
-							}, pv);
-						}
-					};
-					for (size_t q = 0; q < slotCount; ++q) collectNames(q);
 					spdlog::error(
-						"[HeavyDebug] GPU fault after batch {} on queue slot {}. "
-						"Passes in batch: [{}]",
-						batchIndex, qi, passNames);
+						"[HeavyDebug] GPU drain failed frame={} batch={} queueSlot={} target={} completed={} result={}. Passes=[{}]",
+						static_cast<unsigned>(context.frameIndex), batchIndex, qi, highestSignal,
+						SlotFence(qi).GetCompletedValue(), rhi::ResultName(result), passNames);
+					throw std::runtime_error(fmt::format(
+						"Heavy-debug GPU drain failed after batch {} on queue slot {} (target {}, passes [{}])",
+						batchIndex, qi, highestSignal, passNames));
 				}
+				spdlog::info(
+					"[HeavyDebug] drain end frame={} batch={} queueSlot={} target={} completed={}",
+					static_cast<unsigned>(context.frameIndex), batchIndex, qi, highestSignal,
+					SlotFence(qi).GetCompletedValue());
 			}
 			++batchIndex;
 		}
@@ -10432,9 +10521,23 @@ CopyPassBuilder& RenderGraph::GetOrCreateCopyPassBuilder(std::string const& name
 //}
 
 QueueSlotIndex RenderGraph::CreateQueue(QueueKind kind, const char* name, QueueAutoAssignmentPolicy autoAssignmentPolicy) {
-	auto device = DeviceManager::GetInstance().GetDevice();
+	const char* logicalName = name ? name : "UserQueue";
+	const auto existing = m_queueRegistry.FindNamedOwnedSlot(kind, logicalName);
+	if (ToUnderlying(existing) != 0xFF) {
+		if (m_queueRegistry.GetAutoAssignmentPolicy(existing) != autoAssignmentPolicy) {
+			throw std::runtime_error(fmt::format(
+				"Queue '{}' was recreated with a different automatic scheduling policy",
+				logicalName));
+		}
+		return existing;
+	}
+	auto& deviceManager = DeviceManager::GetInstance();
+	auto device = deviceManager.GetDevice();
+	const rhi::Backend backend = m_backendDevices.empty()
+		? rhi::Backend::Null
+		: m_backendDevices.front().backend;
 	rhi::Queue queue;
-	auto result = device.CreateQueue(static_cast<rhi::QueueKind>(kind), name ? name : "UserQueue", queue);
+	auto result = device.CreateQueue(static_cast<rhi::QueueKind>(kind), logicalName, queue);
 	if (result != rhi::Result::Ok) {
 		throw std::runtime_error(fmt::format(
 			"Failed to create queue '{}' for kind {}: {}",
@@ -10449,7 +10552,13 @@ QueueSlotIndex RenderGraph::CreateQueue(QueueKind kind, const char* name, QueueA
 		if (m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(static_cast<uint8_t>(i))) == kind)
 			++instance;
 	}
-	return m_queueRegistry.Register({ kind, instance }, queue, device, autoAssignmentPolicy, true);
+	return m_queueRegistry.Register(
+		{ kind, instance, BackendInstanceId::Primary, backend },
+		queue,
+		device,
+		autoAssignmentPolicy,
+		true,
+		logicalName);
 }
 
 void RenderGraph::SetMinimumAutomaticSchedulingQueues(QueueKind kind, uint8_t count) {

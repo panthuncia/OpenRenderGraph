@@ -170,6 +170,20 @@ void GpuTextureBacking::initialize(const TextureDescription& desc,
 	}
 
 	auto device = DeviceManager::GetInstance().GetDevice();
+	// Vulkan images are born in UNDEFINED (the only other legal initial layout is
+	// PREINITIALIZED for linear host-written images).  ResourceLayout::Common is
+	// a useful D3D12 creation state, but treating it as GENERAL in Vulkan's
+	// symbolic tracker skips the first real layout transition and makes uploads
+	// submit an image that validation still knows is UNDEFINED.
+	rhi::VulkanDeviceInfo vulkanDeviceInfo{};
+	const bool vulkanInitialUndefined = rhi::QueryNativeDevice(
+		device,
+		rhi::RHI_IID_VK_DEVICE,
+		&vulkanDeviceInfo,
+		sizeof(vulkanDeviceInfo));
+	if (vulkanInitialUndefined) {
+		textureDesc.texture.initialLayout = rhi::ResourceLayout::Undefined;
+	}
 
 	rhi::ResourceAllocationInfo allocInfo;
 	device.GetResourceAllocationInfo(&textureDesc, 1, &allocInfo);
@@ -240,12 +254,16 @@ void GpuTextureBacking::initialize(const TextureDescription& desc,
 	wholeRange.mipUpper = { BoundType::All, 0 };
 	wholeRange.sliceLower = { BoundType::All, 0 };
 	wholeRange.sliceUpper = { BoundType::All, 0 };
-	const bool startsInCommon = desc.initialLayout == rhi::ResourceLayout::Common;
+	const bool startsInCommon =
+		desc.initialLayout == rhi::ResourceLayout::Common && !vulkanInitialUndefined;
+	const rhi::ResourceLayout trackedInitialLayout = vulkanInitialUndefined
+		? rhi::ResourceLayout::Undefined
+		: desc.initialLayout;
 	m_stateTracker = SymbolicTracker(
 		wholeRange,
 		ResourceState{
 			startsInCommon ? rhi::ResourceAccessType::Common : rhi::ResourceAccessType::None,
-			desc.initialLayout,
+			trackedInitialLayout,
 			startsInCommon ? rhi::ResourceSyncState::All : rhi::ResourceSyncState::None });
 
 	size_t subCount = m_mipLevels * m_arraySize;
