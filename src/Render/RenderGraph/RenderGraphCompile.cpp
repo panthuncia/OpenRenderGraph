@@ -724,18 +724,21 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 					summary.preferredQueueKind = passResources.preferredQueueKind;
 					summary.queueAssignmentPolicy = passResources.queueAssignmentPolicy;
 					summary.pinnedQueueSlot = passResources.pinnedQueueSlot;
+					summary.backendAffinity = passResources.backendAffinity;
 				}
 				else if (!reuseSummary && pass.type == PassType::Compute) {
 					const auto& passResources = std::get<ComputePassAndResources>(pass.pass).resources;
 					summary.preferredQueueKind = passResources.preferredQueueKind;
 					summary.queueAssignmentPolicy = passResources.queueAssignmentPolicy;
 					summary.pinnedQueueSlot = passResources.pinnedQueueSlot;
+					summary.backendAffinity = passResources.backendAffinity;
 				}
 				else if (!reuseSummary && pass.type == PassType::Copy) {
 					const auto& passResources = std::get<CopyPassAndResources>(pass.pass).resources;
 					summary.preferredQueueKind = passResources.preferredQueueKind;
 					summary.queueAssignmentPolicy = passResources.queueAssignmentPolicy;
 					summary.pinnedQueueSlot = passResources.pinnedQueueSlot;
+					summary.backendAffinity = passResources.backendAffinity;
 				}
 
 				if (reuseSummary) {
@@ -1117,18 +1120,21 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 			summary.preferredQueueKind = passResources.preferredQueueKind;
 			summary.queueAssignmentPolicy = passResources.queueAssignmentPolicy;
 			summary.pinnedQueueSlot = passResources.pinnedQueueSlot;
+			summary.backendAffinity = passResources.backendAffinity;
 		}
 		else if (pass.type == PassType::Compute) {
 			const auto& passResources = std::get<ComputePassAndResources>(pass.pass).resources;
 			summary.preferredQueueKind = passResources.preferredQueueKind;
 			summary.queueAssignmentPolicy = passResources.queueAssignmentPolicy;
 			summary.pinnedQueueSlot = passResources.pinnedQueueSlot;
+			summary.backendAffinity = passResources.backendAffinity;
 		}
 		else if (pass.type == PassType::Copy) {
 			const auto& passResources = std::get<CopyPassAndResources>(pass.pass).resources;
 			summary.preferredQueueKind = passResources.preferredQueueKind;
 			summary.queueAssignmentPolicy = passResources.queueAssignmentPolicy;
 			summary.pinnedQueueSlot = passResources.pinnedQueueSlot;
+			summary.backendAffinity = passResources.backendAffinity;
 		}
 
 		if (!view.reqs.empty()) {
@@ -2013,6 +2019,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				SetImmediateFrameRequirements(immediatePassAndResources.resources, std::move(immediateFrameData.requirements));
 				immediatePassAndResources.resources.preferredQueueKind = p.resources.preferredQueueKind;
 				immediatePassAndResources.resources.pinnedQueueSlot = p.resources.pinnedQueueSlot;
+				immediatePassAndResources.resources.backendAffinity = p.resources.backendAffinity;
 				immediatePassAndResources.immediateBytecode = std::move(immediateFrameData.bytecode);
 				immediatePassAndResources.immediateKeepAlive = std::move(immediateFrameData.keepAlive);
 				immediatePassAndResources.run = PassRunMask::Immediate;
@@ -2076,6 +2083,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				SetImmediateFrameRequirements(immediatePassAndResources.resources, std::move(immediateFrameData.requirements));
 				immediatePassAndResources.resources.preferredQueueKind = p.resources.preferredQueueKind;
 				immediatePassAndResources.resources.pinnedQueueSlot = p.resources.pinnedQueueSlot;
+				immediatePassAndResources.resources.backendAffinity = p.resources.backendAffinity;
 				immediatePassAndResources.immediateBytecode = std::move(immediateFrameData.bytecode);
 				immediatePassAndResources.immediateKeepAlive = std::move(immediateFrameData.keepAlive);
 				immediatePassAndResources.run = PassRunMask::Immediate;
@@ -2139,6 +2147,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				SetImmediateFrameRequirements(immediatePassAndResources.resources, std::move(immediateFrameData.requirements));
 				immediatePassAndResources.resources.preferredQueueKind = p.resources.preferredQueueKind;
 				immediatePassAndResources.resources.pinnedQueueSlot = p.resources.pinnedQueueSlot;
+				immediatePassAndResources.resources.backendAffinity = p.resources.backendAffinity;
 				immediatePassAndResources.immediateBytecode = std::move(immediateFrameData.bytecode);
 				immediatePassAndResources.immediateKeepAlive = std::move(immediateFrameData.keepAlive);
 				immediatePassAndResources.run = PassRunMask::Immediate;
@@ -2843,6 +2852,16 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		traceCompileStep("AutoScheduleAndBuildBatches");
 		BT_ZONE_SCOPE("RenderGraph::CompileFrame::AutoScheduleAndBuildBatches");
 		AutoScheduleAndBuildBatches(*this, m_framePasses, nodes);
+	}
+	{
+		traceCompileStep("MaterializeMultiBackendRepresentations");
+		BT_ZONE_SCOPE("RenderGraph::CompileFrame::MaterializeMultiBackendRepresentations");
+		MaterializeMultiBackendRepresentations();
+	}
+	{
+		traceCompileStep("PlanMultiBackendOwnershipTransfers");
+		BT_ZONE_SCOPE("RenderGraph::CompileFrame::PlanMultiBackendOwnershipTransfers");
+		PlanMultiBackendOwnershipTransfers();
 	}
 	{
 		traceCompileStep("ApplyAliasQueueSynchronization");

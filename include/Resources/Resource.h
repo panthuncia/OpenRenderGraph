@@ -5,12 +5,14 @@
 #include <memory>
 #include <functional>
 #include <mutex>
+#include <unordered_map>
 
 #include <resource_states.h>
 #include <rhi.h>
 #include <flecs.h>
 
 #include "Resources/ResourceStateTracker.h"
+#include "Render/QueueKind.h"
 
 
 namespace org {
@@ -179,6 +181,38 @@ public:
     const std::string& GetName() const { return name; }
     virtual void SetName(const std::string& newName) { this->name = newName; OnSetName(); }
 	virtual rhi::Resource GetAPIResource() = 0;
+	virtual rhi::Resource GetAPIResource(BackendInstanceId backendInstance) {
+		std::scoped_lock lock(m_representationMutex);
+		const auto it = m_representations.find(static_cast<uint8_t>(backendInstance));
+		if (it != m_representations.end()) return it->second->resource.Get();
+		return backendInstance == BackendInstanceId::Primary ? GetAPIResource() : rhi::Resource{};
+	}
+	bool AttachAPIRepresentation(BackendInstanceId backendInstance, rhi::ResourcePtr resource,
+		ResourceState initialState = { rhi::ResourceAccessType::None, rhi::ResourceLayout::Undefined, rhi::ResourceSyncState::None }) {
+		if (!resource) return false;
+		RangeSpec wholeRange{};
+		auto representation = std::make_unique<AdditionalRepresentation>();
+		representation->resource = std::move(resource);
+		representation->tracker = SymbolicTracker(wholeRange, initialState);
+		std::scoped_lock lock(m_representationMutex);
+		m_representations[static_cast<uint8_t>(backendInstance)] = std::move(representation);
+		return true;
+	}
+	bool HasAPIRepresentation(BackendInstanceId backendInstance) {
+		return GetAPIResource(backendInstance).IsValid();
+	}
+	std::vector<BackendInstanceId> GetRepresentationInstances() const {
+		std::vector<BackendInstanceId> result{ BackendInstanceId::Primary };
+		std::scoped_lock lock(m_representationMutex);
+		for (const auto& [id, representation] : m_representations) {
+			if (representation && representation->resource) result.push_back(static_cast<BackendInstanceId>(id));
+		}
+		return result;
+	}
+	void ClearAPIRepresentations() {
+		std::scoped_lock lock(m_representationMutex);
+		m_representations.clear();
+	}
     virtual uint64_t GetGlobalResourceID() const { return m_globalResourceID; }
 	// Identity used by render-graph scheduling. Dynamic wrappers override this so
 	// dependency identity remains stable when their backing resource changes.
@@ -186,7 +220,34 @@ public:
 	GraphOwnership GetGraphOwnership() const noexcept { return m_graphOwnership; }
 	void SetGraphOwnership(GraphOwnership ownership) noexcept { m_graphOwnership = ownership; }
 	bool IsRenderGraphManaged() const noexcept { return m_graphOwnership == GraphOwnership::GraphManaged; }
-    virtual rhi::BarrierBatch GetEnhancedBarrierGroup(RangeSpec range, rhi::ResourceAccessType prevAccessType, rhi::ResourceAccessType newAccessType, rhi::ResourceLayout prevLayout, rhi::ResourceLayout newLayout, rhi::ResourceSyncState prevSyncState, rhi::ResourceSyncState newSyncState) = 0;
+	virtual rhi::BarrierBatch GetEnhancedBarrierGroup(RangeSpec range, rhi::ResourceAccessType prevAccessType, rhi::ResourceAccessType newAccessType, rhi::ResourceLayout prevLayout, rhi::ResourceLayout newLayout, rhi::ResourceSyncState prevSyncState, rhi::ResourceSyncState newSyncState) = 0;
+	virtual rhi::BarrierBatch GetEnhancedBarrierGroup(BackendInstanceId backendInstance, RangeSpec range,
+		rhi::ResourceAccessType prevAccessType, rhi::ResourceAccessType newAccessType,
+		rhi::ResourceLayout prevLayout, rhi::ResourceLayout newLayout,
+		rhi::ResourceSyncState prevSyncState, rhi::ResourceSyncState newSyncState) {
+		std::unique_lock lock(m_representationMutex);
+		auto it = m_representations.find(static_cast<uint8_t>(backendInstance));
+		if (it == m_representations.end()) {
+			lock.unlock();
+			return backendInstance == BackendInstanceId::Primary ? GetEnhancedBarrierGroup(
+				range, prevAccessType, newAccessType, prevLayout, newLayout, prevSyncState, newSyncState) : rhi::BarrierBatch{};
+		}
+		auto& representation = *it->second;
+		if (HasLayout()) {
+			const auto resolved = ResolveRangeSpec(range, m_mipLevels, m_arraySize);
+			representation.textureBarrier = {
+				.texture = representation.resource->GetHandle(),
+				.range = { resolved.firstMip, resolved.mipCount, resolved.firstSlice, resolved.sliceCount },
+				.beforeSync = prevSyncState, .afterSync = newSyncState,
+				.beforeAccess = prevAccessType, .afterAccess = newAccessType,
+				.beforeLayout = prevLayout, .afterLayout = newLayout };
+			return { .textures = { &representation.textureBarrier, 1 } };
+		}
+		representation.bufferBarrier = { .buffer = representation.resource->GetHandle(), .offset = 0, .size = ~0ull,
+			.beforeSync = prevSyncState, .afterSync = newSyncState,
+			.beforeAccess = prevAccessType, .afterAccess = newAccessType };
+		return { .buffers = { &representation.bufferBarrier, 1 } };
+	}
 	bool HasLayout() const { return m_hasLayout; }
 	void AddAliasedResource(Resource* resource) {
 		m_aliasedResources.push_back(resource);
@@ -206,6 +267,14 @@ public:
 	}
 
 	virtual SymbolicTracker* GetStateTracker() = 0;
+	virtual SymbolicTracker* GetStateTracker(BackendInstanceId backendInstance) {
+		std::scoped_lock lock(m_representationMutex);
+		const auto it = m_representations.find(static_cast<uint8_t>(backendInstance));
+		if (it != m_representations.end()) return &it->second->tracker;
+		return backendInstance == BackendInstanceId::Primary ? GetStateTracker() : nullptr;
+	}
+	virtual bool TryGetRHIResourceDesc(rhi::ResourceDesc& outDesc) const { (void)outDesc; return false; }
+	virtual void RefreshAPIRepresentationDescriptors(BackendInstanceId) {}
 
 	// Optional capability: buffer-like resources can expose a byte size for generic readback/copy operations.
 	// This avoids relying on a specific concrete C++ type (e.g. Buffer vs DynamicBuffer).
@@ -225,6 +294,14 @@ protected:
 	unsigned int m_arraySize = 1;
 
 private:
+	struct AdditionalRepresentation {
+		rhi::ResourcePtr resource;
+		SymbolicTracker tracker;
+		rhi::BufferBarrier bufferBarrier{};
+		rhi::TextureBarrier textureBarrier{};
+	};
+	mutable std::mutex m_representationMutex;
+	std::unordered_map<uint8_t, std::unique_ptr<AdditionalRepresentation>> m_representations;
     bool m_uploadInProgress = false;
     inline static std::atomic<uint64_t> globalResourceCount;
 	inline static ECSEntityHooks s_ecsEntityHooks{};

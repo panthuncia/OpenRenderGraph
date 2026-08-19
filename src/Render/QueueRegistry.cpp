@@ -3,6 +3,11 @@
 
 #include <string>
 #include <spdlog/spdlog.h>
+#include <rhi_interop_dx12.h>
+#include <rhi_interop_vulkan.h>
+#ifdef _WIN32
+#include <Windows.h>
+#endif
 
 
 namespace org {
@@ -28,6 +33,7 @@ QueueSlotIndex QueueRegistry::Register(QueueSlot slot, rhi::Queue queue, rhi::De
 QueueSlotIndex QueueRegistry::Register(QueueSlot slot, rhi::Queue queue, rhi::TimelinePtr fence, std::unique_ptr<CommandListPool> pool, QueueAutoAssignmentPolicy autoAssignmentPolicy, bool ownsQueue, rhi::Device device) {
 	auto idx = static_cast<QueueSlotIndex>(static_cast<uint8_t>(m_slots.size()));
 	const std::string queueName = "ORG QueueSlot " + std::to_string(static_cast<uint8_t>(idx)) +
+		" backend=" + std::to_string(static_cast<uint8_t>(slot.backendInstance)) +
 		" " + QueueKindDebugName(slot.kind) + ":" + std::to_string(slot.instance);
 	if (queue) {
 		queue.SetName(queueName.c_str());
@@ -43,13 +49,45 @@ QueueSlotIndex QueueRegistry::Register(QueueSlot slot, rhi::Queue queue, rhi::Ti
 		const std::string fenceName = queueName + " Fence";
 		fence->SetName(fenceName.c_str());
 	}
-	m_slots.push_back({ slot.kind, slot.instance, queue, ownsQueue ? device : rhi::Device{}, std::move(fence), std::move(pool), autoAssignmentPolicy, ownsQueue, 1 });
+	m_slots.push_back({ slot.kind, slot.instance, slot.backendInstance, slot.backend, queue, device, std::move(fence), {}, std::move(pool), autoAssignmentPolicy, ownsQueue, 1 });
 	return idx;
+}
+
+rhi::Result QueueRegistry::EnableD3D12VulkanInterop(rhi::Device d3d12Device, rhi::Device vulkanDevice) {
+#ifdef _WIN32
+	if (!d3d12Device || !vulkanDevice) return rhi::Result::InvalidArgument;
+	for (size_t i = 0; i < m_slots.size(); ++i) {
+		auto& slot = m_slots[i];
+		if (slot.backend != rhi::Backend::D3D12 && slot.backend != rhi::Backend::Vulkan) continue;
+		rhi::TimelinePtr d3dFence;
+		auto result = d3d12Device.CreateTimeline(d3dFence, 0, "ORG Multi-RHI Bridge Fence", true);
+		if (rhi::Failed(result)) return result;
+		rhi::dx12::SharedHandle shared{};
+		result = rhi::dx12::export_shared_timeline(d3d12Device, d3dFence.Get(), shared);
+		if (rhi::Failed(result)) return result;
+		rhi::TimelinePtr vkFence;
+		result = rhi::vulkan::import_d3d12_timeline(vulkanDevice, shared.value, 0, "ORG Multi-RHI Bridge Timeline", vkFence);
+		CloseHandle(static_cast<HANDLE>(shared.value));
+		if (rhi::Failed(result)) return result;
+		if (slot.backend == rhi::Backend::D3D12) {
+			slot.fence = std::move(d3dFence);
+			slot.peerFence = std::move(vkFence);
+		} else {
+			slot.fence = std::move(vkFence);
+			slot.peerFence = std::move(d3dFence);
+		}
+		slot.fenceValue = 1;
+	}
+	return rhi::Result::Ok;
+#else
+	(void)d3d12Device; (void)vulkanDevice;
+	return rhi::Result::Unsupported;
+#endif
 }
 
 QueueSlotIndex QueueRegistry::FindSlot(QueueSlot slot) const {
 	for (size_t i = 0; i < m_slots.size(); ++i) {
-		if (m_slots[i].kind == slot.kind && m_slots[i].instance == slot.instance)
+		if (m_slots[i].kind == slot.kind && m_slots[i].instance == slot.instance && m_slots[i].backendInstance == slot.backendInstance)
 			return static_cast<QueueSlotIndex>(static_cast<uint8_t>(i));
 	}
 	return static_cast<QueueSlotIndex>(0xFF);
@@ -57,7 +95,7 @@ QueueSlotIndex QueueRegistry::FindSlot(QueueSlot slot) const {
 
 bool QueueRegistry::HasSlot(QueueSlot slot) const {
 	for (auto& s : m_slots) {
-		if (s.kind == slot.kind && s.instance == slot.instance) return true;
+		if (s.kind == slot.kind && s.instance == slot.instance && s.backendInstance == slot.backendInstance) return true;
 	}
 	return false;
 }

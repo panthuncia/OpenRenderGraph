@@ -418,11 +418,37 @@ bool BufferBase::TryGetBufferByteSize(uint64_t& outByteSize) const {
     return true;
 }
 
+bool BufferBase::TryGetRHIResourceDesc(rhi::ResourceDesc& outDesc) const {
+	outDesc = rhi::helpers::ResourceDesc::Buffer(m_bufferSize, m_accessType);
+	if (m_unorderedAccess) outDesc.resourceFlags |= rhi::ResourceFlags::RF_AllowUnorderedAccess;
+	return m_bufferSize != 0;
+}
+
+void BufferBase::RefreshAPIRepresentationDescriptors(BackendInstanceId backendInstance) {
+	if (backendInstance == BackendInstanceId::Primary || !m_descriptorRequirements.has_value()) return;
+	auto resource = Resource::GetAPIResource(backendInstance);
+	if (!resource) return;
+	EnsureVirtualDescriptorSlotsAllocated();
+	DescriptorHeapManager::ViewRequirements req{};
+	DescriptorHeapManager::ViewRequirements::BufferViews views{};
+	views.createCBV = m_descriptorRequirements->createCBV;
+	views.createSRV = m_descriptorRequirements->createSRV;
+	views.createUAV = m_descriptorRequirements->createUAV;
+	views.createNonShaderVisibleUAV = m_descriptorRequirements->createNonShaderVisibleUAV;
+	views.cbvDesc = m_descriptorRequirements->cbvDesc;
+	views.srvDesc = m_descriptorRequirements->srvDesc;
+	views.uavDesc = m_descriptorRequirements->uavDesc;
+	views.uavCounterOffset = m_descriptorRequirements->uavCounterOffset;
+	req.views = views;
+	DescriptorHeapManager::GetInstance().UpdateDescriptorContents(*this, resource, req, backendInstance);
+}
+
 void BufferBase::ConfigureBacking(
     rhi::HeapType accessType,
     uint64_t bufferSize,
     bool unorderedAccess)
 {
+	ClearAPIRepresentations();
     m_accessType = accessType;
     m_bufferSize = bufferSize;
     m_unorderedAccess = unorderedAccess;
@@ -449,6 +475,7 @@ uint64_t BufferBase::GetBackingGeneration() const {
 }
 
 void BufferBase::Materialize(const MaterializeOptions* options) {
+	ClearAPIRepresentations();
     if (m_dataBuffer) {
         return;
     }
@@ -481,6 +508,7 @@ void BufferBase::Materialize(const MaterializeOptions* options) {
 }
 
 void BufferBase::Dematerialize() {
+	ClearAPIRepresentations();
     if (!m_dataBuffer) {
         return;
     }
@@ -612,6 +640,7 @@ void BufferBase::UnregisterUploadPolicyClient() {
 }
 
 void BufferBase::SetBacking(std::unique_ptr<GpuBufferBacking> backing, uint64_t bufferSize) {
+	ClearAPIRepresentations();
     if (m_dataBuffer && !IsBackingMutationAllowedOnThisThread()) {
         std::ostringstream threadId;
         threadId << std::this_thread::get_id();

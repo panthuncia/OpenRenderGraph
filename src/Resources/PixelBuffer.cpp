@@ -1,6 +1,7 @@
 #include "Resources/PixelBuffer.h"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <stdexcept>
 
@@ -160,7 +161,47 @@ SymbolicTracker* PixelBuffer::GetStateTracker() {
     return m_backing->GetStateTracker();
 }
 
+bool PixelBuffer::TryGetRHIResourceDesc(rhi::ResourceDesc& outDesc) const {
+	if (m_desc.imageDimensions.empty() || m_desc.type != rhi::ResourceType::Texture2D || m_desc.sampleCount != 1 || m_desc.hasDSV) return false;
+	const uint32_t arraySize = m_desc.isCubemap ? 6u * m_desc.arraySize : (m_desc.isArray ? m_desc.arraySize : 1u);
+	uint32_t width = m_desc.imageDimensions[0].width;
+	uint32_t height = m_desc.imageDimensions[0].height;
+	if (m_desc.padInternalResolution) {
+		width = (std::max)(1u, static_cast<uint32_t>(std::bit_ceil(width)));
+		height = (std::max)(1u, static_cast<uint32_t>(std::bit_ceil(height)));
+	}
+	outDesc = {};
+	outDesc.type = rhi::ResourceType::Texture2D;
+	outDesc.heapType = rhi::HeapType::DeviceLocal;
+	outDesc.texture.format = m_desc.format;
+	outDesc.texture.width = width;
+	outDesc.texture.height = height;
+	outDesc.texture.depthOrLayers = static_cast<uint16_t>(arraySize);
+	outDesc.texture.mipLevels = static_cast<uint16_t>(m_desc.generateMipMaps
+		? org::util::CalculateMipLevels(width, height)
+		: (m_desc.imageDimensions.size() > arraySize ? m_desc.imageDimensions.size() / arraySize : 1));
+	outDesc.texture.sampleCount = 1;
+	outDesc.texture.initialLayout = rhi::ResourceLayout::Undefined;
+	if (m_desc.hasRTV) outDesc.resourceFlags |= rhi::ResourceFlags::RF_AllowRenderTarget;
+	if (m_desc.hasUAV) outDesc.resourceFlags |= rhi::ResourceFlags::RF_AllowUnorderedAccess;
+	return outDesc.texture.format != rhi::Format::Unknown;
+}
+
+void PixelBuffer::RefreshAPIRepresentationDescriptors(BackendInstanceId backendInstance) {
+	if (backendInstance == BackendInstanceId::Primary) return;
+	auto resource = Resource::GetAPIResource(backendInstance);
+	if (!resource) return;
+	EnsureVirtualDescriptorSlotsAllocated();
+	DescriptorHeapManager::ViewRequirements views;
+	const uint16_t mipLevels = m_mipLevels ? static_cast<uint16_t>(m_mipLevels) : ResolveTextureMipLevels(m_desc);
+	const uint32_t arraySize = m_arraySize ? m_arraySize : (m_desc.isCubemap
+		? 6u * m_desc.arraySize : (m_desc.isArray ? m_desc.arraySize : 1u));
+	views.views = BuildTextureViewRequirements(m_desc, mipLevels, arraySize);
+	DescriptorHeapManager::GetInstance().UpdateDescriptorContents(*this, resource, views, backendInstance);
+}
+
 void PixelBuffer::Materialize(const MaterializeOptions* options) {
+	ClearAPIRepresentations();
     std::scoped_lock lock(m_materializationMutex);
     if (m_backing) {
         return;
@@ -206,6 +247,7 @@ void PixelBuffer::Materialize(const MaterializeOptions* options) {
 }
 
 void PixelBuffer::Dematerialize() {
+	ClearAPIRepresentations();
     std::scoped_lock lock(m_materializationMutex);
     if (!m_backing) {
         return;

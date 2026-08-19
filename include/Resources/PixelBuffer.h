@@ -78,6 +78,8 @@ public:
     void ApplyMetadataComponentBundle(const EntityComponentBundle& bundle) const;
 
     SymbolicTracker* GetStateTracker() override;
+	bool TryGetRHIResourceDesc(rhi::ResourceDesc& outDesc) const override;
+	void RefreshAPIRepresentationDescriptors(BackendInstanceId backendInstance) override;
 
     bool IsMaterialized() const override {
         return m_backing != nullptr;

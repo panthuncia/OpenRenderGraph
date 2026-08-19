@@ -36,6 +36,7 @@ struct CopyPassParameters {
 	QueueKind preferredQueueKind = QueueKind::Copy;
 	QueueAssignmentPolicy queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
 	std::optional<QueueSlotIndex> pinnedQueueSlot; // Target a specific queue slot instead of using preferredQueueKind
+	BackendAffinity backendAffinity{};
 };
 
 class CopyPassBuilder;

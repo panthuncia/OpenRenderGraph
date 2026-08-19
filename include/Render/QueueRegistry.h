@@ -20,8 +20,10 @@ enum class QueueAutoAssignmentPolicy : uint8_t {
 struct QueueSlot {
 	QueueKind kind{};
 	uint8_t instance{};
+	BackendInstanceId backendInstance = BackendInstanceId::Primary;
+	rhi::Backend backend = rhi::Backend::Null;
 
-	bool operator==(const QueueSlot& o) const noexcept { return kind == o.kind && instance == o.instance; }
+	bool operator==(const QueueSlot& o) const noexcept { return kind == o.kind && instance == o.instance && backendInstance == o.backendInstance; }
 	bool operator!=(const QueueSlot& o) const noexcept { return !(*this == o); }
 };
 
@@ -61,7 +63,10 @@ public:
 
 	QueueKind      GetKind(QueueSlotIndex i)     const noexcept { return m_slots[ToUnderlying(i)].kind; }
 	uint8_t        GetInstance(QueueSlotIndex i)  const noexcept { return m_slots[ToUnderlying(i)].instance; }
-	QueueSlot      GetSlot(QueueSlotIndex i)      const noexcept { return { m_slots[ToUnderlying(i)].kind, m_slots[ToUnderlying(i)].instance }; }
+	BackendInstanceId GetBackendInstance(QueueSlotIndex i) const noexcept { return m_slots[ToUnderlying(i)].backendInstance; }
+	rhi::Backend GetBackend(QueueSlotIndex i) const noexcept { return m_slots[ToUnderlying(i)].backend; }
+	rhi::Device GetDevice(QueueSlotIndex i) const noexcept { return m_slots[ToUnderlying(i)].device; }
+	QueueSlot      GetSlot(QueueSlotIndex i)      const noexcept { return { m_slots[ToUnderlying(i)].kind, m_slots[ToUnderlying(i)].instance, m_slots[ToUnderlying(i)].backendInstance, m_slots[ToUnderlying(i)].backend }; }
 	rhi::Queue     GetQueue(QueueSlotIndex i)     const noexcept { return m_slots[ToUnderlying(i)].queue; }
 	QueueAutoAssignmentPolicy GetAutoAssignmentPolicy(QueueSlotIndex i) const noexcept { return m_slots[ToUnderlying(i)].autoAssignmentPolicy; }
 	bool IsAutoAssignable(QueueSlotIndex i) const noexcept { return GetAutoAssignmentPolicy(i) == QueueAutoAssignmentPolicy::AllowAutomaticScheduling; }
@@ -69,6 +74,15 @@ public:
 	const rhi::Timeline& GetFence(QueueSlotIndex i) const noexcept { return m_slots[ToUnderlying(i)].fence.Get(); }
 	rhi::TimelinePtr& GetFencePtr(QueueSlotIndex i)     noexcept { return m_slots[ToUnderlying(i)].fence; }
 	CommandListPool* GetPool(QueueSlotIndex i)    const noexcept { return m_slots[ToUnderlying(i)].pool.get(); }
+	rhi::Timeline& GetFenceForConsumer(QueueSlotIndex source, QueueSlotIndex consumer) noexcept {
+		auto& entry = m_slots[ToUnderlying(source)];
+		return GetBackend(source) == GetBackend(consumer) || !entry.peerFence ? entry.fence.Get() : entry.peerFence.Get();
+	}
+
+	/// Replaces backend-local slot fences with two API representations of the
+	/// same D3D12 fence payload. Must be called after all queues are registered
+	/// and before graph execution begins.
+	rhi::Result EnableD3D12VulkanInterop(rhi::Device d3d12Device, rhi::Device vulkanDevice);
 
 	/// Atomically retrieve and increment the per-slot fence value.
 	uint64_t GetNextFenceValue(QueueSlotIndex i) noexcept { return m_slots[ToUnderlying(i)].fenceValue++; }
@@ -99,9 +113,12 @@ private:
 	struct SlotEntry {
 		QueueKind kind{};
 		uint8_t instance{};
+		BackendInstanceId backendInstance = BackendInstanceId::Primary;
+		rhi::Backend backend = rhi::Backend::Null;
 		rhi::Queue queue{};
 		rhi::Device device{};
 		rhi::TimelinePtr fence;
+		rhi::TimelinePtr peerFence;
 		std::unique_ptr<CommandListPool> pool;
 		QueueAutoAssignmentPolicy autoAssignmentPolicy = QueueAutoAssignmentPolicy::AllowAutomaticScheduling;
 		bool ownsQueue = false;

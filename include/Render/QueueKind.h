@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <rhi.h>
 
 
 namespace org {
@@ -15,6 +16,18 @@ enum class QueueAssignmentPolicy : uint8_t {
 
 /// Dense index into queue-parallel arrays. Forward-declared here for use in pass parameters.
 enum class QueueSlotIndex : uint8_t {};
+enum class BackendInstanceId : uint8_t { Primary = 0, Peer = 1 };
+
+enum class BackendAffinityStrength : uint8_t {
+	Primary = 0,
+	Preferred,
+	Required,
+};
+
+struct BackendAffinity {
+	BackendAffinityStrength strength = BackendAffinityStrength::Primary;
+	rhi::Backend backend = rhi::Backend::Null;
+};
 
 constexpr bool IsQueueKindSupportedByRenderPass(QueueKind kind) noexcept {
 	return kind == QueueKind::Graphics;

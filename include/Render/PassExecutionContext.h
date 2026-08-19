@@ -2,15 +2,22 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <typeindex>
 #include <rhi.h>
 #include <DirectXMath.h>
 
 #include "Render/ImmediateExecution/ImmediateCommandList.h"
+#include "Render/QueueKind.h"
 #include "RenderPasses/Base/PassReturn.h"
 
 
 namespace org {
+
+class Resource;
+class SymbolicTracker;
+class GloballyIndexedResource;
+class PipelineState;
 
 struct IHostExecutionData {
 	virtual ~IHostExecutionData() = default;
@@ -44,6 +51,7 @@ struct IHasImmediateModeCommands {
 
 struct PassExecutionContext {
 	rhi::Device device;
+	BackendInstanceId backendInstance = BackendInstanceId::Primary;
 	rhi::CommandList commandList;
 	const org::imm::ImmediateDispatch* immediateDispatch = nullptr;
 	std::function<void(rhi::CommandList, rhi::Queue, const char*, const char*)> beginGpuPassRange;
@@ -57,6 +65,15 @@ struct PassExecutionContext {
 	// Values for structurally placed external-wait bindings. Bindings determine
 	// the consuming batch/queue at compile time; timeline values remain per-frame.
 	std::vector<ExternalTimelineBindingValue> externalTimelineBindings;
+	rhi::Resource Resolve(Resource& resource) const;
+	rhi::Resource Resolve(const std::shared_ptr<Resource>& resource) const;
+	SymbolicTracker* ResolveState(Resource& resource) const;
+	rhi::DescriptorHeap GetResourceDescriptorHeap() const;
+	rhi::DescriptorHeap GetSamplerDescriptorHeap() const;
+	rhi::DescriptorSlot ResolveRTV(const GloballyIndexedResource& resource, uint32_t mip = 0, uint32_t slice = 0) const;
+	rhi::DescriptorSlot ResolveDSV(const GloballyIndexedResource& resource, uint32_t mip = 0, uint32_t slice = 0) const;
+	rhi::DescriptorSlot ResolveNonShaderVisibleUAV(const GloballyIndexedResource& resource, uint32_t mip = 0, uint32_t slice = 0) const;
+	const rhi::Pipeline& ResolvePipeline(const PipelineState& pipeline) const;
 };
 
 

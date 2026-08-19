@@ -55,6 +55,7 @@ struct RenderPassParameters {
 	QueueKind preferredQueueKind = QueueKind::Graphics;
 	QueueAssignmentPolicy queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
 	std::optional<QueueSlotIndex> pinnedQueueSlot; // Target a specific queue slot instead of using preferredQueueKind
+	BackendAffinity backendAffinity{};
 };
 
 class RenderPassBuilder;

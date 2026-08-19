@@ -94,6 +94,7 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/RuntimeDevice.cpp"
     
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PassBuilders.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PassExecutionContext.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraph.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraphCompile.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraphCompileProfile.cpp"
@@ -184,6 +185,16 @@ endif()
 if(OPENRENDERGRAPH_BUILD_TESTS)
     enable_testing()
     add_executable(OpenRenderGraphExternalResourceTests tests/ExternalResourceTests.cpp)
+    if(WIN32)
+        # BasicRHI is a static library and its D3D12 object references the
+        # Streamline C API. Standalone tests do not load the host interposer,
+        # so provide the same no-op symbols as the BasicRHI smoke test.
+        target_sources(OpenRenderGraphExternalResourceTests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/../BasicRHI/tests/StreamlineStubs.cpp")
+        if(TARGET Streamline::headers)
+            target_link_libraries(OpenRenderGraphExternalResourceTests PRIVATE Streamline::headers)
+        endif()
+    endif()
     if(MSVC)
         target_compile_options(OpenRenderGraphExternalResourceTests PRIVATE /utf-8)
     endif()

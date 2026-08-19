@@ -16,6 +16,8 @@
 #include <BasicTelemetry/Tracy.h>
 #include <rhi_helpers.h>
 #include <rhi_debug.h>
+#include <rhi_interop_dx12.h>
+#include <rhi_interop_vulkan.h>
 #include <random>
 
 #include "Render/PassExecutionContext.h"
@@ -1476,7 +1478,7 @@ void RenderGraph::BuildNodes(RenderGraph& rg, std::vector<Node>& nodes) {
 		}
 	}
 
-	auto resolveCompatibleQueueSlotsForPass = [&queueCache, &passTypeIndex](
+	auto resolveCompatibleQueueSlotsForPass = [&queueCache, &passTypeIndex, &rg](
 		const FramePassStaticAccessSummary& passAccess,
 		std::vector<size_t>& compatibleSlots) {
 		compatibleSlots.clear();
@@ -1492,19 +1494,38 @@ void RenderGraph::BuildNodes(RenderGraph& rg, std::vector<Node>& nodes) {
 				compatibleSlots.assign(
 					queueCache.automaticByPassType[typeIndex].begin(),
 					queueCache.automaticByPassType[typeIndex].begin() + count);
-				return;
 			}
 		}
 
-		const size_t kindIndex = QueueIndex(passAccess.preferredQueueKind);
-		const size_t count = queueCache.autoAssignableByKindCount[kindIndex];
-		if (count != 0) {
-			compatibleSlots.assign(
-				queueCache.autoAssignableByKind[kindIndex].begin(),
-				queueCache.autoAssignableByKind[kindIndex].begin() + count);
+		if (compatibleSlots.empty()) {
+			const size_t kindIndex = QueueIndex(passAccess.preferredQueueKind);
+			const size_t count = queueCache.autoAssignableByKindCount[kindIndex];
+			if (count != 0) {
+				compatibleSlots.assign(
+					queueCache.autoAssignableByKind[kindIndex].begin(),
+					queueCache.autoAssignableByKind[kindIndex].begin() + count);
+			}
+			else {
+				compatibleSlots.push_back(kindIndex);
+			}
+		}
+
+		const auto unfiltered = compatibleSlots;
+		auto filter = [&](auto&& reject) {
+			compatibleSlots.erase(std::remove_if(compatibleSlots.begin(), compatibleSlots.end(), [&](size_t slot) {
+				if (slot >= rg.m_queueRegistry.SlotCount()) return true;
+				return reject(static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot)));
+			}), compatibleSlots.end());
+		};
+		if (passAccess.backendAffinity.strength == BackendAffinityStrength::Primary) {
+			filter([&](QueueSlotIndex slot) { return rg.m_queueRegistry.GetBackendInstance(slot) != BackendInstanceId::Primary; });
 		}
 		else {
-			compatibleSlots.push_back(kindIndex);
+			filter([&](QueueSlotIndex slot) { return rg.m_queueRegistry.GetBackend(slot) != passAccess.backendAffinity.backend; });
+			if (compatibleSlots.empty() && passAccess.backendAffinity.strength == BackendAffinityStrength::Preferred) {
+				compatibleSlots = unfiltered;
+				filter([&](QueueSlotIndex slot) { return rg.m_queueRegistry.GetBackendInstance(slot) != BackendInstanceId::Primary; });
+			}
 		}
 	};
 
@@ -1519,6 +1540,9 @@ void RenderGraph::BuildNodes(RenderGraph& rg, std::vector<Node>& nodes) {
 		n.topoRank = 0;
 		n.passIndex = i;
 		resolveCompatibleQueueSlotsForPass(passAccess, n.compatibleQueueSlots);
+		if (n.compatibleQueueSlots.empty() && passAccess.backendAffinity.strength == BackendAffinityStrength::Required) {
+			throw std::runtime_error("RenderGraph required backend is unavailable for pass index " + std::to_string(i));
+		}
 		for (size_t slot : n.compatibleQueueSlots) {
 			if (slot >= rg.m_queueRegistry.SlotCount()) {
 				continue;
@@ -1865,6 +1889,27 @@ bool RenderGraph::BuildDependencyGraph(
 				s.readsSinceWrite.clear();
 				s.lastWriter = i;
 			}
+		}
+	}
+
+	// Imported memory has exclusive API ownership. Add an ordering edge even for
+	// read/read uses when declaration order crosses an API boundary.
+	std::vector<std::optional<size_t>> lastBackendAccess(m_frameDAGResourceCount);
+	std::vector<rhi::Backend> lastBackend(m_frameDAGResourceCount, rhi::Backend::Null);
+	const rhi::Backend primaryBackend = m_backendDevices.empty() ? rhi::Backend::Null : m_backendDevices.front().backend;
+	for (size_t i = 0; i < nodes.size(); ++i) {
+		const size_t passIndex = nodes[i].passIndex;
+		if (passIndex >= m_framePassAccessSummaries.size()) continue;
+		const auto& summary = m_framePassAccessSummaries[passIndex];
+		const rhi::Backend backend = summary.backendAffinity.strength == BackendAffinityStrength::Primary
+			? primaryBackend : summary.backendAffinity.backend;
+		for (const auto& access : summary.dagAccesses) {
+			if (access.resourceIndex >= lastBackendAccess.size()) continue;
+			if (lastBackendAccess[access.resourceIndex] && lastBackend[access.resourceIndex] != backend) {
+				addEdgeCandidate(*lastBackendAccess[access.resourceIndex], i);
+			}
+			lastBackendAccess[access.resourceIndex] = i;
+			lastBackend[access.resourceIndex] = backend;
 		}
 	}
 
@@ -3539,9 +3584,10 @@ bool ResolveFirstMipSlice(ResourceRegistry::RegistryHandle r, RangeSpec range, u
 	return true;
 }
 
-RenderGraph::RenderGraph(rhi::Device device)
+RenderGraph::RenderGraph(rhi::Device device, rhi::Backend primaryBackend)
 	: m_compilerState(std::make_unique<CompilerState>()) {
 	DeviceManager::GetInstance().Initialize(device);
+	m_backendDevices.push_back({ BackendInstanceId::Primary, primaryBackend, device });
 
 	auto MakeDefaultImmediateDispatch = [&]() noexcept -> org::imm::ImmediateDispatch
 		{
@@ -3616,6 +3662,20 @@ RenderGraph::RenderGraph(rhi::Device device)
 	if (!m_renderGraphSettingsService) {
 		m_renderGraphSettingsService = org::runtime::CreateDefaultRenderGraphSettingsService();
 	}
+}
+
+BackendInstanceId RenderGraph::RegisterBackendDevice(rhi::Backend backend, rhi::Device device) {
+	if (!device || backend == rhi::Backend::Null) {
+		throw std::invalid_argument("RegisterBackendDevice requires a valid backend device");
+	}
+	for (const auto& entry : m_backendDevices) {
+		if (entry.backend == backend) return entry.id;
+	}
+	if (m_backendDevices.size() >= 255) throw std::runtime_error("RenderGraph backend device registry exhausted");
+	const auto id = static_cast<BackendInstanceId>(static_cast<uint8_t>(m_backendDevices.size()));
+	m_backendDevices.push_back({ id, backend, device });
+	DescriptorHeapManager::GetInstance().RegisterBackend(id, device);
+	return id;
 }
 
 RenderGraph::~RenderGraph() {
@@ -6342,6 +6402,258 @@ void RenderGraph::MaterializeUnmaterializedResources(std::span<const uint64_t> o
 	}
 }
 
+void RenderGraph::MaterializeMultiBackendRepresentations() {
+	if (m_backendDevices.size() < 2 || m_frameSchedulingResourceCount == 0) return;
+	std::vector<std::vector<uint8_t>> uses(
+		m_frameSchedulingResourceCount, std::vector<uint8_t>(m_backendDevices.size(), 0));
+	for (size_t passIndex = 0; passIndex < m_framePassSchedulingSummaries.size() && passIndex < m_assignedQueueSlotsByFramePass.size(); ++passIndex) {
+		const size_t slot = m_assignedQueueSlotsByFramePass[passIndex];
+		if (slot >= m_queueRegistry.SlotCount()) continue;
+		const auto instance = m_queueRegistry.GetBackendInstance(static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot)));
+		const size_t instanceIndex = static_cast<uint8_t>(instance);
+		if (instanceIndex >= m_backendDevices.size()) continue;
+		for (const size_t resourceIndex : m_framePassSchedulingSummaries[passIndex].touchedResourceIndices) {
+			if (resourceIndex < uses.size()) uses[resourceIndex][instanceIndex] = 1;
+		}
+	}
+
+	BackendDeviceEntry* d3d12 = nullptr;
+	BackendDeviceEntry* vulkan = nullptr;
+	for (auto& entry : m_backendDevices) {
+		if (entry.backend == rhi::Backend::D3D12) d3d12 = &entry;
+		if (entry.backend == rhi::Backend::Vulkan) vulkan = &entry;
+	}
+	if (!d3d12 || !vulkan) return;
+
+	for (size_t resourceIndex = 0; resourceIndex < uses.size(); ++resourceIndex) {
+		size_t backendCount = 0;
+		bool nonPrimaryUse = false;
+		for (size_t i = 0; i < uses[resourceIndex].size(); ++i) {
+			backendCount += uses[resourceIndex][i] != 0;
+			nonPrimaryUse |= i != 0 && uses[resourceIndex][i] != 0;
+		}
+		if (!nonPrimaryUse && backendCount < 2) continue;
+		Resource* resource = resourceIndex < m_frameCompileResources.size()
+			? UnwrapDynamicResource(m_frameCompileResources[resourceIndex].resource)
+			: nullptr;
+		if (!resource && resourceIndex < m_frameSchedulingResourceIDByIndex.size()) {
+			if (auto shared = GetResourceByID(m_frameSchedulingResourceIDByIndex[resourceIndex])) {
+				resource = UnwrapDynamicResource(shared.get());
+			}
+		}
+		if (!resource) continue;
+		if (!resource->IsRenderGraphManaged()) {
+			throw std::runtime_error("Multi-RHI resource '" + resource->GetName() + "' is externally managed");
+		}
+		bool complete = true;
+		for (size_t i = 0; i < uses[resourceIndex].size(); ++i) {
+			if (uses[resourceIndex][i] && !resource->HasAPIRepresentation(static_cast<BackendInstanceId>(static_cast<uint8_t>(i)))) {
+				complete = false;
+			}
+		}
+		if (complete) continue;
+
+		rhi::ResourceDesc desc{};
+		if (!resource->TryGetRHIResourceDesc(desc) || desc.heapType != rhi::HeapType::DeviceLocal ||
+			(desc.type != rhi::ResourceType::Buffer && desc.type != rhi::ResourceType::Texture2D)) {
+			throw std::runtime_error("Multi-RHI resource '" + resource->GetName() + "' has no supported device-local buffer/2D texture representation");
+		}
+		desc.heapFlags |= rhi::HeapFlags::Shared;
+		rhi::ResourcePtr d3Resource;
+		rhi::ResourcePtr vkResource;
+		if (desc.type == rhi::ResourceType::Texture2D &&
+			!rhi::vulkan::query_d3d12_texture_support(vulkan->device, desc).supported) {
+			throw std::runtime_error("Multi-RHI texture '" + resource->GetName() + "' is unsupported for its exact format/usage");
+		}
+		bool placedOnSharedHeap = false;
+		const uint64_t schedulingID = resourceIndex < m_frameSchedulingResourceIDByIndex.size()
+			? m_frameSchedulingResourceIDByIndex[resourceIndex] : resource->GetSchedulingResourceID();
+		// D3D12 shared heaps admit buffers and RT/DS-class textures, but not
+		// ordinary non-RT textures. Keep the latter on committed sharing.
+		const bool sharedHeapCandidate = desc.type == rhi::ResourceType::Buffer ||
+			(desc.type == rhi::ResourceType::Texture2D &&
+				(desc.resourceFlags & rhi::ResourceFlags::RF_AllowRenderTarget) != 0 &&
+				(desc.resourceFlags & rhi::ResourceFlags::RF_AllowDepthStencil) == 0);
+		if (const auto placementIt = aliasPlacementRangesByID.find(schedulingID);
+			sharedHeapCandidate && placementIt != aliasPlacementRangesByID.end()) {
+			const auto& placement = placementIt->second;
+			const auto primaryPool = persistentAliasPools.find(placement.poolID);
+			if (primaryPool != persistentAliasPools.end()) {
+				const uint8_t resourceClass = desc.type == rhi::ResourceType::Buffer ? 1u : 2u;
+				rhi::ResourceAllocationInfo d3Requirements{}, vkRequirements{};
+				d3d12->device.GetResourceAllocationInfo(&desc, 1, &d3Requirements);
+				vulkan->device.GetResourceAllocationInfo(&desc, 1, &vkRequirements);
+				const uint64_t requiredAlignment = (std::max)(d3Requirements.alignment, vkRequirements.alignment);
+				const uint64_t requiredSize = (std::max)(d3Requirements.sizeInBytes, vkRequirements.sizeInBytes);
+				const bool placementCompatible = requiredAlignment != 0 &&
+					(placement.startByte % requiredAlignment) == 0 &&
+					requiredSize <= placement.endByte - placement.startByte;
+				if (!placementCompatible) {
+					spdlog::warn("RenderGraph shared alias requirements rejected; using committed fallback: pool={} resource={} offset={} reserved={} requiredSize={} requiredAlignment={}",
+						placement.poolID, schedulingID, placement.startByte,
+						placement.endByte - placement.startByte, requiredSize, requiredAlignment);
+					goto committed_multi_backend_resource;
+				}
+				auto& sharedPool = m_sharedAliasPools[placement.poolID];
+				if ((!sharedPool.d3d12 || !sharedPool.vulkan || sharedPool.capacityBytes < primaryPool->second.capacityBytes) &&
+					(sharedPool.resourceClass == 0 || sharedPool.resourceClass == resourceClass)) {
+					rhi::HeapDesc heapDesc{};
+					heapDesc.sizeBytes = primaryPool->second.capacityBytes;
+					heapDesc.alignment = (std::max)(primaryPool->second.alignment, requiredAlignment);
+					heapDesc.memory = rhi::HeapType::DeviceLocal;
+					heapDesc.flags = rhi::HeapFlags::Shared | (resourceClass == 1
+						? rhi::HeapFlags::AllowOnlyBuffers : rhi::HeapFlags::AllowOnlyRtDsTextures);
+					heapDesc.debugName = "RenderGraph multi-RHI alias pool";
+					rhi::HeapPtr newD3Heap, newVkHeap;
+					auto heapResult = d3d12->device.CreateHeap(heapDesc, newD3Heap);
+					rhi::dx12::SharedHandle heapHandle{};
+					if (rhi::IsOk(heapResult)) heapResult = rhi::dx12::export_shared_heap(d3d12->device, newD3Heap.Get(), heapHandle);
+					if (rhi::IsOk(heapResult)) heapResult = rhi::vulkan::import_d3d12_heap(vulkan->device, heapHandle.value, heapDesc, newVkHeap);
+#ifdef _WIN32
+					if (heapHandle.value) CloseHandle(static_cast<HANDLE>(heapHandle.value));
+#endif
+					if (rhi::IsOk(heapResult)) {
+						sharedPool.d3d12 = std::move(newD3Heap);
+						sharedPool.vulkan = std::move(newVkHeap);
+						sharedPool.capacityBytes = heapDesc.sizeBytes;
+						sharedPool.resourceClass = resourceClass;
+						++sharedPool.generation;
+						spdlog::info("RenderGraph created shared alias pool: pool={} capacity={} alignment={} class={} generation={}",
+							placement.poolID, heapDesc.sizeBytes, heapDesc.alignment, resourceClass, sharedPool.generation);
+					}
+				}
+				if (sharedPool.d3d12 && sharedPool.vulkan && sharedPool.resourceClass == resourceClass) {
+					rhi::ResourceDesc placedDesc = desc;
+					placedDesc.heapFlags = rhi::HeapFlags::None;
+					auto d3Placed = d3d12->device.CreatePlacedResource(sharedPool.d3d12->GetHandle(), placement.startByte, placedDesc, d3Resource);
+					auto vkPlaced = rhi::IsOk(d3Placed)
+						? vulkan->device.CreatePlacedResource(sharedPool.vulkan->GetHandle(), placement.startByte, placedDesc, vkResource)
+						: d3Placed;
+					placedOnSharedHeap = rhi::IsOk(d3Placed) && rhi::IsOk(vkPlaced);
+					if (!placedOnSharedHeap) {
+						d3Resource.Reset(); vkResource.Reset();
+						spdlog::warn("RenderGraph shared alias placement rejected; using committed fallback: pool={} resource={} offset={}",
+							placement.poolID, schedulingID, placement.startByte);
+					}
+				}
+			}
+		}
+
+	committed_multi_backend_resource:
+		auto result = placedOnSharedHeap ? rhi::Result::Ok : d3d12->device.CreateCommittedResource(desc, d3Resource);
+		if (rhi::Failed(result)) throw std::runtime_error("Failed to create canonical D3D12 representation for '" + resource->GetName() + "'");
+		rhi::dx12::SharedHandle handle{};
+		if (!placedOnSharedHeap) {
+			result = rhi::dx12::export_shared_resource(d3d12->device, d3Resource.Get(), handle);
+			if (rhi::IsOk(result)) {
+				result = desc.type == rhi::ResourceType::Buffer
+					? rhi::vulkan::import_d3d12_buffer(vulkan->device, handle.value, desc, vkResource)
+					: rhi::vulkan::import_d3d12_texture(vulkan->device, handle.value, desc, vkResource);
+			}
+		}
+#ifdef _WIN32
+		if (handle.value) CloseHandle(static_cast<HANDLE>(handle.value));
+#endif
+		if (rhi::Failed(result)) throw std::runtime_error("Failed to import Vulkan representation for '" + resource->GetName() + "'");
+		const ResourceState commonInitial{
+			rhi::ResourceAccessType::Common, rhi::ResourceLayout::Common, rhi::ResourceSyncState::All };
+		const ResourceState d3dInitial = desc.type == rhi::ResourceType::Texture2D
+			? ResourceState{ rhi::ResourceAccessType::None, rhi::ResourceLayout::Undefined, rhi::ResourceSyncState::None }
+			: commonInitial;
+		// The canonical D3D12 texture is created in UNDEFINED.  Its imported Vulkan
+		// representation observes the allocation after the producer releases it in
+		// COMMON, so the two API state trackers intentionally start differently.
+		resource->AttachAPIRepresentation(d3d12->id, std::move(d3Resource), d3dInitial);
+		resource->AttachAPIRepresentation(vulkan->id, std::move(vkResource), commonInitial);
+		resource->RefreshAPIRepresentationDescriptors(d3d12->id);
+		resource->RefreshAPIRepresentationDescriptors(vulkan->id);
+		spdlog::info("RenderGraph materialized multi-RHI representations: id={} name='{}' type={} sharedAlias={} D3D12Instance={} VulkanInstance={}",
+			resource->GetGlobalResourceID(), resource->GetName(), static_cast<uint32_t>(desc.type),
+			placedOnSharedHeap,
+			static_cast<uint32_t>(d3d12->id), static_cast<uint32_t>(vulkan->id));
+	}
+}
+
+void RenderGraph::PlanMultiBackendOwnershipTransfers() {
+	BackendInstanceId canonicalD3D12 = BackendInstanceId::Primary;
+	for (const auto& device : m_backendDevices) {
+		if (device.backend == rhi::Backend::D3D12) canonicalD3D12 = device.id;
+	}
+	struct LastUse {
+		BackendInstanceId backend = BackendInstanceId::Primary;
+		std::vector<ExternalOwnershipBarrier>* releases = nullptr;
+		ResourceState state{};
+	};
+	std::unordered_map<Resource*, LastUse> lastUses;
+
+	auto visitPass = [&](auto* passEntry, BackendInstanceId backend) {
+		passEntry->externalAcquires.clear();
+		passEntry->externalReleases.clear();
+		std::unordered_set<Resource*> seen;
+		ForEachFrameRequirement(passEntry->resources, [&](const auto& requirement) {
+			const auto handle = requirement.resourceHandleAndRange.resource;
+			Resource* resource = handle.IsEphemeral() ? handle.GetEphemeralPtr() : _registry.Resolve(handle);
+			resource = UnwrapDynamicResource(resource);
+			bool hasMultipleRepresentations = false;
+			if (resource) {
+				size_t representationCount = 0;
+				for (const auto& device : m_backendDevices) representationCount += resource->HasAPIRepresentation(device.id) ? 1u : 0u;
+				hasMultipleRepresentations = representationCount > 1;
+			}
+			if (!resource || !hasMultipleRepresentations || !seen.insert(resource).second) {
+				return;
+			}
+			auto previous = lastUses.find(resource);
+			if (previous == lastUses.end() && backend != canonicalD3D12) {
+				passEntry->externalAcquires.push_back({ resource, requirement.state });
+				spdlog::debug("RenderGraph planned initial external texture acquire: resource='{}' toBackend={} consumer='{}'",
+					resource->GetName(), static_cast<uint32_t>(backend), passEntry->name);
+			}
+			else if (previous != lastUses.end() && previous->second.backend != backend) {
+				if (previous->second.releases) {
+					previous->second.releases->push_back({ resource, previous->second.state });
+				}
+				passEntry->externalAcquires.push_back({ resource, requirement.state });
+				spdlog::debug("RenderGraph planned external texture ownership transfer: resource='{}' fromBackend={} toBackend={} consumer='{}'",
+					resource->GetName(), static_cast<uint32_t>(previous->second.backend), static_cast<uint32_t>(backend), passEntry->name);
+			}
+			lastUses[resource] = { backend, &passEntry->externalReleases, requirement.state };
+		});
+	};
+
+	for (auto& batch : batches) {
+		for (size_t queueIndex = 0; queueIndex < m_queueRegistry.SlotCount(); ++queueIndex) {
+			const auto backend = m_queueRegistry.GetBackendInstance(static_cast<QueueSlotIndex>(static_cast<uint8_t>(queueIndex)));
+			for (auto& passVariant : batch.Passes(queueIndex)) {
+				std::visit([&](auto* passEntry) { visitPass(passEntry, backend); }, passVariant);
+			}
+		}
+	}
+
+	// Transition compilation historically followed one logical tracker.  At an
+	// API handoff the destination representation instead starts from the
+	// externally released COMMON state.  Rebase its generated pre-transition so
+	// it never inherits the source API's layout.
+	for (auto& batch : batches) {
+		for (size_t queueIndex = 0; queueIndex < m_queueRegistry.SlotCount(); ++queueIndex) {
+			std::unordered_set<Resource*> acquired;
+			for (auto& passVariant : batch.Passes(queueIndex)) {
+				std::visit([&](auto* passEntry) {
+					for (const auto& entry : passEntry->externalAcquires) acquired.insert(entry.resource);
+				}, passVariant);
+			}
+			if (acquired.empty()) continue;
+			for (auto& transition : batch.Transitions(queueIndex, BatchTransitionPhase::BeforePasses)) {
+				if (!acquired.contains(UnwrapDynamicResource(transition.pResource))) continue;
+				transition.prevAccessType = rhi::ResourceAccessType::Common;
+				transition.prevLayout = rhi::ResourceLayout::Common;
+				transition.prevSyncState = rhi::ResourceSyncState::All;
+				transition.discard = false;
+			}
+		}
+	}
+}
+
 void RenderGraph::ResizeQueueParallelVectors() {
 	const size_t qc = m_queueRegistry.SlotCount();
 	m_compilerState->compiledLastProducerBatchByResourceByQueue.resize(qc);
@@ -6455,9 +6767,29 @@ void RenderGraph::Setup() {
 		auto& gfxQ = DeviceManager::GetInstance().GetGraphicsQueue();
 		auto& compQ = DeviceManager::GetInstance().GetComputeQueue();
 		auto& copyQ = DeviceManager::GetInstance().GetCopyQueue();
-		m_queueRegistry.Register({ QueueKind::Graphics, 0 }, gfxQ, device);
-		m_queueRegistry.Register({ QueueKind::Compute, 0 }, compQ, device);
-		m_queueRegistry.Register({ QueueKind::Copy,    0 }, copyQ, device);
+		const auto primaryBackend = m_backendDevices.empty() ? rhi::Backend::Null : m_backendDevices.front().backend;
+		m_queueRegistry.Register({ QueueKind::Graphics, 0, BackendInstanceId::Primary, primaryBackend }, gfxQ, device);
+		m_queueRegistry.Register({ QueueKind::Compute, 0, BackendInstanceId::Primary, primaryBackend }, compQ, device);
+		m_queueRegistry.Register({ QueueKind::Copy,    0, BackendInstanceId::Primary, primaryBackend }, copyQ, device);
+		for (size_t i = 1; i < m_backendDevices.size(); ++i) {
+			const auto& peer = m_backendDevices[i];
+			auto peerDevice = peer.device;
+			m_queueRegistry.Register({ QueueKind::Graphics, 0, peer.id, peer.backend }, peerDevice.GetQueue(rhi::QueueKind::Graphics), peerDevice);
+			m_queueRegistry.Register({ QueueKind::Compute, 0, peer.id, peer.backend }, peerDevice.GetQueue(rhi::QueueKind::Compute), peerDevice);
+			m_queueRegistry.Register({ QueueKind::Copy, 0, peer.id, peer.backend }, peerDevice.GetQueue(rhi::QueueKind::Copy), peerDevice);
+		}
+		if (m_backendDevices.size() > 1) {
+			rhi::Device d3d12Device{};
+			rhi::Device vulkanDevice{};
+			for (const auto& entry : m_backendDevices) {
+				if (entry.backend == rhi::Backend::D3D12) d3d12Device = entry.device;
+				if (entry.backend == rhi::Backend::Vulkan) vulkanDevice = entry.device;
+			}
+			const auto interopResult = m_queueRegistry.EnableD3D12VulkanInterop(d3d12Device, vulkanDevice);
+			if (rhi::Failed(interopResult)) {
+				throw std::runtime_error(std::string("RenderGraph failed to initialize multi-RHI queue timelines: ") + rhi::ResultName(interopResult));
+			}
+		}
 	}
 	EnsureMinimumAutomaticSchedulingQueues();
 
@@ -6952,6 +7284,7 @@ namespace {
 	void ExecuteTransitions(std::vector<ResourceTransition>& transitions,
 		CommandRecordingManager* crm,
 		QueueKind queueKind,
+		BackendInstanceId backendInstance,
 		rhi::CommandList& commandList) {
 		rhi::helpers::OwnedBarrierBatch batch;
 		for (auto& transition : transitions) {
@@ -6961,10 +7294,10 @@ namespace {
 			}
 
 			std::vector<ResourceTransition> dummy;
-			transition.pResource->GetStateTracker()->Apply(
+			transition.pResource->GetStateTracker(backendInstance)->Apply(
 				transition.range, transition.pResource,
 				{ transition.newAccessType, transition.newLayout, transition.newSyncState }, dummy);
-			auto bg = transition.pResource->GetEnhancedBarrierGroup(
+			auto bg = transition.pResource->GetEnhancedBarrierGroup(backendInstance,
 				transition.range, transition.prevAccessType, transition.newAccessType,
 				transition.prevLayout, transition.newLayout,
 				transition.prevSyncState, transition.newSyncState);
@@ -6987,6 +7320,7 @@ namespace {
 
 	// RecordTransitionBarriers: records barrier commands into a CL
 	void RecordTransitionBarriers(std::vector<ResourceTransition>& transitions,
+		BackendInstanceId backendInstance,
 		rhi::CommandList& commandList) {
 		if (transitions.empty()) return;
 
@@ -7006,7 +7340,7 @@ namespace {
 				// change. The old parallel path bypassed this virtual contract.
 				const size_t textureStart = batch.textures.size();
 				const size_t bufferStart = batch.buffers.size();
-				batch.Append(t.pResource->GetEnhancedBarrierGroup(
+				batch.Append(t.pResource->GetEnhancedBarrierGroup(backendInstance,
 					t.range, t.prevAccessType, t.newAccessType,
 					t.prevLayout, t.newLayout, t.prevSyncState, t.newSyncState));
 				if (t.discard) {
@@ -7016,7 +7350,7 @@ namespace {
 			} else {
 				// Buffer barrier
 				rhi::BufferBarrier bb{};
-				bb.buffer       = t.pResource->GetAPIResource().GetHandle();
+				bb.buffer       = t.pResource->GetAPIResource(backendInstance).GetHandle();
 				bb.offset       = 0;
 				bb.size         = UINT64_MAX;
 				bb.beforeSync   = t.prevSyncState;
@@ -7471,7 +7805,7 @@ namespace {
 		rhi::CommandList commandList = cl0.list.Get();
 
 		auto& preTransitions = batch.Transitions(qi, RenderGraph::BatchTransitionPhase::BeforePasses);
-		ExecuteTransitions(preTransitions, /*crm=*/nullptr, queue, commandList);
+		ExecuteTransitions(preTransitions, /*crm=*/nullptr, queue, args.context.backendInstance, commandList);
 
 		// Waits: BeforeExecution
 		for (size_t srcIndex = 0; srcIndex < batch.QueueCount(); ++srcIndex) {
@@ -7659,7 +7993,7 @@ namespace {
 		// Record post-transitions
 		auto& postTransitions = batch.Transitions(qi, RenderGraph::BatchTransitionPhase::AfterPasses);
 		if (!postTransitions.empty())
-			ExecuteTransitions(postTransitions, /*crm=*/nullptr, queue, commandList);
+			ExecuteTransitions(postTransitions, /*crm=*/nullptr, queue, args.context.backendInstance, commandList);
 
 		// Final submit + recycle signal. Active queues always submit a final CL,
 		// so always use the batch's reserved AfterCompletion fence value.
@@ -7710,6 +8044,47 @@ namespace {
 		bool batchTraceEnabled;
 	};
 
+	void RecordExternalOwnershipBarriers(
+		const std::vector<RenderGraph::ExternalOwnershipBarrier>& barriers,
+		BackendInstanceId backendInstance,
+		bool acquire,
+		rhi::CommandList commandList) {
+		rhi::helpers::OwnedBarrierBatch batch;
+		for (const auto& entry : barriers) {
+			if (!entry.resource) continue;
+			const auto apiResource = entry.resource->GetAPIResource(backendInstance);
+			if (!apiResource) continue;
+			if (entry.resource->HasLayout()) {
+				rhi::TextureBarrier barrier{};
+				barrier.texture = apiResource.GetHandle();
+				barrier.range = { 0, entry.resource->GetMipLevels(), 0, entry.resource->GetArraySize() };
+				barrier.beforeSync = entry.state.sync;
+				barrier.afterSync = acquire ? entry.state.sync : rhi::ResourceSyncState::All;
+				barrier.beforeAccess = entry.state.access;
+				barrier.afterAccess = acquire ? entry.state.access : rhi::ResourceAccessType::Common;
+				barrier.beforeLayout = entry.state.layout;
+				barrier.afterLayout = acquire ? entry.state.layout : rhi::ResourceLayout::Common;
+				barrier.externalOwnership = acquire
+					? rhi::TextureBarrier::ExternalOwnership::Acquire
+					: rhi::TextureBarrier::ExternalOwnership::Release;
+				batch.textures.push_back(barrier);
+			}
+			else {
+				rhi::BufferBarrier barrier{};
+				barrier.buffer = apiResource.GetHandle();
+				barrier.beforeSync = entry.state.sync;
+				barrier.afterSync = acquire ? entry.state.sync : rhi::ResourceSyncState::All;
+				barrier.beforeAccess = entry.state.access;
+				barrier.afterAccess = acquire ? entry.state.access : rhi::ResourceAccessType::Common;
+				barrier.externalOwnership = acquire
+					? rhi::BufferBarrier::ExternalOwnership::Acquire
+					: rhi::BufferBarrier::ExternalOwnership::Release;
+				batch.buffers.push_back(barrier);
+			}
+		}
+		if (!batch.Empty()) commandList.Barriers(batch.View());
+	}
+
 	void RecordQueueBatch(RecordQueueBatchArgs& args) {
 		BT_ZONE_SCOPE("RenderGraph::RecordQueueBatch");
 		auto& sched = args.sched;
@@ -7736,7 +8111,7 @@ namespace {
 
 		// Record pre-transitions
 		auto& preTransitions = batch.Transitions(qi, RenderGraph::BatchTransitionPhase::BeforePasses);
-		RecordTransitionBarriers(preTransitions, commandList);
+		RecordTransitionBarriers(preTransitions, args.context.backendInstance, commandList);
 
 		// Split after transitions?
 		if (sched.splitAfterTransitions) {
@@ -7775,6 +8150,7 @@ namespace {
 						passName);
 				}
 				rhi::debug::Scope scope(commandList, rhi::colors::Mint, passName.data());
+				RecordExternalOwnershipBarriers(pr.externalAcquires, args.context.backendInstance, true, commandList);
 				args.context.currentPassName = passName.data();
 				args.context.currentTechniquePath = techniquePath;
 				(void)rhi::debug::SetInstrumentationContext(commandList, args.context.currentPassName, args.context.currentTechniquePath);
@@ -7805,6 +8181,7 @@ namespace {
 						sched.externalFences.push_back(passReturn);
 					}
 				}
+				RecordExternalOwnershipBarriers(pr.externalReleases, args.context.backendInstance, false, commandList);
 				if (hasStatistics)
 					args.statisticsService->EndQuery(pr.statisticsIndex, args.context.frameIndex, args.rhiQueue, commandList, sched.queryRecordingContext);
 				if (hasStatistics) {
@@ -7888,7 +8265,7 @@ namespace {
 		// Record post-transitions (barriers only).
 		auto& postTransitions = batch.Transitions(qi, RenderGraph::BatchTransitionPhase::AfterPasses);
 		if (!postTransitions.empty())
-			RecordTransitionBarriers(postTransitions, commandList);
+			RecordTransitionBarriers(postTransitions, args.context.backendInstance, commandList);
 
 		// End the last CL.
 		if (args.batchTraceEnabled) {
@@ -8404,7 +8781,11 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 				reason));
 		}
 		auto& srcFence = SlotFence(srcSlot);
+		auto& waitFence = m_queueRegistry.GetFenceForConsumer(
+			static_cast<QueueSlotIndex>(static_cast<uint8_t>(srcSlot)),
+			static_cast<QueueSlotIndex>(static_cast<uint8_t>(dstSlot)));
 		const auto srcFenceHandle = srcFence.GetHandle();
+		const auto waitFenceHandle = waitFence.GetHandle();
 		const auto waitBegin = std::chrono::steady_clock::now();
 		UINT64 completedFenceValue = 0;
 		{
@@ -8446,7 +8827,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 		rhi::Result waitResult = rhi::Result::Ok;
 		{
 			BT_ZONE_SCOPE("RenderGraph::Execute::FrameStartWaitOnSlot::QueueWait");
-			waitResult = dstQ.Wait({ srcFenceHandle, absoluteFenceValue });
+			waitResult = dstQ.Wait({ waitFenceHandle, absoluteFenceValue });
 		}
 		const auto waitElapsedUs = std::chrono::duration_cast<std::chrono::microseconds>(
 			std::chrono::steady_clock::now() - waitBegin).count();
@@ -8895,17 +9276,21 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 				auto& qs = batchSched.queues[qi];
 				if (!qs.active) continue;
 				auto rhiQ = SlotQueue(qi);
+				const auto slotIndex = static_cast<QueueSlotIndex>(static_cast<uint8_t>(qi));
+				PassExecutionContext slotContext = context;
+				slotContext.device = m_queueRegistry.GetDevice(slotIndex);
+				slotContext.backendInstance = m_queueRegistry.GetBackendInstance(slotIndex);
 				ExecuteQueueBatchArgs args{
 					.sched = qs,
 					.batch = batch,
 					.batchIndex = bi,
-					.queue = m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(qi)),
+					.queue = m_queueRegistry.GetKind(slotIndex),
 					.queueSlot = qi,
 					.rhiQueue = rhiQ,
 					.fenceTimeline = SlotFence(qi),
 					.pool = *SlotPool(qi),
 					.fenceOffset = 0,
-					.context = context,
+					.context = slotContext,
 					.statisticsService = statisticsService,
 					.outExternalFences = slotExternalFences[qi],
 					.queuedExternalFenceOrigins = queuedExternalFenceOriginsThisFrame,
@@ -9024,19 +9409,22 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 				auto rhiQ = SlotQueue(task.queueIndex);
 				const QueueKind queueKind = m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(task.queueIndex));
 				try {
-					RecordQueueBatchArgs args{
+				RecordQueueBatchArgs args{
 						.sched = qs,
 						.batch = batches[task.batchIndex],
 						.batchIndex = task.batchIndex,
 						.queue = queueKind,
 						.queueSlot = task.queueIndex,
 						.rhiQueue = rhiQ,
-						.context = context,
+					.context = context,
 						.statisticsService = statisticsService,
 						.queuedExternalFenceOrigins = queuedExternalFenceOriginsThisFrame,
 						.batchTraceEnabled = batchTraceEnabled,
-					};
-					RecordQueueBatch(args);
+				};
+				const auto slotIndex = static_cast<QueueSlotIndex>(static_cast<uint8_t>(task.queueIndex));
+				args.context.device = m_queueRegistry.GetDevice(slotIndex);
+				args.context.backendInstance = m_queueRegistry.GetBackendInstance(slotIndex);
+				RecordQueueBatch(args);
 				}
 				catch (const std::exception& ex) {
 					std::string passNames;

@@ -132,6 +132,8 @@ public:
         rhi::ResourceSyncState newSyncState) override;
 
     bool TryGetBufferByteSize(uint64_t& outByteSize) const override;
+	bool TryGetRHIResourceDesc(rhi::ResourceDesc& outDesc) const override;
+	void RefreshAPIRepresentationDescriptors(BackendInstanceId backendInstance) override;
 
     void ConfigureBacking(
         rhi::HeapType accessType,

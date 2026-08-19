@@ -310,6 +310,11 @@ public:
 		uint64_t retainedAccessCacheKey = 0;
 	};
 
+	struct ExternalOwnershipBarrier {
+		Resource* resource = nullptr;
+		ResourceState state{};
+	};
+
 	struct RenderPassAndResources { // TODO: I'm currently copying these a lot; maybe use pointers instead
 		std::shared_ptr<RenderPass> pass;
 		RenderPassParameters resources;
@@ -324,6 +329,8 @@ public:
 		std::vector<std::shared_ptr<Resource>> retainedAnonymousKeepAlive; // Keeps retained anonymous handles alive across frames
 		std::vector<ResolverSnapshot> resolverSnapshots; // Versioned resolver snapshots for auto-invalidation
 		RetainedDeclarationCache declarationCache;
+		std::vector<ExternalOwnershipBarrier> externalAcquires;
+		std::vector<ExternalOwnershipBarrier> externalReleases;
 	};
 
 	struct ComputePassAndResources { // TODO: Same as above
@@ -340,6 +347,8 @@ public:
 		std::vector<std::shared_ptr<Resource>> retainedAnonymousKeepAlive; // Keeps retained anonymous handles alive across frames
 		std::vector<ResolverSnapshot> resolverSnapshots; // Versioned resolver snapshots for auto-invalidation
 		RetainedDeclarationCache declarationCache;
+		std::vector<ExternalOwnershipBarrier> externalAcquires;
+		std::vector<ExternalOwnershipBarrier> externalReleases;
 	};
 
 	struct CopyPassAndResources {
@@ -356,6 +365,8 @@ public:
 		std::vector<std::shared_ptr<Resource>> retainedAnonymousKeepAlive; // Keeps retained anonymous handles alive across frames
 		std::vector<ResolverSnapshot> resolverSnapshots; // Versioned resolver snapshots for auto-invalidation
 		RetainedDeclarationCache declarationCache;
+		std::vector<ExternalOwnershipBarrier> externalAcquires;
+		std::vector<ExternalOwnershipBarrier> externalReleases;
 	};
 
 	enum class BatchWaitPhase : uint8_t {
@@ -657,7 +668,8 @@ public:
 		bool valid = false;
 	};
 
-	RenderGraph(rhi::Device device);
+	RenderGraph(rhi::Device device, rhi::Backend primaryBackend = rhi::Backend::Null);
+	BackendInstanceId RegisterBackendDevice(rhi::Backend backend, rhi::Device device);
 	~RenderGraph();
 	static void ShutdownRuntime();
 	using AutoAliasReasonCount = org::alias::AutoAliasReasonCount;
@@ -961,6 +973,7 @@ private:
 		QueueKind preferredQueueKind = QueueKind::Graphics;
 		QueueAssignmentPolicy queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
 		std::optional<QueueSlotIndex> pinnedQueueSlot;
+		BackendAffinity backendAffinity{};
 	};
 
 	struct CachedFramePassAccessSummary {
@@ -1230,6 +1243,12 @@ private:
 	uint64_t m_frameDeclarationRefreshEquivalentCount = 0;
 	std::vector<size_t> m_assignedQueueSlotsByFramePass;
 	std::vector<uint8_t> m_activeQueueSlotsThisFrame;
+	struct BackendDeviceEntry {
+		BackendInstanceId id = BackendInstanceId::Primary;
+		rhi::Backend backend = rhi::Backend::Null;
+		rhi::Device device{};
+	};
+	std::vector<BackendDeviceEntry> m_backendDevices;
 	std::array<uint8_t, static_cast<size_t>(QueueKind::Count)> m_minAutomaticSchedulingQueuesByKind = { 1, 1, 1 };
 	std::unordered_map<std::string, std::shared_ptr<RenderPass>> renderPassesByName;
 	std::unordered_map<std::string, std::shared_ptr<ComputePass>> computePassesByName;
@@ -1289,6 +1308,14 @@ private:
 
 	using PersistentAliasPoolState = org::alias::PersistentAliasPoolState;
 	std::unordered_map<uint64_t, PersistentAliasPoolState> persistentAliasPools;
+	struct SharedAliasPoolState {
+		rhi::HeapPtr d3d12;
+		rhi::HeapPtr vulkan;
+		uint64_t capacityBytes = 0;
+		uint64_t generation = 0;
+		uint8_t resourceClass = 0;
+	};
+	std::unordered_map<uint64_t, SharedAliasPoolState> m_sharedAliasPools;
 	std::unordered_map<uint64_t, org::alias::CachedAliasPoolPlan> cachedAliasPlanByPoolID;
 	uint64_t aliasPoolPlanFrameIndex = 0;
 	uint32_t aliasPoolRetireIdleFrames = 120;
@@ -1426,6 +1453,8 @@ private:
 	}
 
 	void MaterializeUnmaterializedResources(std::span<const uint64_t> onlyResourceIDs = {});
+	void MaterializeMultiBackendRepresentations();
+	void PlanMultiBackendOwnershipTransfers();
 	FrameCompileResourceState& GetOrCreateFrameCompileResourceState(size_t resourceIndex, Resource* resource, uint64_t resourceID);
 	void CaptureCompileTrackersForExecution(std::span<const uint64_t> resourceIDs);
 	void PublishCompiledTrackerStates();

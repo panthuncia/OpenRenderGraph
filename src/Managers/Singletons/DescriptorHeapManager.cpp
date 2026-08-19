@@ -69,6 +69,55 @@ void DescriptorHeapManager::Initialize() {
         100000,
         false,
         "nonShaderVisibleHeap");
+
+	BackendHeaps primary{};
+	primary.device = device;
+	primary.cbvSrvUav = m_cbvSrvUavHeap;
+	primary.sampler = m_samplerHeap;
+	primary.rtv = m_rtvHeap;
+	primary.dsv = m_dsvHeap;
+	primary.nonShaderVisible = m_nonShaderVisibleHeap;
+	m_backendHeaps.emplace(static_cast<uint8_t>(BackendInstanceId::Primary), std::move(primary));
+}
+
+void DescriptorHeapManager::RegisterBackend(BackendInstanceId backendInstance, rhi::Device device) {
+	if (!device) throw std::invalid_argument("DescriptorHeapManager::RegisterBackend requires a valid device");
+	std::scoped_lock lock(m_descriptorMutationMutex);
+	const auto key = static_cast<uint8_t>(backendInstance);
+	if (auto existing = m_backendHeaps.find(key); existing != m_backendHeaps.end()) {
+		if (existing->second.device.impl != device.impl) {
+			throw std::runtime_error("Descriptor backend instance was registered with a different device");
+		}
+		return;
+	}
+	const std::string suffix = ".backend" + std::to_string(key);
+	BackendHeaps heaps{};
+	heaps.device = device;
+	heaps.cbvSrvUav = std::make_shared<DescriptorHeap>(device, rhi::DescriptorHeapType::CbvSrvUav,
+		1000000, true, "cbvSrvUavHeap" + suffix);
+	heaps.sampler = std::make_shared<DescriptorHeap>(device, rhi::DescriptorHeapType::Sampler,
+		2048, true, "samplerHeap" + suffix);
+	heaps.rtv = std::make_shared<DescriptorHeap>(device, rhi::DescriptorHeapType::RTV,
+		10000, false, "rtvHeap" + suffix);
+	heaps.dsv = std::make_shared<DescriptorHeap>(device, rhi::DescriptorHeapType::DSV,
+		10000, false, "dsvHeap" + suffix);
+	heaps.nonShaderVisible = std::make_shared<DescriptorHeap>(device, rhi::DescriptorHeapType::CbvSrvUav,
+		100000, false, "nonShaderVisibleHeap" + suffix);
+	for (const auto& [index, description] : m_indexedSamplerDescriptions) {
+		device.CreateSampler({ heaps.sampler->GetHeap().GetHandle(), index }, description);
+	}
+	m_backendHeaps.emplace(key, std::move(heaps));
+	spdlog::info("DescriptorHeapManager registered backend-local descriptor arenas for instance {}", key);
+}
+
+DescriptorHeapManager::BackendHeaps* DescriptorHeapManager::FindBackendHeaps(BackendInstanceId backendInstance) {
+	const auto it = m_backendHeaps.find(static_cast<uint8_t>(backendInstance));
+	return it == m_backendHeaps.end() ? nullptr : &it->second;
+}
+
+const DescriptorHeapManager::BackendHeaps* DescriptorHeapManager::FindBackendHeaps(BackendInstanceId backendInstance) const {
+	const auto it = m_backendHeaps.find(static_cast<uint8_t>(backendInstance));
+	return it == m_backendHeaps.end() ? nullptr : &it->second;
 }
 
 void DescriptorHeapManager::Cleanup() {
@@ -100,6 +149,8 @@ void DescriptorHeapManager::Cleanup() {
             }
         }
     }
+    m_backendHeaps.clear();
+	m_indexedSamplerDescriptions.clear();
     m_cbvSrvUavHeap.reset();
     m_samplerHeap.reset();
     m_rtvHeap.reset();
@@ -316,8 +367,8 @@ void DescriptorHeapManager::AssignDescriptorSlots(
     const ViewRequirements& req)
 {
     std::scoped_lock lock(m_descriptorMutationMutex);
-    ReserveDescriptorSlotsUnlocked(target, req);
-    UpdateDescriptorContentsUnlocked(target, apiResource, req);
+	ReserveDescriptorSlotsUnlocked(target, req);
+	UpdateDescriptorContentsUnlocked(target, apiResource, req, BackendInstanceId::Primary);
 }
 
 void DescriptorHeapManager::ReserveDescriptorSlots(
@@ -463,18 +514,26 @@ void DescriptorHeapManager::ReserveDescriptorSlotsUnlocked(
 void DescriptorHeapManager::UpdateDescriptorContents(
     GloballyIndexedResource& target,
     rhi::Resource& apiResource,
-    const ViewRequirements& req)
+    const ViewRequirements& req,
+	BackendInstanceId backendInstance)
 {
     std::scoped_lock lock(m_descriptorMutationMutex);
-    UpdateDescriptorContentsUnlocked(target, apiResource, req);
+    UpdateDescriptorContentsUnlocked(target, apiResource, req, backendInstance);
 }
 
 void DescriptorHeapManager::UpdateDescriptorContentsUnlocked(
     GloballyIndexedResource& target,
     rhi::Resource& apiResource,
-    const ViewRequirements& req)
+    const ViewRequirements& req,
+	BackendInstanceId backendInstance)
 {
-    auto device = DeviceManager::GetInstance().GetDevice();
+    const auto* backendHeaps = FindBackendHeaps(backendInstance);
+	if (!backendHeaps) throw std::runtime_error("Descriptor backend instance is not registered");
+	auto device = backendHeaps->device;
+	const auto shaderHeap = backendHeaps->cbvSrvUav->GetHeap().GetHandle();
+	const auto rtvHeap = backendHeaps->rtv->GetHeap().GetHandle();
+	const auto dsvHeap = backendHeaps->dsv->GetHeap().GetHandle();
+	const auto cpuHeap = backendHeaps->nonShaderVisible->GetHeap().GetHandle();
 
     if (!m_cbvSrvUavHeap || !m_samplerHeap || !m_rtvHeap || !m_dsvHeap || !m_nonShaderVisibleHeap) {
         spdlog::error("DescriptorHeapManager::UpdateDescriptorContents called before DescriptorHeapManager::Initialize");
@@ -538,7 +597,7 @@ void DescriptorHeapManager::UpdateDescriptorContentsUnlocked(
                     }
 
                     const auto& slot = target.GetSRVInfo(srvViewType, mip, slice).slot;
-                    device.CreateShaderResourceView({ slot.heap, slot.index }, apiResource.GetHandle(), srvDesc);
+                    device.CreateShaderResourceView({ shaderHeap, slot.index }, apiResource.GetHandle(), srvDesc);
                 }
             }
 
@@ -561,7 +620,7 @@ void DescriptorHeapManager::UpdateDescriptorContentsUnlocked(
                     srvDesc.tex2DArray.planeSlice = 0u;
 
                     const auto& slot = target.GetSRVInfo(SRVViewType::Texture2DArrayFull, mip, 0u).slot;
-                    device.CreateShaderResourceView({ slot.heap, slot.index }, apiResource.GetHandle(), srvDesc);
+                    device.CreateShaderResourceView({ shaderHeap, slot.index }, apiResource.GetHandle(), srvDesc);
                 }
             }
             else if (tex->isCubemap && tex->isArray) {
@@ -582,7 +641,7 @@ void DescriptorHeapManager::UpdateDescriptorContentsUnlocked(
                     srvDesc.cubeArray.numCubes = tex->arraySize;
 
                     const auto& slot = target.GetSRVInfo(SRVViewType::TextureCubeArrayFull, mip, 0u).slot;
-                    device.CreateShaderResourceView({ slot.heap, slot.index }, apiResource.GetHandle(), srvDesc);
+                    device.CreateShaderResourceView({ shaderHeap, slot.index }, apiResource.GetHandle(), srvDesc);
                 }
             }
 
@@ -606,7 +665,7 @@ void DescriptorHeapManager::UpdateDescriptorContentsUnlocked(
                         srvDesc.tex2DArray.planeSlice = 0;
 
                         const auto& slot = target.GetSRVInfo(SRVViewType::Texture2DArray, mip, slice).slot;
-                        device.CreateShaderResourceView({ slot.heap, slot.index }, apiResource.GetHandle(), srvDesc);
+                        device.CreateShaderResourceView({ shaderHeap, slot.index }, apiResource.GetHandle(), srvDesc);
                     }
                 }
             }
@@ -635,7 +694,7 @@ void DescriptorHeapManager::UpdateDescriptorContentsUnlocked(
                     }
 
                     const auto& slot = target.GetUAVShaderVisibleInfo(mip, slice).slot;
-                    device.CreateUnorderedAccessView({ slot.heap, slot.index }, apiResource.GetHandle(), uavDesc);
+                    device.CreateUnorderedAccessView({ shaderHeap, slot.index }, apiResource.GetHandle(), uavDesc);
                 }
             }
 
@@ -650,7 +709,7 @@ void DescriptorHeapManager::UpdateDescriptorContentsUnlocked(
                     uavDesc.texture2DArray.planeSlice = 0u;
 
                     const auto& slot = target.GetUAVShaderVisibleInfo(UAVViewType::Texture2DArrayFull, mip, 0u).slot;
-                    device.CreateUnorderedAccessView({ slot.heap, slot.index }, apiResource.GetHandle(), uavDesc);
+                    device.CreateUnorderedAccessView({ shaderHeap, slot.index }, apiResource.GetHandle(), uavDesc);
                 }
             }
         }
@@ -676,7 +735,7 @@ void DescriptorHeapManager::UpdateDescriptorContentsUnlocked(
                     }
 
                     const auto& slot = target.GetUAVNonShaderVisibleInfo(mip, slice).slot;
-                    device.CreateUnorderedAccessView({ slot.heap, slot.index }, apiResource.GetHandle(), uavDesc);
+                    device.CreateUnorderedAccessView({ cpuHeap, slot.index }, apiResource.GetHandle(), uavDesc);
                 }
             }
         }
@@ -697,7 +756,7 @@ void DescriptorHeapManager::UpdateDescriptorContentsUnlocked(
                     };
 
                     const auto& slot = target.GetRTVInfo(mip, slice).slot;
-                    device.CreateRenderTargetView({ slot.heap, slot.index }, apiResource.GetHandle(), rtvDesc);
+                    device.CreateRenderTargetView({ rtvHeap, slot.index }, apiResource.GetHandle(), rtvDesc);
                 }
             }
         }
@@ -718,7 +777,7 @@ void DescriptorHeapManager::UpdateDescriptorContentsUnlocked(
                     };
 
                     const auto& slot = target.GetDSVInfo(mip, slice).slot;
-                    device.CreateDepthStencilView({ slot.heap, slot.index }, apiResource.GetHandle(), dsvDesc);
+                    device.CreateDepthStencilView({ dsvHeap, slot.index }, apiResource.GetHandle(), dsvDesc);
                 }
             }
         }
@@ -730,7 +789,7 @@ void DescriptorHeapManager::UpdateDescriptorContentsUnlocked(
         if (buf->createCBV) {
             const auto& slot = target.GetCBVInfo().slot;
             device.CreateConstantBufferView(
-                { slot.heap, slot.index },
+                { shaderHeap, slot.index },
                 apiResource.GetHandle(),
                 buf->cbvDesc);
         }
@@ -738,7 +797,7 @@ void DescriptorHeapManager::UpdateDescriptorContentsUnlocked(
         if (buf->createSRV) {
             const auto& slot = target.GetSRVInfo(SRVViewType::Buffer, 0, 0).slot;
             device.CreateShaderResourceView(
-                { slot.heap, slot.index },
+                { shaderHeap, slot.index },
                 apiResource.GetHandle(),
                 buf->srvDesc);
         }
@@ -746,7 +805,7 @@ void DescriptorHeapManager::UpdateDescriptorContentsUnlocked(
         if (buf->createUAV) {
             const auto& slot = target.GetUAVShaderVisibleInfo(0, 0).slot;
             device.CreateUnorderedAccessView(
-                { slot.heap, slot.index },
+                { shaderHeap, slot.index },
                 apiResource.GetHandle(),
                 buf->uavDesc);
         }
@@ -754,7 +813,7 @@ void DescriptorHeapManager::UpdateDescriptorContentsUnlocked(
         if (buf->createNonShaderVisibleUAV) {
             const auto& slot = target.GetUAVNonShaderVisibleInfo(0, 0).slot;
             device.CreateUnorderedAccessView(
-                { slot.heap, slot.index },
+                { cpuHeap, slot.index },
                 apiResource.GetHandle(),
                 buf->uavDesc);
         }
@@ -766,18 +825,46 @@ void DescriptorHeapManager::UpdateDescriptorContentsUnlocked(
     throw std::runtime_error("DescriptorHeapManager::UpdateDescriptorContents: invalid ViewRequirements");
 }
 
-rhi::DescriptorHeap DescriptorHeapManager::GetSRVDescriptorHeap() const {
-    if (!m_cbvSrvUavHeap) {
-        return {};
-    }
-    return m_cbvSrvUavHeap->GetHeap();
+rhi::DescriptorHeap DescriptorHeapManager::GetSRVDescriptorHeap(BackendInstanceId backendInstance) const {
+    const auto* heaps = FindBackendHeaps(backendInstance);
+    return heaps && heaps->cbvSrvUav ? heaps->cbvSrvUav->GetHeap() : rhi::DescriptorHeap{};
 }
 
-rhi::DescriptorHeap DescriptorHeapManager::GetSamplerDescriptorHeap() const {
-    if (!m_samplerHeap) {
-        return {};
-    }
-    return m_samplerHeap->GetHeap();
+rhi::DescriptorHeap DescriptorHeapManager::GetSamplerDescriptorHeap(BackendInstanceId backendInstance) const {
+    const auto* heaps = FindBackendHeaps(backendInstance);
+    return heaps && heaps->sampler ? heaps->sampler->GetHeap() : rhi::DescriptorHeap{};
+}
+
+rhi::DescriptorHeap DescriptorHeapManager::GetRTVDescriptorHeap(BackendInstanceId backendInstance) const {
+	const auto* heaps = FindBackendHeaps(backendInstance);
+	return heaps && heaps->rtv ? heaps->rtv->GetHeap() : rhi::DescriptorHeap{};
+}
+
+rhi::DescriptorHeap DescriptorHeapManager::GetDSVDescriptorHeap(BackendInstanceId backendInstance) const {
+	const auto* heaps = FindBackendHeaps(backendInstance);
+	return heaps && heaps->dsv ? heaps->dsv->GetHeap() : rhi::DescriptorHeap{};
+}
+
+rhi::DescriptorHeap DescriptorHeapManager::GetNonShaderVisibleDescriptorHeap(BackendInstanceId backendInstance) const {
+	const auto* heaps = FindBackendHeaps(backendInstance);
+	return heaps && heaps->nonShaderVisible ? heaps->nonShaderVisible->GetHeap() : rhi::DescriptorHeap{};
+}
+
+rhi::DescriptorSlot DescriptorHeapManager::ResolveDescriptorSlot(BackendInstanceId backendInstance,
+	rhi::DescriptorHeapType type, bool shaderVisible, uint32_t logicalIndex) const {
+	const auto* heaps = FindBackendHeaps(backendInstance);
+	if (!heaps) return {};
+	const std::shared_ptr<DescriptorHeap>* heap = nullptr;
+	switch (type) {
+	case rhi::DescriptorHeapType::CbvSrvUav:
+		heap = shaderVisible ? &heaps->cbvSrvUav : &heaps->nonShaderVisible; break;
+	case rhi::DescriptorHeapType::Sampler: heap = &heaps->sampler; break;
+	case rhi::DescriptorHeapType::RTV: heap = &heaps->rtv; break;
+	case rhi::DescriptorHeapType::DSV: heap = &heaps->dsv; break;
+	default: return {};
+	}
+	return *heap && (*heap)->GetHeap() ? rhi::DescriptorSlot{ (*heap)->GetHeap().GetHandle(), logicalIndex }
+		: rhi::DescriptorSlot{};
 }
 
 UINT DescriptorHeapManager::CreateIndexedSampler(const rhi::SamplerDesc& samplerDesc) {
@@ -791,6 +878,11 @@ UINT DescriptorHeapManager::CreateIndexedSampler(const rhi::SamplerDesc& sampler
     auto device = DeviceManager::GetInstance().GetDevice();
     UINT index = m_samplerHeap->AllocateDescriptor();
     device.CreateSampler({ m_samplerHeap->GetHeap().GetHandle(), index }, samplerDesc);
+	m_indexedSamplerDescriptions.insert_or_assign(index, samplerDesc);
+	for (auto& [backend, heaps] : m_backendHeaps) {
+		if (backend == static_cast<uint8_t>(BackendInstanceId::Primary) || !heaps.sampler) continue;
+		heaps.device.CreateSampler({ heaps.sampler->GetHeap().GetHandle(), index }, samplerDesc);
+	}
     return index;
 }
 

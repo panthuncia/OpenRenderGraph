@@ -1194,6 +1194,11 @@ public:
         return std::move(*this);
     }
 
+	RenderPassBuilder& RequireBackend(rhi::Backend backend) & { m_backendAffinity = { BackendAffinityStrength::Required, backend }; return *this; }
+	RenderPassBuilder RequireBackend(rhi::Backend backend) && { m_backendAffinity = { BackendAffinityStrength::Required, backend }; return std::move(*this); }
+	RenderPassBuilder& PreferBackend(rhi::Backend backend) & { m_backendAffinity = { BackendAffinityStrength::Preferred, backend }; return *this; }
+	RenderPassBuilder PreferBackend(rhi::Backend backend) && { m_backendAffinity = { BackendAffinityStrength::Preferred, backend }; return std::move(*this); }
+
 	RenderPassBuilder& WithExternalWaitBeforeTransitions(rhi::Timeline timeline, uint64_t value) & {
 		params.externalWaitsBeforeTransitions.push_back({ timeline, value });
 		return *this;
@@ -1277,6 +1282,7 @@ private:
         params.preferredQueueKind = m_preferredQueueKind;
         params.queueAssignmentPolicy = m_queueAssignmentPolicy;
         params.pinnedQueueSlot = m_pinnedQueueSlot;
+		params.backendAffinity = m_backendAffinity;
         params.identifierSet = _declaredIds;
         params.staticResourceRequirements = GatherResourceRequirements();
 
@@ -1293,6 +1299,7 @@ private:
 		m_preferredQueueKind = QueueKind::Graphics;
 		m_queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
         m_pinnedQueueSlot = std::nullopt;
+		m_backendAffinity = {};
 	}
 
     // Shader Resource
@@ -1643,6 +1650,7 @@ private:
 	QueueKind m_preferredQueueKind = QueueKind::Graphics;
     QueueAssignmentPolicy m_queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
     std::optional<QueueSlotIndex> m_pinnedQueueSlot;
+	BackendAffinity m_backendAffinity{};
     std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> _declaredIds;
     std::vector<ResolverSnapshot> resolverSnapshots_;
 
@@ -1834,6 +1842,11 @@ public:
                 return std::move(*this);
         }
 
+		ComputePassBuilder& RequireBackend(rhi::Backend backend) & { m_backendAffinity = { BackendAffinityStrength::Required, backend }; return *this; }
+		ComputePassBuilder RequireBackend(rhi::Backend backend) && { m_backendAffinity = { BackendAffinityStrength::Required, backend }; return std::move(*this); }
+		ComputePassBuilder& PreferBackend(rhi::Backend backend) & { m_backendAffinity = { BackendAffinityStrength::Preferred, backend }; return *this; }
+		ComputePassBuilder PreferBackend(rhi::Backend backend) && { m_backendAffinity = { BackendAffinityStrength::Preferred, backend }; return std::move(*this); }
+
 		ComputePassBuilder& WithExternalWaitBeforeTransitions(rhi::Timeline timeline, uint64_t value) & {
 			params.externalWaitsBeforeTransitions.push_back({ timeline, value });
 			return *this;
@@ -1967,6 +1980,7 @@ private:
         params.preferredQueueKind = m_preferredQueueKind;
         params.queueAssignmentPolicy = m_queueAssignmentPolicy;
         params.pinnedQueueSlot = m_pinnedQueueSlot;
+		params.backendAffinity = m_backendAffinity;
         params.staticResourceRequirements = GatherResourceRequirements();
 
         graph->AddComputePass(pass, params, passName, TakeResolverSnapshots());
@@ -1981,6 +1995,7 @@ private:
         m_preferredQueueKind = QueueKind::Compute;
 		m_queueAssignmentPolicy = QueueAssignmentPolicy::Automatic;
         m_pinnedQueueSlot = std::nullopt;
+		m_backendAffinity = {};
     }
 
     // Shader resource
@@ -2164,6 +2179,7 @@ private:
 	QueueKind m_preferredQueueKind = QueueKind::Compute;
     QueueAssignmentPolicy m_queueAssignmentPolicy = QueueAssignmentPolicy::Automatic;
     std::optional<QueueSlotIndex> m_pinnedQueueSlot;
+	BackendAffinity m_backendAffinity{};
     std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> _declaredIds;
     std::vector<ResolverSnapshot> resolverSnapshots_;
 
@@ -2284,6 +2300,11 @@ public:
         return std::move(*this);
     }
 
+	CopyPassBuilder& RequireBackend(rhi::Backend backend) & { m_backendAffinity = { BackendAffinityStrength::Required, backend }; return *this; }
+	CopyPassBuilder RequireBackend(rhi::Backend backend) && { m_backendAffinity = { BackendAffinityStrength::Required, backend }; return std::move(*this); }
+	CopyPassBuilder& PreferBackend(rhi::Backend backend) & { m_backendAffinity = { BackendAffinityStrength::Preferred, backend }; return *this; }
+	CopyPassBuilder PreferBackend(rhi::Backend backend) && { m_backendAffinity = { BackendAffinityStrength::Preferred, backend }; return std::move(*this); }
+
 	CopyPassBuilder& WithExternalWaitBeforeTransitions(rhi::Timeline timeline, uint64_t value) & {
 		params.externalWaitsBeforeTransitions.push_back({ timeline, value });
 		return *this;
@@ -2380,6 +2401,7 @@ private:
         params.preferredQueueKind = m_preferredQueueKind;
         params.queueAssignmentPolicy = m_queueAssignmentPolicy;
         params.pinnedQueueSlot = m_pinnedQueueSlot;
+		params.backendAffinity = m_backendAffinity;
         params.staticResourceRequirements = GatherResourceRequirements();
 
         graph->AddCopyPass(pass, params, passName, TakeResolverSnapshots());
@@ -2394,6 +2416,7 @@ private:
         m_preferredQueueKind = QueueKind::Copy;
 		m_queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
         m_pinnedQueueSlot = std::nullopt;
+		m_backendAffinity = {};
     }
 
     template<typename T>
@@ -2460,6 +2483,7 @@ private:
     QueueKind m_preferredQueueKind = QueueKind::Copy;
 	QueueAssignmentPolicy m_queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
     std::optional<QueueSlotIndex> m_pinnedQueueSlot;
+	BackendAffinity m_backendAffinity{};
     std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> _declaredIds;
     std::vector<ResolverSnapshot> resolverSnapshots_;
 

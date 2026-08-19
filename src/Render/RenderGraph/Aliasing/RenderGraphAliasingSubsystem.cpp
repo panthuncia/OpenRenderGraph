@@ -78,6 +78,7 @@ void org::alias::RenderGraphAliasingSubsystem::ResetPersistentState(RenderGraph&
 		}
 	}
 	renderGraph.persistentAliasPools.clear();
+	renderGraph.m_sharedAliasPools.clear();
 	renderGraph.aliasPoolPlanFrameIndex = 0;
 }
 

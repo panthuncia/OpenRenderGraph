@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <unordered_set>
 #include <variant>
 #include <vector>
@@ -9,6 +10,7 @@
 #include <rhi.h>
 
 #include "Render/DescriptorHeap.h"
+#include "Render/QueueKind.h"
 #include "Render/Runtime/DescriptorServiceTypes.h"
 #include "Resources/GPUBacking/GpuBufferBacking.h"
 
@@ -28,6 +30,7 @@ public:
 	}
 
 	void Initialize();
+	void RegisterBackend(BackendInstanceId backendInstance, rhi::Device device);
 	void Cleanup();
 
 	void AssignDescriptorSlots(
@@ -42,7 +45,8 @@ public:
 	void UpdateDescriptorContents(
 		GloballyIndexedResource& target,
 		rhi::Resource& apiResource,
-		const ViewRequirements& req);
+		const ViewRequirements& req,
+		BackendInstanceId backendInstance = BackendInstanceId::Primary);
 
 	void RetireDescriptorSlots(std::vector<std::pair<std::shared_ptr<DescriptorHeap>, UINT>> slots);
 	void RetireResource(std::shared_ptr<Resource> resource);
@@ -73,8 +77,13 @@ public:
 	// registry destroys and recreates its timelines.
 	void DrainDeferredReleasesAfterDeviceIdle();
 
-	rhi::DescriptorHeap GetSRVDescriptorHeap() const;
-	rhi::DescriptorHeap GetSamplerDescriptorHeap() const;
+	rhi::DescriptorHeap GetSRVDescriptorHeap(BackendInstanceId backendInstance = BackendInstanceId::Primary) const;
+	rhi::DescriptorHeap GetSamplerDescriptorHeap(BackendInstanceId backendInstance = BackendInstanceId::Primary) const;
+	rhi::DescriptorHeap GetRTVDescriptorHeap(BackendInstanceId backendInstance = BackendInstanceId::Primary) const;
+	rhi::DescriptorHeap GetDSVDescriptorHeap(BackendInstanceId backendInstance = BackendInstanceId::Primary) const;
+	rhi::DescriptorHeap GetNonShaderVisibleDescriptorHeap(BackendInstanceId backendInstance = BackendInstanceId::Primary) const;
+	rhi::DescriptorSlot ResolveDescriptorSlot(BackendInstanceId backendInstance, rhi::DescriptorHeapType type,
+		bool shaderVisible, uint32_t logicalIndex) const;
 	UINT CreateIndexedSampler(const rhi::SamplerDesc& samplerDesc);
 	rhi::DescriptorSlot AllocateDescriptorSlot(rhi::DescriptorHeapType type, bool shaderVisible);
 	void RetireDescriptorSlot(rhi::DescriptorSlot slot);
@@ -95,13 +104,29 @@ private:
 	void UpdateDescriptorContentsUnlocked(
 		GloballyIndexedResource& target,
 		rhi::Resource& apiResource,
-		const ViewRequirements& req);
+		const ViewRequirements& req,
+		BackendInstanceId backendInstance);
+
+	struct BackendHeaps {
+		rhi::Device device{};
+		std::shared_ptr<DescriptorHeap> cbvSrvUav;
+		std::shared_ptr<DescriptorHeap> sampler;
+		std::shared_ptr<DescriptorHeap> rtv;
+		std::shared_ptr<DescriptorHeap> dsv;
+		std::shared_ptr<DescriptorHeap> nonShaderVisible;
+	};
+	BackendHeaps* FindBackendHeaps(BackendInstanceId backendInstance);
+	const BackendHeaps* FindBackendHeaps(BackendInstanceId backendInstance) const;
 
 	std::shared_ptr<DescriptorHeap> m_cbvSrvUavHeap;
 	std::shared_ptr<DescriptorHeap> m_samplerHeap;
 	std::shared_ptr<DescriptorHeap> m_rtvHeap;
 	std::shared_ptr<DescriptorHeap> m_dsvHeap;
 	std::shared_ptr<DescriptorHeap> m_nonShaderVisibleHeap;
+	std::unordered_map<uint8_t, BackendHeaps> m_backendHeaps;
+	// Logical sampler indices are part of shader ABI. Retain recipes so a
+	// backend registered after renderer startup receives identical contents.
+	std::unordered_map<UINT, rhi::SamplerDesc> m_indexedSamplerDescriptions;
 	struct DeferredRelease {
 		std::vector<std::pair<std::shared_ptr<DescriptorHeap>, UINT>> descriptorSlots;
 		std::vector<std::unique_ptr<GpuBufferBacking>> bufferBackings;

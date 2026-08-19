@@ -45,6 +45,7 @@ struct ComputePassParameters {
 	QueueKind preferredQueueKind = QueueKind::Compute;
 	QueueAssignmentPolicy queueAssignmentPolicy = QueueAssignmentPolicy::Automatic;
 	std::optional<QueueSlotIndex> pinnedQueueSlot; // Target a specific queue slot instead of using preferredQueueKind
+	BackendAffinity backendAffinity{};
 };
 
 class ComputePassBuilder;
