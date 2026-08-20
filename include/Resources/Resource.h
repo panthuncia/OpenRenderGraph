@@ -202,7 +202,12 @@ public:
 		return true;
 	}
 	bool HasAPIRepresentation(BackendInstanceId backendInstance) {
-		return GetAPIResource(backendInstance).IsValid();
+		if (GetAttachedAPIRepresentation(backendInstance)) return true;
+		// The implicit primary backing is intentionally not counted as an explicit
+		// representation. This query is used to decide whether interop
+		// materialization still has work to do and must be safe for unmaterialized
+		// graph resources.
+		return false;
 	}
 	std::vector<BackendInstanceId> GetRepresentationInstances() const {
 		std::vector<BackendInstanceId> result{ BackendInstanceId::Primary };

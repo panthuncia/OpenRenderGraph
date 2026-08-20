@@ -6438,6 +6438,35 @@ void RenderGraph::MaterializeUnmaterializedResources(std::span<const uint64_t> o
 
 void RenderGraph::MaterializeMultiBackendRepresentations() {
 	if (m_backendDevices.size() < 2 || m_frameSchedulingResourceCount == 0) return;
+	// Scheduling indices are deliberately compacted/merged (dynamic wrappers and
+	// their current backings may share one), so they are not interchangeable with
+	// DAG resource indices. Build an exact current-frame ID lookup from pass
+	// requirements. This also covers pass-owned resources which are already
+	// materialized and therefore never entered the transient materialize list.
+	std::unordered_map<uint64_t, Resource*> currentResourcesBySchedulingID;
+	currentResourcesBySchedulingID.reserve(m_frameSchedulingResourceCount);
+	auto collectCurrentResource = [&](const ResourceRegistry::RegistryHandle& handle) {
+		Resource* resource = handle.IsEphemeral() ? handle.GetEphemeralPtr() : _registry.Resolve(handle);
+		resource = UnwrapDynamicResource(resource);
+		if (!resource) return;
+		currentResourcesBySchedulingID.try_emplace(resource->GetSchedulingResourceID(), resource);
+		currentResourcesBySchedulingID.try_emplace(resource->GetGlobalResourceID(), resource);
+	};
+	for (const auto& framePass : m_framePasses) {
+		std::visit([&](const auto& passAndResources) {
+			using PassRecord = std::remove_cvref_t<decltype(passAndResources)>;
+			if constexpr (std::is_same_v<PassRecord, std::monostate>) {
+				return;
+			}
+			else {
+			ForEachFrameRequirement(passAndResources.resources, [&](const auto& requirement) {
+				collectCurrentResource(requirement.resourceHandleAndRange.resource);
+			});
+			for (const auto& transition : passAndResources.resources.internalTransitions)
+				collectCurrentResource(transition.first.resource);
+			}
+		}, framePass.pass);
+	}
 	std::vector<std::vector<uint8_t>> uses(
 		m_frameSchedulingResourceCount, std::vector<uint8_t>(m_backendDevices.size(), 0));
 	for (size_t passIndex = 0; passIndex < m_framePassSchedulingSummaries.size() && passIndex < m_assignedQueueSlotsByFramePass.size(); ++passIndex) {
@@ -6450,6 +6479,12 @@ void RenderGraph::MaterializeMultiBackendRepresentations() {
 			if (resourceIndex < uses.size()) uses[resourceIndex][instanceIndex] = 1;
 		}
 	}
+	for (const auto& [resourceID, mask] : m_frameBackendUseMaskByResourceID) {
+		const auto index = TryGetFrameSchedulingResourceIndex(resourceID);
+		if (!index || *index >= uses.size()) continue;
+		for (size_t backend = 0; backend < uses[*index].size(); ++backend)
+			uses[*index][backend] |= (mask & (uint64_t{1} << backend)) != 0;
+	}
 	BackendDeviceEntry* d3d12 = nullptr;
 	BackendDeviceEntry* vulkan = nullptr;
 	for (auto& entry : m_backendDevices) {
@@ -6457,6 +6492,8 @@ void RenderGraph::MaterializeMultiBackendRepresentations() {
 		if (entry.backend == rhi::Backend::Vulkan) vulkan = &entry;
 	}
 	if (!d3d12 || !vulkan) return;
+	bool drainedForSharedPoolReplacement = false;
+	std::vector<std::pair<rhi::HeapPtr, rhi::HeapPtr>> retiredSharedPools;
 
 	for (size_t resourceIndex = 0; resourceIndex < uses.size(); ++resourceIndex) {
 		size_t backendCount = 0;
@@ -6466,9 +6503,29 @@ void RenderGraph::MaterializeMultiBackendRepresentations() {
 			nonPrimaryUse |= i != 0 && uses[resourceIndex][i] != 0;
 		}
 		if (!nonPrimaryUse && backendCount < 2) continue;
-		Resource* resource = resourceIndex < m_frameCompileResources.size()
-			? UnwrapDynamicResource(m_frameCompileResources[resourceIndex].resource)
-			: nullptr;
+		// This function can run during alias planning, before
+		// RebuildFrameCompileResources. Never consult that prior-frame pointer
+		// cache here; resolve against the current frame's stable IDs/DAG.
+		Resource* resource = nullptr;
+		if (resourceIndex < m_frameSchedulingResourceIDByIndex.size()) {
+			const uint64_t schedulingID = m_frameSchedulingResourceIDByIndex[resourceIndex];
+			if (auto currentIt = currentResourcesBySchedulingID.find(schedulingID);
+				currentIt != currentResourcesBySchedulingID.end()) {
+				resource = currentIt->second;
+			}
+			else if (auto current = GetResourceByID(schedulingID)) {
+				resource = UnwrapDynamicResource(current.get());
+			}
+		}
+		if (!resource) {
+			for (const auto& [candidateID, candidateIndex] : m_frameSchedulingResourceIndexEntries) {
+				if (candidateIndex != resourceIndex) continue;
+				if (auto candidate = GetResourceByID(candidateID)) {
+					resource = UnwrapDynamicResource(candidate.get());
+					break;
+				}
+			}
+		}
 		if (!resource && resourceIndex < m_frameSchedulingResourceIDByIndex.size()) {
 			if (auto shared = GetResourceByID(m_frameSchedulingResourceIDByIndex[resourceIndex])) {
 				resource = UnwrapDynamicResource(shared.get());
@@ -6478,13 +6535,32 @@ void RenderGraph::MaterializeMultiBackendRepresentations() {
 		if (!resource->IsRenderGraphManaged()) {
 			throw std::runtime_error("Multi-RHI resource '" + resource->GetName() + "' is externally managed");
 		}
+		const uint64_t schedulingID = resourceIndex < m_frameSchedulingResourceIDByIndex.size()
+			? m_frameSchedulingResourceIDByIndex[resourceIndex] : resource->GetSchedulingResourceID();
+		const auto generationPlacement = aliasPlacementRangesByID.find(schedulingID);
+		const auto generationPool = generationPlacement == aliasPlacementRangesByID.end()
+			? persistentAliasPools.end() : persistentAliasPools.find(generationPlacement->second.poolID);
+		const bool staleSharedPoolGeneration = generationPool != persistentAliasPools.end() &&
+			generationPool->second.multiBackendShared &&
+			(!m_sharedAliasResourcePoolGeneration.contains(schedulingID) ||
+			 m_sharedAliasResourcePoolGeneration.at(schedulingID) != generationPool->second.generation);
 		bool complete = true;
 		for (size_t i = 0; i < uses[resourceIndex].size(); ++i) {
 			if (uses[resourceIndex][i] && !resource->HasAPIRepresentation(static_cast<BackendInstanceId>(static_cast<uint8_t>(i)))) {
 				complete = false;
 			}
 		}
+		if (staleSharedPoolGeneration) complete = false;
 		if (complete) continue;
+		if (staleSharedPoolGeneration &&
+			(resource->HasAPIRepresentation(d3d12->id) || resource->HasAPIRepresentation(vulkan->id))) {
+			if (!drainedForSharedPoolReplacement) {
+				if (!rhi::IsOk(d3d12->device.WaitIdle()) || !rhi::IsOk(vulkan->device.WaitIdle()))
+					throw std::runtime_error("Failed to drain devices for shared alias pool replacement");
+				drainedForSharedPoolReplacement = true;
+			}
+			resource->ClearAPIRepresentations();
+		}
 
 		rhi::ResourceDesc desc{};
 		if (!resource->TryGetRHIResourceDesc(desc) || desc.heapType != rhi::HeapType::DeviceLocal ||
@@ -6502,10 +6578,8 @@ void RenderGraph::MaterializeMultiBackendRepresentations() {
 			throw std::runtime_error("Multi-RHI texture '" + resource->GetName() + "' is unsupported for its exact format/usage");
 		}
 		bool placedOnSharedHeap = false;
-		const uint64_t schedulingID = resourceIndex < m_frameSchedulingResourceIDByIndex.size()
-			? m_frameSchedulingResourceIDByIndex[resourceIndex] : resource->GetSchedulingResourceID();
-		// D3D12 shared heaps admit buffers and RT/DS-class textures, but not
-		// ordinary non-RT textures. Keep the latter on committed sharing.
+		// D3D12 shared heaps may contain buffers and RT/DS-class textures. Ordinary
+		// non-RT textures must use committed D3D12_RESOURCE sharing.
 		const bool sharedHeapCandidate = desc.type == rhi::ResourceType::Buffer ||
 			(desc.type == rhi::ResourceType::Texture2D &&
 				(desc.resourceFlags & rhi::ResourceFlags::RF_AllowRenderTarget) != 0 &&
@@ -6531,8 +6605,29 @@ void RenderGraph::MaterializeMultiBackendRepresentations() {
 					goto committed_multi_backend_resource;
 				}
 				auto& sharedPool = m_sharedAliasPools[placement.poolID];
-				if ((!sharedPool.d3d12 || !sharedPool.vulkan || sharedPool.capacityBytes < primaryPool->second.capacityBytes) &&
-					(sharedPool.resourceClass == 0 || sharedPool.resourceClass == resourceClass)) {
+				const bool replacePool = !sharedPool.d3d12 || !sharedPool.vulkan ||
+					sharedPool.generation != primaryPool->second.generation ||
+					sharedPool.capacityBytes < primaryPool->second.capacityBytes ||
+					sharedPool.resourceClass != resourceClass;
+				if (replacePool) {
+					if ((sharedPool.d3d12 || sharedPool.vulkan) && !drainedForSharedPoolReplacement) {
+						if (!rhi::IsOk(d3d12->device.WaitIdle()) || !rhi::IsOk(vulkan->device.WaitIdle()))
+							throw std::runtime_error("Failed to drain devices before shared alias heap growth");
+						drainedForSharedPoolReplacement = true;
+					}
+					// Destroy every placed object bound to the old imported memory before
+					// releasing that VkDeviceMemory/D3D12 heap pair.
+					for (auto it = m_sharedAliasResourcePoolID.begin(); it != m_sharedAliasResourcePoolID.end();) {
+						if (it->second != placement.poolID) { ++it; continue; }
+						Resource* oldResource = nullptr;
+						if (auto current = currentResourcesBySchedulingID.find(it->first); current != currentResourcesBySchedulingID.end())
+							oldResource = current->second;
+						else if (auto registered = GetResourceByID(it->first))
+							oldResource = UnwrapDynamicResource(registered.get());
+						if (oldResource) oldResource->ClearAPIRepresentations();
+						m_sharedAliasResourcePoolGeneration.erase(it->first);
+						it = m_sharedAliasResourcePoolID.erase(it);
+					}
 					rhi::HeapDesc heapDesc{};
 					heapDesc.sizeBytes = primaryPool->second.capacityBytes;
 					heapDesc.alignment = (std::max)(primaryPool->second.alignment, requiredAlignment);
@@ -6549,16 +6644,20 @@ void RenderGraph::MaterializeMultiBackendRepresentations() {
 					if (heapHandle.value) CloseHandle(static_cast<HANDLE>(heapHandle.value));
 #endif
 					if (rhi::IsOk(heapResult)) {
+						if (sharedPool.d3d12 || sharedPool.vulkan) {
+							retiredSharedPools.emplace_back(std::move(sharedPool.d3d12), std::move(sharedPool.vulkan));
+						}
 						sharedPool.d3d12 = std::move(newD3Heap);
 						sharedPool.vulkan = std::move(newVkHeap);
 						sharedPool.capacityBytes = heapDesc.sizeBytes;
 						sharedPool.resourceClass = resourceClass;
-						++sharedPool.generation;
+						sharedPool.generation = primaryPool->second.generation;
 						spdlog::info("RenderGraph created shared alias pool: pool={} capacity={} alignment={} class={} generation={}",
 							placement.poolID, heapDesc.sizeBytes, heapDesc.alignment, resourceClass, sharedPool.generation);
 					}
 				}
-				if (sharedPool.d3d12 && sharedPool.vulkan && sharedPool.resourceClass == resourceClass) {
+				if (sharedPool.d3d12 && sharedPool.vulkan && sharedPool.resourceClass == resourceClass &&
+					placement.endByte <= sharedPool.capacityBytes) {
 					rhi::ResourceDesc placedDesc = desc;
 					placedDesc.heapFlags = rhi::HeapFlags::None;
 					auto d3Placed = d3d12->device.CreatePlacedResource(sharedPool.d3d12->GetHandle(), placement.startByte, placedDesc, d3Resource);
@@ -6566,6 +6665,80 @@ void RenderGraph::MaterializeMultiBackendRepresentations() {
 						? vulkan->device.CreatePlacedResource(sharedPool.vulkan->GetHandle(), placement.startByte, placedDesc, vkResource)
 						: d3Placed;
 					placedOnSharedHeap = rhi::IsOk(d3Placed) && rhi::IsOk(vkPlaced);
+					if (placedOnSharedHeap && desc.type == rhi::ResourceType::Texture2D) {
+						// D3D12 requires every placed RT/DS resource to be initialized by
+						// D3D12 before use, even when Vulkan will be its first producer.
+						// A one-time enhanced discard transition initializes all
+						// subresources without allocating or clearing a second backing.
+						rhi::CommandAllocatorPtr allocator;
+						rhi::CommandListPtr list;
+						rhi::DescriptorHeapPtr initializationRtvHeap;
+						auto initResult = d3d12->device.CreateCommandAllocator(rhi::QueueKind::Graphics, allocator);
+						if (rhi::IsOk(initResult)) initResult = d3d12->device.CreateCommandList(rhi::QueueKind::Graphics, allocator.Get(), list);
+						if (rhi::IsOk(initResult)) {
+							rhi::DescriptorHeapDesc heapDesc{};
+							heapDesc.type = rhi::DescriptorHeapType::RTV;
+							heapDesc.capacity = 1;
+							heapDesc.debugName = "RenderGraph shared texture initialization RTV";
+							initResult = d3d12->device.CreateDescriptorHeap(heapDesc, initializationRtvHeap);
+						}
+						if (rhi::IsOk(initResult)) {
+							initResult = d3d12->device.CreateRenderTargetView(
+								{ initializationRtvHeap->GetHandle(), 0 }, d3Resource->GetHandle(), {});
+						}
+						if (rhi::IsOk(initResult)) {
+							rhi::TextureBarrier initialize{
+								.texture = d3Resource->GetHandle(),
+								.range = {
+									.baseMip = 0,
+									.mipCount = desc.texture.mipLevels,
+									.baseLayer = 0,
+									.layerCount = desc.texture.depthOrLayers,
+									.basePlane = 0,
+									.planeCount = 1,
+								},
+								.beforeSync = rhi::ResourceSyncState::None,
+								.afterSync = rhi::ResourceSyncState::All,
+								.beforeAccess = rhi::ResourceAccessType::None,
+								.afterAccess = rhi::ResourceAccessType::RenderTarget,
+								.beforeLayout = rhi::ResourceLayout::Undefined,
+								.afterLayout = rhi::ResourceLayout::RenderTarget,
+								.discard = true,
+							};
+							list->Barriers(rhi::BarrierBatch{ .textures = { &initialize, 1 } });
+							rhi::ColorAttachment attachment{};
+							attachment.rtv = { initializationRtvHeap->GetHandle(), 0 };
+							attachment.loadOp = rhi::LoadOp::DontCare;
+							attachment.resource = d3Resource->GetHandle();
+							attachment.mipSlice = -1;
+							rhi::PassBeginInfo begin{};
+							begin.colors = { &attachment, 1 };
+							begin.width = desc.texture.width;
+							begin.height = desc.texture.height;
+							list->BeginPass(begin);
+							list->EndPass();
+							rhi::TextureBarrier toCommon = initialize;
+							toCommon.beforeSync = rhi::ResourceSyncState::RenderTarget;
+							toCommon.afterSync = rhi::ResourceSyncState::All;
+							toCommon.beforeAccess = rhi::ResourceAccessType::RenderTarget;
+							toCommon.afterAccess = rhi::ResourceAccessType::Common;
+							toCommon.beforeLayout = rhi::ResourceLayout::RenderTarget;
+							toCommon.afterLayout = rhi::ResourceLayout::Common;
+							toCommon.discard = false;
+							list->Barriers(rhi::BarrierBatch{ .textures = { &toCommon, 1 } });
+							list->End();
+							const rhi::CommandList submitted[] = { list.Get() };
+							auto queue = d3d12->device.GetQueue(rhi::QueueKind::Graphics);
+							initResult = queue.Submit(submitted, {});
+							if (rhi::IsOk(initResult)) initResult = d3d12->device.WaitIdle();
+						}
+						if (rhi::Failed(initResult)) {
+							d3Resource.Reset(); vkResource.Reset();
+							placedOnSharedHeap = false;
+							spdlog::warn("RenderGraph shared alias texture initialization failed; using committed fallback: pool={} resource={}",
+								placement.poolID, schedulingID);
+						}
+					}
 					if (!placedOnSharedHeap) {
 						d3Resource.Reset(); vkResource.Reset();
 						spdlog::warn("RenderGraph shared alias placement rejected; using committed fallback: pool={} resource={} offset={}",
@@ -6593,14 +6766,32 @@ void RenderGraph::MaterializeMultiBackendRepresentations() {
 		if (rhi::Failed(result)) throw std::runtime_error("Failed to import Vulkan representation for '" + resource->GetName() + "'");
 		const ResourceState commonInitial{
 			rhi::ResourceAccessType::Common, rhi::ResourceLayout::Common, rhi::ResourceSyncState::All };
-		const ResourceState d3dInitial = desc.type == rhi::ResourceType::Texture2D
+		const ResourceState d3dInitial = desc.type == rhi::ResourceType::Texture2D && !placedOnSharedHeap
 			? ResourceState{ rhi::ResourceAccessType::None, rhi::ResourceLayout::Undefined, rhi::ResourceSyncState::None }
 			: commonInitial;
-		// The canonical D3D12 texture is created in UNDEFINED.  Its imported Vulkan
-		// representation observes the allocation after the producer releases it in
-		// COMMON, so the two API state trackers intentionally start differently.
+		const ResourceState vulkanInitial = desc.type == rhi::ResourceType::Texture2D
+			? ResourceState{ rhi::ResourceAccessType::None, rhi::ResourceLayout::Undefined, rhi::ResourceSyncState::None }
+			: commonInitial;
+		if (placedOnSharedHeap) {
+			if (auto* texture = dynamic_cast<PixelBuffer*>(resource); texture && texture->IsMaterialized()) texture->Dematerialize();
+			else if (auto* buffer = dynamic_cast<BufferBase*>(resource); buffer && buffer->IsMaterialized()) buffer->Dematerialize();
+		}
+		// Enhanced-barrier textures are created in the description's UNDEFINED
+		// layout on both APIs; buffers use the bridge-compatible COMMON state.
 		resource->AttachAPIRepresentation(d3d12->id, std::move(d3Resource), d3dInitial);
-		resource->AttachAPIRepresentation(vulkan->id, std::move(vkResource), commonInitial);
+		resource->AttachAPIRepresentation(vulkan->id, std::move(vkResource), vulkanInitial);
+		if (placedOnSharedHeap) {
+			const auto placement = aliasPlacementRangesByID.find(schedulingID);
+			if (placement != aliasPlacementRangesByID.end())
+			{
+				m_sharedAliasResourcePoolGeneration[schedulingID] = m_sharedAliasPools[placement->second.poolID].generation;
+				m_sharedAliasResourcePoolID[schedulingID] = placement->second.poolID;
+			}
+		}
+		else {
+			m_sharedAliasResourcePoolGeneration.erase(schedulingID);
+			m_sharedAliasResourcePoolID.erase(schedulingID);
+		}
 		resource->RefreshAPIRepresentationDescriptors(d3d12->id);
 		resource->RefreshAPIRepresentationDescriptors(vulkan->id);
 		spdlog::info("RenderGraph materialized multi-RHI representations: id={} name='{}' type={} sharedAlias={} D3D12Instance={} VulkanInstance={}",
@@ -6617,27 +6808,29 @@ void RenderGraph::PlanMultiBackendOwnershipTransfers() {
 	}
 	struct LastUse {
 		BackendInstanceId backend = BackendInstanceId::Primary;
+		size_t batchIndex = 0;
+		size_t queueIndex = 0;
 		std::vector<ExternalOwnershipBarrier>* releases = nullptr;
 		SymbolicTracker tracker{};
 	};
 	std::unordered_map<Resource*, LastUse> lastUses;
+	std::unordered_map<Resource*, std::unordered_map<uint8_t, SymbolicTracker>> representationTrackers;
 	auto backingGeneration = [](Resource* resource) -> uint64_t {
 		if (auto* backed = dynamic_cast<BackedResource*>(resource)) return backed->GetBackingGeneration();
 		return 0;
 	};
-	auto resetRepresentationToCommon = [](Resource* resource, BackendInstanceId backend) {
-		if (auto* tracker = resource->GetStateTracker(backend)) {
-			tracker->Reset({}, { rhi::ResourceAccessType::Common, rhi::ResourceLayout::Common, rhi::ResourceSyncState::All });
+	auto getRepresentationTracker = [&](Resource* resource, BackendInstanceId backend) -> SymbolicTracker& {
+		auto& byBackend = representationTrackers[resource];
+		auto [it, inserted] = byBackend.try_emplace(static_cast<uint8_t>(backend));
+		if (inserted) {
+			if (auto* tracker = resource->GetStateTracker(backend)) it->second.CopyFrom(*tracker);
 		}
-	};
-	auto applyRepresentationRequirement = [](Resource* resource, BackendInstanceId backend, const auto& requirement) {
-		if (auto* tracker = resource->GetStateTracker(backend)) {
-			std::vector<ResourceTransition> ignored;
-			tracker->Apply(requirement.resourceHandleAndRange.range, resource, requirement.state, ignored);
-		}
+		return it->second;
 	};
 
-	auto visitPass = [&](auto* passEntry, BackendInstanceId backend) {
+	auto visitPass = [&](auto* passEntry, BackendInstanceId backend, size_t batchIndex, size_t queueIndex) {
+		passEntry->backendPreTransitions.clear();
+		passEntry->backendPostTransitions.clear();
 		passEntry->externalAcquires.clear();
 		passEntry->externalReleases.clear();
 		ForEachFrameRequirement(passEntry->resources, [&](const auto& requirement) {
@@ -6662,6 +6855,8 @@ void RenderGraph::PlanMultiBackendOwnershipTransfers() {
 					&& persisted->second.backingGeneration == generation) {
 					LastUse restored{};
 					restored.backend = persisted->second.backend;
+					restored.batchIndex = batchIndex;
+					restored.queueIndex = queueIndex;
 					if (auto* tracker = resource->GetStateTracker(restored.backend)) restored.tracker.CopyFrom(*tracker);
 					previous = lastUses.emplace(resource, std::move(restored)).first;
 				}
@@ -6670,40 +6865,67 @@ void RenderGraph::PlanMultiBackendOwnershipTransfers() {
 				}
 			}
 			if (previous == lastUses.end() && backend != canonicalD3D12) {
-				passEntry->externalAcquires.push_back({ resource, requirement.state, {}, true });
+				// Acquire every destination segment from its real local state. A
+				// representation that has never been used is still UNDEFINED; one
+				// used before a prior release is COMMON.
+				auto& destinationTracker = getRepresentationTracker(resource, backend);
+				for (const auto& segment : destinationTracker.GetSegments()) {
+					passEntry->externalAcquires.push_back({
+						resource, segment.state, segment.rangeSpec,
+						segment.state.layout == rhi::ResourceLayout::Undefined });
+				}
 				LastUse initial{};
 				initial.backend = backend;
+				initial.batchIndex = batchIndex;
+				initial.queueIndex = queueIndex;
 				initial.releases = &passEntry->externalReleases;
-				initial.tracker.Reset({}, { rhi::ResourceAccessType::Common, rhi::ResourceLayout::Common, rhi::ResourceSyncState::All });
+				initial.tracker.CopyFrom(destinationTracker);
 				previous = lastUses.emplace(resource, std::move(initial)).first;
-				resetRepresentationToCommon(resource, backend);
+				destinationTracker.Reset({}, { rhi::ResourceAccessType::Common, rhi::ResourceLayout::Common, rhi::ResourceSyncState::All });
 				spdlog::debug("RenderGraph planned initial external texture acquire: resource='{}' toBackend={} consumer='{}'",
 					resource->GetName(), static_cast<uint32_t>(backend), passEntry->name);
 			}
 			else if (previous == lastUses.end() && backend == canonicalD3D12) {
-				// The shared D3D12 representation was installed after the ordinary
-				// transition compiler ran. Its first frame therefore needs an explicit
-				// UNDEFINED -> COMMON initialization followed by the pass requirement,
-				// rather than a transition compiled from the superseded backing's state.
-				passEntry->externalAcquires.push_back({ resource, requirement.state, {}, true });
+				// The canonical representation owns the allocation initially; its normal
+				// per-device transition below initializes the requested subresources.
 				LastUse initial{};
 				initial.backend = backend;
+				initial.batchIndex = batchIndex;
+				initial.queueIndex = queueIndex;
 				initial.releases = &passEntry->externalReleases;
-				initial.tracker.Reset({}, { rhi::ResourceAccessType::Common, rhi::ResourceLayout::Common, rhi::ResourceSyncState::All });
+				if (auto* tracker = resource->GetStateTracker(backend)) initial.tracker.CopyFrom(*tracker);
 				previous = lastUses.emplace(resource, std::move(initial)).first;
-				resetRepresentationToCommon(resource, backend);
 			}
 			else if (previous != lastUses.end() && previous->second.backend != backend) {
 				const BackendInstanceId sourceBackend = previous->second.backend;
+				const size_t sourceBatchIndex = previous->second.batchIndex;
+				const size_t sourceQueueIndex = previous->second.queueIndex;
 				if (previous->second.releases) {
 					for (const auto& segment : previous->second.tracker.GetSegments()) {
 						previous->second.releases->push_back({ resource, segment.state, segment.rangeSpec, false });
 					}
 				}
-				passEntry->externalAcquires.push_back({ resource, requirement.state, {}, false });
-				resetRepresentationToCommon(resource, sourceBackend);
-				resetRepresentationToCommon(resource, backend);
+				auto& destinationTracker = getRepresentationTracker(resource, backend);
+				for (const auto& segment : destinationTracker.GetSegments()) {
+					passEntry->externalAcquires.push_back({
+						resource, segment.state, segment.rangeSpec,
+						segment.state.layout == rhi::ResourceLayout::Undefined });
+				}
+				getRepresentationTracker(resource, sourceBackend).Reset({}, { rhi::ResourceAccessType::Common, rhi::ResourceLayout::Common, rhi::ResourceSyncState::All });
+				destinationTracker.Reset({}, { rhi::ResourceAccessType::Common, rhi::ResourceLayout::Common, rhi::ResourceSyncState::All });
 				previous->second.backend = backend;
+				// Ownership is ordered by the completion of the actual source pass,
+				// rather than by the legacy logical-transition slot. The latter may
+				// become signal-only after its cross-device barriers are removed.
+				if (sourceBatchIndex > 0 && sourceQueueIndex != queueIndex) {
+					auto& sourceBatch = batches[sourceBatchIndex];
+					sourceBatch.MarkQueueSignal(BatchSignalPhase::AfterCompletion, sourceQueueIndex);
+					batches[batchIndex].AddQueueWait(
+						BatchWaitPhase::BeforeTransitions,
+						queueIndex,
+						sourceQueueIndex,
+						sourceBatch.GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, sourceQueueIndex));
+				}
 				previous->second.tracker.Reset({}, { rhi::ResourceAccessType::Common, rhi::ResourceLayout::Common, rhi::ResourceSyncState::All });
 				spdlog::debug("RenderGraph planned external texture ownership transfer: resource='{}' fromBackend={} toBackend={} consumer='{}'",
 					resource->GetName(), static_cast<uint32_t>(sourceBackend), static_cast<uint32_t>(backend), passEntry->name);
@@ -6711,23 +6933,41 @@ void RenderGraph::PlanMultiBackendOwnershipTransfers() {
 			if (previous == lastUses.end()) {
 				LastUse initial{};
 				initial.backend = backend;
+				initial.batchIndex = batchIndex;
+				initial.queueIndex = queueIndex;
 				initial.releases = &passEntry->externalReleases;
 				if (auto* tracker = resource->GetStateTracker(backend)) initial.tracker.CopyFrom(*tracker);
 				previous = lastUses.emplace(resource, std::move(initial)).first;
 			}
 			previous->second.backend = backend;
+			previous->second.batchIndex = batchIndex;
+			previous->second.queueIndex = queueIndex;
 			previous->second.releases = &passEntry->externalReleases;
-			std::vector<ResourceTransition> ignored;
-			previous->second.tracker.Apply(requirement.resourceHandleAndRange.range, resource, requirement.state, ignored);
-			applyRepresentationRequirement(resource, backend, requirement);
+			auto& representationTracker = getRepresentationTracker(resource, backend);
+			representationTracker.Apply(requirement.resourceHandleAndRange.range, resource,
+				requirement.state, passEntry->backendPreTransitions);
+			previous->second.tracker.CopyFrom(representationTracker);
 		});
+		for (const auto& [handleAndRange, targetState] : passEntry->resources.internalTransitions) {
+			Resource* resource = handleAndRange.resource.IsEphemeral()
+				? handleAndRange.resource.GetEphemeralPtr() : _registry.Resolve(handleAndRange.resource);
+			resource = UnwrapDynamicResource(resource);
+			if (!resource) continue;
+			size_t representationCount = 0;
+			for (const auto& device : m_backendDevices) representationCount += resource->HasAPIRepresentation(device.id) ? 1u : 0u;
+			if (representationCount < 2) continue;
+			auto& representationTracker = getRepresentationTracker(resource, backend);
+			representationTracker.Apply(handleAndRange.range, resource, targetState, passEntry->backendPostTransitions);
+			if (auto previous = lastUses.find(resource); previous != lastUses.end()) previous->second.tracker.CopyFrom(representationTracker);
+		}
 	};
 
-	for (auto& batch : batches) {
+	for (size_t batchIndex = 0; batchIndex < batches.size(); ++batchIndex) {
+		auto& batch = batches[batchIndex];
 		for (size_t queueIndex = 0; queueIndex < m_queueRegistry.SlotCount(); ++queueIndex) {
 			const auto backend = m_queueRegistry.GetBackendInstance(static_cast<QueueSlotIndex>(static_cast<uint8_t>(queueIndex)));
 			for (auto& passVariant : batch.Passes(queueIndex)) {
-				std::visit([&](auto* passEntry) { visitPass(passEntry, backend); }, passVariant);
+				std::visit([&](auto* passEntry) { visitPass(passEntry, backend, batchIndex, queueIndex); }, passVariant);
 			}
 		}
 	}
@@ -6738,23 +6978,63 @@ void RenderGraph::PlanMultiBackendOwnershipTransfers() {
 		};
 	}
 
-	// Transition compilation historically followed one logical tracker.  The
-	// external acquire performs the destination representation's first
-	// transition directly into the consuming pass state. Drop the redundant
-	// batch transition for resources acquired in that batch.
+	// Transition compilation historically followed one logical tracker. Multi-
+	// representation resources now use the per-pass, per-backend transitions
+	// built above, so remove every legacy batch transition for those resources.
 	for (auto& batch : batches) {
 		for (size_t queueIndex = 0; queueIndex < m_queueRegistry.SlotCount(); ++queueIndex) {
-			std::unordered_set<Resource*> acquired;
-			for (auto& passVariant : batch.Passes(queueIndex)) {
-				std::visit([&](auto* passEntry) {
-					for (const auto& entry : passEntry->externalAcquires) acquired.insert(entry.resource);
-				}, passVariant);
+			for (const auto phase : { BatchTransitionPhase::BeforePasses, BatchTransitionPhase::AfterPasses }) {
+				auto& transitions = batch.Transitions(queueIndex, phase);
+				std::erase_if(transitions, [&](const ResourceTransition& transition) {
+					auto* resource = UnwrapDynamicResource(transition.pResource);
+					if (!resource) return false;
+					size_t representationCount = 0;
+					for (const auto& device : m_backendDevices) representationCount += resource->HasAPIRepresentation(device.id) ? 1u : 0u;
+					return representationCount > 1;
+				});
 			}
-			if (acquired.empty()) continue;
-			auto& transitions = batch.Transitions(queueIndex, BatchTransitionPhase::BeforePasses);
-			std::erase_if(transitions, [&](const ResourceTransition& transition) {
-				return acquired.contains(UnwrapDynamicResource(transition.pResource));
-			});
+		}
+	}
+	// Publish the independently compiled end state of every API representation.
+	// Subsequent frame compiles must begin from these states, not from the
+	// temporary COMMON state used at an ownership boundary.
+	for (auto& [resource, byBackend] : representationTrackers) {
+		for (auto& [backendValue, compiledTracker] : byBackend) {
+			if (auto* tracker = resource->GetStateTracker(static_cast<BackendInstanceId>(backendValue))) {
+				tracker->CopyFrom(compiledTracker);
+			}
+		}
+	}
+
+	// Removing legacy cross-device transitions can leave synchronization on a
+	// queue slot that no longer contains any command-list work. Such a slot is
+	// deliberately inactive at execution time, so its reserved fence value can
+	// never be signaled. Remove waits on those orphan signals; the explicit
+	// ownership edges above point at real source passes instead.
+	for (size_t sourceBatchIndex = 0; sourceBatchIndex < batches.size(); ++sourceBatchIndex) {
+		auto& sourceBatch = batches[sourceBatchIndex];
+		for (size_t sourceQueueIndex = 0; sourceQueueIndex < sourceBatch.QueueCount(); ++sourceQueueIndex) {
+			const bool hasWork = sourceBatch.HasTransitions(sourceQueueIndex, BatchTransitionPhase::BeforePasses)
+				|| sourceBatch.HasPasses(sourceQueueIndex)
+				|| sourceBatch.HasTransitions(sourceQueueIndex, BatchTransitionPhase::AfterPasses);
+			if (hasWork) continue;
+			for (size_t signalPhaseIndex = 0; signalPhaseIndex < PassBatch::kSignalPhaseCount; ++signalPhaseIndex) {
+				const auto signalPhase = static_cast<BatchSignalPhase>(signalPhaseIndex);
+				if (!sourceBatch.HasQueueSignal(signalPhase, sourceQueueIndex)) continue;
+				const auto orphanValue = sourceBatch.GetQueueSignalFenceValue(signalPhase, sourceQueueIndex);
+				for (auto& consumerBatch : batches) {
+					for (size_t waitPhaseIndex = 0; waitPhaseIndex < PassBatch::kWaitPhaseCount; ++waitPhaseIndex) {
+						const auto waitPhase = static_cast<BatchWaitPhase>(waitPhaseIndex);
+						for (size_t destinationQueueIndex = 0; destinationQueueIndex < consumerBatch.QueueCount(); ++destinationQueueIndex) {
+							if (consumerBatch.HasQueueWait(waitPhase, destinationQueueIndex, sourceQueueIndex)
+								&& consumerBatch.GetQueueWaitFenceValue(waitPhase, destinationQueueIndex, sourceQueueIndex) == orphanValue) {
+								consumerBatch.ClearQueueWait(waitPhase, destinationQueueIndex, sourceQueueIndex);
+							}
+						}
+					}
+				}
+				sourceBatch.ClearQueueSignal(signalPhase, sourceQueueIndex);
+			}
 		}
 	}
 }
@@ -8203,17 +8483,11 @@ namespace {
 					resolvedRange.mipCount,
 					resolvedRange.firstSlice,
 					resolvedRange.sliceCount };
-				barrier.beforeSync = acquire
-					? (entry.initialFromUndefined ? rhi::ResourceSyncState::None : rhi::ResourceSyncState::All)
-					: entry.state.sync;
+				barrier.beforeSync = entry.state.sync;
 				barrier.afterSync = rhi::ResourceSyncState::All;
-				barrier.beforeAccess = acquire
-					? (entry.initialFromUndefined ? rhi::ResourceAccessType::None : rhi::ResourceAccessType::Common)
-					: entry.state.access;
+				barrier.beforeAccess = entry.state.access;
 				barrier.afterAccess = rhi::ResourceAccessType::Common;
-				barrier.beforeLayout = acquire
-					? (entry.initialFromUndefined ? rhi::ResourceLayout::Undefined : rhi::ResourceLayout::Common)
-					: entry.state.layout;
+				barrier.beforeLayout = entry.state.layout;
 				barrier.afterLayout = rhi::ResourceLayout::Common;
 				barrier.externalOwnership = acquire
 					? rhi::TextureBarrier::ExternalOwnership::Acquire
@@ -8223,9 +8497,9 @@ namespace {
 			else {
 				rhi::BufferBarrier barrier{};
 				barrier.buffer = apiResource.GetHandle();
-				barrier.beforeSync = acquire ? rhi::ResourceSyncState::All : entry.state.sync;
+				barrier.beforeSync = entry.state.sync;
 				barrier.afterSync = rhi::ResourceSyncState::All;
-				barrier.beforeAccess = acquire ? rhi::ResourceAccessType::Common : entry.state.access;
+				barrier.beforeAccess = entry.state.access;
 				barrier.afterAccess = rhi::ResourceAccessType::Common;
 				barrier.externalOwnership = acquire
 					? rhi::BufferBarrier::ExternalOwnership::Acquire
@@ -8286,6 +8560,17 @@ namespace {
 			auto executeOne = [&](auto& pr) {
 			if (!pr.pass->IsInvalidated())
 				return;
+			if (args.batchTraceEnabled && (!pr.externalAcquires.empty() || !pr.backendPreTransitions.empty())) {
+				spdlog::info("RenderGraph: frame {} pass {} backend={} externalAcquires={} backendPreTransitions={}",
+					static_cast<unsigned>(args.context.frameIndex), pr.name,
+					static_cast<unsigned>(args.context.backendInstance), pr.externalAcquires.size(), pr.backendPreTransitions.size());
+				for (const auto& transition : pr.backendPreTransitions) {
+					spdlog::info("RenderGraph: pass {} transition resource='{}' layout {}->{} access {}->{}",
+						pr.name, transition.pResource ? transition.pResource->GetName() : "<null>",
+						static_cast<unsigned>(transition.prevLayout), static_cast<unsigned>(transition.newLayout),
+						static_cast<unsigned>(transition.prevAccessType), static_cast<unsigned>(transition.newAccessType));
+				}
+			}
 			// A crossed representation remains externally owned until this exact
 			// consumer.  Acquiring here avoids changing the layout before earlier
 			// passes in the same queue batch have executed.
@@ -8294,49 +8579,7 @@ namespace {
 				args.context.backendInstance,
 				true,
 				commandList);
-			if (!pr.externalAcquires.empty()) {
-				std::unordered_set<Resource*> acquiredResources;
-				for (const auto& acquire : pr.externalAcquires) {
-					if (acquire.resource) acquiredResources.insert(acquire.resource);
-				}
-				rhi::helpers::OwnedBarrierBatch destinationTransitions;
-				ForEachFrameRequirement(pr.resources, [&](const auto& requirement) {
-					const auto handle = requirement.resourceHandleAndRange.resource;
-					Resource* resource = handle.IsEphemeral()
-						? handle.GetEphemeralPtr()
-						: args.registry.Resolve(handle);
-					resource = UnwrapDynamicResource(resource);
-					if (!resource || !acquiredResources.contains(resource)) return;
-					const auto apiResource = resource->GetAPIResource(args.context.backendInstance);
-					if (!apiResource) return;
-					if (resource->HasLayout()) {
-						const auto resolvedRange = ResolveRangeSpec(
-							requirement.resourceHandleAndRange.range,
-							resource->GetMipLevels(), resource->GetArraySize());
-						rhi::TextureBarrier barrier{};
-						barrier.texture = apiResource.GetHandle();
-						barrier.range = { resolvedRange.firstMip, resolvedRange.mipCount,
-							resolvedRange.firstSlice, resolvedRange.sliceCount };
-						barrier.beforeSync = rhi::ResourceSyncState::All;
-						barrier.afterSync = requirement.state.sync;
-						barrier.beforeAccess = rhi::ResourceAccessType::Common;
-						barrier.afterAccess = requirement.state.access;
-						barrier.beforeLayout = rhi::ResourceLayout::Common;
-						barrier.afterLayout = requirement.state.layout;
-						destinationTransitions.textures.push_back(barrier);
-					}
-					else {
-						rhi::BufferBarrier barrier{};
-						barrier.buffer = apiResource.GetHandle();
-						barrier.beforeSync = rhi::ResourceSyncState::All;
-						barrier.afterSync = requirement.state.sync;
-						barrier.beforeAccess = rhi::ResourceAccessType::Common;
-						barrier.afterAccess = requirement.state.access;
-						destinationTransitions.buffers.push_back(barrier);
-					}
-				});
-				if (!destinationTransitions.Empty()) commandList.Barriers(destinationTransitions.View());
-			}
+			RecordTransitionBarriers(pr.backendPreTransitions, args.context.backendInstance, commandList);
 			const std::string_view passName = pr.name.empty() ? std::string_view("<unnamed>") : std::string_view(pr.name);
 			const char* techniquePath = pr.techniquePath.empty() ? nullptr : pr.techniquePath.c_str();
 			try {
@@ -8382,6 +8625,7 @@ namespace {
 						sched.externalFences.push_back(passReturn);
 					}
 				}
+				RecordTransitionBarriers(pr.backendPostTransitions, args.context.backendInstance, commandList);
 				RecordExternalOwnershipBarriers(pr.externalReleases, args.context.backendInstance, false, commandList);
 				if (hasStatistics)
 					args.statisticsService->EndQuery(pr.statisticsIndex, args.context.frameIndex, args.rhiQueue, commandList, sched.queryRecordingContext);
@@ -9023,6 +9267,12 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 			return;
 		}
 		BT_PLOT("RG.FrameStartWait.AlreadyCompleted", int64_t{ 0 });
+		if (batchTraceEnabled) {
+			spdlog::info("RenderGraph::Execute frame={} queue wait dstSlot={} srcSlot={} value={} srcCompleted={} sourceTimeline=({}, {}) consumerTimeline=({}, {}) reason='{}'",
+				static_cast<unsigned>(context.frameIndex), dstSlot, srcSlot, absoluteFenceValue,
+				completedFenceValue, srcFenceHandle.index, srcFenceHandle.generation,
+				waitFenceHandle.index, waitFenceHandle.generation, reason);
+		}
 
 		auto dstQ = SlotQueue(dstSlot);
 		rhi::Result waitResult = rhi::Result::Ok;
@@ -9640,7 +9890,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 					"RenderGraph::Execute frame={} record-all-batches begin taskCount={} (serialBypass={})",
 					static_cast<unsigned>(context.frameIndex),
 					tasks.size(),
-					true);
+					false);
 			}
 			ParallelForOptional("RecordAllBatches", tasks.size(), [&](size_t taskIdx) {
 				auto& task = tasks[taskIdx];
@@ -9687,7 +9937,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 					oss << ": " << ex.what();
 					throw std::runtime_error(oss.str());
 				}
-				}, false); // Toggle to true to force serial recording for easier debugging and validation
+				}, false);
 			if (batchTraceEnabled) {
 				spdlog::info("RenderGraph::Execute frame={} record-all-batches complete", static_cast<unsigned>(context.frameIndex));
 			}

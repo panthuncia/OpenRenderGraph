@@ -90,6 +90,9 @@ struct PersistentAliasPoolState {
 	uint64_t generation = 0;
 	uint64_t lastUsedFrame = 0;
 	bool usedThisFrame = false;
+	bool multiBackendShared = false;
+	uint64_t backendUseMask = 0;
+	uint8_t resourceClass = 0;
 };
 
 struct CachedAliasPoolPlacement {
@@ -141,6 +144,7 @@ struct AliasSchedulingNode {
 	size_t topoRank = 0;
 	uint32_t indegree = 0;
 	uint32_t criticality = 0;
+	uint8_t backendInstance = 0;
 	std::vector<size_t> out;
 };
 
@@ -181,6 +185,8 @@ struct FrameAliasResourceInfo {
 	size_t lastUsePassIndex = std::numeric_limits<size_t>::max();
 
 	uint32_t maxNodeCriticality = 0;
+	uint64_t backendUseMask = 0;
+	uint8_t resourceClass = 0;
 
 	const char* exclusionReason = nullptr;
 };

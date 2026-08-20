@@ -730,6 +730,7 @@ org::alias::FrameAliasAnalysis& org::alias::RenderGraphAliasingSubsystem::BuildA
 		if (auto* texture = dynamic_cast<PixelBuffer*>(resource)) {
 			auto const& desc = texture->GetDescription();
 			info.kind = RGResourceRuntimeKind::Texture;
+			info.resourceClass = (desc.hasRTV || desc.hasDSV) ? 2u : 3u;
 			info.aliasAllowed = desc.allowAlias;
 			info.deviceLocal = true;
 			info.materialized = texture->IsMaterialized();
@@ -763,6 +764,7 @@ org::alias::FrameAliasAnalysis& org::alias::RenderGraphAliasingSubsystem::BuildA
 
 		if (auto* buffer = dynamic_cast<BufferBase*>(resource)) {
 			info.kind = RGResourceRuntimeKind::Buffer;
+			info.resourceClass = 1u;
 			info.aliasAllowed = buffer->IsAliasingAllowed();
 			info.deviceLocal = buffer->GetAccessType() == rhi::HeapType::DeviceLocal;
 			info.materialized = buffer->IsMaterialized();
@@ -805,7 +807,8 @@ org::alias::FrameAliasAnalysis& org::alias::RenderGraphAliasingSubsystem::BuildA
 		info.exclusionReason = "unsupported resource type";
 		info.staticInfoInitialized = true;
 	};
-	auto collectResource = [&](size_t resourceIndex, uint64_t resourceID, const ResourceRegistry::RegistryHandle* handle, bool isWrite, size_t usageOrder, uint32_t passCrit, size_t passIdx) {
+	std::vector<Resource*> currentResourceBySchedulingIndex(analysis.infoByResourceIndex.size(), nullptr);
+	auto collectResource = [&](size_t resourceIndex, uint64_t resourceID, const ResourceRegistry::RegistryHandle* handle, bool isWrite, size_t usageOrder, uint32_t passCrit, size_t passIdx, uint8_t backendInstance) {
 		if (resourceIndex >= analysis.infoByResourceIndex.size()) {
 			return;
 		}
@@ -818,6 +821,11 @@ org::alias::FrameAliasAnalysis& org::alias::RenderGraphAliasingSubsystem::BuildA
 		}
 		if (!info.staticInfoInitialized) {
 			initializeStaticInfo(info, resourceID, handle);
+		}
+		if (handle && !currentResourceBySchedulingIndex[resourceIndex]) {
+			currentResourceBySchedulingIndex[resourceIndex] = handle->IsEphemeral()
+				? handle->GetEphemeralPtr()
+				: rg._registry.Resolve(*handle);
 		}
 		const bool canMatterForAliasing =
 			info.kind != RGResourceRuntimeKind::Unknown
@@ -849,6 +857,7 @@ org::alias::FrameAliasAnalysis& org::alias::RenderGraphAliasingSubsystem::BuildA
 		}
 		info.everWritten = info.everWritten || isWrite;
 		info.maxNodeCriticality = std::max(info.maxNodeCriticality, passCrit);
+		info.backendUseMask |= uint64_t{1} << backendInstance;
 	};
 
 	for (const auto& node : nodes) {
@@ -879,7 +888,8 @@ org::alias::FrameAliasAnalysis& org::alias::RenderGraphAliasingSubsystem::BuildA
 				AccessTypeIsWriteOrCommon(req.state.access),
 				usageOrder,
 				passCrit,
-				passIdx);
+				passIdx,
+				node.backendInstance);
 		}
 		for (const auto& transition : passSummary.internalTransitionSummaries) {
 			const size_t resourceIndex =
@@ -896,7 +906,49 @@ org::alias::FrameAliasAnalysis& org::alias::RenderGraphAliasingSubsystem::BuildA
 				true,
 				usageOrder,
 				passCrit,
-				passIdx);
+				passIdx,
+				node.backendInstance);
+		}
+	}
+
+	// Alias placement is computed before representation materialization.  For a
+	// cross-backend resource the logical interval must nevertheless satisfy the
+	// allocation requirements of every representation.  In particular, Vulkan
+	// commonly reports a 4 KiB buffer requirement while the canonical D3D12
+	// shared heap requires 64 KiB.  Using only the primary device here made pool
+	// placement depend on which API was primary and forced committed fallbacks
+	// for Vulkan-primary runs.
+	for (const uint32_t resourceIndex : analysis.candidateResourceIndices) {
+		if (resourceIndex >= analysis.infoByResourceIndex.size()) continue;
+		auto& info = analysis.infoByResourceIndex[resourceIndex];
+		if (std::popcount(info.backendUseMask) < 2) continue;
+		Resource* resource = currentResourceBySchedulingIndex[resourceIndex];
+		auto resourceRef = rg.GetResourceByID(info.resourceID);
+		if (!resource && resourceRef) resource = resourceRef.get();
+		if (!resource) {
+			auto resourceIt = resourcesByID.find(info.resourceID);
+			resource = resourceIt != resourcesByID.end() && resourceIt->second
+				? resourceIt->second.get() : nullptr;
+		}
+		if (!resource) continue;
+
+		rhi::ResourceDesc resourceDesc{};
+		if (auto* texture = dynamic_cast<PixelBuffer*>(resource)) {
+			resourceDesc = BuildAliasTextureResourceDesc(texture->GetDescription());
+		} else if (auto* buffer = dynamic_cast<BufferBase*>(resource)) {
+			resourceDesc = BuildAliasBufferResourceDesc(
+				buffer->GetBufferSize(), buffer->IsUnorderedAccessEnabled(), buffer->GetAccessType());
+		} else {
+			continue;
+		}
+
+		for (const auto& backendDevice : rg.m_backendDevices) {
+			const auto bit = uint64_t{1} << static_cast<uint8_t>(backendDevice.id);
+			if ((info.backendUseMask & bit) == 0 || !backendDevice.device) continue;
+			rhi::ResourceAllocationInfo allocationInfo{};
+			backendDevice.device.GetResourceAllocationInfo(&resourceDesc, 1, &allocationInfo);
+			info.sizeBytes = (std::max)(info.sizeBytes, allocationInfo.sizeInBytes);
+			info.alignment = (std::max)(info.alignment, (std::max<uint64_t>)(1, allocationInfo.alignment));
 		}
 	}
 
@@ -1368,6 +1420,9 @@ void org::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(Render
 	}
 
 	for (auto& [poolID, poolCandidateIndices] : candidateResourceIndicesByPool) {
+		const auto& poolInfo = getInfoByIndex(poolCandidateIndices.front());
+		const bool multiBackendShared = std::popcount(poolInfo.backendUseMask) > 1;
+		if (multiBackendShared) spdlog::debug("RG shared alias planning begin pool={} candidates={} mask=0x{:X} class={}", poolID, poolCandidateIndices.size(), poolInfo.backendUseMask, poolInfo.resourceClass);
 		AutoAliasPoolDebug poolDebug{};
 		if (buildAliasDebug) {
 			poolDebug.poolID = poolID;
@@ -1940,7 +1995,10 @@ void org::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(Render
 		autoAliasPlannerStats.pooledIndependentBytes += poolIndependentBytes;
 
 		auto& poolState = persistentAliasPools[poolID];
-		const bool needsInitialAllocation = !static_cast<bool>(poolState.allocation);
+		poolState.multiBackendShared = multiBackendShared;
+		poolState.backendUseMask = poolInfo.backendUseMask;
+		poolState.resourceClass = poolInfo.resourceClass;
+		const bool needsInitialAllocation = !multiBackendShared && !static_cast<bool>(poolState.allocation);
 		const bool needsLargerHeap = heapSize > poolState.capacityBytes;
 		const bool needsHigherAlignment = poolAlignment > poolState.alignment;
 		const bool shouldShrinkForModeOrStrategyChange =
@@ -1948,7 +2006,14 @@ void org::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(Render
 			!needsInitialAllocation &&
 			poolState.capacityBytes > heapSize;
 
-		if (needsInitialAllocation || needsLargerHeap || needsHigherAlignment || shouldShrinkForModeOrStrategyChange) {
+		if (multiBackendShared) {
+			if (poolState.allocation) DeletionManager::GetInstance().MarkForDelete(std::move(poolState.allocation));
+			if (poolState.capacityBytes != heapSize || poolState.alignment != poolAlignment) ++poolState.generation;
+			poolState.capacityBytes = heapSize;
+			poolState.alignment = poolAlignment;
+			spdlog::debug("RG shared alias logical pool ready pool={} capacity={} alignment={}", poolID, heapSize, poolAlignment);
+		}
+		else if (needsInitialAllocation || needsLargerHeap || needsHigherAlignment || shouldShrinkForModeOrStrategyChange) {
 			uint64_t newCapacity = heapSize;
 			if (!needsInitialAllocation && needsLargerHeap && poolState.capacityBytes > 0) {
 				const double grownTarget = static_cast<double>(poolState.capacityBytes) * static_cast<double>(aliasPoolGrowthHeadroom);
@@ -2013,7 +2078,7 @@ void org::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(Render
 		}
 
 		auto* allocation = poolState.allocation.GetAllocation();
-		if (!allocation) {
+		if (!allocation && !multiBackendShared) {
 			throw std::runtime_error("Failed to allocate alias pool memory");
 		}
 
@@ -2024,6 +2089,7 @@ void org::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(Render
 				throw std::runtime_error("Missing alias placement for candidate resource");
 			}
 			const auto& placement = placements[candidateIndex];
+			if (multiBackendShared) spdlog::debug("RG shared alias publish pool={} resource={} offset={} size={}", poolID, c.resourceID, placement.offset, c.sizeBytes);
 
 			if (buildAliasDebug) {
 				auto itResDebug = resourcesByID.find(c.resourceID);
@@ -2043,7 +2109,11 @@ void org::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(Render
 					});
 			}
 
-			if (c.kind == RGResourceRuntimeKind::Texture) {
+			if (multiBackendShared) {
+				// Both placed representations are created from the canonical shared
+				// heap pair after all offsets have been published.
+			}
+			else if (c.kind == RGResourceRuntimeKind::Texture) {
 				PixelBuffer::MaterializeOptions options{};
 				options.aliasPlacement = TextureAliasPlacement{
 					.allocation = allocation,
@@ -2081,6 +2151,7 @@ void org::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(Render
 			};
 			setAliasPlacement(resourceIndex, placementRange);
 			setSchedulingPlacement(resourceIndex, placementRange);
+			if (multiBackendShared) aliasPlacementRangesByID[c.resourceID] = placementRange;
 
 			if (aliasLoggingEnabled) {
 				auto itResName = resourcesByID.find(c.resourceID);
@@ -2108,7 +2179,7 @@ void org::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(Render
 			const bool signatureChanged = itSig == aliasPlacementSignatureByID.end() || itSig->second != newSignature;
 			auto itRes = resourcesByID.find(c.resourceID);
 			if (signatureChanged) {
-				if (itRes != resourcesByID.end()) {
+				if (!multiBackendShared && itRes != resourcesByID.end()) {
 					dematerializeResourceForKind(itRes->second.get(), c.kind);
 				}
 				markAliasActivationPending(resourceIndex, AliasActivationReason::NewPlacement);
@@ -2119,6 +2190,10 @@ void org::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(Render
 			}
 			aliasPlacementRangeByResourceIndex[resourceIndex].activationReasonBits =
 				static_cast<uint8_t>(aliasActivationPendingByResourceIndex[resourceIndex]);
+		}
+		if (multiBackendShared) {
+			rg.MaterializeMultiBackendRepresentations();
+			spdlog::debug("RG shared alias planning complete pool={}", poolID);
 		}
 
 		if (buildAliasDebug) {

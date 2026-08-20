@@ -128,6 +128,10 @@ rhi::BarrierBatch PixelBuffer::GetEnhancedBarrierGroup(
     rhi::ResourceSyncState prevSyncState,
     rhi::ResourceSyncState newSyncState)
 {
+	if (GetAttachedAPIRepresentation(BackendInstanceId::Primary)) {
+		return Resource::GetEnhancedBarrierGroup(BackendInstanceId::Primary, range,
+			prevAccessType, newAccessType, prevLayout, newLayout, prevSyncState, newSyncState);
+	}
     std::scoped_lock lock(m_materializationMutex);
     EnsureMaterializedLocked("GetEnhancedBarrierGroup");
     return m_backing->GetEnhancedBarrierGroup(
@@ -143,6 +147,7 @@ void PixelBuffer::OnSetName() {
 }
 
 bool PixelBuffer::HasValidBackingResource() const {
+	if (GetAttachedAPIRepresentation(BackendInstanceId::Primary)) return true;
     std::scoped_lock lock(m_materializationMutex);
     return m_backing && m_backing->HasValidResource();
 }
@@ -198,12 +203,20 @@ void PixelBuffer::RefreshAPIRepresentationDescriptors(BackendInstanceId backendI
 	// render passes continue to access the superseded primary-only backing.
 	auto resource = Resource::GetAPIResource(backendInstance);
 	if (!resource) return;
+	// An attached representation replaces (and may be created before) the normal
+	// GpuTextureBacking.  Do not inherit cached dimensions from that superseded
+	// backing: the logical description is authoritative for every representation.
+	const uint16_t resolvedMipLevels = ResolveTextureMipLevels(m_desc);
+	const uint32_t resolvedArraySize = m_desc.isCubemap
+		? 6u * m_desc.arraySize : (m_desc.isArray ? m_desc.arraySize : 1u);
+	{
+		std::scoped_lock lock(m_materializationMutex);
+		m_mipLevels = resolvedMipLevels;
+		m_arraySize = resolvedArraySize;
+	}
 	EnsureVirtualDescriptorSlotsAllocated();
 	DescriptorHeapManager::ViewRequirements views;
-	const uint16_t mipLevels = m_mipLevels ? static_cast<uint16_t>(m_mipLevels) : ResolveTextureMipLevels(m_desc);
-	const uint32_t arraySize = m_arraySize ? m_arraySize : (m_desc.isCubemap
-		? 6u * m_desc.arraySize : (m_desc.isArray ? m_desc.arraySize : 1u));
-	views.views = BuildTextureViewRequirements(m_desc, mipLevels, arraySize);
+	views.views = BuildTextureViewRequirements(m_desc, resolvedMipLevels, resolvedArraySize);
 	DescriptorHeapManager::GetInstance().UpdateDescriptorContents(*this, resource, views, backendInstance);
 }
 
@@ -254,9 +267,11 @@ void PixelBuffer::Materialize(const MaterializeOptions* options) {
 }
 
 void PixelBuffer::Dematerialize() {
+	const bool hadAttachedPrimary = GetAttachedAPIRepresentation(BackendInstanceId::Primary).IsValid();
 	ClearAPIRepresentations();
     std::scoped_lock lock(m_materializationMutex);
     if (!m_backing) {
+		if (hadAttachedPrimary) ++m_backingGeneration;
         return;
     }
 

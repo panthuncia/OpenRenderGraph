@@ -333,6 +333,8 @@ public:
 		std::vector<std::shared_ptr<Resource>> retainedAnonymousKeepAlive; // Keeps retained anonymous handles alive across frames
 		std::vector<ResolverSnapshot> resolverSnapshots; // Versioned resolver snapshots for auto-invalidation
 		RetainedDeclarationCache declarationCache;
+		std::vector<ResourceTransition> backendPreTransitions;
+		std::vector<ResourceTransition> backendPostTransitions;
 		std::vector<ExternalOwnershipBarrier> externalAcquires;
 		std::vector<ExternalOwnershipBarrier> externalReleases;
 	};
@@ -351,6 +353,8 @@ public:
 		std::vector<std::shared_ptr<Resource>> retainedAnonymousKeepAlive; // Keeps retained anonymous handles alive across frames
 		std::vector<ResolverSnapshot> resolverSnapshots; // Versioned resolver snapshots for auto-invalidation
 		RetainedDeclarationCache declarationCache;
+		std::vector<ResourceTransition> backendPreTransitions;
+		std::vector<ResourceTransition> backendPostTransitions;
 		std::vector<ExternalOwnershipBarrier> externalAcquires;
 		std::vector<ExternalOwnershipBarrier> externalReleases;
 	};
@@ -369,6 +373,8 @@ public:
 		std::vector<std::shared_ptr<Resource>> retainedAnonymousKeepAlive; // Keeps retained anonymous handles alive across frames
 		std::vector<ResolverSnapshot> resolverSnapshots; // Versioned resolver snapshots for auto-invalidation
 		RetainedDeclarationCache declarationCache;
+		std::vector<ResourceTransition> backendPreTransitions;
+		std::vector<ResourceTransition> backendPostTransitions;
 		std::vector<ExternalOwnershipBarrier> externalAcquires;
 		std::vector<ExternalOwnershipBarrier> externalReleases;
 	};
@@ -1311,6 +1317,7 @@ private:
 	std::vector<std::pair<uint64_t, Resource*>> m_materializeScratchItems;
 	std::vector<MaterializeGenerationResult> m_materializeScratchGenerationResults;
 	std::vector<FramePassSchedulingSummary> m_framePassSchedulingSummaries;
+	std::unordered_map<uint64_t, uint64_t> m_frameBackendUseMaskByResourceID;
 	std::unordered_map<uint64_t, CachedFramePassAccessSummary> m_framePassAccessSummaryCache;
 	std::unordered_map<uint64_t, org::alias::CachedAliasStaticResourceInfo> m_aliasStaticInfoCacheByResourceID;
 	org::alias::FrameAliasAnalysis m_aliasFrameAnalysisScratch;
@@ -1327,6 +1334,8 @@ private:
 		uint8_t resourceClass = 0;
 	};
 	std::unordered_map<uint64_t, SharedAliasPoolState> m_sharedAliasPools;
+	std::unordered_map<uint64_t, uint64_t> m_sharedAliasResourcePoolGeneration;
+	std::unordered_map<uint64_t, uint64_t> m_sharedAliasResourcePoolID;
 	std::unordered_map<uint64_t, org::alias::CachedAliasPoolPlan> cachedAliasPlanByPoolID;
 	uint64_t aliasPoolPlanFrameIndex = 0;
 	uint32_t aliasPoolRetireIdleFrames = 120;

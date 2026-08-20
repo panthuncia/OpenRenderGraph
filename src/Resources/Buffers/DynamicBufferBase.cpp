@@ -400,6 +400,10 @@ rhi::BarrierBatch BufferBase::GetEnhancedBarrierGroup(
     rhi::ResourceSyncState prevSyncState,
     rhi::ResourceSyncState newSyncState)
 {
+	if (GetAttachedAPIRepresentation(BackendInstanceId::Primary)) {
+		return Resource::GetEnhancedBarrierGroup(BackendInstanceId::Primary, range,
+			prevAccessType, newAccessType, prevLayout, newLayout, prevSyncState, newSyncState);
+	}
     if (!m_dataBuffer) {
         std::ostringstream err = std::ostringstream() << "Buffer resource '" << GetName() << "' is not materialized";
         throw std::runtime_error(err.str());
@@ -422,7 +426,13 @@ bool BufferBase::TryGetBufferByteSize(uint64_t& outByteSize) const {
 
 bool BufferBase::TryGetRHIResourceDesc(rhi::ResourceDesc& outDesc) const {
 	outDesc = rhi::helpers::ResourceDesc::Buffer(m_bufferSize, m_accessType);
-	if (m_unorderedAccess) outDesc.resourceFlags |= rhi::ResourceFlags::RF_AllowUnorderedAccess;
+	// Some dynamic-buffer implementations install a pre-created backing through
+	// SetBacking rather than ConfigureBacking. Their descriptor requirements are
+	// authoritative too; otherwise peer materialization can omit the UAV flag
+	// while still recreating a UAV descriptor for that representation.
+	if (m_unorderedAccess || (m_descriptorRequirements && m_descriptorRequirements->createUAV)) {
+		outDesc.resourceFlags |= rhi::ResourceFlags::RF_AllowUnorderedAccess;
+	}
 	return m_bufferSize != 0;
 }
 
@@ -460,7 +470,7 @@ void BufferBase::ConfigureBacking(
 }
 
 bool BufferBase::IsMaterialized() const {
-    return m_dataBuffer != nullptr;
+    return m_dataBuffer != nullptr || GetAttachedAPIRepresentation(BackendInstanceId::Primary).IsValid();
 }
 
 uint64_t BufferBase::GetBufferSize() const {
@@ -513,8 +523,10 @@ void BufferBase::Materialize(const MaterializeOptions* options) {
 }
 
 void BufferBase::Dematerialize() {
+	const bool hadAttachedPrimary = GetAttachedAPIRepresentation(BackendInstanceId::Primary).IsValid();
 	ClearAPIRepresentations();
     if (!m_dataBuffer) {
+		if (hadAttachedPrimary) ++m_backingGeneration;
         return;
     }
     m_dataBuffer.reset();

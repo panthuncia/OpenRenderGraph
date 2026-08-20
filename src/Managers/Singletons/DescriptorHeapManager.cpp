@@ -756,7 +756,10 @@ void DescriptorHeapManager::UpdateDescriptorContentsUnlocked(
                     };
 
                     const auto& slot = target.GetRTVInfo(mip, slice).slot;
-                    device.CreateRenderTargetView({ rtvHeap, slot.index }, apiResource.GetHandle(), rtvDesc);
+					const auto result = device.CreateRenderTargetView({ rtvHeap, slot.index }, apiResource.GetHandle(), rtvDesc);
+					if (rhi::Failed(result)) {
+						throw std::runtime_error("Failed to create backend-local RTV descriptor at logical slot " + std::to_string(slot.index));
+					}
                 }
             }
         }

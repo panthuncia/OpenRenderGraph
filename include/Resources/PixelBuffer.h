@@ -82,7 +82,7 @@ public:
 	void RefreshAPIRepresentationDescriptors(BackendInstanceId backendInstance) override;
 
     bool IsMaterialized() const override {
-        return m_backing != nullptr;
+        return m_backing != nullptr || GetAttachedAPIRepresentation(BackendInstanceId::Primary).IsValid();
     }
 
     bool HasValidBackingResource() const;

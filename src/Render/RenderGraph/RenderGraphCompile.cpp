@@ -1518,7 +1518,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	};
 	std::unique_ptr<RenderGraph, decltype(endCompileProfileFrame)> compileProfileFrameGuard(this, endCompileProfileFrame);
 	std::optional<org::profile::ScopedCompileProfileStep> activeCompileProfileStep;
-	const bool traceLifecycle = m_getRenderGraphBatchTraceEnabled && m_getRenderGraphBatchTraceEnabled();
+	const bool traceLifecycle = std::getenv("SARP_RG_COMPILE_TRACE") != nullptr;
 	auto traceCompileStep = [&](const char* step) {
 		activeCompileProfileStep.reset();
 		if (traceLifecycle) {
@@ -1990,11 +1990,11 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 					BT_ZONE_TEXT(p.name.data(), p.name.size());
 				}
 				if (traceLifecycle) {
-					spdlog::info("RG frame {} compute pass '{}' RecordImmediateCommands begin", frameIndex, p.name);
+					spdlog::debug("RG frame {} compute pass '{}' RecordImmediateCommands begin", frameIndex, p.name);
 				}
 				immediateModeCommands->RecordImmediateCommands(c);
 				if (traceLifecycle) {
-					spdlog::info("RG frame {} compute pass '{}' RecordImmediateCommands complete", frameIndex, p.name);
+					spdlog::debug("RG frame {} compute pass '{}' RecordImmediateCommands complete", frameIndex, p.name);
 				}
 			}
 
@@ -2054,11 +2054,11 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 					BT_ZONE_TEXT(p.name.data(), p.name.size());
 				}
 				if (traceLifecycle) {
-					spdlog::info("RG frame {} render pass '{}' RecordImmediateCommands begin", frameIndex, p.name);
+					spdlog::debug("RG frame {} render pass '{}' RecordImmediateCommands begin", frameIndex, p.name);
 				}
 				immediateModeCommands->RecordImmediateCommands(c);
 				if (traceLifecycle) {
-					spdlog::info("RG frame {} render pass '{}' RecordImmediateCommands complete", frameIndex, p.name);
+					spdlog::debug("RG frame {} render pass '{}' RecordImmediateCommands complete", frameIndex, p.name);
 				}
 			}
 			const bool hasRecordedWork = c.list.HasRecordedWork();
@@ -2119,11 +2119,11 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 					BT_ZONE_TEXT(p.name.data(), p.name.size());
 				}
 				if (traceLifecycle) {
-					spdlog::info("RG frame {} copy pass '{}' RecordImmediateCommands begin", frameIndex, p.name);
+					spdlog::debug("RG frame {} copy pass '{}' RecordImmediateCommands begin", frameIndex, p.name);
 				}
 				immediateModeCommands->RecordImmediateCommands(c);
 				if (traceLifecycle) {
-					spdlog::info("RG frame {} copy pass '{}' RecordImmediateCommands complete", frameIndex, p.name);
+					spdlog::debug("RG frame {} copy pass '{}' RecordImmediateCommands complete", frameIndex, p.name);
 				}
 			}
 			const bool hasRecordedWork = c.list.HasRecordedWork();
@@ -2203,11 +2203,11 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 						BT_ZONE_TEXT(p.name.data(), p.name.size());
 					}
 					if (traceLifecycle) {
-						spdlog::info("RG frame {} compute pass '{}' RecordImmediateCommands begin", frameIndex, p.name);
+						spdlog::debug("RG frame {} compute pass '{}' RecordImmediateCommands begin", frameIndex, p.name);
 					}
 					immediateModeCommands->RecordImmediateCommands(c);
 					if (traceLifecycle) {
-						spdlog::info("RG frame {} compute pass '{}' RecordImmediateCommands complete", frameIndex, p.name);
+						spdlog::debug("RG frame {} compute pass '{}' RecordImmediateCommands complete", frameIndex, p.name);
 					}
 				}
 				if (!c.list.HasRecordedWork()) {
@@ -2239,11 +2239,11 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 						BT_ZONE_TEXT(p.name.data(), p.name.size());
 					}
 					if (traceLifecycle) {
-						spdlog::info("RG frame {} copy pass '{}' RecordImmediateCommands begin", frameIndex, p.name);
+						spdlog::debug("RG frame {} copy pass '{}' RecordImmediateCommands begin", frameIndex, p.name);
 					}
 					immediateModeCommands->RecordImmediateCommands(c);
 					if (traceLifecycle) {
-						spdlog::info("RG frame {} copy pass '{}' RecordImmediateCommands complete", frameIndex, p.name);
+						spdlog::debug("RG frame {} copy pass '{}' RecordImmediateCommands complete", frameIndex, p.name);
 					}
 				}
 				if (!c.list.HasRecordedWork()) {
@@ -2275,11 +2275,11 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 						BT_ZONE_TEXT(p.name.data(), p.name.size());
 					}
 					if (traceLifecycle) {
-						spdlog::info("RG frame {} render pass '{}' RecordImmediateCommands begin", frameIndex, p.name);
+						spdlog::debug("RG frame {} render pass '{}' RecordImmediateCommands begin", frameIndex, p.name);
 					}
 					immediateModeCommands->RecordImmediateCommands(c);
 					if (traceLifecycle) {
-						spdlog::info("RG frame {} render pass '{}' RecordImmediateCommands complete", frameIndex, p.name);
+						spdlog::debug("RG frame {} render pass '{}' RecordImmediateCommands complete", frameIndex, p.name);
 					}
 				}
 				if (!c.list.HasRecordedWork()) {
@@ -2738,6 +2738,8 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				.topoRank = node.topoRank,
 				.indegree = node.indegree,
 				.criticality = node.criticality,
+				.backendInstance = static_cast<uint8_t>(m_queueRegistry.GetBackendInstance(
+					static_cast<QueueSlotIndex>(static_cast<uint8_t>(node.queueSlot)))),
 				.out = node.out,
 			});
 		}
@@ -2747,17 +2749,40 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 			traceCompileStep("BuildAliasFrameAnalysis");
 			BT_ZONE_SCOPE("RenderGraph::CompileFrame::BuildAliasFrameAnalysis");
 			aliasAnalysis = &m_aliasingSubsystem.BuildAliasFrameAnalysis(*this, aliasNodes);
+			m_frameBackendUseMaskByResourceID.clear();
+			for (const auto& info : aliasAnalysis->infoByResourceIndex) {
+				if (info.resourceID) m_frameBackendUseMaskByResourceID[info.resourceID] = info.backendUseMask;
+			}
+			for (auto& info : aliasAnalysis->infoByResourceIndex) {
+				if (std::popcount(info.backendUseMask) < 2) continue;
+				auto resource = GetResourceByID(info.resourceID);
+				rhi::ResourceDesc desc{};
+				if (!resource || !resource->TryGetRHIResourceDesc(desc)) continue;
+				for (const auto& backendDevice : m_backendDevices) {
+					if ((info.backendUseMask & (uint64_t{1} << static_cast<uint8_t>(backendDevice.id))) == 0) continue;
+					rhi::ResourceAllocationInfo requirements{};
+					backendDevice.device.GetResourceAllocationInfo(&desc, 1, &requirements);
+					info.sizeBytes = (std::max)(info.sizeBytes, requirements.sizeInBytes);
+					info.alignment = (std::max)(info.alignment, requirements.alignment);
+				}
+			}
 		}
 		{
 			traceCompileStep("AutoAssignAliasingPoolsFromAnalysis");
 			BT_ZONE_SCOPE("RenderGraph::CompileFrame::AutoAssignAliasingPoolsFromAnalysis");
 			m_aliasingSubsystem.AutoAssignAliasingPoolsFromAnalysis(*this, *aliasAnalysis);
+			for (auto& info : aliasAnalysis->infoByResourceIndex) {
+				if (!info.hasFinalPool) continue;
+				boost::hash_combine(info.finalPoolID, info.backendUseMask);
+				boost::hash_combine(info.finalPoolID, info.resourceClass);
+			}
 		}
 		{
 			traceCompileStep("BuildAliasPlanFromAnalysis");
 			BT_ZONE_SCOPE("RenderGraph::CompileFrame::BuildAliasPlanFromAnalysis");
 			m_aliasingSubsystem.BuildAliasPlanFromAnalysis(*this, *aliasAnalysis);
 		}
+		MaterializeMultiBackendRepresentations();
 		{
 			traceCompileStep("AddCurrentFrameAliasSchedulingEdges");
 			BT_ZONE_SCOPE("RenderGraph::CompileFrame::AddCurrentFrameAliasSchedulingEdges");
