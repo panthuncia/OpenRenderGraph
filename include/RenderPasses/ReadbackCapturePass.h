@@ -58,9 +58,9 @@ public:
 
         if (resource->HasLayout()) {
             auto* texture = dynamic_cast<PixelBuffer*>(resource);
-            if (!texture) {
-                throw std::runtime_error("ReadbackCapturePass: texture resource type mismatch.");
-            }
+            rhi::ResourceDesc textureDesc{};
+            if (!resource->TryGetRHIResourceDesc(textureDesc))
+                throw std::runtime_error("ReadbackCapturePass: texture resource does not expose an RHI description.");
 
             const auto handle = inputs.target.resource;
             const SubresourceRange sr = ResolveRangeSpec(inputs.target.range, handle.GetNumMipLevels(), handle.GetArraySize());
@@ -70,7 +70,9 @@ public:
 
             std::vector<rhi::CopyableFootprint> footprints(sr.mipCount * sr.sliceCount);
             rhi::FootprintRangeDesc fr{};
-            fr.texture = texture->GetAPIResource().GetHandle();
+            // Readback extension passes currently default to the primary device.
+            // The immediate list resolves the same primary representation for the copy.
+            fr.texture = resource->GetAPIResource().GetHandle();
             fr.firstMip = sr.firstMip;
             fr.mipCount = sr.mipCount;
             fr.firstArraySlice = sr.firstSlice;
@@ -95,7 +97,7 @@ public:
                     const auto& fp = footprints[subresourceIndex];
 
                     context.list.CopyTextureToBuffer(
-                        texture,
+                        resource,
                         sr.firstMip + mip,
                         sr.firstSlice + slice,
                         readbackBuffer,
@@ -110,9 +112,9 @@ public:
             request.readbackBuffer = readbackBuffer;
             request.layouts = std::move(footprints);
             request.totalSize = info.totalBytes;
-            request.format = texture->GetFormat();
-            request.width = texture->GetWidth();
-            request.height = texture->GetHeight();
+            request.format = textureDesc.texture.format;
+            request.width = textureDesc.texture.width;
+            request.height = textureDesc.texture.height;
             request.depth = 1;
         }
         else {

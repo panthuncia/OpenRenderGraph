@@ -89,8 +89,12 @@ struct RenderGraph::CompilerState {
 	std::vector<PendingFrameInsert> pendingFrameInserts;
 	std::vector<size_t> frameInsertSlotHeads;
 	std::vector<size_t> frameInsertSlotTails;
-	std::unordered_map<std::string_view, size_t> pendingInsertIndexByName;
-	std::unordered_map<std::string_view, size_t> pendingInsertTailByAnchorName;
+	// Frame-extension names are assembled from temporary/materialized strings in
+	// CompileFrame.  These tables outlive each loop iteration, so their keys must
+	// own their storage; string_view keys here previously dangled as soon as the
+	// local insertedPassName was destroyed and corrupted subsequent lookups.
+	std::unordered_map<std::string, size_t> pendingInsertIndexByName;
+	std::unordered_map<std::string, size_t> pendingInsertTailByAnchorName;
 
 	std::vector<const void*> immediateModePassPointers;
 	std::vector<IHasImmediateModeCommands*> immediateModeInterfaces;

@@ -14,12 +14,15 @@ namespace org {
 // non-owning; CreateShared retains an imported BasicRHI resource for generation-safe interop.
 class ExternalTextureResource : public GloballyIndexedResource {
 public:
-    ExternalTextureResource(rhi::ResourceHandle handle, unsigned int width, unsigned int height)
+    ExternalTextureResource(rhi::ResourceHandle handle, unsigned int width, unsigned int height,
+        rhi::Format format = rhi::Format::Unknown)
         : m_handle(handle), m_width(width), m_height(height)
     {
         m_hasLayout = true;
         m_mipLevels = 1;
         m_arraySize = 1;
+        m_description.format = format;
+        m_description.imageDimensions.push_back({ width, height, 0, 0 });
         ResetToUndefined();
     }
 
@@ -48,6 +51,8 @@ public:
         rhi::ResourceSyncState nextSync) override;
 
     SymbolicTracker* GetStateTracker() override { return &m_stateTracker; }
+    bool TryGetRHIResourceDesc(rhi::ResourceDesc& outDesc) const override;
+    rhi::Format GetFormat() const { return m_description.format; }
     unsigned int GetWidth() const { return m_width; }
     unsigned int GetHeight() const { return m_height; }
 

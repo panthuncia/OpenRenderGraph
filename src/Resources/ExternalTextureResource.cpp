@@ -7,6 +7,21 @@
 
 namespace org {
 
+bool ExternalTextureResource::TryGetRHIResourceDesc(rhi::ResourceDesc& outDesc) const
+{
+	if (m_description.imageDimensions.empty()) return false;
+	outDesc = {};
+	outDesc.type = rhi::ResourceType::Texture2D;
+	outDesc.heapType = rhi::HeapType::DeviceLocal;
+	outDesc.texture.format = m_description.format;
+	outDesc.texture.width = m_width;
+	outDesc.texture.height = m_height;
+	outDesc.texture.depthOrLayers = m_arraySize;
+	outDesc.texture.mipLevels = m_mipLevels;
+	outDesc.texture.sampleCount = 1;
+	return outDesc.texture.format != rhi::Format::Unknown;
+}
+
 namespace {
 DescriptorHeapManager::ViewRequirements BuildExternalTextureViews(
 	const TextureDescription& description, uint32_t mipLevels, uint32_t arraySize)

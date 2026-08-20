@@ -181,10 +181,13 @@ public:
     const std::string& GetName() const { return name; }
     virtual void SetName(const std::string& newName) { this->name = newName; OnSetName(); }
 	virtual rhi::Resource GetAPIResource() = 0;
-	virtual rhi::Resource GetAPIResource(BackendInstanceId backendInstance) {
+	rhi::Resource GetAttachedAPIRepresentation(BackendInstanceId backendInstance) const {
 		std::scoped_lock lock(m_representationMutex);
 		const auto it = m_representations.find(static_cast<uint8_t>(backendInstance));
-		if (it != m_representations.end()) return it->second->resource.Get();
+		return it != m_representations.end() && it->second ? it->second->resource.Get() : rhi::Resource{};
+	}
+	virtual rhi::Resource GetAPIResource(BackendInstanceId backendInstance) {
+		if (auto attached = GetAttachedAPIRepresentation(backendInstance)) return attached;
 		return backendInstance == BackendInstanceId::Primary ? GetAPIResource() : rhi::Resource{};
 	}
 	bool AttachAPIRepresentation(BackendInstanceId backendInstance, rhi::ResourcePtr resource,
@@ -267,10 +270,13 @@ public:
 	}
 
 	virtual SymbolicTracker* GetStateTracker() = 0;
-	virtual SymbolicTracker* GetStateTracker(BackendInstanceId backendInstance) {
+	SymbolicTracker* GetAttachedStateTracker(BackendInstanceId backendInstance) {
 		std::scoped_lock lock(m_representationMutex);
 		const auto it = m_representations.find(static_cast<uint8_t>(backendInstance));
-		if (it != m_representations.end()) return &it->second->tracker;
+		return it != m_representations.end() && it->second ? &it->second->tracker : nullptr;
+	}
+	virtual SymbolicTracker* GetStateTracker(BackendInstanceId backendInstance) {
+		if (auto* attached = GetAttachedStateTracker(backendInstance)) return attached;
 		return backendInstance == BackendInstanceId::Primary ? GetStateTracker() : nullptr;
 	}
 	virtual bool TryGetRHIResourceDesc(rhi::ResourceDesc& outDesc) const { (void)outDesc; return false; }

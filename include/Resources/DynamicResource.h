@@ -73,6 +73,9 @@ public:
     SymbolicTracker* GetStateTracker() override {
         return resource->GetStateTracker();
     }
+    bool TryGetRHIResourceDesc(rhi::ResourceDesc& outDesc) const override {
+        return resource && resource->TryGetRHIResourceDesc(outDesc);
+    }
 
 protected:
     void OnSetName() override {

@@ -113,6 +113,7 @@ PixelBuffer::PixelBuffer(const TextureDescription& desc, bool materialize)
 PixelBuffer::~PixelBuffer() = default;
 
 rhi::Resource PixelBuffer::GetAPIResource() {
+    if (auto attached = GetAttachedAPIRepresentation(BackendInstanceId::Primary)) return attached;
     std::scoped_lock lock(m_materializationMutex);
     EnsureMaterializedLocked("GetAPIResource");
     return m_backing->GetAPIResource();
@@ -156,6 +157,7 @@ void PixelBuffer::ApplyMetadataComponentBundle(const EntityComponentBundle& bund
 }
 
 SymbolicTracker* PixelBuffer::GetStateTracker() {
+    if (auto* attached = GetAttachedStateTracker(BackendInstanceId::Primary)) return attached;
     std::scoped_lock lock(m_materializationMutex);
     EnsureMaterializedLocked("GetStateTracker");
     return m_backing->GetStateTracker();
@@ -188,7 +190,12 @@ bool PixelBuffer::TryGetRHIResourceDesc(rhi::ResourceDesc& outDesc) const {
 }
 
 void PixelBuffer::RefreshAPIRepresentationDescriptors(BackendInstanceId backendInstance) {
-	if (backendInstance == BackendInstanceId::Primary) return;
+	// Multi-RHI materialization installs an explicit representation for every
+	// participating device, including the primary device.  The original backing
+	// may already have populated the primary descriptor arena, so it is essential
+	// to overwrite those descriptors with views of the new shared representation.
+	// Otherwise barriers/copies resolve the shared resource while shaders and
+	// render passes continue to access the superseded primary-only backing.
 	auto resource = Resource::GetAPIResource(backendInstance);
 	if (!resource) return;
 	EnsureVirtualDescriptorSlotsAllocated();

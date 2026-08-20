@@ -2433,8 +2433,26 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 			any.pass);
 	};
 
+	// Cross-API ownership barriers are pass-local, while ordinary transitions
+	// are aggregated per batch.  Keep every user of a resource that may cross
+	// APIs in its own batch so an acquire/release cannot consume or suppress a
+	// neighbouring pass's per-subresource transition.
+	std::unordered_set<uint64_t> crossBackendResourceIDs;
+	if (rg.m_backendDevices.size() > 1) {
+		for (const auto& summary : rg.m_framePassAccessSummaries) {
+			if (summary.backendAffinity.strength == BackendAffinityStrength::Primary) continue;
+			crossBackendResourceIDs.insert(summary.touchedResourceIDs.begin(), summary.touchedResourceIDs.end());
+		}
+	}
+
 	auto passForcesBatchIsolation = [&](size_t passIndex) {
 		if (passIndex >= passes.size() || passHasImmediateWork(passes[passIndex])) return true;
+		if (passIndex < rg.m_framePassAccessSummaries.size() && !crossBackendResourceIDs.empty()) {
+			const auto& touched = rg.m_framePassAccessSummaries[passIndex].touchedResourceIDs;
+			if (std::ranges::any_of(touched, [&](uint64_t id) { return crossBackendResourceIDs.contains(id); })) {
+				return true;
+			}
+		}
 		return std::visit([](const auto& entry) {
 			using T = std::decay_t<decltype(entry)>;
 			if constexpr (std::is_same_v<T, std::monostate>) return false;
@@ -4174,6 +4192,13 @@ void RenderGraph::PublishCompiledTrackerStates() {
 
 		auto* liveTracker = resource->GetStateTracker();
 		if (!liveTracker) {
+			continue;
+		}
+		// Multi-representation state is predicted by the ownership planner for
+		// each device independently. Publishing the legacy single logical tracker
+		// here would erase the COMMON release state (or the destination-local
+		// acquired state) and corrupt the next frame's barrier before-state.
+		if (resource->GetRepresentationInstances().size() > 1) {
 			continue;
 		}
 		if (!compileResourceState.tracker.has_value()) {
@@ -6600,6 +6625,17 @@ void RenderGraph::PlanMultiBackendOwnershipTransfers() {
 		if (auto* backed = dynamic_cast<BackedResource*>(resource)) return backed->GetBackingGeneration();
 		return 0;
 	};
+	auto resetRepresentationToCommon = [](Resource* resource, BackendInstanceId backend) {
+		if (auto* tracker = resource->GetStateTracker(backend)) {
+			tracker->Reset({}, { rhi::ResourceAccessType::Common, rhi::ResourceLayout::Common, rhi::ResourceSyncState::All });
+		}
+	};
+	auto applyRepresentationRequirement = [](Resource* resource, BackendInstanceId backend, const auto& requirement) {
+		if (auto* tracker = resource->GetStateTracker(backend)) {
+			std::vector<ResourceTransition> ignored;
+			tracker->Apply(requirement.resourceHandleAndRange.range, resource, requirement.state, ignored);
+		}
+	};
 
 	auto visitPass = [&](auto* passEntry, BackendInstanceId backend) {
 		passEntry->externalAcquires.clear();
@@ -6640,20 +6676,37 @@ void RenderGraph::PlanMultiBackendOwnershipTransfers() {
 				initial.releases = &passEntry->externalReleases;
 				initial.tracker.Reset({}, { rhi::ResourceAccessType::Common, rhi::ResourceLayout::Common, rhi::ResourceSyncState::All });
 				previous = lastUses.emplace(resource, std::move(initial)).first;
+				resetRepresentationToCommon(resource, backend);
 				spdlog::debug("RenderGraph planned initial external texture acquire: resource='{}' toBackend={} consumer='{}'",
 					resource->GetName(), static_cast<uint32_t>(backend), passEntry->name);
 			}
+			else if (previous == lastUses.end() && backend == canonicalD3D12) {
+				// The shared D3D12 representation was installed after the ordinary
+				// transition compiler ran. Its first frame therefore needs an explicit
+				// UNDEFINED -> COMMON initialization followed by the pass requirement,
+				// rather than a transition compiled from the superseded backing's state.
+				passEntry->externalAcquires.push_back({ resource, requirement.state, {}, true });
+				LastUse initial{};
+				initial.backend = backend;
+				initial.releases = &passEntry->externalReleases;
+				initial.tracker.Reset({}, { rhi::ResourceAccessType::Common, rhi::ResourceLayout::Common, rhi::ResourceSyncState::All });
+				previous = lastUses.emplace(resource, std::move(initial)).first;
+				resetRepresentationToCommon(resource, backend);
+			}
 			else if (previous != lastUses.end() && previous->second.backend != backend) {
+				const BackendInstanceId sourceBackend = previous->second.backend;
 				if (previous->second.releases) {
 					for (const auto& segment : previous->second.tracker.GetSegments()) {
 						previous->second.releases->push_back({ resource, segment.state, segment.rangeSpec, false });
 					}
 				}
 				passEntry->externalAcquires.push_back({ resource, requirement.state, {}, false });
+				resetRepresentationToCommon(resource, sourceBackend);
+				resetRepresentationToCommon(resource, backend);
 				previous->second.backend = backend;
 				previous->second.tracker.Reset({}, { rhi::ResourceAccessType::Common, rhi::ResourceLayout::Common, rhi::ResourceSyncState::All });
 				spdlog::debug("RenderGraph planned external texture ownership transfer: resource='{}' fromBackend={} toBackend={} consumer='{}'",
-					resource->GetName(), static_cast<uint32_t>(previous->second.backend), static_cast<uint32_t>(backend), passEntry->name);
+					resource->GetName(), static_cast<uint32_t>(sourceBackend), static_cast<uint32_t>(backend), passEntry->name);
 			}
 			if (previous == lastUses.end()) {
 				LastUse initial{};
@@ -6666,6 +6719,7 @@ void RenderGraph::PlanMultiBackendOwnershipTransfers() {
 			previous->second.releases = &passEntry->externalReleases;
 			std::vector<ResourceTransition> ignored;
 			previous->second.tracker.Apply(requirement.resourceHandleAndRange.range, resource, requirement.state, ignored);
+			applyRepresentationRequirement(resource, backend, requirement);
 		});
 	};
 
@@ -6684,11 +6738,10 @@ void RenderGraph::PlanMultiBackendOwnershipTransfers() {
 		};
 	}
 
-	// Transition compilation historically followed one logical tracker. At an
-	// API handoff the destination representation starts from the externally
-	// acquired COMMON state. Rebase its generated pre-transition so it never
-	// inherits the source API's layout. The acquire is recorded before these
-	// transitions in RecordQueueBatch.
+	// Transition compilation historically followed one logical tracker.  The
+	// external acquire performs the destination representation's first
+	// transition directly into the consuming pass state. Drop the redundant
+	// batch transition for resources acquired in that batch.
 	for (auto& batch : batches) {
 		for (size_t queueIndex = 0; queueIndex < m_queueRegistry.SlotCount(); ++queueIndex) {
 			std::unordered_set<Resource*> acquired;
@@ -6698,13 +6751,10 @@ void RenderGraph::PlanMultiBackendOwnershipTransfers() {
 				}, passVariant);
 			}
 			if (acquired.empty()) continue;
-			for (auto& transition : batch.Transitions(queueIndex, BatchTransitionPhase::BeforePasses)) {
-				if (!acquired.contains(UnwrapDynamicResource(transition.pResource))) continue;
-				transition.prevAccessType = rhi::ResourceAccessType::Common;
-				transition.prevLayout = rhi::ResourceLayout::Common;
-				transition.prevSyncState = rhi::ResourceSyncState::All;
-				transition.discard = false;
-			}
+			auto& transitions = batch.Transitions(queueIndex, BatchTransitionPhase::BeforePasses);
+			std::erase_if(transitions, [&](const ResourceTransition& transition) {
+				return acquired.contains(UnwrapDynamicResource(transition.pResource));
+			});
 		}
 	}
 }
@@ -7428,18 +7478,20 @@ namespace {
 
 	// Signal external fences on the queue. Must be called AFTER the command list
 	struct ExternalFenceSignalKey {
+		void* deviceImpl = nullptr;
 		uint32_t index = 0;
 		uint32_t generation = 0;
 		uint64_t value = 0;
 
 		bool operator==(const ExternalFenceSignalKey& other) const noexcept {
-			return index == other.index && generation == other.generation && value == other.value;
+			return deviceImpl == other.deviceImpl && index == other.index && generation == other.generation && value == other.value;
 		}
 	};
 
 	struct ExternalFenceSignalKeyHash {
 		size_t operator()(const ExternalFenceSignalKey& key) const noexcept {
-			size_t seed = static_cast<size_t>(key.index);
+			size_t seed = std::hash<void*>{}(key.deviceImpl);
+			seed ^= static_cast<size_t>(key.index) + 0x9e3779b9u + (seed << 6) + (seed >> 2);
 			seed ^= static_cast<size_t>(key.generation) + 0x9e3779b9u + (seed << 6) + (seed >> 2);
 			seed ^= static_cast<size_t>(key.value) + 0x9e3779b9u + (seed << 6) + (seed >> 2);
 			seed ^= static_cast<size_t>(key.value >> 32) + 0x9e3779b9u + (seed << 6) + (seed >> 2);
@@ -7457,6 +7509,10 @@ namespace {
 	uint64_t PackTimelineSignalKey(rhi::TimelineHandle handle) noexcept {
 		return (static_cast<uint64_t>(handle.index) << 32) | static_cast<uint64_t>(handle.generation);
 	}
+	struct QueueSlotTimelineIdentity {
+		void* deviceImpl = nullptr;
+		uint64_t handleKey = 0;
+	};
 
 	void LogQueuedExternalFence(
 		unsigned frameIndex,
@@ -7470,8 +7526,10 @@ namespace {
 		if (!passReturn.fence.has_value() && passReturn.externalSignalsAfterCompletion.empty()) {
 			return;
 		}
-		auto logSignal = [&](rhi::TimelineHandle handle, uint64_t value) {
+		auto logSignal = [&](const rhi::Timeline& timeline, uint64_t value) {
+			auto handle = timeline.GetHandle();
 			ExternalFenceSignalKey key{
+				.deviceImpl = timeline.impl,
 				.index = handle.index,
 				.generation = handle.generation,
 				.value = value,
@@ -7513,11 +7571,11 @@ namespace {
 		};
 
 		if (passReturn.fence.has_value()) {
-			logSignal(passReturn.fence->GetHandle(), passReturn.fenceValue);
+			logSignal(*passReturn.fence, passReturn.fenceValue);
 		}
 		for (const auto& signal : passReturn.externalSignalsAfterCompletion) {
 			if (signal.timeline.IsValid()) {
-				logSignal(signal.timeline.GetHandle(), signal.value);
+				logSignal(signal.timeline, signal.value);
 			}
 		}
 	}
@@ -7531,7 +7589,7 @@ namespace {
 		size_t queueSlot,
 		size_t batchIndex,
 		unsigned frameIndex,
-		std::span<const uint64_t> queueSlotFenceTimelineKeys,
+		std::span<const QueueSlotTimelineIdentity> queueSlotFenceTimelineKeys,
 		std::unordered_map<ExternalFenceSignalKey, ExternalFenceSignalOrigin, ExternalFenceSignalKeyHash>& seenSignals,
 		std::unordered_map<uint64_t, uint64_t>& lastExternalSignalValueByTimeline,
 		std::vector<PassReturn>& externalFences) {
@@ -7585,7 +7643,8 @@ namespace {
 				if (slotFence) {
 					auto a = fr.fence.value().GetHandle();
 					auto b = slotFence->GetHandle();
-					if (a.index == b.index && a.generation == b.generation) {
+					if (fr.fence.value().impl == slotFence->impl &&
+						a.index == b.index && a.generation == b.generation) {
 						spdlog::error(
 							"SignalExternalFences: external signal aliases queue slot fence timeline "
 							"(idx={}, gen={}) value={} frame={} queue={} slot={} batch={}. "
@@ -7601,10 +7660,12 @@ namespace {
 					}
 				}
 				auto handle = fr.fence.value().GetHandle();
-				const uint64_t timelineKey = PackTimelineSignalKey(handle);
+				const uint64_t timelineKey = PackTimelineSignalKey(handle)
+					^ (static_cast<uint64_t>(std::hash<void*>{}(fr.fence.value().impl)) * 0x9e3779b97f4a7c15ull);
 				bool aliasesQueueSlotFence = false;
 				for (size_t aliasedSlot = 0; aliasedSlot < queueSlotFenceTimelineKeys.size(); ++aliasedSlot) {
-					if (queueSlotFenceTimelineKeys[aliasedSlot] != timelineKey) {
+					if (queueSlotFenceTimelineKeys[aliasedSlot].deviceImpl != fr.fence.value().impl ||
+						queueSlotFenceTimelineKeys[aliasedSlot].handleKey != timelineKey) {
 						continue;
 					}
 					spdlog::error(
@@ -7654,6 +7715,7 @@ namespace {
 					continue;
 				}
 				ExternalFenceSignalKey key{
+					.deviceImpl = fr.fence.value().impl,
 					.index = handle.index,
 					.generation = handle.generation,
 					.value = fr.fenceValue,
@@ -8112,6 +8174,7 @@ namespace {
 		QueueKind queue;
 		size_t queueSlot;
 		rhi::Queue& rhiQueue;           // needed for statistics Begin/EndQuery
+		ResourceRegistry& registry;
 		PassExecutionContext context;    // COPY: each task gets its own
 		org::runtime::IStatisticsService* statisticsService;
 		std::unordered_map<ExternalFenceSignalKey, ExternalFenceSignalOrigin, ExternalFenceSignalKeyHash>& queuedExternalFenceOrigins;
@@ -8140,9 +8203,13 @@ namespace {
 					resolvedRange.mipCount,
 					resolvedRange.firstSlice,
 					resolvedRange.sliceCount };
-				barrier.beforeSync = acquire ? rhi::ResourceSyncState::All : entry.state.sync;
+				barrier.beforeSync = acquire
+					? (entry.initialFromUndefined ? rhi::ResourceSyncState::None : rhi::ResourceSyncState::All)
+					: entry.state.sync;
 				barrier.afterSync = rhi::ResourceSyncState::All;
-				barrier.beforeAccess = acquire ? rhi::ResourceAccessType::Common : entry.state.access;
+				barrier.beforeAccess = acquire
+					? (entry.initialFromUndefined ? rhi::ResourceAccessType::None : rhi::ResourceAccessType::Common)
+					: entry.state.access;
 				barrier.afterAccess = rhi::ResourceAccessType::Common;
 				barrier.beforeLayout = acquire
 					? (entry.initialFromUndefined ? rhi::ResourceLayout::Undefined : rhi::ResourceLayout::Common)
@@ -8193,19 +8260,6 @@ namespace {
 		uint8_t clIndex = 0;
 		rhi::CommandList commandList = sched.preallocatedCLs[clIndex].list.Get();
 
-		// Ownership must be acquired before any ordinary layout/access transition
-		// touches the destination representation. Acquiring at pass execution time
-		// was too late because pre-transitions are recorded first.
-		for (auto& passVariant : batch.Passes(qi)) {
-			std::visit([&](auto* passEntry) {
-				RecordExternalOwnershipBarriers(
-					passEntry->externalAcquires,
-					args.context.backendInstance,
-					true,
-					commandList);
-			}, passVariant);
-		}
-
 		// Record pre-transitions
 		auto& preTransitions = batch.Transitions(qi, RenderGraph::BatchTransitionPhase::BeforePasses);
 		RecordTransitionBarriers(preTransitions, args.context.backendInstance, commandList);
@@ -8229,9 +8283,60 @@ namespace {
 		// Record all passes.
 		args.context.commandList = commandList;
 
-		auto executeOne = [&](auto& pr) {
+			auto executeOne = [&](auto& pr) {
 			if (!pr.pass->IsInvalidated())
 				return;
+			// A crossed representation remains externally owned until this exact
+			// consumer.  Acquiring here avoids changing the layout before earlier
+			// passes in the same queue batch have executed.
+			RecordExternalOwnershipBarriers(
+				pr.externalAcquires,
+				args.context.backendInstance,
+				true,
+				commandList);
+			if (!pr.externalAcquires.empty()) {
+				std::unordered_set<Resource*> acquiredResources;
+				for (const auto& acquire : pr.externalAcquires) {
+					if (acquire.resource) acquiredResources.insert(acquire.resource);
+				}
+				rhi::helpers::OwnedBarrierBatch destinationTransitions;
+				ForEachFrameRequirement(pr.resources, [&](const auto& requirement) {
+					const auto handle = requirement.resourceHandleAndRange.resource;
+					Resource* resource = handle.IsEphemeral()
+						? handle.GetEphemeralPtr()
+						: args.registry.Resolve(handle);
+					resource = UnwrapDynamicResource(resource);
+					if (!resource || !acquiredResources.contains(resource)) return;
+					const auto apiResource = resource->GetAPIResource(args.context.backendInstance);
+					if (!apiResource) return;
+					if (resource->HasLayout()) {
+						const auto resolvedRange = ResolveRangeSpec(
+							requirement.resourceHandleAndRange.range,
+							resource->GetMipLevels(), resource->GetArraySize());
+						rhi::TextureBarrier barrier{};
+						barrier.texture = apiResource.GetHandle();
+						barrier.range = { resolvedRange.firstMip, resolvedRange.mipCount,
+							resolvedRange.firstSlice, resolvedRange.sliceCount };
+						barrier.beforeSync = rhi::ResourceSyncState::All;
+						barrier.afterSync = requirement.state.sync;
+						barrier.beforeAccess = rhi::ResourceAccessType::Common;
+						barrier.afterAccess = requirement.state.access;
+						barrier.beforeLayout = rhi::ResourceLayout::Common;
+						barrier.afterLayout = requirement.state.layout;
+						destinationTransitions.textures.push_back(barrier);
+					}
+					else {
+						rhi::BufferBarrier barrier{};
+						barrier.buffer = apiResource.GetHandle();
+						barrier.beforeSync = rhi::ResourceSyncState::All;
+						barrier.afterSync = requirement.state.sync;
+						barrier.beforeAccess = rhi::ResourceAccessType::Common;
+						barrier.afterAccess = requirement.state.access;
+						destinationTransitions.buffers.push_back(barrier);
+					}
+				});
+				if (!destinationTransitions.Empty()) commandList.Barriers(destinationTransitions.View());
+			}
 			const std::string_view passName = pr.name.empty() ? std::string_view("<unnamed>") : std::string_view(pr.name);
 			const char* techniquePath = pr.techniquePath.empty() ? nullptr : pr.techniquePath.c_str();
 			try {
@@ -9278,15 +9383,31 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 							qs.numCLs);
 					}
 					qs.preallocatedCLs[ci] = SlotPool(qi)->Request();
-					if (qs.preallocatedCLs[ci].list && (heavyDebug || batchTraceEnabled)) {
+					// Keep graph provenance on command buffers even in the normal parallel
+					// path.  Vulkan synchronization validation reports the command-buffer
+					// debug name, and numeric pool names alone make an intermittent hazard
+					// impossible to associate with its transition/pass batch.
+					if (qs.preallocatedCLs[ci].list) {
 						const auto queueKind = m_queueRegistry.GetKind(static_cast<QueueSlotIndex>(qi));
-						const auto debugName = MakeRenderGraphCommandListName(
+						auto debugName = MakeRenderGraphCommandListName(
 							static_cast<unsigned>(context.frameIndex),
 							bi,
 							qi,
 							queueKind,
 							qs,
 							ci);
+						if (qi < batches[bi].queuePasses.size() && !batches[bi].queuePasses[qi].empty()) {
+							debugName += " passes=";
+							bool first = true;
+							for (const auto& queuedPass : batches[bi].queuePasses[qi]) {
+								std::visit([&](const auto* pass) {
+									if (!pass) return;
+									if (!first) debugName += ',';
+									debugName += pass->name;
+									first = false;
+								}, queuedPass);
+							}
+						}
 						qs.preallocatedCLs[ci].list->SetName(debugName.c_str());
 					}
 					if (batchTraceEnabled) {
@@ -9329,14 +9450,17 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 	// Per-slot signal tracking for monotonic recycle signals.
 	std::vector<UINT64> lastSignaledPerSlot(slotCount);
 	std::vector<UINT64> greatestActuallySignaledPerSlot(slotCount);
-	std::vector<uint64_t> queueSlotFenceTimelineKeys(slotCount);
+	std::vector<QueueSlotTimelineIdentity> queueSlotFenceTimelineKeys(slotCount);
 	std::unordered_map<ExternalFenceSignalKey, ExternalFenceSignalOrigin, ExternalFenceSignalKeyHash> seenExternalFenceSignalsThisFrame;
 	seenExternalFenceSignalsThisFrame.reserve(32);
 	std::unordered_map<ExternalFenceSignalKey, ExternalFenceSignalOrigin, ExternalFenceSignalKeyHash> queuedExternalFenceOriginsThisFrame;
 	queuedExternalFenceOriginsThisFrame.reserve(32);
 	for (size_t qi = 0; qi < slotCount; ++qi) {
 		const auto slotIndex = static_cast<QueueSlotIndex>(static_cast<uint8_t>(qi));
-		queueSlotFenceTimelineKeys[qi] = PackTimelineSignalKey(SlotFence(qi).GetHandle());
+		queueSlotFenceTimelineKeys[qi] = {
+			.deviceImpl = SlotFence(qi).impl,
+			.handleKey = PackTimelineSignalKey(SlotFence(qi).GetHandle())
+		};
 		const UINT64 completedFenceValue = SlotFence(qi).GetCompletedValue();
 		UINT64 nextFenceValue = m_queueRegistry.GetCurrentFenceValue(slotIndex);
 		if (completedFenceValue != UINT64_MAX) {
@@ -9531,6 +9655,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 						.queue = queueKind,
 						.queueSlot = task.queueIndex,
 						.rhiQueue = rhiQ,
+						.registry = _registry,
 					.context = context,
 						.statisticsService = statisticsService,
 						.queuedExternalFenceOrigins = queuedExternalFenceOriginsThisFrame,

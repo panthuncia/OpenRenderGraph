@@ -2400,7 +2400,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 
 				if (!anchorName.empty()) {
 					explicitAfterByName.emplace_back(std::string(anchorName), insertedPassName);
-					pendingInsertTailByAnchorName[anchorName] = pendingIndex;
+					pendingInsertTailByAnchorName[std::string(anchorName)] = pendingIndex;
 				}
 				if (d.where.has_value()) {
 					for (auto const& b : d.where->before) {

@@ -374,6 +374,7 @@ BufferBase::~BufferBase() {
 }
 
 rhi::Resource BufferBase::GetAPIResource() {
+    if (auto attached = GetAttachedAPIRepresentation(BackendInstanceId::Primary)) return attached;
     if (!m_dataBuffer) {
 		std::ostringstream err = std::ostringstream() << "Buffer resource '" << GetName() << "' is not materialized";
         throw std::runtime_error(err.str());
@@ -382,6 +383,7 @@ rhi::Resource BufferBase::GetAPIResource() {
 }
 
 SymbolicTracker* BufferBase::GetStateTracker() {
+    if (auto* attached = GetAttachedStateTracker(BackendInstanceId::Primary)) return attached;
     if (!m_dataBuffer) {
         std::ostringstream err = std::ostringstream() << "Buffer resource '" << GetName() << "' is not materialized";
         throw std::runtime_error(err.str());
@@ -425,7 +427,10 @@ bool BufferBase::TryGetRHIResourceDesc(rhi::ResourceDesc& outDesc) const {
 }
 
 void BufferBase::RefreshAPIRepresentationDescriptors(BackendInstanceId backendInstance) {
-	if (backendInstance == BackendInstanceId::Primary || !m_descriptorRequirements.has_value()) return;
+	// As with textures, an explicit primary representation supersedes the
+	// resource's original backing in multi-RHI mode. Refresh the primary arena as
+	// well so descriptor accesses and graph-resolved resource handles agree.
+	if (!m_descriptorRequirements.has_value()) return;
 	auto resource = Resource::GetAPIResource(backendInstance);
 	if (!resource) return;
 	EnsureVirtualDescriptorSlotsAllocated();
