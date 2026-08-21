@@ -33,6 +33,8 @@
 #include "Render/Runtime/ITaskService.h"
 #include "Render/QueueKind.h"
 #include "Render/QueueRegistry.h"
+#include "Render/RenderGraph/SharedAliasPoolManager.h"
+#include "Render/DeviceRegistry.h"
 #include "Resources/PixelBuffer.h"
 #include "Resources/Buffers/Buffer.h"
 #include "Resources/TrackedAllocation.h"
@@ -679,7 +681,9 @@ public:
 	};
 
 	RenderGraph(rhi::Device device, rhi::Backend primaryBackend = rhi::Backend::Null);
-	BackendInstanceId RegisterBackendDevice(rhi::Backend backend, rhi::Device device);
+	DeviceInstanceId RegisterBackendDevice(rhi::Backend backend, rhi::Device device);
+	const DeviceRegistry& GetDeviceRegistry() const noexcept { return m_backendDevices; }
+	DeviceInstanceId GetPrimaryDeviceInstance() const noexcept { return m_backendDevices.PrimaryId(); }
 	~RenderGraph();
 	static void ShutdownRuntime();
 	using AutoAliasReasonCount = org::alias::AutoAliasReasonCount;
@@ -1253,12 +1257,7 @@ private:
 	uint64_t m_frameDeclarationRefreshEquivalentCount = 0;
 	std::vector<size_t> m_assignedQueueSlotsByFramePass;
 	std::vector<uint8_t> m_activeQueueSlotsThisFrame;
-	struct BackendDeviceEntry {
-		BackendInstanceId id = BackendInstanceId::Primary;
-		rhi::Backend backend = rhi::Backend::Null;
-		rhi::Device device{};
-	};
-	std::vector<BackendDeviceEntry> m_backendDevices;
+	DeviceRegistry m_backendDevices;
 	std::array<uint8_t, static_cast<size_t>(QueueKind::Count)> m_minAutomaticSchedulingQueuesByKind = { 1, 1, 1 };
 	std::unordered_map<std::string, std::shared_ptr<RenderPass>> renderPassesByName;
 	std::unordered_map<std::string, std::shared_ptr<ComputePass>> computePassesByName;
@@ -1326,14 +1325,7 @@ private:
 
 	using PersistentAliasPoolState = org::alias::PersistentAliasPoolState;
 	std::unordered_map<uint64_t, PersistentAliasPoolState> persistentAliasPools;
-	struct SharedAliasPoolState {
-		rhi::HeapPtr d3d12;
-		rhi::HeapPtr vulkan;
-		uint64_t capacityBytes = 0;
-		uint64_t generation = 0;
-		uint8_t resourceClass = 0;
-	};
-	std::unordered_map<uint64_t, SharedAliasPoolState> m_sharedAliasPools;
+	SharedAliasPoolManager m_sharedAliasPools;
 	std::unordered_map<uint64_t, uint64_t> m_sharedAliasResourcePoolGeneration;
 	std::unordered_map<uint64_t, uint64_t> m_sharedAliasResourcePoolID;
 	std::unordered_map<uint64_t, org::alias::CachedAliasPoolPlan> cachedAliasPlanByPoolID;
@@ -1431,6 +1423,16 @@ private:
 	std::unique_ptr<CommandRecordingManager> m_pCommandRecordingManager;
 	ExecutionSchedule m_executionSchedule;
 	std::unordered_map<uint64_t, uint64_t> m_lastExternalSignalValueByTimeline;
+	struct RetiredInteropGeneration {
+		// Members are destroyed in reverse declaration order: placed resources
+		// must die before the heaps that own their memory.
+		std::vector<rhi::HeapPtr> heaps;
+		std::vector<Resource::APIRepresentationPtr> representations;
+		std::vector<uint64_t> queueCompletionValues;
+	};
+	std::vector<RetiredInteropGeneration> m_retiredInteropGenerations;
+	RetiredInteropGeneration BeginInteropRetirement();
+	void CollectRetiredInteropGenerations();
 
 	void BuildExecutionSchedule();
 	void AssignQueueSignalFenceValuesInSubmissionOrder(std::vector<PassBatch>& batchesToAssign);

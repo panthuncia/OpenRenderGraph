@@ -181,10 +181,25 @@ public:
     const std::string& GetName() const { return name; }
     virtual void SetName(const std::string& newName) { this->name = newName; OnSetName(); }
 	virtual rhi::Resource GetAPIResource() = 0;
-	rhi::Resource GetAttachedAPIRepresentation(BackendInstanceId backendInstance) const {
+	struct APIRepresentation {
+		rhi::ResourcePtr resource;
+		SymbolicTracker tracker;
+		uint64_t backingGeneration = 0;
+	};
+	using APIRepresentationPtr = std::shared_ptr<APIRepresentation>;
+	struct PendingAPIRepresentation {
+		BackendInstanceId device;
+		rhi::ResourcePtr resource;
+		ResourceState initialState{ rhi::ResourceAccessType::None, rhi::ResourceLayout::Undefined, rhi::ResourceSyncState::None };
+	};
+	APIRepresentationPtr AcquireAPIRepresentation(BackendInstanceId backendInstance) const {
 		std::scoped_lock lock(m_representationMutex);
 		const auto it = m_representations.find(static_cast<uint8_t>(backendInstance));
-		return it != m_representations.end() && it->second ? it->second->resource.Get() : rhi::Resource{};
+		return it != m_representations.end() ? it->second : APIRepresentationPtr{};
+	}
+	rhi::Resource GetAttachedAPIRepresentation(BackendInstanceId backendInstance) const {
+		auto representation = AcquireAPIRepresentation(backendInstance);
+		return representation && representation->resource ? representation->resource.Get() : rhi::Resource{};
 	}
 	virtual rhi::Resource GetAPIResource(BackendInstanceId backendInstance) {
 		if (auto attached = GetAttachedAPIRepresentation(backendInstance)) return attached;
@@ -192,15 +207,32 @@ public:
 	}
 	bool AttachAPIRepresentation(BackendInstanceId backendInstance, rhi::ResourcePtr resource,
 		ResourceState initialState = { rhi::ResourceAccessType::None, rhi::ResourceLayout::Undefined, rhi::ResourceSyncState::None }) {
-		if (!resource) return false;
-		RangeSpec wholeRange{};
-		auto representation = std::make_unique<AdditionalRepresentation>();
-		representation->resource = std::move(resource);
-		representation->tracker = SymbolicTracker(wholeRange, initialState);
+		std::vector<PendingAPIRepresentation> pending;
+		pending.push_back({ backendInstance, std::move(resource), initialState });
+		return PublishAPIRepresentations(std::move(pending));
+	}
+	// Publishes a complete set of device-local backings as one generation. No
+	// execution thread can observe only half of a cross-device resource pair.
+	bool PublishAPIRepresentations(std::vector<PendingAPIRepresentation> pending) {
+		if (pending.empty()) return true;
+		std::unordered_map<uint8_t, APIRepresentationPtr> replacements;
+		replacements.reserve(pending.size());
+		const uint64_t generation = m_nextRepresentationGeneration.fetch_add(1, std::memory_order_relaxed);
+		for (auto& item : pending) {
+			if (!item.resource) return false;
+			auto representation = std::make_shared<APIRepresentation>();
+			representation->resource = std::move(item.resource);
+			representation->tracker = SymbolicTracker(RangeSpec{}, item.initialState);
+			representation->backingGeneration = generation;
+			replacements[static_cast<uint8_t>(item.device)] = std::move(representation);
+		}
 		std::scoped_lock lock(m_representationMutex);
-		m_representations[static_cast<uint8_t>(backendInstance)] = std::move(representation);
+		for (auto& [device, representation] : replacements)
+			m_representations[device] = std::move(representation);
+		m_publishedRepresentationGeneration = generation;
 		return true;
 	}
+	uint64_t GetAPIRepresentationGeneration() const noexcept { return m_publishedRepresentationGeneration.load(std::memory_order_acquire); }
 	bool HasAPIRepresentation(BackendInstanceId backendInstance) {
 		if (GetAttachedAPIRepresentation(backendInstance)) return true;
 		// The implicit primary backing is intentionally not counted as an explicit
@@ -210,16 +242,28 @@ public:
 		return false;
 	}
 	std::vector<BackendInstanceId> GetRepresentationInstances() const {
-		std::vector<BackendInstanceId> result{ BackendInstanceId::Primary };
+		std::vector<BackendInstanceId> result;
 		std::scoped_lock lock(m_representationMutex);
 		for (const auto& [id, representation] : m_representations) {
 			if (representation && representation->resource) result.push_back(static_cast<BackendInstanceId>(id));
 		}
+		if (result.empty()) result.push_back(BackendInstanceId::Primary); // legacy implicit primary backing
 		return result;
 	}
 	void ClearAPIRepresentations() {
 		std::scoped_lock lock(m_representationMutex);
 		m_representations.clear();
+	}
+	std::vector<APIRepresentationPtr> TakeAPIRepresentations() {
+		std::vector<APIRepresentationPtr> retired;
+		std::scoped_lock lock(m_representationMutex);
+		retired.reserve(m_representations.size());
+		for (auto& [device, representation] : m_representations) {
+			(void)device;
+			if (representation) retired.push_back(std::move(representation));
+		}
+		m_representations.clear();
+		return retired;
 	}
     virtual uint64_t GetGlobalResourceID() const { return m_globalResourceID; }
 	// Identity used by render-graph scheduling. Dynamic wrappers override this so
@@ -242,19 +286,21 @@ public:
 		}
 		auto& representation = *it->second;
 		if (HasLayout()) {
+			thread_local rhi::TextureBarrier textureBarrier{};
 			const auto resolved = ResolveRangeSpec(range, m_mipLevels, m_arraySize);
-			representation.textureBarrier = {
+			textureBarrier = {
 				.texture = representation.resource->GetHandle(),
 				.range = { resolved.firstMip, resolved.mipCount, resolved.firstSlice, resolved.sliceCount },
 				.beforeSync = prevSyncState, .afterSync = newSyncState,
 				.beforeAccess = prevAccessType, .afterAccess = newAccessType,
 				.beforeLayout = prevLayout, .afterLayout = newLayout };
-			return { .textures = { &representation.textureBarrier, 1 } };
+			return { .textures = { &textureBarrier, 1 } };
 		}
-		representation.bufferBarrier = { .buffer = representation.resource->GetHandle(), .offset = 0, .size = ~0ull,
+		thread_local rhi::BufferBarrier bufferBarrier{};
+		bufferBarrier = { .buffer = representation.resource->GetHandle(), .offset = 0, .size = ~0ull,
 			.beforeSync = prevSyncState, .afterSync = newSyncState,
 			.beforeAccess = prevAccessType, .afterAccess = newAccessType };
-		return { .buffers = { &representation.bufferBarrier, 1 } };
+		return { .buffers = { &bufferBarrier, 1 } };
 	}
 	bool HasLayout() const { return m_hasLayout; }
 	void AddAliasedResource(Resource* resource) {
@@ -305,14 +351,10 @@ protected:
 	unsigned int m_arraySize = 1;
 
 private:
-	struct AdditionalRepresentation {
-		rhi::ResourcePtr resource;
-		SymbolicTracker tracker;
-		rhi::BufferBarrier bufferBarrier{};
-		rhi::TextureBarrier textureBarrier{};
-	};
 	mutable std::mutex m_representationMutex;
-	std::unordered_map<uint8_t, std::unique_ptr<AdditionalRepresentation>> m_representations;
+	std::unordered_map<uint8_t, APIRepresentationPtr> m_representations;
+	std::atomic<uint64_t> m_nextRepresentationGeneration{ 1 };
+	std::atomic<uint64_t> m_publishedRepresentationGeneration{ 0 };
     bool m_uploadInProgress = false;
     inline static std::atomic<uint64_t> globalResourceCount;
 	inline static ECSEntityHooks s_ecsEntityHooks{};

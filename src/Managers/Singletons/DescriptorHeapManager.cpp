@@ -521,6 +521,11 @@ void DescriptorHeapManager::UpdateDescriptorContents(
     UpdateDescriptorContentsUnlocked(target, apiResource, req, backendInstance);
 }
 
+std::vector<DescriptorHeapManager::QueueFenceSnapshotPoint> DescriptorHeapManager::GetQueueFenceSnapshot() const {
+	std::scoped_lock lock(m_descriptorMutationMutex);
+	return m_latestQueueFenceSnapshot;
+}
+
 void DescriptorHeapManager::UpdateDescriptorContentsUnlocked(
     GloballyIndexedResource& target,
     rhi::Resource& apiResource,

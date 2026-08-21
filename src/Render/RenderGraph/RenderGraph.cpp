@@ -1,5 +1,6 @@
 #include "Render/RenderGraph/RenderGraph.h"
 #include "RenderGraphCompilerState.h"
+#include "Render/RenderGraph/InteropAllocator.h"
 
 #include <span>
 #include <algorithm>
@@ -1518,13 +1519,17 @@ void RenderGraph::BuildNodes(RenderGraph& rg, std::vector<Node>& nodes) {
 			}), compatibleSlots.end());
 		};
 		if (passAccess.backendAffinity.strength == BackendAffinityStrength::Primary) {
-			filter([&](QueueSlotIndex slot) { return rg.m_queueRegistry.GetBackendInstance(slot) != BackendInstanceId::Primary; });
+			filter([&](QueueSlotIndex slot) { return rg.m_queueRegistry.GetBackendInstance(slot) != rg.m_backendDevices.PrimaryId(); });
 		}
 		else {
-			filter([&](QueueSlotIndex slot) { return rg.m_queueRegistry.GetBackend(slot) != passAccess.backendAffinity.backend; });
+			if (passAccess.backendAffinity.device) {
+				filter([&](QueueSlotIndex slot) { return rg.m_queueRegistry.GetBackendInstance(slot) != *passAccess.backendAffinity.device; });
+			} else {
+				filter([&](QueueSlotIndex slot) { return rg.m_queueRegistry.GetBackend(slot) != passAccess.backendAffinity.backend; });
+			}
 			if (compatibleSlots.empty() && passAccess.backendAffinity.strength == BackendAffinityStrength::Preferred) {
 				compatibleSlots = unfiltered;
-				filter([&](QueueSlotIndex slot) { return rg.m_queueRegistry.GetBackendInstance(slot) != BackendInstanceId::Primary; });
+				filter([&](QueueSlotIndex slot) { return rg.m_queueRegistry.GetBackendInstance(slot) != rg.m_backendDevices.PrimaryId(); });
 			}
 		}
 	};
@@ -3605,7 +3610,7 @@ bool ResolveFirstMipSlice(ResourceRegistry::RegistryHandle r, RangeSpec range, u
 RenderGraph::RenderGraph(rhi::Device device, rhi::Backend primaryBackend)
 	: m_compilerState(std::make_unique<CompilerState>()) {
 	DeviceManager::GetInstance().Initialize(device);
-	m_backendDevices.push_back({ BackendInstanceId::Primary, primaryBackend, device });
+	m_backendDevices.RegisterPrimary(primaryBackend, device);
 
 	auto MakeDefaultImmediateDispatch = [&]() noexcept -> org::imm::ImmediateDispatch
 		{
@@ -3682,16 +3687,11 @@ RenderGraph::RenderGraph(rhi::Device device, rhi::Backend primaryBackend)
 	}
 }
 
-BackendInstanceId RenderGraph::RegisterBackendDevice(rhi::Backend backend, rhi::Device device) {
+DeviceInstanceId RenderGraph::RegisterBackendDevice(rhi::Backend backend, rhi::Device device) {
 	if (!device || backend == rhi::Backend::Null) {
 		throw std::invalid_argument("RegisterBackendDevice requires a valid backend device");
 	}
-	for (const auto& entry : m_backendDevices) {
-		if (entry.backend == backend) return entry.id;
-	}
-	if (m_backendDevices.size() >= 255) throw std::runtime_error("RenderGraph backend device registry exhausted");
-	const auto id = static_cast<BackendInstanceId>(static_cast<uint8_t>(m_backendDevices.size()));
-	m_backendDevices.push_back({ id, backend, device });
+	const auto id = m_backendDevices.Register(backend, device);
 	DescriptorHeapManager::GetInstance().RegisterBackend(id, device);
 	return id;
 }
@@ -3789,6 +3789,12 @@ void RenderGraph::ShutdownOwnedState() {
 	_providers.clear();
 	_resolverMap.clear();
 	_registry = ResourceRegistry();
+	// Queue shutdown is the final completion point. Release placed resources
+	// before their imported/canonical heap pairs, and before queue/device state.
+	m_retiredInteropGenerations.clear();
+	m_sharedAliasPools.clear();
+	m_sharedAliasResourcePoolGeneration.clear();
+	m_sharedAliasResourcePoolID.clear();
 
 	m_pCommandRecordingManager.reset();
 	m_queueRegistry.Clear();
@@ -5644,11 +5650,11 @@ void RenderGraph::CompileStructural() {
 			anyConstraint = true;
 		}
 	}
-	spdlog::info("RenderGraph structural merge: external constraints complete passes={} edges={}", extItems.size(), edgeSet.size());
+	spdlog::debug("RenderGraph structural merge: external constraints complete passes={} edges={}", extItems.size(), edgeSet.size());
 
 	// Extension chaining edges: prev -> next (if keepExtensionOrder on the *next* pass)
 	for (auto& [ei, v] : extOrder) {
-		spdlog::info("RenderGraph structural merge: chaining extension={} passes={}", ei, v.size());
+		spdlog::debug("RenderGraph structural merge: chaining extension={} passes={}", ei, v.size());
 		for (size_t j = 1; j < v.size(); ++j) {
 			// Find the extItems entry for this node to check keepExtensionOrder
 			// (We can check by key because keys are unique.)
@@ -5665,10 +5671,10 @@ void RenderGraph::CompileStructural() {
 			if (keep) addEdge(prevNode, nextNode);
 		}
 	}
-	spdlog::info("RenderGraph structural merge: extension chaining complete edges={}", edgeSet.size());
+	spdlog::debug("RenderGraph structural merge: extension chaining complete edges={}", edgeSet.size());
 
 	// Topological sort (stable by priority then order)
-	spdlog::info("RenderGraph structural merge: sorting {} nodes", nodes.size());
+	spdlog::debug("RenderGraph structural merge: sorting {} nodes", nodes.size());
 	std::vector<uint32_t> indeg(nodes.size());
 	for (size_t n = 0; n < nodes.size(); ++n) indeg[n] = nodes[n].indeg;
 
@@ -5700,7 +5706,7 @@ void RenderGraph::CompileStructural() {
 		throw std::runtime_error("RenderGraph structural merge cycle");
 	}
 
-	spdlog::info("RenderGraph structural merge: topological sort complete nodes={}", topo.size());
+	spdlog::debug("RenderGraph structural merge: topological sort complete nodes={}", topo.size());
 	// Emit final m_masterPassList in topo order (skip sentinels)
 	m_masterPassList.clear();
 	m_compilerState->immediateModePassPointers.clear();
@@ -5713,9 +5719,9 @@ void RenderGraph::CompileStructural() {
 		}
 		m_masterPassList.push_back(std::move(nodes[u].pass));
 	}
-	spdlog::info("RenderGraph structural merge: emitted {} passes; rebuilding retained declarations", m_masterPassList.size());
+	spdlog::debug("RenderGraph structural merge: emitted {} passes; rebuilding retained declarations", m_masterPassList.size());
 	RebuildRetainedDeclarationRefreshCandidates();
-	spdlog::info("RenderGraph structural merge: compile complete");
+	spdlog::debug("RenderGraph structural merge: compile complete");
 }
 
 
@@ -6437,6 +6443,7 @@ void RenderGraph::MaterializeUnmaterializedResources(std::span<const uint64_t> o
 }
 
 void RenderGraph::MaterializeMultiBackendRepresentations() {
+	CollectRetiredInteropGenerations();
 	if (m_backendDevices.size() < 2 || m_frameSchedulingResourceCount == 0) return;
 	// Scheduling indices are deliberately compacted/merged (dynamic wrappers and
 	// their current backings may share one), so they are not interchangeable with
@@ -6485,15 +6492,18 @@ void RenderGraph::MaterializeMultiBackendRepresentations() {
 		for (size_t backend = 0; backend < uses[*index].size(); ++backend)
 			uses[*index][backend] |= (mask & (uint64_t{1} << backend)) != 0;
 	}
-	BackendDeviceEntry* d3d12 = nullptr;
-	BackendDeviceEntry* vulkan = nullptr;
+	DeviceRegistryEntry* d3d12 = nullptr;
+	DeviceRegistryEntry* vulkan = nullptr;
 	for (auto& entry : m_backendDevices) {
 		if (entry.backend == rhi::Backend::D3D12) d3d12 = &entry;
 		if (entry.backend == rhi::Backend::Vulkan) vulkan = &entry;
 	}
 	if (!d3d12 || !vulkan) return;
-	bool drainedForSharedPoolReplacement = false;
-	std::vector<std::pair<rhi::HeapPtr, rhi::HeapPtr>> retiredSharedPools;
+	std::optional<RetiredInteropGeneration> retirement;
+	auto ensureRetirement = [&]() -> RetiredInteropGeneration& {
+		if (!retirement) retirement.emplace(BeginInteropRetirement());
+		return *retirement;
+	};
 
 	for (size_t resourceIndex = 0; resourceIndex < uses.size(); ++resourceIndex) {
 		size_t backendCount = 0;
@@ -6554,12 +6564,9 @@ void RenderGraph::MaterializeMultiBackendRepresentations() {
 		if (complete) continue;
 		if (staleSharedPoolGeneration &&
 			(resource->HasAPIRepresentation(d3d12->id) || resource->HasAPIRepresentation(vulkan->id))) {
-			if (!drainedForSharedPoolReplacement) {
-				if (!rhi::IsOk(d3d12->device.WaitIdle()) || !rhi::IsOk(vulkan->device.WaitIdle()))
-					throw std::runtime_error("Failed to drain devices for shared alias pool replacement");
-				drainedForSharedPoolReplacement = true;
-			}
-			resource->ClearAPIRepresentations();
+			auto old = resource->TakeAPIRepresentations();
+			auto& retired = ensureRetirement().representations;
+			retired.insert(retired.end(), std::make_move_iterator(old.begin()), std::make_move_iterator(old.end()));
 		}
 
 		rhi::ResourceDesc desc{};
@@ -6568,7 +6575,7 @@ void RenderGraph::MaterializeMultiBackendRepresentations() {
 			throw std::runtime_error("Multi-RHI resource '" + resource->GetName() + "' has no supported device-local buffer/2D texture representation");
 		}
 		desc.heapFlags |= rhi::HeapFlags::Shared;
-		spdlog::info("RenderGraph materializing multi-RHI representation: index={} id={} name='{}' type={} flags=0x{:X}",
+		spdlog::debug("RenderGraph materializing multi-RHI representation: index={} id={} name='{}' type={} flags=0x{:X}",
 			resourceIndex, resource->GetGlobalResourceID(), resource->GetName(), static_cast<uint32_t>(desc.type),
 			static_cast<uint32_t>(desc.resourceFlags));
 		rhi::ResourcePtr d3Resource;
@@ -6604,17 +6611,12 @@ void RenderGraph::MaterializeMultiBackendRepresentations() {
 						placement.endByte - placement.startByte, requiredSize, requiredAlignment);
 					goto committed_multi_backend_resource;
 				}
-				auto& sharedPool = m_sharedAliasPools[placement.poolID];
-				const bool replacePool = !sharedPool.d3d12 || !sharedPool.vulkan ||
-					sharedPool.generation != primaryPool->second.generation ||
-					sharedPool.capacityBytes < primaryPool->second.capacityBytes ||
-					sharedPool.resourceClass != resourceClass;
+				auto* sharedPool = m_sharedAliasPools.Find(placement.poolID);
+				const bool replacePool = !sharedPool || !sharedPool->d3d12 || !sharedPool->vulkan ||
+					sharedPool->generation != primaryPool->second.generation ||
+					sharedPool->capacityBytes < primaryPool->second.capacityBytes ||
+					sharedPool->resourceClass != resourceClass;
 				if (replacePool) {
-					if ((sharedPool.d3d12 || sharedPool.vulkan) && !drainedForSharedPoolReplacement) {
-						if (!rhi::IsOk(d3d12->device.WaitIdle()) || !rhi::IsOk(vulkan->device.WaitIdle()))
-							throw std::runtime_error("Failed to drain devices before shared alias heap growth");
-						drainedForSharedPoolReplacement = true;
-					}
 					// Destroy every placed object bound to the old imported memory before
 					// releasing that VkDeviceMemory/D3D12 heap pair.
 					for (auto it = m_sharedAliasResourcePoolID.begin(); it != m_sharedAliasResourcePoolID.end();) {
@@ -6624,45 +6626,39 @@ void RenderGraph::MaterializeMultiBackendRepresentations() {
 							oldResource = current->second;
 						else if (auto registered = GetResourceByID(it->first))
 							oldResource = UnwrapDynamicResource(registered.get());
-						if (oldResource) oldResource->ClearAPIRepresentations();
+						if (oldResource) {
+							auto old = oldResource->TakeAPIRepresentations();
+							auto& retired = ensureRetirement().representations;
+							retired.insert(retired.end(), std::make_move_iterator(old.begin()), std::make_move_iterator(old.end()));
+						}
 						m_sharedAliasResourcePoolGeneration.erase(it->first);
 						it = m_sharedAliasResourcePoolID.erase(it);
 					}
-					rhi::HeapDesc heapDesc{};
-					heapDesc.sizeBytes = primaryPool->second.capacityBytes;
-					heapDesc.alignment = (std::max)(primaryPool->second.alignment, requiredAlignment);
-					heapDesc.memory = rhi::HeapType::DeviceLocal;
-					heapDesc.flags = rhi::HeapFlags::Shared | (resourceClass == 1
-						? rhi::HeapFlags::AllowOnlyBuffers : rhi::HeapFlags::AllowOnlyRtDsTextures);
-					heapDesc.debugName = "RenderGraph multi-RHI alias pool";
-					rhi::HeapPtr newD3Heap, newVkHeap;
-					auto heapResult = d3d12->device.CreateHeap(heapDesc, newD3Heap);
-					rhi::dx12::SharedHandle heapHandle{};
-					if (rhi::IsOk(heapResult)) heapResult = rhi::dx12::export_shared_heap(d3d12->device, newD3Heap.Get(), heapHandle);
-					if (rhi::IsOk(heapResult)) heapResult = rhi::vulkan::import_d3d12_heap(vulkan->device, heapHandle.value, heapDesc, newVkHeap);
-#ifdef _WIN32
-					if (heapHandle.value) CloseHandle(static_cast<HANDLE>(heapHandle.value));
-#endif
+					auto& retiredHeaps = ensureRetirement().heaps;
+					const auto heapResult = m_sharedAliasPools.EnsureD3D12VulkanPool(
+						placement.poolID, primaryPool->second.generation, primaryPool->second.capacityBytes,
+						(std::max)(primaryPool->second.alignment, requiredAlignment), resourceClass,
+						*d3d12, *vulkan, retiredHeaps);
 					if (rhi::IsOk(heapResult)) {
-						if (sharedPool.d3d12 || sharedPool.vulkan) {
-							retiredSharedPools.emplace_back(std::move(sharedPool.d3d12), std::move(sharedPool.vulkan));
-						}
-						sharedPool.d3d12 = std::move(newD3Heap);
-						sharedPool.vulkan = std::move(newVkHeap);
-						sharedPool.capacityBytes = heapDesc.sizeBytes;
-						sharedPool.resourceClass = resourceClass;
-						sharedPool.generation = primaryPool->second.generation;
-						spdlog::info("RenderGraph created shared alias pool: pool={} capacity={} alignment={} class={} generation={}",
-							placement.poolID, heapDesc.sizeBytes, heapDesc.alignment, resourceClass, sharedPool.generation);
+						sharedPool = m_sharedAliasPools.Find(placement.poolID);
+						spdlog::debug("RenderGraph created shared alias pool: pool={} capacity={} alignment={} class={} generation={}",
+							placement.poolID, primaryPool->second.capacityBytes,
+							(std::max)(primaryPool->second.alignment, requiredAlignment), resourceClass,
+							primaryPool->second.generation);
+					}
+					else {
+						sharedPool = nullptr;
+						spdlog::warn("RenderGraph shared alias pool creation failed; using committed fallback: pool={} result={}",
+							placement.poolID, static_cast<uint32_t>(heapResult));
 					}
 				}
-				if (sharedPool.d3d12 && sharedPool.vulkan && sharedPool.resourceClass == resourceClass &&
-					placement.endByte <= sharedPool.capacityBytes) {
+				if (sharedPool && sharedPool->d3d12 && sharedPool->vulkan && sharedPool->resourceClass == resourceClass &&
+					placement.endByte <= sharedPool->capacityBytes) {
 					rhi::ResourceDesc placedDesc = desc;
 					placedDesc.heapFlags = rhi::HeapFlags::None;
-					auto d3Placed = d3d12->device.CreatePlacedResource(sharedPool.d3d12->GetHandle(), placement.startByte, placedDesc, d3Resource);
+					auto d3Placed = d3d12->device.CreatePlacedResource(sharedPool->d3d12->GetHandle(), placement.startByte, placedDesc, d3Resource);
 					auto vkPlaced = rhi::IsOk(d3Placed)
-						? vulkan->device.CreatePlacedResource(sharedPool.vulkan->GetHandle(), placement.startByte, placedDesc, vkResource)
+						? vulkan->device.CreatePlacedResource(sharedPool->vulkan->GetHandle(), placement.startByte, placedDesc, vkResource)
 						: d3Placed;
 					placedOnSharedHeap = rhi::IsOk(d3Placed) && rhi::IsOk(vkPlaced);
 					if (placedOnSharedHeap && desc.type == rhi::ResourceType::Texture2D) {
@@ -6729,8 +6725,12 @@ void RenderGraph::MaterializeMultiBackendRepresentations() {
 							list->End();
 							const rhi::CommandList submitted[] = { list.Get() };
 							auto queue = d3d12->device.GetQueue(rhi::QueueKind::Graphics);
-							initResult = queue.Submit(submitted, {});
-							if (rhi::IsOk(initResult)) initResult = d3d12->device.WaitIdle();
+							rhi::TimelinePtr completion;
+							if (rhi::IsOk(initResult))
+								initResult = d3d12->device.CreateTimeline(completion, 0, "RenderGraph shared texture initialization");
+							const rhi::TimelinePoint completed{ completion ? completion->GetHandle() : rhi::TimelineHandle{}, 1 };
+							if (rhi::IsOk(initResult)) initResult = queue.Submit(submitted, { .signals = { &completed, 1 } });
+							if (rhi::IsOk(initResult)) initResult = completion->HostWait(1, 30000);
 						}
 						if (rhi::Failed(initResult)) {
 							d3Resource.Reset(); vkResource.Reset();
@@ -6749,20 +6749,13 @@ void RenderGraph::MaterializeMultiBackendRepresentations() {
 		}
 
 	committed_multi_backend_resource:
-		auto result = placedOnSharedHeap ? rhi::Result::Ok : d3d12->device.CreateCommittedResource(desc, d3Resource);
-		if (rhi::Failed(result)) throw std::runtime_error("Failed to create canonical D3D12 representation for '" + resource->GetName() + "'");
-		rhi::dx12::SharedHandle handle{};
+		auto result = rhi::Result::Ok;
 		if (!placedOnSharedHeap) {
-			result = rhi::dx12::export_shared_resource(d3d12->device, d3Resource.Get(), handle);
-			if (rhi::IsOk(result)) {
-				result = desc.type == rhi::ResourceType::Buffer
-					? rhi::vulkan::import_d3d12_buffer(vulkan->device, handle.value, desc, vkResource)
-					: rhi::vulkan::import_d3d12_texture(vulkan->device, handle.value, desc, vkResource);
-			}
+			InteropResourcePair pair;
+			result = InteropAllocator::CreateCommittedD3D12Vulkan(*d3d12, *vulkan, desc, pair);
+			d3Resource = std::move(pair.canonical);
+			vkResource = std::move(pair.imported);
 		}
-#ifdef _WIN32
-		if (handle.value) CloseHandle(static_cast<HANDLE>(handle.value));
-#endif
 		if (rhi::Failed(result)) throw std::runtime_error("Failed to import Vulkan representation for '" + resource->GetName() + "'");
 		const ResourceState commonInitial{
 			rhi::ResourceAccessType::Common, rhi::ResourceLayout::Common, rhi::ResourceSyncState::All };
@@ -6778,13 +6771,18 @@ void RenderGraph::MaterializeMultiBackendRepresentations() {
 		}
 		// Enhanced-barrier textures are created in the description's UNDEFINED
 		// layout on both APIs; buffers use the bridge-compatible COMMON state.
-		resource->AttachAPIRepresentation(d3d12->id, std::move(d3Resource), d3dInitial);
-		resource->AttachAPIRepresentation(vulkan->id, std::move(vkResource), vulkanInitial);
+		std::vector<Resource::PendingAPIRepresentation> representations;
+		representations.push_back({ d3d12->id, std::move(d3Resource), d3dInitial });
+		representations.push_back({ vulkan->id, std::move(vkResource), vulkanInitial });
+		if (!resource->PublishAPIRepresentations(std::move(representations)))
+			throw std::runtime_error("Failed to publish multi-RHI representations for '" + resource->GetName() + "'");
 		if (placedOnSharedHeap) {
 			const auto placement = aliasPlacementRangesByID.find(schedulingID);
 			if (placement != aliasPlacementRangesByID.end())
 			{
-				m_sharedAliasResourcePoolGeneration[schedulingID] = m_sharedAliasPools[placement->second.poolID].generation;
+				const auto* pool = m_sharedAliasPools.Find(placement->second.poolID);
+				if (!pool) throw std::runtime_error("Shared alias pool disappeared during representation publication");
+				m_sharedAliasResourcePoolGeneration[schedulingID] = pool->generation;
 				m_sharedAliasResourcePoolID[schedulingID] = placement->second.poolID;
 			}
 		}
@@ -6794,11 +6792,13 @@ void RenderGraph::MaterializeMultiBackendRepresentations() {
 		}
 		resource->RefreshAPIRepresentationDescriptors(d3d12->id);
 		resource->RefreshAPIRepresentationDescriptors(vulkan->id);
-		spdlog::info("RenderGraph materialized multi-RHI representations: id={} name='{}' type={} sharedAlias={} D3D12Instance={} VulkanInstance={}",
+		spdlog::debug("RenderGraph materialized multi-RHI representations: id={} name='{}' type={} sharedAlias={} D3D12Instance={} VulkanInstance={}",
 			resource->GetGlobalResourceID(), resource->GetName(), static_cast<uint32_t>(desc.type),
 			placedOnSharedHeap,
 			static_cast<uint32_t>(d3d12->id), static_cast<uint32_t>(vulkan->id));
 	}
+	if (retirement && (!retirement->representations.empty() || !retirement->heaps.empty()))
+		m_retiredInteropGenerations.push_back(std::move(*retirement));
 }
 
 void RenderGraph::PlanMultiBackendOwnershipTransfers() {
@@ -7037,6 +7037,29 @@ void RenderGraph::PlanMultiBackendOwnershipTransfers() {
 			}
 		}
 	}
+}
+
+RenderGraph::RetiredInteropGeneration RenderGraph::BeginInteropRetirement() {
+	RetiredInteropGeneration generation;
+	generation.queueCompletionValues.reserve(m_queueRegistry.SlotCount());
+	for (size_t slot = 0; slot < m_queueRegistry.SlotCount(); ++slot) {
+		const auto nextValue = m_queueRegistry.GetCurrentFenceValue(
+			static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot)));
+		generation.queueCompletionValues.push_back(nextValue > 0 ? nextValue - 1 : 0);
+	}
+	return generation;
+}
+
+void RenderGraph::CollectRetiredInteropGenerations() {
+	auto completed = [&](const RetiredInteropGeneration& generation) {
+		if (generation.queueCompletionValues.size() > m_queueRegistry.SlotCount()) return false;
+		for (size_t slot = 0; slot < generation.queueCompletionValues.size(); ++slot) {
+			if (m_queueRegistry.GetFence(static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot))).GetCompletedValue() <
+				generation.queueCompletionValues[slot]) return false;
+		}
+		return true;
+	};
+	std::erase_if(m_retiredInteropGenerations, completed);
 }
 
 void RenderGraph::ResizeQueueParallelVectors() {

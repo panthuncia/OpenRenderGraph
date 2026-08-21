@@ -88,9 +88,7 @@ public:
 		// timeline. Backend metadata is diagnostic and must not turn a same-device
 		// wait into an external-handle lookup if a custom slot was incompletely
 		// described.
-		return GetBackendInstance(source) == GetBackendInstance(consumer)
-			|| GetBackend(source) == GetBackend(consumer)
-			|| !entry.peerFence
+		return GetBackendInstance(source) == GetBackendInstance(consumer) || !entry.peerFence
 			? entry.fence.Get()
 			: entry.peerFence.Get();
 	}

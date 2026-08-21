@@ -26,6 +26,27 @@ rhi::DescriptorHeap PassExecutionContext::GetSamplerDescriptorHeap() const {
 	return DescriptorHeapManager::GetInstance().GetSamplerDescriptorHeap(backendInstance);
 }
 
+rhi::DescriptorSlot PassExecutionContext::ResolveSRV(const GloballyIndexedResource& resource, uint32_t mip, uint32_t slice) const {
+	if (!resource.HasSRV()) return {};
+	return DescriptorHeapManager::GetInstance().ResolveDescriptorSlot(
+		backendInstance, rhi::DescriptorHeapType::CbvSrvUav, true,
+		resource.GetSRVInfo(mip, slice).slot.index);
+}
+
+rhi::DescriptorSlot PassExecutionContext::ResolveUAV(const GloballyIndexedResource& resource, uint32_t mip, uint32_t slice) const {
+	if (!resource.HasUAVShaderVisible()) return {};
+	return DescriptorHeapManager::GetInstance().ResolveDescriptorSlot(
+		backendInstance, rhi::DescriptorHeapType::CbvSrvUav, true,
+		resource.GetUAVShaderVisibleInfo(mip, slice).slot.index);
+}
+
+rhi::DescriptorSlot PassExecutionContext::ResolveCBV(const GloballyIndexedResource& resource) const {
+	if (!resource.HasCBV()) return {};
+	return DescriptorHeapManager::GetInstance().ResolveDescriptorSlot(
+		backendInstance, rhi::DescriptorHeapType::CbvSrvUav, true,
+		resource.GetCBVInfo().slot.index);
+}
+
 rhi::DescriptorSlot PassExecutionContext::ResolveRTV(const GloballyIndexedResource& resource, uint32_t mip, uint32_t slice) const {
 	if (!resource.HasRTV()) return {};
 	return DescriptorHeapManager::GetInstance().ResolveDescriptorSlot(

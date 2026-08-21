@@ -5,9 +5,6 @@
 #include <spdlog/spdlog.h>
 #include <rhi_interop_dx12.h>
 #include <rhi_interop_vulkan.h>
-#ifdef _WIN32
-#include <Windows.h>
-#endif
 
 
 namespace org {
@@ -27,7 +24,7 @@ QueueSlotIndex QueueRegistry::Register(QueueSlot slot, rhi::Queue queue, rhi::De
 	auto pool = std::make_unique<CommandListPool>(device, static_cast<rhi::QueueKind>(slot.kind));
 	rhi::TimelinePtr fence;
 	device.CreateTimeline(fence);
-	return Register(slot, queue, std::move(fence), std::move(pool), autoAssignmentPolicy, ownsQueue, ownsQueue ? device : rhi::Device{}, logicalName);
+	return Register(slot, queue, std::move(fence), std::move(pool), autoAssignmentPolicy, ownsQueue, device, logicalName);
 }
 
 QueueSlotIndex QueueRegistry::Register(QueueSlot slot, rhi::Queue queue, rhi::TimelinePtr fence, std::unique_ptr<CommandListPool> pool, QueueAutoAssignmentPolicy autoAssignmentPolicy, bool ownsQueue, rhi::Device device, std::string_view logicalName) {
@@ -73,12 +70,11 @@ rhi::Result QueueRegistry::EnableD3D12VulkanInterop(rhi::Device d3d12Device, rhi
 		rhi::TimelinePtr d3dFence;
 		auto result = d3d12Device.CreateTimeline(d3dFence, 0, "ORG Multi-RHI Bridge Fence", true);
 		if (rhi::Failed(result)) return result;
-		rhi::dx12::SharedHandle shared{};
+		rhi::ExternalHandle shared{};
 		result = rhi::dx12::export_shared_timeline(d3d12Device, d3dFence.Get(), shared);
 		if (rhi::Failed(result)) return result;
 		rhi::TimelinePtr vkFence;
-		result = rhi::vulkan::import_d3d12_timeline(vulkanDevice, shared.value, 0, "ORG Multi-RHI Bridge Timeline", vkFence);
-		CloseHandle(static_cast<HANDLE>(shared.value));
+		result = rhi::vulkan::import_d3d12_timeline(vulkanDevice, shared, 0, "ORG Multi-RHI Bridge Timeline", vkFence);
 		if (rhi::Failed(result)) return result;
 		if (slot.backend == rhi::Backend::D3D12) {
 			slot.fence = std::move(d3dFence);

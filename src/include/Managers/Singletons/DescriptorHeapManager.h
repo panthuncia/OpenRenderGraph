@@ -70,6 +70,7 @@ public:
 		std::vector<uint64_t> resourceIDs;
 	};
 	void PublishQueueFenceSnapshot(std::vector<QueueFenceSnapshotPoint> fenceSnapshot);
+	std::vector<QueueFenceSnapshotPoint> GetQueueFenceSnapshot() const;
 	void ProcessDeferredReleases(uint8_t frameIndex);
 	DeferredReleaseStats GetDeferredReleaseStats();
 	// The caller must have waited for the device to become idle. Releases every
@@ -137,7 +138,7 @@ private:
 	std::vector<DeferredRelease> m_deferredReleases;
 	std::unordered_set<const Resource*> m_deferredResourcePointers;
 	std::vector<QueueFenceSnapshotPoint> m_latestQueueFenceSnapshot;
-	std::mutex m_descriptorMutationMutex;
+	mutable std::mutex m_descriptorMutationMutex;
 };
 
 

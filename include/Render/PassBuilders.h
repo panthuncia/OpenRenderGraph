@@ -1198,6 +1198,14 @@ public:
 	RenderPassBuilder RequireBackend(rhi::Backend backend) && { m_backendAffinity = { BackendAffinityStrength::Required, backend }; return std::move(*this); }
 	RenderPassBuilder& PreferBackend(rhi::Backend backend) & { m_backendAffinity = { BackendAffinityStrength::Preferred, backend }; return *this; }
 	RenderPassBuilder PreferBackend(rhi::Backend backend) && { m_backendAffinity = { BackendAffinityStrength::Preferred, backend }; return std::move(*this); }
+	RenderPassBuilder& RequireAPI(rhi::Backend backend) & { return RequireBackend(backend); }
+	RenderPassBuilder RequireAPI(rhi::Backend backend) && { return std::move(*this).RequireBackend(backend); }
+	RenderPassBuilder& PreferAPI(rhi::Backend backend) & { return PreferBackend(backend); }
+	RenderPassBuilder PreferAPI(rhi::Backend backend) && { return std::move(*this).PreferBackend(backend); }
+	RenderPassBuilder& RequireDevice(DeviceInstanceId device) & { m_backendAffinity = { BackendAffinityStrength::Required, rhi::Backend::Null, device }; return *this; }
+	RenderPassBuilder RequireDevice(DeviceInstanceId device) && { m_backendAffinity = { BackendAffinityStrength::Required, rhi::Backend::Null, device }; return std::move(*this); }
+	RenderPassBuilder& PreferDevice(DeviceInstanceId device) & { m_backendAffinity = { BackendAffinityStrength::Preferred, rhi::Backend::Null, device }; return *this; }
+	RenderPassBuilder PreferDevice(DeviceInstanceId device) && { m_backendAffinity = { BackendAffinityStrength::Preferred, rhi::Backend::Null, device }; return std::move(*this); }
 
 	RenderPassBuilder& WithExternalWaitBeforeTransitions(rhi::Timeline timeline, uint64_t value) & {
 		params.externalWaitsBeforeTransitions.push_back({ timeline, value });
@@ -1846,6 +1854,14 @@ public:
 		ComputePassBuilder RequireBackend(rhi::Backend backend) && { m_backendAffinity = { BackendAffinityStrength::Required, backend }; return std::move(*this); }
 		ComputePassBuilder& PreferBackend(rhi::Backend backend) & { m_backendAffinity = { BackendAffinityStrength::Preferred, backend }; return *this; }
 		ComputePassBuilder PreferBackend(rhi::Backend backend) && { m_backendAffinity = { BackendAffinityStrength::Preferred, backend }; return std::move(*this); }
+		ComputePassBuilder& RequireAPI(rhi::Backend backend) & { return RequireBackend(backend); }
+		ComputePassBuilder RequireAPI(rhi::Backend backend) && { return std::move(*this).RequireBackend(backend); }
+		ComputePassBuilder& PreferAPI(rhi::Backend backend) & { return PreferBackend(backend); }
+		ComputePassBuilder PreferAPI(rhi::Backend backend) && { return std::move(*this).PreferBackend(backend); }
+		ComputePassBuilder& RequireDevice(DeviceInstanceId device) & { m_backendAffinity = { BackendAffinityStrength::Required, rhi::Backend::Null, device }; return *this; }
+		ComputePassBuilder RequireDevice(DeviceInstanceId device) && { m_backendAffinity = { BackendAffinityStrength::Required, rhi::Backend::Null, device }; return std::move(*this); }
+		ComputePassBuilder& PreferDevice(DeviceInstanceId device) & { m_backendAffinity = { BackendAffinityStrength::Preferred, rhi::Backend::Null, device }; return *this; }
+		ComputePassBuilder PreferDevice(DeviceInstanceId device) && { m_backendAffinity = { BackendAffinityStrength::Preferred, rhi::Backend::Null, device }; return std::move(*this); }
 
 		ComputePassBuilder& WithExternalWaitBeforeTransitions(rhi::Timeline timeline, uint64_t value) & {
 			params.externalWaitsBeforeTransitions.push_back({ timeline, value });
@@ -2304,6 +2320,14 @@ public:
 	CopyPassBuilder RequireBackend(rhi::Backend backend) && { m_backendAffinity = { BackendAffinityStrength::Required, backend }; return std::move(*this); }
 	CopyPassBuilder& PreferBackend(rhi::Backend backend) & { m_backendAffinity = { BackendAffinityStrength::Preferred, backend }; return *this; }
 	CopyPassBuilder PreferBackend(rhi::Backend backend) && { m_backendAffinity = { BackendAffinityStrength::Preferred, backend }; return std::move(*this); }
+	CopyPassBuilder& RequireAPI(rhi::Backend backend) & { return RequireBackend(backend); }
+	CopyPassBuilder RequireAPI(rhi::Backend backend) && { return std::move(*this).RequireBackend(backend); }
+	CopyPassBuilder& PreferAPI(rhi::Backend backend) & { return PreferBackend(backend); }
+	CopyPassBuilder PreferAPI(rhi::Backend backend) && { return std::move(*this).PreferBackend(backend); }
+	CopyPassBuilder& RequireDevice(DeviceInstanceId device) & { m_backendAffinity = { BackendAffinityStrength::Required, rhi::Backend::Null, device }; return *this; }
+	CopyPassBuilder RequireDevice(DeviceInstanceId device) && { m_backendAffinity = { BackendAffinityStrength::Required, rhi::Backend::Null, device }; return std::move(*this); }
+	CopyPassBuilder& PreferDevice(DeviceInstanceId device) & { m_backendAffinity = { BackendAffinityStrength::Preferred, rhi::Backend::Null, device }; return *this; }
+	CopyPassBuilder PreferDevice(DeviceInstanceId device) && { m_backendAffinity = { BackendAffinityStrength::Preferred, rhi::Backend::Null, device }; return std::move(*this); }
 
 	CopyPassBuilder& WithExternalWaitBeforeTransitions(rhi::Timeline timeline, uint64_t value) & {
 		params.externalWaitsBeforeTransitions.push_back({ timeline, value });

@@ -70,6 +70,9 @@ struct PassExecutionContext {
 	SymbolicTracker* ResolveState(Resource& resource) const;
 	rhi::DescriptorHeap GetResourceDescriptorHeap() const;
 	rhi::DescriptorHeap GetSamplerDescriptorHeap() const;
+	rhi::DescriptorSlot ResolveSRV(const GloballyIndexedResource& resource, uint32_t mip = 0, uint32_t slice = 0) const;
+	rhi::DescriptorSlot ResolveUAV(const GloballyIndexedResource& resource, uint32_t mip = 0, uint32_t slice = 0) const;
+	rhi::DescriptorSlot ResolveCBV(const GloballyIndexedResource& resource) const;
 	rhi::DescriptorSlot ResolveRTV(const GloballyIndexedResource& resource, uint32_t mip = 0, uint32_t slice = 0) const;
 	rhi::DescriptorSlot ResolveDSV(const GloballyIndexedResource& resource, uint32_t mip = 0, uint32_t slice = 0) const;
 	rhi::DescriptorSlot ResolveNonShaderVisibleUAV(const GloballyIndexedResource& resource, uint32_t mip = 0, uint32_t slice = 0) const;

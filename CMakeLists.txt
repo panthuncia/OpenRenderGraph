@@ -96,6 +96,8 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PassBuilders.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PassExecutionContext.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraph.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/InteropAllocator.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/SharedAliasPoolManager.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraphCompile.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraphCompileProfile.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/Aliasing/RenderGraphAliasingSubsystem.cpp"
@@ -208,6 +210,10 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
     target_compile_features(OpenRenderGraphContributorRegistryTests PRIVATE cxx_std_23)
     target_link_libraries(OpenRenderGraphContributorRegistryTests PRIVATE OpenRenderGraph)
     add_test(NAME OpenRenderGraphContributorRegistryTests COMMAND OpenRenderGraphContributorRegistryTests)
+
+	add_executable(OpenRenderGraphDeviceRegistryTests tests/DeviceRegistryTests.cpp)
+	target_link_libraries(OpenRenderGraphDeviceRegistryTests PRIVATE OpenRenderGraph::OpenRenderGraph)
+	add_test(NAME OpenRenderGraphDeviceRegistryTests COMMAND OpenRenderGraphDeviceRegistryTests)
 endif()
 
 if(OPENRENDERGRAPH_ENABLE_D3D11_INTEROP)

@@ -2882,13 +2882,13 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		traceCompileStep("MaterializeMultiBackendRepresentations");
 		BT_ZONE_SCOPE("RenderGraph::CompileFrame::MaterializeMultiBackendRepresentations");
 		MaterializeMultiBackendRepresentations();
-		spdlog::info("RenderGraph frame compile: multi-RHI representation materialization complete");
+		spdlog::debug("RenderGraph frame compile: multi-RHI representation materialization complete");
 	}
 	{
 		traceCompileStep("PlanMultiBackendOwnershipTransfers");
 		BT_ZONE_SCOPE("RenderGraph::CompileFrame::PlanMultiBackendOwnershipTransfers");
 		PlanMultiBackendOwnershipTransfers();
-		spdlog::info("RenderGraph frame compile: multi-RHI ownership planning complete");
+		spdlog::debug("RenderGraph frame compile: multi-RHI ownership planning complete");
 	}
 	{
 		traceCompileStep("ApplyAliasQueueSynchronization");
