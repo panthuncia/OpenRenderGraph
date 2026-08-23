@@ -24,6 +24,8 @@ public:
     virtual ~ITaskService() = default;
 
     virtual void ParallelFor(std::string_view taskName, size_t itemCount, std::function<void(size_t)> func) = 0;
+    virtual void ParallelForLimited(std::string_view taskName, size_t itemCount, size_t maximumConcurrency,
+        std::function<void(size_t)> func) = 0;
 
     virtual std::shared_ptr<ITaskScope> CreateScope(std::string_view name) = 0;
     virtual bool Submit(

@@ -566,6 +566,7 @@ void UploadInstance::ProcessUploadsThrough(
 	std::vector<TextureUpdate> textureUpdates;
 	UploadResolveContext ctx;
 	{
+		BT_ZONE_SCOPE("UploadInstance::ProcessUploadsThrough::AcquireAndDrainQueue");
 		std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
 		PruneInvalidRegistryHandleUpdatesLocked("upload-pass-execute");
 		resourceUpdates.reserve(m_resourceUpdates.size());

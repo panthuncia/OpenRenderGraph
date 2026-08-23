@@ -44,6 +44,22 @@
 namespace org {
 
 namespace {
+size_t PassRecordingConcurrency()
+{
+	static const size_t value = [] {
+		const char* configured = std::getenv("ORG_PASS_RECORD_CONCURRENCY");
+		if (!configured || !*configured) return (std::numeric_limits<size_t>::max)();
+		char* end = nullptr;
+		const auto parsed = std::strtoull(configured, &end, 10);
+		return end != configured && *end == '\0' && parsed > 0
+			? static_cast<size_t>(parsed)
+			: (std::numeric_limits<size_t>::max)();
+	}();
+	return value;
+}
+}
+
+namespace {
 	constexpr uint64_t kFrameDAGResourceIndexEmptyKey = std::numeric_limits<uint64_t>::max();
 
 	bool SarpClodImportDebugLoggingEnabled()
@@ -5266,8 +5282,15 @@ void RenderGraph::ResetForRebuild()
 void RenderGraph::ResetCompileFrameState() {
 	{
 		BT_ZONE_SCOPE("RenderGraph::ResetCompileFrameState::Batches");
-		m_reusablePassBatches.clear();
-		m_reusablePassBatches.swap(batches);
+		// Keep every previously allocated batch in the reuse pool. Swapping after
+		// clearing discarded any pool entries left over when the new frame used
+		// fewer batches than the preceding frame, paying their potentially large
+		// nested-vector destruction cost at the next frame boundary. AcquireReusablePassBatch
+		// resets all observable state before reuse, so retaining the high-water
+		// pool does not carry frame data forward.
+		m_reusablePassBatches.reserve(m_reusablePassBatches.size() + batches.size());
+		std::move(batches.begin(), batches.end(), std::back_inserter(m_reusablePassBatches));
+		batches.clear();
 	}
 	{
 		BT_ZONE_SCOPE("RenderGraph::ResetCompileFrameState::ResourceMaps");
@@ -8627,23 +8650,29 @@ namespace {
 				rhi::debug::Scope scope(commandList, rhi::colors::Mint, passName.data());
 				args.context.currentPassName = passName.data();
 				args.context.currentTechniquePath = techniquePath;
-				(void)rhi::debug::SetInstrumentationContext(commandList, args.context.currentPassName, args.context.currentTechniquePath);
-				(void)commandList.BeginTracyGpuZone(args.rhiQueue, args.context.currentPassName);
-				if (args.context.beginGpuPassRange) {
-					args.context.beginGpuPassRange(commandList, args.rhiQueue, QueueKindToString(queue), args.context.currentPassName);
+				{
+					BT_ZONE_SCOPE("RenderGraph::PassRecord::BeginInstrumentation");
+					(void)rhi::debug::SetInstrumentationContext(commandList, args.context.currentPassName, args.context.currentTechniquePath);
+					(void)commandList.BeginTracyGpuZone(args.rhiQueue, args.context.currentPassName);
+					if (args.context.beginGpuPassRange) {
+						args.context.beginGpuPassRange(commandList, args.rhiQueue, QueueKindToString(queue), args.context.currentPassName);
+					}
 				}
 				const bool hasStatistics = args.statisticsService && pr.statisticsIndex >= 0;
 				const auto cpuStart = std::chrono::steady_clock::now();
-				if (hasStatistics)
-					args.statisticsService->BeginQuery(pr.statisticsIndex, args.context.frameIndex, args.rhiQueue, commandList, sched.queryRecordingContext);
-				if ((pr.run & PassRunMask::Immediate) != PassRunMask::None)
-					org::imm::Replay(pr.immediateBytecode, commandList, *args.context.immediateDispatch);
-				pr.immediateKeepAlive.reset();
-				if ((pr.run & PassRunMask::Retained) != PassRunMask::None) {
-					auto passReturn = pr.pass->Execute(args.context);
-					if (passReturn.fence || !passReturn.externalSignalsAfterCompletion.empty()) {
-						if (args.batchTraceEnabled) {
-							LogQueuedExternalFence(
+				{
+					BT_ZONE_SCOPE("RenderGraph::PassRecord::ExecuteBody");
+					BT_ZONE_TEXT(passName.data(), passName.size());
+					if (hasStatistics)
+						args.statisticsService->BeginQuery(pr.statisticsIndex, args.context.frameIndex, args.rhiQueue, commandList, sched.queryRecordingContext);
+					if ((pr.run & PassRunMask::Immediate) != PassRunMask::None)
+						org::imm::Replay(pr.immediateBytecode, commandList, *args.context.immediateDispatch);
+					pr.immediateKeepAlive.reset();
+					if ((pr.run & PassRunMask::Retained) != PassRunMask::None) {
+						auto passReturn = pr.pass->Execute(args.context);
+						if (passReturn.fence || !passReturn.externalSignalsAfterCompletion.empty()) {
+							if (args.batchTraceEnabled) {
+								LogQueuedExternalFence(
 								static_cast<unsigned>(args.context.frameIndex),
 								queue,
 								qi,
@@ -8651,24 +8680,31 @@ namespace {
 								passName,
 								args.queuedExternalFenceOrigins,
 								passReturn);
+							}
+							sched.externalFences.push_back(passReturn);
 						}
-						sched.externalFences.push_back(passReturn);
 					}
 				}
-				RecordTransitionBarriers(pr.backendPostTransitions, args.context.backendInstance, commandList);
-				RecordExternalOwnershipBarriers(pr.externalReleases, args.context.backendInstance, false, commandList);
-				if (hasStatistics)
-					args.statisticsService->EndQuery(pr.statisticsIndex, args.context.frameIndex, args.rhiQueue, commandList, sched.queryRecordingContext);
+				{
+					BT_ZONE_SCOPE("RenderGraph::PassRecord::Finalize");
+					RecordTransitionBarriers(pr.backendPostTransitions, args.context.backendInstance, commandList);
+					RecordExternalOwnershipBarriers(pr.externalReleases, args.context.backendInstance, false, commandList);
+					if (hasStatistics)
+						args.statisticsService->EndQuery(pr.statisticsIndex, args.context.frameIndex, args.rhiQueue, commandList, sched.queryRecordingContext);
+				}
 				if (hasStatistics) {
 					args.statisticsService->RecordCpuExecuteTime(
 						static_cast<unsigned>(pr.statisticsIndex),
 						std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - cpuStart).count());
 				}
-				if (args.context.endGpuPassRange) {
-					args.context.endGpuPassRange(commandList, args.rhiQueue);
+				{
+					BT_ZONE_SCOPE("RenderGraph::PassRecord::EndInstrumentation");
+					if (args.context.endGpuPassRange) {
+						args.context.endGpuPassRange(commandList, args.rhiQueue);
+					}
+					commandList.EndTracyGpuZone();
+					(void)rhi::debug::SetInstrumentationContext(commandList, nullptr, nullptr);
 				}
-				commandList.EndTracyGpuZone();
-				(void)rhi::debug::SetInstrumentationContext(commandList, nullptr, nullptr);
 				args.context.currentPassName = nullptr;
 				args.context.currentTechniquePath = nullptr;
 				if (args.batchTraceEnabled) {
@@ -9922,7 +9958,10 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 					tasks.size(),
 					false);
 			}
-			ParallelForOptional("RecordAllBatches", tasks.size(), [&](size_t taskIdx) {
+			// DX12 command recording scales poorly once too many independent lists enter
+			// the driver concurrently. Keep the render thread participating, but leave
+			// capacity for streaming and avoid the all-core contention cliff.
+			ParallelForOptionalLimited("RecordAllBatches", tasks.size(), PassRecordingConcurrency(), [&](size_t taskIdx) {
 				auto& task = tasks[taskIdx];
 				auto& qs = m_executionSchedule.batches[task.batchIndex].queues[task.queueIndex];
 				auto rhiQ = SlotQueue(task.queueIndex);
@@ -9967,7 +10006,7 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 					oss << ": " << ex.what();
 					throw std::runtime_error(oss.str());
 				}
-				}, false);
+				});
 			if (batchTraceEnabled) {
 				spdlog::info("RenderGraph::Execute frame={} record-all-batches complete", static_cast<unsigned>(context.frameIndex));
 			}

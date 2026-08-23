@@ -1479,6 +1479,23 @@ private:
 		}
 	}
 
+	void ParallelForOptionalLimited(std::string_view taskName, size_t itemCount, size_t maximumConcurrency,
+		std::function<void(size_t)> func) {
+		const auto telemetryContext = basic_telemetry::CaptureCurrentContext();
+		if (m_taskService) {
+			m_taskService->ParallelForLimited(taskName, itemCount, maximumConcurrency,
+				[telemetryContext, func = std::move(func)](size_t index) mutable {
+					basic_telemetry::ContextBinding scopedContext(telemetryContext);
+					func(index);
+				});
+		} else {
+			for (size_t i = 0; i < itemCount; ++i) {
+				basic_telemetry::ContextBinding scopedContext(telemetryContext);
+				func(i);
+			}
+		}
+	}
+
 	void MaterializeUnmaterializedResources(std::span<const uint64_t> onlyResourceIDs = {});
 	void MaterializeMultiBackendRepresentations();
 	void PlanMultiBackendOwnershipTransfers();
