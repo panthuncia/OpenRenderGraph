@@ -116,12 +116,21 @@ QueueSlotIndex QueueRegistry::FindGraphicsSlot() const noexcept {
 }
 
 void QueueRegistry::Clear() {
+	ShutdownTaskWorkers();
 	for (auto& slot : m_slots) {
 		if (slot.ownsQueue && slot.device && slot.queue) {
 			slot.device.DestroyQueue(slot.queue.GetQueueHandle());
 		}
 	}
 	m_slots.clear();
+}
+
+void QueueRegistry::ShutdownTaskWorkers() {
+	for (auto& slot : m_slots) {
+		if (slot.pool) {
+			slot.pool->ShutdownBackgroundReset();
+		}
+	}
 }
 
 

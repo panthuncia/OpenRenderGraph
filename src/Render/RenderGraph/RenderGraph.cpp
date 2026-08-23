@@ -3703,6 +3703,12 @@ RenderGraph::~RenderGraph() {
 	ShutdownOwnedState();
 }
 
+void RenderGraph::ShutdownTaskWorkers() {
+	m_queueRegistry.ShutdownTaskWorkers();
+	m_taskService.reset();
+	org::runtime::SetDefaultTaskService({});
+}
+
 void RenderGraph::ShutdownRuntime() {
 	StatisticsManager::GetInstance().ClearAll();
 	DeletionManager::GetInstance().DrainAll();
@@ -3711,6 +3717,7 @@ void RenderGraph::ShutdownRuntime() {
 }
 
 void RenderGraph::ShutdownOwnedState() {
+	ShutdownTaskWorkers();
 	batches.clear();
 	m_reusablePassBatches.clear();
 	initialTransitions.clear();

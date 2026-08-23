@@ -5,13 +5,11 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <condition_variable>
 #include <chrono>
 #include <deque>
 #include <functional>
 #include <mutex>
 #include <string>
-#include <thread>
 #include <unordered_set>
 #include <unordered_map>
 
@@ -19,6 +17,7 @@
 #include <rhi_helpers.h>
 
 #include "Render/Runtime/UploadTypes.h"
+#include "Render/Runtime/ITaskService.h"
 
 namespace org::imm { class ImmediateCommandList; }
 
@@ -211,6 +210,7 @@ private:
 	void StartWorker();
 	void StopWorker();
 	void WorkerMain();
+	void ScheduleWorkerDrain();
 	void RequestWorkerPagesLocked();
 	void RecordProcessedUploadTelemetry(
 		const std::vector<ResourceUpdate>& resourceUpdates,
@@ -262,8 +262,9 @@ private:
 
 	mutable std::mutex m_uploadQueueMutex;
 	std::mutex m_workerMutex;
-	std::condition_variable m_workerCV;
-	std::thread m_workerThread;
+	std::shared_ptr<org::runtime::ITaskService> m_taskService;
+	std::shared_ptr<org::runtime::ITaskScope> m_taskScope;
+	std::atomic<bool> m_workerDrainScheduled{false};
 	bool m_workerQuit = false;
 	size_t m_workerRequestedPages = 0;
 };

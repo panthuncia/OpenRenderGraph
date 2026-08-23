@@ -13,6 +13,7 @@
 #include "Resources/Resource.h"
 #include "Render/MemoryIntrospectionAPI.h"
 #include "Render/ImmediateExecution/ImmediateCommandList.h"
+#include "Render/Runtime/TaskServiceAccess.h"
 
 
 namespace org {
@@ -92,22 +93,27 @@ void UploadInstance::SetInvalidRegistryHandleCallback(InvalidRegistryHandleCallb
 
 void UploadInstance::StartWorker() {
 	std::lock_guard<std::mutex> lock(m_workerMutex);
-	if (m_workerThread.joinable()) {
+	if (m_taskScope) {
 		return;
 	}
+	m_taskService = org::runtime::GetDefaultTaskService();
+	if (!m_taskService) return;
 	m_workerQuit = false;
-	m_workerThread = std::thread(&UploadInstance::WorkerMain, this);
+	m_taskScope = m_taskService->CreateScope(m_debugName + "::PagePreparation");
 }
 
 void UploadInstance::StopWorker() {
+	std::shared_ptr<org::runtime::ITaskScope> scope;
 	{
 		std::lock_guard<std::mutex> lock(m_workerMutex);
 		m_workerQuit = true;
+		scope = std::move(m_taskScope);
 	}
-	m_workerCV.notify_all();
-	if (m_workerThread.joinable()) {
-		m_workerThread.join();
-	}
+	if (scope) scope->CancelAndWait();
+	m_workerDrainScheduled.store(false, std::memory_order_release);
+	std::lock_guard<std::mutex> lock(m_workerMutex);
+	m_taskService.reset();
+	m_workerRequestedPages = 0;
 }
 
 UploadInstance::UploadPagePtr UploadInstance::CreatePage(size_t size, bool dedicated) {
@@ -128,21 +134,17 @@ void UploadInstance::TagPage(const UploadPagePtr& page) {
 }
 
 void UploadInstance::WorkerMain() {
-	for (;;) {
-		size_t pagesToCreate = 0;
-		{
-			std::unique_lock<std::mutex> lock(m_workerMutex);
-			m_workerCV.wait(lock, [this] {
-				return m_workerQuit || m_workerRequestedPages > 0;
-			});
-			if (m_workerQuit) {
-				return;
-			}
-			pagesToCreate = m_workerRequestedPages;
-			m_workerRequestedPages = 0;
+	constexpr size_t kPagesPerDrain = 1;
+	size_t pagesToCreate = 0;
+	{
+		std::lock_guard<std::mutex> lock(m_workerMutex);
+		if (!m_workerQuit) {
+			pagesToCreate = (std::min)(m_workerRequestedPages, kPagesPerDrain);
+			m_workerRequestedPages -= pagesToCreate;
 		}
+	}
 
-		for (size_t i = 0; i < pagesToCreate; ++i) {
+	for (size_t i = 0; i < pagesToCreate; ++i) {
 			auto page = CreatePage(m_pageSize, false);
 			std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
 			const size_t maxWarmPages = m_preallocateCapacityBytes / m_pageSize;
@@ -150,7 +152,33 @@ void UploadInstance::WorkerMain() {
 				continue;
 			}
 			m_readyPages.push_back(std::move(page));
-		}
+	}
+
+	bool hasMore = false;
+	{
+		std::lock_guard<std::mutex> lock(m_workerMutex);
+		m_workerDrainScheduled.store(false, std::memory_order_release);
+		hasMore = !m_workerQuit && m_workerRequestedPages != 0;
+	}
+	if (hasMore) ScheduleWorkerDrain();
+}
+
+void UploadInstance::ScheduleWorkerDrain() {
+	StartWorker();
+	std::shared_ptr<org::runtime::ITaskService> service;
+	std::shared_ptr<org::runtime::ITaskScope> scope;
+	{
+		std::lock_guard<std::mutex> lock(m_workerMutex);
+		if (m_workerQuit || !m_taskService || !m_taskScope) return;
+		service = m_taskService;
+		scope = m_taskScope;
+	}
+	bool expected = false;
+	if (!m_workerDrainScheduled.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return;
+	if (!service->Submit(scope, org::runtime::TaskPriority::Background,
+			m_debugName + "::PrepareUploadPages", [this] { WorkerMain(); })) {
+		m_workerDrainScheduled.store(false, std::memory_order_release);
+		spdlog::error("UploadInstance '{}' page preparation submission was rejected", m_debugName);
 	}
 }
 
@@ -200,7 +228,7 @@ void UploadInstance::RequestWorkerPagesLocked() {
 		std::lock_guard<std::mutex> workerLock(m_workerMutex);
 		m_workerRequestedPages += targetPages - availablePages;
 	}
-	m_workerCV.notify_one();
+	ScheduleWorkerDrain();
 }
 
 void UploadInstance::TrackPageForCurrentFrameLocked(const UploadPagePtr& page) {

@@ -1,14 +1,13 @@
 #pragma once
 
 #include <cstddef>
-#include <condition_variable>
 #include <deque>
 #include <mutex>
-#include <thread>
 #include <vector>
 #include <cstdint>
 #include <atomic>
 #include <rhi.h>
+#include "Render/Runtime/ITaskService.h"
 
 
 namespace org {
@@ -23,6 +22,7 @@ public:
     struct Diagnostics {
         size_t lastRequestedCount = 0;
         size_t availableCount = 0;
+        size_t checkedOutCount = 0;
         size_t inFlightCount = 0;
         size_t createdThisFrame = 0;
         size_t reusedThisFrame = 0;
@@ -36,6 +36,7 @@ public:
 
     CommandListPool(rhi::Device& device, rhi::QueueKind type);
     ~CommandListPool();
+    void ShutdownBackgroundReset();
 
     // Acquire a command allocator / list pair ready for recording
     CommandListPair Request();
@@ -60,7 +61,8 @@ public:
 private:
     void PreparePairForReuse(CommandListPair& pair);
     CommandListPair CreateReadyPair();
-    void BackgroundResetMain();
+    void BackgroundResetDrain();
+    void ScheduleBackgroundReset();
     void UpdateDiagnosticsCountsLocked();
 
     rhi::Device m_device;
@@ -69,10 +71,13 @@ private:
     Diagnostics m_diagnostics{};
 
     mutable std::mutex m_mutex;
-    std::condition_variable m_backgroundResetCv;
-    std::thread m_backgroundResetThread;
+    std::shared_ptr<org::runtime::ITaskService> m_taskService;
+    std::shared_ptr<org::runtime::ITaskScope> m_taskScope;
+    std::atomic<bool> m_backgroundResetScheduled{false};
     bool m_stopBackgroundReset = false;
     size_t m_backgroundResetActiveCount = 0;
+    size_t m_backgroundCreateActiveCount = 0;
+    size_t m_checkedOutCount = 0;
     size_t m_highWaterRequestedCount = 0;
     size_t m_warmTargetCount = 0;
 

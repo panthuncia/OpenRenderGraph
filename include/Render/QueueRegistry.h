@@ -122,6 +122,7 @@ public:
 
 	/// Resets all pools and fences. Called during shutdown.
 	void Clear();
+	void ShutdownTaskWorkers();
 
 private:
 	struct SlotEntry {

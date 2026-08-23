@@ -31,6 +31,7 @@
 #include "Render/Runtime/IDescriptorService.h"
 #include "Render/Runtime/IRenderGraphSettingsService.h"
 #include "Render/Runtime/ITaskService.h"
+#include "Render/Runtime/TaskServiceAccess.h"
 #include "Render/QueueKind.h"
 #include "Render/QueueRegistry.h"
 #include "Render/RenderGraph/SharedAliasPoolManager.h"
@@ -705,6 +706,7 @@ public:
 	void ResetForRebuild();
 	void PrepareExtensionsForBuild();
 	void ShutdownExtensions();
+	void ShutdownTaskWorkers();
 	void ClearExtensions();
 	void Setup();
 	void RegisterExtension(std::unique_ptr<IRenderGraphExtension> ext, std::optional<std::string_view> id = std::nullopt);
@@ -728,7 +730,10 @@ public:
 	void SetRenderGraphSettingsService(std::shared_ptr<org::runtime::IRenderGraphSettingsService> service) { m_renderGraphSettingsService = std::move(service); }
 	org::runtime::IRenderGraphSettingsService* GetRenderGraphSettingsService() { return m_renderGraphSettingsService.get(); }
 	const org::runtime::IRenderGraphSettingsService* GetRenderGraphSettingsService() const { return m_renderGraphSettingsService.get(); }
-	void SetTaskService(std::shared_ptr<org::runtime::ITaskService> service) { m_taskService = std::move(service); }
+	void SetTaskService(std::shared_ptr<org::runtime::ITaskService> service) {
+		m_taskService = std::move(service);
+		org::runtime::SetDefaultTaskService(m_taskService);
+	}
 	org::runtime::ITaskService* GetTaskService() { return m_taskService.get(); }
 	const org::runtime::ITaskService* GetTaskService() const { return m_taskService.get(); }
 	void SetCompileProfileEnabled(bool enabled) noexcept;

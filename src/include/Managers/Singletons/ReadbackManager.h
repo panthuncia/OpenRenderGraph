@@ -1,15 +1,14 @@
 #pragma once
-#include <condition_variable>
 #include <memory>
 #include <vector>
 #include <atomic>
 #include <mutex>
 #include <string>
-#include <thread>
 #include <rhi.h>
 
 #include "Render/QueueKind.h"
 #include "Resources/ReadbackRequest.h"
+#include "Render/Runtime/ITaskService.h"
 
 
 namespace org {
@@ -61,6 +60,7 @@ public:
 	void ProcessReadbackRequests();
 
 	void Cleanup() {
+		StopReleaseWorker();
 		m_queuedCaptures.clear();
 		m_readbackCaptureRequests.clear();
 		m_graphicsReadbackFence.Reset();
@@ -69,7 +69,6 @@ public:
 		m_warnedUninitializedUse = false;
 		m_captureFenceValueGraphics.store(0, std::memory_order_relaxed);
 		m_captureFenceValueCopy.store(0, std::memory_order_relaxed);
-		StopReleaseWorker();
 		{
 			std::lock_guard lock(m_readbackBufferPoolMutex);
 			m_readbackBufferPool.clear();
@@ -83,7 +82,8 @@ private:
 	void EnsureReleaseWorker();
 	void StopReleaseWorker();
 	void QueueDeferredRelease(std::vector<ReadbackCaptureRequest>&& requests);
-	void ReleaseWorkerMain();
+	void ReleaseWorkerDrain();
+	void ScheduleReleaseDrain();
 	void RecycleReadbackBuffer(std::shared_ptr<Resource>&& buffer);
 
 	static QueueKind NormalizeQueueKind(QueueKind queueKind) {
@@ -108,10 +108,11 @@ private:
 	std::atomic<uint64_t> m_captureFenceValueCopy = 0;
 
 	std::mutex m_releaseQueueMutex;
-	std::condition_variable m_releaseQueueCV;
 	std::vector<ReadbackCaptureRequest> m_deferredReleaseRequests;
-	std::thread m_releaseThread;
-	bool m_releaseThreadQuit = false;
+	std::shared_ptr<org::runtime::ITaskService> m_taskService;
+	std::shared_ptr<org::runtime::ITaskScope> m_releaseScope;
+	std::atomic<bool> m_releaseDrainScheduled{false};
+	bool m_releaseStop = false;
 
 	std::mutex m_readbackBufferPoolMutex;
 	std::vector<std::shared_ptr<Resource>> m_readbackBufferPool;

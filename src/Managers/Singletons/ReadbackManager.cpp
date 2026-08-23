@@ -7,6 +7,7 @@
 #include <BasicTelemetry/Tracy.h>
 
 #include "Resources/Buffers/Buffer.h"
+#include "Render/Runtime/TaskServiceAccess.h"
 
 
 namespace org {
@@ -25,33 +26,27 @@ ReadbackManager::~ReadbackManager() {
 
 void ReadbackManager::EnsureReleaseWorker() {
     std::lock_guard lock(m_releaseQueueMutex);
-    if (m_releaseThread.joinable()) {
-        return;
-    }
-
-    m_releaseThreadQuit = false;
-    m_releaseThread = std::thread([this]() {
-        ReleaseWorkerMain();
-    });
+    if (m_releaseScope) return;
+    m_taskService = org::runtime::GetDefaultTaskService();
+    if (!m_taskService) return;
+    m_releaseStop = false;
+    m_releaseScope = m_taskService->CreateScope("ORG.ReadbackRelease");
 }
 
 void ReadbackManager::StopReleaseWorker() {
+	std::shared_ptr<org::runtime::ITaskScope> scope;
     {
         std::lock_guard lock(m_releaseQueueMutex);
-        if (!m_releaseThread.joinable()) {
-            m_deferredReleaseRequests.clear();
-            m_releaseThreadQuit = false;
-            return;
-        }
-
-        m_releaseThreadQuit = true;
+        m_releaseStop = true;
+		scope = std::move(m_releaseScope);
     }
-    m_releaseQueueCV.notify_one();
-    m_releaseThread.join();
+	if (scope) scope->CancelAndWait();
+	m_releaseDrainScheduled.store(false, std::memory_order_release);
 
     std::lock_guard lock(m_releaseQueueMutex);
     m_deferredReleaseRequests.clear();
-    m_releaseThreadQuit = false;
+	m_taskService.reset();
+    m_releaseStop = false;
 }
 
 void ReadbackManager::QueueDeferredRelease(std::vector<ReadbackCaptureRequest>&& requests) {
@@ -68,31 +63,53 @@ void ReadbackManager::QueueDeferredRelease(std::vector<ReadbackCaptureRequest>&&
             std::make_move_iterator(requests.begin()),
             std::make_move_iterator(requests.end()));
     }
-    m_releaseQueueCV.notify_one();
+	ScheduleReleaseDrain();
 }
 
-void ReadbackManager::ReleaseWorkerMain() {
+void ReadbackManager::ScheduleReleaseDrain() {
+	EnsureReleaseWorker();
+	std::shared_ptr<org::runtime::ITaskService> service;
+	std::shared_ptr<org::runtime::ITaskScope> scope;
+	{
+		std::lock_guard lock(m_releaseQueueMutex);
+		if (m_releaseStop || !m_taskService || !m_releaseScope) return;
+		service = m_taskService;
+		scope = m_releaseScope;
+	}
+	bool expected = false;
+	if (!m_releaseDrainScheduled.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return;
+	if (!service->Submit(scope, org::runtime::TaskPriority::Background,
+			"ORG.ReadbackRelease", [this] { ReleaseWorkerDrain(); })) {
+		m_releaseDrainScheduled.store(false, std::memory_order_release);
+		spdlog::error("ORG readback release submission was rejected");
+	}
+}
+
+void ReadbackManager::ReleaseWorkerDrain() {
+	constexpr size_t kReleasesPerDrain = 16;
     std::vector<ReadbackCaptureRequest> releaseBatch;
-    for (;;) {
-        {
-            std::unique_lock lock(m_releaseQueueMutex);
-            m_releaseQueueCV.wait(lock, [this]() {
-                return m_releaseThreadQuit || !m_deferredReleaseRequests.empty();
-            });
+	{
+		std::lock_guard lock(m_releaseQueueMutex);
+		const size_t count = (std::min)(kReleasesPerDrain, m_deferredReleaseRequests.size());
+		releaseBatch.reserve(count);
+		for (size_t i = 0; i < count; ++i) {
+			releaseBatch.emplace_back(std::move(m_deferredReleaseRequests.back()));
+			m_deferredReleaseRequests.pop_back();
+		}
+	}
 
-            if (m_deferredReleaseRequests.empty() && m_releaseThreadQuit) {
-                break;
-            }
-
-            releaseBatch.swap(m_deferredReleaseRequests);
-        }
-
-        {
-            BT_ZONE_SCOPE("ReadbackManager::DeferredReleaseWorker::ReleaseRequests");
-            BT_ZONE_VALUE(releaseBatch.size());
-            releaseBatch.clear();
-        }
-    }
+	{
+		BT_ZONE_SCOPE("ReadbackManager::DeferredReleaseDrain::ReleaseRequests");
+		BT_ZONE_VALUE(releaseBatch.size());
+		releaseBatch.clear();
+	}
+	bool hasMore = false;
+	{
+		std::lock_guard lock(m_releaseQueueMutex);
+		m_releaseDrainScheduled.store(false, std::memory_order_release);
+		hasMore = !m_releaseStop && !m_deferredReleaseRequests.empty();
+	}
+	if (hasMore) ScheduleReleaseDrain();
 }
 
 std::shared_ptr<Resource> ReadbackManager::AcquireReadbackBuffer(uint64_t byteSize, const char* debugName) {
