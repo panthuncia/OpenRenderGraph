@@ -289,7 +289,11 @@ void AsyncBufferBackingResizeState::Schedule(
         return;
     }
 
-    std::thread(std::move(task)).detach();
+    // The renderer installs the unified scheduler before deferred resize clients
+    // become active.  During startup/shutdown there is no safe detached fallback:
+    // complete the request inline so its state remains owned and observable.
+    spdlog::warn("Unified task scheduler unavailable for '{}'; executing safe backing creation inline", taskName);
+    task();
 }
 
 void RegisterDeferredBackingResizeClient(IDeferredBackingResizeClient* client) {
