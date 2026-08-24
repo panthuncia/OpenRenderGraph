@@ -58,10 +58,12 @@ inline bool operator==(const DescriptorAccessor& lhs, const DescriptorAccessor& 
 struct AutoDescriptorRegistration {
 	ResourceIdentifier resourceId;
 	DescriptorAccessor accessor;
+	std::shared_ptr<Resource> resolvedResource;
 };
 
 inline bool operator==(const AutoDescriptorRegistration& lhs, const AutoDescriptorRegistration& rhs) {
-	return lhs.resourceId == rhs.resourceId && lhs.accessor == rhs.accessor;
+	return lhs.resourceId == rhs.resourceId && lhs.accessor == rhs.accessor &&
+		lhs.resolvedResource == rhs.resolvedResource;
 }
 
 struct ResourceAndAccessor {
@@ -79,6 +81,21 @@ public:
 
 	}
 	void RegisterDescriptor(const AutoDescriptorRegistration& registration) {
+		if (registration.resolvedResource) {
+			auto handle = ResourceRegistry::RegistryHandle::MakeEphemeral(registration.resolvedResource.get());
+			try {
+				auto registeredHandle = m_resourceRegistryView->RequestHandle(registration.resourceId);
+				if (m_resourceRegistryView->Resolve<Resource>(registeredHandle) == registration.resolvedResource.get()) {
+					handle = registeredHandle;
+				}
+			} catch (const std::exception&) {
+				// Catalog-only resources are intentionally anonymous in the registry.
+			}
+			auto entry = GetResourceIndexOrDynamicResource(
+				handle, registration.resolvedResource.get(), registration.accessor);
+			m_resourceMap[registration.resourceId.hash] = ResourceAndAccessor{ entry, registration.accessor };
+			return;
+		}
 		switch (registration.accessor.type) {
 		case DescriptorType::SRV:
 			if (registration.accessor.hasSRVViewType) {
