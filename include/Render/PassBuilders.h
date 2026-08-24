@@ -306,7 +306,21 @@ processResourceArguments(const ResourceIdentifierAndRange& rir,
 {
     // This could be a resolver- ask the graph.
     if (auto resolver = graph->RequestResolver(rir.identifier, true)) {
-        return processResourceArguments(*resolver, graph);
+        auto resources = resolver->Resolve();
+        // Keep a single-resource resolver's symbolic registry entry synchronized
+        // with the concrete version selected for this declaration. Pass setup and
+        // execution may legitimately request the declared identifier through its
+        // ResourceRegistryView after scheduling ranges have been materialized.
+        if (resources.size() == 1u && resources.front()) {
+            graph->RegisterResource(rir.identifier, resources.front(), nullptr);
+        }
+        std::vector<ResourceHandleAndRange> resolvedRanges;
+        for (const auto& resource : resources) {
+            auto ranges = processResourceArguments(ResourcePtrAndRange(resource, rir.range), graph);
+            resolvedRanges.insert(resolvedRanges.end(),
+                std::make_move_iterator(ranges.begin()), std::make_move_iterator(ranges.end()));
+        }
+        return resolvedRanges;
     }
 
     return expandToRanges(rir, graph);
@@ -615,6 +629,20 @@ namespace detail
             return;
         }
         MaybeTrackResolverSnapshot(graph, resolverSnapshots, ResourceIdentifier{ id });
+    }
+
+    inline void MaybeTrackResolverSnapshot(RenderGraph* graph, std::vector<ResolverSnapshot>& resolverSnapshots, std::string_view id) {
+        MaybeTrackResolverSnapshot(graph, resolverSnapshots, ResourceIdentifier{ id });
+    }
+
+    template<class S>
+        requires (StringLike<S> &&
+            !std::is_same_v<std::remove_cvref_t<S>, const char*> &&
+            !std::is_same_v<std::remove_cvref_t<S>, char*> &&
+            !std::is_same_v<std::remove_cvref_t<S>, std::string_view>)
+    inline void MaybeTrackResolverSnapshot(RenderGraph* graph, std::vector<ResolverSnapshot>& resolverSnapshots, S&& id) {
+        MaybeTrackResolverSnapshot(graph, resolverSnapshots,
+            ResourceIdentifier{ std::string_view{ std::forward<S>(id) } });
     }
 
     template<typename IdSet, typename DestVec, typename T>

@@ -5886,7 +5886,12 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(RenderPassAndResources& p,
 		UpdateRetainedDeclarationCache(PassType::Render, p.name, p);
 	}
 
-	const bool requiresPassRebind = !p.declarationCache.dynamicInterface ||
+	// A versioned resolver can replace the concrete resource behind an otherwise
+	// unchanged identifier.  Rebuild the pass view/setup in that case so automatic
+	// descriptor bindings follow the newly resolved resource instead of retaining
+	// the descriptor captured from the previous resolver version.
+	const bool requiresPassRebind = !p.resolverSnapshots.empty() ||
+		!p.declarationCache.dynamicInterface ||
 		p.declarationCache.dynamicInterface->RequiresPassRebindAfterDeclarationRefresh();
 	// Only retained passes that resolve through their view or perform declaration-
 	// dependent setup need these execution helpers rebuilt. Immediate-only upload
@@ -5985,7 +5990,8 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(ComputePassAndResources& p
 		UpdateRetainedDeclarationCache(PassType::Compute, p.name, p);
 	}
 
-	const bool requiresPassRebind = !p.declarationCache.dynamicInterface ||
+	const bool requiresPassRebind = !p.resolverSnapshots.empty() ||
+		!p.declarationCache.dynamicInterface ||
 		p.declarationCache.dynamicInterface->RequiresPassRebindAfterDeclarationRefresh();
 	if (requiresPassRebind) {
 		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Compute)::SetResourceRegistryView");
