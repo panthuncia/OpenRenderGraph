@@ -121,6 +121,16 @@ private:
 		void RecordImmediateCommands(ImmediateExecutionContext& context) override {
 			GetInstance().ExecuteResourceCopies(context.frameIndex, context.list);// copies come before uploads to avoid overwriting data
 			GetInstance().ProcessUploads(context.frameIndex, context.list);
+			auto streamingUploads = GetInstance().ConsumeStreamingUploads();
+			for (const auto& upload : streamingUploads) {
+				if (upload.ticket && upload.ticket->state.load(std::memory_order_acquire) ==
+					TrackedUploadTicketState::Cancelled) continue;
+				if (!upload.dstResource || !upload.srcUploadBuffer || upload.size == 0) continue;
+				context.list.CopyBufferRegion(
+					upload.dstResource.get(), upload.dstOffset,
+					upload.srcUploadBuffer, upload.srcOffset,
+					upload.size);
+			}
 		}
 
 		PassReturn Execute(PassExecutionContext& context) override {
@@ -170,6 +180,7 @@ private:
 	std::mutex                            m_streamingMutex;
 	std::vector<StreamingUploadDescriptor> m_pendingStreamingUploads;
 	std::vector<std::shared_ptr<TrackedUploadTicket>> m_claimedTrackedUploads;
+	std::vector<std::shared_ptr<TrackedUploadTicket>> m_submittedTrackedUploads;
 
 };
 

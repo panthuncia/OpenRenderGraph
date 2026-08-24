@@ -212,6 +212,14 @@ void UploadManager::ProcessDeferredReleases(uint8_t frameIndex)
 	if (m_uploadInstance) {
 		m_uploadInstance->ProcessDeferredReleases(frameIndex);
 	}
+	// Upload tickets own GPU completion detection.  Completing them here wakes
+	// graph subscribers directly, so renderer-state publication never scans the
+	// graph for outstanding GPU work.
+	std::lock_guard<std::mutex> lock(m_streamingMutex);
+	std::erase_if(m_submittedTrackedUploads, [](const auto& ticket) {
+		return !ticket || ticket->Complete() ||
+			ticket->state.load(std::memory_order_acquire) == TrackedUploadTicketState::Cancelled;
+	});
 }
 
 std::string UploadManager::DescribeQueuedTargetByGlobalResourceId(uint64_t globalResourceId)
@@ -325,6 +333,7 @@ void UploadManager::Cleanup() {
 		}
 		m_pendingStreamingUploads.clear();
 		m_claimedTrackedUploads.clear();
+		m_submittedTrackedUploads.clear();
 	}
 	MarkUploadPassDirty();
 }
@@ -356,6 +365,7 @@ void UploadManager::QueueStreamingUpload(
 		std::lock_guard<std::mutex> lock(m_streamingMutex);
 		m_pendingStreamingUploads.push_back(std::move(desc));
 	}
+	MarkUploadPassDirty();
 }
 
 std::shared_ptr<TrackedUploadTicket> UploadManager::QueueTrackedStreamingUpload(
@@ -382,6 +392,7 @@ std::shared_ptr<TrackedUploadTicket> UploadManager::QueueTrackedStreamingUpload(
         std::lock_guard<std::mutex> lock(m_streamingMutex);
         m_pendingStreamingUploads.push_back(std::move(desc));
     }
+	MarkUploadPassDirty();
     return ticket;
 }
 
@@ -424,7 +435,11 @@ void UploadManager::NotifyTrackedUploadsSubmitted(std::shared_ptr<const void> ti
             ticket->isTimelineComplete = isTimelineComplete;
         }
         if (ticket->state.compare_exchange_strong(expected, TrackedUploadTicketState::Submitted,
-                std::memory_order_release, std::memory_order_acquire)) ticket->NotifyChanged();
+                std::memory_order_release, std::memory_order_acquire)) {
+			ticket->NotifyChanged();
+			std::lock_guard<std::mutex> lock(m_streamingMutex);
+			m_submittedTrackedUploads.push_back(ticket);
+		}
     }
 }
 
