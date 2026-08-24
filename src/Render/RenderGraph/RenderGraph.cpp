@@ -10793,6 +10793,24 @@ void RenderGraph::RegisterResource(ResourceIdentifier id, std::shared_ptr<Resour
 	}
 }
 
+void RenderGraph::RegisterResolvedResourceAlias(
+	ResourceIdentifier const& id, std::shared_ptr<Resource> resource) {
+	if (!resource) return;
+
+	const auto existing = RequestResourcePtr(id, true);
+	const bool dynamicAlias = dynamic_cast<DynamicResource*>(existing.get()) != nullptr ||
+		dynamic_cast<DynamicGloballyIndexedResource*>(existing.get()) != nullptr;
+	if (dynamicAlias) {
+		m_resolvedResourceAliases.insert(id);
+		spdlog::info(
+			"RenderGraph: enabled dynamic resolver alias '{}' resource={} name='{}'",
+			id.ToString(), resource->GetGlobalResourceID(), resource->GetName());
+	}
+	if (dynamicAlias || m_resolvedResourceAliases.contains(id)) {
+		RegisterResource(id, std::move(resource), nullptr);
+	}
+}
+
 std::shared_ptr<Resource> RenderGraph::RequestResourcePtr(ResourceIdentifier const& rid, bool allowFailure) {
 	// If it's already in our registry, return it
 	auto cached = _registry.RequestShared(rid);

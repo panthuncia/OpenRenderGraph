@@ -307,12 +307,12 @@ processResourceArguments(const ResourceIdentifierAndRange& rir,
     // This could be a resolver- ask the graph.
     if (auto resolver = graph->RequestResolver(rir.identifier, true)) {
         auto resources = resolver->Resolve();
-        // Keep a single-resource resolver's symbolic registry entry synchronized
-        // with the concrete version selected for this declaration. Pass setup and
-        // execution may legitimately request the declared identifier through its
-        // ResourceRegistryView after scheduling ranges have been materialized.
+        // Dynamic-wrapper identifiers are explicit aliases whose concrete resource
+        // may change between retained declaration revisions.  Ordinary resolvers
+        // must not replace their symbolic entry: some of them intentionally expose
+        // a different declaration shape (such as a resource set).
         if (resources.size() == 1u && resources.front()) {
-            graph->RegisterResource(rir.identifier, resources.front(), nullptr);
+            graph->RegisterResolvedResourceAlias(rir.identifier, resources.front());
         }
         std::vector<ResourceHandleAndRange> resolvedRanges;
         for (const auto& resource : resources) {

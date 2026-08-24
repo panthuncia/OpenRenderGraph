@@ -754,6 +754,11 @@ public:
 	void RegisterProvider(IResourceProvider* prov);
 	void EnsureProviderRegistered(IResourceProvider* prov);
 	void RegisterResource(ResourceIdentifier id, std::shared_ptr<Resource> resource, IResourceProvider* provider = nullptr);
+	// Replace a symbolic resource only when that identifier was originally
+	// registered as a dynamic wrapper.  This preserves the alias across later
+	// resolver revisions without changing the handle shape of ordinary
+	// resolver-backed resources (for example terrain resource sets).
+	void RegisterResolvedResourceAlias(ResourceIdentifier const& id, std::shared_ptr<Resource> resource);
 
 	std::unordered_map<ResourceIdentifier, std::shared_ptr<IResourceResolver>, ResourceIdentifier::Hasher> _resolverMap;
 
@@ -1245,6 +1250,7 @@ private:
 	std::vector<IResourceProvider*> _providers;
 	ResourceRegistry _registry;
 	std::unordered_map<ResourceIdentifier, IResourceProvider*, ResourceIdentifier::Hasher> _providerMap;
+	std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> m_resolvedResourceAliases;
 
 	std::vector<IPassBuilder*> m_passBuilderOrder;
 	std::unordered_map<std::string, std::unique_ptr<IPassBuilder>> m_passBuildersByName;

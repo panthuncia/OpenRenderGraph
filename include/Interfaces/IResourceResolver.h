@@ -4,6 +4,7 @@
 #include <memory>
 
 #include "Resources/ResourceStateTracker.h"
+#include "Resources/ResourceIdentifier.h"
 
 
 namespace org {
