@@ -21,6 +21,13 @@ class SymbolicTracker;
 
 class Resource : public std::enable_shared_from_this<Resource> {
 public:
+	class ScopedECSRegistrationSuppression {
+	public:
+		ScopedECSRegistrationSuppression() noexcept { ++s_ecsRegistrationSuppressionDepth; }
+		~ScopedECSRegistrationSuppression() { --s_ecsRegistrationSuppressionDepth; }
+		ScopedECSRegistrationSuppression(const ScopedECSRegistrationSuppression&) = delete;
+		ScopedECSRegistrationSuppression& operator=(const ScopedECSRegistrationSuppression&) = delete;
+	};
 	enum class GraphOwnership : uint8_t {
 		GraphManaged = 0,
 		ExternalImmutableShaderResource,
@@ -152,7 +159,7 @@ public:
 
     Resource() {
         m_globalResourceID = globalResourceCount.fetch_add(1, std::memory_order_relaxed);
-		if (s_ecsEntityHooks.createEntity) {
+		if (s_ecsRegistrationSuppressionDepth == 0 && s_ecsEntityHooks.createEntity) {
 			m_ecsEntity = s_ecsEntityHooks.createEntity();
 		}
     }
@@ -197,6 +204,8 @@ public:
 		const auto it = m_representations.find(static_cast<uint8_t>(backendInstance));
 		return it != m_representations.end() ? it->second : APIRepresentationPtr{};
 	}
+
+	[[nodiscard]] bool HasECSEntity() const noexcept { return static_cast<bool>(m_ecsEntity); }
 	rhi::Resource GetAttachedAPIRepresentation(BackendInstanceId backendInstance) const {
 		auto representation = AcquireAPIRepresentation(backendInstance);
 		return representation && representation->resource ? representation->resource.Get() : rhi::Resource{};
@@ -351,6 +360,7 @@ protected:
 	unsigned int m_arraySize = 1;
 
 private:
+	inline static thread_local std::uint32_t s_ecsRegistrationSuppressionDepth = 0;
 	mutable std::mutex m_representationMutex;
 	std::unordered_map<uint8_t, APIRepresentationPtr> m_representations;
 	std::atomic<uint64_t> m_nextRepresentationGeneration{ 1 };

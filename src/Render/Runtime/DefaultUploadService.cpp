@@ -93,8 +93,21 @@ public:
         UploadManager::GetInstance().QueueStreamingUpload(data, size, std::move(destination), dstOffset);
     }
 
+    std::shared_ptr<TrackedUploadTicket> QueueTrackedStreamingUpload(
+        const void* data, size_t size, std::shared_ptr<Resource> destination,
+        size_t dstOffset) override {
+        return UploadManager::GetInstance().QueueTrackedStreamingUpload(
+            data, size, std::move(destination), dstOffset);
+    }
+
     std::vector<StreamingUploadDescriptor> ConsumeStreamingUploads() override {
         return UploadManager::GetInstance().ConsumeStreamingUploads();
+    }
+
+    void NotifyTrackedUploadsSubmitted(std::shared_ptr<const void> timelineOwner,
+        uint64_t timelineValue, std::function<bool(uint64_t)> isTimelineComplete) override {
+        UploadManager::GetInstance().NotifyTrackedUploadsSubmitted(
+            std::move(timelineOwner), timelineValue, std::move(isTimelineComplete));
     }
 
     void ResetStreamingPagePool() override {

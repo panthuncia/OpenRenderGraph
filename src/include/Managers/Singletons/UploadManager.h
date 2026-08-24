@@ -87,11 +87,16 @@ public:
 	void QueueStreamingUpload(const void* data, size_t size,
 	                          std::shared_ptr<Resource> destination,
 	                          size_t dstOffset = 0);
+	std::shared_ptr<TrackedUploadTicket> QueueTrackedStreamingUpload(
+		const void* data, size_t size, std::shared_ptr<Resource> destination,
+		size_t dstOffset = 0);
 
 	/// Drain all pending streaming uploads. Returns the descriptors to be
 	/// fed into a StreamingUploadPass. Called once per frame by the
 	/// extension that creates the pass.
 	std::vector<StreamingUploadDescriptor> ConsumeStreamingUploads();
+	void NotifyTrackedUploadsSubmitted(std::shared_ptr<const void> timelineOwner,
+		uint64_t timelineValue, std::function<bool(uint64_t)> isTimelineComplete);
 
 	/// Reset the streaming page pool for the next frame. Should be called
 	/// once the GPU is done with the previous frame's streaming uploads.
@@ -164,6 +169,7 @@ private:
 	AsyncCopyPagePool                     m_streamingPagePool;
 	std::mutex                            m_streamingMutex;
 	std::vector<StreamingUploadDescriptor> m_pendingStreamingUploads;
+	std::vector<std::shared_ptr<TrackedUploadTicket>> m_claimedTrackedUploads;
 
 };
 

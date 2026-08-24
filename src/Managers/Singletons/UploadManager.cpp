@@ -1,6 +1,7 @@
 #include "Managers/Singletons/UploadManager.h"
 
 #include <cstring>
+#include <algorithm>
 #include <sstream>
 #include <unordered_set>
 
@@ -316,7 +317,14 @@ void UploadManager::Cleanup() {
 	m_streamingPagePool.Cleanup();
 	{
 		std::lock_guard<std::mutex> lock(m_streamingMutex);
+		for (auto& descriptor : m_pendingStreamingUploads) {
+			if (descriptor.ticket) descriptor.ticket->Cancel();
+		}
+		for (auto& ticket : m_claimedTrackedUploads) {
+			if (ticket) ticket->Cancel();
+		}
 		m_pendingStreamingUploads.clear();
+		m_claimedTrackedUploads.clear();
 	}
 	MarkUploadPassDirty();
 }
@@ -350,12 +358,74 @@ void UploadManager::QueueStreamingUpload(
 	}
 }
 
+std::shared_ptr<TrackedUploadTicket> UploadManager::QueueTrackedStreamingUpload(
+    const void* data, size_t size, std::shared_ptr<Resource> destination, size_t dstOffset)
+{
+    if (!data || size == 0 || !destination) return {};
+
+    auto uploadBuffer = Buffer::CreateShared(rhi::HeapType::Upload, size, false);
+    uploadBuffer->SetName("TrackedStreamingUploadTemp");
+    uint8_t* mapped = nullptr;
+    uploadBuffer->GetAPIResource().Map(reinterpret_cast<void**>(&mapped), 0, size);
+    if (!mapped) return {};
+    std::memcpy(mapped, data, size);
+    uploadBuffer->GetAPIResource().Unmap(0, size);
+
+    auto ticket = std::make_shared<TrackedUploadTicket>();
+    StreamingUploadDescriptor desc;
+    desc.srcUploadBuffer = std::move(uploadBuffer);
+    desc.dstResource = std::move(destination);
+    desc.dstOffset = dstOffset;
+    desc.size = size;
+    desc.ticket = ticket;
+    {
+        std::lock_guard<std::mutex> lock(m_streamingMutex);
+        m_pendingStreamingUploads.push_back(std::move(desc));
+    }
+    return ticket;
+}
+
 std::vector<StreamingUploadDescriptor> UploadManager::ConsumeStreamingUploads()
 {
 	std::lock_guard<std::mutex> lock(m_streamingMutex);
 	std::vector<StreamingUploadDescriptor> result;
 	result.swap(m_pendingStreamingUploads);
+	result.erase(std::remove_if(result.begin(), result.end(), [](auto& descriptor) {
+		if (!descriptor.ticket) return false;
+		auto expected = TrackedUploadTicketState::Queued;
+		if (descriptor.ticket->state.compare_exchange_strong(expected, TrackedUploadTicketState::Claimed,
+				std::memory_order_acq_rel, std::memory_order_acquire)) {
+			descriptor.ticket->NotifyChanged();
+			return false;
+		}
+		return expected == TrackedUploadTicketState::Cancelled;
+	}), result.end());
+	for (const auto& descriptor : result) {
+		if (descriptor.ticket) m_claimedTrackedUploads.push_back(descriptor.ticket);
+	}
 	return result;
+}
+
+void UploadManager::NotifyTrackedUploadsSubmitted(std::shared_ptr<const void> timelineOwner,
+    uint64_t timelineValue, std::function<bool(uint64_t)> isTimelineComplete)
+{
+    std::vector<std::shared_ptr<TrackedUploadTicket>> claimed;
+    {
+        std::lock_guard<std::mutex> lock(m_streamingMutex);
+        claimed.swap(m_claimedTrackedUploads);
+    }
+    for (auto& ticket : claimed) {
+        if (!ticket) continue;
+        auto expected = TrackedUploadTicketState::Claimed;
+        {
+            std::lock_guard lock(ticket->timelineMutex);
+            ticket->timelineOwner = timelineOwner;
+            ticket->timelineValue = timelineValue;
+            ticket->isTimelineComplete = isTimelineComplete;
+        }
+        if (ticket->state.compare_exchange_strong(expected, TrackedUploadTicketState::Submitted,
+                std::memory_order_release, std::memory_order_acquire)) ticket->NotifyChanged();
+    }
 }
 
 
