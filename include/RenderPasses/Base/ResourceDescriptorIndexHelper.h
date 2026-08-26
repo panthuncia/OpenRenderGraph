@@ -59,16 +59,18 @@ struct AutoDescriptorRegistration {
 	ResourceIdentifier resourceId;
 	DescriptorAccessor accessor;
 	std::shared_ptr<Resource> resolvedResource;
+	std::shared_ptr<IResourceResolver> resolver;
 };
 
 inline bool operator==(const AutoDescriptorRegistration& lhs, const AutoDescriptorRegistration& rhs) {
 	return lhs.resourceId == rhs.resourceId && lhs.accessor == rhs.accessor &&
-		lhs.resolvedResource == rhs.resolvedResource;
+		lhs.resolvedResource == rhs.resolvedResource && lhs.resolver == rhs.resolver;
 }
 
 struct ResourceAndAccessor {
 	ResourceIndexOrDynamicResource resource;
 	DescriptorAccessor accessor; // Accessor for the descriptor
+	std::shared_ptr<IResourceResolver> resolver;
 };
 
 class ResourceDescriptorIndexHelper {
@@ -81,6 +83,11 @@ public:
 
 	}
 	void RegisterDescriptor(const AutoDescriptorRegistration& registration) {
+		if (registration.resolver) {
+			m_resourceMap[registration.resourceId.hash] = ResourceAndAccessor{
+				{}, registration.accessor, registration.resolver };
+			return;
+		}
 		if (registration.resolvedResource) {
 			auto handle = ResourceRegistry::RegistryHandle::MakeEphemeral(registration.resolvedResource.get());
 			try {
@@ -93,7 +100,7 @@ public:
 			}
 			auto entry = GetResourceIndexOrDynamicResource(
 				handle, registration.resolvedResource.get(), registration.accessor);
-			m_resourceMap[registration.resourceId.hash] = ResourceAndAccessor{ entry, registration.accessor };
+			m_resourceMap[registration.resourceId.hash] = ResourceAndAccessor{ entry, registration.accessor, {} };
 			return;
 		}
 		switch (registration.accessor.type) {
@@ -132,7 +139,7 @@ public:
 		Resource* res = m_resourceRegistryView->Resolve<Resource>(h);
 
 		auto entry = GetResourceIndexOrDynamicResource(h, res, accessor);
-		m_resourceMap[id.hash] = ResourceAndAccessor{ entry, accessor };
+		m_resourceMap[id.hash] = ResourceAndAccessor{ entry, accessor, {} };
 	}
 	void RegisterSRV(ResourceIdentifier id, unsigned int mip, unsigned int slice = 0) {
 		DescriptorAccessor accessor;
@@ -144,7 +151,7 @@ public:
 		Resource* res = m_resourceRegistryView->Resolve<Resource>(h);
 
 		auto entry = GetResourceIndexOrDynamicResource(h, res, accessor);
-		m_resourceMap[id.hash] = ResourceAndAccessor{ entry, accessor };
+		m_resourceMap[id.hash] = ResourceAndAccessor{ entry, accessor, {} };
 	}
 	void RegisterUAV(ResourceIdentifier id, unsigned int mip, unsigned int slice = 0) {
 		DescriptorAccessor accessor;
@@ -155,7 +162,7 @@ public:
 		Resource* res = m_resourceRegistryView->Resolve<Resource>(h);
 
 		auto entry = GetResourceIndexOrDynamicResource(h, res, accessor);
-		m_resourceMap[id.hash] = ResourceAndAccessor{ entry, accessor };
+		m_resourceMap[id.hash] = ResourceAndAccessor{ entry, accessor, {} };
 	}
 	void RegisterUAV(UAVViewType type, ResourceIdentifier id, unsigned int mip, unsigned int slice = 0) {
 		DescriptorAccessor accessor;
@@ -168,7 +175,7 @@ public:
 		Resource* res = m_resourceRegistryView->Resolve<Resource>(h);
 
 		auto entry = GetResourceIndexOrDynamicResource(h, res, accessor);
-		m_resourceMap[id.hash] = ResourceAndAccessor{ entry, accessor };
+		m_resourceMap[id.hash] = ResourceAndAccessor{ entry, accessor, {} };
 	}
 	void RegisterCBV(ResourceIdentifier id) {
 		DescriptorAccessor accessor;
@@ -177,7 +184,7 @@ public:
 		Resource* res = m_resourceRegistryView->Resolve<Resource>(h);
 
 		auto entry = GetResourceIndexOrDynamicResource(h, res, accessor);
-		m_resourceMap[id.hash] = ResourceAndAccessor{ entry, accessor };
+		m_resourceMap[id.hash] = ResourceAndAccessor{ entry, accessor, {} };
 	}
 	unsigned int GetResourceDescriptorIndex(size_t hash, bool allowFail = true, const std::string* name = nullptr) const {
 		auto it = m_resourceMap.find(hash);
@@ -194,7 +201,25 @@ public:
 		const auto& resourceAndAccessor = it->second;
 		unsigned int resolvedIndex = 0;
 		try {
-			if (resourceAndAccessor.resource.isDynamic) {
+			if (resourceAndAccessor.resolver) {
+				auto resources = resourceAndAccessor.resolver->Resolve();
+				if (resources.size() != 1u || !resources.front()) {
+					throw std::runtime_error("resolver did not produce exactly one resource");
+				}
+				if (auto* dynamicResource = dynamic_cast<DynamicGloballyIndexedResource*>(resources.front().get())) {
+					auto backing = dynamicResource->GetResource();
+					auto* resource = PtrFrom(backing);
+					if (!resource) throw std::runtime_error("resolved dynamic resource has null backing");
+					resolvedIndex = AccessGloballyIndexedResource(*resource, resourceAndAccessor.accessor);
+				}
+				else if (auto* resource = dynamic_cast<GloballyIndexedResource*>(resources.front().get())) {
+					resolvedIndex = AccessGloballyIndexedResource(*resource, resourceAndAccessor.accessor);
+				}
+				else {
+					throw std::runtime_error("resolved resource is not globally indexed");
+				}
+			}
+			else if (resourceAndAccessor.resource.isDynamic) {
 				resolvedIndex = AccessResourceByHandle(resourceAndAccessor.resource.handle, resourceAndAccessor.accessor);
 			}
 			else {

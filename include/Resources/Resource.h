@@ -206,6 +206,15 @@ public:
 	}
 
 	[[nodiscard]] bool HasECSEntity() const noexcept { return static_cast<bool>(m_ecsEntity); }
+	// Graph-published resources are resolved from PublishedRendererState rather
+	// than discovered through Flecs.  Their manager-facing journal object can
+	// outlive the legacy ECS entity, so allow the owning thread to remove only
+	// that discovery handle during an active cutover.
+	void ReleaseECSEntity() {
+		if (!m_ecsEntity) return;
+		if (s_ecsEntityHooks.destroyEntity) s_ecsEntityHooks.destroyEntity(m_ecsEntity);
+		m_ecsEntity.Disarm();
+	}
 	rhi::Resource GetAttachedAPIRepresentation(BackendInstanceId backendInstance) const {
 		auto representation = AcquireAPIRepresentation(backendInstance);
 		return representation && representation->resource ? representation->resource.Get() : rhi::Resource{};

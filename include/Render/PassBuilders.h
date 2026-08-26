@@ -509,12 +509,13 @@ namespace detail
         inline void TrackDefaultDescriptorIdentifier(RenderGraph* graph, std::vector<AutoDescriptorRegistration>& registrations, const ResourceIdentifier& id, DescriptorType type) {
             if (IsResolverBackedIdentifier(graph, id)) {
 				auto resolver = graph->RequestResolver(id, true);
-				auto resources = resolver ? resolver->Resolve() : std::vector<std::shared_ptr<Resource>>{};
-				if (resources.size() == 1u && resources.front()) {
+				if (resolver) {
 					DescriptorAccessor accessor{};
 					accessor.type = type;
+					accessor.mip = 0;
+					accessor.slice = 0;
 					AppendUniqueDescriptorRegistration(registrations,
-						AutoDescriptorRegistration{ id, accessor, resources.front() });
+						AutoDescriptorRegistration{ id, accessor, {}, std::move(resolver) });
 				}
                 return;
             }

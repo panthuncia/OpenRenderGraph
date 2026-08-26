@@ -3,6 +3,7 @@
 #include <atomic>
 #include <vector>
 #include <memory>
+#include <iterator>
 #include <functional>
 #include <mutex>
 #include <rhi.h>
@@ -18,6 +19,7 @@
 #include "Render/ImmediateExecution/ImmediateCommandList.h"
 #include "Render/Runtime/UploadTypes.h"
 #include "Render/Runtime/StreamingUploadTypes.h"
+#include "Render/PassBuilders.h"
 #include "Managers/AsyncCopyPagePool.h"
 #include "Managers/UploadInstance.h"
 
@@ -111,7 +113,17 @@ private:
 		}
 
 		void DeclareResourceUsages(RenderPassBuilder* builder) override {
-			(void)builder;
+			// Tracked streaming uploads must be captured before compilation.  Consuming
+			// them from RecordImmediateCommands made their destinations invisible to
+			// the graph, so a shader consumer could be scheduled without either the
+			// copy -> shader transition or a cross-queue dependency.
+			auto streamingUploads = GetInstance().ConsumeStreamingUploads();
+			m_streamingUploads.insert(m_streamingUploads.end(),
+				std::make_move_iterator(streamingUploads.begin()),
+				std::make_move_iterator(streamingUploads.end()));
+			for (const auto& upload : m_streamingUploads) {
+				if (upload.dstResource) builder->WithCopyDest(upload.dstResource);
+			}
 		}
 
 		void Setup() override {
@@ -121,8 +133,7 @@ private:
 		void RecordImmediateCommands(ImmediateExecutionContext& context) override {
 			GetInstance().ExecuteResourceCopies(context.frameIndex, context.list);// copies come before uploads to avoid overwriting data
 			GetInstance().ProcessUploads(context.frameIndex, context.list);
-			auto streamingUploads = GetInstance().ConsumeStreamingUploads();
-			for (const auto& upload : streamingUploads) {
+			for (const auto& upload : m_streamingUploads) {
 				if (upload.ticket && upload.ticket->state.load(std::memory_order_acquire) ==
 					TrackedUploadTicketState::Cancelled) continue;
 				if (!upload.dstResource || !upload.srcUploadBuffer || upload.size == 0) continue;
@@ -131,6 +142,7 @@ private:
 					upload.srcUploadBuffer, upload.srcOffset,
 					upload.size);
 			}
+			m_streamingUploads.clear();
 		}
 
 		PassReturn Execute(PassExecutionContext& context) override {
@@ -146,7 +158,7 @@ private:
 		}
 
 		bool RequiresPassRebindAfterDeclarationRefresh() const noexcept override { return false; }
-		bool DeclarationsProvidedByImmediateCommands() const noexcept override { return true; }
+		bool DeclarationsProvidedByImmediateCommands() const noexcept override { return false; }
 
 		void MarkDeclaredResourcesDirty() {
 			m_declaredResourcesDirty.store(true);
@@ -154,6 +166,7 @@ private:
 
 	private:
 		mutable std::atomic_bool m_declaredResourcesDirty = true;
+		std::vector<StreamingUploadDescriptor> m_streamingUploads;
 
 	};
 
