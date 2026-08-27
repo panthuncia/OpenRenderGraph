@@ -100,16 +100,6 @@ public:
             data, size, std::move(destination), dstOffset);
     }
 
-    std::vector<StreamingUploadDescriptor> ConsumeStreamingUploads() override {
-        return UploadManager::GetInstance().ConsumeStreamingUploads();
-    }
-
-    void NotifyTrackedUploadsSubmitted(std::shared_ptr<const void> timelineOwner,
-        uint64_t timelineValue, std::function<bool(uint64_t)> isTimelineComplete) override {
-        UploadManager::GetInstance().NotifyTrackedUploadsSubmitted(
-            std::move(timelineOwner), timelineValue, std::move(isTimelineComplete));
-    }
-
     void ResetStreamingPagePool() override {
         UploadManager::GetInstance().ResetStreamingPagePool();
     }

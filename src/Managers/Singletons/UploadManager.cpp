@@ -9,6 +9,7 @@
 
 #include "Render/PassBuilders.h"
 #include "Render/Runtime/OpenRenderGraphSettings.h"
+#include "Managers/Singletons/DeviceManager.h"
 
 
 namespace org {
@@ -47,6 +48,24 @@ void UploadManager::Initialize() {
 			return IsUploadTargetValid(target, reason, file, line);
 		});
 	m_uploadInstance->SetResolveContext(m_ctx);
+	{
+		std::lock_guard lock(m_streamingMutex);
+		if (!m_streamingInitialized) {
+			m_streamingTimeline = std::make_shared<rhi::TimelinePtr>();
+			const auto result = DeviceManager::GetInstance().GetDevice().CreateTimeline(
+				*m_streamingTimeline, 0, "TrackedStreamingUploadTimeline");
+			if (rhi::Failed(result) || !*m_streamingTimeline) {
+				m_streamingTimeline.reset();
+				throw std::runtime_error("UploadManager failed to create the tracked streaming upload timeline");
+			}
+			m_nextStreamingTimelineValue = 0;
+			m_streamingInitialized = true;
+		}
+	}
+	if (!m_streamingCompletionWorker.joinable()) {
+		m_streamingCompletionWorker = std::jthread(
+			[this](std::stop_token stopToken) { RunStreamingCompletionWorker(stopToken); });
+	}
 	MarkUploadPassDirty();
 }
 
@@ -212,14 +231,6 @@ void UploadManager::ProcessDeferredReleases(uint8_t frameIndex)
 	if (m_uploadInstance) {
 		m_uploadInstance->ProcessDeferredReleases(frameIndex);
 	}
-	// Upload tickets own GPU completion detection.  Completing them here wakes
-	// graph subscribers directly, so renderer-state publication never scans the
-	// graph for outstanding GPU work.
-	std::lock_guard<std::mutex> lock(m_streamingMutex);
-	std::erase_if(m_submittedTrackedUploads, [](const auto& ticket) {
-		return !ticket || ticket->Complete() ||
-			ticket->state.load(std::memory_order_acquire) == TrackedUploadTicketState::Cancelled;
-	});
 }
 
 std::string UploadManager::DescribeQueuedTargetByGlobalResourceId(uint64_t globalResourceId)
@@ -312,6 +323,12 @@ void UploadManager::ExecuteResourceCopies(uint8_t frameIndex, org::imm::Immediat
 }
 
 void UploadManager::Cleanup() {
+	if (m_streamingCompletionWorker.joinable()) {
+		m_streamingCompletionWorker.request_stop();
+		m_streamingCv.notify_all();
+		m_streamingCompletionWorker.join();
+	}
+
 	if (m_uploadInstance) {
 		m_uploadInstance->Cleanup();
 		m_uploadInstance.reset();
@@ -328,12 +345,10 @@ void UploadManager::Cleanup() {
 		for (auto& descriptor : m_pendingStreamingUploads) {
 			if (descriptor.ticket) descriptor.ticket->Cancel();
 		}
-		for (auto& ticket : m_claimedTrackedUploads) {
-			if (ticket) ticket->Cancel();
-		}
 		m_pendingStreamingUploads.clear();
-		m_claimedTrackedUploads.clear();
-		m_submittedTrackedUploads.clear();
+		m_streamingTimeline.reset();
+		m_streamingInitialized = false;
+		m_nextStreamingTimelineValue = 0;
 	}
 	MarkUploadPassDirty();
 }
@@ -342,105 +357,155 @@ void UploadManager::QueueStreamingUpload(
     const void* data, size_t size,
     std::shared_ptr<Resource> destination, size_t dstOffset)
 {
-	if (!data || size == 0 || !destination) return;
-
-	auto uploadBuffer = Buffer::CreateShared(rhi::HeapType::Upload, size, /*uav=*/false);
-	uploadBuffer->SetName("StreamingUploadTemp");
-
-	uint8_t* mapped = nullptr;
-	uploadBuffer->GetAPIResource().Map(reinterpret_cast<void**>(&mapped), 0, size);
-	if (mapped) {
-		std::memcpy(mapped, data, size);
-		uploadBuffer->GetAPIResource().Unmap(0, size);
-	}
-
-	StreamingUploadDescriptor desc;
-	desc.srcUploadBuffer = std::move(uploadBuffer);
-	desc.srcOffset       = 0;
-	desc.dstResource     = std::move(destination);
-	desc.dstOffset       = dstOffset;
-	desc.size            = size;
-
-	{
-		std::lock_guard<std::mutex> lock(m_streamingMutex);
-		m_pendingStreamingUploads.push_back(std::move(desc));
-	}
-	MarkUploadPassDirty();
+	(void)SubmitStreamingUpload(data, size, std::move(destination), dstOffset, false);
 }
 
 std::shared_ptr<TrackedUploadTicket> UploadManager::QueueTrackedStreamingUpload(
     const void* data, size_t size, std::shared_ptr<Resource> destination, size_t dstOffset)
 {
-    if (!data || size == 0 || !destination) return {};
-
-    auto uploadBuffer = Buffer::CreateShared(rhi::HeapType::Upload, size, false);
-    uploadBuffer->SetName("TrackedStreamingUploadTemp");
-    uint8_t* mapped = nullptr;
-    uploadBuffer->GetAPIResource().Map(reinterpret_cast<void**>(&mapped), 0, size);
-    if (!mapped) return {};
-    std::memcpy(mapped, data, size);
-    uploadBuffer->GetAPIResource().Unmap(0, size);
-
-    auto ticket = std::make_shared<TrackedUploadTicket>();
-    StreamingUploadDescriptor desc;
-    desc.srcUploadBuffer = std::move(uploadBuffer);
-    desc.dstResource = std::move(destination);
-    desc.dstOffset = dstOffset;
-    desc.size = size;
-    desc.ticket = ticket;
-    {
-        std::lock_guard<std::mutex> lock(m_streamingMutex);
-        m_pendingStreamingUploads.push_back(std::move(desc));
-    }
-	MarkUploadPassDirty();
-    return ticket;
+	return SubmitStreamingUpload(data, size, std::move(destination), dstOffset, true);
 }
 
-std::vector<StreamingUploadDescriptor> UploadManager::ConsumeStreamingUploads()
+std::shared_ptr<TrackedUploadTicket> UploadManager::SubmitStreamingUpload(
+	const void* data, size_t size, std::shared_ptr<Resource> destination,
+	size_t dstOffset, bool exposeTicket)
 {
-	std::lock_guard<std::mutex> lock(m_streamingMutex);
-	std::vector<StreamingUploadDescriptor> result;
-	result.swap(m_pendingStreamingUploads);
-	result.erase(std::remove_if(result.begin(), result.end(), [](auto& descriptor) {
-		if (!descriptor.ticket) return false;
-		auto expected = TrackedUploadTicketState::Queued;
-		if (descriptor.ticket->state.compare_exchange_strong(expected, TrackedUploadTicketState::Claimed,
-				std::memory_order_acq_rel, std::memory_order_acquire)) {
-			descriptor.ticket->NotifyChanged();
-			return false;
-		}
-		return expected == TrackedUploadTicketState::Cancelled;
-	}), result.end());
-	for (const auto& descriptor : result) {
-		if (descriptor.ticket) m_claimedTrackedUploads.push_back(descriptor.ticket);
+	if (!data || size == 0 || !destination) return {};
+	if (!m_streamingInitialized) Initialize();
+
+	auto ticket = std::make_shared<TrackedUploadTicket>();
+	auto uploadBuffer = Buffer::CreateShared(rhi::HeapType::Upload, size, false);
+	uploadBuffer->SetName(exposeTicket ? "TrackedStreamingUploadTemp" : "StreamingUploadTemp");
+	uint8_t* mapped = nullptr;
+	uploadBuffer->GetAPIResource().Map(reinterpret_cast<void**>(&mapped), 0, size);
+	if (!mapped) {
+		ticket->Cancel();
+		return {};
 	}
-	return result;
+	std::memcpy(mapped, data, size);
+	uploadBuffer->GetAPIResource().Unmap(0, size);
+
+	{
+		std::lock_guard lock(m_streamingMutex);
+		StreamingUploadDescriptor descriptor;
+		descriptor.srcUploadBuffer = std::move(uploadBuffer);
+		descriptor.dstResource = std::move(destination);
+		descriptor.dstOffset = dstOffset;
+		descriptor.size = size;
+		descriptor.ticket = ticket;
+		m_pendingStreamingUploads.push_back(std::move(descriptor));
+	}
+	m_streamingCv.notify_one();
+	return exposeTicket ? ticket : std::shared_ptr<TrackedUploadTicket>{};
 }
 
-void UploadManager::NotifyTrackedUploadsSubmitted(std::shared_ptr<const void> timelineOwner,
-    uint64_t timelineValue, std::function<bool(uint64_t)> isTimelineComplete)
+void UploadManager::RunStreamingCompletionWorker(std::stop_token stopToken)
 {
-    std::vector<std::shared_ptr<TrackedUploadTicket>> claimed;
-    {
-        std::lock_guard<std::mutex> lock(m_streamingMutex);
-        claimed.swap(m_claimedTrackedUploads);
-    }
-    for (auto& ticket : claimed) {
-        if (!ticket) continue;
-        auto expected = TrackedUploadTicketState::Claimed;
-        {
-            std::lock_guard lock(ticket->timelineMutex);
-            ticket->timelineOwner = timelineOwner;
-            ticket->timelineValue = timelineValue;
-            ticket->isTimelineComplete = isTimelineComplete;
-        }
-        if (ticket->state.compare_exchange_strong(expected, TrackedUploadTicketState::Submitted,
-                std::memory_order_release, std::memory_order_acquire)) {
-			ticket->NotifyChanged();
-			std::lock_guard<std::mutex> lock(m_streamingMutex);
-			m_submittedTrackedUploads.push_back(ticket);
+	try {
+		for (;;) {
+			SubmittedStreamingBatch batch;
+			std::shared_ptr<rhi::TimelinePtr> timeline;
+			{
+				std::unique_lock lock(m_streamingMutex);
+				m_streamingCv.wait(lock, stopToken, [this] { return !m_pendingStreamingUploads.empty(); });
+				if (stopToken.stop_requested()) {
+					for (auto& descriptor : m_pendingStreamingUploads) {
+						if (descriptor.ticket) descriptor.ticket->Cancel();
+					}
+					m_pendingStreamingUploads.clear();
+					return;
+				}
+				if (m_pendingStreamingUploads.empty()) {
+					continue;
+				}
+				constexpr size_t maxDescriptorsPerBatch = 256;
+				constexpr size_t maxBytesPerBatch = 16u * 1024u * 1024u;
+				size_t batchBytes = 0;
+				while (!m_pendingStreamingUploads.empty() &&
+					batch.descriptors.size() < maxDescriptorsPerBatch) {
+					auto& next = m_pendingStreamingUploads.front();
+					if (!batch.descriptors.empty() && batchBytes + next.size > maxBytesPerBatch) break;
+					batchBytes += next.size;
+					batch.descriptors.push_back(std::move(next));
+					m_pendingStreamingUploads.pop_front();
+				}
+				timeline = m_streamingTimeline;
+			}
+
+			for (auto& descriptor : batch.descriptors) {
+				if (!descriptor.ticket) continue;
+				auto expected = TrackedUploadTicketState::Queued;
+				if (descriptor.ticket->state.compare_exchange_strong(expected,
+						TrackedUploadTicketState::Claimed, std::memory_order_acq_rel,
+						std::memory_order_acquire)) descriptor.ticket->NotifyChanged();
+			}
+			std::erase_if(batch.descriptors, [](const auto& descriptor) {
+				return !descriptor.ticket || descriptor.ticket->state.load(std::memory_order_acquire) ==
+					TrackedUploadTicketState::Cancelled;
+			});
+			if (batch.descriptors.empty()) continue;
+
+			auto& deviceManager = DeviceManager::GetInstance();
+			auto device = deviceManager.GetDevice();
+			if (rhi::Failed(device.CreateCommandAllocator(rhi::QueueKind::Copy, batch.allocator)) ||
+				rhi::Failed(device.CreateCommandList(rhi::QueueKind::Copy, batch.allocator.Get(), batch.commandList))) {
+				for (auto& descriptor : batch.descriptors) descriptor.ticket->Cancel();
+				continue;
+			}
+			std::vector<rhi::BufferBarrier> barriers(batch.descriptors.size());
+			for (size_t index = 0; index < batch.descriptors.size(); ++index) {
+				auto& barrier = barriers[index];
+				barrier.buffer = batch.descriptors[index].dstResource->GetAPIResource().GetHandle();
+				barrier.beforeSync = rhi::ResourceSyncState::Copy;
+				barrier.afterSync = rhi::ResourceSyncState::Copy;
+				barrier.beforeAccess = rhi::ResourceAccessType::Common;
+				barrier.afterAccess = rhi::ResourceAccessType::CopyDest;
+			}
+			batch.commandList->Barriers({ .buffers = {
+				barriers.data(), static_cast<uint32_t>(barriers.size()) } });
+			for (const auto& descriptor : batch.descriptors) {
+				batch.commandList->CopyBufferRegion(
+					descriptor.dstResource->GetAPIResource().GetHandle(), descriptor.dstOffset,
+					descriptor.srcUploadBuffer->GetAPIResource().GetHandle(), descriptor.srcOffset,
+					descriptor.size);
+			}
+			for (auto& barrier : barriers) {
+				barrier.beforeAccess = rhi::ResourceAccessType::CopyDest;
+				barrier.afterAccess = rhi::ResourceAccessType::Common;
+			}
+			batch.commandList->Barriers({ .buffers = {
+				barriers.data(), static_cast<uint32_t>(barriers.size()) } });
+			batch.commandList->End();
+
+			batch.timelineValue = ++m_nextStreamingTimelineValue;
+			for (auto& descriptor : batch.descriptors) {
+				std::lock_guard ticketLock(descriptor.ticket->timelineMutex);
+				descriptor.ticket->timelineOwner = timeline;
+				descriptor.ticket->timelineValue = batch.timelineValue;
+				descriptor.ticket->isTimelineComplete = [timeline](uint64_t value) {
+					return timeline && *timeline && (*timeline)->GetCompletedValue() >= value;
+				};
+			}
+			const rhi::CommandList lists[] = { batch.commandList.Get() };
+			const rhi::TimelinePoint signal{ (*timeline)->GetHandle(), batch.timelineValue };
+			if (rhi::Failed(deviceManager.GetCopyQueue().Submit(lists, { .signals = { &signal, 1 } }))) {
+				for (auto& descriptor : batch.descriptors) descriptor.ticket->Cancel();
+				continue;
+			}
+			for (auto& descriptor : batch.descriptors) {
+				auto expected = TrackedUploadTicketState::Claimed;
+				if (descriptor.ticket->state.compare_exchange_strong(expected,
+						TrackedUploadTicketState::Submitted, std::memory_order_release,
+						std::memory_order_acquire)) descriptor.ticket->NotifyChanged();
+			}
+			if (timeline && *timeline) (void)(*timeline)->HostWait(batch.timelineValue);
+			for (auto& descriptor : batch.descriptors) (void)descriptor.ticket->Complete();
 		}
-    }
+	} catch (const std::exception& error) {
+		spdlog::error("Tracked streaming upload completion worker stopped after exception: {}", error.what());
+	} catch (...) {
+		spdlog::error("Tracked streaming upload completion worker stopped after unknown exception");
+	}
 }
 
 

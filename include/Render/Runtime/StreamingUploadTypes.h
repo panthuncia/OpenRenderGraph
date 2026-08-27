@@ -28,13 +28,21 @@ struct TrackedUploadTicket {
         if (callback) changeCallbacks.push_back(std::move(callback));
     }
 
-    void NotifyChanged() const {
+    void NotifyChanged() const noexcept {
         std::vector<std::function<void()>> callbacks;
         {
             std::lock_guard lock(timelineMutex);
             callbacks = changeCallbacks;
         }
-        for (const auto& callback : callbacks) callback();
+        for (const auto& callback : callbacks) {
+            try {
+                callback();
+            } catch (...) {
+                // Completion notification is advisory; polling remains the
+                // recovery path. Never let a consumer callback terminate the
+                // upload executor thread.
+            }
+        }
     }
 
     bool Cancel() noexcept {

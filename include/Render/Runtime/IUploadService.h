@@ -67,9 +67,6 @@ public:
     virtual std::shared_ptr<TrackedUploadTicket> QueueTrackedStreamingUpload(
         const void* data, size_t size, std::shared_ptr<Resource> destination,
         size_t dstOffset = 0) = 0;
-    virtual std::vector<StreamingUploadDescriptor> ConsumeStreamingUploads() = 0;
-    virtual void NotifyTrackedUploadsSubmitted(std::shared_ptr<const void> timelineOwner,
-        uint64_t timelineValue, std::function<bool(uint64_t)> isTimelineComplete) = 0;
     virtual void ResetStreamingPagePool() = 0;
 
     virtual void Cleanup() = 0;

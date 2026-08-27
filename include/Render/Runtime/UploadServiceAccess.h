@@ -97,14 +97,6 @@ inline void QueueStreamingUploadDispatch(
     throw std::runtime_error("Upload service is not active for QueueStreamingUpload");
 }
 
-inline std::vector<StreamingUploadDescriptor> ConsumeStreamingUploadsDispatch() {
-    if (auto* service = GetActiveUploadService()) {
-        return service->ConsumeStreamingUploads();
-    }
-
-    throw std::runtime_error("Upload service is not active for ConsumeStreamingUploads");
-}
-
 inline void ResetStreamingPagePoolDispatch() {
     if (auto* service = GetActiveUploadService()) {
         service->ResetStreamingPagePool();
