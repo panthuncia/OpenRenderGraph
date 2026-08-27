@@ -40,7 +40,10 @@ struct AsyncBufferBackingResizeResult {
     std::exception_ptr exception;
 };
 
-using AsyncBufferBackingResizeScheduler = std::function<void(std::string, std::function<void()>&&)>;
+// Returns true only when the task has been accepted for execution.  A rejected
+// resize must remain retryable; otherwise its state would be left permanently
+// in-flight without any producer capable of completing it.
+using AsyncBufferBackingResizeScheduler = std::function<bool(std::string, std::function<void()>&&)>;
 
 void SetAsyncBufferBackingResizeScheduler(AsyncBufferBackingResizeScheduler scheduler);
 

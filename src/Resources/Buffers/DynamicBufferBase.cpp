@@ -285,7 +285,23 @@ void AsyncBufferBackingResizeState::Schedule(
         ? std::string("AsyncBufferBackingResize")
         : std::string("AsyncBufferBackingResize::") + request.debugName;
     if (scheduler) {
-        scheduler(taskName, std::move(task));
+        if (scheduler(taskName, std::move(task))) {
+            return;
+        }
+
+        // Submission can be rejected transiently while a task domain is at
+        // capacity.  Undo only this request's in-flight marker so the next
+        // level-triggered reserve request can submit it again.  The desired
+        // byte size and request recipe remain intact.
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (token == state->inFlightToken && !state->readyValid) {
+                state->inFlight = false;
+                state->inFlightByteSize = 0;
+            }
+        }
+        state->cv.notify_all();
+        BT_PLOT("AsyncBufferBackingResize.ScheduleRejected", int64_t{ 1 });
         return;
     }
 
