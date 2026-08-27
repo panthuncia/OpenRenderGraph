@@ -345,6 +345,18 @@ void UploadInstance::MarkPendingWorkChangedLocked() {
 	}
 }
 
+void UploadInstance::CaptureTargetTelemetry(
+	const UploadTarget& target, uint64_t& outId, std::string& outName) {
+	TargetTelemetryCallback callback;
+	{
+		std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
+		callback = m_targetTelemetry;
+	}
+	outId = 0;
+	outName.clear();
+	if (callback) callback(target, outId, outName);
+}
+
 void UploadInstance::CaptureTargetTelemetryLocked(const UploadTarget& target, uint64_t& outId, std::string& outName) {
 	outId = 0;
 	outName.clear();
@@ -372,6 +384,11 @@ void UploadInstance::PruneInvalidRegistryHandleUpdatesLocked(const char* reason)
 		bool changed = false;
 		for (size_t readIndex = 0; readIndex < updates.size(); ++readIndex) {
 			auto& update = updates[readIndex];
+			if (update.staging) {
+				if (writeIndex != readIndex) updates[writeIndex] = std::move(update);
+				++writeIndex;
+				continue;
+			}
 #if BUILD_TYPE == BUILD_TYPE_DEBUG
 			const char* file = update.file;
 			const int line = update.line;
@@ -416,63 +433,60 @@ void UploadInstance::UploadData(const void* data, size_t size, UploadTarget targ
 	std::shared_ptr<Resource> uploadBuffer;
 	size_t uploadOffset = 0;
 	ResourceUpdate update;
+	update.size = size;
+	update.resourceToUpdate = target;
+	update.dataBufferOffset = dstOffset;
+#if BUILD_TYPE == BUILD_TYPE_DEBUG
+	update.file = file;
+	update.line = line;
+#ifdef _WIN32
+	void* frames[ResourceUpdate::MaxStack];
+	USHORT captured = RtlCaptureStackBackTrace(1, ResourceUpdate::MaxStack, frames, nullptr);
+	update.stackSize = static_cast<uint8_t>(captured);
+	for (USHORT i = 0; i < captured; i++) update.stack[i] = frames[i];
+#endif
+#endif
+	CaptureTargetTelemetry(update.resourceToUpdate,
+		update.targetGlobalResourceId, update.targetDebugName);
+	uint64_t sequence = 0;
 	{
 		std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
 		AllocateUploadRegion(size, /*alignment*/16, uploadBuffer, uploadOffset);
 
-		update.size = size;
-		update.resourceToUpdate = target;
 		update.uploadBuffer = uploadBuffer;
 		update.uploadBufferOffset = uploadOffset;
-		update.dataBufferOffset = dstOffset;
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
-		update.file = file;
-		update.line = line;
-#ifdef _WIN32
-		void* frames[ResourceUpdate::MaxStack];
-		USHORT captured = RtlCaptureStackBackTrace(1, ResourceUpdate::MaxStack, frames, nullptr);
-		update.stackSize = static_cast<uint8_t>(captured);
-		for (USHORT i = 0; i < captured; i++) update.stack[i] = frames[i];
-#endif
-#endif
-		CaptureTargetTelemetryLocked(update.resourceToUpdate, update.targetGlobalResourceId, update.targetDebugName);
-
-		// Keep the reservation visible to ProcessUploads for the entire staging
-		// write.  Previously the queue lock was dropped between allocation and
-		// enqueue.  A concurrent ProcessUploads could then conclude that this
-		// page had no remaining updates, retire it, and allow it to be recycled
-		// while the CPU was still writing the reserved region.
-		uint8_t* mapped = nullptr;
-		MapUpload(uploadBuffer, &mapped);
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
-		if (!mapped) {
-			__debugbreak();
-			return;
-		}
-#endif
-		if (mapped) {
-			std::memcpy(mapped + uploadOffset, data, size);
-		}
-		UnmapUpload(uploadBuffer, uploadOffset, size);
-
+		update.staging = true;
 		update.firstSequence = ++m_lastUploadSequence;
 		update.lastSequence = update.firstSequence;
-		for (int i = static_cast<int>(m_resourceUpdates.size()) - 1; i >= 0; --i) {
-			auto& last = m_resourceUpdates[static_cast<size_t>(i)];
-			if (!last.active) {
-				continue;
-			}
-			// A captured batch boundary is immutable: extending a sealed update
-			// would move its earlier bytes past the cutoff without moving the fence
-			// that was assigned to them.
-			if (last.lastSequence > m_lastSealedUploadSequence && TryCoalesceAppend(last, update)) {
-				MarkPendingWorkChangedLocked();
-				return;
-			}
-			break;
-		}
+		sequence = update.firstSequence;
 		m_resourceUpdates.push_back(std::move(update));
 		MarkPendingWorkChangedLocked();
+	}
+
+	uint8_t* mapped = nullptr;
+	MapUpload(uploadBuffer, &mapped);
+	if (mapped) std::memcpy(mapped + uploadOffset, data, size);
+	UnmapUpload(uploadBuffer, uploadOffset, size);
+#if BUILD_TYPE == BUILD_TYPE_DEBUG
+	if (!mapped) __debugbreak();
+#endif
+
+	{
+		std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
+		const auto found = std::ranges::find(m_resourceUpdates, sequence, &ResourceUpdate::firstSequence);
+		if (found != m_resourceUpdates.end()) {
+			found->active = mapped != nullptr;
+			found->staging = false;
+			if (found->active && found != m_resourceUpdates.begin()) {
+				auto& previous = *std::prev(found);
+				if (previous.active && !previous.staging &&
+					previous.lastSequence > m_lastSealedUploadSequence &&
+					TryCoalesceAppend(previous, *found)) {
+					m_resourceUpdates.erase(found);
+				}
+			}
+			MarkPendingWorkChangedLocked();
+		}
 	}
 }
 
@@ -511,20 +525,14 @@ void UploadInstance::UploadTextureSubresources(
 
 	std::shared_ptr<Resource> uploadBuffer;
 	size_t uploadBaseOffset = 0;
+	uint64_t targetGlobalResourceId = 0;
+	std::string targetDebugName;
+	CaptureTargetTelemetry(target, targetGlobalResourceId, targetDebugName);
+	std::vector<uint64_t> sequences;
 	{
 		std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
 		AllocateUploadRegion(static_cast<size_t>(plan.totalSize), /*alignment*/512, uploadBuffer, uploadBaseOffset);
-
-		// Allocation, staging, and enqueue form one ownership transaction.  In
-		// particular, ProcessUploads must not be able to retire this page while
-		// its newly reserved region is not represented in m_textureUpdates yet.
-		uint8_t* mapped = nullptr;
-		MapUpload(uploadBuffer, &mapped);
-		if (mapped) {
-			rhi::helpers::WriteTextureUploadSubresources(plan, srcSpan, mapped, static_cast<uint64_t>(uploadBaseOffset));
-		}
-		UnmapUpload(uploadBuffer, uploadBaseOffset, static_cast<size_t>(plan.totalSize));
-
+		sequences.reserve(plan.footprints.size());
 		for (const auto& fp : plan.footprints) {
 			rhi::CopyableFootprint copyFootprint;
 			copyFootprint.offset = static_cast<uint64_t>(uploadBaseOffset) + fp.offset;
@@ -542,13 +550,34 @@ void UploadInstance::UploadTextureSubresources(
 			update.y = 0;
 			update.z = fp.zSlice;
 			update.uploadBuffer = uploadBuffer;
+			update.staging = true;
 #if BUILD_TYPE == BUILD_TYPE_DEBUG
 			update.file = file;
 			update.line = line;
 #endif
-			CaptureTargetTelemetryLocked(update.texture, update.targetGlobalResourceId, update.targetDebugName);
+			update.targetGlobalResourceId = targetGlobalResourceId;
+			update.targetDebugName = targetDebugName;
 			update.sequence = ++m_lastUploadSequence;
+			sequences.push_back(update.sequence);
 			m_textureUpdates.push_back(std::move(update));
+		}
+		MarkPendingWorkChangedLocked();
+	}
+
+	uint8_t* mapped = nullptr;
+	MapUpload(uploadBuffer, &mapped);
+	if (mapped) {
+		rhi::helpers::WriteTextureUploadSubresources(
+			plan, srcSpan, mapped, static_cast<uint64_t>(uploadBaseOffset));
+	}
+	UnmapUpload(uploadBuffer, uploadBaseOffset, static_cast<size_t>(plan.totalSize));
+	{
+		std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
+		for (const auto sequence : sequences) {
+			const auto found = std::ranges::find(m_textureUpdates, sequence, &TextureUpdate::sequence);
+			if (found == m_textureUpdates.end()) continue;
+			found->active = mapped != nullptr;
+			found->staging = false;
 		}
 		MarkPendingWorkChangedLocked();
 	}
@@ -569,6 +598,13 @@ void UploadInstance::ProcessUploadsThrough(
 		BT_ZONE_SCOPE("UploadInstance::ProcessUploadsThrough::AcquireAndDrainQueue");
 		std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
 		PruneInvalidRegistryHandleUpdatesLocked("upload-pass-execute");
+		const bool detachAll = sequenceInclusive == UINT64_MAX &&
+			std::ranges::none_of(m_resourceUpdates, &ResourceUpdate::staging) &&
+			std::ranges::none_of(m_textureUpdates, &TextureUpdate::staging);
+		if (detachAll) {
+			resourceUpdates.swap(m_resourceUpdates);
+			textureUpdates.swap(m_textureUpdates);
+		} else {
 		resourceUpdates.reserve(m_resourceUpdates.size());
 		textureUpdates.reserve(m_textureUpdates.size());
 		std::vector<ResourceUpdate> remainingResourceUpdates;
@@ -577,7 +613,7 @@ void UploadInstance::ProcessUploadsThrough(
 		remainingTextureUpdates.reserve(m_textureUpdates.size());
 
 		for (auto& update : m_resourceUpdates) {
-			if (update.lastSequence <= sequenceInclusive) {
+			if (!update.staging && update.lastSequence <= sequenceInclusive) {
 				resourceUpdates.push_back(std::move(update));
 			} else {
 				remainingResourceUpdates.push_back(std::move(update));
@@ -586,76 +622,68 @@ void UploadInstance::ProcessUploadsThrough(
 		m_resourceUpdates = std::move(remainingResourceUpdates);
 
 		for (auto& update : m_textureUpdates) {
-			if (update.sequence <= sequenceInclusive) {
+			if (!update.staging && update.sequence <= sequenceInclusive) {
 				textureUpdates.push_back(std::move(update));
 			} else {
 				remainingTextureUpdates.push_back(std::move(update));
 			}
 		}
 		m_textureUpdates = std::move(remainingTextureUpdates);
-
-		// Upload pages must retire relative to the frame that records their last
-		// copy, not the frame in which CPU staging happened. A bounded batch can
-		// remain queued for several frames while declarations are refreshed; the
-		// old allocation-time retirement would recycle and overwrite its staging
-		// memory before CopyBufferRegion was recorded.
-		std::unordered_set<Resource*> remainingUploadBuffers;
-		remainingUploadBuffers.reserve(m_resourceUpdates.size() + m_textureUpdates.size());
-		for (const auto& update : m_resourceUpdates) {
-			if (update.uploadBuffer) remainingUploadBuffers.insert(update.uploadBuffer.get());
-		}
-		for (const auto& update : m_textureUpdates) {
-			if (update.uploadBuffer) remainingUploadBuffers.insert(update.uploadBuffer.get());
 		}
 
-		std::unordered_set<Resource*> completedUploadBuffers;
-		completedUploadBuffers.reserve(resourceUpdates.size() + textureUpdates.size());
-		for (const auto& update : resourceUpdates) {
-			if (update.uploadBuffer && !remainingUploadBuffers.contains(update.uploadBuffer.get())) {
-				completedUploadBuffers.insert(update.uploadBuffer.get());
-			}
-		}
-		for (const auto& update : textureUpdates) {
-			if (update.uploadBuffer && !remainingUploadBuffers.contains(update.uploadBuffer.get())) {
-				completedUploadBuffers.insert(update.uploadBuffer.get());
-			}
-		}
-
-		if (!completedUploadBuffers.empty() && m_numFramesInFlight != 0) {
-			std::vector<UploadPagePtr> completedPages;
-			auto extractCompletedPages = [&](std::vector<UploadPagePtr>& pages) {
-				for (size_t i = 0; i < pages.size();) {
-					auto& page = pages[i];
-					if (page && page->buffer && completedUploadBuffers.contains(page->buffer.get())) {
-						completedPages.push_back(std::move(page));
-						pages[i] = std::move(pages.back());
-						pages.pop_back();
-						continue;
-					}
-					++i;
-				}
-			};
-			extractCompletedPages(m_openPages);
-			for (auto& pages : m_framePages) extractCompletedPages(pages);
-			for (const auto& page : completedPages) {
-				if (page) m_openPageSet.erase(page.get());
-			}
-
-			auto& submissionPages = m_framePages[frameIndex % m_numFramesInFlight];
-			std::unordered_set<UploadPage*> alreadyScheduled;
-			alreadyScheduled.reserve(submissionPages.size() + completedPages.size());
-			for (const auto& page : submissionPages) {
-				if (page) alreadyScheduled.insert(page.get());
-			}
-			for (auto& page : completedPages) {
-				if (page && alreadyScheduled.insert(page.get()).second) {
-					submissionPages.push_back(std::move(page));
-				}
-			}
-		}
 		ctx = m_ctx;
 		if (!resourceUpdates.empty() || !textureUpdates.empty()) {
 			MarkPendingWorkChangedLocked();
+		}
+	}
+
+	// Discover candidate pages from the detached batch without holding the
+	// producer queue lock. Revalidate against uploads that arrived meanwhile
+	// before removing a page from the allocator.
+	std::unordered_set<Resource*> completedUploadBuffers;
+	completedUploadBuffers.reserve(resourceUpdates.size() + textureUpdates.size());
+	for (const auto& update : resourceUpdates) {
+		if (update.uploadBuffer) completedUploadBuffers.insert(update.uploadBuffer.get());
+	}
+	for (const auto& update : textureUpdates) {
+		if (update.uploadBuffer) completedUploadBuffers.insert(update.uploadBuffer.get());
+	}
+	if (!completedUploadBuffers.empty() && m_numFramesInFlight != 0) {
+		std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
+		for (const auto& update : m_resourceUpdates) {
+			if (update.uploadBuffer) completedUploadBuffers.erase(update.uploadBuffer.get());
+		}
+		for (const auto& update : m_textureUpdates) {
+			if (update.uploadBuffer) completedUploadBuffers.erase(update.uploadBuffer.get());
+		}
+		std::vector<UploadPagePtr> completedPages;
+		auto extractCompletedPages = [&](std::vector<UploadPagePtr>& pages) {
+			for (size_t i = 0; i < pages.size();) {
+				auto& page = pages[i];
+				if (page && page->buffer && completedUploadBuffers.contains(page->buffer.get())) {
+					completedPages.push_back(std::move(page));
+					pages[i] = std::move(pages.back());
+					pages.pop_back();
+					continue;
+				}
+				++i;
+			}
+		};
+		extractCompletedPages(m_openPages);
+		for (auto& pages : m_framePages) extractCompletedPages(pages);
+		for (const auto& page : completedPages) {
+			if (page) m_openPageSet.erase(page.get());
+		}
+		auto& submissionPages = m_framePages[frameIndex % m_numFramesInFlight];
+		std::unordered_set<UploadPage*> alreadyScheduled;
+		alreadyScheduled.reserve(submissionPages.size() + completedPages.size());
+		for (const auto& page : submissionPages) {
+			if (page) alreadyScheduled.insert(page.get());
+		}
+		for (auto& page : completedPages) {
+			if (page && alreadyScheduled.insert(page.get()).second) {
+				submissionPages.push_back(std::move(page));
+			}
 		}
 	}
 
@@ -684,6 +712,7 @@ void UploadInstance::ProcessUploadsThrough(
 	}
 
 	for (auto& texUpdate : textureUpdates) {
+		if (!texUpdate.active || !texUpdate.uploadBuffer) continue;
 		if (texUpdate.texture.kind == UploadTarget::Kind::PinnedShared) {
 			commandList.CopyBufferToTexture(
 				texUpdate.uploadBuffer,

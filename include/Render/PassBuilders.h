@@ -1061,6 +1061,9 @@ public:
             graph->AddResource(resource);
         }
         addCallable(resources);
+        auto waits = resolver.GetExternalTimelineWaits();
+        params.externalWaitsBeforeTransitions.insert(params.externalWaitsBeforeTransitions.end(),
+            waits.begin(), waits.end());
         auto v = resolver.GetContentVersion();
         if (v != 0) resolverSnapshots_.push_back({ resolver.Clone(), v });
         return *this;
@@ -1073,6 +1076,9 @@ public:
             graph->AddResource(resource);
         }
         addCallable(resources);
+        auto waits = resolver.GetExternalTimelineWaits();
+        params.externalWaitsBeforeTransitions.insert(params.externalWaitsBeforeTransitions.end(),
+            waits.begin(), waits.end());
         auto v = resolver.GetContentVersion();
         if (v != 0) resolverSnapshots_.push_back({ resolver.Clone(), v });
         return std::move(*this);
@@ -1830,6 +1836,9 @@ public:
             graph->AddResource(resource);
         }
         addCallable(resources);
+        auto waits = resolver.GetExternalTimelineWaits();
+        params.externalWaitsBeforeTransitions.insert(params.externalWaitsBeforeTransitions.end(),
+            waits.begin(), waits.end());
         auto v = resolver.GetContentVersion();
         if (v != 0) resolverSnapshots_.push_back({ resolver.Clone(), v });
         return *this;
@@ -1842,6 +1851,9 @@ public:
             graph->AddResource(resource);
         }
         addCallable(resources);
+        auto waits = resolver.GetExternalTimelineWaits();
+        params.externalWaitsBeforeTransitions.insert(params.externalWaitsBeforeTransitions.end(),
+            waits.begin(), waits.end());
         auto v = resolver.GetContentVersion();
         if (v != 0) resolverSnapshots_.push_back({ resolver.Clone(), v });
         return std::move(*this);
@@ -2296,6 +2308,9 @@ public:
             graph->AddResource(resource);
         }
         addCallable(resources);
+        auto waits = resolver.GetExternalTimelineWaits();
+        params.externalWaitsBeforeTransitions.insert(params.externalWaitsBeforeTransitions.end(),
+            waits.begin(), waits.end());
         auto v = resolver.GetContentVersion();
         if (v != 0) resolverSnapshots_.push_back({ resolver.Clone(), v });
         return *this;
@@ -2308,6 +2323,9 @@ public:
             graph->AddResource(resource);
         }
         addCallable(resources);
+        auto waits = resolver.GetExternalTimelineWaits();
+        params.externalWaitsBeforeTransitions.insert(params.externalWaitsBeforeTransitions.end(),
+            waits.begin(), waits.end());
         auto v = resolver.GetContentVersion();
         if (v != 0) resolverSnapshots_.push_back({ resolver.Clone(), v });
         return std::move(*this);

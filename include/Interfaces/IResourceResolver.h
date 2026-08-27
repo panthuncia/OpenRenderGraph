@@ -5,6 +5,7 @@
 
 #include "Resources/ResourceStateTracker.h"
 #include "Resources/ResourceIdentifier.h"
+#include "RenderPasses/Base/PassReturn.h"
 
 
 namespace org {
@@ -20,6 +21,11 @@ class IResourceResolver {
     /// Resolvers backed by a versioned container (e.g. ResourceGroup) should
     /// override this so that the render graph can detect changes automatically.
     virtual uint64_t GetContentVersion() const { return 0; }
+
+    // Queue submissions that must complete before any resolved resource is
+    // transitioned or consumed. Versioned resolvers should include these in
+    // GetContentVersion() so retained declarations refresh with the wait set.
+    virtual std::vector<ExternalTimelinePoint> GetExternalTimelineWaits() const { return {}; }
 
     template<typename T>
     std::vector<std::shared_ptr<T>> ResolveAs(bool require_all_casts = true) const {

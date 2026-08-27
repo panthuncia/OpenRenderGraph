@@ -61,6 +61,7 @@ public:
 		size_t uploadBufferOffset{};
 		size_t dataBufferOffset{};
 		bool active = true;
+		bool staging = false;
 		uint64_t firstSequence = 0;
 		uint64_t lastSequence = 0;
 #if BUILD_TYPE == BUILD_TYPE_DEBUG
@@ -83,6 +84,8 @@ public:
 		uint32_t y{};
 		uint32_t z{};
 		std::shared_ptr<Resource> uploadBuffer;
+		bool active = true;
+		bool staging = false;
 		uint64_t sequence = 0;
 #if BUILD_TYPE == BUILD_TYPE_DEBUG
 		const char* file{};
@@ -200,6 +203,7 @@ private:
 		size_t writeOffset,
 		size_t writeSize) noexcept;
 	void MarkPendingWorkChangedLocked();
+	void CaptureTargetTelemetry(const UploadTarget& target, uint64_t& outId, std::string& outName);
 	void CaptureTargetTelemetryLocked(const UploadTarget& target, uint64_t& outId, std::string& outName);
 	void RefreshQueuedTargetTelemetryLocked();
 	void PruneInvalidRegistryHandleUpdatesLocked(const char* reason);
