@@ -49,8 +49,14 @@ void CommandListPool::ShutdownBackgroundReset() {
 
 void CommandListPool::PreparePairForReuse(CommandListPair& pair) {
     BT_ZONE_SCOPE("CommandListPool::PreparePairForReuse");
-    pair.allocator->Recycle();
-    pair.list->Recycle(pair.allocator.Get());
+    {
+        BT_ZONE_SCOPE("CommandListPool::PreparePairForReuse::AllocatorReset");
+        pair.allocator->Recycle();
+    }
+    {
+        BT_ZONE_SCOPE("CommandListPool::PreparePairForReuse::CommandListReset");
+        pair.list->Recycle(pair.allocator.Get());
+    }
 }
 
 void CommandListPool::UpdateDiagnosticsCountsLocked() {
@@ -126,43 +132,6 @@ void CommandListPool::PrepareForRequests(size_t requiredCount, uint64_t complete
 
     RecycleCompleted(completedFenceValue);
 
-    // Background reset is deliberately serial and low priority. If it has not
-    // kept enough pairs ready for this frame, reset already-completed pairs on
-    // the requesting thread instead of allocating replacements. Before the
-    // scheduler migration the dedicated reset thread normally emptied this
-    // queue before PrepareForRequests; allowing the backlog to count only for
-    // ownership but not availability caused the pool to grow every frame.
-    std::vector<CommandListPair> immediateReset;
-    {
-        BT_ZONE_SCOPE("CommandListPool::PrepareForRequests::AcquireCompletedBacklog");
-        std::lock_guard lock(m_mutex);
-        const size_t missingReady = requiredCount > m_available.size()
-            ? requiredCount - m_available.size()
-            : 0;
-        const size_t resetCount = (std::min)(missingReady, m_pendingBackgroundReset.size());
-        immediateReset.reserve(resetCount);
-        for (size_t i = 0; i < resetCount; ++i) {
-            immediateReset.emplace_back(std::move(m_pendingBackgroundReset.back()));
-            m_pendingBackgroundReset.pop_back();
-        }
-        m_backgroundResetActiveCount += immediateReset.size();
-        UpdateDiagnosticsCountsLocked();
-    }
-    if (!immediateReset.empty()) {
-        BT_ZONE_SCOPE("CommandListPool::PrepareForRequests::ResetCompletedBacklog");
-        BT_ZONE_VALUE(immediateReset.size());
-        for (auto& pair : immediateReset) {
-            PreparePairForReuse(pair);
-        }
-        std::lock_guard lock(m_mutex);
-        for (auto& pair : immediateReset) {
-            m_available.emplace_back(std::move(pair));
-        }
-        m_backgroundResetActiveCount -= immediateReset.size();
-        m_diagnostics.backgroundResetCompletedThisFrame += immediateReset.size();
-        UpdateDiagnosticsCountsLocked();
-    }
-
     size_t deficit = 0;
     size_t availableBeforeWarm = 0;
     size_t totalOwnedBeforeWarm = 0;
@@ -227,7 +196,7 @@ void CommandListPool::PrepareForRequests(size_t requiredCount, uint64_t complete
     BT_PLOT("ORG.CommandListPool.Prepare.AvailableBeforeWarm", static_cast<int64_t>(availableBeforeWarm));
     BT_PLOT("ORG.CommandListPool.Prepare.TotalOwnedBeforeWarm", static_cast<int64_t>(totalOwnedBeforeWarm));
     BT_PLOT("ORG.CommandListPool.Prepare.WarmTarget", static_cast<int64_t>(warmTargetCount));
-    BT_PLOT("ORG.CommandListPool.Prepare.ResetInline", static_cast<int64_t>(immediateReset.size()));
+    BT_PLOT("ORG.CommandListPool.Prepare.ResetInline", int64_t{ 0 });
     basic_telemetry::Record(
         "ORG.CommandListPool.Prepare.DurationNs",
         static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
