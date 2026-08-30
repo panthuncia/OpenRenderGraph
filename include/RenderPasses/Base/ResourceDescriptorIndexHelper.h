@@ -200,12 +200,14 @@ public:
 		}
 		const auto& resourceAndAccessor = it->second;
 		unsigned int resolvedIndex = 0;
+		const Resource* resolvedResourceForDiagnostics = nullptr;
 		try {
 			if (resourceAndAccessor.resolver) {
 				auto resources = resourceAndAccessor.resolver->Resolve();
 				if (resources.size() != 1u || !resources.front()) {
 					throw std::runtime_error("resolver did not produce exactly one resource");
 				}
+				resolvedResourceForDiagnostics = resources.front().get();
 				if (auto* dynamicResource = dynamic_cast<DynamicGloballyIndexedResource*>(resources.front().get())) {
 					auto backing = dynamicResource->GetResource();
 					auto* resource = PtrFrom(backing);
@@ -243,6 +245,14 @@ public:
 		auto lastIt = m_lastResolvedDescriptorIndices.find(hash);
 		if (lastIt == m_lastResolvedDescriptorIndices.end()) {
 			m_lastResolvedDescriptorIndices.emplace(hash, resolvedIndex);
+			if (name && *name == "Builtin::Material::TextureStreamingMetadataBuffer") {
+				spdlog::info(
+					"Texture streaming metadata bind: resolver={} resource='{}' resource_ptr={} descriptor={}",
+					resourceAndAccessor.resolver != nullptr,
+					resolvedResourceForDiagnostics ? resolvedResourceForDiagnostics->GetName() : std::string("<registry>"),
+					static_cast<const void*>(resolvedResourceForDiagnostics),
+					resolvedIndex);
+			}
 		}
 		else if (lastIt->second != resolvedIndex) {
 			if (m_loggedDescriptorIndexChanges.insert(hash).second) {
