@@ -550,6 +550,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 			par.retainedAnonymousKeepAlive = CaptureRetainedAnonymousKeepAlive(
 				par.resources.staticResourceRequirements,
 				par.resources.internalTransitions);
+			par.resolverSnapshots = b.TakeResolverSnapshots();
 			UpdateRetainedDeclarationCache(PassType::Render, par.name, par);
 		}
 
@@ -624,6 +625,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 			par.retainedAnonymousKeepAlive = CaptureRetainedAnonymousKeepAlive(
 				par.resources.staticResourceRequirements,
 				par.resources.internalTransitions);
+			par.resolverSnapshots = b.TakeResolverSnapshots();
 			UpdateRetainedDeclarationCache(PassType::Compute, par.name, par);
 		}
 
@@ -694,6 +696,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 			par.retainedAnonymousKeepAlive = CaptureRetainedAnonymousKeepAlive(
 				par.resources.staticResourceRequirements,
 				par.resources.internalTransitions);
+			par.resolverSnapshots = b.TakeResolverSnapshots();
 			UpdateRetainedDeclarationCache(PassType::Copy, par.name, par);
 		}
 

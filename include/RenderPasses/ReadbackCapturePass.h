@@ -23,10 +23,12 @@ class ReadbackCapturePass final : public RenderPass, public IHasImmediateModeCom
 public:
     ReadbackCapturePass(
         ReadbackCaptureInputs inputs,
+        std::shared_ptr<Resource> sourceResource,
         ReadbackCaptureCallback callback,
         org::runtime::IReadbackService* readbackService,
         std::string debugCaptureName = {})
-        : m_callback(std::move(callback)),
+        : m_sourceResource(std::move(sourceResource)),
+        m_callback(std::move(callback)),
         m_readbackService(readbackService),
         m_debugCaptureName(std::move(debugCaptureName)) {
         SetInputs(inputs);
@@ -47,7 +49,7 @@ public:
         }
 
         const auto& inputs = Inputs<ReadbackCaptureInputs>();
-        auto* resource = m_resourceRegistryView->Resolve<Resource>(inputs.target.resource);
+        auto* resource = m_sourceResource.get();
         if (!resource) {
             return;
         }
@@ -97,7 +99,7 @@ public:
                     const auto& fp = footprints[subresourceIndex];
 
                     context.list.CopyTextureToBuffer(
-                        resource,
+                        m_sourceResource,
                         sr.firstMip + mip,
                         sr.firstSlice + slice,
                         readbackBuffer,
@@ -130,7 +132,7 @@ public:
             }
             BT_PLOT("Readback.CaptureRequestedBytes", static_cast<int64_t>(byteSize));
 
-            context.list.CopyBufferRegion(readbackBuffer, 0, resource, 0, byteSize);
+            context.list.CopyBufferRegion(readbackBuffer, 0, m_sourceResource, 0, byteSize);
 
             request.desc.kind = ReadbackResourceKind::Buffer;
             request.readbackBuffer = readbackBuffer;
@@ -172,6 +174,7 @@ public:
     }
 
 private:
+    std::shared_ptr<Resource> m_sourceResource;
     ReadbackCaptureCallback m_callback;
     org::runtime::ReadbackCaptureToken m_pendingToken{};
     org::runtime::IReadbackService* m_readbackService = nullptr; // non-owning
