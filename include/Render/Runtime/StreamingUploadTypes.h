@@ -11,6 +11,11 @@
 
 namespace org {
 
+struct StreamingUploadSegment {
+	const void* data = nullptr;
+	std::size_t size = 0;
+};
+
 class Resource;
 
 enum class TrackedUploadTicketState : uint8_t { Queued, Claimed, Submitted, Completed, Cancelled };

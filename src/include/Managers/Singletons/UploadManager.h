@@ -94,6 +94,9 @@ public:
 	std::shared_ptr<TrackedUploadTicket> QueueTrackedStreamingUpload(
 		const void* data, size_t size, std::shared_ptr<Resource> destination,
 		size_t dstOffset = 0);
+	std::shared_ptr<TrackedUploadTicket> QueueTrackedStreamingUploadSegments(
+		std::span<const StreamingUploadSegment> segments, size_t totalSize,
+		std::shared_ptr<Resource> destination, size_t dstOffset = 0);
 
 	/// Reset the streaming page pool for the next frame. Should be called
 	/// once the GPU is done with the previous frame's streaming uploads.
@@ -154,6 +157,9 @@ private:
 	std::shared_ptr<TrackedUploadTicket> SubmitStreamingUpload(
 		const void* data, size_t size, std::shared_ptr<Resource> destination,
 		size_t dstOffset, bool exposeTicket);
+	std::shared_ptr<TrackedUploadTicket> SubmitStreamingUploadSegments(
+		std::span<const StreamingUploadSegment> segments, size_t totalSize,
+		std::shared_ptr<Resource> destination, size_t dstOffset, bool exposeTicket);
 	void RunStreamingCompletionWorker(std::stop_token stopToken);
 
 	struct SubmittedStreamingBatch {

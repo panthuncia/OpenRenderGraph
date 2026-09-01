@@ -366,6 +366,14 @@ std::shared_ptr<TrackedUploadTicket> UploadManager::QueueTrackedStreamingUpload(
 	return SubmitStreamingUpload(data, size, std::move(destination), dstOffset, true);
 }
 
+std::shared_ptr<TrackedUploadTicket> UploadManager::QueueTrackedStreamingUploadSegments(
+	std::span<const StreamingUploadSegment> segments, size_t totalSize,
+	std::shared_ptr<Resource> destination, size_t dstOffset)
+{
+	return SubmitStreamingUploadSegments(
+		segments, totalSize, std::move(destination), dstOffset, true);
+}
+
 std::shared_ptr<TrackedUploadTicket> UploadManager::SubmitStreamingUpload(
 	const void* data, size_t size, std::shared_ptr<Resource> destination,
 	size_t dstOffset, bool exposeTicket)
@@ -374,6 +382,7 @@ std::shared_ptr<TrackedUploadTicket> UploadManager::SubmitStreamingUpload(
 	if (!m_streamingInitialized) Initialize();
 
 	auto ticket = std::make_shared<TrackedUploadTicket>();
+	Resource::ScopedECSRegistrationSuppression suppressECS;
 	auto uploadBuffer = Buffer::CreateShared(rhi::HeapType::Upload, size, false);
 	uploadBuffer->SetName(exposeTicket ? "TrackedStreamingUploadTemp" : "StreamingUploadTemp");
 	uint8_t* mapped = nullptr;
@@ -392,6 +401,54 @@ std::shared_ptr<TrackedUploadTicket> UploadManager::SubmitStreamingUpload(
 		descriptor.dstResource = std::move(destination);
 		descriptor.dstOffset = dstOffset;
 		descriptor.size = size;
+		descriptor.ticket = ticket;
+		m_pendingStreamingUploads.push_back(std::move(descriptor));
+	}
+	m_streamingCv.notify_one();
+	return exposeTicket ? ticket : std::shared_ptr<TrackedUploadTicket>{};
+}
+
+std::shared_ptr<TrackedUploadTicket> UploadManager::SubmitStreamingUploadSegments(
+	std::span<const StreamingUploadSegment> segments, size_t totalSize,
+	std::shared_ptr<Resource> destination, size_t dstOffset, bool exposeTicket)
+{
+	if (segments.empty() || totalSize == 0 || !destination) return {};
+	if (!m_streamingInitialized) Initialize();
+
+	auto ticket = std::make_shared<TrackedUploadTicket>();
+	Resource::ScopedECSRegistrationSuppression suppressECS;
+	auto uploadBuffer = Buffer::CreateShared(rhi::HeapType::Upload, totalSize, false);
+	uploadBuffer->SetName(exposeTicket ? "TrackedStreamingUploadSegmentsTemp" :
+		"StreamingUploadSegmentsTemp");
+	uint8_t* mapped = nullptr;
+	uploadBuffer->GetAPIResource().Map(reinterpret_cast<void**>(&mapped), 0, totalSize);
+	if (!mapped) {
+		ticket->Cancel();
+		return {};
+	}
+	size_t cursor = 0;
+	for (const auto& segment : segments) {
+		if (!segment.data || segment.size == 0 || segment.size > totalSize - cursor) {
+			uploadBuffer->GetAPIResource().Unmap(0, cursor);
+			ticket->Cancel();
+			return {};
+		}
+		std::memcpy(mapped + cursor, segment.data, segment.size);
+		cursor += segment.size;
+	}
+	uploadBuffer->GetAPIResource().Unmap(0, cursor);
+	if (cursor != totalSize) {
+		ticket->Cancel();
+		return {};
+	}
+
+	{
+		std::lock_guard lock(m_streamingMutex);
+		StreamingUploadDescriptor descriptor;
+		descriptor.srcUploadBuffer = std::move(uploadBuffer);
+		descriptor.dstResource = std::move(destination);
+		descriptor.dstOffset = dstOffset;
+		descriptor.size = totalSize;
 		descriptor.ticket = ticket;
 		m_pendingStreamingUploads.push_back(std::move(descriptor));
 	}

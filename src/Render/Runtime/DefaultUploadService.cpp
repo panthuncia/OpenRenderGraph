@@ -100,6 +100,13 @@ public:
             data, size, std::move(destination), dstOffset);
     }
 
+    std::shared_ptr<TrackedUploadTicket> QueueTrackedStreamingUploadSegments(
+        std::span<const StreamingUploadSegment> segments, size_t totalSize,
+        std::shared_ptr<Resource> destination, size_t dstOffset) override {
+        return UploadManager::GetInstance().QueueTrackedStreamingUploadSegments(
+            segments, totalSize, std::move(destination), dstOffset);
+    }
+
     void ResetStreamingPagePool() override {
         UploadManager::GetInstance().ResetStreamingPagePool();
     }

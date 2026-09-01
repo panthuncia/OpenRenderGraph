@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <vector>
 #include <functional>
 
@@ -67,6 +68,9 @@ public:
     virtual std::shared_ptr<TrackedUploadTicket> QueueTrackedStreamingUpload(
         const void* data, size_t size, std::shared_ptr<Resource> destination,
         size_t dstOffset = 0) = 0;
+    virtual std::shared_ptr<TrackedUploadTicket> QueueTrackedStreamingUploadSegments(
+        std::span<const StreamingUploadSegment> segments, size_t totalSize,
+        std::shared_ptr<Resource> destination, size_t dstOffset = 0) = 0;
     virtual void ResetStreamingPagePool() = 0;
 
     virtual void Cleanup() = 0;
