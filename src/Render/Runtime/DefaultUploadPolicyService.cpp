@@ -57,13 +57,17 @@ public:
     }
 
     void BeginFrame() override {
-        auto clients = SnapshotClients();
+        // BufferUploadPolicyState carries dirty ranges across frame boundaries
+        // and consumes them only during FlushAll(). All current client
+        // BeginFrame implementations therefore only acquire their buffer-local
+        // mirror lock before calling that no-op. Iterating every registered
+        // buffer here turned one render-thread frame boundary into a global
+        // rendezvous with concurrent graph publication writers. Preserve the
+        // client hook for the small dirty set only.
+        auto clients = SnapshotDirtyClients(false);
         for (auto* client : clients) {
-            if (client) {
-                client->OnUploadPolicyBeginFrame();
-            }
+            if (client) client->OnUploadPolicyBeginFrame();
         }
-
         std::scoped_lock lock(m_mutex);
         ++m_stats.beginFrameCalls;
         m_stats.registeredClients = static_cast<uint64_t>(m_clients.size());
@@ -71,7 +75,7 @@ public:
 
     void FlushAll() override {
         BT_ZONE_SCOPE("DefaultUploadPolicyService::FlushAll");
-        auto clients = SnapshotDirtyClients();
+        auto clients = SnapshotDirtyClients(true);
         uint64_t flushedClients = 0;
         uint64_t flushedWrites = 0;
         uint64_t flushedBytes = 0;
@@ -112,24 +116,14 @@ public:
     }
 
 private:
-    std::vector<IUploadPolicyClient*> SnapshotClients() {
-        std::scoped_lock lock(m_mutex);
-        std::vector<IUploadPolicyClient*> out;
-        out.reserve(m_clients.size());
-        for (auto* client : m_clients) {
-            out.push_back(client);
-        }
-        return out;
-    }
-
-    std::vector<IUploadPolicyClient*> SnapshotDirtyClients() {
+    std::vector<IUploadPolicyClient*> SnapshotDirtyClients(bool consume) {
         std::scoped_lock lock(m_mutex);
         std::vector<IUploadPolicyClient*> out;
         out.reserve(m_dirtyClients.size());
         for (auto* client : m_dirtyClients) {
             out.push_back(client);
         }
-        m_dirtyClients.clear();
+        if (consume) m_dirtyClients.clear();
         return out;
     }
 
