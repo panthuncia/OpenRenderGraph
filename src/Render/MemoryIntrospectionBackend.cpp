@@ -5,6 +5,8 @@
 #include "Resources/MemoryStatisticsComponents.h"
 #include "Resources/ResourceIdentifier.h"
 
+#include <unordered_map>
+
 namespace org::memory {
 
 namespace {
@@ -48,6 +50,35 @@ public:
 
             out.push_back(std::move(row));
             });
+
+		// Replacement resources and deferred-deletion backings retain the stable
+		// owner ResourceID, but metadata applied after materialization can exist on
+		// only the current backing. Inherit semantic ownership across all records
+		// for that owner so retired generations do not become "Unspecified" while
+		// they wait for their GPU fence.
+		struct OwnerMetadata {
+			std::string usage;
+			std::string name;
+			std::string identifier;
+		};
+		std::unordered_map<std::uint64_t, OwnerMetadata> metadataByOwner;
+		metadataByOwner.reserve(out.size());
+		for (const auto& row : out) {
+			if (row.resourceID == 0) continue;
+			auto& metadata = metadataByOwner[row.resourceID];
+			if (metadata.usage.empty() && !row.usage.empty()) metadata.usage = row.usage;
+			if (metadata.name.empty() && !row.resourceName.empty()) metadata.name = row.resourceName;
+			if (metadata.identifier.empty() && !row.identifier.empty()) metadata.identifier = row.identifier;
+		}
+		for (auto& row : out) {
+			if (row.resourceID == 0) continue;
+			const auto found = metadataByOwner.find(row.resourceID);
+			if (found == metadataByOwner.end()) continue;
+			const auto& metadata = found->second;
+			if (row.usage.empty()) row.usage = metadata.usage;
+			if (row.resourceName.empty()) row.resourceName = metadata.name;
+			if (row.identifier.empty()) row.identifier = metadata.identifier;
+		}
     }
 
 private:
