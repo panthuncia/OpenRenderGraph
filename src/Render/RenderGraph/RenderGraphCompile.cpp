@@ -81,8 +81,22 @@ namespace {
 	uint64_t HashResolverSnapshots(std::span<const ResolverSnapshot> resolverSnapshots) noexcept {
 		uint64_t hash = resolverSnapshots.size();
 		for (const auto& snapshot : resolverSnapshots) {
-			hash = HashCombine64(hash, snapshot.version);
+			hash = HashCombine64(hash, snapshot.resourceSetIdentity.low);
+			hash = HashCombine64(hash, snapshot.resourceSetIdentity.high);
 		}
+		return hash;
+	}
+
+	template<class PassResourceData>
+	uint64_t HashPassSynchronization(const PassResourceData& resources) {
+		uint64_t hash = 0x73796e6368726f01ull;
+		for (const auto& wait : resources.externalWaitsBeforeTransitions) {
+			hash = HashCombine64(hash, wait.timeline.GetHandle().index);
+			hash = HashCombine64(hash, wait.timeline.GetHandle().generation);
+			hash = HashCombine64(hash, wait.value);
+		}
+		for (const auto binding : resources.externalWaitBindingsBeforeTransitions)
+			hash = HashCombine64(hash, binding);
 		return hash;
 	}
 
@@ -187,24 +201,12 @@ namespace {
 			entries.push_back(entry);
 		}
 
-		for (const auto& wait : resources.externalWaitsBeforeTransitions) {
-			uint64_t entry = 0x6578747761697401ull;
-			entry = HashCombine64(entry, wait.timeline.GetHandle().index);
-			entry = HashCombine64(entry, wait.timeline.GetHandle().generation);
-			entry = HashCombine64(entry, wait.value);
-			entries.push_back(entry);
-		}
-		for (const auto binding : resources.externalWaitBindingsBeforeTransitions) {
-			entries.push_back(HashCombine64(0x65787462696e6401ull, binding));
-		}
-
 		std::sort(entries.begin(), entries.end());
 		uint64_t hash = 0xd1ec1a6a710f0001ull;
 		hash = HashCombine64(hash, entries.size());
 		for (const uint64_t entry : entries) {
 			hash = HashCombine64(hash, entry);
 		}
-		hash = HashCombine64(hash, HashResolverSnapshots(resolverSnapshots));
 		return hash;
 	}
 
@@ -279,6 +281,93 @@ namespace {
 	}
 
 	template<class PassAndResources>
+	void PrepareIncrementalResolverPatchRecipe(PassAndResources& passAndResources)
+	{
+		auto& cache = passAndResources.declarationCache;
+		cache.incrementalResolverPatchable = false;
+		cache.resolverIndependentRequirements.clear();
+		if (passAndResources.resolverSnapshots.empty()) return;
+
+		using Template = ResolverSnapshot::RequirementTemplate;
+		std::unordered_map<uint64_t, std::vector<Template>> templatesByResource;
+		templatesByResource.reserve(passAndResources.resources.staticResourceRequirements.size());
+		for (const auto& requirement : passAndResources.resources.staticResourceRequirements) {
+			templatesByResource[requirement.resourceHandleAndRange.resource.GetGlobalResourceID()].push_back({
+				.range = requirement.resourceHandleAndRange.range,
+				.state = requirement.state,
+			});
+		}
+
+		std::unordered_set<uint64_t> resolverResourceIDs;
+		for (auto& snapshot : passAndResources.resolverSnapshots) {
+			snapshot.requirementTemplates.clear();
+			// An empty initial set does not reveal the declaration state that future
+			// members require. Keep the compatibility redeclaration path for it.
+			if (snapshot.resourceIDs.empty()) return;
+			for (const auto id : snapshot.resourceIDs) {
+				if (!resolverResourceIDs.insert(id).second) return;
+			}
+			const auto first = templatesByResource.find(snapshot.resourceIDs.front());
+			if (first == templatesByResource.end() || first->second.empty()) return;
+			snapshot.requirementTemplates = first->second;
+			for (const auto id : snapshot.resourceIDs) {
+				const auto found = templatesByResource.find(id);
+				if (found == templatesByResource.end() || found->second.size() != snapshot.requirementTemplates.size()) return;
+				for (size_t i = 0; i < found->second.size(); ++i) {
+					if (!(found->second[i].range == snapshot.requirementTemplates[i].range) ||
+						!(found->second[i].state == snapshot.requirementTemplates[i].state)) return;
+				}
+			}
+		}
+
+		for (const auto& requirement : passAndResources.resources.staticResourceRequirements) {
+			if (!resolverResourceIDs.contains(requirement.resourceHandleAndRange.resource.GetGlobalResourceID()))
+				cache.resolverIndependentRequirements.push_back(requirement);
+		}
+		cache.incrementalResolverPatchable = true;
+	}
+
+	template<class PassAndResources>
+	uint64_t HashIncrementalResolverDeclaration(const PassAndResources& passAndResources)
+	{
+		std::vector<uint64_t> entries;
+		entries.reserve(passAndResources.declarationCache.resolverIndependentRequirements.size() +
+			passAndResources.resources.internalTransitions.size() + passAndResources.resolverSnapshots.size());
+		for (const auto& requirement : passAndResources.declarationCache.resolverIndependentRequirements) {
+			uint64_t entry = 0x7265717569726501ull;
+			entry = HashCombine64(entry, requirement.resourceHandleAndRange.resource.GetGlobalResourceID());
+			entry = HashRangeForDeclaration(entry, requirement.resourceHandleAndRange.range);
+			entry = HashStateForDeclaration(entry, requirement.state);
+			entries.push_back(entry);
+		}
+		for (const auto& transition : passAndResources.resources.internalTransitions) {
+			uint64_t entry = 0x7472616e73697401ull;
+			entry = HashCombine64(entry, transition.first.resource.GetGlobalResourceID());
+			entry = HashRangeForDeclaration(entry, transition.first.range);
+			entry = HashStateForDeclaration(entry, transition.second);
+			entries.push_back(entry);
+		}
+		for (size_t slot = 0; slot < passAndResources.resolverSnapshots.size(); ++slot) {
+			const auto& snapshot = passAndResources.resolverSnapshots[slot];
+			uint64_t entry = HashCombine64(0x7265736f6c766501ull, slot);
+			entry = HashCombine64(entry, snapshot.resourceSetIdentity.low);
+			entry = HashCombine64(entry, snapshot.resourceSetIdentity.high);
+			const size_t resourceCount = snapshot.requirementBlock && snapshot.requirementBlock->resourceOwnership
+				? snapshot.requirementBlock->resourceOwnership->size() : snapshot.resourceIDs.size();
+			entry = HashCombine64(entry, resourceCount);
+			for (const auto& requirementTemplate : snapshot.requirementTemplates) {
+				entry = HashRangeForDeclaration(entry, requirementTemplate.range);
+				entry = HashStateForDeclaration(entry, requirementTemplate.state);
+			}
+			entries.push_back(entry);
+		}
+		std::sort(entries.begin(), entries.end());
+		uint64_t hash = HashCombine64(0xd1ec1a6a710f0002ull, entries.size());
+		for (const auto entry : entries) hash = HashCombine64(hash, entry);
+		return hash;
+	}
+
+	template<class PassAndResources>
 	void UpdateRetainedDeclarationCacheImpl(
 		const ResourceRegistry& registry,
 		RenderGraph::PassType type,
@@ -295,7 +384,11 @@ namespace {
 		declarationCache.staleHandleValidationStaticRequirementAnonymousEntries = std::move(handleValidation.staticRequirementAnonymousEntries);
 		declarationCache.staleHandleValidationInternalTransitionAnonymousEntries = std::move(handleValidation.internalTransitionAnonymousEntries);
 		declarationCache.resolverSnapshotHash = HashResolverSnapshots(passAndResources.resolverSnapshots);
-		declarationCache.declarationFingerprint = HashPassDeclaration(passAndResources.resources, passAndResources.resolverSnapshots);
+		PrepareIncrementalResolverPatchRecipe(passAndResources);
+		declarationCache.declarationFingerprint = declarationCache.incrementalResolverPatchable
+			? HashIncrementalResolverDeclaration(passAndResources)
+			: HashPassDeclaration(passAndResources.resources, passAndResources.resolverSnapshots);
+		declarationCache.synchronizationFingerprint = HashPassSynchronization(passAndResources.resources);
 		++declarationCache.declarationGeneration;
 		const bool fullyStaticDeclaration = declarationCache.dynamicInterface == nullptr
 			&& passAndResources.resolverSnapshots.empty()
@@ -304,7 +397,9 @@ namespace {
 			? BuildStaticPassAccessCacheKey(type, name, passAndResources)
 			: 0;
 		declarationCache.retainedAccessCacheKey = passAndResources.resources.frameResourceRequirements.empty()
-			? BuildRetainedPassAccessCacheKey(registry, type, name, passAndResources)
+			? (declarationCache.incrementalResolverPatchable
+				? HashCombine64(BuildStaticPassAccessCacheKey(type, name, passAndResources), declarationCache.declarationFingerprint)
+				: BuildRetainedPassAccessCacheKey(registry, type, name, passAndResources))
 			: 0;
 	}
 
@@ -501,16 +596,99 @@ namespace {
 	}
 }
 
+template<class PassAndResources>
+void FinalizeResolverRequirementSegments(RenderGraph& graph, const ResourceRegistry& registry, PassAndResources& passAndResources) {
+	auto& cache = passAndResources.declarationCache;
+	if (!cache.incrementalResolverPatchable || !passAndResources.resources.resolverRequirementBlocks.empty()) return;
+	std::vector<std::shared_ptr<const ResolverRequirementBlock>> blocks;
+	blocks.reserve(passAndResources.resolverSnapshots.size());
+	for (auto& snapshot : passAndResources.resolverSnapshots) {
+		const auto state = snapshot.resolver->CaptureDeclarationState();
+		if (!state || state->resourceSetIdentity != snapshot.resourceSetIdentity) return;
+		snapshot.requirementBlock = graph.RequestResolverRequirementBlock(*state, snapshot.requirementTemplates);
+		blocks.push_back(snapshot.requirementBlock);
+		snapshot.resourceIDs.clear();
+		snapshot.resourceIDs.shrink_to_fit();
+	}
+	passAndResources.resources.staticResourceRequirements = cache.resolverIndependentRequirements;
+	passAndResources.resources.resolverRequirementBlocks = std::move(blocks);
+	passAndResources.resources.mergedFrameRequirementsDirty = true;
+	// Resolver blocks own their resources, so their anonymous handles cannot go
+	// stale independently. Keep validation only for fixed requirements.
+	const auto fixedValidation = AnalyzeCachedHandleValidation(registry, passAndResources.resources);
+	cache.containsEphemeralOrAnonymousHandles = fixedValidation.containsEphemeralOrAnonymousHandles;
+	cache.requiresStaleHandleValidation = fixedValidation.requiresStaleHandleValidation;
+	cache.staleHandleValidationStaticRequirementAnonymousEntries = fixedValidation.staticRequirementAnonymousEntries;
+	cache.staleHandleValidationInternalTransitionAnonymousEntries = fixedValidation.internalTransitionAnonymousEntries;
+}
+
 void RenderGraph::UpdateRetainedDeclarationCache(PassType type, std::string_view name, RenderPassAndResources& passAndResources) {
 	UpdateRetainedDeclarationCacheImpl(_registry, type, name, passAndResources);
+	FinalizeResolverRequirementSegments(*this, _registry, passAndResources);
 }
 
 void RenderGraph::UpdateRetainedDeclarationCache(PassType type, std::string_view name, ComputePassAndResources& passAndResources) {
 	UpdateRetainedDeclarationCacheImpl(_registry, type, name, passAndResources);
+	FinalizeResolverRequirementSegments(*this, _registry, passAndResources);
 }
 
 void RenderGraph::UpdateRetainedDeclarationCache(PassType type, std::string_view name, CopyPassAndResources& passAndResources) {
 	UpdateRetainedDeclarationCacheImpl(_registry, type, name, passAndResources);
+	FinalizeResolverRequirementSegments(*this, _registry, passAndResources);
+}
+
+std::shared_ptr<const ResolverRequirementBlock> RenderGraph::RequestResolverRequirementBlock(
+	const ResolverDeclarationState& state,
+	std::span<const ResolverSnapshot::RequirementTemplate> templates)
+{
+	// Blocks held by passes remain alive through their shared_ptrs, so dropping the
+	// lookup table is a cheap, safe bound on publication churn between registry resets.
+	constexpr size_t MaxCachedResolverRequirementBlocks = 4096;
+	if (m_resolverRequirementBlockCache.size() >= MaxCachedResolverRequirementBlocks)
+		m_resolverRequirementBlockCache.clear();
+
+	uint64_t bindingHash = 0xb10cdec1a4a71001ull;
+	for (const auto& requirementTemplate : templates) {
+		bindingHash = HashRangeForDeclaration(bindingHash, requirementTemplate.range);
+		bindingHash = HashStateForDeclaration(bindingHash, requirementTemplate.state);
+	}
+	uint64_t cacheHash = HashCombine64(reinterpret_cast<uintptr_t>(state.dependencyIdentity.get()), state.resourceSetIdentity.low);
+	cacheHash = HashCombine64(cacheHash, state.resourceSetIdentity.high);
+	cacheHash = HashCombine64(cacheHash, bindingHash);
+	cacheHash = HashCombine64(cacheHash, m_resourceRegistryGeneration);
+	const auto [begin, end] = m_resolverRequirementBlockCache.equal_range(cacheHash);
+	for (auto it = begin; it != end; ++it) {
+		const auto& block = it->second;
+		if (block && block->dependencyIdentity.get() == state.dependencyIdentity.get()
+			&& block->resourceSetIdentityLow == state.resourceSetIdentity.low
+			&& block->resourceSetIdentityHigh == state.resourceSetIdentity.high
+			&& block->registryGeneration == m_resourceRegistryGeneration
+			&& block->bindingHash == bindingHash) {
+			++m_resolverRequirementBlockHitsThisFrame;
+			return block;
+		}
+	}
+
+	++m_resolverRequirementBlockMissesThisFrame;
+	auto block = std::make_shared<ResolverRequirementBlock>();
+	block->dependencyIdentity = state.dependencyIdentity;
+	block->resourceSetIdentityLow = state.resourceSetIdentity.low;
+	block->resourceSetIdentityHigh = state.resourceSetIdentity.high;
+	block->registryGeneration = m_resourceRegistryGeneration;
+	block->bindingHash = bindingHash;
+	block->resourceOwnership = state.resources;
+	const auto handles = RequestResolverResourceHandles(state);
+	block->requirements.reserve(handles->size() * templates.size());
+	for (const auto& handle : *handles) {
+		block->membershipHash = HashCombine64(block->membershipHash, handle.resource.GetGlobalResourceID());
+		for (const auto& requirementTemplate : templates) {
+			ResourceRequirement requirement{ ResourceHandleAndRange{ handle.resource, requirementTemplate.range } };
+			requirement.state = requirementTemplate.state;
+			block->requirements.push_back(std::move(requirement));
+		}
+	}
+	m_resolverRequirementBlockCache.emplace(cacheHash, block);
+	return block;
 }
 
 void RenderGraph::RebuildFramePassAccessSummaries() {
@@ -711,11 +889,19 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 					summary.pinnedQueueSlot.reset();
 				}
 
-				PassView view = GetPassView(pass);
-				if (!reuseSummary && summary.requirementSummaries.capacity() < view.reqs.size()) {
-					summary.requirementSummaries.reserve(view.reqs.size());
+				size_t requirementCount = 0;
+				const std::vector<std::pair<ResourceHandleAndRange, ResourceState>>* internalTransitions = nullptr;
+				std::visit([&](const auto& entry) {
+					using Entry = std::decay_t<decltype(entry)>;
+					if constexpr (!std::is_same_v<Entry, std::monostate>) {
+						requirementCount = GetFrameRequirementCount(entry.resources);
+						internalTransitions = &entry.resources.internalTransitions;
+					}
+				}, pass.pass);
+				if (!reuseSummary && summary.requirementSummaries.capacity() < requirementCount) {
+					summary.requirementSummaries.reserve(requirementCount);
 				}
-				const size_t internalTransitionCount = view.internalTransitions ? view.internalTransitions->size() : 0;
+				const size_t internalTransitionCount = internalTransitions ? internalTransitions->size() : 0;
 				if (!reuseSummary && summary.internalTransitionSummaries.capacity() < internalTransitionCount) {
 					summary.internalTransitionSummaries.reserve(internalTransitionCount);
 				}
@@ -765,7 +951,7 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 					continue;
 				}
 
-				for (const auto& req : view.reqs) {
+				auto appendRequirement = [&](const ResourceRequirement& req) {
 					const auto resource = req.resourceHandleAndRange.resource;
 					Resource* resolvedResource = resolveHandleResource(resource);
 					const auto [resourceID, dagResourceIndex] =
@@ -785,10 +971,15 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 						.isUAV = IsUAVState(req.state),
 						.isWrite = isWrite,
 					});
-				}
+				};
+				std::visit([&](const auto& entry) {
+					using Entry = std::decay_t<decltype(entry)>;
+					if constexpr (!std::is_same_v<Entry, std::monostate>)
+						ForEachFrameRequirement(entry.resources, appendRequirement);
+				}, pass.pass);
 
-				if (view.internalTransitions) {
-					for (const auto& transition : *view.internalTransitions) {
+				if (internalTransitions) {
+					for (const auto& transition : *internalTransitions) {
 						const auto resource = transition.first.resource;
 						Resource* resolvedResource = resolveHandleResource(resource);
 						const auto [resourceID, dagResourceIndex] =
@@ -996,10 +1187,6 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 	};
 
 	auto passAccessSummaryCacheable = [&](size_t passIndex, const AnyPassAndResources& pass) {
-		(void)passIndex;
-		(void)pass;
-		return false;
-#if 0
 		if (passIndex < m_framePassIsFrameExtension.size() && m_framePassIsFrameExtension[passIndex] != 0) {
 			return false;
 		}
@@ -1013,10 +1200,15 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 			}
 		}, pass.pass);
 		return cacheable;
-#endif
 	};
 
 	std::vector<PassAccessWorkItem> workItems(m_framePasses.size());
+	// Cached-summary pointers are consumed after the lookup phase. Reserve the
+	// worst-case publication count up front so later insertions cannot rehash
+	// and invalidate them.
+	if (m_framePassAccessSummaryCache.size() > (std::max)(size_t{ 1024 }, m_masterPassList.size() * 16u))
+		m_framePassAccessSummaryCache.clear();
+	m_framePassAccessSummaryCache.reserve(m_framePassAccessSummaryCache.size() + workItems.size());
 	size_t estimatedUsedResourceIDCount = 0;
 	{
 		BT_ZONE_SCOPE("RGPassAccess::BuildKeysAndLoadCacheHits");
@@ -1587,16 +1779,189 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	size_t resolverSnapshotCheckCount = 0;
 	size_t dynamicDeclarationCheckCount = 0;
 	size_t dynamicDeclarationChangedCount = 0;
+	size_t resolverContentOnlyChangeCount = 0;
+	size_t resolverWaitOnlyChangeCount = 0;
+	size_t resolverSetChangeCount = 0;
+	size_t incrementalResolverPatchCount = 0;
+	size_t incrementalResolverPatchFallbackCount = 0;
+	std::unordered_map<const void*, std::shared_ptr<const ResolverDeclarationState>> capturedResolverStates;
+	capturedResolverStates.reserve(64);
+	std::unordered_map<const void*, bool> capturedResolverMembershipUnique;
+	capturedResolverMembershipUnique.reserve(64);
 	auto needsRefresh = [&](auto& p) -> bool {
-		// Check if any stored resolver's content version has changed
+		bool waitsChanged = false;
+		std::vector<std::pair<size_t, std::shared_ptr<const ResolverDeclarationState>>> setChanges;
 		{
+			BT_ZONE_SCOPE("RenderGraph::CompileFrame::RefreshRetainedDeclarations::CheckResolverState");
 			resolverSnapshotCheckCount += p.resolverSnapshots.size();
-			for (const auto& snap : p.resolverSnapshots) {
-				uint64_t cv = snap.resolver->GetContentVersion();
-				if (cv != 0 && cv != snap.version) {
-					return true;
+			for (size_t snapshotIndex = 0; snapshotIndex < p.resolverSnapshots.size(); ++snapshotIndex) {
+				auto& snap = p.resolverSnapshots[snapshotIndex];
+				std::shared_ptr<const ResolverDeclarationState> state;
+				const auto identity = snap.dependencyIdentity.get();
+				if (identity) {
+					auto [it, inserted] = capturedResolverStates.try_emplace(identity);
+					if (inserted) it->second = snap.resolver->CaptureDeclarationState();
+					state = it->second;
+				} else {
+					state = snap.resolver->CaptureDeclarationState();
+				}
+				if (!state || state->resourceSetIdentity != snap.resourceSetIdentity) {
+					++resolverSetChangeCount;
+					setChanges.emplace_back(snapshotIndex, state);
+					continue;
+				}
+				if (state->contentRevision != snap.contentRevision) {
+					++resolverContentOnlyChangeCount;
+					snap.contentRevision = state->contentRevision;
+				}
+				if (state->waitRevision != snap.waitRevision) {
+					++resolverWaitOnlyChangeCount;
+					snap.waitRevision = state->waitRevision;
+					snap.waits = state->waits ? *state->waits : std::vector<ExternalTimelinePoint>{};
+					waitsChanged = true;
 				}
 			}
+		}
+		if (!setChanges.empty()) {
+			BT_ZONE_SCOPE("RenderGraph::CompileFrame::RefreshRetainedDeclarations::ApplyIncrementalResolverPatch");
+			bool patchable = p.declarationCache.incrementalResolverPatchable;
+			const bool singleUnmixedBinding = p.resolverSnapshots.size() == 1
+				&& setChanges.size() == 1
+				&& p.declarationCache.resolverIndependentRequirements.empty();
+			if (singleUnmixedBinding) {
+				const auto& state = setChanges.front().second;
+				const void* identity = state ? state->dependencyIdentity.get() : nullptr;
+				if (!state || !state->resources || !identity) {
+					patchable = false;
+				} else {
+					auto [uniqueIt, inserted] = capturedResolverMembershipUnique.try_emplace(identity, true);
+					if (inserted) {
+						std::unordered_set<uint64_t> ids;
+						ids.reserve(state->resources->size());
+						for (const auto& resource : *state->resources) {
+							if (!resource || !ids.insert(resource->GetGlobalResourceID()).second) {
+								uniqueIt->second = false;
+								break;
+							}
+						}
+					}
+					patchable = patchable && uniqueIt->second;
+				}
+			}
+			std::unordered_set<uint64_t> changedOldIDs;
+			std::unordered_set<uint64_t> occupiedIDs;
+			std::unordered_set<size_t> changedIndices;
+			if (!singleUnmixedBinding) {
+				for (const auto& requirement : p.declarationCache.resolverIndependentRequirements)
+					occupiedIDs.insert(requirement.resourceHandleAndRange.resource.GetGlobalResourceID());
+				for (const auto& [index, state] : setChanges) {
+					changedIndices.insert(index);
+					if (!state || !state->resources || p.resolverSnapshots[index].requirementTemplates.empty()) patchable = false;
+					for (const auto id : p.resolverSnapshots[index].resourceIDs) changedOldIDs.insert(id);
+				}
+				for (size_t i = 0; i < p.resolverSnapshots.size(); ++i) {
+					if (changedIndices.contains(i)) continue;
+					for (const auto id : p.resolverSnapshots[i].resourceIDs)
+						if (!occupiedIDs.insert(id).second) patchable = false;
+				}
+				for (const auto& [index, state] : setChanges) {
+					if (!state || !state->resources) continue;
+					for (const auto& resource : *state->resources) {
+						const auto id = resource ? resource->GetGlobalResourceID() : 0u;
+						if (!resource || !occupiedIDs.insert(id).second) patchable = false;
+					}
+				}
+			}
+
+			if (patchable) {
+				auto& requirements = p.resources.staticResourceRequirements;
+				if (p.resources.resolverRequirementBlocks.size() != p.resolverSnapshots.size()) patchable = false;
+			}
+			if (patchable) {
+				{
+				BT_ZONE_SCOPE("RenderGraph::IncrementalResolverPatch::ReplaceBlocks");
+				for (const auto& [index, state] : setChanges) {
+					auto& snapshot = p.resolverSnapshots[index];
+					snapshot.requirementBlock = RequestResolverRequirementBlock(*state, snapshot.requirementTemplates);
+					p.resources.resolverRequirementBlocks[index] = snapshot.requirementBlock;
+					snapshot.resourceSetIdentity = state->resourceSetIdentity;
+					snapshot.contentRevision = state->contentRevision;
+					snapshot.waitRevision = state->waitRevision;
+					snapshot.waits = state->waits ? *state->waits : std::vector<ExternalTimelinePoint>{};
+					if (!singleUnmixedBinding) {
+						snapshot.resourceIDs.clear();
+						snapshot.resourceIDs.reserve(state->resources->size());
+						for (const auto& resource : *state->resources) snapshot.resourceIDs.push_back(resource->GetGlobalResourceID());
+					}
+				}
+				}
+				p.resources.mergedFrameRequirementsDirty = true;
+				{
+				BT_ZONE_SCOPE("RenderGraph::IncrementalResolverPatch::MergeWaits");
+				auto& patchedWaits = p.resources.externalWaitsBeforeTransitions;
+				patchedWaits = p.explicitExternalWaitsBeforeTransitions;
+				for (const auto& snapshot : p.resolverSnapshots)
+					patchedWaits.insert(patchedWaits.end(), snapshot.waits.begin(), snapshot.waits.end());
+				std::sort(patchedWaits.begin(), patchedWaits.end(), [](const auto& lhs, const auto& rhs) {
+					const auto lh = lhs.timeline.GetHandle(); const auto rh = rhs.timeline.GetHandle();
+					return lh.index != rh.index ? lh.index < rh.index :
+						(lh.generation != rh.generation ? lh.generation < rh.generation : lhs.value < rhs.value);
+				});
+				patchedWaits.erase(std::unique(patchedWaits.begin(), patchedWaits.end(), [](auto& lhs, const auto& rhs) {
+					const auto lh = lhs.timeline.GetHandle(); const auto rh = rhs.timeline.GetHandle();
+					if (lh.index != rh.index || lh.generation != rh.generation) return false;
+					lhs.value = (std::max)(lhs.value, rhs.value);
+					return true;
+				}), patchedWaits.end());
+				}
+				{
+				BT_ZONE_SCOPE("RenderGraph::IncrementalResolverPatch::UpdateFingerprints");
+				p.declarationCache.resolverSnapshotHash = HashResolverSnapshots(p.resolverSnapshots);
+				p.declarationCache.declarationFingerprint = HashIncrementalResolverDeclaration(p);
+				p.declarationCache.synchronizationFingerprint = HashPassSynchronization(p.resources);
+				++p.declarationCache.declarationGeneration;
+				using PassT = std::remove_cvref_t<decltype(p)>;
+				constexpr PassType passType = std::is_same_v<PassT, RenderPassAndResources> ? PassType::Render
+					: (std::is_same_v<PassT, ComputePassAndResources> ? PassType::Compute : PassType::Copy);
+				p.declarationCache.retainedAccessCacheKey = HashCombine64(
+					BuildStaticPassAccessCacheKey(passType, p.name, p), p.declarationCache.declarationFingerprint);
+				}
+				{
+				BT_ZONE_SCOPE("RenderGraph::IncrementalResolverPatch::Setup");
+				p.pass->Setup();
+				}
+				++incrementalResolverPatchCount;
+				return false;
+			}
+			++incrementalResolverPatchFallbackCount;
+			return true;
+		}
+		if (waitsChanged) {
+			BT_ZONE_SCOPE("RenderGraph::CompileFrame::RefreshRetainedDeclarations::ApplyResolverWaits");
+			auto& waits = p.resources.externalWaitsBeforeTransitions;
+			waits = p.explicitExternalWaitsBeforeTransitions;
+			for (const auto& snap : p.resolverSnapshots)
+				waits.insert(waits.end(), snap.waits.begin(), snap.waits.end());
+			std::sort(waits.begin(), waits.end(), [](const auto& lhs, const auto& rhs) {
+				const auto lh = lhs.timeline.GetHandle(); const auto rh = rhs.timeline.GetHandle();
+				return lh.index != rh.index ? lh.index < rh.index :
+					(lh.generation != rh.generation ? lh.generation < rh.generation : lhs.value < rhs.value);
+			});
+			std::vector<ExternalTimelinePoint> normalized;
+			normalized.reserve(waits.size());
+			for (const auto& wait : waits) {
+				const auto handle = wait.timeline.GetHandle();
+				if (!normalized.empty()) {
+					const auto previous = normalized.back().timeline.GetHandle();
+					if (previous.index == handle.index && previous.generation == handle.generation) {
+						normalized.back().value = (std::max)(normalized.back().value, wait.value);
+						continue;
+					}
+				}
+				normalized.push_back(wait);
+			}
+			waits = std::move(normalized);
+			p.declarationCache.synchronizationFingerprint = HashPassSynchronization(p.resources);
 		}
 
 		if (p.declarationCache.requiresStaleHandleValidation) {
@@ -1755,6 +2120,10 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	size_t copyRefreshCount = 0;
 	size_t changedRefreshCount = 0;
 	size_t equivalentRefreshCount = 0;
+	m_resolverHandleCacheHitsThisFrame = 0;
+	m_resolverHandleCacheMissesThisFrame = 0;
+	m_resolverRequirementBlockHitsThisFrame = 0;
+	m_resolverRequirementBlockMissesThisFrame = 0;
 	{
 		traceCompileStep("RefreshRetainedDeclarationChecks");
 		BT_ZONE_SCOPE("RenderGraph::CompileFrame::RefreshRetainedDeclarations::CheckCandidates");
@@ -1790,8 +2159,17 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		BT_PLOT("ORG.RefreshRetained.CandidatesChecked", static_cast<int64_t>(refreshCandidateCount));
 		BT_PLOT("ORG.RefreshRetained.RefreshNeeded", static_cast<int64_t>(refreshNeededCount));
 		BT_PLOT("ORG.RefreshRetained.ResolverSnapshots", static_cast<int64_t>(resolverSnapshotCheckCount));
+		BT_PLOT("ORG.RefreshRetained.DependencyCaptures", static_cast<int64_t>(capturedResolverStates.size()));
+		BT_PLOT("ORG.RefreshRetained.CoalescedCaptures", static_cast<int64_t>(
+			resolverSnapshotCheckCount >= capturedResolverStates.size()
+				? resolverSnapshotCheckCount - capturedResolverStates.size() : 0));
 		BT_PLOT("ORG.RefreshRetained.DynamicDeclarationChecks", static_cast<int64_t>(dynamicDeclarationCheckCount));
 		BT_PLOT("ORG.RefreshRetained.DynamicDeclaredResourcesChanged", static_cast<int64_t>(dynamicDeclarationChangedCount));
+		BT_PLOT("ORG.RefreshRetained.ResolverContentOnlyChanges", static_cast<int64_t>(resolverContentOnlyChangeCount));
+		BT_PLOT("ORG.RefreshRetained.ResolverWaitOnlyChanges", static_cast<int64_t>(resolverWaitOnlyChangeCount));
+		BT_PLOT("ORG.RefreshRetained.ResolverSetChanges", static_cast<int64_t>(resolverSetChangeCount));
+		BT_PLOT("ORG.RefreshRetained.IncrementalResolverPatches", static_cast<int64_t>(incrementalResolverPatchCount));
+		BT_PLOT("ORG.RefreshRetained.IncrementalResolverPatchFallbacks", static_cast<int64_t>(incrementalResolverPatchFallbackCount));
 	}
 	{
 		traceCompileStep("RefreshRetainedDeclarationApply");
@@ -1864,6 +2242,10 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		BT_PLOT("ORG.RefreshRetained.RefreshCopy", static_cast<int64_t>(copyRefreshCount));
 		BT_PLOT("ORG.RefreshRetained.RefreshChanged", static_cast<int64_t>(changedRefreshCount));
 		BT_PLOT("ORG.RefreshRetained.RefreshEquivalent", static_cast<int64_t>(equivalentRefreshCount));
+		BT_PLOT("ORG.RefreshRetained.ResolverHandleCacheHits", static_cast<int64_t>(m_resolverHandleCacheHitsThisFrame));
+		BT_PLOT("ORG.RefreshRetained.ResolverHandleCacheMisses", static_cast<int64_t>(m_resolverHandleCacheMissesThisFrame));
+		BT_PLOT("ORG.RefreshRetained.ResourceBlockHits", static_cast<int64_t>(m_resolverRequirementBlockHitsThisFrame));
+		BT_PLOT("ORG.RefreshRetained.ResourceBlockMisses", static_cast<int64_t>(m_resolverRequirementBlockMissesThisFrame));
 	}
 	{
 		traceCompileStep("RefreshRetainedDeclarationPrune");

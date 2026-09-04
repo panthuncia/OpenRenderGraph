@@ -276,14 +276,12 @@ inline std::vector<ResourceHandleAndRange>
 processResourceArguments(const ResourceResolverAndRange& rrr,
     RenderGraph* graph)
 {
-    std::vector<ResourceHandleAndRange> out;
     auto resources = rrr.pResolver->Resolve();
-    for (auto const& res : resources) {
-        const auto rar = ResourcePtrAndRange(res, rrr.range);
-        auto vec = processResourceArguments(rar, graph);
-        out.insert(out.end(),
-            std::make_move_iterator(vec.begin()),
-            std::make_move_iterator(vec.end()));
+    std::vector<ResourceHandleAndRange> out;
+    out.reserve(resources.size());
+    for (const auto& resource : resources) {
+        out.push_back(ResourceHandleAndRange{
+            graph->RequestResourceHandle(resource.get()), rrr.range });
     }
     return out;
 }
@@ -315,10 +313,10 @@ processResourceArguments(const ResourceIdentifierAndRange& rir,
             graph->RegisterResolvedResourceAlias(rir.identifier, resources.front());
         }
         std::vector<ResourceHandleAndRange> resolvedRanges;
+        resolvedRanges.reserve(resources.size());
         for (const auto& resource : resources) {
-            auto ranges = processResourceArguments(ResourcePtrAndRange(resource, rir.range), graph);
-            resolvedRanges.insert(resolvedRanges.end(),
-                std::make_move_iterator(ranges.begin()), std::make_move_iterator(ranges.end()));
+            resolvedRanges.push_back(ResourceHandleAndRange{
+                graph->RequestResourceHandle(resource.get()), rir.range });
         }
         return resolvedRanges;
     }
@@ -369,8 +367,9 @@ processResourceArguments(T&& list, RenderGraph* graph)
 
 namespace detail {
     template<typename U>
-    inline void extractId(std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher>& out, std::shared_ptr<U> const& resource) {
-        out.insert(std::to_string(resource->GetGlobalResourceID()));
+    inline void extractId(std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher>&, std::shared_ptr<U> const&) {
+        // Concrete resources are authorized by their handles. identifierSet is
+        // reserved for symbolic names and namespaces used through a pass view.
     }
     inline void extractId(auto& out, const ResourcePtrAndRange& rar) {
 		extractId(out, rar.resource); // empty identifier
@@ -384,8 +383,7 @@ namespace detail {
     inline void extractId(auto& out, char* br) {
         out.insert(ResourceIdentifier{ br });
     }
-    inline void extractId(auto& out, const ResourceHandleAndRange& rar) {
-        out.insert(std::to_string(rar.resource.GetGlobalResourceID()));
+    inline void extractId(auto&, const ResourceHandleAndRange&) {
     }
 
     template<typename T>
@@ -605,6 +603,26 @@ namespace detail
     template<class...>
     inline constexpr bool dependent_false_v = false;
 
+    inline void TrackResolverSnapshot(std::vector<ResolverSnapshot>& snapshots,
+        const IResourceResolver& resolver, const ResolverDeclarationState& state) {
+        const auto identity = state.dependencyIdentity.get();
+        // A retained dependency must have an owned semantic identity.  Treat a
+        // missing identity as untracked even if a resolver accidentally marks
+        // the state tracked; address-less dependencies cannot be refreshed or
+        // deduplicated safely.
+        if (!state.tracked || !identity) return;
+        if (std::ranges::any_of(snapshots, [identity](const auto& snapshot) {
+            return snapshot.dependencyIdentity.get() == identity;
+        })) return;
+        snapshots.emplace_back(resolver.Clone(), state);
+        if (state.resources) {
+            auto& snapshot = snapshots.back();
+            snapshot.resourceIDs.reserve(state.resources->size());
+            for (const auto& resource : *state.resources)
+                snapshot.resourceIDs.push_back(resource ? resource->GetGlobalResourceID() : 0u);
+        }
+    }
+
     template<typename T>
     inline void MaybeTrackResolverSnapshot(RenderGraph*, std::vector<ResolverSnapshot>&, const T&) {
     }
@@ -614,10 +632,8 @@ namespace detail
             return;
         }
         if (auto resolver = graph->RequestResolver(id, true)) {
-            const uint64_t version = resolver->GetContentVersion();
-            if (version != 0) {
-                resolverSnapshots.emplace_back(resolver->Clone(), version);
-            }
+            const auto state = resolver->CaptureDeclarationState();
+            if (state) TrackResolverSnapshot(resolverSnapshots, *resolver, *state);
         }
     }
 
@@ -655,8 +671,14 @@ namespace detail
 
     template<typename IdSet, typename DestVec, typename Range>
     inline void AppendTrackedResourceRange(RenderGraph* graph, IdSet& ids, DestVec& dest, Range&& values) {
-        for (auto&& value : values) {
-            AppendTrackedResource(graph, ids, dest, std::forward<decltype(value)>(value));
+		if constexpr (std::is_same_v<std::remove_cv_t<std::ranges::range_value_t<Range>>, ResourceHandleAndRange>) {
+			if constexpr (requires { values.size(); }) dest.reserve(dest.size() + values.size());
+			for (const auto& value : values) dest.push_back(value);
+		}
+		else {
+			for (auto&& value : values) {
+				AppendTrackedResource(graph, ids, dest, std::forward<decltype(value)>(value));
+			}
         }
     }
 
@@ -672,8 +694,11 @@ namespace detail
     template<typename SyncFunction, typename... Sources>
     inline std::vector<ResourceRequirement> BuildRequirements(SyncFunction&& syncFunction, Sources&&... sources) {
         std::vector<std::pair<ResourceHandleAndRange, rhi::ResourceAccessType>> entries;
-        entries.reserve((std::get<0>(sources).get().size() + ... + 0ull));
+        const size_t sourceEntryCount = (std::get<0>(sources).get().size() + ... + 0ull);
+        entries.reserve(sourceEntryCount);
 		bool canUseUniqueResourceFastPath = true;
+		constexpr size_t linearUniqueCheckLimit = 16;
+		std::unordered_set<uint64_t> uniqueResourceIDs;
 
         auto append = [&](auto&& src) {
             auto const& list = std::get<0>(src).get();
@@ -684,11 +709,22 @@ namespace detail
 				}
 				else if (canUseUniqueResourceFastPath) {
 					const uint64_t resourceID = rr.resource.GetGlobalResourceID();
-					canUseUniqueResourceFastPath = std::none_of(
-						entries.begin(), entries.end(),
-						[resourceID](const auto& entry) {
-							return entry.first.resource.GetGlobalResourceID() == resourceID;
-						});
+					if (entries.size() < linearUniqueCheckLimit) {
+						canUseUniqueResourceFastPath = std::none_of(
+							entries.begin(), entries.end(),
+							[resourceID](const auto& entry) {
+								return entry.first.resource.GetGlobalResourceID() == resourceID;
+							});
+					}
+					else {
+						if (uniqueResourceIDs.empty()) {
+							uniqueResourceIDs.reserve(sourceEntryCount);
+							for (const auto& entry : entries) {
+								uniqueResourceIDs.insert(entry.first.resource.GetGlobalResourceID());
+							}
+						}
+						canUseUniqueResourceFastPath = uniqueResourceIDs.insert(resourceID).second;
+					}
 				}
                 entries.emplace_back(rr, access);
             }
@@ -1056,31 +1092,29 @@ public:
 
     template<typename AddCallable>
     RenderPassBuilder& WithResolver(const IResourceResolver& resolver, AddCallable&& addCallable) & {
-        auto resources = resolver.Resolve();
-        for (auto& resource : resources) {
-            graph->AddResource(resource);
+        const auto state = resolver.CaptureDeclarationState();
+        if (state && state->resources) {
+            addCallable(*graph->RequestResolverResourceHandles(*state));
+        } else {
+            const auto resources = resolver.Resolve();
+            for (const auto& resource : resources) graph->AddResource(resource);
+            addCallable(resources);
         }
-        addCallable(resources);
-        auto waits = resolver.GetExternalTimelineWaits();
-        params.externalWaitsBeforeTransitions.insert(params.externalWaitsBeforeTransitions.end(),
-            waits.begin(), waits.end());
-        auto v = resolver.GetContentVersion();
-        if (v != 0) resolverSnapshots_.push_back({ resolver.Clone(), v });
+        if (state) detail::TrackResolverSnapshot(resolverSnapshots_, resolver, *state);
         return *this;
     }
 
     template<typename AddCallable>
     RenderPassBuilder WithResolver(const IResourceResolver& resolver, AddCallable&& addCallable) && {
-        auto resources = resolver.Resolve();
-        for (auto& resource : resources) {
-            graph->AddResource(resource);
+        const auto state = resolver.CaptureDeclarationState();
+        if (state && state->resources) {
+            addCallable(*graph->RequestResolverResourceHandles(*state));
+        } else {
+            const auto resources = resolver.Resolve();
+            for (const auto& resource : resources) graph->AddResource(resource);
+            addCallable(resources);
         }
-        addCallable(resources);
-        auto waits = resolver.GetExternalTimelineWaits();
-        params.externalWaitsBeforeTransitions.insert(params.externalWaitsBeforeTransitions.end(),
-            waits.begin(), waits.end());
-        auto v = resolver.GetContentVersion();
-        if (v != 0) resolverSnapshots_.push_back({ resolver.Clone(), v });
+        if (state) detail::TrackResolverSnapshot(resolverSnapshots_, resolver, *state);
         return std::move(*this);
     }
 
@@ -1831,31 +1865,29 @@ public:
 
     template<typename AddCallable>
     ComputePassBuilder& WithResolver(const IResourceResolver& resolver, AddCallable&& addCallable) & {
-        auto resources = resolver.Resolve();
-        for (auto& resource : resources) {
-            graph->AddResource(resource);
+        const auto state = resolver.CaptureDeclarationState();
+        if (state && state->resources) {
+            addCallable(*graph->RequestResolverResourceHandles(*state));
+        } else {
+            const auto resources = resolver.Resolve();
+            for (const auto& resource : resources) graph->AddResource(resource);
+            addCallable(resources);
         }
-        addCallable(resources);
-        auto waits = resolver.GetExternalTimelineWaits();
-        params.externalWaitsBeforeTransitions.insert(params.externalWaitsBeforeTransitions.end(),
-            waits.begin(), waits.end());
-        auto v = resolver.GetContentVersion();
-        if (v != 0) resolverSnapshots_.push_back({ resolver.Clone(), v });
+        if (state) detail::TrackResolverSnapshot(resolverSnapshots_, resolver, *state);
         return *this;
     }
 
     template<typename AddCallable>
     ComputePassBuilder WithResolver(const IResourceResolver& resolver, AddCallable&& addCallable) && {
-        auto resources = resolver.Resolve();
-        for (auto& resource : resources) {
-            graph->AddResource(resource);
+        const auto state = resolver.CaptureDeclarationState();
+        if (state && state->resources) {
+            addCallable(*graph->RequestResolverResourceHandles(*state));
+        } else {
+            const auto resources = resolver.Resolve();
+            for (const auto& resource : resources) graph->AddResource(resource);
+            addCallable(resources);
         }
-        addCallable(resources);
-        auto waits = resolver.GetExternalTimelineWaits();
-        params.externalWaitsBeforeTransitions.insert(params.externalWaitsBeforeTransitions.end(),
-            waits.begin(), waits.end());
-        auto v = resolver.GetContentVersion();
-        if (v != 0) resolverSnapshots_.push_back({ resolver.Clone(), v });
+        if (state) detail::TrackResolverSnapshot(resolverSnapshots_, resolver, *state);
         return std::move(*this);
     }
 
@@ -2303,31 +2335,29 @@ public:
 
     template<typename AddCallable>
     CopyPassBuilder& WithResolver(const IResourceResolver& resolver, AddCallable&& addCallable) & {
-        auto resources = resolver.Resolve();
-        for (auto& resource : resources) {
-            graph->AddResource(resource);
+        const auto state = resolver.CaptureDeclarationState();
+        if (state && state->resources) {
+            addCallable(*graph->RequestResolverResourceHandles(*state));
+        } else {
+            const auto resources = resolver.Resolve();
+            for (const auto& resource : resources) graph->AddResource(resource);
+            addCallable(resources);
         }
-        addCallable(resources);
-        auto waits = resolver.GetExternalTimelineWaits();
-        params.externalWaitsBeforeTransitions.insert(params.externalWaitsBeforeTransitions.end(),
-            waits.begin(), waits.end());
-        auto v = resolver.GetContentVersion();
-        if (v != 0) resolverSnapshots_.push_back({ resolver.Clone(), v });
+        if (state) detail::TrackResolverSnapshot(resolverSnapshots_, resolver, *state);
         return *this;
     }
 
     template<typename AddCallable>
     CopyPassBuilder WithResolver(const IResourceResolver& resolver, AddCallable&& addCallable) && {
-        auto resources = resolver.Resolve();
-        for (auto& resource : resources) {
-            graph->AddResource(resource);
+        const auto state = resolver.CaptureDeclarationState();
+        if (state && state->resources) {
+            addCallable(*graph->RequestResolverResourceHandles(*state));
+        } else {
+            const auto resources = resolver.Resolve();
+            for (const auto& resource : resources) graph->AddResource(resource);
+            addCallable(resources);
         }
-        addCallable(resources);
-        auto waits = resolver.GetExternalTimelineWaits();
-        params.externalWaitsBeforeTransitions.insert(params.externalWaitsBeforeTransitions.end(),
-            waits.begin(), waits.end());
-        auto v = resolver.GetContentVersion();
-        if (v != 0) resolverSnapshots_.push_back({ resolver.Clone(), v });
+        if (state) detail::TrackResolverSnapshot(resolverSnapshots_, resolver, *state);
         return std::move(*this);
     }
 

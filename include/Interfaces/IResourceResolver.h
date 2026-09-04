@@ -2,6 +2,7 @@
 
 #include <vector>
 #include <memory>
+#include <cstdint>
 
 #include "Resources/ResourceStateTracker.h"
 #include "Resources/ResourceIdentifier.h"
@@ -10,22 +11,31 @@
 
 namespace org {
 
+struct ResolverRequirementBlock;
+
+using ResolverResourceList = std::vector<std::shared_ptr<Resource>>;
+
+struct ResolverResourceSetIdentity {
+    uint64_t low = 0;
+    uint64_t high = 0;
+    auto operator<=>(const ResolverResourceSetIdentity&) const = default;
+};
+
+struct ResolverDeclarationState {
+    std::shared_ptr<const void> dependencyIdentity;
+    ResolverResourceSetIdentity resourceSetIdentity{};
+    uint64_t contentRevision = 0;
+    uint64_t waitRevision = 0;
+    std::shared_ptr<const ResolverResourceList> resources;
+    std::shared_ptr<const std::vector<ExternalTimelinePoint>> waits;
+    bool tracked = false;
+};
+
 class IResourceResolver {
 	public:
 	virtual ~IResourceResolver() = default;
 	virtual std::vector<std::shared_ptr<Resource>> Resolve() const = 0;
-
-    /// Returns a monotonically-increasing version that changes whenever the
-    /// resolved set changes.  A return value of 0 means "no version tracking —
-    /// the caller must not assume the set is stable between frames."
-    /// Resolvers backed by a versioned container (e.g. ResourceGroup) should
-    /// override this so that the render graph can detect changes automatically.
-    virtual uint64_t GetContentVersion() const { return 0; }
-
-    // Queue submissions that must complete before any resolved resource is
-    // transitioned or consumed. Versioned resolvers should include these in
-    // GetContentVersion() so retained declarations refresh with the wait set.
-    virtual std::vector<ExternalTimelinePoint> GetExternalTimelineWaits() const { return {}; }
+    virtual std::shared_ptr<const ResolverDeclarationState> CaptureDeclarationState() const = 0;
 
     template<typename T>
     std::vector<std::shared_ptr<T>> ResolveAs(bool require_all_casts = true) const {
@@ -68,28 +78,52 @@ struct ResourceResolverAndRange {
     RangeSpec range;
 };
 
-/// Snapshot of a resolver taken during DeclareResourceUsages.
-/// The render graph stores these alongside each pass so it can detect
-/// when a versioned resolver's content changes between frames and
-/// automatically trigger re-declaration.
+/// Snapshot of a resolver taken during DeclareResourceUsages. Resource-set
+/// identity drives retained re-declaration; content and wait revisions are
+/// tracked independently so they cannot invalidate the structural declaration.
 struct ResolverSnapshot {
     std::unique_ptr<IResourceResolver> resolver;
-    uint64_t version = 0;
+    std::shared_ptr<const void> dependencyIdentity;
+    ResolverResourceSetIdentity resourceSetIdentity{};
+    uint64_t contentRevision = 0;
+    uint64_t waitRevision = 0;
+    std::vector<ExternalTimelinePoint> waits;
+    std::vector<uint64_t> resourceIDs;
+    struct RequirementTemplate {
+        RangeSpec range{};
+        ResourceState state{};
+    };
+    std::vector<RequirementTemplate> requirementTemplates;
+    std::shared_ptr<const ResolverRequirementBlock> requirementBlock;
 
     ResolverSnapshot() = default;
-    ResolverSnapshot(std::unique_ptr<IResourceResolver> r, uint64_t v)
-        : resolver(std::move(r)), version(v) {}
+    ResolverSnapshot(std::unique_ptr<IResourceResolver> r, const ResolverDeclarationState& state)
+        : resolver(std::move(r)), dependencyIdentity(state.dependencyIdentity)
+        , resourceSetIdentity(state.resourceSetIdentity)
+        , contentRevision(state.contentRevision), waitRevision(state.waitRevision)
+        , waits(state.waits ? *state.waits : std::vector<ExternalTimelinePoint>{}) {}
     ResolverSnapshot(ResolverSnapshot&&) = default;
     ResolverSnapshot& operator=(ResolverSnapshot&&) = default;
 
     // Deep-copy via Clone() so that PassAndResources structs remain copyable.
     ResolverSnapshot(const ResolverSnapshot& other)
         : resolver(other.resolver ? other.resolver->Clone() : nullptr)
-        , version(other.version) {}
+        , dependencyIdentity(other.dependencyIdentity)
+        , resourceSetIdentity(other.resourceSetIdentity)
+        , contentRevision(other.contentRevision), waitRevision(other.waitRevision)
+        , waits(other.waits), resourceIDs(other.resourceIDs)
+        , requirementTemplates(other.requirementTemplates), requirementBlock(other.requirementBlock) {}
     ResolverSnapshot& operator=(const ResolverSnapshot& other) {
         if (this != &other) {
             resolver = other.resolver ? other.resolver->Clone() : nullptr;
-            version = other.version;
+            dependencyIdentity = other.dependencyIdentity;
+            resourceSetIdentity = other.resourceSetIdentity;
+            contentRevision = other.contentRevision;
+            waitRevision = other.waitRevision;
+            waits = other.waits;
+            resourceIDs = other.resourceIDs;
+            requirementTemplates = other.requirementTemplates;
+            requirementBlock = other.requirementBlock;
         }
         return *this;
     }

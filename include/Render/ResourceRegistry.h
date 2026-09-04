@@ -9,9 +9,11 @@
 #include <stdexcept>
 #include <algorithm>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
+#include <charconv>
 #include <spdlog/spdlog.h>
 
 #include "Render/PassInputs.h"
@@ -497,8 +499,14 @@ private:
 class ResourceRegistryView {
     ResourceRegistry& _global;
     std::vector<ResourceIdentifier>  _allowedPrefixes;
+	std::unordered_set<uint64_t> _allowedConcreteResourceIDs;
+	std::vector<std::function<bool(uint64_t)>> _allowedConcretePredicates;
     uint64_t epoch = 0; // guard
 public:
+	void AllowConcreteResourceID(uint64_t id) { _allowedConcreteResourceIDs.insert(id); }
+	void AllowConcretePredicate(std::function<bool(uint64_t)> predicate) {
+		_allowedConcretePredicates.push_back(std::move(predicate));
+	}
     // allowed may contain BOTH leaf-ids *and* namespace-prefix ids
     template<class Iterable>
     ResourceRegistryView(ResourceRegistry& R, Iterable const& allowed)
@@ -514,7 +522,11 @@ public:
 
 	// Move constructor
     ResourceRegistryView(ResourceRegistryView&& other) noexcept
-        : _global(other._global), _allowedPrefixes(std::move(other._allowedPrefixes)) {
+        : _global(other._global),
+          _allowedPrefixes(std::move(other._allowedPrefixes)),
+          _allowedConcreteResourceIDs(std::move(other._allowedConcreteResourceIDs)),
+          _allowedConcretePredicates(std::move(other._allowedConcretePredicates)),
+          epoch(other.epoch) {
 	}
 
     template<class T>
@@ -536,6 +548,17 @@ public:
         for (auto const& prefix : _allowedPrefixes) {
             if (id == prefix || id.hasPrefix(prefix)) { ok = true; break; }
         }
+		if (!ok) {
+			const std::string text = id.ToString();
+			uint64_t concreteID = 0;
+			const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), concreteID);
+			ok = error == std::errc{} && end == text.data() + text.size()
+				&& _allowedConcreteResourceIDs.contains(concreteID);
+			if (!ok && error == std::errc{} && end == text.data() + text.size()) {
+				for (const auto& predicate : _allowedConcretePredicates)
+					if (predicate && predicate(concreteID)) { ok = true; break; }
+			}
+		}
         if (!ok) {
             throw std::runtime_error(
                 "Access denied to \"" + id.ToString() + "\" (not declared)");

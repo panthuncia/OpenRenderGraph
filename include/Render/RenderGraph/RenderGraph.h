@@ -309,8 +309,11 @@ public:
 		uint64_t resolverSnapshotHash = 0;
 		uint64_t declarationGeneration = 0;
 		uint64_t declarationFingerprint = 0;
+		uint64_t synchronizationFingerprint = 0;
 		uint64_t staticAccessCacheKey = 0;
 		uint64_t retainedAccessCacheKey = 0;
+		bool incrementalResolverPatchable = false;
+		std::vector<ResourceRequirement> resolverIndependentRequirements;
 	};
 
 	struct ExternalOwnershipBarrier {
@@ -335,6 +338,7 @@ public:
 		std::shared_ptr<org::imm::KeepAliveBag> immediateKeepAlive = nullptr; // Keeps alive resources used by immediate execution bytecode
 		std::vector<std::shared_ptr<Resource>> retainedAnonymousKeepAlive; // Keeps retained anonymous handles alive across frames
 		std::vector<ResolverSnapshot> resolverSnapshots; // Versioned resolver snapshots for auto-invalidation
+		std::vector<ExternalTimelinePoint> explicitExternalWaitsBeforeTransitions;
 		RetainedDeclarationCache declarationCache;
 		std::vector<ResourceTransition> backendPreTransitions;
 		std::vector<ResourceTransition> backendPostTransitions;
@@ -355,6 +359,7 @@ public:
 		std::shared_ptr<org::imm::KeepAliveBag> immediateKeepAlive = nullptr; // Keeps alive resources used by immediate execution bytecode
 		std::vector<std::shared_ptr<Resource>> retainedAnonymousKeepAlive; // Keeps retained anonymous handles alive across frames
 		std::vector<ResolverSnapshot> resolverSnapshots; // Versioned resolver snapshots for auto-invalidation
+		std::vector<ExternalTimelinePoint> explicitExternalWaitsBeforeTransitions;
 		RetainedDeclarationCache declarationCache;
 		std::vector<ResourceTransition> backendPreTransitions;
 		std::vector<ResourceTransition> backendPostTransitions;
@@ -375,6 +380,7 @@ public:
 		std::shared_ptr<org::imm::KeepAliveBag> immediateKeepAlive = nullptr;
 		std::vector<std::shared_ptr<Resource>> retainedAnonymousKeepAlive; // Keeps retained anonymous handles alive across frames
 		std::vector<ResolverSnapshot> resolverSnapshots; // Versioned resolver snapshots for auto-invalidation
+		std::vector<ExternalTimelinePoint> explicitExternalWaitsBeforeTransitions;
 		RetainedDeclarationCache declarationCache;
 		std::vector<ResourceTransition> backendPreTransitions;
 		std::vector<ResourceTransition> backendPostTransitions;
@@ -772,6 +778,11 @@ public:
 	std::shared_ptr<Resource> RequestResourcePtr(ResourceIdentifier const& rid, bool allowFailure = false);
 	ResourceRegistry::RegistryHandle RequestResourceHandle(ResourceIdentifier const& rid, bool allowFailure = false);
 	ResourceRegistry::RegistryHandle RequestResourceHandle(Resource* const& pResource, bool allowFailure = false);
+	// Intern the concrete resources from one coherent resolver snapshot once per
+	// resource set.  Retained passes commonly share the same resolver and would
+	// otherwise repeat thousands of registry lookups during a loading frame.
+	std::shared_ptr<const std::vector<ResourceHandleAndRange>>
+		RequestResolverResourceHandles(const ResolverDeclarationState& state);
 
 	//void RegisterECSRenderPhaseEntities(const std::unordered_map<RenderPhase, flecs::entity, RenderPhase::Hasher>& phaseEntities);
 
@@ -1249,6 +1260,19 @@ private:
 
 	std::vector<IResourceProvider*> _providers;
 	ResourceRegistry _registry;
+	struct ResolverHandleCacheEntry {
+		std::shared_ptr<const void> dependencyIdentity;
+		ResolverResourceSetIdentity resourceSetIdentity{};
+		uint64_t registryGeneration = 0;
+		std::shared_ptr<const std::vector<ResourceHandleAndRange>> handles;
+	};
+	std::unordered_map<const void*, ResolverHandleCacheEntry> m_resolverHandleCache;
+	std::unordered_multimap<uint64_t, std::shared_ptr<const ResolverRequirementBlock>> m_resolverRequirementBlockCache;
+	uint64_t m_resourceRegistryGeneration = 1;
+	uint64_t m_resolverHandleCacheHitsThisFrame = 0;
+	uint64_t m_resolverHandleCacheMissesThisFrame = 0;
+	uint64_t m_resolverRequirementBlockHitsThisFrame = 0;
+	uint64_t m_resolverRequirementBlockMissesThisFrame = 0;
 	std::unordered_map<ResourceIdentifier, IResourceProvider*, ResourceIdentifier::Hasher> _providerMap;
 	std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> m_resolvedResourceAliases;
 
@@ -1548,6 +1572,13 @@ private:
 	void UpdateRetainedDeclarationCache(PassType type, std::string_view name, RenderPassAndResources& passAndResources);
 	void UpdateRetainedDeclarationCache(PassType type, std::string_view name, ComputePassAndResources& passAndResources);
 	void UpdateRetainedDeclarationCache(PassType type, std::string_view name, CopyPassAndResources& passAndResources);
+
+public: // Internal builder/compiler bridge; not part of the fluent declaration API.
+	std::shared_ptr<const ResolverRequirementBlock> RequestResolverRequirementBlock(
+		const ResolverDeclarationState& state,
+		std::span<const ResolverSnapshot::RequirementTemplate> templates);
+
+private:
 
 	bool RefreshRetainedDeclarationsForFrame(RenderPassAndResources& p, uint8_t frameIndex);
 	bool RefreshRetainedDeclarationsForFrame(ComputePassAndResources& p, uint8_t frameIndex);

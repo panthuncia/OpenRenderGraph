@@ -48,6 +48,7 @@ struct RenderPassParameters {
 	std::vector<AutoDescriptorRegistration> autoDescriptorUnorderedAccessViews;
 	std::unordered_set<FeatureDomainIdentifier, FeatureDomainIdentifier::Hasher> activeFeatureDomains;
 	std::vector<ResourceRequirement> staticResourceRequirements; // Static resource requirements for the pass
+	std::vector<std::shared_ptr<const ResolverRequirementBlock>> resolverRequirementBlocks;
 	std::vector<ResourceRequirement> frameResourceRequirements; // Immediate-mode requirements recorded for this frame
 	mutable std::vector<ResourceRequirement> mergedFrameResourceRequirements; // Lazily built static + immediate requirements when a contiguous view is needed
 	mutable bool mergedFrameRequirementsDirty = false;

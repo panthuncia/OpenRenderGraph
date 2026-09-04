@@ -30,6 +30,7 @@ struct CopyPassParameters {
 
 	std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> identifierSet;
 	std::vector<ResourceRequirement> staticResourceRequirements;
+	std::vector<std::shared_ptr<const ResolverRequirementBlock>> resolverRequirementBlocks;
 	std::vector<ResourceRequirement> frameResourceRequirements;
 	mutable std::vector<ResourceRequirement> mergedFrameResourceRequirements;
 	mutable bool mergedFrameRequirementsDirty = false;

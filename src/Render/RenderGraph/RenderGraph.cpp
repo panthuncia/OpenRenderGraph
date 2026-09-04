@@ -57,6 +57,55 @@ size_t PassRecordingConcurrency()
 	}();
 	return value;
 }
+
+void MergeResolverWaits(std::vector<ExternalTimelinePoint>& waits,
+    const std::vector<ResolverSnapshot>& snapshots)
+{
+    for (const auto& snapshot : snapshots)
+        waits.insert(waits.end(), snapshot.waits.begin(), snapshot.waits.end());
+    std::sort(waits.begin(), waits.end(), [](const auto& lhs, const auto& rhs) {
+        const auto lh = lhs.timeline.GetHandle(); const auto rh = rhs.timeline.GetHandle();
+        return lh.index != rh.index ? lh.index < rh.index :
+            (lh.generation != rh.generation ? lh.generation < rh.generation : lhs.value < rhs.value);
+    });
+    std::vector<ExternalTimelinePoint> normalized;
+    normalized.reserve(waits.size());
+    for (const auto& wait : waits) {
+        const auto handle = wait.timeline.GetHandle();
+        if (!normalized.empty()) {
+            const auto previous = normalized.back().timeline.GetHandle();
+            if (previous.index == handle.index && previous.generation == handle.generation) {
+                normalized.back().value = (std::max)(normalized.back().value, wait.value);
+                continue;
+            }
+        }
+        normalized.push_back(wait);
+    }
+    waits = std::move(normalized);
+}
+
+template<class PassResourceData>
+std::unique_ptr<ResourceRegistryView> MakePassResourceRegistryView(
+	ResourceRegistry& registry, const PassResourceData& resources)
+{
+	auto view = std::make_unique<ResourceRegistryView>(registry, resources.identifierSet);
+	for (const auto& requirement : resources.staticResourceRequirements) {
+		view->AllowConcreteResourceID(requirement.resourceHandleAndRange.resource.GetGlobalResourceID());
+	}
+	for (const auto& requirement : resources.frameResourceRequirements)
+		view->AllowConcreteResourceID(requirement.resourceHandleAndRange.resource.GetGlobalResourceID());
+	for (const auto& block : resources.resolverRequirementBlocks) {
+		view->AllowConcretePredicate([slot = &block](uint64_t id) {
+			if (!slot || !*slot) return false;
+			return std::ranges::any_of((*slot)->requirements, [id](const auto& requirement) {
+				return requirement.resourceHandleAndRange.resource.GetGlobalResourceID() == id;
+			});
+		});
+	}
+	for (const auto& transition : resources.internalTransitions)
+		view->AllowConcreteResourceID(transition.first.resource.GetGlobalResourceID());
+	return view;
+}
 }
 
 namespace {
@@ -556,7 +605,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 
 		if (callSetup) {
 			par.pass->SetResourceRegistryView(
-				std::make_unique<ResourceRegistryView>(_registry, par.resources.identifierSet),
+				MakePassResourceRegistryView(_registry, par.resources),
 				par.resources.activeFeatureDomains,
 				par.resources.autoDescriptorShaderResources,
 				par.resources.autoDescriptorConstantBuffers,
@@ -631,7 +680,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 
 		if (callSetup) {
 			par.pass->SetResourceRegistryView(
-				std::make_unique<ResourceRegistryView>(_registry, par.resources.identifierSet),
+				MakePassResourceRegistryView(_registry, par.resources),
 				par.resources.activeFeatureDomains,
 				par.resources.autoDescriptorShaderResources,
 				par.resources.autoDescriptorConstantBuffers,
@@ -702,7 +751,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 
 		if (callSetup) {
 			par.pass->SetResourceRegistryView(
-				std::make_unique<ResourceRegistryView>(_registry, par.resources.identifierSet));
+				MakePassResourceRegistryView(_registry, par.resources));
 			if (traceLifecycle) {
 				spdlog::info("RG materialize external copy pass '{}' setup begin", d.name);
 			}
@@ -3815,6 +3864,9 @@ void RenderGraph::ShutdownOwnedState() {
 	_providers.clear();
 	_resolverMap.clear();
 	_registry = ResourceRegistry();
+	++m_resourceRegistryGeneration;
+	m_resolverHandleCache.clear();
+	m_resolverRequirementBlockCache.clear();
 	// Queue shutdown is the final completion point. Release placed resources
 	// before their imported/canonical heap pairs, and before queue/device state.
 	m_retiredInteropGenerations.clear();
@@ -5275,6 +5327,9 @@ void RenderGraph::ResetForRebuild()
 	_providers.clear();
 	_resolverMap.clear();
 	_registry = ResourceRegistry();
+	++m_resourceRegistryGeneration;
+	m_resolverHandleCache.clear();
+	m_resolverRequirementBlockCache.clear();
 
 	// Notify extensions that the registry was replaced
 	for (auto& ext : m_extensions) {
@@ -5855,6 +5910,7 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(RenderPassAndResources& p,
 	{
 		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Render)::StoreRequirements");
 		p.resources.staticResourceRequirements = std::move(refreshedRequirements);
+		p.resources.resolverRequirementBlocks.clear();
 		p.resources.mergedFrameRequirementsDirty = true;
 
 		// Internal transitions also affect scheduling
@@ -5865,6 +5921,7 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(RenderPassAndResources& p,
 		p.resources.autoDescriptorConstantBuffers = std::move(b.params.autoDescriptorConstantBuffers);
 		p.resources.autoDescriptorUnorderedAccessViews = std::move(b.params.autoDescriptorUnorderedAccessViews);
 		p.resources.activeFeatureDomains = std::move(b.params.activeFeatureDomains);
+		p.explicitExternalWaitsBeforeTransitions = b.params.externalWaitsBeforeTransitions;
 		p.resources.externalWaitsBeforeTransitions = std::move(b.params.externalWaitsBeforeTransitions);
 		p.resources.externalWaitBindingsBeforeTransitions = std::move(b.params.externalWaitBindingsBeforeTransitions);
 	}
@@ -5880,6 +5937,7 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(RenderPassAndResources& p,
 	{
 		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Render)::CaptureResolverSnapshots");
 		p.resolverSnapshots = b.TakeResolverSnapshots();
+		MergeResolverWaits(p.resources.externalWaitsBeforeTransitions, p.resolverSnapshots);
 		p.retainedAnonymousKeepAlive = CaptureRetainedAnonymousKeepAlive(
 			p.resources.staticResourceRequirements,
 			p.resources.internalTransitions);
@@ -5902,7 +5960,7 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(RenderPassAndResources& p,
 	if (requiresPassRebind) {
 		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Render)::SetResourceRegistryView");
 		p.pass->SetResourceRegistryView(
-			std::make_unique<ResourceRegistryView>(_registry, p.resources.identifierSet),
+			MakePassResourceRegistryView(_registry, p.resources),
 			p.resources.activeFeatureDomains,
 			p.resources.autoDescriptorShaderResources,
 			p.resources.autoDescriptorConstantBuffers,
@@ -5962,6 +6020,7 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(ComputePassAndResources& p
 	{
 		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Compute)::StoreRequirements");
 		p.resources.staticResourceRequirements = std::move(refreshedRequirements);
+		p.resources.resolverRequirementBlocks.clear();
 		p.resources.mergedFrameRequirementsDirty = true;
 		p.resources.internalTransitions = std::move(b.params.internalTransitions);
 		p.resources.identifierSet = std::move(b._declaredIds);
@@ -5969,6 +6028,7 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(ComputePassAndResources& p
 		p.resources.autoDescriptorConstantBuffers = std::move(b.params.autoDescriptorConstantBuffers);
 		p.resources.autoDescriptorUnorderedAccessViews = std::move(b.params.autoDescriptorUnorderedAccessViews);
 		p.resources.activeFeatureDomains = std::move(b.params.activeFeatureDomains);
+		p.explicitExternalWaitsBeforeTransitions = b.params.externalWaitsBeforeTransitions;
 		p.resources.externalWaitsBeforeTransitions = std::move(b.params.externalWaitsBeforeTransitions);
 		p.resources.externalWaitBindingsBeforeTransitions = std::move(b.params.externalWaitBindingsBeforeTransitions);
 	}
@@ -5984,6 +6044,7 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(ComputePassAndResources& p
 	{
 		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Compute)::CaptureResolverSnapshots");
 		p.resolverSnapshots = b.TakeResolverSnapshots();
+		MergeResolverWaits(p.resources.externalWaitsBeforeTransitions, p.resolverSnapshots);
 		p.retainedAnonymousKeepAlive = CaptureRetainedAnonymousKeepAlive(
 			p.resources.staticResourceRequirements,
 			p.resources.internalTransitions);
@@ -5999,7 +6060,7 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(ComputePassAndResources& p
 	if (requiresPassRebind) {
 		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Compute)::SetResourceRegistryView");
 		p.pass->SetResourceRegistryView(
-			std::make_unique<ResourceRegistryView>(_registry, p.resources.identifierSet),
+			MakePassResourceRegistryView(_registry, p.resources),
 			p.resources.activeFeatureDomains,
 			p.resources.autoDescriptorShaderResources,
 			p.resources.autoDescriptorConstantBuffers,
@@ -6060,9 +6121,11 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(CopyPassAndResources& p, u
 	{
 		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Copy)::StoreRequirements");
 		p.resources.staticResourceRequirements = std::move(refreshedRequirements);
+		p.resources.resolverRequirementBlocks.clear();
 		p.resources.mergedFrameRequirementsDirty = true;
 		p.resources.internalTransitions = std::move(b.params.internalTransitions);
 		p.resources.identifierSet = std::move(b._declaredIds);
+		p.explicitExternalWaitsBeforeTransitions = b.params.externalWaitsBeforeTransitions;
 		p.resources.externalWaitsBeforeTransitions = std::move(b.params.externalWaitsBeforeTransitions);
 		p.resources.externalWaitBindingsBeforeTransitions = std::move(b.params.externalWaitBindingsBeforeTransitions);
 	}
@@ -6078,6 +6141,7 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(CopyPassAndResources& p, u
 	{
 		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Copy)::CaptureResolverSnapshots");
 		p.resolverSnapshots = b.TakeResolverSnapshots();
+		MergeResolverWaits(p.resources.externalWaitsBeforeTransitions, p.resolverSnapshots);
 		p.retainedAnonymousKeepAlive = CaptureRetainedAnonymousKeepAlive(
 			p.resources.staticResourceRequirements,
 			p.resources.internalTransitions);
@@ -6092,7 +6156,7 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(CopyPassAndResources& p, u
 	if (requiresPassRebind) {
 		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Copy)::SetResourceRegistryView");
 		p.pass->SetResourceRegistryView(
-			std::make_unique<ResourceRegistryView>(_registry, p.resources.identifierSet)
+			MakePassResourceRegistryView(_registry, p.resources)
 		);
 	}
 	if (traceLifecycle) {
@@ -7358,7 +7422,7 @@ void RenderGraph::Setup() {
 				spdlog::info("RG setup render pass '{}' begin", renderPass.name);
 			}
 			renderPass.pass->SetResourceRegistryView(
-				std::make_unique<ResourceRegistryView>(_registry, renderPass.resources.identifierSet),
+				MakePassResourceRegistryView(_registry, renderPass.resources),
 				renderPass.resources.activeFeatureDomains,
 				renderPass.resources.autoDescriptorShaderResources,
 				renderPass.resources.autoDescriptorConstantBuffers,
@@ -7375,7 +7439,7 @@ void RenderGraph::Setup() {
 				spdlog::info("RG setup compute pass '{}' begin", computePass.name);
 			}
 			computePass.pass->SetResourceRegistryView(
-				std::make_unique<ResourceRegistryView>(_registry, computePass.resources.identifierSet),
+				MakePassResourceRegistryView(_registry, computePass.resources),
 				computePass.resources.activeFeatureDomains,
 				computePass.resources.autoDescriptorShaderResources,
 				computePass.resources.autoDescriptorConstantBuffers,
@@ -7391,7 +7455,7 @@ void RenderGraph::Setup() {
 			if (traceLifecycle) {
 				spdlog::info("RG setup copy pass '{}' begin", copyPass.name);
 			}
-			copyPass.pass->SetResourceRegistryView(std::make_unique<ResourceRegistryView>(_registry, copyPass.resources.identifierSet));
+			copyPass.pass->SetResourceRegistryView(MakePassResourceRegistryView(_registry, copyPass.resources));
 			copyPass.pass->Setup();
 			if (traceLifecycle) {
 				spdlog::info("RG setup copy pass '{}' complete", copyPass.name);
@@ -7412,6 +7476,8 @@ void RenderGraph::AddRenderPass(std::shared_ptr<RenderPass> pass, RenderPassPara
 		passAndResources.resources.staticResourceRequirements,
 		passAndResources.resources.internalTransitions);
 	passAndResources.resolverSnapshots = std::move(resolverSnapshots);
+	passAndResources.explicitExternalWaitsBeforeTransitions = resources.externalWaitsBeforeTransitions;
+	MergeResolverWaits(passAndResources.resources.externalWaitsBeforeTransitions, passAndResources.resolverSnapshots);
 	UpdateRetainedDeclarationCache(PassType::Render, passAndResources.name, passAndResources);
 	AnyPassAndResources passAndResourcesAny;
 	passAndResourcesAny.type = PassType::Render;
@@ -7437,6 +7503,8 @@ void RenderGraph::AddComputePass(std::shared_ptr<ComputePass> pass, ComputePassP
 		passAndResources.resources.staticResourceRequirements,
 		passAndResources.resources.internalTransitions);
 	passAndResources.resolverSnapshots = std::move(resolverSnapshots);
+	passAndResources.explicitExternalWaitsBeforeTransitions = resources.externalWaitsBeforeTransitions;
+	MergeResolverWaits(passAndResources.resources.externalWaitsBeforeTransitions, passAndResources.resolverSnapshots);
 	UpdateRetainedDeclarationCache(PassType::Compute, passAndResources.name, passAndResources);
 	AnyPassAndResources passAndResourcesAny;
 	passAndResourcesAny.type = PassType::Compute;
@@ -7462,6 +7530,8 @@ void RenderGraph::AddCopyPass(std::shared_ptr<CopyPass> pass, CopyPassParameters
 		passAndResources.resources.staticResourceRequirements,
 		passAndResources.resources.internalTransitions);
 	passAndResources.resolverSnapshots = std::move(resolverSnapshots);
+	passAndResources.explicitExternalWaitsBeforeTransitions = resources.externalWaitsBeforeTransitions;
+	MergeResolverWaits(passAndResources.resources.externalWaitsBeforeTransitions, passAndResources.resolverSnapshots);
 	UpdateRetainedDeclarationCache(PassType::Copy, passAndResources.name, passAndResources);
 	AnyPassAndResources passAndResourcesAny;
 	passAndResourcesAny.type = PassType::Copy;
@@ -10928,6 +10998,44 @@ ResourceRegistry::RegistryHandle RenderGraph::RequestResourceHandle(Resource* co
 	pinTransientForFrame();
 
 	return handle;
+}
+
+std::shared_ptr<const std::vector<ResourceHandleAndRange>>
+RenderGraph::RequestResolverResourceHandles(const ResolverDeclarationState& state) {
+	BT_ZONE_SCOPE("RenderGraph::RequestResolverResourceHandles");
+	const auto identity = state.dependencyIdentity.get();
+	if (identity) {
+		const auto found = m_resolverHandleCache.find(identity);
+		if (found != m_resolverHandleCache.end() &&
+			found->second.registryGeneration == m_resourceRegistryGeneration &&
+			found->second.resourceSetIdentity == state.resourceSetIdentity) {
+			++m_resolverHandleCacheHitsThisFrame;
+			return found->second.handles;
+		}
+	}
+
+	++m_resolverHandleCacheMissesThisFrame;
+	auto handles = std::make_shared<std::vector<ResourceHandleAndRange>>();
+	if (state.resources) {
+		handles->reserve(state.resources->size());
+		for (const auto& resource : *state.resources) {
+			// Resolver declarations, like direct pointer declarations, are authorized
+			// by their concrete registry handles.  Do not promote them into graph-owned
+			// resources: published resolver sets may legitimately contain externally
+			// managed immutable resources.
+			handles->push_back(ResourceHandleAndRange{ RequestResourceHandle(resource.get()), {} });
+		}
+	}
+
+	if (identity) {
+		m_resolverHandleCache.insert_or_assign(identity, ResolverHandleCacheEntry{
+			.dependencyIdentity = state.dependencyIdentity,
+			.resourceSetIdentity = state.resourceSetIdentity,
+			.registryGeneration = m_resourceRegistryGeneration,
+			.handles = handles
+		});
+	}
+	return handles;
 }
 
 
