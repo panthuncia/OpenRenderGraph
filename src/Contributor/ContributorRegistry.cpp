@@ -550,10 +550,10 @@ ORGStatus ContributorRegistry::Compile(uint64_t generation, uint32_t renderWidth
 				expectedView == ORG_RG_VIEW_UNORDERED_ACCESS) && mipCount != 1) {
 				std::unique_lock lock(mutex_); rebuildRequested_ = true; return ORG_RG_E_INCOMPATIBLE_RESOURCE;
 			}
-			if (access.viewDimension == ORG_RG_VIEW_DIMENSION_TEXTURE_CUBE &&
-				(access.range.firstArraySlice != 0 || sliceCount != 6) ||
-				access.viewDimension == ORG_RG_VIEW_DIMENSION_TEXTURE_CUBE_ARRAY &&
-				((access.range.firstArraySlice % 6) || (sliceCount % 6))) {
+			if ((access.viewDimension == ORG_RG_VIEW_DIMENSION_TEXTURE_CUBE &&
+				(access.range.firstArraySlice != 0 || sliceCount != 6)) ||
+				(access.viewDimension == ORG_RG_VIEW_DIMENSION_TEXTURE_CUBE_ARRAY &&
+				((access.range.firstArraySlice % 6) || (sliceCount % 6)))) {
 				std::unique_lock lock(mutex_); rebuildRequested_ = true; return ORG_RG_E_INCOMPATIBLE_RESOURCE;
 			}
 		}

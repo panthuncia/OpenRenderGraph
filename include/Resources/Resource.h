@@ -14,6 +14,7 @@
 #include "Resources/ResourceStateTracker.h"
 #include "Render/QueueKind.h"
 
+class ResourceManager;
 
 namespace org {
 
@@ -383,7 +384,7 @@ private:
 
     //friend class RenderGraph;
     friend class ResourceGroup;
-    friend class ResourceManager;
+    friend class ::ResourceManager;
     friend class DynamicResource;
     friend class DynamicGloballyIndexedResource;
     friend class DynamicBuffer;
