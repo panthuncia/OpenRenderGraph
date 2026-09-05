@@ -783,6 +783,10 @@ public:
 	// otherwise repeat thousands of registry lookups during a loading frame.
 	std::shared_ptr<const std::vector<ResourceHandleAndRange>>
 		RequestResolverResourceHandles(const ResolverDeclarationState& state);
+    std::shared_ptr<const ResolverDeclarationState> CaptureResolverDeclarationState(const IResourceResolver& resolver) const {
+        return m_resolverCaptureContext ? resolver.CaptureDeclarationState(*m_resolverCaptureContext)
+            : resolver.CaptureDeclarationState();
+    }
 
 	//void RegisterECSRenderPhaseEntities(const std::unordered_map<RenderPhase, flecs::entity, RenderPhase::Hasher>& phaseEntities);
 
@@ -1256,7 +1260,11 @@ private:
 	// This keeps compiler algorithm/layout changes from rebuilding all ORG clients.
 	struct Node;
 	struct CompilerState;
+    void SubmitDependencyCompileShadow(const std::vector<Node>& nodes,
+        std::span<const std::pair<size_t, size_t>> explicitEdges,
+        std::vector<std::pair<uint32_t, uint32_t>> dependencyOracle);
 	std::unique_ptr<CompilerState> m_compilerState;
+    std::shared_ptr<const ResolverCaptureContext> m_resolverCaptureContext;
 
 	std::vector<IResourceProvider*> _providers;
 	ResourceRegistry _registry;

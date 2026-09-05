@@ -22,6 +22,8 @@ struct OpenRenderGraphSettings {
     bool collectPipelineStatistics = false;
 
     bool useAsyncCompute = true;
+    bool experimentalAsyncCompileShadow = false;
+    uint8_t experimentalCompileConcurrency = 2;
     bool renderGraphCompileDumpEnabled = false;
     bool renderGraphVramDumpEnabled = false;
     bool renderGraphBatchTraceEnabled = false;
@@ -64,6 +66,7 @@ inline void SetOpenRenderGraphSettings(const OpenRenderGraphSettings& settings) 
     auto& state = detail::GetOpenRenderGraphSettingsState();
     std::scoped_lock lock(state.mutex);
     state.settings = settings;
+    state.settings.experimentalCompileConcurrency = std::clamp(state.settings.experimentalCompileConcurrency, uint8_t{1}, uint8_t{4});
     state.settings.numFramesInFlight = (std::max)(uint8_t{ 1 }, state.settings.numFramesInFlight);
     state.settings.queueSchedulingWidthScale = (std::max)(0.0f, state.settings.queueSchedulingWidthScale);
     if (static_cast<uint8_t>(state.settings.queueSchedulingSelectionPolicy) > static_cast<uint8_t>(QueueSchedulingSelectionPolicy::Scored)) {

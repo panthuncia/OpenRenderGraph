@@ -227,7 +227,7 @@ public:
         // remove its reverse-map entry so stale pointer->handle lookups
         // do not survive replacement.
         if (s.rawPointer && !isSameResource) {
-            resourceToHandle.erase(s.rawPointer);
+            ForgetReverseMapping(s.rawPointer);
         }
 
         s.resource = res;
@@ -252,6 +252,7 @@ public:
             res->GetArraySize());
 
         resourceToHandle[s.rawPointer] = h;
+        concreteToHandle[res->GetGlobalResourceID()] = h;
 
         return h;
     }
@@ -320,7 +321,7 @@ public:
             }
 
             if (s.rawPointer) {
-                resourceToHandle.erase(s.rawPointer);
+                ForgetReverseMapping(s.rawPointer);
                 s.rawPointer = nullptr;
             }
 
@@ -348,7 +349,18 @@ public:
 
     RegistryHandle MakeHandle(ResourceIdentifier const& id) const {
         auto it = intern.find(id);
-        if (it == intern.end()) return RegistryHandle({}, 0, 0, 0, 0, 0); // generation==0 means invalid
+        if (it == intern.end()) {
+            // Numeric compatibility is resolved lazily, not interned once per
+            // resource in every pass declaration. ID zero is a valid resource.
+            const auto text = id.ToString();
+            uint64_t concreteID = 0;
+            const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), concreteID);
+            if (error == std::errc{} && end == text.data() + text.size()) {
+                if (auto concrete = concreteToHandle.find(concreteID);
+                    concrete != concreteToHandle.end() && IsValid(concrete->second)) return concrete->second;
+            }
+            return RegistryHandle({}, 0, 0, 0, 0, 0);
+        }
 
         const ResourceKey key = it->second;
         if (key.idx >= slots.size()) return RegistryHandle({}, 0, 0, 0, 0, 0);
@@ -460,6 +472,18 @@ private:
     uint64_t m_epoch = 0;
     std::vector<uint32_t> m_anonymousSlotChanges;
     std::unordered_map<Resource*, RegistryHandle> resourceToHandle;
+    std::unordered_map<uint64_t, RegistryHandle> concreteToHandle;
+
+    void ForgetReverseMapping(Resource* pointer) {
+        const auto old = resourceToHandle.find(pointer);
+        if (old == resourceToHandle.end()) return;
+        // Use the saved handle, never dereference an expired anonymous pointer.
+        const auto concrete = concreteToHandle.find(old->second.GetGlobalResourceID());
+        if (concrete != concreteToHandle.end() &&
+            concrete->second.GetKey().idx == old->second.GetKey().idx &&
+            concrete->second.GetGeneration() == old->second.GetGeneration()) concreteToHandle.erase(concrete);
+        resourceToHandle.erase(old);
+    }
 	static constexpr uint32_t kEphemeralSlotIndex = UINT32_MAX;
     std::unordered_map<ResourceIdentifier, std::shared_ptr<IResourceResolver>, ResourceIdentifier::Hasher> m_resolvers;
 
@@ -472,7 +496,7 @@ private:
 
         // If slot previously held a resource, remove reverse mapping.
         if (s.rawPointer) {
-            resourceToHandle.erase(s.rawPointer);
+            ForgetReverseMapping(s.rawPointer);
         }
 
         s.resource = std::move(res);
@@ -492,6 +516,7 @@ private:
         );
 
         resourceToHandle[s.rawPointer] = h;
+        concreteToHandle[h.GetGlobalResourceID()] = h;
         return h;
     }
 };

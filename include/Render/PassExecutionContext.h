@@ -18,6 +18,7 @@ class Resource;
 class SymbolicTracker;
 class GloballyIndexedResource;
 class PipelineState;
+class ResolverCaptureContext;
 
 struct IHostExecutionData {
 	virtual ~IHostExecutionData() = default;
@@ -30,6 +31,8 @@ struct IHostExecutionData {
 };
 
 struct UpdateExecutionContext {
+    // Owned publication context supplied by the preparation owner for this update.
+    std::shared_ptr<const ResolverCaptureContext> resolverCaptureContext;
 	UINT frameIndex = 0;
 	UINT64 frameFenceValue = 0;
 	float deltaTime = 0.0f;

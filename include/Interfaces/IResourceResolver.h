@@ -3,6 +3,7 @@
 #include <vector>
 #include <memory>
 #include <cstdint>
+#include <typeindex>
 
 #include "Resources/ResourceStateTracker.h"
 #include "Resources/ResourceIdentifier.h"
@@ -14,6 +15,23 @@ namespace org {
 struct ResolverRequirementBlock;
 
 using ResolverResourceList = std::vector<std::shared_ptr<Resource>>;
+
+// An owned, typed publication token supplied by the preparation owner. Workers
+// consume captured declaration states, never a live process publication source.
+class ResolverCaptureContext {
+public:
+    template<class T>
+    explicit ResolverCaptureContext(std::shared_ptr<const T> publication)
+        : m_type(typeid(T)), m_publication(std::move(publication)) {}
+    template<class T> std::shared_ptr<const T> Get() const noexcept {
+        return m_type == std::type_index(typeid(T))
+            ? std::static_pointer_cast<const T>(m_publication) : nullptr;
+    }
+    template<class T> bool Is() const noexcept { return m_type == std::type_index(typeid(T)); }
+private:
+    std::type_index m_type;
+    std::shared_ptr<const void> m_publication;
+};
 
 struct ResolverResourceSetIdentity {
     uint64_t low = 0;
@@ -28,6 +46,7 @@ struct ResolverDeclarationState {
     uint64_t waitRevision = 0;
     std::shared_ptr<const ResolverResourceList> resources;
     std::shared_ptr<const std::vector<ExternalTimelinePoint>> waits;
+    std::shared_ptr<const void> publicationLease;
     bool tracked = false;
 };
 
@@ -36,6 +55,8 @@ class IResourceResolver {
 	virtual ~IResourceResolver() = default;
 	virtual std::vector<std::shared_ptr<Resource>> Resolve() const = 0;
     virtual std::shared_ptr<const ResolverDeclarationState> CaptureDeclarationState() const = 0;
+    virtual std::shared_ptr<const ResolverDeclarationState> CaptureDeclarationState(
+        const ResolverCaptureContext&) const { return CaptureDeclarationState(); }
 
     template<typename T>
     std::vector<std::shared_ptr<T>> ResolveAs(bool require_all_casts = true) const {
@@ -94,6 +115,9 @@ struct ResolverSnapshot {
         ResourceState state{};
     };
     std::vector<RequirementTemplate> requirementTemplates;
+    // Authored state exists even when the first captured resource set is empty.
+    std::vector<RequirementTemplate> declaredRequirementTemplates;
+    bool hasUnclassifiedDeclaration = false;
     std::shared_ptr<const ResolverRequirementBlock> requirementBlock;
 
     ResolverSnapshot() = default;
@@ -112,7 +136,9 @@ struct ResolverSnapshot {
         , resourceSetIdentity(other.resourceSetIdentity)
         , contentRevision(other.contentRevision), waitRevision(other.waitRevision)
         , waits(other.waits), resourceIDs(other.resourceIDs)
-        , requirementTemplates(other.requirementTemplates), requirementBlock(other.requirementBlock) {}
+        , requirementTemplates(other.requirementTemplates)
+        , declaredRequirementTemplates(other.declaredRequirementTemplates)
+        , hasUnclassifiedDeclaration(other.hasUnclassifiedDeclaration), requirementBlock(other.requirementBlock) {}
     ResolverSnapshot& operator=(const ResolverSnapshot& other) {
         if (this != &other) {
             resolver = other.resolver ? other.resolver->Clone() : nullptr;
@@ -123,6 +149,8 @@ struct ResolverSnapshot {
             waits = other.waits;
             resourceIDs = other.resourceIDs;
             requirementTemplates = other.requirementTemplates;
+            declaredRequirementTemplates = other.declaredRequirementTemplates;
+            hasUnclassifiedDeclaration = other.hasUnclassifiedDeclaration;
             requirementBlock = other.requirementBlock;
         }
         return *this;

@@ -301,21 +301,29 @@ namespace {
 		std::unordered_set<uint64_t> resolverResourceIDs;
 		for (auto& snapshot : passAndResources.resolverSnapshots) {
 			snapshot.requirementTemplates.clear();
-			// An empty initial set does not reveal the declaration state that future
-			// members require. Keep the compatibility redeclaration path for it.
-			if (snapshot.resourceIDs.empty()) return;
+            if (snapshot.hasUnclassifiedDeclaration) return;
+            snapshot.requirementTemplates = snapshot.declaredRequirementTemplates;
+            if (std::any_of(snapshot.requirementTemplates.begin(), snapshot.requirementTemplates.end(),
+                [](const auto& requirement) { return requirement.state.access == rhi::ResourceAccessType::Common; })) return;
+            if (snapshot.resourceIDs.empty()) {
+                // Without concrete subresource dimensions, multiple authored
+                // uses may overlap or merge. Keep that case on the full oracle.
+                if (snapshot.requirementTemplates.size() != 1) return;
+                continue;
+            }
 			for (const auto id : snapshot.resourceIDs) {
 				if (!resolverResourceIDs.insert(id).second) return;
 			}
 			const auto first = templatesByResource.find(snapshot.resourceIDs.front());
 			if (first == templatesByResource.end() || first->second.empty()) return;
-			snapshot.requirementTemplates = first->second;
+            if (snapshot.requirementTemplates.empty()) snapshot.requirementTemplates = first->second;
 			for (const auto id : snapshot.resourceIDs) {
 				const auto found = templatesByResource.find(id);
 				if (found == templatesByResource.end() || found->second.size() != snapshot.requirementTemplates.size()) return;
 				for (size_t i = 0; i < found->second.size(); ++i) {
 					if (!(found->second[i].range == snapshot.requirementTemplates[i].range) ||
-						!(found->second[i].state == snapshot.requirementTemplates[i].state)) return;
+						!(found->second[i].state == snapshot.requirementTemplates[i].state) ||
+						found->second[i].state.sync != snapshot.requirementTemplates[i].state.sync) return;
 				}
 			}
 		}
@@ -603,12 +611,16 @@ void FinalizeResolverRequirementSegments(RenderGraph& graph, const ResourceRegis
 	std::vector<std::shared_ptr<const ResolverRequirementBlock>> blocks;
 	blocks.reserve(passAndResources.resolverSnapshots.size());
 	for (auto& snapshot : passAndResources.resolverSnapshots) {
-		const auto state = snapshot.resolver->CaptureDeclarationState();
+		const auto state = graph.CaptureResolverDeclarationState(*snapshot.resolver);
 		if (!state || state->resourceSetIdentity != snapshot.resourceSetIdentity) return;
 		snapshot.requirementBlock = graph.RequestResolverRequirementBlock(*state, snapshot.requirementTemplates);
 		blocks.push_back(snapshot.requirementBlock);
-		snapshot.resourceIDs.clear();
-		snapshot.resourceIDs.shrink_to_fit();
+        // Mixed bindings need their unchanged membership for overlap checks.
+        // A single unmixed binding uses the shared block's ownership instead.
+        if (passAndResources.resolverSnapshots.size() == 1 && cache.resolverIndependentRequirements.empty()) {
+            snapshot.resourceIDs.clear();
+            snapshot.resourceIDs.shrink_to_fit();
+        }
 	}
 	passAndResources.resources.staticResourceRequirements = cache.resolverIndependentRequirements;
 	passAndResources.resources.resolverRequirementBlocks = std::move(blocks);
@@ -1700,6 +1712,140 @@ std::span<const uint64_t> RenderGraph::GetSchedulingEquivalentIDsCached(uint64_t
 	return std::span<const uint64_t>(fallbackEquivalentIDs.data(), fallbackEquivalentIDs.size());
 }
 
+void RenderGraph::SubmitDependencyCompileShadow(const std::vector<Node>& nodes,
+    std::span<const std::pair<size_t, size_t>> explicitEdges,
+    std::vector<std::pair<uint32_t, uint32_t>> dependencyOracle) try {
+    const bool enabled = m_renderGraphSettingsService &&
+        m_renderGraphSettingsService->GetExperimentalAsyncCompileShadow();
+    if (!enabled) {
+        m_compilerState->shadowCompiler.reset();
+        return;
+    }
+    BT_ZONE_SCOPE("ORG.AsyncCompile.CaptureDependencies");
+    if (!m_taskService) {
+        BT_PLOT("ORG.AsyncCompile.FallbackNoTaskService", int64_t{1});
+        return;
+    }
+    auto& coordinator = m_compilerState->shadowCompiler;
+    if (!coordinator) coordinator = std::make_unique<experimental::GraphCompileCoordinator>(
+        m_taskService, m_renderGraphSettingsService->GetExperimentalCompileConcurrency());
+    coordinator->SetConcurrency(m_renderGraphSettingsService->GetExperimentalCompileConcurrency());
+    experimental::GraphCompileInput input;
+    if (m_resolverCaptureContext) input.leases.push_back(m_resolverCaptureContext);
+    input.structure.generation = m_resourceRegistryGeneration;
+    input.structure.registryGeneration = m_resourceRegistryGeneration;
+    input.structure.resourceIDs = m_frameDAGResourceIDsByIndex;
+    std::unordered_map<uint64_t, uint32_t> capturedIndices;
+    for (uint32_t r = 0; r < input.structure.resourceIDs.size(); ++r) {
+        capturedIndices.emplace(input.structure.resourceIDs[r], r);
+        const auto* resource = r < m_frameDAGResourcePtrByIndex.size() ? m_frameDAGResourcePtrByIndex[r] : nullptr;
+        input.structure.resourceShapes.push_back(resource
+            ? experimental::CompileResourceShape{(std::max)(1u, resource->GetMipLevels()),
+                (std::max)(1u, resource->GetArraySize()), resource->HasLayout()}
+            : experimental::CompileResourceShape{0, 0, false});
+    }
+    auto captureState = [&](uint32_t resourceIndex, const RangeSpec& spec, ResourceState state) {
+        if (resourceIndex >= input.structure.resourceShapes.size())
+            throw std::runtime_error("Invalid resource index during owned state capture");
+        const auto shape = input.structure.resourceShapes[resourceIndex];
+        const auto range = ResolveRangeSpec(spec, shape.mips, shape.slices);
+        return experimental::CompileStateUse{resourceIndex,
+            {range.firstMip, range.mipCount, range.firstSlice, range.sliceCount},
+            {static_cast<uint64_t>(state.access), static_cast<uint64_t>(state.layout),
+                static_cast<uint64_t>(state.sync), AccessTypeIsWriteType(state.access)}};
+    };
+    input.structure.queues.clear();
+    for (size_t slot = 0; slot < m_queueRegistry.SlotCount(); ++slot)
+        input.structure.queues.push_back({static_cast<uint32_t>(m_queueRegistry.GetBackendInstance(
+            static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot)))),
+            slot < m_activeQueueSlotsThisFrame.size() && m_activeQueueSlotsThisFrame[slot] != 0});
+    input.structure.passes.reserve(nodes.size());
+    const auto primaryBackend = m_backendDevices.empty() ? rhi::Backend::Null : m_backendDevices.front().backend;
+    auto oracle = std::make_shared<experimental::DependencyEdges>();
+    for (size_t index = 0; index < nodes.size(); ++index) {
+        const auto& node = nodes[index];
+        experimental::CompilePass pass;
+        pass.originalOrder = node.originalOrder;
+        pass.preferredQueueSlot = static_cast<uint32_t>(node.queueSlot);
+        pass.compatibleQueueSlots.clear();
+        for (auto slot : node.compatibleQueueSlots) {
+            if (slot >= UINT32_MAX) throw std::runtime_error("Compile queue slot exceeds index capacity");
+            pass.compatibleQueueSlots.push_back(static_cast<uint32_t>(slot));
+        }
+        if (node.passIndex < m_framePassAccessSummaries.size()) {
+            const auto& summary = m_framePassAccessSummaries[node.passIndex];
+            pass.backend = static_cast<uint32_t>(summary.backendAffinity.strength == BackendAffinityStrength::Primary
+                ? primaryBackend : summary.backendAffinity.backend);
+            pass.accesses.reserve(summary.dagAccesses.size());
+            for (const auto& access : summary.dagAccesses) {
+                if (access.resourceIndex >= m_frameDAGResourceCount)
+                    throw std::runtime_error("Invalid resource index during owned dependency capture");
+                pass.accesses.push_back({static_cast<uint32_t>(access.resourceIndex), access.kind != AccessKind::Read});
+            }
+            for (const auto& requirement : summary.requirementSummaries)
+                pass.entryStates.push_back(captureState(requirement.dagResourceIndex, requirement.range, requirement.state));
+            const auto view = GetPassView(m_framePasses[node.passIndex]);
+            if (view.internalTransitions) for (const auto& [resource, state] : *view.internalTransitions) {
+                const auto found = capturedIndices.find(resource.resource.GetGlobalResourceID());
+                if (found == capturedIndices.end()) throw std::runtime_error("Internal state missing captured resource");
+                pass.exitStates.push_back(captureState(found->second, resource.range, state));
+            }
+        }
+        input.structure.passes.push_back(std::move(pass));
+        for (auto next : node.out) oracle->emplace_back(static_cast<uint32_t>(index), static_cast<uint32_t>(next));
+    }
+    for (auto [from, to] : explicitEdges) {
+        // Match legacy handling of unresolved external edges before freezing.
+        if (from < nodes.size() && to < nodes.size())
+            input.structure.explicitEdges.emplace_back(static_cast<uint32_t>(from), static_cast<uint32_t>(to));
+    }
+    std::sort(oracle->begin(), oracle->end());
+    std::sort(dependencyOracle.begin(), dependencyOracle.end());
+    std::set_difference(oracle->begin(), oracle->end(), dependencyOracle.begin(), dependencyOracle.end(),
+        std::back_inserter(input.structure.placementEdges));
+    input.expectedSchedulingEdges = std::move(oracle);
+    input.expectedEdges = std::make_shared<const experimental::DependencyEdges>(std::move(dependencyOracle));
+    coordinator->Request(std::move(input));
+    const auto statistics = coordinator->Statistics();
+    BT_PLOT("ORG.AsyncCompile.Active", static_cast<int64_t>(statistics.active));
+    BT_PLOT("ORG.AsyncCompile.Pending", static_cast<int64_t>(statistics.pending));
+    BT_PLOT("ORG.AsyncCompile.RetainedInputAndSelectedBytes", static_cast<int64_t>(statistics.retainedBytes));
+    BT_PLOT("ORG.AsyncCompile.PeakRunning", static_cast<int64_t>(statistics.peakRunning));
+    BT_PLOT("ORG.AsyncCompile.Requested", static_cast<int64_t>(statistics.requested));
+    BT_PLOT("ORG.AsyncCompile.Coalesced", static_cast<int64_t>(statistics.coalesced));
+    BT_PLOT("ORG.AsyncCompile.CompletedCacheHits", static_cast<int64_t>(statistics.completedCacheHits));
+    BT_PLOT("ORG.AsyncCompile.Completed", static_cast<int64_t>(statistics.completed));
+    BT_PLOT("ORG.AsyncCompile.Cancelled", static_cast<int64_t>(statistics.cancelled));
+    BT_PLOT("ORG.AsyncCompile.OracleComparisons", static_cast<int64_t>(statistics.oracleComparisons));
+    BT_PLOT("ORG.AsyncCompile.OracleFailures", static_cast<int64_t>(statistics.oracleFailures));
+    BT_PLOT("ORG.AsyncCompile.ScheduleComparisons", static_cast<int64_t>(statistics.scheduleComparisons));
+    BT_PLOT("ORG.AsyncCompile.ScheduleFailures", static_cast<int64_t>(statistics.scheduleFailures));
+    BT_PLOT("ORG.AsyncCompile.StateComparisons", static_cast<int64_t>(statistics.stateComparisons));
+    BT_PLOT("ORG.AsyncCompile.StateFailures", static_cast<int64_t>(statistics.stateFailures));
+    BT_PLOT("ORG.AsyncCompile.StateFallbacks", static_cast<int64_t>(statistics.stateFallbacks));
+    BT_PLOT("ORG.AsyncCompile.MembershipChanges", static_cast<int64_t>(statistics.membershipChanges));
+    BT_PLOT("ORG.AsyncCompile.PassChanges", static_cast<int64_t>(statistics.passChanges));
+    BT_PLOT("ORG.AsyncCompile.ConstraintChanges", static_cast<int64_t>(statistics.constraintChanges));
+    BT_PLOT("ORG.AsyncCompile.QueueChanges", static_cast<int64_t>(statistics.queueChanges));
+    BT_PLOT("ORG.AsyncCompile.Failed", static_cast<int64_t>(statistics.failed));
+    BT_PLOT("ORG.AsyncCompile.Rejected", static_cast<int64_t>(statistics.rejected));
+    BT_PLOT("ORG.AsyncCompile.SelectedSequence", static_cast<int64_t>(statistics.selectedSequence));
+    const auto failures = statistics.failed + statistics.oracleFailures + statistics.scheduleFailures + statistics.stateFailures + statistics.rejected;
+    if (failures > m_compilerState->reportedShadowFailures) {
+        spdlog::error("Async compile shadow validation: {}", statistics.lastError);
+        m_compilerState->reportedShadowFailures = failures;
+    }
+} catch (const std::exception& error) {
+    const auto failures = ++m_compilerState->shadowCaptureFailures;
+    BT_PLOT("ORG.AsyncCompile.CaptureFailures", static_cast<int64_t>(failures));
+    if (failures == 1 || failures % 64 == 0)
+        spdlog::error("Async shadow capture failed; synchronous graph remains authoritative: {}", error.what());
+} catch (...) {
+    ++m_compilerState->shadowCaptureFailures;
+    BT_PLOT("ORG.AsyncCompile.CaptureFailures", static_cast<int64_t>(m_compilerState->shadowCaptureFailures));
+    spdlog::error("Unknown async shadow capture failure; synchronous graph remains authoritative");
+}
+
 void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHostExecutionData* hostData) {
 	BT_ZONE_SCOPE("RenderGraph::CompileFrame");
 	BeginCompileProfileFrame(frameIndex);
@@ -1784,6 +1930,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	size_t resolverSetChangeCount = 0;
 	size_t incrementalResolverPatchCount = 0;
 	size_t incrementalResolverPatchFallbackCount = 0;
+    size_t emptyInitialResolverFallbackCount = 0;
 	std::unordered_map<const void*, std::shared_ptr<const ResolverDeclarationState>> capturedResolverStates;
 	capturedResolverStates.reserve(64);
 	std::unordered_map<const void*, bool> capturedResolverMembershipUnique;
@@ -1800,10 +1947,10 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				const auto identity = snap.dependencyIdentity.get();
 				if (identity) {
 					auto [it, inserted] = capturedResolverStates.try_emplace(identity);
-					if (inserted) it->second = snap.resolver->CaptureDeclarationState();
+					if (inserted) it->second = CaptureResolverDeclarationState(*snap.resolver);
 					state = it->second;
 				} else {
-					state = snap.resolver->CaptureDeclarationState();
+					state = CaptureResolverDeclarationState(*snap.resolver);
 				}
 				if (!state || state->resourceSetIdentity != snap.resourceSetIdentity) {
 					++resolverSetChangeCount;
@@ -1934,6 +2081,12 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 				return false;
 			}
 			++incrementalResolverPatchFallbackCount;
+            const bool emptyInitialSet = std::any_of(p.resolverSnapshots.begin(), p.resolverSnapshots.end(),
+                [](const auto& snapshot) { return snapshot.resourceIDs.empty(); });
+            emptyInitialResolverFallbackCount += emptyInitialSet ? 1 : 0;
+            const auto reason = fmt::format("{}: {}", p.name,
+                emptyInitialSet ? "empty-initial-resolver-recipe" : "materialized-or-conflicting-recipe");
+            BT_ZONE_TEXT(reason.data(), reason.size());
 			return true;
 		}
 		if (waitsChanged) {
@@ -2170,6 +2323,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		BT_PLOT("ORG.RefreshRetained.ResolverSetChanges", static_cast<int64_t>(resolverSetChangeCount));
 		BT_PLOT("ORG.RefreshRetained.IncrementalResolverPatches", static_cast<int64_t>(incrementalResolverPatchCount));
 		BT_PLOT("ORG.RefreshRetained.IncrementalResolverPatchFallbacks", static_cast<int64_t>(incrementalResolverPatchFallbackCount));
+        BT_PLOT("ORG.RefreshRetained.EmptyInitialResolverFallbacks", static_cast<int64_t>(emptyInitialResolverFallbackCount));
 	}
 	{
 		traceCompileStep("RefreshRetainedDeclarationApply");
@@ -3085,6 +3239,11 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		}
 	}
 
+    std::vector<std::pair<uint32_t, uint32_t>> shadowDependencyOracle;
+    if (m_renderGraphSettingsService && m_renderGraphSettingsService->GetExperimentalAsyncCompileShadow()) {
+        for (uint32_t index = 0; index < nodes.size(); ++index)
+            for (auto next : nodes[index].out) shadowDependencyOracle.emplace_back(index, static_cast<uint32_t>(next));
+    }
 	const AutoAliasMode autoAliasMode = m_getAutoAliasMode ? m_getAutoAliasMode() : AutoAliasMode::Off;
 	auto hasManualAliasPoolThisFrame = [&]() {
 		for (uint64_t resourceID : usedResourceIDs) {
@@ -3216,6 +3375,7 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		BT_ZONE_SCOPE("RenderGraph::CompileFrame::PlanActiveQueueSlots");
 		PlanActiveQueueSlots(*this, m_framePasses, nodes);
 	}
+    SubmitDependencyCompileShadow(nodes, explicitEdges, std::move(shadowDependencyOracle));
 	{
 		traceCompileStep("AssignQueueSlots");
 		BT_ZONE_SCOPE("RenderGraph::CompileFrame::AssignQueueSlots");

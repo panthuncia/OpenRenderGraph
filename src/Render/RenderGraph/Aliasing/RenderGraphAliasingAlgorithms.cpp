@@ -2040,7 +2040,13 @@ void org::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(Render
 				.Set<MemoryStatisticsComponents::ResourceUsage>({ "RenderGraph alias pools" })
 				.Set<MemoryStatisticsComponents::AliasingPool>({ poolID });
 
-			const auto allocResult = DeviceManager::GetInstance().AllocateMemoryTracked(allocDesc, allocInfo, newAliasPool, trackDesc);
+			const auto allocResult = [&] {
+				// This is realization, not pure alias placement. Keep its latency
+				// visible while those responsibilities are being extracted.
+				BT_ZONE_SCOPE("RenderGraphAliasingSubsystem::RealizePoolAllocation");
+				BT_ZONE_VALUE(newCapacity);
+				return DeviceManager::GetInstance().AllocateMemoryTracked(allocDesc, allocInfo, newAliasPool, trackDesc);
+			}();
 			if (!rhi::IsOk(allocResult)) {
 				throw std::runtime_error("Failed to allocate alias pool memory");
 			}

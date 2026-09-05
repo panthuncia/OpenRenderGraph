@@ -96,6 +96,7 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PassBuilders.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PassExecutionContext.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraph.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/ExperimentalGraphCompiler.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/InteropAllocator.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/SharedAliasPoolManager.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraphCompile.cpp"
@@ -186,6 +187,13 @@ endif()
 
 if(OPENRENDERGRAPH_BUILD_TESTS)
     enable_testing()
+    add_executable(OpenRenderGraphAsyncCompileTests tests/AsyncCompileTests.cpp
+        src/Render/RenderGraph/ExperimentalGraphCompiler.cpp)
+    target_compile_features(OpenRenderGraphAsyncCompileTests PRIVATE cxx_std_23)
+    target_include_directories(OpenRenderGraphAsyncCompileTests PRIVATE include)
+    target_link_libraries(OpenRenderGraphAsyncCompileTests PRIVATE BasicTelemetry::Core BasicTelemetry::Tracy)
+    target_compile_definitions(OpenRenderGraphAsyncCompileTests PRIVATE NOMINMAX)
+    add_test(NAME OpenRenderGraphAsyncCompileTests COMMAND OpenRenderGraphAsyncCompileTests)
     add_executable(OpenRenderGraphExternalResourceTests tests/ExternalResourceTests.cpp)
     if(WIN32)
         # BasicRHI is a static library and its D3D12 object references the
@@ -201,6 +209,11 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
         target_compile_options(OpenRenderGraphExternalResourceTests PRIVATE /utf-8)
     endif()
     target_link_libraries(OpenRenderGraphExternalResourceTests PRIVATE OpenRenderGraph BasicRHI::BasicRHI d3d12 dxgi)
+    if(WIN32 AND TARGET Pix::headers)
+        find_library(OPENRENDERGRAPH_PIX_RUNTIME NAMES WinPixEventRuntime
+            HINTS "${CMAKE_CURRENT_SOURCE_DIR}/../BasicRenderer" REQUIRED)
+        target_link_libraries(OpenRenderGraphExternalResourceTests PRIVATE "${OPENRENDERGRAPH_PIX_RUNTIME}")
+    endif()
     add_test(NAME OpenRenderGraphExternalResourceTests COMMAND OpenRenderGraphExternalResourceTests)
     add_executable(OpenRenderGraphContributorHeaderC tests/ContributorHeaderCompile.c)
     set_target_properties(OpenRenderGraphContributorHeaderC PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
@@ -214,6 +227,17 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
 	add_executable(OpenRenderGraphDeviceRegistryTests tests/DeviceRegistryTests.cpp)
 	target_link_libraries(OpenRenderGraphDeviceRegistryTests PRIVATE OpenRenderGraph::OpenRenderGraph)
 	add_test(NAME OpenRenderGraphDeviceRegistryTests COMMAND OpenRenderGraphDeviceRegistryTests)
+    if(WIN32 AND BASICRENDERER_TEST_RUNTIME_DIR)
+        set_tests_properties(
+            OpenRenderGraphAsyncCompileTests
+            OpenRenderGraphExternalResourceTests
+            OpenRenderGraphContributorHeaderC
+            OpenRenderGraphContributorRegistryTests
+            OpenRenderGraphDeviceRegistryTests
+            PROPERTIES
+                WORKING_DIRECTORY "${BASICRENDERER_TEST_RUNTIME_DIR}"
+                ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${BASICRENDERER_TEST_RUNTIME_DIR}")
+    endif()
 endif()
 
 if(OPENRENDERGRAPH_ENABLE_D3D11_INTEROP)

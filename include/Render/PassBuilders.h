@@ -276,6 +276,14 @@ inline std::vector<ResourceHandleAndRange>
 processResourceArguments(const ResourceResolverAndRange& rrr,
     RenderGraph* graph)
 {
+    const auto captured = graph->CaptureResolverDeclarationState(*rrr.pResolver);
+    if (captured && captured->resources) {
+        const auto handles = graph->RequestResolverResourceHandles(*captured);
+        std::vector<ResourceHandleAndRange> out;
+        out.reserve(handles->size());
+        for (const auto& handle : *handles) out.emplace_back(handle.resource, rrr.range);
+        return out;
+    }
     auto resources = rrr.pResolver->Resolve();
     std::vector<ResourceHandleAndRange> out;
     out.reserve(resources.size());
@@ -304,7 +312,8 @@ processResourceArguments(const ResourceIdentifierAndRange& rir,
 {
     // This could be a resolver- ask the graph.
     if (auto resolver = graph->RequestResolver(rir.identifier, true)) {
-        auto resources = resolver->Resolve();
+        const auto captured = graph->CaptureResolverDeclarationState(*resolver);
+        auto resources = captured && captured->resources ? *captured->resources : resolver->Resolve();
         // Dynamic-wrapper identifiers are explicit aliases whose concrete resource
         // may change between retained declaration revisions.  Ordinary resolvers
         // must not replace their symbolic entry: some of them intentionally expose
@@ -383,6 +392,7 @@ namespace detail {
     inline void extractId(auto& out, char* br) {
         out.insert(ResourceIdentifier{ br });
     }
+    inline void extractId(auto&, const ResourceResolverAndRange&) {}
     inline void extractId(auto&, const ResourceHandleAndRange&) {
     }
 
@@ -589,6 +599,7 @@ std::is_same_v<std::remove_cvref_t<T>, ResourceIdentifier> ||
 std::is_same_v<std::remove_cvref_t<T>, ResourcePtrAndRange> ||
 std::is_same_v<std::remove_cvref_t<T>, ResourceIdentifierAndRange> ||
 std::is_same_v<std::remove_cvref_t<T>, ResourceHandleAndRange> ||
+std::is_same_v<std::remove_cvref_t<T>, ResourceResolverAndRange> ||
 std::is_same_v<std::remove_cvref_t<T>, IResourceResolver>;
 
 template<typename T>
@@ -604,22 +615,48 @@ namespace detail
     inline constexpr bool dependent_false_v = false;
 
     inline void TrackResolverSnapshot(std::vector<ResolverSnapshot>& snapshots,
-        const IResourceResolver& resolver, const ResolverDeclarationState& state) {
+        const IResourceResolver& resolver, const ResolverDeclarationState& state,
+        std::optional<ResolverSnapshot::RequirementTemplate> binding = std::nullopt) {
         const auto identity = state.dependencyIdentity.get();
-        // A retained dependency must have an owned semantic identity.  Treat a
-        // missing identity as untracked even if a resolver accidentally marks
-        // the state tracked; address-less dependencies cannot be refreshed or
-        // deduplicated safely.
         if (!state.tracked || !identity) return;
-        if (std::ranges::any_of(snapshots, [identity](const auto& snapshot) {
+        auto found = std::find_if(snapshots.begin(), snapshots.end(), [identity](const auto& snapshot) {
             return snapshot.dependencyIdentity.get() == identity;
-        })) return;
-        snapshots.emplace_back(resolver.Clone(), state);
-        if (state.resources) {
-            auto& snapshot = snapshots.back();
-            snapshot.resourceIDs.reserve(state.resources->size());
-            for (const auto& resource : *state.resources)
-                snapshot.resourceIDs.push_back(resource ? resource->GetGlobalResourceID() : 0u);
+        });
+        if (found == snapshots.end()) {
+            snapshots.emplace_back(resolver.Clone(), state);
+            found = std::prev(snapshots.end());
+            if (state.resources) {
+                found->resourceIDs.reserve(state.resources->size());
+                for (const auto& resource : *state.resources)
+                    found->resourceIDs.push_back(resource ? resource->GetGlobalResourceID() : 0u);
+            }
+        }
+        if (!binding) {
+            found->hasUnclassifiedDeclaration = true;
+        } else if (std::none_of(found->declaredRequirementTemplates.begin(), found->declaredRequirementTemplates.end(),
+            [&](const auto& existing) { return existing.range == binding->range
+                && existing.state == binding->state && existing.state.sync == binding->state.sync; })) {
+            found->declaredRequirementTemplates.push_back(*binding);
+        }
+    }
+
+    template<typename T>
+    inline void TrackResolverDeclaration(RenderGraph* graph, std::vector<ResolverSnapshot>& snapshots,
+        const T& value, ResourceState required) {
+        auto capture = [&](const IResourceResolver& resolver, RangeSpec range) {
+            const auto state = graph->CaptureResolverDeclarationState(resolver);
+            if (state) TrackResolverSnapshot(snapshots, resolver, *state,
+                ResolverSnapshot::RequirementTemplate{range, required});
+        };
+        using Value = std::remove_cvref_t<T>;
+        if constexpr (std::is_same_v<Value, ResourceResolverAndRange>) {
+            capture(*value.pResolver, value.range);
+        } else if constexpr (std::is_same_v<Value, ResourceIdentifierAndRange>) {
+            if (auto resolver = graph->RequestResolver(value.identifier, true)) capture(*resolver, value.range);
+        } else if constexpr (std::is_same_v<Value, ResourceIdentifier>) {
+            if (auto resolver = graph->RequestResolver(value, true)) capture(*resolver, {});
+        } else if constexpr (StringLike<T>) {
+            if (auto resolver = graph->RequestResolver(ResourceIdentifier{std::string_view{value}}, true)) capture(*resolver, {});
         }
     }
 
@@ -632,7 +669,7 @@ namespace detail
             return;
         }
         if (auto resolver = graph->RequestResolver(id, true)) {
-            const auto state = resolver->CaptureDeclarationState();
+            const auto state = graph->CaptureResolverDeclarationState(*resolver);
             if (state) TrackResolverSnapshot(resolverSnapshots, *resolver, *state);
         }
     }
@@ -1091,30 +1128,28 @@ public:
     }
 
     template<typename AddCallable>
-    RenderPassBuilder& WithResolver(const IResourceResolver& resolver, AddCallable&& addCallable) & {
-        const auto state = resolver.CaptureDeclarationState();
+    RenderPassBuilder& WithResolverDeclaration(const IResourceResolver& resolver, AddCallable&& addCallable) & {
+        const auto state = graph->CaptureResolverDeclarationState(resolver);
         if (state && state->resources) {
-            addCallable(*graph->RequestResolverResourceHandles(*state));
+            addCallable(ResourceResolverAndRange{resolver});
         } else {
             const auto resources = resolver.Resolve();
             for (const auto& resource : resources) graph->AddResource(resource);
             addCallable(resources);
         }
-        if (state) detail::TrackResolverSnapshot(resolverSnapshots_, resolver, *state);
         return *this;
     }
 
     template<typename AddCallable>
-    RenderPassBuilder WithResolver(const IResourceResolver& resolver, AddCallable&& addCallable) && {
-        const auto state = resolver.CaptureDeclarationState();
+    RenderPassBuilder WithResolverDeclaration(const IResourceResolver& resolver, AddCallable&& addCallable) && {
+        const auto state = graph->CaptureResolverDeclarationState(resolver);
         if (state && state->resources) {
-            addCallable(*graph->RequestResolverResourceHandles(*state));
+            addCallable(ResourceResolverAndRange{resolver});
         } else {
             const auto resources = resolver.Resolve();
             for (const auto& resource : resources) graph->AddResource(resource);
             addCallable(resources);
         }
-        if (state) detail::TrackResolverSnapshot(resolverSnapshots_, resolver, *state);
         return std::move(*this);
     }
 
@@ -1122,105 +1157,105 @@ public:
 
 	// LVALUE overloads for IResourceResolver
     RenderPassBuilder& WithShaderResource(const IResourceResolver& r)& {
-        return WithResolver(r, [&](auto&& resolved) { addShaderResource(std::forward<decltype(resolved)>(resolved)); });
+        return WithResolverDeclaration(r, [&](auto&& resolved) { addShaderResource(std::forward<decltype(resolved)>(resolved)); });
     }
 
     RenderPassBuilder& WithRenderTarget(const IResourceResolver& r)& {
-        return WithResolver(r, [&](auto&& resolved) { addRenderTarget(std::forward<decltype(resolved)>(resolved)); });
+        return WithResolverDeclaration(r, [&](auto&& resolved) { addRenderTarget(std::forward<decltype(resolved)>(resolved)); });
 	}
 
     RenderPassBuilder& WithRenderTargetClear(const IResourceResolver& r)& {
-        return WithResolver(r, [&](auto&& resolved) { addRenderTargetClear(std::forward<decltype(resolved)>(resolved)); });
+        return WithResolverDeclaration(r, [&](auto&& resolved) { addRenderTargetClear(std::forward<decltype(resolved)>(resolved)); });
     }
 
     RenderPassBuilder& WithPresent(const IResourceResolver& r)& {
-        return WithResolver(r, [&](auto&& resolved) { addPresent(std::forward<decltype(resolved)>(resolved)); });
+        return WithResolverDeclaration(r, [&](auto&& resolved) { addPresent(std::forward<decltype(resolved)>(resolved)); });
     }
 
     RenderPassBuilder& WithDepthReadWrite(const IResourceResolver& r)& {
-		return WithResolver(r, [&](auto&& resolved) { addDepthReadWrite(std::forward<decltype(resolved)>(resolved)); });
+		return WithResolverDeclaration(r, [&](auto&& resolved) { addDepthReadWrite(std::forward<decltype(resolved)>(resolved)); });
     }
 
         RenderPassBuilder& WithDepthStencilClear(const IResourceResolver& r)& {
-		return WithResolver(r, [&](auto&& resolved) { addDepthStencilClear(std::forward<decltype(resolved)>(resolved)); });
+		return WithResolverDeclaration(r, [&](auto&& resolved) { addDepthStencilClear(std::forward<decltype(resolved)>(resolved)); });
         }
 
     RenderPassBuilder& WithDepthRead(const IResourceResolver& r)& {
-		return WithResolver(r, [&](auto&& resolved) { addDepthRead(std::forward<decltype(resolved)>(resolved)); });
+		return WithResolverDeclaration(r, [&](auto&& resolved) { addDepthRead(std::forward<decltype(resolved)>(resolved)); });
     }
 
 	RenderPassBuilder& WithConstantBuffer(const IResourceResolver& r)& {
-        return WithResolver(r, [&](auto&& resolved) { addConstantBuffer(std::forward<decltype(resolved)>(resolved)); });
+        return WithResolverDeclaration(r, [&](auto&& resolved) { addConstantBuffer(std::forward<decltype(resolved)>(resolved)); });
 	}
 
     RenderPassBuilder& WithUnorderedAccess(const IResourceResolver& r)& {
-        return WithResolver(r, [&](auto&& resolved) { addUnorderedAccess(std::forward<decltype(resolved)>(resolved)); });
+        return WithResolverDeclaration(r, [&](auto&& resolved) { addUnorderedAccess(std::forward<decltype(resolved)>(resolved)); });
 	}
 
     RenderPassBuilder& WithUnorderedAccessClear(const IResourceResolver& r)& {
-        return WithResolver(r, [&](auto&& resolved) { addUnorderedAccessClear(std::forward<decltype(resolved)>(resolved)); });
+        return WithResolverDeclaration(r, [&](auto&& resolved) { addUnorderedAccessClear(std::forward<decltype(resolved)>(resolved)); });
 	}
 
     RenderPassBuilder& WithCopyDest(const IResourceResolver& r)& {
-		return WithResolver(r, [&](auto&& resolved) { addCopyDest(std::forward<decltype(resolved)>(resolved)); });
+		return WithResolverDeclaration(r, [&](auto&& resolved) { addCopyDest(std::forward<decltype(resolved)>(resolved)); });
     }
 
     RenderPassBuilder& WithCopySource(const IResourceResolver& r)& {
-		return WithResolver(r, [&](auto&& resolved) { addCopySource(std::forward<decltype(resolved)>(resolved)); });
+		return WithResolverDeclaration(r, [&](auto&& resolved) { addCopySource(std::forward<decltype(resolved)>(resolved)); });
     }
 
     RenderPassBuilder& WithIndirectArguments(const IResourceResolver& r)& {
-        return WithResolver(r, [&](auto&& resolved) { addIndirectArguments(std::forward<decltype(resolved)>(resolved)); });
+        return WithResolverDeclaration(r, [&](auto&& resolved) { addIndirectArguments(std::forward<decltype(resolved)>(resolved)); });
 	}
 
     RenderPassBuilder& WithLegacyInterop(const IResourceResolver& r)& {
-        return WithResolver(r, [&](auto&& resolved) { addLegacyInterop(std::forward<decltype(resolved)>(resolved)); });
+        return WithResolverDeclaration(r, [&](auto&& resolved) { addLegacyInterop(std::forward<decltype(resolved)>(resolved)); });
 	}
 
 	// RVALUE overloads for IResourceResolver
 
     RenderPassBuilder WithShaderResource(const IResourceResolver& r)&& {
-        return std::move(*this).WithResolver(r, [&](auto&& resolved) { addShaderResource(std::forward<decltype(resolved)>(resolved)); });
+        return std::move(*this).WithResolverDeclaration(r, [&](auto&& resolved) { addShaderResource(std::forward<decltype(resolved)>(resolved)); });
 	}
     RenderPassBuilder WithRenderTarget(const IResourceResolver& r)&& {
-		return std::move(*this).WithResolver(r, [&](auto&& resolved) { addRenderTarget(std::forward<decltype(resolved)>(resolved)); });
+		return std::move(*this).WithResolverDeclaration(r, [&](auto&& resolved) { addRenderTarget(std::forward<decltype(resolved)>(resolved)); });
     }
         RenderPassBuilder WithRenderTargetClear(const IResourceResolver& r)&& {
-                return std::move(*this).WithResolver(r, [&](auto&& resolved) { addRenderTargetClear(std::forward<decltype(resolved)>(resolved)); });
+                return std::move(*this).WithResolverDeclaration(r, [&](auto&& resolved) { addRenderTargetClear(std::forward<decltype(resolved)>(resolved)); });
         }
     RenderPassBuilder WithPresent(const IResourceResolver& r)&& {
-        return std::move(*this).WithResolver(r, [&](auto&& resolved) { addPresent(std::forward<decltype(resolved)>(resolved)); });
+        return std::move(*this).WithResolverDeclaration(r, [&](auto&& resolved) { addPresent(std::forward<decltype(resolved)>(resolved)); });
     }
     RenderPassBuilder WithDepthReadWrite(const IResourceResolver& r)&& {
-		return std::move(*this).WithResolver(r, [&](auto&& resolved) { addDepthReadWrite(std::forward<decltype(resolved)>(resolved)); });
+		return std::move(*this).WithResolverDeclaration(r, [&](auto&& resolved) { addDepthReadWrite(std::forward<decltype(resolved)>(resolved)); });
     }
 
         RenderPassBuilder WithDepthStencilClear(const IResourceResolver& r)&& {
-		return std::move(*this).WithResolver(r, [&](auto&& resolved) { addDepthStencilClear(std::forward<decltype(resolved)>(resolved)); });
+		return std::move(*this).WithResolverDeclaration(r, [&](auto&& resolved) { addDepthStencilClear(std::forward<decltype(resolved)>(resolved)); });
         }
     RenderPassBuilder WithDepthRead(const IResourceResolver& r)&& {
-		return std::move(*this).WithResolver(r, [&](auto&& resolved) { addDepthRead(std::forward<decltype(resolved)>(resolved)); });
+		return std::move(*this).WithResolverDeclaration(r, [&](auto&& resolved) { addDepthRead(std::forward<decltype(resolved)>(resolved)); });
     }
     RenderPassBuilder WithConstantBuffer(const IResourceResolver& r)&& {
-		return std::move(*this).WithResolver(r, [&](auto&& resolved) { addConstantBuffer(std::forward<decltype(resolved)>(resolved)); });
+		return std::move(*this).WithResolverDeclaration(r, [&](auto&& resolved) { addConstantBuffer(std::forward<decltype(resolved)>(resolved)); });
     }
     RenderPassBuilder WithUnorderedAccess(const IResourceResolver& r)&& {
-		return std::move(*this).WithResolver(r, [&](auto&& resolved) { addUnorderedAccess(std::forward<decltype(resolved)>(resolved)); });
+		return std::move(*this).WithResolverDeclaration(r, [&](auto&& resolved) { addUnorderedAccess(std::forward<decltype(resolved)>(resolved)); });
     }
         RenderPassBuilder WithUnorderedAccessClear(const IResourceResolver& r)&& {
-		return std::move(*this).WithResolver(r, [&](auto&& resolved) { addUnorderedAccessClear(std::forward<decltype(resolved)>(resolved)); });
+		return std::move(*this).WithResolverDeclaration(r, [&](auto&& resolved) { addUnorderedAccessClear(std::forward<decltype(resolved)>(resolved)); });
         }
     RenderPassBuilder WithCopyDest(const IResourceResolver& r)&& {
-		return std::move(*this).WithResolver(r, [&](auto&& resolved) { addCopyDest(std::forward<decltype(resolved)>(resolved)); });
+		return std::move(*this).WithResolverDeclaration(r, [&](auto&& resolved) { addCopyDest(std::forward<decltype(resolved)>(resolved)); });
     }
     RenderPassBuilder WithCopySource(const IResourceResolver& r)&& {
-		return std::move(*this).WithResolver(r, [&](auto&& resolved) { addCopySource(std::forward<decltype(resolved)>(resolved)); });
+		return std::move(*this).WithResolverDeclaration(r, [&](auto&& resolved) { addCopySource(std::forward<decltype(resolved)>(resolved)); });
     }
     RenderPassBuilder WithIndirectArguments(const IResourceResolver& r)&& {
-		return std::move(*this).WithResolver(r, [&](auto&& resolved) { addIndirectArguments(std::forward<decltype(resolved)>(resolved)); });
+		return std::move(*this).WithResolverDeclaration(r, [&](auto&& resolved) { addIndirectArguments(std::forward<decltype(resolved)>(resolved)); });
     }
     RenderPassBuilder WithLegacyInterop(const IResourceResolver& r)&& {
-        return std::move(*this).WithResolver(r, [&](auto&& resolved) { addLegacyInterop(std::forward<decltype(resolved)>(resolved)); });
+        return std::move(*this).WithResolverDeclaration(r, [&](auto&& resolved) { addLegacyInterop(std::forward<decltype(resolved)>(resolved)); });
 	}
 
 	RenderPassBuilder& IsGeometryPass()& {
@@ -1391,7 +1426,8 @@ private:
 	template<typename T>
         requires ResourceLike<T>
 	RenderPassBuilder& addShaderResource(T&& x) {
-    detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
+    detail::TrackResolverDeclaration(graph, resolverSnapshots_, x,
+            ResourceState{rhi::ResourceAccessType::ShaderResource, AccessToLayout(rhi::ResourceAccessType::ShaderResource, true), RenderSyncFromAccess(rhi::ResourceAccessType::ShaderResource)});
     detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorShaderResources, x, DescriptorType::SRV);
         detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.shaderResources, std::forward<T>(x));
@@ -1411,7 +1447,8 @@ private:
     template<typename T>
         requires ResourceLike<T>
     RenderPassBuilder& addRenderTarget(T&& x) {
-        detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
+        detail::TrackResolverDeclaration(graph, resolverSnapshots_, x,
+            ResourceState{rhi::ResourceAccessType::RenderTarget, AccessToLayout(rhi::ResourceAccessType::RenderTarget, true), RenderSyncFromAccess(rhi::ResourceAccessType::RenderTarget)});
         detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.renderTargets, std::forward<T>(x));
 		return *this;
@@ -1429,7 +1466,8 @@ private:
     template<typename T>
         requires ResourceLike<T>
     RenderPassBuilder& addRenderTargetClear(T&& x) {
-        detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
+        detail::TrackResolverDeclaration(graph, resolverSnapshots_, x,
+            ResourceState{rhi::ResourceAccessType::RenderTargetClear, AccessToLayout(rhi::ResourceAccessType::RenderTargetClear, true), RenderSyncFromAccess(rhi::ResourceAccessType::RenderTargetClear)});
         detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.renderTargetClearResources, std::forward<T>(x));
         return *this;
@@ -1448,7 +1486,8 @@ private:
 	template<typename T>
         requires ResourceLike<T>
 	RenderPassBuilder& addDepthReadWrite(T&& x) {
-        detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
+        detail::TrackResolverDeclaration(graph, resolverSnapshots_, x,
+            ResourceState{rhi::ResourceAccessType::DepthReadWrite, AccessToLayout(rhi::ResourceAccessType::DepthReadWrite, true), RenderSyncFromAccess(rhi::ResourceAccessType::DepthReadWrite)});
     detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.depthReadWriteResources, std::forward<T>(x));
 		return *this;
@@ -1466,7 +1505,8 @@ private:
 	template<typename T>
     requires ResourceLike<T>
 	RenderPassBuilder& addDepthStencilClear(T&& x) {
-    detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
+    detail::TrackResolverDeclaration(graph, resolverSnapshots_, x,
+            ResourceState{rhi::ResourceAccessType::DepthStencilClear, AccessToLayout(rhi::ResourceAccessType::DepthStencilClear, true), RenderSyncFromAccess(rhi::ResourceAccessType::DepthStencilClear)});
     detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
     detail::AppendTrackedResource(graph, _declaredIds, params.depthStencilClearResources, std::forward<T>(x));
 		return *this;
@@ -1484,7 +1524,8 @@ private:
 	template<typename T>
         requires ResourceLike<T>
 	RenderPassBuilder& addDepthRead(T&& x) {
-        detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
+        detail::TrackResolverDeclaration(graph, resolverSnapshots_, x,
+            ResourceState{rhi::ResourceAccessType::DepthRead, AccessToLayout(rhi::ResourceAccessType::DepthRead, true), RenderSyncFromAccess(rhi::ResourceAccessType::DepthRead)});
     detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.depthReadResources, std::forward<T>(x));
 		return *this;
@@ -1503,7 +1544,8 @@ private:
 	template<typename T>
         requires ResourceLike<T>
 	RenderPassBuilder& addConstantBuffer(T&& x) {
-    detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
+    detail::TrackResolverDeclaration(graph, resolverSnapshots_, x,
+            ResourceState{rhi::ResourceAccessType::ConstantBuffer, AccessToLayout(rhi::ResourceAccessType::ConstantBuffer, true), RenderSyncFromAccess(rhi::ResourceAccessType::ConstantBuffer)});
     detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorConstantBuffers, x, DescriptorType::CBV);
         detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.constantBuffers, std::forward<T>(x));
@@ -1523,7 +1565,8 @@ private:
 	template<typename T>
         requires ResourceLike<T>
 	RenderPassBuilder& addUnorderedAccess(T&& x) {
-    detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
+    detail::TrackResolverDeclaration(graph, resolverSnapshots_, x,
+            ResourceState{rhi::ResourceAccessType::UnorderedAccess, AccessToLayout(rhi::ResourceAccessType::UnorderedAccess, true), RenderSyncFromAccess(rhi::ResourceAccessType::UnorderedAccess)});
     detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorUnorderedAccessViews, x, DescriptorType::UAV);
         detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.unorderedAccessViews, std::forward<T>(x));
@@ -1542,7 +1585,8 @@ private:
     template<typename T>
         requires ResourceLike<T>
     RenderPassBuilder& addUnorderedAccessClear(T&& x) {
-        detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
+        detail::TrackResolverDeclaration(graph, resolverSnapshots_, x,
+            ResourceState{rhi::ResourceAccessType::UnorderedAccessClear, AccessToLayout(rhi::ResourceAccessType::UnorderedAccessClear, true), RenderSyncFromAccess(rhi::ResourceAccessType::UnorderedAccessClear)});
         detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorUnorderedAccessViews, x, DescriptorType::UAV);
         detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.unorderedAccessClearViews, std::forward<T>(x));
@@ -1562,7 +1606,8 @@ private:
 	template<typename T>
         requires ResourceLike<T>
 	RenderPassBuilder& addCopyDest(T&& x) {
-        detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
+        detail::TrackResolverDeclaration(graph, resolverSnapshots_, x,
+            ResourceState{rhi::ResourceAccessType::CopyDest, AccessToLayout(rhi::ResourceAccessType::CopyDest, true), RenderSyncFromAccess(rhi::ResourceAccessType::CopyDest)});
     detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.copyTargets, std::forward<T>(x));
 		return *this;
@@ -1581,7 +1626,8 @@ private:
 	template<typename T>
         requires ResourceLike<T>
 	RenderPassBuilder& addCopySource(T&& x) {
-        detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
+        detail::TrackResolverDeclaration(graph, resolverSnapshots_, x,
+            ResourceState{rhi::ResourceAccessType::CopySource, AccessToLayout(rhi::ResourceAccessType::CopySource, true), RenderSyncFromAccess(rhi::ResourceAccessType::CopySource)});
     detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.copySources, std::forward<T>(x));
 		return *this;
@@ -1600,7 +1646,8 @@ private:
 	template<typename T>
         requires ResourceLike<T>
 	RenderPassBuilder& addIndirectArguments(T&& x) {
-        detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
+        detail::TrackResolverDeclaration(graph, resolverSnapshots_, x,
+            ResourceState{rhi::ResourceAccessType::IndirectArgument, AccessToLayout(rhi::ResourceAccessType::IndirectArgument, true), RenderSyncFromAccess(rhi::ResourceAccessType::IndirectArgument)});
     detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.indirectArgumentBuffers, std::forward<T>(x));
 		return *this;
@@ -1609,7 +1656,8 @@ private:
     template<typename T>
         requires ResourceLike<T>
     RenderPassBuilder& addIndexBuffer(T&& x) {
-        detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
+        detail::TrackResolverDeclaration(graph, resolverSnapshots_, x,
+            ResourceState{rhi::ResourceAccessType::IndexBuffer, AccessToLayout(rhi::ResourceAccessType::IndexBuffer, true), RenderSyncFromAccess(rhi::ResourceAccessType::IndexBuffer)});
         detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.indexBuffers, std::forward<T>(x));
         return *this;
@@ -1627,7 +1675,8 @@ private:
     template<typename T>
         requires ResourceLike<T>
     RenderPassBuilder& addPresent(T&& x) {
-        detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
+        detail::TrackResolverDeclaration(graph, resolverSnapshots_, x,
+            ResourceState{rhi::ResourceAccessType::Present, AccessToLayout(rhi::ResourceAccessType::Present, true), RenderSyncFromAccess(rhi::ResourceAccessType::Present)});
         detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.presentResources, std::forward<T>(x));
         return *this;
@@ -1647,7 +1696,8 @@ private:
     template<typename T>
         requires ResourceLike<T>
     RenderPassBuilder& addLegacyInterop(T&& x) {
-        detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
+        detail::TrackResolverDeclaration(graph, resolverSnapshots_, x,
+            ResourceState{rhi::ResourceAccessType::Common, AccessToLayout(rhi::ResourceAccessType::Common, true), RenderSyncFromAccess(rhi::ResourceAccessType::Common)});
         detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.legacyInteropResources, std::forward<T>(x));
         return *this;
@@ -1864,30 +1914,28 @@ public:
     }
 
     template<typename AddCallable>
-    ComputePassBuilder& WithResolver(const IResourceResolver& resolver, AddCallable&& addCallable) & {
-        const auto state = resolver.CaptureDeclarationState();
+    ComputePassBuilder& WithResolverDeclaration(const IResourceResolver& resolver, AddCallable&& addCallable) & {
+        const auto state = graph->CaptureResolverDeclarationState(resolver);
         if (state && state->resources) {
-            addCallable(*graph->RequestResolverResourceHandles(*state));
+            addCallable(ResourceResolverAndRange{resolver});
         } else {
             const auto resources = resolver.Resolve();
             for (const auto& resource : resources) graph->AddResource(resource);
             addCallable(resources);
         }
-        if (state) detail::TrackResolverSnapshot(resolverSnapshots_, resolver, *state);
         return *this;
     }
 
     template<typename AddCallable>
-    ComputePassBuilder WithResolver(const IResourceResolver& resolver, AddCallable&& addCallable) && {
-        const auto state = resolver.CaptureDeclarationState();
+    ComputePassBuilder WithResolverDeclaration(const IResourceResolver& resolver, AddCallable&& addCallable) && {
+        const auto state = graph->CaptureResolverDeclarationState(resolver);
         if (state && state->resources) {
-            addCallable(*graph->RequestResolverResourceHandles(*state));
+            addCallable(ResourceResolverAndRange{resolver});
         } else {
             const auto resources = resolver.Resolve();
             for (const auto& resource : resources) graph->AddResource(resource);
             addCallable(resources);
         }
-        if (state) detail::TrackResolverSnapshot(resolverSnapshots_, resolver, *state);
         return std::move(*this);
     }
 
@@ -1958,52 +2006,52 @@ public:
 
         // LVALUE overloads for IResourceResolver
         ComputePassBuilder& WithShaderResource(const IResourceResolver& r)& {
-		return WithResolver(r, [&](auto&& resolved) { addShaderResource(std::forward<decltype(resolved)>(resolved)); });
+		return WithResolverDeclaration(r, [&](auto&& resolved) { addShaderResource(std::forward<decltype(resolved)>(resolved)); });
         }
 
         ComputePassBuilder& WithConstantBuffer(const IResourceResolver& r)& {
-		return WithResolver(r, [&](auto&& resolved) { addConstantBuffer(std::forward<decltype(resolved)>(resolved)); });
+		return WithResolverDeclaration(r, [&](auto&& resolved) { addConstantBuffer(std::forward<decltype(resolved)>(resolved)); });
         }
 
         ComputePassBuilder& WithUnorderedAccess(const IResourceResolver& r)& {
-		return WithResolver(r, [&](auto&& resolved) { addUnorderedAccess(std::forward<decltype(resolved)>(resolved)); });
+		return WithResolverDeclaration(r, [&](auto&& resolved) { addUnorderedAccess(std::forward<decltype(resolved)>(resolved)); });
         }
 
         ComputePassBuilder& WithUnorderedAccessClear(const IResourceResolver& r)& {
-		return WithResolver(r, [&](auto&& resolved) { addUnorderedAccessClear(std::forward<decltype(resolved)>(resolved)); });
+		return WithResolverDeclaration(r, [&](auto&& resolved) { addUnorderedAccessClear(std::forward<decltype(resolved)>(resolved)); });
         }
 
         ComputePassBuilder& WithIndirectArguments(const IResourceResolver& r)& {
-		return WithResolver(r, [&](auto&& resolved) { addIndirectArguments(std::forward<decltype(resolved)>(resolved)); });
+		return WithResolverDeclaration(r, [&](auto&& resolved) { addIndirectArguments(std::forward<decltype(resolved)>(resolved)); });
         }
 
         ComputePassBuilder& WithLegacyInterop(const IResourceResolver& r)& {
-		return WithResolver(r, [&](auto&& resolved) { addLegacyInterop(std::forward<decltype(resolved)>(resolved)); });
+		return WithResolverDeclaration(r, [&](auto&& resolved) { addLegacyInterop(std::forward<decltype(resolved)>(resolved)); });
         }
 
         // RVALUE overloads for IResourceResolver
         ComputePassBuilder WithShaderResource(const IResourceResolver& r)&& {
-		return std::move(*this).WithResolver(r, [&](auto&& resolved) { addShaderResource(std::forward<decltype(resolved)>(resolved)); });
+		return std::move(*this).WithResolverDeclaration(r, [&](auto&& resolved) { addShaderResource(std::forward<decltype(resolved)>(resolved)); });
         }
 
         ComputePassBuilder WithConstantBuffer(const IResourceResolver& r)&& {
-		return std::move(*this).WithResolver(r, [&](auto&& resolved) { addConstantBuffer(std::forward<decltype(resolved)>(resolved)); });
+		return std::move(*this).WithResolverDeclaration(r, [&](auto&& resolved) { addConstantBuffer(std::forward<decltype(resolved)>(resolved)); });
         }
 
         ComputePassBuilder WithUnorderedAccess(const IResourceResolver& r)&& {
-		return std::move(*this).WithResolver(r, [&](auto&& resolved) { addUnorderedAccess(std::forward<decltype(resolved)>(resolved)); });
+		return std::move(*this).WithResolverDeclaration(r, [&](auto&& resolved) { addUnorderedAccess(std::forward<decltype(resolved)>(resolved)); });
         }
 
         ComputePassBuilder WithUnorderedAccessClear(const IResourceResolver& r)&& {
-		return std::move(*this).WithResolver(r, [&](auto&& resolved) { addUnorderedAccessClear(std::forward<decltype(resolved)>(resolved)); });
+		return std::move(*this).WithResolverDeclaration(r, [&](auto&& resolved) { addUnorderedAccessClear(std::forward<decltype(resolved)>(resolved)); });
         }
 
         ComputePassBuilder WithIndirectArguments(const IResourceResolver& r)&& {
-		return std::move(*this).WithResolver(r, [&](auto&& resolved) { addIndirectArguments(std::forward<decltype(resolved)>(resolved)); });
+		return std::move(*this).WithResolverDeclaration(r, [&](auto&& resolved) { addIndirectArguments(std::forward<decltype(resolved)>(resolved)); });
         }
 
         ComputePassBuilder WithLegacyInterop(const IResourceResolver& r)&& {
-		return std::move(*this).WithResolver(r, [&](auto&& resolved) { addLegacyInterop(std::forward<decltype(resolved)>(resolved)); });
+		return std::move(*this).WithResolverDeclaration(r, [&](auto&& resolved) { addLegacyInterop(std::forward<decltype(resolved)>(resolved)); });
         }
 
     auto const& DeclaredResourceIds() const { return _declaredIds; }
@@ -2099,7 +2147,8 @@ private:
 	template<typename T>
         requires ResourceLike<T>
 	ComputePassBuilder& addShaderResource(T&& x) {
-        detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
+        detail::TrackResolverDeclaration(graph, resolverSnapshots_, x,
+            ResourceState{rhi::ResourceAccessType::ShaderResource, AccessToLayout(rhi::ResourceAccessType::ShaderResource, true), ComputeSyncFromAccess(rhi::ResourceAccessType::ShaderResource)});
     detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorShaderResources, x, DescriptorType::SRV);
         detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.shaderResources, std::forward<T>(x));
@@ -2119,7 +2168,8 @@ private:
 	template<typename T>
         requires ResourceLike<T>
 	ComputePassBuilder& addConstantBuffer(T&& x) {
-        detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
+        detail::TrackResolverDeclaration(graph, resolverSnapshots_, x,
+            ResourceState{rhi::ResourceAccessType::ConstantBuffer, AccessToLayout(rhi::ResourceAccessType::ConstantBuffer, true), ComputeSyncFromAccess(rhi::ResourceAccessType::ConstantBuffer)});
     detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorConstantBuffers, x, DescriptorType::CBV);
         detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.constantBuffers, std::forward<T>(x));
@@ -2139,7 +2189,8 @@ private:
 	template<typename T>
         requires ResourceLike<T>
 	ComputePassBuilder& addUnorderedAccess(T&& x) {
-        detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
+        detail::TrackResolverDeclaration(graph, resolverSnapshots_, x,
+            ResourceState{rhi::ResourceAccessType::UnorderedAccess, AccessToLayout(rhi::ResourceAccessType::UnorderedAccess, true), ComputeSyncFromAccess(rhi::ResourceAccessType::UnorderedAccess)});
     detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorUnorderedAccessViews, x, DescriptorType::UAV);
         detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.unorderedAccessViews, std::forward<T>(x));
@@ -2158,7 +2209,8 @@ private:
     template<typename T>
         requires ResourceLike<T>
     ComputePassBuilder& addUnorderedAccessClear(T&& x) {
-        detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
+        detail::TrackResolverDeclaration(graph, resolverSnapshots_, x,
+            ResourceState{rhi::ResourceAccessType::UnorderedAccessClear, AccessToLayout(rhi::ResourceAccessType::UnorderedAccessClear, true), ComputeSyncFromAccess(rhi::ResourceAccessType::UnorderedAccessClear)});
         detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorUnorderedAccessViews, x, DescriptorType::UAV);
         detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.unorderedAccessClearViews, std::forward<T>(x));
@@ -2178,7 +2230,8 @@ private:
 	template<typename T>
         requires ResourceLike<T>
 	ComputePassBuilder& addIndirectArguments(T&& x) {
-        detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
+        detail::TrackResolverDeclaration(graph, resolverSnapshots_, x,
+            ResourceState{rhi::ResourceAccessType::IndirectArgument, AccessToLayout(rhi::ResourceAccessType::IndirectArgument, true), ComputeSyncFromAccess(rhi::ResourceAccessType::IndirectArgument)});
     detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.indirectArgumentBuffers, std::forward<T>(x));
 		return *this;
@@ -2197,7 +2250,8 @@ private:
     template<typename T>
         requires ResourceLike<T>
     ComputePassBuilder& addLegacyInterop(T&& x) {
-        detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
+        detail::TrackResolverDeclaration(graph, resolverSnapshots_, x,
+            ResourceState{rhi::ResourceAccessType::Common, AccessToLayout(rhi::ResourceAccessType::Common, true), ComputeSyncFromAccess(rhi::ResourceAccessType::Common)});
         detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.legacyInteropResources, std::forward<T>(x));
         return *this;
@@ -2334,30 +2388,28 @@ public:
     }
 
     template<typename AddCallable>
-    CopyPassBuilder& WithResolver(const IResourceResolver& resolver, AddCallable&& addCallable) & {
-        const auto state = resolver.CaptureDeclarationState();
+    CopyPassBuilder& WithResolverDeclaration(const IResourceResolver& resolver, AddCallable&& addCallable) & {
+        const auto state = graph->CaptureResolverDeclarationState(resolver);
         if (state && state->resources) {
-            addCallable(*graph->RequestResolverResourceHandles(*state));
+            addCallable(ResourceResolverAndRange{resolver});
         } else {
             const auto resources = resolver.Resolve();
             for (const auto& resource : resources) graph->AddResource(resource);
             addCallable(resources);
         }
-        if (state) detail::TrackResolverSnapshot(resolverSnapshots_, resolver, *state);
         return *this;
     }
 
     template<typename AddCallable>
-    CopyPassBuilder WithResolver(const IResourceResolver& resolver, AddCallable&& addCallable) && {
-        const auto state = resolver.CaptureDeclarationState();
+    CopyPassBuilder WithResolverDeclaration(const IResourceResolver& resolver, AddCallable&& addCallable) && {
+        const auto state = graph->CaptureResolverDeclarationState(resolver);
         if (state && state->resources) {
-            addCallable(*graph->RequestResolverResourceHandles(*state));
+            addCallable(ResourceResolverAndRange{resolver});
         } else {
             const auto resources = resolver.Resolve();
             for (const auto& resource : resources) graph->AddResource(resource);
             addCallable(resources);
         }
-        if (state) detail::TrackResolverSnapshot(resolverSnapshots_, resolver, *state);
         return std::move(*this);
     }
 
@@ -2427,19 +2479,19 @@ public:
 	CopyPassBuilder WithExternalWaitBindingBeforeTransitions(ExternalTimelineBinding binding) && { params.externalWaitBindingsBeforeTransitions.push_back(binding); return std::move(*this); }
 
     CopyPassBuilder& WithCopyDest(const IResourceResolver& r)& {
-        return WithResolver(r, [&](auto&& resolved) { addCopyDest(std::forward<decltype(resolved)>(resolved)); });
+        return WithResolverDeclaration(r, [&](auto&& resolved) { addCopyDest(std::forward<decltype(resolved)>(resolved)); });
     }
 
     CopyPassBuilder& WithCopySource(const IResourceResolver& r)& {
-        return WithResolver(r, [&](auto&& resolved) { addCopySource(std::forward<decltype(resolved)>(resolved)); });
+        return WithResolverDeclaration(r, [&](auto&& resolved) { addCopySource(std::forward<decltype(resolved)>(resolved)); });
     }
 
     CopyPassBuilder WithCopyDest(const IResourceResolver& r)&& {
-        return std::move(*this).WithResolver(r, [&](auto&& resolved) { addCopyDest(std::forward<decltype(resolved)>(resolved)); });
+        return std::move(*this).WithResolverDeclaration(r, [&](auto&& resolved) { addCopyDest(std::forward<decltype(resolved)>(resolved)); });
     }
 
     CopyPassBuilder WithCopySource(const IResourceResolver& r)&& {
-        return std::move(*this).WithResolver(r, [&](auto&& resolved) { addCopySource(std::forward<decltype(resolved)>(resolved)); });
+        return std::move(*this).WithResolverDeclaration(r, [&](auto&& resolved) { addCopySource(std::forward<decltype(resolved)>(resolved)); });
     }
 
     auto const& DeclaredResourceIds() const { return _declaredIds; }
@@ -2531,7 +2583,8 @@ private:
     template<typename T>
         requires ResourceLike<T>
     CopyPassBuilder& addCopyDest(T&& x) {
-        detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
+        detail::TrackResolverDeclaration(graph, resolverSnapshots_, x,
+            ResourceState{rhi::ResourceAccessType::CopyDest, AccessToLayout(rhi::ResourceAccessType::CopyDest, true), rhi::ResourceSyncState::Copy});
         detail::AppendTrackedResource(graph, _declaredIds, params.copyTargets, std::forward<T>(x));
         return *this;
     }
@@ -2549,7 +2602,8 @@ private:
     template<typename T>
         requires ResourceLike<T>
     CopyPassBuilder& addCopySource(T&& x) {
-        detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
+        detail::TrackResolverDeclaration(graph, resolverSnapshots_, x,
+            ResourceState{rhi::ResourceAccessType::CopySource, AccessToLayout(rhi::ResourceAccessType::CopySource, true), rhi::ResourceSyncState::Copy});
         detail::AppendTrackedResource(graph, _declaredIds, params.copySources, std::forward<T>(x));
         return *this;
     }

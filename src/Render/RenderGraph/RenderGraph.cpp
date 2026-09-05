@@ -2002,7 +2002,8 @@ bool RenderGraph::BuildDependencyGraph(
 		nodes[to].indegree++;
 	}
 
-	return FinalizeDependencyGraph(nodes);
+	const bool valid = FinalizeDependencyGraph(nodes);
+	return valid;
 }
 
 bool RenderGraph::FinalizeDependencyGraph(std::vector<Node>& nodes)
@@ -3772,6 +3773,7 @@ RenderGraph::~RenderGraph() {
 }
 
 void RenderGraph::ShutdownTaskWorkers() {
+    m_compilerState->shadowCompiler.reset();
 	m_queueRegistry.ShutdownTaskWorkers();
 	m_taskService.reset();
 	org::runtime::SetDefaultTaskService({});
@@ -3786,6 +3788,7 @@ void RenderGraph::ShutdownRuntime() {
 
 void RenderGraph::ShutdownOwnedState() {
 	ShutdownTaskWorkers();
+    m_resolverCaptureContext.reset();
 	batches.clear();
 	m_reusablePassBatches.clear();
 	initialTransitions.clear();
@@ -3865,6 +3868,8 @@ void RenderGraph::ShutdownOwnedState() {
 	_resolverMap.clear();
 	_registry = ResourceRegistry();
 	++m_resourceRegistryGeneration;
+    m_resolverCaptureContext.reset();
+    if (m_compilerState->shadowCompiler) m_compilerState->shadowCompiler->Reset(m_resourceRegistryGeneration);
 	m_resolverHandleCache.clear();
 	m_resolverRequirementBlockCache.clear();
 	// Queue shutdown is the final completion point. Release placed resources
@@ -7705,6 +7710,7 @@ std::shared_ptr<ComputePass> RenderGraph::GetComputePassByName(const std::string
 
 void RenderGraph::Update(const UpdateExecutionContext& context, rhi::Device device) {
 	BT_ZONE_SCOPE("RenderGraph::Update");
+    m_resolverCaptureContext = context.resolverCaptureContext;
 	const bool traceLifecycle = m_getRenderGraphBatchTraceEnabled && m_getRenderGraphBatchTraceEnabled();
 	{
 		BT_ZONE_SCOPE("RenderGraph::Update::ResetForFrame");

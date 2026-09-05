@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Render/RenderGraph/RenderGraph.h"
+#include "Render/RenderGraph/ExperimentalGraphCompiler.h"
 
 
 // Private compiler representation. Keep compiler-only data here rather than in
@@ -29,6 +30,9 @@ struct RenderGraph::Node {
 };
 
 struct RenderGraph::CompilerState {
+    std::unique_ptr<experimental::GraphCompileCoordinator> shadowCompiler;
+    uint64_t reportedShadowFailures = 0;
+    uint64_t shadowCaptureFailures = 0;
 	struct SeqState {
 		std::optional<size_t> lastWriter;
 		std::vector<size_t> readsSinceWrite;
