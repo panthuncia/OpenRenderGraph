@@ -1,9 +1,11 @@
 #include "Render/RenderGraph/RenderGraph.h"
 #include "RenderGraphCompilerState.h"
+#include "Render/RenderGraph/ExperimentalRhiExecution.h"
 
 #include <span>
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <limits>
 #include <numeric>
@@ -39,12 +41,20 @@ namespace {
 
 	Resource* UnwrapDynamicResource(Resource* resource) noexcept {
 		auto* current = resource;
-		while (auto* dynamicResource = dynamic_cast<DynamicResource*>(current)) {
-			auto backing = dynamicResource->GetResource();
-			current = backing.get();
-			if (!current) {
-				break;
+		for (;;) {
+			if (auto* dynamicResource = dynamic_cast<DynamicResource*>(current)) {
+				auto backing = dynamicResource->GetResource();
+				current = backing.get();
+				if (!current) break;
+				continue;
 			}
+			if (auto* dynamicResource = dynamic_cast<DynamicGloballyIndexedResource*>(current)) {
+				auto backing = dynamicResource->GetResource();
+				current = backing.get();
+				if (!current) break;
+				continue;
+			}
+			break;
 		}
 		return current;
 	}
@@ -1714,13 +1724,18 @@ std::span<const uint64_t> RenderGraph::GetSchedulingEquivalentIDsCached(uint64_t
 
 void RenderGraph::SubmitDependencyCompileShadow(const std::vector<Node>& nodes,
     std::span<const std::pair<size_t, size_t>> explicitEdges,
-    std::vector<std::pair<uint32_t, uint32_t>> dependencyOracle) try {
-    const bool enabled = m_renderGraphSettingsService &&
-        m_renderGraphSettingsService->GetExperimentalAsyncCompileShadow();
+    std::vector<std::pair<uint32_t, uint32_t>> dependencyOracle,
+    uint8_t frameIndex, float deltaTime, const IHostExecutionData* hostData) try {
+    const auto mode = m_renderGraphSettingsService
+        ? m_renderGraphSettingsService->GetExperimentalAsyncCompileMode()
+        : runtime::AsyncCompileMode::Off;
+    const bool enabled = mode != runtime::AsyncCompileMode::Off;
     if (!enabled) {
         m_compilerState->shadowCompiler.reset();
         return;
     }
+    if (mode == runtime::AsyncCompileMode::Async)
+        BT_PLOT("ORG.AsyncCompile.Fallback.SceneExecutionNotMigrated", int64_t{1});
     BT_ZONE_SCOPE("ORG.AsyncCompile.CaptureDependencies");
     if (!m_taskService) {
         BT_PLOT("ORG.AsyncCompile.FallbackNoTaskService", int64_t{1});
@@ -1734,16 +1749,164 @@ void RenderGraph::SubmitDependencyCompileShadow(const std::vector<Node>& nodes,
     if (m_resolverCaptureContext) input.leases.push_back(m_resolverCaptureContext);
     input.structure.generation = m_resourceRegistryGeneration;
     input.structure.registryGeneration = m_resourceRegistryGeneration;
-    input.structure.resourceIDs = m_frameDAGResourceIDsByIndex;
+    // The dense live index also contains helper identities for dynamic wrappers
+    // and their current backings. Capture only indices actually referenced by
+    // pass access/state declarations; otherwise backing rotation looks like a
+    // structural membership change despite never affecting the compiler DAG.
+    std::vector<uint8_t> referenced(m_frameDAGResourceCount);
+    for (const auto& node : nodes) if (node.passIndex < m_framePassAccessSummaries.size()) {
+        const auto& summary = m_framePassAccessSummaries[node.passIndex];
+        for (const auto& access : summary.dagAccesses)
+            if (access.resourceIndex < referenced.size()) referenced[access.resourceIndex] = 1;
+        for (const auto& requirement : summary.requirementSummaries)
+            if (requirement.dagResourceIndex < referenced.size()) referenced[requirement.dagResourceIndex] = 1;
+        for (const auto& transition : summary.internalTransitionSummaries)
+            if (transition.dagResourceIndex < referenced.size()) referenced[transition.dagResourceIndex] = 1;
+    }
+    std::vector<uint32_t> originalToCaptured(m_frameDAGResourceCount, UINT32_MAX);
+    std::vector<uint32_t> capturedToOriginal;
+    capturedToOriginal.reserve(m_frameDAGResourceCount);
+    for (uint32_t original = 0; original < referenced.size(); ++original) if (referenced[original]) {
+        originalToCaptured[original] = static_cast<uint32_t>(input.structure.resourceIDs.size());
+        input.structure.resourceIDs.push_back(m_frameDAGResourceIDsByIndex[original]);
+        capturedToOriginal.push_back(original);
+    }
+    input.structure.resourceKeys.resize(input.structure.resourceIDs.size());
+    input.backingGenerations.resize(input.structure.resourceIDs.size());
     std::unordered_map<uint64_t, uint32_t> capturedIndices;
+    std::vector<FrozenExecutionBindings::ResourceBinding> frozenResources;
+    frozenResources.reserve(input.structure.resourceIDs.size());
+    std::vector<uint8_t> admissionBoundResources(input.structure.resourceIDs.size());
+    std::vector<experimental::PreparedBackingState> preparedInitialStates;
+    preparedInitialStates.reserve(input.structure.resourceIDs.size());
+    size_t semanticSlotCount = 0;
+    size_t unnamedTransientCount = 0;
+    size_t unresolvedReferencedCount = 0;
+    // Display names are not guaranteed unique (frame extensions commonly
+    // instantiate several copies of the same pass resource). Keep the slot
+    // identity stable across backing rotation while distinguishing equal names
+    // by their deterministic DAG order.
+    std::unordered_map<std::string, uint32_t> transientNameOccurrences;
     for (uint32_t r = 0; r < input.structure.resourceIDs.size(); ++r) {
-        capturedIndices.emplace(input.structure.resourceIDs[r], r);
-        const auto* resource = r < m_frameDAGResourcePtrByIndex.size() ? m_frameDAGResourcePtrByIndex[r] : nullptr;
+        const auto original = capturedToOriginal[r];
+        const auto concreteID = m_frameDAGResourceIDsByIndex[original];
+        capturedIndices.emplace(concreteID, r);
+        auto* resource = original < m_frameDAGResourcePtrByIndex.size() ? m_frameDAGResourcePtrByIndex[original] : nullptr;
+        admissionBoundResources[r] = resource
+            && dynamic_cast<DynamicResource*>(resource) != nullptr
+            && TryGetBackedResource(resource) == nullptr;
+        if (!resource) ++unresolvedReferencedCount;
+        if (resource) {
+            // The compiler consumes declaration slots, not concrete registry
+            // object identities. Frame extensions may rebuild named wrapper
+            // objects each frame even though the slot, description and access
+            // topology are unchanged. Key every named slot semantically and
+            // keep its concrete backing generation in the realization key.
+            // This also gives dynamic wrappers and same-layout replacement the
+            // intended no-recompile behavior.
+            const bool semanticResource = !resource->GetName().empty();
+            if (semanticResource) {
+                auto& semanticKey = input.structure.resourceKeys[r];
+                std::string resourceName = resource->GetName();
+                // Execution-slot/ring resources conventionally append _N to
+                // their logical role. The selected concrete slot is a
+                // realization detail, while simultaneous instances remain
+                // distinct through the occurrence suffix below.
+                const auto suffix = resourceName.find_last_of("_ ");
+                if (suffix != std::string::npos && suffix + 1 < resourceName.size()
+                    && std::all_of(resourceName.begin() + suffix + 1, resourceName.end(),
+                        [](unsigned char c) { return std::isdigit(c) != 0; })) {
+                    resourceName.resize(suffix);
+                }
+                const uint32_t occurrence = transientNameOccurrences[resourceName]++;
+                semanticKey = "frame:" + resourceName + "#" + std::to_string(occurrence);
+                uint64_t stable = 1469598103934665603ull;
+                for (const unsigned char c : semanticKey) stable = (stable ^ c) * 1099511628211ull;
+                input.structure.resourceIDs[r] = stable;
+                ++semanticSlotCount;
+            } else if (m_transientFrameResourcesByID.contains(concreteID)
+                || dynamic_cast<DynamicResource*>(resource) != nullptr) {
+                ++unnamedTransientCount;
+            }
+        }
         input.structure.resourceShapes.push_back(resource
             ? experimental::CompileResourceShape{(std::max)(1u, resource->GetMipLevels()),
                 (std::max)(1u, resource->GetArraySize()), resource->HasLayout()}
             : experimental::CompileResourceShape{0, 0, false});
+        std::shared_ptr<const AliasHeapGeneration> capturedAliasHeap;
+        uint64_t capturedAliasPoolID = 0, capturedAliasOffset = 0, capturedAliasSize = 0;
+        if (auto* backed = TryGetBackedResource(resource)) {
+            BT_ZONE_SCOPE("ORG.AsyncCompile.CaptureBackingAllocation");
+            input.backingGenerations[r] = backed->GetBackingGeneration();
+            auto snapshot = backed->CaptureBackingAllocation();
+            if (snapshot) {
+                capturedAliasHeap = snapshot.aliasHeap;
+                capturedAliasPoolID = snapshot.aliasPoolID;
+                capturedAliasOffset = snapshot.aliasOffset;
+                capturedAliasSize = snapshot.aliasSize;
+                frozenResources.push_back({snapshot.resource, snapshot.lease});
+                input.leases.push_back(std::move(snapshot.lease));
+                basic_telemetry::AddCounter("ORG.AsyncCompile.BackingAllocationLeases");
+            } else {
+                frozenResources.push_back({});
+                basic_telemetry::AddCounter("ORG.AsyncCompile.UnsupportedBackingAllocation");
+            }
+        } else {
+            // Imported resources (notably swapchain images) do not implement
+            // BackedResource. Freeze the concrete unwrapped Resource object;
+            // retaining a mutable DynamicResource wrapper would allow its
+            // backing to change underneath an in-flight recording.
+            auto* concrete = UnwrapDynamicResource(resource);
+            auto owner = concrete ? concrete->weak_from_this().lock() : std::shared_ptr<Resource>{};
+            auto apiResource = concrete ? concrete->GetAPIResource() : rhi::Resource{};
+            if (owner && apiResource.GetHandle().valid()) {
+                frozenResources.push_back({apiResource, owner});
+                input.leases.push_back(owner);
+                const auto handle = apiResource.GetHandle();
+                input.backingGenerations[r] = (uint64_t{handle.generation} << 32) | handle.index;
+                basic_telemetry::AddCounter("ORG.AsyncExecution.ImportedResourceLeases");
+            } else {
+                frozenResources.push_back({});
+                basic_telemetry::AddCounter("ORG.AsyncExecution.NonBackingResources");
+                if (resource && ++m_compilerState->reportedAsyncUnownedResources <= 8) {
+                    spdlog::warn("Async preparation cannot own resource '{}' id={} type={} concreteType={} owner={} api={}",
+                        resource->GetName(), concreteID, typeid(*resource).name(),
+                        concrete ? typeid(*concrete).name() : "<null>",
+                        static_cast<bool>(owner), static_cast<bool>(apiResource));
+                }
+            }
+        }
+        experimental::PreparedBackingState preparedState;
+        preparedState.graphResourceID = input.structure.resourceIDs[r];
+        preparedState.graphResourceKey = input.structure.resourceKeys[r];
+        preparedState.shape = input.structure.resourceShapes[r];
+        if (r < frozenResources.size()) preparedState.resource = frozenResources[r].resource.GetHandle();
+        preparedState.aliasHeap = std::move(capturedAliasHeap);
+        preparedState.aliasHeapIdentity = preparedState.aliasHeap.get();
+        preparedState.aliasPoolID = capturedAliasPoolID;
+        preparedState.aliasOffset = capturedAliasOffset;
+        preparedState.aliasSize = capturedAliasSize;
+        if (resource && resource->GetStateTracker()) {
+            for (const auto& segment : resource->GetStateTracker()->GetSegments()) {
+                const auto resolved = ResolveRangeSpec(segment.rangeSpec,
+                    preparedState.shape.mips, preparedState.shape.slices);
+                if (resolved.isEmpty()) continue;
+                preparedState.regions.push_back({
+                    {resolved.firstMip, resolved.mipCount, resolved.firstSlice, resolved.sliceCount},
+                    {static_cast<uint64_t>(segment.state.access), static_cast<uint64_t>(segment.state.layout),
+                        static_cast<uint64_t>(segment.state.sync), AccessTypeIsWriteType(segment.state.access)}});
+            }
+        }
+        if (preparedState.regions.empty() && preparedState.shape.mips && preparedState.shape.slices) {
+            preparedState.regions.push_back({{0, preparedState.shape.mips, 0, preparedState.shape.slices},
+                {static_cast<uint64_t>(rhi::ResourceAccessType::None), static_cast<uint64_t>(rhi::ResourceLayout::Undefined),
+                    static_cast<uint64_t>(rhi::ResourceSyncState::None), false}});
+        }
+        preparedInitialStates.push_back(std::move(preparedState));
     }
+    BT_PLOT("ORG.AsyncCompile.SemanticResourceSlots", static_cast<int64_t>(semanticSlotCount));
+    BT_PLOT("ORG.AsyncCompile.UnnamedTransientResources", static_cast<int64_t>(unnamedTransientCount));
+    BT_PLOT("ORG.AsyncCompile.UnresolvedReferencedResources", static_cast<int64_t>(unresolvedReferencedCount));
     auto captureState = [&](uint32_t resourceIndex, const RangeSpec& spec, ResourceState state) {
         if (resourceIndex >= input.structure.resourceShapes.size())
             throw std::runtime_error("Invalid resource index during owned state capture");
@@ -1760,17 +1923,31 @@ void RenderGraph::SubmitDependencyCompileShadow(const std::vector<Node>& nodes,
             static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot)))),
             slot < m_activeQueueSlotsThisFrame.size() && m_activeQueueSlotsThisFrame[slot] != 0});
     input.structure.passes.reserve(nodes.size());
+    std::vector<std::vector<ExternalTimelinePoint>> preparedExternalWaits(m_framePasses.size());
     const auto primaryBackend = m_backendDevices.empty() ? rhi::Backend::Null : m_backendDevices.front().backend;
     auto oracle = std::make_shared<experimental::DependencyEdges>();
     for (size_t index = 0; index < nodes.size(); ++index) {
         const auto& node = nodes[index];
         experimental::CompilePass pass;
         pass.originalOrder = node.originalOrder;
+        if (node.passIndex >= UINT32_MAX) throw std::runtime_error("Prepared pass index exceeds capture capacity");
+        pass.preparedPassIndex = static_cast<uint32_t>(node.passIndex);
         pass.preferredQueueSlot = static_cast<uint32_t>(node.queueSlot);
         pass.compatibleQueueSlots.clear();
         for (auto slot : node.compatibleQueueSlots) {
             if (slot >= UINT32_MAX) throw std::runtime_error("Compile queue slot exceeds index capacity");
             pass.compatibleQueueSlots.push_back(static_cast<uint32_t>(slot));
+        }
+        // D3D12 admission emits producer release-to-COMMON and consumer acquire
+        // barriers around the compiler's relative timeline wait. Other backends
+        // retain the conservative graphics route until their queue-family/API
+        // ownership policy is captured as owned compiler metadata.
+        const bool d3d12OwnedQueueTransfers = m_queueRegistry.SlotCount() != 0
+            && m_queueRegistry.GetBackend(static_cast<QueueSlotIndex>(0)) == rhi::Backend::D3D12;
+        if (!d3d12OwnedQueueTransfers && !input.structure.queues.empty()
+            && input.structure.queues[0].active) {
+            pass.compatibleQueueSlots.assign(1, 0u);
+            pass.preferredQueueSlot = 0u;
         }
         if (node.passIndex < m_framePassAccessSummaries.size()) {
             const auto& summary = m_framePassAccessSummaries[node.passIndex];
@@ -1778,13 +1955,24 @@ void RenderGraph::SubmitDependencyCompileShadow(const std::vector<Node>& nodes,
                 ? primaryBackend : summary.backendAffinity.backend);
             pass.accesses.reserve(summary.dagAccesses.size());
             for (const auto& access : summary.dagAccesses) {
-                if (access.resourceIndex >= m_frameDAGResourceCount)
+                if (access.resourceIndex >= originalToCaptured.size()
+                    || originalToCaptured[access.resourceIndex] == UINT32_MAX)
                     throw std::runtime_error("Invalid resource index during owned dependency capture");
-                pass.accesses.push_back({static_cast<uint32_t>(access.resourceIndex), access.kind != AccessKind::Read});
+                pass.accesses.push_back({originalToCaptured[access.resourceIndex], access.kind != AccessKind::Read});
             }
             for (const auto& requirement : summary.requirementSummaries)
-                pass.entryStates.push_back(captureState(requirement.dagResourceIndex, requirement.range, requirement.state));
+                pass.entryStates.push_back(captureState(originalToCaptured.at(requirement.dagResourceIndex), requirement.range, requirement.state));
             const auto view = GetPassView(m_framePasses[node.passIndex]);
+            std::visit([&](const auto& entry) {
+                using T = std::decay_t<decltype(entry)>;
+                if constexpr (!std::is_same_v<T, std::monostate>) {
+                    preparedExternalWaits[node.passIndex] = entry.resources.externalWaitsBeforeTransitions;
+                    pass.forceBatchIsolation = entry.run != PassRunMask::Retained
+                        || !entry.immediateBytecode.empty()
+                        || !entry.resources.externalWaitsBeforeTransitions.empty()
+                        || !entry.resources.externalWaitBindingsBeforeTransitions.empty();
+                }
+            }, m_framePasses[node.passIndex].pass);
             if (view.internalTransitions) for (const auto& [resource, state] : *view.internalTransitions) {
                 const auto found = capturedIndices.find(resource.resource.GetGlobalResourceID());
                 if (found == capturedIndices.end()) throw std::runtime_error("Internal state missing captured resource");
@@ -1803,9 +1991,145 @@ void RenderGraph::SubmitDependencyCompileShadow(const std::vector<Node>& nodes,
     std::sort(dependencyOracle.begin(), dependencyOracle.end());
     std::set_difference(oracle->begin(), oracle->end(), dependencyOracle.begin(), dependencyOracle.end(),
         std::back_inserter(input.structure.placementEdges));
-    input.expectedSchedulingEdges = std::move(oracle);
-    input.expectedEdges = std::make_shared<const experimental::DependencyEdges>(std::move(dependencyOracle));
-    coordinator->Request(std::move(input));
+    if (mode == runtime::AsyncCompileMode::Shadow) {
+        input.expectedSchedulingEdges = std::move(oracle);
+        input.expectedEdges = std::make_shared<const experimental::DependencyEdges>(std::move(dependencyOracle));
+    }
+    if (mode == runtime::AsyncCompileMode::Async) {
+		BT_ZONE_SCOPE("ORG.AsyncExecution.CapturePreparationBasis");
+        const bool allResourcesOwned = std::all_of(frozenResources.begin(), frozenResources.end(),
+            [](const auto& binding) { return binding.resource.GetHandle().valid() && binding.owner; });
+        if (allResourcesOwned) {
+            auto bindings = std::make_shared<const FrozenExecutionBindings>(std::move(frozenResources));
+			auto resources = std::make_shared<experimental::RealizedResourceBundle>();
+			resources->backingGenerations = input.backingGenerations;
+			resources->resourceKeys = input.structure.resourceKeys;
+			resources->admissionBoundResources = std::move(admissionBoundResources);
+			resources->bindings = std::move(bindings);
+			resources->initialStates = std::move(preparedInitialStates);
+			resources->leases = input.leases;
+			if (m_asyncUpdateHostData) resources->leases.push_back(m_asyncUpdateHostData);
+			auto basis = std::make_shared<experimental::FramePreparationBasis>();
+			basis->resources = std::move(resources);
+			basis->externalWaitsByPreparedPass = std::move(preparedExternalWaits);
+			basis->reservedImmediatePasses.resize(m_framePasses.size());
+			basis->immediatePassSlots.resize(m_framePasses.size());
+			for (size_t passIndex = 0; passIndex < m_framePasses.size(); ++passIndex) {
+				auto& any = m_framePasses[passIndex];
+				basis->reservedImmediatePasses[passIndex] = std::visit([&](auto& value) -> PreparedPass {
+					using T = std::decay_t<decltype(value)>;
+					if constexpr (std::is_same_v<T, std::monostate>) return {};
+					else {
+						auto* immediate = dynamic_cast<IHasImmediateModeCommands*>(value.pass.get());
+						if (!immediate) return {};
+						basis->immediatePassSlots[passIndex] = 1;
+						auto effect = immediate->TakeOwnedImmediateSubmissionEffect();
+						auto copies = org::imm::PreparedBufferCopies::Capture(value.immediateBytecode,
+							[&](ResourceRegistry::RegistryHandle handle) -> BackingAllocationSnapshot {
+								auto* resource = _registry.Resolve(handle);
+								if (!resource || resource->HasLayout()) return {};
+								auto* backed = dynamic_cast<BackedResource*>(resource);
+								return backed ? backed->CaptureBackingAllocation() : BackingAllocationSnapshot{};
+							});
+						if (copies) {
+							if (!effect) return PreparedPass::Make(std::move(copies),
+								+[](const std::shared_ptr<const org::imm::PreparedBufferCopies>& data,
+									RecordingContext& recording) { data->Record(recording.Commands()); });
+							struct CopiesWithEffect {
+								std::shared_ptr<const org::imm::PreparedBufferCopies> copies;
+								std::function<void()> commit;
+							};
+							return PreparedPass::Make(CopiesWithEffect{std::move(copies), std::move(effect->commit)},
+								+[](const CopiesWithEffect& data, RecordingContext& recording) {
+									data.copies->Record(recording.Commands());
+								}, +[](const CopiesWithEffect& data) { if (data.commit) data.commit(); },
+								std::move(effect->completionSignals));
+						}
+						if (!immediate->ImmediateCommandsAreCompleteExecution() && !effect) return {};
+						if (value.immediateBytecode.empty()) {
+							if (!effect) return PreparedPass::NoOp();
+							struct EffectOnly { std::function<void()> commit; };
+							return PreparedPass::Make(EffectOnly{std::move(effect->commit)},
+								+[](const EffectOnly&, RecordingContext&) {},
+								+[](const EffectOnly& data) { if (data.commit) data.commit(); },
+								std::move(effect->completionSignals));
+						}
+						struct ReplayData {
+							std::vector<std::byte> bytecode;
+							org::imm::ImmediateDispatch dispatch;
+							std::shared_ptr<org::imm::KeepAliveBag> keepAlive;
+						};
+						ReplayData replay{value.immediateBytecode, m_immediateDispatch, value.immediateKeepAlive};
+						auto record = +[](const ReplayData& data, RecordingContext& recording) {
+							org::imm::Replay(data.bytecode, recording.Commands(), data.dispatch);
+						};
+						if (!effect) return PreparedPass::Make(std::move(replay), record);
+						struct ReplayWithEffect { ReplayData replay; std::function<void()> commit; };
+						return PreparedPass::Make(ReplayWithEffect{std::move(replay), std::move(effect->commit)},
+							+[](const ReplayWithEffect& data, RecordingContext& recording) {
+								org::imm::Replay(data.replay.bytecode, recording.Commands(), data.replay.dispatch);
+							}, +[](const ReplayWithEffect& data) { if (data.commit) data.commit(); },
+							std::move(effect->completionSignals));
+					}
+				}, any.pass);
+			}
+			basis->updateData = m_asyncUpdateHostData;
+			FramePreparationContext preparation{
+				.frameIndex = frameIndex,
+				.frameNumber = ++m_compilerState->asyncPreparationFrameNumber,
+				.deltaTime = deltaTime,
+				.bindings = basis->resources->bindings,
+				.preparationData = basis->updateData ? basis->updateData.get() : hostData,
+				// Transitional legacy adapters receive the owned update snapshot.
+				// Target-scene adapters are migrated below to remove pass pointers.
+				.admissionData = basis->updateData ? basis->updateData.get() : hostData,
+				.frameData = basis->updateData,
+			};
+			std::vector<PreparedPass> packets;
+			packets.reserve(m_framePasses.size());
+			size_t legacyPassCount = 0;
+			for (size_t passIndex = 0; passIndex < m_framePasses.size(); ++passIndex) {
+				auto& any = m_framePasses[passIndex];
+				auto packet = std::visit([&](auto& value) -> PreparedPass {
+					using T = std::decay_t<decltype(value)>;
+					if constexpr (std::is_same_v<T, std::monostate>) return {};
+					else return value.pass->PrepareFrame(preparation);
+				}, any.pass);
+				if (!packet && passIndex < basis->immediatePassSlots.size()
+					&& basis->immediatePassSlots[passIndex]) {
+					packet = basis->reservedImmediatePasses[passIndex];
+				}
+				if (!packet) {
+					++legacyPassCount;
+					if (m_compilerState->reportedAsyncLegacyPasses.insert(any.name).second)
+						spdlog::warn("Async frame request requires owned preparation for pass '{}'", any.name);
+					continue;
+				}
+				packet.SetDebugName(any.name);
+				packets.push_back(std::move(packet));
+			}
+			BT_PLOT("ORG.AsyncExecution.RequestLegacyPasses", static_cast<int64_t>(legacyPassCount));
+			if (!legacyPassCount && packets.size() == m_framePasses.size()) {
+				auto preparedPayload = experimental::BuildPreparedFramePayload(
+					preparation.frameNumber, std::move(packets), basis->resources,
+					std::move(basis->externalWaitsByPreparedPass));
+				input.executionPayload = preparedPayload;
+				input.executionLifecycle = std::move(preparedPayload);
+				basic_telemetry::AddCounter("ORG.AsyncExecution.PreparedFrameRequests");
+			}
+        } else basic_telemetry::AddCounter("ORG.AsyncExecution.PreparationUnownedResources");
+    }
+    const bool inlineBootstrap = mode == runtime::AsyncCompileMode::Async && !coordinator->Latest();
+    auto request = coordinator->RequestOwned(std::move(input), inlineBootstrap);
+    if (mode == runtime::AsyncCompileMode::Async && request.input) {
+        if (request.sequence == 1 && m_compilerState->lastRequestedAsyncSequence != 0)
+            m_compilerState->nextAsyncExecutionSequence = 1;
+        m_compilerState->currentAsyncInput = request.input;
+        m_compilerState->lastRequestedAsyncSequence = request.sequence;
+    }
+    coordinator->Pump();
+    if (mode == runtime::AsyncCompileMode::Async)
+        BT_PLOT("ORG.AsyncExecution.LastRequestedSequence", static_cast<int64_t>(request.sequence));
     const auto statistics = coordinator->Statistics();
     BT_PLOT("ORG.AsyncCompile.Active", static_cast<int64_t>(statistics.active));
     BT_PLOT("ORG.AsyncCompile.Pending", static_cast<int64_t>(statistics.pending));
@@ -1827,6 +2151,7 @@ void RenderGraph::SubmitDependencyCompileShadow(const std::vector<Node>& nodes,
     BT_PLOT("ORG.AsyncCompile.PassChanges", static_cast<int64_t>(statistics.passChanges));
     BT_PLOT("ORG.AsyncCompile.ConstraintChanges", static_cast<int64_t>(statistics.constraintChanges));
     BT_PLOT("ORG.AsyncCompile.QueueChanges", static_cast<int64_t>(statistics.queueChanges));
+    BT_PLOT("ORG.AsyncCompile.RealizationChanges", static_cast<int64_t>(statistics.realizationChanges));
     BT_PLOT("ORG.AsyncCompile.Failed", static_cast<int64_t>(statistics.failed));
     BT_PLOT("ORG.AsyncCompile.Rejected", static_cast<int64_t>(statistics.rejected));
     BT_PLOT("ORG.AsyncCompile.SelectedSequence", static_cast<int64_t>(statistics.selectedSequence));
@@ -1847,7 +2172,18 @@ void RenderGraph::SubmitDependencyCompileShadow(const std::vector<Node>& nodes,
 }
 
 void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHostExecutionData* hostData) {
-	BT_ZONE_SCOPE("RenderGraph::CompileFrame");
+	PrepareAndCompileFrame(device, frameIndex, hostData, false);
+}
+
+void RenderGraph::PrepareAsyncFrame(rhi::Device device, uint8_t frameIndex, float deltaTime,
+	const IHostExecutionData* hostData) {
+	PrepareAndCompileFrame(device, frameIndex, hostData, true, deltaTime);
+}
+
+void RenderGraph::PrepareAndCompileFrame(rhi::Device device, uint8_t frameIndex,
+	const IHostExecutionData* hostData, bool asyncPreparationOnly, float deltaTime) {
+	if (asyncPreparationOnly) { BT_ZONE_SCOPE("RenderGraph::PrepareAsyncFrame"); }
+	else { BT_ZONE_SCOPE("RenderGraph::CompileFrame"); }
 	BeginCompileProfileFrame(frameIndex);
 	auto endCompileProfileFrame = [this](RenderGraph* graph) {
 		if (graph) {
@@ -3125,6 +3461,29 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		BT_ZONE_SCOPE("RenderGraph::CompileFrame::BuildNodes");
 		BuildNodes(*this, nodes);
 	}
+	if (asyncPreparationOnly) {
+		// Async preparation ends before dependency construction, scheduling,
+		// alias planning, transition planning, or batch construction. Those are
+		// exclusively worker-owned CompileGraph responsibilities.
+		BT_ZONE_SCOPE("RenderGraph::PrepareAsyncFrame::RealizeAndSubmit");
+		m_activeQueueSlotsThisFrame.assign(m_queueRegistry.SlotCount(), 1u);
+		m_assignedQueueSlotsByFramePass.resize(m_framePasses.size());
+		for (auto& node : nodes) {
+			node.assignedQueueSlot = node.queueSlot;
+			if (node.passIndex < m_assignedQueueSlotsByFramePass.size())
+				m_assignedQueueSlotsByFramePass[node.passIndex] = node.queueSlot;
+		}
+		// Candidate compilation only describes placement. Until owned alias
+		// realization lands, use ordinary standalone backing for any resource
+		// first encountered by this generation.
+		aliasMaterializeOptionsByID.clear();
+		m_aliasMaterializeOptionsByResourceIndex.clear();
+		m_aliasMaterializeResourceIDs.clear();
+		MaterializeUnmaterializedResources(usedResourceIDs);
+		SubmitDependencyCompileShadow(nodes, explicitEdges, {}, frameIndex, deltaTime, hostData);
+		traceCompileStep("complete");
+		return;
+	}
 	{
 		traceCompileStep("BuildDependencyGraph");
 		BT_ZONE_SCOPE("RenderGraph::CompileFrame::BuildDependencyGraph");
@@ -3240,7 +3599,8 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 	}
 
     std::vector<std::pair<uint32_t, uint32_t>> shadowDependencyOracle;
-    if (m_renderGraphSettingsService && m_renderGraphSettingsService->GetExperimentalAsyncCompileShadow()) {
+    if (m_renderGraphSettingsService &&
+        m_renderGraphSettingsService->GetExperimentalAsyncCompileMode() != runtime::AsyncCompileMode::Off) {
         for (uint32_t index = 0; index < nodes.size(); ++index)
             for (auto next : nodes[index].out) shadowDependencyOracle.emplace_back(index, static_cast<uint32_t>(next));
     }
@@ -3375,7 +3735,6 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		BT_ZONE_SCOPE("RenderGraph::CompileFrame::PlanActiveQueueSlots");
 		PlanActiveQueueSlots(*this, m_framePasses, nodes);
 	}
-    SubmitDependencyCompileShadow(nodes, explicitEdges, std::move(shadowDependencyOracle));
 	{
 		traceCompileStep("AssignQueueSlots");
 		BT_ZONE_SCOPE("RenderGraph::CompileFrame::AssignQueueSlots");
@@ -3414,6 +3773,10 @@ void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHo
 		BT_ZONE_SCOPE("RenderGraph::CompileFrame::SnapshotCompiledResourceGenerations");
 		SnapshotCompiledResourceGenerations(usedResourceIDs);
 	}
+    // Capture only after realization has produced owned backing generations.
+    // Workers still receive immutable numeric metadata and leases; no compile
+    // work is performed by this owner-side placement.
+    SubmitDependencyCompileShadow(nodes, explicitEdges, std::move(shadowDependencyOracle), frameIndex, deltaTime, hostData);
 
 	{
 		traceCompileStep("AutoScheduleAndBuildBatches");

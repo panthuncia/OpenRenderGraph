@@ -7,14 +7,17 @@ namespace org::runtime {
 namespace {
 class DefaultRenderGraphSettingsService final : public IRenderGraphSettingsService {
 public:
-    bool GetExperimentalAsyncCompileShadow() const override {
-        return GetOpenRenderGraphSettings().experimentalAsyncCompileShadow;
+    AsyncCompileMode GetExperimentalAsyncCompileMode() const override {
+        return GetOpenRenderGraphSettings().experimentalAsyncCompileMode;
     }
     uint8_t GetExperimentalCompileConcurrency() const override {
         return GetOpenRenderGraphSettings().experimentalCompileConcurrency;
     }
     bool GetUseAsyncCompute() const override {
         return GetOpenRenderGraphSettings().useAsyncCompute;
+    }
+    uint8_t GetNumFramesInFlight() const override {
+        return GetOpenRenderGraphSettings().numFramesInFlight;
     }
 
     bool GetRenderGraphCompileDumpEnabled() const override {

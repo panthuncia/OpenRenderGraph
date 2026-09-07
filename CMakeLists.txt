@@ -97,6 +97,7 @@ add_library(OpenRenderGraph STATIC
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PassExecutionContext.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraph.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/ExperimentalGraphCompiler.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/ExperimentalExecutionState.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/InteropAllocator.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/SharedAliasPoolManager.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraphCompile.cpp"
@@ -187,11 +188,12 @@ endif()
 
 if(OPENRENDERGRAPH_BUILD_TESTS)
     enable_testing()
-    add_executable(OpenRenderGraphAsyncCompileTests tests/AsyncCompileTests.cpp
-        src/Render/RenderGraph/ExperimentalGraphCompiler.cpp)
+    add_executable(OpenRenderGraphAsyncCompileTests tests/AsyncCompileTests.cpp)
     target_compile_features(OpenRenderGraphAsyncCompileTests PRIVATE cxx_std_23)
     target_include_directories(OpenRenderGraphAsyncCompileTests PRIVATE include)
-    target_link_libraries(OpenRenderGraphAsyncCompileTests PRIVATE BasicTelemetry::Core BasicTelemetry::Tracy)
+    target_link_libraries(OpenRenderGraphAsyncCompileTests PRIVATE
+        OpenRenderGraph BasicTelemetry::Core BasicTelemetry::Tracy
+        BasicRHI::BasicRHI spdlog::spdlog_header_only)
     target_compile_definitions(OpenRenderGraphAsyncCompileTests PRIVATE NOMINMAX)
     add_test(NAME OpenRenderGraphAsyncCompileTests COMMAND OpenRenderGraphAsyncCompileTests)
     add_executable(OpenRenderGraphExternalResourceTests tests/ExternalResourceTests.cpp)

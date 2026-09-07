@@ -542,6 +542,19 @@ void BufferBase::Materialize(const MaterializeOptions* options) {
     OnBackingMaterialized();
 }
 
+BackingAllocationSnapshot BufferBase::CaptureBackingAllocation() {
+    if (!m_dataBuffer || GetAttachedAPIRepresentation(BackendInstanceId::Primary).IsValid()) return {};
+    auto lease = m_dataBuffer->CaptureAllocationLease();
+    if (!lease) return {};
+    BackingAllocationSnapshot snapshot{
+        GetGlobalResourceID(), m_backingGeneration, m_dataBuffer->GetAPIResource(), std::move(lease), m_bufferSize};
+    snapshot.aliasHeap = m_dataBuffer->GetAliasHeap();
+    snapshot.aliasPoolID = m_dataBuffer->GetAliasPoolID();
+    snapshot.aliasOffset = m_dataBuffer->GetAliasOffset();
+    snapshot.aliasSize = m_dataBuffer->GetAliasSize();
+    return snapshot;
+}
+
 void BufferBase::Dematerialize() {
 	const bool hadAttachedPrimary = GetAttachedAPIRepresentation(BackendInstanceId::Primary).IsValid();
 	ClearAPIRepresentations();

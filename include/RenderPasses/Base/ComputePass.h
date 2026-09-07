@@ -1,4 +1,6 @@
 #pragma once
+#include "Render/PreparedPass.h"
+#include "RenderPasses/Base/RenderPass.h"
 
 #include <vector>
 #include <unordered_set>
@@ -22,36 +24,11 @@
 
 namespace org {
 
-struct ComputePassParameters {
-	std::vector<ResourceHandleAndRange> shaderResources;
-	std::vector<ResourceHandleAndRange> constantBuffers;
-	std::vector<ResourceHandleAndRange> unorderedAccessViews;
-	std::vector<ResourceHandleAndRange> unorderedAccessClearViews;
-	std::vector<ResourceHandleAndRange> indirectArgumentBuffers;
-	std::vector<ResourceHandleAndRange> legacyInteropResources;
-	std::vector<std::pair<ResourceHandleAndRange, ResourceState>> internalTransitions;
-	std::vector<ExternalTimelinePoint> externalWaitsBeforeTransitions;
-	std::vector<ExternalTimelineBinding> externalWaitBindingsBeforeTransitions;
-
-	std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> identifierSet;
-	std::vector<AutoDescriptorRegistration> autoDescriptorShaderResources;
-	std::vector<AutoDescriptorRegistration> autoDescriptorConstantBuffers;
-	std::vector<AutoDescriptorRegistration> autoDescriptorUnorderedAccessViews;
-	std::unordered_set<FeatureDomainIdentifier, FeatureDomainIdentifier::Hasher> activeFeatureDomains;
-	std::vector<ResourceRequirement> staticResourceRequirements; // Static resource requirements for the pass
-	std::vector<std::shared_ptr<const ResolverRequirementBlock>> resolverRequirementBlocks;
-	std::vector<ResourceRequirement> frameResourceRequirements; // Immediate-mode requirements recorded for this frame
-	mutable std::vector<ResourceRequirement> mergedFrameResourceRequirements; // Lazily built static + immediate requirements when a contiguous view is needed
-	mutable bool mergedFrameRequirementsDirty = false;
-	QueueKind preferredQueueKind = QueueKind::Compute;
-	QueueAssignmentPolicy queueAssignmentPolicy = QueueAssignmentPolicy::Automatic;
-	std::optional<QueueSlotIndex> pinnedQueueSlot; // Target a specific queue slot instead of using preferredQueueKind
-	BackendAffinity backendAffinity{};
-};
+using ComputePassParameters = PassParameters;
 
 class ComputePassBuilder;
 
-class ComputePass : public IResourceProvider, public RenderGraphPassBase {
+class ComputePass : public RenderGraphPass {
 public:
 	virtual ~ComputePass() = default;
 
@@ -80,14 +57,25 @@ public:
 		}
 	}
 
+    void ConfigureResourceRegistryView(
+        std::shared_ptr<ResourceRegistryView> view,
+        const PassParameters& parameters) override {
+        SetResourceRegistryView(std::move(view), parameters.activeFeatureDomains,
+            parameters.autoDescriptorShaderResources,
+            parameters.autoDescriptorConstantBuffers,
+            parameters.autoDescriptorUnorderedAccessViews);
+    }
+
 	virtual void Setup() = 0;
+    // Preparation owner only. Empty means explicit synchronous legacy fallback.
+    virtual PreparedPass PrepareFrame(FramePreparationContext&) { return {}; }
 
 	virtual void Update(const UpdateExecutionContext& context) {};
 	virtual PassReturn Execute(PassExecutionContext& context) { return {}; };
 	virtual void Cleanup() = 0;
 
-	void Invalidate() { invalidated = true; }
-	bool IsInvalidated() const { return invalidated; }
+	void Invalidate() override { invalidated = true; }
+	bool IsInvalidated() const override { return invalidated; }
 
 protected:
 	bool invalidated = true;
@@ -107,6 +95,17 @@ protected:
 		if (i > 0) {
 			commandList.PushConstants(rhi::ShaderStage::Compute, 0, org::shaderapi::kResourceDescriptorIndicesRootParameter, 0, i, indices);
 		}
+	}
+
+	std::vector<unsigned int> CaptureResourceDescriptorIndices(const PipelineResources& resources) const {
+		std::vector<unsigned int> indices;
+		indices.reserve(resources.mandatoryResourceDescriptorSlots.size()
+			+ resources.optionalResourceDescriptorSlots.size());
+		for (const auto& binding : resources.mandatoryResourceDescriptorSlots)
+			indices.push_back(m_resourceDescriptorIndexHelper->GetResourceDescriptorIndex(binding, false));
+		for (const auto& binding : resources.optionalResourceDescriptorSlots)
+			indices.push_back(m_resourceDescriptorIndexHelper->GetResourceDescriptorIndex(binding, true));
+		return indices;
 	}
 
 	void RegisterSRV(SRVViewType type, ResourceIdentifier id, unsigned int mip = 0, unsigned int slice = 0) {

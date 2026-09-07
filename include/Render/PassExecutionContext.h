@@ -3,12 +3,14 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <typeindex>
 #include <rhi.h>
 #include <DirectXMath.h>
 
 #include "Render/ImmediateExecution/ImmediateCommandList.h"
 #include "Render/QueueKind.h"
+#include "Render/ExternalBindings.h"
 #include "RenderPasses/Base/PassReturn.h"
 
 
@@ -37,6 +39,9 @@ struct UpdateExecutionContext {
 	UINT64 frameFenceValue = 0;
 	float deltaTime = 0.0f;
 	const IHostExecutionData* hostData = nullptr;
+	// Optional ownership for hostData when asynchronous admission may prepare
+	// recording packets after Update returns.
+	std::shared_ptr<const IHostExecutionData> ownedHostData;
 	std::function<void()> beforeCompileFrame;
 };
 
@@ -47,9 +52,22 @@ struct ImmediateExecutionContext {
 	const IHostExecutionData* hostData = nullptr;
 };
 
+// An immediate pass may move its post-submit side effect into an owned packet.
+// The signal is emitted by the packet's actual queue before commit is invoked;
+// compilation never observes or consumes this state.
+struct OwnedImmediateSubmissionEffect {
+	std::vector<ExternalTimelinePoint> completionSignals;
+	std::function<void()> commit;
+};
+
 struct IHasImmediateModeCommands {
 	virtual ~IHasImmediateModeCommands() = default;
 	virtual void RecordImmediateCommands(ImmediateExecutionContext& context) = 0;
+	// True when Execute contributes no additional commands, waits, signals, or
+	// submission effects. This lets owned preparation represent an empty
+	// immediate stream as an explicit no-op without exposing compiler details.
+	virtual bool ImmediateCommandsAreCompleteExecution() const noexcept { return false; }
+	virtual std::optional<OwnedImmediateSubmissionEffect> TakeOwnedImmediateSubmissionEffect() { return std::nullopt; }
 };
 
 struct PassExecutionContext {
@@ -68,6 +86,7 @@ struct PassExecutionContext {
 	// Values for structurally placed external-wait bindings. Bindings determine
 	// the consuming batch/queue at compile time; timeline values remain per-frame.
 	std::vector<ExternalTimelineBindingValue> externalTimelineBindings;
+	std::vector<ExternalDescriptorBindingValue> externalDescriptorBindings;
 	rhi::Resource Resolve(Resource& resource) const;
 	rhi::Resource Resolve(const std::shared_ptr<Resource>& resource) const;
 	SymbolicTracker* ResolveState(Resource& resource) const;

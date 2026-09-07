@@ -57,6 +57,9 @@ public:
 	size_t GetSize() const { return m_size; }
 
 	rhi::Resource GetAPIResource() { return m_bufferAllocation.GetResource(); }
+    std::shared_ptr<const TrackedHandle> CaptureAllocationLease() {
+        return m_bufferAllocation.CaptureAllocationLease();
+    }
 	void SetName(const char* name);
 	// Debug helper: dumps any live buffers that haven't been destroyed yet.
 	static unsigned int DumpLiveBuffers();
@@ -77,6 +80,18 @@ private:
 	rhi::BufferBarrier m_barrier = {};
 
 	SymbolicTracker m_stateTracker;
+	std::shared_ptr<const AliasHeapGeneration> m_aliasHeap;
+	uint64_t m_aliasPoolID = 0;
+	uint64_t m_aliasOffset = 0;
+	uint64_t m_aliasSize = 0;
+
+public:
+	std::shared_ptr<const AliasHeapGeneration> GetAliasHeap() const { return m_aliasHeap; }
+	uint64_t GetAliasPoolID() const { return m_aliasPoolID; }
+	uint64_t GetAliasOffset() const { return m_aliasOffset; }
+	uint64_t GetAliasSize() const { return m_aliasSize; }
+
+private:
 
 	GpuBufferBacking(
 		rhi::HeapType accessType,

@@ -16,13 +16,15 @@ enum class QueueSchedulingSelectionPolicy : uint8_t {
     Scored = 1,
 };
 
+enum class AsyncCompileMode : uint8_t { Off = 0, Shadow = 1, Async = 2 };
+
 struct OpenRenderGraphSettings {
     uint8_t numFramesInFlight = 3;
     bool collectPassStatistics = true;
     bool collectPipelineStatistics = false;
 
     bool useAsyncCompute = true;
-    bool experimentalAsyncCompileShadow = false;
+    AsyncCompileMode experimentalAsyncCompileMode = AsyncCompileMode::Off;
     uint8_t experimentalCompileConcurrency = 2;
     bool renderGraphCompileDumpEnabled = false;
     bool renderGraphVramDumpEnabled = false;

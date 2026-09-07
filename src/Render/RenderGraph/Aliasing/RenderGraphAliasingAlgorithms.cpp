@@ -2008,6 +2008,7 @@ void org::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(Render
 
 		if (multiBackendShared) {
 			if (poolState.allocation) DeletionManager::GetInstance().MarkForDelete(std::move(poolState.allocation));
+			poolState.ownedGeneration.reset();
 			if (poolState.capacityBytes != heapSize || poolState.alignment != poolAlignment) ++poolState.generation;
 			poolState.capacityBytes = heapSize;
 			poolState.alignment = poolAlignment;
@@ -2083,9 +2084,9 @@ void org::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(Render
 			poolDebug.reservedBytes = poolState.capacityBytes;
 		}
 
-		auto* allocation = poolState.allocation.GetAllocation();
-		if (!allocation && !multiBackendShared) {
-			throw std::runtime_error("Failed to allocate alias pool memory");
+		if (!multiBackendShared && (!poolState.ownedGeneration ||
+			poolState.ownedGeneration->Generation() != poolState.generation)) {
+			poolState.ownedGeneration = AliasHeapGeneration::Capture(poolState.allocation, poolState.generation);
 		}
 
 		for (size_t candidateIndex = 0; candidateIndex < poolCandidateIndices.size(); ++candidateIndex) {
@@ -2122,7 +2123,7 @@ void org::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(Render
 			else if (c.kind == RGResourceRuntimeKind::Texture) {
 				PixelBuffer::MaterializeOptions options{};
 				options.aliasPlacement = TextureAliasPlacement{
-					.allocation = allocation,
+					.heap = poolState.ownedGeneration,
 					.offset = placement.offset,
 					.poolID = poolID,
 				};
@@ -2134,7 +2135,7 @@ void org::alias::RenderGraphAliasingSubsystem::BuildAliasPlanFromAnalysis(Render
 			else {
 				BufferBase::MaterializeOptions options{};
 				options.aliasPlacement = BufferAliasPlacement{
-					.allocation = allocation,
+					.heap = poolState.ownedGeneration,
 					.offset = placement.offset,
 					.poolID = poolID,
 				};

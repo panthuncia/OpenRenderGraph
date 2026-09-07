@@ -9,6 +9,7 @@
 
 #include "Render/ResourceRegistry.h"
 #include "Resources/TrackedAllocation.h"
+#include "Resources/AliasingPlacement.h"
 
 namespace org {
 enum class AutoAliasMode : uint8_t;
@@ -85,6 +86,7 @@ struct AutoAliasDebugSnapshot {
 
 struct PersistentAliasPoolState {
 	TrackedHandle allocation;
+	std::shared_ptr<const AliasHeapGeneration> ownedGeneration;
 	uint64_t capacityBytes = 0;
 	uint64_t alignment = 1;
 	uint64_t generation = 0;

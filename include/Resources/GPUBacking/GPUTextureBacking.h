@@ -50,6 +50,9 @@ public:
 	static unsigned int DumpLiveTextures();
 
 	rhi::Resource GetAPIResource() { return m_textureHandle.GetResource(); }
+    std::shared_ptr<const TrackedHandle> CaptureAllocationLease() {
+        return m_textureHandle.CaptureAllocationLease();
+    }
 
 	//rhi::HeapHandle GetPlacedResourceHeap() const {
 	//	return m_placedResourceHeap;
@@ -105,6 +108,16 @@ private:
 	rhi::TextureBarrier m_barrier = {};
 
 	SymbolicTracker m_stateTracker;
+	std::shared_ptr<const AliasHeapGeneration> m_aliasHeap;
+	uint64_t m_aliasPoolID = 0;
+	uint64_t m_aliasOffset = 0;
+	uint64_t m_aliasSize = 0;
+
+public:
+	std::shared_ptr<const AliasHeapGeneration> GetAliasHeap() const { return m_aliasHeap; }
+	uint64_t GetAliasPoolID() const { return m_aliasPoolID; }
+	uint64_t GetAliasOffset() const { return m_aliasOffset; }
+	uint64_t GetAliasSize() const { return m_aliasSize; }
 };
 
 

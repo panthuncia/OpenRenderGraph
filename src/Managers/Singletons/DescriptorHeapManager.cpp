@@ -245,6 +245,15 @@ void DescriptorHeapManager::PublishQueueFenceSnapshot(std::vector<QueueFenceSnap
     }
 }
 
+void DescriptorHeapManager::RetireExecutionLease(std::shared_ptr<const void> lease) {
+    if (!lease) return;
+    std::scoped_lock lock(m_descriptorMutationMutex);
+    DeferredRelease release{};
+    release.requiredFences = m_latestQueueFenceSnapshot;
+    release.executionLeases.push_back(std::move(lease));
+    m_deferredReleases.push_back(std::move(release));
+}
+
 void DescriptorHeapManager::ProcessDeferredReleases(uint8_t frameIndex) {
     (void)frameIndex;
     std::vector<DeferredRelease> readyReleases;

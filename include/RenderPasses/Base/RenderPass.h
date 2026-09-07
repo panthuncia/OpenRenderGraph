@@ -1,4 +1,5 @@
 #pragma once
+#include "Render/PreparedPass.h"
 
 #include <vector>
 #include <unordered_set>
@@ -18,11 +19,12 @@
 #include "Render/FeatureDomainRegistry.h"
 #include "Render/ShaderAPI.h"
 #include "Render/QueueKind.h"
+#include "RenderPasses/Base/RenderGraphPass.h"
 
 
 namespace org {
 
-struct RenderPassParameters {
+struct PassParameters {
 	std::vector<ResourceHandleAndRange> shaderResources;
     std::vector<ResourceHandleAndRange> renderTargets;
 	std::vector<ResourceHandleAndRange> renderTargetClearResources;
@@ -58,10 +60,11 @@ struct RenderPassParameters {
 	std::optional<QueueSlotIndex> pinnedQueueSlot; // Target a specific queue slot instead of using preferredQueueKind
 	BackendAffinity backendAffinity{};
 };
+using RenderPassParameters = PassParameters;
 
 class RenderPassBuilder;
 
-class RenderPass : public IResourceProvider, public RenderGraphPassBase {
+class RenderPass : public RenderGraphPass {
 public:
     virtual ~RenderPass() = default;
 
@@ -90,14 +93,27 @@ public:
 		}
 	}
 
-    virtual void Setup() = 0;
+    void ConfigureResourceRegistryView(
+        std::shared_ptr<ResourceRegistryView> view,
+        const PassParameters& parameters) override {
+        SetResourceRegistryView(std::move(view), parameters.activeFeatureDomains,
+            parameters.autoDescriptorShaderResources,
+            parameters.autoDescriptorConstantBuffers,
+            parameters.autoDescriptorUnorderedAccessViews);
+    }
+
+	virtual void Setup() = 0;
+    // Preparation owner only. Empty means explicit synchronous legacy fallback.
+    virtual PreparedPass PrepareFrame(FramePreparationContext&) { return {}; }
 
 	virtual void Update(const UpdateExecutionContext& context) {};
 	virtual PassReturn Execute(PassExecutionContext& context) { return {}; };
     virtual void Cleanup() = 0;
 
-	void Invalidate() { invalidated = true; }
-	bool IsInvalidated() const { return invalidated; }
+	void Invalidate() override { invalidated = true; }
+	bool IsInvalidated() const override { return invalidated; }
+	bool SupportsUnifiedDeclaration() const override { return true; }
+	void DeclareUnified(RenderPassBuilder& builder) override { DeclareResourceUsages(&builder); }
 
 protected:
 	bool invalidated = true;
@@ -117,6 +133,17 @@ protected:
 		if (i > 0) {
 			commandList.PushConstants(rhi::ShaderStage::All, 0, org::shaderapi::kResourceDescriptorIndicesRootParameter, 0, i, indices);
 		}
+	}
+
+	std::vector<unsigned int> CaptureResourceDescriptorIndices(const PipelineResources& resources) const {
+		std::vector<unsigned int> indices;
+		indices.reserve(resources.mandatoryResourceDescriptorSlots.size()
+			+ resources.optionalResourceDescriptorSlots.size());
+		for (const auto& binding : resources.mandatoryResourceDescriptorSlots)
+			indices.push_back(m_resourceDescriptorIndexHelper->GetResourceDescriptorIndex(binding, false));
+		for (const auto& binding : resources.optionalResourceDescriptorSlots)
+			indices.push_back(m_resourceDescriptorIndexHelper->GetResourceDescriptorIndex(binding, true));
+		return indices;
 	}
 
 	void RegisterSRV(SRVViewType type, ResourceIdentifier id, unsigned int mip = 0, unsigned int slice = 0) {

@@ -1,8 +1,49 @@
 #include "Render/ImmediateExecution/ImmediateCommandList.h"
 
 #include "Render/ResourceRegistry.h"
+#include "Render/BufferBarrierHelpers.h"
+#include <unordered_set>
 
 namespace org::imm {
+
+    std::shared_ptr<const PreparedBufferCopies> PreparedBufferCopies::Capture(
+        const std::vector<std::byte>& bytecode, const Resolver& resolve) {
+        if (bytecode.empty()) return {};
+        auto result = std::make_shared<PreparedBufferCopies>();
+        std::unordered_set<uint64_t> written;
+        BytecodeReader reader(bytecode.data(), bytecode.size());
+        while (!reader.Empty()) {
+            if (reader.ReadOp() != Op::CopyBufferRegion) return {};
+            const auto command = reader.ReadPOD<CopyBufferRegionCmd>();
+            auto dst = resolve(command.dst), src = resolve(command.src);
+            if (!dst || !src) return {};
+            if (!dst.bufferByteSize || !src.bufferByteSize
+                || command.dstOffset > dst.bufferByteSize || command.srcOffset > src.bufferByteSize
+                || command.numBytes > dst.bufferByteSize - command.dstOffset
+                || command.numBytes > src.bufferByteSize - command.srcOffset) return {};
+            const auto handle = dst.resource.GetHandle();
+            const bool previousWrite = !written.insert(
+                (uint64_t{handle.generation} << 32) | handle.index).second;
+            result->m_copies.push_back({std::move(dst), std::move(src),
+                command.dstOffset, command.srcOffset, command.numBytes, previousWrite});
+        }
+        return result;
+    }
+
+    void PreparedBufferCopies::Record(rhi::CommandList& list) const {
+        if (m_recorded.exchange(true)) throw std::logic_error("Prepared buffer copies already recorded");
+        for (const auto& copy : m_copies) {
+            if (copy.orderPreviousWrite) {
+                auto barrier = MakeWholeBufferBarrier(copy.dst.resource.GetHandle(),
+                    rhi::ResourceAccessType::CopyDest, rhi::ResourceAccessType::CopyDest,
+                    rhi::ResourceSyncState::Copy, rhi::ResourceSyncState::Copy);
+                rhi::BarrierBatch batch{}; batch.buffers = {&barrier, 1};
+                list.Barriers(batch);
+            }
+            list.CopyBufferRegion(copy.dst.resource.GetHandle(), copy.dstOffset,
+                copy.src.resource.GetHandle(), copy.srcOffset, copy.bytes);
+        }
+    }
 
     namespace {
 
@@ -199,12 +240,7 @@ namespace org::imm {
         };
         auto barrierRepeatedBufferWrite = [&](rhi::ResourceHandle buffer, rhi::ResourceAccessType access, rhi::ResourceSyncState sync) {
             if (wasWritten(writtenBuffers, buffer)) {
-                rhi::BufferBarrier barrier{};
-                barrier.buffer = buffer;
-                barrier.beforeSync = sync;
-                barrier.afterSync = sync;
-                barrier.beforeAccess = access;
-                barrier.afterAccess = access;
+                auto barrier = MakeWholeBufferBarrier(buffer, access, access, sync, sync);
                 rhi::BarrierBatch batch{};
                 batch.buffers = { &barrier, 1 };
                 cl.Barriers(batch);

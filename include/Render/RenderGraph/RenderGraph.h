@@ -150,6 +150,7 @@ public:
 		std::string techniquePath;
 		std::optional<ExternalInsertPoint> where;
 		std::variant<std::monostate, std::shared_ptr<RenderPass>, std::shared_ptr<ComputePass>, std::shared_ptr<CopyPass>> pass;
+		std::shared_ptr<RenderGraphPass> unifiedPass;
 		std::optional<QueueKind> preferredQueueKind;
 		std::optional<QueueAssignmentPolicy> queueAssignmentPolicy;
 		std::optional<QueueSlotIndex> pinnedQueueSlot; // Target a specific queue slot, bypassing queue preference
@@ -172,6 +173,20 @@ public:
 			desc.type = PassType::Compute;
 			desc.name = std::move(name);
 			desc.pass = std::move(computePass);
+			return desc;
+		}
+
+		// Queue semantics are declaration data, not inheritance. This overload lets
+		// unified/typed passes request compute without entering the legacy compute
+		// pass container or deriving from ComputePass.
+		static ExternalPassDesc Compute(std::string name, std::shared_ptr<RenderPass> computePass) {
+			ExternalPassDesc desc{};
+			// PassType remains an ingestion/compiler shape tag during the migration;
+			// actual execution queue is selected independently below.
+			desc.type = PassType::Render;
+			desc.name = std::move(name);
+			desc.unifiedPass = std::move(computePass);
+			desc.preferredQueueKind = QueueKind::Compute;
 			return desc;
 		}
 
@@ -325,9 +340,10 @@ public:
 		bool initialFromUndefined = false;
 	};
 
-	struct RenderPassAndResources { // TODO: I'm currently copying these a lot; maybe use pointers instead
-		std::shared_ptr<RenderPass> pass;
-		RenderPassParameters resources;
+	struct PassAndResources {
+		std::shared_ptr<RenderGraphPass> pass;
+		bool unifiedDeclaration = false;
+		PassParameters resources;
 		std::string name;
 		std::string techniquePath;
 		int statisticsIndex = -1;
@@ -344,49 +360,14 @@ public:
 		std::vector<ResourceTransition> backendPostTransitions;
 		std::vector<ExternalOwnershipBarrier> externalAcquires;
 		std::vector<ExternalOwnershipBarrier> externalReleases;
+		std::shared_ptr<const org::imm::PreparedBufferCopies> preparedBufferCopies;
 	};
 
-	struct ComputePassAndResources { // TODO: Same as above
-		std::shared_ptr<ComputePass> pass;
-		ComputePassParameters resources;
-		std::string name;
-		std::string techniquePath;
-		int statisticsIndex = -1;
-		bool collectStatistics = true;
-
-		PassRunMask run = PassRunMask::Both;
-		std::vector<std::byte> immediateBytecode; // Stores the immediate execution bytecode
-		std::shared_ptr<org::imm::KeepAliveBag> immediateKeepAlive = nullptr; // Keeps alive resources used by immediate execution bytecode
-		std::vector<std::shared_ptr<Resource>> retainedAnonymousKeepAlive; // Keeps retained anonymous handles alive across frames
-		std::vector<ResolverSnapshot> resolverSnapshots; // Versioned resolver snapshots for auto-invalidation
-		std::vector<ExternalTimelinePoint> explicitExternalWaitsBeforeTransitions;
-		RetainedDeclarationCache declarationCache;
-		std::vector<ResourceTransition> backendPreTransitions;
-		std::vector<ResourceTransition> backendPostTransitions;
-		std::vector<ExternalOwnershipBarrier> externalAcquires;
-		std::vector<ExternalOwnershipBarrier> externalReleases;
-	};
-
-	struct CopyPassAndResources {
-		std::shared_ptr<CopyPass> pass;
-		CopyPassParameters resources;
-		std::string name;
-		std::string techniquePath;
-		int statisticsIndex = -1;
-		bool collectStatistics = true;
-
-		PassRunMask run = PassRunMask::Both;
-		std::vector<std::byte> immediateBytecode;
-		std::shared_ptr<org::imm::KeepAliveBag> immediateKeepAlive = nullptr;
-		std::vector<std::shared_ptr<Resource>> retainedAnonymousKeepAlive; // Keeps retained anonymous handles alive across frames
-		std::vector<ResolverSnapshot> resolverSnapshots; // Versioned resolver snapshots for auto-invalidation
-		std::vector<ExternalTimelinePoint> explicitExternalWaitsBeforeTransitions;
-		RetainedDeclarationCache declarationCache;
-		std::vector<ResourceTransition> backendPreTransitions;
-		std::vector<ResourceTransition> backendPostTransitions;
-		std::vector<ExternalOwnershipBarrier> externalAcquires;
-		std::vector<ExternalOwnershipBarrier> externalReleases;
-	};
+	// Transitional tags preserve the current compiler variant while all three
+	// ingestion paths now share one queue-agnostic stored representation.
+	struct RenderPassAndResources : PassAndResources {};
+	struct ComputePassAndResources : PassAndResources {};
+	struct CopyPassAndResources : PassAndResources {};
 
 	enum class BatchWaitPhase : uint8_t {
 		BeforeTransitions = 0,
@@ -828,6 +809,19 @@ public:
 	template<typename PassT, typename... StableCtorArgs>
 	RenderPassBuilder& BuildRenderPass(std::string const& name, StableCtorArgs&&... ctorArgs);
 
+	// Unified author-facing path. Queue class is a declaration property, not a
+	// C++ base-class choice; typed passes select it through PassBuilder.
+	template<typename PassT, org::PassInputs InputsT, typename... StableCtorArgs>
+	RenderPassBuilder& BuildPass(std::string const& name, InputsT&& inputs, StableCtorArgs&&... ctorArgs) {
+		return BuildRenderPass<PassT>(name, std::forward<InputsT>(inputs),
+			std::forward<StableCtorArgs>(ctorArgs)...);
+	}
+
+	template<typename PassT, typename... StableCtorArgs>
+	RenderPassBuilder& BuildPass(std::string const& name, StableCtorArgs&&... ctorArgs) {
+		return BuildRenderPass<PassT>(name, std::forward<StableCtorArgs>(ctorArgs)...);
+	}
+
 	template<typename PassT, org::PassInputs InputsT, typename... StableCtorArgs>
 	CopyPassBuilder& BuildCopyPass(std::string const& name, InputsT&& inputs, StableCtorArgs&&... ctorArgs);
 
@@ -1262,9 +1256,13 @@ private:
 	struct CompilerState;
     void SubmitDependencyCompileShadow(const std::vector<Node>& nodes,
         std::span<const std::pair<size_t, size_t>> explicitEdges,
-        std::vector<std::pair<uint32_t, uint32_t>> dependencyOracle);
+        std::vector<std::pair<uint32_t, uint32_t>> dependencyOracle,
+        uint8_t frameIndex, float deltaTime, const IHostExecutionData* hostData);
+	bool TryExecuteSelectedAsyncFrame(PassExecutionContext& context);
+	bool PrepareSelectedAsyncFrame(PassExecutionContext& context);
 	std::unique_ptr<CompilerState> m_compilerState;
     std::shared_ptr<const ResolverCaptureContext> m_resolverCaptureContext;
+    std::shared_ptr<const IHostExecutionData> m_asyncUpdateHostData;
 
 	std::vector<IResourceProvider*> _providers;
 	ResourceRegistry _registry;
@@ -1592,6 +1590,10 @@ private:
 	bool RefreshRetainedDeclarationsForFrame(ComputePassAndResources& p, uint8_t frameIndex);
 	bool RefreshRetainedDeclarationsForFrame(CopyPassAndResources& p, uint8_t frameIndex);
 	void CompileFrame(rhi::Device device, uint8_t frameIndex, const IHostExecutionData* hostData);
+	void PrepareAsyncFrame(rhi::Device device, uint8_t frameIndex, float deltaTime,
+		const IHostExecutionData* hostData);
+	void PrepareAndCompileFrame(rhi::Device device, uint8_t frameIndex,
+		const IHostExecutionData* hostData, bool asyncPreparationOnly, float deltaTime = 0.0f);
 	void BeginCompileProfileFrame(uint8_t frameIndex);
 	void EndCompileProfileFrame();
 	void RecordCompileProfileCounters(const std::vector<Node>& nodes, std::span<const uint64_t> usedResourceIDs);

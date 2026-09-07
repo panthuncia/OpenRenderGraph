@@ -56,6 +56,13 @@ uint64_t ExternalBackingResource::GetBackingGeneration() const {
 void ExternalBackingResource::EnsureVirtualDescriptorSlotsAllocated() {
 }
 
+BackingAllocationSnapshot ExternalBackingResource::CaptureBackingAllocation() {
+    if (!IsMaterialized() || GetAttachedAPIRepresentation(BackendInstanceId::Primary).IsValid()) return {};
+    auto lease = m_impl->backing->CaptureAllocationLease();
+    if (!lease) return {};
+    return {GetGlobalResourceID(), GetBackingGeneration(), GetAPIResource(), std::move(lease), m_impl->backing->GetSize()};
+}
+
 ExternalBackingResource::ExternalBackingResource(std::unique_ptr<GpuBufferBacking> backing)
     : m_impl(std::make_unique<Impl>(std::move(backing)))
 {

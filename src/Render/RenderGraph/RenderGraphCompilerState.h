@@ -2,12 +2,15 @@
 
 #include "Render/RenderGraph/RenderGraph.h"
 #include "Render/RenderGraph/ExperimentalGraphCompiler.h"
+#include "Render/RenderGraph/ExperimentalExecutionState.h"
 
 
 // Private compiler representation. Keep compiler-only data here rather than in
 // RenderGraph's installed public header so compile algorithm changes have a
 // narrow incremental-build footprint.
 namespace org {
+
+namespace experimental { struct RenderFrameSnapshot; struct FramePreparationBasis; }
 
 struct RenderGraph::Node {
 	size_t passIndex = 0;
@@ -31,15 +34,23 @@ struct RenderGraph::Node {
 
 struct RenderGraph::CompilerState {
     std::unique_ptr<experimental::GraphCompileCoordinator> shadowCompiler;
+    std::shared_ptr<const experimental::RenderFrameSnapshot> selectedAsyncFrame;
+    std::shared_ptr<const experimental::GraphCompileInput> currentAsyncInput;
+    experimental::BackingStateAdmissionLedger asyncBackingStateLedger;
+    experimental::BackingAccessAdmissionLedger asyncBackingAccessLedger;
+    experimental::AliasAccessAdmissionLedger asyncAliasAccessLedger;
+    std::unique_ptr<experimental::ExecutionTimelineAdmission> asyncTimelineAdmission;
+    uint64_t lastRequestedAsyncSequence = 0;
+    uint64_t nextAsyncExecutionSequence = 1;
+    uint64_t asyncPreparationFrameNumber = 0;
+    uint64_t reportedAsyncSelectionFailures = 0;
+    uint64_t reportedAsyncUnownedResources = 0;
+    std::unordered_set<std::string> reportedAsyncLegacyPasses;
     uint64_t reportedShadowFailures = 0;
     uint64_t shadowCaptureFailures = 0;
-	struct SeqState {
-		std::optional<size_t> lastWriter;
-		std::vector<size_t> readsSinceWrite;
-	};
 
 	std::vector<Node> nodes;
-	std::vector<SeqState> dependencySeqStates;
+	std::vector<compiler::DependencySequence<size_t>> dependencySeqStates;
 	std::vector<uint64_t> dependencyEdgeKeys;
 	std::vector<uint32_t> dependencyIndegrees;
 	std::vector<size_t> dependencyTopoOrder;

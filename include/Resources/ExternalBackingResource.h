@@ -30,6 +30,7 @@ public:
     bool IsMaterialized() const override;
 
     uint64_t GetBackingGeneration() const override;
+    BackingAllocationSnapshot CaptureBackingAllocation() override;
 
     void EnsureVirtualDescriptorSlotsAllocated() override;
 

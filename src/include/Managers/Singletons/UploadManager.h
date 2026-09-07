@@ -126,6 +126,7 @@ private:
 		PassReturn Execute(PassExecutionContext& context) override {
 			return {};
 		}
+		bool ImmediateCommandsAreCompleteExecution() const noexcept override { return true; }
 
 		void Cleanup() override {
 			// Cleanup if necessary

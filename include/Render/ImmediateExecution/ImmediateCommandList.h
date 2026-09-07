@@ -6,6 +6,7 @@
 #include <memory>
 #include <type_traits>
 #include <stdexcept>
+#include <atomic>
 
 #include <rhi.h>
 
@@ -14,6 +15,7 @@
 #include "Render/ResourceRequirements.h"      // ResourceRequirement, ResourceAndRange
 #include "Resources/Resource.h"
 #include "Resources/GloballyIndexedResource.h"
+#include "Resources/BackedResource.h"
 
 namespace org { class RenderGraph; }
 
@@ -184,6 +186,25 @@ namespace org::imm {
 
     // Replay bytecode into a concrete RHI command list.
     void Replay(std::vector<std::byte> const& bytecode, rhi::CommandList& cl, ImmediateDispatch const& dispatch);
+
+    // Owned preparation for the descriptor-free subset. Null means unsupported;
+    // the caller must preserve the original bytecode/side effects for fallback.
+    class PreparedBufferCopies {
+    public:
+        using Resolver = std::function<BackingAllocationSnapshot(ResourceRegistry::RegistryHandle)>;
+        static std::shared_ptr<const PreparedBufferCopies> Capture(
+            const std::vector<std::byte>& bytecode, const Resolver& resolve);
+        void Record(rhi::CommandList& list) const;
+        size_t Size() const { return m_copies.size(); }
+    private:
+        struct Copy {
+            BackingAllocationSnapshot dst, src;
+            uint64_t dstOffset, srcOffset, bytes;
+            bool orderPreviousWrite = false;
+        };
+        std::vector<Copy> m_copies;
+        mutable std::atomic_bool m_recorded{false};
+    };
 
     struct LifetimePin {
         // type-erased owning payload

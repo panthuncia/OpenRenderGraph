@@ -54,6 +54,7 @@ public:
 	// latest graph fence snapshot has finished using it.
 	void RetireNativeResource(rhi::ResourcePtr resource);
 	void RetireBufferBacking(std::unique_ptr<GpuBufferBacking> backing);
+    void RetireExecutionLease(std::shared_ptr<const void> lease);
 	struct QueueFenceSnapshotPoint {
 		rhi::Timeline timeline;
 		uint64_t value = 0;
@@ -133,6 +134,7 @@ private:
 		std::vector<std::unique_ptr<GpuBufferBacking>> bufferBackings;
 		std::vector<std::shared_ptr<Resource>> resources;
 		std::vector<rhi::ResourcePtr> nativeResources;
+        std::vector<std::shared_ptr<const void>> executionLeases;
 		std::vector<QueueFenceSnapshotPoint> requiredFences;
 	};
 	std::vector<DeferredRelease> m_deferredReleases;

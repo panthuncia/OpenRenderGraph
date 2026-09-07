@@ -59,7 +59,10 @@ struct BackendAffinity {
 };
 
 constexpr bool IsQueueKindSupportedByRenderPass(QueueKind kind) noexcept {
-	return kind == QueueKind::Graphics;
+	// The historical RenderPass storage is now the unified typed-pass path.
+	// Operation-level validation in PassBuilder prevents graphics-only
+	// declarations from selecting compute/copy queues.
+	return kind == QueueKind::Graphics || kind == QueueKind::Compute || kind == QueueKind::Copy;
 }
 
 constexpr bool IsQueueKindSupportedByComputePass(QueueKind kind) noexcept {

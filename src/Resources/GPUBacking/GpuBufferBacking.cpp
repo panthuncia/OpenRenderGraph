@@ -20,6 +20,7 @@ GpuBufferBacking::GpuBufferBacking(
     const BufferAliasPlacement* aliasPlacement,
     const bool shared) {
     m_accessType = accessType;
+    if (aliasPlacement && !aliasPlacement->heap) throw std::invalid_argument("Missing alias heap owner");
 
     rhi::ResourceDesc desc = rhi::helpers::ResourceDesc::Buffer(bufferSize);
     if (unorderedAccess) {
@@ -49,9 +50,13 @@ GpuBufferBacking::GpuBufferBacking(
     }
     trackDesc.attach = allocationBundle;
 
-    if (aliasPlacement && aliasPlacement->allocation) {
+    if (aliasPlacement) {
+		m_aliasHeap = aliasPlacement->heap;
+		m_aliasPoolID = aliasPlacement->poolID.value_or(0);
+		m_aliasOffset = aliasPlacement->offset;
+		m_aliasSize = allocInfo.sizeInBytes;
         const auto result = DeviceManager::GetInstance().CreateAliasingResourceTracked(
-            *aliasPlacement->allocation,
+            aliasPlacement->heap->Allocation(),
             aliasPlacement->offset,
             desc,
             0,
@@ -61,6 +66,7 @@ GpuBufferBacking::GpuBufferBacking(
         if (!rhi::IsOk(result)) {
             throw std::runtime_error("Failed to create aliased buffer resource backing");
         }
+        m_bufferAllocation.RetainLifetimeOwner(aliasPlacement->heap);
     }
     else {
         rhi::ma::AllocationDesc allocationDesc;

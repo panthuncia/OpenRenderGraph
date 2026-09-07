@@ -3,6 +3,7 @@
 #include <functional>
 #include <mutex>
 #include <variant>
+#include <stdexcept>
 
 #include <flecs.h>
 #include <rhi_allocator.h>
@@ -281,18 +282,46 @@ public:
     }
 
     TrackedHandle(TrackedHandle&&) noexcept = default;
-    TrackedHandle& operator=(TrackedHandle&&) noexcept = default;
+    TrackedHandle& operator=(TrackedHandle&& other) noexcept {
+        if (this != &other) {
+            Reset(); // Release native objects before their lifetime dependencies.
+            leaseOwner_ = std::move(other.leaseOwner_);
+            h_ = std::move(other.h_);
+            tok_ = std::move(other.tok_);
+            lifetimeOwner_ = std::move(other.lifetimeOwner_);
+        }
+        return *this;
+    }
 
     TrackedHandle(const TrackedHandle&) = delete;
     TrackedHandle& operator=(const TrackedHandle&) = delete;
 
     ~TrackedHandle() { Reset(); }
 
+    // Preparation-owner only. Lazily move concrete ownership (including its
+    // tracking token) into a stable holder; logical Reset no longer invalidates
+    // captured command packets. This does not lease descriptors or alias ranges.
+    std::shared_ptr<const TrackedHandle> CaptureAllocationLease() {
+        if (!*this) return {};
+        if (!leaseOwner_) leaseOwner_ = std::make_shared<TrackedHandle>(std::move(*this));
+        return leaseOwner_;
+    }
+
+    // Set during realization, before publishing/capturing this backing. For a
+    // placed resource this retains its heap generation, not an exclusive range.
+    void RetainLifetimeOwner(std::shared_ptr<const void> owner) {
+        if (!owner || !*this || leaseOwner_ || lifetimeOwner_)
+            throw std::logic_error("Invalid or already published backing ownership");
+        lifetimeOwner_ = std::move(owner);
+    }
+
     void ApplyComponentBundle(const EntityComponentBundle& bundle) noexcept {
+        if (leaseOwner_) { leaseOwner_->ApplyComponentBundle(bundle); return; }
         tok_.ApplyAttachBundle(bundle);
     }
 
     explicit operator bool() const noexcept {
+        if (leaseOwner_) return static_cast<bool>(*leaseOwner_);
         return std::visit([](auto const& v) -> bool {
             using V = std::decay_t<decltype(v)>;
             if constexpr (std::is_same_v<V, std::monostate>) return false;
@@ -301,6 +330,7 @@ public:
     }
 
     rhi::Resource& GetResource() noexcept {
+        if (leaseOwner_) return leaseOwner_->GetResource();
         return std::visit([](auto& v) -> rhi::Resource& {
             using V = std::decay_t<decltype(v)>;
             if constexpr (std::is_same_v<V, rhi::ma::AllocationPtr>) return v.Get()->GetResource();
@@ -311,28 +341,41 @@ public:
 
     // Called by DeletionManager when it's actually time to free.
     void Reset() noexcept {
+        leaseOwner_.reset();
         std::visit([](auto& v) {
             using V = std::decay_t<decltype(v)>;
             if constexpr (!std::is_same_v<V, std::monostate>) v.Reset();
             }, h_);
         h_ = std::monostate{};
         tok_.Reset(); // enqueues entity deletion (main thread flush later)
+        lifetimeOwner_.reset();
     }
 
     // If you want to hand out the underlying pointer and keep the entity alive:
-    rhi::ma::AllocationPtr ReleaseAllocationDisarm() noexcept {
+    rhi::ma::AllocationPtr ReleaseAllocationDisarm() {
+        if (lifetimeOwner_) throw std::logic_error("Cannot disarm an allocation with lifetime dependencies");
+        if (leaseOwner_) {
+            if (leaseOwner_.use_count() != 1) throw std::logic_error("Cannot disarm a leased allocation");
+            return leaseOwner_->ReleaseAllocationDisarm();
+        }
         tok_.Disarm();
         if (auto* p = std::get_if<rhi::ma::AllocationPtr>(&h_)) return std::move(*p);
         return {};
     }
 
-    rhi::ResourcePtr ReleaseResourceDisarm() noexcept {
+    rhi::ResourcePtr ReleaseResourceDisarm() {
+        if (lifetimeOwner_) throw std::logic_error("Cannot disarm a resource with lifetime dependencies");
+        if (leaseOwner_) {
+            if (leaseOwner_.use_count() != 1) throw std::logic_error("Cannot disarm a leased resource");
+            return leaseOwner_->ReleaseResourceDisarm();
+        }
         tok_.Disarm();
         if (auto* p = std::get_if<rhi::ResourcePtr>(&h_)) return std::move(*p);
         return {};
     }
 
     rhi::ma::Allocation* GetAllocation() noexcept {
+        if (leaseOwner_) return leaseOwner_->GetAllocation();
         if (auto* p = std::get_if<rhi::ma::AllocationPtr>(&h_)) {
             return p->Get();
         }
@@ -340,6 +383,8 @@ public:
     }
 
 private:
+    std::shared_ptr<const void> lifetimeOwner_;
+    std::shared_ptr<TrackedHandle> leaseOwner_;
     std::variant<std::monostate, rhi::ma::AllocationPtr, rhi::ResourcePtr> h_;
     TrackedEntityToken tok_;
 };

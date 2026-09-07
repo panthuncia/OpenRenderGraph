@@ -90,6 +90,7 @@ void GpuTextureBacking::initialize(const TextureDescription& desc,
 	const char* name)
 {
 	m_desc = desc;
+    if (placement && !placement->heap) throw std::invalid_argument("Missing alias heap owner");
 	DescriptorHeapManager& rm = DescriptorHeapManager::GetInstance();
 
 	// Honor explicit subresource chains for file-backed textures and caches.
@@ -187,6 +188,12 @@ void GpuTextureBacking::initialize(const TextureDescription& desc,
 
 	rhi::ResourceAllocationInfo allocInfo;
 	device.GetResourceAllocationInfo(&textureDesc, 1, &allocInfo);
+	if (placement) {
+		m_aliasHeap = placement->heap;
+		m_aliasPoolID = placement->poolID.value_or(0);
+		m_aliasOffset = placement->offset;
+		m_aliasSize = allocInfo.sizeInBytes;
+	}
 
 	allocationBundle
 		.Set<MemoryStatisticsComponents::MemSizeBytes>({ allocInfo.sizeInBytes })
@@ -204,14 +211,14 @@ void GpuTextureBacking::initialize(const TextureDescription& desc,
 	}
 	trackDesc.attach = allocationBundle;
 
-	if (placement && placement->allocation) {
+	if (placement) {
 		if (placement->poolID.has_value()) {
 			allocationBundle.Set<MemoryStatisticsComponents::AliasingPool>({ placement->poolID });
 		}
 		trackDesc.attach = allocationBundle;
 
 		const auto result = DeviceManager::GetInstance().CreateAliasingResourceTracked(
-			*placement->allocation,
+			placement->heap->Allocation(),
 			placement->offset,
 			textureDesc,
 			0,
@@ -221,6 +228,7 @@ void GpuTextureBacking::initialize(const TextureDescription& desc,
 		if (!rhi::IsOk(result)) {
 			throw std::runtime_error("Failed to create aliased texture resource backing");
 		}
+		m_textureHandle.RetainLifetimeOwner(placement->heap);
 	}
 	else {
 

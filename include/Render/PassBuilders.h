@@ -1154,6 +1154,9 @@ public:
     }
 
     std::vector<ResolverSnapshot> TakeResolverSnapshots() { return std::move(resolverSnapshots_); }
+    void AdoptResolverSnapshots(std::vector<ResolverSnapshot> snapshots) {
+        resolverSnapshots_ = std::move(snapshots);
+    }
 
 	// LVALUE overloads for IResourceResolver
     RenderPassBuilder& WithShaderResource(const IResourceResolver& r)& {
@@ -1405,6 +1408,23 @@ private:
 		params.backendAffinity = m_backendAffinity;
         params.identifierSet = _declaredIds;
         params.staticResourceRequirements = GatherResourceRequirements();
+
+		const bool hasGraphicsOnlyOperations = !params.renderTargets.empty()
+			|| !params.renderTargetClearResources.empty()
+			|| !params.depthReadResources.empty()
+			|| !params.depthReadWriteResources.empty()
+			|| !params.depthStencilClearResources.empty()
+			|| !params.indexBuffers.empty()
+			|| !params.presentResources.empty();
+		const bool hasShaderOperations = !params.shaderResources.empty()
+			|| !params.constantBuffers.empty()
+			|| !params.unorderedAccessViews.empty()
+			|| !params.unorderedAccessClearViews.empty()
+			|| !params.indirectArgumentBuffers.empty();
+		if (params.preferredQueueKind == QueueKind::Compute && hasGraphicsOnlyOperations)
+			throw std::invalid_argument("Pass declares graphics-only operations but prefers the compute queue");
+		if (params.preferredQueueKind == QueueKind::Copy && (hasGraphicsOnlyOperations || hasShaderOperations))
+			throw std::invalid_argument("Pass declares non-copy operations but prefers the copy queue");
 
         graph->AddRenderPass(pass, params, passName, TakeResolverSnapshots());
     }

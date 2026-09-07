@@ -170,6 +170,22 @@ public:
         return { signalFence, fenceValue };
     }
 
+    std::optional<OwnedImmediateSubmissionEffect> TakeOwnedImmediateSubmissionEffect() override {
+        if (!m_hasPendingToken || !m_readbackService) return std::nullopt;
+        const rhi::Timeline signalFence = m_readbackService->GetReadbackFence(QueueKind::Graphics);
+        if (!signalFence.IsValid()) return std::nullopt;
+        const uint64_t fenceValue = m_readbackService->GetNextReadbackFenceValue(QueueKind::Graphics);
+        const auto token = m_pendingToken;
+        auto* service = m_readbackService;
+        m_hasPendingToken = false;
+        return OwnedImmediateSubmissionEffect{
+            .completionSignals = {{signalFence, fenceValue}},
+            .commit = [service, token, fenceValue]() {
+                service->FinalizeCapture(token, QueueKind::Graphics, nullptr, fenceValue);
+            },
+        };
+    }
+
     void Cleanup() override {
     }
 

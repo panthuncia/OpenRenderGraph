@@ -11,7 +11,7 @@
 #define ORG_C_CALL
 #endif
 
-#define ORG_CONTRIBUTOR_API_VERSION 2u
+#define ORG_CONTRIBUTOR_API_VERSION 3u
 
 typedef enum org_c_pass_kind {
     ORG_C_PASS_RASTER = 0,
@@ -146,7 +146,7 @@ typedef struct org_c_binding {
     uint32_t reserved;
 } org_c_binding;
 
-typedef struct org_c_execute_context {
+typedef struct org_c_record_context {
     uint32_t structure_size;
     uint32_t api_version;
     uint64_t frame_index;
@@ -154,8 +154,37 @@ typedef struct org_c_execute_context {
     basicrhi_c_borrowed_recorder_v1 recorder;
     const org_c_binding* bindings;
     size_t binding_count;
-    const void* host_data;
-} org_c_execute_context;
+} org_c_record_context;
+
+typedef enum org_c_abandon_reason {
+    ORG_C_ABANDON_SHUTDOWN = 0,
+    ORG_C_ABANDON_GENERATION_INVALIDATED = 1,
+    ORG_C_ABANDON_PREPARATION_FAILED = 2,
+    ORG_C_ABANDON_ADMISSION_FAILED = 3
+} org_c_abandon_reason;
+
+// An owned, single-frame packet returned by a contributor on the preparation
+// owner. `data` remains contributor-owned until `destroy` is called. Record
+// and lifecycle callbacks may run after the next logical frame is prepared,
+// so the packet must not borrow contributor frame scratch.
+typedef struct org_c_prepared_pass {
+    uint32_t structure_size;
+    uint32_t api_version;
+    void* data;
+    void (ORG_C_CALL *record)(const void* data, const org_c_record_context* context);
+    void (ORG_C_CALL *submitted)(const void* data, uint64_t submission_id);
+    void (ORG_C_CALL *completed)(const void* data, uint64_t completion_value);
+    void (ORG_C_CALL *abandoned)(const void* data, uint32_t reason);
+    void (ORG_C_CALL *destroy)(void* data);
+} org_c_prepared_pass;
+
+typedef struct org_c_pass_prepare_context {
+    uint32_t structure_size;
+    uint32_t api_version;
+    const org_c_frame_context* frame;
+    const org_c_binding* bindings;
+    size_t binding_count;
+} org_c_pass_prepare_context;
 
 typedef struct org_c_pass {
     uint32_t structure_size;
@@ -169,7 +198,10 @@ typedef struct org_c_pass {
     const org_c_string_view* before_passes;
     size_t before_pass_count;
     void* user_data;
-    void (ORG_C_CALL *execute)(void* user_data, const org_c_execute_context* context);
+    org_c_result (ORG_C_CALL *prepare)(
+        void* user_data,
+        const org_c_pass_prepare_context* context,
+        org_c_prepared_pass* prepared);
 } org_c_pass;
 
 typedef struct org_c_contributor_api {

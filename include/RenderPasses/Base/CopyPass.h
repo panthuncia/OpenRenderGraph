@@ -1,4 +1,6 @@
 #pragma once
+#include "Render/PreparedPass.h"
+#include "RenderPasses/Base/RenderPass.h"
 
 #include <vector>
 #include <unordered_set>
@@ -21,28 +23,11 @@
 
 namespace org {
 
-struct CopyPassParameters {
-	std::vector<ResourceHandleAndRange> copyTargets;
-	std::vector<ResourceHandleAndRange> copySources;
-	std::vector<std::pair<ResourceHandleAndRange, ResourceState>> internalTransitions;
-	std::vector<ExternalTimelinePoint> externalWaitsBeforeTransitions;
-	std::vector<ExternalTimelineBinding> externalWaitBindingsBeforeTransitions;
-
-	std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> identifierSet;
-	std::vector<ResourceRequirement> staticResourceRequirements;
-	std::vector<std::shared_ptr<const ResolverRequirementBlock>> resolverRequirementBlocks;
-	std::vector<ResourceRequirement> frameResourceRequirements;
-	mutable std::vector<ResourceRequirement> mergedFrameResourceRequirements;
-	mutable bool mergedFrameRequirementsDirty = false;
-	QueueKind preferredQueueKind = QueueKind::Copy;
-	QueueAssignmentPolicy queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
-	std::optional<QueueSlotIndex> pinnedQueueSlot; // Target a specific queue slot instead of using preferredQueueKind
-	BackendAffinity backendAffinity{};
-};
+using CopyPassParameters = PassParameters;
 
 class CopyPassBuilder;
 
-class CopyPass : public IResourceProvider, public RenderGraphPassBase {
+class CopyPass : public RenderGraphPass {
 public:
 	virtual ~CopyPass() = default;
 
@@ -51,14 +36,22 @@ public:
 		m_resourceDescriptorIndexHelper = std::make_unique<ResourceDescriptorIndexHelper>(resourceRegistryView);
 	}
 
+    void ConfigureResourceRegistryView(
+        std::shared_ptr<ResourceRegistryView> view,
+        const PassParameters&) override {
+        SetResourceRegistryView(std::move(view));
+    }
+
 	virtual void Setup() = 0;
+    // Preparation owner only. Empty means explicit synchronous legacy fallback.
+    virtual PreparedPass PrepareFrame(FramePreparationContext&) { return {}; }
 
 	virtual void Update(const UpdateExecutionContext& context) {};
 	virtual PassReturn Execute(PassExecutionContext& context) { return {}; };
 	virtual void Cleanup() = 0;
 
-	void Invalidate() { invalidated = true; }
-	bool IsInvalidated() const { return invalidated; }
+	void Invalidate() override { invalidated = true; }
+	bool IsInvalidated() const override { return invalidated; }
 
 protected:
 	bool invalidated = true;

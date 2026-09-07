@@ -1,6 +1,7 @@
 #include "Render/RenderGraph/RenderGraph.h"
 #include "RenderGraphCompilerState.h"
 #include "Render/RenderGraph/InteropAllocator.h"
+#include "Render/RenderGraph/ExperimentalRhiExecution.h"
 
 #include <span>
 #include <algorithm>
@@ -36,6 +37,7 @@
 #include "Resources/DynamicResource.h"
 #include "Resources/ExternalTextureResource.h"
 #include "Resources/BackedResource.h"
+#include "Render/BufferBarrierHelpers.h"
 #include "Resources/PixelBuffer.h"
 #include "Resources/Buffers/DynamicBufferBase.h"
 #include "Resources/MemoryStatisticsComponents.h"
@@ -545,15 +547,20 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 	}
 
 	if (d.type == PassType::Render) {
-		auto rp = std::get<std::shared_ptr<RenderPass>>(d.pass);
+		auto rp = d.unifiedPass
+			? std::dynamic_pointer_cast<RenderPass>(d.unifiedPass)
+			: std::get<std::shared_ptr<RenderPass>>(d.pass);
+		if (!rp) {
+			throw std::logic_error("Unified pass does not implement the unified render-graph pass contract");
+		}
 		RenderPassAndResources par;
-		par.pass = std::move(rp);
+		par.pass = rp;
 		par.name = d.name;
 		par.techniquePath = d.techniquePath;
 		par.collectStatistics = d.collectStatistics;
 		{
 			RenderPassBuilder b(this, d.name);
-			b.pass = par.pass;
+			b.pass = rp;
 			b.built_ = true;
 			b.params = {};
 			b.params.isGeometryPass = d.isGeometryPass;
@@ -562,7 +569,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 				spdlog::info("RG materialize external render pass '{}' declare begin", d.name);
 			}
 			EnsureProviderRegistered(par.pass.get());
-			par.pass->DeclareResourceUsages(&b);
+			rp->DeclareResourceUsages(&b);
 			if (logStructuralMaterialize) {
 				spdlog::info(
 					"RG structural materialize render pass='{}' declare complete requirements={} transitions={} identifiers={}",
@@ -604,12 +611,8 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 		}
 
 		if (callSetup) {
-			par.pass->SetResourceRegistryView(
-				MakePassResourceRegistryView(_registry, par.resources),
-				par.resources.activeFeatureDomains,
-				par.resources.autoDescriptorShaderResources,
-				par.resources.autoDescriptorConstantBuffers,
-				par.resources.autoDescriptorUnorderedAccessViews);
+			par.pass->ConfigureResourceRegistryView(
+				MakePassResourceRegistryView(_registry, par.resources), par.resources);
 			if (traceLifecycle) {
 				spdlog::info("RG materialize external render pass '{}' setup begin", d.name);
 			}
@@ -624,13 +627,13 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 	else if (d.type == PassType::Compute) {
 		auto cp = std::get<std::shared_ptr<ComputePass>>(d.pass);
 		ComputePassAndResources par;
-		par.pass = std::move(cp);
+		par.pass = cp;
 		par.name = d.name;
 		par.techniquePath = d.techniquePath;
 		par.collectStatistics = d.collectStatistics;
 		{
 			ComputePassBuilder b(this, d.name);
-			b.pass = par.pass;
+			b.pass = cp;
 			b.built_ = true;
 			b.params = {};
 			b._declaredIds.clear();
@@ -638,7 +641,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 				spdlog::info("RG materialize external compute pass '{}' declare begin", d.name);
 			}
 			EnsureProviderRegistered(par.pass.get());
-			par.pass->DeclareResourceUsages(&b);
+			cp->DeclareResourceUsages(&b);
 			if (logStructuralMaterialize) {
 				spdlog::info(
 					"RG structural materialize compute pass='{}' declare complete requirements={} transitions={} identifiers={}",
@@ -679,12 +682,8 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 		}
 
 		if (callSetup) {
-			par.pass->SetResourceRegistryView(
-				MakePassResourceRegistryView(_registry, par.resources),
-				par.resources.activeFeatureDomains,
-				par.resources.autoDescriptorShaderResources,
-				par.resources.autoDescriptorConstantBuffers,
-				par.resources.autoDescriptorUnorderedAccessViews);
+			par.pass->ConfigureResourceRegistryView(
+				MakePassResourceRegistryView(_registry, par.resources), par.resources);
 			if (traceLifecycle) {
 				spdlog::info("RG materialize external compute pass '{}' setup begin", d.name);
 			}
@@ -699,13 +698,13 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 	else if (d.type == PassType::Copy) {
 		auto cp = std::get<std::shared_ptr<CopyPass>>(d.pass);
 		CopyPassAndResources par;
-		par.pass = std::move(cp);
+		par.pass = cp;
 		par.name = d.name;
 		par.techniquePath = d.techniquePath;
 		par.collectStatistics = d.collectStatistics;
 		{
 			CopyPassBuilder b(this, d.name);
-			b.pass = par.pass;
+			b.pass = cp;
 			b.built_ = true;
 			b.params = {};
 			b._declaredIds.clear();
@@ -713,7 +712,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 				spdlog::info("RG materialize external copy pass '{}' declare begin", d.name);
 			}
 			EnsureProviderRegistered(par.pass.get());
-			par.pass->DeclareResourceUsages(&b);
+			cp->DeclareResourceUsages(&b);
 			if (logStructuralMaterialize) {
 				spdlog::info(
 					"RG structural materialize copy pass='{}' declare complete requirements={} transitions={} identifiers={}",
@@ -750,8 +749,8 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 		}
 
 		if (callSetup) {
-			par.pass->SetResourceRegistryView(
-				MakePassResourceRegistryView(_registry, par.resources));
+			par.pass->ConfigureResourceRegistryView(
+				MakePassResourceRegistryView(_registry, par.resources), par.resources);
 			if (traceLifecycle) {
 				spdlog::info("RG materialize external copy pass '{}' setup begin", d.name);
 			}
@@ -785,13 +784,13 @@ void RenderGraph::RegisterExternalPassName(const ExternalPassDesc& d, AnyPassAnd
 	if (d.type == PassType::Render) {
 		auto& rp = std::get<RenderPassAndResources>(any.pass);
 		if (!d.name.empty()) {
-			renderPassesByName[d.name] = rp.pass;
+			renderPassesByName[d.name] = std::dynamic_pointer_cast<RenderPass>(rp.pass);
 		}
 	}
 	else if (d.type == PassType::Compute) {
 		auto& cp = std::get<ComputePassAndResources>(any.pass);
 		if (!d.name.empty()) {
-			computePassesByName[d.name] = cp.pass;
+			computePassesByName[d.name] = std::dynamic_pointer_cast<ComputePass>(cp.pass);
 		}
 	}
 }
@@ -1917,11 +1916,11 @@ bool RenderGraph::BuildDependencyGraph(
 	std::span<const std::pair<size_t, size_t>> explicitEdges)
 {
 	BT_ZONE_SCOPE("RenderGraph::BuildDependencyGraph");
+    if (nodes.size() >= UINT32_MAX) throw std::invalid_argument("Dependency graph exceeds edge-key capacity");
 	auto& seq = m_compilerState->dependencySeqStates;
 	seq.resize(m_frameDAGResourceCount);
 	for (auto& state : seq) {
-		state.lastWriter.reset();
-		state.readsSinceWrite.clear();
+		state.Reset();
 	}
 
 	auto& edgeKeys = m_compilerState->dependencyEdgeKeys;
@@ -1934,7 +1933,8 @@ bool RenderGraph::BuildDependencyGraph(
 		edgeKeys.push_back((uint64_t(from) << 32) | uint64_t(to));
 	};
 
-	// build deps in ORIGINAL order
+    const rhi::Backend primaryBackend = m_backendDevices.empty() ? rhi::Backend::Null : m_backendDevices.front().backend;
+	// Build hazards and API ownership together in original declaration order.
 	for (size_t i = 0; i < nodes.size(); ++i) {
 		auto& node = nodes[i];
 		const auto* dagAccesses = node.passIndex < m_framePassAccessSummaries.size()
@@ -1943,46 +1943,16 @@ bool RenderGraph::BuildDependencyGraph(
 		if (!dagAccesses) {
 			continue;
 		}
+        const auto& affinity = m_framePassAccessSummaries[node.passIndex].backendAffinity;
+        const auto backend = affinity.strength == BackendAffinityStrength::Primary ? primaryBackend : affinity.backend;
 
 		for (const auto& access : *dagAccesses) {
 			if (access.resourceIndex >= seq.size()) {
 				continue;
 			}
 
-			auto& s = seq[access.resourceIndex];
-
-			if (access.kind == AccessKind::Read) {
-				if (s.lastWriter) addEdgeCandidate(*s.lastWriter, i);
-				s.readsSinceWrite.push_back(i);
-			}
-			else { // Write
-				if (s.lastWriter) addEdgeCandidate(*s.lastWriter, i);
-				for (size_t r : s.readsSinceWrite)
-					addEdgeCandidate(r, i);
-				s.readsSinceWrite.clear();
-				s.lastWriter = i;
-			}
-		}
-	}
-
-	// Imported memory has exclusive API ownership. Add an ordering edge even for
-	// read/read uses when declaration order crosses an API boundary.
-	std::vector<std::optional<size_t>> lastBackendAccess(m_frameDAGResourceCount);
-	std::vector<rhi::Backend> lastBackend(m_frameDAGResourceCount, rhi::Backend::Null);
-	const rhi::Backend primaryBackend = m_backendDevices.empty() ? rhi::Backend::Null : m_backendDevices.front().backend;
-	for (size_t i = 0; i < nodes.size(); ++i) {
-		const size_t passIndex = nodes[i].passIndex;
-		if (passIndex >= m_framePassAccessSummaries.size()) continue;
-		const auto& summary = m_framePassAccessSummaries[passIndex];
-		const rhi::Backend backend = summary.backendAffinity.strength == BackendAffinityStrength::Primary
-			? primaryBackend : summary.backendAffinity.backend;
-		for (const auto& access : summary.dagAccesses) {
-			if (access.resourceIndex >= lastBackendAccess.size()) continue;
-			if (lastBackendAccess[access.resourceIndex] && lastBackend[access.resourceIndex] != backend) {
-				addEdgeCandidate(*lastBackendAccess[access.resourceIndex], i);
-			}
-			lastBackendAccess[access.resourceIndex] = i;
-			lastBackend[access.resourceIndex] = backend;
+            compiler::AppendDependencyAccess(seq[access.resourceIndex], i,
+                access.kind != AccessKind::Read, static_cast<uint32_t>(backend), addEdgeCandidate);
 		}
 	}
 
@@ -2010,67 +1980,22 @@ bool RenderGraph::FinalizeDependencyGraph(std::vector<Node>& nodes)
 {
 	// topo + criticality (longest path)
 	auto& indeg = m_compilerState->dependencyIndegrees;
-	indeg.resize(nodes.size());
-	for (size_t i = 0; i < nodes.size(); ++i) indeg[i] = nodes[i].indegree;
-
-	auto originalOrderLess = [&](size_t lhs, size_t rhs) {
-		if (nodes[lhs].originalOrder != nodes[rhs].originalOrder) {
-			return nodes[lhs].originalOrder > nodes[rhs].originalOrder;
-		}
-		return lhs > rhs;
-	};
-
 	auto& ready = m_compilerState->dependencyReadyHeap;
-	ready.clear();
-	if (ready.capacity() < nodes.size()) {
-		ready.reserve(nodes.size());
-	}
-	for (size_t i = 0; i < nodes.size(); ++i) {
-		if (indeg[i] == 0) {
-			ready.push_back(i);
-			std::push_heap(ready.begin(), ready.end(), originalOrderLess);
-		}
-	}
-
 	auto& topo = m_compilerState->dependencyTopoOrder;
-	topo.clear();
-	if (topo.capacity() < nodes.size()) {
-		topo.reserve(nodes.size());
-	}
-
-	while (!ready.empty()) {
-		std::pop_heap(ready.begin(), ready.end(), originalOrderLess);
-		size_t u = ready.back();
-		ready.pop_back();
-		topo.push_back(u);
-		for (size_t v : nodes[u].out) {
-			if (--indeg[v] == 0) {
-				ready.push_back(v);
-				std::push_heap(ready.begin(), ready.end(), originalOrderLess);
-			}
-		}
-	}
-
-	if (topo.size() != nodes.size()) {
-		// cycle: invalid graph
-		return false;
-	}
+    if (compiler::BuildTopologicalOrder<size_t>(nodes.size(),
+        [&](size_t i) { return nodes[i].originalOrder; },
+        [&](size_t i) -> const auto& { return nodes[i].out; },
+        [&](size_t i) { return nodes[i].indegree; }, [] { return false; },
+        indeg, ready, topo) != compiler::TopologyResult::Complete) return false;
 
 	for (size_t rank = 0; rank < topo.size(); ++rank) {
 		nodes[topo[rank]].topoRank = rank;
 	}
 
-	// reverse topo DP
-	for (auto& node : nodes) {
-		node.criticality = 0;
-	}
-	for (auto it = topo.rbegin(); it != topo.rend(); ++it) {
-		size_t u = *it;
-		uint32_t best = 0;
-		for (size_t v : nodes[u].out)
-			best = std::max(best, uint32_t(1 + nodes[v].criticality));
-		nodes[u].criticality = best;
-	}
+    compiler::ComputeCriticality(topo,
+        [&](size_t i) -> const auto& { return nodes[i].out; },
+        [&](size_t i) { return nodes[i].criticality; },
+        [&](size_t i, uint32_t value) { nodes[i].criticality = value; });
 
 	return true;
 }
@@ -2585,8 +2510,7 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 		size_t bestQueueSlot = 0;
 		{
 
-			auto candidateFits = [&](size_t readyIndex, size_t nodeQueueSlot) {
-				const size_t ni = ready[readyIndex];
+			auto candidateFits = [&](size_t ni, size_t nodeQueueSlot) {
 				auto& n = nodes[ni];
 				++candidateChecks;
 				if (nodeQueueSlot >= queueCount) {
@@ -2658,7 +2582,7 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 					const auto& passSummary = rg.m_framePassSchedulingSummaries[node.passIndex];
 
 					for (size_t nodeQueueSlot : node.compatibleQueueSlots) {
-						if (!candidateFits(readyIndex, nodeQueueSlot)) {
+						if (!candidateFits(nodeIndex, nodeQueueSlot)) {
 							continue;
 						}
 
@@ -2731,34 +2655,21 @@ void RenderGraph::AutoScheduleAndBuildBatches(
 				}
 			}
 			else {
-				auto trySelect = [&](size_t readyIndex, size_t queueSlot) {
-					if (!candidateFits(readyIndex, queueSlot)) {
-						return false;
-					}
-					bestIdxInReady = readyIndex;
-					bestQueueSlot = queueSlot;
-					return true;
-				};
-
-				for (size_t readyIndex = 0; readyIndex < ready.size() && bestIdxInReady == SIZE_MAX; ++readyIndex) {
-					Node& node = nodes[ready[readyIndex]];
-
-					for (size_t slot : node.compatibleQueueSlots) {
-						if (slot < queueCount && currentBatch.HasPasses(slot) && trySelect(readyIndex, slot)) {
-							break;
-						}
-					}
-					if (bestIdxInReady != SIZE_MAX) {
-						break;
-					}
-					if (trySelect(readyIndex, node.queueSlot)) {
-						break;
-					}
-					for (size_t slot : node.compatibleQueueSlots) {
-						if (slot != node.queueSlot && trySelect(readyIndex, slot)) {
-							break;
-						}
-					}
+				const auto selected = compiler::SelectFirstFitCandidate<size_t>(
+					std::span<const size_t>{ready},
+					[&](size_t nodeIndex) -> std::span<const size_t> {
+						return nodes[nodeIndex].compatibleQueueSlots;
+					},
+					[&](size_t nodeIndex) { return nodes[nodeIndex].queueSlot; },
+					[&](uint32_t queueSlot) {
+						return queueSlot < queueCount && currentBatch.HasPasses(queueSlot);
+					},
+					[&](size_t nodeIndex, uint32_t queueSlot) {
+						return candidateFits(nodeIndex, queueSlot);
+					});
+				if (selected) {
+					bestIdxInReady = selected->first;
+					bestQueueSlot = selected->second;
 				}
 			}
 		}
@@ -3773,7 +3684,18 @@ RenderGraph::~RenderGraph() {
 }
 
 void RenderGraph::ShutdownTaskWorkers() {
-    m_compilerState->shadowCompiler.reset();
+	m_compilerState->shadowCompiler.reset();
+	m_compilerState->selectedAsyncFrame.reset();
+	m_compilerState->currentAsyncInput.reset();
+	m_compilerState->asyncBackingStateLedger.Reset();
+	m_compilerState->asyncBackingAccessLedger.Reset();
+	m_compilerState->asyncAliasAccessLedger.Reset();
+	m_compilerState->asyncTimelineAdmission.reset();
+	m_compilerState->lastRequestedAsyncSequence = 0;
+	m_compilerState->nextAsyncExecutionSequence = 1;
+	m_compilerState->reportedAsyncSelectionFailures = 0;
+	m_compilerState->reportedAsyncUnownedResources = 0;
+	m_compilerState->reportedAsyncLegacyPasses.clear();
 	m_queueRegistry.ShutdownTaskWorkers();
 	m_taskService.reset();
 	org::runtime::SetDefaultTaskService({});
@@ -3869,7 +3791,18 @@ void RenderGraph::ShutdownOwnedState() {
 	_registry = ResourceRegistry();
 	++m_resourceRegistryGeneration;
     m_resolverCaptureContext.reset();
-    if (m_compilerState->shadowCompiler) m_compilerState->shadowCompiler->Reset(m_resourceRegistryGeneration);
+	if (m_compilerState->shadowCompiler) m_compilerState->shadowCompiler->Reset(m_resourceRegistryGeneration);
+	m_compilerState->selectedAsyncFrame.reset();
+	m_compilerState->currentAsyncInput.reset();
+	m_compilerState->asyncBackingStateLedger.Reset();
+	m_compilerState->asyncBackingAccessLedger.Reset();
+	m_compilerState->asyncAliasAccessLedger.Reset();
+	m_compilerState->asyncTimelineAdmission.reset();
+	m_compilerState->lastRequestedAsyncSequence = 0;
+	m_compilerState->nextAsyncExecutionSequence = 1;
+	m_compilerState->reportedAsyncSelectionFailures = 0;
+	m_compilerState->reportedAsyncUnownedResources = 0;
+	m_compilerState->reportedAsyncLegacyPasses.clear();
 	m_resolverHandleCache.clear();
 	m_resolverRequirementBlockCache.clear();
 	// Queue shutdown is the final completion point. Release placed resources
@@ -5882,9 +5815,13 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(RenderPassAndResources& p,
 		spdlog::info("RG frame {} refresh render pass '{}' declare begin", frameIndex, p.name);
 	}
 	RenderPassBuilder b(this, p.name);
+	auto renderPass = std::dynamic_pointer_cast<RenderPass>(p.pass);
+	if (!renderPass) {
+		throw std::logic_error("Render-tagged pass does not implement the legacy render declaration interface");
+	}
 
 	// Make it look like a normal builder enough for any pass code that queries ResourceProvider()
-	b.pass = p.pass;
+	b.pass = renderPass;
 	b.built_ = true;
 
 	// Clear any previous declarations
@@ -5901,7 +5838,7 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(RenderPassAndResources& p,
 		if (!p.name.empty()) {
 			BT_ZONE_TEXT(p.name.data(), p.name.size());
 		}
-		p.pass->DeclareResourceUsages(&b);
+		renderPass->DeclareResourceUsages(&b);
 	}
 	if (traceLifecycle) {
 		spdlog::info("RG frame {} refresh render pass '{}' declare complete requirements={} transitions={}", frameIndex, p.name, b.GatherResourceRequirements().size(), b.params.internalTransitions.size());
@@ -5964,13 +5901,7 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(RenderPassAndResources& p,
 	// and readback passes consume the resources captured in their bytecode.
 	if (requiresPassRebind) {
 		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Render)::SetResourceRegistryView");
-		p.pass->SetResourceRegistryView(
-			MakePassResourceRegistryView(_registry, p.resources),
-			p.resources.activeFeatureDomains,
-			p.resources.autoDescriptorShaderResources,
-			p.resources.autoDescriptorConstantBuffers,
-			p.resources.autoDescriptorUnorderedAccessViews
-		);
+		p.pass->ConfigureResourceRegistryView(MakePassResourceRegistryView(_registry, p.resources), p.resources);
 	}
 	if (traceLifecycle) {
 		spdlog::info("RG frame {} refresh render pass '{}' setup begin", frameIndex, p.name);
@@ -5997,7 +5928,11 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(ComputePassAndResources& p
 		spdlog::info("RG frame {} refresh compute pass '{}' declare begin", frameIndex, p.name);
 	}
 	ComputePassBuilder b(this, p.name);
-	b.pass = p.pass;
+	auto computePass = std::dynamic_pointer_cast<ComputePass>(p.pass);
+	if (!computePass) {
+		throw std::logic_error("Compute-tagged pass does not implement the legacy compute declaration interface");
+	}
+	b.pass = computePass;
 	b.built_ = true;
 
 	b.params = {};
@@ -6012,7 +5947,7 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(ComputePassAndResources& p
 		if (!p.name.empty()) {
 			BT_ZONE_TEXT(p.name.data(), p.name.size());
 		}
-		p.pass->DeclareResourceUsages(&b);
+		computePass->DeclareResourceUsages(&b);
 	}
 	if (traceLifecycle) {
 		spdlog::info("RG frame {} refresh compute pass '{}' declare complete requirements={} transitions={}", frameIndex, p.name, b.GatherResourceRequirements().size(), b.params.internalTransitions.size());
@@ -6064,13 +5999,7 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(ComputePassAndResources& p
 		p.declarationCache.dynamicInterface->RequiresPassRebindAfterDeclarationRefresh();
 	if (requiresPassRebind) {
 		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Compute)::SetResourceRegistryView");
-		p.pass->SetResourceRegistryView(
-			MakePassResourceRegistryView(_registry, p.resources),
-			p.resources.activeFeatureDomains,
-			p.resources.autoDescriptorShaderResources,
-			p.resources.autoDescriptorConstantBuffers,
-			p.resources.autoDescriptorUnorderedAccessViews
-		);
+		p.pass->ConfigureResourceRegistryView(MakePassResourceRegistryView(_registry, p.resources), p.resources);
 	}
 	if (traceLifecycle) {
 		spdlog::info("RG frame {} refresh compute pass '{}' setup begin", frameIndex, p.name);
@@ -6098,7 +6027,11 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(CopyPassAndResources& p, u
 		spdlog::info("RG frame {} refresh copy pass '{}' declare begin", frameIndex, p.name);
 	}
 	CopyPassBuilder b(this, p.name);
-	b.pass = p.pass;
+	auto copyPass = std::dynamic_pointer_cast<CopyPass>(p.pass);
+	if (!copyPass) {
+		throw std::logic_error("Copy-tagged pass does not implement the legacy copy declaration interface");
+	}
+	b.pass = copyPass;
 	b.built_ = true;
 
 	b.params = {};
@@ -6113,7 +6046,7 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(CopyPassAndResources& p, u
 		if (!p.name.empty()) {
 			BT_ZONE_TEXT(p.name.data(), p.name.size());
 		}
-		p.pass->DeclareResourceUsages(&b);
+		copyPass->DeclareResourceUsages(&b);
 	}
 	if (traceLifecycle) {
 		spdlog::info("RG frame {} refresh copy pass '{}' declare complete requirements={} transitions={}", frameIndex, p.name, b.GatherResourceRequirements().size(), b.params.internalTransitions.size());
@@ -6160,9 +6093,7 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(CopyPassAndResources& p, u
 		p.declarationCache.dynamicInterface->RequiresPassRebindAfterDeclarationRefresh();
 	if (requiresPassRebind) {
 		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Copy)::SetResourceRegistryView");
-		p.pass->SetResourceRegistryView(
-			MakePassResourceRegistryView(_registry, p.resources)
-		);
+		p.pass->ConfigureResourceRegistryView(MakePassResourceRegistryView(_registry, p.resources), p.resources);
 	}
 	if (traceLifecycle) {
 		spdlog::info("RG frame {} refresh copy pass '{}' setup begin", frameIndex, p.name);
@@ -7426,12 +7357,8 @@ void RenderGraph::Setup() {
 			if (traceLifecycle) {
 				spdlog::info("RG setup render pass '{}' begin", renderPass.name);
 			}
-			renderPass.pass->SetResourceRegistryView(
-				MakePassResourceRegistryView(_registry, renderPass.resources),
-				renderPass.resources.activeFeatureDomains,
-				renderPass.resources.autoDescriptorShaderResources,
-				renderPass.resources.autoDescriptorConstantBuffers,
-				renderPass.resources.autoDescriptorUnorderedAccessViews);
+			renderPass.pass->ConfigureResourceRegistryView(
+				MakePassResourceRegistryView(_registry, renderPass.resources), renderPass.resources);
 			renderPass.pass->Setup();
 			if (traceLifecycle) {
 				spdlog::info("RG setup render pass '{}' complete", renderPass.name);
@@ -7443,12 +7370,8 @@ void RenderGraph::Setup() {
 			if (traceLifecycle) {
 				spdlog::info("RG setup compute pass '{}' begin", computePass.name);
 			}
-			computePass.pass->SetResourceRegistryView(
-				MakePassResourceRegistryView(_registry, computePass.resources),
-				computePass.resources.activeFeatureDomains,
-				computePass.resources.autoDescriptorShaderResources,
-				computePass.resources.autoDescriptorConstantBuffers,
-				computePass.resources.autoDescriptorUnorderedAccessViews);
+			computePass.pass->ConfigureResourceRegistryView(
+				MakePassResourceRegistryView(_registry, computePass.resources), computePass.resources);
 			computePass.pass->Setup();
 			if (traceLifecycle) {
 				spdlog::info("RG setup compute pass '{}' complete", computePass.name);
@@ -7460,7 +7383,8 @@ void RenderGraph::Setup() {
 			if (traceLifecycle) {
 				spdlog::info("RG setup copy pass '{}' begin", copyPass.name);
 			}
-			copyPass.pass->SetResourceRegistryView(MakePassResourceRegistryView(_registry, copyPass.resources));
+			copyPass.pass->ConfigureResourceRegistryView(
+				MakePassResourceRegistryView(_registry, copyPass.resources), copyPass.resources);
 			copyPass.pass->Setup();
 			if (traceLifecycle) {
 				spdlog::info("RG setup copy pass '{}' complete", copyPass.name);
@@ -7494,7 +7418,7 @@ void RenderGraph::AddRenderPass(std::shared_ptr<RenderPass> pass, RenderPassPara
 		m_retainedDeclarationRefreshCandidateMasterIndices.push_back(m_masterPassList.size() - 1);
 	}
 	if (name != "") {
-		renderPassesByName[name] = pass;
+		renderPassesByName[name] = std::move(pass);
 	}
 }
 
@@ -7521,7 +7445,7 @@ void RenderGraph::AddComputePass(std::shared_ptr<ComputePass> pass, ComputePassP
 		m_retainedDeclarationRefreshCandidateMasterIndices.push_back(m_masterPassList.size() - 1);
 	}
 	if (name != "") {
-		computePassesByName[name] = pass;
+		computePassesByName[name] = std::move(pass);
 	}
 }
 
@@ -7711,6 +7635,7 @@ std::shared_ptr<ComputePass> RenderGraph::GetComputePassByName(const std::string
 void RenderGraph::Update(const UpdateExecutionContext& context, rhi::Device device) {
 	BT_ZONE_SCOPE("RenderGraph::Update");
     m_resolverCaptureContext = context.resolverCaptureContext;
+	m_asyncUpdateHostData = context.ownedHostData;
 	const bool traceLifecycle = m_getRenderGraphBatchTraceEnabled && m_getRenderGraphBatchTraceEnabled();
 	{
 		BT_ZONE_SCOPE("RenderGraph::Update::ResetForFrame");
@@ -7785,8 +7710,15 @@ void RenderGraph::Update(const UpdateExecutionContext& context, rhi::Device devi
 	}
 
 	{
-		BT_ZONE_SCOPE("RenderGraph::Update::CompileFrame");
-		CompileFrame(device, context.frameIndex, context.hostData);
+		const bool asyncMode = m_renderGraphSettingsService
+			&& m_renderGraphSettingsService->GetExperimentalAsyncCompileMode() == runtime::AsyncCompileMode::Async;
+		if (asyncMode) {
+			BT_ZONE_SCOPE("RenderGraph::Update::PrepareAsyncFrame");
+			PrepareAsyncFrame(device, context.frameIndex, context.deltaTime, context.hostData);
+		} else {
+			BT_ZONE_SCOPE("RenderGraph::Update::CompileFrame");
+			CompileFrame(device, context.frameIndex, context.hostData);
+		}
 	}
 }
 
@@ -7876,16 +7808,9 @@ namespace {
 				}
 			} else {
 				// Buffer barrier
-				rhi::BufferBarrier bb{};
-				bb.buffer       = t.pResource->GetAPIResource(backendInstance).GetHandle();
-				bb.offset       = 0;
-				bb.size         = UINT64_MAX;
-				bb.beforeSync   = t.prevSyncState;
-				bb.afterSync    = t.newSyncState;
-				bb.beforeAccess = t.prevAccessType;
-				bb.afterAccess  = t.newAccessType;
-				bb.discard      = t.discard;
-				batch.buffers.push_back(bb);
+                batch.buffers.push_back(MakeWholeBufferBarrier(
+                    t.pResource->GetAPIResource(backendInstance).GetHandle(),
+                    t.prevAccessType, t.newAccessType, t.prevSyncState, t.newSyncState, t.discard));
 			}
 		}
 
@@ -8421,8 +8346,12 @@ namespace {
 				const auto cpuStart = std::chrono::steady_clock::now();
 				if (hasStatistics)
 					args.statisticsService->BeginQuery(pr.statisticsIndex, args.context.frameIndex, rhiQueue, commandList);
-				if ((pr.run & PassRunMask::Immediate) != PassRunMask::None)
-					org::imm::Replay(pr.immediateBytecode, commandList, *args.context.immediateDispatch);
+				if ((pr.run & PassRunMask::Immediate) != PassRunMask::None) {
+                    if (pr.preparedBufferCopies) {
+                        pr.preparedBufferCopies->Record(commandList);
+                        basic_telemetry::AddCounter("ORG.AsyncExecution.RecordedSceneCopyPasses");
+                    } else org::imm::Replay(pr.immediateBytecode, commandList, *args.context.immediateDispatch);
+                }
 				pr.immediateKeepAlive.reset();
 				if ((pr.run & PassRunMask::Retained) != PassRunMask::None) {
 					auto passReturn = pr.pass->Execute(args.context);
@@ -8750,8 +8679,12 @@ namespace {
 					BT_ZONE_TEXT(passName.data(), passName.size());
 					if (hasStatistics)
 						args.statisticsService->BeginQuery(pr.statisticsIndex, args.context.frameIndex, args.rhiQueue, commandList, sched.queryRecordingContext);
-					if ((pr.run & PassRunMask::Immediate) != PassRunMask::None)
-						org::imm::Replay(pr.immediateBytecode, commandList, *args.context.immediateDispatch);
+					if ((pr.run & PassRunMask::Immediate) != PassRunMask::None) {
+                        if (pr.preparedBufferCopies) {
+                            pr.preparedBufferCopies->Record(commandList);
+                            basic_telemetry::AddCounter("ORG.AsyncExecution.RecordedSceneCopyPasses");
+                        } else org::imm::Replay(pr.immediateBytecode, commandList, *args.context.immediateDispatch);
+                    }
 					pr.immediateKeepAlive.reset();
 					if ((pr.run & PassRunMask::Retained) != PassRunMask::None) {
 						auto passReturn = pr.pass->Execute(args.context);
@@ -9308,7 +9241,264 @@ void RenderGraph::BuildExecutionSchedule() {
 	}
 }
 
+bool RenderGraph::PrepareSelectedAsyncFrame(PassExecutionContext& context) {
+    BT_ZONE_SCOPE("ORG.AsyncExecution.PopExecutableFrame");
+    (void)context;
+    auto& coordinator = m_compilerState->shadowCompiler;
+    const uint64_t sequence = m_compilerState->nextAsyncExecutionSequence;
+    if (!coordinator || !sequence || sequence > m_compilerState->lastRequestedAsyncSequence)
+        return false;
+    auto bundle = coordinator->WaitAndPop(sequence);
+    if (!bundle || !bundle->input || !bundle->input->executionPayload)
+        throw std::runtime_error("Ordered compiled frame has no owned execution payload");
+    auto payload = std::static_pointer_cast<const experimental::PreparedFramePayload>(
+        bundle->input->executionPayload);
+    auto layout = experimental::BuildExecutionLayout(bundle, *bundle->input);
+    auto initialStates = payload->initialStates;
+    const auto activated = m_compilerState->asyncAliasAccessLedger.ApplyInitialStates(
+        *bundle->graph, initialStates);
+    m_compilerState->asyncBackingStateLedger.Invalidate(activated);
+    m_compilerState->selectedAsyncFrame = experimental::BuildRenderFrameSnapshot(
+        std::move(layout), experimental::BuildPreparedFramePayloadWithInitialStates(
+            payload->frameNumber, payload->passes, payload->resources,
+            std::move(initialStates), payload->externalWaitsByPreparedPass),
+        m_compilerState->asyncBackingStateLedger);
+    ++m_compilerState->nextAsyncExecutionSequence;
+    basic_telemetry::AddCounter("ORG.AsyncExecution.PoppedExecutableFrames");
+    BT_PLOT("ORG.AsyncExecution.ExecutingSequence", static_cast<int64_t>(sequence));
+    return true;
+}
+
+bool RenderGraph::TryExecuteSelectedAsyncFrame(PassExecutionContext& context) {
+    BT_ZONE_SCOPE("ORG.AsyncExecution.ExecuteSelectedFrame");
+    auto frame = std::move(m_compilerState->selectedAsyncFrame);
+    m_compilerState->selectedAsyncFrame.reset();
+    if (!frame || !frame->layout || !frame->layout->bundle || !frame->barrierPlan) return false;
+    const auto& graph = *frame->layout->bundle->graph;
+    if (graph.batches.empty() || frame->barrierPlan->batches.size() != graph.batches.size())
+        throw std::runtime_error("Selected async frame has incomplete execution data");
+
+    std::vector<experimental::ExecutionTimelinePoint> queuePoints;
+    std::vector<experimental::PreparedTimelineBinding> timelineBindings;
+    queuePoints.reserve(m_queueRegistry.SlotCount());
+    timelineBindings.reserve(m_queueRegistry.SlotCount());
+    for (size_t slot = 0; slot < m_queueRegistry.SlotCount(); ++slot) {
+        const auto index = static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot));
+        const uint64_t identity = slot + 1;
+        const uint64_t next = m_queueRegistry.GetCurrentFenceValue(index);
+        queuePoints.push_back({identity, next ? next - 1 : 0});
+        timelineBindings.push_back({identity, m_queueRegistry.GetFence(index).GetHandle()});
+    }
+    std::vector<std::vector<experimental::ExecutionTimelinePoint>> incoming(graph.batches.size());
+    auto timelineIdentity = [&](const rhi::Timeline& timeline) -> uint64_t {
+        const auto handle = timeline.GetHandle();
+        if (!timeline || !handle.valid()) return 0;
+        for (const auto& binding : timelineBindings) {
+            if (binding.handle.index == handle.index && binding.handle.generation == handle.generation)
+                return binding.identity;
+        }
+        const uint64_t identity = static_cast<uint64_t>(timelineBindings.size()) + 1;
+        timelineBindings.push_back({identity, handle});
+        return identity;
+    };
+    for (size_t prepared = 0; prepared < frame->externalWaitsByPreparedPass.size(); ++prepared) {
+        if (prepared >= frame->layout->placements.size())
+            throw std::runtime_error("Async external wait has no prepared-pass placement");
+        const auto batch = frame->layout->placements[prepared].batch;
+        if (batch >= incoming.size()) throw std::runtime_error("Async external wait has invalid batch placement");
+        for (const auto& wait : frame->externalWaitsByPreparedPass[prepared]) {
+            const auto identity = timelineIdentity(wait.timeline);
+            if (!identity || !wait.value) throw std::runtime_error("Async external wait is invalid");
+            auto& waits = incoming[batch];
+            auto existing = std::find_if(waits.begin(), waits.end(),
+                [&](const auto& value) { return value.timeline == identity; });
+            if (existing == waits.end()) waits.push_back({identity, wait.value});
+            else existing->value = (std::max)(existing->value, wait.value);
+        }
+    }
+    basic_telemetry::AddCounter("ORG.AsyncExecution.ExternalWaits",
+        static_cast<int64_t>(std::accumulate(incoming.begin(), incoming.end(), size_t{0},
+            [](size_t count, const auto& waits) { return count + waits.size(); })));
+    m_compilerState->asyncBackingAccessLedger.AppendIncomingWaits(
+        graph, frame->initialStates, queuePoints, incoming);
+    m_compilerState->asyncAliasAccessLedger.AppendIncomingWaits(
+        graph, frame->initialStates, queuePoints, incoming);
+    if (!m_compilerState->asyncTimelineAdmission) {
+        const auto executionSlots = m_renderGraphSettingsService
+            ? m_renderGraphSettingsService->GetNumFramesInFlight() : uint8_t{3};
+        m_compilerState->asyncTimelineAdmission =
+            std::make_unique<experimental::ExecutionTimelineAdmission>(queuePoints,
+                (std::max)(size_t{1}, static_cast<size_t>(executionSlots)));
+    } else {
+        std::vector<experimental::ExecutionTimelinePoint> completed;
+        const auto submitted = m_compilerState->asyncTimelineAdmission->Submitted();
+        completed.reserve(submitted.size());
+        for (size_t slot = 0; slot < submitted.size(); ++slot) {
+            const auto index = static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot));
+            completed.push_back({submitted[slot].timeline,
+                (std::min)(submitted[slot].value, m_queueRegistry.GetFence(index).GetCompletedValue())});
+        }
+        const auto retired = m_compilerState->asyncTimelineAdmission->RetireCompleted(completed);
+        BT_PLOT("ORG.AsyncExecution.RetiredFrames", static_cast<int64_t>(retired));
+    }
+
+    auto recordingPlan = experimental::BuildPreparedBatchRecordings(*frame);
+    std::vector<std::shared_ptr<const experimental::IPreparedExecutionBatch>> packets;
+    packets.resize(recordingPlan.size());
+    const auto runtimeOwner = std::static_pointer_cast<const void>(frame);
+    struct RecordingJob {
+        uint32_t slot = 0;
+        rhi::QueueKind queueKind = rhi::QueueKind::Graphics;
+        rhi::Device device;
+        rhi::Queue queue;
+        experimental::OwnedRecordingList recording;
+    };
+    std::vector<RecordingJob> recordingJobs(recordingPlan.size());
+    const auto defaultResourceHeap = context.GetResourceDescriptorHeap().GetHandle();
+    const auto defaultSamplerHeap = context.GetSamplerDescriptorHeap().GetHandle();
+    auto externalDescriptorBindings = std::make_shared<const std::vector<ExternalDescriptorBindingValue>>(
+        context.externalDescriptorBindings);
+    for (size_t batch = 0; batch < recordingPlan.size(); ++batch) {
+        const uint32_t slot = recordingPlan[batch].queueSlot;
+        if (slot >= m_queueRegistry.SlotCount()) throw std::runtime_error("Async batch queue is unavailable");
+        const auto index = static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot));
+        const auto queueKind = m_queueRegistry.GetKind(index);
+        const auto rhiKind = queueKind == QueueKind::Graphics ? rhi::QueueKind::Graphics
+            : queueKind == QueueKind::Compute ? rhi::QueueKind::Compute : rhi::QueueKind::Copy;
+        auto& job = recordingJobs[batch];
+        job.slot = slot;
+        job.queueKind = rhiKind;
+        job.device = m_queueRegistry.GetDevice(index);
+        job.queue = m_queueRegistry.GetQueue(index);
+        auto& recording = job.recording;
+        recording.bindings = frame->bindings;
+        recording.externalBindings = externalDescriptorBindings;
+        if (queueKind != QueueKind::Copy) {
+            recording.resourceDescriptorHeap = defaultResourceHeap;
+            recording.samplerDescriptorHeap = defaultSamplerHeap;
+        }
+        recording.textureBarriers = frame->barrierPlan->batches[batch].textures;
+        recording.bufferBarriers = frame->barrierPlan->batches[batch].buffers;
+        recording.barriersBeforePass = frame->barrierPlan->batches[batch].beforePass;
+        recording.barriersAfterPass = frame->barrierPlan->batches[batch].afterPass;
+        recording.passes = std::move(recordingPlan[batch].passes);
+    }
+    // Recording remains ordered on the admission owner while the last legacy
+    // packets are being removed. Those packets can still read owner-managed
+    // view/manager containers and are not safe to run concurrently. Graph
+    // compilation remains concurrent; typed packets can re-enable bounded
+    // recording workers once the legacy count reaches zero.
+    const size_t recordingConcurrency = 1;
+    basic_telemetry::AddCounter("ORG.AsyncExecution.SerialRecordingForLegacyPackets");
+    ParallelForOptionalLimited("ORG.AsyncExecution.RecordBatches", recordingJobs.size(), recordingConcurrency,
+        [&](size_t batch) {
+            auto& job = recordingJobs[batch];
+            auto& recording = job.recording;
+            if (job.device.CreateCommandAllocator(job.queueKind, recording.allocator) != rhi::Result::Ok
+                || job.device.CreateCommandList(job.queueKind, recording.allocator.Get(), recording.commands) != rhi::Result::Ok)
+                throw std::runtime_error("Failed to allocate async recording command list");
+            std::vector<experimental::OwnedRecordingList> recordings;
+            recordings.push_back(std::move(recording));
+            packets[batch] = experimental::RecordPreparedRhiExecutionBatch(job.slot,
+                job.queue, std::move(recordings), timelineBindings, runtimeOwner);
+        });
+    try {
+        auto execution = m_compilerState->asyncTimelineAdmission->SubmitPrepared(
+            frame->layout->bundle, incoming, packets);
+        m_compilerState->asyncBackingAccessLedger.Commit(graph, frame->initialStates, *execution);
+        m_compilerState->asyncAliasAccessLedger.Commit(graph, frame->initialStates, *execution);
+        for (size_t batch = 0; batch < frame->barrierPlan->batches.size(); ++batch)
+            m_compilerState->asyncBackingStateLedger.CommitBatch(frame->barrierPlan->batches[batch]);
+        for (const auto& signal : execution->batches) {
+            const auto slot = graph.batches[&signal - execution->batches.data()].queue;
+            m_queueRegistry.EnsureNextFenceValueAtLeast(
+                static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot)), signal.signal.value + 1);
+        }
+        // Preserve the legacy present contract from the symbolic declaration,
+        // not from a mutable pass object. The selected graph's batch signal is
+        // the precise dependency the swapchain must wait on.
+        for (size_t batchIndex = 0; batchIndex < graph.batches.size(); ++batchIndex) {
+            for (const auto passIndex : graph.batches[batchIndex].passes) {
+            if (passIndex >= graph.structure->passes.size()) continue;
+            const auto& pass = graph.structure->passes[passIndex];
+            const auto declaresPresent = std::ranges::any_of(pass.entryStates, [](const auto& state) {
+                return state.state.access == static_cast<uint64_t>(rhi::ResourceAccessType::Present);
+            }) || std::ranges::any_of(pass.exitStates, [](const auto& state) {
+                return state.state.access == static_cast<uint64_t>(rhi::ResourceAccessType::Present);
+            });
+            if (!declaresPresent) continue;
+            const auto slot = graph.batches[batchIndex].queue;
+            const auto queueSlot = static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot));
+            m_lastPresentDependency = PresentDependency{
+                .queue = m_queueRegistry.GetQueue(queueSlot),
+                .wait = {m_queueRegistry.GetFence(queueSlot).GetHandle(), execution->batches[batchIndex].signal.value},
+                .queueSlot = queueSlot,
+                .batchIndex = batchIndex,
+                .valid = execution->batches[batchIndex].signal.value != 0,
+            };
+            }
+        }
+        basic_telemetry::AddCounter("ORG.AsyncExecution.SubmittedSceneFrames");
+        BT_PLOT("ORG.AsyncExecution.SubmittedSequence", static_cast<int64_t>(frame->layout->bundle->sequence));
+        return true;
+    } catch (...) {
+        const auto& failure = m_compilerState->asyncTimelineAdmission->Failure();
+        auto partial = m_compilerState->asyncTimelineAdmission->PendingExecution();
+        if (failure && partial && failure->batch != 0) {
+            const auto submittedBatches = failure->batch;
+            m_compilerState->asyncBackingAccessLedger.Commit(
+                graph, frame->initialStates, *partial, submittedBatches);
+            m_compilerState->asyncAliasAccessLedger.Commit(
+                graph, frame->initialStates, *partial, submittedBatches);
+            for (uint32_t batch = 0; batch < submittedBatches; ++batch)
+                m_compilerState->asyncBackingStateLedger.CommitBatch(frame->barrierPlan->batches[batch]);
+            basic_telemetry::AddCounter(
+                "ORG.AsyncExecution.PartialSubmittedBatches", submittedBatches);
+        }
+        basic_telemetry::AddCounter("ORG.AsyncExecution.SceneSubmissionFailures");
+        throw;
+    }
+}
+
 void RenderGraph::Execute(PassExecutionContext& context) {
+    const bool asyncExecutionRequested = m_renderGraphSettingsService
+        && m_renderGraphSettingsService->GetExperimentalAsyncCompileMode() == runtime::AsyncCompileMode::Async;
+    if (asyncExecutionRequested) {
+		// Consume the exact next owned frame. Preparation and compilation both
+		// belong to that request; current mutable pass state is never consulted.
+		if (!m_compilerState->selectedAsyncFrame) PrepareSelectedAsyncFrame(context);
+        if (m_compilerState->selectedAsyncFrame && TryExecuteSelectedAsyncFrame(context)) return;
+		basic_telemetry::AddCounter("ORG.AsyncExecution.NoQueuedFrame");
+        return;
+    }
+    // First owned scene-recording subset. The legacy compiler/state ledger still
+    // controls this execution; this is not latest-compiled-graph selection.
+    const bool ownedCopiesEnabled = m_renderGraphSettingsService &&
+        m_renderGraphSettingsService->GetExperimentalAsyncCompileMode() != runtime::AsyncCompileMode::Off;
+    if (ownedCopiesEnabled) {
+        BT_ZONE_SCOPE("ORG.AsyncExecution.PrepareSceneBufferCopies");
+        for (size_t i = 0; i < m_framePasses.size(); ++i) {
+            std::visit([&](auto& pass) {
+                using T = std::decay_t<decltype(pass)>;
+                if constexpr (!std::is_same_v<T, std::monostate>) {
+                    pass.preparedBufferCopies.reset();
+                    if (pass.immediateBytecode.empty()) return;
+                    if (i >= m_assignedQueueSlotsByFramePass.size()
+                        || m_queueRegistry.GetBackendInstance(static_cast<QueueSlotIndex>(m_assignedQueueSlotsByFramePass[i]))
+                            != BackendInstanceId::Primary) return;
+                    pass.preparedBufferCopies = org::imm::PreparedBufferCopies::Capture(pass.immediateBytecode,
+                        [&](ResourceRegistry::RegistryHandle handle) -> BackingAllocationSnapshot {
+                            auto* resource = _registry.Resolve(handle);
+                            if (!resource || resource->HasLayout()) return {};
+                            auto* backed = dynamic_cast<BackedResource*>(resource);
+                            return backed ? backed->CaptureBackingAllocation() : BackingAllocationSnapshot{};
+                        });
+                    basic_telemetry::AddCounter(pass.preparedBufferCopies
+                        ? "ORG.AsyncExecution.PreparedSceneCopyPasses" : "ORG.AsyncExecution.UnsupportedSceneCopyPasses");
+                }
+            }, m_framePasses[i].pass);
+        }
+    }
 	BT_ZONE_SCOPE("RenderGraph::Execute");
 	m_lastPresentDependency.reset();
 	{
@@ -10648,6 +10838,19 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 			});
 		}
 		DescriptorHeapManager::GetInstance().PublishQueueFenceSnapshot(std::move(fenceSnapshot));
+        for (auto& framePass : m_framePasses) {
+            std::visit([](auto& pass) {
+                using T = std::decay_t<decltype(pass)>;
+                if constexpr (!std::is_same_v<T, std::monostate>) {
+                    if (pass.preparedBufferCopies) {
+                        // Keep frame ownership if retirement registration throws
+                        // after GPU submission (for example allocation failure).
+                        DescriptorHeapManager::GetInstance().RetireExecutionLease(pass.preparedBufferCopies);
+                        pass.preparedBufferCopies.reset();
+                    }
+                }
+            }, framePass.pass);
+        }
 	}
 
 	{

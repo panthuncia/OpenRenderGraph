@@ -1,6 +1,7 @@
 #include "Render/External/ContributorRuntime.h"
 
 #include "Render/PassBuilders.h"
+#include "Render/PreparedPass.h"
 #include "Render/RenderGraph/RenderGraph.h"
 #include "RenderPasses/Base/ComputePass.h"
 #include "RenderPasses/Base/CopyPass.h"
@@ -13,6 +14,7 @@
 #include <atomic>
 #include <cstring>
 #include <mutex>
+#include <spdlog/spdlog.h>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -38,6 +40,16 @@ namespace
         std::string resource;
     };
 
+    struct ContributorFrameState {
+        mutable std::mutex mutex;
+        org_c_frame_context frame{};
+
+        org_c_frame_context Capture() const {
+            std::scoped_lock lock(mutex);
+            return frame;
+        }
+    };
+
     struct PassDescription {
         uint32_t kind = ORG_C_PASS_COMPUTE;
         std::string name;
@@ -46,8 +58,9 @@ namespace
         std::vector<std::string> after;
         std::vector<std::string> before;
         void* userData = nullptr;
-        void (ORG_C_CALL *execute)(void*, const org_c_execute_context*) = nullptr;
+        org_c_result (ORG_C_CALL *prepare)(void*, const org_c_pass_prepare_context*, org_c_prepared_pass*) = nullptr;
         std::shared_ptr<std::atomic_bool> active;
+        std::shared_ptr<ContributorFrameState> frameState;
     };
 
     struct ResourceDescription {
@@ -63,6 +76,7 @@ namespace
         std::vector<ResourceDescription> resources;
         mutable std::unordered_map<std::string, std::shared_ptr<Resource>> persistentResources;
         std::shared_ptr<std::atomic_bool> active{ std::make_shared<std::atomic_bool>(true) };
+        std::shared_ptr<ContributorFrameState> frameState{ std::make_shared<ContributorFrameState>() };
         bool initialized = false;
     };
 
@@ -311,20 +325,64 @@ namespace
         {
             m_resources.clear();
             for (const auto& binding : m_description->bindings)
-                m_resources.push_back(registry->RequestPtr<Resource>(ResourceIdentifier{ binding.resource }));
+                m_resources.push_back(registry->RequestShared(ResourceIdentifier{ binding.resource }));
         }
 
-        PassReturn Execute(PassExecutionContext& executionContext)
+        struct PacketOwner {
+            org_c_prepared_pass packet{};
+            ~PacketOwner() { if (packet.destroy) packet.destroy(packet.data); }
+        };
+
+        struct PreparedData {
+            std::shared_ptr<PacketOwner> owner;
+            std::shared_ptr<const PassDescription> description;
+            std::vector<std::shared_ptr<Resource>> resources;
+            std::vector<org_c_binding> bindings;
+            uint64_t frameIndex = 0;
+            uint64_t completionValue = 0;
+        };
+
+        struct PacketCallbacks {
+            static void Record(const PreparedData& data, RecordingContext& recording)
+            {
+                const auto& packet = data.owner->packet;
+                if (!packet.record || !data.description->active->load(std::memory_order_acquire)) return;
+                BorrowState borrow{ &recording.Commands(), ++s_nextBorrowToken, true };
+                org_c_record_context context{ sizeof(context), ORG_CONTRIBUTOR_API_VERSION,
+                    data.frameIndex, data.completionValue, MakeRecorder(borrow),
+                    data.bindings.data(), data.bindings.size() };
+                packet.record(packet.data, &context);
+                borrow.active = false;
+                borrow.commandList = nullptr;
+            }
+            static void Submitted(const PreparedData& data, const SubmissionContext& context)
+            { if (data.owner->packet.submitted) data.owner->packet.submitted(data.owner->packet.data, context.submissionID); }
+            static void Completed(const PreparedData& data, const CompletionContext& context)
+            { if (data.owner->packet.completed) data.owner->packet.completed(data.owner->packet.data, context.submissionID); }
+            static void Abandoned(const PreparedData& data, AbandonReason reason)
+            {
+                if (!data.owner->packet.abandoned) return;
+                uint32_t externalReason = ORG_C_ABANDON_SHUTDOWN;
+                switch (reason) {
+                case AbandonReason::Shutdown: externalReason = ORG_C_ABANDON_SHUTDOWN; break;
+                case AbandonReason::GenerationInvalidated: externalReason = ORG_C_ABANDON_GENERATION_INVALIDATED; break;
+                case AbandonReason::PreparationFailed: externalReason = ORG_C_ABANDON_PREPARATION_FAILED; break;
+                case AbandonReason::AdmissionFailed: externalReason = ORG_C_ABANDON_ADMISSION_FAILED; break;
+                }
+                data.owner->packet.abandoned(data.owner->packet.data, externalReason);
+            }
+            inline static std::atomic<uint64_t> s_nextBorrowToken{ 0 };
+        };
+
+        PreparedPass PrepareFrame()
         {
-            // Graph objects can outlive contributor registration while queued
-            // frames drain. Never enter DLL code after unregistration.
-            if (!m_description->execute || !m_description->active ||
-                !m_description->active->load(std::memory_order_acquire)) return {};
+            if (!m_description->prepare || !m_description->active ||
+                !m_description->active->load(std::memory_order_acquire)) return PreparedPass::NoOp();
             std::vector<org_c_binding> bindings;
             bindings.reserve(m_description->bindings.size());
             for (size_t index = 0; index < m_description->bindings.size(); ++index) {
                 const auto& description = m_description->bindings[index];
-                auto* resource = m_resources[index];
+                auto* resource = m_resources[index].get();
                 org_c_binding binding{};
                 binding.structure_size = sizeof(binding);
                 binding.kind = description.kind;
@@ -343,14 +401,30 @@ namespace
                 }
                 bindings.push_back(binding);
             }
+            const auto frame = m_description->frameState->Capture();
+            org_c_pass_prepare_context context{ sizeof(context), ORG_CONTRIBUTOR_API_VERSION,
+                &frame, bindings.data(), bindings.size() };
+            auto owner = std::make_shared<PacketOwner>();
+            owner->packet.structure_size = sizeof(org_c_prepared_pass);
+            owner->packet.api_version = ORG_CONTRIBUTOR_API_VERSION;
+            if (m_description->prepare(m_description->userData, &context, &owner->packet) != ORG_C_OK ||
+                owner->packet.structure_size < sizeof(org_c_prepared_pass) ||
+                owner->packet.api_version != ORG_CONTRIBUTOR_API_VERSION || !owner->packet.record)
+                throw std::runtime_error("External contributor failed to prepare an owned pass packet");
+            return PreparedPass::FromTyped<PacketCallbacks>(PreparedData{
+                std::move(owner), m_description, m_resources, std::move(bindings),
+                frame.frame_index, frame.completion_value });
+        }
 
-            BorrowState borrow{ &executionContext.commandList, ++s_nextBorrowToken, true };
-            org_c_execute_context context{ sizeof(context), ORG_CONTRIBUTOR_API_VERSION,
-                executionContext.frameIndex, executionContext.frameFenceValue, MakeRecorder(borrow),
-                bindings.data(), bindings.size(), executionContext.hostData };
-            m_description->execute(m_description->userData, &context);
-            borrow.active = false;
-            borrow.commandList = nullptr;
+        PassReturn ExecuteInline(PassExecutionContext& execution)
+        {
+            auto packet = PrepareFrame();
+            auto bindings = std::make_shared<const FrozenExecutionBindings>(
+                std::vector<FrozenExecutionBindings::ResourceBinding>{});
+            auto external = std::make_shared<const std::vector<ExternalDescriptorBindingValue>>(
+                execution.externalDescriptorBindings);
+            RecordingContext recording(execution.commandList, std::move(bindings), std::move(external));
+            packet.Record(recording);
             return {};
         }
 
@@ -358,15 +432,15 @@ namespace
 
     private:
         std::shared_ptr<const PassDescription> m_description;
-        std::vector<Resource*> m_resources;
-        inline static std::atomic<uint64_t> s_nextBorrowToken{ 0 };
+        std::vector<std::shared_ptr<Resource>> m_resources;
     };
 
     class ExternalRenderPass final : public RenderPass {
     public:
         explicit ExternalRenderPass(std::shared_ptr<const PassDescription> description) : m_state(std::move(description)) {}
         void Setup() override { m_state.Setup(m_resourceRegistryView); }
-        PassReturn Execute(PassExecutionContext& context) override { return m_state.Execute(context); }
+        PreparedPass PrepareFrame(FramePreparationContext&) override { return m_state.PrepareFrame(); }
+        PassReturn Execute(PassExecutionContext& context) override { return m_state.ExecuteInline(context); }
         void Cleanup() override {}
     protected:
         void DeclareResourceUsages(RenderPassBuilder* builder) override
@@ -379,7 +453,8 @@ namespace
     public:
         explicit ExternalComputePass(std::shared_ptr<const PassDescription> description) : m_state(std::move(description)) {}
         void Setup() override { m_state.Setup(m_resourceRegistryView); }
-        PassReturn Execute(PassExecutionContext& context) override { return m_state.Execute(context); }
+        PreparedPass PrepareFrame(FramePreparationContext&) override { return m_state.PrepareFrame(); }
+        PassReturn Execute(PassExecutionContext& context) override { return m_state.ExecuteInline(context); }
         void Cleanup() override {}
     protected:
         void DeclareResourceUsages(ComputePassBuilder* builder) override
@@ -392,7 +467,8 @@ namespace
     public:
         explicit ExternalCopyPass(std::shared_ptr<const PassDescription> description) : m_state(std::move(description)) {}
         void Setup() override { m_state.Setup(m_resourceRegistryView); }
-        PassReturn Execute(PassExecutionContext& context) override { return m_state.Execute(context); }
+        PreparedPass PrepareFrame(FramePreparationContext&) override { return m_state.PrepareFrame(); }
+        PassReturn Execute(PassExecutionContext& context) override { return m_state.ExecuteInline(context); }
         void Cleanup() override {}
     protected:
         void DeclareResourceUsages(CopyPassBuilder* builder) override
@@ -432,8 +508,13 @@ void ContributorRuntime::SetHostAPI(const org_c_host_api& host)
 bool ContributorRuntime::Register(const org_c_contributor_api* api, uint64_t& registration)
 {
     registration = 0;
-    if (!api || api->structure_size < sizeof(*api) || api->api_version != ORG_CONTRIBUTOR_API_VERSION ||
-        !api->describe_passes) return false;
+    if (!api) return false;
+    if (api->api_version != ORG_CONTRIBUTOR_API_VERSION) {
+        spdlog::error("Rejected OpenRenderGraph contributor ABI version {}; host requires owned prepare/record ABI version {}",
+            api->api_version, ORG_CONTRIBUTOR_API_VERSION);
+        return false;
+    }
+    if (api->structure_size < sizeof(*api) || !api->describe_passes) return false;
     const size_t count = api->describe_passes(api->contributor, nullptr, 0);
     std::vector<org_c_pass> descriptions(count);
     for (auto& pass : descriptions) pass.structure_size = sizeof(pass);
@@ -462,15 +543,16 @@ bool ContributorRuntime::Register(const org_c_contributor_api* api, uint64_t& re
     }
     state->passes.reserve(count);
     for (const auto& source : descriptions) {
-        if (source.structure_size < sizeof(source) || source.kind > ORG_C_PASS_COPY || !source.execute ||
+        if (source.structure_size < sizeof(source) || source.kind > ORG_C_PASS_COPY || !source.prepare ||
             (!source.declared_bindings && source.declared_binding_count)) return false;
         PassDescription destination;
         destination.kind = source.kind;
         destination.name = CopyString(source.name);
         destination.technique = CopyString(source.technique_path);
         destination.userData = source.user_data;
-        destination.execute = source.execute;
+        destination.prepare = source.prepare;
         destination.active = state->active;
+        destination.frameState = state->frameState;
         if (destination.name.empty()) return false;
         for (size_t index = 0; index < source.declared_binding_count; ++index) {
             const auto& binding = source.declared_bindings[index];
@@ -525,9 +607,14 @@ bool ContributorRuntime::PrepareFrame(const org_c_frame_context& frame) const
         frame.render_width == 0 || frame.render_height == 0) return false;
     std::scoped_lock lock(m_impl->mutex);
     m_impl->frame = frame;
-    for (const auto& state : m_impl->contributors)
+    for (const auto& state : m_impl->contributors) {
+        {
+            std::scoped_lock frameLock(state->frameState->mutex);
+            state->frameState->frame = frame;
+        }
         if (state->api->prepare_frame && state->api->prepare_frame(state->api->contributor, &frame) != ORG_C_OK)
             return false;
+    }
     return true;
 }
 

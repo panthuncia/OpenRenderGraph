@@ -610,6 +610,17 @@ public:
         return Resolve<T>(h);
     }
 
+    std::shared_ptr<Resource> RequestShared(ResourceIdentifier const& id) const {
+        auto h = RequestHandle(id);
+        if (!IsValid(h)) return nullptr;
+        return _global.RequestShared(id);
+    }
+
+    template<class T>
+    std::shared_ptr<T> RequestSharedAs(ResourceIdentifier const& id) const {
+        return std::dynamic_pointer_cast<T>(RequestShared(id));
+    }
+
     std::shared_ptr<IResourceResolver> RequestResolver(ResourceIdentifier const& id) const {
         // Prefix check (same as resources)
         bool ok = false;

@@ -142,7 +142,7 @@ struct AnyPassInputs {
     ~AnyPassInputs() { reset(); }
 };
 
-class RenderGraphPassBase {
+class RenderGraphPass {
 public:
     org::Hash64 CompileKey() const noexcept { return compileKey_; }
     bool ConsumeCompileDirty() noexcept { return std::exchange(compileDirty_, false); }
@@ -188,3 +188,7 @@ private:
         return a;
     }
 };
+
+// Transitional source alias while the historical queue-specific bases are
+// removed from in-tree passes. New passes derive TypedRenderGraphPass.
+using RenderGraphPassBase = RenderGraphPass;

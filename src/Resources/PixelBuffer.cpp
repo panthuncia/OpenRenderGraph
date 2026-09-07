@@ -266,6 +266,20 @@ void PixelBuffer::Materialize(const MaterializeOptions* options) {
     ++m_backingGeneration;
 }
 
+BackingAllocationSnapshot PixelBuffer::CaptureBackingAllocation() {
+    std::scoped_lock lock(m_materializationMutex);
+    if (!m_backing || GetAttachedAPIRepresentation(BackendInstanceId::Primary).IsValid()) return {};
+    auto lease = m_backing->CaptureAllocationLease();
+    if (!lease) return {};
+    BackingAllocationSnapshot snapshot{
+        GetGlobalResourceID(), m_backingGeneration, m_backing->GetAPIResource(), std::move(lease)};
+    snapshot.aliasHeap = m_backing->GetAliasHeap();
+    snapshot.aliasPoolID = m_backing->GetAliasPoolID();
+    snapshot.aliasOffset = m_backing->GetAliasOffset();
+    snapshot.aliasSize = m_backing->GetAliasSize();
+    return snapshot;
+}
+
 void PixelBuffer::Dematerialize() {
 	const bool hadAttachedPrimary = GetAttachedAPIRepresentation(BackendInstanceId::Primary).IsValid();
 	ClearAPIRepresentations();
