@@ -657,7 +657,7 @@ int main() {
     auto stateTasks = std::make_shared<ManualTasks>();
     GraphCompileCoordinator stateCoordinator(stateTasks);
     stateCoordinator.Request(stateInput); stateTasks->RunAll(); stateCoordinator.Pump();
-    auto ownedPlan = stateCoordinator.Latest()->graph;
+    auto ownedPlan = stateCoordinator.PeekReady(1)->graph;
     CHECK(stateCoordinator.Statistics().stateComparisons == 1 && stateCoordinator.Statistics().stateFailures == 0);
     // Sync-only changes are structural for state plans (unlike content/waits).
     stateInput.structure.passes[0].entryStates[0].state.sync ^= 128;
@@ -671,16 +671,16 @@ int main() {
     stateInput.leases = {realizationLease};
     const auto realizationSequence = stateCoordinator.Request(stateInput);
     CHECK(stateCoordinator.Statistics().started == 3);
-    CHECK(stateCoordinator.Latest()->sequence == realizationSequence);
-    CHECK(stateCoordinator.Latest()->input->backingGenerations == std::vector<uint64_t>{1});
+    CHECK(stateCoordinator.PeekReady(realizationSequence)->sequence == realizationSequence);
+    CHECK(stateCoordinator.PeekReady(realizationSequence)->input->backingGenerations == std::vector<uint64_t>{1});
     ++stateInput.backingGenerations[0];
     auto newerRealizationLease = std::make_shared<int>(2);
     std::weak_ptr<int> oldRealization = realizationLease;
     stateInput.leases = {newerRealizationLease}; realizationLease.reset();
     const auto replacementSequence = stateCoordinator.Request(stateInput);
     CHECK(stateCoordinator.Statistics().started == 3);
-    CHECK(stateCoordinator.Latest()->sequence == replacementSequence);
-    CHECK(stateCoordinator.Latest()->input->backingGenerations == std::vector<uint64_t>{2});
+    CHECK(stateCoordinator.PeekReady(replacementSequence)->sequence == replacementSequence);
+    CHECK(stateCoordinator.PeekReady(replacementSequence)->input->backingGenerations == std::vector<uint64_t>{2});
     CHECK(!oldRealization.expired()); // Every queued frame retains its own realization.
     for (uint64_t sequence = 1; sequence <= realizationSequence; ++sequence) {
         auto queuedFrame = stateCoordinator.WaitAndPop(sequence);
@@ -699,7 +699,7 @@ int main() {
         GraphCompileCoordinator inlineCoordinator(inlineTasks, 2);
         const auto receipt = inlineCoordinator.RequestOwned(Input(1, 9), true);
         CHECK(receipt.sequence == 1);
-        CHECK(inlineCoordinator.Latest() && inlineCoordinator.Latest()->sequence == receipt.sequence);
+        CHECK(inlineCoordinator.PeekReady(receipt.sequence));
         CHECK(inlineTasks->queue.empty());
         CHECK(inlineCoordinator.Statistics().started == 1);
         CHECK(inlineCoordinator.Statistics().completed == 1);
@@ -712,26 +712,26 @@ int main() {
     const auto second = coordinator.Request(Input(1, 20));
     CHECK(coordinator.Statistics().active == 2);
     tasks->Run(1); coordinator.Pump();
-    CHECK(coordinator.Latest()->sequence == second);
-    CHECK(!coordinator.AcquireNextReadyAfter(0)); // Sequence one is the queue head.
+    CHECK(coordinator.PeekReady(second));
+    CHECK(!coordinator.PeekReady(first)); // Sequence one is still compiling.
     tasks->Run(0); coordinator.Pump();
-    CHECK(coordinator.Latest()->sequence == second && second > first);
+    CHECK(coordinator.PeekReady(first) && coordinator.PeekReady(second) && second > first);
     CHECK(coordinator.WaitAndPop(first)->sequence == first);
     CHECK(coordinator.WaitAndPop(second)->sequence == second);
     auto lease = std::make_shared<int>(42); std::weak_ptr<int> weakLease = lease;
     auto coalesced = Input(1, 20); coalesced.leases.push_back(lease); lease.reset();
     const auto third = coordinator.Request(std::move(coalesced));
-    CHECK(coordinator.Latest()->sequence == third && !weakLease.expired());
+    CHECK(coordinator.PeekReady(third) && !weakLease.expired());
     CHECK(coordinator.Statistics().started == 2);
     CHECK(coordinator.Statistics().scheduleFailures == 0);
-    const auto retainedGraph = coordinator.Latest()->graph;
+    const auto retainedGraph = coordinator.PeekReady(third)->graph;
     const auto fourth = coordinator.Request(Input(1, 20));
     CHECK(!weakLease.expired()); // Queued frame retains its own content.
     CHECK(coordinator.WaitAndPop(third)->sequence == third);
     CHECK(weakLease.expired());
     CHECK(coordinator.WaitAndPop(fourth)->sequence == fourth);
     coordinator.Reset(2);
-    CHECK(weakLease.expired() && !coordinator.Latest());
+    CHECK(weakLease.expired() && !coordinator.PeekReady(third));
     CHECK(coordinator.Request(Input(1)) == 0);
 
     coordinator.Request(Input(2, 30));
@@ -740,13 +740,13 @@ int main() {
     const auto latest = coordinator.Request(Input(2, 60));
     CHECK(coordinator.Statistics().active == 2 && coordinator.Statistics().pending == 2);
     tasks->RunAll(); coordinator.Pump(); tasks->RunAll(); coordinator.Pump();
-    CHECK(coordinator.Latest()->sequence == latest);
+    CHECK(coordinator.PeekReady(latest));
     CHECK(coordinator.Statistics().oracleFailures == 0);
 
     auto badOracle = Input(2, 70); badOracle.expectedEdges = std::make_shared<const DependencyEdges>();
     coordinator.Request(std::move(badOracle)); tasks->RunAll(); coordinator.Pump();
     CHECK(coordinator.Statistics().oracleFailures == 1);
-    CHECK(coordinator.Latest()->sequence == latest);
+    CHECK(coordinator.PeekReady(latest));
     coordinator.Request(Input(2, 80));
     auto cancelledPayload = std::make_shared<PayloadLifecycleProbe>();
     auto cancelledInput = Input(2, 81);
@@ -754,7 +754,7 @@ int main() {
     coordinator.Request(std::move(cancelledInput));
     coordinator.Reset(3); tasks->RunAll(); coordinator.Pump();
     CHECK(cancelledPayload->abandonCount == 1 && cancelledPayload->reason == 1);
-    CHECK(!coordinator.Latest());
+    CHECK(!coordinator.PeekReady(1));
     tasks->reject = true;
     const auto inlineFallback = coordinator.Request(Input(3));
     coordinator.Pump();
@@ -783,7 +783,7 @@ int main() {
     std::jthread a([&]{ gate.arrive_and_wait(); concurrentTasks->Run(0); });
     std::jthread b([&]{ gate.arrive_and_wait(); concurrentTasks->Run(1); });
     gate.arrive_and_wait(); a.join(); b.join(); concurrent.Pump();
-    CHECK(concurrent.Latest()->sequence == newer);
+    CHECK(concurrent.PeekReady(newer));
     CHECK(concurrent.Statistics().completed == 2);
     CHECK(concurrent.Statistics().peakRunning == 2);
     CHECK(concurrent.Statistics().oracleFailures == 0);
@@ -813,8 +813,8 @@ int main() {
     CHECK(realizationRace.Statistics().started == 1 && realizationRace.Statistics().coalesced == 1);
     CHECK(!backingOneWeak.expired() && !backingTwoWeak.expired());
     realizationTasks->RunAll(); realizationRace.Pump();
-    CHECK(realizationRace.Latest()->sequence == latestRealization);
-    CHECK(realizationRace.Latest()->input->backingGenerations == std::vector<uint64_t>{2});
+    CHECK(realizationRace.PeekReady(latestRealization));
+    CHECK(realizationRace.PeekReady(latestRealization)->input->backingGenerations == std::vector<uint64_t>{2});
     CHECK(!backingOneWeak.expired() && !backingTwoWeak.expired());
     CHECK(!payloadOneWeak.expired() && !payloadTwoWeak.expired());
     CHECK(realizationRace.WaitAndPop(1)->sequence == 1);
@@ -842,7 +842,7 @@ int main() {
     canonical.Request(reordered);
     CHECK(canonical.Statistics().started == 1 && canonical.Statistics().coalesced == 1);
     CHECK(canonical.Statistics().membershipChanges == 0 && canonical.Statistics().passChanges == 0);
-    CHECK(canonical.Latest()->input->backingGenerations == std::vector<uint64_t>({100,200}));
+    CHECK(canonical.PeekReady(2)->input->backingGenerations == std::vector<uint64_t>({100,200}));
     reordered.structure.resourceIDs[0] = 30;
     canonical.Request(reordered);
     CHECK(canonical.Statistics().membershipChanges == 1);
@@ -854,7 +854,7 @@ int main() {
     auto firstSlot = Input(1, 100); firstSlot.leases.push_back(publication);
     publication.reset();
     rotation.Request(std::move(firstSlot)); rotationTasks->RunAll(); rotation.Pump();
-    auto firstPlan = rotation.Latest()->graph;
+    auto firstPlan = rotation.PeekReady(1)->graph;
     std::weak_ptr<const CompiledGraph> evictedPlan = firstPlan;
     for (uint64_t id : {200, 300}) {
         rotation.Request(Input(1, id)); rotationTasks->RunAll(); rotation.Pump();
@@ -865,7 +865,7 @@ int main() {
     CHECK(rotation.WaitAndPop(2)->sequence == 2);
     CHECK(rotation.WaitAndPop(3)->sequence == 3);
     const auto revisitedSequence = rotation.Request(Input(1, 100));
-    CHECK(rotation.Latest()->sequence == revisitedSequence && rotation.Latest()->graph == firstPlan);
+    CHECK(rotation.PeekReady(revisitedSequence)->graph == firstPlan);
     CHECK(rotation.Statistics().completedCacheHits == 1 && rotation.Statistics().started == 3);
     CHECK(rotation.WaitAndPop(revisitedSequence)->sequence == revisitedSequence);
     firstPlan.reset();
@@ -878,10 +878,10 @@ int main() {
     const auto beforeResetBuilds = rotation.Statistics().started;
     rotation.Request(Input(2, 1200)); rotationTasks->RunAll(); rotation.Pump();
     CHECK(rotation.Statistics().started == beforeResetBuilds + 1);
-    const auto goodSequence = rotation.Latest()->sequence;
+    const auto goodSequence = rotation.Statistics().highestReadySequence;
     auto invalidJob = Input(2, 1400); invalidJob.structure.placementEdges = {{2, 0}};
     const auto invalidSequence = rotation.Request(invalidJob); rotationTasks->RunAll(); rotation.Pump();
-    CHECK(rotation.Statistics().failed == 1 && rotation.Latest()->sequence == goodSequence);
+    CHECK(rotation.Statistics().failed == 1 && rotation.Statistics().highestReadySequence == goodSequence);
     bool sawOrderedFailure = false;
     try { (void)rotation.WaitAndPop(invalidSequence); }
     catch (const std::runtime_error&) { sawOrderedFailure = true; }

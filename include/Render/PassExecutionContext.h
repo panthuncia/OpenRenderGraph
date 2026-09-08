@@ -36,6 +36,10 @@ struct UpdateExecutionContext {
     // Owned publication context supplied by the preparation owner for this update.
     std::shared_ptr<const ResolverCaptureContext> resolverCaptureContext;
 	UINT frameIndex = 0;
+	// CPU-owned slot whose mutable frame data is reserved by this logical
+	// frame. It is deliberately distinct from the swapchain image acquired at
+	// ordered admission. frameIndex remains an alias during migration.
+	UINT preparationSlot = 0;
 	UINT64 frameFenceValue = 0;
 	float deltaTime = 0.0f;
 	const IHostExecutionData* hostData = nullptr;
@@ -80,12 +84,16 @@ struct PassExecutionContext {
 	const char* currentPassName = nullptr;
 	const char* currentTechniquePath = nullptr;
 	UINT frameIndex = 0;
+	// Execution-slot identity selected at admission. This is not necessarily
+	// the preparation slot captured by the executable frame.
+	UINT executionSlot = 0;
 	UINT64 frameFenceValue = 0;
 	float deltaTime = 0.0f;
 	const IHostExecutionData* hostData = nullptr;
 	// Values for structurally placed external-wait bindings. Bindings determine
 	// the consuming batch/queue at compile time; timeline values remain per-frame.
 	std::vector<ExternalTimelineBindingValue> externalTimelineBindings;
+	std::vector<ExternalResourceBindingValue> externalResourceBindings;
 	std::vector<ExternalDescriptorBindingValue> externalDescriptorBindings;
 	rhi::Resource Resolve(Resource& resource) const;
 	rhi::Resource Resolve(const std::shared_ptr<Resource>& resource) const;

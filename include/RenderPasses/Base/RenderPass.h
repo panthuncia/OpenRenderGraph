@@ -135,6 +135,18 @@ protected:
 		}
 	}
 
+	template<class CommandSink>
+	void BindResourceDescriptorIndices(CommandSink& commandList, const PipelineResources& resources) {
+		unsigned int indices[org::shaderapi::kNumResourceDescriptorIndicesRootConstants] = {};
+		int i = 0;
+		for (auto& binding : resources.mandatoryResourceDescriptorSlots)
+			indices[i++] = m_resourceDescriptorIndexHelper->GetResourceDescriptorIndex(binding, false);
+		for (auto& binding : resources.optionalResourceDescriptorSlots)
+			indices[i++] = m_resourceDescriptorIndexHelper->GetResourceDescriptorIndex(binding, true);
+		if (i > 0) commandList.PushConstants(rhi::ShaderStage::Compute, 0,
+			org::shaderapi::kResourceDescriptorIndicesRootParameter, 0, i, indices);
+	}
+
 	std::vector<unsigned int> CaptureResourceDescriptorIndices(const PipelineResources& resources) const {
 		std::vector<unsigned int> indices;
 		indices.reserve(resources.mandatoryResourceDescriptorSlots.size()

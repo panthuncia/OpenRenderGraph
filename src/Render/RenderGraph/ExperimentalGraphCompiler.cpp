@@ -752,11 +752,6 @@ GraphCompileCoordinator::RequestReceipt GraphCompileCoordinator::RequestOwned(
     RequestState request{++m_sequence, std::make_shared<const GraphCompileInput>(std::move(input)), std::chrono::steady_clock::now()};
     m_previousRequest = request.input;
     ++m_stats.requested;
-    if (m_latest && m_latest->input->structure == request.input->structure) {
-        ++m_stats.coalesced;
-        Accept(request, m_latest->graph);
-        return {request.sequence, request.input};
-    }
     for (auto& job : m_jobs) {
         if (!job->cancel.load() && job->input->structure == request.input->structure) {
             job->followers.push_back(request);
@@ -805,8 +800,9 @@ void GraphCompileCoordinator::StartPending() {
         job->originalSequence = job->request.sequence;
         job->queued = job->request.queued;
         auto running = m_running;
+        auto completion = m_completion;
         const bool accepted = m_tasks->Submit(m_scope, runtime::TaskPriority::Background,
-        "ORG.AsyncCompile.Job", [job, running] {
+        "ORG.AsyncCompile.Job", [job, running, completion] {
             BT_ZONE_SCOPE("ORG.AsyncCompile.Job");
             BT_ZONE_VALUE(job->originalSequence);
             BT_PLOT("ORG.AsyncCompile.QueueDelayUs", static_cast<int64_t>(
@@ -821,6 +817,11 @@ void GraphCompileCoordinator::StartPending() {
             catch (...) { job->error = "Unknown graph compile exception"; }
             running->running.fetch_sub(1);
             job->done.store(true, std::memory_order_release);
+            {
+                std::lock_guard lock(completion->mutex);
+                ++completion->revision;
+            }
+            completion->changed.notify_all();
             });
         ++m_stats.started;
         if (!accepted) {
@@ -832,6 +833,11 @@ void GraphCompileCoordinator::StartPending() {
             } catch (const std::exception& error) { job->error = error.what(); }
             catch (...) { job->error = "Unknown inline graph compile exception"; }
             job->done.store(true, std::memory_order_release);
+            {
+                std::lock_guard lock(m_completion->mutex);
+                ++m_completion->revision;
+            }
+            m_completion->changed.notify_all();
         }
         m_jobs.push_back(std::move(job));
         m_stats.peakActive = (std::max)(m_stats.peakActive, m_jobs.size());
@@ -879,19 +885,13 @@ void GraphCompileCoordinator::Accept(const RequestState& request,
     auto bundle = std::make_shared<const CompiledGraphBundle>(CompiledGraphBundle{
         request.sequence, std::move(result), request.input});
     m_ready.emplace(request.sequence, bundle);
-    if (!m_latest || request.sequence > m_latest->sequence) m_latest = bundle;
-    m_stats.selectedSequence = (std::max)(m_stats.selectedSequence, request.sequence);
+    m_stats.highestReadySequence = (std::max)(m_stats.highestReadySequence, request.sequence);
 }
 
-std::shared_ptr<const CompiledGraphBundle> GraphCompileCoordinator::AcquireNextReadyAfter(
-    uint64_t sequence) {
-    while (!m_ready.empty() && m_ready.begin()->first <= sequence) m_ready.erase(m_ready.begin());
-    const auto wanted = sequence + 1;
-    const auto found = m_ready.find(wanted);
+std::shared_ptr<const CompiledGraphBundle> GraphCompileCoordinator::PeekReady(uint64_t sequence) const {
+    const auto found = m_ready.find(sequence);
     if (found == m_ready.end()) return {};
-    auto result = found->second;
-    m_ready.erase(found);
-    return result;
+    return found->second;
 }
 
 void GraphCompileCoordinator::Pump() {
@@ -915,17 +915,20 @@ void GraphCompileCoordinator::Pump() {
     StartPending();
 }
 
-void GraphCompileCoordinator::WaitForLatest() {
-    if (m_latest || m_stopped) return;
-    if (m_scope) m_scope->Wait();
-    Pump();
-}
-
 void GraphCompileCoordinator::WaitForSequence(uint64_t sequence) {
     while (!m_stopped && !m_ready.contains(sequence) && !m_failures.contains(sequence)) {
-        if (m_scope) m_scope->Wait();
+        uint64_t observed = 0;
+        {
+            std::lock_guard lock(m_completion->mutex);
+            observed = m_completion->revision;
+        }
         Pump();
         if (m_jobs.empty() && m_pending.empty()) break;
+        if (m_ready.contains(sequence) || m_failures.contains(sequence)) break;
+        std::unique_lock lock(m_completion->mutex);
+        m_completion->changed.wait(lock, [&] {
+            return m_completion->revision != observed || m_stopped;
+        });
     }
 }
 
@@ -962,11 +965,10 @@ void GraphCompileCoordinator::Reset(uint64_t generation) {
     for (const auto& [_, bundle] : m_ready)
         if (bundle && bundle->input && bundle->input->executionLifecycle)
             bundle->input->executionLifecycle->Abandon(1);
-    m_latest.reset();
     m_ready.clear();
     m_failures.clear();
     m_completedPlans.clear();
-    m_stats.selectedSequence = 0;
+    m_stats.highestReadySequence = 0;
 }
 
 void GraphCompileCoordinator::Shutdown() {
@@ -988,7 +990,7 @@ void GraphCompileCoordinator::Shutdown() {
     // completion mailboxes and scheduler accounting finish normally.
     if (m_scope) m_scope->Wait();
     Pump();
-    m_jobs.clear(); m_ready.clear(); m_failures.clear(); m_latest.reset(); m_completedPlans.clear();
+    m_jobs.clear(); m_ready.clear(); m_failures.clear(); m_completedPlans.clear();
 }
 
 CompileCoordinatorStatistics GraphCompileCoordinator::Statistics() const {
@@ -1028,7 +1030,6 @@ CompileCoordinatorStatistics GraphCompileCoordinator::Statistics() const {
         (void)sequence;
         accountInput(bundle->input);
     }
-    if (m_latest) accountInput(m_latest->input);
     for (const auto& graph : m_completedPlans) {
         const auto& structure = *graph->structure;
         result.retainedBytes += sizeof(GraphCompileStructure) + structureBytes(structure);

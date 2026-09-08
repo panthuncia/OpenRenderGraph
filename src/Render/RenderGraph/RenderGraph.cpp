@@ -5,6 +5,7 @@
 
 #include <span>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <map>
 #include <chrono>
@@ -46,6 +47,9 @@
 namespace org {
 
 namespace {
+std::atomic_bool g_loggedParallelTypedRecording{false};
+std::atomic_bool g_loggedLegacyPacketRecording{false};
+
 size_t PassRecordingConcurrency()
 {
 	static const size_t value = [] {
@@ -5484,7 +5488,7 @@ void RenderGraph::CompileStructural() {
 			BT_ZONE_SCOPE("RenderGraph::CompileStructural::MaterializeExtensionPass");
 			BT_ZONE_TEXT(d.name.data(), d.name.size());
 			if (d.type == PassType::Unknown) continue;
-			if (std::holds_alternative<std::monostate>(d.pass)) continue;
+			if (std::holds_alternative<std::monostate>(d.pass) && !d.unifiedPass) continue;
 
 			ExtItem it;
 			if (m_getRenderGraphBatchTraceEnabled && m_getRenderGraphBatchTraceEnabled()) {
@@ -9243,7 +9247,6 @@ void RenderGraph::BuildExecutionSchedule() {
 
 bool RenderGraph::PrepareSelectedAsyncFrame(PassExecutionContext& context) {
     BT_ZONE_SCOPE("ORG.AsyncExecution.PopExecutableFrame");
-    (void)context;
     auto& coordinator = m_compilerState->shadowCompiler;
     const uint64_t sequence = m_compilerState->nextAsyncExecutionSequence;
     if (!coordinator || !sequence || sequence > m_compilerState->lastRequestedAsyncSequence)
@@ -9253,6 +9256,37 @@ bool RenderGraph::PrepareSelectedAsyncFrame(PassExecutionContext& context) {
         throw std::runtime_error("Ordered compiled frame has no owned execution payload");
     auto payload = std::static_pointer_cast<const experimental::PreparedFramePayload>(
         bundle->input->executionPayload);
+    // Resolve true admission resources before initial-state and backend-barrier
+    // construction. A queued frame must never retain the swapchain image that
+    // happened to be current when its logical request was prepared.
+    if (payload->resources && std::ranges::any_of(
+            payload->resources->admissionBoundResources, [](uint32_t key) { return key != 0; })) {
+        auto resources = std::make_shared<experimental::RealizedResourceBundle>(*payload->resources);
+        auto concrete = resources->bindings->Resources();
+        auto states = resources->initialStates;
+        if (resources->admissionBoundResources.size() != concrete.size()
+            || states.size() != concrete.size())
+            throw std::runtime_error("External resource-binding manifest is inconsistent");
+        for (size_t slot = 0; slot < concrete.size(); ++slot) {
+            const auto rawKey = resources->admissionBoundResources[slot];
+            if (!rawKey) continue;
+            const auto key = static_cast<ExternalBindingKey>(rawKey);
+            const auto found = std::ranges::find(context.externalResourceBindings, key,
+                &ExternalResourceBindingValue::key);
+            if (found == context.externalResourceBindings.end()
+                || !found->resource.GetHandle().valid() || !found->owner)
+                throw std::runtime_error("Required external resource binding is unavailable at admission");
+            concrete[slot] = {found->resource, found->owner};
+            states[slot].resource = found->resource.GetHandle();
+            resources->leases.push_back(found->owner);
+        }
+        resources->bindings = std::make_shared<const FrozenExecutionBindings>(std::move(concrete));
+        resources->initialStates = states;
+        payload = experimental::BuildPreparedFramePayloadWithInitialStates(
+            payload->frameNumber, payload->passes, std::move(resources), std::move(states),
+            payload->externalWaitsByPreparedPass, payload->preparationSlot);
+        basic_telemetry::AddCounter("ORG.AsyncExecution.ExternalResourcesBound");
+    }
     auto layout = experimental::BuildExecutionLayout(bundle, *bundle->input);
     auto initialStates = payload->initialStates;
     const auto activated = m_compilerState->asyncAliasAccessLedger.ApplyInitialStates(
@@ -9261,12 +9295,38 @@ bool RenderGraph::PrepareSelectedAsyncFrame(PassExecutionContext& context) {
     m_compilerState->selectedAsyncFrame = experimental::BuildRenderFrameSnapshot(
         std::move(layout), experimental::BuildPreparedFramePayloadWithInitialStates(
             payload->frameNumber, payload->passes, payload->resources,
-            std::move(initialStates), payload->externalWaitsByPreparedPass),
+            std::move(initialStates), payload->externalWaitsByPreparedPass,
+            payload->preparationSlot),
         m_compilerState->asyncBackingStateLedger);
     ++m_compilerState->nextAsyncExecutionSequence;
     basic_telemetry::AddCounter("ORG.AsyncExecution.PoppedExecutableFrames");
     BT_PLOT("ORG.AsyncExecution.ExecutingSequence", static_cast<int64_t>(sequence));
     return true;
+}
+
+bool RenderGraph::ShouldDeferAsyncAdmission() {
+    if (!m_renderGraphSettingsService
+        || m_renderGraphSettingsService->GetExperimentalAsyncCompileMode()
+            != runtime::AsyncCompileMode::Async
+        || !m_compilerState->shadowCompiler) return false;
+    auto& coordinator = *m_compilerState->shadowCompiler;
+    coordinator.Pump();
+    const auto next = m_compilerState->nextAsyncExecutionSequence;
+    if (!next || next > m_compilerState->lastRequestedAsyncSequence) return false;
+    const auto depth = m_compilerState->lastRequestedAsyncSequence - next + 1;
+    const auto target = static_cast<uint64_t>((std::max)(uint8_t{1},
+        m_renderGraphSettingsService->GetExperimentalCompileConcurrency()));
+    // Maintain an actual producer/consumer window even when compilation is
+    // shorter than owner preparation. Otherwise Async silently degenerates to
+    // request-then-immediate-pop and can never absorb a later expensive frame.
+    const bool defer = depth < target;
+    if (defer) basic_telemetry::AddCounter("ORG.AsyncExecution.QueuePrefillDeferrals");
+    BT_PLOT("ORG.AsyncExecution.OwnedQueueDepth", static_cast<int64_t>(depth));
+    return defer;
+}
+
+std::optional<uint32_t> RenderGraph::GetLastExecutedPreparationSlot() const noexcept {
+    return m_compilerState ? m_compilerState->lastExecutedPreparationSlot : std::nullopt;
 }
 
 bool RenderGraph::TryExecuteSelectedAsyncFrame(PassExecutionContext& context) {
@@ -9358,7 +9418,12 @@ bool RenderGraph::TryExecuteSelectedAsyncFrame(PassExecutionContext& context) {
     const auto defaultSamplerHeap = context.GetSamplerDescriptorHeap().GetHandle();
     auto externalDescriptorBindings = std::make_shared<const std::vector<ExternalDescriptorBindingValue>>(
         context.externalDescriptorBindings);
+    bool allPacketsWorkerSafe = true;
     for (size_t batch = 0; batch < recordingPlan.size(); ++batch) {
+        allPacketsWorkerSafe = allPacketsWorkerSafe && std::ranges::all_of(
+            recordingPlan[batch].passes, [](const PreparedPass& pass) {
+                return pass.IsWorkerSafe();
+            });
         const uint32_t slot = recordingPlan[batch].queueSlot;
         if (slot >= m_queueRegistry.SlotCount()) throw std::runtime_error("Async batch queue is unavailable");
         const auto index = static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot));
@@ -9383,13 +9448,41 @@ bool RenderGraph::TryExecuteSelectedAsyncFrame(PassExecutionContext& context) {
         recording.barriersAfterPass = frame->barrierPlan->batches[batch].afterPass;
         recording.passes = std::move(recordingPlan[batch].passes);
     }
-    // Recording remains ordered on the admission owner while the last legacy
-    // packets are being removed. Those packets can still read owner-managed
-    // view/manager containers and are not safe to run concurrently. Graph
-    // compilation remains concurrent; typed packets can re-enable bounded
-    // recording workers once the legacy count reaches zero.
-    const size_t recordingConcurrency = 1;
-    basic_telemetry::AddCounter("ORG.AsyncExecution.SerialRecordingForLegacyPackets");
+    // Typed packets are owned and worker-safe by construction. Hand-authored
+    // and legacy packets remain serial unless explicitly migrated through the
+    // typed contract, making the safe path the automatic/default one.
+    const size_t recordingConcurrency = allPacketsWorkerSafe
+        ? std::min<size_t>(recordingJobs.size(),
+            std::min<size_t>(4u, PassRecordingConcurrency()))
+        : 1u;
+    if (allPacketsWorkerSafe) {
+        basic_telemetry::AddCounter("ORG.AsyncExecution.ParallelTypedRecordingFrames");
+        BT_PLOT("ORG.AsyncExecution.RecordingConcurrency",
+            static_cast<int64_t>(recordingConcurrency));
+        bool expected = false;
+        if (g_loggedParallelTypedRecording.compare_exchange_strong(expected, true))
+            spdlog::info(
+                "Async execution enabled parallel owned-packet recording: batches={} concurrency={}",
+                recordingJobs.size(), recordingConcurrency);
+    } else {
+        basic_telemetry::AddCounter("ORG.AsyncExecution.SerialRecordingForLegacyPackets");
+        bool expected = false;
+        if (g_loggedLegacyPacketRecording.compare_exchange_strong(expected, true)) {
+            std::vector<std::string> legacyNames;
+            for (const auto& job : recordingJobs)
+                for (const auto& pass : job.recording.passes)
+                    if (!pass.IsWorkerSafe())
+                        legacyNames.emplace_back(pass.DebugName());
+            std::ostringstream names;
+            for (size_t index = 0; index < legacyNames.size(); ++index) {
+                if (index) names << ", ";
+                names << legacyNames[index];
+            }
+            spdlog::warn(
+                "Async execution retained serial recording for {} legacy packets: {}",
+                legacyNames.size(), names.str());
+        }
+    }
     ParallelForOptionalLimited("ORG.AsyncExecution.RecordBatches", recordingJobs.size(), recordingConcurrency,
         [&](size_t batch) {
             auto& job = recordingJobs[batch];
@@ -9439,6 +9532,7 @@ bool RenderGraph::TryExecuteSelectedAsyncFrame(PassExecutionContext& context) {
             }
         }
         basic_telemetry::AddCounter("ORG.AsyncExecution.SubmittedSceneFrames");
+        m_compilerState->lastExecutedPreparationSlot = frame->preparationSlot;
         BT_PLOT("ORG.AsyncExecution.SubmittedSequence", static_cast<int64_t>(frame->layout->bundle->sequence));
         return true;
     } catch (...) {
@@ -9461,14 +9555,20 @@ bool RenderGraph::TryExecuteSelectedAsyncFrame(PassExecutionContext& context) {
 }
 
 void RenderGraph::Execute(PassExecutionContext& context) {
-    const bool asyncExecutionRequested = m_renderGraphSettingsService
-        && m_renderGraphSettingsService->GetExperimentalAsyncCompileMode() == runtime::AsyncCompileMode::Async;
-    if (asyncExecutionRequested) {
+    const auto compileMode = m_renderGraphSettingsService
+        ? m_renderGraphSettingsService->GetExperimentalAsyncCompileMode()
+        : runtime::AsyncCompileMode::Off;
+    const bool ownedExecutionRequested = compileMode != runtime::AsyncCompileMode::Shadow
+        && m_compilerState->shadowCompiler
+        && m_compilerState->lastRequestedAsyncSequence != 0;
+    if (ownedExecutionRequested) {
 		// Consume the exact next owned frame. Preparation and compilation both
 		// belong to that request; current mutable pass state is never consulted.
 		if (!m_compilerState->selectedAsyncFrame) PrepareSelectedAsyncFrame(context);
         if (m_compilerState->selectedAsyncFrame && TryExecuteSelectedAsyncFrame(context)) return;
-		basic_telemetry::AddCounter("ORG.AsyncExecution.NoQueuedFrame");
+		basic_telemetry::AddCounter(compileMode == runtime::AsyncCompileMode::Off
+			? "ORG.OwnedExecution.InlineFrameUnavailable"
+			: "ORG.AsyncExecution.NoQueuedFrame");
         return;
     }
     // First owned scene-recording subset. The legacy compiler/state ledger still

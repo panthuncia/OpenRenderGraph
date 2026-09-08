@@ -1,10 +1,12 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -326,7 +328,7 @@ private:
 struct CompileCoordinatorStatistics {
     uint64_t requested = 0, coalesced = 0, started = 0, completed = 0;
     uint64_t cancelled = 0, failed = 0, oracleComparisons = 0, oracleFailures = 0;
-    uint64_t rejected = 0, selectedSequence = 0;
+    uint64_t rejected = 0, highestReadySequence = 0;
     uint64_t scheduleComparisons = 0, scheduleFailures = 0;
     uint64_t stateComparisons = 0, stateFailures = 0, stateFallbacks = 0;
     uint64_t membershipChanges = 0, passChanges = 0, constraintChanges = 0;
@@ -357,7 +359,6 @@ public:
     // point and workspace type as worker jobs. No alternate compiler exists.
     RequestReceipt RequestOwned(GraphCompileInput input, bool compileInline = false);
     void Pump();
-	void WaitForLatest();
 	void WaitForSequence(uint64_t sequence);
     // Waits for, and consumes, exactly sequence. Later completed requests stay
     // in the reorder buffer. Compilation failure for sequence is reported by
@@ -366,10 +367,9 @@ public:
     void SetConcurrency(size_t concurrency);
     void Reset(uint64_t generation);
     void Shutdown();
-    std::shared_ptr<const CompiledGraphBundle> Latest() const { return m_latest; }
-    // Returns the oldest completed request newer than the admitted sequence.
-    // Ready results remain ordered even when worker completion is reversed.
-    std::shared_ptr<const CompiledGraphBundle> AcquireNextReadyAfter(uint64_t sequence);
+    // Non-consuming exact-sequence inspection for tests and diagnostics. This
+    // never selects a frame and cannot skip over a queue hole.
+    std::shared_ptr<const CompiledGraphBundle> PeekReady(uint64_t sequence) const;
     CompileCoordinatorStatistics Statistics() const;
 private:
     struct RequestState {
@@ -381,11 +381,17 @@ private:
     struct RunningStatistics {
         std::atomic_size_t running{0}, peak{0};
     };
+    struct CompletionSignal {
+        std::mutex mutex;
+        std::condition_variable changed;
+        uint64_t revision = 0;
+    };
     void StartPending();
     void Accept(const RequestState&, std::shared_ptr<const CompiledGraph>);
     std::shared_ptr<runtime::ITaskService> m_tasks;
     std::shared_ptr<runtime::ITaskScope> m_scope;
     std::shared_ptr<RunningStatistics> m_running = std::make_shared<RunningStatistics>();
+    std::shared_ptr<CompletionSignal> m_completion = std::make_shared<CompletionSignal>();
     size_t m_concurrency;
     bool m_stopped = false;
     uint64_t m_generation = 0, m_sequence = 0;
@@ -393,7 +399,6 @@ private:
     std::deque<RequestState> m_pending;
     std::map<uint64_t, std::shared_ptr<const CompiledGraphBundle>> m_ready;
     std::map<uint64_t, std::string> m_failures;
-    std::shared_ptr<const CompiledGraphBundle> m_latest;
     // Structural plans only: never retain an old publication lease in this
     // bounded generation cache. Frame-slot rotations can revisit older keys.
     std::vector<std::shared_ptr<const CompiledGraph>> m_completedPlans;

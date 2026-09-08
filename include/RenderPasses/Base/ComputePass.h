@@ -81,7 +81,8 @@ protected:
 	bool invalidated = true;
 	virtual void DeclareResourceUsages(ComputePassBuilder* builder) {};
 
-	void BindResourceDescriptorIndices(rhi::CommandList& commandList, const PipelineResources& resources) {
+	template<class CommandSink>
+	void BindResourceDescriptorIndices(CommandSink& commandList, const PipelineResources& resources) {
 		unsigned int indices[org::shaderapi::kNumResourceDescriptorIndicesRootConstants] = {};
 		int i = 0;
 		for (auto& binding : resources.mandatoryResourceDescriptorSlots) {

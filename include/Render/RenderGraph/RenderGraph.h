@@ -198,6 +198,15 @@ public:
 			return desc;
 		}
 
+		static ExternalPassDesc Copy(std::string name, std::shared_ptr<RenderPass> copyPass) {
+			ExternalPassDesc desc{};
+			desc.type = PassType::Render;
+			desc.name = std::move(name);
+			desc.unifiedPass = std::move(copyPass);
+			desc.preferredQueueKind = QueueKind::Copy;
+			return desc;
+		}
+
 		ExternalPassDesc& At(ExternalInsertPoint insertPoint) & {
 			where = std::move(insertPoint);
 			return *this;
@@ -688,6 +697,10 @@ public:
 	void AddCopyPass(std::shared_ptr<CopyPass> pass, CopyPassParameters& resources, std::string name = "", std::vector<ResolverSnapshot> resolverSnapshots = {});
 	void Update(const UpdateExecutionContext& context, rhi::Device device);
 	void Execute(PassExecutionContext& context);
+	// Async producer/admission handshake. True asks the host to prepare another
+	// logical frame before blocking for the exact queue head.
+	bool ShouldDeferAsyncAdmission();
+	std::optional<uint32_t> GetLastExecutedPreparationSlot() const noexcept;
 	void CompileStructural();
 	void ResetForFrame();
 	void ResetForRebuild();

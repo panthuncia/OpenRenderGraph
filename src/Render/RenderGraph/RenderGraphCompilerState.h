@@ -43,6 +43,7 @@ struct RenderGraph::CompilerState {
     uint64_t lastRequestedAsyncSequence = 0;
     uint64_t nextAsyncExecutionSequence = 1;
     uint64_t asyncPreparationFrameNumber = 0;
+    std::optional<uint32_t> lastExecutedPreparationSlot;
     uint64_t reportedAsyncSelectionFailures = 0;
     uint64_t reportedAsyncUnownedResources = 0;
     std::unordered_set<std::string> reportedAsyncLegacyPasses;

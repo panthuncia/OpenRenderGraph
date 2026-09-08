@@ -33,6 +33,10 @@ public:
     // migrated, while typed passes always support this entry point.
     virtual bool SupportsUnifiedDeclaration() const { return false; }
     virtual void DeclareUnified(RenderPassBuilder&) {}
+    // Typed preparation is the complete per-frame execution contract. Such a
+    // pass must never also be captured through the legacy immediate replay
+    // adapter, even if an intermediate class still implements that interface.
+    virtual bool UsesTypedPreparation() const noexcept { return false; }
 };
 
 } // namespace org

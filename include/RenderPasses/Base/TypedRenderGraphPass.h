@@ -29,6 +29,8 @@ class TypedRenderGraphPass : public RenderPass {
 public:
     using PreparedData = FrameData;
 
+    bool UsesTypedPreparation() const noexcept final { return true; }
+
     PreparedPass PrepareFrame(FramePreparationContext& context) final {
         static_assert(requires(Derived& pass, const PassPrepareContext& prepare) {
             { pass.Prepare(prepare) } -> std::same_as<FrameData>;
@@ -36,31 +38,22 @@ public:
         static_assert(requires(const FrameData& data, PassRecordContext& record) {
             { Derived::Record(data, record) } -> std::same_as<void>;
         }, "Typed passes require static void Record(const FrameData&, PassRecordContext&)");
-        return PreparedPass::FromTyped<Derived>(
-            static_cast<Derived*>(this)->Prepare(context));
+        auto collector = std::make_shared<PreparedDependencyCollector>();
+        auto typedContext = context;
+        typedContext.dependencyCollector = collector;
+        typedContext.captureDescriptorIndices = [this](const PipelineResources& resources) {
+            return this->CaptureResourceDescriptorIndices(resources);
+        };
+        auto data = static_cast<Derived*>(this)->Prepare(typedContext);
+        return PreparedPass::FromTyped<Derived>(std::move(data), std::move(*collector).Freeze());
     }
 
-    // Synchronous mode consumes the identical prepared packet. Submission and
-    // completion hooks are owned by the graph submission path; this method
-    // performs command recording only.
-    PassReturn Execute(PassExecutionContext& execution) final {
-        auto bindings = std::make_shared<const FrozenExecutionBindings>(
-            std::vector<FrozenExecutionBindings::ResourceBinding>{});
-        FramePreparationContext preparation{
-            .frameIndex = execution.frameIndex,
-            .deltaTime = execution.deltaTime,
-            .bindings = bindings,
-            .preparationData = execution.hostData,
-            .admissionData = execution.hostData,
-        };
-        auto packet = PrepareFrame(preparation);
-        auto externalBindings = std::make_shared<const std::vector<ExternalDescriptorBindingValue>>(
-            execution.externalDescriptorBindings);
-        RecordingContext recording(execution.commandList, std::move(bindings), std::move(externalBindings));
-        packet.Record(recording);
-        PassReturn result;
-        result.externalSignalsAfterCompletion = packet.ExternalSignalsAfterCompletion();
-        return result;
+    // Both Off and Async modes execute the owned packet produced above. Keep
+    // the historical virtual solely as an ABI bridge and fail loudly if graph
+    // execution ever attempts to re-enter a typed pass through it.
+    PassReturn Execute(PassExecutionContext&) final {
+        throw std::logic_error(
+            "TypedRenderGraphPass reached the removed legacy Execute route");
     }
 
     void Setup() final {
@@ -73,6 +66,13 @@ public:
     }
 
 protected:
+    [[nodiscard]] PreparedProgramBinding CaptureProgramBinding(
+        const PassPrepareContext& preparation,
+        const PipelineState& pipeline,
+        BackendInstanceId backend = BackendInstanceId::Primary) const {
+        return preparation.CaptureProgramBinding(pipeline, backend);
+    }
+
     void DeclareResourceUsages(RenderPassBuilder* builder) final {
         static_assert(requires(Derived& pass, PassBuilder& declaration) {
             { pass.Declare(declaration) } -> std::same_as<void>;

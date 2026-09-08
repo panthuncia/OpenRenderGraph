@@ -59,7 +59,8 @@ int TestOwnedRenderFrameSnapshot() {
     auto realized = std::make_shared<org::experimental::RealizedResourceBundle>();
     realized->backingGenerations = {9};
     realized->bindings = bindings;
-    realized->initialStates = {org::experimental::PreparedBackingState{.graphResourceID = 1}};
+    realized->initialStates = {org::experimental::PreparedBackingState{
+        .graphResourceID = 1, .resource = rhi::ResourceHandle{0, 1}}};
     realized->leases = {lease};
     std::vector<std::vector<org::ExternalTimelinePoint>> waits(1);
     waits[0].push_back({{}, 17});
@@ -286,7 +287,8 @@ int TestPreparedGpuSubmission(rhi::Device device, ID3D12Device* nativeDevice) {
                 {1,1,false}, {{{},commonState}}});
         auto barrierPlan = backingStates.Prepare(*compiled, initialStates);
         CHECK(barrierPlan.batches.size() == compiled->batches.size());
-        CHECK(!barrierPlan.batches[0].buffers.empty() && !barrierPlan.batches[1].buffers.empty());
+        CHECK(!barrierPlan.batches[0].beforePass[0].buffers.empty()
+            && !barrierPlan.batches[1].beforePass[0].buffers.empty());
         void* mapped = nullptr;
         CHECK(SUCCEEDED(lease->native[0]->Map(0, nullptr, &mapped)));
         std::memset(mapped, static_cast<int>(iteration * 37), 4096);
@@ -322,6 +324,7 @@ int TestPreparedGpuSubmission(rhi::Device device, ID3D12Device* nativeDevice) {
         CHECK(invalidSlotRejected);
         auto lifecycle = std::make_shared<TypedLifecycleCounts>();
         auto typedPacket = org::PreparedPass::FromTyped<TypedLifecyclePass>(TypedLifecycleData{lifecycle});
+        CHECK(typedPacket.IsWorkerSafe());
         typedPacket.Record(recording);
         typedPacket.CommitSubmitted();
         typedPacket.CommitCompleted({17});
@@ -331,6 +334,29 @@ int TestPreparedGpuSubmission(rhi::Device device, ID3D12Device* nativeDevice) {
         CHECK(abandonedPacket.Abandon(org::AbandonReason::GenerationInvalidated));
         CHECK(!abandonedPacket.Abandon(org::AbandonReason::Shutdown));
         CHECK(lifecycle->abandoned == 1);
+        auto frameworkLifecycle = std::make_shared<TypedLifecycleCounts>();
+        org::PreparedDependencyCollector dependencies;
+        dependencies.Reserve(std::make_shared<const org::PreparedOwnedLifecycle<TypedLifecycleCounts>>(
+            frameworkLifecycle,
+            +[](TypedLifecycleCounts& value, org::SubmissionContext) { ++value.submitted; },
+            +[](TypedLifecycleCounts& value, org::CompletionContext) { ++value.completed; },
+            +[](TypedLifecycleCounts& value, org::AbandonReason) { ++value.abandoned; }));
+        auto frameworkPacket = org::PreparedPass::FromTyped<TypedLifecyclePass>(
+            TypedLifecycleData{lifecycle}, std::move(dependencies).Freeze());
+        frameworkPacket.Record(recording);
+        frameworkPacket.CommitSubmitted();
+        frameworkPacket.CommitCompleted();
+        CHECK(frameworkLifecycle->submitted == 1
+            && frameworkLifecycle->completed == 1
+            && frameworkLifecycle->abandoned == 0);
+        org::PreparedDependencyCollector abandonedDependencies;
+        abandonedDependencies.Reserve(std::make_shared<const org::PreparedOwnedLifecycle<TypedLifecycleCounts>>(
+            frameworkLifecycle, nullptr, nullptr,
+            +[](TypedLifecycleCounts& value, org::AbandonReason) { ++value.abandoned; }));
+        auto frameworkAbandoned = org::PreparedPass::FromTyped<TypedLifecyclePass>(
+            TypedLifecycleData{lifecycle}, std::move(abandonedDependencies).Freeze());
+        CHECK(frameworkAbandoned.Abandon(org::AbandonReason::Shutdown));
+        CHECK(frameworkLifecycle->abandoned == 1);
         struct CopyData {
             std::shared_ptr<const org::imm::PreparedBufferCopies> copies;
             std::shared_ptr<int> submitted;
@@ -339,6 +365,7 @@ int TestPreparedGpuSubmission(rhi::Device device, ID3D12Device* nativeDevice) {
         auto preparedPass = org::PreparedPass::Make(CopyData{preparedCopies, submittedEffects},
             +[](const CopyData& data, org::RecordingContext& context) { data.copies->Record(context.Commands()); },
             +[](const CopyData& data) { ++*data.submitted; });
+        CHECK(!preparedPass.IsWorkerSafe());
         auto packetCopy = preparedPass;
         preparedPass.Record(recording);
         bool packetReplayRejected = false;

@@ -19,7 +19,9 @@ struct RealizedResourceBundle {
     std::vector<std::string> resourceKeys;
     // Frame-bound slots (swapchain images and equivalent dynamic imports) are
     // rebound from the admission frame. Other slots stay owned by the request.
-    std::vector<uint8_t> admissionBoundResources;
+    // Zero means fixed in the captured realization; non-zero is the
+    // ExternalBindingKey resolved during ordered admission.
+    std::vector<uint32_t> admissionBoundResources;
     std::shared_ptr<const FrozenExecutionBindings> bindings;
     std::vector<PreparedBackingState> initialStates;
     std::vector<std::shared_ptr<const void>> leases;
@@ -29,6 +31,7 @@ struct RealizedResourceBundle {
 // packets are deliberately separate from the reusable compiled layout.
 struct RenderFrameSnapshot {
     uint64_t frameNumber = 0;
+    uint32_t preparationSlot = 0;
     std::shared_ptr<const GraphExecutionLayout> layout;
     std::vector<PreparedPass> passes;
     std::shared_ptr<const FrozenExecutionBindings> bindings;
@@ -41,6 +44,7 @@ struct RenderFrameSnapshot {
 
 struct PreparedFramePayload final : IFramePayloadLifecycle {
     uint64_t frameNumber = 0;
+    uint32_t preparationSlot = 0;
     std::vector<PreparedPass> passes;
     std::shared_ptr<const FrozenExecutionBindings> bindings;
     std::vector<PreparedBackingState> initialStates;
@@ -118,13 +122,15 @@ inline std::shared_ptr<const PreparedFramePayload> BuildPreparedFramePayload(
     std::shared_ptr<const FrozenExecutionBindings> bindings,
     std::vector<PreparedBackingState> initialStates,
     std::vector<std::vector<ExternalTimelinePoint>> externalWaitsByPreparedPass = {},
-    std::vector<std::shared_ptr<const void>> leases = {}) {
+    std::vector<std::shared_ptr<const void>> leases = {},
+    uint32_t preparationSlot = 0) {
     if (!frameNumber || !bindings || passes.empty() || initialStates.empty())
         throw std::invalid_argument("Incomplete prepared frame payload");
     for (const auto& pass : passes)
         if (!pass) throw std::invalid_argument("Legacy pass prevents async frame preparation");
     auto result = std::make_shared<PreparedFramePayload>();
     result->frameNumber = frameNumber;
+    result->preparationSlot = preparationSlot;
     result->passes = std::move(passes);
     result->bindings = std::move(bindings);
     result->initialStates = std::move(initialStates);
@@ -137,13 +143,15 @@ inline std::shared_ptr<const PreparedFramePayload> BuildPreparedFramePayloadWith
     uint64_t frameNumber, std::vector<PreparedPass> passes,
     std::shared_ptr<const RealizedResourceBundle> resources,
     std::vector<PreparedBackingState> initialStates,
-    std::vector<std::vector<ExternalTimelinePoint>> externalWaitsByPreparedPass = {}) {
+    std::vector<std::vector<ExternalTimelinePoint>> externalWaitsByPreparedPass = {},
+    uint32_t preparationSlot = 0) {
     if (!resources || !frameNumber || !resources->bindings || passes.empty() || initialStates.empty())
         throw std::invalid_argument("Incomplete realized frame payload");
     for (const auto& pass : passes)
         if (!pass) throw std::invalid_argument("Legacy pass prevents async frame preparation");
     auto result = std::make_shared<PreparedFramePayload>();
     result->frameNumber = frameNumber;
+    result->preparationSlot = preparationSlot;
     result->passes = std::move(passes);
     result->bindings = resources->bindings;
     result->initialStates = std::move(initialStates);
@@ -156,7 +164,8 @@ inline std::shared_ptr<const PreparedFramePayload> BuildPreparedFramePayloadWith
 inline std::shared_ptr<const PreparedFramePayload> BuildPreparedFramePayload(
     uint64_t frameNumber, std::vector<PreparedPass> passes,
     std::shared_ptr<const RealizedResourceBundle> resources,
-    std::vector<std::vector<ExternalTimelinePoint>> externalWaitsByPreparedPass = {}) {
+    std::vector<std::vector<ExternalTimelinePoint>> externalWaitsByPreparedPass = {},
+    uint32_t preparationSlot = 0) {
     if (!resources || !frameNumber || !resources->bindings || passes.empty()
         || resources->initialStates.empty())
         throw std::invalid_argument("Incomplete realized frame payload");
@@ -164,6 +173,7 @@ inline std::shared_ptr<const PreparedFramePayload> BuildPreparedFramePayload(
         if (!pass) throw std::invalid_argument("Legacy pass prevents async frame preparation");
     auto result = std::make_shared<PreparedFramePayload>();
     result->frameNumber = frameNumber;
+    result->preparationSlot = preparationSlot;
     result->passes = std::move(passes);
     result->bindings = resources->bindings;
     result->initialStates = resources->initialStates;
@@ -182,7 +192,8 @@ inline std::shared_ptr<const RenderFrameSnapshot> BuildRenderFrameSnapshot(
     std::shared_ptr<const PreparedExecutionBarrierPlan> barrierPlan,
     std::vector<std::shared_ptr<const void>> leases = {},
     std::vector<std::vector<ExternalTimelinePoint>> externalWaitsByPreparedPass = {},
-    std::shared_ptr<const RealizedResourceBundle> resources = {}) {
+    std::shared_ptr<const RealizedResourceBundle> resources = {},
+    uint32_t preparationSlot = 0) {
     BT_ZONE_SCOPE("ORG.AsyncExecution.BuildFrameSnapshot");
     if (!frameNumber || !layout || !layout->bundle || !bindings
         || passes.size() != layout->placements.size() || initialStates.empty() || !barrierPlan
@@ -193,6 +204,7 @@ inline std::shared_ptr<const RenderFrameSnapshot> BuildRenderFrameSnapshot(
         if (!pass) throw std::invalid_argument("Legacy pass prevents async frame publication");
     auto result = std::make_shared<RenderFrameSnapshot>();
     result->frameNumber = frameNumber;
+    result->preparationSlot = preparationSlot;
     result->layout = std::move(layout);
     result->passes = std::move(passes);
     result->bindings = std::move(bindings);
@@ -217,7 +229,7 @@ inline std::shared_ptr<const RenderFrameSnapshot> BuildRenderFrameSnapshot(
     return BuildRenderFrameSnapshot(payload->frameNumber, std::move(layout),
         payload->passes, payload->bindings, payload->initialStates,
         std::move(barrierPlan), payload->leases, payload->externalWaitsByPreparedPass,
-        payload->resources);
+        payload->resources, payload->preparationSlot);
 }
 
 // Numeric IDs are admission identities, never casts of backend handles.

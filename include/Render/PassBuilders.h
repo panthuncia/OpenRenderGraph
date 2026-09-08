@@ -888,6 +888,63 @@ class RenderPassBuilder : public IPassBuilder {
 public:
     PassBuilderKind Kind() const noexcept override { return PassBuilderKind::Render; }
     IResourceProvider* ResourceProvider() noexcept override { return pass.get(); }
+    // Typed declaration entry points return a stable token for Prepare. This
+    // keeps the familiar fluent With* API intact while avoiding registry
+    // lookups and global-ID plumbing in typed passes.
+    template<class ResourceT>
+        requires std::derived_from<ResourceT, Resource>
+    ResourceBindingToken BindShaderResource(const std::shared_ptr<ResourceT>& resource) {
+        if (!resource) throw std::invalid_argument("Cannot bind an empty shader resource");
+        addShaderResource(resource);
+        return { resource->GetSchedulingResourceID(), graph->RequestResourceHandle(resource.get()).GetGlobalResourceID() };
+    }
+
+    template<class ResourceT>
+        requires std::derived_from<ResourceT, Resource>
+    ResourceBindingToken BindUnorderedAccess(const std::shared_ptr<ResourceT>& resource) {
+        if (!resource) throw std::invalid_argument("Cannot bind an empty unordered-access resource");
+        addUnorderedAccess(resource);
+        return { resource->GetSchedulingResourceID(), graph->RequestResourceHandle(resource.get()).GetGlobalResourceID() };
+    }
+
+    template<class ResourceT>
+        requires std::derived_from<ResourceT, Resource>
+    ResourceBindingToken BindIndirectArguments(const std::shared_ptr<ResourceT>& resource) {
+        if (!resource) throw std::invalid_argument("Cannot bind an empty indirect-argument resource");
+        addIndirectArguments(resource);
+        return { resource->GetSchedulingResourceID(), graph->RequestResourceHandle(resource.get()).GetGlobalResourceID() };
+    }
+
+    template<class ResourceT>
+        requires std::derived_from<ResourceT, Resource>
+    ResourceBindingToken BindRenderTarget(const std::shared_ptr<ResourceT>& resource) {
+        if (!resource) throw std::invalid_argument("Cannot bind an empty render target");
+        addRenderTarget(resource);
+        return { resource->GetSchedulingResourceID(), graph->RequestResourceHandle(resource.get()).GetGlobalResourceID() };
+    }
+
+    ResourceBindingToken BindRenderTarget(const ResourceIdentifier& identifier) {
+        addRenderTarget(identifier);
+        const auto handle = graph->RequestResourceHandle(identifier);
+        return {handle.GetGlobalResourceID(), handle.GetGlobalResourceID()};
+    }
+
+    template<class ResourceT>
+        requires std::derived_from<ResourceT, Resource>
+    ResourceBindingToken BindCopySource(const std::shared_ptr<ResourceT>& resource) {
+        if (!resource) throw std::invalid_argument("Cannot bind an empty copy-source resource");
+        addCopySource(resource);
+        return { resource->GetSchedulingResourceID(), graph->RequestResourceHandle(resource.get()).GetGlobalResourceID() };
+    }
+
+    template<class ResourceT>
+        requires std::derived_from<ResourceT, Resource>
+    ResourceBindingToken BindCopyDestination(const std::shared_ptr<ResourceT>& resource) {
+        if (!resource) throw std::invalid_argument("Cannot bind an empty copy-destination resource");
+        addCopyDest(resource);
+        return { resource->GetSchedulingResourceID(), graph->RequestResourceHandle(resource.get()).GetGlobalResourceID() };
+    }
+
     // Variadic entry points
 
     //First set, callable on Lvalues
@@ -1819,6 +1876,33 @@ class ComputePassBuilder : public IPassBuilder {
 public:
     PassBuilderKind Kind() const noexcept override { return PassBuilderKind::Compute; }
     IResourceProvider* ResourceProvider() noexcept override { return pass.get(); }
+    // Typed declaration entry points mirror RenderPassBuilder.  Prepared
+    // packets retain these stable declaration slots and resolve the admitted
+    // backing at record time; they must not capture a buffer's current native
+    // handle during preparation.
+    template<class ResourceT>
+        requires std::derived_from<ResourceT, Resource>
+    ResourceBindingToken BindShaderResource(const std::shared_ptr<ResourceT>& resource) {
+        if (!resource) throw std::invalid_argument("Cannot bind an empty shader resource");
+        addShaderResource(resource);
+        return { resource->GetSchedulingResourceID(), graph->RequestResourceHandle(resource.get()).GetGlobalResourceID() };
+    }
+
+    template<class ResourceT>
+        requires std::derived_from<ResourceT, Resource>
+    ResourceBindingToken BindUnorderedAccess(const std::shared_ptr<ResourceT>& resource) {
+        if (!resource) throw std::invalid_argument("Cannot bind an empty unordered-access resource");
+        addUnorderedAccess(resource);
+        return { resource->GetSchedulingResourceID(), graph->RequestResourceHandle(resource.get()).GetGlobalResourceID() };
+    }
+
+    template<class ResourceT>
+        requires std::derived_from<ResourceT, Resource>
+    ResourceBindingToken BindIndirectArguments(const std::shared_ptr<ResourceT>& resource) {
+        if (!resource) throw std::invalid_argument("Cannot bind an empty indirect-argument resource");
+        addIndirectArguments(resource);
+        return { resource->GetSchedulingResourceID(), graph->RequestResourceHandle(resource.get()).GetGlobalResourceID() };
+    }
     // Variadic entry points
 
     //First set, callable on Lvalues

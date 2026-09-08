@@ -29,6 +29,10 @@ struct PreparedBackingState {
     uint64_t aliasPoolID = 0;
     uint64_t aliasOffset = 0;
     uint64_t aliasSize = 0;
+    // Immutable realization metadata used to encode legal backend barriers.
+    // D3D12 upload/readback buffers remain in fixed states and must not receive
+    // enhanced buffer transition barriers.
+    rhi::HeapType heapType = rhi::HeapType::DeviceLocal;
 };
 
 struct PreparedBatchBarriers {
@@ -45,6 +49,10 @@ struct PreparedBatchBarriers {
     std::vector<rhi::BufferBarrier> buffers;
     std::vector<PreparedStateRegion> committedStates;
     std::vector<rhi::ResourceHandle> committedResources;
+    // Queue slot that performed each committed state update. Kept parallel to
+    // committedStates/resources so the admission ledger can distinguish a
+    // same-queue memory dependency from a timeline-ordered queue handoff.
+    std::vector<uint32_t> committedQueues;
     std::vector<PreparedBackingState> seeds;
 };
 
@@ -65,6 +73,7 @@ private:
     struct StateGrid {
         CompileResourceShape shape{};
         std::vector<CompileResourceState> cells;
+        std::vector<uint32_t> queues;
     };
     std::unordered_map<uint64_t, StateGrid> m_states;
 };

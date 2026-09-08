@@ -1,4 +1,5 @@
 #include "Render/RenderGraph/ExperimentalExecutionState.h"
+#include "Render/BufferBarrierHelpers.h"
 
 #include <algorithm>
 #include <stdexcept>
@@ -69,6 +70,7 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
             auto& grid = projected[resource];
             grid.shape = captured.shape;
             grid.cells.resize(size_t{grid.shape.mips} * grid.shape.slices);
+            grid.queues.assign(grid.cells.size(), UINT32_MAX);
             for (const auto& region : captured.regions)
                 Visit(grid.shape, region.range, [&](uint32_t mip, uint32_t slice) {
                     grid.cells[CellIndex(grid.shape, mip, slice)] = region.state;
@@ -76,6 +78,8 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
         }
         if (projected[resource].shape != captured.shape)
             throw std::invalid_argument("Backing shape changed without a new backing identity");
+        if (projected[resource].queues.size() != projected[resource].cells.size())
+            projected[resource].queues.assign(projected[resource].cells.size(), UINT32_MAX);
     }
     uint64_t entrySteps = 0, intraBatchSteps = 0, crossQueueSteps = 0;
     for (const auto& step : graph.states.steps) {
@@ -110,7 +114,12 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
             [&](const auto& seed) { return Key(seed.resource) == Key(handle); }))
             output.seeds.push_back(*ordered[step.resource]);
         Visit(grid.shape, step.range, [&](uint32_t mip, uint32_t slice) {
-            auto& before = grid.cells[CellIndex(grid.shape, mip, slice)];
+            const auto cellIndex = CellIndex(grid.shape, mip, slice);
+            auto& before = grid.cells[cellIndex];
+            auto& previousQueue = grid.queues[cellIndex];
+            const auto consumerQueue = graph.batches[step.batch].queue;
+            const bool submittedQueueHandoff = previousQueue != UINT32_MAX
+                && previousQueue != consumerQueue;
             if (grid.shape.hasLayout) {
                 rhi::TextureBarrier barrier{};
                 barrier.texture = handle;
@@ -138,30 +147,46 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
                 }
                 beforePass.textures.push_back(barrier);
             } else {
-                rhi::BufferBarrier barrier{};
-                barrier.buffer = handle;
-                barrier.beforeAccess = (crossQueue || entryCopyQueueAcquire) ? rhi::ResourceAccessType::Common
-                    : static_cast<rhi::ResourceAccessType>(before.access);
-                barrier.afterAccess = static_cast<rhi::ResourceAccessType>(step.after.access);
-                barrier.beforeSync = (crossQueue || entryCopyQueueAcquire) ? rhi::ResourceSyncState::All
-                    : static_cast<rhi::ResourceSyncState>(before.sync);
-                barrier.afterSync = static_cast<rhi::ResourceSyncState>(step.after.sync);
-                barrier.discard = before.access == 0;
-                if (crossQueue) {
-                    auto release = barrier;
-                    release.beforeAccess = static_cast<rhi::ResourceAccessType>(before.access);
-                    release.afterAccess = rhi::ResourceAccessType::Common;
-                    release.beforeSync = static_cast<rhi::ResourceSyncState>(before.sync);
-                    release.afterSync = rhi::ResourceSyncState::All;
-                    release.discard = before.access == 0;
-                    afterProducer->buffers.push_back(release);
-                }
-                beforePass.buffers.push_back(barrier);
+                const auto heapType = ordered[step.resource]->heapType;
+                const bool fixedHeapState = heapType == rhi::HeapType::Upload
+                    || heapType == rhi::HeapType::Readback;
+                const auto beforeAccess = static_cast<rhi::ResourceAccessType>(before.access);
+                const auto beforeSync = static_cast<rhi::ResourceSyncState>(before.sync);
+                const auto afterAccess = static_cast<rhi::ResourceAccessType>(step.after.access);
+                const auto afterSync = static_cast<rhi::ResourceSyncState>(step.after.sync);
+                const bool copyQueueCompatibleBefore = graph.batches[step.batch].queue != 2
+                    || beforeSync == rhi::ResourceSyncState::None
+                    || beforeSync == rhi::ResourceSyncState::Copy;
+                // Buffers have no layout or queue ownership state in D3D12. The
+                // timeline edge orders a cross-queue producer, after which the
+                // consumer can express the actual producer and consumer scopes in
+                // one barrier. Splitting through COMMON manufactures NO_ACCESS
+                // buffer barriers, which are invalid enhanced barriers. Vulkan's
+                // queue-family ownership is represented separately by the explicit
+                // execution timeline/import policy rather than this layout split.
+                // A newly-created buffer has no prior GPU access or layout to
+                // transition. D3D12 enhanced buffer barriers have no discard
+                // operation, and a NONE/NO_ACCESS before scope is not a legal
+                // synchronization barrier. The first access itself establishes
+                // state; subsequent and cross-queue accesses use the common
+                // helper shared with the synchronous recorder.
+                if (!fixedHeapState
+                    && copyQueueCompatibleBefore
+                    && !submittedQueueHandoff
+                    && beforeAccess != rhi::ResourceAccessType::None
+                    && beforeAccess != rhi::ResourceAccessType::Common
+                    && afterAccess != rhi::ResourceAccessType::None
+                    && afterAccess != rhi::ResourceAccessType::Common
+                    && NeedsWholeBufferBarrier(beforeAccess, afterAccess, beforeSync, afterSync))
+                    beforePass.buffers.push_back(MakeWholeBufferBarrier(handle,
+                        beforeAccess, afterAccess, beforeSync, afterSync));
             }
             before = step.after;
+            previousQueue = consumerQueue;
         });
         output.committedResources.push_back(handle);
         output.committedStates.push_back({step.range, step.after});
+        output.committedQueues.push_back(graph.batches[step.batch].queue);
     }
     BT_PLOT("ORG.AsyncExecution.StateBarrierSteps", static_cast<int64_t>(entrySteps));
     BT_PLOT("ORG.AsyncExecution.IntraBatchStateBarrierSteps", static_cast<int64_t>(intraBatchSteps));
@@ -173,7 +198,8 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
 }
 
 void BackingStateAdmissionLedger::CommitBatch(const PreparedBatchBarriers& batch) {
-    if (batch.committedResources.size() != batch.committedStates.size())
+    if (batch.committedResources.size() != batch.committedStates.size()
+        || batch.committedQueues.size() != batch.committedStates.size())
         throw std::invalid_argument("Invalid backing-state commit");
     for (const auto& seed : batch.seeds) {
         const auto key = Key(seed.resource);
@@ -181,6 +207,7 @@ void BackingStateAdmissionLedger::CommitBatch(const PreparedBatchBarriers& batch
         StateGrid grid;
         grid.shape = seed.shape;
         grid.cells.resize(size_t{grid.shape.mips} * grid.shape.slices);
+        grid.queues.assign(grid.cells.size(), UINT32_MAX);
         for (const auto& region : seed.regions)
             Visit(grid.shape, region.range, [&](uint32_t mip, uint32_t slice) {
                 grid.cells[CellIndex(grid.shape, mip, slice)] = region.state;
@@ -194,7 +221,9 @@ void BackingStateAdmissionLedger::CommitBatch(const PreparedBatchBarriers& batch
             throw std::logic_error("Backing state was not seeded before commit");
         const auto& update = batch.committedStates[i];
         Visit(found->second.shape, update.range, [&](uint32_t mip, uint32_t slice) {
-            found->second.cells[CellIndex(found->second.shape, mip, slice)] = update.state;
+            const auto cellIndex = CellIndex(found->second.shape, mip, slice);
+            found->second.cells[cellIndex] = update.state;
+            found->second.queues[cellIndex] = batch.committedQueues[i];
         });
     }
 }
