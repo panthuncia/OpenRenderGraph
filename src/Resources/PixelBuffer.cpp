@@ -285,10 +285,14 @@ void PixelBuffer::Dematerialize() {
 	ClearAPIRepresentations();
     std::scoped_lock lock(m_materializationMutex);
     if (!m_backing) {
-		if (hadAttachedPrimary) ++m_backingGeneration;
+		if (hadAttachedPrimary) {
+			RotateDescriptorSlotsForPublication();
+			++m_backingGeneration;
+		}
         return;
     }
 
+	RotateDescriptorSlotsForPublication();
     m_backing.reset();
     ++m_backingGeneration;
 }

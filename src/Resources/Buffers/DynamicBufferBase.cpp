@@ -559,9 +559,13 @@ void BufferBase::Dematerialize() {
 	const bool hadAttachedPrimary = GetAttachedAPIRepresentation(BackendInstanceId::Primary).IsValid();
 	ClearAPIRepresentations();
     if (!m_dataBuffer) {
-		if (hadAttachedPrimary) ++m_backingGeneration;
+		if (hadAttachedPrimary) {
+			RotateDescriptorSlotsForPublication();
+			++m_backingGeneration;
+		}
         return;
     }
+	RotateDescriptorSlotsForPublication();
     m_dataBuffer.reset();
     ++m_backingGeneration;
 }

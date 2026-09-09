@@ -4,6 +4,7 @@
 #include "Render/DescriptorHeap.h"
 #include "spdlog/spdlog.h"
 #include "Resources/HeapIndexInfo.h"
+#include "Render/BindlessResourceViews.h"
 
 
 // Implemented by DescriptorHeapManager.cpp. Keeping this small bridge here
@@ -184,7 +185,58 @@ public:
 	virtual ~GloballyIndexedResource() {
 		RetireDescriptorSlotsForDeferredRelease(DetachDescriptorSlotsForDeferredRelease());
 	};
+    // Captured by the preparation owner alongside the exact allocation. This
+    // copies ownership, not descriptor contents, and never consults GPU fences.
+    std::shared_ptr<const void> CaptureDescriptorOwnership() const {
+        auto leases = std::make_shared<std::vector<std::shared_ptr<const void>>>();
+        auto captureGrid = [&](const std::shared_ptr<DescriptorHeap>& heap, const auto& grid) {
+            if (!heap) return;
+            for (const auto& slice : grid)
+                for (const auto& info : slice)
+                    if (info.slot.heap.valid())
+                        leases->push_back(heap->CaptureDescriptorLease(info.slot.index));
+        };
+        for (const auto& view : m_SRVViews) captureGrid(view.heap, view.infos);
+        for (const auto& view : m_UAVViews) captureGrid(view.heap, view.infos);
+        captureGrid(m_pUAVShaderVisibleHeap, m_UAVShaderVisibleInfos);
+        captureGrid(m_pUAVNonShaderVisibleHeap, m_UAVNonShaderVisibleInfos);
+        captureGrid(m_pRTVHeap, m_RTVInfos);
+        captureGrid(m_pDSVHeap, m_DSVInfos);
+        if (m_pCBVHeap && m_CBVInfo.slot.heap.valid())
+            leases->push_back(m_pCBVHeap->CaptureDescriptorLease(m_CBVInfo.slot.index));
+        return leases->empty() ? std::shared_ptr<const void>{} : leases;
+    }
+    std::shared_ptr<const BindlessResourceViews> CaptureBindlessViews() const {
+        auto result = std::make_shared<BindlessResourceViews>();
+        TryGetRHIResourceDesc(result->description);
+        result->hasClear = TryGetPublishedClearValue(result->clear);
+        result->defaultSrvVariant = static_cast<uint32_t>(m_primaryViewType);
+        auto append = [&](BindlessViewKind kind, uint32_t variant, const auto& grid) {
+            for (uint32_t slice = 0; slice < grid.size(); ++slice)
+                for (uint32_t mip = 0; mip < grid[slice].size(); ++mip)
+                    if (grid[slice][mip].slot.heap.valid())
+                        result->views.push_back({kind, variant, mip, slice, grid[slice][mip].slot});
+        };
+        for (uint32_t variant = 0; variant < m_SRVViews.size(); ++variant)
+            append(BindlessViewKind::ShaderResource, variant, m_SRVViews[variant].infos);
+        append(BindlessViewKind::UnorderedAccess, UINT32_MAX, m_UAVShaderVisibleInfos);
+        for (uint32_t variant = 0; variant < m_UAVViews.size(); ++variant)
+            append(BindlessViewKind::UnorderedAccess, variant, m_UAVViews[variant].infos);
+        append(BindlessViewKind::NonShaderVisibleUnorderedAccess, UINT32_MAX, m_UAVNonShaderVisibleInfos);
+        append(BindlessViewKind::RenderTarget, UINT32_MAX, m_RTVInfos);
+        append(BindlessViewKind::DepthStencil, UINT32_MAX, m_DSVInfos);
+        if (m_CBVInfo.slot.heap.valid())
+            result->views.push_back({BindlessViewKind::ConstantBuffer, UINT32_MAX, 0, 0, m_CBVInfo.slot});
+        return result->views.empty() ? std::shared_ptr<const BindlessResourceViews>{} : result;
+    }
+    // Begin publication of descriptors for a different concrete allocation.
+    // Future readers will receive fresh physical indices; prior frames keep
+    // the detached slots alive through their captured descriptor leases.
+    void RotateDescriptorSlotsForPublication() {
+        RetireDescriptorSlotsForDeferredRelease(DetachDescriptorSlotsForDeferredRelease());
+    }
 protected:
+	virtual bool TryGetPublishedClearValue(rhi::ClearValue&) const { return false; }
 	virtual void OnSetName() override {}
 
 	std::vector<std::pair<std::shared_ptr<DescriptorHeap>, UINT>> DetachDescriptorSlotsForDeferredRelease() {

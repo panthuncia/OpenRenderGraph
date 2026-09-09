@@ -1846,7 +1846,10 @@ void RenderGraph::SubmitDependencyCompileShadow(rhi::Device device, const std::v
                 capturedAliasPoolID = snapshot.aliasPoolID;
                 capturedAliasOffset = snapshot.aliasOffset;
                 capturedAliasSize = snapshot.aliasSize;
-                frozenResources.push_back({snapshot.resource, snapshot.lease});
+                frozenResources.push_back({snapshot.resource, snapshot.lease,
+                    dynamic_cast<GloballyIndexedResource*>(UnwrapDynamicResource(resource))
+                        ? dynamic_cast<GloballyIndexedResource*>(UnwrapDynamicResource(resource))->CaptureBindlessViews()
+                        : std::shared_ptr<const BindlessResourceViews>{}});
                 input.leases.push_back(std::move(snapshot.lease));
                 basic_telemetry::AddCounter("ORG.AsyncCompile.BackingAllocationLeases");
             } else {
@@ -1862,7 +1865,10 @@ void RenderGraph::SubmitDependencyCompileShadow(rhi::Device device, const std::v
             auto owner = concrete ? concrete->weak_from_this().lock() : std::shared_ptr<Resource>{};
             auto apiResource = concrete ? concrete->GetAPIResource() : rhi::Resource{};
             if (owner && apiResource.GetHandle().valid()) {
-                frozenResources.push_back({apiResource, owner});
+                frozenResources.push_back({apiResource, owner,
+                    dynamic_cast<GloballyIndexedResource*>(concrete)
+                        ? dynamic_cast<GloballyIndexedResource*>(concrete)->CaptureBindlessViews()
+                        : std::shared_ptr<const BindlessResourceViews>{}});
                 input.leases.push_back(owner);
                 const auto handle = apiResource.GetHandle();
                 input.backingGenerations[r] = (uint64_t{handle.generation} << 32) | handle.index;
@@ -1876,6 +1882,21 @@ void RenderGraph::SubmitDependencyCompileShadow(rhi::Device device, const std::v
                         concrete ? typeid(*concrete).name() : "<null>",
                         static_cast<bool>(owner), static_cast<bool>(apiResource));
                 }
+            }
+        }
+        // Keep descriptor slots and the concrete allocation under the same
+        // frozen binding owner. Buffer replacement already rotates slots; its
+        // fence retirement must also respect CPU frames not yet submitted.
+        if (auto* indexed = dynamic_cast<GloballyIndexedResource*>(UnwrapDynamicResource(resource));
+            indexed && !frozenResources.empty() && frozenResources.back().owner) {
+            if (auto descriptors = indexed->CaptureDescriptorOwnership()) {
+                struct VersionOwnership {
+                    std::shared_ptr<const void> allocation, descriptors;
+                };
+                auto& binding = frozenResources.back();
+                binding.owner = std::make_shared<const VersionOwnership>(binding.owner, std::move(descriptors));
+                input.leases.push_back(binding.owner);
+                basic_telemetry::AddCounter("ORG.AsyncCompile.DescriptorOwnershipLeases");
             }
         }
         experimental::PreparedBackingState preparedState;

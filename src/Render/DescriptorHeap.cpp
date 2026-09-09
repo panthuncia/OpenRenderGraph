@@ -1,5 +1,6 @@
 #include "Render/DescriptorHeap.h"
 #include <mutex>
+#include <algorithm>
 
 
 namespace org {
@@ -24,31 +25,53 @@ rhi::DescriptorHeap DescriptorHeap::GetHeap() {
 
 UINT DescriptorHeap::AllocateDescriptor() {
     std::lock_guard lock(m_allocationMutex);
+    // Reclaim CPU-retained retirements only when another free slot is needed.
+    // No GPU polling or second retirement queue is introduced here: callers
+    // request ReleaseDescriptor only after their fence requirements are met.
+    if (m_freeIndices.empty()) {
+        std::erase_if(m_retainedRetiredIndices, [&](UINT index) {
+            if (!m_slots[index].lease.expired()) return false;
+            m_freeIndices.push(index);
+            return true;
+        });
+    }
+    UINT index;
     if (!m_freeIndices.empty()) {
-        UINT freeIndex = m_freeIndices.front();
+        index = m_freeIndices.front();
         m_freeIndices.pop();
-        return freeIndex;
+    } else if (m_numDescriptorsAllocated < m_totalSize) {
+        index = m_numDescriptorsAllocated++;
+        m_slots.emplace_back();
+    } else {
+        throw std::runtime_error("Out of descriptor heap space (including retained frame slots)");
     }
-    else if (m_numDescriptorsAllocated < m_totalSize) {
-        return m_numDescriptorsAllocated++;
-    }
-    throw std::runtime_error("Out of descriptor heap space!");
+    m_slots[index].allocated = true;
+    return index;
+}
+
+std::shared_ptr<const void> DescriptorHeap::CaptureDescriptorLease(UINT index) {
+    std::lock_guard lock(m_allocationMutex);
+    if (index >= m_slots.size() || !m_slots[index].allocated)
+        throw std::logic_error("Cannot capture an unallocated or retired descriptor slot");
+    auto& slot = m_slots[index];
+    if (auto existing = slot.lease.lock()) return existing;
+    // A distinct control block per slot; aliasing the heap's control block
+    // would make the lease live for the entire heap lifetime.
+    auto lease = std::make_shared<std::shared_ptr<DescriptorHeap>>(shared_from_this());
+    slot.lease = lease;
+    return lease;
 }
 
 void DescriptorHeap::ReleaseDescriptor(UINT index) {
     std::lock_guard lock(m_allocationMutex);
-//#if BUILD_TYPE == BUILD_TYPE_DEBUG
-//    if (index == 0) {
-//		spdlog::error("DescriptorHeap::ReleaseDescriptor: Attempting to release descriptor 0");
-//    }
-//    int32_t signedValue = static_cast<int32_t>(index);
-//	// Disable signed/unsigned comparison warning for this line
-//#pragma warning(suppress : 4018)
-//	assert(signedValue >= 0 && signedValue < m_totalSize); // If this trggers, a descriptor is likely set but uninitialized
-//#pragma warning(default : 4018)
-//#endif
-    m_freeIndices.push(index);
+    if (index >= m_slots.size() || !m_slots[index].allocated)
+        throw std::logic_error("Descriptor slot released more than once or out of range");
+    auto& slot = m_slots[index];
+    slot.allocated = false;
+    if (slot.lease.expired()) m_freeIndices.push(index);
+    else m_retainedRetiredIndices.push_back(index);
 }
+
 
 
 } // namespace org

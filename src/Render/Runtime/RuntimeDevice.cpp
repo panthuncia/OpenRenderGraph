@@ -2,6 +2,7 @@
 
 #include "Managers/Singletons/DeviceManager.h"
 #include "Managers/Singletons/DescriptorHeapManager.h"
+#include "Managers/Singletons/DeletionManager.h"
 #include "Managers/Singletons/ECSManager.h"
 #include "Resources/TrackedAllocation.h"
 #include "Resources/MemoryStatisticsComponents.h"
@@ -48,7 +49,13 @@ void InitializeRuntimeDevice(rhi::Device device)
 
 void ShutdownRuntimeDevice() noexcept
 {
+	// Callers have joined CPU work and completed GPU work before shutdown.
+	// Deferred allocations must be destroyed while their allocator is alive;
+	// releasing descriptor owners can enqueue another wave of backing releases.
+	DeletionManager::GetInstance().DrainAll();
 	DescriptorHeapManager::GetInstance().Cleanup();
+	DeletionManager::GetInstance().DrainAll();
+	DeletionManager::GetInstance().Cleanup();
 	DeviceManager::GetInstance().Cleanup();
 	TrackedEntityToken::ResetHooks();
 }

@@ -28,10 +28,67 @@ int TestProgramVersions(rhi::Device device);
 int TestReadbackCaptures(rhi::Device device);
 
 namespace {
+struct RecordingStatisticsProbe final : org::runtime::IStatisticsService {
+    unsigned begins = 0, ends = 0, resolves = 0, merges = 0, cpuSamples = 0;
+    void Initialize() override {}
+    void BeginFrame() override {}
+    void ClearAll() override {}
+    unsigned RegisterPass(const std::string&, bool, std::string_view) override { return 0; }
+    void RegisterQueue(rhi::QueueKind) override {}
+    void SetupQueryHeap() override {}
+    void BeginQuery(unsigned, unsigned, rhi::Queue&, rhi::CommandList&) override { throw std::logic_error("Shared query recording"); }
+    void EndQuery(unsigned, unsigned, rhi::Queue&, rhi::CommandList&) override { throw std::logic_error("Shared query recording"); }
+    void ResolveQueries(unsigned, rhi::Queue&, rhi::CommandList&) override { throw std::logic_error("Shared query recording"); }
+    void OnFrameComplete(unsigned, rhi::Queue&) override {}
+    void RecordCpuUpdateTime(unsigned, double) override {}
+    void RecordCpuExecuteTime(unsigned, double milliseconds) override {
+        if (milliseconds < 0) throw std::logic_error("Negative CPU timing");
+        ++cpuSamples;
+    }
+    void BeginQuery(unsigned, unsigned, rhi::Queue&, rhi::CommandList&, org::runtime::QueryRecordingContext&) override { ++begins; }
+    void EndQuery(unsigned, unsigned, rhi::Queue&, rhi::CommandList&, org::runtime::QueryRecordingContext&) override { ++ends; }
+    void ResolveQueries(unsigned, rhi::Queue&, rhi::CommandList&, org::runtime::QueryRecordingContext&) override { ++resolves; }
+    void MergePendingResolves(rhi::QueueKind, unsigned, org::runtime::QueryRecordingContext&) override { ++merges; }
+    const std::vector<std::string>& GetPassNames() const override { return names; }
+    const std::vector<std::string>& GetPassTechniquePaths() const override { return names; }
+    const std::vector<org::runtime::PassStats>& GetPassStats() const override { return stats; }
+    const std::vector<org::runtime::MeshPipelineStats>& GetMeshStats() const override { return mesh; }
+    org::runtime::MemoryBudgetStats GetMemoryBudgetStats() const override { return {}; }
+    const std::vector<bool>& GetIsGeometryPassVector() const override { return geometry; }
+    const std::vector<unsigned>& GetVisiblePassIndices(uint64_t) const override { return visible; }
+    std::vector<std::string> names;
+    std::vector<org::runtime::PassStats> stats;
+    std::vector<org::runtime::MeshPipelineStats> mesh;
+    std::vector<bool> geometry;
+    std::vector<unsigned> visible;
+};
 struct DirectRecordingPass : org::TypedRenderGraphPass<DirectRecordingPass> {
     inline static unsigned recordings = 0;
     void Declare(org::PassBuilder&) {}
     static void Record(org::PassRecordContext&) { ++recordings; }
+};
+struct DeclaredTestBindings { org::ResourceBindingToken resource; };
+struct DeclaredRecordingPass : org::TypedRenderGraphPass<DeclaredRecordingPass,
+    org::EmptyPassFrameData, DeclaredTestBindings> {
+    inline static rhi::ResourceHandle observed{};
+    uint64_t selected = 41;
+    DeclaredTestBindings Declare(org::PassBuilder&) { return {{selected, 0}}; }
+    static void Record(const DeclaredTestBindings& bindings, org::PassRecordContext& context) {
+        observed = context.Resolve(bindings.resource).GetHandle();
+    }
+};
+struct DeclaredPreparedPass : org::TypedRenderGraphPass<DeclaredPreparedPass,
+    uint64_t, DeclaredTestBindings> {
+    inline static uint64_t observedFrame = 0;
+    DeclaredTestBindings Declare(org::PassBuilder&) { return {{41, 0}}; }
+    uint64_t Prepare(const DeclaredTestBindings&, const org::PassPrepareContext& context) const {
+        return context.frameNumber;
+    }
+    static void Record(const DeclaredTestBindings& bindings, const uint64_t& frame,
+        org::PassRecordContext& context) {
+        (void)context.Resolve(bindings.resource);
+        observedFrame = frame;
+    }
 };
 
 struct TypedLifecycleCounts { int recorded = 0, submitted = 0, completed = 0, abandoned = 0; };
@@ -457,6 +514,51 @@ int TestPreparedGpuSubmission(rhi::Device device, ID3D12Device* nativeDevice) {
         try { recording.Resolve(org::PreparedResourceReference{2}); }
         catch (const std::out_of_range&) { invalidSlotRejected = true; }
         CHECK(invalidSlotRejected);
+        org::PreparedPass declaredPacket;
+        {
+            DeclaredRecordingPass pass;
+            org::RenderGraph declarationGraph(device, rhi::Backend::D3D12);
+            auto& declaration = declarationGraph.BuildRenderPass<DeclaredRecordingPass>("Declared binding lifetime");
+            pass.DeclareUnified(declaration);
+            auto permissions = std::make_shared<std::unordered_map<uint64_t, uint32_t>>();
+            permissions->emplace(41, 0);
+            org::FramePreparationContext preparation{};
+            preparation.bindings = bindings;
+            preparation.resourceSlots = permissions;
+            preparation.frameNumber = iteration;
+            declaredPacket = pass.PrepareFrame(preparation);
+            DeclaredPreparedPass preparedAuthor;
+            preparedAuthor.DeclareUnified(declaration);
+            auto withData = preparedAuthor.PrepareFrame(preparation);
+            preparation.frameNumber = iteration + 100;
+            withData.Record(recording);
+            CHECK(DeclaredPreparedPass::observedFrame == iteration);
+            withData.CommitSubmitted();
+            withData.CommitCompleted();
+            // Both a graph-generation declaration refresh and mutation of the
+            // original permission map must leave the queued packet untouched.
+            pass.selected = 42;
+            pass.DeclareUnified(declaration);
+            permissions->at(41) = 99;
+            bool invalidDeclarationRejected = false;
+            try { (void)pass.PrepareFrame(preparation); }
+            catch (const std::out_of_range&) { invalidDeclarationRejected = true; }
+            CHECK(invalidDeclarationRejected);
+        }
+        auto replacementBindings = std::make_shared<const org::FrozenExecutionBindings>(
+            std::vector<org::FrozenExecutionBindings::ResourceBinding>{
+                {lease->resources[1], lease->allocations[1]},
+                {lease->resources[0], lease->allocations[0]}});
+        org::RecordingContext newerRecording(list, replacementBindings);
+        declaredPacket.Record(newerRecording);
+        CHECK(rhi::HandleEqual<rhi::ResourceHandle>{}(
+            DeclaredRecordingPass::observed, lease->resources[0].GetHandle()));
+        declaredPacket.CommitSubmitted();
+        declaredPacket.CommitCompleted();
+        bool unscopedTokenRejected = false;
+        try { recording.Resolve(org::ResourceBindingToken{41, 0}); }
+        catch (const std::logic_error&) { unscopedTokenRejected = true; }
+        CHECK(unscopedTokenRejected);
         auto lifecycle = std::make_shared<TypedLifecycleCounts>();
         org::PreparedPass directPacket;
         {
@@ -837,6 +939,11 @@ int TestOwnedDescriptorGpuExecution(const rhi::DeviceCreateInfo& create) {
                 context.Commands().CopyBufferRegion(context.Resolve(org::PreparedResourceReference{1}).GetHandle(),0,source.GetHandle(),0,4096);
             }));
         recordings[0].barriersBeforePass = barrierPlan.batches[0].beforePass;
+        auto timingProbe = std::make_shared<RecordingStatisticsProbe>();
+        auto timing = std::make_shared<OwnedRecordingStatistics>();
+        timing->service = timingProbe;
+        timing->passIndices = {0, 1};
+        recordings[0].statistics = timing;
         auto recordingJob = std::async(std::launch::async,
             [recordings = std::move(recordings), runtime, bundle, device, commandPool]() mutable {
                 auto layout = std::make_shared<GraphExecutionLayout>(); layout->bundle = bundle;
@@ -852,9 +959,13 @@ int TestOwnedDescriptorGpuExecution(const rhi::DeviceCreateInfo& create) {
                 return RecordFrame(std::move(plan), {}, 1);
             });
         std::optional<RecordedFrame> recorded(recordingJob.get());
+        CHECK(timingProbe->begins == 2 && timingProbe->ends == 2 && timingProbe->resolves == 1);
+        CHECK(timingProbe->cpuSamples == 0 && timingProbe->merges == 0);
         std::weak_ptr<const org::FrozenExecutionBindings> bindingLease = bindings;
         gpu.reset(); cpu.reset(); backing.reset(); bindings.reset();
         auto execution = std::move(*recorded).Submit(admission);
+        timing->Publish();
+        CHECK(timingProbe->cpuSamples == 2 && timingProbe->merges == 1);
         bool duplicateRejected = false;
         try { std::move(*recorded).Submit(admission); }
         catch (const std::logic_error&) { duplicateRejected = true; }
@@ -968,8 +1079,38 @@ int main() {
     if (const auto failure = TestAliasHeapOwnership(create)) return failure;
 	rhi::DevicePtr device; CHECK(!rhi::Failed(rhi::CreateD3D12Device(create, device)) && device);
 	auto* nativeDevice = rhi::dx12::get_device(device.Get()); CHECK(nativeDevice);
-	if (const auto failure = TestPreparedGpuSubmission(device.Get(), nativeDevice)) return failure;
 	org::runtime::InitializeRuntimeDevice(device.Get());
+
+    {
+        auto api = device.Get();
+        auto heap = std::make_shared<org::DescriptorHeap>(api,
+            rhi::DescriptorHeapType::CbvSrvUav, 2, true, "Queued descriptor ownership test");
+        const auto first = heap->AllocateDescriptor();
+        auto frame = heap->CaptureDescriptorLease(first);
+        auto secondFrame = heap->CaptureDescriptorLease(first);
+        CHECK(frame == secondFrame);
+        // The old submitted fences can complete while an accepted CPU frame
+        // still references the slot. It must not become available for reuse.
+        heap->ReleaseDescriptor(first);
+        const auto replacement = heap->AllocateDescriptor();
+        CHECK(replacement != first);
+        bool exhausted = false;
+        try { (void)heap->AllocateDescriptor(); } catch (const std::runtime_error&) { exhausted = true; }
+        CHECK(exhausted);
+        frame.reset();
+        CHECK(!std::weak_ptr<const void>(secondFrame).expired());
+        secondFrame.reset();
+        CHECK(heap->AllocateDescriptor() == first);
+        heap->ReleaseDescriptor(first);
+        heap->ReleaseDescriptor(replacement);
+        for (unsigned i = 0; i < 128; ++i) {
+            const auto slot = heap->AllocateDescriptor();
+            auto queued = heap->CaptureDescriptorLease(slot);
+            heap->ReleaseDescriptor(slot);
+            queued.reset();
+        }
+    }
+	if (const auto failure = TestPreparedGpuSubmission(device.Get(), nativeDevice)) return failure;
 	if (const auto failure = TestEmptyResolverDeclarations(device.Get())) return failure;
 
 	auto bufferA = MakeResource(nativeDevice, false, 4096), bufferB = MakeResource(nativeDevice, false, 4096);
@@ -1031,7 +1172,17 @@ int main() {
 	CHECK(!rhi::Failed(rhi::dx12::import_resource(device.Get(), textureA.Get(), textureImportA)));
 	CHECK(!rhi::Failed(rhi::dx12::import_resource(device.Get(), textureB.Get(), textureImportB)));
 	auto texture = org::ExternalTextureResource::CreateShared(std::move(textureImportA), description, false);
-	CHECK(texture && texture->RefreshShared(std::move(textureImportB), description, false));
+	CHECK(texture);
+	const auto oldTextureIndex = texture->GetSRVInfo(0).slot.index;
+	auto oldTextureViews = texture->CaptureBindlessViews();
+	auto oldTextureDescriptors = texture->CaptureDescriptorOwnership();
+	CHECK(oldTextureDescriptors && texture->RefreshShared(std::move(textureImportB), description, false));
+	CHECK(texture->GetSRVInfo(0).slot.index != oldTextureIndex);
+	CHECK(oldTextureViews && oldTextureViews->Resolve({org::BindlessViewKind::ShaderResource}).index == oldTextureIndex);
+	auto newTextureViews = texture->CaptureBindlessViews();
+	CHECK(newTextureViews && newTextureViews->Resolve({org::BindlessViewKind::ShaderResource}).index
+		== texture->GetSRVInfo(0).slot.index);
+	CHECK(newTextureViews->description.texture.width == 64 && newTextureViews->description.texture.height == 64);
 	auto changed = description; changed.imageDimensions[0].width = 32;
 	rhi::ResourcePtr incompatible; CHECK(!rhi::Failed(rhi::dx12::import_resource(device.Get(), textureA.Get(), incompatible)));
 	CHECK(!texture->RefreshShared(std::move(incompatible), changed, false));

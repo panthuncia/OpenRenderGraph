@@ -14,6 +14,7 @@
 #include "RenderPasses/Base/PassReturn.h"
 #include "Render/ExternalBindings.h"
 #include "Render/PipelineState.h"
+#include "Render/BindlessResourceViews.h"
 
 namespace org {
 
@@ -205,7 +206,11 @@ private:
 // concrete version owners, not shared pointers to mutable resource wrappers.
 class FrozenExecutionBindings {
 public:
-    struct ResourceBinding { rhi::Resource resource; std::shared_ptr<const void> owner; };
+    struct ResourceBinding {
+        rhi::Resource resource;
+        std::shared_ptr<const void> owner;
+        std::shared_ptr<const BindlessResourceViews> views;
+    };
     struct DescriptorBinding { rhi::DescriptorSlot descriptor; std::shared_ptr<const void> owner; };
     FrozenExecutionBindings(std::vector<ResourceBinding> resources,
         std::vector<DescriptorBinding> descriptors = {})
@@ -219,6 +224,11 @@ public:
     rhi::Resource Resolve(PreparedResourceReference ref) const { return m_resources.at(ref.slot).resource; }
     std::shared_ptr<const void> Owner(PreparedResourceReference ref) const {
         return m_resources.at(ref.slot).owner;
+    }
+    const BindlessResourceViews& Views(PreparedResourceReference ref) const {
+        const auto& views = m_resources.at(ref.slot).views;
+        if (!views) throw std::out_of_range("Resource has no captured bindless views");
+        return *views;
     }
     rhi::DescriptorSlot Resolve(PreparedDescriptorReference ref) const { return m_descriptors.at(ref.slot).descriptor; }
     const std::vector<ResourceBinding>& Resources() const { return m_resources; }
@@ -366,6 +376,36 @@ struct FramePreparationContext {
         return dependencyCollector->CaptureDescriptor(descriptor, bindings->Owner(resource));
     }
 
+    rhi::DescriptorSlot ResolveView(ResourceBindingToken binding, BindlessViewRequest request) const {
+        if (!bindings) throw std::logic_error("Frozen resource bindings are unavailable during preparation");
+        return bindings->Views(CaptureResource(binding)).Resolve(request);
+    }
+
+    PreparedDescriptorReference CaptureView(ResourceBindingToken binding, BindlessViewRequest request) const {
+        if (!dependencyCollector || !bindings)
+            throw std::logic_error("View capture is unavailable outside typed preparation");
+        const auto resource = CaptureResource(binding);
+        return dependencyCollector->CaptureDescriptor(bindings->Views(resource).Resolve(request),
+            bindings->Owner(resource));
+    }
+
+    const rhi::ResourceDesc& Describe(ResourceBindingToken binding) const {
+        if (!bindings) throw std::logic_error("Frozen resource bindings are unavailable during preparation");
+        return bindings->Views(CaptureResource(binding)).description;
+    }
+
+    rhi::ClearValue ClearValue(ResourceBindingToken binding) const {
+        if (!bindings) throw std::logic_error("Frozen resource bindings are unavailable during preparation");
+        const auto& views = bindings->Views(CaptureResource(binding));
+        if (!views.hasClear) throw std::out_of_range("Resource has no captured clear value");
+        return views.clear;
+    }
+
+    uint32_t ViewSliceCount(ResourceBindingToken binding, BindlessViewRequest request) const {
+        if (!bindings) throw std::logic_error("Frozen resource bindings are unavailable during preparation");
+        return bindings->Views(CaptureResource(binding)).SliceCount(request);
+    }
+
     rhi::Resource ResolveCapturedResource(PreparedResourceReference reference) const {
         if (!bindings) throw std::logic_error("Frozen resource bindings are unavailable during preparation");
         return bindings->Resolve(reference);
@@ -411,6 +451,28 @@ public:
     }
     rhi::CommandList& Commands() { return m_commands; }
     rhi::Resource Resolve(PreparedResourceReference ref) const { return m_bindings->Resolve(ref); }
+    rhi::Resource Resolve(ResourceBindingToken token) const {
+        if (!m_declaredResourceSlots)
+            throw std::logic_error("Declaration tokens require a declared recording scope");
+        auto found = m_declaredResourceSlots->find(token.globalResourceID);
+        if (found == m_declaredResourceSlots->end())
+            found = m_declaredResourceSlots->find(token.registryResourceID);
+        if (found == m_declaredResourceSlots->end())
+            throw std::invalid_argument("Recording attempted to resolve an undeclared resource");
+        return m_bindings->Resolve(PreparedResourceReference{found->second});
+    }
+    // The framework creates a pass-local copy of the recording context. Its
+    // permissions and concrete allocation table travel with the prepared frame;
+    // declaration tokens never consult the current graph or a resource wrapper.
+    RecordingContext WithDeclaredResources(
+        std::shared_ptr<const FrozenExecutionBindings> bindings,
+        std::shared_ptr<const std::unordered_map<uint64_t, uint32_t>> slots) const {
+        if (!bindings || !slots) throw std::invalid_argument("Incomplete declared recording scope");
+        auto result = *this;
+        result.m_bindings = std::move(bindings);
+        result.m_declaredResourceSlots = std::move(slots);
+        return result;
+    }
     rhi::DescriptorSlot Resolve(PreparedDescriptorReference ref) const {
         if (m_dependencies && ref.slot < m_dependencies->DescriptorCount())
             return m_dependencies->Resolve(ref);
@@ -446,6 +508,7 @@ private:
     std::shared_ptr<const FrozenExecutionBindings> m_bindings;
     std::shared_ptr<const std::vector<ExternalDescriptorBindingValue>> m_externalBindings;
     std::shared_ptr<const PreparedDependencySnapshot> m_dependencies;
+    std::shared_ptr<const std::unordered_map<uint64_t, uint32_t>> m_declaredResourceSlots;
 };
 
 // One owned packet per submitted frame. Copies share the single-consumption

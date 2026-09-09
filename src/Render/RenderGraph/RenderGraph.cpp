@@ -6859,6 +6859,8 @@ void RenderGraph::MaterializeMultiBackendRepresentations() {
 		std::vector<Resource::PendingAPIRepresentation> representations;
 		representations.push_back({ d3d12->id, std::move(d3Resource), d3dInitial });
 		representations.push_back({ vulkan->id, std::move(vkResource), vulkanInitial });
+		if (auto* indexed = dynamic_cast<GloballyIndexedResource*>(resource))
+			indexed->RotateDescriptorSlotsForPublication();
 		if (!resource->PublishAPIRepresentations(std::move(representations)))
 			throw std::runtime_error("Failed to publish multi-RHI representations for '" + resource->GetName() + "'");
 		if (placedOnSharedHeap) {
@@ -9451,6 +9453,12 @@ bool RenderGraph::TryExecuteSelectedAsyncFrame(PassExecutionContext& context) {
     }
 
     auto recordingPlan = experimental::BuildPreparedBatchRecordings(*frame);
+    std::unordered_map<std::string_view, unsigned> statisticsIndices;
+    if (m_statisticsService) {
+        const auto& names = m_statisticsService->GetPassNames();
+        for (unsigned i = 0; i < names.size(); ++i) statisticsIndices.emplace(names[i], i);
+    }
+    std::vector<std::shared_ptr<experimental::OwnedRecordingStatistics>> recordingStatistics;
     std::vector<experimental::FrameRecordingJob> recordingJobs(recordingPlan.size());
     const auto defaultResourceHeap = context.GetResourceDescriptorHeap().GetHandle();
     const auto defaultSamplerHeap = context.GetSamplerDescriptorHeap().GetHandle();
@@ -9488,6 +9496,20 @@ bool RenderGraph::TryExecuteSelectedAsyncFrame(PassExecutionContext& context) {
         recording.barriersBeforePass = frame->barrierPlan->batches[batch].beforePass;
         recording.barriersAfterPass = frame->barrierPlan->batches[batch].afterPass;
         recording.passes = std::move(recordingPlan[batch].passes);
+        if (m_statisticsService) {
+            auto statistics = std::make_shared<experimental::OwnedRecordingStatistics>();
+            statistics->service = m_statisticsService;
+            statistics->frameIndex = context.frameIndex;
+            statistics->queueKind = rhiKind;
+            statistics->gpuQueries = queueKind != QueueKind::Copy
+                && m_queueRegistry.GetBackendInstance(index) == BackendInstanceId::Primary;
+            for (const auto& pass : recording.passes) {
+                const auto found = statisticsIndices.find(pass.DebugName());
+                statistics->passIndices.push_back(found == statisticsIndices.end() ? -1 : static_cast<int>(found->second));
+            }
+            recording.statistics = statistics;
+            recordingStatistics.push_back(std::move(statistics));
+        }
     }
     // Typed packets are owned and worker-safe by construction. Hand-authored
     // and legacy packets remain serial unless explicitly migrated through the
@@ -9544,6 +9566,7 @@ bool RenderGraph::TryExecuteSelectedAsyncFrame(PassExecutionContext& context) {
     try {
         auto execution = std::move(*recorded).Submit(*m_compilerState->asyncTimelineAdmission);
         m_compilerState->framePlanner->Confirm(planning, *execution);
+        for (const auto& statistics : recordingStatistics) statistics->Publish();
         for (const auto& signal : execution->batches) {
             const auto slot = graph.batches[&signal - execution->batches.data()].queue;
             m_queueRegistry.EnsureNextFenceValueAtLeast(

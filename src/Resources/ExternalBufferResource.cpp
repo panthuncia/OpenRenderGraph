@@ -39,12 +39,13 @@ bool ExternalBufferResource::RefreshShared(
 		memcmp(&views.uavDesc, &m_views.uavDesc, sizeof(views.uavDesc)) != 0 ||
 		views.uavCounterOffset != m_views.uavCounterOffset) return false;
 	auto previous = std::move(m_resource);
+	RotateDescriptorSlotsForPublication();
 	m_resource = std::move(resource);
 	m_stateTracker = SymbolicTracker{};
 	runtime::DescriptorViewRequirements requirements{};
 	requirements.views = m_views;
 	auto apiResource = m_resource.Get();
-	DescriptorHeapManager::GetInstance().UpdateDescriptorContents(*this, apiResource, requirements);
+	DescriptorHeapManager::GetInstance().AssignDescriptorSlots(*this, apiResource, requirements);
 	DescriptorHeapManager::GetInstance().RetireNativeResource(std::move(previous));
 	return true;
 }

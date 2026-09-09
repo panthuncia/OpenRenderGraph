@@ -49,6 +49,31 @@ int TestFrameRetirement(rhi::Device device) {
     retirement.ProcessDeferredReleases(0);
     CHECK(weak.expired() && retirement.GetDeferredReleaseStats().releaseCount == 0);
 
+    {
+        auto heap = std::make_shared<org::DescriptorHeap>(device,
+            rhi::DescriptorHeapType::CbvSrvUav, 1, true, "Retained bindless slot");
+        const auto slot = heap->AllocateDescriptor();
+        auto queuedFrame = heap->CaptureDescriptorLease(slot);
+        retirement.RetireDescriptorSlots({{heap, slot}});
+        retirement.ProcessDeferredReleases(0);
+        auto unavailable = [&] {
+            try { (void)heap->AllocateDescriptor(); }
+            catch (const std::runtime_error&) { return true; }
+            return false;
+        };
+        CHECK(unavailable()); // No frame submission fence exists yet.
+        retirement.RetireExecutionLease(std::move(queuedFrame), {{required.Get(), 9}});
+        CHECK(queue.Signal({unrelated.Get().GetHandle(), 101}) == rhi::Result::Ok);
+        CHECK(unrelated.Get().HostWait(101, 10000) == rhi::Result::Ok);
+        retirement.ProcessDeferredReleases(0);
+        CHECK(unavailable());
+        CHECK(queue.Signal({required.Get().GetHandle(), 9}) == rhi::Result::Ok);
+        CHECK(required.Get().HostWait(9, 10000) == rhi::Result::Ok);
+        retirement.ProcessDeferredReleases(0);
+        CHECK(heap->AllocateDescriptor() == slot);
+        heap->ReleaseDescriptor(slot);
+    }
+
     // Owners may release further owners, which in turn retire descriptors or
     // backings. Cleanup must drain all waves while its arenas are still alive.
     auto destroyed = std::make_shared<int>(0);

@@ -899,11 +899,37 @@ public:
         return { resource->GetSchedulingResourceID(), graph->RequestResourceHandle(resource.get()).GetGlobalResourceID() };
     }
 
+    ResourceBindingToken BindShaderResource(const ResourceIdentifierAndRange& resource) {
+        addShaderResource(resource);
+        const auto handle = graph->RequestResourceHandle(resource.identifier);
+        return {handle.GetGlobalResourceID(), handle.GetGlobalResourceID()};
+    }
+
+    ResourceBindingToken BindUnorderedAccessClear(const ResourceIdentifier& identifier) {
+        addUnorderedAccessClear(identifier);
+        const auto handle = graph->RequestResourceHandle(identifier);
+        return {handle.GetGlobalResourceID(), handle.GetGlobalResourceID()};
+    }
+
+    ResourceBindingToken BindDepthStencilClear(const ResourceIdentifier& identifier) {
+        addDepthStencilClear(identifier);
+        const auto handle = graph->RequestResourceHandle(identifier);
+        return {handle.GetGlobalResourceID(), handle.GetGlobalResourceID()};
+    }
+
     template<class ResourceT>
         requires std::derived_from<ResourceT, Resource>
     ResourceBindingToken BindUnorderedAccess(const std::shared_ptr<ResourceT>& resource) {
         if (!resource) throw std::invalid_argument("Cannot bind an empty unordered-access resource");
         addUnorderedAccess(resource);
+        return { resource->GetSchedulingResourceID(), graph->RequestResourceHandle(resource.get()).GetGlobalResourceID() };
+    }
+
+    template<class ResourceT>
+        requires std::derived_from<ResourceT, Resource>
+    ResourceBindingToken BindUnorderedAccessClear(const std::shared_ptr<ResourceT>& resource) {
+        if (!resource) throw std::invalid_argument("Cannot bind an empty unordered-access clear resource");
+        addUnorderedAccessClear(resource);
         return { resource->GetSchedulingResourceID(), graph->RequestResourceHandle(resource.get()).GetGlobalResourceID() };
     }
 
@@ -917,15 +943,37 @@ public:
 
     template<class ResourceT>
         requires std::derived_from<ResourceT, Resource>
+    ResourceBindingToken BindDepthReadWrite(const std::shared_ptr<ResourceT>& resource) {
+        if (!resource) throw std::invalid_argument("Cannot bind an empty depth resource");
+        addDepthReadWrite(resource);
+        return { resource->GetSchedulingResourceID(), graph->RequestResourceHandle(resource.get()).GetGlobalResourceID() };
+    }
+
+    template<class ResourceT>
+        requires std::derived_from<ResourceT, Resource>
     ResourceBindingToken BindRenderTarget(const std::shared_ptr<ResourceT>& resource) {
         if (!resource) throw std::invalid_argument("Cannot bind an empty render target");
         addRenderTarget(resource);
         return { resource->GetSchedulingResourceID(), graph->RequestResourceHandle(resource.get()).GetGlobalResourceID() };
     }
 
+    template<class ResourceT>
+        requires std::derived_from<ResourceT, Resource>
+    ResourceBindingToken BindRenderTargetClear(const std::shared_ptr<ResourceT>& resource) {
+        if (!resource) throw std::invalid_argument("Cannot bind an empty render-target clear resource");
+        addRenderTargetClear(resource);
+        return { resource->GetSchedulingResourceID(), graph->RequestResourceHandle(resource.get()).GetGlobalResourceID() };
+    }
+
     ResourceBindingToken BindRenderTarget(const ResourceIdentifier& identifier) {
         addRenderTarget(identifier);
         const auto handle = graph->RequestResourceHandle(identifier);
+        return {handle.GetGlobalResourceID(), handle.GetGlobalResourceID()};
+    }
+
+    ResourceBindingToken BindRenderTarget(const ResourceIdentifierAndRange& resource) {
+        addRenderTarget(resource);
+        const auto handle = graph->RequestResourceHandle(resource.identifier);
         return {handle.GetGlobalResourceID(), handle.GetGlobalResourceID()};
     }
 

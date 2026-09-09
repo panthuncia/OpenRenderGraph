@@ -27,6 +27,65 @@ not establish visual parity and must not serve as valid performance baselines.
 
 ## Framework follow-up audit
 
+### Returned declaration bindings (September 9, 2026)
+
+The first descriptor-free integration uses
+`TypedRenderGraphPass<Pass, EmptyPassFrameData, Bindings>`. `Declare` returns a
+bindings value and static `Record` receives that value and its recording context.
+The framework copies bindings and resolved resource permissions into each
+prepared packet and retains its concrete allocation table. Recording resolves
+tokens against that frame, without re-entering the pass or resource registry.
+`ReyesCopyCounterPass` uses this path and no longer authors preparation or manual
+resource captures. Passes with workload data can provide const
+`Prepare(const Bindings&, const PassPrepareContext&)` and static
+`Record(const Bindings&, const FrameData&, PassRecordContext&)`.
+
+This is an incremental interface, not completion of unified binding migration:
+tokens still carry resource identities, declarations are still refreshed through
+the existing graph-generation machinery, and immutable `FrameInputs`, view
+tokens, program declarations and production descriptor snapshots remain pending.
+The old typed signature remains available while those paths migrate.
+
+Descriptor integration must publish an allocation lease with each view recipe.
+It must not acquire that lease by calling back into `PixelBuffer` from the
+descriptor manager: materialization already holds the texture's backing mutex
+when it updates descriptors. Attached backend representations must supply their
+own leases rather than the replaced primary backing. BloomBlend migration must
+wait for these real frozen-view bindings, rather than wrapping its current live
+descriptor indices in a new struct.
+
+Validation artifacts are under `build/async-frame-validation/unified-declarations`.
+Root build/install and six selected CTest suites pass. The new test also exposed
+runtime shutdown releasing the allocator before the legacy deletion queue;
+`ShutdownRuntimeDevice` now drains deferred ownership before allocator cleanup,
+including releases enqueued by descriptor cleanup. The native debugger verified
+that the original failure occurred after all test assertions passed.
+
+Off/radius-1/run1 and Async/radius-1/run1/run2 have fresh stable reports, verified
+executable identity, loaded PIX capture injection, no renderer errors, no dropped
+telemetry, and clean retirement. Readbacks show full terrain/mesh coverage. Menu
+glyph appearance is excluded from this investigation at the user's request.
+These runs do not establish final acceptance or a performance baseline. No
+recording-ahead scheduling or default-mode change is included in this slice.
+
+### Pass timing feedback restored
+
+The owned executor bypassed the old executor's CPU timing and GPU query calls,
+so registered passes remained invisible to the timing window. Native inspection
+confirmed statistics collection was enabled. Owned recording now uses captured
+statistics indices and per-job query contexts; successful FIFO submission merges
+query ranges and publishes CPU recording durations on the owner thread. Failed
+recording and failed submission do not publish those samples. GPU queries are
+limited to supported primary-device graphics/compute queues; other queues still
+publish CPU timings.
+
+`ExternalResourceTests` checks query pairing and deferred publication. The
+Async radius-1 capture under `build/async-frame-validation/pass-timing-feedback`
+shows populated GPU and CPU pass timings. The existing statistics heap and
+swapchain-slot readback lifetime remain tied to current admission ordering;
+future recording-ahead integration must give statistics query allocations the
+same explicit frame-slot and generation ownership as other services.
+
 ### Raster binding regression investigation
 
 Artifacts: `build/async-frame-validation/visual-regression`. The same-camera,
@@ -874,3 +933,113 @@ bounded frame ownership, no ordinary preparation/recording on the main thread,
 deterministic overlap and cancellation tests, and no repeatable median/p95
 frame-time regression exceeding 5%. Diagnostic runs are separate from timed
 runs. No phase is complete until its validation gate passes.
+
+## Bindless ownership consolidation (September 9, 2026)
+
+The target is shared bindless heaps with immutable published views, not per-pass
+binding tables or per-frame copies of the entire descriptor heap. Physical
+indices may change across resource versions; GPU publications must change
+coherently with them. The unintegrated named-view/program table scaffolding was
+removed. DescriptorSnapshots remains exercised by existing infrastructure tests,
+but is not the production descriptor strategy.
+
+Existing responsibilities and integration status:
+
+| Responsibility | Existing authority | Current gap |
+| --- | --- | --- |
+| Concrete allocation ownership | BackingAllocationSnapshot / TrackedHandle allocation leases | Imported mutable wrappers and attached representations need uniform exact-version capture |
+| Descriptor allocation and recycling | DescriptorHeap arenas, DescriptorHeapManager fence retirement | Published contents must become immutable on every replacement path |
+| View reuse | ORGModuleServices DescriptorViewCache | Not integrated with all renderer views; keys need exact version/backend/full-description identity |
+| Program replacement | Coherent pipeline payload capture | Finish automatic declaration capture across passes |
+| CPU/GPU frame ownership | FrameContext and explicit completion retirement | Finish publication/service integration |
+| Material/mesh indices | Existing producer publications | Retain versioned GPU table contents and all referenced view/allocation versions together |
+
+DescriptorHeap now offers a per-slot ownership lease. Existing fence retirement
+requests slot release as before, but a CPU-retained slot cannot re-enter the free
+list until its lease expires. Capture after retirement and duplicate release are
+rejected. Exhaustion fails explicitly; it never overwrites retained slots.
+Deferred CPU reclamation is checked when the free list needs replenishment.
+Leases retain their heap without introducing a strong ownership cycle.
+
+Preparation captures descriptor leases from the concrete globally indexed
+resource and combines them with its existing frozen allocation owner. Thus
+buffer backing replacement, which already allocates fresh slots, cannot recycle
+old slots solely because older submitted fences completed. No pass callback or
+second descriptor allocator was added.
+
+External buffer/texture replacement, ordinary buffer/texture dematerialization,
+and paired backend-representation publication now rotate descriptor slots before
+publishing a new allocation. Primary and secondary backend descriptors for one
+representation generation use the same newly allocated logical indices. The
+existing in-place refresh methods remain valid only while describing the same
+concrete allocation; replacement paths must go through rotation.
+
+This completes the initial bindless ownership gate, not the migration. Worker
+preparation, declaration-level view resolution, versioned material/mesh
+publications, multi-frame recording queues, presentation/history changes, and
+full pass migration remain outstanding. Scheduling and its default have not
+changed.
+
+### Declaration-level bindless views
+
+`FrozenExecutionBindings::ResourceBinding` now carries a value snapshot of the
+published views and resource description alongside the exact allocation/version
+owner. `FramePreparationContext::ResolveView`, `CaptureView`, and `Describe`
+resolve a declaration token through that frozen binding. They never inspect the
+current resource wrapper or descriptor registry. The snapshot records SRV/UAV,
+CPU UAV, RTV, DSV, and CBV slots, including mip, slice, and view-variant identity.
+Missing views fail during preparation.
+
+BloomBlend is the first representative conversion. Its returned declaration
+bindings cover the bloom SRV range and HDR render target; preparation obtains
+both bloom mip indices, the target descriptor, and target dimensions from the
+frozen declaration. The pass no longer initializes or reads `PixelBuffer*`
+members and no longer manually couples a wrapper descriptor to a capture call.
+Its program still uses the established coherent payload capture.
+
+The resource-description snapshot is deliberately small. This is not a named
+shader-binding table, reflection layer, or per-frame descriptor heap. The next
+migration step is to apply the same contract to representative compute and
+indirect raster passes, then remove the parallel automatic-descriptor declaration
+path once all consumers have moved.
+
+ClearDeepVisibility and AVBOITEarlyDepth now cover the next representative
+shapes. ClearDeepVisibility returns a value list of declaration tokens for its
+dynamic head-pointer set and resolves both shader-visible and CPU UAV views from
+the frozen version. Its prepared work no longer iterates current resource
+wrappers. AVBOITEarlyDepth returns tokens for the config SRV, indirect argument
+and count buffers, and depth target. Preparation derives the DSV, clear value,
+dimensions, argument-buffer capacity, and config bindless index from those
+tokens; only the captured pipeline and command-signature owners remain as pass
+configuration.
+
+Published clear values are now part of the resource-view snapshot for attachment
+recording. `BindDepthReadWrite` joins the other typed declaration methods and
+returns the same lightweight resource token used by planning and preparation.
+
+The next conversion removed every remaining explicit `CaptureDescriptor` call
+from BasicRenderer. BRDF integration, specular IBL, bloom sampling, and AVBOIT
+setup now return declaration tokens and obtain their descriptor indices,
+attachment descriptors, clear values, dimensions, slice counts, and concrete
+resources from the frozen declaration snapshot. `CaptureDescriptor` remains a
+transitional ORG primitive for external/internal compatibility, but ordinary
+renderer passes no longer use it to repair ownership after reading a live
+resource wrapper.
+
+ClearVisibilityBufferPass exercises registry-identifier declarations for a
+larger dynamic-looking binding set. Its ten UAV clears and depth clear use
+returned tokens; preparation stores frame-owned descriptor and resource
+references, and recording resolves those references from the same frozen frame.
+The render builder therefore exposes identifier forms of
+`BindUnorderedAccessClear` and `BindDepthStencilClear` in addition to the shared
+resource forms.
+
+This does not yet mean all pass preparation is independent of live registries.
+The current source inventory finds direct descriptor-view queries in 76 pass or
+graph-extension source files. Some are legitimate publication/update work, but
+many construct root constants during `Prepare`. Those sites are the next pass
+migration queue: return declaration tokens, resolve their immutable views during
+preparation, and leave index publication in versioned producer services. In
+particular, AVBOIT setup's `Update` still publishes descriptor indices into its
+configuration upload; that upload and the referenced versions must become one
+frame-owned publication before preparation can safely run ahead across frames.

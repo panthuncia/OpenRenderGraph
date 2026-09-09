@@ -4,6 +4,8 @@
 #include "Render/RenderGraph/ExperimentalExecutionState.h"
 #include "Render/PreparedPass.h"
 #include "Render/CommandListPool.h"
+#include "Render/Runtime/IStatisticsService.h"
+#include <chrono>
 #include <rhi.h>
 #include <stdexcept>
 #include <string>
@@ -338,6 +340,25 @@ struct FrameCommandAllocation {
     }
 };
 
+// Framework service state for one recording job. Workers produce query ranges
+// and CPU samples locally; the submission owner publishes them after success.
+struct OwnedRecordingStatistics {
+    std::shared_ptr<runtime::IStatisticsService> service;
+    unsigned frameIndex = 0;
+    rhi::QueueKind queueKind = rhi::QueueKind::Graphics;
+    bool gpuQueries = true;
+    std::vector<int> passIndices;
+    std::vector<double> cpuMilliseconds;
+    runtime::QueryRecordingContext queries;
+
+    void Publish() {
+        if (gpuQueries) service->MergePendingResolves(queueKind, frameIndex, queries);
+        for (size_t i = 0; i < passIndices.size(); ++i)
+            if (passIndices[i] >= 0)
+                service->RecordCpuExecuteTime(static_cast<unsigned>(passIndices[i]), cpuMilliseconds.at(i));
+    }
+};
+
 struct OwnedRecordingList {
     OwnedRecordingList() = default;
     OwnedRecordingList(OwnedRecordingList&&) = default;
@@ -355,6 +376,7 @@ struct OwnedRecordingList {
     std::vector<PreparedBatchBarriers::BeforePass> barriersBeforePass;
     std::vector<PreparedBatchBarriers::BeforePass> barriersAfterPass;
     std::vector<PreparedPass> passes;
+    std::shared_ptr<OwnedRecordingStatistics> statistics;
     std::shared_ptr<FrameCommandAllocation> allocation = std::make_shared<FrameCommandAllocation>();
 };
 
@@ -384,6 +406,9 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
         if (!recording.barriersAfterPass.empty()
             && recording.barriersAfterPass.size() != recording.passes.size())
             throw std::invalid_argument("Prepared post-pass/barrier count mismatch");
+        if (recording.statistics && (!recording.statistics->service
+            || recording.statistics->passIndices.size() != recording.passes.size()))
+            throw std::invalid_argument("Prepared pass/statistics count mismatch");
         for (const auto& pass : recording.passes)
             if (!pass) throw std::invalid_argument("Legacy pass in owned recording batch");
     }
@@ -399,6 +424,8 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
         std::move(lists), std::move(timelines), ownership, std::move(submissionEffects));
     for (const auto& recording : ownership->recordings) {
         RecordingContext context(recording.allocation->pair.list.Get(), recording.bindings, recording.externalBindings);
+        auto* statistics = recording.statistics.get();
+        if (statistics) statistics->cpuMilliseconds.resize(recording.passes.size());
         if (recording.resourceDescriptorHeap.valid()) {
             context.Commands().SetDescriptorHeaps(recording.resourceDescriptorHeap,
                 recording.samplerDescriptorHeap.valid()
@@ -421,7 +448,20 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
                     context.Commands().Barriers(barriers);
                 }
             }
+            const int statisticsIndex = statistics ? statistics->passIndices[passIndex] : -1;
+            if (statisticsIndex >= 0 && statistics->gpuQueries)
+                statistics->service->BeginQuery(static_cast<unsigned>(statisticsIndex), statistics->frameIndex,
+                    queue, context.Commands(), statistics->queries);
+            const auto cpuStart = statisticsIndex >= 0 ? std::chrono::steady_clock::now()
+                : std::chrono::steady_clock::time_point{};
             recording.passes[passIndex].Record(context);
+            if (statisticsIndex >= 0) {
+                statistics->cpuMilliseconds[passIndex] = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - cpuStart).count();
+                if (statistics->gpuQueries)
+                    statistics->service->EndQuery(static_cast<unsigned>(statisticsIndex), statistics->frameIndex,
+                        queue, context.Commands(), statistics->queries);
+            }
             if (!recording.barriersAfterPass.empty()) {
                 const auto& after = recording.barriersAfterPass[passIndex];
                 if (!after.textures.empty() || !after.buffers.empty()) {
@@ -432,6 +472,8 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
                 }
             }
         }
+        if (statistics && statistics->gpuQueries)
+            statistics->service->ResolveQueries(statistics->frameIndex, queue, context.Commands(), statistics->queries);
         if (context.Commands().EndChecked() != rhi::Result::Ok) {
             basic_telemetry::AddCounter("ORG.AsyncExecution.RecordingCloseFailures");
             std::string names;

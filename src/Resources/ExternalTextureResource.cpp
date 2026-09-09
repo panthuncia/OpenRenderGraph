@@ -101,6 +101,7 @@ bool ExternalTextureResource::RefreshShared(
 	if (!resource || !IsStructurallyCompatible(description))
 		return false;
 	auto previous = std::move(m_resource);
+	RotateDescriptorSlotsForPublication();
 	m_resource = std::move(resource);
 	m_handle = m_resource.Get().GetHandle();
 	m_commonLayoutOnly = commonLayoutOnly;
@@ -111,7 +112,7 @@ bool ExternalTextureResource::RefreshShared(
 		ResetToUndefined();
 	auto views = BuildExternalTextureViews(description, m_mipLevels, m_arraySize);
 	auto apiResource = m_resource.Get();
-	DescriptorHeapManager::GetInstance().UpdateDescriptorContents(*this, apiResource, views);
+	DescriptorHeapManager::GetInstance().AssignDescriptorSlots(*this, apiResource, views);
 	DescriptorHeapManager::GetInstance().RetireNativeResource(std::move(previous));
 	return true;
 }

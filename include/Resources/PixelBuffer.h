@@ -55,6 +55,10 @@ public:
     const rhi::ClearValue& GetClearColor() const {
         return m_clearValue;
     }
+    bool TryGetPublishedClearValue(rhi::ClearValue& value) const override {
+        value = m_clearValue;
+        return true;
+    }
     unsigned int GetInternalWidth() const {
         return m_internalWidth;
     }
