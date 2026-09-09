@@ -4,6 +4,7 @@
 #include <concepts>
 #include <functional>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <utility>
 #include <unordered_map>
@@ -40,6 +41,7 @@ struct CapturedPipeline {
     // Recording only needs an immutable handle plus lifetime ownership; pass
     // authors should not need a separate frame-data lifecycle for custom PSOs.
     std::shared_ptr<const void> owner;
+    rhi::PipelineLayoutHandle layout{};
     explicit operator bool() const noexcept { return pipeline.valid() && static_cast<bool>(owner); }
 };
 
@@ -49,6 +51,7 @@ public:
     virtual void Submitted(SubmissionContext) const {}
     virtual void Completed(CompletionContext) const {}
     virtual void Abandoned(AbandonReason) const {}
+    virtual std::span<const ExternalTimelinePoint> SignalsAfterCompletion() const { return {}; }
 };
 
 // Reusable lifecycle adapter for framework-owned reservations. The callbacks
@@ -98,7 +101,13 @@ public:
         : m_programs(std::move(programs)), m_workGraphs(std::move(workGraphs)),
           m_descriptors(std::move(descriptors)),
           m_owners(std::move(owners)),
-          m_effects(std::move(effects)) {}
+          m_effects(std::move(effects)) {
+        for (const auto& effect : m_effects) {
+            const auto signals = effect->SignalsAfterCompletion();
+            m_signals.insert(m_signals.end(), signals.begin(), signals.end());
+        }
+    }
+    const std::vector<ExternalTimelinePoint>& SignalsAfterCompletion() const { return m_signals; }
     const CapturedPipeline& Resolve(PreparedProgramReference ref) const {
         return m_programs.at(ref.slot);
     }
@@ -109,7 +118,8 @@ public:
         return m_descriptors.at(ref.slot).descriptor;
     }
     size_t DescriptorCount() const noexcept { return m_descriptors.size(); }
-    bool empty() const noexcept { return m_programs.empty() && m_workGraphs.empty() && m_descriptors.empty(); }
+    bool empty() const noexcept { return m_programs.empty() && m_workGraphs.empty() && m_descriptors.empty()
+        && m_owners.empty() && m_effects.empty(); }
     void Submitted(SubmissionContext context) const {
         for (const auto& effect : m_effects) effect->Submitted(context);
     }
@@ -125,6 +135,7 @@ private:
     std::vector<DescriptorBinding> m_descriptors;
     std::vector<std::shared_ptr<const void>> m_owners;
     std::vector<std::shared_ptr<const PreparedLifecycleEffect>> m_effects;
+    std::vector<ExternalTimelinePoint> m_signals;
 };
 
 class PreparedDependencyCollector {
@@ -132,7 +143,8 @@ public:
     PreparedProgramReference Capture(std::shared_ptr<const PipelineStatePayload> owner) {
         if (!owner || !owner->pso) throw std::invalid_argument("Pipeline has no immutable payload");
         const auto slot = static_cast<uint32_t>(m_programs.size());
-        m_programs.push_back({owner->pso.Get().GetHandle(), std::move(owner)});
+        const auto layout = owner->layout;
+        m_programs.push_back({owner->pso.Get().GetHandle(), std::move(owner), layout});
         return {slot};
     }
     PreparedProgramReference Capture(const PipelineState& pipeline,
@@ -175,7 +187,8 @@ public:
         return {slot};
     }
     std::shared_ptr<const PreparedDependencySnapshot> Freeze() && {
-        if (m_programs.empty() && m_descriptors.empty() && m_owners.empty() && m_effects.empty()) return {};
+        if (m_programs.empty() && m_workGraphs.empty() && m_descriptors.empty()
+            && m_owners.empty() && m_effects.empty()) return {};
         return std::make_shared<const PreparedDependencySnapshot>(
             std::move(m_programs), std::move(m_workGraphs), std::move(m_descriptors),
             std::move(m_owners), std::move(m_effects));
@@ -216,6 +229,7 @@ private:
 };
 
 struct FramePreparationContext {
+    rhi::Device device; // Host-owned device; valid through frame retirement.
     uint32_t frameIndex = 0;
     // Stable CPU frame-data slot retained by this prepared request. The
     // swapchain image and execution slot are intentionally late-bound.
@@ -251,7 +265,8 @@ struct FramePreparationContext {
         BackendInstanceId backend = BackendInstanceId::Primary) const {
         auto owner = pipeline.GetPayload(backend);
         if (!owner || !owner->pso) throw std::invalid_argument("Pipeline has no immutable payload");
-        return {owner->pso.Get().GetHandle(), std::move(owner)};
+        const auto layout = owner->layout;
+        return {owner->pso.Get().GetHandle(), std::move(owner), layout};
     }
 
     PreparedProgramReference CaptureProgram(const PipelineState& pipeline,
@@ -293,6 +308,17 @@ struct FramePreparationContext {
             throw std::invalid_argument("Pipeline has no immutable payload");
         auto indices = captureDescriptorIndices(payload->pipelineResources);
         return {dependencyCollector->Capture(std::move(payload)), std::move(indices)};
+    }
+
+    rhi::CommandSignatureHandle CaptureCommandSignature(
+        std::shared_ptr<const rhi::CommandSignaturePtr> owner) const {
+        if (!dependencyCollector)
+            throw std::logic_error("Command-signature capture is unavailable outside typed preparation");
+        if (!owner || !*owner)
+            throw std::invalid_argument("Cannot capture an empty command signature");
+        const auto handle = owner->Get().GetHandle();
+        dependencyCollector->Retain(std::move(owner));
+        return handle;
     }
 
     PreparedWorkGraphReference CaptureWorkGraph(
@@ -400,6 +426,14 @@ public:
         if (!m_dependencies) throw std::out_of_range("Missing prepared dependency snapshot");
         return m_dependencies->Resolve(ref).pipeline;
     }
+    rhi::PipelineLayoutHandle ResolveLayout(PreparedProgramReference ref,
+        rhi::PipelineLayoutHandle transitionalLayout = {}) const {
+        if (!m_dependencies) throw std::out_of_range("Missing prepared dependency snapshot");
+        const auto layout = m_dependencies->Resolve(ref).layout;
+        if (layout.valid()) return layout;
+        if (transitionalLayout.valid()) return transitionalLayout;
+        throw std::logic_error("Prepared program has no captured layout");
+    }
     rhi::WorkGraphHandle Resolve(PreparedWorkGraphReference ref) const {
         if (!m_dependencies) throw std::out_of_range("Missing prepared dependency snapshot");
         return m_dependencies->Resolve(ref);
@@ -499,6 +533,7 @@ public:
         }, "Typed passes require static Record(const FrameData&, RecordingContext&)");
         PreparedPass result;
         auto storage = std::make_shared<TypedStorage<Derived, Data>>(std::move(data));
+        if (dependencies) storage->externalSignals = dependencies->SignalsAfterCompletion();
         storage->dependencies = std::move(dependencies);
         storage->workerSafe = true;
         result.m_storage = std::move(storage);

@@ -1,5 +1,8 @@
 #include "Render/RenderGraph/RenderGraph.h"
 #include "RenderGraphCompilerState.h"
+#include "FrameRecording.h"
+#include "FrameWorker.h"
+#include "FrameTrace.h"
 #include "Render/RenderGraph/InteropAllocator.h"
 #include "Render/RenderGraph/ExperimentalRhiExecution.h"
 
@@ -3687,14 +3690,46 @@ RenderGraph::~RenderGraph() {
 	ShutdownOwnedState();
 }
 
-void RenderGraph::ShutdownTaskWorkers() {
+void RenderGraph::StopFrameProduction() {
+    BT_ZONE_SCOPE("ORG.Frame.StopProduction");
+    m_compilerState->frameProductionStopped = true;
+    // Coordinator destruction may drop the last input/bundle reference. Keep
+    // each accepted frame alive until CPU join and its terminal transition.
+    std::vector<std::shared_ptr<FrameContext>> frames;
+    for (const auto& [slot, weak] : m_compilerState->frameSlotOwners)
+        if (auto frame = weak.lock()) frames.push_back(std::move(frame));
+    if (m_compilerState->frameWorkerScope) m_compilerState->frameWorkerScope->CancelAndWait();
+    m_compilerState->frameWorkerScope.reset();
 	m_compilerState->shadowCompiler.reset();
+    // Joining compilation/recording precedes cancellation. Keep admission and
+    // recovery owners intact until the caller establishes GPU quiescence.
+    if (m_compilerState->framePlanner && !m_compilerState->framePlanner->RecoveryRequired())
+        m_compilerState->framePlanner->CancelUnsubmittedSuffixAfterJoin();
+    for (const auto& frame : frames) {
+        if (frame->Stage() < FrameStage::Submitted)
+            frame->CancelAfterJoin();
+    }
+}
+
+void RenderGraph::ShutdownTaskWorkers() {
+    StopFrameProduction();
+    const auto slotsBefore = m_compilerState->frameSlots ? m_compilerState->frameSlots->Active() : 0;
+    m_compilerState->RetireCompletedFrames(m_queueRegistry);
+    const auto pendingGpu = m_compilerState->asyncTimelineAdmission ? m_compilerState->asyncTimelineAdmission->InFlight() : 0;
 	m_compilerState->selectedAsyncFrame.reset();
 	m_compilerState->currentAsyncInput.reset();
-	m_compilerState->asyncBackingStateLedger.Reset();
-	m_compilerState->asyncBackingAccessLedger.Reset();
-	m_compilerState->asyncAliasAccessLedger.Reset();
+	m_compilerState->preparingFrame.reset();
+	m_compilerState->selectedPlanning.reset();
+	m_compilerState->framePlanner.reset();
 	m_compilerState->asyncTimelineAdmission.reset();
+	m_compilerState->frameSlotOwners.clear();
+	m_compilerState->frameCommandPools.clear();
+    if (m_compilerState->frameSlots) {
+        const auto slotsAfter = m_compilerState->frameSlots->Active();
+        spdlog::info("ORG frame shutdown: slots_before={} slots_after={} pending_gpu={}", slotsBefore, slotsAfter, pendingGpu);
+        if (slotsAfter || pendingGpu) spdlog::error("ORG frame shutdown retained unresolved ownership");
+    }
+    m_compilerState->frameSlots.reset();
 	m_compilerState->lastRequestedAsyncSequence = 0;
 	m_compilerState->nextAsyncExecutionSequence = 1;
 	m_compilerState->reportedAsyncSelectionFailures = 0;
@@ -3707,6 +3742,10 @@ void RenderGraph::ShutdownTaskWorkers() {
 
 void RenderGraph::ShutdownRuntime() {
 	StatisticsManager::GetInstance().ClearAll();
+	DeletionManager::GetInstance().DrainAll();
+	// Resource destruction above and during host teardown can enqueue further
+	// descriptor/backing owners. Global arenas outlive all of those owners.
+	DescriptorHeapManager::GetInstance().Cleanup();
 	DeletionManager::GetInstance().DrainAll();
 	DeletionManager::GetInstance().Cleanup();
 	DeviceManager::GetInstance().Cleanup();
@@ -3798,10 +3837,13 @@ void RenderGraph::ShutdownOwnedState() {
 	if (m_compilerState->shadowCompiler) m_compilerState->shadowCompiler->Reset(m_resourceRegistryGeneration);
 	m_compilerState->selectedAsyncFrame.reset();
 	m_compilerState->currentAsyncInput.reset();
-	m_compilerState->asyncBackingStateLedger.Reset();
-	m_compilerState->asyncBackingAccessLedger.Reset();
-	m_compilerState->asyncAliasAccessLedger.Reset();
+	m_compilerState->preparingFrame.reset();
+	m_compilerState->selectedPlanning.reset();
+	m_compilerState->framePlanner.reset();
 	m_compilerState->asyncTimelineAdmission.reset();
+	m_compilerState->frameSlots.reset();
+	m_compilerState->frameSlotOwners.clear();
+	m_compilerState->frameCommandPools.clear();
 	m_compilerState->lastRequestedAsyncSequence = 0;
 	m_compilerState->nextAsyncExecutionSequence = 1;
 	m_compilerState->reportedAsyncSelectionFailures = 0;
@@ -7638,6 +7680,8 @@ std::shared_ptr<ComputePass> RenderGraph::GetComputePassByName(const std::string
 
 void RenderGraph::Update(const UpdateExecutionContext& context, rhi::Device device) {
 	BT_ZONE_SCOPE("RenderGraph::Update");
+    if (m_compilerState->frameProductionStopped)
+        throw std::logic_error("Frame production has stopped");
     m_resolverCaptureContext = context.resolverCaptureContext;
 	m_asyncUpdateHostData = context.ownedHostData;
 	const bool traceLifecycle = m_getRenderGraphBatchTraceEnabled && m_getRenderGraphBatchTraceEnabled();
@@ -9254,6 +9298,7 @@ bool RenderGraph::PrepareSelectedAsyncFrame(PassExecutionContext& context) {
     auto bundle = coordinator->WaitAndPop(sequence);
     if (!bundle || !bundle->input || !bundle->input->executionPayload)
         throw std::runtime_error("Ordered compiled frame has no owned execution payload");
+    AnnotateFrameTrace(bundle->input->frameContext);
     auto payload = std::static_pointer_cast<const experimental::PreparedFramePayload>(
         bundle->input->executionPayload);
     // Resolve true admission resources before initial-state and backend-barrier
@@ -9287,17 +9332,29 @@ bool RenderGraph::PrepareSelectedAsyncFrame(PassExecutionContext& context) {
             payload->externalWaitsByPreparedPass, payload->preparationSlot);
         basic_telemetry::AddCounter("ORG.AsyncExecution.ExternalResourcesBound");
     }
-    auto layout = experimental::BuildExecutionLayout(bundle, *bundle->input);
-    auto initialStates = payload->initialStates;
-    const auto activated = m_compilerState->asyncAliasAccessLedger.ApplyInitialStates(
-        *bundle->graph, initialStates);
-    m_compilerState->asyncBackingStateLedger.Invalidate(activated);
-    m_compilerState->selectedAsyncFrame = experimental::BuildRenderFrameSnapshot(
-        std::move(layout), experimental::BuildPreparedFramePayloadWithInitialStates(
-            payload->frameNumber, payload->passes, payload->resources,
-            std::move(initialStates), payload->externalWaitsByPreparedPass,
-            payload->preparationSlot),
-        m_compilerState->asyncBackingStateLedger);
+    if (!m_compilerState->framePlanner)
+        m_compilerState->framePlanner = std::make_unique<experimental::FramePlanningState>(
+            m_renderGraphSettingsService ? m_renderGraphSettingsService->GetNumFramesInFlight() : 3);
+    std::vector<experimental::ExecutionTimelinePoint> queues;
+    for (size_t slot = 0; slot < m_queueRegistry.SlotCount(); ++slot) {
+        const auto next = m_queueRegistry.GetCurrentFenceValue(static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot)));
+        queues.push_back({slot + 1, next ? next - 1 : 0});
+    }
+    const bool asynchronous = m_renderGraphSettingsService
+        && m_renderGraphSettingsService->GetExperimentalAsyncCompileMode() == runtime::AsyncCompileMode::Async;
+    auto* planner = m_compilerState->framePlanner.get();
+    try {
+        m_compilerState->selectedPlanning = experimental::RunFrameWorker<experimental::FrameWorkerStage::Planning>(m_taskService,
+            m_compilerState->frameWorkerScope, asynchronous,
+            [planner, bundle, payload, queues = std::move(queues)] { return planner->Plan(bundle, payload, queues); });
+    } catch (...) {
+        if (m_compilerState->frameWorkerScope) m_compilerState->frameWorkerScope->Wait();
+        planner->CancelUnsubmittedSuffixAfterJoin();
+        if (const auto& owner = bundle->input->frameContext; owner && owner->Stage() == FrameStage::Compiling)
+            owner->CancelAfterJoin();
+        throw;
+    }
+    m_compilerState->selectedAsyncFrame = m_compilerState->selectedPlanning->snapshot;
     ++m_compilerState->nextAsyncExecutionSequence;
     basic_telemetry::AddCounter("ORG.AsyncExecution.PoppedExecutableFrames");
     BT_PLOT("ORG.AsyncExecution.ExecutingSequence", static_cast<int64_t>(sequence));
@@ -9314,15 +9371,10 @@ bool RenderGraph::ShouldDeferAsyncAdmission() {
     const auto next = m_compilerState->nextAsyncExecutionSequence;
     if (!next || next > m_compilerState->lastRequestedAsyncSequence) return false;
     const auto depth = m_compilerState->lastRequestedAsyncSequence - next + 1;
-    const auto target = static_cast<uint64_t>((std::max)(uint8_t{1},
-        m_renderGraphSettingsService->GetExperimentalCompileConcurrency()));
-    // Maintain an actual producer/consumer window even when compilation is
-    // shorter than owner preparation. Otherwise Async silently degenerates to
-    // request-then-immediate-pop and can never absorb a later expensive frame.
-    const bool defer = depth < target;
-    if (defer) basic_telemetry::AddCounter("ORG.AsyncExecution.QueuePrefillDeferrals");
     BT_PLOT("ORG.AsyncExecution.OwnedQueueDepth", static_cast<int64_t>(depth));
-    return defer;
+    // Submit ready work immediately. CPU overlap must come from independent
+    // production and recording, never a synthetic queue-prefill delay.
+    return false;
 }
 
 std::optional<uint32_t> RenderGraph::GetLastExecutedPreparationSlot() const noexcept {
@@ -9379,10 +9431,6 @@ bool RenderGraph::TryExecuteSelectedAsyncFrame(PassExecutionContext& context) {
     basic_telemetry::AddCounter("ORG.AsyncExecution.ExternalWaits",
         static_cast<int64_t>(std::accumulate(incoming.begin(), incoming.end(), size_t{0},
             [](size_t count, const auto& waits) { return count + waits.size(); })));
-    m_compilerState->asyncBackingAccessLedger.AppendIncomingWaits(
-        graph, frame->initialStates, queuePoints, incoming);
-    m_compilerState->asyncAliasAccessLedger.AppendIncomingWaits(
-        graph, frame->initialStates, queuePoints, incoming);
     if (!m_compilerState->asyncTimelineAdmission) {
         const auto executionSlots = m_renderGraphSettingsService
             ? m_renderGraphSettingsService->GetNumFramesInFlight() : uint8_t{3};
@@ -9403,17 +9451,7 @@ bool RenderGraph::TryExecuteSelectedAsyncFrame(PassExecutionContext& context) {
     }
 
     auto recordingPlan = experimental::BuildPreparedBatchRecordings(*frame);
-    std::vector<std::shared_ptr<const experimental::IPreparedExecutionBatch>> packets;
-    packets.resize(recordingPlan.size());
-    const auto runtimeOwner = std::static_pointer_cast<const void>(frame);
-    struct RecordingJob {
-        uint32_t slot = 0;
-        rhi::QueueKind queueKind = rhi::QueueKind::Graphics;
-        rhi::Device device;
-        rhi::Queue queue;
-        experimental::OwnedRecordingList recording;
-    };
-    std::vector<RecordingJob> recordingJobs(recordingPlan.size());
+    std::vector<experimental::FrameRecordingJob> recordingJobs(recordingPlan.size());
     const auto defaultResourceHeap = context.GetResourceDescriptorHeap().GetHandle();
     const auto defaultSamplerHeap = context.GetSamplerDescriptorHeap().GetHandle();
     auto externalDescriptorBindings = std::make_shared<const std::vector<ExternalDescriptorBindingValue>>(
@@ -9435,6 +9473,9 @@ bool RenderGraph::TryExecuteSelectedAsyncFrame(PassExecutionContext& context) {
         job.queueKind = rhiKind;
         job.device = m_queueRegistry.GetDevice(index);
         job.queue = m_queueRegistry.GetQueue(index);
+        auto& pool = m_compilerState->frameCommandPools[{frame->preparationSlot, slot}];
+        if (!pool) pool = std::make_shared<CommandListPool>(job.device, job.queueKind);
+        job.pool = pool;
         auto& recording = job.recording;
         recording.bindings = frame->bindings;
         recording.externalBindings = externalDescriptorBindings;
@@ -9483,25 +9524,26 @@ bool RenderGraph::TryExecuteSelectedAsyncFrame(PassExecutionContext& context) {
                 legacyNames.size(), names.str());
         }
     }
-    ParallelForOptionalLimited("ORG.AsyncExecution.RecordBatches", recordingJobs.size(), recordingConcurrency,
-        [&](size_t batch) {
-            auto& job = recordingJobs[batch];
-            auto& recording = job.recording;
-            if (job.device.CreateCommandAllocator(job.queueKind, recording.allocator) != rhi::Result::Ok
-                || job.device.CreateCommandList(job.queueKind, recording.allocator.Get(), recording.commands) != rhi::Result::Ok)
-                throw std::runtime_error("Failed to allocate async recording command list");
-            std::vector<experimental::OwnedRecordingList> recordings;
-            recordings.push_back(std::move(recording));
-            packets[batch] = experimental::RecordPreparedRhiExecutionBatch(job.slot,
-                job.queue, std::move(recordings), timelineBindings, runtimeOwner);
-        });
+    auto planning = std::move(m_compilerState->selectedPlanning);
+    const bool asynchronous = m_renderGraphSettingsService
+        && m_renderGraphSettingsService->GetExperimentalAsyncCompileMode() == runtime::AsyncCompileMode::Async;
+    if (asynchronous && !allPacketsWorkerSafe)
+        throw std::runtime_error("Async frame recording requires worker-safe pass data");
+    std::optional<experimental::RecordedFrame> recorded;
     try {
-        auto execution = m_compilerState->asyncTimelineAdmission->SubmitPrepared(
-            frame->layout->bundle, incoming, packets);
-        m_compilerState->asyncBackingAccessLedger.Commit(graph, frame->initialStates, *execution);
-        m_compilerState->asyncAliasAccessLedger.Commit(graph, frame->initialStates, *execution);
-        for (size_t batch = 0; batch < frame->barrierPlan->batches.size(); ++batch)
-            m_compilerState->asyncBackingStateLedger.CommitBatch(frame->barrierPlan->batches[batch]);
+        recorded.emplace(experimental::RunFrameWorker(m_taskService, m_compilerState->frameWorkerScope, asynchronous,
+            [plan = experimental::PlannedFrame{frame, std::move(recordingJobs), std::move(timelineBindings),
+                std::move(incoming), planning}, tasks = m_taskService, recordingConcurrency]() mutable {
+                return experimental::RecordFrame(std::move(plan), tasks, recordingConcurrency);
+            }));
+    } catch (...) {
+        if (m_compilerState->frameWorkerScope) m_compilerState->frameWorkerScope->Wait();
+        m_compilerState->framePlanner->CancelUnsubmittedSuffixAfterJoin();
+        throw;
+    }
+    try {
+        auto execution = std::move(*recorded).Submit(*m_compilerState->asyncTimelineAdmission);
+        m_compilerState->framePlanner->Confirm(planning, *execution);
         for (const auto& signal : execution->batches) {
             const auto slot = graph.batches[&signal - execution->batches.data()].queue;
             m_queueRegistry.EnsureNextFenceValueAtLeast(
@@ -9538,16 +9580,9 @@ bool RenderGraph::TryExecuteSelectedAsyncFrame(PassExecutionContext& context) {
     } catch (...) {
         const auto& failure = m_compilerState->asyncTimelineAdmission->Failure();
         auto partial = m_compilerState->asyncTimelineAdmission->PendingExecution();
-        if (failure && partial && failure->batch != 0) {
-            const auto submittedBatches = failure->batch;
-            m_compilerState->asyncBackingAccessLedger.Commit(
-                graph, frame->initialStates, *partial, submittedBatches);
-            m_compilerState->asyncAliasAccessLedger.Commit(
-                graph, frame->initialStates, *partial, submittedBatches);
-            for (uint32_t batch = 0; batch < submittedBatches; ++batch)
-                m_compilerState->asyncBackingStateLedger.CommitBatch(frame->barrierPlan->batches[batch]);
-            basic_telemetry::AddCounter(
-                "ORG.AsyncExecution.PartialSubmittedBatches", submittedBatches);
+        if (failure && partial) {
+            m_compilerState->framePlanner->ConfirmFailure(planning, *partial, failure->batch);
+            basic_telemetry::AddCounter("ORG.AsyncExecution.PartialSubmittedBatches", failure->batch);
         }
         basic_telemetry::AddCounter("ORG.AsyncExecution.SceneSubmissionFailures");
         throw;
@@ -9555,6 +9590,8 @@ bool RenderGraph::TryExecuteSelectedAsyncFrame(PassExecutionContext& context) {
 }
 
 void RenderGraph::Execute(PassExecutionContext& context) {
+    if (m_compilerState->frameProductionStopped)
+        throw std::logic_error("Frame production has stopped");
     const auto compileMode = m_renderGraphSettingsService
         ? m_renderGraphSettingsService->GetExperimentalAsyncCompileMode()
         : runtime::AsyncCompileMode::Off;

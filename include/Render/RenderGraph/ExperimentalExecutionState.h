@@ -65,7 +65,8 @@ struct PreparedExecutionBarrierPlan {
 class BackingStateAdmissionLedger {
 public:
     PreparedExecutionBarrierPlan Prepare(
-        const CompiledGraph& graph, std::span<const PreparedBackingState> initial) const;
+        const CompiledGraph& graph, std::span<const PreparedBackingState> initial,
+        std::span<const rhi::ResourceHandle> invalidated = {}) const;
     void CommitBatch(const PreparedBatchBarriers&);
     void Invalidate(std::span<const rhi::ResourceHandle> resources);
     void Reset() { m_states.clear(); }
@@ -92,6 +93,7 @@ public:
         std::span<const PreparedBackingState> resources,
         const GraphExecutionTimeline& execution, uint32_t batchCount = UINT32_MAX);
     void Reset() { m_accesses.clear(); }
+    void ResolvePlannedPoints(const std::unordered_map<uint64_t, ExecutionTimelinePoint>& points);
 private:
     struct Cell {
         ExecutionTimelinePoint writer{};
@@ -119,6 +121,7 @@ public:
         std::span<const PreparedBackingState> resources,
         const GraphExecutionTimeline& execution, uint32_t batchCount = UINT32_MAX);
     void Reset() { m_intervals.clear(); }
+    void ResolvePlannedPoints(const std::unordered_map<uint64_t, ExecutionTimelinePoint>& points);
 private:
     struct SubmittedInterval {
         uint64_t begin = 0, end = 0;

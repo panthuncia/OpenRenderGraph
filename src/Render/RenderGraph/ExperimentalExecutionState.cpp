@@ -28,7 +28,8 @@ void Visit(const CompileResourceShape& shape, CompileRange range, auto&& fn) {
 }
 
 PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
-    const CompiledGraph& graph, std::span<const PreparedBackingState> initial) const {
+    const CompiledGraph& graph, std::span<const PreparedBackingState> initial,
+    std::span<const rhi::ResourceHandle> invalidated) const {
     BT_ZONE_SCOPE("ORG.AsyncExecution.ResolveBackingStates");
     if (!graph.structure || !graph.states.complete || initial.size() != graph.structure->resourceIDs.size())
         throw std::invalid_argument("Incomplete symbolic state admission input");
@@ -61,11 +62,14 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
         }
     }
     std::vector<StateGrid> projected(initial.size());
+    const auto wasInvalidated = [&](rhi::ResourceHandle handle) {
+        return std::ranges::any_of(invalidated, [&](auto other) { return SameHandle(handle, other); });
+    };
     for (size_t resource = 0; resource < initial.size(); ++resource) {
         const auto& captured = *ordered[resource];
         const auto key = Key(captured.resource);
         auto existing = m_states.find(key);
-        if (existing != m_states.end()) projected[resource] = existing->second;
+        if (existing != m_states.end() && !wasInvalidated(captured.resource)) projected[resource] = existing->second;
         else {
             auto& grid = projected[resource];
             grid.shape = captured.shape;
@@ -110,7 +114,7 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
         ++entrySteps;
         intraBatchSteps += step.previousBatch == step.batch;
         const auto handle = ordered[step.resource]->resource;
-        if (!m_states.contains(Key(handle)) && std::none_of(output.seeds.begin(), output.seeds.end(),
+        if ((!m_states.contains(Key(handle)) || wasInvalidated(handle)) && std::none_of(output.seeds.begin(), output.seeds.end(),
             [&](const auto& seed) { return Key(seed.resource) == Key(handle); }))
             output.seeds.push_back(*ordered[step.resource]);
         Visit(grid.shape, step.range, [&](uint32_t mip, uint32_t slice) {
@@ -482,6 +486,24 @@ void AliasAccessAdmissionLedger::Commit(const CompiledGraph& graph,
             });
         }
     }
+}
+
+void BackingAccessAdmissionLedger::ResolvePlannedPoints(
+    const std::unordered_map<uint64_t, ExecutionTimelinePoint>& points) {
+    auto resolve = [&](ExecutionTimelinePoint& point) {
+        if (const auto found = points.find(point.value); found != points.end()) point = found->second;
+    };
+    for (auto& [_, grid] : m_accesses) for (auto& cell : grid.cells) {
+        resolve(cell.writer);
+        for (auto& reader : cell.readers) resolve(reader);
+    }
+}
+
+void AliasAccessAdmissionLedger::ResolvePlannedPoints(
+    const std::unordered_map<uint64_t, ExecutionTimelinePoint>& points) {
+    for (auto& [_, intervals] : m_intervals) for (auto& interval : intervals)
+        for (auto& point : interval.accesses)
+            if (const auto found = points.find(point.value); found != points.end()) point = found->second;
 }
 
 } // namespace org::experimental

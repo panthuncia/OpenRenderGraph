@@ -1,202 +1,115 @@
 #pragma once
 
-#include <boost/container_hash/hash.hpp>
-#include <BasicTelemetry/Tracy.h>
-
-#include "RenderPasses/Base/RenderPass.h"
-#include "Render/Runtime/IReadbackService.h"
-#include "Render/ResourceRequirements.h"
+#include "RenderPasses/Base/TypedRenderGraphPass.h"
+#include "Render/PassBuilders.h"
+#include "Render/Runtime/ReadbackCaptureReservation.h"
 #include "Resources/Buffers/Buffer.h"
 #include "Resources/PixelBuffer.h"
-#include "Resources/ResourceStateTracker.h"
-
 
 namespace org {
-
 struct ReadbackCaptureInputs {
     ResourceHandleAndRange target;
-
     RG_DEFINE_PASS_INPUTS(ReadbackCaptureInputs, &ReadbackCaptureInputs::target);
 };
 
-class ReadbackCapturePass final : public RenderPass, public IHasImmediateModeCommands {
-public:
-    ReadbackCapturePass(
-        ReadbackCaptureInputs inputs,
-        std::shared_ptr<Resource> sourceResource,
-        ReadbackCaptureCallback callback,
-        org::runtime::IReadbackService* readbackService,
-        std::string debugCaptureName = {})
-        : m_sourceResource(std::move(sourceResource)),
-        m_callback(std::move(callback)),
-        m_readbackService(readbackService),
-        m_debugCaptureName(std::move(debugCaptureName)) {
-        SetInputs(inputs);
-    }
-
-    void DeclareResourceUsages(RenderPassBuilder* builder) override {
-        const auto& inputs = Inputs<ReadbackCaptureInputs>();
-        builder->WithCopySource(inputs.target);
-    }
-
-    void Setup() override {
-    }
-
-    void RecordImmediateCommands(ImmediateExecutionContext& context) override {
-        BT_ZONE_SCOPE("ReadbackCapturePass::RecordImmediateCommands");
-        if (!m_debugCaptureName.empty()) {
-            BT_ZONE_TEXT(m_debugCaptureName.c_str(), m_debugCaptureName.size());
-        }
-
-        const auto& inputs = Inputs<ReadbackCaptureInputs>();
-        auto* resource = m_sourceResource.get();
-        if (!resource) {
-            return;
-        }
-
-        ReadbackCaptureRequest request{};
-        request.desc.range = inputs.target.range;
-        request.desc.resourceId = resource->GetGlobalResourceID();
-
-        if (resource->HasLayout()) {
-            auto* texture = dynamic_cast<PixelBuffer*>(resource);
-            rhi::ResourceDesc textureDesc{};
-            if (!resource->TryGetRHIResourceDesc(textureDesc))
-                throw std::runtime_error("ReadbackCapturePass: texture resource does not expose an RHI description.");
-
-            const auto handle = inputs.target.resource;
-            const SubresourceRange sr = ResolveRangeSpec(inputs.target.range, handle.GetNumMipLevels(), handle.GetArraySize());
-            if (sr.isEmpty()) {
-                return;
-            }
-
-            std::vector<rhi::CopyableFootprint> footprints(sr.mipCount * sr.sliceCount);
-            rhi::FootprintRangeDesc fr{};
-            // Readback extension passes currently default to the primary device.
-            // The immediate list resolves the same primary representation for the copy.
-            fr.texture = resource->GetAPIResource().GetHandle();
-            fr.firstMip = sr.firstMip;
-            fr.mipCount = sr.mipCount;
-            fr.firstArraySlice = sr.firstSlice;
-            fr.arraySize = sr.sliceCount;
-            fr.firstPlane = 0;
-            fr.planeCount = 1;
-            fr.baseOffset = 0;
-
-            auto info = context.device.GetCopyableFootprints(fr, footprints.data(), static_cast<uint32_t>(footprints.size()));
-
-            auto readbackBuffer = m_readbackService
-                ? m_readbackService->AcquireReadbackBuffer(info.totalBytes, "ReadbackCaptureBuffer")
-                : std::static_pointer_cast<Resource>(Buffer::CreateShared(rhi::HeapType::Readback, info.totalBytes));
-            if (!readbackBuffer) {
-                return;
-            }
-            BT_PLOT("Readback.CaptureRequestedBytes", static_cast<int64_t>(info.totalBytes));
-
-            for (uint32_t slice = 0; slice < sr.sliceCount; ++slice) {
-                for (uint32_t mip = 0; mip < sr.mipCount; ++mip) {
-                    const uint32_t subresourceIndex = (slice * sr.mipCount) + mip;
-                    const auto& fp = footprints[subresourceIndex];
-
-                    context.list.CopyTextureToBuffer(
-                        m_sourceResource,
-                        sr.firstMip + mip,
-                        sr.firstSlice + slice,
-                        readbackBuffer,
-                        fp,
-                        0,
-                        0,
-                        0);
-                }
-            }
-
-            request.desc.kind = ReadbackResourceKind::Texture;
-            request.readbackBuffer = readbackBuffer;
-            request.layouts = std::move(footprints);
-            request.totalSize = info.totalBytes;
-            request.format = textureDesc.texture.format;
-            request.width = textureDesc.texture.width;
-            request.height = textureDesc.texture.height;
-            request.depth = 1;
-        }
-        else {
-            uint64_t byteSize = 0;
-            if (!resource->TryGetBufferByteSize(byteSize) || byteSize == 0) {
-                throw std::runtime_error("ReadbackCapturePass: resource is not a texture (has no layout) and does not expose a buffer byte size for readback.");
-            }
-            auto readbackBuffer = m_readbackService
-                ? m_readbackService->AcquireReadbackBuffer(byteSize, "ReadbackCaptureBuffer")
-                : std::static_pointer_cast<Resource>(Buffer::CreateShared(rhi::HeapType::Readback, byteSize));
-            if (!readbackBuffer) {
-                return;
-            }
-            BT_PLOT("Readback.CaptureRequestedBytes", static_cast<int64_t>(byteSize));
-
-            context.list.CopyBufferRegion(readbackBuffer, 0, m_sourceResource, 0, byteSize);
-
-            request.desc.kind = ReadbackResourceKind::Buffer;
-            request.readbackBuffer = readbackBuffer;
-            request.totalSize = byteSize;
-        }
-
-        request.callback = m_callback;
-        if (!m_readbackService) {
-            return;
-        }
-
-        m_pendingToken = m_readbackService->EnqueueCapture(std::move(request));
-        m_hasPendingToken = true;
-    }
-
-    PassReturn Execute(PassExecutionContext& context) override {
-        if (!m_hasPendingToken) {
-            return {};
-        }
-
-        if (!m_readbackService) {
-            m_hasPendingToken = false;
-            return {};
-        }
-
-        const rhi::Timeline signalFence = m_readbackService->GetReadbackFence(QueueKind::Graphics);
-        if (!signalFence.IsValid()) {
-            m_hasPendingToken = false;
-            return {};
-        }
-
-        const uint64_t fenceValue = m_readbackService->GetNextReadbackFenceValue(QueueKind::Graphics);
-        m_readbackService->FinalizeCapture(m_pendingToken, QueueKind::Graphics, nullptr, fenceValue);
-        m_hasPendingToken = false;
-        return { signalFence, fenceValue };
-    }
-
-    std::optional<OwnedImmediateSubmissionEffect> TakeOwnedImmediateSubmissionEffect() override {
-        if (!m_hasPendingToken || !m_readbackService) return std::nullopt;
-        const rhi::Timeline signalFence = m_readbackService->GetReadbackFence(QueueKind::Graphics);
-        if (!signalFence.IsValid()) return std::nullopt;
-        const uint64_t fenceValue = m_readbackService->GetNextReadbackFenceValue(QueueKind::Graphics);
-        const auto token = m_pendingToken;
-        auto* service = m_readbackService;
-        m_hasPendingToken = false;
-        return OwnedImmediateSubmissionEffect{
-            .completionSignals = {{signalFence, fenceValue}},
-            .commit = [service, token, fenceValue]() {
-                service->FinalizeCapture(token, QueueKind::Graphics, nullptr, fenceValue);
-            },
-        };
-    }
-
-    void Cleanup() override {
-    }
-
-private:
-    std::shared_ptr<Resource> m_sourceResource;
-    ReadbackCaptureCallback m_callback;
-    org::runtime::ReadbackCaptureToken m_pendingToken{};
-    org::runtime::IReadbackService* m_readbackService = nullptr; // non-owning
-    std::string m_debugCaptureName;
-    bool m_hasPendingToken = false;
+struct ReadbackCaptureFrameData {
+    PreparedResourceReference source;
+    rhi::ResourceHandle destination{};
+    uint64_t bytes = 0;
+    uint32_t firstMip = 0, firstSlice = 0, mipCount = 0, sliceCount = 0;
+    std::vector<rhi::CopyableFootprint> footprints;
 };
 
+// Queue capability is the only difference between graphics and copy capture.
+template<QueueKind Queue>
+class BasicReadbackCapturePass final
+    : public TypedRenderGraphPass<BasicReadbackCapturePass<Queue>, ReadbackCaptureFrameData> {
+public:
+    BasicReadbackCapturePass(ReadbackCaptureInputs inputs, std::shared_ptr<Resource> source,
+        ReadbackCaptureCallback callback, std::shared_ptr<runtime::IReadbackService> service,
+        std::string debugName = {})
+        : m_source(std::move(source)),
+          m_callback(std::move(callback)), m_service(std::move(service)), m_name(std::move(debugName)) { this->SetInputs(std::move(inputs)); }
 
+    void Declare(PassBuilder& builder) {
+        const auto& inputs = this->template Inputs<ReadbackCaptureInputs>();
+        builder.WithCopySource(inputs.target).PreferQueue(Queue);
+    }
+    ReadbackCaptureFrameData Prepare(const PassPrepareContext& preparation) {
+        const auto& inputs = this->template Inputs<ReadbackCaptureInputs>();
+        ReadbackCaptureFrameData data{};
+        if (!m_source || !m_service) return data;
+        data.source = preparation.CaptureResource(m_source->GetGlobalResourceID());
+        ReadbackCaptureRequest request{};
+        request.desc.range = inputs.target.range;
+        request.desc.resourceId = m_source->GetGlobalResourceID();
+        request.callback = m_callback;
+        if (m_source->HasLayout()) {
+            rhi::ResourceDesc desc{};
+            if (!m_source->TryGetRHIResourceDesc(desc))
+                throw std::runtime_error("Readback texture does not expose an RHI description");
+            const auto handle = inputs.target.resource;
+            const auto range = ResolveRangeSpec(inputs.target.range,
+                handle.GetNumMipLevels(), handle.GetArraySize());
+            if (range.isEmpty()) return data;
+            data.firstMip = range.firstMip; data.firstSlice = range.firstSlice;
+            data.mipCount = range.mipCount; data.sliceCount = range.sliceCount;
+            data.footprints.resize(range.mipCount * range.sliceCount);
+            rhi::FootprintRangeDesc footprint{};
+            footprint.texture = preparation.ResolveCapturedResource(data.source).GetHandle();
+            footprint.firstMip = range.firstMip; footprint.mipCount = range.mipCount;
+            footprint.firstArraySlice = range.firstSlice; footprint.arraySize = range.sliceCount;
+            footprint.planeCount = 1;
+            auto device = preparation.device;
+            auto info = device.GetCopyableFootprints(footprint, data.footprints.data(),
+                static_cast<uint32_t>(data.footprints.size()));
+            data.bytes = info.totalBytes;
+            request.desc.kind = ReadbackResourceKind::Texture;
+            request.layouts = data.footprints;
+            request.format = desc.texture.format;
+            request.width = desc.texture.width;
+            request.height = desc.texture.height;
+            request.depth = 1;
+        } else {
+            if (!m_source->TryGetBufferByteSize(data.bytes) || !data.bytes)
+                throw std::runtime_error("Readback buffer does not expose its byte size");
+            request.desc.kind = ReadbackResourceKind::Buffer;
+        }
+        auto destination = m_service->AcquireReadbackBuffer(data.bytes,
+            m_name.empty() ? "ReadbackCaptureBuffer" : m_name.c_str());
+        if (!destination) return {};
+        auto* backing = dynamic_cast<BackedResource*>(destination.get());
+        auto allocation = backing ? backing->CaptureBackingAllocation() : BackingAllocationSnapshot{};
+        if (!allocation) throw std::runtime_error("Readback destination lacks concrete allocation ownership");
+        data.destination = allocation.resource.GetHandle();
+        preparation.Retain(allocation.lease);
+        request.readbackBuffer = std::move(destination);
+        request.totalSize = data.bytes;
+        preparation.Reserve(std::make_shared<runtime::ReadbackCaptureReservation>(
+            preparation.device, m_service, std::move(request), Queue));
+        return data;
+    }
+    static void Record(const ReadbackCaptureFrameData& data, PassRecordContext& recording) {
+        if (!data.bytes) return;
+        const auto source = recording.Resolve(data.source).GetHandle();
+        if (data.footprints.empty()) {
+            recording.Commands().CopyBufferRegion(data.destination, 0, source, 0, data.bytes);
+            return;
+        }
+        for (uint32_t slice = 0; slice < data.sliceCount; ++slice)
+            for (uint32_t mip = 0; mip < data.mipCount; ++mip) {
+                rhi::BufferTextureCopyFootprint region{};
+                region.texture = source; region.buffer = data.destination;
+                region.mip = data.firstMip + mip; region.arraySlice = data.firstSlice + slice;
+                region.footprint = data.footprints[slice * data.mipCount + mip];
+                recording.Commands().CopyTextureToBuffer(region);
+            }
+    }
+private:
+    std::shared_ptr<Resource> m_source;
+    ReadbackCaptureCallback m_callback;
+    std::shared_ptr<runtime::IReadbackService> m_service;
+    std::string m_name;
+};
+using ReadbackCapturePass = BasicReadbackCapturePass<QueueKind::Graphics>;
 } // namespace org

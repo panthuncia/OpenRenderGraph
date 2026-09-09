@@ -59,6 +59,8 @@ public:
 		rhi::Timeline timeline;
 		uint64_t value = 0;
 	};
+    void RetireExecutionLease(std::shared_ptr<const void> lease,
+        std::vector<QueueFenceSnapshotPoint> completion);
 	struct DeferredReleaseStats {
 		uint64_t releaseCount = 0;
 		uint64_t descriptorSlotCount = 0;

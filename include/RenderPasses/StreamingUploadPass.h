@@ -5,7 +5,8 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "RenderPasses/Base/CopyPass.h"
+#include "RenderPasses/Base/TypedRenderGraphPass.h"
+#include "Render/PassBuilders.h"
 #include "Render/ResourceRequirements.h"
 #include "Render/Runtime/StreamingUploadTypes.h"
 #include "Interfaces/IResourceResolver.h"
@@ -32,55 +33,40 @@ inline bool operator==(const StreamingUploadInputs& a, const StreamingUploadInpu
     return a.uploads.size() == b.uploads.size(); // identity by reference; ephemeral
 }
 
-/// A CopyPass that runs on the copy queue and performs streaming buffer uploads.
-/// Created per-frame by the streaming extension when there are pending uploads.
-class StreamingUploadPass final : public CopyPass, public IHasImmediateModeCommands {
-public:
-    explicit StreamingUploadPass(StreamingUploadInputs inputs) {
-        SetInputs(std::move(inputs));
-    }
-
-    void DeclareResourceUsages(CopyPassBuilder* builder) override {
-        const auto& inputs = Inputs<StreamingUploadInputs>();
-        for (const auto& upload : inputs.uploads) {
-            if (upload.dstResource) {
-                builder->WithCopyDest(upload.dstResource);
-            }
-            // Upload-heap sources don't need to be declared — they are
-            // ephemeral resources pinned via the shared_ptr overload of
-            // CopyBufferRegion in RecordImmediateCommands.
-        }
-        // Declare all pool slab buffers as copy destinations so the render
-        // graph knows about them and can schedule transitions correctly,
-        // even though individual uploads already declare their specific
-        // destination resource.
-        if (inputs.poolResolver) {
-            builder->WithCopyDest(*inputs.poolResolver);
-        }
-        builder->PreferQueue(QueueKind::Copy);
-    }
-
-    void Setup() override {}
-
-    void RecordImmediateCommands(ImmediateExecutionContext& context) override {
-        const auto& inputs = Inputs<StreamingUploadInputs>();
-        for (const auto& upload : inputs.uploads) {
-            if (!upload.dstResource || !upload.srcUploadBuffer || upload.size == 0) {
-                continue;
-            }
-            context.list.CopyBufferRegion(
-                upload.dstResource.get(), upload.dstOffset,
-                upload.srcUploadBuffer, upload.srcOffset,
-                upload.size);
-        }
-    }
-
-    PassReturn Execute(PassExecutionContext& context) override {
-        return {};
-    }
-
-    void Cleanup() override {}
+struct StreamingUploadFrameData {
+    struct Copy {
+        PreparedResourceReference source, destination;
+        uint64_t sourceOffset, destinationOffset, size;
+    };
+    std::vector<Copy> copies;
 };
 
-
+class StreamingUploadPass final : public TypedRenderGraphPass<StreamingUploadPass, StreamingUploadFrameData> {
+public:
+    explicit StreamingUploadPass(StreamingUploadInputs inputs) { SetInputs(std::move(inputs)); }
+    void Declare(PassBuilder& builder) {
+        const auto& inputs = Inputs<StreamingUploadInputs>();
+        for (const auto& upload : inputs.uploads) {
+            if (!upload.dstResource || !upload.srcUploadBuffer || !upload.size) continue;
+            builder.WithCopyDest(upload.dstResource).WithCopySource(upload.srcUploadBuffer);
+        }
+        if (inputs.poolResolver) builder.WithCopyDest(*inputs.poolResolver);
+        builder.PreferQueue(QueueKind::Copy);
+    }
+    StreamingUploadFrameData Prepare(const PassPrepareContext& preparation) {
+        StreamingUploadFrameData data;
+        for (const auto& upload : Inputs<StreamingUploadInputs>().uploads) {
+            if (!upload.dstResource || !upload.srcUploadBuffer || !upload.size) continue;
+            data.copies.push_back({preparation.CaptureResource(upload.srcUploadBuffer->GetGlobalResourceID()),
+                preparation.CaptureResource(upload.dstResource->GetGlobalResourceID()),
+                upload.srcOffset, upload.dstOffset, upload.size});
+        }
+        return data;
+    }
+    static void Record(const StreamingUploadFrameData& data, PassRecordContext& recording) {
+        for (const auto& copy : data.copies)
+            recording.Commands().CopyBufferRegion(recording.Resolve(copy.destination).GetHandle(),
+                copy.destinationOffset, recording.Resolve(copy.source).GetHandle(), copy.sourceOffset, copy.size);
+    }
+};
 } // namespace org

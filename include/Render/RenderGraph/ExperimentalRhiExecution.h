@@ -3,6 +3,7 @@
 #include "Render/RenderGraph/ExperimentalGraphCompiler.h"
 #include "Render/RenderGraph/ExperimentalExecutionState.h"
 #include "Render/PreparedPass.h"
+#include "Render/CommandListPool.h"
 #include <rhi.h>
 #include <stdexcept>
 #include <string>
@@ -325,7 +326,24 @@ private:
 // One owned recording packet. The binding table transitively owns descriptor
 // snapshots and backing versions; pass data owns immutable pipeline references.
 // Member order retires command lists before their allocators and bindings.
+struct FrameCommandAllocation {
+    std::shared_ptr<CommandListPool> pool;
+    CommandListPair pair;
+    bool closed = false;
+    ~FrameCommandAllocation() {
+        if (!pool) return;
+        if (!closed) { pool->Discard(std::move(pair)); return; }
+        try { pool->RecycleForNextRequest(std::move(pair)); }
+        catch (...) { pool->Discard(std::move(pair)); }
+    }
+};
+
 struct OwnedRecordingList {
+    OwnedRecordingList() = default;
+    OwnedRecordingList(OwnedRecordingList&&) = default;
+    OwnedRecordingList& operator=(OwnedRecordingList&&) = default;
+    OwnedRecordingList(const OwnedRecordingList&) = delete;
+    OwnedRecordingList& operator=(const OwnedRecordingList&) = delete;
     std::shared_ptr<const FrozenExecutionBindings> bindings;
     std::shared_ptr<const std::vector<ExternalDescriptorBindingValue>> externalBindings;
     // Admission-captured defaults for passes using directly-indexed root
@@ -337,8 +355,7 @@ struct OwnedRecordingList {
     std::vector<PreparedBatchBarriers::BeforePass> barriersBeforePass;
     std::vector<PreparedBatchBarriers::BeforePass> barriersAfterPass;
     std::vector<PreparedPass> passes;
-    rhi::CommandAllocatorPtr allocator;
-    rhi::CommandListPtr commands;
+    std::shared_ptr<FrameCommandAllocation> allocation = std::make_shared<FrameCommandAllocation>();
 };
 
 // Called only after admission freezes bindings and barriers. It may run on a
@@ -356,9 +373,10 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
     // Validate all packets before consuming any pass. Empty legacy preparation
     // must be selected into a synchronous route by the preparation owner.
     for (const auto& recording : recordings) {
-        if (!recording.bindings || !recording.allocator || !recording.commands || recording.passes.empty())
+        if (!recording.bindings || !recording.allocation || !recording.allocation->pair.allocator
+            || !recording.allocation->pair.list || recording.passes.empty())
             throw std::invalid_argument("Incomplete owned recording packet");
-        if (!recording.commands.Get().SupportsCheckedEnd())
+        if (!recording.allocation->pair.list.Get().SupportsCheckedEnd())
             throw std::invalid_argument("Backend lacks checked command list close");
         if (!recording.barriersBeforePass.empty()
             && recording.barriersBeforePass.size() != recording.passes.size())
@@ -374,13 +392,13 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
     std::vector<PreparedPass> submissionEffects;
     lists.reserve(ownership->recordings.size());
     for (const auto& recording : ownership->recordings) {
-        lists.push_back(recording.commands.Get());
+        lists.push_back(recording.allocation->pair.list.Get());
         submissionEffects.insert(submissionEffects.end(), recording.passes.begin(), recording.passes.end());
     }
     auto packet = std::make_shared<const PreparedRhiExecutionBatch>(queueSlot, queue,
         std::move(lists), std::move(timelines), ownership, std::move(submissionEffects));
     for (const auto& recording : ownership->recordings) {
-        RecordingContext context(recording.commands.Get(), recording.bindings, recording.externalBindings);
+        RecordingContext context(recording.allocation->pair.list.Get(), recording.bindings, recording.externalBindings);
         if (recording.resourceDescriptorHeap.valid()) {
             context.Commands().SetDescriptorHeaps(recording.resourceDescriptorHeap,
                 recording.samplerDescriptorHeap.valid()
@@ -438,6 +456,7 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
                 + " afterTextures=" + std::to_string(afterTextures)
                 + " afterBuffers=" + std::to_string(afterBuffers) + " passes=" + names);
         }
+        recording.allocation->closed = true;
     }
     return packet;
 }

@@ -94,6 +94,7 @@ CommandListPair CommandListPool::CreateReadyPair() {
 
 CommandListPair CommandListPool::Request() {
     BT_ZONE_SCOPE("CommandListPool::Request");
+    std::optional<CommandListPair> pending;
     {
         std::lock_guard lock(m_mutex);
         if (!m_available.empty()) {
@@ -104,6 +105,18 @@ CommandListPair CommandListPool::Request() {
             UpdateDiagnosticsCountsLocked();
             return pair;
         }
+        if (!m_pendingBackgroundReset.empty()) {
+            pending.emplace(std::move(m_pendingBackgroundReset.back()));
+            m_pendingBackgroundReset.pop_back();
+            ++m_checkedOutCount;
+            ++m_diagnostics.reusedThisFrame;
+            UpdateDiagnosticsCountsLocked();
+        }
+    }
+
+    if (pending) {
+        PreparePairForReuse(*pending);
+        return std::move(*pending);
     }
 
     CommandListPair pair = CreateReadyPair();
@@ -207,6 +220,19 @@ void CommandListPool::PrepareForRequests(size_t requiredCount, uint64_t complete
         UpdateDiagnosticsCountsLocked();
     }
     ScheduleBackgroundReset();
+}
+
+void CommandListPool::RecycleForNextRequest(CommandListPair&& pair) {
+    std::lock_guard lock(m_mutex);
+    m_pendingBackgroundReset.emplace_back(std::move(pair));
+    if (m_checkedOutCount != 0) --m_checkedOutCount;
+    UpdateDiagnosticsCountsLocked();
+}
+
+void CommandListPool::Discard(CommandListPair&& pair) noexcept {
+    std::lock_guard lock(m_mutex);
+    if (m_checkedOutCount != 0) --m_checkedOutCount;
+    UpdateDiagnosticsCountsLocked();
 }
 
 void CommandListPool::Recycle(CommandListPair&& pair, uint64_t fenceValue) {

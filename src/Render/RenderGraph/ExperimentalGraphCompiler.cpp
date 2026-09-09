@@ -1,4 +1,5 @@
 #include "Render/RenderGraph/ExperimentalGraphCompiler.h"
+#include "FrameTrace.h"
 
 #include <algorithm>
 #include <array>
@@ -147,6 +148,8 @@ std::shared_ptr<const GraphExecutionTimeline> ExecutionTimelineAdmission::Submit
         leases.push_back(packet);
     }
     auto execution = Prepare(std::move(bundle), incomingWaits, std::move(leases), packets);
+    CompletionSet completion;
+    for (const auto& batch : execution->batches) completion.Include(batch.signal);
     for (uint32_t i = 0; i < packets.size(); ++i) {
         const auto receipt = packets[i]->Submit(execution->batches[i]);
         if (!receipt) {
@@ -155,6 +158,8 @@ std::shared_ptr<const GraphExecutionTimeline> ExecutionTimelineAdmission::Submit
         }
         CommitBatch(execution->submission, i);
     }
+    if (execution->bundle->input->frameContext)
+        execution->bundle->input->frameContext->MarkSubmitted(std::move(completion));
     return execution;
 }
 
@@ -173,6 +178,7 @@ void ExecutionTimelineAdmission::Fail(uint64_t submission, SubmissionReceipt rec
     if (m_failed || !m_pending || submission != m_pending->submission || receipt)
         throw std::logic_error("Unknown failed execution");
     m_failed = true;
+    if (const auto& frame = m_pending->bundle->input->frameContext) frame->EnterRecovery();
     m_failure = FailedExecutionBatch{submission, m_nextBatch, receipt};
     basic_telemetry::AddCounter(receipt.state == SubmissionState::SubmittedWithoutSignal
         ? "ORG.AsyncExecution.SubmittedWithoutSignal"
@@ -196,8 +202,12 @@ size_t ExecutionTimelineAdmission::RetireCompleted(std::span<const ExecutionTime
         for (size_t i = 0; i < execution->batches.size(); ++i)
             if (execution->batches[i].signal.value > completed[execution->bundle->graph->batches[i].queue].value)
                 return false;
+        BT_ZONE_SCOPE("ORG.Frame.Retire");
+        AnnotateFrameTrace(execution->bundle->input->frameContext);
         for (const auto& packet : execution->preparedBatches)
             if (packet) packet->Complete(execution->submission);
+        if (const auto& frame = execution->bundle->input->frameContext)
+            if (!frame->Retire(completed)) throw std::logic_error("Frame completion disagrees with admission");
         return true;
     });
     // Failed partial packets remain recovery-owned: completion alone cannot
@@ -805,6 +815,7 @@ void GraphCompileCoordinator::StartPending() {
         "ORG.AsyncCompile.Job", [job, running, completion] {
             BT_ZONE_SCOPE("ORG.AsyncCompile.Job");
             BT_ZONE_VALUE(job->originalSequence);
+            AnnotateFrameTrace(job->input->frameContext);
             BT_PLOT("ORG.AsyncCompile.QueueDelayUs", static_cast<int64_t>(
                 std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - job->queued).count()));
             const size_t count = running->running.fetch_add(1) + 1;

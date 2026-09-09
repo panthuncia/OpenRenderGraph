@@ -37,6 +37,9 @@ struct PipelineStatePayload {
 		bytecodeHash(bytecodeFingerprint),
 		label(std::move(pipelineLabel)) {}
 
+    // Layout ownership must survive until after the pipeline is destroyed.
+    std::shared_ptr<const void> layoutOwner;
+    rhi::PipelineLayoutHandle layout{};
 	uint64_t resourceIDsHash = 0;
 	rhi::PipelinePtr pso;
 	PipelineResources pipelineResources;
@@ -67,13 +70,19 @@ class PipelineState {
 public:
 	PipelineState(rhi::PipelinePtr pso,
 		uint64_t resourceIDsHash, 
-		PipelineResources resources) :
+		PipelineResources resources,
+        std::shared_ptr<const void> layoutOwner = {},
+        rhi::PipelineLayoutHandle layout = {}) :
 		m_slot(std::make_shared<PipelineStateSlot>(
 			std::make_shared<PipelineStatePayload>(
 				std::move(pso),
 				resourceIDsHash,
 				std::move(resources)))),
-		m_backendSlots(std::make_shared<BackendSlotMap>()) {}
+		m_backendSlots(std::make_shared<BackendSlotMap>()) {
+        auto payload = m_slot->Load();
+        payload->layoutOwner = std::move(layoutOwner);
+        payload->layout = layout;
+    }
 	PipelineState() :
 		m_slot(std::make_shared<PipelineStateSlot>(
 			std::make_shared<PipelineStatePayload>(
@@ -92,16 +101,17 @@ public:
 		const auto payload = GetPayload(backendInstance);
 		return payload && payload->pso;
 	}
-	void AttachBackendPipeline(BackendInstanceId backendInstance, rhi::PipelinePtr pipeline,
-		uint64_t resourceIDsHash, PipelineResources resources) const {
-		const auto key = static_cast<uint8_t>(backendInstance);
-		if (key == static_cast<uint8_t>(BackendInstanceId::Primary)) {
-			m_slot->Exchange(std::make_shared<PipelineStatePayload>(std::move(pipeline), resourceIDsHash, std::move(resources)));
-			return;
-		}
-		(*m_backendSlots)[key] = std::make_shared<PipelineStateSlot>(
-			std::make_shared<PipelineStatePayload>(std::move(pipeline), resourceIDsHash, std::move(resources)));
-	}
+    void AttachBackendPipeline(BackendInstanceId backendInstance, rhi::PipelinePtr pipeline,
+        uint64_t resourceIDsHash, PipelineResources resources,
+        std::shared_ptr<const void> layoutOwner = {}, rhi::PipelineLayoutHandle layout = {}) const {
+        auto payload = std::make_shared<PipelineStatePayload>(
+            std::move(pipeline), resourceIDsHash, std::move(resources));
+        payload->layoutOwner = std::move(layoutOwner);
+        payload->layout = layout;
+        const auto key = static_cast<uint8_t>(backendInstance);
+        if (backendInstance == BackendInstanceId::Primary) m_slot->Exchange(std::move(payload));
+        else (*m_backendSlots)[key] = std::make_shared<PipelineStateSlot>(std::move(payload));
+    }
 	uint64_t GetResourceIDsHash() const {
 		return RequirePayload()->resourceIDsHash;
 	}

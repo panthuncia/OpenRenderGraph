@@ -15,6 +15,7 @@
 
 #include "Render/Runtime/ITaskService.h"
 #include "Render/RenderGraph/CompilerAlgorithms.h"
+#include "Render/RenderGraph/FrameContext.h"
 
 namespace org::experimental {
 
@@ -103,6 +104,7 @@ public:
 };
 
 struct GraphCompileInput {
+    std::shared_ptr<FrameContext> frameContext;
     GraphCompileStructure structure;
     // Realization identity, ordered with structure.resourceIDs. It is excluded
     // from symbolic compilation equality: same layout/new backing reuses a plan.
@@ -241,10 +243,7 @@ std::shared_ptr<const GraphExecutionLayout> BuildExecutionLayout(
     std::shared_ptr<const CompiledGraphBundle>, const GraphCompileInput& prepared);
 
 
-struct ExecutionTimelinePoint {
-    uint64_t timeline = 0, value = 0;
-    bool operator==(const ExecutionTimelinePoint&) const = default;
-};
+using ExecutionTimelinePoint = FrameCompletionPoint;
 struct ExecutionBatchTimeline {
     ExecutionTimelinePoint signal;
     std::vector<ExecutionTimelinePoint> waits;

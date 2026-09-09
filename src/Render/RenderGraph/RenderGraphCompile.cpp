@@ -1,4 +1,5 @@
 #include "Render/RenderGraph/RenderGraph.h"
+#include "FrameTrace.h"
 #include "RenderGraphCompilerState.h"
 #include "Render/RenderGraph/ExperimentalRhiExecution.h"
 
@@ -1722,7 +1723,7 @@ std::span<const uint64_t> RenderGraph::GetSchedulingEquivalentIDsCached(uint64_t
 	return std::span<const uint64_t>(fallbackEquivalentIDs.data(), fallbackEquivalentIDs.size());
 }
 
-void RenderGraph::SubmitDependencyCompileShadow(const std::vector<Node>& nodes,
+void RenderGraph::SubmitDependencyCompileShadow(rhi::Device device, const std::vector<Node>& nodes,
     std::span<const std::pair<size_t, size_t>> explicitEdges,
     std::vector<std::pair<uint32_t, uint32_t>> dependencyOracle,
     uint8_t frameIndex, float deltaTime, const IHostExecutionData* hostData) try {
@@ -1744,6 +1745,7 @@ void RenderGraph::SubmitDependencyCompileShadow(const std::vector<Node>& nodes,
         m_taskService, m_renderGraphSettingsService->GetExperimentalCompileConcurrency());
     coordinator->SetConcurrency(m_renderGraphSettingsService->GetExperimentalCompileConcurrency());
     experimental::GraphCompileInput input;
+    input.frameContext = m_compilerState->preparingFrame;
     if (m_resolverCaptureContext) input.leases.push_back(m_resolverCaptureContext);
     input.structure.generation = m_resourceRegistryGeneration;
     input.structure.registryGeneration = m_resourceRegistryGeneration;
@@ -2111,9 +2113,11 @@ void RenderGraph::SubmitDependencyCompileShadow(const std::vector<Node>& nodes,
 			}
 			basis->updateData = m_asyncUpdateHostData;
 			FramePreparationContext preparation{
+                .device = device,
 				.frameIndex = frameIndex,
 				.preparationSlot = frameIndex,
-				.frameNumber = ++m_compilerState->asyncPreparationFrameNumber,
+				.frameNumber = input.frameContext ? input.frameContext->Number()
+                    : ++m_compilerState->asyncPreparationFrameNumber,
 				.deltaTime = deltaTime,
 				.bindings = basis->resources->bindings,
 				.preparationData = basis->updateData ? basis->updateData.get() : hostData,
@@ -2166,12 +2170,21 @@ void RenderGraph::SubmitDependencyCompileShadow(const std::vector<Node>& nodes,
     const bool inlineBootstrap = mode == runtime::AsyncCompileMode::Off
         || (mode == runtime::AsyncCompileMode::Async
             && m_compilerState->lastRequestedAsyncSequence == 0);
+    if (input.frameContext) {
+        if (!input.executionPayload) throw std::runtime_error("Frame preparation produced no owned execution payload");
+        input.frameContext->Retain(input.executionPayload);
+        for (const auto& lease : input.leases) input.frameContext->Retain(lease);
+        input.frameContext->Advance(FrameStage::Preparing, FrameStage::Compiling);
+    }
     auto request = coordinator->RequestOwned(std::move(input), inlineBootstrap);
+    if (mode != runtime::AsyncCompileMode::Shadow && (!request.input || !request.sequence))
+        throw std::runtime_error("Owned frame compile request was rejected");
     if (mode != runtime::AsyncCompileMode::Shadow && request.input) {
         if (request.sequence == 1 && m_compilerState->lastRequestedAsyncSequence != 0)
             m_compilerState->nextAsyncExecutionSequence = 1;
         m_compilerState->currentAsyncInput = request.input;
         m_compilerState->lastRequestedAsyncSequence = request.sequence;
+        m_compilerState->preparingFrame.reset();
     }
     coordinator->Pump();
     if (mode != runtime::AsyncCompileMode::Shadow)
@@ -2210,11 +2223,27 @@ void RenderGraph::SubmitDependencyCompileShadow(const std::vector<Node>& nodes,
     const auto failures = ++m_compilerState->shadowCaptureFailures;
     BT_PLOT("ORG.AsyncCompile.CaptureFailures", static_cast<int64_t>(failures));
     if (failures == 1 || failures % 64 == 0)
-        spdlog::error("Async shadow capture failed; synchronous graph remains authoritative: {}", error.what());
+        spdlog::error("Graph frame capture failed: {}", error.what());
+    if (m_compilerState->preparingFrame) {
+        if (m_compilerState->preparingFrame->Stage() == FrameStage::Compiling && m_compilerState->shadowCompiler)
+            m_compilerState->shadowCompiler->Shutdown();
+        m_compilerState->preparingFrame->CancelAfterJoin();
+        m_compilerState->preparingFrame.reset();
+    }
+    if (m_renderGraphSettingsService
+        && m_renderGraphSettingsService->GetExperimentalAsyncCompileMode() != runtime::AsyncCompileMode::Shadow) throw;
 } catch (...) {
     ++m_compilerState->shadowCaptureFailures;
     BT_PLOT("ORG.AsyncCompile.CaptureFailures", static_cast<int64_t>(m_compilerState->shadowCaptureFailures));
-    spdlog::error("Unknown async shadow capture failure; synchronous graph remains authoritative");
+    spdlog::error("Unknown graph frame capture failure");
+    if (m_compilerState->preparingFrame) {
+        if (m_compilerState->preparingFrame->Stage() == FrameStage::Compiling && m_compilerState->shadowCompiler)
+            m_compilerState->shadowCompiler->Shutdown();
+        m_compilerState->preparingFrame->CancelAfterJoin();
+        m_compilerState->preparingFrame.reset();
+    }
+    if (m_renderGraphSettingsService
+        && m_renderGraphSettingsService->GetExperimentalAsyncCompileMode() != runtime::AsyncCompileMode::Shadow) throw;
 }
 
 void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHostExecutionData* hostData) {
@@ -2228,6 +2257,50 @@ void RenderGraph::PrepareAsyncFrame(rhi::Device device, uint8_t frameIndex, floa
 
 void RenderGraph::PrepareAndCompileFrame(rhi::Device device, uint8_t frameIndex,
 	const IHostExecutionData* hostData, bool asyncPreparationOnly, float deltaTime) {
+    BT_ZONE_SCOPE("ORG.Frame.PrepareAndCompile");
+    if (m_compilerState->frameProductionStopped)
+        throw std::logic_error("Frame production has stopped");
+    const auto mode = m_renderGraphSettingsService
+        ? m_renderGraphSettingsService->GetExperimentalAsyncCompileMode() : runtime::AsyncCompileMode::Off;
+    if (mode != runtime::AsyncCompileMode::Shadow && m_taskService && m_renderGraphSettingsService) {
+        m_compilerState->RetireCompletedFrames(m_queueRegistry);
+        if (m_compilerState->currentAsyncInput && m_compilerState->currentAsyncInput->frameContext
+            && m_compilerState->currentAsyncInput->frameContext->Stage() == FrameStage::Retired)
+            m_compilerState->currentAsyncInput.reset();
+        if (!m_compilerState->frameSlots) m_compilerState->frameSlots = std::make_unique<FrameSlotPool>(
+            m_renderGraphSettingsService ? m_renderGraphSettingsService->GetNumFramesInFlight() : 3);
+        auto lease = m_compilerState->frameSlots->TryAcquire(frameIndex);
+        if (!lease) {
+            BT_ZONE_SCOPE("ORG.Frame.SlotBackpressure");
+            auto previous = m_compilerState->frameSlotOwners[frameIndex].lock();
+            if (!previous || previous->Stage() != FrameStage::Submitted)
+                throw std::logic_error("Preparation slot " + std::to_string(frameIndex)
+                    + " is retained by frame " + std::to_string(previous ? previous->Number() : 0)
+                    + " in stage " + std::to_string(previous ? static_cast<unsigned>(previous->Stage()) : 255));
+            AnnotateFrameTrace(previous);
+            for (const auto point : previous->CompletionPoints()) {
+                if (!point.timeline || point.timeline > m_queueRegistry.SlotCount())
+                    throw std::logic_error("Frame completion references an unavailable queue");
+                auto fence = m_queueRegistry.GetFence(static_cast<QueueSlotIndex>(static_cast<uint8_t>(point.timeline - 1)));
+                if (fence.HostWait(point.value, 10000) != rhi::Result::Ok)
+                    throw std::runtime_error("GPU completion wait failed while reclaiming a frame slot");
+            }
+            m_compilerState->RetireCompletedFrames(m_queueRegistry);
+            if (m_compilerState->currentAsyncInput && m_compilerState->currentAsyncInput->frameContext == previous)
+                m_compilerState->currentAsyncInput.reset();
+            previous.reset();
+            lease = m_compilerState->frameSlots->TryAcquire(frameIndex);
+            if (!lease) throw std::logic_error("Completed frame still retains its preparation slot");
+        }
+        m_compilerState->preparingFrame = std::make_shared<FrameContext>(
+            ++m_compilerState->asyncPreparationFrameNumber, m_resourceRegistryGeneration, std::move(lease));
+        m_compilerState->frameSlotOwners[frameIndex] = m_compilerState->preparingFrame;
+        BT_PLOT("ORG.Frame.ActiveSlots", static_cast<int64_t>(m_compilerState->frameSlots->Active()));
+        BT_PLOT("ORG.Frame.PreparationNumber", static_cast<int64_t>(m_compilerState->preparingFrame->Number()));
+        BT_PLOT("ORG.Frame.Generation", static_cast<int64_t>(m_resourceRegistryGeneration));
+        BT_PLOT("ORG.Frame.PreparationSlot", static_cast<int64_t>(frameIndex));
+        AnnotateFrameTrace(m_compilerState->preparingFrame);
+    }
 	if (asyncPreparationOnly) { BT_ZONE_SCOPE("RenderGraph::PrepareAsyncFrame"); }
 	else { BT_ZONE_SCOPE("RenderGraph::CompileFrame"); }
 	BeginCompileProfileFrame(frameIndex);
@@ -3529,7 +3602,7 @@ void RenderGraph::PrepareAndCompileFrame(rhi::Device device, uint8_t frameIndex,
 		m_aliasMaterializeOptionsByResourceIndex.clear();
 		m_aliasMaterializeResourceIDs.clear();
 		MaterializeUnmaterializedResources(usedResourceIDs);
-		SubmitDependencyCompileShadow(nodes, explicitEdges, {}, frameIndex, deltaTime, hostData);
+		SubmitDependencyCompileShadow(device, nodes, explicitEdges, {}, frameIndex, deltaTime, hostData);
 		traceCompileStep("complete");
 		return;
 	}
@@ -3825,7 +3898,7 @@ void RenderGraph::PrepareAndCompileFrame(rhi::Device device, uint8_t frameIndex,
     // Capture only after realization has produced owned backing generations.
     // Workers still receive immutable numeric metadata and leases; no compile
     // work is performed by this owner-side placement.
-    SubmitDependencyCompileShadow(nodes, explicitEdges, std::move(shadowDependencyOracle), frameIndex, deltaTime, hostData);
+    SubmitDependencyCompileShadow(device, nodes, explicitEdges, std::move(shadowDependencyOracle), frameIndex, deltaTime, hostData);
 
 	{
 		traceCompileStep("AutoScheduleAndBuildBatches");

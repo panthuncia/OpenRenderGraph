@@ -24,7 +24,9 @@ concept OwnedPassFrameData = std::movable<Data>
 // One author-facing pass contract for synchronous and asynchronous execution.
 // Both modes call Prepare once and consume the resulting type-erased packet;
 // neither compiler route calls a pass object.
-template<class Derived, OwnedPassFrameData FrameData>
+struct EmptyPassFrameData {};
+
+template<class Derived, OwnedPassFrameData FrameData = EmptyPassFrameData>
 class TypedRenderGraphPass : public RenderPass {
 public:
     using PreparedData = FrameData;
@@ -32,20 +34,29 @@ public:
     bool UsesTypedPreparation() const noexcept final { return true; }
 
     PreparedPass PrepareFrame(FramePreparationContext& context) final {
-        static_assert(requires(Derived& pass, const PassPrepareContext& prepare) {
-            { pass.Prepare(prepare) } -> std::same_as<FrameData>;
-        }, "Typed passes require FrameData Prepare(const PassPrepareContext&)");
-        static_assert(requires(const FrameData& data, PassRecordContext& record) {
-            { Derived::Record(data, record) } -> std::same_as<void>;
-        }, "Typed passes require static void Record(const FrameData&, PassRecordContext&)");
         auto collector = std::make_shared<PreparedDependencyCollector>();
         auto typedContext = context;
         typedContext.dependencyCollector = collector;
         typedContext.captureDescriptorIndices = [this](const PipelineResources& resources) {
             return this->CaptureResourceDescriptorIndices(resources);
         };
-        auto data = static_cast<Derived*>(this)->Prepare(typedContext);
-        return PreparedPass::FromTyped<Derived>(std::move(data), std::move(*collector).Freeze());
+        if constexpr (requires(Derived& pass, const PassPrepareContext& prepare) {
+            { pass.Prepare(prepare) } -> std::same_as<FrameData>;
+        }) {
+            static_assert(requires(const FrameData& data, PassRecordContext& record) {
+                { Derived::Record(data, record) } -> std::same_as<void>;
+            }, "Prepared passes require static void Record(const FrameData&, PassRecordContext&)");
+            auto data = static_cast<Derived*>(this)->Prepare(typedContext);
+            return PreparedPass::FromTyped<Derived>(std::move(data), std::move(*collector).Freeze());
+        } else {
+            static_assert(std::same_as<FrameData, EmptyPassFrameData>,
+                "Passes with prepared data require FrameData Prepare(const PassPrepareContext&)");
+            static_assert(requires(PassRecordContext& record) {
+                { Derived::Record(record) } -> std::same_as<void>;
+            }, "Direct passes require static void Record(PassRecordContext&)");
+            return PreparedPass::FromTyped<DirectRecorder>(EmptyPassFrameData{},
+                std::move(*collector).Freeze());
+        }
     }
 
     // Both Off and Async modes execute the owned packet produced above. Keep
@@ -64,6 +75,13 @@ public:
         if constexpr (requires(Derived& pass) { pass.ShutdownPass(); })
             static_cast<Derived*>(this)->ShutdownPass();
     }
+
+private:
+    struct DirectRecorder {
+        static void Record(const EmptyPassFrameData&, PassRecordContext& context) {
+            Derived::Record(context);
+        }
+    };
 
 protected:
     [[nodiscard]] PreparedProgramBinding CaptureProgramBinding(

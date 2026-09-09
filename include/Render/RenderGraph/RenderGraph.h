@@ -706,6 +706,10 @@ public:
 	void ResetForRebuild();
 	void PrepareExtensionsForBuild();
 	void ShutdownExtensions();
+	// Serialized producer boundary. Joins CPU frame work without releasing
+	// submitted ownership; the caller can then wait for every device to idle.
+	void StopFrameProduction();
+	// Requires GPU idle. Releases frame ownership after CPU production stopped.
 	void ShutdownTaskWorkers();
 	void ClearExtensions();
 	void Setup();
@@ -722,11 +726,14 @@ public:
 	org::runtime::IUploadService* GetUploadService() { return m_uploadService.get(); }
 	const org::runtime::IUploadService* GetUploadService() const { return m_uploadService.get(); }
 	void SetReadbackService(std::shared_ptr<org::runtime::IReadbackService> service) { m_readbackService = std::move(service); }
+	std::shared_ptr<org::runtime::IReadbackService> GetReadbackServiceOwner() const { return m_readbackService; }
 	org::runtime::IReadbackService* GetReadbackService() { return m_readbackService.get(); }
 	const org::runtime::IReadbackService* GetReadbackService() const { return m_readbackService.get(); }
 	void SetDescriptorService(std::shared_ptr<org::runtime::IDescriptorService> service) { m_descriptorService = std::move(service); }
 	org::runtime::IDescriptorService* GetDescriptorService() { return m_descriptorService.get(); }
 	const org::runtime::IDescriptorService* GetDescriptorService() const { return m_descriptorService.get(); }
+	// Host shutdown retains the service beyond graph/manager resource owners.
+	std::shared_ptr<org::runtime::IDescriptorService> RetainDescriptorService() const { return m_descriptorService; }
 	void SetRenderGraphSettingsService(std::shared_ptr<org::runtime::IRenderGraphSettingsService> service) { m_renderGraphSettingsService = std::move(service); }
 	org::runtime::IRenderGraphSettingsService* GetRenderGraphSettingsService() { return m_renderGraphSettingsService.get(); }
 	const org::runtime::IRenderGraphSettingsService* GetRenderGraphSettingsService() const { return m_renderGraphSettingsService.get(); }
@@ -1267,7 +1274,7 @@ private:
 	// This keeps compiler algorithm/layout changes from rebuilding all ORG clients.
 	struct Node;
 	struct CompilerState;
-    void SubmitDependencyCompileShadow(const std::vector<Node>& nodes,
+    void SubmitDependencyCompileShadow(rhi::Device device, const std::vector<Node>& nodes,
         std::span<const std::pair<size_t, size_t>> explicitEdges,
         std::vector<std::pair<uint32_t, uint32_t>> dependencyOracle,
         uint8_t frameIndex, float deltaTime, const IHostExecutionData* hostData);

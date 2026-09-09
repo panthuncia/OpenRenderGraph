@@ -1,8 +1,10 @@
 #pragma once
+#include <map>
 
 #include "Render/RenderGraph/RenderGraph.h"
 #include "Render/RenderGraph/ExperimentalGraphCompiler.h"
 #include "Render/RenderGraph/ExperimentalExecutionState.h"
+#include "FramePlanning.h"
 
 
 // Private compiler representation. Keep compiler-only data here rather than in
@@ -33,12 +35,30 @@ struct RenderGraph::Node {
 };
 
 struct RenderGraph::CompilerState {
+    std::unique_ptr<FrameSlotPool> frameSlots;
+    std::shared_ptr<FrameContext> preparingFrame;
+    std::map<uint32_t, std::weak_ptr<FrameContext>> frameSlotOwners;
+    std::map<std::pair<uint32_t, uint32_t>, std::shared_ptr<CommandListPool>> frameCommandPools;
+
+    void RetireCompletedFrames(QueueRegistry& queues) {
+        if (!asyncTimelineAdmission) return;
+        std::vector<experimental::ExecutionTimelinePoint> completed;
+        const auto submitted = asyncTimelineAdmission->Submitted();
+        completed.reserve(submitted.size());
+        for (size_t slot = 0; slot < submitted.size(); ++slot) {
+            const auto value = queues.GetFence(static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot))).GetCompletedValue();
+            if (value == UINT64_MAX) throw std::runtime_error("Invalid GPU completion while retiring frame slots");
+            completed.push_back({submitted[slot].timeline, (std::min)(submitted[slot].value, value)});
+        }
+        asyncTimelineAdmission->RetireCompleted(completed);
+    }
     std::unique_ptr<experimental::GraphCompileCoordinator> shadowCompiler;
     std::shared_ptr<const experimental::RenderFrameSnapshot> selectedAsyncFrame;
     std::shared_ptr<const experimental::GraphCompileInput> currentAsyncInput;
-    experimental::BackingStateAdmissionLedger asyncBackingStateLedger;
-    experimental::BackingAccessAdmissionLedger asyncBackingAccessLedger;
-    experimental::AliasAccessAdmissionLedger asyncAliasAccessLedger;
+    std::unique_ptr<experimental::FramePlanningState> framePlanner;
+    std::shared_ptr<const experimental::PlannedFrameState> selectedPlanning;
+    std::shared_ptr<runtime::ITaskScope> frameWorkerScope;
+    bool frameProductionStopped = false;
     std::unique_ptr<experimental::ExecutionTimelineAdmission> asyncTimelineAdmission;
     uint64_t lastRequestedAsyncSequence = 0;
     uint64_t nextAsyncExecutionSequence = 1;

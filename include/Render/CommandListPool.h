@@ -50,6 +50,11 @@ public:
     // RecycleCompleted is called with a sufficiently large fence value.
     void Recycle(CommandListPair&& pair, uint64_t fenceValue);
 
+    // Frame ownership already proves GPU completion. Reset on the next
+    // recording worker, without scheduling work from the retirement thread.
+    void RecycleForNextRequest(CommandListPair&& pair);
+    void Discard(CommandListPair&& pair) noexcept;
+
     // Queue any completed command lists for background reset.
     void RecycleCompleted(uint64_t completedFenceValue);
 

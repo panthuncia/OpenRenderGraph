@@ -2,10 +2,14 @@
 #include <Resources/ExternalTextureResource.h>
 #include <Render/Runtime/RuntimeDevice.h>
 #include <Render/PassBuilders.h>
+#include <RenderPasses/Base/TypedRenderGraphPass.h>
 #include <Render/RenderGraph/ExperimentalRhiExecution.h>
+#include "../src/Render/RenderGraph/FrameRecording.h"
 #include <Render/RenderGraph/ExperimentalExecutionState.h>
 #include <Render/BufferBarrierHelpers.h>
 #include <Render/DescriptorSnapshots.h>
+#include <Render/Runtime/FrameWorkQueue.h>
+#include <Render/Runtime/ExternalSignalReservation.h>
 #include <Resources/TrackedAllocation.h>
 #include <rhi_interop_dx12.h>
 #include <rhi_helpers.h>
@@ -18,9 +22,54 @@
 #include <type_traits>
 
 #define CHECK(x) do { if (!(x)) return __LINE__; } while (false)
+int TestDelayedFrameRecording(const rhi::DeviceCreateInfo& create);
+int TestFrameRetirement(rhi::Device device);
+int TestProgramVersions(rhi::Device device);
+int TestReadbackCaptures(rhi::Device device);
 
 namespace {
+struct DirectRecordingPass : org::TypedRenderGraphPass<DirectRecordingPass> {
+    inline static unsigned recordings = 0;
+    void Declare(org::PassBuilder&) {}
+    static void Record(org::PassRecordContext&) { ++recordings; }
+};
+
 struct TypedLifecycleCounts { int recorded = 0, submitted = 0, completed = 0, abandoned = 0; };
+struct SignalRecorder {
+    static void Record(const org::EmptyPassFrameData&, org::RecordingContext&) {}
+};
+
+int TestSignalReservations(rhi::Device device) {
+    for (bool submit : {false, true}) {
+        int cancelled = 0;
+        std::weak_ptr<rhi::TimelinePtr> lifetime;
+        {
+            auto timeline = std::make_shared<rhi::TimelinePtr>();
+            CHECK(device.CreateTimeline(*timeline, 0, "Service reservation") == rhi::Result::Ok);
+            lifetime = timeline;
+            org::PreparedDependencyCollector collector;
+            collector.Reserve(std::make_shared<org::runtime::ExternalSignalReservation>(
+                timeline, 7, [&] { ++cancelled; }));
+            auto dependencies = std::move(collector).Freeze();
+            auto packet = org::PreparedPass::FromTyped<SignalRecorder>(org::EmptyPassFrameData{}, dependencies);
+            timeline.reset();
+            CHECK(!lifetime.expired());
+            CHECK(packet.ExternalSignalsAfterCompletion().size() == 1);
+            CHECK(packet.ExternalSignalsAfterCompletion()[0].value == 7);
+            CHECK(packet.ExternalSignalsAfterCompletion()[0].timeline.IsValid());
+            if (submit) dependencies->Submitted({1});
+            else {
+                CHECK(packet.Abandon(org::AbandonReason::GenerationInvalidated));
+                CHECK(!packet.Abandon(org::AbandonReason::Shutdown));
+            }
+            dependencies.reset();
+            CHECK(!lifetime.expired());
+        }
+        CHECK(lifetime.expired());
+        CHECK(cancelled == (submit ? 0 : 1));
+    }
+    return 0;
+}
 struct TypedLifecycleData { std::shared_ptr<TypedLifecycleCounts> counts; };
 struct TypedLifecyclePass {
     static void Record(const TypedLifecycleData& data, org::RecordingContext&) { ++data.counts->recorded; }
@@ -28,6 +77,81 @@ struct TypedLifecyclePass {
     static void Completed(const TypedLifecycleData& data, const org::CompletionContext&) { ++data.counts->completed; }
     static void Abandoned(const TypedLifecycleData& data, org::AbandonReason) { ++data.counts->abandoned; }
 };
+
+int TestServiceWorkReservations() {
+    org::runtime::FrameWorkQueue<int> queue;
+    queue.Enqueue(1); queue.Enqueue(2);
+    auto selected = queue.Pending();
+    org::FramePreparationContext prepare;
+    prepare.dependencyCollector = std::make_shared<org::PreparedDependencyCollector>();
+    queue.Reserve(selected, prepare);
+    auto first = std::move(*prepare.dependencyCollector).Freeze();
+    CHECK(queue.Pending().empty());
+    queue.Enqueue(3);
+    first->Abandoned(org::AbandonReason::AdmissionFailed);
+    first->Abandoned(org::AbandonReason::Shutdown);
+    auto restored = queue.Pending();
+    CHECK(restored.size() == 3 && restored[0]->work == 1 && restored[2]->work == 3);
+    prepare.dependencyCollector = std::make_shared<org::PreparedDependencyCollector>();
+    queue.Reserve(restored, prepare);
+    auto submitted = std::move(*prepare.dependencyCollector).Freeze();
+    submitted->Submitted({1});
+    submitted->Abandoned(org::AbandonReason::Shutdown);
+    submitted.reset();
+    CHECK(queue.Pending().empty());
+    // Publication failure restores the queue even without an explicit callback.
+    queue.Enqueue(4);
+    prepare.dependencyCollector.reset();
+    bool rejected = false;
+    try { queue.Reserve(queue.Pending(), prepare); } catch (const std::logic_error&) { rejected = true; }
+    CHECK(rejected && queue.Pending().size() == 1);
+    prepare.dependencyCollector = std::make_shared<org::PreparedDependencyCollector>();
+    queue.Reserve(queue.Pending(), prepare);
+    auto discarded = std::move(*prepare.dependencyCollector).Freeze();
+    queue.DiscardUnsubmitted([](int work) { return work == 4; });
+    discarded->Abandoned(org::AbandonReason::GenerationInvalidated);
+    CHECK(queue.Pending().empty());
+    // Stale and duplicate selections must not partially consume valid work.
+    queue.Enqueue(5);
+    auto duplicates = queue.Pending(); duplicates.push_back(duplicates.front());
+    rejected = false;
+    try { queue.Reserve(duplicates, prepare); } catch (const std::logic_error&) { rejected = true; }
+    CHECK(rejected && queue.Pending().size() == 1);
+    const auto counters = queue.ReadCounters();
+    CHECK(counters.accepted == 5 && counters.submitted == 3 && counters.discarded == 1);
+    CHECK(counters.pending == 1 && counters.reserved == 0 && counters.returned == 3);
+    struct CommitWork { std::shared_ptr<unsigned> count; void Commit() const { ++*count; } };
+    org::runtime::FrameWorkQueue<CommitWork> commits;
+    auto count = std::make_shared<unsigned>(0);
+    commits.Enqueue({count});
+    prepare.dependencyCollector = std::make_shared<org::PreparedDependencyCollector>();
+    commits.Reserve(commits.Pending(), prepare);
+    auto effect = std::move(*prepare.dependencyCollector).Freeze();
+    effect->Submitted({1}); effect->Submitted({1}); effect.reset();
+    CHECK(*count == 1 && commits.Pending().empty());
+    // CPU-written service allocations survive queue replacement and submission.
+    // Cancellation returns the same owner; retirement releases it exactly once.
+    unsigned releases = 0;
+    org::runtime::FrameWorkQueue<std::shared_ptr<unsigned>> leases;
+    auto lease = std::shared_ptr<unsigned>(new unsigned{42}, [&](unsigned* value) { ++releases; delete value; });
+    leases.Enqueue(lease);
+    lease.reset();
+    prepare.dependencyCollector = std::make_shared<org::PreparedDependencyCollector>();
+    leases.Reserve(leases.Pending(), prepare);
+    auto retained = std::move(*prepare.dependencyCollector).Freeze();
+    retained->Abandoned(org::AbandonReason::AdmissionFailed);
+    retained.reset();
+    CHECK(releases == 0 && leases.Pending().size() == 1);
+    prepare.dependencyCollector = std::make_shared<org::PreparedDependencyCollector>();
+    leases.Reserve(leases.Pending(), prepare);
+    retained = std::move(*prepare.dependencyCollector).Freeze();
+    retained->Submitted({2});
+    leases = {};
+    CHECK(releases == 0);
+    retained.reset(); // The containing frame drops dependencies after retirement.
+    CHECK(releases == 1);
+    return 0;
+}
 
 int TestOwnedRenderFrameSnapshot() {
     org::experimental::GraphCompileInput input;
@@ -234,10 +358,16 @@ int TestPreparedGpuSubmission(rhi::Device device, ID3D12Device* nativeDevice) {
             0, static_cast<uint64_t>(rhi::ResourceSyncState::Copy), write};
     };
     pass.entryStates = {{0,{},copyState(false)}, {1,{},copyState(true)}};
+    // This test deliberately submits upload and readback as separate packets.
+    // The compiler otherwise legally merges the two same-queue passes.
+    pass.preparedPassIndex = 0;
+    pass.forceBatchIsolation = true;
     CompilePass readbackPass;
     readbackPass.originalOrder = 1;
     readbackPass.accesses = {{1,false},{2,true}};
     readbackPass.entryStates = {{1,{},copyState(false)}, {2,{},copyState(true)}};
+    readbackPass.preparedPassIndex = 1;
+    readbackPass.forceBatchIsolation = true;
     input.structure.passes = {pass,readbackPass};
     auto owned = std::make_shared<const GraphCompileInput>(std::move(input));
     auto job = std::async(std::launch::async, [owned] {
@@ -282,12 +412,17 @@ int TestPreparedGpuSubmission(rhi::Device device, ID3D12Device* nativeDevice) {
             static_cast<uint64_t>(rhi::ResourceAccessType::Common), 0,
             static_cast<uint64_t>(rhi::ResourceSyncState::All), false};
         std::vector<PreparedBackingState> initialStates;
-        for (int i = 0; i < 3; ++i)
+        for (int i = 0; i < 3; ++i) {
             initialStates.push_back({static_cast<uint64_t>(i + 1), {}, lease->resources[i].GetHandle(),
                 {1,1,false}, {{{},commonState}}});
+            initialStates.back().heapType = i == 0 ? rhi::HeapType::Upload
+                : i == 2 ? rhi::HeapType::Readback : rhi::HeapType::DeviceLocal;
+        }
         auto barrierPlan = backingStates.Prepare(*compiled, initialStates);
         CHECK(barrierPlan.batches.size() == compiled->batches.size());
-        CHECK(!barrierPlan.batches[0].beforePass[0].buffers.empty()
+        CHECK(barrierPlan.batches.size() == 2);
+        CHECK(!barrierPlan.batches[0].beforePass.empty() && !barrierPlan.batches[1].beforePass.empty());
+        CHECK(barrierPlan.batches[0].beforePass[0].buffers.empty()
             && !barrierPlan.batches[1].beforePass[0].buffers.empty());
         void* mapped = nullptr;
         CHECK(SUCCEEDED(lease->native[0]->Map(0, nullptr, &mapped)));
@@ -323,6 +458,17 @@ int TestPreparedGpuSubmission(rhi::Device device, ID3D12Device* nativeDevice) {
         catch (const std::out_of_range&) { invalidSlotRejected = true; }
         CHECK(invalidSlotRejected);
         auto lifecycle = std::make_shared<TypedLifecycleCounts>();
+        org::PreparedPass directPacket;
+        {
+            DirectRecordingPass pass;
+            org::FramePreparationContext preparation{};
+            directPacket = pass.PrepareFrame(preparation);
+        } // A direct packet must not capture its authoring object.
+        const auto directRecordingsBefore = DirectRecordingPass::recordings;
+        directPacket.Record(recording);
+        CHECK(DirectRecordingPass::recordings == directRecordingsBefore + 1);
+        directPacket.CommitSubmitted();
+        directPacket.CommitCompleted();
         auto typedPacket = org::PreparedPass::FromTyped<TypedLifecyclePass>(TypedLifecycleData{lifecycle});
         CHECK(typedPacket.IsWorkerSafe());
         typedPacket.Record(recording);
@@ -562,12 +708,12 @@ int TestOwnedDescriptorGpuExecution(const rhi::DeviceCreateInfo& create) {
         closed.bindings = std::make_shared<const org::FrozenExecutionBindings>(
             std::vector<org::FrozenExecutionBindings::ResourceBinding>{});
         closed.passes.push_back(org::PreparedPass::Make(0,+[](const int&,org::RecordingContext&) {}));
-        CHECK(device.CreateCommandAllocator(rhi::QueueKind::Graphics,closed.allocator) == rhi::Result::Ok);
-        CHECK(device.CreateCommandList(rhi::QueueKind::Graphics,closed.allocator.Get(),closed.commands) == rhi::Result::Ok);
-        auto legacy = closed.commands.Get(); auto legacyTable = *legacy.vt;
+        CHECK(device.CreateCommandAllocator(rhi::QueueKind::Graphics,closed.allocation->pair.allocator) == rhi::Result::Ok);
+        CHECK(device.CreateCommandList(rhi::QueueKind::Graphics,closed.allocation->pair.allocator.Get(),closed.allocation->pair.list) == rhi::Result::Ok);
+        auto legacy = closed.allocation->pair.list.Get(); auto legacyTable = *legacy.vt;
         legacyTable.abi_version = 5; legacy.vt = &legacyTable;
         CHECK(!legacy.SupportsCheckedEnd() && legacy.EndChecked() == rhi::Result::Unsupported);
-        CHECK(closed.commands.Get().EndChecked() == rhi::Result::Ok);
+        CHECK(closed.allocation->pair.list.Get().EndChecked() == rhi::Result::Ok);
         std::vector<OwnedRecordingList> lists; lists.push_back(std::move(closed));
         bool rejected = false;
         try {
@@ -600,6 +746,7 @@ int TestOwnedDescriptorGpuExecution(const rhi::DeviceCreateInfo& create) {
     CHECK(graph->batches.size() == 1 && graph->batches[0].passes == (std::vector<uint32_t>{0,1}));
     auto bundle = std::make_shared<const CompiledGraphBundle>(CompiledGraphBundle{1,graph,owned});
     ExecutionTimelineAdmission admission({{1,0}},1);
+    auto commandPool = std::make_shared<org::CommandListPool>(device, rhi::QueueKind::Graphics);
     for (uint32_t iteration = 1; iteration != 3; ++iteration) {
         struct Backing {
             std::shared_ptr<Runtime> runtime;
@@ -665,13 +812,14 @@ int TestOwnedDescriptorGpuExecution(const rhi::DeviceCreateInfo& create) {
         auto barrierPlan = stateLedger.Prepare(*graph, initial);
         CHECK(barrierPlan.batches.size() == 1);
         CHECK(barrierPlan.batches[0].beforePass.size() == 2);
-        CHECK(!barrierPlan.batches[0].beforePass[0].buffers.empty());
+        // A fresh COMMON buffer has no prior access to synchronize. The
+        // clear-to-copy dependency must still have an intra-batch barrier.
+        CHECK(barrierPlan.batches[0].beforePass[0].buffers.empty());
         CHECK(!barrierPlan.batches[0].beforePass[1].buffers.empty());
         std::vector<OwnedRecordingList> recordings(1);
         for (auto& recording : recordings) {
             recording.bindings = bindings;
-            CHECK(device.CreateCommandAllocator(rhi::QueueKind::Graphics,recording.allocator) == rhi::Result::Ok);
-            CHECK(device.CreateCommandList(rhi::QueueKind::Graphics,recording.allocator.Get(),recording.commands) == rhi::Result::Ok);
+
         }
         recordings[0].passes.push_back(org::PreparedPass::Make(iteration,
             +[](const uint32_t& value, org::RecordingContext& context) {
@@ -690,21 +838,30 @@ int TestOwnedDescriptorGpuExecution(const rhi::DeviceCreateInfo& create) {
             }));
         recordings[0].barriersBeforePass = barrierPlan.batches[0].beforePass;
         auto recordingJob = std::async(std::launch::async,
-            [recordings = std::move(recordings), runtime, device]() mutable {
-                std::vector<std::shared_ptr<const IPreparedExecutionBatch>> packets;
-                for (auto& recording : recordings) {
-                    std::vector<OwnedRecordingList> batch; batch.push_back(std::move(recording));
-                    packets.push_back(RecordPreparedRhiExecutionBatch(0, device.GetQueue(rhi::QueueKind::Graphics),
-                        std::move(batch),{{1,runtime->timeline.Get().GetHandle()}},runtime));
-                }
-                return packets;
+            [recordings = std::move(recordings), runtime, bundle, device, commandPool]() mutable {
+                auto layout = std::make_shared<GraphExecutionLayout>(); layout->bundle = bundle;
+                auto snapshot = std::make_shared<RenderFrameSnapshot>(); snapshot->layout = layout;
+                snapshot->leases.push_back(runtime);
+                PlannedFrame plan; plan.snapshot = snapshot;
+                plan.timelines = {{1,runtime->timeline.Get().GetHandle()}};
+                plan.incomingWaits.resize(1);
+                FrameRecordingJob job; job.device = device;
+                job.queue = device.GetQueue(rhi::QueueKind::Graphics); job.pool = commandPool;
+                job.recording = std::move(recordings[0]);
+                plan.jobs.push_back(std::move(job));
+                return RecordFrame(std::move(plan), {}, 1);
             });
-        auto packets = recordingJob.get();
+        std::optional<RecordedFrame> recorded(recordingJob.get());
         std::weak_ptr<const org::FrozenExecutionBindings> bindingLease = bindings;
         gpu.reset(); cpu.reset(); backing.reset(); bindings.reset();
-        auto execution = admission.SubmitPrepared(bundle,{{}},packets);
-        packets.clear(); execution.reset(); // Only admission owns the recording packets now.
+        auto execution = std::move(*recorded).Submit(admission);
+        bool duplicateRejected = false;
+        try { std::move(*recorded).Submit(admission); }
+        catch (const std::logic_error&) { duplicateRejected = true; }
+        CHECK(duplicateRejected);
+        recorded.reset(); execution.reset(); // Admission alone retains GPU recording ownership.
         CHECK(!bindingLease.expired());
+        CHECK(commandPool->GetDiagnostics().checkedOutCount == 1);
         CHECK(!gpuPool.Assemble(0,gpuContents) && !cpuPool.Assemble(0,cpuContents));
         CHECK(runtime->timeline.Get().HostWait(iteration,10000) == rhi::Result::Ok);
         void* mapped = nullptr; CHECK(SUCCEEDED(readbackResource->Map(0,nullptr,&mapped)));
@@ -712,6 +869,8 @@ int TestOwnedDescriptorGpuExecution(const rhi::DeviceCreateInfo& create) {
         readbackResource->Unmap(0,nullptr);
         CHECK(admission.RetireCompleted(std::vector<ExecutionTimelinePoint>{{1,iteration}}) == 1);
         CHECK(bindingLease.expired());
+        CHECK(commandPool->GetDiagnostics().checkedOutCount == 0);
+        CHECK(commandPool->GetDiagnostics().totalOwnedCount == 1);
         CHECK(gpuPool.Assemble(0,gpuContents) && cpuPool.Assemble(0,cpuContents));
     }
     return 0;
@@ -779,6 +938,25 @@ int TestAliasHeapOwnership(const rhi::DeviceCreateInfo& create) {
 }
 
 int main() {
+    if (const auto failure = TestServiceWorkReservations()) return failure;
+    {
+        // A work graph may be the only retained program in a pass.
+        bool destroyed = false;
+        rhi::WorkGraphVTable table{};
+        rhi::WorkGraph graph(rhi::WorkGraphHandle{1, 1});
+        graph.impl = &destroyed;
+        graph.vt = &table;
+        auto owner = std::make_shared<rhi::WorkGraphPtr>(rhi::Device{}, graph,
+            +[](rhi::Device&, rhi::WorkGraph& value) noexcept { *static_cast<bool*>(value.impl) = true; });
+        org::PreparedDependencyCollector collector;
+        const auto reference = collector.CaptureWorkGraph(owner);
+        auto dependencies = std::move(collector).Freeze();
+        owner.reset();
+        CHECK(dependencies && !dependencies->empty() && !destroyed);
+        CHECK(dependencies->Resolve(reference).index == 1);
+        dependencies.reset();
+        CHECK(destroyed);
+    }
 	if (const auto failure = TestOwnedRenderFrameSnapshot()) return failure;
 	Microsoft::WRL::ComPtr<IDXGIFactory6> factory; Microsoft::WRL::ComPtr<IDXGIAdapter> warp;
 	CHECK(SUCCEEDED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory))));
@@ -786,6 +964,7 @@ int main() {
 	rhi::DeviceCreateInfo create{}; create.backend = rhi::Backend::D3D12; create.nativeAdapter = warp.Get(); create.framesInFlight = 2;
     if (const auto failure = TestDescriptorSnapshots(create)) return failure;
     if (const auto failure = TestOwnedDescriptorGpuExecution(create)) return failure;
+    if (const auto failure = TestDelayedFrameRecording(create)) return failure;
     if (const auto failure = TestAliasHeapOwnership(create)) return failure;
 	rhi::DevicePtr device; CHECK(!rhi::Failed(rhi::CreateD3D12Device(create, device)) && device);
 	auto* nativeDevice = rhi::dx12::get_device(device.Get()); CHECK(nativeDevice);
@@ -857,6 +1036,10 @@ int main() {
 	rhi::ResourcePtr incompatible; CHECK(!rhi::Failed(rhi::dx12::import_resource(device.Get(), textureA.Get(), incompatible)));
 	CHECK(!texture->RefreshShared(std::move(incompatible), changed, false));
 	buffer.reset(); texture.reset();
+    if (const auto failure = TestSignalReservations(device.Get())) return failure;
+    if (const auto failure = TestProgramVersions(device.Get())) return failure;
+    if (const auto failure = TestReadbackCaptures(device.Get())) return failure;
+    if (const auto failure = TestFrameRetirement(device.Get())) return failure;
 	org::runtime::ShutdownRuntimeDevice();
 	return 0;
 }

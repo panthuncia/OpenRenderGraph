@@ -121,34 +121,9 @@ const DescriptorHeapManager::BackendHeaps* DescriptorHeapManager::FindBackendHea
 }
 
 void DescriptorHeapManager::Cleanup() {
-    std::vector<DeferredRelease> releases;
-    {
-        std::scoped_lock lock(m_descriptorMutationMutex);
-        releases.swap(m_deferredReleases);
-        m_deferredResourcePointers.clear();
-        m_latestQueueFenceSnapshot.clear();
-    }
-    for (auto& release : releases) {
-        for (auto& [heap, index] : release.descriptorSlots) {
-            if (heap) {
-                heap->ReleaseDescriptor(index);
-            }
-        }
-    }
-    releases.clear();
-    // Destroying deferred resources above may enqueue their descriptor slots.
-    // Drain that final descriptor-only wave before releasing the heaps.
-    {
-        std::scoped_lock lock(m_descriptorMutationMutex);
-        releases.swap(m_deferredReleases);
-    }
-    for (auto& release : releases) {
-        for (auto& [heap, index] : release.descriptorSlots) {
-            if (heap) {
-                heap->ReleaseDescriptor(index);
-            }
-        }
-    }
+    // Destruction can recursively retire other owners, not just one final
+    // wave of descriptor slots. Quiescent cleanup must reach a fixed point.
+    DrainDeferredReleasesAfterDeviceIdle();
     m_backendHeaps.clear();
 	m_indexedSamplerDescriptions.clear();
     m_cbvSrvUavHeap.reset();
@@ -254,6 +229,20 @@ void DescriptorHeapManager::RetireExecutionLease(std::shared_ptr<const void> lea
     m_deferredReleases.push_back(std::move(release));
 }
 
+void DescriptorHeapManager::RetireExecutionLease(std::shared_ptr<const void> lease,
+    std::vector<QueueFenceSnapshotPoint> completion) {
+    if (!lease) return;
+    if (completion.empty()) throw std::invalid_argument("Execution retirement requires submitted completion points");
+    for (const auto& point : completion)
+        if (!point.timeline.IsValid() || !point.value || point.value == UINT64_MAX)
+            throw std::invalid_argument("Invalid execution retirement point");
+    DeferredRelease release{};
+    release.requiredFences = std::move(completion);
+    release.executionLeases.push_back(std::move(lease));
+    std::scoped_lock lock(m_descriptorMutationMutex);
+    m_deferredReleases.push_back(std::move(release));
+}
+
 void DescriptorHeapManager::ProcessDeferredReleases(uint8_t frameIndex) {
     (void)frameIndex;
     std::vector<DeferredRelease> readyReleases;
@@ -344,6 +333,7 @@ void DescriptorHeapManager::DrainDeferredReleasesAfterDeviceIdle() {
     // discarded before a render-graph rebuild destroys the timelines owned by
     // QueueRegistry.
     std::vector<DeferredRelease> releases;
+    uint64_t drained = 0, waves = 0;
     for (;;) {
         {
             std::scoped_lock lock(m_descriptorMutationMutex);
@@ -355,6 +345,8 @@ void DescriptorHeapManager::DrainDeferredReleasesAfterDeviceIdle() {
             releases.swap(m_deferredReleases);
             m_deferredResourcePointers.clear();
         }
+        drained += releases.size();
+        ++waves;
 
         for (auto& release : releases) {
             for (auto& [heap, index] : release.descriptorSlots) {
@@ -368,6 +360,7 @@ void DescriptorHeapManager::DrainDeferredReleasesAfterDeviceIdle() {
         // descriptor slots. Loop until that wave has also been released.
         releases.clear();
     }
+    spdlog::info("ORG retirement drain: releases={} waves={} remaining=0", drained, waves);
 }
 
 void DescriptorHeapManager::AssignDescriptorSlots(

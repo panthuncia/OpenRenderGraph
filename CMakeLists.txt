@@ -101,6 +101,8 @@ add_library(OpenRenderGraph STATIC
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/InteropAllocator.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/SharedAliasPoolManager.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraphCompile.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/FrameRecording.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/FramePlanning.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraphCompileProfile.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/Aliasing/RenderGraphAliasingSubsystem.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/Aliasing/RenderGraphAliasingAlgorithms.cpp"
@@ -188,7 +190,14 @@ endif()
 
 if(OPENRENDERGRAPH_BUILD_TESTS)
     enable_testing()
-    add_executable(OpenRenderGraphAsyncCompileTests tests/AsyncCompileTests.cpp)
+    add_custom_target(OpenRenderGraphAsyncFrameTests DEPENDS
+        OpenRenderGraphFrameContextTests OpenRenderGraphAsyncCompileTests OpenRenderGraphExternalResourceTests)
+    add_executable(OpenRenderGraphFrameContextTests tests/FrameContextTests.cpp)
+    target_compile_features(OpenRenderGraphFrameContextTests PRIVATE cxx_std_23)
+    target_include_directories(OpenRenderGraphFrameContextTests PRIVATE include)
+    target_compile_definitions(OpenRenderGraphFrameContextTests PRIVATE NOMINMAX)
+    add_test(NAME OpenRenderGraphFrameContextTests COMMAND OpenRenderGraphFrameContextTests)
+    add_executable(OpenRenderGraphAsyncCompileTests tests/AsyncCompileTests.cpp tests/FramePlanningTests.cpp)
     target_compile_features(OpenRenderGraphAsyncCompileTests PRIVATE cxx_std_23)
     target_include_directories(OpenRenderGraphAsyncCompileTests PRIVATE include)
     target_link_libraries(OpenRenderGraphAsyncCompileTests PRIVATE
@@ -196,7 +205,8 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
         BasicRHI::BasicRHI spdlog::spdlog_header_only)
     target_compile_definitions(OpenRenderGraphAsyncCompileTests PRIVATE NOMINMAX)
     add_test(NAME OpenRenderGraphAsyncCompileTests COMMAND OpenRenderGraphAsyncCompileTests)
-    add_executable(OpenRenderGraphExternalResourceTests tests/ExternalResourceTests.cpp)
+    add_executable(OpenRenderGraphExternalResourceTests tests/ExternalResourceTests.cpp tests/FrameRecordingTests.cpp tests/FrameRetirementTests.cpp tests/ProgramVersionTests.cpp tests/ReadbackCaptureTests.cpp)
+    target_include_directories(OpenRenderGraphExternalResourceTests PRIVATE src/include)
     if(WIN32)
         # BasicRHI is a static library and its D3D12 object references the
         # Streamline C API. Standalone tests do not load the host interposer,
@@ -210,7 +220,7 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
     if(MSVC)
         target_compile_options(OpenRenderGraphExternalResourceTests PRIVATE /utf-8)
     endif()
-    target_link_libraries(OpenRenderGraphExternalResourceTests PRIVATE OpenRenderGraph BasicRHI::BasicRHI d3d12 dxgi)
+    target_link_libraries(OpenRenderGraphExternalResourceTests PRIVATE OpenRenderGraph BasicRHI::BasicRHI d3d12 dxgi d3dcompiler)
     if(WIN32 AND TARGET Pix::headers)
         find_library(OPENRENDERGRAPH_PIX_RUNTIME NAMES WinPixEventRuntime
             HINTS "${CMAKE_CURRENT_SOURCE_DIR}/../BasicRenderer" REQUIRED)
