@@ -43,7 +43,12 @@ struct BindlessResourceViews {
             if (view.kind == request.kind && view.variant == request.variant
                 && view.mip == request.mip && view.slice == request.slice)
                 return view.descriptor;
-        throw std::out_of_range("Declared resource does not publish the requested bindless view");
+        throw std::out_of_range("Declared resource does not publish the requested bindless view; kind="
+            + std::to_string(static_cast<uint32_t>(request.kind))
+            + " variant=" + std::to_string(request.variant)
+            + " mip=" + std::to_string(request.mip)
+            + " slice=" + std::to_string(request.slice)
+            + " available=" + std::to_string(views.size()));
     }
     uint32_t SliceCount(BindlessViewRequest request) const noexcept {
         if (request.kind == BindlessViewKind::ShaderResource && request.variant == UINT32_MAX)

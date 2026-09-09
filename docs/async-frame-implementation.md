@@ -1043,3 +1043,152 @@ preparation, and leave index publication in versioned producer services. In
 particular, AVBOIT setup's `Update` still publishes descriptor indices into its
 configuration upload; that upload and the referenced versions must become one
 frame-owned publication before preparation can safely run ahead across frames.
+
+The GTAO filter, main, and denoise passes are also converted as one compute
+family. Their SRV and UAV root constants resolve from returned tokens, including
+the five distinct working-depth mip UAVs. GTAO's rotating sample index now comes
+from the immutable logical frame number; preparation no longer increments
+pass-owned state. Identifier overloads for shader-resource, unordered-access,
+and constant-buffer declarations support this style without an early registry
+lookup.
+
+Returned bindings deliberately enforce a const preparation callback. The debug
+sphere and skeleton passes currently build ECS workloads and mutate upload
+buffers during preparation, so they remain on the transitional callback until
+that workload production is published as immutable frame input. Converting only
+their descriptor constants would incorrectly certify the mutable preparation
+path as safe for recording ahead.
+
+Tonemapping, motion-vector dilation, and skybox compute now use the same
+contract. Tonemapping freezes the LPM resource and optional bloom mip views;
+motion dilation and skybox derive dispatch dimensions from the captured resource
+description rather than `PixelBuffer` instances. Their initialization-time
+resource pointer caches were removed.
+
+ForwardRenderPass now freezes its color and depth attachment views through
+returned bindings. Its unused direct-forward and duplicate indirect execution
+bodies were removed; the typed recorded sequence is the sole implementation.
+AVBOIT adaptive fit and occupancy histogram likewise resolve their compute views
+from returned tokens, with histogram dispatch dimensions taken from the frozen
+occupancy description. Using the precise descriptor-view API inventory (and
+excluding buffer metadata such as `GetUAVCounterOffset`), 66 pass/extension
+files with 558 direct queries remain.
+
+AVBOIT integrate and resolve complete another stable-resource compute pair.
+Their configuration, fit-state, accumulation, normalization, and extinction
+indices now come from frozen SRV tokens, while dispatch dimensions come from
+the captured occupancy/accumulation descriptions. The inventory after this pair
+is 64 files with 552 direct descriptor-view queries.
+
+The remaining AVBOIT fit-update, depth-warp, occupancy-remap, early-depth-build,
+and sparse-clear compute passes now use returned bindings as well. Their root
+constants and dimensions resolve exclusively from each accepted frame's frozen
+resource versions. Together with the Reyes queue-reset pass, which freezes its
+required and optional counter sets, this reduces the precise inventory to 58
+files with 526 direct descriptor-view queries. AVBOIT setup remains separate:
+its remaining queries publish indices into a CPU upload during `Update`, so it
+must move as a coherent publication rather than disguising live indices as
+prepared bindings.
+
+Range-aware returned bindings now accept the same `ResourcePtrAndRange` used by
+the state declaration API. The virtual-shadow dirty and non-rasterable hierarchy
+passes use those tokens for their mip ranges and resolve full-array SRV/UAV
+views from the accepted frame. Clear-dirty-bits, build-active-blocks, and
+build-mark-tiles use the same contract; settings that affect recorded constants
+are copied into returned bindings during declaration. This five-pass batch
+removes another 14 live descriptor queries. The precise remaining inventory is
+53 files with 512 queries.
+
+Page-list construction, physical-page composition, wrapped-page release, and
+statistics gathering now freeze all of their buffer and texture views through
+returned bindings. Their pass configuration flags are copied into the binding
+snapshot, and array texture variants are selected explicitly while resolving
+the captured version. This removes 22 more queries, leaving 49 pass/extension
+files with 490 direct descriptor-view queries.
+
+Virtual-shadow allocation, physical-page clear, marked-block resolution, and
+marking now use returned binding snapshots. This includes indirect argument
+ownership, optional receiver-mask resources, explicit UAV barrier resources,
+and configuration values previously read from mutable pass state or settings
+during preparation. The multi-pipeline mark pass demonstrates that one binding
+snapshot can safely feed clears, barriers, and an indirect dispatch. These four
+passes remove 38 queries, leaving 45 files with 452 direct descriptor-view
+queries.
+
+Reyes classification, raster-work construction, and raster-work compaction now
+return all queue, counter, indirect, telemetry, optional occlusion, and barrier
+resources as accepted-frame bindings. Configuration values, including the
+AABB-occlusion choice and raster bucket count, are copied into the same
+snapshot; the builder's counter reset remains owned by the upload service.
+Deep-visibility resolve likewise freezes its dynamically selected primary-view
+head pointers, resolution, PSO flags, lighting switches, and ten descriptor
+views before preparation. The remaining inventory is 24 files with 298 direct
+descriptor-view queries.
+
+Debug spheres now resolve camera and object-buffer indices through returned
+bindings. Debug skeleton moves line generation and dynamic-buffer replacement
+to host update, before declaration freezes the backing, then resolves its line
+SRV, per-frame CBV, and camera SRV during const preparation. The direct-query
+inventory is now 22 files with 293 calls.
+
+Reyes split and patch rasterization now resolve all queue, tessellation, shadow
+hierarchy, replay, telemetry, and indirect resources from returned bindings.
+Split retains its output-counter barriers through those tokens and snapshots
+its occlusion/coarse-target settings. Patch raster preserves its dynamic
+visibility-output declarations while freezing every descriptor constant and
+its enable state. This removes 31 queries, leaving 20 files with 262 direct
+descriptor-view calls.
+
+Predicted-page deduplication and page invalidation now use the same returned
+snapshot. Invalidation copies its pending input counts, bounds count, and
+invalidate-all flag after update, so preparation no longer reads mutable
+workload state while resolving its nine views. These two passes remove 18
+queries, leaving 43 files with 434 direct descriptor-view queries.
+
+Virtual-shadow setup now returns the nine views used by its setup dispatch and
+copies reset reasons, recovery state, automatic-bias enablement, and bias scale
+after `Update`. Its const preparation step derives descriptors only from the
+accepted frame snapshot. The inventory is now 42 files with 425 direct
+descriptor-view queries.
+
+Predicted-page expansion now resolves ten resource views from one returned
+binding snapshot, including the full-array page-table UAV. Page admission also
+returns frozen tokens for its static resources and declared upgrade-input set;
+queued upgrade publications are matched to those tokens while the existing
+service reservation retains its submit-or-return semantics. The complete
+virtual-shadow-map pass family now has no direct descriptor-view queries. The
+remaining pass/extension inventory is 40 files with 407 queries.
+
+The raster-bucket command, histogram, block-scan, and block-offset setup chain
+now returns resource tokens and the immutable bucket-count/enable snapshot used
+by its worker preparation. Optional Reyes ownership, telemetry, replay, and
+base-counter inputs carry explicit presence flags, and indirect/barrier
+resources are captured through their declaration tokens. Preparation no longer
+consults the live material manager or software-raster setting. This removes 18
+queries, leaving 36 files with 389 direct descriptor-view queries.
+
+Raster-bucket compaction now captures all fifteen input/output views, its
+indirect command, cursor barrier resource, optional telemetry/Reyes inputs, and
+the update-derived workload configuration through returned bindings. The
+streaming begin-frame clears and Reyes dispatch-argument builder follow the
+same contract. Replay merge, patch seeding, dice, and raster-work histogram
+then remove their mutable stored tokens and resolve queue, telemetry, indirect,
+and barrier resources from accepted-frame snapshots. These migrations leave 29
+files with 349 direct descriptor-view queries.
+
+Streaming feedback sort now declares and returns its request-counter SRV, seven
+ping-pong/scratch UAVs, and separate UAV and indirect-argument tokens for both
+generated dispatch buffers. Preparation captures barrier and indirect
+resources from those tokens and derives every radix-sort constant from the same
+frozen views. The inventory is now 28 files with 339 direct descriptor-view
+queries.
+
+The compute and hardware Reyes virtual-shadow raster paths now return their
+complete input, output, telemetry, and indirect-argument binding snapshots.
+Resolution and raster-bucket metadata are copied at declaration, so worker
+preparation resolves coherent views and program variants without reading live
+pass state. Reyes deep-visibility raster preparation follows the same contract,
+including its dynamically declared visibility and head-pointer resources. Its
+two host-update queries remain explicit pending the per-view GPU publication
+migration. The current exact inventory is 18 files with 218 direct
+descriptor-view queries.

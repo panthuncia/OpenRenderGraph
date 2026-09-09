@@ -360,12 +360,12 @@ struct FramePreparationContext {
 
     PreparedResourceReference CaptureResource(ResourceBindingToken binding) const {
         if (resourceSlots) {
-            if (const auto found = resourceSlots->find(binding.globalResourceID);
-                found != resourceSlots->end()) return {found->second};
             if (const auto found = resourceSlots->find(binding.registryResourceID);
                 found != resourceSlots->end()) return {found->second};
+            if (const auto found = resourceSlots->find(binding.globalResourceID);
+                found != resourceSlots->end()) return {found->second};
         }
-        return CaptureResource(binding.globalResourceID);
+        return CaptureResource(binding.registryResourceID);
     }
 
     PreparedDescriptorReference CaptureDescriptor(ResourceBindingToken binding,
@@ -378,7 +378,15 @@ struct FramePreparationContext {
 
     rhi::DescriptorSlot ResolveView(ResourceBindingToken binding, BindlessViewRequest request) const {
         if (!bindings) throw std::logic_error("Frozen resource bindings are unavailable during preparation");
-        return bindings->Views(CaptureResource(binding)).Resolve(request);
+        try {
+            return bindings->Views(CaptureResource(binding)).Resolve(request);
+        } catch (const std::exception& error) {
+            throw std::out_of_range(std::string(error.what()) + "; resource="
+                + std::to_string(binding.globalResourceID) + "/" + std::to_string(binding.registryResourceID)
+                + " kind=" + std::to_string(static_cast<uint32_t>(request.kind))
+                + " variant=" + std::to_string(request.variant)
+                + " mip=" + std::to_string(request.mip) + " slice=" + std::to_string(request.slice));
+        }
     }
 
     PreparedDescriptorReference CaptureView(ResourceBindingToken binding, BindlessViewRequest request) const {

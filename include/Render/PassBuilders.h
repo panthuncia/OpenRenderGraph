@@ -13,6 +13,7 @@
 #include "ResourceRequirements.h"
 #include "Resources/ResourceStateTracker.h"
 #include "Resources/ResourceIdentifier.h"
+#include "Resources/GloballyIndexedResource.h"
 #include "Interfaces/IResourceResolver.h"
 #include "Interfaces/IPassBuilder.h"
 #include "Interfaces/IResourceResolver.h"
@@ -20,6 +21,19 @@
 
 // Tag for a contiguous mip-range [first..first+count)
 namespace org {
+
+inline void MaterializeDeclaredBindlessView(Resource& resource, BindlessViewKind kind) {
+    auto* indexed = dynamic_cast<GloballyIndexedResource*>(&resource);
+    if (!indexed) return;
+    switch (kind) {
+    case BindlessViewKind::ShaderResource: indexed->GetSRVInfo(0); break;
+    case BindlessViewKind::UnorderedAccess: indexed->GetUAVShaderVisibleInfo(0); break;
+    case BindlessViewKind::NonShaderVisibleUnorderedAccess: indexed->GetUAVNonShaderVisibleInfo(0); break;
+    case BindlessViewKind::RenderTarget: indexed->GetRTVInfo(0); break;
+    case BindlessViewKind::DepthStencil: indexed->GetDSVInfo(0); break;
+    case BindlessViewKind::ConstantBuffer: indexed->GetCBVInfo(); break;
+    }
+}
 
 struct Mip {
 	Mip(uint32_t first, uint32_t count) : first(first), count(count) {}
@@ -888,6 +902,18 @@ class RenderPassBuilder : public IPassBuilder {
 public:
     PassBuilderKind Kind() const noexcept override { return PassBuilderKind::Render; }
     IResourceProvider* ResourceProvider() noexcept override { return pass.get(); }
+    // Resolve immutable descriptor metadata for generation-owned GPU tables.
+    // The resource must also be bound by this declaration; this method is not
+    // an alternative resource-access path.
+    template<class ResourceT>
+        requires std::derived_from<ResourceT, GloballyIndexedResource>
+    uint32_t DeclaredBindlessIndex(const std::shared_ptr<ResourceT>& resource,
+        BindlessViewRequest request) const {
+        if (!resource) throw std::invalid_argument("Cannot resolve a view for an empty declared resource");
+        const auto views = resource->CaptureBindlessViews();
+        if (!views) throw std::out_of_range("Declared resource publishes no bindless views");
+        return views->Resolve(request).index;
+    }
     // Typed declaration entry points return a stable token for Prepare. This
     // keeps the familiar fluent With* API intact while avoiding registry
     // lookups and global-ID plumbing in typed passes.
@@ -895,6 +921,7 @@ public:
         requires std::derived_from<ResourceT, Resource>
     ResourceBindingToken BindShaderResource(const std::shared_ptr<ResourceT>& resource) {
         if (!resource) throw std::invalid_argument("Cannot bind an empty shader resource");
+        MaterializeDeclaredBindlessView(*resource, BindlessViewKind::ShaderResource);
         addShaderResource(resource);
         return { resource->GetSchedulingResourceID(), graph->RequestResourceHandle(resource.get()).GetGlobalResourceID() };
     }
@@ -905,8 +932,27 @@ public:
         return {handle.GetGlobalResourceID(), handle.GetGlobalResourceID()};
     }
 
+    ResourceBindingToken BindShaderResource(const ResourcePtrAndRange& resource) {
+        if (!resource.resource) throw std::invalid_argument("Cannot bind an empty shader resource");
+        addShaderResource(resource);
+        return {resource.resource->GetSchedulingResourceID(),
+            graph->RequestResourceHandle(resource.resource.get()).GetGlobalResourceID()};
+    }
+
+    ResourceBindingToken BindShaderResource(const ResourceIdentifier& identifier) {
+        addShaderResource(identifier);
+        const auto handle = graph->RequestResourceHandle(identifier);
+        return {handle.GetGlobalResourceID(), handle.GetGlobalResourceID()};
+    }
+
     ResourceBindingToken BindUnorderedAccessClear(const ResourceIdentifier& identifier) {
         addUnorderedAccessClear(identifier);
+        const auto handle = graph->RequestResourceHandle(identifier);
+        return {handle.GetGlobalResourceID(), handle.GetGlobalResourceID()};
+    }
+
+    ResourceBindingToken BindUnorderedAccess(const ResourceIdentifier& identifier) {
+        addUnorderedAccess(identifier);
         const auto handle = graph->RequestResourceHandle(identifier);
         return {handle.GetGlobalResourceID(), handle.GetGlobalResourceID()};
     }
@@ -917,18 +963,40 @@ public:
         return {handle.GetGlobalResourceID(), handle.GetGlobalResourceID()};
     }
 
+    ResourceBindingToken BindDepthReadWrite(const ResourceIdentifier& identifier) {
+        addDepthReadWrite(identifier);
+        const auto handle = graph->RequestResourceHandle(identifier);
+        return {handle.GetGlobalResourceID(), handle.GetGlobalResourceID()};
+    }
+
+    ResourceBindingToken BindConstantBuffer(const ResourceIdentifier& identifier) {
+        addConstantBuffer(identifier);
+        const auto handle = graph->RequestResourceHandle(identifier);
+        return {handle.GetGlobalResourceID(), handle.GetGlobalResourceID()};
+    }
+
     template<class ResourceT>
         requires std::derived_from<ResourceT, Resource>
     ResourceBindingToken BindUnorderedAccess(const std::shared_ptr<ResourceT>& resource) {
         if (!resource) throw std::invalid_argument("Cannot bind an empty unordered-access resource");
+        MaterializeDeclaredBindlessView(*resource, BindlessViewKind::UnorderedAccess);
         addUnorderedAccess(resource);
         return { resource->GetSchedulingResourceID(), graph->RequestResourceHandle(resource.get()).GetGlobalResourceID() };
+    }
+
+    ResourceBindingToken BindUnorderedAccess(const ResourcePtrAndRange& resource) {
+        if (!resource.resource) throw std::invalid_argument("Cannot bind an empty unordered-access resource");
+        addUnorderedAccess(resource);
+        return {resource.resource->GetSchedulingResourceID(),
+            graph->RequestResourceHandle(resource.resource.get()).GetGlobalResourceID()};
     }
 
     template<class ResourceT>
         requires std::derived_from<ResourceT, Resource>
     ResourceBindingToken BindUnorderedAccessClear(const std::shared_ptr<ResourceT>& resource) {
         if (!resource) throw std::invalid_argument("Cannot bind an empty unordered-access clear resource");
+        MaterializeDeclaredBindlessView(*resource, BindlessViewKind::UnorderedAccess);
+        MaterializeDeclaredBindlessView(*resource, BindlessViewKind::NonShaderVisibleUnorderedAccess);
         addUnorderedAccessClear(resource);
         return { resource->GetSchedulingResourceID(), graph->RequestResourceHandle(resource.get()).GetGlobalResourceID() };
     }
@@ -943,8 +1011,18 @@ public:
 
     template<class ResourceT>
         requires std::derived_from<ResourceT, Resource>
+    ResourceBindingToken BindDepthRead(const std::shared_ptr<ResourceT>& resource) {
+        if (!resource) throw std::invalid_argument("Cannot bind an empty depth-read resource");
+        MaterializeDeclaredBindlessView(*resource, BindlessViewKind::DepthStencil);
+        addDepthRead(resource);
+        return { resource->GetSchedulingResourceID(), graph->RequestResourceHandle(resource.get()).GetGlobalResourceID() };
+    }
+
+    template<class ResourceT>
+        requires std::derived_from<ResourceT, Resource>
     ResourceBindingToken BindDepthReadWrite(const std::shared_ptr<ResourceT>& resource) {
         if (!resource) throw std::invalid_argument("Cannot bind an empty depth resource");
+        MaterializeDeclaredBindlessView(*resource, BindlessViewKind::DepthStencil);
         addDepthReadWrite(resource);
         return { resource->GetSchedulingResourceID(), graph->RequestResourceHandle(resource.get()).GetGlobalResourceID() };
     }
@@ -953,6 +1031,7 @@ public:
         requires std::derived_from<ResourceT, Resource>
     ResourceBindingToken BindRenderTarget(const std::shared_ptr<ResourceT>& resource) {
         if (!resource) throw std::invalid_argument("Cannot bind an empty render target");
+        MaterializeDeclaredBindlessView(*resource, BindlessViewKind::RenderTarget);
         addRenderTarget(resource);
         return { resource->GetSchedulingResourceID(), graph->RequestResourceHandle(resource.get()).GetGlobalResourceID() };
     }
@@ -961,6 +1040,7 @@ public:
         requires std::derived_from<ResourceT, Resource>
     ResourceBindingToken BindRenderTargetClear(const std::shared_ptr<ResourceT>& resource) {
         if (!resource) throw std::invalid_argument("Cannot bind an empty render-target clear resource");
+        MaterializeDeclaredBindlessView(*resource, BindlessViewKind::RenderTarget);
         addRenderTargetClear(resource);
         return { resource->GetSchedulingResourceID(), graph->RequestResourceHandle(resource.get()).GetGlobalResourceID() };
     }
