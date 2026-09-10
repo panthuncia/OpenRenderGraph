@@ -5,12 +5,37 @@ only immutable publications selected by an accepted frame. Mutable objects may
 remain behind ingestion, allocation, cache, IO, upload, readback, and vendor
 service boundaries, but they are not alternative sources of frame state.
 
-Implementation note (September 9, 2026): material artifact producers now use
-`IMaterialStateStorage`; material raster flags and compile-slot mappings are
-consumed from `PublishedMaterialState`; and the first software-raster view
-consumer uses the accepted-frame retained view snapshot. The view snapshot is
-still assembled from `ViewManager` and is the next candidate for promotion to a
-registered view-family artifact.
+Implementation note (September 10, 2026): material usage and row producers are
+pure publication steps. Their preallocated reservation tokens commit accepted
+results to the versioned journals exactly once; the removed
+`IMaterialStateStorage` callback is no longer part of producer execution.
+Material raster flags and compile-slot mappings are consumed from
+`PublishedMaterialState`. Geometry-residency publications retain exact slab and
+page-pool versions, and CLOD streaming uses a scoped storage/residency service
+instead of a broad `MeshManager` dependency. Object publications also own the
+skinned-placement inputs consumed by Procedural Wind. These paths complete the
+render-facing portion of migration step 1; remaining manager calls are within
+scene ingestion or scoped residency services.
+
+View-family, light-table, and pose state are async-graph artifacts and renderer
+manifest fragments. The view family retains camera/culling buffers, visibility
+attachments, current/history depth resources, their bindless indices, and
+immutable per-view metadata. Ordinary render-graph extensions no longer
+enumerate `ViewManager`; deep-visibility resources are allocated before the
+family is published. The light fragment retains the coherent GPU table set and
+has an exact state-graph dependency on the view-family revision containing its
+shadow view IDs. Shadow view allocation is a narrow ingestion-time identity and
+storage service; `LightManager` no longer owns or queries `ViewManager`.
+View-creation events are composed at the renderer boundary to maintain legacy
+indirect workload storage, so `ViewManager` no longer owns an indirect-buffer
+manager.
+The pose fragment retains palette resources, active instance membership,
+offsets, and immutable base-skeleton owners. Procedural Wind consumes that pose
+selection and calls only the narrow serialized wind-palette allocation service.
+Depth history is represented in accepted frame data as an owned selection of
+the exact resource, history epoch, and producer submission. Consumers no longer
+consult a separate global validity flag. Selecting an unsubmitted producer and
+removing the measured startup view fallback remain scheduling-integration work.
 
 ## Ownership model
 
@@ -35,7 +60,7 @@ tables together.
 | `SceneRenderBridge` / `ManagerInterface` | Scene deltas and alive sets | None directly | None | Replays changes into every manager through raw pointers | Renderer source-state store emits ordered artifact intents; retain a temporary ingestion adapter |
 | `MaterialManager` | Material identity, usage counts, raster flags | Material rows/tables, compile-flag slots, texture-image dependencies | Slot/raster-bucket allocation and texture-streaming coordination | Resource-provider lookup and graph producers capturing `MaterialManager&` | Owned material inputs and table artifacts; scoped identity/allocation and texture-streaming services |
 | `ObjectManager` | Object/group identity and transform changes | Draw records, transforms, visibility generations, active draw sets | Static-import reservations, range allocation, compaction and deferred retirement | Direct buffer getters and rendering-time resource-provider lookup | Object source records; draw-page/buffer artifacts; allocation/import/retirement services |
-| `MeshManager` | Mesh/instance registration and imported geometry | Mesh tables and geometry/residency selections | Geometry storage, page allocation, DirectStorage IO and residency cache | Borrowed page-pool pointers, view/skeleton links, resource-provider lookup | Owned geometry artifacts plus geometry-storage and residency services |
+| `MeshManager` | Mesh/instance registration and imported geometry | Mesh tables and geometry/residency selections | Owns the current implementation of the scoped CLOD geometry-storage/residency service | View/skeleton links and bootstrap resource-provider registration | Owned geometry artifacts plus the extracted geometry-storage and residency service |
 | `IndirectCommandBufferManager` | Requested workload keys and capacity policy | Immutable workload membership and argument-buffer versions | Per-frame argument/counter allocation and build scheduling | Direct object/material/view queries and submission caches exposed as manager state | Workload artifact producer; frame-owned scratch/argument service |
 | `ViewManager` | Stable view identity and camera/light association | Camera/culling tables and view-family metadata | View-ID allocation; generation-owned attachment creation | Calls indirect manager, mutable view enumeration, global depth-history validity | View-family artifacts; view identity service; frame resources and history service |
 | `LightManager` | Light source records and shadow configuration | Light tables and view requirements | None beyond storage allocation | Creates/mutates views imperatively and reads their live indices | Light artifacts feeding the view-family producer |

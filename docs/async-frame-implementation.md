@@ -27,6 +27,79 @@ not establish visual parity and must not serve as valid performance baselines.
 
 ## Framework follow-up audit
 
+### Coherent workload and activation publication selection (September 10, 2026)
+
+Indirect-workload publication no longer reloads the process-global latest
+renderer state. The renderer supplies its selected `PublishedRendererState` to
+`PublishDesiredState`, so draw-record acknowledgement, material readiness and
+the workload request are derived from one coherent publication cut.
+
+Material and terrain activation now follow the same rule. The renderer passes
+the state returned by its publication commit directly to each activation path;
+neither manager can acknowledge or activate a newer global state than the one
+selected by the renderer context.
+
+The repository-root build and focused pipeline, external-resource, async-state,
+and contributor-loader tests pass. Fresh Async and Off radius-1 runs for the
+workload change are archived under
+`build/async-frame-validation/phase2-explicit-indirect-publication/`; both have
+zero failing counters, dropped events, or renderer errors. The follow-up Async
+activation run is under
+`build/async-frame-validation/phase2-coherent-activation/Async/radius1/run1`
+and also passes the phase-1/final visibility readback gate.
+
+The active-draw journal connection is now a lifetime-safe ingestion
+subscription. `IndirectCommandBufferManager` retains a weak observer state
+instead of retaining `ObjectManager*` merely to uninstall its callback. Shutdown
+invalidates the observer under its own mutex; subsequent source notifications
+become no-ops and cannot dereference the retired workload owner. The root build,
+focused tests, and the Async radius-1 run under
+`build/async-frame-validation/phase2-workload-source-subscription/` pass with
+the same raster/readback and telemetry requirements.
+
+The complete source inventory now passes `--require-unified --scope all`: 140
+ordinary in-tree passes use typed authoring. The remaining non-typed entries are
+the documented external contributor ABI adapters and the upload service's
+specialized immediate pass. Contributor anchor/boundary nodes are classified as
+part of that ABI boundary rather than as ordinary renderer passes. The archived
+machine-readable inventory is
+`build/async-frame-validation/phase2-source-inventory.json`.
+
+### Reserved material usage admission (September 10, 2026)
+
+Static-import material usage now reserves stable material slots and texture
+service registrations before submitting its immutable graph request. The
+reservation exposes the resulting material-ID/slot mapping as immutable output;
+the material-usage producer verifies exact texture-binding dependencies and
+publishes that mapping without invoking `MaterialManager`. Its ordered acceptance
+action commits the frame-owned reservation exactly once. Dropped or cancelled
+requests release texture registrations and recycle reservation-owned slots only
+after all pending claims have left them.
+
+Material removal also observes pending reservations, preventing an accepted slot
+from being returned to the free list while queued graph work still identifies it.
+The focused async-state test now exercises producer acceptance, immutable result
+publication, and exactly-once commit in addition to concurrent token resolution.
+
+The repository-root build and five affected tests pass. Fresh Off run 1 and Async
+runs 1/2 under
+`build/async-frame-validation/phase2-material-usage-reservations/` pass with zero
+failing counters, dropped telemetry events, or renderer errors. The final Async
+run reports 3,685,971 phase-1 and final occupied pixels out of 3,686,400.
+
+Individual material-row publication now uses the same contract. A
+`MaterialRowReservation` owns the immutable row and the ordered journal update;
+the graph producer validates identity, publishes the row, and commits the token
+on the material-acceptance lane. It no longer captures `MaterialManager` or an
+`IMaterialStateStorage` façade. Superseded rows cancel their token without
+touching manager state, while accepted rows update the journals exactly once.
+
+The focused graph test covers row identity, publication, and exactly-once
+acceptance. The repository-root build and five affected tests pass. Fresh Off
+and Async radius-1 runs under
+`build/async-frame-validation/phase2-material-row-reservations/` pass the full
+raster readback, telemetry, and shutdown gates.
+
 ### Manager-state architecture baseline (September 9, 2026)
 
 The authoritative responsibility and destination inventory is recorded in
@@ -134,12 +207,18 @@ successor and verifies that its CPU placement selection and GPU buffer version
 remain unchanged. Off and Async radius-1 validation artifacts are archived in
 `build/async-frame-validation/phase2-object-graph-publication/`.
 
-Static-import material usage payloads also no longer borrow `TextureFactory`.
-They carry a value indicating whether the configured texture service should
-refresh bindings. The remaining `shared_ptr<Material>` entry is explicitly
-transitional: replacing it with an owned material description and exact texture
-artifact handles is still required to finish the Phase 2 material-ingestion
-boundary.
+Static-import material usage payloads no longer borrow `TextureFactory`,
+`Material`, or `TextureAsset`. The renderer-host ingestion adapter briefly owns
+`MaterialUsageCapture` values while it registers texture-streaming reservations.
+Only copied material rows, exact texture-binding identities, retained GPU
+resources, and the resolved reservation enter `AsyncStateGraph`; mutable texture
+assets remain inside the ingestion/service boundary.
+
+The full root build, focused material/state/resource/contributor tests, and the
+fixed-camera Async radius-1 raster gate pass. The latter reports 3,685,971 of
+3,686,400 pixels occupied after phase 1 (99.988%), with identical final,
+material-argument, pixel-list, and surface-identity counts. Artifacts are under
+`build/async-frame-validation/phase2-material-capture-boundary/`.
 
 The repository-root build and ten affected CTests pass. Fresh Off and Async
 radius-1 runs are stable with fresh telemetry/executable identity and zero
@@ -1265,6 +1344,31 @@ head pointers, resolution, PSO flags, lighting switches, and ten descriptor
 views before preparation. The remaining inventory is 24 files with 298 direct
 descriptor-view queries.
 
+### Exact geometry cut and scoped storage access (September 10, 2026)
+
+Frame culling now treats the selected `PublishedGeometryResidencyState` as its
+only traversal-depth authority. The transitional comparison with
+`MeshManager::GetCLodMaxTraversalDepth()` was removed because it allowed scene
+ingestion after frame acceptance to change the traversal domain of queued work.
+A missing accepted publication fails explicitly and is an automated telemetry
+failure. Off and Async radius-1 captures both selected depth 7 and retained full
+phase-1 raster output after this cut.
+
+Graph construction and terrain/material-evaluation passes no longer acquire the
+broad `MeshManager` merely to discover the persistent CLOD slab resource group.
+They use a scoped geometry-storage accessor returning the retained
+`ResourceGroup`; declaration resolution still freezes its exact resources for
+the accepted frame. CLOD streaming now receives `ICLodGeometryStorage`, whose
+surface is limited to immutable domain snapshots plus page allocation,
+residency, disk IO, upload, and wake operations. `MeshManager` owns the current
+implementation, but the streaming system can no longer query unrelated mesh,
+scene, view, or skeleton state through that dependency.
+
+The graph IO extension likewise depends on the narrow
+`ITextureStreamingFeedbackService` contract. Suppression and readback-pass
+reservation remain owned by the material/texture streaming implementation,
+without exposing `MaterialManager` to the frame graph.
+
 ### Object and material source publications (September 9, 2026)
 
 Skinned-placement CPU records and active membership now belong to the
@@ -1277,6 +1381,15 @@ resident transform count, placement records, and active entries as one
 coherent selection. Queued frames therefore keep their selected placement
 version while later streaming mutations build a successor.
 
+The placement table and active-placement table are also materialized as
+ordinary `PublishedGpuBufferVersion` artifacts. Their allocation, descriptor,
+CPU image, upload dependency, and journal sequence are selected with the same
+`DrawRecords` root as the immutable CPU records. Procedural Wind resolves both
+versions from that accepted root and no longer reads the transitional
+`PreparedObjectFrameData` or either specialized mutable ingestion buffer. A
+bootstrap resolver fallback exists only before the initial root is published;
+accepted roots use the exact catalog variants.
+
 Static material admission now follows the same pattern. Scene ingestion copies
 the material table rows and compile flags before submitting graph work. It also
 captures the current bindless texture indices, exact image owners, and texture
@@ -1287,8 +1400,9 @@ node selects the captured revisions as exact dependencies at
 reservation only when serialized material storage accepts the complete batch.
 Destruction cancels an uncommitted reservation exactly once. A binding that
 advances changes future input and cannot alter the copied row or its retained
-image. The storage facade remains transitional, but ordinary artifact execution
-no longer dereferences a `Material` or `TextureFactory` borrowed from the host.
+image. The preallocated usage and row reservation tokens commit accepted
+results to the journals exactly once; ordinary artifact execution no longer
+dereferences a manager, `Material`, or `TextureFactory` borrowed from the host.
 
 Debug spheres now resolve camera and object-buffer indices through returned
 bindings. Debug skeleton moves line generation and dynamic-buffer replacement
