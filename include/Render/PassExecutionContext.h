@@ -90,6 +90,10 @@ struct PassExecutionContext {
 	UINT64 frameFenceValue = 0;
 	float deltaTime = 0.0f;
 	const IHostExecutionData* hostData = nullptr;
+	// Retains hostData whenever execution or recording may outlive the caller's
+	// stack frame. Code receiving hostData must treat the publication as
+	// immutable and must not retain the raw pointer without this owner.
+	std::shared_ptr<const IHostExecutionData> ownedHostData;
 	// Values for structurally placed external-wait bindings. Bindings determine
 	// the consuming batch/queue at compile time; timeline values remain per-frame.
 	std::vector<ExternalTimelineBindingValue> externalTimelineBindings;

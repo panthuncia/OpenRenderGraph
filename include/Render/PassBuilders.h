@@ -25,13 +25,20 @@ namespace org {
 inline void MaterializeDeclaredBindlessView(Resource& resource, BindlessViewKind kind) {
     auto* indexed = dynamic_cast<GloballyIndexedResource*>(&resource);
     if (!indexed) return;
-    switch (kind) {
-    case BindlessViewKind::ShaderResource: indexed->GetSRVInfo(0); break;
-    case BindlessViewKind::UnorderedAccess: indexed->GetUAVShaderVisibleInfo(0); break;
-    case BindlessViewKind::NonShaderVisibleUnorderedAccess: indexed->GetUAVNonShaderVisibleInfo(0); break;
-    case BindlessViewKind::RenderTarget: indexed->GetRTVInfo(0); break;
-    case BindlessViewKind::DepthStencil: indexed->GetDSVInfo(0); break;
-    case BindlessViewKind::ConstantBuffer: indexed->GetCBVInfo(); break;
+    try {
+        switch (kind) {
+        case BindlessViewKind::ShaderResource: indexed->GetSRVInfo(0); break;
+        case BindlessViewKind::UnorderedAccess: indexed->GetUAVShaderVisibleInfo(0); break;
+        case BindlessViewKind::NonShaderVisibleUnorderedAccess: indexed->GetUAVNonShaderVisibleInfo(0); break;
+        case BindlessViewKind::RenderTarget: indexed->GetRTVInfo(0); break;
+        case BindlessViewKind::DepthStencil: indexed->GetDSVInfo(0); break;
+        case BindlessViewKind::ConstantBuffer: indexed->GetCBVInfo(); break;
+        }
+    }
+    catch (...) {
+        spdlog::error("Failed to materialize declared bindless view: resource='{}' kind={}",
+            resource.GetName(), static_cast<uint32_t>(kind));
+        throw;
     }
 }
 

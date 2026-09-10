@@ -21,11 +21,151 @@ not establish visual parity and must not serve as valid performance baselines.
 | 1: frame ownership and retirement | Slot leases, retained dependencies, completion sets and recovery retention integrated; runtime descriptor snapshot integration and full program-version audit remain |
 | 2: separate recording/submission | Recording boundary and slot/queue command pools implemented; focused tests and Off/Async radius-1/100 runs pass; full phase acceptance remains pending |
 | 3: ordered planning and recording ahead | Planned/submitted ledgers, symbolic waits, worker planning/recording and deterministic concurrent-frame tests implemented; scene recording-ahead integration remains gated |
-| 4: worker preparation and presentation tail | Pending |
+| 4: worker preparation and presentation tail | Immutable renderer frame publication integrated; worker preparation, stage queues and presentation tail remain |
 | 5: pass migration and legacy API removal | 138 BasicRenderer/plugin entries use typed authoring; broader audit still finds the framework upload adapter and explicit contributor boundary paths |
 | 6: full correctness/performance matrix | Pending |
 
 ## Framework follow-up audit
+
+### Manager-state architecture baseline (September 9, 2026)
+
+The authoritative responsibility and destination inventory is recorded in
+`renderer-state-ownership.md`. It separates editable scene sources, artifact
+production/publication, persistent allocation and IO services, and accepted
+frame state. This is the removal checklist for broad manager/provider access;
+moving code into an artifact callback does not count as migration when that
+callback still captures a mutable manager.
+
+The reference matrix at
+`build/async-frame-validation/manager-architecture-baseline/` contains Off and
+Async runs at radii 1 and 100. All four runs used the freshly installed
+RelWithDebInfo executable, produced structured telemetry, reported
+`status=stable` for 270 frames, and contained no renderer error or critical log
+entries. These are migration references rather than the final three-run
+performance matrix.
+
+### Published material raster metadata (September 9, 2026)
+
+`PublishedMaterialState` now owns the dense raster-bucket flag table selected
+with its material parameter tables and compile-flag mapping. The material
+fingerprint includes that table, so bucket changes create a coherent successor
+publication. Accepted renderer inputs use the selected publication rather than
+enumerating live `MaterialManager` bucket state. A telemetry-labelled bootstrap
+fallback remains until initial material publication is made a hard admission
+requirement; it did not appear in either steady radius-1 validation trace.
+
+The root build and ten affected CTest tests passed. Fresh Off and Async radius-1
+runs both reported `status=stable` for 270 frames with zero renderer errors;
+their structured telemetry contains `SARP.FrameInputs.PublishedRasterBuckets`
+and no bootstrap-fallback counter. Artifacts are under
+`build/async-frame-validation/material-publication-raster-buckets/`.
+
+### Material producer and consumer boundary (September 9, 2026)
+
+Material artifact callbacks now depend on the narrow `IMaterialStateStorage`
+contract instead of capturing `MaterialManager`. This is an extraction seam for
+the serialized row/table storage and stable-slot service; it deliberately does
+not claim that the storage has left the manager yet. `MaterialManager` currently
+implements the contract while scene-ingestion callers are migrated to owned
+material descriptions and reservations.
+
+`MaterialHistogramPass` and `BuildPixelListPass` also obtain the voxel compile
+slot from the exact `PublishedMaterialState` selected by their accepted frame.
+They no longer query the live material manager during preparation. The helper
+on the publication preserves the existing sparse compile-flag mapping without
+exposing its mutable registry.
+
+The repository-root build and ten affected CTests pass. Fresh Off and Async
+radius-1 runs each reported `status=stable`, fresh telemetry and executable
+identity, and zero renderer errors. Their artifacts are archived under
+`build/async-frame-validation/manager-material-publication/`.
+
+### Retained view-family input slice (September 9, 2026)
+
+The accepted-frame view snapshot now carries the camera-table extent, resource
+layout revision, per-view identity and classification, retained visibility and
+deep-visibility resources, and their coherently published bindless indices.
+`ClusterSoftwareRasterizationPass` is the first view consumer migrated: its
+update builds the per-camera raster table and declaration resource set entirely
+from this selected snapshot and no longer enumerates `ViewManager`.
+
+This remains a transitional frame publication assembled by the renderer. The
+next step is to make it the payload of a view-family artifact, move any required
+resource creation ahead of publication, and migrate the other view consumers.
+The retained resource wrappers are sufficient for the existing synchronous
+mutation discipline, but exact backing versions must be carried before queued
+preparation can overlap replacements.
+
+The repository-root build, ten affected CTests, and fresh Off and Async radius-1
+runs passed. Both reports are stable with fresh telemetry and executable
+identity and zero renderer errors. Artifacts are under
+`build/async-frame-validation/manager-view-publication/`.
+
+### Value-based indirect workload admission (September 9, 2026)
+
+`IndirectCommandBufferManager` no longer receives broad object and material
+managers while publishing desired workload state. Active-list changes enter
+through a one-time ingestion subscription; publication ticks supply only the
+captured draw-record artifact requirement and resident logical extent. The
+unused material-manager argument and implementation include were removed. The
+workload root continues to retain exact active-list, draw-record, material-ready,
+view-lifetime, and argument-buffer graph dependencies.
+
+### Object placement publication (September 9, 2026)
+
+Skinned-placement CPU records and active membership now belong to the exact
+DrawRecords artifact cut. Ordered object ingestion creates immutable source
+versions when a placement batch changes; `ObjectManager` seals those versions
+with the versioned object-buffer journals, and the object-state producer publishes them in
+`PublishedObjectBufferState`, and frame acceptance selects them through its
+retained renderer-state manifest. Procedural wind consumes that selected
+publication and no longer enumerates mutable object-manager storage.
+
+This replaces a temporary per-frame snapshot which copied 67,702 placement and
+active records on the radius-100 scene. That copy measured 0.989 ms median and
+1.215 ms p95 over 120 frames. The accepted-frame path now shares immutable
+publication storage. Producer-cut cost and population are reported as
+`SARP.AsyncState.ObjectPlacementSnapshot.BuildNs`, `PlacementCount`, and
+`ActivePlacementCount`, so streaming cost remains attributable to async state
+production rather than appearing unpredictably in frame preparation.
+
+The object replacement test retains an old DrawRecords root while publishing a
+successor and verifies that its CPU placement selection and GPU buffer version
+remain unchanged. Off and Async radius-1 validation artifacts are archived in
+`build/async-frame-validation/phase2-object-graph-publication/`.
+
+Static-import material usage payloads also no longer borrow `TextureFactory`.
+They carry a value indicating whether the configured texture service should
+refresh bindings. The remaining `shared_ptr<Material>` entry is explicitly
+transitional: replacing it with an owned material description and exact texture
+artifact handles is still required to finish the Phase 2 material-ingestion
+boundary.
+
+The repository-root build and ten affected CTests pass. Fresh Off and Async
+radius-1 runs are stable with fresh telemetry/executable identity and zero
+renderer errors under `build/async-frame-validation/phase2-workload-values/`.
+The subsequent texture-service request cleanup passed the same root build,
+CTest, Off, and Async gates; those artifacts are under
+`build/async-frame-validation/phase2-material-service-request/`.
+
+### Immutable renderer frame publication (September 9, 2026)
+
+BasicRenderer now publishes one owned `RendererFrameInputs` object for each
+accepted logical frame. It retains the copied `UpdateContext` and transitional
+`RenderContext` snapshots and supplies the same owned publication to graph
+update, preparation and execution. `PassExecutionContext` also carries the
+owner corresponding to its `hostData` view. The render path no longer builds a
+stack host wrapper which points at live mutable `Renderer::m_context`.
+
+This completes the top-level host-data lifetime boundary, but it is not yet a
+fully immutable frame input and does not complete worker preparation: the
+copied contexts still contain transitional manager pointers,
+and graph `Update` still performs pass updates and calls `PrepareAsyncFrame` on
+the producer thread. Those fields must be replaced with owned publications or
+service requests before moving preparation wholesale to the worker. The root
+build, ten affected CTest tests, and fresh radius-1 Off and Async runs passed;
+both benchmark reports were stable for 120 frames and are archived under
+`build/async-frame-validation/immutable-inputs/`.
 
 ### Returned declaration bindings (September 9, 2026)
 
@@ -1124,6 +1264,31 @@ Deep-visibility resolve likewise freezes its dynamically selected primary-view
 head pointers, resolution, PSO flags, lighting switches, and ten descriptor
 views before preparation. The remaining inventory is 24 files with 298 direct
 descriptor-view queries.
+
+### Object and material source publications (September 9, 2026)
+
+Skinned-placement CPU records and active membership now belong to the
+`DrawRecords` state-graph artifact. `ObjectManager` creates a new immutable
+source version at the ordered mutation boundary used by bulk placement import
+and removal/compaction. Sealing a frame-facing object cut only retains those
+vectors; it no longer copies the complete world placement set on the render
+thread. The published object artifact carries the typed GPU buffer versions,
+resident transform count, placement records, and active entries as one
+coherent selection. Queued frames therefore keep their selected placement
+version while later streaming mutations build a successor.
+
+Static material admission now follows the same pattern. Scene ingestion copies
+the material table rows and compile flags before submitting graph work. It also
+captures the current bindless texture indices, exact image owners, and texture
+service inputs. Ingestion reserves texture-streaming ownership before submitting
+the usage node, which seeds the corresponding `TextureBinding` vertices. The
+node selects the captured revisions as exact dependencies at
+`UploadSubmitted`, validates their image and sampler indices, and commits the
+reservation only when serialized material storage accepts the complete batch.
+Destruction cancels an uncommitted reservation exactly once. A binding that
+advances changes future input and cannot alter the copied row or its retained
+image. The storage facade remains transitional, but ordinary artifact execution
+no longer dereferences a `Material` or `TextureFactory` borrowed from the host.
 
 Debug spheres now resolve camera and object-buffer indices through returned
 bindings. Debug skeleton moves line generation and dynamic-buffer replacement
