@@ -1,11 +1,13 @@
 #pragma once
 #include <future>
+#include <deque>
 #include <map>
 
 #include "Render/RenderGraph/RenderGraph.h"
 #include "Render/RenderGraph/ExperimentalGraphCompiler.h"
 #include "Render/RenderGraph/ExperimentalExecutionState.h"
 #include "FramePlanning.h"
+#include "FrameRecording.h"
 
 
 // Private compiler representation. Keep compiler-only data here rather than in
@@ -36,6 +38,30 @@ struct RenderGraph::Node {
 };
 
 struct RenderGraph::CompilerState {
+    struct RecordingFrameOwner {
+        uint64_t sequence = 0;
+        std::shared_ptr<const experimental::RenderFrameSnapshot> snapshot;
+        std::shared_ptr<const experimental::PlannedFrameState> planning;
+        std::vector<std::shared_ptr<experimental::OwnedRecordingStatistics>> statistics;
+        std::optional<experimental::RecordedFrame> inlineResult;
+        experimental::DispatchedFrameRecording workerRecording;
+
+        bool Ready() const {
+            if (inlineResult) return true;
+            return workerRecording.Valid() && workerRecording.Ready();
+        }
+
+        experimental::RecordedFrame Join() {
+            if (inlineResult) {
+                auto result = std::move(*inlineResult);
+                inlineResult.reset();
+                return result;
+            }
+            if (!workerRecording.Valid()) throw std::logic_error("Recording owner has no completion");
+            return workerRecording.Join();
+        }
+    };
+
     std::unique_ptr<FrameSlotPool> frameSlots;
     std::shared_ptr<FrameContext> preparingFrame;
     std::map<uint32_t, std::weak_ptr<FrameContext>> frameSlotOwners;
@@ -53,11 +79,13 @@ struct RenderGraph::CompilerState {
         }
         asyncTimelineAdmission->RetireCompleted(completed);
     }
-    std::unique_ptr<experimental::GraphCompileCoordinator> shadowCompiler;
+    std::unique_ptr<experimental::GraphCompileCoordinator> compileCoordinator;
     std::shared_ptr<const experimental::RenderFrameSnapshot> selectedAsyncFrame;
     std::shared_ptr<const experimental::GraphCompileInput> currentAsyncInput;
     std::unique_ptr<experimental::FramePlanningState> framePlanner;
     std::shared_ptr<const experimental::PlannedFrameState> selectedPlanning;
+    std::deque<RecordingFrameOwner> recordingFrames;
+    std::shared_ptr<FrameContext> pendingPresentationFrame;
     std::shared_ptr<runtime::ITaskScope> frameWorkerScope;
     std::shared_ptr<runtime::ITaskScope> preparationWorkerScope;
     std::future<void> preparationWorker;
@@ -70,8 +98,8 @@ struct RenderGraph::CompilerState {
     uint64_t reportedAsyncSelectionFailures = 0;
     uint64_t reportedAsyncUnownedResources = 0;
     std::unordered_set<std::string> reportedAsyncLegacyPasses;
-    uint64_t reportedShadowFailures = 0;
-    uint64_t shadowCaptureFailures = 0;
+    uint64_t reportedCompileFailures = 0;
+    uint64_t compileCaptureFailures = 0;
 
 	std::vector<Node> nodes;
 	std::vector<compiler::DependencySequence<size_t>> dependencySeqStates;

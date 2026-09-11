@@ -33,15 +33,21 @@ The pose fragment retains palette resources, active instance membership,
 offsets, and immutable base-skeleton owners. Procedural Wind consumes that pose
 selection and calls only the narrow serialized wind-palette allocation service.
 Depth history is represented in accepted frame data as an owned selection of
-the exact resource, history epoch, and producer submission. Consumers no longer
-consult a separate global validity flag. Selecting an unsubmitted producer and
-removing the measured startup view fallback remain scheduling-integration work.
+the exact resource, history epoch, and producer dependency. Consumers no longer
+consult a separate global validity flag. The next frame can select a prepared,
+unsubmitted predecessor; submission fills in its receipt and joined cancellation
+invalidates that pending selection. Startup material, view, light, and pose
+fallbacks have been removed in favor of explicit admission backpressure.
 
 Scene ingestion now enters through a renderer-owned `SceneSourceStateStore`.
-The store serializes complete batches, rejects older source revisions, and is
-detached before the renderer ECS world is destroyed. The existing ECS-backed
-mutation adapter remains behind that boundary while its individual mutations
-are converted to artifact intents.
+The store serializes batches, commits their revision only after successful
+materialization, treats exact replay as idempotent, rejects conflicting or older
+revisions, and assigns internal revisions to unsequenced changes. It is detached
+before the renderer ECS world is destroyed. Snapshot export owns mutable
+mesh-instance values, evaluated skeleton poses, and instance transforms, and
+the committed bridge revision retains its exact mesh artifacts. The existing
+ECS-backed mutation adapter remains behind that boundary. An exception after
+mutation begins terminates the process until those stores support rollback.
 
 Environment conversion, prefilter, and spherical-harmonics queues are owned by
 the renderer-scoped environment work service. `EnvironmentManager` produces

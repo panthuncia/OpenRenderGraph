@@ -1,9 +1,10 @@
 #include "../src/Render/RenderGraph/FrameRecording.h"
 #include <array>
+#include <cstdio>
 #include <future>
 #include <thread>
 
-#define CHECK(x) do { if (!(x)) return __LINE__; } while (false)
+#define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "Frame recording check failed at %d: %s\n", __LINE__, #x); return __LINE__; } } while (false)
 using namespace org::experimental;
 
 namespace {
@@ -30,6 +31,30 @@ void RecordProbe(const ProbeData& data, org::RecordingContext&) {
 struct Runtime {
     rhi::DevicePtr device;
     rhi::TimelinePtr timeline;
+};
+struct RecordingTasks final : org::runtime::ITaskService {
+    struct Scope final : org::runtime::ITaskScope {
+        std::vector<std::jthread> threads;
+        void Cancel() noexcept override {}
+        void Wait() override { threads.clear(); }
+        void CancelAndWait() override { Wait(); }
+    };
+    void ParallelFor(std::string_view, size_t n, std::function<void(size_t)> fn) override {
+        for (size_t i = 0; i < n; ++i) fn(i);
+    }
+    void ParallelForLimited(std::string_view name, size_t n, size_t,
+        std::function<void(size_t)> fn) override { ParallelFor(name,n,std::move(fn)); }
+    std::shared_ptr<org::runtime::ITaskScope> CreateScope(std::string_view) override {
+        return std::make_shared<Scope>();
+    }
+    bool Submit(const std::shared_ptr<org::runtime::ITaskScope>& scope,
+        org::runtime::TaskPriority, std::string_view, std::function<void()>&& fn) override {
+        std::static_pointer_cast<Scope>(scope)->threads.emplace_back(std::move(fn));
+        return true;
+    }
+    bool ScheduleAfter(const std::shared_ptr<org::runtime::ITaskScope>&,
+        std::chrono::steady_clock::duration, org::runtime::TaskPriority,
+        std::string_view, std::function<void()>&&) override { return false; }
 };
 struct Work {
     std::shared_ptr<const PlannedFrameState> state;
@@ -82,27 +107,30 @@ int TestDelayedFrameRecording(const rhi::DeviceCreateInfo& create) {
     CHECK(runtime->device.Get().CreateTimeline(runtime->timeline,0,"Frame recording FIFO test") == rhi::Result::Ok);
     FramePlanningState planner(2); org::FrameSlotPool slots(2);
     ExecutionTimelineAdmission admission({{1,0}},2);
+    auto tasks = std::make_shared<RecordingTasks>();
+    std::shared_ptr<org::runtime::ITaskScope> recordingScope;
     for (unsigned failureRun = 0; failureRun != 2; ++failureRun) {
         auto probe = std::make_shared<RecordingProbe>(); probe->failFirst = failureRun != 0;
         auto entered0 = probe->entered[0].get_future(), entered1 = probe->entered[1].get_future();
         auto first = MakeWork(planner,slots,1 + failureRun * 2,0,runtime,probe);
         auto second = MakeWork(planner,slots,2 + failureRun * 2,1,runtime,probe);
-        auto record = [](PlannedFrame plan) { return RecordFrame(std::move(plan),{},1); };
-        auto worker0 = std::async(std::launch::async,record,std::move(first.recording));
-        auto worker1 = std::async(std::launch::async,record,std::move(second.recording));
+        auto worker0 = DispatchFrameRecording(std::move(first.recording),tasks,recordingScope,1);
+        auto worker1 = DispatchFrameRecording(std::move(second.recording),tasks,recordingScope,1);
         CHECK(entered0.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
         CHECK(entered1.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
         CHECK(probe->peak == 2 && !probe->recordedOnHost);
         CHECK(!slots.TryAcquire(0) && !slots.TryAcquire(1));
         probe->release[1].set_value();
-        std::optional<RecordedFrame> ready1(worker1.get());
+        while (!worker1.Ready()) std::this_thread::yield();
+        CHECK(!worker0.Ready()); // Later recording completed first without violating FIFO ownership.
+        std::optional<RecordedFrame> ready1(worker1.Join());
         bool rejected = false;
         try { std::move(*ready1).Submit(admission); } catch (const std::logic_error&) { rejected = true; }
         CHECK(rejected && admission.Submitted()[0].value == failureRun * 2);
         probe->release[0].set_value();
         if (failureRun) {
             bool failed = false;
-            try { worker0.get(); } catch (const std::runtime_error&) { failed = true; }
+            try { worker0.Join(); } catch (const std::runtime_error&) { failed = true; }
             CHECK(failed && probe->active == 0);
             planner.CancelUnsubmittedSuffixAfterJoin();
             CHECK(first.state->cancelled && second.state->cancelled);
@@ -110,7 +138,7 @@ int TestDelayedFrameRecording(const rhi::DeviceCreateInfo& create) {
             try { std::move(*ready1).Submit(admission); } catch (const std::logic_error&) { rejected = true; }
             CHECK(rejected && admission.Submitted()[0].value == 2 && planner.SymbolCount() == 0);
         } else {
-            std::optional<RecordedFrame> ready0(worker0.get());
+            std::optional<RecordedFrame> ready0(worker0.Join());
             auto receipt0 = std::move(*ready0).Submit(admission);
             planner.Confirm(first.state,*receipt0);
             auto receipt1 = std::move(*ready1).Submit(admission);
@@ -120,6 +148,8 @@ int TestDelayedFrameRecording(const rhi::DeviceCreateInfo& create) {
             ready0.reset(); ready1.reset(); receipt0.reset(); receipt1.reset();
             CHECK(admission.RetireCompleted(std::array{ExecutionTimelinePoint{1,2}}) == 2);
         }
+        recordingScope->Wait();
+        recordingScope.reset();
         ready1.reset(); first.state.reset(); second.state.reset();
         CHECK(slots.Active() == 0);
     }

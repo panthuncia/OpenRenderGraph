@@ -437,6 +437,31 @@ int main() {
         CHECK(!packetLease.expired());
         CHECK(submission.RetireCompleted(std::vector<ExecutionTimelinePoint>{{10,2},{20,1}}) == 1);
         CHECK(packetLease.expired());
+        org::FrameSlotPool tailSlots(1);
+        auto tailFrame = std::make_shared<org::FrameContext>(2, 1, tailSlots.TryAcquire(0));
+        for (auto stage : {org::FrameStage::Preparing,
+            org::FrameStage::Compiling, org::FrameStage::Planned, org::FrameStage::Recording})
+            tailFrame->Advance(stage, static_cast<org::FrameStage>(static_cast<unsigned>(stage) + 1));
+        auto tailInput = std::make_shared<GraphCompileInput>(*bundle->input);
+        tailInput->frameContext = tailFrame;
+        auto tailBundle = std::make_shared<CompiledGraphBundle>(*bundle);
+        tailBundle->input = tailInput;
+        std::vector<std::shared_ptr<const IPreparedExecutionBatch>> tailPackets;
+        for (int i = 0; i < 3; ++i) {
+            auto packet = std::make_shared<Packet>(); packet->queueSlot = i == 1 ? 1 : 0;
+            tailPackets.push_back(packet);
+        }
+        ExecutionTimelineAdmission presentation({{10,0},{20,0}});
+        presentation.SubmitPrepared(tailBundle,
+            std::vector<std::vector<ExecutionTimelinePoint>>(3), tailPackets);
+        presentation.ExtendSubmittedFrame(tailFrame, {10,3});
+        CHECK(tailFrame->CompletionPoints() ==
+            (std::vector<ExecutionTimelinePoint>{{10,3},{20,1}}));
+        CHECK(presentation.RetireCompleted(
+            std::vector<ExecutionTimelinePoint>{{10,2},{20,1}}) == 0);
+        CHECK(presentation.RetireCompleted(
+            std::vector<ExecutionTimelinePoint>{{10,3},{20,1}}) == 1);
+        CHECK(tailFrame->Stage() == org::FrameStage::Retired);
         auto firstPacket = std::make_shared<Packet>();
         auto failedPacket = std::make_shared<Packet>(); failedPacket->succeeds = false;
         failedPacket->queueSlot = 1;

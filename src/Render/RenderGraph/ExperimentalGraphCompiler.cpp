@@ -188,6 +188,30 @@ void ExecutionTimelineAdmission::Fail(uint64_t submission, SubmissionReceipt rec
     // recovery/retirement can release the admission owner after GPU completion.
 }
 
+void ExecutionTimelineAdmission::ExtendSubmittedFrame(
+    const std::shared_ptr<FrameContext>& frame, ExecutionTimelinePoint completion) {
+    if (!frame || !completion.timeline || !completion.value)
+        throw std::invalid_argument("Invalid submitted-frame completion extension");
+    auto found = std::ranges::find_if(m_retained, [&](const auto& execution) {
+        return execution && execution->bundle && execution->bundle->input
+            && execution->bundle->input->frameContext == frame;
+    });
+    if (found == m_retained.end())
+        throw std::logic_error("Submitted frame is no longer retained");
+    auto submitted = std::ranges::find(m_submitted, completion.timeline,
+        &ExecutionTimelinePoint::timeline);
+    auto reserved = std::ranges::find(m_reserved, completion.timeline,
+        &ExecutionTimelinePoint::timeline);
+    if (submitted == m_submitted.end() || reserved == m_reserved.end())
+        throw std::invalid_argument("Unknown submitted-frame completion timeline");
+    if (completion.value <= submitted->value)
+        throw std::logic_error("Presentation completion is not monotonic");
+    submitted->value = completion.value;
+    reserved->value = completion.value;
+    (*found)->tailCompletions.push_back(completion);
+    frame->IncludeSubmittedCompletion(completion);
+}
+
 size_t ExecutionTimelineAdmission::RetireCompleted(std::span<const ExecutionTimelinePoint> completed) {
     BT_ZONE_SCOPE("ORG.AsyncExecution.RetireTimelines");
     if (completed.size() != m_completed.size()) throw std::invalid_argument("Invalid completion dimensions");
@@ -202,6 +226,12 @@ size_t ExecutionTimelineAdmission::RetireCompleted(std::span<const ExecutionTime
         for (size_t i = 0; i < execution->batches.size(); ++i)
             if (execution->batches[i].signal.value > completed[execution->bundle->graph->batches[i].queue].value)
                 return false;
+        for (const auto completion : execution->tailCompletions) {
+            const auto observed = std::ranges::find(completed, completion.timeline,
+                &ExecutionTimelinePoint::timeline);
+            if (observed == completed.end() || completion.value > observed->value)
+                return false;
+        }
         BT_ZONE_SCOPE("ORG.Frame.Retire");
         AnnotateFrameTrace(execution->bundle->input->frameContext);
         for (const auto& packet : execution->preparedBatches)

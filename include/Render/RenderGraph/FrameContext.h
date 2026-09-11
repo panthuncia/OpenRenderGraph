@@ -9,6 +9,8 @@
 #include <stdexcept>
 #include <vector>
 
+#include "Render/Runtime/OpenRenderGraphSettings.h"
+
 namespace org {
 
 struct FrameCompletionPoint {
@@ -73,6 +75,7 @@ public:
         std::scoped_lock lock(m_mutex);
         return std::ranges::count_if(m_slots, [](const auto& slot) { return !slot.expired(); });
     }
+    size_t Capacity() const noexcept { return m_slots.size(); }
 private:
     mutable std::mutex m_mutex;
     std::vector<std::weak_ptr<const FrameSlotLease>> m_slots;
@@ -83,13 +86,23 @@ private:
 // keeps this object recovery-owned until the device is known to be quiescent.
 class FrameContext {
 public:
-    FrameContext(uint64_t frame, uint64_t generation, std::shared_ptr<const FrameSlotLease> slot)
-        : m_frame(frame), m_generation(generation), m_slot(std::move(slot)) {
+    using Settings = runtime::OpenRenderGraphSettings;
+
+    FrameContext(uint64_t frame, uint64_t generation, std::shared_ptr<const FrameSlotLease> slot,
+        bool asynchronousScheduling = false, uint8_t compileConcurrency = 2,
+        Settings settings = {})
+        : m_frame(frame), m_generation(generation), m_slot(std::move(slot)),
+          m_asynchronousScheduling(asynchronousScheduling),
+          m_compileConcurrency((std::max)(uint8_t{1}, compileConcurrency)),
+          m_settings(std::move(settings)) {
         if (!frame || !generation || !m_slot) throw std::invalid_argument("Incomplete frame identity");
     }
     uint64_t Number() const noexcept { return m_frame; }
     uint64_t Generation() const noexcept { return m_generation; }
     uint32_t Slot() const noexcept { return m_slot->Index(); }
+    bool AsynchronousScheduling() const noexcept { return m_asynchronousScheduling; }
+    uint8_t CompileConcurrency() const noexcept { return m_compileConcurrency; }
+    const Settings& AcceptedSettings() const noexcept { return m_settings; }
     FrameStage Stage() const noexcept { return m_stage.load(std::memory_order_acquire); }
     std::vector<FrameCompletionPoint> CompletionPoints() const {
         std::scoped_lock lock(m_mutex);
@@ -117,6 +130,12 @@ public:
             throw std::logic_error("Frame is not ready for submission");
         m_completion = std::move(completion);
     }
+    void IncludeSubmittedCompletion(FrameCompletionPoint completion) {
+        std::scoped_lock lock(m_mutex);
+        if (Stage() != FrameStage::Submitted)
+            throw std::logic_error("Frame is not submitted");
+        m_completion.Include(completion);
+    }
     bool Retire(std::span<const FrameCompletionPoint> observed) {
         std::scoped_lock lock(m_mutex);
         if (Stage() != FrameStage::Submitted || !m_completion.IsComplete(observed)) return false;
@@ -139,6 +158,9 @@ private:
     const uint64_t m_generation;
     // Declared before owners so the slot is released after its dependencies.
     const std::shared_ptr<const FrameSlotLease> m_slot;
+    const bool m_asynchronousScheduling;
+    const uint8_t m_compileConcurrency;
+    const Settings m_settings;
     std::atomic<FrameStage> m_stage{FrameStage::Preparing};
     mutable std::mutex m_mutex;
     CompletionSet m_completion;

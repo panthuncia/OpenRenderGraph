@@ -16,7 +16,9 @@ enum class QueueSchedulingSelectionPolicy : uint8_t {
     Scored = 1,
 };
 
-enum class AsyncCompileMode : uint8_t { Off = 0, Shadow = 1, Async = 2 };
+// Value 1 was the removed shadow/replay route. Preserve Async's stored value
+// so existing configuration remains compatible.
+enum class AsyncCompileMode : uint8_t { Off = 0, Async = 2 };
 
 struct OpenRenderGraphSettings {
     uint8_t numFramesInFlight = 3;

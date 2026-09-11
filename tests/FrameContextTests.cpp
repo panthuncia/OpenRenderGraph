@@ -13,8 +13,22 @@ using namespace org;
 int main() {
     FrameSlotPool slots(2);
     auto first = std::make_shared<FrameContext>(1, 1, slots.TryAcquire(0));
-    auto second = std::make_shared<FrameContext>(2, 1, slots.TryAcquire(1));
+    runtime::OpenRenderGraphSettings acceptedSettings;
+    acceptedSettings.useAsyncCompute = false;
+    acceptedSettings.queueSchedulingWidthScale = 7.5f;
+    acceptedSettings.autoAliasPoolRetireIdleFrames = 91;
+    auto second = std::make_shared<FrameContext>(
+        2, 1, slots.TryAcquire(1), true, 4, acceptedSettings);
     CHECK(slots.Active() == 2);
+    CHECK(slots.Capacity() == 2);
+    CHECK(!first->AsynchronousScheduling() && first->CompileConcurrency() == 2);
+    CHECK(second->AsynchronousScheduling() && second->CompileConcurrency() == 4);
+    acceptedSettings.useAsyncCompute = true;
+    acceptedSettings.queueSchedulingWidthScale = 1.0f;
+    acceptedSettings.autoAliasPoolRetireIdleFrames = 1;
+    CHECK(!second->AcceptedSettings().useAsyncCompute);
+    CHECK(second->AcceptedSettings().queueSchedulingWidthScale == 7.5f);
+    CHECK(second->AcceptedSettings().autoAliasPoolRetireIdleFrames == 91);
     CHECK(!slots.TryAcquire(0)); // No GPU fence exists yet; CPU work owns the slot.
     auto oldBacking = std::make_shared<int>(42);
     auto oldPipeline = std::make_shared<int>(17);

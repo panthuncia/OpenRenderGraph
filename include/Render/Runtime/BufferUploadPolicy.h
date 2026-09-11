@@ -8,7 +8,7 @@
 #include <utility>
 #include <vector>
 
-#include "Render/Runtime/UploadServiceAccess.h"
+#include "Render/Runtime/IUploadService.h"
 
 namespace org::runtime {
 
@@ -116,18 +116,13 @@ public:
     }
 
     template<class SourceBytesFn>
-    void FlushToUploadService(UploadTarget target, SourceBytesFn&& sourceBytes) {
+    void FlushToUploadService(IUploadService& uploadService, UploadTarget target, SourceBytesFn&& sourceBytes) {
         if (m_config.tag != UploadPolicyTag::Coalesced) {
             m_lastFlushStats = {};
             return;
         }
 
         BufferUploadPolicyStats stats{};
-        auto* uploadService = GetActiveUploadService();
-        if (!uploadService) {
-            throw std::runtime_error("Upload service is not active while flushing upload policies");
-        }
-
         stats.stagedWrites = m_coalescedStagedWrites;
         stats.stagedBytes = m_coalescedStagedBytes;
         stats.overlapEvents = m_coalescedOverlapEvents;
@@ -146,7 +141,7 @@ public:
             }
 
 #if BUILD_TYPE == BUILD_TYPE_DEBUG
-            uploadService->UploadData(
+            uploadService.UploadData(
                 source,
                 uploadSize,
                 target,
@@ -154,7 +149,7 @@ public:
                 range.file,
                 range.line);
 #else
-            uploadService->UploadData(
+            uploadService.UploadData(
                 source,
                 uploadSize,
                 target,

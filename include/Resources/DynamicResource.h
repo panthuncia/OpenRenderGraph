@@ -3,6 +3,7 @@
 #pragma once
 
 #include <memory>
+#include <shared_mutex>
 #include <string>
 #include <rhi.h>
 #include "Resources/Resource.h"
@@ -30,6 +31,7 @@ public:
             throw std::runtime_error("Cannot set a null resource.");
         }
 
+        std::unique_lock lock(resourceMutex);
         resource = std::move(newResource);
         //currentState = resource->GetState();
         name = resource->GetName();
@@ -39,26 +41,28 @@ public:
     }
 
     std::shared_ptr<Resource> GetResource() const {
+        std::shared_lock lock(resourceMutex);
         return resource;
     }
 
     rhi::BarrierBatch GetEnhancedBarrierGroup(RangeSpec range, rhi::ResourceAccessType prevAccessType, rhi::ResourceAccessType newAccessType, rhi::ResourceLayout prevLayout, rhi::ResourceLayout newLayout, rhi::ResourceSyncState prevSyncState, rhi::ResourceSyncState newSyncState) override {
-        if (resource) {
-            return resource->GetEnhancedBarrierGroup(range, prevAccessType, newAccessType, prevLayout, newLayout, prevSyncState, newSyncState);
+        auto backing = GetResource();
+        if (backing) {
+            return backing->GetEnhancedBarrierGroup(range, prevAccessType, newAccessType, prevLayout, newLayout, prevSyncState, newSyncState);
         }
         return {};
     }
 
     rhi::Resource GetAPIResource() override {
-		return resource->GetAPIResource();
+		return GetResource()->GetAPIResource();
 	}
     bool HasResource() const {
-        return resource != nullptr;
+        return static_cast<bool>(GetResource());
 	}
 
     virtual uint64_t GetGlobalResourceID() const override {
-        if (resource) {
-            return resource->GetGlobalResourceID();
+        if (auto backing = GetResource()) {
+            return backing->GetGlobalResourceID();
         }
         return m_globalResourceID;
 	}
@@ -71,20 +75,22 @@ public:
 	}
 
     SymbolicTracker* GetStateTracker() override {
-        return resource->GetStateTracker();
+        return GetResource()->GetStateTracker();
     }
     bool TryGetRHIResourceDesc(rhi::ResourceDesc& outDesc) const override {
-        return resource && resource->TryGetRHIResourceDesc(outDesc);
+        auto backing = GetResource();
+        return backing && backing->TryGetRHIResourceDesc(outDesc);
     }
 
 protected:
     void OnSetName() override {
-        if (resource) {
-            resource->SetName(name);
+        if (auto backing = GetResource()) {
+            backing->SetName(name);
         }
     }
 
 private:
+    mutable std::shared_mutex resourceMutex;
     std::shared_ptr<Resource> resource; // T actual resource
 };
 
@@ -103,12 +109,14 @@ public:
         if (!newResource) {
             throw std::runtime_error("Cannot set a null resource.");
         }
+        std::unique_lock lock(m_resourceMutex);
         m_resource = std::move(newResource);
         //currentState = m_resource->GetState();
         name = m_resource->GetName();
     }
 
     std::shared_ptr<GloballyIndexedResource> GetResource() const {
+        std::shared_lock lock(m_resourceMutex);
         return m_resource;
     }
 
@@ -137,6 +145,7 @@ protected:
     }
 
 private:
+    mutable std::shared_mutex m_resourceMutex;
     std::shared_ptr<GloballyIndexedResource> m_resource; // actual resource
 };
 

@@ -675,6 +675,40 @@ int TestPreparedGpuSubmission(rhi::Device device, ID3D12Device* nativeDevice) {
             auto& p = *static_cast<QueueProbe*>(queue->impl); ++p.signals;
             return p.fail == 3 ? rhi::Result::Failed : rhi::Result::Ok;
         };
+        {
+            QueueProbe probe;
+            rhi::Queue queue; queue.impl = &probe; queue.vt = &probeTable;
+            auto cancelledCounts = std::make_shared<TypedLifecycleCounts>();
+            auto cancelledEffect = org::PreparedPass::FromTyped<TypedLifecyclePass>(
+                TypedLifecycleData{cancelledCounts});
+            PreparedRhiExecutionBatch cancelledPacket(0, queue, {lease->lists[0].Get()},
+                {{1,timeline.Get().GetHandle()}}, lease, {cancelledEffect});
+            cancelledPacket.Abandon();
+            CHECK(cancelledCounts->abandoned == 1);
+            CHECK(cancelledPacket.Submit(execution->batches[0]).failureStage ==
+                SubmissionFailureStage::Replay);
+            CHECK(probe.waits == 0 && probe.submits == 0 && probe.signals == 0);
+        }
+        {
+            QueueProbe probe;
+            rhi::Queue queue; queue.impl = &probe; queue.vt = &probeTable;
+            auto callbackCount = std::make_shared<int>(0);
+            auto throwingEffect = org::PreparedPass::Make(callbackCount,
+                +[](const std::shared_ptr<int>&, org::RecordingContext&) {},
+                +[](const std::shared_ptr<int>& count) {
+                    ++*count;
+                    throw std::runtime_error("injected submission lifecycle failure");
+                });
+            throwingEffect.Record(recording);
+            PreparedRhiExecutionBatch throwingPacket(0, queue, {lease->lists[0].Get()},
+                {{1,timeline.Get().GetHandle()}}, lease, {throwingEffect});
+            const auto receipt = throwingPacket.Submit(execution->batches[0]);
+            CHECK(receipt.state == SubmissionState::SubmittedWithoutSignal);
+            CHECK(receipt.failureStage == SubmissionFailureStage::Lifecycle);
+            CHECK(*callbackCount == 1 && probe.submits == 1 && probe.signals == 0);
+            CHECK(throwingPacket.Submit(execution->batches[0]).failureStage ==
+                SubmissionFailureStage::Replay);
+        }
         for (int failure = 0; failure != 4; ++failure) {
             QueueProbe probe; probe.fail = failure;
             rhi::Queue queue; queue.impl = &probe; queue.vt = &probeTable;

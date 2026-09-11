@@ -133,11 +133,12 @@ namespace rhi {
 
 namespace org {
 
+namespace runtime { class IDescriptorService; }
+
 class Sampler {
 public:
         static std::shared_ptr<Sampler> CreateSampler(rhi::SamplerDesc samplerDesc);
         static std::shared_ptr<Sampler> CreateCpuOnlySampler(rhi::SamplerDesc samplerDesc);
-        static bool CanCreateDescriptorSamplers();
     ~Sampler() {
     }
 
@@ -146,7 +147,7 @@ public:
     Sampler& operator=(const Sampler&) = delete;
 
     // Get the index of the sampler in the descriptor heap
-    UINT GetDescriptorIndex() const;
+    UINT GetDescriptorIndex(runtime::IDescriptorService& descriptorService) const;
 
     static std::shared_ptr<Sampler> GetDefaultSampler();
 	static std::shared_ptr<Sampler> GetDefaultShadowSampler();
@@ -154,9 +155,10 @@ public:
 private:
     mutable UINT m_index; // Index of the sampler in the descriptor heap
     mutable std::atomic_bool m_hasDescriptorIndex;
+    mutable std::atomic<runtime::IDescriptorService*> m_descriptorOwner{ nullptr };
     mutable std::mutex m_descriptorMutex;
     rhi::SamplerDesc m_samplerDesc; // Descriptor of the sampler
-    Sampler(rhi::SamplerDesc samplerDesc, bool createDescriptor);
+    explicit Sampler(rhi::SamplerDesc samplerDesc);
 
     static std::shared_ptr<Sampler> m_defaultSampler;
 	static std::shared_ptr<Sampler> m_defaultShadowSampler;

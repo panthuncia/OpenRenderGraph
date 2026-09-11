@@ -263,6 +263,7 @@ public:
                     throw std::invalid_argument("Duplicate timeline identity");
         }
     }
+    ~PreparedRhiExecutionBatch() override { Abandon(); }
     uint32_t QueueSlot() const noexcept override { return m_queueSlot; }
     SubmissionReceipt Submit(const ExecutionBatchTimeline& batch) const noexcept override {
         // Single-consumption even after failure: uploads/readbacks cannot replay.
@@ -273,24 +274,33 @@ public:
         };
         const auto* signal = find(batch.signal.timeline);
         if (!signal || !batch.signal.value || batch.signal.value == UINT64_MAX) {
-            Abandon();
+            AbandonEffects();
             return {SubmissionState::NotSubmitted, SubmissionFailureStage::Validation};
         }
         for (auto wait : batch.waits) if (!find(wait.timeline)) {
-            Abandon();
+            AbandonEffects();
             return {SubmissionState::NotSubmitted, SubmissionFailureStage::Validation};
         }
         for (auto wait : batch.waits) {
             const auto result = m_queue.Wait({find(wait.timeline)->handle, wait.value});
             if (result != rhi::Result::Ok) {
-                Abandon();
+                AbandonEffects();
                 return {SubmissionState::NotSubmitted, SubmissionFailureStage::Wait, static_cast<uint32_t>(result)};
             }
         }
         const auto submitted = m_queue.Submit({m_lists.data(), static_cast<uint32_t>(m_lists.size())}, {});
         if (submitted != rhi::Result::Ok)
             return {SubmissionState::SubmissionUncertain, SubmissionFailureStage::Submit, static_cast<uint32_t>(submitted)};
-        for (const auto& pass : m_submissionEffects) pass.CommitSubmitted({batch.signal.value});
+        bool lifecycleFailed = false;
+        for (const auto& pass : m_submissionEffects) {
+            try { pass.CommitSubmitted({batch.signal.value}); }
+            catch (...) {
+                lifecycleFailed = true;
+                basic_telemetry::AddCounter("ORG.AsyncExecution.SubmissionLifecycleFailures");
+            }
+        }
+        if (lifecycleFailed)
+            return {SubmissionState::SubmittedWithoutSignal, SubmissionFailureStage::Lifecycle};
         for (const auto& pass : m_submissionEffects) {
             for (const auto& external : pass.ExternalSignalsAfterCompletion()) {
                 if (!external.timeline || !external.value)
@@ -313,9 +323,16 @@ public:
         }
     }
     void Abandon() const noexcept override {
-        for (const auto& pass : m_submissionEffects) pass.Abandon(AbandonReason::AdmissionFailed);
+        if (m_consumed.exchange(true)) return;
+        AbandonEffects();
     }
 private:
+    void AbandonEffects() const noexcept {
+        for (const auto& pass : m_submissionEffects) {
+            try { pass.Abandon(AbandonReason::AdmissionFailed); }
+            catch (...) { basic_telemetry::AddCounter("ORG.AsyncExecution.AbandonLifecycleFailures"); }
+        }
+    }
     uint32_t m_queueSlot;
     mutable rhi::Queue m_queue;
     mutable std::vector<rhi::CommandList> m_lists; // RHI Span uses non-const handles.

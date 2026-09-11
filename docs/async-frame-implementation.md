@@ -18,14 +18,178 @@ not establish visual parity and must not serve as valid performance baselines.
 | Phase | Status |
 | --- | --- |
 | 0: checkpoint baseline and telemetry | Four original failures archived; four repaired baseline runs stable; frame-stage annotation added |
-| 1: frame ownership and retirement | Slot leases, retained dependencies, completion sets and recovery retention integrated; runtime descriptor snapshot integration and full program-version audit remain |
+| 1: frame ownership and retirement | Slot leases, retained dependencies, completion sets, recovery retention, and presentation-tail completion extension integrated; runtime descriptor snapshot integration and full program-version audit remain |
 | 2: separate recording/submission | Recording boundary and slot/queue command pools implemented; focused tests and Off/Async radius-1/100 runs pass; full phase acceptance remains pending |
-| 3: ordered planning and recording ahead | Planned/submitted ledgers, symbolic waits, worker planning/recording and deterministic concurrent-frame tests implemented; scene recording-ahead integration remains gated |
-| 4: worker preparation and presentation tail | Immutable renderer frame publication integrated; worker preparation, stage queues and presentation tail remain |
-| 5: pass migration and legacy API removal | 138 BasicRenderer/plugin entries use typed authoring; broader audit still finds the framework upload adapter and explicit contributor boundary paths |
+| 3: ordered planning and recording ahead | Planned/submitted ledgers, symbolic waits, worker planning/recording and deterministic concurrent-frame tests implemented; flat peer batch workers and the integrated slot-bounded recording-owner FIFO are active, while measured simultaneous logical-frame recording remains one |
+| 4: worker preparation and presentation tail | Immutable renderer frame publication, worker preparation, slot-owned scene output, acquisition-time presentation tail, and presentation-inclusive ORG retirement are integrated |
+| 5: pass migration and legacy API removal | 141 entries use typed authoring; the obsolete Shadow scheduling/replay route is removed; the remaining adapters are the framework upload path and documented contributor boundary paths |
 | 6: full correctness/performance matrix | Pending |
 
 ## Framework follow-up audit
+
+### Strict frame admission and pending history (September 11, 2026)
+
+Executable-frame admission now acquires the `FrameSlotLease` in `RenderGraph::Update`
+before reset, readback/statistics processing, pass updates, contributor boundary
+work, or compilation. The same accepted `FrameContext` is retained by the
+preparation task and verified by compilation; compilation no longer acquires a
+second, later lease. Slot collisions therefore apply backpressure before any
+frame-local CPU or GPU writes. Ownership uses `UpdateExecutionContext::preparationSlot`
+explicitly, leaving pass `frameIndex` and later swapchain-image selection as
+separate identities. Structural test hosts without an execution task service
+retain their synchronous declaration-refresh path but do not admit an executable
+frame.
+
+Frame acceptance no longer synthesizes material, view, light, or pose state from
+live managers while the initial publications are pending. The renderer applies
+measured admission backpressure until all four roots exist, and clears its local
+frame-input alias at the start of each update so an early return cannot replay a
+previous logical frame. UI draw data is copied into the accepted render context;
+worker preparation no longer consults ImGui's mutable global draw lists.
+
+Depth history reservations publish a pending producer selection during
+preparation. The following frame can therefore retain the immediate compatible
+producer before submission; submission fills in its receipt and joined
+cancellation invalidates the selection. Cross-frame resource ordering and suffix
+cancellation continue to use the existing frame planner.
+
+Reservation callbacks retain the history service's state instead of a raw
+service pointer, so submission or cancellation remains safe after the façade is
+detached. `Clear` advances a service generation, invalidates dependencies already
+copied into accepted consumers, and prevents late callbacks from an older graph
+generation from republishing stale history. Focused coverage exercises pending
+selection, resolved submission, cancellation fallback, generation invalidation,
+and delayed callbacks after service destruction.
+
+The image-readback pass now follows the same rule. Its prepared reservation
+retains a shared request state containing queued inputs, submitted requests, the
+fence-value allocator, and admission status; delayed submission and cancellation
+callbacks no longer dereference `ReadbackManager`. Shutdown joins graph workers
+before closing this state. Cancellation after shutdown discards the input rather
+than reopening admission, while submitted ownership remains retained until the
+frame and its reservation retire.
+
+BC7 compression readback also retains the exact graph-generation
+`IReadbackService`. `TextureFactory` and its readback pass accept a shared service
+owner, and each prepared reservation copies that owner before it can enqueue or
+finalize captures. Replacing or destroying the current graph therefore cannot
+redirect an accepted BC7 job through a newer service or leave its callback with
+a dangling service pointer.
+
+Material-streaming feedback reservations now route their submitted/cancelled
+callbacks through a retained callback-state token. Manager shutdown clears the
+token under its mutex before freeing readback slots, so an accepted callback can
+either join the live owner or observe closed admission without dereferencing a
+destroyed manager. CLod readback cancellation uses its existing retained wake
+state for the same purpose. CLod upload/readback signal reservations also use an
+atomic exchange on both terminal paths, making submission versus cancellation an
+exactly-once decision.
+
+Recording completion now has an explicit per-frame owner in a FIFO bounded by
+the configured frame-slot capacity. Async mode dispatches through a retained
+future, Off mode stores the result inline, and both feed the same ordered
+submission path. The compiled graph now ends at `PresentationReadyPass`, leaving
+slot-owned scene output in `CopySource`. The renderer records the swapchain copy
+and Present transition on a worker after FIFO scene submission selects a logical
+frame, using the exact marker-batch receipt as its queue wait. A preparation-slot
+collision with CPU-owned work applies admission backpressure before graph
+preparation. Recording batches are peer scheduler tasks retained by one frame
+dispatch object; no recording worker blocks while joining child tasks, and each
+peer's packaged completion makes rejection and cancellation observable. Joining
+now relinquishes the dispatch owner's retained worker and frame state, including
+on exceptions. The backend-integrated recording test dispatches two slot-backed
+logical frames, holds both callbacks concurrently, completes the second first,
+rejects its premature submission, and then verifies ordered submission and failed
+head suffix cancellation. The
+integrated FIFO reaches its configured depth of three under the radius-1 benchmark,
+although trace evidence still measures one simultaneous logical `RecordBatch` frame;
+genuine recording overlap remains open.
+
+The renderer now confirms the presentation-tail submission by placing an ORG
+timeline signal after the tail on the graphics queue. The admission ledger adds
+that exact completion to its retained execution and to the accepted frame's
+completion set, and reserves the value before subsequent graph submissions.
+Timeline lookup uses stable identities rather than dense queue indices. Focused
+coverage proves that scene completion alone cannot retire the slot. The fresh
+`presentation-retirement-20260911-0205/Async/radius1/run1` run submitted 120
+frames, reached recording depth three, exited stable with no renderer errors or
+dropped telemetry, and shut down with `slots_before=3`, `slots_after=0`, and
+`pending_gpu=0`. Its two analyzer failures are the existing GPU visibility
+coverage assertions.
+
+Structural graph replacement now uses the same ownership shutdown protocol as
+normal termination. `ResetForRebuild` closes admission, joins preparation,
+compilation, planning, and recording users, cancels the unsubmitted suffix,
+retires submissions from observed queue completion after the caller's device-idle
+barrier, and refuses the rebuild when submitted ownership cannot be proven safe.
+Only after all slot leases are released does it detach graph storage and reopen
+admission for the new registry generation. Preparation failures and every owned
+execution-stage exception also close admission before propagating, while partial
+or uncertain submission remains retained in the admission ledger.
+
+Scheduling selection and compiler concurrency are now copied into the accepted
+`FrameContext` when its slot lease is acquired. Compilation, ordered planning,
+and recording read those retained values instead of consulting mutable settings
+again. A queued frame therefore continues through one scheduling contract even
+if the host changes settings while the frame is delayed. Frame-local queue bounds
+also derive from the established slot pool rather than a later settings read.
+
+Pass runtime services now enter through a nonvirtual graph setup hook. Passes
+hold weak generation references to avoid the upload-service/upload-pass cycle,
+while every accepted `FrameContext` retains the upload and descriptor service
+owners through cancellation or GPU retirement. Environment SH and all GTAO
+sampler setup now use the explicitly installed descriptor service, and ordinary
+pass uploads use the installed upload service. `CLodRayTracingSystem` retains the
+graph's upload-service generation explicitly. Reusable dynamic buffers receive
+that same generation from their upload-policy registration; immediate writes,
+coalesced flushes, backing-copy work, and resize replays no longer select an
+upload service through thread-local state. Graph replacement refreshes all
+registered buffers before new work is admitted. The pass hook is nonvirtual so
+contributor vtables and callback ABI remain unchanged. Page-pool uploads now
+require their generation-bound streaming callback and fail if the owner has been
+detached. Skeleton pose uploads, per-frame constants, texture construction, and
+environment texture loading retain the graph's upload-service generation and are
+refreshed at the stop/join graph-replacement boundary. Material, terrain,
+texture-image, camera, light, pose, and grass buffer publications also retain
+the exact upload generation in their delayed build inputs. The shared versioned
+buffer-family API requires a retained owner, so a caller cannot enqueue work with
+only a borrowed service pointer. BasicRenderer no longer installs a process-wide
+or thread-local upload service. Worker preparation and the host ingestion workers
+no longer install ambient graph services. The scoped contributor adapter remains
+only at the external callback boundary for ABI compatibility. `RenderGraphIOService`
+also retains its upload generation for the full imported-pass lifetime.
+
+Prepared RHI batches now make cancellation terminal before any queue operation.
+Dropping an unconsumed packet abandons its service reservations, and an explicit
+abandon prevents later submission. Submission callbacks are isolated from the
+`noexcept` backend boundary: all callbacks receive one resolution attempt, and a
+callback failure after queue submission produces a retained
+`SubmittedWithoutSignal/Lifecycle` receipt instead of terminating or releasing
+potentially GPU-referenced ownership. Focused fault injection covers cancellation,
+callback failure, backend wait/submit/signal failure, and replay rejection.
+
+The obsolete Shadow scheduling route has been removed. The setting now admits
+only Off and Async while retaining Async's existing numeric value for saved
+configuration compatibility; the retired value maps to Off. The former shadow
+compiler/request members now describe the authoritative owned compile
+coordinator, and capture failures propagate through the common stop/join/cancel
+recovery path instead of being swallowed by a diagnostic replay mode.
+
+Frame admission now copies the selected scheduling mode and compile concurrency
+into `FrameContext`. Compilation, ordered planning, and recording read those
+immutable values from the accepted owner instead of consulting the mutable
+settings service again. A later settings update therefore cannot move queued
+work between inline and worker execution or change its compiler concurrency.
+
+Scene-source revisions are transactional: abandoned ingestion leaves the
+committed revision unchanged, exact duplicate delivery is idempotent, conflicting
+reuse is rejected, and unsequenced ingestion receives an internal monotonic
+revision. The ECS compatibility adapter remains the current materialization
+backend. Snapshot export deep-copies mutable mesh-instance state, evaluated
+skeleton poses, and instance transforms, while the committed bridge revision
+retains its exact mesh artifacts. Until that backend supports rollback, an
+exception after mutation begins is a critical process failure; revision and
+service validation still fail normally before mutation starts.
 
 ### Coherent workload and activation publication selection (September 10, 2026)
 
@@ -1471,3 +1635,36 @@ including its dynamically declared visibility and head-pointer resources. Its
 two host-update queries remain explicit pending the per-view GPU publication
 migration. The current exact inventory is 18 files with 218 direct
 descriptor-view queries.
+
+Sampler objects are now immutable CPU descriptions. Material, texture-streaming,
+terrain, render-context, and grass artifact producers realize sampler indices
+through the descriptor service selected for their renderer generation; there is
+no manager or thread-local fallback in these paths. Static-scene clients share
+an atomic execution-generation cell, and every delayed grass shard, scene, and
+scratch payload snapshots strong upload and descriptor references. Graph
+replacement publishes the successor services through that cell after the stop
+and join boundary. Shutdown clears the cell only after request producers and
+the async state graph have joined, preventing copied ingestion access objects
+from keeping a detached backend generation alive indefinitely.
+
+Object-buffer and indirect-workload publication owners now retain their upload
+service generation. Every `VersionedGpuBufferBuildInput` they enqueue carries
+that same strong owner alongside the narrow service pointer used by the
+producer, so replacement cannot invalidate queued uploads. Graph rebuild also
+refreshes both owners through their existing service setters before new
+publication is admitted.
+
+Accepted frames now retain an immutable copy of the renderer settings used for
+their preparation. Scheduling callbacks resolve that snapshot while an accepted
+frame is being prepared, so later settings changes cannot alter its queue,
+aliasing, transition, or debug decisions. Frame planning, timeline admission,
+and recording queues use the FrameSlotPool capacity as their single bounded
+ownership limit rather than rereading the mutable settings service.
+
+Service binding lifetime: render passes retain weak references to upload and descriptor generations. Accessors fail when the generation has expired; they do not fall back to a process-wide active service, preventing delayed work from crossing generation boundaries.
+
+## Current integration status
+
+Implemented and validated: immutable accepted-frame settings, bounded frame-slot admission, owned publication inputs, ordered planning and submission, weak generation service bindings, worker preparation, nonblocking recording handles, presentation-tail ownership, and failure/shutdown retirement paths. Focused frame, compiler, external-resource, device-registry, and AsyncStateGraph tests pass.
+
+Remaining acceptance work: resolve Async scene GPU visibility undercoverage (current standalone capture is 8.9% occupied pixels versus 90.5% in Off), then rerun the integrated Off/Async radius-1 and radius-100 benchmark matrix. The known CLodCoordinatorTests segmentation fault and skeleton LOD behavior remain outside the current work scope. Do not switch the default scheduling mode until the visibility gate, multi-frame overlap evidence, failure-injection checks, and final performance/visual acceptance runs pass.

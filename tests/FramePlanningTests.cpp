@@ -78,6 +78,9 @@ void RunFramePlanningTests() {
     std::shared_ptr<org::runtime::ITaskScope> scope;
     const auto host = std::this_thread::get_id();
     CHECK(RunFrameWorker(tasks,scope,true,[] { return std::this_thread::get_id(); }) != host);
+    auto deferred = DispatchFrameWorker(tasks, scope, [] { return 17; });
+    CHECK(deferred.valid());
+    CHECK(deferred.get() == 17);
     scope->Wait();
     CHECK(RunFrameWorker(tasks,scope,false,[] { return std::this_thread::get_id(); }) == host);
     tasks->mode = BoundaryTasks::Inline;

@@ -2,6 +2,7 @@
 #include "FrameTrace.h"
 #include "RenderGraphCompilerState.h"
 #include "Render/RenderGraph/ExperimentalRhiExecution.h"
+#include "Render/Runtime/ScopedActiveGraphServices.h"
 
 #include <span>
 #include <algorithm>
@@ -1723,27 +1724,26 @@ std::span<const uint64_t> RenderGraph::GetSchedulingEquivalentIDsCached(uint64_t
 	return std::span<const uint64_t>(fallbackEquivalentIDs.data(), fallbackEquivalentIDs.size());
 }
 
-void RenderGraph::SubmitDependencyCompileShadow(rhi::Device device, const std::vector<Node>& nodes,
+void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vector<Node>& nodes,
     std::span<const std::pair<size_t, size_t>> explicitEdges,
     std::vector<std::pair<uint32_t, uint32_t>> dependencyOracle,
     uint8_t frameIndex, float deltaTime, const IHostExecutionData* hostData) try {
-    const auto mode = m_renderGraphSettingsService
-        ? m_renderGraphSettingsService->GetExperimentalAsyncCompileMode()
-        : runtime::AsyncCompileMode::Off;
+    const bool asynchronous = m_compilerState->preparingFrame
+        && m_compilerState->preparingFrame->AsynchronousScheduling();
     // Off is the synchronous form of the owned-frame pipeline: capture the
-    // exact same input and compile it inline. Shadow and Async differ only in
-    // whether/how the completed executable envelope is consumed.
-    if (mode == runtime::AsyncCompileMode::Async)
+    // exact same input and compile it inline. Scheduling mode changes only
+    // whether the completed executable envelope runs inline or on workers.
+    if (asynchronous)
         BT_PLOT("ORG.AsyncExecution.SceneRouteEnabled", int64_t{1});
     BT_ZONE_SCOPE("ORG.AsyncCompile.CaptureDependencies");
     if (!m_taskService) {
         BT_PLOT("ORG.AsyncCompile.FallbackNoTaskService", int64_t{1});
         return;
     }
-    auto& coordinator = m_compilerState->shadowCompiler;
+    auto& coordinator = m_compilerState->compileCoordinator;
     if (!coordinator) coordinator = std::make_unique<experimental::GraphCompileCoordinator>(
-        m_taskService, m_renderGraphSettingsService->GetExperimentalCompileConcurrency());
-    coordinator->SetConcurrency(m_renderGraphSettingsService->GetExperimentalCompileConcurrency());
+        m_taskService, m_compilerState->preparingFrame->CompileConcurrency());
+    coordinator->SetConcurrency(m_compilerState->preparingFrame->CompileConcurrency());
     experimental::GraphCompileInput input;
     input.frameContext = m_compilerState->preparingFrame;
     if (m_resolverCaptureContext) input.leases.push_back(m_resolverCaptureContext);
@@ -2047,11 +2047,7 @@ void RenderGraph::SubmitDependencyCompileShadow(rhi::Device device, const std::v
     std::sort(dependencyOracle.begin(), dependencyOracle.end());
     std::set_difference(oracle->begin(), oracle->end(), dependencyOracle.begin(), dependencyOracle.end(),
         std::back_inserter(input.structure.placementEdges));
-    if (mode == runtime::AsyncCompileMode::Shadow) {
-        input.expectedSchedulingEdges = std::move(oracle);
-        input.expectedEdges = std::make_shared<const experimental::DependencyEdges>(std::move(dependencyOracle));
-    }
-    if (mode != runtime::AsyncCompileMode::Shadow) {
+	{
 		BT_ZONE_SCOPE("ORG.AsyncExecution.CapturePreparationBasis");
         const bool allResourcesOwned = std::all_of(frozenResources.begin(), frozenResources.end(),
             [](const auto& binding) { return binding.resource.GetHandle().valid() && binding.owner; });
@@ -2188,9 +2184,8 @@ void RenderGraph::SubmitDependencyCompileShadow(rhi::Device device, const std::v
 			}
         } else basic_telemetry::AddCounter("ORG.AsyncExecution.PreparationUnownedResources");
     }
-    const bool inlineBootstrap = mode == runtime::AsyncCompileMode::Off
-        || (mode == runtime::AsyncCompileMode::Async
-            && m_compilerState->lastRequestedAsyncSequence == 0);
+    const bool inlineBootstrap = !asynchronous
+        || m_compilerState->lastRequestedAsyncSequence == 0;
     if (input.frameContext) {
         if (!input.executionPayload) throw std::runtime_error("Frame preparation produced no owned execution payload");
         input.frameContext->Retain(input.executionPayload);
@@ -2198,9 +2193,9 @@ void RenderGraph::SubmitDependencyCompileShadow(rhi::Device device, const std::v
         input.frameContext->Advance(FrameStage::Preparing, FrameStage::Compiling);
     }
     auto request = coordinator->RequestOwned(std::move(input), inlineBootstrap);
-    if (mode != runtime::AsyncCompileMode::Shadow && (!request.input || !request.sequence))
+    if (!request.input || !request.sequence)
         throw std::runtime_error("Owned frame compile request was rejected");
-    if (mode != runtime::AsyncCompileMode::Shadow && request.input) {
+    if (request.input) {
         if (request.sequence == 1 && m_compilerState->lastRequestedAsyncSequence != 0)
             m_compilerState->nextAsyncExecutionSequence = 1;
         m_compilerState->currentAsyncInput = request.input;
@@ -2208,8 +2203,7 @@ void RenderGraph::SubmitDependencyCompileShadow(rhi::Device device, const std::v
         m_compilerState->preparingFrame.reset();
     }
     coordinator->Pump();
-    if (mode != runtime::AsyncCompileMode::Shadow)
-        BT_PLOT("ORG.AsyncExecution.LastRequestedSequence", static_cast<int64_t>(request.sequence));
+    BT_PLOT("ORG.AsyncExecution.LastRequestedSequence", static_cast<int64_t>(request.sequence));
     const auto statistics = coordinator->Statistics();
     BT_PLOT("ORG.AsyncCompile.Active", static_cast<int64_t>(statistics.active));
     BT_PLOT("ORG.AsyncCompile.Pending", static_cast<int64_t>(statistics.pending));
@@ -2236,35 +2230,33 @@ void RenderGraph::SubmitDependencyCompileShadow(rhi::Device device, const std::v
     BT_PLOT("ORG.AsyncCompile.Rejected", static_cast<int64_t>(statistics.rejected));
     BT_PLOT("ORG.AsyncCompile.HighestReadySequence", static_cast<int64_t>(statistics.highestReadySequence));
     const auto failures = statistics.failed + statistics.oracleFailures + statistics.scheduleFailures + statistics.stateFailures + statistics.rejected;
-    if (failures > m_compilerState->reportedShadowFailures) {
-        spdlog::error("Async compile shadow validation: {}", statistics.lastError);
-        m_compilerState->reportedShadowFailures = failures;
+    if (failures > m_compilerState->reportedCompileFailures) {
+        spdlog::error("Async compile failure: {}", statistics.lastError);
+        m_compilerState->reportedCompileFailures = failures;
     }
 } catch (const std::exception& error) {
-    const auto failures = ++m_compilerState->shadowCaptureFailures;
+    const auto failures = ++m_compilerState->compileCaptureFailures;
     BT_PLOT("ORG.AsyncCompile.CaptureFailures", static_cast<int64_t>(failures));
     if (failures == 1 || failures % 64 == 0)
         spdlog::error("Graph frame capture failed: {}", error.what());
     if (m_compilerState->preparingFrame) {
-        if (m_compilerState->preparingFrame->Stage() == FrameStage::Compiling && m_compilerState->shadowCompiler)
-            m_compilerState->shadowCompiler->Shutdown();
+        if (m_compilerState->preparingFrame->Stage() == FrameStage::Compiling && m_compilerState->compileCoordinator)
+            m_compilerState->compileCoordinator->Shutdown();
         m_compilerState->preparingFrame->CancelAfterJoin();
         m_compilerState->preparingFrame.reset();
     }
-    if (m_renderGraphSettingsService
-        && m_renderGraphSettingsService->GetExperimentalAsyncCompileMode() != runtime::AsyncCompileMode::Shadow) throw;
+    throw;
 } catch (...) {
-    ++m_compilerState->shadowCaptureFailures;
-    BT_PLOT("ORG.AsyncCompile.CaptureFailures", static_cast<int64_t>(m_compilerState->shadowCaptureFailures));
+    ++m_compilerState->compileCaptureFailures;
+    BT_PLOT("ORG.AsyncCompile.CaptureFailures", static_cast<int64_t>(m_compilerState->compileCaptureFailures));
     spdlog::error("Unknown graph frame capture failure");
     if (m_compilerState->preparingFrame) {
-        if (m_compilerState->preparingFrame->Stage() == FrameStage::Compiling && m_compilerState->shadowCompiler)
-            m_compilerState->shadowCompiler->Shutdown();
+        if (m_compilerState->preparingFrame->Stage() == FrameStage::Compiling && m_compilerState->compileCoordinator)
+            m_compilerState->compileCoordinator->Shutdown();
         m_compilerState->preparingFrame->CancelAfterJoin();
         m_compilerState->preparingFrame.reset();
     }
-    if (m_renderGraphSettingsService
-        && m_renderGraphSettingsService->GetExperimentalAsyncCompileMode() != runtime::AsyncCompileMode::Shadow) throw;
+    throw;
 }
 
 void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHostExecutionData* hostData) {
@@ -2276,52 +2268,112 @@ void RenderGraph::PrepareAsyncFrame(rhi::Device device, uint8_t frameIndex, floa
 	PrepareAndCompileFrame(device, frameIndex, hostData, true, deltaTime);
 }
 
+std::shared_ptr<FrameContext> RenderGraph::TryAcceptFrame(
+    uint32_t preparationSlot, bool asynchronousScheduling) {
+    BT_ZONE_SCOPE("ORG.Frame.Accept");
+    if (m_compilerState->frameProductionStopped)
+        throw std::logic_error("Frame production has stopped");
+    if (!m_taskService || !m_renderGraphSettingsService) return {};
+
+    m_compilerState->RetireCompletedFrames(m_queueRegistry);
+    if (m_compilerState->currentAsyncInput && m_compilerState->currentAsyncInput->frameContext
+        && m_compilerState->currentAsyncInput->frameContext->Stage() == FrameStage::Retired)
+        m_compilerState->currentAsyncInput.reset();
+    if (!m_compilerState->frameSlots)
+        m_compilerState->frameSlots = std::make_unique<FrameSlotPool>(
+            m_renderGraphSettingsService->GetNumFramesInFlight());
+
+    auto lease = m_compilerState->frameSlots->TryAcquire(preparationSlot);
+    if (!lease) {
+        BT_ZONE_SCOPE("ORG.Frame.SlotBackpressure");
+        auto previous = m_compilerState->frameSlotOwners[preparationSlot].lock();
+        if (!previous || previous->Stage() != FrameStage::Submitted) {
+            basic_telemetry::AddCounter("ORG.Frame.AdmissionBackpressure");
+            BT_PLOT("ORG.Frame.ActiveSlots",
+                static_cast<int64_t>(m_compilerState->frameSlots->Active()));
+            return {};
+        }
+        AnnotateFrameTrace(previous);
+        for (const auto point : previous->CompletionPoints()) {
+            if (!point.timeline || point.timeline > m_queueRegistry.SlotCount())
+                throw std::logic_error("Frame completion references an unavailable queue");
+            auto fence = m_queueRegistry.GetFence(
+                static_cast<QueueSlotIndex>(static_cast<uint8_t>(point.timeline - 1)));
+            if (fence.HostWait(point.value, 10000) != rhi::Result::Ok)
+                throw std::runtime_error(
+                    "GPU completion wait failed while reclaiming a frame slot");
+        }
+        m_compilerState->RetireCompletedFrames(m_queueRegistry);
+        if (m_compilerState->currentAsyncInput
+            && m_compilerState->currentAsyncInput->frameContext == previous)
+            m_compilerState->currentAsyncInput.reset();
+        previous.reset();
+        lease = m_compilerState->frameSlots->TryAcquire(preparationSlot);
+        if (!lease)
+            throw std::logic_error("Completed frame still retains its preparation slot");
+    }
+
+    runtime::OpenRenderGraphSettings acceptedSettings;
+    acceptedSettings.numFramesInFlight = m_renderGraphSettingsService->GetNumFramesInFlight();
+    acceptedSettings.useAsyncCompute = m_renderGraphSettingsService->GetUseAsyncCompute();
+    acceptedSettings.experimentalAsyncCompileMode = asynchronousScheduling
+        ? runtime::AsyncCompileMode::Async : runtime::AsyncCompileMode::Off;
+    acceptedSettings.experimentalCompileConcurrency =
+        m_renderGraphSettingsService->GetExperimentalCompileConcurrency();
+    acceptedSettings.renderGraphCompileDumpEnabled = m_renderGraphSettingsService->GetRenderGraphCompileDumpEnabled();
+    acceptedSettings.renderGraphVramDumpEnabled = m_renderGraphSettingsService->GetRenderGraphVramDumpEnabled();
+    acceptedSettings.renderGraphBatchTraceEnabled = m_renderGraphSettingsService->GetRenderGraphBatchTraceEnabled();
+    acceptedSettings.renderGraphLightweightCompileSummaryEnabled = m_renderGraphSettingsService->GetRenderGraphLightweightCompileSummaryEnabled();
+    acceptedSettings.readOnlyUniformTransitionElisionEnabled = m_renderGraphSettingsService->GetReadOnlyUniformTransitionElisionEnabled();
+    acceptedSettings.autoAliasMode = m_renderGraphSettingsService->GetAutoAliasMode();
+    acceptedSettings.autoAliasPackingStrategy = m_renderGraphSettingsService->GetAutoAliasPackingStrategy();
+    acceptedSettings.autoAliasEnableLogging = m_renderGraphSettingsService->GetAutoAliasEnableLogging();
+    acceptedSettings.autoAliasLogExclusionReasons = m_renderGraphSettingsService->GetAutoAliasLogExclusionReasons();
+    acceptedSettings.autoAliasBuildDebugData = m_renderGraphSettingsService->GetAutoAliasBuildDebugData();
+    acceptedSettings.queueSchedulingEnableLogging = m_renderGraphSettingsService->GetQueueSchedulingEnableLogging();
+    acceptedSettings.queueSchedulingSelectionPolicy = m_renderGraphSettingsService->GetQueueSchedulingSelectionPolicy();
+    acceptedSettings.queueSchedulingWidthScale = m_renderGraphSettingsService->GetQueueSchedulingWidthScale();
+    acceptedSettings.queueSchedulingPenaltyBias = m_renderGraphSettingsService->GetQueueSchedulingPenaltyBias();
+    acceptedSettings.queueSchedulingMinPenalty = m_renderGraphSettingsService->GetQueueSchedulingMinPenalty();
+    acceptedSettings.queueSchedulingResourcePressureWeight = m_renderGraphSettingsService->GetQueueSchedulingResourcePressureWeight();
+    acceptedSettings.queueSchedulingUavPressureWeight = m_renderGraphSettingsService->GetQueueSchedulingUavPressureWeight();
+    acceptedSettings.queueSchedulingAutoGraphicsBias = m_renderGraphSettingsService->GetQueueSchedulingAutoGraphicsBias();
+    acceptedSettings.queueSchedulingAsyncOverlapBonus = m_renderGraphSettingsService->GetQueueSchedulingAsyncOverlapBonus();
+    acceptedSettings.queueSchedulingCrossQueueHandoffPenalty = m_renderGraphSettingsService->GetQueueSchedulingCrossQueueHandoffPenalty();
+    acceptedSettings.autoAliasPoolRetireIdleFrames = m_renderGraphSettingsService->GetAutoAliasPoolRetireIdleFrames();
+    acceptedSettings.autoAliasPoolGrowthHeadroom = m_renderGraphSettingsService->GetAutoAliasPoolGrowthHeadroom();
+    acceptedSettings.transitionPlacementMode = m_renderGraphSettingsService->GetTransitionPlacementMode();
+    acceptedSettings.heavyDebug = m_renderGraphSettingsService->GetHeavyDebug();
+
+    auto frame = std::make_shared<FrameContext>(
+        ++m_compilerState->asyncPreparationFrameNumber, m_resourceRegistryGeneration,
+        std::move(lease), asynchronousScheduling,
+        acceptedSettings.experimentalCompileConcurrency, std::move(acceptedSettings));
+    if (m_uploadService) frame->Retain(m_uploadService);
+    if (m_descriptorService) frame->Retain(m_descriptorService);
+    m_compilerState->preparingFrame = frame;
+    m_compilerState->frameSlotOwners[preparationSlot] = frame;
+    BT_PLOT("ORG.Frame.ActiveSlots", static_cast<int64_t>(m_compilerState->frameSlots->Active()));
+    BT_PLOT("ORG.Frame.PreparationNumber", static_cast<int64_t>(frame->Number()));
+    BT_PLOT("ORG.Frame.Generation", static_cast<int64_t>(m_resourceRegistryGeneration));
+    BT_PLOT("ORG.Frame.PreparationSlot", static_cast<int64_t>(preparationSlot));
+    AnnotateFrameTrace(frame);
+    return frame;
+}
+
 void RenderGraph::PrepareAndCompileFrame(rhi::Device device, uint8_t frameIndex,
 	const IHostExecutionData* hostData, bool asyncPreparationOnly, float deltaTime) {
     BT_ZONE_SCOPE("ORG.Frame.PrepareAndCompile");
     if (m_compilerState->frameProductionStopped)
         throw std::logic_error("Frame production has stopped");
-    const auto mode = m_renderGraphSettingsService
-        ? m_renderGraphSettingsService->GetExperimentalAsyncCompileMode() : runtime::AsyncCompileMode::Off;
-    if (mode != runtime::AsyncCompileMode::Shadow && m_taskService && m_renderGraphSettingsService) {
-        m_compilerState->RetireCompletedFrames(m_queueRegistry);
-        if (m_compilerState->currentAsyncInput && m_compilerState->currentAsyncInput->frameContext
-            && m_compilerState->currentAsyncInput->frameContext->Stage() == FrameStage::Retired)
-            m_compilerState->currentAsyncInput.reset();
-        if (!m_compilerState->frameSlots) m_compilerState->frameSlots = std::make_unique<FrameSlotPool>(
-            m_renderGraphSettingsService ? m_renderGraphSettingsService->GetNumFramesInFlight() : 3);
-        auto lease = m_compilerState->frameSlots->TryAcquire(frameIndex);
-        if (!lease) {
-            BT_ZONE_SCOPE("ORG.Frame.SlotBackpressure");
-            auto previous = m_compilerState->frameSlotOwners[frameIndex].lock();
-            if (!previous || previous->Stage() != FrameStage::Submitted)
-                throw std::logic_error("Preparation slot " + std::to_string(frameIndex)
-                    + " is retained by frame " + std::to_string(previous ? previous->Number() : 0)
-                    + " in stage " + std::to_string(previous ? static_cast<unsigned>(previous->Stage()) : 255));
-            AnnotateFrameTrace(previous);
-            for (const auto point : previous->CompletionPoints()) {
-                if (!point.timeline || point.timeline > m_queueRegistry.SlotCount())
-                    throw std::logic_error("Frame completion references an unavailable queue");
-                auto fence = m_queueRegistry.GetFence(static_cast<QueueSlotIndex>(static_cast<uint8_t>(point.timeline - 1)));
-                if (fence.HostWait(point.value, 10000) != rhi::Result::Ok)
-                    throw std::runtime_error("GPU completion wait failed while reclaiming a frame slot");
-            }
-            m_compilerState->RetireCompletedFrames(m_queueRegistry);
-            if (m_compilerState->currentAsyncInput && m_compilerState->currentAsyncInput->frameContext == previous)
-                m_compilerState->currentAsyncInput.reset();
-            previous.reset();
-            lease = m_compilerState->frameSlots->TryAcquire(frameIndex);
-            if (!lease) throw std::logic_error("Completed frame still retains its preparation slot");
-        }
-        m_compilerState->preparingFrame = std::make_shared<FrameContext>(
-            ++m_compilerState->asyncPreparationFrameNumber, m_resourceRegistryGeneration, std::move(lease));
-        m_compilerState->frameSlotOwners[frameIndex] = m_compilerState->preparingFrame;
-        BT_PLOT("ORG.Frame.ActiveSlots", static_cast<int64_t>(m_compilerState->frameSlots->Active()));
-        BT_PLOT("ORG.Frame.PreparationNumber", static_cast<int64_t>(m_compilerState->preparingFrame->Number()));
-        BT_PLOT("ORG.Frame.Generation", static_cast<int64_t>(m_resourceRegistryGeneration));
-        BT_PLOT("ORG.Frame.PreparationSlot", static_cast<int64_t>(frameIndex));
-        AnnotateFrameTrace(m_compilerState->preparingFrame);
+    const bool asynchronousScheduling = asyncPreparationOnly;
+    if (m_taskService && m_renderGraphSettingsService) {
+        if (!m_compilerState->preparingFrame
+            || m_compilerState->preparingFrame->Slot() != frameIndex
+            || m_compilerState->preparingFrame->AsynchronousScheduling() != asynchronousScheduling)
+            throw std::logic_error("Compilation does not own the accepted frame slot");
     }
+	org::runtime::ScopedActiveGraphServices activeServices(m_uploadService.get(), m_descriptorService.get());
 	if (asyncPreparationOnly) { BT_ZONE_SCOPE("RenderGraph::PrepareAsyncFrame"); }
 	else { BT_ZONE_SCOPE("RenderGraph::CompileFrame"); }
 	BeginCompileProfileFrame(frameIndex);
@@ -3623,7 +3675,7 @@ void RenderGraph::PrepareAndCompileFrame(rhi::Device device, uint8_t frameIndex,
 		m_aliasMaterializeOptionsByResourceIndex.clear();
 		m_aliasMaterializeResourceIDs.clear();
 		MaterializeUnmaterializedResources(usedResourceIDs);
-		SubmitDependencyCompileShadow(device, nodes, explicitEdges, {}, frameIndex, deltaTime, hostData);
+		SubmitOwnedCompileRequest(device, nodes, explicitEdges, {}, frameIndex, deltaTime, hostData);
 		traceCompileStep("complete");
 		return;
 	}
@@ -3741,12 +3793,10 @@ void RenderGraph::PrepareAndCompileFrame(rhi::Device device, uint8_t frameIndex,
 		}
 	}
 
-    std::vector<std::pair<uint32_t, uint32_t>> shadowDependencyOracle;
-    if (m_renderGraphSettingsService &&
-        m_renderGraphSettingsService->GetExperimentalAsyncCompileMode() != runtime::AsyncCompileMode::Off) {
-        for (uint32_t index = 0; index < nodes.size(); ++index)
-            for (auto next : nodes[index].out) shadowDependencyOracle.emplace_back(index, static_cast<uint32_t>(next));
-    }
+    std::vector<std::pair<uint32_t, uint32_t>> dependencyOracle;
+    for (uint32_t index = 0; index < nodes.size(); ++index)
+        for (auto next : nodes[index].out)
+            dependencyOracle.emplace_back(index, static_cast<uint32_t>(next));
 	const AutoAliasMode autoAliasMode = m_getAutoAliasMode ? m_getAutoAliasMode() : AutoAliasMode::Off;
 	auto hasManualAliasPoolThisFrame = [&]() {
 		for (uint64_t resourceID : usedResourceIDs) {
@@ -3919,7 +3969,7 @@ void RenderGraph::PrepareAndCompileFrame(rhi::Device device, uint8_t frameIndex,
     // Capture only after realization has produced owned backing generations.
     // Workers still receive immutable numeric metadata and leases; no compile
     // work is performed by this owner-side placement.
-    SubmitDependencyCompileShadow(device, nodes, explicitEdges, std::move(shadowDependencyOracle), frameIndex, deltaTime, hostData);
+    SubmitOwnedCompileRequest(device, nodes, explicitEdges, std::move(dependencyOracle), frameIndex, deltaTime, hostData);
 
 	{
 		traceCompileStep("AutoScheduleAndBuildBatches");

@@ -6,6 +6,8 @@
 
 namespace org::runtime {
 
+class IUploadService;
+
 class IUploadPolicyClient {
 public:
     virtual ~IUploadPolicyClient() = default;
@@ -15,6 +17,14 @@ public:
     virtual std::string GetUploadPolicyDebugName() const { return {}; }
     virtual uint64_t GetUploadPolicyLastFlushWrites() const { return 0; }
     virtual uint64_t GetUploadPolicyLastFlushBytes() const { return 0; }
+
+    void ConfigureUploadService(const std::shared_ptr<IUploadService>& service) { m_uploadService = service; }
+
+protected:
+    std::shared_ptr<IUploadService> RetainUploadService() const { return m_uploadService.lock(); }
+
+private:
+    std::weak_ptr<IUploadService> m_uploadService;
 };
 
 struct UploadPolicyServiceStats {
@@ -32,6 +42,7 @@ public:
 
     virtual void Initialize() = 0;
     virtual void Cleanup() = 0;
+    virtual void SetUploadService(std::shared_ptr<IUploadService> service) = 0;
 
     virtual void RegisterClient(IUploadPolicyClient* client) = 0;
     virtual void UnregisterClient(IUploadPolicyClient* client) = 0;
@@ -43,6 +54,6 @@ public:
     virtual UploadPolicyServiceStats GetStats() const = 0;
 };
 
-std::shared_ptr<IUploadPolicyService> CreateDefaultUploadPolicyService();
+std::shared_ptr<IUploadPolicyService> CreateDefaultUploadPolicyService(std::shared_ptr<IUploadService> uploadService);
 
 }

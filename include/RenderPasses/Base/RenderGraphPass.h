@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <source_location>
 
 #include "Interfaces/IResourceProvider.h"
 #include "Render/PassInputs.h"
@@ -8,6 +9,12 @@
 #include "Render/PassExecutionContext.h"
 
 namespace org {
+
+namespace runtime {
+class IUploadService;
+class IDescriptorService;
+struct UploadTarget;
+}
 
 class ResourceRegistryView;
 class RenderPassBuilder;
@@ -18,6 +25,14 @@ struct PassParameters;
 class RenderGraphPass : public IResourceProvider, public RenderGraphPassBase {
 public:
     virtual ~RenderGraphPass() = default;
+    // Nonvirtual to preserve contributor vtables. The graph installs its exact
+    // service generation before Setup; accepted frames retain the same owners.
+    void ConfigureRuntimeServices(
+        std::shared_ptr<runtime::IUploadService> uploads,
+        std::shared_ptr<runtime::IDescriptorService> descriptors) noexcept {
+        m_uploadService = std::move(uploads);
+        m_descriptorService = std::move(descriptors);
+    }
     virtual void ConfigureResourceRegistryView(
         std::shared_ptr<ResourceRegistryView> view,
         const PassParameters& parameters) = 0;
@@ -37,6 +52,14 @@ public:
     // pass must never also be captured through the legacy immediate replay
     // adapter, even if an intermediate class still implements that interface.
     virtual bool UsesTypedPreparation() const noexcept { return false; }
+protected:
+    runtime::IUploadService& UploadService() const;
+    runtime::IDescriptorService& DescriptorService() const;
+    void UploadBufferData(const void* data, size_t size, runtime::UploadTarget target,
+        size_t offset, std::source_location source = std::source_location::current()) const;
+private:
+    std::weak_ptr<runtime::IUploadService> m_uploadService;
+    std::weak_ptr<runtime::IDescriptorService> m_descriptorService;
 };
 
 } // namespace org

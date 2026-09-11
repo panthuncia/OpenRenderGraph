@@ -51,6 +51,7 @@ class RenderPassBuilder;
 class ComputePassBuilder;
 class CopyPassBuilder;
 class CommandRecordingManager;
+class FrameContext;
 struct IPassBuilder;
 struct IDynamicDeclaredResources;
 
@@ -719,6 +720,7 @@ public:
 	void RegisterExtension(std::unique_ptr<IRenderGraphExtension> ext, std::optional<std::string_view> id = std::nullopt);
 	const std::vector<PassBatch>& GetBatches() const { return batches; }
 	std::optional<PresentDependency> GetLastPresentDependency() const noexcept { return m_lastPresentDependency; }
+	void ConfirmPresentationTailSubmission();
 	org::memory::SnapshotProvider& GetMemorySnapshotProvider() { return m_memorySnapshotProvider; }
 	const org::memory::SnapshotProvider& GetMemorySnapshotProvider() const { return m_memorySnapshotProvider; }
 	void WriteVramUsageDebugDumpNow(uint8_t frameIndex) const { WriteVramUsageDebugDump(frameIndex); }
@@ -728,6 +730,7 @@ public:
 	void SetUploadService(std::shared_ptr<org::runtime::IUploadService> service) { m_uploadService = std::move(service); }
 	org::runtime::IUploadService* GetUploadService() { return m_uploadService.get(); }
 	const org::runtime::IUploadService* GetUploadService() const { return m_uploadService.get(); }
+	std::shared_ptr<org::runtime::IUploadService> RetainUploadService() const { return m_uploadService; }
 	void SetReadbackService(std::shared_ptr<org::runtime::IReadbackService> service) { m_readbackService = std::move(service); }
 	std::shared_ptr<org::runtime::IReadbackService> GetReadbackServiceOwner() const { return m_readbackService; }
 	org::runtime::IReadbackService* GetReadbackService() { return m_readbackService.get(); }
@@ -867,7 +870,10 @@ public:
 	QueueRegistry& GetQueueRegistry() noexcept { return m_queueRegistry; }
 
 private:
-	void UpdateOnPreparationOwner(const UpdateExecutionContext& context, rhi::Device device);
+	void UpdateOnPreparationOwner(const UpdateExecutionContext& context, rhi::Device device,
+		bool asynchronousScheduling, const std::shared_ptr<FrameContext>& acceptedFrame);
+	std::shared_ptr<FrameContext> TryAcceptFrame(uint32_t preparationSlot,
+		bool asynchronousScheduling);
 	void JoinPreparationOwner();
 	std::string GetTechniquePathForPassName(std::string_view passName) const;
 
@@ -1279,11 +1285,12 @@ private:
 	// This keeps compiler algorithm/layout changes from rebuilding all ORG clients.
 	struct Node;
 	struct CompilerState;
-    void SubmitDependencyCompileShadow(rhi::Device device, const std::vector<Node>& nodes,
+    void SubmitOwnedCompileRequest(rhi::Device device, const std::vector<Node>& nodes,
         std::span<const std::pair<size_t, size_t>> explicitEdges,
         std::vector<std::pair<uint32_t, uint32_t>> dependencyOracle,
         uint8_t frameIndex, float deltaTime, const IHostExecutionData* hostData);
-	bool TryExecuteSelectedAsyncFrame(PassExecutionContext& context);
+	bool TryExecuteSelectedAsyncFrame(PassExecutionContext& context, bool queueOnly = false);
+	bool TrySubmitRecordedFrame(PassExecutionContext& context);
 	bool PrepareSelectedAsyncFrame(PassExecutionContext& context);
 	std::unique_ptr<CompilerState> m_compilerState;
     std::shared_ptr<const ResolverCaptureContext> m_resolverCaptureContext;

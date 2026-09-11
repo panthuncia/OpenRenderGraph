@@ -21,6 +21,9 @@
 #include <sstream>
 #include <future>
 #include <thread>
+#include "Render/Runtime/IUploadService.h"
+#include "Render/Runtime/IDescriptorService.h"
+#include "Render/Runtime/DescriptorServiceAccess.h"
 #include "Render/Runtime/ScopedActiveGraphServices.h"
 #include <BasicTelemetry/Tracy.h>
 #include <rhi_helpers.h>
@@ -51,6 +54,33 @@
 
 
 namespace org {
+
+runtime::IUploadService& RenderGraphPass::UploadService() const {
+    auto service = m_uploadService.lock();
+    if (!service) throw std::runtime_error("Pass upload service generation is unavailable");
+    return *service;
+}
+
+runtime::IDescriptorService& RenderGraphPass::DescriptorService() const {
+    auto service = m_descriptorService.lock();
+    if (service) return *service;
+    // Pass construction can precede graph service binding during startup;
+    // retain the weak binding contract while allowing that initialization
+    // window to resolve through the graph's active generation.
+    if (auto* active = runtime::GetActiveDescriptorService()) return *active;
+    throw std::runtime_error("Pass descriptor service generation is unavailable");
+}
+
+void RenderGraphPass::UploadBufferData(const void* data, size_t size,
+    runtime::UploadTarget target, size_t offset, std::source_location source) const {
+#if BUILD_TYPE == BUILD_TYPE_DEBUG
+    UploadService().UploadData(data, size, std::move(target), offset,
+        source.file_name(), static_cast<int>(source.line()));
+#else
+    (void)source;
+    UploadService().UploadData(data, size, std::move(target), offset);
+#endif
+}
 
 namespace {
 std::atomic_bool g_loggedParallelTypedRecording{false};
@@ -621,6 +651,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 		}
 
 		if (callSetup) {
+			par.pass->ConfigureRuntimeServices(m_uploadService, m_descriptorService);
 			par.pass->ConfigureResourceRegistryView(
 				MakePassResourceRegistryView(_registry, par.resources), par.resources);
 			if (traceLifecycle) {
@@ -692,6 +723,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 		}
 
 		if (callSetup) {
+			par.pass->ConfigureRuntimeServices(m_uploadService, m_descriptorService);
 			par.pass->ConfigureResourceRegistryView(
 				MakePassResourceRegistryView(_registry, par.resources), par.resources);
 			if (traceLifecycle) {
@@ -759,6 +791,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 		}
 
 		if (callSetup) {
+			par.pass->ConfigureRuntimeServices(m_uploadService, m_descriptorService);
 			par.pass->ConfigureResourceRegistryView(
 				MakePassResourceRegistryView(_registry, par.resources), par.resources);
 			if (traceLifecycle) {
@@ -3675,6 +3708,14 @@ RenderGraph::RenderGraph(rhi::Device device, rhi::Backend primaryBackend)
 	if (!m_renderGraphSettingsService) {
 		m_renderGraphSettingsService = org::runtime::CreateDefaultRenderGraphSettingsService();
 	}
+	for (auto& entry : m_masterPassList) {
+		std::visit([&](auto& obj) {
+			using T = std::decay_t<decltype(obj)>;
+			if constexpr (!std::is_same_v<T, std::monostate>) {
+				if (obj.pass) obj.pass->ConfigureRuntimeServices(m_uploadService, m_descriptorService);
+			}
+		}, entry.pass);
+	}
 }
 
 DeviceInstanceId RenderGraph::RegisterBackendDevice(rhi::Backend backend, rhi::Device device) {
@@ -3712,7 +3753,7 @@ void RenderGraph::StopFrameProduction() {
         if (auto frame = weak.lock()) frames.push_back(std::move(frame));
     if (m_compilerState->frameWorkerScope) m_compilerState->frameWorkerScope->CancelAndWait();
     m_compilerState->frameWorkerScope.reset();
-	m_compilerState->shadowCompiler.reset();
+	m_compilerState->compileCoordinator.reset();
     // Joining compilation/recording precedes cancellation. Keep admission and
     // recovery owners intact until the caller establishes GPU quiescence.
     if (m_compilerState->framePlanner && !m_compilerState->framePlanner->RecoveryRequired())
@@ -3730,8 +3771,10 @@ void RenderGraph::ShutdownTaskWorkers() {
     const auto pendingGpu = m_compilerState->asyncTimelineAdmission ? m_compilerState->asyncTimelineAdmission->InFlight() : 0;
 	m_compilerState->selectedAsyncFrame.reset();
 	m_compilerState->currentAsyncInput.reset();
+	m_compilerState->pendingPresentationFrame.reset();
 	m_compilerState->preparingFrame.reset();
 	m_compilerState->selectedPlanning.reset();
+	m_compilerState->recordingFrames.clear();
 	m_compilerState->framePlanner.reset();
 	m_compilerState->asyncTimelineAdmission.reset();
 	m_compilerState->frameSlotOwners.clear();
@@ -3846,11 +3889,12 @@ void RenderGraph::ShutdownOwnedState() {
 	_registry = ResourceRegistry();
 	++m_resourceRegistryGeneration;
     m_resolverCaptureContext.reset();
-	if (m_compilerState->shadowCompiler) m_compilerState->shadowCompiler->Reset(m_resourceRegistryGeneration);
+	if (m_compilerState->compileCoordinator) m_compilerState->compileCoordinator->Reset(m_resourceRegistryGeneration);
 	m_compilerState->selectedAsyncFrame.reset();
 	m_compilerState->currentAsyncInput.reset();
 	m_compilerState->preparingFrame.reset();
 	m_compilerState->selectedPlanning.reset();
+	m_compilerState->recordingFrames.clear();
 	m_compilerState->framePlanner.reset();
 	m_compilerState->asyncTimelineAdmission.reset();
 	m_compilerState->frameSlots.reset();
@@ -3880,9 +3924,9 @@ void RenderGraph::ShutdownOwnedState() {
 	m_copyReadbackFence.Reset();
 
 	m_statisticsService.reset();
-	m_uploadService.reset();
+	// Keep service generations alive across graph rebuilds; existing pass
+	// objects may still be initialized before the successor setup boundary.
 	m_readbackService.reset();
-	m_descriptorService.reset();
 	m_renderGraphSettingsService.reset();
 }
 
@@ -5270,6 +5314,35 @@ void RenderGraph::ClearExtensions() {
 
 void RenderGraph::ResetForRebuild()
 {
+	// A structural replacement is a generation boundary for every accepted
+	// frame. The caller has already made all devices idle; join CPU users first,
+	// cancel the unsubmitted suffix, retire submitted ownership from confirmed
+	// queue completion, and only then detach graph storage.
+	StopFrameProduction();
+	m_compilerState->RetireCompletedFrames(m_queueRegistry);
+	if (m_compilerState->asyncTimelineAdmission
+		&& m_compilerState->asyncTimelineAdmission->InFlight() != 0)
+		throw std::runtime_error(
+			"Graph rebuild cannot prove completion of submitted frame ownership");
+	m_compilerState->selectedAsyncFrame.reset();
+	m_compilerState->currentAsyncInput.reset();
+	m_compilerState->pendingPresentationFrame.reset();
+	m_compilerState->preparingFrame.reset();
+	m_compilerState->selectedPlanning.reset();
+	m_compilerState->recordingFrames.clear();
+	m_compilerState->framePlanner.reset();
+	m_compilerState->asyncTimelineAdmission.reset();
+	m_compilerState->compileCoordinator.reset();
+	m_compilerState->frameSlotOwners.clear();
+	m_compilerState->frameCommandPools.clear();
+	if (m_compilerState->frameSlots && m_compilerState->frameSlots->Active() != 0)
+		throw std::runtime_error("Graph rebuild retained an accepted frame slot");
+	m_compilerState->frameSlots.reset();
+	m_compilerState->lastRequestedAsyncSequence = 0;
+	m_compilerState->nextAsyncExecutionSequence = 1;
+	m_compilerState->frameProductionStopped = false;
+	basic_telemetry::AddCounter("ORG.Frame.GenerationBoundaryResets");
+
 	if (m_pCommandRecordingManager) {
 		m_pCommandRecordingManager->ShutdownThreadLocal();
 		m_pCommandRecordingManager.reset();
@@ -5959,6 +6032,7 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(RenderPassAndResources& p,
 	// and readback passes consume the resources captured in their bytecode.
 	if (requiresPassRebind) {
 		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Render)::SetResourceRegistryView");
+		p.pass->ConfigureRuntimeServices(m_uploadService, m_descriptorService);
 		p.pass->ConfigureResourceRegistryView(MakePassResourceRegistryView(_registry, p.resources), p.resources);
 	}
 	if (traceLifecycle) {
@@ -6057,6 +6131,7 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(ComputePassAndResources& p
 		p.declarationCache.dynamicInterface->RequiresPassRebindAfterDeclarationRefresh();
 	if (requiresPassRebind) {
 		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Compute)::SetResourceRegistryView");
+		p.pass->ConfigureRuntimeServices(m_uploadService, m_descriptorService);
 		p.pass->ConfigureResourceRegistryView(MakePassResourceRegistryView(_registry, p.resources), p.resources);
 	}
 	if (traceLifecycle) {
@@ -6151,6 +6226,7 @@ bool RenderGraph::RefreshRetainedDeclarationsForFrame(CopyPassAndResources& p, u
 		p.declarationCache.dynamicInterface->RequiresPassRebindAfterDeclarationRefresh();
 	if (requiresPassRebind) {
 		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Copy)::SetResourceRegistryView");
+		p.pass->ConfigureRuntimeServices(m_uploadService, m_descriptorService);
 		p.pass->ConfigureResourceRegistryView(MakePassResourceRegistryView(_registry, p.resources), p.resources);
 	}
 	if (traceLifecycle) {
@@ -6274,6 +6350,11 @@ std::tuple<int, int, int> RenderGraph::GetBatchesToWaitOn(
 
 void RenderGraph::MaterializeUnmaterializedResources(std::span<const uint64_t> onlyResourceIDs) {
 	BT_ZONE_SCOPE("RenderGraph::MaterializeUnmaterializedResources");
+	// Rebuilds may have retired the prior service generation before structural
+	// materialization runs. Establish the successor generation before any pass
+	// Setup/configuration callback can resolve descriptor or upload services.
+	if (!m_uploadService) m_uploadService = org::runtime::CreateDefaultUploadService();
+	if (!m_descriptorService) m_descriptorService = org::runtime::CreateDefaultDescriptorService();
 	const bool limitToResourceIDs = !onlyResourceIDs.empty();
 	auto tryGetAliasMaterializeOptions = [&](uint64_t id) -> ResourceMaterializeOptions* {
 		auto resourceIndex = TryGetFrameSchedulingResourceIndex(id);
@@ -7244,6 +7325,13 @@ void RenderGraph::RebuildRetainedDeclarationRefreshCandidates()
 }
 
 void RenderGraph::Setup() {
+	// Establish service generations before any pass initialization or setup
+	// callback. Rebuilds may have retired the prior generation.
+	if (!m_uploadService) m_uploadService = org::runtime::CreateDefaultUploadService();
+	if (!m_descriptorService) m_descriptorService = org::runtime::CreateDefaultDescriptorService();
+	if (!m_readbackService) m_readbackService = org::runtime::CreateDefaultReadbackService();
+	if (!m_statisticsService) m_statisticsService = org::runtime::CreateDefaultStatisticsService();
+	org::runtime::ScopedActiveGraphServices activeServices(m_uploadService.get(), m_descriptorService.get());
 	DeletionManager::GetInstance().Initialize();
 
 	// Setup the statistics manager
@@ -7319,89 +7407,116 @@ void RenderGraph::Setup() {
 	ResizeQueueParallelVectors();
 
 	m_getUseAsyncCompute = [this]() {
+		if (m_compilerState && m_compilerState->preparingFrame) return m_compilerState->preparingFrame->AcceptedSettings().useAsyncCompute;
 		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetUseAsyncCompute() : false;
 	};
 	m_getHeavyDebug = [this]() {
+		if (m_compilerState && m_compilerState->preparingFrame) return m_compilerState->preparingFrame->AcceptedSettings().heavyDebug;
 		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetHeavyDebug() : false;
 	};
 	m_getRenderGraphCompileDumpEnabled = [this]() {
+		if (m_compilerState && m_compilerState->preparingFrame) return m_compilerState->preparingFrame->AcceptedSettings().renderGraphCompileDumpEnabled;
 		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetRenderGraphCompileDumpEnabled() : false;
 	};
 	m_getRenderGraphVramDumpEnabled = [this]() {
+		if (m_compilerState && m_compilerState->preparingFrame) return m_compilerState->preparingFrame->AcceptedSettings().renderGraphVramDumpEnabled;
 		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetRenderGraphVramDumpEnabled() : false;
 	};
 	m_getRenderGraphBatchTraceEnabled = [this]() {
+		if (m_compilerState && m_compilerState->preparingFrame) return m_compilerState->preparingFrame->AcceptedSettings().renderGraphBatchTraceEnabled;
 		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetRenderGraphBatchTraceEnabled() : false;
 	};
 	m_getRenderGraphLightweightCompileSummaryEnabled = [this]() {
+		if (m_compilerState && m_compilerState->preparingFrame) return m_compilerState->preparingFrame->AcceptedSettings().renderGraphLightweightCompileSummaryEnabled;
 		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetRenderGraphLightweightCompileSummaryEnabled() : false;
 	};
 	m_getReadOnlyUniformTransitionElisionEnabled = [this]() {
+		if (m_compilerState && m_compilerState->preparingFrame) return m_compilerState->preparingFrame->AcceptedSettings().readOnlyUniformTransitionElisionEnabled;
 		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetReadOnlyUniformTransitionElisionEnabled() : false;
 	};
 
 	m_getAutoAliasMode = [this]() {
+		if (m_compilerState && m_compilerState->preparingFrame)
+			return static_cast<AutoAliasMode>(m_compilerState->preparingFrame->AcceptedSettings().autoAliasMode);
 		const auto mode = m_renderGraphSettingsService
 			? m_renderGraphSettingsService->GetAutoAliasMode()
 			: static_cast<uint8_t>(AutoAliasMode::Off);
 		return static_cast<AutoAliasMode>(mode);
 	};
 	m_getAutoAliasPackingStrategy = [this]() {
+		if (m_compilerState && m_compilerState->preparingFrame)
+			return static_cast<AutoAliasPackingStrategy>(m_compilerState->preparingFrame->AcceptedSettings().autoAliasPackingStrategy);
 		const auto strategy = m_renderGraphSettingsService
 			? m_renderGraphSettingsService->GetAutoAliasPackingStrategy()
 			: static_cast<uint8_t>(AutoAliasPackingStrategy::GreedySweepLine);
 		return static_cast<AutoAliasPackingStrategy>(strategy);
 	};
 	m_getAutoAliasEnableLogging = [this]() {
+		if (m_compilerState && m_compilerState->preparingFrame) return m_compilerState->preparingFrame->AcceptedSettings().autoAliasEnableLogging;
 		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetAutoAliasEnableLogging() : false;
 	};
 	m_getAutoAliasLogExclusionReasons = [this]() {
+		if (m_compilerState && m_compilerState->preparingFrame) return m_compilerState->preparingFrame->AcceptedSettings().autoAliasLogExclusionReasons;
 		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetAutoAliasLogExclusionReasons() : false;
 	};
 	m_getAutoAliasBuildDebugData = [this]() {
+		if (m_compilerState && m_compilerState->preparingFrame) return m_compilerState->preparingFrame->AcceptedSettings().autoAliasBuildDebugData;
 		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetAutoAliasBuildDebugData() : false;
 	};
 	m_getQueueSchedulingEnableLogging = [this]() {
+		if (m_compilerState && m_compilerState->preparingFrame) return m_compilerState->preparingFrame->AcceptedSettings().queueSchedulingEnableLogging;
 		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetQueueSchedulingEnableLogging() : false;
 	};
 	m_getQueueSchedulingSelectionPolicy = [this]() {
+		if (m_compilerState && m_compilerState->preparingFrame) return m_compilerState->preparingFrame->AcceptedSettings().queueSchedulingSelectionPolicy;
 		return m_renderGraphSettingsService
 			? m_renderGraphSettingsService->GetQueueSchedulingSelectionPolicy()
 			: org::runtime::QueueSchedulingSelectionPolicy::FirstFit;
 	};
 	m_getQueueSchedulingWidthScale = [this]() {
+		if (m_compilerState && m_compilerState->preparingFrame) return m_compilerState->preparingFrame->AcceptedSettings().queueSchedulingWidthScale;
 		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetQueueSchedulingWidthScale() : 1.0f;
 	};
 	m_getQueueSchedulingPenaltyBias = [this]() {
+		if (m_compilerState && m_compilerState->preparingFrame) return m_compilerState->preparingFrame->AcceptedSettings().queueSchedulingPenaltyBias;
 		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetQueueSchedulingPenaltyBias() : 0.0f;
 	};
 	m_getQueueSchedulingMinPenalty = [this]() {
+		if (m_compilerState && m_compilerState->preparingFrame) return m_compilerState->preparingFrame->AcceptedSettings().queueSchedulingMinPenalty;
 		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetQueueSchedulingMinPenalty() : 1.0f;
 	};
 	m_getQueueSchedulingResourcePressureWeight = [this]() {
+		if (m_compilerState && m_compilerState->preparingFrame) return m_compilerState->preparingFrame->AcceptedSettings().queueSchedulingResourcePressureWeight;
 		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetQueueSchedulingResourcePressureWeight() : 1.0f;
 	};
 	m_getQueueSchedulingUavPressureWeight = [this]() {
+		if (m_compilerState && m_compilerState->preparingFrame) return m_compilerState->preparingFrame->AcceptedSettings().queueSchedulingUavPressureWeight;
 		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetQueueSchedulingUavPressureWeight() : 0.5f;
 	};
 	m_getQueueSchedulingAutoGraphicsBias = [this]() {
+		if (m_compilerState && m_compilerState->preparingFrame) return m_compilerState->preparingFrame->AcceptedSettings().queueSchedulingAutoGraphicsBias;
 		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetQueueSchedulingAutoGraphicsBias() : 2.5f;
 	};
 	m_getQueueSchedulingAsyncOverlapBonus = [this]() {
+		if (m_compilerState && m_compilerState->preparingFrame) return m_compilerState->preparingFrame->AcceptedSettings().queueSchedulingAsyncOverlapBonus;
 		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetQueueSchedulingAsyncOverlapBonus() : 3.0f;
 	};
 	m_getQueueSchedulingCrossQueueHandoffPenalty = [this]() {
+		if (m_compilerState && m_compilerState->preparingFrame) return m_compilerState->preparingFrame->AcceptedSettings().queueSchedulingCrossQueueHandoffPenalty;
 		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetQueueSchedulingCrossQueueHandoffPenalty() : 2.0f;
 	};
 	m_getTransitionPlacementMode = [this]() {
+		if (m_compilerState && m_compilerState->preparingFrame) return m_compilerState->preparingFrame->AcceptedSettings().transitionPlacementMode;
 		return m_renderGraphSettingsService
 			? m_renderGraphSettingsService->GetTransitionPlacementMode()
 			: org::runtime::TransitionPlacementMode::InlineEarlyPlacement;
 	};
 	m_getAutoAliasPoolRetireIdleFrames = [this]() {
+		if (m_compilerState && m_compilerState->preparingFrame) return m_compilerState->preparingFrame->AcceptedSettings().autoAliasPoolRetireIdleFrames;
 		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetAutoAliasPoolRetireIdleFrames() : 120u;
 	};
 	m_getAutoAliasPoolGrowthHeadroom = [this]() {
+		if (m_compilerState && m_compilerState->preparingFrame) return m_compilerState->preparingFrame->AcceptedSettings().autoAliasPoolGrowthHeadroom;
 		return m_renderGraphSettingsService ? m_renderGraphSettingsService->GetAutoAliasPoolGrowthHeadroom() : 1.5f;
 	};
 	MaterializeUnmaterializedResources();
@@ -7414,6 +7529,7 @@ void RenderGraph::Setup() {
 		switch (pass.type) {
 		case PassType::Render: {
 			auto& renderPass = std::get<RenderPassAndResources>(pass.pass);
+			renderPass.pass->ConfigureRuntimeServices(m_uploadService, m_descriptorService);
 			if (traceLifecycle) {
 				spdlog::info("RG setup render pass '{}' begin", renderPass.name);
 			}
@@ -7427,6 +7543,7 @@ void RenderGraph::Setup() {
 		}
 		case PassType::Compute: {
 			auto& computePass = std::get<ComputePassAndResources>(pass.pass);
+			computePass.pass->ConfigureRuntimeServices(m_uploadService, m_descriptorService);
 			if (traceLifecycle) {
 				spdlog::info("RG setup compute pass '{}' begin", computePass.name);
 			}
@@ -7440,6 +7557,7 @@ void RenderGraph::Setup() {
 		}
 		case PassType::Copy: {
 			auto& copyPass = std::get<CopyPassAndResources>(pass.pass);
+			copyPass.pass->ConfigureRuntimeServices(m_uploadService, m_descriptorService);
 			if (traceLifecycle) {
 				spdlog::info("RG setup copy pass '{}' begin", copyPass.name);
 			}
@@ -7700,6 +7818,7 @@ void RenderGraph::JoinPreparationOwner() {
     } catch (const std::exception& error) {
         basic_telemetry::AddCounter("ORG.Frame.PreparationFailures");
         spdlog::error("Async frame preparation failed: {}", error.what());
+        StopFrameProduction();
         throw;
     }
 }
@@ -7711,8 +7830,24 @@ void RenderGraph::Update(const UpdateExecutionContext& context, rhi::Device devi
     const bool asynchronous = m_renderGraphSettingsService &&
         m_renderGraphSettingsService->GetExperimentalAsyncCompileMode() ==
             runtime::AsyncCompileMode::Async;
+    auto acceptedFrame = TryAcceptFrame(context.preparationSlot, asynchronous);
+    if (!acceptedFrame) {
+        // Structural/unit hosts without a task service do not admit executable
+        // frames. Preserve their synchronous declaration-refresh path.
+        if (!m_taskService) UpdateOnPreparationOwner(context, device, false, {});
+        return;
+    }
     if (!asynchronous) {
-        UpdateOnPreparationOwner(context, device);
+        try {
+            UpdateOnPreparationOwner(context, device, false, acceptedFrame);
+        } catch (...) {
+            if (m_compilerState->preparingFrame == acceptedFrame) {
+                if (acceptedFrame->Stage() < FrameStage::Submitted)
+                    acceptedFrame->CancelAfterJoin();
+                m_compilerState->preparingFrame.reset();
+            }
+            throw;
+        }
         return;
     }
     if (!m_taskService) throw std::runtime_error("Async preparation requires a task service");
@@ -7725,23 +7860,15 @@ void RenderGraph::Update(const UpdateExecutionContext& context, rhi::Device devi
     auto accepted = context;
     accepted.hostData = accepted.ownedHostData.get();
     const auto submissionThread = std::this_thread::get_id();
-    auto* const uploadService = m_uploadService.get();
-    auto* const descriptorService = m_descriptorService.get();
     auto task = std::make_shared<std::packaged_task<void()>>(
-        [this, accepted = std::move(accepted), device, submissionThread,
-            uploadService, descriptorService]() mutable {
+        [this, accepted = std::move(accepted), acceptedFrame = std::move(acceptedFrame),
+            device, submissionThread]() mutable {
             if (std::this_thread::get_id() == submissionThread)
                 throw std::logic_error("Async frame preparation ran on the submission thread");
-            // The compatibility upload/descriptor accessors are thread-local.
-            // Preparation is the owner of these operations, so install this
-            // graph's services for the duration of its worker task.  Passes are
-            // being migrated to explicit service reservations, after which
-            // this bridge can disappear with the accessors.
-            runtime::ScopedActiveGraphServices activeServices(uploadService, descriptorService);
             BT_ZONE_SCOPE("ORG.Frame.PreparationWorker");
             basic_telemetry::AddCounter("ORG.Frame.WorkerPreparationStarted");
             const auto begin = std::chrono::steady_clock::now();
-            UpdateOnPreparationOwner(accepted, device);
+            UpdateOnPreparationOwner(accepted, device, true, acceptedFrame);
             basic_telemetry::AddCounter("ORG.Frame.WorkerPreparationFrames");
             const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - begin).count();
@@ -7752,16 +7879,47 @@ void RenderGraph::Update(const UpdateExecutionContext& context, rhi::Device devi
     if (!m_taskService->Submit(m_compilerState->preparationWorkerScope,
             runtime::TaskPriority::FrameCritical, "ORG.Frame.Preparation", [task] { (*task)(); })) {
         m_compilerState->preparationWorker = {};
+        if (m_compilerState->preparingFrame) {
+            m_compilerState->preparingFrame->CancelAfterJoin();
+            m_compilerState->preparingFrame.reset();
+        }
         throw std::runtime_error("Async preparation task rejected");
     }
 }
 
-void RenderGraph::UpdateOnPreparationOwner(const UpdateExecutionContext& context, rhi::Device device) {
+void RenderGraph::UpdateOnPreparationOwner(const UpdateExecutionContext& context, rhi::Device device,
+    bool asynchronousScheduling, const std::shared_ptr<FrameContext>& acceptedFrame) {
 	BT_ZONE_SCOPE("RenderGraph::Update");
     if (m_compilerState->frameProductionStopped)
         throw std::logic_error("Frame production has stopped");
+    if (acceptedFrame && (m_compilerState->preparingFrame != acceptedFrame
+        || acceptedFrame->Slot() != context.preparationSlot
+        || acceptedFrame->AsynchronousScheduling() != asynchronousScheduling))
+        throw std::logic_error("Preparation does not own the accepted frame slot");
+    if (!acceptedFrame && m_taskService)
+        throw std::logic_error("Executable preparation has no accepted frame slot");
     m_resolverCaptureContext = context.resolverCaptureContext;
 	m_asyncUpdateHostData = context.ownedHostData;
+	// Graph replacement tears down the previous generation's services before the
+	// next frame is admitted. Recreate the generation here before pass setup so
+	// every pass receives a live owned service pair; otherwise a rebuilt graph can
+	// enter Setup with empty weak service references.
+	if (!m_uploadService) m_uploadService = org::runtime::CreateDefaultUploadService();
+	if (!m_descriptorService) m_descriptorService = org::runtime::CreateDefaultDescriptorService();
+	if (!m_readbackService) m_readbackService = org::runtime::CreateDefaultReadbackService();
+	if (!m_statisticsService) m_statisticsService = org::runtime::CreateDefaultStatisticsService();
+	// A graph rebuild may replace the service generation after passes were
+	// registered. Refresh every pass' weak service bindings before Update/Setup
+	// callbacks run so they cannot retain an expired generation.
+	for (auto& pr : m_masterPassList) {
+		std::visit([&](auto& obj) {
+			using T = std::decay_t<decltype(obj)>;
+			if constexpr (!std::is_same_v<T, std::monostate>) {
+				if (obj.pass) obj.pass->ConfigureRuntimeServices(m_uploadService, m_descriptorService);
+			}
+		}, pr.pass);
+	}
+	org::runtime::ScopedActiveGraphServices activeServices(m_uploadService.get(), m_descriptorService.get());
 	const bool traceLifecycle = m_getRenderGraphBatchTraceEnabled && m_getRenderGraphBatchTraceEnabled();
 	{
 		BT_ZONE_SCOPE("RenderGraph::Update::ResetForFrame");
@@ -7836,14 +7994,13 @@ void RenderGraph::UpdateOnPreparationOwner(const UpdateExecutionContext& context
 	}
 
 	{
-		const bool asyncMode = m_renderGraphSettingsService
-			&& m_renderGraphSettingsService->GetExperimentalAsyncCompileMode() == runtime::AsyncCompileMode::Async;
-		if (asyncMode) {
+		if (asynchronousScheduling) {
 			BT_ZONE_SCOPE("RenderGraph::Update::PrepareAsyncFrame");
-			PrepareAsyncFrame(device, context.frameIndex, context.deltaTime, context.hostData);
+            PrepareAsyncFrame(device, static_cast<uint8_t>(context.preparationSlot),
+                context.deltaTime, context.hostData);
 		} else {
 			BT_ZONE_SCOPE("RenderGraph::Update::CompileFrame");
-			CompileFrame(device, context.frameIndex, context.hostData);
+			CompileFrame(device, static_cast<uint8_t>(context.preparationSlot), context.hostData);
 		}
 	}
 }
@@ -9369,7 +9526,7 @@ void RenderGraph::BuildExecutionSchedule() {
 
 bool RenderGraph::PrepareSelectedAsyncFrame(PassExecutionContext& context) {
     BT_ZONE_SCOPE("ORG.AsyncExecution.PopExecutableFrame");
-    auto& coordinator = m_compilerState->shadowCompiler;
+    auto& coordinator = m_compilerState->compileCoordinator;
     const uint64_t sequence = m_compilerState->nextAsyncExecutionSequence;
     if (!coordinator || !sequence || sequence > m_compilerState->lastRequestedAsyncSequence)
         return false;
@@ -9412,14 +9569,14 @@ bool RenderGraph::PrepareSelectedAsyncFrame(PassExecutionContext& context) {
     }
     if (!m_compilerState->framePlanner)
         m_compilerState->framePlanner = std::make_unique<experimental::FramePlanningState>(
-            m_renderGraphSettingsService ? m_renderGraphSettingsService->GetNumFramesInFlight() : 3);
+            m_compilerState->frameSlots ? m_compilerState->frameSlots->Capacity() : size_t{3});
     std::vector<experimental::ExecutionTimelinePoint> queues;
     for (size_t slot = 0; slot < m_queueRegistry.SlotCount(); ++slot) {
         const auto next = m_queueRegistry.GetCurrentFenceValue(static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot)));
         queues.push_back({slot + 1, next ? next - 1 : 0});
     }
-    const bool asynchronous = m_renderGraphSettingsService
-        && m_renderGraphSettingsService->GetExperimentalAsyncCompileMode() == runtime::AsyncCompileMode::Async;
+    const bool asynchronous = bundle->input->frameContext
+        && bundle->input->frameContext->AsynchronousScheduling();
     auto* planner = m_compilerState->framePlanner.get();
     try {
         m_compilerState->selectedPlanning = experimental::RunFrameWorker<experimental::FrameWorkerStage::Planning>(m_taskService,
@@ -9443,9 +9600,17 @@ bool RenderGraph::ShouldDeferAsyncAdmission() {
     if (!m_renderGraphSettingsService
         || m_renderGraphSettingsService->GetExperimentalAsyncCompileMode()
             != runtime::AsyncCompileMode::Async
-        || !m_compilerState->shadowCompiler) return false;
-    auto& coordinator = *m_compilerState->shadowCompiler;
+        || !m_compilerState->compileCoordinator) return false;
+    auto& coordinator = *m_compilerState->compileCoordinator;
     coordinator.Pump();
+    m_compilerState->RetireCompletedFrames(m_queueRegistry);
+    const auto capacity = m_compilerState->frameSlots
+        ? m_compilerState->frameSlots->Capacity() : size_t{1};
+    if (m_compilerState->frameSlots
+        && m_compilerState->frameSlots->Active() >= capacity) {
+        basic_telemetry::AddCounter("ORG.AsyncExecution.AdmissionBackpressure");
+        return true;
+    }
     const auto next = m_compilerState->nextAsyncExecutionSequence;
     if (!next || next > m_compilerState->lastRequestedAsyncSequence) return false;
     const auto depth = m_compilerState->lastRequestedAsyncSequence - next + 1;
@@ -9459,8 +9624,11 @@ std::optional<uint32_t> RenderGraph::GetLastExecutedPreparationSlot() const noex
     return m_compilerState ? m_compilerState->lastExecutedPreparationSlot : std::nullopt;
 }
 
-bool RenderGraph::TryExecuteSelectedAsyncFrame(PassExecutionContext& context) {
+bool RenderGraph::TryExecuteSelectedAsyncFrame(PassExecutionContext& context, bool queueOnly) {
     BT_ZONE_SCOPE("ORG.AsyncExecution.ExecuteSelectedFrame");
+    if (!m_compilerState->selectedAsyncFrame
+        && !m_compilerState->recordingFrames.empty())
+        return queueOnly ? false : TrySubmitRecordedFrame(context);
     auto frame = std::move(m_compilerState->selectedAsyncFrame);
     m_compilerState->selectedAsyncFrame.reset();
     if (!frame || !frame->layout || !frame->layout->bundle || !frame->barrierPlan) return false;
@@ -9510,8 +9678,8 @@ bool RenderGraph::TryExecuteSelectedAsyncFrame(PassExecutionContext& context) {
         static_cast<int64_t>(std::accumulate(incoming.begin(), incoming.end(), size_t{0},
             [](size_t count, const auto& waits) { return count + waits.size(); })));
     if (!m_compilerState->asyncTimelineAdmission) {
-        const auto executionSlots = m_renderGraphSettingsService
-            ? m_renderGraphSettingsService->GetNumFramesInFlight() : uint8_t{3};
+        const auto executionSlots = m_compilerState->frameSlots
+            ? m_compilerState->frameSlots->Capacity() : size_t{3};
         m_compilerState->asyncTimelineAdmission =
             std::make_unique<experimental::ExecutionTimelineAdmission>(queuePoints,
                 (std::max)(size_t{1}, static_cast<size_t>(executionSlots)));
@@ -9575,7 +9743,7 @@ bool RenderGraph::TryExecuteSelectedAsyncFrame(PassExecutionContext& context) {
         if (m_statisticsService) {
             auto statistics = std::make_shared<experimental::OwnedRecordingStatistics>();
             statistics->service = m_statisticsService;
-            statistics->frameIndex = context.frameIndex;
+            statistics->frameIndex = frame->preparationSlot;
             statistics->queueKind = rhiKind;
             statistics->gpuQueries = queueKind != QueueKind::Copy
                 && m_queueRegistry.GetBackendInstance(index) == BackendInstanceId::Primary;
@@ -9623,65 +9791,138 @@ bool RenderGraph::TryExecuteSelectedAsyncFrame(PassExecutionContext& context) {
         }
     }
     auto planning = std::move(m_compilerState->selectedPlanning);
-    const bool asynchronous = m_renderGraphSettingsService
-        && m_renderGraphSettingsService->GetExperimentalAsyncCompileMode() == runtime::AsyncCompileMode::Async;
+    const bool asynchronous = frame->layout->bundle->input->frameContext
+        && frame->layout->bundle->input->frameContext->AsynchronousScheduling();
     if (asynchronous && !allPacketsWorkerSafe)
         throw std::runtime_error("Async frame recording requires worker-safe pass data");
-    std::optional<experimental::RecordedFrame> recorded;
+    CompilerState::RecordingFrameOwner recordingOwner;
+    recordingOwner.sequence = frame->layout->bundle->sequence;
+    recordingOwner.snapshot = frame;
+    recordingOwner.planning = planning;
+    recordingOwner.statistics = std::move(recordingStatistics);
     try {
-        recorded.emplace(experimental::RunFrameWorker(m_taskService, m_compilerState->frameWorkerScope, asynchronous,
-            [plan = experimental::PlannedFrame{frame, std::move(recordingJobs), std::move(timelineBindings),
-                std::move(incoming), planning}, tasks = m_taskService, recordingConcurrency]() mutable {
-                return experimental::RecordFrame(std::move(plan), tasks, recordingConcurrency);
-            }));
+        experimental::PlannedFrame recordingPlanOwner{frame, std::move(recordingJobs),
+            std::move(timelineBindings), std::move(incoming), planning};
+        if (asynchronous) {
+            recordingOwner.workerRecording = experimental::DispatchFrameRecording(
+                std::move(recordingPlanOwner), m_taskService,
+                m_compilerState->frameWorkerScope, recordingConcurrency);
+        } else {
+            recordingOwner.inlineResult.emplace(experimental::RecordFrame(
+                std::move(recordingPlanOwner), m_taskService, recordingConcurrency));
+        }
+        const auto recordingCapacity = m_compilerState->frameSlots
+            ? m_compilerState->frameSlots->Capacity() : size_t{3};
+        if (m_compilerState->recordingFrames.size() >= recordingCapacity)
+            throw std::logic_error("Recording queue exceeded frame-slot capacity");
+        m_compilerState->recordingFrames.push_back(std::move(recordingOwner));
+        BT_PLOT("ORG.AsyncExecution.RecordingQueueDepth",
+            static_cast<int64_t>(m_compilerState->recordingFrames.size()));
     } catch (...) {
         if (m_compilerState->frameWorkerScope) m_compilerState->frameWorkerScope->Wait();
         m_compilerState->framePlanner->CancelUnsubmittedSuffixAfterJoin();
         throw;
     }
-    try {
-        auto execution = std::move(*recorded).Submit(*m_compilerState->asyncTimelineAdmission);
-        m_compilerState->framePlanner->Confirm(planning, *execution);
-        for (const auto& statistics : recordingStatistics) statistics->Publish();
-        for (const auto& signal : execution->batches) {
-            const auto slot = graph.batches[&signal - execution->batches.data()].queue;
-            m_queueRegistry.EnsureNextFenceValueAtLeast(
-                static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot)), signal.signal.value + 1);
+    if (queueOnly) return true;
+    if (asynchronous) {
+        const auto recordingCapacity = m_compilerState->frameSlots
+            ? m_compilerState->frameSlots->Capacity() : size_t{3};
+        while (m_compilerState->recordingFrames.size() < recordingCapacity
+            && m_compilerState->nextAsyncExecutionSequence <= m_compilerState->lastRequestedAsyncSequence
+            && m_compilerState->compileCoordinator->PeekReady(
+                m_compilerState->nextAsyncExecutionSequence)) {
+            if (!PrepareSelectedAsyncFrame(context)) break;
+            if (!TryExecuteSelectedAsyncFrame(context, true)) break;
         }
-        // Preserve the legacy present contract from the symbolic declaration,
-        // not from a mutable pass object. The selected graph's batch signal is
-        // the precise dependency the swapchain must wait on.
+    }
+    return TrySubmitRecordedFrame(context);
+}
+
+void RenderGraph::ConfirmPresentationTailSubmission() {
+    if (!m_compilerState->pendingPresentationFrame
+        || !m_compilerState->asyncTimelineAdmission)
+        return;
+    const auto slot = m_queueRegistry.FindGraphicsSlot();
+    auto queue = m_queueRegistry.GetQueue(slot);
+    auto& fence = m_queueRegistry.GetFence(slot);
+    const auto value = m_queueRegistry.GetNextFenceValue(slot);
+    if (queue.Signal({fence.GetHandle(), value}) != rhi::Result::Ok)
+        throw std::runtime_error("Presentation tail completion signal failed");
+    m_compilerState->asyncTimelineAdmission->ExtendSubmittedFrame(
+        m_compilerState->pendingPresentationFrame,
+        {static_cast<uint64_t>(ToUnderlying(slot)) + 1u, value});
+    m_compilerState->pendingPresentationFrame.reset();
+    basic_telemetry::AddCounter("ORG.PresentationTail.RetirementReceipts");
+}
+
+bool RenderGraph::TrySubmitRecordedFrame(PassExecutionContext&) {
+    BT_ZONE_SCOPE("ORG.AsyncExecution.SubmitRecordingHead");
+    if (m_compilerState->recordingFrames.empty()) return false;
+    if (!m_compilerState->recordingFrames.front().Ready()) {
+        basic_telemetry::AddCounter("ORG.AsyncExecution.RecordingHeadNotReady");
+        return false;
+    }
+    auto pending = std::move(m_compilerState->recordingFrames.front());
+    m_compilerState->recordingFrames.pop_front();
+    auto frame = pending.snapshot;
+    if (!frame || !frame->layout || !frame->layout->bundle
+        || !frame->layout->bundle->graph)
+        throw std::logic_error("Recording queue head has no compiled frame");
+    const auto& graph = *frame->layout->bundle->graph;
+    experimental::RecordedFrame recorded = [&]() {
+        try {
+            return pending.Join();
+        } catch (...) {
+            if (m_compilerState->frameWorkerScope) m_compilerState->frameWorkerScope->Wait();
+            m_compilerState->framePlanner->CancelUnsubmittedSuffixAfterJoin();
+            throw;
+        }
+    }();
+    try {
+        auto execution = std::move(recorded).Submit(*m_compilerState->asyncTimelineAdmission);
+        m_compilerState->framePlanner->Confirm(pending.planning, *execution);
+        for (const auto& statistics : pending.statistics) statistics->Publish();
+        for (size_t batchIndex = 0; batchIndex < execution->batches.size(); ++batchIndex) {
+            const auto slot = graph.batches[batchIndex].queue;
+            m_queueRegistry.EnsureNextFenceValueAtLeast(
+                static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot)),
+                execution->batches[batchIndex].signal.value + 1);
+        }
         for (size_t batchIndex = 0; batchIndex < graph.batches.size(); ++batchIndex) {
             for (const auto passIndex : graph.batches[batchIndex].passes) {
-            if (passIndex >= graph.structure->passes.size()) continue;
-            const auto& pass = graph.structure->passes[passIndex];
-            const auto declaresPresent = std::ranges::any_of(pass.entryStates, [](const auto& state) {
-                return state.state.access == static_cast<uint64_t>(rhi::ResourceAccessType::Present);
-            }) || std::ranges::any_of(pass.exitStates, [](const auto& state) {
-                return state.state.access == static_cast<uint64_t>(rhi::ResourceAccessType::Present);
-            });
-            if (!declaresPresent) continue;
-            const auto slot = graph.batches[batchIndex].queue;
-            const auto queueSlot = static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot));
-            m_lastPresentDependency = PresentDependency{
-                .queue = m_queueRegistry.GetQueue(queueSlot),
-                .wait = {m_queueRegistry.GetFence(queueSlot).GetHandle(), execution->batches[batchIndex].signal.value},
-                .queueSlot = queueSlot,
-                .batchIndex = batchIndex,
-                .valid = execution->batches[batchIndex].signal.value != 0,
-            };
+                if (passIndex >= graph.structure->passes.size()) continue;
+                const auto preparedIndex = graph.structure->passes[passIndex].preparedPassIndex;
+                if (preparedIndex >= frame->passes.size()
+                    || frame->passes[preparedIndex].DebugName() != "PresentationReadyPass") continue;
+                const auto slot = graph.batches[batchIndex].queue;
+                const auto queueSlot = static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot));
+                m_lastPresentDependency = PresentDependency{
+                    .queue = m_queueRegistry.GetQueue(queueSlot),
+                    .wait = {m_queueRegistry.GetFence(queueSlot).GetHandle(),
+                        execution->batches[batchIndex].signal.value},
+                    .queueSlot = queueSlot,
+                    .batchIndex = batchIndex,
+                    .valid = execution->batches[batchIndex].signal.value != 0,
+                };
             }
         }
         basic_telemetry::AddCounter("ORG.AsyncExecution.SubmittedSceneFrames");
+        m_compilerState->pendingPresentationFrame =
+            frame->layout->bundle->input->frameContext;
         m_compilerState->lastExecutedPreparationSlot = frame->preparationSlot;
-        BT_PLOT("ORG.AsyncExecution.SubmittedSequence", static_cast<int64_t>(frame->layout->bundle->sequence));
+        BT_PLOT("ORG.AsyncExecution.SubmittedSequence",
+            static_cast<int64_t>(frame->layout->bundle->sequence));
+        BT_PLOT("ORG.AsyncExecution.ReadyQueueDepth",
+            static_cast<int64_t>(m_compilerState->recordingFrames.size()));
         return true;
     } catch (...) {
         const auto& failure = m_compilerState->asyncTimelineAdmission->Failure();
         auto partial = m_compilerState->asyncTimelineAdmission->PendingExecution();
         if (failure && partial) {
-            m_compilerState->framePlanner->ConfirmFailure(planning, *partial, failure->batch);
-            basic_telemetry::AddCounter("ORG.AsyncExecution.PartialSubmittedBatches", failure->batch);
+            m_compilerState->framePlanner->ConfirmFailure(
+                pending.planning, *partial, failure->batch);
+            basic_telemetry::AddCounter(
+                "ORG.AsyncExecution.PartialSubmittedBatches", failure->batch);
         }
         basic_telemetry::AddCounter("ORG.AsyncExecution.SceneSubmissionFailures");
         throw;
@@ -9692,21 +9933,34 @@ void RenderGraph::Execute(PassExecutionContext& context) {
     JoinPreparationOwner();
     if (m_compilerState->frameProductionStopped)
         throw std::logic_error("Frame production has stopped");
-    const auto compileMode = m_renderGraphSettingsService
-        ? m_renderGraphSettingsService->GetExperimentalAsyncCompileMode()
-        : runtime::AsyncCompileMode::Off;
-    const bool ownedExecutionRequested = compileMode != runtime::AsyncCompileMode::Shadow
-        && m_compilerState->shadowCompiler
+    // Once an owned request exists, its scheduling mode belongs to the accepted
+    // frame. Reading the mutable settings service here could relabel (and in
+    // future accidentally steer) already accepted work after a generation
+    // boundary change.
+    const auto compileMode = (m_compilerState->currentAsyncInput
+        && m_compilerState->currentAsyncInput->frameContext
+        && m_compilerState->currentAsyncInput->frameContext->AsynchronousScheduling())
+        ? runtime::AsyncCompileMode::Async : runtime::AsyncCompileMode::Off;
+    const bool ownedExecutionRequested = m_compilerState->compileCoordinator
         && m_compilerState->lastRequestedAsyncSequence != 0;
     if (ownedExecutionRequested) {
-		// Consume the exact next owned frame. Preparation and compilation both
-		// belong to that request; current mutable pass state is never consulted.
-		if (!m_compilerState->selectedAsyncFrame) PrepareSelectedAsyncFrame(context);
-        if (m_compilerState->selectedAsyncFrame && TryExecuteSelectedAsyncFrame(context)) return;
-		basic_telemetry::AddCounter(compileMode == runtime::AsyncCompileMode::Off
-			? "ORG.OwnedExecution.InlineFrameUnavailable"
-			: "ORG.AsyncExecution.NoQueuedFrame");
-        return;
+        try {
+			// Consume the exact next owned frame. Preparation and compilation both
+			// belong to that request; current mutable pass state is never consulted.
+			if (!m_compilerState->selectedAsyncFrame) PrepareSelectedAsyncFrame(context);
+            if (m_compilerState->selectedAsyncFrame && TryExecuteSelectedAsyncFrame(context)) return;
+			if (!m_compilerState->recordingFrames.empty() && TrySubmitRecordedFrame(context)) return;
+			basic_telemetry::AddCounter(compileMode == runtime::AsyncCompileMode::Off
+				? "ORG.OwnedExecution.InlineFrameUnavailable"
+				: "ORG.AsyncExecution.NoQueuedFrame");
+            return;
+        } catch (...) {
+            // The failing stage has joined its own work before propagation.
+            // Close admission and join/cancel every remaining unsubmitted user;
+            // submitted or uncertain GPU ownership stays in the admission ledger.
+            StopFrameProduction();
+            throw;
+        }
     }
     // First owned scene-recording subset. The legacy compiler/state ledger still
     // controls this execution; this is not latest-compiled-graph selection.
@@ -10859,12 +11113,11 @@ void RenderGraph::Execute(PassExecutionContext& context) {
 
 	auto passDeclaresPresent = [](const PassBatch::QueuedPass& queuedPass) -> bool {
 		return std::visit([](auto* passAndResources) -> bool {
+			if (!passAndResources) return false;
 			using PassPtr = std::decay_t<decltype(passAndResources)>;
-			if constexpr (std::is_same_v<PassPtr, RenderPassAndResources*>) {
-				return passAndResources && !passAndResources->resources.presentResources.empty();
-			} else {
-				return false;
-			}
+			if constexpr (std::is_same_v<PassPtr, RenderPassAndResources*>)
+				if (!passAndResources->resources.presentResources.empty()) return true;
+			return passAndResources->name == "PresentationReadyPass";
 		}, queuedPass);
 	};
 

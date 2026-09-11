@@ -20,7 +20,7 @@
 #include "Managers/Singletons/DescriptorHeapManager.h"
 #include "Resources/GPUBacking/GpuBufferBacking.h"
 #include "Resources/ExternalBackingResource.h"
-#include "Render/Runtime/UploadServiceAccess.h"
+#include "Render/Runtime/IUploadService.h"
 #include "Render/Runtime/UploadPolicyServiceAccess.h"
 
 
@@ -757,9 +757,24 @@ void BufferBase::QueueResourceCopyFromOldBacking(uint64_t bytesToCopy) {
     }
 
     auto oldBackingResource = ExternalBackingResource::CreateShared(std::move(m_dataBuffer));
-    if (auto* uploadService = org::runtime::GetActiveUploadService()) {
-        uploadService->QueueResourceCopy(shared_from_this(), oldBackingResource, bytesToCopy);
-    }
+    auto uploadService = RetainBufferUploadService();
+    uploadService->QueueResourceCopy(shared_from_this(), oldBackingResource, bytesToCopy);
+}
+
+std::shared_ptr<org::runtime::IUploadService> BufferBase::RetainBufferUploadService() const {
+    auto service = RetainUploadService();
+    if (!service) throw std::runtime_error("Buffer upload service generation is unavailable");
+    return service;
+}
+
+void BufferBase::UploadBufferData(const void* data, size_t size, org::runtime::UploadTarget target,
+    size_t offset, const char* file, int line) const {
+#if BUILD_TYPE == BUILD_TYPE_DEBUG
+    RetainBufferUploadService()->UploadData(data, size, std::move(target), offset, file, line);
+#else
+    (void)file; (void)line;
+    RetainBufferUploadService()->UploadData(data, size, std::move(target), offset);
+#endif
 }
 
 void BufferBase::ApplyMetadataToBacking(const EntityComponentBundle& bundle) {

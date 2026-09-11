@@ -38,13 +38,13 @@ owned input after alias edges and active queue capabilities are prepared. The
 worker independently reconstructs resource and explicit dependencies and adds
 the captured alias-placement constraints. Dependency edges are compared against
 the pre-alias oracle, not copied into the worker's resource dependency input.
-The shadow
-result has no authority over the live graph. Configuration is default-off. One
-`experimentalAsyncCompileMode` setting selects `Off`, `Shadow`, or `Async` and
-`experimentalCompileConcurrency` remains bounded 1-4. The startup override is
-`SARP_ASYNC_COMPILE_MODE=Off|Shadow|Async`. Until scene execution migration is
-complete, `Async` runs the same compiler/shadow capture and reports the exact
-`SceneExecutionNotMigrated` synchronous fallback.
+The resulting owned bundle is authoritative for its accepted logical frame.
+Configuration remains default-off. `experimentalAsyncCompileMode` selects
+`Off` or `Async`, and `experimentalCompileConcurrency` remains bounded 1-4.
+The startup override is `SARP_ASYNC_COMPILE_MODE=Off|Async`. The former Shadow
+value (`1`) maps to Off; Async retains numeric value `2` for configuration
+compatibility. Off and Async consume the same preparation, compilation,
+planning, recording, submission, presentation-tail, and retirement functions.
 
 The first pure queue scheduler uses isolated single-pass batches and orders all
 uses of each resource, including read/read. It chooses only active compatible

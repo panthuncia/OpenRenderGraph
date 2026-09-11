@@ -260,11 +260,12 @@ struct GraphExecutionTimeline {
     // Kept separately from opaque leases so lifecycle completion can be
     // delivered when all queue signals for this execution are observed.
     std::vector<std::shared_ptr<const IPreparedExecutionBatch>> preparedBatches;
+    std::vector<ExecutionTimelinePoint> tailCompletions;
 };
 // Prepared packets contain no live pass callbacks. Implementations own closed
 // command lists, allocators, backing/descriptor versions and timeline leases.
 enum class SubmissionState { NotSubmitted, SubmissionUncertain, SubmittedWithoutSignal, Signaled };
-enum class SubmissionFailureStage { None, Validation, Wait, Submit, Signal, Replay };
+enum class SubmissionFailureStage { None, Validation, Wait, Submit, Lifecycle, Signal, Replay };
 struct SubmissionReceipt {
     SubmissionState state = SubmissionState::NotSubmitted;
     SubmissionFailureStage failureStage = SubmissionFailureStage::None;
@@ -304,6 +305,8 @@ public:
     // A partial failure preserves committed values and permanently closes this
     // admission owner until device/error recovery constructs a fresh owner.
     void Fail(uint64_t submission, SubmissionReceipt receipt = {});
+    void ExtendSubmittedFrame(const std::shared_ptr<FrameContext>& frame,
+        ExecutionTimelinePoint completion);
     // Called by the ordered owner with observed GPU completion values, in the
     // same queue order as construction. Releases only fully completed bundles.
     size_t RetireCompleted(std::span<const ExecutionTimelinePoint> completed);
@@ -314,8 +317,8 @@ public:
     std::shared_ptr<const GraphExecutionTimeline> PendingExecution() const { return m_pending; }
 private:
     std::vector<ExecutionTimelinePoint> m_reserved, m_submitted;
-    std::shared_ptr<const GraphExecutionTimeline> m_pending;
-    std::vector<std::shared_ptr<const GraphExecutionTimeline>> m_retained;
+    std::shared_ptr<GraphExecutionTimeline> m_pending;
+    std::vector<std::shared_ptr<GraphExecutionTimeline>> m_retained;
     std::vector<ExecutionTimelinePoint> m_completed;
     size_t m_maximumInFlight;
     uint64_t m_sequence = 0;

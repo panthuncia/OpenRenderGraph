@@ -136,10 +136,6 @@ unsigned StatisticsManager::RegisterPass(const std::string& passName, bool isGeo
 void StatisticsManager::BeginFrame() {
     ++m_frameSerial;
 
-    if (m_getCollectPassStatistics) {
-        m_collectPassStatistics = m_getCollectPassStatistics();
-    }
-
     org::runtime::MemoryBudgetStats memoryBudgetStats{};
     memoryBudgetStats.sampleFrameSerial = m_frameSerial;
     if (auto* allocator = DeviceManager::GetInstance().GetAllocator()) {
@@ -264,13 +260,6 @@ void StatisticsManager::EnsureQueueBuffers(rhi::QueueKind queueKind) {
 
 void StatisticsManager::SetupQueryHeap() {
     auto device = DeviceManager::GetInstance().GetDevice();
-    if (m_getCollectPassStatistics) {
-        m_collectPassStatistics = m_getCollectPassStatistics();
-    }
-    if (m_getCollectPipelineStatistics) {
-        m_collectPipelineStatistics = m_getCollectPipelineStatistics();
-    }
-
     if (!m_collectPassStatistics) {
         return;
     }
@@ -625,13 +614,6 @@ void StatisticsManager::OnFrameComplete(
 {
 	if (!m_timestampPool || m_timestampQueryInfo.elementSize == 0) return;
 
-    if (m_getCollectPassStatistics) {
-        m_collectPassStatistics = m_getCollectPassStatistics();
-    }
-
-    if (m_getCollectPipelineStatistics) {
-        m_collectPipelineStatistics = m_getCollectPipelineStatistics();
-    }
 	if (!m_collectPassStatistics) return;
 	auto queueKind = queue.GetKind();
 	auto tsIt = m_timestampBuffers.find(queueKind);

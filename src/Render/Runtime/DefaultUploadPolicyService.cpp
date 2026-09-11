@@ -1,4 +1,5 @@
 #include "Render/Runtime/IUploadPolicyService.h"
+#include "Render/Runtime/IUploadService.h"
 
 #include <mutex>
 #include <unordered_set>
@@ -12,7 +13,18 @@ namespace {
 
 class DefaultUploadPolicyService final : public IUploadPolicyService {
 public:
+    explicit DefaultUploadPolicyService(std::shared_ptr<IUploadService> uploadService)
+        : m_uploadService(std::move(uploadService)) {}
+
     void Initialize() override {}
+
+    void SetUploadService(std::shared_ptr<IUploadService> uploadService) override {
+        std::scoped_lock lock(m_mutex);
+        m_uploadService = std::move(uploadService);
+        for (auto* client : m_clients) {
+            if (client) client->ConfigureUploadService(m_uploadService);
+        }
+    }
 
     void Cleanup() override {
         std::scoped_lock lock(m_mutex);
@@ -27,6 +39,7 @@ public:
         }
 
         std::scoped_lock lock(m_mutex);
+        client->ConfigureUploadService(m_uploadService);
         m_clients.insert(client);
         if (client->HasPendingUploadPolicyWork()) {
             m_dirtyClients.insert(client);
@@ -131,12 +144,13 @@ private:
     std::unordered_set<IUploadPolicyClient*> m_clients;
     std::unordered_set<IUploadPolicyClient*> m_dirtyClients;
     UploadPolicyServiceStats m_stats{};
+    std::shared_ptr<IUploadService> m_uploadService;
 };
 
 }
 
-std::shared_ptr<IUploadPolicyService> CreateDefaultUploadPolicyService() {
-    return std::make_shared<DefaultUploadPolicyService>();
+std::shared_ptr<IUploadPolicyService> CreateDefaultUploadPolicyService(std::shared_ptr<IUploadService> uploadService) {
+    return std::make_shared<DefaultUploadPolicyService>(std::move(uploadService));
 }
 
 }
