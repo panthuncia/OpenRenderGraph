@@ -921,6 +921,14 @@ public:
         if (!views) throw std::out_of_range("Declared resource publishes no bindless views");
         return views->Resolve(request).index;
     }
+    ResourceBindingToken MakeBindingToken(const ResourceIdentifier& identifier) const {
+        const auto handle = graph->RequestResourceHandle(identifier);
+        const auto resource = graph->RequestResourcePtr(identifier);
+        return {
+            resource ? resource->GetSchedulingResourceID() : handle.GetGlobalResourceID(),
+            handle.GetGlobalResourceID()
+        };
+    }
     // Typed declaration entry points return a stable token for Prepare. This
     // keeps the familiar fluent With* API intact while avoiding registry
     // lookups and global-ID plumbing in typed passes.
@@ -935,8 +943,7 @@ public:
 
     ResourceBindingToken BindShaderResource(const ResourceIdentifierAndRange& resource) {
         addShaderResource(resource);
-        const auto handle = graph->RequestResourceHandle(resource.identifier);
-        return {handle.GetGlobalResourceID(), handle.GetGlobalResourceID()};
+        return MakeBindingToken(resource.identifier);
     }
 
     ResourceBindingToken BindShaderResource(const ResourcePtrAndRange& resource) {
@@ -948,38 +955,32 @@ public:
 
     ResourceBindingToken BindShaderResource(const ResourceIdentifier& identifier) {
         addShaderResource(identifier);
-        const auto handle = graph->RequestResourceHandle(identifier);
-        return {handle.GetGlobalResourceID(), handle.GetGlobalResourceID()};
+        return MakeBindingToken(identifier);
     }
 
     ResourceBindingToken BindUnorderedAccessClear(const ResourceIdentifier& identifier) {
         addUnorderedAccessClear(identifier);
-        const auto handle = graph->RequestResourceHandle(identifier);
-        return {handle.GetGlobalResourceID(), handle.GetGlobalResourceID()};
+        return MakeBindingToken(identifier);
     }
 
     ResourceBindingToken BindUnorderedAccess(const ResourceIdentifier& identifier) {
         addUnorderedAccess(identifier);
-        const auto handle = graph->RequestResourceHandle(identifier);
-        return {handle.GetGlobalResourceID(), handle.GetGlobalResourceID()};
+        return MakeBindingToken(identifier);
     }
 
     ResourceBindingToken BindDepthStencilClear(const ResourceIdentifier& identifier) {
         addDepthStencilClear(identifier);
-        const auto handle = graph->RequestResourceHandle(identifier);
-        return {handle.GetGlobalResourceID(), handle.GetGlobalResourceID()};
+        return MakeBindingToken(identifier);
     }
 
     ResourceBindingToken BindDepthReadWrite(const ResourceIdentifier& identifier) {
         addDepthReadWrite(identifier);
-        const auto handle = graph->RequestResourceHandle(identifier);
-        return {handle.GetGlobalResourceID(), handle.GetGlobalResourceID()};
+        return MakeBindingToken(identifier);
     }
 
     ResourceBindingToken BindConstantBuffer(const ResourceIdentifier& identifier) {
         addConstantBuffer(identifier);
-        const auto handle = graph->RequestResourceHandle(identifier);
-        return {handle.GetGlobalResourceID(), handle.GetGlobalResourceID()};
+        return MakeBindingToken(identifier);
     }
 
     template<class ResourceT>
@@ -1054,14 +1055,12 @@ public:
 
     ResourceBindingToken BindRenderTarget(const ResourceIdentifier& identifier) {
         addRenderTarget(identifier);
-        const auto handle = graph->RequestResourceHandle(identifier);
-        return {handle.GetGlobalResourceID(), handle.GetGlobalResourceID()};
+        return MakeBindingToken(identifier);
     }
 
     ResourceBindingToken BindRenderTarget(const ResourceIdentifierAndRange& resource) {
         addRenderTarget(resource);
-        const auto handle = graph->RequestResourceHandle(resource.identifier);
-        return {handle.GetGlobalResourceID(), handle.GetGlobalResourceID()};
+        return MakeBindingToken(resource.identifier);
     }
 
     template<class ResourceT>
@@ -1078,6 +1077,16 @@ public:
         if (!resource) throw std::invalid_argument("Cannot bind an empty copy-destination resource");
         addCopyDest(resource);
         return { resource->GetSchedulingResourceID(), graph->RequestResourceHandle(resource.get()).GetGlobalResourceID() };
+    }
+
+    ResourceBindingToken BindCopySource(const ResourceIdentifier& identifier) {
+        addCopySource(identifier);
+        return MakeBindingToken(identifier);
+    }
+
+    ResourceBindingToken BindCopyDestination(const ResourceIdentifier& identifier) {
+        addCopyDest(identifier);
+        return MakeBindingToken(identifier);
     }
 
     // Variadic entry points

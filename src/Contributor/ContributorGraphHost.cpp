@@ -6,8 +6,7 @@
 #include <Render/Runtime/RuntimeDevice.h>
 #include <Render/Runtime/OpenRenderGraphSettings.h>
 #include <Render/Runtime/IUploadService.h>
-#include <Render/Runtime/UploadServiceAccess.h>
-#include <Render/Runtime/DescriptorServiceAccess.h>
+#include <Render/Runtime/ScopedActiveGraphServices.h>
 #include <Render/MemoryIntrospectionBackend.h>
 #include <RenderPasses/Base/ComputePass.h>
 #include <RenderPasses/Base/RenderPass.h>
@@ -25,27 +24,6 @@ namespace org::contributor {
 
 namespace
 {
-	class ActiveGraphServices final
-	{
-	public:
-		ActiveGraphServices(org::runtime::IUploadService* uploads,
-			org::runtime::IDescriptorService* descriptors) noexcept
-			: previousUploads_(org::runtime::GetActiveUploadService()),
-			  previousDescriptors_(org::runtime::GetActiveDescriptorService())
-		{
-			org::runtime::SetActiveUploadService(uploads);
-			org::runtime::SetActiveDescriptorService(descriptors);
-		}
-		~ActiveGraphServices()
-		{
-			org::runtime::SetActiveDescriptorService(previousDescriptors_);
-			org::runtime::SetActiveUploadService(previousUploads_);
-		}
-	private:
-		org::runtime::IUploadService* previousUploads_{};
-		org::runtime::IDescriptorService* previousDescriptors_{};
-	};
-
 	uint16_t FormatChannels(ORGFormat format) noexcept
 	{
 		switch (format) {
@@ -787,7 +765,7 @@ public:
 		extension->SetGenericResources(candidate.resources);
 		extension->SetDescriptorContext(device, *generation->graph->GetDescriptorService());
 		generation->graph->RegisterExtension(std::move(extension), "org.contributor.frontend");
-		ActiveGraphServices services(generation->graph->GetUploadService(),
+		org::runtime::ScopedActiveGraphServices services(generation->graph->GetUploadService(),
 			generation->graph->GetDescriptorService());
 		// Native extensions register their symbolic providers here. ORG keeps this
 		// step explicit so applications can finish installing every extension
@@ -840,7 +818,7 @@ void ContributorGraphHost::Execute(
 	state.host = &impl->active->host;
 	impl->active->Activate(frame.generation);
 	impl->active->frontendExtension->SetFrame(std::move(state));
-	ActiveGraphServices services(impl->active->graph->GetUploadService(),
+	org::runtime::ScopedActiveGraphServices services(impl->active->graph->GetUploadService(),
 		impl->active->graph->GetDescriptorService());
 	org::UpdateExecutionContext update{};
 	update.frameIndex = frameIndex;

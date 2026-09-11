@@ -19,6 +19,9 @@
 #include <numeric>
 #include <optional>
 #include <sstream>
+#include <future>
+#include <thread>
+#include "Render/Runtime/ScopedActiveGraphServices.h"
 #include <BasicTelemetry/Tracy.h>
 #include <rhi_helpers.h>
 #include <rhi_debug.h>
@@ -3693,6 +3696,15 @@ RenderGraph::~RenderGraph() {
 void RenderGraph::StopFrameProduction() {
     BT_ZONE_SCOPE("ORG.Frame.StopProduction");
     m_compilerState->frameProductionStopped = true;
+    if (m_compilerState->preparationWorkerScope)
+        m_compilerState->preparationWorkerScope->CancelAndWait();
+    m_compilerState->preparationWorkerScope.reset();
+    if (m_compilerState->preparationWorker.valid()) {
+        try { m_compilerState->preparationWorker.get(); }
+        catch (const std::exception& error) {
+            spdlog::warn("Async preparation stopped before completion: {}", error.what());
+        }
+    }
     // Coordinator destruction may drop the last input/bundle reference. Keep
     // each accepted frame alive until CPU join and its terminal transition.
     std::vector<std::shared_ptr<FrameContext>> frames;
@@ -7680,7 +7692,71 @@ std::shared_ptr<ComputePass> RenderGraph::GetComputePassByName(const std::string
 	}
 }
 
+void RenderGraph::JoinPreparationOwner() {
+    if (!m_compilerState->preparationWorker.valid()) return;
+    BT_ZONE_SCOPE("ORG.Frame.WaitForPreparation");
+    try {
+        m_compilerState->preparationWorker.get();
+    } catch (const std::exception& error) {
+        basic_telemetry::AddCounter("ORG.Frame.PreparationFailures");
+        spdlog::error("Async frame preparation failed: {}", error.what());
+        throw;
+    }
+}
+
+void RenderGraph::WaitForPreparation() { JoinPreparationOwner(); }
+
 void RenderGraph::Update(const UpdateExecutionContext& context, rhi::Device device) {
+    JoinPreparationOwner();
+    const bool asynchronous = m_renderGraphSettingsService &&
+        m_renderGraphSettingsService->GetExperimentalAsyncCompileMode() ==
+            runtime::AsyncCompileMode::Async;
+    if (!asynchronous) {
+        UpdateOnPreparationOwner(context, device);
+        return;
+    }
+    if (!m_taskService) throw std::runtime_error("Async preparation requires a task service");
+    if (!context.ownedHostData)
+        throw std::runtime_error("Async preparation requires owned host frame data");
+    if (!m_compilerState->preparationWorkerScope)
+        m_compilerState->preparationWorkerScope = m_taskService->CreateScope("ORG.Frame.Preparation");
+    if (!m_compilerState->preparationWorkerScope)
+        throw std::runtime_error("Async preparation scope rejected");
+    auto accepted = context;
+    accepted.hostData = accepted.ownedHostData.get();
+    const auto submissionThread = std::this_thread::get_id();
+    auto* const uploadService = m_uploadService.get();
+    auto* const descriptorService = m_descriptorService.get();
+    auto task = std::make_shared<std::packaged_task<void()>>(
+        [this, accepted = std::move(accepted), device, submissionThread,
+            uploadService, descriptorService]() mutable {
+            if (std::this_thread::get_id() == submissionThread)
+                throw std::logic_error("Async frame preparation ran on the submission thread");
+            // The compatibility upload/descriptor accessors are thread-local.
+            // Preparation is the owner of these operations, so install this
+            // graph's services for the duration of its worker task.  Passes are
+            // being migrated to explicit service reservations, after which
+            // this bridge can disappear with the accessors.
+            runtime::ScopedActiveGraphServices activeServices(uploadService, descriptorService);
+            BT_ZONE_SCOPE("ORG.Frame.PreparationWorker");
+            basic_telemetry::AddCounter("ORG.Frame.WorkerPreparationStarted");
+            const auto begin = std::chrono::steady_clock::now();
+            UpdateOnPreparationOwner(accepted, device);
+            basic_telemetry::AddCounter("ORG.Frame.WorkerPreparationFrames");
+            const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - begin).count();
+            basic_telemetry::SetGauge("ORG.Frame.LastWorkerPreparationMicros", micros);
+            BT_PLOT("ORG.Frame.PreparationWorkerMicros", micros);
+        });
+    m_compilerState->preparationWorker = task->get_future();
+    if (!m_taskService->Submit(m_compilerState->preparationWorkerScope,
+            runtime::TaskPriority::FrameCritical, "ORG.Frame.Preparation", [task] { (*task)(); })) {
+        m_compilerState->preparationWorker = {};
+        throw std::runtime_error("Async preparation task rejected");
+    }
+}
+
+void RenderGraph::UpdateOnPreparationOwner(const UpdateExecutionContext& context, rhi::Device device) {
 	BT_ZONE_SCOPE("RenderGraph::Update");
     if (m_compilerState->frameProductionStopped)
         throw std::logic_error("Frame production has stopped");
@@ -9613,6 +9689,7 @@ bool RenderGraph::TryExecuteSelectedAsyncFrame(PassExecutionContext& context) {
 }
 
 void RenderGraph::Execute(PassExecutionContext& context) {
+    JoinPreparationOwner();
     if (m_compilerState->frameProductionStopped)
         throw std::logic_error("Frame production has stopped");
     const auto compileMode = m_renderGraphSettingsService

@@ -1,4 +1,5 @@
 #pragma once
+#include <future>
 #include <map>
 
 #include "Render/RenderGraph/RenderGraph.h"
@@ -58,6 +59,8 @@ struct RenderGraph::CompilerState {
     std::unique_ptr<experimental::FramePlanningState> framePlanner;
     std::shared_ptr<const experimental::PlannedFrameState> selectedPlanning;
     std::shared_ptr<runtime::ITaskScope> frameWorkerScope;
+    std::shared_ptr<runtime::ITaskScope> preparationWorkerScope;
+    std::future<void> preparationWorker;
     bool frameProductionStopped = false;
     std::unique_ptr<experimental::ExecutionTimelineAdmission> asyncTimelineAdmission;
     uint64_t lastRequestedAsyncSequence = 0;

@@ -696,6 +696,9 @@ public:
 	void AddComputePass(std::shared_ptr<ComputePass> pass, ComputePassParameters& resources, std::string name = "", std::vector<ResolverSnapshot> resolverSnapshots = {});
 	void AddCopyPass(std::shared_ptr<CopyPass> pass, CopyPassParameters& resources, std::string name = "", std::vector<ResolverSnapshot> resolverSnapshots = {});
 	void Update(const UpdateExecutionContext& context, rhi::Device device);
+	// Joins the single mutable preparation owner before host code touches
+	// transitional renderer state. Submission also performs this join.
+	void WaitForPreparation();
 	void Execute(PassExecutionContext& context);
 	// Async producer/admission handshake. True asks the host to prepare another
 	// logical frame before blocking for the exact queue head.
@@ -864,6 +867,8 @@ public:
 	QueueRegistry& GetQueueRegistry() noexcept { return m_queueRegistry; }
 
 private:
+	void UpdateOnPreparationOwner(const UpdateExecutionContext& context, rhi::Device device);
+	void JoinPreparationOwner();
 	std::string GetTechniquePathForPassName(std::string_view passName) const;
 
 	struct AnyPassAndResources {

@@ -37,6 +37,58 @@ the exact resource, history epoch, and producer submission. Consumers no longer
 consult a separate global validity flag. Selecting an unsubmitted producer and
 removing the measured startup view fallback remain scheduling-integration work.
 
+Scene ingestion now enters through a renderer-owned `SceneSourceStateStore`.
+The store serializes complete batches, rejects older source revisions, and is
+detached before the renderer ECS world is destroyed. The existing ECS-backed
+mutation adapter remains behind that boundary while its individual mutations
+are converted to artifact intents.
+
+Environment conversion, prefilter, and spherical-harmonics queues are owned by
+the renderer-scoped environment work service. `EnvironmentManager` produces
+owned requests into those queues, but no longer owns or exposes queue accessors.
+Frame preparation consumes the same service handles, whose reservation resolves
+each request once on submission or joined cancellation.
+
+Terrain ingestion, pending-update reconciliation, and activation of a published
+terrain root now cross `SceneAssetRequestService`. The renderer and its static
+producer capability no longer receive a `TerrainManager*`; the manager remains
+the current storage implementation behind this narrow request boundary.
+`SceneRenderBridge` also retains the source store rather than a raw ECS-world
+pointer, so camera/root queries and resize resynchronization acquire the ordered
+source boundary and cannot outlive world detachment.
+
+Object, camera, and light materialization from an external scene snapshot now
+cross `SceneEntityMaterializationService`. The bridge submits source entities
+and immutable snapshot values, including one bulk renderable request, while the
+service contains the legacy object/view/light storage implementations. Removal
+and resize paths use the same boundary. This preserves bulk allocation without
+giving the ingestion adapter a general manager capability; the service is
+detached before those storage implementations are destroyed.
+
+Pose-instance residency crosses `PoseInstanceRegistrationService` as an
+explicit acquire/release operation. `MeshInstance` retains that service and a
+lifetime token, so skin replacement and destruction no longer borrow a
+`SkeletonManager`. The pose storage implementation remains renderer-owned and
+continues to publish immutable pose artifacts.
+
+Scene workload count changes and view removal now cross
+`StaticWorkloadRequestService`. Active draw-set reconciliation stays inside
+the entity materialization boundary. Consequently the temporary ingestion
+capability bundle no longer exposes object, view, light, skeleton, or indirect
+workload managers.
+
+Dynamic mesh/material activation now crosses
+`SceneRenderableResidencyService`. It coordinates material usage and texture
+refresh, compile/raster slot references, mesh and instance registration, and
+override-buffer allocation. The scene retains no mesh, material, texture, or
+other rendering-manager pointer, and the temporary broad artifact/asset
+capability structs have been removed.
+
+Upscaling and screen-space-reflection passes retain generation service objects.
+Declaration uses the captured upscaling mode, backend, motion-vector policy,
+and resolutions; recorded frame data retains the same service endpoint. Vendor
+backend calls remain serialized by their device-scoped implementations.
+
 ## Ownership model
 
 | Layer | Owns | Must not own |
@@ -57,7 +109,7 @@ tables together.
 
 | Current owner | Source state | Derived/published state | Persistent service work | Compatibility to remove | Destination |
 | --- | --- | --- | --- | --- | --- |
-| `SceneRenderBridge` / `ManagerInterface` | Scene deltas and alive sets | None directly | None | Replays changes into every manager through raw pointers | Renderer source-state store emits ordered artifact intents; retain a temporary ingestion adapter |
+| `SceneRenderBridge` / source store | Scene deltas and alive sets | Ordered immutable source revisions | None | Scene-facing adapters still translate source changes into typed requests | Renderer source-state store emits ordered artifact intents through narrow services |
 | `MaterialManager` | Material identity, usage counts, raster flags | Material rows/tables, compile-flag slots, texture-image dependencies | Slot/raster-bucket allocation and texture-streaming coordination | Resource-provider lookup and graph producers capturing `MaterialManager&` | Owned material inputs and table artifacts; scoped identity/allocation and texture-streaming services |
 | `ObjectManager` | Object/group identity and transform changes | Draw records, transforms, visibility generations, active draw sets | Static-import reservations, range allocation, compaction and deferred retirement | Direct buffer getters and rendering-time resource-provider lookup | Object source records; draw-page/buffer artifacts; allocation/import/retirement services |
 | `MeshManager` | Mesh/instance registration and imported geometry | Mesh tables and geometry/residency selections | Owns the current implementation of the scoped CLOD geometry-storage/residency service | View/skeleton links and bootstrap resource-provider registration | Owned geometry artifacts plus the extracted geometry-storage and residency service |
@@ -71,6 +123,11 @@ tables together.
 | Pipeline/signature managers | Program request keys | Coherent immutable program versions | Device-scoped compilation/cache and signature/work-graph creation | Recording-time singleton lookup | Program-version service retained by declarations |
 | Upscaling/FFX managers | Requested mode/quality | Per-generation SDK configuration and selected history | Exclusive SDK contexts and ordered evaluation | Settings/global singleton reads during preparation or recording | Generation-owned vendor service requests captured by accepted frames |
 | Upload/readback/statistics services | Work requests | Submission receipts and completed feedback | Queue reservations, staging/query allocation and completion processing | Generic immediate-pass replay and slot-global timing reuse | Frame-owned reservations resolved exactly once on submission or cancellation |
+
+`RenderGraphIOService` is the device-scoped import boundary for upload, texture
+production, texture-streaming feedback, and readback passes. Graph extensions retain
+that service and only assign insertion points; they no longer retain the implementing
+factory and manager bundle themselves.
 | External contributor host | ABI-owned callback state | Contributor declarations and packets | Contractually required callback dispatch | Internal compatibility behavior leaking beyond the ABI edge | Preserve as the sole compatibility boundary and measure main-thread callbacks |
 
 ## Migration invariants
