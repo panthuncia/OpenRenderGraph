@@ -46,7 +46,7 @@ QueueSlotIndex QueueRegistry::Register(QueueSlot slot, rhi::Queue queue, rhi::Ti
 		const std::string fenceName = queueName + " Fence";
 		fence->SetName(fenceName.c_str());
 	}
-	m_slots.push_back({ slot.kind, slot.instance, slot.backendInstance, slot.backend, queue, device, std::move(fence), {}, std::move(pool), autoAssignmentPolicy, ownsQueue, std::string(logicalName), 1 });
+	m_slots.push_back({ slot.kind, slot.instance, slot.backendInstance, slot.backend, queue, device, std::move(fence), {}, std::shared_ptr<CommandListPool>(std::move(pool)), autoAssignmentPolicy, ownsQueue, std::string(logicalName), 1 });
 	return idx;
 }
 

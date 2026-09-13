@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <rhi.h>
 
 
@@ -35,7 +36,32 @@ public:
     virtual uint64_t GetBackingGeneration() const = 0;
     virtual void EnsureVirtualDescriptorSlotsAllocated() = 0;
     // Capture and backing mutation are serialized by the preparation owner.
-    virtual BackingAllocationSnapshot CaptureBackingAllocation() { return {}; }
+    // Borrowed synchronous callers need the immutable allocation metadata but
+    // must not manufacture an ownership lease. Async publication requests the
+    // default retained form.
+    virtual BackingAllocationSnapshot CaptureBackingAllocation(bool retain = true) { return {}; }
+    // Resource-version publication. A stable backing generation returns the
+    // same immutable token; this is allocation ownership, not graph caching.
+    std::shared_ptr<const BackingAllocationSnapshot> CapturePublishedBackingAllocation() {
+        const auto generation = GetBackingGeneration();
+        std::scoped_lock lock(m_publicationMutex);
+        if (m_publishedAllocation && m_publishedGeneration == generation)
+            return m_publishedAllocation;
+        auto snapshot = CaptureBackingAllocation(true);
+        if (!snapshot) {
+            m_publishedAllocation.reset();
+            m_publishedGeneration = generation;
+            return {};
+        }
+        m_publishedAllocation =
+            std::make_shared<const BackingAllocationSnapshot>(std::move(snapshot));
+        m_publishedGeneration = generation;
+        return m_publishedAllocation;
+    }
+private:
+    std::mutex m_publicationMutex;
+    uint64_t m_publishedGeneration = UINT64_MAX;
+    std::shared_ptr<const BackingAllocationSnapshot> m_publishedAllocation;
 };
 
 

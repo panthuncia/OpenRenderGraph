@@ -37,7 +37,8 @@ public:
     bool UsesTypedPreparation() const noexcept final { return true; }
 
     PreparedPass PrepareFrame(FramePreparationContext& context) final {
-        auto collector = std::make_shared<PreparedDependencyCollector>();
+        auto collector = std::make_shared<PreparedDependencyCollector>(
+            context.borrowedDependencies);
         auto typedContext = context;
         typedContext.dependencyCollector = collector;
         typedContext.captureDescriptorIndices = [this](const PipelineResources& resources) {
@@ -47,9 +48,10 @@ public:
             static_assert(std::copy_constructible<Bindings>, "Declared bindings must be values");
             if (!m_declaredBindings || !context.bindings || !context.resourceSlots)
                 throw std::logic_error("Declared pass prepared without resolved declarations");
-            // Copy permissions: a future declaration refresh must not change a
-            // queued frame. Validate all slots before dispatching recording.
-            auto slots = std::make_shared<const std::unordered_map<uint64_t, uint32_t>>(*context.resourceSlots);
+            // The permission table is built once for this owned frame and is
+            // already immutable. Retain it directly; deep-copying the same hash
+            // table once per pass was a sizeable part of dependency capture.
+            auto slots = context.resourceSlots;
             for (const auto& [id, slot] : *slots) {
                 (void)id;
                 (void)context.bindings->Resolve(PreparedResourceReference{slot});
@@ -110,7 +112,7 @@ private:
         Bindings bindings;
         FrameData data;
         std::shared_ptr<const FrozenExecutionBindings> resources;
-        std::shared_ptr<const std::unordered_map<uint64_t, uint32_t>> slots;
+        std::shared_ptr<const FramePreparationContext::ResourceSlots> slots;
     };
     struct DeclaredRecorder {
         static void Record(const DeclaredFrame& frame, PassRecordContext& context) {

@@ -223,7 +223,7 @@ int TestOwnedRenderFrameSnapshot() {
     auto graph = org::experimental::CompileGraph(ownedInput, workspace, cancelled);
     auto bundle = std::make_shared<const org::experimental::CompiledGraphBundle>(
         org::experimental::CompiledGraphBundle{1, graph, ownedInput});
-    auto layout = org::experimental::BuildExecutionLayout(bundle, input);
+    auto layout = org::experimental::BuildExecutionLayout(bundle, *ownedInput);
     auto bindings = std::make_shared<const org::FrozenExecutionBindings>(
         std::vector<org::FrozenExecutionBindings::ResourceBinding>{});
     auto record = +[](const uint32_t&, org::RecordingContext&) {};
@@ -232,7 +232,9 @@ int TestOwnedRenderFrameSnapshot() {
     barriers->batches.resize(1);
     auto frame = org::experimental::BuildRenderFrameSnapshot(7, layout,
         {org::PreparedPass::Make(uint32_t{1}, record)}, bindings,
-        {org::experimental::PreparedBackingState{.graphResourceID = 1}}, barriers, {lease});
+        std::make_shared<const std::vector<org::experimental::PreparedBackingState>>(
+            std::initializer_list<org::experimental::PreparedBackingState>{{.graphResourceID = 1}}),
+        barriers, {lease});
     CHECK(frame->frameNumber == 7 && frame->layout == layout && frame->passes.size() == 1);
     auto recordings = org::experimental::BuildPreparedBatchRecordings(*frame);
     CHECK(recordings.size() == 1 && recordings[0].queueSlot == 0
@@ -240,8 +242,9 @@ int TestOwnedRenderFrameSnapshot() {
     auto realized = std::make_shared<org::experimental::RealizedResourceBundle>();
     realized->backingGenerations = {9};
     realized->bindings = bindings;
-    realized->initialStates = {org::experimental::PreparedBackingState{
-        .graphResourceID = 1, .resource = rhi::ResourceHandle{0, 1}}};
+    realized->initialStates = std::make_shared<const std::vector<org::experimental::PreparedBackingState>>(
+        std::initializer_list<org::experimental::PreparedBackingState>{{
+            .graphResourceID = 1, .resource = rhi::ResourceHandle{0, 1}}});
     realized->leases = {lease};
     std::vector<std::vector<org::ExternalTimelinePoint>> waits(1);
     waits[0].push_back({{}, 17});
@@ -471,7 +474,8 @@ int TestPreparedGpuSubmission(rhi::Device device, ID3D12Device* nativeDevice) {
         std::vector<PreparedBackingState> initialStates;
         for (int i = 0; i < 3; ++i) {
             initialStates.push_back({static_cast<uint64_t>(i + 1), {}, lease->resources[i].GetHandle(),
-                {1,1,false}, {{{},commonState}}});
+                {1,1,false}, std::make_shared<const std::vector<PreparedStateRegion>>(
+                    std::initializer_list<PreparedStateRegion>{{{}, commonState}})});
             initialStates.back().heapType = i == 0 ? rhi::HeapType::Upload
                 : i == 2 ? rhi::HeapType::Readback : rhi::HeapType::DeviceLocal;
         }
@@ -520,8 +524,8 @@ int TestPreparedGpuSubmission(rhi::Device device, ID3D12Device* nativeDevice) {
             org::RenderGraph declarationGraph(device, rhi::Backend::D3D12);
             auto& declaration = declarationGraph.BuildRenderPass<DeclaredRecordingPass>("Declared binding lifetime");
             pass.DeclareUnified(declaration);
-            auto permissions = std::make_shared<std::unordered_map<uint64_t, uint32_t>>();
-            permissions->emplace(41, 0);
+            auto permissions = std::make_shared<org::FramePreparationContext::ResourceSlots>();
+            permissions->emplace_back(41, 0);
             org::FramePreparationContext preparation{};
             preparation.bindings = bindings;
             preparation.resourceSlots = permissions;
@@ -539,7 +543,7 @@ int TestPreparedGpuSubmission(rhi::Device device, ID3D12Device* nativeDevice) {
             // original permission map must leave the queued packet untouched.
             pass.selected = 42;
             pass.DeclareUnified(declaration);
-            permissions->at(41) = 99;
+            permissions->front().second = 99;
             bool invalidDeclarationRejected = false;
             try { (void)pass.PrepareFrame(preparation); }
             catch (const std::out_of_range&) { invalidDeclarationRejected = true; }
@@ -940,10 +944,12 @@ int TestOwnedDescriptorGpuExecution(const rhi::DeviceCreateInfo& create) {
             initial[resource].resource = backing->resource[resource].Get().GetHandle();
             initial[resource].shape = {1,1,false};
         }
-        initial[0].regions.push_back({{}, {static_cast<uint64_t>(rhi::ResourceAccessType::Common),0,
-            static_cast<uint64_t>(rhi::ResourceSyncState::All),false}});
-        initial[1].regions.push_back({{}, {static_cast<uint64_t>(rhi::ResourceAccessType::CopyDest),0,
-            static_cast<uint64_t>(rhi::ResourceSyncState::Copy),true}});
+        initial[0].regions = std::make_shared<const std::vector<PreparedStateRegion>>(
+            std::initializer_list<PreparedStateRegion>{{{}, {static_cast<uint64_t>(rhi::ResourceAccessType::Common),0,
+            static_cast<uint64_t>(rhi::ResourceSyncState::All),false}}});
+        initial[1].regions = std::make_shared<const std::vector<PreparedStateRegion>>(
+            std::initializer_list<PreparedStateRegion>{{{}, {static_cast<uint64_t>(rhi::ResourceAccessType::CopyDest),0,
+            static_cast<uint64_t>(rhi::ResourceSyncState::Copy),true}}});
         BackingStateAdmissionLedger stateLedger;
         auto barrierPlan = stateLedger.Prepare(*graph, initial);
         CHECK(barrierPlan.batches.size() == 1);

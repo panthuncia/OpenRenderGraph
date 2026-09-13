@@ -542,10 +542,10 @@ void BufferBase::Materialize(const MaterializeOptions* options) {
     OnBackingMaterialized();
 }
 
-BackingAllocationSnapshot BufferBase::CaptureBackingAllocation() {
+BackingAllocationSnapshot BufferBase::CaptureBackingAllocation(bool retain) {
     if (!m_dataBuffer || GetAttachedAPIRepresentation(BackendInstanceId::Primary).IsValid()) return {};
-    auto lease = m_dataBuffer->CaptureAllocationLease();
-    if (!lease) return {};
+    auto lease = retain ? m_dataBuffer->CaptureAllocationLease() : std::shared_ptr<const void>{};
+    if (retain && !lease) return {};
     BackingAllocationSnapshot snapshot{
         GetGlobalResourceID(), m_backingGeneration, m_dataBuffer->GetAPIResource(), std::move(lease), m_bufferSize};
     snapshot.aliasHeap = m_dataBuffer->GetAliasHeap();

@@ -1735,18 +1735,24 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
     // whether the completed executable envelope runs inline or on workers.
     if (asynchronous)
         BT_PLOT("ORG.AsyncExecution.SceneRouteEnabled", int64_t{1});
-    BT_ZONE_SCOPE("ORG.AsyncCompile.CaptureDependencies");
+    BT_ZONE_SCOPE("ORG.FreshCompile.CaptureDependencies");
     if (!m_taskService) {
-        BT_PLOT("ORG.AsyncCompile.FallbackNoTaskService", int64_t{1});
+        BT_PLOT("ORG.FreshCompile.FallbackNoTaskService", int64_t{1});
         return;
     }
     auto& coordinator = m_compilerState->compileCoordinator;
-    if (!coordinator) coordinator = std::make_unique<experimental::GraphCompileCoordinator>(
-        m_taskService, m_compilerState->preparingFrame->CompileConcurrency());
-    coordinator->SetConcurrency(m_compilerState->preparingFrame->CompileConcurrency());
+    if (asynchronous) {
+        if (!coordinator) coordinator = std::make_unique<experimental::GraphCompileCoordinator>(
+            m_taskService, m_compilerState->preparingFrame->CompileConcurrency());
+        coordinator->SetConcurrency(m_compilerState->preparingFrame->CompileConcurrency());
+    }
     experimental::GraphCompileInput input;
+    input.executionPolicy = asynchronous
+        ? experimental::GraphCompileInput::ExecutionPolicy::OwnedAsynchronous
+        : experimental::GraphCompileInput::ExecutionPolicy::BorrowedSynchronous;
     input.frameContext = m_compilerState->preparingFrame;
-    if (m_resolverCaptureContext) input.leases.push_back(m_resolverCaptureContext);
+    if (asynchronous && m_resolverCaptureContext)
+        input.leases.push_back(m_resolverCaptureContext);
     input.structure.generation = m_resourceRegistryGeneration;
     input.structure.registryGeneration = m_resourceRegistryGeneration;
     // The dense live index also contains helper identities for dynamic wrappers
@@ -1754,6 +1760,8 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
     // pass access/state declarations; otherwise backing rotation looks like a
     // structural membership change despite never affecting the compiler DAG.
     std::vector<uint8_t> referenced(m_frameDAGResourceCount);
+    {
+    BT_ZONE_SCOPE("ORG.FreshCompile.IR.ResourceIndexing");
     for (const auto& node : nodes) if (node.passIndex < m_framePassAccessSummaries.size()) {
         const auto& summary = m_framePassAccessSummaries[node.passIndex];
         for (const auto& access : summary.dagAccesses)
@@ -1763,15 +1771,18 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
         for (const auto& transition : summary.internalTransitionSummaries)
             if (transition.dagResourceIndex < referenced.size()) referenced[transition.dagResourceIndex] = 1;
     }
+    }
     std::vector<uint32_t> originalToCaptured(m_frameDAGResourceCount, UINT32_MAX);
     std::vector<uint32_t> capturedToOriginal;
     capturedToOriginal.reserve(m_frameDAGResourceCount);
     for (uint32_t original = 0; original < referenced.size(); ++original) if (referenced[original]) {
         originalToCaptured[original] = static_cast<uint32_t>(input.structure.resourceIDs.size());
-        input.structure.resourceIDs.push_back(m_frameDAGResourceIDsByIndex[original]);
+        // This graph is compiled exactly once and is permanently paired with
+        // this frame. Dense slot identity is sufficient and keeps capture in
+        // compiler order without per-frame semantic strings or hashing.
+        input.structure.resourceIDs.push_back(input.structure.resourceIDs.size() + 1);
         capturedToOriginal.push_back(original);
     }
-    input.structure.resourceKeys.resize(input.structure.resourceIDs.size());
     input.backingGenerations.resize(input.structure.resourceIDs.size());
     std::unordered_map<uint64_t, uint32_t> capturedIndices;
     std::vector<FrozenExecutionBindings::ResourceBinding> frozenResources;
@@ -1782,11 +1793,8 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
     size_t semanticSlotCount = 0;
     size_t unnamedTransientCount = 0;
     size_t unresolvedReferencedCount = 0;
-    // Display names are not guaranteed unique (frame extensions commonly
-    // instantiate several copies of the same pass resource). Keep the slot
-    // identity stable across backing rotation while distinguishing equal names
-    // by their deterministic DAG order.
-    std::unordered_map<std::string, uint32_t> transientNameOccurrences;
+    {
+    BT_ZONE_SCOPE("ORG.FreshCompile.RealizationCollection");
     for (uint32_t r = 0; r < input.structure.resourceIDs.size(); ++r) {
         const auto original = capturedToOriginal[r];
         const auto concreteID = m_frameDAGResourceIDsByIndex[original];
@@ -1798,39 +1806,9 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
             && resource->GetName() == "Backbuffer"
             ? static_cast<uint32_t>(ExternalBindingKey::SwapchainColor) : 0u;
         if (!resource) ++unresolvedReferencedCount;
-        if (resource) {
-            // The compiler consumes declaration slots, not concrete registry
-            // object identities. Frame extensions may rebuild named wrapper
-            // objects each frame even though the slot, description and access
-            // topology are unchanged. Key every named slot semantically and
-            // keep its concrete backing generation in the realization key.
-            // This also gives dynamic wrappers and same-layout replacement the
-            // intended no-recompile behavior.
-            const bool semanticResource = !resource->GetName().empty();
-            if (semanticResource) {
-                auto& semanticKey = input.structure.resourceKeys[r];
-                std::string resourceName = resource->GetName();
-                // Execution-slot/ring resources conventionally append _N to
-                // their logical role. The selected concrete slot is a
-                // realization detail, while simultaneous instances remain
-                // distinct through the occurrence suffix below.
-                const auto suffix = resourceName.find_last_of("_ ");
-                if (suffix != std::string::npos && suffix + 1 < resourceName.size()
-                    && std::all_of(resourceName.begin() + suffix + 1, resourceName.end(),
-                        [](unsigned char c) { return std::isdigit(c) != 0; })) {
-                    resourceName.resize(suffix);
-                }
-                const uint32_t occurrence = transientNameOccurrences[resourceName]++;
-                semanticKey = "frame:" + resourceName + "#" + std::to_string(occurrence);
-                uint64_t stable = 1469598103934665603ull;
-                for (const unsigned char c : semanticKey) stable = (stable ^ c) * 1099511628211ull;
-                input.structure.resourceIDs[r] = stable;
-                ++semanticSlotCount;
-            } else if (m_transientFrameResourcesByID.contains(concreteID)
-                || dynamic_cast<DynamicResource*>(resource) != nullptr) {
-                ++unnamedTransientCount;
-            }
-        }
+        if (resource && !resource->GetName().empty()) ++semanticSlotCount;
+        else if (resource && (m_transientFrameResourcesByID.contains(concreteID)
+            || dynamic_cast<DynamicResource*>(resource) != nullptr)) ++unnamedTransientCount;
         input.structure.resourceShapes.push_back(resource
             ? experimental::CompileResourceShape{(std::max)(1u, resource->GetMipLevels()),
                 (std::max)(1u, resource->GetArraySize()), resource->HasLayout()}
@@ -1838,23 +1816,30 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
         std::shared_ptr<const AliasHeapGeneration> capturedAliasHeap;
         uint64_t capturedAliasPoolID = 0, capturedAliasOffset = 0, capturedAliasSize = 0;
         if (auto* backed = TryGetBackedResource(resource)) {
-            BT_ZONE_SCOPE("ORG.AsyncCompile.CaptureBackingAllocation");
+            BT_ZONE_SCOPE("ORG.FreshCompile.CaptureBackingAllocation");
             input.backingGenerations[r] = backed->GetBackingGeneration();
-            auto snapshot = backed->CaptureBackingAllocation();
-            if (snapshot) {
+            auto retainedSnapshot = asynchronous
+                ? backed->CapturePublishedBackingAllocation()
+                : std::shared_ptr<const BackingAllocationSnapshot>{};
+            auto snapshot = retainedSnapshot
+                ? *retainedSnapshot : backed->CaptureBackingAllocation(false);
+            if (snapshot.resource) {
                 capturedAliasHeap = snapshot.aliasHeap;
                 capturedAliasPoolID = snapshot.aliasPoolID;
                 capturedAliasOffset = snapshot.aliasOffset;
                 capturedAliasSize = snapshot.aliasSize;
-                frozenResources.push_back({snapshot.resource, snapshot.lease,
+                frozenResources.push_back({snapshot.resource,
+                    asynchronous ? std::shared_ptr<const void>{retainedSnapshot}
+                                 : std::shared_ptr<const void>{},
                     dynamic_cast<GloballyIndexedResource*>(UnwrapDynamicResource(resource))
                         ? dynamic_cast<GloballyIndexedResource*>(UnwrapDynamicResource(resource))->CaptureBindlessViews()
                         : std::shared_ptr<const BindlessResourceViews>{}});
-                input.leases.push_back(std::move(snapshot.lease));
-                basic_telemetry::AddCounter("ORG.AsyncCompile.BackingAllocationLeases");
+                if (asynchronous) {
+                    basic_telemetry::AddCounter("ORG.AsyncCompile.BackingAllocationLeases");
+                }
             } else {
                 frozenResources.push_back({});
-                basic_telemetry::AddCounter("ORG.AsyncCompile.UnsupportedBackingAllocation");
+                basic_telemetry::AddCounter("ORG.FreshCompile.UnsupportedBackingAllocation");
             }
         } else {
             // Imported resources (notably swapchain images) do not implement
@@ -1865,17 +1850,20 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
             auto owner = concrete ? concrete->weak_from_this().lock() : std::shared_ptr<Resource>{};
             auto apiResource = concrete ? concrete->GetAPIResource() : rhi::Resource{};
             if (owner && apiResource.GetHandle().valid()) {
-                frozenResources.push_back({apiResource, owner,
+                frozenResources.push_back({apiResource,
+                    asynchronous ? std::shared_ptr<const void>{owner} : std::shared_ptr<const void>{},
                     dynamic_cast<GloballyIndexedResource*>(concrete)
                         ? dynamic_cast<GloballyIndexedResource*>(concrete)->CaptureBindlessViews()
                         : std::shared_ptr<const BindlessResourceViews>{}});
-                input.leases.push_back(owner);
+                if (asynchronous) input.leases.push_back(owner);
                 const auto handle = apiResource.GetHandle();
                 input.backingGenerations[r] = (uint64_t{handle.generation} << 32) | handle.index;
-                basic_telemetry::AddCounter("ORG.AsyncExecution.ImportedResourceLeases");
+                basic_telemetry::AddCounter(asynchronous
+                    ? "ORG.AsyncExecution.ImportedResourceLeases"
+                    : "ORG.SyncExecution.BorrowedImportedResources");
             } else {
                 frozenResources.push_back({});
-                basic_telemetry::AddCounter("ORG.AsyncExecution.NonBackingResources");
+                basic_telemetry::AddCounter("ORG.Execution.NonBackingResources");
                 if (resource && ++m_compilerState->reportedAsyncUnownedResources <= 8) {
                     spdlog::warn("Async preparation cannot own resource '{}' id={} type={} concreteType={} owner={} api={}",
                         resource->GetName(), concreteID, typeid(*resource).name(),
@@ -1887,21 +1875,22 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
         // Keep descriptor slots and the concrete allocation under the same
         // frozen binding owner. Buffer replacement already rotates slots; its
         // fence retirement must also respect CPU frames not yet submitted.
-        if (auto* indexed = dynamic_cast<GloballyIndexedResource*>(UnwrapDynamicResource(resource));
-            indexed && !frozenResources.empty() && frozenResources.back().owner) {
+        if (asynchronous
+            && (dynamic_cast<GloballyIndexedResource*>(UnwrapDynamicResource(resource)) != nullptr)) {
+            auto* indexed = dynamic_cast<GloballyIndexedResource*>(UnwrapDynamicResource(resource));
+            if (!frozenResources.empty() && frozenResources.back().owner) {
             if (auto descriptors = indexed->CaptureDescriptorOwnership()) {
-                struct VersionOwnership {
-                    std::shared_ptr<const void> allocation, descriptors;
-                };
                 auto& binding = frozenResources.back();
-                binding.owner = std::make_shared<const VersionOwnership>(binding.owner, std::move(descriptors));
-                input.leases.push_back(binding.owner);
+                binding.descriptorOwner = std::move(descriptors);
+                input.leases.push_back(binding.descriptorOwner);
                 basic_telemetry::AddCounter("ORG.AsyncCompile.DescriptorOwnershipLeases");
+            }
             }
         }
         experimental::PreparedBackingState preparedState;
         preparedState.graphResourceID = input.structure.resourceIDs[r];
-        preparedState.graphResourceKey = input.structure.resourceKeys[r];
+        if (!input.structure.resourceKeys.empty())
+            preparedState.graphResourceKey = input.structure.resourceKeys[r];
         preparedState.shape = input.structure.resourceShapes[r];
         if (r < frozenResources.size()) preparedState.resource = frozenResources[r].resource.GetHandle();
         preparedState.aliasHeap = std::move(capturedAliasHeap);
@@ -1909,32 +1898,53 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
         preparedState.aliasPoolID = capturedAliasPoolID;
         preparedState.aliasOffset = capturedAliasOffset;
         preparedState.aliasSize = capturedAliasSize;
-        if (resource) {
+        const auto seedKey = resource ? UnwrapDynamicResource(resource) : nullptr;
+        auto seed = seedKey ? m_compilerState->realizationSeeds.find(seedKey)
+                            : m_compilerState->realizationSeeds.end();
+        const bool seedMatches = seed != m_compilerState->realizationSeeds.end()
+            && seed->second.backingGeneration == input.backingGenerations[r]
+            && seed->second.resource.index == preparedState.resource.index
+            && seed->second.resource.generation == preparedState.resource.generation
+            && seed->second.shape == preparedState.shape;
+        if (seedMatches) {
+            preparedState.heapType = seed->second.heapType;
+            preparedState.regions = seed->second.regions;
+            basic_telemetry::AddCounter("ORG.FreshCompile.RealizationSeedHits");
+        } else if (resource) {
+            auto regions = std::make_shared<std::vector<experimental::PreparedStateRegion>>();
             rhi::ResourceDesc resourceDesc{};
             if (resource->TryGetRHIResourceDesc(resourceDesc))
                 preparedState.heapType = resourceDesc.heapType;
-        }
-        if (resource && resource->GetStateTracker()) {
-            for (const auto& segment : resource->GetStateTracker()->GetSegments()) {
+            if (resource->GetStateTracker()) for (const auto& segment : resource->GetStateTracker()->GetSegments()) {
                 const auto resolved = ResolveRangeSpec(segment.rangeSpec,
                     preparedState.shape.mips, preparedState.shape.slices);
                 if (resolved.isEmpty()) continue;
-                preparedState.regions.push_back({
+                regions->push_back({
                     {resolved.firstMip, resolved.mipCount, resolved.firstSlice, resolved.sliceCount},
                     {static_cast<uint64_t>(segment.state.access), static_cast<uint64_t>(segment.state.layout),
                         static_cast<uint64_t>(segment.state.sync), AccessTypeIsWriteType(segment.state.access)}});
             }
+            preparedState.regions = std::move(regions);
         }
-        if (preparedState.regions.empty() && preparedState.shape.mips && preparedState.shape.slices) {
-            preparedState.regions.push_back({{0, preparedState.shape.mips, 0, preparedState.shape.slices},
+        if ((!preparedState.regions || preparedState.regions->empty())
+            && preparedState.shape.mips && preparedState.shape.slices) {
+            preparedState.regions = std::make_shared<const std::vector<experimental::PreparedStateRegion>>(
+                std::initializer_list<experimental::PreparedStateRegion>{{{0, preparedState.shape.mips, 0, preparedState.shape.slices},
                 {static_cast<uint64_t>(rhi::ResourceAccessType::None), static_cast<uint64_t>(rhi::ResourceLayout::Undefined),
-                    static_cast<uint64_t>(rhi::ResourceSyncState::None), false}});
+                    static_cast<uint64_t>(rhi::ResourceSyncState::None), false}}});
+        }
+        if (!seedMatches && seedKey) {
+            m_compilerState->realizationSeeds.insert_or_assign(seedKey,
+                CompilerState::RealizationSeed{input.backingGenerations[r], preparedState.resource,
+                    preparedState.shape, preparedState.heapType, preparedState.regions});
+            basic_telemetry::AddCounter("ORG.FreshCompile.RealizationSeedPublications");
         }
         preparedInitialStates.push_back(std::move(preparedState));
     }
-    BT_PLOT("ORG.AsyncCompile.SemanticResourceSlots", static_cast<int64_t>(semanticSlotCount));
-    BT_PLOT("ORG.AsyncCompile.UnnamedTransientResources", static_cast<int64_t>(unnamedTransientCount));
-    BT_PLOT("ORG.AsyncCompile.UnresolvedReferencedResources", static_cast<int64_t>(unresolvedReferencedCount));
+    }
+    BT_PLOT("ORG.FreshCompile.SemanticResourceSlots", static_cast<int64_t>(semanticSlotCount));
+    BT_PLOT("ORG.FreshCompile.UnnamedTransientResources", static_cast<int64_t>(unnamedTransientCount));
+    BT_PLOT("ORG.FreshCompile.UnresolvedReferencedResources", static_cast<int64_t>(unresolvedReferencedCount));
     auto captureState = [&](uint32_t resourceIndex, const RangeSpec& spec, ResourceState state) {
         if (resourceIndex >= input.structure.resourceShapes.size())
             throw std::runtime_error("Invalid resource index during owned state capture");
@@ -1952,10 +1962,12 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
             slot < m_activeQueueSlotsThisFrame.size() && m_activeQueueSlotsThisFrame[slot] != 0});
     input.structure.passes.reserve(nodes.size());
     std::vector<std::vector<ExternalTimelinePoint>> preparedExternalWaits(m_framePasses.size());
-    std::vector<std::shared_ptr<const std::unordered_map<uint64_t, uint32_t>>>
+    std::vector<std::shared_ptr<const FramePreparationContext::ResourceSlots>>
         preparedResourceSlots(m_framePasses.size());
     const auto primaryBackend = m_backendDevices.empty() ? rhi::Backend::Null : m_backendDevices.front().backend;
     auto oracle = std::make_shared<experimental::DependencyEdges>();
+    {
+    BT_ZONE_SCOPE("ORG.FreshCompile.IR.PassConstruction");
     for (size_t index = 0; index < nodes.size(); ++index) {
         const auto& node = nodes[index];
         experimental::CompilePass pass;
@@ -1981,7 +1993,9 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
         }
         if (node.passIndex < m_framePassAccessSummaries.size()) {
             const auto& summary = m_framePassAccessSummaries[node.passIndex];
-            auto resourceSlots = std::make_shared<std::unordered_map<uint64_t, uint32_t>>();
+            auto resourceSlots = std::make_shared<FramePreparationContext::ResourceSlots>();
+            resourceSlots->reserve((summary.requirementSummaries.size()
+                + summary.internalTransitionSummaries.size()) * 3);
             pass.backend = static_cast<uint32_t>(summary.backendAffinity.strength == BackendAffinityStrength::Primary
                 ? primaryBackend : summary.backendAffinity.backend);
             pass.accesses.reserve(summary.dagAccesses.size());
@@ -1990,14 +2004,14 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
                     || originalToCaptured[resourceIndex] == UINT32_MAX)
                     throw std::runtime_error("Invalid resource index during owned preparation-slot capture");
                 const auto capturedSlot = originalToCaptured[resourceIndex];
-                resourceSlots->emplace(m_frameDAGResourceIDsByIndex[resourceIndex], capturedSlot);
+                resourceSlots->emplace_back(m_frameDAGResourceIDsByIndex[resourceIndex], capturedSlot);
                 // A declaration may be represented by the registry handle ID,
                 // a dynamic wrapper's stable scheduling ID, or its current
                 // concrete backing ID. They are aliases of this exact access.
                 if (resourceIndex < m_frameDAGResourcePtrByIndex.size()) {
                     if (auto* resource = m_frameDAGResourcePtrByIndex[resourceIndex]) {
-                        resourceSlots->emplace(resource->GetSchedulingResourceID(), capturedSlot);
-                        resourceSlots->emplace(resource->GetGlobalResourceID(), capturedSlot);
+                        resourceSlots->emplace_back(resource->GetSchedulingResourceID(), capturedSlot);
+                        resourceSlots->emplace_back(resource->GetGlobalResourceID(), capturedSlot);
                     }
                 }
             };
@@ -2038,6 +2052,7 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
         input.structure.passes.push_back(std::move(pass));
         for (auto next : node.out) oracle->emplace_back(static_cast<uint32_t>(index), static_cast<uint32_t>(next));
     }
+    }
     for (auto [from, to] : explicitEdges) {
         // Match legacy handling of unresolved external edges before freezing.
         if (from < nodes.size() && to < nodes.size())
@@ -2048,24 +2063,39 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
     std::set_difference(oracle->begin(), oracle->end(), dependencyOracle.begin(), dependencyOracle.end(),
         std::back_inserter(input.structure.placementEdges));
 	{
-		BT_ZONE_SCOPE("ORG.AsyncExecution.CapturePreparationBasis");
+		BT_ZONE_SCOPE("ORG.Execution.CapturePreparationBasis");
         const bool allResourcesOwned = std::all_of(frozenResources.begin(), frozenResources.end(),
-            [](const auto& binding) { return binding.resource.GetHandle().valid() && binding.owner; });
+            [asynchronous](const auto& binding) {
+                return binding.resource.GetHandle().valid()
+                    && (!asynchronous || binding.owner);
+            });
         if (allResourcesOwned) {
-            auto bindings = std::make_shared<const FrozenExecutionBindings>(std::move(frozenResources));
+            auto bindings = std::make_shared<const FrozenExecutionBindings>(
+                std::move(frozenResources),
+                std::vector<FrozenExecutionBindings::DescriptorBinding>{},
+                asynchronous ? FrozenExecutionBindings::OwnershipPolicy::Owned
+                             : FrozenExecutionBindings::OwnershipPolicy::Borrowed);
 			auto resources = std::make_shared<experimental::RealizedResourceBundle>();
 			resources->backingGenerations = input.backingGenerations;
 			resources->resourceKeys = input.structure.resourceKeys;
 			resources->admissionBoundResources = std::move(admissionBoundResources);
 			resources->bindings = std::move(bindings);
-			resources->initialStates = std::move(preparedInitialStates);
-			resources->leases = input.leases;
-			if (m_asyncUpdateHostData) resources->leases.push_back(m_asyncUpdateHostData);
+			resources->initialStates =
+				std::make_shared<const std::vector<experimental::PreparedBackingState>>(
+					std::move(preparedInitialStates));
+			// The payload is owned by the exact compile input and the compiled
+			// bundle is retained through GPU retirement. Move the leases into that
+			// one ownership chain instead of retaining every version three times.
+			resources->leases = std::move(input.leases);
+			if (asynchronous && m_asyncUpdateHostData)
+                resources->leases.push_back(m_asyncUpdateHostData);
 			auto basis = std::make_shared<experimental::FramePreparationBasis>();
 			basis->resources = std::move(resources);
 			basis->externalWaitsByPreparedPass = std::move(preparedExternalWaits);
 			basis->reservedImmediatePasses.resize(m_framePasses.size());
 			basis->immediatePassSlots.resize(m_framePasses.size());
+			{
+			BT_ZONE_SCOPE("ORG.Execution.CaptureImmediatePasses");
 			for (size_t passIndex = 0; passIndex < m_framePasses.size(); ++passIndex) {
 				auto& any = m_framePasses[passIndex];
 				basis->reservedImmediatePasses[passIndex] = std::visit([&](auto& value) -> PreparedPass {
@@ -2128,6 +2158,7 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
 					}
 				}, any.pass);
 			}
+			}
 			basis->updateData = m_asyncUpdateHostData;
 			FramePreparationContext preparation{
                 .device = device,
@@ -2142,19 +2173,22 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
 				// Target-scene adapters are migrated below to remove pass pointers.
 				.admissionData = basis->updateData ? basis->updateData.get() : hostData,
 				.frameData = basis->updateData,
+				.borrowedDependencies = !asynchronous,
 			};
-			std::vector<PreparedPass> packets;
-			packets.reserve(m_framePasses.size());
-			size_t legacyPassCount = 0;
-			for (size_t passIndex = 0; passIndex < m_framePasses.size(); ++passIndex) {
+			std::vector<PreparedPass> preparedPackets(m_framePasses.size());
+			std::vector<uint8_t> legacyPassSlots(m_framePasses.size());
+			{
+			BT_ZONE_SCOPE("ORG.Execution.PreparePasses");
+			auto preparePass = [&](size_t passIndex) {
 				auto& any = m_framePasses[passIndex];
-				preparation.resourceSlots = preparedResourceSlots[passIndex];
+				auto passPreparation = preparation;
+				passPreparation.resourceSlots = preparedResourceSlots[passIndex];
 				PreparedPass packet;
 				try {
 					packet = std::visit([&](auto& value) -> PreparedPass {
 						using T = std::decay_t<decltype(value)>;
 						if constexpr (std::is_same_v<T, std::monostate>) return {};
-						else return value.pass->PrepareFrame(preparation);
+						else return value.pass->PrepareFrame(passPreparation);
 					}, any.pass);
 				}
 				catch (const std::exception& e) {
@@ -2165,36 +2199,74 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
 					packet = basis->reservedImmediatePasses[passIndex];
 				}
 				if (!packet) {
-					++legacyPassCount;
-					if (m_compilerState->reportedAsyncLegacyPasses.insert(any.name).second)
-						spdlog::warn("Async frame request requires owned preparation for pass '{}'", any.name);
-					continue;
+					legacyPassSlots[passIndex] = 1;
+					return;
 				}
 				packet.SetDebugName(any.name);
-				packets.push_back(std::move(packet));
+				preparedPackets[passIndex] = std::move(packet);
+			};
+			// Typed preparation is pass-local and consumes only the immutable frame
+			// snapshot assembled above. Fan it out while this frame exclusively owns
+			// pass preparation; the next Update joins this preparation owner before it
+			// can mutate any pass again.
+			if (asynchronous)
+				m_taskService->ParallelForLimited("ORG.Execution.PreparePass", m_framePasses.size(), 4, preparePass);
+			else
+				for (size_t passIndex = 0; passIndex < m_framePasses.size(); ++passIndex)
+					preparePass(passIndex);
 			}
-			BT_PLOT("ORG.AsyncExecution.RequestLegacyPasses", static_cast<int64_t>(legacyPassCount));
+			std::vector<PreparedPass> packets;
+			packets.reserve(preparedPackets.size());
+			size_t legacyPassCount = 0;
+			for (size_t passIndex = 0; passIndex < preparedPackets.size(); ++passIndex) {
+				if (legacyPassSlots[passIndex]) {
+					++legacyPassCount;
+					const auto& name = m_framePasses[passIndex].name;
+					if (m_compilerState->reportedAsyncLegacyPasses.insert(name).second)
+						spdlog::warn("Async frame request requires owned preparation for pass '{}'", name);
+				} else packets.push_back(std::move(preparedPackets[passIndex]));
+			}
+			BT_PLOT("ORG.Execution.RequestLegacyPasses", static_cast<int64_t>(legacyPassCount));
 			if (!legacyPassCount && packets.size() == m_framePasses.size()) {
+				BT_ZONE_SCOPE("ORG.Execution.BuildPreparedPayload");
 				auto preparedPayload = experimental::BuildPreparedFramePayload(
 					preparation.frameNumber, std::move(packets), basis->resources,
 					std::move(basis->externalWaitsByPreparedPass), preparation.preparationSlot);
 				input.executionPayload = preparedPayload;
-				input.executionLifecycle = std::move(preparedPayload);
-				basic_telemetry::AddCounter("ORG.AsyncExecution.PreparedFrameRequests");
+				if (asynchronous)
+                    input.executionLifecycle = preparedPayload;
+				basic_telemetry::AddCounter("ORG.Execution.PreparedFrameRequests");
 			}
-        } else basic_telemetry::AddCounter("ORG.AsyncExecution.PreparationUnownedResources");
+        } else basic_telemetry::AddCounter("ORG.Execution.PreparationUnownedResources");
     }
     const bool inlineBootstrap = !asynchronous
         || m_compilerState->lastRequestedAsyncSequence == 0;
+    basic_telemetry::AddCounter("ORG.FreshCompile.FrameIRBuilds");
     if (input.frameContext) {
         if (!input.executionPayload) throw std::runtime_error("Frame preparation produced no owned execution payload");
-        input.frameContext->Retain(input.executionPayload);
-        for (const auto& lease : input.leases) input.frameContext->Retain(lease);
         input.frameContext->Advance(FrameStage::Preparing, FrameStage::Compiling);
     }
-    auto request = coordinator->RequestOwned(std::move(input), inlineBootstrap);
+    experimental::GraphCompileCoordinator::RequestReceipt request;
+    if (asynchronous) {
+        request = coordinator->RequestOwned(std::move(input), inlineBootstrap);
+    } else {
+        BT_ZONE_SCOPE("ORG.SyncCompile.DirectCompile");
+        auto ownedInput = std::make_shared<const experimental::GraphCompileInput>(std::move(input));
+        experimental::CompileWorkspace workspace;
+        std::atomic_bool cancelled{false};
+        auto graph = experimental::CompileGraph(ownedInput, workspace, cancelled);
+        if (!graph) throw std::runtime_error("Synchronous fresh graph compilation failed");
+        const auto sequence = m_compilerState->lastRequestedAsyncSequence + 1;
+        m_compilerState->synchronousBundle =
+            std::make_shared<const experimental::CompiledGraphBundle>(
+                experimental::CompiledGraphBundle{sequence, std::move(graph), ownedInput});
+        request = {sequence, std::move(ownedInput)};
+        basic_telemetry::AddCounter("ORG.SyncCompile.DirectFrames");
+    }
     if (!request.input || !request.sequence)
-        throw std::runtime_error("Owned frame compile request was rejected");
+        throw std::runtime_error("Fresh frame compile request was rejected");
+    basic_telemetry::AddCounter("ORG.FreshCompile.AcceptedFrameRequests");
+    BT_PLOT("ORG.FreshCompile.StructuralReuses", int64_t{0});
     if (request.input) {
         if (request.sequence == 1 && m_compilerState->lastRequestedAsyncSequence != 0)
             m_compilerState->nextAsyncExecutionSequence = 1;
@@ -2202,8 +2274,9 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
         m_compilerState->lastRequestedAsyncSequence = request.sequence;
         m_compilerState->preparingFrame.reset();
     }
-    coordinator->Pump();
-    BT_PLOT("ORG.AsyncExecution.LastRequestedSequence", static_cast<int64_t>(request.sequence));
+    if (asynchronous) coordinator->Pump();
+    BT_PLOT("ORG.Execution.LastRequestedSequence", static_cast<int64_t>(request.sequence));
+    if (!asynchronous) return;
     const auto statistics = coordinator->Statistics();
     BT_PLOT("ORG.AsyncCompile.Active", static_cast<int64_t>(statistics.active));
     BT_PLOT("ORG.AsyncCompile.Pending", static_cast<int64_t>(statistics.pending));
@@ -2216,9 +2289,9 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
     BT_PLOT("ORG.AsyncCompile.Cancelled", static_cast<int64_t>(statistics.cancelled));
     BT_PLOT("ORG.AsyncCompile.OracleComparisons", static_cast<int64_t>(statistics.oracleComparisons));
     BT_PLOT("ORG.AsyncCompile.OracleFailures", static_cast<int64_t>(statistics.oracleFailures));
-    BT_PLOT("ORG.AsyncCompile.ScheduleComparisons", static_cast<int64_t>(statistics.scheduleComparisons));
+    BT_PLOT("ORG.AsyncCompile.ScheduleValidations", static_cast<int64_t>(statistics.scheduleValidations));
     BT_PLOT("ORG.AsyncCompile.ScheduleFailures", static_cast<int64_t>(statistics.scheduleFailures));
-    BT_PLOT("ORG.AsyncCompile.StateComparisons", static_cast<int64_t>(statistics.stateComparisons));
+    BT_PLOT("ORG.AsyncCompile.StateValidations", static_cast<int64_t>(statistics.stateValidations));
     BT_PLOT("ORG.AsyncCompile.StateFailures", static_cast<int64_t>(statistics.stateFailures));
     BT_PLOT("ORG.AsyncCompile.StateFallbacks", static_cast<int64_t>(statistics.stateFallbacks));
     BT_PLOT("ORG.AsyncCompile.MembershipChanges", static_cast<int64_t>(statistics.membershipChanges));
@@ -2276,6 +2349,19 @@ std::shared_ptr<FrameContext> RenderGraph::TryAcceptFrame(
     if (!m_taskService || !m_renderGraphSettingsService) return {};
 
     m_compilerState->RetireCompletedFrames(m_queueRegistry);
+    if (m_compilerState->asyncTimelineAdmission) {
+        auto retired = m_compilerState->asyncTimelineAdmission->TakeRetiredGarbage();
+        if (!retired.empty()) {
+            if (!m_compilerState->frameWorkerScope)
+                m_compilerState->frameWorkerScope = m_taskService->CreateScope("ORG.Frame.Worker");
+            auto garbage = std::make_shared<decltype(retired)>(std::move(retired));
+            if (!m_compilerState->frameWorkerScope
+                || !m_taskService->Submit(m_compilerState->frameWorkerScope,
+                    runtime::TaskPriority::Background, "ORG.Frame.RetiredOwnership",
+                    [garbage] { BT_ZONE_SCOPE("ORG.Frame.DestroyRetiredOwnership"); }))
+                basic_telemetry::AddCounter("ORG.Frame.InlineRetiredOwnershipDestruction");
+        }
+    }
     if (m_compilerState->currentAsyncInput && m_compilerState->currentAsyncInput->frameContext
         && m_compilerState->currentAsyncInput->frameContext->Stage() == FrameStage::Retired)
         m_compilerState->currentAsyncInput.reset();
@@ -2367,7 +2453,7 @@ void RenderGraph::PrepareAndCompileFrame(rhi::Device device, uint8_t frameIndex,
     if (m_compilerState->frameProductionStopped)
         throw std::logic_error("Frame production has stopped");
     const bool asynchronousScheduling = asyncPreparationOnly;
-    if (m_taskService && m_renderGraphSettingsService) {
+    if (asynchronousScheduling && m_taskService && m_renderGraphSettingsService) {
         if (!m_compilerState->preparingFrame
             || m_compilerState->preparingFrame->Slot() != frameIndex
             || m_compilerState->preparingFrame->AsynchronousScheduling() != asynchronousScheduling)
@@ -3656,11 +3742,11 @@ void RenderGraph::PrepareAndCompileFrame(rhi::Device device, uint8_t frameIndex,
 		BT_ZONE_SCOPE("RenderGraph::CompileFrame::BuildNodes");
 		BuildNodes(*this, nodes);
 	}
-	if (asyncPreparationOnly) {
-		// Async preparation ends before dependency construction, scheduling,
-		// alias planning, transition planning, or batch construction. Those are
-		// exclusively worker-owned CompileGraph responsibilities.
-		BT_ZONE_SCOPE("RenderGraph::PrepareAsyncFrame::RealizeAndSubmit");
+	if (m_taskService && m_compilerState->preparingFrame) {
+		// The owned compiler is the single compiler for executable frames in both
+		// policies. Off compiles the request inline; Async submits the identical
+		// fresh IR to a worker. Do not also run the legacy scheduler below.
+		BT_ZONE_SCOPE("RenderGraph::PrepareFrame::RealizeAndSubmit");
 		m_activeQueueSlotsThisFrame.assign(m_queueRegistry.SlotCount(), 1u);
 		m_assignedQueueSlotsByFramePass.resize(m_framePasses.size());
 		for (auto& node : nodes) {

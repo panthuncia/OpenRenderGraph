@@ -90,7 +90,7 @@ public:
     }
 
     bool HasValidBackingResource() const;
-    BackingAllocationSnapshot CaptureBackingAllocation() override;
+    BackingAllocationSnapshot CaptureBackingAllocation(bool retain = true) override;
 
     uint64_t GetBackingGeneration() const override {
         return m_backingGeneration;

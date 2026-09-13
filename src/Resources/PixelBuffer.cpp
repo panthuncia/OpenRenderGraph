@@ -266,11 +266,11 @@ void PixelBuffer::Materialize(const MaterializeOptions* options) {
     ++m_backingGeneration;
 }
 
-BackingAllocationSnapshot PixelBuffer::CaptureBackingAllocation() {
+BackingAllocationSnapshot PixelBuffer::CaptureBackingAllocation(bool retain) {
     std::scoped_lock lock(m_materializationMutex);
     if (!m_backing || GetAttachedAPIRepresentation(BackendInstanceId::Primary).IsValid()) return {};
-    auto lease = m_backing->CaptureAllocationLease();
-    if (!lease) return {};
+    auto lease = retain ? m_backing->CaptureAllocationLease() : std::shared_ptr<const void>{};
+    if (retain && !lease) return {};
     BackingAllocationSnapshot snapshot{
         GetGlobalResourceID(), m_backingGeneration, m_backing->GetAPIResource(), std::move(lease)};
     snapshot.aliasHeap = m_backing->GetAliasHeap();

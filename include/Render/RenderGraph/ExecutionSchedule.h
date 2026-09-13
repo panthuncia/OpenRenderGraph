@@ -20,8 +20,8 @@ struct QueueBatchSchedule {
 	bool splitAfterExecution = false;   // AfterExecution signal → CL boundary
 	bool signalAfterCompletion = false; // AfterCompletion signal present
 
-	// Pre-allocated CL pairs (indexed 0..numCLs-1).
-	// Filled during the pre-allocation phase of Execute().
+	// Prepared-pool CL pairs (indexed 0..numCLs-1).
+	// Acquired as one queue batch before recording begins.
 	std::array<CommandListPair, 3> preallocatedCLs;
 
 	// External fences collected during recording (populated by RecordQueueBatch,

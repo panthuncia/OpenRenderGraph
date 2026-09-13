@@ -38,10 +38,23 @@ struct RenderGraph::Node {
 };
 
 struct RenderGraph::CompilerState {
+    // Resource-version state seed. This is realization ownership, not graph
+    // caching: every frame still builds and compiles a distinct structural IR.
+    // Stable concrete versions publish their immutable admission seed once.
+    struct RealizationSeed {
+        uint64_t backingGeneration = 0;
+        rhi::ResourceHandle resource{};
+        experimental::CompileResourceShape shape{};
+        rhi::HeapType heapType = rhi::HeapType::DeviceLocal;
+        std::shared_ptr<const std::vector<experimental::PreparedStateRegion>> regions;
+    };
+    std::unordered_map<const Resource*, RealizationSeed> realizationSeeds;
+
     struct RecordingFrameOwner {
         uint64_t sequence = 0;
         std::shared_ptr<const experimental::RenderFrameSnapshot> snapshot;
         std::shared_ptr<const experimental::PlannedFrameState> planning;
+        std::shared_ptr<const experimental::SynchronousFramePlan> synchronousPlanning;
         std::vector<std::shared_ptr<experimental::OwnedRecordingStatistics>> statistics;
         std::optional<experimental::RecordedFrame> inlineResult;
         experimental::DispatchedFrameRecording workerRecording;
@@ -65,8 +78,6 @@ struct RenderGraph::CompilerState {
     std::unique_ptr<FrameSlotPool> frameSlots;
     std::shared_ptr<FrameContext> preparingFrame;
     std::map<uint32_t, std::weak_ptr<FrameContext>> frameSlotOwners;
-    std::map<std::pair<uint32_t, uint32_t>, std::shared_ptr<CommandListPool>> frameCommandPools;
-
     void RetireCompletedFrames(QueueRegistry& queues) {
         if (!asyncTimelineAdmission) return;
         std::vector<experimental::ExecutionTimelinePoint> completed;
@@ -80,12 +91,22 @@ struct RenderGraph::CompilerState {
         asyncTimelineAdmission->RetireCompleted(completed);
     }
     std::unique_ptr<experimental::GraphCompileCoordinator> compileCoordinator;
+    // Direct fresh result for BorrowedSynchronous compilation. It never enters
+    // the async coordinator/reorder mailbox.
+    std::shared_ptr<const experimental::CompiledGraphBundle> synchronousBundle;
     std::shared_ptr<const experimental::RenderFrameSnapshot> selectedAsyncFrame;
     std::shared_ptr<const experimental::GraphCompileInput> currentAsyncInput;
     std::unique_ptr<experimental::FramePlanningState> framePlanner;
+    std::unique_ptr<experimental::SynchronousPlanningState> synchronousPlanner;
     std::shared_ptr<const experimental::PlannedFrameState> selectedPlanning;
+    std::shared_ptr<const experimental::SynchronousFramePlan> selectedSynchronousPlanning;
+    // BorrowedSynchronous submits directly; it never enters the asynchronous
+    // recording FIFO or consumes a retained frame slot.
+    std::optional<RecordingFrameOwner> synchronousRecording;
     std::deque<RecordingFrameOwner> recordingFrames;
+    std::unique_ptr<experimental::PersistentRecordingLanes> recordingLanes;
     std::shared_ptr<FrameContext> pendingPresentationFrame;
+    uint64_t pendingPresentationSequence = 0;
     std::shared_ptr<runtime::ITaskScope> frameWorkerScope;
     std::shared_ptr<runtime::ITaskScope> preparationWorkerScope;
     std::future<void> preparationWorker;

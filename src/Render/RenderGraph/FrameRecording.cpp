@@ -3,6 +3,49 @@
 
 namespace org::experimental {
 
+PersistentRecordingLanes::PersistentRecordingLanes(size_t laneCount) {
+    if (!laneCount) throw std::invalid_argument("Recording lane count must be nonzero");
+    m_threads.reserve(laneCount);
+    for (size_t lane = 0; lane < laneCount; ++lane)
+        m_threads.emplace_back([this] { Run(); });
+}
+
+PersistentRecordingLanes::~PersistentRecordingLanes() {
+    {
+        std::lock_guard lock(m_mutex);
+        m_stopping = true;
+    }
+    m_ready.notify_all();
+    for (auto& thread : m_threads) if (thread.joinable()) thread.join();
+}
+
+void PersistentRecordingLanes::Submit(std::function<void()> work) {
+    if (!work) throw std::invalid_argument("Empty recording-lane work");
+    {
+        std::lock_guard lock(m_mutex);
+        if (m_stopping) throw std::runtime_error("Recording lanes are stopping");
+        m_work.push_back(std::move(work));
+    }
+    m_ready.notify_one();
+}
+
+void PersistentRecordingLanes::Run() {
+    while (true) {
+        std::function<void()> work;
+        {
+            std::unique_lock lock(m_mutex);
+            m_ready.wait(lock, [this] { return m_stopping || !m_work.empty(); });
+            if (m_work.empty()) {
+                if (m_stopping) return;
+                continue;
+            }
+            work = std::move(m_work.front());
+            m_work.pop_front();
+        }
+        work();
+    }
+}
+
 struct DispatchedFrameRecording::State {
     State(RecordedFrame&& recorded, std::vector<FrameRecordingJob>&& recordingJobs,
         std::vector<PreparedTimelineBinding>&& timelineBindings,
@@ -14,32 +57,35 @@ struct DispatchedFrameRecording::State {
     std::vector<FrameRecordingJob> jobs;
     std::vector<PreparedTimelineBinding> timelines;
     std::shared_ptr<FrameContext> frame;
-    std::vector<std::future<void>> workers;
     std::atomic_size_t nextBatch{0};
+    std::atomic_size_t completedWorkers{0};
+    size_t workerCount = 0;
+    std::mutex completionMutex;
+    std::condition_variable completion;
+    std::mutex failureMutex;
+    std::exception_ptr failure;
     bool joined = false;
 };
 
 bool DispatchedFrameRecording::Ready() const {
-    if (!m_state || m_state->workers.empty() || m_state->joined) return false;
-    return std::ranges::all_of(m_state->workers, [](std::future<void>& worker) {
-        return worker.valid()
-            && worker.wait_for(std::chrono::seconds{0}) == std::future_status::ready;
-    });
+    return m_state && !m_state->joined && m_state->workerCount
+        && m_state->completedWorkers.load(std::memory_order_acquire) == m_state->workerCount;
 }
 
 RecordedFrame DispatchedFrameRecording::Join() {
     if (!m_state || m_state->joined) throw std::logic_error("Dispatched recording already consumed");
     auto state = std::exchange(m_state, {});
     state->joined = true;
-    std::exception_ptr failure;
-    for (auto& worker : state->workers) {
-        try { worker.get(); }
-        catch (...) { if (!failure) failure = std::current_exception(); }
+    {
+        std::unique_lock lock(state->completionMutex);
+        state->completion.wait(lock, [&] {
+            return state->completedWorkers.load(std::memory_order_acquire) == state->workerCount;
+        });
     }
-    if (failure) {
+    if (state->failure) {
         if (state->frame) state->frame->CancelAfterJoin();
         basic_telemetry::AddCounter("ORG.Frame.RecordingFailures");
-        std::rethrow_exception(failure);
+        std::rethrow_exception(state->failure);
     }
     if (state->frame)
         state->frame->Advance(FrameStage::Recording, FrameStage::Ready);
@@ -47,13 +93,10 @@ RecordedFrame DispatchedFrameRecording::Join() {
 }
 
 DispatchedFrameRecording DispatchFrameRecording(PlannedFrame plan,
-    const std::shared_ptr<runtime::ITaskService>& tasks,
-    std::shared_ptr<runtime::ITaskScope>& scope, size_t concurrency) {
-    if (!tasks || !plan.snapshot || !plan.snapshot->layout || !plan.snapshot->layout->bundle
+    PersistentRecordingLanes& lanes, size_t concurrency) {
+    if (!plan.snapshot || !plan.snapshot->layout || !plan.snapshot->layout->bundle
         || plan.jobs.empty() || !concurrency)
         throw std::invalid_argument("Incomplete dispatched frame recording");
-    if (!scope) scope = tasks->CreateScope("ORG.Frame.Recording");
-    if (!scope) throw std::runtime_error("Frame recording scope rejected");
 
     auto frame = plan.snapshot->layout->bundle->input->frameContext;
     AnnotateFrameTrace(frame);
@@ -66,37 +109,32 @@ DispatchedFrameRecording DispatchFrameRecording(PlannedFrame plan,
 
     auto state = std::make_shared<DispatchedFrameRecording::State>(
         std::move(recorded), std::move(plan.jobs), std::move(plan.timelines), frame);
-    const auto workerCount = (std::min)(concurrency, state->jobs.size());
-    state->workers.reserve(workerCount);
-    for (size_t workerIndex = 0; workerIndex < workerCount; ++workerIndex) {
-        std::weak_ptr<DispatchedFrameRecording::State> weakState = state;
-        auto worker = std::make_shared<std::packaged_task<void()>>([weakState] {
-            auto state = weakState.lock();
-            if (!state) throw std::runtime_error("Frame recording owner was cancelled");
+    state->workerCount = (std::min)({concurrency, state->jobs.size(), lanes.LaneCount()});
+    for (size_t workerIndex = 0; workerIndex < state->workerCount; ++workerIndex) {
+        lanes.Submit([state] {
             BT_ZONE_SCOPE("ORG.Frame.RecordWorker");
-            while (true) {
-                const auto batch = state->nextBatch.fetch_add(1, std::memory_order_relaxed);
-                if (batch >= state->jobs.size()) return;
-                BT_ZONE_SCOPE("ORG.Frame.RecordBatch");
-                AnnotateFrameTrace(state->frame);
-                auto& job = state->jobs[batch];
-                if (!job.pool) throw std::invalid_argument("Frame recording has no slot command pool");
-                job.recording.allocation->pair = job.pool->Request();
-                job.recording.allocation->pool = job.pool;
-                std::vector<OwnedRecordingList> recordings;
-                recordings.push_back(std::move(job.recording));
-                state->result.m_batches[batch] = RecordPreparedRhiExecutionBatch(
-                    job.slot, job.queue, std::move(recordings), state->timelines,
-                    state->result.m_snapshot);
+            try {
+                while (true) {
+                    const auto batch = state->nextBatch.fetch_add(1, std::memory_order_relaxed);
+                    if (batch >= state->jobs.size()) break;
+                    BT_ZONE_SCOPE("ORG.Frame.RecordBatch");
+                    AnnotateFrameTrace(state->frame);
+                    auto& job = state->jobs[batch];
+                    if (!job.pool || !job.recording.allocation->pair.list)
+                        throw std::invalid_argument("Frame recording has no prepared command list");
+                    std::vector<OwnedRecordingList> recordings;
+                    recordings.push_back(std::move(job.recording));
+                    state->result.m_batches[batch] = RecordPreparedRhiExecutionBatch(
+                        job.slot, job.queue, std::move(recordings), state->timelines,
+                        state->result.m_snapshot);
+                }
+            } catch (...) {
+                std::lock_guard lock(state->failureMutex);
+                if (!state->failure) state->failure = std::current_exception();
             }
+            if (state->completedWorkers.fetch_add(1, std::memory_order_release) + 1 == state->workerCount)
+                state->completion.notify_all();
         });
-        state->workers.push_back(worker->get_future());
-        if (!tasks->Submit(scope, runtime::TaskPriority::FrameCritical,
-                "ORG.Frame.RecordWorker", [worker] { (*worker)(); })) {
-            worker.reset();
-            break;
-        }
-        worker.reset();
     }
     DispatchedFrameRecording dispatch;
     dispatch.m_state = std::move(state);
@@ -123,9 +161,8 @@ RecordedFrame RecordFrame(PlannedFrame plan,
             AnnotateFrameTrace(frame);
             auto& job = plan.jobs[batch];
             auto& recording = job.recording;
-            if (!job.pool) throw std::invalid_argument("Frame recording has no slot command pool");
-            recording.allocation->pair = job.pool->Request();
-            recording.allocation->pool = job.pool;
+            if (!job.pool || !recording.allocation->pair.list)
+                throw std::invalid_argument("Frame recording has no prepared command list");
             std::vector<OwnedRecordingList> recordings;
             recordings.push_back(std::move(recording));
             result.m_batches[batch] = RecordPreparedRhiExecutionBatch(job.slot, job.queue,
@@ -159,7 +196,12 @@ std::shared_ptr<const GraphExecutionTimeline> RecordedFrame::Submit(ExecutionTim
     // Set before touching the API: even an uncertain submission is single-use.
     m_submitted = true;
     AnnotateFrameTrace(m_snapshot->layout->bundle->input->frameContext);
-    return admission.SubmitPrepared(m_snapshot->layout->bundle, incoming, m_batches);
+    std::vector<ExecutionTimelinePoint> reserved;
+    if (m_planning) {
+        reserved.reserve(m_planning->signals.size());
+        for (const auto& signal : m_planning->signals) reserved.push_back(signal->symbolic);
+    }
+    return admission.SubmitPrepared(m_snapshot->layout->bundle, incoming, m_batches, reserved);
 }
 
 } // namespace org::experimental

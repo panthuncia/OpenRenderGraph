@@ -37,8 +37,8 @@ int TestQueue(rhi::Device device) {
     sourceAllocation.resource.Unmap(0, 256);
     auto bindings = std::make_shared<org::FrozenExecutionBindings>(
         std::vector<org::FrozenExecutionBindings::ResourceBinding>{{sourceAllocation.resource, sourceAllocation.lease}});
-    auto slots = std::make_shared<std::unordered_map<uint64_t, uint32_t>>();
-    slots->emplace(source->GetGlobalResourceID(), 0);
+    auto slots = std::make_shared<org::FramePreparationContext::ResourceSlots>();
+    slots->emplace_back(source->GetGlobalResourceID(), 0);
     org::FramePreparationContext preparation{};
     preparation.device = device; preparation.bindings = bindings; preparation.resourceSlots = slots;
     org::PreparedPass cancelled, submitted;

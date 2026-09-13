@@ -56,10 +56,10 @@ uint64_t ExternalBackingResource::GetBackingGeneration() const {
 void ExternalBackingResource::EnsureVirtualDescriptorSlotsAllocated() {
 }
 
-BackingAllocationSnapshot ExternalBackingResource::CaptureBackingAllocation() {
+BackingAllocationSnapshot ExternalBackingResource::CaptureBackingAllocation(bool retain) {
     if (!IsMaterialized() || GetAttachedAPIRepresentation(BackendInstanceId::Primary).IsValid()) return {};
-    auto lease = m_impl->backing->CaptureAllocationLease();
-    if (!lease) return {};
+    auto lease = retain ? m_impl->backing->CaptureAllocationLease() : std::shared_ptr<const void>{};
+    if (retain && !lease) return {};
     return {GetGlobalResourceID(), GetBackingGeneration(), GetAPIResource(), std::move(lease), m_impl->backing->GetSize()};
 }
 

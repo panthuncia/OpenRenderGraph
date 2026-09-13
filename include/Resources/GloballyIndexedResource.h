@@ -57,6 +57,7 @@ public:
 		std::shared_ptr<DescriptorHeap> heap,
 		std::vector<std::vector<ShaderVisibleIndexInfo>> const & infos
 	) {
+		InvalidateDescriptorCapture();
 		if (type == SRVViewType::Buffer) {
 			m_primaryViewType = SRVViewType::Buffer;
 		}
@@ -65,6 +66,7 @@ public:
 	}
 
 	void SetUAVGPUDescriptors(std::shared_ptr<DescriptorHeap> pUAVHeap, const std::vector<std::vector<ShaderVisibleIndexInfo>>& uavInfos, size_t counterOffset = 0) {
+		InvalidateDescriptorCapture();
 		m_pUAVShaderVisibleHeap = pUAVHeap;
 		m_UAVShaderVisibleInfos = uavInfos;
 		m_counterOffset = counterOffset;
@@ -75,26 +77,31 @@ public:
 		std::shared_ptr<DescriptorHeap> heap,
 		std::vector<std::vector<ShaderVisibleIndexInfo>> const& infos
 	) {
+		InvalidateDescriptorCapture();
 		m_UAVViews[static_cast<unsigned int>(type)] = { heap, infos };
 		m_pUAVShaderVisibleHeap = heap;
 	}
 
 	void SetUAVCPUDescriptors(std::shared_ptr<DescriptorHeap> pUAVHeap, const std::vector<std::vector<NonShaderVisibleIndexInfo>>& uavInfos) {
+		InvalidateDescriptorCapture();
 		m_pUAVNonShaderVisibleHeap = pUAVHeap;
 		m_UAVNonShaderVisibleInfos = uavInfos;
 	}
 
 	void SetCBVDescriptor(std::shared_ptr<DescriptorHeap> pCBVHeap, const ShaderVisibleIndexInfo& cbvInfo) {
+		InvalidateDescriptorCapture();
 		m_pCBVHeap = pCBVHeap;
 		m_CBVInfo = cbvInfo;
 	}
 
 	void SetRTVDescriptors(std::shared_ptr<DescriptorHeap> pRTVHeap, const std::vector<std::vector<NonShaderVisibleIndexInfo>>& rtvInfos) {
+		InvalidateDescriptorCapture();
 		m_pRTVHeap = pRTVHeap;
 		m_RTVInfos = rtvInfos;
 	}
 
 	void SetDSVDescriptors(std::shared_ptr<DescriptorHeap> pDSVHeap, const std::vector<std::vector<NonShaderVisibleIndexInfo>>& dsvInfos) {
+		InvalidateDescriptorCapture();
 		m_pDSVHeap = pDSVHeap;
 		m_DSVInfos = dsvInfos;
 	}
@@ -157,6 +164,7 @@ public:
 			spdlog::error("Invalid SRV view type specified.");
 			return;
 		}
+		InvalidateDescriptorCapture();
 		m_primaryViewType = type;
 	}
 
@@ -188,6 +196,7 @@ public:
     // Captured by the preparation owner alongside the exact allocation. This
     // copies ownership, not descriptor contents, and never consults GPU fences.
     std::shared_ptr<const void> CaptureDescriptorOwnership() const {
+        if (m_descriptorCaptureValid) return m_capturedDescriptorOwnership;
         auto leases = std::make_shared<std::vector<std::shared_ptr<const void>>>();
         auto captureGrid = [&](const std::shared_ptr<DescriptorHeap>& heap, const auto& grid) {
             if (!heap) return;
@@ -204,9 +213,12 @@ public:
         captureGrid(m_pDSVHeap, m_DSVInfos);
         if (m_pCBVHeap && m_CBVInfo.slot.heap.valid())
             leases->push_back(m_pCBVHeap->CaptureDescriptorLease(m_CBVInfo.slot.index));
-        return leases->empty() ? std::shared_ptr<const void>{} : leases;
+        m_capturedDescriptorOwnership = leases->empty() ? std::shared_ptr<const void>{} : leases;
+        m_descriptorCaptureValid = true;
+        return m_capturedDescriptorOwnership;
     }
     std::shared_ptr<const BindlessResourceViews> CaptureBindlessViews() const {
+        if (m_bindlessCaptureValid) return m_capturedBindlessViews;
         auto result = std::make_shared<BindlessResourceViews>();
         TryGetRHIResourceDesc(result->description);
         result->hasClear = TryGetPublishedClearValue(result->clear);
@@ -227,7 +239,9 @@ public:
         append(BindlessViewKind::DepthStencil, UINT32_MAX, m_DSVInfos);
         if (m_CBVInfo.slot.heap.valid())
             result->views.push_back({BindlessViewKind::ConstantBuffer, UINT32_MAX, 0, 0, m_CBVInfo.slot});
-        return result->views.empty() ? std::shared_ptr<const BindlessResourceViews>{} : result;
+        m_capturedBindlessViews = result->views.empty() ? std::shared_ptr<const BindlessResourceViews>{} : result;
+        m_bindlessCaptureValid = true;
+        return m_capturedBindlessViews;
     }
     // Begin publication of descriptors for a different concrete allocation.
     // Future readers will receive fresh physical indices; prior frames keep
@@ -240,6 +254,7 @@ protected:
 	virtual void OnSetName() override {}
 
 	std::vector<std::pair<std::shared_ptr<DescriptorHeap>, UINT>> DetachDescriptorSlotsForDeferredRelease() {
+		InvalidateDescriptorCapture();
 		std::vector<std::pair<std::shared_ptr<DescriptorHeap>, UINT>> slots;
 
 		auto collectShaderVisibleGrid = [&slots](const std::shared_ptr<DescriptorHeap>& heap, auto& infos) {
@@ -319,6 +334,12 @@ protected:
 		}
 	}
 private:
+	void InvalidateDescriptorCapture() noexcept {
+		m_descriptorCaptureValid = false;
+		m_bindlessCaptureValid = false;
+		m_capturedDescriptorOwnership.reset();
+		m_capturedBindlessViews.reset();
+	}
 	struct SRVView {
 		std::shared_ptr<DescriptorHeap> heap = nullptr;
 		std::vector<std::vector<ShaderVisibleIndexInfo>> infos;
@@ -343,6 +364,10 @@ private:
 	size_t m_counterOffset = 0;
 
 	SRVViewType m_primaryViewType = SRVViewType::Invalid;
+	mutable bool m_descriptorCaptureValid = false;
+	mutable bool m_bindlessCaptureValid = false;
+	mutable std::shared_ptr<const void> m_capturedDescriptorOwnership;
+	mutable std::shared_ptr<const BindlessResourceViews> m_capturedBindlessViews;
 
 	const std::vector<std::vector<ShaderVisibleIndexInfo>>& GetDefaultSRVInfo() const {
 		if (m_primaryViewType == SRVViewType::Invalid) {

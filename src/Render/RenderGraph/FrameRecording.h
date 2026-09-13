@@ -3,7 +3,10 @@
 #include "Render/RenderGraph/ExperimentalRhiExecution.h"
 #include "Render/Runtime/ITaskService.h"
 #include "FramePlanning.h"
-#include <future>
+#include <condition_variable>
+#include <functional>
+#include <mutex>
+#include <thread>
 
 namespace org::experimental {
 
@@ -38,6 +41,25 @@ struct PlannedFrame {
 
 class DispatchedFrameRecording;
 
+// Long-lived recording workers. Per-frame dispatch only enqueues small work
+// closures; it does not create tasks, futures, scopes, or threads.
+class PersistentRecordingLanes {
+public:
+    explicit PersistentRecordingLanes(size_t laneCount);
+    ~PersistentRecordingLanes();
+    PersistentRecordingLanes(const PersistentRecordingLanes&) = delete;
+    PersistentRecordingLanes& operator=(const PersistentRecordingLanes&) = delete;
+    void Submit(std::function<void()> work);
+    size_t LaneCount() const noexcept { return m_threads.size(); }
+private:
+    void Run();
+    std::mutex m_mutex;
+    std::condition_variable m_ready;
+    std::deque<std::function<void()>> m_work;
+    std::vector<std::thread> m_threads;
+    bool m_stopping = false;
+};
+
 class RecordedFrame {
 public:
     RecordedFrame(RecordedFrame&&) = default;
@@ -49,8 +71,7 @@ private:
     friend RecordedFrame RecordFrame(PlannedFrame, const std::shared_ptr<runtime::ITaskService>&, size_t);
     friend class DispatchedFrameRecording;
     friend DispatchedFrameRecording DispatchFrameRecording(PlannedFrame,
-        const std::shared_ptr<runtime::ITaskService>&,
-        std::shared_ptr<runtime::ITaskScope>&, size_t);
+        PersistentRecordingLanes&, size_t);
     RecordedFrame() = default;
     std::shared_ptr<const RenderFrameSnapshot> m_snapshot;
     std::vector<std::vector<ExecutionTimelinePoint>> m_incomingWaits;
@@ -75,8 +96,7 @@ public:
     RecordedFrame Join();
 private:
     friend DispatchedFrameRecording DispatchFrameRecording(PlannedFrame,
-        const std::shared_ptr<runtime::ITaskService>&,
-        std::shared_ptr<runtime::ITaskScope>&, size_t);
+        PersistentRecordingLanes&, size_t);
     struct State;
     std::shared_ptr<State> m_state;
 };
@@ -84,7 +104,6 @@ private:
 RecordedFrame RecordFrame(PlannedFrame plan,
     const std::shared_ptr<runtime::ITaskService>& tasks, size_t concurrency);
 DispatchedFrameRecording DispatchFrameRecording(PlannedFrame plan,
-    const std::shared_ptr<runtime::ITaskService>& tasks,
-    std::shared_ptr<runtime::ITaskScope>& scope, size_t concurrency);
+    PersistentRecordingLanes& lanes, size_t concurrency);
 
 } // namespace org::experimental

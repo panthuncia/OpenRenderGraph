@@ -141,11 +141,14 @@ private:
 
 class PreparedDependencyCollector {
 public:
+    explicit PreparedDependencyCollector(bool borrowed = false) : m_borrowed(borrowed) {}
     PreparedProgramReference Capture(std::shared_ptr<const PipelineStatePayload> owner) {
         if (!owner || !owner->pso) throw std::invalid_argument("Pipeline has no immutable payload");
         const auto slot = static_cast<uint32_t>(m_programs.size());
         const auto layout = owner->layout;
-        m_programs.push_back({owner->pso.Get().GetHandle(), std::move(owner), layout});
+        auto retained = m_borrowed ? std::shared_ptr<const void>{}
+                                   : std::shared_ptr<const void>{owner};
+        m_programs.push_back({owner->pso.Get().GetHandle(), std::move(retained), layout});
         return {slot};
     }
     PreparedProgramReference Capture(const PipelineState& pipeline,
@@ -155,7 +158,9 @@ public:
     PreparedProgramReference Capture(std::shared_ptr<const rhi::PipelinePtr> owner) {
         if (!owner || !*owner) throw std::invalid_argument("Cannot capture an empty pipeline");
         const auto slot = static_cast<uint32_t>(m_programs.size());
-        m_programs.push_back({owner->Get().GetHandle(), std::move(owner)});
+        auto retained = m_borrowed ? std::shared_ptr<const void>{}
+                                   : std::shared_ptr<const void>{owner};
+        m_programs.push_back({owner->Get().GetHandle(), std::move(retained)});
         return {slot};
     }
     PreparedWorkGraphReference CaptureWorkGraph(
@@ -181,7 +186,7 @@ public:
     }
     PreparedDescriptorReference CaptureDescriptor(rhi::DescriptorSlot descriptor,
         std::shared_ptr<const void> owner) {
-        if (!descriptor.heap.valid() || !owner)
+        if (!descriptor.heap.valid() || (!m_borrowed && !owner))
             throw std::invalid_argument("Cannot capture an unowned descriptor");
         const auto slot = static_cast<uint32_t>(m_descriptors.size());
         m_descriptors.push_back({descriptor, std::move(owner)});
@@ -195,6 +200,7 @@ public:
             std::move(m_owners), std::move(m_effects));
     }
 private:
+    bool m_borrowed = false;
     std::vector<CapturedPipeline> m_programs;
     std::vector<std::shared_ptr<const rhi::WorkGraphPtr>> m_workGraphs;
     std::vector<PreparedDependencySnapshot::DescriptorBinding> m_descriptors;
@@ -206,24 +212,30 @@ private:
 // concrete version owners, not shared pointers to mutable resource wrappers.
 class FrozenExecutionBindings {
 public:
+    enum class OwnershipPolicy : uint8_t { Owned, Borrowed };
     struct ResourceBinding {
         rhi::Resource resource;
         std::shared_ptr<const void> owner;
         std::shared_ptr<const BindlessResourceViews> views;
+        std::shared_ptr<const void> descriptorOwner;
     };
     struct DescriptorBinding { rhi::DescriptorSlot descriptor; std::shared_ptr<const void> owner; };
     FrozenExecutionBindings(std::vector<ResourceBinding> resources,
-        std::vector<DescriptorBinding> descriptors = {})
+        std::vector<DescriptorBinding> descriptors = {},
+        OwnershipPolicy policy = OwnershipPolicy::Owned)
         : m_resources(std::move(resources)), m_descriptors(std::move(descriptors)) {
         for (const auto& binding : m_resources)
-            if (!binding.resource.GetHandle().valid() || !binding.owner)
+            if (!binding.resource.GetHandle().valid()
+                || (policy == OwnershipPolicy::Owned && !binding.owner))
                 throw std::invalid_argument("Unowned recording resource");
         for (const auto& binding : m_descriptors)
-            if (!binding.owner) throw std::invalid_argument("Unowned recording descriptor");
+            if (policy == OwnershipPolicy::Owned && !binding.owner)
+                throw std::invalid_argument("Unowned recording descriptor");
     }
     rhi::Resource Resolve(PreparedResourceReference ref) const { return m_resources.at(ref.slot).resource; }
     std::shared_ptr<const void> Owner(PreparedResourceReference ref) const {
-        return m_resources.at(ref.slot).owner;
+        const auto& binding = m_resources.at(ref.slot);
+        return binding.descriptorOwner ? binding.descriptorOwner : binding.owner;
     }
     const BindlessResourceViews& Views(PreparedResourceReference ref) const {
         const auto& views = m_resources.at(ref.slot).views;
@@ -261,10 +273,14 @@ struct FramePreparationContext {
     // Authors receive compact slot references; PreparedPass owns the captured
     // immutable program generations until terminal lifecycle state.
     std::shared_ptr<PreparedDependencyCollector> dependencyCollector;
+    // BorrowedSynchronous records before the live dependency publishers may
+    // rotate, so handles are captured without retaining their version owners.
+    bool borrowedDependencies = false;
     // Per-pass permission map assembled from that pass's declarations. This
     // lets preparation capture a stable binding slot without retaining a
     // Resource wrapper or knowing anything about graph indices.
-    std::shared_ptr<const std::unordered_map<uint64_t, uint32_t>> resourceSlots;
+    using ResourceSlots = std::vector<std::pair<uint64_t, uint32_t>>;
+    std::shared_ptr<const ResourceSlots> resourceSlots;
     // Installed by TypedRenderGraphPass for the duration of Prepare. This
     // hides the legacy registry-view descriptor helper from pass authors and
     // keeps descriptor indices coherent with the captured pipeline payload.
@@ -340,7 +356,8 @@ struct FramePreparationContext {
 
     PreparedResourceReference CaptureResource(uint64_t globalResourceID) const {
         if (!resourceSlots) throw std::logic_error("Resource capture is unavailable outside owned preparation");
-        const auto found = resourceSlots->find(globalResourceID);
+        const auto found = std::find_if(resourceSlots->begin(), resourceSlots->end(),
+            [globalResourceID](const auto& entry) { return entry.first == globalResourceID; });
         if (found == resourceSlots->end()) {
             std::string message = "Pass attempted to capture undeclared resource "
                 + std::to_string(globalResourceID) + "; declared IDs:";
@@ -360,10 +377,10 @@ struct FramePreparationContext {
 
     PreparedResourceReference CaptureResource(ResourceBindingToken binding) const {
         if (resourceSlots) {
-            if (const auto found = resourceSlots->find(binding.registryResourceID);
-                found != resourceSlots->end()) return {found->second};
-            if (const auto found = resourceSlots->find(binding.globalResourceID);
-                found != resourceSlots->end()) return {found->second};
+            for (const auto& [id, slot] : *resourceSlots)
+                if (id == binding.registryResourceID) return {slot};
+            for (const auto& [id, slot] : *resourceSlots)
+                if (id == binding.globalResourceID) return {slot};
         }
         return CaptureResource(binding.registryResourceID);
     }
@@ -462,9 +479,11 @@ public:
     rhi::Resource Resolve(ResourceBindingToken token) const {
         if (!m_declaredResourceSlots)
             throw std::logic_error("Declaration tokens require a declared recording scope");
-        auto found = m_declaredResourceSlots->find(token.globalResourceID);
+        auto found = std::find_if(m_declaredResourceSlots->begin(), m_declaredResourceSlots->end(),
+            [token](const auto& entry) { return entry.first == token.globalResourceID; });
         if (found == m_declaredResourceSlots->end())
-            found = m_declaredResourceSlots->find(token.registryResourceID);
+            found = std::find_if(m_declaredResourceSlots->begin(), m_declaredResourceSlots->end(),
+                [token](const auto& entry) { return entry.first == token.registryResourceID; });
         if (found == m_declaredResourceSlots->end())
             throw std::invalid_argument("Recording attempted to resolve an undeclared resource");
         return m_bindings->Resolve(PreparedResourceReference{found->second});
@@ -474,7 +493,7 @@ public:
     // declaration tokens never consult the current graph or a resource wrapper.
     RecordingContext WithDeclaredResources(
         std::shared_ptr<const FrozenExecutionBindings> bindings,
-        std::shared_ptr<const std::unordered_map<uint64_t, uint32_t>> slots) const {
+        std::shared_ptr<const FramePreparationContext::ResourceSlots> slots) const {
         if (!bindings || !slots) throw std::invalid_argument("Incomplete declared recording scope");
         auto result = *this;
         result.m_bindings = std::move(bindings);
@@ -516,7 +535,7 @@ private:
     std::shared_ptr<const FrozenExecutionBindings> m_bindings;
     std::shared_ptr<const std::vector<ExternalDescriptorBindingValue>> m_externalBindings;
     std::shared_ptr<const PreparedDependencySnapshot> m_dependencies;
-    std::shared_ptr<const std::unordered_map<uint64_t, uint32_t>> m_declaredResourceSlots;
+    std::shared_ptr<const FramePreparationContext::ResourceSlots> m_declaredResourceSlots;
 };
 
 // One owned packet per submitted frame. Copies share the single-consumption

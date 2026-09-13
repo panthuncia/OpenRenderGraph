@@ -23,7 +23,7 @@ struct PreparedBackingState {
     std::string graphResourceKey;
     rhi::ResourceHandle resource{};
     CompileResourceShape shape{};
-    std::vector<PreparedStateRegion> regions;
+    std::shared_ptr<const std::vector<PreparedStateRegion>> regions;
     std::shared_ptr<const AliasHeapGeneration> aliasHeap;
     const AliasHeapGeneration* aliasHeapIdentity = nullptr;
     uint64_t aliasPoolID = 0;
@@ -112,7 +112,8 @@ private:
 class AliasAccessAdmissionLedger {
 public:
     std::vector<rhi::ResourceHandle> ApplyInitialStates(
-        const CompiledGraph& graph, std::vector<PreparedBackingState>& resources) const;
+        const CompiledGraph& graph,
+        std::span<const PreparedBackingState> resources) const;
     void AppendIncomingWaits(const CompiledGraph& graph,
         std::span<const PreparedBackingState> resources,
         std::span<const ExecutionTimelinePoint> queues,

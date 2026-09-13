@@ -82,6 +82,7 @@ public:
 	const rhi::Timeline& GetFence(QueueSlotIndex i) const noexcept { return m_slots[ToUnderlying(i)].fence.Get(); }
 	rhi::TimelinePtr& GetFencePtr(QueueSlotIndex i)     noexcept { return m_slots[ToUnderlying(i)].fence; }
 	CommandListPool* GetPool(QueueSlotIndex i)    const noexcept { return m_slots[ToUnderlying(i)].pool.get(); }
+	std::shared_ptr<CommandListPool> GetSharedPool(QueueSlotIndex i) const noexcept { return m_slots[ToUnderlying(i)].pool; }
 	rhi::Timeline& GetFenceForConsumer(QueueSlotIndex source, QueueSlotIndex consumer) noexcept {
 		auto& entry = m_slots[ToUnderlying(source)];
 		// Slots on the same device instance always consume the source's local
@@ -134,7 +135,7 @@ private:
 		rhi::Device device{};
 		rhi::TimelinePtr fence;
 		rhi::TimelinePtr peerFence;
-		std::unique_ptr<CommandListPool> pool;
+		std::shared_ptr<CommandListPool> pool;
 		QueueAutoAssignmentPolicy autoAssignmentPolicy = QueueAutoAssignmentPolicy::AllowAutomaticScheduling;
 		bool ownsQueue = false;
 		std::string logicalName;

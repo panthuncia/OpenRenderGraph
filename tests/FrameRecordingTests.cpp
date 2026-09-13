@@ -78,7 +78,9 @@ Work MakeWork(FramePlanningState& planner, org::FrameSlotPool& slots, uint64_t s
     auto graph = CompileGraph(owned,workspace,cancelled);
     auto bundle = std::make_shared<const CompiledGraphBundle>(CompiledGraphBundle{sequence,graph,owned});
     PreparedBackingState backing; backing.graphResourceID = 1; backing.resource = {1,1};
-    backing.shape = {1,1,false}; backing.regions = {{{},common}};
+    backing.shape = {1,1,false};
+    backing.regions = std::make_shared<const std::vector<PreparedStateRegion>>(
+        std::initializer_list<PreparedStateRegion>{{{},common}});
     auto bindings = std::make_shared<const org::FrozenExecutionBindings>(std::vector<org::FrozenExecutionBindings::ResourceBinding>{});
     auto packet = org::PreparedPass::Make(ProbeData{probe,slot},RecordProbe);
     auto payload = BuildPreparedFramePayload(sequence,{packet},bindings,{backing},{},{runtime},slot);
@@ -93,6 +95,8 @@ Work MakeWork(FramePlanningState& planner, org::FrameSlotPool& slots, uint64_t s
     auto device = runtime->device.Get();
     FrameRecordingJob job; job.device = device; job.queue = device.GetQueue(rhi::QueueKind::Graphics);
     job.pool = std::make_shared<org::CommandListPool>(device,rhi::QueueKind::Graphics);
+    job.recording.allocation->pair = job.pool->Request();
+    job.recording.allocation->pool = job.pool;
     job.recording.bindings = bindings; job.recording.passes = {packet};
     PlannedFrame plan; plan.snapshot = state->snapshot; plan.planning = state;
     plan.timelines = {{1,runtime->timeline.Get().GetHandle()}}; plan.incomingWaits.resize(1);
@@ -109,13 +113,14 @@ int TestDelayedFrameRecording(const rhi::DeviceCreateInfo& create) {
     ExecutionTimelineAdmission admission({{1,0}},2);
     auto tasks = std::make_shared<RecordingTasks>();
     std::shared_ptr<org::runtime::ITaskScope> recordingScope;
+    PersistentRecordingLanes recordingLanes(2);
     for (unsigned failureRun = 0; failureRun != 2; ++failureRun) {
         auto probe = std::make_shared<RecordingProbe>(); probe->failFirst = failureRun != 0;
         auto entered0 = probe->entered[0].get_future(), entered1 = probe->entered[1].get_future();
         auto first = MakeWork(planner,slots,1 + failureRun * 2,0,runtime,probe);
         auto second = MakeWork(planner,slots,2 + failureRun * 2,1,runtime,probe);
-        auto worker0 = DispatchFrameRecording(std::move(first.recording),tasks,recordingScope,1);
-        auto worker1 = DispatchFrameRecording(std::move(second.recording),tasks,recordingScope,1);
+        auto worker0 = DispatchFrameRecording(std::move(first.recording), recordingLanes, 1);
+        auto worker1 = DispatchFrameRecording(std::move(second.recording), recordingLanes, 1);
         CHECK(entered0.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
         CHECK(entered1.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
         CHECK(probe->peak == 2 && !probe->recordedOnHost);

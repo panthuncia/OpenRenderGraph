@@ -25,7 +25,7 @@ namespace org::experimental {
 enum class CompiledGraphStage : uint8_t { Dependencies, SymbolicSchedule };
 
 // Numeric, owned metadata only. Unlike the legacy ResourceState comparison,
-// synchronization scopes participate in equality and structural cache keys.
+// synchronization scopes are part of the fresh frame-owned compiler input.
 struct CompileResourceShape {
     // {0,0,false} is a dependency-only identity, with no stateful resource.
     // A state declaration referencing it is unsupported, never treated as 1x1.
@@ -104,6 +104,11 @@ public:
 };
 
 struct GraphCompileInput {
+    enum class ExecutionPolicy : uint8_t {
+        BorrowedSynchronous,
+        OwnedAsynchronous,
+    };
+    ExecutionPolicy executionPolicy = ExecutionPolicy::BorrowedSynchronous;
     std::shared_ptr<FrameContext> frameContext;
     GraphCompileStructure structure;
     // Realization identity, ordered with structure.resourceIDs. It is excluded
@@ -175,6 +180,31 @@ struct CompiledGraph {
     std::vector<uint32_t> topologicalOrder;
     std::vector<uint32_t> criticality;
     std::vector<SymbolicBatch> batches;
+    // Dense execution placement produced once by the compiler. Admission must
+    // not rebuild these graph-structural lookup tables for every frame.
+    std::vector<uint32_t> batchByPass;
+    std::vector<uint32_t> positionByPass;
+    struct BarrierCapacity {
+        uint32_t beforeTextures = 0;
+        uint32_t beforeBuffers = 0;
+        uint32_t afterTextures = 0;
+    };
+    // Upper bounds indexed by compiler pass. They are exact for textures and
+    // conservative for buffers whose heap/state policy is admission-bound.
+    std::vector<BarrierCapacity> barrierCapacityByPass;
+    std::vector<uint32_t> stateDeltaCapacityByBatch;
+    std::vector<uint32_t> stateSeedCapacityByBatch;
+    // Dense access stream in execution order. Admission consumes this directly
+    // and never walks pass declarations to rediscover resource boundaries.
+    std::vector<std::vector<CompileStateUse>> boundaryAccessesByBatch;
+    // Minimal entry hazard stream: first access per subresource, plus its first
+    // write when the first access was a read. This preserves RAW/WAR/WAW while
+    // avoiding a full intra-frame access walk during admission.
+    std::vector<std::vector<CompileStateUse>> incomingBoundaryAccessesByBatch;
+    // Whole-allocation alias admission needs only the first use and the final
+    // use on each queue, not every subresource access in between.
+    std::vector<std::vector<uint32_t>> aliasFirstResourcesByBatch;
+    std::vector<std::vector<uint32_t>> aliasFinalResourcesByBatch;
     std::vector<RelativeQueueWait> relativeWaits;
     SymbolicStatePlan states;
     bool scheduleValidated = false;
@@ -211,13 +241,13 @@ std::shared_ptr<const CompiledGraph> CompileGraph(
 struct CompiledGraphBundle {
     uint64_t sequence = 0;
     std::shared_ptr<const CompiledGraph> graph;
-    // May be a newer coalesced publication with the same complete structure.
+    // Exact input that produced this fresh graph; never substituted by a
+    // structurally equivalent request.
     std::shared_ptr<const GraphCompileInput> input;
 };
 
 // A compile result is paired permanently with the exact owned frame request
-// that produced it. CompiledGraph may be shared by structurally identical
-// requests, but input/executionPayload is never replaced or skipped.
+// that produced it. No structural result is shared between frame requests.
 struct ExecutableCompiledFrame {
     uint64_t sequence = 0;
     std::shared_ptr<const CompiledGraphBundle> bundle;
@@ -295,11 +325,13 @@ public:
         std::shared_ptr<const CompiledGraphBundle>,
         const std::vector<std::vector<ExecutionTimelinePoint>>& incomingWaits,
         std::vector<std::shared_ptr<const void>> executionLeases = {},
-        std::vector<std::shared_ptr<const IPreparedExecutionBatch>> preparedBatches = {});
+        std::vector<std::shared_ptr<const IPreparedExecutionBatch>> preparedBatches = {},
+        std::span<const ExecutionTimelinePoint> reservedSignals = {});
     std::shared_ptr<const GraphExecutionTimeline> SubmitPrepared(
         std::shared_ptr<const CompiledGraphBundle>,
         const std::vector<std::vector<ExecutionTimelinePoint>>& incomingWaits,
-        const std::vector<std::shared_ptr<const IPreparedExecutionBatch>>& packets);
+        const std::vector<std::shared_ptr<const IPreparedExecutionBatch>>& packets,
+        std::span<const ExecutionTimelinePoint> reservedSignals = {});
     // Call only after the backend successfully submits this batch's signal.
     void CommitBatch(uint64_t submission, uint32_t batch);
     // A partial failure preserves committed values and permanently closes this
@@ -307,9 +339,14 @@ public:
     void Fail(uint64_t submission, SubmissionReceipt receipt = {});
     void ExtendSubmittedFrame(const std::shared_ptr<FrameContext>& frame,
         ExecutionTimelinePoint completion);
+    void ExtendSubmittedFrame(uint64_t frameSequence,
+        ExecutionTimelinePoint completion);
     // Called by the ordered owner with observed GPU completion values, in the
     // same queue order as construction. Releases only fully completed bundles.
     size_t RetireCompleted(std::span<const ExecutionTimelinePoint> completed);
+    // Transfers already-retired ownership so destruction may run on a
+    // non-critical cleanup lane after owner-thread completion callbacks.
+    std::vector<std::shared_ptr<GraphExecutionTimeline>> TakeRetiredGarbage();
     size_t InFlight() const { return m_retained.size() + (m_pending ? 1 : 0); }
     std::span<const ExecutionTimelinePoint> Submitted() const { return m_submitted; }
     bool Failed() const { return m_failed; }
@@ -319,6 +356,7 @@ private:
     std::vector<ExecutionTimelinePoint> m_reserved, m_submitted;
     std::shared_ptr<GraphExecutionTimeline> m_pending;
     std::vector<std::shared_ptr<GraphExecutionTimeline>> m_retained;
+    std::vector<std::shared_ptr<GraphExecutionTimeline>> m_retiredGarbage;
     std::vector<ExecutionTimelinePoint> m_completed;
     size_t m_maximumInFlight;
     uint64_t m_sequence = 0;
@@ -331,8 +369,8 @@ struct CompileCoordinatorStatistics {
     uint64_t requested = 0, coalesced = 0, started = 0, completed = 0;
     uint64_t cancelled = 0, failed = 0, oracleComparisons = 0, oracleFailures = 0;
     uint64_t rejected = 0, highestReadySequence = 0;
-    uint64_t scheduleComparisons = 0, scheduleFailures = 0;
-    uint64_t stateComparisons = 0, stateFailures = 0, stateFallbacks = 0;
+    uint64_t scheduleValidations = 0, scheduleFailures = 0;
+    uint64_t stateValidations = 0, stateFailures = 0, stateFallbacks = 0;
     uint64_t membershipChanges = 0, passChanges = 0, constraintChanges = 0;
     uint64_t queueChanges = 0, realizationChanges = 0;
     uint64_t completedCacheHits = 0;
@@ -401,11 +439,6 @@ private:
     std::deque<RequestState> m_pending;
     std::map<uint64_t, std::shared_ptr<const CompiledGraphBundle>> m_ready;
     std::map<uint64_t, std::string> m_failures;
-    // Structural plans only: never retain an old publication lease in this
-    // bounded generation cache. Frame-slot rotations can revisit older keys.
-    std::vector<std::shared_ptr<const CompiledGraph>> m_completedPlans;
-    static constexpr size_t kMaximumCompletedPlans = 8;
-    std::weak_ptr<const GraphCompileInput> m_previousRequest;
     CompileCoordinatorStatistics m_stats;
 };
 

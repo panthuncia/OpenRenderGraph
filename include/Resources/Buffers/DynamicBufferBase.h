@@ -153,7 +153,7 @@ public:
     bool IsUnorderedAccessEnabled() const;
 
     uint64_t GetBackingGeneration() const override;
-    BackingAllocationSnapshot CaptureBackingAllocation() override;
+    BackingAllocationSnapshot CaptureBackingAllocation(bool retain = true) override;
 
     void Materialize(const MaterializeOptions* options = nullptr);
 

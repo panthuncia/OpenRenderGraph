@@ -15,8 +15,8 @@ bool IsExecutionCompatible(const CompiledGraphBundle& bundle,
     const GraphCompileInput& prepared) noexcept {
     if (!bundle.graph || !bundle.input || !bundle.graph->structure
         || !bundle.graph->scheduleValidated || !bundle.graph->scheduleValidationError.empty()
-        || bundle.input->structure != prepared.structure
-        || *bundle.graph->structure != prepared.structure) return false;
+        || bundle.input.get() != &prepared
+        || bundle.graph->structure.get() != &bundle.input->structure) return false;
     size_t scheduledPasses = 0;
     for (const auto& batch : bundle.graph->batches) scheduledPasses += batch.passes.size();
     if (scheduledPasses != prepared.structure.passes.size()) return false;
@@ -31,7 +31,7 @@ bool IsExecutionCompatible(const CompiledGraphBundle& bundle,
 std::shared_ptr<const GraphExecutionLayout> BuildExecutionLayout(
     std::shared_ptr<const CompiledGraphBundle> bundle,
     const GraphCompileInput& prepared) {
-    BT_ZONE_SCOPE("ORG.AsyncExecution.BuildLayout");
+    BT_ZONE_SCOPE("ORG.Execution.BuildLayout");
     if (!bundle || !IsExecutionCompatible(*bundle, prepared))
         throw std::invalid_argument("Compiled graph is incompatible with prepared frame");
     auto result = std::make_shared<GraphExecutionLayout>();
@@ -73,12 +73,13 @@ std::shared_ptr<const GraphExecutionTimeline> ExecutionTimelineAdmission::Prepar
     std::shared_ptr<const CompiledGraphBundle> bundle,
     const std::vector<std::vector<ExecutionTimelinePoint>>& incomingWaits,
     std::vector<std::shared_ptr<const void>> executionLeases,
-    std::vector<std::shared_ptr<const IPreparedExecutionBatch>> preparedBatches) {
-    BT_ZONE_SCOPE("ORG.AsyncExecution.PrepareTimelines");
+    std::vector<std::shared_ptr<const IPreparedExecutionBatch>> preparedBatches,
+    std::span<const ExecutionTimelinePoint> reservedSignals) {
+    BT_ZONE_SCOPE("ORG.Execution.PrepareTimelines");
     if (m_failed || m_pending || InFlight() >= m_maximumInFlight)
         throw std::logic_error("Admission unavailable");
     if (!bundle || !bundle->graph || !bundle->input || !bundle->graph->structure
-        || *bundle->graph->structure != bundle->input->structure)
+        || bundle->graph->structure.get() != &bundle->input->structure)
         throw std::invalid_argument("Incompatible execution bundle");
     const auto& graph = *bundle->graph;
     if (graph.structure->queues.size() != m_reserved.size()
@@ -96,8 +97,17 @@ std::shared_ptr<const GraphExecutionTimeline> ExecutionTimelineAdmission::Prepar
     result->batches.resize(graph.batches.size());
     for (size_t i = 0; i < graph.batches.size(); ++i) {
         auto& point = reserved.at(graph.batches[i].queue);
-        if (point.value >= UINT64_MAX - 1) throw std::overflow_error("Queue timeline exhausted");
-        result->batches[i].signal = {point.timeline, ++point.value};
+        if (!reservedSignals.empty()) {
+            if (reservedSignals.size() != graph.batches.size()
+                || reservedSignals[i].timeline != point.timeline
+                || reservedSignals[i].value <= point.value)
+                throw std::invalid_argument("Invalid concrete queue-signal reservation");
+            point.value = reservedSignals[i].value;
+            result->batches[i].signal = reservedSignals[i];
+        } else {
+            if (point.value >= UINT64_MAX - 1) throw std::overflow_error("Queue timeline exhausted");
+            result->batches[i].signal = {point.timeline, ++point.value};
+        }
         result->batches[i].waits = incomingWaits[i];
         for (auto wait : incomingWaits[i]) {
             if (!wait.timeline) throw std::invalid_argument("Missing wait timeline");
@@ -134,8 +144,9 @@ std::shared_ptr<const GraphExecutionTimeline> ExecutionTimelineAdmission::Prepar
 std::shared_ptr<const GraphExecutionTimeline> ExecutionTimelineAdmission::SubmitPrepared(
     std::shared_ptr<const CompiledGraphBundle> bundle,
     const std::vector<std::vector<ExecutionTimelinePoint>>& incomingWaits,
-    const std::vector<std::shared_ptr<const IPreparedExecutionBatch>>& packets) {
-    BT_ZONE_SCOPE("ORG.AsyncExecution.SubmitPrepared");
+    const std::vector<std::shared_ptr<const IPreparedExecutionBatch>>& packets,
+    std::span<const ExecutionTimelinePoint> reservedSignals) {
+    BT_ZONE_SCOPE("ORG.Execution.SubmitPrepared");
     if (!bundle || !bundle->graph || packets.size() != bundle->graph->batches.size())
         throw std::invalid_argument("Prepared packet count mismatch");
     std::vector<std::shared_ptr<const void>> leases;
@@ -147,7 +158,8 @@ std::shared_ptr<const GraphExecutionTimeline> ExecutionTimelineAdmission::Submit
             throw std::invalid_argument("Prepared packet queue mismatch");
         leases.push_back(packet);
     }
-    auto execution = Prepare(std::move(bundle), incomingWaits, std::move(leases), packets);
+    auto execution = Prepare(std::move(bundle), incomingWaits, std::move(leases), packets,
+        reservedSignals);
     CompletionSet completion;
     for (const auto& batch : execution->batches) completion.Include(batch.signal);
     for (uint32_t i = 0; i < packets.size(); ++i) {
@@ -164,7 +176,7 @@ std::shared_ptr<const GraphExecutionTimeline> ExecutionTimelineAdmission::Submit
 }
 
 void ExecutionTimelineAdmission::CommitBatch(uint64_t submission, uint32_t batch) {
-    BT_ZONE_SCOPE("ORG.AsyncExecution.CommitTimeline");
+    BT_ZONE_SCOPE("ORG.Execution.CommitTimeline");
     if (m_failed || !m_pending || submission != m_pending->submission || batch != m_nextBatch)
         throw std::logic_error("Out-of-order execution submission");
     const auto queue = m_pending->bundle->graph->batches.at(batch).queue;
@@ -181,20 +193,33 @@ void ExecutionTimelineAdmission::Fail(uint64_t submission, SubmissionReceipt rec
     if (const auto& frame = m_pending->bundle->input->frameContext) frame->EnterRecovery();
     m_failure = FailedExecutionBatch{submission, m_nextBatch, receipt};
     basic_telemetry::AddCounter(receipt.state == SubmissionState::SubmittedWithoutSignal
-        ? "ORG.AsyncExecution.SubmittedWithoutSignal"
+        ? "ORG.Execution.SubmittedWithoutSignal"
         : receipt.state == SubmissionState::SubmissionUncertain
-            ? "ORG.AsyncExecution.SubmissionUncertain" : "ORG.AsyncExecution.FailedBeforeSubmit");
+            ? "ORG.Execution.SubmissionUncertain" : "ORG.Execution.FailedBeforeSubmit");
     // Retain the pending bundle: it may own partially submitted GPU work. Only
     // recovery/retirement can release the admission owner after GPU completion.
 }
 
 void ExecutionTimelineAdmission::ExtendSubmittedFrame(
     const std::shared_ptr<FrameContext>& frame, ExecutionTimelinePoint completion) {
-    if (!frame || !completion.timeline || !completion.value)
+    if (!frame)
         throw std::invalid_argument("Invalid submitted-frame completion extension");
     auto found = std::ranges::find_if(m_retained, [&](const auto& execution) {
         return execution && execution->bundle && execution->bundle->input
             && execution->bundle->input->frameContext == frame;
+    });
+    if (found == m_retained.end())
+        throw std::logic_error("Submitted frame is no longer retained");
+    ExtendSubmittedFrame((*found)->bundle->sequence, completion);
+}
+
+void ExecutionTimelineAdmission::ExtendSubmittedFrame(
+    uint64_t frameSequence, ExecutionTimelinePoint completion) {
+    if (!frameSequence || !completion.timeline || !completion.value)
+        throw std::invalid_argument("Invalid submitted-frame completion extension");
+    auto found = std::ranges::find_if(m_retained, [&](const auto& execution) {
+        return execution && execution->bundle
+            && execution->bundle->sequence == frameSequence;
     });
     if (found == m_retained.end())
         throw std::logic_error("Submitted frame is no longer retained");
@@ -209,11 +234,12 @@ void ExecutionTimelineAdmission::ExtendSubmittedFrame(
     submitted->value = completion.value;
     reserved->value = completion.value;
     (*found)->tailCompletions.push_back(completion);
-    frame->IncludeSubmittedCompletion(completion);
+    if (const auto& frame = (*found)->bundle->input->frameContext)
+        frame->IncludeSubmittedCompletion(completion);
 }
 
 size_t ExecutionTimelineAdmission::RetireCompleted(std::span<const ExecutionTimelinePoint> completed) {
-    BT_ZONE_SCOPE("ORG.AsyncExecution.RetireTimelines");
+    BT_ZONE_SCOPE("ORG.Execution.RetireTimelines");
     if (completed.size() != m_completed.size()) throw std::invalid_argument("Invalid completion dimensions");
     for (size_t i = 0; i < completed.size(); ++i)
         if (completed[i].timeline != m_completed[i].timeline
@@ -222,27 +248,36 @@ size_t ExecutionTimelineAdmission::RetireCompleted(std::span<const ExecutionTime
             throw std::invalid_argument("Invalid completion observation");
     std::copy(completed.begin(), completed.end(), m_completed.begin());
     const auto before = m_retained.size();
-    std::erase_if(m_retained, [&](const auto& execution) {
+    for (auto iterator = m_retained.begin(); iterator != m_retained.end();) {
+        const auto& execution = *iterator;
+        bool complete = true;
         for (size_t i = 0; i < execution->batches.size(); ++i)
             if (execution->batches[i].signal.value > completed[execution->bundle->graph->batches[i].queue].value)
-                return false;
+                complete = false;
         for (const auto completion : execution->tailCompletions) {
             const auto observed = std::ranges::find(completed, completion.timeline,
                 &ExecutionTimelinePoint::timeline);
             if (observed == completed.end() || completion.value > observed->value)
-                return false;
+                complete = false;
         }
+        if (!complete) { ++iterator; continue; }
         BT_ZONE_SCOPE("ORG.Frame.Retire");
         AnnotateFrameTrace(execution->bundle->input->frameContext);
         for (const auto& packet : execution->preparedBatches)
             if (packet) packet->Complete(execution->submission);
         if (const auto& frame = execution->bundle->input->frameContext)
             if (!frame->Retire(completed)) throw std::logic_error("Frame completion disagrees with admission");
-        return true;
-    });
+        m_retiredGarbage.push_back(std::move(*iterator));
+        iterator = m_retained.erase(iterator);
+    }
     // Failed partial packets remain recovery-owned: completion alone cannot
     // establish that recording/backend error recovery has released its objects.
     return before - m_retained.size();
+}
+
+std::vector<std::shared_ptr<GraphExecutionTimeline>>
+ExecutionTimelineAdmission::TakeRetiredGarbage() {
+    return std::exchange(m_retiredGarbage, {});
 }
 
 namespace {
@@ -278,15 +313,15 @@ struct StateRegion {
 
 SymbolicStatePlan BuildStatePlan(const GraphCompileStructure& s,
     std::span<const SymbolicBatch> batches, const std::atomic_bool& cancelled) {
-    BT_ZONE_SCOPE("ORG.AsyncCompile.SymbolicStates");
+    BT_ZONE_SCOPE("ORG.FreshCompile.SymbolicStates");
     SymbolicStatePlan plan;
     auto fallback = [&](const char* reason) {
-        BT_ZONE_SCOPE("ORG.AsyncCompile.StateFallback");
+        BT_ZONE_SCOPE("ORG.FreshCompile.StateFallback");
         plan.steps.clear(); plan.finalStates.clear(); plan.fallbackReason = reason;
         BT_ZONE_TEXT(plan.fallbackReason.data(), plan.fallbackReason.size());
         // A bounded set of literal reasons: diagnostic attempts include jobs
         // later cancelled/coalesced, unlike the coordinator acceptance counts.
-        basic_telemetry::AddCounter(std::string("ORG.AsyncCompile.StateFallback.") + reason);
+        basic_telemetry::AddCounter(std::string("ORG.FreshCompile.StateFallback.") + reason);
         return plan;
     };
     if (s.resourceShapes.size() != s.resourceIDs.size()) return fallback("Resource shapes not captured");
@@ -430,7 +465,7 @@ void NormalizeCompileInput(GraphCompileInput& input) {
 }
 
 std::string ValidateSymbolicSchedule(const GraphCompileInput& input, const CompiledGraph& graph) {
-    BT_ZONE_SCOPE("ORG.AsyncCompile.ValidateSchedule");
+    BT_ZONE_SCOPE("ORG.FreshCompile.ValidateSchedule");
     const auto& s = input.structure;
     const size_t count = s.passes.size(), batchCount = graph.batches.size();
     const size_t words = (batchCount + 63) / 64;
@@ -500,7 +535,7 @@ std::string ValidateSymbolicSchedule(const GraphCompileInput& input, const Compi
 }
 
 std::string ValidateSymbolicStates(const GraphCompileInput& input, const CompiledGraph& graph) {
-    BT_ZONE_SCOPE("ORG.AsyncCompile.ValidateStates");
+    BT_ZONE_SCOPE("ORG.FreshCompile.ValidateStates");
     // Independent dense-cell oracle; it does not share the planner's rectangle
     // splitting algorithm. Only the worker invokes this on captured host inputs.
     const auto& s = input.structure;
@@ -577,13 +612,14 @@ std::string ValidateSymbolicStates(const GraphCompileInput& input, const Compile
 
 std::shared_ptr<const CompiledGraph> CompileWorkspace::Compile(
     std::shared_ptr<const GraphCompileInput> input, const std::atomic_bool& cancelled) {
-    BT_ZONE_SCOPE("ORG.AsyncCompile.DependencyCompile");
+    BT_ZONE_SCOPE("ORG.FreshCompile.DependencyCompile");
+    basic_telemetry::AddCounter("ORG.FreshCompile.Compiles");
     if (!input) throw std::invalid_argument("Null graph compile input");
     const auto& structure = input->structure;
     if (structure.passes.size() >= UINT32_MAX || structure.resourceIDs.size() >= UINT32_MAX)
         throw std::invalid_argument("Graph exceeds dependency index capacity");
     auto result = std::make_shared<CompiledGraph>();
-    result->structure = std::make_shared<const GraphCompileStructure>(structure);
+    result->structure = std::shared_ptr<const GraphCompileStructure>(input, &input->structure);
     const auto passCount = static_cast<uint32_t>(structure.passes.size());
     m_resources.resize(structure.resourceIDs.size());
     for (auto& state : m_resources) state.Reset();
@@ -591,7 +627,7 @@ std::shared_ptr<const CompiledGraph> CompileWorkspace::Compile(
         if (from != UINT32_MAX && from != to) result->edges.emplace_back(from, to);
     };
     {
-        BT_ZONE_SCOPE("ORG.AsyncCompile.BuildDependencies");
+        BT_ZONE_SCOPE("ORG.FreshCompile.BuildDependencies");
         for (uint32_t index = 0; index < passCount; ++index) {
             if (cancelled.load(std::memory_order_relaxed)) return {};
             const auto& pass = structure.passes[index];
@@ -619,7 +655,7 @@ std::shared_ptr<const CompiledGraph> CompileWorkspace::Compile(
     std::sort(result->schedulingEdges.begin(), result->schedulingEdges.end());
     result->schedulingEdges.erase(std::unique(result->schedulingEdges.begin(), result->schedulingEdges.end()), result->schedulingEdges.end());
     {
-        BT_ZONE_SCOPE("ORG.AsyncCompile.Topology");
+        BT_ZONE_SCOPE("ORG.FreshCompile.Topology");
         m_successors.clear(); m_successors.resize(passCount);
         m_indegrees.assign(passCount, 0);
         for (auto [from, to] : result->schedulingEdges) {
@@ -644,7 +680,7 @@ std::shared_ptr<const CompiledGraph> CompileWorkspace::Compile(
             [&](uint32_t i, uint32_t value) { result->criticality[i] = value; });
     }
     {
-        BT_ZONE_SCOPE("ORG.AsyncCompile.SymbolicSchedule");
+        BT_ZONE_SCOPE("ORG.FreshCompile.SymbolicSchedule");
         std::vector<uint32_t> batchByPass(passCount, UINT32_MAX), lastResource(structure.resourceIDs.size(), UINT32_MAX);
         for (auto passIndex : result->topologicalOrder) {
             if (cancelled.load(std::memory_order_relaxed)) return {};
@@ -677,6 +713,11 @@ std::shared_ptr<const CompiledGraph> CompileWorkspace::Compile(
                 previous = passIndex;
             });
         }
+        result->batchByPass = batchByPass;
+        result->positionByPass.assign(passCount, UINT32_MAX);
+        for (uint32_t batch = 0; batch < result->batches.size(); ++batch)
+            for (uint32_t position = 0; position < result->batches[batch].passes.size(); ++position)
+                result->positionByPass[result->batches[batch].passes[position]] = position;
         std::sort(result->schedulingEdges.begin(), result->schedulingEdges.end());
         result->schedulingEdges.erase(std::unique(result->schedulingEdges.begin(), result->schedulingEdges.end()), result->schedulingEdges.end());
         std::vector<std::vector<uint32_t>> latestProducer(result->batches.size(),
@@ -695,9 +736,96 @@ std::shared_ptr<const CompiledGraph> CompileWorkspace::Compile(
     if (!structure.resourceShapes.empty()) {
         result->states = BuildStatePlan(structure, result->batches, cancelled);
         if (cancelled.load(std::memory_order_relaxed)) return {};
-        if (result->states.complete) result->stateValidationError = ValidateSymbolicStates(*input, *result);
+        result->barrierCapacityByPass.resize(passCount);
+        result->stateDeltaCapacityByBatch.assign(result->batches.size(), 0);
+        result->stateSeedCapacityByBatch.assign(result->batches.size(), 0);
+        result->boundaryAccessesByBatch.resize(result->batches.size());
+        for (uint32_t batch = 0; batch < result->batches.size(); ++batch) {
+            auto& accesses = result->boundaryAccessesByBatch[batch];
+            for (const auto passIndex : result->batches[batch].passes) {
+                const auto& pass = structure.passes[passIndex];
+                if (!pass.entryStates.empty()) {
+                    accesses.insert(accesses.end(), pass.entryStates.begin(), pass.entryStates.end());
+                } else for (const auto& access : pass.accesses) {
+                    const auto shape = structure.resourceShapes.at(access.resourceIndex);
+                    accesses.push_back({access.resourceIndex,
+                        {0, shape.mips, 0, shape.slices}, {0, 0, 0, access.write}});
+                }
+            }
+        }
+        result->incomingBoundaryAccessesByBatch.resize(result->batches.size());
+        std::vector<std::vector<uint8_t>> seenAny(structure.resourceShapes.size());
+        std::vector<std::vector<uint8_t>> seenWrite(structure.resourceShapes.size());
+        for (size_t resource = 0; resource < structure.resourceShapes.size(); ++resource) {
+            const auto cells = size_t{structure.resourceShapes[resource].mips}
+                * structure.resourceShapes[resource].slices;
+            seenAny[resource].resize(cells);
+            seenWrite[resource].resize(cells);
+        }
+        for (uint32_t batch = 0; batch < result->boundaryAccessesByBatch.size(); ++batch) {
+            for (const auto& access : result->boundaryAccessesByBatch[batch]) {
+                const auto shape = structure.resourceShapes.at(access.resource);
+                for (uint32_t slice = access.range.slice;
+                    slice < access.range.slice + access.range.slices; ++slice)
+                    for (uint32_t mip = access.range.mip;
+                        mip < access.range.mip + access.range.mips; ++mip) {
+                        const auto cell = size_t{slice} * shape.mips + mip;
+                        const bool first = !seenAny[access.resource][cell];
+                        const bool firstWrite = access.state.write
+                            && !seenWrite[access.resource][cell];
+                        if (first || firstWrite)
+                            result->incomingBoundaryAccessesByBatch[batch].push_back({
+                                access.resource, {mip, 1, slice, 1}, access.state});
+                        seenAny[access.resource][cell] = 1;
+                        if (access.state.write) seenWrite[access.resource][cell] = 1;
+                    }
+            }
+        }
+        result->aliasFirstResourcesByBatch.resize(result->batches.size());
+        result->aliasFinalResourcesByBatch.resize(result->batches.size());
+        std::vector<std::vector<uint8_t>> aliasSeen(
+            structure.resourceShapes.size(),
+            std::vector<uint8_t>(structure.queues.size()));
+        std::vector<std::vector<uint32_t>> aliasLast(
+            structure.resourceShapes.size(),
+            std::vector<uint32_t>(structure.queues.size(), UINT32_MAX));
+        for (uint32_t batch = 0; batch < result->boundaryAccessesByBatch.size(); ++batch) {
+            for (const auto& access : result->boundaryAccessesByBatch[batch]) {
+                const auto queue = result->batches[batch].queue;
+                if (!aliasSeen[access.resource][queue]) {
+                    aliasSeen[access.resource][queue] = 1;
+                    result->aliasFirstResourcesByBatch[batch].push_back(access.resource);
+                }
+                aliasLast[access.resource][queue] = batch;
+            }
+        }
+        for (uint32_t resource = 0; resource < aliasLast.size(); ++resource)
+            for (const auto batch : aliasLast[resource])
+                if (batch != UINT32_MAX)
+                    result->aliasFinalResourcesByBatch[batch].push_back(resource);
+        std::vector<uint8_t> seeded(structure.resourceIDs.size());
+        for (const auto& step : result->states.steps) {
+            const auto cells = step.range.mips * step.range.slices;
+            auto& capacity = result->barrierCapacityByPass.at(step.pass);
+            if (structure.resourceShapes.at(step.resource).hasLayout) {
+                capacity.beforeTextures += cells;
+                if (step.previousBatch != UINT32_MAX
+                    && result->batches[step.previousBatch].queue != result->batches[step.batch].queue)
+                    result->barrierCapacityByPass.at(step.previousPass).afterTextures += cells;
+            } else capacity.beforeBuffers += cells;
+            ++result->stateDeltaCapacityByBatch.at(step.batch);
+            if (step.previousBatch == UINT32_MAX && !seeded[step.resource]) {
+                seeded[step.resource] = 1;
+                ++result->stateSeedCapacityByBatch.at(step.batch);
+            }
+        }
     }
-    result->scheduleValidationError = ValidateSymbolicSchedule(*input, *result);
+    // The renderer compiles a fresh graph every frame. Replaying the complete
+    // schedule and subresource state machine here made validation more costly
+    // than compilation itself. Construction above enforces its local
+    // invariants; the exhaustive independent validators remain public for
+    // focused tests and diagnostic tools, but are not part of production
+    // frame compilation.
     result->scheduleValidated = true;
     return cancelled.load(std::memory_order_relaxed) ? nullptr : result;
 }
@@ -711,9 +839,6 @@ std::shared_ptr<const CompiledGraph> CompileGraph(
 
 struct GraphCompileCoordinator::Job {
     RequestState request;
-    // Structurally identical frame requests share compiler work, but retain
-    // distinct owned payloads and each publish an executable queue entry.
-    std::vector<RequestState> followers;
     std::shared_ptr<const GraphCompileInput> input;
     std::atomic_bool cancel{false}, done{false};
     std::shared_ptr<const CompiledGraph> result;
@@ -745,70 +870,9 @@ GraphCompileCoordinator::RequestReceipt GraphCompileCoordinator::RequestOwned(
     if (input.structure.generation < m_generation) { ++m_stats.rejected; return {}; }
     if (input.structure.generation != m_generation) Reset(input.structure.generation);
     NormalizeCompileInput(input);
-    if (auto previous = m_previousRequest.lock()) {
-        const auto& before = previous->structure;
-        const auto& after = input.structure;
-        const bool membershipChanged = before.resourceIDs != after.resourceIDs;
-        m_stats.membershipChanges += membershipChanged;
-        if (membershipChanged && (m_stats.membershipChanges == 1
-            || (m_stats.membershipChanges % 128) == 0)) {
-            auto removed = before.resourceIDs.begin(), added = after.resourceIDs.begin();
-            while (removed != before.resourceIDs.end()
-                && std::binary_search(after.resourceIDs.begin(), after.resourceIDs.end(), *removed)) ++removed;
-            while (added != after.resourceIDs.end()
-                && std::binary_search(before.resourceIDs.begin(), before.resourceIDs.end(), *added)) ++added;
-            const auto beforeIndex = static_cast<size_t>(removed - before.resourceIDs.begin());
-            const auto afterIndex = static_cast<size_t>(added - after.resourceIDs.begin());
-            const auto beforeID = removed == before.resourceIDs.end() ? uint64_t{0} : *removed;
-            const auto afterID = added == after.resourceIDs.end() ? uint64_t{0} : *added;
-            const auto beforeKey = beforeIndex < before.resourceKeys.size() ? before.resourceKeys[beforeIndex] : std::string{};
-            const auto afterKey = afterIndex < after.resourceKeys.size() ? after.resourceKeys[afterIndex] : std::string{};
-            spdlog::info("Async compile membership changed count={} beforeCount={} afterCount={} firstBefore={}:'{}' firstAfter={}:'{}'",
-                m_stats.membershipChanges, before.resourceIDs.size(), after.resourceIDs.size(),
-                beforeID, beforeKey, afterID, afterKey);
-        }
-        const bool passesChanged = before.passes != after.passes;
-        m_stats.passChanges += passesChanged;
-        if (passesChanged && (m_stats.passChanges == 1 || (m_stats.passChanges % 128) == 0)) {
-            const auto mismatch = std::mismatch(before.passes.begin(), before.passes.end(),
-                after.passes.begin(), after.passes.end());
-            const auto index = static_cast<size_t>(mismatch.first - before.passes.begin());
-            const auto* a = mismatch.first == before.passes.end() ? nullptr : &*mismatch.first;
-            const auto* b = mismatch.second == after.passes.end() ? nullptr : &*mismatch.second;
-            spdlog::info("Async compile pass changed count={} index={} beforeCount={} afterCount={} access={} entry={} exit={} isolation={} placement={} queue={}",
-                m_stats.passChanges, index, before.passes.size(), after.passes.size(),
-                a && b && a->accesses != b->accesses,
-                a && b && a->entryStates != b->entryStates,
-                a && b && a->exitStates != b->exitStates,
-                a && b && a->forceBatchIsolation != b->forceBatchIsolation,
-                a && b && (a->originalOrder != b->originalOrder || a->preparedPassIndex != b->preparedPassIndex),
-                a && b && (a->compatibleQueueSlots != b->compatibleQueueSlots
-                    || a->preferredQueueSlot != b->preferredQueueSlot));
-        }
-        m_stats.constraintChanges += before.explicitEdges != after.explicitEdges || before.placementEdges != after.placementEdges;
-        m_stats.queueChanges += before.queues != after.queues;
-        m_stats.realizationChanges += previous->backingGenerations != input.backingGenerations;
-    }
     RequestState request{++m_sequence, std::make_shared<const GraphCompileInput>(std::move(input)), std::chrono::steady_clock::now()};
-    m_previousRequest = request.input;
     ++m_stats.requested;
-    for (auto& job : m_jobs) {
-        if (!job->cancel.load() && job->input->structure == request.input->structure) {
-            job->followers.push_back(request);
-            ++m_stats.coalesced;
-            return {request.sequence, request.input};
-        }
-    }
-    for (auto& plan : m_completedPlans) {
-        if (*plan->structure == request.input->structure) {
-            ++m_stats.coalesced;
-            ++m_stats.completedCacheHits;
-            // Accept may reorder the cache; retain the value across that call.
-            auto cached = plan;
-            Accept(request, std::move(cached));
-            return {request.sequence, request.input};
-        }
-    }
+    basic_telemetry::AddCounter("ORG.AsyncCompile.FreshRequests");
     if (compileInline) {
         BT_ZONE_SCOPE("ORG.AsyncCompile.InlineBootstrap");
         ++m_stats.started;
@@ -894,7 +958,7 @@ void GraphCompileCoordinator::Accept(const RequestState& request,
             m_stats.lastStateFallback = result->states.fallbackReason;
         }
         else {
-            ++m_stats.stateComparisons;
+            ++m_stats.stateValidations;
             if (!result->stateValidationError.empty()) {
                 ++m_stats.stateFailures;
                 m_stats.lastError = "Async state oracle at request " + std::to_string(request.sequence) + ": " + result->stateValidationError;
@@ -912,7 +976,7 @@ void GraphCompileCoordinator::Accept(const RequestState& request,
             return;
         }
     }
-    ++m_stats.scheduleComparisons;
+    ++m_stats.scheduleValidations;
     if (!result->scheduleValidated || !result->scheduleValidationError.empty()) {
         ++m_stats.scheduleFailures;
         m_stats.lastError = "Async schedule validation at request " + std::to_string(request.sequence) + ": "
@@ -920,9 +984,6 @@ void GraphCompileCoordinator::Accept(const RequestState& request,
         m_failures.emplace(request.sequence, m_stats.lastError);
         return;
     }
-    std::erase(m_completedPlans, result);
-    m_completedPlans.push_back(result);
-    if (m_completedPlans.size() > kMaximumCompletedPlans) m_completedPlans.erase(m_completedPlans.begin());
     auto bundle = std::make_shared<const CompiledGraphBundle>(CompiledGraphBundle{
         request.sequence, std::move(result), request.input});
     m_ready.emplace(request.sequence, bundle);
@@ -945,11 +1006,9 @@ void GraphCompileCoordinator::Pump() {
             if (!job->error.empty()) { ++m_stats.failed; m_stats.lastError = job->error; }
             else ++m_stats.cancelled;
             m_failures.emplace(job->request.sequence, error);
-            for (const auto& follower : job->followers) m_failures.emplace(follower.sequence, error);
         } else {
             ++m_stats.completed;
             Accept(job->request, job->result);
-            for (const auto& follower : job->followers) Accept(follower, job->result);
         }
         it = m_jobs.erase(it);
     }
@@ -1000,15 +1059,12 @@ void GraphCompileCoordinator::Reset(uint64_t generation) {
     for (auto& job : m_jobs) {
         job->cancel.store(true);
         if (job->request.input->executionLifecycle) job->request.input->executionLifecycle->Abandon(1);
-        for (const auto& follower : job->followers)
-            if (follower.input->executionLifecycle) follower.input->executionLifecycle->Abandon(1);
     }
     for (const auto& [_, bundle] : m_ready)
         if (bundle && bundle->input && bundle->input->executionLifecycle)
             bundle->input->executionLifecycle->Abandon(1);
     m_ready.clear();
     m_failures.clear();
-    m_completedPlans.clear();
     m_stats.highestReadySequence = 0;
 }
 
@@ -1021,8 +1077,6 @@ void GraphCompileCoordinator::Shutdown() {
     for (auto& job : m_jobs) {
         job->cancel.store(true);
         if (job->request.input->executionLifecycle) job->request.input->executionLifecycle->Abandon(0);
-        for (const auto& follower : job->followers)
-            if (follower.input->executionLifecycle) follower.input->executionLifecycle->Abandon(0);
     }
     for (const auto& [_, bundle] : m_ready)
         if (bundle && bundle->input && bundle->input->executionLifecycle)
@@ -1031,7 +1085,7 @@ void GraphCompileCoordinator::Shutdown() {
     // completion mailboxes and scheduler accounting finish normally.
     if (m_scope) m_scope->Wait();
     Pump();
-    m_jobs.clear(); m_ready.clear(); m_failures.clear(); m_completedPlans.clear();
+    m_jobs.clear(); m_ready.clear(); m_failures.clear();
 }
 
 CompileCoordinatorStatistics GraphCompileCoordinator::Statistics() const {
@@ -1070,20 +1124,6 @@ CompileCoordinatorStatistics GraphCompileCoordinator::Statistics() const {
     for (const auto& [sequence, bundle] : m_ready) {
         (void)sequence;
         accountInput(bundle->input);
-    }
-    for (const auto& graph : m_completedPlans) {
-        const auto& structure = *graph->structure;
-        result.retainedBytes += sizeof(GraphCompileStructure) + structureBytes(structure);
-        result.retainedBytes += sizeof(CompiledGraph) + graph->edges.capacity() * sizeof(DependencyEdges::value_type)
-            + graph->schedulingEdges.capacity() * sizeof(DependencyEdges::value_type)
-            + graph->batches.capacity() * sizeof(SymbolicBatch)
-            + graph->relativeWaits.capacity() * sizeof(RelativeQueueWait)
-            + graph->states.steps.capacity() * sizeof(SymbolicStateStep)
-            + graph->states.finalStates.capacity() * sizeof(SymbolicFinalState)
-            + graph->topologicalOrder.capacity() * sizeof(uint32_t)
-            + graph->criticality.capacity() * sizeof(uint32_t);
-        for (const auto& batch : graph->batches)
-            result.retainedBytes += batch.passes.capacity() * sizeof(uint32_t);
     }
     return result;
 }

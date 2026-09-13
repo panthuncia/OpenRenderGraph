@@ -33,8 +33,9 @@ InputFrame MakeFrame(uint64_t sequence, uint32_t queue, bool write) {
     auto bindings = std::make_shared<const org::FrozenExecutionBindings>(std::vector<org::FrozenExecutionBindings::ResourceBinding>{});
     PreparedBackingState backing;
     backing.graphResourceID = 1; backing.resource = {1,1}; backing.shape = {1,1,false};
-    backing.regions = {{{}, {static_cast<uint64_t>(rhi::ResourceAccessType::Common),0,
-        static_cast<uint64_t>(rhi::ResourceSyncState::All),false}}};
+    backing.regions = std::make_shared<const std::vector<PreparedStateRegion>>(
+        std::initializer_list<PreparedStateRegion>{{{}, {static_cast<uint64_t>(rhi::ResourceAccessType::Common),0,
+        static_cast<uint64_t>(rhi::ResourceSyncState::All),false}}});
     auto payload = BuildPreparedFramePayload(sequence,
         {org::PreparedPass::Make(0,+[](const int&,org::RecordingContext&) {})}, bindings, {backing});
     return {bundle, payload};
@@ -151,7 +152,7 @@ void RunFramePlanningTests() {
     // Even read/read access conflicts for distinct physical alias occupants.
     // Cancelling B must restore A as the confirmed occupant of the interval.
     auto aliasPayload = [](const InputFrame& frame, uint32_t handle, uint64_t offset) {
-        auto backing = frame.payload->initialStates;
+        auto backing = *frame.payload->initialStates;
         backing[0].resource = {handle,1};
         backing[0].aliasHeapIdentity = reinterpret_cast<const org::AliasHeapGeneration*>(uintptr_t{1});
         backing[0].aliasOffset = offset; backing[0].aliasSize = 256;
@@ -193,5 +194,27 @@ void RunFramePlanningTests() {
     CHECK(Rejects([&] { failure.CancelUnsubmittedSuffixAfterJoin(); }));
     CHECK(Rejects([&] { failure.Plan(c.bundle,c.payload,queues); }));
     CHECK(Rejects([&] { fb->ResolveWaits(); }));
+
+    // The renderer's one-frame admission policy uses concrete reservations.
+    // Cancellation burns the unsubmitted value and an externally advanced
+    // queue creates an intentional gap; neither value may be reused.
+    FramePlanningState concrete(1);
+    auto concreteA = MakeFrame(1,0,true);
+    auto concretePlanA = concrete.Plan(concreteA.bundle, concreteA.payload, queues);
+    CHECK(concretePlanA->signals[0]->symbolic == ExecutionTimelinePoint{10,1});
+    CHECK(concrete.SymbolCount() == 0);
+    concrete.Confirm(concretePlanA, Receipt(concreteA,10,1));
+    auto concreteB = MakeFrame(2,1,false);
+    auto cancelledConcrete = concrete.Plan(concreteB.bundle, concreteB.payload, queues);
+    CHECK(cancelledConcrete->signals[0]->symbolic == ExecutionTimelinePoint{20,1});
+    concrete.CancelUnsubmittedSuffixAfterJoin();
+    auto replacementConcrete = concrete.Plan(concreteB.bundle, concreteB.payload, queues);
+    CHECK(replacementConcrete->signals[0]->symbolic == ExecutionTimelinePoint{20,2});
+    concrete.Confirm(replacementConcrete, Receipt(concreteB,20,2));
+    auto concreteC = MakeFrame(3,0,true);
+    const std::vector<ExecutionTimelinePoint> advanced{{10,7},{20,2}};
+    auto gappedConcrete = concrete.Plan(concreteC.bundle, concreteC.payload, advanced);
+    CHECK(gappedConcrete->signals[0]->symbolic == ExecutionTimelinePoint{10,8});
+    CHECK(Rejects([&] { concrete.Confirm(gappedConcrete, Receipt(concreteC,10,7)); }));
     std::puts("Ordered frame planning, symbolic waits, suffix cancellation and recovery tests passed.");
 }

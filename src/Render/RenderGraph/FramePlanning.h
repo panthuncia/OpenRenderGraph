@@ -54,10 +54,31 @@ private:
     static constexpr uint64_t PlannedBit = uint64_t{1} << 63;
     size_t m_capacity;
     uint64_t m_generation = 0, m_nextSequence = 1, m_nextSymbol = PlannedBit;
+    std::vector<ExecutionTimelinePoint> m_reservedQueues;
     bool m_recovery = false, m_failedPlanning = false;
     Ledgers m_confirmed, m_tail;
     std::deque<std::shared_ptr<PlannedFrameState>> m_pending;
     std::unordered_map<uint64_t, std::shared_ptr<PlannedBatchSignal>> m_symbols;
+};
+
+struct SynchronousFramePlan {
+    std::shared_ptr<const RenderFrameSnapshot> snapshot;
+    std::vector<std::vector<ExecutionTimelinePoint>> incomingWaits;
+    std::vector<rhi::ResourceHandle> invalidated;
+};
+
+// Immediate admission policy for Off mode. There is no pending tail, symbolic
+// signal, FIFO token, cancellation state, or frame-lifecycle transition.
+class SynchronousPlanningState {
+public:
+    SynchronousFramePlan Plan(std::shared_ptr<const CompiledGraphBundle>,
+        std::shared_ptr<const PreparedFramePayload>,
+        std::span<const ExecutionTimelinePoint> queues);
+    void Confirm(const SynchronousFramePlan&, const GraphExecutionTimeline&);
+private:
+    BackingStateAdmissionLedger m_states;
+    BackingAccessAdmissionLedger m_accesses;
+    AliasAccessAdmissionLedger m_aliases;
 };
 
 } // namespace org::experimental

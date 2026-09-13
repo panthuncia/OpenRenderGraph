@@ -209,8 +209,8 @@ int main() {
         std::vector firstAgain{first};
         auto activations = ledger.ApplyInitialStates(firstGraph, firstAgain);
         CHECK(activations.size() == 1);
-        CHECK(firstAgain[0].regions.size() == 1);
-        CHECK(firstAgain[0].regions[0].state.access
+        CHECK(firstAgain[0].regions->size() == 1);
+        CHECK((*firstAgain[0].regions)[0].state.access
             == static_cast<uint64_t>(rhi::ResourceAccessType::None));
 
         auto disjointGraph = makeGraph(103, 1);
@@ -313,18 +313,19 @@ int main() {
         for (uint32_t i = 0; i < packedInput.structure.passes.size(); ++i)
             packedInput.structure.passes[i].preparedPassIndex = i;
         packedInput.expectedEdges.reset();
-        auto packed = workspace.Compile(std::make_shared<const GraphCompileInput>(packedInput), cancelled);
+        auto owned = std::make_shared<const GraphCompileInput>(packedInput);
+        auto packed = workspace.Compile(owned, cancelled);
         CHECK(packed->batches.size() == 1);
         CHECK(packed->batches[0].passes == (std::vector<uint32_t>{0, 1}));
         CHECK(ValidateSymbolicSchedule(packedInput, *packed).empty());
-        auto owned = std::make_shared<const GraphCompileInput>(packedInput);
         auto bundle = std::make_shared<const CompiledGraphBundle>(CompiledGraphBundle{1, packed, owned});
         auto layout = BuildExecutionLayout(bundle, *owned);
         CHECK(layout->placements == (std::vector<ExecutionPassPlacement>{{0,0,0},{1,0,0}}));
     }
     {
         auto prepared = std::make_shared<const GraphCompileInput>(Input());
-        CompiledGraphBundle compatible{1, graph, prepared};
+        auto compatibleGraph = CompileGraph(prepared, workspace, cancelled);
+        CompiledGraphBundle compatible{1, compatibleGraph, prepared};
         CHECK(IsExecutionCompatible(compatible, *prepared));
         auto compatibleOwner = std::make_shared<const CompiledGraphBundle>(compatible);
         auto layout = BuildExecutionLayout(compatibleOwner, *prepared);
@@ -444,8 +445,9 @@ int main() {
             tailFrame->Advance(stage, static_cast<org::FrameStage>(static_cast<unsigned>(stage) + 1));
         auto tailInput = std::make_shared<GraphCompileInput>(*bundle->input);
         tailInput->frameContext = tailFrame;
-        auto tailBundle = std::make_shared<CompiledGraphBundle>(*bundle);
-        tailBundle->input = tailInput;
+        auto tailGraph = workspace.Compile(tailInput, cancelled);
+        auto tailBundle = std::make_shared<CompiledGraphBundle>(CompiledGraphBundle{
+            bundle->sequence, std::move(tailGraph), tailInput});
         std::vector<std::shared_ptr<const IPreparedExecutionBatch>> tailPackets;
         for (int i = 0; i < 3; ++i) {
             auto packet = std::make_shared<Packet>(); packet->queueSlot = i == 1 ? 1 : 0;
@@ -473,8 +475,9 @@ int main() {
             failureFrame->Advance(stage, static_cast<org::FrameStage>(static_cast<unsigned>(stage) + 1));
         auto failureInput = std::make_shared<GraphCompileInput>(*bundle->input);
         failureInput->frameContext = failureFrame;
-        auto failureBundle = std::make_shared<CompiledGraphBundle>(*bundle);
-        failureBundle->input = failureInput;
+        auto failureGraph = workspace.Compile(failureInput, cancelled);
+        auto failureBundle = std::make_shared<CompiledGraphBundle>(CompiledGraphBundle{
+            bundle->sequence, std::move(failureGraph), failureInput});
         CHECK(rejects([&] { submission.SubmitPrepared(failureBundle,
             std::vector<std::vector<ExecutionTimelinePoint>>(3), {firstPacket, failedPacket, lastPacket}); }));
         CHECK(submission.Failed());
@@ -611,7 +614,8 @@ int main() {
         .graphResourceID = 1,
         .resource = crossQueueHandle,
         .shape = {4, 2, true},
-        .regions = {{{0, 4, 0, 2}, {}}},
+        .regions = std::make_shared<const std::vector<PreparedStateRegion>>(
+            std::initializer_list<PreparedStateRegion>{{{0, 4, 0, 2}, {}}}),
     };
     BackingStateAdmissionLedger stateLedger;
     auto crossQueueBarriers = stateLedger.Prepare(*crossQueueStateGraph,
@@ -715,7 +719,7 @@ int main() {
     GraphCompileCoordinator stateCoordinator(stateTasks);
     stateCoordinator.Request(stateInput); stateTasks->RunAll(); stateCoordinator.Pump();
     auto ownedPlan = stateCoordinator.PeekReady(1)->graph;
-    CHECK(stateCoordinator.Statistics().stateComparisons == 1 && stateCoordinator.Statistics().stateFailures == 0);
+    CHECK(stateCoordinator.Statistics().stateValidations == 1 && stateCoordinator.Statistics().stateFailures == 0);
     // Sync-only changes are structural for state plans (unlike content/waits).
     stateInput.structure.passes[0].entryStates[0].state.sync ^= 128;
     stateCoordinator.Request(stateInput); stateTasks->RunAll(); stateCoordinator.Pump();
@@ -727,7 +731,8 @@ int main() {
     auto realizationLease = std::make_shared<int>(1);
     stateInput.leases = {realizationLease};
     const auto realizationSequence = stateCoordinator.Request(stateInput);
-    CHECK(stateCoordinator.Statistics().started == 3);
+    stateTasks->RunAll(); stateCoordinator.Pump();
+    CHECK(stateCoordinator.Statistics().started == 4);
     CHECK(stateCoordinator.PeekReady(realizationSequence)->sequence == realizationSequence);
     CHECK(stateCoordinator.PeekReady(realizationSequence)->input->backingGenerations == std::vector<uint64_t>{1});
     ++stateInput.backingGenerations[0];
@@ -735,7 +740,8 @@ int main() {
     std::weak_ptr<int> oldRealization = realizationLease;
     stateInput.leases = {newerRealizationLease}; realizationLease.reset();
     const auto replacementSequence = stateCoordinator.Request(stateInput);
-    CHECK(stateCoordinator.Statistics().started == 3);
+    stateTasks->RunAll(); stateCoordinator.Pump();
+    CHECK(stateCoordinator.Statistics().started == 5);
     CHECK(stateCoordinator.PeekReady(replacementSequence)->sequence == replacementSequence);
     CHECK(stateCoordinator.PeekReady(replacementSequence)->input->backingGenerations == std::vector<uint64_t>{2});
     CHECK(!oldRealization.expired()); // Every queued frame retains its own realization.
@@ -745,7 +751,7 @@ int main() {
     }
     CHECK(oldRealization.expired());
     CHECK(stateCoordinator.WaitAndPop(replacementSequence)->sequence == replacementSequence);
-    CHECK(stateCoordinator.Statistics().realizationChanges == 2);
+    CHECK(stateCoordinator.Statistics().realizationChanges == 0);
     stateCoordinator.Shutdown();
     CHECK(ownedPlan->states.complete); // No pointers into the workspace/coordinator.
 
@@ -778,13 +784,17 @@ int main() {
     auto lease = std::make_shared<int>(42); std::weak_ptr<int> weakLease = lease;
     auto coalesced = Input(1, 20); coalesced.leases.push_back(lease); lease.reset();
     const auto third = coordinator.Request(std::move(coalesced));
+    tasks->RunAll(); coordinator.Pump();
     CHECK(coordinator.PeekReady(third) && !weakLease.expired());
-    CHECK(coordinator.Statistics().started == 2);
+    CHECK(coordinator.Statistics().started == 3 && coordinator.Statistics().coalesced == 0);
     CHECK(coordinator.Statistics().scheduleFailures == 0);
-    const auto retainedGraph = coordinator.PeekReady(third)->graph;
+    auto retainedGraph = coordinator.PeekReady(third)->graph;
     const auto fourth = coordinator.Request(Input(1, 20));
+    tasks->RunAll(); coordinator.Pump();
     CHECK(!weakLease.expired()); // Queued frame retains its own content.
     CHECK(coordinator.WaitAndPop(third)->sequence == third);
+    CHECK(!weakLease.expired()); // The compiled graph aliases its exact owned input.
+    retainedGraph.reset();
     CHECK(weakLease.expired());
     CHECK(coordinator.WaitAndPop(fourth)->sequence == fourth);
     coordinator.Reset(2);
@@ -844,13 +854,11 @@ int main() {
     CHECK(concurrent.Statistics().completed == 2);
     CHECK(concurrent.Statistics().peakRunning == 2);
     CHECK(concurrent.Statistics().oracleFailures == 0);
-    CHECK(concurrent.Statistics().scheduleComparisons == 2);
+    CHECK(concurrent.Statistics().scheduleValidations == 2);
     CHECK(concurrent.Statistics().scheduleFailures == 0);
-    CHECK(concurrent.Statistics().stateComparisons == 2 && concurrent.Statistics().stateFailures == 0);
+    CHECK(concurrent.Statistics().stateValidations == 2 && concurrent.Statistics().stateFailures == 0);
 
-    // A backing-only publication arriving while the structural job is active
-    // must not start another compile. The completed plan is paired with the
-    // newest coherent realization metadata and lease.
+    // Even structurally identical backing-only publications compile independently.
     auto realizationTasks = std::make_shared<ManualTasks>();
     GraphCompileCoordinator realizationRace(realizationTasks, 2);
     auto backingOne = std::make_shared<int>(1), backingTwo = std::make_shared<int>(2);
@@ -867,7 +875,7 @@ int main() {
     const auto latestRealization = realizationRace.Request(backingInput);
     backingInput.leases.clear();
     backingInput.executionPayload.reset();
-    CHECK(realizationRace.Statistics().started == 1 && realizationRace.Statistics().coalesced == 1);
+    CHECK(realizationRace.Statistics().started == 2 && realizationRace.Statistics().coalesced == 0);
     CHECK(!backingOneWeak.expired() && !backingTwoWeak.expired());
     realizationTasks->RunAll(); realizationRace.Pump();
     CHECK(realizationRace.PeekReady(latestRealization));
@@ -881,8 +889,7 @@ int main() {
     CHECK(backingTwoWeak.expired());
     CHECK(payloadTwoWeak.expired());
 
-    // Equivalent global-ID enumerations must coalesce while preserving the
-    // newest publication. No resource, pass, or queue semantic change is hidden.
+    // Equivalent global-ID enumerations normalize independently and still compile fresh.
     auto canonicalTasks = std::make_shared<ManualTasks>();
     GraphCompileCoordinator canonical(canonicalTasks, 2);
     auto original = Input(); original.structure.resourceIDs = {10, 20};
@@ -897,12 +904,13 @@ int main() {
     }
     std::reverse(reordered.backingGenerations.begin(), reordered.backingGenerations.end());
     canonical.Request(reordered);
-    CHECK(canonical.Statistics().started == 1 && canonical.Statistics().coalesced == 1);
+    canonicalTasks->RunAll(); canonical.Pump();
+    CHECK(canonical.Statistics().started == 2 && canonical.Statistics().coalesced == 0);
     CHECK(canonical.Statistics().membershipChanges == 0 && canonical.Statistics().passChanges == 0);
     CHECK(canonical.PeekReady(2)->input->backingGenerations == std::vector<uint64_t>({100,200}));
     reordered.structure.resourceIDs[0] = 30;
     canonical.Request(reordered);
-    CHECK(canonical.Statistics().membershipChanges == 1);
+    CHECK(canonical.Statistics().membershipChanges == 0);
 
     auto rotationTasks = std::make_shared<ManualTasks>();
     GraphCompileCoordinator rotation(rotationTasks, 2);
@@ -918,19 +926,21 @@ int main() {
     }
     CHECK(!oldPublication.expired());
     CHECK(rotation.WaitAndPop(1)->sequence == 1);
-    CHECK(oldPublication.expired()); // Consumed frame releases content; plan cache does not retain it.
+    CHECK(!oldPublication.expired()); // A retained compiled graph owns its exact frame input.
     CHECK(rotation.WaitAndPop(2)->sequence == 2);
     CHECK(rotation.WaitAndPop(3)->sequence == 3);
     const auto revisitedSequence = rotation.Request(Input(1, 100));
-    CHECK(rotation.PeekReady(revisitedSequence)->graph == firstPlan);
-    CHECK(rotation.Statistics().completedCacheHits == 1 && rotation.Statistics().started == 3);
+    rotationTasks->RunAll(); rotation.Pump();
+    CHECK(rotation.PeekReady(revisitedSequence)->graph != firstPlan);
+    CHECK(rotation.Statistics().completedCacheHits == 0 && rotation.Statistics().started == 4);
     CHECK(rotation.WaitAndPop(revisitedSequence)->sequence == revisitedSequence);
     firstPlan.reset();
+    CHECK(oldPublication.expired()); // No coordinator/cache ownership remains.
     for (uint64_t id = 400; id < 1300; id += 100) {
         const auto sequence = rotation.Request(Input(1, id)); rotationTasks->RunAll(); rotation.Pump();
         CHECK(rotation.WaitAndPop(sequence)->sequence == sequence);
     }
-    CHECK(evictedPlan.expired()); // Eight completed structures at most.
+    CHECK(evictedPlan.expired()); // No completed structure is retained by the coordinator.
     rotation.Reset(2);
     const auto beforeResetBuilds = rotation.Statistics().started;
     rotation.Request(Input(2, 1200)); rotationTasks->RunAll(); rotation.Pump();

@@ -6,6 +6,7 @@
 #include "Render/CommandListPool.h"
 #include "Render/Runtime/IStatisticsService.h"
 #include <chrono>
+#include <functional>
 #include <rhi.h>
 #include <stdexcept>
 #include <string>
@@ -26,7 +27,7 @@ struct RealizedResourceBundle {
     // ExternalBindingKey resolved during ordered admission.
     std::vector<uint32_t> admissionBoundResources;
     std::shared_ptr<const FrozenExecutionBindings> bindings;
-    std::vector<PreparedBackingState> initialStates;
+    std::shared_ptr<const std::vector<PreparedBackingState>> initialStates;
     std::vector<std::shared_ptr<const void>> leases;
 };
 
@@ -38,7 +39,7 @@ struct RenderFrameSnapshot {
     std::shared_ptr<const GraphExecutionLayout> layout;
     std::vector<PreparedPass> passes;
     std::shared_ptr<const FrozenExecutionBindings> bindings;
-    std::vector<PreparedBackingState> initialStates;
+    std::shared_ptr<const std::vector<PreparedBackingState>> initialStates;
     std::vector<std::vector<ExternalTimelinePoint>> externalWaitsByPreparedPass;
     std::shared_ptr<const PreparedExecutionBarrierPlan> barrierPlan;
     std::vector<std::shared_ptr<const void>> leases;
@@ -50,7 +51,7 @@ struct PreparedFramePayload final : IFramePayloadLifecycle {
     uint32_t preparationSlot = 0;
     std::vector<PreparedPass> passes;
     std::shared_ptr<const FrozenExecutionBindings> bindings;
-    std::vector<PreparedBackingState> initialStates;
+    std::shared_ptr<const std::vector<PreparedBackingState>> initialStates;
     std::vector<std::vector<ExternalTimelinePoint>> externalWaitsByPreparedPass;
     std::vector<std::shared_ptr<const void>> leases;
     std::shared_ptr<const RealizedResourceBundle> resources;
@@ -89,7 +90,7 @@ struct PreparedBatchRecording {
 // can reserve an execution slot before any backend object is mutated.
 inline std::vector<PreparedBatchRecording> BuildPreparedBatchRecordings(
     const RenderFrameSnapshot& frame) {
-    BT_ZONE_SCOPE("ORG.AsyncExecution.BuildRecordingPlan");
+    BT_ZONE_SCOPE("ORG.Execution.BuildRecordingPlan");
     if (!frame.layout || !frame.layout->bundle || !frame.layout->bundle->graph
         || frame.passes.size() != frame.layout->placements.size())
         throw std::invalid_argument("Incomplete async recording plan input");
@@ -136,7 +137,8 @@ inline std::shared_ptr<const PreparedFramePayload> BuildPreparedFramePayload(
     result->preparationSlot = preparationSlot;
     result->passes = std::move(passes);
     result->bindings = std::move(bindings);
-    result->initialStates = std::move(initialStates);
+    result->initialStates = std::make_shared<const std::vector<PreparedBackingState>>(
+        std::move(initialStates));
     result->externalWaitsByPreparedPass = std::move(externalWaitsByPreparedPass);
     result->leases = std::move(leases);
     return result;
@@ -157,7 +159,8 @@ inline std::shared_ptr<const PreparedFramePayload> BuildPreparedFramePayloadWith
     result->preparationSlot = preparationSlot;
     result->passes = std::move(passes);
     result->bindings = resources->bindings;
-    result->initialStates = std::move(initialStates);
+    result->initialStates = std::make_shared<const std::vector<PreparedBackingState>>(
+        std::move(initialStates));
     result->externalWaitsByPreparedPass = std::move(externalWaitsByPreparedPass);
     result->leases = resources->leases;
     result->resources = std::move(resources);
@@ -170,7 +173,7 @@ inline std::shared_ptr<const PreparedFramePayload> BuildPreparedFramePayload(
     std::vector<std::vector<ExternalTimelinePoint>> externalWaitsByPreparedPass = {},
     uint32_t preparationSlot = 0) {
     if (!resources || !frameNumber || !resources->bindings || passes.empty()
-        || resources->initialStates.empty())
+        || !resources->initialStates || resources->initialStates->empty())
         throw std::invalid_argument("Incomplete realized frame payload");
     for (const auto& pass : passes)
         if (!pass) throw std::invalid_argument("Legacy pass prevents async frame preparation");
@@ -191,15 +194,16 @@ inline std::shared_ptr<const RenderFrameSnapshot> BuildRenderFrameSnapshot(
     std::shared_ptr<const GraphExecutionLayout> layout,
     std::vector<PreparedPass> passes,
     std::shared_ptr<const FrozenExecutionBindings> bindings,
-    std::vector<PreparedBackingState> initialStates,
+    std::shared_ptr<const std::vector<PreparedBackingState>> initialStates,
     std::shared_ptr<const PreparedExecutionBarrierPlan> barrierPlan,
     std::vector<std::shared_ptr<const void>> leases = {},
     std::vector<std::vector<ExternalTimelinePoint>> externalWaitsByPreparedPass = {},
     std::shared_ptr<const RealizedResourceBundle> resources = {},
     uint32_t preparationSlot = 0) {
-    BT_ZONE_SCOPE("ORG.AsyncExecution.BuildFrameSnapshot");
+    BT_ZONE_SCOPE("ORG.Execution.BuildFrameSnapshot");
     if (!frameNumber || !layout || !layout->bundle || !bindings
-        || passes.size() != layout->placements.size() || initialStates.empty() || !barrierPlan
+        || passes.size() != layout->placements.size() || !initialStates
+        || initialStates->empty() || !barrierPlan
         || (!externalWaitsByPreparedPass.empty() && externalWaitsByPreparedPass.size() != passes.size())
         || barrierPlan->batches.size() != layout->bundle->graph->batches.size())
         throw std::invalid_argument("Incomplete async render-frame snapshot");
@@ -228,7 +232,7 @@ inline std::shared_ptr<const RenderFrameSnapshot> BuildRenderFrameSnapshot(
     if (!layout || !layout->bundle || !layout->bundle->graph)
         throw std::invalid_argument("Missing compiled layout for state admission");
     auto barrierPlan = std::make_shared<const PreparedExecutionBarrierPlan>(
-        stateLedger.Prepare(*layout->bundle->graph, payload->initialStates));
+        stateLedger.Prepare(*layout->bundle->graph, *payload->initialStates));
     return BuildRenderFrameSnapshot(payload->frameNumber, std::move(layout),
         payload->passes, payload->bindings, payload->initialStates,
         std::move(barrierPlan), payload->leases, payload->externalWaitsByPreparedPass,
@@ -250,9 +254,10 @@ class PreparedRhiExecutionBatch final : public IPreparedExecutionBatch {
 public:
     PreparedRhiExecutionBatch(uint32_t queueSlot, rhi::Queue queue, std::vector<rhi::CommandList> lists,
         std::vector<PreparedTimelineBinding> timelines, std::shared_ptr<const void> lease,
-        std::vector<PreparedPass> submissionEffects = {})
+        std::vector<PreparedPass> submissionEffects = {}, std::function<void()> retireCommandLists = {})
         : m_queueSlot(queueSlot), m_queue(queue), m_lists(std::move(lists)), m_timelines(std::move(timelines)),
-          m_lease(std::move(lease)), m_submissionEffects(std::move(submissionEffects)) {
+          m_lease(std::move(lease)), m_submissionEffects(std::move(submissionEffects)),
+          m_retireCommandLists(std::move(retireCommandLists)) {
         if (!m_queue || m_lists.empty() || !m_lease || m_lists.size() > UINT32_MAX)
             throw std::invalid_argument("Incomplete prepared RHI packet");
         for (auto list : m_lists) if (!list) throw std::invalid_argument("Invalid command list");
@@ -296,7 +301,7 @@ public:
             try { pass.CommitSubmitted({batch.signal.value}); }
             catch (...) {
                 lifecycleFailed = true;
-                basic_telemetry::AddCounter("ORG.AsyncExecution.SubmissionLifecycleFailures");
+                basic_telemetry::AddCounter("ORG.Execution.SubmissionLifecycleFailures");
             }
         }
         if (lifecycleFailed)
@@ -319,7 +324,14 @@ public:
     void Complete(uint64_t submission) const noexcept override {
         for (const auto& pass : m_submissionEffects) {
             try { pass.CommitCompleted({submission}); }
-            catch (...) { basic_telemetry::AddCounter("ORG.AsyncExecution.InvalidCompletionTransition"); }
+            catch (...) { basic_telemetry::AddCounter("ORG.Execution.InvalidCompletionTransition"); }
+        }
+        // Admission has observed every queue completion for this execution.
+        // Return command allocators immediately instead of waiting for the
+        // retired execution's diagnostic/resource garbage to be destroyed.
+        if (!m_commandListsRetired.exchange(true) && m_retireCommandLists) {
+            try { m_retireCommandLists(); }
+            catch (...) { basic_telemetry::AddCounter("ORG.CommandListPool.RetirementFailures"); }
         }
     }
     void Abandon() const noexcept override {
@@ -330,7 +342,7 @@ private:
     void AbandonEffects() const noexcept {
         for (const auto& pass : m_submissionEffects) {
             try { pass.Abandon(AbandonReason::AdmissionFailed); }
-            catch (...) { basic_telemetry::AddCounter("ORG.AsyncExecution.AbandonLifecycleFailures"); }
+            catch (...) { basic_telemetry::AddCounter("ORG.Execution.AbandonLifecycleFailures"); }
         }
     }
     uint32_t m_queueSlot;
@@ -339,21 +351,30 @@ private:
     std::vector<PreparedTimelineBinding> m_timelines;
     std::shared_ptr<const void> m_lease;
     std::vector<PreparedPass> m_submissionEffects;
+    mutable std::function<void()> m_retireCommandLists;
     mutable std::atomic_bool m_consumed{false};
+    mutable std::atomic_bool m_commandListsRetired{false};
 };
 
 // One owned recording packet. The binding table transitively owns descriptor
 // snapshots and backing versions; pass data owns immutable pipeline references.
-// Member order retires command lists before their allocators and bindings.
+// A recording allocation returns its queue-scoped pair only after frame
+// ownership proves GPU completion. Member order retires command lists before
+// their allocators and bindings.
 struct FrameCommandAllocation {
     std::shared_ptr<CommandListPool> pool;
     CommandListPair pair;
     bool closed = false;
+    void RecycleAfterCompletion() noexcept {
+        if (!pool) return;
+        try { pool->RecycleForNextRequest(std::move(pair)); }
+        catch (...) { pool->Discard(std::move(pair)); }
+        pool.reset();
+    }
     ~FrameCommandAllocation() {
         if (!pool) return;
         if (!closed) { pool->Discard(std::move(pair)); return; }
-        try { pool->RecycleForNextRequest(std::move(pair)); }
-        catch (...) { pool->Discard(std::move(pair)); }
+        RecycleAfterCompletion();
     }
 };
 
@@ -403,7 +424,7 @@ struct OwnedRecordingList {
 inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecutionBatch(
     uint32_t queueSlot, rhi::Queue queue, std::vector<OwnedRecordingList> recordings,
     std::vector<PreparedTimelineBinding> timelines, std::shared_ptr<const void> runtimeOwner) {
-    BT_ZONE_SCOPE("ORG.AsyncExecution.RecordOwnedBatch");
+    BT_ZONE_SCOPE("ORG.Execution.RecordOwnedBatch");
     if (!runtimeOwner || recordings.empty()) throw std::invalid_argument("Missing recording ownership");
     struct Ownership {
         std::shared_ptr<const void> runtime;
@@ -432,13 +453,20 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
     auto ownership = std::make_shared<Ownership>(Ownership{std::move(runtimeOwner), std::move(recordings)});
     std::vector<rhi::CommandList> lists;
     std::vector<PreparedPass> submissionEffects;
+    std::vector<std::shared_ptr<FrameCommandAllocation>> allocations;
     lists.reserve(ownership->recordings.size());
+    allocations.reserve(ownership->recordings.size());
     for (const auto& recording : ownership->recordings) {
         lists.push_back(recording.allocation->pair.list.Get());
+        allocations.push_back(recording.allocation);
         submissionEffects.insert(submissionEffects.end(), recording.passes.begin(), recording.passes.end());
     }
     auto packet = std::make_shared<const PreparedRhiExecutionBatch>(queueSlot, queue,
-        std::move(lists), std::move(timelines), ownership, std::move(submissionEffects));
+        std::move(lists), std::move(timelines), ownership, std::move(submissionEffects),
+        [allocations = std::move(allocations)]() mutable {
+            for (const auto& allocation : allocations) allocation->RecycleAfterCompletion();
+            allocations.clear();
+        });
     for (const auto& recording : ownership->recordings) {
         RecordingContext context(recording.allocation->pair.list.Get(), recording.bindings, recording.externalBindings);
         auto* statistics = recording.statistics.get();
@@ -492,7 +520,7 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
         if (statistics && statistics->gpuQueries)
             statistics->service->ResolveQueries(statistics->frameIndex, queue, context.Commands(), statistics->queries);
         if (context.Commands().EndChecked() != rhi::Result::Ok) {
-            basic_telemetry::AddCounter("ORG.AsyncExecution.RecordingCloseFailures");
+            basic_telemetry::AddCounter("ORG.Execution.RecordingCloseFailures");
             std::string names;
             for (const auto& pass : recording.passes) {
                 if (!names.empty()) names += ", ";

@@ -27,12 +27,24 @@ inline void MaterializeDeclaredBindlessView(Resource& resource, BindlessViewKind
     if (!indexed) return;
     try {
         switch (kind) {
-        case BindlessViewKind::ShaderResource: indexed->GetSRVInfo(0); break;
-        case BindlessViewKind::UnorderedAccess: indexed->GetUAVShaderVisibleInfo(0); break;
-        case BindlessViewKind::NonShaderVisibleUnorderedAccess: indexed->GetUAVNonShaderVisibleInfo(0); break;
-        case BindlessViewKind::RenderTarget: indexed->GetRTVInfo(0); break;
-        case BindlessViewKind::DepthStencil: indexed->GetDSVInfo(0); break;
-        case BindlessViewKind::ConstantBuffer: indexed->GetCBVInfo(); break;
+        case BindlessViewKind::ShaderResource:
+            if (indexed->HasSRV()) indexed->GetSRVInfo(0);
+            break;
+        case BindlessViewKind::UnorderedAccess:
+            if (indexed->HasUAVShaderVisible()) indexed->GetUAVShaderVisibleInfo(0);
+            break;
+        case BindlessViewKind::NonShaderVisibleUnorderedAccess:
+            if (indexed->HasUAVNonShaderVisible()) indexed->GetUAVNonShaderVisibleInfo(0);
+            break;
+        case BindlessViewKind::RenderTarget:
+            if (indexed->HasRTV()) indexed->GetRTVInfo(0);
+            break;
+        case BindlessViewKind::DepthStencil:
+            if (indexed->HasDSV()) indexed->GetDSVInfo(0);
+            break;
+        case BindlessViewKind::ConstantBuffer:
+            if (indexed->HasCBV()) indexed->GetCBVInfo();
+            break;
         }
     }
     catch (...) {
