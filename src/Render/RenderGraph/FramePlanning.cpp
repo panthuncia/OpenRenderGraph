@@ -46,7 +46,8 @@ std::shared_ptr<const PlannedFrameState> FramePlanningState::Plan(
         *bundle->graph, initial, result->invalidated));
     result->snapshot = BuildRenderFrameSnapshot(payload->frameNumber, std::move(layout), payload->passes,
         payload->bindings, payload->initialStates, barriers, payload->leases,
-        payload->externalWaitsByPreparedPass, payload->resources, payload->preparationSlot);
+        payload->externalWaitsByPreparedPass, payload->resources, payload->preparationSlot,
+        payload->frameData);
     const auto& graph = *bundle->graph;
     std::vector<std::vector<ExecutionTimelinePoint>> incoming(graph.batches.size());
     planningLedgers.accesses.AppendIncomingWaits(graph, *result->snapshot->initialStates, queues, incoming);
@@ -221,7 +222,7 @@ SynchronousFramePlan SynchronousPlanningState::Plan(
     result.snapshot = BuildRenderFrameSnapshot(payload->frameNumber, std::move(layout),
         payload->passes, payload->bindings, payload->initialStates, std::move(barriers),
         payload->leases, payload->externalWaitsByPreparedPass, payload->resources,
-        payload->preparationSlot);
+        payload->preparationSlot, payload->frameData);
     result.incomingWaits.resize(bundle->graph->batches.size());
     m_accesses.AppendIncomingWaits(*bundle->graph, *result.snapshot->initialStates,
         queues, result.incomingWaits);

@@ -1795,66 +1795,91 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
     size_t unresolvedReferencedCount = 0;
     {
     BT_ZONE_SCOPE("ORG.FreshCompile.RealizationCollection");
+    size_t capturedBackingCount = 0;
+    size_t capturedBindlessCount = 0;
+    size_t realizationSeedHitCount = 0;
     for (uint32_t r = 0; r < input.structure.resourceIDs.size(); ++r) {
         const auto original = capturedToOriginal[r];
         const auto concreteID = m_frameDAGResourceIDsByIndex[original];
         capturedIndices.emplace(concreteID, r);
         auto* resource = original < m_frameDAGResourcePtrByIndex.size() ? m_frameDAGResourcePtrByIndex[original] : nullptr;
+        auto* dynamicResource = dynamic_cast<DynamicResource*>(resource);
+        auto* concreteResource = UnwrapDynamicResource(resource);
+        auto* indexedResource = dynamic_cast<GloballyIndexedResource*>(concreteResource);
+        auto* backedResource = TryGetBackedResource(resource);
+        const auto seedKey = concreteResource;
+        auto seed = seedKey ? m_compilerState->realizationSeeds.find(seedKey)
+                            : m_compilerState->realizationSeeds.end();
         admissionBoundResources[r] = resource
-            && dynamic_cast<DynamicResource*>(resource) != nullptr
-            && TryGetBackedResource(resource) == nullptr
+            && dynamicResource != nullptr
+            && backedResource == nullptr
             && resource->GetName() == "Backbuffer"
             ? static_cast<uint32_t>(ExternalBindingKey::SwapchainColor) : 0u;
         if (!resource) ++unresolvedReferencedCount;
         if (resource && !resource->GetName().empty()) ++semanticSlotCount;
         else if (resource && (m_transientFrameResourcesByID.contains(concreteID)
-            || dynamic_cast<DynamicResource*>(resource) != nullptr)) ++unnamedTransientCount;
+            || dynamicResource != nullptr)) ++unnamedTransientCount;
         input.structure.resourceShapes.push_back(resource
             ? experimental::CompileResourceShape{(std::max)(1u, resource->GetMipLevels()),
                 (std::max)(1u, resource->GetArraySize()), resource->HasLayout()}
             : experimental::CompileResourceShape{0, 0, false});
         std::shared_ptr<const AliasHeapGeneration> capturedAliasHeap;
         uint64_t capturedAliasPoolID = 0, capturedAliasOffset = 0, capturedAliasSize = 0;
-        if (auto* backed = TryGetBackedResource(resource)) {
-            BT_ZONE_SCOPE("ORG.FreshCompile.CaptureBackingAllocation");
-            input.backingGenerations[r] = backed->GetBackingGeneration();
-            auto retainedSnapshot = asynchronous
-                ? backed->CapturePublishedBackingAllocation()
-                : std::shared_ptr<const BackingAllocationSnapshot>{};
-            auto snapshot = retainedSnapshot
-                ? *retainedSnapshot : backed->CaptureBackingAllocation(false);
-            if (snapshot.resource) {
-                capturedAliasHeap = snapshot.aliasHeap;
-                capturedAliasPoolID = snapshot.aliasPoolID;
-                capturedAliasOffset = snapshot.aliasOffset;
-                capturedAliasSize = snapshot.aliasSize;
-                frozenResources.push_back({snapshot.resource,
-                    asynchronous ? std::shared_ptr<const void>{retainedSnapshot}
-                                 : std::shared_ptr<const void>{},
-                    dynamic_cast<GloballyIndexedResource*>(UnwrapDynamicResource(resource))
-                        ? dynamic_cast<GloballyIndexedResource*>(UnwrapDynamicResource(resource))->CaptureBindlessViews()
-                        : std::shared_ptr<const BindlessResourceViews>{}});
-                if (asynchronous) {
-                    basic_telemetry::AddCounter("ORG.AsyncCompile.BackingAllocationLeases");
-                }
+        if (backedResource) {
+            const auto currentGeneration = backedResource->GetBackingGeneration();
+            const bool cachedBorrowedRealization = !asynchronous
+                && seed != m_compilerState->realizationSeeds.end()
+                && seed->second.backingGeneration == currentGeneration
+                && seed->second.capturedResource;
+            if (cachedBorrowedRealization) {
+                input.backingGenerations[r] = currentGeneration;
+                capturedAliasHeap = seed->second.aliasHeap;
+                capturedAliasPoolID = seed->second.aliasPoolID;
+                capturedAliasOffset = seed->second.aliasOffset;
+                capturedAliasSize = seed->second.aliasSize;
+                frozenResources.push_back({seed->second.capturedResource, {}, seed->second.bindlessViews});
+                basic_telemetry::AddCounter("ORG.FreshCompile.BackingCaptureCacheHits");
             } else {
-                frozenResources.push_back({});
-                basic_telemetry::AddCounter("ORG.FreshCompile.UnsupportedBackingAllocation");
+                auto retainedSnapshot = asynchronous
+                    ? backedResource->CapturePublishedBackingAllocation()
+                    : std::shared_ptr<const BackingAllocationSnapshot>{};
+                auto snapshot = retainedSnapshot
+                    ? *retainedSnapshot : backedResource->CaptureBackingAllocation(false);
+                input.backingGenerations[r] = snapshot.generation;
+                ++capturedBackingCount;
+                if (snapshot.resource) {
+                    capturedAliasHeap = snapshot.aliasHeap;
+                    capturedAliasPoolID = snapshot.aliasPoolID;
+                    capturedAliasOffset = snapshot.aliasOffset;
+                    capturedAliasSize = snapshot.aliasSize;
+                    frozenResources.push_back({snapshot.resource,
+                        asynchronous ? std::shared_ptr<const void>{retainedSnapshot}
+                                     : std::shared_ptr<const void>{},
+                        indexedResource ? indexedResource->CaptureBindlessViews()
+                                        : std::shared_ptr<const BindlessResourceViews>{}});
+                    capturedBindlessCount += indexedResource != nullptr;
+                    if (asynchronous) {
+                        basic_telemetry::AddCounter("ORG.AsyncCompile.BackingAllocationLeases");
+                    }
+                } else {
+                    frozenResources.push_back({});
+                    basic_telemetry::AddCounter("ORG.FreshCompile.UnsupportedBackingAllocation");
+                }
             }
         } else {
             // Imported resources (notably swapchain images) do not implement
             // BackedResource. Freeze the concrete unwrapped Resource object;
             // retaining a mutable DynamicResource wrapper would allow its
             // backing to change underneath an in-flight recording.
-            auto* concrete = UnwrapDynamicResource(resource);
+            auto* concrete = concreteResource;
             auto owner = concrete ? concrete->weak_from_this().lock() : std::shared_ptr<Resource>{};
             auto apiResource = concrete ? concrete->GetAPIResource() : rhi::Resource{};
             if (owner && apiResource.GetHandle().valid()) {
                 frozenResources.push_back({apiResource,
                     asynchronous ? std::shared_ptr<const void>{owner} : std::shared_ptr<const void>{},
-                    dynamic_cast<GloballyIndexedResource*>(concrete)
-                        ? dynamic_cast<GloballyIndexedResource*>(concrete)->CaptureBindlessViews()
-                        : std::shared_ptr<const BindlessResourceViews>{}});
+                    indexedResource ? indexedResource->CaptureBindlessViews()
+                                    : std::shared_ptr<const BindlessResourceViews>{}});
+                capturedBindlessCount += indexedResource != nullptr;
                 if (asynchronous) input.leases.push_back(owner);
                 const auto handle = apiResource.GetHandle();
                 input.backingGenerations[r] = (uint64_t{handle.generation} << 32) | handle.index;
@@ -1875,11 +1900,9 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
         // Keep descriptor slots and the concrete allocation under the same
         // frozen binding owner. Buffer replacement already rotates slots; its
         // fence retirement must also respect CPU frames not yet submitted.
-        if (asynchronous
-            && (dynamic_cast<GloballyIndexedResource*>(UnwrapDynamicResource(resource)) != nullptr)) {
-            auto* indexed = dynamic_cast<GloballyIndexedResource*>(UnwrapDynamicResource(resource));
+        if (asynchronous && indexedResource) {
             if (!frozenResources.empty() && frozenResources.back().owner) {
-            if (auto descriptors = indexed->CaptureDescriptorOwnership()) {
+            if (auto descriptors = indexedResource->CaptureDescriptorOwnership()) {
                 auto& binding = frozenResources.back();
                 binding.descriptorOwner = std::move(descriptors);
                 input.leases.push_back(binding.descriptorOwner);
@@ -1898,9 +1921,6 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
         preparedState.aliasPoolID = capturedAliasPoolID;
         preparedState.aliasOffset = capturedAliasOffset;
         preparedState.aliasSize = capturedAliasSize;
-        const auto seedKey = resource ? UnwrapDynamicResource(resource) : nullptr;
-        auto seed = seedKey ? m_compilerState->realizationSeeds.find(seedKey)
-                            : m_compilerState->realizationSeeds.end();
         const bool seedMatches = seed != m_compilerState->realizationSeeds.end()
             && seed->second.backingGeneration == input.backingGenerations[r]
             && seed->second.resource.index == preparedState.resource.index
@@ -1910,6 +1930,7 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
             preparedState.heapType = seed->second.heapType;
             preparedState.regions = seed->second.regions;
             basic_telemetry::AddCounter("ORG.FreshCompile.RealizationSeedHits");
+            ++realizationSeedHitCount;
         } else if (resource) {
             auto regions = std::make_shared<std::vector<experimental::PreparedStateRegion>>();
             rhi::ResourceDesc resourceDesc{};
@@ -1935,12 +1956,20 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
         }
         if (!seedMatches && seedKey) {
             m_compilerState->realizationSeeds.insert_or_assign(seedKey,
-                CompilerState::RealizationSeed{input.backingGenerations[r], preparedState.resource,
-                    preparedState.shape, preparedState.heapType, preparedState.regions});
+                CompilerState::RealizationSeed{input.backingGenerations[r],
+                    r < frozenResources.size() ? frozenResources[r].resource : rhi::Resource{},
+                    preparedState.resource, preparedState.shape, preparedState.heapType,
+                    preparedState.aliasHeap, preparedState.aliasPoolID, preparedState.aliasOffset,
+                    preparedState.aliasSize,
+                    r < frozenResources.size() ? frozenResources[r].views : nullptr,
+                    preparedState.regions});
             basic_telemetry::AddCounter("ORG.FreshCompile.RealizationSeedPublications");
         }
         preparedInitialStates.push_back(std::move(preparedState));
     }
+    BT_PLOT("ORG.FreshCompile.BackingCaptures", static_cast<int64_t>(capturedBackingCount));
+    BT_PLOT("ORG.FreshCompile.BindlessCaptures", static_cast<int64_t>(capturedBindlessCount));
+    BT_PLOT("ORG.FreshCompile.RealizationSeedHitCount", static_cast<int64_t>(realizationSeedHitCount));
     }
     BT_PLOT("ORG.FreshCompile.SemanticResourceSlots", static_cast<int64_t>(semanticSlotCount));
     BT_PLOT("ORG.FreshCompile.UnnamedTransientResources", static_cast<int64_t>(unnamedTransientCount));
@@ -1966,6 +1995,8 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
         preparedResourceSlots(m_framePasses.size());
     const auto primaryBackend = m_backendDevices.empty() ? rhi::Backend::Null : m_backendDevices.front().backend;
     auto oracle = std::make_shared<experimental::DependencyEdges>();
+    const bool d3d12OwnedQueueTransfers = m_queueRegistry.SlotCount() != 0
+        && m_queueRegistry.GetBackend(static_cast<QueueSlotIndex>(0)) == rhi::Backend::D3D12;
     {
     BT_ZONE_SCOPE("ORG.FreshCompile.IR.PassConstruction");
     for (size_t index = 0; index < nodes.size(); ++index) {
@@ -1984,8 +2015,6 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
         // barriers around the compiler's relative timeline wait. Other backends
         // retain the conservative graphics route until their queue-family/API
         // ownership policy is captured as owned compiler metadata.
-        const bool d3d12OwnedQueueTransfers = m_queueRegistry.SlotCount() != 0
-            && m_queueRegistry.GetBackend(static_cast<QueueSlotIndex>(0)) == rhi::Backend::D3D12;
         if (!d3d12OwnedQueueTransfers && !input.structure.queues.empty()
             && input.structure.queues[0].active) {
             pass.compatibleQueueSlots.assign(1, 0u);
@@ -2209,7 +2238,7 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
 			// snapshot assembled above. Fan it out while this frame exclusively owns
 			// pass preparation; the next Update joins this preparation owner before it
 			// can mutate any pass again.
-			if (asynchronous)
+            if (asynchronous)
 				m_taskService->ParallelForLimited("ORG.Execution.PreparePass", m_framePasses.size(), 4, preparePass);
 			else
 				for (size_t passIndex = 0; passIndex < m_framePasses.size(); ++passIndex)
@@ -2231,7 +2260,8 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
 				BT_ZONE_SCOPE("ORG.Execution.BuildPreparedPayload");
 				auto preparedPayload = experimental::BuildPreparedFramePayload(
 					preparation.frameNumber, std::move(packets), basis->resources,
-					std::move(basis->externalWaitsByPreparedPass), preparation.preparationSlot);
+					std::move(basis->externalWaitsByPreparedPass), preparation.preparationSlot,
+					basis->updateData);
 				input.executionPayload = preparedPayload;
 				if (asynchronous)
                     input.executionLifecycle = preparedPayload;

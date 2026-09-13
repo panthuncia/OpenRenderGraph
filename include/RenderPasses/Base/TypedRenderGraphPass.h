@@ -49,13 +49,12 @@ public:
             if (!m_declaredBindings || !context.bindings || !context.resourceSlots)
                 throw std::logic_error("Declared pass prepared without resolved declarations");
             // The permission table is built once for this owned frame and is
-            // already immutable. Retain it directly; deep-copying the same hash
-            // table once per pass was a sizeable part of dependency capture.
+            // already immutable. FrozenExecutionBindings validated the complete
+            // resource table at construction, and CaptureResource validates the
+            // declarations actually used by this pass. Re-resolving every alias
+            // of every declaration here made preparation scale with declaration
+            // volume even when a pass captured only a handful of resources.
             auto slots = context.resourceSlots;
-            for (const auto& [id, slot] : *slots) {
-                (void)id;
-                (void)context.bindings->Resolve(PreparedResourceReference{slot});
-            }
             auto data = [&]() -> FrameData {
                 if constexpr (requires(const Derived& pass, const Bindings& bindings,
                     const PassPrepareContext& prepare) {

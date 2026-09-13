@@ -705,6 +705,7 @@ public:
 	// logical frame before blocking for the exact queue head.
 	bool ShouldDeferAsyncAdmission();
 	std::optional<uint32_t> GetLastExecutedPreparationSlot() const noexcept;
+	std::shared_ptr<const IHostExecutionData> GetLastSubmittedFrameData() const noexcept;
 	void CompileStructural();
 	void ResetForFrame();
 	void ResetForRebuild();

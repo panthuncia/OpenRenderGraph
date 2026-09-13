@@ -9556,7 +9556,7 @@ bool RenderGraph::PrepareSelectedAsyncFrame(PassExecutionContext& context) {
                 states);
         payload = experimental::BuildPreparedFramePayloadWithInitialStates(
             payload->frameNumber, payload->passes, std::move(resources), std::move(states),
-            payload->externalWaitsByPreparedPass, payload->preparationSlot);
+            payload->externalWaitsByPreparedPass, payload->preparationSlot, payload->frameData);
         basic_telemetry::AddCounter("ORG.Execution.ExternalResourcesBound");
     }
     std::vector<experimental::ExecutionTimelinePoint> queues;
@@ -9634,6 +9634,10 @@ bool RenderGraph::ShouldDeferAsyncAdmission() {
 
 std::optional<uint32_t> RenderGraph::GetLastExecutedPreparationSlot() const noexcept {
     return m_compilerState ? m_compilerState->lastExecutedPreparationSlot : std::nullopt;
+}
+
+std::shared_ptr<const IHostExecutionData> RenderGraph::GetLastSubmittedFrameData() const noexcept {
+    return m_compilerState ? m_compilerState->lastSubmittedFrameData : nullptr;
 }
 
 bool RenderGraph::TryExecuteSelectedAsyncFrame(PassExecutionContext& context, bool queueOnly) {
@@ -9803,6 +9807,17 @@ bool RenderGraph::TryExecuteSelectedAsyncFrame(PassExecutionContext& context, bo
             }
             if (readyIndex != ready.size())
                 throw std::logic_error("Command-list batch demand did not match recording jobs");
+
+            // Advance/collect the Tracy GPU context once per queue generation,
+            // before recording workers can allocate zone queries. Vulkan also
+            // records its collection commands into this first submitted list.
+            const auto firstJob = std::ranges::find_if(recordingJobs,
+                [slot](const experimental::FrameRecordingJob& job) { return job.slot == slot; });
+            if (firstJob != recordingJobs.end()) {
+                auto firstCommandList = firstJob->recording.allocation->pair.list.Get();
+                firstJob->queue.TracyGpuFrameBegin(firstCommandList);
+                basic_telemetry::AddCounter("ORG.TracyGpuZones.FrameBegins");
+            }
         }
     }
     // Typed packets are owned and worker-safe by construction. Hand-authored
@@ -9991,6 +10006,7 @@ bool RenderGraph::TrySubmitRecordedFrame(PassExecutionContext&) {
         m_compilerState->pendingPresentationSequence =
             frame->layout->bundle->sequence;
         m_compilerState->lastExecutedPreparationSlot = frame->preparationSlot;
+        m_compilerState->lastSubmittedFrameData = frame->frameData;
         BT_PLOT("ORG.Execution.SubmittedSequence",
             static_cast<int64_t>(frame->layout->bundle->sequence));
         BT_PLOT("ORG.Execution.ReadyQueueDepth",

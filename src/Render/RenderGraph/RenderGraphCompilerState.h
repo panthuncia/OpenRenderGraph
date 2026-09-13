@@ -43,9 +43,15 @@ struct RenderGraph::CompilerState {
     // Stable concrete versions publish their immutable admission seed once.
     struct RealizationSeed {
         uint64_t backingGeneration = 0;
+        rhi::Resource capturedResource{};
         rhi::ResourceHandle resource{};
         experimental::CompileResourceShape shape{};
         rhi::HeapType heapType = rhi::HeapType::DeviceLocal;
+        std::shared_ptr<const AliasHeapGeneration> aliasHeap;
+        uint64_t aliasPoolID = 0;
+        uint64_t aliasOffset = 0;
+        uint64_t aliasSize = 0;
+        std::shared_ptr<const BindlessResourceViews> bindlessViews;
         std::shared_ptr<const std::vector<experimental::PreparedStateRegion>> regions;
     };
     std::unordered_map<const Resource*, RealizationSeed> realizationSeeds;
@@ -116,6 +122,7 @@ struct RenderGraph::CompilerState {
     uint64_t nextAsyncExecutionSequence = 1;
     uint64_t asyncPreparationFrameNumber = 0;
     std::optional<uint32_t> lastExecutedPreparationSlot;
+    std::shared_ptr<const IHostExecutionData> lastSubmittedFrameData;
     uint64_t reportedAsyncSelectionFailures = 0;
     uint64_t reportedAsyncUnownedResources = 0;
     std::unordered_set<std::string> reportedAsyncLegacyPasses;

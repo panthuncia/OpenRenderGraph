@@ -44,6 +44,7 @@ struct RenderFrameSnapshot {
     std::shared_ptr<const PreparedExecutionBarrierPlan> barrierPlan;
     std::vector<std::shared_ptr<const void>> leases;
     std::shared_ptr<const RealizedResourceBundle> resources;
+    std::shared_ptr<const IHostExecutionData> frameData;
 };
 
 struct PreparedFramePayload final : IFramePayloadLifecycle {
@@ -55,6 +56,7 @@ struct PreparedFramePayload final : IFramePayloadLifecycle {
     std::vector<std::vector<ExternalTimelinePoint>> externalWaitsByPreparedPass;
     std::vector<std::shared_ptr<const void>> leases;
     std::shared_ptr<const RealizedResourceBundle> resources;
+    std::shared_ptr<const IHostExecutionData> frameData;
     void Abandon(uint8_t reason) const noexcept override {
         if (abandoned.exchange(true)) return;
         for (const auto& pass : passes)
@@ -149,7 +151,8 @@ inline std::shared_ptr<const PreparedFramePayload> BuildPreparedFramePayloadWith
     std::shared_ptr<const RealizedResourceBundle> resources,
     std::vector<PreparedBackingState> initialStates,
     std::vector<std::vector<ExternalTimelinePoint>> externalWaitsByPreparedPass = {},
-    uint32_t preparationSlot = 0) {
+    uint32_t preparationSlot = 0,
+    std::shared_ptr<const IHostExecutionData> frameData = {}) {
     if (!resources || !frameNumber || !resources->bindings || passes.empty() || initialStates.empty())
         throw std::invalid_argument("Incomplete realized frame payload");
     for (const auto& pass : passes)
@@ -164,6 +167,7 @@ inline std::shared_ptr<const PreparedFramePayload> BuildPreparedFramePayloadWith
     result->externalWaitsByPreparedPass = std::move(externalWaitsByPreparedPass);
     result->leases = resources->leases;
     result->resources = std::move(resources);
+    result->frameData = std::move(frameData);
     return result;
 }
 
@@ -171,7 +175,8 @@ inline std::shared_ptr<const PreparedFramePayload> BuildPreparedFramePayload(
     uint64_t frameNumber, std::vector<PreparedPass> passes,
     std::shared_ptr<const RealizedResourceBundle> resources,
     std::vector<std::vector<ExternalTimelinePoint>> externalWaitsByPreparedPass = {},
-    uint32_t preparationSlot = 0) {
+    uint32_t preparationSlot = 0,
+    std::shared_ptr<const IHostExecutionData> frameData = {}) {
     if (!resources || !frameNumber || !resources->bindings || passes.empty()
         || !resources->initialStates || resources->initialStates->empty())
         throw std::invalid_argument("Incomplete realized frame payload");
@@ -186,6 +191,7 @@ inline std::shared_ptr<const PreparedFramePayload> BuildPreparedFramePayload(
     result->externalWaitsByPreparedPass = std::move(externalWaitsByPreparedPass);
     result->leases = resources->leases;
     result->resources = std::move(resources);
+    result->frameData = std::move(frameData);
     return result;
 }
 
@@ -199,7 +205,8 @@ inline std::shared_ptr<const RenderFrameSnapshot> BuildRenderFrameSnapshot(
     std::vector<std::shared_ptr<const void>> leases = {},
     std::vector<std::vector<ExternalTimelinePoint>> externalWaitsByPreparedPass = {},
     std::shared_ptr<const RealizedResourceBundle> resources = {},
-    uint32_t preparationSlot = 0) {
+    uint32_t preparationSlot = 0,
+    std::shared_ptr<const IHostExecutionData> frameData = {}) {
     BT_ZONE_SCOPE("ORG.Execution.BuildFrameSnapshot");
     if (!frameNumber || !layout || !layout->bundle || !bindings
         || passes.size() != layout->placements.size() || !initialStates
@@ -221,6 +228,7 @@ inline std::shared_ptr<const RenderFrameSnapshot> BuildRenderFrameSnapshot(
     result->barrierPlan = std::move(barrierPlan);
     result->leases = std::move(leases);
     result->resources = std::move(resources);
+    result->frameData = std::move(frameData);
     return result;
 }
 
@@ -236,7 +244,7 @@ inline std::shared_ptr<const RenderFrameSnapshot> BuildRenderFrameSnapshot(
     return BuildRenderFrameSnapshot(payload->frameNumber, std::move(layout),
         payload->passes, payload->bindings, payload->initialStates,
         std::move(barrierPlan), payload->leases, payload->externalWaitsByPreparedPass,
-        payload->resources, payload->preparationSlot);
+        payload->resources, payload->preparationSlot, payload->frameData);
 }
 
 // Numeric IDs are admission identities, never casts of backend handles.
@@ -469,6 +477,26 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
         });
     for (const auto& recording : ownership->recordings) {
         RecordingContext context(recording.allocation->pair.list.Get(), recording.bindings, recording.externalBindings);
+        struct TracyGpuZoneScope {
+            rhi::CommandList& commands;
+            bool open = false;
+            TracyGpuZoneScope(rhi::CommandList& commandList, const rhi::Queue& queue, const char* name)
+                : commands(commandList) {
+                const auto result = commands.BeginTracyGpuZone(queue, name);
+                open = result == rhi::Result::Ok;
+                if (open) basic_telemetry::AddCounter("ORG.TracyGpuZones.BeginAccepted");
+                else if (result != rhi::Result::Unsupported)
+                    basic_telemetry::AddCounter("ORG.TracyGpuZones.BeginFailures");
+            }
+            TracyGpuZoneScope(const TracyGpuZoneScope&) = delete;
+            TracyGpuZoneScope& operator=(const TracyGpuZoneScope&) = delete;
+            ~TracyGpuZoneScope() { Close(); }
+            void Close() noexcept {
+                if (!open) return;
+                commands.EndTracyGpuZone();
+                open = false;
+            }
+        };
         auto* statistics = recording.statistics.get();
         if (statistics) statistics->cpuMilliseconds.resize(recording.passes.size());
         if (recording.resourceDescriptorHeap.valid()) {
@@ -494,6 +522,9 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
                 }
             }
             const int statisticsIndex = statistics ? statistics->passIndices[passIndex] : -1;
+            const auto debugName = recording.passes[passIndex].DebugName();
+            TracyGpuZoneScope tracyGpuZone(context.Commands(), queue,
+                debugName.empty() ? "<unnamed>" : debugName.data());
             if (statisticsIndex >= 0 && statistics->gpuQueries)
                 statistics->service->BeginQuery(static_cast<unsigned>(statisticsIndex), statistics->frameIndex,
                     queue, context.Commands(), statistics->queries);
@@ -516,6 +547,7 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
                     context.Commands().Barriers(barriers);
                 }
             }
+            tracyGpuZone.Close();
         }
         if (statistics && statistics->gpuQueries)
             statistics->service->ResolveQueries(statistics->frameIndex, queue, context.Commands(), statistics->queries);
