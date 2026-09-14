@@ -23,35 +23,13 @@
 namespace org {
 
 inline void MaterializeDeclaredBindlessView(Resource& resource, BindlessViewKind kind) {
-    auto* indexed = dynamic_cast<GloballyIndexedResource*>(&resource);
-    if (!indexed) return;
-    try {
-        switch (kind) {
-        case BindlessViewKind::ShaderResource:
-            if (indexed->HasSRV()) indexed->GetSRVInfo(0);
-            break;
-        case BindlessViewKind::UnorderedAccess:
-            if (indexed->HasUAVShaderVisible()) indexed->GetUAVShaderVisibleInfo(0);
-            break;
-        case BindlessViewKind::NonShaderVisibleUnorderedAccess:
-            if (indexed->HasUAVNonShaderVisible()) indexed->GetUAVNonShaderVisibleInfo(0);
-            break;
-        case BindlessViewKind::RenderTarget:
-            if (indexed->HasRTV()) indexed->GetRTVInfo(0);
-            break;
-        case BindlessViewKind::DepthStencil:
-            if (indexed->HasDSV()) indexed->GetDSVInfo(0);
-            break;
-        case BindlessViewKind::ConstantBuffer:
-            if (indexed->HasCBV()) indexed->GetCBVInfo();
-            break;
-        }
-    }
-    catch (...) {
-        spdlog::error("Failed to materialize declared bindless view: resource='{}' kind={}",
-            resource.GetName(), static_cast<uint32_t>(kind));
-        throw;
-    }
+    // Binding tokens identify resources, not physical descriptor slots. External
+    // passes are declared before their referenced resources are materialized, so
+    // touching descriptor grids here can observe an intentionally empty (or
+    // concurrently rotating) publication. Resolve the concrete view later from
+    // the generation-owned preparation snapshot.
+    (void)resource;
+    (void)kind;
 }
 
 struct Mip {
@@ -929,8 +907,18 @@ public:
     uint32_t DeclaredBindlessIndex(const std::shared_ptr<ResourceT>& resource,
         BindlessViewRequest request) const {
         if (!resource) throw std::invalid_argument("Cannot resolve a view for an empty declared resource");
-        const auto views = resource->CaptureBindlessViews();
-        if (!views) throw std::out_of_range("Declared resource publishes no bindless views");
+        auto views = resource->CaptureBindlessViews();
+        if (!views) {
+            // Legacy declarations freeze a physical descriptor index immediately
+            // instead of returning a binding token. They therefore cannot wait for
+            // the normal post-declaration materialization phase.
+            (void)resource->GetAPIResource();
+            views = resource->CaptureBindlessViews();
+        }
+        if (!views) {
+            throw std::out_of_range("Declared resource '" + resource->GetName() +
+                "' publishes no bindless views");
+        }
         return views->Resolve(request).index;
     }
     ResourceBindingToken MakeBindingToken(const ResourceIdentifier& identifier) const {
