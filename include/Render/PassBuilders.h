@@ -909,10 +909,11 @@ public:
         if (!resource) throw std::invalid_argument("Cannot resolve a view for an empty declared resource");
         auto views = resource->CaptureBindlessViews();
         if (!views) {
-            // Legacy declarations freeze a physical descriptor index immediately
-            // instead of returning a binding token. They therefore cannot wait for
-            // the normal post-declaration materialization phase.
-            (void)resource->GetAPIResource();
+            // Legacy declarations freeze a descriptor index immediately instead of
+            // returning a binding token. Reserve the resource's stable virtual slots
+            // without forcing an aliased resource to acquire physical backing before
+            // structural compilation has computed its placement.
+            resource->EnsureVirtualDescriptorSlotsAllocated();
             views = resource->CaptureBindlessViews();
         }
         if (!views) {

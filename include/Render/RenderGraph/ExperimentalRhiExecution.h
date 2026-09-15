@@ -523,8 +523,19 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
             }
             const int statisticsIndex = statistics ? statistics->passIndices[passIndex] : -1;
             const auto debugName = recording.passes[passIndex].DebugName();
+            // Copy batches are recorded concurrently and already have explicit
+            // CPU/statistics attribution. Injecting a Tracy timestamp pair and
+            // ResolveQueryData for every tiny copy pass makes the profiler's
+            // queue-wide query/readback state another concurrent writer. DX12
+            // can report that earlier instrumentation error only when a later
+            // command list closes, obscuring the actual pass. Keep GPU zones on
+            // graphics/compute queues and leave copy lists instrumentation-free.
+            const bool allowTracyGpuZone = !statistics ||
+                statistics->queueKind != rhi::QueueKind::Copy;
             TracyGpuZoneScope tracyGpuZone(context.Commands(), queue,
-                debugName.empty() ? "<unnamed>" : debugName.data());
+                allowTracyGpuZone
+                    ? (debugName.empty() ? "<unnamed>" : debugName.data())
+                    : nullptr);
             if (statisticsIndex >= 0 && statistics->gpuQueries)
                 statistics->service->BeginQuery(static_cast<unsigned>(statisticsIndex), statistics->frameIndex,
                     queue, context.Commands(), statistics->queries);
