@@ -238,6 +238,14 @@ private:
 	std::vector<std::vector<UploadPagePtr>> m_framePages;
 	UploadPagePtr             m_activePage;
 	std::atomic_size_t         m_nextPageIndex = 0;
+	struct PageLifetimeTrace {
+		std::weak_ptr<Resource> buffer;
+		size_t capacity = 0;
+		size_t index = 0;
+		bool dedicated = false;
+	};
+	std::mutex m_pageLifetimeTraceMutex;
+	std::vector<PageLifetimeTrace> m_pageLifetimeTraces;
 	uint8_t                    m_numFramesInFlight;
 	size_t                     m_currentFrameUploadBytes = 0;
 	std::vector<size_t>        m_recentFrameBytes;
@@ -254,6 +262,7 @@ private:
 	};
 	std::unordered_map<std::string, UploadTelemetryTarget> m_uploadTelemetryTargets;
 	std::chrono::steady_clock::time_point m_uploadTelemetryLastLog{};
+	std::chrono::steady_clock::time_point m_lifetimeTelemetryLastLog{};
 	uint64_t m_uploadTelemetryBufferWrites = 0;
 	uint64_t m_uploadTelemetryTextureWrites = 0;
 	uint64_t m_uploadTelemetryBytes = 0;

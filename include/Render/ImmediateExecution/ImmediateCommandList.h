@@ -210,10 +210,18 @@ namespace org::imm {
         // type-erased owning payload
         std::shared_ptr<void> shared;
         std::unique_ptr<void, void(*)(void*)> unique;
+		uint64_t resourceID = 0;
+		std::string resourceName;
     };
 
     struct KeepAliveBag {
+		KeepAliveBag();
+		~KeepAliveBag();
+		KeepAliveBag(const KeepAliveBag&) = delete;
+		KeepAliveBag& operator=(const KeepAliveBag&) = delete;
         std::vector<LifetimePin> pins;
+		uint64_t traceID = 0;
+		std::string traceOwner;
         template<class T>
         uint32_t pinUnique(std::unique_ptr<T> v) {
             pins.push_back(LifetimePin{
@@ -224,10 +232,22 @@ namespace org::imm {
         }
         template<class T>
         uint32_t pinShared(std::shared_ptr<T> v) {
-            pins.push_back(LifetimePin{
+			uint64_t resourceID = 0;
+			std::string resourceName;
+			if constexpr (requires(const T& value) {
+				value.GetGlobalResourceID(); value.GetName();
+			}) {
+				if (v) {
+					resourceID = v->GetGlobalResourceID();
+					resourceName = v->GetName();
+				}
+			}
+            LifetimePin pin{
                 std::static_pointer_cast<void>(std::move(v)),
-                std::unique_ptr<void, void(*)(void*)>{ nullptr, +[](void*) noexcept {} } // Annoying
-                });
+				std::unique_ptr<void, void(*)(void*)>{ nullptr, +[](void*) noexcept {} }, // Annoying
+				resourceID, std::move(resourceName)
+			};
+			pins.push_back(std::move(pin));
             return static_cast<uint32_t>(pins.size() - 1);
         }
     };

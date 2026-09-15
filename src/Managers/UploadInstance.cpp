@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <format>
 #include <sstream>
 
 #include <rhi_helpers.h>
@@ -122,6 +123,10 @@ UploadInstance::UploadPagePtr UploadInstance::CreatePage(size_t size, bool dedic
 	page->dedicated = dedicated;
 	page->index = m_nextPageIndex++;
 	page->buffer = Buffer::CreateShared(rhi::HeapType::Upload, page->capacity, false);
+	{
+		std::lock_guard lock(m_pageLifetimeTraceMutex);
+		m_pageLifetimeTraces.push_back({ page->buffer, page->capacity, page->index, dedicated });
+	}
 	return page;
 }
 
@@ -893,6 +898,87 @@ void UploadInstance::ProcessDeferredReleases(uint8_t frameIndex) {
 	m_currentFrameUploadBytes = 0;
 	m_activePage.reset();
 	RequestWorkerPagesLocked();
+
+	// These gauges distinguish allocator ownership from resources retained by
+	// an in-flight/retired render-graph timeline. Dedicated pages deliberately
+	// disappear from all four collections as soon as their frame slot retires.
+	auto bytes = [](const auto& pages) {
+		size_t result = 0;
+		for (const auto& page : pages) if (page) result += page->capacity;
+		return result;
+	};
+	size_t framePageCount = 0;
+	size_t framePageBytes = 0;
+	for (const auto& pages : m_framePages) {
+		framePageCount += pages.size();
+		framePageBytes += bytes(pages);
+	}
+	basic_telemetry::SetGauge("ORG.Upload.Pages.Free", static_cast<std::int64_t>(m_freePages.size()));
+	basic_telemetry::SetGauge("ORG.Upload.Pages.Ready", static_cast<std::int64_t>(m_readyPages.size()));
+	basic_telemetry::SetGauge("ORG.Upload.Pages.Open", static_cast<std::int64_t>(m_openPages.size()));
+	basic_telemetry::SetGauge("ORG.Upload.Pages.InFlight", static_cast<std::int64_t>(framePageCount));
+	basic_telemetry::SetGauge("ORG.Upload.Bytes.Owned", static_cast<std::int64_t>(
+		bytes(m_freePages) + bytes(m_readyPages) + bytes(m_openPages) + framePageBytes));
+
+	const auto lifetimeNow = std::chrono::steady_clock::now();
+	if (UploadTelemetryLoggingEnabled() &&
+		(m_lifetimeTelemetryLastLog.time_since_epoch().count() == 0 ||
+		 lifetimeNow - m_lifetimeTelemetryLastLog >= std::chrono::seconds(1))) {
+		m_lifetimeTelemetryLastLog = lifetimeNow;
+		size_t liveBytes = 0;
+		size_t livePages = 0;
+		size_t liveDedicatedBytes = 0;
+		{
+			std::lock_guard traceLock(m_pageLifetimeTraceMutex);
+			for (auto it = m_pageLifetimeTraces.begin(); it != m_pageLifetimeTraces.end();) {
+				if (it->buffer.expired()) {
+					it = m_pageLifetimeTraces.erase(it);
+					continue;
+				}
+				++livePages;
+				liveBytes += it->capacity;
+				if (it->dedicated) liveDedicatedBytes += it->capacity;
+				++it;
+			}
+		}
+		const auto ownedBytes = bytes(m_freePages) + bytes(m_readyPages) +
+			bytes(m_openPages) + framePageBytes;
+		size_t pendingBytes = 0;
+		size_t stagingWrites = 0;
+		std::unordered_map<std::string, size_t> pendingByTarget;
+		for (const auto& update : m_resourceUpdates) {
+			pendingBytes += update.size;
+			stagingWrites += update.staging ? 1u : 0u;
+			pendingByTarget[update.targetDebugName.empty() ? "<unnamed-buffer>" : update.targetDebugName] += update.size;
+		}
+		for (const auto& update : m_textureUpdates) {
+			const auto bytes = static_cast<size_t>(update.footprint.rowPitch) *
+				update.footprint.height * (std::max)(update.footprint.depth, 1u);
+			pendingBytes += bytes;
+			stagingWrites += update.staging ? 1u : 0u;
+			pendingByTarget[update.targetDebugName.empty() ? "<unnamed-texture>" : update.targetDebugName] += bytes;
+		}
+		spdlog::info(
+			"UploadLifetime instance='{}' live_pages={} live_bytes={} dedicated_bytes={} allocator_owned_bytes={} externally_retained_bytes={} queues(free={} ready={} open={} inflight={}) pending(buffer={} texture={})",
+			m_debugName, livePages, liveBytes, liveDedicatedBytes, ownedBytes,
+			liveBytes > ownedBytes ? liveBytes - ownedBytes : 0,
+			m_freePages.size(), m_readyPages.size(), m_openPages.size(), framePageCount,
+			m_resourceUpdates.size(), m_textureUpdates.size());
+		if (pendingBytes != 0) {
+			std::vector<std::pair<std::string, size_t>> pendingTargets(
+				pendingByTarget.begin(), pendingByTarget.end());
+			std::ranges::sort(pendingTargets, [](const auto& left, const auto& right) {
+				return left.second > right.second;
+			});
+			std::string topTargets;
+			for (size_t i = 0; i < (std::min)(pendingTargets.size(), size_t{ 8 }); ++i) {
+				if (!topTargets.empty()) topTargets += "; ";
+				topTargets += std::format("{}={}", pendingTargets[i].first, pendingTargets[i].second);
+			}
+			spdlog::info("UploadLifetime pending: instance='{}' bytes={} staging={} targets={}",
+				m_debugName, pendingBytes, stagingWrites, topTargets);
+		}
+	}
 }
 
 bool UploadInstance::HasPendingWork() const {

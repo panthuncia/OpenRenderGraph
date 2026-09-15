@@ -1306,7 +1306,10 @@ private:
 		std::shared_ptr<const std::vector<ResourceHandleAndRange>> handles;
 	};
 	std::unordered_map<const void*, ResolverHandleCacheEntry> m_resolverHandleCache;
-	std::unordered_multimap<uint64_t, std::shared_ptr<const ResolverRequirementBlock>> m_resolverRequirementBlockCache;
+	// Interning must not extend the lifetime of exact-version resource sets.
+	// Active declarations own their blocks; the lookup table only reuses blocks
+	// which are already alive through a declaration or in-flight frame.
+	std::unordered_multimap<uint64_t, std::weak_ptr<const ResolverRequirementBlock>> m_resolverRequirementBlockCache;
 	uint64_t m_resourceRegistryGeneration = 1;
 	uint64_t m_resolverHandleCacheHitsThisFrame = 0;
 	uint64_t m_resolverHandleCacheMissesThisFrame = 0;

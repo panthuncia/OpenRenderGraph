@@ -665,11 +665,19 @@ std::shared_ptr<const ResolverRequirementBlock> RenderGraph::RequestResolverRequ
 	const ResolverDeclarationState& state,
 	std::span<const ResolverSnapshot::RequirementTemplate> templates)
 {
-	// Blocks held by passes remain alive through their shared_ptrs, so dropping the
-	// lookup table is a cheap, safe bound on publication churn between registry resets.
+	// Blocks held by passes remain alive through their shared_ptrs. The interning
+	// table is deliberately weak: caching an exact-version block must not retain
+	// every resource in a superseded scene publication after its frame retires.
 	constexpr size_t MaxCachedResolverRequirementBlocks = 4096;
-	if (m_resolverRequirementBlockCache.size() >= MaxCachedResolverRequirementBlocks)
-		m_resolverRequirementBlockCache.clear();
+	if (m_resolverRequirementBlockCache.size() >= MaxCachedResolverRequirementBlocks) {
+		for (auto it = m_resolverRequirementBlockCache.begin();
+			it != m_resolverRequirementBlockCache.end();) {
+			if (it->second.expired()) it = m_resolverRequirementBlockCache.erase(it);
+			else ++it;
+		}
+		if (m_resolverRequirementBlockCache.size() >= MaxCachedResolverRequirementBlocks)
+			m_resolverRequirementBlockCache.clear();
+	}
 
 	uint64_t bindingHash = 0xb10cdec1a4a71001ull;
 	for (const auto& requirementTemplate : templates) {
@@ -680,9 +688,13 @@ std::shared_ptr<const ResolverRequirementBlock> RenderGraph::RequestResolverRequ
 	cacheHash = HashCombine64(cacheHash, state.resourceSetIdentity.high);
 	cacheHash = HashCombine64(cacheHash, bindingHash);
 	cacheHash = HashCombine64(cacheHash, m_resourceRegistryGeneration);
-	const auto [begin, end] = m_resolverRequirementBlockCache.equal_range(cacheHash);
-	for (auto it = begin; it != end; ++it) {
-		const auto& block = it->second;
+	auto [begin, end] = m_resolverRequirementBlockCache.equal_range(cacheHash);
+	for (auto it = begin; it != end;) {
+		auto block = it->second.lock();
+		if (!block) {
+			it = m_resolverRequirementBlockCache.erase(it);
+			continue;
+		}
 		if (block && block->dependencyIdentity.get() == state.dependencyIdentity.get()
 			&& block->resourceSetIdentityLow == state.resourceSetIdentity.low
 			&& block->resourceSetIdentityHigh == state.resourceSetIdentity.high
@@ -691,6 +703,7 @@ std::shared_ptr<const ResolverRequirementBlock> RenderGraph::RequestResolverRequ
 			++m_resolverRequirementBlockHitsThisFrame;
 			return block;
 		}
+		++it;
 	}
 
 	++m_resolverRequirementBlockMissesThisFrame;
@@ -711,7 +724,8 @@ std::shared_ptr<const ResolverRequirementBlock> RenderGraph::RequestResolverRequ
 			block->requirements.push_back(std::move(requirement));
 		}
 	}
-	m_resolverRequirementBlockCache.emplace(cacheHash, block);
+	m_resolverRequirementBlockCache.emplace(cacheHash,
+		std::weak_ptr<const ResolverRequirementBlock>{ block });
 	return block;
 }
 
@@ -1795,6 +1809,17 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
     size_t unresolvedReferencedCount = 0;
     {
     BT_ZONE_SCOPE("ORG.FreshCompile.RealizationCollection");
+    // Publication creates a new Resource identity for each exact version.  A
+    // realization seed is an optimization, not an owner: discard identities
+    // whose graph/resource snapshots have retired before examining this frame.
+    // This also prevents a recycled address from hitting an unrelated seed.
+    for (auto it = m_compilerState->realizationSeeds.begin();
+         it != m_compilerState->realizationSeeds.end();) {
+        if (it->second.owner.expired()) it = m_compilerState->realizationSeeds.erase(it);
+        else ++it;
+    }
+    BT_PLOT("ORG.FreshCompile.RealizationSeedCacheSize",
+        static_cast<int64_t>(m_compilerState->realizationSeeds.size()));
     size_t capturedBackingCount = 0;
     size_t capturedBindlessCount = 0;
     size_t realizationSeedHitCount = 0;
@@ -1955,13 +1980,16 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
                     static_cast<uint64_t>(rhi::ResourceSyncState::None), false}}});
         }
         if (!seedMatches && seedKey) {
+            auto seedOwner = concreteResource->weak_from_this();
             m_compilerState->realizationSeeds.insert_or_assign(seedKey,
-                CompilerState::RealizationSeed{input.backingGenerations[r],
-                    r < frozenResources.size() ? frozenResources[r].resource : rhi::Resource{},
+                CompilerState::RealizationSeed{std::move(seedOwner), input.backingGenerations[r],
+                    !asynchronous && r < frozenResources.size()
+                        ? frozenResources[r].resource : rhi::Resource{},
                     preparedState.resource, preparedState.shape, preparedState.heapType,
-                    preparedState.aliasHeap, preparedState.aliasPoolID, preparedState.aliasOffset,
+                    !asynchronous ? preparedState.aliasHeap : nullptr,
+                    preparedState.aliasPoolID, preparedState.aliasOffset,
                     preparedState.aliasSize,
-                    r < frozenResources.size() ? frozenResources[r].views : nullptr,
+                    !asynchronous && r < frozenResources.size() ? frozenResources[r].views : nullptr,
                     preparedState.regions});
             basic_telemetry::AddCounter("ORG.FreshCompile.RealizationSeedPublications");
         }
@@ -2186,6 +2214,17 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
 							std::move(effect->completionSignals));
 					}
 				}, any.pass);
+				// The prepared packet is now the sole owner of this frame's
+				// immediate resources. Keeping the same bag in the persistent
+				// structural pass pins every large upload page until the next
+				// structural compile (or shutdown), which is unbounded when scene
+				// streaming becomes quiescent.
+				std::visit([](auto& value) {
+					using T = std::decay_t<decltype(value)>;
+					if constexpr (!std::is_same_v<T, std::monostate>) {
+						value.immediateKeepAlive.reset();
+					}
+				}, any.pass);
 			}
 			}
 			basis->updateData = m_asyncUpdateHostData;
@@ -2387,8 +2426,25 @@ std::shared_ptr<FrameContext> RenderGraph::TryAcceptFrame(
             auto garbage = std::make_shared<decltype(retired)>(std::move(retired));
             if (!m_compilerState->frameWorkerScope
                 || !m_taskService->Submit(m_compilerState->frameWorkerScope,
-                    runtime::TaskPriority::Background, "ORG.Frame.RetiredOwnership",
-                    [garbage] { BT_ZONE_SCOPE("ORG.Frame.DestroyRetiredOwnership"); }))
+                    // Retired timelines own the immediate-upload keepalive bag
+                    // and every ephemeral resource referenced by that frame.
+                    // Background work can be starved indefinitely by the
+                    // streaming lanes during traversal, turning a deferred
+                    // destructor into unbounded GPU-memory retention.
+                    runtime::TaskPriority::Streaming, "ORG.Frame.RetiredOwnership",
+                    [garbage] {
+                        BT_ZONE_SCOPE("ORG.Frame.DestroyRetiredOwnership");
+                        // Task services are permitted to retain completed task
+                        // callables for diagnostics and allocator reuse.  Do not
+                        // make destruction of that callable the retirement event:
+                        // the captured frame bundles own publication snapshots and
+                        // immediate-upload keepalive bags, which can otherwise
+                        // accumulate for the lifetime of the scheduler.
+                        basic_telemetry::Record("ORG.Frame.RetiredOwnershipDestroyed",
+                            garbage->size());
+                        garbage->clear();
+                        garbage->shrink_to_fit();
+                    }))
                 basic_telemetry::AddCounter("ORG.Frame.InlineRetiredOwnershipDestruction");
         }
     }
@@ -3180,6 +3236,7 @@ void RenderGraph::PrepareAndCompileFrame(rhi::Device device, uint8_t frameIndex,
 
 			const bool hasRecordedWork = c.list.HasRecordedWork();
 			auto immediateFrameData = c.list.Finalize();
+			if (immediateFrameData.keepAlive) immediateFrameData.keepAlive->traceOwner = p.name;
 			if (!hasRecordedWork) {
 				p.immediateBytecode = std::move(immediateFrameData.bytecode);
 				p.immediateKeepAlive = std::move(immediateFrameData.keepAlive);
@@ -3243,6 +3300,7 @@ void RenderGraph::PrepareAndCompileFrame(rhi::Device device, uint8_t frameIndex,
 			}
 			const bool hasRecordedWork = c.list.HasRecordedWork();
 			auto immediateFrameData = c.list.Finalize();
+			if (immediateFrameData.keepAlive) immediateFrameData.keepAlive->traceOwner = p.name;
 			if (!hasRecordedWork) {
 				p.immediateBytecode = std::move(immediateFrameData.bytecode);
 				p.immediateKeepAlive = std::move(immediateFrameData.keepAlive);
@@ -3308,6 +3366,7 @@ void RenderGraph::PrepareAndCompileFrame(rhi::Device device, uint8_t frameIndex,
 			}
 			const bool hasRecordedWork = c.list.HasRecordedWork();
 			auto immediateFrameData = c.list.Finalize();
+			if (immediateFrameData.keepAlive) immediateFrameData.keepAlive->traceOwner = p.name;
 			if (!hasRecordedWork) {
 				p.immediateBytecode = std::move(immediateFrameData.bytecode);
 				p.immediateKeepAlive = std::move(immediateFrameData.keepAlive);
@@ -3366,7 +3425,18 @@ void RenderGraph::PrepareAndCompileFrame(rhi::Device device, uint8_t frameIndex,
 		auto recordImmediateCommands = [&](AnyPassAndResources& pr) {
 			if (pr.type == PassType::Compute) {
 				auto& p = std::get<ComputePassAndResources>(pr.pass);
-				if (p.pass->UsesTypedPreparation()) { p.run = PassRunMask::Retained; return; }
+				if (p.pass->UsesTypedPreparation()) {
+					// A frame-extension pass can migrate from legacy immediate
+					// recording to typed preparation while its structural template
+					// still contains the last immediate payload. Typed preparation owns
+					// its own execution lifetime; never retain that stale keepalive in
+					// the persistent pass template.
+					p.immediateBytecode.clear();
+					p.immediateKeepAlive.reset();
+					ClearImmediateFrameRequirements(p.resources);
+					p.run = PassRunMask::Retained;
+					return;
+				}
 				auto* immediateModeCommands = dynamic_cast<IHasImmediateModeCommands*>(p.pass.get());
 				if (!immediateModeCommands) {
 					p.run = PassRunMask::Retained;
@@ -3396,6 +3466,7 @@ void RenderGraph::PrepareAndCompileFrame(rhi::Device device, uint8_t frameIndex,
 					return;
 				}
 				auto immediateFrameData = c.list.Finalize();
+				if (immediateFrameData.keepAlive) immediateFrameData.keepAlive->traceOwner = p.name;
 				p.immediateBytecode = std::move(immediateFrameData.bytecode);
 				p.immediateKeepAlive = std::move(immediateFrameData.keepAlive);
 				SetImmediateFrameRequirements(p.resources, std::move(immediateFrameData.requirements));
@@ -3403,7 +3474,13 @@ void RenderGraph::PrepareAndCompileFrame(rhi::Device device, uint8_t frameIndex,
 			}
 			else if (pr.type == PassType::Copy) {
 				auto& p = std::get<CopyPassAndResources>(pr.pass);
-				if (p.pass->UsesTypedPreparation()) { p.run = PassRunMask::Retained; return; }
+				if (p.pass->UsesTypedPreparation()) {
+					p.immediateBytecode.clear();
+					p.immediateKeepAlive.reset();
+					ClearImmediateFrameRequirements(p.resources);
+					p.run = PassRunMask::Retained;
+					return;
+				}
 				auto* immediateModeCommands = dynamic_cast<IHasImmediateModeCommands*>(p.pass.get());
 				if (!immediateModeCommands) {
 					p.run = PassRunMask::Retained;
@@ -3433,6 +3510,7 @@ void RenderGraph::PrepareAndCompileFrame(rhi::Device device, uint8_t frameIndex,
 					return;
 				}
 				auto immediateFrameData = c.list.Finalize();
+				if (immediateFrameData.keepAlive) immediateFrameData.keepAlive->traceOwner = p.name;
 				p.immediateBytecode = std::move(immediateFrameData.bytecode);
 				p.immediateKeepAlive = std::move(immediateFrameData.keepAlive);
 				SetImmediateFrameRequirements(p.resources, std::move(immediateFrameData.requirements));
@@ -3440,7 +3518,13 @@ void RenderGraph::PrepareAndCompileFrame(rhi::Device device, uint8_t frameIndex,
 			}
 			else {
 				auto& p = std::get<RenderPassAndResources>(pr.pass);
-				if (p.pass->UsesTypedPreparation()) { p.run = PassRunMask::Retained; return; }
+				if (p.pass->UsesTypedPreparation()) {
+					p.immediateBytecode.clear();
+					p.immediateKeepAlive.reset();
+					ClearImmediateFrameRequirements(p.resources);
+					p.run = PassRunMask::Retained;
+					return;
+				}
 				auto* immediateModeCommands = dynamic_cast<IHasImmediateModeCommands*>(p.pass.get());
 				if (!immediateModeCommands) {
 					p.run = PassRunMask::Retained;
@@ -3470,6 +3554,7 @@ void RenderGraph::PrepareAndCompileFrame(rhi::Device device, uint8_t frameIndex,
 					return;
 				}
 				auto immediateFrameData = c.list.Finalize();
+				if (immediateFrameData.keepAlive) immediateFrameData.keepAlive->traceOwner = p.name;
 				p.immediateBytecode = std::move(immediateFrameData.bytecode);
 				p.immediateKeepAlive = std::move(immediateFrameData.keepAlive);
 				SetImmediateFrameRequirements(p.resources, std::move(immediateFrameData.requirements));

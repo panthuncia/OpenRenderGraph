@@ -42,6 +42,10 @@ struct RenderGraph::CompilerState {
     // caching: every frame still builds and compiles a distinct structural IR.
     // Stable concrete versions publish their immutable admission seed once.
     struct RealizationSeed {
+        // The pointer used as the cache key is only an identity.  Keep a weak
+        // reference so stale publication resources can be removed without the
+        // seed cache extending their lifetime.
+        std::weak_ptr<Resource> owner;
         uint64_t backingGeneration = 0;
         rhi::Resource capturedResource{};
         rhi::ResourceHandle resource{};

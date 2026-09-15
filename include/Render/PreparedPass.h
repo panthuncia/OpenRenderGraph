@@ -4,6 +4,7 @@
 #include <concepts>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <utility>
@@ -699,6 +700,7 @@ public:
             throw std::logic_error("Prepared pass completion transition is invalid");
         if (m_storage->dependencies) m_storage->dependencies->Completed(context);
         m_storage->CommitCompleted(context);
+        m_storage->dependencies.reset();
     }
     bool Abandon(AbandonReason reason) const {
         if (!m_storage) return false;
@@ -707,6 +709,7 @@ public:
             if (m_storage->state.compare_exchange_weak(current, LifecycleState::Abandoned)) {
                 if (m_storage->dependencies) m_storage->dependencies->Abandoned(reason);
                 m_storage->Abandon(reason);
+                m_storage->dependencies.reset();
                 return true;
             }
         }
@@ -721,33 +724,37 @@ private:
         virtual void CommitCompleted(CompletionContext) const {}
         virtual void Abandon(AbandonReason) const {}
         mutable std::atomic<LifecycleState> state{LifecycleState::Prepared};
-        std::shared_ptr<const PreparedDependencySnapshot> dependencies;
+        mutable std::shared_ptr<const PreparedDependencySnapshot> dependencies;
         std::vector<ExternalTimelinePoint> externalSignals;
         mutable std::string debugName;
         bool workerSafe = false;
     };
     template<class Data> struct Storage final : StorageBase {
         Storage(Data value, void (*fn)(const Data&, RecordingContext&), void (*onSubmitted)(const Data&) = nullptr)
-            : data(std::move(value)), record(fn), submitted(onSubmitted) {}
-        void Record(RecordingContext& context) const override { record(data, context); }
-        void CommitSubmitted(SubmissionContext) const override { if (submitted) submitted(data); }
-        const Data data;
+			: data(std::move(value)), record(fn), submitted(onSubmitted) {}
+		void Record(RecordingContext& context) const override { record(*data, context); }
+		void CommitSubmitted(SubmissionContext) const override { if (submitted) submitted(*data); }
+		void CommitCompleted(CompletionContext) const override { data.reset(); }
+		void Abandon(AbandonReason) const override { data.reset(); }
+		mutable std::optional<Data> data;
         void (*const record)(const Data&, RecordingContext&);
         void (*const submitted)(const Data&);
     };
     template<class Derived, class Data> struct TypedStorage final : StorageBase {
         explicit TypedStorage(Data value) : data(std::move(value)) {}
-        void Record(RecordingContext& context) const override { Derived::Record(data, context); }
+		void Record(RecordingContext& context) const override { Derived::Record(*data, context); }
         void CommitSubmitted(SubmissionContext context) const override {
-            if constexpr (requires { Derived::Submitted(data, context); }) Derived::Submitted(data, context);
+			if constexpr (requires { Derived::Submitted(*data, context); }) Derived::Submitted(*data, context);
         }
         void CommitCompleted(CompletionContext context) const override {
-            if constexpr (requires { Derived::Completed(data, context); }) Derived::Completed(data, context);
+			if constexpr (requires { Derived::Completed(*data, context); }) Derived::Completed(*data, context);
+			data.reset();
         }
         void Abandon(AbandonReason reason) const override {
-            if constexpr (requires { Derived::Abandoned(data, reason); }) Derived::Abandoned(data, reason);
+			if constexpr (requires { Derived::Abandoned(*data, reason); }) Derived::Abandoned(*data, reason);
+			data.reset();
         }
-        const Data data;
+		mutable std::optional<Data> data;
     };
     std::shared_ptr<const StorageBase> m_storage;
 };

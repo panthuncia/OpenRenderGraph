@@ -2,9 +2,47 @@
 
 #include "Render/ResourceRegistry.h"
 #include "Render/BufferBarrierHelpers.h"
+#include <atomic>
+#include <cstdlib>
+#include <spdlog/spdlog.h>
 #include <unordered_set>
+#include <unordered_map>
 
 namespace org::imm {
+	namespace {
+		std::atomic_uint64_t g_keepAliveBagIdentity{0};
+		bool KeepAliveLifetimeTraceEnabled() {
+			static const bool enabled = [] {
+				char* value = nullptr;
+				size_t length = 0;
+				const bool result = _dupenv_s(&value, &length,
+					"SARP_GPU_LIFETIME_TRACE") == 0 && value && value[0] && value[0] != '0';
+				std::free(value);
+				return result;
+			}();
+			return enabled;
+		}
+	}
+
+	KeepAliveBag::KeepAliveBag()
+		: traceID(g_keepAliveBagIdentity.fetch_add(1, std::memory_order_relaxed) + 1) {}
+
+	KeepAliveBag::~KeepAliveBag() {
+		if (!KeepAliveLifetimeTraceEnabled()) return;
+		std::unordered_map<uint64_t, std::pair<const LifetimePin*, size_t>> resources;
+		for (const auto& pin : pins) {
+			if (pin.resourceID == 0) continue;
+			auto& entry = resources[pin.resourceID];
+			entry.first = &pin;
+			++entry.second;
+		}
+		for (const auto& [resourceID, entry] : resources) {
+			const auto& pin = *entry.first;
+			spdlog::info("GpuLifetime keepalive_release: bag={} owner='{}' resource={} name='{}' pins={} remaining_refs={}",
+				traceID, traceOwner, resourceID, pin.resourceName, entry.second,
+				pin.shared ? pin.shared.use_count() - entry.second : 0);
+		}
+	}
 
     std::shared_ptr<const PreparedBufferCopies> PreparedBufferCopies::Capture(
         const std::vector<std::byte>& bytecode, const Resolver& resolve) {

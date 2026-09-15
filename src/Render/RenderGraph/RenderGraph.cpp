@@ -8581,8 +8581,18 @@ namespace {
 		args.context.commandList = commandList;
 
 		auto executeOne = [&](auto& pr) {
-			if (!pr.pass->IsInvalidated())
+			const bool runImmediate =
+				(pr.run & PassRunMask::Immediate) != PassRunMask::None;
+			const bool runRetained =
+				(pr.run & PassRunMask::Retained) != PassRunMask::None &&
+				pr.pass->IsInvalidated();
+			if (!runImmediate && !runRetained) {
+				// Frame-local ownership must not inherit the retained pass's
+				// invalidation state. A skipped retained body cannot keep upload
+				// staging or publication resources alive indefinitely.
+				pr.immediateKeepAlive.reset();
 				return;
+			}
 			const std::string_view passName = pr.name.empty() ? std::string_view("<unnamed>") : std::string_view(pr.name);
 			const char* techniquePath = pr.techniquePath.empty() ? nullptr : pr.techniquePath.c_str();
 			try {
@@ -8609,14 +8619,14 @@ namespace {
 				const auto cpuStart = std::chrono::steady_clock::now();
 				if (hasStatistics)
 					args.statisticsService->BeginQuery(pr.statisticsIndex, args.context.frameIndex, rhiQueue, commandList);
-				if ((pr.run & PassRunMask::Immediate) != PassRunMask::None) {
+				if (runImmediate) {
                     if (pr.preparedBufferCopies) {
                         pr.preparedBufferCopies->Record(commandList);
                         basic_telemetry::AddCounter("ORG.AsyncExecution.RecordedSceneCopyPasses");
                     } else org::imm::Replay(pr.immediateBytecode, commandList, *args.context.immediateDispatch);
                 }
 				pr.immediateKeepAlive.reset();
-				if ((pr.run & PassRunMask::Retained) != PassRunMask::None) {
+				if (runRetained) {
 					auto passReturn = pr.pass->Execute(args.context);
 					// In batch trace, do some fence debug
 					if (args.batchTraceEnabled && (passReturn.fence || !passReturn.externalSignalsAfterCompletion.empty())) {
@@ -8888,8 +8898,15 @@ namespace {
 		args.context.commandList = commandList;
 
 			auto executeOne = [&](auto& pr) {
-			if (!pr.pass->IsInvalidated())
+			const bool runImmediate =
+				(pr.run & PassRunMask::Immediate) != PassRunMask::None;
+			const bool runRetained =
+				(pr.run & PassRunMask::Retained) != PassRunMask::None &&
+				pr.pass->IsInvalidated();
+			if (!runImmediate && !runRetained) {
+				pr.immediateKeepAlive.reset();
 				return;
+			}
 			if (args.batchTraceEnabled && (!pr.externalAcquires.empty() || !pr.backendPreTransitions.empty())) {
 				spdlog::info("RenderGraph: frame {} pass {} backend={} externalAcquires={} backendPreTransitions={}",
 					static_cast<unsigned>(args.context.frameIndex), pr.name,
@@ -8942,14 +8959,14 @@ namespace {
 					BT_ZONE_TEXT(passName.data(), passName.size());
 					if (hasStatistics)
 						args.statisticsService->BeginQuery(pr.statisticsIndex, args.context.frameIndex, args.rhiQueue, commandList, sched.queryRecordingContext);
-					if ((pr.run & PassRunMask::Immediate) != PassRunMask::None) {
+					if (runImmediate) {
                         if (pr.preparedBufferCopies) {
                             pr.preparedBufferCopies->Record(commandList);
                             basic_telemetry::AddCounter("ORG.AsyncExecution.RecordedSceneCopyPasses");
                         } else org::imm::Replay(pr.immediateBytecode, commandList, *args.context.immediateDispatch);
                     }
 					pr.immediateKeepAlive.reset();
-					if ((pr.run & PassRunMask::Retained) != PassRunMask::None) {
+					if (runRetained) {
 						auto passReturn = pr.pass->Execute(args.context);
 						if (passReturn.fence || !passReturn.externalSignalsAfterCompletion.empty()) {
 							if (args.batchTraceEnabled) {
