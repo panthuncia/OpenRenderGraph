@@ -1,3 +1,5 @@
+#include <cstdlib>
+#include "Render/PublicationBindingBundle.h"
 #include "Render/RenderGraph/ExperimentalGraphCompiler.h"
 #include "FrameTrace.h"
 
@@ -32,7 +34,11 @@ std::shared_ptr<const GraphExecutionLayout> BuildExecutionLayout(
     std::shared_ptr<const CompiledGraphBundle> bundle,
     const GraphCompileInput& prepared) {
     BT_ZONE_SCOPE("ORG.Execution.BuildLayout");
-    if (!bundle || !IsExecutionCompatible(*bundle, prepared))
+    const bool borrowed = prepared.executionPolicy == GraphCompileInput::ExecutionPolicy::BorrowedSynchronous;
+    const bool exactDirect = bundle && bundle->graph && bundle->input.get() == &prepared
+        && bundle->graph->structure.get() == &prepared.structure && bundle->graph->scheduleValidated
+        && bundle->graph->stage == CompiledGraphStage::SymbolicSchedule && bundle->graph->scheduleValidationError.empty();
+    if (!bundle || (borrowed ? !exactDirect : !IsExecutionCompatible(*bundle, prepared)))
         throw std::invalid_argument("Compiled graph is incompatible with prepared frame");
     auto result = std::make_shared<GraphExecutionLayout>();
     result->bundle = std::move(bundle);
@@ -182,6 +188,7 @@ void ExecutionTimelineAdmission::CommitBatch(uint64_t submission, uint32_t batch
     const auto queue = m_pending->bundle->graph->batches.at(batch).queue;
     m_submitted.at(queue) = m_pending->batches.at(batch).signal;
     if (++m_nextBatch == m_pending->batches.size()) {
+        TraceBindingHolderFromOwner(m_pending->bundle->input->executionPayload.get(), m_pending, "SubmittedExecution");
         m_retained.push_back(std::move(m_pending));
     }
 }
@@ -267,6 +274,7 @@ size_t ExecutionTimelineAdmission::RetireCompleted(std::span<const ExecutionTime
             if (packet) packet->Complete(execution->submission);
         if (const auto& frame = execution->bundle->input->frameContext)
             if (!frame->Retire(completed)) throw std::logic_error("Frame completion disagrees with admission");
+        TraceBindingHolderFromOwner(execution->bundle->input->executionPayload.get(), execution, "RetiredExecution");
         m_retiredGarbage.push_back(std::move(*iterator));
         iterator = m_retained.erase(iterator);
     }
@@ -277,6 +285,13 @@ size_t ExecutionTimelineAdmission::RetireCompleted(std::span<const ExecutionTime
 
 std::vector<std::shared_ptr<GraphExecutionTimeline>>
 ExecutionTimelineAdmission::TakeRetiredGarbage() {
+    // Explicit diagnostic reproduction of the old synchronous retention bug.
+    // Never enabled by normal tracing or normal execution.
+    static const bool holdRetired = [] {
+        const auto* value = std::getenv("ORG_RESOURCE_LIFETIME_TRACE_HOLD_RETIRED");
+        return BindingLifetimeTraceEnabled() && value && value[0] == '1';
+    }();
+    if (holdRetired) return {};
     return std::exchange(m_retiredGarbage, {});
 }
 
@@ -610,21 +625,14 @@ std::string ValidateSymbolicStates(const GraphCompileInput& input, const Compile
     return {};
 }
 
-std::shared_ptr<const CompiledGraph> CompileWorkspace::Compile(
-    std::shared_ptr<const GraphCompileInput> input, const std::atomic_bool& cancelled) {
-    BT_ZONE_SCOPE("ORG.FreshCompile.DependencyCompile");
-    basic_telemetry::AddCounter("ORG.FreshCompile.Compiles");
-    if (!input) throw std::invalid_argument("Null graph compile input");
-    const auto& structure = input->structure;
-    if (structure.passes.size() >= UINT32_MAX || structure.resourceIDs.size() >= UINT32_MAX)
-        throw std::invalid_argument("Graph exceeds dependency index capacity");
-    auto result = std::make_shared<CompiledGraph>();
-    result->structure = std::shared_ptr<const GraphCompileStructure>(input, &input->structure);
+std::shared_ptr<const DependencyEdges> CompileWorkspace::AnalyzeDependencies(
+    const GraphCompileStructure& structure, const std::atomic_bool& cancelled) {
     const auto passCount = static_cast<uint32_t>(structure.passes.size());
+    DependencyEdges edges;
     m_resources.resize(structure.resourceIDs.size());
     for (auto& state : m_resources) state.Reset();
     auto edge = [&](uint32_t from, uint32_t to) {
-        if (from != UINT32_MAX && from != to) result->edges.emplace_back(from, to);
+        if (from != UINT32_MAX && from != to) edges.emplace_back(from, to);
     };
     {
         BT_ZONE_SCOPE("ORG.FreshCompile.BuildDependencies");
@@ -643,9 +651,31 @@ std::shared_ptr<const CompiledGraph> CompileWorkspace::Compile(
                 throw std::invalid_argument("Invalid captured explicit dependency edge");
             edge(from, to);
         }
-        std::sort(result->edges.begin(), result->edges.end());
-        result->edges.erase(std::unique(result->edges.begin(), result->edges.end()), result->edges.end());
+        std::sort(edges.begin(), edges.end());
+        edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
     }
+    if (cancelled.load(std::memory_order_relaxed)) return {};
+    return std::make_shared<const DependencyEdges>(std::move(edges));
+}
+
+std::shared_ptr<const CompiledGraph> CompileWorkspace::Compile(
+    std::shared_ptr<const GraphCompileInput> input, const std::atomic_bool& cancelled) {
+    BT_ZONE_SCOPE("ORG.FreshCompile.DependencyCompile");
+    basic_telemetry::AddCounter("ORG.FreshCompile.Compiles");
+    if (!input) throw std::invalid_argument("Null graph compile input");
+    const auto& structure = input->structure;
+    if (structure.passes.size() >= UINT32_MAX || structure.resourceIDs.size() >= UINT32_MAX)
+        throw std::invalid_argument("Graph exceeds dependency index capacity");
+    auto result = std::make_shared<CompiledGraph>();
+    result->structure = std::shared_ptr<const GraphCompileStructure>(input, &input->structure);
+    const auto passCount = static_cast<uint32_t>(structure.passes.size());
+    const auto dependencies = input->analyzedDependencies
+        ? input->analyzedDependencies : AnalyzeDependencies(structure, cancelled);
+    if (!dependencies) return {};
+    for (const auto [from, to] : *dependencies)
+        if (from >= passCount || to >= passCount)
+            throw std::invalid_argument("Invalid analyzed dependency edge");
+    result->edges = *dependencies;
     if (cancelled.load(std::memory_order_relaxed)) return {};
     result->schedulingEdges = result->edges;
     for (auto edge : structure.placementEdges) {
@@ -736,6 +766,7 @@ std::shared_ptr<const CompiledGraph> CompileWorkspace::Compile(
     if (!structure.resourceShapes.empty()) {
         result->states = BuildStatePlan(structure, result->batches, cancelled);
         if (cancelled.load(std::memory_order_relaxed)) return {};
+        if (!result->states.complete) return result;
         result->barrierCapacityByPass.resize(passCount);
         result->stateDeltaCapacityByBatch.assign(result->batches.size(), 0);
         result->stateSeedCapacityByBatch.assign(result->batches.size(), 0);

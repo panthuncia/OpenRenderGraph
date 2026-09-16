@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstdlib>
 #include <cmath>
 #include <limits>
 #include <numeric>
@@ -26,6 +27,14 @@
 namespace org {
 
 namespace {
+    bool CompileDiagnosticsEnabled() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("ORG_COMPILE_DIAGNOSTICS");
+            return value && value[0] == '1';
+        }();
+        return enabled;
+    }
+
 	constexpr uint64_t kFrameDAGResourceIndexEmptyKey = std::numeric_limits<uint64_t>::max();
 
 	uint64_t MixFrameDAGResourceID(uint64_t value) noexcept {
@@ -1749,7 +1758,7 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
     // whether the completed executable envelope runs inline or on workers.
     if (asynchronous)
         BT_PLOT("ORG.AsyncExecution.SceneRouteEnabled", int64_t{1});
-    BT_ZONE_SCOPE("ORG.FreshCompile.CaptureDependencies");
+    BT_ZONE_SCOPE("ORG.FreshCompile.BuildFrameRequest");
     if (!m_taskService) {
         BT_PLOT("ORG.FreshCompile.FallbackNoTaskService", int64_t{1});
         return;
@@ -1765,8 +1774,12 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
         ? experimental::GraphCompileInput::ExecutionPolicy::OwnedAsynchronous
         : experimental::GraphCompileInput::ExecutionPolicy::BorrowedSynchronous;
     input.frameContext = m_compilerState->preparingFrame;
-    if (asynchronous && m_resolverCaptureContext)
+    input.analyzedDependencies = std::exchange(m_compilerState->frameDependencyAnalysis, {});
+    if (CompileDiagnosticsEnabled()) input.expectedEdges = input.analyzedDependencies;
+    if (m_resolverCaptureContext)
         input.leases.push_back(m_resolverCaptureContext);
+    const auto publicationBindings = m_resolverCaptureContext
+        ? m_resolverCaptureContext->BindingBundle() : nullptr;
     input.structure.generation = m_resourceRegistryGeneration;
     input.structure.registryGeneration = m_resourceRegistryGeneration;
     // The dense live index also contains helper identities for dynamic wrappers
@@ -1801,6 +1814,11 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
     std::unordered_map<uint64_t, uint32_t> capturedIndices;
     std::vector<FrozenExecutionBindings::ResourceBinding> frozenResources;
     frozenResources.reserve(input.structure.resourceIDs.size());
+    std::vector<uint8_t> publicationOwnedResources(input.structure.resourceIDs.size());
+    std::vector<PublicationBindingBundle::Snapshot> graphLocalSnapshots;
+    int64_t publicationBindingSelections = 0, graphLocalBindingSelections = 0;
+    bool graphLocalBindingsChanged = false;
+    std::unordered_set<uint64_t> graphLocalBindingIDs;
     std::vector<uint32_t> admissionBoundResources(input.structure.resourceIDs.size());
     std::vector<experimental::PreparedBackingState> preparedInitialStates;
     preparedInitialStates.reserve(input.structure.resourceIDs.size());
@@ -1809,6 +1827,7 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
     size_t unresolvedReferencedCount = 0;
     {
     BT_ZONE_SCOPE("ORG.FreshCompile.RealizationCollection");
+    BT_ZONE_VALUE(input.structure.resourceIDs.size());
     // Publication creates a new Resource identity for each exact version.  A
     // realization seed is an optimization, not an owner: discard identities
     // whose graph/resource snapshots have retired before examining this frame.
@@ -1850,7 +1869,40 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
             : experimental::CompileResourceShape{0, 0, false});
         std::shared_ptr<const AliasHeapGeneration> capturedAliasHeap;
         uint64_t capturedAliasPoolID = 0, capturedAliasOffset = 0, capturedAliasSize = 0;
-        if (backedResource) {
+        const auto bindingID = concreteResource ? concreteResource->GetGlobalResourceID() : concreteID;
+        const auto* published = publicationBindings ? publicationBindings->Find(bindingID) : nullptr;
+        PublicationBindingBundle::Snapshot selectedBinding;
+        if (published && (!backedResource || (*published)->backingGeneration == backedResource->GetBackingGeneration())
+            && (!indexedResource || (*published)->views == indexedResource->CaptureBindlessViews()))
+            selectedBinding = *published;
+        else if (concreteResource && admissionBoundResources[r] == 0) {
+            const auto* cached = m_compilerState->graphLocalBindingBundle
+                ? m_compilerState->graphLocalBindingBundle->Find(bindingID) : nullptr;
+            if (cached && (!backedResource || (*cached)->backingGeneration == backedResource->GetBackingGeneration())
+                && (!indexedResource || (*cached)->views == indexedResource->CaptureBindlessViews()))
+                selectedBinding = *cached;
+            else selectedBinding = PublicationBindingBundle::Capture(*concreteResource);
+            if (selectedBinding && graphLocalBindingIDs.insert(bindingID).second) {
+                const auto index = graphLocalSnapshots.size();
+                const auto previous = m_compilerState->graphLocalBindingBundle
+                    ? m_compilerState->graphLocalBindingBundle->Bindings() : std::span<const PublicationBindingBundle::Snapshot>{};
+                graphLocalBindingsChanged |= index >= previous.size() || previous[index] != selectedBinding;
+                graphLocalSnapshots.push_back(selectedBinding);
+            }
+        }
+        const bool usePublished = static_cast<bool>(selectedBinding);
+        if (usePublished) {
+            publicationOwnedResources[r] = 1;
+            const auto& binding = *selectedBinding;
+            input.backingGenerations[r] = binding.backingGeneration;
+            capturedAliasHeap = binding.aliasHeap;
+            capturedAliasPoolID = binding.aliasPoolID;
+            capturedAliasOffset = binding.aliasOffset;
+            capturedAliasSize = binding.aliasSize;
+            frozenResources.push_back({binding.resource, {}, binding.views});
+            if (published && selectedBinding == *published) ++publicationBindingSelections;
+            else ++graphLocalBindingSelections;
+        } else if (backedResource) {
             const auto currentGeneration = backedResource->GetBackingGeneration();
             const bool cachedBorrowedRealization = !asynchronous
                 && seed != m_compilerState->realizationSeeds.end()
@@ -1925,7 +1977,7 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
         // Keep descriptor slots and the concrete allocation under the same
         // frozen binding owner. Buffer replacement already rotates slots; its
         // fence retirement must also respect CPU frames not yet submitted.
-        if (asynchronous && indexedResource) {
+        if (asynchronous && indexedResource && !usePublished) {
             if (!frozenResources.empty() && frozenResources.back().owner) {
             if (auto descriptors = indexedResource->CaptureDescriptorOwnership()) {
                 auto& binding = frozenResources.back();
@@ -2000,8 +2052,34 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
     BT_PLOT("ORG.FreshCompile.RealizationSeedHitCount", static_cast<int64_t>(realizationSeedHitCount));
     }
     BT_PLOT("ORG.FreshCompile.SemanticResourceSlots", static_cast<int64_t>(semanticSlotCount));
+    basic_telemetry::AddCounter("ORG.Execution.PublicationBindingSelections", publicationBindingSelections);
+    basic_telemetry::AddCounter("ORG.Execution.GraphLocalBindingSelections", graphLocalBindingSelections);
     BT_PLOT("ORG.FreshCompile.UnnamedTransientResources", static_cast<int64_t>(unnamedTransientCount));
     BT_PLOT("ORG.FreshCompile.UnresolvedReferencedResources", static_cast<int64_t>(unresolvedReferencedCount));
+    const auto previousLocalCount = m_compilerState->graphLocalBindingBundle
+        ? m_compilerState->graphLocalBindingBundle->Bindings().size() : 0u;
+    graphLocalBindingsChanged |= previousLocalCount != graphLocalSnapshots.size();
+    if (graphLocalBindingsChanged || !m_compilerState->graphLocalBindingBundle) {
+        auto replacement = std::make_shared<const PublicationBindingBundle>(std::move(graphLocalSnapshots));
+        auto retired = std::exchange(m_compilerState->graphLocalBindingBundle, std::move(replacement));
+        TraceBindingHolder(m_compilerState->graphLocalBindingBundle,
+            m_compilerState->graphLocalBindingBundle, "GraphLocalBindings");
+        if (retired) {
+            if (!m_compilerState->ownershipRetirementScope)
+                m_compilerState->ownershipRetirementScope = m_taskService->CreateScope("ORG.Ownership.Retirement");
+            if (!m_taskService->Submit(m_compilerState->ownershipRetirementScope, runtime::TaskPriority::Background,
+                "ORG.Ownership.RetireBindings", [retired = std::move(retired)]() mutable { retired.reset(); }))
+                basic_telemetry::AddCounter("ORG.Ownership.RetirementRejected");
+        }
+        basic_telemetry::AddCounter("ORG.Execution.GraphLocalBindingBundleBuilds");
+    } else basic_telemetry::AddCounter("ORG.Execution.GraphLocalBindingBundleReuses");
+    std::vector<std::shared_ptr<const PublicationBindingBundle>> bindingRoots;
+    if (publicationBindings) bindingRoots.push_back(publicationBindings);
+    if (m_compilerState->graphLocalBindingBundle) bindingRoots.push_back(m_compilerState->graphLocalBindingBundle);
+    auto recordingOwnership = std::make_shared<const PublicationBindingBundle>(
+        std::vector<PublicationBindingBundle::Snapshot>{}, std::vector<std::shared_ptr<const void>>{}, std::move(bindingRoots));
+    TraceBindingHolder(recordingOwnership, recordingOwnership, "FrameRecordingBindings",
+        input.frameContext ? input.frameContext->Number() : m_compilerState->asyncPreparationFrameNumber + 1);
     auto captureState = [&](uint32_t resourceIndex, const RangeSpec& spec, ResourceState state) {
         if (resourceIndex >= input.structure.resourceShapes.size())
             throw std::runtime_error("Invalid resource index during owned state capture");
@@ -2117,21 +2195,21 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
     }
     std::sort(oracle->begin(), oracle->end());
     std::sort(dependencyOracle.begin(), dependencyOracle.end());
-    std::set_difference(oracle->begin(), oracle->end(), dependencyOracle.begin(), dependencyOracle.end(),
+    const auto& dependenciesBeforePlacement = input.analyzedDependencies ? *input.analyzedDependencies : dependencyOracle;
+    std::set_difference(oracle->begin(), oracle->end(), dependenciesBeforePlacement.begin(), dependenciesBeforePlacement.end(),
         std::back_inserter(input.structure.placementEdges));
 	{
 		BT_ZONE_SCOPE("ORG.Execution.CapturePreparationBasis");
-        const bool allResourcesOwned = std::all_of(frozenResources.begin(), frozenResources.end(),
-            [asynchronous](const auto& binding) {
-                return binding.resource.GetHandle().valid()
-                    && (!asynchronous || binding.owner);
-            });
+        bool allResourcesOwned = true;
+        for (size_t i = 0; i < frozenResources.size(); ++i)
+            allResourcesOwned &= frozenResources[i].resource.GetHandle().valid()
+                && (!asynchronous || frozenResources[i].owner || publicationOwnedResources[i]);
         if (allResourcesOwned) {
             auto bindings = std::make_shared<const FrozenExecutionBindings>(
                 std::move(frozenResources),
                 std::vector<FrozenExecutionBindings::DescriptorBinding>{},
                 asynchronous ? FrozenExecutionBindings::OwnershipPolicy::Owned
-                             : FrozenExecutionBindings::OwnershipPolicy::Borrowed);
+                             : FrozenExecutionBindings::OwnershipPolicy::Borrowed, recordingOwnership);
 			auto resources = std::make_shared<experimental::RealizedResourceBundle>();
 			resources->backingGenerations = input.backingGenerations;
 			resources->resourceKeys = input.structure.resourceKeys;
@@ -2228,7 +2306,17 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
 			}
 			}
 			basis->updateData = m_asyncUpdateHostData;
+            if (!m_compilerState->ownershipRetirementScope)
+                m_compilerState->ownershipRetirementScope = m_taskService->CreateScope("ORG.Ownership.Retirement");
+            auto& invocationArena = m_compilerState->invocationArenas[frameIndex];
+            if (!invocationArena) invocationArena = std::make_shared<PreparedInvocationArena>();
 			FramePreparationContext preparation{
+                .invocationArena = invocationArena,
+                .retireOwnership = [tasks = m_taskService, scope = m_compilerState->ownershipRetirementScope](std::shared_ptr<const void> owner) {
+                    if (!tasks->Submit(scope, runtime::TaskPriority::Background, "ORG.Ownership.RetireRecipe",
+                        [owner = std::move(owner)]() mutable { owner.reset(); }))
+                        basic_telemetry::AddCounter("ORG.Ownership.RetirementRejected");
+                },
                 .device = device,
 				.frameIndex = frameIndex,
 				.preparationSlot = frameIndex,
@@ -2249,6 +2337,9 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
 			BT_ZONE_SCOPE("ORG.Execution.PreparePasses");
 			auto preparePass = [&](size_t passIndex) {
 				auto& any = m_framePasses[passIndex];
+				BT_ZONE_SCOPE("ORG.Execution.PreparePass");
+				BT_ZONE_TEXT(any.name.data(), any.name.size());
+				BT_ZONE_VALUE(preparedResourceSlots[passIndex] ? preparedResourceSlots[passIndex]->size() : 0);
 				auto passPreparation = preparation;
 				passPreparation.resourceSlots = preparedResourceSlots[passIndex];
 				PreparedPass packet;
@@ -2321,10 +2412,11 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
     } else {
         BT_ZONE_SCOPE("ORG.SyncCompile.DirectCompile");
         auto ownedInput = std::make_shared<const experimental::GraphCompileInput>(std::move(input));
-        experimental::CompileWorkspace workspace;
         std::atomic_bool cancelled{false};
-        auto graph = experimental::CompileGraph(ownedInput, workspace, cancelled);
+        auto graph = experimental::CompileGraph(ownedInput, m_compilerState->synchronousCompileWorkspace, cancelled);
         if (!graph) throw std::runtime_error("Synchronous fresh graph compilation failed");
+        if (ownedInput->expectedEdges && graph->edges != *ownedInput->expectedEdges)
+            throw std::runtime_error("Synchronous dependency diagnostic failed");
         const auto sequence = m_compilerState->lastRequestedAsyncSequence + 1;
         m_compilerState->synchronousBundle =
             std::make_shared<const experimental::CompiledGraphBundle>(
@@ -2417,7 +2509,7 @@ std::shared_ptr<FrameContext> RenderGraph::TryAcceptFrame(
         throw std::logic_error("Frame production has stopped");
     if (!m_taskService || !m_renderGraphSettingsService) return {};
 
-    m_compilerState->RetireCompletedFrames(m_queueRegistry);
+    m_compilerState->RetireCompletedFrames(m_queueRegistry, m_taskService.get());
     if (m_compilerState->asyncTimelineAdmission) {
         auto retired = m_compilerState->asyncTimelineAdmission->TakeRetiredGarbage();
         if (!retired.empty()) {
@@ -2475,7 +2567,7 @@ std::shared_ptr<FrameContext> RenderGraph::TryAcceptFrame(
                 throw std::runtime_error(
                     "GPU completion wait failed while reclaiming a frame slot");
         }
-        m_compilerState->RetireCompletedFrames(m_queueRegistry);
+        m_compilerState->RetireCompletedFrames(m_queueRegistry, m_taskService.get());
         if (m_compilerState->currentAsyncInput
             && m_compilerState->currentAsyncInput->frameContext == previous)
             m_compilerState->currentAsyncInput.reset();
@@ -2671,6 +2763,25 @@ void RenderGraph::PrepareAndCompileFrame(rhi::Device device, uint8_t frameIndex,
 		}
 		if (!setChanges.empty()) {
 			BT_ZONE_SCOPE("RenderGraph::CompileFrame::RefreshRetainedDeclarations::ApplyIncrementalResolverPatch");
+			BT_ZONE_TEXT(p.name.data(), p.name.size());
+			size_t changedResourceCount = 0;
+			for (const auto& [index, state] : setChanges)
+				if (state && state->resources) changedResourceCount += state->resources->size();
+			BT_ZONE_VALUE(changedResourceCount);
+			for (const auto& [index, state] : setChanges) {
+				BT_ZONE_SCOPE("ORG.RefreshRetained.ChangedResolver");
+				BT_ZONE_TEXT(p.name.data(), p.name.size());
+				if (!state || !state->resources) continue;
+				BT_ZONE_VALUE(state->resources->size());
+				// Sample member names without tracing every resource in large resolver sets.
+				for (size_t resourceIndex = 0; resourceIndex < (std::min)(size_t{ 4 }, state->resources->size()); ++resourceIndex)
+					if (const auto& resource = (*state->resources)[resourceIndex]) {
+						BT_ZONE_SCOPE("ORG.RefreshRetained.ChangedResolverMember");
+						const auto& name = resource->GetName();
+						BT_ZONE_TEXT(name.data(), name.size());
+						BT_ZONE_VALUE(resource->GetGlobalResourceID());
+					}
+			}
 			bool patchable = p.declarationCache.incrementalResolverPatchable;
 			const bool singleUnmixedBinding = p.resolverSnapshots.size() == 1
 				&& setChanges.size() == 1
@@ -3880,10 +3991,63 @@ void RenderGraph::PrepareAndCompileFrame(rhi::Device device, uint8_t frameIndex,
 		traceCompileStep("complete");
 		return;
 	}
+	const AutoAliasMode autoAliasMode = m_getAutoAliasMode ? m_getAutoAliasMode() : AutoAliasMode::Off;
+	auto hasManualAliasPoolThisFrame = [&]() {
+		for (uint64_t resourceID : usedResourceIDs) {
+			Resource* resource = nullptr;
+			if (auto it = resourcesByID.find(resourceID); it != resourcesByID.end() && it->second) {
+				resource = it->second.get();
+			}
+			else if (auto it = m_transientFrameResourcesByID.find(resourceID); it != m_transientFrameResourcesByID.end() && it->second) {
+				resource = it->second.get();
+			}
+			resource = UnwrapDynamicResource(resource);
+			if (auto* texture = dynamic_cast<PixelBuffer*>(resource)) {
+				if (texture->GetDescription().allowAlias && texture->GetDescription().aliasingPoolID.has_value()) {
+					return true;
+				}
+			}
+			else if (auto* buffer = dynamic_cast<BufferBase*>(resource)) {
+				if (buffer->IsAliasingAllowed() && buffer->GetAliasingPoolHint().has_value()) {
+					return true;
+				}
+			}
+		}
+		return false;
+	};
+	const bool needsAliasCompile = autoAliasMode != AutoAliasMode::Off || hasManualAliasPoolThisFrame();
+    m_compilerState->frameDependencyAnalysis.reset();
+    auto buildFreshDependencies = [&] {
+        experimental::GraphCompileStructure structure;
+        structure.resourceIDs.resize(m_frameDAGResourceCount);
+        const auto primary = m_backendDevices.empty() ? rhi::Backend::Null : m_backendDevices.front().backend;
+        for (const auto& node : nodes) {
+            experimental::CompilePass pass;
+            if (node.passIndex < m_framePassAccessSummaries.size()) {
+                const auto& summary = m_framePassAccessSummaries[node.passIndex];
+                pass.backend = static_cast<uint32_t>(summary.backendAffinity.strength == BackendAffinityStrength::Primary
+                    ? primary : summary.backendAffinity.backend);
+                for (const auto& access : summary.dagAccesses)
+                    pass.accesses.push_back({access.resourceIndex, access.kind != AccessKind::Read});
+            }
+            structure.passes.push_back(std::move(pass));
+        }
+        for (auto [from, to] : explicitEdges) if (from < nodes.size() && to < nodes.size())
+            structure.explicitEdges.emplace_back(static_cast<uint32_t>(from), static_cast<uint32_t>(to));
+        std::atomic_bool cancelled{false};
+        m_compilerState->frameDependencyAnalysis =
+            m_compilerState->synchronousCompileWorkspace.AnalyzeDependencies(structure, cancelled);
+        for (auto [from, to] : *m_compilerState->frameDependencyAnalysis) {
+            nodes[from].out.push_back(to);
+            nodes[to].in.push_back(from);
+            ++nodes[to].indegree;
+        }
+        return FinalizeDependencyGraph(nodes);
+    };
 	{
 		traceCompileStep("BuildDependencyGraph");
 		BT_ZONE_SCOPE("RenderGraph::CompileFrame::BuildDependencyGraph");
-		if (!BuildDependencyGraph(nodes, explicitEdges)) {
+		if (!(m_taskService ? buildFreshDependencies() : BuildDependencyGraph(nodes, explicitEdges))) {
 			auto passNameForNode = [&](size_t nodeIndex) -> std::string_view {
 				if (nodeIndex >= nodes.size()) {
 					return "<invalid-node>";
@@ -3995,34 +4159,10 @@ void RenderGraph::PrepareAndCompileFrame(rhi::Device device, uint8_t frameIndex,
 	}
 
     std::vector<std::pair<uint32_t, uint32_t>> dependencyOracle;
-    for (uint32_t index = 0; index < nodes.size(); ++index)
+    if (!m_taskService) for (uint32_t index = 0; index < nodes.size(); ++index)
         for (auto next : nodes[index].out)
             dependencyOracle.emplace_back(index, static_cast<uint32_t>(next));
-	const AutoAliasMode autoAliasMode = m_getAutoAliasMode ? m_getAutoAliasMode() : AutoAliasMode::Off;
-	auto hasManualAliasPoolThisFrame = [&]() {
-		for (uint64_t resourceID : usedResourceIDs) {
-			Resource* resource = nullptr;
-			if (auto it = resourcesByID.find(resourceID); it != resourcesByID.end() && it->second) {
-				resource = it->second.get();
-			}
-			else if (auto it = m_transientFrameResourcesByID.find(resourceID); it != m_transientFrameResourcesByID.end() && it->second) {
-				resource = it->second.get();
-			}
-			resource = UnwrapDynamicResource(resource);
-			if (auto* texture = dynamic_cast<PixelBuffer*>(resource)) {
-				if (texture->GetDescription().allowAlias && texture->GetDescription().aliasingPoolID.has_value()) {
-					return true;
-				}
-			}
-			else if (auto* buffer = dynamic_cast<BufferBase*>(resource)) {
-				if (buffer->IsAliasingAllowed() && buffer->GetAliasingPoolHint().has_value()) {
-					return true;
-				}
-			}
-		}
-		return false;
-	};
-	const bool needsAliasCompile = autoAliasMode != AutoAliasMode::Off || hasManualAliasPoolThisFrame();
+
 	if (needsAliasCompile) {
 		std::vector<org::alias::AliasSchedulingNode> aliasNodes;
 		aliasNodes.reserve(nodes.size());
@@ -4112,13 +4252,13 @@ void RenderGraph::PrepareAndCompileFrame(rhi::Device device, uint8_t frameIndex,
 		BT_ZONE_SCOPE("RenderGraph::CompileFrame::RebuildSchedulingEquivalentIDCache");
 		RebuildSchedulingEquivalentIDCache(usedResourceIDs);
 	}
-	{
+	if (!m_taskService || CompileDiagnosticsEnabled() || m_backendDevices.size() > 1) {
 		traceCompileStep("RebuildEquivalentResourceIndicesByResourceIndex");
 		BT_ZONE_SCOPE("RenderGraph::CompileFrame::RebuildEquivalentResourceIndicesByResourceIndex");
 		RebuildEquivalentResourceIndicesByResourceIndex();
 		ResetFrameQueueBatchHistoryTables();
 	}
-	{
+	if (!m_taskService || CompileDiagnosticsEnabled() || m_backendDevices.size() > 1) {
 		traceCompileStep("RebuildFramePassSchedulingSummaries");
 		BT_ZONE_SCOPE("RenderGraph::CompileFrame::RebuildFramePassSchedulingSummaries");
 		RebuildFramePassSchedulingSummaries();
@@ -4147,7 +4287,7 @@ void RenderGraph::PrepareAndCompileFrame(rhi::Device device, uint8_t frameIndex,
 			}
 		}
 	}
-	{
+	if (!m_taskService || CompileDiagnosticsEnabled() || m_backendDevices.size() > 1) {
 		traceCompileStep("RebuildFrameResourceAccessSummaries");
 		BT_ZONE_SCOPE("RenderGraph::CompileFrame::RebuildFrameResourceAccessSummaries");
 		RebuildFrameResourceAccessSummaries(nodes);
@@ -4157,12 +4297,12 @@ void RenderGraph::PrepareAndCompileFrame(rhi::Device device, uint8_t frameIndex,
 		BT_ZONE_SCOPE("RenderGraph::CompileFrame::MaterializeUnmaterializedResources");
 		MaterializeUnmaterializedResources(usedResourceIDs);
 	}
-	{
+	if (!m_taskService || CompileDiagnosticsEnabled() || m_backendDevices.size() > 1) {
 		traceCompileStep("RebuildFrameCompileResources");
 		BT_ZONE_SCOPE("RenderGraph::CompileFrame::RebuildFrameCompileResources");
 		RebuildFrameCompileResources();
 	}
-	{
+	if (!m_taskService || CompileDiagnosticsEnabled() || m_backendDevices.size() > 1) {
 		traceCompileStep("SnapshotCompiledResourceGenerations");
 		BT_ZONE_SCOPE("RenderGraph::CompileFrame::SnapshotCompiledResourceGenerations");
 		SnapshotCompiledResourceGenerations(usedResourceIDs);
@@ -4170,11 +4310,21 @@ void RenderGraph::PrepareAndCompileFrame(rhi::Device device, uint8_t frameIndex,
     // Capture only after realization has produced owned backing generations.
     // Workers still receive immutable numeric metadata and leases; no compile
     // work is performed by this owner-side placement.
+    // Representations must exist before the exact recording input is frozen.
+    MaterializeMultiBackendRepresentations();
     SubmitOwnedCompileRequest(device, nodes, explicitEdges, std::move(dependencyOracle), frameIndex, deltaTime, hostData);
+
+    if (m_taskService && !CompileDiagnosticsEnabled() && m_backendDevices.size() <= 1) {
+        // The fresh execution planner owns barriers, alias admission and queue
+        // waits. The legacy batches below are only for the no-service adapter.
+        traceCompileStep("complete");
+        return;
+    }
 
 	{
 		traceCompileStep("AutoScheduleAndBuildBatches");
 		BT_ZONE_SCOPE("RenderGraph::CompileFrame::AutoScheduleAndBuildBatches");
+        basic_telemetry::AddCounter("ORG.Execution.LegacySchedulingBuilds");
 		AutoScheduleAndBuildBatches(*this, m_framePasses, nodes);
 	}
 	{

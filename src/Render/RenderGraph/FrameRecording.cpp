@@ -200,6 +200,10 @@ std::shared_ptr<const GraphExecutionTimeline> RecordedFrame::Submit(ExecutionTim
     if (m_planning) {
         reserved.reserve(m_planning->signals.size());
         for (const auto& signal : m_planning->signals) reserved.push_back(signal->symbolic);
+        // Asynchronous planning uses symbolic predecessor tokens. Only the
+        // synchronous planner reserves concrete admission signal values.
+        if (std::ranges::any_of(reserved, [](auto point) { return point.value & (uint64_t{1} << 63); }))
+            reserved.clear();
     }
     return admission.SubmitPrepared(m_snapshot->layout->bundle, incoming, m_batches, reserved);
 }

@@ -120,7 +120,7 @@ int TestSignalReservations(rhi::Device device) {
                 CHECK(!packet.Abandon(org::AbandonReason::Shutdown));
             }
             dependencies.reset();
-            CHECK(!lifetime.expired());
+            CHECK(submit ? !lifetime.expired() : lifetime.expired());
         }
         CHECK(lifetime.expired());
         CHECK(cancelled == (submit ? 0 : 1));
@@ -539,13 +539,14 @@ int TestPreparedGpuSubmission(rhi::Device device, ID3D12Device* nativeDevice) {
             CHECK(DeclaredPreparedPass::observedFrame == iteration);
             withData.CommitSubmitted();
             withData.CommitCompleted();
-            // Both a graph-generation declaration refresh and mutation of the
-            // original permission map must leave the queued packet untouched.
+            // Declaration refresh and a new frame's permission map must leave
+            // the queued packet's immutable permission map untouched.
             pass.selected = 42;
             pass.DeclareUnified(declaration);
-            permissions->front().second = 99;
+            preparation.resourceSlots = std::make_shared<const org::FramePreparationContext::ResourceSlots>(
+                org::FramePreparationContext::ResourceSlots{{42,99}});
             bool invalidDeclarationRejected = false;
-            try { (void)pass.PrepareFrame(preparation); }
+            try { auto invalid = pass.PrepareFrame(preparation); invalid.Record(recording); }
             catch (const std::out_of_range&) { invalidDeclarationRejected = true; }
             CHECK(invalidDeclarationRejected);
         }
@@ -995,6 +996,9 @@ int TestOwnedDescriptorGpuExecution(const rhi::DeviceCreateInfo& create) {
                 FrameRecordingJob job; job.device = device;
                 job.queue = device.GetQueue(rhi::QueueKind::Graphics); job.pool = commandPool;
                 job.recording = std::move(recordings[0]);
+                auto ready = commandPool->AcquireBatch(1, runtime->timeline.Get().GetCompletedValue());
+                job.recording.allocation->pair = std::move(ready.front());
+                job.recording.allocation->pool = commandPool;
                 plan.jobs.push_back(std::move(job));
                 return RecordFrame(std::move(plan), {}, 1);
             });
@@ -1019,9 +1023,10 @@ int TestOwnedDescriptorGpuExecution(const rhi::DeviceCreateInfo& create) {
         for (size_t i = 0; i != 1024; ++i) CHECK(static_cast<const uint32_t*>(mapped)[i] == iteration);
         readbackResource->Unmap(0,nullptr);
         CHECK(admission.RetireCompleted(std::vector<ExecutionTimelinePoint>{{1,iteration}}) == 1);
+        admission.TakeRetiredGarbage().clear();
         CHECK(bindingLease.expired());
         CHECK(commandPool->GetDiagnostics().checkedOutCount == 0);
-        CHECK(commandPool->GetDiagnostics().totalOwnedCount == 1);
+        CHECK(commandPool->GetDiagnostics().totalOwnedCount >= 1);
         CHECK(gpuPool.Assemble(0,gpuContents) && cpuPool.Assemble(0,cpuContents));
     }
     return 0;

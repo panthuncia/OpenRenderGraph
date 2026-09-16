@@ -22,6 +22,14 @@ class SymbolicTracker;
 
 class Resource : public std::enable_shared_from_this<Resource> {
 public:
+    // Installed before publication by mutable backing pools. Allocation
+    // ownership alone does not prevent reuse of the allocation's contents.
+    void SetSemanticConsumerLeaseFactory(std::function<std::shared_ptr<const void>()> factory) {
+        m_semanticConsumerLeaseFactory = std::move(factory);
+    }
+    std::shared_ptr<const void> CaptureSemanticConsumerLease() const {
+        return m_semanticConsumerLeaseFactory ? m_semanticConsumerLeaseFactory() : nullptr;
+    }
 	class ScopedECSRegistrationSuppression {
 	public:
 		ScopedECSRegistrationSuppression() noexcept { ++s_ecsRegistrationSuppressionDepth; }
@@ -370,6 +378,7 @@ protected:
 	unsigned int m_arraySize = 1;
 
 private:
+    std::function<std::shared_ptr<const void>()> m_semanticConsumerLeaseFactory;
 	inline static thread_local std::uint32_t s_ecsRegistrationSuppressionDepth = 0;
 	mutable std::mutex m_representationMutex;
 	std::unordered_map<uint8_t, APIRepresentationPtr> m_representations;

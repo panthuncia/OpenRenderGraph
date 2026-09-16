@@ -121,18 +121,24 @@ int main() {
             .shape = {2, 1, false},
         };
         auto makeGraph = [&](bool write, uint32_t queue, uint32_t mip) {
-            CompiledGraph graph;
             auto structure = std::make_shared<GraphCompileStructure>();
             structure->resourceIDs = {99};
             structure->resourceShapes = {{2, 1, false}};
             structure->queues = {{0, true}, {0, true}};
             CompilePass pass;
             pass.preparedPassIndex = 0;
+            pass.compatibleQueueSlots = {queue};
+            pass.preferredQueueSlot = queue;
+            pass.accesses = {{0, write}};
             pass.entryStates.push_back({0, {mip, 1, 0, 1}, {1, 1, 1, write}});
             structure->passes.push_back(std::move(pass));
-            graph.structure = std::move(structure);
-            graph.batches.push_back({0, queue});
-            return graph;
+            GraphCompileInput input;
+            input.structure = std::move(*structure);
+            CompileWorkspace workspace;
+            std::atomic_bool cancelled{false};
+            auto graph = CompileGraph(std::make_shared<const GraphCompileInput>(std::move(input)), workspace, cancelled);
+            CHECK(graph && graph->stateValidationError.empty());
+            return *graph;
         };
         const std::array queues{ExecutionTimelinePoint{11, 0}, ExecutionTimelinePoint{22, 0}};
         auto writeMip0 = makeGraph(true, 0, 0);
@@ -165,18 +171,24 @@ int main() {
     {
         AliasAccessAdmissionLedger ledger;
         auto makeGraph = [](uint64_t resourceID, uint32_t queue) {
-            CompiledGraph graph;
             auto structure = std::make_shared<GraphCompileStructure>();
             structure->resourceIDs = {resourceID};
             structure->resourceShapes = {{1, 1, false}};
             structure->queues = {{0, true}, {0, true}};
             CompilePass pass;
             pass.preparedPassIndex = 0;
+            pass.compatibleQueueSlots = {queue};
+            pass.preferredQueueSlot = queue;
+            pass.accesses = {{0, false}};
             pass.entryStates.push_back({0, {0, 1, 0, 1}, {1, 0, 1, false}});
             structure->passes.push_back(std::move(pass));
-            graph.structure = std::move(structure);
-            graph.batches.push_back({0, queue});
-            return graph;
+            GraphCompileInput input;
+            input.structure = std::move(*structure);
+            CompileWorkspace workspace;
+            std::atomic_bool cancelled{false};
+            auto graph = CompileGraph(std::make_shared<const GraphCompileInput>(std::move(input)), workspace, cancelled);
+            CHECK(graph && graph->stateValidationError.empty());
+            return *graph;
         };
         const auto* heap = reinterpret_cast<const org::AliasHeapGeneration*>(uintptr_t{1});
         rhi::ResourceHandle firstHandle{}, secondHandle{}, disjointHandle{};
@@ -209,9 +221,10 @@ int main() {
         std::vector firstAgain{first};
         auto activations = ledger.ApplyInitialStates(firstGraph, firstAgain);
         CHECK(activations.size() == 1);
-        CHECK(firstAgain[0].regions->size() == 1);
-        CHECK((*firstAgain[0].regions)[0].state.access
-            == static_cast<uint64_t>(rhi::ResourceAccessType::None));
+        CHECK(activations[0].index == first.resource.index && activations[0].generation == first.resource.generation);
+        // Activation is returned to state admission; this ledger does not
+        // rewrite the immutable selected backing snapshot.
+        CHECK(!firstAgain[0].regions);
 
         auto disjointGraph = makeGraph(103, 1);
         waits.assign(1, {});
@@ -402,6 +415,7 @@ int main() {
         CHECK(!lifetime.expired());
         completed[0].value = 2;
         CHECK(bounded.RetireCompleted(completed) == 1);
+        bounded.TakeRetiredGarbage().clear();
         CHECK(lifetime.expired());
         CHECK(bounded.InFlight() == 0);
         completed[0].value = 1;
@@ -437,6 +451,7 @@ int main() {
         packets.clear(); submitted.reset();
         CHECK(!packetLease.expired());
         CHECK(submission.RetireCompleted(std::vector<ExecutionTimelinePoint>{{10,2},{20,1}}) == 1);
+        submission.TakeRetiredGarbage().clear();
         CHECK(packetLease.expired());
         org::FrameSlotPool tailSlots(1);
         auto tailFrame = std::make_shared<org::FrameContext>(2, 1, tailSlots.TryAcquire(0));

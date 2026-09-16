@@ -59,6 +59,11 @@ struct RenderGraph::CompilerState {
         std::shared_ptr<const std::vector<experimental::PreparedStateRegion>> regions;
     };
     std::unordered_map<const Resource*, RealizationSeed> realizationSeeds;
+    experimental::CompileWorkspace synchronousCompileWorkspace;
+    std::shared_ptr<const experimental::DependencyEdges> frameDependencyAnalysis;
+    std::map<uint32_t, std::shared_ptr<PreparedInvocationArena>> invocationArenas;
+    std::shared_ptr<runtime::ITaskScope> ownershipRetirementScope;
+    std::shared_ptr<const PublicationBindingBundle> graphLocalBindingBundle;
 
     struct RecordingFrameOwner {
         uint64_t sequence = 0;
@@ -88,7 +93,7 @@ struct RenderGraph::CompilerState {
     std::unique_ptr<FrameSlotPool> frameSlots;
     std::shared_ptr<FrameContext> preparingFrame;
     std::map<uint32_t, std::weak_ptr<FrameContext>> frameSlotOwners;
-    void RetireCompletedFrames(QueueRegistry& queues) {
+    void RetireCompletedFrames(QueueRegistry& queues, runtime::ITaskService* tasks = nullptr) {
         if (!asyncTimelineAdmission) return;
         std::vector<experimental::ExecutionTimelinePoint> completed;
         const auto submitted = asyncTimelineAdmission->Submitted();
@@ -99,6 +104,25 @@ struct RenderGraph::CompilerState {
             completed.push_back({submitted[slot].timeline, (std::min)(submitted[slot].value, value)});
         }
         asyncTimelineAdmission->RetireCompleted(completed);
+        DrainRetiredOwnership(tasks);
+    }
+    void DrainRetiredOwnership(runtime::ITaskService* tasks) {
+        // Both execution policies retire here. Synchronous execution bypasses
+        // TryAcceptFrame, so leaving garbage destruction there archives every
+        // completed frame and permanently pins publication backing rings.
+        auto retired = asyncTimelineAdmission->TakeRetiredGarbage();
+        if (retired.empty()) return;
+        auto garbage = std::make_shared<decltype(retired)>(std::move(retired));
+        if (tasks && !frameWorkerScope) frameWorkerScope = tasks->CreateScope("ORG.Frame.Worker");
+        if (!tasks || !frameWorkerScope || !tasks->Submit(frameWorkerScope,
+            runtime::TaskPriority::Streaming, "ORG.Frame.RetiredOwnership", [garbage] {
+                BT_ZONE_SCOPE("ORG.Frame.DestroyRetiredOwnership");
+                basic_telemetry::Record("ORG.Frame.RetiredOwnershipDestroyed", garbage->size());
+                garbage->clear();
+            })) {
+            basic_telemetry::AddCounter("ORG.Frame.InlineRetiredOwnershipDestruction");
+            garbage->clear();
+        }
     }
     std::unique_ptr<experimental::GraphCompileCoordinator> compileCoordinator;
     // Direct fresh result for BorrowedSynchronous compilation. It never enters

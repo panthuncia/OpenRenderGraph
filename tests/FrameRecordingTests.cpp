@@ -112,7 +112,6 @@ int TestDelayedFrameRecording(const rhi::DeviceCreateInfo& create) {
     FramePlanningState planner(2); org::FrameSlotPool slots(2);
     ExecutionTimelineAdmission admission({{1,0}},2);
     auto tasks = std::make_shared<RecordingTasks>();
-    std::shared_ptr<org::runtime::ITaskScope> recordingScope;
     PersistentRecordingLanes recordingLanes(2);
     for (unsigned failureRun = 0; failureRun != 2; ++failureRun) {
         auto probe = std::make_shared<RecordingProbe>(); probe->failFirst = failureRun != 0;
@@ -152,9 +151,8 @@ int TestDelayedFrameRecording(const rhi::DeviceCreateInfo& create) {
             CHECK(runtime->timeline.Get().HostWait(2,10000) == rhi::Result::Ok);
             ready0.reset(); ready1.reset(); receipt0.reset(); receipt1.reset();
             CHECK(admission.RetireCompleted(std::array{ExecutionTimelinePoint{1,2}}) == 2);
+            admission.TakeRetiredGarbage().clear();
         }
-        recordingScope->Wait();
-        recordingScope.reset();
         ready1.reset(); first.state.reset(); second.state.reset();
         CHECK(slots.Active() == 0);
     }

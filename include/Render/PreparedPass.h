@@ -16,6 +16,8 @@
 #include "Render/ExternalBindings.h"
 #include "Render/PipelineState.h"
 #include "Render/BindlessResourceViews.h"
+#include "Render/PreparedInvocationArena.h"
+#include "Render/PublicationBindingBundle.h"
 
 namespace org {
 
@@ -91,6 +93,7 @@ private:
 
 class PreparedDependencySnapshot {
 public:
+    bool HasLifecycleEffects() const noexcept { return !m_effects.empty(); }
     struct DescriptorBinding {
         rhi::DescriptorSlot descriptor;
         std::shared_ptr<const void> owner;
@@ -223,22 +226,30 @@ public:
     struct DescriptorBinding { rhi::DescriptorSlot descriptor; std::shared_ptr<const void> owner; };
     FrozenExecutionBindings(std::vector<ResourceBinding> resources,
         std::vector<DescriptorBinding> descriptors = {},
-        OwnershipPolicy policy = OwnershipPolicy::Owned)
-        : m_resources(std::move(resources)), m_descriptors(std::move(descriptors)) {
+        OwnershipPolicy policy = OwnershipPolicy::Owned,
+        std::shared_ptr<const PublicationBindingBundle> publicationRoot = {})
+        : m_resources(std::move(resources)), m_descriptors(std::move(descriptors)), m_publicationRoot(std::move(publicationRoot)) {
         for (const auto& binding : m_resources)
             if (!binding.resource.GetHandle().valid()
-                || (policy == OwnershipPolicy::Owned && !binding.owner))
+                || (policy == OwnershipPolicy::Owned && !binding.owner && !m_publicationRoot))
                 throw std::invalid_argument("Unowned recording resource");
         for (const auto& binding : m_descriptors)
             if (policy == OwnershipPolicy::Owned && !binding.owner)
                 throw std::invalid_argument("Unowned recording descriptor");
     }
-    rhi::Resource Resolve(PreparedResourceReference ref) const { return m_resources.at(ref.slot).resource; }
+    rhi::Resource Resolve(PreparedResourceReference ref) const {
+        return m_source ? m_source->Resolve(PreparedResourceReference{m_resourceMap.at(ref.slot)}) : m_resources.at(ref.slot).resource;
+    }
     std::shared_ptr<const void> Owner(PreparedResourceReference ref) const {
+        if (m_source) return m_source->Owner({m_resourceMap.at(ref.slot)});
         const auto& binding = m_resources.at(ref.slot);
-        return binding.descriptorOwner ? binding.descriptorOwner : binding.owner;
+        if (!binding.owner && m_publicationRoot)
+            if (const auto* version = m_publicationRoot->FindNative(binding.resource.GetHandle(), binding.views.get()))
+                return (*version)->recordingOwner ? (*version)->recordingOwner : (*version)->allocationOwner;
+        return binding.descriptorOwner ? binding.descriptorOwner : binding.owner ? binding.owner : m_publicationRoot;
     }
     const BindlessResourceViews& Views(PreparedResourceReference ref) const {
+        if (m_source) return m_source->Views({m_resourceMap.at(ref.slot)});
         const auto& views = m_resources.at(ref.slot).views;
         if (!views) throw std::out_of_range("Resource has no captured bindless views");
         return *views;
@@ -246,12 +257,27 @@ public:
     rhi::DescriptorSlot Resolve(PreparedDescriptorReference ref) const { return m_descriptors.at(ref.slot).descriptor; }
     const std::vector<ResourceBinding>& Resources() const { return m_resources; }
     const std::vector<DescriptorBinding>& Descriptors() const { return m_descriptors; }
+    const std::shared_ptr<const PublicationBindingBundle>& PublicationRoot() const noexcept { return m_publicationRoot; }
+    static std::shared_ptr<const FrozenExecutionBindings> WithResourceMap(
+        std::shared_ptr<const FrozenExecutionBindings> source, std::vector<uint32_t> map) {
+        if (!source) throw std::invalid_argument("Missing recipe binding source");
+        auto result = std::make_shared<FrozenExecutionBindings>(std::vector<ResourceBinding>{});
+        for (auto slot : map) (void)source->Resolve(PreparedResourceReference{slot});
+        result->m_source = std::move(source);
+        result->m_resourceMap = std::move(map);
+        return result;
+    }
 private:
     std::vector<ResourceBinding> m_resources;
     std::vector<DescriptorBinding> m_descriptors;
+    std::shared_ptr<const PublicationBindingBundle> m_publicationRoot;
+    std::shared_ptr<const FrozenExecutionBindings> m_source;
+    std::vector<uint32_t> m_resourceMap;
 };
 
 struct FramePreparationContext {
+    std::shared_ptr<PreparedInvocationArena> invocationArena;
+    std::function<void(std::shared_ptr<const void>)> retireOwnership;
     rhi::Device device; // Host-owned device; valid through frame retirement.
     uint32_t frameIndex = 0;
     // Stable CPU frame-data slot retained by this prepared request. The
@@ -618,12 +644,14 @@ public:
     // the immutable frame data captured by Prepare.
     template<class Derived, class Data>
     static PreparedPass FromTyped(Data data,
-        std::shared_ptr<const PreparedDependencySnapshot> dependencies = {}) {
+        std::shared_ptr<const PreparedDependencySnapshot> dependencies = {},
+        std::shared_ptr<PreparedInvocationArena> arena = {}) {
         static_assert(requires(const Data& value, RecordingContext& context) {
             { Derived::Record(value, context) } -> std::same_as<void>;
         }, "Typed passes require static Record(const FrameData&, RecordingContext&)");
         PreparedPass result;
-        auto storage = std::make_shared<TypedStorage<Derived, Data>>(std::move(data));
+        auto storage = arena ? arena->MakeShared<TypedStorage<Derived, Data>>(std::move(data))
+                             : std::make_shared<TypedStorage<Derived, Data>>(std::move(data));
         if (dependencies) storage->externalSignals = dependencies->SignalsAfterCompletion();
         storage->dependencies = std::move(dependencies);
         storage->workerSafe = true;

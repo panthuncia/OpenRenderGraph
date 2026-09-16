@@ -77,6 +77,9 @@ add_library(OpenRenderGraph STATIC
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Contributor/ContributorGraphHost.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Contributor/ContributorRuntime.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/DescriptorHeap.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PublicationBindingBundle.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/PublicationBindingBundle.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/PreparedInvocationArena.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/External/ContributorRuntime.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/CommandListPool.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/QueueRegistry.cpp"
@@ -190,6 +193,14 @@ endif()
 
 if(OPENRENDERGRAPH_BUILD_TESTS)
     enable_testing()
+    add_executable(OpenRenderGraphRecordingRecipeTests tests/RecordingRecipeTests.cpp)
+    target_compile_features(OpenRenderGraphRecordingRecipeTests PRIVATE cxx_std_23)
+    target_compile_definitions(OpenRenderGraphRecordingRecipeTests PRIVATE NOMINMAX)
+    if(MSVC)
+        target_compile_options(OpenRenderGraphRecordingRecipeTests PRIVATE /utf-8)
+    endif()
+    target_link_libraries(OpenRenderGraphRecordingRecipeTests PRIVATE OpenRenderGraph)
+    add_test(NAME OpenRenderGraphRecordingRecipeTests COMMAND OpenRenderGraphRecordingRecipeTests)
     add_custom_target(OpenRenderGraphAsyncFrameTests DEPENDS
         OpenRenderGraphFrameContextTests OpenRenderGraphAsyncCompileTests OpenRenderGraphExternalResourceTests)
     add_executable(OpenRenderGraphFrameContextTests tests/FrameContextTests.cpp)

@@ -8,6 +8,7 @@
 #include "Resources/ResourceStateTracker.h"
 #include "Resources/ResourceIdentifier.h"
 #include "RenderPasses/Base/PassReturn.h"
+#include "Render/PublicationBindingBundle.h"
 
 
 namespace org {
@@ -21,8 +22,10 @@ using ResolverResourceList = std::vector<std::shared_ptr<Resource>>;
 class ResolverCaptureContext {
 public:
     template<class T>
-    explicit ResolverCaptureContext(std::shared_ptr<const T> publication)
-        : m_type(typeid(T)), m_publication(std::move(publication)) {}
+    explicit ResolverCaptureContext(std::shared_ptr<const T> publication,
+        std::shared_ptr<const PublicationBindingBundle> bindings = {})
+        : m_type(typeid(T)), m_publication(std::move(publication)), m_bindings(std::move(bindings)) {}
+    const std::shared_ptr<const PublicationBindingBundle>& BindingBundle() const noexcept { return m_bindings; }
     template<class T> std::shared_ptr<const T> Get() const noexcept {
         return m_type == std::type_index(typeid(T))
             ? std::static_pointer_cast<const T>(m_publication) : nullptr;
@@ -31,6 +34,7 @@ public:
 private:
     std::type_index m_type;
     std::shared_ptr<const void> m_publication;
+    std::shared_ptr<const PublicationBindingBundle> m_bindings;
 };
 
 struct ResolverResourceSetIdentity {

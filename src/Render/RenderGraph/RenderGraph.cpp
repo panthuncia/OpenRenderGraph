@@ -3753,6 +3753,8 @@ void RenderGraph::StopFrameProduction() {
         if (auto frame = weak.lock()) frames.push_back(std::move(frame));
     if (m_compilerState->frameWorkerScope) m_compilerState->frameWorkerScope->CancelAndWait();
     m_compilerState->frameWorkerScope.reset();
+    if (m_compilerState->ownershipRetirementScope) m_compilerState->ownershipRetirementScope->Wait();
+    m_compilerState->ownershipRetirementScope.reset();
 	m_compilerState->compileCoordinator.reset();
     // Joining compilation/recording precedes cancellation. Keep admission and
     // recovery owners intact until the caller establishes GPU quiescence.
@@ -3767,7 +3769,7 @@ void RenderGraph::StopFrameProduction() {
 void RenderGraph::ShutdownTaskWorkers() {
     StopFrameProduction();
     const auto slotsBefore = m_compilerState->frameSlots ? m_compilerState->frameSlots->Active() : 0;
-    m_compilerState->RetireCompletedFrames(m_queueRegistry);
+    m_compilerState->RetireCompletedFrames(m_queueRegistry, m_taskService.get());
     const auto pendingGpu = m_compilerState->asyncTimelineAdmission ? m_compilerState->asyncTimelineAdmission->InFlight() : 0;
 	m_compilerState->selectedAsyncFrame.reset();
 	m_compilerState->currentAsyncInput.reset();
@@ -5322,7 +5324,7 @@ void RenderGraph::ResetForRebuild()
 	// cancel the unsubmitted suffix, retire submitted ownership from confirmed
 	// queue completion, and only then detach graph storage.
 	StopFrameProduction();
-	m_compilerState->RetireCompletedFrames(m_queueRegistry);
+	m_compilerState->RetireCompletedFrames(m_queueRegistry, m_taskService.get());
 	if (m_compilerState->asyncTimelineAdmission
 		&& m_compilerState->asyncTimelineAdmission->InFlight() != 0)
 		throw std::runtime_error(
@@ -9567,7 +9569,9 @@ bool RenderGraph::PrepareSelectedAsyncFrame(PassExecutionContext& context) {
             states[slot].resource = found->resource.GetHandle();
             resources->leases.push_back(found->owner);
         }
-        resources->bindings = std::make_shared<const FrozenExecutionBindings>(std::move(concrete));
+        resources->bindings = std::make_shared<const FrozenExecutionBindings>(std::move(concrete),
+            std::vector<FrozenExecutionBindings::DescriptorBinding>{},
+            FrozenExecutionBindings::OwnershipPolicy::Owned, resources->bindings->PublicationRoot());
         resources->initialStates =
             std::make_shared<const std::vector<experimental::PreparedBackingState>>(
                 states);
@@ -9632,7 +9636,7 @@ bool RenderGraph::ShouldDeferAsyncAdmission() {
         || !m_compilerState->compileCoordinator) return false;
     auto& coordinator = *m_compilerState->compileCoordinator;
     coordinator.Pump();
-    m_compilerState->RetireCompletedFrames(m_queueRegistry);
+    m_compilerState->RetireCompletedFrames(m_queueRegistry, m_taskService.get());
     const auto capacity = m_compilerState->frameSlots
         ? m_compilerState->frameSlots->Capacity() : size_t{1};
     if (m_compilerState->frameSlots
@@ -9730,6 +9734,7 @@ bool RenderGraph::TryExecuteSelectedAsyncFrame(PassExecutionContext& context, bo
                 (std::min)(submitted[slot].value, m_queueRegistry.GetFence(index).GetCompletedValue())});
         }
         const auto retired = m_compilerState->asyncTimelineAdmission->RetireCompleted(completed);
+        m_compilerState->DrainRetiredOwnership(m_taskService.get());
         BT_PLOT("ORG.Execution.RetiredFrames", static_cast<int64_t>(retired));
     }
 

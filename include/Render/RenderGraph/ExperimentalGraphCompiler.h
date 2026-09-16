@@ -121,6 +121,8 @@ struct GraphCompileInput {
     // compiler never dereferences it; realization/admission interprets it.
     std::shared_ptr<const void> executionPayload;
     std::shared_ptr<const IFramePayloadLifecycle> executionLifecycle;
+    // Produced once for this request before alias realization; never reused between frames.
+    std::shared_ptr<const DependencyEdges> analyzedDependencies;
     std::shared_ptr<const DependencyEdges> expectedEdges;
     std::shared_ptr<const DependencyEdges> expectedSchedulingEdges;
 };
@@ -222,6 +224,8 @@ std::string ValidateSymbolicStates(const GraphCompileInput&, const CompiledGraph
 
 class CompileWorkspace {
 public:
+    std::shared_ptr<const DependencyEdges> AnalyzeDependencies(
+        const GraphCompileStructure&, const std::atomic_bool& cancelled);
     std::shared_ptr<const CompiledGraph> Compile(
         std::shared_ptr<const GraphCompileInput> input, const std::atomic_bool& cancelled);
 private:
