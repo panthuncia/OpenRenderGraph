@@ -18,8 +18,11 @@
 #include "Render/BindlessResourceViews.h"
 #include "Render/PreparedInvocationArena.h"
 #include "Render/PublicationBindingBundle.h"
+#include "Render/RenderGraph/CompileTelemetry.h"
+#include "Resources/ResourceIdentifier.h"
 
 namespace org {
+namespace persistent { class SelectedPublication; class BindingToken; class ViewToken; }
 
 struct IHostExecutionData;
 struct SubmissionContext { uint64_t submissionID = 0; };
@@ -38,6 +41,24 @@ struct PreparedWorkGraphReference { uint32_t slot = 0; };
 struct PreparedProgramBinding {
     PreparedProgramReference program;
     std::vector<unsigned int> descriptorIndices;
+};
+
+// One preparation call may capture many programs sharing the same descriptor
+// registrations. Resolve each successful registration once against that
+// call's selected publication; never carry numeric results into another frame.
+class PreparedDescriptorIndexCache {
+public:
+    template<class Resolver>
+    uint32_t Resolve(const ResourceIdentifier& resource, bool optional, Resolver&& resolver) {
+        const auto found = m_indices.find(resource.hash);
+        if (found != m_indices.end()) return found->second;
+        const auto index = resolver(resource, optional);
+        // An optional miss must not hide a subsequent mandatory failure.
+        if (index != UINT32_MAX) m_indices.emplace(resource.hash, index);
+        return index;
+    }
+private:
+    std::unordered_map<size_t, uint32_t> m_indices;
 };
 struct CapturedPipeline {
     rhi::PipelineHandle pipeline{};
@@ -222,6 +243,9 @@ public:
         std::shared_ptr<const void> owner;
         std::shared_ptr<const BindlessResourceViews> views;
         std::shared_ptr<const void> descriptorOwner;
+        // The frame's publication root owns this exact generation. Keep a
+        // non-owning lookup here so recipe capture never searches the catalog.
+        const ResourceBindingSnapshot* publicationBinding = nullptr;
     };
     struct DescriptorBinding { rhi::DescriptorSlot descriptor; std::shared_ptr<const void> owner; };
     FrozenExecutionBindings(std::vector<ResourceBinding> resources,
@@ -231,6 +255,10 @@ public:
         : m_resources(std::move(resources)), m_descriptors(std::move(descriptors)), m_publicationRoot(std::move(publicationRoot)) {
         for (const auto& binding : m_resources)
             if (!binding.resource.GetHandle().valid()
+                || (binding.publicationBinding && (!m_publicationRoot
+                    || binding.publicationBinding->resource.GetHandle().index != binding.resource.GetHandle().index
+                    || binding.publicationBinding->resource.GetHandle().generation != binding.resource.GetHandle().generation
+                    || binding.publicationBinding->views != binding.views))
                 || (policy == OwnershipPolicy::Owned && !binding.owner && !m_publicationRoot))
                 throw std::invalid_argument("Unowned recording resource");
         for (const auto& binding : m_descriptors)
@@ -243,6 +271,9 @@ public:
     std::shared_ptr<const void> Owner(PreparedResourceReference ref) const {
         if (m_source) return m_source->Owner({m_resourceMap.at(ref.slot)});
         const auto& binding = m_resources.at(ref.slot);
+        if (binding.publicationBinding)
+            return binding.publicationBinding->recordingOwner
+                ? binding.publicationBinding->recordingOwner : binding.publicationBinding->allocationOwner;
         if (!binding.owner && m_publicationRoot)
             if (const auto* version = m_publicationRoot->FindNative(binding.resource.GetHandle(), binding.views.get()))
                 return (*version)->recordingOwner ? (*version)->recordingOwner : (*version)->allocationOwner;
@@ -258,6 +289,7 @@ public:
     const std::vector<ResourceBinding>& Resources() const { return m_resources; }
     const std::vector<DescriptorBinding>& Descriptors() const { return m_descriptors; }
     const std::shared_ptr<const PublicationBindingBundle>& PublicationRoot() const noexcept { return m_publicationRoot; }
+    std::span<const uint32_t> FrameResourceMap() const noexcept { return m_resourceMap; }
     static std::shared_ptr<const FrozenExecutionBindings> WithResourceMap(
         std::shared_ptr<const FrozenExecutionBindings> source, std::vector<uint32_t> map) {
         if (!source) throw std::invalid_argument("Missing recipe binding source");
@@ -306,7 +338,17 @@ struct FramePreparationContext {
     // Per-pass permission map assembled from that pass's declarations. This
     // lets preparation capture a stable binding slot without retaining a
     // Resource wrapper or knowing anything about graph indices.
-    using ResourceSlots = std::vector<std::pair<uint64_t, uint32_t>>;
+    struct ResourceSlots : std::vector<std::pair<uint64_t, uint32_t>> {
+        using std::vector<std::pair<uint64_t, uint32_t>>::vector;
+        bool sorted = false;
+        const_iterator Find(uint64_t id) const {
+            if (!sorted) return std::find_if(begin(), end(),
+                [id](const auto& entry) { return entry.first == id; });
+            const auto found = std::lower_bound(begin(), end(), id,
+                [](const auto& entry, uint64_t key) { return entry.first < key; });
+            return found != end() && found->first == id ? found : end();
+        }
+    };
     std::shared_ptr<const ResourceSlots> resourceSlots;
     // Installed by TypedRenderGraphPass for the duration of Prepare. This
     // hides the legacy registry-view descriptor helper from pass authors and
@@ -359,6 +401,10 @@ struct FramePreparationContext {
             throw std::logic_error("Program binding capture is unavailable outside typed preparation");
         if (!payload || !payload->pso)
             throw std::invalid_argument("Pipeline has no immutable payload");
+        static const basic_telemetry::Callsite callsite("ORG.Execution.CaptureProgramBindings");
+        CompileDetailScope trace(callsite, payload->label,
+            payload->pipelineResources.mandatoryResourceDescriptorSlots.size()
+                + payload->pipelineResources.optionalResourceDescriptorSlots.size());
         auto indices = captureDescriptorIndices(payload->pipelineResources);
         return {dependencyCollector->Capture(std::move(payload)), std::move(indices)};
     }
@@ -383,8 +429,7 @@ struct FramePreparationContext {
 
     PreparedResourceReference CaptureResource(uint64_t globalResourceID) const {
         if (!resourceSlots) throw std::logic_error("Resource capture is unavailable outside owned preparation");
-        const auto found = std::find_if(resourceSlots->begin(), resourceSlots->end(),
-            [globalResourceID](const auto& entry) { return entry.first == globalResourceID; });
+        const auto found = resourceSlots->Find(globalResourceID);
         if (found == resourceSlots->end()) {
             std::string message = "Pass attempted to capture undeclared resource "
                 + std::to_string(globalResourceID) + "; declared IDs:";
@@ -404,10 +449,10 @@ struct FramePreparationContext {
 
     PreparedResourceReference CaptureResource(ResourceBindingToken binding) const {
         if (resourceSlots) {
-            for (const auto& [id, slot] : *resourceSlots)
-                if (id == binding.registryResourceID) return {slot};
-            for (const auto& [id, slot] : *resourceSlots)
-                if (id == binding.globalResourceID) return {slot};
+            const auto registry = resourceSlots->Find(binding.registryResourceID);
+            if (registry != resourceSlots->end()) return {registry->second};
+            const auto global = resourceSlots->Find(binding.globalResourceID);
+            if (global != resourceSlots->end()) return {global->second};
         }
         return CaptureResource(binding.registryResourceID);
     }
@@ -496,13 +541,22 @@ struct FramePreparationContext {
 
 class RecordingContext {
 public:
+    static RecordingContext FromPersistentBindings(rhi::CommandList commands,
+        std::shared_ptr<const persistent::SelectedPublication> publication);
+    RecordingContext WithPersistentBindings(std::shared_ptr<const persistent::SelectedPublication> publication) const;
+    const persistent::SelectedPublication* PersistentPublication() const noexcept { return m_persistentPublication.get(); }
+    rhi::Resource Resolve(persistent::BindingToken token) const;
+    rhi::DescriptorSlot Resolve(persistent::ViewToken token) const;
     RecordingContext(rhi::CommandList commands, std::shared_ptr<const FrozenExecutionBindings> bindings,
         std::shared_ptr<const std::vector<ExternalDescriptorBindingValue>> externalBindings = {})
         : m_commands(commands), m_bindings(std::move(bindings)), m_externalBindings(std::move(externalBindings)) {
         if (!m_commands || !m_bindings) throw std::invalid_argument("Incomplete recording context");
     }
     rhi::CommandList& Commands() { return m_commands; }
-    rhi::Resource Resolve(PreparedResourceReference ref) const { return m_bindings->Resolve(ref); }
+    rhi::Resource Resolve(PreparedResourceReference ref) const {
+        if (!m_bindings) throw std::logic_error("Legacy reference requires frozen recording bindings");
+        return m_bindings->Resolve(ref);
+    }
     rhi::Resource Resolve(ResourceBindingToken token) const {
         if (!m_declaredResourceSlots)
             throw std::logic_error("Declaration tokens require a declared recording scope");
@@ -530,6 +584,7 @@ public:
     rhi::DescriptorSlot Resolve(PreparedDescriptorReference ref) const {
         if (m_dependencies && ref.slot < m_dependencies->DescriptorCount())
             return m_dependencies->Resolve(ref);
+        if (!m_bindings) throw std::logic_error("Legacy descriptor requires frozen recording bindings");
         return m_bindings->Resolve(ref);
     }
     rhi::DescriptorSlot Resolve(ExternalBindingKey key) const {
@@ -558,6 +613,9 @@ public:
         m_dependencies = std::move(dependencies);
     }
 private:
+    struct PersistentTag {};
+    RecordingContext(rhi::CommandList commands, std::shared_ptr<const persistent::SelectedPublication> publication, PersistentTag);
+    std::shared_ptr<const persistent::SelectedPublication> m_persistentPublication;
     rhi::CommandList m_commands;
     std::shared_ptr<const FrozenExecutionBindings> m_bindings;
     std::shared_ptr<const std::vector<ExternalDescriptorBindingValue>> m_externalBindings;

@@ -78,6 +78,7 @@ add_library(OpenRenderGraph STATIC
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Contributor/ContributorRuntime.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/DescriptorHeap.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PublicationBindingBundle.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/RenderGraph/CompileTelemetry.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/PublicationBindingBundle.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/PreparedInvocationArena.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/External/ContributorRuntime.cpp"
@@ -100,6 +101,11 @@ add_library(OpenRenderGraph STATIC
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PassExecutionContext.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraph.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/ExperimentalGraphCompiler.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/PersistentGraph.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/GraphReplay.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/RenderGraph/GraphReplay.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/RenderGraph/PersistentGraph.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/RenderPasses/Base/PersistentTypedPass.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/ExperimentalExecutionState.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/InteropAllocator.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/SharedAliasPoolManager.cpp"
@@ -193,6 +199,17 @@ endif()
 
 if(OPENRENDERGRAPH_BUILD_TESTS)
     enable_testing()
+    add_executable(OpenRenderGraphPersistentTests tests/PersistentGraphTests.cpp tests/GraphReplayRunner.h)
+    target_compile_features(OpenRenderGraphPersistentTests PRIVATE cxx_std_23)
+    target_compile_definitions(OpenRenderGraphPersistentTests PRIVATE
+        ORG_REPLAY_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
+    target_link_libraries(OpenRenderGraphPersistentTests PRIVATE OpenRenderGraph)
+    add_test(NAME OpenRenderGraphPersistentTests COMMAND OpenRenderGraphPersistentTests)
+    set_tests_properties(OpenRenderGraphPersistentTests PROPERTIES
+        ENVIRONMENT "ORG_GRAPH_REPLAY_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/persistent_test_snapshot.orggraph")
+    add_executable(OpenRenderGraphHeadlessBenchmark tests/HeadlessGraphBenchmark.cpp tests/GraphReplayRunner.h)
+    target_compile_features(OpenRenderGraphHeadlessBenchmark PRIVATE cxx_std_23)
+    target_link_libraries(OpenRenderGraphHeadlessBenchmark PRIVATE OpenRenderGraph)
     add_executable(OpenRenderGraphRecordingRecipeTests tests/RecordingRecipeTests.cpp)
     target_compile_features(OpenRenderGraphRecordingRecipeTests PRIVATE cxx_std_23)
     target_compile_definitions(OpenRenderGraphRecordingRecipeTests PRIVATE NOMINMAX)
@@ -238,6 +255,22 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
         target_link_libraries(OpenRenderGraphExternalResourceTests PRIVATE "${OPENRENDERGRAPH_PIX_RUNTIME}")
     endif()
     add_test(NAME OpenRenderGraphExternalResourceTests COMMAND OpenRenderGraphExternalResourceTests)
+    add_custom_target(OpenRenderGraphOffscreenTests DEPENDS OpenRenderGraphExternalResourceTests)
+    if(WIN32)
+        # Keep the offscreen suite runnable from its build directory without a
+        # deployed renderer or MO2 runtime directory on PATH.
+        foreach(runtime_dll
+            "${CMAKE_CURRENT_SOURCE_DIR}/../BasicRenderer/WinPixEventRuntime.dll"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../BasicRenderer/dxcompiler.dll"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../BasicRenderer/dxil.dll"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../BasicRenderer/hlsl.dll")
+            if(EXISTS "${runtime_dll}")
+                add_custom_command(TARGET OpenRenderGraphExternalResourceTests POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${runtime_dll}"
+                        "$<TARGET_FILE_DIR:OpenRenderGraphExternalResourceTests>")
+            endif()
+        endforeach()
+    endif()
     add_executable(OpenRenderGraphContributorHeaderC tests/ContributorHeaderCompile.c)
     set_target_properties(OpenRenderGraphContributorHeaderC PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
     target_include_directories(OpenRenderGraphContributorHeaderC PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
@@ -261,6 +294,9 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
                 WORKING_DIRECTORY "${BASICRENDERER_TEST_RUNTIME_DIR}"
                 ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${BASICRENDERER_TEST_RUNTIME_DIR}")
     endif()
+    set_tests_properties(OpenRenderGraphExternalResourceTests PROPERTIES
+        WORKING_DIRECTORY "$<TARGET_FILE_DIR:OpenRenderGraphExternalResourceTests>"
+        ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:OpenRenderGraphExternalResourceTests>")
 endif()
 
 if(OPENRENDERGRAPH_ENABLE_D3D11_INTEROP)

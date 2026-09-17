@@ -7,6 +7,38 @@
 
 namespace org::experimental {
 namespace {
+bool PointCompleted(ExecutionTimelinePoint point, const std::map<uint64_t, uint64_t>& completed) {
+    if (!point.timeline && !point.value) return true;
+    const auto found = completed.find(point.timeline);
+    return found != completed.end() && found->second >= point.value;
+}
+}
+bool BackingAccessAdmissionLedger::RetireCompleted(rhi::ResourceHandle resource,
+    const std::map<uint64_t, uint64_t>& completed) {
+    const auto key = (uint64_t{resource.generation} << 32) | resource.index;
+    const auto found = m_accesses.find(key);
+    if (found == m_accesses.end()) return true;
+    for (const auto& cell : found->second.cells) {
+        if (!PointCompleted(cell.writer, completed)) return false;
+        for (auto point : cell.readers) if (!PointCompleted(point, completed)) return false;
+    }
+    m_accesses.erase(found);
+    return true;
+}
+bool AliasAccessAdmissionLedger::RetireCompleted(const AliasHeapGeneration* heap,
+    const std::weak_ptr<const AliasHeapGeneration>& owner, const std::map<uint64_t, uint64_t>& completed) {
+    const auto found = m_intervals.find(heap);
+    if (found == m_intervals.end()) return true;
+    const auto recorded = m_heapOwners.find(heap);
+    if (recorded == m_heapOwners.end() || !owner.expired()
+        || owner.owner_before(recorded->second) || recorded->second.owner_before(owner)) return false;
+    for (const auto& interval : found->second)
+        for (auto point : interval.accesses) if (!PointCompleted(point, completed)) return false;
+    m_intervals.erase(found);
+    m_heapOwners.erase(heap);
+    return true;
+}
+namespace {
 uint64_t Key(rhi::ResourceHandle handle) {
     if (!handle.valid()) throw std::invalid_argument("Invalid prepared backing handle");
     return (uint64_t{handle.generation} << 32) | handle.index;
@@ -79,6 +111,26 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
     };
     for (size_t resource = 0; resource < initial.size(); ++resource) {
         const auto& captured = ordered[resource];
+        if (captured.authoritativeIncoming) {
+            if (!captured.regions || captured.regions->empty())
+                throw std::invalid_argument("Authoritative incoming state has no complete regions");
+            const uint64_t area = uint64_t{captured.shape.mips} * captured.shape.slices;
+            uint64_t covered = 0;
+            for (size_t i = 0; i < captured.regions->size(); ++i) {
+                const auto& range = captured.regions->at(i).range;
+                if (!range.mips || !range.slices || range.mip >= captured.shape.mips || range.slice >= captured.shape.slices
+                    || range.mips > captured.shape.mips-range.mip || range.slices > captured.shape.slices-range.slice)
+                    throw std::invalid_argument("Authoritative incoming state range violates backing shape");
+                for (size_t j = 0; j < i; ++j) {
+                    const auto& previous = captured.regions->at(j).range;
+                    if (range.mip < previous.mip+previous.mips && previous.mip < range.mip+range.mips
+                        && range.slice < previous.slice+previous.slices && previous.slice < range.slice+range.slices)
+                        throw std::invalid_argument("Authoritative incoming state regions overlap");
+                }
+                covered += uint64_t{range.mips} * range.slices;
+            }
+            if (covered != area) throw std::invalid_argument("Authoritative incoming state regions do not cover backing");
+        }
         const auto key = Key(captured.resource);
         auto existing = m_states.find(key);
         if (existing != m_states.end() && !wasInvalidated(captured.resource)
@@ -86,6 +138,7 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
             throw std::invalid_argument("Backing shape changed without a new backing identity");
     }
     uint64_t entrySteps = 0, intraBatchSteps = 0, crossQueueSteps = 0;
+    std::vector<rhi::ResourceHandle> authoritativeSeeded;
     for (const auto& step : graph.states.steps) {
         if (step.resource >= ordered.size() || step.batch >= result.batches.size())
             throw std::invalid_argument("Invalid symbolic state step");
@@ -115,16 +168,27 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
         intraBatchSteps += step.previousBatch == step.batch;
         const auto handle = captured.resource;
         const bool boundaryStep = step.previousBatch == UINT32_MAX;
-        const bool invalidatedState = boundaryStep && wasInvalidated(handle);
+        const bool authoritativeState = boundaryStep && captured.authoritativeIncoming;
+        const bool invalidatedState = boundaryStep && wasInvalidated(handle) && !authoritativeState;
         if (boundaryStep
-            && (!m_states.contains(Key(handle)) || invalidatedState)
+            && (!m_states.contains(Key(handle)) || invalidatedState || authoritativeState)
             && std::none_of(output.seeds.begin(), output.seeds.end(),
                 [&](const auto& seed) { return Key(seed.resource) == Key(handle); }))
-            output.seeds.push_back(captured);
+        {
+            const bool alreadySeeded = authoritativeState && std::ranges::any_of(authoritativeSeeded,
+                [&](auto resource) { return SameHandle(resource,handle); });
+            if (!alreadySeeded) {
+                output.seeds.push_back(captured);
+                if (authoritativeState) {
+                    authoritativeSeeded.push_back(handle);
+                    output.authoritativeSeeds.push_back(handle);
+                }
+            }
+        }
         const auto stateKey = Key(handle);
         const auto existing = boundaryStep ? m_states.find(stateKey) : m_states.end();
         const bool useSubmittedState = boundaryStep
-            && existing != m_states.end() && !invalidatedState;
+            && existing != m_states.end() && !invalidatedState && !authoritativeState;
         // Intra-frame state is compiler-invariant. Encode its complete range
         // once instead of replaying one identical barrier per mip/slice cell.
         if (!boundaryStep) {
@@ -356,7 +420,9 @@ void BackingStateAdmissionLedger::CommitBatch(const PreparedBatchBarriers& batch
         throw std::invalid_argument("Invalid backing-state commit");
     for (const auto& seed : batch.seeds) {
         const auto key = Key(seed.resource);
-        if (m_states.contains(key)) continue;
+        const bool authoritative = std::ranges::any_of(batch.authoritativeSeeds,
+            [&](auto resource) { return SameHandle(resource,seed.resource); });
+        if (m_states.contains(key) && !authoritative) continue;
         StateGrid grid;
         grid.shape = seed.shape;
         grid.cells.resize(size_t{grid.shape.mips} * grid.shape.slices);
@@ -365,7 +431,7 @@ void BackingStateAdmissionLedger::CommitBatch(const PreparedBatchBarriers& batch
             Visit(grid.shape, region.range, [&](uint32_t mip, uint32_t slice) {
                 grid.cells[CellIndex(grid.shape, mip, slice)] = region.state;
             });
-        m_states.emplace(key, std::move(grid));
+        m_states.insert_or_assign(key, std::move(grid));
     }
     for (size_t i = 0; i < batch.committedStates.size(); ++i) {
         const auto key = Key(batch.committedResources[i]);
@@ -587,6 +653,7 @@ void AliasAccessAdmissionLedger::Commit(const CompiledGraph& graph,
         for (const auto resourceIndex : graph.aliasFinalResourcesByBatch[batchIndex]) {
                 const auto& resource = ordered[resourceIndex];
                 if (!resource.aliasHeapIdentity || !resource.aliasSize) continue;
+                if (resource.aliasHeap) m_heapOwners[resource.aliasHeapIdentity] = resource.aliasHeap;
                 auto& intervals = m_intervals[resource.aliasHeapIdentity];
                 const uint64_t end = resource.aliasOffset + resource.aliasSize;
                 std::vector<SubmittedInterval> retainedFragments;

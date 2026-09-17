@@ -156,6 +156,15 @@ struct RenderGraph::CompilerState {
     std::unordered_set<std::string> reportedAsyncLegacyPasses;
     uint64_t reportedCompileFailures = 0;
     uint64_t compileCaptureFailures = 0;
+    // Measurement-only (ORG_PERSISTENT_PROBE): classifies frame-to-frame changes
+    // of the lowered compile structure to size persistent executable reuse.
+    struct StructureProbe {
+        std::optional<experimental::GraphCompileStructure> previous;
+        std::vector<std::string> previousNames;
+        std::map<std::string, uint64_t> reasons;
+        uint64_t frames = 0, unchanged = 0;
+    };
+    std::unique_ptr<StructureProbe> structureProbe;
 
 	std::vector<Node> nodes;
 	std::vector<compiler::DependencySequence<size_t>> dependencySeqStates;

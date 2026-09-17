@@ -1,7 +1,9 @@
 #include <cstdlib>
 #include "Render/PublicationBindingBundle.h"
 #include "Render/RenderGraph/ExperimentalGraphCompiler.h"
+#include "Render/RenderGraph/GraphReplay.h"
 #include "FrameTrace.h"
+#include "Render/RenderGraph/CompileTelemetry.h"
 
 #include <algorithm>
 #include <array>
@@ -12,6 +14,17 @@
 #include <spdlog/spdlog.h>
 
 namespace org::experimental {
+
+namespace {
+std::string_view DiagnosticPassName(const GraphCompileStructure& structure, uint32_t pass) {
+    return pass < structure.diagnosticPassNames.size()
+        ? std::string_view(structure.diagnosticPassNames[pass]) : std::string_view{};
+}
+std::string_view DiagnosticResourceName(const GraphCompileStructure& structure, uint32_t resource) {
+    return resource < structure.diagnosticResourceNames.size()
+        ? std::string_view(structure.diagnosticResourceNames[resource]) : std::string_view{};
+}
+}
 
 bool IsExecutionCompatible(const CompiledGraphBundle& bundle,
     const GraphCompileInput& prepared) noexcept {
@@ -364,16 +377,32 @@ SymbolicStatePlan BuildStatePlan(const GraphCompileStructure& s,
     for (size_t r = 0; r < regions.size(); ++r) if (s.resourceShapes[r].mips)
         regions[r].push_back({{0, s.resourceShapes[r].mips, 0, s.resourceShapes[r].slices}, {}});
     std::vector<StateRegion> next;
+    std::vector<uint32_t> accessEpoch(s.resourceIDs.size());
+    std::vector<uint8_t> accessFlags(s.resourceIDs.size());
     for (uint32_t b = 0; b < batches.size(); ++b) {
         if (cancelled.load(std::memory_order_relaxed)) return fallback("Cancelled");
         for (const auto passIndex : batches[b].passes) {
         if (passIndex >= s.passes.size()) return fallback("Invalid scheduled pass");
         const auto& pass = s.passes[passIndex];
+        const auto epoch = passIndex + 1;
+        for (const auto& access : pass.accesses) {
+            if (access.resourceIndex >= accessEpoch.size()) return fallback("Invalid hazard resource");
+            auto& flags = accessFlags[access.resourceIndex];
+            if (accessEpoch[access.resourceIndex] != epoch) flags = 0;
+            accessEpoch[access.resourceIndex] = epoch;
+            flags |= access.write ? 3u : 1u;
+        }
+        static const basic_telemetry::Callsite callsite("ORG.FreshCompile.States.Pass");
+        CompileDetailScope trace(callsite, DiagnosticPassName(s, passIndex),
+            pass.entryStates.size() + pass.exitStates.size(), !s.diagnosticPassNames.empty());
         auto apply = [&](const CompileStateUse& use, bool exit) -> const char* {
+            static const basic_telemetry::Callsite resourceCallsite("ORG.FreshCompile.States.Resource");
+            CompileDetailScope resourceTrace(resourceCallsite, DiagnosticResourceName(s, use.resource),
+                uint64_t{use.range.mips} * use.range.slices, !s.diagnosticResourceNames.empty());
             if (use.resource >= regions.size() || !ValidRange(use.range, s.resourceShapes[use.resource]))
                 return "Invalid captured state range";
-            if ((written[use.resource] || use.state.write) && std::none_of(pass.accesses.begin(), pass.accesses.end(),
-                [&](auto a) { return a.resourceIndex == use.resource && (!use.state.write || a.write); }))
+            if ((written[use.resource] || use.state.write)
+                && (accessEpoch[use.resource] != epoch || !(accessFlags[use.resource] & (use.state.write ? 2u : 1u))))
                 return "State use missing required hazard access";
             const auto state = StateForShape(use.state, s.resourceShapes[use.resource]);
             next.clear();
@@ -428,10 +457,13 @@ void NormalizeCompileInput(GraphCompileInput& input) {
     });
     std::vector<uint64_t> ids;
     std::vector<std::string> keys;
+    std::vector<std::string> diagnosticNames;
     std::vector<CompileResourceShape> shapes;
     std::vector<uint64_t> backingGenerations;
     if (!s.resourceShapes.empty() && s.resourceShapes.size() != order.size())
         throw std::invalid_argument("Captured resource shape count mismatch");
+    if (!s.diagnosticResourceNames.empty() && s.diagnosticResourceNames.size() != order.size())
+        throw std::invalid_argument("Captured diagnostic resource name count mismatch");
     if (!input.backingGenerations.empty() && input.backingGenerations.size() != order.size())
         throw std::invalid_argument("Captured backing generation count mismatch");
     ids.reserve(order.size());
@@ -445,11 +477,13 @@ void NormalizeCompileInput(GraphCompileInput& input) {
         ids.push_back(id); remap[order[i]] = i;
         if (!s.resourceKeys.empty()) keys.emplace_back(key);
         if (!s.resourceShapes.empty()) shapes.push_back(s.resourceShapes[order[i]]);
+        if (!s.diagnosticResourceNames.empty()) diagnosticNames.push_back(s.diagnosticResourceNames[order[i]]);
         if (!input.backingGenerations.empty()) backingGenerations.push_back(input.backingGenerations[order[i]]);
     }
     s.resourceIDs = std::move(ids);
     s.resourceKeys = std::move(keys);
     s.resourceShapes = std::move(shapes);
+    s.diagnosticResourceNames = std::move(diagnosticNames);
     input.backingGenerations = std::move(backingGenerations);
     for (auto& pass : s.passes) {
         for (auto* uses : {&pass.entryStates, &pass.exitStates}) for (auto& use : *uses) {
@@ -484,8 +518,12 @@ std::string ValidateSymbolicSchedule(const GraphCompileInput& input, const Compi
     const auto& s = input.structure;
     const size_t count = s.passes.size(), batchCount = graph.batches.size();
     const size_t words = (batchCount + 63) / 64;
-    if (graph.stage != CompiledGraphStage::SymbolicSchedule || graph.batches.empty())
+    if (graph.stage != CompiledGraphStage::SymbolicSchedule)
         return "Missing complete symbolic schedule";
+    if (!count)
+        return graph.batches.empty() && graph.relativeWaits.empty() && graph.edges.empty() && graph.schedulingEdges.empty()
+            ? std::string{} : "Nonempty schedule for an empty graph";
+    if (graph.batches.empty()) return "Missing complete symbolic schedule";
     std::vector<uint32_t> batchByPass(count, UINT32_MAX), positionByPass(count, UINT32_MAX);
     std::vector<uint32_t> lastQueue(s.queues.size(), UINT32_MAX);
     std::vector<std::vector<uint32_t>> waits(batchCount);
@@ -626,8 +664,17 @@ std::string ValidateSymbolicStates(const GraphCompileInput& input, const Compile
 }
 
 std::shared_ptr<const DependencyEdges> CompileWorkspace::AnalyzeDependencies(
-    const GraphCompileStructure& structure, const std::atomic_bool& cancelled) {
+    const GraphCompileStructure& structure, const std::atomic_bool& cancelled,
+    std::span<const uint32_t> accessOrder) {
     const auto passCount = static_cast<uint32_t>(structure.passes.size());
+    if (!accessOrder.empty()) {
+        if (accessOrder.size() != passCount) throw std::invalid_argument("Invalid dependency access order size");
+        std::vector<uint8_t> seen(passCount);
+        for (auto index : accessOrder) {
+            if (index >= passCount || seen[index]) throw std::invalid_argument("Invalid dependency access order permutation");
+            seen[index] = 1;
+        }
+    }
     DependencyEdges edges;
     m_resources.resize(structure.resourceIDs.size());
     for (auto& state : m_resources) state.Reset();
@@ -636,9 +683,13 @@ std::shared_ptr<const DependencyEdges> CompileWorkspace::AnalyzeDependencies(
     };
     {
         BT_ZONE_SCOPE("ORG.FreshCompile.BuildDependencies");
-        for (uint32_t index = 0; index < passCount; ++index) {
+        for (uint32_t ordinal = 0; ordinal < passCount; ++ordinal) {
+            const auto index = accessOrder.empty() ? ordinal : accessOrder[ordinal];
             if (cancelled.load(std::memory_order_relaxed)) return {};
             const auto& pass = structure.passes[index];
+            static const basic_telemetry::Callsite callsite("ORG.FreshCompile.Dependencies.Pass");
+            CompileDetailScope trace(callsite, DiagnosticPassName(structure, index),
+                pass.accesses.size(), !structure.diagnosticPassNames.empty());
             for (const auto& access : pass.accesses) {
                 if (access.resourceIndex >= m_resources.size())
                     throw std::invalid_argument("Invalid captured dependency resource index");
@@ -651,8 +702,12 @@ std::shared_ptr<const DependencyEdges> CompileWorkspace::AnalyzeDependencies(
                 throw std::invalid_argument("Invalid captured explicit dependency edge");
             edge(from, to);
         }
+        BT_ZONE_VALUE(edges.size());
+        {
+        BT_ZONE_SCOPE("ORG.FreshCompile.DependencyEdgeSort");
         std::sort(edges.begin(), edges.end());
         edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
+        }
     }
     if (cancelled.load(std::memory_order_relaxed)) return {};
     return std::make_shared<const DependencyEdges>(std::move(edges));
@@ -678,12 +733,15 @@ std::shared_ptr<const CompiledGraph> CompileWorkspace::Compile(
     result->edges = *dependencies;
     if (cancelled.load(std::memory_order_relaxed)) return {};
     result->schedulingEdges = result->edges;
+    {
+    BT_ZONE_SCOPE("ORG.FreshCompile.PlacementEdges");
     for (auto edge : structure.placementEdges) {
         if (edge.first >= passCount || edge.second >= passCount) throw std::invalid_argument("Invalid alias placement edge");
         if (edge.first != edge.second) result->schedulingEdges.push_back(edge);
     }
     std::sort(result->schedulingEdges.begin(), result->schedulingEdges.end());
     result->schedulingEdges.erase(std::unique(result->schedulingEdges.begin(), result->schedulingEdges.end()), result->schedulingEdges.end());
+    }
     {
         BT_ZONE_SCOPE("ORG.FreshCompile.Topology");
         m_successors.clear(); m_successors.resize(passCount);
@@ -715,6 +773,9 @@ std::shared_ptr<const CompiledGraph> CompileWorkspace::Compile(
         for (auto passIndex : result->topologicalOrder) {
             if (cancelled.load(std::memory_order_relaxed)) return {};
             const auto& pass = structure.passes[passIndex];
+            static const basic_telemetry::Callsite callsite("ORG.FreshCompile.Schedule.Pass");
+            CompileDetailScope trace(callsite, DiagnosticPassName(structure, passIndex),
+                pass.accesses.size(), !structure.diagnosticPassNames.empty());
             auto usable = [&](uint32_t queue) {
                 return queue < structure.queues.size() && structure.queues[queue].active
                     && std::find(pass.compatibleQueueSlots.begin(), pass.compatibleQueueSlots.end(), queue) != pass.compatibleQueueSlots.end();
@@ -763,11 +824,17 @@ std::shared_ptr<const CompiledGraph> CompileWorkspace::Compile(
             if (producer != UINT32_MAX) result->relativeWaits.push_back({b, producer});
         result->stage = CompiledGraphStage::SymbolicSchedule;
     }
-    if (!structure.resourceShapes.empty()) {
+    if (!structure.resourceShapes.empty() || structure.resourceIDs.empty()) {
         result->states = BuildStatePlan(structure, result->batches, cancelled);
         if (cancelled.load(std::memory_order_relaxed)) return {};
         if (!result->states.complete) return result;
         result->barrierCapacityByPass.resize(passCount);
+        // Diagnostic provenance only. The compiled boundary representation and
+        // normal runtime allocation path remain unchanged.
+        std::vector<std::vector<uint32_t>> diagnosticBoundaryOwners;
+        if (!structure.diagnosticPassNames.empty()) diagnosticBoundaryOwners.resize(result->batches.size());
+        {
+        BT_ZONE_SCOPE("ORG.FreshCompile.BoundaryAccesses");
         result->stateDeltaCapacityByBatch.assign(result->batches.size(), 0);
         result->stateSeedCapacityByBatch.assign(result->batches.size(), 0);
         result->boundaryAccessesByBatch.resize(result->batches.size());
@@ -775,6 +842,10 @@ std::shared_ptr<const CompiledGraph> CompileWorkspace::Compile(
             auto& accesses = result->boundaryAccessesByBatch[batch];
             for (const auto passIndex : result->batches[batch].passes) {
                 const auto& pass = structure.passes[passIndex];
+                static const basic_telemetry::Callsite callsite("ORG.FreshCompile.Boundary.Pass");
+                CompileDetailScope trace(callsite, DiagnosticPassName(structure, passIndex),
+                    pass.entryStates.size(), !structure.diagnosticPassNames.empty());
+                const auto begin = accesses.size();
                 if (!pass.entryStates.empty()) {
                     accesses.insert(accesses.end(), pass.entryStates.begin(), pass.entryStates.end());
                 } else for (const auto& access : pass.accesses) {
@@ -782,58 +853,84 @@ std::shared_ptr<const CompiledGraph> CompileWorkspace::Compile(
                     accesses.push_back({access.resourceIndex,
                         {0, shape.mips, 0, shape.slices}, {0, 0, 0, access.write}});
                 }
+                if (!diagnosticBoundaryOwners.empty())
+                    diagnosticBoundaryOwners[batch].insert(diagnosticBoundaryOwners[batch].end(),
+                        accesses.size() - begin, passIndex);
             }
         }
+        }
+        {
+        BT_ZONE_SCOPE("ORG.FreshCompile.IncomingBoundaryAccesses");
         result->incomingBoundaryAccessesByBatch.resize(result->batches.size());
-        std::vector<std::vector<uint8_t>> seenAny(structure.resourceShapes.size());
-        std::vector<std::vector<uint8_t>> seenWrite(structure.resourceShapes.size());
+        std::vector<size_t> cellOffsets(structure.resourceShapes.size() + 1);
         for (size_t resource = 0; resource < structure.resourceShapes.size(); ++resource) {
             const auto cells = size_t{structure.resourceShapes[resource].mips}
                 * structure.resourceShapes[resource].slices;
-            seenAny[resource].resize(cells);
-            seenWrite[resource].resize(cells);
+            cellOffsets[resource + 1] = cellOffsets[resource] + cells;
         }
+        // Bit zero is any access; bit one is a write. One contiguous allocation
+        // replaces two heap allocations for every resource on each compilation.
+        std::vector<uint8_t> seenCells(cellOffsets.back());
+        {
+        BT_ZONE_SCOPE("ORG.FreshCompile.IncomingBoundaryCells");
         for (uint32_t batch = 0; batch < result->boundaryAccessesByBatch.size(); ++batch) {
+            std::optional<CompileDetailScope> passTrace;
+            uint32_t previousPass = UINT32_MAX;
+            size_t accessIndex = 0;
             for (const auto& access : result->boundaryAccessesByBatch[batch]) {
+                if (!diagnosticBoundaryOwners.empty()) {
+                    const auto passIndex = diagnosticBoundaryOwners[batch][accessIndex++];
+                    if (passIndex != previousPass) {
+                        passTrace.reset();
+                        static const basic_telemetry::Callsite callsite("ORG.FreshCompile.IncomingBoundary.Pass");
+                        passTrace.emplace(callsite, DiagnosticPassName(structure, passIndex),
+                            structure.passes[passIndex].entryStates.size(), true);
+                        previousPass = passIndex;
+                    }
+                }
                 const auto shape = structure.resourceShapes.at(access.resource);
                 for (uint32_t slice = access.range.slice;
                     slice < access.range.slice + access.range.slices; ++slice)
                     for (uint32_t mip = access.range.mip;
                         mip < access.range.mip + access.range.mips; ++mip) {
-                        const auto cell = size_t{slice} * shape.mips + mip;
-                        const bool first = !seenAny[access.resource][cell];
+                        auto& seen = seenCells[cellOffsets[access.resource] + size_t{slice} * shape.mips + mip];
+                        const bool first = !(seen & 1u);
                         const bool firstWrite = access.state.write
-                            && !seenWrite[access.resource][cell];
+                            && !(seen & 2u);
                         if (first || firstWrite)
                             result->incomingBoundaryAccessesByBatch[batch].push_back({
                                 access.resource, {mip, 1, slice, 1}, access.state});
-                        seenAny[access.resource][cell] = 1;
-                        if (access.state.write) seenWrite[access.resource][cell] = 1;
+                        seen |= access.state.write ? 3u : 1u;
                     }
             }
         }
+        }
+        }
+        {
+        BT_ZONE_SCOPE("ORG.FreshCompile.AliasBoundaryAccesses");
         result->aliasFirstResourcesByBatch.resize(result->batches.size());
         result->aliasFinalResourcesByBatch.resize(result->batches.size());
-        std::vector<std::vector<uint8_t>> aliasSeen(
-            structure.resourceShapes.size(),
-            std::vector<uint8_t>(structure.queues.size()));
-        std::vector<std::vector<uint32_t>> aliasLast(
-            structure.resourceShapes.size(),
-            std::vector<uint32_t>(structure.queues.size(), UINT32_MAX));
+        const auto queueCount = structure.queues.size();
+        std::vector<uint32_t> aliasLast(structure.resourceShapes.size() * queueCount, UINT32_MAX);
         for (uint32_t batch = 0; batch < result->boundaryAccessesByBatch.size(); ++batch) {
             for (const auto& access : result->boundaryAccessesByBatch[batch]) {
                 const auto queue = result->batches[batch].queue;
-                if (!aliasSeen[access.resource][queue]) {
-                    aliasSeen[access.resource][queue] = 1;
+                auto& last = aliasLast[access.resource * queueCount + queue];
+                if (last == UINT32_MAX) {
                     result->aliasFirstResourcesByBatch[batch].push_back(access.resource);
                 }
-                aliasLast[access.resource][queue] = batch;
+                last = batch;
             }
         }
-        for (uint32_t resource = 0; resource < aliasLast.size(); ++resource)
-            for (const auto batch : aliasLast[resource])
+        for (uint32_t resource = 0; resource < structure.resourceShapes.size(); ++resource)
+            for (size_t queue = 0; queue < queueCount; ++queue) {
+                const auto batch = aliasLast[resource * queueCount + queue];
                 if (batch != UINT32_MAX)
                     result->aliasFinalResourcesByBatch[batch].push_back(resource);
+            }
+        }
+        {
+        BT_ZONE_SCOPE("ORG.FreshCompile.BarrierCapacities");
         std::vector<uint8_t> seeded(structure.resourceIDs.size());
         for (const auto& step : result->states.steps) {
             const auto cells = step.range.mips * step.range.slices;
@@ -850,6 +947,7 @@ std::shared_ptr<const CompiledGraph> CompileWorkspace::Compile(
                 ++result->stateSeedCapacityByBatch.at(step.batch);
             }
         }
+        }
     }
     // The renderer compiles a fresh graph every frame. Replaying the complete
     // schedule and subresource state machine here made validation more costly
@@ -865,7 +963,9 @@ std::shared_ptr<const CompiledGraph> CompileGraph(
     std::shared_ptr<const GraphCompileInput> input,
     CompileWorkspace& workspace,
     const std::atomic_bool& cancelled) {
-    return workspace.Compile(std::move(input), cancelled);
+    auto graph = workspace.Compile(std::move(input), cancelled);
+    if (graph) ObserveGraphReplay(graph->structure);
+    return graph;
 }
 
 struct GraphCompileCoordinator::Job {

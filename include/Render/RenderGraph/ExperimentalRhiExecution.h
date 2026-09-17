@@ -3,6 +3,7 @@
 #include "Render/RenderGraph/ExperimentalGraphCompiler.h"
 #include "Render/RenderGraph/ExperimentalExecutionState.h"
 #include "Render/PreparedPass.h"
+#include "Render/RenderGraph/PersistentGraph.h"
 #include "Render/CommandListPool.h"
 #include "Render/Runtime/IStatisticsService.h"
 #include <chrono>
@@ -34,6 +35,20 @@ struct RealizedResourceBundle {
 // Immutable frame publication consumed by recording/admission. Fresh pass
 // packets are deliberately separate from the reusable compiled layout.
 struct RenderFrameSnapshot {
+    RenderFrameSnapshot() = default;
+    RenderFrameSnapshot(const RenderFrameSnapshot&) = delete;
+    RenderFrameSnapshot& operator=(const RenderFrameSnapshot&) = delete;
+    ~RenderFrameSnapshot() {
+        // Recording workers and submitted batches retain this packet. Its
+        // final owner disappears only after their CPU/GPU terminal conditions.
+        // Submitted/completed effects are guarded by PreparedPass itself.
+        if (publication) for (const auto& pass : passes) {
+            try { pass.Abandon(AbandonReason::AdmissionFailed); }
+            catch (...) { basic_telemetry::AddCounter("ORG.Persistent.AbandonLifecycleFailures"); }
+        }
+    }
+    std::shared_ptr<const persistent::SelectedPublication> publication;
+    std::vector<std::vector<ExecutionTimelinePoint>> incomingWaits;
     uint64_t frameNumber = 0;
     uint32_t preparationSlot = 0;
     std::shared_ptr<const GraphExecutionLayout> layout;
@@ -45,6 +60,106 @@ struct RenderFrameSnapshot {
     std::vector<std::shared_ptr<const void>> leases;
     std::shared_ptr<const RealizedResourceBundle> resources;
     std::shared_ptr<const IHostExecutionData> frameData;
+};
+
+// Async sealing is an explicit ownership operation. Synchronous preparation
+// need not allocate this packet or construct a compile request/candidate.
+inline std::shared_ptr<const RenderFrameSnapshot> SealPersistentFrame(
+    uint64_t frameNumber, const persistent::FrameAdmission& admission,
+    std::vector<PreparedPass> invocations) {
+    const auto selected = admission.publication;
+    if (!frameNumber || !admission.sequence || !admission.domain || !selected || !selected->executable
+        || !selected->executable->executionLayout)
+        throw std::invalid_argument("Incomplete persistent frame seal");
+    const auto layout = selected->executable->executionLayout;
+    if (invocations.size() != layout->placements.size()
+        || admission.barriers.batches.size() != selected->executable->graph->batches.size()
+        || admission.incomingWaits.size() != admission.barriers.batches.size())
+        throw std::invalid_argument("Persistent frame seal dimensions mismatch");
+    const auto& slots = selected->executable->resourceSlots;
+    if (admission.backings.size() != slots.size())
+        throw std::invalid_argument("Persistent frame seal backing count mismatch");
+    for (size_t i = 0; i < slots.size(); ++i) {
+        const auto& expected = selected->bindings.At(slots[i]).admission;
+        const auto& actual = admission.backings[i];
+        if (!expected || actual.resource.index != expected->resource.index
+            || actual.resource.generation != expected->resource.generation
+            || actual.graphResourceID != expected->graphResourceID || actual.shape != expected->shape
+            || !actual.regions || actual.aliasHeapIdentity != expected->aliasHeapIdentity
+            || actual.aliasOffset != expected->aliasOffset || actual.aliasSize != expected->aliasSize
+            || actual.aliasPoolID != expected->aliasPoolID || actual.heapType != expected->heapType
+            || actual.aliasHeap.get() != expected->aliasHeap.get()
+            || actual.aliasHeap.owner_before(expected->aliasHeap) || expected->aliasHeap.owner_before(actual.aliasHeap))
+            throw std::invalid_argument("Persistent frame seal lost selected backing metadata");
+    }
+    for (size_t i = 0; i < invocations.size(); ++i) {
+        const bool active = layout->placements[i].preparedPass != UINT32_MAX;
+        if (active != bool(invocations[i]) || (active && (invocations[i].IsConsumed() || !invocations[i].IsWorkerSafe())))
+            throw std::invalid_argument("Persistent frame seal requires fresh active invocations");
+    }
+    auto result = std::make_shared<RenderFrameSnapshot>();
+    result->frameNumber = frameNumber;
+    result->incomingWaits = admission.incomingWaits;
+    result->layout = layout;
+    result->passes = std::move(invocations);
+    result->initialStates = std::make_shared<const std::vector<PreparedBackingState>>(admission.backings);
+    result->barrierPlan = std::make_shared<const PreparedExecutionBarrierPlan>(admission.barriers);
+    // Arm lifecycle ownership only after every fallible allocation succeeds.
+    // A pending packet still owns these handles if sealing fails partway through.
+    result->publication = selected;
+    return result;
+}
+
+// Owned asynchronous preparation before ordered admission. CPU tasks retain the
+// packet until they join; final release abandons untransferred invocation effects.
+// Seal is called only by the ordered owner, after preparation consumers join.
+// The synchronous path continues to borrow tables directly and needs no packet.
+class PendingPersistentFrame {
+public:
+    PendingPersistentFrame(uint64_t frameNumber,
+        std::shared_ptr<const persistent::SelectedPublication> selected,
+        std::vector<PreparedPass> invocations)
+        : m_frameNumber(frameNumber), m_publication(std::move(selected)), m_passes(std::move(invocations)) {
+        try {
+            if (!m_frameNumber || !m_publication || !m_publication->executable
+                || !m_publication->executable->executionLayout)
+                throw std::invalid_argument("Incomplete pending persistent frame");
+            const auto& placements = m_publication->executable->executionLayout->placements;
+            if (placements.size() != m_passes.size())
+                throw std::invalid_argument("Pending persistent invocation dimensions mismatch");
+            for (size_t i = 0; i < placements.size(); ++i) {
+                const bool active = placements[i].preparedPass != UINT32_MAX;
+                if (active != bool(m_passes[i]) || (active && (m_passes[i].IsConsumed() || !m_passes[i].IsWorkerSafe())))
+                    throw std::invalid_argument("Pending persistent frame requires fresh invocations");
+            }
+        } catch (...) { Abandon(); throw; }
+    }
+    PendingPersistentFrame(const PendingPersistentFrame&) = delete;
+    PendingPersistentFrame& operator=(const PendingPersistentFrame&) = delete;
+    ~PendingPersistentFrame() { Abandon(); }
+    const std::shared_ptr<const persistent::SelectedPublication>& Publication() const noexcept { return m_publication; }
+    std::shared_ptr<const RenderFrameSnapshot> Seal(const persistent::FrameAdmission& admission) {
+        if (m_transferred) throw std::logic_error("Pending persistent frame already transferred");
+        if (admission.publication != m_publication)
+            throw std::invalid_argument("Pending persistent frame admission changed publication");
+        // Copy the small handles so failed validation retains the pending effects.
+        auto result = SealPersistentFrame(m_frameNumber,admission,m_passes);
+        m_transferred = true;
+        m_passes.clear();
+        return result;
+    }
+private:
+    void Abandon() noexcept {
+        if (m_transferred) return;
+        for (const auto& pass : m_passes) {
+            try { pass.Abandon(AbandonReason::AdmissionFailed); }
+            catch (...) { basic_telemetry::AddCounter("ORG.Persistent.AbandonLifecycleFailures"); }
+        }
+    }
+    uint64_t m_frameNumber;
+    const std::shared_ptr<const persistent::SelectedPublication> m_publication;
+    std::vector<PreparedPass> m_passes;
+    bool m_transferred = false;
 };
 
 struct PreparedFramePayload final : IFramePayloadLifecycle {
@@ -415,7 +530,13 @@ struct OwnedRecordingList {
     OwnedRecordingList(const OwnedRecordingList&) = delete;
     OwnedRecordingList& operator=(const OwnedRecordingList&) = delete;
     std::shared_ptr<const FrozenExecutionBindings> bindings;
+    // Exact selected version, rooted through CPU recording and GPU retirement.
+    // Persistent-only packets need no legacy frozen leaf table.
+    std::shared_ptr<const persistent::SelectedPublication> publication;
     std::shared_ptr<const std::vector<ExternalDescriptorBindingValue>> externalBindings;
+    // Keep invocation lifecycle ownership until CPU recording and batch
+    // retirement finish, even if the caller drops its sealed frame handle.
+    std::shared_ptr<const RenderFrameSnapshot> frame;
     // Admission-captured defaults for passes using directly-indexed root
     // signatures. Individual passes may rebind a compatible snapshot.
     rhi::DescriptorHeapHandle resourceDescriptorHeap{};
@@ -428,6 +549,31 @@ struct OwnedRecordingList {
     std::shared_ptr<OwnedRecordingStatistics> statistics;
     std::shared_ptr<FrameCommandAllocation> allocation = std::make_shared<FrameCommandAllocation>();
 };
+
+inline OwnedRecordingList BuildPersistentRecordingList(std::shared_ptr<const RenderFrameSnapshot> sealed, uint32_t batch) {
+    if (!sealed) throw std::invalid_argument("Missing persistent frame seal");
+    const auto& frame = *sealed;
+    if (!frame.publication || !frame.barrierPlan
+        || frame.layout != frame.publication->executable->executionLayout)
+        throw std::invalid_argument("Recording list requires an exact persistent frame seal");
+    const auto& graph = *frame.publication->executable->graph;
+    const auto& compiled = graph.batches.at(batch);
+    const auto& barriers = frame.barrierPlan->batches.at(batch);
+    OwnedRecordingList result;
+    result.frame = std::move(sealed);
+    result.publication = frame.publication;
+    result.textureBarriers = barriers.textures;
+    result.bufferBarriers = barriers.buffers;
+    result.barriersBeforePass = barriers.beforePass;
+    result.barriersAfterPass = barriers.afterPass;
+    for (auto pass : compiled.passes) {
+        const auto& invocation = frame.passes.at(graph.structure->passes.at(pass).preparedPassIndex);
+        if (!invocation || invocation.IsConsumed() || !invocation.IsWorkerSafe())
+            throw std::invalid_argument("Persistent recording list requires fresh worker-safe invocations");
+        result.passes.push_back(invocation);
+    }
+    return result;
+}
 
 // Called only after admission freezes bindings and barriers. It may run on a
 // recording worker; no declaration/Setup callbacks or live registries are used.
@@ -444,7 +590,7 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
     // Validate all packets before consuming any pass. Empty legacy preparation
     // must be selected into a synchronous route by the preparation owner.
     for (const auto& recording : recordings) {
-        if (!recording.bindings || !recording.allocation || !recording.allocation->pair.allocator
+        if ((!recording.bindings && !recording.publication) || !recording.allocation || !recording.allocation->pair.allocator
             || !recording.allocation->pair.list || recording.passes.empty())
             throw std::invalid_argument("Incomplete owned recording packet");
         if (!recording.allocation->pair.list.Get().SupportsCheckedEnd())
@@ -459,7 +605,7 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
             || recording.statistics->passIndices.size() != recording.passes.size()))
             throw std::invalid_argument("Prepared pass/statistics count mismatch");
         for (const auto& pass : recording.passes)
-            if (!pass) throw std::invalid_argument("Legacy pass in owned recording batch");
+            if (!pass || pass.IsConsumed()) throw std::invalid_argument("Missing or consumed pass in owned recording batch");
     }
     auto ownership = std::make_shared<Ownership>(Ownership{std::move(runtimeOwner), std::move(recordings)});
     std::vector<rhi::CommandList> lists;
@@ -479,7 +625,11 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
             allocations.clear();
         });
     for (const auto& recording : ownership->recordings) {
-        RecordingContext context(recording.allocation->pair.list.Get(), recording.bindings, recording.externalBindings);
+        auto context = recording.bindings
+            ? RecordingContext(recording.allocation->pair.list.Get(), recording.bindings, recording.externalBindings)
+            : RecordingContext::FromPersistentBindings(recording.allocation->pair.list.Get(),recording.publication);
+        if (recording.bindings && recording.publication)
+            context = context.WithPersistentBindings(recording.publication);
         struct TracyGpuZoneScope {
             rhi::CommandList& commands;
             bool open = false;

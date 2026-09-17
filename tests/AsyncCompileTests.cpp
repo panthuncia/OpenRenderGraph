@@ -1,6 +1,7 @@
 #include "Render/RenderGraph/ExperimentalGraphCompiler.h"
 #include "Render/RenderGraph/ExperimentalExecutionState.h"
 #include "Render/RenderGraph/RenderGraphCompileProfile.h"
+#include <BasicTelemetry/Telemetry.h>
 #include <algorithm>
 #include <barrier>
 #include <cstdio>
@@ -91,7 +92,43 @@ DependencyEdges Oracle(const GraphCompileStructure& s) {
 }
 
 void RunFramePlanningTests();
+void DiagnosticPassAttribution() {
+    auto input = Input();
+    input.structure.resourceIDs = {20, 10};
+    input.structure.resourceShapes = {{1, 1, false}, {2, 1, true}};
+    input.structure.diagnosticResourceNames = {"frameBuffer", "unusedTexture"};
+    input.structure.diagnosticPassNames = {"reader", "writer", "consumer"};
+    for (auto& pass : input.structure.passes)
+        pass.entryStates.push_back({0, {0, 1, 0, 1}, {0, 0, 0, pass.accesses.front().write}});
+    NormalizeCompileInput(input);
+    CHECK(input.structure.diagnosticResourceNames == std::vector<std::string>{"unusedTexture", "frameBuffer"});
+    std::atomic_bool cancelled{false};
+    CompileWorkspace workspace;
+    basic_telemetry::Session session({ .mode = basic_telemetry::CaptureMode::Trace,
+        .traceRootScopes = {"ORG.FreshCompile.DependencyCompile"} });
+    const auto graph = workspace.Compile(std::make_shared<const GraphCompileInput>(input), cancelled);
+    CHECK(graph && graph->states.complete);
+    const auto snapshot = session.Snapshot();
+    for (const auto stage : {"ORG.FreshCompile.Dependencies.Pass", "ORG.FreshCompile.Schedule.Pass",
+        "ORG.FreshCompile.States.Pass", "ORG.FreshCompile.Boundary.Pass",
+        "ORG.FreshCompile.IncomingBoundary.Pass"}) {
+        const auto definition = std::ranges::find_if(snapshot.scopeDefinitions,
+            [&](const auto& d) { return d.name == stage; });
+        CHECK(definition != snapshot.scopeDefinitions.end());
+        for (const auto& label : input.structure.diagnosticPassNames)
+            CHECK(std::ranges::count_if(snapshot.events, [&](const auto& e) {
+                return e.scopeId == definition->id && e.text == label;
+            }) == 1);
+    }
+    input.structure.diagnosticPassNames.clear();
+    input.structure.diagnosticResourceNames.clear();
+    const auto reference = workspace.Compile(std::make_shared<const GraphCompileInput>(input), cancelled);
+    CHECK(reference && reference->edges == graph->edges && reference->batches == graph->batches);
+    CHECK(reference->states.steps == graph->states.steps);
+}
+
 int main() {
+    DiagnosticPassAttribution();
     RunFramePlanningTests();
     // Export after all step objects and their dynamically supplied names have
     // died. Telemetry retains callsites, so stack-local definitions are unsafe.

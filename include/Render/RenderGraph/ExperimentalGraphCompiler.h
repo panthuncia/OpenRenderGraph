@@ -86,6 +86,10 @@ struct GraphCompileStructure {
     // The string is retained for full collision-safe equality.
     std::vector<std::string> resourceKeys;
     std::vector<CompilePass> passes;
+    // Optional immutable trace labels, indexed exactly like passes. Workers
+    // never ask a live pass for its name. Empty during normal compilation.
+    std::vector<std::string> diagnosticPassNames;
+    std::vector<std::string> diagnosticResourceNames;
     std::vector<std::pair<uint32_t, uint32_t>> explicitEdges;
     // Additional constraints from owned alias-placement preparation. These do
     // not substitute for independently deriving the resource dependency DAG.
@@ -225,7 +229,8 @@ std::string ValidateSymbolicStates(const GraphCompileInput&, const CompiledGraph
 class CompileWorkspace {
 public:
     std::shared_ptr<const DependencyEdges> AnalyzeDependencies(
-        const GraphCompileStructure&, const std::atomic_bool& cancelled);
+        const GraphCompileStructure&, const std::atomic_bool& cancelled,
+        std::span<const uint32_t> accessOrder = {});
     std::shared_ptr<const CompiledGraph> Compile(
         std::shared_ptr<const GraphCompileInput> input, const std::atomic_bool& cancelled);
 private:

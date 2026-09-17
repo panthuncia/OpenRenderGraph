@@ -1,5 +1,6 @@
 #include "Render/RenderGraph/RenderGraph.h"
 #include "FrameTrace.h"
+#include "Render/RenderGraph/CompileTelemetry.h"
 #include "RenderGraphCompilerState.h"
 #include "Render/RenderGraph/ExperimentalRhiExecution.h"
 #include "Render/Runtime/ScopedActiveGraphServices.h"
@@ -27,6 +28,13 @@
 namespace org {
 
 namespace {
+    bool CompileResourceDetailTracingEnabled() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("ORG_COMPILE_TRACE_RESOURCES");
+            return value && value[0] == '1';
+        }();
+        return CompileDetailTracingEnabled() && enabled;
+    }
     bool CompileDiagnosticsEnabled() {
         static const bool enabled = [] {
             const char* value = std::getenv("ORG_COMPILE_DIAGNOSTICS");
@@ -896,6 +904,8 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 			BT_ZONE_SCOPE("RGPassAccess::BuildDenseSummaries");
 			for (size_t passIndex = 0; passIndex < m_framePasses.size(); ++passIndex) {
 				const auto& pass = m_framePasses[passIndex];
+				static const basic_telemetry::Callsite callsite("ORG.FreshCompile.AccessSummary.Pass");
+				CompileDetailScope trace(callsite, pass.name, passIndex);
 				auto& summary = m_framePassAccessSummaries[passIndex];
 				uint64_t accessKey = 0;
 				if (passIndex >= m_framePassIsFrameExtension.size()
@@ -1340,6 +1350,7 @@ void RenderGraph::RebuildFramePassAccessSummaries() {
 		BT_ZONE_VALUE(passIndex);
 
 		const auto& pass = m_framePasses[passIndex];
+		BT_ZONE_TEXT(pass.name.data(), pass.name.size());
 		auto& summary = workItem.summary;
 		summary = FramePassStaticAccessSummary{};
 		summary.type = pass.type;
@@ -1847,6 +1858,10 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
         const auto concreteID = m_frameDAGResourceIDsByIndex[original];
         capturedIndices.emplace(concreteID, r);
         auto* resource = original < m_frameDAGResourcePtrByIndex.size() ? m_frameDAGResourcePtrByIndex[original] : nullptr;
+        const std::string_view resourceName = resource ? resource->GetName() : std::string_view{};
+        static const basic_telemetry::Callsite resourceCallsite("ORG.FreshCompile.Realization.Resource");
+        CompileDetailScope resourceTrace(resourceCallsite, resourceName, r, CompileResourceDetailTracingEnabled());
+        if (CompileResourceDetailTracingEnabled()) input.structure.diagnosticResourceNames.emplace_back(resourceName);
         auto* dynamicResource = dynamic_cast<DynamicResource*>(resource);
         auto* concreteResource = UnwrapDynamicResource(resource);
         auto* indexedResource = dynamic_cast<GloballyIndexedResource*>(concreteResource);
@@ -1899,7 +1914,7 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
             capturedAliasPoolID = binding.aliasPoolID;
             capturedAliasOffset = binding.aliasOffset;
             capturedAliasSize = binding.aliasSize;
-            frozenResources.push_back({binding.resource, {}, binding.views});
+            frozenResources.push_back({binding.resource, {}, binding.views, {}, &binding});
             if (published && selectedBinding == *published) ++publicationBindingSelections;
             else ++graphLocalBindingSelections;
         } else if (backedResource) {
@@ -2107,6 +2122,11 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
     BT_ZONE_SCOPE("ORG.FreshCompile.IR.PassConstruction");
     for (size_t index = 0; index < nodes.size(); ++index) {
         const auto& node = nodes[index];
+        if (node.passIndex >= m_framePasses.size()) throw std::runtime_error("Invalid frame pass during IR capture");
+        const auto& passName = m_framePasses[node.passIndex].name;
+        static const basic_telemetry::Callsite callsite("ORG.FreshCompile.IR.Pass");
+        CompileDetailScope trace(callsite, passName, node.passIndex);
+        if (CompileDetailTracingEnabled()) input.structure.diagnosticPassNames.push_back(passName);
         experimental::CompilePass pass;
         pass.originalOrder = node.originalOrder;
         if (node.passIndex >= UINT32_MAX) throw std::runtime_error("Prepared pass index exceeds capture capacity");
@@ -2150,21 +2170,37 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
                     }
                 }
             };
+            {
+            static const basic_telemetry::Callsite accessCallsite("ORG.FreshCompile.IR.HazardAccesses");
+            CompileDetailScope accessTrace(accessCallsite, passName, summary.dagAccesses.size());
             for (const auto& access : summary.dagAccesses) {
                 if (access.resourceIndex >= originalToCaptured.size()
                     || originalToCaptured[access.resourceIndex] == UINT32_MAX)
                     throw std::runtime_error("Invalid resource index during owned dependency capture");
                 pass.accesses.push_back({originalToCaptured[access.resourceIndex], access.kind != AccessKind::Read});
             }
+            }
             // Preparation permissions cover every declared requirement, not
             // merely accesses participating in dependency edges. Read-only
             // external inputs (including indirect argument buffers) may have
             // no in-frame writer and are deliberately absent from dagAccesses.
+            {
+            static const basic_telemetry::Callsite slotsCallsite("ORG.FreshCompile.IR.BindingSlots");
+            CompileDetailScope slotsTrace(slotsCallsite, passName,
+                summary.requirementSummaries.size() + summary.internalTransitionSummaries.size());
             for (const auto& requirement : summary.requirementSummaries)
                 exposePreparationSlot(requirement.dagResourceIndex);
             for (const auto& transition : summary.internalTransitionSummaries)
                 exposePreparationSlot(transition.dagResourceIndex);
+            std::sort(resourceSlots->begin(), resourceSlots->end());
+            resourceSlots->erase(std::unique(resourceSlots->begin(), resourceSlots->end()), resourceSlots->end());
+            resourceSlots->sorted = true;
             preparedResourceSlots[node.passIndex] = std::move(resourceSlots);
+            }
+            {
+            static const basic_telemetry::Callsite statesCallsite("ORG.FreshCompile.IR.StateCapture");
+            CompileDetailScope statesTrace(statesCallsite, passName,
+                summary.requirementSummaries.size() + summary.internalTransitionSummaries.size());
             for (const auto& requirement : summary.requirementSummaries)
                 pass.entryStates.push_back(captureState(originalToCaptured.at(requirement.dagResourceIndex), requirement.range, requirement.state));
             const auto view = GetPassView(m_framePasses[node.passIndex]);
@@ -2182,6 +2218,7 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
                 const auto found = capturedIndices.find(resource.resource.GetGlobalResourceID());
                 if (found == capturedIndices.end()) throw std::runtime_error("Internal state missing captured resource");
                 pass.exitStates.push_back(captureState(found->second, resource.range, state));
+            }
             }
         }
         input.structure.passes.push_back(std::move(pass));
@@ -2410,6 +2447,98 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
     if (asynchronous) {
         request = coordinator->RequestOwned(std::move(input), inlineBootstrap);
     } else {
+        static const bool probeEnabled = [] {
+            const auto* value = std::getenv("ORG_PERSISTENT_PROBE");
+            return value && value[0] == '1';
+        }();
+        if (probeEnabled) {
+            auto& probe = m_compilerState->structureProbe;
+            if (!probe) probe = std::make_unique<CompilerState::StructureProbe>();
+            std::vector<std::string> names;
+            names.reserve(input.structure.passes.size());
+            for (const auto& pass : input.structure.passes)
+                names.push_back(pass.preparedPassIndex < m_framePasses.size()
+                    ? m_framePasses[pass.preparedPassIndex].name : std::string("<invalid>"));
+            ++probe->frames;
+            // Rename compiler resources by first appearance so that insertion of
+            // an unrelated resource does not renumber every later declaration.
+            auto canonicalize = [](const experimental::GraphCompileStructure& source) {
+                auto result = source;
+                std::vector<uint32_t> renamed(source.resourceIDs.size(), UINT32_MAX);
+                std::vector<experimental::CompileResourceShape> shapes;
+                uint32_t next = 0;
+                auto rename = [&](uint32_t& index) {
+                    if (index >= renamed.size()) return;
+                    if (renamed[index] == UINT32_MAX) {
+                        renamed[index] = next++;
+                        if (index < source.resourceShapes.size()) shapes.push_back(source.resourceShapes[index]);
+                    }
+                    index = renamed[index];
+                };
+                for (auto& pass : result.passes) {
+                    for (auto& use : pass.entryStates) rename(use.resource);
+                    for (auto& use : pass.exitStates) rename(use.resource);
+                    for (auto& access : pass.accesses) rename(access.resourceIndex);
+                    std::sort(pass.accesses.begin(), pass.accesses.end(), [](const auto& l, const auto& r) {
+                        return l.resourceIndex != r.resourceIndex ? l.resourceIndex < r.resourceIndex : l.write < r.write; });
+                }
+                result.resourceShapes = std::move(shapes);
+                result.resourceIDs.clear();
+                result.diagnosticPassNames.clear();
+                result.diagnosticResourceNames.clear();
+                return result;
+            };
+            auto canonical = canonicalize(input.structure);
+            std::vector<std::string> reasons;
+            if (!probe->previous) reasons.push_back("bootstrap");
+            else {
+                const auto& a = *probe->previous;
+                const auto& b = canonical;
+                if (a.generation != b.generation) reasons.push_back("generation");
+                if (a.queues != b.queues) reasons.push_back("queues");
+                if (probe->previousNames != names) reasons.push_back("passList");
+                else {
+                    if (a.resourceShapes != b.resourceShapes) reasons.push_back(a.resourceShapes.size() != b.resourceShapes.size()
+                        ? "canonicalResourceCount" : "canonicalResourceShapes");
+                    if (a.explicitEdges != b.explicitEdges) reasons.push_back("explicitEdges");
+                    if (a.placementEdges != b.placementEdges) reasons.push_back("placementEdges");
+                    bool firstIndexChange = true;
+                    for (size_t i = 0; i < b.passes.size(); ++i) {
+                        const auto& x = a.passes[i]; const auto& y = b.passes[i];
+                        auto add = [&](const char* field) { reasons.push_back(names[i] + "." + field); };
+                        // Shape changes ignore resource identity entirely.
+                        const bool entryShape = x.entryStates.size() != y.entryStates.size()
+                            || !std::equal(x.entryStates.begin(), x.entryStates.end(), y.entryStates.begin(),
+                                [](const auto& l, const auto& r) { return l.range == r.range && l.state == r.state; });
+                        if (entryShape) add("entryShape");
+                        if (x.exitStates.size() != y.exitStates.size()) add("exitShape");
+                        if (x.accesses.size() != y.accesses.size()) add("accessCount");
+                        if (!entryShape && x.accesses.size() == y.accesses.size()
+                            && (x.entryStates != y.entryStates || x.accesses != y.accesses || x.exitStates != y.exitStates)
+                            && std::exchange(firstIndexChange, false)) add("firstCanonicalIdentityChange");
+                        if (x.forceBatchIsolation != y.forceBatchIsolation) add("isolation");
+                        if (x.compatibleQueueSlots != y.compatibleQueueSlots || x.preferredQueueSlot != y.preferredQueueSlot) add("queue");
+                        if (x.preparedPassIndex != y.preparedPassIndex || x.originalOrder != y.originalOrder) add("order");
+                        if (x.backend != y.backend) add("backend");
+                    }
+                    if (reasons.empty() && a.passes != b.passes) reasons.push_back("canonicalIdentityOnly");
+                }
+            }
+            if (reasons.empty()) ++probe->unchanged;
+            for (const auto& reason : reasons) ++probe->reasons[reason];
+            probe->previous = std::move(canonical);
+            probe->previousNames = std::move(names);
+            if (probe->frames % 500 == 0) {
+                std::vector<std::pair<uint64_t, std::string>> sorted;
+                for (const auto& [reason, count] : probe->reasons) sorted.emplace_back(count, reason);
+                std::sort(sorted.rbegin(), sorted.rend());
+                std::string text;
+                for (size_t i = 0; i < (std::min)(sorted.size(), size_t{40}); ++i)
+                    text += fmt::format("\n  {:6} {}", sorted[i].first, sorted[i].second);
+                spdlog::info("ORG persistent probe: frames={} unchangedStructure={} passes={} resources={} reasons:{}",
+                    probe->frames, probe->unchanged, input.structure.passes.size(), input.structure.resourceIDs.size(), text);
+            }
+        }
         BT_ZONE_SCOPE("ORG.SyncCompile.DirectCompile");
         auto ownedInput = std::make_shared<const experimental::GraphCompileInput>(std::move(input));
         std::atomic_bool cancelled{false};
@@ -4023,6 +4152,8 @@ void RenderGraph::PrepareAndCompileFrame(rhi::Device device, uint8_t frameIndex,
         const auto primary = m_backendDevices.empty() ? rhi::Backend::Null : m_backendDevices.front().backend;
         for (const auto& node : nodes) {
             experimental::CompilePass pass;
+            if (CompileDetailTracingEnabled())
+                structure.diagnosticPassNames.push_back(m_framePasses[node.passIndex].name);
             if (node.passIndex < m_framePassAccessSummaries.size()) {
                 const auto& summary = m_framePassAccessSummaries[node.passIndex];
                 pass.backend = static_cast<uint32_t>(summary.backendAffinity.strength == BackendAffinityStrength::Primary

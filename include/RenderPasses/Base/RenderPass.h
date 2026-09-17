@@ -136,7 +136,11 @@ protected:
 	}
 
 	template<class CommandSink>
-	void BindResourceDescriptorIndices(CommandSink& commandList, const PipelineResources& resources) {
+	void BindResourceDescriptorIndices(CommandSink& commandList, const PipelineResources& resources) const {
+		if constexpr (requires { commandList.BindDescriptorIndices(resources); }) {
+			commandList.BindDescriptorIndices(resources);
+			return;
+		}
 		unsigned int indices[org::shaderapi::kNumResourceDescriptorIndicesRootConstants] = {};
 		int i = 0;
 		for (auto& binding : resources.mandatoryResourceDescriptorSlots)
@@ -147,14 +151,18 @@ protected:
 			org::shaderapi::kResourceDescriptorIndicesRootParameter, 0, i, indices);
 	}
 
-	std::vector<unsigned int> CaptureResourceDescriptorIndices(const PipelineResources& resources) const {
+	std::vector<unsigned int> CaptureResourceDescriptorIndices(const PipelineResources& resources,
+		PreparedDescriptorIndexCache* cache = nullptr) const {
+		auto resolve = [this](const ResourceIdentifier& binding, bool optional) {
+			return m_resourceDescriptorIndexHelper->GetResourceDescriptorIndex(binding, optional);
+		};
 		std::vector<unsigned int> indices;
 		indices.reserve(resources.mandatoryResourceDescriptorSlots.size()
 			+ resources.optionalResourceDescriptorSlots.size());
 		for (const auto& binding : resources.mandatoryResourceDescriptorSlots)
-			indices.push_back(m_resourceDescriptorIndexHelper->GetResourceDescriptorIndex(binding, false));
+			indices.push_back(cache ? cache->Resolve(binding, false, resolve) : resolve(binding, false));
 		for (const auto& binding : resources.optionalResourceDescriptorSlots)
-			indices.push_back(m_resourceDescriptorIndexHelper->GetResourceDescriptorIndex(binding, true));
+			indices.push_back(cache ? cache->Resolve(binding, true, resolve) : resolve(binding, true));
 		return indices;
 	}
 

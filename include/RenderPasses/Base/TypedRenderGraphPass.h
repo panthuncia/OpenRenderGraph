@@ -7,6 +7,7 @@
 #include <utility>
 #include <optional>
 #include <algorithm>
+#include <string_view>
 #include <BasicTelemetry/Telemetry.h>
 #include <BasicTelemetry/Tracy.h>
 
@@ -48,8 +49,9 @@ public:
             context.borrowedDependencies);
         auto typedContext = context;
         typedContext.dependencyCollector = collector;
-        typedContext.captureDescriptorIndices = [this](const PipelineResources& resources) {
-            return this->CaptureResourceDescriptorIndices(resources);
+        PreparedDescriptorIndexCache descriptorIndices;
+        typedContext.captureDescriptorIndices = [this, &descriptorIndices](const PipelineResources& resources) {
+            return this->CaptureResourceDescriptorIndices(resources, &descriptorIndices);
         };
         if constexpr (!std::same_as<Bindings, LegacyPassBindings>) {
             static_assert(std::copy_constructible<Bindings>, "Declared bindings must be values");
@@ -120,6 +122,12 @@ private:
         std::vector<uint64_t> revision;
     };
     std::shared_ptr<const RecordingRecipe> m_recipe;
+    // Selection scratch belongs to the exclusive preparation owner. It never
+    // becomes recipe data and is rebuilt from the current frame enumeration.
+    std::vector<uint32_t> m_frameToRecipeSlots;
+    std::vector<uint32_t> m_frameToRecipeSlotEpochs;
+    uint32_t m_recipeSlotEpoch = 0;
+    std::vector<uint64_t> m_recipeRevisionScratch;
     struct RecipeInvocation {
         std::shared_ptr<const RecordingRecipe> recipe;
         FrameData data;
@@ -139,56 +147,89 @@ private:
             throw std::logic_error("Recipe pass has no resolved declarations");
         // Alias IDs, not compiler enumeration, define the recipe's slot layout.
         auto slots = std::make_shared<FramePreparationContext::ResourceSlots>(*context.resourceSlots);
-        std::sort(slots->begin(), slots->end());
-        slots->erase(std::unique(slots->begin(), slots->end()), slots->end());
-        std::unordered_map<uint32_t, uint32_t> localSlots;
+        if (!slots->sorted) {
+            std::sort(slots->begin(), slots->end());
+            slots->erase(std::unique(slots->begin(), slots->end()), slots->end());
+            slots->sorted = true;
+        }
         std::vector<uint32_t> map;
-        std::vector<uint64_t> revision = static_cast<const Derived*>(this)->RecipeRevision(context);
-        revision.insert(revision.begin(), revision.size());
-        revision.push_back(slots->size());
-        for (auto& [id, slot] : *slots) {
-            const auto [found, inserted] = localSlots.emplace(slot, static_cast<uint32_t>(map.size()));
-            if (inserted) {
-                map.push_back(slot);
-                const auto& binding = context.bindings->Resources().at(slot);
-                const auto handle = binding.resource.GetHandle();
-                revision.push_back((uint64_t{handle.generation} << 32) | handle.index);
-                revision.push_back(reinterpret_cast<uintptr_t>(binding.views.get()));
+        auto& revision = m_recipeRevisionScratch;
+        {
+            BT_ZONE_SCOPE("ORG.Execution.SelectRecipeBindings");
+            // Only declarations touched by this pass need initialization. Clearing
+            // the whole frame table here multiplied binding churn by pass count.
+            const auto resourceCount = context.bindings->Resources().size();
+            m_frameToRecipeSlots.resize(resourceCount);
+            m_frameToRecipeSlotEpochs.resize(resourceCount, 0);
+            if (++m_recipeSlotEpoch == 0) {
+                std::fill(m_frameToRecipeSlotEpochs.begin(), m_frameToRecipeSlotEpochs.end(), 0);
+                m_recipeSlotEpoch = 1;
             }
-            slot = found->second;
-            revision.push_back(id);
-            revision.push_back(slot);
+            map.reserve((std::min)(slots->size(), m_frameToRecipeSlots.size()));
+            const auto dependencyRevision = static_cast<const Derived*>(this)->RecipeRevision(context);
+            revision.assign(dependencyRevision.begin(), dependencyRevision.end());
+            revision.reserve(revision.size() + 2 + slots->size() * 4);
+            revision.insert(revision.begin(), revision.size());
+            revision.push_back(slots->size());
+            for (auto& [id, slot] : *slots) {
+                auto& localSlot = m_frameToRecipeSlots.at(slot);
+                auto& epoch = m_frameToRecipeSlotEpochs.at(slot);
+                if (epoch != m_recipeSlotEpoch) {
+                    epoch = m_recipeSlotEpoch;
+                    localSlot = static_cast<uint32_t>(map.size());
+                    map.push_back(slot);
+                    const auto& binding = context.bindings->Resources().at(slot);
+                    const auto handle = binding.resource.GetHandle();
+                    revision.push_back((uint64_t{handle.generation} << 32) | handle.index);
+                    revision.push_back(reinterpret_cast<uintptr_t>(binding.views.get()));
+                }
+                slot = localSlot;
+                revision.push_back(id);
+                revision.push_back(slot);
+            }
         }
         auto local = context;
         local.resourceSlots = slots;
         local.bindings = FrozenExecutionBindings::WithResourceMap(context.bindings, std::move(map));
-        local.captureDescriptorIndices = [this](const PipelineResources& resources) {
-            return this->CaptureResourceDescriptorIndices(resources);
+        PreparedDescriptorIndexCache descriptorIndices;
+        local.captureDescriptorIndices = [this, &descriptorIndices](const PipelineResources& resources) {
+            return this->CaptureResourceDescriptorIndices(resources, &descriptorIndices);
         };
         if (!m_recipe || m_recipe->revision != revision) {
             BT_ZONE_SCOPE("ORG.Execution.BuildRecordingRecipe");
+            const std::string_view reason = !m_recipe ? "bootstrap" :
+                m_recipe->revision.size() < revision.front() + 1
+                    || !std::equal(revision.begin(), revision.begin() + revision.front() + 1, m_recipe->revision.begin())
+                        ? "pass dependencies" : "resource bindings";
+            BT_ZONE_TEXT(reason.data(), reason.size());
             local.borrowedDependencies = false; // Recipes survive publication rotation in both policies.
             local.dependencyCollector = std::make_shared<PreparedDependencyCollector>();
             auto data = [&] {
+                BT_ZONE_SCOPE("ORG.Execution.BuildRecipeData");
                 if constexpr (std::same_as<Bindings, LegacyPassBindings>)
                     return static_cast<const Derived*>(this)->BuildRecipe(local);
                 else return static_cast<const Derived*>(this)->BuildRecipe(*m_declaredBindings, local);
             }();
             // Retain exact recording generations, including embedded view
             // indices, without retaining publication semantic-consumer pins.
-            for (const auto& [frameSlot, recipeSlot] : localSlots) {
-                auto owner = local.bindings->Owner({recipeSlot});
-                if (owner == context.bindings->PublicationRoot())
-                    throw std::logic_error("Recording recipe requires exact ownership, not a frame publication root; slot="
-                        + std::to_string(frameSlot));
-                local.dependencyCollector->Retain(std::move(owner));
-                local.dependencyCollector->Retain(context.bindings->Resources().at(frameSlot).views);
+            {
+                BT_ZONE_SCOPE("ORG.Execution.RetainRecipeBindings");
+                uint32_t recipeSlot = 0;
+                for (const auto frameSlot : local.bindings->FrameResourceMap()) {
+                    auto owner = local.bindings->Owner({recipeSlot});
+                    if (owner == context.bindings->PublicationRoot())
+                        throw std::logic_error("Recording recipe requires exact ownership, not a frame publication root; slot="
+                            + std::to_string(frameSlot));
+                    local.dependencyCollector->Retain(std::move(owner));
+                    local.dependencyCollector->Retain(context.bindings->Resources().at(frameSlot).views);
+                    ++recipeSlot;
+                }
             }
             auto dependencies = std::move(*local.dependencyCollector).Freeze();
             if (dependencies && dependencies->HasLifecycleEffects())
                 throw std::logic_error("Recording recipes cannot own frame lifecycle reservations");
             auto replacement = std::make_shared<const RecordingRecipe>(
-                RecordingRecipe{std::move(data), std::move(dependencies), std::move(revision)});
+                RecordingRecipe{std::move(data), std::move(dependencies), revision});
             auto retired = std::exchange(m_recipe, std::move(replacement));
             if (retired && context.retireOwnership) context.retireOwnership(std::move(retired));
             basic_telemetry::AddCounter("ORG.Execution.RecordingRecipeBuilds");

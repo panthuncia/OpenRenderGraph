@@ -4,6 +4,7 @@
 #include "Resources/AliasingPlacement.h"
 #include <rhi.h>
 #include <span>
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -33,6 +34,9 @@ struct PreparedBackingState {
     // D3D12 upload/readback buffers remain in fixed states and must not receive
     // enhanced buffer transition barriers.
     rhi::HeapType heapType = rhi::HeapType::DeviceLocal;
+    // Frame-only report from an external producer. Its complete incoming states
+    // supersede the last graph submission, transactionally at batch commit.
+    bool authoritativeIncoming = false;
 };
 
 struct PreparedBatchBarriers {
@@ -54,6 +58,7 @@ struct PreparedBatchBarriers {
     // same-queue memory dependency from a timeline-ordered queue handoff.
     std::vector<uint32_t> committedQueues;
     std::vector<PreparedBackingState> seeds;
+    std::vector<rhi::ResourceHandle> authoritativeSeeds;
 };
 
 struct PreparedExecutionBarrierPlan {
@@ -69,6 +74,7 @@ public:
         std::span<const rhi::ResourceHandle> invalidated = {}) const;
     void CommitBatch(const PreparedBatchBarriers&);
     void Invalidate(std::span<const rhi::ResourceHandle> resources);
+    size_t BackingCount() const noexcept { return m_states.size(); }
     void Reset() { m_states.clear(); }
 private:
     struct StateGrid {
@@ -94,6 +100,8 @@ public:
         const GraphExecutionTimeline& execution, uint32_t batchCount = UINT32_MAX);
     void Reset() { m_accesses.clear(); }
     void ResolvePlannedPoints(const std::unordered_map<uint64_t, ExecutionTimelinePoint>& points);
+    bool RetireCompleted(rhi::ResourceHandle resource, const std::map<uint64_t, uint64_t>& completed);
+    size_t BackingCount() const noexcept { return m_accesses.size(); }
 private:
     struct Cell {
         ExecutionTimelinePoint writer{};
@@ -121,8 +129,11 @@ public:
     void Commit(const CompiledGraph& graph,
         std::span<const PreparedBackingState> resources,
         const GraphExecutionTimeline& execution, uint32_t batchCount = UINT32_MAX);
-    void Reset() { m_intervals.clear(); }
+    void Reset() { m_intervals.clear(); m_heapOwners.clear(); }
     void ResolvePlannedPoints(const std::unordered_map<uint64_t, ExecutionTimelinePoint>& points);
+    bool RetireCompleted(const AliasHeapGeneration* heap, const std::weak_ptr<const AliasHeapGeneration>& owner,
+        const std::map<uint64_t, uint64_t>& completed);
+    size_t HeapCount() const noexcept { return m_intervals.size(); }
 private:
     struct SubmittedInterval {
         uint64_t begin = 0, end = 0;
@@ -130,6 +141,7 @@ private:
         std::vector<ExecutionTimelinePoint> accesses;
     };
     std::unordered_map<const AliasHeapGeneration*, std::vector<SubmittedInterval>> m_intervals;
+    std::unordered_map<const AliasHeapGeneration*, std::weak_ptr<const AliasHeapGeneration>> m_heapOwners;
 };
 
 } // namespace org::experimental

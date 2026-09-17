@@ -1,3 +1,4 @@
+#include "RenderPasses/Base/PersistentTypedPass.h"
 #include <Resources/ExternalBufferResource.h>
 #include <Resources/ExternalTextureResource.h>
 #include <Render/Runtime/RuntimeDevice.h>
@@ -6,6 +7,7 @@
 #include <Render/RenderGraph/ExperimentalRhiExecution.h>
 #include "../src/Render/RenderGraph/FrameRecording.h"
 #include <Render/RenderGraph/ExperimentalExecutionState.h>
+#include <Render/RenderGraph/PersistentGraph.h>
 #include <Render/BufferBarrierHelpers.h>
 #include <Render/DescriptorSnapshots.h>
 #include <Render/Runtime/FrameWorkQueue.h>
@@ -830,6 +832,50 @@ int TestDescriptorSnapshots(const rhi::DeviceCreateInfo& create) {
     return 0;
 }
 
+struct PersistentNativeClear {
+    struct Bindings { org::persistent::BindingToken resource; org::persistent::ViewToken shader, cpu; };
+    struct ProgramInterface { uint32_t multiplier; };
+    using Invocation = uint32_t;
+    org::persistent::ResourceSlotId resource;
+    unsigned declarationCalls = 0;
+    Bindings Declare(org::persistent::PassDeclaration& declaration) {
+        ++declarationCalls;
+        auto token = declaration.Resource(resource,
+            {static_cast<uint64_t>(rhi::ResourceAccessType::UnorderedAccessClear),0,
+             static_cast<uint64_t>(rhi::ResourceSyncState::ClearUnorderedAccessView),true});
+        return {token,declaration.View(token,{org::BindlessViewKind::UnorderedAccess}),
+            declaration.View(token,{org::BindlessViewKind::NonShaderVisibleUnorderedAccess})};
+    }
+    ProgramInterface BuildProgramInterface(const Bindings&, uint32_t multiplier) const { return {multiplier}; }
+    static Invocation PrepareInvocation(const ProgramInterface&, const Bindings&, uint32_t value) { return value; }
+    static void Record(const ProgramInterface& program, const Bindings& bindings, const Invocation& value,
+        org::RecordingContext& context) {
+        const auto shader = context.Resolve(bindings.shader);
+        const auto clear = value * program.multiplier;
+        context.Commands().SetDescriptorHeaps(shader.heap,{});
+        context.Commands().ClearUavUint({shader,context.Resolve(bindings.cpu),context.Resolve(bindings.resource)},
+            rhi::UavClearUint(std::array<uint32_t,4>{clear,clear,clear,clear}));
+    }
+};
+struct PersistentNativeCopy {
+    struct Bindings { org::persistent::BindingToken source, destination; };
+    struct ProgramInterface {};
+    using Invocation = uint8_t;
+    org::persistent::ResourceSlotId source, destination;
+    Bindings Declare(org::persistent::PassDeclaration& declaration) {
+        return {declaration.Resource(source,{static_cast<uint64_t>(rhi::ResourceAccessType::CopySource),0,
+                    static_cast<uint64_t>(rhi::ResourceSyncState::Copy),false}),
+                declaration.Resource(destination,{static_cast<uint64_t>(rhi::ResourceAccessType::CopyDest),0,
+                    static_cast<uint64_t>(rhi::ResourceSyncState::Copy),true})};
+    }
+    ProgramInterface BuildProgramInterface(const Bindings&, uint8_t) const { return {}; }
+    static Invocation PrepareInvocation(const ProgramInterface&, const Bindings&, uint8_t value) { return value; }
+    static void Record(const ProgramInterface&, const Bindings& bindings, const Invocation&, org::RecordingContext& context) {
+        context.Commands().CopyBufferRegion(context.Resolve(bindings.destination).GetHandle(),0,
+            context.Resolve(bindings.source).GetHandle(),0,4096);
+    }
+};
+
 int TestOwnedDescriptorGpuExecution(const rhi::DeviceCreateInfo& create) {
     using namespace org::experimental;
     struct Runtime {
@@ -885,13 +931,14 @@ int TestOwnedDescriptorGpuExecution(const rhi::DeviceCreateInfo& create) {
     auto graph = workspace.Compile(owned, cancelled);
     CHECK(graph && graph->stateValidationError.empty());
     CHECK(graph->batches.size() == 1 && graph->batches[0].passes == (std::vector<uint32_t>{0,1}));
-    auto bundle = std::make_shared<const CompiledGraphBundle>(CompiledGraphBundle{1,graph,owned});
     ExecutionTimelineAdmission admission({{1,0}},1);
+    org::persistent::SynchronousAdmission persistentAdmission(1);
     auto commandPool = std::make_shared<org::CommandListPool>(device, rhi::QueueKind::Graphics);
     for (uint32_t iteration = 1; iteration != 3; ++iteration) {
         struct Backing {
             std::shared_ptr<Runtime> runtime;
             std::shared_ptr<const org::AliasHeapGeneration> heapGeneration;
+            uint64_t aliasSize = 0;
             Microsoft::WRL::ComPtr<ID3D12Resource> native[2];
             rhi::ResourcePtr resource[2];
         };
@@ -901,6 +948,7 @@ int TestOwnedDescriptorGpuExecution(const rhi::DeviceCreateInfo& create) {
                 auto desc = rhi::helpers::ResourceDesc::Buffer(4096);
                 desc.resourceFlags |= rhi::ResourceFlags::RF_AllowUnorderedAccess;
                 rhi::ResourceAllocationInfo info{}; device.GetResourceAllocationInfo(&desc,1,&info);
+                backing->aliasSize = info.sizeInBytes;
                 rhi::ma::AllocationDesc allocationDesc{};
                 allocationDesc.heapType = rhi::HeapType::DeviceLocal;
                 allocationDesc.flags = rhi::ma::AllocationFlagCanAlias;
@@ -935,10 +983,9 @@ int TestOwnedDescriptorGpuExecution(const rhi::DeviceCreateInfo& create) {
         auto gpuContents = gpuJournal.CaptureContents(), cpuContents = cpuJournal.CaptureContents();
         auto gpu = gpuPool.Assemble(0,gpuContents), cpu = cpuPool.Assemble(0,cpuContents);
         CHECK(gpu && cpu);
-        auto bindings = std::make_shared<const org::FrozenExecutionBindings>(
-            std::vector<org::FrozenExecutionBindings::ResourceBinding>{
-                {backing->resource[0].Get(),backing}, {backing->resource[1].Get(),backing}},
-            std::vector<org::FrozenExecutionBindings::DescriptorBinding>{{gpu->Resolve(7),gpu},{cpu->Resolve(7),cpu}});
+        // Descriptor tables are publication-owned; no per-leaf frozen table
+        // participates in this persistent-only recording path.
+        std::shared_ptr<const void> descriptorOwner = std::make_shared<const decltype(std::make_pair(gpu,cpu))>(gpu,cpu);
         std::vector<PreparedBackingState> initial(2);
         for (uint32_t resource = 0; resource < 2; ++resource) {
             initial[resource].graphResourceID = resource + 1;
@@ -951,48 +998,113 @@ int TestOwnedDescriptorGpuExecution(const rhi::DeviceCreateInfo& create) {
         initial[1].regions = std::make_shared<const std::vector<PreparedStateRegion>>(
             std::initializer_list<PreparedStateRegion>{{{}, {static_cast<uint64_t>(rhi::ResourceAccessType::CopyDest),0,
             static_cast<uint64_t>(rhi::ResourceSyncState::Copy),true}}});
-        BackingStateAdmissionLedger stateLedger;
-        auto barrierPlan = stateLedger.Prepare(*graph, initial);
+        initial[0].aliasHeap = backing->heapGeneration;
+        initial[0].aliasHeapIdentity = backing->heapGeneration.get();
+        initial[0].aliasSize = backing->aliasSize;
+        initial[1].heapType = rhi::HeapType::Readback;
+        // Exercise stable logical tokens through the production prepared-pass
+        // executor, using real native resources and exact publication ownership.
+        std::shared_ptr<const org::persistent::SelectedPublication> selected;
+        std::optional<org::persistent::TypedPassExecutable<PersistentNativeClear>> clearExecutable;
+        std::optional<org::persistent::TypedPassExecutable<PersistentNativeCopy>> copyExecutable;
+        {
+            org::persistent::GraphProgram persistentProgram;
+            auto edit = persistentProgram.BeginEdit();
+            std::array<org::persistent::ResourceSlotId,2> slots;
+            std::shared_ptr<const org::ResourceBindingSnapshot> sourceSnapshot;
+            for (uint32_t resource = 0; resource != 2; ++resource) {
+                auto snapshot = std::make_shared<org::ResourceBindingSnapshot>();
+                snapshot->resourceID = resource + 100;
+                snapshot->backingGeneration = 1;
+                snapshot->resource = backing->resource[resource].Get();
+                snapshot->allocationOwner = backing;
+                snapshot->description = rhi::helpers::ResourceDesc::Buffer(4096,initial[resource].heapType,
+                    resource == 0 ? rhi::ResourceFlags::RF_AllowUnorderedAccess : rhi::ResourceFlags{});
+                if (resource == 0) {
+                    snapshot->descriptorOwner = descriptorOwner;
+                    auto views = std::make_shared<org::BindlessResourceViews>();
+                    views->description = snapshot->description;
+                    views->views.push_back({org::BindlessViewKind::UnorderedAccess,UINT32_MAX,0,0,gpu->Resolve(7)});
+                    views->views.push_back({org::BindlessViewKind::NonShaderVisibleUnorderedAccess,UINT32_MAX,0,0,cpu->Resolve(7)});
+                    snapshot->views = std::move(views);
+                }
+                snapshot->aliasHeap = initial[resource].aliasHeap;
+                snapshot->aliasPoolID = initial[resource].aliasPoolID;
+                snapshot->aliasOffset = initial[resource].aliasOffset;
+                snapshot->aliasSize = initial[resource].aliasSize;
+                if (resource == 0) sourceSnapshot = snapshot;
+                slots[resource] = edit.AddSnapshot(std::move(snapshot),initial[resource]);
+            }
+            // Copy records through a different logical slot for the same placed
+            // backing. Compilation must still synchronize clear before copy.
+            auto aliasInitial = initial[0]; aliasInitial.graphResourceID = 3;
+            const auto copySource = edit.AddSnapshot(sourceSnapshot,aliasInitial);
+            PersistentNativeClear clearAuthor{slots[0]};
+            PersistentNativeCopy copyAuthor{copySource,slots[1]};
+            clearExecutable.emplace(org::persistent::TypedPassExecutable<PersistentNativeClear>::Build(edit,{},clearAuthor,uint32_t{1}));
+            copyExecutable.emplace(org::persistent::TypedPassExecutable<PersistentNativeCopy>::Build(edit,{},copyAuthor,uint8_t{}));
+            selected = edit.Build(workspace,cancelled);
+            CHECK(persistentProgram.Install(selected));
+            CHECK(selected->bindings.Size() == 3 && selected->executable->resourceSlots.size() == 2);
+            auto programEdit = persistentProgram.BeginEdit();
+            auto changedExecutable = clearExecutable->RebuildProgramInterface(programEdit,clearAuthor,iteration);
+            auto changed = programEdit.Build(workspace,cancelled);
+            CHECK(changed->executable == selected->executable);
+            CHECK(persistentProgram.Install(changed));
+            CHECK(clearAuthor.declarationCalls == 1);
+            clearExecutable.emplace(std::move(changedExecutable));
+            selected = std::move(changed);
+        }
+        auto frame = persistentAdmission.Prepare(selected,std::array<ExecutionTimelinePoint,1>{{{1,iteration-1}}});
+        const auto& barrierPlan = frame.barriers;
+        // Native recording and submission use the authoritative executable,
+        // not the independently compiled diagnostic graph above.
+        auto selectedLayout = selected->executable->executionLayout;
         CHECK(barrierPlan.batches.size() == 1);
         CHECK(barrierPlan.batches[0].beforePass.size() == 2);
         // A fresh COMMON buffer has no prior access to synchronize. The
         // clear-to-copy dependency must still have an intra-batch barrier.
         CHECK(barrierPlan.batches[0].beforePass[0].buffers.empty());
         CHECK(!barrierPlan.batches[0].beforePass[1].buffers.empty());
-        std::vector<OwnedRecordingList> recordings(1);
-        for (auto& recording : recordings) {
-            recording.bindings = bindings;
-
-        }
-        recordings[0].passes.push_back(org::PreparedPass::Make(iteration,
-            +[](const uint32_t& value, org::RecordingContext& context) {
-                const auto shader = context.Resolve(org::PreparedDescriptorReference{0});
-                context.Commands().SetDescriptorHeaps(shader.heap, {});
-                context.Commands().ClearUavUint({shader,context.Resolve(org::PreparedDescriptorReference{1}),
-                    context.Resolve(org::PreparedResourceReference{0})}, rhi::UavClearUint(std::array<uint32_t,4>{value,value,value,value}));
-            }));
+        std::vector<PreparedPass> invocations(selectedLayout->placements.size());
+        invocations[clearExecutable->Id().index] = clearExecutable->PrepareInvocation(*selected,uint32_t{1});
         const auto step = std::find_if(graph->states.steps.begin(),graph->states.steps.end(),
             [](const auto& s) { return s.resource == 0 && s.batch == 0 && s.pass == 1; });
         CHECK(step != graph->states.steps.end() && step->previousBatch == 0);
-        recordings[0].passes.push_back(org::PreparedPass::Make(uint8_t{},
-            +[](const uint8_t&, org::RecordingContext& context) {
-                auto source = context.Resolve(org::PreparedResourceReference{0});
-                context.Commands().CopyBufferRegion(context.Resolve(org::PreparedResourceReference{1}).GetHandle(),0,source.GetHandle(),0,4096);
-            }));
-        recordings[0].barriersBeforePass = barrierPlan.batches[0].beforePass;
+        invocations[copyExecutable->Id().index] = copyExecutable->PrepareInvocation(*selected,uint8_t{});
+        auto rejectSeal = [&](const org::persistent::FrameAdmission& invalid) {
+            try { SealPersistentFrame(iteration,invalid,invocations); }
+            catch (const std::invalid_argument&) { return true; }
+            return false;
+        };
+        auto invalidSeal = frame; invalidSeal.backings.pop_back();
+        CHECK(rejectSeal(invalidSeal));
+        invalidSeal = frame; std::swap(invalidSeal.backings[0],invalidSeal.backings[1]);
+        CHECK(rejectSeal(invalidSeal));
+        invalidSeal = frame; invalidSeal.backings[0].regions.reset();
+        CHECK(rejectSeal(invalidSeal));
+        // An aliasing shared_ptr may retain the right control block while
+        // pointing at the wrong heap. Ownership equality alone is insufficient.
+        CHECK(frame.backings[0].aliasHeap.get() != nullptr);
+        invalidSeal = frame;
+        invalidSeal.backings[0].aliasHeap = std::shared_ptr<const org::AliasHeapGeneration>(frame.backings[0].aliasHeap,nullptr);
+        CHECK(rejectSeal(invalidSeal));
+        CHECK(!invocations[0].IsConsumed() && !invocations[1].IsConsumed());
+        invalidSeal = {};
+        auto sealed = SealPersistentFrame(iteration,frame,std::move(invocations));
+        std::vector<OwnedRecordingList> recordings;
+        recordings.push_back(BuildPersistentRecordingList(sealed,0));
+        CHECK(!recordings[0].bindings && recordings[0].publication == selected);
         auto timingProbe = std::make_shared<RecordingStatisticsProbe>();
         auto timing = std::make_shared<OwnedRecordingStatistics>();
         timing->service = timingProbe;
         timing->passIndices = {0, 1};
         recordings[0].statistics = timing;
         auto recordingJob = std::async(std::launch::async,
-            [recordings = std::move(recordings), runtime, bundle, device, commandPool]() mutable {
-                auto layout = std::make_shared<GraphExecutionLayout>(); layout->bundle = bundle;
-                auto snapshot = std::make_shared<RenderFrameSnapshot>(); snapshot->layout = layout;
-                snapshot->leases.push_back(runtime);
+            [recordings = std::move(recordings), runtime, snapshot = std::move(sealed), device, commandPool]() mutable {
                 PlannedFrame plan; plan.snapshot = snapshot;
                 plan.timelines = {{1,runtime->timeline.Get().GetHandle()}};
-                plan.incomingWaits.resize(1);
+                plan.incomingWaits = snapshot->incomingWaits;
                 FrameRecordingJob job; job.device = device;
                 job.queue = device.GetQueue(rhi::QueueKind::Graphics); job.pool = commandPool;
                 job.recording = std::move(recordings[0]);
@@ -1005,9 +1117,14 @@ int TestOwnedDescriptorGpuExecution(const rhi::DeviceCreateInfo& create) {
         std::optional<RecordedFrame> recorded(recordingJob.get());
         CHECK(timingProbe->begins == 2 && timingProbe->ends == 2 && timingProbe->resolves == 1);
         CHECK(timingProbe->cpuSamples == 0 && timingProbe->merges == 0);
-        std::weak_ptr<const org::FrozenExecutionBindings> bindingLease = bindings;
-        gpu.reset(); cpu.reset(); backing.reset(); bindings.reset();
+        std::weak_ptr<const void> bindingLease = descriptorOwner;
+        std::weak_ptr<const org::persistent::SelectedPublication> publicationLease = selected;
+        selected.reset(); clearExecutable.reset(); copyExecutable.reset();
+        gpu.reset(); cpu.reset(); backing.reset(); descriptorOwner.reset();
         auto execution = std::move(*recorded).Submit(admission);
+        persistentAdmission.Commit(frame,*execution);
+        frame = {};
+        CHECK(persistentAdmission.RetainedFrames() == 1);
         timing->Publish();
         CHECK(timingProbe->cpuSamples == 2 && timingProbe->merges == 1);
         bool duplicateRejected = false;
@@ -1016,6 +1133,7 @@ int TestOwnedDescriptorGpuExecution(const rhi::DeviceCreateInfo& create) {
         CHECK(duplicateRejected);
         recorded.reset(); execution.reset(); // Admission alone retains GPU recording ownership.
         CHECK(!bindingLease.expired());
+        CHECK(!publicationLease.expired());
         CHECK(commandPool->GetDiagnostics().checkedOutCount == 1);
         CHECK(!gpuPool.Assemble(0,gpuContents) && !cpuPool.Assemble(0,cpuContents));
         CHECK(runtime->timeline.Get().HostWait(iteration,10000) == rhi::Result::Ok);
@@ -1024,7 +1142,13 @@ int TestOwnedDescriptorGpuExecution(const rhi::DeviceCreateInfo& create) {
         readbackResource->Unmap(0,nullptr);
         CHECK(admission.RetireCompleted(std::vector<ExecutionTimelinePoint>{{1,iteration}}) == 1);
         admission.TakeRetiredGarbage().clear();
+        // Even after command ownership retires, the publication remains rooted
+        // until persistent admission observes all required completion points.
+        CHECK(!publicationLease.expired());
+        CHECK(persistentAdmission.RetireCompleted(std::array<ExecutionTimelinePoint,1>{{{1,iteration}}}) == 1);
+        CHECK(persistentAdmission.RetainedFrames() == 0);
         CHECK(bindingLease.expired());
+        CHECK(publicationLease.expired());
         CHECK(commandPool->GetDiagnostics().checkedOutCount == 0);
         CHECK(commandPool->GetDiagnostics().totalOwnedCount >= 1);
         CHECK(gpuPool.Assemble(0,gpuContents) && cpuPool.Assemble(0,cpuContents));
@@ -1064,6 +1188,97 @@ int TestAliasHeapOwnership(const rhi::DeviceCreateInfo& create) {
         resource = org::TrackedHandle::FromResource(std::move(native),{});
         resource.RetainLifetimeOwner(generation);
     }
+    {
+        // Use real heap ownership and placed resource identities to validate
+        // the persistent publication contract, without renderer initialization.
+        using namespace org::persistent;
+        using namespace org::experimental;
+        GraphProgram program;
+        CompileWorkspace workspace;
+        std::atomic_bool cancelled{false};
+        auto edit = program.BeginEdit();
+        edit.SetQueues({{0,true},{0,true}});
+        PassId passes[2];
+        BindingToken tokens[2];
+        for (uint32_t i = 0; i < 2; ++i) {
+            const auto handle = placed[i].GetResource().GetHandle();
+            auto state = std::make_shared<PreparedBackingState>();
+            state->graphResourceID = i + 1;
+            state->resource = handle;
+            state->aliasHeap = generation;
+            state->aliasHeapIdentity = generation.get();
+            state->aliasSize = info.sizeInBytes;
+            BindingVersion binding;
+            binding.identity = (uint64_t{handle.generation} << 32) | handle.index;
+            binding.backingRevision = 1;
+            binding.owner = placed[i].CaptureAllocationLease();
+            binding.admission = state;
+            auto snapshot = std::make_shared<org::ResourceBindingSnapshot>();
+            snapshot->resourceID = 9000+i;
+            snapshot->backingGeneration = 1;
+            snapshot->resource = placed[i].GetResource();
+            snapshot->description = desc;
+            snapshot->allocationOwner = binding.owner;
+            snapshot->aliasHeap = generation;
+            snapshot->aliasSize = info.sizeInBytes;
+            binding.recording = snapshot;
+            const auto slot = edit.AddResource(binding.shape,std::move(binding));
+            CompilePass pass;
+            pass.compatibleQueueSlots = {i}; pass.preferredQueueSlot = i;
+            passes[i] = edit.AddPass(std::move(pass));
+            tokens[i] = edit.Declare(passes[i],slot,{}, {1,0,1,true});
+        }
+        bool rejected = false;
+        try { edit.Build(workspace,cancelled); } catch (const std::invalid_argument&) { rejected = true; }
+        CHECK(rejected && program.Select()->bindings.Size() == 0);
+        edit.AddPlacementOrdering(passes[0],passes[1]);
+        auto ready = edit.Build(workspace,cancelled);
+        CHECK(ready && !ready->executable->graph->relativeWaits.empty());
+        CHECK(program.Install(edit,ready));
+        for (uint32_t i = 0; i < 2; ++i)
+            CHECK(rhi::HandleEqual<rhi::ResourceHandle>{}(ready->ResolveNative(tokens[i]).GetHandle(),placed[i].GetResource().GetHandle()));
+        auto mismatched = program.BeginEdit();
+        auto mismatchedBinding = ready->bindings.At({0,1});
+        ++mismatchedBinding.backingRevision;
+        rejected = false;
+        try { mismatched.ReplaceBinding({0,1},std::move(mismatchedBinding)); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        CHECK(rejected && program.Select() == ready);
+        {
+            GraphProgram initiallyUnplaced;
+            auto bootstrap = initiallyUnplaced.BeginEdit();
+            auto unplacedBinding = ready->bindings.At({0,1});
+            unplacedBinding.admission.reset();
+            bootstrap.AddResource(unplacedBinding.shape,std::move(unplacedBinding));
+            CompilePass pass;
+            pass.accesses = {{0,true}};
+            pass.entryStates = {{0,{}, {1,0,1,true}}};
+            bootstrap.AddPass(std::move(pass));
+            CHECK(initiallyUnplaced.Install(bootstrap,bootstrap.Build(workspace,cancelled)));
+            auto unsafe = initiallyUnplaced.BeginEdit();
+            rejected = false;
+            try { unsafe.ReplaceBinding({0,1},ready->bindings.At({0,1})); }
+            catch (const std::invalid_argument&) { rejected = true; }
+            CHECK(rejected);
+            auto structural = initiallyUnplaced.BeginEdit();
+            structural.ReplaceResourceContract({0,1},{1,1,false},ready->bindings.At({0,1}));
+            CHECK(initiallyUnplaced.Install(structural,structural.Build(workspace,cancelled)));
+        }
+        auto programOnly = program.BeginEdit();
+        programOnly.SetPassRecordingInterface(passes[0],std::make_shared<const uint32_t>(17));
+        auto programReady = programOnly.Build(workspace,cancelled);
+        CHECK(programReady->executable == ready->executable);
+        auto moved = program.BeginEdit();
+        moved.SetPassRecordingInterface(passes[0],std::make_shared<const uint32_t>(18));
+        auto replacementBinding = ready->bindings.At({0,1});
+        auto replacementState = std::make_shared<PreparedBackingState>(*replacementBinding.admission);
+        replacementState->aliasOffset = info.sizeInBytes;
+        replacementBinding.admission = replacementState;
+        rejected = false;
+        try { moved.ReplaceBinding({0,1},std::move(replacementBinding)); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        CHECK(rejected && program.Select() == ready);
+    }
     bool disarmRejected = false;
     try { placed[0].ReleaseResourceDisarm(); } catch (const std::logic_error&) { disarmRejected = true; }
     CHECK(disarmRejected);
@@ -1093,7 +1308,12 @@ int TestAliasHeapOwnership(const rhi::DeviceCreateInfo& create) {
     return 0;
 }
 
-int main() {
+int main(int argc, char** argv) {
+    bool hardware = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--hardware") == 0) hardware = true;
+        else if (std::strcmp(argv[i], "--warp") != 0) return 2;
+    }
     if (const auto failure = TestServiceWorkReservations()) return failure;
     {
         // A work graph may be the only retained program in a pass.
@@ -1116,7 +1336,19 @@ int main() {
 	if (const auto failure = TestOwnedRenderFrameSnapshot()) return failure;
 	Microsoft::WRL::ComPtr<IDXGIFactory6> factory; Microsoft::WRL::ComPtr<IDXGIAdapter> warp;
 	CHECK(SUCCEEDED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory))));
-	CHECK(SUCCEEDED(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp))));
+    if (hardware) {
+        Microsoft::WRL::ComPtr<IDXGIAdapter1> candidate;
+        for (UINT index = 0; SUCCEEDED(factory->EnumAdapterByGpuPreference(index,
+            DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&candidate))); ++index) {
+            DXGI_ADAPTER_DESC1 description{};
+            CHECK(SUCCEEDED(candidate->GetDesc1(&description)));
+            if (!(description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) { warp = candidate; break; }
+            candidate.Reset();
+        }
+        if (!warp) { std::puts("SKIP: no hardware adapter available"); return 77; }
+    } else {
+        CHECK(SUCCEEDED(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp))));
+    }
 	rhi::DeviceCreateInfo create{}; create.backend = rhi::Backend::D3D12; create.nativeAdapter = warp.Get(); create.framesInFlight = 2;
     if (const auto failure = TestDescriptorSnapshots(create)) return failure;
     if (const auto failure = TestOwnedDescriptorGpuExecution(create)) return failure;
