@@ -82,6 +82,13 @@ inline std::shared_ptr<const RenderFrameSnapshot> SealPersistentFrame(
     for (size_t i = 0; i < slots.size(); ++i) {
         const auto& expected = selected->bindings.At(slots[i]).admission;
         const auto& actual = admission.backings[i];
+        if (std::find(admission.rebound.begin(), admission.rebound.end(), static_cast<uint32_t>(i)) != admission.rebound.end()) {
+            // Frame-supplied backing: the contract (shape/heap) is checked by
+            // admission; the physical identity is deliberately not the publication's.
+            if (!expected || !actual.resource.valid() || !actual.regions || actual.shape != expected->shape)
+                throw std::invalid_argument("Persistent frame seal has an invalid rebound backing");
+            continue;
+        }
         if (!expected || actual.resource.index != expected->resource.index
             || actual.resource.generation != expected->resource.generation
             || actual.graphResourceID != expected->graphResourceID || actual.shape != expected->shape

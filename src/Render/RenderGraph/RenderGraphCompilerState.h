@@ -165,6 +165,8 @@ struct RenderGraph::CompilerState {
         uint64_t frames = 0, unchanged = 0;
     };
     std::unique_ptr<StructureProbe> structureProbe;
+    // Owned by RenderGraphPersistent.cpp; shared_ptr keeps the type opaque here.
+    std::shared_ptr<PersistentExecutionState> persistent;
 
 	std::vector<Node> nodes;
 	std::vector<compiler::DependencySequence<size_t>> dependencySeqStates;

@@ -3,7 +3,9 @@
 #include <stdexcept>
 #include <exception>
 #include <algorithm>
+#include <iterator>
 #include <BasicTelemetry/Tracy.h>
+#include <spdlog/spdlog.h>
 #include <BasicTelemetry/Telemetry.h>
 
 namespace org::persistent {
@@ -225,6 +227,31 @@ ResourceSlotId BindingTable::CurrentSlot(uint32_t index) const {
     Require(binding.active, "Retired resource slot");
     return {index,binding.slotGeneration};
 }
+const BindingVersion* BindingTable::TryAt(uint32_t index) const noexcept {
+    if (index >= m_size) return nullptr;
+    const auto& binding = m_pages[index / PageSize]->at(index % PageSize);
+    return binding.active ? &binding : nullptr;
+}
+namespace {
+// Reserved slots need a unique physical identity so canonicalization never
+// merges them, and a placeholder admission entry so compiler resource order
+// is preserved. The invalid handle is what admission and recording skip on.
+constexpr uint64_t ReservedIdentityBit = uint64_t{1} << 63;
+BindingVersion PlaceholderBinding(uint32_t index, experimental::CompileResourceShape shape) {
+    BindingVersion binding;
+    binding.identity = ReservedIdentityBit | index;
+    binding.backingRevision = 1;
+    binding.shape = shape;
+    binding.owner = std::make_shared<const uint32_t>(index);
+    binding.bound = false;
+    auto state = std::make_shared<experimental::PreparedBackingState>();
+    state->graphResourceID = uint64_t{index} + 1;
+    state->shape = shape;
+    state->regions = std::make_shared<const std::vector<experimental::PreparedStateRegion>>();
+    binding.admission = std::move(state);
+    return binding;
+}
+}
 const BindingVersion& SelectedPublication::Resolve(BindingToken token) const {
     Require(token.domain == logical->domain && token.pass.index < logical->passSlots.size(), "Foreign binding token");
     const auto& pass = logical->passSlots[token.pass.index];
@@ -263,6 +290,7 @@ ResourceSlotId GraphEditTransaction::AddResource(experimental::CompileResourceSh
         structure.resourceShapes[i] = shape;
         EditLogical().resourceActive[i] = 1;
         EditLogical().nativeContracts[i].reset();
+        if (i < EditLogical().groupBySlot.size()) EditLogical().groupBySlot[i] = LogicalGraph::NoGroup;
         if (binding.recording && binding.recording->description.type != rhi::ResourceType::Unknown)
             EditLogical().nativeContracts[i] = NativeBindingContract::Capture(binding.recording->description);
         ReplaceBinding(reused,std::move(binding));
@@ -273,6 +301,7 @@ ResourceSlotId GraphEditTransaction::AddResource(experimental::CompileResourceSh
     structure.resourceShapes.push_back(shape);
     EditLogical().resourceActive.push_back(1);
     EditLogical().nativeContracts.emplace_back();
+    EditLogical().groupBySlot.resize(EditLogical().resourceActive.size(), LogicalGraph::NoGroup);
     if (binding.recording && binding.recording->description.type != rhi::ResourceType::Unknown)
         EditLogical().nativeContracts.back() = NativeBindingContract::Capture(binding.recording->description);
     EditLogical().bindingSubscribers.emplace_back();
@@ -280,6 +309,43 @@ ResourceSlotId GraphEditTransaction::AddResource(experimental::CompileResourceSh
         m_bindings.m_pages.push_back(std::make_shared<const BindingTable::Page>());
     ReplaceBinding(slot, std::move(binding));
     return slot;
+}
+ResourceSlotId GraphEditTransaction::ReserveResource(experimental::CompileResourceShape shape,
+    std::optional<NativeBindingContract> contract) {
+    MutationGuard mutation{m_failed};
+    Require(shape.mips && shape.slices, "Reserved slots require a stateful resource contract");
+    // ReplaceBinding re-stamps the placeholder with the allocated slot index.
+    auto slot = AddResource(shape,PlaceholderBinding(0,shape));
+    if (contract) EditLogical().nativeContracts.at(slot.index) = std::move(*contract);
+    return slot;
+}
+void GraphEditTransaction::BindReserved(ResourceSlotId slot, BindingVersion binding) {
+    MutationGuard mutation{m_failed};
+    Require(!m_bindings.At(slot).bound, "Slot is not reserved");
+    Require(binding.bound && binding.recording, "Reserved slots bind exact recording snapshots");
+    ReplaceBinding(slot,std::move(binding));
+}
+void GraphEditTransaction::Unbind(ResourceSlotId slot) {
+    MutationGuard mutation{m_failed};
+    const auto& current = m_bindings.At(slot);
+    Require(current.bound, "Slot is already unbound");
+    ReplaceBinding(slot,PlaceholderBinding(slot.index,current.shape));
+}
+std::vector<ResourceSlotId> GraphEditTransaction::ReserveGroupMembers(ResourceGroupId id, uint32_t count) {
+    MutationGuard mutation{m_failed};
+    const auto& logical = m_logical ? *m_logical : *m_base->logical;
+    Require(id.index < logical.groups.size() && logical.groups[id.index].active
+        && id.generation == logical.groups[id.index].generation, "Stale resource group");
+    const auto shape = logical.groups[id.index].memberShape;
+    auto members = logical.groups[id.index].members;
+    std::vector<ResourceSlotId> reserved;
+    reserved.reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        reserved.push_back(ReserveResource(shape));
+        members.push_back(reserved.back());
+    }
+    ReplaceGroupMembers(id,std::move(members));
+    return reserved;
 }
 void GraphEditTransaction::RemoveResource(ResourceSlotId slot) {
     MutationGuard mutation{m_failed};
@@ -500,6 +566,10 @@ void GraphEditTransaction::AddPlacementOrdering(PassId before, PassId after) {
     Require(before != after, "Self placement cycle");
     structure.placementEdges.emplace_back(before.index,after.index);
 }
+void GraphEditTransaction::ClearPlacementOrderings() {
+    MutationGuard mutation{m_failed};
+    EditStructure().placementEdges.clear();
+}
 void GraphEditTransaction::ReplaceResourceContract(ResourceSlotId slot,
     experimental::CompileResourceShape shape, BindingVersion binding) {
     MutationGuard mutation{m_failed};
@@ -530,6 +600,12 @@ void GraphEditTransaction::ReplaceBinding(ResourceSlotId slot, BindingVersion bi
     const auto& structure = m_logical ? m_logical->declarations : m_base->logical->declarations;
     Require(binding.shape == structure.resourceShapes.at(slot.index), "Binding violates shape contract");
     Require(binding.active && binding.identity && binding.backingRevision && binding.owner, "Binding has no exact ownership/version");
+    const bool placeholder = !binding.bound;
+    if (placeholder) {
+        Require(!binding.recording && !binding.preparedViews, "Reserved placeholder carries recording data");
+        binding = PlaceholderBinding(slot.index,binding.shape);
+        binding.slotGeneration = slot.generation;
+    } else Require((binding.identity & ReservedIdentityBit) == 0, "Bound binding uses a reserved identity");
     if (binding.recording) {
         const auto handle = binding.recording->resource.GetHandle();
         Require(handle.valid() && binding.recording->allocationOwner
@@ -568,13 +644,19 @@ void GraphEditTransaction::ReplaceBinding(ResourceSlotId slot, BindingVersion bi
             "Native description changed without a new physical identity");
     }
     const auto& logical = m_logical ? *m_logical : *m_base->logical;
-    for (const auto& group : logical.groups) {
-        if (!group.active || group.memberType == rhi::ResourceType::Unknown) continue;
-        if (std::ranges::find(group.members,slot) == group.members.end()) continue;
-        Require(binding.recording && binding.recording->description.type == group.memberType,
-            "Replacement violates group resource class");
+    if (!placeholder) {
+        auto checkClass = [&](const ResourceGroup& group) {
+            if (!group.active || group.memberType == rhi::ResourceType::Unknown) return;
+            Require(binding.recording && binding.recording->description.type == group.memberType,
+                "Replacement violates group resource class");
+        };
+        const auto groupIndex = slot.index < logical.groupBySlot.size() ? logical.groupBySlot[slot.index] : LogicalGraph::MultipleGroups;
+        if (groupIndex == LogicalGraph::MultipleGroups) {
+            for (const auto& group : logical.groups)
+                if (std::ranges::find(group.members,slot) != group.members.end()) checkClass(group);
+        } else if (groupIndex != LogicalGraph::NoGroup) checkClass(logical.groups.at(groupIndex));
     }
-    if (const auto& contract = logical.nativeContracts.at(slot.index)) {
+    if (const auto& contract = logical.nativeContracts.at(slot.index); contract && !placeholder) {
         Require(binding.recording && contract->Matches(binding.recording->description,binding.shape),
             "Replacement violates native binding contract");
         Require(!binding.admission || binding.admission->heapType == contract->heapType, "Admission heap type violates native binding contract");
@@ -582,7 +664,7 @@ void GraphEditTransaction::ReplaceBinding(ResourceSlotId slot, BindingVersion bi
     std::shared_ptr<BindingVersion::DescriptorTable> descriptors;
     for (auto [pass,ordinal] : logical.bindingSubscribers.at(slot.index)) {
         const auto& entry = logical.passSlots.at(pass).bindingSlots.at(ordinal);
-        if (entry.requiredViews.empty()) continue;
+        if (entry.requiredViews.empty() || placeholder) continue;
         Require(binding.recording && binding.recording->views && binding.recording->descriptorOwner,
             "Replacement lost a required descriptor snapshot");
         if (!descriptors) descriptors = std::make_shared<BindingVersion::DescriptorTable>();
@@ -601,7 +683,7 @@ void GraphEditTransaction::ReplaceBinding(ResourceSlotId slot, BindingVersion bi
         Require(binding.admission->shape == binding.shape, "Admission shape violates binding contract");
         Require(binding.admission->graphResourceID == structure.resourceIDs.at(slot.index), "Admission slot mismatch");
         const auto handle = binding.admission->resource;
-        Require(binding.identity == ((uint64_t{handle.generation} << 32) | handle.index), "Admission identity mismatch");
+        Require(placeholder || binding.identity == ((uint64_t{handle.generation} << 32) | handle.index), "Admission identity mismatch");
         if (binding.admission->aliasSize) {
             Require(binding.admission->aliasHeap && binding.admission->aliasHeapIdentity == binding.admission->aliasHeap.get(),
                 "Alias placement has no exact heap owner");
@@ -685,9 +767,33 @@ void GraphEditTransaction::ReplaceGroupMembers(ResourceGroupId id, std::vector<R
     }
     if (group.members != members) {
         Require(group.membershipRevision != UINT64_MAX, "Group membership revision exhausted");
-        auto& changed = EditLogical().groups[id.index];
+        auto& edited = EditLogical();
+        auto& changed = edited.groups[id.index];
+        edited.groupBySlot.resize(edited.resourceActive.size(), LogicalGraph::NoGroup);
+        const auto byIndex = [](ResourceSlotId a, ResourceSlotId b) { return a.index < b.index; };
+        std::vector<ResourceSlotId> removed, added;
+        std::set_difference(changed.members.begin(),changed.members.end(),members.begin(),members.end(),std::back_inserter(removed),byIndex);
+        std::set_difference(members.begin(),members.end(),changed.members.begin(),changed.members.end(),std::back_inserter(added),byIndex);
         changed.members = std::move(members);
         ++changed.membershipRevision;
+        for (const auto slot : removed) UnindexGroupMember(edited,slot,id.index);
+        for (const auto slot : added) {
+            auto& entry = edited.groupBySlot.at(slot.index);
+            entry = entry == LogicalGraph::NoGroup ? id.index : entry == id.index ? entry : LogicalGraph::MultipleGroups;
+        }
+    }
+}
+void GraphEditTransaction::UnindexGroupMember(LogicalGraph& logical, ResourceSlotId slot, uint32_t groupIndex) {
+    if (slot.index >= logical.groupBySlot.size()) return;
+    auto& entry = logical.groupBySlot[slot.index];
+    if (entry == groupIndex) { entry = LogicalGraph::NoGroup; return; }
+    if (entry != LogicalGraph::MultipleGroups) return;
+    // Rare: recompute from the remaining groups.
+    entry = LogicalGraph::NoGroup;
+    for (uint32_t i = 0; i < logical.groups.size(); ++i) {
+        const auto& group = logical.groups[i];
+        if (i == groupIndex || !group.active || std::ranges::find(group.members,slot) == group.members.end()) continue;
+        entry = entry == LogicalGraph::NoGroup ? i : LogicalGraph::MultipleGroups;
     }
 }
 void GraphEditTransaction::SetGroupResourceClass(ResourceGroupId id, rhi::ResourceType type) {
@@ -753,11 +859,12 @@ void GraphEditTransaction::RemoveGroup(ResourceGroupId id) {
         && id.generation == logical.groups[id.index].generation, "Stale resource group");
     auto& group = logical.groups[id.index];
     group.active = false;
+    for (const auto slot : group.members) UnindexGroupMember(logical,slot,id.index);
     group.members.clear();
     group.subscribers.clear();
 }
 std::shared_ptr<const SelectedPublication> GraphEditTransaction::Build(
-    experimental::CompileWorkspace& workspace, const std::atomic_bool& cancelled) {
+    experimental::CompileWorkspace& workspace, const std::atomic_bool& cancelled, bool validateAliasOrder) {
     Require(!m_failed, "Publication transaction contains a failed edit");
     Require(m_base->revision != UINT64_MAX, "Publication revision exhausted");
     if (cancelled.load(std::memory_order_relaxed)) return {};
@@ -767,7 +874,14 @@ std::shared_ptr<const SelectedPublication> GraphEditTransaction::Build(
         for (const auto& [identity,members] : *bucket) for (const auto slot : members) {
             const auto& old = m_base->bindings.At(m_base->bindings.CurrentSlot(slot));
             const auto& previous = m_base->bindings.m_identities[old.identity % BindingTable::IdentityBuckets]->at(old.identity);
-            if (previous != members) { EditLogical(); break; }
+            if (previous != members) {
+                basic_telemetry::AddCounter("ORG.Persistent.EquivalenceClassRebuilds");
+                static std::atomic<uint32_t> reported{0};
+                if (reported.fetch_add(1) < 8)
+                    spdlog::info("Persistent binding edit changed an equivalence class: slot={} identity={:#x} oldIdentity={:#x} previousMembers={} members={}",
+                        slot, identity, old.identity, previous.size(), members.size());
+                EditLogical(); break;
+            }
         }
     }
     // Validate only changed identity buckets on a binding-only publication.
@@ -939,7 +1053,7 @@ std::shared_ptr<const SelectedPublication> GraphEditTransaction::Build(
         auto graph = experimental::CompileGraph(compileInput, workspace, cancelled);
         if (!graph) return {};
         Require(graph->states.complete, "Incomplete persistent state plan");
-        if (std::ranges::any_of(m_bindings.m_pages, [](const auto& page) {
+        if (validateAliasOrder && std::ranges::any_of(m_bindings.m_pages, [](const auto& page) {
             return std::ranges::any_of(*page, [](const auto& binding) { return binding.admission && binding.admission->aliasSize; });
         })) ValidateAliasOrder(*graph, m_bindings);
         std::vector<ResourceSlotId> resourceSlots;
@@ -1074,7 +1188,7 @@ BindingVersion BindingVersion::FromSnapshot(std::shared_ptr<const ResourceBindin
 }
 FrameAdmission SynchronousAdmission::Prepare(std::shared_ptr<const SelectedPublication> publication,
     std::span<const experimental::ExecutionTimelinePoint> queues, std::span<const FrameProducerWait> producerWaits,
-    std::span<const FrameIncomingState> incomingStates) {
+    std::span<const FrameIncomingState> incomingStates, std::span<const FrameRebinding> rebindings) {
     BT_ZONE_SCOPE("ORG.Persistent.PrepareAdmission");
     Require(publication && publication->executable && publication->executable->graph, "No executable publication");
     Require(!m_pendingSequence, "Previous synchronous admission has not terminated");
@@ -1096,6 +1210,24 @@ FrameAdmission SynchronousAdmission::Prepare(std::shared_ptr<const SelectedPubli
         const auto& binding = frame.publication->bindings.At(slot);
         Require(bool(binding.admission), "Binding has no prepared admission state");
         frame.backings.push_back(*binding.admission);
+    }
+    if (!rebindings.empty()) {
+        BT_ZONE_SCOPE("ORG.Persistent.ApplyFrameRebindings");
+        for (const auto& rebinding : rebindings) {
+            const auto& binding = frame.publication->bindings.At(rebinding.slot);
+            Require(!binding.bound, "Frame rebinding targets a publication-owned slot");
+            const auto index = frame.publication->executable->resourceIndexBySlot.at(rebinding.slot.index);
+            Require(index < frame.backings.size(), "Frame rebinding has no compiled resource");
+            Require(std::ranges::find(frame.rebound,index) == frame.rebound.end(), "Duplicate frame rebinding");
+            Require(rebinding.backing.resource.valid() && rebinding.backing.regions
+                && rebinding.backing.shape == binding.shape && !rebinding.backing.aliasSize
+                && rebinding.backing.graphResourceID == uint64_t{rebinding.slot.index} + 1, "Invalid frame rebinding");
+            Require(rebinding.recording && rebinding.recording->resource.GetHandle().index == rebinding.backing.resource.index
+                && rebinding.recording->resource.GetHandle().generation == rebinding.backing.resource.generation,
+                "Frame rebinding recording disagrees with admission");
+            frame.backings[index] = rebinding.backing;
+            frame.rebound.push_back(index);
+        }
     }
     frame.incomingWaits.resize(graph.batches.size());
     const auto appendProducerWait = [&](uint32_t batch, experimental::ExecutionTimelinePoint completion) {
@@ -1221,6 +1353,16 @@ void SynchronousAdmission::Abandon(const FrameAdmission& frame) {
     Require(frame.domain == m_domain && frame.sequence && frame.sequence == m_pendingSequence, "Stale synchronous abandonment");
     m_pendingSequence = 0;
 }
+void SynchronousAdmission::ExtendSubmitted(experimental::ExecutionTimelinePoint point) {
+    Require(point.timeline && point.value, "Invalid submitted extension");
+    auto& submitted = m_submitted[point.timeline];
+    Require(point.value >= submitted, "Submitted extension is not monotonic");
+    submitted = point.value;
+}
+uint64_t SynchronousAdmission::Submitted(uint64_t timeline) const noexcept {
+    const auto found = m_submitted.find(timeline);
+    return found == m_submitted.end() ? 0 : found->second;
+}
 size_t SynchronousAdmission::RetireCompleted(std::span<const experimental::ExecutionTimelinePoint> completed) {
     auto observations = m_completed;
     std::map<uint64_t,bool> seen;
@@ -1247,11 +1389,14 @@ size_t SynchronousAdmission::RetireCompleted(std::span<const experimental::Execu
 }
 struct PublicationCoordinator::Job {
     explicit Job(GraphEditTransaction value) : transaction(std::move(value)) {}
+    explicit Job(StructuralEdit value) : author(std::move(value)) {}
     std::optional<GraphEditTransaction> transaction;
+    StructuralEdit author; // Replayable; rebased onto a newer selection when superseded.
     std::atomic_bool cancelled{false}, done{false};
     std::shared_ptr<const SelectedPublication> ready;
     std::string failure;
     PublicationState state = PublicationState::Pending;
+    uint32_t rebases = 0;
 };
 PublicationCoordinator::PublicationCoordinator(GraphProgram& program, std::shared_ptr<runtime::ITaskService> tasks)
     : m_program(program), m_tasks(std::move(tasks)) {
@@ -1263,15 +1408,16 @@ PublicationCoordinator::~PublicationCoordinator() {
     if (m_latest) m_latest->cancelled.store(true,std::memory_order_relaxed);
     m_scope->CancelAndWait();
 }
-uint64_t PublicationCoordinator::Submit(GraphEditTransaction transaction) {
-    if (m_latest) m_latest->cancelled.store(true,std::memory_order_relaxed);
-    auto job = std::make_shared<Job>(std::move(transaction));
-    m_latest = job;
-    Require(m_nextSequence != UINT64_MAX, "Publication build sequence exhausted");
-    const auto sequence = m_nextSequence++;
-    if (!m_tasks->Submit(m_scope,runtime::TaskPriority::Streaming,"ORG.Publication.Build",[job] {
+void PublicationCoordinator::Start(const std::shared_ptr<Job>& job) {
+    job->ready.reset();
+    job->failure.clear();
+    job->done.store(false,std::memory_order_release);
+    job->state = PublicationState::Pending;
+    if (!m_tasks->Submit(m_scope,runtime::TaskPriority::Streaming,"ORG.Publication.Build",[job,&program = m_program] {
         try {
             experimental::CompileWorkspace workspace;
+            if (job->author) job->transaction.emplace(program.BeginEdit());
+            if (job->author) job->author(*job->transaction);
             job->ready = job->transaction->Build(workspace,job->cancelled);
             if (!job->ready && !job->cancelled.load(std::memory_order_relaxed)) job->failure = "Publication build returned no result";
             if (job->cancelled.load(std::memory_order_relaxed)) job->ready.reset();
@@ -1282,6 +1428,24 @@ uint64_t PublicationCoordinator::Submit(GraphEditTransaction transaction) {
         job->failure = "Publication worker submission rejected";
         job->done.store(true,std::memory_order_release);
     }
+}
+uint64_t PublicationCoordinator::Submit(GraphEditTransaction transaction) {
+    if (m_latest) m_latest->cancelled.store(true,std::memory_order_relaxed);
+    auto job = std::make_shared<Job>(std::move(transaction));
+    m_latest = job;
+    Require(m_nextSequence != UINT64_MAX, "Publication build sequence exhausted");
+    const auto sequence = m_nextSequence++;
+    Start(job);
+    return sequence;
+}
+uint64_t PublicationCoordinator::Submit(StructuralEdit edit) {
+    Require(bool(edit), "Missing structural edit");
+    if (m_latest) m_latest->cancelled.store(true,std::memory_order_relaxed);
+    auto job = std::make_shared<Job>(std::move(edit));
+    m_latest = job;
+    Require(m_nextSequence != UINT64_MAX, "Publication build sequence exhausted");
+    const auto sequence = m_nextSequence++;
+    Start(job);
     return sequence;
 }
 PublicationState PublicationCoordinator::Pump() {
@@ -1292,7 +1456,17 @@ PublicationState PublicationCoordinator::Pump() {
     if (!job.failure.empty()) return job.state = PublicationState::Failed;
     if (!job.ready || job.cancelled.load(std::memory_order_relaxed)) return job.state = PublicationState::Superseded;
     job.state = PublicationState::Ready;
-    return job.state = m_program.Install(job.ready) ? PublicationState::Selected : PublicationState::Superseded;
+    if (m_program.Install(job.ready)) return job.state = PublicationState::Selected;
+    // A binding edit installed meanwhile. Replayable edits rebase instead of
+    // being lost; bounded so a producer publishing every frame cannot starve it.
+    constexpr uint32_t maximumRebases = 16;
+    if (job.author && job.rebases < maximumRebases) {
+        ++job.rebases; ++m_rebases;
+        basic_telemetry::AddCounter("ORG.Persistent.StructuralRebases");
+        Start(m_latest);
+        return PublicationState::Pending;
+    }
+    return job.state = PublicationState::Superseded;
 }
 PublicationState PublicationCoordinator::State() const {
     if (!m_latest) return PublicationState::Selected;

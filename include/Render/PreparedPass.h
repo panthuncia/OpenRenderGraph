@@ -43,6 +43,20 @@ struct PreparedProgramBinding {
     std::vector<unsigned int> descriptorIndices;
 };
 
+// Registry descriptor indices embedded in a recording recipe change whenever a
+// registered backing is replaced (publications rotate versioned buffers every
+// few frames). A recipe type that can relocate every embedded index through
+// RemapDescriptorIndices(Recipe&, const DescriptorIndexRemap&) is patched in
+// place of a full rebuild when nothing else about it changed.
+using DescriptorIndexRemap = std::unordered_map<uint32_t, uint32_t>;
+inline void RemapDescriptorIndices(std::vector<unsigned int>& indices, const DescriptorIndexRemap& remap) {
+    for (auto& index : indices)
+        if (const auto found = remap.find(index); found != remap.end()) index = found->second;
+}
+inline void RemapDescriptorIndices(PreparedProgramBinding& binding, const DescriptorIndexRemap& remap) {
+    RemapDescriptorIndices(binding.descriptorIndices, remap);
+}
+
 // One preparation call may capture many programs sharing the same descriptor
 // registrations. Resolve each successful registration once against that
 // call's selected publication; never carry numeric results into another frame.
@@ -54,11 +68,14 @@ public:
         if (found != m_indices.end()) return found->second;
         const auto index = resolver(resource, optional);
         // An optional miss must not hide a subsequent mandatory failure.
-        if (index != UINT32_MAX) m_indices.emplace(resource.hash, index);
+        if (index != UINT32_MAX) { m_indices.emplace(resource.hash, index); m_names.emplace(resource.hash, resource.name); }
         return index;
     }
+    const std::unordered_map<size_t, uint32_t>& Indices() const noexcept { return m_indices; }
+    const std::unordered_map<size_t, std::string>& Names() const noexcept { return m_names; }
 private:
     std::unordered_map<size_t, uint32_t> m_indices;
+    std::unordered_map<size_t, std::string> m_names; // diagnostics
 };
 struct CapturedPipeline {
     rhi::PipelineHandle pipeline{};
@@ -265,11 +282,48 @@ public:
             if (policy == OwnershipPolicy::Owned && !binding.owner)
                 throw std::invalid_argument("Unowned recording descriptor");
     }
+    // Persistent publications may leave slots unbound (reserved capacity,
+    // late-bound imports). Entries with an invalid handle are permitted here and
+    // reject resolution, so a pass touching an unbound slot fails at preparation.
+    static std::shared_ptr<const FrozenExecutionBindings> Sparse(std::vector<ResourceBinding> resources) {
+        auto result = std::make_shared<FrozenExecutionBindings>(std::vector<ResourceBinding>{});
+        for (const auto& binding : resources)
+            if (binding.resource.GetHandle().valid() && !binding.owner)
+                throw std::invalid_argument("Unowned sparse recording resource");
+        result->m_resources = std::move(resources);
+        return result;
+    }
+    // Touch tracking: while a flag vector is installed, every resolution marks
+    // its slot (1 = handle/ownership, 2 = bindless views). Recipe builders use
+    // this to learn which bindings a recording recipe actually embedded.
+    enum : uint8_t { TouchHandle = 1, TouchViews = 2 };
+    void TrackTouches(std::vector<uint8_t>* flags) const noexcept { m_touched = flags; }
     rhi::Resource Resolve(PreparedResourceReference ref) const {
-        return m_source ? m_source->Resolve(PreparedResourceReference{m_resourceMap.at(ref.slot)}) : m_resources.at(ref.slot).resource;
+        Touch(ref, TouchHandle);
+        if (m_source) return m_source->Resolve(MappedReference(ref));
+        const auto& resource = m_resources.at(ref.slot).resource;
+        if (!resource.GetHandle().valid()) throw std::logic_error("Recording resolved an unbound persistent slot");
+        return resource;
+    }
+    // Reverse lookup by native handle; never counts as a touch.
+    std::optional<PreparedResourceReference> FindByHandle(rhi::ResourceHandle handle) const {
+        if (m_source) {
+            for (uint32_t slot = 0; slot < m_resourceMap.size(); ++slot) {
+                if (m_resourceMap[slot] == UINT32_MAX) continue;
+                const auto candidate = m_source->Resources().at(m_resourceMap[slot]).resource.GetHandle();
+                if (candidate.index == handle.index && candidate.generation == handle.generation) return PreparedResourceReference{slot};
+            }
+            return std::nullopt;
+        }
+        for (uint32_t slot = 0; slot < m_resources.size(); ++slot) {
+            const auto candidate = m_resources[slot].resource.GetHandle();
+            if (candidate.index == handle.index && candidate.generation == handle.generation) return PreparedResourceReference{slot};
+        }
+        return std::nullopt;
     }
     std::shared_ptr<const void> Owner(PreparedResourceReference ref) const {
-        if (m_source) return m_source->Owner({m_resourceMap.at(ref.slot)});
+        Touch(ref, TouchHandle);
+        if (m_source) return m_source->Owner(MappedReference(ref));
         const auto& binding = m_resources.at(ref.slot);
         if (binding.publicationBinding)
             return binding.publicationBinding->recordingOwner
@@ -280,7 +334,8 @@ public:
         return binding.descriptorOwner ? binding.descriptorOwner : binding.owner ? binding.owner : m_publicationRoot;
     }
     const BindlessResourceViews& Views(PreparedResourceReference ref) const {
-        if (m_source) return m_source->Views({m_resourceMap.at(ref.slot)});
+        Touch(ref, TouchViews);
+        if (m_source) return m_source->Views(MappedReference(ref));
         const auto& views = m_resources.at(ref.slot).views;
         if (!views) throw std::out_of_range("Resource has no captured bindless views");
         return *views;
@@ -290,21 +345,32 @@ public:
     const std::vector<DescriptorBinding>& Descriptors() const { return m_descriptors; }
     const std::shared_ptr<const PublicationBindingBundle>& PublicationRoot() const noexcept { return m_publicationRoot; }
     std::span<const uint32_t> FrameResourceMap() const noexcept { return m_resourceMap; }
+    // UINT32_MAX map entries are pass-local slots with no binding this frame;
+    // resolving one fails like an unbound persistent slot.
     static std::shared_ptr<const FrozenExecutionBindings> WithResourceMap(
         std::shared_ptr<const FrozenExecutionBindings> source, std::vector<uint32_t> map) {
         if (!source) throw std::invalid_argument("Missing recipe binding source");
         auto result = std::make_shared<FrozenExecutionBindings>(std::vector<ResourceBinding>{});
-        for (auto slot : map) (void)source->Resolve(PreparedResourceReference{slot});
+        for (auto slot : map) if (slot != UINT32_MAX) (void)source->Resolve(PreparedResourceReference{slot});
         result->m_source = std::move(source);
         result->m_resourceMap = std::move(map);
         return result;
     }
 private:
+    void Touch(PreparedResourceReference ref, uint8_t kind) const noexcept {
+        if (m_touched && ref.slot < m_touched->size()) (*m_touched)[ref.slot] |= kind;
+    }
+    PreparedResourceReference MappedReference(PreparedResourceReference ref) const {
+        const auto mapped = m_resourceMap.at(ref.slot);
+        if (mapped == UINT32_MAX) throw std::logic_error("Recording resolved a pass slot with no binding this frame");
+        return PreparedResourceReference{mapped};
+    }
     std::vector<ResourceBinding> m_resources;
     std::vector<DescriptorBinding> m_descriptors;
     std::shared_ptr<const PublicationBindingBundle> m_publicationRoot;
     std::shared_ptr<const FrozenExecutionBindings> m_source;
     std::vector<uint32_t> m_resourceMap;
+    mutable std::vector<uint8_t>* m_touched = nullptr;
 };
 
 struct FramePreparationContext {
@@ -355,6 +421,10 @@ struct FramePreparationContext {
     // keeps descriptor indices coherent with the captured pipeline payload.
     std::function<std::vector<unsigned int>(const PipelineResources&)>
         captureDescriptorIndices;
+    // Single-binding form of the same capture. Passes that need per-binding
+    // optionality must resolve through this rather than the registry helper,
+    // so the captured index participates in the recipe revision.
+    std::function<unsigned int(const ResourceIdentifier&, bool optional)> captureDescriptorIndex;
 
     CapturedPipeline CapturePipeline(const PipelineState& pipeline,
         BackendInstanceId backend = BackendInstanceId::Primary) const {

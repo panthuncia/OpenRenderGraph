@@ -27,14 +27,14 @@ bool BackingAccessAdmissionLedger::RetireCompleted(rhi::ResourceHandle resource,
 }
 bool AliasAccessAdmissionLedger::RetireCompleted(const AliasHeapGeneration* heap,
     const std::weak_ptr<const AliasHeapGeneration>& owner, const std::map<uint64_t, uint64_t>& completed) {
-    const auto found = m_intervals.find(heap);
-    if (found == m_intervals.end()) return true;
+    const auto found = m_heaps.find(heap);
+    if (found == m_heaps.end()) return true;
     const auto recorded = m_heapOwners.find(heap);
     if (recorded == m_heapOwners.end() || !owner.expired()
         || owner.owner_before(recorded->second) || recorded->second.owner_before(owner)) return false;
-    for (const auto& interval : found->second)
-        for (auto point : interval.accesses) if (!PointCompleted(point, completed)) return false;
-    m_intervals.erase(found);
+    for (const auto& occupant : found->second.occupants)
+        for (auto point : occupant.accesses) if (!PointCompleted(point, completed)) return false;
+    m_heaps.erase(found);
     m_heapOwners.erase(heap);
     return true;
 }
@@ -111,6 +111,7 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
     };
     for (size_t resource = 0; resource < initial.size(); ++resource) {
         const auto& captured = ordered[resource];
+        if (!captured.resource.valid()) continue; // Reserved slot: no backing this frame.
         if (captured.authoritativeIncoming) {
             if (!captured.regions || captured.regions->empty())
                 throw std::invalid_argument("Authoritative incoming state has no complete regions");
@@ -145,6 +146,7 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
         const auto& captured = ordered[step.resource];
         if (step.pass >= graph.batchByPass.size() || graph.batchByPass[step.pass] != step.batch)
             throw std::invalid_argument("Symbolic state step has no consuming pass placement");
+        if (!captured.resource.valid()) continue; // Reserved slot: no barriers, seeds or commits.
         auto& output = result.batches[step.batch];
         auto& beforePass = output.beforePass[graph.positionByPass[step.pass]];
         const bool crossQueue = step.previousBatch != UINT32_MAX
@@ -507,6 +509,7 @@ void BackingAccessAdmissionLedger::AppendIncomingWaits(const CompiledGraph& grap
             const auto resourceIndex = access.resource;
             const auto range = access.range;
             const bool write = access.state.write;
+                if (!ordered[resourceIndex].resource.valid()) continue;
                 const auto key = Key(ordered[resourceIndex].resource);
                 const auto found = m_accesses.find(key);
                 if (found == m_accesses.end()) continue;
@@ -544,6 +547,7 @@ void BackingAccessAdmissionLedger::Commit(const CompiledGraph& graph,
             const auto range = access.range;
             const bool write = access.state.write;
                 const auto& backing = ordered[resourceIndex];
+                if (!backing.resource.valid()) continue;
                 auto [found, inserted] = m_accesses.try_emplace(Key(backing.resource));
                 auto& grid = found->second;
                 if (inserted) {
@@ -574,6 +578,33 @@ bool Overlaps(uint64_t lhsBegin, uint64_t lhsEnd, uint64_t rhsBegin, uint64_t rh
 }
 }
 
+uint64_t AliasAccessAdmissionLedger::OwnSequence(const Heap& heap, const PreparedBackingState& resource) {
+    const auto found = heap.occupantByHandle.find(Key(resource.resource));
+    if (found == heap.occupantByHandle.end()) return 0;
+    const uint64_t end = resource.aliasOffset + resource.aliasSize;
+    for (const auto& range : heap.occupants[found->second].ranges)
+        if (range.begin == resource.aliasOffset && range.end == end) return range.sequence;
+    return 0;
+}
+
+template<class Fn>
+void AliasAccessAdmissionLedger::ForEachConflict(const PreparedBackingState& resource, Fn&& fn) const {
+    if (!resource.aliasHeapIdentity || !resource.aliasSize) return;
+    const auto found = m_heaps.find(resource.aliasHeapIdentity);
+    if (found == m_heaps.end()) return;
+    const auto& heap = found->second;
+    const uint64_t own = OwnSequence(heap, resource);
+    const uint64_t end = resource.aliasOffset + resource.aliasSize;
+    for (const auto& occupant : heap.occupants) {
+        if (SameHandle(occupant.handle, resource.resource)) continue;
+        for (const auto& range : occupant.ranges) {
+            if (range.sequence <= own || !Overlaps(resource.aliasOffset, end, range.begin, range.end)) continue;
+            fn(occupant);
+            break;
+        }
+    }
+}
+
 std::vector<rhi::ResourceHandle> AliasAccessAdmissionLedger::ApplyInitialStates(
     const CompiledGraph& graph,
     std::span<const PreparedBackingState> resources) const {
@@ -584,13 +615,8 @@ std::vector<rhi::ResourceHandle> AliasAccessAdmissionLedger::ApplyInitialStates(
     std::vector<rhi::ResourceHandle> activated;
     for (const auto& resource : ordered) {
         if (!resource.aliasHeapIdentity || !resource.aliasSize) continue;
-        const auto found = m_intervals.find(resource.aliasHeapIdentity);
-        if (found == m_intervals.end()) continue;
-        const uint64_t end = resource.aliasOffset + resource.aliasSize;
-        const bool replacesOccupant = std::ranges::any_of(found->second, [&](const auto& prior) {
-            return !SameHandle(prior.occupant, resource.resource)
-                && Overlaps(resource.aliasOffset, end, prior.begin, prior.end);
-        });
+        bool replacesOccupant = false;
+        ForEachConflict(resource, [&](const Occupant&) { replacesOccupant = true; });
         if (!replacesOccupant) continue;
         activated.push_back(resource.resource);
     }
@@ -616,18 +642,12 @@ void AliasAccessAdmissionLedger::AppendIncomingWaits(const CompiledGraph& graph,
         const auto consumerTimeline = queues[batch.queue].timeline;
         const auto before = incoming[batchIndex].size();
         for (const auto resourceIndex : graph.aliasFirstResourcesByBatch[batchIndex]) {
-                const auto& resource = ordered[resourceIndex];
-                if (!resource.aliasHeapIdentity || !resource.aliasSize) continue;
-                const auto found = m_intervals.find(resource.aliasHeapIdentity);
-                if (found == m_intervals.end()) continue;
-                const uint64_t end = resource.aliasOffset + resource.aliasSize;
-                for (const auto& prior : found->second) {
-                    if (SameHandle(prior.occupant, resource.resource)
-                        || !Overlaps(resource.aliasOffset, end, prior.begin, prior.end)) continue;
-                    ++overlapsFound;
-                    for (const auto point : prior.accesses)
-                        AppendWait(incoming[batchIndex], point, consumerTimeline);
-                }
+            const auto& resource = ordered[resourceIndex];
+            ForEachConflict(resource, [&](const Occupant& occupant) {
+                ++overlapsFound;
+                for (const auto point : occupant.accesses)
+                    AppendWait(incoming[batchIndex], point, consumerTimeline);
+            });
         }
         waitsAdded += incoming[batchIndex].size() - before;
     }
@@ -651,45 +671,28 @@ void AliasAccessAdmissionLedger::Commit(const CompiledGraph& graph,
         const auto signal = execution.batches[batchIndex].signal;
         if (!signal.timeline || !signal.value) throw std::invalid_argument("Unsubmitted alias point");
         for (const auto resourceIndex : graph.aliasFinalResourcesByBatch[batchIndex]) {
-                const auto& resource = ordered[resourceIndex];
-                if (!resource.aliasHeapIdentity || !resource.aliasSize) continue;
-                if (resource.aliasHeap) m_heapOwners[resource.aliasHeapIdentity] = resource.aliasHeap;
-                auto& intervals = m_intervals[resource.aliasHeapIdentity];
-                const uint64_t end = resource.aliasOffset + resource.aliasSize;
-                std::vector<SubmittedInterval> retainedFragments;
-                for (auto it = intervals.begin(); it != intervals.end();) {
-                    if (SameHandle(it->occupant, resource.resource)
-                        || !Overlaps(resource.aliasOffset, end, it->begin, it->end)) {
-                        ++it;
-                        continue;
-                    }
-                    if (it->begin < resource.aliasOffset) {
-                        auto left = *it;
-                        left.end = resource.aliasOffset;
-                        retainedFragments.push_back(std::move(left));
-                    }
-                    if (end < it->end) {
-                        auto right = *it;
-                        right.begin = end;
-                        retainedFragments.push_back(std::move(right));
-                    }
-                    it = intervals.erase(it);
-                }
-                intervals.insert(intervals.end(),
-                    std::make_move_iterator(retainedFragments.begin()),
-                    std::make_move_iterator(retainedFragments.end()));
-                auto found = std::find_if(intervals.begin(), intervals.end(), [&](const auto& interval) {
-                    return SameHandle(interval.occupant, resource.resource)
-                        && interval.begin == resource.aliasOffset && interval.end == end;
-                });
-                if (found == intervals.end()) {
-                    intervals.push_back({resource.aliasOffset, end, resource.resource, {signal}});
-                    continue;
-                }
-                auto point = std::find_if(found->accesses.begin(), found->accesses.end(),
-                    [&](const auto& existing) { return existing.timeline == signal.timeline; });
-                if (point == found->accesses.end()) found->accesses.push_back(signal);
-                else if (point->value < signal.value) *point = signal;
+            const auto& resource = ordered[resourceIndex];
+            if (!resource.aliasHeapIdentity || !resource.aliasSize) continue;
+            if (resource.aliasHeap) m_heapOwners[resource.aliasHeapIdentity] = resource.aliasHeap;
+            auto& heap = m_heaps[resource.aliasHeapIdentity];
+            const auto key = Key(resource.resource);
+            auto slot = heap.occupantByHandle.find(key);
+            if (slot == heap.occupantByHandle.end()) {
+                slot = heap.occupantByHandle.emplace(key, static_cast<uint32_t>(heap.occupants.size())).first;
+                heap.occupants.push_back({resource.resource, {}, {}});
+            }
+            auto& occupant = heap.occupants[slot->second];
+            const uint64_t end = resource.aliasOffset + resource.aliasSize;
+            const auto sequence = ++m_sequence;
+            auto range = std::find_if(occupant.ranges.begin(), occupant.ranges.end(), [&](const auto& existing) {
+                return existing.begin == resource.aliasOffset && existing.end == end;
+            });
+            if (range == occupant.ranges.end()) occupant.ranges.push_back({resource.aliasOffset, end, sequence});
+            else range->sequence = sequence;
+            auto point = std::find_if(occupant.accesses.begin(), occupant.accesses.end(),
+                [&](const auto& existing) { return existing.timeline == signal.timeline; });
+            if (point == occupant.accesses.end()) occupant.accesses.push_back(signal);
+            else if (point->value < signal.value) *point = signal;
         }
     }
 }
@@ -707,8 +710,8 @@ void BackingAccessAdmissionLedger::ResolvePlannedPoints(
 
 void AliasAccessAdmissionLedger::ResolvePlannedPoints(
     const std::unordered_map<uint64_t, ExecutionTimelinePoint>& points) {
-    for (auto& [_, intervals] : m_intervals) for (auto& interval : intervals)
-        for (auto& point : interval.accesses)
+    for (auto& [_, heap] : m_heaps) for (auto& occupant : heap.occupants)
+        for (auto& point : occupant.accesses)
             if (const auto found = points.find(point.value); found != points.end()) point = found->second;
 }
 

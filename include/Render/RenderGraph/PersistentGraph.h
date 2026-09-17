@@ -100,6 +100,10 @@ struct LogicalGraph {
     std::vector<uint8_t> resourceActive;
     std::vector<std::optional<NativeBindingContract>> nativeContracts;
     std::vector<std::vector<std::pair<uint32_t,uint32_t>>> bindingSubscribers;
+    // Group index per slot (NoGroup / MultipleGroups), so binding edits check a
+    // member's group class without scanning every group's member list.
+    static constexpr uint32_t NoGroup = UINT32_MAX, MultipleGroups = UINT32_MAX - 1;
+    std::vector<uint32_t> groupBySlot;
 };
 
 // Numeric physical identity plus exact ownership. No native handles are used by
@@ -114,6 +118,9 @@ struct BindingVersion {
     std::shared_ptr<const void> owner;
     std::shared_ptr<const experimental::PreparedBackingState> admission;
     bool active = true;
+    // A reserved slot is active and compiled but currently has no backing.
+    // Admission and recording skip it; binding one later is not structural.
+    bool bound = true;
     uint32_t slotGeneration = 1;
     std::shared_ptr<const ResourceBindingSnapshot> recording;
     using DescriptorTable = std::map<uint64_t,std::vector<rhi::DescriptorSlot>>;
@@ -125,6 +132,8 @@ public:
     using Page = std::array<BindingVersion, PageSize>;
     const BindingVersion& At(ResourceSlotId slot) const;
     ResourceSlotId CurrentSlot(uint32_t index) const;
+    // Null for retired slots; reserved (unbound) slots are returned.
+    const BindingVersion* TryAt(uint32_t index) const noexcept;
     uint32_t Size() const noexcept { return m_size; }
 private:
     friend class GraphEditTransaction;
@@ -181,6 +190,13 @@ public:
     GraphEditTransaction(GraphEditTransaction&&) noexcept = default;
     GraphEditTransaction& operator=(GraphEditTransaction&&) noexcept = default;
     ResourceSlotId AddResource(experimental::CompileResourceShape shape, BindingVersion binding);
+    // Reserved capacity: the slot participates in compilation with a placeholder
+    // backing so a later BindReserved/Unbind is a binding-only edit. The optional
+    // contract is checked when a real binding arrives.
+    ResourceSlotId ReserveResource(experimental::CompileResourceShape shape,
+        std::optional<NativeBindingContract> contract = {});
+    void BindReserved(ResourceSlotId slot, BindingVersion binding);
+    void Unbind(ResourceSlotId slot);
     void RemoveResource(ResourceSlotId slot);
     void SetNativeBindingContract(ResourceSlotId slot, NativeBindingContract contract);
     PassId AddPass(experimental::CompilePass pass);
@@ -195,6 +211,9 @@ public:
     ViewToken DeclareView(BindingToken binding, BindlessViewRequest view);
     void AddOrdering(PassId before, PassId after);
     void AddPlacementOrdering(PassId before, PassId after);
+    // Drops every placement ordering (structural). Alias planning re-derives
+    // them from the schedule of the new executable.
+    void ClearPlacementOrderings();
     void ReplaceResourceContract(ResourceSlotId slot, experimental::CompileResourceShape shape, BindingVersion binding);
     void SetQueues(std::vector<experimental::CompileQueue> queues);
     void ReplaceBinding(ResourceSlotId slot, BindingVersion binding);
@@ -204,14 +223,21 @@ public:
         const experimental::PreparedBackingState& initial, uint64_t descriptorRevision = 0, uint64_t contentRevision = 0);
     ResourceGroupId AddGroup(experimental::CompileResourceShape memberShape, std::vector<ResourceSlotId> members);
     void ReplaceGroupMembers(ResourceGroupId group, std::vector<ResourceSlotId> members);
+    // Appends `count` reserved member slots (structural). Binding them later is
+    // a binding-only edit; this is how streaming membership stays non-structural.
+    std::vector<ResourceSlotId> ReserveGroupMembers(ResourceGroupId group, uint32_t count);
     void SetGroupResourceClass(ResourceGroupId group, rhi::ResourceType type);
     void DeclareGroupAccess(PassId pass, ResourceGroupId group,
         experimental::CompileResourceState state, uint32_t phase,
         std::optional<experimental::CompileRange> range = {});
     void RemoveGroupAccess(PassId pass, ResourceGroupId group);
     void RemoveGroup(ResourceGroupId group);
+    static void UnindexGroupMember(LogicalGraph& logical, ResourceSlotId slot, uint32_t groupIndex);
+    // validateAliasOrder=false builds a schedule-only publication for alias
+    // planning: existing placements may be unordered against new users. Such a
+    // publication must not be installed; plan, re-edit and build again.
     std::shared_ptr<const SelectedPublication> Build(experimental::CompileWorkspace& workspace,
-        const std::atomic_bool& cancelled);
+        const std::atomic_bool& cancelled, bool validateAliasOrder = true);
     uint64_t BaseRevision() const noexcept;
     // Producer-side preparation failure makes the entire edit unselectable.
     void Abort() noexcept { m_failed = true; }
@@ -259,6 +285,17 @@ struct FrameAdmission {
         uint32_t firstBatch;
     };
     std::vector<IncomingEffect> incomingEffects;
+    // Compiler resource indices whose backing was supplied by the frame
+    // (swapchain images and similar late-bound imports), not the publication.
+    std::vector<uint32_t> rebound;
+};
+// Frame-supplied backing for a slot the publication deliberately leaves
+// unbound. The executable and its state contract stay selected; only the
+// physical identity is late-bound, so this never supersedes a pending edit.
+struct FrameRebinding {
+    ResourceSlotId slot;
+    experimental::PreparedBackingState backing;
+    std::shared_ptr<const ResourceBindingSnapshot> recording;
 };
 
 // Producer completion requirements are invocation data, not graph structure or
@@ -303,10 +340,15 @@ public:
     FrameAdmission Prepare(std::shared_ptr<const SelectedPublication> publication,
         std::span<const experimental::ExecutionTimelinePoint> queues,
         std::span<const FrameProducerWait> producerWaits = {},
-        std::span<const FrameIncomingState> incomingStates = {});
+        std::span<const FrameIncomingState> incomingStates = {},
+        std::span<const FrameRebinding> rebindings = {});
     void Commit(const FrameAdmission& frame, const experimental::GraphExecutionTimeline& receipt,
         uint32_t signaledBatches = UINT32_MAX);
     void Abandon(const FrameAdmission& frame);
+    // Work submitted outside a graph receipt on a graph queue (presentation
+    // tails). Completion observations are clamped against this.
+    void ExtendSubmitted(experimental::ExecutionTimelinePoint point);
+    uint64_t Submitted(uint64_t timeline) const noexcept;
     size_t RetireCompleted(std::span<const experimental::ExecutionTimelinePoint> completed);
     size_t RetainedFrames() const noexcept { return m_retained.size(); }
 private:
@@ -332,19 +374,26 @@ enum class PublicationState { Pending, Ready, Selected, Failed, Superseded };
 // frame instantiation. The owner calls Pump; workers never select publications.
 class PublicationCoordinator {
 public:
+    using StructuralEdit = std::function<void(GraphEditTransaction&)>;
     PublicationCoordinator(GraphProgram& program, std::shared_ptr<runtime::ITaskService> tasks);
     ~PublicationCoordinator();
     uint64_t Submit(GraphEditTransaction transaction);
+    // Replayable structural edit. Inline binding edits installed while this
+    // builds do not lose it: Pump re-applies the closure on the new base.
+    uint64_t Submit(StructuralEdit edit);
     PublicationState State() const;
     PublicationState Pump();
     std::string Failure() const;
+    uint64_t Rebases() const noexcept { return m_rebases; }
 private:
     struct Job;
+    void Start(const std::shared_ptr<Job>& job);
     GraphProgram& m_program;
     std::shared_ptr<runtime::ITaskService> m_tasks;
     std::shared_ptr<runtime::ITaskScope> m_scope;
     std::shared_ptr<Job> m_latest;
     uint64_t m_nextSequence = 1;
+    uint64_t m_rebases = 0;
 };
 
 } // namespace org::persistent

@@ -102,6 +102,7 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraph.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/ExperimentalGraphCompiler.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/PersistentGraph.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraphPersistent.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/GraphReplay.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/RenderGraph/GraphReplay.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/RenderGraph/PersistentGraph.h"

@@ -61,6 +61,10 @@ class IResourceResolver {
     virtual std::shared_ptr<const ResolverDeclarationState> CaptureDeclarationState() const = 0;
     virtual std::shared_ptr<const ResolverDeclarationState> CaptureDeclarationState(
         const ResolverCaptureContext&) const { return CaptureDeclarationState(); }
+    // Cheap change hint for per-frame polling: while the returned value is
+    // nonzero and unchanged, CaptureDeclarationState() would return an
+    // equivalent state. Zero means "unknown, capture to find out".
+    virtual uint64_t DeclarationVersionHint() const noexcept { return 0; }
 
     template<typename T>
     std::vector<std::shared_ptr<T>> ResolveAs(bool require_all_casts = true) const {

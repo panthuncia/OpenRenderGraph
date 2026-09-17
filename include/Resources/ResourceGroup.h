@@ -49,6 +49,11 @@ public:
 	/// Monotonically-increasing version, bumped on every mutation.
 	uint64_t GetContentVersion() const { return m_contentVersion; }
 
+	/// Stable identity of this group as a resolver dependency. Every resolver
+	/// wrapping the same group reports the same identity, so declaration caches
+	/// and persistent resource groups are shared instead of duplicated per pass.
+	std::shared_ptr<const void> DependencyIdentity() const { return m_dependencyIdentity; }
+
 protected:
 
 
@@ -57,6 +62,8 @@ protected:
 
 	std::string name = "";
 	uint64_t m_contentVersion = 1;
+	struct DependencyIdentityTag {};
+	std::shared_ptr<const DependencyIdentityTag> m_dependencyIdentity = std::make_shared<const DependencyIdentityTag>();
 
 private:
 

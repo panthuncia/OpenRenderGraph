@@ -15,6 +15,7 @@ namespace org {
 enum class AutoAliasMode : uint8_t;
 enum class AutoAliasPackingStrategy : uint8_t;
 class RenderGraph;
+struct TextureDescription;
 }
 
 namespace org::alias {
@@ -212,6 +213,11 @@ struct CachedAliasStaticResourceInfo {
 	std::string debugName;
 	const char* exclusionReason = nullptr;
 };
+
+// Native descriptions used to size alias placements. Shared by the per-frame
+// planner and the persistent structural planner so both agree on bytes/alignment.
+rhi::ResourceDesc AliasTextureResourceDesc(const TextureDescription& desc);
+rhi::ResourceDesc AliasBufferResourceDesc(uint64_t sizeBytes, bool unorderedAccess, rhi::HeapType heapType);
 
 class RenderGraphAliasingSubsystem {
 public:

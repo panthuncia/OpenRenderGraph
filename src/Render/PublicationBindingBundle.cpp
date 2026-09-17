@@ -3,6 +3,7 @@
 #include "Resources/GloballyIndexedResource.h"
 #include "Resources/Resource.h"
 #include "Resources/DynamicResource.h"
+#include <BasicTelemetry/Tracy.h>
 #include <stdexcept>
 #include <cstdlib>
 #include <mutex>

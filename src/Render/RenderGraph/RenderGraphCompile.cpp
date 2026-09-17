@@ -2759,6 +2759,14 @@ void RenderGraph::PrepareAndCompileFrame(rhi::Device device, uint8_t frameIndex,
     BT_ZONE_SCOPE("ORG.Frame.PrepareAndCompile");
     if (m_compilerState->frameProductionStopped)
         throw std::logic_error("Frame production has stopped");
+    if (m_persistentExecution && !asyncPreparationOnly && m_taskService) {
+        PreparePersistentFrame(device, frameIndex, hostData, deltaTime);
+        return;
+    }
+    if (m_persistentExecution && asyncPreparationOnly) {
+        static bool warned = false;
+        if (!warned) { warned = true; spdlog::warn("Persistent execution requires synchronous scheduling; asynchronous frames use the fresh compiler"); }
+    }
     const bool asynchronousScheduling = asyncPreparationOnly;
     if (asynchronousScheduling && m_taskService && m_renderGraphSettingsService) {
         if (!m_compilerState->preparingFrame

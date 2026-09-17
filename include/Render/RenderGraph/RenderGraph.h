@@ -108,6 +108,8 @@ enum class AutoAliasPackingStrategy : uint8_t {
 	BranchAndBound = 1,
 };
 
+namespace persistent { class GraphEditTransaction; class SelectedPublication; }
+
 class RenderGraph {
 public:
 	enum class ExternalInsertKind : uint8_t { Begin, End, Before, After };
@@ -701,6 +703,17 @@ public:
 	// transitional renderer state. Submission also performs this join.
 	void WaitForPreparation();
 	void Execute(PassExecutionContext& context);
+	// Persistent execution: the main graph runs from a selected persistent
+	// publication rebuilt only by explicit structural edits; truly dynamic passes
+	// run in per-frame Pre/Tail segments admitted through the same ledgers.
+	// Requires synchronous scheduling during migration.
+	enum class PersistentSegmentKind : uint8_t { Main, Pre, Tail };
+	struct PersistentExecutionState; // Defined in RenderGraphPersistent.cpp; opaque elsewhere.
+	void SetPersistentExecutionEnabled(bool enabled) noexcept { m_persistentExecution = enabled; }
+	bool PersistentExecutionEnabled() const noexcept { return m_persistentExecution; }
+	void SetPersistentSegment(std::string passName, PersistentSegmentKind kind) {
+		m_persistentSegmentKinds[std::move(passName)] = kind;
+	}
 	// Async producer/admission handshake. True asks the host to prepare another
 	// logical frame before blocking for the exact queue head.
 	bool ShouldDeferAsyncAdmission();
@@ -1286,6 +1299,21 @@ private:
 	// This keeps compiler algorithm/layout changes from rebuilding all ORG clients.
 	struct Node;
 	struct CompilerState;
+	void PreparePersistentFrame(rhi::Device device, uint8_t frameIndex, const IHostExecutionData* hostData, float deltaTime);
+	void ExecutePersistentFrame(PassExecutionContext& context);
+	void ConfirmPersistentPresentationTail();
+	// skipAliasCandidates leaves alias-eligible transients unmaterialized so the
+	// structural build can place them (see PlanPersistentAliasPlacement).
+	void MaterializePersistentStandalone(std::span<Resource* const> resources, bool skipAliasCandidates = false);
+	bool IsPersistentAliasCandidate(Resource* concrete) const;
+	// Returns true when the edit changed (placement edges or bindings) and needs
+	// another build before installation.
+	bool PlanPersistentAliasPlacement(persistent::GraphEditTransaction& edit, const persistent::SelectedPublication& scheduled);
+	void BindUnboundPersistentEntries(persistent::GraphEditTransaction& edit);
+	// Structural build: bind, schedule, plan alias placement, rebuild if needed.
+	std::shared_ptr<const persistent::SelectedPublication> BuildPersistentStructural(persistent::GraphEditTransaction& edit);
+	bool m_persistentExecution = false;
+	std::unordered_map<std::string, PersistentSegmentKind> m_persistentSegmentKinds;
     void SubmitOwnedCompileRequest(rhi::Device device, const std::vector<Node>& nodes,
         std::span<const std::pair<size_t, size_t>> explicitEdges,
         std::vector<std::pair<uint32_t, uint32_t>> dependencyOracle,

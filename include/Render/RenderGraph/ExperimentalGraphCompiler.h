@@ -350,6 +350,9 @@ public:
         ExecutionTimelinePoint completion);
     void ExtendSubmittedFrame(uint64_t frameSequence,
         ExecutionTimelinePoint completion);
+    // Keyed by the unique submission id rather than the bundle sequence, which
+    // persistent executables share across frames.
+    void ExtendSubmittedExecution(uint64_t submission, ExecutionTimelinePoint completion);
     // Called by the ordered owner with observed GPU completion values, in the
     // same queue order as construction. Releases only fully completed bundles.
     size_t RetireCompleted(std::span<const ExecutionTimelinePoint> completed);

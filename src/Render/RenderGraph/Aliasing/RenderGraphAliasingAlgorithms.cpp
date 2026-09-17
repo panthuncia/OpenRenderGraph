@@ -2576,4 +2576,11 @@ void org::alias::RenderGraphAliasingSubsystem::ApplyAliasQueueSynchronization(Re
 }
 
 
+rhi::ResourceDesc org::alias::AliasTextureResourceDesc(const TextureDescription& desc) {
+	return BuildAliasTextureResourceDesc(desc);
+}
+rhi::ResourceDesc org::alias::AliasBufferResourceDesc(uint64_t sizeBytes, bool unorderedAccess, rhi::HeapType heapType) {
+	return BuildAliasBufferResourceDesc(sizeBytes, unorderedAccess, heapType);
+}
+
 } // namespace org

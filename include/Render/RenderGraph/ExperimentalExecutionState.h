@@ -114,9 +114,17 @@ private:
     std::unordered_map<uint64_t, AccessGrid> m_accesses;
 };
 
-// Tracks submitted use of physical placed-resource intervals. Different graph
+// Tracks submitted use of physical placed-resource ranges. Different graph
 // resource handles that overlap the same heap generation conflict even for
 // read/read access because they represent distinct alias occupants.
+//
+// Representation: one occupant per (heap, handle) with the placements it has
+// committed and its latest signal per timeline. Committing assigns a monotonic
+// sequence to the placement; a query range conflicts with every other
+// occupant range that overlaps it and was committed after the query occupant
+// last committed that same range. This is equivalent to the byte-interval
+// ownership model (a later commit takes over the overlapping bytes) but needs
+// no interval fragmentation, so steady-state placements cost O(occupants).
 class AliasAccessAdmissionLedger {
 public:
     std::vector<rhi::ResourceHandle> ApplyInitialStates(
@@ -129,19 +137,34 @@ public:
     void Commit(const CompiledGraph& graph,
         std::span<const PreparedBackingState> resources,
         const GraphExecutionTimeline& execution, uint32_t batchCount = UINT32_MAX);
-    void Reset() { m_intervals.clear(); m_heapOwners.clear(); }
+    void Reset() { m_heaps.clear(); m_heapOwners.clear(); }
     void ResolvePlannedPoints(const std::unordered_map<uint64_t, ExecutionTimelinePoint>& points);
     bool RetireCompleted(const AliasHeapGeneration* heap, const std::weak_ptr<const AliasHeapGeneration>& owner,
         const std::map<uint64_t, uint64_t>& completed);
-    size_t HeapCount() const noexcept { return m_intervals.size(); }
+    size_t HeapCount() const noexcept { return m_heaps.size(); }
 private:
-    struct SubmittedInterval {
+    struct OccupantRange {
         uint64_t begin = 0, end = 0;
-        rhi::ResourceHandle occupant{};
-        std::vector<ExecutionTimelinePoint> accesses;
+        uint64_t sequence = 0; // Commit order of the latest submission using this placement.
     };
-    std::unordered_map<const AliasHeapGeneration*, std::vector<SubmittedInterval>> m_intervals;
+    struct Occupant {
+        rhi::ResourceHandle handle{};
+        std::vector<OccupantRange> ranges;             // Usually one; more after a re-placement.
+        std::vector<ExecutionTimelinePoint> accesses;  // Latest signal per timeline.
+    };
+    struct Heap {
+        std::vector<Occupant> occupants;
+        std::unordered_map<uint64_t, uint32_t> occupantByHandle;
+    };
+    // Sequence of the query occupant's own commit at exactly this placement,
+    // zero when it never committed there. Ranges committed later conflict.
+    static uint64_t OwnSequence(const Heap& heap, const PreparedBackingState& resource);
+    // Visits every other occupant with a range overlapping the query placement
+    // that was committed after the query occupant's own commit there.
+    template<class Fn> void ForEachConflict(const PreparedBackingState& resource, Fn&& fn) const;
+    std::unordered_map<const AliasHeapGeneration*, Heap> m_heaps;
     std::unordered_map<const AliasHeapGeneration*, std::weak_ptr<const AliasHeapGeneration>> m_heapOwners;
+    uint64_t m_sequence = 0;
 };
 
 } // namespace org::experimental

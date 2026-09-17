@@ -172,19 +172,21 @@ int main() {
     context.bindings = std::make_shared<const FrozenExecutionBindings>(
         std::vector<FrozenExecutionBindings::ResourceBinding>{{rhi::Resource{rhi::ResourceHandle{12,1}},owner,views},
             {resource,owner,nextViews}});
+    // The recipe embedded resource 101's handle, never its views: a view
+    // snapshot replacement on an untouched binding reuses the recipe.
     auto descriptorChanged = probe.PrepareFrame(context);
-    CHECK(probe.builds == 3);
+    CHECK(probe.builds == 2);
     CHECK(descriptorChanged.Abandon(AbandonReason::Shutdown));
     probe.failBuild = true;
     ++probe.revision;
     bool buildFailed = false;
     try { probe.PrepareFrame(context); }
     catch (const std::runtime_error&) { buildFailed = true; }
-    CHECK(buildFailed && probe.builds == 4);
+    CHECK(buildFailed && probe.builds == 3);
     probe.failBuild = false;
     --probe.revision;
     auto preserved = probe.PrepareFrame(context);
-    CHECK(probe.builds == 4 && preserved.Abandon(AbandonReason::Shutdown));
+    CHECK(probe.builds == 3 && preserved.Abandon(AbandonReason::Shutdown));
 
     // Packet allocator remains usable after its arena and slot owners leave.
     {

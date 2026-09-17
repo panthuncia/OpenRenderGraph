@@ -243,6 +243,18 @@ void ExecutionTimelineAdmission::ExtendSubmittedFrame(
     });
     if (found == m_retained.end())
         throw std::logic_error("Submitted frame is no longer retained");
+    ExtendSubmittedExecution((*found)->submission, completion);
+}
+
+void ExecutionTimelineAdmission::ExtendSubmittedExecution(
+    uint64_t submission, ExecutionTimelinePoint completion) {
+    if (!submission || !completion.timeline || !completion.value)
+        throw std::invalid_argument("Invalid submitted-execution completion extension");
+    auto found = std::ranges::find_if(m_retained, [&](const auto& execution) {
+        return execution && execution->submission == submission;
+    });
+    if (found == m_retained.end())
+        throw std::logic_error("Submitted execution is no longer retained");
     auto submitted = std::ranges::find(m_submitted, completion.timeline,
         &ExecutionTimelinePoint::timeline);
     auto reserved = std::ranges::find(m_reserved, completion.timeline,

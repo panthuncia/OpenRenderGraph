@@ -1,5 +1,6 @@
 #include "Render/RenderGraph/PersistentGraph.h"
 #include "Render/RenderGraph/GraphReplay.h"
+#include "Render/RenderGraph/ExperimentalRhiExecution.h"
 #include "GraphReplayRunner.h"
 #include <cstdio>
 #include <stdexcept>
@@ -1666,6 +1667,128 @@ int main() {
         CHECK(Rejects([&] { publish(texture,org::BindlessViewKind::UnorderedAccess); }));
         buffer.resourceFlags = {};
         CHECK(Rejects([&] { publish(buffer,static_cast<org::BindlessViewKind>(255)); }));
+    }
+    {
+        // Reserved capacity: membership within capacity is a binding edit, unbound
+        // slots produce no admission work, and a reserved slot can be rebound per
+        // frame without touching the publication.
+        GraphProgram program; CompileWorkspace workspace; std::atomic_bool cancelled{false};
+        auto edit = program.BeginEdit();
+        const auto group = edit.AddGroup({1,1,false},{});
+        const auto reserved = edit.ReserveGroupMembers(group,4);
+        CHECK(reserved.size() == 4);
+        const auto swapchain = edit.ReserveResource({1,1,false});
+        const auto consumer = edit.AddPass({});
+        edit.DeclareGroupAccess(consumer,group,{2,0,1,false},0);
+        const auto present = edit.AddPass({});
+        edit.Declare(present,swapchain,{},{static_cast<uint64_t>(rhi::ResourceAccessType::RenderTarget),0,1,true});
+        auto makeSnapshot = [](uint32_t index) {
+            auto snapshot = std::make_shared<org::ResourceBindingSnapshot>();
+            snapshot->resource = rhi::Resource(rhi::ResourceHandle{index,1}); snapshot->backingGeneration = 1;
+            snapshot->allocationOwner = std::make_shared<const uint32_t>(index);
+            return snapshot;
+        };
+        auto makeBinding = [&](uint32_t index, ResourceSlotId slot) {
+            PreparedBackingState initial;
+            initial.graphResourceID = uint64_t{slot.index} + 1; initial.resource = {index,1}; initial.shape = {1,1,false};
+            initial.regions = std::make_shared<const std::vector<PreparedStateRegion>>();
+            return BindingVersion::FromSnapshot(makeSnapshot(index),initial);
+        };
+        edit.BindReserved(reserved[0],makeBinding(100,reserved[0]));
+        auto base = edit.Build(workspace,cancelled); CHECK(program.Install(edit,base));
+        CHECK(base->executable->resourceSlots.size() == 5);
+        CHECK(CheckConflicts(*base->executable->graph) && CheckStates(*base->executable->graph));
+        auto membership = program.BeginEdit();
+        membership.BindReserved(reserved[1],makeBinding(101,reserved[1]));
+        membership.BindReserved(reserved[2],makeBinding(102,reserved[2]));
+        membership.Unbind(reserved[0]);
+        auto rotated = membership.Build(workspace,cancelled); CHECK(program.Install(membership,rotated));
+        CHECK(rotated->executable == base->executable);
+        CHECK(!rotated->bindings.At(reserved[0]).bound && rotated->bindings.At(reserved[1]).bound);
+        CHECK(base->bindings.At(reserved[0]).bound);
+        CHECK(Rejects([&] { auto stale = program.BeginEdit(); stale.Unbind(reserved[0]); }));
+        CHECK(Rejects([&] { auto stale = program.BeginEdit(); stale.BindReserved(reserved[1],makeBinding(103,reserved[1])); }));
+        SynchronousAdmission admission;
+        const std::array<ExecutionTimelinePoint,1> queues{{{1,0}}};
+        FrameRebinding rebinding;
+        rebinding.slot = swapchain;
+        rebinding.backing.graphResourceID = uint64_t{swapchain.index} + 1;
+        rebinding.backing.resource = {200,1}; rebinding.backing.shape = {1,1,false};
+        rebinding.backing.regions = std::make_shared<const std::vector<PreparedStateRegion>>();
+        rebinding.recording = makeSnapshot(200);
+        auto frame = admission.Prepare(rotated,queues,{},{},std::span{&rebinding,1});
+        CHECK(frame.rebound.size() == 1);
+        const auto swapchainIndex = rotated->executable->resourceIndexBySlot.at(swapchain.index);
+        CHECK(frame.backings[swapchainIndex].resource.index == 200);
+        size_t seeded = 0;
+        for (const auto& batch : frame.barriers.batches) seeded += batch.seeds.size();
+        CHECK(seeded == 3); // Two bound members plus the rebound swapchain; unbound slots are skipped.
+        GraphExecutionTimeline receipt; receipt.batches.resize(frame.barriers.batches.size());
+        for (size_t i = 0; i < receipt.batches.size(); ++i) receipt.batches[i].signal = {1,i+1};
+        std::vector<org::PreparedPass> invocations(rotated->logical->passSlots.size());
+        invocations[consumer.index] = org::PreparedPass::NoOp();
+        invocations[present.index] = org::PreparedPass::NoOp();
+        auto sealed = org::experimental::SealPersistentFrame(1,frame,std::move(invocations));
+        CHECK(sealed && sealed->initialStates->at(swapchainIndex).resource.index == 200);
+        admission.Commit(frame,receipt);
+        CHECK(admission.StateBackingCount() == 3);
+        auto bad = rebinding; bad.slot = reserved[1];
+        CHECK(Rejects([&] { admission.Prepare(rotated,queues,{},{},std::span{&bad,1}); }));
+        admission.ExtendSubmitted({1,50});
+        CHECK(admission.Submitted(1) == 50);
+        auto grow = program.BeginEdit();
+        const auto more = grow.ReserveGroupMembers(group,4);
+        CHECK(more.size() == 4);
+        auto grown = grow.Build(workspace,cancelled); CHECK(program.Install(grow,grown));
+        CHECK(grown->executable != rotated->executable && grown->executable->resourceSlots.size() == 9);
+        CHECK(CheckConflicts(*grown->executable->graph) && CheckStates(*grown->executable->graph));
+    }
+    {
+        // Schedule-only builds skip alias-order validation so a planner can
+        // derive lifetimes from the schedule; a validated build still rejects
+        // overlapping placements whose users are unordered, and clearing the
+        // placement orderings re-exposes that.
+        GraphProgram program; CompileWorkspace workspace; std::atomic_bool cancelled{false};
+        auto heapOwner = std::make_shared<const uint64_t>(1);
+        auto heap = std::shared_ptr<const org::AliasHeapGeneration>(heapOwner,
+            reinterpret_cast<const org::AliasHeapGeneration*>(heapOwner.get()));
+        auto placed = [&](uint64_t index, uint64_t offset) {
+            auto binding = Binding(index); binding.identity = (uint64_t{1} << 32) | index;
+            PreparedBackingState backing; backing.graphResourceID = index; backing.resource = {static_cast<uint32_t>(index),1};
+            backing.shape = binding.shape;
+            backing.regions = std::make_shared<const std::vector<PreparedStateRegion>>(
+                std::initializer_list<PreparedStateRegion>{{{0,1,0,1},{0,0,0,false}}});
+            backing.aliasHeap = heap; backing.aliasHeapIdentity = heap.get();
+            backing.aliasOffset = offset; backing.aliasSize = 256;
+            binding.admission = std::make_shared<const PreparedBackingState>(backing);
+            return binding;
+        };
+        auto edit = program.BeginEdit();
+        edit.SetQueues({{0,true},{0,true}});
+        const auto x = edit.AddResource({1,1,false},placed(1,0));
+        const auto y = edit.AddResource({1,1,false},placed(2,128));
+        const CompileResourceState write{static_cast<uint64_t>(rhi::ResourceAccessType::UnorderedAccess),
+            static_cast<uint64_t>(rhi::ResourceLayout::UnorderedAccess),static_cast<uint64_t>(rhi::ResourceSyncState::ComputeShading),true};
+        CompilePass onSecondQueue; onSecondQueue.compatibleQueueSlots = {1}; onSecondQueue.preferredQueueSlot = 1;
+        const auto a = edit.AddPass({}); edit.Declare(a,x,{0,1,0,1},write);
+        const auto b = edit.AddPass(onSecondQueue); edit.Declare(b,y,{0,1,0,1},write);
+        CHECK(Rejects([&] { edit.Build(workspace,cancelled); }));
+        auto scheduled = edit.Build(workspace,cancelled,false);
+        CHECK(scheduled && scheduled->executable->graph->batches.size() == 2);
+        edit.AddPlacementOrdering(a,b);
+        auto ordered = edit.Build(workspace,cancelled);
+        CHECK(ordered && program.Install(edit,ordered));
+        CHECK(ordered->logical->declarations.placementEdges.size() == 1);
+        auto cleared = program.BeginEdit();
+        cleared.ClearPlacementOrderings();
+        CHECK(Rejects([&] { cleared.Build(workspace,cancelled); }));
+        auto reordered = program.BeginEdit();
+        reordered.ClearPlacementOrderings();
+        reordered.AddPlacementOrdering(b,a);
+        auto flipped = reordered.Build(workspace,cancelled);
+        CHECK(flipped && program.Install(reordered,flipped));
+        CHECK(flipped->logical->declarations.placementEdges.size() == 1 && flipped->logical->declarations.placementEdges[0].first == b.index);
+        CHECK(CheckConflicts(*flipped->executable->graph) && CheckStates(*flipped->executable->graph));
     }
     std::puts("Persistent graph tests passed");
 }

@@ -9936,6 +9936,7 @@ bool RenderGraph::TryExecuteSelectedAsyncFrame(PassExecutionContext& context, bo
 }
 
 void RenderGraph::ConfirmPresentationTailSubmission() {
+    if (m_compilerState->persistent) { ConfirmPersistentPresentationTail(); return; }
     if (!m_compilerState->pendingPresentationSequence
         || !m_compilerState->asyncTimelineAdmission)
         return;
@@ -10052,6 +10053,11 @@ void RenderGraph::Execute(PassExecutionContext& context) {
     JoinPreparationOwner();
     if (m_compilerState->frameProductionStopped)
         throw std::logic_error("Frame production has stopped");
+    if (m_compilerState->persistent) {
+        try { ExecutePersistentFrame(context); }
+        catch (...) { StopFrameProduction(); throw; }
+        return;
+    }
     // Once an owned request exists, its scheduling mode belongs to the accepted
     // frame. Reading the mutable settings service here could relabel (and in
     // future accidentally steer) already accepted work after a generation
