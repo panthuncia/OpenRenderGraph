@@ -273,18 +273,29 @@ UploadInstance::UploadPagePtr UploadInstance::AcquirePageLocked(size_t minSize, 
 	return page;
 }
 
+UploadInstance::UploadPagePtr UploadInstance::PrepareDedicatedPage(size_t size) {
+	if (size <= m_pageSize) return nullptr;
+	return CreatePage(size, true);
+}
+
 bool UploadInstance::AllocateUploadRegion(
 	size_t size,
 	size_t alignment,
 	std::shared_ptr<Resource>& outUploadBuffer,
-	size_t& outOffset)
+	size_t& outOffset,
+	UploadPagePtr preparedDedicated)
 {
 	if (alignment == 0) {
 		alignment = 1;
 	}
 
 	const bool dedicated = size > m_pageSize;
-	if (!m_activePage || m_activePage->dedicated || dedicated) {
+	if (dedicated && preparedDedicated && preparedDedicated->capacity >= size) {
+		TagPage(preparedDedicated);
+		preparedDedicated->tailOffset = 0;
+		TrackPageForCurrentFrameLocked(preparedDedicated);
+		m_activePage = std::move(preparedDedicated);
+	} else if (!m_activePage || m_activePage->dedicated || dedicated) {
 		m_activePage = AcquirePageLocked(size, dedicated);
 	}
 
@@ -454,9 +465,10 @@ void UploadInstance::UploadData(const void* data, size_t size, UploadTarget targ
 	CaptureTargetTelemetry(update.resourceToUpdate,
 		update.targetGlobalResourceId, update.targetDebugName);
 	uint64_t sequence = 0;
+	auto preparedPage = PrepareDedicatedPage(size);
 	{
 		std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
-		AllocateUploadRegion(size, /*alignment*/16, uploadBuffer, uploadOffset);
+		AllocateUploadRegion(size, /*alignment*/16, uploadBuffer, uploadOffset, std::move(preparedPage));
 
 		update.uploadBuffer = uploadBuffer;
 		update.uploadBufferOffset = uploadOffset;
@@ -534,9 +546,10 @@ void UploadInstance::UploadTextureSubresources(
 	std::string targetDebugName;
 	CaptureTargetTelemetry(target, targetGlobalResourceId, targetDebugName);
 	std::vector<uint64_t> sequences;
+	auto preparedPage = PrepareDedicatedPage(static_cast<size_t>(plan.totalSize));
 	{
 		std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
-		AllocateUploadRegion(static_cast<size_t>(plan.totalSize), /*alignment*/512, uploadBuffer, uploadBaseOffset);
+		AllocateUploadRegion(static_cast<size_t>(plan.totalSize), /*alignment*/512, uploadBuffer, uploadBaseOffset, std::move(preparedPage));
 		sequences.reserve(plan.footprints.size());
 		for (const auto& fp : plan.footprints) {
 			rhi::CopyableFootprint copyFootprint;

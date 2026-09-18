@@ -3,6 +3,10 @@
 #include <spdlog/spdlog.h>
 #include <atomic>
 #include <span>
+#include <mutex>
+#include <chrono>
+#include <atomic>
+#include <typeinfo>
 #include <unordered_map>
 #include <string>
 
@@ -39,6 +43,16 @@ struct EmptyPassFrameData {};
 struct LegacyPassBindings {};
 struct NoPassRecordingRecipe {};
 
+// Temporary diagnostics for invocation reuse: per pass type, hit/miss counts
+// and where the preparation time goes. Printed by the persistent owner log.
+struct InvocationReuseStats {
+    const char* name = "";
+    std::atomic<uint64_t> hits{0}, misses{0}, checkNs{0}, buildNs{0}, packageNs{0};
+    std::atomic<uint64_t> revisionNs{0}, bindingNs{0}, descriptorNs{0};
+};
+inline std::mutex& InvocationReuseRegistryMutex() { static std::mutex m; return m; }
+inline std::vector<InvocationReuseStats*>& InvocationReuseRegistry() { static std::vector<InvocationReuseStats*> r; return r; }
+
 template<class Derived, OwnedPassFrameData FrameData = EmptyPassFrameData,
     class Bindings = LegacyPassBindings, class Recipe = NoPassRecordingRecipe>
 class TypedRenderGraphPass : public RenderPass {
@@ -47,18 +61,96 @@ public:
 
     bool UsesTypedPreparation() const noexcept final { return true; }
 
+    // Opt-in invocation reuse for passes without a recording recipe. A pass
+    // that provides
+    //   void InvocationRevision(const PassPrepareContext&, std::vector<uint64_t>&) const
+    // promises that Prepare is a pure function of the values it appends
+    // (settings, pipeline payload pointers, publication revisions, host-snapshot
+    // fields it reads), of the declared bindings it resolves and of the registry
+    // descriptor indices it captures, and that it has no side effects. The
+    // framework then reuses the previous frame data and dependency snapshot
+    // while the revision, every slot index the packet captured, every binding
+    // Prepare touched (handle / view snapshot) and every captured descriptor
+    // index are unchanged. Packets carrying lifecycle effects (Reserve) are never reused.
+    static constexpr bool kReusableInvocation = std::same_as<Recipe, NoPassRecordingRecipe>
+        && requires(const Derived& pass, const PassPrepareContext& prepare, std::vector<uint64_t>& out) {
+            { pass.InvocationRevision(prepare, out) } -> std::same_as<void>;
+        };
+
     PreparedPass PrepareFrame(FramePreparationContext& context) final {
         if constexpr (!std::same_as<Recipe, NoPassRecordingRecipe>)
             return PrepareRecipeInvocation(context);
         else {
+        size_t revisionPrefix = 0;
+        [[maybe_unused]] InvocationReuseStats* stats = nullptr;
+        [[maybe_unused]] std::chrono::steady_clock::time_point started{};
+        if constexpr (kReusableInvocation) {
+            static InvocationReuseStats* registered = [] {
+                auto* entry = new InvocationReuseStats{typeid(Derived).name()};
+                std::lock_guard<std::mutex> lock(InvocationReuseRegistryMutex());
+                InvocationReuseRegistry().push_back(entry);
+                return entry;
+            }();
+            stats = registered;
+            started = std::chrono::steady_clock::now();
+        }
+        if constexpr (kReusableInvocation) {
+            static_assert(!requires(const FrameData& data, SubmissionContext submission) { Derived::Submitted(data, submission); }
+                && !requires(const FrameData& data, CompletionContext completion) { Derived::Completed(data, completion); }
+                && !requires(const FrameData& data, AbandonReason reason) { Derived::Abandoned(data, reason); },
+                "Reusable invocations cannot observe packet lifecycle events");
+            auto& revision = m_invocationRevisionScratch;
+            revision.clear();
+            static_cast<const Derived*>(this)->InvocationRevision(context, revision);
+            revisionPrefix = revision.size();
+            const auto revisioned = std::chrono::steady_clock::now();
+            stats->revisionNs.fetch_add(static_cast<uint64_t>((revisioned - started).count()), std::memory_order_relaxed);
+            if (m_cachedInvocation.data && context.bindings && context.resourceSlots
+                && AppendInvocationBindingRevision(context, m_cachedInvocation.touched, revision)) {
+                const auto bound = std::chrono::steady_clock::now();
+                stats->bindingNs.fetch_add(static_cast<uint64_t>((bound - revisioned).count()), std::memory_order_relaxed);
+                revision.push_back(m_cachedInvocation.descriptorIndices.size());
+                for (const auto& [hash, index] : m_cachedInvocation.descriptorIndices) {
+                    (void)index;
+                    revision.push_back(this->m_resourceDescriptorIndexHelper->PeekResourceDescriptorIndex(hash));
+                }
+                stats->descriptorNs.fetch_add(static_cast<uint64_t>((std::chrono::steady_clock::now() - bound).count()), std::memory_order_relaxed);
+                if (revision == m_cachedInvocation.revision) {
+                    basic_telemetry::AddCounter("ORG.Execution.InvocationReuses");
+                    const auto checked = std::chrono::steady_clock::now();
+                    auto packet = PackageInvocation(context, m_cachedInvocation.data, m_cachedInvocation.dependencies);
+                    const auto packaged = std::chrono::steady_clock::now();
+                    stats->hits.fetch_add(1, std::memory_order_relaxed);
+                    stats->checkNs.fetch_add(static_cast<uint64_t>((checked - started).count()), std::memory_order_relaxed);
+                    stats->packageNs.fetch_add(static_cast<uint64_t>((packaged - checked).count()), std::memory_order_relaxed);
+                    return packet;
+                }
+            }
+            stats->misses.fetch_add(1, std::memory_order_relaxed);
+            stats->checkNs.fetch_add(static_cast<uint64_t>((std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
+        }
         auto collector = std::make_shared<PreparedDependencyCollector>(
             context.borrowedDependencies);
         auto typedContext = context;
         typedContext.dependencyCollector = collector;
-        PreparedDescriptorIndexCache descriptorIndices;
+        auto& descriptorIndices = m_descriptorScratch;
+        descriptorIndices.Clear();
         typedContext.captureDescriptorIndices = [this, &descriptorIndices](const PipelineResources& resources) {
             return this->CaptureResourceDescriptorIndices(resources, &descriptorIndices);
         };
+        // Reusable invocations learn which bindings Prepare resolved.
+        std::vector<uint8_t>* touchFlags = nullptr;
+        if constexpr (kReusableInvocation) {
+            if (context.bindings && context.resourceSlots) {
+                m_touchScratch.assign(context.bindings->Resources().size(), 0);
+                touchFlags = &m_touchScratch;
+                context.bindings->TrackTouches(touchFlags);
+            }
+        }
+        struct TouchGuard {
+            const FrozenExecutionBindings* bindings;
+            ~TouchGuard() { if (bindings) bindings->TrackTouches(nullptr); }
+        } touchGuard{touchFlags ? context.bindings.get() : nullptr};
         if constexpr (!std::same_as<Bindings, LegacyPassBindings>) {
             static_assert(std::copy_constructible<Bindings>, "Declared bindings must be values");
             if (!m_declaredBindings || !context.bindings || !context.resourceSlots)
@@ -81,6 +173,15 @@ public:
                     return {};
                 }
             }();
+            if constexpr (kReusableInvocation) {
+                auto dependencies = std::move(*collector).Freeze();
+                stats->buildNs.fetch_add(static_cast<uint64_t>((std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
+                if (StoreInvocation(context, touchFlags, std::move(data), dependencies, revisionPrefix))
+                    return PackageInvocation(context, m_cachedInvocation.data, std::move(dependencies));
+                return PreparedPass::FromTyped<DeclaredRecorder>(
+                    DeclaredFrame{*m_declaredBindings, std::move(data), context.bindings, std::move(slots)},
+                    std::move(dependencies), context.invocationArena);
+            } else
             return PreparedPass::FromTyped<DeclaredRecorder>(
                 DeclaredFrame{*m_declaredBindings, std::move(data), context.bindings, std::move(slots)},
                 std::move(*collector).Freeze(), context.invocationArena);
@@ -91,6 +192,13 @@ public:
                 { Derived::Record(data, record) } -> std::same_as<void>;
             }, "Prepared passes require static void Record(const FrameData&, PassRecordContext&)");
             auto data = static_cast<Derived*>(this)->Prepare(typedContext);
+            if constexpr (kReusableInvocation) {
+                auto dependencies = std::move(*collector).Freeze();
+                stats->buildNs.fetch_add(static_cast<uint64_t>((std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
+                if (StoreInvocation(context, touchFlags, std::move(data), dependencies, revisionPrefix))
+                    return PackageInvocation(context, m_cachedInvocation.data, std::move(dependencies));
+                return PreparedPass::FromTyped<Derived>(std::move(data), std::move(dependencies), context.invocationArena);
+            } else
             return PreparedPass::FromTyped<Derived>(std::move(data), std::move(*collector).Freeze(), context.invocationArena);
         } else {
             static_assert(std::same_as<FrameData, EmptyPassFrameData>,
@@ -144,6 +252,80 @@ private:
     std::shared_ptr<const FramePreparationContext::ResourceSlots> m_layoutSourceOwner;
     std::vector<uint32_t> m_frameMap;
     std::vector<uint64_t> m_recipeRevisionScratch;
+    PreparedDescriptorIndexCache m_descriptorScratch;
+    // Reusable invocation (see kReusableInvocation).
+    struct SharedFrame { std::shared_ptr<const FrameData> data; };
+    struct SharedRecorder {
+        static void Record(const SharedFrame& frame, PassRecordContext& context) { Derived::Record(*frame.data, context); }
+    };
+    struct CachedInvocation {
+        std::shared_ptr<const FrameData> data;
+        std::shared_ptr<const PreparedDependencySnapshot> dependencies;
+        std::vector<uint64_t> revision;
+        std::vector<std::pair<uint64_t, uint8_t>> touched;           // (declared id, touch flags)
+        std::vector<std::pair<size_t, uint32_t>> descriptorIndices;  // (registry hash, index)
+    };
+    CachedInvocation m_cachedInvocation;
+    std::vector<uint64_t> m_invocationRevisionScratch;
+    std::vector<uint8_t> m_touchScratch;
+    // False when a touched binding is no longer declared.
+    bool AppendInvocationBindingRevision(const FramePreparationContext& context,
+        std::span<const std::pair<uint64_t, uint8_t>> touched, std::vector<uint64_t>& revision) const {
+        const auto& resources = context.bindings->Resources();
+        for (const auto& [id, flags] : touched) {
+            const auto found = context.resourceSlots->Find(id);
+            if (found == context.resourceSlots->end() || found->second >= resources.size()) return false;
+            const auto& binding = resources[found->second];
+            revision.push_back(id);
+            if (flags & FrozenExecutionBindings::TouchSlot) revision.push_back(found->second);
+            if (flags & FrozenExecutionBindings::TouchHandle) {
+                const auto handle = binding.resource.GetHandle();
+                revision.push_back((uint64_t{handle.generation} << 32) | handle.index);
+            }
+            if (flags & FrozenExecutionBindings::TouchViews) revision.push_back(ViewsRevision(binding.views.get()));
+        }
+        return true;
+    }
+    static uint64_t ViewsRevision(const BindlessResourceViews* views) noexcept {
+        if (!views) return 0;
+        uint64_t h = 0x9e3779b97f4a7c15ull ^ views->views.size();
+        auto mix = [&](uint64_t value) { h ^= value + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2); };
+        mix(views->defaultSrvVariant);
+        for (const auto& view : views->views) {
+            mix(static_cast<uint64_t>(view.kind)); mix(view.variant); mix(view.mip); mix(view.slice);
+            mix((uint64_t{view.descriptor.heap.generation} << 32) | view.descriptor.heap.index);
+            mix(view.descriptor.index);
+        }
+        return h ? h : 1;
+    }
+    // Caches the inputs of a freshly prepared packet; false when it cannot be reused.
+    bool StoreInvocation(const FramePreparationContext& context, const std::vector<uint8_t>* touchFlags, FrameData&& data,
+        const std::shared_ptr<const PreparedDependencySnapshot>& dependencies, size_t revisionPrefix) {
+        if (!touchFlags || (dependencies && dependencies->HasLifecycleEffects())) { m_cachedInvocation = {}; return false; }
+        auto& revision = m_invocationRevisionScratch;
+        revision.resize(revisionPrefix);
+        m_cachedInvocation.touched.clear();
+        for (const auto& [id, slot] : *context.resourceSlots)
+            if (slot < touchFlags->size() && (*touchFlags)[slot]) m_cachedInvocation.touched.emplace_back(id, (*touchFlags)[slot]);
+        if (!AppendInvocationBindingRevision(context, m_cachedInvocation.touched, revision)) { m_cachedInvocation = {}; return false; }
+        revision.push_back(m_descriptorScratch.Indices().size());
+        for (const auto& [hash, index] : m_descriptorScratch.Indices()) revision.push_back(index);
+        m_cachedInvocation.data = std::make_shared<const FrameData>(std::move(data));
+        m_cachedInvocation.dependencies = dependencies;
+        m_cachedInvocation.revision = revision;
+        m_cachedInvocation.descriptorIndices.assign(m_descriptorScratch.Indices().begin(), m_descriptorScratch.Indices().end());
+        basic_telemetry::AddCounter("ORG.Execution.InvocationBuilds");
+        return true;
+    }
+    PreparedPass PackageInvocation(const FramePreparationContext& context, std::shared_ptr<const FrameData> data,
+        std::shared_ptr<const PreparedDependencySnapshot> dependencies) const {
+        if constexpr (std::same_as<Bindings, LegacyPassBindings>)
+            return PreparedPass::FromTyped<SharedRecorder>(SharedFrame{std::move(data)}, std::move(dependencies), context.invocationArena);
+        else
+            return PreparedPass::FromTyped<SharedDeclaredRecorder>(
+                SharedDeclaredFrame{*m_declaredBindings, std::move(data), context.bindings, context.resourceSlots},
+                std::move(dependencies), context.invocationArena);
+    }
     struct RecipeInvocation {
         std::shared_ptr<const RecordingRecipe> recipe;
         FrameData data;
@@ -196,7 +378,7 @@ private:
         }
         for (const auto& [hash, index] : descriptorIndices) {
             (void)index;
-            revision.push_back(this->m_resourceDescriptorIndexHelper->GetResourceDescriptorIndex(hash, true));
+            revision.push_back(this->m_resourceDescriptorIndexHelper->PeekResourceDescriptorIndex(hash));
         }
         return true;
     }
@@ -252,7 +434,8 @@ private:
         auto local = context;
         local.resourceSlots = m_localSlots;
         local.bindings = FrozenExecutionBindings::WithResourceMap(context.bindings, m_frameMap);
-        PreparedDescriptorIndexCache descriptorIndices;
+        auto& descriptorIndices = m_descriptorScratch;
+        descriptorIndices.Clear();
         local.captureDescriptorIndices = [this, &descriptorIndices](const PipelineResources& resources) {
             return this->CaptureResourceDescriptorIndices(resources, &descriptorIndices);
         };
@@ -312,10 +495,7 @@ private:
             std::vector<std::pair<size_t, uint32_t>> capturedIndices(descriptorIndices.Indices().begin(), descriptorIndices.Indices().end());
             std::sort(capturedIndices.begin(), capturedIndices.end());
             std::vector<std::string> capturedNames;
-            for (const auto& [hash, index] : capturedIndices) {
-                const auto found = descriptorIndices.Names().find(hash);
-                capturedNames.push_back(found != descriptorIndices.Names().end() ? found->second : std::string{});
-            }
+            for (const auto& [hash, index] : capturedIndices) capturedNames.emplace_back(descriptorIndices.Name(hash));
             // Retain exact recording generations of the embedded bindings,
             // including their view snapshots, without retaining publication
             // semantic-consumer pins.
@@ -374,6 +554,21 @@ private:
     struct DirectRecorder {
         static void Record(const EmptyPassFrameData&, PassRecordContext& context) {
             Derived::Record(context);
+        }
+    };
+    struct SharedDeclaredFrame {
+        Bindings bindings;
+        std::shared_ptr<const FrameData> data;
+        std::shared_ptr<const FrozenExecutionBindings> resources;
+        std::shared_ptr<const FramePreparationContext::ResourceSlots> slots;
+    };
+    struct SharedDeclaredRecorder {
+        static void Record(const SharedDeclaredFrame& frame, PassRecordContext& context) {
+            auto scoped = context.WithDeclaredResources(frame.resources, frame.slots);
+            if constexpr (std::same_as<FrameData, EmptyPassFrameData>)
+                Derived::Record(frame.bindings, scoped);
+            else
+                Derived::Record(frame.bindings, *frame.data, scoped);
         }
     };
 

@@ -1312,6 +1312,13 @@ private:
 	void BindUnboundPersistentEntries(persistent::GraphEditTransaction& edit);
 	// Structural build: bind, schedule, plan alias placement, rebuild if needed.
 	std::shared_ptr<const persistent::SelectedPublication> BuildPersistentStructural(persistent::GraphEditTransaction& edit);
+	// Worker-side structural builds: the transaction is prepared on the owner,
+	// its schedule/placed builds run on a task worker while frames keep the
+	// selected publication; binding edits made meanwhile are replayed onto the
+	// result before a rebased install.
+	void SubmitPersistentStructuralBuild(const std::vector<uint32_t>& structural, const std::vector<uint32_t>& growGroups, rhi::Backend primaryBackend);
+	void AdvancePersistentStructuralBuild(std::vector<uint32_t>& structural);
+	void RunPersistentStructuralBuildPhase(bool validated);
 	bool m_persistentExecution = false;
 	std::unordered_map<std::string, PersistentSegmentKind> m_persistentSegmentKinds;
     void SubmitOwnedCompileRequest(rhi::Device device, const std::vector<Node>& nodes,

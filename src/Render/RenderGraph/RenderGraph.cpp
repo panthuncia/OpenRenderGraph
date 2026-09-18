@@ -3751,6 +3751,8 @@ void RenderGraph::StopFrameProduction() {
     std::vector<std::shared_ptr<FrameContext>> frames;
     for (const auto& [slot, weak] : m_compilerState->frameSlotOwners)
         if (auto frame = weak.lock()) frames.push_back(std::move(frame));
+    if (m_compilerState->persistentBuildScope) m_compilerState->persistentBuildScope->CancelAndWait();
+    m_compilerState->persistentBuildScope.reset();
     if (m_compilerState->frameWorkerScope) m_compilerState->frameWorkerScope->CancelAndWait();
     m_compilerState->frameWorkerScope.reset();
     if (m_compilerState->ownershipRetirementScope) m_compilerState->ownershipRetirementScope->Wait();

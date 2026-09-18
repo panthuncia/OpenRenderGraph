@@ -60,22 +60,32 @@ inline void RemapDescriptorIndices(PreparedProgramBinding& binding, const Descri
 // One preparation call may capture many programs sharing the same descriptor
 // registrations. Resolve each successful registration once against that
 // call's selected publication; never carry numeric results into another frame.
+// Per-preparation memo of registry descriptor indices. A pass captures a few
+// dozen at most, so flat storage that keeps its capacity across frames beats
+// hash maps allocated per pass per frame.
 class PreparedDescriptorIndexCache {
 public:
     template<class Resolver>
     uint32_t Resolve(const ResourceIdentifier& resource, bool optional, Resolver&& resolver) {
-        const auto found = m_indices.find(resource.hash);
-        if (found != m_indices.end()) return found->second;
+        for (const auto& [hash, index] : m_indices) if (hash == resource.hash) return index;
         const auto index = resolver(resource, optional);
         // An optional miss must not hide a subsequent mandatory failure.
-        if (index != UINT32_MAX) { m_indices.emplace(resource.hash, index); m_names.emplace(resource.hash, resource.name); }
+        if (index != UINT32_MAX) {
+            m_indices.emplace_back(resource.hash, index);
+            if (m_names.size() < m_indices.size()) m_names.emplace_back();
+            m_names[m_indices.size() - 1].assign(resource.name);
+        }
         return index;
     }
-    const std::unordered_map<size_t, uint32_t>& Indices() const noexcept { return m_indices; }
-    const std::unordered_map<size_t, std::string>& Names() const noexcept { return m_names; }
+    void Clear() noexcept { m_indices.clear(); }
+    const std::vector<std::pair<size_t, uint32_t>>& Indices() const noexcept { return m_indices; }
+    std::string_view Name(size_t hash) const noexcept {
+        for (size_t i = 0; i < m_indices.size(); ++i) if (m_indices[i].first == hash) return m_names[i];
+        return {};
+    }
 private:
-    std::unordered_map<size_t, uint32_t> m_indices;
-    std::unordered_map<size_t, std::string> m_names; // diagnostics
+    std::vector<std::pair<size_t, uint32_t>> m_indices;
+    std::vector<std::string> m_names; // parallel; strings keep their buffers across frames (diagnostics)
 };
 struct CapturedPipeline {
     rhi::PipelineHandle pipeline{};
@@ -296,8 +306,9 @@ public:
     // Touch tracking: while a flag vector is installed, every resolution marks
     // its slot (1 = handle/ownership, 2 = bindless views). Recipe builders use
     // this to learn which bindings a recording recipe actually embedded.
-    enum : uint8_t { TouchHandle = 1, TouchViews = 2 };
+    enum : uint8_t { TouchHandle = 1, TouchViews = 2, TouchSlot = 4 };
     void TrackTouches(std::vector<uint8_t>* flags) const noexcept { m_touched = flags; }
+    void NoteCapturedSlot(PreparedResourceReference ref) const noexcept { Touch(ref, TouchSlot); }
     rhi::Resource Resolve(PreparedResourceReference ref) const {
         Touch(ref, TouchHandle);
         if (m_source) return m_source->Resolve(MappedReference(ref));
@@ -514,15 +525,22 @@ struct FramePreparationContext {
             }
             throw std::invalid_argument(std::move(message));
         }
+        if (bindings) bindings->NoteCapturedSlot({found->second});
         return {found->second};
     }
 
     PreparedResourceReference CaptureResource(ResourceBindingToken binding) const {
         if (resourceSlots) {
             const auto registry = resourceSlots->Find(binding.registryResourceID);
-            if (registry != resourceSlots->end()) return {registry->second};
+            if (registry != resourceSlots->end()) {
+                if (bindings) bindings->NoteCapturedSlot({registry->second});
+                return {registry->second};
+            }
             const auto global = resourceSlots->Find(binding.globalResourceID);
-            if (global != resourceSlots->end()) return {global->second};
+            if (global != resourceSlots->end()) {
+                if (bindings) bindings->NoteCapturedSlot({global->second});
+                return {global->second};
+            }
         }
         return CaptureResource(binding.registryResourceID);
     }

@@ -263,6 +263,10 @@ public:
     bool Install(const GraphEditTransaction& transaction,
         std::shared_ptr<const SelectedPublication> ready);
     bool Install(std::shared_ptr<const SelectedPublication> ready);
+    // Installs a publication built from an older base after the caller has
+    // replayed every edit installed since onto it. The publication is
+    // renumbered as the successor of the current selection.
+    bool InstallRebased(std::shared_ptr<const SelectedPublication> ready);
 private:
     mutable std::mutex m_mutex;
     std::shared_ptr<const SelectedPublication> m_selected;

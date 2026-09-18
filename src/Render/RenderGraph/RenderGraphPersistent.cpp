@@ -29,6 +29,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <optional>
 #include <bit>
 #include <boost/functional/hash.hpp>
 #include <chrono>
@@ -40,6 +42,7 @@
 #include <typeinfo>
 #include <unordered_map>
 #include <unordered_set>
+#include "RenderPasses/Base/TypedRenderGraphPass.h"
 #include <BasicTelemetry/Tracy.h>
 #include <spdlog/spdlog.h>
 
@@ -155,6 +158,19 @@ struct RotationKey {
 	uint32_t apiIndex = 0, apiGeneration = 0;
 	bool operator==(const RotationKey&) const = default;
 };
+RotationKey RotationKeyOfResource(Resource& resource) {
+	RotationKey key;
+	auto* concrete = UnwrapDynamic(&resource);
+	if (!concrete) return key;
+	key.concreteID = concrete->GetGlobalResourceID();
+	if (auto* backed = dynamic_cast<BackedResource*>(concrete)) key.backingGeneration = backed->GetBackingGeneration();
+	else {
+		const auto handle = concrete->GetAPIResource().GetHandle();
+		key.apiIndex = handle.index; key.apiGeneration = handle.generation;
+	}
+	if (auto* indexed = dynamic_cast<GloballyIndexedResource*>(concrete)) key.views = indexed->CaptureBindlessViews().get();
+	return key;
+}
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -216,13 +232,60 @@ struct RenderGraph::PersistentExecutionState {
 		const char* label = "";
 		std::shared_ptr<const persistent::SelectedPublication> publication;
 		std::vector<PreparedPass> invocations;
-		std::vector<std::string> names;       // Per logical pass slot, for statistics/present detection.
+		std::shared_ptr<const std::vector<std::string>> names; // Per logical pass slot, for statistics/present detection.
 		std::vector<persistent::FrameRebinding> rebindings;
 		std::vector<persistent::FrameProducerWait> waits;
 		std::shared_ptr<const FrozenExecutionBindings> legacyBindings;
 		std::vector<experimental::PreparedTimelineBinding> foreignTimelines;
 		std::vector<std::shared_ptr<const void>> leases;
 	};
+
+	// A dynamic segment whose lowered structure and bound backings match the
+	// previous frame's reuses that publication: no binding capture, no build.
+	struct SegmentCache {
+		std::vector<uint64_t> key;
+		std::shared_ptr<const persistent::SelectedPublication> publication;
+		std::shared_ptr<const FrozenExecutionBindings> legacyBindings;
+		std::vector<persistent::PassId> ids;
+	};
+	SegmentCache preCache, tailCache;
+	// Persistent program for a dynamic segment: the passes are lowered once per
+	// structure; each frame's resource set is bound into reserved-capacity
+	// groups (one per pass and access template) by diff. A frame whose set and
+	// backings repeat does no edit and no build. Capacity overflow and
+	// structure changes rebuild the program (rare); postconditions, swapchain
+	// images and a backing wanted by two pools fall back to a fresh build.
+	struct SegmentProgram {
+		struct Template {
+			CompileResourceShape shape; CompileRange range; CompileResourceState state;
+			bool operator==(const Template&) const = default;
+		};
+		struct Pool {
+			uint32_t pass = 0;
+			uint64_t templateHash = 0;
+			Template request;
+			persistent::ResourceGroupId group;
+			uint32_t capacity = 0;
+			std::vector<persistent::ResourceSlotId> slots;    // member slots (positions)
+			std::vector<uint64_t> physical;                   // wanted physical identity per position, 0 = none
+			std::vector<Resource*> resources;
+			std::vector<RotationKey> bound;
+			std::vector<uint8_t> isBound;                     // position holds a binding (kept until refilled or unbound)
+			std::unordered_map<uint64_t, uint32_t> positionByPhysical;
+			std::vector<uint32_t> free, vacated;
+			std::vector<uint8_t> wanted;                      // per-frame scratch
+		};
+		struct Pass { persistent::PassId id; std::vector<uint32_t> pools; };
+		std::vector<uint64_t> key;                            // structure: pass names, declarations, templates
+		persistent::GraphProgram program;
+		std::vector<Pool> pools;
+		std::vector<Pass> passes;
+		std::vector<FrozenExecutionBindings::ResourceBinding> table; // per slot
+		std::shared_ptr<const persistent::SelectedPublication> publication;
+		std::shared_ptr<const FrozenExecutionBindings> legacyBindings;
+		uint64_t frames = 0;
+	};
+	std::vector<std::unique_ptr<SegmentProgram>> prePrograms, tailPrograms;
 
 	persistent::GraphProgram program;
 	std::unique_ptr<persistent::SynchronousAdmission> admission;
@@ -260,7 +323,32 @@ struct RenderGraph::PersistentExecutionState {
 	std::vector<std::pair<uint32_t, uint32_t>> aliasEdges;          // Installed placement orderings (logical pass slots).
 	uint64_t aliasPlans = 0, aliasRematerializations = 0;
 	// Diagnostic: per-pass preparation cost (logged periodically).
-	std::unordered_map<std::string, std::pair<uint64_t, uint64_t>> prepareCostByPass; // name -> (ns, calls)
+	std::unordered_map<std::string, std::pair<uint64_t, uint64_t>> prepareCostByPass; // lowering: name -> (ns, calls)
+	std::vector<std::pair<uint64_t, uint64_t>> prepareCostByMain;                    // main pass index -> (ns, calls)
+	std::shared_ptr<const std::vector<std::string>> mainNames;
+	const void* mainNamesExecutable = nullptr;
+	// A structural build in flight on a worker. Frames keep using the selected
+	// publication; the slot directory already describes the new structure, so
+	// subscriber slot maps are frozen (no rebuild) until the install.
+	struct PendingStructural {
+		std::unique_ptr<persistent::GraphEditTransaction> edit;
+		std::shared_ptr<const persistent::SelectedPublication> base;
+		uint32_t baseSlotCount = 0;
+		std::atomic<int> phase{0}; // 0 scheduling, 1 scheduled, 2 placing, 3 placed, -1 failed
+		std::atomic_bool cancelled{false};
+		std::atomic_bool clearedOrderings{false};
+		std::shared_ptr<const persistent::SelectedPublication> result;
+		std::string error;
+		experimental::CompileWorkspace workspace;
+		std::vector<uint32_t> dirtyPasses;        // slotsDirty deferred to the install
+		std::vector<uint32_t> touchedGroups;      // grown in the transaction: not polled meanwhile
+		std::vector<uint32_t> deferredStructural; // relower requests that arrived meanwhile
+		// Binding edits installed on the live publication meanwhile, replayed
+		// onto the result (nullopt = unbind). Keyed by slot index.
+		std::unordered_map<uint32_t, std::optional<persistent::BindingVersion>> bindingLog;
+		std::chrono::steady_clock::time_point started;
+	};
+	std::shared_ptr<PendingStructural> pending;
 	// Submitted this frame.
 	uint64_t pendingPresentSubmission = 0;
 	uint64_t structuralBuilds = 0, bindingBuilds = 0;
@@ -311,6 +399,27 @@ std::vector<experimental::CompileQueue> RegistryQueues(const QueueRegistry& regi
 // Declaration lowering (legacy adapter)
 
 namespace {
+
+bool IsSwapchainResource(Resource& resource) {
+	return resource.GetName() == "Backbuffer" && dynamic_cast<DynamicResource*>(&resource)
+		&& !dynamic_cast<BackedResource*>(UnwrapDynamic(&resource));
+}
+uint64_t FingerprintDeclaration(const experimental::CompilePass& d) {
+	uint64_t h = 0x9e3779b97f4a7c15ull;
+	auto mix = [&](uint64_t value) { h ^= value + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2); };
+	mix(d.backend); mix(d.preferredQueueSlot); mix(d.forceBatchIsolation ? 1 : 0);
+	auto slots = d.compatibleQueueSlots; std::sort(slots.begin(), slots.end());
+	for (const auto slot : slots) mix(0x100 + slot);
+	return h;
+}
+uint64_t HashSegmentTemplate(const State::SegmentProgram::Template& t) {
+	uint64_t h = 0x7f4a7c159e3779b9ull;
+	auto mix = [&](uint64_t value) { h ^= value + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2); };
+	mix(t.shape.mips); mix(t.shape.slices); mix(t.shape.hasLayout ? 1 : 0);
+	mix(t.range.mip); mix(t.range.mips); mix(t.range.slice); mix(t.range.slices);
+	mix(t.state.access); mix(t.state.layout); mix(t.state.sync); mix(t.state.write ? 1 : 0);
+	return h ? h : 1;
+}
 
 struct LoweredUse {
 	uint64_t resourceID = 0;         // Scheduling identity.
@@ -521,19 +630,37 @@ uint32_t DirectEntry(State& state, persistent::GraphEditTransaction& edit, uint6
 	return index;
 }
 
+// While a structural build is pending, edits against the live publication are
+// logged for replay onto the result; slots the live publication does not have
+// yet are logged only.
+bool LiveEdit(const State& state, const persistent::GraphEditTransaction& edit) {
+	return state.pending && &edit != state.pending->edit.get();
+}
+void UnbindSlot(State& state, persistent::GraphEditTransaction& edit, const State::SlotEntry& entry) {
+	if (LiveEdit(state, edit)) {
+		state.pending->bindingLog[entry.slot.index] = std::nullopt;
+		if (entry.slot.index >= state.pending->baseSlotCount) return;
+	}
+	edit.Unbind(entry.slot);
+}
 bool BindEntry(State& state, persistent::GraphEditTransaction& edit, uint32_t index) {
 	auto& entry = state.entries[index];
 	if (entry.swapchain || !entry.resource) return false;
 	auto binding = CaptureSlotBinding(*entry.resource, entry.slot.index, entry.shape);
 	if (!binding) {
-		if (entry.isBound) { edit.Unbind(entry.slot); entry.isBound = false; entry.bound = {}; }
+		if (entry.isBound) { UnbindSlot(state, edit, entry); entry.isBound = false; entry.bound = {}; }
 		static std::atomic<uint32_t> reported{0};
 		if (reported.fetch_add(1) < 16)
 			spdlog::warn("Persistent slot {} could not capture a backing for '{}' (unmaterialized or invalid)", index, entry.resource->GetName());
 		basic_telemetry::AddCounter("ORG.Persistent.UnboundCaptures");
 		return false;
 	}
-	{
+	bool apply = true;
+	if (LiveEdit(state, edit)) {
+		state.pending->bindingLog[entry.slot.index] = *binding;
+		apply = entry.slot.index < state.pending->baseSlotCount;
+	}
+	if (apply) {
 		BT_ZONE_SCOPE("ORG.Persistent.BindEntry.Edit");
 		if (entry.isBound) edit.ReplaceBinding(entry.slot, std::move(*binding));
 		else edit.BindReserved(entry.slot, std::move(*binding));
@@ -547,13 +674,15 @@ bool BindEntry(State& state, persistent::GraphEditTransaction& edit, uint32_t in
 // subscribers: scheduling ID, registry object ID and (for wrappers) the
 // concrete backing ID. Direct entries additionally expose registry handle
 // IDs, which never change and are only produced by the full rebuild.
-void QueueSlotPatch(State& state, const State::SlotEntry& entry, uint64_t concreteID, bool add) {
-	std::array<uint64_t, 3> ids{entry.resourceID, entry.resource ? entry.resource->GetGlobalResourceID() : 0, concreteID};
+void QueueSlotPatchIDs(State& state, const State::SlotEntry& entry, const std::array<uint64_t, 3>& ids, bool add) {
 	for (const auto subscriber : entry.subscribers) {
 		auto& pass = state.mainPasses[subscriber];
 		auto& list = add ? pass.slotAdds : pass.slotRemoves;
 		for (const auto id : ids) if (id) list.emplace_back(id, entry.slot.index);
 	}
+}
+void QueueSlotPatch(State& state, const State::SlotEntry& entry, uint64_t concreteID, bool add) {
+	QueueSlotPatchIDs(state, entry, {entry.resourceID, entry.resource ? entry.resource->GetGlobalResourceID() : 0, concreteID}, add);
 }
 
 } // namespace
@@ -614,7 +743,10 @@ static void InstallMainPass(RenderGraph& graph, State& state, persistent::GraphE
 			group.identity = loweredGroup.identity;
 			group.waitRevision = loweredGroup.waitRevision;
 			group.waits = std::move(loweredGroup.waits);
-			group.capacity = (std::max<uint32_t>)(16, static_cast<uint32_t>(loweredGroup.members.size() * 2));
+			// Exact published selections have one member that rotates in place;
+			// reserving 16 slots for each only inflates the tables and ledgers.
+			group.capacity = loweredGroup.members.size() <= 1 ? 2u
+				: (std::max<uint32_t>)(16, static_cast<uint32_t>(loweredGroup.members.size() * 2));
 			group.group = edit.AddGroup(loweredGroup.shape, {});
 			const auto reserved = edit.ReserveGroupMembers(group.group, group.capacity);
 			for (const auto slot : reserved) {
@@ -848,6 +980,7 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 		std::vector<uint32_t> growGroups;
 		std::unordered_map<uint32_t, LoweredPass> relowered;
 		std::optional<persistent::GraphEditTransaction> edit;
+		AdvancePersistentStructuralBuild(structural);
 		auto ensureEdit = [&]() -> persistent::GraphEditTransaction& {
 			if (!edit) edit.emplace(state.program.BeginEdit());
 			return *edit;
@@ -869,6 +1002,7 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 					auto lowered = LowerLegacyPass(*this, _registry, m_queueRegistry, primaryBackend, value, any.type, mainIndex);
 					if (FingerprintLowering(lowered) == main.fingerprint) return; // Membership-only change.
 					LogRelowerDiff(any.name, main, lowered);
+					if (state.pending) { state.pending->deferredStructural.push_back(mainIndex); return; }
 					relowered.emplace(mainIndex, std::move(lowered));
 					structural.push_back(mainIndex);
 				}
@@ -881,6 +1015,7 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 		for (uint32_t groupIndex = 0; groupIndex < state.groups.size(); ++groupIndex) {
 			auto& group = state.groups[groupIndex];
 			if (group.subscribers.empty() || !group.resolver) continue;
+			if (state.pending && std::find(state.pending->touchedGroups.begin(), state.pending->touchedGroups.end(), groupIndex) != state.pending->touchedGroups.end()) continue;
 			const auto hint = group.resolver->DeclarationVersionHint();
 			if (hint && hint == group.versionHint) continue;
 			std::shared_ptr<const ResolverDeclarationState> captured;
@@ -909,44 +1044,63 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 			}
 			if (!uniform) {
 				// Shape contract broken: subscribers re-lower (direct declarations).
+				if (state.pending) { group.versionHint = 0; for (const auto subscriber : group.subscribers) state.pending->deferredStructural.push_back(subscriber); continue; }
 				for (const auto subscriber : group.subscribers) structural.push_back(subscriber);
 				continue;
 			}
-			if (members.size() > group.capacity) { growGroups.push_back(groupIndex); continue; }
+			if (members.size() > group.capacity) {
+				if (state.pending) { group.versionHint = 0; continue; } // re-detected after the install
+				growGroups.push_back(groupIndex);
+				continue;
+			}
 			auto& transaction = ensureEdit();
 			// Diff against the bound set: O(members) with the per-group index.
 			std::unordered_set<uint64_t> wanted;
 			wanted.reserve(members.size());
 			for (const auto& [id, resource] : members) wanted.insert(id);
+			// Members that left: their positions stay bound for now so that a
+			// member arriving in the same poll (a rotated publication of the same
+			// logical resource) replaces the binding in place. Positions are
+			// reused lowest-first in resolver order so a resource set that is
+			// republished every frame lands on the same member slots each time;
+			// a physical backing shared with another group then keeps its
+			// equivalence class (a position swap would be a structural change).
+			std::vector<uint32_t> vacated;
 			for (auto it = group.memberIndexByID.begin(); it != group.memberIndexByID.end();) {
 				const auto [id, i] = *it;
 				if (wanted.contains(id)) { ++it; continue; }
-				auto& entry = state.entries[group.memberEntries[i]];
-				if (entry.isBound) { transaction.Unbind(entry.slot); QueueSlotPatch(state, entry, entry.bound.concreteID, false); ++removed; }
-				entry.isBound = false; entry.bound = {}; entry.resource = nullptr; entry.resourceID = 0;
 				std::erase(state.entriesByResourceID[id], group.memberEntries[i]);
 				group.memberResourceIDs[i] = 0;
-				group.freeMembers.push_back(i);
+				vacated.push_back(i);
 				it = group.memberIndexByID.erase(it);
 			}
-			// Positions are reused lowest-first in resolver order so a resource set
-			// that is republished every frame lands on the same member slots each
-			// time; a physical backing shared with another group then keeps its
-			// equivalence class (a position swap would be a structural change).
+			std::sort(vacated.begin(), vacated.end(), std::greater<>());
 			std::sort(group.freeMembers.begin(), group.freeMembers.end(), std::greater<>());
 			for (const auto& [id, resource] : members) {
 				if (group.memberIndexByID.contains(id)) continue;
-				if (group.freeMembers.empty()) throw std::logic_error("Persistent group capacity accounting mismatch");
-				const auto i = group.freeMembers.back();
-				group.freeMembers.pop_back();
+				uint32_t i;
+				if (!vacated.empty()) { i = vacated.back(); vacated.pop_back(); }
+				else if (!group.freeMembers.empty()) { i = group.freeMembers.back(); group.freeMembers.pop_back(); }
+				else throw std::logic_error("Persistent group capacity accounting mismatch");
 				auto& entry = state.entries[group.memberEntries[i]];
+				const bool replacing = entry.isBound;
+				const std::array<uint64_t, 3> previousIDs = replacing && entry.resource
+					? std::array<uint64_t, 3>{entry.resourceID, entry.resource->GetGlobalResourceID(), entry.bound.concreteID} : std::array<uint64_t, 3>{};
 				entry.resource = resource; entry.resourceID = id;
 				state.entriesByResourceID[id].push_back(group.memberEntries[i]);
 				group.memberResourceIDs[i] = id;
 				group.memberIndexByID.emplace(id, i);
 				{ BT_ZONE_SCOPE("ORG.Persistent.PollGroups.Diff.Materialize"); MaterializePersistentStandalone(std::span<Resource* const>{&resource, 1}); }
 				BT_ZONE_SCOPE("ORG.Persistent.PollGroups.Diff.Bind");
+				if (replacing) { QueueSlotPatchIDs(state, entry, previousIDs, false); ++removed; }
 				if (BindEntry(state, transaction, group.memberEntries[i])) { QueueSlotPatch(state, entry, entry.bound.concreteID, true); ++added; }
+			}
+			// Positions nobody refilled are unbound.
+			for (const auto i : vacated) {
+				auto& entry = state.entries[group.memberEntries[i]];
+				if (entry.isBound) { UnbindSlot(state, transaction, entry); QueueSlotPatch(state, entry, entry.bound.concreteID, false); ++removed; }
+				entry.isBound = false; entry.bound = {}; entry.resource = nullptr; entry.resourceID = 0;
+				group.freeMembers.push_back(i);
 			}
 			group.identity = captured->resourceSetIdentity;
 			BT_ZONE_VALUE(static_cast<int64_t>(added + removed));
@@ -955,47 +1109,10 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 		}
 		std::sort(structural.begin(), structural.end());
 		structural.erase(std::unique(structural.begin(), structural.end()), structural.end());
-		for (const auto groupIndex : growGroups) {
-			auto& transaction = ensureEdit();
-			auto& group = state.groups[groupIndex];
-			const auto more = transaction.ReserveGroupMembers(group.group, group.capacity);
-			for (const auto slot : more) {
-				if (slot.index != state.entries.size()) throw std::logic_error("Persistent slot directory expects dense slot allocation");
-				State::SlotEntry entry;
-				entry.slot = slot;
-				entry.shape = group.shape;
-				entry.subscribers = group.subscribers;
-				state.entries.push_back(std::move(entry));
-				group.memberEntries.push_back(slot.index);
-				group.memberResourceIDs.push_back(0);
-				group.freeMembers.push_back(static_cast<uint32_t>(group.memberEntries.size() - 1));
-			}
-			group.capacity *= 2;
-			group.identity = {}; // Re-syncs (binding-only) on the next poll.
-			basic_telemetry::AddCounter("ORG.Persistent.GroupCapacityGrowth");
-		}
-		for (const auto mainIndex : structural) {
-			auto& transaction = ensureEdit();
-			auto& main = state.mainPasses[mainIndex];
-			auto& any = m_masterPassList[main.masterIndex];
-			std::visit([&](auto& value) {
-				using T = std::decay_t<decltype(value)>;
-				if constexpr (!std::is_same_v<T, std::monostate>) {
-					auto found = relowered.find(mainIndex);
-					auto lowered = found != relowered.end() ? std::move(found->second)
-						: LowerLegacyPass(*this, _registry, m_queueRegistry, primaryBackend, value, any.type, mainIndex);
-					std::vector<Resource*> resources;
-					for (const auto& use : lowered.entries) resources.push_back(use.resource);
-					for (const auto& group : lowered.groups) for (const auto& [id, resource] : group.members) resources.push_back(resource);
-					MaterializePersistentStandalone(resources, true);
-					InstallMainPass(*this, state, transaction, main, std::move(lowered), mainIndex, true);
-					basic_telemetry::AddCounter("ORG.Persistent.StructuralPassRelowerings");
-				}
-			}, any.pass);
-		}
-		// Backing rotation, in the same transaction: a rotating wrapper and a
-		// group slot that tracks the same backing must move together, or the
-		// backing's equivalence class changes between the two edits (structural).
+		// Backing rotation, in the same transaction as membership: a rotating
+		// wrapper and a group slot that tracks the same backing must move
+		// together, or the backing's equivalence class changes between the two
+		// edits (structural).
 		size_t rotated = 0;
 		{
 			BT_ZONE_SCOPE("ORG.Persistent.PollBackings");
@@ -1039,19 +1156,17 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 			BT_PLOT("ORG.Persistent.RotatedBindings", static_cast<int64_t>(rotated));
 		}
 		if (edit) {
-			const bool structuralBuild = !structural.empty() || !growGroups.empty();
 			BT_ZONE_SCOPE("ORG.Persistent.InlineEditBuild");
-			std::shared_ptr<const persistent::SelectedPublication> ready;
-			if (structuralBuild) ready = BuildPersistentStructural(*edit);
-			else {
-				std::atomic_bool cancelled{false};
-				ready = edit->Build(compiler.synchronousCompileWorkspace, cancelled);
-			}
+			std::atomic_bool cancelled{false};
+			auto ready = edit->Build(compiler.synchronousCompileWorkspace, cancelled);
 			if (!ready || !state.program.Install(*edit, ready)) throw std::runtime_error("Persistent edit failed to install");
-			if (structuralBuild) { ++state.structuralBuilds; basic_telemetry::AddCounter("ORG.Persistent.StructuralBuilds"); }
-			else ++state.bindingBuilds;
+			++state.bindingBuilds;
 			if (rotated) basic_telemetry::AddCounter("ORG.Persistent.BindingEdits", static_cast<int64_t>(rotated));
 		}
+		// Structural edits build on a worker against the publication that now
+		// includes this frame's binding edits.
+		if (!state.pending && (!structural.empty() || !growGroups.empty()))
+			SubmitPersistentStructuralBuild(structural, growGroups, primaryBackend);
 	}
 	// 3. Select and prepare the main segment.
 	auto selected = state.program.Select();
@@ -1120,9 +1235,19 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 	main.rebindings = std::move(rebindings);
 	main.legacyBindings = preparation.bindings;
 	main.invocations.resize(selected->logical->passSlots.size());
-	main.names.resize(selected->logical->passSlots.size());
 	{
 		BT_ZONE_SCOPE("ORG.Persistent.PrepareInvocations");
+		auto passPreparation = preparation;
+		state.prepareCostByMain.resize(state.mainPasses.size());
+		// Pass names per logical slot only change with the executable.
+		const bool namesDirty = !state.mainNames || state.mainNamesExecutable != selected->executable.get();
+		std::shared_ptr<std::vector<std::string>> mainNames;
+		if (namesDirty) {
+			mainNames = std::make_shared<std::vector<std::string>>(selected->logical->passSlots.size());
+			state.mainNames = mainNames;
+			state.mainNamesExecutable = selected->executable.get();
+		}
+		main.names = state.mainNames;
 		for (uint32_t mainIndex = 0; mainIndex < state.mainPasses.size(); ++mainIndex) {
 			auto& pass = state.mainPasses[mainIndex];
 			if (pass.slotsDirty || pass.slotsExecutable != selected->executable.get()) {
@@ -1131,6 +1256,7 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 					const auto& entry = state.entries[entryIndex];
 					if (!entry.resource || (!entry.isBound && !entry.swapchain)) return;
 					const auto slot = entry.slot.index;
+					if (slot >= selected->bindings.Size()) return; // reserved by a pending structural build
 					slots->emplace_back(entry.resourceID, slot);
 					slots->emplace_back(entry.resource->GetGlobalResourceID(), slot);
 					if (auto* concrete = UnwrapDynamic(entry.resource)) slots->emplace_back(concrete->GetGlobalResourceID(), slot);
@@ -1168,15 +1294,16 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 					slots->erase(std::remove_if(slots->begin(), slots->end(),
 						[&](const auto& pair) { return std::binary_search(removes.begin(), removes.end(), pair); }), slots->end());
 				}
-				slots->insert(slots->end(), pass.slotAdds.begin(), pass.slotAdds.end());
+				for (const auto& add : pass.slotAdds)
+					if (add.second < selected->bindings.Size()) slots->push_back(add);
 				std::sort(slots->begin(), slots->end());
 				slots->erase(std::unique(slots->begin(), slots->end()), slots->end());
 				slots->sorted = true;
 				pass.slots = std::move(slots);
 				pass.slotAdds.clear(); pass.slotRemoves.clear();
 			}
+			if (pass.id.index >= main.invocations.size()) continue; // added by a pending structural build
 			auto& any = m_masterPassList[pass.masterIndex];
-			auto passPreparation = preparation;
 			passPreparation.resourceSlots = pass.slots;
 			PreparedPass packet;
 			const auto prepareStarted = std::chrono::steady_clock::now();
@@ -1193,13 +1320,13 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 			}
 			if (!packet) throw std::runtime_error("Pass '" + any.name + "' has no owned preparation; persistent execution requires PrepareFrame");
 			{
-				auto& cost = state.prepareCostByPass[any.name];
+				auto& cost = state.prepareCostByMain[mainIndex];
 				cost.first += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - prepareStarted).count());
 				++cost.second;
 			}
 			packet.SetDebugName(any.name);
 			main.invocations[pass.id.index] = std::move(packet);
-			main.names[pass.id.index] = any.name;
+			if (namesDirty) (*mainNames)[pass.id.index] = any.name;
 			// External waits (explicit + resolver-provided) become per-frame producer waits.
 			auto appendWait = [&](const ExternalTimelinePoint& wait) {
 				if (!wait.timeline || !wait.value) return;
@@ -1228,17 +1355,18 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 	{
 		BT_ZONE_SCOPE("ORG.Persistent.PrepareDynamicSegments");
 		auto buildSegment = [&](const char* label, std::span<const size_t> masterIndices,
-			std::vector<AnyPassAndResources>& extensionPasses, bool immediate) -> std::optional<PersistentExecutionState::PreparedSegment> {
+			std::vector<AnyPassAndResources>& extensionPasses, bool immediate,
+			PersistentExecutionState::SegmentCache& cache,
+			std::vector<std::unique_ptr<PersistentExecutionState::SegmentProgram>>& programs) -> std::optional<PersistentExecutionState::PreparedSegment> {
 			struct Entry { persistent::ResourceSlotId slot; Resource* resource; CompileResourceShape shape; };
 			std::vector<AnyPassAndResources*> passes;
 			for (const auto masterIndex : masterIndices) passes.push_back(&m_masterPassList[masterIndex]);
 			for (auto& pass : extensionPasses) passes.push_back(&pass);
 			if (passes.empty()) return std::nullopt;
-			persistent::GraphProgram program;
-			auto edit = program.BeginEdit();
-			edit.SetQueues(RegistryQueues(m_queueRegistry));
 			std::unordered_map<uint64_t, uint32_t> entriesByID;
-			std::vector<Entry> entries;
+			std::vector<Entry> entries;               // slot index == entry index (fresh path)
+			std::vector<LoweredPass> loweredPasses;
+			std::vector<AnyPassAndResources*> loweredOwners; // parallel to loweredPasses
 			std::vector<persistent::PassId> ids;
 			std::vector<PreparedPass> packets;
 			std::vector<std::string> names;
@@ -1247,11 +1375,10 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 			auto slotFor = [&](Resource* resource) -> uint32_t {
 				const auto id = resource->GetSchedulingResourceID();
 				if (const auto found = entriesByID.find(id); found != entriesByID.end()) return found->second;
-				const auto shape = ShapeOf(*resource);
-				const auto slot = edit.ReserveResource(shape);
-				entries.push_back({slot, resource, shape});
-				entriesByID.emplace(id, slot.index);
-				return slot.index;
+				const auto index = static_cast<uint32_t>(entries.size());
+				entries.push_back({persistent::ResourceSlotId{index, 0}, resource, ShapeOf(*resource)});
+				entriesByID.emplace(id, index);
+				return index;
 			};
 			BT_ZONE_SCOPE("ORG.Persistent.DynamicSegment");
 			for (uint32_t passIndex = 0; passIndex < passes.size(); ++passIndex) {
@@ -1261,11 +1388,14 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 				struct CostScope {
 					State& state; const std::string& name; std::chrono::steady_clock::time_point started;
 					~CostScope() {
-						auto& cost = state.prepareCostByPass["lower:" + name];
-						cost.first += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
-						++cost.second;
+						// Extension passes are recreated per frame; only master-list passes are tracked.
+						auto found = state.prepareCostByPass.find(name);
+						if (found == state.prepareCostByPass.end()) return;
+						found->second.first += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
+						++found->second.second;
 					}
 				} costScope{state, any.name, lowerStarted};
+				if (passIndex < masterIndices.size()) state.prepareCostByPass.try_emplace(any.name);
 				std::visit([&](auto& value) {
 					using T = std::decay_t<decltype(value)>;
 					if constexpr (!std::is_same_v<T, std::monostate>) {
@@ -1326,30 +1456,365 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 						std::vector<Resource*> resources;
 						for (const auto& use : lowered.entries) resources.push_back(use.resource);
 						MaterializePersistentStandalone(resources);
-						const auto id = edit.AddPass(std::move(lowered.declaration));
-						std::unordered_map<uint32_t, persistent::BindingToken> tokens;
-						for (const auto& use : lowered.entries) tokens[slotFor(use.resource)] = edit.Declare(id, entries[slotFor(use.resource)].slot, use.range, use.state);
-						for (const auto& use : lowered.exits) {
-							const auto slot = slotFor(use.resource);
-							auto found = tokens.find(slot);
-							if (found == tokens.end()) found = tokens.emplace(slot, edit.DeclareDependency(id, entries[slot].slot, use.state.write)).first;
-							edit.DeclarePostcondition(found->second, use.range, use.state);
-						}
-						for (const auto& wait : lowered.explicitWaits) waits.emplace_back(static_cast<uint32_t>(ids.size()), wait);
-						ids.push_back(id);
+						for (const auto& use : lowered.entries) slotFor(use.resource);
+						for (const auto& use : lowered.exits) slotFor(use.resource);
+						for (const auto& wait : lowered.explicitWaits) waits.emplace_back(static_cast<uint32_t>(loweredPasses.size()), wait);
+						loweredPasses.push_back(std::move(lowered));
+						loweredOwners.push_back(&any);
 						packets.push_back(std::move(packet));
 						names.push_back(any.name);
 					}
 				}, any.pass);
 			}
-			if (ids.empty()) return std::nullopt;
+			if (loweredPasses.empty()) return std::nullopt;
+
+			// Packets, names and waits over a selected publication; shared by the
+			// persistent segment program and the fresh (fallback) build.
+			auto finish = [&](std::shared_ptr<const persistent::SelectedPublication> ready,
+				std::shared_ptr<const FrozenExecutionBindings> legacyBindings, std::span<const persistent::PassId> passIds,
+				std::vector<persistent::FrameRebinding> segmentRebindings,
+				auto&& slotsForPass) -> PersistentExecutionState::PreparedSegment {
+				PersistentExecutionState::PreparedSegment segment;
+				segment.label = label;
+				segment.publication = ready;
+				segment.legacyBindings = std::move(legacyBindings);
+				segment.rebindings = std::move(segmentRebindings);
+				segment.invocations.resize(ready->logical->passSlots.size());
+				auto segmentNames = std::make_shared<std::vector<std::string>>(ready->logical->passSlots.size());
+				auto segmentPreparation = preparation;
+				segmentPreparation.bindings = segment.legacyBindings;
+				{
+				BT_ZONE_SCOPE("ORG.Persistent.DynamicSegment.Prepare");
+				for (size_t i = 0; i < passIds.size(); ++i) {
+					auto& any = *loweredOwners[i];
+					if (!packets[i]) {
+						auto passPreparation = segmentPreparation;
+						passPreparation.resourceSlots = slotsForPass(i);
+						try {
+							packets[i] = std::visit([&](auto& value) -> PreparedPass {
+								using T = std::decay_t<decltype(value)>;
+								if constexpr (std::is_same_v<T, std::monostate>) return {};
+								else return value.pass->PrepareFrame(passPreparation);
+							}, any.pass);
+						} catch (const std::exception& e) {
+							throw std::runtime_error("Pass '" + any.name + "' persistent preparation failed: " + e.what());
+						}
+						if (!packets[i]) throw std::runtime_error("Pass '" + any.name + "' has no owned preparation for the " + label + " segment");
+					}
+					packets[i].SetDebugName(any.name);
+					segment.invocations[passIds[i].index] = std::move(packets[i]);
+					(*segmentNames)[passIds[i].index] = names[i];
+				}
+				}
+				segment.names = std::move(segmentNames);
+				for (const auto& [passIndex, wait] : waits) {
+					if (!wait.timeline || !wait.value) continue;
+					const auto handle = wait.timeline.GetHandle();
+					uint64_t identity = 0;
+					for (const auto& binding : segment.foreignTimelines)
+						if (binding.handle.index == handle.index && binding.handle.generation == handle.generation) identity = binding.identity;
+					for (size_t slot = 0; slot < m_queueRegistry.SlotCount() && !identity; ++slot) {
+						const auto fence = m_queueRegistry.GetFence(static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot))).GetHandle();
+						if (fence.index == handle.index && fence.generation == handle.generation) identity = slot + 1;
+					}
+					if (!identity) {
+						identity = m_queueRegistry.SlotCount() + 1 + segment.foreignTimelines.size();
+						segment.foreignTimelines.push_back({identity, handle});
+					}
+					segment.waits.push_back({passIds[passIndex], {identity, wait.value}});
+				}
+				return segment;
+			};
+			// Registry-handle identities a legacy pass may resolve in addition to
+			// the scheduling/global identities every bound slot exposes.
+			auto appendRequirementIDs = [&](AnyPassAndResources& any, FramePreparationContext::ResourceSlots& slots,
+				auto&& slotOfSchedulingID) {
+				const auto view = GetPassView(any);
+				for (const auto& requirement : view.reqs) {
+					auto* resource = requirement.resourceHandleAndRange.resource.IsEphemeral()
+						? requirement.resourceHandleAndRange.resource.GetEphemeralPtr() : _registry.Resolve(requirement.resourceHandleAndRange.resource);
+					if (!resource) continue;
+					const auto slot = slotOfSchedulingID(resource->GetSchedulingResourceID());
+					if (slot != UINT32_MAX) slots.emplace_back(requirement.resourceHandleAndRange.resource.GetGlobalResourceID(), slot);
+				}
+			};
+
+			// ---- Persistent segment program: bind this frame's resource set into
+			// reserved-capacity groups; no relowering into a new program, no compile
+			// unless the pass structure or a pool's capacity changes.
+			auto persistentSegment = [&]() -> std::optional<PersistentExecutionState::PreparedSegment> {
+				using Program = PersistentExecutionState::SegmentProgram;
+				struct Want { uint32_t pass; uint64_t templateHash; uint64_t physical; Resource* resource; RotationKey key; };
+				std::vector<Want> wants;
+				std::vector<uint64_t> key;
+				key.push_back(loweredPasses.size());
+				std::vector<std::vector<std::pair<uint64_t, Program::Template>>> passTemplates(loweredPasses.size());
+				for (size_t p = 0; p < loweredPasses.size(); ++p) {
+					const auto& lowered = loweredPasses[p];
+					// Postconditions and swapchain images stay on the fresh build.
+					if (!lowered.exits.empty() || !lowered.groups.empty()) return std::nullopt;
+					key.push_back(std::hash<std::string_view>{}(names[p]));
+					key.push_back(FingerprintDeclaration(lowered.declaration));
+					auto& templates = passTemplates[p];
+					for (const auto& use : lowered.entries) {
+						if (IsSwapchainResource(*use.resource)) return std::nullopt;
+						const auto rotation = RotationKeyOfResource(*use.resource);
+						if (!rotation.concreteID) return std::nullopt;
+						const Program::Template request{ShapeOf(*use.resource), use.range, use.state};
+						const auto hash = HashSegmentTemplate(request);
+						if (std::none_of(templates.begin(), templates.end(), [&](const auto& e) { return e.first == hash; })) templates.emplace_back(hash, request);
+						wants.push_back({static_cast<uint32_t>(p), hash, rotation.concreteID, use.resource, rotation});
+					}
+				}
+				// One slot per physical backing: bound in two pools it would form a
+				// multi-slot equivalence class, which is structural and changes with
+				// every frame the pairing differs.
+				std::sort(wants.begin(), wants.end(), [](const Want& a, const Want& b) {
+					return std::tie(a.physical, a.pass, a.templateHash) < std::tie(b.physical, b.pass, b.templateHash); });
+				for (size_t i = 1; i < wants.size(); ++i)
+					if (wants[i].physical == wants[i - 1].physical
+						&& (wants[i].pass != wants[i - 1].pass || wants[i].templateHash != wants[i - 1].templateHash)) {
+						basic_telemetry::AddCounter("ORG.Persistent.SegmentPoolConflicts");
+						return std::nullopt;
+					}
+				const auto allWants = wants; // every registry object, for the slot maps
+				wants.erase(std::unique(wants.begin(), wants.end(), [](const Want& a, const Want& b) { return a.physical == b.physical; }), wants.end());
+				// Select the program for this pass structure. Pools and capacities
+				// grow on the same program (structural, rare); the structure key
+				// deliberately excludes them so a new access template or a larger
+				// target set never starts a new program.
+				Program* program = nullptr;
+				for (auto& candidate : programs) if (candidate->key == key) { program = candidate.get(); break; }
+				auto poolIndexOf = [&](const Program& candidate, uint32_t pass, uint64_t templateHash) -> uint32_t {
+					for (const auto index : candidate.passes[pass].pools)
+						if (candidate.pools[index].templateHash == templateHash) return index;
+					return UINT32_MAX;
+				};
+				std::optional<persistent::GraphEditTransaction> edit;
+				if (!program) {
+					BT_ZONE_SCOPE("ORG.Persistent.DynamicSegment.CreateProgram");
+					basic_telemetry::AddCounter("ORG.Persistent.SegmentProgramBuilds");
+					if (programs.size() >= 4) programs.erase(programs.begin());
+					programs.push_back(std::make_unique<Program>());
+					program = programs.back().get();
+					program->key = key;
+					edit.emplace(program->program.BeginEdit());
+					edit->SetQueues(RegistryQueues(m_queueRegistry));
+					for (size_t p = 0; p < loweredPasses.size(); ++p) {
+						Program::Pass pass;
+						pass.id = edit->AddPass(loweredPasses[p].declaration);
+						program->passes.push_back(std::move(pass));
+					}
+				}
+				auto ensureEdit = [&]() -> persistent::GraphEditTransaction& {
+					if (!edit) edit.emplace(program->program.BeginEdit());
+					return *edit;
+				};
+				auto addPositions = [&](Program::Pool& pool, uint32_t count) {
+					const auto more = ensureEdit().ReserveGroupMembers(pool.group, count);
+					for (const auto slot : more) {
+						pool.slots.push_back(slot);
+						if (slot.index >= program->table.size()) program->table.resize(slot.index + 1);
+					}
+					for (uint32_t i = 0; i < count; ++i) pool.free.push_back(pool.capacity + count - 1 - i);
+					pool.capacity += count;
+					pool.physical.resize(pool.capacity, 0);
+					pool.resources.resize(pool.capacity, nullptr);
+					pool.bound.resize(pool.capacity, RotationKey{});
+					pool.isBound.resize(pool.capacity, 0);
+					pool.wanted.resize(pool.capacity, 0);
+				};
+				// Missing templates become new pools; overfull pools double.
+				for (size_t p = 0; p < loweredPasses.size(); ++p)
+					for (const auto& [hash, request] : passTemplates[p]) {
+						if (poolIndexOf(*program, static_cast<uint32_t>(p), hash) != UINT32_MAX) continue;
+						BT_ZONE_SCOPE("ORG.Persistent.DynamicSegment.AddPool");
+						basic_telemetry::AddCounter("ORG.Persistent.SegmentPoolAdds");
+						uint32_t count = 0;
+						for (const auto& want : wants) if (want.pass == p && want.templateHash == hash) ++count;
+						Program::Pool pool;
+						pool.pass = static_cast<uint32_t>(p);
+						pool.templateHash = hash;
+						pool.request = request;
+						pool.group = ensureEdit().AddGroup(request.shape, {});
+						program->passes[p].pools.push_back(static_cast<uint32_t>(program->pools.size()));
+						program->pools.push_back(std::move(pool));
+						addPositions(program->pools.back(), (std::max<uint32_t>)(4, count * 2));
+						ensureEdit().DeclareGroupAccess(program->passes[p].id, program->pools.back().group, request.state, static_cast<uint32_t>(p), request.range);
+					}
+				{
+					std::vector<uint32_t> counts(program->pools.size(), 0);
+					for (const auto& want : wants) ++counts[poolIndexOf(*program, want.pass, want.templateHash)];
+					for (size_t i = 0; i < counts.size(); ++i) {
+						auto& pool = program->pools[i];
+						if (counts[i] <= pool.capacity) continue;
+						basic_telemetry::AddCounter("ORG.Persistent.SegmentPoolGrowth");
+						addPositions(pool, (std::max)(pool.capacity, counts[i] * 2 - pool.capacity));
+					}
+				}
+				auto bindPosition = [&](Program::Pool& pool, uint32_t i, const Want& want) {
+					BT_ZONE_SCOPE("ORG.Persistent.DynamicSegment.Bind");
+					const auto slot = pool.slots[i];
+					auto snapshot = PublicationBindingBundle::Capture(*want.resource);
+					if (!snapshot) throw std::runtime_error(std::string(label) + " segment resource has no backing: " + want.resource->GetName());
+					program->table[slot.index] = {snapshot->resource, snapshot->allocationOwner, snapshot->views, snapshot->descriptorOwner, nullptr};
+					auto binding = CaptureSlotBinding(*want.resource, slot.index, pool.request.shape, std::move(snapshot));
+					if (!binding) throw std::runtime_error(std::string(label) + " segment resource could not be bound: " + want.resource->GetName());
+					auto& transaction = ensureEdit();
+					if (pool.isBound[i]) transaction.ReplaceBinding(slot, std::move(*binding));
+					else transaction.BindReserved(slot, std::move(*binding));
+					pool.isBound[i] = 1;
+					pool.physical[i] = want.physical;
+					pool.resources[i] = want.resource;
+					pool.bound[i] = want.key;
+					pool.positionByPhysical[want.physical] = i;
+				};
+				// Diff against the bound set: rotated backings rebind in place,
+				// departed members vacate, arrivals refill vacated positions first.
+				for (auto& pool : program->pools) std::fill(pool.wanted.begin(), pool.wanted.end(), uint8_t{0});
+				std::vector<std::pair<const Want*, uint32_t>> arriving;
+				size_t rebound = 0;
+				for (const auto& want : wants) {
+					const auto poolIndex = poolIndexOf(*program, want.pass, want.templateHash);
+					auto& pool = program->pools[poolIndex];
+					const auto found = pool.positionByPhysical.find(want.physical);
+					if (found == pool.positionByPhysical.end()) { arriving.emplace_back(&want, poolIndex); continue; }
+					pool.wanted[found->second] = 1;
+					if (pool.bound[found->second] != want.key) { bindPosition(pool, found->second, want); ++rebound; }
+				}
+				for (auto& pool : program->pools) {
+					pool.vacated.clear();
+					for (uint32_t i = 0; i < pool.capacity; ++i) {
+						if (!pool.physical[i] || pool.wanted[i]) continue;
+						pool.positionByPhysical.erase(pool.physical[i]);
+						pool.physical[i] = 0;
+						pool.resources[i] = nullptr;
+						pool.vacated.push_back(i);
+					}
+					std::sort(pool.vacated.begin(), pool.vacated.end(), std::greater<>());
+					std::sort(pool.free.begin(), pool.free.end(), std::greater<>());
+				}
+				for (const auto& [want, poolIndex] : arriving) {
+					auto& pool = program->pools[poolIndex];
+					uint32_t i;
+					if (!pool.vacated.empty()) { i = pool.vacated.back(); pool.vacated.pop_back(); }
+					else if (!pool.free.empty()) { i = pool.free.back(); pool.free.pop_back(); }
+					else throw std::logic_error("Dynamic segment pool capacity accounting mismatch");
+					bindPosition(pool, i, *want);
+				}
+				size_t unbound = 0;
+				for (auto& pool : program->pools) {
+					for (const auto i : pool.vacated) {
+						if (pool.isBound[i]) {
+							ensureEdit().Unbind(pool.slots[i]);
+							pool.isBound[i] = 0;
+							pool.bound[i] = RotationKey{};
+							program->table[pool.slots[i].index] = {};
+							++unbound;
+						}
+						pool.free.push_back(i);
+					}
+					pool.vacated.clear();
+				}
+				if (edit) {
+					BT_ZONE_SCOPE("ORG.Persistent.BuildDynamicSegment");
+					BT_ZONE_VALUE(static_cast<int64_t>(arriving.size() + rebound + unbound));
+					std::atomic_bool cancelled{false};
+					auto ready = edit->Build(compiler.synchronousCompileWorkspace, cancelled);
+					if (!ready || !program->program.Install(*edit, ready)) throw std::runtime_error(std::string(label) + " segment program failed to build");
+					program->publication = std::move(ready);
+					program->legacyBindings = FrozenExecutionBindings::Sparse(program->table);
+					basic_telemetry::AddCounter("ORG.Persistent.SegmentBindingBuilds");
+				} else basic_telemetry::AddCounter("ORG.Persistent.SegmentReuses");
+				++program->frames;
+				std::vector<persistent::PassId> passIds;
+				for (const auto& pass : program->passes) passIds.push_back(pass.id);
+				// Slot maps for legacy (non-immediate) passes: every identity of every
+				// bound registry object, plus the pass's registry-handle identities.
+				std::shared_ptr<FramePreparationContext::ResourceSlots> base;
+				auto slotOfPhysical = [&](uint64_t physical) -> uint32_t {
+					for (const auto& pool : program->pools)
+						if (const auto found = pool.positionByPhysical.find(physical); found != pool.positionByPhysical.end())
+							return pool.slots[found->second].index;
+					return UINT32_MAX;
+				};
+				auto slotsForPass = [&](size_t i) -> std::shared_ptr<const FramePreparationContext::ResourceSlots> {
+					if (!base) {
+						base = std::make_shared<FramePreparationContext::ResourceSlots>();
+						for (const auto& want : allWants) {
+							const auto slot = slotOfPhysical(want.physical);
+							if (slot == UINT32_MAX) continue;
+							base->emplace_back(want.resource->GetSchedulingResourceID(), slot);
+							base->emplace_back(want.resource->GetGlobalResourceID(), slot);
+							base->emplace_back(want.physical, slot);
+						}
+					}
+					auto slots = std::make_shared<FramePreparationContext::ResourceSlots>(*base);
+					appendRequirementIDs(*loweredOwners[i], *slots, [&](uint64_t schedulingID) -> uint32_t {
+						for (const auto& want : allWants)
+							if (want.resource->GetSchedulingResourceID() == schedulingID) return slotOfPhysical(want.physical);
+						return UINT32_MAX;
+					});
+					std::sort(slots->begin(), slots->end());
+					slots->erase(std::unique(slots->begin(), slots->end()), slots->end());
+					slots->sorted = true;
+					return slots;
+				};
+				return finish(program->publication, program->legacyBindings, passIds, {}, slotsForPass);
+			};
+			if (auto segment = persistentSegment()) return segment;
+			basic_telemetry::AddCounter("ORG.Persistent.SegmentFreshBuilds");
+
+			// ---- Fresh build (fallback): a throwaway program for this frame.
+			// Reuse key: lowered structure of every pass plus the exact backing bound
+			// to every entry. Swapchain entries are rebound per frame and never cached.
+			std::vector<uint64_t> key;
+			key.reserve(loweredPasses.size() + entries.size() * 5 + 1);
+			key.push_back(loweredPasses.size());
+			for (const auto& lowered : loweredPasses) key.push_back(FingerprintLowering(lowered));
+			bool cacheable = true;
+			for (const auto& entry : entries) {
+				if (IsSwapchainResource(*entry.resource)) { cacheable = false; break; }
+				const auto rotation = RotationKeyOfResource(*entry.resource);
+				key.push_back(entry.resource->GetSchedulingResourceID());
+				key.push_back(rotation.concreteID); key.push_back(rotation.backingGeneration);
+				key.push_back(reinterpret_cast<uintptr_t>(rotation.views));
+				key.push_back((uint64_t{rotation.apiGeneration} << 32) | rotation.apiIndex);
+			}
+			std::shared_ptr<const persistent::SelectedPublication> ready;
+			std::shared_ptr<const FrozenExecutionBindings> legacyBindings;
+			if (cacheable && cache.publication && cache.key == key) {
+				basic_telemetry::AddCounter("ORG.Persistent.DynamicSegmentReuses");
+				ready = cache.publication;
+				legacyBindings = cache.legacyBindings;
+				ids = cache.ids;
+			} else {
+			persistent::GraphProgram program;
+			auto edit = program.BeginEdit();
+			edit.SetQueues(RegistryQueues(m_queueRegistry));
+			for (auto& entry : entries) {
+				const auto slot = edit.ReserveResource(entry.shape);
+				if (slot.index != entry.slot.index) throw std::logic_error("Dynamic segment slot allocation is not dense");
+				entry.slot = slot;
+			}
+			for (auto& lowered : loweredPasses) {
+				const auto id = edit.AddPass(std::move(lowered.declaration));
+				std::unordered_map<uint32_t, persistent::BindingToken> tokens;
+				for (const auto& use : lowered.entries) tokens[slotFor(use.resource)] = edit.Declare(id, entries[slotFor(use.resource)].slot, use.range, use.state);
+				for (const auto& use : lowered.exits) {
+					const auto slot = slotFor(use.resource);
+					auto found = tokens.find(slot);
+					if (found == tokens.end()) found = tokens.emplace(slot, edit.DeclareDependency(id, entries[slot].slot, use.state.write)).first;
+					edit.DeclarePostcondition(found->second, use.range, use.state);
+				}
+				ids.push_back(id);
+			}
 			std::vector<FrozenExecutionBindings::ResourceBinding> table(entries.size());
 			{
 			BT_ZONE_SCOPE("ORG.Persistent.DynamicSegment.Bind");
 			for (uint32_t index = 0; index < entries.size(); ++index) {
 				auto& entry = entries[index];
-				const bool swapchain = entry.resource->GetName() == "Backbuffer" && dynamic_cast<DynamicResource*>(entry.resource)
-					&& !dynamic_cast<BackedResource*>(UnwrapDynamic(entry.resource));
+				const bool swapchain = IsSwapchainResource(*entry.resource);
 				auto snapshot = PublicationBindingBundle::Capture(*entry.resource);
 				if (!snapshot) throw std::runtime_error(std::string(label) + " segment resource has no backing: " + entry.resource->GetName());
 				table[index] = {snapshot->resource, snapshot->allocationOwner, snapshot->views, snapshot->descriptorOwner, nullptr};
@@ -1373,80 +1838,35 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 			}
 			}
 			std::atomic_bool cancelled{false};
-			auto ready = [&] {
+			ready = [&] {
 				BT_ZONE_SCOPE("ORG.Persistent.BuildDynamicSegment");
 				return edit.Build(compiler.synchronousCompileWorkspace, cancelled);
 			}();
 			if (!ready || !program.Install(edit, ready)) throw std::runtime_error(std::string(label) + " segment failed to build");
-			PersistentExecutionState::PreparedSegment segment;
-			segment.label = label;
-			segment.publication = ready;
-			segment.legacyBindings = FrozenExecutionBindings::Sparse(std::move(table));
-			segment.rebindings = std::move(rebindings);
-			segment.invocations.resize(ready->logical->passSlots.size());
-			segment.names.resize(ready->logical->passSlots.size());
-			auto segmentPreparation = preparation;
-			segmentPreparation.bindings = segment.legacyBindings;
-			{
-			BT_ZONE_SCOPE("ORG.Persistent.DynamicSegment.Prepare");
-			for (size_t i = 0; i < ids.size(); ++i) {
-				auto& any = *passes[i];
-				if (!packets[i]) {
-					auto slots = std::make_shared<FramePreparationContext::ResourceSlots>();
-					for (const auto& entry : entries) {
-						slots->emplace_back(entry.resource->GetSchedulingResourceID(), entry.slot.index);
-						slots->emplace_back(entry.resource->GetGlobalResourceID(), entry.slot.index);
-						if (auto* concrete = UnwrapDynamic(entry.resource)) slots->emplace_back(concrete->GetGlobalResourceID(), entry.slot.index);
-					}
-					const auto view = GetPassView(any);
-					for (const auto& requirement : view.reqs) {
-						auto* resource = requirement.resourceHandleAndRange.resource.IsEphemeral()
-							? requirement.resourceHandleAndRange.resource.GetEphemeralPtr() : _registry.Resolve(requirement.resourceHandleAndRange.resource);
-						if (!resource) continue;
-						if (const auto found = entriesByID.find(resource->GetSchedulingResourceID()); found != entriesByID.end())
-							slots->emplace_back(requirement.resourceHandleAndRange.resource.GetGlobalResourceID(), found->second);
-					}
-					std::sort(slots->begin(), slots->end());
-					slots->erase(std::unique(slots->begin(), slots->end()), slots->end());
-					slots->sorted = true;
-					auto passPreparation = segmentPreparation;
-					passPreparation.resourceSlots = std::move(slots);
-					try {
-						packets[i] = std::visit([&](auto& value) -> PreparedPass {
-							using T = std::decay_t<decltype(value)>;
-							if constexpr (std::is_same_v<T, std::monostate>) return {};
-							else return value.pass->PrepareFrame(passPreparation);
-						}, any.pass);
-					} catch (const std::exception& e) {
-						throw std::runtime_error("Pass '" + any.name + "' persistent preparation failed: " + e.what());
-					}
-					if (!packets[i]) throw std::runtime_error("Pass '" + any.name + "' has no owned preparation for the " + label + " segment");
-				}
-				packets[i].SetDebugName(any.name);
-				segment.invocations[ids[i].index] = std::move(packets[i]);
-				segment.names[ids[i].index] = names[i];
+			legacyBindings = FrozenExecutionBindings::Sparse(std::move(table));
+			if (cacheable) cache = {std::move(key), ready, legacyBindings, ids};
+			else cache = {};
 			}
-			}
-			for (const auto& [passIndex, wait] : waits) {
-				if (!wait.timeline || !wait.value) continue;
-				const auto handle = wait.timeline.GetHandle();
-				uint64_t identity = 0;
-				for (const auto& binding : segment.foreignTimelines)
-					if (binding.handle.index == handle.index && binding.handle.generation == handle.generation) identity = binding.identity;
-				for (size_t slot = 0; slot < m_queueRegistry.SlotCount() && !identity; ++slot) {
-					const auto fence = m_queueRegistry.GetFence(static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot))).GetHandle();
-					if (fence.index == handle.index && fence.generation == handle.generation) identity = slot + 1;
+			auto slotsForPass = [&](size_t i) -> std::shared_ptr<const FramePreparationContext::ResourceSlots> {
+				auto slots = std::make_shared<FramePreparationContext::ResourceSlots>();
+				for (const auto& entry : entries) {
+					slots->emplace_back(entry.resource->GetSchedulingResourceID(), entry.slot.index);
+					slots->emplace_back(entry.resource->GetGlobalResourceID(), entry.slot.index);
+					if (auto* concrete = UnwrapDynamic(entry.resource)) slots->emplace_back(concrete->GetGlobalResourceID(), entry.slot.index);
 				}
-				if (!identity) {
-					identity = m_queueRegistry.SlotCount() + 1 + segment.foreignTimelines.size();
-					segment.foreignTimelines.push_back({identity, handle});
-				}
-				segment.waits.push_back({ids[passIndex], {identity, wait.value}});
-			}
-			return segment;
+				appendRequirementIDs(*loweredOwners[i], *slots, [&](uint64_t schedulingID) -> uint32_t {
+					const auto found = entriesByID.find(schedulingID);
+					return found == entriesByID.end() ? UINT32_MAX : found->second;
+				});
+				std::sort(slots->begin(), slots->end());
+				slots->erase(std::unique(slots->begin(), slots->end()), slots->end());
+				slots->sorted = true;
+				return slots;
+			};
+			return finish(ready, legacyBindings, ids, std::move(rebindings), slotsForPass);
 		};
 		std::vector<AnyPassAndResources> none;
-		state.pre = buildSegment("Pre", state.preMasterIndices, none, true);
+		state.pre = buildSegment("Pre", state.preMasterIndices, none, true, state.preCache, state.prePrograms);
 		// Per-frame extension passes are materialized fresh, as the legacy path does.
 		auto& frameExt = compiler.frameExtensions;
 		frameExt.clear();
@@ -1456,15 +1876,33 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 			if (d.type == PassType::Unknown || (std::holds_alternative<std::monostate>(d.pass) && !d.unifiedPass) || d.name.empty()) continue;
 			state.frameExtensionPasses.push_back(MaterializeExternalPass(d, true, false));
 		}
-		state.tail = buildSegment("Tail", state.tailMasterIndices, state.frameExtensionPasses, false);
+		state.tail = buildSegment("Tail", state.tailMasterIndices, state.frameExtensionPasses, false, state.tailCache, state.tailPrograms);
 	}
-	if (state.frameNumber % 900 == 0 && !state.prepareCostByPass.empty()) {
+	if (state.frameNumber % 900 == 0 && (!state.prepareCostByPass.empty() || !state.prepareCostByMain.empty())) {
 		std::vector<std::pair<std::string, std::pair<uint64_t, uint64_t>>> rows(state.prepareCostByPass.begin(), state.prepareCostByPass.end());
+		for (uint32_t i = 0; i < state.prepareCostByMain.size() && i < state.mainPasses.size(); ++i)
+			if (state.prepareCostByMain[i].second) rows.emplace_back(state.mainPasses[i].name, state.prepareCostByMain[i]);
 		std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second.first > b.second.first; });
 		std::string text;
-		for (size_t i = 0; i < rows.size() && i < 16; ++i)
+		for (size_t i = 0; i < rows.size() && i < 48; ++i)
 			text += rows[i].first + "=" + std::to_string(rows[i].second.first / (std::max<uint64_t>)(1, rows[i].second.second) / 1000) + "us x" + std::to_string(rows[i].second.second) + "; ";
 		spdlog::info("Persistent preparation cost top passes (mean per call): {}", text);
+		std::string reuse;
+		{
+			std::lock_guard<std::mutex> lock(InvocationReuseRegistryMutex());
+			for (const auto* stats : InvocationReuseRegistry()) {
+				const uint64_t hits = stats->hits.load();
+				const uint64_t misses = stats->misses.load();
+				reuse += std::string(stats->name) + " hits=" + std::to_string(hits) + " misses=" + std::to_string(misses)
+					+ " check=" + std::to_string(stats->checkNs.load() / (std::max<uint64_t>)(1, hits + misses) / 1000) + "us"
+					+ " build=" + std::to_string(stats->buildNs.load() / (std::max<uint64_t>)(1, misses) / 1000) + "us"
+					+ " package=" + std::to_string(stats->packageNs.load() / (std::max<uint64_t>)(1, hits) / 1000) + "us"
+					+ " [rev=" + std::to_string(stats->revisionNs.load() / (std::max<uint64_t>)(1, hits + misses)) + "ns"
+					+ " bind=" + std::to_string(stats->bindingNs.load() / (std::max<uint64_t>)(1, hits + misses)) + "ns"
+					+ " desc=" + std::to_string(stats->descriptorNs.load() / (std::max<uint64_t>)(1, hits + misses)) + "ns]; ";
+			}
+		}
+		spdlog::info("Invocation reuse: {}", reuse);
 	}
 	BT_PLOT("ORG.Persistent.StructuralBuildsTotal", static_cast<int64_t>(state.structuralBuilds));
 	BT_PLOT("ORG.Persistent.BindingBuildsTotal", static_cast<int64_t>(state.bindingBuilds));
@@ -1553,6 +1991,201 @@ std::shared_ptr<const persistent::SelectedPublication> RenderGraph::BuildPersist
 	auto ready = edit.Build(compiler.synchronousCompileWorkspace, cancelled);
 	if (!ready) throw std::runtime_error("Persistent structural build failed (placement)");
 	return ready;
+}
+
+void RenderGraph::RunPersistentStructuralBuildPhase(bool validated) {
+	auto& compiler = *m_compilerState;
+	auto pending = compiler.persistent->pending;
+	auto run = [pending, validated] {
+		BT_ZONE_SCOPE("ORG.Persistent.WorkerBuild");
+		try {
+			std::shared_ptr<const persistent::SelectedPublication> ready;
+			try {
+				ready = pending->edit->Build(pending->workspace, pending->cancelled, validated);
+			} catch (const std::exception& e) {
+				if (validated) throw;
+				// Stale placement orderings can contradict a new dependency: schedule
+				// without them (the planner recomputes every ordering it needs).
+				spdlog::warn("Persistent schedule build failed with stale placement orderings ({}); retrying without them", e.what());
+				basic_telemetry::AddCounter("ORG.Persistent.StalePlacementOrderingRetries");
+				pending->edit->ClearPlacementOrderings();
+				pending->clearedOrderings.store(true, std::memory_order_release);
+				ready = pending->edit->Build(pending->workspace, pending->cancelled, false);
+			}
+			if (!ready) throw std::runtime_error("build produced no publication");
+			pending->result = std::move(ready);
+			pending->phase.store(validated ? 3 : 1, std::memory_order_release);
+		} catch (const std::exception& e) {
+			pending->error = e.what();
+			pending->phase.store(-1, std::memory_order_release);
+		}
+	};
+	pending->phase.store(validated ? 2 : 0, std::memory_order_release);
+	if (!compiler.persistentBuildScope && m_taskService) compiler.persistentBuildScope = m_taskService->CreateScope("ORG.Persistent.Build");
+	if (!m_taskService || !compiler.persistentBuildScope
+		|| !m_taskService->Submit(compiler.persistentBuildScope, runtime::TaskPriority::Streaming, "ORG.Persistent.WorkerBuild", run))
+		run();
+}
+
+// True when the new lowering declares a direct resource or group the pass
+// did not declare before (the live publication has no slot for it).
+static bool LoweringAddsDeclarations(const State::MainPass& main, const LoweredPass& lowered) {
+	for (const auto& use : lowered.entries) {
+		bool known = false;
+		for (const auto& previous : main.loweredDirect) if (previous.first == use.resourceID) { known = true; break; }
+		if (!known) return true;
+	}
+	for (const auto& group : lowered.groups) {
+		bool known = false;
+		for (const auto* key : main.loweredGroupKeys) if (key == group.key.get()) { known = true; break; }
+		if (!known) return true;
+	}
+	return false;
+}
+
+void RenderGraph::SubmitPersistentStructuralBuild(const std::vector<uint32_t>& structural, const std::vector<uint32_t>& growGroups, rhi::Backend primaryBackend) {
+	BT_ZONE_SCOPE("ORG.Persistent.SubmitStructuralBuild");
+	auto& compiler = *m_compilerState;
+	auto& state = *compiler.persistent;
+	// A relowered pass that declares resources the live publication does not
+	// have cannot be prepared against it while the build is pending: such
+	// edits build inline (one frame hitch). Growth, new passes and relowers
+	// that add nothing are safe to build on the worker.
+	bool inlineRequired = false;
+	std::unordered_map<uint32_t, LoweredPass> lowerings;
+	for (const auto mainIndex : structural) {
+		auto& main = state.mainPasses[mainIndex];
+		auto& any = m_masterPassList[main.masterIndex];
+		std::visit([&](auto& value) {
+			using T = std::decay_t<decltype(value)>;
+			if constexpr (!std::is_same_v<T, std::monostate>) {
+				auto lowered = LowerLegacyPass(*this, _registry, m_queueRegistry, primaryBackend, value, any.type, mainIndex);
+				if (LoweringAddsDeclarations(main, lowered)) inlineRequired = true;
+				lowerings.emplace(mainIndex, std::move(lowered));
+			}
+		}, any.pass);
+	}
+	auto pending = std::make_shared<State::PendingStructural>();
+	pending->started = std::chrono::steady_clock::now();
+	pending->base = state.program.Select();
+	pending->baseSlotCount = pending->base->bindings.Size();
+	std::optional<persistent::GraphEditTransaction> inlineEdit;
+	if (inlineRequired) inlineEdit.emplace(state.program.BeginEdit());
+	else pending->edit = std::make_unique<persistent::GraphEditTransaction>(pending->base);
+	persistent::GraphEditTransaction* const transactionPtr = inlineRequired ? &*inlineEdit : pending->edit.get();
+	auto& transaction = *transactionPtr;
+	for (const auto groupIndex : growGroups) {
+		auto& group = state.groups[groupIndex];
+		const auto more = transaction.ReserveGroupMembers(group.group, group.capacity);
+		for (const auto slot : more) {
+			if (slot.index != state.entries.size()) throw std::logic_error("Persistent slot directory expects dense slot allocation");
+			State::SlotEntry entry;
+			entry.slot = slot;
+			entry.shape = group.shape;
+			entry.subscribers = group.subscribers;
+			state.entries.push_back(std::move(entry));
+			group.memberEntries.push_back(slot.index);
+			group.memberResourceIDs.push_back(0);
+			group.freeMembers.push_back(static_cast<uint32_t>(group.memberEntries.size() - 1));
+		}
+		group.capacity *= 2;
+		group.identity = {}; // Re-syncs (binding-only) after the install.
+		pending->touchedGroups.push_back(groupIndex);
+		basic_telemetry::AddCounter("ORG.Persistent.GroupCapacityGrowth");
+	}
+	for (const auto mainIndex : structural) {
+		auto& main = state.mainPasses[mainIndex];
+		auto& any = m_masterPassList[main.masterIndex];
+		std::visit([&](auto& value) {
+			using T = std::decay_t<decltype(value)>;
+			if constexpr (!std::is_same_v<T, std::monostate>) {
+				auto lowered = std::move(lowerings.at(mainIndex));
+				std::vector<Resource*> resources;
+				for (const auto& use : lowered.entries) resources.push_back(use.resource);
+				for (const auto& group : lowered.groups) for (const auto& [id, resource] : group.members) resources.push_back(resource);
+				MaterializePersistentStandalone(resources, true);
+				InstallMainPass(*this, state, transaction, main, std::move(lowered), mainIndex, true);
+				basic_telemetry::AddCounter("ORG.Persistent.StructuralPassRelowerings");
+			}
+		}, any.pass);
+	}
+	if (inlineRequired) {
+		BT_ZONE_SCOPE("ORG.Persistent.InlineStructuralBuild");
+		auto ready = BuildPersistentStructural(*inlineEdit);
+		if (!ready || !state.program.Install(*inlineEdit, ready)) throw std::runtime_error("Persistent structural edit failed to install");
+		++state.structuralBuilds;
+		basic_telemetry::AddCounter("ORG.Persistent.StructuralBuilds");
+		basic_telemetry::AddCounter("ORG.Persistent.StructuralBuildsInline");
+		return;
+	}
+	// Frames keep their current slot maps until the new executable installs.
+	for (uint32_t mainIndex = 0; mainIndex < state.mainPasses.size(); ++mainIndex) {
+		auto& main = state.mainPasses[mainIndex];
+		if (!main.slotsDirty) continue;
+		main.slotsDirty = false;
+		pending->dirtyPasses.push_back(mainIndex);
+	}
+	BindUnboundPersistentEntries(transaction);
+	state.pending = pending;
+	RunPersistentStructuralBuildPhase(false);
+	basic_telemetry::AddCounter("ORG.Persistent.StructuralBuildsSubmitted");
+}
+
+void RenderGraph::AdvancePersistentStructuralBuild(std::vector<uint32_t>& structural) {
+	auto& compiler = *m_compilerState;
+	auto& state = *compiler.persistent;
+	auto pending = state.pending;
+	if (!pending) return;
+	const int phase = pending->phase.load(std::memory_order_acquire);
+	if (phase == 0 || phase == 2) return;
+	if (phase < 0) throw std::runtime_error("Persistent structural build failed: " + pending->error);
+	BT_ZONE_SCOPE("ORG.Persistent.AdvanceStructuralBuild");
+	if (phase == 1) {
+		if (pending->clearedOrderings.exchange(false)) state.aliasEdges.clear();
+		// Unchanged orderings and bindings mean every overlapping pair is still
+		// ordered between all of its users, so the scheduled publication is valid.
+		if (PlanPersistentAliasPlacement(*pending->edit, *pending->result)) {
+			basic_telemetry::AddCounter("ORG.Persistent.PlacedRebuilds");
+			RunPersistentStructuralBuildPhase(true);
+			return;
+		}
+	}
+	// Replay binding edits installed since the base onto the result.
+	auto ready = pending->result;
+	if (!pending->bindingLog.empty()) {
+		BT_ZONE_SCOPE("ORG.Persistent.ReplayBindingLog");
+		persistent::GraphEditTransaction replay(ready);
+		size_t applied = 0;
+		for (const auto& [index, version] : pending->bindingLog) {
+			const auto* current = ready->bindings.TryAt(index);
+			if (!current) continue; // retired by the structural edit
+			const auto slot = ready->bindings.CurrentSlot(index);
+			if (!version) {
+				if (current->bound) { replay.Unbind(slot); ++applied; }
+				continue;
+			}
+			if (current->bound && current->identity == version->identity && current->backingRevision == version->backingRevision
+				&& current->recording == version->recording) continue;
+			if (current->bound) replay.ReplaceBinding(slot, *version);
+			else replay.BindReserved(slot, *version);
+			++applied;
+		}
+		if (applied) {
+			std::atomic_bool cancelled{false};
+			ready = replay.Build(compiler.synchronousCompileWorkspace, cancelled);
+			if (!ready) throw std::runtime_error("Persistent structural build failed to replay binding edits");
+		}
+		BT_ZONE_VALUE(static_cast<int64_t>(applied));
+	}
+	if (!state.program.InstallRebased(ready)) throw std::runtime_error("Persistent structural build failed to install");
+	for (const auto mainIndex : pending->dirtyPasses) state.mainPasses[mainIndex].slotsDirty = true;
+	structural.insert(structural.end(), pending->deferredStructural.begin(), pending->deferredStructural.end());
+	++state.structuralBuilds;
+	basic_telemetry::AddCounter("ORG.Persistent.StructuralBuilds");
+	spdlog::info("Persistent structural build installed: latency_ms={:.2f} replayed={} deferred={}",
+		std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pending->started).count(),
+		pending->bindingLog.size(), pending->deferredStructural.size());
+	state.pending.reset();
 }
 
 // Alias placement over the scheduled executable. Lifetimes are ranks in batch
@@ -2056,7 +2689,7 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 		for (size_t batch = 0; batch < graph.batches.size(); ++batch)
 			for (const auto pass : graph.batches[batch].passes) {
 				const auto prepared = graph.structure->passes[pass].preparedPassIndex;
-				if (prepared >= segment.names.size() || segment.names[prepared] != "PresentationReadyPass") continue;
+				if (!segment.names || prepared >= segment.names->size() || (*segment.names)[prepared] != "PresentationReadyPass") continue;
 				const auto slot = static_cast<QueueSlotIndex>(static_cast<uint8_t>(graph.batches[batch].queue));
 				m_lastPresentDependency = PresentDependency{
 					.queue = m_queueRegistry.GetQueue(slot),

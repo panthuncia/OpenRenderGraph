@@ -71,6 +71,18 @@ struct ResourceAndAccessor {
 	ResourceIndexOrDynamicResource resource;
 	DescriptorAccessor accessor; // Accessor for the descriptor
 	std::shared_ptr<IResourceResolver> resolver;
+	// Classification of the registry object the dynamic handle resolved to
+	// (PeekResourceDescriptorIndex); re-derived when the handle resolves to a
+	// different object.
+	mutable Resource* peekBase = nullptr;
+	mutable DynamicGloballyIndexedResource* peekDynamic = nullptr;
+	mutable GloballyIndexedResource* peekIndexed = nullptr;
+	// Resolver-backed registration: the resolved resource behind the resolver's
+	// declaration version (a Resolve() allocates its list on every call).
+	mutable uint64_t resolvedHint = 0;
+	mutable std::shared_ptr<Resource> resolvedResource;
+	mutable DynamicGloballyIndexedResource* resolvedDynamic = nullptr;
+	mutable GloballyIndexedResource* resolvedIndexed = nullptr;
 };
 
 class ResourceDescriptorIndexHelper {
@@ -186,6 +198,40 @@ public:
 		auto entry = GetResourceIndexOrDynamicResource(h, res, accessor);
 		m_resourceMap[id.hash] = ResourceAndAccessor{ entry, accessor, {} };
 	}
+	// Re-resolution of a previously captured index for change detection:
+	// same result as GetResourceDescriptorIndex(hash, true) but without the
+	// change log, the resolver's resource list, the wrapper's shared lock or
+	// any shared_ptr traffic. Falls back to the full path when a cache is cold.
+	unsigned int PeekResourceDescriptorIndex(size_t hash) const {
+		const auto it = m_resourceMap.find(hash);
+		if (it == m_resourceMap.end()) return (std::numeric_limits<unsigned int>().max)();
+		const auto& entry = it->second;
+		if (entry.resolver) {
+			const auto hint = entry.resolver->DeclarationVersionHint();
+			if (!hint || entry.resolvedHint != hint || !entry.resolvedResource)
+				return GetResourceDescriptorIndex(hash, true);
+			if (entry.resolvedDynamic) {
+				auto* backing = entry.resolvedDynamic->PeekResource();
+				return backing ? AccessGloballyIndexedResource(*backing, entry.accessor) : (std::numeric_limits<unsigned int>().max)();
+			}
+			if (entry.resolvedIndexed) return AccessGloballyIndexedResource(*entry.resolvedIndexed, entry.accessor);
+			return GetResourceDescriptorIndex(hash, true);
+		}
+		if (!entry.resource.isDynamic) return entry.resource.index;
+		Resource* base = m_resourceRegistryView->Resolve<Resource>(entry.resource.handle);
+		if (!base) return GetResourceDescriptorIndex(hash, true);
+		if (base != entry.peekBase) {
+			entry.peekBase = base;
+			entry.peekDynamic = dynamic_cast<DynamicGloballyIndexedResource*>(base);
+			entry.peekIndexed = entry.peekDynamic ? nullptr : dynamic_cast<GloballyIndexedResource*>(base);
+		}
+		if (entry.peekDynamic) {
+			auto* backing = entry.peekDynamic->PeekResource();
+			return backing ? AccessGloballyIndexedResource(*backing, entry.accessor) : (std::numeric_limits<unsigned int>().max)();
+		}
+		if (entry.peekIndexed) return AccessGloballyIndexedResource(*entry.peekIndexed, entry.accessor);
+		return GetResourceDescriptorIndex(hash, true);
+	}
 	unsigned int GetResourceDescriptorIndex(size_t hash, bool allowFail = true, const std::string* name = nullptr) const {
 		auto it = m_resourceMap.find(hash);
 		if (it == m_resourceMap.end()) {
@@ -202,17 +248,34 @@ public:
 		unsigned int resolvedIndex = 0;
 		try {
 			if (resourceAndAccessor.resolver) {
-				auto resources = resourceAndAccessor.resolver->Resolve();
-				if (resources.size() != 1u || !resources.front()) {
-					throw std::runtime_error("resolver did not produce exactly one resource");
+				// Frame preparation asks for the same indices hundreds of times per
+				// frame and a resolver allocates its resource list on every call.
+				// Keep the resolved resource behind the resolver's declaration
+				// version; the descriptor itself is still read from the live object.
+				std::shared_ptr<Resource> resolved;
+				const auto hint = resourceAndAccessor.resolver->DeclarationVersionHint();
+				auto& cache = resourceAndAccessor;
+				if (hint && cache.resolvedHint == hint && cache.resolvedResource) resolved = cache.resolvedResource;
+				else {
+					auto resources = resourceAndAccessor.resolver->Resolve();
+					if (resources.size() != 1u || !resources.front()) {
+						throw std::runtime_error("resolver did not produce exactly one resource");
+					}
+					resolved = std::move(resources.front());
+					cache.resolvedHint = hint;
+					cache.resolvedResource = hint ? resolved : nullptr;
+					cache.resolvedDynamic = nullptr;
+					cache.resolvedIndexed = nullptr;
 				}
-				if (auto* dynamicResource = dynamic_cast<DynamicGloballyIndexedResource*>(resources.front().get())) {
+				if (auto* dynamicResource = dynamic_cast<DynamicGloballyIndexedResource*>(resolved.get())) {
+					if (cache.resolvedResource) cache.resolvedDynamic = dynamicResource;
 					auto backing = dynamicResource->GetResource();
 					auto* resource = PtrFrom(backing);
 					if (!resource) throw std::runtime_error("resolved dynamic resource has null backing");
 					resolvedIndex = AccessGloballyIndexedResource(*resource, resourceAndAccessor.accessor);
 				}
-				else if (auto* resource = dynamic_cast<GloballyIndexedResource*>(resources.front().get())) {
+				else if (auto* resource = dynamic_cast<GloballyIndexedResource*>(resolved.get())) {
+					if (cache.resolvedResource) cache.resolvedIndexed = resource;
 					resolvedIndex = AccessGloballyIndexedResource(*resource, resourceAndAccessor.accessor);
 				}
 				else {

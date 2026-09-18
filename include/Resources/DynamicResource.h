@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <shared_mutex>
 #include <string>
@@ -98,6 +99,7 @@ class DynamicGloballyIndexedResource : public GloballyIndexedResourceBase {
 public:
     DynamicGloballyIndexedResource(std::shared_ptr<GloballyIndexedResource> initialResource)
         : m_resource(std::move(initialResource)) {
+        m_peek.store(m_resource.get(), std::memory_order_release);
         if (m_resource) {
             //currentState = m_resource->GetState();
             name = m_resource->GetName();
@@ -111,6 +113,7 @@ public:
         }
         std::unique_lock lock(m_resourceMutex);
         m_resource = std::move(newResource);
+        m_peek.store(m_resource.get(), std::memory_order_release);
         //currentState = m_resource->GetState();
         name = m_resource->GetName();
     }
@@ -118,6 +121,13 @@ public:
     std::shared_ptr<GloballyIndexedResource> GetResource() const {
         std::shared_lock lock(m_resourceMutex);
         return m_resource;
+    }
+    // Non-owning view of the current backing for per-frame checks that only
+    // read immutable per-object data (descriptor indices). The owner keeps
+    // retired backings alive through the publication that recorded them, so a
+    // stale pointer is never dereferenced across a rotation.
+    GloballyIndexedResource* PeekResource() const noexcept {
+        return m_peek.load(std::memory_order_acquire);
     }
 
     rhi::BarrierBatch GetEnhancedBarrierGroup(RangeSpec range, rhi::ResourceAccessType prevAccessType, rhi::ResourceAccessType newAccessType, rhi::ResourceLayout prevLayout, rhi::ResourceLayout newLayout, rhi::ResourceSyncState prevSyncState, rhi::ResourceSyncState newSyncState) override {
@@ -147,6 +157,7 @@ protected:
 private:
     mutable std::shared_mutex m_resourceMutex;
     std::shared_ptr<GloballyIndexedResource> m_resource; // actual resource
+    std::atomic<GloballyIndexedResource*> m_peek{nullptr};
 };
 
 

@@ -63,6 +63,7 @@ struct RenderGraph::CompilerState {
     std::shared_ptr<const experimental::DependencyEdges> frameDependencyAnalysis;
     std::map<uint32_t, std::shared_ptr<PreparedInvocationArena>> invocationArenas;
     std::shared_ptr<runtime::ITaskScope> ownershipRetirementScope;
+    std::shared_ptr<runtime::ITaskScope> persistentBuildScope; // worker-side structural builds
     std::shared_ptr<const PublicationBindingBundle> graphLocalBindingBundle;
 
     struct RecordingFrameOwner {

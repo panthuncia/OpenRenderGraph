@@ -1080,15 +1080,13 @@ std::shared_ptr<const SelectedPublication> GraphEditTransaction::Build(
                 std::move(compileInput),std::move(layout),std::move(resourceIndexBySlot),std::move(incomingBatchesByResource),
                 std::move(incomingStateBatchByResource)});
     }
-    // Freeze mutable transaction pages by copying once at readiness, not per frame.
+    // Freeze the pages this transaction edited by handing them to the
+    // publication as-is. The transaction forgets them as mutable, so a later
+    // edit to the same page clones it again from the (now frozen) table:
+    // copy-on-write, one copy per page per edit, none at readiness.
     auto bindings = m_bindings;
-    {
-        BT_ZONE_SCOPE("ORG.Persistent.FreezeBindingPages");
-        for (const auto& [index, page] : m_changedPages)
-            bindings.m_pages[index] = std::make_shared<const BindingTable::Page>(*page);
-        for (const auto& [index, identities] : m_changedIdentities)
-            bindings.m_identities[index] = std::make_shared<const BindingTable::IdentityBucket>(*identities);
-    }
+    m_changedPages.clear();
+    m_changedIdentities.clear();
     if (cancelled.load(std::memory_order_relaxed)) return {};
     return std::shared_ptr<const SelectedPublication>(new SelectedPublication(
         m_base->revision + 1, std::move(executable), std::move(bindings),
@@ -1128,6 +1126,21 @@ bool GraphProgram::Install(std::shared_ptr<const SelectedPublication> ready) {
     }
     // The renderer supplies its shared scheduler retirement queue. Never call
     // external retirement code while holding the selection mutex.
+    RetireOwnership(m_retireOwnership,std::move(retired));
+    return true;
+}
+bool GraphProgram::InstallRebased(std::shared_ptr<const SelectedPublication> ready) {
+    BT_ZONE_SCOPE("ORG.Persistent.InstallPublication");
+    if (!ready) return false;
+    std::shared_ptr<const SelectedPublication> retired;
+    {
+        std::lock_guard lock(m_mutex);
+        if (ready == m_selected) return true;
+        if (m_selected->revision == UINT64_MAX) return false;
+        std::shared_ptr<const SelectedPublication> renumbered(new SelectedPublication(
+            m_selected->revision + 1, ready->executable, ready->bindings, ready->logical, m_selected));
+        retired = std::exchange(m_selected,std::move(renumbered));
+    }
     RetireOwnership(m_retireOwnership,std::move(retired));
     return true;
 }

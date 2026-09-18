@@ -192,8 +192,13 @@ private:
 
 	// Internal helpers
 
+	// A region larger than a page needs a dedicated page; callers create it with
+	// PrepareDedicatedPage before taking m_uploadQueueMutex so GPU allocation
+	// never runs under the lock the render thread drains through.
+	UploadPagePtr PrepareDedicatedPage(size_t size);
 	bool AllocateUploadRegion(size_t size, size_t alignment,
-	                          std::shared_ptr<Resource>& outUploadBuffer, size_t& outOffset);
+	                          std::shared_ptr<Resource>& outUploadBuffer, size_t& outOffset,
+	                          UploadPagePtr preparedDedicated = nullptr);
 
 	static bool TryCoalesceAppend(ResourceUpdate& last, const ResourceUpdate& next) noexcept;
 

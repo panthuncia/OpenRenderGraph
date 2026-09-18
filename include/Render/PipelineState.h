@@ -52,18 +52,24 @@ struct PipelineStatePayload {
 class PipelineStateSlot {
 public:
 	explicit PipelineStateSlot(std::shared_ptr<PipelineStatePayload> payload) :
-		m_active(std::move(payload)) {}
+		m_active(payload), m_peek(payload.get()) {}
 
 	std::shared_ptr<PipelineStatePayload> Load() const {
 		return m_active.load(std::memory_order_acquire);
 	}
+	// Non-owning identity of the active payload for revision checks: no
+	// atomic shared_ptr load, no refcount traffic. Retired payloads stay alive
+	// through the packets that captured them, so the pointer is only compared.
+	PipelineStatePayload* Peek() const noexcept { return m_peek.load(std::memory_order_acquire); }
 
 	std::shared_ptr<PipelineStatePayload> Exchange(std::shared_ptr<PipelineStatePayload> payload) {
+		m_peek.store(payload.get(), std::memory_order_release);
 		return m_active.exchange(std::move(payload), std::memory_order_acq_rel);
 	}
 
 private:
 	std::atomic<std::shared_ptr<PipelineStatePayload>> m_active;
+	std::atomic<PipelineStatePayload*> m_peek{nullptr};
 };
 
 class PipelineState {
@@ -142,6 +148,7 @@ public:
 	std::shared_ptr<PipelineStatePayload> GetPayload() const {
 		return m_slot ? m_slot->Load() : nullptr;
 	}
+	PipelineStatePayload* PeekPayload() const noexcept { return m_slot ? m_slot->Peek() : nullptr; }
 	std::shared_ptr<PipelineStatePayload> GetPayload(BackendInstanceId backendInstance) const {
 		const auto key = static_cast<uint8_t>(backendInstance);
 		if (key == static_cast<uint8_t>(BackendInstanceId::Primary)) return GetPayload();
