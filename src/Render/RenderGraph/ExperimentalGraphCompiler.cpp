@@ -687,6 +687,23 @@ std::shared_ptr<const DependencyEdges> CompileWorkspace::AnalyzeDependencies(
             seen[index] = 1;
         }
     }
+    // Without an explicit order, accesses follow the authored order. It equals
+    // the index for freshly compiled graphs; persistent programs can place a
+    // pass between two others without renumbering them.
+    std::vector<uint32_t> authoredOrder;
+    if (accessOrder.empty()) {
+        bool monotonic = true;
+        for (uint32_t index = 1; index < passCount && monotonic; ++index)
+            monotonic = structure.passes[index - 1].originalOrder <= structure.passes[index].originalOrder;
+        if (!monotonic) {
+            authoredOrder.resize(passCount);
+            std::iota(authoredOrder.begin(), authoredOrder.end(), 0u);
+            std::stable_sort(authoredOrder.begin(), authoredOrder.end(), [&](uint32_t l, uint32_t r) {
+                return structure.passes[l].originalOrder < structure.passes[r].originalOrder;
+            });
+            accessOrder = authoredOrder;
+        }
+    }
     DependencyEdges edges;
     m_resources.resize(structure.resourceIDs.size());
     for (auto& state : m_resources) state.Reset();

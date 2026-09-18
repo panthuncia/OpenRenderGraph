@@ -35,6 +35,9 @@
 #include <boost/functional/hash.hpp>
 #include <chrono>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <cstdlib>
 #include <map>
 #include <numeric>
@@ -191,6 +194,7 @@ struct RenderGraph::PersistentExecutionState {
 		bool isBound = false;
 		bool direct = false;               // Shared by direct declarations; never a group member.
 		bool swapchain = false;            // Rebound per frame at admission.
+		bool retired = false;              // Slot removed from the program; the index may be reclaimed.
 		std::vector<uint32_t> subscribers; // Main pass indices resolving this slot.
 	};
 	// One persistent group per resolver identity, shared by every subscribing
@@ -227,6 +231,12 @@ struct RenderGraph::PersistentExecutionState {
 		std::vector<std::pair<uint64_t, std::string>> loweredDirect; // Diagnostic: (scheduling ID, name).
 		std::vector<const void*> loweredGroupKeys;
 		std::vector<ExternalTimelinePoint> explicitWaits;
+		// Frame-interrupting per-frame pass hosted in the main executable (not in
+		// the master list). It is prepared once and records nothing afterwards
+		// until its removal is installed.
+		std::unique_ptr<AnyPassAndResources> hosted;
+		bool hostedPrepared = false;
+		bool retired = false; // Hosted pass removed; the main index may be reused.
 	};
 	struct PreparedSegment {
 		const char* label = "";
@@ -303,6 +313,8 @@ struct RenderGraph::PersistentExecutionState {
 	// Frame in preparation.
 	std::optional<PreparedSegment> pre, main, tail;
 	std::vector<AnyPassAndResources> frameExtensionPasses;
+	std::vector<uint32_t> hostedMainPasses;             // Main indices of installed frame-interrupting passes.
+	std::vector<ExternalPassDesc> deferredInterrupting; // Requested while a structural build was pending.
 	uint64_t frameNumber = 0;
 	uint8_t frameIndex = 0;
 	std::shared_ptr<const IHostExecutionData> frameData;
@@ -322,6 +334,7 @@ struct RenderGraph::PersistentExecutionState {
 	std::unordered_map<Resource*, AliasPlacementRecord> aliasPlaced; // Concrete resources placed by this planner.
 	std::vector<std::pair<uint32_t, uint32_t>> aliasEdges;          // Installed placement orderings (logical pass slots).
 	uint64_t aliasPlans = 0, aliasRematerializations = 0;
+	const void* dumpedExecutable = nullptr; // Compile-dump mode: last executable written.
 	// Diagnostic: per-pass preparation cost (logged periodically).
 	std::unordered_map<std::string, std::pair<uint64_t, uint64_t>> prepareCostByPass; // lowering: name -> (ns, calls)
 	std::vector<std::pair<uint64_t, uint64_t>> prepareCostByMain;                    // main pass index -> (ns, calls)
@@ -605,6 +618,18 @@ static LoweredPass LowerLegacyPass(RenderGraph& graph, ResourceRegistry& registr
 
 namespace {
 
+// Directory entry for a slot the program just allocated. Slots are dense except
+// that the program reuses the indices of removed slots, whose entries are
+// retired rather than erased.
+State::SlotEntry& ClaimEntry(State& state, persistent::ResourceSlotId slot) {
+	if (slot.index == state.entries.size()) return state.entries.emplace_back();
+	if (slot.index > state.entries.size() || !state.entries[slot.index].retired)
+		throw std::logic_error("Persistent slot directory expects dense slot allocation");
+	auto& entry = state.entries[slot.index];
+	entry = {};
+	return entry;
+}
+
 // Finds or creates the directory slot for a scheduling identity. Direct slots
 // are shared by every pass declaring the resource directly; group member slots
 // are private to their group (see ReserveGroupMember).
@@ -615,19 +640,16 @@ uint32_t DirectEntry(State& state, persistent::GraphEditTransaction& edit, uint6
 		const auto& entry = state.entries[index];
 		if (entry.direct && entry.resource == resource && entry.shape == shape) return index;
 	}
-	State::SlotEntry entry;
+	const auto slot = edit.ReserveResource(shape);
+	auto& entry = ClaimEntry(state, slot);
 	entry.direct = true;
 	entry.resource = resource;
 	entry.resourceID = resourceID;
 	entry.shape = shape;
 	entry.swapchain = swapchain;
-	entry.slot = edit.ReserveResource(shape);
-	const auto index = entry.slot.index;
-	if (index != state.entries.size())
-		throw std::logic_error("Persistent slot directory expects dense slot allocation");
-	state.entries.push_back(std::move(entry));
-	indices.push_back(index);
-	return index;
+	entry.slot = slot;
+	indices.push_back(slot.index);
+	return slot.index;
 }
 
 // While a structural build is pending, edits against the live publication are
@@ -689,7 +711,7 @@ void QueueSlotPatch(State& state, const State::SlotEntry& entry, uint64_t concre
 
 // Installs (or reinstalls) a main pass declaration into the transaction.
 static void InstallMainPass(RenderGraph& graph, State& state, persistent::GraphEditTransaction& edit,
-	State::MainPass& main, LoweredPass lowered, uint32_t mainIndex, bool replace) {
+	State::MainPass& main, LoweredPass lowered, uint32_t mainIndex, bool replace, std::optional<uint32_t> authoredOrder = std::nullopt) {
 	if (replace) {
 		for (const auto groupIndex : main.groups) {
 			auto& group = state.groups[groupIndex];
@@ -702,7 +724,7 @@ static void InstallMainPass(RenderGraph& graph, State& state, persistent::GraphE
 		main.directEntries.clear();
 		edit.ReplacePass(main.id, std::move(lowered.declaration));
 	} else {
-		main.id = edit.AddPass(std::move(lowered.declaration));
+		main.id = edit.AddPass(std::move(lowered.declaration), authoredOrder);
 	}
 	main.fingerprint = FingerprintLowering(lowered);
 	main.loweredDirect.clear();
@@ -750,11 +772,9 @@ static void InstallMainPass(RenderGraph& graph, State& state, persistent::GraphE
 			group.group = edit.AddGroup(loweredGroup.shape, {});
 			const auto reserved = edit.ReserveGroupMembers(group.group, group.capacity);
 			for (const auto slot : reserved) {
-				if (slot.index != state.entries.size()) throw std::logic_error("Persistent slot directory expects dense slot allocation");
-				State::SlotEntry entry;
+				auto& entry = ClaimEntry(state, slot);
 				entry.slot = slot;
 				entry.shape = loweredGroup.shape;
-				state.entries.push_back(std::move(entry));
 				group.memberEntries.push_back(slot.index);
 				group.memberResourceIDs.push_back(0);
 			}
@@ -970,6 +990,21 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 	org::runtime::ScopedActiveGraphServices activeServices(m_uploadService.get(), m_descriptorService.get());
 	const auto primaryBackend = m_backendDevices.empty() ? rhi::Backend::Null : m_backendDevices.front().backend;
 
+	// 0. Per-frame extension passes, gathered before declarations are polled as
+	// in the fresh compiler: frame hooks may publish work that retained passes
+	// consume this frame (streaming uploads).
+	auto& frameExt = compiler.frameExtensions;
+	std::vector<ExternalPassDesc> interrupting;
+	{
+		BT_ZONE_SCOPE("ORG.Persistent.GatherFramePasses");
+		frameExt.clear();
+		for (auto& ext : m_extensions) if (ext) ext->GatherFramePasses(*this, frameExt);
+		for (auto it = frameExt.begin(); it != frameExt.end();) {
+			if (!it->interruptsFrame) { ++it; continue; }
+			interrupting.push_back(std::move(*it));
+			it = frameExt.erase(it);
+		}
+	}
 	// 1. Structural and membership changes reported by legacy passes. One
 	// transaction carries both so the slot directory never diverges from the
 	// installed program: a directory change is only made against an edit that
@@ -981,6 +1016,8 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 		std::unordered_map<uint32_t, LoweredPass> relowered;
 		std::optional<persistent::GraphEditTransaction> edit;
 		AdvancePersistentStructuralBuild(structural);
+		for (auto& desc : UpdatePersistentFrameInterruptingPasses(std::move(interrupting), primaryBackend))
+			frameExt.push_back(std::move(desc));
 		auto ensureEdit = [&]() -> persistent::GraphEditTransaction& {
 			if (!edit) edit.emplace(state.program.BeginEdit());
 			return *edit;
@@ -989,6 +1026,7 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 		{ BT_ZONE_SCOPE("ORG.Persistent.PollDynamicDeclared");
 		for (uint32_t mainIndex = 0; mainIndex < state.mainPasses.size(); ++mainIndex) {
 			auto& main = state.mainPasses[mainIndex];
+			if (main.hosted || main.retired) continue; // One-shot; never relowered.
 			auto& any = m_masterPassList[main.masterIndex];
 			std::visit([&](auto& value) {
 				using T = std::decay_t<decltype(value)>;
@@ -1170,6 +1208,10 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 	}
 	// 3. Select and prepare the main segment.
 	auto selected = state.program.Select();
+	if (m_getRenderGraphCompileDumpEnabled && m_getRenderGraphCompileDumpEnabled() && state.dumpedExecutable != selected->executable.get()) {
+		state.dumpedExecutable = selected->executable.get();
+		WritePersistentGraphDebugDump(*selected);
+	}
 	if (state.bindingsFor != selected.get()) {
 		BT_ZONE_SCOPE("ORG.Persistent.BuildLegacyBindingTable");
 		std::vector<FrozenExecutionBindings::ResourceBinding> table(selected->bindings.Size());
@@ -1250,6 +1292,7 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 		main.names = state.mainNames;
 		for (uint32_t mainIndex = 0; mainIndex < state.mainPasses.size(); ++mainIndex) {
 			auto& pass = state.mainPasses[mainIndex];
+			if (pass.retired) continue;
 			if (pass.slotsDirty || pass.slotsExecutable != selected->executable.get()) {
 				auto slots = std::make_shared<FramePreparationContext::ResourceSlots>();
 				auto expose = [&](uint32_t entryIndex) {
@@ -1264,7 +1307,7 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 				for (const auto index : pass.directEntries) expose(index);
 				for (const auto groupIndex : pass.groups) for (const auto index : state.groups[groupIndex].memberEntries) expose(index);
 				// Registry handle identities may differ from scheduling identities.
-				const auto view = GetPassView(m_masterPassList[pass.masterIndex]);
+				const auto view = GetPassView(pass.hosted ? *pass.hosted : m_masterPassList[pass.masterIndex]);
 				for (const auto& requirement : view.reqs) {
 					auto* resource = requirement.resourceHandleAndRange.resource.IsEphemeral()
 						? requirement.resourceHandleAndRange.resource.GetEphemeralPtr() : _registry.Resolve(requirement.resourceHandleAndRange.resource);
@@ -1303,7 +1346,14 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 				pass.slotAdds.clear(); pass.slotRemoves.clear();
 			}
 			if (pass.id.index >= main.invocations.size()) continue; // added by a pending structural build
-			auto& any = m_masterPassList[pass.masterIndex];
+			auto& any = pass.hosted ? *pass.hosted : m_masterPassList[pass.masterIndex];
+			if (pass.hosted && pass.hostedPrepared) {
+				// Already ran; stays in the executable until its removal installs.
+				main.invocations[pass.id.index] = PreparedPass::NoOp();
+				if (namesDirty) (*mainNames)[pass.id.index] = any.name;
+				continue;
+			}
+			pass.hostedPrepared = static_cast<bool>(pass.hosted);
 			passPreparation.resourceSlots = pass.slots;
 			PreparedPass packet;
 			const auto prepareStarted = std::chrono::steady_clock::now();
@@ -1867,10 +1917,8 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 		};
 		std::vector<AnyPassAndResources> none;
 		state.pre = buildSegment("Pre", state.preMasterIndices, none, true, state.preCache, state.prePrograms);
-		// Per-frame extension passes are materialized fresh, as the legacy path does.
-		auto& frameExt = compiler.frameExtensions;
-		frameExt.clear();
-		for (auto& ext : m_extensions) if (ext) ext->GatherFramePasses(*this, frameExt);
+		// Per-frame extension passes (gathered in step 0) are materialized fresh,
+		// as the legacy path does.
 		state.frameExtensionPasses.clear();
 		for (auto& d : frameExt) {
 			if (d.type == PassType::Unknown || (std::holds_alternative<std::monostate>(d.pass) && !d.unifiedPass) || d.name.empty()) continue;
@@ -2078,12 +2126,10 @@ void RenderGraph::SubmitPersistentStructuralBuild(const std::vector<uint32_t>& s
 		auto& group = state.groups[groupIndex];
 		const auto more = transaction.ReserveGroupMembers(group.group, group.capacity);
 		for (const auto slot : more) {
-			if (slot.index != state.entries.size()) throw std::logic_error("Persistent slot directory expects dense slot allocation");
-			State::SlotEntry entry;
+			auto& entry = ClaimEntry(state, slot);
 			entry.slot = slot;
 			entry.shape = group.shape;
 			entry.subscribers = group.subscribers;
-			state.entries.push_back(std::move(entry));
 			group.memberEntries.push_back(slot.index);
 			group.memberResourceIDs.push_back(0);
 			group.freeMembers.push_back(static_cast<uint32_t>(group.memberEntries.size() - 1));
@@ -2186,6 +2232,212 @@ void RenderGraph::AdvancePersistentStructuralBuild(std::vector<uint32_t>& struct
 		std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pending->started).count(),
 		pending->bindingLog.size(), pending->deferredStructural.size());
 	state.pending.reset();
+}
+
+// Compile-dump mode for the persistent graph. The legacy compiler rewrites its
+// dump every compiled frame; the persistent executable changes only on
+// structural builds, so it is written once per selected executable: batches in
+// submission order with each pass's authored order and declared states, then
+// every slot with its alias placement.
+void RenderGraph::WritePersistentGraphDebugDump(const persistent::SelectedPublication& selected) const {
+	try {
+		const auto& state = *m_compilerState->persistent;
+		const auto& executable = *selected.executable;
+		const auto& graph = *executable.graph;
+		const auto& structure = *graph.structure;
+		std::unordered_map<uint32_t, const std::string*> nameBySlot;
+		for (const auto& main : state.mainPasses) if (!main.retired) nameBySlot.emplace(main.id.index, &main.name);
+		auto passName = [&](uint32_t pass) -> std::string {
+			const auto found = nameBySlot.find(structure.passes[pass].preparedPassIndex);
+			return found != nameBySlot.end() ? *found->second : "<pass " + std::to_string(pass) + ">";
+		};
+		auto resourceName = [&](uint32_t resource) -> std::string {
+			if (resource >= executable.resourceSlots.size()) return "<resource " + std::to_string(resource) + ">";
+			const auto slot = executable.resourceSlots[resource].index;
+			const auto* entry = slot < state.entries.size() ? &state.entries[slot] : nullptr;
+			return "slot=" + std::to_string(slot) + " name=\"" + (entry && entry->resource ? entry->resource->GetName() : std::string("-")) + "\"";
+		};
+		auto appendState = [](std::ostringstream& out, const CompileResourceState& value) {
+			out << "access=" << rhi::helpers::ResourceAccessMaskToString(static_cast<rhi::ResourceAccessType>(value.access))
+				<< " layout=" << rhi::helpers::ResourceLayoutToString(static_cast<rhi::ResourceLayout>(value.layout))
+				<< " sync=" << rhi::helpers::ResourceSyncToString(static_cast<rhi::ResourceSyncState>(value.sync))
+				<< (value.write ? " write" : "");
+		};
+		auto appendRange = [](std::ostringstream& out, const CompileRange& range) {
+			out << "mips=[" << range.mip << "+" << range.mips << "] slices=[" << range.slice << "+" << range.slices << "]";
+		};
+		std::ostringstream dump;
+		dump << "RenderGraph Persistent State\n"
+			<< "structural_revision=" << executable.structuralRevision << " structural_builds=" << state.structuralBuilds
+			<< " alias_plans=" << state.aliasPlans << "\n"
+			<< "passes=" << structure.passes.size() << " batches=" << graph.batches.size() << " resources=" << structure.resourceIDs.size()
+			<< " explicit_edges=" << structure.explicitEdges.size() << " placement_edges=" << structure.placementEdges.size()
+			<< " pre_passes=" << state.preMasterIndices.size() << " tail_passes=" << state.tailMasterIndices.size()
+			<< " hosted_frame_interrupting=" << state.hostedMainPasses.size() << "\n\n[Batches]\n";
+		for (uint32_t batchIndex = 0; batchIndex < graph.batches.size(); ++batchIndex) {
+			const auto& batch = graph.batches[batchIndex];
+			dump << "batch " << batchIndex << " queue=" << batch.queue << "\n";
+			for (const auto pass : batch.passes) {
+				const auto& declaration = structure.passes[pass];
+				dump << "  [" << pass << "] \"" << passName(pass) << "\" order=" << declaration.originalOrder
+					<< " backend=" << declaration.backend << "\n";
+				for (const auto& use : declaration.entryStates) {
+					dump << "    entry " << resourceName(use.resource) << " "; appendRange(dump, use.range); dump << " "; appendState(dump, use.state); dump << "\n";
+				}
+				for (const auto& use : declaration.exitStates) {
+					dump << "    exit " << resourceName(use.resource) << " "; appendRange(dump, use.range); dump << " "; appendState(dump, use.state); dump << "\n";
+				}
+				for (const auto& access : declaration.accesses)
+					dump << "    access " << resourceName(access.resourceIndex) << (access.write ? " write" : " read") << "\n";
+			}
+		}
+		dump << "\n[Resources]\n";
+		for (uint32_t resource = 0; resource < executable.resourceSlots.size(); ++resource) {
+			dump << "  [" << resource << "] " << resourceName(resource);
+			const auto slot = executable.resourceSlots[resource];
+			if (const auto* version = selected.bindings.TryAt(slot.index)) {
+				dump << (version->bound ? " bound" : " reserved");
+				if (const auto& admission = version->admission; admission && admission->aliasSize)
+					dump << " alias_pool=0x" << std::hex << admission->aliasPoolID << std::dec
+						<< " alias_offset=" << admission->aliasOffset << " alias_bytes=" << admission->aliasSize;
+			}
+			dump << "\n";
+		}
+		namespace fs = std::filesystem;
+		std::error_code error;
+		fs::path directory = fs::current_path(error);
+		if (error) directory.clear();
+		directory /= "rendergraph_dumps";
+		fs::create_directories(directory, error);
+		const auto path = directory / "rendergraph_persistent_state.txt";
+		std::ofstream file(path, std::ios::out | std::ios::trunc);
+		if (!file.is_open()) { spdlog::warn("Failed to open persistent render graph dump '{}'", path.string()); return; }
+		file << dump.str();
+		spdlog::info("Persistent render graph dump written to '{}' (structural revision {})", path.string(), executable.structuralRevision);
+	} catch (const std::exception& e) {
+		spdlog::warn("Failed to write persistent render graph dump: {}", e.what());
+	}
+}
+
+// Frame-interrupting per-frame passes (ExternalPassDesc::interruptsFrame, e.g.
+// mid-frame debug readbacks) must observe resources at their insert point, so
+// they cannot run in the Tail segment. Each frame that has them, or had them the
+// frame before, pays one inline structural build: the previous set is removed
+// and the new set is added at authored orders just after (or before) their
+// anchors. Hazards follow the authored order, so a capture after a pass reads
+// the state that pass left, and alias placement treats it as a user.
+std::vector<RenderGraph::ExternalPassDesc> RenderGraph::UpdatePersistentFrameInterruptingPasses(
+	std::vector<ExternalPassDesc> requested, rhi::Backend primaryBackend) {
+	auto& state = *m_compilerState->persistent;
+	std::vector<ExternalPassDesc> unhosted;
+	if (!state.deferredInterrupting.empty()) {
+		requested.insert(requested.begin(), std::make_move_iterator(state.deferredInterrupting.begin()),
+			std::make_move_iterator(state.deferredInterrupting.end()));
+		state.deferredInterrupting.clear();
+	}
+	if (requested.empty() && state.hostedMainPasses.empty()) return unhosted;
+	if (state.pending) {
+		// The program cannot be edited inline under an in-flight structural
+		// build. Installed passes keep recording nothing; new ones wait.
+		state.deferredInterrupting = std::move(requested);
+		return unhosted;
+	}
+	BT_ZONE_SCOPE("ORG.Persistent.FrameInterruptingPasses");
+	const auto started = std::chrono::steady_clock::now();
+	auto edit = state.program.BeginEdit();
+	const size_t removed = state.hostedMainPasses.size();
+	for (const auto mainIndex : state.hostedMainPasses) {
+		auto& main = state.mainPasses[mainIndex];
+		edit.RemovePass(main.id);
+		for (const auto groupIndex : main.groups) {
+			auto& group = state.groups[groupIndex];
+			std::erase(group.subscribers, mainIndex);
+			for (const auto entryIndex : group.memberEntries) std::erase(state.entries[entryIndex].subscribers, mainIndex);
+		}
+		for (const auto entryIndex : main.directEntries) {
+			auto& entry = state.entries[entryIndex];
+			std::erase(entry.subscribers, mainIndex);
+			if (!entry.direct || !entry.subscribers.empty()) continue;
+			// Declared only by the removed pass: release the slot, and with it the
+			// raw resource pointer (published versions retire independently).
+			edit.RemoveResource(entry.slot);
+			if (auto found = state.entriesByResourceID.find(entry.resourceID); found != state.entriesByResourceID.end()) {
+				std::erase(found->second, entryIndex);
+				if (found->second.empty()) state.entriesByResourceID.erase(found);
+			}
+			entry = {};
+			entry.retired = true;
+		}
+		main = {};
+		main.retired = true;
+	}
+	state.hostedMainPasses.clear();
+
+	std::unordered_map<std::string, uint32_t> byName;
+	for (uint32_t i = 0; i < state.mainPasses.size(); ++i)
+		if (!state.mainPasses[i].retired && !state.mainPasses[i].hosted) byName.emplace(state.mainPasses[i].name, i);
+	std::unordered_map<uint32_t, uint32_t> insertedAt; // anchor main index -> passes inserted there
+	constexpr uint32_t stride = persistent::GraphEditTransaction::kAuthoredOrderStride;
+	for (auto& desc : requested) {
+		if (desc.type == PassType::Unknown || (std::holds_alternative<std::monostate>(desc.pass) && !desc.unifiedPass) || desc.name.empty()) continue;
+		std::vector<uint32_t> after, before;
+		if (desc.where) {
+			for (const auto& name : desc.where->after) if (const auto found = byName.find(name); found != byName.end()) after.push_back(found->second);
+			for (const auto& name : desc.where->before) if (const auto found = byName.find(name); found != byName.end()) before.push_back(found->second);
+		}
+		if (after.empty() && before.empty()) {
+			static std::atomic<uint32_t> reported{0};
+			if (reported.fetch_add(1) < 8)
+				spdlog::warn("Frame-interrupting pass '{}' names no main pass to insert against; running it after the main executable", desc.name);
+			unhosted.push_back(std::move(desc));
+			continue;
+		}
+		// Latest 'after' anchor, else earliest 'before' anchor; consecutive
+		// insertions at one anchor keep their request order.
+		uint32_t anchor = after.empty() ? before.front() : after.front();
+		for (const auto a : after) if (edit.AuthoredOrder(state.mainPasses[a].id) > edit.AuthoredOrder(state.mainPasses[anchor].id)) anchor = a;
+		if (after.empty()) for (const auto b : before) if (edit.AuthoredOrder(state.mainPasses[b].id) < edit.AuthoredOrder(state.mainPasses[anchor].id)) anchor = b;
+		const auto k = ++insertedAt[anchor];
+		if (k >= stride / 2) throw std::runtime_error("Too many frame-interrupting passes at '" + state.mainPasses[anchor].name + "'");
+		const auto anchorOrder = edit.AuthoredOrder(state.mainPasses[anchor].id);
+		const uint32_t order = after.empty() ? anchorOrder - stride / 2 + k : anchorOrder + k;
+
+		uint32_t mainIndex = 0;
+		while (mainIndex < state.mainPasses.size() && !state.mainPasses[mainIndex].retired) ++mainIndex;
+		if (mainIndex == state.mainPasses.size()) state.mainPasses.emplace_back();
+		auto& main = state.mainPasses[mainIndex];
+		main = {};
+		main.hosted = std::make_unique<AnyPassAndResources>(MaterializeExternalPass(desc, true, false));
+		main.name = main.hosted->name;
+		auto& any = *main.hosted;
+		std::visit([&](auto& value) {
+			using T = std::decay_t<decltype(value)>;
+			if constexpr (!std::is_same_v<T, std::monostate>) {
+				auto lowered = LowerLegacyPass(*this, _registry, m_queueRegistry, primaryBackend, value, any.type, mainIndex);
+				std::vector<Resource*> resources;
+				for (const auto& use : lowered.entries) resources.push_back(use.resource);
+				for (const auto& group : lowered.groups) for (const auto& [id, resource] : group.members) resources.push_back(resource);
+				MaterializePersistentStandalone(resources, true);
+				InstallMainPass(*this, state, edit, main, std::move(lowered), mainIndex, false, order);
+			}
+		}, any.pass);
+		for (const auto a : after) edit.AddOrdering(state.mainPasses[a].id, main.id);
+		for (const auto b : before) edit.AddOrdering(main.id, state.mainPasses[b].id);
+		state.hostedMainPasses.push_back(mainIndex);
+	}
+	auto ready = BuildPersistentStructural(edit);
+	if (!ready || !state.program.Install(edit, ready)) throw std::runtime_error("Persistent frame-interrupting pass edit failed to install");
+	++state.structuralBuilds;
+	basic_telemetry::AddCounter("ORG.Persistent.StructuralBuilds");
+	basic_telemetry::AddCounter("ORG.Persistent.FrameInterruptingBuilds");
+	std::string names;
+	for (const auto mainIndex : state.hostedMainPasses) {
+		if (names.size() > 512) { names += " ..."; break; }
+		names += (names.empty() ? "" : ", ") + state.mainPasses[mainIndex].name;
+	}
+	spdlog::info("Persistent frame-interrupting passes: added={} removed={} build_ms={:.2f} [{}]", state.hostedMainPasses.size(), removed,
+		std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(), names);
+	return unhosted;
 }
 
 // Alias placement over the scheduled executable. Lifetimes are ranks in batch
@@ -2473,7 +2725,7 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		changed = true;
 		edit.ClearPlacementOrderings();
 		std::unordered_map<uint32_t, persistent::PassId> idBySlot;
-		for (const auto& main : state.mainPasses) idBySlot.emplace(main.id.index, main.id);
+		for (const auto& main : state.mainPasses) if (!main.retired) idBySlot.emplace(main.id.index, main.id);
 		for (const auto& [from, to] : edges) {
 			const auto a = idBySlot.find(from), b = idBySlot.find(to);
 			if (a == idBySlot.end() || b == idBySlot.end()) throw std::logic_error("Persistent alias planning: ordering references an unknown pass slot");
@@ -2541,7 +2793,7 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		spdlog::info("Persistent alias exclusion: '{}' reason='{}' bytes={}", c.concrete->GetName(), c.exclusion, c.sizeBytes);
 	if (logging) {
 		std::unordered_map<uint32_t, const std::string*> nameBySlot;
-		for (const auto& main : state.mainPasses) nameBySlot.emplace(main.id.index, &main.name);
+		for (const auto& main : state.mainPasses) if (!main.retired) nameBySlot.emplace(main.id.index, &main.name);
 		std::vector<std::string> nameByRank(nextRank);
 		for (uint32_t p = 0; p < structure.passes.size(); ++p) {
 			if (rank[p] == UINT32_MAX) continue;

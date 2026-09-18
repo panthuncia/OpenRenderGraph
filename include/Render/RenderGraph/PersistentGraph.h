@@ -199,7 +199,12 @@ public:
     void Unbind(ResourceSlotId slot);
     void RemoveResource(ResourceSlotId slot);
     void SetNativeBindingContract(ResourceSlotId slot, NativeBindingContract contract);
-    PassId AddPass(experimental::CompilePass pass);
+    // Passes are ordered by authored order (hazard direction, tie-breaks). By
+    // default a pass is placed at index * kAuthoredOrderStride, leaving room to
+    // insert passes between existing ones with an explicit order.
+    static constexpr uint32_t kAuthoredOrderStride = 1024;
+    PassId AddPass(experimental::CompilePass pass, std::optional<uint32_t> authoredOrder = std::nullopt);
+    uint32_t AuthoredOrder(PassId pass) const;
     void ReplacePass(PassId pass, experimental::CompilePass declaration);
     void RemovePass(PassId pass);
     void SetPassRecordingInterface(PassId pass, std::shared_ptr<const void> recordingInterface);

@@ -162,6 +162,12 @@ public:
 		bool registerName = true;
 		bool isGeometryPass = false; // Optional: opts pass into statistics tracking for rasterization
 		bool collectStatistics = true;
+		// Per-frame passes only. A frame-interrupting pass must run at its insert
+		// point even under the persistent graph, which hosts it in the main
+		// executable at the cost of a structural rebuild when it appears and when
+		// it goes away. Meant for rare debugging work (mid-frame readbacks); other
+		// per-frame passes run after the persistent main executable.
+		bool interruptsFrame = false;
 
 		static ExternalPassDesc Render(std::string name, std::shared_ptr<RenderPass> renderPass) {
 			ExternalPassDesc desc{};
@@ -289,6 +295,16 @@ public:
 
 		ExternalPassDesc CollectStatistics(bool enabled = true) && {
 			collectStatistics = enabled;
+			return std::move(*this);
+		}
+
+		ExternalPassDesc& InterruptsFrame(bool enabled = true) & {
+			interruptsFrame = enabled;
+			return *this;
+		}
+
+		ExternalPassDesc InterruptsFrame(bool enabled = true) && {
+			interruptsFrame = enabled;
 			return std::move(*this);
 		}
 	};
@@ -1319,6 +1335,12 @@ private:
 	void SubmitPersistentStructuralBuild(const std::vector<uint32_t>& structural, const std::vector<uint32_t>& growGroups, rhi::Backend primaryBackend);
 	void AdvancePersistentStructuralBuild(std::vector<uint32_t>& structural);
 	void RunPersistentStructuralBuildPhase(bool validated);
+	// Hosts this frame's frame-interrupting passes in the main executable and
+	// removes the previous frame's. Returns requested passes that name no main
+	// pass to insert against; they run in the Tail segment instead.
+	std::vector<ExternalPassDesc> UpdatePersistentFrameInterruptingPasses(std::vector<ExternalPassDesc> requested, rhi::Backend primaryBackend);
+	// Compile-dump mode for the persistent graph: written once per selected executable.
+	void WritePersistentGraphDebugDump(const persistent::SelectedPublication& selected) const;
 	bool m_persistentExecution = false;
 	std::unordered_map<std::string, PersistentSegmentKind> m_persistentSegmentKinds;
     void SubmitOwnedCompileRequest(rhi::Device device, const std::vector<Node>& nodes,

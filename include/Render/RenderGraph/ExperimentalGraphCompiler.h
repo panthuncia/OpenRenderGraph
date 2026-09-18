@@ -55,6 +55,8 @@ struct CompileAccess {
     bool operator==(const CompileAccess&) const = default;
 };
 struct CompilePass {
+    // Authored position. Hazards between passes touching the same resource are
+    // derived in this order (ties by index), so it need not follow the index.
     uint32_t originalOrder = 0;
     uint32_t backend = 0;
     std::vector<CompileAccess> accesses;

@@ -31,12 +31,21 @@ struct ReadbackCaptureToken {
     uint64_t id = 0;
 };
 
+// Capture anchor for a resource's end-of-frame contents: the copy is queued after
+// the whole graph and never interrupts it. Periodic telemetry should use this.
+// Anchoring after a named pass interrupts the frame at that pass, which costs
+// structural rebuilds under the persistent graph and is meant for debugging.
+inline constexpr const char* kReadbackAfterGraph = "__rg_end__";
+
 class IReadbackService {
 public:
     virtual ~IReadbackService() = default;
 
     virtual void Initialize(rhi::Timeline graphicsReadbackFence, rhi::Timeline copyReadbackFence) = 0;
     virtual void RequestReadbackCapture(const std::string& passName, Resource* resource, const RangeSpec& range, ReadbackCaptureCallback callback, QueueKind preferredQueueKind = QueueKind::Graphics) = 0;
+    void RequestReadbackCaptureAfterGraph(Resource* resource, const RangeSpec& range, ReadbackCaptureCallback callback, QueueKind preferredQueueKind = QueueKind::Graphics) {
+        RequestReadbackCapture(kReadbackAfterGraph, resource, range, std::move(callback), preferredQueueKind);
+    }
     virtual std::vector<ReadbackCaptureInfo> ConsumeCaptureRequests() = 0;
     virtual std::shared_ptr<Resource> AcquireReadbackBuffer(uint64_t byteSize, const char* debugName) = 0;
     virtual ReadbackCaptureToken EnqueueCapture(ReadbackCaptureRequest&& request) = 0;

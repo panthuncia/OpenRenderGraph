@@ -385,7 +385,7 @@ void GraphEditTransaction::ValidatePass(PassId pass) const {
     Require(pass.index < logical.passSlots.size() && logical.passSlots[pass.index].active
         && pass.generation == logical.passSlots[pass.index].generation, "Stale pass");
 }
-PassId GraphEditTransaction::AddPass(experimental::CompilePass pass) {
+PassId GraphEditTransaction::AddPass(experimental::CompilePass pass, std::optional<uint32_t> authoredOrder) {
     MutationGuard mutation{m_failed};
     auto& logical = EditLogical();
     auto& structure = logical.declarations;
@@ -398,13 +398,19 @@ PassId GraphEditTransaction::AddPass(experimental::CompilePass pass) {
         id = {i,slot.generation};
         break;
     }
-    pass.originalOrder = id.index;
+    Require(authoredOrder || id.index < UINT32_MAX / kAuthoredOrderStride, "Pass authored order exhausted");
+    pass.originalOrder = authoredOrder.value_or(id.index * kAuthoredOrderStride);
     pass.preparedPassIndex = id.index;
     if (id.index == structure.passes.size()) {
         structure.passes.push_back(std::move(pass));
         logical.passSlots.push_back({});
     } else structure.passes[id.index] = std::move(pass);
     return id;
+}
+uint32_t GraphEditTransaction::AuthoredOrder(PassId pass) const {
+    ValidatePass(pass);
+    const auto& logical = m_logical ? *m_logical : *m_base->logical;
+    return logical.declarations.passes[pass.index].originalOrder;
 }
 void GraphEditTransaction::SetPassRecordingInterface(PassId pass, std::shared_ptr<const void> recordingInterface) {
     MutationGuard guard{m_failed};
@@ -437,7 +443,7 @@ void GraphEditTransaction::ReplacePass(PassId pass, experimental::CompilePass de
     ClearPassBindings(pass);
     EditLogical().passSlots[pass.index].recordingInterface.reset();
     ++layout.layoutRevision; layout.bindingSlots.clear();
-    declaration.originalOrder = pass.index;
+    declaration.originalOrder = structure.passes[pass.index].originalOrder;
     declaration.preparedPassIndex = pass.index;
     structure.passes[pass.index] = std::move(declaration);
     for (auto& group : EditLogical().groups)
@@ -989,7 +995,8 @@ std::shared_ptr<const SelectedPublication> GraphEditTransaction::Build(
             while (order.size() < count) {
                 uint32_t next = UINT32_MAX;
                 for (uint32_t i = 0; i < count; ++i)
-                    if (!selected[i] && !incoming[i]) { next = i; break; }
+                    if (!selected[i] && !incoming[i] && (next == UINT32_MAX
+                        || input.structure.passes[i].originalOrder < input.structure.passes[next].originalOrder)) next = i;
                 Require(next != UINT32_MAX, "Cyclic group phase ordering");
                 selected[next] = 1; order.push_back(next);
                 for (auto to : successors[next]) --incoming[to];
