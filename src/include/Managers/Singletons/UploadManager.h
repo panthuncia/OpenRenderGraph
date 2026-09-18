@@ -1,4 +1,6 @@
 #pragma once
+
+#include <span>
 #include <wrl/client.h>
 #include <atomic>
 #include <vector>
@@ -50,6 +52,7 @@ public:
 	void Initialize();
 #if BUILD_TYPE == BUILD_TYPE_DEBUG
 	void UploadData(const void* data, size_t size, UploadTarget resourceToUpdate, size_t dataBufferOffset, const char* file, int line);
+	void UploadDataBatch(UploadTarget resourceToUpdate, std::span<const org::runtime::UploadRegion> regions, const char* file, int line);
 	void UploadTextureSubresources(
 		UploadTarget target,
 		rhi::Format fmt,
@@ -64,6 +67,7 @@ public:
 		int line);
 #else
 	void UploadData(const void* data, size_t size, UploadTarget resourceToUpdate, size_t dataBufferOffset);
+	void UploadDataBatch(UploadTarget resourceToUpdate, std::span<const org::runtime::UploadRegion> regions);
 	void UploadTextureSubresources(
 		UploadTarget target,
 		rhi::Format fmt,

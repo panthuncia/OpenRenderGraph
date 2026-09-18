@@ -1,5 +1,7 @@
 #pragma once
 
+#include <span>
+
 #include <vector>
 #include <memory>
 #include <atomic>
@@ -97,6 +99,7 @@ public:
 
 	using PendingWorkChangedCallback = std::function<void()>;
 	using TargetTelemetryCallback = std::function<void(const UploadTarget&, uint64_t&, std::string&)>;
+	using UploadRegion = org::runtime::UploadRegion;
 	using InvalidRegistryHandleCallback = std::function<bool(const UploadTarget&, const char* reason, const char* file, int line)>;
 
 	// Construct an upload instance.
@@ -115,8 +118,11 @@ public:
 #if BUILD_TYPE == BUILD_TYPE_DEBUG
 	void UploadData(const void* data, size_t size, UploadTarget target, size_t dstOffset,
 	                const char* file = nullptr, int line = 0);
+	void UploadDataBatch(UploadTarget target, std::span<const UploadRegion> regions,
+	                     const char* file = nullptr, int line = 0);
 #else
 	void UploadData(const void* data, size_t size, UploadTarget target, size_t dstOffset);
+	void UploadDataBatch(UploadTarget target, std::span<const UploadRegion> regions);
 #endif
 
 	// Texture uploads

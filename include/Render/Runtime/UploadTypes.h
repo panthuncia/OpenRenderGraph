@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <memory>
 
 #include "Render/ResourceRegistry.h"
@@ -11,6 +12,14 @@ namespace org::runtime {
 struct UploadResolveContext {
     ResourceRegistry* registry = nullptr;
     uint64_t epoch = 0;
+};
+
+// One contiguous write of a batched buffer upload: `size` bytes from `data`
+// land at `dstOffset` in the batch's target.
+struct UploadRegion {
+    const void* data = nullptr;
+    size_t size = 0;
+    size_t dstOffset = 0;
 };
 
 struct UploadTarget {

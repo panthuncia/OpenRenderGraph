@@ -25,6 +25,10 @@ public:
         UploadManager::GetInstance().UploadData(data, size, std::move(resourceToUpdate), dataBufferOffset, file, line);
     }
 
+    void UploadDataBatch(UploadTarget resourceToUpdate, std::span<const UploadRegion> regions, const char* file, int line) override {
+        UploadManager::GetInstance().UploadDataBatch(std::move(resourceToUpdate), regions, file, line);
+    }
+
     void UploadTextureSubresources(
         UploadTarget target,
         rhi::Format fmt,
@@ -53,6 +57,10 @@ public:
 #else
     void UploadData(const void* data, size_t size, UploadTarget resourceToUpdate, size_t dataBufferOffset) override {
         UploadManager::GetInstance().UploadData(data, size, std::move(resourceToUpdate), dataBufferOffset);
+    }
+
+    void UploadDataBatch(UploadTarget resourceToUpdate, std::span<const UploadRegion> regions) override {
+        UploadManager::GetInstance().UploadDataBatch(std::move(resourceToUpdate), regions);
     }
 
     void UploadTextureSubresources(

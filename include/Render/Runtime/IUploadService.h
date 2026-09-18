@@ -58,6 +58,19 @@ public:
         uint32_t srcCount) = 0;
 #endif
 
+    // Upload several regions of one target as a single queue entry: one telemetry
+    // capture, one upload-heap allocation, one map/unmap. Regions must be sorted
+    // by dstOffset and must not overlap. The default forwards region by region.
+#if BUILD_TYPE == BUILD_TYPE_DEBUG
+    virtual void UploadDataBatch(UploadTarget resourceToUpdate, std::span<const UploadRegion> regions, const char* file, int line) {
+        for (const auto& region : regions) UploadData(region.data, region.size, resourceToUpdate, region.dstOffset, file, line);
+    }
+#else
+    virtual void UploadDataBatch(UploadTarget resourceToUpdate, std::span<const UploadRegion> regions) {
+        for (const auto& region : regions) UploadData(region.data, region.size, resourceToUpdate, region.dstOffset);
+    }
+#endif
+
     virtual void QueueResourceCopy(const std::shared_ptr<Resource>& destination, const std::shared_ptr<Resource>& source, size_t size) = 0;
     virtual void ProcessDeferredReleases(uint8_t frameIndex) = 0;
 

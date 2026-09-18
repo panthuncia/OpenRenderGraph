@@ -165,6 +165,22 @@ void UploadManager::UploadData(const void* data, size_t size, UploadTarget resou
 }
 
 #if BUILD_TYPE == BUILD_TYPE_DEBUG
+void UploadManager::UploadDataBatch(UploadTarget resourceToUpdate, std::span<const org::runtime::UploadRegion> regions, const char* file, int line)
+#else
+void UploadManager::UploadDataBatch(UploadTarget resourceToUpdate, std::span<const org::runtime::UploadRegion> regions)
+#endif
+{
+	if (!m_uploadInstance) {
+		Initialize();
+	}
+#if BUILD_TYPE == BUILD_TYPE_DEBUG
+	m_uploadInstance->UploadDataBatch(std::move(resourceToUpdate), regions, file, line);
+#else
+	m_uploadInstance->UploadDataBatch(std::move(resourceToUpdate), regions);
+#endif
+}
+
+#if BUILD_TYPE == BUILD_TYPE_DEBUG
 void UploadManager::UploadTextureSubresources(
 	UploadTarget target,
 	rhi::Format fmt,

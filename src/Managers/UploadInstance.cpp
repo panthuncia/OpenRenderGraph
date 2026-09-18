@@ -490,8 +490,10 @@ void UploadInstance::UploadData(const void* data, size_t size, UploadTarget targ
 
 	{
 		std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
-		const auto found = std::ranges::find(m_resourceUpdates, sequence, &ResourceUpdate::firstSequence);
-		if (found != m_resourceUpdates.end()) {
+		const auto rfound = std::ranges::find(m_resourceUpdates.rbegin(), m_resourceUpdates.rend(),
+			sequence, &ResourceUpdate::firstSequence);
+		if (rfound != m_resourceUpdates.rend()) {
+			const auto found = std::prev(rfound.base());
 			found->active = mapped != nullptr;
 			found->staging = false;
 			if (found->active && found != m_resourceUpdates.begin()) {
@@ -504,6 +506,101 @@ void UploadInstance::UploadData(const void* data, size_t size, UploadTarget targ
 			}
 			MarkPendingWorkChangedLocked();
 		}
+	}
+}
+
+#if BUILD_TYPE == BUILD_TYPE_DEBUG
+void UploadInstance::UploadDataBatch(UploadTarget target, std::span<const UploadRegion> regions,
+                                     const char* file, int line)
+#else
+void UploadInstance::UploadDataBatch(UploadTarget target, std::span<const UploadRegion> regions)
+#endif
+{
+	// Contiguous runs of regions (dstOffset == previous end) share one queue
+	// entry; every entry of the batch shares one upload-heap allocation, one
+	// telemetry capture and one map/unmap, so a palette upload of ~60 skeletons
+	// costs one lock round trip instead of one per skeleton.
+	size_t totalBytes = 0;
+	size_t liveRegions = 0;
+	for (const auto& region : regions) {
+		if (!region.data || region.size == 0) continue;
+		totalBytes += region.size;
+		++liveRegions;
+	}
+	if (liveRegions == 0) return;
+
+	uint64_t targetId = 0;
+	std::string targetName;
+	CaptureTargetTelemetry(target, targetId, targetName);
+
+	std::shared_ptr<Resource> uploadBuffer;
+	size_t uploadOffset = 0;
+	uint64_t firstSequence = 0;
+	uint64_t lastSequence = 0;
+	auto preparedPage = PrepareDedicatedPage(totalBytes);
+	{
+		std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
+		AllocateUploadRegion(totalBytes, /*alignment*/16, uploadBuffer, uploadOffset, std::move(preparedPage));
+
+		size_t cursor = 0;
+		ResourceUpdate* open = nullptr;
+		for (const auto& region : regions) {
+			if (!region.data || region.size == 0) continue;
+			if (open && open->dataBufferOffset + open->size == region.dstOffset) {
+				open->size += region.size;
+				open->lastSequence = ++m_lastUploadSequence;
+			} else {
+				ResourceUpdate update;
+				update.size = region.size;
+				update.resourceToUpdate = target;
+				update.dataBufferOffset = region.dstOffset;
+				update.uploadBuffer = uploadBuffer;
+				update.uploadBufferOffset = uploadOffset + cursor;
+				update.staging = true;
+				update.firstSequence = ++m_lastUploadSequence;
+				update.lastSequence = update.firstSequence;
+				update.targetGlobalResourceId = targetId;
+				update.targetDebugName = targetName;
+#if BUILD_TYPE == BUILD_TYPE_DEBUG
+				update.file = file;
+				update.line = line;
+#endif
+				if (firstSequence == 0) firstSequence = update.firstSequence;
+				m_resourceUpdates.push_back(std::move(update));
+				open = &m_resourceUpdates.back();
+			}
+			cursor += region.size;
+		}
+		lastSequence = m_lastUploadSequence;
+		MarkPendingWorkChangedLocked();
+	}
+
+	uint8_t* mapped = nullptr;
+	MapUpload(uploadBuffer, &mapped);
+	if (mapped) {
+		size_t cursor = 0;
+		for (const auto& region : regions) {
+			if (!region.data || region.size == 0) continue;
+			std::memcpy(mapped + uploadOffset + cursor, region.data, region.size);
+			cursor += region.size;
+		}
+	}
+	UnmapUpload(uploadBuffer, uploadOffset, totalBytes);
+#if BUILD_TYPE == BUILD_TYPE_DEBUG
+	if (!mapped) __debugbreak();
+#endif
+
+	{
+		std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
+		// The batch's entries are the newest staging entries with sequences in
+		// [firstSequence, lastSequence]; walk back from the end until we pass them.
+		for (auto it = m_resourceUpdates.rbegin(); it != m_resourceUpdates.rend(); ++it) {
+			if (it->firstSequence < firstSequence) break;
+			if (it->firstSequence > lastSequence || !it->staging) continue;
+			it->active = mapped != nullptr;
+			it->staging = false;
+		}
+		MarkPendingWorkChangedLocked();
 	}
 }
 
