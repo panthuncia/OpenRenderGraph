@@ -2298,11 +2298,29 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 	constexpr uint64_t kAutoPoolGlobal = 0xA171000000000000ull;
 	const float threshold = mode == AutoAliasMode::Conservative ? 1.0f : mode == AutoAliasMode::Balanced ? 0.25f
 		: mode == AutoAliasMode::Aggressive ? -0.5f : std::numeric_limits<float>::infinity();
+	// Diagnostic bisection: comma-separated name substrings kept out of the pools.
+	static const std::vector<std::string> diagnosticExclusions = [] {
+		std::vector<std::string> out;
+		if (const char* list = std::getenv("ORG_PERSISTENT_ALIAS_EXCLUDE")) {
+			std::string text(list);
+			for (size_t pos = 0; pos < text.size();) {
+				const auto next = text.find(',', pos);
+				auto token = text.substr(pos, next == std::string::npos ? std::string::npos : next - pos);
+				if (!token.empty()) out.push_back(std::move(token));
+				pos = next == std::string::npos ? text.size() : next + 1;
+			}
+		}
+		return out;
+	}();
 	size_t excludedCount = 0;
 	for (auto& c : candidates) {
 		std::sort(c.users.begin(), c.users.end());
 		c.users.erase(std::unique(c.users.begin(), c.users.end()), c.users.end());
-		if (c.firstUse == UINT32_MAX) { c.exclusion = "unused"; }
+		const auto& name = c.concrete->GetName();
+		if (std::any_of(diagnosticExclusions.begin(), diagnosticExclusions.end(),
+				[&](const std::string& token) { return name.find(token) != std::string::npos; }))
+			c.exclusion = "ORG_PERSISTENT_ALIAS_EXCLUDE";
+		else if (c.firstUse == UINT32_MAX) { c.exclusion = "unused"; }
 		else if (!c.direct) { c.exclusion = "group member"; }
 		else if (c.manualPool) {
 			if (!c.firstUseIsWrite)
@@ -2521,6 +2539,25 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 			independentBytes / (1024.0 * 1024.0), requiredBytes / (1024.0 * 1024.0), reservedBytes / (1024.0 * 1024.0), changed);
 	if (logging) for (const auto& c : candidates) if (c.exclusion)
 		spdlog::info("Persistent alias exclusion: '{}' reason='{}' bytes={}", c.concrete->GetName(), c.exclusion, c.sizeBytes);
+	if (logging) {
+		std::unordered_map<uint32_t, const std::string*> nameBySlot;
+		for (const auto& main : state.mainPasses) nameBySlot.emplace(main.id.index, &main.name);
+		std::vector<std::string> nameByRank(nextRank);
+		for (uint32_t p = 0; p < structure.passes.size(); ++p) {
+			if (rank[p] == UINT32_MAX) continue;
+			const auto found = nameBySlot.find(structure.passes[p].preparedPassIndex);
+			nameByRank[rank[p]] = found != nameBySlot.end() ? *found->second : "<pass " + std::to_string(p) + ">";
+		}
+		if (state.aliasPlans <= 2) {
+			uint32_t r = 0;
+			for (const auto& batch : graph.batches) for (const auto pass : batch.passes)
+				spdlog::info("Persistent alias rank {}: '{}' queue={}", r++, nameByRank[rank[pass]], batch.queue);
+		}
+		for (const auto& c : candidates) if (c.pooled)
+			spdlog::info("Persistent alias placement:'{}' pool={:#x} offset={} bytes={} first={}:{}({}) last={}:{} users={}",
+				c.concrete->GetName(), c.poolID, c.offset, c.sizeBytes, c.firstUse, nameByRank[c.firstUse],
+				c.firstUseIsWrite ? "write" : "read", c.lastUse, nameByRank[c.lastUse], c.users.size());
+	}
 	return changed;
 }
 
