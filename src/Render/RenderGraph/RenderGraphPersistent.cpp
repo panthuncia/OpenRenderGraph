@@ -334,6 +334,7 @@ struct RenderGraph::PersistentExecutionState {
 	std::unordered_map<Resource*, AliasPlacementRecord> aliasPlaced; // Concrete resources placed by this planner.
 	std::vector<std::pair<uint32_t, uint32_t>> aliasEdges;          // Installed placement orderings (logical pass slots).
 	uint64_t aliasPlans = 0, aliasRematerializations = 0;
+	bool forceNewAliasHeaps = false; // Diagnostic (ORG_PERSISTENT_FORCE_REALIAS): next plan re-places every pool.
 	const void* dumpedExecutable = nullptr; // Compile-dump mode: last executable written.
 	// Diagnostic: per-pass preparation cost (logged periodically).
 	std::unordered_map<std::string, std::pair<uint64_t, uint64_t>> prepareCostByPass; // lowering: name -> (ns, calls)
@@ -808,6 +809,34 @@ static void InstallMainPass(RenderGraph& graph, State& state, persistent::GraphE
 }
 
 // ---------------------------------------------------------------------------
+// Diagnostic: forced alias re-placement
+//
+// ORG_PERSISTENT_FORCE_REALIAS realizes every alias pool on a fresh heap, which
+// rematerializes every placed resource and rotates its descriptor slots: the
+// event a pool growth causes once at startup, made repeatable so consumers of
+// descriptor indices can be tested on the exact frame it happens.
+//   interval:N  every N frames (a structural build each time)
+//   captures    in the build that hosts frame-interrupting passes, so a
+//               mid-frame readback observes the rotation frame itself
+
+namespace {
+struct ForcedRealiasConfig { uint64_t interval = 0; bool withCaptures = false; };
+const ForcedRealiasConfig& ForcedRealias() {
+	static const ForcedRealiasConfig config = [] {
+		ForcedRealiasConfig result;
+		const char* value = std::getenv("ORG_PERSISTENT_FORCE_REALIAS");
+		if (!value) return result;
+		const std::string text(value);
+		if (text == "captures") result.withCaptures = true;
+		else if (text.rfind("interval:", 0) == 0) result.interval = std::strtoull(text.c_str() + 9, nullptr, 10);
+		if (result.interval || result.withCaptures) spdlog::warn("Persistent graph: forced alias re-placement enabled ({})", text);
+		return result;
+	}();
+	return config;
+}
+} // namespace
+
+// ---------------------------------------------------------------------------
 // Bootstrap
 
 static void LogRelowerDiff(const std::string& name, const State::MainPass& main, const LoweredPass& lowered) {
@@ -1018,6 +1047,21 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 		AdvancePersistentStructuralBuild(structural);
 		for (auto& desc : UpdatePersistentFrameInterruptingPasses(std::move(interrupting), primaryBackend))
 			frameExt.push_back(std::move(desc));
+		if (const auto interval = ForcedRealias().interval; interval && !state.pending && state.frameNumber % interval == 0) {
+			BT_ZONE_SCOPE("ORG.Persistent.ForcedRealias");
+			auto forced = state.program.BeginEdit();
+			// Re-placement is only valid in a structural edit (the executable must
+			// re-validate the new overlaps). Dropping the orderings makes it one;
+			// the planner re-derives them for the new placements.
+			forced.ClearPlacementOrderings();
+			state.aliasEdges.clear();
+			state.forceNewAliasHeaps = true;
+			auto ready = BuildPersistentStructural(forced);
+			state.forceNewAliasHeaps = false;
+			if (!ready || !state.program.Install(forced, ready)) throw std::runtime_error("Persistent forced alias re-placement failed to install");
+			++state.structuralBuilds;
+			spdlog::info("Persistent forced alias re-placement: frame={}", state.frameNumber);
+		}
 		auto ensureEdit = [&]() -> persistent::GraphEditTransaction& {
 			if (!edit) edit.emplace(state.program.BeginEdit());
 			return *edit;
@@ -2425,7 +2469,10 @@ std::vector<RenderGraph::ExternalPassDesc> RenderGraph::UpdatePersistentFrameInt
 		for (const auto b : before) edit.AddOrdering(main.id, state.mainPasses[b].id);
 		state.hostedMainPasses.push_back(mainIndex);
 	}
+	state.forceNewAliasHeaps = ForcedRealias().withCaptures && !state.hostedMainPasses.empty();
 	auto ready = BuildPersistentStructural(edit);
+	if (state.forceNewAliasHeaps) spdlog::info("Persistent forced alias re-placement with frame-interrupting passes: frame={}", state.frameNumber);
+	state.forceNewAliasHeaps = false;
 	if (!ready || !state.program.Install(edit, ready)) throw std::runtime_error("Persistent frame-interrupting pass edit failed to install");
 	++state.structuralBuilds;
 	basic_telemetry::AddCounter("ORG.Persistent.StructuralBuilds");
@@ -2669,9 +2716,12 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		// through the leases held by in-flight publications.
 		auto& pool = state.aliasPools[poolID];
 		const bool initial = !static_cast<bool>(pool.allocation);
-		if (initial || heapEnd > pool.capacityBytes || poolAlignment > pool.alignment) {
+		const bool grow = !initial && (heapEnd > pool.capacityBytes || poolAlignment > pool.alignment);
+		const bool forced = !initial && !grow && state.forceNewAliasHeaps;
+		if (initial || grow || forced) {
 			uint64_t capacity = heapEnd;
-			if (!initial && pool.capacityBytes)
+			if (forced) capacity = (std::max)(capacity, pool.capacityBytes);
+			else if (!initial && pool.capacityBytes)
 				capacity = (std::max)(capacity, static_cast<uint64_t>(std::ceil(static_cast<double>(pool.capacityBytes) * headroom)));
 			rhi::ma::AllocationDesc allocDesc{};
 			allocDesc.heapType = rhi::HeapType::DeviceLocal;
@@ -2698,7 +2748,7 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 			++pool.generation;
 			pool.heap = AliasHeapGeneration::Capture(pool.allocation, pool.generation);
 			spdlog::info("Persistent alias pool {}: pool={:#x} capacity={} required={} alignment={} placements={} generation={}",
-				initial ? "allocated" : "grew", poolID, capacity, heapEnd, poolAlignment, members.size(), pool.generation);
+				initial ? "allocated" : forced ? "reallocated (forced)" : "grew", poolID, capacity, heapEnd, poolAlignment, members.size(), pool.generation);
 			basic_telemetry::AddCounter("ORG.Persistent.AliasPoolAllocations");
 		}
 		pool.resourceClass = candidates[members.front()].resourceClass;
