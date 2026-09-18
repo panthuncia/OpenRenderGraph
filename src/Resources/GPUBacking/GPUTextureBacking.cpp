@@ -3,6 +3,7 @@
 #include <stdexcept>
 
 #include "Managers/Singletons/DeviceManager.h"
+#include <BasicTelemetry/Tracy.h>
 #include "Utilities/ORGUtilities.h"
 #include "Managers/Singletons/DescriptorHeapManager.h"
 #include "Managers/Singletons/UploadManager.h"
@@ -138,6 +139,7 @@ void GpuTextureBacking::initialize(const TextureDescription& desc,
 
 	rhi::ResourceDesc textureDesc{
 		.type = desc.type,
+		.queueSharing = desc.queueSharing,
 		.texture = {
 			.format = desc.format,
 			.width = static_cast<uint32_t>(width),
@@ -235,6 +237,7 @@ void GpuTextureBacking::initialize(const TextureDescription& desc,
 		rhi::ma::AllocationDesc allocationDesc;
 		allocationDesc.heapType = rhi::HeapType::DeviceLocal;
 
+		BT_ZONE_SCOPE("GPUTextureBacking::CreateResource");
 		const auto result = DeviceManager::GetInstance().CreateResourceTracked(
 			allocationDesc,
 			textureDesc,

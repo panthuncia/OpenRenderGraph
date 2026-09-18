@@ -77,9 +77,8 @@ struct TrackedUploadTicket {
     }
 };
 
-/// Descriptor for a single streaming upload operation.
-/// Captured by the UploadManager's streaming path and consumed each frame
-/// by the StreamingUploadPass.
+/// Descriptor for a single copy-queue upload consumed by a graph copy pass
+/// (CLod::AsyncUpload snapshots).
 struct StreamingUploadDescriptor {
     std::shared_ptr<Resource> srcUploadBuffer;   // Upload-heap page
     size_t srcOffset = 0;
@@ -87,6 +86,20 @@ struct StreamingUploadDescriptor {
     size_t dstOffset = 0;
     size_t size = 0;
     std::shared_ptr<TrackedUploadTicket> ticket;
+};
+
+// Worker-side upload destination. The producer attests that, for the whole
+// write window, no queue can access any byte of the resource: it is either a
+// pooled versioned backing leased from VersionedGpuBufferBackingPool::Acquire
+// (pool-only owned or retired past the frame ring) or a texture that no queue
+// has used yet. Live, published resources never go through this path; they are
+// written by the render thread's frame upload instance, ordered by the graph.
+// The resource must be created with rhi::QueueSharing::Concurrent so the copy
+// queue write needs no queue-family ownership transfer on any backend.
+struct WorkerOwnedDestination {
+    enum class Ownership : uint8_t { PooledBackingLease, FreshTexture };
+    std::shared_ptr<Resource> resource;
+    Ownership ownership = Ownership::PooledBackingLease;
 };
 
 

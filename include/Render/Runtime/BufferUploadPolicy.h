@@ -129,6 +129,13 @@ public:
         stats.overlapBytes = m_coalescedOverlapBytes;
 
         auto mergedDirty = CoalesceDirtyRanges(std::move(m_coalescedDirtyRanges), m_coalescedDirtyRangesSorted);
+        // One batched upload for every dirty range of this buffer: a single
+        // upload-heap allocation and map instead of one per range, which
+        // matters once producers stage rows individually (scattered ranges).
+        std::vector<UploadRegion> regions;
+        regions.reserve(mergedDirty.size());
+        const char* firstFile = nullptr;
+        int firstLine = 0;
         for (const auto& range : mergedDirty) {
             const size_t uploadSize = range.end - range.begin;
             if (uploadSize == 0) {
@@ -139,24 +146,17 @@ public:
             if (!source) {
                 throw std::runtime_error("Upload policy source mirror returned null for a dirty range");
             }
-
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
-            uploadService.UploadData(
-                source,
-                uploadSize,
-                target,
-                range.begin,
-                range.file,
-                range.line);
-#else
-            uploadService.UploadData(
-                source,
-                uploadSize,
-                target,
-                range.begin);
-#endif
+            if (!firstFile) { firstFile = range.file; firstLine = range.line; }
+            regions.push_back({ source, uploadSize, range.begin });
             ++stats.flushedWrites;
             stats.flushedBytes += static_cast<uint64_t>(uploadSize);
+        }
+        if (!regions.empty()) {
+#if BUILD_TYPE == BUILD_TYPE_DEBUG
+            uploadService.UploadDataBatch(target, regions, firstFile, firstLine);
+#else
+            uploadService.UploadDataBatch(target, regions);
+#endif
         }
 
         stats.mergedWrites = stats.stagedWrites > stats.flushedWrites ? (stats.stagedWrites - stats.flushedWrites) : 0;

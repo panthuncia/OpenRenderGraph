@@ -694,6 +694,17 @@ int main() {
         .afterPass[producerPosition].textures.front().afterSync == rhi::ResourceSyncState::All);
     CHECK(crossQueueBarriers.batches[crossQueueStep->batch]
         .beforePass[consumerPosition].textures.front().beforeSync == rhi::ResourceSyncState::All);
+    // Queue-family ownership travels with the pair: the producer (slot 0,
+    // graphics) releases to the consumer's family (slot 1, compute) and the
+    // consumer acquires from graphics.
+    CHECK(crossQueueBarriers.batches[crossQueueStep->previousBatch]
+        .afterPass[producerPosition].textures.front().queueOwnership == rhi::QueueOwnership::Release);
+    CHECK(crossQueueBarriers.batches[crossQueueStep->previousBatch]
+        .afterPass[producerPosition].textures.front().ownershipPeer == rhi::QueueKind::Compute);
+    CHECK(crossQueueBarriers.batches[crossQueueStep->batch]
+        .beforePass[consumerPosition].textures.front().queueOwnership == rhi::QueueOwnership::Acquire);
+    CHECK(crossQueueBarriers.batches[crossQueueStep->batch]
+        .beforePass[consumerPosition].textures.front().ownershipPeer == rhi::QueueKind::Graphics);
     auto dependencyOnly = stateInput;
     dependencyOnly.structure.resourceIDs.push_back(2);
     dependencyOnly.structure.resourceShapes.push_back({0, 0, false});

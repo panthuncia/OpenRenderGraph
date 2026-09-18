@@ -5,6 +5,7 @@
 #include <stdexcept>
 
 #include "Managers/Singletons/DeviceManager.h"
+#include <BasicTelemetry/Tracy.h>
 #include "Managers/Singletons/DeletionManager.h"
 #include "Resources/MemoryStatisticsComponents.h"
 
@@ -23,6 +24,12 @@ GpuBufferBacking::GpuBufferBacking(
     if (aliasPlacement && !aliasPlacement->heap) throw std::invalid_argument("Missing alias heap owner");
 
     rhi::ResourceDesc desc = rhi::helpers::ResourceDesc::Buffer(bufferSize);
+    // Buffers are routinely touched from more than one queue (frame uploads,
+    // copy-queue streaming, readbacks) and carry no compression metadata that
+    // concurrent sharing could cost, so every graph buffer is concurrent: no
+    // Vulkan queue-family ownership transfers are needed for buffers, and D3D12
+    // ignores the flag.
+    desc.queueSharing = rhi::QueueSharing::Concurrent;
     if (unorderedAccess) {
         desc.resourceFlags |= rhi::ResourceFlags::RF_AllowUnorderedAccess;
     }
@@ -78,6 +85,8 @@ GpuBufferBacking::GpuBufferBacking(
 			allocationDesc.flags |= rhi::ma::AllocationFlagCommitted;
 			allocationDesc.extraHeapFlags = rhi::HeapFlags::Shared;
 		}
+        BT_ZONE_SCOPE("GpuBufferBacking::CreateResource");
+        BT_ZONE_VALUE(static_cast<int64_t>(bufferSize));
         const auto result = DeviceManager::GetInstance().CreateResourceTracked(
             allocationDesc,
             desc,

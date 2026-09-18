@@ -20,6 +20,7 @@
 
 #include "Render/Runtime/UploadTypes.h"
 #include "Render/Runtime/ITaskService.h"
+#include "Render/Runtime/MpscQueue.h"
 
 namespace org::imm { class ImmediateCommandList; }
 
@@ -39,6 +40,13 @@ class Buffer;
 //   2. Call UploadData() / UploadTextureSubresources() during the Update phase.
 //   3. Call ProcessUploads() from a pass's RecordImmediateCommands() to emit GPU copies.
 //   4. Call ProcessDeferredReleases() once per frame (after GPU retire) to reclaim pages.
+//
+// Threading: the instance is owned by one thread (SetOwnerThread, the render
+// thread). Every queue operation runs on that thread and there is no queue
+// mutex. Other threads reach it only through lock-free mailboxes: posted
+// uploads (PostTextureSubresources, off-owner UploadData) drained by the owner
+// before it records, and pages prepared by the background task. Off-owner
+// producer calls are counted (ORG.Upload.FrameInstance.OffThreadCalls).
 class UploadInstance {
 public:
 	using UploadTarget        = org::runtime::UploadTarget;
@@ -156,6 +164,20 @@ public:
 
 	// Emit GPU copy commands for all queued buffer and texture uploads.
 	// Call from a pass's RecordImmediateCommands().
+	// Owner-thread texture upload with caller-owned bytes; from any other
+	// thread the request is posted and recorded by the owner. See IUploadService.
+#if BUILD_TYPE == BUILD_TYPE_DEBUG
+	void PostTextureSubresources(UploadTarget target, rhi::Format fmt, uint32_t baseWidth, uint32_t baseHeight,
+		uint32_t depthOrLayers, uint32_t mipLevels, uint32_t arraySize,
+		std::shared_ptr<const std::vector<rhi::helpers::SubresourceData>> subresources,
+		std::shared_ptr<const void> keepAlive, const char* file = nullptr, int line = 0);
+#else
+	void PostTextureSubresources(UploadTarget target, rhi::Format fmt, uint32_t baseWidth, uint32_t baseHeight,
+		uint32_t depthOrLayers, uint32_t mipLevels, uint32_t arraySize,
+		std::shared_ptr<const std::vector<rhi::helpers::SubresourceData>> subresources,
+		std::shared_ptr<const void> keepAlive);
+#endif
+
 	void ProcessUploads(uint8_t frameIndex, org::imm::ImmediateCommandList& commandList);
 	void ProcessUploadsThrough(uint8_t frameIndex, org::imm::ImmediateCommandList& commandList, uint64_t sequenceInclusive);
 
@@ -166,6 +188,12 @@ public:
 	// Configuration
 
 	void SetResolveContext(UploadResolveContext ctx);
+	// The frame upload instance is owned by the render thread. Producer calls
+	// from any other thread are counted (ORG.Upload.FrameInstance.OffThreadCalls
+	// and per-API) so they can be routed to the worker upload service; once the
+	// count is zero the queue mutex can be removed.
+	void SetOwnerThread();
+	bool IsOwnerThread() const noexcept;
 	void SetPendingWorkChangedCallback(PendingWorkChangedCallback callback);
 	void SetTargetTelemetryCallback(TargetTelemetryCallback callback);
 	void SetInvalidRegistryHandleCallback(InvalidRegistryHandleCallback callback);
@@ -199,9 +227,14 @@ private:
 	// Internal helpers
 
 	// A region larger than a page needs a dedicated page; callers create it with
-	// PrepareDedicatedPage before taking m_uploadQueueMutex so GPU allocation
+	// PrepareDedicatedPage so GPU allocation
 	// never runs under the lock the render thread drains through.
 	UploadPagePtr PrepareDedicatedPage(size_t size);
+	// Owner-thread texture upload with an optional pre-created dedicated page.
+	void UploadTextureSubresourcesPrepared(UploadTarget target, rhi::Format fmt, uint32_t baseWidth, uint32_t baseHeight,
+		uint32_t depthOrLayers, uint32_t mipLevels, uint32_t arraySize,
+		const rhi::helpers::SubresourceData* srcSubresources, uint32_t srcCount,
+		UploadPagePtr preparedPage, const char* file, int line);
 	bool AllocateUploadRegion(size_t size, size_t alignment,
 	                          std::shared_ptr<Resource>& outUploadBuffer, size_t& outOffset,
 	                          UploadPagePtr preparedDedicated = nullptr);
@@ -284,13 +317,43 @@ private:
 	TargetTelemetryCallback m_targetTelemetry;
 	InvalidRegistryHandleCallback m_invalidRegistryHandle;
 
-	mutable std::mutex m_uploadQueueMutex;
-	std::mutex m_workerMutex;
+	void NoteProducerCall(const char* api, const UploadTarget& target);
+	void NoteOffOwnerCall(const char* api);
+	// Owner-thread: apply uploads other threads posted.
+	void DrainPostedUploads();
+	// Owner-thread: move pages the background task prepared into m_readyPages.
+	void DrainReadyPageInbox();
+	std::atomic<std::size_t> m_ownerThreadHash{ 0 };
+	std::atomic<std::uint32_t> m_offThreadCallsLogged{ 0 };
+
+	// A texture upload staged entirely on the posting thread: it created the
+	// dedicated page and copied the subresources into it. The owner only
+	// registers the copy records, so no allocation or memcpy runs on the
+	// render thread for a posted upload.
+	struct PostedTextureUpload {
+		UploadTarget target;
+		UploadPagePtr page;
+		std::vector<TextureUpdate> updates; // footprint offsets are page-relative
+		size_t bytes = 0;
+		bool mapped = false;
+	};
+	struct PostedBufferUpload {
+		UploadTarget target;
+		std::vector<uint8_t> bytes;
+		size_t dstOffset = 0;
+		const char* file = nullptr;
+		int line = 0;
+	};
+	org::runtime::MpscQueue<PostedTextureUpload> m_postedTextureUploads;
+	org::runtime::MpscQueue<PostedBufferUpload> m_postedBufferUploads;
+	org::runtime::MpscQueue<UploadPagePtr> m_readyPageInbox;
+
+	std::mutex m_workerMutex; // page-preparation task lifetime only (start/stop)
 	std::shared_ptr<org::runtime::ITaskService> m_taskService;
 	std::shared_ptr<org::runtime::ITaskScope> m_taskScope;
 	std::atomic<bool> m_workerDrainScheduled{false};
-	bool m_workerQuit = false;
-	size_t m_workerRequestedPages = 0;
+	std::atomic<bool> m_workerQuit{ false };
+	std::atomic<size_t> m_workerRequestedPages{ 0 };
 };
 
 } // namespace org

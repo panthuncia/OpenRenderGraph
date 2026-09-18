@@ -4,6 +4,16 @@
 #include <algorithm>
 #include <stdexcept>
 #include <BasicTelemetry/Tracy.h>
+#include <BasicTelemetry/Telemetry.h>
+
+namespace {
+// Schedule queue slots map to QueueKind the same way submission does
+// (RenderGraph.cpp: 0 graphics, 1 compute, otherwise copy).
+rhi::QueueKind OwnershipPeerForQueue(uint32_t queue) noexcept {
+    return queue == 0 ? rhi::QueueKind::Graphics
+        : queue == 1 ? rhi::QueueKind::Compute : rhi::QueueKind::Copy;
+}
+}
 
 namespace org::experimental {
 namespace {
@@ -220,7 +230,11 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
                     release.beforeSync = static_cast<rhi::ResourceSyncState>(step.before.sync);
                     release.afterSync = rhi::ResourceSyncState::All;
                     release.discard = release.beforeLayout == rhi::ResourceLayout::Undefined;
+                    release.queueOwnership = rhi::QueueOwnership::Release;
+                    release.ownershipPeer = OwnershipPeerForQueue(consumerQueue);
                     afterProducer->textures.push_back(release);
+                    barrier.queueOwnership = rhi::QueueOwnership::Acquire;
+                    barrier.ownershipPeer = OwnershipPeerForQueue(previousQueue);
                 }
                 beforePass.textures.push_back(barrier);
             } else {
@@ -230,6 +244,21 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
                 const auto beforeSync = static_cast<rhi::ResourceSyncState>(step.before.sync);
                 const auto afterAccess = static_cast<rhi::ResourceAccessType>(step.after.access);
                 const auto afterSync = static_cast<rhi::ResourceSyncState>(step.after.sync);
+                if (!fixedHeapState && crossQueue) {
+                    // Queue-family ownership handoff for exclusive buffers. The RHI
+                    // drops the pair on D3D12 and on Vulkan when families match or the
+                    // buffer is QueueSharing::Concurrent.
+                    auto release = MakeWholeBufferBarrier(handle, beforeAccess,
+                        rhi::ResourceAccessType::Common, beforeSync, rhi::ResourceSyncState::All);
+                    release.queueOwnership = rhi::QueueOwnership::Release;
+                    release.ownershipPeer = OwnershipPeerForQueue(consumerQueue);
+                    afterProducer->buffers.push_back(release);
+                    auto acquire = MakeWholeBufferBarrier(handle, rhi::ResourceAccessType::Common,
+                        afterAccess, rhi::ResourceSyncState::All, afterSync);
+                    acquire.queueOwnership = rhi::QueueOwnership::Acquire;
+                    acquire.ownershipPeer = OwnershipPeerForQueue(previousQueue);
+                    beforePass.buffers.push_back(acquire);
+                }
                 if (!fixedHeapState && previousQueue == consumerQueue
                     && beforeAccess != rhi::ResourceAccessType::None
                     && beforeAccess != rhi::ResourceAccessType::Common
@@ -364,7 +393,16 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
                     release.beforeSync = static_cast<rhi::ResourceSyncState>(before.sync);
                     release.afterSync = rhi::ResourceSyncState::All;
                     release.discard = release.beforeLayout == rhi::ResourceLayout::Undefined;
+                    release.queueOwnership = rhi::QueueOwnership::Release;
+                    release.ownershipPeer = OwnershipPeerForQueue(consumerQueue);
                     afterProducer->textures.push_back(release);
+                    barrier.queueOwnership = rhi::QueueOwnership::Acquire;
+                    barrier.ownershipPeer = OwnershipPeerForQueue(previousQueue);
+                } else if (submittedQueueHandoff) {
+                    // The producer ran in an earlier submission on another queue and
+                    // cannot record a release here. Counted so cross-frame exclusive
+                    // texture handoffs are visible; graph buffers are Concurrent.
+                    basic_telemetry::AddCounter("ORG.Execution.CrossFrameTextureQueueHandoff");
                 }
                 beforePass.textures.push_back(barrier);
             } else {
@@ -391,6 +429,18 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
                 // synchronization barrier. The first access itself establishes
                 // state; subsequent and cross-queue accesses use the common
                 // helper shared with the synchronous recorder.
+                if (!fixedHeapState && crossQueue) {
+                    auto release = MakeWholeBufferBarrier(handle, beforeAccess,
+                        rhi::ResourceAccessType::Common, beforeSync, rhi::ResourceSyncState::All);
+                    release.queueOwnership = rhi::QueueOwnership::Release;
+                    release.ownershipPeer = OwnershipPeerForQueue(graph.batches[step.batch].queue);
+                    afterProducer->buffers.push_back(release);
+                    auto acquire = MakeWholeBufferBarrier(handle, rhi::ResourceAccessType::Common,
+                        afterAccess, rhi::ResourceSyncState::All, afterSync);
+                    acquire.queueOwnership = rhi::QueueOwnership::Acquire;
+                    acquire.ownershipPeer = OwnershipPeerForQueue(previousQueue);
+                    beforePass.buffers.push_back(acquire);
+                }
                 if (!fixedHeapState
                     && copyQueueCompatibleBefore
                     && !submittedQueueHandoff

@@ -90,6 +90,7 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/MemoryIntrospectionBackend.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/DefaultStatisticsService.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/DefaultUploadService.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/CopyQueueUploadService.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/DefaultUploadPolicyService.cpp"
     
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/DefaultReadbackService.cpp"
@@ -256,6 +257,23 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
         target_link_libraries(OpenRenderGraphExternalResourceTests PRIVATE "${OPENRENDERGRAPH_PIX_RUNTIME}")
     endif()
     add_test(NAME OpenRenderGraphExternalResourceTests COMMAND OpenRenderGraphExternalResourceTests)
+    add_executable(OpenRenderGraphCopyQueueUploadTests tests/CopyQueueUploadServiceTests.cpp)
+    target_include_directories(OpenRenderGraphCopyQueueUploadTests PRIVATE src/include)
+    if(WIN32)
+        target_sources(OpenRenderGraphCopyQueueUploadTests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/../BasicRHI/tests/StreamlineStubs.cpp")
+        if(TARGET Streamline::headers)
+            target_link_libraries(OpenRenderGraphCopyQueueUploadTests PRIVATE Streamline::headers)
+        endif()
+    endif()
+    if(MSVC)
+        target_compile_options(OpenRenderGraphCopyQueueUploadTests PRIVATE /utf-8)
+    endif()
+    target_link_libraries(OpenRenderGraphCopyQueueUploadTests PRIVATE OpenRenderGraph BasicRHI::BasicRHI d3d12 dxgi d3dcompiler)
+    if(WIN32 AND TARGET Pix::headers)
+        target_link_libraries(OpenRenderGraphCopyQueueUploadTests PRIVATE "${OPENRENDERGRAPH_PIX_RUNTIME}")
+    endif()
+    add_test(NAME OpenRenderGraphCopyQueueUploadTests COMMAND OpenRenderGraphCopyQueueUploadTests)
     add_custom_target(OpenRenderGraphOffscreenTests DEPENDS OpenRenderGraphExternalResourceTests)
     if(WIN32)
         # Keep the offscreen suite runnable from its build directory without a

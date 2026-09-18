@@ -43,6 +43,10 @@ struct TextureDescription {
 	bool allowAlias = false;
     std::optional<uint64_t> aliasingPoolID;
 	rhi::ResourceLayout initialLayout = rhi::ResourceLayout::Undefined;
+	// Concurrent: written by the worker upload service on the copy queue and
+	// read by the graph without a queue-family ownership transfer. Textures stay
+	// exclusive by default because concurrent images may lose compression.
+	rhi::QueueSharing queueSharing = rhi::QueueSharing::Exclusive;
 
 	float clearColor[4] = { 0.0f, 0.0f, 0.0f, 1.0f }; // default RGBA clear color
 	float depthClearValue = 1.0f; // default depth clear value

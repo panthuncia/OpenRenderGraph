@@ -24,8 +24,8 @@
 #include "Render/Runtime/UploadTypes.h"
 #include "Render/Runtime/StreamingUploadTypes.h"
 #include "Render/PassBuilders.h"
-#include "Managers/AsyncCopyPagePool.h"
 #include "Managers/UploadInstance.h"
+#include "Render/Runtime/CopyQueueUploadService.h"
 
 namespace org {
 
@@ -53,6 +53,10 @@ public:
 #if BUILD_TYPE == BUILD_TYPE_DEBUG
 	void UploadData(const void* data, size_t size, UploadTarget resourceToUpdate, size_t dataBufferOffset, const char* file, int line);
 	void UploadDataBatch(UploadTarget resourceToUpdate, std::span<const org::runtime::UploadRegion> regions, const char* file, int line);
+	void PostTextureSubresources(UploadTarget target, rhi::Format fmt, uint32_t baseWidth, uint32_t baseHeight,
+		uint32_t depthOrLayers, uint32_t mipLevels, uint32_t arraySize,
+		std::shared_ptr<const std::vector<rhi::helpers::SubresourceData>> subresources,
+		std::shared_ptr<const void> keepAlive, const char* file, int line);
 	void UploadTextureSubresources(
 		UploadTarget target,
 		rhi::Format fmt,
@@ -68,6 +72,10 @@ public:
 #else
 	void UploadData(const void* data, size_t size, UploadTarget resourceToUpdate, size_t dataBufferOffset);
 	void UploadDataBatch(UploadTarget resourceToUpdate, std::span<const org::runtime::UploadRegion> regions);
+	void PostTextureSubresources(UploadTarget target, rhi::Format fmt, uint32_t baseWidth, uint32_t baseHeight,
+		uint32_t depthOrLayers, uint32_t mipLevels, uint32_t arraySize,
+		std::shared_ptr<const std::vector<rhi::helpers::SubresourceData>> subresources,
+		std::shared_ptr<const void> keepAlive);
 	void UploadTextureSubresources(
 		UploadTarget target,
 		rhi::Format fmt,
@@ -80,6 +88,7 @@ public:
 		uint32_t srcCount);
 #endif	
 	void ProcessUploads(uint8_t frameIndex, org::imm::ImmediateCommandList& commandList);
+	void SetOwnerThread();
 	void QueueResourceCopy(const std::shared_ptr<Resource>& destination, const std::shared_ptr<Resource>& source, size_t size);
 	void ExecuteResourceCopies(uint8_t frameIndex, org::imm::ImmediateCommandList& commandList);
 	void ProcessDeferredReleases(uint8_t frameIndex);
@@ -87,24 +96,11 @@ public:
 	std::shared_ptr<RenderPass> GetUploadPass() const { return m_uploadPass; }
 	std::string DescribeQueuedTargetByGlobalResourceId(uint64_t globalResourceId);
 
-	// ── Streaming upload API (copy-queue path) ──────────────────────────
-	/// Queue a streaming upload that will be executed on the copy queue
-	/// via StreamingUploadPass. The data is copied into a dedicated
-	/// upload-heap page pool (AsyncCopyPagePool) immediately.
-	/// Thread-safe.
-	void QueueStreamingUpload(const void* data, size_t size,
-	                          std::shared_ptr<Resource> destination,
-	                          size_t dstOffset = 0);
-	std::shared_ptr<TrackedUploadTicket> QueueTrackedStreamingUpload(
-		const void* data, size_t size, std::shared_ptr<Resource> destination,
-		size_t dstOffset = 0);
+	// ── Worker upload path (copy queue) ─────────────────────────────────
 	std::shared_ptr<TrackedUploadTicket> QueueTrackedStreamingUploadSegments(
 		std::span<const StreamingUploadSegment> segments, size_t totalSize,
-		std::shared_ptr<Resource> destination, size_t dstOffset = 0);
-
-	/// Reset the streaming page pool for the next frame. Should be called
-	/// once the GPU is done with the previous frame's streaming uploads.
-	void ResetStreamingPagePool() { m_streamingPagePool.ResetForFrame(); }
+		WorkerOwnedDestination destination, size_t dstOffset = 0);
+	org::runtime::CopyQueueUploadService* CopyQueueUploads() { return m_copyQueueUploads.get(); }
 
 	void Cleanup();
 private:
@@ -159,20 +155,6 @@ private:
 	void RefreshQueuedCopyTelemetryLocked();
 	bool IsUploadTargetValid(const UploadTarget& target, const char* reason, const char* file, int line);
 	void CaptureUploadTargetTelemetry(const UploadTarget& target, uint64_t& outId, std::string& outName);
-	std::shared_ptr<TrackedUploadTicket> SubmitStreamingUpload(
-		const void* data, size_t size, std::shared_ptr<Resource> destination,
-		size_t dstOffset, bool exposeTicket);
-	std::shared_ptr<TrackedUploadTicket> SubmitStreamingUploadSegments(
-		std::span<const StreamingUploadSegment> segments, size_t totalSize,
-		std::shared_ptr<Resource> destination, size_t dstOffset, bool exposeTicket);
-	void RunStreamingCompletionWorker(std::stop_token stopToken);
-
-	struct SubmittedStreamingBatch {
-		rhi::CommandAllocatorPtr allocator;
-		rhi::CommandListPtr commandList;
-		std::vector<StreamingUploadDescriptor> descriptors;
-		uint64_t timelineValue = 0;
-	};
 
 	uint8_t m_numFramesInFlight = 0;
 
@@ -183,15 +165,8 @@ private:
 	std::shared_ptr<UploadPass> m_uploadPass;
 	std::unique_ptr<UploadInstance> m_uploadInstance;
 
-	// ── Streaming upload (copy-queue) state ─────────────────────────────
-	AsyncCopyPagePool                     m_streamingPagePool;
-	std::mutex                            m_streamingMutex;
-	std::condition_variable_any           m_streamingCv;
-	std::shared_ptr<rhi::TimelinePtr>     m_streamingTimeline;
-	std::deque<StreamingUploadDescriptor> m_pendingStreamingUploads;
-	std::jthread                          m_streamingCompletionWorker;
-	uint64_t                              m_nextStreamingTimelineValue = 0;
-	bool                                  m_streamingInitialized = false;
+	// ── Worker upload path ──────────────────────────────────────────────
+	std::unique_ptr<org::runtime::CopyQueueUploadService> m_copyQueueUploads;
 
 };
 

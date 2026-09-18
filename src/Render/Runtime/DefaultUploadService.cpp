@@ -12,6 +12,10 @@ public:
         UploadManager::GetInstance().Initialize();
     }
 
+    void SetOwnerThread() override {
+        UploadManager::GetInstance().SetOwnerThread();
+    }
+
     void SetUploadResolveContext(UploadResolveContext context) override {
         UploadManager::GetInstance().SetUploadResolveContext(context);
     }
@@ -27,6 +31,14 @@ public:
 
     void UploadDataBatch(UploadTarget resourceToUpdate, std::span<const UploadRegion> regions, const char* file, int line) override {
         UploadManager::GetInstance().UploadDataBatch(std::move(resourceToUpdate), regions, file, line);
+    }
+
+    void PostTextureSubresources(UploadTarget target, rhi::Format fmt, uint32_t baseWidth, uint32_t baseHeight,
+        uint32_t depthOrLayers, uint32_t mipLevels, uint32_t arraySize,
+        std::shared_ptr<const std::vector<rhi::helpers::SubresourceData>> subresources,
+        std::shared_ptr<const void> keepAlive, const char* file, int line) override {
+        UploadManager::GetInstance().PostTextureSubresources(std::move(target), fmt, baseWidth, baseHeight,
+            depthOrLayers, mipLevels, arraySize, std::move(subresources), std::move(keepAlive), file, line);
     }
 
     void UploadTextureSubresources(
@@ -63,6 +75,14 @@ public:
         UploadManager::GetInstance().UploadDataBatch(std::move(resourceToUpdate), regions);
     }
 
+    void PostTextureSubresources(UploadTarget target, rhi::Format fmt, uint32_t baseWidth, uint32_t baseHeight,
+        uint32_t depthOrLayers, uint32_t mipLevels, uint32_t arraySize,
+        std::shared_ptr<const std::vector<rhi::helpers::SubresourceData>> subresources,
+        std::shared_ptr<const void> keepAlive) override {
+        UploadManager::GetInstance().PostTextureSubresources(std::move(target), fmt, baseWidth, baseHeight,
+            depthOrLayers, mipLevels, arraySize, std::move(subresources), std::move(keepAlive));
+    }
+
     void UploadTextureSubresources(
         UploadTarget target,
         rhi::Format fmt,
@@ -95,28 +115,11 @@ public:
         DeletionManager::GetInstance().ProcessDeletions();
     }
 
-    void QueueStreamingUpload(const void* data, size_t size,
-                              std::shared_ptr<Resource> destination,
-                              size_t dstOffset) override {
-        UploadManager::GetInstance().QueueStreamingUpload(data, size, std::move(destination), dstOffset);
-    }
-
-    std::shared_ptr<TrackedUploadTicket> QueueTrackedStreamingUpload(
-        const void* data, size_t size, std::shared_ptr<Resource> destination,
-        size_t dstOffset) override {
-        return UploadManager::GetInstance().QueueTrackedStreamingUpload(
-            data, size, std::move(destination), dstOffset);
-    }
-
     std::shared_ptr<TrackedUploadTicket> QueueTrackedStreamingUploadSegments(
         std::span<const StreamingUploadSegment> segments, size_t totalSize,
-        std::shared_ptr<Resource> destination, size_t dstOffset) override {
+        WorkerOwnedDestination destination, size_t dstOffset) override {
         return UploadManager::GetInstance().QueueTrackedStreamingUploadSegments(
             segments, totalSize, std::move(destination), dstOffset);
-    }
-
-    void ResetStreamingPagePool() override {
-        UploadManager::GetInstance().ResetStreamingPagePool();
     }
 
     void Cleanup() override {

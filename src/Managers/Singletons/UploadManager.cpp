@@ -1,5 +1,7 @@
 #include "Managers/Singletons/UploadManager.h"
 
+#include <BasicTelemetry/Telemetry.h>
+
 #include <cstring>
 #include <algorithm>
 #include <sstream>
@@ -48,23 +50,15 @@ void UploadManager::Initialize() {
 			return IsUploadTargetValid(target, reason, file, line);
 		});
 	m_uploadInstance->SetResolveContext(m_ctx);
-	{
-		std::lock_guard lock(m_streamingMutex);
-		if (!m_streamingInitialized) {
-			m_streamingTimeline = std::make_shared<rhi::TimelinePtr>();
-			const auto result = DeviceManager::GetInstance().GetDevice().CreateTimeline(
-				*m_streamingTimeline, 0, "TrackedStreamingUploadTimeline");
-			if (rhi::Failed(result) || !*m_streamingTimeline) {
-				m_streamingTimeline.reset();
-				throw std::runtime_error("UploadManager failed to create the tracked streaming upload timeline");
-			}
-			m_nextStreamingTimelineValue = 0;
-			m_streamingInitialized = true;
-		}
+	if (!m_copyQueueUploads) {
+		m_copyQueueUploads = std::make_unique<org::runtime::CopyQueueUploadService>();
 	}
-	if (!m_streamingCompletionWorker.joinable()) {
-		m_streamingCompletionWorker = std::jthread(
-			[this](std::stop_token stopToken) { RunStreamingCompletionWorker(stopToken); });
+	if (!m_copyQueueUploads->Initialized()) {
+		auto& deviceManager = DeviceManager::GetInstance();
+		m_copyQueueUploads->Initialize(deviceManager.GetDevice(), deviceManager.GetCopyQueue());
+		if (!m_copyQueueUploads->Initialized()) {
+			throw std::runtime_error("UploadManager failed to initialize the copy-queue upload service");
+		}
 	}
 	MarkUploadPassDirty();
 }
@@ -177,6 +171,30 @@ void UploadManager::UploadDataBatch(UploadTarget resourceToUpdate, std::span<con
 	m_uploadInstance->UploadDataBatch(std::move(resourceToUpdate), regions, file, line);
 #else
 	m_uploadInstance->UploadDataBatch(std::move(resourceToUpdate), regions);
+#endif
+}
+
+#if BUILD_TYPE == BUILD_TYPE_DEBUG
+void UploadManager::PostTextureSubresources(UploadTarget target, rhi::Format fmt, uint32_t baseWidth, uint32_t baseHeight,
+	uint32_t depthOrLayers, uint32_t mipLevels, uint32_t arraySize,
+	std::shared_ptr<const std::vector<rhi::helpers::SubresourceData>> subresources,
+	std::shared_ptr<const void> keepAlive, const char* file, int line)
+#else
+void UploadManager::PostTextureSubresources(UploadTarget target, rhi::Format fmt, uint32_t baseWidth, uint32_t baseHeight,
+	uint32_t depthOrLayers, uint32_t mipLevels, uint32_t arraySize,
+	std::shared_ptr<const std::vector<rhi::helpers::SubresourceData>> subresources,
+	std::shared_ptr<const void> keepAlive)
+#endif
+{
+	if (!m_uploadInstance) {
+		Initialize();
+	}
+#if BUILD_TYPE == BUILD_TYPE_DEBUG
+	m_uploadInstance->PostTextureSubresources(std::move(target), fmt, baseWidth, baseHeight, depthOrLayers,
+		mipLevels, arraySize, std::move(subresources), std::move(keepAlive), file, line);
+#else
+	m_uploadInstance->PostTextureSubresources(std::move(target), fmt, baseWidth, baseHeight, depthOrLayers,
+		mipLevels, arraySize, std::move(subresources), std::move(keepAlive));
 #endif
 }
 
@@ -295,6 +313,13 @@ std::string UploadManager::DescribeQueuedTargetByGlobalResourceId(uint64_t globa
 	return result.str();
 }
 
+void UploadManager::SetOwnerThread() {
+	if (!m_uploadInstance) {
+		Initialize();
+	}
+	m_uploadInstance->SetOwnerThread();
+}
+
 void UploadManager::ProcessUploads(uint8_t frameIndex, org::imm::ImmediateCommandList& commandList) {
 	if (m_uploadInstance) {
 		m_uploadInstance->ProcessUploads(frameIndex, commandList);
@@ -339,10 +364,9 @@ void UploadManager::ExecuteResourceCopies(uint8_t frameIndex, org::imm::Immediat
 }
 
 void UploadManager::Cleanup() {
-	if (m_streamingCompletionWorker.joinable()) {
-		m_streamingCompletionWorker.request_stop();
-		m_streamingCv.notify_all();
-		m_streamingCompletionWorker.join();
+	if (m_copyQueueUploads) {
+		m_copyQueueUploads->Cleanup();
+		m_copyQueueUploads.reset();
 	}
 
 	if (m_uploadInstance) {
@@ -355,230 +379,15 @@ void UploadManager::Cleanup() {
 		queuedResourceCopies.clear();
 	}
 
-	m_streamingPagePool.Cleanup();
-	{
-		std::lock_guard<std::mutex> lock(m_streamingMutex);
-		for (auto& descriptor : m_pendingStreamingUploads) {
-			if (descriptor.ticket) descriptor.ticket->Cancel();
-		}
-		m_pendingStreamingUploads.clear();
-		m_streamingTimeline.reset();
-		m_streamingInitialized = false;
-		m_nextStreamingTimelineValue = 0;
-	}
 	MarkUploadPassDirty();
-}
-
-void UploadManager::QueueStreamingUpload(
-    const void* data, size_t size,
-    std::shared_ptr<Resource> destination, size_t dstOffset)
-{
-	(void)SubmitStreamingUpload(data, size, std::move(destination), dstOffset, false);
-}
-
-std::shared_ptr<TrackedUploadTicket> UploadManager::QueueTrackedStreamingUpload(
-    const void* data, size_t size, std::shared_ptr<Resource> destination, size_t dstOffset)
-{
-	return SubmitStreamingUpload(data, size, std::move(destination), dstOffset, true);
 }
 
 std::shared_ptr<TrackedUploadTicket> UploadManager::QueueTrackedStreamingUploadSegments(
 	std::span<const StreamingUploadSegment> segments, size_t totalSize,
-	std::shared_ptr<Resource> destination, size_t dstOffset)
+	WorkerOwnedDestination destination, size_t dstOffset)
 {
-	return SubmitStreamingUploadSegments(
-		segments, totalSize, std::move(destination), dstOffset, true);
-}
-
-std::shared_ptr<TrackedUploadTicket> UploadManager::SubmitStreamingUpload(
-	const void* data, size_t size, std::shared_ptr<Resource> destination,
-	size_t dstOffset, bool exposeTicket)
-{
-	if (!data || size == 0 || !destination) return {};
-	if (!m_streamingInitialized) Initialize();
-
-	auto ticket = std::make_shared<TrackedUploadTicket>();
-	Resource::ScopedECSRegistrationSuppression suppressECS;
-	auto uploadBuffer = Buffer::CreateShared(rhi::HeapType::Upload, size, false);
-	uploadBuffer->SetName(exposeTicket ? "TrackedStreamingUploadTemp" : "StreamingUploadTemp");
-	uint8_t* mapped = nullptr;
-	uploadBuffer->GetAPIResource().Map(reinterpret_cast<void**>(&mapped), 0, size);
-	if (!mapped) {
-		ticket->Cancel();
-		return {};
-	}
-	std::memcpy(mapped, data, size);
-	uploadBuffer->GetAPIResource().Unmap(0, size);
-
-	{
-		std::lock_guard lock(m_streamingMutex);
-		StreamingUploadDescriptor descriptor;
-		descriptor.srcUploadBuffer = std::move(uploadBuffer);
-		descriptor.dstResource = std::move(destination);
-		descriptor.dstOffset = dstOffset;
-		descriptor.size = size;
-		descriptor.ticket = ticket;
-		m_pendingStreamingUploads.push_back(std::move(descriptor));
-	}
-	m_streamingCv.notify_one();
-	return exposeTicket ? ticket : std::shared_ptr<TrackedUploadTicket>{};
-}
-
-std::shared_ptr<TrackedUploadTicket> UploadManager::SubmitStreamingUploadSegments(
-	std::span<const StreamingUploadSegment> segments, size_t totalSize,
-	std::shared_ptr<Resource> destination, size_t dstOffset, bool exposeTicket)
-{
-	if (segments.empty() || totalSize == 0 || !destination) return {};
-	if (!m_streamingInitialized) Initialize();
-
-	auto ticket = std::make_shared<TrackedUploadTicket>();
-	Resource::ScopedECSRegistrationSuppression suppressECS;
-	auto uploadBuffer = Buffer::CreateShared(rhi::HeapType::Upload, totalSize, false);
-	uploadBuffer->SetName(exposeTicket ? "TrackedStreamingUploadSegmentsTemp" :
-		"StreamingUploadSegmentsTemp");
-	uint8_t* mapped = nullptr;
-	uploadBuffer->GetAPIResource().Map(reinterpret_cast<void**>(&mapped), 0, totalSize);
-	if (!mapped) {
-		ticket->Cancel();
-		return {};
-	}
-	size_t cursor = 0;
-	for (const auto& segment : segments) {
-		if (!segment.data || segment.size == 0 || segment.size > totalSize - cursor) {
-			uploadBuffer->GetAPIResource().Unmap(0, cursor);
-			ticket->Cancel();
-			return {};
-		}
-		std::memcpy(mapped + cursor, segment.data, segment.size);
-		cursor += segment.size;
-	}
-	uploadBuffer->GetAPIResource().Unmap(0, cursor);
-	if (cursor != totalSize) {
-		ticket->Cancel();
-		return {};
-	}
-
-	{
-		std::lock_guard lock(m_streamingMutex);
-		StreamingUploadDescriptor descriptor;
-		descriptor.srcUploadBuffer = std::move(uploadBuffer);
-		descriptor.dstResource = std::move(destination);
-		descriptor.dstOffset = dstOffset;
-		descriptor.size = totalSize;
-		descriptor.ticket = ticket;
-		m_pendingStreamingUploads.push_back(std::move(descriptor));
-	}
-	m_streamingCv.notify_one();
-	return exposeTicket ? ticket : std::shared_ptr<TrackedUploadTicket>{};
-}
-
-void UploadManager::RunStreamingCompletionWorker(std::stop_token stopToken)
-{
-	try {
-		for (;;) {
-			SubmittedStreamingBatch batch;
-			std::shared_ptr<rhi::TimelinePtr> timeline;
-			{
-				std::unique_lock lock(m_streamingMutex);
-				m_streamingCv.wait(lock, stopToken, [this] { return !m_pendingStreamingUploads.empty(); });
-				if (stopToken.stop_requested()) {
-					for (auto& descriptor : m_pendingStreamingUploads) {
-						if (descriptor.ticket) descriptor.ticket->Cancel();
-					}
-					m_pendingStreamingUploads.clear();
-					return;
-				}
-				if (m_pendingStreamingUploads.empty()) {
-					continue;
-				}
-				constexpr size_t maxDescriptorsPerBatch = 256;
-				constexpr size_t maxBytesPerBatch = 16u * 1024u * 1024u;
-				size_t batchBytes = 0;
-				while (!m_pendingStreamingUploads.empty() &&
-					batch.descriptors.size() < maxDescriptorsPerBatch) {
-					auto& next = m_pendingStreamingUploads.front();
-					if (!batch.descriptors.empty() && batchBytes + next.size > maxBytesPerBatch) break;
-					batchBytes += next.size;
-					batch.descriptors.push_back(std::move(next));
-					m_pendingStreamingUploads.pop_front();
-				}
-				timeline = m_streamingTimeline;
-			}
-
-			for (auto& descriptor : batch.descriptors) {
-				if (!descriptor.ticket) continue;
-				auto expected = TrackedUploadTicketState::Queued;
-				if (descriptor.ticket->state.compare_exchange_strong(expected,
-						TrackedUploadTicketState::Claimed, std::memory_order_acq_rel,
-						std::memory_order_acquire)) descriptor.ticket->NotifyChanged();
-			}
-			std::erase_if(batch.descriptors, [](const auto& descriptor) {
-				return !descriptor.ticket || descriptor.ticket->state.load(std::memory_order_acquire) ==
-					TrackedUploadTicketState::Cancelled;
-			});
-			if (batch.descriptors.empty()) continue;
-
-			auto& deviceManager = DeviceManager::GetInstance();
-			auto device = deviceManager.GetDevice();
-			if (rhi::Failed(device.CreateCommandAllocator(rhi::QueueKind::Copy, batch.allocator)) ||
-				rhi::Failed(device.CreateCommandList(rhi::QueueKind::Copy, batch.allocator.Get(), batch.commandList))) {
-				for (auto& descriptor : batch.descriptors) descriptor.ticket->Cancel();
-				continue;
-			}
-			std::vector<rhi::BufferBarrier> barriers(batch.descriptors.size());
-			for (size_t index = 0; index < batch.descriptors.size(); ++index) {
-				auto& barrier = barriers[index];
-				barrier.buffer = batch.descriptors[index].dstResource->GetAPIResource().GetHandle();
-				barrier.beforeSync = rhi::ResourceSyncState::Copy;
-				barrier.afterSync = rhi::ResourceSyncState::Copy;
-				barrier.beforeAccess = rhi::ResourceAccessType::Common;
-				barrier.afterAccess = rhi::ResourceAccessType::CopyDest;
-			}
-			batch.commandList->Barriers({ .buffers = {
-				barriers.data(), static_cast<uint32_t>(barriers.size()) } });
-			for (const auto& descriptor : batch.descriptors) {
-				batch.commandList->CopyBufferRegion(
-					descriptor.dstResource->GetAPIResource().GetHandle(), descriptor.dstOffset,
-					descriptor.srcUploadBuffer->GetAPIResource().GetHandle(), descriptor.srcOffset,
-					descriptor.size);
-			}
-			for (auto& barrier : barriers) {
-				barrier.beforeAccess = rhi::ResourceAccessType::CopyDest;
-				barrier.afterAccess = rhi::ResourceAccessType::Common;
-			}
-			batch.commandList->Barriers({ .buffers = {
-				barriers.data(), static_cast<uint32_t>(barriers.size()) } });
-			batch.commandList->End();
-
-			batch.timelineValue = ++m_nextStreamingTimelineValue;
-			for (auto& descriptor : batch.descriptors) {
-				std::lock_guard ticketLock(descriptor.ticket->timelineMutex);
-				descriptor.ticket->timelineOwner = timeline;
-				descriptor.ticket->timelineValue = batch.timelineValue;
-				descriptor.ticket->isTimelineComplete = [timeline](uint64_t value) {
-					return timeline && *timeline && (*timeline)->GetCompletedValue() >= value;
-				};
-			}
-			const rhi::CommandList lists[] = { batch.commandList.Get() };
-			const rhi::TimelinePoint signal{ (*timeline)->GetHandle(), batch.timelineValue };
-			if (rhi::Failed(deviceManager.GetCopyQueue().Submit(lists, { .signals = { &signal, 1 } }))) {
-				for (auto& descriptor : batch.descriptors) descriptor.ticket->Cancel();
-				continue;
-			}
-			for (auto& descriptor : batch.descriptors) {
-				auto expected = TrackedUploadTicketState::Claimed;
-				if (descriptor.ticket->state.compare_exchange_strong(expected,
-						TrackedUploadTicketState::Submitted, std::memory_order_release,
-						std::memory_order_acquire)) descriptor.ticket->NotifyChanged();
-			}
-			if (timeline && *timeline) (void)(*timeline)->HostWait(batch.timelineValue);
-			for (auto& descriptor : batch.descriptors) (void)descriptor.ticket->Complete();
-		}
-	} catch (const std::exception& error) {
-		spdlog::error("Tracked streaming upload completion worker stopped after exception: {}", error.what());
-	} catch (...) {
-		spdlog::error("Tracked streaming upload completion worker stopped after unknown exception");
-	}
+	if (!m_copyQueueUploads || !m_copyQueueUploads->Initialized()) Initialize();
+	return m_copyQueueUploads->QueueBufferUpload(segments, totalSize, std::move(destination), dstOffset);
 }
 
 

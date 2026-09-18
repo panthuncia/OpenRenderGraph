@@ -27,6 +27,8 @@ public:
     virtual ~IUploadService() = default;
 
     virtual void Initialize() = 0;
+    // Marks the calling thread as the owner of the frame (in-graph) upload path.
+    virtual void SetOwnerThread() {}
     virtual void SetUploadResolveContext(UploadResolveContext context) = 0;
     virtual std::shared_ptr<RenderPass> GetUploadPass() const = 0;
 
@@ -58,6 +60,34 @@ public:
         uint32_t srcCount) = 0;
 #endif
 
+    // Texture upload whose source bytes are owned by the caller through
+    // `keepAlive`. On the owner (render) thread this is UploadTextureSubresources;
+    // from any other thread the request is posted to the owner's mailbox and
+    // recorded by the next frame's upload pass, so producers never touch the
+    // frame upload queue. Live textures published to consumers are graph-ordered
+    // this way; only never-used, concurrent textures may use the worker service.
+#if BUILD_TYPE == BUILD_TYPE_DEBUG
+    virtual void PostTextureSubresources(UploadTarget target, rhi::Format fmt, uint32_t baseWidth, uint32_t baseHeight,
+        uint32_t depthOrLayers, uint32_t mipLevels, uint32_t arraySize,
+        std::shared_ptr<const std::vector<rhi::helpers::SubresourceData>> subresources,
+        std::shared_ptr<const void> keepAlive, const char* file, int line) {
+        (void)keepAlive;
+        if (!subresources) return;
+        UploadTextureSubresources(std::move(target), fmt, baseWidth, baseHeight, depthOrLayers, mipLevels, arraySize,
+            subresources->data(), static_cast<uint32_t>(subresources->size()), file, line);
+    }
+#else
+    virtual void PostTextureSubresources(UploadTarget target, rhi::Format fmt, uint32_t baseWidth, uint32_t baseHeight,
+        uint32_t depthOrLayers, uint32_t mipLevels, uint32_t arraySize,
+        std::shared_ptr<const std::vector<rhi::helpers::SubresourceData>> subresources,
+        std::shared_ptr<const void> keepAlive) {
+        (void)keepAlive;
+        if (!subresources) return;
+        UploadTextureSubresources(std::move(target), fmt, baseWidth, baseHeight, depthOrLayers, mipLevels, arraySize,
+            subresources->data(), static_cast<uint32_t>(subresources->size()));
+    }
+#endif
+
     // Upload several regions of one target as a single queue entry: one telemetry
     // capture, one upload-heap allocation, one map/unmap. Regions must be sorted
     // by dstOffset and must not overlap. The default forwards region by region.
@@ -74,17 +104,14 @@ public:
     virtual void QueueResourceCopy(const std::shared_ptr<Resource>& destination, const std::shared_ptr<Resource>& source, size_t size) = 0;
     virtual void ProcessDeferredReleases(uint8_t frameIndex) = 0;
 
-    // ── Streaming upload (copy-queue path) ──────────────────────────
-    virtual void QueueStreamingUpload(const void* data, size_t size,
-                                      std::shared_ptr<Resource> destination,
-                                      size_t dstOffset = 0) = 0;
-    virtual std::shared_ptr<TrackedUploadTicket> QueueTrackedStreamingUpload(
-        const void* data, size_t size, std::shared_ptr<Resource> destination,
-        size_t dstOffset = 0) = 0;
+    // ── Worker upload path (copy queue, CopyQueueUploadService) ──────
+    // Never touches the frame upload instance: bytes are staged into the
+    // worker service's pages and copied on the copy queue; completion is
+    // observed only through the ticket. See WorkerOwnedDestination for the
+    // ownership rule the destination must satisfy.
     virtual std::shared_ptr<TrackedUploadTicket> QueueTrackedStreamingUploadSegments(
         std::span<const StreamingUploadSegment> segments, size_t totalSize,
-        std::shared_ptr<Resource> destination, size_t dstOffset = 0) = 0;
-    virtual void ResetStreamingPagePool() = 0;
+        WorkerOwnedDestination destination, size_t dstOffset = 0) = 0;
 
     virtual void Cleanup() = 0;
 };

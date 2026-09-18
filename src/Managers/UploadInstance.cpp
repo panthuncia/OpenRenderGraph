@@ -5,6 +5,8 @@
 #include <cstring>
 #include <format>
 #include <sstream>
+#include <stdexcept>
+#include <thread>
 
 #include <rhi_helpers.h>
 #include <spdlog/spdlog.h>
@@ -68,8 +70,42 @@ UploadInstance::~UploadInstance() {
 	Cleanup();
 }
 
+void UploadInstance::SetOwnerThread() {
+	m_ownerThreadHash.store(std::hash<std::thread::id>{}(std::this_thread::get_id()),
+		std::memory_order_release);
+}
+
+bool UploadInstance::IsOwnerThread() const noexcept {
+	const auto owner = m_ownerThreadHash.load(std::memory_order_acquire);
+	return owner == 0 || owner == std::hash<std::thread::id>{}(std::this_thread::get_id());
+}
+
+void UploadInstance::NoteOffOwnerCall(const char* api) {
+	if (IsOwnerThread()) return;
+	basic_telemetry::AddCounter("ORG.Upload.FrameInstance.OffThreadCalls");
+	basic_telemetry::AddCounter(std::string("ORG.Upload.FrameInstance.OffThreadCalls.") + api);
+	const auto logged = m_offThreadCallsLogged.fetch_add(1, std::memory_order_relaxed);
+	if (logged < 32u) {
+		spdlog::warn("UploadInstance '{}': {} called off the owner thread (frame upload instance is render-thread owned)",
+			m_debugName, api);
+	}
+}
+
+void UploadInstance::NoteProducerCall(const char* api, const UploadTarget& target) {
+	if (IsOwnerThread()) return;
+	basic_telemetry::AddCounter("ORG.Upload.FrameInstance.OffThreadCalls");
+	basic_telemetry::AddCounter(std::string("ORG.Upload.FrameInstance.OffThreadCalls.") + api);
+	const auto logged = m_offThreadCallsLogged.fetch_add(1, std::memory_order_relaxed);
+	if (logged < 32u) {
+		const std::string name = target.kind == UploadTarget::Kind::PinnedShared && target.pinned
+			? target.pinned->GetName()
+			: std::string("registry-handle");
+		spdlog::warn("UploadInstance '{}': {} called off the owner thread target='{}' (frame upload instance is render-thread owned)",
+			m_debugName, api, name);
+	}
+}
+
 void UploadInstance::SetResolveContext(UploadResolveContext ctx) {
-	std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
 	m_ctx = ctx;
 	RefreshQueuedTargetTelemetryLocked();
 	PruneInvalidRegistryHandleUpdatesLocked("resolve-context-update");
@@ -77,18 +113,15 @@ void UploadInstance::SetResolveContext(UploadResolveContext ctx) {
 }
 
 void UploadInstance::SetPendingWorkChangedCallback(PendingWorkChangedCallback callback) {
-	std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
 	m_pendingWorkChanged = std::move(callback);
 }
 
 void UploadInstance::SetTargetTelemetryCallback(TargetTelemetryCallback callback) {
-	std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
 	m_targetTelemetry = std::move(callback);
 	RefreshQueuedTargetTelemetryLocked();
 }
 
 void UploadInstance::SetInvalidRegistryHandleCallback(InvalidRegistryHandleCallback callback) {
-	std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
 	m_invalidRegistryHandle = std::move(callback);
 }
 
@@ -99,7 +132,7 @@ void UploadInstance::StartWorker() {
 	}
 	m_taskService = org::runtime::GetDefaultTaskService();
 	if (!m_taskService) return;
-	m_workerQuit = false;
+	m_workerQuit.store(false, std::memory_order_release);
 	m_taskScope = m_taskService->CreateScope(m_debugName + "::PagePreparation");
 }
 
@@ -107,14 +140,14 @@ void UploadInstance::StopWorker() {
 	std::shared_ptr<org::runtime::ITaskScope> scope;
 	{
 		std::lock_guard<std::mutex> lock(m_workerMutex);
-		m_workerQuit = true;
+		m_workerQuit.store(true, std::memory_order_release);
 		scope = std::move(m_taskScope);
 	}
 	if (scope) scope->CancelAndWait();
 	m_workerDrainScheduled.store(false, std::memory_order_release);
 	std::lock_guard<std::mutex> lock(m_workerMutex);
 	m_taskService.reset();
-	m_workerRequestedPages = 0;
+	m_workerRequestedPages.store(0, std::memory_order_release);
 }
 
 UploadInstance::UploadPagePtr UploadInstance::CreatePage(size_t size, bool dedicated) {
@@ -141,30 +174,27 @@ void UploadInstance::TagPage(const UploadPagePtr& page) {
 void UploadInstance::WorkerMain() {
 	constexpr size_t kPagesPerDrain = 1;
 	size_t pagesToCreate = 0;
-	{
-		std::lock_guard<std::mutex> lock(m_workerMutex);
-		if (!m_workerQuit) {
-			pagesToCreate = (std::min)(m_workerRequestedPages, kPagesPerDrain);
-			m_workerRequestedPages -= pagesToCreate;
+	if (!m_workerQuit.load(std::memory_order_acquire)) {
+		auto requested = m_workerRequestedPages.load(std::memory_order_acquire);
+		while (requested != 0) {
+			const size_t take = (std::min)(requested, kPagesPerDrain);
+			if (m_workerRequestedPages.compare_exchange_weak(requested, requested - take,
+					std::memory_order_acq_rel, std::memory_order_acquire)) {
+				pagesToCreate = take;
+				break;
+			}
 		}
 	}
 
 	for (size_t i = 0; i < pagesToCreate; ++i) {
-			auto page = CreatePage(m_pageSize, false);
-			std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
-			const size_t maxWarmPages = m_preallocateCapacityBytes / m_pageSize;
-			if (maxWarmPages == 0 || AvailableReusableNormalPagesLocked() >= maxWarmPages) {
-				continue;
-			}
-			m_readyPages.push_back(std::move(page));
+		// Pages cross to the owner through a lock-free inbox; the owner drops
+		// any beyond its warm target when it drains.
+		m_readyPageInbox.Push(CreatePage(m_pageSize, false));
 	}
 
-	bool hasMore = false;
-	{
-		std::lock_guard<std::mutex> lock(m_workerMutex);
-		m_workerDrainScheduled.store(false, std::memory_order_release);
-		hasMore = !m_workerQuit && m_workerRequestedPages != 0;
-	}
+	m_workerDrainScheduled.store(false, std::memory_order_release);
+	const bool hasMore = !m_workerQuit.load(std::memory_order_acquire) &&
+		m_workerRequestedPages.load(std::memory_order_acquire) != 0;
 	if (hasMore) ScheduleWorkerDrain();
 }
 
@@ -174,7 +204,7 @@ void UploadInstance::ScheduleWorkerDrain() {
 	std::shared_ptr<org::runtime::ITaskScope> scope;
 	{
 		std::lock_guard<std::mutex> lock(m_workerMutex);
-		if (m_workerQuit || !m_taskService || !m_taskScope) return;
+		if (m_workerQuit.load(std::memory_order_acquire) || !m_taskService || !m_taskScope) return;
 		service = m_taskService;
 		scope = m_taskScope;
 	}
@@ -215,6 +245,7 @@ size_t UploadInstance::AvailableReusableNormalPagesLocked() const noexcept {
 			++count;
 		}
 	}
+	count += static_cast<size_t>(m_readyPageInbox.Count());
 	return count;
 }
 
@@ -229,10 +260,7 @@ void UploadInstance::RequestWorkerPagesLocked() {
 		return;
 	}
 
-	{
-		std::lock_guard<std::mutex> workerLock(m_workerMutex);
-		m_workerRequestedPages += targetPages - availablePages;
-	}
+	m_workerRequestedPages.fetch_add(targetPages - availablePages, std::memory_order_acq_rel);
 	ScheduleWorkerDrain();
 }
 
@@ -248,6 +276,7 @@ void UploadInstance::TrackPageForCurrentFrameLocked(const UploadPagePtr& page) {
 UploadInstance::UploadPagePtr UploadInstance::AcquirePageLocked(size_t minSize, bool dedicated) {
 	UploadPagePtr page;
 	if (!dedicated && minSize <= m_pageSize) {
+		DrainReadyPageInbox();
 		if (!m_freePages.empty()) {
 			page = std::move(m_freePages.front());
 			m_freePages.pop_front();
@@ -365,7 +394,6 @@ void UploadInstance::CaptureTargetTelemetry(
 	const UploadTarget& target, uint64_t& outId, std::string& outName) {
 	TargetTelemetryCallback callback;
 	{
-		std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
 		callback = m_targetTelemetry;
 	}
 	outId = 0;
@@ -445,6 +473,22 @@ void UploadInstance::UploadData(const void* data, size_t size, UploadTarget targ
 	if (!data || size == 0) {
 		return;
 	}
+	if (!IsOwnerThread()) {
+		// Producers never touch the owner's queue: the bytes are copied and the
+		// owner applies the upload before its next upload pass records.
+		NoteProducerCall("UploadData", target);
+		PostedBufferUpload posted;
+		posted.target = std::move(target);
+		posted.bytes.assign(static_cast<const uint8_t*>(data), static_cast<const uint8_t*>(data) + size);
+		posted.dstOffset = dstOffset;
+#if BUILD_TYPE == BUILD_TYPE_DEBUG
+		posted.file = file;
+		posted.line = line;
+#endif
+		m_postedBufferUploads.Push(std::move(posted));
+		MarkPendingWorkChangedLocked();
+		return;
+	}
 
 	std::shared_ptr<Resource> uploadBuffer;
 	size_t uploadOffset = 0;
@@ -467,7 +511,6 @@ void UploadInstance::UploadData(const void* data, size_t size, UploadTarget targ
 	uint64_t sequence = 0;
 	auto preparedPage = PrepareDedicatedPage(size);
 	{
-		std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
 		AllocateUploadRegion(size, /*alignment*/16, uploadBuffer, uploadOffset, std::move(preparedPage));
 
 		update.uploadBuffer = uploadBuffer;
@@ -489,7 +532,6 @@ void UploadInstance::UploadData(const void* data, size_t size, UploadTarget targ
 #endif
 
 	{
-		std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
 		const auto rfound = std::ranges::find(m_resourceUpdates.rbegin(), m_resourceUpdates.rend(),
 			sequence, &ResourceUpdate::firstSequence);
 		if (rfound != m_resourceUpdates.rend()) {
@@ -528,6 +570,17 @@ void UploadInstance::UploadDataBatch(UploadTarget target, std::span<const Upload
 		++liveRegions;
 	}
 	if (liveRegions == 0) return;
+	if (!IsOwnerThread()) {
+		for (const auto& region : regions) {
+			if (!region.data || region.size == 0) continue;
+#if BUILD_TYPE == BUILD_TYPE_DEBUG
+			UploadData(region.data, region.size, target, region.dstOffset, file, line);
+#else
+			UploadData(region.data, region.size, target, region.dstOffset);
+#endif
+		}
+		return;
+	}
 
 	uint64_t targetId = 0;
 	std::string targetName;
@@ -539,7 +592,6 @@ void UploadInstance::UploadDataBatch(UploadTarget target, std::span<const Upload
 	uint64_t lastSequence = 0;
 	auto preparedPage = PrepareDedicatedPage(totalBytes);
 	{
-		std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
 		AllocateUploadRegion(totalBytes, /*alignment*/16, uploadBuffer, uploadOffset, std::move(preparedPage));
 
 		size_t cursor = 0;
@@ -591,7 +643,6 @@ void UploadInstance::UploadDataBatch(UploadTarget target, std::span<const Upload
 #endif
 
 	{
-		std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
 		// The batch's entries are the newest staging entries with sequences in
 		// [firstSequence, lastSequence]; walk back from the end until we pass them.
 		for (auto it = m_resourceUpdates.rbegin(); it != m_resourceUpdates.rend(); ++it) {
@@ -631,6 +682,33 @@ void UploadInstance::UploadTextureSubresources(
 #endif
 {
 	if (!srcSubresources || srcCount == 0) return;
+	rhi::Span<const rhi::helpers::SubresourceData> srcSpan{ srcSubresources, srcCount };
+	const auto plan = rhi::helpers::PlanTextureUploadSubresources(
+		fmt, baseWidth, baseHeight, depthOrLayers, mipLevels, arraySize, srcSpan);
+	if (plan.totalSize == 0 || plan.footprints.empty()) return;
+	if (!IsOwnerThread()) {
+		// The raw entry cannot outlive the caller's source pointers, so an
+		// off-owner call has no safe way to post; PostTextureSubresources is the
+		// producer-side API (caller-owned bytes).
+		NoteProducerCall("UploadTextureSubresources", target);
+		throw std::logic_error("UploadInstance::UploadTextureSubresources called off the owner thread; use PostTextureSubresources");
+	}
+#if BUILD_TYPE == BUILD_TYPE_DEBUG
+	UploadTextureSubresourcesPrepared(std::move(target), fmt, baseWidth, baseHeight, depthOrLayers, mipLevels, arraySize,
+		srcSubresources, srcCount, PrepareDedicatedPage(static_cast<size_t>(plan.totalSize)), file, line);
+#else
+	UploadTextureSubresourcesPrepared(std::move(target), fmt, baseWidth, baseHeight, depthOrLayers, mipLevels, arraySize,
+		srcSubresources, srcCount, PrepareDedicatedPage(static_cast<size_t>(plan.totalSize)), nullptr, 0);
+#endif
+}
+
+void UploadInstance::UploadTextureSubresourcesPrepared(UploadTarget target, rhi::Format fmt, uint32_t baseWidth, uint32_t baseHeight,
+	uint32_t depthOrLayers, uint32_t mipLevels, uint32_t arraySize,
+	const rhi::helpers::SubresourceData* srcSubresources, uint32_t srcCount,
+	UploadPagePtr preparedPage, const char* file, int line)
+{
+	(void)file; (void)line;
+	if (!srcSubresources || srcCount == 0) return;
 
 	rhi::Span<const rhi::helpers::SubresourceData> srcSpan{ srcSubresources, srcCount };
 	const auto plan = rhi::helpers::PlanTextureUploadSubresources(
@@ -643,9 +721,8 @@ void UploadInstance::UploadTextureSubresources(
 	std::string targetDebugName;
 	CaptureTargetTelemetry(target, targetGlobalResourceId, targetDebugName);
 	std::vector<uint64_t> sequences;
-	auto preparedPage = PrepareDedicatedPage(static_cast<size_t>(plan.totalSize));
+	if (!preparedPage) preparedPage = PrepareDedicatedPage(static_cast<size_t>(plan.totalSize));
 	{
-		std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
 		AllocateUploadRegion(static_cast<size_t>(plan.totalSize), /*alignment*/512, uploadBuffer, uploadBaseOffset, std::move(preparedPage));
 		sequences.reserve(plan.footprints.size());
 		for (const auto& fp : plan.footprints) {
@@ -687,7 +764,6 @@ void UploadInstance::UploadTextureSubresources(
 	}
 	UnmapUpload(uploadBuffer, uploadBaseOffset, static_cast<size_t>(plan.totalSize));
 	{
-		std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
 		for (const auto sequence : sequences) {
 			const auto found = std::ranges::find(m_textureUpdates, sequence, &TextureUpdate::sequence);
 			if (found == m_textureUpdates.end()) continue;
@@ -695,6 +771,121 @@ void UploadInstance::UploadTextureSubresources(
 			found->staging = false;
 		}
 		MarkPendingWorkChangedLocked();
+	}
+}
+
+#if BUILD_TYPE == BUILD_TYPE_DEBUG
+void UploadInstance::PostTextureSubresources(UploadTarget target, rhi::Format fmt, uint32_t baseWidth, uint32_t baseHeight,
+	uint32_t depthOrLayers, uint32_t mipLevels, uint32_t arraySize,
+	std::shared_ptr<const std::vector<rhi::helpers::SubresourceData>> subresources,
+	std::shared_ptr<const void> keepAlive, const char* file, int line)
+#else
+void UploadInstance::PostTextureSubresources(UploadTarget target, rhi::Format fmt, uint32_t baseWidth, uint32_t baseHeight,
+	uint32_t depthOrLayers, uint32_t mipLevels, uint32_t arraySize,
+	std::shared_ptr<const std::vector<rhi::helpers::SubresourceData>> subresources,
+	std::shared_ptr<const void> keepAlive)
+#endif
+{
+	if (!subresources || subresources->empty()) return;
+	if (IsOwnerThread()) {
+#if BUILD_TYPE == BUILD_TYPE_DEBUG
+		UploadTextureSubresources(std::move(target), fmt, baseWidth, baseHeight, depthOrLayers, mipLevels, arraySize,
+			subresources->data(), static_cast<uint32_t>(subresources->size()), file, line);
+#else
+		UploadTextureSubresources(std::move(target), fmt, baseWidth, baseHeight, depthOrLayers, mipLevels, arraySize,
+			subresources->data(), static_cast<uint32_t>(subresources->size()));
+#endif
+		return;
+	}
+	NoteProducerCall("PostTextureSubresources", target);
+	rhi::Span<const rhi::helpers::SubresourceData> srcSpan{ subresources->data(),
+		static_cast<uint32_t>(subresources->size()) };
+	const auto plan = rhi::helpers::PlanTextureUploadSubresources(
+		fmt, baseWidth, baseHeight, depthOrLayers, mipLevels, arraySize, srcSpan);
+	if (plan.totalSize == 0 || plan.footprints.empty()) return;
+
+	// Stage on this thread: own dedicated page, own map and copy. The page
+	// joins the owner's frame ring when the owner drains the mailbox.
+	PostedTextureUpload posted;
+	posted.target = std::move(target);
+	posted.page = CreatePage(static_cast<size_t>(plan.totalSize), true);
+	posted.bytes = static_cast<size_t>(plan.totalSize);
+	if (!posted.page || !posted.page->buffer) return;
+	uint8_t* mapped = nullptr;
+	MapUpload(posted.page->buffer, &mapped);
+	if (mapped) {
+		rhi::helpers::WriteTextureUploadSubresources(plan, srcSpan, mapped, 0u);
+	}
+	UnmapUpload(posted.page->buffer, 0u, posted.bytes);
+	posted.mapped = mapped != nullptr;
+	posted.updates.reserve(plan.footprints.size());
+	for (const auto& fp : plan.footprints) {
+		TextureUpdate update;
+		update.texture = posted.target;
+		update.mip = fp.mip;
+		update.slice = fp.arraySlice;
+		update.footprint.offset = fp.offset;
+		update.footprint.rowPitch = fp.rowPitch;
+		update.footprint.width = fp.width;
+		update.footprint.height = fp.height;
+		update.footprint.depth = fp.depth;
+		update.x = 0;
+		update.y = 0;
+		update.z = fp.zSlice;
+		update.uploadBuffer = posted.page->buffer;
+		update.active = posted.mapped;
+		update.staging = false;
+#if BUILD_TYPE == BUILD_TYPE_DEBUG
+		update.file = file;
+		update.line = line;
+#endif
+		posted.updates.push_back(std::move(update));
+	}
+	(void)keepAlive; // bytes are staged; the caller's storage may be released
+	basic_telemetry::AddCounter("ORG.Upload.FrameInstance.PostedTextureUploads");
+	basic_telemetry::AddCounter("ORG.Upload.FrameInstance.PostedTextureBytes", static_cast<std::int64_t>(posted.bytes));
+	m_postedTextureUploads.Push(std::move(posted));
+	MarkPendingWorkChangedLocked();
+}
+
+void UploadInstance::DrainPostedUploads() {
+	PostedBufferUpload buffer;
+	while (m_postedBufferUploads.Pop(buffer)) {
+#if BUILD_TYPE == BUILD_TYPE_DEBUG
+		UploadData(buffer.bytes.data(), buffer.bytes.size(), buffer.target, buffer.dstOffset, buffer.file, buffer.line);
+#else
+		UploadData(buffer.bytes.data(), buffer.bytes.size(), buffer.target, buffer.dstOffset);
+#endif
+	}
+	PostedTextureUpload texture;
+	while (m_postedTextureUploads.Pop(texture)) {
+		if (!texture.page || !texture.page->buffer) continue;
+		// Bookkeeping only: adopt the page into this frame's ring and queue the
+		// already-staged copy records.
+		TagPage(texture.page);
+		texture.page->tailOffset = texture.page->capacity;
+		TrackPageForCurrentFrameLocked(texture.page);
+		m_currentFrameUploadBytes += texture.bytes;
+		uint64_t targetGlobalResourceId = 0;
+		std::string targetDebugName;
+		CaptureTargetTelemetry(texture.target, targetGlobalResourceId, targetDebugName);
+		for (auto& update : texture.updates) {
+			update.targetGlobalResourceId = targetGlobalResourceId;
+			update.targetDebugName = targetDebugName;
+			update.sequence = ++m_lastUploadSequence;
+			m_textureUpdates.push_back(std::move(update));
+		}
+		MarkPendingWorkChangedLocked();
+	}
+}
+
+void UploadInstance::DrainReadyPageInbox() {
+	UploadPagePtr page;
+	const size_t maxWarmPages = m_preallocateCapacityBytes / m_pageSize;
+	while (m_readyPageInbox.Pop(page)) {
+		if (!page) continue;
+		if (maxWarmPages != 0 && AvailableReusableNormalPagesLocked() >= maxWarmPages) continue; // dropped
+		m_readyPages.push_back(std::move(page));
 	}
 }
 
@@ -706,12 +897,16 @@ void UploadInstance::ProcessUploadsThrough(
 	uint8_t frameIndex,
 	org::imm::ImmediateCommandList& commandList,
 	uint64_t sequenceInclusive) {
+	NoteOffOwnerCall("ProcessUploadsThrough");
+	{
+		BT_ZONE_SCOPE("UploadInstance::ProcessUploadsThrough::DrainPosted");
+		DrainPostedUploads();
+	}
 	std::vector<ResourceUpdate> resourceUpdates;
 	std::vector<TextureUpdate> textureUpdates;
 	UploadResolveContext ctx;
 	{
 		BT_ZONE_SCOPE("UploadInstance::ProcessUploadsThrough::AcquireAndDrainQueue");
-		std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
 		PruneInvalidRegistryHandleUpdatesLocked("upload-pass-execute");
 		const bool detachAll = sequenceInclusive == UINT64_MAX &&
 			std::ranges::none_of(m_resourceUpdates, &ResourceUpdate::staging) &&
@@ -764,7 +959,6 @@ void UploadInstance::ProcessUploadsThrough(
 		if (update.uploadBuffer) completedUploadBuffers.insert(update.uploadBuffer.get());
 	}
 	if (!completedUploadBuffers.empty() && m_numFramesInFlight != 0) {
-		std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
 		for (const auto& update : m_resourceUpdates) {
 			if (update.uploadBuffer) completedUploadBuffers.erase(update.uploadBuffer.get());
 		}
@@ -961,7 +1155,7 @@ void UploadInstance::RecordProcessedUploadTelemetry(
 
 void UploadInstance::ProcessDeferredReleases(uint8_t frameIndex) {
 	BT_ZONE_SCOPE("UploadInstance::ProcessDeferredReleases");
-	std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
+	NoteOffOwnerCall("ProcessDeferredReleases");
 	if (m_numFramesInFlight == 0) {
 		return;
 	}
@@ -1092,12 +1286,13 @@ void UploadInstance::ProcessDeferredReleases(uint8_t frameIndex) {
 }
 
 bool UploadInstance::HasPendingWork() const {
-	std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
-	return !m_resourceUpdates.empty() || !m_textureUpdates.empty();
+	return !m_resourceUpdates.empty() || !m_textureUpdates.empty() ||
+		!m_postedTextureUploads.Empty() || !m_postedBufferUploads.Empty();
 }
 
 uint64_t UploadInstance::CapturePendingUploadSequence() {
-	std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
+	NoteOffOwnerCall("CapturePendingUploadSequence");
+	DrainPostedUploads();
 	m_lastSealedUploadSequence = m_lastUploadSequence;
 	return m_lastSealedUploadSequence;
 }
@@ -1109,7 +1304,6 @@ void UploadInstance::CollectPendingDestinations(std::vector<std::shared_ptr<Reso
 void UploadInstance::CollectPendingDestinationsThrough(
 	uint64_t sequenceInclusive,
 	std::vector<std::shared_ptr<Resource>>& out) const {
-	std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
 	std::unordered_set<Resource*> seen;
 	for (const auto& u : m_resourceUpdates) {
 		if (!u.active || u.lastSequence > sequenceInclusive) continue;
@@ -1134,7 +1328,6 @@ std::string UploadInstance::DescribeQueuedTargetByGlobalResourceId(uint64_t glob
 		return {};
 	}
 
-	std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
 	RefreshQueuedTargetTelemetryLocked();
 
 	std::ostringstream result;
@@ -1172,7 +1365,14 @@ std::string UploadInstance::DescribeQueuedTargetByGlobalResourceId(uint64_t glob
 
 void UploadInstance::Cleanup() {
 	StopWorker();
-	std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
+	{
+		UploadPagePtr page;
+		while (m_readyPageInbox.Pop(page)) {}
+		PostedBufferUpload buffer;
+		while (m_postedBufferUploads.Pop(buffer)) {}
+		PostedTextureUpload texture;
+		while (m_postedTextureUploads.Pop(texture)) {}
+	}
 	m_freePages.clear();
 	m_readyPages.clear();
 	m_openPages.clear();
