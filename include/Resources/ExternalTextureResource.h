@@ -53,6 +53,7 @@ public:
     SymbolicTracker* GetStateTracker() override { return &m_stateTracker; }
     bool TryGetRHIResourceDesc(rhi::ResourceDesc& outDesc) const override;
     rhi::Format GetFormat() const { return m_description.format; }
+    bool CommonLayoutOnly() const noexcept override { return m_commonLayoutOnly; }
     unsigned int GetWidth() const { return m_width; }
     unsigned int GetHeight() const { return m_height; }
 

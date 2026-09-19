@@ -99,9 +99,9 @@ CompileResourceShape ShapeOf(const Resource& resource) {
 			else if (desc.generateMipMaps)
 				mips = static_cast<uint32_t>(std::floor(std::log2((std::max)(desc.imageDimensions[0].width, desc.imageDimensions[0].height)))) + 1;
 		}
-		return {(std::max)(1u, mips), (std::max)(1u, slices), resource.HasLayout()};
+		return {(std::max)(1u, mips), (std::max)(1u, slices), resource.HasLayout(), resource.CommonLayoutOnly()};
 	}
-	return {(std::max)(1u, resource.GetMipLevels()), (std::max)(1u, resource.GetArraySize()), resource.HasLayout()};
+	return {(std::max)(1u, resource.GetMipLevels()), (std::max)(1u, resource.GetArraySize()), resource.HasLayout(), resource.CommonLayoutOnly()};
 }
 
 CompileResourceState LowerState(const ResourceState& state) {

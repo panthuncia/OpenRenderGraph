@@ -19,6 +19,14 @@ bool ExternalTextureResource::TryGetRHIResourceDesc(rhi::ResourceDesc& outDesc) 
 	outDesc.texture.depthOrLayers = m_arraySize;
 	outDesc.texture.mipLevels = m_mipLevels;
 	outDesc.texture.sampleCount = 1;
+	// The views the description asks for are the ones the imported image supports; persistent
+	// graphs validate each declared view against these flags.
+	auto flags = static_cast<uint32_t>(rhi::ResourceFlags::RF_None);
+	if (m_description.hasRTV) flags |= rhi::ResourceFlags::RF_AllowRenderTarget;
+	if (m_description.hasDSV) flags |= rhi::ResourceFlags::RF_AllowDepthStencil;
+	if (m_description.hasUAV || m_description.hasNonShaderVisibleUAV) flags |= rhi::ResourceFlags::RF_AllowUnorderedAccess;
+	if (m_commonLayoutOnly) flags |= rhi::ResourceFlags::RF_AllowSimultaneousAccess;
+	outDesc.resourceFlags = static_cast<rhi::ResourceFlags>(flags);
 	return outDesc.texture.format != rhi::Format::Unknown;
 }
 

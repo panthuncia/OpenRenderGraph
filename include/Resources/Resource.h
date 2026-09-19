@@ -330,6 +330,9 @@ public:
 		return { .buffers = { &bufferBarrier, 1 } };
 	}
 	bool HasLayout() const { return m_hasLayout; }
+	// Textures with the simultaneous-access contract (shared with another API that uses them between
+	// the graph's commands) stay in layout Common: the graph changes only their access and sync.
+	virtual bool CommonLayoutOnly() const noexcept { return false; }
 	void AddAliasedResource(Resource* resource) {
 		m_aliasedResources.push_back(resource);
 	}

@@ -31,6 +31,8 @@ struct CompileResourceShape {
     // A state declaration referencing it is unsupported, never treated as 1x1.
     uint32_t mips = 1, slices = 1;
     bool hasLayout = false;
+    // Simultaneous-access texture (Resource::CommonLayoutOnly): every state keeps layout Common.
+    bool commonLayoutOnly = false;
     bool operator==(const CompileResourceShape&) const = default;
 };
 struct CompileRange {

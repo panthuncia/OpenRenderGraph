@@ -1880,7 +1880,7 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
             || dynamicResource != nullptr)) ++unnamedTransientCount;
         input.structure.resourceShapes.push_back(resource
             ? experimental::CompileResourceShape{(std::max)(1u, resource->GetMipLevels()),
-                (std::max)(1u, resource->GetArraySize()), resource->HasLayout()}
+                (std::max)(1u, resource->GetArraySize()), resource->HasLayout(), resource->CommonLayoutOnly()}
             : experimental::CompileResourceShape{0, 0, false});
         std::shared_ptr<const AliasHeapGeneration> capturedAliasHeap;
         uint64_t capturedAliasPoolID = 0, capturedAliasOffset = 0, capturedAliasSize = 0;

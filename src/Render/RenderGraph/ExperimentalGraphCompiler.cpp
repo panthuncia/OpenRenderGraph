@@ -336,6 +336,8 @@ bool ValidRange(CompileRange r, CompileResourceShape shape) {
 CompileResourceState StateForShape(CompileResourceState state, CompileResourceShape shape) {
     // Buffer barriers have no layout field. Preserve all access/sync bits.
     if (!shape.hasLayout) state.layout = 0;
+    // Simultaneous-access textures never leave COMMON (Vulkan: GENERAL); only access and sync change.
+    else if (shape.commonLayoutOnly) state.layout = static_cast<uint64_t>(rhi::ResourceLayout::Common);
     return state;
 }
 CompileRange Intersection(CompileRange a, CompileRange b) {

@@ -26,6 +26,8 @@ struct IHostExecutionData;
 //   - persistent execution with the requested external queue boundary,
 //   - rebuilding the graph from the registered extension factories on request,
 //   - synchronous per-frame Update + Execute (Execute submits before returning),
+//   - per-frame-slot retirement: before a slot is reused, its previous frame's GPU work is
+//     waited for and the upload pages and descriptors it retired are released,
 //   - an orderly shutdown that waits only for the graph's own work.
 // Not thread-safe: all calls come from the host's render thread.
 class PersistentGraphHost {
@@ -81,6 +83,9 @@ private:
 	};
 	std::vector<Registered> m_extensions;
 	std::unique_ptr<RenderGraph> m_graph;
+	// Signalled on the graphics queue after each frame; a slot's last value gates its reuse.
+	rhi::TimelinePtr m_frameTimeline;
+	std::vector<uint64_t> m_slotFrameValues;
 	bool m_rebuildRequested = true;
 	uint64_t m_frameNumber = 0;
 };

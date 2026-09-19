@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <stdexcept>
 
+#include "Managers/Singletons/DescriptorHeapManager.h"
 #include "Render/PassExecutionContext.h"
 #include "Render/Runtime/IUploadService.h"
 #include "Render/Runtime/RuntimeDevice.h"
@@ -41,6 +42,9 @@ PersistentGraphHost::PersistentGraphHost(Desc desc) : m_desc(std::move(desc)) {
 	if (m_desc.backend == rhi::Backend::Null) throw std::invalid_argument("PersistentGraphHost requires a device backend");
 	if (!m_desc.tasks) m_desc.tasks = std::make_shared<runtime::ThreadPoolTaskService>();
 	runtime::InitializeRuntimeDevice(m_desc.device);
+	if (m_desc.device.CreateTimeline(m_frameTimeline, 0, "ORG host frames") != rhi::Result::Ok)
+		throw std::runtime_error("PersistentGraphHost could not create its frame timeline");
+	m_slotFrameValues.assign((std::max)(m_desc.framesInFlight, 1u), 0);
 }
 
 PersistentGraphHost::~PersistentGraphHost() {
@@ -94,8 +98,13 @@ void PersistentGraphHost::Build() {
 void PersistentGraphHost::ExecuteFrame(const IHostExecutionData* hostData, const FrameCallback& beforePrepare) {
 	if (m_rebuildRequested || !m_graph) Build();
 	runtime::ScopedActiveGraphServices services(m_graph->GetUploadService(), m_graph->GetDescriptorService());
-	if (beforePrepare) beforePrepare(*m_graph);
 	const auto slot = static_cast<uint32_t>(m_frameNumber % (std::max)(m_desc.framesInFlight, 1u));
+	// The slot's previous frame must be done on the GPU before the upload pages it used are recycled
+	// (and before this frame records uploads into the slot).
+	if (m_slotFrameValues[slot]) (void)m_frameTimeline->HostWait(m_slotFrameValues[slot]);
+	if (auto* uploads = m_graph->GetUploadService()) uploads->ProcessDeferredReleases(static_cast<uint8_t>(slot));
+	DescriptorHeapManager::GetInstance().ProcessDeferredReleases(static_cast<uint8_t>(slot));
+	if (beforePrepare) beforePrepare(*m_graph);
 	UpdateExecutionContext update{};
 	update.frameIndex = slot;
 	update.preparationSlot = slot;
@@ -108,6 +117,10 @@ void PersistentGraphHost::ExecuteFrame(const IHostExecutionData* hostData, const
 	execute.frameFenceValue = m_frameNumber + 1;
 	execute.hostData = hostData;
 	m_graph->Execute(execute);
+	// Execute submitted the frame; this signal follows it on the same queue.
+	const uint64_t frameValue = m_frameNumber + 1;
+	if (m_desc.device.GetQueue(rhi::QueueKind::Graphics).Signal({ m_frameTimeline->GetHandle(), frameValue }) == rhi::Result::Ok)
+		m_slotFrameValues[slot] = frameValue;
 	++m_frameNumber;
 }
 
