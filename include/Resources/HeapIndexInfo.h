@@ -15,5 +15,3 @@ struct NonShaderVisibleIndexInfo {
 
 } // namespace org
 
-using org::NonShaderVisibleIndexInfo;
-using org::ShaderVisibleIndexInfo;

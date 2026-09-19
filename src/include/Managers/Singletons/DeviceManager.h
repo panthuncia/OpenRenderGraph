@@ -1,6 +1,5 @@
 #pragma once
 
-#include <directx/d3d12.h>
 #include <memory>
 #include <mutex>
 #include <optional>

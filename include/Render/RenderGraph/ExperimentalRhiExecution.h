@@ -555,6 +555,10 @@ struct OwnedRecordingList {
     std::vector<PreparedPass> passes;
     std::shared_ptr<OwnedRecordingStatistics> statistics;
     std::shared_ptr<FrameCommandAllocation> allocation = std::make_shared<FrameCommandAllocation>();
+    // RenderGraph::ExternalQueueBoundary: full memory barrier before the first
+    // pass / after the last pass of this command list.
+    bool externalEntryBarrier = false;
+    bool externalExitBarrier = false;
 };
 
 inline OwnedRecordingList BuildPersistentRecordingList(std::shared_ptr<const RenderFrameSnapshot> sealed, uint32_t batch) {
@@ -665,6 +669,12 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
                     ? std::optional<rhi::DescriptorHeapHandle>{recording.samplerDescriptorHeap}
                     : std::nullopt);
         }
+        if (recording.externalEntryBarrier) {
+            auto full = rhi::FullMemoryBarrier();
+            rhi::BarrierBatch barriers{};
+            barriers.globals = {&full, 1u};
+            context.Commands().Barriers(barriers);
+        }
         if (!recording.textureBarriers.empty() || !recording.bufferBarriers.empty()) {
             rhi::BarrierBatch barriers{};
             barriers.textures = {recording.textureBarriers.data(), static_cast<uint32_t>(recording.textureBarriers.size())};
@@ -722,6 +732,12 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
         }
         if (statistics && statistics->gpuQueries)
             statistics->service->ResolveQueries(statistics->frameIndex, queue, context.Commands(), statistics->queries);
+        if (recording.externalExitBarrier) {
+            auto full = rhi::FullMemoryBarrier();
+            rhi::BarrierBatch barriers{};
+            barriers.globals = {&full, 1u};
+            context.Commands().Barriers(barriers);
+        }
         if (context.Commands().EndChecked() != rhi::Result::Ok) {
             basic_telemetry::AddCounter("ORG.Execution.RecordingCloseFailures");
             std::string names;

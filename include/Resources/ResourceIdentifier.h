@@ -74,8 +74,6 @@ struct ResourceIdentifier {
 
 } // namespace org
 
-using org::ResourceIdentifier;
-
 namespace std {
     template<>
     struct hash<org::ResourceIdentifier> {
@@ -98,4 +96,3 @@ struct ResourceIdentifierAndRange {
 
 } // namespace org
 
-using org::ResourceIdentifierAndRange;

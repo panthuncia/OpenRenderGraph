@@ -215,6 +215,7 @@ void DeviceManager::Cleanup() {
     }
 }
 
+#if BASICRHI_ENABLE_D3D12
 static std::string AutoBreadcrumbOpToString(D3D12_AUTO_BREADCRUMB_OP op) {
     switch (op) {
     case D3D12_AUTO_BREADCRUMB_OP_SETMARKER: return "SetMarker";
@@ -338,6 +339,7 @@ void LogPageFaults(const D3D12_DRED_PAGE_FAULT_OUTPUT& pageFault) {
     LogAllocationNodes(pageFault.pHeadExistingAllocationNode, "ExistingAllocation");
     LogAllocationNodes(pageFault.pHeadRecentFreedAllocationNode, "RecentFreedAllocation");
 }
+#endif // BASICRHI_ENABLE_D3D12
 
 
 } // namespace org

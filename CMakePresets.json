@@ -24,6 +24,22 @@
         "value": "x64"
       },
       "binaryDir": "${sourceDir}/out/build/${presetName}"
+    },
+    {
+      "name": "ninja-x64-vcpkg-vulkan-only",
+      "displayName": "Ninja + vcpkg, Vulkan backend only",
+      "description": "Embedding configuration for hosts without D3D12 (e.g. DXVK-based hosts that adopt an existing VkDevice).",
+      "inherits": [ "ninja-x64-vcpkg" ],
+      "cacheVariables": {
+        "VCPKG_TARGET_TRIPLET": "x64-windows-static-md",
+        "BASICRHI_ENABLE_D3D12": "OFF",
+        "BASICRHI_ENABLE_VULKAN": "ON",
+        "BASICRHI_ENABLE_STREAMLINE": "OFF",
+        "BASICRHI_ENABLE_PIX": "OFF",
+        "BASICRHI_ENABLE_TRACY_GPU_PROFILING": "OFF",
+        "BASICRHI_BUILD_TESTS": "ON",
+        "OPENRENDERGRAPH_BUILD_TESTS": "ON"
+      }
     }
   ],
   "buildPresets": [

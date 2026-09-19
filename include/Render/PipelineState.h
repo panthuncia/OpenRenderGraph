@@ -187,7 +187,3 @@ private:
 
 } // namespace org
 
-using org::PipelineResources;
-using org::PipelineState;
-using org::PipelineStatePayload;
-using org::PipelineStateSlot;

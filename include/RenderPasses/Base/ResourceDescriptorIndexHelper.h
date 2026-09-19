@@ -456,7 +456,7 @@ private:
 	ResourceIndexOrDynamicResource GetResourceIndexOrDynamicResource(
 		const ResourceRegistry::RegistryHandle& h,
 		Resource* resource,
-		const DescriptorAccessor& accessor) const
+		[[maybe_unused]] const DescriptorAccessor& accessor) const
 	{
 		if (!resource) {
 			throw std::runtime_error("Resource is null");

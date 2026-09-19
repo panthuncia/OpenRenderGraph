@@ -16,8 +16,6 @@
 
 namespace org {
 
-using Microsoft::WRL::ComPtr;
-
 class Buffer : public BufferBase, public IHasMemoryMetadata {
 public:
 
@@ -317,6 +315,3 @@ private:
 
 } // namespace org
 
-using org::Buffer;
-using org::BufferBase;
-using namespace org;

@@ -57,5 +57,3 @@ struct TextureDescription {
 
 } // namespace org
 
-using org::ImageDimensions;
-using org::TextureDescription;

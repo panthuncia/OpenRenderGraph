@@ -403,5 +403,3 @@ private:
 
 } // namespace org
 
-using org::Resource;
-using namespace org;

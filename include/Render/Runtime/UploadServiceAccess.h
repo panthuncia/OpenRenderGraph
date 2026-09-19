@@ -26,8 +26,8 @@ inline void UploadBufferDataDispatch(
     size_t size,
     UploadTarget resourceToUpdate,
     size_t dataBufferOffset,
-    const char* file,
-    int line) {
+    [[maybe_unused]] const char* file,
+    [[maybe_unused]] int line) {
     if (auto* service = GetActiveUploadService()) {
 #if BUILD_TYPE == BUILD_TYPE_DEBUG
         service->UploadData(data, size, std::move(resourceToUpdate), dataBufferOffset, file, line);
@@ -50,8 +50,8 @@ inline void UploadTextureSubresourcesDispatch(
     uint32_t arraySize,
     const rhi::helpers::SubresourceData* srcSubresources,
     uint32_t srcCount,
-    const char* file,
-    int line) {
+    [[maybe_unused]] const char* file,
+    [[maybe_unused]] int line) {
     if (auto* service = GetActiveUploadService()) {
 #if BUILD_TYPE == BUILD_TYPE_DEBUG
         service->UploadTextureSubresources(

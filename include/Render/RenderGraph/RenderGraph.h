@@ -321,7 +321,7 @@ public:
 		virtual void Shutdown(RenderGraph& rg) { (void)rg; }
 
 		// lets systems react to registry recreation without RenderGraph including them
-		virtual void OnRegistryReset(ResourceRegistry* registry) {}
+		virtual void OnRegistryReset(ResourceRegistry* /*registry*/) {}
 
 		// main hook: inject passes
 		virtual void GatherStructuralPasses(RenderGraph& rg, std::vector<ExternalPassDesc>& out) = 0;
@@ -730,6 +730,19 @@ public:
 	void SetPersistentSegment(std::string passName, PersistentSegmentKind kind) {
 		m_persistentSegmentKinds[std::move(passName)] = kind;
 	}
+	// Hosts that share a queue with another API (for example an adopted DXVK
+	// VkQueue whose translated D3D11 work is submitted before and after the graph)
+	// order that work against the graph with full memory barriers: `entry` at the
+	// start of each queue's first batch in the frame, `exit` at the end of each
+	// queue's last batch. Barrier scopes span submissions on the same queue, so no
+	// semaphores or per-resource transitions are needed. Honored by persistent
+	// execution.
+	struct ExternalQueueBoundary {
+		bool entry = false;
+		bool exit = false;
+	};
+	void SetExternalQueueBoundary(ExternalQueueBoundary boundary) noexcept { m_externalQueueBoundary = boundary; }
+	ExternalQueueBoundary GetExternalQueueBoundary() const noexcept { return m_externalQueueBoundary; }
 	// Async producer/admission handshake. True asks the host to prepare another
 	// logical frame before blocking for the exact queue head.
 	bool ShouldDeferAsyncAdmission();
@@ -1343,6 +1356,7 @@ private:
 	void WritePersistentGraphDebugDump(const persistent::SelectedPublication& selected) const;
 	bool m_persistentExecution = false;
 	std::unordered_map<std::string, PersistentSegmentKind> m_persistentSegmentKinds;
+	ExternalQueueBoundary m_externalQueueBoundary{};
     void SubmitOwnedCompileRequest(rhi::Device device, const std::vector<Node>& nodes,
         std::span<const std::pair<size_t, size_t>> explicitEdges,
         std::vector<std::pair<uint32_t, uint32_t>> dependencyOracle,

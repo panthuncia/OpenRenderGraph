@@ -102,7 +102,6 @@ struct ResourceResolverAndRange {
         // Copy resolver into unique_ptr
         pResolver = resolver.Clone();
     }
-    ResourceResolverAndRange(const ResourceIdentifier& resource, const RangeSpec& range) : range(range) {}
     std::unique_ptr<IResourceResolver> pResolver;
     RangeSpec range;
 };

@@ -70,8 +70,8 @@ public:
     // Preparation owner only. Empty means explicit synchronous legacy fallback.
     virtual PreparedPass PrepareFrame(FramePreparationContext&) { return {}; }
 
-	virtual void Update(const UpdateExecutionContext& context) {};
-	virtual PassReturn Execute(PassExecutionContext& context) { return {}; };
+	virtual void Update(const UpdateExecutionContext& /*context*/) {};
+	virtual PassReturn Execute(PassExecutionContext& /*context*/) { return {}; };
 	virtual void Cleanup() = 0;
 
 	void Invalidate() override { invalidated = true; }
@@ -79,7 +79,7 @@ public:
 
 protected:
 	bool invalidated = true;
-	virtual void DeclareResourceUsages(ComputePassBuilder* builder) {};
+	virtual void DeclareResourceUsages(ComputePassBuilder* /*builder*/) {};
 
 	template<class CommandSink>
 	void BindResourceDescriptorIndices(CommandSink& commandList, const PipelineResources& resources) {
@@ -125,7 +125,7 @@ protected:
 		m_resourceDescriptorIndexHelper->RegisterCBV(id);
 	}
 
-	virtual std::shared_ptr<Resource> ProvideResource(ResourceIdentifier const& key) { return nullptr; }
+	virtual std::shared_ptr<Resource> ProvideResource(ResourceIdentifier const& /*key*/) { return nullptr; }
 	virtual std::vector<ResourceIdentifier> GetSupportedKeys() { return {}; }
 
 	std::unique_ptr<ResourceDescriptorIndexHelper> m_resourceDescriptorIndexHelper;

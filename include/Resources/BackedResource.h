@@ -39,7 +39,7 @@ public:
     // Borrowed synchronous callers need the immutable allocation metadata but
     // must not manufacture an ownership lease. Async publication requests the
     // default retained form.
-    virtual BackingAllocationSnapshot CaptureBackingAllocation(bool retain = true) { return {}; }
+    virtual BackingAllocationSnapshot CaptureBackingAllocation(bool /*retain*/ = true) { return {}; }
     // Resource-version publication. A stable backing generation returns the
     // same immutable token; this is allocation ownership, not graph caching.
     std::shared_ptr<const BackingAllocationSnapshot> CapturePublishedBackingAllocation() {

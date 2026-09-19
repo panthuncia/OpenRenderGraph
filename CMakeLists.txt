@@ -63,6 +63,14 @@ if(NOT TARGET BasicTelemetry::Core OR NOT TARGET BasicTelemetry::Tracy)
 endif()
 
 find_package(spdlog CONFIG REQUIRED)
+# Must match the spdlog flavor the host links (spdlog::spdlog for SPDLOG_COMPILED_LIB hosts); defaults to
+# whatever BasicRHI was configured with.
+if(DEFINED BASICRHI_SPDLOG_TARGET)
+    set(_org_default_spdlog_target "${BASICRHI_SPDLOG_TARGET}")
+else()
+    set(_org_default_spdlog_target "spdlog::spdlog_header_only")
+endif()
+set(OPENRENDERGRAPH_SPDLOG_TARGET "${_org_default_spdlog_target}" CACHE STRING "spdlog target linked by OpenRenderGraph")
 find_package(flecs CONFIG REQUIRED)
 find_package(Boost REQUIRED COMPONENTS container_hash)
 if(OPENRENDERGRAPH_ENABLE_DEBUG_UI)
@@ -76,6 +84,8 @@ add_library(OpenRenderGraph STATIC
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Contributor/ExtensionRegistry.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Contributor/ContributorGraphHost.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Contributor/ContributorRuntime.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/src/Host/PersistentGraphHost.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/include/OpenRenderGraph/PersistentGraphHost.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/DescriptorHeap.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PublicationBindingBundle.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PreparedTablePublisher.cpp"
@@ -97,6 +107,8 @@ add_library(OpenRenderGraph STATIC
     
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/DefaultReadbackService.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/DefaultDescriptorService.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/ThreadPoolTaskService.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/Runtime/ThreadPoolTaskService.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/DefaultRenderGraphSettingsService.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/RuntimeDevice.cpp"
     
@@ -163,7 +175,7 @@ target_link_libraries(OpenRenderGraph
         flecs::flecs
         Boost::container_hash
     PRIVATE
-        spdlog::spdlog_header_only
+        ${OPENRENDERGRAPH_SPDLOG_TARGET}
 )
 
 if(OPENRENDERGRAPH_ENABLE_DEBUG_UI)
@@ -199,6 +211,9 @@ target_compile_definitions(OpenRenderGraph PRIVATE NOMINMAX)
 
 if (MSVC)
     target_compile_options(OpenRenderGraph PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
+    # RenderGraph.cpp exceeds the default COFF section limit; hosts that embed ORG
+    # standalone do not necessarily set /bigobj globally.
+    target_compile_options(OpenRenderGraph PRIVATE /bigobj)
 endif()
 
 if(OPENRENDERGRAPH_BUILD_TESTS)
@@ -222,8 +237,14 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
     endif()
     target_link_libraries(OpenRenderGraphRecordingRecipeTests PRIVATE OpenRenderGraph)
     add_test(NAME OpenRenderGraphRecordingRecipeTests COMMAND OpenRenderGraphRecordingRecipeTests)
+    # Offscreen suites that create D3D12 (WARP) devices exist only when the D3D12 backend is built.
+    set(_org_d3d12_tests OFF)
+    if(NOT DEFINED BASICRHI_ENABLE_D3D12 OR BASICRHI_ENABLE_D3D12) # packaged BasicRHI: assume D3D12
+        set(_org_d3d12_tests ON)
+    endif()
     add_custom_target(OpenRenderGraphAsyncFrameTests DEPENDS
-        OpenRenderGraphFrameContextTests OpenRenderGraphAsyncCompileTests OpenRenderGraphExternalResourceTests)
+        OpenRenderGraphFrameContextTests OpenRenderGraphAsyncCompileTests
+        $<$<BOOL:${_org_d3d12_tests}>:OpenRenderGraphExternalResourceTests>)
     add_executable(OpenRenderGraphFrameContextTests tests/FrameContextTests.cpp)
     target_compile_features(OpenRenderGraphFrameContextTests PRIVATE cxx_std_23)
     target_include_directories(OpenRenderGraphFrameContextTests PRIVATE include)
@@ -234,9 +255,10 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
     target_include_directories(OpenRenderGraphAsyncCompileTests PRIVATE include)
     target_link_libraries(OpenRenderGraphAsyncCompileTests PRIVATE
         OpenRenderGraph BasicTelemetry::Core BasicTelemetry::Tracy
-        BasicRHI::BasicRHI spdlog::spdlog_header_only)
+        BasicRHI::BasicRHI ${OPENRENDERGRAPH_SPDLOG_TARGET})
     target_compile_definitions(OpenRenderGraphAsyncCompileTests PRIVATE NOMINMAX)
     add_test(NAME OpenRenderGraphAsyncCompileTests COMMAND OpenRenderGraphAsyncCompileTests)
+    if(_org_d3d12_tests)
     add_executable(OpenRenderGraphExternalResourceTests tests/ExternalResourceTests.cpp tests/FrameRecordingTests.cpp tests/FrameRetirementTests.cpp tests/ProgramVersionTests.cpp tests/ReadbackCaptureTests.cpp)
     target_include_directories(OpenRenderGraphExternalResourceTests PRIVATE src/include)
     if(WIN32)
@@ -292,6 +314,7 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
             endif()
         endforeach()
     endif()
+    endif() # _org_d3d12_tests
     add_executable(OpenRenderGraphContributorHeaderC tests/ContributorHeaderCompile.c)
     set_target_properties(OpenRenderGraphContributorHeaderC PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
     target_include_directories(OpenRenderGraphContributorHeaderC PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
@@ -304,10 +327,46 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
 	add_executable(OpenRenderGraphDeviceRegistryTests tests/DeviceRegistryTests.cpp)
 	target_link_libraries(OpenRenderGraphDeviceRegistryTests PRIVATE OpenRenderGraph::OpenRenderGraph)
 	add_test(NAME OpenRenderGraphDeviceRegistryTests COMMAND OpenRenderGraphDeviceRegistryTests)
+    # Persistent execution on an adopted host VkDevice (DXVK embedding model).
+    if(BASICRHI_ENABLE_VULKAN AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/../BasicRHI/cmake/BasicRHIShaderFlags.cmake")
+        include("${CMAKE_CURRENT_LIST_DIR}/../BasicRHI/cmake/BasicRHIShaderFlags.cmake")
+        if(BASICRHI_DXC_EXECUTABLE)
+            set(_org_persistent_write_spv "${CMAKE_CURRENT_BINARY_DIR}/test_shaders/PersistentHostWrite.spv")
+            basicrhi_compile_spirv(OUTPUT "${_org_persistent_write_spv}"
+                SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/PersistentHostWrite.hlsl"
+                ENTRY main PROFILE cs_6_6)
+            add_executable(OpenRenderGraphPersistentVulkanHostTests tests/PersistentVulkanHostTests.cpp "${_org_persistent_write_spv}")
+            target_compile_features(OpenRenderGraphPersistentVulkanHostTests PRIVATE cxx_std_23)
+            target_include_directories(OpenRenderGraphPersistentVulkanHostTests PRIVATE src/include)
+            target_compile_definitions(OpenRenderGraphPersistentVulkanHostTests PRIVATE NOMINMAX
+                ORG_TEST_PERSISTENT_WRITE_SPV="${_org_persistent_write_spv}")
+            if(MSVC)
+                target_compile_options(OpenRenderGraphPersistentVulkanHostTests PRIVATE /utf-8)
+            endif()
+            target_link_libraries(OpenRenderGraphPersistentVulkanHostTests PRIVATE OpenRenderGraph BasicRHI::BasicRHI)
+            if(WIN32 AND TARGET Streamline::headers)
+                # BasicRHI references the Streamline C API; this test does not load the interposer.
+                target_sources(OpenRenderGraphPersistentVulkanHostTests PRIVATE
+                    "${CMAKE_CURRENT_SOURCE_DIR}/../BasicRHI/tests/StreamlineStubs.cpp")
+                target_link_libraries(OpenRenderGraphPersistentVulkanHostTests PRIVATE Streamline::headers)
+            endif()
+            if(WIN32 AND TARGET Pix::headers)
+                find_library(OPENRENDERGRAPH_PIX_RUNTIME NAMES WinPixEventRuntime
+                    HINTS "${CMAKE_CURRENT_SOURCE_DIR}/../BasicRenderer" REQUIRED)
+                target_link_libraries(OpenRenderGraphPersistentVulkanHostTests PRIVATE "${OPENRENDERGRAPH_PIX_RUNTIME}")
+                if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../BasicRenderer/WinPixEventRuntime.dll")
+                    add_custom_command(TARGET OpenRenderGraphPersistentVulkanHostTests POST_BUILD
+                        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                            "${CMAKE_CURRENT_SOURCE_DIR}/../BasicRenderer/WinPixEventRuntime.dll"
+                            "$<TARGET_FILE_DIR:OpenRenderGraphPersistentVulkanHostTests>")
+                endif()
+            endif()
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests COMMAND OpenRenderGraphPersistentVulkanHostTests)
+        endif()
+    endif()
     if(WIN32 AND BASICRENDERER_TEST_RUNTIME_DIR)
         set_tests_properties(
             OpenRenderGraphAsyncCompileTests
-            OpenRenderGraphExternalResourceTests
             OpenRenderGraphContributorHeaderC
             OpenRenderGraphContributorRegistryTests
             OpenRenderGraphDeviceRegistryTests
@@ -315,9 +374,16 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
                 WORKING_DIRECTORY "${BASICRENDERER_TEST_RUNTIME_DIR}"
                 ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${BASICRENDERER_TEST_RUNTIME_DIR}")
     endif()
-    set_tests_properties(OpenRenderGraphExternalResourceTests PROPERTIES
-        WORKING_DIRECTORY "$<TARGET_FILE_DIR:OpenRenderGraphExternalResourceTests>"
-        ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:OpenRenderGraphExternalResourceTests>")
+    if(_org_d3d12_tests)
+        set_tests_properties(OpenRenderGraphExternalResourceTests PROPERTIES
+            WORKING_DIRECTORY "$<TARGET_FILE_DIR:OpenRenderGraphExternalResourceTests>"
+            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:OpenRenderGraphExternalResourceTests>")
+        if(WIN32 AND BASICRENDERER_TEST_RUNTIME_DIR)
+            set_tests_properties(OpenRenderGraphExternalResourceTests PROPERTIES
+                WORKING_DIRECTORY "${BASICRENDERER_TEST_RUNTIME_DIR}"
+                ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${BASICRENDERER_TEST_RUNTIME_DIR}")
+        endif()
+    endif()
 endif()
 
 if(OPENRENDERGRAPH_ENABLE_D3D11_INTEROP)

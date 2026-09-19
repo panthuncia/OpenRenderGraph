@@ -255,7 +255,7 @@ constexpr bool is_shared_ptr_v<std::shared_ptr<U>> = true;
 // For a ResourceHandleAndRange, just return it in a vector
 inline std::vector<ResourceHandleAndRange>
 processResourceArguments(const ResourceHandleAndRange& rar,
-    RenderGraph* graph)
+    RenderGraph* /*graph*/)
 {
     //if (!rar.resource) return {};
     return { rar };

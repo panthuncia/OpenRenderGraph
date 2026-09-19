@@ -2918,7 +2918,26 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 	state.tracyFrameBegun.assign(slotCount, 0);
 	const auto presentationSlot = m_queueRegistry.FindGraphicsSlot();
 
-	auto submitSegment = [&](PersistentExecutionState::PreparedSegment& segment) -> std::shared_ptr<const experimental::GraphExecutionTimeline> {
+	std::vector<PersistentExecutionState::PreparedSegment*> segments;
+	if (state.pre) segments.push_back(&*state.pre);
+	segments.push_back(&*state.main);
+	if (state.tail) segments.push_back(&*state.tail);
+	// ExternalQueueBoundary: each queue's first and last batch across the frame's segments.
+	struct BoundaryBatch { size_t segment = SIZE_MAX; uint32_t batch = 0; };
+	std::vector<BoundaryBatch> firstBatchOnSlot(slotCount), lastBatchOnSlot(slotCount);
+	if (m_externalQueueBoundary.entry || m_externalQueueBoundary.exit) {
+		for (size_t segmentIndex = 0; segmentIndex < segments.size(); ++segmentIndex) {
+			const auto& batches = segments[segmentIndex]->publication->executable->graph->batches;
+			for (uint32_t batch = 0; batch < batches.size(); ++batch) {
+				const auto slot = batches[batch].queue;
+				if (slot >= slotCount) continue;
+				if (firstBatchOnSlot[slot].segment == SIZE_MAX) firstBatchOnSlot[slot] = {segmentIndex, batch};
+				lastBatchOnSlot[slot] = {segmentIndex, batch};
+			}
+		}
+	}
+
+	auto submitSegment = [&](PersistentExecutionState::PreparedSegment& segment, size_t segmentIndex) -> std::shared_ptr<const experimental::GraphExecutionTimeline> {
 		BT_ZONE_SCOPE("ORG.Persistent.SubmitSegment");
 		BT_ZONE_TEXT(segment.label, std::strlen(segment.label));
 		std::vector<experimental::ExecutionTimelinePoint> queues;
@@ -2962,6 +2981,10 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 			if (!job.pool) throw std::logic_error("Recording queue has no command-list pool");
 			job.recording = experimental::BuildPersistentRecordingList(sealed, batch);
 			job.recording.bindings = segment.legacyBindings;
+			job.recording.externalEntryBarrier = m_externalQueueBoundary.entry
+				&& firstBatchOnSlot[slot].segment == segmentIndex && firstBatchOnSlot[slot].batch == batch;
+			job.recording.externalExitBarrier = m_externalQueueBoundary.exit
+				&& lastBatchOnSlot[slot].segment == segmentIndex && lastBatchOnSlot[slot].batch == batch;
 			if (queueKind != QueueKind::Copy) {
 				job.recording.resourceDescriptorHeap = defaultResourceHeap;
 				job.recording.samplerDescriptorHeap = defaultSamplerHeap;
@@ -3038,9 +3061,8 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 			}
 		return execution;
 	};
-	if (state.pre) submitSegment(*state.pre);
-	submitSegment(*state.main);
-	if (state.tail) submitSegment(*state.tail);
+	for (size_t segmentIndex = 0; segmentIndex < segments.size(); ++segmentIndex)
+		submitSegment(*segments[segmentIndex], segmentIndex);
 	state.pre.reset(); state.main.reset(); state.tail.reset();
 	compiler.lastExecutedPreparationSlot = state.frameIndex;
 	compiler.lastSubmittedFrameData = state.frameData;

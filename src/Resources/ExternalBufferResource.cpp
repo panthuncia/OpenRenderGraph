@@ -28,16 +28,33 @@ std::shared_ptr<ExternalBufferResource> ExternalBufferResource::CreateShared(
 	return result;
 }
 
+namespace {
+	// Field-wise: the descriptors contain unions and padding, whose bytes are not
+	// preserved by member-wise copies, so memcmp would reject identical views.
+	bool SameBufferViews(const ExternalBufferResource::ViewRequirements& a, const ExternalBufferResource::ViewRequirements& b) {
+		const auto sameSrv = [](const rhi::SrvDesc& x, const rhi::SrvDesc& y) {
+			return x.dimension == y.dimension && x.formatOverride == y.formatOverride && x.componentMapping == y.componentMapping
+				&& x.buffer.kind == y.buffer.kind && x.buffer.firstElement == y.buffer.firstElement
+				&& x.buffer.numElements == y.buffer.numElements && x.buffer.structureByteStride == y.buffer.structureByteStride;
+		};
+		const auto sameUav = [](const rhi::UavDesc& x, const rhi::UavDesc& y) {
+			return x.dimension == y.dimension && x.formatOverride == y.formatOverride
+				&& x.buffer.kind == y.buffer.kind && x.buffer.firstElement == y.buffer.firstElement
+				&& x.buffer.numElements == y.buffer.numElements && x.buffer.structureByteStride == y.buffer.structureByteStride
+				&& x.buffer.counterOffsetInBytes == y.buffer.counterOffsetInBytes;
+		};
+		return a.createCBV == b.createCBV && a.createSRV == b.createSRV && a.createUAV == b.createUAV
+			&& a.createNonShaderVisibleUAV == b.createNonShaderVisibleUAV && a.uavCounterOffset == b.uavCounterOffset
+			&& (!a.createCBV || (a.cbvDesc.byteOffset == b.cbvDesc.byteOffset && a.cbvDesc.byteSize == b.cbvDesc.byteSize))
+			&& (!a.createSRV || sameSrv(a.srvDesc, b.srvDesc))
+			&& (!(a.createUAV || a.createNonShaderVisibleUAV) || sameUav(a.uavDesc, b.uavDesc));
+	}
+}
+
 bool ExternalBufferResource::RefreshShared(
 	rhi::ResourcePtr resource, uint64_t byteSize, const ViewRequirements& views)
 {
-	if (!resource || byteSize != m_byteSize || views.createCBV != m_views.createCBV ||
-		views.createSRV != m_views.createSRV || views.createUAV != m_views.createUAV ||
-		views.createNonShaderVisibleUAV != m_views.createNonShaderVisibleUAV ||
-		memcmp(&views.cbvDesc, &m_views.cbvDesc, sizeof(views.cbvDesc)) != 0 ||
-		memcmp(&views.srvDesc, &m_views.srvDesc, sizeof(views.srvDesc)) != 0 ||
-		memcmp(&views.uavDesc, &m_views.uavDesc, sizeof(views.uavDesc)) != 0 ||
-		views.uavCounterOffset != m_views.uavCounterOffset) return false;
+	if (!resource || byteSize != m_byteSize || !SameBufferViews(views, m_views)) return false;
 	auto previous = std::move(m_resource);
 	RotateDescriptorSlotsForPublication();
 	m_resource = std::move(resource);
