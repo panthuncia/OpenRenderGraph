@@ -101,7 +101,16 @@ void PersistentGraphHost::ExecuteFrame(const IHostExecutionData* hostData, const
 	const auto slot = static_cast<uint32_t>(m_frameNumber % (std::max)(m_desc.framesInFlight, 1u));
 	// The slot's previous frame must be done on the GPU before the upload pages it used are recycled
 	// (and before this frame records uploads into the slot).
-	if (m_slotFrameValues[slot]) (void)m_frameTimeline->HostWait(m_slotFrameValues[slot]);
+	if (m_slotFrameValues[slot]) {
+		(void)m_frameTimeline->HostWait(m_slotFrameValues[slot]);
+		// Nothing else completes a frame's statistics on this path: without it the pass timestamps were
+		// written and resolved every frame and never read, and their pending resolves only grew.
+		if (auto* stats = m_graph->GetStatisticsService()) {
+			rhi::Queue queue = m_desc.device.GetQueue(rhi::QueueKind::Graphics);
+			stats->OnFrameComplete(slot, queue);
+			if (m_completedFrame) m_completedFrame(m_slotFrameValues[slot] - 1, *stats);
+		}
+	}
 	if (auto* uploads = m_graph->GetUploadService()) uploads->ProcessDeferredReleases(static_cast<uint8_t>(slot));
 	DescriptorHeapManager::GetInstance().ProcessDeferredReleases(static_cast<uint8_t>(slot));
 	if (beforePrepare) beforePrepare(*m_graph);

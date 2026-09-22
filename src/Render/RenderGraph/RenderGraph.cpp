@@ -7352,6 +7352,14 @@ void RenderGraph::Setup() {
 	if (m_statisticsService) {
 		m_statisticsService->RegisterQueue(manager.GetGraphicsQueue().GetKind());
 		m_statisticsService->RegisterQueue(manager.GetComputeQueue().GetKind());
+		// ClearAll above dropped every registration, but passes keep their old index. A graph compiled before
+		// Setup (the persistent host: CompileStructural, then Setup) would then never register again and record
+		// no timestamps at all - the query heap is sized from zero passes. Re-register what is compiled.
+		for (auto& any : m_framePasses)
+			std::visit([](auto& pass) { if constexpr (!std::is_same_v<std::decay_t<decltype(pass)>, std::monostate>) pass.statisticsIndex = -1; }, any.pass);
+		for (auto& any : m_masterPassList)
+			std::visit([](auto& pass) { if constexpr (!std::is_same_v<std::decay_t<decltype(pass)>, std::monostate>) pass.statisticsIndex = -1; }, any.pass);
+		RegisterFramePassStatistics();
 		m_statisticsService->SetupQueryHeap();
 	}
 
@@ -7970,6 +7978,11 @@ void RenderGraph::UpdateOnPreparationOwner(const UpdateExecutionContext& context
 				}
 				}, pr.pass);
 		}
+		// Registration above may have added passes. The persistent recorder only looks passes up by name, so
+		// this is the one place its query heap gets sized: before it, every lookup found a pass with no query
+		// slots, and no persistent graph ever recorded a timestamp. A no-op when the capacity already fits.
+		if (m_statisticsService)
+			m_statisticsService->SetupQueryHeap();
 	}
 
 	if (context.beforeCompileFrame) {

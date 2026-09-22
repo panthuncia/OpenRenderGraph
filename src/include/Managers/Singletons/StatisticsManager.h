@@ -74,6 +74,8 @@ public:
 	const std::vector<std::string>&        GetPassNames() const { return m_passNames; }
 	const std::vector<std::string>&        GetPassTechniquePaths() const { return m_passTechniquePaths; }
 	const std::vector<PassStats>&          GetPassStats() const { return m_stats; }
+	uint64_t GetFrameSerial() const { return m_frameSerial; }
+	double GetGpuTicksToMilliseconds() const { return m_gpuTimestampFreq ? 1000.0 / double(m_gpuTimestampFreq) : 0.0; }
 	const std::vector<MeshPipelineStats>&  GetMeshStats() const { return m_meshStatsEma; }
 	org::runtime::MemoryBudgetStats GetMemoryBudgetStats() const { return m_memoryBudgetStats; }
 

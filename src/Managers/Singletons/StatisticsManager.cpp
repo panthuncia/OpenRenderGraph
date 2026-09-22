@@ -239,7 +239,7 @@ void StatisticsManager::RegisterQueue(rhi::QueueKind queueKind) {
 }
 
 void StatisticsManager::EnsureQueueBuffers(rhi::QueueKind queueKind) {
-    if (!m_timestampPool || !m_pipelineStatsPool) {
+    if (!m_timestampPool) {
         return;
     }
 
@@ -248,14 +248,14 @@ void StatisticsManager::EnsureQueueBuffers(rhi::QueueKind queueKind) {
     rhi::ResourceDesc tsRb = rhi::helpers::ResourceDesc::Buffer(
         static_cast<uint64_t>(m_timestampQueryInfo.elementSize) * m_timestampQueryInfo.count,
         rhi::HeapType::Readback);
-    rhi::ResourceDesc psRb = rhi::helpers::ResourceDesc::Buffer(
-        static_cast<uint64_t>(m_pipelineStatsQueryInfo.elementSize) * m_pipelineStatsQueryInfo.count,
-        rhi::HeapType::Readback);
-
-    auto& tsBuf = m_timestampBuffers[queueKind];
-    auto& psBuf = m_meshStatsBuffers[queueKind];
-    auto result = device.CreateCommittedResource(tsRb, tsBuf);
-    result = device.CreateCommittedResource(psRb, psBuf);
+    auto result = device.CreateCommittedResource(tsRb, m_timestampBuffers[queueKind]);
+    if (m_pipelineStatsPool) {
+        rhi::ResourceDesc psRb = rhi::helpers::ResourceDesc::Buffer(
+            static_cast<uint64_t>(m_pipelineStatsQueryInfo.elementSize) * m_pipelineStatsQueryInfo.count,
+            rhi::HeapType::Readback);
+        result = device.CreateCommittedResource(psRb, m_meshStatsBuffers[queueKind]);
+    }
+    (void)result;
 }
 
 void StatisticsManager::SetupQueryHeap() {
@@ -268,7 +268,7 @@ void StatisticsManager::SetupQueryHeap() {
         return;
     }
 
-    if (m_queryPoolPassCapacity >= m_numPasses && m_timestampPool && m_pipelineStatsPool) {
+    if (m_queryPoolPassCapacity >= m_numPasses && m_timestampPool && (m_pipelineStatsPool || !m_collectPipelineStatistics)) {
         return;
     }
 
@@ -293,40 +293,45 @@ void StatisticsManager::SetupQueryHeap() {
         }
     }
 
-    // Timestamp heap: 2 queries/pass/frame
-
-	rhi::QueryPoolDesc tq;
+    // Timestamp heap: 2 queries/pass/frame. The pass timings need nothing else.
+    rhi::QueryPoolDesc tq;
     tq.type = rhi::QueryType::Timestamp;
     tq.count = m_queryPoolPassCapacity * 2 * m_numFramesInFlight;
-    auto result = device.CreateQueryPool(tq, m_timestampPool);
+    if (device.CreateQueryPool(tq, m_timestampPool) != rhi::Result::Ok || !m_timestampPool) {
+        spdlog::warn("StatisticsManager: could not create a timestamp query pool for {} passes; pass GPU timings are off", m_queryPoolPassCapacity);
+        m_timestampPool = {};
+        m_collectPassStatistics = false;
+        return;
+    }
 
-	rhi::QueryPoolDesc sq;
-	sq.type = rhi::QueryType::PipelineStatistics;
-	sq.count = m_queryPoolPassCapacity * m_numFramesInFlight;
-	sq.statsMask = rhi::PipelineStatBits::PS_MeshInvocations | rhi::PipelineStatBits::PS_MeshPrimitives;
-	result = device.CreateQueryPool(sq, m_pipelineStatsPool);
-
-
-    // Allocate readback buffers for each queue
-    auto tsInfo = m_timestampPool->GetQueryResultInfo();
-    auto psInfo = m_pipelineStatsPool->GetQueryResultInfo();
-
-    rhi::ResourceDesc tsRb = rhi::helpers::ResourceDesc::Buffer(static_cast<uint64_t>(tsInfo.elementSize) * tsInfo.count, rhi::HeapType::Readback);
-    rhi::ResourceDesc psRb = rhi::helpers::ResourceDesc::Buffer(static_cast<uint64_t>(psInfo.elementSize) * psInfo.count, rhi::HeapType::Readback);
-
-    for (auto& kv : m_timestampBuffers) {
-        auto& buf = kv.second;
-        result = device.CreateCommittedResource(tsRb, buf);
-        auto& mb = m_meshStatsBuffers[kv.first];
-        result = std::move(device.CreateCommittedResource(psRb, mb));
-	}
+    // Mesh-shader pipeline statistics are optional. A device without mesh-shader queries (or an adopted
+    // device that did not enable them) fails this pool, and until now the null pool was dereferenced right
+    // after; the timestamps must not go down with it.
+    if (m_collectPipelineStatistics) {
+        rhi::QueryPoolDesc sq;
+        sq.type = rhi::QueryType::PipelineStatistics;
+        sq.count = m_queryPoolPassCapacity * m_numFramesInFlight;
+        sq.statsMask = rhi::PipelineStatBits::PS_MeshInvocations | rhi::PipelineStatBits::PS_MeshPrimitives;
+        if (device.CreateQueryPool(sq, m_pipelineStatsPool) != rhi::Result::Ok || !m_pipelineStatsPool) {
+            spdlog::info("StatisticsManager: mesh pipeline statistics unavailable on this device; collecting pass timestamps only");
+            m_pipelineStatsPool = {};
+            m_collectPipelineStatistics = false;
+        }
+    }
 
     m_timestampQueryInfo = m_timestampPool->GetQueryResultInfo();
-    m_pipelineStatsQueryInfo = m_pipelineStatsPool->GetQueryResultInfo();
-	m_pipelineStatsFields.resize(2);
-    m_pipelineStatsFields[0].field = rhi::PipelineStatTypes::MeshInvocations;
-    m_pipelineStatsFields[1].field = rhi::PipelineStatTypes::MeshPrimitives;
-    m_pipelineStatsLayout = m_pipelineStatsPool->GetPipelineStatsLayout(m_pipelineStatsFields.data(), static_cast<uint32_t>(m_pipelineStatsFields.size()));
+    if (m_pipelineStatsPool) {
+        m_pipelineStatsQueryInfo = m_pipelineStatsPool->GetQueryResultInfo();
+        m_pipelineStatsFields.resize(2);
+        m_pipelineStatsFields[0].field = rhi::PipelineStatTypes::MeshInvocations;
+        m_pipelineStatsFields[1].field = rhi::PipelineStatTypes::MeshPrimitives;
+        m_pipelineStatsLayout = m_pipelineStatsPool->GetPipelineStatsLayout(m_pipelineStatsFields.data(), static_cast<uint32_t>(m_pipelineStatsFields.size()));
+    }
+
+    // Readback buffers for each registered queue.
+    for (auto& kv : m_timestampBuffers) {
+        EnsureQueueBuffers(kv.first);
+    }
 
     m_recordedQueries.clear();
     m_pendingResolves.clear();
@@ -406,7 +411,7 @@ void StatisticsManager::ResolveQueries(
     auto tsIt = m_timestampBuffers.find(queueKind);
     if (tsIt == m_timestampBuffers.end() || !tsIt->second) return;
     auto psIt = m_meshStatsBuffers.find(queueKind);
-    if (psIt == m_meshStatsBuffers.end() || !psIt->second) return;
+    const bool havePipelineStats = m_collectPipelineStatistics && psIt != m_meshStatsBuffers.end() && psIt->second;
 
     auto& rec = m_recordedQueries[queueKind][frameIndex];
     if (rec.empty()) return;
@@ -432,7 +437,6 @@ void StatisticsManager::ResolveQueries(
     const uint64_t psStride = m_pipelineStatsQueryInfo.elementSize; // backend-dependent
 
     auto& tsBuf = tsIt->second;   // rhi::ResourcePtr
-    auto& psBuf = psIt->second;   // rhi::ResourcePtr
 
     // Resolve timestamp data and remember what to read on frame complete
     for (auto& r : ranges) {
@@ -446,7 +450,7 @@ void StatisticsManager::ResolveQueries(
 
         m_pendingResolves[queueKind][frameIndex].push_back(r);
 
-        if (!m_collectPipelineStatistics) continue;
+        if (!havePipelineStats) continue;
 
         // For each stamped pass in this range, resolve pipeline stats if it's a geometry pass
         for (uint32_t idx = r.first; idx < r.first + r.second; idx += 2) {
@@ -465,7 +469,7 @@ void StatisticsManager::ResolveQueries(
             cmd.ResolveQueryData(
                 m_pipelineStatsPool->GetHandle(),
                 psIdx, 1,
-                psBuf->GetHandle(),
+                psIt->second->GetHandle(),
                 psStride * uint64_t(psIdx)
             );
         }
@@ -540,7 +544,7 @@ void StatisticsManager::ResolveQueries(
     auto tsIt = m_timestampBuffers.find(queueKind);
     if (tsIt == m_timestampBuffers.end() || !tsIt->second) return;
     auto psIt = m_meshStatsBuffers.find(queueKind);
-    if (psIt == m_meshStatsBuffers.end() || !psIt->second) return;
+    const bool havePipelineStats = m_collectPipelineStatistics && psIt != m_meshStatsBuffers.end() && psIt->second;
 
     auto& rec = ctx.recordedIndices;
     if (rec.empty()) return;
@@ -564,7 +568,6 @@ void StatisticsManager::ResolveQueries(
     const uint64_t psStride = m_pipelineStatsQueryInfo.elementSize;
 
     auto& tsBuf = tsIt->second;
-    auto& psBuf = psIt->second;
 
     for (auto& r : ranges) {
         cmd.ResolveQueryData(
@@ -576,7 +579,7 @@ void StatisticsManager::ResolveQueries(
 
         ctx.pendingRanges.push_back(r);
 
-        if (!m_collectPipelineStatistics) continue;
+        if (!havePipelineStats) continue;
 
         for (uint32_t idx = r.first; idx < r.first + r.second; idx += 2) {
             const uint32_t encoded = idx / 2;
@@ -589,7 +592,7 @@ void StatisticsManager::ResolveQueries(
             cmd.ResolveQueryData(
                 m_pipelineStatsPool->GetHandle(),
                 psIdx, 1,
-                psBuf->GetHandle(),
+                psIt->second->GetHandle(),
                 psStride * uint64_t(psIdx)
             );
         }
@@ -619,10 +622,9 @@ void StatisticsManager::OnFrameComplete(
 	auto tsIt = m_timestampBuffers.find(queueKind);
 	auto psIt = m_meshStatsBuffers.find(queueKind);
 	if (tsIt == m_timestampBuffers.end() || !tsIt->second) return;
-	if (psIt == m_meshStatsBuffers.end() || !psIt->second) return;
+	const bool havePipelineStats = m_collectPipelineStatistics && psIt != m_meshStatsBuffers.end() && psIt->second;
 
     auto& tsBuf = tsIt->second;
-    auto& psBuf = psIt->second;
     auto& pending = m_pendingResolves[queueKind][frameIndex];
     if (pending.empty()) return;
 
@@ -698,11 +700,14 @@ void StatisticsManager::OnFrameComplete(
             UpdateEma(m_stats[pi].gpuTimeEma, ms);
             m_stats[pi].gpuTimeMs = ms;
             m_stats[pi].gpuSampleSerial = m_frameSerial;
+            m_stats[pi].gpuBeginTick = t0;
+            m_stats[pi].gpuEndTick = t1;
             if (pi < m_passLastExecutionFrame.size()) {
                 m_passLastExecutionFrame[pi] = m_frameSerial;
             }
 
-            if (!m_collectPipelineStatistics || !m_isGeometryPass[pi]) continue;
+            if (!havePipelineStats || !m_isGeometryPass[pi]) continue;
+            auto& psBuf = psIt->second;
 
             // Map just this pass's pipeline stat element
             const uint32_t psIdx = frameBase + pi;

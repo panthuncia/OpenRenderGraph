@@ -9,6 +9,8 @@
 #include <chrono>
 #include <functional>
 #include <rhi.h>
+#include <rhi_colors.h>
+#include <rhi_debug.h>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -682,6 +684,11 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
             context.Commands().Barriers(barriers);
         }
         for (size_t passIndex = 0; passIndex < recording.passes.size(); ++passIndex) {
+            // A capture tool's region for the pass (PIX / VK_EXT_debug_utils), opened before the pass's entry
+            // barriers so that a wait on the previous pass's output shows up inside the pass that needed it.
+            // The legacy recorder labels its passes; without this, persistent graphs recorded none at all.
+            const auto passLabel = recording.passes[passIndex].DebugName();
+            rhi::debug::Scope captureScope(context.Commands(), rhi::colors::Mint, passLabel.empty() ? "<unnamed>" : passLabel.data());
             if (!recording.barriersBeforePass.empty()) {
                 const auto& before = recording.barriersBeforePass[passIndex];
                 if (!before.textures.empty() || !before.buffers.empty()) {

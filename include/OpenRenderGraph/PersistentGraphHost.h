@@ -61,6 +61,12 @@ public:
 	// (BUFFER_UPLOAD) into graph resources.
 	using FrameCallback = std::function<void(RenderGraph&)>;
 
+	// Called from ExecuteFrame once an earlier frame is known complete on the GPU (its slot is about to be
+	// reused), after that frame's pass timestamps were read back: the passes whose gpuSampleSerial equals
+	// stats.GetFrameSerial() are the ones that frame recorded. frameNumber is that frame's 0-based number.
+	using CompletedFrameCallback = std::function<void(uint64_t frameNumber, const runtime::IStatisticsService& stats)>;
+	void SetCompletedFrameCallback(CompletedFrameCallback callback) { m_completedFrame = std::move(callback); }
+
 	// Builds if needed, then prepares and submits one frame. hostData is visible to
 	// passes through PassPrepareContext::preparationData for this frame only.
 	void ExecuteFrame(const IHostExecutionData* hostData = nullptr, const FrameCallback& beforePrepare = {});
@@ -88,6 +94,7 @@ private:
 	std::vector<uint64_t> m_slotFrameValues;
 	bool m_rebuildRequested = true;
 	uint64_t m_frameNumber = 0;
+	CompletedFrameCallback m_completedFrame;
 };
 
 } // namespace org

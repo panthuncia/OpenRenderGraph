@@ -760,6 +760,8 @@ public:
 	void ShutdownTaskWorkers();
 	void ClearExtensions();
 	void Setup();
+	// Registers every compiled pass that collects statistics and has no index yet (names dedupe).
+	void RegisterFramePassStatistics();
 	void RegisterExtension(std::unique_ptr<IRenderGraphExtension> ext, std::optional<std::string_view> id = std::nullopt);
 	const std::vector<PassBatch>& GetBatches() const { return batches; }
 	std::optional<PresentDependency> GetLastPresentDependency() const noexcept { return m_lastPresentDependency; }

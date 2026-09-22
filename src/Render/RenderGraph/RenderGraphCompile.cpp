@@ -3986,52 +3986,7 @@ void RenderGraph::PrepareAndCompileFrame(rhi::Device device, uint8_t frameIndex,
 	if (m_statisticsService) {
 		traceCompileStep("RegisterStatistics");
 		BT_ZONE_SCOPE("RenderGraph::CompileFrame::RegisterStatistics");
-		for (size_t i = 0; i < m_framePasses.size(); ++i) {
-			auto& any = m_framePasses[i];
-			if (any.type == PassType::Render) {
-				auto& p = std::get<RenderPassAndResources>(any.pass);
-				if (!p.collectStatistics) {
-					p.statisticsIndex = -1;
-					continue;
-				}
-				if (p.name.empty()) {
-					p.name = "RenderPass#" + std::to_string(i);
-				}
-				any.name = p.name;
-				if (p.statisticsIndex < 0) {
-					p.statisticsIndex = static_cast<int>(m_statisticsService->RegisterPass(p.name, p.resources.isGeometryPass, p.techniquePath));
-				}
-			}
-			else if (any.type == PassType::Compute) {
-				auto& p = std::get<ComputePassAndResources>(any.pass);
-				if (!p.collectStatistics) {
-					p.statisticsIndex = -1;
-					continue;
-				}
-				if (p.name.empty()) {
-					p.name = "ComputePass#" + std::to_string(i);
-				}
-				any.name = p.name;
-				if (p.statisticsIndex < 0) {
-					p.statisticsIndex = static_cast<int>(m_statisticsService->RegisterPass(p.name, false, p.techniquePath));
-				}
-			}
-			else if (any.type == PassType::Copy) {
-				auto& p = std::get<CopyPassAndResources>(any.pass);
-				if (!p.collectStatistics) {
-					p.statisticsIndex = -1;
-					continue;
-				}
-				if (p.name.empty()) {
-					p.name = "CopyPass#" + std::to_string(i);
-				}
-				any.name = p.name;
-				if (p.statisticsIndex < 0) {
-					p.statisticsIndex = static_cast<int>(m_statisticsService->RegisterPass(p.name, false, p.techniquePath));
-				}
-			}
-		}
-
+		RegisterFramePassStatistics();
 		m_statisticsService->SetupQueryHeap();
 	}
 
@@ -5284,5 +5239,53 @@ void RenderGraph::PrepareAndCompileFrame(rhi::Device device, uint8_t frameIndex,
 #endif
 }
 
+
+void RenderGraph::RegisterFramePassStatistics() {
+	for (size_t i = 0; i < m_framePasses.size(); ++i) {
+		auto& any = m_framePasses[i];
+		if (any.type == PassType::Render) {
+			auto& p = std::get<RenderPassAndResources>(any.pass);
+			if (!p.collectStatistics) {
+				p.statisticsIndex = -1;
+				continue;
+			}
+			if (p.name.empty()) {
+				p.name = "RenderPass#" + std::to_string(i);
+			}
+			any.name = p.name;
+			if (p.statisticsIndex < 0) {
+				p.statisticsIndex = static_cast<int>(m_statisticsService->RegisterPass(p.name, p.resources.isGeometryPass, p.techniquePath));
+			}
+		}
+		else if (any.type == PassType::Compute) {
+			auto& p = std::get<ComputePassAndResources>(any.pass);
+			if (!p.collectStatistics) {
+				p.statisticsIndex = -1;
+				continue;
+			}
+			if (p.name.empty()) {
+				p.name = "ComputePass#" + std::to_string(i);
+			}
+			any.name = p.name;
+			if (p.statisticsIndex < 0) {
+				p.statisticsIndex = static_cast<int>(m_statisticsService->RegisterPass(p.name, false, p.techniquePath));
+			}
+		}
+		else if (any.type == PassType::Copy) {
+			auto& p = std::get<CopyPassAndResources>(any.pass);
+			if (!p.collectStatistics) {
+				p.statisticsIndex = -1;
+				continue;
+			}
+			if (p.name.empty()) {
+				p.name = "CopyPass#" + std::to_string(i);
+			}
+			any.name = p.name;
+			if (p.statisticsIndex < 0) {
+				p.statisticsIndex = static_cast<int>(m_statisticsService->RegisterPass(p.name, false, p.techniquePath));
+			}
+		}
+	}
+}
 
 } // namespace org

@@ -98,6 +98,14 @@ public:
     const std::vector<unsigned>& GetVisiblePassIndices(uint64_t maxStaleFrames) const override {
         return StatisticsManager::GetInstance().GetVisiblePassIndices(maxStaleFrames);
     }
+
+    uint64_t GetFrameSerial() const override {
+        return StatisticsManager::GetInstance().GetFrameSerial();
+    }
+
+    double GetGpuTicksToMilliseconds() const override {
+        return StatisticsManager::GetInstance().GetGpuTicksToMilliseconds();
+    }
 };
 }
 

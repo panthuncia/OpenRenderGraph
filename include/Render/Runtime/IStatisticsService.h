@@ -45,6 +45,9 @@ public:
     virtual MemoryBudgetStats GetMemoryBudgetStats() const = 0;
     virtual const std::vector<bool>& GetIsGeometryPassVector() const = 0;
     virtual const std::vector<unsigned>& GetVisiblePassIndices(uint64_t maxStaleFrames) const = 0;
+    // Passes read back by the latest OnFrameComplete carry this value as their gpuSampleSerial.
+    virtual uint64_t GetFrameSerial() const = 0;
+    virtual double GetGpuTicksToMilliseconds() const = 0;
 };
 
 std::shared_ptr<IStatisticsService> CreateDefaultStatisticsService();

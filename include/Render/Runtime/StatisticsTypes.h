@@ -10,6 +10,11 @@ struct PassStats {
     double gpuTimeEma = 0.0;
     double gpuTimeMs = 0.0;
     uint64_t gpuSampleSerial = 0;
+    // The raw timestamp pair of the last sample, in GPU ticks (IStatisticsService::GetGpuTicksToMilliseconds).
+    // A pass's begin is written after its entry barriers and can precede the previous pass's end, so
+    // per-pass durations overlap; the pair lets a consumer compute exclusive time along the queue.
+    uint64_t gpuBeginTick = 0;
+    uint64_t gpuEndTick = 0;
     double cpuUpdateTimeEma = 0.0;
     double cpuExecuteTimeEma = 0.0;
     static constexpr double alpha = 0.1;
