@@ -162,6 +162,9 @@ public:
 		bool registerName = true;
 		bool isGeometryPass = false; // Optional: opts pass into statistics tracking for rasterization
 		bool collectStatistics = true;
+		// Persistent execution: the host epoch the pass runs in (persistent::AllEpochs:
+		// every one). See SetPersistentEpochOrder.
+		uint32_t epoch = UINT32_MAX;
 		// Per-frame passes only. A frame-interrupting pass must run at its insert
 		// point even under the persistent graph, which hosts it in the main
 		// executable at the cost of a structural rebuild when it appears and when
@@ -298,6 +301,16 @@ public:
 			return std::move(*this);
 		}
 
+		ExternalPassDesc& Epoch(uint32_t value) & {
+			epoch = value;
+			return *this;
+		}
+
+		ExternalPassDesc Epoch(uint32_t value) && {
+			epoch = value;
+			return std::move(*this);
+		}
+
 		ExternalPassDesc& InterruptsFrame(bool enabled = true) & {
 			interruptsFrame = enabled;
 			return *this;
@@ -376,6 +389,7 @@ public:
 		std::string techniquePath;
 		int statisticsIndex = -1;
 		bool collectStatistics = true;
+		uint32_t epoch = UINT32_MAX; // persistent::AllEpochs
 
 		PassRunMask run = PassRunMask::Both; // default behavior
 		std::vector<std::byte> immediateBytecode; // Stores the immediate execution bytecode
@@ -726,9 +740,78 @@ public:
 	enum class PersistentSegmentKind : uint8_t { Main, Pre, Tail };
 	struct PersistentExecutionState; // Defined in RenderGraphPersistent.cpp; opaque elsewhere.
 	void SetPersistentExecutionEnabled(bool enabled) noexcept { m_persistentExecution = enabled; }
+
+	// The calling thread's CPU time in the last persistent Execute, by phase. Diagnostics: a host that
+	// reports where an epoch's time goes reads it after Execute returns.
+	struct PersistentExecuteTimings {
+		double retireUs = 0.0;     // retirement of completed executions
+		double admissionUs = 0.0;  // admission, seal and recording-job setup
+		double acquireUs = 0.0;    // command-list acquisition
+		double recordUs = 0.0;     // batch recording (the calling thread joins the task service)
+		double submitUs = 0.0;     // queue submission of the recorded batches
+		double commitUs = 0.0;     // admission commit, statistics publication, fence bookkeeping
+		uint32_t segments = 0;
+		uint32_t cachedAdmissions = 0;  // segments whose barrier plan came from the admission cache
+		uint32_t batches = 0;
+	};
+	const PersistentExecuteTimings& LastPersistentExecuteTimings() const noexcept { return m_lastPersistentExecuteTimings; }
 	bool PersistentExecutionEnabled() const noexcept { return m_persistentExecution; }
 	void SetPersistentSegment(std::string passName, PersistentSegmentKind kind) {
 		m_persistentSegmentKinds[std::move(passName)] = kind;
+	}
+	// Host epochs (persistent execution). A host that submits the graph at several
+	// points of its own frame tags each pass with its epoch (ExternalPassDesc::Epoch)
+	// and names the execution order once. The graph compiles over the whole frame, so
+	// scheduling and transient alias placement see every lifetime; each execution then
+	// prepares, admits, records and submits only the current epoch's passes (and the
+	// untagged ones). Changing the order is structural.
+	void SetPersistentEpochOrder(std::vector<uint32_t> order) { m_persistentEpochOrder = std::move(order); }
+	// Closed executions (persistent::SynchronousAdmission::SetClosedExecutions): each segment the host
+	// executes leaves every resource it touches in its home state and starts with a full memory barrier, so
+	// its admission does not depend on what ran before. Set before the first frame.
+	void SetPersistentClosedExecutions(bool closed) noexcept { m_persistentClosedExecutions = closed; }
+	bool PersistentClosedExecutions() const noexcept { return m_persistentClosedExecutions; }
+
+	// Tickets (async epochs, PersistentGraphHost::EnableAsyncEpochs). The graph's owner thread prepares an
+	// epoch's main execution ahead of its epoch point - Update, invocations, admission, recording - into a
+	// ticket, for a frame slot it has waited for. The host's submitting thread later checks the ticket is
+	// still current, records the uploads queued since (RecordPendingUploads) and submits the ticket's
+	// packets, assigning their timeline values then, in submission order. The owner completes every ticket
+	// in that order, with those values, or abandons it. Requires closed executions (a ticket's admission
+	// must not depend on the executions around it) and no Pre/Tail passes other than the host's uploads.
+	struct PersistentTicket;
+	struct PersistentTicketSubmission {
+		bool submitted = false;
+		std::vector<uint64_t> signals;  // per batch of every segment, in order: the value it signalled
+	};
+	// Owner thread. hostFrame numbers the execution (its statistics and lifecycle).
+	std::shared_ptr<PersistentTicket> PreparePersistentTicket(rhi::Device device, uint32_t epoch, uint8_t slot, uint64_t hostFrame);
+	// Returns the last value the submission signals on each queue slot it used (empty when abandoned).
+	std::vector<std::pair<uint32_t, uint64_t>> CompletePersistentTicket(PersistentTicket& ticket, const PersistentTicketSubmission& submission);
+	// Owner thread: releases executions the GPU has finished (the retirement Execute does before submitting).
+	void RetirePersistentExecutions();
+	// Submitting thread; they touch nothing the owner thread uses.
+	static uint32_t PersistentTicketEpoch(const PersistentTicket& ticket) noexcept;
+	static uint8_t PersistentTicketSlot(const PersistentTicket& ticket) noexcept;
+	static uint64_t PersistentTicketHostFrame(const PersistentTicket& ticket) noexcept;
+	// Every pass it prepared would still prepare the same invocation (RenderGraphPass::InvocationRevisionHash).
+	static bool PersistentTicketCurrent(const PersistentTicket& ticket);
+	// Submits the packets with values from nextQueueValues (the last value assigned per queue slot, advanced
+	// here). Returns false when a packet failed.
+	static bool SubmitPersistentTicket(PersistentTicket& ticket, std::span<uint64_t> nextQueueValues, PersistentTicketSubmission& out);
+	// Submitting thread (the upload service's owner): records the uploads queued since the last call into
+	// `list` as plain buffer copies, without the graph's registry or admission: a full barrier (against the
+	// work before them), then the copies, whose destinations are left for the next execution's entry
+	// barrier - so the list must precede a closed execution on its queue.
+	// keepAlive owns the staging they read until the GPU is done with the slot. False when an upload is not
+	// a pointer-targeted buffer copy (the caller must use the synchronous path).
+	bool RecordPendingUploads(rhi::Device device, rhi::CommandList& list, uint8_t slot, std::shared_ptr<void>& keepAlive, bool& recorded);
+	// The epoch the next Update/Execute runs; persistent::AllEpochs runs every pass.
+	void SetPersistentEpoch(uint32_t epoch) noexcept { m_persistentEpoch = epoch; }
+	uint32_t PersistentEpoch() const noexcept { return m_persistentEpoch; }
+	// Whether a pass of that epoch takes part in the current execution.
+	bool RunsInPersistentEpoch(uint32_t passEpoch) const noexcept {
+		return !m_persistentExecution || m_persistentEpoch == UINT32_MAX || passEpoch == UINT32_MAX || passEpoch == m_persistentEpoch;
 	}
 	// Hosts that share a queue with another API (for example an adopted DXVK
 	// VkQueue whose translated D3D11 work is submitted before and after the graph)
@@ -1357,6 +1440,12 @@ private:
 	// Compile-dump mode for the persistent graph: written once per selected executable.
 	void WritePersistentGraphDebugDump(const persistent::SelectedPublication& selected) const;
 	bool m_persistentExecution = false;
+	std::vector<uint32_t> m_persistentEpochOrder;
+	bool m_persistentClosedExecutions = false;
+	// Set while PreparePersistentTicket runs: Update skips the dynamic segments, Execute stops after recording.
+	PersistentTicket* m_persistentTicketTarget = nullptr;
+	uint32_t m_persistentEpoch = UINT32_MAX;
+	PersistentExecuteTimings m_lastPersistentExecuteTimings{};
 	std::unordered_map<std::string, PersistentSegmentKind> m_persistentSegmentKinds;
 	ExternalQueueBoundary m_externalQueueBoundary{};
     void SubmitOwnedCompileRequest(rhi::Device device, const std::vector<Node>& nodes,

@@ -23,6 +23,7 @@
 #include "Render/Runtime/MpscQueue.h"
 
 namespace org::imm { class ImmediateCommandList; }
+namespace org::runtime { class StagedUploadBatch; }
 
 namespace org {
 
@@ -185,6 +186,11 @@ public:
 	// Call once per frame after the GPU has finished with the retiring frame.
 	void ProcessDeferredReleases(uint8_t frameIndex);
 
+	// Owner thread: queues a producer's staged batch (IUploadService::SubmitStagedUploads).
+	void SubmitStagedUploads(std::shared_ptr<org::runtime::StagedUploadBatch> batch);
+	void SetStagedUploadsRecordedDirectly(bool direct);
+	size_t RecordStagedUploads(rhi::CommandList& list, uint8_t frameIndex);
+
 	// Configuration
 
 	void SetResolveContext(UploadResolveContext ctx);
@@ -280,6 +286,13 @@ private:
 	std::vector<UploadPagePtr> m_openPages;
 	std::unordered_set<UploadPage*> m_openPageSet;
 	std::vector<std::vector<UploadPagePtr>> m_framePages;
+	// Staged batches submitted since the last upload pass, and those the pass of each frame slot recorded
+	// (released with the slot).
+	std::vector<std::shared_ptr<org::runtime::StagedUploadBatch>> m_pendingStaged;
+	// Direct mode: submitted batches waiting for RecordStagedUploads.
+	bool m_stagedDirect = false;
+	std::vector<std::shared_ptr<org::runtime::StagedUploadBatch>> m_directStaged;
+	std::vector<std::vector<std::shared_ptr<org::runtime::StagedUploadBatch>>> m_frameStaged;
 	UploadPagePtr             m_activePage;
 	std::atomic_size_t         m_nextPageIndex = 0;
 	struct PageLifetimeTrace {

@@ -182,6 +182,16 @@ RecordedFrame RecordFrame(PlannedFrame plan,
     return result;
 }
 
+bool RecordedFrame::SubmitPackets(std::span<const ExecutionBatchTimeline> batches) {
+    BT_ZONE_SCOPE("ORG.Frame.SubmitPackets");
+    if (m_submitted || !m_snapshot || m_batches.empty() || batches.size() != m_batches.size())
+        throw std::logic_error("Recorded frame already consumed or incomplete");
+    m_submitted = true;
+    for (size_t i = 0; i < m_batches.size(); ++i)
+        if (!m_batches[i]->Submit(batches[i])) return false;
+    return true;
+}
+
 std::shared_ptr<const GraphExecutionTimeline> RecordedFrame::Submit(ExecutionTimelineAdmission& admission) && {
     BT_ZONE_SCOPE("ORG.Frame.Submit");
     if (m_submitted || !m_snapshot || m_batches.empty())

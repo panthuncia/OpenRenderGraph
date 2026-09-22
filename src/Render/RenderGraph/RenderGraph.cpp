@@ -598,6 +598,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 		par.name = d.name;
 		par.techniquePath = d.techniquePath;
 		par.collectStatistics = d.collectStatistics;
+		par.epoch = d.epoch;
 		{
 			RenderPassBuilder b(this, d.name);
 			b.pass = rp;
@@ -672,6 +673,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 		par.name = d.name;
 		par.techniquePath = d.techniquePath;
 		par.collectStatistics = d.collectStatistics;
+		par.epoch = d.epoch;
 		{
 			ComputePassBuilder b(this, d.name);
 			b.pass = cp;
@@ -744,6 +746,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 		par.name = d.name;
 		par.techniquePath = d.techniquePath;
 		par.collectStatistics = d.collectStatistics;
+		par.epoch = d.epoch;
 		{
 			CopyPassBuilder b(this, d.name);
 			b.pass = cp;
@@ -7944,7 +7947,7 @@ void RenderGraph::UpdateOnPreparationOwner(const UpdateExecutionContext& context
 				if constexpr (std::is_same_v<T, std::monostate>) {
 					// no-op
 				}
-				else {
+				else if (RunsInPersistentEpoch(obj.epoch)) {
 					BT_ZONE_SCOPE("RenderGraph::Update::PassUpdate");
 					if (!obj.name.empty()) {
 						BT_ZONE_TEXT(obj.name.data(), obj.name.size());

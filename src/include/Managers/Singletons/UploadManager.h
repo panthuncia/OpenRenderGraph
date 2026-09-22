@@ -92,6 +92,9 @@ public:
 	void QueueResourceCopy(const std::shared_ptr<Resource>& destination, const std::shared_ptr<Resource>& source, size_t size);
 	void ExecuteResourceCopies(uint8_t frameIndex, org::imm::ImmediateCommandList& commandList);
 	void ProcessDeferredReleases(uint8_t frameIndex);
+	void SubmitStagedUploads(std::shared_ptr<org::runtime::StagedUploadBatch> batch);
+	void SetStagedUploadsRecordedDirectly(bool direct);
+	size_t RecordStagedUploads(rhi::CommandList& list, uint8_t frameIndex);
 	void SetUploadResolveContext(UploadResolveContext ctx);
 	std::shared_ptr<RenderPass> GetUploadPass() const { return m_uploadPass; }
 	std::string DescribeQueuedTargetByGlobalResourceId(uint64_t globalResourceId);
@@ -164,6 +167,7 @@ private:
 	UploadResolveContext m_ctx{};
 	std::shared_ptr<UploadPass> m_uploadPass;
 	std::unique_ptr<UploadInstance> m_uploadInstance;
+	bool m_stagedUploadsDirect = false;  // applied to every instance (SetStagedUploadsRecordedDirectly)
 
 	// ── Worker upload path ──────────────────────────────────────────────
 	std::unique_ptr<org::runtime::CopyQueueUploadService> m_copyQueueUploads;

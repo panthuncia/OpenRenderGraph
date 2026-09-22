@@ -194,6 +194,24 @@ std::shared_ptr<const GraphExecutionTimeline> ExecutionTimelineAdmission::Submit
     return execution;
 }
 
+std::shared_ptr<const GraphExecutionTimeline> ExecutionTimelineAdmission::RecordSubmitted(
+    std::shared_ptr<const CompiledGraphBundle> bundle,
+    const std::vector<std::vector<ExecutionTimelinePoint>>& incomingWaits,
+    const std::vector<std::shared_ptr<const IPreparedExecutionBatch>>& packets,
+    std::span<const ExecutionTimelinePoint> signals) {
+    BT_ZONE_SCOPE("ORG.Execution.RecordSubmitted");
+    if (!bundle || !bundle->graph || packets.size() != bundle->graph->batches.size())
+        throw std::invalid_argument("Recorded packet count mismatch");
+    std::vector<std::shared_ptr<const void>> leases(packets.begin(), packets.end());
+    auto execution = Prepare(std::move(bundle), incomingWaits, std::move(leases), packets, signals);
+    CompletionSet completion;
+    for (const auto& batch : execution->batches) completion.Include(batch.signal);
+    for (uint32_t i = 0; i < packets.size(); ++i) CommitBatch(execution->submission, i);
+    if (execution->bundle->input->frameContext)
+        execution->bundle->input->frameContext->MarkSubmitted(std::move(completion));
+    return execution;
+}
+
 void ExecutionTimelineAdmission::CommitBatch(uint64_t submission, uint32_t batch) {
     BT_ZONE_SCOPE("ORG.Execution.CommitTimeline");
     if (m_failed || !m_pending || submission != m_pending->submission || batch != m_nextBatch)

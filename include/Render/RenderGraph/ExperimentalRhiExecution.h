@@ -421,14 +421,25 @@ public:
             AbandonEffects();
             return {SubmissionState::NotSubmitted, SubmissionFailureStage::Validation};
         }
-        for (auto wait : batch.waits) {
-            const auto result = m_queue.Wait({find(wait.timeline)->handle, wait.value});
-            if (result != rhi::Result::Ok) {
-                AbandonEffects();
-                return {SubmissionState::NotSubmitted, SubmissionFailureStage::Wait, static_cast<uint32_t>(result)};
+        // One queue submission: the waits, the lists, the passes' external signals and the batch's own
+        // signal. The external signals are fixed at preparation, so they can travel with the lists; a host
+        // that orders submissions in its own stream (DXVK) then takes one entry per batch instead of one
+        // per wait and per signal.
+        std::vector<rhi::TimelinePoint> waits;
+        waits.reserve(batch.waits.size());
+        for (auto wait : batch.waits) waits.push_back({find(wait.timeline)->handle, wait.value});
+        std::vector<rhi::TimelinePoint> signals;
+        for (const auto& pass : m_submissionEffects)
+            for (const auto& external : pass.ExternalSignalsAfterCompletion()) {
+                if (!external.timeline || !external.value) {
+                    AbandonEffects();
+                    return {SubmissionState::NotSubmitted, SubmissionFailureStage::Validation};
+                }
+                signals.push_back({external.timeline.GetHandle(), external.value});
             }
-        }
-        const auto submitted = m_queue.Submit({m_lists.data(), static_cast<uint32_t>(m_lists.size())}, {});
+        signals.push_back({signal->handle, batch.signal.value});
+        const auto submitted = m_queue.Submit({m_lists.data(), static_cast<uint32_t>(m_lists.size())},
+            {{waits.data(), static_cast<uint32_t>(waits.size())}, {signals.data(), static_cast<uint32_t>(signals.size())}});
         if (submitted != rhi::Result::Ok)
             return {SubmissionState::SubmissionUncertain, SubmissionFailureStage::Submit, static_cast<uint32_t>(submitted)};
         bool lifecycleFailed = false;
@@ -439,21 +450,9 @@ public:
                 basic_telemetry::AddCounter("ORG.Execution.SubmissionLifecycleFailures");
             }
         }
+        // The signal is already queued; a failed lifecycle is still reported, conservatively, as unsignaled.
         if (lifecycleFailed)
             return {SubmissionState::SubmittedWithoutSignal, SubmissionFailureStage::Lifecycle};
-        for (const auto& pass : m_submissionEffects) {
-            for (const auto& external : pass.ExternalSignalsAfterCompletion()) {
-                if (!external.timeline || !external.value)
-                    return {SubmissionState::SubmittedWithoutSignal, SubmissionFailureStage::Signal};
-                const auto externalSignaled = m_queue.Signal({external.timeline.GetHandle(), external.value});
-                if (externalSignaled != rhi::Result::Ok)
-                    return {SubmissionState::SubmittedWithoutSignal, SubmissionFailureStage::Signal,
-                        static_cast<uint32_t>(externalSignaled)};
-            }
-        }
-        const auto signaled = m_queue.Signal({signal->handle, batch.signal.value});
-        if (signaled != rhi::Result::Ok)
-            return {SubmissionState::SubmittedWithoutSignal, SubmissionFailureStage::Signal, static_cast<uint32_t>(signaled)};
         return {SubmissionState::Signaled};
     }
     void Complete(uint64_t submission) const noexcept override {
@@ -557,6 +556,8 @@ struct OwnedRecordingList {
     std::vector<PreparedPass> passes;
     std::shared_ptr<OwnedRecordingStatistics> statistics;
     std::shared_ptr<FrameCommandAllocation> allocation = std::make_shared<FrameCommandAllocation>();
+    // RecordingContext::FrameSlot for the passes of this list.
+    uint32_t frameSlot = 0;
     // RenderGraph::ExternalQueueBoundary: full memory barrier before the first
     // pass / after the last pass of this command list.
     bool externalEntryBarrier = false;
@@ -643,6 +644,7 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
             : RecordingContext::FromPersistentBindings(recording.allocation->pair.list.Get(),recording.publication);
         if (recording.bindings && recording.publication)
             context = context.WithPersistentBindings(recording.publication);
+        context.SetFrameSlot(recording.frameSlot);
         struct TracyGpuZoneScope {
             rhi::CommandList& commands;
             bool open = false;

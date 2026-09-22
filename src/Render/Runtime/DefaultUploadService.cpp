@@ -110,6 +110,18 @@ public:
         UploadManager::GetInstance().QueueResourceCopy(destination, source, size);
     }
 
+    void SubmitStagedUploads(std::shared_ptr<StagedUploadBatch> batch) override {
+        UploadManager::GetInstance().SubmitStagedUploads(std::move(batch));
+    }
+
+    void SetStagedUploadsRecordedDirectly(bool direct) override {
+        UploadManager::GetInstance().SetStagedUploadsRecordedDirectly(direct);
+    }
+
+    size_t RecordStagedUploads(rhi::CommandList& list, uint8_t frameIndex) override {
+        return UploadManager::GetInstance().RecordStagedUploads(list, frameIndex);
+    }
+
     void ProcessDeferredReleases(uint8_t frameIndex) override {
         UploadManager::GetInstance().ProcessDeferredReleases(frameIndex);
         DeletionManager::GetInstance().ProcessDeletions();

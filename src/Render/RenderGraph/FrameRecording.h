@@ -67,6 +67,13 @@ public:
     RecordedFrame(const RecordedFrame&) = delete;
     const auto& Snapshot() const noexcept { return m_snapshot; }
     std::shared_ptr<const GraphExecutionTimeline> Submit(ExecutionTimelineAdmission& admission) &&;
+    // Async epochs: hands the packets to their queues with timelines the caller assigned (one per batch),
+    // touching no admission state - safe on the submitting thread while the owner prepares other work. The
+    // owner records the submission afterwards (ExecutionTimelineAdmission::RecordSubmitted). False when a
+    // packet failed; the frame is consumed either way.
+    bool SubmitPackets(std::span<const ExecutionBatchTimeline> batches);
+    const auto& Packets() const noexcept { return m_batches; }
+    const auto& IncomingWaits() const noexcept { return m_incomingWaits; }
 private:
     friend RecordedFrame RecordFrame(PlannedFrame, const std::shared_ptr<runtime::ITaskService>&, size_t);
     friend class DispatchedFrameRecording;

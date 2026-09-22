@@ -77,6 +77,22 @@ public:
             { pass.InvocationRevision(prepare, out) } -> std::same_as<void>;
         };
 
+    bool InvocationRevisionHash(uint64_t& hash) const final {
+        if constexpr (kReusableInvocation) {
+            // A local vector: the pass may be preparing on another thread with its own scratch.
+            static const FramePreparationContext context{};
+            std::vector<uint64_t> revision;
+            static_cast<const Derived*>(this)->InvocationRevision(context, revision);
+            uint64_t value = 1469598103934665603ull;
+            for (const auto word : revision) value = (value ^ word) * 1099511628211ull;
+            hash = value ^ revision.size();
+            return true;
+        } else {
+            (void)hash;
+            return false;
+        }
+    }
+
     PreparedPass PrepareFrame(FramePreparationContext& context) final {
         if constexpr (!std::same_as<Recipe, NoPassRecordingRecipe>)
             return PrepareRecipeInvocation(context);

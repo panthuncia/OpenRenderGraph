@@ -347,6 +347,14 @@ public:
         std::span<const ExecutionTimelinePoint> reservedSignals = {});
     // Call only after the backend successfully submits this batch's signal.
     void CommitBatch(uint64_t submission, uint32_t batch);
+    // An execution another thread has already submitted with these signal values (async epochs: the values
+    // are assigned at submission, in submission order, and recorded here by the ordered owner in the same
+    // order). Values above the reserved ones may skip - timelines only need to rise.
+    std::shared_ptr<const GraphExecutionTimeline> RecordSubmitted(
+        std::shared_ptr<const CompiledGraphBundle>,
+        const std::vector<std::vector<ExecutionTimelinePoint>>& incomingWaits,
+        const std::vector<std::shared_ptr<const IPreparedExecutionBatch>>& packets,
+        std::span<const ExecutionTimelinePoint> signals);
     // A partial failure preserves committed values and permanently closes this
     // admission owner until device/error recovery constructs a fresh owner.
     void Fail(uint64_t submission, SubmissionReceipt receipt = {});

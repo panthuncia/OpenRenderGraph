@@ -52,6 +52,12 @@ public:
     // pass must never also be captured through the legacy immediate replay
     // adapter, even if an intermediate class still implements that interface.
     virtual bool UsesTypedPreparation() const noexcept { return false; }
+    // Async epochs: a hash of what the pass's preparation depends on (a reusable typed pass's
+    // InvocationRevision), so an invocation prepared ahead of its execution can be checked, on the
+    // submitting thread, against what the pass would prepare now. Safe to call concurrently with the pass's
+    // own preparation. False when the pass cannot tell - its preparation may depend on anything - and a
+    // prepared execution holding it is then never current.
+    virtual bool InvocationRevisionHash(uint64_t&) const { return false; }
 protected:
     runtime::IUploadService& UploadService() const;
     runtime::IDescriptorService& DescriptorService() const;

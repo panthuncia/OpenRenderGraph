@@ -17,6 +17,15 @@
 
 namespace org::persistent {
 
+// Epochs: a host that submits the graph at several points of its own frame (a
+// renderer embedded in another engine) tags passes with the epoch they belong to.
+// The program compiles once over the whole frame, epochs in their declared order,
+// so scheduling and alias placement see every lifetime of the frame; each epoch
+// also gets an executable of its own passes, which is what runs at that epoch.
+// Untagged passes (AllEpochs) belong to every epoch, which with no tags at all is
+// the whole graph in every execution.
+inline constexpr uint32_t AllEpochs = UINT32_MAX;
+
 struct ResourceSlotId {
     uint32_t index = UINT32_MAX, generation = 0;
     bool operator==(const ResourceSlotId&) const = default;
@@ -92,7 +101,11 @@ struct LogicalGraph {
         uint64_t layoutRevision = 1;
         std::vector<BindingEntry> bindingSlots;
         std::shared_ptr<const void> recordingInterface;
+        uint32_t epoch = AllEpochs;
     };
+    // Execution order of the epochs within one host frame. Epochs not listed
+    // follow the listed ones in ascending order.
+    std::vector<uint32_t> epochOrder;
     uint64_t domain = 0;
     experimental::GraphCompileStructure declarations;
     std::vector<ResourceGroup> groups;
@@ -159,9 +172,18 @@ struct ExecutableGeneration {
     std::vector<uint32_t> resourceIndexBySlot;
     std::vector<std::vector<uint32_t>> incomingBatchesByResource;
     std::vector<uint32_t> incomingStateBatchByResource;
+    // Per epoch (in execution order), the executable of that epoch's passes plus
+    // the untagged ones, compiled over the same bindings and alias placements as
+    // this whole-frame executable. Empty when no pass is tagged.
+    std::vector<std::pair<uint32_t, std::shared_ptr<const ExecutableGeneration>>> epochs;
 };
 class SelectedPublication {
 public:
+    // The publication an epoch executes: these bindings, the epoch's executable.
+    // Null when the program has no epochs, or none of its passes is in this one
+    // (the caller then executes this publication, or nothing). Cached.
+    std::shared_ptr<const SelectedPublication> ForEpoch(uint32_t epoch) const;
+    bool HasEpochs() const noexcept { return executable && !executable->epochs.empty(); }
     const BindingVersion& Resolve(BindingToken token) const;
     rhi::Resource ResolveNative(BindingToken token) const;
     rhi::DescriptorSlot ResolveView(BindingToken token, BindlessViewRequest view) const;
@@ -178,6 +200,8 @@ private:
         BindingTable table, std::shared_ptr<const LogicalGraph> program,
         std::weak_ptr<const SelectedPublication> base = {})
         : revision(value), executable(std::move(generation)), bindings(std::move(table)), logical(std::move(program)), source(std::move(base)) {}
+    mutable std::mutex m_epochMutex;
+    mutable std::vector<std::pair<uint32_t, std::shared_ptr<const SelectedPublication>>> m_epochViews;
 };
 
 // Build may run on a worker. Installation is an O(1) revision check. A rejected
@@ -208,6 +232,10 @@ public:
     void ReplacePass(PassId pass, experimental::CompilePass declaration);
     void RemovePass(PassId pass);
     void SetPassRecordingInterface(PassId pass, std::shared_ptr<const void> recordingInterface);
+    // Structural: the epoch the pass executes in (AllEpochs: every one).
+    void SetPassEpoch(PassId pass, uint32_t epoch);
+    // Structural: the order the host executes its epochs in within a frame.
+    void SetEpochOrder(std::vector<uint32_t> order);
     BindingToken Declare(PassId pass, ResourceSlotId resource,
         experimental::CompileRange range, experimental::CompileResourceState state);
     BindingToken DeclareDependency(PassId pass, ResourceSlotId resource, bool write);
@@ -297,6 +325,11 @@ struct FrameAdmission {
     // Compiler resource indices whose backing was supplied by the frame
     // (swapchain images and similar late-bound imports), not the publication.
     std::vector<uint32_t> rebound;
+    // A closed execution (SynchronousAdmission::SetClosedExecutions): its recording must begin with a full
+    // memory barrier on each queue, which is what makes the previous execution's writes visible to it.
+    bool closed = false;
+    // The barrier plan came from the admission's cache rather than the ledgers.
+    bool cachedPlan = false;
 };
 // Frame-supplied backing for a slot the publication deliberately leaves
 // unbound. The executable and its state contract stay selected; only the
@@ -346,6 +379,18 @@ public:
     size_t IncomingRevisionCount() const noexcept { return m_incomingRevisions.size(); }
     explicit SynchronousAdmission(size_t frameCapacity = 3,
         std::function<void(std::shared_ptr<const void>)> retireOwnership = {});
+    // Closed executions: every resource an execution touches leaves it in its home state
+    // (BackingStateAdmissionLedger::Prepare closeToHome) and every execution starts with a full memory
+    // barrier (FrameAdmission::closed). An execution's barrier plan then depends only on its executable and
+    // backings, not on what ran before it; the admission caches it per executable, and allows several
+    // admissions to be prepared before the earlier ones commit, and to commit or be abandoned in any order
+    // (a commit's signals must still rise on each timeline: they commit in submission order).
+    // Requires every resource of an execution to be used from one queue. Set before the first Prepare.
+    void SetClosedExecutions(bool closed);
+    bool ClosedExecutions() const noexcept { return m_closed; }
+    size_t PendingAdmissions() const noexcept { return m_pending.size(); }
+    uint64_t PlanCacheHits() const noexcept { return m_planCacheHits; }
+    uint64_t PlanCacheMisses() const noexcept { return m_planCacheMisses; }
     FrameAdmission Prepare(std::shared_ptr<const SelectedPublication> publication,
         std::span<const experimental::ExecutionTimelinePoint> queues,
         std::span<const FrameProducerWait> producerWaits = {},
@@ -364,7 +409,18 @@ private:
     experimental::BackingStateAdmissionLedger m_states;
     experimental::BackingAccessAdmissionLedger m_accesses;
     experimental::AliasAccessAdmissionLedger m_aliases;
-    uint64_t m_nextSequence = 1, m_pendingSequence = 0;
+    uint64_t m_nextSequence = 1;
+    // Admissions prepared and not yet committed or abandoned, in sequence order (at most one unless closed).
+    std::vector<uint64_t> m_pending;
+    bool m_closed = false;
+    struct CachedPlan {
+        std::weak_ptr<const ExecutableGeneration> executable;
+        std::vector<rhi::ResourceHandle> resources;
+        std::vector<const void*> regions;
+        experimental::PreparedExecutionBarrierPlan barriers;
+    };
+    std::vector<CachedPlan> m_planCache;
+    uint64_t m_planCacheHits = 0, m_planCacheMisses = 0;
     uint64_t m_domain = 0;
     std::map<uint64_t,uint64_t> m_submitted, m_completed;
     struct IncomingRevision { uint64_t revision = 0; experimental::ExecutionTimelinePoint completion; };

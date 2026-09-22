@@ -189,6 +189,133 @@ bool CheckStates(const CompiledGraph& graph) {
 }
 int main() {
     {
+        // Closed executions: a texture written in one epoch and read in another leaves each execution in its
+        // home state, so an epoch's barrier plan does not depend on whether the other ran, is cached, and
+        // admissions can be prepared ahead of commits and abandoned out of order.
+        GraphProgram program; CompileWorkspace workspace; std::atomic_bool cancelled{false};
+        auto edit = program.BeginEdit();
+        auto binding = Binding(96); binding.identity = (uint64_t{1} << 32) | 96; binding.shape = {1,1,true};
+        auto state = std::make_shared<PreparedBackingState>();
+        state->graphResourceID = 1; state->resource = {96,1}; state->shape = binding.shape;
+        const CompileResourceState home{static_cast<uint64_t>(rhi::ResourceAccessType::Common),
+            static_cast<uint64_t>(rhi::ResourceLayout::Common), static_cast<uint64_t>(rhi::ResourceSyncState::None), false};
+        state->regions = std::make_shared<const std::vector<PreparedStateRegion>>(std::vector<PreparedStateRegion>{{{0,1,0,1}, home}});
+        binding.admission = state;
+        const auto slot = edit.AddResource(binding.shape,binding);
+        const auto writer = edit.AddPass({});
+        edit.Declare(writer,slot,{},{static_cast<uint64_t>(rhi::ResourceAccessType::UnorderedAccess),
+            static_cast<uint64_t>(rhi::ResourceLayout::UnorderedAccess),static_cast<uint64_t>(rhi::ResourceSyncState::ComputeShading),true});
+        const auto reader = edit.AddPass({});
+        edit.Declare(reader,slot,{},{static_cast<uint64_t>(rhi::ResourceAccessType::ShaderResource),
+            static_cast<uint64_t>(rhi::ResourceLayout::ShaderResource),static_cast<uint64_t>(rhi::ResourceSyncState::ComputeShading),false});
+        edit.SetPassEpoch(writer,7); edit.SetPassEpoch(reader,3);
+        edit.SetEpochOrder({3,7});
+        auto selected = edit.Build(workspace,cancelled);
+        CHECK(selected && program.Install(selected));
+        const auto readEpoch = selected->ForEpoch(3), writeEpoch = selected->ForEpoch(7);
+        CHECK(readEpoch && writeEpoch);
+        SynchronousAdmission admission(8);
+        admission.SetClosedExecutions(true);
+        const std::array<ExecutionTimelinePoint,1> queues{{{12,0}}};
+        auto commit = [&](const FrameAdmission& frame, uint64_t value) {
+            GraphExecutionTimeline receipt; receipt.batches.resize(frame.publication->executable->graph->batches.size());
+            for (auto& batch : receipt.batches) batch.signal = {12,value};
+            admission.Commit(frame,receipt);
+        };
+        // The texture's home is Common: each execution transitions it back after its last use.
+        auto exitsHome = [](const FrameAdmission& frame) {
+            for (const auto& batch : frame.barriers.batches)
+                for (const auto& after : batch.afterPass)
+                    for (const auto& barrier : after.textures)
+                        if (barrier.afterLayout == rhi::ResourceLayout::Common) return true;
+            return false;
+        };
+        auto entryLayout = [](const FrameAdmission& frame) {
+            for (const auto& batch : frame.barriers.batches)
+                for (const auto& before : batch.beforePass)
+                    for (const auto& barrier : before.textures) return barrier.beforeLayout;
+            return rhi::ResourceLayout::Undefined;
+        };
+        auto first = admission.Prepare(readEpoch,queues);
+        CHECK(first.closed && !first.cachedPlan && exitsHome(first));
+        CHECK(entryLayout(first) == rhi::ResourceLayout::Common);
+        commit(first,1);
+        auto write = admission.Prepare(writeEpoch,queues);
+        CHECK(exitsHome(write) && entryLayout(write) == rhi::ResourceLayout::Common);
+        // Prepared before the write commits, and after it: the same plan, from the cache.
+        auto again = admission.Prepare(readEpoch,queues);
+        CHECK(admission.PendingAdmissions() == 2 && again.cachedPlan && entryLayout(again) == rhi::ResourceLayout::Common);
+        // Closed admissions abandon out of order; the later one still commits.
+        admission.Abandon(write);
+        commit(again,2);
+        auto after = admission.Prepare(writeEpoch,queues);
+        CHECK(after.cachedPlan && entryLayout(after) == rhi::ResourceLayout::Common);
+        commit(after,3);
+        CHECK(admission.PlanCacheHits() == 2 && admission.PlanCacheMisses() == 2);
+        // Closed admissions commit in submission order, not preparation order.
+        auto earlier = admission.Prepare(writeEpoch,queues), later = admission.Prepare(readEpoch,queues);
+        commit(later,4);
+        commit(earlier,5);
+        CHECK(admission.PendingAdmissions() == 0);
+        // An open admission keeps its single pending frame.
+        SynchronousAdmission open(8);
+        auto single = open.Prepare(readEpoch,queues);
+        bool threw = false;
+        try { (void)open.Prepare(writeEpoch,queues); } catch (const std::exception&) { threw = true; }
+        CHECK(threw && !single.closed);
+        open.Abandon(single);
+    }
+    {
+        // Host epochs: one whole-frame executable, epochs in their declared order, and
+        // one executable per epoch with only its passes (and the untagged ones).
+        GraphProgram program; CompileWorkspace workspace; std::atomic_bool cancelled{false};
+        auto edit = program.BeginEdit();
+        auto binding = Binding(95); binding.identity = (uint64_t{1} << 32) | 95;
+        auto state = std::make_shared<PreparedBackingState>();
+        state->graphResourceID = 1; state->resource = {95,1}; state->shape = binding.shape;
+        state->regions = std::make_shared<const std::vector<PreparedStateRegion>>(); binding.admission = state;
+        const auto slot = edit.AddResource(binding.shape,binding);
+        // Registered in the opposite order to the frame's: the reader's epoch runs first.
+        const auto writer = edit.AddPass({}); edit.Declare(writer,slot,{},{32,0,1,true});
+        const auto reader = edit.AddPass({}); edit.Declare(reader,slot,{},{32,0,1,false});
+        const auto untagged = edit.AddPass({});
+        edit.SetPassEpoch(writer,7); edit.SetPassEpoch(reader,3);
+        edit.SetEpochOrder({3,7});
+        auto selected = edit.Build(workspace,cancelled);
+        CHECK(selected && program.Install(selected));
+        CHECK(selected->HasEpochs() && selected->executable->epochs.size() == 2);
+        CHECK(selected->executable->epochs[0].first == 3 && selected->executable->epochs[1].first == 7);
+        const auto& whole = *selected->executable->executionLayout;
+        CHECK(whole.placements[reader.index].batch <= whole.placements[writer.index].batch);
+        const auto first = selected->ForEpoch(3), second = selected->ForEpoch(7);
+        CHECK(first && second && !selected->ForEpoch(5));
+        CHECK(first == selected->ForEpoch(3));  // cached
+        CHECK(first->executable == selected->executable->epochs[0].second);
+        const auto& firstLayout = *first->executable->executionLayout;
+        CHECK(firstLayout.placements[reader.index].preparedPass == reader.index);
+        CHECK(firstLayout.placements[untagged.index].preparedPass == untagged.index);
+        CHECK(firstLayout.placements[writer.index].preparedPass == UINT32_MAX);
+        const auto& secondLayout = *second->executable->executionLayout;
+        CHECK(secondLayout.placements[writer.index].preparedPass == writer.index);
+        CHECK(secondLayout.placements[reader.index].preparedPass == UINT32_MAX);
+        // Each split is admitted on its own, in order, through one admission.
+        SynchronousAdmission admission;
+        const std::array<ExecutionTimelinePoint,1> queues{{{12,0}}};
+        auto frameA = admission.Prepare(first,queues);
+        CHECK(frameA.barriers.batches.size() == first->executable->graph->batches.size());
+        GraphExecutionTimeline receiptA; receiptA.batches.resize(first->executable->graph->batches.size());
+        for (auto& batch : receiptA.batches) batch.signal = {12,1};
+        admission.Commit(frameA,receiptA);
+        auto frameB = admission.Prepare(second,queues);
+        CHECK(frameB.barriers.batches.size() == second->executable->graph->batches.size());
+        admission.Abandon(frameB);
+        // A program without epochs has none.
+        GraphProgram plain;
+        auto plainEdit = plain.BeginEdit(); plainEdit.AddPass({});
+        auto plainSelected = plainEdit.Build(workspace,cancelled);
+        CHECK(plainSelected && !plainSelected->HasEpochs() && !plainSelected->ForEpoch(3));
+    }
+    {
         GraphProgram program; CompileWorkspace workspace; std::atomic_bool cancelled{false};
         auto edit = program.BeginEdit(); edit.SetQueues({{0,true},{0,true}});
         std::array<ResourceSlotId,2> slots;

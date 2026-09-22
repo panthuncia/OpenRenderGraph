@@ -69,9 +69,15 @@ struct PreparedExecutionBarrierPlan {
 // transactional; CommitBatch is called only for work known to have submitted.
 class BackingStateAdmissionLedger {
 public:
+    // closeToHome: the execution is closed. Every resource it touches leaves it in its home state - the
+    // backing's seeded region state, or the state its first access in the graph expects - so the next
+    // execution's entry states are the same whatever ran before it (or whether anything did). Textures get
+    // a layout transition after their last access; the ledger records home as their final state. Closed
+    // executions provide their own memory visibility (a full barrier at entry, see FrameAdmission::closed),
+    // so buffers need no exit barrier. Every resource must be used from a single queue.
     PreparedExecutionBarrierPlan Prepare(
         const CompiledGraph& graph, std::span<const PreparedBackingState> initial,
-        std::span<const rhi::ResourceHandle> invalidated = {}) const;
+        std::span<const rhi::ResourceHandle> invalidated = {}, bool closeToHome = false) const;
     void CommitBatch(const PreparedBatchBarriers&);
     void Invalidate(std::span<const rhi::ResourceHandle> resources);
     size_t BackingCount() const noexcept { return m_states.size(); }

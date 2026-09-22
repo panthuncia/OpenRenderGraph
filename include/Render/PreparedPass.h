@@ -633,6 +633,10 @@ public:
         std::shared_ptr<const persistent::SelectedPublication> publication);
     RecordingContext WithPersistentBindings(std::shared_ptr<const persistent::SelectedPublication> publication) const;
     const persistent::SelectedPublication* PersistentPublication() const noexcept { return m_persistentPublication.get(); }
+    // The frame slot of the execution being recorded (the host's frames-in-flight index). A recording
+    // may depend on it - a LatchBlock region is per slot - but on nothing else about the frame.
+    uint32_t FrameSlot() const noexcept { return m_frameSlot; }
+    void SetFrameSlot(uint32_t slot) noexcept { m_frameSlot = slot; }
     rhi::Resource Resolve(persistent::BindingToken token) const;
     rhi::DescriptorSlot Resolve(persistent::ViewToken token) const;
     RecordingContext(rhi::CommandList commands, std::shared_ptr<const FrozenExecutionBindings> bindings,
@@ -704,6 +708,7 @@ private:
     struct PersistentTag {};
     RecordingContext(rhi::CommandList commands, std::shared_ptr<const persistent::SelectedPublication> publication, PersistentTag);
     std::shared_ptr<const persistent::SelectedPublication> m_persistentPublication;
+    uint32_t m_frameSlot = 0;
     rhi::CommandList m_commands;
     std::shared_ptr<const FrozenExecutionBindings> m_bindings;
     std::shared_ptr<const std::vector<ExternalDescriptorBindingValue>> m_externalBindings;

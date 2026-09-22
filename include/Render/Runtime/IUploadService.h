@@ -6,6 +6,7 @@
 #include <span>
 #include <vector>
 #include <functional>
+#include <stdexcept>
 
 #include <rhi.h>
 #include <rhi_helpers.h>
@@ -21,6 +22,8 @@ class Resource;
 }
 
 namespace org::runtime {
+
+class StagedUploadBatch;
 
 class IUploadService {
 public:
@@ -102,6 +105,21 @@ public:
 #endif
 
     virtual void QueueResourceCopy(const std::shared_ptr<Resource>& destination, const std::shared_ptr<Resource>& source, size_t size) = 0;
+
+    // Owner thread: queues a batch a producer staged (StagedUploadBatch) as this frame's uploads, in order after
+    // the uploads queued before it, without copying its bytes. The service holds the batch until the GPU is
+    // done with the frame slot that records it.
+    virtual void SubmitStagedUploads(std::shared_ptr<StagedUploadBatch> batch) {
+        (void)batch;
+        throw std::logic_error("This upload service does not take staged uploads");
+    }
+    // Owner thread. Direct: staged batches wait for RecordStagedUploads instead of joining the upload pass's
+    // queue - for a host that records the frame's uploads itself (RenderGraph::RecordPendingUploads), where
+    // every entry is then one copy with no further bookkeeping. Switching it off queues what is waiting.
+    virtual void SetStagedUploadsRecordedDirectly(bool direct) { (void)direct; }
+    // Owner thread: records the waiting staged batches' copies into `list` (whose frame slot is frameIndex:
+    // the batches live until it retires). Returns the number of copies; the caller orders them.
+    virtual size_t RecordStagedUploads(rhi::CommandList& list, uint8_t frameIndex) { (void)list; (void)frameIndex; return 0; }
     virtual void ProcessDeferredReleases(uint8_t frameIndex) = 0;
 
     // ── Worker upload path (copy queue, CopyQueueUploadService) ──────

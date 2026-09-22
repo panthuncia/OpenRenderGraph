@@ -1,4 +1,5 @@
 #include "Managers/UploadInstance.h"
+#include "Render/Runtime/StagedUploadBatch.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -62,6 +63,7 @@ UploadInstance::UploadInstance(Config config)
 	, m_numFramesInFlight((std::max)(uint8_t{ 1 }, config.numFramesInFlight))
 {
 	m_framePages.resize(m_numFramesInFlight);
+	m_frameStaged.resize(m_numFramesInFlight);
 	m_recentFrameBytes.assign(m_numFramesInFlight, 0);
 	StartWorker();
 }
@@ -848,6 +850,62 @@ void UploadInstance::PostTextureSubresources(UploadTarget target, rhi::Format fm
 	MarkPendingWorkChangedLocked();
 }
 
+void UploadInstance::SubmitStagedUploads(std::shared_ptr<org::runtime::StagedUploadBatch> batch) {
+	NoteOffOwnerCall("SubmitStagedUploads");
+	if (!batch || batch->Entries().empty()) return;
+	if (m_stagedDirect) {
+		m_currentFrameUploadBytes += batch->Bytes();
+		m_directStaged.push_back(std::move(batch));
+		basic_telemetry::AddCounter("ORG.Upload.FrameInstance.StagedBatches");
+		return;
+	}
+	for (const auto& entry : batch->Entries()) {
+		ResourceUpdate update;
+		update.size = entry.size;
+		update.resourceToUpdate = entry.target;
+		update.uploadBuffer = entry.page;
+		update.uploadBufferOffset = entry.pageOffset;
+		update.dataBufferOffset = entry.dstOffset;
+		update.firstSequence = update.lastSequence = ++m_lastUploadSequence;
+		m_resourceUpdates.push_back(std::move(update));
+	}
+	m_currentFrameUploadBytes += batch->Bytes();
+	m_pendingStaged.push_back(std::move(batch));
+	MarkPendingWorkChangedLocked();
+	basic_telemetry::AddCounter("ORG.Upload.FrameInstance.StagedBatches");
+}
+
+void UploadInstance::SetStagedUploadsRecordedDirectly(bool direct) {
+	NoteOffOwnerCall("SetStagedUploadsRecordedDirectly");
+	if (m_stagedDirect == direct) return;
+	m_stagedDirect = direct;
+	if (!direct) {
+		auto waiting = std::move(m_directStaged);
+		m_directStaged.clear();
+		for (auto& batch : waiting) SubmitStagedUploads(std::move(batch));
+	}
+}
+
+size_t UploadInstance::RecordStagedUploads(rhi::CommandList& list, uint8_t frameIndex) {
+	NoteOffOwnerCall("RecordStagedUploads");
+	size_t copies = 0;
+	for (const auto& batch : m_directStaged) {
+		for (const auto& entry : batch->Entries()) {
+			if (entry.target.kind != UploadTarget::Kind::PinnedShared || !entry.target.pinned || !entry.page)
+				throw std::logic_error("Direct staged uploads need pointer targets");
+			list.CopyBufferRegion(entry.target.pinned->GetAPIResource().GetHandle(), entry.dstOffset,
+				entry.page->GetAPIResource().GetHandle(), entry.pageOffset, entry.size);
+			++copies;
+		}
+	}
+	if (!m_directStaged.empty() && m_numFramesInFlight != 0) {
+		auto& retained = m_frameStaged[frameIndex % m_numFramesInFlight];
+		retained.insert(retained.end(), std::make_move_iterator(m_directStaged.begin()), std::make_move_iterator(m_directStaged.end()));
+	}
+	m_directStaged.clear();
+	return copies;
+}
+
 void UploadInstance::DrainPostedUploads() {
 	PostedBufferUpload buffer;
 	while (m_postedBufferUploads.Pop(buffer)) {
@@ -997,6 +1055,12 @@ void UploadInstance::ProcessUploadsThrough(
 	}
 
 	RecordProcessedUploadTelemetry(resourceUpdates, textureUpdates);
+	// Staged batches whose entries this pass records stay alive until its frame slot retires.
+	if (sequenceInclusive == UINT64_MAX && !m_pendingStaged.empty() && m_numFramesInFlight != 0) {
+		auto& retained = m_frameStaged[frameIndex % m_numFramesInFlight];
+		retained.insert(retained.end(), std::make_move_iterator(m_pendingStaged.begin()), std::make_move_iterator(m_pendingStaged.end()));
+		m_pendingStaged.clear();
+	}
 
 	for (auto& update : resourceUpdates) {
 		if (!update.active || !update.uploadBuffer || update.size == 0) continue;
@@ -1161,6 +1225,7 @@ void UploadInstance::ProcessDeferredReleases(uint8_t frameIndex) {
 	}
 	frameIndex %= m_numFramesInFlight;
 
+	m_frameStaged[frameIndex].clear();  // the GPU is done with the slot: producers may reuse these batches
 	auto& retiringPages = m_framePages[frameIndex];
 	std::unordered_set<Resource*> pendingUploadBuffers;
 	pendingUploadBuffers.reserve(m_resourceUpdates.size() + m_textureUpdates.size());

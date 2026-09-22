@@ -39,6 +39,7 @@ void UploadManager::Initialize() {
 	config.pageNamePrefix = "UploadManagerPage";
 	config.usageHint = "Upload buffer";
 	m_uploadInstance = std::make_unique<UploadInstance>(std::move(config));
+	m_uploadInstance->SetStagedUploadsRecordedDirectly(m_stagedUploadsDirect);
 	m_uploadInstance->SetPendingWorkChangedCallback([this] {
 		MarkUploadPassDirty();
 	});
@@ -258,6 +259,29 @@ void UploadManager::UploadTextureSubresources(
 		srcSubresources,
 		srcCount);
 #endif
+}
+
+// The instance is created on first use, like UploadData's: a frame whose uploads are all staged makes no
+// other call that would create it. The direct mode is the manager's, so an instance created later has it too.
+void UploadManager::SubmitStagedUploads(std::shared_ptr<org::runtime::StagedUploadBatch> batch)
+{
+	if (!m_uploadInstance) {
+		Initialize();
+	}
+	m_uploadInstance->SubmitStagedUploads(std::move(batch));
+}
+
+void UploadManager::SetStagedUploadsRecordedDirectly(bool direct)
+{
+	m_stagedUploadsDirect = direct;
+	if (m_uploadInstance) {
+		m_uploadInstance->SetStagedUploadsRecordedDirectly(direct);
+	}
+}
+
+size_t UploadManager::RecordStagedUploads(rhi::CommandList& list, uint8_t frameIndex)
+{
+	return m_uploadInstance ? m_uploadInstance->RecordStagedUploads(list, frameIndex) : 0;
 }
 
 void UploadManager::ProcessDeferredReleases(uint8_t frameIndex)

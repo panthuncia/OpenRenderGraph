@@ -85,7 +85,7 @@ std::span<const PreparedBackingState> ValidatePreparedBackings(
 
 PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
     const CompiledGraph& graph, std::span<const PreparedBackingState> initial,
-    std::span<const rhi::ResourceHandle> invalidated) const {
+    std::span<const rhi::ResourceHandle> invalidated, bool closeToHome) const {
     BT_ZONE_SCOPE("ORG.Execution.ResolveBackingStates");
     if (!graph.structure || !graph.states.complete || initial.size() != graph.structure->resourceIDs.size())
         throw std::invalid_argument("Incomplete symbolic state admission input");
@@ -456,6 +456,66 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
         output.committedResources.push_back(handle);
         output.committedStates.push_back({step.range, step.after});
         output.committedQueues.push_back(graph.batches[step.batch].queue);
+    }
+    if (closeToHome) {
+        // Per resource and cell: the first step (its entry state is home when the backing seeds nothing
+        // for the cell) and the last (where the resource leaves the execution).
+        struct Cells { std::vector<uint32_t> first, last; uint32_t queue = UINT32_MAX; };
+        std::unordered_map<uint32_t, Cells> byResource;
+        for (uint32_t index = 0; index < graph.states.steps.size(); ++index) {
+            const auto& step = graph.states.steps[index];
+            const auto& captured = ordered[step.resource];
+            if (!captured.resource.valid()) continue;
+            auto& cells = byResource[step.resource];
+            if (cells.first.empty()) {
+                const size_t count = size_t{captured.shape.mips} * captured.shape.slices;
+                cells.first.assign(count, UINT32_MAX);
+                cells.last.assign(count, UINT32_MAX);
+            }
+            const auto queue = graph.batches[step.batch].queue;
+            if (cells.queue == UINT32_MAX) cells.queue = queue;
+            else if (cells.queue != queue)
+                throw std::invalid_argument("A closed execution uses a resource from more than one queue");
+            Visit(captured.shape, step.range, [&](uint32_t mip, uint32_t slice) {
+                const auto cell = CellIndex(captured.shape, mip, slice);
+                if (cells.first[cell] == UINT32_MAX) cells.first[cell] = index;
+                cells.last[cell] = index;
+            });
+        }
+        for (const auto& [resource, cells] : byResource) {
+            const auto& captured = ordered[resource];
+            const bool fixedHeapState = captured.heapType == rhi::HeapType::Upload
+                || captured.heapType == rhi::HeapType::Readback;
+            for (uint32_t mip = 0; mip < captured.shape.mips; ++mip)
+                for (uint32_t slice = 0; slice < captured.shape.slices; ++slice) {
+                    const auto cell = CellIndex(captured.shape, mip, slice);
+                    if (cells.last[cell] == UINT32_MAX) continue;
+                    const auto& last = graph.states.steps[cells.last[cell]];
+                    CompileResourceState home = graph.states.steps[cells.first[cell]].before;
+                    if (captured.regions) for (const auto& region : *captured.regions)
+                        if (mip >= region.range.mip && mip < region.range.mip + region.range.mips
+                            && slice >= region.range.slice && slice < region.range.slice + region.range.slices) {
+                            home = region.state;
+                            break;
+                        }
+                    auto& output = result.batches[last.batch];
+                    if (captured.shape.hasLayout && !fixedHeapState && home.layout != last.after.layout) {
+                        rhi::TextureBarrier barrier{};
+                        barrier.texture = captured.resource;
+                        barrier.range = {mip, 1, slice, 1};
+                        barrier.beforeAccess = static_cast<rhi::ResourceAccessType>(last.after.access);
+                        barrier.afterAccess = rhi::ResourceAccessType::Common;
+                        barrier.beforeLayout = static_cast<rhi::ResourceLayout>(last.after.layout);
+                        barrier.afterLayout = static_cast<rhi::ResourceLayout>(home.layout);
+                        barrier.beforeSync = static_cast<rhi::ResourceSyncState>(last.after.sync);
+                        barrier.afterSync = rhi::ResourceSyncState::All;
+                        output.afterPass[graph.positionByPass[last.pass]].textures.push_back(barrier);
+                    }
+                    output.committedResources.push_back(captured.resource);
+                    output.committedStates.push_back({CompileRange{mip, 1, slice, 1}, home});
+                    output.committedQueues.push_back(cells.queue);
+                }
+        }
     }
     BT_PLOT("ORG.Execution.StateBarrierSteps", static_cast<int64_t>(entrySteps));
     BT_PLOT("ORG.Execution.IntraBatchStateBarrierSteps", static_cast<int64_t>(intraBatchSteps));
