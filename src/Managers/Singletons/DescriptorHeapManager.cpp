@@ -887,7 +887,14 @@ UINT DescriptorHeapManager::CreateIndexedSampler(const rhi::SamplerDesc& sampler
 
     auto device = DeviceManager::GetInstance().GetDevice();
     UINT index = m_samplerHeap->AllocateDescriptor();
-    device.CreateSampler({ m_samplerHeap->GetHeap().GetHandle(), index }, samplerDesc);
+    // A slot whose sampler was not created holds no descriptor: a shader sampling through it reads with whatever
+    // the heap memory decodes to (no filtering, no mips, and on some hardware no sRGB conversion). Never hand
+    // one out.
+    if (const auto result = device.CreateSampler({ m_samplerHeap->GetHeap().GetHandle(), index }, samplerDesc); rhi::Failed(result)) {
+        m_samplerHeap->ReleaseDescriptor(index);
+        spdlog::error("DescriptorHeapManager::CreateIndexedSampler: the backend could not create the sampler (result {})", static_cast<int>(result));
+        throw std::runtime_error("DescriptorHeapManager::CreateIndexedSampler: the backend could not create the sampler");
+    }
 	m_indexedSamplerDescriptions.insert_or_assign(index, samplerDesc);
 	for (auto& [backend, heaps] : m_backendHeaps) {
 		if (backend == static_cast<uint8_t>(BackendInstanceId::Primary) || !heaps.sampler) continue;
