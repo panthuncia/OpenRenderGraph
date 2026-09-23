@@ -279,9 +279,9 @@ void UploadManager::SetStagedUploadsRecordedDirectly(bool direct)
 	}
 }
 
-size_t UploadManager::RecordStagedUploads(rhi::CommandList& list, uint8_t frameIndex)
+size_t UploadManager::RecordStagedUploads(rhi::CommandList& list, uint8_t frameIndex, bool afterCopies)
 {
-	return m_uploadInstance ? m_uploadInstance->RecordStagedUploads(list, frameIndex) : 0;
+	return m_uploadInstance ? m_uploadInstance->RecordStagedUploads(list, frameIndex, afterCopies) : 0;
 }
 
 void UploadManager::ProcessDeferredReleases(uint8_t frameIndex)

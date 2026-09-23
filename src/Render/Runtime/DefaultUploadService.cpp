@@ -118,8 +118,8 @@ public:
         UploadManager::GetInstance().SetStagedUploadsRecordedDirectly(direct);
     }
 
-    size_t RecordStagedUploads(rhi::CommandList& list, uint8_t frameIndex) override {
-        return UploadManager::GetInstance().RecordStagedUploads(list, frameIndex);
+    size_t RecordStagedUploads(rhi::CommandList& list, uint8_t frameIndex, bool afterCopies) override {
+        return UploadManager::GetInstance().RecordStagedUploads(list, frameIndex, afterCopies);
     }
 
     void ProcessDeferredReleases(uint8_t frameIndex) override {

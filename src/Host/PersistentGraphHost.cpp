@@ -217,7 +217,10 @@ struct PersistentGraphHost::Async {
 
 	// Render thread only.
 	std::vector<uint64_t> queueValues;  // the last value assigned per queue slot
-	std::vector<CommandListPair> uploadLists;  // per frame slot
+	// Per frame slot. Reset and begun by the host's thread when it prepares the slot's ticket (after the slot's
+	// wait: the slot's last upload list is done), then recorded, ended and submitted by the render thread; the
+	// ticket cell orders the two.
+	std::vector<CommandListPair> uploadLists;
 	uint32_t graphicsSlot = 0;
 	rhi::Queue graphicsQueue;
 	rhi::TimelineHandle graphicsFence{};
@@ -391,6 +394,11 @@ void PersistentGraphHost::PrepareTicket(Async& state, uint32_t epochIndex, int32
 		}
 		entry.keepAlive.reset();
 	}
+	// The render thread records this ticket's uploads into an open list: resetting and beginning it is several
+	// microseconds of driver work that belongs here.
+	auto& uploads = state.uploadLists[slot];
+	uploads.allocator->Recycle();
+	uploads.list->Recycle(uploads.allocator.Get());
 	DescriptorHeapManager::GetInstance().ProcessDeferredReleases(static_cast<uint8_t>(slot));
 	entry.reserved = true;
 	auto ticket = m_graph->PreparePersistentTicket(m_desc.device, state.epochs[epochIndex], static_cast<uint8_t>(slot), state.hostFrame++);
@@ -476,9 +484,7 @@ void PersistentGraphHost::SubmitEpoch(uint32_t epoch, const FrameCallback& befor
 	lap(m_lastTimings.checkUs);
 	// The uploads queued since the last submission, as plain copies ahead of the ticket (its first batch
 	// starts with a full barrier, so they need none of their own).
-	auto& list = async.uploadLists[slot];
-	list.allocator->Recycle();
-	list.list->Recycle(list.allocator.Get());
+	auto& list = async.uploadLists[slot];  // begun by the host's thread (PrepareTicket)
 	std::shared_ptr<void> keepAlive;
 	bool recorded = false;
 	auto commands = list.list.Get();

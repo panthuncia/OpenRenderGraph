@@ -94,7 +94,7 @@ public:
 	void ProcessDeferredReleases(uint8_t frameIndex);
 	void SubmitStagedUploads(std::shared_ptr<org::runtime::StagedUploadBatch> batch);
 	void SetStagedUploadsRecordedDirectly(bool direct);
-	size_t RecordStagedUploads(rhi::CommandList& list, uint8_t frameIndex);
+	size_t RecordStagedUploads(rhi::CommandList& list, uint8_t frameIndex, bool afterCopies);
 	void SetUploadResolveContext(UploadResolveContext ctx);
 	std::shared_ptr<RenderPass> GetUploadPass() const { return m_uploadPass; }
 	std::string DescribeQueuedTargetByGlobalResourceId(uint64_t globalResourceId);

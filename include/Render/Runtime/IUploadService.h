@@ -118,8 +118,13 @@ public:
     // every entry is then one copy with no further bookkeeping. Switching it off queues what is waiting.
     virtual void SetStagedUploadsRecordedDirectly(bool direct) { (void)direct; }
     // Owner thread: records the waiting staged batches' copies into `list` (whose frame slot is frameIndex:
-    // the batches live until it retires). Returns the number of copies; the caller orders them.
-    virtual size_t RecordStagedUploads(rhi::CommandList& list, uint8_t frameIndex) { (void)list; (void)frameIndex; return 0; }
+    // the batches live until it retires), in submission order: a copy that overlaps one recorded before it -
+    // in these batches, or among the list's copies before them when afterCopies - waits for it. Returns the
+    // number of copies; the caller orders them against everything else.
+    virtual size_t RecordStagedUploads(rhi::CommandList& list, uint8_t frameIndex, bool afterCopies) {
+        (void)list; (void)frameIndex; (void)afterCopies;
+        return 0;
+    }
     virtual void ProcessDeferredReleases(uint8_t frameIndex) = 0;
 
     // ── Worker upload path (copy queue, CopyQueueUploadService) ──────

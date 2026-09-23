@@ -886,15 +886,39 @@ void UploadInstance::SetStagedUploadsRecordedDirectly(bool direct) {
 	}
 }
 
-size_t UploadInstance::RecordStagedUploads(rhi::CommandList& list, uint8_t frameIndex) {
+size_t UploadInstance::RecordStagedUploads(rhi::CommandList& list, uint8_t frameIndex, bool afterCopies) {
 	NoteOffOwnerCall("RecordStagedUploads");
 	size_t copies = 0;
+	// Copies in one list are unordered without a barrier, and batches can overlap (a producer's batch whose
+	// submission never went out, then its replacement): the later write has to win. One barrier per overlap,
+	// none in steady state.
+	auto ordered = [&list] {
+		const auto full = rhi::FullMemoryBarrier();
+		rhi::BarrierBatch barriers{};
+		barriers.globals = {&full, 1u};
+		list.Barriers(barriers);
+	};
+	if (afterCopies && !m_directStaged.empty()) ordered();
+	struct Written {
+		rhi::ResourceHandle target;
+		uint64_t begin = 0, end = 0;
+	};
+	std::vector<Written> written;
 	for (const auto& batch : m_directStaged) {
 		for (const auto& entry : batch->Entries()) {
 			if (entry.target.kind != UploadTarget::Kind::PinnedShared || !entry.target.pinned || !entry.page)
 				throw std::logic_error("Direct staged uploads need pointer targets");
-			list.CopyBufferRegion(entry.target.pinned->GetAPIResource().GetHandle(), entry.dstOffset,
-				entry.page->GetAPIResource().GetHandle(), entry.pageOffset, entry.size);
+			const auto target = entry.target.pinned->GetAPIResource().GetHandle();
+			const uint64_t begin = entry.dstOffset, end = entry.dstOffset + entry.size;
+			const bool overlaps = std::ranges::any_of(written, [&](const Written& w) {
+				return w.target.index == target.index && w.target.generation == target.generation && begin < w.end && w.begin < end;
+			});
+			if (overlaps) {
+				ordered();
+				written.clear();
+			}
+			written.push_back({target, begin, end});
+			list.CopyBufferRegion(target, entry.dstOffset, entry.page->GetAPIResource().GetHandle(), entry.pageOffset, entry.size);
 			++copies;
 		}
 	}

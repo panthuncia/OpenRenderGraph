@@ -3292,11 +3292,12 @@ bool RenderGraph::RecordPendingUploads(rhi::Device device, rhi::CommandList& lis
 	};
 	const auto pass = m_uploadService->GetUploadPass();
 	auto* immediate = dynamic_cast<IHasImmediateModeCommands*>(pass.get());
+	bool queuedCopies = false;
 	auto recordStaged = [&]() -> bool {
 		// Direct staged batches carry resolved destinations: one copy each, after the queued uploads, so a
 		// producer's payload replaces what was queued before it. (With none, the barrier goes unsubmitted.)
 		orderAfterPreviousWork();
-		if (m_uploadService->RecordStagedUploads(list, slot)) recorded = true;
+		if (m_uploadService->RecordStagedUploads(list, slot, queuedCopies)) recorded = true;
 		return true;
 	};
 	if (!immediate) return recordStaged();
@@ -3320,6 +3321,7 @@ bool RenderGraph::RecordPendingUploads(rhi::Device device, rhi::CommandList& lis
 		// after it (the next execution's full barrier comes after them), so they start with one of their own.
 		orderAfterPreviousWork();
 		copies->Record(list);
+		queuedCopies = true;
 		struct Owned {
 			std::shared_ptr<const org::imm::PreparedBufferCopies> copies;
 			std::unique_ptr<org::imm::KeepAliveBag> bag;

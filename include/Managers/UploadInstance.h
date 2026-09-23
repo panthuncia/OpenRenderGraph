@@ -189,7 +189,7 @@ public:
 	// Owner thread: queues a producer's staged batch (IUploadService::SubmitStagedUploads).
 	void SubmitStagedUploads(std::shared_ptr<org::runtime::StagedUploadBatch> batch);
 	void SetStagedUploadsRecordedDirectly(bool direct);
-	size_t RecordStagedUploads(rhi::CommandList& list, uint8_t frameIndex);
+	size_t RecordStagedUploads(rhi::CommandList& list, uint8_t frameIndex, bool afterCopies);
 
 	// Configuration
 
