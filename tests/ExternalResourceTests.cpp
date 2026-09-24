@@ -56,6 +56,8 @@ struct RecordingStatisticsProbe final : org::runtime::IStatisticsService {
     const std::vector<org::runtime::PassStats>& GetPassStats() const override { return stats; }
     const std::vector<org::runtime::MeshPipelineStats>& GetMeshStats() const override { return mesh; }
     org::runtime::MemoryBudgetStats GetMemoryBudgetStats() const override { return {}; }
+    uint64_t GetFrameSerial() const override { return 0; }
+    double GetGpuTicksToMilliseconds() const override { return 0.0; }
     const std::vector<bool>& GetIsGeometryPassVector() const override { return geometry; }
     const std::vector<unsigned>& GetVisiblePassIndices(uint64_t) const override { return visible; }
     std::vector<std::string> names;
@@ -1066,7 +1068,7 @@ int TestOwnedDescriptorGpuExecution(const rhi::DeviceCreateInfo& create) {
         // clear-to-copy dependency must still have an intra-batch barrier.
         CHECK(barrierPlan.batches[0].beforePass[0].buffers.empty());
         CHECK(!barrierPlan.batches[0].beforePass[1].buffers.empty());
-        std::vector<PreparedPass> invocations(selectedLayout->placements.size());
+        std::vector<org::PreparedPass> invocations(selectedLayout->placements.size());
         invocations[clearExecutable->Id().index] = clearExecutable->PrepareInvocation(*selected,uint32_t{1});
         const auto step = std::find_if(graph->states.steps.begin(),graph->states.steps.end(),
             [](const auto& s) { return s.resource == 0 && s.batch == 0 && s.pass == 1; });
