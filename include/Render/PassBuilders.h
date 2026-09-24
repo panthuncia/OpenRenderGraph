@@ -1018,6 +1018,15 @@ public:
         return { resource->GetSchedulingResourceID(), graph->RequestResourceHandle(resource.get()).GetGlobalResourceID() };
     }
 
+    /** @brief A buffer the pass's draws read as a vertex stream (bound by address, e.g. an indirect VertexBuffer argument). */
+    template<class ResourceT>
+        requires std::derived_from<ResourceT, Resource>
+    ResourceBindingToken BindVertexBuffer(const std::shared_ptr<ResourceT>& resource) {
+        if (!resource) throw std::invalid_argument("Cannot bind an empty vertex buffer");
+        addVertexBuffer(resource);
+        return { resource->GetSchedulingResourceID(), graph->RequestResourceHandle(resource.get()).GetGlobalResourceID() };
+    }
+
     template<class ResourceT>
         requires std::derived_from<ResourceT, Resource>
     ResourceBindingToken BindDepthRead(const std::shared_ptr<ResourceT>& resource) {
@@ -1193,6 +1202,13 @@ public:
 
     template<typename... Args>
         requires ((NotIResourceResolver<Args>) && ...)
+    RenderPassBuilder& WithVertexBuffer(Args&&... args) & {
+        (addVertexBuffer(std::forward<Args>(args)), ...);
+        return *this;
+    }
+
+    template<typename... Args>
+        requires ((NotIResourceResolver<Args>) && ...)
     RenderPassBuilder& WithLegacyInterop(Args&&... args)& {
         (addLegacyInterop(std::forward<Args>(args)), ...);
         return *this;
@@ -1306,6 +1322,13 @@ public:
         requires ((NotIResourceResolver<Args>) && ...)
     RenderPassBuilder WithIndexBuffer(Args&&... args) && {
         (addIndexBuffer(std::forward<Args>(args)), ...);
+        return std::move(*this);
+    }
+
+    template<typename... Args>
+        requires ((NotIResourceResolver<Args>) && ...)
+    RenderPassBuilder WithVertexBuffer(Args&&... args) && {
+        (addVertexBuffer(std::forward<Args>(args)), ...);
         return std::move(*this);
     }
 
@@ -1617,6 +1640,7 @@ private:
 			|| !params.depthReadWriteResources.empty()
 			|| !params.depthStencilClearResources.empty()
 			|| !params.indexBuffers.empty()
+			|| !params.vertexBuffers.empty()
 			|| !params.presentResources.empty();
 		const bool hasShaderOperations = !params.shaderResources.empty()
 			|| !params.constantBuffers.empty()
@@ -1884,6 +1908,16 @@ private:
         detail::AppendTrackedResource(graph, _declaredIds, params.indexBuffers, std::forward<T>(x));
         return *this;
     }
+
+    template<typename T>
+        requires ResourceLike<T>
+    RenderPassBuilder& addVertexBuffer(T&& x) {
+        detail::TrackResolverDeclaration(graph, resolverSnapshots_, x,
+            ResourceState{rhi::ResourceAccessType::VertexBuffer, AccessToLayout(rhi::ResourceAccessType::VertexBuffer, true), RenderSyncFromAccess(rhi::ResourceAccessType::VertexBuffer)});
+        detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
+        detail::AppendTrackedResource(graph, _declaredIds, params.vertexBuffers, std::forward<T>(x));
+        return *this;
+    }
 	template <class Range>
 		requires (std::ranges::range<Range>&&
     ResourceLike<std::ranges::range_value_t<Range>>)
@@ -1993,6 +2027,7 @@ private:
             std::pair{ std::cref(params.copyTargets), rhi::ResourceAccessType::CopyDest },
             std::pair{ std::cref(params.indirectArgumentBuffers), rhi::ResourceAccessType::IndirectArgument },
             std::pair{ std::cref(params.indexBuffers), rhi::ResourceAccessType::IndexBuffer },
+            std::pair{ std::cref(params.vertexBuffers), rhi::ResourceAccessType::VertexBuffer },
                 std::pair{ std::cref(params.presentResources), rhi::ResourceAccessType::Present },
             std::pair{ std::cref(params.legacyInteropResources), rhi::ResourceAccessType::Common });
     }
