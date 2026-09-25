@@ -733,6 +733,15 @@ public:
 	// transitional renderer state. Submission also performs this join.
 	void WaitForPreparation();
 	void Execute(PassExecutionContext& context);
+	// GPU ranges around every pass this graph records (a GPU profiler's, e.g. Telemetry/NvPerfCapture): used by an
+	// execution whose context brings none of its own, which is how a host that builds the context itself
+	// (PersistentGraphHost, persistent tickets) gets them. Set before executions that should carry them.
+	using GpuPassRangeBegin = std::function<void(rhi::CommandList, rhi::Queue, const char* queueName, const char* passName)>;
+	using GpuPassRangeEnd = std::function<void(rhi::CommandList, rhi::Queue)>;
+	void SetGpuPassRangeCallbacks(GpuPassRangeBegin begin, GpuPassRangeEnd end) {
+		m_gpuPassRangeBegin = std::move(begin);
+		m_gpuPassRangeEnd = std::move(end);
+	}
 	// Persistent execution: the main graph runs from a selected persistent
 	// publication rebuilt only by explicit structural edits; truly dynamic passes
 	// run in per-frame Pre/Tail segments admitted through the same ledgers.
@@ -998,6 +1007,8 @@ public:
 	QueueRegistry& GetQueueRegistry() noexcept { return m_queueRegistry; }
 
 private:
+	GpuPassRangeBegin m_gpuPassRangeBegin;
+	GpuPassRangeEnd m_gpuPassRangeEnd;
 	void UpdateOnPreparationOwner(const UpdateExecutionContext& context, rhi::Device device,
 		bool asynchronousScheduling, const std::shared_ptr<FrameContext>& acceptedFrame);
 	std::shared_ptr<FrameContext> TryAcceptFrame(uint32_t preparationSlot,

@@ -10069,6 +10069,10 @@ bool RenderGraph::TrySubmitRecordedFrame(PassExecutionContext&) {
 
 void RenderGraph::Execute(PassExecutionContext& context) {
     JoinPreparationOwner();
+    if (!context.beginGpuPassRange && !context.endGpuPassRange && m_gpuPassRangeBegin && m_gpuPassRangeEnd) {
+        context.beginGpuPassRange = m_gpuPassRangeBegin;
+        context.endGpuPassRange = m_gpuPassRangeEnd;
+    }
     if (m_compilerState->frameProductionStopped)
         throw std::logic_error("Frame production has stopped");
     if (m_compilerState->persistent) {

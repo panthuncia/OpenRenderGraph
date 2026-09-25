@@ -90,6 +90,12 @@ void PersistentGraphHost::DestroyGraph() {
 	m_graph.reset();
 }
 
+void PersistentGraphHost::SetGpuPassRangeCallbacks(RenderGraph::GpuPassRangeBegin begin, RenderGraph::GpuPassRangeEnd end) {
+	m_gpuPassRangeBegin = std::move(begin);
+	m_gpuPassRangeEnd = std::move(end);
+	if (m_graph) m_graph->SetGpuPassRangeCallbacks(m_gpuPassRangeBegin, m_gpuPassRangeEnd);
+}
+
 void PersistentGraphHost::Build() {
 	DestroyGraph();
 	auto graph = std::make_unique<RenderGraph>(m_desc.device, m_desc.backend);
@@ -107,6 +113,7 @@ void PersistentGraphHost::Build() {
 	graph->SetExternalQueueBoundary(m_desc.queueBoundary);
 	graph->Setup();
 	m_graph = std::move(graph);
+	m_graph->SetGpuPassRangeCallbacks(m_gpuPassRangeBegin, m_gpuPassRangeEnd);
 	m_rebuildRequested = false;
 }
 

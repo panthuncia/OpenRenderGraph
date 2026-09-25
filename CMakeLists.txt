@@ -9,6 +9,8 @@ option(OPENRENDERGRAPH_FORWARD_BASICRHI_DEP_OPTIONS "Forward BasicRHI PIX/Stream
 option(OPENRENDERGRAPH_ENABLE_DEBUG_UI "Build the optional ImGui/ImPlot/Slang inspector" OFF)
 option(OPENRENDERGRAPH_ENABLE_D3D11_INTEROP "Build the optional Windows D3D11/D3D12 interop library" OFF)
 option(OPENRENDERGRAPH_BUILD_TESTS "Build OpenRenderGraph tests" OFF)
+option(ORG_ENABLE_NVPERF "Build Telemetry/NvPerfCapture against NVIDIA's Nsight Perf SDK (otherwise it reports itself unavailable)" OFF)
+set(ORG_NVPERF_ROOT "" CACHE PATH "Nsight Perf SDK root: include/ and bin/x64/nvperf_grfx_host.lib (ORG_ENABLE_NVPERF)")
 
 set(OPENRENDERGRAPH_BASICRHI_ENABLE_STREAMLINE "" CACHE STRING "Override BASICRHI_ENABLE_STREAMLINE for submodule fallback (ON/OFF). Empty keeps BasicRHI default.")
 set(OPENRENDERGRAPH_BASICRHI_ENABLE_PIX "" CACHE STRING "Override BASICRHI_ENABLE_PIX for submodule fallback (ON/OFF). Empty keeps BasicRHI default.")
@@ -85,6 +87,7 @@ add_library(OpenRenderGraph STATIC
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Contributor/ContributorGraphHost.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Contributor/ContributorRuntime.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Host/PersistentGraphHost.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/src/Telemetry/NvPerfCapture.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/include/OpenRenderGraph/PersistentGraphHost.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/DescriptorHeap.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PublicationBindingBundle.cpp"
@@ -179,6 +182,24 @@ target_link_libraries(OpenRenderGraph
     PRIVATE
         ${OPENRENDERGRAPH_SPDLOG_TARGET}
 )
+
+# Nsight Perf for Telemetry/NvPerfCapture: an NVPerf::Host target a parent project defines, or the SDK at ORG_NVPERF_ROOT.
+# The host library is linked normally; a host that must load without it (a plugin) delay-loads nvperf_grfx_host.dll and
+# calls nvperf::LoadLibraryFrom first.
+set(_org_nvperf OFF)
+if(ORG_ENABLE_NVPERF)
+    if(TARGET NVPerf::Host)
+        target_link_libraries(OpenRenderGraph PRIVATE NVPerf::Host)
+        set(_org_nvperf ON)
+    elseif(ORG_NVPERF_ROOT AND EXISTS "${ORG_NVPERF_ROOT}/include/nvperf_host.h" AND EXISTS "${ORG_NVPERF_ROOT}/bin/x64/nvperf_grfx_host.lib")
+        target_include_directories(OpenRenderGraph PRIVATE "${ORG_NVPERF_ROOT}/include")
+        target_link_libraries(OpenRenderGraph PRIVATE "${ORG_NVPERF_ROOT}/bin/x64/nvperf_grfx_host.lib")
+        set(_org_nvperf ON)
+    else()
+        message(WARNING "OpenRenderGraph: ORG_ENABLE_NVPERF is on but no Nsight Perf SDK was found (NVPerf::Host or ORG_NVPERF_ROOT='${ORG_NVPERF_ROOT}')")
+    endif()
+endif()
+target_compile_definitions(OpenRenderGraph PRIVATE ORG_ENABLE_NVPERF=$<BOOL:${_org_nvperf}>)
 
 if(OPENRENDERGRAPH_ENABLE_DEBUG_UI)
     add_library(OpenRenderGraphDebugUI STATIC

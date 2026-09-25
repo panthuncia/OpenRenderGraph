@@ -3008,6 +3008,7 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 		std::vector<uint8_t> closedEntryDone(slotCount, 0);
 		std::vector<experimental::FrameRecordingJob> jobs(graph.batches.size());
 		std::vector<std::shared_ptr<experimental::OwnedRecordingStatistics>> recordingStatistics;
+		std::array<std::shared_ptr<const experimental::OwnedRecordingGpuRanges>, 3> gpuPassRanges;  // per rhi::QueueKind
 		std::vector<size_t> demand(slotCount);
 		for (uint32_t batch = 0; batch < graph.batches.size(); ++batch) {
 			const auto slot = graph.batches[batch].queue;
@@ -3052,6 +3053,14 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 				}
 				job.recording.statistics = statistics;
 				recordingStatistics.push_back(std::move(statistics));
+			}
+			if (m_gpuPassRangeBegin && m_gpuPassRangeEnd) {
+				auto& ranges = gpuPassRanges[static_cast<size_t>(rhiKind)];
+				if (!ranges) {
+					ranges = std::make_shared<experimental::OwnedRecordingGpuRanges>(experimental::OwnedRecordingGpuRanges{m_gpuPassRangeBegin, m_gpuPassRangeEnd,
+						rhiKind == rhi::QueueKind::Graphics ? "Graphics" : rhiKind == rhi::QueueKind::Compute ? "Compute" : "Copy"});
+				}
+				job.recording.gpuPassRanges = ranges;
 			}
 		}
 		lap(timings.admissionUs);

@@ -76,6 +76,10 @@ public:
 	using CompletedFrameCallback = std::function<void(uint64_t frameNumber, const runtime::IStatisticsService& stats)>;
 	void SetCompletedFrameCallback(CompletedFrameCallback callback) { m_completedFrame = std::move(callback); }
 
+	// GPU ranges around every pass (RenderGraph::SetGpuPassRangeCallbacks), kept across rebuilds. Set them while no
+	// frame executes: the host's thread reads them when it prepares.
+	void SetGpuPassRangeCallbacks(RenderGraph::GpuPassRangeBegin begin, RenderGraph::GpuPassRangeEnd end);
+
 	// Builds if needed, then prepares and submits one frame. hostData is visible to
 	// passes through PassPrepareContext::preparationData for this frame only.
 	// With an epoch, only that epoch's passes (and untagged ones) are prepared,
@@ -167,6 +171,8 @@ private:
 	bool m_rebuildRequested = true;
 	uint64_t m_frameNumber = 0;
 	CompletedFrameCallback m_completedFrame;
+	RenderGraph::GpuPassRangeBegin m_gpuPassRangeBegin;
+	RenderGraph::GpuPassRangeEnd m_gpuPassRangeEnd;
 	FrameTimings m_lastTimings{};
 	uint64_t m_lastHostFrame = 0;
 	struct Async;

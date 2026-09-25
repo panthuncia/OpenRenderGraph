@@ -531,6 +531,13 @@ struct OwnedRecordingStatistics {
     }
 };
 
+// A profiler's GPU range around each pass of a list (RenderGraph::SetGpuPassRangeCallbacks), named by the pass.
+struct OwnedRecordingGpuRanges {
+    std::function<void(rhi::CommandList, rhi::Queue, const char* queueName, const char* passName)> begin;
+    std::function<void(rhi::CommandList, rhi::Queue)> end;
+    const char* queueName = "Graphics";
+};
+
 struct OwnedRecordingList {
     OwnedRecordingList() = default;
     OwnedRecordingList(OwnedRecordingList&&) = default;
@@ -555,6 +562,7 @@ struct OwnedRecordingList {
     std::vector<PreparedBatchBarriers::BeforePass> barriersAfterPass;
     std::vector<PreparedPass> passes;
     std::shared_ptr<OwnedRecordingStatistics> statistics;
+    std::shared_ptr<const OwnedRecordingGpuRanges> gpuPassRanges;
     std::shared_ptr<FrameCommandAllocation> allocation = std::make_shared<FrameCommandAllocation>();
     // RecordingContext::FrameSlot for the passes of this list.
     uint32_t frameSlot = 0;
@@ -720,7 +728,10 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
                     queue, context.Commands(), statistics->queries);
             const auto cpuStart = statisticsIndex >= 0 ? std::chrono::steady_clock::now()
                 : std::chrono::steady_clock::time_point{};
+            const auto* ranges = recording.gpuPassRanges.get();
+            if (ranges) ranges->begin(context.Commands(), queue, ranges->queueName, debugName.empty() ? "<unnamed>" : debugName.data());
             recording.passes[passIndex].Record(context);
+            if (ranges) ranges->end(context.Commands(), queue);
             if (statisticsIndex >= 0) {
                 statistics->cpuMilliseconds[passIndex] = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - cpuStart).count();
