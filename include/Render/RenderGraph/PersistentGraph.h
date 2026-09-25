@@ -220,6 +220,9 @@ public:
     ResourceSlotId ReserveResource(experimental::CompileResourceShape shape,
         std::optional<NativeBindingContract> contract = {});
     void BindReserved(ResourceSlotId slot, BindingVersion binding);
+    // Slot indices this transaction currently binds to one physical identity.
+    // Every such slot must carry the same admission state when the edit builds.
+    std::vector<uint32_t> SlotsSharingIdentity(uint64_t identity) const;
     void Unbind(ResourceSlotId slot);
     void RemoveResource(ResourceSlotId slot);
     void SetNativeBindingContract(ResourceSlotId slot, NativeBindingContract contract);

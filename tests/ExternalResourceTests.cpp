@@ -56,6 +56,8 @@ struct RecordingStatisticsProbe final : org::runtime::IStatisticsService {
     const std::vector<org::runtime::PassStats>& GetPassStats() const override { return stats; }
     const std::vector<org::runtime::MeshPipelineStats>& GetMeshStats() const override { return mesh; }
     org::runtime::MemoryBudgetStats GetMemoryBudgetStats() const override { return {}; }
+    uint64_t GetFrameSerial() const override { return 0; }
+    double GetGpuTicksToMilliseconds() const override { return 0.0; }
     const std::vector<bool>& GetIsGeometryPassVector() const override { return geometry; }
     const std::vector<unsigned>& GetVisiblePassIndices(uint64_t) const override { return visible; }
     std::vector<std::string> names;
@@ -668,19 +670,23 @@ int TestPreparedGpuSubmission(rhi::Device device, ID3D12Device* nativeDevice) {
         CHECK(effectReplayRejected && *submittedEffects == 1);
         CHECK(timeline.Get().HostWait(iteration * 2, 10000) == rhi::Result::Ok);
         // Fault injection uses an inert queue: it must never execute these lists.
-        struct QueueProbe { int fail = 0, waits = 0, submits = 0, signals = 0; };
+        // A batch is one queue submission carrying its waits and signals, so the
+        // standalone wait/signal entry points must stay untouched.
+        struct QueueProbe { bool fail = false; int submits = 0, submittedWaits = 0, submittedSignals = 0, separateCalls = 0; };
         rhi::QueueVTable probeTable{};
         probeTable.wait = +[](rhi::Queue* queue, const rhi::TimelinePoint&) noexcept {
-            auto& p = *static_cast<QueueProbe*>(queue->impl); ++p.waits;
-            return p.fail == 1 ? rhi::Result::Failed : rhi::Result::Ok;
+            ++static_cast<QueueProbe*>(queue->impl)->separateCalls;
+            return rhi::Result::Failed;
         };
-        probeTable.submit = +[](rhi::Queue* queue, rhi::Span<rhi::CommandList>, const rhi::SubmitDesc&) noexcept {
+        probeTable.submit = +[](rhi::Queue* queue, rhi::Span<rhi::CommandList>, const rhi::SubmitDesc& desc) noexcept {
             auto& p = *static_cast<QueueProbe*>(queue->impl); ++p.submits;
-            return p.fail == 2 ? rhi::Result::Failed : rhi::Result::Ok;
+            p.submittedWaits += static_cast<int>(desc.waits.size);
+            p.submittedSignals += static_cast<int>(desc.signals.size);
+            return p.fail ? rhi::Result::Failed : rhi::Result::Ok;
         };
         probeTable.signal = +[](rhi::Queue* queue, const rhi::TimelinePoint&) noexcept {
-            auto& p = *static_cast<QueueProbe*>(queue->impl); ++p.signals;
-            return p.fail == 3 ? rhi::Result::Failed : rhi::Result::Ok;
+            ++static_cast<QueueProbe*>(queue->impl)->separateCalls;
+            return rhi::Result::Failed;
         };
         {
             QueueProbe probe;
@@ -694,7 +700,7 @@ int TestPreparedGpuSubmission(rhi::Device device, ID3D12Device* nativeDevice) {
             CHECK(cancelledCounts->abandoned == 1);
             CHECK(cancelledPacket.Submit(execution->batches[0]).failureStage ==
                 SubmissionFailureStage::Replay);
-            CHECK(probe.waits == 0 && probe.submits == 0 && probe.signals == 0);
+            CHECK(probe.submits == 0 && probe.separateCalls == 0);
         }
         {
             QueueProbe probe;
@@ -712,23 +718,21 @@ int TestPreparedGpuSubmission(rhi::Device device, ID3D12Device* nativeDevice) {
             const auto receipt = throwingPacket.Submit(execution->batches[0]);
             CHECK(receipt.state == SubmissionState::SubmittedWithoutSignal);
             CHECK(receipt.failureStage == SubmissionFailureStage::Lifecycle);
-            CHECK(*callbackCount == 1 && probe.submits == 1 && probe.signals == 0);
+            CHECK(*callbackCount == 1 && probe.submits == 1 && probe.submittedSignals == 1 && probe.separateCalls == 0);
             CHECK(throwingPacket.Submit(execution->batches[0]).failureStage ==
                 SubmissionFailureStage::Replay);
         }
-        for (int failure = 0; failure != 4; ++failure) {
-            QueueProbe probe; probe.fail = failure;
+        for (const bool fail : {false, true}) {
+            QueueProbe probe; probe.fail = fail;
             rhi::Queue queue; queue.impl = &probe; queue.vt = &probeTable;
             PreparedRhiExecutionBatch packet(0, queue, {lease->lists[0].Get()}, {{1,timeline.Get().GetHandle()}}, lease);
             auto batch = execution->batches[0]; batch.waits = {{1,0}};
             const auto receipt = packet.Submit(batch);
-            CHECK(probe.waits == 1 && probe.submits == (failure != 1) && probe.signals == (failure != 1 && failure != 2));
-            CHECK(receipt.state == (failure == 0 ? SubmissionState::Signaled : failure == 1 ? SubmissionState::NotSubmitted
-                : failure == 2 ? SubmissionState::SubmissionUncertain : SubmissionState::SubmittedWithoutSignal));
-            CHECK(receipt.failureStage == (failure == 0 ? SubmissionFailureStage::None : failure == 1 ? SubmissionFailureStage::Wait
-                : failure == 2 ? SubmissionFailureStage::Submit : SubmissionFailureStage::Signal));
+            CHECK(probe.submits == 1 && probe.submittedWaits == 1 && probe.submittedSignals == 1 && probe.separateCalls == 0);
+            CHECK(receipt.state == (fail ? SubmissionState::SubmissionUncertain : SubmissionState::Signaled));
+            CHECK(receipt.failureStage == (fail ? SubmissionFailureStage::Submit : SubmissionFailureStage::None));
             CHECK(packet.Submit(batch).failureStage == SubmissionFailureStage::Replay);
-            CHECK(probe.waits == 1);
+            CHECK(probe.submits == 1);
         }
         CHECK(SUCCEEDED(lease->native[2]->Map(0, nullptr, &mapped)));
         for (size_t i = 0; i < 4096; ++i) CHECK(static_cast<uint8_t*>(mapped)[i] == iteration * 37);
@@ -1066,7 +1070,7 @@ int TestOwnedDescriptorGpuExecution(const rhi::DeviceCreateInfo& create) {
         // clear-to-copy dependency must still have an intra-batch barrier.
         CHECK(barrierPlan.batches[0].beforePass[0].buffers.empty());
         CHECK(!barrierPlan.batches[0].beforePass[1].buffers.empty());
-        std::vector<PreparedPass> invocations(selectedLayout->placements.size());
+        std::vector<org::PreparedPass> invocations(selectedLayout->placements.size());
         invocations[clearExecutable->Id().index] = clearExecutable->PrepareInvocation(*selected,uint32_t{1});
         const auto step = std::find_if(graph->states.steps.begin(),graph->states.steps.end(),
             [](const auto& s) { return s.resource == 0 && s.batch == 0 && s.pass == 1; });

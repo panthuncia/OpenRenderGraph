@@ -42,6 +42,7 @@
 #include <map>
 #include <numeric>
 #include <queue>
+#include <set>
 #include <typeinfo>
 #include <unordered_map>
 #include <unordered_set>
@@ -685,10 +686,11 @@ void UnbindSlot(State& state, persistent::GraphEditTransaction& edit, const Stat
 	}
 	edit.Unbind(entry.slot);
 }
-bool BindEntry(State& state, persistent::GraphEditTransaction& edit, uint32_t index) {
+bool BindEntryOnly(State& state, persistent::GraphEditTransaction& edit, uint32_t index, uint64_t* identity = nullptr) {
 	auto& entry = state.entries[index];
 	if (entry.swapchain || !entry.resource) return false;
 	auto binding = CaptureSlotBinding(*entry.resource, entry.slot.index, entry.shape);
+	if (binding && identity) *identity = binding->identity;
 	if (!binding) {
 		if (entry.isBound) { UnbindSlot(state, edit, entry); entry.isBound = false; entry.bound = {}; }
 		static std::atomic<uint32_t> reported{0};
@@ -709,6 +711,27 @@ bool BindEntry(State& state, persistent::GraphEditTransaction& edit, uint32_t in
 	}
 	entry.isBound = true;
 	entry.bound = RotationKeyOf(entry);
+	return true;
+}
+// Every slot bound to one physical backing must carry the same admission
+// state. A capture reads the resource's live state tracker, so binding one slot
+// (a relowered pass's new direct entry, a group member arriving for a backing
+// another slot already binds) next to a sibling captured frames earlier pairs
+// two different incoming states, and the edit fails to build with "Shared
+// physical slots disagree on incoming state". Recapture the bound siblings at
+// the same moment. Admission seeds a backing from these regions only until it
+// tracks the backing, so a refresh at most moves an untracked seed to the
+// tracker's current state.
+bool BindEntry(State& state, persistent::GraphEditTransaction& edit, uint32_t index) {
+	uint64_t identity = 0;
+	if (!BindEntryOnly(state, edit, index, &identity)) return false;
+	for (const auto sibling : edit.SlotsSharingIdentity(identity)) {
+		if (sibling == state.entries[index].slot.index || sibling >= state.entries.size()) continue;
+		const auto& other = state.entries[sibling];
+		if (other.retired || !other.isBound || other.swapchain || !other.resource || other.slot.index != sibling) continue;
+		basic_telemetry::AddCounter("ORG.Persistent.SharedBackingRecaptures");
+		BindEntryOnly(state, edit, sibling);
+	}
 	return true;
 }
 
@@ -1801,8 +1824,12 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 						addPositions(pool, (std::max)(pool.capacity, counts[i] * 2 - pool.capacity));
 					}
 				}
+				std::unordered_set<uint64_t> capturedPhysicals;
+				std::set<std::pair<const Program::Pool*, uint32_t>> capturedPositions;
 				auto bindPosition = [&](Program::Pool& pool, uint32_t i, const Want& want) {
 					BT_ZONE_SCOPE("ORG.Persistent.DynamicSegment.Bind");
+					capturedPhysicals.insert(want.physical);
+					capturedPositions.emplace(&pool, i);
 					const auto slot = pool.slots[i];
 					auto snapshot = PublicationBindingBundle::Capture(*want.resource);
 					if (!snapshot) throw std::runtime_error(std::string(label) + " segment resource has no backing: " + want.resource->GetName());
@@ -1865,6 +1892,16 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 					}
 					pool.vacated.clear();
 				}
+				// A backing bound in several pools must carry one admission state
+				// (see BindEntry): recapture the positions this edit did not touch.
+				if (!capturedPhysicals.empty())
+					for (auto& pool : program->pools)
+						for (uint32_t i = 0; i < pool.capacity; ++i) {
+							if (!pool.isBound[i] || !pool.physical[i] || !capturedPhysicals.contains(pool.physical[i])
+								|| capturedPositions.contains({&pool, i})) continue;
+							basic_telemetry::AddCounter("ORG.Persistent.SharedBackingRecaptures");
+							bindPosition(pool, i, Want{pool.pass, pool.templateHash, pool.physical[i], pool.resources[i], pool.bound[i]});
+						}
 				if (edit) {
 					BT_ZONE_SCOPE("ORG.Persistent.BuildDynamicSegment");
 					BT_ZONE_VALUE(static_cast<int64_t>(arriving.size() + rebound + unbound));

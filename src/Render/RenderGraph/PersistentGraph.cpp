@@ -325,6 +325,12 @@ void GraphEditTransaction::BindReserved(ResourceSlotId slot, BindingVersion bind
     Require(binding.bound && binding.recording, "Reserved slots bind exact recording snapshots");
     ReplaceBinding(slot,std::move(binding));
 }
+std::vector<uint32_t> GraphEditTransaction::SlotsSharingIdentity(uint64_t identity) const {
+    const auto& bucket = m_bindings.m_identities[identity % BindingTable::IdentityBuckets];
+    if (!bucket) return {};
+    const auto found = bucket->find(identity);
+    return found == bucket->end() ? std::vector<uint32_t>{} : found->second;
+}
 void GraphEditTransaction::Unbind(ResourceSlotId slot) {
     MutationGuard mutation{m_failed};
     const auto& current = m_bindings.At(slot);

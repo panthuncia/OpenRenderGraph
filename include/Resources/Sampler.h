@@ -160,9 +160,8 @@ private:
     rhi::SamplerDesc m_samplerDesc; // Descriptor of the sampler
     explicit Sampler(rhi::SamplerDesc samplerDesc);
 
-    static std::shared_ptr<Sampler> m_defaultSampler;
-	static std::shared_ptr<Sampler> m_defaultShadowSampler;
-	static std::unordered_map<rhi::SamplerDesc, std::shared_ptr<Sampler>, rhi::SamplerDescHash, rhi::SamplerDescEq> m_samplerCache;
+	using SamplerCache = std::unordered_map<rhi::SamplerDesc, std::shared_ptr<Sampler>, rhi::SamplerDescHash, rhi::SamplerDescEq>;
+	static std::atomic<std::shared_ptr<const SamplerCache>> m_samplerCache;
 };
 
 } // namespace org
