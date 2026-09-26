@@ -486,14 +486,17 @@ rhi::DescriptorSlot SelectedPublication::ResolveView(BindingToken token, Bindles
     return version.recording->views->Resolve(view);
 }
 BindingToken GraphEditTransaction::Declare(PassId pass, ResourceSlotId resource,
-    experimental::CompileRange range, experimental::CompileResourceState state) {
+    experimental::CompileRange range, experimental::CompileResourceState state,
+    uint64_t byteOffset, uint64_t byteSize, uint32_t aspects) {
     MutationGuard mutation{m_failed};
     ValidatePass(pass);
     const auto shape = m_bindings.At(resource).shape;
     Require(range.mips && range.slices && range.mip < shape.mips && range.slice < shape.slices
         && range.mips <= shape.mips-range.mip && range.slices <= shape.slices-range.slice, "Invalid declared binding range");
+    Require(byteSize && (byteSize == UINT64_MAX || byteOffset <= UINT64_MAX - byteSize)
+        && (shape.hasLayout ? (!byteOffset && byteSize == UINT64_MAX) : !aspects), "Invalid declared access extent");
     auto token = DeclareDependency(pass,resource,state.write);
-    EditLogical().declarations.passes[pass.index].entryStates.push_back({resource.index,range,state});
+    EditLogical().declarations.passes[pass.index].entryStates.push_back({resource.index,range,state,byteOffset,byteSize,aspects});
     return token;
 }
 rhi::DescriptorSlot SelectedPublication::ResolveView(ViewToken token) const {

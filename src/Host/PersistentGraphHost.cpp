@@ -111,6 +111,7 @@ void PersistentGraphHost::Build() {
 	graph->SetPersistentClosedExecutions(m_desc.closedExecutions);
 	graph->SetPersistentExecutionEnabled(true);
 	graph->SetExternalQueueBoundary(m_desc.queueBoundary);
+	graph->SetBoundaryManifestRecorder(m_desc.boundaryManifestRecorder);
 	graph->Setup();
 	m_graph = std::move(graph);
 	m_graph->SetGpuPassRangeCallbacks(m_gpuPassRangeBegin, m_gpuPassRangeEnd);
@@ -466,7 +467,6 @@ void PersistentGraphHost::SubmitEpoch(uint32_t epoch, const FrameCallback& befor
 	lap(m_lastTimings.ticketWaitUs);
 	const uint32_t slot = RenderGraph::PersistentTicketSlot(*ticket);
 	m_asyncSlot = slot;
-	m_lastHostFrame = RenderGraph::PersistentTicketHostFrame(*ticket);
 	runtime::ScopedActiveGraphServices services(m_graph->GetUploadService(), m_graph->GetDescriptorService());
 	// The host's thread waited for this slot before preparing the ticket: its upload pages are free again.
 	if (auto* uploads = m_graph->GetUploadService()) uploads->ProcessDeferredReleases(static_cast<uint8_t>(slot));
@@ -488,6 +488,9 @@ void PersistentGraphHost::SubmitEpoch(uint32_t epoch, const FrameCallback& befor
 		async.Post(std::move(prepare));
 		ticket = async.WaitTicket(index);
 	}
+	// The submitted ticket's frame: one prepared again above has a new number, and the completed-frame callback
+	// reports it by that one.
+	m_lastHostFrame = RenderGraph::PersistentTicketHostFrame(*ticket);
 	lap(m_lastTimings.checkUs);
 	// The uploads queued since the last submission, as plain copies ahead of the ticket (its first batch
 	// starts with a full barrier, so they need none of their own).

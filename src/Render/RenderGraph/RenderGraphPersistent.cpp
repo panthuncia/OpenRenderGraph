@@ -3062,7 +3062,8 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 			job.queue = m_queueRegistry.GetQueue(index);
 			job.pool = m_queueRegistry.GetSharedPool(index);
 			if (!job.pool) throw std::logic_error("Recording queue has no command-list pool");
-			job.recording = experimental::BuildPersistentRecordingList(sealed, batch);
+			job.recording = experimental::BuildPersistentRecordingList(sealed, batch, static_cast<bool>(m_boundaryManifestRecorder));
+			job.recording.boundaryRecorder = m_boundaryManifestRecorder;
 			job.recording.bindings = segment.legacyBindings;
 			job.recording.frameSlot = state.frameIndex;
 			job.recording.externalEntryBarrier = m_externalQueueBoundary.entry

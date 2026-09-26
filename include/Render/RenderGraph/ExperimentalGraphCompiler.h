@@ -48,6 +48,11 @@ struct CompileStateUse {
     uint32_t resource = 0;
     CompileRange range;
     CompileResourceState state;
+    // Boundary access extent. Internal state scheduling may conservatively
+    // serialize the whole buffer; interop must retain the actual byte interval.
+    uint64_t byteOffset = 0;
+    uint64_t byteSize = UINT64_MAX;
+    uint32_t aspects = 0; // zero selects all aspects of the realized image
     bool operator==(const CompileStateUse&) const = default;
 };
 

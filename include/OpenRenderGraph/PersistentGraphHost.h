@@ -40,6 +40,7 @@ public:
 		// Optional; a ThreadPoolTaskService is created when absent.
 		std::shared_ptr<runtime::ITaskService> tasks;
 		RenderGraph::ExternalQueueBoundary queueBoundary{};
+		RenderGraph::BoundaryManifestRecorder boundaryManifestRecorder;
 		uint32_t framesInFlight = 3;
 		// Host epochs: the order the host runs them in within its own frame (see
 		// RenderGraph::SetPersistentEpochOrder). Passes declare theirs with

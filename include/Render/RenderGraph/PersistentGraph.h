@@ -240,7 +240,8 @@ public:
     // Structural: the order the host executes its epochs in within a frame.
     void SetEpochOrder(std::vector<uint32_t> order);
     BindingToken Declare(PassId pass, ResourceSlotId resource,
-        experimental::CompileRange range, experimental::CompileResourceState state);
+        experimental::CompileRange range, experimental::CompileResourceState state,
+        uint64_t byteOffset = 0, uint64_t byteSize = UINT64_MAX, uint32_t aspects = 0);
     BindingToken DeclareDependency(PassId pass, ResourceSlotId resource, bool write);
     void DeclarePostcondition(BindingToken binding, experimental::CompileRange range,
         experimental::CompileResourceState state);

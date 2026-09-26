@@ -2,6 +2,7 @@
 
 #include "Render/RenderGraph/ExperimentalGraphCompiler.h"
 #include "Render/RenderGraph/ExperimentalExecutionState.h"
+#include "Render/RenderGraph/ExecutionBoundary.h"
 #include "Render/PreparedPass.h"
 #include "Render/RenderGraph/PersistentGraph.h"
 #include "Render/CommandListPool.h"
@@ -552,6 +553,8 @@ struct OwnedRecordingList {
     // Keep invocation lifecycle ownership until CPU recording and batch
     // retirement finish, even if the caller drops its sealed frame handle.
     std::shared_ptr<const RenderFrameSnapshot> frame;
+    std::shared_ptr<const ExecutionBoundaryManifest> boundary;
+    std::function<void(rhi::CommandList, const ExecutionBoundaryManifest&)> boundaryRecorder;
     // Admission-captured defaults for passes using directly-indexed root
     // signatures. Individual passes may rebind a compatible snapshot.
     rhi::DescriptorHeapHandle resourceDescriptorHeap{};
@@ -572,7 +575,8 @@ struct OwnedRecordingList {
     bool externalExitBarrier = false;
 };
 
-inline OwnedRecordingList BuildPersistentRecordingList(std::shared_ptr<const RenderFrameSnapshot> sealed, uint32_t batch) {
+inline OwnedRecordingList BuildPersistentRecordingList(std::shared_ptr<const RenderFrameSnapshot> sealed, uint32_t batch,
+    bool captureBoundary = false) {
     if (!sealed) throw std::invalid_argument("Missing persistent frame seal");
     const auto& frame = *sealed;
     if (!frame.publication || !frame.barrierPlan
@@ -584,6 +588,11 @@ inline OwnedRecordingList BuildPersistentRecordingList(std::shared_ptr<const Ren
     OwnedRecordingList result;
     result.frame = std::move(sealed);
     result.publication = frame.publication;
+    if (captureBoundary) {
+        if (!frame.initialStates) throw std::invalid_argument("Missing boundary backing states");
+        result.boundary = BuildExecutionBoundaryManifest(graph, batch, *frame.initialStates,
+            {result.frame});
+    }
     result.textureBarriers = barriers.textures;
     result.bufferBarriers = barriers.buffers;
     result.barriersBeforePass = barriers.beforePass;
@@ -686,6 +695,10 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
             rhi::BarrierBatch barriers{};
             barriers.globals = {&full, 1u};
             context.Commands().Barriers(barriers);
+        }
+        if (recording.boundaryRecorder) {
+            if (!recording.boundary) throw std::invalid_argument("Missing execution boundary manifest");
+            recording.boundaryRecorder(context.Commands(), *recording.boundary);
         }
         if (!recording.textureBarriers.empty() || !recording.bufferBarriers.empty()) {
             rhi::BarrierBatch barriers{};

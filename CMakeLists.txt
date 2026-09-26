@@ -128,6 +128,7 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/RenderGraph/PersistentGraph.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/RenderPasses/Base/PersistentTypedPass.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/ExperimentalExecutionState.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/RenderGraph/ExecutionBoundary.h"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/InteropAllocator.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/SharedAliasPoolManager.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraphCompile.cpp"
@@ -241,6 +242,11 @@ endif()
 
 if(OPENRENDERGRAPH_BUILD_TESTS)
     enable_testing()
+    add_executable(OpenRenderGraphExecutionBoundaryTests tests/ExecutionBoundaryTests.cpp)
+    target_compile_features(OpenRenderGraphExecutionBoundaryTests PRIVATE cxx_std_23)
+    target_compile_definitions(OpenRenderGraphExecutionBoundaryTests PRIVATE NOMINMAX)
+    target_link_libraries(OpenRenderGraphExecutionBoundaryTests PRIVATE OpenRenderGraph)
+    add_test(NAME OpenRenderGraphExecutionBoundaryTests COMMAND OpenRenderGraphExecutionBoundaryTests)
     add_executable(OpenRenderGraphPersistentTests tests/PersistentGraphTests.cpp tests/GraphReplayRunner.h)
     target_compile_features(OpenRenderGraphPersistentTests PRIVATE cxx_std_23)
     target_compile_definitions(OpenRenderGraphPersistentTests PRIVATE

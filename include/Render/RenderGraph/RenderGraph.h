@@ -46,6 +46,8 @@
 
 namespace org {
 
+namespace experimental { struct ExecutionBoundaryManifest; }
+
 class Resource;
 class RenderPassBuilder;
 class ComputePassBuilder;
@@ -833,6 +835,8 @@ public:
 		bool entry = false;
 		bool exit = false;
 	};
+	using BoundaryManifestRecorder = std::function<void(rhi::CommandList, const experimental::ExecutionBoundaryManifest&)>;
+	void SetBoundaryManifestRecorder(BoundaryManifestRecorder recorder) { m_boundaryManifestRecorder = std::move(recorder); }
 	void SetExternalQueueBoundary(ExternalQueueBoundary boundary) noexcept { m_externalQueueBoundary = boundary; }
 	ExternalQueueBoundary GetExternalQueueBoundary() const noexcept { return m_externalQueueBoundary; }
 	// Async producer/admission handshake. True asks the host to prepare another
@@ -1459,6 +1463,7 @@ private:
 	PersistentExecuteTimings m_lastPersistentExecuteTimings{};
 	std::unordered_map<std::string, PersistentSegmentKind> m_persistentSegmentKinds;
 	ExternalQueueBoundary m_externalQueueBoundary{};
+	BoundaryManifestRecorder m_boundaryManifestRecorder;
     void SubmitOwnedCompileRequest(rhi::Device device, const std::vector<Node>& nodes,
         std::span<const std::pair<size_t, size_t>> explicitEdges,
         std::vector<std::pair<uint32_t, uint32_t>> dependencyOracle,
