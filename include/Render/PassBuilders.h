@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <type_traits>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <rhi.h>
 
@@ -899,6 +900,179 @@ class RenderPassBuilder : public IPassBuilder {
 public:
     PassBuilderKind Kind() const noexcept override { return PassBuilderKind::Render; }
     IResourceProvider* ResourceProvider() noexcept override { return pass.get(); }
+    std::shared_ptr<const ResourceUseLayout> ResourceUses() const { return resourceUses_; }
+
+private:
+    template<class T>
+        requires (!std::derived_from<T, IResourceResolver>)
+    DeclaredResourceUse DeclareResourceUse(const T& resource, ResourceUseSpecification specification) {
+        ValidateResourceUse(specification);
+        if constexpr (detail::SharedPtrToResource<T>) {
+            if (!resource) throw std::invalid_argument("Cannot declare an empty resource");
+        } else if constexpr (std::same_as<T, ResourcePtrAndRange>) {
+            if (!resource.resource) throw std::invalid_argument("Cannot declare an empty resource");
+        }
+        // Resolve through the existing resolver machinery, preserving captured ownership.
+        const auto ranges = processResourceArguments(resource, graph);
+        std::shared_ptr<const void> resolverIdentity;
+        const auto captureResolver = [&](const IResourceResolver* resolver) {
+            if (resolver) if (const auto state = graph->CaptureResolverDeclarationState(*resolver); state && state->tracked)
+                resolverIdentity = state->dependencyIdentity;
+        };
+        if constexpr (std::same_as<T, ResourceResolverAndRange>) captureResolver(resource.pResolver.get());
+        else if constexpr (std::same_as<T, ResourceIdentifierAndRange>) captureResolver(graph->RequestResolver(resource.identifier, true).get());
+        else if constexpr (std::same_as<T, ResourceIdentifier>) captureResolver(graph->RequestResolver(resource, true).get());
+        else if constexpr (detail::StringLike<T>) captureResolver(graph->RequestResolver(ResourceIdentifier{std::string_view{resource}}, true).get());
+        if (resolverIdentity) {
+            auto& groups = resourceUses_->resolverViews;
+            auto found = std::find_if(groups.begin(), groups.end(), [&](const auto& group) { return group.identity == resolverIdentity; });
+            if (found == groups.end()) { groups.push_back({resolverIdentity, {}}); found = std::prev(groups.end()); }
+            for (const auto view : specification.views)
+                if (std::none_of(found->views.begin(), found->views.end(), [&](auto existing) { return SameView(existing, view); }))
+                    found->views.push_back(view);
+        }
+        const bool alreadyDeclared = !ranges.empty() && std::all_of(ranges.begin(), ranges.end(), [&](const auto& range) {
+            return std::any_of(resourceUses_->uses.begin(), resourceUses_->uses.end(), [&](const auto& use) {
+                return use.resource.resource == range.resource && use.resource.range == range.range
+                    && use.state.access == specification.access;
+            });
+        });
+        using A = rhi::ResourceAccessType;
+        // Symbolic names still need their registration/domain side effects, even
+        // when the same resource was previously declared by pointer.
+        if (!alreadyDeclared || !detail::SharedPtrToResource<T>) switch (specification.access) {
+        case A::ShaderResource: addShaderResource(resource); break;
+        case A::UnorderedAccess: addUnorderedAccess(resource); break;
+        case A::UnorderedAccessClear: addUnorderedAccessClear(resource); break;
+        case A::ConstantBuffer: addConstantBuffer(resource); break;
+        case A::IndirectArgument: addIndirectArguments(resource); break;
+        case A::RenderTarget: addRenderTarget(resource); break;
+        case A::RenderTargetClear: addRenderTargetClear(resource); break;
+        case A::DepthRead: addDepthRead(resource); break;
+        case A::DepthReadWrite: addDepthReadWrite(resource); break;
+        case A::DepthStencilClear: addDepthStencilClear(resource); break;
+        case A::CopySource: addCopySource(resource); break;
+        case A::CopyDest: addCopyDest(resource); break;
+        case A::VertexBuffer: addVertexBuffer(resource); break;
+        case A::IndexBuffer: addIndexBuffer(resource); break;
+        case A::Present: addPresent(resource); break;
+        default: throw std::invalid_argument("Unsupported resource use access");
+        }
+        DeclaredResourceUse result;
+        uint32_t memberOrdinal = 0;
+        for (const auto& range : ranges) {
+            auto* concrete = graph->_registry.Resolve(range.resource);
+            if (!concrete) throw std::invalid_argument("Resource declaration did not resolve");
+            const auto validBound = [](Bound bound, uint32_t count) {
+                return bound.type == BoundType::All || bound.value < count;
+            };
+            if (!validBound(range.range.mipLower, concrete->GetMipLevels()) || !validBound(range.range.mipUpper, concrete->GetMipLevels())
+                || !validBound(range.range.sliceLower, concrete->GetArraySize()) || !validBound(range.range.sliceUpper, concrete->GetArraySize()))
+                throw std::invalid_argument("Resource access range outside resource bounds");
+            const auto resolvedRange = ResolveRangeSpec(range.range, concrete->GetMipLevels(), concrete->GetArraySize());
+            if (resolvedRange.isEmpty()) throw std::invalid_argument("Empty resource access range");
+            for (const auto view : specification.views)
+                if (view.mip >= concrete->GetMipLevels() || view.slice >= concrete->GetArraySize())
+                    throw std::invalid_argument("Declared view outside resource bounds");
+            const ResourceBindingToken binding{concrete->GetSchedulingResourceID(), range.resource.GetGlobalResourceID()};
+            const ResourceState state{specification.access, AccessToLayout(specification.access, true), RenderSyncFromAccess(specification.access)};
+            auto& uses = resourceUses_->uses;
+            auto found = std::find_if(uses.begin(), uses.end(), [&](const auto& use) {
+                return use.resolverIdentity == resolverIdentity && use.binding.registryResourceID == binding.registryResourceID && use.resource.range == range.range
+                    && use.state == state && use.state.sync == state.sync;
+            });
+            if (found == uses.end()) { uses.push_back({range, state, binding, {}, resolverIdentity, memberOrdinal}); found = std::prev(uses.end()); }
+            const auto ordinal = static_cast<uint32_t>(found - uses.begin());
+            ++memberOrdinal;
+            result.resources.push_back(binding);
+            for (const auto view : specification.views) {
+                auto& views = found->requiredViews;
+                auto existing = std::find_if(views.begin(), views.end(), [&](auto v) { return SameView(v, view); });
+                if (existing == views.end()) { views.push_back(view); existing = std::prev(views.end()); }
+                result.views.push_back({resourceUses_, ordinal, static_cast<uint32_t>(existing - views.begin())});
+            }
+        }
+        RegisterUseViews(resource, specification);
+        return result;
+    }
+    DeclaredResourceUse DeclareResourceUse(const IResourceResolver& resolver, ResourceUseSpecification specification) {
+        return DeclareResourceUse(ResourceResolverAndRange{resolver}, std::move(specification));
+    }
+
+public:
+    template<class T> DeclaredResourceUse ShaderResource(const T& resource, SrvView view = {}) {
+        return DeclareResourceUse(resource, {rhi::ResourceAccessType::ShaderResource, {view}});
+    }
+    template<class T> DeclaredResourceUse ShaderResource(const T& resource, std::span<const SrvView> views) {
+        ResourceUseSpecification specification{rhi::ResourceAccessType::ShaderResource, {}};
+        for (const auto view : views) specification.views.push_back(view);
+        return DeclareResourceUse(resource, std::move(specification));
+    }
+    template<class T> DeclaredResourceUse UnorderedAccess(const T& resource, UavView view = {}) {
+        return DeclareResourceUse(resource, {rhi::ResourceAccessType::UnorderedAccess, {view}});
+    }
+    template<class T> DeclaredResourceUse UnorderedAccess(const T& resource, std::span<const UavView> views) {
+        ResourceUseSpecification specification{rhi::ResourceAccessType::UnorderedAccess, {}};
+        for (const auto view : views) specification.views.push_back(view);
+        return DeclareResourceUse(resource, std::move(specification));
+    }
+    template<class T, class Destination> DeclaredViewToken ShaderResource(const T& resource, SrvView view, Destination destination) {
+        auto token = ShaderResource(resource, view).View(); destination.Bind(token); return token;
+    }
+    template<class T, class Destination> DeclaredViewToken UnorderedAccess(const T& resource, UavView view, Destination destination) {
+        auto token = UnorderedAccess(resource, view).View(); destination.Bind(token); return token;
+    }
+    template<class First, class Second, class... Rest>
+        requires (!std::same_as<std::remove_cvref_t<Second>, SrvView> && !std::same_as<std::remove_cvref_t<Second>, std::span<const SrvView>>)
+    void ShaderResource(const First& first, const Second& second, const Rest&... rest) {
+        ShaderResource(first); ShaderResource(second); (ShaderResource(rest), ...);
+    }
+    template<class First, class Second, class... Rest>
+        requires (!std::same_as<std::remove_cvref_t<Second>, UavView> && !std::same_as<std::remove_cvref_t<Second>, std::span<const UavView>>)
+    void UnorderedAccess(const First& first, const Second& second, const Rest&... rest) {
+        UnorderedAccess(first); UnorderedAccess(second); (UnorderedAccess(rest), ...);
+    }
+    template<class T> DeclaredResourceUse UnorderedAccessClear(const T& resource, UavView view = {}) {
+        return DeclareResourceUse(resource, {rhi::ResourceAccessType::UnorderedAccessClear,
+            {view, {BindlessViewKind::NonShaderVisibleUnorderedAccess, view.variant, view.mip, view.slice}}});
+    }
+    template<class T> DeclaredResourceUse ConstantBuffer(const T& resource) {
+        return DeclareResourceUse(resource, {rhi::ResourceAccessType::ConstantBuffer, {{BindlessViewKind::ConstantBuffer}}});
+    }
+    template<class T> ResourceBindingToken IndirectArguments(const T& resource) {
+        return DeclareResourceUse(resource, {rhi::ResourceAccessType::IndirectArgument, {}}).Resource();
+    }
+    template<class T> DeclaredResourceUse RenderTarget(const T& resource) {
+        return DeclareResourceUse(resource, {rhi::ResourceAccessType::RenderTarget, {{BindlessViewKind::RenderTarget}}});
+    }
+    template<class T> DeclaredResourceUse RenderTargetClear(const T& resource) {
+        return DeclareResourceUse(resource, {rhi::ResourceAccessType::RenderTargetClear, {{BindlessViewKind::RenderTarget}}});
+    }
+    template<class T> DeclaredResourceUse DepthRead(const T& resource) {
+        return DeclareResourceUse(resource, {rhi::ResourceAccessType::DepthRead, {{BindlessViewKind::DepthStencil}}});
+    }
+    template<class T> DeclaredResourceUse DepthReadWrite(const T& resource) {
+        return DeclareResourceUse(resource, {rhi::ResourceAccessType::DepthReadWrite, {{BindlessViewKind::DepthStencil}}});
+    }
+    template<class T> DeclaredResourceUse DepthStencilClear(const T& resource) {
+        return DeclareResourceUse(resource, {rhi::ResourceAccessType::DepthStencilClear, {{BindlessViewKind::DepthStencil}}});
+    }
+    template<class T> ResourceBindingToken CopySource(const T& resource) {
+        return DeclareResourceUse(resource, {rhi::ResourceAccessType::CopySource, {}}).Resource();
+    }
+    template<class T> ResourceBindingToken CopyDestination(const T& resource) {
+        return DeclareResourceUse(resource, {rhi::ResourceAccessType::CopyDest, {}}).Resource();
+    }
+    template<class T> ResourceBindingToken VertexBuffer(const T& resource) {
+        return DeclareResourceUse(resource, {rhi::ResourceAccessType::VertexBuffer, {}}).Resource();
+    }
+    template<class T> ResourceBindingToken IndexBuffer(const T& resource) {
+        return DeclareResourceUse(resource, {rhi::ResourceAccessType::IndexBuffer, {}}).Resource();
+    }
+    template<class T> ResourceBindingToken Present(const T& resource) {
+        return DeclareResourceUse(resource, {rhi::ResourceAccessType::Present, {}}).Resource();
+    }
+
     // Resolve immutable descriptor metadata for generation-owned GPU tables.
     // The resource must also be bound by this declaration; this method is not
     // an alternative resource-access path.
@@ -1562,6 +1736,30 @@ public:
     auto const& DeclaredResourceIds() const { return _declaredIds; }
 
 private:
+    std::shared_ptr<ResourceUseLayout> resourceUses_ = std::make_shared<ResourceUseLayout>();
+    template<class T> void RegisterUseViews(const T&, const ResourceUseSpecification&) {}
+    void RegisterUseViews(const ResourceIdentifier& identifier, const ResourceUseSpecification& specification) {
+        for (const auto view : specification.views) {
+            if (view.kind != BindlessViewKind::ShaderResource && view.kind != BindlessViewKind::UnorderedAccess
+                && view.kind != BindlessViewKind::ConstantBuffer) continue;
+            DescriptorAccessor accessor{};
+            accessor.type = view.kind == BindlessViewKind::ShaderResource ? DescriptorType::SRV
+                : view.kind == BindlessViewKind::UnorderedAccess ? DescriptorType::UAV : DescriptorType::CBV;
+            accessor.mip = view.mip; accessor.slice = view.slice;
+            accessor.hasSRVViewType = view.kind == BindlessViewKind::ShaderResource && view.variant != UINT32_MAX;
+            accessor.SRVType = static_cast<SRVViewType>(view.variant);
+            accessor.hasUAVViewType = view.kind == BindlessViewKind::UnorderedAccess && view.variant != UINT32_MAX;
+            accessor.UAVType = static_cast<UAVViewType>(view.variant);
+            auto& registrations = view.kind == BindlessViewKind::ShaderResource ? params.autoDescriptorShaderResources
+                : view.kind == BindlessViewKind::UnorderedAccess ? params.autoDescriptorUnorderedAccessViews : params.autoDescriptorConstantBuffers;
+            detail::AppendUniqueDescriptorRegistration(registrations,
+                AutoDescriptorRegistration{identifier, accessor, {}, graph->RequestResolver(identifier, true)});
+        }
+    }
+    void RegisterUseViews(const ResourceIdentifierAndRange& resource, const ResourceUseSpecification& specification) {
+        RegisterUseViews(resource.identifier, specification);
+    }
+
     struct AuthorState {
         RenderPassParameters params;
         std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> declaredIds;
@@ -1656,6 +1854,7 @@ private:
     }
 
     void Reset() override {
+        resourceUses_ = std::make_shared<ResourceUseLayout>();
         built_ = false;
         pass = nullptr;
         params = {};

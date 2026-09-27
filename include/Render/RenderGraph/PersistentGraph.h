@@ -243,9 +243,15 @@ public:
         experimental::CompileRange range, experimental::CompileResourceState state,
         uint64_t byteOffset = 0, uint64_t byteSize = UINT64_MAX, uint32_t aspects = 0);
     BindingToken DeclareDependency(PassId pass, ResourceSlotId resource, bool write);
+    // A descriptor binding for a group position. Group access supplies hazards;
+    // unused reserved positions must not become mandatory direct accesses.
+    BindingToken BindGroupMember(PassId pass, ResourceGroupId group, ResourceSlotId resource);
     void DeclarePostcondition(BindingToken binding, experimental::CompileRange range,
         experimental::CompileResourceState state);
     ViewToken DeclareView(BindingToken binding, BindlessViewRequest view);
+    // Adapter path for logical declarations preceding alias materialization.
+    // Bound versions are validated immediately; placeholders are validated by ReplaceBinding.
+    ViewToken RequireView(BindingToken binding, BindlessViewRequest view);
     void AddOrdering(PassId before, PassId after);
     void AddPlacementOrdering(PassId before, PassId after);
     // Drops every placement ordering (structural). Alias planning re-derives
@@ -283,6 +289,7 @@ private:
     LogicalGraph& EditLogical(bool structural = true);
     void ValidatePass(PassId pass) const;
     void ClearPassBindings(PassId pass);
+    BindingToken DeclareBinding(PassId pass, ResourceSlotId resource, std::optional<bool> write);
     std::shared_ptr<const SelectedPublication> m_base;
     std::optional<LogicalGraph> m_logical;
     BindingTable m_bindings;

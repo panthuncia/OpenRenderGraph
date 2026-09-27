@@ -71,6 +71,40 @@ struct DirectRecordingPass : org::TypedRenderGraphPass<DirectRecordingPass> {
     void Declare(org::PassBuilder&) {}
     static void Record(org::PassRecordContext&) { ++recordings; }
 };
+int TestUnifiedDeclarations(rhi::Device device, const std::shared_ptr<org::Resource>& resource) {
+    org::RenderGraph graph(device, rhi::Backend::D3D12);
+    const org::ResourceIdentifier name("test.unified");
+    graph.RegisterResource(name, resource);
+    auto& builder = graph.BuildPass<DirectRecordingPass>("Unified");
+    const auto first = builder.ShaderResource(resource).View();
+    const auto repeated = builder.ShaderResource(resource).View();
+    const auto named = builder.ShaderResource(name).View();
+    CHECK(first.layout == repeated.layout && first.use == repeated.use && first.view == repeated.view);
+    CHECK(first.Resource().registryResourceID == named.Resource().registryResourceID);
+    CHECK(builder.ResourceUses()->uses.size() == 1);
+    builder.ShaderResource(resource, name);
+    const org::SrvView requestedViews[] = {{}, {3}};
+    const auto multiple = builder.ShaderResource(resource, std::span<const org::SrvView>{requestedViews});
+    CHECK(multiple.views.size() == 2 && multiple.View(0).view != multiple.View(1).view);
+    bool rejected = false;
+    try { (void)multiple.View(); } catch (const std::invalid_argument&) { rejected = true; }
+    CHECK(rejected);
+    const auto indirect = builder.IndirectArguments(resource);
+    CHECK(indirect.registryResourceID == first.Resource().registryResourceID);
+    CHECK(builder.ResourceUses()->uses.size() == 2);
+    const auto clear = builder.UnorderedAccessClear(resource);
+    CHECK(clear.views.size() == 2 && clear.View(0).use == clear.View(1).use && clear.View(0).view != clear.View(1).view);
+    rejected = false;
+    try { builder.ShaderResource(std::shared_ptr<org::Resource>{}); } catch (const std::invalid_argument&) { rejected = true; }
+    CHECK(rejected);
+    rejected = false;
+    try { builder.ShaderResource(resource, {UINT32_MAX, 99, 0}); } catch (const std::invalid_argument&) { rejected = true; }
+    CHECK(rejected);
+    // Declaration does not touch descriptors: this fixture has no published SRV/UAV views.
+    CHECK(builder.ResourceUses()->uses.size() == 3);
+    return 0;
+}
+
 struct DeclaredTestBindings { org::ResourceBindingToken resource; };
 struct DeclaredRecordingPass : org::TypedRenderGraphPass<DeclaredRecordingPass,
     org::EmptyPassFrameData, DeclaredTestBindings> {
@@ -1442,6 +1476,7 @@ int main(int argc, char** argv) {
 		registry = {};
 		CHECK(registry.MakeHandle(bufferID).GetGeneration() == 0);
 	}
+	if (const auto failure = TestUnifiedDeclarations(device.Get(), buffer)) return failure;
 	if (const auto failure = TestEmptyResolverRefresh(device.Get(), buffer)) return failure;
 	if (const auto failure = TestMixedResolverCollision(device.Get(), buffer)) return failure;
 

@@ -508,6 +508,20 @@ rhi::DescriptorSlot SelectedPublication::ResolveView(ViewToken token) const {
     return version.preparedViews->at(token.binding.declarationId).at(token.ordinal);
 }
 BindingToken GraphEditTransaction::DeclareDependency(PassId pass, ResourceSlotId resource, bool write) {
+    return DeclareBinding(pass, resource, write);
+}
+BindingToken GraphEditTransaction::BindGroupMember(PassId pass, ResourceGroupId id, ResourceSlotId resource) {
+    MutationGuard mutation{m_failed};
+    auto& logical = EditLogical();
+    Require(id.index < logical.groups.size() && logical.groups[id.index].active
+        && id.generation == logical.groups[id.index].generation, "Stale resource group");
+    const auto& group = logical.groups[id.index];
+    Require(std::ranges::find(group.members, resource) != group.members.end(), "Resource is not a group member");
+    Require(std::any_of(group.subscribers.begin(), group.subscribers.end(),
+        [&](const auto& subscriber) { return subscriber.pass == pass; }), "Pass does not declare this group");
+    return DeclareBinding(pass, resource, std::nullopt);
+}
+BindingToken GraphEditTransaction::DeclareBinding(PassId pass, ResourceSlotId resource, std::optional<bool> write) {
     MutationGuard mutation{m_failed};
     ValidatePass(pass); m_bindings.At(resource);
     auto& logical = EditLogical();
@@ -517,7 +531,7 @@ BindingToken GraphEditTransaction::DeclareDependency(PassId pass, ResourceSlotId
     layout.bindingSlots.push_back({resource,declarationId});
     logical.bindingSubscribers.at(resource.index).push_back({pass.index,ordinal});
     auto& declaration = logical.declarations.passes[pass.index];
-    declaration.accesses.push_back({resource.index,write});
+    if (write) declaration.accesses.push_back({resource.index,*write});
     return BindingToken(logical.domain,layout.layoutRevision,pass,ordinal,declarationId);
 }
 void GraphEditTransaction::ClearPassBindings(PassId pass) {
@@ -545,9 +559,20 @@ ViewToken GraphEditTransaction::DeclareView(BindingToken token, BindlessViewRequ
     Require(token.layoutRevision == layout.layoutRevision && token.ordinal < layout.bindingSlots.size()
         && token.declarationId == layout.bindingSlots[token.ordinal].declarationId, "Stale view binding");
     const auto& binding = m_bindings.At(layout.bindingSlots[token.ordinal].resource);
-    Require(view.mip < binding.shape.mips && view.slice < binding.shape.slices, "Declared view outside resource contract");
     Require(binding.recording && binding.recording->views && binding.recording->descriptorOwner, "View has no owned snapshot");
-    Require(binding.recording->views->Resolve(view).heap.valid(), "Declared view has invalid descriptor heap");
+    return RequireView(token, view);
+}
+ViewToken GraphEditTransaction::RequireView(BindingToken token, BindlessViewRequest view) {
+    MutationGuard mutation{m_failed};
+    const auto& logical = m_logical ? *m_logical : *m_base->logical;
+    Require(token.domain == logical.domain, "Foreign view binding");
+    ValidatePass(token.pass);
+    const auto& layout = logical.passSlots[token.pass.index];
+    Require(token.layoutRevision == layout.layoutRevision && token.ordinal < layout.bindingSlots.size()
+        && token.declarationId == layout.bindingSlots[token.ordinal].declarationId, "Stale view binding");
+    const auto& binding = m_bindings.At(layout.bindingSlots[token.ordinal].resource);
+    Require(view.mip < binding.shape.mips && view.slice < binding.shape.slices, "Declared view outside resource contract");
+
     const auto resource = layout.bindingSlots[token.ordinal].resource;
     auto replacement = binding;
     auto& required = EditLogical().passSlots[token.pass.index].bindingSlots[token.ordinal].requiredViews;

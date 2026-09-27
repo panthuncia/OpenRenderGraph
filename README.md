@@ -348,3 +348,5 @@ When fallback is used, you can forward BasicRHI manual dependency options:
 - `OPENRENDERGRAPH_BASICRHI_STREAMLINE_HEADERS_DIR=<path>`
 - `OPENRENDERGRAPH_BASICRHI_PIX_HEADERS_DIR=<path>`
 
+
+See [resource uses and declared views](RESOURCE_USES.md) for the unified declaration API and migration rules.

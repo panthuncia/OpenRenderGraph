@@ -3,6 +3,8 @@
 
 namespace org {
 
+std::shared_ptr<const ResourceUseLayout> GetResourceUses(const RenderPassBuilder& builder) { return builder.ResourceUses(); }
+
 std::vector<ResourceHandleAndRange>
 expandToRanges(ResourceIdentifierAndRange const & rir, RenderGraph* graph)
 {
