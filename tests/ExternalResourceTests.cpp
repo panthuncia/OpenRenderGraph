@@ -349,9 +349,9 @@ struct RefreshTestPass final : org::ComputePass {
 	org::ResourceRegistryView* View() const { return m_resourceRegistryView.get(); }
 	void DeclareResourceUsages(org::ComputePassBuilder* builder) override {
 		++declarations;
-		if (symbolic) builder->WithShaderResource(org::ResourceIdentifier("test.empty-resolver"));
-		else builder->WithShaderResource(*resolver);
-		if (secondResolver) builder->WithShaderResource(*secondResolver);
+		if (symbolic) builder->ShaderResource(org::ResourceIdentifier("test.empty-resolver"));
+		else builder->ShaderResource(*resolver);
+		if (secondResolver) builder->ShaderResource(*secondResolver);
 	}
 };
 
@@ -421,9 +421,9 @@ int TestEmptyResolverDeclarations(rhi::Device device) {
 	const org::ResourceIdentifier identifier("test.empty-resolver");
 	graph.RegisterResolver(identifier, resolver);
 	auto& direct = graph.BuildComputePass<DeclarationTestPass>("Direct");
-	direct.WithShaderResource(*resolver);
+	direct.ShaderResource(*resolver);
 	auto& symbolic = graph.BuildComputePass<DeclarationTestPass>("Symbolic");
-	symbolic.WithShaderResource(identifier);
+	symbolic.ShaderResource(identifier);
 	auto directStates = direct.TakeResolverSnapshots();
 	auto symbolicStates = symbolic.TakeResolverSnapshots();
 	CHECK(directStates.size() == 1 && symbolicStates.size() == 1);
@@ -439,7 +439,9 @@ int TestEmptyResolverDeclarations(rhi::Device device) {
 	CHECK(a.declaredRequirementTemplates[0].state.sync == b.declaredRequirementTemplates[0].state.sync);
 	// Multiple authored uses must survive an empty initial capture, too.
 	auto& multiple = graph.BuildComputePass<DeclarationTestPass>("Multiple");
-	multiple.WithShaderResource(*resolver).WithUnorderedAccess(*resolver).WithShaderResource(*resolver);
+	multiple.ShaderResource(*resolver);
+	multiple.UnorderedAccess(*resolver);
+	multiple.ShaderResource(*resolver);
 	auto multiStates = multiple.TakeResolverSnapshots();
 	CHECK(multiStates.size() == 1);
 	CHECK(multiStates[0].declaredRequirementTemplates.size() == 2);

@@ -1367,8 +1367,8 @@ changed.
 
 `FrozenExecutionBindings::ResourceBinding` now carries a value snapshot of the
 published views and resource description alongside the exact allocation/version
-owner. `FramePreparationContext::ResolveView`, `CaptureView`, and `Describe`
-resolve a declaration token through that frozen binding. They never inspect the
+owner. `FramePreparationContext::Resolve`, `Capture`, and `Describe`
+resolve a declared view token through that frozen binding. They never inspect the
 current resource wrapper or descriptor registry. The snapshot records SRV/UAV,
 CPU UAV, RTV, DSV, and CBV slots, including mip, slice, and view-variant identity.
 Missing views fail during preparation.
@@ -1397,8 +1397,8 @@ tokens; only the captured pipeline and command-signature owners remain as pass
 configuration.
 
 Published clear values are now part of the resource-view snapshot for attachment
-recording. `BindDepthReadWrite` joins the other typed declaration methods and
-returns the same lightweight resource token used by planning and preparation.
+recording. `DepthReadWrite` declares the depth view and returns a token used by
+planning and preparation.
 
 The next conversion removed every remaining explicit `CaptureDescriptor` call
 from BasicRenderer. BRDF integration, specular IBL, bloom sampling, and AVBOIT
@@ -1413,9 +1413,8 @@ ClearVisibilityBufferPass exercises registry-identifier declarations for a
 larger dynamic-looking binding set. Its ten UAV clears and depth clear use
 returned tokens; preparation stores frame-owned descriptor and resource
 references, and recording resolves those references from the same frozen frame.
-The render builder therefore exposes identifier forms of
-`BindUnorderedAccessClear` and `BindDepthStencilClear` in addition to the shared
-resource forms.
+The render builder accepts identifiers or shared resources through
+`UnorderedAccessClear` and `DepthStencilClear`.
 
 This does not yet mean all pass preparation is independent of live registries.
 The current source inventory finds direct descriptor-view queries in 76 pass or

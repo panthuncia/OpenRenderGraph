@@ -474,17 +474,6 @@ rhi::Resource SelectedPublication::ResolveNative(BindingToken token) const {
     Require(bool(version.recording), "Binding has no native recording snapshot");
     return version.recording->resource;
 }
-rhi::DescriptorSlot SelectedPublication::ResolveView(BindingToken token, BindlessViewRequest view) const {
-    const auto& version = Resolve(token);
-    const auto& requirements = logical->passSlots[token.pass.index].bindingSlots[token.ordinal].requiredViews;
-    Require(std::any_of(requirements.begin(),requirements.end(),[&](const auto& required) {
-        return required.request.kind == view.kind && required.request.variant == view.variant
-            && required.request.mip == view.mip && required.request.slice == view.slice;
-    }), "Recording requested an undeclared descriptor view");
-    Require(version.recording && version.recording->views && version.recording->descriptorOwner,
-        "Binding has no owned descriptor snapshot");
-    return version.recording->views->Resolve(view);
-}
 BindingToken GraphEditTransaction::Declare(PassId pass, ResourceSlotId resource,
     experimental::CompileRange range, experimental::CompileResourceState state,
     uint64_t byteOffset, uint64_t byteSize, uint32_t aspects) {
@@ -499,7 +488,7 @@ BindingToken GraphEditTransaction::Declare(PassId pass, ResourceSlotId resource,
     EditLogical().declarations.passes[pass.index].entryStates.push_back({resource.index,range,state,byteOffset,byteSize,aspects});
     return token;
 }
-rhi::DescriptorSlot SelectedPublication::ResolveView(ViewToken token) const {
+rhi::DescriptorSlot SelectedPublication::Resolve(ViewToken token) const {
     const auto& version = Resolve(token.binding);
     const auto& required = logical->passSlots[token.binding.pass.index].bindingSlots[token.binding.ordinal].requiredViews;
     Require(token.ordinal < required.size() && required[token.ordinal].declarationId == token.declarationId,
@@ -1719,6 +1708,6 @@ rhi::Resource RecordingContext::Resolve(persistent::BindingToken token) const {
 }
 rhi::DescriptorSlot RecordingContext::Resolve(persistent::ViewToken token) const {
     if (!m_persistentPublication) throw std::logic_error("Persistent view requires selected recording bindings");
-    return m_persistentPublication->ResolveView(token);
+    return m_persistentPublication->Resolve(token);
 }
 } // namespace org

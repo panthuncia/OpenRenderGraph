@@ -23,16 +23,6 @@
 // Tag for a contiguous mip-range [first..first+count)
 namespace org {
 
-inline void MaterializeDeclaredBindlessView(Resource& resource, BindlessViewKind kind) {
-    // Binding tokens identify resources, not physical descriptor slots. External
-    // passes are declared before their referenced resources are materialized, so
-    // touching descriptor grids here can observe an intentionally empty (or
-    // concurrently rotating) publication. Resolve the concrete view later from
-    // the generation-owned preparation snapshot.
-    (void)resource;
-    (void)kind;
-}
-
 struct Mip {
 	Mip(uint32_t first, uint32_t count) : first(first), count(count) {}
     uint32_t first, count;
@@ -1081,592 +1071,41 @@ public:
         return DeclareResourceUse(resource, {rhi::ResourceAccessType::Present, {}}).Resource();
     }
 
-    // Resolve immutable descriptor metadata for generation-owned GPU tables.
-    // The resource must also be bound by this declaration; this method is not
-    // an alternative resource-access path.
-    template<class ResourceT>
-        requires std::derived_from<ResourceT, GloballyIndexedResource>
-    uint32_t DeclaredBindlessIndex(const std::shared_ptr<ResourceT>& resource,
-        BindlessViewRequest request) const {
-        if (!resource) throw std::invalid_argument("Cannot resolve a view for an empty declared resource");
-        auto views = resource->CaptureBindlessViews();
-        if (!views) {
-            // Legacy declarations freeze a descriptor index immediately instead of
-            // returning a binding token. Reserve the resource's stable virtual slots
-            // without forcing an aliased resource to acquire physical backing before
-            // structural compilation has computed its placement.
-            resource->EnsureVirtualDescriptorSlotsAllocated();
-            views = resource->CaptureBindlessViews();
-        }
-        if (!views) {
-            throw std::out_of_range("Declared resource '" + resource->GetName() +
-                "' publishes no bindless views");
-        }
-        return views->Resolve(request).index;
-    }
-    ResourceBindingToken MakeBindingToken(const ResourceIdentifier& identifier) const {
-        const auto handle = graph->RequestResourceHandle(identifier);
-        const auto resource = graph->RequestResourcePtr(identifier);
-        return {
-            resource ? resource->GetSchedulingResourceID() : handle.GetGlobalResourceID(),
-            handle.GetGlobalResourceID()
-        };
-    }
-    // Typed declaration entry points return a stable token for Prepare. This
-    // keeps the familiar fluent With* API intact while avoiding registry
-    // lookups and global-ID plumbing in typed passes.
-    template<class ResourceT>
-        requires std::derived_from<ResourceT, Resource>
-    ResourceBindingToken BindShaderResource(const std::shared_ptr<ResourceT>& resource) {
-        if (!resource) throw std::invalid_argument("Cannot bind an empty shader resource");
-        MaterializeDeclaredBindlessView(*resource, BindlessViewKind::ShaderResource);
-        addShaderResource(resource);
-        return { resource->GetSchedulingResourceID(), graph->RequestResourceHandle(resource.get()).GetGlobalResourceID() };
-    }
-
-    ResourceBindingToken BindShaderResource(const ResourceIdentifierAndRange& resource) {
-        addShaderResource(resource);
-        return MakeBindingToken(resource.identifier);
-    }
-
-    ResourceBindingToken BindShaderResource(const ResourcePtrAndRange& resource) {
-        if (!resource.resource) throw std::invalid_argument("Cannot bind an empty shader resource");
-        addShaderResource(resource);
-        return {resource.resource->GetSchedulingResourceID(),
-            graph->RequestResourceHandle(resource.resource.get()).GetGlobalResourceID()};
-    }
-
-    ResourceBindingToken BindShaderResource(const ResourceIdentifier& identifier) {
-        addShaderResource(identifier);
-        return MakeBindingToken(identifier);
-    }
-
-    ResourceBindingToken BindUnorderedAccessClear(const ResourceIdentifier& identifier) {
-        addUnorderedAccessClear(identifier);
-        return MakeBindingToken(identifier);
-    }
-
-    ResourceBindingToken BindUnorderedAccess(const ResourceIdentifier& identifier) {
-        addUnorderedAccess(identifier);
-        return MakeBindingToken(identifier);
-    }
-
-    ResourceBindingToken BindDepthStencilClear(const ResourceIdentifier& identifier) {
-        addDepthStencilClear(identifier);
-        return MakeBindingToken(identifier);
-    }
-
-    ResourceBindingToken BindDepthReadWrite(const ResourceIdentifier& identifier) {
-        addDepthReadWrite(identifier);
-        return MakeBindingToken(identifier);
-    }
-
-    ResourceBindingToken BindConstantBuffer(const ResourceIdentifier& identifier) {
-        addConstantBuffer(identifier);
-        return MakeBindingToken(identifier);
-    }
-
-    template<class ResourceT>
-        requires std::derived_from<ResourceT, Resource>
-    ResourceBindingToken BindUnorderedAccess(const std::shared_ptr<ResourceT>& resource) {
-        if (!resource) throw std::invalid_argument("Cannot bind an empty unordered-access resource");
-        MaterializeDeclaredBindlessView(*resource, BindlessViewKind::UnorderedAccess);
-        addUnorderedAccess(resource);
-        return { resource->GetSchedulingResourceID(), graph->RequestResourceHandle(resource.get()).GetGlobalResourceID() };
-    }
-
-    ResourceBindingToken BindUnorderedAccess(const ResourcePtrAndRange& resource) {
-        if (!resource.resource) throw std::invalid_argument("Cannot bind an empty unordered-access resource");
-        addUnorderedAccess(resource);
-        return {resource.resource->GetSchedulingResourceID(),
-            graph->RequestResourceHandle(resource.resource.get()).GetGlobalResourceID()};
-    }
-
-    template<class ResourceT>
-        requires std::derived_from<ResourceT, Resource>
-    ResourceBindingToken BindUnorderedAccessClear(const std::shared_ptr<ResourceT>& resource) {
-        if (!resource) throw std::invalid_argument("Cannot bind an empty unordered-access clear resource");
-        MaterializeDeclaredBindlessView(*resource, BindlessViewKind::UnorderedAccess);
-        MaterializeDeclaredBindlessView(*resource, BindlessViewKind::NonShaderVisibleUnorderedAccess);
-        addUnorderedAccessClear(resource);
-        return { resource->GetSchedulingResourceID(), graph->RequestResourceHandle(resource.get()).GetGlobalResourceID() };
-    }
-
-    template<class ResourceT>
-        requires std::derived_from<ResourceT, Resource>
-    ResourceBindingToken BindIndirectArguments(const std::shared_ptr<ResourceT>& resource) {
-        if (!resource) throw std::invalid_argument("Cannot bind an empty indirect-argument resource");
-        addIndirectArguments(resource);
-        return { resource->GetSchedulingResourceID(), graph->RequestResourceHandle(resource.get()).GetGlobalResourceID() };
-    }
-
-    /** @brief A buffer the pass's draws read as a vertex stream (bound by address, e.g. an indirect VertexBuffer argument). */
-    template<class ResourceT>
-        requires std::derived_from<ResourceT, Resource>
-    ResourceBindingToken BindVertexBuffer(const std::shared_ptr<ResourceT>& resource) {
-        if (!resource) throw std::invalid_argument("Cannot bind an empty vertex buffer");
-        addVertexBuffer(resource);
-        return { resource->GetSchedulingResourceID(), graph->RequestResourceHandle(resource.get()).GetGlobalResourceID() };
-    }
-
-    template<class ResourceT>
-        requires std::derived_from<ResourceT, Resource>
-    ResourceBindingToken BindDepthRead(const std::shared_ptr<ResourceT>& resource) {
-        if (!resource) throw std::invalid_argument("Cannot bind an empty depth-read resource");
-        MaterializeDeclaredBindlessView(*resource, BindlessViewKind::DepthStencil);
-        addDepthRead(resource);
-        return { resource->GetSchedulingResourceID(), graph->RequestResourceHandle(resource.get()).GetGlobalResourceID() };
-    }
-
-    template<class ResourceT>
-        requires std::derived_from<ResourceT, Resource>
-    ResourceBindingToken BindDepthReadWrite(const std::shared_ptr<ResourceT>& resource) {
-        if (!resource) throw std::invalid_argument("Cannot bind an empty depth resource");
-        MaterializeDeclaredBindlessView(*resource, BindlessViewKind::DepthStencil);
-        addDepthReadWrite(resource);
-        return { resource->GetSchedulingResourceID(), graph->RequestResourceHandle(resource.get()).GetGlobalResourceID() };
-    }
-
-    template<class ResourceT>
-        requires std::derived_from<ResourceT, Resource>
-    ResourceBindingToken BindRenderTarget(const std::shared_ptr<ResourceT>& resource) {
-        if (!resource) throw std::invalid_argument("Cannot bind an empty render target");
-        MaterializeDeclaredBindlessView(*resource, BindlessViewKind::RenderTarget);
-        addRenderTarget(resource);
-        return { resource->GetSchedulingResourceID(), graph->RequestResourceHandle(resource.get()).GetGlobalResourceID() };
-    }
-
-    template<class ResourceT>
-        requires std::derived_from<ResourceT, Resource>
-    ResourceBindingToken BindRenderTargetClear(const std::shared_ptr<ResourceT>& resource) {
-        if (!resource) throw std::invalid_argument("Cannot bind an empty render-target clear resource");
-        MaterializeDeclaredBindlessView(*resource, BindlessViewKind::RenderTarget);
-        addRenderTargetClear(resource);
-        return { resource->GetSchedulingResourceID(), graph->RequestResourceHandle(resource.get()).GetGlobalResourceID() };
-    }
-
-    ResourceBindingToken BindRenderTarget(const ResourceIdentifier& identifier) {
-        addRenderTarget(identifier);
-        return MakeBindingToken(identifier);
-    }
-
-    ResourceBindingToken BindRenderTarget(const ResourceIdentifierAndRange& resource) {
-        addRenderTarget(resource);
-        return MakeBindingToken(resource.identifier);
-    }
-
-    template<class ResourceT>
-        requires std::derived_from<ResourceT, Resource>
-    ResourceBindingToken BindCopySource(const std::shared_ptr<ResourceT>& resource) {
-        if (!resource) throw std::invalid_argument("Cannot bind an empty copy-source resource");
-        addCopySource(resource);
-        return { resource->GetSchedulingResourceID(), graph->RequestResourceHandle(resource.get()).GetGlobalResourceID() };
-    }
-
-    template<class ResourceT>
-        requires std::derived_from<ResourceT, Resource>
-    ResourceBindingToken BindCopyDestination(const std::shared_ptr<ResourceT>& resource) {
-        if (!resource) throw std::invalid_argument("Cannot bind an empty copy-destination resource");
-        addCopyDest(resource);
-        return { resource->GetSchedulingResourceID(), graph->RequestResourceHandle(resource.get()).GetGlobalResourceID() };
-    }
-
-    ResourceBindingToken BindCopySource(const ResourceIdentifier& identifier) {
-        addCopySource(identifier);
-        return MakeBindingToken(identifier);
-    }
-
-    ResourceBindingToken BindCopyDestination(const ResourceIdentifier& identifier) {
-        addCopyDest(identifier);
-        return MakeBindingToken(identifier);
-    }
-
-    // Variadic entry points
-
-    //First set, callable on Lvalues
     template<typename... Args>
         requires ((NotIResourceResolver<Args>) && ...)
-    RenderPassBuilder& WithShaderResource(Args&&... args) & {
-        (addShaderResource(std::forward<Args>(args)), ...);
-        return *this;
-    }
-
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    RenderPassBuilder& WithRenderTarget(Args&&... args) & {
-        (addRenderTarget(std::forward<Args>(args)), ...);
-        return *this;
-    }
-
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    RenderPassBuilder& WithRenderTargetClear(Args&&... args) & {
-        (addRenderTargetClear(std::forward<Args>(args)), ...);
-        return *this;
-    }
-
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    RenderPassBuilder& WithPresent(Args&&... args) & {
-        (addPresent(std::forward<Args>(args)), ...);
-        return *this;
-    }
-
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    RenderPassBuilder& WithDepthRead(Args&&... args) & {
-        (addDepthRead(std::forward<Args>(args)), ...);
-        return *this;
-    }
-
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    RenderPassBuilder& WithDepthReadWrite(Args&&... args) & {
-        (addDepthReadWrite(std::forward<Args>(args)), ...);
-        return *this;
-    }
-
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    RenderPassBuilder& WithDepthStencilClear(Args&&... args) & {
-        (addDepthStencilClear(std::forward<Args>(args)), ...);
-        return *this;
-    }
-
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    RenderPassBuilder& WithConstantBuffer(Args&&... args) & {
-        (addConstantBuffer(std::forward<Args>(args)), ...);
-        return *this;
-    }
-
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    RenderPassBuilder& WithUnorderedAccess(Args&&... args) & {
-        (addUnorderedAccess(std::forward<Args>(args)), ...);
-        return *this;
-    }
-
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    RenderPassBuilder& WithUnorderedAccessClear(Args&&... args) & {
-        (addUnorderedAccessClear(std::forward<Args>(args)), ...);
-        return *this;
-    }
-
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    RenderPassBuilder& WithCopyDest(Args&&... args) & {
-        (addCopyDest(std::forward<Args>(args)), ...);
-        return *this;
-    }
-
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    RenderPassBuilder& WithCopySource(Args&&... args) & {
-        (addCopySource(std::forward<Args>(args)), ...);
-        return *this;
-    }
-
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    RenderPassBuilder& WithIndirectArguments(Args&&... args) & {
-        (addIndirectArguments(std::forward<Args>(args)), ...);
-        return *this;
-    }
-
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    RenderPassBuilder& WithIndexBuffer(Args&&... args) & {
-        (addIndexBuffer(std::forward<Args>(args)), ...);
-        return *this;
-    }
-
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    RenderPassBuilder& WithVertexBuffer(Args&&... args) & {
-        (addVertexBuffer(std::forward<Args>(args)), ...);
-        return *this;
-    }
-
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    RenderPassBuilder& WithLegacyInterop(Args&&... args)& {
+    RenderPassBuilder& LegacyInterop(Args&&... args) & {
         (addLegacyInterop(std::forward<Args>(args)), ...);
+        return *this;
+    }
+
+    RenderPassBuilder& LegacyInterop(const IResourceResolver& resolver) & {
+        const auto state = graph->CaptureResolverDeclarationState(resolver);
+        if (state && state->resources) addLegacyInterop(ResourceResolverAndRange{resolver});
+        else {
+            const auto resources = resolver.Resolve();
+            for (const auto& resource : resources) graph->AddResource(resource);
+            addLegacyInterop(resources);
+        }
         return *this;
     }
 
     template<typename T>
         requires ResourceLike<T>
-    RenderPassBuilder& WithInternalTransition(T&& resource, ResourceState exitState)& {
+    RenderPassBuilder& InternalTransition(T&& resource, ResourceState exitState) & {
         addInternalTransition(std::forward<T>(resource), exitState);
         return *this;
     }
 
     template<typename... Args>
-    RenderPassBuilder& WithActiveFeatureDomain(Args&&... args) & {
+    RenderPassBuilder& ActiveFeatureDomain(Args&&... args) & {
         (addActiveFeatureDomain(std::forward<Args>(args)), ...);
         return *this;
-    }
-
-    // Second set, callable on temporaries
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    RenderPassBuilder WithShaderResource(Args&&... args) && {
-        (addShaderResource(std::forward<Args>(args)), ...);
-        return std::move(*this);
-    }
-
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    RenderPassBuilder WithRenderTarget(Args&&... args) && {
-        (addRenderTarget(std::forward<Args>(args)), ...);
-        return std::move(*this);
-    }
-
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    RenderPassBuilder WithRenderTargetClear(Args&&... args) && {
-        (addRenderTargetClear(std::forward<Args>(args)), ...);
-        return std::move(*this);
-    }
-
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    RenderPassBuilder WithPresent(Args&&... args) && {
-        (addPresent(std::forward<Args>(args)), ...);
-        return std::move(*this);
-    }
-
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    RenderPassBuilder WithDepthReadWrite(Args&&... args) && {
-        (addDepthReadWrite(std::forward<Args>(args)), ...);
-        return std::move(*this);
-    }
-
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    RenderPassBuilder WithDepthStencilClear(Args&&... args) && {
-        (addDepthStencilClear(std::forward<Args>(args)), ...);
-        return std::move(*this);
-    }
-
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    RenderPassBuilder WithDepthRead(Args&&... args) && {
-        (addDepthRead(std::forward<Args>(args)), ...);
-        return std::move(*this);
-    }
-
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    RenderPassBuilder WithConstantBuffer(Args&&... args) && {
-        (addConstantBuffer(std::forward<Args>(args)), ...);
-        return std::move(*this);
-    }
-
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    RenderPassBuilder WithUnorderedAccess(Args&&... args) && {
-        (addUnorderedAccess(std::forward<Args>(args)), ...);
-        return std::move(*this);
-    }
-
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    RenderPassBuilder WithUnorderedAccessClear(Args&&... args) && {
-        (addUnorderedAccessClear(std::forward<Args>(args)), ...);
-        return std::move(*this);
-    }
-
-    template<typename... Args>
-    RenderPassBuilder WithCopyDest(Args&&... args) && {
-        (addCopyDest(std::forward<Args>(args)), ...);
-        return std::move(*this);
-    }
-
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    RenderPassBuilder WithCopySource(Args&&... args) && {
-        (addCopySource(std::forward<Args>(args)), ...);
-        return std::move(*this);
-    }
-
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    RenderPassBuilder WithIndirectArguments(Args&&... args) && {
-        (addIndirectArguments(std::forward<Args>(args)), ...);
-        return std::move(*this);
-    }
-
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    RenderPassBuilder WithIndexBuffer(Args&&... args) && {
-        (addIndexBuffer(std::forward<Args>(args)), ...);
-        return std::move(*this);
-    }
-
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    RenderPassBuilder WithVertexBuffer(Args&&... args) && {
-        (addVertexBuffer(std::forward<Args>(args)), ...);
-        return std::move(*this);
-    }
-
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    RenderPassBuilder WithLegacyInterop(Args&&... args)&& {
-        (addLegacyInterop(std::forward<Args>(args)), ...);
-        return std::move(*this);
-    }
-
-    template<typename T>
-        requires ResourceLike<T>
-    RenderPassBuilder WithInternalTransition(T&& resource, ResourceState exitState)&& {
-        addInternalTransition(std::forward<T>(resource), exitState);
-        return std::move(*this);
-    }
-
-    template<typename... Args>
-    RenderPassBuilder WithActiveFeatureDomain(Args&&... args) && {
-        (addActiveFeatureDomain(std::forward<Args>(args)), ...);
-        return std::move(*this);
-    }
-
-    template<typename AddCallable>
-    RenderPassBuilder& WithResolverDeclaration(const IResourceResolver& resolver, AddCallable&& addCallable) & {
-        const auto state = graph->CaptureResolverDeclarationState(resolver);
-        if (state && state->resources) {
-            addCallable(ResourceResolverAndRange{resolver});
-        } else {
-            const auto resources = resolver.Resolve();
-            for (const auto& resource : resources) graph->AddResource(resource);
-            addCallable(resources);
-        }
-        return *this;
-    }
-
-    template<typename AddCallable>
-    RenderPassBuilder WithResolverDeclaration(const IResourceResolver& resolver, AddCallable&& addCallable) && {
-        const auto state = graph->CaptureResolverDeclarationState(resolver);
-        if (state && state->resources) {
-            addCallable(ResourceResolverAndRange{resolver});
-        } else {
-            const auto resources = resolver.Resolve();
-            for (const auto& resource : resources) graph->AddResource(resource);
-            addCallable(resources);
-        }
-        return std::move(*this);
     }
 
     std::vector<ResolverSnapshot> TakeResolverSnapshots() { return std::move(resolverSnapshots_); }
     void AdoptResolverSnapshots(std::vector<ResolverSnapshot> snapshots) {
         resolverSnapshots_ = std::move(snapshots);
     }
-
-	// LVALUE overloads for IResourceResolver
-    RenderPassBuilder& WithShaderResource(const IResourceResolver& r)& {
-        return WithResolverDeclaration(r, [&](auto&& resolved) { addShaderResource(std::forward<decltype(resolved)>(resolved)); });
-    }
-
-    RenderPassBuilder& WithRenderTarget(const IResourceResolver& r)& {
-        return WithResolverDeclaration(r, [&](auto&& resolved) { addRenderTarget(std::forward<decltype(resolved)>(resolved)); });
-	}
-
-    RenderPassBuilder& WithRenderTargetClear(const IResourceResolver& r)& {
-        return WithResolverDeclaration(r, [&](auto&& resolved) { addRenderTargetClear(std::forward<decltype(resolved)>(resolved)); });
-    }
-
-    RenderPassBuilder& WithPresent(const IResourceResolver& r)& {
-        return WithResolverDeclaration(r, [&](auto&& resolved) { addPresent(std::forward<decltype(resolved)>(resolved)); });
-    }
-
-    RenderPassBuilder& WithDepthReadWrite(const IResourceResolver& r)& {
-		return WithResolverDeclaration(r, [&](auto&& resolved) { addDepthReadWrite(std::forward<decltype(resolved)>(resolved)); });
-    }
-
-        RenderPassBuilder& WithDepthStencilClear(const IResourceResolver& r)& {
-		return WithResolverDeclaration(r, [&](auto&& resolved) { addDepthStencilClear(std::forward<decltype(resolved)>(resolved)); });
-        }
-
-    RenderPassBuilder& WithDepthRead(const IResourceResolver& r)& {
-		return WithResolverDeclaration(r, [&](auto&& resolved) { addDepthRead(std::forward<decltype(resolved)>(resolved)); });
-    }
-
-	RenderPassBuilder& WithConstantBuffer(const IResourceResolver& r)& {
-        return WithResolverDeclaration(r, [&](auto&& resolved) { addConstantBuffer(std::forward<decltype(resolved)>(resolved)); });
-	}
-
-    RenderPassBuilder& WithUnorderedAccess(const IResourceResolver& r)& {
-        return WithResolverDeclaration(r, [&](auto&& resolved) { addUnorderedAccess(std::forward<decltype(resolved)>(resolved)); });
-	}
-
-    RenderPassBuilder& WithUnorderedAccessClear(const IResourceResolver& r)& {
-        return WithResolverDeclaration(r, [&](auto&& resolved) { addUnorderedAccessClear(std::forward<decltype(resolved)>(resolved)); });
-	}
-
-    RenderPassBuilder& WithCopyDest(const IResourceResolver& r)& {
-		return WithResolverDeclaration(r, [&](auto&& resolved) { addCopyDest(std::forward<decltype(resolved)>(resolved)); });
-    }
-
-    RenderPassBuilder& WithCopySource(const IResourceResolver& r)& {
-		return WithResolverDeclaration(r, [&](auto&& resolved) { addCopySource(std::forward<decltype(resolved)>(resolved)); });
-    }
-
-    RenderPassBuilder& WithIndirectArguments(const IResourceResolver& r)& {
-        return WithResolverDeclaration(r, [&](auto&& resolved) { addIndirectArguments(std::forward<decltype(resolved)>(resolved)); });
-	}
-
-    RenderPassBuilder& WithLegacyInterop(const IResourceResolver& r)& {
-        return WithResolverDeclaration(r, [&](auto&& resolved) { addLegacyInterop(std::forward<decltype(resolved)>(resolved)); });
-	}
-
-	// RVALUE overloads for IResourceResolver
-
-    RenderPassBuilder WithShaderResource(const IResourceResolver& r)&& {
-        return std::move(*this).WithResolverDeclaration(r, [&](auto&& resolved) { addShaderResource(std::forward<decltype(resolved)>(resolved)); });
-	}
-    RenderPassBuilder WithRenderTarget(const IResourceResolver& r)&& {
-		return std::move(*this).WithResolverDeclaration(r, [&](auto&& resolved) { addRenderTarget(std::forward<decltype(resolved)>(resolved)); });
-    }
-        RenderPassBuilder WithRenderTargetClear(const IResourceResolver& r)&& {
-                return std::move(*this).WithResolverDeclaration(r, [&](auto&& resolved) { addRenderTargetClear(std::forward<decltype(resolved)>(resolved)); });
-        }
-    RenderPassBuilder WithPresent(const IResourceResolver& r)&& {
-        return std::move(*this).WithResolverDeclaration(r, [&](auto&& resolved) { addPresent(std::forward<decltype(resolved)>(resolved)); });
-    }
-    RenderPassBuilder WithDepthReadWrite(const IResourceResolver& r)&& {
-		return std::move(*this).WithResolverDeclaration(r, [&](auto&& resolved) { addDepthReadWrite(std::forward<decltype(resolved)>(resolved)); });
-    }
-
-        RenderPassBuilder WithDepthStencilClear(const IResourceResolver& r)&& {
-		return std::move(*this).WithResolverDeclaration(r, [&](auto&& resolved) { addDepthStencilClear(std::forward<decltype(resolved)>(resolved)); });
-        }
-    RenderPassBuilder WithDepthRead(const IResourceResolver& r)&& {
-		return std::move(*this).WithResolverDeclaration(r, [&](auto&& resolved) { addDepthRead(std::forward<decltype(resolved)>(resolved)); });
-    }
-    RenderPassBuilder WithConstantBuffer(const IResourceResolver& r)&& {
-		return std::move(*this).WithResolverDeclaration(r, [&](auto&& resolved) { addConstantBuffer(std::forward<decltype(resolved)>(resolved)); });
-    }
-    RenderPassBuilder WithUnorderedAccess(const IResourceResolver& r)&& {
-		return std::move(*this).WithResolverDeclaration(r, [&](auto&& resolved) { addUnorderedAccess(std::forward<decltype(resolved)>(resolved)); });
-    }
-        RenderPassBuilder WithUnorderedAccessClear(const IResourceResolver& r)&& {
-		return std::move(*this).WithResolverDeclaration(r, [&](auto&& resolved) { addUnorderedAccessClear(std::forward<decltype(resolved)>(resolved)); });
-        }
-    RenderPassBuilder WithCopyDest(const IResourceResolver& r)&& {
-		return std::move(*this).WithResolverDeclaration(r, [&](auto&& resolved) { addCopyDest(std::forward<decltype(resolved)>(resolved)); });
-    }
-    RenderPassBuilder WithCopySource(const IResourceResolver& r)&& {
-		return std::move(*this).WithResolverDeclaration(r, [&](auto&& resolved) { addCopySource(std::forward<decltype(resolved)>(resolved)); });
-    }
-    RenderPassBuilder WithIndirectArguments(const IResourceResolver& r)&& {
-		return std::move(*this).WithResolverDeclaration(r, [&](auto&& resolved) { addIndirectArguments(std::forward<decltype(resolved)>(resolved)); });
-    }
-    RenderPassBuilder WithLegacyInterop(const IResourceResolver& r)&& {
-        return std::move(*this).WithResolverDeclaration(r, [&](auto&& resolved) { addLegacyInterop(std::forward<decltype(resolved)>(resolved)); });
-	}
 
 	RenderPassBuilder& IsGeometryPass()& {
 		m_isGeometryPass = true;
@@ -1745,7 +1184,10 @@ public:
 
 private:
     std::shared_ptr<ResourceUseLayout> resourceUses_ = std::make_shared<ResourceUseLayout>();
-    template<class T> void RegisterUseViews(const T&, const ResourceUseSpecification&) {}
+    template<class T> void RegisterUseViews(const T& resource, const ResourceUseSpecification& specification) {
+        if constexpr (detail::StringLike<T>)
+            RegisterUseViews(ResourceIdentifier{std::string_view{resource}}, specification);
+    }
     void RegisterUseViews(const ResourceIdentifier& identifier, const ResourceUseSpecification& specification) {
         for (const auto view : specification.views) {
             if (view.kind != BindlessViewKind::ShaderResource && view.kind != BindlessViewKind::UnorderedAccess
@@ -2263,93 +1705,60 @@ class ComputePassBuilder : public IPassBuilder {
 public:
     PassBuilderKind Kind() const noexcept override { return PassBuilderKind::Compute; }
     IResourceProvider* ResourceProvider() noexcept override { return pass.get(); }
-    // Legacy compute passes do not produce frozen preparation packets. Expose
-    // the same access vocabulary while retaining their existing descriptor path.
-    template<class... Args> void ShaderResource(Args&&... args) { (WithShaderResource(std::forward<Args>(args)), ...); }
-    template<class... Args> void UnorderedAccess(Args&&... args) { (WithUnorderedAccess(std::forward<Args>(args)), ...); }
-    template<class... Args> void ConstantBuffer(Args&&... args) { (WithConstantBuffer(std::forward<Args>(args)), ...); }
-    template<class... Args> void IndirectArguments(Args&&... args) { (WithIndirectArguments(std::forward<Args>(args)), ...); }
-    // Typed declaration entry points mirror RenderPassBuilder.  Prepared
-    // packets retain these stable declaration slots and resolve the admitted
-    // backing at record time; they must not capture a buffer's current native
-    // handle during preparation.
-    template<class ResourceT>
-        requires std::derived_from<ResourceT, Resource>
-    ResourceBindingToken BindShaderResource(const std::shared_ptr<ResourceT>& resource) {
-        if (!resource) throw std::invalid_argument("Cannot bind an empty shader resource");
-        addShaderResource(resource);
-        return { resource->GetSchedulingResourceID(), graph->RequestResourceHandle(resource.get()).GetGlobalResourceID() };
-    }
-
-    template<class ResourceT>
-        requires std::derived_from<ResourceT, Resource>
-    ResourceBindingToken BindUnorderedAccess(const std::shared_ptr<ResourceT>& resource) {
-        if (!resource) throw std::invalid_argument("Cannot bind an empty unordered-access resource");
-        addUnorderedAccess(resource);
-        return { resource->GetSchedulingResourceID(), graph->RequestResourceHandle(resource.get()).GetGlobalResourceID() };
-    }
-
-    template<class ResourceT>
-        requires std::derived_from<ResourceT, Resource>
-    ResourceBindingToken BindIndirectArguments(const std::shared_ptr<ResourceT>& resource) {
-        if (!resource) throw std::invalid_argument("Cannot bind an empty indirect-argument resource");
-        addIndirectArguments(resource);
-        return { resource->GetSchedulingResourceID(), graph->RequestResourceHandle(resource.get()).GetGlobalResourceID() };
-    }
     // Variadic entry points
 
     //First set, callable on Lvalues
     template<typename... Args>
         requires ((NotIResourceResolver<Args>) && ...)
-    ComputePassBuilder& WithShaderResource(Args&&... args) & {
+    ComputePassBuilder& ShaderResource(Args&&... args) & {
         (addShaderResource(std::forward<Args>(args)), ...);
         return *this;
     }
 
     template<typename... Args>
         requires ((NotIResourceResolver<Args>) && ...)
-    ComputePassBuilder& WithConstantBuffer(Args&&... args) & {
+    ComputePassBuilder& ConstantBuffer(Args&&... args) & {
         (addConstantBuffer(std::forward<Args>(args)), ...);
         return *this;
     }
 
     template<typename... Args>
         requires ((NotIResourceResolver<Args>) && ...)
-    ComputePassBuilder& WithUnorderedAccess(Args&&... args) & {
+    ComputePassBuilder& UnorderedAccess(Args&&... args) & {
         (addUnorderedAccess(std::forward<Args>(args)), ...);
         return *this;
     }
 
     template<typename... Args>
         requires ((NotIResourceResolver<Args>) && ...)
-    ComputePassBuilder& WithUnorderedAccessClear(Args&&... args) & {
+    ComputePassBuilder& UnorderedAccessClear(Args&&... args) & {
         (addUnorderedAccessClear(std::forward<Args>(args)), ...);
         return *this;
     }
 
     template<typename... Args>
         requires ((NotIResourceResolver<Args>) && ...)
-    ComputePassBuilder& WithIndirectArguments(Args&&... args) & {
+    ComputePassBuilder& IndirectArguments(Args&&... args) & {
         (addIndirectArguments(std::forward<Args>(args)), ...);
         return *this;
     }
 
     template<typename... Args>
         requires ((NotIResourceResolver<Args>) && ...)
-    ComputePassBuilder& WithLegacyInterop(Args&&... args)& {
+    ComputePassBuilder& LegacyInterop(Args&&... args)& {
         (addLegacyInterop(std::forward<Args>(args)), ...);
         return *this;
     }
 
     template<typename T>
         requires ResourceLike<T>
-    ComputePassBuilder& WithInternalTransition(T&& resource, ResourceState exitState)& {
+    ComputePassBuilder& InternalTransition(T&& resource, ResourceState exitState)& {
         addInternalTransition(std::forward<T>(resource), exitState);
         return *this;
     }
 
     template<typename... Args>
-    ComputePassBuilder& WithActiveFeatureDomain(Args&&... args) & {
+    ComputePassBuilder& ActiveFeatureDomain(Args&&... args) & {
         (addActiveFeatureDomain(std::forward<Args>(args)), ...);
         return *this;
     }
@@ -2357,61 +1766,62 @@ public:
     // Second set, callable on temporaries
     template<typename... Args>
         requires ((NotIResourceResolver<Args>) && ...)
-    ComputePassBuilder WithShaderResource(Args&&... args) && {
+    ComputePassBuilder ShaderResource(Args&&... args) && {
         (addShaderResource(std::forward<Args>(args)), ...);
         return std::move(*this);
     }
 
     template<typename... Args>
         requires ((NotIResourceResolver<Args>) && ...)
-    ComputePassBuilder WithConstantBuffer(Args&&... args) && {
+    ComputePassBuilder ConstantBuffer(Args&&... args) && {
         (addConstantBuffer(std::forward<Args>(args)), ...);
         return std::move(*this);
     }
 
     template<typename... Args>
         requires ((NotIResourceResolver<Args>) && ...)
-    ComputePassBuilder WithUnorderedAccess(Args&&... args) && {
+    ComputePassBuilder UnorderedAccess(Args&&... args) && {
         (addUnorderedAccess(std::forward<Args>(args)), ...);
         return std::move(*this);
     }
 
     template<typename... Args>
         requires ((NotIResourceResolver<Args>) && ...)
-    ComputePassBuilder WithUnorderedAccessClear(Args&&... args) && {
+    ComputePassBuilder UnorderedAccessClear(Args&&... args) && {
         (addUnorderedAccessClear(std::forward<Args>(args)), ...);
         return std::move(*this);
     }
 
     template<typename... Args>
         requires ((NotIResourceResolver<Args>) && ...)
-    ComputePassBuilder WithIndirectArguments(Args&&... args) && {
+    ComputePassBuilder IndirectArguments(Args&&... args) && {
         (addIndirectArguments(std::forward<Args>(args)), ...);
         return std::move(*this);
     }
 
     template<typename... Args>
         requires ((NotIResourceResolver<Args>) && ...)
-    ComputePassBuilder WithLegacyInterop(Args&&... args)&& {
+    ComputePassBuilder LegacyInterop(Args&&... args)&& {
         (addLegacyInterop(std::forward<Args>(args)), ...);
         return std::move(*this);
     }
 
     template<typename T>
         requires ResourceLike<T>
-    ComputePassBuilder WithInternalTransition(T&& resource, ResourceState exitState)&& {
+    ComputePassBuilder InternalTransition(T&& resource, ResourceState exitState)&& {
         addInternalTransition(std::forward<T>(resource), exitState);
         return std::move(*this);
     }
 
     template<typename... Args>
-    ComputePassBuilder WithActiveFeatureDomain(Args&&... args) && {
+    ComputePassBuilder ActiveFeatureDomain(Args&&... args) && {
         (addActiveFeatureDomain(std::forward<Args>(args)), ...);
         return std::move(*this);
     }
 
+private:
     template<typename AddCallable>
-    ComputePassBuilder& WithResolverDeclaration(const IResourceResolver& resolver, AddCallable&& addCallable) & {
+    ComputePassBuilder& DeclareResolverAccess(const IResourceResolver& resolver, AddCallable&& addCallable) & {
         const auto state = graph->CaptureResolverDeclarationState(resolver);
         if (state && state->resources) {
             addCallable(ResourceResolverAndRange{resolver});
@@ -2424,7 +1834,7 @@ public:
     }
 
     template<typename AddCallable>
-    ComputePassBuilder WithResolverDeclaration(const IResourceResolver& resolver, AddCallable&& addCallable) && {
+    ComputePassBuilder DeclareResolverAccess(const IResourceResolver& resolver, AddCallable&& addCallable) && {
         const auto state = graph->CaptureResolverDeclarationState(resolver);
         if (state && state->resources) {
             addCallable(ResourceResolverAndRange{resolver});
@@ -2436,6 +1846,7 @@ public:
         return std::move(*this);
     }
 
+public:
         std::vector<ResolverSnapshot> TakeResolverSnapshots() { return std::move(resolverSnapshots_); }
 
         ComputePassBuilder& PreferQueue(QueueKind kind) & {
@@ -2502,53 +1913,53 @@ public:
 		ComputePassBuilder WithExternalWaitBindingBeforeTransitions(ExternalTimelineBinding binding) && { params.externalWaitBindingsBeforeTransitions.push_back(binding); return std::move(*this); }
 
         // LVALUE overloads for IResourceResolver
-        ComputePassBuilder& WithShaderResource(const IResourceResolver& r)& {
-		return WithResolverDeclaration(r, [&](auto&& resolved) { addShaderResource(std::forward<decltype(resolved)>(resolved)); });
+        ComputePassBuilder& ShaderResource(const IResourceResolver& r)& {
+		return DeclareResolverAccess(r, [&](auto&& resolved) { addShaderResource(std::forward<decltype(resolved)>(resolved)); });
         }
 
-        ComputePassBuilder& WithConstantBuffer(const IResourceResolver& r)& {
-		return WithResolverDeclaration(r, [&](auto&& resolved) { addConstantBuffer(std::forward<decltype(resolved)>(resolved)); });
+        ComputePassBuilder& ConstantBuffer(const IResourceResolver& r)& {
+		return DeclareResolverAccess(r, [&](auto&& resolved) { addConstantBuffer(std::forward<decltype(resolved)>(resolved)); });
         }
 
-        ComputePassBuilder& WithUnorderedAccess(const IResourceResolver& r)& {
-		return WithResolverDeclaration(r, [&](auto&& resolved) { addUnorderedAccess(std::forward<decltype(resolved)>(resolved)); });
+        ComputePassBuilder& UnorderedAccess(const IResourceResolver& r)& {
+		return DeclareResolverAccess(r, [&](auto&& resolved) { addUnorderedAccess(std::forward<decltype(resolved)>(resolved)); });
         }
 
-        ComputePassBuilder& WithUnorderedAccessClear(const IResourceResolver& r)& {
-		return WithResolverDeclaration(r, [&](auto&& resolved) { addUnorderedAccessClear(std::forward<decltype(resolved)>(resolved)); });
+        ComputePassBuilder& UnorderedAccessClear(const IResourceResolver& r)& {
+		return DeclareResolverAccess(r, [&](auto&& resolved) { addUnorderedAccessClear(std::forward<decltype(resolved)>(resolved)); });
         }
 
-        ComputePassBuilder& WithIndirectArguments(const IResourceResolver& r)& {
-		return WithResolverDeclaration(r, [&](auto&& resolved) { addIndirectArguments(std::forward<decltype(resolved)>(resolved)); });
+        ComputePassBuilder& IndirectArguments(const IResourceResolver& r)& {
+		return DeclareResolverAccess(r, [&](auto&& resolved) { addIndirectArguments(std::forward<decltype(resolved)>(resolved)); });
         }
 
-        ComputePassBuilder& WithLegacyInterop(const IResourceResolver& r)& {
-		return WithResolverDeclaration(r, [&](auto&& resolved) { addLegacyInterop(std::forward<decltype(resolved)>(resolved)); });
+        ComputePassBuilder& LegacyInterop(const IResourceResolver& r)& {
+		return DeclareResolverAccess(r, [&](auto&& resolved) { addLegacyInterop(std::forward<decltype(resolved)>(resolved)); });
         }
 
         // RVALUE overloads for IResourceResolver
-        ComputePassBuilder WithShaderResource(const IResourceResolver& r)&& {
-		return std::move(*this).WithResolverDeclaration(r, [&](auto&& resolved) { addShaderResource(std::forward<decltype(resolved)>(resolved)); });
+        ComputePassBuilder ShaderResource(const IResourceResolver& r)&& {
+		return std::move(*this).DeclareResolverAccess(r, [&](auto&& resolved) { addShaderResource(std::forward<decltype(resolved)>(resolved)); });
         }
 
-        ComputePassBuilder WithConstantBuffer(const IResourceResolver& r)&& {
-		return std::move(*this).WithResolverDeclaration(r, [&](auto&& resolved) { addConstantBuffer(std::forward<decltype(resolved)>(resolved)); });
+        ComputePassBuilder ConstantBuffer(const IResourceResolver& r)&& {
+		return std::move(*this).DeclareResolverAccess(r, [&](auto&& resolved) { addConstantBuffer(std::forward<decltype(resolved)>(resolved)); });
         }
 
-        ComputePassBuilder WithUnorderedAccess(const IResourceResolver& r)&& {
-		return std::move(*this).WithResolverDeclaration(r, [&](auto&& resolved) { addUnorderedAccess(std::forward<decltype(resolved)>(resolved)); });
+        ComputePassBuilder UnorderedAccess(const IResourceResolver& r)&& {
+		return std::move(*this).DeclareResolverAccess(r, [&](auto&& resolved) { addUnorderedAccess(std::forward<decltype(resolved)>(resolved)); });
         }
 
-        ComputePassBuilder WithUnorderedAccessClear(const IResourceResolver& r)&& {
-		return std::move(*this).WithResolverDeclaration(r, [&](auto&& resolved) { addUnorderedAccessClear(std::forward<decltype(resolved)>(resolved)); });
+        ComputePassBuilder UnorderedAccessClear(const IResourceResolver& r)&& {
+		return std::move(*this).DeclareResolverAccess(r, [&](auto&& resolved) { addUnorderedAccessClear(std::forward<decltype(resolved)>(resolved)); });
         }
 
-        ComputePassBuilder WithIndirectArguments(const IResourceResolver& r)&& {
-		return std::move(*this).WithResolverDeclaration(r, [&](auto&& resolved) { addIndirectArguments(std::forward<decltype(resolved)>(resolved)); });
+        ComputePassBuilder IndirectArguments(const IResourceResolver& r)&& {
+		return std::move(*this).DeclareResolverAccess(r, [&](auto&& resolved) { addIndirectArguments(std::forward<decltype(resolved)>(resolved)); });
         }
 
-        ComputePassBuilder WithLegacyInterop(const IResourceResolver& r)&& {
-		return std::move(*this).WithResolverDeclaration(r, [&](auto&& resolved) { addLegacyInterop(std::forward<decltype(resolved)>(resolved)); });
+        ComputePassBuilder LegacyInterop(const IResourceResolver& r)&& {
+		return std::move(*this).DeclareResolverAccess(r, [&](auto&& resolved) { addLegacyInterop(std::forward<decltype(resolved)>(resolved)); });
         }
 
     auto const& DeclaredResourceIds() const { return _declaredIds; }
@@ -2844,48 +2255,49 @@ public:
 
     template<typename... Args>
         requires ((NotIResourceResolver<Args>) && ...)
-    CopyPassBuilder& WithCopyDest(Args&&... args) & {
+    CopyPassBuilder& CopyDestination(Args&&... args) & {
         (addCopyDest(std::forward<Args>(args)), ...);
         return *this;
     }
 
     template<typename... Args>
         requires ((NotIResourceResolver<Args>) && ...)
-    CopyPassBuilder& WithCopySource(Args&&... args) & {
+    CopyPassBuilder& CopySource(Args&&... args) & {
         (addCopySource(std::forward<Args>(args)), ...);
         return *this;
     }
 
     template<typename T>
         requires ResourceLike<T>
-    CopyPassBuilder& WithInternalTransition(T&& resource, ResourceState exitState)& {
+    CopyPassBuilder& InternalTransition(T&& resource, ResourceState exitState)& {
         addInternalTransition(std::forward<T>(resource), exitState);
         return *this;
     }
 
     template<typename... Args>
         requires ((NotIResourceResolver<Args>) && ...)
-    CopyPassBuilder WithCopyDest(Args&&... args) && {
+    CopyPassBuilder CopyDestination(Args&&... args) && {
         (addCopyDest(std::forward<Args>(args)), ...);
         return std::move(*this);
     }
 
     template<typename... Args>
         requires ((NotIResourceResolver<Args>) && ...)
-    CopyPassBuilder WithCopySource(Args&&... args) && {
+    CopyPassBuilder CopySource(Args&&... args) && {
         (addCopySource(std::forward<Args>(args)), ...);
         return std::move(*this);
     }
 
     template<typename T>
         requires ResourceLike<T>
-    CopyPassBuilder WithInternalTransition(T&& resource, ResourceState exitState)&& {
+    CopyPassBuilder InternalTransition(T&& resource, ResourceState exitState)&& {
         addInternalTransition(std::forward<T>(resource), exitState);
         return std::move(*this);
     }
 
+private:
     template<typename AddCallable>
-    CopyPassBuilder& WithResolverDeclaration(const IResourceResolver& resolver, AddCallable&& addCallable) & {
+    CopyPassBuilder& DeclareResolverAccess(const IResourceResolver& resolver, AddCallable&& addCallable) & {
         const auto state = graph->CaptureResolverDeclarationState(resolver);
         if (state && state->resources) {
             addCallable(ResourceResolverAndRange{resolver});
@@ -2898,7 +2310,7 @@ public:
     }
 
     template<typename AddCallable>
-    CopyPassBuilder WithResolverDeclaration(const IResourceResolver& resolver, AddCallable&& addCallable) && {
+    CopyPassBuilder DeclareResolverAccess(const IResourceResolver& resolver, AddCallable&& addCallable) && {
         const auto state = graph->CaptureResolverDeclarationState(resolver);
         if (state && state->resources) {
             addCallable(ResourceResolverAndRange{resolver});
@@ -2910,6 +2322,7 @@ public:
         return std::move(*this);
     }
 
+public:
     std::vector<ResolverSnapshot> TakeResolverSnapshots() { return std::move(resolverSnapshots_); }
 
     CopyPassBuilder& PreferQueue(QueueKind kind) & {
@@ -2975,20 +2388,20 @@ public:
 	CopyPassBuilder& WithExternalWaitBindingBeforeTransitions(ExternalTimelineBinding binding) & { params.externalWaitBindingsBeforeTransitions.push_back(binding); return *this; }
 	CopyPassBuilder WithExternalWaitBindingBeforeTransitions(ExternalTimelineBinding binding) && { params.externalWaitBindingsBeforeTransitions.push_back(binding); return std::move(*this); }
 
-    CopyPassBuilder& WithCopyDest(const IResourceResolver& r)& {
-        return WithResolverDeclaration(r, [&](auto&& resolved) { addCopyDest(std::forward<decltype(resolved)>(resolved)); });
+    CopyPassBuilder& CopyDestination(const IResourceResolver& r)& {
+        return DeclareResolverAccess(r, [&](auto&& resolved) { addCopyDest(std::forward<decltype(resolved)>(resolved)); });
     }
 
-    CopyPassBuilder& WithCopySource(const IResourceResolver& r)& {
-        return WithResolverDeclaration(r, [&](auto&& resolved) { addCopySource(std::forward<decltype(resolved)>(resolved)); });
+    CopyPassBuilder& CopySource(const IResourceResolver& r)& {
+        return DeclareResolverAccess(r, [&](auto&& resolved) { addCopySource(std::forward<decltype(resolved)>(resolved)); });
     }
 
-    CopyPassBuilder WithCopyDest(const IResourceResolver& r)&& {
-        return std::move(*this).WithResolverDeclaration(r, [&](auto&& resolved) { addCopyDest(std::forward<decltype(resolved)>(resolved)); });
+    CopyPassBuilder CopyDestination(const IResourceResolver& r)&& {
+        return std::move(*this).DeclareResolverAccess(r, [&](auto&& resolved) { addCopyDest(std::forward<decltype(resolved)>(resolved)); });
     }
 
-    CopyPassBuilder WithCopySource(const IResourceResolver& r)&& {
-        return std::move(*this).WithResolverDeclaration(r, [&](auto&& resolved) { addCopySource(std::forward<decltype(resolved)>(resolved)); });
+    CopyPassBuilder CopySource(const IResourceResolver& r)&& {
+        return std::move(*this).DeclareResolverAccess(r, [&](auto&& resolved) { addCopySource(std::forward<decltype(resolved)>(resolved)); });
     }
 
     auto const& DeclaredResourceIds() const { return _declaredIds; }

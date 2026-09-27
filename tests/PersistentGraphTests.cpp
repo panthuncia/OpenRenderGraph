@@ -1209,8 +1209,7 @@ int main() {
         const auto descriptorToken = edit.DeclareView(token,{});
         auto held = edit.Build(workspace,cancelled);
         CHECK(views.Install(edit,held));
-        CHECK(held->ResolveView(token,{}).index == 7);
-        CHECK(held->ResolveView(descriptorToken).index == 7);
+        CHECK(held->Resolve(descriptorToken).index == 7);
         auto shared = views.BeginEdit();
         const auto otherPass = shared.AddPass({});
         const auto otherBinding = shared.Declare(otherPass,resource,{}, {2,0,1,false});
@@ -1221,8 +1220,8 @@ int main() {
         removeOne.RemovePass(pass);
         auto remaining = removeOne.Build(workspace,cancelled);
         CHECK(remaining->bindings.At(resource).preparedViews->size() == 1);
-        CHECK(remaining->ResolveView(otherView).index == 7);
-        CHECK(sharedReady->ResolveView(descriptorToken).index == 7);
+        CHECK(remaining->Resolve(otherView).index == 7);
+        CHECK(sharedReady->Resolve(descriptorToken).index == 7);
         GraphEditTransaction removeLast(remaining);
         removeLast.RemovePass(otherPass);
         auto noConsumers = removeLast.Build(workspace,cancelled);
@@ -1238,9 +1237,8 @@ int main() {
         rotation.ReplaceBinding(resource,std::move(next));
         auto selected = rotation.Build(workspace,cancelled);
         CHECK(selected->executable == held->executable);
-        CHECK(selected->ResolveView(token,{}).index == 11 && held->ResolveView(token,{}).index == 7);
-        CHECK(selected->ResolveView(descriptorToken).index == 11 && held->ResolveView(descriptorToken).index == 7);
-        CHECK(Rejects([&] { held->ResolveView(ViewToken{}); }));
+        CHECK(selected->Resolve(descriptorToken).index == 11 && held->Resolve(descriptorToken).index == 7);
+        CHECK(Rejects([&] { held->Resolve(ViewToken{}); }));
         auto badBounds = views.BeginEdit();
         CHECK(Rejects([&] { badBounds.DeclareView(token,{org::BindlessViewKind::ShaderResource,UINT32_MAX,1,0}); }));
         auto badHeap = views.BeginEdit();
@@ -1256,9 +1254,8 @@ int main() {
         auto competingB = views.BeginEdit();
         const auto alternateView = competingB.DeclareView(token,{});
         auto readyB = competingB.Build(workspace,cancelled);
-        CHECK(readyA->ResolveView(pendingView).index == 7 && readyB->ResolveView(alternateView).index == 7);
-        CHECK(Rejects([&] { readyB->ResolveView(pendingView); }));
-        CHECK(Rejects([&] { selected->ResolveView(token,{org::BindlessViewKind::UnorderedAccess}); }));
+        CHECK(readyA->Resolve(pendingView).index == 7 && readyB->Resolve(alternateView).index == 7);
+        CHECK(Rejects([&] { readyB->Resolve(pendingView); }));
         auto unowned = views.BeginEdit();
         auto invalid = held->bindings.At(resource);
         auto invalidSnapshot = std::make_shared<org::ResourceBindingSnapshot>(*invalid.recording);
@@ -1278,13 +1275,12 @@ int main() {
         CHECK(changed->logical->bindingSubscribers[resource.index].empty());
         CHECK(!changed->bindings.At(resource).preparedViews);
         CHECK(held->bindings.At(resource).preparedViews);
-        CHECK(Rejects([&] { changed->ResolveView(token,{}); }));
-        CHECK(Rejects([&] { changed->ResolveView(descriptorToken); }));
+        CHECK(Rejects([&] { changed->Resolve(descriptorToken); }));
         auto retirement = views.BeginEdit();
         retirement.RemovePass(pass);
         auto retired = retirement.Build(workspace,cancelled);
         CHECK(!retired->bindings.At(resource).preparedViews);
-        CHECK(held->ResolveView(descriptorToken).index == 7);
+        CHECK(held->Resolve(descriptorToken).index == 7);
     }
     {
         GraphProgram postconditions;
@@ -1327,7 +1323,7 @@ int main() {
         auto held = bootstrap.Build(workspace,cancelled);
         CHECK(typed.Install(bootstrap,held));
         CHECK(held->Resolve(token).identity == 1001);
-        CHECK(Rejects([&] { held->Resolve({}); }));
+        CHECK(Rejects([&] { held->Resolve(BindingToken{}); }));
         auto backing = typed.BeginEdit();
         backing.ReplaceBinding(a,Binding(1003));
         auto rotated = backing.Build(workspace,cancelled);

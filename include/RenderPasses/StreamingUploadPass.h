@@ -48,9 +48,10 @@ public:
         const auto& inputs = Inputs<StreamingUploadInputs>();
         for (const auto& upload : inputs.uploads) {
             if (!upload.dstResource || !upload.srcUploadBuffer || !upload.size) continue;
-            builder.WithCopyDest(upload.dstResource).WithCopySource(upload.srcUploadBuffer);
+            builder.CopyDestination(upload.dstResource);
+            builder.CopySource(upload.srcUploadBuffer);
         }
-        if (inputs.poolResolver) builder.WithCopyDest(*inputs.poolResolver);
+        if (inputs.poolResolver) builder.CopyDestination(*inputs.poolResolver);
         builder.PreferQueue(QueueKind::Copy);
     }
     StreamingUploadFrameData Prepare(const PassPrepareContext& preparation) {

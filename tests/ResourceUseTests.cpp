@@ -103,7 +103,7 @@ int main() {
     std::atomic_bool cancelled{false};
     const auto held = edit.Build(workspace, cancelled);
     CHECK(held && program.Install(edit, held));
-    CHECK(held->ResolveView(view).index == 8);
+    CHECK(held->Resolve(view).index == 8);
     CHECK(held->logical->declarations.passes[pass.index].accesses.empty());
     auto join = program.BeginEdit();
     auto unavailable = version;
@@ -117,7 +117,7 @@ int main() {
     version.recording = replacement; ++version.descriptorRevision;
     rotation.ReplaceBinding(slot, version);
     const auto selected = rotation.Build(workspace, cancelled);
-    CHECK(selected->ResolveView(view).index == 20 && held->ResolveView(view).index == 8);
+    CHECK(selected->Resolve(view).index == 20 && held->Resolve(view).index == 8);
     auto missing = program.BeginEdit();
     replacement = std::make_shared<ResourceBindingSnapshot>(*snapshot);
     replacement->views = std::make_shared<BindlessResourceViews>(); version.recording = replacement;

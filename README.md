@@ -153,7 +153,7 @@ public:
 
 	void DeclareResourceUsages(ComputePassBuilder* builder) override {
 		const auto& in = Inputs<ClearCounterInputs>();
-		builder->WithUnorderedAccess(in.counter);
+		builder->UnorderedAccess(in.counter);
 	}
 
 	void Setup() override {}

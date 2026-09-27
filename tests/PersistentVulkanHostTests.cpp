@@ -212,7 +212,7 @@ struct ComputeProgram {
 	rhi::PipelinePtr pipeline;
 };
 
-struct WriteBindings { org::ResourceBindingToken input, target; };
+struct WriteBindings { org::DeclaredViewToken input, target; };
 struct WriteFrame {
 	std::shared_ptr<const ComputeProgram> program;
 	uint32_t inputIndex = 0;
@@ -226,11 +226,11 @@ public:
 		: m_input(std::move(input)), m_target(std::move(target)), m_program(std::move(program)) {}
 	WriteBindings Declare(org::PassBuilder& builder) {
 		builder.PreferQueue(org::QueueKind::Graphics);
-		return {builder.BindShaderResource(m_input), builder.BindUnorderedAccess(m_target)};
+		return {builder.ShaderResource(m_input).View(), builder.UnorderedAccess(m_target).View()};
 	}
 	WriteFrame Prepare(const WriteBindings& bindings, const org::PassPrepareContext& preparation) const {
-		return {m_program, preparation.ResolveView(bindings.input, {org::BindlessViewKind::ShaderResource}).index,
-			preparation.ResolveView(bindings.target, {org::BindlessViewKind::UnorderedAccess}).index};
+		return {m_program, preparation.Resolve(bindings.input).index,
+			preparation.Resolve(bindings.target).index};
 	}
 	static void Record(const WriteBindings&, const WriteFrame& frame, org::PassRecordContext& recording) {
 		auto& commands = recording.Commands();
@@ -253,7 +253,7 @@ public:
 		: m_source(std::move(source)), m_destination(std::move(destination)) {}
 	CopyBindings Declare(org::PassBuilder& builder) {
 		builder.PreferQueue(org::QueueKind::Graphics);
-		return {builder.BindCopySource(m_source), builder.BindCopyDestination(m_destination)};
+		return {builder.CopySource(m_source), builder.CopyDestination(m_destination)};
 	}
 	static void Record(const CopyBindings& bindings, org::PassRecordContext& recording) {
 		recording.Commands().CopyBufferRegion(recording.Resolve(bindings.destination).GetHandle(), 0,

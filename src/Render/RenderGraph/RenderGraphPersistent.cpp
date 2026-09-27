@@ -1538,7 +1538,7 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 			pass.hostedPrepared = static_cast<bool>(pass.hosted);
 			passPreparation.resourceSlots = pass.slots;
             passPreparation.resolveDeclaredView = [&pass, selected](uint32_t use, uint32_t view) {
-                return selected->ResolveView(pass.declaredViews.at(use).at(view));
+                return selected->Resolve(pass.declaredViews.at(use).at(view));
             };
             passPreparation.resolveDeclaredResource = [&pass, selected](uint32_t use) {
                 return selected->ResolveNative(pass.declaredBindings.at(use));

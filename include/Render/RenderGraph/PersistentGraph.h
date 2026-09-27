@@ -186,8 +186,7 @@ public:
     bool HasEpochs() const noexcept { return executable && !executable->epochs.empty(); }
     const BindingVersion& Resolve(BindingToken token) const;
     rhi::Resource ResolveNative(BindingToken token) const;
-    rhi::DescriptorSlot ResolveView(BindingToken token, BindlessViewRequest view) const;
-    rhi::DescriptorSlot ResolveView(ViewToken token) const;
+    rhi::DescriptorSlot Resolve(ViewToken token) const;
     const uint64_t revision;
     const std::shared_ptr<const ExecutableGeneration> executable;
     const BindingTable bindings;
