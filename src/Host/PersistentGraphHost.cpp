@@ -1,5 +1,6 @@
 #include "OpenRenderGraph/PersistentGraphHost.h"
 
+#include <BasicTelemetry/Tracy.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -97,6 +98,7 @@ void PersistentGraphHost::SetGpuPassRangeCallbacks(RenderGraph::GpuPassRangeBegi
 }
 
 void PersistentGraphHost::Build() {
+	BT_ZONE_SCOPE("ORG.Host.Build");
 	DestroyGraph();
 	auto graph = std::make_unique<RenderGraph>(m_desc.device, m_desc.backend);
 	graph->SetTaskService(m_desc.tasks);
@@ -118,6 +120,7 @@ void PersistentGraphHost::Build() {
 }
 
 void PersistentGraphHost::ExecuteFrame(const IHostExecutionData* hostData, const FrameCallback& beforePrepare, uint32_t epoch) {
+	BT_ZONE_SCOPE("ORG.Host.ExecuteFrame");
 	if (m_async) throw std::logic_error("ExecuteFrame while async epochs run: the host's thread owns the graph (use SubmitEpoch)");
 	m_lastTimings = {};
 	auto lap = [last = std::chrono::steady_clock::now()](double& a_into) mutable {
@@ -132,7 +135,10 @@ void PersistentGraphHost::ExecuteFrame(const IHostExecutionData* hostData, const
 	// The slot's previous frame must be done on the GPU before the upload pages it used are recycled
 	// (and before this frame records uploads into the slot).
 	if (auto& completion = m_slotCompletions[slot]; completion.pending) {
-		for (const auto& [timeline, value] : completion.points) (void)timeline->HostWait(value);
+		{
+			BT_ZONE_SCOPE("ORG.Host.WaitSlotCompletion");
+			for (const auto& [timeline, value] : completion.points) (void)timeline->HostWait(value);
+		}
 		completion.pending = false;
 		// Nothing else completes a frame's statistics on this path: without it the pass timestamps were
 		// written and resolved every frame and never read, and their pending resolves only grew.
@@ -147,7 +153,10 @@ void PersistentGraphHost::ExecuteFrame(const IHostExecutionData* hostData, const
 	DescriptorHeapManager::GetInstance().ProcessDeferredReleases(static_cast<uint8_t>(slot));
 	lap(m_lastTimings.releaseUs);
 	m_graph->SetPersistentEpoch(epoch);
-	if (beforePrepare) beforePrepare(*m_graph);
+	if (beforePrepare) {
+		BT_ZONE_SCOPE("ORG.Host.CommitInputs");
+		beforePrepare(*m_graph);
+	}
 	lap(m_lastTimings.beforePrepareUs);
 	UpdateExecutionContext update{};
 	update.frameIndex = slot;
@@ -205,6 +214,9 @@ struct PersistentGraphHost::Async {
 	std::array<Message, kMailbox> mailbox;
 	std::atomic<uint64_t> written{0}, read{0};
 	std::atomic<uint32_t> wake{0};
+	// Ticket publication and terminal failure both advance this counter. A
+	// notify on an unchanged null shared_ptr cannot release atomic::wait(nullptr).
+	std::atomic<uint32_t> ticketWake{0};
 	std::atomic<bool> failed{false};
 	std::string error;  // written before failed is set
 	std::thread thread;
@@ -252,10 +264,12 @@ struct PersistentGraphHost::Async {
 		if (failed.load(std::memory_order_acquire)) throw std::runtime_error("Async epochs failed: " + error);
 	}
 	std::shared_ptr<Ticket> WaitTicket(uint32_t index) {
+		BT_ZONE_SCOPE("ORG.Host.WaitTicket");
 		for (;;) {
+			const auto seen = ticketWake.load(std::memory_order_acquire);
 			if (auto ticket = cells[index].exchange(nullptr, std::memory_order_acq_rel)) return ticket;
 			ThrowIfFailed();
-			cells[index].wait(nullptr, std::memory_order_acquire);
+			ticketWake.wait(seen, std::memory_order_acquire);
 		}
 	}
 };
@@ -369,12 +383,14 @@ void PersistentGraphHost::StartAsync() {
 			state->failed.store(true, std::memory_order_release);
 		}
 		// Wake a render thread waiting for a ticket, so it sees the failure.
-		for (uint32_t index = 0; index < state->epochs.size(); ++index) state->cells[index].notify_all();
+		state->ticketWake.fetch_add(1, std::memory_order_release);
+		state->ticketWake.notify_all();
 	});
 	m_async = std::move(async);
 }
 
 void PersistentGraphHost::PrepareTicket(Async& state, uint32_t epochIndex, int32_t requestedSlot) {
+	BT_ZONE_SCOPE("ORG.Host.PrepareTicket.Worker");
 	const uint32_t slotCount = static_cast<uint32_t>(state.slots.size());
 	uint32_t slot = 0;
 	if (requestedSlot >= 0) {
@@ -392,7 +408,10 @@ void PersistentGraphHost::PrepareTicket(Async& state, uint32_t epochIndex, int32
 	// The slot's previous execution must be done before its command lists, statistics range and latch region
 	// are reused: the wait happens here, on this thread, never on the render thread.
 	if (entry.pending) {
-		for (const auto& [timeline, value] : entry.points) (void)timeline->HostWait(value);
+		{
+			BT_ZONE_SCOPE("ORG.Host.WaitSlotCompletion.Worker");
+			for (const auto& [timeline, value] : entry.points) (void)timeline->HostWait(value);
+		}
 		entry.pending = false;
 		if (auto* stats = m_graph->GetStatisticsService()) {
 			rhi::Queue queue = m_desc.device.GetQueue(rhi::QueueKind::Graphics);
@@ -411,10 +430,12 @@ void PersistentGraphHost::PrepareTicket(Async& state, uint32_t epochIndex, int32
 	auto ticket = m_graph->PreparePersistentTicket(m_desc.device, state.epochs[epochIndex], static_cast<uint8_t>(slot), state.hostFrame++);
 	state.needsTicket[epochIndex] = 0;
 	state.cells[epochIndex].store(std::move(ticket), std::memory_order_release);
-	state.cells[epochIndex].notify_all();
+	state.ticketWake.fetch_add(1, std::memory_order_release);
+	state.ticketWake.notify_all();
 }
 
 void PersistentGraphHost::StopAsync() {
+	BT_ZONE_SCOPE("ORG.Host.StopAsync");
 	if (!m_async) return;
 	auto async = std::move(m_async);
 	Async::Message stop;
@@ -441,6 +462,7 @@ void PersistentGraphHost::StopAsync() {
 }
 
 void PersistentGraphHost::SubmitEpoch(uint32_t epoch, const FrameCallback& beforeSubmit) {
+	BT_ZONE_SCOPE("ORG.Host.SubmitEpoch");
 	m_lastTimings = {};
 	m_lastTimings.async = true;
 	auto lap = [last = std::chrono::steady_clock::now()](double& a_into) mutable {
@@ -466,14 +488,17 @@ void PersistentGraphHost::SubmitEpoch(uint32_t epoch, const FrameCallback& befor
 	lap(m_lastTimings.ticketWaitUs);
 	const uint32_t slot = RenderGraph::PersistentTicketSlot(*ticket);
 	m_asyncSlot = slot;
-	m_lastHostFrame = RenderGraph::PersistentTicketHostFrame(*ticket);
 	runtime::ScopedActiveGraphServices services(m_graph->GetUploadService(), m_graph->GetDescriptorService());
 	// The host's thread waited for this slot before preparing the ticket: its upload pages are free again.
 	if (auto* uploads = m_graph->GetUploadService()) uploads->ProcessDeferredReleases(static_cast<uint8_t>(slot));
 	lap(m_lastTimings.releaseUs);
-	if (beforeSubmit) beforeSubmit(*m_graph);
+	if (beforeSubmit) {
+		BT_ZONE_SCOPE("ORG.Host.CommitInputs");
+		beforeSubmit(*m_graph);
+	}
 	lap(m_lastTimings.beforePrepareUs);
 	if (!RenderGraph::PersistentTicketCurrent(*ticket)) {
+		BT_ZONE_SCOPE("ORG.Host.ReprepareStaleTicket");
 		// Prepared before beforeSubmit changed what a pass depends on: prepare it again, for the same slot (its
 		// latch region was just written), and wait. The new one is prepared after the change, so it is current.
 		++m_asyncStats.stale;
@@ -488,6 +513,9 @@ void PersistentGraphHost::SubmitEpoch(uint32_t epoch, const FrameCallback& befor
 		async.Post(std::move(prepare));
 		ticket = async.WaitTicket(index);
 	}
+	// The submitted ticket's frame: one prepared again above has a new number, and the completed-frame callback
+	// reports it by that one.
+	m_lastHostFrame = RenderGraph::PersistentTicketHostFrame(*ticket);
 	lap(m_lastTimings.checkUs);
 	// The uploads queued since the last submission, as plain copies ahead of the ticket (its first batch
 	// starts with a full barrier, so they need none of their own).
@@ -496,7 +524,10 @@ void PersistentGraphHost::SubmitEpoch(uint32_t epoch, const FrameCallback& befor
 	bool recorded = false;
 	auto commands = list.list.Get();
 	const bool supported = m_graph->RecordPendingUploads(m_desc.device, commands, static_cast<uint8_t>(slot), keepAlive, recorded);
-	list.list->End();
+	{
+		BT_ZONE_SCOPE("ORG.Host.CloseUploadList");
+		list.list->End();
+	}
 	if (!supported) {
 		Async::Message discard;
 		discard.kind = Async::Message::Kind::Discard;
@@ -508,6 +539,7 @@ void PersistentGraphHost::SubmitEpoch(uint32_t epoch, const FrameCallback& befor
 	submitted.kind = Async::Message::Kind::Submitted;
 	submitted.epochIndex = index;
 	if (recorded) {
+		BT_ZONE_SCOPE("ORG.Host.EnqueueUploads");
 		++m_asyncStats.uploads;
 		const auto value = ++async.queueValues.at(async.graphicsSlot);
 		const rhi::TimelinePoint signal{async.graphicsFence, value};

@@ -1,4 +1,5 @@
 #include "Managers/UploadInstance.h"
+#include <unordered_map>
 #include "Render/Runtime/StagedUploadBatch.h"
 
 #include <algorithm>
@@ -887,6 +888,8 @@ void UploadInstance::SetStagedUploadsRecordedDirectly(bool direct) {
 }
 
 size_t UploadInstance::RecordStagedUploads(rhi::CommandList& list, uint8_t frameIndex, bool afterCopies) {
+	BT_ZONE_SCOPE("ORG.Upload.RecordStagedUploads");
+	uint64_t bytes = 0;
 	NoteOffOwnerCall("RecordStagedUploads");
 	size_t copies = 0;
 	// Copies in one list are unordered without a barrier, and batches can overlap (a producer's batch whose
@@ -903,23 +906,26 @@ size_t UploadInstance::RecordStagedUploads(rhi::CommandList& list, uint8_t frame
 		rhi::ResourceHandle target;
 		uint64_t begin = 0, end = 0;
 	};
-	std::vector<Written> written;
+	// Index by backing, as in the scoped branch, without changing this host's barriers.
+	std::unordered_map<uint64_t, std::vector<Written>> written;
 	for (const auto& batch : m_directStaged) {
 		for (const auto& entry : batch->Entries()) {
 			if (entry.target.kind != UploadTarget::Kind::PinnedShared || !entry.target.pinned || !entry.page)
 				throw std::logic_error("Direct staged uploads need pointer targets");
 			const auto target = entry.target.pinned->GetAPIResource().GetHandle();
 			const uint64_t begin = entry.dstOffset, end = entry.dstOffset + entry.size;
-			const bool overlaps = std::ranges::any_of(written, [&](const Written& w) {
+			const uint64_t key = (uint64_t{target.generation} << 32) | target.index;
+			const bool overlaps = std::ranges::any_of(written[key], [&](const Written& w) {
 				return w.target.index == target.index && w.target.generation == target.generation && begin < w.end && w.begin < end;
 			});
 			if (overlaps) {
 				ordered();
 				written.clear();
 			}
-			written.push_back({target, begin, end});
+			written[key].push_back({target, begin, end});
 			list.CopyBufferRegion(target, entry.dstOffset, entry.page->GetAPIResource().GetHandle(), entry.pageOffset, entry.size);
 			++copies;
+			bytes += entry.size;
 		}
 	}
 	if (!m_directStaged.empty() && m_numFramesInFlight != 0) {
@@ -927,6 +933,9 @@ size_t UploadInstance::RecordStagedUploads(rhi::CommandList& list, uint8_t frame
 		retained.insert(retained.end(), std::make_move_iterator(m_directStaged.begin()), std::make_move_iterator(m_directStaged.end()));
 	}
 	m_directStaged.clear();
+	BT_ZONE_VALUE(copies);
+	BT_PLOT("ORG.Upload.StagedCopies", static_cast<int64_t>(copies));
+	BT_PLOT("ORG.Upload.StagedBytes", static_cast<int64_t>(bytes));
 	return copies;
 }
 
