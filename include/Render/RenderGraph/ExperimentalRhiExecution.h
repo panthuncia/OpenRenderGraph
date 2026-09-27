@@ -620,6 +620,8 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
     };
     // Validate all packets before consuming any pass. Empty legacy preparation
     // must be selected into a synchronous route by the preparation owner.
+    {
+    BT_ZONE_SCOPE("ORG.Execution.RecordOwned.Validate");
     for (const auto& recording : recordings) {
         if ((!recording.bindings && !recording.publication) || !recording.allocation || !recording.allocation->pair.allocator
             || !recording.allocation->pair.list || recording.passes.empty())
@@ -638,6 +640,7 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
         for (const auto& pass : recording.passes)
             if (!pass || pass.IsConsumed()) throw std::invalid_argument("Missing or consumed pass in owned recording batch");
     }
+    }
     auto ownership = std::make_shared<Ownership>(Ownership{std::move(runtimeOwner), std::move(recordings)});
     std::vector<rhi::CommandList> lists;
     std::vector<PreparedPass> submissionEffects;
@@ -645,6 +648,7 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
     lists.reserve(ownership->recordings.size());
     allocations.reserve(ownership->recordings.size());
     for (const auto& recording : ownership->recordings) {
+        BT_ZONE_SCOPE("ORG.Execution.RecordOwned.PacketEntries");
         lists.push_back(recording.allocation->pair.list.Get());
         allocations.push_back(recording.allocation);
         submissionEffects.insert(submissionEffects.end(), recording.passes.begin(), recording.passes.end());
@@ -656,6 +660,7 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
             allocations.clear();
         });
     for (const auto& recording : ownership->recordings) {
+        BT_ZONE_SCOPE("ORG.Execution.RecordOwned.List");
         auto context = recording.bindings
             ? RecordingContext(recording.allocation->pair.list.Get(), recording.bindings, recording.externalBindings)
             : RecordingContext::FromPersistentBindings(recording.allocation->pair.list.Get(),recording.publication);
@@ -667,6 +672,7 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
             bool open = false;
             TracyGpuZoneScope(rhi::CommandList& commandList, const rhi::Queue& queue, const char* name)
                 : commands(commandList) {
+                BT_ZONE_SCOPE("ORG.Execution.RecordOwned.TracyBegin");
                 const auto result = commands.BeginTracyGpuZone(queue, name);
                 open = result == rhi::Result::Ok;
                 if (open) basic_telemetry::AddCounter("ORG.TracyGpuZones.BeginAccepted");
@@ -678,6 +684,7 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
             ~TracyGpuZoneScope() { Close(); }
             void Close() noexcept {
                 if (!open) return;
+                BT_ZONE_SCOPE("ORG.Execution.RecordOwned.TracyEnd");
                 commands.EndTracyGpuZone();
                 open = false;
             }
@@ -707,12 +714,15 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
             context.Commands().Barriers(barriers);
         }
         for (size_t passIndex = 0; passIndex < recording.passes.size(); ++passIndex) {
+            BT_ZONE_SCOPE("ORG.Execution.RecordOwned.Pass");
             // A capture tool's region for the pass (PIX / VK_EXT_debug_utils), opened before the pass's entry
             // barriers so that a wait on the previous pass's output shows up inside the pass that needed it.
             // The legacy recorder labels its passes; without this, persistent graphs recorded none at all.
             const auto passLabel = recording.passes[passIndex].DebugName();
+            BT_ZONE_TEXT(passLabel.data(), passLabel.size());
             rhi::debug::Scope captureScope(context.Commands(), rhi::colors::Mint, passLabel.empty() ? "<unnamed>" : passLabel.data());
             if (!recording.barriersBeforePass.empty()) {
+                BT_ZONE_SCOPE("ORG.Execution.RecordOwned.BeforeBarriers");
                 const auto& before = recording.barriersBeforePass[passIndex];
                 if (!before.textures.empty() || !before.buffers.empty()) {
                     rhi::BarrierBatch barriers{};
@@ -743,7 +753,11 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
                 : std::chrono::steady_clock::time_point{};
             const auto* ranges = recording.gpuPassRanges.get();
             if (ranges) ranges->begin(context.Commands(), queue, ranges->queueName, debugName.empty() ? "<unnamed>" : debugName.data());
-            recording.passes[passIndex].Record(context);
+            {
+                BT_ZONE_SCOPE("ORG.Execution.RecordOwned.Record");
+                BT_ZONE_TEXT(passLabel.data(), passLabel.size());
+                recording.passes[passIndex].Record(context);
+            }
             if (ranges) ranges->end(context.Commands(), queue);
             if (statisticsIndex >= 0) {
                 statistics->cpuMilliseconds[passIndex] = std::chrono::duration<double, std::milli>(
@@ -753,6 +767,7 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
                         queue, context.Commands(), statistics->queries);
             }
             if (!recording.barriersAfterPass.empty()) {
+                BT_ZONE_SCOPE("ORG.Execution.RecordOwned.AfterBarriers");
                 const auto& after = recording.barriersAfterPass[passIndex];
                 if (!after.textures.empty() || !after.buffers.empty()) {
                     rhi::BarrierBatch barriers{};
@@ -771,7 +786,11 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
             barriers.globals = {&full, 1u};
             context.Commands().Barriers(barriers);
         }
-        if (context.Commands().EndChecked() != rhi::Result::Ok) {
+        const auto closeResult = [&] {
+            BT_ZONE_SCOPE("ORG.Execution.RecordOwned.EndChecked");
+            return context.Commands().EndChecked();
+        }();
+        if (closeResult != rhi::Result::Ok) {
             basic_telemetry::AddCounter("ORG.Execution.RecordingCloseFailures");
             std::string names;
             for (const auto& pass : recording.passes) {

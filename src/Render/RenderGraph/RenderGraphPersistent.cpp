@@ -3351,7 +3351,10 @@ bool RenderGraph::RecordPendingUploads(rhi::Device device, rhi::CommandList& lis
 	try {
 		ImmediateExecutionContext context{device, {org::imm::ImmediatePassKind::Copy, m_immediateDispatch,
 			&TicketUploadResolveById, &TicketUploadResolveByPtr, nullptr}, slot, nullptr};
-		immediate->RecordImmediateCommands(context);
+		{
+			BT_ZONE_SCOPE("ORG.Upload.DrainImmediateCommands");
+			immediate->RecordImmediateCommands(context);
+		}
 		auto effect = immediate->TakeOwnedImmediateSubmissionEffect();
 		auto frame = context.list.Finalize();
 		if (effect) return false;  // tracked uploads signal their completion: the synchronous path's job

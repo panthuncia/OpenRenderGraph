@@ -26,6 +26,8 @@
 #include "Resources/Buffers/Buffer.h"
 #include "Resources/ExternalBufferResource.h"
 #include "Render/Runtime/UploadServiceAccess.h"
+#include "Render/Runtime/IUploadService.h"
+#include "Render/Runtime/StagedUploadBatch.h"
 
 #include <atomic>
 #include <cstdio>
@@ -314,11 +316,12 @@ bool Matches(const HostBuffer& buffer, uint32_t value) {
 }
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+	const bool async = argc > 1 && std::strcmp(argv[1], "async") == 0;
 	HostDevice host;
 	if (const int created = CreateHostDevice(host); created != 0) {
 		std::puts(created == 77 ? "SKIP: no Vulkan device with VK_EXT_descriptor_heap" : "FAIL: host device");
-		return created == 77 ? 0 : 1;
+		return created == 77 ? 77 : 1;
 	}
 	HostBuffer first, second;
 	REQUIRE(CreateHostBuffer(host, first) && CreateHostBuffer(host, second), "host buffers");
@@ -342,7 +345,7 @@ int main() {
 		// pass, and drives persistent execution with the external queue boundary.
 		org::PersistentGraphHost host({.device = device.Get(), .backend = rhi::Backend::Vulkan,
 			.tasks = std::make_shared<org::runtime::ThreadPoolTaskService>(2),
-			.queueBoundary = {.entry = true, .exit = true}});
+			.queueBoundary = {.entry = true, .exit = true}, .epochOrder = {0}, .closedExecutions = async});
 		{
 			auto program = CreateProgram(device.Get());
 			REQUIRE(program, "compute program");
@@ -367,8 +370,20 @@ int main() {
 			// The value reaches the GPU through the graph's upload pass (persistent Pre segment).
 			const auto upload = [&](org::RenderGraph&) {
 				BUFFER_UPLOAD(&value, sizeof(value), org::runtime::UploadTarget::FromShared(input), 0);
+				if (async) {
+					// An abandoned payload followed by its replacement: the last overlapping write wins.
+					auto first = org::runtime::StagedUploadBatch::Create(256);
+					const auto wrong = value ^ 0x12345678u;
+					first->Stage(org::runtime::UploadTarget::FromShared(input), 0, &wrong, sizeof(wrong));
+					first->Stage(org::runtime::UploadTarget::FromShared(input), 4, &wrong, sizeof(wrong));
+					org::runtime::GetActiveUploadService()->SubmitStagedUploads(std::move(first));
+					auto replacement = org::runtime::StagedUploadBatch::Create(256);
+					replacement->Stage(org::runtime::UploadTarget::FromShared(input), 0, &value, sizeof(value));
+					org::runtime::GetActiveUploadService()->SubmitStagedUploads(std::move(replacement));
+				}
 			};
 			host.AddExtension("test.host", [&] { return std::make_unique<HostExtension>(input, scratch, output, program); });
+			if (async) host.SetAsyncEpochs({0});
 			for (uint32_t frame = 0; frame < 6; ++frame) {
 				if (frame == 3) {
 					// Rotate the host buffer: the next frame must write the second one.
@@ -376,7 +391,8 @@ int main() {
 				}
 				value = 1000u * (frame + 1);
 				const int locksBefore = counters.locks.load();
-				host.ExecuteFrame(nullptr, upload);
+				if (async) host.SubmitEpoch(0, upload);
+				else host.ExecuteFrame(nullptr, upload);
 				REQUIRE(counters.locks.load() > locksBefore, "Execute submitted the current frame before returning");
 				REQUIRE(device->WaitIdle() == rhi::Result::Ok, "wait for BasicRHI timelines");
 				const HostBuffer& expected = frame < 3 ? first : second;
@@ -394,7 +410,8 @@ int main() {
 			// A rebuild (e.g. on resize) retires the old graph and keeps rendering.
 			host.RequestRebuild();
 			value = 7000u;
-			host.ExecuteFrame(nullptr, upload);
+			if (async) host.SubmitEpoch(0, upload);
+			else host.ExecuteFrame(nullptr, upload);
 			REQUIRE(device->WaitIdle() == rhi::Result::Ok, "wait after rebuild");
 			REQUIRE(Matches(second, 7000u), "frame after rebuild");
 			host.DestroyGraph();
@@ -406,6 +423,6 @@ int main() {
 	DestroyHostBuffer(host, second);
 	vkDestroyDevice(host.device, nullptr);
 	vkDestroyInstance(host.instance, nullptr);
-	std::printf("PersistentVulkanHostTests: ok (locks=%d)\n", counters.locks.load());
+	std::printf("PersistentVulkanHostTests: ok (%s, locks=%d)\n", async ? "async" : "sync", counters.locks.load());
 	return 0;
 }
