@@ -36,7 +36,20 @@ std::byte* StagedUploadBatch::Stage(UploadTarget target, size_t dstOffset, size_
     auto& page = m_pages[m_current];
     const size_t offset = page.used;
     page.used += aligned;
-    m_entries.push_back({std::move(target), dstOffset, size, page.buffer, offset});
+    // Consecutive array/journal ranges are commonly staged one element at a time. Keep them as one copy when
+    // both source and destination are contiguous; this substantially reduces command-recording work without
+    // changing ordering or merging across the alignment padding between non-aligned writes.
+    if (!m_entries.empty()) {
+        auto& previous = m_entries.back();
+        if (previous.target == target && previous.page == page.buffer &&
+            previous.dstOffset + previous.size == dstOffset && previous.pageOffset + previous.size == offset) {
+            previous.size += size;
+        } else {
+            m_entries.push_back({std::move(target), dstOffset, size, page.buffer, offset});
+        }
+    } else {
+        m_entries.push_back({std::move(target), dstOffset, size, page.buffer, offset});
+    }
     m_bytes += size;
     return page.mapped + offset;
 }
