@@ -113,7 +113,6 @@ void PersistentGraphHost::Build() {
 	graph->SetPersistentClosedExecutions(m_desc.closedExecutions);
 	graph->SetPersistentExecutionEnabled(true);
 	graph->SetExternalQueueBoundary(m_desc.queueBoundary);
-	graph->SetBoundaryManifestRecorder(m_desc.boundaryManifestRecorder);
 	graph->Setup();
 	m_graph = std::move(graph);
 	m_graph->SetGpuPassRangeCallbacks(m_gpuPassRangeBegin, m_gpuPassRangeEnd);
