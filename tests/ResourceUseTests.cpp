@@ -69,10 +69,15 @@ int main() {
     CHECK(oldRows[1].b == 7 && oldRows[1].a == UINT32_MAX);
     rows[0].value = 23;
     CHECK(table.Resolve(old, rows)[0].value == 23 && table.SameLayout(table));
+    const auto compiledTable = table;
+    table = DeclaredTableLayout<Row>(2);
+    table.Field(0, &Row::a).Bind(foreign);
+    CHECK(compiledTable.Resolve(old, rows)[0].a == 7);
+    CHECK(Rejects([&] { table.Resolve(old, rows); }));
     DeclaredTableLayout<Row> remapped(2);
     remapped.Field(1, &Row::a).Bind(first);
-    CHECK(!table.SameLayout(remapped));
-    CHECK(Rejects([&] { table.Resolve(old, std::span<const Row>{}); }));
+    CHECK(!compiledTable.SameLayout(remapped));
+    CHECK(Rejects([&] { compiledTable.Resolve(old, std::span<const Row>{}); }));
 
     // Declare before materialization, then rotate owned descriptor snapshots.
     persistent::GraphProgram program;

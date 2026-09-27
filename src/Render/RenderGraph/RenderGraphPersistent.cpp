@@ -905,7 +905,20 @@ static void InstallMainPass(RenderGraph& graph, State& state, persistent::GraphE
                 if (entry.resourceID == use.binding.globalResourceID ||
                     (entry.resource && entry.resource->GetGlobalResourceID() == use.binding.registryResourceID)) { index = candidate; break; }
             }
-            if (index == UINT32_MAX) throw std::logic_error("Declared view has no lowered resource slot");
+            if (index == UINT32_MAX) for (const auto groupIndex : main.groups) {
+                for (const auto candidate : state.groups[groupIndex].memberEntries) {
+                    const auto& entry = state.entries[candidate];
+                    if (entry.resourceID == use.binding.globalResourceID ||
+                        (entry.resource && entry.resource->GetGlobalResourceID() == use.binding.registryResourceID)) {
+                        index = candidate;
+                        break;
+                    }
+                }
+                if (index != UINT32_MAX) break;
+            }
+            if (index == UINT32_MAX) throw std::logic_error("Declared view has no lowered resource slot: pass='"
+                + main.name + "' resource=" + std::to_string(use.binding.globalResourceID)
+                + " registry=" + std::to_string(use.binding.registryResourceID));
             auto token = tokens.find(index);
             if (token == tokens.end()) token = tokens.emplace(index,
                 edit.DeclareDependency(main.id, state.entries[index].slot, false)).first;

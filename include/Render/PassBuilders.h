@@ -1039,26 +1039,34 @@ public:
     template<class T> DeclaredResourceUse ConstantBuffer(const T& resource) {
         return DeclareResourceUse(resource, {rhi::ResourceAccessType::ConstantBuffer, {{BindlessViewKind::ConstantBuffer}}});
     }
+    template<class T> requires std::derived_from<T, IResourceResolver>
+    DeclaredResourceUse IndirectArguments(const T& resolver) {
+        return DeclareResourceUse(static_cast<const IResourceResolver&>(resolver), {rhi::ResourceAccessType::IndirectArgument, {}});
+    }
     template<class T> ResourceBindingToken IndirectArguments(const T& resource) {
         return DeclareResourceUse(resource, {rhi::ResourceAccessType::IndirectArgument, {}}).Resource();
     }
-    template<class T> DeclaredResourceUse RenderTarget(const T& resource) {
-        return DeclareResourceUse(resource, {rhi::ResourceAccessType::RenderTarget, {{BindlessViewKind::RenderTarget}}});
+    template<class T> DeclaredResourceUse RenderTarget(const T& resource, RtvView view = {}) {
+        return DeclareResourceUse(resource, {rhi::ResourceAccessType::RenderTarget, {view}});
     }
-    template<class T> DeclaredResourceUse RenderTargetClear(const T& resource) {
-        return DeclareResourceUse(resource, {rhi::ResourceAccessType::RenderTargetClear, {{BindlessViewKind::RenderTarget}}});
+    template<class T> DeclaredResourceUse RenderTargetClear(const T& resource, RtvView view = {}) {
+        return DeclareResourceUse(resource, {rhi::ResourceAccessType::RenderTargetClear, {view}});
     }
-    template<class T> DeclaredResourceUse DepthRead(const T& resource) {
-        return DeclareResourceUse(resource, {rhi::ResourceAccessType::DepthRead, {{BindlessViewKind::DepthStencil}}});
+    template<class T> DeclaredResourceUse DepthRead(const T& resource, DsvView view = {}) {
+        return DeclareResourceUse(resource, {rhi::ResourceAccessType::DepthRead, {view}});
     }
-    template<class T> DeclaredResourceUse DepthReadWrite(const T& resource) {
-        return DeclareResourceUse(resource, {rhi::ResourceAccessType::DepthReadWrite, {{BindlessViewKind::DepthStencil}}});
+    template<class T> DeclaredResourceUse DepthReadWrite(const T& resource, DsvView view = {}) {
+        return DeclareResourceUse(resource, {rhi::ResourceAccessType::DepthReadWrite, {view}});
     }
-    template<class T> DeclaredResourceUse DepthStencilClear(const T& resource) {
-        return DeclareResourceUse(resource, {rhi::ResourceAccessType::DepthStencilClear, {{BindlessViewKind::DepthStencil}}});
+    template<class T> DeclaredResourceUse DepthStencilClear(const T& resource, DsvView view = {}) {
+        return DeclareResourceUse(resource, {rhi::ResourceAccessType::DepthStencilClear, {view}});
     }
     template<class T> ResourceBindingToken CopySource(const T& resource) {
         return DeclareResourceUse(resource, {rhi::ResourceAccessType::CopySource, {}}).Resource();
+    }
+    template<class T> requires std::derived_from<T, IResourceResolver>
+    DeclaredResourceUse CopyDestination(const T& resolver) {
+        return DeclareResourceUse(static_cast<const IResourceResolver&>(resolver), {rhi::ResourceAccessType::CopyDest, {}});
     }
     template<class T> ResourceBindingToken CopyDestination(const T& resource) {
         return DeclareResourceUse(resource, {rhi::ResourceAccessType::CopyDest, {}}).Resource();
@@ -2255,6 +2263,12 @@ class ComputePassBuilder : public IPassBuilder {
 public:
     PassBuilderKind Kind() const noexcept override { return PassBuilderKind::Compute; }
     IResourceProvider* ResourceProvider() noexcept override { return pass.get(); }
+    // Legacy compute passes do not produce frozen preparation packets. Expose
+    // the same access vocabulary while retaining their existing descriptor path.
+    template<class... Args> void ShaderResource(Args&&... args) { (WithShaderResource(std::forward<Args>(args)), ...); }
+    template<class... Args> void UnorderedAccess(Args&&... args) { (WithUnorderedAccess(std::forward<Args>(args)), ...); }
+    template<class... Args> void ConstantBuffer(Args&&... args) { (WithConstantBuffer(std::forward<Args>(args)), ...); }
+    template<class... Args> void IndirectArguments(Args&&... args) { (WithIndirectArguments(std::forward<Args>(args)), ...); }
     // Typed declaration entry points mirror RenderPassBuilder.  Prepared
     // packets retain these stable declaration slots and resolve the admitted
     // backing at record time; they must not capture a buffer's current native

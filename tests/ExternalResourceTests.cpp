@@ -13,6 +13,7 @@
 #include <Render/Runtime/FrameWorkQueue.h>
 #include <Render/Runtime/ExternalSignalReservation.h>
 #include <Resources/TrackedAllocation.h>
+#include <Resources/PixelBuffer.h>
 #include <rhi_interop_dx12.h>
 #include <rhi_helpers.h>
 #include <directx/d3d12.h>
@@ -102,6 +103,20 @@ int TestUnifiedDeclarations(rhi::Device device, const std::shared_ptr<org::Resou
     CHECK(rejected);
     // Declaration does not touch descriptors: this fixture has no published SRV/UAV views.
     CHECK(builder.ResourceUses()->uses.size() == 3);
+    org::TextureDescription textureDesc{};
+    textureDesc.imageDimensions.push_back({64, 64, 0, 0});
+    textureDesc.format = rhi::Format::R16G16B16A16_Float;
+    textureDesc.generateMipMaps = true;
+    textureDesc.hasSRV = textureDesc.hasRTV = true;
+    auto texture = org::PixelBuffer::CreateSharedUnmaterialized(textureDesc);
+    CHECK(texture->GetMipLevels() == 7);
+    const auto mipSource = builder.ShaderResource(org::Subresources(texture, org::Mip{2, 1}), {UINT32_MAX, 2}).View();
+    const auto mipTarget = builder.RenderTarget(org::Subresources(texture, org::Mip{3, 1}), {UINT32_MAX, 3}).View();
+    CHECK(mipSource.Resource().registryResourceID == mipTarget.Resource().registryResourceID);
+    rejected = false;
+    try { builder.RenderTarget(org::Subresources(texture, org::Mip{7, 1}), {UINT32_MAX, 7}); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    CHECK(rejected);
     return 0;
 }
 

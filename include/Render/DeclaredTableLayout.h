@@ -11,7 +11,8 @@ namespace org {
 template<class Row>
 class DeclaredTableLayout {
 public:
-    explicit DeclaredTableLayout(size_t rows = 0) : m_rows(rows) {}
+    DeclaredTableLayout() = default;
+    explicit DeclaredTableLayout(size_t rows) : m_rows(rows) {}
     struct Destination {
         DeclaredTableLayout* table;
         size_t row;

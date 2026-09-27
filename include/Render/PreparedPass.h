@@ -618,6 +618,10 @@ struct FramePreparationContext {
         if (!bindings) throw std::logic_error("Frozen resource bindings are unavailable during preparation");
         return bindings->Views(CaptureResource(binding)).description;
     }
+    const rhi::ResourceDesc& Describe(const DeclaredViewToken& token) const {
+        if (!bindings) throw std::logic_error("Frozen resource bindings are unavailable during preparation");
+        return bindings->Views(DeclaredReference(token)).description;
+    }
 
     rhi::ClearValue ClearValue(ResourceBindingToken binding) const {
         if (!bindings) throw std::logic_error("Frozen resource bindings are unavailable during preparation");

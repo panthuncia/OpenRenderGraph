@@ -22,6 +22,14 @@ struct UavView {
     uint32_t variant = UINT32_MAX, mip = 0, slice = 0;
     operator BindlessViewRequest() const { return {BindlessViewKind::UnorderedAccess, variant, mip, slice}; }
 };
+struct RtvView {
+    uint32_t variant = UINT32_MAX, mip = 0, slice = 0;
+    operator BindlessViewRequest() const { return {BindlessViewKind::RenderTarget, variant, mip, slice}; }
+};
+struct DsvView {
+    uint32_t variant = UINT32_MAX, mip = 0, slice = 0;
+    operator BindlessViewRequest() const { return {BindlessViewKind::DepthStencil, variant, mip, slice}; }
+};
 
 struct ResourceUseSpecification {
     rhi::ResourceAccessType access;
