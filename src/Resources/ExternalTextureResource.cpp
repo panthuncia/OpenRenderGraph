@@ -3,7 +3,7 @@
 #include "Managers/Singletons/DescriptorHeapManager.h"
 #include "Utilities/ORGUtilities.h"
 #include <rhi_interop_dx12.h>
-#include <d3d12.h>
+#include <directx/d3d12.h>
 
 namespace org {
 

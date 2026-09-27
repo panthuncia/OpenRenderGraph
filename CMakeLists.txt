@@ -180,7 +180,6 @@ target_link_libraries(OpenRenderGraph
         BasicTelemetry::Tracy
         flecs::flecs
         Boost::container_hash
-    PRIVATE
         ${OPENRENDERGRAPH_SPDLOG_TARGET}
 )
 
@@ -213,8 +212,7 @@ if(OPENRENDERGRAPH_ENABLE_DEBUG_UI)
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
         PRIVATE
-            "${CMAKE_CURRENT_SOURCE_DIR}/src"
-            "${CMAKE_CURRENT_SOURCE_DIR}/../BasicRenderer/include")
+            "${CMAKE_CURRENT_SOURCE_DIR}/src")
     if(MSVC)
         target_compile_options(OpenRenderGraphDebugUI PRIVATE /utf-8)
     endif()
@@ -234,7 +232,7 @@ target_compile_definitions(OpenRenderGraph
 target_compile_definitions(OpenRenderGraph PRIVATE NOMINMAX)
 
 if (MSVC)
-    target_compile_options(OpenRenderGraph PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
+    target_compile_options(OpenRenderGraph PUBLIC $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
     # RenderGraph.cpp exceeds the default COFF section limit; hosts that embed ORG
     # standalone do not necessarily set /bigobj globally.
     target_compile_options(OpenRenderGraph PRIVATE /bigobj)
