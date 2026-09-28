@@ -127,6 +127,7 @@ void DescriptorHeapManager::Cleanup() {
     // wave of descriptor slots. Quiescent cleanup must reach a fixed point.
     DrainDeferredReleasesAfterDeviceIdle();
     if (m_resourceCleanup) m_resourceCleanup->Drain();
+    DrainDeferredReleasesAfterDeviceIdle();
     m_backendHeaps.clear();
 	m_indexedSamplerDescriptions.clear();
     m_cbvSrvUavHeap.reset();

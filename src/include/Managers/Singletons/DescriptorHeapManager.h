@@ -10,6 +10,7 @@
 #include <rhi.h>
 
 #include "Render/DescriptorHeap.h"
+#include "Render/Runtime/ResourceCleanupQueue.h"
 #include "Render/QueueKind.h"
 #include "Render/Runtime/DescriptorServiceTypes.h"
 #include "Resources/GPUBacking/GpuBufferBacking.h"
