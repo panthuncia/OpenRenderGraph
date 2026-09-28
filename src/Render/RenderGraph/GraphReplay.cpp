@@ -25,20 +25,24 @@ void WriteUses(std::ostream& out, const std::vector<CompileStateUse>& uses) {
     for (const auto& use : uses)
         out << use.resource << ' ' << use.range.mip << ' ' << use.range.mips << ' '
             << use.range.slice << ' ' << use.range.slices << ' ' << use.state.access << ' '
-            << use.state.layout << ' ' << use.state.sync << ' ' << use.state.write << '\n';
+            << use.state.layout << ' ' << use.state.sync << ' ' << use.state.write << ' '
+            << use.byteOffset << ' ' << use.byteSize << ' ' << use.aspects << '\n';
 }
-void ReadUses(std::istream& in, std::vector<CompileStateUse>& uses) {
+void ReadUses(std::istream& in, std::vector<CompileStateUse>& uses, uint32_t version) {
     uses.resize(Count(in));
     for (auto& use : uses) {
         Read(in,use.resource); Read(in,use.range.mip); Read(in,use.range.mips);
         Read(in,use.range.slice); Read(in,use.range.slices); Read(in,use.state.access);
         Read(in,use.state.layout); Read(in,use.state.sync); Read(in,use.state.write);
+        if (version >= 3) {
+            Read(in,use.byteOffset); Read(in,use.byteSize); Read(in,use.aspects);
+        }
     }
 }
 }
 void WriteGraphReplay(std::ostream& out, const GraphCompileStructure& s) {
     if (s.resourceIDs.size() != s.resourceShapes.size()) throw std::invalid_argument("Replay requires resource shapes");
-    out << "ORG_GRAPH_REPLAY 2\n" << s.resourceIDs.size() << '\n';
+    out << "ORG_GRAPH_REPLAY 3\n" << s.resourceIDs.size() << '\n';
     for (size_t i = 0; i < s.resourceIDs.size(); ++i)
         out << s.resourceIDs[i] << ' ' << s.resourceShapes[i].mips << ' ' << s.resourceShapes[i].slices
             << ' ' << s.resourceShapes[i].hasLayout << '\n';
@@ -156,14 +160,14 @@ namespace {
 GraphCompileStructure ReadSnapshot(std::istream& in, bool requireEnd) {
     std::string magic; uint32_t version;
     Read(in,magic); Read(in,version);
-    if (magic != "ORG_GRAPH_REPLAY" || (version != 1 && version != 2)) throw std::invalid_argument("Unsupported graph replay version");
+    if (magic != "ORG_GRAPH_REPLAY" || (version < 1 || version > 3)) throw std::invalid_argument("Unsupported graph replay version");
     GraphCompileStructure s;
     s.resourceIDs.resize(Count(in)); s.resourceShapes.resize(s.resourceIDs.size());
     for (size_t i = 0; i < s.resourceIDs.size(); ++i) {
         Read(in,s.resourceIDs[i]); Read(in,s.resourceShapes[i].mips);
         Read(in,s.resourceShapes[i].slices); Read(in,s.resourceShapes[i].hasLayout);
     }
-    if (version == 2) {
+    if (version >= 2) {
         s.resourceKeys.resize(Count(in));
         if (!s.resourceKeys.empty() && s.resourceKeys.size() != s.resourceIDs.size())
             throw std::invalid_argument("Invalid replay semantic key count");
@@ -180,7 +184,7 @@ GraphCompileStructure ReadSnapshot(std::istream& in, bool requireEnd) {
         for (auto& queue : pass.compatibleQueueSlots) Read(in,queue);
         pass.accesses.resize(Count(in));
         for (auto& access : pass.accesses) { Read(in,access.resourceIndex); Read(in,access.write); }
-        ReadUses(in,pass.entryStates); ReadUses(in,pass.exitStates);
+        ReadUses(in,pass.entryStates,version); ReadUses(in,pass.exitStates,version);
     }
     for (auto* edges : {&s.explicitEdges,&s.placementEdges}) {
         edges->resize(Count(in));

@@ -48,6 +48,11 @@ struct CompileStateUse {
     uint32_t resource = 0;
     CompileRange range;
     CompileResourceState state;
+    // Internal scheduling may conservatively use the whole resource, but an
+    // execution boundary must retain the caller's exact buffer/image extent.
+    uint64_t byteOffset = 0;
+    uint64_t byteSize = UINT64_MAX;
+    uint32_t aspects = 0;
     bool operator==(const CompileStateUse&) const = default;
 };
 

@@ -338,7 +338,7 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
     add_test(NAME OpenRenderGraphExternalResourceTests COMMAND OpenRenderGraphExternalResourceTests)
     add_executable(OpenRenderGraphCopyQueueUploadTests tests/CopyQueueUploadServiceTests.cpp)
     target_include_directories(OpenRenderGraphCopyQueueUploadTests PRIVATE src/include)
-    if(WIN32)
+    if(WIN32 AND BASICRHI_ENABLE_STREAMLINE)
         target_sources(OpenRenderGraphCopyQueueUploadTests PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/../BasicRHI/tests/StreamlineStubs.cpp")
         if(TARGET Streamline::headers)
