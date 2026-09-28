@@ -1071,6 +1071,31 @@ public:
         return DeclareResourceUse(resource, {rhi::ResourceAccessType::Present, {}}).Resource();
     }
 
+    // Compatibility for passes that keep resource tokens and select physical views
+    // from the frozen preparation snapshot. These still register typed uses.
+    template<class T> ResourceBindingToken BindShaderResource(const T& resource) { return ShaderResource(resource).Resource(); }
+    template<class T> ResourceBindingToken BindUnorderedAccess(const T& resource) { return UnorderedAccess(resource).Resource(); }
+    template<class T> ResourceBindingToken BindIndirectArguments(const T& resource) { return IndirectArguments(resource); }
+    template<class T> ResourceBindingToken BindRenderTarget(const T& resource) { return RenderTarget(resource).Resource(); }
+    template<class T> ResourceBindingToken BindDepthReadWrite(const T& resource) { return DepthReadWrite(resource).Resource(); }
+    template<class T> ResourceBindingToken BindVertexBuffer(const T& resource) { return VertexBuffer(resource); }
+    template<class T> ResourceBindingToken BindCopySource(const T& resource) { return CopySource(resource); }
+    template<class T> ResourceBindingToken BindCopyDestination(const T& resource) { return CopyDestination(resource); }
+
+    // Source-compatible fluent declarations for existing external passes.
+    template<typename... Args> RenderPassBuilder& WithShaderResource(Args&&... args) & {
+        (addShaderResource(std::forward<Args>(args)), ...); return *this;
+    }
+    template<typename... Args> RenderPassBuilder& WithConstantBuffer(Args&&... args) & {
+        (addConstantBuffer(std::forward<Args>(args)), ...); return *this;
+    }
+    template<typename... Args> RenderPassBuilder& WithUnorderedAccess(Args&&... args) & {
+        (addUnorderedAccess(std::forward<Args>(args)), ...); return *this;
+    }
+    template<typename... Args> RenderPassBuilder& WithIndirectArguments(Args&&... args) & {
+        (addIndirectArguments(std::forward<Args>(args)), ...); return *this;
+    }
+
     template<typename... Args>
         requires ((NotIResourceResolver<Args>) && ...)
     RenderPassBuilder& LegacyInterop(Args&&... args) & {
@@ -1705,6 +1730,18 @@ class ComputePassBuilder : public IPassBuilder {
 public:
     PassBuilderKind Kind() const noexcept override { return PassBuilderKind::Compute; }
     IResourceProvider* ResourceProvider() noexcept override { return pass.get(); }
+    template<typename... Args> ComputePassBuilder& WithShaderResource(Args&&... args) & {
+        return ShaderResource(std::forward<Args>(args)...);
+    }
+    template<typename... Args> ComputePassBuilder& WithConstantBuffer(Args&&... args) & {
+        return ConstantBuffer(std::forward<Args>(args)...);
+    }
+    template<typename... Args> ComputePassBuilder& WithUnorderedAccess(Args&&... args) & {
+        return UnorderedAccess(std::forward<Args>(args)...);
+    }
+    template<typename... Args> ComputePassBuilder& WithIndirectArguments(Args&&... args) & {
+        return IndirectArguments(std::forward<Args>(args)...);
+    }
     // Variadic entry points
 
     //First set, callable on Lvalues
