@@ -91,6 +91,12 @@ add_library(OpenRenderGraph STATIC
 	"${CMAKE_CURRENT_SOURCE_DIR}/include/OpenRenderGraph/PersistentGraphHost.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/DescriptorHeap.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PublicationBindingBundle.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/OwnedDescriptorBinding.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/BindingTable.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/ResourceCleanupQueue.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/OwnedDescriptorBinding.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/BindingTable.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/Runtime/ResourceCleanupQueue.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PreparedTablePublisher.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/LatchBlock.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/StagedUploadBatch.cpp"
@@ -286,7 +292,7 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
     target_compile_definitions(OpenRenderGraphAsyncCompileTests PRIVATE NOMINMAX)
     add_test(NAME OpenRenderGraphAsyncCompileTests COMMAND OpenRenderGraphAsyncCompileTests)
     if(_org_d3d12_tests)
-    add_executable(OpenRenderGraphExternalResourceTests tests/ExternalResourceTests.cpp tests/FrameRecordingTests.cpp tests/FrameRetirementTests.cpp tests/ProgramVersionTests.cpp tests/ReadbackCaptureTests.cpp)
+    add_executable(OpenRenderGraphExternalResourceTests tests/ExternalResourceTests.cpp tests/FrameRecordingTests.cpp tests/FrameRetirementTests.cpp tests/BindingOwnershipTests.cpp tests/ProgramVersionTests.cpp tests/ReadbackCaptureTests.cpp)
     target_include_directories(OpenRenderGraphExternalResourceTests PRIVATE src/include)
     if(WIN32)
         # BasicRHI is a static library and its D3D12 object references the

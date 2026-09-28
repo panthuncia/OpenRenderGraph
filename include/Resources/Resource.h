@@ -19,9 +19,13 @@ class ResourceManager;
 namespace org {
 
 class SymbolicTracker;
+class BindingTableVersion;
 
 class Resource : public std::enable_shared_from_this<Resource> {
 public:
+    // Preparation owner only, before publication of this exact content version.
+    void SetBindingTableVersion(std::shared_ptr<const BindingTableVersion> version) { m_bindingTable = std::move(version); }
+    const std::shared_ptr<const BindingTableVersion>& GetBindingTableVersion() const noexcept { return m_bindingTable; }
     // Installed before publication by mutable backing pools. Allocation
     // ownership alone does not prevent reuse of the allocation's contents.
     void SetSemanticConsumerLeaseFactory(std::function<std::shared_ptr<const void>()> factory) {
@@ -382,6 +386,7 @@ protected:
 
 private:
     std::function<std::shared_ptr<const void>()> m_semanticConsumerLeaseFactory;
+    std::shared_ptr<const BindingTableVersion> m_bindingTable;
 	inline static thread_local std::uint32_t s_ecsRegistrationSuppressionDepth = 0;
 	mutable std::mutex m_representationMutex;
 	std::unordered_map<uint8_t, APIRepresentationPtr> m_representations;
@@ -405,4 +410,3 @@ private:
 
 
 } // namespace org
-

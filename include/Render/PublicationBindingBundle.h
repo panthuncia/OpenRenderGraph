@@ -12,6 +12,7 @@
 namespace org {
 class Resource;
 class AliasHeapGeneration;
+class BindingTableVersion;
 
 // Exact recording version. Incoming states and timeline waits are deliberately
 // absent: those belong to an execution, not a publication.
@@ -23,6 +24,7 @@ struct ResourceBindingSnapshot {
     std::shared_ptr<const void> allocationOwner, descriptorOwner;
     std::shared_ptr<const void> recordingOwner;
     std::shared_ptr<const void> semanticConsumer;
+    std::shared_ptr<const BindingTableVersion> bindingTable;
     std::shared_ptr<const AliasHeapGeneration> aliasHeap;
     uint64_t aliasPoolID = 0, aliasOffset = 0, aliasSize = 0;
 };

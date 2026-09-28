@@ -31,6 +31,8 @@ void DescriptorHeapManager::Initialize() {
 		return;
 	}
 	auto device = DeviceManager::GetInstance().GetDevice();
+    ++m_deviceGeneration;
+    m_resourceCleanup = runtime::ResourceCleanupQueue::Create();
     m_deferredReleases.clear();
     m_deferredResourcePointers.clear();
     m_latestQueueFenceSnapshot.clear();
@@ -124,6 +126,8 @@ void DescriptorHeapManager::Cleanup() {
     // Destruction can recursively retire other owners, not just one final
     // wave of descriptor slots. Quiescent cleanup must reach a fixed point.
     DrainDeferredReleasesAfterDeviceIdle();
+    if (m_resourceCleanup) m_resourceCleanup->Drain();
+    DrainDeferredReleasesAfterDeviceIdle();
     m_backendHeaps.clear();
 	m_indexedSamplerDescriptions.clear();
     m_cbvSrvUavHeap.reset();
@@ -131,6 +135,7 @@ void DescriptorHeapManager::Cleanup() {
     m_rtvHeap.reset();
     m_dsvHeap.reset();
     m_nonShaderVisibleHeap.reset();
+    m_resourceCleanup.reset();
 }
 
 void DescriptorHeapManager::RetireDescriptorSlots(std::vector<std::pair<std::shared_ptr<DescriptorHeap>, UINT>> slots) {

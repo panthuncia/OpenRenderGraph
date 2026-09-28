@@ -13,6 +13,7 @@
 namespace org::runtime {
 class ITaskService;
 class IUploadService;
+class ResourceCleanupQueue;
 }
 
 namespace org {
@@ -117,6 +118,8 @@ public:
 	AsyncStats TakeAsyncStats() noexcept { return std::exchange(m_asyncStats, {}); }
 
 	RenderGraph* Graph() noexcept { return m_graph.get(); }
+	/** @brief The device-generation cleanup lane used for immutable binding roots. */
+	std::shared_ptr<runtime::ResourceCleanupQueue> ResourceCleanup() const;
 	runtime::IUploadService* Uploads() noexcept;
 	uint64_t FramesExecuted() const noexcept { return m_frameNumber; }
 	// The frame slot of the execution ExecuteFrame is running (valid from its beforePrepare callback until

@@ -10,6 +10,7 @@
 #include <rhi.h>
 
 #include "Render/DescriptorHeap.h"
+#include "Render/Runtime/ResourceCleanupQueue.h"
 #include "Render/QueueKind.h"
 #include "Render/Runtime/DescriptorServiceTypes.h"
 #include "Resources/GPUBacking/GpuBufferBacking.h"
@@ -32,6 +33,8 @@ public:
 	void Initialize();
 	void RegisterBackend(BackendInstanceId backendInstance, rhi::Device device);
 	void Cleanup();
+    const std::shared_ptr<runtime::ResourceCleanupQueue>& GetResourceCleanupQueue() const { return m_resourceCleanup; }
+    uint64_t DeviceGeneration() const { return m_deviceGeneration; }
 
 	void AssignDescriptorSlots(
 		GloballyIndexedResource& target,
@@ -100,6 +103,8 @@ public:
 
 private:
 	DescriptorHeapManager() = default;
+    std::shared_ptr<runtime::ResourceCleanupQueue> m_resourceCleanup;
+    uint64_t m_deviceGeneration = 0;
 
 	void ReserveDescriptorSlotsUnlocked(
 		GloballyIndexedResource& target,

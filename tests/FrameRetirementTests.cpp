@@ -18,7 +18,9 @@ struct RetirementChain {
 };
 }
 
+int TestBindingOwnership(rhi::Device device);
 int TestFrameRetirement(rhi::Device device) {
+    CHECK(TestBindingOwnership(device) == 0);
     {
         org::RenderGraph graph(device, rhi::Backend::D3D12);
         graph.StopFrameProduction();

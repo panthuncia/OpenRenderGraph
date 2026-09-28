@@ -1888,12 +1888,14 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
         const auto* published = publicationBindings ? publicationBindings->Find(bindingID) : nullptr;
         PublicationBindingBundle::Snapshot selectedBinding;
         if (published && (!backedResource || (*published)->backingGeneration == backedResource->GetBackingGeneration())
+            && (!concreteResource || (*published)->bindingTable == concreteResource->GetBindingTableVersion())
             && (!indexedResource || (*published)->views == indexedResource->CaptureBindlessViews()))
             selectedBinding = *published;
         else if (concreteResource && admissionBoundResources[r] == 0) {
             const auto* cached = m_compilerState->graphLocalBindingBundle
                 ? m_compilerState->graphLocalBindingBundle->Find(bindingID) : nullptr;
             if (cached && (!backedResource || (*cached)->backingGeneration == backedResource->GetBackingGeneration())
+                && (*cached)->bindingTable == concreteResource->GetBindingTableVersion()
                 && (!indexedResource || (*cached)->views == indexedResource->CaptureBindlessViews()))
                 selectedBinding = *cached;
             else selectedBinding = PublicationBindingBundle::Capture(*concreteResource);

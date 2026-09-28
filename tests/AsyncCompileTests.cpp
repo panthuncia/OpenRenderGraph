@@ -1,4 +1,5 @@
 #include "Render/RenderGraph/ExperimentalGraphCompiler.h"
+#include "Render/BindingTable.h"
 #include "Render/RenderGraph/ExperimentalExecutionState.h"
 #include "Render/RenderGraph/RenderGraphCompileProfile.h"
 #include <BasicTelemetry/Telemetry.h>
@@ -440,7 +441,12 @@ int main() {
         CHECK(rejects([&] { overflow.Prepare(bundle, std::vector<std::vector<ExecutionTimelinePoint>>(3)); }));
         CHECK(overflow.Submitted()[0].value == UINT64_MAX);
         ExecutionTimelineAdmission bounded({{10,0},{20,0}}, 1);
-        auto packet = bounded.Prepare(bundle, std::vector<std::vector<ExecutionTimelinePoint>>(3));
+        auto cleanup = org::runtime::ResourceCleanupQueue::Create();
+        auto sourceOwner = cleanup->Make<int>(42);
+        std::weak_ptr<int> sourceWeak = sourceOwner;
+        auto reusable = org::ExecutionResourceLease::Create(cleanup, {sourceOwner});
+        sourceOwner.reset();
+        auto packet = bounded.Prepare(bundle, std::vector<std::vector<ExecutionTimelinePoint>>(3), {reusable.Owner()});
         std::weak_ptr<const GraphExecutionTimeline> lifetime = packet;
         for (uint32_t i = 0; i < 3; ++i) bounded.CommitBatch(packet->submission, i);
         packet.reset();
@@ -450,11 +456,18 @@ int main() {
         std::vector<ExecutionTimelinePoint> completed{{10,1},{20,1}};
         CHECK(bounded.RetireCompleted(completed) == 0);
         CHECK(!lifetime.expired());
+        cleanup->Drain();
+        CHECK(!sourceWeak.expired());
         completed[0].value = 2;
         CHECK(bounded.RetireCompleted(completed) == 1);
         bounded.TakeRetiredGarbage().clear();
         CHECK(lifetime.expired());
         CHECK(bounded.InFlight() == 0);
+        cleanup->Drain();
+        CHECK(!sourceWeak.expired()); // GPU completion cannot revoke a replayable CPU packet.
+        reusable = {};
+        cleanup->Drain();
+        CHECK(sourceWeak.expired());
         completed[0].value = 1;
         CHECK(rejects([&] { bounded.RetireCompleted(completed); }));
         completed[0].value = 3;

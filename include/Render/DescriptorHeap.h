@@ -22,7 +22,7 @@ public:
     rhi::DescriptorHeap GetHeap();
 
     UINT AllocateDescriptor();
-    void ReleaseDescriptor(UINT index);
+    void ReleaseDescriptor(UINT index, std::shared_ptr<const void> owner = {});
     // CPU frames retain slots before they have submission fences. Retirement
     // requests reclamation; a retained slot cannot return to the free list.
     std::shared_ptr<const void> CaptureDescriptorLease(UINT index);
@@ -35,10 +35,14 @@ private:
     std::queue<UINT> m_freeIndices;
     struct SlotState {
         bool allocated = false;
+        bool awaitingLease = false;
+        uint64_t leaseGeneration = 0;
         std::weak_ptr<const void> lease;
+        std::shared_ptr<const void> retiredOwner;
     };
+    struct Lease;
+    void ReleaseLease(UINT index, uint64_t generation);
     std::vector<SlotState> m_slots;
-    std::vector<UINT> m_retainedRetiredIndices;
     rhi::DescriptorHeapType m_type;
     bool m_shaderVisible;
     std::mutex m_allocationMutex;
