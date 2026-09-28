@@ -20,8 +20,10 @@
 #include "Render/RenderGraph/RenderGraph.h"
 #include "Render/Runtime/RuntimeDevice.h"
 #include "Render/Runtime/ScopedActiveGraphServices.h"
+#include "Render/Runtime/DescriptorServiceAccess.h"
 #include "Render/Runtime/ThreadPoolTaskService.h"
 #include "OpenRenderGraph/PersistentGraphHost.h"
+#include "Managers/Singletons/DescriptorHeapManager.h"
 #include "RenderPasses/Base/TypedRenderGraphPass.h"
 #include "Resources/Buffers/Buffer.h"
 #include "Resources/ExternalBufferResource.h"
@@ -30,11 +32,14 @@
 #include "Render/Runtime/StagedUploadBatch.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <future>
 #include <iterator>
 #include <memory>
+#include <thread>
 #include <vector>
 
 #ifndef ORG_TEST_PERSISTENT_WRITE_SPV
@@ -234,6 +239,9 @@ public:
 		return {m_program, preparation.ResolveView(bindings.input, {org::BindlessViewKind::ShaderResource}).index,
 			preparation.ResolveView(bindings.target, {org::BindlessViewKind::UnorderedAccess}).index};
 	}
+	void InvocationRevision(const org::PassPrepareContext&, std::vector<uint64_t>& out) const {
+		out.push_back(reinterpret_cast<uintptr_t>(m_program.get()));
+	}
 	static void Record(const WriteBindings&, const WriteFrame& frame, org::PassRecordContext& recording) {
 		auto& commands = recording.Commands();
 		commands.BindLayout(frame.program->layout->GetHandle());
@@ -251,11 +259,15 @@ private:
 struct CopyBindings { org::ResourceBindingToken source, destination; };
 class CopyToHostPass final : public org::TypedRenderGraphPass<CopyToHostPass, org::EmptyPassFrameData, CopyBindings> {
 public:
-	CopyToHostPass(std::shared_ptr<org::Buffer> source, std::shared_ptr<org::ExternalBufferResource> destination)
-		: m_source(std::move(source)), m_destination(std::move(destination)) {}
+	CopyToHostPass(std::shared_ptr<org::Buffer> source, std::shared_ptr<org::ExternalBufferResource> destination,
+		std::shared_ptr<std::atomic<uint64_t>> destinationRevision)
+		: m_source(std::move(source)), m_destination(std::move(destination)), m_destinationRevision(std::move(destinationRevision)) {}
 	CopyBindings Declare(org::PassBuilder& builder) {
 		builder.PreferQueue(org::QueueKind::Graphics);
 		return {builder.BindCopySource(m_source), builder.BindCopyDestination(m_destination)};
+	}
+	void InvocationRevision(const org::PassPrepareContext&, std::vector<uint64_t>& out) const {
+		out.push_back(m_destinationRevision->load(std::memory_order_acquire));
 	}
 	static void Record(const CopyBindings& bindings, org::PassRecordContext& recording) {
 		recording.Commands().CopyBufferRegion(recording.Resolve(bindings.destination).GetHandle(), 0,
@@ -264,13 +276,16 @@ public:
 private:
 	std::shared_ptr<org::Buffer> m_source;
 	std::shared_ptr<org::ExternalBufferResource> m_destination;
+	std::shared_ptr<std::atomic<uint64_t>> m_destinationRevision;
 };
 
 class HostExtension final : public org::RenderGraph::IRenderGraphExtension {
 public:
 	HostExtension(std::shared_ptr<org::Buffer> input, std::shared_ptr<org::Buffer> scratch,
-		std::shared_ptr<org::ExternalBufferResource> output, std::shared_ptr<const ComputeProgram> program)
-		: m_input(std::move(input)), m_scratch(std::move(scratch)), m_output(std::move(output)), m_program(std::move(program)) {}
+		std::shared_ptr<org::ExternalBufferResource> output, std::shared_ptr<const ComputeProgram> program,
+		std::shared_ptr<std::atomic<uint64_t>> outputRevision)
+		: m_input(std::move(input)), m_scratch(std::move(scratch)), m_output(std::move(output)), m_program(std::move(program)),
+		m_outputRevision(std::move(outputRevision)) {}
 	void PrepareForBuild(org::RenderGraph& graph) override {
 		graph.RegisterResource(org::ResourceIdentifier("test.input"), m_input);
 		graph.RegisterResource(org::ResourceIdentifier("test.scratch"), m_scratch);
@@ -281,7 +296,7 @@ public:
 			std::static_pointer_cast<org::RenderPass>(std::make_shared<WritePass>(m_input, m_scratch, m_program)))
 			.PreferQueue(org::QueueKind::Graphics));
 		out.push_back(org::RenderGraph::ExternalPassDesc::Copy("test.copy-to-host",
-			std::static_pointer_cast<org::RenderPass>(std::make_shared<CopyToHostPass>(m_scratch, m_output)))
+			std::static_pointer_cast<org::RenderPass>(std::make_shared<CopyToHostPass>(m_scratch, m_output, m_outputRevision)))
 			.PreferQueue(org::QueueKind::Graphics));
 	}
 private:
@@ -289,6 +304,7 @@ private:
 	std::shared_ptr<org::Buffer> m_scratch;
 	std::shared_ptr<org::ExternalBufferResource> m_output;
 	std::shared_ptr<const ComputeProgram> m_program;
+	std::shared_ptr<std::atomic<uint64_t>> m_outputRevision;
 };
 
 std::shared_ptr<ComputeProgram> CreateProgram(rhi::Device device) {
@@ -316,6 +332,8 @@ bool Matches(const HostBuffer& buffer, uint32_t value) {
 }
 } // namespace
 
+int TestFrameRetirement(rhi::Device device, rhi::Backend backend);
+
 int main(int argc, char** argv) {
 	const bool async = argc > 1 && std::strcmp(argv[1], "async") == 0;
 	HostDevice host;
@@ -341,6 +359,7 @@ int main(int argc, char** argv) {
 		info.submissionHooks = {&counters, &Lock, &Unlock};
 		rhi::DevicePtr device;
 		REQUIRE(rhi::vulkan::AdoptVulkanDevice(info, device) == rhi::Result::Ok, "AdoptVulkanDevice");
+		REQUIRE(TestFrameRetirement(device.Get(), rhi::Backend::Vulkan) == 0, "descriptor and frame retirement");
 		// The host registers the runtime device, owns the task service and upload
 		// pass, and drives persistent execution with the external queue boundary.
 		org::PersistentGraphHost host({.device = device.Get(), .backend = rhi::Backend::Vulkan,
@@ -382,19 +401,113 @@ int main(int argc, char** argv) {
 					org::runtime::GetActiveUploadService()->SubmitStagedUploads(std::move(replacement));
 				}
 			};
-			host.AddExtension("test.host", [&] { return std::make_unique<HostExtension>(input, scratch, output, program); });
+			auto outputRevision = std::make_shared<std::atomic<uint64_t>>(1);
+			host.AddExtension("test.host", [&] { return std::make_unique<HostExtension>(input, scratch, output, program, outputRevision); });
+			org::PersistentGraphHost::FrameCallback premature = [](org::RenderGraph&) {};
+			REQUIRE(!host.TryPostOwnedPreparation(premature) && premature, "pre-build request stays with caller");
+			org::PersistentGraphHost::FrameTicketReservation reservation;
+			const uint32_t requiredEpoch = 0;
+			REQUIRE(!host.TryReserveReadyEpochs({&requiredEpoch, 1}, reservation), "no reservation before async start");
 			if (async) host.SetAsyncEpochs({0});
+			std::atomic<uint32_t> ownedRequests{0};
+			std::atomic<bool> ownedServices{false};
+			std::weak_ptr<int> ownedWeak;
+			if (async) {
+				const uint32_t unavailableEpochs[] = {0, 1};
+				REQUIRE(!host.TryReserveReadyEpochs(unavailableEpochs, reservation) && reservation.Empty(),
+					"incomplete epoch set does not consume a control credit");
+				const auto readyDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+				while (!host.TryReserveReadyEpochs({&requiredEpoch, 1}, reservation) && std::chrono::steady_clock::now() < readyDeadline)
+					std::this_thread::yield();
+				REQUIRE(!reservation.Empty(), "initial ticket and control-mailbox credit are reserved");
+				auto ownedValue = std::make_shared<int>(42);
+				ownedWeak = ownedValue;
+				const auto renderThread = std::this_thread::get_id();
+				org::PersistentGraphHost::FrameCallback request = [ownedValue, renderThread, &ownedRequests, &ownedServices](org::RenderGraph&) {
+					ownedServices.store(*ownedValue == 42 && std::this_thread::get_id() != renderThread &&
+						org::runtime::GetActiveDescriptorService() != nullptr && org::runtime::GetActiveUploadService() != nullptr);
+					ownedRequests.fetch_add(1);
+				};
+				REQUIRE(host.TryPostOwnedPreparation(request), "owned preparation admitted without a wait");
+				REQUIRE(!request, "accepted request transfers ownership");
+				ownedValue.reset();
+				// Hold the host consumer while filling its bounded mailbox. The
+				// overflow call must return promptly with the request still owned.
+				auto submittedOwner = std::make_shared<int>(73);
+				std::weak_ptr<int> submittedWeak = submittedOwner;
+				reservation.HoldResources(submittedOwner);
+				submittedOwner.reset();
+				std::promise<void> releaseConsumer;
+				auto gate = releaseConsumer.get_future().share();
+				std::atomic<bool> entered{false};
+				org::PersistentGraphHost::FrameCallback blocker = [gate, &entered](org::RenderGraph&) {
+					entered.store(true);
+					gate.wait();
+				};
+				const bool blockerAccepted = host.TryPostOwnedPreparation(blocker);
+				const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+				while (!entered.load() && std::chrono::steady_clock::now() < deadline)
+					std::this_thread::yield();
+				bool filled = entered.load();
+				if (filled)
+					for (uint32_t i = 0; i < 63; ++i) {
+						org::PersistentGraphHost::FrameCallback filler = [](org::RenderGraph&) {};
+						filled &= host.TryPostOwnedPreparation(filler);
+					}
+				org::PersistentGraphHost::FrameCallback overflow = [](org::RenderGraph&) {};
+				const bool refused = filled && !host.TryPostOwnedPreparation(overflow) && static_cast<bool>(overflow);
+				// The worker is still blocked and the mailbox has exactly one free
+				// cell: the reserved frame must spend that cell without waiting.
+				value = 1000u;
+				const int firstLocksBefore = counters.locks.load();
+				const bool submittedWhileFull = refused && host.TrySubmitReservedEpoch(reservation, 0, upload);
+				releaseConsumer.set_value();
+				REQUIRE(blockerAccepted && filled && refused && submittedWhileFull,
+					"reserved submission uses its control credit while owned-request mailbox is saturated");
+				REQUIRE(counters.locks.load() > firstLocksBefore, "reserved epoch reached host queue despite blocked worker");
+				REQUIRE(!host.TrySubmitReservedEpoch(reservation, 0, upload), "reserved ticket is consumed exactly once");
+				reservation.Clear();
+				// No following frame is needed to release the exact submitted owner:
+				// the host worker observes GPU completion independently of slot reuse.
+				REQUIRE(device->WaitIdle() == rhi::Result::Ok, "wait for submitted owner completion");
+				const auto ownerDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+				while (!submittedWeak.expired() && std::chrono::steady_clock::now() < ownerDeadline)
+					std::this_thread::yield();
+				REQUIRE(submittedWeak.expired(), "submitted owner retires without another frame");
+				// DCLF still uses the legacy ticket path. It needs the same
+				// completion lifetime as a nonblocking reservation.
+				auto legacyOwner = std::make_shared<int>(74);
+				std::weak_ptr<int> legacyWeak = legacyOwner;
+				host.SubmitEpoch(0, upload, legacyOwner);
+				legacyOwner.reset();
+				REQUIRE(device->WaitIdle() == rhi::Result::Ok, "wait for legacy owned submission");
+				const auto legacyDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+				while (!legacyWeak.expired() && std::chrono::steady_clock::now() < legacyDeadline)
+					std::this_thread::yield();
+				REQUIRE(legacyWeak.expired(), "legacy submission owner retires without another frame");
+			}
 			for (uint32_t frame = 0; frame < 6; ++frame) {
+				auto syncOwner = !async && frame == 0 ? std::make_shared<int>(91) : std::shared_ptr<int>{};
+				std::weak_ptr<int> syncWeak = syncOwner;
 				if (frame == 3) {
 					// Rotate the host buffer: the next frame must write the second one.
 					REQUIRE(ImportHostBuffer(device.Get(), second, "test.host-output.second", output), "RefreshShared host buffer");
+					outputRevision->fetch_add(1, std::memory_order_release);
 				}
 				value = 1000u * (frame + 1);
 				const int locksBefore = counters.locks.load();
-				if (async) host.SubmitEpoch(0, upload);
-				else host.ExecuteFrame(nullptr, upload);
-				REQUIRE(counters.locks.load() > locksBefore, "Execute submitted the current frame before returning");
+				if (async) {
+					if (frame != 0) host.SubmitEpoch(0, upload);
+				} else host.ExecuteFrame(nullptr, upload, UINT32_MAX, syncOwner);
+				syncOwner.reset();
+				if (!async || frame != 0)
+					REQUIRE(counters.locks.load() > locksBefore, "Execute submitted the current frame before returning");
 				REQUIRE(device->WaitIdle() == rhi::Result::Ok, "wait for BasicRHI timelines");
+				if (!async && frame == 0) {
+					REQUIRE(!syncWeak.expired(), "synchronous owner survives CPU caller release");
+					org::DescriptorHeapManager::GetInstance().ProcessDeferredReleases(0);
+					REQUIRE(syncWeak.expired(), "synchronous owner retires after accepted GPU work");
+				}
 				const HostBuffer& expected = frame < 3 ? first : second;
 				if (!Matches(expected, 1000u * (frame + 1))) {
 					std::fprintf(stderr, "FAIL: frame %u wrote %u..., expected %u...\n", frame, expected.mapped[0], 1000u * (frame + 1));
@@ -406,14 +519,41 @@ int main(int argc, char** argv) {
 				}
 			}
 			REQUIRE(!counters.unbalanced && counters.locks.load() == counters.unlocks.load(), "balanced host queue locks");
+			if (async) {
+				const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+				while (!host.TryReserveReadyEpochs({&requiredEpoch, 1}, reservation) && std::chrono::steady_clock::now() < deadline)
+					std::this_thread::yield();
+				REQUIRE(!reservation.Empty(), "ticket ready for revision-change test");
+				bool rejectedStale = false;
+				try {
+					(void)host.TrySubmitReservedEpoch(reservation, 0, [&](org::RenderGraph&) {
+						outputRevision->fetch_add(1, std::memory_order_release);
+					});
+				} catch (const std::logic_error&) {
+					rejectedStale = true;
+				}
+				reservation.Clear();
+				REQUIRE(rejectedStale, "post-reservation revision change rejects instead of submitting stale work");
+				value = 6500u;
+				host.SubmitEpoch(0, upload);
+				REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(second, value), "replacement ticket recovers after stale reservation");
+			}
 
 			// A rebuild (e.g. on resize) retires the old graph and keeps rendering.
 			host.RequestRebuild();
+			if (async) REQUIRE(!host.TryReserveReadyEpochs({&requiredEpoch, 1}, reservation), "pending rebuild prevents reservation");
 			value = 7000u;
 			if (async) host.SubmitEpoch(0, upload);
 			else host.ExecuteFrame(nullptr, upload);
 			REQUIRE(device->WaitIdle() == rhi::Result::Ok, "wait after rebuild");
 			REQUIRE(Matches(second, 7000u), "frame after rebuild");
+			if (async) {
+				host.SetAsyncEpochs({});
+				REQUIRE(ownedRequests.load() == 1 && ownedServices.load(), "owned preparation ran on host thread with services");
+				REQUIRE(ownedWeak.expired(), "owned request released after completion");
+				org::PersistentGraphHost::FrameCallback afterStop = [](org::RenderGraph&) {};
+				REQUIRE(!host.TryPostOwnedPreparation(afterStop) && afterStop, "post-stop request stays with caller");
+			}
 			host.DestroyGraph();
 		}
 	}

@@ -25,7 +25,7 @@
 
 #define CHECK(x) do { if (!(x)) return __LINE__; } while (false)
 int TestDelayedFrameRecording(const rhi::DeviceCreateInfo& create);
-int TestFrameRetirement(rhi::Device device);
+int TestFrameRetirement(rhi::Device device, rhi::Backend backend);
 int TestProgramVersions(rhi::Device device);
 int TestReadbackCaptures(rhi::Device device);
 
@@ -1471,7 +1471,7 @@ int main(int argc, char** argv) {
     if (const auto failure = TestSignalReservations(device.Get())) return failure;
     if (const auto failure = TestProgramVersions(device.Get())) return failure;
     if (const auto failure = TestReadbackCaptures(device.Get())) return failure;
-    if (const auto failure = TestFrameRetirement(device.Get())) return failure;
+    if (const auto failure = TestFrameRetirement(device.Get(), rhi::Backend::D3D12)) return failure;
 	org::runtime::ShutdownRuntimeDevice();
 	return 0;
 }

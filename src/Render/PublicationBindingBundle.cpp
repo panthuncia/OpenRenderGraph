@@ -9,6 +9,7 @@
 #include <mutex>
 #include <ostream>
 #include <algorithm>
+#include <tuple>
 
 namespace org {
 namespace {
@@ -143,8 +144,9 @@ PublicationBindingBundle::Snapshot PublicationBindingBundle::Capture(Resource& r
         result->views = indexed->CaptureBindlessViews();
         result->descriptorOwner = indexed->CaptureDescriptorOwnership();
     }
-    result->recordingOwner = std::make_shared<const std::pair<std::shared_ptr<const void>, std::shared_ptr<const void>>>(
-        result->allocationOwner, result->descriptorOwner);
+    result->bindingTable = resource.GetBindingTableVersion();
+    result->recordingOwner = std::make_shared<const std::tuple<std::shared_ptr<const void>, std::shared_ptr<const void>,
+        std::shared_ptr<const BindingTableVersion>>>(result->allocationOwner, result->descriptorOwner, result->bindingTable);
     if (BindingLifetimeTraceEnabled()) {
         std::lock_guard lock(g_bindingHolderMutex);
         std::erase_if(g_producerSnapshots, [](const auto& entry) { return entry.expired(); });
