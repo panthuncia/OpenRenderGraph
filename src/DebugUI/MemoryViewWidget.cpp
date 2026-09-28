@@ -14,7 +14,6 @@
 #include "Resources/Resource.h"
 #include "structFormatHelper.h"
 #include "TextureDecoder.h"
-#include "Managers/Singletons/DeviceManager.h"
 
 #include <rhi_helpers.h>
 #include <spdlog/spdlog.h>
@@ -496,7 +495,7 @@ namespace ui {
 
             ReleasePreviewTexture();
 
-            auto device = DeviceManager::GetInstance().GetDevice();
+            auto device = device_();
 
             // Create a staging (GPU-local) texture
             rhi::ResourceDesc texDesc{};
@@ -572,7 +571,7 @@ namespace ui {
             cmdList->End();
 
             auto& clRef = cmdList.Get();
-            auto queue = DeviceManager::GetInstance().GetGraphicsQueue();
+            auto queue = graphicsQueue_();
             queue.Submit(rhi::Span<rhi::CommandList>(&clRef, 1));
             queue.Signal({ fence->GetHandle(), 1 });
             fence->HostWait(1);

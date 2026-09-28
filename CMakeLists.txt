@@ -101,6 +101,8 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/LatchBlock.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/StagedUploadBatch.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/PreparedTablePublisher.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/DeclaredTableLayout.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/ResourceUseDeclaration.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/RenderGraph/CompileTelemetry.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/PublicationBindingBundle.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/PreparedInvocationArena.h"
@@ -185,7 +187,6 @@ target_link_libraries(OpenRenderGraph
         BasicTelemetry::Tracy
         flecs::flecs
         Boost::container_hash
-    PRIVATE
         ${OPENRENDERGRAPH_SPDLOG_TARGET}
 )
 
@@ -218,8 +219,7 @@ if(OPENRENDERGRAPH_ENABLE_DEBUG_UI)
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
         PRIVATE
-            "${CMAKE_CURRENT_SOURCE_DIR}/src"
-            "${CMAKE_CURRENT_SOURCE_DIR}/../BasicRenderer/include")
+            "${CMAKE_CURRENT_SOURCE_DIR}/src")
     if(MSVC)
         target_compile_options(OpenRenderGraphDebugUI PRIVATE /utf-8)
     endif()
@@ -239,7 +239,7 @@ target_compile_definitions(OpenRenderGraph
 target_compile_definitions(OpenRenderGraph PRIVATE NOMINMAX)
 
 if (MSVC)
-    target_compile_options(OpenRenderGraph PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
+    target_compile_options(OpenRenderGraph PUBLIC $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
     # RenderGraph.cpp exceeds the default COFF section limit; hosts that embed ORG
     # standalone do not necessarily set /bigobj globally.
     target_compile_options(OpenRenderGraph PRIVATE /bigobj)
@@ -247,6 +247,16 @@ endif()
 
 if(OPENRENDERGRAPH_BUILD_TESTS)
     enable_testing()
+    add_executable(OpenRenderGraphResourceUseTests tests/ResourceUseTests.cpp)
+    target_compile_features(OpenRenderGraphResourceUseTests PRIVATE cxx_std_23)
+    target_compile_definitions(OpenRenderGraphResourceUseTests PRIVATE NOMINMAX)
+    target_link_libraries(OpenRenderGraphResourceUseTests PRIVATE OpenRenderGraph)
+    add_test(NAME OpenRenderGraphResourceUseTests COMMAND OpenRenderGraphResourceUseTests)
+    add_executable(OpenRenderGraphExecutionBoundaryTests tests/ExecutionBoundaryTests.cpp)
+    target_compile_features(OpenRenderGraphExecutionBoundaryTests PRIVATE cxx_std_23)
+    target_compile_definitions(OpenRenderGraphExecutionBoundaryTests PRIVATE NOMINMAX)
+    target_link_libraries(OpenRenderGraphExecutionBoundaryTests PRIVATE OpenRenderGraph)
+    add_test(NAME OpenRenderGraphExecutionBoundaryTests COMMAND OpenRenderGraphExecutionBoundaryTests)
     add_executable(OpenRenderGraphPersistentTests tests/PersistentGraphTests.cpp tests/GraphReplayRunner.h)
     target_compile_features(OpenRenderGraphPersistentTests PRIVATE cxx_std_23)
     target_compile_definitions(OpenRenderGraphPersistentTests PRIVATE
@@ -265,6 +275,21 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
         target_compile_options(OpenRenderGraphRecordingRecipeTests PRIVATE /utf-8)
     endif()
     target_link_libraries(OpenRenderGraphRecordingRecipeTests PRIVATE OpenRenderGraph)
+    # Typed recipe fixtures instantiate graph declarations and pull the D3D12 backend.
+    if(WIN32 AND TARGET Streamline::headers)
+        target_sources(OpenRenderGraphRecordingRecipeTests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/../BasicRHI/tests/StreamlineStubs.cpp")
+        target_link_libraries(OpenRenderGraphRecordingRecipeTests PRIVATE Streamline::headers)
+    endif()
+    if(WIN32 AND TARGET Pix::headers)
+        find_library(OPENRENDERGRAPH_PIX_RUNTIME NAMES WinPixEventRuntime
+            HINTS "${CMAKE_CURRENT_SOURCE_DIR}/../BasicRenderer" REQUIRED)
+        target_link_libraries(OpenRenderGraphRecordingRecipeTests PRIVATE "${OPENRENDERGRAPH_PIX_RUNTIME}")
+        add_custom_command(TARGET OpenRenderGraphRecordingRecipeTests POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CMAKE_CURRENT_SOURCE_DIR}/../BasicRenderer/WinPixEventRuntime.dll"
+                "$<TARGET_FILE_DIR:OpenRenderGraphRecordingRecipeTests>")
+    endif()
     add_test(NAME OpenRenderGraphRecordingRecipeTests COMMAND OpenRenderGraphRecordingRecipeTests)
     # Offscreen suites that create D3D12 (WARP) devices exist only when the D3D12 backend is built.
     set(_org_d3d12_tests OFF)

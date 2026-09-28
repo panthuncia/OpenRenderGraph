@@ -37,6 +37,8 @@ struct RGInspectorOptions {
     std::function<void(uint32_t)> imguiFreeDescriptor;
     std::function<ImTextureID(uint32_t)> imguiGpuHandle;
     rhi::DescriptorHeapHandle imguiHeapHandle{};
+    std::function<rhi::Device()> device;
+    std::function<rhi::Queue()> graphicsQueue;
 
 };
 

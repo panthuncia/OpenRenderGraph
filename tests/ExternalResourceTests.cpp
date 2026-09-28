@@ -13,9 +13,10 @@
 #include <Render/Runtime/FrameWorkQueue.h>
 #include <Render/Runtime/ExternalSignalReservation.h>
 #include <Resources/TrackedAllocation.h>
+#include <Resources/PixelBuffer.h>
 #include <rhi_interop_dx12.h>
 #include <rhi_helpers.h>
-#include <d3d12.h>
+#include <directx/d3d12.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 #include <future>
@@ -71,6 +72,54 @@ struct DirectRecordingPass : org::TypedRenderGraphPass<DirectRecordingPass> {
     void Declare(org::PassBuilder&) {}
     static void Record(org::PassRecordContext&) { ++recordings; }
 };
+int TestUnifiedDeclarations(rhi::Device device, const std::shared_ptr<org::Resource>& resource) {
+    org::RenderGraph graph(device, rhi::Backend::D3D12);
+    const org::ResourceIdentifier name("test.unified");
+    graph.RegisterResource(name, resource);
+    auto& builder = graph.BuildPass<DirectRecordingPass>("Unified");
+    const auto first = builder.ShaderResource(resource).View();
+    const auto repeated = builder.ShaderResource(resource).View();
+    const auto named = builder.ShaderResource(name).View();
+    CHECK(first.layout == repeated.layout && first.use == repeated.use && first.view == repeated.view);
+    CHECK(first.Resource().registryResourceID == named.Resource().registryResourceID);
+    CHECK(builder.ResourceUses()->uses.size() == 1);
+    builder.ShaderResource(resource, name);
+    const org::SrvView requestedViews[] = {{}, {3}};
+    const auto multiple = builder.ShaderResource(resource, std::span<const org::SrvView>{requestedViews});
+    CHECK(multiple.views.size() == 2 && multiple.View(0).view != multiple.View(1).view);
+    bool rejected = false;
+    try { (void)multiple.View(); } catch (const std::invalid_argument&) { rejected = true; }
+    CHECK(rejected);
+    const auto indirect = builder.IndirectArguments(resource);
+    CHECK(indirect.registryResourceID == first.Resource().registryResourceID);
+    CHECK(builder.ResourceUses()->uses.size() == 2);
+    const auto clear = builder.UnorderedAccessClear(resource);
+    CHECK(clear.views.size() == 2 && clear.View(0).use == clear.View(1).use && clear.View(0).view != clear.View(1).view);
+    rejected = false;
+    try { builder.ShaderResource(std::shared_ptr<org::Resource>{}); } catch (const std::invalid_argument&) { rejected = true; }
+    CHECK(rejected);
+    rejected = false;
+    try { builder.ShaderResource(resource, {UINT32_MAX, 99, 0}); } catch (const std::invalid_argument&) { rejected = true; }
+    CHECK(rejected);
+    // Declaration does not touch descriptors: this fixture has no published SRV/UAV views.
+    CHECK(builder.ResourceUses()->uses.size() == 3);
+    org::TextureDescription textureDesc{};
+    textureDesc.imageDimensions.push_back({64, 64, 0, 0});
+    textureDesc.format = rhi::Format::R16G16B16A16_Float;
+    textureDesc.generateMipMaps = true;
+    textureDesc.hasSRV = textureDesc.hasRTV = true;
+    auto texture = org::PixelBuffer::CreateSharedUnmaterialized(textureDesc);
+    CHECK(texture->GetMipLevels() == 7);
+    const auto mipSource = builder.ShaderResource(org::Subresources(texture, org::Mip{2, 1}), {UINT32_MAX, 2}).View();
+    const auto mipTarget = builder.RenderTarget(org::Subresources(texture, org::Mip{3, 1}), {UINT32_MAX, 3}).View();
+    CHECK(mipSource.Resource().registryResourceID == mipTarget.Resource().registryResourceID);
+    rejected = false;
+    try { builder.RenderTarget(org::Subresources(texture, org::Mip{7, 1}), {UINT32_MAX, 7}); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    CHECK(rejected);
+    return 0;
+}
+
 struct DeclaredTestBindings { org::ResourceBindingToken resource; };
 struct DeclaredRecordingPass : org::TypedRenderGraphPass<DeclaredRecordingPass,
     org::EmptyPassFrameData, DeclaredTestBindings> {
@@ -300,9 +349,9 @@ struct RefreshTestPass final : org::ComputePass {
 	org::ResourceRegistryView* View() const { return m_resourceRegistryView.get(); }
 	void DeclareResourceUsages(org::ComputePassBuilder* builder) override {
 		++declarations;
-		if (symbolic) builder->WithShaderResource(org::ResourceIdentifier("test.empty-resolver"));
-		else builder->WithShaderResource(*resolver);
-		if (secondResolver) builder->WithShaderResource(*secondResolver);
+		if (symbolic) builder->ShaderResource(org::ResourceIdentifier("test.empty-resolver"));
+		else builder->ShaderResource(*resolver);
+		if (secondResolver) builder->ShaderResource(*secondResolver);
 	}
 };
 
@@ -372,9 +421,9 @@ int TestEmptyResolverDeclarations(rhi::Device device) {
 	const org::ResourceIdentifier identifier("test.empty-resolver");
 	graph.RegisterResolver(identifier, resolver);
 	auto& direct = graph.BuildComputePass<DeclarationTestPass>("Direct");
-	direct.WithShaderResource(*resolver);
+	direct.ShaderResource(*resolver);
 	auto& symbolic = graph.BuildComputePass<DeclarationTestPass>("Symbolic");
-	symbolic.WithShaderResource(identifier);
+	symbolic.ShaderResource(identifier);
 	auto directStates = direct.TakeResolverSnapshots();
 	auto symbolicStates = symbolic.TakeResolverSnapshots();
 	CHECK(directStates.size() == 1 && symbolicStates.size() == 1);
@@ -390,7 +439,9 @@ int TestEmptyResolverDeclarations(rhi::Device device) {
 	CHECK(a.declaredRequirementTemplates[0].state.sync == b.declaredRequirementTemplates[0].state.sync);
 	// Multiple authored uses must survive an empty initial capture, too.
 	auto& multiple = graph.BuildComputePass<DeclarationTestPass>("Multiple");
-	multiple.WithShaderResource(*resolver).WithUnorderedAccess(*resolver).WithShaderResource(*resolver);
+	multiple.ShaderResource(*resolver);
+	multiple.UnorderedAccess(*resolver);
+	multiple.ShaderResource(*resolver);
 	auto multiStates = multiple.TakeResolverSnapshots();
 	CHECK(multiStates.size() == 1);
 	CHECK(multiStates[0].declaredRequirementTemplates.size() == 2);
@@ -1442,6 +1493,7 @@ int main(int argc, char** argv) {
 		registry = {};
 		CHECK(registry.MakeHandle(bufferID).GetGeneration() == 0);
 	}
+	if (const auto failure = TestUnifiedDeclarations(device.Get(), buffer)) return failure;
 	if (const auto failure = TestEmptyResolverRefresh(device.Get(), buffer)) return failure;
 	if (const auto failure = TestMixedResolverCollision(device.Get(), buffer)) return failure;
 

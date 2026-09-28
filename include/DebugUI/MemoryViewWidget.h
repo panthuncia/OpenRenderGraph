@@ -46,12 +46,16 @@ namespace ui {
             ImGuiDescriptorAllocFn alloc,
             ImGuiDescriptorFreeFn free,
             ImGuiGpuHandleFn gpuHandle,
-            rhi::DescriptorHeapHandle heapHandle)
+            rhi::DescriptorHeapHandle heapHandle,
+            std::function<rhi::Device()> device,
+            std::function<rhi::Queue()> graphicsQueue)
         {
             imguiAllocDesc_ = std::move(alloc);
             imguiFreeDesc_ = std::move(free);
             imguiGpuHandle_ = std::move(gpuHandle);
             imguiHeapHandle_ = heapHandle;
+            device_ = std::move(device);
+            graphicsQueue_ = std::move(graphicsQueue);
         }
 
     private:
@@ -121,6 +125,8 @@ namespace ui {
         ImGuiDescriptorFreeFn imguiFreeDesc_;
         ImGuiGpuHandleFn imguiGpuHandle_;
         rhi::DescriptorHeapHandle imguiHeapHandle_{};
+        std::function<rhi::Device()> device_;
+        std::function<rhi::Queue()> graphicsQueue_;
     };
 
 } // namespace ui

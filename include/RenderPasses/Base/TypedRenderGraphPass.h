@@ -94,6 +94,9 @@ public:
     }
 
     PreparedPass PrepareFrame(FramePreparationContext& context) final {
+        context.resourceUses = this->ResourceUses();
+        context.ValidateDeclaredViews();
+
         if constexpr (!std::same_as<Recipe, NoPassRecordingRecipe>)
             return PrepareRecipeInvocation(context);
         else {
@@ -607,7 +610,10 @@ protected:
                 { pass.Declare(declaration) } -> std::same_as<Bindings>;
             }, "Declared passes require Bindings Declare(PassBuilder&)");
             m_declaredBindings = static_cast<Derived*>(this)->Declare(*builder);
+            m_recipe.reset();
+            m_cachedInvocation = {};
         }
+        this->SetResourceUses(GetResourceUses(*builder));
     }
 };
 

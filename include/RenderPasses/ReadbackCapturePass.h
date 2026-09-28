@@ -33,7 +33,8 @@ public:
 
     void Declare(PassBuilder& builder) {
         const auto& inputs = this->template Inputs<ReadbackCaptureInputs>();
-        builder.WithCopySource(inputs.target).PreferQueue(Queue);
+        builder.CopySource(inputs.target);
+        builder.PreferQueue(Queue);
     }
     ReadbackCaptureFrameData Prepare(const PassPrepareContext& preparation) {
         const auto& inputs = this->template Inputs<ReadbackCaptureInputs>();

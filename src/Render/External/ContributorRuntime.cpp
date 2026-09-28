@@ -286,13 +286,13 @@ namespace
     {
         const ResourceIdentifier id{ binding.resource };
         switch (binding.kind) {
-        case ORG_C_BINDING_SRV: builder.WithShaderResource(id); break;
-        case ORG_C_BINDING_UAV: builder.WithUnorderedAccess(id); break;
-        case ORG_C_BINDING_RTV: builder.WithRenderTarget(id); break;
-        case ORG_C_BINDING_DSV: builder.WithDepthReadWrite(id); break;
-        case ORG_C_BINDING_INDIRECT: builder.WithIndirectArguments(id); break;
-        case ORG_C_BINDING_COPY_SOURCE: builder.WithCopySource(id); break;
-        case ORG_C_BINDING_COPY_DESTINATION: builder.WithCopyDest(id); break;
+        case ORG_C_BINDING_SRV: builder.ShaderResource(id); break;
+        case ORG_C_BINDING_UAV: builder.UnorderedAccess(id); break;
+        case ORG_C_BINDING_RTV: builder.RenderTarget(id); break;
+        case ORG_C_BINDING_DSV: builder.DepthReadWrite(id); break;
+        case ORG_C_BINDING_INDIRECT: builder.IndirectArguments(id); break;
+        case ORG_C_BINDING_COPY_SOURCE: builder.CopySource(id); break;
+        case ORG_C_BINDING_COPY_DESTINATION: builder.CopyDestination(id); break;
         default: break;
         }
     }
@@ -301,9 +301,9 @@ namespace
     {
         const ResourceIdentifier id{ binding.resource };
         switch (binding.kind) {
-        case ORG_C_BINDING_SRV: builder.WithShaderResource(id); break;
-        case ORG_C_BINDING_UAV: builder.WithUnorderedAccess(id); break;
-        case ORG_C_BINDING_INDIRECT: builder.WithIndirectArguments(id); break;
+        case ORG_C_BINDING_SRV: builder.ShaderResource(id); break;
+        case ORG_C_BINDING_UAV: builder.UnorderedAccess(id); break;
+        case ORG_C_BINDING_INDIRECT: builder.IndirectArguments(id); break;
         default: break;
         }
     }
@@ -311,8 +311,8 @@ namespace
     void AddBinding(CopyPassBuilder& builder, const BindingDescription& binding)
     {
         const ResourceIdentifier id{ binding.resource };
-        if (binding.kind == ORG_C_BINDING_COPY_SOURCE) builder.WithCopySource(id);
-        else if (binding.kind == ORG_C_BINDING_COPY_DESTINATION) builder.WithCopyDest(id);
+        if (binding.kind == ORG_C_BINDING_COPY_SOURCE) builder.CopySource(id);
+        else if (binding.kind == ORG_C_BINDING_COPY_DESTINATION) builder.CopyDestination(id);
     }
 
     class ExternalPassState

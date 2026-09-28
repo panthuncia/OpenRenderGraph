@@ -352,7 +352,9 @@ namespace RGInspector {
                 opts.imguiAllocDescriptor,
                 opts.imguiFreeDescriptor,
                 opts.imguiGpuHandle,
-                opts.imguiHeapHandle);
+                opts.imguiHeapHandle,
+                opts.device,
+                opts.graphicsQueue);
             s_memoryViewCallbacksWired = true;
         }
         static char filterBuf[128] = {};
