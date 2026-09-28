@@ -68,10 +68,6 @@ PersistentGraphHost::~PersistentGraphHost() {
 	m_uncertainUploadOwners.clear();
 }
 
-std::shared_ptr<runtime::ResourceCleanupQueue> PersistentGraphHost::ResourceCleanup() const {
-	return DescriptorHeapManager::GetInstance().GetResourceCleanupQueue();
-}
-
 void PersistentGraphHost::AddExtension(std::string id, ExtensionFactory factory) {
 	RemoveExtension(id);
 	m_extensions.push_back({std::move(id), std::move(factory)});
