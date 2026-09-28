@@ -554,18 +554,6 @@ struct FramePreparationContext {
         return dependencyCollector->CaptureDescriptor(descriptor, bindings->Owner(resource));
     }
 
-    PreparedDescriptorReference CaptureView(ResourceBindingToken binding, BindlessViewRequest request) const {
-        if (!dependencyCollector || !bindings)
-            throw std::logic_error("View capture is unavailable outside typed preparation");
-        const auto resource = CaptureResource(binding);
-        return dependencyCollector->CaptureDescriptor(bindings->Views(resource).Resolve(request), bindings->Owner(resource));
-    }
-
-    rhi::DescriptorSlot ResolveView(ResourceBindingToken binding, BindlessViewRequest request) const {
-        if (!bindings) throw std::logic_error("Frozen resource bindings are unavailable during preparation");
-        return bindings->Views(CaptureResource(binding)).Resolve(request);
-    }
-
     const ResourceUseDeclaration& DeclaredUse(const DeclaredViewToken& token) const {
         if (!resourceUses || token.layout != resourceUses || token.use >= resourceUses->uses.size())
             throw std::invalid_argument("Foreign or stale declared view token");
