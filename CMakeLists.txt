@@ -90,6 +90,12 @@ add_library(OpenRenderGraph STATIC
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Telemetry/NvPerfCapture.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/include/OpenRenderGraph/PersistentGraphHost.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/DescriptorHeap.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/OwnedDescriptorBinding.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/BindingTable.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/ResourceCleanupQueue.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/OwnedDescriptorBinding.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/BindingTable.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/Runtime/ResourceCleanupQueue.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PublicationBindingBundle.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/OwnedDescriptorBinding.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/BindingTable.cpp"
@@ -101,6 +107,8 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/LatchBlock.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/StagedUploadBatch.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/PreparedTablePublisher.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/DeclaredTableLayout.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/ResourceUseDeclaration.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/RenderGraph/CompileTelemetry.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/PublicationBindingBundle.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/PreparedInvocationArena.h"
@@ -134,7 +142,6 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/RenderGraph/PersistentGraph.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/RenderPasses/Base/PersistentTypedPass.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/ExperimentalExecutionState.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/RenderGraph/ExecutionBoundary.h"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/InteropAllocator.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/SharedAliasPoolManager.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraphCompile.cpp"
@@ -246,6 +253,11 @@ endif()
 
 if(OPENRENDERGRAPH_BUILD_TESTS)
     enable_testing()
+    add_executable(OpenRenderGraphResourceUseTests tests/ResourceUseTests.cpp)
+    target_compile_features(OpenRenderGraphResourceUseTests PRIVATE cxx_std_23)
+    target_compile_definitions(OpenRenderGraphResourceUseTests PRIVATE NOMINMAX)
+    target_link_libraries(OpenRenderGraphResourceUseTests PRIVATE OpenRenderGraph)
+    add_test(NAME OpenRenderGraphResourceUseTests COMMAND OpenRenderGraphResourceUseTests)
     add_executable(OpenRenderGraphExecutionBoundaryTests tests/ExecutionBoundaryTests.cpp)
     target_compile_features(OpenRenderGraphExecutionBoundaryTests PRIVATE cxx_std_23)
     target_compile_definitions(OpenRenderGraphExecutionBoundaryTests PRIVATE NOMINMAX)
@@ -269,6 +281,21 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
         target_compile_options(OpenRenderGraphRecordingRecipeTests PRIVATE /utf-8)
     endif()
     target_link_libraries(OpenRenderGraphRecordingRecipeTests PRIVATE OpenRenderGraph)
+    # Typed recipe fixtures instantiate graph declarations and pull the D3D12 backend.
+    if(WIN32 AND TARGET Streamline::headers)
+        target_sources(OpenRenderGraphRecordingRecipeTests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/../BasicRHI/tests/StreamlineStubs.cpp")
+        target_link_libraries(OpenRenderGraphRecordingRecipeTests PRIVATE Streamline::headers)
+    endif()
+    if(WIN32 AND TARGET Pix::headers)
+        find_library(OPENRENDERGRAPH_PIX_RUNTIME NAMES WinPixEventRuntime
+            HINTS "${CMAKE_CURRENT_SOURCE_DIR}/../BasicRenderer" REQUIRED)
+        target_link_libraries(OpenRenderGraphRecordingRecipeTests PRIVATE "${OPENRENDERGRAPH_PIX_RUNTIME}")
+        add_custom_command(TARGET OpenRenderGraphRecordingRecipeTests POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CMAKE_CURRENT_SOURCE_DIR}/../BasicRenderer/WinPixEventRuntime.dll"
+                "$<TARGET_FILE_DIR:OpenRenderGraphRecordingRecipeTests>")
+    endif()
     add_test(NAME OpenRenderGraphRecordingRecipeTests COMMAND OpenRenderGraphRecordingRecipeTests)
     # Offscreen suites that create D3D12 (WARP) devices exist only when the D3D12 backend is built.
     set(_org_d3d12_tests OFF)
@@ -294,7 +321,8 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
     if(_org_d3d12_tests)
     add_executable(OpenRenderGraphExternalResourceTests tests/ExternalResourceTests.cpp tests/FrameRecordingTests.cpp tests/FrameRetirementTests.cpp tests/BindingOwnershipTests.cpp tests/ProgramVersionTests.cpp tests/ReadbackCaptureTests.cpp)
     target_include_directories(OpenRenderGraphExternalResourceTests PRIVATE src/include)
-    if(WIN32)
+    target_compile_definitions(OpenRenderGraphExternalResourceTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    if(WIN32 AND BASICRHI_ENABLE_STREAMLINE)
         # BasicRHI is a static library and its D3D12 object references the
         # Streamline C API. Standalone tests do not load the host interposer,
         # so provide the same no-op symbols as the BasicRHI smoke test.
@@ -368,7 +396,7 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
             basicrhi_compile_spirv(OUTPUT "${_org_persistent_write_spv}"
                 SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/PersistentHostWrite.hlsl"
                 ENTRY main PROFILE cs_6_6)
-            add_executable(OpenRenderGraphPersistentVulkanHostTests tests/PersistentVulkanHostTests.cpp "${_org_persistent_write_spv}")
+            add_executable(OpenRenderGraphPersistentVulkanHostTests tests/PersistentVulkanHostTests.cpp tests/FrameRetirementTests.cpp tests/BindingOwnershipTests.cpp "${_org_persistent_write_spv}")
             target_compile_features(OpenRenderGraphPersistentVulkanHostTests PRIVATE cxx_std_23)
             target_include_directories(OpenRenderGraphPersistentVulkanHostTests PRIVATE src/include)
             target_compile_definitions(OpenRenderGraphPersistentVulkanHostTests PRIVATE NOMINMAX
@@ -395,6 +423,9 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
                 endif()
             endif()
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests COMMAND OpenRenderGraphPersistentVulkanHostTests)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.Async COMMAND OpenRenderGraphPersistentVulkanHostTests async)
+            set_tests_properties(OpenRenderGraphPersistentVulkanHostTests OpenRenderGraphPersistentVulkanHostTests.Async
+                PROPERTIES TIMEOUT 60)
         endif()
     endif()
     if(WIN32 AND BASICRENDERER_TEST_RUNTIME_DIR)

@@ -1,4 +1,5 @@
 #include "Managers/UploadInstance.h"
+#include <unordered_map>
 #include "Render/Runtime/StagedUploadBatch.h"
 
 #include <algorithm>
@@ -887,6 +888,8 @@ void UploadInstance::SetStagedUploadsRecordedDirectly(bool direct) {
 }
 
 size_t UploadInstance::RecordStagedUploads(rhi::CommandList& list, uint8_t frameIndex, bool afterCopies) {
+	BT_ZONE_SCOPE("ORG.Upload.RecordStagedUploads");
+	uint64_t bytes = 0;
 	NoteOffOwnerCall("RecordStagedUploads");
 	size_t copies = 0;
 	// Copies in one list are unordered without a barrier, and batches can overlap (a producer's batch whose
@@ -903,30 +906,50 @@ size_t UploadInstance::RecordStagedUploads(rhi::CommandList& list, uint8_t frame
 		rhi::ResourceHandle target;
 		uint64_t begin = 0, end = 0;
 	};
-	std::vector<Written> written;
-	for (const auto& batch : m_directStaged) {
-		for (const auto& entry : batch->Entries()) {
-			if (entry.target.kind != UploadTarget::Kind::PinnedShared || !entry.target.pinned || !entry.page)
-				throw std::logic_error("Direct staged uploads need pointer targets");
-			const auto target = entry.target.pinned->GetAPIResource().GetHandle();
-			const uint64_t begin = entry.dstOffset, end = entry.dstOffset + entry.size;
-			const bool overlaps = std::ranges::any_of(written, [&](const Written& w) {
-				return w.target.index == target.index && w.target.generation == target.generation && begin < w.end && w.begin < end;
-			});
-			if (overlaps) {
-				ordered();
-				written.clear();
+	// Index by backing, as in the scoped branch, without changing this host's barriers.
+	std::unordered_map<uint64_t, std::vector<Written>> written;
+	written.reserve(32);
+	{
+		BT_ZONE_SCOPE("ORG.Upload.RecordStagedUploads.Copies");
+		for (const auto& batch : m_directStaged) {
+			for (const auto& entry : batch->Entries()) {
+				if (entry.target.kind != UploadTarget::Kind::PinnedShared || !entry.target.pinned || !entry.page)
+					throw std::logic_error("Direct staged uploads need pointer targets");
+				const auto target = entry.target.pinned->GetAPIResource().GetHandle();
+				const uint64_t begin = entry.dstOffset, end = entry.dstOffset + entry.size;
+				const uint64_t key = (uint64_t{target.generation} << 32) | target.index;
+				auto [writtenIt, inserted] = written.try_emplace(key);
+				if (inserted)
+					writtenIt->second.reserve(128);
+				const bool overlaps = std::ranges::any_of(writtenIt->second, [&](const Written& w) {
+					return w.target.index == target.index && w.target.generation == target.generation && begin < w.end && w.begin < end;
+				});
+				if (overlaps) {
+					ordered();
+					written.clear();
+					auto& fresh = written.try_emplace(key).first->second;
+					fresh.reserve(128);
+					fresh.push_back({target, begin, end});
+				} else {
+					writtenIt->second.push_back({target, begin, end});
+				}
+				list.CopyBufferRegion(target, entry.dstOffset, entry.page->GetAPIResource().GetHandle(), entry.pageOffset, entry.size);
+				++copies;
+				bytes += entry.size;
 			}
-			written.push_back({target, begin, end});
-			list.CopyBufferRegion(target, entry.dstOffset, entry.page->GetAPIResource().GetHandle(), entry.pageOffset, entry.size);
-			++copies;
 		}
 	}
-	if (!m_directStaged.empty() && m_numFramesInFlight != 0) {
-		auto& retained = m_frameStaged[frameIndex % m_numFramesInFlight];
-		retained.insert(retained.end(), std::make_move_iterator(m_directStaged.begin()), std::make_move_iterator(m_directStaged.end()));
+	{
+		BT_ZONE_SCOPE("ORG.Upload.RecordStagedUploads.Retain");
+		if (!m_directStaged.empty() && m_numFramesInFlight != 0) {
+			auto& retained = m_frameStaged[frameIndex % m_numFramesInFlight];
+			retained.insert(retained.end(), std::make_move_iterator(m_directStaged.begin()), std::make_move_iterator(m_directStaged.end()));
+		}
+		m_directStaged.clear();
 	}
-	m_directStaged.clear();
+	BT_ZONE_VALUE(copies);
+	BT_PLOT("ORG.Upload.StagedCopies", static_cast<int64_t>(copies));
+	BT_PLOT("ORG.Upload.StagedBytes", static_cast<int64_t>(bytes));
 	return copies;
 }
 

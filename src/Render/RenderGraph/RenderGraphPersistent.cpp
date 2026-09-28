@@ -244,6 +244,11 @@ struct RenderGraph::PersistentExecutionState {
 		// Pending incremental slot-map patches (membership and rotation edits);
 		// applied copy-on-write before preparation instead of a full rebuild.
 		std::vector<std::pair<uint64_t, uint32_t>> slotAdds, slotRemoves;
+        std::shared_ptr<const ResourceUseLayout> resourceUses;
+        std::vector<std::vector<persistent::ViewToken>> declaredViews;
+        std::vector<persistent::BindingToken> declaredBindings;
+        struct GroupViews { uint32_t group; std::vector<BindlessViewRequest> views; };
+        std::vector<GroupViews> groupViews;
 		uint64_t fingerprint = 0; // Structural identity of the lowered declaration (membership excluded).
 		std::vector<std::pair<uint64_t, std::string>> loweredDirect; // Diagnostic: (scheduling ID, name).
 		std::vector<const void*> loweredGroupKeys;
@@ -473,6 +478,7 @@ struct LoweredGroup {
 	bool uniform = true;
 };
 struct LoweredPass {
+    std::shared_ptr<const ResourceUseLayout> resourceUses;
 	experimental::CompilePass declaration;
 	std::vector<LoweredUse> entries, exits;
 	std::vector<LoweredGroup> groups;
@@ -527,6 +533,22 @@ uint64_t FingerprintLowering(const LoweredPass& lowered) {
 	fold(0xE1); for (auto v : entries) fold(v);
 	fold(0xE2); for (auto v : exits) fold(v);
 	fold(0xE3); for (auto v : groups) fold(v);
+    if (lowered.resourceUses) for (const auto& group : lowered.resourceUses->resolverViews) {
+        fold(reinterpret_cast<uintptr_t>(group.identity.get()));
+        for (const auto view : group.views) {
+            fold(static_cast<uint64_t>(view.kind)); fold(view.variant); fold(view.mip); fold(view.slice);
+        }
+        fold(UINT64_MAX);
+    }
+    if (lowered.resourceUses) for (const auto& use : lowered.resourceUses->uses) {
+        fold(use.resolverIdentity ? reinterpret_cast<uintptr_t>(use.resolverIdentity.get()) : use.binding.registryResourceID);
+        fold(use.memberOrdinal); fold(static_cast<uint64_t>(use.state.access));
+        for (const auto view : use.requiredViews) {
+            fold(static_cast<uint64_t>(view.kind)); fold(view.variant); fold(view.mip); fold(view.slice);
+        }
+        fold(UINT64_MAX);
+    }
+
 	return h;
 }
 
@@ -538,6 +560,7 @@ uint64_t FingerprintLowering(const LoweredPass& lowered) {
 static LoweredPass LowerLegacyPass(RenderGraph& graph, ResourceRegistry& registry, const QueueRegistry& queues,
 	rhi::Backend primaryBackend, const RenderGraph::PassAndResources& pass, RenderGraph::PassType type, uint32_t phase) {
 	LoweredPass result;
+    result.resourceUses = pass.pass->ResourceUses();
 	auto& declaration = result.declaration;
 	// Queue compatibility mirrors BuildNodes for the retained path.
 	const auto& resources = pass.resources;
@@ -770,6 +793,10 @@ static void InstallMainPass(RenderGraph& graph, State& state, persistent::GraphE
 		main.id = edit.AddPass(std::move(lowered.declaration), authoredOrder);
 	}
 	edit.SetPassEpoch(main.id, main.epoch);
+    main.resourceUses = lowered.resourceUses;
+    main.declaredViews.clear();
+    main.declaredBindings.clear();
+    main.groupViews.clear();
 	main.fingerprint = FingerprintLowering(lowered);
 	main.loweredDirect.clear();
 	for (const auto& use : lowered.entries) main.loweredDirect.emplace_back(use.resourceID, use.resource ? use.resource->GetName() : std::string{});
@@ -848,6 +875,58 @@ static void InstallMainPass(RenderGraph& graph, State& state, persistent::GraphE
 			edit.DeclareGroupAccess(main.id, group.group, stateValue, mainIndex, range);
 		main.groups.push_back(groupIndex);
 	}
+    if (main.resourceUses) {
+        // Requirements belong to resolver positions, including reserved capacity,
+        // rather than to the transient resource IDs captured by Declare.
+        for (const auto& requirement : main.resourceUses->resolverViews) {
+            for (const auto groupIndex : main.groups) {
+                const auto& group = state.groups[groupIndex];
+                if (group.key != requirement.identity) continue;
+                main.groupViews.push_back({groupIndex, requirement.views});
+                for (const auto index : group.memberEntries) {
+                    auto found = tokens.find(index);
+                    if (found == tokens.end()) found = tokens.emplace(index,
+                        edit.BindGroupMember(main.id, group.group, state.entries[index].slot)).first;
+                    for (const auto view : requirement.views) edit.RequireView(found->second, view);
+                }
+            }
+        }
+        for (const auto& use : main.resourceUses->uses) {
+            main.declaredViews.emplace_back();
+            main.declaredBindings.emplace_back();
+            if (use.requiredViews.empty()) continue;
+            uint32_t index = UINT32_MAX;
+            if (use.resolverIdentity) for (const auto groupIndex : main.groups) {
+                const auto& group = state.groups[groupIndex];
+                if (group.key == use.resolverIdentity) { index = group.memberEntries.at(use.memberOrdinal); break; }
+            }
+            if (index == UINT32_MAX) for (const auto candidate : main.directEntries) {
+                const auto& entry = state.entries[candidate];
+                if (entry.resourceID == use.binding.globalResourceID ||
+                    (entry.resource && entry.resource->GetGlobalResourceID() == use.binding.registryResourceID)) { index = candidate; break; }
+            }
+            if (index == UINT32_MAX) for (const auto groupIndex : main.groups) {
+                for (const auto candidate : state.groups[groupIndex].memberEntries) {
+                    const auto& entry = state.entries[candidate];
+                    if (entry.resourceID == use.binding.globalResourceID ||
+                        (entry.resource && entry.resource->GetGlobalResourceID() == use.binding.registryResourceID)) {
+                        index = candidate;
+                        break;
+                    }
+                }
+                if (index != UINT32_MAX) break;
+            }
+            if (index == UINT32_MAX) throw std::logic_error("Declared view has no lowered resource slot: pass='"
+                + main.name + "' resource=" + std::to_string(use.binding.globalResourceID)
+                + " registry=" + std::to_string(use.binding.registryResourceID));
+            auto token = tokens.find(index);
+            if (token == tokens.end()) token = tokens.emplace(index,
+                edit.DeclareDependency(main.id, state.entries[index].slot, false)).first;
+            main.declaredBindings.back() = token->second;
+            for (const auto view : use.requiredViews)
+                main.declaredViews.back().push_back(edit.RequireView(token->second, view));
+        }
+    }
 	(void)graph;
 }
 
@@ -1458,6 +1537,13 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 			}
 			pass.hostedPrepared = static_cast<bool>(pass.hosted);
 			passPreparation.resourceSlots = pass.slots;
+            passPreparation.resolveDeclaredView = [&pass, selected](uint32_t use, uint32_t view) {
+                return selected->Resolve(pass.declaredViews.at(use).at(view));
+            };
+            passPreparation.resolveDeclaredResource = [&pass, selected](uint32_t use) {
+                return selected->ResolveNative(pass.declaredBindings.at(use));
+            };
+
 			PreparedPass packet;
 			const auto prepareStarted = std::chrono::steady_clock::now();
 			try {
@@ -2214,6 +2300,10 @@ void RenderGraph::RunPersistentStructuralBuildPhase(bool validated) {
 // True when the new lowering declares a direct resource or group the pass
 // did not declare before (the live publication has no slot for it).
 static bool LoweringAddsDeclarations(const State::MainPass& main, const LoweredPass& lowered) {
+    // A new view layout cannot prepare against the old publication while its
+    // structural edit is pending, even when the resource set is unchanged.
+    if (lowered.resourceUses && !lowered.resourceUses->uses.empty()
+        && lowered.resourceUses != main.resourceUses) return true;
 	for (const auto& use : lowered.entries) {
 		bool known = false;
 		for (const auto& previous : main.loweredDirect) if (previous.first == use.resourceID) { known = true; break; }
@@ -2270,6 +2360,14 @@ void RenderGraph::SubmitPersistentStructuralBuild(const std::vector<uint32_t>& s
 			group.memberResourceIDs.push_back(0);
 			group.freeMembers.push_back(static_cast<uint32_t>(group.memberEntries.size() - 1));
 		}
+        for (const auto subscriber : group.subscribers) {
+            const auto& main = state.mainPasses[subscriber];
+            for (const auto& requirement : main.groupViews) if (requirement.group == groupIndex)
+                for (const auto slot : more) {
+                    const auto binding = transaction.BindGroupMember(main.id, group.group, slot);
+                    for (const auto view : requirement.views) transaction.RequireView(binding, view);
+                }
+        }
 		group.capacity *= 2;
 		group.identity = {}; // Re-syncs (binding-only) after the install.
 		pending->touchedGroups.push_back(groupIndex);
@@ -3062,8 +3160,7 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 			job.queue = m_queueRegistry.GetQueue(index);
 			job.pool = m_queueRegistry.GetSharedPool(index);
 			if (!job.pool) throw std::logic_error("Recording queue has no command-list pool");
-			job.recording = experimental::BuildPersistentRecordingList(sealed, batch, static_cast<bool>(m_boundaryManifestRecorder));
-			job.recording.boundaryRecorder = m_boundaryManifestRecorder;
+			job.recording = experimental::BuildPersistentRecordingList(sealed, batch);
 			job.recording.bindings = segment.legacyBindings;
 			job.recording.frameSlot = state.frameIndex;
 			job.recording.externalEntryBarrier = m_externalQueueBoundary.entry
@@ -3351,7 +3448,10 @@ bool RenderGraph::RecordPendingUploads(rhi::Device device, rhi::CommandList& lis
 	try {
 		ImmediateExecutionContext context{device, {org::imm::ImmediatePassKind::Copy, m_immediateDispatch,
 			&TicketUploadResolveById, &TicketUploadResolveByPtr, nullptr}, slot, nullptr};
-		immediate->RecordImmediateCommands(context);
+		{
+			BT_ZONE_SCOPE("ORG.Upload.DrainImmediateCommands");
+			immediate->RecordImmediateCommands(context);
+		}
 		auto effect = immediate->TakeOwnedImmediateSubmissionEffect();
 		auto frame = context.list.Finalize();
 		if (effect) return false;  // tracked uploads signal their completion: the synchronous path's job

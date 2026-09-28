@@ -14,6 +14,7 @@
 #include "Render/QueueKind.h"
 #include "Render/Runtime/DescriptorServiceTypes.h"
 #include "Resources/GPUBacking/GpuBufferBacking.h"
+#include "Render/Runtime/ResourceCleanupQueue.h"
 
 
 namespace org {
@@ -33,8 +34,8 @@ public:
 	void Initialize();
 	void RegisterBackend(BackendInstanceId backendInstance, rhi::Device device);
 	void Cleanup();
-    const std::shared_ptr<runtime::ResourceCleanupQueue>& GetResourceCleanupQueue() const { return m_resourceCleanup; }
-    uint64_t DeviceGeneration() const { return m_deviceGeneration; }
+    std::shared_ptr<runtime::ResourceCleanupQueue> GetResourceCleanupQueue() const { return m_resourceCleanup; }
+    uint64_t DeviceGeneration() const noexcept { return m_deviceGeneration; }
 
 	void AssignDescriptorSlots(
 		GloballyIndexedResource& target,
@@ -94,6 +95,7 @@ public:
 	UINT CreateIndexedSampler(const rhi::SamplerDesc& samplerDesc);
 	rhi::DescriptorSlot AllocateDescriptorSlot(rhi::DescriptorHeapType type, bool shaderVisible);
 	void RetireDescriptorSlot(rhi::DescriptorSlot slot);
+	void RetireDescriptorSlotWithOwner(rhi::DescriptorSlot slot, std::shared_ptr<const void> owner);
 
 	const std::shared_ptr<DescriptorHeap>& GetCBVSRVUAVHeap() const { return m_cbvSrvUavHeap; }
 	const std::shared_ptr<DescriptorHeap>& GetSamplerHeap() const { return m_samplerHeap; }
@@ -138,6 +140,7 @@ private:
 	std::unordered_map<UINT, rhi::SamplerDesc> m_indexedSamplerDescriptions;
 	struct DeferredRelease {
 		std::vector<std::pair<std::shared_ptr<DescriptorHeap>, UINT>> descriptorSlots;
+		std::shared_ptr<const void> descriptorOwner;
 		std::vector<std::unique_ptr<GpuBufferBacking>> bufferBackings;
 		std::vector<std::shared_ptr<Resource>> resources;
 		std::vector<rhi::ResourcePtr> nativeResources;

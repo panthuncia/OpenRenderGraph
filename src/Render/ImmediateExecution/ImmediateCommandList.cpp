@@ -2,6 +2,7 @@
 
 #include "Render/ResourceRegistry.h"
 #include "Render/BufferBarrierHelpers.h"
+#include <BasicTelemetry/Tracy.h>
 #include <atomic>
 #include <cstdlib>
 #include <spdlog/spdlog.h>
@@ -46,6 +47,7 @@ namespace org::imm {
 
     std::shared_ptr<const PreparedBufferCopies> PreparedBufferCopies::Capture(
         const std::vector<std::byte>& bytecode, const Resolver& resolve) {
+        BT_ZONE_SCOPE("ORG.Upload.CapturePreparedCopies");
         if (bytecode.empty()) return {};
         auto result = std::make_shared<PreparedBufferCopies>();
         std::unordered_set<uint64_t> written;
@@ -69,6 +71,7 @@ namespace org::imm {
     }
 
     void PreparedBufferCopies::Record(rhi::CommandList& list) const {
+        BT_ZONE_SCOPE("ORG.Upload.RecordPreparedCopies");
         if (m_recorded.exchange(true)) throw std::logic_error("Prepared buffer copies already recorded");
         for (const auto& copy : m_copies) {
             if (copy.orderPreviousWrite) {

@@ -23,7 +23,8 @@ class BindingTableVersion;
 
 class Resource : public std::enable_shared_from_this<Resource> {
 public:
-    // Preparation owner only, before publication of this exact content version.
+    // Preparation-owner operation. The table names the exact descriptor
+    // dependencies of this allocation's contents; consumers capture it once.
     void SetBindingTableVersion(std::shared_ptr<const BindingTableVersion> version) { m_bindingTable = std::move(version); }
     const std::shared_ptr<const BindingTableVersion>& GetBindingTableVersion() const noexcept { return m_bindingTable; }
     // Installed before publication by mutable backing pools. Allocation

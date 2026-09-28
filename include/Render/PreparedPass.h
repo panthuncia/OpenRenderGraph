@@ -16,6 +16,7 @@
 #include "Render/ExternalBindings.h"
 #include "Render/PipelineState.h"
 #include "Render/BindlessResourceViews.h"
+#include "Render/ResourceUseDeclaration.h"
 #include "Render/PreparedInvocationArena.h"
 #include "Render/PublicationBindingBundle.h"
 #include "Render/RenderGraph/CompileTelemetry.h"
@@ -31,10 +32,7 @@ enum class AbandonReason : uint8_t { Shutdown, GenerationInvalidated, Preparatio
 struct PreparedResourceReference { uint32_t slot = 0; };
 // Stable declaration-time token retained by the pass. It carries no resource
 // ownership and is resolved to the request's frozen backing during Prepare.
-struct ResourceBindingToken {
-    uint64_t globalResourceID = 0;
-    uint64_t registryResourceID = 0;
-};
+
 struct PreparedDescriptorReference { uint32_t slot = 0; };
 struct PreparedProgramReference { uint32_t slot = 0; };
 struct PreparedWorkGraphReference { uint32_t slot = 0; };
@@ -385,6 +383,9 @@ private:
 };
 
 struct FramePreparationContext {
+    std::shared_ptr<const ResourceUseLayout> resourceUses;
+    std::function<rhi::DescriptorSlot(uint32_t, uint32_t)> resolveDeclaredView;
+    std::function<rhi::Resource(uint32_t)> resolveDeclaredResource;
     std::shared_ptr<PreparedInvocationArena> invocationArena;
     std::function<void(std::shared_ptr<const void>)> retireOwnership;
     rhi::Device device; // Host-owned device; valid through frame retirement.
@@ -553,30 +554,62 @@ struct FramePreparationContext {
         return dependencyCollector->CaptureDescriptor(descriptor, bindings->Owner(resource));
     }
 
-    rhi::DescriptorSlot ResolveView(ResourceBindingToken binding, BindlessViewRequest request) const {
+    const ResourceUseDeclaration& DeclaredUse(const DeclaredViewToken& token) const {
+        if (!resourceUses || token.layout != resourceUses || token.use >= resourceUses->uses.size())
+            throw std::invalid_argument("Foreign or stale declared view token");
+        const auto& use = resourceUses->uses[token.use];
+        if (token.view >= use.requiredViews.size()) throw std::invalid_argument("Invalid declared view ordinal");
+        return use;
+    }
+    rhi::DescriptorSlot Resolve(const DeclaredViewToken& token) const {
+        const auto& use = DeclaredUse(token);
+        if (resolveDeclaredView) {
+            (void)bindings->Views(DeclaredReference(token));
+            return resolveDeclaredView(token.use, token.view);
+        }
         if (!bindings) throw std::logic_error("Frozen resource bindings are unavailable during preparation");
+        const auto request = use.requiredViews[token.view];
         try {
-            return bindings->Views(CaptureResource(binding)).Resolve(request);
+            return bindings->Views(CaptureResource(use.binding)).Resolve(request);
         } catch (const std::exception& error) {
             throw std::out_of_range(std::string(error.what()) + "; resource="
-                + std::to_string(binding.globalResourceID) + "/" + std::to_string(binding.registryResourceID)
+                + std::to_string(use.binding.globalResourceID) + "/" + std::to_string(use.binding.registryResourceID)
                 + " kind=" + std::to_string(static_cast<uint32_t>(request.kind))
                 + " variant=" + std::to_string(request.variant)
                 + " mip=" + std::to_string(request.mip) + " slice=" + std::to_string(request.slice));
         }
     }
-
-    PreparedDescriptorReference CaptureView(ResourceBindingToken binding, BindlessViewRequest request) const {
-        if (!dependencyCollector || !bindings)
-            throw std::logic_error("View capture is unavailable outside typed preparation");
-        const auto resource = CaptureResource(binding);
-        return dependencyCollector->CaptureDescriptor(bindings->Views(resource).Resolve(request),
-            bindings->Owner(resource));
+    PreparedDescriptorReference Capture(const DeclaredViewToken& token) const {
+        (void)DeclaredUse(token);
+        if (!dependencyCollector || !bindings) throw std::logic_error("Declared view capture requires owned preparation");
+        return dependencyCollector->CaptureDescriptor(Resolve(token), bindings->Owner(DeclaredReference(token)));
+    }
+    PreparedResourceReference DeclaredReference(const DeclaredViewToken& token) const {
+        const auto& use = DeclaredUse(token);
+        if (!resolveDeclaredResource) return CaptureResource(use.binding);
+        const auto resource = resolveDeclaredResource(token.use);
+        const auto reference = bindings->FindByHandle(resource.GetHandle());
+        if (!reference) throw std::invalid_argument("Declared view backing is absent from frozen pass bindings");
+        return *reference;
+    }
+    void ValidateDeclaredViews() const {
+        // Persistent requirements are validated for every occupied group slot on
+        // binding edits, including members that joined since Declare ran.
+        if (!resourceUses || resolveDeclaredView) return;
+        for (uint32_t use = 0; use < resourceUses->uses.size(); ++use)
+            for (uint32_t view = 0; view < resourceUses->uses[use].requiredViews.size(); ++view) {
+                const auto slot = Resolve({resourceUses, use, view});
+                if (!slot.heap.valid()) throw std::invalid_argument("Declared view has no descriptor heap");
+            }
     }
 
     const rhi::ResourceDesc& Describe(ResourceBindingToken binding) const {
         if (!bindings) throw std::logic_error("Frozen resource bindings are unavailable during preparation");
         return bindings->Views(CaptureResource(binding)).description;
+    }
+    const rhi::ResourceDesc& Describe(const DeclaredViewToken& token) const {
+        if (!bindings) throw std::logic_error("Frozen resource bindings are unavailable during preparation");
+        return bindings->Views(DeclaredReference(token)).description;
     }
 
     rhi::ClearValue ClearValue(ResourceBindingToken binding) const {
@@ -586,10 +619,6 @@ struct FramePreparationContext {
         return views.clear;
     }
 
-    uint32_t ViewSliceCount(ResourceBindingToken binding, BindlessViewRequest request) const {
-        if (!bindings) throw std::logic_error("Frozen resource bindings are unavailable during preparation");
-        return bindings->Views(CaptureResource(binding)).SliceCount(request);
-    }
 
     rhi::Resource ResolveCapturedResource(PreparedResourceReference reference) const {
         if (!bindings) throw std::logic_error("Frozen resource bindings are unavailable during preparation");

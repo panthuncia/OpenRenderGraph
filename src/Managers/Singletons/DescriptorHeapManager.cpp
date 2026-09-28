@@ -276,7 +276,7 @@ void DescriptorHeapManager::ProcessDeferredReleases(uint8_t frameIndex) {
 
             for (auto& [heap, index] : release.descriptorSlots) {
                 if (heap) {
-                    heap->ReleaseDescriptor(index);
+                    heap->ReleaseDescriptor(index, release.descriptorOwner);
                 }
             }
             for (const auto& resource : release.resources) {
@@ -356,7 +356,7 @@ void DescriptorHeapManager::DrainDeferredReleasesAfterDeviceIdle() {
         for (auto& release : releases) {
             for (auto& [heap, index] : release.descriptorSlots) {
                 if (heap) {
-                    heap->ReleaseDescriptor(index);
+                    heap->ReleaseDescriptor(index, release.descriptorOwner);
                 }
             }
         }
@@ -947,6 +947,25 @@ void DescriptorHeapManager::RetireDescriptorSlot(rhi::DescriptorSlot slot) {
 	}
 	if (!heap) throw std::invalid_argument("Descriptor slot does not belong to ORG");
 	RetireDescriptorSlots({ { std::move(heap), slot.index } });
+}
+
+void DescriptorHeapManager::RetireDescriptorSlotWithOwner(rhi::DescriptorSlot slot, std::shared_ptr<const void> owner) {
+	if (!slot.heap.valid()) throw std::invalid_argument("Invalid descriptor slot for owned retirement");
+	std::scoped_lock lock(m_descriptorMutationMutex);
+	const std::shared_ptr<DescriptorHeap> candidates[]{ m_cbvSrvUavHeap, m_nonShaderVisibleHeap,
+		m_rtvHeap, m_dsvHeap, m_samplerHeap };
+	for (const auto& heap : candidates) {
+		if (!heap) continue;
+		const auto handle = heap->GetHeap().GetHandle();
+		if (handle.index != slot.heap.index || handle.generation != slot.heap.generation) continue;
+		DeferredRelease release{};
+		release.requiredFences = m_latestQueueFenceSnapshot;
+		release.descriptorSlots.emplace_back(heap, slot.index);
+		release.descriptorOwner = std::move(owner);
+		m_deferredReleases.push_back(std::move(release));
+		return;
+	}
+	throw std::invalid_argument("Descriptor slot does not belong to ORG");
 }
 
 

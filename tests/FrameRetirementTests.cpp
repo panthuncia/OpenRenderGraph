@@ -3,6 +3,12 @@
 #include <Render/PassExecutionContext.h>
 #include <memory>
 #include <cstdio>
+#include <atomic>
+#include <cstring>
+#include <thread>
+#include <future>
+#include <chrono>
+#include "Render/BindingTable.h"
 
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "Retirement check failed at %d: %s\n", __LINE__, #x); return __LINE__; } } while (false)
 
@@ -19,10 +25,41 @@ struct RetirementChain {
 }
 
 int TestBindingOwnership(rhi::Device device);
-int TestFrameRetirement(rhi::Device device) {
+
+int TestCompletionWake(rhi::Device device) {
+    std::unique_ptr<rhi::CompletionWait> waiter;
+    CHECK(device.CreateCompletionWait(waiter) == rhi::Result::Ok && waiter);
+    // Wake before arming must not be lost, including when there are no GPU points.
+    for (int iteration = 0; iteration < 100; ++iteration) {
+        const auto observed = waiter->WakeVersion();
+        auto future = std::async(std::launch::async, [&] { return waiter->Wait({}, observed); });
+        CHECK(waiter->Notify() == rhi::Result::Ok);
+        if (future.wait_for(std::chrono::seconds(5)) != std::future_status::ready) std::abort();
+        CHECK(future.get() == rhi::Result::Ok);
+    }
+    rhi::TimelinePtr first, second;
+    CHECK(device.CreateTimeline(first, 0, "Completion wait first") == rhi::Result::Ok);
+    CHECK(device.CreateTimeline(second, 0, "Completion wait second") == rhi::Result::Ok);
+    const rhi::TimelinePoint points[]{{first->GetHandle(), 1}, {second->GetHandle(), 1}};
+    const auto observed = waiter->WakeVersion();
+    auto future = std::async(std::launch::async, [&] { return waiter->Wait({points, 2}, observed); });
+    auto queue = device.GetQueue(rhi::QueueKind::Graphics);
+    CHECK(queue.Signal(points[1]) == rhi::Result::Ok);
+    if (future.wait_for(std::chrono::seconds(5)) != std::future_status::ready) std::abort();
+    CHECK(future.get() == rhi::Result::Ok);
+    CHECK(first->GetCompletedValue() == 0); // Wait-any, not wait-all.
+    CHECK(queue.Signal(points[0]) == rhi::Result::Ok);
+    CHECK(first->HostWait(1, 5000) == rhi::Result::Ok);
+    waiter.reset(); // Wait object precedes timelines in destruction order.
+    return 0;
+}
+
+
+int TestFrameRetirement(rhi::Device device, rhi::Backend backend) {
+    CHECK(TestCompletionWake(device) == 0);
     CHECK(TestBindingOwnership(device) == 0);
     {
-        org::RenderGraph graph(device, rhi::Backend::D3D12);
+        org::RenderGraph graph(device, backend);
         graph.StopFrameProduction();
         graph.StopFrameProduction();
         org::UpdateExecutionContext update{};
@@ -31,6 +68,28 @@ int TestFrameRetirement(rhi::Device device) {
         try { graph.Update(update, device); } catch (const std::logic_error&) { rejectedUpdate = true; }
         try { graph.Execute(execute); } catch (const std::logic_error&) { rejectedExecute = true; }
         CHECK(rejectedUpdate && rejectedExecute);
+
+        auto& retirement = org::DescriptorHeapManager::GetInstance();
+        retirement.Initialize();
+        rhi::TimelinePtr descriptorDone;
+        CHECK(device.CreateTimeline(descriptorDone, 0, "Owned descriptor retirement") == rhi::Result::Ok);
+        const auto ownedSlot = retirement.AllocateDescriptorSlot(rhi::DescriptorHeapType::CbvSrvUav, true);
+        auto cpuLease = retirement.GetCBVSRVUAVHeap()->CaptureDescriptorLease(ownedSlot.index);
+        auto ownedView = std::make_shared<int>(17);
+        std::weak_ptr<int> ownedViewWeak = ownedView;
+        retirement.PublishQueueFenceSnapshot({{descriptorDone.Get(), 1}});
+        retirement.RetireDescriptorSlotWithOwner(ownedSlot, std::move(ownedView));
+        retirement.ProcessDeferredReleases(0);
+        CHECK(!ownedViewWeak.expired());
+        auto descriptorQueue = device.GetQueue(rhi::QueueKind::Graphics);
+        CHECK(descriptorQueue.Signal({descriptorDone.Get().GetHandle(), 1}) == rhi::Result::Ok);
+        CHECK(descriptorDone.Get().HostWait(1, 10000) == rhi::Result::Ok);
+        retirement.ProcessDeferredReleases(0);
+        CHECK(!ownedViewWeak.expired()); // GPU completion alone cannot release a CPU-retained owner.
+        cpuLease.reset();
+        CHECK(ownedViewWeak.expired());
+        CHECK(device.WaitIdle() == rhi::Result::Ok);
+        retirement.DrainDeferredReleasesAfterDeviceIdle();
     }
     auto& retirement = org::DescriptorHeapManager::GetInstance();
     CHECK(device.WaitIdle() == rhi::Result::Ok);
@@ -50,6 +109,30 @@ int TestFrameRetirement(rhi::Device device) {
     CHECK(required.Get().HostWait(7, 10000) == rhi::Result::Ok);
     retirement.ProcessDeferredReleases(0);
     CHECK(weak.expired() && retirement.GetDeferredReleaseStats().releaseCount == 0);
+
+    {
+        auto heap = std::make_shared<org::DescriptorHeap>(device,
+            rhi::DescriptorHeapType::CbvSrvUav, 1, true, "Final lease callback");
+        const auto index = heap->AllocateDescriptor();
+        // A lease can disappear while the slot stays allocated, then be
+        // reacquired by a successor. The later lease must prevent recycling.
+        auto lease = heap->CaptureDescriptorLease(index);
+        lease.reset();
+        lease = heap->CaptureDescriptorLease(index);
+        auto otherConsumer = heap->CaptureDescriptorLease(index);
+        auto backing = std::make_shared<int>(123);
+        std::weak_ptr<int> backingWeak = backing;
+        heap->ReleaseDescriptor(index, std::move(backing));
+        lease.reset();
+        CHECK(!backingWeak.expired());
+        bool full = false;
+        try { (void)heap->AllocateDescriptor(); } catch (const std::runtime_error&) { full = true; }
+        CHECK(full);
+        otherConsumer.reset();
+        CHECK(backingWeak.expired()); // Callback ran before any allocation or polling.
+        CHECK(heap->AllocateDescriptor() == index);
+        heap->ReleaseDescriptor(index);
+    }
 
     {
         auto heap = std::make_shared<org::DescriptorHeap>(device,

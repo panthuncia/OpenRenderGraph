@@ -1,5 +1,6 @@
 #include "Render/Runtime/ThreadPoolTaskService.h"
 
+#include <BasicTelemetry/Tracy.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -18,6 +19,7 @@ class PoolScope final : public ITaskScope {
 public:
     void Cancel() noexcept override { m_cancelled.store(true, std::memory_order_release); }
     void Wait() override {
+        BT_ZONE_SCOPE("ORG.TaskScope.Wait");
         std::unique_lock lock(m_mutex);
         m_idle.wait(lock, [&] { return m_outstanding == 0; });
     }

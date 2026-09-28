@@ -1,6 +1,7 @@
 #include "Render/Runtime/IDescriptorService.h"
 
 #include "Managers/Singletons/DescriptorHeapManager.h"
+#include "Managers/Singletons/DeviceManager.h"
 
 namespace org::runtime {
 
@@ -63,8 +64,28 @@ public:
 		DescriptorHeapManager::GetInstance().RetireDescriptorSlot(slot);
 	}
 
+	void RetireDescriptorSlotWithOwner(rhi::DescriptorSlot slot, std::shared_ptr<const void> owner) override {
+		DescriptorHeapManager::GetInstance().RetireDescriptorSlotWithOwner(slot, std::move(owner));
+	}
+
     UINT CreateIndexedSampler(const rhi::SamplerDesc& samplerDesc) override {
         return DescriptorHeapManager::GetInstance().CreateIndexedSampler(samplerDesc);
+    }
+    OwnedDescriptorBinding CreateOwnedShaderResourceView(std::shared_ptr<const void> deviceOwner,
+        rhi::Resource resource, std::shared_ptr<const void> backingOwner, const rhi::SrvDesc& description) override {
+        auto& manager = DescriptorHeapManager::GetInstance();
+        return OwnedDescriptorBinding::CreateShaderResourceView(DeviceManager::GetInstance().GetDevice(),
+            std::move(deviceOwner), manager.DeviceGeneration(), manager.GetCBVSRVUAVHeap(), manager.GetResourceCleanupQueue(),
+            resource, std::move(backingOwner), description);
+    }
+    OwnedDescriptorBinding CreateOwnedSampler(std::shared_ptr<const void> deviceOwner,
+        const rhi::SamplerDesc& description) override {
+        auto& manager = DescriptorHeapManager::GetInstance();
+        return OwnedDescriptorBinding::CreateSampler(DeviceManager::GetInstance().GetDevice(), std::move(deviceOwner),
+            manager.DeviceGeneration(), manager.GetSamplerHeap(), manager.GetResourceCleanupQueue(), description);
+    }
+    std::shared_ptr<ResourceCleanupQueue> GetResourceCleanupQueue() const override {
+        return DescriptorHeapManager::GetInstance().GetResourceCleanupQueue();
     }
 };
 } // namespace

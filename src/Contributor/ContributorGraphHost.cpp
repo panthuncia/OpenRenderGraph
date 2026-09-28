@@ -102,24 +102,24 @@ namespace
 
 	void DeclareGeneric(org::RenderPassBuilder* builder, const ContributorRegistry::Pass& pass, const FrontendState& state)
 	{
-		for (const auto& domain : pass.featureDomains) builder->WithActiveFeatureDomain(domain);
+		for (const auto& domain : pass.featureDomains) builder->ActiveFeatureDomain(domain);
 		for (const auto& access : pass.accesses) {
 			auto resource = GenericResourceRange(access, *state.host);
 			switch (access.kind) {
-			case ORG_RG_ACCESS_SHADER_RESOURCE: builder->WithShaderResource(resource); break;
-			case ORG_RG_ACCESS_CONSTANT_BUFFER: builder->WithConstantBuffer(resource); break;
-			case ORG_RG_ACCESS_UNORDERED_ACCESS: builder->WithUnorderedAccess(resource); break;
-			case ORG_RG_ACCESS_UNORDERED_ACCESS_CLEAR: builder->WithUnorderedAccessClear(resource); break;
-			case ORG_RG_ACCESS_RENDER_TARGET: builder->WithRenderTarget(resource); break;
-			case ORG_RG_ACCESS_RENDER_TARGET_CLEAR: builder->WithRenderTargetClear(resource); break;
-			case ORG_RG_ACCESS_DEPTH_READ: builder->WithDepthRead(resource); break;
-			case ORG_RG_ACCESS_DEPTH_READ_WRITE: builder->WithDepthReadWrite(resource); break;
-			case ORG_RG_ACCESS_DEPTH_STENCIL_CLEAR: builder->WithDepthStencilClear(resource); break;
-			case ORG_RG_ACCESS_COPY_SOURCE: builder->WithCopySource(resource); break;
-			case ORG_RG_ACCESS_COPY_DESTINATION: builder->WithCopyDest(resource); break;
-			case ORG_RG_ACCESS_INDIRECT_ARGUMENT: builder->WithIndirectArguments(resource); break;
-			case ORG_RG_ACCESS_INDEX_BUFFER: builder->WithIndexBuffer(resource); break;
-			case ORG_RG_ACCESS_LEGACY_INTEROP: builder->WithLegacyInterop(resource); break;
+			case ORG_RG_ACCESS_SHADER_RESOURCE: builder->ShaderResource(resource); break;
+			case ORG_RG_ACCESS_CONSTANT_BUFFER: builder->ConstantBuffer(resource); break;
+			case ORG_RG_ACCESS_UNORDERED_ACCESS: builder->UnorderedAccess(resource); break;
+			case ORG_RG_ACCESS_UNORDERED_ACCESS_CLEAR: builder->UnorderedAccessClear(resource); break;
+			case ORG_RG_ACCESS_RENDER_TARGET: builder->RenderTarget(resource); break;
+			case ORG_RG_ACCESS_RENDER_TARGET_CLEAR: builder->RenderTargetClear(resource); break;
+			case ORG_RG_ACCESS_DEPTH_READ: builder->DepthRead(resource); break;
+			case ORG_RG_ACCESS_DEPTH_READ_WRITE: builder->DepthReadWrite(resource); break;
+			case ORG_RG_ACCESS_DEPTH_STENCIL_CLEAR: builder->DepthStencilClear(resource); break;
+			case ORG_RG_ACCESS_COPY_SOURCE: builder->CopySource(resource); break;
+			case ORG_RG_ACCESS_COPY_DESTINATION: builder->CopyDestination(resource); break;
+			case ORG_RG_ACCESS_INDIRECT_ARGUMENT: builder->IndirectArguments(resource); break;
+			case ORG_RG_ACCESS_INDEX_BUFFER: builder->IndexBuffer(resource); break;
+			case ORG_RG_ACCESS_LEGACY_INTEROP: builder->LegacyInterop(resource); break;
 			default: throw std::runtime_error("Unsupported render-pass resource access");
 			}
 		}
@@ -127,16 +127,16 @@ namespace
 
 	void DeclareGeneric(org::ComputePassBuilder* builder, const ContributorRegistry::Pass& pass, const FrontendState& state)
 	{
-		for (const auto& domain : pass.featureDomains) builder->WithActiveFeatureDomain(domain);
+		for (const auto& domain : pass.featureDomains) builder->ActiveFeatureDomain(domain);
 		for (const auto& access : pass.accesses) {
 			auto resource = GenericResourceRange(access, *state.host);
 			switch (access.kind) {
-			case ORG_RG_ACCESS_SHADER_RESOURCE: builder->WithShaderResource(resource); break;
-			case ORG_RG_ACCESS_CONSTANT_BUFFER: builder->WithConstantBuffer(resource); break;
-			case ORG_RG_ACCESS_UNORDERED_ACCESS: builder->WithUnorderedAccess(resource); break;
-			case ORG_RG_ACCESS_UNORDERED_ACCESS_CLEAR: builder->WithUnorderedAccessClear(resource); break;
-			case ORG_RG_ACCESS_INDIRECT_ARGUMENT: builder->WithIndirectArguments(resource); break;
-			case ORG_RG_ACCESS_LEGACY_INTEROP: builder->WithLegacyInterop(resource); break;
+			case ORG_RG_ACCESS_SHADER_RESOURCE: builder->ShaderResource(resource); break;
+			case ORG_RG_ACCESS_CONSTANT_BUFFER: builder->ConstantBuffer(resource); break;
+			case ORG_RG_ACCESS_UNORDERED_ACCESS: builder->UnorderedAccess(resource); break;
+			case ORG_RG_ACCESS_UNORDERED_ACCESS_CLEAR: builder->UnorderedAccessClear(resource); break;
+			case ORG_RG_ACCESS_INDIRECT_ARGUMENT: builder->IndirectArguments(resource); break;
+			case ORG_RG_ACCESS_LEGACY_INTEROP: builder->LegacyInterop(resource); break;
 			default: throw std::runtime_error("Unsupported compute-pass resource access");
 			}
 		}
@@ -146,8 +146,8 @@ namespace
 	{
 		for (const auto& access : pass.accesses) {
 			auto resource = GenericResourceRange(access, *state.host);
-			if (access.kind == ORG_RG_ACCESS_COPY_SOURCE) builder->WithCopySource(resource);
-			else if (access.kind == ORG_RG_ACCESS_COPY_DESTINATION) builder->WithCopyDest(resource);
+			if (access.kind == ORG_RG_ACCESS_COPY_SOURCE) builder->CopySource(resource);
+			else if (access.kind == ORG_RG_ACCESS_COPY_DESTINATION) builder->CopyDestination(resource);
 			else throw std::runtime_error("Unsupported copy-pass resource access");
 		}
 	}

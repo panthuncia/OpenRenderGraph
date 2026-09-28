@@ -1,8 +1,10 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <functional>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -41,7 +43,6 @@ public:
 		// Optional; a ThreadPoolTaskService is created when absent.
 		std::shared_ptr<runtime::ITaskService> tasks;
 		RenderGraph::ExternalQueueBoundary queueBoundary{};
-		RenderGraph::BoundaryManifestRecorder boundaryManifestRecorder;
 		uint32_t framesInFlight = 3;
 		// Host epochs: the order the host runs them in within its own frame (see
 		// RenderGraph::SetPersistentEpochOrder). Passes declare theirs with
@@ -88,7 +89,7 @@ public:
 	// admitted, recorded and submitted: the graph was compiled once for the whole
 	// host frame, and this is one execution split of it.
 	void ExecuteFrame(const IHostExecutionData* hostData = nullptr, const FrameCallback& beforePrepare = {},
-		uint32_t epoch = UINT32_MAX);  // persistent::AllEpochs
+		uint32_t epoch = UINT32_MAX, std::shared_ptr<const void> resourceOwner = {});  // persistent::AllEpochs
 
 	// Retires the current graph: stops frame production and waits for its work.
 	void DestroyGraph();
@@ -107,7 +108,68 @@ public:
 	// if a pass would now prepare differently; records the uploads queued since the last submission; and
 	// hands both to the queue - timeline values are assigned here, in submission order. Throws when the
 	// graph failed (on either thread).
-	void SubmitEpoch(uint32_t epoch, const FrameCallback& beforeSubmit = {});
+	// resourceOwner pins immutable descriptors/imports named by this execution
+	// until all accepted queue submissions complete, even without slot reuse.
+	void SubmitEpoch(uint32_t epoch, const FrameCallback& beforeSubmit = {}, std::shared_ptr<const void> resourceOwner = {});
+	// A render-thread snapshot of complete, current tickets for all required
+	// epochs. The async worker never removes ticket cells; only this render
+	// thread can consume them. It also retains one control-mailbox credit per
+	// unsubmitted epoch; Clear (or destruction) releases unused credits. Retaining
+	// a ticket does not reserve a future graph rebuild or make arbitrary
+	// beforeSubmit mutations compatible.
+	class FrameTicketReservation {
+		friend class PersistentGraphHost;
+	public:
+		FrameTicketReservation() = default;
+		~FrameTicketReservation() { Clear(); }
+		FrameTicketReservation(const FrameTicketReservation&) = delete;
+		FrameTicketReservation& operator=(const FrameTicketReservation&) = delete;
+		FrameTicketReservation(FrameTicketReservation&& other) noexcept { *this = std::move(other); }
+		FrameTicketReservation& operator=(FrameTicketReservation&& other) noexcept {
+			if (this != &other) {
+				Clear();
+				tickets = std::move(other.tickets);
+				generation = std::exchange(other.generation, 0);
+				controlCredits = std::move(other.controlCredits);
+				heldCredits = std::exchange(other.heldCredits, 0);
+				resourceOwner = std::move(other.resourceOwner);
+			}
+			return *this;
+		}
+		void Clear() {
+			if (controlCredits && heldCredits) controlCredits->fetch_sub(heldCredits, std::memory_order_relaxed);
+			controlCredits.reset();
+			heldCredits = 0;
+			tickets.clear();
+			resourceOwner.reset();
+			generation = 0;
+		}
+		bool Empty() const { return tickets.empty(); }
+		// Retain immutable resource bindings from ownership selection through every
+		// submitted ticket. The owner itself handles cleanup-lane final release.
+		void HoldResources(std::shared_ptr<const void> owner) { resourceOwner = std::move(owner); }
+	private:
+		struct Entry { uint32_t epoch = 0; std::shared_ptr<RenderGraph::PersistentTicket> ticket; };
+		std::vector<Entry> tickets;
+		uint64_t generation = 0;
+		std::shared_ptr<std::atomic<uint32_t>> controlCredits;
+		uint32_t heldCredits = 0;
+		std::shared_ptr<const void> resourceOwner;
+	};
+	// Returns false immediately when any ticket is absent/stale, a rebuild is
+	// pending, or the async host is unavailable. Leaves destination empty on
+	// failure; no graph build, ticket wait, or inline preparation occurs.
+	bool TryReserveReadyEpochs(std::span<const uint32_t> epochs, FrameTicketReservation& destination);
+	// Consumes one exact ticket from the reservation, with no ticket wait or
+	// reprepare. BeforeSubmit may patch latches/uploads but must not invalidate
+	// ticket invocation revisions; doing so throws instead of skipping a draw.
+	bool TrySubmitReservedEpoch(FrameTicketReservation& reservation, uint32_t epoch, const FrameCallback& beforeSubmit = {});
+	// Render-thread producer, nonblocking admission. The callback must own every
+	// input it uses; it runs on the graph-owning async thread with upload and
+	// descriptor services active, outside an epoch callback. False means the
+	// bounded mailbox is full or async epochs are unavailable; the caller retains
+	// its request for retry. A callback exception faults the async host.
+	bool TryPostOwnedPreparation(FrameCallback& request);
 	// SubmitEpoch counters since the last call.
 	struct AsyncStats {
 		uint64_t submitted = 0;
@@ -179,14 +241,22 @@ private:
 	RenderGraph::GpuPassRangeEnd m_gpuPassRangeEnd;
 	FrameTimings m_lastTimings{};
 	uint64_t m_lastHostFrame = 0;
+	uint64_t m_ticketGeneration = 0;
 	struct Async;
 	std::unique_ptr<Async> m_async;
+	// A failed/uncertain GPU completion cannot release submitted owners during
+	// a graph rebuild. Keep them until device teardown has stopped execution.
+	std::vector<std::shared_ptr<const void>> m_uncertainExecutionOwners;
+	std::vector<std::shared_ptr<void>> m_uncertainUploadOwners;
 	uint32_t m_asyncSlot = 0;
 	std::vector<uint32_t> m_asyncEpochs;  // restarted with these after a rebuild
 	AsyncStats m_asyncStats{};
 	void StartAsync();
 	void StopAsync();
 	void PrepareTicket(Async& state, uint32_t epochIndex, int32_t requestedSlot);
+	void SubmitTicket(Async& state, uint32_t epochIndex, std::shared_ptr<RenderGraph::PersistentTicket> ticket,
+		const FrameCallback& beforeSubmit, bool allowReprepare, FrameTicketReservation* reservation = nullptr,
+		std::shared_ptr<const void> resourceOwner = {});
 };
 
 } // namespace org

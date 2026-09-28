@@ -18,6 +18,7 @@ struct UploadTarget;
 
 class ResourceRegistryView;
 class RenderPassBuilder;
+std::shared_ptr<const ResourceUseLayout> GetResourceUses(const RenderPassBuilder& builder);
 struct PassParameters;
 
 // Queue-agnostic pass lifecycle. Queue eligibility is stored in the pass
@@ -25,6 +26,9 @@ struct PassParameters;
 class RenderGraphPass : public IResourceProvider, public RenderGraphPassBase {
 public:
     virtual ~RenderGraphPass() = default;
+    std::shared_ptr<const ResourceUseLayout> ResourceUses() const { return m_resourceUses; }
+    void SetResourceUses(std::shared_ptr<const ResourceUseLayout> uses) { m_resourceUses = std::move(uses); }
+
     // Nonvirtual to preserve contributor vtables. The graph installs its exact
     // service generation before Setup; accepted frames retain the same owners.
     void ConfigureRuntimeServices(
@@ -64,6 +68,7 @@ protected:
     void UploadBufferData(const void* data, size_t size, runtime::UploadTarget target,
         size_t offset, std::source_location source = std::source_location::current()) const;
 private:
+    std::shared_ptr<const ResourceUseLayout> m_resourceUses;
     std::weak_ptr<runtime::IUploadService> m_uploadService;
     std::weak_ptr<runtime::IDescriptorService> m_descriptorService;
 };

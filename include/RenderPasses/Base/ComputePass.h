@@ -109,22 +109,6 @@ protected:
 		return indices;
 	}
 
-	void RegisterSRV(SRVViewType type, ResourceIdentifier id, unsigned int mip = 0, unsigned int slice = 0) {
-		m_resourceDescriptorIndexHelper->RegisterSRV(type, id, mip, slice);
-	}
-	void RegisterSRV(ResourceIdentifier id, unsigned int mip = 0, unsigned int slice = 0) {
-		m_resourceDescriptorIndexHelper->RegisterSRV(id, mip, slice);
-	}
-	void RegisterUAV(ResourceIdentifier id, unsigned int mip = 0, unsigned int slice = 0) {
-		m_resourceDescriptorIndexHelper->RegisterUAV(id, mip, slice);
-	}
-	void RegisterUAV(UAVViewType type, ResourceIdentifier id, unsigned int mip = 0, unsigned int slice = 0) {
-		m_resourceDescriptorIndexHelper->RegisterUAV(type, id, mip, slice);
-	}
-	void RegisterCBV(ResourceIdentifier id) {
-		m_resourceDescriptorIndexHelper->RegisterCBV(id);
-	}
-
 	virtual std::shared_ptr<Resource> ProvideResource(ResourceIdentifier const& /*key*/) { return nullptr; }
 	virtual std::vector<ResourceIdentifier> GetSupportedKeys() { return {}; }
 

@@ -85,6 +85,10 @@ PixelBuffer::PixelBuffer(const TextureDescription& desc, bool materialize)
 {
     m_hasLayout = true;
     m_desc = desc;
+    // Graph declarations can precede backing allocation. Keep range validation
+    // tied to the logical texture description from construction onward.
+    m_mipLevels = ResolveTextureMipLevels(desc);
+    m_arraySize = desc.isCubemap ? 6u * desc.arraySize : (desc.isArray ? desc.arraySize : 1u);
     if (materialize) {
         Materialize();
     }
