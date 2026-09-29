@@ -126,6 +126,13 @@ public:
         return 0;
     }
     virtual void ProcessDeferredReleases(uint8_t frameIndex) = 0;
+    // Owner thread: ProcessDeferredReleases, except that the GPU objects retiring at this step are handed back instead of
+    // destroyed here. They are already safe to destroy; they go when the returned owner is dropped, on the thread that
+    // drops it - for a host whose render thread must not pay for driver frees.
+    virtual std::shared_ptr<void> ProcessDeferredReleasesRetiringElsewhere(uint8_t frameIndex) {
+        ProcessDeferredReleases(frameIndex);
+        return {};
+    }
 
     // ── Worker upload path (copy queue, CopyQueueUploadService) ──────
     // Never touches the frame upload instance: bytes are staged into the

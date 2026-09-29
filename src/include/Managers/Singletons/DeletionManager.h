@@ -21,6 +21,16 @@ public:
 		uint64_t trackedAllocationCount = 0;
 	};
 
+	// What one retirement step (Rotate) retired: safe to destroy, and destroyed wherever the owner drops it. Members are
+	// destroyed in reverse order, so the objects go first, then the allocations, then the tracked allocations.
+	struct Retired {
+		std::vector<TrackedHandle> trackedAllocations;
+		std::vector<rhi::ma::AllocationPtr> allocations;
+		std::vector<rhi::helpers::AnyObjectPtr> objects;
+
+		bool Empty() const noexcept { return objects.empty() && allocations.empty() && trackedAllocations.empty(); }
+	};
+
 	static DeletionManager& GetInstance();
 
 	bool IsInitialized() const {
@@ -62,25 +72,35 @@ public:
 		m_trackedAllocationDeletionQueue[0].push_back(std::move(alloc));
 	}
 
-	void ProcessDeletions() {
+	// One retirement step: the oldest queue retires and every other ages by one. The retired objects are returned, not
+	// destroyed: the destruction (driver frees, taking the device's memory locks) happens after this lock is released, on
+	// whichever thread the caller chooses, so MarkForDelete never waits for it.
+	Retired Rotate() {
+		Retired retired;
 		std::scoped_lock lock(m_mutex);
 		if (!IsInitializedUnlocked()) {
-			return;
+			return retired;
 		}
-		m_deletionQueue.back().clear();
+		retired.objects.swap(m_deletionQueue.back());
 		for (int i = static_cast<int>(m_deletionQueue.size()) - 1; i >= 1; --i) {
 			m_deletionQueue[i].swap(m_deletionQueue[i - 1]);
 		}
 
-		m_allocationDeletionQueue.back().clear();
+		retired.allocations.swap(m_allocationDeletionQueue.back());
 		for (int i = static_cast<int>(m_allocationDeletionQueue.size()) - 1; i >= 1; --i) {
 			m_allocationDeletionQueue[i].swap(m_allocationDeletionQueue[i - 1]);
 		}
 
-		m_trackedAllocationDeletionQueue.back().clear();
+		retired.trackedAllocations.swap(m_trackedAllocationDeletionQueue.back());
 		for (int i = static_cast<int>(m_trackedAllocationDeletionQueue.size()) - 1; i >= 1; --i) {
 			m_trackedAllocationDeletionQueue[i].swap(m_trackedAllocationDeletionQueue[i - 1]);
 		}
+		return retired;
+	}
+
+	// One retirement step, destroying what retires on the calling thread.
+	void ProcessDeletions() {
+		(void)Rotate();
 	}
 
 	Stats GetStats() const {

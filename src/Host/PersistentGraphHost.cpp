@@ -223,6 +223,7 @@ struct PersistentGraphHost::Async {
 		uint32_t epochIndex = 0;
 		int32_t slot = -1;  // Discard: the slot to prepare the epoch's replacement ticket into, or -1 for none
 		std::shared_ptr<void> keepAlive;          // the uploads' staging, until the slot completes
+		std::shared_ptr<void> retired;            // Submitted: GPU objects that retired at this submission, destroyed on the host's thread
 		std::shared_ptr<const void> resourceOwner;
 		std::pair<uint32_t, uint64_t> uploadSignal{UINT32_MAX, 0};
 		FrameCallback ownedPrepare;
@@ -392,9 +393,13 @@ void PersistentGraphHost::StartAsync() {
 						slot.pending = !slot.points.empty();
 						slot.reserved = false;
 						slot.hostFrame = RenderGraph::PersistentTicketHostFrame(*message.ticket);
-						slot.keepAlive = std::move(state->uncertainUploadOwner);
-						slot.resourceOwner = std::move(state->uncertainResourceOwner);
+							slot.keepAlive = std::move(state->uncertainUploadOwner);
+							slot.resourceOwner = std::move(state->uncertainResourceOwner);
 						state->needsTicket[message.epochIndex] = 1;
+						if (message.retired) {
+							BT_ZONE_SCOPE("ORG.Host.DestroyRetired.Worker");
+							message.retired.reset();
+						}
 						break;
 					}
 					case Async::Message::Kind::Discard:
@@ -684,8 +689,11 @@ void PersistentGraphHost::SubmitTicket(Async& async, uint32_t index, std::shared
 	const uint32_t slot = RenderGraph::PersistentTicketSlot(*ticket);
 	m_asyncSlot = slot;
 	runtime::ScopedActiveGraphServices services(m_graph->GetUploadService(), m_graph->GetDescriptorService());
-	// The host's thread waited for this slot before preparing the ticket: its upload pages are free again.
-	if (auto* uploads = m_graph->GetUploadService()) uploads->ProcessDeferredReleases(static_cast<uint8_t>(slot));
+	// The host's thread waited for this slot before preparing the ticket: its upload pages are free again. What retires from
+	// the deletion queues goes to the host's thread with the submission: its driver frees take the device's memory locks,
+	// which the render thread must not wait on here.
+	std::shared_ptr<void> retired;
+	if (auto* uploads = m_graph->GetUploadService()) retired = uploads->ProcessDeferredReleasesRetiringElsewhere(static_cast<uint8_t>(slot));
 	lap(m_lastTimings.releaseUs);
 	if (beforeSubmit) {
 		BT_ZONE_SCOPE("ORG.Host.CommitInputs");
@@ -742,6 +750,7 @@ void PersistentGraphHost::SubmitTicket(Async& async, uint32_t index, std::shared
 	submitted.kind = Async::Message::Kind::Submitted;
 	submitted.epochIndex = index;
 	submitted.keepAlive = std::move(keepAlive);
+	submitted.retired = std::move(retired);
 	submitted.resourceOwner = reservation ? reservation->resourceOwner : std::move(resourceOwner);
 	if (recorded) {
 		BT_ZONE_SCOPE("ORG.Host.EnqueueUploads");

@@ -127,6 +127,13 @@ public:
         DeletionManager::GetInstance().ProcessDeletions();
     }
 
+    std::shared_ptr<void> ProcessDeferredReleasesRetiringElsewhere(uint8_t frameIndex) override {
+        UploadManager::GetInstance().ProcessDeferredReleases(frameIndex);
+        auto retired = DeletionManager::GetInstance().Rotate();
+        if (retired.Empty()) return {};
+        return std::make_shared<DeletionManager::Retired>(std::move(retired));
+    }
+
     std::shared_ptr<TrackedUploadTicket> QueueTrackedStreamingUploadSegments(
         std::span<const StreamingUploadSegment> segments, size_t totalSize,
         WorkerOwnedDestination destination, size_t dstOffset) override {
