@@ -217,11 +217,11 @@ void PersistentGraphHost::ExecuteFrame(const IHostExecutionData* hostData, const
 struct PersistentGraphHost::Async {
 	using Ticket = RenderGraph::PersistentTicket;
 	struct Message {
-		enum class Kind : uint8_t { Submitted, Discard, PrepareNow, OwnedPrepare, Stop } kind = Kind::Stop;
+		enum class Kind : uint8_t { Submitted, Discard, OwnedPrepare, Stop } kind = Kind::Stop;
 		std::shared_ptr<Ticket> ticket;
 		RenderGraph::PersistentTicketSubmission submission;
 		uint32_t epochIndex = 0;
-		int32_t slot = -1;
+		int32_t slot = -1;  // Discard: the slot to prepare the epoch's replacement ticket into, or -1 for none
 		std::shared_ptr<void> keepAlive;          // the uploads' staging, until the slot completes
 		std::shared_ptr<const void> resourceOwner;
 		std::pair<uint32_t, uint64_t> uploadSignal{UINT32_MAX, 0};
@@ -400,10 +400,14 @@ void PersistentGraphHost::StartAsync() {
 					case Async::Message::Kind::Discard:
 						state->slots[RenderGraph::PersistentTicketSlot(*message.ticket)].reserved = false;
 						(void)graph->CompletePersistentTicket(*message.ticket, {});
-						state->needsTicket[message.epochIndex] = 1;
-						break;
-					case Async::Message::Kind::PrepareNow:
-						PrepareTicket(*state, message.epochIndex, message.slot);
+						// A discard naming a slot is a stale ticket's reprepare: its replacement is prepared here, in the same
+						// step, into the slot the render thread is recording. Marking the epoch as needing a ticket instead
+						// would let the proactive pass below prepare one into a slot of its own choosing, which the render
+						// thread would take while it records into the other slot's upload list.
+						if (message.slot >= 0)
+							PrepareTicket(*state, message.epochIndex, message.slot);
+						else
+							state->needsTicket[message.epochIndex] = 1;
 						break;
 					case Async::Message::Kind::OwnedPrepare: {
 						runtime::ScopedActiveGraphServices services(graph->GetUploadService(), graph->GetDescriptorService());
@@ -697,18 +701,19 @@ void PersistentGraphHost::SubmitTicket(Async& async, uint32_t index, std::shared
 		discard.kind = Async::Message::Kind::Discard;
 		discard.epochIndex = index;
 		discard.ticket = std::move(ticket);
-		postControl(discard);
 		if (!allowReprepare) {
+			postControl(discard);
 			// A reserved ticket becoming stale is an execution-contract violation. Never wait or
 			// silently omit a draw after native ownership may have been claimed.
 			throw std::logic_error("Reserved async epoch ticket became stale before submission");
 		}
-		Async::Message prepare;
-		prepare.kind = Async::Message::Kind::PrepareNow;
-		prepare.epochIndex = index;
-		prepare.slot = static_cast<int32_t>(slot);
-		if (!async.Post(prepare)) throw std::runtime_error("Async epoch host stopped before reprepare");
+		// The discard and the reprepare are one message, so the worker prepares the replacement into this slot before it
+		// can prepare the epoch's next ticket anywhere else (the Discard handler).
+		discard.slot = static_cast<int32_t>(slot);
+		postControl(discard);
 		ticket = async.WaitTicket(index);
+		if (RenderGraph::PersistentTicketSlot(*ticket) != slot)
+			throw std::logic_error("A reprepared async epoch ticket is not for the slot whose upload list the render thread records");
 	}
 	// The submitted ticket's frame: one prepared again above has a new number, and the completed-frame callback
 	// reports it by that one.
@@ -755,7 +760,7 @@ void PersistentGraphHost::SubmitTicket(Async& async, uint32_t index, std::shared
 		if (uploadResult != rhi::Result::Ok) {
 			if (submitted.resourceOwner) m_uncertainExecutionOwners.push_back(std::move(submitted.resourceOwner));
 			if (submitted.keepAlive) m_uncertainUploadOwners.push_back(std::move(submitted.keepAlive));
-			throw std::runtime_error("Async epochs could not submit their uploads (rhi::Result " + std::to_string(static_cast<int>(uploadResult)) + ")");
+			throw std::runtime_error(std::string("Async epochs could not submit their uploads (rhi::Result ") + rhi::ResultName(uploadResult) + ")");
 		}
 		submitted.uploadSignal = {async.graphicsSlot, value};
 	}

@@ -933,6 +933,11 @@ size_t UploadInstance::RecordStagedUploads(rhi::CommandList& list, uint8_t frame
 				} else {
 					writtenIt->second.push_back({target, begin, end});
 				}
+				// A copy past the target's current backing is the producer's defect (staged against another size): the RHI
+				// rejects it and the submission fails, so name it here, where the target's name is known.
+				if (const auto* buffer = dynamic_cast<const Buffer*>(entry.target.pinned.get()); buffer && end > buffer->GetSize())
+					spdlog::error("UploadInstance '{}': staged upload of {} bytes at {} into '{}' is past its {} bytes", m_debugName, entry.size,
+						entry.dstOffset, buffer->GetName(), buffer->GetSize());
 				list.CopyBufferRegion(target, entry.dstOffset, entry.page->GetAPIResource().GetHandle(), entry.pageOffset, entry.size);
 				++copies;
 				bytes += entry.size;
