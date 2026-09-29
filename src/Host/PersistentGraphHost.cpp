@@ -755,7 +755,7 @@ void PersistentGraphHost::SubmitTicket(Async& async, uint32_t index, std::shared
 		if (uploadResult != rhi::Result::Ok) {
 			if (submitted.resourceOwner) m_uncertainExecutionOwners.push_back(std::move(submitted.resourceOwner));
 			if (submitted.keepAlive) m_uncertainUploadOwners.push_back(std::move(submitted.keepAlive));
-			throw std::runtime_error("Async epochs could not submit their uploads");
+			throw std::runtime_error("Async epochs could not submit their uploads (rhi::Result " + std::to_string(static_cast<int>(uploadResult)) + ")");
 		}
 		submitted.uploadSignal = {async.graphicsSlot, value};
 	}
