@@ -1,5 +1,9 @@
 #pragma once
 
+#ifdef _WIN32
+// Consumers use Microsoft::WRL::ComPtr through this header.
+#include <wrl/client.h>
+#endif
 #include <rhi.h>
 #include <queue>
 #include <vector>
