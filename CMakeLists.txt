@@ -74,6 +74,10 @@ else()
 endif()
 set(OPENRENDERGRAPH_SPDLOG_TARGET "${_org_default_spdlog_target}" CACHE STRING "spdlog target linked by OpenRenderGraph")
 find_package(flecs CONFIG REQUIRED)
+# DirectXMath ships with the Windows SDK; elsewhere it comes from its package (vcpkg: directxmath).
+if(NOT WIN32)
+    find_package(directxmath CONFIG REQUIRED)
+endif()
 find_package(Boost REQUIRED COMPONENTS container_hash)
 if(OPENRENDERGRAPH_ENABLE_DEBUG_UI)
     find_package(imgui CONFIG REQUIRED)
@@ -195,6 +199,9 @@ target_link_libraries(OpenRenderGraph
         Boost::container_hash
         ${OPENRENDERGRAPH_SPDLOG_TARGET}
 )
+if(NOT WIN32)
+    target_link_libraries(OpenRenderGraph PUBLIC Microsoft::DirectXMath)
+endif()
 
 # Nsight Perf for Telemetry/NvPerfCapture: an NVPerf::Host target a parent project defines, or the SDK at ORG_NVPERF_ROOT.
 # The host library is linked normally; a host that must load without it (a plugin) delay-loads nvperf_grfx_host.dll and

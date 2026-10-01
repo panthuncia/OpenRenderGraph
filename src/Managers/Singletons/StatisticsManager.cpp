@@ -1,4 +1,5 @@
 #include "Managers/Singletons/StatisticsManager.h"
+#include "Utilities/EnvironmentFlag.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -24,14 +25,7 @@ void UpdateEma(double& value, double sample) {
 }
 
 bool MemoryIntrospectionLoggingEnabled() {
-    static const bool enabled = [] {
-        char* value = nullptr;
-        size_t valueLength = 0;
-        const bool result = _dupenv_s(&value, &valueLength, "SARP_MEMORY_INTROSPECTION_LOG") == 0 &&
-            value != nullptr && valueLength > 1 && value[0] != '0';
-        std::free(value);
-        return result;
-    }();
+    static const bool enabled = org::detail::EnvironmentFlagEnabled("SARP_MEMORY_INTROSPECTION_LOG");
     return enabled;
 }
 

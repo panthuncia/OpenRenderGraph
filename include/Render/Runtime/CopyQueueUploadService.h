@@ -62,7 +62,10 @@ public:
     CopyQueueUploadService& operator=(const CopyQueueUploadService&) = delete;
 
     // The queue must be a copy queue of `device`. Idempotent.
-    void Initialize(rhi::Device device, rhi::Queue copyQueue, Config config = {});
+    void Initialize(rhi::Device device, rhi::Queue copyQueue, Config config);
+    // Not a `Config config = {}` default: GCC rejects a nested class's default member
+    // initializers in a default argument of the enclosing class.
+    void Initialize(rhi::Device device, rhi::Queue copyQueue) { Initialize(device, copyQueue, Config{}); }
     bool Initialized() const noexcept { return m_initialized.load(std::memory_order_acquire); }
 
     // Copies `totalSize` bytes gathered from `segments` to `destination` at

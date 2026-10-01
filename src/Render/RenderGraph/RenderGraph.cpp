@@ -1,4 +1,5 @@
 #include "Render/RenderGraph/RenderGraph.h"
+#include "Utilities/EnvironmentFlag.h"
 #include "RenderGraphCompilerState.h"
 #include "FrameRecording.h"
 #include "FrameWorker.h"
@@ -155,16 +156,7 @@ namespace {
 
 	bool SarpClodImportDebugLoggingEnabled()
 	{
-		static const bool enabled = [] {
-			char* value = nullptr;
-			size_t length = 0;
-			if (_dupenv_s(&value, &length, "SARP_DEBUG_CLOD_IMPORT") != 0 || value == nullptr) {
-				return false;
-			}
-			const bool result = length > 1 && value[0] != '0';
-			std::free(value);
-			return result;
-		}();
+		static const bool enabled = org::detail::EnvironmentFlagEnabled("SARP_DEBUG_CLOD_IMPORT");
 		return enabled;
 	}
 

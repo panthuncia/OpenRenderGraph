@@ -45,6 +45,110 @@ private:
 
 } // namespace
 
+// Defined before the constructor: a throwing constructor destroys m_async, and clang instantiates
+// ~unique_ptr<Async> there.
+struct PersistentGraphHost::Async {
+	using Ticket = RenderGraph::PersistentTicket;
+	struct Message {
+		enum class Kind : uint8_t { Submitted, Discard, OwnedPrepare, Stop } kind = Kind::Stop;
+		std::shared_ptr<Ticket> ticket;
+		RenderGraph::PersistentTicketSubmission submission;
+		uint32_t epochIndex = 0;
+		int32_t slot = -1;  // Discard: the slot to prepare the epoch's replacement ticket into, or -1 for none
+		std::shared_ptr<void> keepAlive;          // the uploads' staging, until the slot completes
+		std::shared_ptr<void> retired;            // Submitted: GPU objects that retired at this submission, destroyed on the host's thread
+		std::shared_ptr<const void> resourceOwner;
+		std::pair<uint32_t, uint64_t> uploadSignal{UINT32_MAX, 0};
+		FrameCallback ownedPrepare;
+	};
+
+	std::vector<uint32_t> epochs;
+	// One ticket cell per epoch: stored by the host's thread, taken by the render thread.
+	std::unique_ptr<std::atomic<std::shared_ptr<Ticket>>[]> cells;
+	// Render thread -> host thread, single producer / single consumer, in order.
+	static constexpr uint64_t kMailbox = 64;
+	std::array<Message, kMailbox> mailbox;
+	std::atomic<uint64_t> written{0}, read{0};
+	// Credits held by render-thread frame reservations. Owned preparation may not
+	// consume these cells, so a reserved submission always has a control-message
+	// slot even when the worker is busy.
+	std::shared_ptr<std::atomic<uint32_t>> controlCredits = std::make_shared<std::atomic<uint32_t>>(0);
+	std::unique_ptr<rhi::CompletionWait> completionWake;
+	// Ticket publication and terminal failure both advance this counter. A
+	// notify on an unchanged null shared_ptr cannot release atomic::wait(nullptr).
+	std::atomic<uint32_t> ticketWake{0};
+	std::atomic<bool> failed{false};
+	std::string error;  // written before failed is set
+	std::thread thread;
+
+	// Host thread only.
+	struct Slot {
+		std::vector<std::pair<rhi::Timeline*, uint64_t>> points;  // its last submission's completion
+		uint64_t hostFrame = 0;
+		bool pending = false;   // submitted work not yet waited for
+		bool reserved = false;  // held by a ticket that has not been submitted
+		std::shared_ptr<void> keepAlive;
+		std::shared_ptr<const void> resourceOwner;
+	};
+	std::vector<Slot> slots;
+	// The worker stops on the first completion exception. Preserve the one
+	// submitted message it was processing until device teardown.
+	std::shared_ptr<void> uncertainUploadOwner;
+	std::shared_ptr<const void> uncertainResourceOwner;
+	std::vector<uint8_t> needsTicket;
+	uint64_t nextSlot = 0;
+	uint64_t hostFrame = 0;
+
+	// Render thread only.
+	std::vector<uint64_t> queueValues;  // the last value assigned per queue slot
+	// Per frame slot. Reset and begun by the host's thread when it prepares the slot's ticket (after the slot's
+	// wait: the slot's last upload list is done), then recorded, ended and submitted by the render thread; the
+	// ticket cell orders the two.
+	std::vector<CommandListPair> uploadLists;
+	uint32_t graphicsSlot = 0;
+	rhi::Queue graphicsQueue;
+	rhi::TimelineHandle graphicsFence{};
+
+	uint32_t IndexOf(uint32_t epoch) const {
+		for (uint32_t i = 0; i < epochs.size(); ++i) if (epochs[i] == epoch) return i;
+		throw std::invalid_argument("SubmitEpoch: epoch " + std::to_string(epoch) + " has no ticket");
+	}
+	bool TryPost(Message& message, bool spendsReservedCredit = false) {
+		const auto index = written.load(std::memory_order_relaxed);
+		const auto credits = controlCredits->load(std::memory_order_relaxed);
+		if (spendsReservedCredit && !credits) return false;
+		const auto protectedCredits = credits - static_cast<uint32_t>(spendsReservedCredit);
+		if (failed.load(std::memory_order_acquire)
+			|| index - read.load(std::memory_order_acquire) >= kMailbox - protectedCredits)
+			return false;
+		mailbox[index % kMailbox] = std::move(message);
+		written.store(index + 1, std::memory_order_release);
+		(void)completionWake->Notify();
+		return true;
+	}
+	bool Post(Message& message) {
+		// Legacy SubmitEpoch still blocks for admission; published callers use
+		// TryPostOwnedPreparation and never take this path on a full mailbox.
+		while (!TryPost(message)) {
+			if (failed.load(std::memory_order_acquire)) return false;
+			std::this_thread::yield();
+		}
+		return true;
+	}
+	void ThrowIfFailed() const {
+		if (failed.load(std::memory_order_acquire)) throw std::runtime_error("Async epochs failed: " + error);
+	}
+	std::shared_ptr<Ticket> WaitTicket(uint32_t index) {
+		BT_ZONE_SCOPE("ORG.Host.WaitTicket");
+		for (;;) {
+			const auto seen = ticketWake.load(std::memory_order_acquire);
+			if (auto ticket = cells[index].exchange(nullptr, std::memory_order_acq_rel)) return ticket;
+			ThrowIfFailed();
+			ticketWake.wait(seen, std::memory_order_acquire);
+		}
+	}
+};
+
 PersistentGraphHost::PersistentGraphHost(Desc desc) : m_desc(std::move(desc)) {
 	if (!m_desc.device) throw std::invalid_argument("PersistentGraphHost requires a device");
 	if (m_desc.backend == rhi::Backend::Null) throw std::invalid_argument("PersistentGraphHost requires a device backend");
@@ -214,107 +318,6 @@ void PersistentGraphHost::ExecuteFrame(const IHostExecutionData* hostData, const
 
 // ---- async epochs ----
 
-struct PersistentGraphHost::Async {
-	using Ticket = RenderGraph::PersistentTicket;
-	struct Message {
-		enum class Kind : uint8_t { Submitted, Discard, OwnedPrepare, Stop } kind = Kind::Stop;
-		std::shared_ptr<Ticket> ticket;
-		RenderGraph::PersistentTicketSubmission submission;
-		uint32_t epochIndex = 0;
-		int32_t slot = -1;  // Discard: the slot to prepare the epoch's replacement ticket into, or -1 for none
-		std::shared_ptr<void> keepAlive;          // the uploads' staging, until the slot completes
-		std::shared_ptr<void> retired;            // Submitted: GPU objects that retired at this submission, destroyed on the host's thread
-		std::shared_ptr<const void> resourceOwner;
-		std::pair<uint32_t, uint64_t> uploadSignal{UINT32_MAX, 0};
-		FrameCallback ownedPrepare;
-	};
-
-	std::vector<uint32_t> epochs;
-	// One ticket cell per epoch: stored by the host's thread, taken by the render thread.
-	std::unique_ptr<std::atomic<std::shared_ptr<Ticket>>[]> cells;
-	// Render thread -> host thread, single producer / single consumer, in order.
-	static constexpr uint64_t kMailbox = 64;
-	std::array<Message, kMailbox> mailbox;
-	std::atomic<uint64_t> written{0}, read{0};
-	// Credits held by render-thread frame reservations. Owned preparation may not
-	// consume these cells, so a reserved submission always has a control-message
-	// slot even when the worker is busy.
-	std::shared_ptr<std::atomic<uint32_t>> controlCredits = std::make_shared<std::atomic<uint32_t>>(0);
-	std::unique_ptr<rhi::CompletionWait> completionWake;
-	// Ticket publication and terminal failure both advance this counter. A
-	// notify on an unchanged null shared_ptr cannot release atomic::wait(nullptr).
-	std::atomic<uint32_t> ticketWake{0};
-	std::atomic<bool> failed{false};
-	std::string error;  // written before failed is set
-	std::thread thread;
-
-	// Host thread only.
-	struct Slot {
-		std::vector<std::pair<rhi::Timeline*, uint64_t>> points;  // its last submission's completion
-		uint64_t hostFrame = 0;
-		bool pending = false;   // submitted work not yet waited for
-		bool reserved = false;  // held by a ticket that has not been submitted
-		std::shared_ptr<void> keepAlive;
-		std::shared_ptr<const void> resourceOwner;
-	};
-	std::vector<Slot> slots;
-	// The worker stops on the first completion exception. Preserve the one
-	// submitted message it was processing until device teardown.
-	std::shared_ptr<void> uncertainUploadOwner;
-	std::shared_ptr<const void> uncertainResourceOwner;
-	std::vector<uint8_t> needsTicket;
-	uint64_t nextSlot = 0;
-	uint64_t hostFrame = 0;
-
-	// Render thread only.
-	std::vector<uint64_t> queueValues;  // the last value assigned per queue slot
-	// Per frame slot. Reset and begun by the host's thread when it prepares the slot's ticket (after the slot's
-	// wait: the slot's last upload list is done), then recorded, ended and submitted by the render thread; the
-	// ticket cell orders the two.
-	std::vector<CommandListPair> uploadLists;
-	uint32_t graphicsSlot = 0;
-	rhi::Queue graphicsQueue;
-	rhi::TimelineHandle graphicsFence{};
-
-	uint32_t IndexOf(uint32_t epoch) const {
-		for (uint32_t i = 0; i < epochs.size(); ++i) if (epochs[i] == epoch) return i;
-		throw std::invalid_argument("SubmitEpoch: epoch " + std::to_string(epoch) + " has no ticket");
-	}
-	bool TryPost(Message& message, bool spendsReservedCredit = false) {
-		const auto index = written.load(std::memory_order_relaxed);
-		const auto credits = controlCredits->load(std::memory_order_relaxed);
-		if (spendsReservedCredit && !credits) return false;
-		const auto protectedCredits = credits - static_cast<uint32_t>(spendsReservedCredit);
-		if (failed.load(std::memory_order_acquire)
-			|| index - read.load(std::memory_order_acquire) >= kMailbox - protectedCredits)
-			return false;
-		mailbox[index % kMailbox] = std::move(message);
-		written.store(index + 1, std::memory_order_release);
-		(void)completionWake->Notify();
-		return true;
-	}
-	bool Post(Message& message) {
-		// Legacy SubmitEpoch still blocks for admission; published callers use
-		// TryPostOwnedPreparation and never take this path on a full mailbox.
-		while (!TryPost(message)) {
-			if (failed.load(std::memory_order_acquire)) return false;
-			std::this_thread::yield();
-		}
-		return true;
-	}
-	void ThrowIfFailed() const {
-		if (failed.load(std::memory_order_acquire)) throw std::runtime_error("Async epochs failed: " + error);
-	}
-	std::shared_ptr<Ticket> WaitTicket(uint32_t index) {
-		BT_ZONE_SCOPE("ORG.Host.WaitTicket");
-		for (;;) {
-			const auto seen = ticketWake.load(std::memory_order_acquire);
-			if (auto ticket = cells[index].exchange(nullptr, std::memory_order_acq_rel)) return ticket;
-			ThrowIfFailed();
-			ticketWake.wait(seen, std::memory_order_acquire);
-		}
-	}
-};
 
 void PersistentGraphHost::SetAsyncEpochs(std::vector<uint32_t> epochs) {
 	StopAsync();

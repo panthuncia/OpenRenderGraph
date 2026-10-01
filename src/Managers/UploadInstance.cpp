@@ -1,4 +1,5 @@
 #include "Managers/UploadInstance.h"
+#include "Utilities/EnvironmentFlag.h"
 #include <unordered_map>
 #include "Render/Runtime/StagedUploadBatch.h"
 
@@ -33,13 +34,7 @@ namespace {
 			for (const char* name : {
 				"SARP_UPLOAD_TELEMETRY_LOG",
 				"SARP_TEXTURE_STREAMING_TRANSITION_LOG" }) {
-				char* value = nullptr;
-				size_t valueLength = 0;
-				const bool isSet =
-					_dupenv_s(&value, &valueLength, name) == 0 &&
-					value != nullptr && value[0] != '\0' && value[0] != '0';
-				std::free(value);
-				if (isSet) return true;
+				if (org::detail::EnvironmentFlagEnabled(name)) return true;
 			}
 			return false;
 		}();

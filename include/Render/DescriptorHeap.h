@@ -1,6 +1,5 @@
 #pragma once
 
-#include <wrl/client.h>
 #include <rhi.h>
 #include <queue>
 #include <vector>
