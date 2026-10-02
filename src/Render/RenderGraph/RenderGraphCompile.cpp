@@ -2120,6 +2120,24 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
     auto oracle = std::make_shared<experimental::DependencyEdges>();
     const bool d3d12OwnedQueueTransfers = m_queueRegistry.SlotCount() != 0
         && m_queueRegistry.GetBackend(static_cast<QueueSlotIndex>(0)) == rhi::Backend::D3D12;
+    // Whether nothing the pass declares needs a queue-family ownership transfer to change queues: every resource
+    // QueueSharing::Concurrent (every graph buffer is). Unknown resources answer no.
+    const auto concurrentlyShared = [&](size_t passIndex) {
+        if (passIndex >= m_framePassAccessSummaries.size()) return false;
+        const auto shared = [&](auto resourceIndex) {
+            auto* resource = static_cast<size_t>(resourceIndex) < m_frameDAGResourcePtrByIndex.size()
+                ? m_frameDAGResourcePtrByIndex[resourceIndex] : nullptr;
+            rhi::ResourceDesc description{};
+            return resource && resource->TryGetRHIResourceDesc(description)
+                && description.queueSharing == rhi::QueueSharing::Concurrent;
+        };
+        const auto& summary = m_framePassAccessSummaries[passIndex];
+        for (const auto& requirement : summary.requirementSummaries)
+            if (!shared(requirement.dagResourceIndex)) return false;
+        for (const auto& transition : summary.internalTransitionSummaries)
+            if (!shared(transition.dagResourceIndex)) return false;
+        return true;
+    };
     {
     BT_ZONE_SCOPE("ORG.FreshCompile.IR.PassConstruction");
     for (size_t index = 0; index < nodes.size(); ++index) {
@@ -2141,10 +2159,10 @@ void RenderGraph::SubmitOwnedCompileRequest(rhi::Device device, const std::vecto
         }
         // D3D12 admission emits producer release-to-COMMON and consumer acquire
         // barriers around the compiler's relative timeline wait. Other backends
-        // retain the conservative graphics route until their queue-family/API
-        // ownership policy is captured as owned compiler metadata.
+        // keep the graphics route unless nothing the pass touches needs a
+        // queue-family ownership transfer.
         if (!d3d12OwnedQueueTransfers && !input.structure.queues.empty()
-            && input.structure.queues[0].active) {
+            && input.structure.queues[0].active && !concurrentlyShared(node.passIndex)) {
             pass.compatibleQueueSlots.assign(1, 0u);
             pass.preferredQueueSlot = 0u;
         }

@@ -828,7 +828,10 @@ public:
 	// start of each queue's first batch in the frame, `exit` at the end of each
 	// queue's last batch. Barrier scopes span submissions on the same queue, so no
 	// semaphores or per-resource transitions are needed. Honored by persistent
-	// execution.
+	// execution. A graph queue the host does not share (an async compute queue)
+	// is the host's to order: its first submission of an execution after the
+	// host's work before the execution, and the host's later work after its last
+	// submission's signals.
 	struct ExternalQueueBoundary {
 		bool entry = false;
 		bool exit = false;

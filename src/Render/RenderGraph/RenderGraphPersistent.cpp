@@ -86,6 +86,13 @@ Resource* UnwrapDynamic(Resource* resource) noexcept {
 	return nullptr;
 }
 
+// Whether moving the resource between queues of different families needs no ownership transfer: it was created
+// QueueSharing::Concurrent (every graph buffer is). Unknown resources answer no.
+bool ConcurrentlyShared(const Resource& resource) {
+	rhi::ResourceDesc description{};
+	return resource.TryGetRHIResourceDesc(description) && description.queueSharing == rhi::QueueSharing::Concurrent;
+}
+
 // Shape from the logical description when the texture has no backing yet: an
 // unmaterialized PixelBuffer reports default mip/array counts until realized.
 CompileResourceShape ShapeOf(const Resource& resource) {
@@ -585,7 +592,6 @@ static LoweredPass LowerLegacyPass(RenderGraph& graph, ResourceRegistry& registr
 	}
 	const bool d3d12OwnedQueueTransfers = queues.SlotCount() != 0
 		&& queues.GetBackend(static_cast<QueueSlotIndex>(0)) == rhi::Backend::D3D12;
-	if (!d3d12OwnedQueueTransfers) compatible.assign(1, 0u);
 	declaration.compatibleQueueSlots = compatible;
 	declaration.preferredQueueSlot = compatible.front();
 	declaration.backend = static_cast<uint32_t>(resources.backendAffinity.strength == BackendAffinityStrength::Primary
@@ -652,6 +658,19 @@ static LoweredPass LowerLegacyPass(RenderGraph& graph, ResourceRegistry& registr
 		const auto range = LowerRange(handleAndRange.range, shape);
 		if (!range) continue;
 		result.exits.push_back({resource->GetSchedulingResourceID(), resource, *range, LowerState(state)});
+	}
+	// D3D12 admission emits the producer's release and the consumer's acquire around a cross-queue wait. Elsewhere a
+	// pass leaves the graphics route only when nothing it touches needs a queue-family ownership transfer.
+	if (!d3d12OwnedQueueTransfers) {
+		bool concurrent = true;
+		for (const auto& use : result.entries) concurrent = concurrent && use.resource && ConcurrentlyShared(*use.resource);
+		for (const auto& use : result.exits) concurrent = concurrent && use.resource && ConcurrentlyShared(*use.resource);
+		for (const auto& group : result.groups)
+			for (const auto& [id, member] : group.members) concurrent = concurrent && member && ConcurrentlyShared(*member);
+		if (!concurrent) {
+			declaration.compatibleQueueSlots.assign(1, 0u);
+			declaration.preferredQueueSlot = 0u;
+		}
 	}
 	(void)phase;
 	return result;

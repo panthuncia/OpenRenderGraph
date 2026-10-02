@@ -460,6 +460,11 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
     if (closeToHome) {
         // Per resource and cell: the first step (its entry state is home when the backing seeds nothing
         // for the cell) and the last (where the resource leaves the execution).
+        //
+        // A resource without a layout (a buffer) may be used from several queues: the execution's relative waits order
+        // its uses inside it, and the host orders whole executions against each other on every queue
+        // (ExternalQueueBoundary). It goes home on the queue of its last use. A texture's home layout would need a
+        // queue-family ownership transfer back, so a texture stays on one queue.
         struct Cells { std::vector<uint32_t> first, last; uint32_t queue = UINT32_MAX; };
         std::unordered_map<uint32_t, Cells> byResource;
         for (uint32_t index = 0; index < graph.states.steps.size(); ++index) {
@@ -473,9 +478,9 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
                 cells.last.assign(count, UINT32_MAX);
             }
             const auto queue = graph.batches[step.batch].queue;
-            if (cells.queue == UINT32_MAX) cells.queue = queue;
-            else if (cells.queue != queue)
-                throw std::invalid_argument("A closed execution uses a resource from more than one queue");
+            if (cells.queue != UINT32_MAX && cells.queue != queue && captured.shape.hasLayout)
+                throw std::invalid_argument("A closed execution uses a texture from more than one queue");
+            cells.queue = queue;
             Visit(captured.shape, step.range, [&](uint32_t mip, uint32_t slice) {
                 const auto cell = CellIndex(captured.shape, mip, slice);
                 if (cells.first[cell] == UINT32_MAX) cells.first[cell] = index;

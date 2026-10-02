@@ -339,13 +339,40 @@ ExecutionTimelineAdmission::TakeRetiredGarbage() {
 }
 
 namespace {
+// A pass's uses of each resource it schedules, once per resource: whether any of them writes it.
 template<class Fn>
-void ForEachScheduledResource(const CompilePass& pass, Fn&& fn) {
-    for (auto access : pass.accesses) fn(access.resourceIndex);
-    // The legacy dependency DAG deliberately omits globally read-only
-    // resources. They still require state/queue ordering in a compiled plan.
-    for (const auto& use : pass.entryStates) fn(use.resource);
-    for (const auto& use : pass.exitStates) fn(use.resource);
+void ForEachScheduledUse(const CompilePass& pass, Fn&& fn) {
+    std::vector<std::pair<uint32_t, bool>> uses;
+    const auto add = [&](uint32_t resource, bool write) {
+        for (auto& use : uses) if (use.first == resource) { use.second = use.second || write; return; }
+        uses.emplace_back(resource, write);
+    };
+    for (auto access : pass.accesses) add(access.resourceIndex, access.write);
+    for (const auto& use : pass.entryStates) add(use.resource, use.state.write);
+    for (const auto& use : pass.exitStates) add(use.resource, use.state.write);
+    for (const auto& [resource, write] : uses) fn(resource, write);
+}
+// One resource's uses in schedule order. A write is ordered after every use since the last write. A read of a buffer is ordered
+// after the last write alone: two reads of a buffer have nothing to see of each other and no state between them but their
+// access (graph buffers are QueueSharing::Concurrent, so even a change of queue needs no ownership transfer), so readers on
+// different queues need not wait for each other. A texture's uses stay serialized: its layout is state the plan transitions.
+struct ResourceUseOrder {
+    uint32_t lastWrite = UINT32_MAX;
+    std::vector<uint32_t> reads;
+};
+template<class Edge>
+void OrderUse(ResourceUseOrder& order, uint32_t pass, bool write, bool overlappingReads, Edge&& edge) {
+    if (order.lastWrite != UINT32_MAX && order.lastWrite != pass) edge(order.lastWrite, pass);
+    if (!write && overlappingReads) {
+        order.reads.push_back(pass);
+        return;
+    }
+    for (auto read : order.reads) if (read != pass) edge(read, pass);
+    order.reads.clear();
+    order.lastWrite = pass;
+}
+bool OverlappingReads(const GraphCompileStructure& s, uint32_t resource) {
+    return resource < s.resourceShapes.size() && !s.resourceShapes[resource].hasLayout;
 }
 bool ValidRange(CompileRange r, CompileResourceShape shape) {
     return r.mips && r.slices && r.mip < shape.mips && r.slice < shape.slices
@@ -598,18 +625,16 @@ std::string ValidateSymbolicSchedule(const GraphCompileInput& input, const Compi
     if (!checkEdges(graph.edges) || !checkEdges(s.explicitEdges) || !checkEdges(s.placementEdges)
         || (input.expectedSchedulingEdges && !checkEdges(*input.expectedSchedulingEdges)))
         return "Schedule does not enforce a dependency or alias-placement edge";
-    // The initial scheduler deliberately serializes all uses of a resource,
-    // including read/read. This keeps state transitions safe until owned range
-    // and state planning can prove which reads may overlap.
-    std::vector<uint32_t> lastResource(s.resourceIDs.size(), UINT32_MAX);
+    // Every use of a resource is ordered after the last write, and a write after every use since (OrderUse): only a buffer's
+    // reads may overlap.
+    std::vector<ResourceUseOrder> useOrder(s.resourceIDs.size());
     for (const auto& batch : graph.batches) {
         for (const auto pass : batch.passes) {
             bool invalid = false;
-            ForEachScheduledResource(s.passes[pass], [&](uint32_t resource) {
-                if (resource >= lastResource.size()) { invalid = true; return; }
-                auto& previous = lastResource[resource];
-                if (previous != UINT32_MAX && previous != pass && !ordered(previous, pass)) invalid = true;
-                previous = pass;
+            ForEachScheduledUse(s.passes[pass], [&](uint32_t resource, bool write) {
+                if (resource >= useOrder.size()) { invalid = true; return; }
+                OrderUse(useOrder[resource], pass, write, OverlappingReads(s, resource),
+                    [&](uint32_t from, uint32_t to) { if (!ordered(from, to)) invalid = true; });
             });
             if (invalid) return "Invalid or unordered resource accesses across queues";
         }
@@ -818,7 +843,8 @@ std::shared_ptr<const CompiledGraph> CompileWorkspace::Compile(
     }
     {
         BT_ZONE_SCOPE("ORG.FreshCompile.SymbolicSchedule");
-        std::vector<uint32_t> batchByPass(passCount, UINT32_MAX), lastResource(structure.resourceIDs.size(), UINT32_MAX);
+        std::vector<uint32_t> batchByPass(passCount, UINT32_MAX);
+        std::vector<ResourceUseOrder> useOrder(structure.resourceIDs.size());
         for (auto passIndex : result->topologicalOrder) {
             if (cancelled.load(std::memory_order_relaxed)) return {};
             const auto& pass = structure.passes[passIndex];
@@ -846,11 +872,10 @@ std::shared_ptr<const CompiledGraph> CompileWorkspace::Compile(
             if (!extendPrevious) result->batches.push_back({passIndex, queue});
             else result->batches.back().passes.push_back(passIndex);
             batchByPass[passIndex] = static_cast<uint32_t>(result->batches.size() - 1);
-            ForEachScheduledResource(pass, [&](uint32_t resource) {
-                if (resource >= lastResource.size()) throw std::invalid_argument("Invalid scheduled state resource");
-                auto& previous = lastResource[resource];
-                if (previous != UINT32_MAX && previous != passIndex) result->schedulingEdges.emplace_back(previous, passIndex);
-                previous = passIndex;
+            ForEachScheduledUse(pass, [&](uint32_t resource, bool write) {
+                if (resource >= useOrder.size()) throw std::invalid_argument("Invalid scheduled state resource");
+                OrderUse(useOrder[resource], passIndex, write, OverlappingReads(structure, resource),
+                    [&](uint32_t from, uint32_t to) { result->schedulingEdges.emplace_back(from, to); });
             });
         }
         result->batchByPass = batchByPass;

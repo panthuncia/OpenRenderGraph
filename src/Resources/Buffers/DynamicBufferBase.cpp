@@ -446,6 +446,8 @@ bool BufferBase::TryGetBufferByteSize(uint64_t& outByteSize) const {
 
 bool BufferBase::TryGetRHIResourceDesc(rhi::ResourceDesc& outDesc) const {
 	outDesc = rhi::helpers::ResourceDesc::Buffer(m_bufferSize, m_accessType);
+	// As the backing creates it (GpuBufferBacking): every graph buffer is shared concurrently by all queue families.
+	outDesc.queueSharing = rhi::QueueSharing::Concurrent;
 	// Some dynamic-buffer implementations install a pre-created backing through
 	// SetBacking rather than ConfigureBacking. Their descriptor requirements are
 	// authoritative too; otherwise peer materialization can omit the UAV flag
