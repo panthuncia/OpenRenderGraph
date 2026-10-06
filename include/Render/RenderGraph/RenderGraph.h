@@ -814,6 +814,9 @@ public:
 	// candidate admitted for exactly this recording, which needs no tag: the recording holds every backing it was recorded with.
 	static bool BindPersistentTicketRecording(PersistentTicket& ticket, std::shared_ptr<const PersistentRecording> recording, uint64_t hostTag,
 		std::string* why = nullptr);
+	// Whether BindPersistentTicketRecording would bind it, the ticket unchanged (the same rules; why, when not).
+	static bool CanBindPersistentTicketRecording(const PersistentTicket& ticket, const PersistentRecording& recording, uint64_t hostTag,
+		std::string* why = nullptr);
 	// Revision-driven epochs (immutable inputs). A recording made for host data (a revision) resolves the graph's resolvers through
 	// it (ResolverCaptureContext of IHostExecutionData), so its publication and bindings are the revision's own, and it holds them.
 	// Owner thread: a ticket for the epoch's slot that prepares nothing from live state: its admissions are its candidates', one

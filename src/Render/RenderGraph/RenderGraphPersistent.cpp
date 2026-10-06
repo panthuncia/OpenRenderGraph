@@ -313,6 +313,9 @@ struct RenderGraph::PersistentExecutionState {
 		std::vector<std::pair<uint64_t, std::string>> loweredDirect; // Diagnostic: (scheduling ID, name).
 		std::vector<const void*> loweredGroupKeys;
 		std::vector<ExternalTimelinePoint> explicitWaits;
+		// Resolvers lowered as direct declarations, with the resource set they were lowered with: their slots hold those
+		// resources until the pass is lowered again, so every preparation checks that it resolves the same set.
+		std::vector<std::pair<std::shared_ptr<const IResourceResolver>, ResolverResourceSetIdentity>> directResolvers;
 		// Frame-interrupting per-frame pass hosted in the main executable (not in
 		// the master list). It is prepared once and records nothing afterwards
 		// until its removal is installed.
@@ -542,6 +545,8 @@ struct LoweredPass {
 	experimental::CompilePass declaration;
 	std::vector<LoweredUse> entries, exits;
 	std::vector<LoweredGroup> groups;
+	// The resolvers whose resources are among the entries (not a group), with the set they resolved to.
+	std::vector<std::pair<std::shared_ptr<const IResourceResolver>, ResolverResourceSetIdentity>> directResolvers;
 	std::vector<ExternalTimelinePoint> explicitWaits;
 };
 
@@ -694,6 +699,8 @@ static LoweredPass LowerLegacyPass(RenderGraph& graph, ResourceRegistry& registr
 			}
 			if (group.uniform && group.key && group.resolver && !group.templates.empty()) { result.groups.push_back(std::move(group)); continue; }
 			// Mixed shapes: fall back to direct declarations for this resolver.
+			if (snapshot.resolver)
+				result.directResolvers.emplace_back(snapshot.resolver->Clone(), state ? state->resourceSetIdentity : snapshot.resourceSetIdentity);
 			for (const auto& [id, member] : group.members)
 				for (const auto& request : snapshot.requirementTemplates) {
 					const auto memberShape = ShapeOf(*member);
@@ -703,6 +710,11 @@ static LoweredPass LowerLegacyPass(RenderGraph& graph, ResourceRegistry& registr
 		}
 	} else {
 		for (const auto& requirement : GetFrameRequirementsSpan(resources)) lowerRequirement(requirement);
+		for (const auto& snapshot : pass.resolverSnapshots) {
+			if (!snapshot.resolver) continue;
+			const auto state = graph.CaptureResolverDeclarationState(*snapshot.resolver);
+			result.directResolvers.emplace_back(snapshot.resolver->Clone(), state ? state->resourceSetIdentity : snapshot.resourceSetIdentity);
+		}
 	}
 	for (const auto& [handleAndRange, state] : resources.internalTransitions) {
 		auto* resource = resolve(handleAndRange.resource);
@@ -876,6 +888,7 @@ static void InstallMainPass(RenderGraph& graph, State& state, persistent::GraphE
 	main.loweredGroupKeys.clear();
 	for (const auto& group : lowered.groups) main.loweredGroupKeys.push_back(group.key.get());
 	main.explicitWaits = std::move(lowered.explicitWaits);
+	main.directResolvers = std::move(lowered.directResolvers);
 	main.slotsDirty = true;
 	std::unordered_map<uint64_t, persistent::BindingToken> tokens;
 	auto declare = [&](const LoweredUse& use, bool entry) {
@@ -1390,6 +1403,22 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 			group.identity = captured->resourceSetIdentity;
 			BT_ZONE_VALUE(static_cast<int64_t>(added + removed));
 			basic_telemetry::AddCounter("ORG.Persistent.MembershipEdits");
+		}
+		}
+		// Direct declarations of a resolver bind the set it resolved to when the pass was lowered. A preparation that resolves
+		// another set (a revision's version, or a new current one before the pass is lowered again) would record against
+		// resources it does not name - read past a grown buffer's old backing, say. Never silently: the pass must be lowered as
+		// a group (PrepareIncrementalResolverPatchRecipe) or lowered again first.
+		{ BT_ZONE_SCOPE("ORG.Persistent.CheckDirectResolvers");
+		for (const auto& main : state.mainPasses) {
+			if (main.hosted || main.retired) continue;
+			for (const auto& [resolver, identity] : main.directResolvers) {
+				const auto captured = CaptureResolverDeclarationState(*resolver);
+				if (captured && !(captured->resourceSetIdentity == identity))
+					throw std::logic_error("Persistent pass '" + main.name
+						+ "' binds a resolver's resources directly, as they were when it was lowered, but this preparation resolves "
+						  "another set of them");
+			}
 		}
 		}
 		std::sort(structural.begin(), structural.end());
@@ -3688,6 +3717,35 @@ bool RenderGraph::BindPersistentTicketRecording(PersistentTicket& ticket, std::s
 	segment.recording = std::move(recording);
 	ticket.revisions = segment.recording->revisions;
 	ticket.hostTag = hostTag;
+	return true;
+}
+
+bool RenderGraph::CanBindPersistentTicketRecording(const PersistentTicket& ticket, const PersistentRecording& recording, uint64_t hostTag,
+	std::string* why) {
+	auto fail = [&](const char* reason) {
+		if (why) *why = reason;
+		return false;
+	};
+	const auto admitted = [&] {
+		for (const auto* candidate = ticket.candidates.load(std::memory_order_acquire); candidate; candidate = candidate->next)
+			if (candidate->segment.recording.get() == &recording) return true;
+		return false;
+	};
+	if (ticket.revision) {
+		if (!ticket.segments.empty()) return fail("the ticket already has a recording");
+		return admitted() || fail("the ticket admitted no candidate for this recording (made after the ticket, and not added to it)");
+	}
+	if (admitted()) return !ticket.chosen || fail("the ticket already took a candidate");
+	if (ticket.segments.size() != 1) return fail("the ticket has no single segment");
+	const auto& segment = ticket.segments.front();
+	if (segment.recording) return fail("the ticket already has a recording");
+	if (!recording.replayable) return fail("the recording is not replayable");
+	if (recording.publication != segment.admission.publication) return fail("recorded for another publication");
+	if (recording.bindings != segment.bindings) return fail("recorded for other bindings");
+	if (recording.resourceHeap.index != segment.resourceHeap.index || recording.resourceHeap.generation != segment.resourceHeap.generation
+		|| recording.samplerHeap.index != segment.samplerHeap.index || recording.samplerHeap.generation != segment.samplerHeap.generation)
+		return fail("recorded for other descriptor heaps");
+	if (recording.hostTag != hostTag) return fail("recorded under another backing version");
 	return true;
 }
 

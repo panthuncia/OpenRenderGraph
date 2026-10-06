@@ -317,6 +317,16 @@ void PersistentGraphHost::Build() {
 	m_graph = std::move(graph);
 	m_graph->SetGpuPassRangeCallbacks(m_gpuPassRangeBegin, m_gpuPassRangeEnd);
 	m_rebuildRequested = false;
+	++m_buildGeneration;
+}
+
+bool PersistentGraphHost::BuildIfRequested() {
+	if (m_graph && !m_rebuildRequested) return false;
+	const bool async = static_cast<bool>(m_async);
+	StopAsync();
+	Build();
+	if (async) StartAsync();
+	return true;
 }
 
 void PersistentGraphHost::ExecuteFrame(const IHostExecutionData* hostData, const FrameCallback& beforePrepare,
@@ -329,7 +339,7 @@ void PersistentGraphHost::ExecuteFrame(const IHostExecutionData* hostData, const
 		a_into += std::chrono::duration<double, std::micro>(now - last).count();
 		last = now;
 	};
-	if (m_rebuildRequested || !m_graph) Build();
+	if (BuildDue()) Build();
 	lap(m_lastTimings.buildUs);
 	runtime::ScopedActiveGraphServices services(m_graph->GetUploadService(), m_graph->GetDescriptorService());
 	const auto slot = static_cast<uint32_t>(m_frameNumber % m_frameSlots);
@@ -422,7 +432,7 @@ void PersistentGraphHost::SetAsyncEpochs(std::vector<uint32_t> epochs, std::vect
 	m_revisionEpochs = std::move(revisionEpochs);
 	if (m_asyncEpochs.empty()) return;
 	if (!m_desc.closedExecutions) throw std::logic_error("Async epochs require closed executions");
-	if (m_rebuildRequested || !m_graph) Build();
+	if (BuildDue()) Build();
 	StartAsync();
 }
 
@@ -655,6 +665,25 @@ void PersistentGraphHost::WaitSlot(Async& state, uint32_t slot) {
 	entry.resourceOwner.reset();
 }
 
+bool PersistentGraphHost::ReleaseEpochTicket(uint32_t epoch) {
+	if (!m_async) return false;
+	auto& async = *m_async;
+	const auto found = std::ranges::find(async.epochs, epoch);
+	if (found == async.epochs.end()) return false;
+	const auto index = static_cast<uint32_t>(found - async.epochs.begin());
+	auto ticket = async.cells[index].exchange(nullptr, std::memory_order_acq_rel);
+	if (!ticket) return false;
+	// The host's thread prepares into an empty cell only once the ticket it last put there is submitted or discarded: the cell is the
+	// render thread's until the discard is read, so a ticket the mailbox has no room for goes back.
+	Async::Message discard;
+	discard.kind = Async::Message::Kind::Discard;
+	discard.epochIndex = index;
+	discard.ticket = ticket;
+	if (async.TryPost(discard)) return true;
+	async.cells[index].store(std::move(ticket), std::memory_order_release);
+	return false;
+}
+
 bool PersistentGraphHost::RequestEpochRecording(uint32_t epoch, std::shared_ptr<const IHostExecutionData> hostData, EpochRecordingCallback done) {
 	auto* async = m_async.get();
 	if (!async || !done || async->failed.load(std::memory_order_acquire)) return false;
@@ -686,6 +715,7 @@ bool PersistentGraphHost::AdvanceRecordingRequests(Async& state) {
 				request.result->firstSlot = request.epochIndex * state.ringSize;
 				request.result->slots.resize(state.ringSize);
 				request.result->revision = request.hostData;
+				request.result->buildGeneration = m_buildGeneration;
 				request.recorded.assign(state.ringSize, 0);
 			}
 			for (uint32_t position = 0; position < state.ringSize; ++position) {
@@ -857,6 +887,22 @@ PersistentGraphHost::BackingMutation PersistentGraphHost::MutateBackings() {
 	return BackingMutation(this);
 }
 
+bool PersistentGraphHost::CanUseEpochRecording(const EpochRecording& recording, std::string* why) const {
+	auto fail = [&](const char* reason) {
+		if (why) *why = reason;
+		return false;
+	};
+	if (!m_async || !m_submittingTicket) return fail("not inside a live async epoch's submission");
+	const auto& async = *m_async;
+	if (async.revisionDriven[m_submittingIndex]) return fail("a revision-driven epoch (its recording is SubmitEpoch's)");
+	if (recording.epoch != async.epochs[m_submittingIndex]) return fail("recorded for another epoch");
+	const uint32_t slot = RenderGraph::PersistentTicketSlot(*m_submittingTicket);
+	if (slot < recording.firstSlot || slot - recording.firstSlot >= recording.slots.size() || !recording.slots[slot - recording.firstSlot])
+		return fail("no recording for the ticket's slot");
+	return RenderGraph::CanBindPersistentTicketRecording(*m_submittingTicket, *recording.slots[slot - recording.firstSlot],
+		async.backingVersion.load(std::memory_order_acquire), why);
+}
+
 void PersistentGraphHost::NoteNewVersions() noexcept {
 	// After the version's publication (release), so a preparation that reads the new value resolves the new version.
 	if (m_async) m_async->backingVersion.fetch_add(1, std::memory_order_acq_rel);
@@ -923,7 +969,7 @@ PersistentGraphHost::AsyncStats PersistentGraphHost::TakeAsyncStats() noexcept {
 }
 
 bool PersistentGraphHost::TryPostOwnedPreparation(FrameCallback& request) {
-	if (!request || !m_async || m_rebuildRequested || !m_graph)
+	if (!request || !m_async || BuildDue())
 		return false;
 	Async::Message message;
 	message.kind = Async::Message::Kind::OwnedPrepare;
@@ -936,7 +982,7 @@ bool PersistentGraphHost::TryPostOwnedPreparation(FrameCallback& request) {
 
 bool PersistentGraphHost::TryReserveReadyEpochs(std::span<const uint32_t> epochs, FrameTicketReservation& destination) {
 	BT_ZONE_SCOPE("ORG.Host.TryReserveReadyEpochs");
-	if (!destination.Empty() || epochs.empty() || !m_async || m_rebuildRequested || !m_graph || m_async->failed.load(std::memory_order_acquire))
+	if (!destination.Empty() || epochs.empty() || !m_async || BuildDue() || m_async->failed.load(std::memory_order_acquire))
 		return false;
 	std::vector<FrameTicketReservation::Entry> ready;
 	ready.reserve(epochs.size());
@@ -964,7 +1010,7 @@ bool PersistentGraphHost::TryReserveReadyEpochs(std::span<const uint32_t> epochs
 
 bool PersistentGraphHost::TrySubmitReservedEpoch(FrameTicketReservation& reservation, uint32_t epoch, const FrameCallback& beforeSubmit) {
 	BT_ZONE_SCOPE("ORG.Host.TrySubmitReservedEpoch");
-	if (!m_async || m_rebuildRequested || !m_graph || reservation.generation != m_ticketGeneration
+	if (!m_async || BuildDue() || reservation.generation != m_ticketGeneration
 		|| m_async->failed.load(std::memory_order_acquire)) return false;
 	auto found = std::ranges::find(reservation.tickets, epoch, &FrameTicketReservation::Entry::epoch);
 	if (found == reservation.tickets.end() || !found->ticket) return false;
@@ -988,7 +1034,7 @@ void PersistentGraphHost::SubmitEpoch(uint32_t epoch, const FrameCallback& befor
 		a_into += std::chrono::duration<double, std::micro>(now - last).count();
 		last = now;
 	};
-	if (m_rebuildRequested || !m_graph) {
+	if (BuildDue()) {
 		StopAsync();
 		Build();
 		StartAsync();
@@ -1039,6 +1085,12 @@ void PersistentGraphHost::SubmitTicket(Async& async, uint32_t index, std::shared
 	lap(m_lastTimings.releaseUs);
 	if (beforeSubmit) {
 		BT_ZONE_SCOPE("ORG.Host.CommitInputs");
+		struct Submitting {
+			PersistentGraphHost& host;
+			~Submitting() { host.m_submittingTicket = nullptr; }
+		} submitting{*this};
+		m_submittingTicket = ticket.get();
+		m_submittingIndex = index;
 		beforeSubmit(*m_graph);
 	}
 	lap(m_lastTimings.beforePrepareUs);

@@ -345,7 +345,12 @@ namespace {
 			}
 			const auto first = templatesByResource.find(snapshot.resourceIDs.front());
 			if (first == templatesByResource.end() || first->second.empty()) return;
-            if (snapshot.requirementTemplates.empty()) snapshot.requirementTemplates = first->second;
+            // The pass's requirements for the resolver's resources are what its declarations of them came to: several uses of one
+            // resolver (indirect arguments and a shader read, say) merge into fewer requirements than they were declared as. The
+            // members' requirements are the recipe, so a pass that declares one resolver several ways is patched (lowered as a
+            // group, re-resolved by every preparation under its own capture context) rather than lowered direct, where a
+            // preparation for another version - a revision's - would bind the version current when the pass was lowered.
+            if (snapshot.requirementTemplates.size() != first->second.size()) snapshot.requirementTemplates = first->second;
 			for (const auto id : snapshot.resourceIDs) {
 				const auto found = templatesByResource.find(id);
 				if (found == templatesByResource.end() || found->second.size() != snapshot.requirementTemplates.size()) return;

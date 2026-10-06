@@ -294,7 +294,14 @@ public:
 		m_versions(std::move(versions)) {}
 	CopyBindings Declare(org::PassBuilder& builder) {
 		builder.PreferQueue(org::QueueKind::Graphics);
-		if (m_versions) return {builder.CopySource(*m_versions), builder.CopyDestination(m_destination)};
+		if (m_versions) {
+			// Declared two ways, as a pass reading a buffer both as indirect arguments and through its address does: the
+			// declarations merge into one requirement, and the pass is still lowered as a group (re-resolved per preparation).
+			const std::span<const org::SrvView> noViews{};
+			CopyBindings bindings{builder.CopySource(*m_versions), builder.CopyDestination(m_destination)};
+			builder.ShaderResource(*m_versions, noViews);
+			return bindings;
+		}
 		return {builder.CopySource(m_source), builder.CopyDestination(m_destination)};
 	}
 	void InvocationRevision(const org::PassPrepareContext&, std::vector<uint64_t>& out) const {
@@ -518,6 +525,18 @@ int main(int argc, char** argv) {
 					std::fprintf(stderr, "half revision: [0] %u [half-1] %u [half] %u [last] %u; expected %u, %u, %u, %u\n", first.mapped[0], first.mapped[half - 1],
 						first.mapped[half], first.mapped[kCount - 1], value, value + half - 1, before + half, before + kCount - 1);
 				REQUIRE(halfOk, "the new revision's recording writes its elements, and leaves the rest");
+				// A pending version (made, not adopted), named by a revision: its recording writes and copies that version, every
+				// pass resolving it through the revision - the copy pass's two declarations of it included - while the current one
+				// stays what live work uses.
+				{
+					const auto pending = versions->MakeBytes(kBytes * 2);
+					REQUIRE(pending->buffer != grown->buffer && versions->Get() == grown->buffer, "a pending version is not current");
+					auto pendingRecording = record(kCount, pending);
+					REQUIRE(pendingRecording, "the pending version's revision's recording");
+					value = 47000u;
+					host.SubmitEpoch(0, upload, {}, pendingRecording);
+					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "a revision's recording copies the version it names");
+				}
 				// A revision-driven epoch without its recording is an error, never a re-preparation.
 				bool rejected = false;
 				try {
@@ -534,7 +553,7 @@ int main(int argc, char** argv) {
 					static_cast<unsigned long long>(stats.revisionRecordings), static_cast<unsigned long long>(stats.revisionSlotsRecorded),
 					static_cast<unsigned long long>(stats.revisionSubmissions), static_cast<unsigned long long>(stats.recorded),
 					static_cast<unsigned long long>(stats.stale));
-				REQUIRE(stats.revisionSubmissions == 12 && stats.stale == 0 && stats.revisionRecordings == 2 && stats.revisionSlotsRecorded == 6,
+				REQUIRE(stats.revisionSubmissions == 13 && stats.stale == 0 && stats.revisionRecordings == 3 && stats.revisionSlotsRecorded == 9,
 					"every submission bound a revision's recording; nothing prepared again");
 				REQUIRE(!counters.unbalanced && counters.locks.load() == counters.unlocks.load(), "balanced host queue locks");
 				// Growth as graph work: a version made on a producer's thread and filled through the dedicated uploader (the worker
@@ -611,6 +630,8 @@ int main(int argc, char** argv) {
 						value = 71000u + 10u * frame;
 						host.SubmitEpoch(0, [&](org::RenderGraph& a_graph) {
 							upload(a_graph);
+							std::string why;
+							REQUIRE(host.CanUseEpochRecording(*live, &why), "the ticket being submitted takes the revision's recording");
 							host.UseEpochRecording(live);
 						});
 						REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "a live epoch submits the revision's recording it chose");
@@ -621,6 +642,83 @@ int main(int argc, char** argv) {
 					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "a live epoch's own preparation after a chosen recording");
 					const auto chosenStats = host.TakeAsyncStats();
 					REQUIRE(chosenStats.revisionSubmissions == 4 && chosenStats.stale == 0, "every chosen recording submitted, nothing prepared again");
+					// The graph built again (its extension replaced): the recording is the build before's. The commit asks before it
+					// chooses it, and the rebuilt graph's ticket would not take it; the epoch draws its own preparation.
+					const auto builds = host.BuildGeneration();
+					host.AddExtension("test.host", [&] { return std::make_unique<HostExtension>(input, scratch, output, program, outputRevision, versions); });
+					value = 73000u;
+					bool usable = true;
+					std::string why;
+					host.SubmitEpoch(0, [&](org::RenderGraph& a_graph) {
+						upload(a_graph);
+						usable = host.CanUseEpochRecording(*live, &why);
+					});
+					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "the rebuilt graph's own preparation");
+					std::printf("after a rebuild: %s\n", why.c_str());
+					REQUIRE(host.BuildGeneration() != builds && !usable && !why.empty(), "a recording of the build before is not the rebuilt graph's ticket's");
+					// Explicit builds: an extension added waits for the build point (BuildIfRequested). Until then the graph as built runs,
+					// and a recording of it stays its tickets'; the build point builds, and the recording is the build before's.
+					host.SetExplicitBuilds(true);
+					std::shared_ptr<const org::PersistentGraphHost::EpochRecording> held;
+					state.store(0, std::memory_order_relaxed);
+					REQUIRE(host.RequestEpochRecording(0, data, [&](std::shared_ptr<const org::PersistentGraphHost::EpochRecording> a_recording, std::exception_ptr a_error) {
+						held = std::move(a_recording);
+						state.store(a_error ? 2 : 1, std::memory_order_release);
+					}), "a recording request of the current build");
+					const auto heldDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+					for (uint32_t frame = 0; state.load(std::memory_order_acquire) == 0 && std::chrono::steady_clock::now() < heldDeadline; ++frame) {
+						value = 74000u + 10u * (frame % 100u);
+						host.SubmitEpoch(0, upload);
+						REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "the live epoch draws while it is recorded");
+					}
+					REQUIRE(state.load(std::memory_order_acquire) == 1 && held && host.EpochRecordingCurrent(*held), "a recording of the current build");
+					const auto explicitBuilds = host.BuildGeneration();
+					host.AddExtension("test.host", [&] { return std::make_unique<HostExtension>(input, scratch, output, program, outputRevision, versions); });
+					REQUIRE(host.RebuildRequested(), "the extension added is a rebuild requested");
+					for (uint32_t frame = 0; frame < 4; ++frame) {
+						value = 75000u + 10u * frame;
+						usable = false;
+						host.SubmitEpoch(0, [&](org::RenderGraph& a_graph) {
+							upload(a_graph);
+							usable = host.CanUseEpochRecording(*held, &why);
+							if (usable)
+								host.UseEpochRecording(held);
+						});
+						REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "the graph as built draws until the build point");
+						REQUIRE(usable && host.BuildGeneration() == explicitBuilds && host.EpochRecordingCurrent(*held), "its recording is its tickets' until the build point");
+					}
+					REQUIRE(host.BuildIfRequested() && !host.RebuildRequested() && host.BuildGeneration() != explicitBuilds && !host.EpochRecordingCurrent(*held),
+						"the build point builds; the recording is the build before's");
+					REQUIRE(!host.BuildIfRequested(), "nothing to build without a request");
+					value = 76000u;
+					host.SubmitEpoch(0, [&](org::RenderGraph& a_graph) {
+						upload(a_graph);
+						usable = host.CanUseEpochRecording(*held, &why);
+					});
+					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value) && !usable, "the rebuilt graph's own preparation");
+					host.SetExplicitBuilds(false);
+					// An epoch the caller does not submit: its ready ticket holds a slot of its ring, so a recording requested for it
+					// waits for that slot until the caller gives the ticket back (ReleaseEpochTicket); then it completes, unsubmitted.
+					std::shared_ptr<const org::PersistentGraphHost::EpochRecording> idle;
+					state.store(0, std::memory_order_relaxed);
+					const auto readyDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+					while (!host.ReleaseEpochTicket(0) && std::chrono::steady_clock::now() < readyDeadline)
+						std::this_thread::yield();
+					REQUIRE(host.RequestEpochRecording(0, data, [&](std::shared_ptr<const org::PersistentGraphHost::EpochRecording> a_recording, std::exception_ptr a_error) {
+						idle = std::move(a_recording);
+						state.store(a_error ? 2 : 1, std::memory_order_release);
+					}), "a recording request for an epoch not submitted");
+					std::this_thread::sleep_for(std::chrono::milliseconds(200));
+					REQUIRE(state.load(std::memory_order_acquire) == 0, "it waits for the slot the epoch's ready ticket holds");
+					const auto idleDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+					while (state.load(std::memory_order_acquire) == 0 && std::chrono::steady_clock::now() < idleDeadline) {
+						(void)host.ReleaseEpochTicket(0);
+						std::this_thread::sleep_for(std::chrono::milliseconds(5));
+					}
+					REQUIRE(state.load(std::memory_order_acquire) == 1 && idle && idle->slots.size() == 3, "given the ticket back, the recording completes unsubmitted");
+					value = 77000u;
+					host.SubmitEpoch(0, upload);
+					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "the epoch submits again after its ticket was given back");
 				}
 				host.SetAsyncEpochs({});
 			}
