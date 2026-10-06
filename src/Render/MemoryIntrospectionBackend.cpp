@@ -12,14 +12,20 @@ namespace org::memory {
 namespace {
 class ECSMemorySnapshotProvider final : public IMemorySnapshotProvider {
 public:
-    explicit ECSMemorySnapshotProvider(flecs::world& world)
-        : m_memoryQuery(world.query_builder<const MemoryStatisticsComponents::MemSizeBytes>().build()) {
+    // a_world: a host's own world, which the host keeps from being changed while a snapshot reads it; null for ORG's
+    // tracking world, which has one owner at a time (ECSManager): the query is built, and read, only while owning it.
+    explicit ECSMemorySnapshotProvider(flecs::world* a_world)
+        : m_hostWorld(a_world)
+        , m_memoryQuery(WithWorld(a_world, [](flecs::world& world) {
+            return world.query_builder<const MemoryStatisticsComponents::MemSizeBytes>().build();
+        })) {
     }
 
     void BuildSnapshot(std::vector<ResourceMemoryRecord>& out) override {
         out.clear();
         out.reserve(2048);
 
+        auto read = [&](flecs::world&) {
         m_memoryQuery.each([&](flecs::entity e, const MemoryStatisticsComponents::MemSizeBytes& sz) {
             ResourceMemoryRecord row;
             row.bytes = sz.size;
@@ -50,6 +56,11 @@ public:
 
             out.push_back(std::move(row));
             });
+        };
+        if (m_hostWorld)
+            read(*m_hostWorld);
+        else
+            ECSManager::GetInstance().Access(read);
 
 		// Replacement resources and deferred-deletion backings retain the stable
 		// owner ResourceID, but metadata applied after materialization can exist on
@@ -82,17 +93,24 @@ public:
     }
 
 private:
+    template <class F>
+    static decltype(auto) WithWorld(flecs::world* a_world, F&& a_use) {
+        if (a_world)
+            return std::forward<F>(a_use)(*a_world);
+        return ECSManager::GetInstance().Access(std::forward<F>(a_use));
+    }
+
+    flecs::world* m_hostWorld;  // null: ORG's tracking world
     flecs::query<const MemoryStatisticsComponents::MemSizeBytes> m_memoryQuery;
 };
 }
 
 std::shared_ptr<IMemorySnapshotProvider> CreateECSMemorySnapshotProvider() {
-    auto& world = ECSManager::GetInstance().GetWorld();
-    return CreateECSMemorySnapshotProvider(world);
+    return std::make_shared<ECSMemorySnapshotProvider>(nullptr);
 }
 
 std::shared_ptr<IMemorySnapshotProvider> CreateECSMemorySnapshotProvider(flecs::world& world) {
-    return std::make_shared<ECSMemorySnapshotProvider>(world);
+    return std::make_shared<ECSMemorySnapshotProvider>(&world);
 }
 
 }

@@ -94,6 +94,17 @@ public:
 
     size_t GetSize() const { return m_bufferSize; }
 
+    // A new buffer like this one - heap, access, structure, descriptors, upload policy and name - without a backing: resized and
+    // materialized, it is the next version of a buffer that grows (VersionedBuffer), so nothing changes in place.
+    std::shared_ptr<Buffer> UnmaterializedLike() const {
+        auto buffer = CreateSharedUnmaterialized(m_accessType, m_bufferSize, m_unorderedAccess);
+        buffer->m_structuredParams = m_structuredParams;
+        if (m_descriptorRequirements) buffer->SetDescriptorRequirements(*m_descriptorRequirements);
+        buffer->SetUploadPolicyTag(GetUploadPolicyTag());
+        buffer->SetName(GetName());
+        return buffer;
+    }
+
     // TODO: Should these expose the ability to copy the old buffer's contents into the new buffer if materialized?
     bool ResizeBytes(uint64_t newBufferSize) {
         if (newBufferSize == 0) {
@@ -105,6 +116,8 @@ public:
         if (newBufferSize == m_bufferSize) {
             return false;
         }
+        // Between the release below and the new backing the buffer has none: a concurrent capture must not see that.
+        RequireBackingMutationAllowed("ResizeBytes", newBufferSize);
 
         const bool wasMaterialized = IsMaterialized();
         if (wasMaterialized) {
@@ -139,6 +152,7 @@ public:
             params.elementSize,
             m_unorderedAccess,
             params.unorderedAccessCounter);
+        RequireBackingMutationAllowed("ResizeStructured", layout.bufferSize);
 
         const bool wasMaterialized = IsMaterialized();
         if (wasMaterialized) {

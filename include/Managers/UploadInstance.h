@@ -189,7 +189,11 @@ public:
 	// Owner thread: queues a producer's staged batch (IUploadService::SubmitStagedUploads).
 	void SubmitStagedUploads(std::shared_ptr<org::runtime::StagedUploadBatch> batch);
 	void SetStagedUploadsRecordedDirectly(bool direct);
-	size_t RecordStagedUploads(rhi::CommandList& list, uint8_t frameIndex, bool afterCopies);
+	size_t RecordStagedUploads(rhi::CommandList& list, uint8_t frameIndex, bool afterWork);
+	// IUploadService::SubmitRecordedUploads / TakeRecordedUploads (direct mode). a_nothingQueued: the manager's own queue
+	// (resource copies) is empty.
+	bool SubmitRecordedUploads(std::shared_ptr<org::runtime::StagedUploadBatch> batch, bool a_nothingQueued);
+	size_t TakeRecordedUploads(std::vector<rhi::CommandList>& out, uint8_t frameIndex);
 
 	// Configuration
 
@@ -292,6 +296,8 @@ private:
 	// Direct mode: submitted batches waiting for RecordStagedUploads.
 	bool m_stagedDirect = false;
 	std::vector<std::shared_ptr<org::runtime::StagedUploadBatch>> m_directStaged;
+	// Direct mode: recorded batches accepted ahead of every other upload of the frame, waiting for TakeRecordedUploads.
+	std::vector<std::shared_ptr<org::runtime::StagedUploadBatch>> m_directRecorded;
 	std::vector<std::vector<std::shared_ptr<org::runtime::StagedUploadBatch>>> m_frameStaged;
 	UploadPagePtr             m_activePage;
 	std::atomic_size_t         m_nextPageIndex = 0;

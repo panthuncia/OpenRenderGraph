@@ -6,11 +6,14 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
+#include <exception>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
 
 #include "Managers/Singletons/DescriptorHeapManager.h"
+#include "Resources/Buffers/DynamicBufferBase.h"
 #include "Render/PassExecutionContext.h"
 #include "Render/Runtime/IUploadService.h"
 #include "Render/Runtime/OpenRenderGraphSettings.h"
@@ -63,6 +66,34 @@ struct PersistentGraphHost::Async {
 	};
 
 	std::vector<uint32_t> epochs;
+	std::vector<uint8_t> revisionDriven;  // per epoch index: recorded ahead for revisions, its tickets admission-only
+	// Per epoch index, its ring of frame slots: [index * ringSize, + ringSize), the next position. 0: one ring of every slot.
+	uint32_t ringSize = 0;
+	std::vector<uint64_t> ringNext;
+	// Recording requests (RequestEpochRecording): any thread pushes, the host's thread takes them all (a Treiber stack, taken
+	// whole and reversed into posting order).
+	struct RecordingRequest {
+		uint32_t epochIndex = 0;
+		std::shared_ptr<const IHostExecutionData> hostData;
+		PersistentGraphHost::EpochRecordingCallback done;
+		std::shared_ptr<PersistentGraphHost::EpochRecording> result;
+		std::vector<uint8_t> recorded;  // by ring position
+		RecordingRequest* next = nullptr;
+	};
+	std::atomic<RecordingRequest*> requests{nullptr};
+	std::deque<std::unique_ptr<RecordingRequest>> pendingRequests;  // host thread
+	// Host thread, per epoch index: the revision recordings made (admitted by each ticket while their callers hold them), and the
+	// ticket prepared and not yet submitted or discarded, which a recording finished meanwhile is added to before its callback.
+	std::vector<std::vector<std::weak_ptr<const PersistentGraphHost::EpochRecording>>> liveRecordings;
+	std::vector<std::shared_ptr<RenderGraph::PersistentTicket>> outstanding;
+	std::atomic<uint64_t> revisionSlotsRecorded{0}, revisionRecordings{0};
+	~Async() {
+		for (auto* request = requests.exchange(nullptr); request;) {
+			auto* next = request->next;
+			delete request;
+			request = next;
+		}
+	}
 	// One ticket cell per epoch: stored by the host's thread, taken by the render thread.
 	std::unique_ptr<std::atomic<std::shared_ptr<Ticket>>[]> cells;
 	// Render thread -> host thread, single producer / single consumer, in order.
@@ -74,12 +105,27 @@ struct PersistentGraphHost::Async {
 	// slot even when the worker is busy.
 	std::shared_ptr<std::atomic<uint32_t>> controlCredits = std::make_shared<std::atomic<uint32_t>>(0);
 	std::unique_ptr<rhi::CompletionWait> completionWake;
+	// Whether the host's thread, if it sleeps, sleeps on GPU completions as well as on completionWake: then a submission's
+	// message needs no wake of its own (vkSignalSemaphore, several microseconds on the render thread), because the next GPU
+	// completion wakes the thread and it reads the mailbox then. Written by the host's thread before its last look at the
+	// mailbox, read by a poster after its write: both sequentially consistent, so one of them sees the other.
+	std::atomic<bool> wakesOnGpu{false};
+	uint64_t wakesSkipped = 0;  // render thread
 	// Ticket publication and terminal failure both advance this counter. A
 	// notify on an unchanged null shared_ptr cannot release atomic::wait(nullptr).
 	std::atomic<uint32_t> ticketWake{0};
 	std::atomic<bool> failed{false};
 	std::string error;  // written before failed is set
 	std::thread thread;
+	// Backing changes from the submitting thread (BackingMutation) against this thread's ticket preparation, which captures
+	// every slot's backing (BackedResource: capture and backing mutation never overlap). A Dekker pair, both sides
+	// sequentially consistent: the submitting thread raises mutating, then waits for preparing to fall; the host's thread
+	// raises preparing, then backs off while mutating is up. So a preparation sees every backing whole, before or after.
+	std::atomic<uint32_t> preparing{0}, mutating{0};
+	// Advanced by every BackingMutation. A ticket prepared under an older value may hold a backing that has changed since
+	// (the render thread then writes the new one): it is not current (Current).
+	std::atomic<uint64_t> backingVersion{0};
+	std::atomic<uint64_t> preparationWaits{0};  // AsyncStats::preparationWaits, from the host's thread
 
 	// Host thread only.
 	struct Slot {
@@ -105,6 +151,7 @@ struct PersistentGraphHost::Async {
 	// wait: the slot's last upload list is done), then recorded, ended and submitted by the render thread; the
 	// ticket cell orders the two.
 	std::vector<CommandListPair> uploadLists;
+	std::vector<rhi::CommandList> recordedLists;  // SubmitTicket's scratch: the producers' recorded upload lists, then the slot's
 	uint32_t graphicsSlot = 0;
 	rhi::Queue graphicsQueue;
 	rhi::TimelineHandle graphicsFence{};
@@ -113,7 +160,8 @@ struct PersistentGraphHost::Async {
 		for (uint32_t i = 0; i < epochs.size(); ++i) if (epochs[i] == epoch) return i;
 		throw std::invalid_argument("SubmitEpoch: epoch " + std::to_string(epoch) + " has no ticket");
 	}
-	bool TryPost(Message& message, bool spendsReservedCredit = false) {
+	// lazyWake: a submission's completion, which the host's thread can take at its next GPU wake-up (wakesOnGpu).
+	bool TryPost(Message& message, bool spendsReservedCredit = false, bool lazyWake = false) {
 		const auto index = written.load(std::memory_order_relaxed);
 		const auto credits = controlCredits->load(std::memory_order_relaxed);
 		if (spendsReservedCredit && !credits) return false;
@@ -122,24 +170,58 @@ struct PersistentGraphHost::Async {
 			|| index - read.load(std::memory_order_acquire) >= kMailbox - protectedCredits)
 			return false;
 		mailbox[index % kMailbox] = std::move(message);
-		written.store(index + 1, std::memory_order_release);
+		written.store(index + 1, std::memory_order_seq_cst);
+		if (lazyWake && wakesOnGpu.load(std::memory_order_seq_cst)) {
+			++wakesSkipped;
+			return true;
+		}
 		(void)completionWake->Notify();
 		return true;
 	}
-	bool Post(Message& message) {
+	bool Post(Message& message, bool lazyWake = false) {
 		// Legacy SubmitEpoch still blocks for admission; published callers use
 		// TryPostOwnedPreparation and never take this path on a full mailbox.
-		while (!TryPost(message)) {
+		while (!TryPost(message, false, lazyWake)) {
 			if (failed.load(std::memory_order_acquire)) return false;
 			std::this_thread::yield();
 		}
 		return true;
+	}
+	// Host thread: a preparation, kept clear of backing mutations (preparing, mutating). It may change backings itself.
+	struct Preparation {
+		explicit Preparation(Async& a_async) : async(a_async) {
+			for (;;) {
+				async.preparing.store(1, std::memory_order_seq_cst);
+				if (!async.mutating.load(std::memory_order_seq_cst)) break;
+				Leave();
+				async.preparationWaits.fetch_add(1, std::memory_order_relaxed);
+				BT_ZONE_SCOPE("ORG.Host.WaitBackingMutation.Worker");
+				async.mutating.wait(1, std::memory_order_seq_cst);
+			}
+			BufferBase::EnterBackingMutation();
+		}
+		~Preparation() {
+			BufferBase::LeaveBackingMutation();
+			Leave();
+		}
+		void Leave() {
+			async.preparing.store(0, std::memory_order_seq_cst);
+			async.preparing.notify_all();
+		}
+		Async& async;
+	};
+	// Every pass it prepared would prepare the same invocation, and no backing has changed since.
+	bool Current(const Ticket& ticket) const {
+		return RenderGraph::PersistentTicketCurrent(ticket)
+			&& RenderGraph::PersistentTicketHostTag(ticket) == backingVersion.load(std::memory_order_acquire);
 	}
 	void ThrowIfFailed() const {
 		if (failed.load(std::memory_order_acquire)) throw std::runtime_error("Async epochs failed: " + error);
 	}
 	std::shared_ptr<Ticket> WaitTicket(uint32_t index) {
 		BT_ZONE_SCOPE("ORG.Host.WaitTicket");
+		// About to block on the host's thread: it must not be left asleep on GPU work that waits for this thread.
+		(void)completionWake->Notify();
 		for (;;) {
 			const auto seen = ticketWake.load(std::memory_order_acquire);
 			if (auto ticket = cells[index].exchange(nullptr, std::memory_order_acq_rel)) return ticket;
@@ -153,15 +235,20 @@ PersistentGraphHost::PersistentGraphHost(Desc desc) : m_desc(std::move(desc)) {
 	if (!m_desc.device) throw std::invalid_argument("PersistentGraphHost requires a device");
 	if (m_desc.backend == rhi::Backend::Null) throw std::invalid_argument("PersistentGraphHost requires a device backend");
 	if (!m_desc.tasks) m_desc.tasks = std::make_shared<runtime::ThreadPoolTaskService>();
-	// The host's slot count is the one frames-in-flight: upload pages, statistics query ranges, deletion
+	// The frame slots: framesInFlight frames of every epoch in the order, so that adding an epoch keeps the CPU's lead over
+	// the GPU the same rather than shortening it (each slot's next execution waits for its last one).
+	const uint32_t epochs = (std::max)(static_cast<uint32_t>(m_desc.epochOrder.size()), 1u);
+	m_frameSlots = (std::max)(m_desc.framesInFlight, 1u) * epochs;
+	if (m_frameSlots > 255) throw std::invalid_argument("PersistentGraphHost: more than 255 frame slots (frames in flight times epochs)");
+	// The host's slot count is the runtime's frames-in-flight: upload pages, statistics query ranges, deletion
 	// and admission capacity all size themselves from the runtime settings, so they follow it.
 	{
 		auto settings = runtime::GetOpenRenderGraphSettings();
-		settings.numFramesInFlight = static_cast<uint8_t>((std::clamp)(m_desc.framesInFlight, 1u, 255u));
+		settings.numFramesInFlight = static_cast<uint8_t>(m_frameSlots);
 		runtime::SetOpenRenderGraphSettings(settings);
 	}
 	runtime::InitializeRuntimeDevice(m_desc.device);
-	m_slotCompletions.assign((std::max)(m_desc.framesInFlight, 1u), {});
+	m_slotCompletions.assign(m_frameSlots, {});
 }
 
 PersistentGraphHost::~PersistentGraphHost() {
@@ -219,6 +306,7 @@ void PersistentGraphHost::Build() {
 	graph->SetPersistentSegment(kUploadPassName, RenderGraph::PersistentSegmentKind::Pre);
 	graph->SetPersistentEpochOrder(m_desc.epochOrder);
 	graph->SetPersistentClosedExecutions(m_desc.closedExecutions);
+	graph->SetPersistentRecordingReuse(m_desc.reuseRecordings && m_desc.closedExecutions);
 	graph->SetPersistentExecutionEnabled(true);
 	graph->SetExternalQueueBoundary(m_desc.queueBoundary);
 	graph->Setup();
@@ -240,7 +328,7 @@ void PersistentGraphHost::ExecuteFrame(const IHostExecutionData* hostData, const
 	if (m_rebuildRequested || !m_graph) Build();
 	lap(m_lastTimings.buildUs);
 	runtime::ScopedActiveGraphServices services(m_graph->GetUploadService(), m_graph->GetDescriptorService());
-	const auto slot = static_cast<uint32_t>(m_frameNumber % (std::max)(m_desc.framesInFlight, 1u));
+	const auto slot = static_cast<uint32_t>(m_frameNumber % m_frameSlots);
 	// The slot's previous frame must be done on the GPU before the upload pages it used are recycled
 	// (and before this frame records uploads into the slot).
 	if (auto& completion = m_slotCompletions[slot]; completion.pending) {
@@ -319,9 +407,15 @@ void PersistentGraphHost::ExecuteFrame(const IHostExecutionData* hostData, const
 // ---- async epochs ----
 
 
-void PersistentGraphHost::SetAsyncEpochs(std::vector<uint32_t> epochs) {
+void PersistentGraphHost::SetAsyncEpochs(std::vector<uint32_t> epochs, std::vector<uint32_t> revisionEpochs) {
 	StopAsync();
 	m_asyncEpochs = std::move(epochs);
+	for (const auto epoch : revisionEpochs)
+		if (std::ranges::find(m_asyncEpochs, epoch) == m_asyncEpochs.end())
+			throw std::invalid_argument("A revision-driven epoch must be an async epoch");
+	if (!revisionEpochs.empty() && !m_desc.reuseRecordings)
+		throw std::logic_error("Revision-driven epochs need Desc::reuseRecordings (replayable recordings)");
+	m_revisionEpochs = std::move(revisionEpochs);
 	if (m_asyncEpochs.empty()) return;
 	if (!m_desc.closedExecutions) throw std::logic_error("Async epochs require closed executions");
 	if (m_rebuildRequested || !m_graph) Build();
@@ -334,9 +428,19 @@ void PersistentGraphHost::StartAsync() {
 	if (m_desc.device.CreateCompletionWait(async->completionWake) != rhi::Result::Ok)
 		throw std::runtime_error("Async epochs require wakeable GPU completion waits");
 	async->epochs = m_asyncEpochs;
+	async->revisionDriven.assign(async->epochs.size(), 0);
+	for (uint32_t index = 0; index < async->epochs.size(); ++index)
+		async->revisionDriven[index] = std::ranges::find(m_revisionEpochs, async->epochs[index]) != m_revisionEpochs.end();
+	// Each epoch its own ring of framesInFlight slots, when the slots hold one per async epoch (they hold framesInFlight of every
+	// epoch in the order); otherwise one ring of all.
+	if (const uint32_t ring = (std::max)(m_desc.framesInFlight, 1u); m_frameSlots >= ring * async->epochs.size())
+		async->ringSize = ring;
+	async->ringNext.assign(async->epochs.size(), 0);
 	async->cells = std::make_unique<std::atomic<std::shared_ptr<Async::Ticket>>[]>(async->epochs.size());
 	async->needsTicket.assign(async->epochs.size(), 1);
-	const uint32_t slotCount = (std::max)(m_desc.framesInFlight, 1u);
+	async->liveRecordings.assign(async->epochs.size(), {});
+	async->outstanding.assign(async->epochs.size(), {});
+	const uint32_t slotCount = m_frameSlots;
 	async->slots.resize(slotCount);
 	// What the synchronous frames left: their slots' completions, and the values the queues have reached.
 	for (uint32_t slot = 0; slot < slotCount && slot < m_slotCompletions.size(); ++slot) {
@@ -396,6 +500,7 @@ void PersistentGraphHost::StartAsync() {
 						slot.pending = !slot.points.empty();
 						slot.reserved = false;
 						slot.hostFrame = RenderGraph::PersistentTicketHostFrame(*message.ticket);
+						if (state->outstanding[message.epochIndex] == message.ticket) state->outstanding[message.epochIndex].reset();
 							slot.keepAlive = std::move(state->uncertainUploadOwner);
 							slot.resourceOwner = std::move(state->uncertainResourceOwner);
 						state->needsTicket[message.epochIndex] = 1;
@@ -407,6 +512,7 @@ void PersistentGraphHost::StartAsync() {
 					}
 					case Async::Message::Kind::Discard:
 						state->slots[RenderGraph::PersistentTicketSlot(*message.ticket)].reserved = false;
+						if (state->outstanding[message.epochIndex] == message.ticket) state->outstanding[message.epochIndex].reset();
 						(void)graph->CompletePersistentTicket(*message.ticket, {});
 						// A discard naming a slot is a stale ticket's reprepare: its replacement is prepared here, in the same
 						// step, into the slot the render thread is recording. Marking the epoch as needing a ticket instead
@@ -419,6 +525,7 @@ void PersistentGraphHost::StartAsync() {
 						break;
 					case Async::Message::Kind::OwnedPrepare: {
 						runtime::ScopedActiveGraphServices services(graph->GetUploadService(), graph->GetDescriptorService());
+						Async::Preparation preparation(*state);
 						message.ownedPrepare(*graph);
 						break;
 					}
@@ -428,6 +535,16 @@ void PersistentGraphHost::StartAsync() {
 					}
 				}
 				if (stop) break;
+				// Recording requests: taken in posting order, each recording the slots of its ring that are free.
+				if (auto* head = state->requests.exchange(nullptr, std::memory_order_acquire)) {
+					std::vector<Async::RecordingRequest*> taken;
+					for (; head; head = head->next) taken.push_back(head);
+					for (auto it = taken.rbegin(); it != taken.rend(); ++it) {
+						(*it)->next = nullptr;
+						state->pendingRequests.emplace_back(*it);
+					}
+				}
+				const bool requestsAdvanced = AdvanceRecordingRequests(*state);
 				graph->RetirePersistentExecutions();
 				// A submitted upload batch owns its staging until the GPU has actually
 				// signalled every queue that used the slot. Retire it on this worker even
@@ -454,7 +571,8 @@ void PersistentGraphHost::StartAsync() {
 					PrepareTicket(*state, index, -1);
 					prepared = true;
 				}
-				if (!prepared && state->read.load(std::memory_order_relaxed) == state->written.load(std::memory_order_acquire)) {
+				if (!prepared && !requestsAdvanced && !state->requests.load(std::memory_order_acquire)
+					&& state->read.load(std::memory_order_relaxed) == state->written.load(std::memory_order_acquire)) {
 					std::array<rhi::TimelinePoint, rhi::CompletionWait::MaxTimelines> heads{};
 					uint32_t count = 0;
 					bool retireAgain = false;
@@ -479,7 +597,16 @@ void PersistentGraphHost::StartAsync() {
 						if (!incomplete && (slot.keepAlive || slot.resourceOwner)) retireAgain = true;
 					}
 					if (retireAgain) continue;
-					if (state->completionWake->Wait({heads.data(), count}, seen) != rhi::Result::Ok)
+					// Posters skip the wake while this sleep has GPU completions to end it; a message written before this store
+					// is seen by the look below, and one written after it sees the store.
+					state->wakesOnGpu.store(count != 0, std::memory_order_seq_cst);
+					if (state->read.load(std::memory_order_relaxed) != state->written.load(std::memory_order_seq_cst)) {
+						state->wakesOnGpu.store(false, std::memory_order_seq_cst);
+						continue;
+					}
+					const auto waited = state->completionWake->Wait({heads.data(), count}, seen);
+					state->wakesOnGpu.store(false, std::memory_order_seq_cst);
+					if (waited != rhi::Result::Ok)
 						throw std::runtime_error("GPU completion wait failed");
 				}
 			}
@@ -494,6 +621,8 @@ void PersistentGraphHost::StartAsync() {
 		state->ticketWake.fetch_add(1, std::memory_order_release);
 		state->ticketWake.notify_all();
 	});
+	// From here the host's thread captures backings while the submitting thread runs: their changes need BackingMutation.
+	BufferBase::RegisterConcurrentBackingCapture();
 	m_async = std::move(async);
 	++m_ticketGeneration;
 }
@@ -502,12 +631,128 @@ std::shared_ptr<runtime::ResourceCleanupQueue> PersistentGraphHost::ResourceClea
 	return DescriptorHeapManager::GetInstance().GetResourceCleanupQueue();
 }
 
+void PersistentGraphHost::WaitSlot(Async& state, uint32_t slot) {
+	// The slot's previous execution must be done before its command lists, statistics range and latch region are reused, or
+	// before it is recorded for again: the wait happens here, on this thread, never on the render thread.
+	auto& entry = state.slots[slot];
+	if (!entry.pending) return;
+	{
+		BT_ZONE_SCOPE("ORG.Host.WaitSlotCompletion.Worker");
+		for (const auto& [timeline, value] : entry.points) (void)timeline->HostWait(value);
+	}
+	entry.pending = false;
+	if (auto* stats = m_graph->GetStatisticsService()) {
+		rhi::Queue queue = m_desc.device.GetQueue(rhi::QueueKind::Graphics);
+		stats->OnFrameComplete(slot, queue);
+		if (m_completedFrame) m_completedFrame(entry.hostFrame, *stats);
+	}
+	entry.keepAlive.reset();
+	entry.resourceOwner.reset();
+}
+
+bool PersistentGraphHost::RequestEpochRecording(uint32_t epoch, std::shared_ptr<const IHostExecutionData> hostData, EpochRecordingCallback done) {
+	auto* async = m_async.get();
+	if (!async || !done || async->failed.load(std::memory_order_acquire)) return false;
+	const auto found = std::ranges::find(async->epochs, epoch);
+	if (found == async->epochs.end()) return false;
+	const auto index = static_cast<uint32_t>(found - async->epochs.begin());
+	if (!async->revisionDriven[index] || !async->ringSize) return false;
+	auto request = std::make_unique<Async::RecordingRequest>();
+	request->epochIndex = index;
+	request->hostData = std::move(hostData);
+	request->done = std::move(done);
+	auto* node = request.release();
+	auto* head = async->requests.load(std::memory_order_relaxed);
+	do node->next = head;
+	while (!async->requests.compare_exchange_weak(head, node, std::memory_order_release, std::memory_order_relaxed));
+	(void)async->completionWake->Notify();
+	return true;
+}
+
+bool PersistentGraphHost::AdvanceRecordingRequests(Async& state) {
+	bool advanced = false;
+	for (auto it = state.pendingRequests.begin(); it != state.pendingRequests.end();) {
+		auto& request = **it;
+		std::exception_ptr error;
+		try {
+			if (!request.result) {
+				request.result = std::make_shared<EpochRecording>();
+				request.result->epoch = state.epochs[request.epochIndex];
+				request.result->firstSlot = request.epochIndex * state.ringSize;
+				request.result->slots.resize(state.ringSize);
+				request.result->revision = request.hostData;
+				request.recorded.assign(state.ringSize, 0);
+			}
+			for (uint32_t position = 0; position < state.ringSize; ++position) {
+				const uint32_t slot = request.result->firstSlot + position;
+				// A slot its epoch's unsubmitted ticket holds is recorded too: a revision-driven ticket holds the admission alone (its
+				// preparation recorded nothing, and already waited out the slot's last work), and it cannot be submitted without this.
+				if (request.recorded[position]) continue;
+				BT_ZONE_SCOPE("ORG.Host.RecordForRevision");
+				runtime::ScopedActiveGraphServices services(m_graph->GetUploadService(), m_graph->GetDescriptorService());
+				WaitSlot(state, slot);
+				std::shared_ptr<const RenderGraph::PersistentRecording> recording;
+				{
+					Async::Preparation preparation(state);
+					const auto version = state.backingVersion.load(std::memory_order_acquire);
+					auto ticket = m_graph->PreparePersistentTicket(m_desc.device, request.result->epoch, static_cast<uint8_t>(slot), state.hostFrame, version,
+						request.hostData);
+					recording = RenderGraph::PersistentTicketRecording(*ticket);
+					// Recorded only: its admission is abandoned, never submitted.
+					(void)m_graph->CompletePersistentTicket(*ticket, {});
+				}
+				if (!recording || !RenderGraph::PersistentRecordingReplayable(*recording))
+					throw std::logic_error("A revision-driven epoch's recording is not replayable (a pass with lifecycle effects, or a late-bound slot)");
+				request.result->slots[position] = std::move(recording);
+				request.recorded[position] = 1;
+				state.revisionSlotsRecorded.fetch_add(1, std::memory_order_relaxed);
+				advanced = true;
+			}
+		} catch (...) {
+			error = std::current_exception();
+		}
+		const bool complete = !error && std::ranges::all_of(request.recorded, [](uint8_t a_done) { return a_done != 0; });
+		if (!error && !complete) {
+			++it;
+			continue;
+		}
+		auto done = std::move(request.done);
+		auto result = error ? nullptr : std::shared_ptr<const EpochRecording>(std::move(request.result));
+		const auto epochIndex = request.epochIndex;
+		it = state.pendingRequests.erase(it);
+		if (!error) {
+			state.revisionRecordings.fetch_add(1, std::memory_order_relaxed);
+			// Admitted from now on: by every ticket prepared next, and by the one waiting for submission, before the caller can
+			// publish it to the submitting thread.
+			state.liveRecordings[epochIndex].push_back(result);
+			if (const auto& ticket = state.outstanding[epochIndex]) {
+				try {
+					AddRevisionCandidate(state, *ticket, *result);
+				} catch (...) {
+					error = std::current_exception();
+					result = nullptr;
+				}
+			}
+		}
+		done(std::move(result), error);
+		advanced = true;
+	}
+	return advanced;
+}
+
 void PersistentGraphHost::PrepareTicket(Async& state, uint32_t epochIndex, int32_t requestedSlot) {
 	BT_ZONE_SCOPE("ORG.Host.PrepareTicket.Worker");
 	const uint32_t slotCount = static_cast<uint32_t>(state.slots.size());
 	uint32_t slot = 0;
 	if (requestedSlot >= 0) {
 		slot = static_cast<uint32_t>(requestedSlot);
+	} else if (state.ringSize) {
+		// The next slot of the epoch's ring no unsubmitted ticket holds.
+		for (uint32_t attempt = 0;; ++attempt) {
+			if (attempt == state.ringSize) throw std::logic_error("Every frame slot of the epoch's ring is held by an unsubmitted ticket");
+			slot = epochIndex * state.ringSize + static_cast<uint32_t>(state.ringNext[epochIndex]++ % state.ringSize);
+			if (!state.slots[slot].reserved) break;
+		}
 	} else {
 		// The next slot no unsubmitted ticket holds.
 		for (uint32_t attempt = 0;; ++attempt) {
@@ -518,22 +763,7 @@ void PersistentGraphHost::PrepareTicket(Async& state, uint32_t epochIndex, int32
 	}
 	auto& entry = state.slots[slot];
 	runtime::ScopedActiveGraphServices services(m_graph->GetUploadService(), m_graph->GetDescriptorService());
-	// The slot's previous execution must be done before its command lists, statistics range and latch region
-	// are reused: the wait happens here, on this thread, never on the render thread.
-	if (entry.pending) {
-		{
-			BT_ZONE_SCOPE("ORG.Host.WaitSlotCompletion.Worker");
-			for (const auto& [timeline, value] : entry.points) (void)timeline->HostWait(value);
-		}
-		entry.pending = false;
-		if (auto* stats = m_graph->GetStatisticsService()) {
-			rhi::Queue queue = m_desc.device.GetQueue(rhi::QueueKind::Graphics);
-			stats->OnFrameComplete(slot, queue);
-			if (m_completedFrame) m_completedFrame(entry.hostFrame, *stats);
-		}
-		entry.keepAlive.reset();
-		entry.resourceOwner.reset();
-	}
+	WaitSlot(state, slot);
 	// The render thread records this ticket's uploads into an open list: resetting and beginning it is several
 	// microseconds of driver work that belongs here.
 	auto& uploads = state.uploadLists[slot];
@@ -541,11 +771,73 @@ void PersistentGraphHost::PrepareTicket(Async& state, uint32_t epochIndex, int32
 	uploads.list->Recycle(uploads.allocator.Get());
 	DescriptorHeapManager::GetInstance().ProcessDeferredReleases(static_cast<uint8_t>(slot));
 	entry.reserved = true;
-	auto ticket = m_graph->PreparePersistentTicket(m_desc.device, state.epochs[epochIndex], static_cast<uint8_t>(slot), state.hostFrame++);
+	std::shared_ptr<Async::Ticket> ticket;
+	if (state.revisionDriven[epochIndex]) {
+		// Nothing from live state: the ticket admits the revisions' recordings for its slot, the ones still held.
+		ticket = m_graph->PrepareRevisionTicket(state.epochs[epochIndex], static_cast<uint8_t>(slot), state.hostFrame++);
+		auto& live = state.liveRecordings[epochIndex];
+		std::erase_if(live, [](const auto& a_recording) { return a_recording.expired(); });
+		for (const auto& weak : live)
+			if (const auto recording = weak.lock()) AddRevisionCandidate(state, *ticket, *recording);
+		state.outstanding[epochIndex] = ticket;
+	} else {
+		// Clear of the submitting thread's backing changes: the preparation captures every slot's backing.
+		Async::Preparation preparation(state);
+		const auto version = state.backingVersion.load(std::memory_order_acquire);
+		ticket = m_graph->PreparePersistentTicket(m_desc.device, state.epochs[epochIndex], static_cast<uint8_t>(slot), state.hostFrame++, version);
+		RenderGraph::SetPersistentTicketHostTag(*ticket, version);
+	}
 	state.needsTicket[epochIndex] = 0;
 	state.cells[epochIndex].store(std::move(ticket), std::memory_order_release);
 	state.ticketWake.fetch_add(1, std::memory_order_release);
 	state.ticketWake.notify_all();
+}
+
+void PersistentGraphHost::AddRevisionCandidate(Async& state, RenderGraph::PersistentTicket& ticket, const EpochRecording& recording) {
+	const uint32_t slot = RenderGraph::PersistentTicketSlot(ticket);
+	if (slot < recording.firstSlot || slot - recording.firstSlot >= recording.slots.size())
+		throw std::logic_error("A revision recording does not cover its epoch's ticket slot");
+	(void)state;
+	m_graph->AddPersistentTicketCandidate(ticket, recording.slots[slot - recording.firstSlot]);
+}
+
+PersistentGraphHost::BackingMutation::BackingMutation(PersistentGraphHost* host) : m_host(host) {
+	BufferBase::EnterBackingMutation();
+	if (m_host->m_backingMutationDepth++ || !m_host->m_async) return;
+	auto& async = *m_host->m_async;
+	BT_ZONE_SCOPE("ORG.Host.BackingMutation");
+	async.mutating.store(1, std::memory_order_seq_cst);
+	++m_host->m_asyncStats.backingMutations;
+	// A preparation in progress ends within its own work (the slot's GPU wait comes before it); a failed host has none.
+	bool waited = false;
+	for (auto preparing = async.preparing.load(std::memory_order_seq_cst); preparing && !async.failed.load(std::memory_order_acquire);
+		preparing = async.preparing.load(std::memory_order_seq_cst)) {
+		waited = true;
+		async.preparing.wait(preparing, std::memory_order_seq_cst);
+	}
+	m_host->m_asyncStats.backingWaits += waited;
+	async.backingVersion.fetch_add(1, std::memory_order_acq_rel);
+}
+
+PersistentGraphHost::BackingMutation::BackingMutation(BackingMutation&& other) noexcept : m_host(std::exchange(other.m_host, nullptr)) {}
+
+PersistentGraphHost::BackingMutation::~BackingMutation() {
+	if (!m_host) return;
+	if (!--m_host->m_backingMutationDepth && m_host->m_async) {
+		auto& async = *m_host->m_async;
+		async.mutating.store(0, std::memory_order_seq_cst);
+		async.mutating.notify_all();
+	}
+	BufferBase::LeaveBackingMutation();
+}
+
+PersistentGraphHost::BackingMutation PersistentGraphHost::MutateBackings() {
+	return BackingMutation(this);
+}
+
+void PersistentGraphHost::NoteNewVersions() noexcept {
+	// After the version's publication (release), so a preparation that reads the new value resolves the new version.
+	if (m_async) m_async->backingVersion.fetch_add(1, std::memory_order_acq_rel);
 }
 
 void PersistentGraphHost::StopAsync() {
@@ -556,6 +848,7 @@ void PersistentGraphHost::StopAsync() {
 	stop.kind = Async::Message::Kind::Stop;
 	(void)async->Post(stop);
 	if (async->thread.joinable()) async->thread.join();
+	BufferBase::UnregisterConcurrentBackingCapture();
 	// Unsubmitted tickets are abandoned; submitted work keeps its slots' completions for the synchronous path.
 	if (m_graph && !async->failed.load()) {
 		for (uint32_t index = 0; index < async->epochs.size(); ++index)
@@ -580,10 +873,31 @@ void PersistentGraphHost::StopAsync() {
 			if (slot.keepAlive) m_uncertainUploadOwners.push_back(std::move(slot.keepAlive));
 		}
 	}
+	// Every slot's work is done (or its owners kept as uncertain): the kept recordings can go.
+	if (m_graph) m_graph->ClearKeptPersistentRecordings();
 	if (async->uncertainResourceOwner)
 		m_uncertainExecutionOwners.push_back(std::move(async->uncertainResourceOwner));
 	if (async->uncertainUploadOwner)
 		m_uncertainUploadOwners.push_back(std::move(async->uncertainUploadOwner));
+}
+
+PersistentGraphHost::AsyncStats PersistentGraphHost::TakeAsyncStats() noexcept {
+	if (m_graph) {
+		const auto recordings = m_graph->TakePersistentRecordingStats();
+		m_asyncStats.recorded = recordings.recorded;
+		m_asyncStats.kept = recordings.kept;
+		m_asyncStats.reused = recordings.reused;
+		m_asyncStats.adopted = recordings.adopted;
+	}
+	if (m_async) {
+		m_asyncStats.revisionSlotsRecorded = m_async->revisionSlotsRecorded.exchange(0, std::memory_order_relaxed);
+		m_asyncStats.revisionRecordings = m_async->revisionRecordings.exchange(0, std::memory_order_relaxed);
+	}
+	if (m_async) {
+		m_asyncStats.wakesSkipped = std::exchange(m_async->wakesSkipped, 0);
+		m_asyncStats.preparationWaits = m_async->preparationWaits.exchange(0, std::memory_order_relaxed);
+	}
+	return std::exchange(m_asyncStats, {});
 }
 
 bool PersistentGraphHost::TryPostOwnedPreparation(FrameCallback& request) {
@@ -612,7 +926,7 @@ bool PersistentGraphHost::TryReserveReadyEpochs(std::span<const uint32_t> epochs
 		}
 		const auto index = static_cast<uint32_t>(found - m_async->epochs.begin());
 		auto ticket = m_async->cells[index].load(std::memory_order_acquire);
-		if (!ticket || !RenderGraph::PersistentTicketCurrent(*ticket)) return false;
+		if (!ticket || !m_async->Current(*ticket)) return false;
 		ready.push_back({epoch, std::move(ticket)});
 	}
 	const auto outstanding = m_async->written.load(std::memory_order_relaxed) - m_async->read.load(std::memory_order_acquire);
@@ -642,7 +956,8 @@ bool PersistentGraphHost::TrySubmitReservedEpoch(FrameTicketReservation& reserva
 	return true;
 }
 
-void PersistentGraphHost::SubmitEpoch(uint32_t epoch, const FrameCallback& beforeSubmit, std::shared_ptr<const void> resourceOwner) {
+void PersistentGraphHost::SubmitEpoch(uint32_t epoch, const FrameCallback& beforeSubmit, std::shared_ptr<const void> resourceOwner,
+	std::shared_ptr<const EpochRecording> recording) {
 	BT_ZONE_SCOPE("ORG.Host.SubmitEpoch");
 	m_lastTimings = {};
 	m_lastTimings.async = true;
@@ -669,18 +984,20 @@ void PersistentGraphHost::SubmitEpoch(uint32_t epoch, const FrameCallback& befor
 		ticket = async.WaitTicket(index);
 	}
 	lap(m_lastTimings.ticketWaitUs);
-	SubmitTicket(async, index, std::move(ticket), beforeSubmit, true, nullptr, std::move(resourceOwner));
+	SubmitTicket(async, index, std::move(ticket), beforeSubmit, true, nullptr, std::move(resourceOwner), std::move(recording));
 }
 
 void PersistentGraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<RenderGraph::PersistentTicket> ticket,
 	const FrameCallback& beforeSubmit, bool allowReprepare, FrameTicketReservation* reservation,
-	std::shared_ptr<const void> resourceOwner) {
+	std::shared_ptr<const void> resourceOwner, std::shared_ptr<const EpochRecording> recording) {
+	// A submission's completion message wakes the host's thread lazily (wakesOnGpu); a discard always wakes it.
 	auto postControl = [&](Async::Message& message) {
+		const bool lazy = message.kind == Async::Message::Kind::Submitted;
 		if (!reservation) {
-			if (!async.Post(message)) throw std::runtime_error("Async epoch host stopped before accepting its completion");
+			if (!async.Post(message, lazy)) throw std::runtime_error("Async epoch host stopped before accepting its completion");
 			return;
 		}
-		if (!async.TryPost(message, true)) throw std::logic_error("Reserved async epoch lost its control-mailbox credit");
+		if (!async.TryPost(message, true, lazy)) throw std::logic_error("Reserved async epoch lost its control-mailbox credit");
 		--reservation->heldCredits;
 		reservation->controlCredits->fetch_sub(1, std::memory_order_relaxed);
 	};
@@ -703,10 +1020,34 @@ void PersistentGraphHost::SubmitTicket(Async& async, uint32_t index, std::shared
 		beforeSubmit(*m_graph);
 	}
 	lap(m_lastTimings.beforePrepareUs);
-	if (!RenderGraph::PersistentTicketCurrent(*ticket)) {
+	// A revision-driven epoch: the revision's recording for this slot, recorded ahead. Never prepared again: a recording that
+	// does not match the ticket is the caller's error.
+	if (async.revisionDriven[index]) {
+		std::string why = "no recording given";
+		const uint32_t position = recording ? slot - recording->firstSlot : 0;
+		const bool bound = recording && recording->epoch == async.epochs[index] && slot >= recording->firstSlot && position < recording->slots.size()
+			&& RenderGraph::BindPersistentTicketRecording(*ticket, recording->slots[position], async.backingVersion.load(std::memory_order_acquire), &why);
+		if (!bound) {
+			Async::Message discard;
+			discard.kind = Async::Message::Kind::Discard;
+			discard.epochIndex = index;
+			discard.ticket = std::move(ticket);
+			postControl(discard);
+			throw std::logic_error("A revision-driven epoch was submitted without its revision's recording for the slot: " + why);
+		}
+		++m_asyncStats.revisionSubmissions;
+	}
+	// Stale, but recorded before for what its passes depend on now (Desc::reuseRecordings): it takes that recording, and
+	// nothing is prepared again.
+	if (!async.revisionDriven[index] && !async.Current(*ticket)
+		&& m_graph->AdoptKeptPersistentRecording(*ticket, async.backingVersion.load(std::memory_order_acquire))
+		&& !async.Current(*ticket))
+		throw std::logic_error("An adopted recording left its ticket stale");
+	if (!async.revisionDriven[index] && !async.Current(*ticket)) {
 		BT_ZONE_SCOPE("ORG.Host.ReprepareStaleTicket");
-		// Prepared before beforeSubmit changed what a pass depends on: prepare it again, for the same slot (its
-		// latch region was just written), and wait. The new one is prepared after the change, so it is current.
+		m_asyncStats.staleBacking += RenderGraph::PersistentTicketCurrent(*ticket);
+		// Prepared before beforeSubmit changed what a pass depends on, or a backing it captured: prepare it again, for the
+		// same slot (its latch region was just written), and wait. The new one is prepared after the change, so it is current.
 		++m_asyncStats.stale;
 		Async::Message discard;
 		discard.kind = Async::Message::Kind::Discard;
@@ -736,7 +1077,8 @@ void PersistentGraphHost::SubmitTicket(Async& async, uint32_t index, std::shared
 	std::shared_ptr<void> keepAlive;
 	bool recorded = false;
 	auto commands = list.list.Get();
-	const bool supported = m_graph->RecordPendingUploads(m_desc.device, commands, static_cast<uint8_t>(slot), keepAlive, recorded);
+	auto& recordedLists = async.recordedLists;
+	const bool supported = m_graph->RecordPendingUploads(m_desc.device, commands, static_cast<uint8_t>(slot), keepAlive, recorded, recordedLists);
 	{
 		BT_ZONE_SCOPE("ORG.Host.CloseUploadList");
 		list.list->End();
@@ -755,15 +1097,17 @@ void PersistentGraphHost::SubmitTicket(Async& async, uint32_t index, std::shared
 	submitted.keepAlive = std::move(keepAlive);
 	submitted.retired = std::move(retired);
 	submitted.resourceOwner = reservation ? reservation->resourceOwner : std::move(resourceOwner);
-	if (recorded) {
+	if (recorded || !recordedLists.empty()) {
 		BT_ZONE_SCOPE("ORG.Host.EnqueueUploads");
 		++m_asyncStats.uploads;
+		m_asyncStats.recordedUploadLists += recordedLists.size();
 		const auto value = ++async.queueValues.at(async.graphicsSlot);
 		const rhi::TimelinePoint signal{async.graphicsFence, value};
-		rhi::CommandList lists[] = {commands};
+		// The producers' recorded lists, then this thread's (an empty one costs nothing but its begin and end).
+		recordedLists.push_back(commands);
 		rhi::Result uploadResult = rhi::Result::Ok;
 		try {
-			uploadResult = async.graphicsQueue.Submit({lists, 1}, {{}, {&signal, 1}});
+			uploadResult = async.graphicsQueue.Submit({recordedLists.data(), static_cast<uint32_t>(recordedLists.size())}, {{}, {&signal, 1}});
 		} catch (...) {
 			if (submitted.resourceOwner) m_uncertainExecutionOwners.push_back(std::move(submitted.resourceOwner));
 			if (submitted.keepAlive) m_uncertainUploadOwners.push_back(std::move(submitted.keepAlive));
@@ -779,7 +1123,7 @@ void PersistentGraphHost::SubmitTicket(Async& async, uint32_t index, std::shared
 	lap(m_lastTimings.uploadsUs);
 	bool ok = false;
 	try {
-		ok = RenderGraph::SubmitPersistentTicket(*ticket, async.queueValues, submitted.submission);
+		ok = RenderGraph::SubmitPersistentTicket(*ticket, async.queueValues, submitted.submission, submitted.uploadSignal);
 	} catch (...) {
 		// The queue may have accepted a prefix of this ticket. Completion is
 		// unknown, so preserve both owners until device teardown.
@@ -796,6 +1140,7 @@ void PersistentGraphHost::SubmitTicket(Async& async, uint32_t index, std::shared
 		if (submitted.keepAlive) m_uncertainUploadOwners.push_back(std::move(submitted.keepAlive));
 		throw;
 	}
+	lap(m_lastTimings.postUs);
 	++m_asyncStats.submitted;
 	if (!ok) throw std::runtime_error("Async epoch submission failed");
 }

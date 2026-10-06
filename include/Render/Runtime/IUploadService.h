@@ -118,11 +118,27 @@ public:
     // every entry is then one copy with no further bookkeeping. Switching it off queues what is waiting.
     virtual void SetStagedUploadsRecordedDirectly(bool direct) { (void)direct; }
     // Owner thread: records the waiting staged batches' copies into `list` (whose frame slot is frameIndex:
-    // the batches live until it retires), in submission order: a copy that overlaps one recorded before it -
-    // in these batches, or among the list's copies before them when afterCopies - waits for it. Returns the
-    // number of copies; the caller orders them against everything else.
-    virtual size_t RecordStagedUploads(rhi::CommandList& list, uint8_t frameIndex, bool afterCopies) {
-        (void)list; (void)frameIndex; (void)afterCopies;
+    // the batches live until it retires), in submission order: a copy that overlaps one recorded before it in
+    // these batches waits for it. afterWork: the copies follow work they must wait for (copies earlier in the
+    // list, or the previous execution's): one full barrier ahead of the first, recorded only when there is a
+    // copy, so an epoch with no batch pays nothing. Returns the number of copies.
+    virtual size_t RecordStagedUploads(rhi::CommandList& list, uint8_t frameIndex, bool afterWork) {
+        (void)list; (void)frameIndex; (void)afterWork;
+        return 0;
+    }
+    // Owner thread, direct mode: queues a batch its producer already recorded (StagedUploadBatch::Record), whose list
+    // the host submits as it is, ahead of the copies it records itself - so only when that is the batch's place: nothing
+    // staged, queued or posted before it is waiting, and no backing was released since it was recorded. False leaves the
+    // batch with the caller, which submits it as staged (SubmitStagedUploads) instead.
+    virtual bool SubmitRecordedUploads(std::shared_ptr<StagedUploadBatch> batch) {
+        (void)batch;
+        return false;
+    }
+    // Owner thread: the accepted recorded batches' lists, in order, for frame slot frameIndex (the batches live until it
+    // retires). Call before RecordStagedUploads: a batch whose recording a backing release has since outdated goes back
+    // to be recorded there, first, and none is returned.
+    virtual size_t TakeRecordedUploads(std::vector<rhi::CommandList>& out, uint8_t frameIndex) {
+        (void)out; (void)frameIndex;
         return 0;
     }
     virtual void ProcessDeferredReleases(uint8_t frameIndex) = 0;

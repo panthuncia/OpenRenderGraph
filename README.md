@@ -243,6 +243,24 @@ ORG exposes service interfaces through `RenderGraph`:
 
 Integrators typically initialize needed services during startup, then consume them during update/execute and teardown.
 
+### Resource tracking (memory statistics)
+
+Every resource ORG creates gets an entity in a flecs world (its size, name, usage), which the memory view reads.
+Resources are created and destroyed on any thread: a render thread, a persistent host's thread, task workers, wherever a
+retired backing is released. flecs is not thread-safe, so the world has one owner at a time (`ECSManager`, private):
+
+- **Changes are posted, never applied in place.** Creating, attaching to and destroying an entity each post a command to
+  a wait-free queue (`ECSManager::Post`). Tracking tokens are deferred: the entity is made when its creation command is
+  applied, with whatever was attached before then; a token reset before then never gets one.
+- **Whoever posts drains, if no one else is.** `Drain` applies the queue only when it can take ownership at once, so a
+  poster never waits; the drainer looks again after releasing, so no command is left behind.
+- **Readers wait for ownership.** `Access` takes it, applies everything posted before, and reads. The snapshot provider
+  (`CreateECSMemorySnapshotProvider()`) reads this way, so it may run on any thread.
+
+`InitializeRuntimeDevice` installs these hooks. A host that tracks into a world of its own installs its own
+`TrackedEntityToken` hooks after it, and passes that world to `CreateECSMemorySnapshotProvider(world)`, synchronizing it
+itself. `tests/TrackingWorldTests.cpp` creates, attaches and destroys from eight threads beside a reader.
+
 ## Debug UI usage (ImGui)
 
 Widgets can be used directly if your app already has an ImGui frame:

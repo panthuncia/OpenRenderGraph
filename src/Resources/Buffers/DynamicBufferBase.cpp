@@ -1,6 +1,7 @@
 #include "Resources/Buffers/DynamicBufferBase.h"
 
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <exception>
 #include <functional>
@@ -28,6 +29,10 @@ namespace org {
 
 namespace {
     thread_local uint32_t g_backingMutationScopeDepth = 0;
+    // BufferBase::RegisterConcurrentBackingCapture: owners capturing backings on threads of their own.
+    std::atomic<uint32_t> g_concurrentBackingCaptures{0};
+    // BufferBase::BackingReleaseSerial.
+    std::atomic<uint64_t> g_backingReleases{0};
     std::mutex g_deferredBackingResizeClientsMutex;
     std::vector<IDeferredBackingResizeClient*> g_deferredBackingResizeClients;
     std::mutex g_asyncResizeSchedulerMutex;
@@ -375,6 +380,40 @@ bool BufferBase::IsBackingMutationAllowedOnThisThread() {
     return g_backingMutationScopeDepth > 0u;
 }
 
+void BufferBase::EnterBackingMutation() {
+    ++g_backingMutationScopeDepth;
+}
+
+void BufferBase::LeaveBackingMutation() {
+    if (g_backingMutationScopeDepth > 0u) {
+        --g_backingMutationScopeDepth;
+    }
+}
+
+void BufferBase::RegisterConcurrentBackingCapture() {
+    g_concurrentBackingCaptures.fetch_add(1u, std::memory_order_acq_rel);
+}
+
+void BufferBase::UnregisterConcurrentBackingCapture() {
+    g_concurrentBackingCaptures.fetch_sub(1u, std::memory_order_acq_rel);
+}
+
+void BufferBase::RequireBackingMutationAllowed(const char* operation, uint64_t newSize) const {
+    // A buffer without a backing (a new version being sized, VersionedBuffer) has nothing a capture could see.
+    if (g_concurrentBackingCaptures.load(std::memory_order_acquire) == 0u || IsBackingMutationAllowedOnThisThread() || !IsMaterialized()) {
+        return;
+    }
+    std::ostringstream threadId;
+    threadId << std::this_thread::get_id();
+    std::ostringstream message;
+    message
+        << "GPU buffer backing change (" << operation << ") outside a backing mutation scope while a concurrent capture owner"
+        << " prepares: resource='" << GetName() << "' id=" << GetGlobalResourceID() << " oldSize=" << m_bufferSize
+        << " newSize=" << newSize << " backingGeneration=" << m_backingGeneration << " thread=" << threadId.str();
+    spdlog::critical("{}", message.str());
+    throw std::runtime_error(message.str());
+}
+
 BufferBase::BufferBase(
     rhi::HeapType accessType,
     uint64_t bufferSize,
@@ -570,6 +609,11 @@ void BufferBase::Dematerialize() {
 	RotateDescriptorSlotsForPublication();
     m_dataBuffer.reset();
     ++m_backingGeneration;
+    g_backingReleases.fetch_add(1u, std::memory_order_acq_rel);
+}
+
+uint64_t BufferBase::BackingReleaseSerial() noexcept {
+    return g_backingReleases.load(std::memory_order_acquire);
 }
 
 void BufferBase::SetDescriptorRequirements(const DescriptorRequirements& requirements) {

@@ -77,7 +77,7 @@ ExecutionTimelineAdmission::ExecutionTimelineAdmission(std::vector<ExecutionTime
     size_t maximumInFlight)
     : m_reserved(std::move(queues)), m_submitted(m_reserved), m_completed(m_reserved),
       m_maximumInFlight(maximumInFlight) {
-    if (!maximumInFlight || maximumInFlight > 64) throw std::invalid_argument("Invalid execution capacity");
+    if (!maximumInFlight) throw std::invalid_argument("Invalid execution capacity");
     m_retained.reserve(maximumInFlight); // Commit cannot allocate after submission.
     for (auto& completed : m_completed) completed.value = 0;
     for (size_t i = 0; i < m_reserved.size(); ++i) {

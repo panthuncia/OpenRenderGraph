@@ -26,6 +26,7 @@
 #include "Managers/Singletons/DescriptorHeapManager.h"
 #include "RenderPasses/Base/TypedRenderGraphPass.h"
 #include "Resources/Buffers/Buffer.h"
+#include "Resources/Buffers/VersionedBuffer.h"
 #include "Resources/ExternalBufferResource.h"
 #include "Render/Runtime/UploadServiceAccess.h"
 #include "Render/Runtime/IUploadService.h"
@@ -224,46 +225,73 @@ struct WriteFrame {
 	std::shared_ptr<const ComputeProgram> program;
 	uint32_t inputIndex = 0;
 	uint32_t targetIndex = 0;
+	uint32_t count = kCount;
 };
+
+// A scene revision, as host data (the "revision" mode): how many elements the write pass writes, baked into its recording, and
+// the version of its target it writes (immutable inputs: a grown target is a new version, named by the revisions after it).
+struct TestRevision final : org::IHostExecutionData, org::IResourceVersions {
+	uint32_t count = kCount;
+	const void* versioned = nullptr;  // VersionedBuffer::Key
+	std::shared_ptr<const org::BufferVersion> target;
+	const void* TryGet(std::type_index type) const noexcept override {
+		if (type == std::type_index(typeid(TestRevision))) return this;
+		if (type == std::type_index(typeid(org::IResourceVersions))) return static_cast<const org::IResourceVersions*>(this);
+		return nullptr;
+	}
+	std::shared_ptr<const org::BufferVersion> Find(const org::VersionedBuffer& buffer) const noexcept override {
+		return buffer.Key() == versioned ? target : nullptr;
+	}
+};
+uint32_t RevisionCount(const org::PassPrepareContext& preparation) {
+	const auto* revision = preparation.preparationData ? preparation.preparationData->Get<TestRevision>() : nullptr;
+	return revision ? revision->count : kCount;
+}
 
 // Reads the host-uploaded value (Pre-segment upload pass) and writes value + index.
 class WritePass final : public org::TypedRenderGraphPass<WritePass, WriteFrame, WriteBindings> {
 public:
-	WritePass(std::shared_ptr<org::Buffer> input, std::shared_ptr<org::Buffer> target, std::shared_ptr<const ComputeProgram> program)
-		: m_input(std::move(input)), m_target(std::move(target)), m_program(std::move(program)) {}
+	WritePass(std::shared_ptr<org::Buffer> input, std::shared_ptr<org::Buffer> target, std::shared_ptr<const ComputeProgram> program,
+		std::shared_ptr<const org::VersionedBuffer> versions = {})
+		: m_input(std::move(input)), m_target(std::move(target)), m_program(std::move(program)), m_versions(std::move(versions)) {}
 	WriteBindings Declare(org::PassBuilder& builder) {
 		builder.PreferQueue(org::QueueKind::Graphics);
+		if (m_versions) return {builder.ShaderResource(m_input).View(), builder.UnorderedAccess(*m_versions).View()};
 		return {builder.ShaderResource(m_input).View(), builder.UnorderedAccess(m_target).View()};
 	}
 	WriteFrame Prepare(const WriteBindings& bindings, const org::PassPrepareContext& preparation) const {
 		return {m_program, preparation.Resolve(bindings.input).index,
-			preparation.Resolve(bindings.target).index};
+			preparation.Resolve(bindings.target).index, RevisionCount(preparation)};
 	}
-	void InvocationRevision(const org::PassPrepareContext&, std::vector<uint64_t>& out) const {
+	void InvocationRevision(const org::PassPrepareContext& preparation, std::vector<uint64_t>& out) const {
 		out.push_back(reinterpret_cast<uintptr_t>(m_program.get()));
+		out.push_back(RevisionCount(preparation));
 	}
 	static void Record(const WriteBindings&, const WriteFrame& frame, org::PassRecordContext& recording) {
 		auto& commands = recording.Commands();
 		commands.BindLayout(frame.program->layout->GetHandle());
 		commands.BindPipeline(frame.program->pipeline->GetHandle());
-		const uint32_t constants[3] = {frame.targetIndex, frame.inputIndex, kCount};
+		const uint32_t constants[3] = {frame.targetIndex, frame.inputIndex, frame.count};
 		commands.PushConstants(rhi::ShaderStage::Compute, 0, 0, 0, 3, constants);
-		commands.Dispatch((kCount + 63) / 64, 1, 1);
+		commands.Dispatch((frame.count + 63) / 64, 1, 1);
 	}
 private:
 	std::shared_ptr<org::Buffer> m_input;
 	std::shared_ptr<org::Buffer> m_target;
 	std::shared_ptr<const ComputeProgram> m_program;
+	std::shared_ptr<const org::VersionedBuffer> m_versions;
 };
 
 struct CopyBindings { org::ResourceBindingToken source, destination; };
 class CopyToHostPass final : public org::TypedRenderGraphPass<CopyToHostPass, org::EmptyPassFrameData, CopyBindings> {
 public:
 	CopyToHostPass(std::shared_ptr<org::Buffer> source, std::shared_ptr<org::ExternalBufferResource> destination,
-		std::shared_ptr<std::atomic<uint64_t>> destinationRevision)
-		: m_source(std::move(source)), m_destination(std::move(destination)), m_destinationRevision(std::move(destinationRevision)) {}
+		std::shared_ptr<std::atomic<uint64_t>> destinationRevision, std::shared_ptr<const org::VersionedBuffer> versions = {})
+		: m_source(std::move(source)), m_destination(std::move(destination)), m_destinationRevision(std::move(destinationRevision)),
+		m_versions(std::move(versions)) {}
 	CopyBindings Declare(org::PassBuilder& builder) {
 		builder.PreferQueue(org::QueueKind::Graphics);
+		if (m_versions) return {builder.CopySource(*m_versions), builder.CopyDestination(m_destination)};
 		return {builder.CopySource(m_source), builder.CopyDestination(m_destination)};
 	}
 	void InvocationRevision(const org::PassPrepareContext&, std::vector<uint64_t>& out) const {
@@ -277,15 +305,16 @@ private:
 	std::shared_ptr<org::Buffer> m_source;
 	std::shared_ptr<org::ExternalBufferResource> m_destination;
 	std::shared_ptr<std::atomic<uint64_t>> m_destinationRevision;
+	std::shared_ptr<const org::VersionedBuffer> m_versions;
 };
 
 class HostExtension final : public org::RenderGraph::IRenderGraphExtension {
 public:
 	HostExtension(std::shared_ptr<org::Buffer> input, std::shared_ptr<org::Buffer> scratch,
 		std::shared_ptr<org::ExternalBufferResource> output, std::shared_ptr<const ComputeProgram> program,
-		std::shared_ptr<std::atomic<uint64_t>> outputRevision)
+		std::shared_ptr<std::atomic<uint64_t>> outputRevision, std::shared_ptr<const org::VersionedBuffer> versions = {})
 		: m_input(std::move(input)), m_scratch(std::move(scratch)), m_output(std::move(output)), m_program(std::move(program)),
-		m_outputRevision(std::move(outputRevision)) {}
+		m_outputRevision(std::move(outputRevision)), m_versions(std::move(versions)) {}
 	void PrepareForBuild(org::RenderGraph& graph) override {
 		graph.RegisterResource(org::ResourceIdentifier("test.input"), m_input);
 		graph.RegisterResource(org::ResourceIdentifier("test.scratch"), m_scratch);
@@ -293,10 +322,10 @@ public:
 	}
 	void GatherStructuralPasses(org::RenderGraph&, std::vector<org::RenderGraph::ExternalPassDesc>& out) override {
 		out.push_back(org::RenderGraph::ExternalPassDesc::Compute("test.write",
-			std::static_pointer_cast<org::RenderPass>(std::make_shared<WritePass>(m_input, m_scratch, m_program)))
+			std::static_pointer_cast<org::RenderPass>(std::make_shared<WritePass>(m_input, m_scratch, m_program, m_versions)))
 			.PreferQueue(org::QueueKind::Graphics));
 		out.push_back(org::RenderGraph::ExternalPassDesc::Copy("test.copy-to-host",
-			std::static_pointer_cast<org::RenderPass>(std::make_shared<CopyToHostPass>(m_scratch, m_output, m_outputRevision)))
+			std::static_pointer_cast<org::RenderPass>(std::make_shared<CopyToHostPass>(m_scratch, m_output, m_outputRevision, m_versions)))
 			.PreferQueue(org::QueueKind::Graphics));
 	}
 private:
@@ -305,6 +334,7 @@ private:
 	std::shared_ptr<org::ExternalBufferResource> m_output;
 	std::shared_ptr<const ComputeProgram> m_program;
 	std::shared_ptr<std::atomic<uint64_t>> m_outputRevision;
+	std::shared_ptr<const org::VersionedBuffer> m_versions;
 };
 
 std::shared_ptr<ComputeProgram> CreateProgram(rhi::Device device) {
@@ -335,7 +365,12 @@ bool Matches(const HostBuffer& buffer, uint32_t value) {
 int TestFrameRetirement(rhi::Device device, rhi::Backend backend);
 
 int main(int argc, char** argv) {
-	const bool async = argc > 1 && std::strcmp(argv[1], "async") == 0;
+	// "reuse": async epochs that keep and resubmit their recordings (PersistentGraphHost::Desc::reuseRecordings).
+	const bool reuse = argc > 1 && std::strcmp(argv[1], "reuse") == 0;
+	// "revision": a revision-driven epoch (SetAsyncEpochs' revisionEpochs), recorded ahead for each revision
+	// (RequestEpochRecording) and submitted with that recording.
+	const bool revision = argc > 1 && std::strcmp(argv[1], "revision") == 0;
+	const bool async = reuse || revision || (argc > 1 && std::strcmp(argv[1], "async") == 0);
 	HostDevice host;
 	if (const int created = CreateHostDevice(host); created != 0) {
 		std::puts(created == 77 ? "SKIP: no Vulkan device with VK_EXT_descriptor_heap" : "FAIL: host device");
@@ -364,7 +399,7 @@ int main(int argc, char** argv) {
 		// pass, and drives persistent execution with the external queue boundary.
 		org::PersistentGraphHost host({.device = device.Get(), .backend = rhi::Backend::Vulkan,
 			.tasks = std::make_shared<org::runtime::ThreadPoolTaskService>(2),
-			.queueBoundary = {.entry = true, .exit = true}, .epochOrder = {0}, .closedExecutions = async});
+			.queueBoundary = {.entry = true, .exit = true}, .epochOrder = {0}, .closedExecutions = async, .reuseRecordings = reuse || revision});
 		{
 			auto program = CreateProgram(device.Get());
 			REQUIRE(program, "compute program");
@@ -402,12 +437,100 @@ int main(int argc, char** argv) {
 				}
 			};
 			auto outputRevision = std::make_shared<std::atomic<uint64_t>>(1);
-			host.AddExtension("test.host", [&] { return std::make_unique<HostExtension>(input, scratch, output, program, outputRevision); });
+			// "revision": the write pass's target is a versioned buffer, which the revision names a version of.
+			std::shared_ptr<org::VersionedBuffer> versions;
+			if (revision) {
+				scratch->Materialize();
+				versions = org::VersionedBuffer::Create(scratch);
+			}
+			host.AddExtension("test.host", [&] { return std::make_unique<HostExtension>(input, scratch, output, program, outputRevision, versions); });
 			org::PersistentGraphHost::FrameCallback premature = [](org::RenderGraph&) {};
 			REQUIRE(!host.TryPostOwnedPreparation(premature) && premature, "pre-build request stays with caller");
 			org::PersistentGraphHost::FrameTicketReservation reservation;
 			const uint32_t requiredEpoch = 0;
 			REQUIRE(!host.TryReserveReadyEpochs({&requiredEpoch, 1}, reservation), "no reservation before async start");
+			if (revision) {
+				host.SetAsyncEpochs({0}, {0});
+				// Records the epoch for a revision of `count` elements; the callback runs on the host's thread.
+				auto record = [&](uint32_t count, std::shared_ptr<const org::BufferVersion> target) -> std::shared_ptr<const org::PersistentGraphHost::EpochRecording> {
+					auto data = std::make_shared<TestRevision>();
+					data->count = count;
+					data->versioned = versions->Key();
+					data->target = std::move(target);
+					std::atomic<int> state{0};
+					std::shared_ptr<const org::PersistentGraphHost::EpochRecording> result;
+					const bool posted = host.RequestEpochRecording(0, data, [&](std::shared_ptr<const org::PersistentGraphHost::EpochRecording> a_recording,
+						std::exception_ptr a_error) {
+						result = std::move(a_recording);
+						state.store(a_error ? 2 : 1, std::memory_order_release);
+						state.notify_all();
+					});
+					if (!posted) return nullptr;
+					const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+					while (state.load(std::memory_order_acquire) == 0 && std::chrono::steady_clock::now() < deadline)
+						std::this_thread::yield();
+					return state.load(std::memory_order_acquire) == 1 ? result : nullptr;
+				};
+				const auto firstVersion = versions->Current();
+				auto full = record(kCount, firstVersion);
+				REQUIRE(full && full->slots.size() == 3, "a revision's recording, one per slot of the epoch's ring");
+				(void)host.TakeAsyncStats();
+				for (uint32_t frame = 0; frame < 6; ++frame) {
+					value = 40000u + 10u * frame;
+					host.SubmitEpoch(0, upload, {}, full);
+					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "a revision's recording writes every element");
+				}
+				// Growth as a new version: a revision naming the grown target, recorded while the frames submit the old one. Each
+				// recording resolved its own version (its own publication and bindings), and each ticket admits both: the old one
+				// still submits after the new one was recorded, and the new one after it, with nothing prepared again.
+				// The growth: the next version, current from now on; the old revision still names the first.
+				const auto grown = versions->GrowBytes(kBytes * 2);
+				REQUIRE(grown->buffer != firstVersion->buffer && versions->Get() == grown->buffer, "growth is a new version");
+				auto grownRecording = record(kCount, grown);
+				REQUIRE(grownRecording, "the grown revision's recording");
+				for (uint32_t frame = 0; frame < 4; ++frame) {
+					value = 45000u + 10u * frame;
+					host.SubmitEpoch(0, upload, {}, frame < 2 ? full : grownRecording);
+					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value),
+						frame < 2 ? "the old version's revision after the grown one was recorded" : "the grown version's revision");
+				}
+				// A new revision: half the elements. Until its recording is ready the frames keep submitting the old one.
+				const uint32_t half = kCount / 2;
+				auto halfRecording = record(half, grown);
+				REQUIRE(halfRecording, "the next revision's recording");
+				const uint32_t before = value;
+				value = 50000u;
+				host.SubmitEpoch(0, upload, {}, halfRecording);
+				REQUIRE(device->WaitIdle() == rhi::Result::Ok, "wait for the half revision");
+				bool halfOk = true;
+				for (uint32_t i = 0; i < kCount; ++i)
+					halfOk &= first.mapped[i] == (i < half ? value + i : before + i);
+				if (!halfOk)
+					std::fprintf(stderr, "half revision: [0] %u [half-1] %u [half] %u [last] %u; expected %u, %u, %u, %u\n", first.mapped[0], first.mapped[half - 1],
+						first.mapped[half], first.mapped[kCount - 1], value, value + half - 1, before + half, before + kCount - 1);
+				REQUIRE(halfOk, "the new revision's recording writes its elements, and leaves the rest");
+				// A revision-driven epoch without its recording is an error, never a re-preparation.
+				bool rejected = false;
+				try {
+					host.SubmitEpoch(0, upload);
+				} catch (const std::logic_error&) {
+					rejected = true;
+				}
+				REQUIRE(rejected, "a revision-driven epoch without a recording is rejected");
+				value = 60000u;
+				host.SubmitEpoch(0, upload, {}, full);
+				REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "the host goes on after a rejected submission");
+				const auto stats = host.TakeAsyncStats();
+				std::printf("revision: %llu recordings (%llu slots), %llu submissions, %llu recorded at tickets, %llu prepared again\n",
+					static_cast<unsigned long long>(stats.revisionRecordings), static_cast<unsigned long long>(stats.revisionSlotsRecorded),
+					static_cast<unsigned long long>(stats.revisionSubmissions), static_cast<unsigned long long>(stats.recorded),
+					static_cast<unsigned long long>(stats.stale));
+				REQUIRE(stats.revisionSubmissions == 12 && stats.stale == 0 && stats.revisionRecordings == 2 && stats.revisionSlotsRecorded == 6,
+					"every submission bound a revision's recording; nothing prepared again");
+				REQUIRE(!counters.unbalanced && counters.locks.load() == counters.unlocks.load(), "balanced host queue locks");
+				host.SetAsyncEpochs({});
+			}
+			if (!revision) {
 			if (async) host.SetAsyncEpochs({0});
 			std::atomic<uint32_t> ownedRequests{0};
 			std::atomic<bool> ownedServices{false};
@@ -519,6 +642,42 @@ int main(int argc, char** argv) {
 				}
 			}
 			REQUIRE(!counters.unbalanced && counters.locks.load() == counters.unlocks.load(), "balanced host queue locks");
+			if (reuse) {
+				// Steady frames: the slots' tickets take their kept recordings, and each submission of the same lists reads that
+				// frame's upload.
+				(void)host.TakeAsyncStats();
+				for (uint32_t frame = 0; frame < 12; ++frame) {
+					value = 20000u + 10u * frame;
+					host.SubmitEpoch(0, upload);
+					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(second, value), "a resubmitted recording writes its frame's value");
+				}
+				const auto steady = host.TakeAsyncStats();
+				std::printf("reuse: steady %llu recorded, %llu kept, %llu reused, %llu adopted, %llu prepared again\n",
+					static_cast<unsigned long long>(steady.recorded), static_cast<unsigned long long>(steady.kept),
+					static_cast<unsigned long long>(steady.reused), static_cast<unsigned long long>(steady.adopted),
+					static_cast<unsigned long long>(steady.stale));
+				REQUIRE(steady.reused >= 9 && steady.stale == 0, "steady frames take kept recordings");
+				// A pass's revision alternating inside the commit (beforeSubmit), as a view's state does: each slot's ticket,
+				// prepared for the other variant, is stale at submission. Once every slot has kept both variants, a stale ticket
+				// adopts the kept recording, and nothing is prepared again.
+				const uint64_t base = outputRevision->load() + 100;
+				uint64_t warmStale = 0;
+				for (uint32_t frame = 0; frame < 24; ++frame) {
+					value = 30000u + 10u * frame;
+					host.SubmitEpoch(0, [&](org::RenderGraph& graph) {
+						upload(graph);
+						outputRevision->store(base + (frame & 1u), std::memory_order_release);
+					});
+					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(second, value), "an adopted recording writes its frame's value");
+					if (frame == 11) warmStale = host.TakeAsyncStats().stale;
+				}
+				const auto alternating = host.TakeAsyncStats();
+				std::printf("reuse: alternating (after %llu prepared again to warm up) %llu recorded, %llu reused, %llu adopted, %llu prepared again\n",
+					static_cast<unsigned long long>(warmStale), static_cast<unsigned long long>(alternating.recorded),
+					static_cast<unsigned long long>(alternating.reused), static_cast<unsigned long long>(alternating.adopted),
+					static_cast<unsigned long long>(alternating.stale));
+				REQUIRE(alternating.stale == 0 && alternating.adopted >= 6, "warm alternating revisions adopt kept recordings");
+			}
 			if (async) {
 				const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
 				while (!host.TryReserveReadyEpochs({&requiredEpoch, 1}, reservation) && std::chrono::steady_clock::now() < deadline)
@@ -553,6 +712,7 @@ int main(int argc, char** argv) {
 				REQUIRE(ownedWeak.expired(), "owned request released after completion");
 				org::PersistentGraphHost::FrameCallback afterStop = [](org::RenderGraph&) {};
 				REQUIRE(!host.TryPostOwnedPreparation(afterStop) && afterStop, "post-stop request stays with caller");
+			}
 			}
 			host.DestroyGraph();
 		}

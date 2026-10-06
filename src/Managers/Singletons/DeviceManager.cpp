@@ -144,12 +144,8 @@ void DeviceManager::Initialize(rhi::Device device) {
                 return token;
             }
 
-            auto& world = ECSManager::GetInstance().GetWorld();
-            flecs::entity entity = existing;
-            if (!entity.is_alive()) {
-                entity = world.entity();
-            }
-            return TrackedEntityToken(world, entity);
+            // Never the world directly: it has one owner at a time (ECSManager).
+            return ECSManager::GetInstance().CreateTrackedToken(existing.id());
         };
     }
 

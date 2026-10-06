@@ -102,6 +102,7 @@ struct LogicalGraph {
         std::vector<BindingEntry> bindingSlots;
         std::shared_ptr<const void> recordingInterface;
         uint32_t epoch = AllEpochs;
+        std::string debugName;  // diagnostics only (SetPassDebugName)
     };
     // Execution order of the epochs within one host frame. Epochs not listed
     // follow the listed ones in ascending order.
@@ -236,6 +237,8 @@ public:
     void SetPassRecordingInterface(PassId pass, std::shared_ptr<const void> recordingInterface);
     // Structural: the epoch the pass executes in (AllEpochs: every one).
     void SetPassEpoch(PassId pass, uint32_t epoch);
+    // The pass's name in diagnostics (an ordering failure names its passes). Not structural.
+    void SetPassDebugName(PassId pass, std::string name);
     // Structural: the order the host executes its epochs in within a frame.
     void SetEpochOrder(std::vector<uint32_t> order);
     BindingToken Declare(PassId pass, ResourceSlotId resource,

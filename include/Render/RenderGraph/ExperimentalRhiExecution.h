@@ -387,14 +387,19 @@ struct PreparedTimelineBinding {
 // This adapter is not yet used by legacy passes or the benchmark renderer.
 class PreparedRhiExecutionBatch final : public IPreparedExecutionBatch {
 public:
+    // replayable: every pass is (PreparedPass::IsReplayable) and the lists were recorded for resubmission. Such a packet has
+    // no submission effects; each submission (after the previous one completed) submits the same lists, and its lists go
+    // back to their pool when its last owner lets it go, not at a completion.
     PreparedRhiExecutionBatch(uint32_t queueSlot, rhi::Queue queue, std::vector<rhi::CommandList> lists,
         std::vector<PreparedTimelineBinding> timelines, std::shared_ptr<const void> lease,
-        std::vector<PreparedPass> submissionEffects = {}, std::function<void()> retireCommandLists = {})
+        std::vector<PreparedPass> submissionEffects = {}, std::function<void()> retireCommandLists = {}, bool replayable = false)
         : m_queueSlot(queueSlot), m_queue(queue), m_lists(std::move(lists)), m_timelines(std::move(timelines)),
           m_lease(std::move(lease)), m_submissionEffects(std::move(submissionEffects)),
-          m_retireCommandLists(std::move(retireCommandLists)) {
+          m_retireCommandLists(std::move(retireCommandLists)), m_replayable(replayable) {
         if (!m_queue || m_lists.empty() || !m_lease || m_lists.size() > UINT32_MAX)
             throw std::invalid_argument("Incomplete prepared RHI packet");
+        if (m_replayable && !m_submissionEffects.empty())
+            throw std::invalid_argument("A replayable packet has no submission effects");
         for (auto list : m_lists) if (!list) throw std::invalid_argument("Invalid command list");
         for (size_t i = 0; i < m_timelines.size(); ++i) {
             if (!m_timelines[i].identity) throw std::invalid_argument("Invalid timeline identity");
@@ -405,9 +410,10 @@ public:
     }
     ~PreparedRhiExecutionBatch() override { Abandon(); }
     uint32_t QueueSlot() const noexcept override { return m_queueSlot; }
+    bool Replayable() const noexcept override { return m_replayable; }
     SubmissionReceipt Submit(const ExecutionBatchTimeline& batch) const noexcept override {
-        // Single-consumption even after failure: uploads/readbacks cannot replay.
-        if (m_consumed.exchange(true)) return {SubmissionState::NotSubmitted, SubmissionFailureStage::Replay};
+        // Single-consumption even after failure: uploads/readbacks cannot replay. A replayable packet has neither.
+        if (!m_replayable && m_consumed.exchange(true)) return {SubmissionState::NotSubmitted, SubmissionFailureStage::Replay};
         auto find = [&](uint64_t identity) -> const PreparedTimelineBinding* {
             for (const auto& item : m_timelines) if (item.identity == identity) return &item;
             return nullptr;
@@ -456,6 +462,7 @@ public:
         return {SubmissionState::Signaled};
     }
     void Complete(uint64_t submission) const noexcept override {
+        if (m_replayable) return;  // the lists are submitted again: they go when the last owner lets the packet go
         for (const auto& pass : m_submissionEffects) {
             try { pass.CommitCompleted({submission}); }
             catch (...) { basic_telemetry::AddCounter("ORG.Execution.InvalidCompletionTransition"); }
@@ -469,7 +476,7 @@ public:
         }
     }
     void Abandon() const noexcept override {
-        if (m_consumed.exchange(true)) return;
+        if (m_replayable || m_consumed.exchange(true)) return;
         AbandonEffects();
     }
 private:
@@ -488,6 +495,7 @@ private:
     mutable std::function<void()> m_retireCommandLists;
     mutable std::atomic_bool m_consumed{false};
     mutable std::atomic_bool m_commandListsRetired{false};
+    bool m_replayable = false;
 };
 
 // One owned recording packet. The binding table transitively owns descriptor
@@ -570,6 +578,10 @@ struct OwnedRecordingList {
     // pass / after the last pass of this command list.
     bool externalEntryBarrier = false;
     bool externalExitBarrier = false;
+    // Record for resubmission (PreparedRhiExecutionBatch's replayable packets), when every pass of the packet is replayable:
+    // with no profiler GPU zones or ranges, whose queries a resubmission would write again. Nothing a list records may name a
+    // resource its recording does not own (the caller records no statistics queries for it either).
+    bool replayable = false;
 };
 
 inline OwnedRecordingList BuildPersistentRecordingList(std::shared_ptr<const RenderFrameSnapshot> sealed, uint32_t batch) {
@@ -632,6 +644,11 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
             if (!pass || pass.IsConsumed()) throw std::invalid_argument("Missing or consumed pass in owned recording batch");
     }
     }
+    bool replayable = true;
+    for (const auto& recording : recordings) {
+        replayable &= recording.replayable;
+        for (const auto& pass : recording.passes) replayable &= pass.IsReplayable();
+    }
     auto ownership = std::make_shared<Ownership>(Ownership{std::move(runtimeOwner), std::move(recordings)});
     std::vector<rhi::CommandList> lists;
     std::vector<PreparedPass> submissionEffects;
@@ -642,14 +659,14 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
         BT_ZONE_SCOPE("ORG.Execution.RecordOwned.PacketEntries");
         lists.push_back(recording.allocation->pair.list.Get());
         allocations.push_back(recording.allocation);
-        submissionEffects.insert(submissionEffects.end(), recording.passes.begin(), recording.passes.end());
+        if (!replayable) submissionEffects.insert(submissionEffects.end(), recording.passes.begin(), recording.passes.end());
     }
     auto packet = std::make_shared<const PreparedRhiExecutionBatch>(queueSlot, queue,
         std::move(lists), std::move(timelines), ownership, std::move(submissionEffects),
         [allocations = std::move(allocations)]() mutable {
             for (const auto& allocation : allocations) allocation->RecycleAfterCompletion();
             allocations.clear();
-        });
+        }, replayable);
     for (const auto& recording : ownership->recordings) {
         BT_ZONE_SCOPE("ORG.Execution.RecordOwned.List");
         auto context = recording.bindings
@@ -727,8 +744,8 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
             // can report that earlier instrumentation error only when a later
             // command list closes, obscuring the actual pass. Keep GPU zones on
             // graphics/compute queues and leave copy lists instrumentation-free.
-            const bool allowTracyGpuZone = !statistics ||
-                statistics->queueKind != rhi::QueueKind::Copy;
+            const bool allowTracyGpuZone = !replayable && (!statistics ||
+                statistics->queueKind != rhi::QueueKind::Copy);
             TracyGpuZoneScope tracyGpuZone(context.Commands(), queue,
                 allowTracyGpuZone
                     ? (debugName.empty() ? "<unnamed>" : debugName.data())
@@ -738,7 +755,7 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
                     queue, context.Commands(), statistics->queries);
             const auto cpuStart = statisticsIndex >= 0 ? std::chrono::steady_clock::now()
                 : std::chrono::steady_clock::time_point{};
-            const auto* ranges = recording.gpuPassRanges.get();
+            const auto* ranges = replayable ? nullptr : recording.gpuPassRanges.get();
             if (ranges) ranges->begin(context.Commands(), queue, ranges->queueName, debugName.empty() ? "<unnamed>" : debugName.data());
             {
                 BT_ZONE_SCOPE("ORG.Execution.RecordOwned.Record");

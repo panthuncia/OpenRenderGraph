@@ -186,6 +186,33 @@ RotationKey RotationKeyOfResource(Resource& resource) {
 
 // ---------------------------------------------------------------------------
 
+// A segment's recorded packets, and what they were recorded for. Kept (RenderGraph::m_keptRecordings) when replayable: then
+// submitted by every ticket that takes it, one at a time (a frame slot's tickets follow each other's completion).
+struct RenderGraph::PersistentRecording {
+	std::shared_ptr<const experimental::RenderFrameSnapshot> snapshot;
+	std::vector<std::shared_ptr<const experimental::IPreparedExecutionBatch>> packets;
+	std::vector<std::shared_ptr<experimental::OwnedRecordingStatistics>> statistics;
+	bool replayable = false;
+	// The reuse key.
+	uint64_t hostTag = 0;
+	std::shared_ptr<const persistent::SelectedPublication> publication;
+	std::shared_ptr<const FrozenExecutionBindings> bindings;
+	rhi::DescriptorHeapHandle resourceHeap{}, samplerHeap{};
+	std::vector<std::pair<const RenderGraphPass*, uint64_t>> revisions;
+	mutable std::atomic<uint64_t> lastUse{0};  // the host frame that last took it
+	// What a revision ticket admits it with (AddPersistentTicketCandidate): its producer waits, and the leases its preparation held.
+	std::vector<persistent::FrameProducerWait> waits;
+	std::vector<std::shared_ptr<const void>> leases;
+
+	bool Recorded(uint64_t a_hostTag, const persistent::SelectedPublication* a_publication, const FrozenExecutionBindings* a_bindings,
+		rhi::DescriptorHeapHandle a_resourceHeap, rhi::DescriptorHeapHandle a_samplerHeap,
+		const std::vector<std::pair<const RenderGraphPass*, uint64_t>>& a_revisions) const {
+		return hostTag == a_hostTag && publication.get() == a_publication && bindings.get() == a_bindings
+			&& resourceHeap.index == a_resourceHeap.index && resourceHeap.generation == a_resourceHeap.generation
+			&& samplerHeap.index == a_samplerHeap.index && samplerHeap.generation == a_samplerHeap.generation && revisions == a_revisions;
+	}
+};
+
 // An epoch's main execution, prepared and recorded ahead of its submission (RenderGraph::PreparePersistentTicket).
 struct RenderGraph::PersistentTicket {
 	uint32_t epoch = 0;
@@ -193,13 +220,34 @@ struct RenderGraph::PersistentTicket {
 	uint64_t hostFrame = 0;
 	struct Segment {
 		persistent::FrameAdmission admission;
-		std::optional<experimental::RecordedFrame> recorded;
-		std::vector<std::shared_ptr<experimental::OwnedRecordingStatistics>> statistics;
+		std::shared_ptr<const PersistentRecording> recording;
+		// What the segment was prepared with, which a recording bound later must have been recorded for.
+		std::shared_ptr<const FrozenExecutionBindings> bindings;
+		rhi::DescriptorHeapHandle resourceHeap{}, samplerHeap{};
 	};
 	std::vector<Segment> segments;
+	// Recordings a kept one replaced (AdoptKeptPersistentRecording): released by the owner thread, with the ticket.
+	std::vector<std::shared_ptr<const PersistentRecording>> replaced;
 	// What each prepared pass's preparation depended on (RenderGraphPass::InvocationRevisionHash).
 	std::vector<std::pair<const RenderGraphPass*, uint64_t>> revisions;
 	bool uncheckable = false;  // a pass that cannot report its revision: never current
+	uint64_t hostTag = 0;      // the host's, for its own currency checks (PersistentGraphHost: the backing version)
+	// A revision ticket (PrepareRevisionTicket): its candidates, pushed by the owner thread (newest first) and read by the bind on
+	// the submitting thread; the one the bind took. Completion abandons every other candidate's admission.
+	struct Candidate {
+		Segment segment;
+		Candidate* next = nullptr;
+	};
+	bool revision = false;
+	std::atomic<Candidate*> candidates{nullptr};
+	const Candidate* chosen = nullptr;
+	PersistentTicket() = default;
+	PersistentTicket(const PersistentTicket&) = delete;
+	PersistentTicket& operator=(const PersistentTicket&) = delete;
+	~PersistentTicket() {
+		for (auto* candidate = candidates.exchange(nullptr, std::memory_order_acquire); candidate;)
+			delete std::exchange(candidate, candidate->next);
+	}
 };
 
 struct RenderGraph::PersistentExecutionState {
@@ -812,6 +860,7 @@ static void InstallMainPass(RenderGraph& graph, State& state, persistent::GraphE
 		main.id = edit.AddPass(std::move(lowered.declaration), authoredOrder);
 	}
 	edit.SetPassEpoch(main.id, main.epoch);
+	edit.SetPassDebugName(main.id, main.name);
     main.resourceUses = lowered.resourceUses;
     main.declaredViews.clear();
     main.declaredBindings.clear();
@@ -1489,6 +1538,31 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 			for (const auto& pass : state.mainPasses)
 				if (!pass.retired && pass.id.index < mainNames->size())
 					(*mainNames)[pass.id.index] = (pass.hosted ? *pass.hosted : m_masterPassList[pass.masterIndex]).name;
+		// A resolver use's resource tokens name the member it had when the pass declared it. They resolve by position, as its views
+		// do: to the member bound now at the use's ordinal (a versioned buffer's version: VersionedBuffer), so a membership change
+		// stays a binding edit.
+		auto addDeclaredOrdinals = [&](const auto& a_pass, FramePreparationContext::ResourceSlots& a_slots) {
+			if (!a_pass.resourceUses) return;
+			for (const auto& use : a_pass.resourceUses->uses) {
+				if (!use.resolverIdentity) continue;
+				for (const auto groupIndex : a_pass.groups) {
+					const auto& group = state.groups[groupIndex];
+					if (group.key != use.resolverIdentity) continue;
+					uint32_t ordinal = 0;
+					for (const auto entryIndex : group.memberEntries) {
+						const auto& entry = state.entries[entryIndex];
+						if (!entry.resource || !entry.isBound) continue;
+						if (ordinal++ != use.memberOrdinal) continue;
+						if (entry.slot.index < selected->bindings.Size()) {
+							a_slots.emplace_back(use.binding.registryResourceID, entry.slot.index);
+							a_slots.emplace_back(use.binding.globalResourceID, entry.slot.index);
+						}
+						break;
+					}
+					break;
+				}
+			}
+		};
 		for (uint32_t mainIndex = 0; mainIndex < state.mainPasses.size() && executing; ++mainIndex) {
 			auto& pass = state.mainPasses[mainIndex];
 			if (pass.retired) continue;
@@ -1519,6 +1593,7 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 						if (std::find(pass.directEntries.begin(), pass.directEntries.end(), entryIndex) != pass.directEntries.end())
 							slots->emplace_back(requirement.resourceHandleAndRange.resource.GetGlobalResourceID(), state.entries[entryIndex].slot.index);
 				}
+				addDeclaredOrdinals(pass, *slots);
 				std::sort(slots->begin(), slots->end());
 				slots->erase(std::unique(slots->begin(), slots->end()), slots->end());
 				slots->sorted = true;
@@ -1540,6 +1615,8 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 				}
 				for (const auto& add : pass.slotAdds)
 					if (add.second < selected->bindings.Size()) slots->push_back(add);
+				// A removed member's own pair may have been a declared token's: map those again.
+				addDeclaredOrdinals(pass, *slots);
 				std::sort(slots->begin(), slots->end());
 				slots->erase(std::unique(slots->begin(), slots->end()), slots->end());
 				slots->sorted = true;
@@ -3152,6 +3229,39 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 			BT_ZONE_SCOPE("ORG.Persistent.PrepareAdmission");
 			return state.admission->Prepare(segment.publication, queues, segment.waits, {}, segment.rebindings);
 		}();
+		// Recording reuse (SetPersistentRecordingReuse): a ticket's closed execution with nothing late-bound, whose passes all
+		// report their revisions, is recorded for resubmission and kept per (epoch, slot); one prepared for what a kept
+		// recording was recorded for takes it.
+		auto* const ticketTarget = m_persistentTicketTarget;
+		if (ticketTarget && m_persistentTicketAdmissionOnly) {
+			// Recorded ahead (BindPersistentTicketRecording): this preparation's invocations are never recorded.
+			for (const auto& invocation : segment.invocations)
+				if (invocation) invocation.Abandon(AbandonReason::AdmissionFailed);
+			ticketTarget->segments.push_back({std::move(admission), nullptr, segment.legacyBindings, defaultResourceHeap, defaultSamplerHeap});
+			return nullptr;
+		}
+		const bool keepable = ticketTarget && m_persistentRecordingReuse && admission.closed && admission.rebound.empty()
+			&& admission.incomingEffects.empty() && !ticketTarget->uncheckable && segments.size() == 1
+			&& ticketTarget->epoch < kKeptRecordingEpochs && state.frameIndex < kKeptRecordingSlots;
+		if (keepable && !m_keptRecordings) m_keptRecordings = std::make_unique<std::remove_reference_t<decltype(*m_keptRecordings)>>();
+		if (keepable && !m_persistentTicketHostData) {
+			if (!m_keptRecordings) m_keptRecordings = std::make_unique<std::remove_reference_t<decltype(*m_keptRecordings)>>();
+			const auto set = (*m_keptRecordings)[ticketTarget->epoch][state.frameIndex].load(std::memory_order_acquire);
+			for (const auto& kept : set ? *set : KeptRecordingSet{}) {
+				if (!kept->Recorded(m_persistentTicketHostTag, segment.publication.get(), segment.legacyBindings.get(), defaultResourceHeap, defaultSamplerHeap,
+						ticketTarget->revisions))
+					continue;
+				BT_ZONE_SCOPE("ORG.Persistent.ReuseRecording");
+				// This preparation's invocations are the kept ones' equals (the same revisions): never recorded.
+				for (const auto& invocation : segment.invocations)
+					if (invocation) invocation.Abandon(AbandonReason::AdmissionFailed);
+				kept->lastUse.store(ticketTarget->hostFrame, std::memory_order_relaxed);
+				ticketTarget->segments.push_back({std::move(admission), kept, segment.legacyBindings, defaultResourceHeap, defaultSamplerHeap});
+				m_recordingsReused.fetch_add(1, std::memory_order_relaxed);
+				lap(timings.recordUs);
+				return nullptr;
+			}
+		}
 		std::shared_ptr<const experimental::RenderFrameSnapshot> sealed;
 		try {
 			sealed = experimental::SealPersistentFrame(state.frameNumber, admission, std::move(segment.invocations));
@@ -3190,6 +3300,7 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 			}
 			job.recording.externalExitBarrier = m_externalQueueBoundary.exit
 				&& lastBatchOnSlot[slot].segment == segmentIndex && lastBatchOnSlot[slot].batch == batch;
+			job.recording.replayable = keepable;
 			if (queueKind != QueueKind::Copy) {
 				job.recording.resourceDescriptorHeap = defaultResourceHeap;
 				job.recording.samplerDescriptorHeap = defaultSamplerHeap;
@@ -3199,7 +3310,9 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 				statistics->service = m_statisticsService;
 				statistics->frameIndex = state.frameIndex;
 				statistics->queueKind = rhiKind;
-				statistics->gpuQueries = queueKind != QueueKind::Copy
+				// A recording kept for resubmission records no GPU queries: the statistics service recreates its query pools and
+				// readback buffers as passes register, and a resubmitted list would resolve into the freed ones.
+				statistics->gpuQueries = queueKind != QueueKind::Copy && !keepable
 					&& m_queueRegistry.GetBackendInstance(index) == BackendInstanceId::Primary;
 				for (const auto& pass : job.recording.passes) {
 					const auto found = statisticsIndices.find(pass.DebugName());
@@ -3236,7 +3349,7 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 					job.recording.allocation->pool = job.pool;
 				}
 				if (readyIndex != ready.size()) throw std::logic_error("Command-list batch demand did not match recording jobs");
-				if (!state.tracyFrameBegun[slot]) {
+				if (!state.tracyFrameBegun[slot] && !keepable) {
 					const auto first = std::ranges::find_if(jobs, [slot](const auto& job) { return job.slot == slot; });
 					if (first != jobs.end()) {
 						first->queue.TracyGpuFrameBegin(first->recording.allocation->pair.list.Get());
@@ -3254,7 +3367,43 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 			lap(timings.recordUs);
 			if (auto* ticket = m_persistentTicketTarget) {
 				// Submitted later, by the host's submitting thread; completed (or abandoned) by the owner.
-				ticket->segments.push_back({std::move(admission), std::move(recorded), std::move(recordingStatistics)});
+				auto recording = std::make_shared<PersistentRecording>();
+				recording->snapshot = recorded.Snapshot();
+				recording->packets = recorded.Packets();
+				recording->statistics = std::move(recordingStatistics);
+				recording->replayable = keepable && std::ranges::all_of(recording->packets, [](const auto& packet) { return packet->Replayable(); });
+				m_recordingsRecorded.fetch_add(1, std::memory_order_relaxed);
+				if (recording->replayable) {
+					recording->hostTag = m_persistentTicketHostTag;
+					recording->publication = segment.publication;
+					recording->bindings = segment.legacyBindings;
+					recording->resourceHeap = defaultResourceHeap;
+					recording->samplerHeap = defaultSamplerHeap;
+					recording->revisions = ticket->revisions;
+					recording->lastUse.store(ticket->hostFrame, std::memory_order_relaxed);
+					recording->waits = segment.waits;
+					recording->leases = segment.leases;
+				}
+				// A recording made for host data is its caller's (BindPersistentTicketRecording), never kept here.
+				if (recording->replayable && !m_persistentTicketHostData) {
+					// Kept with the others recorded under the same publication, bindings and host tag (any other can never be
+					// taken again), the most recently used first.
+					auto& cell = (*m_keptRecordings)[ticket->epoch][state.frameIndex];
+					const auto previous = cell.load(std::memory_order_acquire);
+					auto next = std::make_shared<KeptRecordingSet>();
+					next->push_back(recording);
+					for (const auto& kept : previous ? *previous : KeptRecordingSet{})
+						if (kept->hostTag == recording->hostTag && kept->publication == recording->publication && kept->bindings == recording->bindings
+							&& kept->resourceHeap.index == recording->resourceHeap.index && kept->samplerHeap.index == recording->samplerHeap.index)
+							next->push_back(kept);
+					std::stable_sort(next->begin() + 1, next->end(), [](const auto& a, const auto& b) {
+						return a->lastUse.load(std::memory_order_relaxed) > b->lastUse.load(std::memory_order_relaxed);
+					});
+					if (next->size() > kKeptRecordingVariants) next->resize(kKeptRecordingVariants);
+					cell.store(std::move(next), std::memory_order_release);
+					m_recordingsKept.fetch_add(1, std::memory_order_relaxed);
+				}
+				ticket->segments.push_back({std::move(admission), std::move(recording), segment.legacyBindings, defaultResourceHeap, defaultSamplerHeap});
 				return nullptr;
 			}
 			execution = std::move(recorded).Submit(*state.timelines);
@@ -3321,16 +3470,25 @@ void RenderGraph::RetirePersistentExecutions() {
 	BT_PLOT("ORG.Persistent.InFlight", static_cast<int64_t>(state.timelines->InFlight()));
 }
 
-std::shared_ptr<RenderGraph::PersistentTicket> RenderGraph::PreparePersistentTicket(rhi::Device device, uint32_t epoch, uint8_t slot, uint64_t hostFrame) {
+std::shared_ptr<RenderGraph::PersistentTicket> RenderGraph::PreparePersistentTicket(rhi::Device device, uint32_t epoch, uint8_t slot, uint64_t hostFrame,
+	uint64_t hostTag, std::shared_ptr<const IHostExecutionData> hostData, bool admissionOnly) {
 	BT_ZONE_SCOPE("ORG.Persistent.PrepareTicket");
 	if (!m_persistentClosedExecutions) throw std::logic_error("Tickets require closed executions");
 	auto ticket = std::make_shared<PersistentTicket>();
 	ticket->epoch = epoch;
 	ticket->slot = slot;
 	ticket->hostFrame = hostFrame;
+	ticket->hostTag = hostTag;
+	m_persistentTicketHostTag = hostTag;
+	m_persistentTicketAdmissionOnly = admissionOnly;
+	m_persistentTicketHostData = static_cast<bool>(hostData);
 	struct TargetScope {
 		RenderGraph& graph;
-		~TargetScope() { graph.m_persistentTicketTarget = nullptr; }
+		~TargetScope() {
+			graph.m_persistentTicketTarget = nullptr;
+			graph.m_persistentTicketAdmissionOnly = false;
+			graph.m_persistentTicketHostData = false;
+		}
 	} scope{*this};
 	m_persistentTicketTarget = ticket.get();
 	SetPersistentEpoch(epoch);
@@ -3338,13 +3496,58 @@ std::shared_ptr<RenderGraph::PersistentTicket> RenderGraph::PreparePersistentTic
 	update.frameIndex = slot;
 	update.preparationSlot = slot;
 	update.frameFenceValue = hostFrame + 1;
+	update.hostData = hostData.get();
+	update.ownedHostData = hostData;
+	// What it prepares for resolves the resolvers too: a revision names its resources (its versions of them), never the live ones.
+	if (hostData) update.resolverCaptureContext = std::make_shared<const ResolverCaptureContext>(hostData);
 	Update(update, device);
 	PassExecutionContext execute{};
 	execute.device = device;
 	execute.frameIndex = slot;
 	execute.frameFenceValue = hostFrame + 1;
+	execute.hostData = hostData.get();
+	execute.ownedHostData = hostData;
 	Execute(execute);
 	return ticket;
+}
+
+std::shared_ptr<RenderGraph::PersistentTicket> RenderGraph::PrepareRevisionTicket(uint32_t epoch, uint8_t slot, uint64_t hostFrame) {
+	BT_ZONE_SCOPE("ORG.Persistent.PrepareRevisionTicket");
+	if (!m_persistentClosedExecutions) throw std::logic_error("Tickets require closed executions");
+	auto ticket = std::make_shared<PersistentTicket>();
+	ticket->epoch = epoch;
+	ticket->slot = slot;
+	ticket->hostFrame = hostFrame;
+	ticket->revision = true;
+	// What Execute does before it admits: release the executions the GPU has finished.
+	RetirePersistentExecutions();
+	return ticket;
+}
+
+void RenderGraph::AddPersistentTicketCandidate(PersistentTicket& ticket, std::shared_ptr<const PersistentRecording> recording) {
+	BT_ZONE_SCOPE("ORG.Persistent.AddTicketCandidate");
+	if (!ticket.revision) throw std::logic_error("Candidates are a revision ticket's");
+	if (!recording || !recording->replayable || !recording->publication)
+		throw std::logic_error("A revision ticket's candidate must be a replayable recording");
+	for (const auto* candidate = ticket.candidates.load(std::memory_order_relaxed); candidate; candidate = candidate->next)
+		if (candidate->segment.recording == recording) return;
+	auto& state = *m_compilerState->persistent;
+	if (!state.timelines || !state.admission) throw std::logic_error("A revision ticket's candidate before the graph executed");
+	// The queues as submitSegment takes them: what each has submitted, a pending presentation tail owning the next graphics value.
+	const size_t slotCount = m_queueRegistry.SlotCount();
+	const auto presentationSlot = m_queueRegistry.FindGraphicsSlot();
+	std::vector<experimental::ExecutionTimelinePoint> queues;
+	for (size_t slot = 0; slot < slotCount; ++slot) {
+		const auto next = m_queueRegistry.GetCurrentFenceValue(static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot)));
+		auto submitted = next ? next - 1 : 0;
+		if (state.pendingPresentSubmission && slot == static_cast<size_t>(ToUnderlying(presentationSlot))) submitted = next;
+		queues.push_back({slot + 1, submitted});
+	}
+	auto* candidate = new PersistentTicket::Candidate{
+		{state.admission->Prepare(recording->publication, queues, recording->waits, {}, {}), recording, recording->bindings, recording->resourceHeap,
+			recording->samplerHeap}};
+	candidate->next = ticket.candidates.load(std::memory_order_relaxed);
+	ticket.candidates.store(candidate, std::memory_order_release);  // the owner thread is the only writer
 }
 
 std::vector<std::pair<uint32_t, uint64_t>> RenderGraph::CompletePersistentTicket(PersistentTicket& ticket, const PersistentTicketSubmission& submission) {
@@ -3354,7 +3557,7 @@ std::vector<std::pair<uint32_t, uint64_t>> RenderGraph::CompletePersistentTicket
 	size_t next = 0;
 	for (auto& segment : ticket.segments) {
 		const auto& graph = *segment.admission.publication->executable->graph;
-		if (!submission.submitted || !segment.recorded) {
+		if (!submission.submitted || !segment.recording) {
 			state.admission->Abandon(segment.admission);
 			continue;
 		}
@@ -3362,10 +3565,10 @@ std::vector<std::pair<uint32_t, uint64_t>> RenderGraph::CompletePersistentTicket
 		signals.reserve(graph.batches.size());
 		for (uint32_t batch = 0; batch < graph.batches.size(); ++batch)
 			signals.push_back({uint64_t{graph.batches[batch].queue} + 1, submission.signals.at(next++)});
-		const auto execution = state.timelines->RecordSubmitted(segment.recorded->Snapshot()->layout->bundle,
-			segment.recorded->IncomingWaits(), segment.recorded->Packets(), signals);
+		const auto execution = state.timelines->RecordSubmitted(segment.recording->snapshot->layout->bundle,
+			segment.admission.incomingWaits, segment.recording->packets, signals);
 		state.admission->Commit(segment.admission, *execution);
-		for (const auto& statistics : segment.statistics) statistics->Publish();
+		for (const auto& statistics : segment.recording->statistics) statistics->Publish();
 		for (uint32_t batch = 0; batch < graph.batches.size(); ++batch) {
 			const auto queue = graph.batches[batch].queue;
 			m_queueRegistry.EnsureNextFenceValueAtLeast(static_cast<QueueSlotIndex>(static_cast<uint8_t>(queue)), signals[batch].value + 1);
@@ -3374,9 +3577,12 @@ std::vector<std::pair<uint32_t, uint64_t>> RenderGraph::CompletePersistentTicket
 			else found->second = (std::max)(found->second, signals[batch].value);
 		}
 	}
+	for (auto* candidate = ticket.candidates.load(std::memory_order_acquire); candidate; candidate = candidate->next)
+		if (candidate != ticket.chosen) state.admission->Abandon(candidate->segment.admission);
 	// Abandoned packets are destroyed here, never submitted: their lifecycle effects abandon and their
-	// command lists return to the pool.
+	// command lists return to the pool. A kept recording stays with its set.
 	ticket.segments.clear();
+	ticket.replaced.clear();
 	basic_telemetry::AddCounter(submission.submitted ? "ORG.Persistent.TicketsSubmitted" : "ORG.Persistent.TicketsAbandoned");
 	return completion;
 }
@@ -3384,6 +3590,92 @@ std::vector<std::pair<uint32_t, uint64_t>> RenderGraph::CompletePersistentTicket
 uint32_t RenderGraph::PersistentTicketEpoch(const PersistentTicket& ticket) noexcept { return ticket.epoch; }
 uint8_t RenderGraph::PersistentTicketSlot(const PersistentTicket& ticket) noexcept { return ticket.slot; }
 uint64_t RenderGraph::PersistentTicketHostFrame(const PersistentTicket& ticket) noexcept { return ticket.hostFrame; }
+uint64_t RenderGraph::PersistentTicketHostTag(const PersistentTicket& ticket) noexcept { return ticket.hostTag; }
+void RenderGraph::SetPersistentTicketHostTag(PersistentTicket& ticket, uint64_t tag) noexcept { ticket.hostTag = tag; }
+
+bool RenderGraph::AdoptKeptPersistentRecording(PersistentTicket& ticket, uint64_t hostTag) {
+	BT_ZONE_SCOPE("ORG.Persistent.AdoptKeptRecording");
+	if (!m_keptRecordings || ticket.uncheckable || ticket.segments.size() != 1 || ticket.epoch >= kKeptRecordingEpochs || ticket.slot >= kKeptRecordingSlots)
+		return false;
+	auto& segment = ticket.segments.front();
+	if (!segment.recording) return false;
+	const auto set = (*m_keptRecordings)[ticket.epoch][ticket.slot].load(std::memory_order_acquire);
+	if (!set || set->empty()) return false;
+	// What the ticket's passes depend on now: the same passes (the same publication), their revisions as they are.
+	std::vector<std::pair<const RenderGraphPass*, uint64_t>> now;
+	now.reserve(ticket.revisions.size());
+	for (const auto& [pass, recorded] : ticket.revisions) {
+		uint64_t hash = 0;
+		if (!pass->InvocationRevisionHash(hash)) return false;
+		now.emplace_back(pass, hash);
+	}
+	const auto& current = *segment.recording;
+	for (const auto& kept : *set) {
+		if (kept.get() == &current || !kept->Recorded(hostTag, segment.admission.publication.get(), current.bindings.get(), current.resourceHeap, current.samplerHeap, now))
+			continue;
+		ticket.replaced.push_back(std::move(segment.recording));
+		segment.recording = kept;
+		kept->lastUse.store(ticket.hostFrame, std::memory_order_relaxed);
+		ticket.revisions = std::move(now);
+		ticket.hostTag = hostTag;
+		m_recordingsAdopted.fetch_add(1, std::memory_order_relaxed);
+		return true;
+	}
+	return false;
+}
+
+std::shared_ptr<const RenderGraph::PersistentRecording> RenderGraph::PersistentTicketRecording(const PersistentTicket& ticket) noexcept {
+	return ticket.segments.size() == 1 ? ticket.segments.front().recording : nullptr;
+}
+
+bool RenderGraph::PersistentRecordingReplayable(const PersistentRecording& recording) noexcept {
+	return recording.replayable;
+}
+
+bool RenderGraph::BindPersistentTicketRecording(PersistentTicket& ticket, std::shared_ptr<const PersistentRecording> recording, uint64_t hostTag,
+	std::string* why) {
+	auto fail = [&](const char* reason) {
+		if (why) *why = reason;
+		return false;
+	};
+	if (!recording) return fail("no recording");
+	if (ticket.revision) {
+		if (!ticket.segments.empty()) return fail("the ticket already has a recording");
+		for (const auto* candidate = ticket.candidates.load(std::memory_order_acquire); candidate; candidate = candidate->next) {
+			if (candidate->segment.recording != recording) continue;
+			recording->lastUse.store(ticket.hostFrame, std::memory_order_relaxed);
+			ticket.segments.push_back(candidate->segment);
+			ticket.chosen = candidate;
+			ticket.revisions = recording->revisions;
+			return true;
+		}
+		return fail("the ticket admitted no candidate for this recording (made after the ticket, and not added to it)");
+	}
+	if (ticket.segments.size() != 1) return fail("the ticket has no single segment");
+	auto& segment = ticket.segments.front();
+	if (segment.recording) return fail("the ticket already has a recording");
+	if (!recording->replayable) return fail("the recording is not replayable");
+	if (recording->publication != segment.admission.publication) return fail("recorded for another publication");
+	if (recording->bindings != segment.bindings) return fail("recorded for other bindings");
+	if (recording->resourceHeap.index != segment.resourceHeap.index || recording->resourceHeap.generation != segment.resourceHeap.generation
+		|| recording->samplerHeap.index != segment.samplerHeap.index || recording->samplerHeap.generation != segment.samplerHeap.generation)
+		return fail("recorded for other descriptor heaps");
+	if (recording->hostTag != hostTag) return fail("recorded under another backing version");
+	recording->lastUse.store(ticket.hostFrame, std::memory_order_relaxed);
+	segment.recording = std::move(recording);
+	ticket.revisions = segment.recording->revisions;
+	ticket.hostTag = hostTag;
+	return true;
+}
+
+RenderGraph::PersistentRecordingStats RenderGraph::TakePersistentRecordingStats() noexcept {
+	PersistentRecordingStats stats;
+	stats.recorded = m_recordingsRecorded.exchange(0, std::memory_order_relaxed);
+	stats.kept = m_recordingsKept.exchange(0, std::memory_order_relaxed);
+	stats.reused = m_recordingsReused.exchange(0, std::memory_order_relaxed);
+	stats.adopted = m_recordingsAdopted.exchange(0, std::memory_order_relaxed);
+	return stats;
+}
 
 bool RenderGraph::PersistentTicketCurrent(const PersistentTicket& ticket) {
 	BT_ZONE_SCOPE("ORG.Persistent.CheckTicket");
@@ -3395,7 +3687,8 @@ bool RenderGraph::PersistentTicketCurrent(const PersistentTicket& ticket) {
 	return true;
 }
 
-bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uint64_t> nextQueueValues, PersistentTicketSubmission& out) {
+bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uint64_t> nextQueueValues, PersistentTicketSubmission& out,
+	std::pair<uint32_t, uint64_t> uploadsDone) {
 	BT_ZONE_SCOPE("ORG.Persistent.SubmitTicket");
 	out = {};
 	for (auto& segment : ticket.segments) {
@@ -3403,12 +3696,16 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 		// The same timeline composition the owner's RecordSubmitted will derive from these values: the
 		// execution's incoming waits plus its batches' waits on each other.
 		std::vector<experimental::ExecutionBatchTimeline> batches(graph.batches.size());
-		const auto& incoming = segment.recorded->IncomingWaits();
+		const auto& incoming = segment.admission.incomingWaits;
 		for (uint32_t batch = 0; batch < graph.batches.size(); ++batch) {
 			const auto queue = graph.batches[batch].queue;
 			if (queue >= nextQueueValues.size()) throw std::logic_error("Ticket batch on an unknown queue");
 			batches[batch].signal = {uint64_t{queue} + 1, ++nextQueueValues[queue]};
 			if (batch < incoming.size()) batches[batch].waits = incoming[batch];
+			// The uploads ahead of the ticket order only the batches on their own queue (its entry barrier): any other queue
+			// would otherwise read what this epoch's uploads write before they land.
+			if (uploadsDone.second && queue != uploadsDone.first)
+				batches[batch].waits.push_back({uint64_t{uploadsDone.first} + 1, uploadsDone.second});
 			out.signals.push_back(batches[batch].signal.value);
 		}
 		for (const auto wait : graph.relativeWaits)
@@ -3424,7 +3721,13 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 			}
 			batch.waits.resize(count);
 		}
-		if (!segment.recorded->SubmitPackets(batches)) return false;
+		{
+			BT_ZONE_SCOPE("ORG.Frame.SubmitPackets");
+			const auto& packets = segment.recording->packets;
+			if (packets.size() != batches.size()) throw std::logic_error("Ticket packets do not match its batches");
+			for (size_t i = 0; i < packets.size(); ++i)
+				if (!packets[i]->Submit(batches[i])) return false;
+		}
 	}
 	out.submitted = true;
 	return true;
@@ -3439,10 +3742,14 @@ ResourceRegistry::RegistryHandle TicketUploadResolveByPtr(void*, Resource* resou
 }
 }
 
-bool RenderGraph::RecordPendingUploads(rhi::Device device, rhi::CommandList& list, uint8_t slot, std::shared_ptr<void>& keepAlive, bool& recorded) {
+bool RenderGraph::RecordPendingUploads(rhi::Device device, rhi::CommandList& list, uint8_t slot, std::shared_ptr<void>& keepAlive, bool& recorded,
+	std::vector<rhi::CommandList>& recordedLists) {
 	BT_ZONE_SCOPE("ORG.Persistent.RecordPendingUploads");
 	recorded = false;
+	recordedLists.clear();
 	if (!m_uploadService) return true;
+	// Before the staged batches: an outdated recording goes back among them, first.
+	m_uploadService->TakeRecordedUploads(recordedLists, slot);
 	// Every copy follows one full barrier against the work before them (see the declaration).
 	bool barrier = false;
 	auto orderAfterPreviousWork = [&] {
@@ -3455,12 +3762,11 @@ bool RenderGraph::RecordPendingUploads(rhi::Device device, rhi::CommandList& lis
 	};
 	const auto pass = m_uploadService->GetUploadPass();
 	auto* immediate = dynamic_cast<IHasImmediateModeCommands*>(pass.get());
-	bool queuedCopies = false;
 	auto recordStaged = [&]() -> bool {
 		// Direct staged batches carry resolved destinations: one copy each, after the queued uploads, so a
-		// producer's payload replaces what was queued before it. (With none, the barrier goes unsubmitted.)
-		orderAfterPreviousWork();
-		if (m_uploadService->RecordStagedUploads(list, slot, queuedCopies)) recorded = true;
+		// producer's payload replaces what was queued before it. The service orders them after the work before them
+		// (the queued copies, or the previous execution) with one barrier, and records none when it has no batch.
+		if (m_uploadService->RecordStagedUploads(list, slot, true)) recorded = true;
 		return true;
 	};
 	if (!immediate) return recordStaged();
@@ -3487,7 +3793,6 @@ bool RenderGraph::RecordPendingUploads(rhi::Device device, rhi::CommandList& lis
 		// after it (the next execution's full barrier comes after them), so they start with one of their own.
 		orderAfterPreviousWork();
 		copies->Record(list);
-		queuedCopies = true;
 		struct Owned {
 			std::shared_ptr<const org::imm::PreparedBufferCopies> copies;
 			std::unique_ptr<org::imm::KeepAliveBag> bag;

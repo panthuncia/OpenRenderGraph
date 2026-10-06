@@ -426,6 +426,13 @@ void GraphEditTransaction::SetPassEpoch(PassId pass, uint32_t epoch) {
     if (logical.passSlots[pass.index].epoch == epoch) return;
     EditLogical().passSlots[pass.index].epoch = epoch;
 }
+void GraphEditTransaction::SetPassDebugName(PassId pass, std::string name) {
+    MutationGuard guard{m_failed};
+    ValidatePass(pass);
+    const auto& logical = m_logical ? *m_logical : *m_base->logical;
+    if (logical.passSlots[pass.index].debugName == name) return;
+    EditLogical().passSlots[pass.index].debugName = std::move(name);
+}
 void GraphEditTransaction::SetEpochOrder(std::vector<uint32_t> order) {
     MutationGuard guard{m_failed};
     const auto& logical = m_logical ? *m_logical : *m_base->logical;
@@ -987,6 +994,7 @@ std::shared_ptr<const SelectedPublication> GraphEditTransaction::Build(
             const auto& binding = m_bindings.At(m_bindings.CurrentSlot(i));
             canonical[i] = m_bindings.m_identities[binding.identity % BindingTable::IdentityBuckets]->at(binding.identity).front();
         }
+        size_t groupEdgesFrom = SIZE_MAX;  // explicitEdges from here on are the group phases
         {
             BT_ZONE_SCOPE("ORG.Persistent.PrepareGroups");
             for (const auto& group : m_logical->groups) {
@@ -1005,6 +1013,7 @@ std::shared_ptr<const SelectedPublication> GraphEditTransaction::Build(
             }
             // Phase contracts order overlapping groups as well as each group's
             // own producer/consumer phases. Equal-phase writes are ambiguous.
+            groupEdgesFrom = input.structure.explicitEdges.size();
             auto explicitlyOrdered = [&](uint32_t from, uint32_t to) {
                 std::vector<uint8_t> visited(input.structure.passes.size());
                 std::vector<uint32_t> pending{from};
@@ -1031,6 +1040,11 @@ std::shared_ptr<const SelectedPublication> GraphEditTransaction::Build(
                     if (!overlap) continue;
                     for (const auto& u : x.subscribers) for (const auto& v : y.subscribers) {
                         if (u.pass == v.pass || (!u.state.write && !v.state.write)) continue;
+                        // Passes of different epochs are ordered by their epochs (the explicit edges between consecutive
+                        // epochs above), which need not follow the phases (registration order): a phase edge against the
+                        // epoch order would be a cycle. An untagged pass (AllEpochs) is in every epoch: its phases stand.
+                        if (const auto eu = m_logical->passSlots.at(u.pass.index).epoch, ev = m_logical->passSlots.at(v.pass.index).epoch;
+                            eu != ev && eu != AllEpochs && ev != AllEpochs) continue;
                         const auto ur = u.range.value_or(experimental::CompileRange{0,x.memberShape.mips,0,x.memberShape.slices});
                         const auto vr = v.range.value_or(experimental::CompileRange{0,y.memberShape.mips,0,y.memberShape.slices});
                         if (uint64_t{ur.mip} + ur.mips <= vr.mip || uint64_t{vr.mip} + vr.mips <= ur.mip
@@ -1053,6 +1067,10 @@ std::shared_ptr<const SelectedPublication> GraphEditTransaction::Build(
             // lowered access hazards in a legal authored order without changing
             // stable pass indices or frame recording associations.
             auto directStructure = m_logical->declarations;
+            // In the authored order as ranked by epoch above: the declarations' own order is registration order, and a hazard
+            // derived in it between passes of two epochs could run against the epoch order (a cycle with the epoch edges).
+            for (size_t i = 0; i < directStructure.passes.size() && i < input.structure.passes.size(); ++i)
+                directStructure.passes[i].originalOrder = input.structure.passes[i].originalOrder;
             CanonicalizeUses(directStructure,canonical);
             const auto direct = workspace.AnalyzeDependencies(directStructure,cancelled);
             if (!direct) return {};
@@ -1063,9 +1081,15 @@ std::shared_ptr<const SelectedPublication> GraphEditTransaction::Build(
                 Require(from < count && to < count && from != to, "Invalid group phase ordering");
                 successors[from].push_back(to); ++incoming[to];
             };
-            for (auto [from,to] : *direct) append(from,to);
-            for (auto [from,to] : input.structure.explicitEdges) append(from,to);
-            for (auto [from,to] : input.structure.placementEdges) append(from,to);
+            // Kinds, for the diagnostics of a cycle: direct access, explicit (authored, epochs, group phases), placement.
+            std::vector<std::vector<std::pair<uint32_t,char>>> predecessors(count);
+            for (auto [from,to] : *direct) { append(from,to); predecessors[to].emplace_back(from,'d'); }
+            for (size_t e = 0; e < input.structure.explicitEdges.size(); ++e) {
+                const auto [from,to] = input.structure.explicitEdges[e];
+                append(from,to);
+                predecessors[to].emplace_back(from, e >= groupEdgesFrom ? 'g' : 'x');
+            }
+            for (auto [from,to] : input.structure.placementEdges) { append(from,to); predecessors[to].emplace_back(from,'p'); }
             std::vector<uint32_t> order;
             order.reserve(count);
             std::vector<uint8_t> selected(count);
@@ -1074,7 +1098,25 @@ std::shared_ptr<const SelectedPublication> GraphEditTransaction::Build(
                 for (uint32_t i = 0; i < count; ++i)
                     if (!selected[i] && !incoming[i] && (next == UINT32_MAX
                         || input.structure.passes[i].originalOrder < input.structure.passes[next].originalOrder)) next = i;
-                Require(next != UINT32_MAX, "Cyclic group phase ordering");
+                if (next == UINT32_MAX) {
+                    // Every pass left has a predecessor left: name them, with the edges between them.
+                    auto name = [&](uint32_t pass) {
+                        const auto& slot = m_logical->passSlots[pass];
+                        return (slot.debugName.empty() ? "#" + std::to_string(pass) : slot.debugName)
+                            + "(e" + (slot.epoch == AllEpochs ? std::string("*") : std::to_string(slot.epoch)) + ")";
+                    };
+                    std::string message = "Cyclic group phase ordering (edges d: access, x: authored or epoch, g: group phase, p: placement):";
+                    size_t listed = 0;
+                    for (uint32_t i = 0; i < count && listed < 24; ++i) {
+                        if (selected[i]) continue;
+                        ++listed;
+                        message += " " + name(i) + " after";
+                        for (const auto& [from,kind] : predecessors[i])
+                            if (!selected[from]) message += std::string(" ") + kind + ":" + name(from);
+                        message += ";";
+                    }
+                    Require(false, message.c_str());
+                }
                 selected[next] = 1; order.push_back(next);
                 for (auto to : successors[next]) --incoming[to];
             }
@@ -1497,7 +1539,7 @@ void SynchronousAdmission::SetClosedExecutions(bool closed) {
 SynchronousAdmission::SynchronousAdmission(size_t frameCapacity,
     std::function<void(std::shared_ptr<const void>)> retireOwnership)
     : m_capacity(frameCapacity), m_retireOwnership(std::move(retireOwnership)) {
-    Require(frameCapacity && frameCapacity <= 64, "Invalid synchronous frame capacity");
+    Require(frameCapacity, "Invalid synchronous frame capacity");
     m_retained.reserve(frameCapacity);
     static std::atomic_uint64_t nextDomain{1};
     m_domain = nextDomain.fetch_add(1,std::memory_order_relaxed);

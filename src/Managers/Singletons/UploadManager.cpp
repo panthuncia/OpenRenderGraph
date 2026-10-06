@@ -279,9 +279,27 @@ void UploadManager::SetStagedUploadsRecordedDirectly(bool direct)
 	}
 }
 
-size_t UploadManager::RecordStagedUploads(rhi::CommandList& list, uint8_t frameIndex, bool afterCopies)
+size_t UploadManager::RecordStagedUploads(rhi::CommandList& list, uint8_t frameIndex, bool afterWork)
 {
-	return m_uploadInstance ? m_uploadInstance->RecordStagedUploads(list, frameIndex, afterCopies) : 0;
+	return m_uploadInstance ? m_uploadInstance->RecordStagedUploads(list, frameIndex, afterWork) : 0;
+}
+
+bool UploadManager::SubmitRecordedUploads(std::shared_ptr<org::runtime::StagedUploadBatch> batch)
+{
+	if (!m_uploadInstance) {
+		Initialize();
+	}
+	bool nothingQueued = false;
+	{
+		std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
+		nothingQueued = queuedResourceCopies.empty();
+	}
+	return m_uploadInstance->SubmitRecordedUploads(std::move(batch), nothingQueued);
+}
+
+size_t UploadManager::TakeRecordedUploads(std::vector<rhi::CommandList>& out, uint8_t frameIndex)
+{
+	return m_uploadInstance ? m_uploadInstance->TakeRecordedUploads(out, frameIndex) : 0;
 }
 
 void UploadManager::ProcessDeferredReleases(uint8_t frameIndex)

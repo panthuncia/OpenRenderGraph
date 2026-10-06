@@ -11,6 +11,7 @@
 #include <span>
 #include <utility>
 #include <array>
+#include <atomic>
 #include <algorithm>
 #include <spdlog/spdlog.h>
 #include <rhi.h>
@@ -793,8 +794,57 @@ public:
 		bool submitted = false;
 		std::vector<uint64_t> signals;  // per batch of every segment, in order: the value it signalled
 	};
-	// Owner thread. hostFrame numbers the execution (its statistics and lifecycle).
-	std::shared_ptr<PersistentTicket> PreparePersistentTicket(rhi::Device device, uint32_t epoch, uint8_t slot, uint64_t hostFrame);
+	// Owner thread. hostFrame numbers the execution (its statistics and lifecycle). hostTag: the host's currency tag the ticket
+	// is prepared under (SetPersistentTicketHostTag), which a kept recording must have been recorded under too. hostData: what
+	// the passes prepare for (FramePreparationContext::preparationData), e.g. a scene revision; retained while it records.
+	// admissionOnly: the ticket carries the admission alone, and its recording is bound before submission
+	// (BindPersistentTicketRecording) - an epoch recorded ahead, for a revision (PersistentGraphHost::RequestEpochRecording).
+	std::shared_ptr<PersistentTicket> PreparePersistentTicket(rhi::Device device, uint32_t epoch, uint8_t slot, uint64_t hostFrame,
+		uint64_t hostTag = 0, std::shared_ptr<const IHostExecutionData> hostData = {}, bool admissionOnly = false);
+	// A segment's recorded packets and what they were recorded for (the publication, bindings, heaps, host tag and every pass's
+	// revision). Shared, immutable once made.
+	struct PersistentRecording;
+	// The ticket's recording (one segment), or null; the ticket keeps it.
+	static std::shared_ptr<const PersistentRecording> PersistentTicketRecording(const PersistentTicket& ticket) noexcept;
+	// Whether it may be submitted again and again (every pass replayable, recorded for resubmission).
+	static bool PersistentRecordingReplayable(const PersistentRecording& recording) noexcept;
+	// Submitting thread: binds a recording made ahead (PreparePersistentTicket for the same epoch and slot) to an admission-only
+	// ticket. It must have been recorded for the ticket's publication, bindings, descriptor heaps and hostTag (the host's backing
+	// version now); otherwise false, with why, and the ticket unchanged. A revision ticket (PrepareRevisionTicket) instead takes the
+	// candidate admitted for exactly this recording, which needs no tag: the recording holds every backing it was recorded with.
+	static bool BindPersistentTicketRecording(PersistentTicket& ticket, std::shared_ptr<const PersistentRecording> recording, uint64_t hostTag,
+		std::string* why = nullptr);
+	// Revision-driven epochs (immutable inputs). A recording made for host data (a revision) resolves the graph's resolvers through
+	// it (ResolverCaptureContext of IHostExecutionData), so its publication and bindings are the revision's own, and it holds them.
+	// Owner thread: a ticket for the epoch's slot that prepares nothing from live state: its admissions are its candidates', one
+	// per recording it may be submitted with (AddPersistentTicketCandidate); the bind takes one, completion abandons the rest.
+	std::shared_ptr<PersistentTicket> PrepareRevisionTicket(uint32_t epoch, uint8_t slot, uint64_t hostFrame);
+	// Owner thread: admits the recording's publication as a candidate of the revision ticket. Lock-free against a bind on the
+	// submitting thread (an append-only list); a recording published to that thread after this call is always found.
+	void AddPersistentTicketCandidate(PersistentTicket& ticket, std::shared_ptr<const PersistentRecording> recording);
+	// Recording reuse. A ticket's recording, when every pass of it is replayable (PreparedPass::IsReplayable) and its
+	// execution closed with nothing late-bound, is kept per (epoch, frame slot) - up to kKeptRecordingVariants of them, by
+	// what they were recorded for: the publication, the bindings and descriptor heaps, the host tag, and each pass's
+	// revision. A ticket prepared for what a kept recording was recorded for takes it instead of recording (its lists are
+	// submitted again), and a ticket the commit made stale can take the kept recording of what it depends on now
+	// (AdoptKeptPersistentRecording) instead of being prepared again. Kept recordings have no profiler GPU zones and no GPU
+	// statistics queries: each references resources (query pools, readback buffers) that are recreated as passes register.
+	static constexpr size_t kKeptRecordingVariants = 4;
+	void SetPersistentRecordingReuse(bool reuse) noexcept { m_persistentRecordingReuse = reuse; }
+	bool PersistentRecordingReuse() const noexcept { return m_persistentRecordingReuse; }
+	// Submitting thread: swaps the ticket's recording for the kept one of what its passes depend on now and a_hostTag, and
+	// makes the ticket current. False (the ticket unchanged) when none is kept. Reads the kept sets only (lock-free).
+	bool AdoptKeptPersistentRecording(PersistentTicket& ticket, uint64_t hostTag);
+	// Owner thread, with no ticket in flight: lets every kept recording go (their lists return to their pools).
+	void ClearKeptPersistentRecordings() noexcept { m_keptRecordings.reset(); }
+	struct PersistentRecordingStats {
+		uint64_t recorded = 0;    // tickets recorded (owner thread)
+		uint64_t kept = 0;        // of them, kept for reuse
+		uint64_t reused = 0;      // tickets that took a kept recording instead of recording (owner thread)
+		uint64_t adopted = 0;     // stale tickets made current by a kept recording (submitting thread)
+	};
+	// Since the last call (any thread).
+	PersistentRecordingStats TakePersistentRecordingStats() noexcept;
 	// Returns the last value the submission signals on each queue slot it used (empty when abandoned).
 	std::vector<std::pair<uint32_t, uint64_t>> CompletePersistentTicket(PersistentTicket& ticket, const PersistentTicketSubmission& submission);
 	// Owner thread: releases executions the GPU has finished (the retirement Execute does before submitting).
@@ -803,18 +853,29 @@ public:
 	static uint32_t PersistentTicketEpoch(const PersistentTicket& ticket) noexcept;
 	static uint8_t PersistentTicketSlot(const PersistentTicket& ticket) noexcept;
 	static uint64_t PersistentTicketHostFrame(const PersistentTicket& ticket) noexcept;
+	// A value the host keeps with the ticket for its own currency checks (PersistentGraphHost: the backing version it was
+	// prepared under). Set by the owner thread before the ticket is published.
+	static uint64_t PersistentTicketHostTag(const PersistentTicket& ticket) noexcept;
+	static void SetPersistentTicketHostTag(PersistentTicket& ticket, uint64_t tag) noexcept;
 	// Every pass it prepared would still prepare the same invocation (RenderGraphPass::InvocationRevisionHash).
 	static bool PersistentTicketCurrent(const PersistentTicket& ticket);
 	// Submits the packets with values from nextQueueValues (the last value assigned per queue slot, advanced
 	// here). Returns false when a packet failed.
-	static bool SubmitPersistentTicket(PersistentTicket& ticket, std::span<uint64_t> nextQueueValues, PersistentTicketSubmission& out);
+	// uploadsDone: the queue slot and value that signal the uploads recorded ahead of the ticket (RecordPendingUploads), when
+	// there are any. They precede the ticket on their own queue only, so every batch on another queue waits for them.
+	static bool SubmitPersistentTicket(PersistentTicket& ticket, std::span<uint64_t> nextQueueValues, PersistentTicketSubmission& out,
+		std::pair<uint32_t, uint64_t> uploadsDone = {UINT32_MAX, 0});
 	// Submitting thread (the upload service's owner): records the uploads queued since the last call into
 	// `list` as plain buffer copies, without the graph's registry or admission: a full barrier (against the
 	// work before them), then the copies, whose destinations are left for the next execution's entry
 	// barrier - so the list must precede a closed execution on its queue.
 	// keepAlive owns the staging they read until the GPU is done with the slot. False when an upload is not
 	// a pointer-targeted buffer copy (the caller must use the synchronous path).
-	bool RecordPendingUploads(rhi::Device device, rhi::CommandList& list, uint8_t slot, std::shared_ptr<void>& keepAlive, bool& recorded);
+	// recordedLists receives, first, the lists of batches their producers recorded (IUploadService::SubmitRecordedUploads),
+	// which go to the queue ahead of `list`, as they are: each starts with its own full barrier, and `list` starts with one
+	// whenever it records a copy.
+	bool RecordPendingUploads(rhi::Device device, rhi::CommandList& list, uint8_t slot, std::shared_ptr<void>& keepAlive, bool& recorded,
+		std::vector<rhi::CommandList>& recordedLists);
 	// The epoch the next Update/Execute runs; persistent::AllEpochs runs every pass.
 	void SetPersistentEpoch(uint32_t epoch) noexcept { m_persistentEpoch = epoch; }
 	uint32_t PersistentEpoch() const noexcept { return m_persistentEpoch; }
@@ -1458,6 +1519,18 @@ private:
 	bool m_persistentClosedExecutions = false;
 	// Set while PreparePersistentTicket runs: Update skips the dynamic segments, Execute stops after recording.
 	PersistentTicket* m_persistentTicketTarget = nullptr;
+	uint64_t m_persistentTicketHostTag = 0;
+	bool m_persistentTicketAdmissionOnly = false;
+	// The ticket prepares for host data (a revision): its passes' revision hashes do not see it (InvocationRevisionHash reads
+	// live state), so its recording is neither taken from nor added to the kept sets.
+	bool m_persistentTicketHostData = false;
+	bool m_persistentRecordingReuse = false;
+	// Kept recordings per (epoch, frame slot): replaced whole by the owner thread, read by the submitting thread. A host's frame
+	// slots are its frames in flight of every epoch (PersistentGraphHost::FrameSlots), so an epoch meets several.
+	static constexpr size_t kKeptRecordingEpochs = 32, kKeptRecordingSlots = 32;
+	using KeptRecordingSet = std::vector<std::shared_ptr<const PersistentRecording>>;
+	std::unique_ptr<std::array<std::array<std::atomic<std::shared_ptr<const KeptRecordingSet>>, kKeptRecordingSlots>, kKeptRecordingEpochs>> m_keptRecordings;
+	std::atomic<uint64_t> m_recordingsRecorded{0}, m_recordingsKept{0}, m_recordingsReused{0}, m_recordingsAdopted{0};
 	uint32_t m_persistentEpoch = UINT32_MAX;
 	PersistentExecuteTimings m_lastPersistentExecuteTimings{};
 	std::unordered_map<std::string, PersistentSegmentKind> m_persistentSegmentKinds;

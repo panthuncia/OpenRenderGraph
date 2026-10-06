@@ -43,6 +43,10 @@ public:
 		// Optional; a ThreadPoolTaskService is created when absent.
 		std::shared_ptr<runtime::ITaskService> tasks;
 		RenderGraph::ExternalQueueBoundary queueBoundary{};
+		// Frames the CPU may run ahead of the GPU: whole frames of the host's epochs (each epoch of epochOrder once), or of
+		// ExecuteFrame calls without epochs. The host's frame slots - the ring every execution takes the next slot of, and waits
+		// for that slot's previous execution before reusing - number framesInFlight times the epochs (FrameSlots), so the ring
+		// covers the same frames however many epochs there are.
 		uint32_t framesInFlight = 3;
 		// Host epochs: the order the host runs them in within its own frame (see
 		// RenderGraph::SetPersistentEpochOrder). Passes declare theirs with
@@ -51,6 +55,11 @@ public:
 		// RenderGraph::SetPersistentClosedExecutions: every execution leaves its resources in their home
 		// states and starts with a full barrier, so its admission is independent of what ran before.
 		bool closedExecutions = false;
+		// Async epochs: keep an epoch's replayable recordings per frame slot and submit them again
+		// (RenderGraph::SetPersistentRecordingReuse). A ticket prepared for what a kept recording was recorded for takes it
+		// instead of recording, and a ticket the beforeSubmit callback made stale takes the kept recording of what it depends
+		// on now instead of being prepared again (a wait). Kept recordings carry no profiler GPU zones.
+		bool reuseRecordings = false;
 	};
 
 	using ExtensionFactory = std::function<std::unique_ptr<RenderGraph::IRenderGraphExtension>()>;
@@ -100,8 +109,28 @@ public:
 	// in submission order and retires finished work. The render thread calls SubmitEpoch instead of
 	// ExecuteFrame. Requires Desc::closedExecutions. Empty stops it (and waits for the thread); a rebuild
 	// stops and restarts it.
-	void SetAsyncEpochs(std::vector<uint32_t> epochs);
+	// revisionEpochs (a subset of epochs): recorded ahead for a revision (RequestEpochRecording) and submitted with that
+	// recording (SubmitEpoch's recording). Their tickets carry the admission alone; nothing about them is recorded or prepared
+	// again at submission. They need Desc::reuseRecordings' replayable recordings.
+	void SetAsyncEpochs(std::vector<uint32_t> epochs, std::vector<uint32_t> revisionEpochs = {});
 	bool AsyncEpochs() const noexcept { return static_cast<bool>(m_async); }
+
+	// An epoch recorded for one revision: a recording per frame slot of the epoch's ring (async epoch i uses slots
+	// i * framesInFlight .. + framesInFlight - 1, so its tickets and its recordings meet there). Immutable.
+	// A revision's recordings of an epoch, one per slot of its ring. While the caller holds it, the epoch's tickets admit it as a
+	// candidate (RenderGraph::PrepareRevisionTicket), so it can be submitted at any frame; released, it is never admitted again.
+	struct EpochRecording {
+		uint32_t epoch = 0;
+		uint32_t firstSlot = 0;
+		std::vector<std::shared_ptr<const RenderGraph::PersistentRecording>> slots;  // by ring position
+		std::shared_ptr<const IHostExecutionData> revision;  // what it was recorded for
+	};
+	using EpochRecordingCallback = std::function<void(std::shared_ptr<const EpochRecording>, std::exception_ptr)>;
+	// Any thread, lock-free: records the revision-driven epoch for hostData (what its passes prepare for: the revision) on the
+	// host's thread, into every slot of its ring once the slot's last work is done (the host's thread waits for that, never the
+	// caller; a slot the epoch's admission-only ticket holds is recorded too). done runs on the host's thread once every slot is recorded, or with the error
+	// that stopped it. False when async epochs are not running or the epoch is not revision-driven.
+	bool RequestEpochRecording(uint32_t epoch, std::shared_ptr<const IHostExecutionData> hostData, EpochRecordingCallback done);
 	// Submits the epoch at the current point of the host's queue stream. Waits for its ticket if the host's
 	// thread has not finished it; runs beforeSubmit with the graph's services active and CurrentFrameSlot()
 	// the ticket's slot (write latches and queue uploads there); has the ticket prepared again (and waits)
@@ -110,7 +139,10 @@ public:
 	// graph failed (on either thread).
 	// resourceOwner pins immutable descriptors/imports named by this execution
 	// until all accepted queue submissions complete, even without slot reuse.
-	void SubmitEpoch(uint32_t epoch, const FrameCallback& beforeSubmit = {}, std::shared_ptr<const void> resourceOwner = {});
+	// recording: a revision-driven epoch's (RequestEpochRecording), whose recording for the ticket's slot is submitted; it must
+	// match the ticket's publication, bindings and backing version, or this throws (it is never prepared again).
+	void SubmitEpoch(uint32_t epoch, const FrameCallback& beforeSubmit = {}, std::shared_ptr<const void> resourceOwner = {},
+		std::shared_ptr<const EpochRecording> recording = {});
 	// A render-thread snapshot of complete, current tickets for all required
 	// epochs. The async worker never removes ticket cells; only this render
 	// thread can consume them. It also retains one control-mailbox credit per
@@ -170,16 +202,55 @@ public:
 	// bounded mailbox is full or async epochs are unavailable; the caller retains
 	// its request for retry. A callback exception faults the async host.
 	bool TryPostOwnedPreparation(FrameCallback& request);
+	// A change of graph resources' backings (Buffer::ResizeBytes, ResizeStructured) from the submitting thread. With async
+	// epochs the host's thread captures every slot's backing as it prepares a ticket, and capture and backing mutation must
+	// not overlap (BackedResource): a resize has no backing between releasing the old one and creating the new one, and a
+	// capture then binds nothing, or materializes the buffer itself. The scope waits for a preparation in progress to end,
+	// holds the next one off until it closes, and lets this thread change backings (BufferBase::ScopedBackingMutation);
+	// every ticket prepared before it is prepared again when submitted. Without async epochs it only opens the mutation
+	// scope. Held around the change itself, never across a ticket wait; nests.
+	class BackingMutation {
+	public:
+		BackingMutation(BackingMutation&& other) noexcept;
+		BackingMutation& operator=(BackingMutation&&) = delete;
+		BackingMutation(const BackingMutation&) = delete;
+		BackingMutation& operator=(const BackingMutation&) = delete;
+		~BackingMutation();
+
+	private:
+		friend class PersistentGraphHost;
+		explicit BackingMutation(PersistentGraphHost* host);
+		PersistentGraphHost* m_host = nullptr;
+	};
+	[[nodiscard]] BackingMutation MutateBackings();
+	// Submitting thread: a versioned buffer (VersionedBuffer) published a new version. Nothing changed in place, so nothing waits;
+	// a ticket prepared before resolved the old version and is not current (it is prepared again, or takes a kept recording).
+	// Revision-driven epochs need no call: their recordings resolve the versions their revisions name.
+	void NoteNewVersions() noexcept;
 	// SubmitEpoch counters since the last call.
 	struct AsyncStats {
 		uint64_t submitted = 0;
 		uint64_t waited = 0;   // the ticket was not ready yet
 		uint64_t stale = 0;    // prepared again after beforeSubmit
 		uint64_t uploads = 0;  // submissions that carried uploads
+		uint64_t recordedUploadLists = 0;  // producers' recorded upload lists submitted as they were (IUploadService::SubmitRecordedUploads)
+		uint64_t wakesSkipped = 0;  // submissions whose completion the host's thread took at a GPU wake-up instead of a signal
+		uint64_t backingMutations = 0;  // BackingMutation scopes opened while async epochs ran
+		uint64_t backingWaits = 0;      // of them, those that found a ticket preparation in progress and waited it out
+		uint64_t preparationWaits = 0;  // ticket preparations the host's thread held off for a scope
+		uint64_t staleBacking = 0;      // tickets prepared again only because a backing changed since their preparation
+		// Desc::reuseRecordings: tickets recorded, recordings kept, tickets that took a kept recording instead of recording,
+		// and stale tickets made current by a kept recording (not prepared again).
+		uint64_t recorded = 0, kept = 0, reused = 0, adopted = 0;
+		// Revision-driven epochs: slots recorded for requests (RequestEpochRecording), requests completed, and submissions of a
+		// revision's recording.
+		uint64_t revisionSlotsRecorded = 0, revisionRecordings = 0, revisionSubmissions = 0;
 	};
-	AsyncStats TakeAsyncStats() noexcept { return std::exchange(m_asyncStats, {}); }
+	AsyncStats TakeAsyncStats() noexcept;
 
 	RenderGraph* Graph() noexcept { return m_graph.get(); }
+	/** @brief The device the host was made with (Desc::device), e.g. for a producer recording its uploads ahead (StagedUploadBatch::Record). */
+	rhi::Device Device() const noexcept { return m_desc.device; }
 	/** @brief The device-generation cleanup lane used for immutable binding roots. */
 	std::shared_ptr<runtime::ResourceCleanupQueue> ResourceCleanup() const;
 	runtime::IUploadService* Uploads() noexcept;
@@ -188,12 +259,13 @@ public:
 	// it returns): the region of a LatchBlock the host may write for it. Also RecordingContext::FrameSlot.
 	bool ClosedExecutions() const noexcept { return m_desc.closedExecutions; }
 	uint32_t CurrentFrameSlot() const noexcept {
-		return m_async ? m_asyncSlot : static_cast<uint32_t>(m_frameNumber % (std::max)(m_desc.framesInFlight, 1u));
+		return m_async ? m_asyncSlot : static_cast<uint32_t>(m_frameNumber % m_frameSlots);
 	}
 	// The host frame number of the last execution (ExecuteFrame or SubmitEpoch); the completed-frame
 	// callback reports frames by it.
 	uint64_t LastHostFrame() const noexcept { return m_lastHostFrame; }
-	uint32_t FrameSlots() const noexcept { return (std::max)(m_desc.framesInFlight, 1u); }
+	// The frame slots: Desc::framesInFlight frames of every epoch in the order (one execution a frame without epochs).
+	uint32_t FrameSlots() const noexcept { return m_frameSlots; }
 
 	// The calling thread's CPU time in the last ExecuteFrame, by phase. Diagnostics only.
 	struct FrameTimings {
@@ -210,6 +282,7 @@ public:
 		double checkUs = 0.0;          // checking it is current, and preparing it again when not
 		double uploadsUs = 0.0;        // recording the queued uploads
 		double submitUs = 0.0;         // handing the uploads and the ticket to the queue
+		double postUs = 0.0;           // handing the submitted ticket back to the host's thread (its completion)
 		RenderGraph::PersistentExecuteTimings execute{};
 	};
 	const FrameTimings& LastFrameTimings() const noexcept { return m_lastTimings; }
@@ -219,6 +292,7 @@ private:
 	void Build();
 
 	Desc m_desc;
+	uint32_t m_frameSlots = 1;  // FrameSlots: Desc::framesInFlight times the epochs in the order
 	struct Registered {
 		std::string id;
 		ExtensionFactory factory;
@@ -244,19 +318,25 @@ private:
 	uint64_t m_ticketGeneration = 0;
 	struct Async;
 	std::unique_ptr<Async> m_async;
+	uint32_t m_backingMutationDepth = 0;  // submitting thread: open BackingMutation scopes
 	// A failed/uncertain GPU completion cannot release submitted owners during
 	// a graph rebuild. Keep them until device teardown has stopped execution.
 	std::vector<std::shared_ptr<const void>> m_uncertainExecutionOwners;
 	std::vector<std::shared_ptr<void>> m_uncertainUploadOwners;
 	uint32_t m_asyncSlot = 0;
 	std::vector<uint32_t> m_asyncEpochs;  // restarted with these after a rebuild
+	std::vector<uint32_t> m_revisionEpochs;
 	AsyncStats m_asyncStats{};
 	void StartAsync();
 	void StopAsync();
 	void PrepareTicket(Async& state, uint32_t epochIndex, int32_t requestedSlot);
+	void WaitSlot(Async& state, uint32_t slot);
+	bool AdvanceRecordingRequests(Async& state);
+	// Host thread: admits the recording of the ticket's slot as one of the revision ticket's candidates.
+	void AddRevisionCandidate(Async& state, RenderGraph::PersistentTicket& ticket, const EpochRecording& recording);
 	void SubmitTicket(Async& state, uint32_t epochIndex, std::shared_ptr<RenderGraph::PersistentTicket> ticket,
 		const FrameCallback& beforeSubmit, bool allowReprepare, FrameTicketReservation* reservation = nullptr,
-		std::shared_ptr<const void> resourceOwner = {});
+		std::shared_ptr<const void> resourceOwner = {}, std::shared_ptr<const EpochRecording> recording = {});
 };
 
 } // namespace org

@@ -870,6 +870,14 @@ public:
     explicit operator bool() const { return static_cast<bool>(m_storage); }
     bool IsConsumed() const { return m_storage && m_storage->state.load(std::memory_order_acquire) != LifecycleState::Prepared; }
     bool IsWorkerSafe() const noexcept { return m_storage && m_storage->workerSafe; }
+    // Its recording may be submitted again and again (a replayable packet, OwnedRecordingList::replayable): it has no
+    // submission, completion or abandonment callback, no external signal and no dependency lifecycle effect, so a submission
+    // has nothing to commit but the commands themselves. A replayed pass is recorded once and never transitions further;
+    // its data lives as long as the recording.
+    bool IsReplayable() const noexcept {
+        return m_storage && !m_storage->HasCallbacks() && m_storage->externalSignals.empty()
+            && (!m_storage->dependencies || !m_storage->dependencies->HasLifecycleEffects());
+    }
     void SetDebugName(std::string name) const { if (m_storage) m_storage->debugName = std::move(name); }
     std::string_view DebugName() const { return m_storage ? std::string_view{m_storage->debugName} : std::string_view{}; }
     const std::vector<ExternalTimelinePoint>& ExternalSignalsAfterCompletion() const {
@@ -931,6 +939,7 @@ private:
         virtual void CommitSubmitted(SubmissionContext) const = 0;
         virtual void CommitCompleted(CompletionContext) const {}
         virtual void Abandon(AbandonReason) const {}
+        virtual bool HasCallbacks() const noexcept { return false; }
         mutable std::atomic<LifecycleState> state{LifecycleState::Prepared};
         mutable std::shared_ptr<const PreparedDependencySnapshot> dependencies;
         std::vector<ExternalTimelinePoint> externalSignals;
@@ -944,6 +953,7 @@ private:
 		void CommitSubmitted(SubmissionContext) const override { if (submitted) submitted(*data); }
 		void CommitCompleted(CompletionContext) const override { data.reset(); }
 		void Abandon(AbandonReason) const override { data.reset(); }
+		bool HasCallbacks() const noexcept override { return submitted != nullptr; }
 		mutable std::optional<Data> data;
         void (*const record)(const Data&, RecordingContext&);
         void (*const submitted)(const Data&);
@@ -961,6 +971,11 @@ private:
         void Abandon(AbandonReason reason) const override {
 			if constexpr (requires { Derived::Abandoned(*data, reason); }) Derived::Abandoned(*data, reason);
 			data.reset();
+        }
+        bool HasCallbacks() const noexcept override {
+            return requires(const Data& value, SubmissionContext submitted) { Derived::Submitted(value, submitted); }
+                || requires(const Data& value, CompletionContext completed) { Derived::Completed(value, completed); }
+                || requires(const Data& value, AbandonReason reason) { Derived::Abandoned(value, reason); };
         }
 		mutable std::optional<Data> data;
     };

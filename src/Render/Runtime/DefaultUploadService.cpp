@@ -118,8 +118,16 @@ public:
         UploadManager::GetInstance().SetStagedUploadsRecordedDirectly(direct);
     }
 
-    size_t RecordStagedUploads(rhi::CommandList& list, uint8_t frameIndex, bool afterCopies) override {
-        return UploadManager::GetInstance().RecordStagedUploads(list, frameIndex, afterCopies);
+    size_t RecordStagedUploads(rhi::CommandList& list, uint8_t frameIndex, bool afterWork) override {
+        return UploadManager::GetInstance().RecordStagedUploads(list, frameIndex, afterWork);
+    }
+
+    bool SubmitRecordedUploads(std::shared_ptr<StagedUploadBatch> batch) override {
+        return UploadManager::GetInstance().SubmitRecordedUploads(std::move(batch));
+    }
+
+    size_t TakeRecordedUploads(std::vector<rhi::CommandList>& out, uint8_t frameIndex) override {
+        return UploadManager::GetInstance().TakeRecordedUploads(out, frameIndex);
     }
 
     void ProcessDeferredReleases(uint8_t frameIndex) override {

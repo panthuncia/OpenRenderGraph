@@ -876,69 +876,62 @@ void UploadInstance::SetStagedUploadsRecordedDirectly(bool direct) {
 	if (m_stagedDirect == direct) return;
 	m_stagedDirect = direct;
 	if (!direct) {
-		auto waiting = std::move(m_directStaged);
+		// Recorded batches came first: queued first, as staged ones.
+		auto waiting = std::move(m_directRecorded);
+		m_directRecorded.clear();
+		waiting.insert(waiting.end(), std::make_move_iterator(m_directStaged.begin()), std::make_move_iterator(m_directStaged.end()));
 		m_directStaged.clear();
 		for (auto& batch : waiting) SubmitStagedUploads(std::move(batch));
 	}
 }
 
-size_t UploadInstance::RecordStagedUploads(rhi::CommandList& list, uint8_t frameIndex, bool afterCopies) {
+bool UploadInstance::SubmitRecordedUploads(std::shared_ptr<org::runtime::StagedUploadBatch> batch, bool a_nothingQueued) {
+	NoteOffOwnerCall("SubmitRecordedUploads");
+	// Its copies go to the GPU ahead of everything the owner records itself, so it is taken only when that is its place
+	// in submission order: nothing staged, queued or posted before it is still waiting.
+	if (!batch || !m_stagedDirect || !batch->Recorded() || batch->RecordedSerial() != BufferBase::BackingReleaseSerial() ||
+		!a_nothingQueued || !m_directStaged.empty() || HasPendingWork())
+		return false;
+	m_currentFrameUploadBytes += batch->Bytes();
+	m_directRecorded.push_back(std::move(batch));
+	basic_telemetry::AddCounter("ORG.Upload.FrameInstance.RecordedBatches");
+	return true;
+}
+
+size_t UploadInstance::TakeRecordedUploads(std::vector<rhi::CommandList>& out, uint8_t frameIndex) {
+	NoteOffOwnerCall("TakeRecordedUploads");
+	if (m_directRecorded.empty()) return 0;
+	// A backing released since a batch was recorded: its copies name the old one. The owner records them instead, first.
+	if (std::ranges::any_of(m_directRecorded, [](const auto& batch) { return batch->RecordedSerial() != BufferBase::BackingReleaseSerial(); })) {
+		m_directStaged.insert(m_directStaged.begin(), std::make_move_iterator(m_directRecorded.begin()), std::make_move_iterator(m_directRecorded.end()));
+		m_directRecorded.clear();
+		basic_telemetry::AddCounter("ORG.Upload.FrameInstance.RecordedBatchesRerecorded");
+		return 0;
+	}
+	for (const auto& batch : m_directRecorded) out.push_back(batch->RecordedList());
+	const size_t taken = m_directRecorded.size();
+	if (m_numFramesInFlight != 0) {
+		auto& retained = m_frameStaged[frameIndex % m_numFramesInFlight];
+		retained.insert(retained.end(), std::make_move_iterator(m_directRecorded.begin()), std::make_move_iterator(m_directRecorded.end()));
+	}
+	m_directRecorded.clear();
+	return taken;
+}
+
+size_t UploadInstance::RecordStagedUploads(rhi::CommandList& list, uint8_t frameIndex, bool afterWork) {
 	BT_ZONE_SCOPE("ORG.Upload.RecordStagedUploads");
-	uint64_t bytes = 0;
 	NoteOffOwnerCall("RecordStagedUploads");
-	size_t copies = 0;
-	// Copies in one list are unordered without a barrier, and batches can overlap (a producer's batch whose
-	// submission never went out, then its replacement): the later write has to win. One barrier per overlap,
-	// none in steady state.
-	auto ordered = [&list] {
+	uint64_t bytes = 0;
+	for (const auto& batch : m_directStaged) bytes += batch->Bytes();
+	// After the work before them (the list's own copies, the previous execution), the batches' first copy waits for it:
+	// one barrier, and none without a batch.
+	if (afterWork && !m_directStaged.empty()) {
 		const auto full = rhi::FullMemoryBarrier();
 		rhi::BarrierBatch barriers{};
 		barriers.globals = {&full, 1u};
 		list.Barriers(barriers);
-	};
-	if (afterCopies && !m_directStaged.empty()) ordered();
-	struct Written {
-		rhi::ResourceHandle target;
-		uint64_t begin = 0, end = 0;
-	};
-	// Index by backing, as in the scoped branch, without changing this host's barriers.
-	std::unordered_map<uint64_t, std::vector<Written>> written;
-	written.reserve(32);
-	{
-		BT_ZONE_SCOPE("ORG.Upload.RecordStagedUploads.Copies");
-		for (const auto& batch : m_directStaged) {
-			for (const auto& entry : batch->Entries()) {
-				if (entry.target.kind != UploadTarget::Kind::PinnedShared || !entry.target.pinned || !entry.page)
-					throw std::logic_error("Direct staged uploads need pointer targets");
-				const auto target = entry.target.pinned->GetAPIResource().GetHandle();
-				const uint64_t begin = entry.dstOffset, end = entry.dstOffset + entry.size;
-				const uint64_t key = (uint64_t{target.generation} << 32) | target.index;
-				auto [writtenIt, inserted] = written.try_emplace(key);
-				if (inserted)
-					writtenIt->second.reserve(128);
-				const bool overlaps = std::ranges::any_of(writtenIt->second, [&](const Written& w) {
-					return w.target.index == target.index && w.target.generation == target.generation && begin < w.end && w.begin < end;
-				});
-				if (overlaps) {
-					ordered();
-					written.clear();
-					auto& fresh = written.try_emplace(key).first->second;
-					fresh.reserve(128);
-					fresh.push_back({target, begin, end});
-				} else {
-					writtenIt->second.push_back({target, begin, end});
-				}
-				// A copy past the target's current backing is the producer's defect (staged against another size): the RHI
-				// rejects it and the submission fails, so name it here, where the target's name is known.
-				if (const auto* buffer = dynamic_cast<const Buffer*>(entry.target.pinned.get()); buffer && end > buffer->GetSize())
-					spdlog::error("UploadInstance '{}': staged upload of {} bytes at {} into '{}' is past its {} bytes", m_debugName, entry.size,
-						entry.dstOffset, buffer->GetName(), buffer->GetSize());
-				list.CopyBufferRegion(target, entry.dstOffset, entry.page->GetAPIResource().GetHandle(), entry.pageOffset, entry.size);
-				++copies;
-				bytes += entry.size;
-			}
-		}
 	}
+	const size_t copies = org::runtime::StagedUploadBatch::RecordCopies(list, m_directStaged, m_debugName);
 	{
 		BT_ZONE_SCOPE("ORG.Upload.RecordStagedUploads.Retain");
 		if (!m_directStaged.empty() && m_numFramesInFlight != 0) {

@@ -332,6 +332,9 @@ public:
     virtual SubmissionReceipt Submit(const ExecutionBatchTimeline&) const noexcept = 0;
     virtual void Complete(uint64_t submission) const noexcept = 0;
     virtual void Abandon() const noexcept = 0;
+    // Submittable again once the previous submission has completed (PreparedRhiExecutionBatch's replayable packets): a
+    // submission commits nothing but its commands, and completion releases nothing; the owner's last reference does.
+    virtual bool Replayable() const noexcept { return false; }
 };
 class ExecutionTimelineAdmission {
 public:
