@@ -186,6 +186,21 @@ a scene revision recorded by a dependency graph (CS's DCLF: the scene revision, 
         unsubmitted ticket holds is recorded too, since that ticket holds its admission alone.
     -   `done(EpochRecording, error)` runs on the host's thread once every slot is recorded. A recording that is not
         replayable is an error.
+    -   A live (not revision-driven) async epoch takes requests too: recorded the same way, never admitted. This is what a
+        revision would submit, recorded before the epoch switches to revision-driven submission. A slot its live ticket holds
+        is recorded once that ticket is submitted, and a slot with work in flight once that work completes (the loop wakes on
+        completions), so the request never waits on the GPU.
+    -   The host's thread prepares the frames' tickets before it advances requests, so recording ahead never delays a
+        submission.
+    -   A live epoch's tickets admit the recordings still held as candidates beside their own preparation. Inside
+        `SubmitEpoch`'s `beforeSubmit`, the submitting thread may choose one (`UseEpochRecording`). The bind then displaces
+        the ticket's own segment, whose admission completion abandons, and the stale check does not apply. A chosen
+        recording the ticket did not admit makes the call throw. This lets a scene take a revision's recordings frame by
+        frame, wherever its revision covers the frame, before its epochs become revision-driven.
+-   **Resolver group members are owned by their slots.** A slot entry bound to a group member holds the member until the
+    slot is rebound. Every preparation polls every slot's backing, including slots another epoch's preparation bound. A
+    versioned buffer whose old version nothing else held (several growths in a row) would otherwise leave a slot naming a
+    freed resource.
 -   **Immutable inputs.** A recording for a revision resolves the graph's resolvers through it: `PreparePersistentTicket`
     passes its host data as the resolver capture context (`ResolverCaptureContext` of `IHostExecutionData`). The recording's
     publication and bindings are the revision's own, and its frozen bindings hold the backings and descriptors it was

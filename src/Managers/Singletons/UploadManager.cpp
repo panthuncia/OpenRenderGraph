@@ -56,7 +56,15 @@ void UploadManager::Initialize() {
 	}
 	if (!m_copyQueueUploads->Initialized()) {
 		auto& deviceManager = DeviceManager::GetInstance();
-		m_copyQueueUploads->Initialize(deviceManager.GetDevice(), deviceManager.GetCopyQueue());
+		auto device = deviceManager.GetDevice();
+		// The dedicated uploader of graph work: a queue of its own when the device has one to give (a distinct copy queue, or an
+		// adopted device's spare queue), so its copies never wait behind the graph's, nor the graph's behind them.
+		if (!m_uploadQueue) {
+			rhi::Queue queue;
+			if (device.CreateQueue(rhi::QueueKind::Copy, "ORG Upload Queue", queue) == rhi::Result::Ok && queue)
+				m_uploadQueue = queue;
+		}
+		m_copyQueueUploads->Initialize(device, m_uploadQueue ? m_uploadQueue : deviceManager.GetCopyQueue());
 		if (!m_copyQueueUploads->Initialized()) {
 			throw std::runtime_error("UploadManager failed to initialize the copy-queue upload service");
 		}
@@ -409,6 +417,11 @@ void UploadManager::Cleanup() {
 	if (m_copyQueueUploads) {
 		m_copyQueueUploads->Cleanup();
 		m_copyQueueUploads.reset();
+	}
+	if (m_uploadQueue) {
+		if (auto device = DeviceManager::GetInstance().GetDevice())
+			device.DestroyQueue(m_uploadQueue.GetQueueHandle());
+		m_uploadQueue = {};
 	}
 
 	if (m_uploadInstance) {

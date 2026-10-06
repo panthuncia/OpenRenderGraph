@@ -36,8 +36,13 @@ struct IResourceVersions {
 // recording (its bindings hold the backing) or a frame holds it, so the work recorded for an older revision runs unchanged while
 // a newer one is recorded: no backing mutation, no wait.
 //
-// Thread contract: Publish, Make*, Adopt and Grow* on the owner thread; Current, Key and the resolver calls on any thread (the current version
-// is an atomic shared_ptr, read whole).
+// Growth as graph work (the SARP/BasicRenderer model): a producer on any thread makes the next version (Make*, which materializes
+// it), fills it through the dedicated uploader (IUploadService::QueueTrackedStreamingUploadSegments, a WorkerOwnedDestination of
+// ownership PendingVersion: no queue uses a version before it is adopted), and the version is ready once those copies complete;
+// the owner adopts it when the revision that names it is selected.
+//
+// Thread contract: Make* on any thread; Publish, Adopt and Grow* on the owner thread; Current, Key and the resolver calls on any
+// thread (the current version is an atomic shared_ptr, read whole).
 class VersionedBuffer final : public ClonableResolver<VersionedBuffer> {
 public:
     static std::shared_ptr<VersionedBuffer> Create(std::shared_ptr<Buffer> first) {
@@ -64,12 +69,12 @@ public:
         Adopt(version);
         return version;
     }
-    // Owner thread: the next version of `next`, numbered but not current (pending): a revision can name it, and its owner makes
+    // Any thread: the next version of `next`, numbered but not current (pending): a revision can name it, and its owner makes
     // it current (Adopt) when that revision is selected. Until then the current version is what writes and live preparations use.
     std::shared_ptr<const BufferVersion> Make(std::shared_ptr<Buffer> next) {
         if (!next) throw std::invalid_argument("VersionedBuffer: a version needs a buffer");
         auto version = std::make_shared<BufferVersion>();
-        version->number = ++m_state->published;
+        version->number = m_state->published.fetch_add(1, std::memory_order_relaxed) + 1;
         auto declaration = std::make_shared<ResolverDeclarationState>();
         declaration->tracked = true;
         declaration->dependencyIdentity = m_state;
@@ -85,16 +90,19 @@ public:
             throw std::invalid_argument("VersionedBuffer: adopting another buffer's version");
         m_state->current.store(version, std::memory_order_release);
     }
-    // Owner thread: the next version, like the current one at another size (a structured buffer's elements, or a raw buffer's
-    // bytes), materialized; pending (MakeStructured, MakeBytes) or current (Grow*). It holds nothing: its owner writes it whole
-    // (the old version is untouched).
+    // The next version, like the current one at another size (a structured buffer's elements, or a raw buffer's bytes),
+    // materialized; pending (MakeStructured, MakeBytes: any thread) or current (Grow*: the owner's). It holds nothing: its maker
+    // fills it (the old version is untouched). Made without an ECS entity, as a pooled backing is (Resource::
+    // ScopedECSRegistrationSuppression): a producer's thread may not touch the host's world.
     std::shared_ptr<const BufferVersion> MakeStructured(uint32_t elements) {
+        Resource::ScopedECSRegistrationSuppression suppressECS;
         auto next = Get()->UnmaterializedLike();
         next->ResizeStructured(elements);
         next->Materialize();
         return Make(std::move(next));
     }
     std::shared_ptr<const BufferVersion> MakeBytes(uint64_t bytes) {
+        Resource::ScopedECSRegistrationSuppression suppressECS;
         auto next = Get()->UnmaterializedLike();
         next->ResizeBytes(bytes);
         next->Materialize();
@@ -128,7 +136,7 @@ private:
     VersionedBuffer() : m_state(std::make_shared<State>()) {}
     struct State {
         std::atomic<std::shared_ptr<const BufferVersion>> current;
-        uint64_t published = 0;  // owner thread
+        std::atomic<uint64_t> published{ 0 };  // the last version's number (Make, any thread)
     };
     std::shared_ptr<State> m_state;
 };

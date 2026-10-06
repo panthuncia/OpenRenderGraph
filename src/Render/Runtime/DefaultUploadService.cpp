@@ -149,6 +149,10 @@ public:
             segments, totalSize, std::move(destination), dstOffset);
     }
 
+    bool HasDedicatedStreamingQueue() const override {
+        return UploadManager::GetInstance().HasDedicatedStreamingQueue();
+    }
+
     void Cleanup() override {
         UploadManager::GetInstance().Cleanup();
     }

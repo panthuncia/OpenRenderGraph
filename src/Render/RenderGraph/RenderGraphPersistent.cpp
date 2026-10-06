@@ -232,8 +232,9 @@ struct RenderGraph::PersistentTicket {
 	std::vector<std::pair<const RenderGraphPass*, uint64_t>> revisions;
 	bool uncheckable = false;  // a pass that cannot report its revision: never current
 	uint64_t hostTag = 0;      // the host's, for its own currency checks (PersistentGraphHost: the backing version)
-	// A revision ticket (PrepareRevisionTicket): its candidates, pushed by the owner thread (newest first) and read by the bind on
-	// the submitting thread; the one the bind took. Completion abandons every other candidate's admission.
+	// A revision ticket (PrepareRevisionTicket), or a live one with alternatives to its own segment: its candidates, pushed by the
+	// owner thread (newest first) and read by the bind on the submitting thread; the one the bind took. Completion abandons every
+	// other candidate's admission, and a live ticket's own segment when a candidate displaced it.
 	struct Candidate {
 		Segment segment;
 		Candidate* next = nullptr;
@@ -241,6 +242,7 @@ struct RenderGraph::PersistentTicket {
 	bool revision = false;
 	std::atomic<Candidate*> candidates{nullptr};
 	const Candidate* chosen = nullptr;
+	std::vector<Segment> displaced;  // a live ticket's own segment, which a bound candidate replaced
 	PersistentTicket() = default;
 	PersistentTicket(const PersistentTicket&) = delete;
 	PersistentTicket& operator=(const PersistentTicket&) = delete;
@@ -254,6 +256,9 @@ struct RenderGraph::PersistentExecutionState {
 	struct SlotEntry {
 		persistent::ResourceSlotId slot;
 		Resource* resource = nullptr;      // Registry object (wrapper for dynamic resources).
+		// A resolver group member's own reference: the resolver may drop the member (a versioned buffer's old version) while the
+		// slot still names it, and every preparation polls the slots' backings (PollBackings). Released when the slot is rebound.
+		std::shared_ptr<Resource> member;
 		uint64_t resourceID = 0;           // Scheduling identity.
 		CompileResourceShape shape;
 		RotationKey bound;                 // Rotation state of the currently bound backing.
@@ -524,7 +529,7 @@ struct LoweredUse {
 struct LoweredGroup {
 	std::shared_ptr<const void> key;
 	std::unique_ptr<IResourceResolver> resolver;
-	std::vector<std::pair<uint64_t, Resource*>> members;
+	std::vector<std::pair<uint64_t, std::shared_ptr<Resource>>> members;
 	std::vector<std::pair<CompileRange, CompileResourceState>> templates;
 	CompileResourceShape shape;
 	ResolverResourceSetIdentity identity{};
@@ -679,7 +684,7 @@ static LoweredPass LowerLegacyPass(RenderGraph& graph, ResourceRegistry& registr
 				const auto memberShape = ShapeOf(*member);
 				if (!shape) shape = memberShape;
 				else if (*shape != memberShape) group.uniform = false;
-				group.members.emplace_back(member->GetSchedulingResourceID(), member.get());
+				group.members.emplace_back(member->GetSchedulingResourceID(), member);
 			}
 			group.shape = shape.value_or(CompileResourceShape{1, 1, false});
 			for (const auto& request : snapshot.requirementTemplates) {
@@ -693,7 +698,7 @@ static LoweredPass LowerLegacyPass(RenderGraph& graph, ResourceRegistry& registr
 				for (const auto& request : snapshot.requirementTemplates) {
 					const auto memberShape = ShapeOf(*member);
 					const auto range = LowerRange(request.range, memberShape);
-					if (range) result.entries.push_back({id, member, *range, LowerState(request.state)});
+					if (range) result.entries.push_back({id, member.get(), *range, LowerState(request.state)});
 				}
 		}
 	} else {
@@ -920,9 +925,11 @@ static void InstallMainPass(RenderGraph& graph, State& state, persistent::GraphE
 			for (uint32_t i = static_cast<uint32_t>(group.memberEntries.size()); i-- > loweredGroup.members.size();)
 				group.freeMembers.push_back(i);
 			for (size_t i = 0; i < loweredGroup.members.size(); ++i) {
-				const auto [id, resource] = loweredGroup.members[i];
+				const auto& [id, member] = loweredGroup.members[i];
+				Resource* const resource = member.get();
 				auto& entry = state.entries[group.memberEntries[i]];
 				entry.resource = resource;
+				entry.member = member;
 				entry.resourceID = id;
 				state.entriesByResourceID[id].push_back(group.memberEntries[i]);
 				group.memberResourceIDs[i] = id;
@@ -1310,14 +1317,14 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 			BT_ZONE_SCOPE("ORG.Persistent.PollGroups.Diff");
 			if (!group.subscribers.empty()) { const auto& n = state.mainPasses[group.subscribers.front()].name; BT_ZONE_TEXT(n.data(), n.size()); }
 			size_t added = 0, removed = 0;
-			std::vector<std::pair<uint64_t, Resource*>> members;
+			std::vector<std::pair<uint64_t, std::shared_ptr<Resource>>> members;
 			bool uniform = true;
 			if (captured->resources) for (const auto& member : *captured->resources) {
 				if (!member) continue;
 				const auto id = member->GetSchedulingResourceID();
 				// Shapes of already-bound members were checked when they joined.
 				if (!group.memberIndexByID.contains(id) && ShapeOf(*member) != group.shape) uniform = false;
-				members.emplace_back(id, member.get());
+				members.emplace_back(id, member);
 			}
 			if (!uniform) {
 				// Shape contract broken: subscribers re-lower (direct declarations).
@@ -1334,7 +1341,7 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 			// Diff against the bound set: O(members) with the per-group index.
 			std::unordered_set<uint64_t> wanted;
 			wanted.reserve(members.size());
-			for (const auto& [id, resource] : members) wanted.insert(id);
+			for (const auto& [id, member] : members) wanted.insert(id);
 			// Members that left: their positions stay bound for now so that a
 			// member arriving in the same poll (a rotated publication of the same
 			// logical resource) replaces the binding in place. Positions are
@@ -1353,8 +1360,9 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 			}
 			std::sort(vacated.begin(), vacated.end(), std::greater<>());
 			std::sort(group.freeMembers.begin(), group.freeMembers.end(), std::greater<>());
-			for (const auto& [id, resource] : members) {
+			for (const auto& [id, member] : members) {
 				if (group.memberIndexByID.contains(id)) continue;
+				Resource* const resource = member.get();
 				uint32_t i;
 				if (!vacated.empty()) { i = vacated.back(); vacated.pop_back(); }
 				else if (!group.freeMembers.empty()) { i = group.freeMembers.back(); group.freeMembers.pop_back(); }
@@ -1363,7 +1371,7 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 				const bool replacing = entry.isBound;
 				const std::array<uint64_t, 3> previousIDs = replacing && entry.resource
 					? std::array<uint64_t, 3>{entry.resourceID, entry.resource->GetGlobalResourceID(), entry.bound.concreteID} : std::array<uint64_t, 3>{};
-				entry.resource = resource; entry.resourceID = id;
+				entry.resource = resource; entry.resourceID = id; entry.member = member;
 				state.entriesByResourceID[id].push_back(group.memberEntries[i]);
 				group.memberResourceIDs[i] = id;
 				group.memberIndexByID.emplace(id, i);
@@ -1376,7 +1384,7 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 			for (const auto i : vacated) {
 				auto& entry = state.entries[group.memberEntries[i]];
 				if (entry.isBound) { UnbindSlot(state, transaction, entry); QueueSlotPatch(state, entry, entry.bound.concreteID, false); ++removed; }
-				entry.isBound = false; entry.bound = {}; entry.resource = nullptr; entry.resourceID = 0;
+				entry.isBound = false; entry.bound = {}; entry.resource = nullptr; entry.resourceID = 0; entry.member.reset();
 				group.freeMembers.push_back(i);
 			}
 			group.identity = captured->resourceSetIdentity;
@@ -1803,7 +1811,7 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 							for (auto& group : lowered.groups)
 								for (const auto& [id, resource] : group.members)
 									for (const auto& [range, stateValue] : group.templates)
-										lowered.entries.push_back({id, resource, range, stateValue});
+										lowered.entries.push_back({id, resource.get(), range, stateValue});
 							lowered.groups.clear();
 							lowered.declaration.forceBatchIsolation = true;
 						}
@@ -2478,7 +2486,7 @@ void RenderGraph::SubmitPersistentStructuralBuild(const std::vector<uint32_t>& s
 				auto lowered = std::move(lowerings.at(mainIndex));
 				std::vector<Resource*> resources;
 				for (const auto& use : lowered.entries) resources.push_back(use.resource);
-				for (const auto& group : lowered.groups) for (const auto& [id, resource] : group.members) resources.push_back(resource);
+				for (const auto& group : lowered.groups) for (const auto& [id, resource] : group.members) resources.push_back(resource.get());
 				MaterializePersistentStandalone(resources, true);
 				InstallMainPass(*this, state, transaction, main, std::move(lowered), mainIndex, true);
 				basic_telemetry::AddCounter("ORG.Persistent.StructuralPassRelowerings");
@@ -2746,7 +2754,7 @@ std::vector<RenderGraph::ExternalPassDesc> RenderGraph::UpdatePersistentFrameInt
 				auto lowered = LowerLegacyPass(*this, _registry, m_queueRegistry, primaryBackend, value, any.type, mainIndex);
 				std::vector<Resource*> resources;
 				for (const auto& use : lowered.entries) resources.push_back(use.resource);
-				for (const auto& group : lowered.groups) for (const auto& [id, resource] : group.members) resources.push_back(resource);
+				for (const auto& group : lowered.groups) for (const auto& [id, resource] : group.members) resources.push_back(resource.get());
 				MaterializePersistentStandalone(resources, true);
 				InstallMainPass(*this, state, edit, main, std::move(lowered), mainIndex, false, order);
 			}
@@ -3526,7 +3534,6 @@ std::shared_ptr<RenderGraph::PersistentTicket> RenderGraph::PrepareRevisionTicke
 
 void RenderGraph::AddPersistentTicketCandidate(PersistentTicket& ticket, std::shared_ptr<const PersistentRecording> recording) {
 	BT_ZONE_SCOPE("ORG.Persistent.AddTicketCandidate");
-	if (!ticket.revision) throw std::logic_error("Candidates are a revision ticket's");
 	if (!recording || !recording->replayable || !recording->publication)
 		throw std::logic_error("A revision ticket's candidate must be a replayable recording");
 	for (const auto* candidate = ticket.candidates.load(std::memory_order_relaxed); candidate; candidate = candidate->next)
@@ -3579,6 +3586,10 @@ std::vector<std::pair<uint32_t, uint64_t>> RenderGraph::CompletePersistentTicket
 	}
 	for (auto* candidate = ticket.candidates.load(std::memory_order_acquire); candidate; candidate = candidate->next)
 		if (candidate != ticket.chosen) state.admission->Abandon(candidate->segment.admission);
+	for (auto& segment : ticket.displaced) state.admission->Abandon(segment.admission);
+	for (auto& segment : ticket.displaced)
+		if (segment.recording) ticket.replaced.push_back(std::move(segment.recording));
+	ticket.displaced.clear();
 	// Abandoned packets are destroyed here, never submitted: their lifecycle effects abandon and their
 	// command lists return to the pool. A kept recording stays with its set.
 	ticket.segments.clear();
@@ -3650,6 +3661,18 @@ bool RenderGraph::BindPersistentTicketRecording(PersistentTicket& ticket, std::s
 			return true;
 		}
 		return fail("the ticket admitted no candidate for this recording (made after the ticket, and not added to it)");
+	}
+	// A live ticket's candidate (a revision's recording admitted beside the ticket's own): it displaces the ticket's segment.
+	for (const auto* candidate = ticket.candidates.load(std::memory_order_acquire); candidate; candidate = candidate->next) {
+		if (candidate->segment.recording != recording) continue;
+		if (ticket.chosen) return fail("the ticket already took a candidate");
+		recording->lastUse.store(ticket.hostFrame, std::memory_order_relaxed);
+		for (auto& segment : ticket.segments) ticket.displaced.push_back(std::move(segment));
+		ticket.segments.clear();
+		ticket.segments.push_back(candidate->segment);
+		ticket.chosen = candidate;
+		ticket.revisions = recording->revisions;
+		return true;
 	}
 	if (ticket.segments.size() != 1) return fail("the ticket has no single segment");
 	auto& segment = ticket.segments.front();

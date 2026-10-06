@@ -91,13 +91,14 @@ struct StreamingUploadDescriptor {
 // Worker-side upload destination. The producer attests that, for the whole
 // write window, no queue can access any byte of the resource: it is either a
 // pooled versioned backing leased from VersionedGpuBufferBackingPool::Acquire
-// (pool-only owned or retired past the frame ring) or a texture that no queue
-// has used yet. Live, published resources never go through this path; they are
+// (pool-only owned or retired past the frame ring), a texture that no queue
+// has used yet, or a VersionedBuffer version not yet adopted (no queue uses a
+// version before its owner adopts it, after these copies complete). Live, published resources never go through this path; they are
 // written by the render thread's frame upload instance, ordered by the graph.
 // The resource must be created with rhi::QueueSharing::Concurrent so the copy
 // queue write needs no queue-family ownership transfer on any backend.
 struct WorkerOwnedDestination {
-    enum class Ownership : uint8_t { PooledBackingLease, FreshTexture };
+    enum class Ownership : uint8_t { PooledBackingLease, FreshTexture, PendingVersion };
     std::shared_ptr<Resource> resource;
     Ownership ownership = Ownership::PooledBackingLease;
 };

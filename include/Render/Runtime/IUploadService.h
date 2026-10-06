@@ -158,6 +158,9 @@ public:
     virtual std::shared_ptr<TrackedUploadTicket> QueueTrackedStreamingUploadSegments(
         std::span<const StreamingUploadSegment> segments, size_t totalSize,
         WorkerOwnedDestination destination, size_t dstOffset = 0) = 0;
+    // Whether that path has a queue of its own (the dedicated uploader of graph work). Without one its copies go to the graph's
+    // copy queue, which a host may alias to its graphics queue: a producer that relies on running beside the frame checks this.
+    virtual bool HasDedicatedStreamingQueue() const { return false; }
 
     virtual void Cleanup() = 0;
 };

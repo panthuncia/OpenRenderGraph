@@ -129,7 +129,10 @@ public:
 	// Any thread, lock-free: records the revision-driven epoch for hostData (what its passes prepare for: the revision) on the
 	// host's thread, into every slot of its ring once the slot's last work is done (the host's thread waits for that, never the
 	// caller; a slot the epoch's admission-only ticket holds is recorded too). done runs on the host's thread once every slot is recorded, or with the error
-	// that stopped it. False when async epochs are not running or the epoch is not revision-driven.
+	// that stopped it. False when async epochs are not running or the epoch is not an async one. A live (not revision-driven) async
+	// epoch's is made the same way (a slot its live ticket holds once that ticket is submitted, a slot with work in flight once it
+	// completes) and admitted beside its tickets' own preparations, while held: the submitting thread may submit it instead
+	// (UseEpochRecording).
 	bool RequestEpochRecording(uint32_t epoch, std::shared_ptr<const IHostExecutionData> hostData, EpochRecordingCallback done);
 	// Submits the epoch at the current point of the host's queue stream. Waits for its ticket if the host's
 	// thread has not finished it; runs beforeSubmit with the graph's services active and CurrentFrameSlot()
@@ -143,6 +146,10 @@ public:
 	// match the ticket's publication, bindings and backing version, or this throws (it is never prepared again).
 	void SubmitEpoch(uint32_t epoch, const FrameCallback& beforeSubmit = {}, std::shared_ptr<const void> resourceOwner = {},
 		std::shared_ptr<const EpochRecording> recording = {});
+	// Submitting thread, inside SubmitEpoch's beforeSubmit for a live async epoch: submit this revision recording (one of the
+	// ticket's candidates: RequestEpochRecording) instead of the ticket's own preparation, which is abandoned. Its stale check does
+	// not apply: the recording is what the caller's revision drew. A recording the ticket did not admit makes SubmitEpoch throw.
+	void UseEpochRecording(std::shared_ptr<const EpochRecording> recording) noexcept { m_chosenRecording = std::move(recording); }
 	// A render-thread snapshot of complete, current tickets for all required
 	// epochs. The async worker never removes ticket cells; only this render
 	// thread can consume them. It also retains one control-mailbox credit per
@@ -254,6 +261,8 @@ public:
 	/** @brief The device-generation cleanup lane used for immutable binding roots. */
 	std::shared_ptr<runtime::ResourceCleanupQueue> ResourceCleanup() const;
 	runtime::IUploadService* Uploads() noexcept;
+	// The same, kept alive by the caller: a producer on another thread (growth as graph work, its worker upload path).
+	std::shared_ptr<runtime::IUploadService> RetainUploads() noexcept;
 	uint64_t FramesExecuted() const noexcept { return m_frameNumber; }
 	// The frame slot of the execution ExecuteFrame is running (valid from its beforePrepare callback until
 	// it returns): the region of a LatchBlock the host may write for it. Also RecordingContext::FrameSlot.
@@ -326,6 +335,7 @@ private:
 	uint32_t m_asyncSlot = 0;
 	std::vector<uint32_t> m_asyncEpochs;  // restarted with these after a rebuild
 	std::vector<uint32_t> m_revisionEpochs;
+	std::shared_ptr<const EpochRecording> m_chosenRecording;  // submitting thread: UseEpochRecording's, until SubmitEpoch takes it
 	AsyncStats m_asyncStats{};
 	void StartAsync();
 	void StopAsync();

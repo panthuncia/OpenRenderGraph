@@ -106,6 +106,8 @@ public:
 		std::span<const StreamingUploadSegment> segments, size_t totalSize,
 		WorkerOwnedDestination destination, size_t dstOffset = 0);
 	org::runtime::CopyQueueUploadService* CopyQueueUploads() { return m_copyQueueUploads.get(); }
+	// Whether the worker upload path has a queue of its own (not the graph's copy queue, which may alias the graphics one).
+	bool HasDedicatedStreamingQueue() const { return static_cast<bool>(m_uploadQueue); }
 
 	void Cleanup();
 private:
@@ -173,6 +175,9 @@ private:
 
 	// ── Worker upload path ──────────────────────────────────────────────
 	std::unique_ptr<org::runtime::CopyQueueUploadService> m_copyQueueUploads;
+	// The copy-queue uploader's own queue (Device::CreateQueue: a distinct queue, or an adopted device's spare one), destroyed
+	// with it; null when it shares the primary copy queue.
+	rhi::Queue m_uploadQueue{};
 
 };
 

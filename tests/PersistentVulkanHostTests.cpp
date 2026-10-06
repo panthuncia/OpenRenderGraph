@@ -58,6 +58,7 @@ struct HostDevice {
 	VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
 	VkDevice device = VK_NULL_HANDLE;
 	VkQueue queue = VK_NULL_HANDLE;
+	VkQueue spare = VK_NULL_HANDLE;  // a second queue of the family, when it has one: offered to BasicRHI as a spare queue
 	uint32_t family = 0;
 	std::vector<const char*> extensions;
 	VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
@@ -138,11 +139,11 @@ int CreateHostDevice(HostDevice& host) {
 	host.features.pNext = &host.vulkan12;
 	host.vulkan12.pNext = &host.vulkan13;
 	host.vulkan13.pNext = &host.descriptorHeap;
-	const float priority = 1.0f;
+	const float priorities[2] = {1.0f, 1.0f};
 	VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
 	qci.queueFamilyIndex = host.family;
-	qci.queueCount = 1;
-	qci.pQueuePriorities = &priority;
+	qci.queueCount = host.family < familyCount && families[host.family].queueCount > 1 ? 2u : 1u;
+	qci.pQueuePriorities = priorities;
 	VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
 	dci.pNext = &host.features;
 	dci.queueCreateInfoCount = 1;
@@ -152,6 +153,8 @@ int CreateHostDevice(HostDevice& host) {
 	if (vkCreateDevice(host.physicalDevice, &dci, nullptr, &host.device) != VK_SUCCESS) return 1;
 	volkLoadDevice(host.device);
 	vkGetDeviceQueue(host.device, host.family, 0, &host.queue);
+	if (qci.queueCount > 1)
+		vkGetDeviceQueue(host.device, host.family, 1, &host.spare);
 	return 0;
 }
 
@@ -391,6 +394,12 @@ int main(int argc, char** argv) {
 		info.enabledDeviceExtensionCount = static_cast<uint32_t>(host.extensions.size());
 		info.enabledFeatureChain = &host.features;
 		info.queues[0] = {host.queue, host.family, 0};
+		const bool spareQueue = host.spare != VK_NULL_HANDLE;
+		const rhi::vulkan::AdoptedQueue spare{host.spare, host.family, 1};
+		if (host.spare) {
+			info.spareQueues = &spare;
+			info.spareQueueCount = 1;
+		}
 		info.submissionHooks = {&counters, &Lock, &Unlock};
 		rhi::DevicePtr device;
 		REQUIRE(rhi::vulkan::AdoptVulkanDevice(info, device) == rhi::Result::Ok, "AdoptVulkanDevice");
@@ -528,6 +537,91 @@ int main(int argc, char** argv) {
 				REQUIRE(stats.revisionSubmissions == 12 && stats.stale == 0 && stats.revisionRecordings == 2 && stats.revisionSlotsRecorded == 6,
 					"every submission bound a revision's recording; nothing prepared again");
 				REQUIRE(!counters.unbalanced && counters.locks.load() == counters.unlocks.load(), "balanced host queue locks");
+				// Growth as graph work: a version made on a producer's thread and filled through the dedicated uploader (the worker
+				// upload path, on the queue the device offered spare when it has one), ready once its copy completes; no queue uses it
+				// before then, and its owner adopts it after.
+				{
+					auto readable = org::Buffer::CreateShared(rhi::HeapType::Readback, kBytes);
+					auto growing = org::VersionedBuffer::Create(readable);
+					std::vector<uint32_t> contents(kCount * 2);
+					for (uint32_t i = 0; i < contents.size(); ++i)
+						contents[i] = 0xC0DE0000u + i;
+					auto uploads = host.RetainUploads();
+					REQUIRE(uploads, "the host's upload service");
+					std::shared_ptr<const org::BufferVersion> made;
+					std::shared_ptr<org::TrackedUploadTicket> ticket;
+					std::thread producer([&] {
+						made = growing->MakeBytes(kBytes * 2);
+						const org::StreamingUploadSegment segment{contents.data(), contents.size() * sizeof(uint32_t)};
+						ticket = uploads->QueueTrackedStreamingUploadSegments({&segment, 1}, segment.size,
+							org::WorkerOwnedDestination{made->buffer, org::WorkerOwnedDestination::Ownership::PendingVersion}, 0);
+					});
+					producer.join();
+					REQUIRE(made && ticket && growing->Get() == readable, "a pending version, made on a producer's thread");
+					const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+					while (!ticket->Complete() && std::chrono::steady_clock::now() < deadline)
+						std::this_thread::yield();
+					REQUIRE(ticket->Complete(), "its fill completes on the uploader's queue");
+					void* mapped = nullptr;
+					auto resource = made->buffer->GetAPIResource();
+					resource.Map(&mapped, 0, contents.size() * sizeof(uint32_t));
+					const bool filled = mapped && std::memcmp(mapped, contents.data(), contents.size() * sizeof(uint32_t)) == 0;
+					resource.Unmap(0, 0);
+					REQUIRE(filled, "the new version holds its contents");
+					growing->Adopt(made);
+					REQUIRE(growing->Get() == made->buffer, "adopted by its owner");
+					std::printf("growth as graph work: %s uploader queue\n", uploads->HasDedicatedStreamingQueue() ? "a dedicated" : "the shared");
+					REQUIRE(!spareQueue || uploads->HasDedicatedStreamingQueue(), "the spare queue is the uploader's");
+				}
+				// A live epoch recorded for a revision ahead of the switch to revision-driven submission: recorded only, never admitted.
+				// The slot its live ticket holds is recorded once that ticket is submitted, and one with work in flight once that completes.
+				host.SetAsyncEpochs({0});
+				{
+					// The restarted host's first ticket (the first submission waits for it).
+					value = 69990u;
+					host.SubmitEpoch(0, upload);
+					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "the live epoch after the switch");
+					(void)host.TakeAsyncStats();
+					auto data = std::make_shared<TestRevision>();
+					data->count = kCount;
+					data->versioned = versions->Key();
+					data->target = versions->Current();
+					std::atomic<int> state{0};
+					std::shared_ptr<const org::PersistentGraphHost::EpochRecording> live;
+					REQUIRE(host.RequestEpochRecording(0, data, [&](std::shared_ptr<const org::PersistentGraphHost::EpochRecording> a_recording, std::exception_ptr a_error) {
+						live = std::move(a_recording);
+						state.store(a_error ? 2 : 1, std::memory_order_release);
+					}), "a live async epoch takes a recording request");
+					(void)host.TakeAsyncStats();
+					const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+					for (uint32_t frame = 0; state.load(std::memory_order_acquire) == 0 && std::chrono::steady_clock::now() < deadline; ++frame) {
+						value = 70000u + 10u * (frame % 1000u);
+						host.SubmitEpoch(0, upload);
+						REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "the live epoch draws while it is recorded for a revision");
+					}
+					REQUIRE(state.load(std::memory_order_acquire) == 1 && live && live->slots.size() == 3, "a live epoch's revision recording, one per slot of its ring");
+					const auto liveStats = host.TakeAsyncStats();
+					std::printf("live revision recording: %llu recordings, %llu revision submissions, %llu submitted, %llu waited\n",
+						static_cast<unsigned long long>(liveStats.revisionRecordings), static_cast<unsigned long long>(liveStats.revisionSubmissions),
+						static_cast<unsigned long long>(liveStats.submitted), static_cast<unsigned long long>(liveStats.waited));
+					// (This loop submits right after the GPU is idle, ahead of the host's next ticket, so its frames wait either way.)
+					REQUIRE(liveStats.revisionRecordings == 1 && liveStats.revisionSubmissions == 0, "admitted, not submitted until chosen");
+					// The commit chooses it (UseEpochRecording): the ticket takes it instead of its own preparation, for every slot.
+					for (uint32_t frame = 0; frame < 4; ++frame) {
+						value = 71000u + 10u * frame;
+						host.SubmitEpoch(0, [&](org::RenderGraph& a_graph) {
+							upload(a_graph);
+							host.UseEpochRecording(live);
+						});
+						REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "a live epoch submits the revision's recording it chose");
+					}
+					// And its own preparation again when it chooses none.
+					value = 72000u;
+					host.SubmitEpoch(0, upload);
+					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "a live epoch's own preparation after a chosen recording");
+					const auto chosenStats = host.TakeAsyncStats();
+					REQUIRE(chosenStats.revisionSubmissions == 4 && chosenStats.stale == 0, "every chosen recording submitted, nothing prepared again");
+				}
 				host.SetAsyncEpochs({});
 			}
 			if (!revision) {

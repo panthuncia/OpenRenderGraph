@@ -274,6 +274,10 @@ runtime::IUploadService* PersistentGraphHost::Uploads() noexcept {
 	return m_graph ? m_graph->GetUploadService() : nullptr;
 }
 
+std::shared_ptr<runtime::IUploadService> PersistentGraphHost::RetainUploads() noexcept {
+	return m_graph ? m_graph->RetainUploadService() : nullptr;
+}
+
 void PersistentGraphHost::DestroyGraph() {
 	StopAsync();
 	if (!m_graph) return;
@@ -544,7 +548,6 @@ void PersistentGraphHost::StartAsync() {
 						state->pendingRequests.emplace_back(*it);
 					}
 				}
-				const bool requestsAdvanced = AdvanceRecordingRequests(*state);
 				graph->RetirePersistentExecutions();
 				// A submitted upload batch owns its staging until the GPU has actually
 				// signalled every queue that used the slot. Retire it on this worker even
@@ -571,6 +574,8 @@ void PersistentGraphHost::StartAsync() {
 					PrepareTicket(*state, index, -1);
 					prepared = true;
 				}
+				// Then the recording requests: the frames' tickets come first, so recording ahead never delays a submission.
+				const bool requestsAdvanced = AdvanceRecordingRequests(*state);
 				if (!prepared && !requestsAdvanced && !state->requests.load(std::memory_order_acquire)
 					&& state->read.load(std::memory_order_relaxed) == state->written.load(std::memory_order_acquire)) {
 					std::array<rhi::TimelinePoint, rhi::CompletionWait::MaxTimelines> heads{};
@@ -656,7 +661,7 @@ bool PersistentGraphHost::RequestEpochRecording(uint32_t epoch, std::shared_ptr<
 	const auto found = std::ranges::find(async->epochs, epoch);
 	if (found == async->epochs.end()) return false;
 	const auto index = static_cast<uint32_t>(found - async->epochs.begin());
-	if (!async->revisionDriven[index] || !async->ringSize) return false;
+	if (!async->ringSize) return false;
 	auto request = std::make_unique<Async::RecordingRequest>();
 	request->epochIndex = index;
 	request->hostData = std::move(hostData);
@@ -688,6 +693,17 @@ bool PersistentGraphHost::AdvanceRecordingRequests(Async& state) {
 				// A slot its epoch's unsubmitted ticket holds is recorded too: a revision-driven ticket holds the admission alone (its
 				// preparation recorded nothing, and already waited out the slot's last work), and it cannot be submitted without this.
 				if (request.recorded[position]) continue;
+				// A live epoch's: a slot its ticket holds is recorded once the ticket is submitted, and a slot whose work is in flight once
+				// that completes (the loop wakes at completions), so its frames never wait for this.
+				if (!state.revisionDriven[request.epochIndex]) {
+					const auto& entry = state.slots[slot];
+					if (entry.reserved) continue;
+					if (entry.pending && std::ranges::any_of(entry.points, [](const auto& a_point) {
+							const auto reached = a_point.first->GetCompletedValue();
+							return reached == UINT64_MAX || reached < a_point.second;
+						}))
+						continue;
+				}
 				BT_ZONE_SCOPE("ORG.Host.RecordForRevision");
 				runtime::ScopedActiveGraphServices services(m_graph->GetUploadService(), m_graph->GetDescriptorService());
 				WaitSlot(state, slot);
@@ -786,6 +802,12 @@ void PersistentGraphHost::PrepareTicket(Async& state, uint32_t epochIndex, int32
 		const auto version = state.backingVersion.load(std::memory_order_acquire);
 		ticket = m_graph->PreparePersistentTicket(m_desc.device, state.epochs[epochIndex], static_cast<uint8_t>(slot), state.hostFrame++, version);
 		RenderGraph::SetPersistentTicketHostTag(*ticket, version);
+		// The revisions' recordings still held, as alternatives the submitting thread may take instead (UseEpochRecording).
+		auto& live = state.liveRecordings[epochIndex];
+		std::erase_if(live, [](const auto& a_recording) { return a_recording.expired(); });
+		for (const auto& weak : live)
+			if (const auto recording = weak.lock()) AddRevisionCandidate(state, *ticket, *recording);
+		state.outstanding[epochIndex] = ticket;
 	}
 	state.needsTicket[epochIndex] = 0;
 	state.cells[epochIndex].store(std::move(ticket), std::memory_order_release);
@@ -1022,6 +1044,25 @@ void PersistentGraphHost::SubmitTicket(Async& async, uint32_t index, std::shared
 	lap(m_lastTimings.beforePrepareUs);
 	// A revision-driven epoch: the revision's recording for this slot, recorded ahead. Never prepared again: a recording that
 	// does not match the ticket is the caller's error.
+	// A live epoch's alternative: the revision's recording the commit chose (UseEpochRecording), admitted as the ticket's candidate.
+	if (!recording) recording = std::exchange(m_chosenRecording, nullptr);
+	m_chosenRecording.reset();
+	if (!async.revisionDriven[index] && recording) {
+		std::string why;
+		const uint32_t position = slot - recording->firstSlot;
+		const bool bound = recording->epoch == async.epochs[index] && slot >= recording->firstSlot && position < recording->slots.size()
+			&& RenderGraph::BindPersistentTicketRecording(*ticket, recording->slots[position], async.backingVersion.load(std::memory_order_acquire), &why);
+		if (!bound) {
+			Async::Message discard;
+			discard.kind = Async::Message::Kind::Discard;
+			discard.epochIndex = index;
+			discard.ticket = std::move(ticket);
+			postControl(discard);
+			throw std::logic_error("A revision's recording chosen for a live epoch is not its ticket's candidate: " + why);
+		}
+		++m_asyncStats.revisionSubmissions;
+	}
+	const bool chosen = !async.revisionDriven[index] && recording;
 	if (async.revisionDriven[index]) {
 		std::string why = "no recording given";
 		const uint32_t position = recording ? slot - recording->firstSlot : 0;
@@ -1039,11 +1080,11 @@ void PersistentGraphHost::SubmitTicket(Async& async, uint32_t index, std::shared
 	}
 	// Stale, but recorded before for what its passes depend on now (Desc::reuseRecordings): it takes that recording, and
 	// nothing is prepared again.
-	if (!async.revisionDriven[index] && !async.Current(*ticket)
+	if (!async.revisionDriven[index] && !chosen && !async.Current(*ticket)
 		&& m_graph->AdoptKeptPersistentRecording(*ticket, async.backingVersion.load(std::memory_order_acquire))
 		&& !async.Current(*ticket))
 		throw std::logic_error("An adopted recording left its ticket stale");
-	if (!async.revisionDriven[index] && !async.Current(*ticket)) {
+	if (!async.revisionDriven[index] && !chosen && !async.Current(*ticket)) {
 		BT_ZONE_SCOPE("ORG.Host.ReprepareStaleTicket");
 		m_asyncStats.staleBacking += RenderGraph::PersistentTicketCurrent(*ticket);
 		// Prepared before beforeSubmit changed what a pass depends on, or a backing it captured: prepare it again, for the
