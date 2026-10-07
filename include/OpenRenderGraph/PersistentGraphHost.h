@@ -290,6 +290,8 @@ public:
 	/** @brief The device-generation cleanup lane used for immutable binding roots. */
 	std::shared_ptr<runtime::ResourceCleanupQueue> ResourceCleanup() const;
 	runtime::IUploadService* Uploads() noexcept;
+	// Owner thread: the graph's descriptor service (its resource and sampler heaps: what a recording binds), null without a graph.
+	runtime::IDescriptorService* Descriptors() noexcept;
 	// The same, kept alive by the caller: a producer on another thread (growth as graph work, its worker upload path).
 	std::shared_ptr<runtime::IUploadService> RetainUploads() noexcept;
 	uint64_t FramesExecuted() const noexcept { return m_frameNumber; }

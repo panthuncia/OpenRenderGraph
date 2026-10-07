@@ -262,7 +262,8 @@ CopyQueueUploadService::CommandPair CopyQueueUploadService::AcquireCommandPair()
 		return pair;
 	}
 	CommandPair pair;
-	if (rhi::Failed(m_device.CreateCommandAllocator(rhi::QueueKind::Copy, pair.allocator)) ||
+	// For the queue the lists are submitted to: a dedicated upload queue may be of another family than the device's copy queue.
+	if (rhi::Failed(m_device.CreateCommandAllocator(m_copyQueue, pair.allocator)) ||
 		rhi::Failed(m_device.CreateCommandList(rhi::QueueKind::Copy, pair.allocator.Get(), pair.list))) {
 		spdlog::error("CopyQueueUploadService '{}': copy command list creation failed", m_config.debugName);
 		return {};

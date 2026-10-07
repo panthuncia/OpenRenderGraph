@@ -274,6 +274,10 @@ runtime::IUploadService* PersistentGraphHost::Uploads() noexcept {
 	return m_graph ? m_graph->GetUploadService() : nullptr;
 }
 
+runtime::IDescriptorService* PersistentGraphHost::Descriptors() noexcept {
+	return m_graph ? m_graph->GetDescriptorService() : nullptr;
+}
+
 std::shared_ptr<runtime::IUploadService> PersistentGraphHost::RetainUploads() noexcept {
 	return m_graph ? m_graph->RetainUploadService() : nullptr;
 }
