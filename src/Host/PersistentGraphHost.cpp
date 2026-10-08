@@ -750,17 +750,16 @@ bool PersistentGraphHost::AdvanceRecordingRequests(Async& state) {
 				// A slot its epoch's unsubmitted ticket holds is recorded too: a revision-driven ticket holds the admission alone (its
 				// preparation recorded nothing, and already waited out the slot's last work), and it cannot be submitted without this.
 				if (request.recorded[position]) continue;
-				// A live epoch's: a slot its ticket holds is recorded once the ticket is submitted, and a slot whose work is in flight once
-				// that completes (the loop wakes at completions), so its frames never wait for this.
-				if (!state.revisionDriven[request.epochIndex]) {
-					const auto& entry = state.slots[slot];
-					if (entry.reserved) continue;
-					if (entry.pending && std::ranges::any_of(entry.points, [](const auto& a_point) {
-							const auto reached = a_point.first->GetCompletedValue();
-							return reached == UINT64_MAX || reached < a_point.second;
-						}))
-						continue;
-				}
+				// A slot whose work is in flight is recorded once that completes (the loop wakes at completions), so the host's thread never
+				// waits on the GPU here and the epochs' tickets are not held up behind it. A live epoch's slot its ticket holds is recorded once
+				// the ticket is submitted.
+				const auto& entry = state.slots[slot];
+				if (!state.revisionDriven[request.epochIndex] && entry.reserved) continue;
+				if (entry.pending && std::ranges::any_of(entry.points, [](const auto& a_point) {
+						const auto reached = a_point.first->GetCompletedValue();
+						return reached == UINT64_MAX || reached < a_point.second;
+					}))
+					continue;
 				BT_ZONE_SCOPE("ORG.Host.RecordForRevision");
 				runtime::ScopedActiveGraphServices services(m_graph->GetUploadService(), m_graph->GetDescriptorService());
 				WaitSlot(state, slot);
