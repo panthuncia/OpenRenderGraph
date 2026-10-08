@@ -304,6 +304,33 @@ public:
 	// The host frame number of the last execution (ExecuteFrame or SubmitEpoch); the completed-frame
 	// callback reports frames by it.
 	uint64_t LastHostFrame() const noexcept { return m_lastHostFrame; }
+
+	// A point of the GPU's progress: per queue, its timeline (shared: valid after a rebuild) and a value it reaches. Any thread.
+	struct GpuPoint {
+		std::vector<std::pair<std::shared_ptr<rhi::TimelinePtr>, uint64_t>> points;
+		bool Reached() const noexcept {
+			for (const auto& [timeline, value] : points)
+				if (timeline && *timeline && (*timeline)->GetCompletedValue() < value) return false;
+			return true;
+		}
+		// False on a timeout or a failed wait.
+		bool Wait(uint32_t timeoutMs = UINT32_MAX) const noexcept {
+			for (const auto& [timeline, value] : points)
+				if (timeline && *timeline && (*timeline)->HostWait(value, timeoutMs) != rhi::Result::Ok) return false;
+			return true;
+		}
+	};
+	// Submitting thread: the point every queue reaches once everything submitted so far (ExecuteFrame, SubmitEpoch) is done.
+	GpuPoint SubmittedPoint() const;
+
+	// The frame-wait timeline (RenderGraph::SetFrameWaitTimeline): a host producer of per-frame values signals it once per frame,
+	// after the values it wrote for that frame, and every batch submitted from then on waits for SetFrameWaitValue's value. Set
+	// once, before the frames that wait; set on a built graph, the graph is built again (packets prepared before cannot wait).
+	void SetFrameWaitTimeline(std::shared_ptr<rhi::TimelinePtr> timeline);
+	// Submitting thread: what every batch submitted from now on waits for (0: nothing). The producer must signal it: the waits
+	// are on the GPU, and a value never signalled stalls the queue.
+	void SetFrameWaitValue(uint64_t value) noexcept { m_frameWaitValue = value; }
+	uint64_t FrameWaitValue() const noexcept { return m_frameWaitValue; }
 	// The frame slots: Desc::framesInFlight frames of every epoch in the order (one execution a frame without epochs).
 	uint32_t FrameSlots() const noexcept { return m_frameSlots; }
 
@@ -358,6 +385,8 @@ private:
 	RenderGraph::GpuPassRangeEnd m_gpuPassRangeEnd;
 	FrameTimings m_lastTimings{};
 	uint64_t m_lastHostFrame = 0;
+	std::shared_ptr<rhi::TimelinePtr> m_frameWaitTimeline;  // SetFrameWaitTimeline
+	uint64_t m_frameWaitValue = 0;
 	uint64_t m_ticketGeneration = 0;
 	uint64_t m_buildGeneration = 0;
 	struct Async;

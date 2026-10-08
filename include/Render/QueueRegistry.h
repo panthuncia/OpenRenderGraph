@@ -78,9 +78,11 @@ public:
 	rhi::Queue     GetQueue(QueueSlotIndex i)     const noexcept { return m_slots[ToUnderlying(i)].queue; }
 	QueueAutoAssignmentPolicy GetAutoAssignmentPolicy(QueueSlotIndex i) const noexcept { return m_slots[ToUnderlying(i)].autoAssignmentPolicy; }
 	bool IsAutoAssignable(QueueSlotIndex i) const noexcept { return GetAutoAssignmentPolicy(i) == QueueAutoAssignmentPolicy::AllowAutomaticScheduling; }
-	rhi::Timeline& GetFence(QueueSlotIndex i)           noexcept { return m_slots[ToUnderlying(i)].fence.Get(); }
-	const rhi::Timeline& GetFence(QueueSlotIndex i) const noexcept { return m_slots[ToUnderlying(i)].fence.Get(); }
-	rhi::TimelinePtr& GetFencePtr(QueueSlotIndex i)     noexcept { return m_slots[ToUnderlying(i)].fence; }
+	rhi::Timeline& GetFence(QueueSlotIndex i)           noexcept { return m_slots[ToUnderlying(i)].fence->Get(); }
+	const rhi::Timeline& GetFence(QueueSlotIndex i) const noexcept { return m_slots[ToUnderlying(i)].fence->Get(); }
+	rhi::TimelinePtr& GetFencePtr(QueueSlotIndex i)     noexcept { return *m_slots[ToUnderlying(i)].fence; }
+	/// The slot's fence, shared: valid for its holder after the registry is cleared (a graph rebuild).
+	std::shared_ptr<rhi::TimelinePtr> GetFenceOwner(QueueSlotIndex i) const noexcept { return m_slots[ToUnderlying(i)].fence; }
 	CommandListPool* GetPool(QueueSlotIndex i)    const noexcept { return m_slots[ToUnderlying(i)].pool.get(); }
 	std::shared_ptr<CommandListPool> GetSharedPool(QueueSlotIndex i) const noexcept { return m_slots[ToUnderlying(i)].pool; }
 	rhi::Timeline& GetFenceForConsumer(QueueSlotIndex source, QueueSlotIndex consumer) noexcept {
@@ -90,7 +92,7 @@ public:
 		// wait into an external-handle lookup if a custom slot was incompletely
 		// described.
 		return GetBackendInstance(source) == GetBackendInstance(consumer) || !entry.peerFence
-			? entry.fence.Get()
+			? entry.fence->Get()
 			: entry.peerFence.Get();
 	}
 
@@ -133,7 +135,7 @@ private:
 		rhi::Backend backend = rhi::Backend::Null;
 		rhi::Queue queue{};
 		rhi::Device device{};
-		rhi::TimelinePtr fence;
+		std::shared_ptr<rhi::TimelinePtr> fence;
 		rhi::TimelinePtr peerFence;
 		std::shared_ptr<CommandListPool> pool;
 		QueueAutoAssignmentPolicy autoAssignmentPolicy = QueueAutoAssignmentPolicy::AllowAutomaticScheduling;

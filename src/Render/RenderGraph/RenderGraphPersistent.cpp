@@ -3262,10 +3262,16 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 			timelineBindings.push_back({slot + 1, m_queueRegistry.GetFence(index).GetHandle()});
 		}
 		timelineBindings.insert(timelineBindings.end(), segment.foreignTimelines.begin(), segment.foreignTimelines.end());
+		if (HasFrameWaitTimeline())
+			timelineBindings.push_back({kFrameWaitTimelineIdentity, (*m_frameWaitTimeline)->GetHandle()});
 		auto admission = [&] {
 			BT_ZONE_SCOPE("ORG.Persistent.PrepareAdmission");
 			return state.admission->Prepare(segment.publication, queues, segment.waits, {}, segment.rebindings);
 		}();
+		// Executed now (not a ticket, which takes its wait when submitted): every batch waits for the frame's values.
+		if (!m_persistentTicketTarget && HasFrameWaitTimeline() && m_frameWaitValue)
+			for (auto& waits : admission.incomingWaits)
+				waits.push_back({kFrameWaitTimelineIdentity, m_frameWaitValue});
 		// Recording reuse (SetPersistentRecordingReuse): a ticket's closed execution with nothing late-bound, whose passes all
 		// report their revisions, is recorded for resubmission and kept per (epoch, slot); one prepared for what a kept
 		// recording was recorded for takes it.
@@ -3769,7 +3775,7 @@ bool RenderGraph::PersistentTicketCurrent(const PersistentTicket& ticket) {
 }
 
 bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uint64_t> nextQueueValues, PersistentTicketSubmission& out,
-	std::pair<uint32_t, uint64_t> uploadsDone) {
+	std::pair<uint32_t, uint64_t> uploadsDone, uint64_t frameWait) {
 	BT_ZONE_SCOPE("ORG.Persistent.SubmitTicket");
 	out = {};
 	for (auto& segment : ticket.segments) {
@@ -3787,6 +3793,9 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 			// would otherwise read what this epoch's uploads write before they land.
 			if (uploadsDone.second && queue != uploadsDone.first)
 				batches[batch].waits.push_back({uint64_t{uploadsDone.first} + 1, uploadsDone.second});
+			// The frame's values (SetFrameWaitTimeline): every packet prepared since it was set binds the timeline.
+			if (frameWait)
+				batches[batch].waits.push_back({kFrameWaitTimelineIdentity, frameWait});
 			out.signals.push_back(batches[batch].signal.value);
 		}
 		for (const auto wait : graph.relativeWaits)

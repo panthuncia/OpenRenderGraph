@@ -866,8 +866,18 @@ public:
 	// here). Returns false when a packet failed.
 	// uploadsDone: the queue slot and value that signal the uploads recorded ahead of the ticket (RecordPendingUploads), when
 	// there are any. They precede the ticket on their own queue only, so every batch on another queue waits for them.
+	// frameWait: the frame-wait timeline's value (SetFrameWaitTimeline) every batch waits for; 0 for none.
 	static bool SubmitPersistentTicket(PersistentTicket& ticket, std::span<uint64_t> nextQueueValues, PersistentTicketSubmission& out,
-		std::pair<uint32_t, uint64_t> uploadsDone = {UINT32_MAX, 0});
+		std::pair<uint32_t, uint64_t> uploadsDone = {UINT32_MAX, 0}, uint64_t frameWait = 0);
+	// The frame-wait timeline: a timeline a host's producer of per-frame values signals, once per frame, after the values it
+	// wrote for that frame; every batch of an execution waits for the value set for it (SetFrameWaitValue here, or
+	// SubmitPersistentTicket's frameWait), so a late producer costs GPU idle, never a CPU wait. Set before the first execution:
+	// every packet prepared from then on can wait on it.
+	static constexpr uint64_t kFrameWaitTimelineIdentity = UINT64_MAX - 1;
+	void SetFrameWaitTimeline(std::shared_ptr<rhi::TimelinePtr> timeline) { m_frameWaitTimeline = std::move(timeline); }
+	bool HasFrameWaitTimeline() const noexcept { return m_frameWaitTimeline && *m_frameWaitTimeline; }
+	// The synchronous executions' wait (Execute): until changed. 0: none.
+	void SetFrameWaitValue(uint64_t value) noexcept { m_frameWaitValue = value; }
 	// Submitting thread (the upload service's owner): records the uploads queued since the last call into
 	// `list` as plain buffer copies, without the graph's registry or admission: a full barrier (against the
 	// work before them), then the copies, whose destinations are left for the next execution's entry
@@ -1738,6 +1748,8 @@ private:
 	std::vector<std::vector<UINT64>> m_pendingFrameStartQueueWaitFenceValue;
 
 	QueueRegistry m_queueRegistry;
+	std::shared_ptr<rhi::TimelinePtr> m_frameWaitTimeline;  // SetFrameWaitTimeline
+	uint64_t m_frameWaitValue = 0;
 	std::optional<PresentDependency> m_lastPresentDependency;
 
 	rhi::CommandAllocatorPtr initialTransitionCommandAllocator;

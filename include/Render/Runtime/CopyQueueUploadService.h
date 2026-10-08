@@ -76,6 +76,13 @@ public:
         std::span<const StreamingUploadSegment> segments, size_t totalSize,
         org::WorkerOwnedDestination destination, size_t dstOffset);
 
+    // Signals `timeline` to `value` from the copy queue once every copy the calling thread queued before it is done (the
+    // intake is FIFO per producer and batches go to the one queue in order; the batch carrying it signals it with its own
+    // timeline). Another queue can wait on that value for those copies - before it is signalled, too (wait-before-signal), so
+    // a producer that announced one must always queue it: with nothing to copy it goes out in a batch of its own. False when
+    // the service is not initialized or the arguments are invalid.
+    bool QueueSignal(std::shared_ptr<rhi::TimelinePtr> timeline, uint64_t value);
+
     // Blocks until nothing is queued or in flight (tests and shutdown).
     bool WaitIdle(uint32_t timeoutMs = UINT32_MAX);
 
@@ -104,6 +111,9 @@ private:
         size_t size = 0;
         std::shared_ptr<TrackedUploadTicket> ticket;
         std::chrono::steady_clock::time_point queued{};
+        // A signal entry (QueueSignal): no copy, the batch signals this.
+        std::shared_ptr<rhi::TimelinePtr> signalTimeline;
+        uint64_t signalValue = 0;
     };
 
     struct CommandPair {

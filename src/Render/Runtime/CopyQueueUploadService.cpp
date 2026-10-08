@@ -280,6 +280,17 @@ void CopyQueueUploadService::RecycleCommandPair(CommandPair&& pair) {
 	}
 }
 
+bool CopyQueueUploadService::QueueSignal(std::shared_ptr<rhi::TimelinePtr> timeline, uint64_t value) {
+	if (!Initialized() || !timeline || !*timeline || value == 0) return false;
+	PendingCopy signal;
+	signal.signalTimeline = std::move(timeline);
+	signal.signalValue = value;
+	signal.queued = std::chrono::steady_clock::now();
+	m_intake.Push(std::move(signal));
+	m_wake.notify_one();
+	return true;
+}
+
 bool CopyQueueUploadService::CollectBatch(Batch& batch) {
 	batch.copies.clear();
 	batch.bytes = 0;
@@ -363,9 +374,22 @@ bool CopyQueueUploadService::RecordAndSubmit(Batch& batch) {
 		};
 	}
 	const rhi::CommandList lists[] = { batch.pair.list.Get() };
-	const rhi::TimelinePoint signal{ (*timeline)->GetHandle(), batch.timelineValue };
-	if (rhi::Failed(m_copyQueue.Submit(lists, { .signals = { &signal, 1 } }))) {
-		spdlog::error("CopyQueueUploadService '{}': copy queue submission failed", m_config.debugName);
+	// The batch's own value, then each signal entry's timeline at the largest value the batch carries for it.
+	std::vector<rhi::TimelinePoint> signals{ { (*timeline)->GetHandle(), batch.timelineValue } };
+	size_t externalSignals = 0;
+	for (const auto& copy : batch.copies) {
+		if (!copy.signalTimeline) continue;
+		const auto handle = (*copy.signalTimeline)->GetHandle();
+		auto found = std::find_if(signals.begin() + 1, signals.end(), [&](const rhi::TimelinePoint& a_point) {
+			return a_point.t.index == handle.index && a_point.t.generation == handle.generation;
+		});
+		if (found == signals.end()) signals.push_back({ handle, copy.signalValue });
+		else found->value = (std::max)(found->value, copy.signalValue);
+		++externalSignals;
+	}
+	if (rhi::Failed(m_copyQueue.Submit(lists, { .signals = { signals.data(), static_cast<uint32_t>(signals.size()) } }))) {
+		spdlog::error("CopyQueueUploadService '{}': copy queue submission failed{}", m_config.debugName,
+			externalSignals ? fmt::format("; {} external signals dropped (their waiters will not proceed)", externalSignals) : std::string());
 		FinishBatch(batch, true);
 		return false;
 	}

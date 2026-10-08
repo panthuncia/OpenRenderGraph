@@ -898,6 +898,44 @@ int main(int argc, char** argv) {
 			else host.ExecuteFrame(nullptr, upload);
 			REQUIRE(device->WaitIdle() == rhi::Result::Ok, "wait after rebuild");
 			REQUIRE(Matches(second, 7000u), "frame after rebuild");
+
+			// The frame-wait timeline: a frame's batches wait on the GPU for the value its producer of per-frame values signals
+			// (the render thread never waits); the producer signals it from the dedicated uploader, after its copies.
+			{
+				auto frameValues = std::make_shared<rhi::TimelinePtr>();
+				REQUIRE(device->CreateTimeline(*frameValues, 0, "test.frame-values") == rhi::Result::Ok && *frameValues, "frame-wait timeline");
+				host.SetFrameWaitTimeline(frameValues);
+				REQUIRE(host.RebuildRequested(), "packets prepared before cannot wait on it: the graph is built again");
+				auto uploads = host.RetainUploads();
+				const bool dedicated = uploads && uploads->HasDedicatedStreamingQueue();
+				for (uint64_t frame = 1; frame <= 3; ++frame) {
+					host.SetFrameWaitValue(frame);
+					value = 8000u + 10u * static_cast<uint32_t>(frame);
+					if (async) host.SubmitEpoch(0, upload);
+					else host.ExecuteFrame(nullptr, upload);
+					const auto submitted = host.SubmittedPoint();
+					REQUIRE(!submitted.points.empty(), "a submitted point");
+					if (dedicated) {
+						// Not signalled yet: the frame's work has not run.
+						std::this_thread::sleep_for(std::chrono::milliseconds(20));
+						REQUIRE(!submitted.Reached() && !Matches(second, value), "the frame waits for its values");
+						REQUIRE(uploads->QueueStreamingSignal(frameValues, frame), "the producer's signal");
+					} else {
+						// No queue of its own to signal from (QueueStreamingSignal refuses): the test signals it from the graphics queue.
+						REQUIRE(!uploads || !uploads->QueueStreamingSignal(frameValues, frame), "no signal without a dedicated queue");
+						const rhi::TimelinePoint signal{(*frameValues)->GetHandle(), frame};
+						REQUIRE(device->GetQueue(rhi::QueueKind::Compute).Submit({}, {{}, {&signal, 1}}) == rhi::Result::Ok, "signal from another queue");
+					}
+					REQUIRE(submitted.Wait(5000) && Matches(second, value), "the frame runs once its values are signalled");
+				}
+				// No wait: frames run as before.
+				host.SetFrameWaitValue(0);
+				value = 8100u;
+				if (async) host.SubmitEpoch(0, upload);
+				else host.ExecuteFrame(nullptr, upload);
+				REQUIRE(host.SubmittedPoint().Wait(5000) && Matches(second, value), "a frame without a wait");
+				std::printf("frame wait: %s\n", dedicated ? "signalled from the dedicated uploader" : "signalled from another queue");
+			}
 			if (async) {
 				host.SetAsyncEpochs({});
 				REQUIRE(ownedRequests.load() == 1 && ownedServices.load(), "owned preparation ran on host thread with services");

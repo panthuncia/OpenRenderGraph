@@ -445,5 +445,13 @@ std::shared_ptr<TrackedUploadTicket> UploadManager::QueueTrackedStreamingUploadS
 	return m_copyQueueUploads->QueueBufferUpload(segments, totalSize, std::move(destination), dstOffset);
 }
 
+bool UploadManager::QueueStreamingSignal(std::shared_ptr<rhi::TimelinePtr> timeline, uint64_t value)
+{
+	// Only from a queue of its own: the graph's copy queue may be its graphics queue, whose own waits would then wait on this.
+	if (!HasDedicatedStreamingQueue()) return false;
+	if (!m_copyQueueUploads || !m_copyQueueUploads->Initialized()) Initialize();
+	return m_copyQueueUploads->QueueSignal(std::move(timeline), value);
+}
+
 
 } // namespace org

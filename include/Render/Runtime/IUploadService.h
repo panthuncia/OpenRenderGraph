@@ -161,6 +161,13 @@ public:
     // Whether that path has a queue of its own (the dedicated uploader of graph work). Without one its copies go to the graph's
     // copy queue, which a host may alias to its graphics queue: a producer that relies on running beside the frame checks this.
     virtual bool HasDedicatedStreamingQueue() const { return false; }
+    // Any thread: signals `timeline` to `value` on that path's queue once every upload the calling thread queued on it before
+    // is done (CopyQueueUploadService::QueueSignal). Another queue may wait on the value before it is signalled, so a producer
+    // that announced one always queues it. False when the path has no queue of its own to signal from.
+    virtual bool QueueStreamingSignal(std::shared_ptr<rhi::TimelinePtr> timeline, uint64_t value) {
+        (void)timeline; (void)value;
+        return false;
+    }
 
     virtual void Cleanup() = 0;
 };

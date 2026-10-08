@@ -153,6 +153,10 @@ public:
         return UploadManager::GetInstance().HasDedicatedStreamingQueue();
     }
 
+    bool QueueStreamingSignal(std::shared_ptr<rhi::TimelinePtr> timeline, uint64_t value) override {
+        return UploadManager::GetInstance().QueueStreamingSignal(std::move(timeline), value);
+    }
+
     void Cleanup() override {
         UploadManager::GetInstance().Cleanup();
     }

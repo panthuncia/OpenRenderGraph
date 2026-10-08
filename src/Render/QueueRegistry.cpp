@@ -46,7 +46,7 @@ QueueSlotIndex QueueRegistry::Register(QueueSlot slot, rhi::Queue queue, rhi::Ti
 		const std::string fenceName = queueName + " Fence";
 		fence->SetName(fenceName.c_str());
 	}
-	m_slots.push_back({ slot.kind, slot.instance, slot.backendInstance, slot.backend, queue, device, std::move(fence), {}, std::shared_ptr<CommandListPool>(std::move(pool)), autoAssignmentPolicy, ownsQueue, std::string(logicalName), 1 });
+	m_slots.push_back({ slot.kind, slot.instance, slot.backendInstance, slot.backend, queue, device, std::make_shared<rhi::TimelinePtr>(std::move(fence)), {}, std::shared_ptr<CommandListPool>(std::move(pool)), autoAssignmentPolicy, ownsQueue, std::string(logicalName), 1 });
 	return idx;
 }
 
@@ -77,10 +77,10 @@ rhi::Result QueueRegistry::EnableD3D12VulkanInterop(rhi::Device d3d12Device, rhi
 		result = rhi::vulkan::import_d3d12_timeline(vulkanDevice, shared, 0, "ORG Multi-RHI Bridge Timeline", vkFence);
 		if (rhi::Failed(result)) return result;
 		if (slot.backend == rhi::Backend::D3D12) {
-			slot.fence = std::move(d3dFence);
+			slot.fence = std::make_shared<rhi::TimelinePtr>(std::move(d3dFence));
 			slot.peerFence = std::move(vkFence);
 		} else {
-			slot.fence = std::move(vkFence);
+			slot.fence = std::make_shared<rhi::TimelinePtr>(std::move(vkFence));
 			slot.peerFence = std::move(d3dFence);
 		}
 		slot.fenceValue = 1;

@@ -98,7 +98,9 @@ struct StreamingUploadDescriptor {
 // The resource must be created with rhi::QueueSharing::Concurrent so the copy
 // queue write needs no queue-family ownership transfer on any backend.
 struct WorkerOwnedDestination {
-    enum class Ownership : uint8_t { PooledBackingLease, FreshTexture, PendingVersion };
+    // RetiredFrameRegion: a buffer of a ring of per-frame buffers whose last readers (the frame that last used it) the producer
+    // has seen complete on the GPU, and that no frame reads again until the producer's signal for it (a frame-wait timeline).
+    enum class Ownership : uint8_t { PooledBackingLease, FreshTexture, PendingVersion, RetiredFrameRegion };
     std::shared_ptr<Resource> resource;
     Ownership ownership = Ownership::PooledBackingLease;
 };

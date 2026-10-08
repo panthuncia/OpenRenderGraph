@@ -317,11 +317,33 @@ void PersistentGraphHost::Build() {
 	graph->SetPersistentRecordingReuse(m_desc.reuseRecordings && m_desc.closedExecutions);
 	graph->SetPersistentExecutionEnabled(true);
 	graph->SetExternalQueueBoundary(m_desc.queueBoundary);
+	graph->SetFrameWaitTimeline(m_frameWaitTimeline);
 	graph->Setup();
 	m_graph = std::move(graph);
 	m_graph->SetGpuPassRangeCallbacks(m_gpuPassRangeBegin, m_gpuPassRangeEnd);
 	m_rebuildRequested = false;
 	++m_buildGeneration;
+}
+
+void PersistentGraphHost::SetFrameWaitTimeline(std::shared_ptr<rhi::TimelinePtr> timeline) {
+	m_frameWaitTimeline = std::move(timeline);
+	// Every packet binds its timelines when it is prepared: the graph's present ones cannot wait on it.
+	if (m_graph) m_rebuildRequested = true;
+}
+
+PersistentGraphHost::GpuPoint PersistentGraphHost::SubmittedPoint() const {
+	GpuPoint point;
+	if (!m_graph) return point;
+	const auto& queues = m_graph->GetQueueRegistry();
+	for (size_t index = 0; index < queues.SlotCount(); ++index) {
+		const auto slot = static_cast<QueueSlotIndex>(static_cast<uint8_t>(index));
+		// Async epochs: the values the submitting thread assigned; synchronous frames: the registry's.
+		uint64_t value = 0;
+		if (m_async) value = index < m_async->queueValues.size() ? m_async->queueValues[index] : 0;
+		else if (const auto next = queues.GetCurrentFenceValue(slot); next > 1) value = next - 1;
+		if (value) point.points.emplace_back(queues.GetFenceOwner(slot), value);
+	}
+	return point;
 }
 
 bool PersistentGraphHost::BuildIfRequested() {
@@ -368,6 +390,7 @@ void PersistentGraphHost::ExecuteFrame(const IHostExecutionData* hostData, const
 	DescriptorHeapManager::GetInstance().ProcessDeferredReleases(static_cast<uint8_t>(slot));
 	lap(m_lastTimings.releaseUs);
 	m_graph->SetPersistentEpoch(epoch);
+	m_graph->SetFrameWaitValue(m_frameWaitValue);
 	if (beforePrepare) {
 		BT_ZONE_SCOPE("ORG.Host.CommitInputs");
 		beforePrepare(*m_graph);
@@ -1220,7 +1243,7 @@ void PersistentGraphHost::SubmitTicket(Async& async, uint32_t index, std::shared
 	lap(m_lastTimings.uploadsUs);
 	bool ok = false;
 	try {
-		ok = RenderGraph::SubmitPersistentTicket(*ticket, async.queueValues, submitted.submission, submitted.uploadSignal);
+		ok = RenderGraph::SubmitPersistentTicket(*ticket, async.queueValues, submitted.submission, submitted.uploadSignal, m_frameWaitValue);
 	} catch (...) {
 		// The queue may have accepted a prefix of this ticket. Completion is
 		// unknown, so preserve both owners until device teardown.
