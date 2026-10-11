@@ -178,8 +178,11 @@ a scene revision recorded by a dependency graph (CS's DCLF: the scene revision, 
 -   **Slot rings.** Async epoch i uses frame slots `i * framesInFlight` up to `+ framesInFlight - 1` (when the host's slots
     hold `framesInFlight` per async epoch, which `FrameSlots` does). Its tickets take the next slot of its ring, so a
     recording per ring slot covers every ticket. Every async epoch uses its ring, revision-driven or not.
--   **`RequestEpochRecording(epoch, hostData, done)`.** Lock-free, from any thread: a request pushed on a Treiber stack that
-    the host's thread takes whole, in posting order.
+-   **`RequestEpochRecording(epoch, hostData, done)`.** Lock-free, from any thread, safe across a build: a request pushed on
+    a Treiber stack of the host's own lifetime (never the async state a build replaces) that the host's thread takes whole, in
+    posting order. `done` runs exactly once: with the recording (its `buildGeneration` the build it was recorded on), with
+    the error that stopped it, or with `EpochRecordingDropped` when a build stopped the host's thread first (on the thread that
+    built; the caller asks again for the new build's graph). The host's end drops what is queued without calling `done`.
     -   The host's thread records the epoch for `hostData` into every slot of its ring: what the passes prepare for
         (`FramePreparationContext::preparationData`), retained while it records.
     -   It records a slot once the slot's last work is done; it waits for that, never the caller. A slot the epoch's

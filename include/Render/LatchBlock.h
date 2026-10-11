@@ -28,8 +28,14 @@ class Buffer;
 //    indirect-argument buffer (Resource()) and as a copy source.
 class LatchBlock {
 public:
-    // bytesPerSlot is rounded up to 256 so every region is aligned for any use.
+    // bytesPerSlot is rounded up to 256 so every region is aligned for any use. Its buffer is registered with the host's world as
+    // any resource made on the owner's thread is; Create makes one on any thread.
     LatchBlock(std::string name, uint32_t bytesPerSlot, uint32_t slots);
+    // Any thread: a block made without an ECS entity (Resource::ScopedECSRegistrationSuppression), as a versioned buffer's pending
+    // version is (VersionedBuffer::MakeStructured): it is no graph resource (nothing declares it), so nothing of the host's world
+    // needs it, and a producer's thread may not touch that world. Its last reference may drop on any thread: its buffer goes
+    // through ORG's deletion path as any other.
+    static std::shared_ptr<LatchBlock> Create(std::string name, uint32_t bytesPerSlot, uint32_t slots);
     ~LatchBlock();
     LatchBlock(const LatchBlock&) = delete;
     LatchBlock& operator=(const LatchBlock&) = delete;

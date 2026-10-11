@@ -70,30 +70,20 @@ struct PersistentGraphHost::Async {
 	// Per epoch index, its ring of frame slots: [index * ringSize, + ringSize), the next position. 0: one ring of every slot.
 	uint32_t ringSize = 0;
 	std::vector<uint64_t> ringNext;
-	// Recording requests (RequestEpochRecording): any thread pushes, the host's thread takes them all (a Treiber stack, taken
-	// whole and reversed into posting order).
+	// Recording requests taken from the host's queue (RecordingQueue), by the host's thread, in posting order.
 	struct RecordingRequest {
 		uint32_t epochIndex = 0;
 		std::shared_ptr<const IHostExecutionData> hostData;
 		PersistentGraphHost::EpochRecordingCallback done;
 		std::shared_ptr<PersistentGraphHost::EpochRecording> result;
 		std::vector<uint8_t> recorded;  // by ring position
-		RecordingRequest* next = nullptr;
 	};
-	std::atomic<RecordingRequest*> requests{nullptr};
-	std::deque<std::unique_ptr<RecordingRequest>> pendingRequests;  // host thread
+	std::deque<std::unique_ptr<RecordingRequest>> pendingRequests;  // host thread; StopAsync drops what is left
 	// Host thread, per epoch index: the revision recordings made (admitted by each ticket while their callers hold them), and the
 	// ticket prepared and not yet submitted or discarded, which a recording finished meanwhile is added to before its callback.
 	std::vector<std::vector<std::weak_ptr<const PersistentGraphHost::EpochRecording>>> liveRecordings;
 	std::vector<std::shared_ptr<RenderGraph::PersistentTicket>> outstanding;
 	std::atomic<uint64_t> revisionSlotsRecorded{0}, revisionRecordings{0};
-	~Async() {
-		for (auto* request = requests.exchange(nullptr); request;) {
-			auto* next = request->next;
-			delete request;
-			request = next;
-		}
-	}
 	// One ticket cell per epoch: stored by the host's thread, taken by the render thread.
 	std::unique_ptr<std::atomic<std::shared_ptr<Ticket>>[]> cells;
 	// Render thread -> host thread, single producer / single consumer, in order.
@@ -104,7 +94,7 @@ struct PersistentGraphHost::Async {
 	// consume these cells, so a reserved submission always has a control-message
 	// slot even when the worker is busy.
 	std::shared_ptr<std::atomic<uint32_t>> controlCredits = std::make_shared<std::atomic<uint32_t>>(0);
-	std::unique_ptr<rhi::CompletionWait> completionWake;
+	rhi::CompletionWait* completionWake = nullptr;  // the host's (m_completionWake): requesters wake the thread through it too
 	// Whether the host's thread, if it sleeps, sleeps on GPU completions as well as on completionWake: then a submission's
 	// message needs no wake of its own (vkSignalSemaphore, several microseconds on the render thread), because the next GPU
 	// completion wakes the thread and it reads the mailbox then. Written by the host's thread before its last look at the
@@ -231,7 +221,41 @@ struct PersistentGraphHost::Async {
 	}
 };
 
-PersistentGraphHost::PersistentGraphHost(Desc desc) : m_desc(std::move(desc)) {
+// The host's recording requests (RequestEpochRecording): any thread pushes onto a Treiber stack, the host's thread takes it whole
+// and reverses it into posting order. It and the wake live as long as the host, so a request never meets a build's teardown.
+struct PersistentGraphHost::RecordingQueue {
+	struct Request {
+		uint32_t epoch = 0;
+		std::shared_ptr<const IHostExecutionData> hostData;
+		PersistentGraphHost::EpochRecordingCallback done;
+		Request* next = nullptr;
+	};
+	std::atomic<Request*> head{nullptr};
+	std::atomic<rhi::CompletionWait*> wake{nullptr};  // the host's thread's, once async epochs first started
+	std::atomic<bool> accepting{false};
+	// The host's end: what is left goes without its callbacks.
+	~RecordingQueue() {
+		for (auto* request = head.exchange(nullptr); request;) {
+			auto* next = request->next;
+			delete request;
+			request = next;
+		}
+	}
+	// Takes every request pushed so far, in posting order.
+	std::vector<std::unique_ptr<Request>> Take() {
+		std::vector<std::unique_ptr<Request>> taken;
+		for (auto* request = head.exchange(nullptr, std::memory_order_acquire); request;) {
+			auto* next = request->next;
+			request->next = nullptr;
+			taken.emplace_back(request);
+			request = next;
+		}
+		std::reverse(taken.begin(), taken.end());
+		return taken;
+	}
+};
+
+PersistentGraphHost::PersistentGraphHost(Desc desc) : m_desc(std::move(desc)), m_recordingQueue(std::make_unique<RecordingQueue>()) {
 	if (!m_desc.device) throw std::invalid_argument("PersistentGraphHost requires a device");
 	if (m_desc.backend == rhi::Backend::Null) throw std::invalid_argument("PersistentGraphHost requires a device backend");
 	if (!m_desc.tasks) m_desc.tasks = std::make_shared<runtime::ThreadPoolTaskService>();
@@ -252,6 +276,9 @@ PersistentGraphHost::PersistentGraphHost(Desc desc) : m_desc(std::move(desc)) {
 }
 
 PersistentGraphHost::~PersistentGraphHost() {
+	// Nothing queued is completed from here on: its callers may be torn down before the host.
+	m_ending = true;
+	m_recordingQueue->accepting.store(false, std::memory_order_release);
 	StopAsync();
 	DestroyGraph();
 	runtime::ShutdownRuntimeDevice();
@@ -457,7 +484,10 @@ void PersistentGraphHost::SetAsyncEpochs(std::vector<uint32_t> epochs, std::vect
 	if (!revisionEpochs.empty() && !m_desc.reuseRecordings)
 		throw std::logic_error("Revision-driven epochs need Desc::reuseRecordings (replayable recordings)");
 	m_revisionEpochs = std::move(revisionEpochs);
-	if (m_asyncEpochs.empty()) return;
+	if (m_asyncEpochs.empty()) {
+		m_recordingQueue->accepting.store(false, std::memory_order_release);
+		return;
+	}
 	if (!m_desc.closedExecutions) throw std::logic_error("Async epochs require closed executions");
 	if (BuildDue()) Build();
 	StartAsync();
@@ -466,8 +496,10 @@ void PersistentGraphHost::SetAsyncEpochs(std::vector<uint32_t> epochs, std::vect
 void PersistentGraphHost::StartAsync() {
 	if (m_async || m_asyncEpochs.empty() || !m_graph) return;
 	auto async = std::make_unique<Async>();
-	if (m_desc.device.CreateCompletionWait(async->completionWake) != rhi::Result::Ok)
+	// The host's wake, made once: a requester's Notify may reach it whenever, so no build destroys it.
+	if (!m_completionWake && m_desc.device.CreateCompletionWait(m_completionWake) != rhi::Result::Ok)
 		throw std::runtime_error("Async epochs require wakeable GPU completion waits");
+	async->completionWake = m_completionWake.get();
 	async->epochs = m_asyncEpochs;
 	async->revisionDriven.assign(async->epochs.size(), 0);
 	for (uint32_t index = 0; index < async->epochs.size(); ++index)
@@ -576,14 +608,21 @@ void PersistentGraphHost::StartAsync() {
 					}
 				}
 				if (stop) break;
-				// Recording requests: taken in posting order, each recording the slots of its ring that are free.
-				if (auto* head = state->requests.exchange(nullptr, std::memory_order_acquire)) {
-					std::vector<Async::RecordingRequest*> taken;
-					for (; head; head = head->next) taken.push_back(head);
-					for (auto it = taken.rbegin(); it != taken.rend(); ++it) {
-						(*it)->next = nullptr;
-						state->pendingRequests.emplace_back(*it);
+				// Recording requests: taken in posting order, each recording the slots of its ring that are free. One for an epoch that
+				// is not an async one (or without rings) completes with that error now.
+				for (auto& node : m_recordingQueue->Take()) {
+					const auto found = std::ranges::find(state->epochs, node->epoch);
+					if (found == state->epochs.end() || !state->ringSize) {
+						if (node->done)
+							node->done(nullptr, std::make_exception_ptr(std::invalid_argument("RequestEpochRecording: epoch " + std::to_string(node->epoch) +
+								" is not an async epoch with a slot ring")));
+						continue;
 					}
+					auto request = std::make_unique<Async::RecordingRequest>();
+					request->epochIndex = static_cast<uint32_t>(found - state->epochs.begin());
+					request->hostData = std::move(node->hostData);
+					request->done = std::move(node->done);
+					state->pendingRequests.push_back(std::move(request));
 				}
 				graph->RetirePersistentExecutions();
 				// A submitted upload batch owns its staging until the GPU has actually
@@ -613,7 +652,7 @@ void PersistentGraphHost::StartAsync() {
 				}
 				// Then the recording requests: the frames' tickets come first, so recording ahead never delays a submission.
 				const bool requestsAdvanced = AdvanceRecordingRequests(*state);
-				if (!prepared && !requestsAdvanced && !state->requests.load(std::memory_order_acquire)
+				if (!prepared && !requestsAdvanced && !m_recordingQueue->head.load(std::memory_order_acquire)
 					&& state->read.load(std::memory_order_relaxed) == state->written.load(std::memory_order_acquire)) {
 					std::array<rhi::TimelinePoint, rhi::CompletionWait::MaxTimelines> heads{};
 					uint32_t count = 0;
@@ -667,6 +706,10 @@ void PersistentGraphHost::StartAsync() {
 	BufferBase::RegisterConcurrentBackingCapture();
 	m_async = std::move(async);
 	++m_ticketGeneration;
+	// Requests from now on (and any queued across the build that started this) are this thread's.
+	m_recordingQueue->wake.store(m_completionWake.get(), std::memory_order_release);
+	m_recordingQueue->accepting.store(true, std::memory_order_release);
+	(void)m_completionWake->Notify();
 }
 
 std::shared_ptr<runtime::ResourceCleanupQueue> PersistentGraphHost::ResourceCleanup() const {
@@ -712,21 +755,15 @@ bool PersistentGraphHost::ReleaseEpochTicket(uint32_t epoch) {
 }
 
 bool PersistentGraphHost::RequestEpochRecording(uint32_t epoch, std::shared_ptr<const IHostExecutionData> hostData, EpochRecordingCallback done) {
-	auto* async = m_async.get();
-	if (!async || !done || async->failed.load(std::memory_order_acquire)) return false;
-	const auto found = std::ranges::find(async->epochs, epoch);
-	if (found == async->epochs.end()) return false;
-	const auto index = static_cast<uint32_t>(found - async->epochs.begin());
-	if (!async->ringSize) return false;
-	auto request = std::make_unique<Async::RecordingRequest>();
-	request->epochIndex = index;
-	request->hostData = std::move(hostData);
-	request->done = std::move(done);
-	auto* node = request.release();
-	auto* head = async->requests.load(std::memory_order_relaxed);
+	// The host's queue alone (never m_async, which a build moves out from under any other thread): the host's thread validates the
+	// epoch when it takes it, and a build drops what it did not take (StopAsync), each completed.
+	auto& queue = *m_recordingQueue;
+	if (!done || !queue.accepting.load(std::memory_order_acquire)) return false;
+	auto* node = new RecordingQueue::Request{epoch, std::move(hostData), std::move(done), nullptr};
+	auto* head = queue.head.load(std::memory_order_relaxed);
 	do node->next = head;
-	while (!async->requests.compare_exchange_weak(head, node, std::memory_order_release, std::memory_order_relaxed));
-	(void)async->completionWake->Notify();
+	while (!queue.head.compare_exchange_weak(head, node, std::memory_order_release, std::memory_order_relaxed));
+	if (auto* wake = queue.wake.load(std::memory_order_acquire)) (void)wake->Notify();
 	return true;
 }
 
@@ -943,6 +980,17 @@ void PersistentGraphHost::StopAsync() {
 	(void)async->Post(stop);
 	if (async->thread.joinable()) async->thread.join();
 	BufferBase::UnregisterConcurrentBackingCapture();
+	// The recording requests not recorded: dropped, each completed so (EpochRecordingDropped), here, on the thread that builds -
+	// the taken ones and the ones still queued (a request posted after this goes to the next thread, on the next build's graph).
+	// The host's end drops them without their callbacks.
+	if (!m_ending) {
+		const auto dropped = std::make_exception_ptr(EpochRecordingDropped(m_buildGeneration));
+		for (auto& request : async->pendingRequests)
+			if (request && request->done) request->done(nullptr, dropped);
+		for (auto& node : m_recordingQueue->Take())
+			if (node->done) node->done(nullptr, dropped);
+	}
+	async->pendingRequests.clear();
 	// Unsubmitted tickets are abandoned; submitted work keeps its slots' completions for the synchronous path.
 	if (m_graph && !async->failed.load()) {
 		for (uint32_t index = 0; index < async->epochs.size(); ++index)

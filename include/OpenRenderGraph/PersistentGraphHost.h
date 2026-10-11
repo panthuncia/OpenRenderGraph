@@ -2,9 +2,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -139,13 +141,24 @@ public:
 		uint64_t buildGeneration = 0;  // the build it was recorded on (BuildGeneration): no later build's tickets take it
 	};
 	using EpochRecordingCallback = std::function<void(std::shared_ptr<const EpochRecording>, std::exception_ptr)>;
-	// Any thread, lock-free: records the revision-driven epoch for hostData (what its passes prepare for: the revision) on the
-	// host's thread, into every slot of its ring once the slot's last work is done (the host's thread waits for that, never the
-	// caller; a slot the epoch's admission-only ticket holds is recorded too). done runs on the host's thread once every slot is recorded, or with the error
-	// that stopped it. False when async epochs are not running or the epoch is not an async one. A live (not revision-driven) async
-	// epoch's is made the same way (a slot its live ticket holds once that ticket is submitted, a slot with work in flight once it
-	// completes) and admitted beside its tickets' own preparations, while held: the submitting thread may submit it instead
-	// (UseEpochRecording).
+	// The error a request's done gets when it was dropped unrecorded: a build stopped the host's thread first (BuildIfRequested,
+	// SetAsyncEpochs, DestroyGraph). Nothing was recorded for it; the caller asks again for the graph as built now, once.
+	struct EpochRecordingDropped : std::runtime_error {
+		explicit EpochRecordingDropped(uint64_t generation)
+			: std::runtime_error("an epoch recording request was dropped by a graph build"), buildGeneration(generation) {}
+		uint64_t buildGeneration = 0;  // the build current when it was dropped (BuildGeneration)
+	};
+	// Any thread, lock-free, safe across a build: records the revision-driven epoch for hostData (what its passes prepare for: the
+	// revision) on the host's thread, into every slot of its ring once the slot's last work is done (the host's thread waits for
+	// that, never the caller; a slot the epoch's admission-only ticket holds is recorded too). The request goes onto a queue of the
+	// host's own lifetime, never through the async state a build replaces; the host's thread takes it whole, in posting order.
+	// done runs exactly once: on the host's thread once every slot is recorded (the recording carries the build it was recorded on,
+	// EpochRecording::buildGeneration), or with the error that stopped it (an epoch that is not an async one is one), or with
+	// EpochRecordingDropped when a build stopped the host's thread before it was recorded (on the thread that built). False only
+	// when async epochs were never started or are off (SetAsyncEpochs with none): done is not called then. A live (not
+	// revision-driven) async epoch's is made the same way (a slot its live ticket holds once that ticket is submitted, a slot with
+	// work in flight once it completes) and admitted beside its tickets' own preparations, while held: the submitting thread may
+	// submit it instead (UseEpochRecording). The host's end drops what is queued without calling done (its callers may be gone).
 	bool RequestEpochRecording(uint32_t epoch, std::shared_ptr<const IHostExecutionData> hostData, EpochRecordingCallback done);
 	// Render thread, for an async epoch it did not submit this frame: its ready ticket, prepared and not submitted, goes back to the
 	// host's thread (abandoned, its slot freed, a new one prepared). A live epoch's recording waits for the slot its unsubmitted ticket
@@ -391,6 +404,12 @@ private:
 	uint64_t m_buildGeneration = 0;
 	struct Async;
 	std::unique_ptr<Async> m_async;
+	// Recording requests (RequestEpochRecording) and the wake of the host's thread: the host's lifetime, never a build's, so a
+	// requester on any thread never touches the async state a build replaces.
+	struct RecordingQueue;
+	std::unique_ptr<RecordingQueue> m_recordingQueue;
+	std::unique_ptr<rhi::CompletionWait> m_completionWake;
+	bool m_ending = false;  // the destructor: requests still queued are dropped without their callbacks
 	uint32_t m_backingMutationDepth = 0;  // submitting thread: open BackingMutation scopes
 	// A failed/uncertain GPU completion cannot release submitted owners during
 	// a graph rebuild. Keep them until device teardown has stopped execution.

@@ -23,6 +23,11 @@ LatchBlock::LatchBlock(std::string name, uint32_t bytesPerSlot, uint32_t slots)
     m_srvIndex = m_buffer->GetSRVInfo(0).slot.index;
 }
 
+std::shared_ptr<LatchBlock> LatchBlock::Create(std::string name, uint32_t bytesPerSlot, uint32_t slots) {
+    Resource::ScopedECSRegistrationSuppression suppressECS;
+    return std::make_shared<LatchBlock>(std::move(name), bytesPerSlot, slots);
+}
+
 LatchBlock::~LatchBlock() {
     if (m_buffer && m_mapped) m_buffer->GetAPIResource().Unmap(0, uint64_t(m_stride) * m_slots);
 }
