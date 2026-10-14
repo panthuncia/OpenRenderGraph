@@ -1540,7 +1540,10 @@ private:
 	bool m_persistentRecordingReuse = false;
 	// Kept recordings per (epoch, frame slot): replaced whole by the owner thread, read by the submitting thread. A host's frame
 	// slots are its frames in flight of every epoch (PersistentGraphHost::FrameSlots), so an epoch meets several.
-	static constexpr size_t kKeptRecordingEpochs = 32, kKeptRecordingSlots = 32;
+	// Slots: every frame slot a host can have (PersistentGraphHost refuses more than 255): a host with frames in flight times epochs past
+	// 32 (Community Shaders' 4 x 9 since DCLF's first-person epochs) had its last epoch's slots unkeepable, so a revision-driven epoch's
+	// recording there was refused as not replayable.
+	static constexpr size_t kKeptRecordingEpochs = 32, kKeptRecordingSlots = 255;
 	using KeptRecordingSet = std::vector<std::shared_ptr<const PersistentRecording>>;
 	std::unique_ptr<std::array<std::array<std::atomic<std::shared_ptr<const KeptRecordingSet>>, kKeptRecordingSlots>, kKeptRecordingEpochs>> m_keptRecordings;
 	std::atomic<uint64_t> m_recordingsRecorded{0}, m_recordingsKept{0}, m_recordingsReused{0}, m_recordingsAdopted{0};
