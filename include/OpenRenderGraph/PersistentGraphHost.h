@@ -101,6 +101,12 @@ public:
 	// stats.GetFrameSerial() are the ones that frame recorded. frameNumber is that frame's 0-based number.
 	using CompletedFrameCallback = std::function<void(uint64_t frameNumber, const runtime::IStatisticsService& stats)>;
 	void SetCompletedFrameCallback(CompletedFrameCallback callback) { m_completedFrame = std::move(callback); }
+	// Called on the thread that sees completions (ExecuteFrame's, or the async host's thread) with n: every submission numbered n or
+	// less (SubmissionsMade) has completed on the GPU. Never decreases. Frame numbers cannot say this: an async ticket's is given when
+	// it is prepared, so a frame's submissions are not numbered in their order, and a frame number completing says nothing of a
+	// ticket submitted after it with a lower one. What a submitter keeps from reuse until its work is done retires on this.
+	using RetiredCallback = std::function<void(uint64_t submissions)>;
+	void SetRetiredCallback(RetiredCallback callback) { m_retired = std::move(callback); }
 
 	// GPU ranges around every pass (RenderGraph::SetGpuPassRangeCallbacks), kept across rebuilds. Set them while no
 	// frame executes: the host's thread reads them when it prepares.
@@ -317,6 +323,9 @@ public:
 	// The host frame number of the last execution (ExecuteFrame or SubmitEpoch); the completed-frame
 	// callback reports frames by it.
 	uint64_t LastHostFrame() const noexcept { return m_lastHostFrame; }
+	// Submitting thread: the executions submitted so far (ExecuteFrame and SubmitEpoch), each numbered in submission order from 1.
+	// Work submitted before this returns has retired once the retired callback reports this value.
+	uint64_t SubmissionsMade() const noexcept { return m_submissions; }
 
 	// A point of the GPU's progress: per queue, its timeline (shared: valid after a rebuild) and a value it reaches. Any thread.
 	struct GpuPoint {
@@ -387,6 +396,7 @@ private:
 	struct SlotCompletion {
 		std::vector<std::pair<rhi::Timeline*, uint64_t>> points;
 		uint64_t frameNumber = 0;
+		uint64_t submission = 0;  // its number (SubmissionsMade)
 		bool pending = false;
 	};
 	std::vector<SlotCompletion> m_slotCompletions;
@@ -394,6 +404,8 @@ private:
 	bool m_explicitBuilds = false;
 	uint64_t m_frameNumber = 0;
 	CompletedFrameCallback m_completedFrame;
+	RetiredCallback m_retired;
+	uint64_t m_submissions = 0;  // submitting thread (SubmissionsMade)
 	RenderGraph::GpuPassRangeBegin m_gpuPassRangeBegin;
 	RenderGraph::GpuPassRangeEnd m_gpuPassRangeEnd;
 	FrameTimings m_lastTimings{};

@@ -62,6 +62,7 @@ struct PersistentGraphHost::Async {
 		std::shared_ptr<void> retired;            // Submitted: GPU objects that retired at this submission, destroyed on the host's thread
 		std::shared_ptr<const void> resourceOwner;
 		std::pair<uint32_t, uint64_t> uploadSignal{UINT32_MAX, 0};
+		uint64_t number = 0;  // Submitted: its number (SubmissionsMade)
 		FrameCallback ownedPrepare;
 	};
 
@@ -121,6 +122,7 @@ struct PersistentGraphHost::Async {
 	struct Slot {
 		std::vector<std::pair<rhi::Timeline*, uint64_t>> points;  // its last submission's completion
 		uint64_t hostFrame = 0;
+		uint64_t submission = 0;  // its last submission's number (SubmissionsMade)
 		bool pending = false;   // submitted work not yet waited for
 		bool reserved = false;  // held by a ticket that has not been submitted
 		std::shared_ptr<void> keepAlive;
@@ -134,6 +136,9 @@ struct PersistentGraphHost::Async {
 	std::vector<uint8_t> needsTicket;
 	uint64_t nextSlot = 0;
 	uint64_t hostFrame = 0;
+	// The highest submission number a Submitted message brought (the mailbox is in order: every one not read yet is higher), and
+	// the last value the retired callback was given.
+	uint64_t submissionsSeen = 0, retiredReported = 0;
 
 	// Render thread only.
 	std::vector<uint64_t> queueValues;  // the last value assigned per queue slot
@@ -404,6 +409,7 @@ void PersistentGraphHost::ExecuteFrame(const IHostExecutionData* hostData, const
 			for (const auto& [timeline, value] : completion.points) (void)timeline->HostWait(value);
 		}
 		completion.pending = false;
+		if (m_retired) m_retired(completion.submission);
 		// Nothing else completes a frame's statistics on this path: without it the pass timestamps were
 		// written and resolved every frame and never read, and their pending resolves only grew.
 		if (auto* stats = m_graph->GetStatisticsService()) {
@@ -454,6 +460,7 @@ void PersistentGraphHost::ExecuteFrame(const IHostExecutionData* hostData, const
 				completion.points.emplace_back(&queues.GetFence(queueSlot), next - 1);
 		}
 		completion.frameNumber = m_frameNumber;
+		completion.submission = ++m_submissions;
 		completion.pending = true;
 		if (heldResources) {
 			const auto& owner = m_uncertainExecutionOwners.back();
@@ -520,11 +527,13 @@ void PersistentGraphHost::StartAsync() {
 		auto& completion = m_slotCompletions[slot];
 		async->slots[slot].points = completion.points;
 		async->slots[slot].hostFrame = completion.frameNumber;
+		async->slots[slot].submission = completion.submission;
 		async->slots[slot].pending = completion.pending;
 		completion = {};
 	}
 	async->nextSlot = m_frameNumber;
 	async->hostFrame = m_frameNumber;
+	async->submissionsSeen = m_submissions;
 	auto& queues = m_graph->GetQueueRegistry();
 	for (size_t index = 0; index < queues.SlotCount(); ++index) {
 		const auto next = queues.GetCurrentFenceValue(static_cast<QueueSlotIndex>(static_cast<uint8_t>(index)));
@@ -573,6 +582,8 @@ void PersistentGraphHost::StartAsync() {
 						slot.pending = !slot.points.empty();
 						slot.reserved = false;
 						slot.hostFrame = RenderGraph::PersistentTicketHostFrame(*message.ticket);
+						slot.submission = message.number;
+						state->submissionsSeen = (std::max)(state->submissionsSeen, message.number);
 						if (state->outstanding[message.epochIndex] == message.ticket) state->outstanding[message.epochIndex].reset();
 							slot.keepAlive = std::move(state->uncertainUploadOwner);
 							slot.resourceOwner = std::move(state->uncertainResourceOwner);
@@ -726,6 +737,22 @@ void PersistentGraphHost::WaitSlot(Async& state, uint32_t slot) {
 		for (const auto& [timeline, value] : entry.points) (void)timeline->HostWait(value);
 	}
 	entry.pending = false;
+	// Retired: every submission below the oldest one still running (all that were seen, with none). Slots complete in the order the
+	// host's thread reuses them, not in submission order, so a slot's own number says nothing of the ones before it; a pending slot
+	// whose points are reached counts as done.
+	{
+		uint64_t retired = state.submissionsSeen;
+		for (const auto& other : state.slots) {
+			if (!other.pending) continue;
+			bool reached = true;
+			for (const auto& [timeline, value] : other.points) reached = reached && timeline->GetCompletedValue() >= value;
+			if (!reached) retired = (std::min)(retired, other.submission - 1);
+		}
+		if (retired > state.retiredReported) {
+			state.retiredReported = retired;
+			if (m_retired) m_retired(retired);
+		}
+	}
 	if (auto* stats = m_graph->GetStatisticsService()) {
 		rhi::Queue queue = m_desc.device.GetQueue(rhi::QueueKind::Graphics);
 		stats->OnFrameComplete(slot, queue);
@@ -1000,6 +1027,7 @@ void PersistentGraphHost::StopAsync() {
 		auto& completion = m_slotCompletions[slot];
 		completion.points = async->slots[slot].points;
 		completion.frameNumber = async->slots[slot].hostFrame;
+		completion.submission = async->slots[slot].submission;
 		completion.pending = async->slots[slot].pending;
 	}
 	m_frameNumber = (std::max)(m_frameNumber, async->hostFrame);
@@ -1260,6 +1288,7 @@ void PersistentGraphHost::SubmitTicket(Async& async, uint32_t index, std::shared
 	}
 	Async::Message submitted;
 	submitted.kind = Async::Message::Kind::Submitted;
+	submitted.number = ++m_submissions;
 	submitted.epochIndex = index;
 	submitted.keepAlive = std::move(keepAlive);
 	submitted.retired = std::move(retired);
