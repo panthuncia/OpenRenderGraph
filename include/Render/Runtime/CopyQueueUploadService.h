@@ -76,6 +76,14 @@ public:
         std::span<const StreamingUploadSegment> segments, size_t totalSize,
         org::WorkerOwnedDestination destination, size_t dstOffset);
 
+    // Copies every range to `destination` at its own dstOffset, as one entry per staging page: the page is mapped once for
+    // the ranges it takes, one intake push and one wake for the call, one copy region recorded per range (a range larger than
+    // a page is split as QueueBufferUpload splits). The bytes are staged before it returns. One ticket for the batch, on the
+    // last entry (batches complete in order). Zero-sized ranges are skipped; null when the service is not initialized, the
+    // arguments are invalid or nothing is to be copied.
+    std::shared_ptr<TrackedUploadTicket> QueueBufferUploadRanges(
+        std::span<const StreamingUploadRange> ranges, org::WorkerOwnedDestination destination);
+
     // Signals `timeline` to `value` from the copy queue once every copy the calling thread queued before it is done (the
     // intake is FIFO per producer and batches go to the one queue in order; the batch carrying it signals it with its own
     // timeline). Another queue can wait on that value for those copies - before it is signalled, too (wait-before-signal), so
@@ -103,12 +111,21 @@ private:
         std::atomic<bool> closed{ false };
     };
 
+    // One copy region of a ranges entry (QueueBufferUploadRanges): page bytes at srcOffset to the destination at dstOffset.
+    struct CopyRegion {
+        size_t srcOffset = 0;
+        size_t dstOffset = 0;
+        size_t size = 0;
+    };
+
     struct PendingCopy {
         std::shared_ptr<StagingPage> page;
         size_t srcOffset = 0;
         std::shared_ptr<Resource> destination;
         size_t dstOffset = 0;
-        size_t size = 0;
+        size_t size = 0; // a ranges entry: the sum of its regions
+        // A ranges entry: its regions on `page` (srcOffset/dstOffset unused); empty: the one copy above.
+        std::vector<CopyRegion> regions;
         std::shared_ptr<TrackedUploadTicket> ticket;
         std::chrono::steady_clock::time_point queued{};
         // A signal entry (QueueSignal): no copy, the batch signals this.

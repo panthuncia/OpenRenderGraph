@@ -252,6 +252,89 @@ std::shared_ptr<TrackedUploadTicket> CopyQueueUploadService::QueueBufferUpload(
 	return ticket;
 }
 
+std::shared_ptr<TrackedUploadTicket> CopyQueueUploadService::QueueBufferUploadRanges(
+	std::span<const StreamingUploadRange> ranges, org::WorkerOwnedDestination destination) {
+	if (!Initialized() || !destination.resource || ranges.empty()) return {};
+	size_t totalSize = 0;
+	for (const auto& range : ranges) {
+		if (range.data == nullptr && range.size != 0) return {};
+		totalSize += range.size;
+	}
+	if (totalSize == 0) return {};
+	BT_ZONE_SCOPE("CopyQueueUploadService::QueueBufferUploadRanges");
+	BT_ZONE_VALUE(static_cast<int64_t>(totalSize));
+
+	// One entry per staging page the ranges land on (the producer thread's pages, as StageChunk takes them): the page mapped
+	// once while it takes them, one copy region per range. The ticket rides on the last entry; batches complete in order, so
+	// it completes after every range.
+	auto ticket = std::make_shared<TrackedUploadTicket>();
+	const auto queued = std::chrono::steady_clock::now();
+	auto& slot = Slot();
+	PendingCopy entry;
+	uint8_t* mapped = nullptr;
+	size_t mappedFrom = 0;
+	size_t writtenEnd = 0;
+	bool pushed = false;
+	// Opens an entry on the thread's page (a new one when bytes do not fit), mapped; rangeCount: the ranges it may take.
+	const auto openEntry = [&](size_t bytes, size_t rangeCount) -> bool {
+		if (slot.page && slot.page->tail + bytes > slot.page->capacity) {
+			ClosePage(std::move(slot.page));
+		}
+		if (slot.page && !slot.page->buffer) slot.page.reset();
+		if (!slot.page) {
+			slot.page = AcquirePage();
+			if (!slot.page) return false;
+		}
+		void* pointer = nullptr;
+		slot.page->buffer->Map(&pointer, 0, slot.page->capacity);
+		if (!pointer) {
+			spdlog::error("CopyQueueUploadService '{}': upload page map failed", m_config.debugName);
+			return false;
+		}
+		slot.page->pendingRegions.fetch_add(1, std::memory_order_acq_rel);
+		entry.page = slot.page;
+		entry.destination = destination.resource;
+		entry.queued = queued;
+		entry.regions.reserve(rangeCount);
+		mapped = static_cast<uint8_t*>(pointer);
+		mappedFrom = writtenEnd = slot.page->tail;
+		return true;
+	};
+	// The open entry's written bytes unmapped, and the entry onto the intake.
+	const auto closeEntry = [&](bool last) {
+		entry.page->buffer->Unmap(mappedFrom, writtenEnd - mappedFrom);
+		if (last) entry.ticket = ticket;
+		m_intake.Push(std::move(entry));
+		entry = PendingCopy{};
+		pushed = true;
+	};
+	for (size_t i = 0; i < ranges.size(); ++i) {
+		const auto& range = ranges[i];
+		size_t done = 0;
+		while (done < range.size) {
+			// A range larger than a page is split into page-sized chunks, as QueueBufferUpload splits.
+			const size_t chunk = (std::min)(range.size - done, m_config.pageBytes);
+			if (entry.page && entry.page->tail + chunk > entry.page->capacity) closeEntry(false);
+			if (!entry.page && !openEntry(chunk, ranges.size() - i)) {
+				if (pushed) m_wake.notify_one();
+				ticket->Cancel();
+				return ticket;
+			}
+			auto& page = *entry.page;
+			const size_t offset = page.tail;
+			std::memcpy(mapped + offset, static_cast<const uint8_t*>(range.data) + done, chunk);
+			page.tail = AlignUp(offset + chunk, kRegionAlignment);
+			writtenEnd = offset + chunk;
+			entry.regions.push_back({ offset, range.dstOffset + done, chunk });
+			entry.size += chunk;
+			done += chunk;
+		}
+	}
+	closeEntry(true);
+	m_wake.notify_one();
+	return ticket;
+}
+
 // ---------------------------------------------------------------------------
 // Submitter
 
@@ -295,7 +378,8 @@ bool CopyQueueUploadService::CollectBatch(Batch& batch) {
 	batch.copies.clear();
 	batch.bytes = 0;
 	PendingCopy copy;
-	while (batch.copies.size() < m_config.maxBatchCopies) {
+	size_t regions = 0; // copy regions: a ranges entry counts each of its own
+	while (regions < m_config.maxBatchCopies) {
 		if (!batch.copies.empty() && m_intake.Count() == 0) break;
 		if (!m_intake.Pop(copy)) break;
 		if (copy.ticket) {
@@ -311,6 +395,7 @@ bool CopyQueueUploadService::CollectBatch(Batch& batch) {
 			copy.ticket->NotifyChanged();
 		}
 		batch.bytes += copy.size;
+		regions += copy.regions.empty() ? 1 : copy.regions.size();
 		batch.copies.push_back(std::move(copy));
 		if (batch.bytes >= m_config.maxBatchBytes) break;
 	}
@@ -346,10 +431,21 @@ bool CopyQueueUploadService::RecordAndSubmit(Batch& batch) {
 	if (!barriers.empty()) {
 		list.Barriers({ .buffers = { barriers.data(), static_cast<uint32_t>(barriers.size()) } });
 	}
+	size_t regions = 0;
 	for (const auto& copy : batch.copies) {
 		if (!copy.destination || !copy.page) continue;
-		list.CopyBufferRegion(copy.destination->GetAPIResource().GetHandle(), copy.dstOffset,
-			copy.page->buffer->GetHandle(), copy.srcOffset, copy.size);
+		if (copy.regions.empty()) {
+			list.CopyBufferRegion(copy.destination->GetAPIResource().GetHandle(), copy.dstOffset,
+				copy.page->buffer->GetHandle(), copy.srcOffset, copy.size);
+			++regions;
+			continue;
+		}
+		const auto dst = copy.destination->GetAPIResource().GetHandle();
+		const auto src = copy.page->buffer->GetHandle();
+		for (const auto& region : copy.regions) {
+			list.CopyBufferRegion(dst, region.dstOffset, src, region.srcOffset, region.size);
+		}
+		regions += copy.regions.size();
 	}
 	for (auto& barrier : barriers) {
 		barrier.beforeSync = rhi::ResourceSyncState::Copy;
@@ -408,7 +504,7 @@ bool CopyQueueUploadService::RecordAndSubmit(Batch& batch) {
 	{
 		std::lock_guard lock(m_statsMutex);
 		++m_stats.batchesSubmitted;
-		m_stats.copiesSubmitted += batch.copies.size();
+		m_stats.copiesSubmitted += regions;
 		m_stats.bytesSubmitted += batch.bytes;
 	}
 	basic_telemetry::AddCounter("ORG.Upload.Worker.BatchesSubmitted");

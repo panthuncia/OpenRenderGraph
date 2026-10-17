@@ -149,6 +149,11 @@ public:
             segments, totalSize, std::move(destination), dstOffset);
     }
 
+    std::shared_ptr<TrackedUploadTicket> QueueTrackedStreamingUploadRanges(
+        std::span<const StreamingUploadRange> ranges, WorkerOwnedDestination destination) override {
+        return UploadManager::GetInstance().QueueTrackedStreamingUploadRanges(ranges, std::move(destination));
+    }
+
     bool HasDedicatedStreamingQueue() const override {
         return UploadManager::GetInstance().HasDedicatedStreamingQueue();
     }

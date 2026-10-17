@@ -16,6 +16,14 @@ struct StreamingUploadSegment {
 	std::size_t size = 0;
 };
 
+// One range of a batched upload to one destination (QueueTrackedStreamingUploadRanges): `size` bytes from `data` to the
+// destination at `dstOffset`.
+struct StreamingUploadRange {
+	const void* data = nullptr;
+	std::size_t size = 0;
+	std::size_t dstOffset = 0;
+};
+
 class Resource;
 
 enum class TrackedUploadTicketState : uint8_t { Queued, Claimed, Submitted, Completed, Cancelled };

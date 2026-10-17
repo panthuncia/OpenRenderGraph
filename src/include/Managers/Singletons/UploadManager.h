@@ -105,6 +105,8 @@ public:
 	std::shared_ptr<TrackedUploadTicket> QueueTrackedStreamingUploadSegments(
 		std::span<const StreamingUploadSegment> segments, size_t totalSize,
 		WorkerOwnedDestination destination, size_t dstOffset = 0);
+	std::shared_ptr<TrackedUploadTicket> QueueTrackedStreamingUploadRanges(
+		std::span<const StreamingUploadRange> ranges, WorkerOwnedDestination destination);
 	org::runtime::CopyQueueUploadService* CopyQueueUploads() { return m_copyQueueUploads.get(); }
 	// Whether the worker upload path has a queue of its own (not the graph's copy queue, which may alias the graphics one).
 	bool HasDedicatedStreamingQueue() const { return static_cast<bool>(m_uploadQueue); }

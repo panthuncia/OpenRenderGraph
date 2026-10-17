@@ -158,6 +158,20 @@ public:
     virtual std::shared_ptr<TrackedUploadTicket> QueueTrackedStreamingUploadSegments(
         std::span<const StreamingUploadSegment> segments, size_t totalSize,
         WorkerOwnedDestination destination, size_t dstOffset = 0) = 0;
+    // The same path, many ranges of one destination in one call (CopyQueueUploadService::QueueBufferUploadRanges): one
+    // ticket for the batch, completed after every range. The bytes are staged before it returns. The default forwards range
+    // by range and returns the last range's ticket (or the first that failed: null or cancelled).
+    virtual std::shared_ptr<TrackedUploadTicket> QueueTrackedStreamingUploadRanges(
+        std::span<const StreamingUploadRange> ranges, WorkerOwnedDestination destination) {
+        std::shared_ptr<TrackedUploadTicket> ticket;
+        for (const auto& range : ranges) {
+            if (range.size == 0) continue;
+            const StreamingUploadSegment segment{ range.data, range.size };
+            ticket = QueueTrackedStreamingUploadSegments({ &segment, 1 }, segment.size, destination, range.dstOffset);
+            if (!ticket || ticket->state.load(std::memory_order_acquire) == TrackedUploadTicketState::Cancelled) return ticket;
+        }
+        return ticket;
+    }
     // Whether that path has a queue of its own (the dedicated uploader of graph work). Without one its copies go to the graph's
     // copy queue, which a host may alias to its graphics queue: a producer that relies on running beside the frame checks this.
     virtual bool HasDedicatedStreamingQueue() const { return false; }
