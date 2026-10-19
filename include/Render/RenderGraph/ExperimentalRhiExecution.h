@@ -755,7 +755,9 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
                     queue, context.Commands(), statistics->queries);
             const auto cpuStart = statisticsIndex >= 0 ? std::chrono::steady_clock::now()
                 : std::chrono::steady_clock::time_point{};
-            const auto* ranges = replayable ? nullptr : recording.gpuPassRanges.get();
+            // A replayable list carries its ranges too (the callbacks push one only while a capture is armed): a host that
+            // keeps lists across frames records them again when a capture arms and when it ends, so none outlives its session.
+            const auto* ranges = recording.gpuPassRanges.get();
             if (ranges) ranges->begin(context.Commands(), queue, ranges->queueName, debugName.empty() ? "<unnamed>" : debugName.data());
             {
                 BT_ZONE_SCOPE("ORG.Execution.RecordOwned.Record");
