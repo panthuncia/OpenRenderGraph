@@ -85,6 +85,9 @@ void BeginFrameCapture(const QueueTarget& queue, std::uint64_t frameNumber);
 void EndFrameCapture(const QueueTarget& queue, std::uint64_t frameNumber);
 
 // Whether a range of that name on that queue is one the capture measures.
+// Ranges pushed (recorded into command buffers) since ArmCapture: a host whose command buffers are recorded ahead of
+// the frame they execute in (re-recorded at arming) begins the first pass only once these exist.
+std::uint64_t RangesRecordedSinceArm();
 bool RangeSelected(const char* queueName, const char* rangeName);
 
 // A range in a native command buffer (ID3D12GraphicsCommandList* / VkCommandBuffer) that will execute on the queue,

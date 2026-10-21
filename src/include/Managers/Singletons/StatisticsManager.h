@@ -10,7 +10,7 @@
 #include <limits>
 #include <mutex>
 #include <rhi.h>
-#include "Render/Runtime/StatisticsTypes.h"
+#include "Render/Runtime/IStatisticsService.h"
 
 
 namespace org {
@@ -19,6 +19,8 @@ using QueryRecordingContext = org::runtime::QueryRecordingContext;
 
 using PassStats = org::runtime::PassStats;
 using MeshPipelineStats = org::runtime::MeshPipelineStats;
+using OwnedTimestampQueries = org::runtime::OwnedTimestampQueries;
+using CompletedTimestamp = org::runtime::CompletedTimestamp;
 
 class StatisticsManager {
 public:
@@ -60,6 +62,13 @@ public:
 	void ResolveQueries(unsigned frameIndex, rhi::Queue& queue, rhi::CommandList& cmdList, QueryRecordingContext& ctx);
 	void MergePendingResolves(rhi::QueueKind queueKind, unsigned frameIndex, QueryRecordingContext& ctx);
 
+	// Kept recordings' own queries (IStatisticsService::CreateOwnedTimestamps).
+	std::shared_ptr<OwnedTimestampQueries> CreateOwnedTimestamps(rhi::QueueKind queueKind, uint32_t ranges);
+	void BeginRangeQuery(std::string_view name, rhi::CommandList& cmdList, QueryRecordingContext& ctx);
+	void EndRangeQuery(rhi::CommandList& cmdList, QueryRecordingContext& ctx);
+	bool BeginSubRangeQuery(std::string_view name, rhi::CommandList& cmdList, QueryRecordingContext& ctx);
+	const std::vector<CompletedTimestamp>& GetCompletedTimestamps() const { return m_completedTimestamps; }
+
 	void OnFrameComplete(unsigned frameIndex,
 		rhi::Queue& queue);
 	void RecordCpuUpdateTime(unsigned passIndex, double milliseconds);
@@ -84,6 +93,9 @@ private:
 	~StatisticsManager() = default;
 
 	void EnsureQueueBuffers(rhi::QueueKind queueKind);
+	bool BeginOwnedRange(OwnedTimestampQueries& owned, std::string_view name, int passIndex, org::runtime::TimestampRangeKind kind, rhi::CommandList& cmd);
+	void EndOwnedRange(OwnedTimestampQueries& owned, rhi::CommandList& cmd);
+	void ReadOwnedTimestamps(unsigned frameIndex);
 	void RecordCpuTimeSample(unsigned passIndex, double milliseconds, bool isUpdate);
 
 	bool m_collectPassStatistics = true;
@@ -129,6 +141,12 @@ private:
 		std::unordered_map<unsigned, std::vector<unsigned>>> m_recordedQueries;
 	std::unordered_map<rhi::QueueKind,
 		std::unordered_map<unsigned, std::vector<std::pair<unsigned,unsigned>>>> m_pendingResolves;
+
+	// Kept recordings' queries submitted per frame slot, read when the slot completes; what the latest completion read (its
+	// owned queries kept alive with it, for the names the timestamps view).
+	std::unordered_map<unsigned, std::vector<std::shared_ptr<OwnedTimestampQueries>>> m_pendingOwned;
+	std::vector<std::shared_ptr<OwnedTimestampQueries>> m_completedOwned;
+	std::vector<CompletedTimestamp> m_completedTimestamps;
 };
 
 

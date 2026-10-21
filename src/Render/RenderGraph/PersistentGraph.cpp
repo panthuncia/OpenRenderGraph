@@ -1526,6 +1526,25 @@ FrameAdmission SynchronousAdmission::Prepare(std::shared_ptr<const SelectedPubli
     }
     m_accesses.AppendIncomingWaits(graph, frame.backings, queues, frame.incomingWaits);
     m_aliases.AppendIncomingWaits(graph, frame.backings, queues, frame.incomingWaits);
+    // The resources a batch off the upload queue uses: what a host may record an upload into on that batch's queue.
+    if (m_uploadQueue != UINT32_MAX
+        && std::ranges::any_of(graph.batches, [&](const auto& batch) { return batch.queue != m_uploadQueue; })
+        && graph.boundaryAccessesByBatch.size() == graph.batches.size()) {
+        std::vector<uint8_t> selected(frame.backings.size());
+        bool any = false;
+        for (uint32_t batch = 0; batch < graph.batches.size(); ++batch) {
+            if (graph.batches[batch].queue == m_uploadQueue) continue;
+            for (const auto& access : graph.boundaryAccessesByBatch[batch])
+                if (access.resource < selected.size()) {
+                    selected[access.resource] = 1;
+                    any = true;
+                }
+        }
+        if (any) {
+            frame.boundaryAccessWaits.resize(graph.batches.size());
+            m_accesses.AppendBoundaryAccessWaits(graph, frame.backings, selected, frame.boundaryAccessWaits);
+        }
+    }
     frame.sequence = m_nextSequence++;
     frame.domain = m_domain;
     m_pending.push_back(frame.sequence);

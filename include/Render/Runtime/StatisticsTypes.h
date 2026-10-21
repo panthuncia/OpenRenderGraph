@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -36,12 +37,18 @@ struct MemoryBudgetStats {
     bool valid = false;
 };
 
+struct OwnedTimestampQueries;
+
 /// Per-task context for thread-safe query recording.
 /// Each parallel recording task owns one of these; the main thread
 /// merges them after all tasks complete.
 struct QueryRecordingContext {
     std::vector<uint32_t> recordedIndices;
     std::vector<std::pair<uint32_t, uint32_t>> pendingRanges;
+    // A recording kept for resubmission: its own queries (IStatisticsService::CreateOwnedTimestamps) instead of the
+    // frame-indexed shared ones, which the service recreates as passes register. Kept across merges, so every
+    // submission of the recording publishes them again.
+    std::shared_ptr<OwnedTimestampQueries> owned;
 };
 
 }

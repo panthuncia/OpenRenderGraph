@@ -946,6 +946,70 @@ size_t UploadInstance::RecordStagedUploads(rhi::CommandList& list, uint8_t frame
 	return copies;
 }
 
+bool UploadInstance::TakeRecordedUploadsWithDestinations(std::vector<rhi::CommandList>& out, uint8_t frameIndex,
+	std::vector<rhi::ResourceHandle>& destinations) {
+	// Read before the take: the batches move to the slot's retained list. A batch the take sends back to be recorded as
+	// staged (an outdated recording) returns no list, and its destinations are then the staged ones.
+	std::vector<rhi::ResourceHandle> written;
+	const bool known = org::runtime::StagedUploadBatch::AppendDestinations(m_directRecorded, written);
+	if (!TakeRecordedUploads(out, frameIndex)) return true;
+	destinations.insert(destinations.end(), written.begin(), written.end());
+	return known;
+}
+
+bool UploadInstance::StagedUploadDestinations(std::vector<rhi::ResourceHandle>& out) const {
+	return org::runtime::StagedUploadBatch::AppendDestinations(m_directStaged, out);
+}
+
+size_t UploadInstance::RecordStagedUploadsRouted(rhi::CommandList& list, uint8_t frameIndex, bool afterWork,
+	const std::function<rhi::CommandList*(rhi::ResourceHandle)>& route, size_t& routed) {
+	routed = 0;
+	if (!route || m_directStaged.empty()) return RecordStagedUploads(list, frameIndex, afterWork);
+	BT_ZONE_SCOPE("ORG.Upload.RecordStagedUploadsRouted");
+	NoteOffOwnerCall("RecordStagedUploadsRouted");
+	std::vector<rhi::ResourceHandle> destinations;
+	if (!org::runtime::StagedUploadBatch::AppendDestinations(m_directStaged, destinations))
+		return RecordStagedUploads(list, frameIndex, afterWork);
+	// Each destination's list, asked once; the lists in the order their first copy comes. Every copy of one destination goes to
+	// the same list, so the batches' order between overlapping copies (the later write wins) holds within it.
+	auto key = [](rhi::ResourceHandle handle) { return (uint64_t{handle.generation} << 32) | handle.index; };
+	std::unordered_map<uint64_t, rhi::CommandList*> byDestination;
+	std::vector<rhi::CommandList*> targets;
+	for (const auto destination : destinations) {
+		const auto found = byDestination.find(key(destination));
+		if (found != byDestination.end()) continue;
+		auto* target = route(destination);
+		if (!target) target = &list;
+		byDestination.emplace(key(destination), target);
+		if (std::ranges::find(targets, target) == targets.end()) targets.push_back(target);
+	}
+	uint64_t bytes = 0;
+	for (const auto& batch : m_directStaged) bytes += batch->Bytes();
+	size_t copies = 0;
+	for (auto* target : targets) {
+		// After the work before them on the target's queue (its earlier copies, the previous execution): one barrier per list.
+		if (afterWork) {
+			const auto full = rhi::FullMemoryBarrier();
+			rhi::BarrierBatch barriers{};
+			barriers.globals = {&full, 1u};
+			target->Barriers(barriers);
+		}
+		const size_t recorded = org::runtime::StagedUploadBatch::RecordCopies(*target, m_directStaged, m_debugName,
+			[&](rhi::ResourceHandle destination) { return byDestination.at(key(destination)) == target; });
+		copies += recorded;
+		if (target != &list) routed += recorded;
+	}
+	if (m_numFramesInFlight != 0) {
+		auto& retained = m_frameStaged[frameIndex % m_numFramesInFlight];
+		retained.insert(retained.end(), std::make_move_iterator(m_directStaged.begin()), std::make_move_iterator(m_directStaged.end()));
+	}
+	m_directStaged.clear();
+	BT_ZONE_VALUE(copies);
+	BT_PLOT("ORG.Upload.StagedCopies", static_cast<int64_t>(copies));
+	BT_PLOT("ORG.Upload.StagedBytes", static_cast<int64_t>(bytes));
+	return copies;
+}
+
 void UploadInstance::DrainPostedUploads() {
 	PostedBufferUpload buffer;
 	while (m_postedBufferUploads.Pop(buffer)) {

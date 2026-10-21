@@ -146,6 +146,10 @@ struct PersistentGraphHost::Async {
 	// wait: the slot's last upload list is done), then recorded, ended and submitted by the render thread; the
 	// ticket cell orders the two.
 	std::vector<CommandListPair> uploadLists;
+	// The same, per frame slot and per queue slot, for the uploads recorded on another queue than graphics (Desc::queueScopedUploads):
+	// a list for each compute or copy queue of the graphics queue's device, none (empty) for the others.
+	std::vector<std::vector<CommandListPair>> queueUploadLists;
+	std::vector<rhi::CommandList> queueLists;     // SubmitTicket's scratch: the slot's queue upload lists, by queue slot
 	std::vector<rhi::CommandList> recordedLists;  // SubmitTicket's scratch: the producers' recorded upload lists, then the slot's
 	uint32_t graphicsSlot = 0;
 	rhi::Queue graphicsQueue;
@@ -261,6 +265,7 @@ struct PersistentGraphHost::RecordingQueue {
 };
 
 PersistentGraphHost::PersistentGraphHost(Desc desc) : m_desc(std::move(desc)), m_recordingQueue(std::make_unique<RecordingQueue>()) {
+	m_queueScopedUploads.store(m_desc.queueScopedUploads, std::memory_order_relaxed);
 	if (!m_desc.device) throw std::invalid_argument("PersistentGraphHost requires a device");
 	if (m_desc.backend == rhi::Backend::Null) throw std::invalid_argument("PersistentGraphHost requires a device backend");
 	if (!m_desc.tasks) m_desc.tasks = std::make_shared<runtime::ThreadPoolTaskService>();
@@ -347,6 +352,8 @@ void PersistentGraphHost::Build() {
 	graph->SetPersistentEpochOrder(m_desc.epochOrder);
 	graph->SetPersistentClosedExecutions(m_desc.closedExecutions);
 	graph->SetPersistentRecordingReuse(m_desc.reuseRecordings && m_desc.closedExecutions);
+	graph->SetPersistentRecordingTimestamps(m_recordingTimestamps.load(std::memory_order_acquire));
+	graph->SetScheduleTraceEnabled(m_scheduleTrace.load(std::memory_order_acquire));
 	graph->SetPersistentExecutionEnabled(true);
 	graph->SetExternalQueueBoundary(m_desc.queueBoundary);
 	graph->SetFrameWaitTimeline(m_frameWaitTimeline);
@@ -551,7 +558,25 @@ void PersistentGraphHost::StartAsync() {
 		pair.list->SetName(("ORG ticket uploads #" + std::to_string(slot)).c_str());
 		pair.list->End();
 		async->uploadLists.push_back(std::move(pair));
+		// Queue-scoped uploads: one list per compute or copy queue on the graphics queue's device (a copy needs no more).
+		auto& perQueue = async->queueUploadLists.emplace_back(queues.SlotCount());
+		for (size_t index = 0; index < queues.SlotCount(); ++index) {
+			const auto queueSlot = static_cast<QueueSlotIndex>(static_cast<uint8_t>(index));
+			const auto kind = queues.GetKind(queueSlot);
+			if (queueSlot == graphics || (kind != QueueKind::Compute && kind != QueueKind::Copy)
+				|| queues.GetBackendInstance(queueSlot) != queues.GetBackendInstance(graphics) || !queues.GetQueue(queueSlot))
+				continue;
+			const auto queueKind = kind == QueueKind::Compute ? rhi::QueueKind::Compute : rhi::QueueKind::Copy;
+			CommandListPair queuePair;
+			if (!rhi::IsOk(m_desc.device.CreateCommandAllocator(queueKind, queuePair.allocator))
+				|| !rhi::IsOk(m_desc.device.CreateCommandList(queueKind, queuePair.allocator.Get(), queuePair.list)))
+				throw std::runtime_error("Async epochs could not create their queue upload command lists");
+			queuePair.list->SetName(("ORG ticket queue uploads #" + std::to_string(slot) + " q" + std::to_string(index)).c_str());
+			queuePair.list->End();
+			perQueue[index] = std::move(queuePair);
+		}
 	}
+	async->queueLists.resize(queues.SlotCount());
 	// Staged uploads go straight into each submission's upload list (RenderGraph::RecordPendingUploads).
 	if (auto* uploads = m_graph->GetUploadService()) uploads->SetStagedUploadsRecordedDirectly(true);
 	auto* state = async.get();
@@ -905,6 +930,13 @@ void PersistentGraphHost::PrepareTicket(Async& state, uint32_t epochIndex, int32
 	auto& uploads = state.uploadLists[slot];
 	uploads.allocator->Recycle();
 	uploads.list->Recycle(uploads.allocator.Get());
+	// The slot's queue upload lists likewise: their last submission went ahead of a batch of the slot's last ticket on their queue,
+	// whose completion the wait above covers.
+	for (auto& queueUploads : state.queueUploadLists[slot]) {
+		if (!queueUploads.list) continue;
+		queueUploads.allocator->Recycle();
+		queueUploads.list->Recycle(queueUploads.allocator.Get());
+	}
 	DescriptorHeapManager::GetInstance().ProcessDeferredReleases(static_cast<uint8_t>(slot));
 	entry.reserved = true;
 	std::shared_ptr<Async::Ticket> ticket;
@@ -1273,11 +1305,24 @@ void PersistentGraphHost::SubmitTicket(Async& async, uint32_t index, std::shared
 	bool recorded = false;
 	auto commands = list.list.Get();
 	auto& recordedLists = async.recordedLists;
-	const bool supported = m_graph->RecordPendingUploads(m_desc.device, commands, static_cast<uint8_t>(slot), keepAlive, recorded, recordedLists);
+	// Queue-scoped uploads (Desc::queueScopedUploads): the slot's open lists of the other queues, which take the uploads their
+	// queue uses first, and go to it just ahead of the ticket's first batch there (SubmitPersistentTicket).
+	auto& queueUploadLists = async.queueUploadLists[slot];
+	const bool queueScoped = m_queueScopedUploads.load(std::memory_order_acquire);
+	for (size_t index = 0; index < async.queueLists.size(); ++index)
+		async.queueLists[index] = queueScoped && index < queueUploadLists.size() && queueUploadLists[index].list
+			? queueUploadLists[index].list.Get() : rhi::CommandList{};
+	size_t queueCopies = 0;
+	const bool supported = m_graph->RecordPendingUploads(m_desc.device, commands, static_cast<uint8_t>(slot), keepAlive, recorded, recordedLists,
+		queueScoped ? ticket.get() : nullptr, queueScoped ? std::span<rhi::CommandList>(async.queueLists) : std::span<rhi::CommandList>{}, &queueCopies);
 	{
 		BT_ZONE_SCOPE("ORG.Host.CloseUploadList");
 		list.list->End();
+		// Every one the host's thread began, used or not (it begins them all again for the slot's next ticket).
+		for (auto& queueUploads : queueUploadLists)
+			if (queueUploads.list) queueUploads.list->End();
 	}
+	m_asyncStats.queueUploadCopies += queueCopies;
 	if (!supported) {
 		Async::Message discard;
 		discard.kind = Async::Message::Kind::Discard;
@@ -1328,6 +1373,7 @@ void PersistentGraphHost::SubmitTicket(Async& async, uint32_t index, std::shared
 		throw;
 	}
 	lap(m_lastTimings.submitUs);
+	if (submitted.uploadSignal.second) m_asyncStats.sparedUploadWaits += RenderGraph::PersistentTicketSparedUploadWaits(*ticket);
 	submitted.ticket = std::move(ticket);
 	try {
 		postControl(submitted);

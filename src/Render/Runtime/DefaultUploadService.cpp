@@ -130,6 +130,20 @@ public:
         return UploadManager::GetInstance().TakeRecordedUploads(out, frameIndex);
     }
 
+    bool TakeRecordedUploadsWithDestinations(std::vector<rhi::CommandList>& out, uint8_t frameIndex,
+        std::vector<rhi::ResourceHandle>& destinations) override {
+        return UploadManager::GetInstance().TakeRecordedUploadsWithDestinations(out, frameIndex, destinations);
+    }
+
+    bool StagedUploadDestinations(std::vector<rhi::ResourceHandle>& out) const override {
+        return UploadManager::GetInstance().StagedUploadDestinations(out);
+    }
+
+    size_t RecordStagedUploadsRouted(rhi::CommandList& list, uint8_t frameIndex, bool afterWork,
+        const std::function<rhi::CommandList*(rhi::ResourceHandle)>& route, size_t& routed) override {
+        return UploadManager::GetInstance().RecordStagedUploadsRouted(list, frameIndex, afterWork, route, routed);
+    }
+
     void ProcessDeferredReleases(uint8_t frameIndex) override {
         UploadManager::GetInstance().ProcessDeferredReleases(frameIndex);
         DeletionManager::GetInstance().ProcessDeletions();

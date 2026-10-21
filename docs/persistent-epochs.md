@@ -112,6 +112,24 @@ instead of `ExecuteFrame`. `ExecuteFrame` throws while async epochs are on.
         (async compute) waits for the uploads' signal instead (`SubmitPersistentTicket`'s `uploadsDone`).
         Without that wait, a compute pass could read the epoch's uploaded inputs before they land: on the first
         frames, never-written memory.
+    6.  **Queue-scoped uploads** (`Desc::queueScopedUploads`, default on; `SetQueueScopedUploads`). The submission
+        passes the slot's open lists of the other queues to `RecordPendingUploads` with the ticket, which plans
+        the uploads by destination backing:
+        -   A staged upload whose destination the ticket first uses on another queue is recorded into that queue's
+            list, after a full barrier. Every batch that uses the destination must be ordered after that queue's
+            first batch, and nothing in the graphics list or the recorded lists may touch it. `SubmitPersistentTicket`
+            submits the list just ahead of that first batch (`PreparedRhiExecutionBatch::SubmitLeading`), so the
+            batch needs no wait for it.
+        -   That list waits for what a write of the destination needs against earlier executions: every earlier
+            access the admission ledger holds (`FrameAdmission::boundaryAccessWaits`, readers included), and the
+            incoming waits of the batches that use it.
+        -   A batch on another queue waits for the graphics list only if it uses something written there. That
+            covers the immediate copies' destinations and sources, the recorded lists' destinations and the staged
+            copies left on graphics.
+        -   When a destination is not known, nothing is planned, and every batch waits as before. The same holds for
+            a ticket of several segments.
+        -   The schedule trace shows `Uploads` points only on the batches that wait. Each batch that a queue list
+            precedes carries its copy count and that list's waits (`queueUploadCopies`, `queueUploadWaits`).
 -   **Completion.** The host thread receives the submission through a single-producer mailbox. It commits
     admission, retires, reads statistics and releases deferred resources, in submission order.
 -   **Constraints on a ticket.** Its recording may not depend on anything the render thread produces at the
@@ -158,7 +176,16 @@ again.
 -   **What a kept recording leaves out.** Every resource a list names must be owned by its recording. Kept recordings
     therefore record no profiler GPU zones or ranges (Tracy), and no GPU statistics queries: the statistics service recreates
     its query pools and readback buffers as passes register, and a resubmitted list resolved into freed ones (a GPU page
-    fault). Turn reuse off to profile an epoch's passes on the GPU.
+    fault). Turn reuse off to profile an epoch's passes on the GPU with Tracy.
+-   **Timestamps of their own.** With `PersistentGraphHost::SetRecordingTimestamps` (`RenderGraph::SetPersistentRecordingTimestamps`,
+    off by default; a change rebuilds the graph so every kept list is recorded again) a kept list owns its queries
+    (`IStatisticsService::CreateOwnedTimestamps`: a query pool and readback buffer per list, released with it through deferred
+    deletion). The list resets them, writes a begin/end pair around each pass and each barrier batch (named
+    `cs.org.barrier.<where>.<pass>`, the profiler ranges' names) and resolves them into its buffer after its exit barrier. As
+    a list is in one submission at a time and belongs to one frame slot, fixed query indices never collide: each submission
+    (its statistics' publication) puts the list on its slot's pending set, and the slot's completion (`OnFrameComplete`) reads
+    the buffer, which holds that submission's values. `GetCompletedTimestamps` lists every pair read, with its queue: a compute
+    list's ticks are its queue's.
 -   **Statistics.** `AsyncStats::recorded`, `kept`, `reused` and `adopted`.
 -   **Release.** `StopAsync` lets every kept recording go once the slots' work is done (`ClearKeptPersistentRecordings`).
 

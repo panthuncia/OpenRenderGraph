@@ -845,6 +845,13 @@ std::shared_ptr<const CompiledGraph> CompileWorkspace::Compile(
         BT_ZONE_SCOPE("ORG.FreshCompile.SymbolicSchedule");
         std::vector<uint32_t> batchByPass(passCount, UINT32_MAX);
         std::vector<ResourceUseOrder> useOrder(structure.resourceIDs.size());
+        // A batch waits for another queue's batch at its start. The open batch's latest producer batch per queue: a pass needing a
+        // later one starts a batch of its own, so the passes before it run without that wait.
+        std::vector<std::vector<uint32_t>> predecessors(passCount);
+        for (auto [from, to] : result->schedulingEdges) predecessors[to].push_back(from);
+        std::vector<uint32_t> openWaits(structure.queues.size(), UINT32_MAX);
+        std::vector<uint32_t> passWaits(structure.queues.size(), UINT32_MAX);
+        std::vector<uint32_t> orderedFrom;
         for (auto passIndex : result->topologicalOrder) {
             if (cancelled.load(std::memory_order_relaxed)) return {};
             const auto& pass = structure.passes[passIndex];
@@ -866,17 +873,43 @@ std::shared_ptr<const CompiledGraph> CompileWorkspace::Compile(
                 [&](uint32_t, uint32_t queue) { return usable(queue); });
             if (!selected) throw std::runtime_error("Pass has no active compatible compile queue");
             const auto queue = selected->second;
-            const bool extendPrevious = !pass.forceBatchIsolation && !result->batches.empty()
-                && result->batches.back().queue == queue
-                && !structure.passes[result->batches.back().passes.back()].forceBatchIsolation;
-            if (!extendPrevious) result->batches.push_back({passIndex, queue});
-            else result->batches.back().passes.push_back(passIndex);
-            batchByPass[passIndex] = static_cast<uint32_t>(result->batches.size() - 1);
+            orderedFrom.clear();
             ForEachScheduledUse(pass, [&](uint32_t resource, bool write) {
                 if (resource >= useOrder.size()) throw std::invalid_argument("Invalid scheduled state resource");
                 OrderUse(useOrder[resource], passIndex, write, OverlappingReads(structure, resource),
-                    [&](uint32_t from, uint32_t to) { result->schedulingEdges.emplace_back(from, to); });
+                    [&](uint32_t from, uint32_t to) {
+                        result->schedulingEdges.emplace_back(from, to);
+                        orderedFrom.push_back(from);
+                    });
             });
+            // The latest batch of each other queue this pass waits for (its predecessors are placed: topological order).
+            std::fill(passWaits.begin(), passWaits.end(), UINT32_MAX);
+            const auto needs = [&](uint32_t from) {
+                const auto producer = batchByPass[from];
+                if (producer == UINT32_MAX) return;
+                const auto producerQueue = result->batches[producer].queue;
+                if (producerQueue == queue) return;
+                auto& latest = passWaits[producerQueue];
+                if (latest == UINT32_MAX || producer > latest) latest = producer;
+            };
+            for (auto from : predecessors[passIndex]) needs(from);
+            for (auto from : orderedFrom) needs(from);
+            bool newWait = false;
+            for (size_t q = 0; q < passWaits.size(); ++q)
+                if (passWaits[q] != UINT32_MAX && (openWaits[q] == UINT32_MAX || passWaits[q] > openWaits[q])) newWait = true;
+            const bool extendPrevious = !pass.forceBatchIsolation && !result->batches.empty()
+                && result->batches.back().queue == queue
+                && !structure.passes[result->batches.back().passes.back()].forceBatchIsolation
+                && !newWait;
+            if (!extendPrevious) {
+                result->batches.push_back({passIndex, queue});
+                std::fill(openWaits.begin(), openWaits.end(), UINT32_MAX);
+            } else {
+                result->batches.back().passes.push_back(passIndex);
+            }
+            for (size_t q = 0; q < passWaits.size(); ++q)
+                if (passWaits[q] != UINT32_MAX && (openWaits[q] == UINT32_MAX || passWaits[q] > openWaits[q])) openWaits[q] = passWaits[q];
+            batchByPass[passIndex] = static_cast<uint32_t>(result->batches.size() - 1);
         }
         result->batchByPass = batchByPass;
         result->positionByPass.assign(passCount, UINT32_MAX);

@@ -196,6 +196,8 @@ namespace org::imm {
             const std::vector<std::byte>& bytecode, const Resolver& resolve);
         void Record(rhi::CommandList& list) const;
         size_t Size() const { return m_copies.size(); }
+        // Appends every buffer the copies touch, destinations and sources (their backings as captured).
+        void AppendBuffers(std::vector<rhi::ResourceHandle>& out) const;
     private:
         struct Copy {
             BackingAllocationSnapshot dst, src;

@@ -106,6 +106,26 @@ public:
     double GetGpuTicksToMilliseconds() const override {
         return StatisticsManager::GetInstance().GetGpuTicksToMilliseconds();
     }
+
+    std::shared_ptr<OwnedTimestampQueries> CreateOwnedTimestamps(rhi::QueueKind queueKind, uint32_t ranges) override {
+        return StatisticsManager::GetInstance().CreateOwnedTimestamps(queueKind, ranges);
+    }
+
+    void BeginRangeQuery(std::string_view name, rhi::CommandList& cmdList, QueryRecordingContext& ctx) override {
+        StatisticsManager::GetInstance().BeginRangeQuery(name, cmdList, ctx);
+    }
+
+    bool BeginSubRangeQuery(std::string_view name, rhi::CommandList& cmdList, QueryRecordingContext& ctx) override {
+        return StatisticsManager::GetInstance().BeginSubRangeQuery(name, cmdList, ctx);
+    }
+
+    void EndRangeQuery(rhi::CommandList& cmdList, QueryRecordingContext& ctx) override {
+        StatisticsManager::GetInstance().EndRangeQuery(cmdList, ctx);
+    }
+
+    const std::vector<CompletedTimestamp>& GetCompletedTimestamps() const override {
+        return StatisticsManager::GetInstance().GetCompletedTimestamps();
+    }
 };
 }
 

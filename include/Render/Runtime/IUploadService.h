@@ -141,6 +141,32 @@ public:
         (void)out; (void)frameIndex;
         return 0;
     }
+    // Where the uploads go, for a host that splits them between queues (RenderGraph::RecordPendingUploads' queue-scoped uploads).
+    // TakeRecordedUploads, also appending to `destinations` every buffer backing the taken lists write. False when that is not
+    // known (the default, unless nothing was taken): the caller then treats the lists as writing anything.
+    virtual bool TakeRecordedUploadsWithDestinations(std::vector<rhi::CommandList>& out, uint8_t frameIndex,
+        std::vector<rhi::ResourceHandle>& destinations) {
+        (void)destinations;
+        const size_t before = out.size();
+        TakeRecordedUploads(out, frameIndex);
+        return out.size() == before;
+    }
+    // Owner thread, direct mode: appends the destination backing of every copy RecordStagedUploads would record now, one per copy
+    // in recording order. False when one is not known (the default): the caller then records them with RecordStagedUploads.
+    virtual bool StagedUploadDestinations(std::vector<rhi::ResourceHandle>& out) const {
+        (void)out;
+        return false;
+    }
+    // RecordStagedUploads, with each copy recorded into the list `route` names for its destination backing (null: `list`) instead:
+    // the copies of one destination all go to the same list, in order. Each list that takes a copy starts with afterWork's barrier.
+    // Returns the copies recorded in all; routed counts those that went elsewhere than `list`. Only a service whose
+    // StagedUploadDestinations answers routes (the default records everything into `list`).
+    virtual size_t RecordStagedUploadsRouted(rhi::CommandList& list, uint8_t frameIndex, bool afterWork,
+        const std::function<rhi::CommandList*(rhi::ResourceHandle)>& route, size_t& routed) {
+        (void)route;
+        routed = 0;
+        return RecordStagedUploads(list, frameIndex, afterWork);
+    }
     virtual void ProcessDeferredReleases(uint8_t frameIndex) = 0;
     // Owner thread: ProcessDeferredReleases, except that the GPU objects retiring at this step are handed back instead of
     // destroyed here. They are already safe to destroy; they go when the returned owner is dropped, on the thread that

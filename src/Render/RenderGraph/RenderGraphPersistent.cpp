@@ -14,6 +14,7 @@
 #include "Render/RenderGraph/RenderGraph.h"
 #include "RenderGraphCompilerState.h"
 #include "FrameRecording.h"
+#include "ScheduleTraceBuild.h"
 #include "Render/RenderGraph/ExperimentalRhiExecution.h"
 #include "Render/RenderGraph/PersistentGraph.h"
 #include "Render/Runtime/ScopedActiveGraphServices.h"
@@ -243,6 +244,24 @@ struct RenderGraph::PersistentTicket {
 	std::atomic<Candidate*> candidates{nullptr};
 	const Candidate* chosen = nullptr;
 	std::vector<Segment> displaced;  // a live ticket's own segment, which a bound candidate replaced
+	// What SubmitPersistentTicket added to every batch's waits (schedule introspection, read when the owner completes it).
+	std::pair<uint32_t, uint64_t> submittedUploads{UINT32_MAX, 0};
+	uint64_t submittedFrameWait = 0;
+	// The ticket's uploads planned by queue (RecordPendingUploads with queue lists), for SubmitPersistentTicket; written by the
+	// submitting thread before it submits, read by the owner after the ticket's Submitted message (schedule introspection).
+	struct QueueUploads {
+		bool planned = false;  // false: every batch off the uploads' queue waits for them
+		std::vector<uint8_t> waitsForUploads;  // per batch of segments.front(): it uses what the graphics uploads write
+		uint32_t spared = 0;  // batches off the graphics queue that do not (statistics)
+		// A list of uploads recorded on a batch's queue, submitted just ahead of that batch (its queue's first in the ticket).
+		struct Leading {
+			uint32_t batch = 0;
+			rhi::CommandList list{};
+			size_t copies = 0;
+			std::vector<experimental::ExecutionTimelinePoint> waits;  // against earlier executions' use of its destinations
+		};
+		std::vector<Leading> leading;
+	} queueUploads;
 	PersistentTicket() = default;
 	PersistentTicket(const PersistentTicket&) = delete;
 	PersistentTicket& operator=(const PersistentTicket&) = delete;
@@ -455,6 +474,16 @@ struct RenderGraph::PersistentExecutionState {
 	uint64_t pendingPresentSubmission = 0;
 	uint64_t structuralBuilds = 0, bindingBuilds = 0;
 	std::vector<uint8_t> tracyFrameBegun;
+	// Schedule introspection (RenderGraph::SetScheduleTraceEnabled), owner thread.
+	struct ScheduleTraces {
+		const void* executable = nullptr;  // the traced whole-frame executable (not retained), with its revision
+		uint64_t structuralRevision = 0;
+		std::vector<std::pair<const void*, std::shared_ptr<const ScheduleTrace>>> traces;  // by executable: the frame's, then each epoch's
+		std::vector<ScheduleSubmissionWaits> submissions;  // the latest of each label
+		std::vector<uint8_t> recorded;                     // per submission: recorded since the last publication
+		ScheduleSubmissionWaits scratch;                   // one execution's, filled before it is recorded (capacity reused)
+	};
+	ScheduleTraces scheduleTraces;
 };
 
 namespace {
@@ -1091,6 +1120,9 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 					basic_telemetry::AddCounter("ORG.Ownership.RetirementRejected");
 			});
 		state.admission->SetClosedExecutions(m_persistentClosedExecutions);
+		// Tickets record their uploads on the graphics queue, or on the queue that first uses them (RecordPendingUploads).
+		if (m_queueRegistry.SlotCount())
+			state.admission->SetUploadQueue(static_cast<uint32_t>(ToUnderlying(m_queueRegistry.FindGraphicsSlot())));
 		// Classify master passes into segments.
 		state.mainPassByMaster.assign(m_masterPassList.size(), UINT32_MAX);
 		state.masterHostedInMain.assign(m_masterPassList.size(), 0);
@@ -1487,6 +1519,11 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 	if (m_getRenderGraphCompileDumpEnabled && m_getRenderGraphCompileDumpEnabled() && state.dumpedExecutable != selected->executable.get()) {
 		state.dumpedExecutable = selected->executable.get();
 		WritePersistentGraphDebugDump(*selected);
+	}
+	if (m_scheduleTraceEnabled.load(std::memory_order_relaxed)) RefreshPersistentScheduleTraces(*selected);
+	else if (state.scheduleTraces.executable) {
+		state.scheduleTraces = {};
+		m_scheduleSnapshot.store(nullptr, std::memory_order_release);
 	}
 	if (state.bindingsFor != selected.get()) {
 		BT_ZONE_SCOPE("ORG.Persistent.BuildLegacyBindingTable");
@@ -2601,6 +2638,73 @@ void RenderGraph::AdvancePersistentStructuralBuild(std::vector<uint32_t>& struct
 	state.pending.reset();
 }
 
+namespace {
+
+// Schedule introspection names: a pass by its logical slot's debug name (the main pass's name when it has none), a resource by
+// its slot's registry object, a queue by its kind and instance.
+ScheduleTraceNames ScheduleTraceNamesOf(const State& state, const persistent::SelectedPublication& selected, const QueueRegistry& registry) {
+	ScheduleTraceNames names;
+	names.pass = [&state, logical = selected.logical.get()](uint32_t prepared) -> std::string {
+		if (logical && prepared < logical->passSlots.size() && !logical->passSlots[prepared].debugName.empty())
+			return logical->passSlots[prepared].debugName;
+		for (const auto& main : state.mainPasses)
+			if (!main.retired && main.id.index == prepared) return main.name;
+		return {};
+	};
+	names.resource = [&state](uint32_t slot) -> std::string {
+		if (slot >= state.entries.size()) return {};
+		const auto& entry = state.entries[slot];
+		return entry.resource && !entry.retired ? entry.resource->GetName() : std::string{};
+	};
+	for (size_t slot = 0; slot < registry.SlotCount(); ++slot) {
+		const auto index = static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot));
+		const auto kind = registry.GetKind(index);
+		std::string name = kind == QueueKind::Graphics ? "graphics" : kind == QueueKind::Compute ? "compute" : "copy";
+		if (const auto instance = registry.GetInstance(index)) name += " " + std::to_string(instance);
+		names.queues.push_back(std::move(name));
+	}
+	return names;
+}
+
+std::string ScheduleTraceEpochLabel(uint32_t epoch) { return "epoch " + std::to_string(epoch); }
+
+// One execution's waits beyond its batches' own (ScheduleTrace::waits), per batch: its admission's incoming waits (the frame
+// values' timeline among them for a synchronous execution), and what a ticket adds at submission (SubmitPersistentTicket): the
+// uploads ahead of it, on every other queue (or, planned by queue, on the batches that use what they write, with the uploads
+// recorded on a batch's own queue noted on it), and the frame values. Zero values are no wait (submission drops them).
+void FillScheduleSubmissionWaits(ScheduleSubmissionWaits& out, const experimental::CompiledGraph& graph,
+	const std::vector<std::vector<experimental::ExecutionTimelinePoint>>& incoming, std::pair<uint32_t, uint64_t> uploadsDone, uint64_t frameWait,
+	const RenderGraph::PersistentTicket::QueueUploads* queueUploads = nullptr) {
+	using Source = ScheduleSubmissionWaits::Point::Source;
+	const bool planned = queueUploads && queueUploads->planned && queueUploads->waitsForUploads.size() == graph.batches.size();
+	out.batches.resize(graph.batches.size());
+	for (uint32_t batch = 0; batch < graph.batches.size(); ++batch) {
+		auto& traced = out.batches[batch];
+		traced.points.clear();
+		traced.externalEntryBarrier = traced.externalExitBarrier = false;
+		traced.queueUploadCopies = 0;
+		traced.queueUploadWaits.clear();
+		if (batch < incoming.size())
+			for (const auto& wait : incoming[batch])
+				if (wait.value)
+					traced.points.push_back({wait.timeline == RenderGraph::kFrameWaitTimelineIdentity ? Source::FrameValues : Source::Incoming,
+						wait.timeline, wait.value});
+		if (uploadsDone.second && graph.batches[batch].queue != uploadsDone.first && (!planned || queueUploads->waitsForUploads[batch]))
+			traced.points.push_back({Source::Uploads, uint64_t{uploadsDone.first} + 1, uploadsDone.second});
+		if (frameWait) traced.points.push_back({Source::FrameValues, RenderGraph::kFrameWaitTimelineIdentity, frameWait});
+	}
+	if (planned)
+		for (const auto& leading : queueUploads->leading) {
+			if (leading.batch >= out.batches.size() || !leading.copies) continue;
+			auto& traced = out.batches[leading.batch];
+			traced.queueUploadCopies += leading.copies;
+			for (const auto wait : leading.waits)
+				if (wait.value) traced.queueUploadWaits.push_back({Source::Incoming, wait.timeline, wait.value});
+		}
+}
+
+} // namespace
+
 // Compile-dump mode for the persistent graph. The legacy compiler rewrites its
 // dump every compiled frame; the persistent executable changes only on
 // structural builds, so it is written once per selected executable: batches in
@@ -2670,6 +2774,11 @@ void RenderGraph::WritePersistentGraphDebugDump(const persistent::SelectedPublic
 			}
 			dump << "\n";
 		}
+		// The schedules explained: every cross-queue wait of the executable and of each epoch's, with its causes.
+		const auto traceNames = ScheduleTraceNamesOf(state, selected, m_queueRegistry);
+		dump << "\n" << ScheduleTraceToText(*BuildScheduleTrace(executable, traceNames, "frame", UINT32_MAX));
+		for (const auto& [epoch, split] : executable.epochs)
+			if (split) dump << "\n" << ScheduleTraceToText(*BuildScheduleTrace(*split, traceNames, ScheduleTraceEpochLabel(epoch), epoch));
 		namespace fs = std::filesystem;
 		std::error_code error;
 		fs::path directory = fs::current_path(error);
@@ -2684,6 +2793,126 @@ void RenderGraph::WritePersistentGraphDebugDump(const persistent::SelectedPublic
 	} catch (const std::exception& e) {
 		spdlog::warn("Failed to write persistent render graph dump: {}", e.what());
 	}
+}
+
+void RenderGraph::SetScheduleTraceEnabled(bool enabled) noexcept {
+	m_scheduleTraceEnabled.store(enabled, std::memory_order_release);
+	if (!enabled) m_scheduleSnapshot.store(nullptr, std::memory_order_release);
+}
+
+bool RenderGraph::ScheduleTraceEnabled() const noexcept { return m_scheduleTraceEnabled.load(std::memory_order_acquire); }
+
+std::shared_ptr<const PersistentScheduleSnapshot> RenderGraph::GetPersistentScheduleSnapshot() const {
+	if (!m_scheduleTraceEnabled.load(std::memory_order_acquire)) return {};
+	return m_scheduleSnapshot.load(std::memory_order_acquire);
+}
+
+void RenderGraph::RefreshPersistentScheduleTraces(const persistent::SelectedPublication& selected) {
+	auto& state = *m_compilerState->persistent;
+	auto& traces = state.scheduleTraces;
+	const auto* executable = selected.executable.get();
+	if (!executable || (traces.executable == executable && traces.structuralRevision == executable->structuralRevision)) return;
+	BT_ZONE_SCOPE("ORG.Persistent.BuildScheduleTraces");
+	const auto names = ScheduleTraceNamesOf(state, selected, m_queueRegistry);
+	traces.traces.clear();
+	traces.traces.emplace_back(executable, BuildScheduleTrace(*executable, names, "frame", UINT32_MAX));
+	for (const auto& [epoch, split] : executable->epochs)
+		if (split) traces.traces.emplace_back(split.get(), BuildScheduleTrace(*split, names, ScheduleTraceEpochLabel(epoch), epoch));
+	traces.executable = executable;
+	traces.structuralRevision = executable->structuralRevision;
+	// Recorded submissions index the previous executables' batches.
+	traces.submissions.clear();
+	traces.recorded.clear();
+	PublishPersistentScheduleSnapshot();
+}
+
+void RenderGraph::RecordPersistentScheduleSubmission(const persistent::ExecutableGeneration& executable, const char* segmentLabel, uint64_t frame) {
+	auto& state = *m_compilerState->persistent;
+	auto& traces = state.scheduleTraces;
+	auto traceOf = [&]() -> const ScheduleTrace* {
+		for (const auto& [key, value] : traces.traces)
+			if (key == &executable) return value.get();
+		return nullptr;
+	};
+	const std::string_view segment = segmentLabel;
+	const bool dynamic = segment == "Pre" || segment == "Tail";
+	const auto* trace = traceOf();
+	if (!trace && !dynamic) {
+		// Selected since this graph last prepared a frame (a ticket prepared from a revision's recording).
+		RefreshPersistentScheduleTraces(*state.program.Select());
+		trace = traceOf();
+	}
+	// An executable no longer selected (an older revision's recording) matches no trace: not recorded.
+	if (!trace && !dynamic) return;
+	const std::string_view label = trace ? std::string_view(trace->label) : segment == "Pre" ? std::string_view("pre") : std::string_view("tail");
+	size_t index = 0;
+	while (index < traces.submissions.size() && traces.submissions[index].label != label) ++index;
+	if (index == traces.submissions.size()) {
+		traces.submissions.emplace_back().label = label;
+		traces.recorded.push_back(0);
+	} else if (traces.recorded[index]) {
+		// A label's second execution since the last publication: the round before it is complete.
+		PublishPersistentScheduleSnapshot();
+	}
+	auto& submission = traces.submissions[index];
+	submission.frame = frame;
+	std::swap(submission.batches, traces.scratch.batches);
+	traces.recorded[index] = 1;
+}
+
+void RenderGraph::RecordPersistentTicketScheduleSubmissions(const PersistentTicket& ticket) {
+	auto& state = *m_compilerState->persistent;
+	const size_t slotCount = m_queueRegistry.SlotCount();
+	// The boundary barriers ExecutePersistentFrame records a ticket's segments with (a ticket has no Pre/Tail segments, so they are
+	// its execution's only ones; a kept or revision recording was recorded as a ticket's too): the host's queue boundary at each
+	// queue's first and last batch across them, and a closed execution's full barrier at each queue's first batch of a segment.
+	using Position = std::pair<size_t, uint32_t>;
+	std::vector<Position> first(slotCount, {SIZE_MAX, 0}), last(slotCount, {SIZE_MAX, 0});
+	for (size_t segmentIndex = 0; segmentIndex < ticket.segments.size(); ++segmentIndex) {
+		const auto& segment = ticket.segments[segmentIndex];
+		if (!segment.recording) continue;
+		const auto& segmentBatches = segment.admission.publication->executable->graph->batches;
+		for (uint32_t batch = 0; batch < segmentBatches.size(); ++batch) {
+			const auto slot = segmentBatches[batch].queue;
+			if (slot >= slotCount) continue;
+			if (first[slot].first == SIZE_MAX) first[slot] = {segmentIndex, batch};
+			last[slot] = {segmentIndex, batch};
+		}
+	}
+	std::vector<uint8_t> closedEntryDone(slotCount);
+	for (size_t segmentIndex = 0; segmentIndex < ticket.segments.size(); ++segmentIndex) {
+		const auto& segment = ticket.segments[segmentIndex];
+		if (!segment.recording) continue;
+		const auto& executable = *segment.admission.publication->executable;
+		const auto& graph = *executable.graph;
+		auto& waits = state.scheduleTraces.scratch;
+		FillScheduleSubmissionWaits(waits, graph, segment.admission.incomingWaits, ticket.submittedUploads, ticket.submittedFrameWait,
+			&ticket.queueUploads);
+		std::fill(closedEntryDone.begin(), closedEntryDone.end(), uint8_t{0});
+		for (uint32_t batch = 0; batch < graph.batches.size(); ++batch) {
+			const auto slot = graph.batches[batch].queue;
+			if (slot >= slotCount) continue;
+			const Position position{segmentIndex, batch};
+			bool entry = m_externalQueueBoundary.entry && first[slot] == position;
+			if (segment.admission.closed && !closedEntryDone[slot]) {
+				entry = true;
+				closedEntryDone[slot] = 1;
+			}
+			waits.batches[batch].externalEntryBarrier = entry;
+			waits.batches[batch].externalExitBarrier = m_externalQueueBoundary.exit && last[slot] == position;
+		}
+		RecordPersistentScheduleSubmission(executable, "Main", ticket.hostFrame);
+	}
+}
+
+void RenderGraph::PublishPersistentScheduleSnapshot() {
+	auto& traces = m_compilerState->persistent->scheduleTraces;
+	auto snapshot = std::make_shared<PersistentScheduleSnapshot>();
+	snapshot->executables.reserve(traces.traces.size());
+	for (const auto& entry : traces.traces) snapshot->executables.push_back(entry.second);
+	snapshot->lastSubmission = traces.submissions;
+	std::fill(traces.recorded.begin(), traces.recorded.end(), uint8_t{0});
+	m_scheduleSnapshot.store(std::move(snapshot), std::memory_order_release);
 }
 
 // Frame-interrupting per-frame passes (ExternalPassDesc::interruptsFrame, e.g.
@@ -3196,6 +3425,7 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 	if (!state.framePrepared) throw std::logic_error("Persistent execution has no prepared frame");
 	auto& timings = m_lastPersistentExecuteTimings;
 	timings = {};
+	const bool traceSchedule = m_scheduleTraceEnabled.load(std::memory_order_relaxed);
 	auto lap = [last = std::chrono::steady_clock::now()](double& a_into) mutable {
 		const auto now = std::chrono::steady_clock::now();
 		a_into += std::chrono::duration<double, std::micro>(now - last).count();
@@ -3353,13 +3583,23 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 				statistics->service = m_statisticsService;
 				statistics->frameIndex = state.frameIndex;
 				statistics->queueKind = rhiKind;
-				// A recording kept for resubmission records no GPU queries: the statistics service recreates its query pools and
-				// readback buffers as passes register, and a resubmitted list would resolve into the freed ones.
-				statistics->gpuQueries = queueKind != QueueKind::Copy && !keepable
+				// A recording kept for resubmission records no queries of the shared pool: the statistics service recreates it and
+				// its readback buffers as passes register (a resubmitted list would resolve into the freed ones), and its slots are
+				// frame-indexed. With recording timestamps it owns its own instead: a range per pass, per barrier batch around one
+				// (before and after it) and for the list's entry and exit barriers.
+				statistics->gpuQueries = queueKind != QueueKind::Copy && (!keepable || m_persistentRecordingTimestamps)
 					&& m_queueRegistry.GetBackendInstance(index) == BackendInstanceId::Primary;
 				for (const auto& pass : job.recording.passes) {
 					const auto found = statisticsIndices.find(pass.DebugName());
 					statistics->passIndices.push_back(found == statisticsIndices.end() ? -1 : static_cast<int>(found->second));
+				}
+				if (keepable && statistics->gpuQueries) {
+					// Each pass's range and barrier batches, plus sub-ranges the passes time inside themselves (a draw pass's views
+					// or draw groups: BeginRecordingSubRange).
+					constexpr uint32_t kSubRanges = 256;
+					const auto ranges = static_cast<uint32_t>(job.recording.passes.size() * 3 + 3) + kSubRanges;
+					statistics->queries.owned = m_statisticsService->CreateOwnedTimestamps(rhiKind, ranges);
+					statistics->gpuQueries = static_cast<bool>(statistics->queries.owned);
 				}
 				job.recording.statistics = statistics;
 				recordingStatistics.push_back(std::move(statistics));
@@ -3371,6 +3611,17 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 						rhiKind == rhi::QueueKind::Graphics ? "Graphics" : rhiKind == rhi::QueueKind::Compute ? "Compute" : "Copy"});
 				}
 				job.recording.gpuPassRanges = ranges;
+			}
+		}
+		// Schedule introspection: an execution submitted here (a ticket's is recorded when the owner completes it) waits for its
+		// admission's incoming waits, the frame's values among them, and has the boundary barriers its jobs record.
+		const bool traceSubmission = traceSchedule && !ticketTarget;
+		if (traceSubmission) {
+			auto& waits = state.scheduleTraces.scratch;
+			FillScheduleSubmissionWaits(waits, graph, admission.incomingWaits, {UINT32_MAX, 0}, 0);
+			for (uint32_t batch = 0; batch < graph.batches.size(); ++batch) {
+				waits.batches[batch].externalEntryBarrier = jobs[batch].recording.externalEntryBarrier;
+				waits.batches[batch].externalExitBarrier = jobs[batch].recording.externalExitBarrier;
 			}
 		}
 		lap(timings.admissionUs);
@@ -3459,6 +3710,7 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 			BT_ZONE_SCOPE("ORG.Persistent.CommitAdmission");
 			state.admission->Commit(admission, *execution);
 		}
+		if (traceSubmission) RecordPersistentScheduleSubmission(*segment.publication->executable, segment.label, state.frameNumber);
 		for (const auto& statistics : recordingStatistics) statistics->Publish();
 		for (size_t batch = 0; batch < execution->batches.size(); ++batch)
 			m_queueRegistry.EnsureNextFenceValueAtLeast(static_cast<QueueSlotIndex>(static_cast<uint8_t>(graph.batches[batch].queue)),
@@ -3619,6 +3871,7 @@ std::vector<std::pair<uint32_t, uint64_t>> RenderGraph::CompletePersistentTicket
 			else found->second = (std::max)(found->second, signals[batch].value);
 		}
 	}
+	if (submission.submitted && m_scheduleTraceEnabled.load(std::memory_order_relaxed)) RecordPersistentTicketScheduleSubmissions(ticket);
 	for (auto* candidate = ticket.candidates.load(std::memory_order_acquire); candidate; candidate = candidate->next)
 		if (candidate != ticket.chosen) state.admission->Abandon(candidate->segment.admission);
 	for (auto& segment : ticket.displaced) state.admission->Abandon(segment.admission);
@@ -3638,6 +3891,9 @@ uint8_t RenderGraph::PersistentTicketSlot(const PersistentTicket& ticket) noexce
 uint64_t RenderGraph::PersistentTicketHostFrame(const PersistentTicket& ticket) noexcept { return ticket.hostFrame; }
 uint64_t RenderGraph::PersistentTicketHostTag(const PersistentTicket& ticket) noexcept { return ticket.hostTag; }
 void RenderGraph::SetPersistentTicketHostTag(PersistentTicket& ticket, uint64_t tag) noexcept { ticket.hostTag = tag; }
+uint32_t RenderGraph::PersistentTicketSparedUploadWaits(const PersistentTicket& ticket) noexcept {
+	return ticket.queueUploads.planned ? ticket.queueUploads.spared : 0;
+}
 
 bool RenderGraph::AdoptKeptPersistentRecording(PersistentTicket& ticket, uint64_t hostTag) {
 	BT_ZONE_SCOPE("ORG.Persistent.AdoptKeptRecording");
@@ -3778,20 +4034,27 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 	std::pair<uint32_t, uint64_t> uploadsDone, uint64_t frameWait) {
 	BT_ZONE_SCOPE("ORG.Persistent.SubmitTicket");
 	out = {};
+	ticket.submittedUploads = uploadsDone;
+	ticket.submittedFrameWait = frameWait;
+	const auto& planned = ticket.queueUploads;
+	if (planned.planned && ticket.segments.size() != 1) throw std::logic_error("Queue-scoped uploads planned for a ticket of several segments");
 	for (auto& segment : ticket.segments) {
 		const auto& graph = *segment.admission.publication->executable->graph;
 		// The same timeline composition the owner's RecordSubmitted will derive from these values: the
 		// execution's incoming waits plus its batches' waits on each other.
 		std::vector<experimental::ExecutionBatchTimeline> batches(graph.batches.size());
 		const auto& incoming = segment.admission.incomingWaits;
+		if (planned.planned && planned.waitsForUploads.size() != graph.batches.size())
+			throw std::logic_error("Queue-scoped uploads planned for other batches");
 		for (uint32_t batch = 0; batch < graph.batches.size(); ++batch) {
 			const auto queue = graph.batches[batch].queue;
 			if (queue >= nextQueueValues.size()) throw std::logic_error("Ticket batch on an unknown queue");
 			batches[batch].signal = {uint64_t{queue} + 1, ++nextQueueValues[queue]};
 			if (batch < incoming.size()) batches[batch].waits = incoming[batch];
 			// The uploads ahead of the ticket order only the batches on their own queue (its entry barrier): any other queue
-			// would otherwise read what this epoch's uploads write before they land.
-			if (uploadsDone.second && queue != uploadsDone.first)
+			// would otherwise read what this epoch's uploads write before they land. Planned by queue (RecordPendingUploads),
+			// only the batches that use what they write wait (the rest of theirs went to their own queue, ahead of them).
+			if (uploadsDone.second && queue != uploadsDone.first && (!planned.planned || planned.waitsForUploads[batch]))
 				batches[batch].waits.push_back({uint64_t{uploadsDone.first} + 1, uploadsDone.second});
 			// The frame's values (SetFrameWaitTimeline): every packet prepared since it was set binds the timeline.
 			if (frameWait)
@@ -3815,8 +4078,18 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 			BT_ZONE_SCOPE("ORG.Frame.SubmitPackets");
 			const auto& packets = segment.recording->packets;
 			if (packets.size() != batches.size()) throw std::logic_error("Ticket packets do not match its batches");
-			for (size_t i = 0; i < packets.size(); ++i)
+			for (size_t i = 0; i < packets.size(); ++i) {
+				// The uploads recorded on this batch's queue: on the queue just ahead of it, so it needs no wait for them (its
+				// closed execution's entry barrier orders it after them), with the waits their destinations need.
+				for (const auto& leading : planned.leading) {
+					if (leading.batch != i || !leading.copies) continue;
+					const auto* packet = dynamic_cast<const experimental::PreparedRhiExecutionBatch*>(packets[i].get());
+					if (!packet) throw std::logic_error("Queue-scoped uploads ahead of a packet that cannot take them");
+					auto list = leading.list;
+					if (!packet->SubmitLeading({&list, 1}, leading.waits)) return false;
+				}
 				if (!packets[i]->Submit(batches[i])) return false;
+			}
 		}
 	}
 	out.submitted = true;
@@ -3830,16 +4103,159 @@ ResourceRegistry::RegistryHandle TicketUploadResolveById(void*, ResourceIdentifi
 ResourceRegistry::RegistryHandle TicketUploadResolveByPtr(void*, Resource* resource, bool) {
 	return ResourceRegistry::RegistryHandle::MakeEphemeral(resource);
 }
+
+uint64_t UploadBufferKey(rhi::ResourceHandle handle) { return (uint64_t{handle.generation} << 32) | handle.index; }
+
+// Queue-scoped ticket uploads (RenderGraph::RecordPendingUploads): the staged destinations recorded on the queue that first uses
+// them instead of the graphics list, and the batches off the graphics queue that use what stays there.
+struct TicketUploadRouting {
+	std::unordered_map<uint64_t, uint32_t> routed;  // destination backing -> the queue slot its copies go to
+	std::vector<uint8_t> waitsForUploads;           // per batch: uses what the graphics list (or a recorded list) writes
+	std::vector<uint32_t> firstOnQueue;             // per queue slot: its first batch, UINT32_MAX for none
+	std::vector<size_t> copies;                     // per queue slot: the staged copies routed to it
+	std::vector<std::vector<experimental::ExecutionTimelinePoint>> waits;  // per queue slot: its upload list's waits
+};
+
+// graphicsBuffers: everything the graphics list and the recorded lists touch (known). staged: the staged copies' destinations, one
+// per copy. False when the ticket cannot be planned: every batch off the graphics queue then waits for the uploads, as before.
+bool PlanTicketUploads(const RenderGraph::PersistentTicket& ticket, uint32_t graphicsQueue, std::span<rhi::CommandList> queueLists,
+	std::span<const rhi::ResourceHandle> graphicsBuffers, std::span<const rhi::ResourceHandle> staged, TicketUploadRouting& out) {
+	BT_ZONE_SCOPE("ORG.Persistent.PlanTicketUploads");
+	if (ticket.segments.size() != 1) return false;
+	const auto& segment = ticket.segments.front();
+	if (!segment.recording || !segment.admission.publication || !segment.admission.publication->executable
+		|| !segment.admission.publication->executable->graph)
+		return false;
+	const auto& graph = *segment.admission.publication->executable->graph;
+	const auto& backings = segment.admission.backings;
+	const auto& packets = segment.recording->packets;
+	const auto batchCount = static_cast<uint32_t>(graph.batches.size());
+	if (!graph.structure || backings.size() != graph.structure->resourceIDs.size() || packets.size() != batchCount
+		|| graph.boundaryAccessesByBatch.size() != batchCount)
+		return false;
+	uint32_t queueCount = 0;
+	for (const auto& batch : graph.batches) queueCount = (std::max)(queueCount, batch.queue + 1);
+	out.firstOnQueue.assign(queueCount, UINT32_MAX);
+	for (uint32_t batch = 0; batch < batchCount; ++batch)
+		if (out.firstOnQueue[graph.batches[batch].queue] == UINT32_MAX) out.firstOnQueue[graph.batches[batch].queue] = batch;
+	out.copies.assign(queueCount, 0);
+	out.waits.assign(queueCount, {});
+	out.waitsForUploads.assign(batchCount, 0);
+
+	// Every destination's uses in the ticket, in batch order: (batch, compiler resource), through each resource's backing for
+	// this execution. Several compiler resources may share a backing; an aliased one is never routed (another backing may share
+	// its memory).
+	struct Destination {
+		std::vector<std::pair<uint32_t, uint32_t>> uses;
+		bool graphics = false;  // written by the graphics list or a recorded list
+		bool staged = false;
+		bool aliased = false;
+	};
+	std::unordered_map<uint64_t, Destination> destinations;
+	destinations.reserve(graphicsBuffers.size() + staged.size());
+	for (const auto handle : graphicsBuffers) destinations[UploadBufferKey(handle)].graphics = true;
+	for (const auto handle : staged) destinations[UploadBufferKey(handle)].staged = true;
+	for (uint32_t batch = 0; batch < batchCount; ++batch)
+		for (const auto& access : graph.boundaryAccessesByBatch[batch]) {
+			if (access.resource >= backings.size()) continue;
+			const auto& backing = backings[access.resource];
+			if (!backing.resource.valid()) continue;
+			const auto found = destinations.find(UploadBufferKey(backing.resource));
+			if (found == destinations.end()) continue;
+			auto& uses = found->second.uses;
+			if (uses.empty() || uses.back() != std::pair{batch, access.resource}) uses.push_back({batch, access.resource});
+			if (backing.aliasSize || backing.aliasHeapIdentity || backing.aliasHeap) found->second.aliased = true;
+		}
+
+	// Whether each batch is ordered after a queue's first batch: on that queue, or behind a batch that is (its queue's order,
+	// or a wait). Only waits on earlier batches count; anything else is taken as unordered.
+	std::vector<std::vector<uint32_t>> producers(batchCount);
+	for (const auto wait : graph.relativeWaits)
+		if (wait.consumerBatch < batchCount && wait.producerBatch < wait.consumerBatch) producers[wait.consumerBatch].push_back(wait.producerBatch);
+	std::vector<std::vector<uint8_t>> after(queueCount);
+	auto orderedAfter = [&](uint32_t queue) -> const std::vector<uint8_t>& {
+		auto& ordered = after[queue];
+		if (!ordered.empty()) return ordered;
+		ordered.assign(batchCount, 0);
+		std::vector<uint32_t> previousOnQueue(queueCount, UINT32_MAX);
+		for (uint32_t batch = 0; batch < batchCount; ++batch) {
+			const auto batchQueue = graph.batches[batch].queue;
+			bool behind = batchQueue == queue;  // every batch of the queue is at or after its first
+			if (!behind && previousOnQueue[batchQueue] != UINT32_MAX) behind = ordered[previousOnQueue[batchQueue]] != 0;
+			for (const auto producer : producers[batch]) behind = behind || ordered[producer] != 0;
+			ordered[batch] = behind ? 1 : 0;
+			previousOnQueue[batchQueue] = batch;
+		}
+		return ordered;
+	};
+
+	// A staged destination goes to the queue of its first use, when that is not the graphics queue and has a list, nothing on the
+	// graphics list touches it, every use is ordered after that queue's first batch (where its list goes), and the earlier
+	// executions' use of it is known (the admission's boundary access waits) and can be waited for there.
+	const auto& incoming = segment.admission.incomingWaits;
+	const auto& boundary = segment.admission.boundaryAccessWaits;
+	const bool earlierUseKnown = boundary.size() == batchCount;
+	std::vector<experimental::ExecutionTimelinePoint> waits;
+	for (auto& [key, destination] : destinations) {
+		if (!destination.staged || destination.graphics || destination.aliased || destination.uses.empty() || !earlierUseKnown) continue;
+		const auto queue = graph.batches[destination.uses.front().first].queue;
+		if (queue == graphicsQueue || queue >= queueLists.size() || !queueLists[queue]) continue;
+		const auto* packet = dynamic_cast<const experimental::PreparedRhiExecutionBatch*>(packets[out.firstOnQueue[queue]].get());
+		if (!packet) continue;
+		const auto& ordered = orderedAfter(queue);
+		if (!std::ranges::all_of(destination.uses, [&](const auto& use) { return ordered[use.first] != 0; })) continue;
+		// What a write of it on this queue, ahead of the execution, must wait for: every earlier use the ledger holds (any queue;
+		// its own queue is ordered by the list's barrier), and what each batch using it waits for at entry.
+		waits.clear();
+		const uint64_t ownTimeline = uint64_t{queue} + 1;
+		auto addWait = [&](experimental::ExecutionTimelinePoint point) {
+			if (!point.timeline || !point.value || point.timeline == ownTimeline) return;
+			const auto found = std::ranges::find(waits, point.timeline, &experimental::ExecutionTimelinePoint::timeline);
+			if (found == waits.end()) waits.push_back(point);
+			else found->value = (std::max)(found->value, point.value);
+		};
+		for (const auto& [batch, resource] : destination.uses) {
+			if (batch < incoming.size()) for (const auto point : incoming[batch]) addWait(point);
+			for (const auto& [waitResource, point] : boundary[batch])
+				if (waitResource == resource) addWait(point);
+		}
+		if (!std::ranges::all_of(waits, [&](const auto& point) { return packet->BindsTimeline(point.timeline); })) continue;
+		out.routed.emplace(key, queue);
+		for (const auto point : waits) {
+			auto& queueWaits = out.waits[queue];
+			const auto found = std::ranges::find(queueWaits, point.timeline, &experimental::ExecutionTimelinePoint::timeline);
+			if (found == queueWaits.end()) queueWaits.push_back(point);
+			else found->value = (std::max)(found->value, point.value);
+		}
+	}
+	for (const auto handle : staged)
+		if (const auto found = out.routed.find(UploadBufferKey(handle)); found != out.routed.end()) ++out.copies[found->second];
+
+	// The batches off the graphics queue that use what stays on it wait for the graphics list.
+	for (const auto& [key, destination] : destinations) {
+		if (out.routed.contains(key)) continue;
+		for (const auto& use : destination.uses)
+			if (graph.batches[use.first].queue != graphicsQueue) out.waitsForUploads[use.first] = 1;
+	}
+	return true;
+}
 }
 
 bool RenderGraph::RecordPendingUploads(rhi::Device device, rhi::CommandList& list, uint8_t slot, std::shared_ptr<void>& keepAlive, bool& recorded,
-	std::vector<rhi::CommandList>& recordedLists) {
+	std::vector<rhi::CommandList>& recordedLists, PersistentTicket* ticket, std::span<rhi::CommandList> queueLists, size_t* queueCopies) {
 	BT_ZONE_SCOPE("ORG.Persistent.RecordPendingUploads");
 	recorded = false;
 	recordedLists.clear();
+	if (queueCopies) *queueCopies = 0;
+	if (ticket) ticket->queueUploads = {};
 	if (!m_uploadService) return true;
+	// Queue-scoped (see the declaration): everything the graphics list and the recorded lists touch, while it is known.
+	const bool scoped = ticket && !queueLists.empty() && m_queueRegistry.SlotCount();
+	std::vector<rhi::ResourceHandle> graphicsBuffers;
+	bool graphicsKnown = true;
 	// Before the staged batches: an outdated recording goes back among them, first.
-	m_uploadService->TakeRecordedUploads(recordedLists, slot);
+	if (scoped) graphicsKnown = m_uploadService->TakeRecordedUploadsWithDestinations(recordedLists, slot, graphicsBuffers);
+	else m_uploadService->TakeRecordedUploads(recordedLists, slot);
 	// Every copy follows one full barrier against the work before them (see the declaration).
 	bool barrier = false;
 	auto orderAfterPreviousWork = [&] {
@@ -3856,10 +4272,50 @@ bool RenderGraph::RecordPendingUploads(rhi::Device device, rhi::CommandList& lis
 		// Direct staged batches carry resolved destinations: one copy each, after the queued uploads, so a
 		// producer's payload replaces what was queued before it. The service orders them after the work before them
 		// (the queued copies, or the previous execution) with one barrier, and records none when it has no batch.
-		if (m_uploadService->RecordStagedUploads(list, slot, true)) recorded = true;
+		std::vector<rhi::ResourceHandle> staged;
+		TicketUploadRouting routing;
+		const auto graphicsQueue = scoped ? static_cast<uint32_t>(ToUnderlying(m_queueRegistry.FindGraphicsSlot())) : UINT32_MAX;
+		if (!scoped || !graphicsKnown || !m_uploadService->StagedUploadDestinations(staged)
+			|| !PlanTicketUploads(*ticket, graphicsQueue, queueLists, graphicsBuffers, staged, routing)) {
+			// Not planned: every batch off the graphics queue waits for the uploads.
+			if (m_uploadService->RecordStagedUploads(list, slot, true)) recorded = true;
+			return true;
+		}
+		// Planned by queue: each routed destination's copies into its queue's list (behind that list's own barrier against the
+		// work before it on that queue), the rest into `list`.
+		size_t routed = 0;
+		const size_t copies = m_uploadService->RecordStagedUploadsRouted(list, slot, true,
+			[&](rhi::ResourceHandle destination) -> rhi::CommandList* {
+				const auto found = routing.routed.find(UploadBufferKey(destination));
+				return found == routing.routed.end() ? nullptr : &queueLists[found->second];
+			}, routed);
+		size_t expected = 0;
+		for (const auto count : routing.copies) expected += count;
+		// The batches that use a routed destination do not wait for the graphics list: a service that kept a copy there would
+		// race them.
+		if (routed != expected) throw std::logic_error("The upload service did not record the staged uploads on the queues asked");
+		if (copies > routed) recorded = true;
+		auto& plan = ticket->queueUploads;
+		plan.planned = true;
+		plan.waitsForUploads = std::move(routing.waitsForUploads);
+		const auto& planGraph = *ticket->segments.front().admission.publication->executable->graph;
+		for (uint32_t batch = 0; batch < plan.waitsForUploads.size(); ++batch)
+			if (planGraph.batches[batch].queue != graphicsQueue && !plan.waitsForUploads[batch]) ++plan.spared;
+		for (uint32_t queue = 0; queue < routing.copies.size(); ++queue) {
+			if (!routing.copies[queue]) continue;
+			plan.leading.push_back({routing.firstOnQueue[queue], queueLists[queue], routing.copies[queue], std::move(routing.waits[queue])});
+		}
+		if (queueCopies) *queueCopies = routed;
 		return true;
 	};
-	if (!immediate) return recordStaged();
+	if (!immediate) {
+		try {
+			return recordStaged();
+		} catch (const std::exception& e) {
+			spdlog::error("Ticket uploads could not be recorded: {}", e.what());
+			return false;
+		}
+	}
 	try {
 		ImmediateExecutionContext context{device, {org::imm::ImmediatePassKind::Copy, m_immediateDispatch,
 			&TicketUploadResolveById, &TicketUploadResolveByPtr, nullptr}, slot, nullptr};
@@ -3883,6 +4339,7 @@ bool RenderGraph::RecordPendingUploads(rhi::Device device, rhi::CommandList& lis
 		// after it (the next execution's full barrier comes after them), so they start with one of their own.
 		orderAfterPreviousWork();
 		copies->Record(list);
+		if (scoped) copies->AppendBuffers(graphicsBuffers);
 		struct Owned {
 			std::shared_ptr<const org::imm::PreparedBufferCopies> copies;
 			std::unique_ptr<org::imm::KeepAliveBag> bag;

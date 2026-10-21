@@ -62,6 +62,12 @@ public:
 		// instead of recording, and a ticket the beforeSubmit callback made stale takes the kept recording of what it depends
 		// on now instead of being prepared again (a wait). Kept recordings carry no profiler GPU zones.
 		bool reuseRecordings = false;
+		// Async epochs: a ticket's staged uploads whose destination it first uses on another queue than graphics (async compute)
+		// are recorded on that queue, just ahead of the ticket's first batch there, instead of on the graphics queue; and a batch
+		// on another queue waits for the graphics queue's uploads only when it uses what they write (RenderGraph::
+		// RecordPendingUploads' queue-scoped uploads). Off: every upload on the graphics queue, and every batch on another queue
+		// waits for them. SetQueueScopedUploads changes it at run time.
+		bool queueScopedUploads = true;
 	};
 
 	using ExtensionFactory = std::function<std::unique_ptr<RenderGraph::IRenderGraphExtension>()>;
@@ -78,6 +84,24 @@ public:
 
 	// The next ExecuteFrame builds a new graph (after retiring the current one).
 	void RequestRebuild() noexcept { m_rebuildRequested = true; }
+	// Pass and barrier-batch timestamps in the recordings kept across frames (RenderGraph::SetPersistentRecordingTimestamps),
+	// off by default: read back with the other pass timestamps (IStatisticsService::GetCompletedTimestamps, in the completed
+	// frame callback). A change requests a rebuild, so every kept recording (a revision's epochs) is recorded again with them,
+	// or without; until that build, kept recordings stay as they were recorded.
+	void SetRecordingTimestamps(bool enabled) noexcept {
+		if (m_recordingTimestamps.exchange(enabled, std::memory_order_acq_rel) != enabled) RequestRebuild();
+	}
+	bool RecordingTimestamps() const noexcept { return m_recordingTimestamps.load(std::memory_order_acquire); }
+	// Schedule introspection (RenderGraph::SetScheduleTraceEnabled) on the graph and on every graph built after it, so it
+	// survives rebuilds. Host thread (it reads the current graph); read the snapshots through Graph().
+	void SetScheduleTraceEnabled(bool enabled) noexcept {
+		m_scheduleTrace.store(enabled, std::memory_order_release);
+		if (m_graph) m_graph->SetScheduleTraceEnabled(enabled);
+	}
+	bool ScheduleTraceEnabled() const noexcept { return m_scheduleTrace.load(std::memory_order_acquire); }
+	// Desc::queueScopedUploads, from the next SubmitEpoch on (any thread; for A/B comparisons).
+	void SetQueueScopedUploads(bool enabled) noexcept { m_queueScopedUploads.store(enabled, std::memory_order_release); }
+	bool QueueScopedUploads() const noexcept { return m_queueScopedUploads.load(std::memory_order_acquire); }
 
 	// Explicit builds: a rebuild requested (an extension added or removed, RequestRebuild) waits for the caller's build point,
 	// BuildIfRequested; until then every execution, submission and preparation runs the graph as built, whose extensions keep
@@ -289,6 +313,9 @@ public:
 		uint64_t stale = 0;    // prepared again after beforeSubmit
 		uint64_t uploads = 0;  // submissions that carried uploads
 		uint64_t recordedUploadLists = 0;  // producers' recorded upload lists submitted as they were (IUploadService::SubmitRecordedUploads)
+		// Desc::queueScopedUploads: staged copies recorded on another queue than graphics, ahead of the batch that first uses them;
+		// and batches off the graphics queue spared the wait for the graphics queue's uploads (they use nothing those write).
+		uint64_t queueUploadCopies = 0, sparedUploadWaits = 0;
 		uint64_t wakesSkipped = 0;  // submissions whose completion the host's thread took at a GPU wake-up instead of a signal
 		uint64_t backingMutations = 0;  // BackingMutation scopes opened while async epochs ran
 		uint64_t backingWaits = 0;      // of them, those that found a ticket preparation in progress and waited it out
@@ -401,6 +428,9 @@ private:
 	};
 	std::vector<SlotCompletion> m_slotCompletions;
 	bool m_rebuildRequested = true;
+	std::atomic<bool> m_recordingTimestamps{false};
+	std::atomic<bool> m_scheduleTrace{false};
+	std::atomic<bool> m_queueScopedUploads{true};  // SetQueueScopedUploads; Desc::queueScopedUploads at construction
 	bool m_explicitBuilds = false;
 	uint64_t m_frameNumber = 0;
 	CompletedFrameCallback m_completedFrame;

@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string_view>
@@ -64,8 +65,13 @@ public:
 
     // Records a_batches' copies into a_list, in order, with a barrier before a copy that overlaps an earlier one (none in
     // steady state). Every target must be a pointer target with a backing; a copy past a buffer's backing is logged under
-    // a_owner. Returns the copies recorded.
-    static size_t RecordCopies(rhi::CommandList& a_list, std::span<const std::shared_ptr<StagedUploadBatch>> a_batches, std::string_view a_owner);
+    // a_owner. Returns the copies recorded. a_include, when given, takes only the entries whose destination backing it accepts
+    // (their order among themselves kept): a caller that splits the batches' copies between lists by destination.
+    static size_t RecordCopies(rhi::CommandList& a_list, std::span<const std::shared_ptr<StagedUploadBatch>> a_batches, std::string_view a_owner,
+        const std::function<bool(rhi::ResourceHandle)>& a_include = {});
+    // Appends each entry's destination backing (its target's buffer as it is now), one per entry in recording order. False when a
+    // target is not a pointer target with a backing: then nothing is known about where the batches write.
+    static bool AppendDestinations(std::span<const std::shared_ptr<StagedUploadBatch>> a_batches, std::vector<rhi::ResourceHandle>& a_out);
 
 private:
     explicit StagedUploadBatch(size_t pageSize) : m_pageSize(pageSize) {}

@@ -310,6 +310,24 @@ size_t UploadManager::TakeRecordedUploads(std::vector<rhi::CommandList>& out, ui
 	return m_uploadInstance ? m_uploadInstance->TakeRecordedUploads(out, frameIndex) : 0;
 }
 
+bool UploadManager::TakeRecordedUploadsWithDestinations(std::vector<rhi::CommandList>& out, uint8_t frameIndex,
+	std::vector<rhi::ResourceHandle>& destinations)
+{
+	return m_uploadInstance ? m_uploadInstance->TakeRecordedUploadsWithDestinations(out, frameIndex, destinations) : true;
+}
+
+bool UploadManager::StagedUploadDestinations(std::vector<rhi::ResourceHandle>& out) const
+{
+	return m_uploadInstance ? m_uploadInstance->StagedUploadDestinations(out) : true;
+}
+
+size_t UploadManager::RecordStagedUploadsRouted(rhi::CommandList& list, uint8_t frameIndex, bool afterWork,
+	const std::function<rhi::CommandList*(rhi::ResourceHandle)>& route, size_t& routed)
+{
+	routed = 0;
+	return m_uploadInstance ? m_uploadInstance->RecordStagedUploadsRouted(list, frameIndex, afterWork, route, routed) : 0;
+}
+
 void UploadManager::ProcessDeferredReleases(uint8_t frameIndex)
 {
 	if (m_uploadInstance) {

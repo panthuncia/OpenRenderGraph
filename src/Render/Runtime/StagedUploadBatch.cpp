@@ -119,7 +119,25 @@ bool StagedUploadBatch::Record(rhi::Device device) {
     return true;
 }
 
-size_t StagedUploadBatch::RecordCopies(rhi::CommandList& a_list, std::span<const std::shared_ptr<StagedUploadBatch>> a_batches, std::string_view a_owner) {
+bool StagedUploadBatch::AppendDestinations(std::span<const std::shared_ptr<StagedUploadBatch>> a_batches, std::vector<rhi::ResourceHandle>& a_out) {
+    try {
+        for (const auto& batch : a_batches) {
+            if (!batch) continue;
+            for (const auto& entry : batch->Entries()) {
+                if (entry.target.kind != UploadTarget::Kind::PinnedShared || !entry.target.pinned || !entry.page) return false;
+                const auto target = entry.target.pinned->GetAPIResource().GetHandle();
+                if (!target.valid()) return false;
+                a_out.push_back(target);
+            }
+        }
+    } catch (const std::exception&) {
+        return false;  // a target without a backing
+    }
+    return true;
+}
+
+size_t StagedUploadBatch::RecordCopies(rhi::CommandList& a_list, std::span<const std::shared_ptr<StagedUploadBatch>> a_batches, std::string_view a_owner,
+    const std::function<bool(rhi::ResourceHandle)>& a_include) {
     BT_ZONE_SCOPE("ORG.Upload.RecordCopies");
     size_t copies = 0;
     // Copies in one list are unordered without a barrier, and batches can overlap (a producer's batch whose submission
@@ -140,6 +158,7 @@ size_t StagedUploadBatch::RecordCopies(rhi::CommandList& a_list, std::span<const
             if (entry.target.kind != UploadTarget::Kind::PinnedShared || !entry.target.pinned || !entry.page)
                 throw std::logic_error("Recorded staged uploads need pointer targets");
             const auto target = entry.target.pinned->GetAPIResource().GetHandle();
+            if (a_include && !a_include(target)) continue;
             const uint64_t begin = entry.dstOffset, end = entry.dstOffset + entry.size;
             const uint64_t key = (uint64_t{target.generation} << 32) | target.index;
             auto* ranges = &written[key];

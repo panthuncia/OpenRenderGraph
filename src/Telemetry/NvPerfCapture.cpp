@@ -658,11 +658,12 @@ struct Profiler {
     std::vector<uint8_t> counterDataPrefix;
     size_t configPassCount = 0;
     size_t traceBufferSize = 0;
-    size_t maxRangesPerPass = 512;
+    size_t maxRangesPerPass = 2048;  // the D3D11 backend's; a frame with barrier ranges (cs.org.barrier.*) passes 512
     size_t traceBufferCount = 8;
     uint32_t syncTimeoutMs = 10000;
     uint64_t framesWithoutRange = 0;
     uint64_t rangesPushed = 0;
+    uint64_t rangesSinceArm = 0;  // RangesRecordedSinceArm: every range pushed since ArmCapture
     uint64_t droppedRanges = 0;
     uint64_t droppedTraceBytes = 0;
     std::string error;
@@ -1297,7 +1298,7 @@ bool ArmCapture(uint64_t sampleId, std::string& error)
     profiler.finished = false;
     profiler.sampleId = sampleId;
     profiler.captureStartFrame = profiler.captureEndFrame = 0;
-    profiler.framesWithoutRange = profiler.rangesPushed = 0;
+    profiler.framesWithoutRange = profiler.rangesPushed = profiler.rangesSinceArm = 0;
     profiler.droppedRanges = profiler.droppedTraceBytes = 0;
     profiler.error.clear();
     profiler.result.emplace();
@@ -1449,7 +1450,9 @@ void EndFrameCapture(const QueueTarget& queue, uint64_t frameNumber)
         return;
     auto& capture = found->second;
     if (capture.passActive) {
-        if (!profiler.rangesPushed && ++profiler.framesWithoutRange >= 8) {
+        // Ranges recorded since arming count: a host's kept command buffers (recorded once with their ranges) execute in
+        // later frames' passes without pushing anything on the CPU.
+        if (!profiler.rangesPushed && !profiler.rangesSinceArm && ++profiler.framesWithoutRange >= 8) {
             Fail(profiler, capture, "no selected NVPerf range was recorded within 8 frames");
             return;
         }
@@ -1479,6 +1482,17 @@ void EndFrameCapture(const QueueTarget& queue, uint64_t frameNumber)
 #else
     (void)queue;
     (void)frameNumber;
+#endif
+}
+
+uint64_t RangesRecordedSinceArm()
+{
+#if ORG_ENABLE_NVPERF
+    auto& profiler = Get();
+    std::lock_guard lock(profiler.mutex);
+    return profiler.armed ? profiler.rangesSinceArm : 0;
+#else
+    return 0;
 #endif
 }
 
@@ -1514,6 +1528,7 @@ bool PushRange(const QueueTarget& queue, void* commandBuffer, const char* queueN
     if (Backend{ queue.backend }.PushRange(commandBuffer, name)) {
         ++profiler.openRanges[commandBuffer];
         ++profiler.rangesPushed;
+        ++profiler.rangesSinceArm;
         return true;
     }
     return false;

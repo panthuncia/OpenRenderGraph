@@ -644,6 +644,38 @@ void BackingAccessAdmissionLedger::AppendIncomingWaits(const CompiledGraph& grap
         "ORG.Execution.CrossFrameHazardWaits", static_cast<int64_t>(waitsAdded));
 }
 
+void BackingAccessAdmissionLedger::AppendBoundaryAccessWaits(const CompiledGraph& graph,
+    std::span<const PreparedBackingState> resources, std::span<const uint8_t> selected, ResourceWaits& out) const {
+    BT_ZONE_SCOPE("ORG.Execution.ResolveBoundaryAccessWaits");
+    const auto ordered = OrderBackings(graph, resources);
+    if (out.size() != graph.batches.size() || graph.incomingBoundaryAccessesByBatch.size() != graph.batches.size()
+        || selected.size() != ordered.size())
+        throw std::invalid_argument("Invalid boundary access wait dimensions");
+    for (uint32_t batchIndex = 0; batchIndex < graph.batches.size(); ++batchIndex) {
+        auto& waits = out[batchIndex];
+        for (const auto& access : graph.incomingBoundaryAccessesByBatch[batchIndex]) {
+            const auto resourceIndex = access.resource;
+            if (!selected[resourceIndex] || !ordered[resourceIndex].resource.valid()) continue;
+            const auto found = m_accesses.find(Key(ordered[resourceIndex].resource));
+            if (found == m_accesses.end() || found->second.shape != ordered[resourceIndex].shape) continue;
+            const auto append = [&](ExecutionTimelinePoint point) {
+                if (!point.timeline || !point.value) return;
+                for (auto& [resource, wait] : waits)
+                    if (resource == resourceIndex && wait.timeline == point.timeline) {
+                        wait.value = (std::max)(wait.value, point.value);
+                        return;
+                    }
+                waits.push_back({resourceIndex, point});
+            };
+            Visit(found->second.shape, access.range, [&](uint32_t mip, uint32_t slice) {
+                const auto& cell = found->second.cells[CellIndex(found->second.shape, mip, slice)];
+                append(cell.writer);
+                for (const auto reader : cell.readers) append(reader);
+            });
+        }
+    }
+}
+
 void BackingAccessAdmissionLedger::Commit(const CompiledGraph& graph,
     std::span<const PreparedBackingState> resources,
     const GraphExecutionTimeline& execution, uint32_t batchCount) {

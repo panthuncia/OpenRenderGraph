@@ -7,6 +7,7 @@ include(GNUInstallDirs)
 option(OPENRENDERGRAPH_ENABLE_SUBMODULE_FALLBACK "Allow fallback to in-tree BasicRHI when package is unavailable" ON)
 option(OPENRENDERGRAPH_FORWARD_BASICRHI_DEP_OPTIONS "Forward BasicRHI PIX/Streamline options when adding BasicRHI subdirectory" ON)
 option(OPENRENDERGRAPH_ENABLE_DEBUG_UI "Build the optional ImGui/ImPlot/Slang inspector" OFF)
+option(OPENRENDERGRAPH_ENABLE_SCHEDULE_UI "Build the persistent schedule inspector (DebugUI/ScheduleInspector.h), Dear ImGui only" OFF)
 option(OPENRENDERGRAPH_ENABLE_D3D11_INTEROP "Build the optional Windows D3D11/D3D12 interop library" OFF)
 option(OPENRENDERGRAPH_BUILD_TESTS "Build OpenRenderGraph tests" OFF)
 option(ORG_ENABLE_NVPERF "Build Telemetry/NvPerfCapture against NVIDIA's Nsight Perf SDK (otherwise it reports itself unavailable)" OFF)
@@ -84,6 +85,9 @@ if(OPENRENDERGRAPH_ENABLE_DEBUG_UI)
     find_package(implot CONFIG REQUIRED)
     find_package(slang CONFIG REQUIRED)
 endif()
+if(OPENRENDERGRAPH_ENABLE_SCHEDULE_UI AND NOT TARGET imgui::imgui)
+    find_package(imgui CONFIG REQUIRED)
+endif()
 
 add_library(OpenRenderGraph STATIC
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Contributor/ContributorRegistry.cpp"
@@ -141,6 +145,9 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/ExperimentalGraphCompiler.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/PersistentGraph.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraphPersistent.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/ScheduleTrace.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/ScheduleTraceBuild.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/RenderGraph/ScheduleTrace.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/GraphReplay.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/RenderGraph/GraphReplay.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/RenderGraph/PersistentGraph.h"
@@ -238,6 +245,22 @@ if(OPENRENDERGRAPH_ENABLE_DEBUG_UI)
     endif()
     target_link_libraries(OpenRenderGraphDebugUI PUBLIC OpenRenderGraph::OpenRenderGraph
         imgui::imgui implot::implot slang::slang)
+endif()
+
+# The persistent schedule inspector: plain Dear ImGui (the host's imgui::imgui and its context), no ImPlot or Slang.
+if(OPENRENDERGRAPH_ENABLE_SCHEDULE_UI)
+    add_library(OpenRenderGraphScheduleUI STATIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/DebugUI/ScheduleInspector.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/DebugUI/ScheduleInspector.h")
+    add_library(OpenRenderGraph::ScheduleUI ALIAS OpenRenderGraphScheduleUI)
+    target_compile_features(OpenRenderGraphScheduleUI PUBLIC cxx_std_23)
+    target_include_directories(OpenRenderGraphScheduleUI PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+    if(MSVC)
+        target_compile_options(OpenRenderGraphScheduleUI PRIVATE /utf-8)
+    endif()
+    target_link_libraries(OpenRenderGraphScheduleUI PUBLIC OpenRenderGraph::OpenRenderGraph imgui::imgui)
 endif()
 
 target_compile_definitions(OpenRenderGraph

@@ -6,8 +6,13 @@
 #include "Render/RenderGraph/PersistentGraph.h"
 #include "Render/CommandListPool.h"
 #include "Render/Runtime/IStatisticsService.h"
+#include <algorithm>
 #include <chrono>
 #include <functional>
+#include <span>
+#include <mutex>
+#include <set>
+#include <string_view>
 #include <rhi.h>
 #include <rhi_colors.h>
 #include <rhi_debug.h>
@@ -411,6 +416,29 @@ public:
     ~PreparedRhiExecutionBatch() override { Abandon(); }
     uint32_t QueueSlot() const noexcept override { return m_queueSlot; }
     bool Replayable() const noexcept override { return m_replayable; }
+    // Whether a timeline identity resolves through this packet's bindings (a wait SubmitLeading may take).
+    bool BindsTimeline(uint64_t identity) const noexcept {
+        return std::any_of(m_timelines.begin(), m_timelines.end(), [&](const auto& item) { return item.identity == identity; });
+    }
+    // Submits `lists` on this packet's queue ahead of it, waiting for `waits` (identities it binds) and signalling nothing: work a
+    // host orders before the batch on its queue (RenderGraph's queue-scoped ticket uploads). The batch's own Submit follows it, in
+    // queue order; the batch's signal then covers it too. Consumes nothing: the packet is submitted as usual afterwards.
+    SubmissionReceipt SubmitLeading(std::span<rhi::CommandList> lists, std::span<const ExecutionTimelinePoint> waits) const noexcept {
+        if (lists.empty()) return {SubmissionState::Signaled};
+        std::vector<rhi::TimelinePoint> points;
+        points.reserve(waits.size());
+        for (const auto wait : waits) {
+            if (!wait.value) continue;
+            const auto found = std::find_if(m_timelines.begin(), m_timelines.end(), [&](const auto& item) { return item.identity == wait.timeline; });
+            if (found == m_timelines.end()) return {SubmissionState::NotSubmitted, SubmissionFailureStage::Validation};
+            points.push_back({found->handle, wait.value});
+        }
+        const auto submitted = m_queue.Submit({lists.data(), static_cast<uint32_t>(lists.size())},
+            {{points.data(), static_cast<uint32_t>(points.size())}, {}});
+        if (submitted != rhi::Result::Ok)
+            return {SubmissionState::SubmissionUncertain, SubmissionFailureStage::Submit, static_cast<uint32_t>(submitted)};
+        return {SubmissionState::Signaled};
+    }
     SubmissionReceipt Submit(const ExecutionBatchTimeline& batch) const noexcept override {
         // Single-consumption even after failure: uploads/readbacks cannot replay. A replayable packet has neither.
         if (!m_replayable && m_consumed.exchange(true)) return {SubmissionState::NotSubmitted, SubmissionFailureStage::Replay};
@@ -546,6 +574,18 @@ struct OwnedRecordingGpuRanges {
     const char* queueName = "Graphics";
 };
 
+// A range name for the barriers recorded around a pass ("cs.org.barrier.<where>.<pass>"), interned for the process: the
+// pass ranges cover only a pass's own commands, so a profiler sees a list's barrier batches only through these.
+inline const char* OwnedRecordingBarrierRangeName(std::string_view where, std::string_view pass) {
+    static std::mutex mutex;
+    static std::set<std::string, std::less<>> names;
+    std::string name = "cs.org.barrier.";
+    name.append(where);
+    if (!pass.empty()) { name.push_back('.'); name.append(pass); }
+    std::lock_guard lock(mutex);
+    return names.insert(std::move(name)).first->c_str();
+}
+
 struct OwnedRecordingList {
     OwnedRecordingList() = default;
     OwnedRecordingList(OwnedRecordingList&&) = default;
@@ -580,7 +620,7 @@ struct OwnedRecordingList {
     bool externalExitBarrier = false;
     // Record for resubmission (PreparedRhiExecutionBatch's replayable packets), when every pass of the packet is replayable:
     // with no profiler GPU zones or ranges, whose queries a resubmission would write again. Nothing a list records may name a
-    // resource its recording does not own (the caller records no statistics queries for it either).
+    // resource its recording does not own: its statistics queries, if any, are its own (QueryRecordingContext::owned).
     bool replayable = false;
 };
 
@@ -705,17 +745,29 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
                     ? std::optional<rhi::DescriptorHeapHandle>{recording.samplerDescriptorHeap}
                     : std::nullopt);
         }
+        const auto* barrierRanges = recording.gpuPassRanges.get();
+        const auto firstPass = recording.passes.empty() ? std::string_view{} : std::string_view(recording.passes.front().DebugName());
+        // A kept recording's own queries (OwnedTimestampQueries) time its barrier batches too, under the profiler's range names.
+        auto* const ownedQueries = statistics && statistics->gpuQueries && statistics->queries.owned ? &statistics->queries : nullptr;
+        const auto recordBarriers = [&](const char* where, std::string_view pass, const rhi::BarrierBatch& barriers) {
+            const char* name = barrierRanges || ownedQueries ? OwnedRecordingBarrierRangeName(where, pass) : nullptr;
+            if (barrierRanges) barrierRanges->begin(context.Commands(), queue, barrierRanges->queueName, name);
+            if (ownedQueries) statistics->service->BeginRangeQuery(name, context.Commands(), *ownedQueries);
+            context.Commands().Barriers(barriers);
+            if (ownedQueries) statistics->service->EndRangeQuery(context.Commands(), *ownedQueries);
+            if (barrierRanges) barrierRanges->end(context.Commands(), queue);
+        };
         if (recording.externalEntryBarrier) {
             auto full = rhi::FullMemoryBarrier();
             rhi::BarrierBatch barriers{};
             barriers.globals = {&full, 1u};
-            context.Commands().Barriers(barriers);
+            recordBarriers("external-entry", firstPass, barriers);
         }
         if (!recording.textureBarriers.empty() || !recording.bufferBarriers.empty()) {
             rhi::BarrierBatch barriers{};
             barriers.textures = {recording.textureBarriers.data(), static_cast<uint32_t>(recording.textureBarriers.size())};
             barriers.buffers = {recording.bufferBarriers.data(), static_cast<uint32_t>(recording.bufferBarriers.size())};
-            context.Commands().Barriers(barriers);
+            recordBarriers("entry", firstPass, barriers);
         }
         for (size_t passIndex = 0; passIndex < recording.passes.size(); ++passIndex) {
             BT_ZONE_SCOPE("ORG.Execution.RecordOwned.Pass");
@@ -732,7 +784,7 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
                     rhi::BarrierBatch barriers{};
                     barriers.textures = {before.textures.data(), static_cast<uint32_t>(before.textures.size())};
                     barriers.buffers = {before.buffers.data(), static_cast<uint32_t>(before.buffers.size())};
-                    context.Commands().Barriers(barriers);
+                    recordBarriers("before", passLabel, barriers);
                 }
             }
             const int statisticsIndex = statistics ? statistics->passIndices[passIndex] : -1;
@@ -762,6 +814,9 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
             {
                 BT_ZONE_SCOPE("ORG.Execution.RecordOwned.Record");
                 BT_ZONE_TEXT(passLabel.data(), passLabel.size());
+                // The pass may time parts of itself (BeginRecordingSubRange) under its own range, with the recording's queries.
+                runtime::RecordingRanges subRanges{ ownedQueries ? statistics->service.get() : nullptr, ownedQueries, &context.Commands() };
+                runtime::RecordingRangeScope subRangeScope(ownedQueries ? &subRanges : nullptr);
                 recording.passes[passIndex].Record(context);
             }
             if (ranges) ranges->end(context.Commands(), queue);
@@ -779,19 +834,20 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
                     rhi::BarrierBatch barriers{};
                     barriers.textures = {after.textures.data(), static_cast<uint32_t>(after.textures.size())};
                     barriers.buffers = {after.buffers.data(), static_cast<uint32_t>(after.buffers.size())};
-                    context.Commands().Barriers(barriers);
+                    recordBarriers("after", passLabel, barriers);
                 }
             }
             tracyGpuZone.Close();
         }
-        if (statistics && statistics->gpuQueries)
-            statistics->service->ResolveQueries(statistics->frameIndex, queue, context.Commands(), statistics->queries);
         if (recording.externalExitBarrier) {
             auto full = rhi::FullMemoryBarrier();
             rhi::BarrierBatch barriers{};
             barriers.globals = {&full, 1u};
-            context.Commands().Barriers(barriers);
+            recordBarriers("external-exit", firstPass, barriers);
         }
+        // After the exit barrier, so a kept recording's own queries time it too.
+        if (statistics && statistics->gpuQueries)
+            statistics->service->ResolveQueries(statistics->frameIndex, queue, context.Commands(), statistics->queries);
         const auto closeResult = [&] {
             BT_ZONE_SCOPE("ORG.Execution.RecordOwned.EndChecked");
             return context.Commands().EndChecked();

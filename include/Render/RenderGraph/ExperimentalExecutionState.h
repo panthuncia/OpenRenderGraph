@@ -101,6 +101,16 @@ public:
         std::span<const PreparedBackingState> resources,
         std::span<const ExecutionTimelinePoint> queues,
         std::vector<std::vector<ExecutionTimelinePoint>>& incoming) const;
+    // Per batch, (compiler resource index, wait).
+    using ResourceWaits = std::vector<std::vector<std::pair<uint32_t, ExecutionTimelinePoint>>>;
+    // For each boundary access (incomingBoundaryAccessesByBatch) to a selected resource (selected: one flag per compiler
+    // resource), every earlier access the ledger holds - its writer and all its readers, on every queue, the consumer's own
+    // included: what a write into the resource on any queue ahead of the execution must wait for (RenderGraph's queue-scoped
+    // ticket uploads), where AppendIncomingWaits gives a read only the writer, and nothing on its own queue. out: one list per batch.
+    void AppendBoundaryAccessWaits(const CompiledGraph& graph,
+        std::span<const PreparedBackingState> resources,
+        std::span<const uint8_t> selected,
+        ResourceWaits& out) const;
     void Commit(const CompiledGraph& graph,
         std::span<const PreparedBackingState> resources,
         const GraphExecutionTimeline& execution, uint32_t batchCount = UINT32_MAX);

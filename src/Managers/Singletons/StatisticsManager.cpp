@@ -2,6 +2,7 @@
 #include "Utilities/EnvironmentFlag.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <rhi_helpers.h>
@@ -480,6 +481,11 @@ void StatisticsManager::BeginQuery(
     QueryRecordingContext& ctx)
 {
     if (!m_collectPassStatistics) return;
+    if (ctx.owned) {
+        if (passIndex < m_passNames.size())
+            BeginOwnedRange(*ctx.owned, m_passNames[passIndex], static_cast<int>(passIndex), org::runtime::TimestampRangeKind::Pass, cmd);
+        return;
+    }
     if (!m_timestampPool || passIndex >= m_numPasses || passIndex >= m_queryPoolPassCapacity) return;
 
     auto queueKind = queue.GetKind();
@@ -507,6 +513,10 @@ void StatisticsManager::EndQuery(
     QueryRecordingContext& ctx)
 {
     if (!m_collectPassStatistics) return;
+    if (ctx.owned) {
+        EndOwnedRange(*ctx.owned, cmd);
+        return;
+    }
     if (!m_timestampPool || passIndex >= m_numPasses || passIndex >= m_queryPoolPassCapacity) return;
 
     auto queueKind = queue.GetKind();
@@ -532,6 +542,15 @@ void StatisticsManager::ResolveQueries(
     QueryRecordingContext& ctx)
 {
     if (!m_collectPassStatistics) return;
+    if (ctx.owned) {
+        // Every range the list recorded, into the recording's own buffer: each submission resolves them again.
+        auto& owned = *ctx.owned;
+        EndOwnedRange(owned, cmd);
+        if (!owned.resolved && !owned.entries.empty())
+            cmd.ResolveQueryData(owned.pool->GetHandle(), 0, static_cast<uint32_t>(owned.entries.size() * 2u), owned.readback->GetHandle(), 0);
+        owned.resolved = true;
+        return;
+    }
     if (!m_timestampPool || m_timestampQueryInfo.elementSize == 0) return;
 
     auto queueKind = queue.GetKind();
@@ -600,6 +619,16 @@ void StatisticsManager::MergePendingResolves(
     unsigned frameIndex,
     QueryRecordingContext& ctx)
 {
+    if (ctx.owned) {
+        // A submission of a kept recording: its slot's completion reads what this one wrote. Never cleared from the
+        // context; a slot's pending list is bounded in case a build stopped its completion from coming.
+        if (ctx.owned->resolved && !ctx.owned->entries.empty()) {
+            auto& pending = m_pendingOwned[frameIndex];
+            if (std::ranges::find(pending, ctx.owned) == pending.end() && pending.size() < 256)
+                pending.push_back(ctx.owned);
+        }
+        return;
+    }
     auto& dest = m_pendingResolves[queueKind][frameIndex];
     dest.insert(dest.end(), ctx.pendingRanges.begin(), ctx.pendingRanges.end());
     ctx.pendingRanges.clear();
@@ -609,6 +638,9 @@ void StatisticsManager::OnFrameComplete(
     unsigned frameIndex,
     rhi::Queue& queue)
 {
+    m_completedTimestamps.clear();
+    m_completedOwned.clear();
+    ReadOwnedTimestamps(frameIndex);
 	if (!m_timestampPool || m_timestampQueryInfo.elementSize == 0) return;
 
 	if (!m_collectPassStatistics) return;
@@ -699,6 +731,8 @@ void StatisticsManager::OnFrameComplete(
             if (pi < m_passLastExecutionFrame.size()) {
                 m_passLastExecutionFrame[pi] = m_frameSerial;
             }
+            m_completedTimestamps.push_back({m_passNames[pi], static_cast<int>(pi), 0, queueKind,
+                org::runtime::TimestampRangeKind::Pass, false, t0, t1, ms});
 
             if (!havePipelineStats || !m_isGeometryPass[pi]) continue;
             auto& psBuf = psIt->second;
@@ -742,6 +776,103 @@ void StatisticsManager::OnFrameComplete(
     m_pendingResolves[queueKind].erase(frameIndex);
 }
 
+std::shared_ptr<OwnedTimestampQueries> StatisticsManager::CreateOwnedTimestamps(rhi::QueueKind queueKind, uint32_t ranges) {
+    if (!m_collectPassStatistics || ranges == 0) return nullptr;
+    auto device = DeviceManager::GetInstance().GetDevice();
+    auto owned = std::make_shared<OwnedTimestampQueries>();
+    rhi::QueryPoolDesc desc;
+    desc.type = rhi::QueryType::Timestamp;
+    desc.count = ranges * 2u;
+    if (device.CreateQueryPool(desc, owned->pool) != rhi::Result::Ok || !owned->pool) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true))
+            spdlog::warn("StatisticsManager: could not create a kept recording's timestamp pool ({} ranges); its passes are not timed", ranges);
+        return nullptr;
+    }
+    owned->stride = owned->pool->GetQueryResultInfo().elementSize;
+    const auto readback = rhi::helpers::ResourceDesc::Buffer(owned->stride * desc.count, rhi::HeapType::Readback);
+    if (owned->stride == 0 || device.CreateCommittedResource(readback, owned->readback) != rhi::Result::Ok || !owned->readback)
+        return nullptr;
+    const auto ticksPerSecond = device.GetTimestampCalibration(queueKind).ticksPerSecond;
+    owned->ticksToMilliseconds = ticksPerSecond ? 1000.0 / double(ticksPerSecond) : GetGpuTicksToMilliseconds();
+    owned->queueKind = queueKind;
+    owned->capacity = ranges;
+    owned->entries.reserve(ranges);
+    return owned;
+}
+
+bool StatisticsManager::BeginOwnedRange(OwnedTimestampQueries& owned, std::string_view name, int passIndex,
+    org::runtime::TimestampRangeKind kind, rhi::CommandList& cmd) {
+    // Ranges nest (a pass's sub-ranges inside it); a pass or barrier range opens only at the top level.
+    if (owned.resolved || (kind != org::runtime::TimestampRangeKind::Sub && !owned.open.empty())) return false;
+    if (owned.entries.size() >= owned.capacity) {
+        ++owned.overflow;
+        return false;
+    }
+    // The list's first range resets them all: one reset per submission, outside any render pass.
+    if (owned.entries.empty()) cmd.ResetQueries(owned.pool->GetHandle(), 0, owned.capacity * 2u);
+    uint32_t occurrence = 0;
+    for (const auto& entry : owned.entries) occurrence += entry.name == name;
+    owned.entries.push_back({std::string(name), passIndex, kind, occurrence});
+    const auto index = static_cast<uint32_t>(owned.entries.size() - 1);
+    cmd.WriteTimestamp(owned.pool->GetHandle(), index * 2u, rhi::Stage::Top);
+    owned.open.push_back(static_cast<int>(index));
+    return true;
+}
+
+void StatisticsManager::EndOwnedRange(OwnedTimestampQueries& owned, rhi::CommandList& cmd) {
+    if (owned.open.empty()) return;
+    cmd.WriteTimestamp(owned.pool->GetHandle(), static_cast<uint32_t>(owned.open.back()) * 2u + 1u, rhi::Stage::Bottom);
+    owned.open.pop_back();
+}
+
+void StatisticsManager::BeginRangeQuery(std::string_view name, rhi::CommandList& cmdList, QueryRecordingContext& ctx) {
+    if (m_collectPassStatistics && ctx.owned)
+        BeginOwnedRange(*ctx.owned, name, -1, org::runtime::TimestampRangeKind::Barrier, cmdList);
+}
+
+bool StatisticsManager::BeginSubRangeQuery(std::string_view name, rhi::CommandList& cmdList, QueryRecordingContext& ctx) {
+    return m_collectPassStatistics && ctx.owned && !ctx.owned->open.empty() &&
+           BeginOwnedRange(*ctx.owned, name, -1, org::runtime::TimestampRangeKind::Sub, cmdList);
+}
+
+void StatisticsManager::EndRangeQuery(rhi::CommandList& cmdList, QueryRecordingContext& ctx) {
+    if (ctx.owned) EndOwnedRange(*ctx.owned, cmdList);
+}
+
+void StatisticsManager::ReadOwnedTimestamps(unsigned frameIndex) {
+    const auto found = m_pendingOwned.find(frameIndex);
+    if (found == m_pendingOwned.end()) return;
+    auto submitted = std::move(found->second);
+    m_pendingOwned.erase(found);
+    for (auto& owned : submitted) {
+        const auto queries = static_cast<uint64_t>(owned->entries.size()) * 2u;
+        void* mapped = nullptr;
+        owned->readback->Map(&mapped, 0, owned->stride * queries);
+        if (!mapped) continue;
+        const auto* base = static_cast<const uint8_t*>(mapped);
+        for (size_t i = 0; i < owned->entries.size(); ++i) {
+            uint64_t t0 = 0, t1 = 0;
+            std::memcpy(&t0, base + owned->stride * (2u * i), sizeof(uint64_t));
+            std::memcpy(&t1, base + owned->stride * (2u * i + 1u), sizeof(uint64_t));
+            if (!t0 || t1 < t0) continue;
+            const auto& entry = owned->entries[i];
+            const double ms = double(t1 - t0) * owned->ticksToMilliseconds;
+            m_completedTimestamps.push_back({entry.name, entry.passIndex, entry.occurrence, owned->queueKind, entry.kind, true, t0, t1, ms});
+            if (entry.passIndex < 0 || static_cast<size_t>(entry.passIndex) >= m_stats.size()) continue;
+            auto& stats = m_stats[entry.passIndex];
+            UpdateEma(stats.gpuTimeEma, ms);
+            stats.gpuTimeMs = ms;
+            stats.gpuSampleSerial = m_frameSerial;
+            stats.gpuBeginTick = t0;
+            stats.gpuEndTick = t1;
+            if (static_cast<size_t>(entry.passIndex) < m_passLastExecutionFrame.size())
+                m_passLastExecutionFrame[entry.passIndex] = m_frameSerial;
+        }
+        owned->readback->Unmap(0, 0);
+        m_completedOwned.push_back(std::move(owned));
+    }
+}
 
 void StatisticsManager::ClearAll() {
     m_timestampPool.Reset();
@@ -760,6 +891,9 @@ void StatisticsManager::ClearAll() {
     m_visiblePassIndices.clear();
     m_recordedQueries.clear();
     m_pendingResolves.clear();
+    m_pendingOwned.clear();
+    m_completedOwned.clear();
+    m_completedTimestamps.clear();
     m_numPasses=0;
     m_queryPoolPassCapacity = 0;
     m_unnamedPassCounter = 0;
@@ -773,3 +907,15 @@ void StatisticsManager::ClearAll() {
 
 
 } // namespace org
+
+namespace org::runtime {
+
+OwnedTimestampQueries::~OwnedTimestampQueries() {
+    // A recording is released once its submissions are complete; the deferred deletion keeps the destruction off the thread that
+    // drops it, as for the shared pool.
+    auto& deletion = org::DeletionManager::GetInstance();
+    if (pool) deletion.MarkForDelete(std::move(pool));
+    if (readback) deletion.MarkForDelete(std::move(readback));
+}
+
+} // namespace org::runtime

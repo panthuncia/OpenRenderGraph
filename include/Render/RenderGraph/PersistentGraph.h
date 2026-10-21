@@ -326,6 +326,11 @@ struct FrameAdmission {
     std::vector<experimental::PreparedBackingState> backings;
     experimental::PreparedExecutionBarrierPlan barriers;
     std::vector<std::vector<experimental::ExecutionTimelinePoint>> incomingWaits;
+    // Per batch, (compiler resource index, wait): every earlier access (writer and readers, any queue) the ledger holds of each
+    // resource the batch uses first and that some batch off the upload queue uses (SynchronousAdmission::SetUploadQueue; empty
+    // without one). What an upload into the resource recorded on another queue than the upload queue, ahead of the execution,
+    // must wait for (RenderGraph::RecordPendingUploads' queue-scoped uploads); incomingWaits gives a read only the writer.
+    experimental::BackingAccessAdmissionLedger::ResourceWaits boundaryAccessWaits;
     std::vector<uint64_t> queueTimelines;
     struct IncomingEffect {
         rhi::ResourceHandle resource;
@@ -400,6 +405,10 @@ public:
     // Requires every resource of an execution to be used from one queue. Set before the first Prepare.
     void SetClosedExecutions(bool closed);
     bool ClosedExecutions() const noexcept { return m_closed; }
+    // The queue slot a host records its uploads on ahead of an execution (the graphics queue). Set, every admission fills
+    // FrameAdmission::boundaryAccessWaits for the resources batches on other queues use, so a host can record their uploads
+    // on those queues instead. UINT32_MAX (the default): none.
+    void SetUploadQueue(uint32_t queueSlot) noexcept { m_uploadQueue = queueSlot; }
     size_t PendingAdmissions() const noexcept { return m_pending.size(); }
     uint64_t PlanCacheHits() const noexcept { return m_planCacheHits; }
     uint64_t PlanCacheMisses() const noexcept { return m_planCacheMisses; }
@@ -425,6 +434,7 @@ private:
     // Admissions prepared and not yet committed or abandoned, in sequence order (at most one unless closed).
     std::vector<uint64_t> m_pending;
     bool m_closed = false;
+    uint32_t m_uploadQueue = UINT32_MAX;  // SetUploadQueue
     struct CachedPlan {
         std::weak_ptr<const ExecutableGeneration> executable;
         std::vector<rhi::ResourceHandle> resources;

@@ -64,6 +64,14 @@ namespace org::imm {
         return result;
     }
 
+    void PreparedBufferCopies::AppendBuffers(std::vector<rhi::ResourceHandle>& out) const {
+        out.reserve(out.size() + m_copies.size() * 2);
+        for (const auto& copy : m_copies) {
+            out.push_back(copy.dst.resource.GetHandle());
+            out.push_back(copy.src.resource.GetHandle());
+        }
+    }
+
     void PreparedBufferCopies::Record(rhi::CommandList& list) const {
         BT_ZONE_SCOPE("ORG.Upload.RecordPreparedCopies");
         if (m_recorded.exchange(true)) throw std::logic_error("Prepared buffer copies already recorded");

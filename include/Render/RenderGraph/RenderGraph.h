@@ -43,6 +43,7 @@
 #include "Render/RenderGraph/Aliasing/RenderGraphAliasingSubsystem.h"
 #include "Render/RenderGraph/ExecutionSchedule.h"
 #include "Render/RenderGraph/RenderGraphCompileProfile.h"
+#include "Render/RenderGraph/ScheduleTrace.h"
 #include "Interfaces/IResourceResolver.h"
 
 namespace org {
@@ -109,7 +110,7 @@ enum class AutoAliasPackingStrategy : uint8_t {
 	BranchAndBound = 1,
 };
 
-namespace persistent { class GraphEditTransaction; class SelectedPublication; }
+namespace persistent { class GraphEditTransaction; class SelectedPublication; struct ExecutableGeneration; }
 
 class RenderGraph {
 public:
@@ -765,6 +766,14 @@ public:
 		uint32_t batches = 0;
 	};
 	const PersistentExecuteTimings& LastPersistentExecuteTimings() const noexcept { return m_lastPersistentExecuteTimings; }
+	// Schedule introspection (ScheduleTrace.h), off by default. While on, the owner thread traces each executable it selects
+	// (the whole-frame one and each epoch's, once per executable: a steady frame builds nothing) and records what each execution
+	// waits for at submission beyond its batches' own waits, publishing snapshots of both. Off costs one relaxed load per
+	// preparation, execution and ticket completion. Any thread.
+	void SetScheduleTraceEnabled(bool enabled) noexcept;
+	bool ScheduleTraceEnabled() const noexcept;
+	// Any thread: the latest published snapshot; null while off, or before anything executed with it on.
+	std::shared_ptr<const PersistentScheduleSnapshot> GetPersistentScheduleSnapshot() const;
 	bool PersistentExecutionEnabled() const noexcept { return m_persistentExecution; }
 	void SetPersistentSegment(std::string passName, PersistentSegmentKind kind) {
 		m_persistentSegmentKinds[std::move(passName)] = kind;
@@ -830,11 +839,18 @@ public:
 	// what they were recorded for: the publication, the bindings and descriptor heaps, the host tag, and each pass's
 	// revision. A ticket prepared for what a kept recording was recorded for takes it instead of recording (its lists are
 	// submitted again), and a ticket the commit made stale can take the kept recording of what it depends on now
-	// (AdoptKeptPersistentRecording) instead of being prepared again. Kept recordings have no profiler GPU zones and no GPU
-	// statistics queries: each references resources (query pools, readback buffers) that are recreated as passes register.
+	// (AdoptKeptPersistentRecording) instead of being prepared again. Kept recordings have no profiler GPU zones, and no GPU
+	// statistics queries in the shared pool (recreated as passes register, and frame-indexed): with
+	// SetPersistentRecordingTimestamps, each records into queries of its own instead.
 	static constexpr size_t kKeptRecordingVariants = 4;
 	void SetPersistentRecordingReuse(bool reuse) noexcept { m_persistentRecordingReuse = reuse; }
 	bool PersistentRecordingReuse() const noexcept { return m_persistentRecordingReuse; }
+	// Pass and barrier-batch timestamps in recordings kept for resubmission (off by default): each such list records into
+	// queries it owns (IStatisticsService::CreateOwnedTimestamps), resolved by every submission and read when its frame slot
+	// completes (IStatisticsService::GetCompletedTimestamps). Read when a list is recorded: set it before the graph records
+	// (PersistentGraphHost::SetRecordingTimestamps rebuilds the graph for it).
+	void SetPersistentRecordingTimestamps(bool enabled) noexcept { m_persistentRecordingTimestamps = enabled; }
+	bool PersistentRecordingTimestamps() const noexcept { return m_persistentRecordingTimestamps; }
 	// Submitting thread: swaps the ticket's recording for the kept one of what its passes depend on now and a_hostTag, and
 	// makes the ticket current. False (the ticket unchanged) when none is kept. Reads the kept sets only (lock-free).
 	bool AdoptKeptPersistentRecording(PersistentTicket& ticket, uint64_t hostTag);
@@ -860,12 +876,17 @@ public:
 	// prepared under). Set by the owner thread before the ticket is published.
 	static uint64_t PersistentTicketHostTag(const PersistentTicket& ticket) noexcept;
 	static void SetPersistentTicketHostTag(PersistentTicket& ticket, uint64_t tag) noexcept;
+	// After RecordPendingUploads planned the ticket's uploads by queue: its batches off the graphics queue that will not wait for
+	// the graphics queue's uploads (statistics); 0 when not planned.
+	static uint32_t PersistentTicketSparedUploadWaits(const PersistentTicket& ticket) noexcept;
 	// Every pass it prepared would still prepare the same invocation (RenderGraphPass::InvocationRevisionHash).
 	static bool PersistentTicketCurrent(const PersistentTicket& ticket);
 	// Submits the packets with values from nextQueueValues (the last value assigned per queue slot, advanced
 	// here). Returns false when a packet failed.
 	// uploadsDone: the queue slot and value that signal the uploads recorded ahead of the ticket (RecordPendingUploads), when
-	// there are any. They precede the ticket on their own queue only, so every batch on another queue waits for them.
+	// there are any. They precede the ticket on their own queue only, so a batch on another queue waits for them: every such
+	// batch, unless RecordPendingUploads planned the ticket's uploads by queue (queueLists), and then only a batch that uses
+	// what they write. The uploads it recorded on another queue go to that queue just ahead of its first batch there.
 	// frameWait: the frame-wait timeline's value (SetFrameWaitTimeline) every batch waits for; 0 for none.
 	static bool SubmitPersistentTicket(PersistentTicket& ticket, std::span<uint64_t> nextQueueValues, PersistentTicketSubmission& out,
 		std::pair<uint32_t, uint64_t> uploadsDone = {UINT32_MAX, 0}, uint64_t frameWait = 0);
@@ -887,8 +908,18 @@ public:
 	// recordedLists receives, first, the lists of batches their producers recorded (IUploadService::SubmitRecordedUploads),
 	// which go to the queue ahead of `list`, as they are: each starts with its own full barrier, and `list` starts with one
 	// whenever it records a copy.
+	// Queue-scoped uploads (ticket and queueLists given): queueLists holds, per queue slot, an open list of that queue (an empty
+	// handle for none; the graphics slot's is ignored). A staged upload whose destination the ticket first uses on another queue -
+	// with every batch that uses it ordered after that queue's first batch, and nothing in `list` or the recorded lists touching it -
+	// is recorded into that queue's list instead (after a full barrier against the work before it on that queue), which
+	// SubmitPersistentTicket submits just ahead of the queue's first batch, with the waits a write into the destination needs
+	// against earlier executions. The plan also records which batches on other queues use what `list` and the recorded lists
+	// write: only they wait for uploadsDone (all of them when a destination there is not known). `recorded` then means that
+	// `list` itself took a copy; queueCopies, when given, receives the copies recorded into queueLists. Without a ticket or
+	// queueLists, everything goes into `list` and every batch on another queue waits, as before.
 	bool RecordPendingUploads(rhi::Device device, rhi::CommandList& list, uint8_t slot, std::shared_ptr<void>& keepAlive, bool& recorded,
-		std::vector<rhi::CommandList>& recordedLists);
+		std::vector<rhi::CommandList>& recordedLists, PersistentTicket* ticket = nullptr, std::span<rhi::CommandList> queueLists = {},
+		size_t* queueCopies = nullptr);
 	// The epoch the next Update/Execute runs; persistent::AllEpochs runs every pass.
 	void SetPersistentEpoch(uint32_t epoch) noexcept { m_persistentEpoch = epoch; }
 	uint32_t PersistentEpoch() const noexcept { return m_persistentEpoch; }
@@ -1527,6 +1558,15 @@ private:
 	std::vector<ExternalPassDesc> UpdatePersistentFrameInterruptingPasses(std::vector<ExternalPassDesc> requested, rhi::Backend primaryBackend);
 	// Compile-dump mode for the persistent graph: written once per selected executable.
 	void WritePersistentGraphDebugDump(const persistent::SelectedPublication& selected) const;
+	// Schedule introspection, owner thread. Traces the selected executable and its epochs' when it is not the traced one.
+	void RefreshPersistentScheduleTraces(const persistent::SelectedPublication& selected);
+	// Records the submission waits filled into the persistent state's scratch for one execution of `executable` (a segment
+	// labelled segmentLabel), and publishes a snapshot once per round of executions.
+	void RecordPersistentScheduleSubmission(const persistent::ExecutableGeneration& executable, const char* segmentLabel, uint64_t frame);
+	void RecordPersistentTicketScheduleSubmissions(const PersistentTicket& ticket);
+	void PublishPersistentScheduleSnapshot();
+	std::atomic<bool> m_scheduleTraceEnabled{false};
+	std::atomic<std::shared_ptr<const PersistentScheduleSnapshot>> m_scheduleSnapshot;
 	bool m_persistentExecution = false;
 	std::vector<uint32_t> m_persistentEpochOrder;
 	bool m_persistentClosedExecutions = false;
@@ -1538,6 +1578,7 @@ private:
 	// live state), so its recording is neither taken from nor added to the kept sets.
 	bool m_persistentTicketHostData = false;
 	bool m_persistentRecordingReuse = false;
+	bool m_persistentRecordingTimestamps = false;
 	// Kept recordings per (epoch, frame slot): replaced whole by the owner thread, read by the submitting thread. A host's frame
 	// slots are its frames in flight of every epoch (PersistentGraphHost::FrameSlots), so an epoch meets several.
 	// Slots: every frame slot a host can have (PersistentGraphHost refuses more than 255): a host with frames in flight times epochs past
