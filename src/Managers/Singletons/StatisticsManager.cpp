@@ -822,6 +822,16 @@ bool StatisticsManager::BeginOwnedRange(OwnedTimestampQueries& owned, std::strin
 
 void StatisticsManager::EndOwnedRange(OwnedTimestampQueries& owned, rhi::CommandList& cmd) {
     if (owned.open.empty()) return;
+    // A pass's or barrier batch's end waits for its work. NVIDIA's Blackwell driver stamps a timestamp (bottom-of-pipe or
+    // all-commands) before a preceding generated-commands execution (ExecuteIndirect) has run, and an execution-only or
+    // writes-only barrier does not wait for it either; one whose second scope reads indirect arguments does. Without it that work's
+    // time lands in a later range. The wait costs each range ~4 us and the epoch its overlap between passes: only kept recordings'
+    // own queries (a trace's recording timestamps). A sub-range may be inside a render pass, which a barrier would end.
+    if (owned.entries[static_cast<size_t>(owned.open.back())].kind != org::runtime::TimestampRangeKind::Sub) {
+        const rhi::GlobalBarrier wait{ rhi::ResourceSyncState::All, rhi::ResourceSyncState::All, rhi::FullMemoryBarrier().beforeAccess,
+            rhi::ResourceAccessType::IndirectArgument };
+        cmd.Barriers(rhi::BarrierBatch{ {}, {}, { &wait, 1u } });
+    }
     cmd.WriteTimestamp(owned.pool->GetHandle(), static_cast<uint32_t>(owned.open.back()) * 2u + 1u, rhi::Stage::Bottom);
     owned.open.pop_back();
 }
