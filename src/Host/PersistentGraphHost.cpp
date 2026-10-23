@@ -355,7 +355,14 @@ void PersistentGraphHost::Build() {
 	graph->SetPersistentRecordingTimestamps(m_recordingTimestamps.load(std::memory_order_acquire));
 	graph->SetScheduleTraceEnabled(m_scheduleTrace.load(std::memory_order_acquire));
 	graph->SetPersistentExecutionEnabled(true);
-	graph->SetExternalQueueBoundary(m_desc.queueBoundary);
+	{
+		auto boundary = m_desc.queueBoundary;
+		if (m_boundaryOverridden.load(std::memory_order_acquire)) {
+			boundary.entry = m_boundaryEntry.load(std::memory_order_acquire);
+			boundary.exit = m_boundaryExit.load(std::memory_order_acquire);
+		}
+		graph->SetExternalQueueBoundary(boundary);
+	}
 	graph->SetFrameWaitTimeline(m_frameWaitTimeline);
 	graph->Setup();
 	m_graph = std::move(graph);

@@ -92,6 +92,14 @@ public:
 		if (m_recordingTimestamps.exchange(enabled, std::memory_order_acq_rel) != enabled) RequestRebuild();
 	}
 	bool RecordingTimestamps() const noexcept { return m_recordingTimestamps.load(std::memory_order_acquire); }
+	// Diagnostics: the external queue boundary's entry and exit barriers in place of Desc::queueBoundary's, from the next build
+	// (dropping them is unsafe: the graph's first and last accesses are then unordered against the host's work).
+	void SetQueueBoundary(RenderGraph::ExternalQueueBoundary boundary) noexcept {
+		m_boundaryEntry.store(boundary.entry, std::memory_order_release);
+		m_boundaryExit.store(boundary.exit, std::memory_order_release);
+		m_boundaryOverridden.store(true, std::memory_order_release);
+		RequestRebuild();
+	}
 	// Schedule introspection (RenderGraph::SetScheduleTraceEnabled) on the graph and on every graph built after it, so it
 	// survives rebuilds. Host thread (it reads the current graph); read the snapshots through Graph().
 	void SetScheduleTraceEnabled(bool enabled) noexcept {
@@ -429,6 +437,7 @@ private:
 	std::vector<SlotCompletion> m_slotCompletions;
 	bool m_rebuildRequested = true;
 	std::atomic<bool> m_recordingTimestamps{false};
+	std::atomic<bool> m_boundaryOverridden{false}, m_boundaryEntry{false}, m_boundaryExit{false};
 	std::atomic<bool> m_scheduleTrace{false};
 	std::atomic<bool> m_queueScopedUploads{true};  // SetQueueScopedUploads; Desc::queueScopedUploads at construction
 	bool m_explicitBuilds = false;

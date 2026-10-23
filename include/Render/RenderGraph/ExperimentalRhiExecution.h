@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include "Render/RenderGraph/ExperimentalGraphCompiler.h"
 #include "Render/RenderGraph/ExperimentalExecutionState.h"
 #include "Render/PreparedPass.h"
@@ -624,6 +625,26 @@ struct OwnedRecordingList {
     bool replayable = false;
 };
 
+// Diagnostics: recordings made while set skip the list-start descriptor heap bind of lists holding only latched copies (which read
+// no descriptor). For timing the bind's cost only.
+inline std::atomic<bool>& DiagnosticSkipListHeapBinds() {
+    static std::atomic<bool> skip{false};
+    return skip;
+}
+
+// Diagnostics: recordings made while set leave out their full external entry and exit barriers, the closed execution's included (1), or
+// every barrier batch (2). Unsafe: timing runs whose lists access nothing only.
+inline std::atomic<int>& DiagnosticSkipListBarriers() {
+    static std::atomic<int> skip{0};
+    return skip;
+}
+
+// Diagnostics: lists recorded while set have no pass timestamp queries (nor their resets and resolve) and no Tracy GPU zones.
+inline std::atomic<bool>& DiagnosticSkipPassQueries() {
+    static std::atomic<bool> skip{false};
+    return skip;
+}
+
 inline OwnedRecordingList BuildPersistentRecordingList(std::shared_ptr<const RenderFrameSnapshot> sealed, uint32_t batch) {
     if (!sealed) throw std::invalid_argument("Missing persistent frame seal");
     const auto& frame = *sealed;
@@ -739,7 +760,12 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
         };
         auto* statistics = recording.statistics.get();
         if (statistics) statistics->cpuMilliseconds.resize(recording.passes.size());
-        if (recording.resourceDescriptorHeap.valid()) {
+        const bool skipQueries = DiagnosticSkipPassQueries().load(std::memory_order_relaxed);
+        if (skipQueries && statistics) statistics->gpuQueries = false;
+        // The diagnostic skips it only for lists of copies alone (the latched copies'), which read no descriptor.
+        const bool copiesOnly = std::all_of(recording.passes.begin(), recording.passes.end(),
+            [](const PreparedPass& p) { return p.DebugName().ends_with("latched-copies"); });
+        if (recording.resourceDescriptorHeap.valid() && !(copiesOnly && DiagnosticSkipListHeapBinds().load(std::memory_order_relaxed))) {
             context.Commands().SetDescriptorHeaps(recording.resourceDescriptorHeap,
                 recording.samplerDescriptorHeap.valid()
                     ? std::optional<rhi::DescriptorHeapHandle>{recording.samplerDescriptorHeap}
@@ -749,7 +775,10 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
         const auto firstPass = recording.passes.empty() ? std::string_view{} : std::string_view(recording.passes.front().DebugName());
         // A kept recording's own queries (OwnedTimestampQueries) time its barrier batches too, under the profiler's range names.
         auto* const ownedQueries = statistics && statistics->gpuQueries && statistics->queries.owned ? &statistics->queries : nullptr;
+        const int skipBarriers = DiagnosticSkipListBarriers().load(std::memory_order_relaxed);
         const auto recordBarriers = [&](const char* where, std::string_view pass, const rhi::BarrierBatch& barriers) {
+            if (skipBarriers >= 2 || (skipBarriers == 1 && barriers.globals.size != 0))
+                return;
             const char* name = barrierRanges || ownedQueries ? OwnedRecordingBarrierRangeName(where, pass) : nullptr;
             if (barrierRanges) barrierRanges->begin(context.Commands(), queue, barrierRanges->queueName, name);
             if (ownedQueries) statistics->service->BeginRangeQuery(name, context.Commands(), *ownedQueries);
@@ -796,7 +825,7 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
             // can report that earlier instrumentation error only when a later
             // command list closes, obscuring the actual pass. Keep GPU zones on
             // graphics/compute queues and leave copy lists instrumentation-free.
-            const bool allowTracyGpuZone = !replayable && (!statistics ||
+            const bool allowTracyGpuZone = !replayable && !skipQueries && (!statistics ||
                 statistics->queueKind != rhi::QueueKind::Copy);
             TracyGpuZoneScope tracyGpuZone(context.Commands(), queue,
                 allowTracyGpuZone
