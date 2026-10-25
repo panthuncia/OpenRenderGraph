@@ -24,6 +24,14 @@ struct StreamingUploadRange {
 	std::size_t dstOffset = 0;
 };
 
+// One range of a GPU copy between two buffers on the worker path (QueueTrackedStreamingCopyRanges): `size` bytes from the source
+// at `srcOffset` to the destination at `dstOffset`.
+struct StreamingCopyRange {
+	std::size_t srcOffset = 0;
+	std::size_t dstOffset = 0;
+	std::size_t size = 0;
+};
+
 class Resource;
 
 enum class TrackedUploadTicketState : uint8_t { Queued, Claimed, Submitted, Completed, Cancelled };

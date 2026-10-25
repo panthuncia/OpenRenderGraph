@@ -8,6 +8,7 @@ option(OPENRENDERGRAPH_ENABLE_SUBMODULE_FALLBACK "Allow fallback to in-tree Basi
 option(OPENRENDERGRAPH_FORWARD_BASICRHI_DEP_OPTIONS "Forward BasicRHI PIX/Streamline options when adding BasicRHI subdirectory" ON)
 option(OPENRENDERGRAPH_ENABLE_DEBUG_UI "Build the optional ImGui/ImPlot/Slang inspector" OFF)
 option(OPENRENDERGRAPH_ENABLE_SCHEDULE_UI "Build the persistent schedule inspector (DebugUI/ScheduleInspector.h), Dear ImGui only" OFF)
+option(OPENRENDERGRAPH_ENABLE_MEMORY_UI "Build the memory introspection widget (DebugUI/MemoryIntrospectionWidget.h), Dear ImGui and ImPlot only" OFF)
 option(OPENRENDERGRAPH_ENABLE_D3D11_INTEROP "Build the optional Windows D3D11/D3D12 interop library" OFF)
 option(OPENRENDERGRAPH_BUILD_TESTS "Build OpenRenderGraph tests" OFF)
 option(ORG_ENABLE_NVPERF "Build Telemetry/NvPerfCapture against NVIDIA's Nsight Perf SDK (otherwise it reports itself unavailable)" OFF)
@@ -85,8 +86,11 @@ if(OPENRENDERGRAPH_ENABLE_DEBUG_UI)
     find_package(implot CONFIG REQUIRED)
     find_package(slang CONFIG REQUIRED)
 endif()
-if(OPENRENDERGRAPH_ENABLE_SCHEDULE_UI AND NOT TARGET imgui::imgui)
+if((OPENRENDERGRAPH_ENABLE_SCHEDULE_UI OR OPENRENDERGRAPH_ENABLE_MEMORY_UI) AND NOT TARGET imgui::imgui)
     find_package(imgui CONFIG REQUIRED)
+endif()
+if(OPENRENDERGRAPH_ENABLE_MEMORY_UI AND NOT TARGET implot::implot)
+    find_package(implot CONFIG REQUIRED)
 endif()
 
 add_library(OpenRenderGraph STATIC
@@ -261,6 +265,23 @@ if(OPENRENDERGRAPH_ENABLE_SCHEDULE_UI)
         target_compile_options(OpenRenderGraphScheduleUI PRIVATE /utf-8)
     endif()
     target_link_libraries(OpenRenderGraphScheduleUI PUBLIC OpenRenderGraph::OpenRenderGraph imgui::imgui)
+endif()
+
+# The memory introspection widget alone: Dear ImGui and ImPlot (the host's contexts), no Slang. The host feeds it a
+# ui::MemorySnapshot built from the graph's memory snapshot provider (Render/MemoryIntrospectionAPI.h).
+if(OPENRENDERGRAPH_ENABLE_MEMORY_UI)
+    add_library(OpenRenderGraphMemoryUI STATIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/DebugUI/MemoryIntrospectionWidget.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/DebugUI/MemoryIntrospectionWidget.h")
+    add_library(OpenRenderGraph::MemoryUI ALIAS OpenRenderGraphMemoryUI)
+    target_compile_features(OpenRenderGraphMemoryUI PUBLIC cxx_std_23)
+    target_include_directories(OpenRenderGraphMemoryUI PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+    if(MSVC)
+        target_compile_options(OpenRenderGraphMemoryUI PRIVATE /utf-8)
+    endif()
+    target_link_libraries(OpenRenderGraphMemoryUI PUBLIC OpenRenderGraph::OpenRenderGraph imgui::imgui implot::implot)
 endif()
 
 target_compile_definitions(OpenRenderGraph

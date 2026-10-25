@@ -61,9 +61,22 @@ namespace ui {
         DrawToolbar();
         ImGui::Separator();
 
+        // Dummy data only for a host that passes none (a preview of the widget); a host's empty snapshot or missing frame graph
+        // is shown as such, never as made-up rows.
+        if (snapshot && snapshot->categories.empty() && snapshot->resources.empty()) {
+            ImGui::TextUnformatted("No tracked allocations.");
+            ImGui::End();
+            return;
+        }
+        if (snapshot && !frameGraph && view_ == ViewMode::BatchTimeline) {
+            ImGui::TextWrapped("The host provides no frame-graph batches for this graph.");
+            ImGui::End();
+            return;
+        }
+
         MemorySnapshot dummyMem;
         const MemorySnapshot* ms = snapshot;
-        if (ms == nullptr || (ms->categories.empty() && ms->resources.empty())) {
+        if (ms == nullptr) {
             dummyMem = MakeDummySnapshot();
             ms = &dummyMem;
         }

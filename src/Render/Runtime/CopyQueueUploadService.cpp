@@ -335,6 +335,35 @@ std::shared_ptr<TrackedUploadTicket> CopyQueueUploadService::QueueBufferUploadRa
 	return ticket;
 }
 
+std::shared_ptr<TrackedUploadTicket> CopyQueueUploadService::QueueBufferCopyRanges(std::shared_ptr<Resource> source,
+	std::span<const StreamingCopyRange> ranges, org::WorkerOwnedDestination destination) {
+	if (!Initialized() || !source || !destination.resource || source == destination.resource) return {};
+	BT_ZONE_SCOPE("CopyQueueUploadService::QueueBufferCopyRanges");
+
+	// One entry, no staging page: a region per range, read from the source on the GPU. Ranges are not split (nothing is
+	// staged), so the entry may exceed maxBatchBytes and maxBatchCopies alone, as a ranges entry's regions may.
+	auto ticket = std::make_shared<TrackedUploadTicket>();
+	PendingCopy entry;
+	entry.regions.reserve(ranges.size());
+	for (const auto& range : ranges) {
+		if (range.size == 0) continue;
+		entry.regions.push_back({ range.srcOffset, range.dstOffset, range.size });
+		entry.size += range.size;
+	}
+	BT_ZONE_VALUE(static_cast<int64_t>(entry.size));
+	// Nothing to copy: the ticket rides a copy-less entry (no source, no destination: no barriers, no hazard), so it still
+	// completes in order, on the service's timeline.
+	if (!entry.regions.empty()) {
+		entry.source = std::move(source);
+		entry.destination = std::move(destination.resource);
+	}
+	entry.ticket = ticket;
+	entry.queued = std::chrono::steady_clock::now();
+	m_intake.Push(std::move(entry));
+	m_wake.notify_one();
+	return ticket;
+}
+
 // ---------------------------------------------------------------------------
 // Submitter
 
@@ -374,14 +403,43 @@ bool CopyQueueUploadService::QueueSignal(std::shared_ptr<rhi::TimelinePtr> timel
 	return true;
 }
 
+bool CopyQueueUploadService::QueueWait(std::span<const std::pair<std::shared_ptr<rhi::TimelinePtr>, uint64_t>> points) {
+	if (!Initialized()) return false;
+	PendingCopy wait;
+	for (const auto& [timeline, value] : points)
+		if (timeline && *timeline && value) wait.waits.emplace_back(timeline, value);
+	if (wait.waits.empty()) return true;
+	wait.queued = std::chrono::steady_clock::now();
+	m_intake.Push(std::move(wait));
+	m_wake.notify_one();
+	return true;
+}
+
 bool CopyQueueUploadService::CollectBatch(Batch& batch) {
 	batch.copies.clear();
 	batch.bytes = 0;
 	PendingCopy copy;
 	size_t regions = 0; // copy regions: a ranges entry counts each of its own
+	// One batch records no barriers between its copies, so it never holds both a write and a read of one resource: a buffer
+	// copy whose source an earlier entry writes, or an entry writing what an earlier copy reads, ends the batch and opens the
+	// next one (carried over, unclaimed). Whole resources, not byte ranges: conservative and cheap.
+	std::unordered_set<Resource*> written;
+	std::unordered_set<Resource*> read;
 	while (regions < m_config.maxBatchCopies) {
-		if (!batch.copies.empty() && m_intake.Count() == 0) break;
-		if (!m_intake.Pop(copy)) break;
+		if (m_carried) {
+			copy = std::move(*m_carried);
+			m_carried.reset();
+			m_hasCarried.store(false, std::memory_order_release);
+		} else {
+			if (!batch.copies.empty() && m_intake.Count() == 0) break;
+			if (!m_intake.Pop(copy)) break;
+		}
+		if (!batch.copies.empty() && ((copy.source && written.contains(copy.source.get())) ||
+				(copy.destination && read.contains(copy.destination.get())))) {
+			m_carried = std::move(copy);
+			m_hasCarried.store(true, std::memory_order_release);
+			break;
+		}
 		if (copy.ticket) {
 			auto expected = TrackedUploadTicketState::Queued;
 			if (!copy.ticket->state.compare_exchange_strong(expected, TrackedUploadTicketState::Claimed,
@@ -394,6 +452,8 @@ bool CopyQueueUploadService::CollectBatch(Batch& batch) {
 			}
 			copy.ticket->NotifyChanged();
 		}
+		if (copy.destination) written.insert(copy.destination.get());
+		if (copy.source) read.insert(copy.source.get());
 		batch.bytes += copy.size;
 		regions += copy.regions.empty() ? 1 : copy.regions.size();
 		batch.copies.push_back(std::move(copy));
@@ -412,28 +472,45 @@ bool CopyQueueUploadService::RecordAndSubmit(Batch& batch) {
 	}
 	auto& list = batch.pair.list.Get();
 
-	// One barrier per distinct destination on each side of the copies. The
-	// same barriers are legal on both backends: buffers have no layout, and the
-	// destinations are QueueSharing::Concurrent so no family transfer is needed.
+	// One barrier per distinct destination (to CopyDest) and per distinct buffer
+	// copy source (to CopySource) on each side of the copies; CollectBatch keeps
+	// the two sets disjoint. The same barriers are legal on both backends:
+	// buffers have no layout, and both are QueueSharing::Concurrent so no family
+	// transfer is needed.
 	std::vector<rhi::BufferBarrier> barriers;
 	std::unordered_set<Resource*> seen;
 	barriers.reserve(batch.copies.size());
-	for (const auto& copy : batch.copies) {
-		if (!copy.destination || !seen.insert(copy.destination.get()).second) continue;
+	const auto addBarrier = [&](const std::shared_ptr<Resource>& resource, rhi::ResourceAccessType access) {
+		if (!resource || !seen.insert(resource.get()).second) return;
 		rhi::BufferBarrier barrier{};
-		barrier.buffer = copy.destination->GetAPIResource().GetHandle();
+		barrier.buffer = resource->GetAPIResource().GetHandle();
 		barrier.beforeSync = rhi::ResourceSyncState::All;
 		barrier.afterSync = rhi::ResourceSyncState::Copy;
 		barrier.beforeAccess = rhi::ResourceAccessType::Common;
-		barrier.afterAccess = rhi::ResourceAccessType::CopyDest;
+		barrier.afterAccess = access;
 		barriers.push_back(barrier);
+	};
+	for (const auto& copy : batch.copies) {
+		addBarrier(copy.destination, rhi::ResourceAccessType::CopyDest);
+		if (copy.destination) addBarrier(copy.source, rhi::ResourceAccessType::CopySource);
 	}
 	if (!barriers.empty()) {
 		list.Barriers({ .buffers = { barriers.data(), static_cast<uint32_t>(barriers.size()) } });
 	}
 	size_t regions = 0;
 	for (const auto& copy : batch.copies) {
-		if (!copy.destination || !copy.page) continue;
+		if (!copy.destination) continue;
+		if (copy.source) {
+			// A buffer copy entry: its regions read the source.
+			const auto dst = copy.destination->GetAPIResource().GetHandle();
+			const auto src = copy.source->GetAPIResource().GetHandle();
+			for (const auto& region : copy.regions) {
+				list.CopyBufferRegion(dst, region.dstOffset, src, region.srcOffset, region.size);
+			}
+			regions += copy.regions.size();
+			continue;
+		}
+		if (!copy.page) continue;
 		if (copy.regions.empty()) {
 			list.CopyBufferRegion(copy.destination->GetAPIResource().GetHandle(), copy.dstOffset,
 				copy.page->buffer->GetHandle(), copy.srcOffset, copy.size);
@@ -450,7 +527,7 @@ bool CopyQueueUploadService::RecordAndSubmit(Batch& batch) {
 	for (auto& barrier : barriers) {
 		barrier.beforeSync = rhi::ResourceSyncState::Copy;
 		barrier.afterSync = rhi::ResourceSyncState::All;
-		barrier.beforeAccess = rhi::ResourceAccessType::CopyDest;
+		barrier.beforeAccess = barrier.afterAccess; // CopyDest or CopySource
 		barrier.afterAccess = rhi::ResourceAccessType::Common;
 	}
 	if (!barriers.empty()) {
@@ -483,7 +560,21 @@ bool CopyQueueUploadService::RecordAndSubmit(Batch& batch) {
 		else found->value = (std::max)(found->value, copy.signalValue);
 		++externalSignals;
 	}
-	if (rhi::Failed(m_copyQueue.Submit(lists, { .signals = { signals.data(), static_cast<uint32_t>(signals.size()) } }))) {
+	// The wait entries' points, each timeline at the largest value any entry asks: the whole batch waits (copies queued before a wait in
+	// the same batch only start later).
+	std::vector<rhi::TimelinePoint> waits;
+	for (const auto& copy : batch.copies) {
+		for (const auto& [waitTimeline, value] : copy.waits) {
+			const auto handle = (*waitTimeline)->GetHandle();
+			auto found = std::find_if(waits.begin(), waits.end(), [&](const rhi::TimelinePoint& a_point) {
+				return a_point.t.index == handle.index && a_point.t.generation == handle.generation;
+			});
+			if (found == waits.end()) waits.push_back({ handle, value });
+			else found->value = (std::max)(found->value, value);
+		}
+	}
+	if (rhi::Failed(m_copyQueue.Submit(lists, { .waits = { waits.data(), static_cast<uint32_t>(waits.size()) },
+			.signals = { signals.data(), static_cast<uint32_t>(signals.size()) } }))) {
 		spdlog::error("CopyQueueUploadService '{}': copy queue submission failed{}", m_config.debugName,
 			externalSignals ? fmt::format("; {} external signals dropped (their waiters will not proceed)", externalSignals) : std::string());
 		FinishBatch(batch, true);
@@ -547,7 +638,7 @@ void CopyQueueUploadService::SubmitterMain(std::stop_token stopToken) {
 			}
 			bool submittedAny = false;
 			while (m_inFlight.size() < m_config.maxInFlightBatches &&
-				m_intake.Count() != 0 && !stopToken.stop_requested()) {
+				(m_intake.Count() != 0 || m_carried) && !stopToken.stop_requested()) {
 				Batch batch;
 				if (!CollectBatch(batch)) break;
 				if (RecordAndSubmit(batch)) {
@@ -557,7 +648,7 @@ void CopyQueueUploadService::SubmitterMain(std::stop_token stopToken) {
 				}
 			}
 			RetirePages();
-			if (m_inFlight.empty() && m_intake.Count() == 0) {
+			if (m_inFlight.empty() && m_intake.Count() == 0 && !m_carried) {
 				m_idle.notify_all();
 			}
 			if (stopToken.stop_requested() && m_inFlight.empty()) break;
@@ -566,11 +657,11 @@ void CopyQueueUploadService::SubmitterMain(std::stop_token stopToken) {
 			if (!m_inFlight.empty()) {
 				// Poll completion at millisecond granularity; a new upload wakes us sooner.
 				m_wake.wait_for(lock, stopToken, std::chrono::milliseconds(1), [this] {
-					return m_intake.Count() != 0;
+					return m_intake.Count() != 0 || m_hasCarried.load(std::memory_order_acquire);
 				});
 			} else {
 				m_wake.wait(lock, stopToken, [this] {
-					return m_intake.Count() != 0;
+					return m_intake.Count() != 0 || m_hasCarried.load(std::memory_order_acquire);
 				});
 			}
 		}
@@ -587,7 +678,7 @@ bool CopyQueueUploadService::WaitIdle(uint32_t timeoutMs) {
 	if (!Initialized()) return true;
 	std::unique_lock lock(m_wakeMutex);
 	const auto idle = [this] {
-		return m_intake.Count() == 0 &&
+		return m_intake.Count() == 0 && !m_hasCarried.load(std::memory_order_acquire) &&
 			m_inFlightCount.load(std::memory_order_acquire) == 0;
 	};
 	if (idle()) return true;
@@ -624,6 +715,13 @@ void CopyQueueUploadService::Cleanup() {
 		m_submitter.request_stop();
 		m_wake.notify_all();
 		m_submitter.join();
+	}
+	// The carried entry first (it precedes the intake), then the intake.
+	if (m_carried) {
+		if (m_carried->ticket) m_carried->ticket->Cancel();
+		if (m_carried->page) m_carried->page->pendingRegions.fetch_sub(1, std::memory_order_acq_rel);
+		m_carried.reset();
+		m_hasCarried.store(false, std::memory_order_release);
 	}
 	PendingCopy copy;
 	while (m_intake.Pop(copy)) {

@@ -111,10 +111,14 @@ public:
 		WorkerOwnedDestination destination, size_t dstOffset = 0);
 	std::shared_ptr<TrackedUploadTicket> QueueTrackedStreamingUploadRanges(
 		std::span<const StreamingUploadRange> ranges, WorkerOwnedDestination destination);
+	// A GPU copy between two buffers on that path (IUploadService::QueueTrackedStreamingCopyRanges); null without a queue of its own.
+	std::shared_ptr<TrackedUploadTicket> QueueTrackedStreamingCopyRanges(std::shared_ptr<Resource> source,
+		std::span<const StreamingCopyRange> ranges, WorkerOwnedDestination destination);
 	org::runtime::CopyQueueUploadService* CopyQueueUploads() { return m_copyQueueUploads.get(); }
 	// Whether the worker upload path has a queue of its own (not the graph's copy queue, which may alias the graphics one).
 	bool HasDedicatedStreamingQueue() const { return static_cast<bool>(m_uploadQueue); }
 	bool QueueStreamingSignal(std::shared_ptr<rhi::TimelinePtr> timeline, uint64_t value);
+	bool QueueStreamingWait(std::span<const std::pair<std::shared_ptr<rhi::TimelinePtr>, uint64_t>> points);
 
 	void Cleanup();
 private:

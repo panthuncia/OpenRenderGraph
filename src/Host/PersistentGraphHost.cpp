@@ -14,6 +14,7 @@
 
 #include "Managers/Singletons/DescriptorHeapManager.h"
 #include "Resources/Buffers/DynamicBufferBase.h"
+#include "Render/MemoryIntrospectionBackend.h"
 #include "Render/PassExecutionContext.h"
 #include "Render/Runtime/IUploadService.h"
 #include "Render/Runtime/OpenRenderGraphSettings.h"
@@ -347,6 +348,8 @@ void PersistentGraphHost::Build() {
 		if (auto extension = entry.factory()) graph->RegisterExtension(std::move(extension), entry.id);
 	runtime::ScopedActiveGraphServices services(graph->GetUploadService(), graph->GetDescriptorService());
 	graph->PrepareExtensionsForBuild();
+	// The graph's memory snapshots (its VRAM dump, a host's memory UI): ORG's tracking world, as the contributor host's.
+	graph->GetMemorySnapshotProvider().SetProvider(memory::CreateECSMemorySnapshotProvider());
 	graph->CompileStructural();
 	graph->SetPersistentSegment(kUploadPassName, RenderGraph::PersistentSegmentKind::Pre);
 	graph->SetPersistentEpochOrder(m_desc.epochOrder);

@@ -113,6 +113,7 @@ public:
 			world.component<MemoryStatisticsComponents::ResourceName>();
 			world.component<MemoryStatisticsComponents::AliasingPool>();
 			world.component<MemoryStatisticsComponents::ResourceUsage>();
+			world.component<MemoryStatisticsComponents::HeapKind>();
 			world.component<MemoryStatisticsComponents::TextureShape>();
 			world.component<ResourceIdentifier>();
 		});

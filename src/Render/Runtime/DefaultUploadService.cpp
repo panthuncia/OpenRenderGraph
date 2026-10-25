@@ -168,10 +168,19 @@ public:
         return UploadManager::GetInstance().QueueTrackedStreamingUploadRanges(ranges, std::move(destination));
     }
 
+    std::shared_ptr<TrackedUploadTicket> QueueTrackedStreamingCopyRanges(std::shared_ptr<Resource> source,
+        std::span<const StreamingCopyRange> ranges, WorkerOwnedDestination destination) override {
+        return UploadManager::GetInstance().QueueTrackedStreamingCopyRanges(
+            std::move(source), ranges, std::move(destination));
+    }
+
     bool HasDedicatedStreamingQueue() const override {
         return UploadManager::GetInstance().HasDedicatedStreamingQueue();
     }
 
+    bool QueueStreamingWait(std::span<const std::pair<std::shared_ptr<rhi::TimelinePtr>, uint64_t>> points) override {
+        return UploadManager::GetInstance().QueueStreamingWait(points);
+    }
     bool QueueStreamingSignal(std::shared_ptr<rhi::TimelinePtr> timeline, uint64_t value) override {
         return UploadManager::GetInstance().QueueStreamingSignal(std::move(timeline), value);
     }

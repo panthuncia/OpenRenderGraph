@@ -198,6 +198,16 @@ public:
         }
         return ticket;
     }
+    // The same path, a GPU copy from another buffer (CopyQueueUploadService::QueueBufferCopyRanges): one ticket for the ranges,
+    // completed after every one. The source must be a buffer no queue writes while the copy is queued (an immutable published
+    // version, kept alive by the caller until the ticket completes) and rhi::QueueSharing::Concurrent like the destination. It is
+    // ordered after every upload queued on this path before it, including writes to the source itself. Null: the path cannot copy
+    // (no dedicated queue), and the caller uploads instead.
+    virtual std::shared_ptr<TrackedUploadTicket> QueueTrackedStreamingCopyRanges(
+        std::shared_ptr<Resource> source, std::span<const StreamingCopyRange> ranges, WorkerOwnedDestination destination) {
+        (void)source; (void)ranges; (void)destination;
+        return {};
+    }
     // Whether that path has a queue of its own (the dedicated uploader of graph work). Without one its copies go to the graph's
     // copy queue, which a host may alias to its graphics queue: a producer that relies on running beside the frame checks this.
     virtual bool HasDedicatedStreamingQueue() const { return false; }
@@ -206,6 +216,13 @@ public:
     // that announced one always queues it. False when the path has no queue of its own to signal from.
     virtual bool QueueStreamingSignal(std::shared_ptr<rhi::TimelinePtr> timeline, uint64_t value) {
         (void)timeline; (void)value;
+        return false;
+    }
+    // Any thread: the uploads the calling thread queues on that path from now on wait, on the GPU, until each timeline reached its
+    // value (another queue's progress: a frame in flight still reading the destination they overwrite). Nothing waits on the CPU.
+    // False when the path has no queue of its own.
+    virtual bool QueueStreamingWait(std::span<const std::pair<std::shared_ptr<rhi::TimelinePtr>, uint64_t>> points) {
+        (void)points;
         return false;
     }
 

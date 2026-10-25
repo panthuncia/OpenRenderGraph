@@ -470,12 +470,29 @@ std::shared_ptr<TrackedUploadTicket> UploadManager::QueueTrackedStreamingUploadR
 	return m_copyQueueUploads->QueueBufferUploadRanges(ranges, std::move(destination));
 }
 
+std::shared_ptr<TrackedUploadTicket> UploadManager::QueueTrackedStreamingCopyRanges(std::shared_ptr<Resource> source,
+	std::span<const StreamingCopyRange> ranges, WorkerOwnedDestination destination)
+{
+	// As the signal: only on a queue of its own (the caller uploads instead).
+	if (!HasDedicatedStreamingQueue()) return {};
+	if (!m_copyQueueUploads || !m_copyQueueUploads->Initialized()) Initialize();
+	return m_copyQueueUploads->QueueBufferCopyRanges(std::move(source), ranges, std::move(destination));
+}
+
 bool UploadManager::QueueStreamingSignal(std::shared_ptr<rhi::TimelinePtr> timeline, uint64_t value)
 {
 	// Only from a queue of its own: the graph's copy queue may be its graphics queue, whose own waits would then wait on this.
 	if (!HasDedicatedStreamingQueue()) return false;
 	if (!m_copyQueueUploads || !m_copyQueueUploads->Initialized()) Initialize();
 	return m_copyQueueUploads->QueueSignal(std::move(timeline), value);
+}
+
+bool UploadManager::QueueStreamingWait(std::span<const std::pair<std::shared_ptr<rhi::TimelinePtr>, uint64_t>> points)
+{
+	// As the signal: only from a queue of its own (a wait on the graph's queue would wait on itself).
+	if (!HasDedicatedStreamingQueue()) return false;
+	if (!m_copyQueueUploads || !m_copyQueueUploads->Initialized()) Initialize();
+	return m_copyQueueUploads->QueueWait(points);
 }
 
 

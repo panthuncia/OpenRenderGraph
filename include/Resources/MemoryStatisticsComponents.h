@@ -35,6 +35,11 @@ namespace MemoryStatisticsComponents
 		std::string usage;
 	};
 
+	// The heap an allocation was made in (a buffer's access type); an allocation without one is device-local (textures).
+	struct HeapKind {
+		rhi::HeapType type = rhi::HeapType::DeviceLocal;
+	};
+
 	struct TextureShape {
 		uint32_t width = 0;
 		uint32_t height = 0;

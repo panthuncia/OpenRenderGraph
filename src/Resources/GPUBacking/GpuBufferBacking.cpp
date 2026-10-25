@@ -51,6 +51,7 @@ GpuBufferBacking::GpuBufferBacking(
     allocationBundle
         .Set<MemoryStatisticsComponents::MemSizeBytes>({ allocInfo.sizeInBytes })
         .Set<MemoryStatisticsComponents::ResourceType>({ rhi::ResourceType::Buffer })
+        .Set<MemoryStatisticsComponents::HeapKind>({ accessType })
         .Set<MemoryStatisticsComponents::ResourceID>({ owningResourceID });
     if (aliasPlacement && aliasPlacement->poolID.has_value()) {
         allocationBundle.Set<MemoryStatisticsComponents::AliasingPool>({ aliasPlacement->poolID });

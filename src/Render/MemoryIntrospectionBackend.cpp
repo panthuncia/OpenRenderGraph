@@ -39,6 +39,9 @@ public:
             if (auto rn = e.try_get<MemoryStatisticsComponents::ResourceName>()) {
                 row.resourceName = rn->name;
             }
+            if (auto heap = e.try_get<MemoryStatisticsComponents::HeapKind>()) {
+                row.heapType = heap->type;
+            }
             if (auto usage = e.try_get<MemoryStatisticsComponents::ResourceUsage>()) {
                 row.usage = usage->usage;
             }

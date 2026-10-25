@@ -14,6 +14,8 @@ struct ResourceMemoryRecord {
     uint64_t resourceID = 0;
     uint64_t bytes = 0;
     rhi::ResourceType resourceType = rhi::ResourceType::Unknown;
+    // The allocation's heap: Upload and Readback are host memory on a discrete GPU, the rest (GPUUpload too) device memory.
+    rhi::HeapType heapType = rhi::HeapType::DeviceLocal;
     std::string resourceName;
     std::string usage;
     std::string identifier;
