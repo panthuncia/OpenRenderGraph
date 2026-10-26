@@ -352,9 +352,29 @@ public:
 	// The frame slot of the execution ExecuteFrame is running (valid from its beforePrepare callback until
 	// it returns): the region of a LatchBlock the host may write for it. Also RecordingContext::FrameSlot.
 	bool ClosedExecutions() const noexcept { return m_desc.closedExecutions; }
+	// An external frame slot set (BeginExternalFrameSlot) wins outside a ticket's beforeSubmit: the slot an epoch submitted meanwhile
+	// writes is its ticket's own.
 	uint32_t CurrentFrameSlot() const noexcept {
+		if (m_externalSlot != kNoExternalSlot && !m_submittingTicket) return m_externalSlot;
 		return m_async ? m_asyncSlot : static_cast<uint32_t>(m_frameNumber % m_frameSlots);
 	}
+	// Submitting thread: a client that records the work reading its LatchBlocks outside the host's executions (into another
+	// submitter's command buffer: Community Shaders' DCLF CPU pipeline, DXVK's own list) writes its latch regions at `slot`
+	// (taken modulo FrameSlots()) from now until EndExternalFrameSlot: CurrentFrameSlot() returns it, except inside a ticket's
+	// beforeSubmit. The client owns the slot's reuse: it waits, before Begin, until the work that read the slot last has retired
+	// (the host's slot waits cover its own submissions only), and it does not use a slot under an execution of the host's that
+	// writes the same blocks. The slot's upload pages and staged batches are released here once the host's own last work at the
+	// slot has completed too: a client's frames go round every slot, and an execution of the host's releases only the slot it takes.
+	void BeginExternalFrameSlot(uint32_t slot);
+	void EndExternalFrameSlot() noexcept { m_externalSlot = kNoExternalSlot; }
+	bool ExternalFrameSlotActive() const noexcept { return m_externalSlot != kNoExternalSlot; }
+	// Submitting thread: the client's work at frame slot `slot` is complete once `timeline` reaches `value`, which the client may signal
+	// later (its frame's end). The host's slot waits cover its own submissions alone, so until then an execution of the host's taking
+	// the slot leaves the slot's upload pages for a later release (the client's work may still read them; BeginExternalFrameSlot's
+	// when the client takes the slot again, if no execution of the host's took it first), and every descriptor slot,
+	// resource or backing retired from now on waits for the point too (an execution of the host's mid-frame would otherwise release
+	// what the client's pending work still reads).
+	void NoteExternalSlotUse(uint32_t slot, std::shared_ptr<rhi::TimelinePtr> timeline, uint64_t value);
 	// The host frame number of the last execution (ExecuteFrame or SubmitEpoch); the completed-frame
 	// callback reports frames by it.
 	uint64_t LastHostFrame() const noexcept { return m_lastHostFrame; }
@@ -467,6 +487,19 @@ private:
 	std::vector<std::shared_ptr<const void>> m_uncertainExecutionOwners;
 	std::vector<std::shared_ptr<void>> m_uncertainUploadOwners;
 	uint32_t m_asyncSlot = 0;
+	static constexpr uint32_t kNoExternalSlot = ~0u;
+	uint32_t m_externalSlot = kNoExternalSlot;  // submitting thread: BeginExternalFrameSlot's
+	// Submitting thread: NoteExternalSlotUse's timeline and each slot's last point on it (0: none).
+	std::shared_ptr<rhi::TimelinePtr> m_externalTimeline;
+	std::vector<uint64_t> m_externalSlotValues;
+	// Submitting thread: per slot, every queue's value assigned when the host last submitted work for it (SubmittedPoint), which
+	// BeginExternalFrameSlot's release waits for without blocking; and, with async epochs, what its releases retired, handed to
+	// the host's thread with the next submission (its driver frees take the device's memory locks).
+	std::vector<GpuPoint> m_slotSubmitted;
+	std::vector<std::shared_ptr<void>> m_externalRetired;
+	bool ExternalSlotInUse(uint32_t slot) const noexcept;
+	// Submitting thread, after work for `slot` was submitted: m_slotSubmitted's point for it.
+	void NoteSlotSubmitted(uint32_t slot);
 	std::vector<uint32_t> m_asyncEpochs;  // restarted with these after a rebuild
 	std::vector<uint32_t> m_revisionEpochs;
 	std::shared_ptr<const EpochRecording> m_chosenRecording;  // submitting thread: UseEpochRecording's, until SubmitEpoch takes it

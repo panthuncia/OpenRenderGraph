@@ -26,6 +26,32 @@ void RetireDescriptorSlotsForDeferredRelease(
     DescriptorHeapManager::GetInstance().RetireDescriptorSlots(std::move(slots));
 }
 
+namespace {
+	struct ShaderVisibleCapacities {
+		UINT resources = 0;
+		UINT samplers = 0;
+	};
+
+	// The shader-visible heap capacities the device was set up with (ShaderFeatureInfo; a backend may hold fewer than the preferred
+	// 1,000,000 / 2048). Defaults where the backend does not report them. Logged once per device.
+	ShaderVisibleCapacities QueryShaderVisibleCapacities(rhi::Device device) {
+		const rhi::DescriptorHeapCapacities defaults{};
+		ShaderVisibleCapacities capacities{ defaults.preferredResources, defaults.preferredSamplers };
+		ShaderFeatureInfo features{};
+		if (device.QueryFeatureInfo(&features.header) == rhi::Result::Ok) {
+			if (features.maxShaderVisibleResourceDescriptors != 0) capacities.resources = features.maxShaderVisibleResourceDescriptors;
+			if (features.maxShaderVisibleSamplerDescriptors != 0) capacities.samplers = features.maxShaderVisibleSamplerDescriptors;
+		}
+		static const void* loggedDevice = nullptr;
+		if (loggedDevice != device.impl) {
+			loggedDevice = device.impl;
+			spdlog::info("DescriptorHeapManager: shader-visible heaps of {} CBV/SRV/UAV and {} sampler descriptors{}", capacities.resources,
+				capacities.samplers, features.maxShaderVisibleResourceDescriptors == 0 ? " (defaults: the backend reports no capacity)" : "");
+		}
+		return capacities;
+	}
+}
+
 void DescriptorHeapManager::Initialize() {
 	if (m_cbvSrvUavHeap) {
 		return;
@@ -36,18 +62,19 @@ void DescriptorHeapManager::Initialize() {
     m_deferredReleases.clear();
     m_deferredResourcePointers.clear();
     m_latestQueueFenceSnapshot.clear();
+    const ShaderVisibleCapacities capacities = QueryShaderVisibleCapacities(device);
 
     m_cbvSrvUavHeap = std::make_shared<DescriptorHeap>(
         device,
         rhi::DescriptorHeapType::CbvSrvUav,
-        1000000,
+        capacities.resources,
         true,
         "cbvSrvUavHeap");
 
     m_samplerHeap = std::make_shared<DescriptorHeap>(
         device,
         rhi::DescriptorHeapType::Sampler,
-        2048,
+        capacities.samplers,
         true,
         "samplerHeap");
 
@@ -95,10 +122,11 @@ void DescriptorHeapManager::RegisterBackend(BackendInstanceId backendInstance, r
 	const std::string suffix = ".backend" + std::to_string(key);
 	BackendHeaps heaps{};
 	heaps.device = device;
+	const ShaderVisibleCapacities capacities = QueryShaderVisibleCapacities(device);
 	heaps.cbvSrvUav = std::make_shared<DescriptorHeap>(device, rhi::DescriptorHeapType::CbvSrvUav,
-		1000000, true, "cbvSrvUavHeap" + suffix);
+		capacities.resources, true, "cbvSrvUavHeap" + suffix);
 	heaps.sampler = std::make_shared<DescriptorHeap>(device, rhi::DescriptorHeapType::Sampler,
-		2048, true, "samplerHeap" + suffix);
+		capacities.samplers, true, "samplerHeap" + suffix);
 	heaps.rtv = std::make_shared<DescriptorHeap>(device, rhi::DescriptorHeapType::RTV,
 		10000, false, "rtvHeap" + suffix);
 	heaps.dsv = std::make_shared<DescriptorHeap>(device, rhi::DescriptorHeapType::DSV,

@@ -327,6 +327,8 @@ void PersistentGraphHost::DestroyGraph() {
 	// Adopted devices wait on their own timelines only (never the whole device).
 	(void)m_desc.device.WaitIdle();
 	for (auto& completion : m_slotCompletions) completion = {};
+	m_slotSubmitted.clear();
+	m_externalRetired.clear();
 	m_graph->ShutdownExtensions();
 	m_graph->ShutdownTaskWorkers();
 	m_graph.reset();
@@ -436,7 +438,8 @@ void PersistentGraphHost::ExecuteFrame(const IHostExecutionData* hostData, const
 		}
 	}
 	lap(m_lastTimings.waitUs);
-	if (auto* uploads = m_graph->GetUploadService()) uploads->ProcessDeferredReleases(static_cast<uint8_t>(slot));
+	// A slot an external client's work still uses (NoteExternalSlotUse) keeps its upload pages for a later release.
+	if (auto* uploads = m_graph->GetUploadService(); uploads && !ExternalSlotInUse(slot)) uploads->ProcessDeferredReleases(static_cast<uint8_t>(slot));
 	DescriptorHeapManager::GetInstance().ProcessDeferredReleases(static_cast<uint8_t>(slot));
 	lap(m_lastTimings.releaseUs);
 	m_graph->SetPersistentEpoch(epoch);
@@ -491,6 +494,7 @@ void PersistentGraphHost::ExecuteFrame(const IHostExecutionData* hostData, const
 			m_uncertainExecutionOwners.pop_back();
 		}
 	}
+	NoteSlotSubmitted(slot);
 	lap(m_lastTimings.signalUs);
 	m_lastHostFrame = m_frameNumber;
 	++m_frameNumber;
@@ -1225,7 +1229,8 @@ void PersistentGraphHost::SubmitTicket(Async& async, uint32_t index, std::shared
 	// the deletion queues goes to the host's thread with the submission: its driver frees take the device's memory locks,
 	// which the render thread must not wait on here.
 	std::shared_ptr<void> retired;
-	if (auto* uploads = m_graph->GetUploadService()) retired = uploads->ProcessDeferredReleasesRetiringElsewhere(static_cast<uint8_t>(slot));
+	if (auto* uploads = m_graph->GetUploadService(); uploads && !ExternalSlotInUse(slot))
+		retired = uploads->ProcessDeferredReleasesRetiringElsewhere(static_cast<uint8_t>(slot));
 	lap(m_lastTimings.releaseUs);
 	if (beforeSubmit) {
 		BT_ZONE_SCOPE("ORG.Host.CommitInputs");
@@ -1346,6 +1351,10 @@ void PersistentGraphHost::SubmitTicket(Async& async, uint32_t index, std::shared
 	submitted.number = ++m_submissions;
 	submitted.epochIndex = index;
 	submitted.keepAlive = std::move(keepAlive);
+	if (!m_externalRetired.empty()) {
+		m_externalRetired.push_back(std::move(retired));
+		retired = std::make_shared<std::vector<std::shared_ptr<void>>>(std::exchange(m_externalRetired, {}));
+	}
 	submitted.retired = std::move(retired);
 	submitted.resourceOwner = reservation ? reservation->resourceOwner : std::move(resourceOwner);
 	if (recorded || !recordedLists.empty()) {
@@ -1393,8 +1402,47 @@ void PersistentGraphHost::SubmitTicket(Async& async, uint32_t index, std::shared
 		throw;
 	}
 	lap(m_lastTimings.postUs);
+	NoteSlotSubmitted(slot);
 	++m_asyncStats.submitted;
 	if (!ok) throw std::runtime_error("Async epoch submission failed");
+}
+
+void PersistentGraphHost::NoteExternalSlotUse(uint32_t slot, std::shared_ptr<rhi::TimelinePtr> timeline, uint64_t value) {
+	if (!timeline || !*timeline || !value || !m_frameSlots) return;
+	slot %= m_frameSlots;
+	if (m_externalSlotValues.size() != m_frameSlots) m_externalSlotValues.assign(m_frameSlots, 0);
+	m_externalTimeline = timeline;
+	m_externalSlotValues[slot] = (std::max)(m_externalSlotValues[slot], value);
+	DescriptorHeapManager::GetInstance().PublishQueueFenceSnapshot({ DescriptorHeapManager::QueueFenceSnapshotPoint{ .timeline = timeline->Get(), .value = value } });
+}
+
+void PersistentGraphHost::BeginExternalFrameSlot(uint32_t slot) {
+	m_externalSlot = m_frameSlots ? slot % m_frameSlots : 0u;
+	// The client waited out its own last work at the slot (the contract above). The host's last work there must be done too, or
+	// the slot is left to the host's next execution taking it, or to the client's next frame at it.
+	auto* uploads = m_graph ? m_graph->GetUploadService() : nullptr;
+	if (!uploads || (m_externalSlot < m_slotSubmitted.size() && !m_slotSubmitted[m_externalSlot].Reached())) return;
+	if (!m_async) {
+		uploads->ProcessDeferredReleases(static_cast<uint8_t>(m_externalSlot));
+		return;
+	}
+	if (auto retired = uploads->ProcessDeferredReleasesRetiringElsewhere(static_cast<uint8_t>(m_externalSlot))) m_externalRetired.push_back(std::move(retired));
+	// No submission came to take them for a round of slots: they are freed here rather than kept.
+	if (m_externalRetired.size() > m_frameSlots) m_externalRetired.clear();
+}
+
+void PersistentGraphHost::NoteSlotSubmitted(uint32_t slot) {
+	if (m_slotSubmitted.size() != m_frameSlots) m_slotSubmitted.resize(m_frameSlots);
+	m_slotSubmitted[slot % m_frameSlots] = SubmittedPoint();
+}
+
+bool PersistentGraphHost::ExternalSlotInUse(uint32_t slot) const noexcept {
+	if (!m_externalTimeline || !*m_externalTimeline || m_frameSlots == 0 || m_externalSlotValues.size() != m_frameSlots) return false;
+	const uint64_t value = m_externalSlotValues[slot % m_frameSlots];
+	if (!value) return false;
+	const uint64_t completed = (*m_externalTimeline)->GetCompletedValue();
+	// UINT64_MAX: a lost device, whose pending work will never read anything.
+	return completed != UINT64_MAX && completed < value;
 }
 
 } // namespace org
