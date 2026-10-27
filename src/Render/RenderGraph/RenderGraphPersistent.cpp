@@ -3612,12 +3612,14 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 				job.recording.resourceDescriptorHeap = defaultResourceHeap;
 				job.recording.samplerDescriptorHeap = defaultSamplerHeap;
 			}
-			// A late batch is recorded after its ticket completes on the owner thread (which publishes the statistics): none.
-			if (m_statisticsService && !late) {
+			// A late batch is recorded after its ticket completes on the owner thread (which publishes the statistics): its frame
+			// slot's completion publishes its (OwnedRecordingStatistics::atCompletion). It is never kept: the shared pool's queries.
+			if (m_statisticsService) {
 				auto statistics = std::make_shared<experimental::OwnedRecordingStatistics>();
 				statistics->service = m_statisticsService;
 				statistics->frameIndex = state.frameIndex;
 				statistics->queueKind = rhiKind;
+				statistics->atCompletion = late;
 				// A recording kept for resubmission records no queries of the shared pool: the statistics service recreates it and
 				// its readback buffers as passes register (a resubmitted list would resolve into the freed ones), and its slots are
 				// frame-indexed. With recording timestamps it owns its own instead: a range per pass, per barrier batch around one

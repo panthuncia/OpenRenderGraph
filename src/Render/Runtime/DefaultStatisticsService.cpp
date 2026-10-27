@@ -59,6 +59,10 @@ public:
         StatisticsManager::GetInstance().MergePendingResolves(queueKind, frameIndex, ctx);
     }
 
+    void PublishAtCompletion(unsigned frameIndex, std::function<void()> publish) override {
+        StatisticsManager::GetInstance().PublishAtCompletion(frameIndex, std::move(publish));
+    }
+
     void OnFrameComplete(unsigned frameIndex, rhi::Queue& queue) override {
         StatisticsManager::GetInstance().OnFrameComplete(frameIndex, queue);
     }

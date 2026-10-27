@@ -31,15 +31,20 @@
 #include "Render/Runtime/UploadServiceAccess.h"
 #include "Render/Runtime/IUploadService.h"
 #include "Render/Runtime/StagedUploadBatch.h"
+#include "Render/Runtime/IStatisticsService.h"
 
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <future>
 #include <iterator>
 #include <memory>
+#include <mutex>
+#include <set>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -67,6 +72,10 @@ struct HostDevice {
 	VkPhysicalDeviceVulkan12Features vulkan12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
 	VkPhysicalDeviceVulkan13Features vulkan13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
 	VkPhysicalDeviceDescriptorHeapFeaturesEXT descriptorHeap{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_FEATURES_EXT};
+	// Without descriptor heaps: BasicRHI's descriptor-buffer model (descriptor buffers with mutable descriptors).
+	VkPhysicalDeviceDescriptorBufferFeaturesEXT descriptorBuffer{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT};
+	VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT mutableDescriptors{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT};
+	bool bufferModel = false;
 };
 
 struct HostBuffer {
@@ -117,6 +126,21 @@ int CreateHostDevice(HostDevice& host) {
 	for (VkPhysicalDevice candidate : devices)
 		if (HasDeviceExtension(candidate, VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME) &&
 			HasDeviceExtension(candidate, VK_KHR_MAINTENANCE_5_EXTENSION_NAME)) { host.physicalDevice = candidate; break; }
+	// Else the first with descriptor buffers and mutable descriptors (ORG_TEST_DEVICE=<name substring> picks among them).
+	if (!host.physicalDevice) {
+		const char* wanted = std::getenv("ORG_TEST_DEVICE");
+		for (VkPhysicalDevice candidate : devices) {
+			VkPhysicalDeviceProperties properties{};
+			vkGetPhysicalDeviceProperties(candidate, &properties);
+			if ((!wanted || std::strstr(properties.deviceName, wanted)) && HasDeviceExtension(candidate, VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME) &&
+				HasDeviceExtension(candidate, VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME)) {
+				host.physicalDevice = candidate;
+				host.bufferModel = true;
+				std::printf("descriptor-buffer model on %s\n", properties.deviceName);
+				break;
+			}
+		}
+	}
 	if (!host.physicalDevice) return 77;
 	uint32_t familyCount = 0;
 	vkGetPhysicalDeviceQueueFamilyProperties(host.physicalDevice, &familyCount, nullptr);
@@ -125,22 +149,27 @@ int CreateHostDevice(HostDevice& host) {
 	for (uint32_t i = 0; i < familyCount; ++i)
 		if ((families[i].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) == (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) { host.family = i; break; }
 
-	host.extensions = {VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME, VK_KHR_MAINTENANCE_5_EXTENSION_NAME};
+	host.extensions = host.bufferModel ? std::vector<const char*>{VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME, VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME}
+		: std::vector<const char*>{VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME, VK_KHR_MAINTENANCE_5_EXTENSION_NAME};
 	host.vulkan12.bufferDeviceAddress = VK_TRUE;
 	host.vulkan12.timelineSemaphore = VK_TRUE;
 	host.vulkan12.descriptorIndexing = VK_TRUE;
 	host.vulkan12.runtimeDescriptorArray = VK_TRUE;
 	host.vulkan12.scalarBlockLayout = VK_TRUE;
 	host.vulkan12.descriptorBindingPartiallyBound = VK_TRUE;
+	host.vulkan12.descriptorBindingVariableDescriptorCount = VK_TRUE;
 	host.vulkan12.shaderStorageBufferArrayNonUniformIndexing = VK_TRUE;
 	host.vulkan12.hostQueryReset = VK_TRUE;
 	host.vulkan13.dynamicRendering = VK_TRUE;
 	host.vulkan13.synchronization2 = VK_TRUE;
 	host.vulkan13.maintenance4 = VK_TRUE;
 	host.descriptorHeap.descriptorHeap = VK_TRUE;
+	host.descriptorBuffer.descriptorBuffer = VK_TRUE;
+	host.descriptorBuffer.pNext = &host.mutableDescriptors;
+	host.mutableDescriptors.mutableDescriptorType = VK_TRUE;
 	host.features.pNext = &host.vulkan12;
 	host.vulkan12.pNext = &host.vulkan13;
-	host.vulkan13.pNext = &host.descriptorHeap;
+	host.vulkan13.pNext = host.bufferModel ? static_cast<void*>(&host.descriptorBuffer) : &host.descriptorHeap;
 	const float priorities[2] = {1.0f, 1.0f};
 	VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
 	qci.queueFamilyIndex = host.family;
@@ -775,6 +804,48 @@ static int Run(int argc, char** argv) {
 				host.SubmitEpoch(0, upload);
 				auto next = host.TakeExternalExecution();
 				REQUIRE(next && execute(*next) && device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "the epoch after a skipped execution");
+				// Pass timestamps of an external epoch, its late pass's included: the completed frames' (the host's thread), by name.
+				std::mutex timedMutex;
+				std::set<std::string> timed;
+				host.SetCompletedFrameCallback([&](uint64_t, const org::runtime::IStatisticsService& a_stats) {
+					std::scoped_lock lock(timedMutex);
+					for (const auto& timestamp : a_stats.GetCompletedTimestamps())
+						if (timestamp.kind == org::runtime::TimestampRangeKind::Pass && timestamp.beginTick && timestamp.endTick >= timestamp.beginTick)
+							timed.emplace(timestamp.name);
+				});
+				const auto timedPasses = [&](bool a_recordingTimestamps, std::set<std::string>& result) -> int {
+					host.SetRecordingTimestamps(a_recordingTimestamps);
+					{
+						std::scoped_lock lock(timedMutex);
+						timed.clear();
+					}
+					for (uint32_t frame = 0; frame < 6; ++frame) {
+						value = 97000u + 10u * frame;
+						host.SubmitEpoch(0, upload);
+						auto execution = host.TakeExternalExecution();
+						REQUIRE(execution && execute(*execution), "a timed external execution");
+					}
+					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "the timed executions write and copy");
+					// Completions are read on the host's thread: until both passes are, or a second.
+					const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+					do {
+						std::this_thread::sleep_for(std::chrono::milliseconds(10));
+						std::scoped_lock lock(timedMutex);
+						result = timed;
+					} while (result.size() < 2 && std::chrono::steady_clock::now() < deadline);
+					std::string names;
+					for (const auto& name : result) names += " " + name;
+					std::printf("external, recording timestamps %s: timed passes%s\n", a_recordingTimestamps ? "on" : "off", names.c_str());
+					return 0;
+				};
+				std::set<std::string> timedOff, timedOn;
+				if (const int failed = timedPasses(false, timedOff)) return failed;
+				if (const int failed = timedPasses(true, timedOn)) return failed;
+				for (const auto* timedSet : {&timedOff, &timedOn})
+					REQUIRE(timedSet->contains("test.write") && timedSet->contains("test.copy-to-host"),
+						"an external epoch's passes are timed, its late pass's too, with or without recording timestamps");
+				host.SetRecordingTimestamps(false);
+				host.SetCompletedFrameCallback({});
 				const auto stats = host.TakeAsyncStats();
 				std::printf("external: %llu submissions, %llu prepared again\n", static_cast<unsigned long long>(stats.submitted),
 					static_cast<unsigned long long>(stats.stale));

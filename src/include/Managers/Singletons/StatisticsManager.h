@@ -61,6 +61,7 @@ public:
 	void EndQuery(unsigned passIndex, unsigned frameIndex, rhi::Queue& queue, rhi::CommandList& cmdList, QueryRecordingContext& ctx);
 	void ResolveQueries(unsigned frameIndex, rhi::Queue& queue, rhi::CommandList& cmdList, QueryRecordingContext& ctx);
 	void MergePendingResolves(rhi::QueueKind queueKind, unsigned frameIndex, QueryRecordingContext& ctx);
+	void PublishAtCompletion(unsigned frameIndex, std::function<void()> publish);
 
 	// Kept recordings' own queries (IStatisticsService::CreateOwnedTimestamps).
 	std::shared_ptr<OwnedTimestampQueries> CreateOwnedTimestamps(rhi::QueueKind queueKind, uint32_t ranges);
@@ -145,6 +146,8 @@ private:
 	// Kept recordings' queries submitted per frame slot, read when the slot completes; what the latest completion read (its
 	// owned queries kept alive with it, for the names the timestamps view).
 	std::unordered_map<unsigned, std::vector<std::shared_ptr<OwnedTimestampQueries>>> m_pendingOwned;
+	// PublishAtCompletion's, by frame slot: run first by the slot's next OnFrameComplete (bounded, as m_pendingOwned).
+	std::unordered_map<unsigned, std::vector<std::function<void()>>> m_publishAtCompletion;
 	std::vector<std::shared_ptr<OwnedTimestampQueries>> m_completedOwned;
 	std::vector<CompletedTimestamp> m_completedTimestamps;
 };

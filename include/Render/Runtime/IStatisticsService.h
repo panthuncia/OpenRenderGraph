@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -116,6 +117,9 @@ public:
         (void)name; (void)cmdList; (void)ctx;
         return false;
     }
+    // A publication (MergePendingResolves and the CPU samples of a recording made after its submission: a late batch of an external
+    // epoch) run by the frame slot's next OnFrameComplete, before it reads the slot's queries, on the thread that calls both.
+    virtual void PublishAtCompletion(unsigned frameIndex, std::function<void()> publish) { (void)frameIndex; (void)publish; }
     // Every timestamp pair the latest OnFrameComplete read, in reading order.
     virtual const std::vector<CompletedTimestamp>& GetCompletedTimestamps() const {
         static const std::vector<CompletedTimestamp> none;

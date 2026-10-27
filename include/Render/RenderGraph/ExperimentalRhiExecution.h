@@ -608,16 +608,29 @@ struct FrameCommandAllocation {
 
 // Framework service state for one recording job. Workers produce query ranges
 // and CPU samples locally; the submission owner publishes them after success.
-struct OwnedRecordingStatistics {
+// A late batch's (an external epoch's pass recorded at execution, atCompletion) is recorded after that: its publication is left to
+// its frame slot's completion (IStatisticsService::PublishAtCompletion), when the execution that records it has run on the GPU, and
+// is dropped when it did not record it (an execution signalled unexecuted).
+struct OwnedRecordingStatistics : std::enable_shared_from_this<OwnedRecordingStatistics> {
     std::shared_ptr<runtime::IStatisticsService> service;
     unsigned frameIndex = 0;
     rhi::QueueKind queueKind = rhi::QueueKind::Graphics;
     bool gpuQueries = true;
+    bool atCompletion = false;
+    std::atomic<bool> recorded{false};  // a late batch's: set (release) by its recording, read (acquire) by its publication
     std::vector<int> passIndices;
     std::vector<double> cpuMilliseconds;
     runtime::QueryRecordingContext queries;
 
     void Publish() {
+        if (!atCompletion) return PublishRecorded();
+        service->PublishAtCompletion(frameIndex, [self = shared_from_this()] {
+            if (self->recorded.load(std::memory_order_acquire)) self->PublishRecorded();
+        });
+    }
+
+private:
+    void PublishRecorded() {
         if (gpuQueries) service->MergePendingResolves(queueKind, frameIndex, queries);
         for (size_t i = 0; i < passIndices.size(); ++i)
             if (passIndices[i] >= 0)
@@ -901,6 +914,8 @@ inline void PreparedRhiExecutionBatch::RecordDeferred(rhi::CommandList a_list) c
     if (!m_deferred || m_deferredRecorded.exchange(true)) throw std::logic_error("A deferred packet is recorded once");
     auto context = MakeOwnedRecordingContext(a_list, *m_deferred);
     RecordOwnedRecordingCommands(context, *m_deferred, m_queue, false);
+    // Its queries are in a_list now: its frame slot's completion publishes them (OwnedRecordingStatistics::atCompletion).
+    if (m_deferred->statistics) m_deferred->statistics->recorded.store(true, std::memory_order_release);
     if (!CommitEffectsSubmitted(m_deferredSignal)) throw std::logic_error("A deferred packet's passes could not be committed as submitted");
 }
 

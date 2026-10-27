@@ -634,10 +634,21 @@ void StatisticsManager::MergePendingResolves(
     ctx.pendingRanges.clear();
 }
 
+void StatisticsManager::PublishAtCompletion(unsigned frameIndex, std::function<void()> publish) {
+    auto& pending = m_publishAtCompletion[frameIndex];
+    if (publish && pending.size() < 256) pending.push_back(std::move(publish));
+}
+
 void StatisticsManager::OnFrameComplete(
     unsigned frameIndex,
     rhi::Queue& queue)
 {
+    // The slot's recordings made after their submission (late batches) merge their queries before the slot's are read.
+    if (const auto found = m_publishAtCompletion.find(frameIndex); found != m_publishAtCompletion.end()) {
+        auto publications = std::move(found->second);
+        m_publishAtCompletion.erase(found);
+        for (auto& publish : publications) publish();
+    }
     m_completedTimestamps.clear();
     m_completedOwned.clear();
     ReadOwnedTimestamps(frameIndex);
@@ -902,6 +913,7 @@ void StatisticsManager::ClearAll() {
     m_recordedQueries.clear();
     m_pendingResolves.clear();
     m_pendingOwned.clear();
+    m_publishAtCompletion.clear();
     m_completedOwned.clear();
     m_completedTimestamps.clear();
     m_numPasses=0;
