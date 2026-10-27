@@ -120,6 +120,11 @@ DispatchedFrameRecording DispatchFrameRecording(PlannedFrame plan,
                     BT_ZONE_SCOPE("ORG.Frame.RecordBatch");
                     AnnotateFrameTrace(state->frame);
                     auto& job = state->jobs[batch];
+                    if (job.deferred) {
+                        state->result.m_batches[batch] = std::make_shared<const PreparedRhiExecutionBatch>(
+                            job.slot, job.queue, std::move(job.recording), state->timelines, state->result.m_snapshot);
+                        continue;
+                    }
                     if (!job.pool || !job.recording.allocation->pair.list)
                         throw std::invalid_argument("Frame recording has no prepared command list");
                     std::vector<OwnedRecordingList> recordings;
@@ -161,6 +166,11 @@ RecordedFrame RecordFrame(PlannedFrame plan,
             AnnotateFrameTrace(frame);
             auto& job = plan.jobs[batch];
             auto& recording = job.recording;
+            if (job.deferred) {
+                result.m_batches[batch] = std::make_shared<const PreparedRhiExecutionBatch>(job.slot, job.queue,
+                    std::move(recording), plan.timelines, plan.snapshot);
+                return;
+            }
             if (!job.pool || !recording.allocation->pair.list)
                 throw std::invalid_argument("Frame recording has no prepared command list");
             std::vector<OwnedRecordingList> recordings;

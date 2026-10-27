@@ -275,6 +275,37 @@ thing holding it does: a revision, a recording's bindings, a frame in flight.
 -   A buffer without a backing has nothing a capture could see, so sizing an unmaterialized version needs no backing
     mutation scope (`RequireBackingMutationAllowed`).
 
+## External epochs
+
+`PersistentGraphHost::SetExternalEpochs(epochs)` (`RenderGraph::SetExternalPersistentEpochs`) marks async epochs the host
+executes itself, in a command buffer of its own: CS's DCLF CPU pipeline runs them inside DXVK's command buffer (an
+external-commands callback), so ORG records the passes and their barriers and DXVK's list is never split for them.
+
+-   **Recording.** A ticket of an external epoch records each batch into a secondary list (a pool of secondaries,
+    `CommandListPool(..., secondary)`), begun outside any pass. Every batch must be on the graphics queue, and none may wait
+    for another across queues; a ticket that breaks either throws. Its recording is kept for reuse like any other's (the
+    same secondaries executed again), so revision-driven epochs can be external.
+-   **Passes recorded at execution.** A pass declared with `ExternalPassDesc::RecordAtExecution()` is alone in its batch
+    (`CompilePass::recordAtExecution`). The ticket records the other batches ahead and keeps this one's invocation and barrier
+    plan; the host's execution records its barriers and calls its `Record` there, on the host's thread, into the host's list.
+    For work only known then: a CPU cull's draws. A recording with such a batch is never kept, and the batch has no ORG
+    statistics (the ticket completes on the owner thread before it is recorded).
+-   **Submission.** `SubmitEpoch` runs as for any async epoch (the commit, the bind, the checks), but submits nothing: the
+    uploads go into a secondary of the slot's, and `SubmitPersistentTicket` gives each batch its waits and signal as usual,
+    then commits the packets as submitted (`CommitExternal`) instead of handing them to the queue.
+    `TakeExternalExecution` returns an `ExternalEpochExecution`: the uploads' secondary, the batches in order, and the waits and
+    signals the host's submission must carry. Its signals include the graph's own value on its graphics timeline, so retirement,
+    slot waits and later tickets work as for a submitted epoch.
+-   **Execution.** `ExternalEpochExecution::Execute(primary)`, on the host's thread, binds the graph's heaps in the primary before
+    each execution of secondaries, executes them, and records each late batch. Everything the primary had bound is undefined
+    afterwards. A host that cannot execute it calls `SignalExternalExecutionUnexecuted`: a submission of no lists with its waits
+    and signals, whose late passes are abandoned.
+-   **Ordering.** The host submits the buffer in its stream, after the graph's earlier submissions on that queue and before its
+    later ones, so the graphics timeline's values still grow in submission order.
+-   **Test.** `tests/PersistentVulkanHostTests.cpp`, run as `external`: an external epoch whose copy pass is recorded at
+    execution, executed in the test's own primary; each execution records the late pass once and writes the frame's value, and
+    one signalled unexecuted leaves the output as it was.
+
 ## Latches
 
 `org::LatchBlock` is a host-visible buffer with one region per frame slot. A recording refers only to the slot's

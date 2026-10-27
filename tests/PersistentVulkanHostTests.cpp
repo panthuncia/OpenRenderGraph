@@ -52,6 +52,8 @@
 namespace {
 constexpr uint32_t kCount = 64;
 constexpr uint64_t kBytes = kCount * sizeof(uint32_t);
+// CopyToHostPass's recordings ("external": the pass is recorded at execution, so each execution records it once more).
+std::atomic<uint32_t> g_copyRecords{0};
 
 struct HostDevice {
 	VkInstance instance = VK_NULL_HANDLE;
@@ -308,6 +310,7 @@ public:
 		out.push_back(m_destinationRevision->load(std::memory_order_acquire));
 	}
 	static void Record(const CopyBindings& bindings, org::PassRecordContext& recording) {
+		g_copyRecords.fetch_add(1, std::memory_order_relaxed);
 		recording.Commands().CopyBufferRegion(recording.Resolve(bindings.destination).GetHandle(), 0,
 			recording.Resolve(bindings.source).GetHandle(), 0, kBytes);
 	}
@@ -322,9 +325,9 @@ class HostExtension final : public org::RenderGraph::IRenderGraphExtension {
 public:
 	HostExtension(std::shared_ptr<org::Buffer> input, std::shared_ptr<org::Buffer> scratch,
 		std::shared_ptr<org::ExternalBufferResource> output, std::shared_ptr<const ComputeProgram> program,
-		std::shared_ptr<std::atomic<uint64_t>> outputRevision, std::shared_ptr<const org::VersionedBuffer> versions = {})
+		std::shared_ptr<std::atomic<uint64_t>> outputRevision, std::shared_ptr<const org::VersionedBuffer> versions = {}, bool lateCopy = false)
 		: m_input(std::move(input)), m_scratch(std::move(scratch)), m_output(std::move(output)), m_program(std::move(program)),
-		m_outputRevision(std::move(outputRevision)), m_versions(std::move(versions)) {}
+		m_outputRevision(std::move(outputRevision)), m_versions(std::move(versions)), m_lateCopy(lateCopy) {}
 	void PrepareForBuild(org::RenderGraph& graph) override {
 		graph.RegisterResource(org::ResourceIdentifier("test.input"), m_input);
 		graph.RegisterResource(org::ResourceIdentifier("test.scratch"), m_scratch);
@@ -334,9 +337,12 @@ public:
 		out.push_back(org::RenderGraph::ExternalPassDesc::Compute("test.write",
 			std::static_pointer_cast<org::RenderPass>(std::make_shared<WritePass>(m_input, m_scratch, m_program, m_versions)))
 			.PreferQueue(org::QueueKind::Graphics));
-		out.push_back(org::RenderGraph::ExternalPassDesc::Copy("test.copy-to-host",
+		auto copy = org::RenderGraph::ExternalPassDesc::Copy("test.copy-to-host",
 			std::static_pointer_cast<org::RenderPass>(std::make_shared<CopyToHostPass>(m_scratch, m_output, m_outputRevision, m_versions)))
-			.PreferQueue(org::QueueKind::Graphics));
+			.PreferQueue(org::QueueKind::Graphics);
+		// "external": recorded by the host's execution of the epoch, after the write pass's secondary.
+		if (m_lateCopy) copy.RecordAtExecution();
+		out.push_back(std::move(copy));
 	}
 private:
 	std::shared_ptr<org::Buffer> m_input;
@@ -345,6 +351,7 @@ private:
 	std::shared_ptr<const ComputeProgram> m_program;
 	std::shared_ptr<std::atomic<uint64_t>> m_outputRevision;
 	std::shared_ptr<const org::VersionedBuffer> m_versions;
+	bool m_lateCopy = false;
 };
 
 std::shared_ptr<ComputeProgram> CreateProgram(rhi::Device device) {
@@ -374,13 +381,16 @@ bool Matches(const HostBuffer& buffer, uint32_t value) {
 
 int TestFrameRetirement(rhi::Device device, rhi::Backend backend);
 
-int main(int argc, char** argv) {
+static int Run(int argc, char** argv) {
 	// "reuse": async epochs that keep and resubmit their recordings (PersistentGraphHost::Desc::reuseRecordings).
 	const bool reuse = argc > 1 && std::strcmp(argv[1], "reuse") == 0;
 	// "revision": a revision-driven epoch (SetAsyncEpochs' revisionEpochs), recorded ahead for each revision
 	// (RequestEpochRecording) and submitted with that recording.
 	const bool revision = argc > 1 && std::strcmp(argv[1], "revision") == 0;
-	const bool async = reuse || revision || (argc > 1 && std::strcmp(argv[1], "async") == 0);
+	// "external": an async epoch the test executes itself (PersistentGraphHost::SetExternalEpochs), its copy pass recorded at
+	// execution, in a primary of the test's, submitted with the execution's waits and signals.
+	const bool external = argc > 1 && std::strcmp(argv[1], "external") == 0;
+	const bool async = reuse || revision || external || (argc > 1 && std::strcmp(argv[1], "async") == 0);
 	HostDevice host;
 	if (const int created = CreateHostDevice(host); created != 0) {
 		std::puts(created == 77 ? "SKIP: no Vulkan device with VK_EXT_descriptor_heap" : "FAIL: host device");
@@ -459,7 +469,7 @@ int main(int argc, char** argv) {
 				scratch->Materialize();
 				versions = org::VersionedBuffer::Create(scratch);
 			}
-			host.AddExtension("test.host", [&] { return std::make_unique<HostExtension>(input, scratch, output, program, outputRevision, versions); });
+			host.AddExtension("test.host", [&] { return std::make_unique<HostExtension>(input, scratch, output, program, outputRevision, versions, external); });
 			org::PersistentGraphHost::FrameCallback premature = [](org::RenderGraph&) {};
 			REQUIRE(!host.TryPostOwnedPreparation(premature) && premature, "pre-build request stays with caller");
 			org::PersistentGraphHost::FrameTicketReservation reservation;
@@ -645,7 +655,7 @@ int main(int argc, char** argv) {
 					// The graph built again (its extension replaced): the recording is the build before's. The commit asks before it
 					// chooses it, and the rebuilt graph's ticket would not take it; the epoch draws its own preparation.
 					const auto builds = host.BuildGeneration();
-					host.AddExtension("test.host", [&] { return std::make_unique<HostExtension>(input, scratch, output, program, outputRevision, versions); });
+					host.AddExtension("test.host", [&] { return std::make_unique<HostExtension>(input, scratch, output, program, outputRevision, versions, external); });
 					value = 73000u;
 					bool usable = true;
 					std::string why;
@@ -673,7 +683,7 @@ int main(int argc, char** argv) {
 					}
 					REQUIRE(state.load(std::memory_order_acquire) == 1 && held && host.EpochRecordingCurrent(*held), "a recording of the current build");
 					const auto explicitBuilds = host.BuildGeneration();
-					host.AddExtension("test.host", [&] { return std::make_unique<HostExtension>(input, scratch, output, program, outputRevision, versions); });
+					host.AddExtension("test.host", [&] { return std::make_unique<HostExtension>(input, scratch, output, program, outputRevision, versions, external); });
 					REQUIRE(host.RebuildRequested(), "the extension added is a rebuild requested");
 					for (uint32_t frame = 0; frame < 4; ++frame) {
 						value = 75000u + 10u * frame;
@@ -722,7 +732,57 @@ int main(int argc, char** argv) {
 				}
 				host.SetAsyncEpochs({});
 			}
-			if (!revision) {
+			if (external) {
+				host.SetExternalEpochs({0});
+				host.SetAsyncEpochs({0});
+				auto queue = device->GetQueue(rhi::QueueKind::Graphics);
+				rhi::CommandAllocatorPtr allocator;
+				rhi::CommandListPtr primary;
+				REQUIRE(device->CreateCommandAllocator(rhi::QueueKind::Graphics, allocator) == rhi::Result::Ok
+					&& device->CreateCommandList(rhi::QueueKind::Graphics, allocator.Get(), primary) == rhi::Result::Ok, "the test's primary");
+				primary->End();
+				const auto execute = [&](org::ExternalEpochExecution& a_execution) -> bool {
+					allocator->Recycle();
+					primary->Recycle(allocator.Get());
+					a_execution.Execute(primary.Get());
+					if (primary->EndChecked() != rhi::Result::Ok) return false;
+					auto list = primary.Get();
+					auto waits = a_execution.waits;
+					auto signals = a_execution.signals;
+					return queue.Submit({&list, 1}, {{waits.data(), static_cast<uint32_t>(waits.size())},
+						{signals.data(), static_cast<uint32_t>(signals.size())}}) == rhi::Result::Ok;
+				};
+				for (uint32_t frame = 0; frame < 6; ++frame) {
+					value = 90000u + 10u * frame;
+					host.SubmitEpoch(0, upload);
+					auto execution = host.TakeExternalExecution();
+					REQUIRE(execution && !execution->signals.empty() && !execution->items.empty(), "an external epoch's execution");
+					REQUIRE(!host.TakeExternalExecution(), "taken once");
+					const auto before = g_copyRecords.load(std::memory_order_relaxed);
+					REQUIRE(execute(*execution), "the execution in the test's primary");
+					REQUIRE(g_copyRecords.load(std::memory_order_relaxed) == before + 1, "the late copy pass recorded at execution");
+					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "an external execution writes and copies");
+				}
+				// Not executed: signalled without its work. The output keeps its last value, and the next execution goes on.
+				const uint32_t kept = value;
+				value = 95000u;
+				host.SubmitEpoch(0, upload);
+				auto skipped = host.TakeExternalExecution();
+				REQUIRE(skipped, "the execution to skip");
+				host.SignalExternalExecutionUnexecuted(*skipped);
+				REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, kept), "an unexecuted execution writes nothing");
+				value = 96000u;
+				host.SubmitEpoch(0, upload);
+				auto next = host.TakeExternalExecution();
+				REQUIRE(next && execute(*next) && device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "the epoch after a skipped execution");
+				const auto stats = host.TakeAsyncStats();
+				std::printf("external: %llu submissions, %llu prepared again\n", static_cast<unsigned long long>(stats.submitted),
+					static_cast<unsigned long long>(stats.stale));
+				REQUIRE(!counters.unbalanced && counters.locks.load() == counters.unlocks.load(), "balanced host queue locks");
+				host.SetAsyncEpochs({});
+				host.SetExternalEpochs({});
+			}
+			if (!revision && !external) {
 			if (async) host.SetAsyncEpochs({0});
 			std::atomic<uint32_t> ownedRequests{0};
 			std::atomic<bool> ownedServices{false};
@@ -953,6 +1013,16 @@ int main(int argc, char** argv) {
 	DestroyHostBuffer(host, second);
 	vkDestroyDevice(host.device, nullptr);
 	vkDestroyInstance(host.instance, nullptr);
-	std::printf("PersistentVulkanHostTests: ok (%s, locks=%d)\n", async ? "async" : "sync", counters.locks.load());
+	std::printf("PersistentVulkanHostTests: ok (%s, locks=%d)\n", external ? "external" : async ? "async" : "sync", counters.locks.load());
 	return 0;
+}
+
+int main(int argc, char** argv) {
+	// An exception the graph throws names what failed; uncaught, it would end the run without saying.
+	try {
+		return Run(argc, argv);
+	} catch (const std::exception& e) {
+		std::fprintf(stderr, "FAIL: uncaught exception: %s\n", e.what());
+		return 1;
+	}
 }

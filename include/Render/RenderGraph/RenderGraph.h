@@ -54,6 +54,7 @@ class ComputePassBuilder;
 class CopyPassBuilder;
 class CommandRecordingManager;
 class FrameContext;
+class ExternalEpochExecution;
 struct IPassBuilder;
 struct IDynamicDeclaredResources;
 
@@ -167,6 +168,10 @@ public:
 		// Persistent execution: the host epoch the pass runs in (persistent::AllEpochs:
 		// every one). See SetPersistentEpochOrder.
 		uint32_t epoch = UINT32_MAX;
+		// Persistent execution, an external epoch's pass (SetExternalPersistentEpochs): recorded when the host executes the epoch
+		// (ExternalEpochExecution::Execute, on the host's thread, into its command buffer), not ahead with the rest. Alone in its
+		// batch; its barriers are the admission's, recorded around it. For work only known then (a CPU cull's draws).
+		bool recordAtExecution = false;
 		// Per-frame passes only. A frame-interrupting pass must run at its insert
 		// point even under the persistent graph, which hosts it in the main
 		// executable at the cost of a structural rebuild when it appears and when
@@ -250,6 +255,16 @@ public:
 
 		ExternalPassDesc AutomaticQueueAssignment() && {
 			queueAssignmentPolicy = QueueAssignmentPolicy::Automatic;
+			return std::move(*this);
+		}
+
+		ExternalPassDesc& RecordAtExecution() & {
+			recordAtExecution = true;
+			return *this;
+		}
+
+		ExternalPassDesc RecordAtExecution() && {
+			recordAtExecution = true;
 			return std::move(*this);
 		}
 
@@ -392,6 +407,7 @@ public:
 		int statisticsIndex = -1;
 		bool collectStatistics = true;
 		uint32_t epoch = UINT32_MAX; // persistent::AllEpochs
+		bool recordAtExecution = false; // ExternalPassDesc::recordAtExecution
 
 		PassRunMask run = PassRunMask::Both; // default behavior
 		std::vector<std::byte> immediateBytecode; // Stores the immediate execution bytecode
@@ -802,7 +818,19 @@ public:
 	struct PersistentTicketSubmission {
 		bool submitted = false;
 		std::vector<uint64_t> signals;  // per batch of every segment, in order: the value it signalled
+		// An external epoch's ticket (SetExternalPersistentEpochs): nothing was submitted; its packets are the host's to execute,
+		// with these waits and signals (the values above among them).
+		std::shared_ptr<ExternalEpochExecution> external;
 	};
+	/**
+	 * @brief Owner thread, while no ticket is prepared (the host's async epochs stopped): the persistent epochs the host executes
+	 * itself, in a command buffer of its own (ExternalEpochExecution). Their tickets record into secondary lists, and a pass of
+	 * theirs recorded at execution (ExternalPassDesc::recordAtExecution) is recorded by the host's execution. Every pass of such an
+	 * epoch must run on the graphics queue (the host's buffer is one graphics submission), and their batches must not wait for each
+	 * other across queues; a ticket that breaks either throws. A recording of one with a pass recorded at execution is never kept for reuse.
+	 */
+	void SetExternalPersistentEpochs(std::vector<uint32_t> epochs);
+	bool IsExternalPersistentEpoch(uint32_t epoch) const noexcept;
 	// Owner thread. hostFrame numbers the execution (its statistics and lifecycle). hostTag: the host's currency tag the ticket
 	// is prepared under (SetPersistentTicketHostTag), which a kept recording must have been recorded under too. hostData: what
 	// the passes prepare for (FramePreparationContext::preparationData), e.g. a scene revision; retained while it records.
@@ -1570,6 +1598,9 @@ private:
 	bool m_persistentExecution = false;
 	std::vector<uint32_t> m_persistentEpochOrder;
 	bool m_persistentClosedExecutions = false;
+	// SetExternalPersistentEpochs; and the secondary lists their tickets record into (graphics, made at their first ticket).
+	std::vector<uint32_t> m_externalPersistentEpochs;
+	std::shared_ptr<CommandListPool> m_externalSecondaryPool;
 	// Set while PreparePersistentTicket runs: Update skips the dynamic segments, Execute stops after recording.
 	PersistentTicket* m_persistentTicketTarget = nullptr;
 	uint64_t m_persistentTicketHostTag = 0;

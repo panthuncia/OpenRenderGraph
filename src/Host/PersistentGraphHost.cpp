@@ -147,6 +147,9 @@ struct PersistentGraphHost::Async {
 	// wait: the slot's last upload list is done), then recorded, ended and submitted by the render thread; the
 	// ticket cell orders the two.
 	std::vector<CommandListPair> uploadLists;
+	// The same for an external epoch's ticket (SetExternalEpochs): a secondary, recycled by the host's thread with the slot's
+	// list and begun by the render thread, executed first by the caller's execution (ExternalEpochExecution::leading).
+	std::vector<CommandListPair> uploadSecondaries;
 	// The same, per frame slot and per queue slot, for the uploads recorded on another queue than graphics (Desc::queueScopedUploads):
 	// a list for each compute or copy queue of the graphics queue's device, none (empty) for the others.
 	std::vector<std::vector<CommandListPair>> queueUploadLists;
@@ -356,6 +359,7 @@ void PersistentGraphHost::Build() {
 	graph->SetPersistentSegment(kUploadPassName, RenderGraph::PersistentSegmentKind::Pre);
 	graph->SetPersistentEpochOrder(m_desc.epochOrder);
 	graph->SetPersistentClosedExecutions(m_desc.closedExecutions);
+	graph->SetExternalPersistentEpochs(m_externalEpochs);
 	graph->SetPersistentRecordingReuse(m_desc.reuseRecordings && m_desc.closedExecutions);
 	graph->SetPersistentRecordingTimestamps(m_recordingTimestamps.load(std::memory_order_acquire));
 	graph->SetScheduleTraceEnabled(m_scheduleTrace.load(std::memory_order_acquire));
@@ -521,6 +525,26 @@ void PersistentGraphHost::SetAsyncEpochs(std::vector<uint32_t> epochs, std::vect
 	StartAsync();
 }
 
+void PersistentGraphHost::SetExternalEpochs(std::vector<uint32_t> epochs) {
+	StopAsync();
+	m_externalEpochs = std::move(epochs);
+	if (m_graph) m_graph->SetExternalPersistentEpochs(m_externalEpochs);
+	if (!m_asyncEpochs.empty()) {
+		if (BuildDue()) Build();
+		StartAsync();
+	}
+}
+
+void PersistentGraphHost::SignalExternalExecutionUnexecuted(const ExternalEpochExecution& execution) {
+	if (!m_async) throw std::logic_error("An external execution without async epochs");
+	auto waits = execution.waits;
+	auto signals = execution.signals;
+	const auto result = m_async->graphicsQueue.Submit({}, {{waits.data(), static_cast<uint32_t>(waits.size())},
+		{signals.data(), static_cast<uint32_t>(signals.size())}});
+	if (result != rhi::Result::Ok)
+		throw std::runtime_error(std::string("An unexecuted external execution could not be signalled (rhi::Result ") + rhi::ResultName(result) + ")");
+}
+
 void PersistentGraphHost::StartAsync() {
 	if (m_async || m_asyncEpochs.empty() || !m_graph) return;
 	auto async = std::make_unique<Async>();
@@ -572,6 +596,14 @@ void PersistentGraphHost::StartAsync() {
 		pair.list->SetName(("ORG ticket uploads #" + std::to_string(slot)).c_str());
 		pair.list->End();
 		async->uploadLists.push_back(std::move(pair));
+		CommandListPair secondary;
+		if (!m_externalEpochs.empty()) {
+			if (!rhi::IsOk(m_desc.device.CreateCommandAllocator(rhi::QueueKind::Graphics, secondary.allocator))
+				|| !rhi::IsOk(m_desc.device.CreateSecondaryCommandList(rhi::QueueKind::Graphics, secondary.allocator.Get(), secondary.list)))
+				throw std::runtime_error("External epochs could not create their upload secondary lists");
+			secondary.list->SetName(("ORG external ticket uploads #" + std::to_string(slot)).c_str());
+		}
+		async->uploadSecondaries.push_back(std::move(secondary));
 		// Queue-scoped uploads: one list per compute or copy queue on the graphics queue's device (a copy needs no more).
 		auto& perQueue = async->queueUploadLists.emplace_back(queues.SlotCount());
 		for (size_t index = 0; index < queues.SlotCount(); ++index) {
@@ -944,6 +976,11 @@ void PersistentGraphHost::PrepareTicket(Async& state, uint32_t epochIndex, int32
 	auto& uploads = state.uploadLists[slot];
 	uploads.allocator->Recycle();
 	uploads.list->Recycle(uploads.allocator.Get());
+	// An external epoch's uploads secondary: recycled here, begun where it is recorded.
+	if (auto& secondary = state.uploadSecondaries[slot]; secondary.list) {
+		secondary.allocator->Recycle();
+		secondary.list->Recycle(secondary.allocator.Get());
+	}
 	// The slot's queue upload lists likewise: their last submission went ahead of a batch of the slot's last ticket on their queue,
 	// whose completion the wait above covers.
 	for (auto& queueUploads : state.queueUploadLists[slot]) {
@@ -1318,12 +1355,22 @@ void PersistentGraphHost::SubmitTicket(Async& async, uint32_t index, std::shared
 	auto& list = async.uploadLists[slot];  // begun by the host's thread (PrepareTicket)
 	std::shared_ptr<void> keepAlive;
 	bool recorded = false;
-	auto commands = list.list.Get();
+	// An external epoch's uploads go into the slot's secondary, which its execution runs first: nothing is submitted here.
+	const bool external = m_graph->IsExternalPersistentEpoch(async.epochs[index]);
+	auto& secondary = async.uploadSecondaries[slot];
+	if (external) {
+		rhi::SecondaryInheritance outside{};
+		outside.insideRendering = false;
+		outside.debugName = "ORG external ticket uploads";
+		if (!secondary.list || secondary.list->BeginSecondary(outside) != rhi::Result::Ok)
+			throw std::runtime_error("An external epoch's uploads secondary could not begin");
+	}
+	auto commands = external ? secondary.list.Get() : list.list.Get();
 	auto& recordedLists = async.recordedLists;
 	// Queue-scoped uploads (Desc::queueScopedUploads): the slot's open lists of the other queues, which take the uploads their
 	// queue uses first, and go to it just ahead of the ticket's first batch there (SubmitPersistentTicket).
 	auto& queueUploadLists = async.queueUploadLists[slot];
-	const bool queueScoped = m_queueScopedUploads.load(std::memory_order_acquire);
+	const bool queueScoped = m_queueScopedUploads.load(std::memory_order_acquire) && !external;
 	for (size_t index = 0; index < async.queueLists.size(); ++index)
 		async.queueLists[index] = queueScoped && index < queueUploadLists.size() && queueUploadLists[index].list
 			? queueUploadLists[index].list.Get() : rhi::CommandList{};
@@ -1333,11 +1380,21 @@ void PersistentGraphHost::SubmitTicket(Async& async, uint32_t index, std::shared
 	{
 		BT_ZONE_SCOPE("ORG.Host.CloseUploadList");
 		list.list->End();
+		if (external) secondary.list->End();
 		// Every one the host's thread began, used or not (it begins them all again for the slot's next ticket).
 		for (auto& queueUploads : queueUploadLists)
 			if (queueUploads.list) queueUploads.list->End();
 	}
 	m_asyncStats.queueUploadCopies += queueCopies;
+	if (external && !recordedLists.empty()) {
+		recordedLists.clear();
+		Async::Message discard;
+		discard.kind = Async::Message::Kind::Discard;
+		discard.epochIndex = index;
+		discard.ticket = std::move(ticket);
+		postControl(discard);
+		throw std::runtime_error("An external epoch's uploads include producer-recorded lists, which its execution cannot run");
+	}
 	if (!supported) {
 		Async::Message discard;
 		discard.kind = Async::Message::Kind::Discard;
@@ -1357,7 +1414,7 @@ void PersistentGraphHost::SubmitTicket(Async& async, uint32_t index, std::shared
 	}
 	submitted.retired = std::move(retired);
 	submitted.resourceOwner = reservation ? reservation->resourceOwner : std::move(resourceOwner);
-	if (recorded || !recordedLists.empty()) {
+	if (!external && (recorded || !recordedLists.empty())) {
 		BT_ZONE_SCOPE("ORG.Host.EnqueueUploads");
 		++m_asyncStats.uploads;
 		m_asyncStats.recordedUploadLists += recordedLists.size();
@@ -1392,6 +1449,13 @@ void PersistentGraphHost::SubmitTicket(Async& async, uint32_t index, std::shared
 		throw;
 	}
 	lap(m_lastTimings.submitUs);
+	if (external && ok) {
+		// The caller's to execute (TakeExternalExecution): the uploads first.
+		auto execution = submitted.submission.external;
+		if (!execution) throw std::logic_error("An external epoch's ticket gave no execution");
+		if (recorded) execution->leading.push_back(commands);
+		m_externalExecution = std::move(execution);
+	}
 	if (submitted.uploadSignal.second) m_asyncStats.sparedUploadWaits += RenderGraph::PersistentTicketSparedUploadWaits(*ticket);
 	submitted.ticket = std::move(ticket);
 	try {

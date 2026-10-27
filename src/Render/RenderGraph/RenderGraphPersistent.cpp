@@ -16,6 +16,7 @@
 #include "FrameRecording.h"
 #include "ScheduleTraceBuild.h"
 #include "Render/RenderGraph/ExperimentalRhiExecution.h"
+#include "Render/RenderGraph/ExternalEpochExecution.h"
 #include "Render/RenderGraph/PersistentGraph.h"
 #include "Render/Runtime/ScopedActiveGraphServices.h"
 #include "Interfaces/IDynamicDeclaredResources.h"
@@ -233,6 +234,7 @@ struct RenderGraph::PersistentTicket {
 	std::vector<std::pair<const RenderGraphPass*, uint64_t>> revisions;
 	bool uncheckable = false;  // a pass that cannot report its revision: never current
 	uint64_t hostTag = 0;      // the host's, for its own currency checks (PersistentGraphHost: the backing version)
+	bool external = false;     // an external epoch's (SetExternalPersistentEpochs): its submission is the host's execution
 	// A revision ticket (PrepareRevisionTicket), or a live one with alternatives to its own segment: its candidates, pushed by the
 	// owner thread (newest first) and read by the bind on the submitting thread; the one the bind took. Completion abandons every
 	// other candidate's admission, and a live ticket's own segment when a candidate displaced it.
@@ -538,7 +540,7 @@ bool IsSwapchainResource(Resource& resource) {
 uint64_t FingerprintDeclaration(const experimental::CompilePass& d) {
 	uint64_t h = 0x9e3779b97f4a7c15ull;
 	auto mix = [&](uint64_t value) { h ^= value + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2); };
-	mix(d.backend); mix(d.preferredQueueSlot); mix(d.forceBatchIsolation ? 1 : 0);
+	mix(d.backend); mix(d.preferredQueueSlot); mix(d.forceBatchIsolation ? 1 : 0); mix(d.recordAtExecution ? 1 : 0);
 	auto slots = d.compatibleQueueSlots; std::sort(slots.begin(), slots.end());
 	for (const auto slot : slots) mix(0x100 + slot);
 	return h;
@@ -603,6 +605,7 @@ uint64_t FingerprintLowering(const LoweredPass& lowered) {
 	std::vector<uint64_t> parts;
 	const auto& d = lowered.declaration;
 	parts.push_back(d.backend); parts.push_back(d.preferredQueueSlot); parts.push_back(d.forceBatchIsolation ? 1 : 0);
+	parts.push_back(d.recordAtExecution ? 1 : 0);
 	{
 		auto slots = d.compatibleQueueSlots; std::sort(slots.begin(), slots.end());
 		for (auto slot : slots) parts.push_back(0x100 + slot);
@@ -683,8 +686,10 @@ static LoweredPass LowerLegacyPass(RenderGraph& graph, ResourceRegistry& registr
 	declaration.preferredQueueSlot = compatible.front();
 	declaration.backend = static_cast<uint32_t>(resources.backendAffinity.strength == BackendAffinityStrength::Primary
 		? primaryBackend : resources.backendAffinity.backend);
+	// A pass recorded at execution is a batch of its own: the batch is recorded by the host's execution, the rest ahead.
+	declaration.recordAtExecution = pass.recordAtExecution;
 	declaration.forceBatchIsolation = !resources.externalWaitsBeforeTransitions.empty()
-		|| !resources.externalWaitBindingsBeforeTransitions.empty();
+		|| !resources.externalWaitBindingsBeforeTransitions.empty() || pass.recordAtExecution;
 	result.explicitWaits = resources.externalWaitsBeforeTransitions;
 
 	auto resolve = [&](const ResourceRegistry::RegistryHandle& handle) -> Resource* {
@@ -3513,9 +3518,14 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 			ticketTarget->segments.push_back({std::move(admission), nullptr, segment.legacyBindings, defaultResourceHeap, defaultSamplerHeap});
 			return nullptr;
 		}
+		// An external epoch's recording is kept as any other's (its secondaries executed again by each ticket that takes it), but not
+		// one with a late batch: its pass is recorded by each execution, from the invocation it consumes.
+		bool lateBatch = false;
+		for (const auto& batch : segment.publication->executable->graph->batches)
+			for (const auto pass : batch.passes) lateBatch = lateBatch || segment.publication->executable->graph->structure->passes[pass].recordAtExecution;
 		const bool keepable = ticketTarget && m_persistentRecordingReuse && admission.closed && admission.rebound.empty()
 			&& admission.incomingEffects.empty() && !ticketTarget->uncheckable && segments.size() == 1
-			&& ticketTarget->epoch < kKeptRecordingEpochs && state.frameIndex < kKeptRecordingSlots;
+			&& ticketTarget->epoch < kKeptRecordingEpochs && state.frameIndex < kKeptRecordingSlots && !(ticketTarget->external && lateBatch);
 		if (keepable && !m_keptRecordings) m_keptRecordings = std::make_unique<std::remove_reference_t<decltype(*m_keptRecordings)>>();
 		if (keepable && !m_persistentTicketHostData) {
 			if (!m_keptRecordings) m_keptRecordings = std::make_unique<std::remove_reference_t<decltype(*m_keptRecordings)>>();
@@ -3547,10 +3557,32 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 		std::vector<std::shared_ptr<experimental::OwnedRecordingStatistics>> recordingStatistics;
 		std::array<std::shared_ptr<const experimental::OwnedRecordingGpuRanges>, 3> gpuPassRanges;  // per rhi::QueueKind
 		std::vector<size_t> demand(slotCount);
+		// An external epoch's ticket (SetExternalPersistentEpochs): every batch on the graphics queue, none waiting for another,
+		// recorded into secondaries; a late batch's pass (recordAtExecution) is recorded by the host's execution.
+		const bool external = ticketTarget && ticketTarget->external;
+		const auto graphicsSlot = static_cast<uint32_t>(ToUnderlying(m_queueRegistry.FindGraphicsSlot()));
+		if (external && !graph.relativeWaits.empty())
+			throw std::logic_error("An external epoch's batches wait for each other across queues");
+		if (external && !m_externalSecondaryPool) {
+			auto device = m_queueRegistry.GetDevice(static_cast<QueueSlotIndex>(static_cast<uint8_t>(graphicsSlot)));
+			m_externalSecondaryPool = std::make_shared<CommandListPool>(device, rhi::QueueKind::Graphics, true);
+		}
 		for (uint32_t batch = 0; batch < graph.batches.size(); ++batch) {
 			const auto slot = graph.batches[batch].queue;
 			if (slot >= slotCount) throw std::runtime_error("Persistent batch queue is unavailable");
-			++demand[slot];
+			bool late = false;
+			for (const auto pass : graph.batches[batch].passes) late = late || graph.structure->passes[pass].recordAtExecution;
+			if (external && slot != graphicsSlot) {
+				std::string names;
+				for (const auto pass : graph.batches[batch].passes) {
+					const auto prepared = graph.structure->passes[pass].preparedPassIndex;
+					if (!names.empty()) names += ", ";
+					names += segment.names && prepared < segment.names->size() ? (*segment.names)[prepared] : std::string("<unnamed>");
+				}
+				throw std::logic_error("An external epoch's passes must run on the graphics queue: " + names);
+			}
+			if (late && !external) throw std::logic_error("A pass recorded at execution is not an external epoch's");
+			if (!late) ++demand[slot];
 			const auto index = static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot));
 			const auto queueKind = m_queueRegistry.GetKind(index);
 			const auto rhiKind = queueKind == QueueKind::Graphics ? rhi::QueueKind::Graphics
@@ -3560,9 +3592,11 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 			job.queueKind = rhiKind;
 			job.device = m_queueRegistry.GetDevice(index);
 			job.queue = m_queueRegistry.GetQueue(index);
-			job.pool = m_queueRegistry.GetSharedPool(index);
+			job.pool = external ? m_externalSecondaryPool : m_queueRegistry.GetSharedPool(index);
 			if (!job.pool) throw std::logic_error("Recording queue has no command-list pool");
+			job.deferred = late;
 			job.recording = experimental::BuildPersistentRecordingList(sealed, batch);
+			job.recording.external = external;
 			job.recording.bindings = segment.legacyBindings;
 			job.recording.frameSlot = state.frameIndex;
 			job.recording.externalEntryBarrier = m_externalQueueBoundary.entry
@@ -3578,7 +3612,8 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 				job.recording.resourceDescriptorHeap = defaultResourceHeap;
 				job.recording.samplerDescriptorHeap = defaultSamplerHeap;
 			}
-			if (m_statisticsService) {
+			// A late batch is recorded after its ticket completes on the owner thread (which publishes the statistics): none.
+			if (m_statisticsService && !late) {
 				auto statistics = std::make_shared<experimental::OwnedRecordingStatistics>();
 				statistics->service = m_statisticsService;
 				statistics->frameIndex = state.frameIndex;
@@ -3632,18 +3667,19 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 			for (size_t slot = 0; slot < slotCount; ++slot) {
 				if (!demand[slot]) continue;
 				const auto index = static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot));
-				auto pool = m_queueRegistry.GetSharedPool(index);
+				// An external ticket's secondaries retire with its execution, on the graphics timeline as well.
+				auto pool = external ? m_externalSecondaryPool : m_queueRegistry.GetSharedPool(index);
 				const auto completed = m_queueRegistry.GetFence(index).GetCompletedValue();
 				pool->PublishDemand(demand[slot], completed);
 				auto ready = pool->AcquireBatch(demand[slot], completed);
 				size_t readyIndex = 0;
 				for (auto& job : jobs) {
-					if (job.slot != slot) continue;
+					if (job.slot != slot || job.deferred) continue;
 					job.recording.allocation->pair = std::move(ready[readyIndex++]);
 					job.recording.allocation->pool = job.pool;
 				}
 				if (readyIndex != ready.size()) throw std::logic_error("Command-list batch demand did not match recording jobs");
-				if (!state.tracyFrameBegun[slot] && !keepable) {
+				if (!state.tracyFrameBegun[slot] && !keepable && !external) {
 					const auto first = std::ranges::find_if(jobs, [slot](const auto& job) { return job.slot == slot; });
 					if (first != jobs.end()) {
 						first->queue.TracyGpuFrameBegin(first->recording.allocation->pair.list.Get());
@@ -3765,6 +3801,16 @@ void RenderGraph::RetirePersistentExecutions() {
 	BT_PLOT("ORG.Persistent.InFlight", static_cast<int64_t>(state.timelines->InFlight()));
 }
 
+void RenderGraph::SetExternalPersistentEpochs(std::vector<uint32_t> epochs) {
+	std::sort(epochs.begin(), epochs.end());
+	epochs.erase(std::unique(epochs.begin(), epochs.end()), epochs.end());
+	m_externalPersistentEpochs = std::move(epochs);
+}
+
+bool RenderGraph::IsExternalPersistentEpoch(uint32_t epoch) const noexcept {
+	return std::binary_search(m_externalPersistentEpochs.begin(), m_externalPersistentEpochs.end(), epoch);
+}
+
 std::shared_ptr<RenderGraph::PersistentTicket> RenderGraph::PreparePersistentTicket(rhi::Device device, uint32_t epoch, uint8_t slot, uint64_t hostFrame,
 	uint64_t hostTag, std::shared_ptr<const IHostExecutionData> hostData, bool admissionOnly) {
 	BT_ZONE_SCOPE("ORG.Persistent.PrepareTicket");
@@ -3774,6 +3820,7 @@ std::shared_ptr<RenderGraph::PersistentTicket> RenderGraph::PreparePersistentTic
 	ticket->slot = slot;
 	ticket->hostFrame = hostFrame;
 	ticket->hostTag = hostTag;
+	ticket->external = IsExternalPersistentEpoch(epoch);
 	m_persistentTicketHostTag = hostTag;
 	m_persistentTicketAdmissionOnly = admissionOnly;
 	m_persistentTicketHostData = static_cast<bool>(hostData);
@@ -3814,6 +3861,7 @@ std::shared_ptr<RenderGraph::PersistentTicket> RenderGraph::PrepareRevisionTicke
 	ticket->slot = slot;
 	ticket->hostFrame = hostFrame;
 	ticket->revision = true;
+	ticket->external = IsExternalPersistentEpoch(epoch);
 	// What Execute does before it admits: release the executions the GPU has finished.
 	RetirePersistentExecutions();
 	return ticket;
@@ -4038,6 +4086,7 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 	ticket.submittedFrameWait = frameWait;
 	const auto& planned = ticket.queueUploads;
 	if (planned.planned && ticket.segments.size() != 1) throw std::logic_error("Queue-scoped uploads planned for a ticket of several segments");
+	if (ticket.external && planned.planned) throw std::logic_error("Queue-scoped uploads planned for an external epoch's ticket");
 	for (auto& segment : ticket.segments) {
 		const auto& graph = *segment.admission.publication->executable->graph;
 		// The same timeline composition the owner's RecordSubmitted will derive from these values: the
@@ -4073,6 +4122,33 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 				else batch.waits[count++] = wait;
 			}
 			batch.waits.resize(count);
+		}
+		if (ticket.external) {
+			// Not submitted: the host executes the packets in its own submission, which waits for every batch's waits and
+			// signals the last batch's value (the batches are all the graphics queue's, in order).
+			BT_ZONE_SCOPE("ORG.Persistent.ExternalExecution");
+			const auto& packets = segment.recording->packets;
+			if (packets.size() != batches.size()) throw std::logic_error("Ticket packets do not match its batches");
+			if (!out.external) out.external = std::make_shared<ExternalEpochExecution>();
+			auto& execution = *out.external;
+			for (size_t i = 0; i < packets.size(); ++i) {
+				auto packet = std::dynamic_pointer_cast<const experimental::PreparedRhiExecutionBatch>(packets[i]);
+				if (!packet) throw std::logic_error("An external epoch's packet the host cannot execute");
+				for (const auto wait : batches[i].waits) {
+					const auto timeline = packet->ResolveTimeline(wait.timeline);
+					if (!timeline.valid()) throw std::logic_error("An external epoch's wait on a timeline its packet does not bind");
+					execution.waits.push_back({timeline, wait.value});
+				}
+				if (!packet->CommitExternal(batches[i].signal.value, execution.signals)) return false;
+				execution.items.push_back({packet, segment.resourceHeap, segment.samplerHeap});
+				if (i + 1 == packets.size()) {
+					const auto timeline = packet->ResolveTimeline(batches[i].signal.timeline);
+					if (!timeline.valid()) throw std::logic_error("An external epoch's signal on a timeline its packet does not bind");
+					execution.signals.push_back({timeline, batches[i].signal.value});
+				}
+			}
+			execution.keepAlive.push_back(segment.recording);
+			continue;
 		}
 		{
 			BT_ZONE_SCOPE("ORG.Frame.SubmitPackets");

@@ -79,6 +79,9 @@ struct CompilePass {
     // batch boundary. This is authored preparation metadata, not worker access
     // to the mutable pass object.
     bool forceBatchIsolation = false;
+    // Recorded at execution (ExternalPassDesc::recordAtExecution): alone in its batch, which an external epoch's host records
+    // when it executes the epoch (ExternalEpochExecution), not ahead.
+    bool recordAtExecution = false;
     bool operator==(const CompilePass&) const = default;
 };
 struct CompileQueue {

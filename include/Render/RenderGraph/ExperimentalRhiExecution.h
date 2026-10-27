@@ -391,6 +391,8 @@ struct PreparedTimelineBinding {
 // queue/device and timelines until retirement. A shared Resource alone is NOT
 // such a lease: mutable backing may be replaced while that object remains alive.
 // This adapter is not yet used by legacy passes or the benchmark renderer.
+struct OwnedRecordingList;
+
 class PreparedRhiExecutionBatch final : public IPreparedExecutionBatch {
 public:
     // replayable: every pass is (PreparedPass::IsReplayable) and the lists were recorded for resubmission. Such a packet has
@@ -414,7 +416,41 @@ public:
                     throw std::invalid_argument("Duplicate timeline identity");
         }
     }
+    // A late batch of an external epoch (its pass recorded at execution, CompilePass::recordAtExecution): no lists, its recording
+    // kept for RecordDeferred, which the host's execution calls once, into the host's list. Never submitted by the graph.
+    PreparedRhiExecutionBatch(uint32_t queueSlot, rhi::Queue queue, OwnedRecordingList deferred,
+        std::vector<PreparedTimelineBinding> timelines, std::shared_ptr<const void> lease);
     ~PreparedRhiExecutionBatch() override { Abandon(); }
+    // Its lists, for a host that executes them (an external epoch's secondaries); none for a deferred batch.
+    std::span<rhi::CommandList> Lists() const noexcept { return {m_lists.data(), m_lists.size()}; }
+    bool Deferred() const noexcept { return static_cast<bool>(m_deferred); }
+    // The timeline an identity binds (a null handle: none).
+    rhi::TimelineHandle ResolveTimeline(uint64_t identity) const noexcept {
+        for (const auto& item : m_timelines) if (item.identity == identity) return item.handle;
+        return {};
+    }
+    // An external epoch's: the host executes the packet in its own submission, which waits for and signals what the batch would
+    // have (ExternalEpochExecution). Consumes the packet as Submit does, commits its passes as submitted with a_signal (a deferred
+    // batch's once RecordDeferred recorded them), and adds their external signals to a_signals. False when consumed, or when a
+    // pass's external signal is invalid.
+    bool CommitExternal(uint64_t a_signal, std::vector<rhi::TimelinePoint>& a_signals) const noexcept {
+        if (!m_replayable && m_consumed.exchange(true)) return false;
+        for (const auto& pass : m_submissionEffects)
+            for (const auto& external : pass.ExternalSignalsAfterCompletion()) {
+                if (!external.timeline || !external.value) {
+                    AbandonEffects();
+                    return false;
+                }
+                a_signals.push_back({external.timeline.GetHandle(), external.value});
+            }
+        if (m_deferred) {
+            m_deferredSignal = a_signal;
+            return true;
+        }
+        return CommitEffectsSubmitted(a_signal);
+    }
+    // A deferred batch's recording into the host's list (outside any pass), on the host's thread; once.
+    void RecordDeferred(rhi::CommandList a_list) const;
     uint32_t QueueSlot() const noexcept override { return m_queueSlot; }
     bool Replayable() const noexcept override { return m_replayable; }
     // Whether a timeline identity resolves through this packet's bindings (a wait SubmitLeading may take).
@@ -441,6 +477,8 @@ public:
         return {SubmissionState::Signaled};
     }
     SubmissionReceipt Submit(const ExecutionBatchTimeline& batch) const noexcept override {
+        // A deferred batch has no lists: only its host's execution records it.
+        if (m_deferred) return {SubmissionState::NotSubmitted, SubmissionFailureStage::Validation};
         // Single-consumption even after failure: uploads/readbacks cannot replay. A replayable packet has neither.
         if (!m_replayable && m_consumed.exchange(true)) return {SubmissionState::NotSubmitted, SubmissionFailureStage::Replay};
         auto find = [&](uint64_t identity) -> const PreparedTimelineBinding* {
@@ -492,6 +530,11 @@ public:
     }
     void Complete(uint64_t submission) const noexcept override {
         if (m_replayable) return;  // the lists are submitted again: they go when the last owner lets the packet go
+        // A deferred batch its host never recorded (its execution signalled unexecuted): its passes did nothing.
+        if (m_deferred && !m_deferredRecorded.load(std::memory_order_acquire)) {
+            AbandonEffects();
+            return;
+        }
         for (const auto& pass : m_submissionEffects) {
             try { pass.CommitCompleted({submission}); }
             catch (...) { basic_telemetry::AddCounter("ORG.Execution.InvalidCompletionTransition"); }
@@ -509,6 +552,17 @@ public:
         AbandonEffects();
     }
 private:
+    bool CommitEffectsSubmitted(uint64_t a_signal) const noexcept {
+        bool lifecycleFailed = false;
+        for (const auto& pass : m_submissionEffects) {
+            try { pass.CommitSubmitted({a_signal}); }
+            catch (...) {
+                lifecycleFailed = true;
+                basic_telemetry::AddCounter("ORG.Execution.SubmissionLifecycleFailures");
+            }
+        }
+        return !lifecycleFailed;
+    }
     void AbandonEffects() const noexcept {
         for (const auto& pass : m_submissionEffects) {
             try { pass.Abandon(AbandonReason::AdmissionFailed); }
@@ -525,6 +579,9 @@ private:
     mutable std::atomic_bool m_consumed{false};
     mutable std::atomic_bool m_commandListsRetired{false};
     bool m_replayable = false;
+    std::shared_ptr<OwnedRecordingList> m_deferred;
+    mutable std::atomic_bool m_deferredRecorded{false};
+    mutable uint64_t m_deferredSignal = 0;  // CommitExternal's, which RecordDeferred commits its passes with
 };
 
 // One owned recording packet. The binding table transitively owns descriptor
@@ -619,6 +676,9 @@ struct OwnedRecordingList {
     // pass / after the last pass of this command list.
     bool externalEntryBarrier = false;
     bool externalExitBarrier = false;
+    // An external epoch's (RenderGraph::SetExternalPersistentEpochs): recorded into a secondary list (its pool's), or at execution
+    // into the host's list (a late batch), never submitted by the graph; no Tracy GPU zones (their queue-scoped state).
+    bool external = false;
     // Record for resubmission (PreparedRhiExecutionBatch's replayable packets), when every pass of the packet is replayable:
     // with no profiler GPU zones or ranges, whose queries a resubmission would write again. Nothing a list records may name a
     // resource its recording does not own: its statistics queries, if any, are its own (QueryRecordingContext::owned).
@@ -668,6 +728,180 @@ inline OwnedRecordingList BuildPersistentRecordingList(std::shared_ptr<const Ren
         result.passes.push_back(invocation);
     }
     return result;
+}
+
+// The recording context of one owned recording, on `list`: its bindings (legacy, persistent, or both) and frame slot.
+inline RecordingContext MakeOwnedRecordingContext(rhi::CommandList list, const OwnedRecordingList& recording) {
+    auto context = recording.bindings
+        ? RecordingContext(list, recording.bindings, recording.externalBindings)
+        : RecordingContext::FromPersistentBindings(list, recording.publication);
+    if (recording.bindings && recording.publication)
+        context = context.WithPersistentBindings(recording.publication);
+    context.SetFrameSlot(recording.frameSlot);
+    return context;
+}
+
+// One owned recording's commands into the context's list: its heaps, its entry, per-pass and exit barriers, its passes and its
+// queries' resolve. Not the list's begin or end: RecordPreparedRhiExecutionBatch's for its own lists; a late batch of an external
+// epoch records into the host's list (PreparedRhiExecutionBatch::RecordDeferred), which the host ends.
+inline void RecordOwnedRecordingCommands(RecordingContext& context, const OwnedRecordingList& recording, rhi::Queue queue, bool replayable) {
+    struct TracyGpuZoneScope {
+        rhi::CommandList& commands;
+        bool open = false;
+        TracyGpuZoneScope(rhi::CommandList& commandList, const rhi::Queue& queue, const char* name)
+            : commands(commandList) {
+            BT_ZONE_SCOPE("ORG.Execution.RecordOwned.TracyBegin");
+            const auto result = commands.BeginTracyGpuZone(queue, name);
+            open = result == rhi::Result::Ok;
+            if (open) basic_telemetry::AddCounter("ORG.TracyGpuZones.BeginAccepted");
+            else if (result != rhi::Result::Unsupported)
+                basic_telemetry::AddCounter("ORG.TracyGpuZones.BeginFailures");
+        }
+        TracyGpuZoneScope(const TracyGpuZoneScope&) = delete;
+        TracyGpuZoneScope& operator=(const TracyGpuZoneScope&) = delete;
+        ~TracyGpuZoneScope() { Close(); }
+        void Close() noexcept {
+            if (!open) return;
+            BT_ZONE_SCOPE("ORG.Execution.RecordOwned.TracyEnd");
+            commands.EndTracyGpuZone();
+            open = false;
+        }
+    };
+    auto* statistics = recording.statistics.get();
+    if (statistics) statistics->cpuMilliseconds.resize(recording.passes.size());
+    const bool skipQueries = DiagnosticSkipPassQueries().load(std::memory_order_relaxed);
+    if (skipQueries && statistics) statistics->gpuQueries = false;
+    // The diagnostic skips it only for lists of copies alone (the latched copies'), which read no descriptor.
+    const bool copiesOnly = std::all_of(recording.passes.begin(), recording.passes.end(),
+        [](const PreparedPass& p) { return p.DebugName().ends_with("latched-copies"); });
+    if (recording.resourceDescriptorHeap.valid() && !(copiesOnly && DiagnosticSkipListHeapBinds().load(std::memory_order_relaxed))) {
+        context.Commands().SetDescriptorHeaps(recording.resourceDescriptorHeap,
+            recording.samplerDescriptorHeap.valid()
+                ? std::optional<rhi::DescriptorHeapHandle>{recording.samplerDescriptorHeap}
+                : std::nullopt);
+    }
+    const auto* barrierRanges = recording.gpuPassRanges.get();
+    const auto firstPass = recording.passes.empty() ? std::string_view{} : std::string_view(recording.passes.front().DebugName());
+    // A kept recording's own queries (OwnedTimestampQueries) time its barrier batches too, under the profiler's range names.
+    auto* const ownedQueries = statistics && statistics->gpuQueries && statistics->queries.owned ? &statistics->queries : nullptr;
+    const int skipBarriers = DiagnosticSkipListBarriers().load(std::memory_order_relaxed);
+    const auto recordBarriers = [&](const char* where, std::string_view pass, const rhi::BarrierBatch& barriers) {
+        if (skipBarriers >= 2 || (skipBarriers == 1 && barriers.globals.size != 0))
+            return;
+        const char* name = barrierRanges || ownedQueries ? OwnedRecordingBarrierRangeName(where, pass) : nullptr;
+        if (barrierRanges) barrierRanges->begin(context.Commands(), queue, barrierRanges->queueName, name);
+        if (ownedQueries) statistics->service->BeginRangeQuery(name, context.Commands(), *ownedQueries);
+        context.Commands().Barriers(barriers);
+        if (ownedQueries) statistics->service->EndRangeQuery(context.Commands(), *ownedQueries);
+        if (barrierRanges) barrierRanges->end(context.Commands(), queue);
+    };
+    if (recording.externalEntryBarrier) {
+        auto full = rhi::FullMemoryBarrier();
+        rhi::BarrierBatch barriers{};
+        barriers.globals = {&full, 1u};
+        recordBarriers("external-entry", firstPass, barriers);
+    }
+    if (!recording.textureBarriers.empty() || !recording.bufferBarriers.empty()) {
+        rhi::BarrierBatch barriers{};
+        barriers.textures = {recording.textureBarriers.data(), static_cast<uint32_t>(recording.textureBarriers.size())};
+        barriers.buffers = {recording.bufferBarriers.data(), static_cast<uint32_t>(recording.bufferBarriers.size())};
+        recordBarriers("entry", firstPass, barriers);
+    }
+    for (size_t passIndex = 0; passIndex < recording.passes.size(); ++passIndex) {
+        BT_ZONE_SCOPE("ORG.Execution.RecordOwned.Pass");
+        // A capture tool's region for the pass (PIX / VK_EXT_debug_utils), opened before the pass's entry
+        // barriers so that a wait on the previous pass's output shows up inside the pass that needed it.
+        // The legacy recorder labels its passes; without this, persistent graphs recorded none at all.
+        const auto passLabel = recording.passes[passIndex].DebugName();
+        BT_ZONE_TEXT(passLabel.data(), passLabel.size());
+        rhi::debug::Scope captureScope(context.Commands(), rhi::colors::Mint, passLabel.empty() ? "<unnamed>" : passLabel.data());
+        if (!recording.barriersBeforePass.empty()) {
+            BT_ZONE_SCOPE("ORG.Execution.RecordOwned.BeforeBarriers");
+            const auto& before = recording.barriersBeforePass[passIndex];
+            if (!before.textures.empty() || !before.buffers.empty()) {
+                rhi::BarrierBatch barriers{};
+                barriers.textures = {before.textures.data(), static_cast<uint32_t>(before.textures.size())};
+                barriers.buffers = {before.buffers.data(), static_cast<uint32_t>(before.buffers.size())};
+                recordBarriers("before", passLabel, barriers);
+            }
+        }
+        const int statisticsIndex = statistics ? statistics->passIndices[passIndex] : -1;
+        const auto debugName = recording.passes[passIndex].DebugName();
+        // Copy batches are recorded concurrently and already have explicit
+        // CPU/statistics attribution. Injecting a Tracy timestamp pair and
+        // ResolveQueryData for every tiny copy pass makes the profiler's
+        // queue-wide query/readback state another concurrent writer. DX12
+        // can report that earlier instrumentation error only when a later
+        // command list closes, obscuring the actual pass. Keep GPU zones on
+        // graphics/compute queues and leave copy lists instrumentation-free.
+        const bool allowTracyGpuZone = !replayable && !skipQueries && !recording.external && (!statistics ||
+            statistics->queueKind != rhi::QueueKind::Copy);
+        TracyGpuZoneScope tracyGpuZone(context.Commands(), queue,
+            allowTracyGpuZone
+                ? (debugName.empty() ? "<unnamed>" : debugName.data())
+                : nullptr);
+        if (statisticsIndex >= 0 && statistics->gpuQueries)
+            statistics->service->BeginQuery(static_cast<unsigned>(statisticsIndex), statistics->frameIndex,
+                queue, context.Commands(), statistics->queries);
+        const auto cpuStart = statisticsIndex >= 0 ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
+        // A replayable list carries its ranges too (the callbacks push one only while a capture is armed): a host that
+        // keeps lists across frames records them again when a capture arms and when it ends, so none outlives its session.
+        const auto* ranges = recording.gpuPassRanges.get();
+        if (ranges) ranges->begin(context.Commands(), queue, ranges->queueName, debugName.empty() ? "<unnamed>" : debugName.data());
+        {
+            BT_ZONE_SCOPE("ORG.Execution.RecordOwned.Record");
+            BT_ZONE_TEXT(passLabel.data(), passLabel.size());
+            // The pass may time parts of itself (BeginRecordingSubRange) under its own range, with the recording's queries.
+            runtime::RecordingRanges subRanges{ ownedQueries ? statistics->service.get() : nullptr, ownedQueries, &context.Commands() };
+            runtime::RecordingRangeScope subRangeScope(ownedQueries ? &subRanges : nullptr);
+            recording.passes[passIndex].Record(context);
+        }
+        if (ranges) ranges->end(context.Commands(), queue);
+        if (statisticsIndex >= 0) {
+            statistics->cpuMilliseconds[passIndex] = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - cpuStart).count();
+            if (statistics->gpuQueries)
+                statistics->service->EndQuery(static_cast<unsigned>(statisticsIndex), statistics->frameIndex,
+                    queue, context.Commands(), statistics->queries);
+        }
+        if (!recording.barriersAfterPass.empty()) {
+            BT_ZONE_SCOPE("ORG.Execution.RecordOwned.AfterBarriers");
+            const auto& after = recording.barriersAfterPass[passIndex];
+            if (!after.textures.empty() || !after.buffers.empty()) {
+                rhi::BarrierBatch barriers{};
+                barriers.textures = {after.textures.data(), static_cast<uint32_t>(after.textures.size())};
+                barriers.buffers = {after.buffers.data(), static_cast<uint32_t>(after.buffers.size())};
+                recordBarriers("after", passLabel, barriers);
+            }
+        }
+        tracyGpuZone.Close();
+    }
+    if (recording.externalExitBarrier) {
+        auto full = rhi::FullMemoryBarrier();
+        rhi::BarrierBatch barriers{};
+        barriers.globals = {&full, 1u};
+        recordBarriers("external-exit", firstPass, barriers);
+    }
+    // After the exit barrier, so a kept recording's own queries time it too.
+    if (statistics && statistics->gpuQueries)
+        statistics->service->ResolveQueries(statistics->frameIndex, queue, context.Commands(), statistics->queries);
+}
+
+inline PreparedRhiExecutionBatch::PreparedRhiExecutionBatch(uint32_t queueSlot, rhi::Queue queue, OwnedRecordingList deferred,
+    std::vector<PreparedTimelineBinding> timelines, std::shared_ptr<const void> lease)
+    : m_queueSlot(queueSlot), m_queue(queue), m_timelines(std::move(timelines)), m_lease(std::move(lease)),
+      m_deferred(std::make_shared<OwnedRecordingList>(std::move(deferred))) {
+    if (!m_queue || !m_lease || m_deferred->passes.empty())
+        throw std::invalid_argument("Incomplete deferred RHI packet");
+    m_submissionEffects = m_deferred->passes;
+}
+
+inline void PreparedRhiExecutionBatch::RecordDeferred(rhi::CommandList a_list) const {
+    if (!m_deferred || m_deferredRecorded.exchange(true)) throw std::logic_error("A deferred packet is recorded once");
+    auto context = MakeOwnedRecordingContext(a_list, *m_deferred);
+    RecordOwnedRecordingCommands(context, *m_deferred, m_queue, false);
+    if (!CommitEffectsSubmitted(m_deferredSignal)) throw std::logic_error("A deferred packet's passes could not be committed as submitted");
 }
 
 // Called only after admission freezes bindings and barriers. It may run on a
@@ -730,153 +964,17 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
         }, replayable);
     for (const auto& recording : ownership->recordings) {
         BT_ZONE_SCOPE("ORG.Execution.RecordOwned.List");
-        auto context = recording.bindings
-            ? RecordingContext(recording.allocation->pair.list.Get(), recording.bindings, recording.externalBindings)
-            : RecordingContext::FromPersistentBindings(recording.allocation->pair.list.Get(),recording.publication);
-        if (recording.bindings && recording.publication)
-            context = context.WithPersistentBindings(recording.publication);
-        context.SetFrameSlot(recording.frameSlot);
-        struct TracyGpuZoneScope {
-            rhi::CommandList& commands;
-            bool open = false;
-            TracyGpuZoneScope(rhi::CommandList& commandList, const rhi::Queue& queue, const char* name)
-                : commands(commandList) {
-                BT_ZONE_SCOPE("ORG.Execution.RecordOwned.TracyBegin");
-                const auto result = commands.BeginTracyGpuZone(queue, name);
-                open = result == rhi::Result::Ok;
-                if (open) basic_telemetry::AddCounter("ORG.TracyGpuZones.BeginAccepted");
-                else if (result != rhi::Result::Unsupported)
-                    basic_telemetry::AddCounter("ORG.TracyGpuZones.BeginFailures");
-            }
-            TracyGpuZoneScope(const TracyGpuZoneScope&) = delete;
-            TracyGpuZoneScope& operator=(const TracyGpuZoneScope&) = delete;
-            ~TracyGpuZoneScope() { Close(); }
-            void Close() noexcept {
-                if (!open) return;
-                BT_ZONE_SCOPE("ORG.Execution.RecordOwned.TracyEnd");
-                commands.EndTracyGpuZone();
-                open = false;
-            }
-        };
-        auto* statistics = recording.statistics.get();
-        if (statistics) statistics->cpuMilliseconds.resize(recording.passes.size());
-        const bool skipQueries = DiagnosticSkipPassQueries().load(std::memory_order_relaxed);
-        if (skipQueries && statistics) statistics->gpuQueries = false;
-        // The diagnostic skips it only for lists of copies alone (the latched copies'), which read no descriptor.
-        const bool copiesOnly = std::all_of(recording.passes.begin(), recording.passes.end(),
-            [](const PreparedPass& p) { return p.DebugName().ends_with("latched-copies"); });
-        if (recording.resourceDescriptorHeap.valid() && !(copiesOnly && DiagnosticSkipListHeapBinds().load(std::memory_order_relaxed))) {
-            context.Commands().SetDescriptorHeaps(recording.resourceDescriptorHeap,
-                recording.samplerDescriptorHeap.valid()
-                    ? std::optional<rhi::DescriptorHeapHandle>{recording.samplerDescriptorHeap}
-                    : std::nullopt);
+        auto list = recording.allocation->pair.list.Get();
+        // A secondary pool's list (an external epoch's) is handed out recycled, not begun: begun here, for work outside any pass.
+        if (recording.allocation->pool && recording.allocation->pool->Secondary()) {
+            rhi::SecondaryInheritance outside{};
+            outside.insideRendering = false;
+            outside.debugName = "ORG external epoch";
+            if (list.BeginSecondary(outside) != rhi::Result::Ok)
+                throw std::runtime_error("Owned secondary command list could not begin");
         }
-        const auto* barrierRanges = recording.gpuPassRanges.get();
-        const auto firstPass = recording.passes.empty() ? std::string_view{} : std::string_view(recording.passes.front().DebugName());
-        // A kept recording's own queries (OwnedTimestampQueries) time its barrier batches too, under the profiler's range names.
-        auto* const ownedQueries = statistics && statistics->gpuQueries && statistics->queries.owned ? &statistics->queries : nullptr;
-        const int skipBarriers = DiagnosticSkipListBarriers().load(std::memory_order_relaxed);
-        const auto recordBarriers = [&](const char* where, std::string_view pass, const rhi::BarrierBatch& barriers) {
-            if (skipBarriers >= 2 || (skipBarriers == 1 && barriers.globals.size != 0))
-                return;
-            const char* name = barrierRanges || ownedQueries ? OwnedRecordingBarrierRangeName(where, pass) : nullptr;
-            if (barrierRanges) barrierRanges->begin(context.Commands(), queue, barrierRanges->queueName, name);
-            if (ownedQueries) statistics->service->BeginRangeQuery(name, context.Commands(), *ownedQueries);
-            context.Commands().Barriers(barriers);
-            if (ownedQueries) statistics->service->EndRangeQuery(context.Commands(), *ownedQueries);
-            if (barrierRanges) barrierRanges->end(context.Commands(), queue);
-        };
-        if (recording.externalEntryBarrier) {
-            auto full = rhi::FullMemoryBarrier();
-            rhi::BarrierBatch barriers{};
-            barriers.globals = {&full, 1u};
-            recordBarriers("external-entry", firstPass, barriers);
-        }
-        if (!recording.textureBarriers.empty() || !recording.bufferBarriers.empty()) {
-            rhi::BarrierBatch barriers{};
-            barriers.textures = {recording.textureBarriers.data(), static_cast<uint32_t>(recording.textureBarriers.size())};
-            barriers.buffers = {recording.bufferBarriers.data(), static_cast<uint32_t>(recording.bufferBarriers.size())};
-            recordBarriers("entry", firstPass, barriers);
-        }
-        for (size_t passIndex = 0; passIndex < recording.passes.size(); ++passIndex) {
-            BT_ZONE_SCOPE("ORG.Execution.RecordOwned.Pass");
-            // A capture tool's region for the pass (PIX / VK_EXT_debug_utils), opened before the pass's entry
-            // barriers so that a wait on the previous pass's output shows up inside the pass that needed it.
-            // The legacy recorder labels its passes; without this, persistent graphs recorded none at all.
-            const auto passLabel = recording.passes[passIndex].DebugName();
-            BT_ZONE_TEXT(passLabel.data(), passLabel.size());
-            rhi::debug::Scope captureScope(context.Commands(), rhi::colors::Mint, passLabel.empty() ? "<unnamed>" : passLabel.data());
-            if (!recording.barriersBeforePass.empty()) {
-                BT_ZONE_SCOPE("ORG.Execution.RecordOwned.BeforeBarriers");
-                const auto& before = recording.barriersBeforePass[passIndex];
-                if (!before.textures.empty() || !before.buffers.empty()) {
-                    rhi::BarrierBatch barriers{};
-                    barriers.textures = {before.textures.data(), static_cast<uint32_t>(before.textures.size())};
-                    barriers.buffers = {before.buffers.data(), static_cast<uint32_t>(before.buffers.size())};
-                    recordBarriers("before", passLabel, barriers);
-                }
-            }
-            const int statisticsIndex = statistics ? statistics->passIndices[passIndex] : -1;
-            const auto debugName = recording.passes[passIndex].DebugName();
-            // Copy batches are recorded concurrently and already have explicit
-            // CPU/statistics attribution. Injecting a Tracy timestamp pair and
-            // ResolveQueryData for every tiny copy pass makes the profiler's
-            // queue-wide query/readback state another concurrent writer. DX12
-            // can report that earlier instrumentation error only when a later
-            // command list closes, obscuring the actual pass. Keep GPU zones on
-            // graphics/compute queues and leave copy lists instrumentation-free.
-            const bool allowTracyGpuZone = !replayable && !skipQueries && (!statistics ||
-                statistics->queueKind != rhi::QueueKind::Copy);
-            TracyGpuZoneScope tracyGpuZone(context.Commands(), queue,
-                allowTracyGpuZone
-                    ? (debugName.empty() ? "<unnamed>" : debugName.data())
-                    : nullptr);
-            if (statisticsIndex >= 0 && statistics->gpuQueries)
-                statistics->service->BeginQuery(static_cast<unsigned>(statisticsIndex), statistics->frameIndex,
-                    queue, context.Commands(), statistics->queries);
-            const auto cpuStart = statisticsIndex >= 0 ? std::chrono::steady_clock::now()
-                : std::chrono::steady_clock::time_point{};
-            // A replayable list carries its ranges too (the callbacks push one only while a capture is armed): a host that
-            // keeps lists across frames records them again when a capture arms and when it ends, so none outlives its session.
-            const auto* ranges = recording.gpuPassRanges.get();
-            if (ranges) ranges->begin(context.Commands(), queue, ranges->queueName, debugName.empty() ? "<unnamed>" : debugName.data());
-            {
-                BT_ZONE_SCOPE("ORG.Execution.RecordOwned.Record");
-                BT_ZONE_TEXT(passLabel.data(), passLabel.size());
-                // The pass may time parts of itself (BeginRecordingSubRange) under its own range, with the recording's queries.
-                runtime::RecordingRanges subRanges{ ownedQueries ? statistics->service.get() : nullptr, ownedQueries, &context.Commands() };
-                runtime::RecordingRangeScope subRangeScope(ownedQueries ? &subRanges : nullptr);
-                recording.passes[passIndex].Record(context);
-            }
-            if (ranges) ranges->end(context.Commands(), queue);
-            if (statisticsIndex >= 0) {
-                statistics->cpuMilliseconds[passIndex] = std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - cpuStart).count();
-                if (statistics->gpuQueries)
-                    statistics->service->EndQuery(static_cast<unsigned>(statisticsIndex), statistics->frameIndex,
-                        queue, context.Commands(), statistics->queries);
-            }
-            if (!recording.barriersAfterPass.empty()) {
-                BT_ZONE_SCOPE("ORG.Execution.RecordOwned.AfterBarriers");
-                const auto& after = recording.barriersAfterPass[passIndex];
-                if (!after.textures.empty() || !after.buffers.empty()) {
-                    rhi::BarrierBatch barriers{};
-                    barriers.textures = {after.textures.data(), static_cast<uint32_t>(after.textures.size())};
-                    barriers.buffers = {after.buffers.data(), static_cast<uint32_t>(after.buffers.size())};
-                    recordBarriers("after", passLabel, barriers);
-                }
-            }
-            tracyGpuZone.Close();
-        }
-        if (recording.externalExitBarrier) {
-            auto full = rhi::FullMemoryBarrier();
-            rhi::BarrierBatch barriers{};
-            barriers.globals = {&full, 1u};
-            recordBarriers("external-exit", firstPass, barriers);
-        }
-        // After the exit barrier, so a kept recording's own queries time it too.
-        if (statistics && statistics->gpuQueries)
-            statistics->service->ResolveQueries(statistics->frameIndex, queue, context.Commands(), statistics->queries);
+        auto context = MakeOwnedRecordingContext(list, recording);
+        RecordOwnedRecordingCommands(context, recording, queue, replayable);
         const auto closeResult = [&] {
             BT_ZONE_SCOPE("ORG.Execution.RecordOwned.EndChecked");
             return context.Commands().EndChecked();

@@ -591,6 +591,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 		par.techniquePath = d.techniquePath;
 		par.collectStatistics = d.collectStatistics;
 		par.epoch = d.epoch;
+		par.recordAtExecution = d.recordAtExecution;
 		{
 			RenderPassBuilder b(this, d.name);
 			b.pass = rp;
@@ -666,6 +667,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 		par.techniquePath = d.techniquePath;
 		par.collectStatistics = d.collectStatistics;
 		par.epoch = d.epoch;
+		par.recordAtExecution = d.recordAtExecution;
 		{
 			ComputePassBuilder b(this, d.name);
 			b.pass = cp;
@@ -739,6 +741,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 		par.techniquePath = d.techniquePath;
 		par.collectStatistics = d.collectStatistics;
 		par.epoch = d.epoch;
+		par.recordAtExecution = d.recordAtExecution;
 		{
 			CopyPassBuilder b(this, d.name);
 			b.pass = cp;

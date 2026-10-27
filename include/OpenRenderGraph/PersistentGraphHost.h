@@ -13,6 +13,7 @@
 #include <rhi.h>
 
 #include "Render/RenderGraph/RenderGraph.h"
+#include "Render/RenderGraph/ExternalEpochExecution.h"
 
 namespace org::runtime {
 class ITaskService;
@@ -166,6 +167,25 @@ public:
 	// again at submission. They need Desc::reuseRecordings' replayable recordings.
 	void SetAsyncEpochs(std::vector<uint32_t> epochs, std::vector<uint32_t> revisionEpochs = {});
 	bool AsyncEpochs() const noexcept { return static_cast<bool>(m_async); }
+	/**
+	 * @brief Async epochs the caller executes itself, in a command buffer of its own (RenderGraph::SetExternalPersistentEpochs):
+	 * SubmitEpoch submits nothing for them. Their uploads are recorded into a secondary list, the execution is taken with
+	 * TakeExternalExecution, and the caller's submission of its buffer waits for and signals what the execution names. Every
+	 * pass of theirs runs on the graphics queue, and their uploads must be plain copies (no producer-recorded lists, no
+	 * queue-scoped uploads). Stops and restarts the async epochs; kept across rebuilds.
+	 */
+	void SetExternalEpochs(std::vector<uint32_t> epochs);
+	/**
+	 * @brief Submitting thread, after SubmitEpoch of an external epoch: its execution (null: none since the last call). The caller
+	 * must execute it (ExternalEpochExecution::Execute) in a command buffer whose submission waits for its waits and signals its
+	 * signals, or signal it unexecuted: the graph's later work on its timelines waits for those signals.
+	 */
+	std::shared_ptr<ExternalEpochExecution> TakeExternalExecution() noexcept { return std::move(m_externalExecution); }
+	/**
+	 * @brief Submitting thread: an external execution the caller could not execute, completed without running it (a submission on
+	 * the graphics queue of no lists, with its waits and signals). What its passes would have written is left as it was.
+	 */
+	void SignalExternalExecutionUnexecuted(const ExternalEpochExecution& execution);
 
 	// An epoch recorded for one revision: a recording per frame slot of the epoch's ring (async epoch i uses slots
 	// i * framesInFlight .. + framesInFlight - 1, so its tickets and its recordings meet there). Immutable.
@@ -502,6 +522,8 @@ private:
 	void NoteSlotSubmitted(uint32_t slot);
 	std::vector<uint32_t> m_asyncEpochs;  // restarted with these after a rebuild
 	std::vector<uint32_t> m_revisionEpochs;
+	std::vector<uint32_t> m_externalEpochs;  // SetExternalEpochs; set on every build's graph
+	std::shared_ptr<ExternalEpochExecution> m_externalExecution;  // submitting thread: the last external SubmitEpoch's
 	std::shared_ptr<const EpochRecording> m_chosenRecording;  // submitting thread: UseEpochRecording's, until SubmitEpoch takes it
 	// Submitting thread, during SubmitTicket's beforeSubmit: the ticket being submitted and its epoch's index (CanUseEpochRecording).
 	const RenderGraph::PersistentTicket* m_submittingTicket = nullptr;

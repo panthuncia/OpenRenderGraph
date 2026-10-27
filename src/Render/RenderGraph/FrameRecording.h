@@ -17,6 +17,9 @@ struct FrameRecordingJob {
     rhi::Queue queue;
     std::shared_ptr<CommandListPool> pool;
     OwnedRecordingList recording;
+    // An external epoch's late batch (CompilePass::recordAtExecution): no list; its packet keeps the recording for the host's
+    // execution (PreparedRhiExecutionBatch::RecordDeferred).
+    bool deferred = false;
 };
 
 // Everything the recorder may read is frozen before dispatch. It has no graph,

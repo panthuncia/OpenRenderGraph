@@ -26,9 +26,9 @@ namespace {
     }
 }
 
-CommandListPool::CommandListPool(rhi::Device& device, rhi::QueueKind type)
-    : m_device(device), m_type(type),
-      m_telemetryPrefix(std::string("ORG.CommandListPool.") + QueueKindDebugName(type) + ".") {
+CommandListPool::CommandListPool(rhi::Device& device, rhi::QueueKind type, bool secondary)
+    : m_device(device), m_type(type), m_secondary(secondary),
+      m_telemetryPrefix(std::string("ORG.CommandListPool.") + QueueKindDebugName(type) + (secondary ? ".Secondary." : ".")) {
 }
 
 CommandListPool::~CommandListPool() {
@@ -87,16 +87,18 @@ CommandListPair CommandListPool::CreateReadyPair() {
 	if (!rhi::IsOk(result) || !pair.allocator) {
 		throw std::runtime_error(std::string("Failed to create ORG command allocator: ") + rhi::ResultName(result));
 	}
-	result = m_device.CreateCommandList(m_type, pair.allocator.Get(), pair.list);
+	result = m_secondary ? m_device.CreateSecondaryCommandList(m_type, pair.allocator.Get(), pair.list)
+	                     : m_device.CreateCommandList(m_type, pair.allocator.Get(), pair.list);
 	if (!rhi::IsOk(result) || !pair.list) {
-		throw std::runtime_error(std::string("Failed to create ORG command list: ") + rhi::ResultName(result));
+		throw std::runtime_error(std::string("Failed to create ORG ") + (m_secondary ? "secondary " : "") + "command list: " + rhi::ResultName(result));
 	}
 
     const uint64_t nameId = m_nextDebugNameId.fetch_add(1, std::memory_order_relaxed);
-    std::string debugName = std::string("ORG ") + QueueKindDebugName(m_type) + " CommandList #" + std::to_string(nameId);
+    std::string debugName = std::string("ORG ") + QueueKindDebugName(m_type) + (m_secondary ? " Secondary" : "") + " CommandList #" + std::to_string(nameId);
     pair.list->SetName(debugName.c_str());
 
-    pair.list->End();
+    // A primary is created recording; a secondary is not (it begins in BeginSecondary).
+    if (!m_secondary) pair.list->End();
     PreparePairForReuse(pair);
     const auto duration = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - createBegin).count());

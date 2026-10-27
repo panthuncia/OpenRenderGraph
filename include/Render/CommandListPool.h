@@ -42,7 +42,9 @@ public:
         uint64_t recycleQueuedCount = 0;
     };
 
-    CommandListPool(rhi::Device& device, rhi::QueueKind type);
+    // secondary: secondary lists (Device::CreateSecondaryCommandList), handed out recycled but not begun: the recorder begins
+    // each with CommandList::BeginSecondary (an external epoch's, ExternalEpochExecution).
+    CommandListPool(rhi::Device& device, rhi::QueueKind type, bool secondary = false);
     ~CommandListPool();
     void ShutdownBackgroundReset();
 
@@ -70,6 +72,8 @@ public:
     // Queue any completed command lists for background reset.
     void RecycleCompleted(uint64_t completedFenceValue);
 
+    bool Secondary() const noexcept { return m_secondary; }
+
     Diagnostics GetDiagnostics() const {
         std::lock_guard lock(m_mutex);
         return m_diagnostics;
@@ -84,6 +88,7 @@ private:
 
     rhi::Device m_device;
     rhi::QueueKind m_type;
+    bool m_secondary = false;
     std::atomic<uint64_t> m_nextDebugNameId{ 1 };
     Diagnostics m_diagnostics{};
 
