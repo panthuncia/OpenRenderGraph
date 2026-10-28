@@ -181,7 +181,7 @@ public:
     bool QueueStreamingWait(std::span<const std::pair<std::shared_ptr<rhi::TimelinePtr>, uint64_t>> points) override {
         return UploadManager::GetInstance().QueueStreamingWait(points);
     }
-    bool QueueStreamingSignal(std::shared_ptr<rhi::TimelinePtr> timeline, uint64_t value) override {
+    std::shared_ptr<TrackedUploadTicket> QueueStreamingSignal(std::shared_ptr<rhi::TimelinePtr> timeline, uint64_t value) override {
         return UploadManager::GetInstance().QueueStreamingSignal(std::move(timeline), value);
     }
 

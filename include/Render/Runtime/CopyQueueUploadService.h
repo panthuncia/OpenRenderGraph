@@ -99,9 +99,11 @@ public:
     // Signals `timeline` to `value` from the copy queue once every copy the calling thread queued before it is done (the
     // intake is FIFO per producer and batches go to the one queue in order; the batch carrying it signals it with its own
     // timeline). Another queue can wait on that value for those copies - before it is signalled, too (wait-before-signal), so
-    // a producer that announced one must always queue it: with nothing to copy it goes out in a batch of its own. False when
-    // the service is not initialized or the arguments are invalid.
-    bool QueueSignal(std::shared_ptr<rhi::TimelinePtr> timeline, uint64_t value);
+    // a producer that announced one must always queue it: with nothing to copy it goes out in a batch of its own. Its ticket is
+    // Submitted once the signal is on the copy queue (Cancelled if its batch failed): a waiter submitted to a queue whose own
+    // progress the copy queue's submission depends on (a host lock held across a blocking present) waits for that first. Null
+    // when the service is not initialized or the arguments are invalid.
+    std::shared_ptr<TrackedUploadTicket> QueueSignal(std::shared_ptr<rhi::TimelinePtr> timeline, uint64_t value);
     // Any thread: the batch holding the uploads the calling thread queues next waits, on the GPU, for each timeline to reach its
     // value (IUploadService::QueueStreamingWait). False without the queue.
     bool QueueWait(std::span<const std::pair<std::shared_ptr<rhi::TimelinePtr>, uint64_t>> points);

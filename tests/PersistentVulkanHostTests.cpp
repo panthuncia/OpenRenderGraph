@@ -412,13 +412,15 @@ int TestFrameRetirement(rhi::Device device, rhi::Backend backend);
 
 static int Run(int argc, char** argv) {
 	// "reuse": async epochs that keep and resubmit their recordings (PersistentGraphHost::Desc::reuseRecordings).
-	const bool reuse = argc > 1 && std::strcmp(argv[1], "reuse") == 0;
+	// "external-reuse": "external" with its recordings kept: the late pass, replayable, recorded again by each execution of a kept one.
+	const bool externalReuse = argc > 1 && std::strcmp(argv[1], "external-reuse") == 0;
+	const bool reuse = externalReuse || (argc > 1 && std::strcmp(argv[1], "reuse") == 0);
 	// "revision": a revision-driven epoch (SetAsyncEpochs' revisionEpochs), recorded ahead for each revision
 	// (RequestEpochRecording) and submitted with that recording.
 	const bool revision = argc > 1 && std::strcmp(argv[1], "revision") == 0;
 	// "external": an async epoch the test executes itself (PersistentGraphHost::SetExternalEpochs), its copy pass recorded at
 	// execution, in a primary of the test's, submitted with the execution's waits and signals.
-	const bool external = argc > 1 && std::strcmp(argv[1], "external") == 0;
+	const bool external = externalReuse || (argc > 1 && std::strcmp(argv[1], "external") == 0);
 	const bool async = reuse || revision || external || (argc > 1 && std::strcmp(argv[1], "async") == 0);
 	HostDevice host;
 	if (const int created = CreateHostDevice(host); created != 0) {
@@ -781,6 +783,7 @@ static int Run(int argc, char** argv) {
 					return queue.Submit({&list, 1}, {{waits.data(), static_cast<uint32_t>(waits.size())},
 						{signals.data(), static_cast<uint32_t>(signals.size())}}) == rhi::Result::Ok;
 				};
+				(void)host.TakeAsyncStats();
 				for (uint32_t frame = 0; frame < 6; ++frame) {
 					value = 90000u + 10u * frame;
 					host.SubmitEpoch(0, upload);
@@ -791,6 +794,12 @@ static int Run(int argc, char** argv) {
 					REQUIRE(execute(*execution), "the execution in the test's primary");
 					REQUIRE(g_copyRecords.load(std::memory_order_relaxed) == before + 1, "the late copy pass recorded at execution");
 					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "an external execution writes and copies");
+				}
+				if (externalReuse) {
+					const auto kept = host.TakeAsyncStats();
+					std::printf("external-reuse: %llu recorded, %llu kept, %llu reused\n", static_cast<unsigned long long>(kept.recorded),
+						static_cast<unsigned long long>(kept.kept), static_cast<unsigned long long>(kept.reused));
+					REQUIRE(kept.kept > 0 && kept.reused > 0, "an external epoch with a replayable late pass is kept and taken again");
 				}
 				// Not executed: signalled without its work. The output keeps its last value, and the next execution goes on.
 				const uint32_t kept = value;
@@ -841,9 +850,11 @@ static int Run(int argc, char** argv) {
 				std::set<std::string> timedOff, timedOn;
 				if (const int failed = timedPasses(false, timedOff)) return failed;
 				if (const int failed = timedPasses(true, timedOn)) return failed;
+				// Kept recordings (external-reuse) are timed with recording timestamps only, as every kept recording.
 				for (const auto* timedSet : {&timedOff, &timedOn})
-					REQUIRE(timedSet->contains("test.write") && timedSet->contains("test.copy-to-host"),
-						"an external epoch's passes are timed, its late pass's too, with or without recording timestamps");
+					if (timedSet == &timedOn || !externalReuse)
+						REQUIRE(timedSet->contains("test.write") && timedSet->contains("test.copy-to-host"),
+							"an external epoch's passes are timed, its late pass's too (a kept one's with recording timestamps)");
 				host.SetRecordingTimestamps(false);
 				host.SetCompletedFrameCallback({});
 				const auto stats = host.TakeAsyncStats();

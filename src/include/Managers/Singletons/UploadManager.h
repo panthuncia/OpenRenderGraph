@@ -117,7 +117,7 @@ public:
 	org::runtime::CopyQueueUploadService* CopyQueueUploads() { return m_copyQueueUploads.get(); }
 	// Whether the worker upload path has a queue of its own (not the graph's copy queue, which may alias the graphics one).
 	bool HasDedicatedStreamingQueue() const { return static_cast<bool>(m_uploadQueue); }
-	bool QueueStreamingSignal(std::shared_ptr<rhi::TimelinePtr> timeline, uint64_t value);
+	std::shared_ptr<TrackedUploadTicket> QueueStreamingSignal(std::shared_ptr<rhi::TimelinePtr> timeline, uint64_t value);
 	bool QueueStreamingWait(std::span<const std::pair<std::shared_ptr<rhi::TimelinePtr>, uint64_t>> points);
 
 	void Cleanup();

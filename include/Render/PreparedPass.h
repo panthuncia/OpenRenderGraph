@@ -901,6 +901,23 @@ public:
             throw;
         }
     }
+    // A replayable pass recorded again (after Record), into another list, with the same data: a late batch of a kept recording,
+    // which each execution records into its host's list (PreparedRhiExecutionBatch::RecordDeferred). No transition: a replayable
+    // pass has no lifecycle to advance.
+    void RecordAgain(RecordingContext& context) const {
+        if (!m_storage) throw std::logic_error("Legacy pass has no owned recording packet");
+        if (!IsReplayable() || m_storage->state.load(std::memory_order_acquire) != LifecycleState::Recorded)
+            throw std::logic_error("Only a recorded replayable pass is recorded again");
+        context.SetPreparedDependencies(m_storage->dependencies);
+        try {
+            m_storage->Record(context);
+            context.SetPreparedDependencies({});
+        }
+        catch (...) {
+            context.SetPreparedDependencies({});
+            throw;
+        }
+    }
     void CommitSubmitted(SubmissionContext context = {}) const {
         if (!m_storage) throw std::logic_error("Legacy pass has no submission effect");
         auto expected = LifecycleState::Recorded;

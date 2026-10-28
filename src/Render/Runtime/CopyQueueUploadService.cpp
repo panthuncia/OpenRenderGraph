@@ -392,15 +392,17 @@ void CopyQueueUploadService::RecycleCommandPair(CommandPair&& pair) {
 	}
 }
 
-bool CopyQueueUploadService::QueueSignal(std::shared_ptr<rhi::TimelinePtr> timeline, uint64_t value) {
-	if (!Initialized() || !timeline || !*timeline || value == 0) return false;
+std::shared_ptr<TrackedUploadTicket> CopyQueueUploadService::QueueSignal(std::shared_ptr<rhi::TimelinePtr> timeline, uint64_t value) {
+	if (!Initialized() || !timeline || !*timeline || value == 0) return {};
+	auto ticket = std::make_shared<TrackedUploadTicket>();
 	PendingCopy signal;
 	signal.signalTimeline = std::move(timeline);
 	signal.signalValue = value;
+	signal.ticket = ticket;
 	signal.queued = std::chrono::steady_clock::now();
 	m_intake.Push(std::move(signal));
 	m_wake.notify_one();
-	return true;
+	return ticket;
 }
 
 bool CopyQueueUploadService::QueueWait(std::span<const std::pair<std::shared_ptr<rhi::TimelinePtr>, uint64_t>> points) {

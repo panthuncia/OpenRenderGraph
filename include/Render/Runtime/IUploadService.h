@@ -213,10 +213,11 @@ public:
     virtual bool HasDedicatedStreamingQueue() const { return false; }
     // Any thread: signals `timeline` to `value` on that path's queue once every upload the calling thread queued on it before
     // is done (CopyQueueUploadService::QueueSignal). Another queue may wait on the value before it is signalled, so a producer
-    // that announced one always queues it. False when the path has no queue of its own to signal from.
-    virtual bool QueueStreamingSignal(std::shared_ptr<rhi::TimelinePtr> timeline, uint64_t value) {
+    // that announced one always queues it. Its ticket is Submitted once the signal is on that queue (see QueueSignal). Null when
+    // the path has no queue of its own to signal from.
+    virtual std::shared_ptr<TrackedUploadTicket> QueueStreamingSignal(std::shared_ptr<rhi::TimelinePtr> timeline, uint64_t value) {
         (void)timeline; (void)value;
-        return false;
+        return {};
     }
     // Any thread: the uploads the calling thread queues on that path from now on wait, on the GPU, until each timeline reached its
     // value (another queue's progress: a frame in flight still reading the destination they overwrite). Nothing waits on the CPU.

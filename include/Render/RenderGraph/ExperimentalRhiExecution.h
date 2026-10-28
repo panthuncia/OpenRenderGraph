@@ -617,15 +617,16 @@ struct OwnedRecordingStatistics : std::enable_shared_from_this<OwnedRecordingSta
     rhi::QueueKind queueKind = rhi::QueueKind::Graphics;
     bool gpuQueries = true;
     bool atCompletion = false;
-    std::atomic<bool> recorded{false};  // a late batch's: set (release) by its recording, read (acquire) by its publication
+    std::atomic<bool> recorded{false};  // a late batch's: set (release) by each recording, taken (acquire) by its publication
     std::vector<int> passIndices;
     std::vector<double> cpuMilliseconds;
     runtime::QueryRecordingContext queries;
 
     void Publish() {
         if (!atCompletion) return PublishRecorded();
+        // Taken by this completion: a kept recording's late batch is recorded, and published, once per execution.
         service->PublishAtCompletion(frameIndex, [self = shared_from_this()] {
-            if (self->recorded.load(std::memory_order_acquire)) self->PublishRecorded();
+            if (self->recorded.exchange(false, std::memory_order_acq_rel)) self->PublishRecorded();
         });
     }
 
@@ -757,7 +758,9 @@ inline RecordingContext MakeOwnedRecordingContext(rhi::CommandList list, const O
 // One owned recording's commands into the context's list: its heaps, its entry, per-pass and exit barriers, its passes and its
 // queries' resolve. Not the list's begin or end: RecordPreparedRhiExecutionBatch's for its own lists; a late batch of an external
 // epoch records into the host's list (PreparedRhiExecutionBatch::RecordDeferred), which the host ends.
-inline void RecordOwnedRecordingCommands(RecordingContext& context, const OwnedRecordingList& recording, rhi::Queue queue, bool replayable) {
+// a_again: a replayable recording's passes recorded again (PreparedPass::RecordAgain), a late batch of a kept recording.
+inline void RecordOwnedRecordingCommands(RecordingContext& context, const OwnedRecordingList& recording, rhi::Queue queue, bool replayable,
+    bool a_again = false) {
     struct TracyGpuZoneScope {
         rhi::CommandList& commands;
         bool open = false;
@@ -868,7 +871,8 @@ inline void RecordOwnedRecordingCommands(RecordingContext& context, const OwnedR
             // The pass may time parts of itself (BeginRecordingSubRange) under its own range, with the recording's queries.
             runtime::RecordingRanges subRanges{ ownedQueries ? statistics->service.get() : nullptr, ownedQueries, &context.Commands() };
             runtime::RecordingRangeScope subRangeScope(ownedQueries ? &subRanges : nullptr);
-            recording.passes[passIndex].Record(context);
+            if (a_again) recording.passes[passIndex].RecordAgain(context);
+            else recording.passes[passIndex].Record(context);
         }
         if (ranges) ranges->end(context.Commands(), queue);
         if (statisticsIndex >= 0) {
@@ -907,16 +911,29 @@ inline PreparedRhiExecutionBatch::PreparedRhiExecutionBatch(uint32_t queueSlot, 
       m_deferred(std::make_shared<OwnedRecordingList>(std::move(deferred))) {
     if (!m_queue || !m_lease || m_deferred->passes.empty())
         throw std::invalid_argument("Incomplete deferred RHI packet");
-    m_submissionEffects = m_deferred->passes;
+    // A kept recording's late batch (its passes replayable): recorded by every execution that takes the recording, no effects to commit.
+    m_replayable = m_deferred->replayable
+        && std::all_of(m_deferred->passes.begin(), m_deferred->passes.end(), [](const PreparedPass& pass) { return pass.IsReplayable(); });
+    if (!m_replayable) m_submissionEffects = m_deferred->passes;
 }
 
 inline void PreparedRhiExecutionBatch::RecordDeferred(rhi::CommandList a_list) const {
-    if (!m_deferred || m_deferredRecorded.exchange(true)) throw std::logic_error("A deferred packet is recorded once");
+    if (!m_deferred) throw std::logic_error("Not a deferred packet");
+    const bool again = m_deferredRecorded.exchange(true);
+    if (again && !m_replayable) throw std::logic_error("A deferred packet is recorded once, unless it is replayable");
+    // A kept recording's own queries start over in each list that records it (the last execution's were read at its completion).
+    if (auto* statistics = m_deferred->statistics.get(); again && statistics && statistics->queries.owned) {
+        auto& owned = *statistics->queries.owned;
+        owned.entries.clear();
+        owned.open.clear();
+        owned.resolved = false;
+        owned.overflow = 0;
+    }
     auto context = MakeOwnedRecordingContext(a_list, *m_deferred);
-    RecordOwnedRecordingCommands(context, *m_deferred, m_queue, false);
+    RecordOwnedRecordingCommands(context, *m_deferred, m_queue, false, again);
     // Its queries are in a_list now: its frame slot's completion publishes them (OwnedRecordingStatistics::atCompletion).
     if (m_deferred->statistics) m_deferred->statistics->recorded.store(true, std::memory_order_release);
-    if (!CommitEffectsSubmitted(m_deferredSignal)) throw std::logic_error("A deferred packet's passes could not be committed as submitted");
+    if (!m_replayable && !CommitEffectsSubmitted(m_deferredSignal)) throw std::logic_error("A deferred packet's passes could not be committed as submitted");
 }
 
 // Called only after admission freezes bindings and barriers. It may run on a

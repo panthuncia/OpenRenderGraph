@@ -3518,14 +3518,20 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 			ticketTarget->segments.push_back({std::move(admission), nullptr, segment.legacyBindings, defaultResourceHeap, defaultSamplerHeap});
 			return nullptr;
 		}
-		// An external epoch's recording is kept as any other's (its secondaries executed again by each ticket that takes it), but not
-		// one with a late batch: its pass is recorded by each execution, from the invocation it consumes.
-		bool lateBatch = false;
+		// An external epoch's recording is kept as any other's (its secondaries executed again by each ticket that takes it); a late
+		// batch's passes are recorded by each execution, so it is kept only when they are replayable (PreparedPass::RecordAgain: their
+		// invocation recorded again by each).
+		bool lateUnreplayable = false;
+		const auto& structure = *segment.publication->executable->graph->structure;
 		for (const auto& batch : segment.publication->executable->graph->batches)
-			for (const auto pass : batch.passes) lateBatch = lateBatch || segment.publication->executable->graph->structure->passes[pass].recordAtExecution;
+			for (const auto pass : batch.passes) {
+				if (!structure.passes[pass].recordAtExecution) continue;
+				const auto prepared = structure.passes[pass].preparedPassIndex;
+				lateUnreplayable = lateUnreplayable || prepared >= segment.invocations.size() || !segment.invocations[prepared].IsReplayable();
+			}
 		const bool keepable = ticketTarget && m_persistentRecordingReuse && admission.closed && admission.rebound.empty()
 			&& admission.incomingEffects.empty() && !ticketTarget->uncheckable && segments.size() == 1
-			&& ticketTarget->epoch < kKeptRecordingEpochs && state.frameIndex < kKeptRecordingSlots && !(ticketTarget->external && lateBatch);
+			&& ticketTarget->epoch < kKeptRecordingEpochs && state.frameIndex < kKeptRecordingSlots && !(ticketTarget->external && lateUnreplayable);
 		if (keepable && !m_keptRecordings) m_keptRecordings = std::make_unique<std::remove_reference_t<decltype(*m_keptRecordings)>>();
 		if (keepable && !m_persistentTicketHostData) {
 			if (!m_keptRecordings) m_keptRecordings = std::make_unique<std::remove_reference_t<decltype(*m_keptRecordings)>>();
