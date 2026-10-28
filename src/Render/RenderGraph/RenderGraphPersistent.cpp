@@ -3503,6 +3503,14 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 			BT_ZONE_SCOPE("ORG.Persistent.PrepareAdmission");
 			return state.admission->Prepare(segment.publication, queues, segment.waits, {}, segment.rebindings);
 		}();
+		// A segment with no batches (an epoch none of whose passes the graph has, as in the empty bootstrap graph) records and submits
+		// nothing: its admission is abandoned, and a ticket gets no segment for it (an external one an empty execution).
+		if (segment.publication->executable->graph->batches.empty()) {
+			for (const auto& invocation : segment.invocations)
+				if (invocation) invocation.Abandon(AbandonReason::AdmissionFailed);
+			state.admission->Abandon(admission);
+			return nullptr;
+		}
 		// Executed now (not a ticket, which takes its wait when submitted): every batch waits for the frame's values.
 		if (!m_persistentTicketTarget && HasFrameWaitTimeline() && m_frameWaitValue)
 			for (auto& waits : admission.incomingWaits)
@@ -4176,6 +4184,8 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 			}
 		}
 	}
+	// An external ticket without segments (none had batches: ExecutePersistentFrame) executes nothing but its uploads.
+	if (ticket.external && !out.external) out.external = std::make_shared<ExternalEpochExecution>();
 	out.submitted = true;
 	return true;
 }
