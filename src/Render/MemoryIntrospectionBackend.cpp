@@ -45,6 +45,17 @@ public:
             if (auto usage = e.try_get<MemoryStatisticsComponents::ResourceUsage>()) {
                 row.usage = usage->usage;
             }
+            if (auto owner = e.try_get<MemoryStatisticsComponents::ResourceOwner>()) {
+                row.owner = owner->owner;
+            }
+            if (auto pool = e.try_get<MemoryStatisticsComponents::AliasingPool>(); pool && pool->poolID) {
+                row.aliasPoolID = *pool->poolID;
+            }
+            if (auto placed = e.try_get<MemoryStatisticsComponents::PlacedInAliasPool>()) {
+                row.placedInAliasPool = true;
+                row.aliased = true;
+                if (placed->poolID) row.aliasPoolID = placed->poolID;
+            }
             if (auto ident = e.try_get<ResourceIdentifier>()) {
                 row.identifier = ident->name;
             }
@@ -54,7 +65,7 @@ public:
                 row.mipLevels = shape->mipLevels;
                 row.arraySize = shape->arraySize;
                 row.format = shape->format;
-                row.aliased = shape->aliased;
+                row.aliased = row.aliased || shape->aliased;
             }
 
             out.push_back(std::move(row));
@@ -74,6 +85,7 @@ public:
 			std::string usage;
 			std::string name;
 			std::string identifier;
+			std::string owner;
 		};
 		std::unordered_map<std::uint64_t, OwnerMetadata> metadataByOwner;
 		metadataByOwner.reserve(out.size());
@@ -83,6 +95,7 @@ public:
 			if (metadata.usage.empty() && !row.usage.empty()) metadata.usage = row.usage;
 			if (metadata.name.empty() && !row.resourceName.empty()) metadata.name = row.resourceName;
 			if (metadata.identifier.empty() && !row.identifier.empty()) metadata.identifier = row.identifier;
+			if (metadata.owner.empty() && !row.owner.empty()) metadata.owner = row.owner;
 		}
 		for (auto& row : out) {
 			if (row.resourceID == 0) continue;
@@ -92,6 +105,7 @@ public:
 			if (row.usage.empty()) row.usage = metadata.usage;
 			if (row.resourceName.empty()) row.resourceName = metadata.name;
 			if (row.identifier.empty()) row.identifier = metadata.identifier;
+			if (row.owner.empty()) row.owner = metadata.owner;
 		}
     }
 

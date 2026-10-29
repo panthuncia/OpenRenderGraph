@@ -217,6 +217,7 @@ void GpuTextureBacking::initialize(const TextureDescription& desc,
 		if (placement->poolID.has_value()) {
 			allocationBundle.Set<MemoryStatisticsComponents::AliasingPool>({ placement->poolID });
 		}
+		allocationBundle.Set<MemoryStatisticsComponents::PlacedInAliasPool>({ placement->poolID.value_or(0) });
 		trackDesc.attach = allocationBundle;
 
 		const auto result = DeviceManager::GetInstance().CreateAliasingResourceTracked(

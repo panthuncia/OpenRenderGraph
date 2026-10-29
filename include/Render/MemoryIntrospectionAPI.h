@@ -25,6 +25,15 @@ struct ResourceMemoryRecord {
     uint32_t arraySize = 0;
     rhi::Format format = rhi::Format::Unknown;
     bool aliased = false;
+    // Who the memory is for (SetResourceOwner); '/' nests levels.
+    std::string owner;
+    // The aliasing pool the record belongs to: its placements and the pool's own memory. 0 for none.
+    uint64_t aliasPoolID = 0;
+    // Placed in an aliasing pool's memory: the pool's record already counts these bytes.
+    bool placedInAliasPool = false;
+
+    // Whether the bytes add to a total; placements in an aliasing pool would count the pool's memory twice.
+    bool CountsTowardTotal() const { return !placedInAliasPool; }
 };
 
 class IMemorySnapshotProvider {
@@ -50,6 +59,10 @@ inline void SetResourceUsageHint(IHasMemoryMetadata& resource, std::string usage
 
 inline void SetResourceMemoryIdentifier(IHasMemoryMetadata& resource, std::string identifier) {
     resource.SetMemoryIdentifier(std::move(identifier));
+}
+
+inline void SetResourceOwner(IHasMemoryMetadata& resource, std::string owner) {
+    resource.SetMemoryOwner(std::move(owner));
 }
 
 }

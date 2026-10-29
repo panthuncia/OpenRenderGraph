@@ -18,5 +18,11 @@ void IHasMemoryMetadata::SetMemoryIdentifier(std::string identifier) {
     ApplyMetadataComponentBundle(bundle);
 }
 
+void IHasMemoryMetadata::SetMemoryOwner(std::string owner) {
+    EntityComponentBundle bundle;
+    bundle.Set<MemoryStatisticsComponents::ResourceOwner>({ std::move(owner) });
+    ApplyMetadataComponentBundle(bundle);
+}
+
 
 } // namespace org

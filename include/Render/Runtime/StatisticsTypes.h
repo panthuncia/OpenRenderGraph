@@ -35,6 +35,14 @@ struct MemoryBudgetStats {
     uint64_t budgetBytes = 0;
     uint64_t sampleFrameSerial = 0;
     bool valid = false;
+    // ORG's allocator, device-local (local) and host (nonLocal) segments: memory in its blocks, and the part of it
+    // that allocations use. Block bytes past allocation bytes are its slack.
+    uint64_t localBlockBytes = 0;
+    uint64_t localAllocationBytes = 0;
+    uint32_t localBlockCount = 0;
+    uint32_t localAllocationCount = 0;
+    uint64_t nonLocalBlockBytes = 0;
+    uint64_t nonLocalAllocationBytes = 0;
 };
 
 struct OwnedTimestampQueries;

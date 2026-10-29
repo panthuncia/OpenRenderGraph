@@ -63,7 +63,8 @@ namespace ui {
 
         // Dummy data only for a host that passes none (a preview of the widget); a host's empty snapshot or missing frame graph
         // is shown as such, never as made-up rows.
-        if (snapshot && snapshot->categories.empty() && snapshot->resources.empty()) {
+        if (snapshot && snapshot->categories.empty() && snapshot->resources.empty() && snapshot->heaps.empty()
+            && snapshot->reconciliation.empty()) {
             ImGui::TextUnformatted("No tracked allocations.");
             ImGui::End();
             return;
@@ -92,12 +93,33 @@ namespace ui {
             fg = &dummyFG;
         }
 
+        if (snapshot) {
+            PushGroupSample(localMem);
+        }
+
         switch (view_) {
-        case ViewMode::Pie:      DrawPieView(localMem); break;
+        case ViewMode::Pie:
+            if (groupBy_ != GroupBy::Category && !localMem.resources.empty()) {
+                MemorySnapshot grouped;
+                grouped.categories = GroupRows(localMem, groupBy_);
+                grouped.totalBytes = CountedBytes(localMem);
+                DrawPieView(grouped);
+            }
+            else {
+                DrawPieView(localMem);
+            }
+            break;
         case ViewMode::List:     DrawListView(localMem); break;
+        case ViewMode::Heaps:    DrawHeapsView(localMem); break;
+        case ViewMode::Reconciliation: DrawReconciliationView(localMem); break;
         case ViewMode::Timeline:
             timelineMode_ = TimelineMode::RealTime;
-            DrawTimelineView(*fg, localMem);
+            if (rt_.stacked && snapshot && !localMem.resources.empty()) {
+                DrawStackedTimeline();
+            }
+            else {
+                DrawTimelineView(*fg, localMem);
+            }
             break;
         case ViewMode::BatchTimeline:
             timelineMode_ = TimelineMode::FrameGraph;
@@ -117,7 +139,117 @@ namespace ui {
         RadioButtonView("List", &v, static_cast<int>(ViewMode::List));
         RadioButtonView("Timeline", &v, static_cast<int>(ViewMode::Timeline));
         RadioButtonView("Batch Timeline", &v, static_cast<int>(ViewMode::BatchTimeline));
+        RadioButtonView("Heaps", &v, static_cast<int>(ViewMode::Heaps));
+        RadioButtonView("Reconciliation", &v, static_cast<int>(ViewMode::Reconciliation));
         view_ = static_cast<ViewMode>(v);
+
+        if (view_ == ViewMode::Pie || view_ == ViewMode::Timeline) {
+            static const char* groupNames[] = { "Category", "Owner", "Source", "Heap", "Type" };
+            int g = static_cast<int>(groupBy_);
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted("Group by:");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(ImGui::GetFontSize() * 9.0f);
+            if (ImGui::Combo("##mem_group_by", &g, groupNames, IM_ARRAYSIZE(groupNames))) {
+                groupBy_ = static_cast<GroupBy>(g);
+            }
+            if (view_ == ViewMode::Timeline) {
+                ImGui::SameLine();
+                ImGui::Checkbox("Stacked", &rt_.stacked);
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(ImGui::GetFontSize() * 6.0f);
+                ImGui::SliderInt("Window (s)", &rt_.maxSeconds, 5, 120);
+            }
+        }
+    }
+
+    // ----------------- Grouping -----------------
+
+    uint64_t MemoryIntrospectionWidget::CountedBytes(const MemorySnapshot& s) {
+        uint64_t sum = 0;
+        for (const auto& r : s.resources) {
+            if (!(r.flags & MemoryRowFlag_NotCounted)) {
+                sum += r.bytes;
+            }
+        }
+        return sum;
+    }
+
+    std::vector<MemoryCategorySlice> MemoryIntrospectionWidget::GroupRows(const MemorySnapshot& s, GroupBy a_groupBy) {
+        if (a_groupBy == GroupBy::Category) {
+            return s.categories;
+        }
+
+        std::unordered_map<std::string, uint64_t> bytes;
+        for (const auto& r : s.resources) {
+            if (r.flags & MemoryRowFlag_NotCounted) {
+                continue;
+            }
+            const std::string* key = nullptr;
+            switch (a_groupBy) {
+            case GroupBy::Owner:  key = &r.owner; break;
+            case GroupBy::Source: key = &r.source; break;
+            case GroupBy::Heap:   key = &r.heap; break;
+            default:              key = &r.type; break;
+            }
+            bytes[key->empty() ? std::string("Unspecified") : *key] += r.bytes;
+        }
+
+        std::vector<MemoryCategorySlice> out;
+        out.reserve(bytes.size());
+        for (auto& [label, b] : bytes) {
+            out.push_back({ label, b });
+        }
+        std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) { return a.bytes > b.bytes; });
+        return out;
+    }
+
+    void MemoryIntrospectionWidget::PushGroupSample(const MemorySnapshot& s) {
+        if (s.resources.empty() && s.categories.empty()) {
+            return;
+        }
+        if (groupSamplesBy_ != groupBy_) {
+            groupSamples_.clear();
+            groupSamplesBy_ = groupBy_;
+        }
+
+        const double now = ImGui::GetTime();
+        const double window = static_cast<double>(std::max(1, rt_.maxSeconds));
+        const double minDt = window / 300.0;
+
+        GroupSample sample;
+        sample.time = now;
+        // The top level of each group ("CS/Feature" -> "CS") keeps the stack readable.
+        for (auto& slice : GroupRows(s, groupBy_)) {
+            std::string label = slice.label;
+            if (const auto slash = label.find('/'); slash != std::string::npos && groupBy_ != GroupBy::Category) {
+                label.resize(slash);
+            }
+            auto it = std::find_if(sample.groups.begin(), sample.groups.end(), [&](const auto& g) { return g.label == label; });
+            if (it == sample.groups.end()) {
+                sample.groups.push_back({ std::move(label), slice.bytes });
+            }
+            else {
+                it->bytes += slice.bytes;
+            }
+        }
+        for (const auto& heap : s.heaps) {
+            if (heap.deviceLocal) {
+                sample.usageBytes += heap.usageBytes;
+                sample.budgetBytes += heap.budgetBytes;
+            }
+        }
+
+        if (!groupSamples_.empty() && now - groupSamples_.back().time < minDt) {
+            groupSamples_.back() = std::move(sample);
+        }
+        else {
+            groupSamples_.push_back(std::move(sample));
+        }
+
+        const auto stale = std::find_if(groupSamples_.begin(), groupSamples_.end(),
+            [&](const GroupSample& g) { return g.time >= now - window; });
+        groupSamples_.erase(groupSamples_.begin(), stale);
     }
 
     // ----------------- Dummy data -----------------
@@ -131,11 +263,7 @@ namespace ui {
             return sum;
         }
         if (!s.resources.empty()) {
-            uint64_t sum = 0;
-            for (auto& r : s.resources) {
-                sum += r.bytes;
-            }
-            return sum;
+            return CountedBytes(s);
         }
         return 0;
     }
@@ -658,84 +786,262 @@ namespace ui {
         }
     }
 
+    namespace {
+        static std::string FlagsText(uint32_t flags) {
+            std::string out;
+            auto add = [&](uint32_t bit, const char* text) {
+                if (flags & bit) {
+                    if (!out.empty()) {
+                        out += ", ";
+                    }
+                    out += text;
+                }
+            };
+            add(MemoryRowFlag_Aliased, "aliased");
+            add(MemoryRowFlag_NotCounted, "not counted");
+            add(MemoryRowFlag_Imported, "imported");
+            add(MemoryRowFlag_Internal, "internal");
+            add(MemoryRowFlag_Unattributed, "unattributed");
+            return out;
+        }
+
+        enum ListColumn : int { ColName, ColOwner, ColType, ColSource, ColHeap, ColSize, ColPct, ColFlags, ColUid, ColCallsite, ColCount };
+    }
+
     void MemoryIntrospectionWidget::DrawListView(const MemorySnapshot& s) {
         if (s.resources.empty()) {
             ImGui::TextUnformatted("No per-resource data.");
             return;
         }
 
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 18.0f);
+        list_.filter.Draw("Filter (name, owner, type, source, call site; '-' excludes)");
+
         std::vector<const MemoryResourceRow*> rows;
         rows.reserve(s.resources.size());
+        uint64_t filteredBytes = 0;
         for (auto& r : s.resources) {
             if (list_.filter.IsActive()) {
-                if (!list_.filter.PassFilter(r.name.c_str()) && !list_.filter.PassFilter(r.type.c_str())) {
+                if (!list_.filter.PassFilter(r.name.c_str()) && !list_.filter.PassFilter(r.type.c_str())
+                    && !list_.filter.PassFilter(r.owner.c_str()) && !list_.filter.PassFilter(r.source.c_str())
+                    && !list_.filter.PassFilter(r.callsite.c_str())) {
                     continue;
                 }
             }
             rows.push_back(&r);
-        }
-
-        auto cmpSize = [&](auto* a, auto* b) { return a->bytes < b->bytes; };
-        auto cmpName = [&](auto* a, auto* b) { return a->name < b->name; };
-        auto cmpType = [&](auto* a, auto* b) { return a->type < b->type; };
-
-        switch (list_.sortKey) {
-        case 0: std::sort(rows.begin(), rows.end(), cmpSize); break;
-        case 1: std::sort(rows.begin(), rows.end(), cmpName); break;
-        case 2: std::sort(rows.begin(), rows.end(), cmpType); break;
-        default: break;
-        }
-        if (list_.descending) {
-            std::reverse(rows.begin(), rows.end());
+            if (!(r.flags & MemoryRowFlag_NotCounted)) {
+                filteredBytes += r.bytes;
+            }
         }
 
         const uint64_t total = (s.totalBytes != 0) ? s.totalBytes : ComputeTotalBytes(s);
-        ImGui::Text("Resources: %d   Total: %s", static_cast<int>(rows.size()), FormatBytes(total).c_str());
+        ImGui::Text("Resources: %d   Shown: %s of %s", static_cast<int>(rows.size()), FormatBytes(filteredBytes).c_str(),
+            FormatBytes(total).c_str());
 
         ImGuiTableFlags flags =
-            ImGuiTableFlags_BordersV | ImGuiTableFlags_BordersOuterH |
-            ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY;
+            ImGuiTableFlags_BordersV | ImGuiTableFlags_BordersOuterH | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable
+            | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Sortable | ImGuiTableFlags_Hideable | ImGuiTableFlags_Reorderable;
 
         const float tableH = ImGui::GetContentRegionAvail().y;
-        if (ImGui::BeginTable("##mem_list", 5, flags, ImVec2(-1.0f, tableH))) {
-            ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch, 0.45f);
-            ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthStretch, 0.20f);
-            ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 120.0f);
-            ImGui::TableSetupColumn("%", ImGuiTableColumnFlags_WidthFixed, 70.0f);
-            ImGui::TableSetupColumn("UID", ImGuiTableColumnFlags_WidthFixed, 110.0f);
+        if (ImGui::BeginTable("##mem_list", ColCount, flags, ImVec2(-1.0f, tableH))) {
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch, 0.40f, ColName);
+            ImGui::TableSetupColumn("Owner", ImGuiTableColumnFlags_WidthStretch, 0.25f, ColOwner);
+            ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthStretch, 0.20f, ColType);
+            ImGui::TableSetupColumn("Source", ImGuiTableColumnFlags_WidthFixed, 90.0f, ColSource);
+            ImGui::TableSetupColumn("Heap", ImGuiTableColumnFlags_WidthFixed, 60.0f, ColHeap);
+            ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_DefaultSort
+                | ImGuiTableColumnFlags_PreferSortDescending, 100.0f, ColSize);
+            ImGui::TableSetupColumn("%", ImGuiTableColumnFlags_WidthFixed, 55.0f, ColPct);
+            ImGui::TableSetupColumn("Flags", ImGuiTableColumnFlags_WidthFixed, 110.0f, ColFlags);
+            ImGui::TableSetupColumn("UID", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_DefaultHide, 110.0f, ColUid);
+            ImGui::TableSetupColumn("Call site", ImGuiTableColumnFlags_WidthStretch, 0.30f, ColCallsite);
             ImGui::TableHeadersRow();
 
+            // Percent sorts as size does; flags by their bits.
+            if (const ImGuiTableSortSpecs* specs = ImGui::TableGetSortSpecs(); specs && specs->SpecsCount > 0) {
+                const ImGuiTableColumnSortSpecs spec = specs->Specs[0];
+                const bool descending = spec.SortDirection == ImGuiSortDirection_Descending;
+                auto key = [&](const MemoryResourceRow* r) -> const std::string& {
+                    switch (spec.ColumnUserID) {
+                    case ColOwner:    return r->owner;
+                    case ColType:     return r->type;
+                    case ColSource:   return r->source;
+                    case ColHeap:     return r->heap;
+                    case ColCallsite: return r->callsite;
+                    default:          return r->name;
+                    }
+                };
+                std::stable_sort(rows.begin(), rows.end(), [&](const MemoryResourceRow* a, const MemoryResourceRow* b) {
+                    switch (spec.ColumnUserID) {
+                    case ColSize:
+                    case ColPct:   return descending ? a->bytes > b->bytes : a->bytes < b->bytes;
+                    case ColUid:   return descending ? a->uid > b->uid : a->uid < b->uid;
+                    case ColFlags: return descending ? a->flags > b->flags : a->flags < b->flags;
+                    default:       return descending ? key(a) > key(b) : key(a) < key(b);
+                    }
+                });
+            }
+
             const int pageSize = std::max(1, list_.pageSize);
-            const int count = static_cast<int>(rows.size());
-            int shown = 0;
+            const int count = std::min(static_cast<int>(rows.size()), pageSize);
 
             ImGuiListClipper clipper;
             clipper.Begin(count);
             while (clipper.Step()) {
                 for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
-                    if (shown++ > pageSize) {
-                        break;
-                    }
-
                     const MemoryResourceRow& r = *rows[i];
-                    const double pct = (total == 0) ? 0.0 : (100.0 * static_cast<double>(r.bytes) / static_cast<double>(total));
+                    const bool counted = !(r.flags & MemoryRowFlag_NotCounted);
+                    const double pct = (total == 0 || !counted) ? 0.0 : (100.0 * static_cast<double>(r.bytes) / static_cast<double>(total));
 
                     ImGui::TableNextRow();
+                    if (!counted) {
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+                    }
 
-                    ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(r.name.c_str());
-                    ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(r.type.c_str());
-                    ImGui::TableSetColumnIndex(2); ImGui::TextUnformatted(FormatBytes(r.bytes).c_str());
-                    ImGui::TableSetColumnIndex(3); ImGui::Text("%.2f", pct);
-                    ImGui::TableSetColumnIndex(4); ImGui::Text("%llu", static_cast<unsigned long long>(r.uid));
+                    ImGui::TableSetColumnIndex(ColName); ImGui::TextUnformatted(r.name.c_str());
+                    ImGui::TableSetColumnIndex(ColOwner); ImGui::TextUnformatted(r.owner.c_str());
+                    ImGui::TableSetColumnIndex(ColType); ImGui::TextUnformatted(r.type.c_str());
+                    ImGui::TableSetColumnIndex(ColSource); ImGui::TextUnformatted(r.source.c_str());
+                    ImGui::TableSetColumnIndex(ColHeap); ImGui::TextUnformatted(r.heap.c_str());
+                    ImGui::TableSetColumnIndex(ColSize); ImGui::TextUnformatted(FormatBytes(r.bytes).c_str());
+                    ImGui::TableSetColumnIndex(ColPct); ImGui::Text("%.2f", pct);
+                    ImGui::TableSetColumnIndex(ColFlags); ImGui::TextUnformatted(FlagsText(r.flags).c_str());
+                    ImGui::TableSetColumnIndex(ColUid); ImGui::Text("%llu", static_cast<unsigned long long>(r.uid));
+                    ImGui::TableSetColumnIndex(ColCallsite); ImGui::TextUnformatted(r.callsite.c_str());
+
+                    if (!counted) {
+                        ImGui::PopStyleColor();
+                    }
                 }
             }
 
-            if (shown > pageSize) {
+            if (static_cast<int>(rows.size()) > pageSize) {
                 ImGui::TableNextRow();
-                ImGui::TableSetColumnIndex(0);
-                ImGui::TextDisabled("Showing first %d rows (increase Page size to see more).", pageSize);
+                ImGui::TableSetColumnIndex(ColName);
+                ImGui::TextDisabled("Showing the first %d of %d rows; narrow the filter to see the rest.", pageSize,
+                    static_cast<int>(rows.size()));
             }
 
+            ImGui::EndTable();
+        }
+    }
+
+    // ----------------- Heaps and reconciliation -----------------
+
+    void MemoryIntrospectionWidget::DrawHeapsView(const MemorySnapshot& s) {
+        if (s.heaps.empty()) {
+            ImGui::TextUnformatted("The host reports no heaps.");
+            return;
+        }
+
+        const ImU32 attributedCol = IM_COL32(90, 170, 255, 230);
+        const ImU32 residualCol = IM_COL32(255, 200, 90, 230);
+        const ImU32 budgetCol = IM_COL32(255, 90, 90, 255);
+
+        for (const auto& heap : s.heaps) {
+            ImGui::PushID(heap.label.c_str());
+            const uint64_t residual = heap.usageBytes > heap.attributedBytes ? heap.usageBytes - heap.attributedBytes : 0;
+            ImGui::Text("%s%s", heap.label.c_str(), heap.deviceLocal ? "" : " (host)");
+            ImGui::SameLine();
+            ImGui::TextDisabled("usage %s, budget %s, attributed %s, unattributed %s", FormatBytes(heap.usageBytes).c_str(),
+                FormatBytes(heap.budgetBytes).c_str(), FormatBytes(heap.attributedBytes).c_str(), FormatBytes(residual).c_str());
+
+            // One bar on the scale of max(usage, budget): attributed, then the rest of usage, and the budget as a mark.
+            const double scale = static_cast<double>(std::max<uint64_t>({ heap.usageBytes, heap.budgetBytes, heap.attributedBytes, 1 }));
+            const float width = std::max(1.0f, ImGui::GetContentRegionAvail().x);
+            const float height = ImGui::GetFrameHeight();
+            const ImVec2 p0 = ImGui::GetCursorScreenPos();
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            dl->AddRectFilled(p0, ImVec2(p0.x + width, p0.y + height), ImGui::GetColorU32(ImGuiCol_FrameBg), 3.0f);
+            const float xAttributed = p0.x + width * static_cast<float>(static_cast<double>(std::min(heap.attributedBytes, heap.usageBytes)) / scale);
+            const float xUsage = p0.x + width * static_cast<float>(static_cast<double>(heap.usageBytes) / scale);
+            dl->AddRectFilled(p0, ImVec2(xAttributed, p0.y + height), attributedCol, 3.0f);
+            if (xUsage > xAttributed) {
+                dl->AddRectFilled(ImVec2(xAttributed, p0.y), ImVec2(xUsage, p0.y + height), residualCol);
+            }
+            if (heap.budgetBytes) {
+                const float xBudget = p0.x + width * static_cast<float>(static_cast<double>(heap.budgetBytes) / scale);
+                dl->AddLine(ImVec2(xBudget, p0.y - 2.0f), ImVec2(xBudget, p0.y + height + 2.0f), budgetCol, 2.0f);
+            }
+            ImGui::Dummy(ImVec2(width, height));
+            if (ImGui::IsItemHovered()) {
+                ImGui::BeginTooltip();
+                ImGui::Text("Attributed: %s", FormatBytes(heap.attributedBytes).c_str());
+                ImGui::Text("Unattributed: %s", FormatBytes(residual).c_str());
+                if (heap.budgetBytes) {
+                    ImGui::Text("Usage: %.1f%% of budget", 100.0 * static_cast<double>(heap.usageBytes) / static_cast<double>(heap.budgetBytes));
+                }
+                ImGui::EndTooltip();
+            }
+            ImGui::Spacing();
+            ImGui::PopID();
+        }
+
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(attributedCol), "Attributed");
+        ImGui::SameLine();
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(residualCol), "Unattributed");
+        ImGui::SameLine();
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(budgetCol), "| Budget");
+    }
+
+    void MemoryIntrospectionWidget::DrawReconciliationView(const MemorySnapshot& s) {
+        if (s.reconciliation.empty()) {
+            ImGui::TextUnformatted("The host provides no reconciliation.");
+            return;
+        }
+
+        auto kindColor = [](MemoryReconciliationKind kind) {
+            switch (kind) {
+            case MemoryReconciliationKind::Total:    return ImGui::GetStyleColorVec4(ImGuiCol_Text);
+            case MemoryReconciliationKind::Residual: return ImVec4(1.0f, 0.78f, 0.35f, 1.0f);
+            case MemoryReconciliationKind::Opaque:   return ImVec4(1.0f, 0.45f, 0.45f, 1.0f);
+            default:                                 return ImVec4(0.55f, 0.8f, 1.0f, 1.0f);
+            }
+        };
+
+        const ImGuiTableFlags flags = ImGuiTableFlags_BordersV | ImGuiTableFlags_BordersOuterH | ImGuiTableFlags_RowBg
+            | ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY;
+        if (ImGui::BeginTable("##mem_reconciliation", 4, flags, ImVec2(-1.0f, ImGui::GetContentRegionAvail().y))) {
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableSetupColumn("Breakdown", ImGuiTableColumnFlags_WidthStretch, 0.5f);
+            ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 100.0f);
+            ImGui::TableSetupColumn("% of parent", ImGuiTableColumnFlags_WidthFixed, 160.0f);
+            ImGui::TableSetupColumn("Note", ImGuiTableColumnFlags_WidthStretch, 0.5f);
+            ImGui::TableHeadersRow();
+
+            // A row's parent is the nearest row above it one depth shallower.
+            std::vector<uint64_t> parentBytes;
+            for (const auto& row : s.reconciliation) {
+                const size_t depth = static_cast<size_t>(std::max(0, row.depth));
+                parentBytes.resize(depth + 1);
+                parentBytes[depth] = row.bytes;
+                const uint64_t parent = depth > 0 ? parentBytes[depth - 1] : 0;
+                const float indent = static_cast<float>(depth) * ImGui::GetStyle().IndentSpacing;
+
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                if (indent > 0.0f) {
+                    ImGui::Indent(indent);
+                }
+                ImGui::TextColored(kindColor(row.kind), "%s", row.label.c_str());
+                if (indent > 0.0f) {
+                    ImGui::Unindent(indent);
+                }
+                ImGui::TableSetColumnIndex(1);
+                ImGui::TextUnformatted(FormatBytes(row.bytes).c_str());
+                ImGui::TableSetColumnIndex(2);
+                if (parent) {
+                    const float fraction = static_cast<float>(static_cast<double>(row.bytes) / static_cast<double>(parent));
+                    char overlay[32];
+                    std::snprintf(overlay, sizeof(overlay), "%.1f%%", 100.0 * fraction);
+                    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, kindColor(row.kind));
+                    ImGui::ProgressBar(std::min(fraction, 1.0f), ImVec2(-1.0f, 0.0f), overlay);
+                    ImGui::PopStyleColor();
+                }
+                ImGui::TableSetColumnIndex(3);
+                ImGui::TextWrapped("%s", row.note.c_str());
+            }
             ImGui::EndTable();
         }
     }
@@ -872,6 +1178,83 @@ namespace ui {
         }
     }
 
+
+    // ----------------- Stacked real-time timeline -----------------
+
+    void MemoryIntrospectionWidget::DrawStackedTimeline() {
+        if (groupSamples_.size() < 2) {
+            ImGui::TextUnformatted("Collecting samples...");
+            return;
+        }
+
+        // The groups largest in the latest sample get a band each; the rest are summed into "Other".
+        std::vector<std::string> bands;
+        {
+            auto latest = groupSamples_.back().groups;
+            std::sort(latest.begin(), latest.end(), [](const auto& a, const auto& b) { return a.bytes > b.bytes; });
+            for (const auto& g : latest) {
+                if (static_cast<int>(bands.size()) >= std::max(1, rt_.maxGroups)) {
+                    break;
+                }
+                bands.push_back(g.label);
+            }
+        }
+        const size_t bandCount = bands.size() + 1;  // + "Other"
+        const size_t n = groupSamples_.size();
+
+        std::vector<double> xs(n);
+        std::vector<std::vector<double>> cumulative(bandCount + 1, std::vector<double>(n, 0.0));
+        std::vector<double> usage(n), budget(n);
+        double maxBytes = 1.0;
+        bool hasHeaps = false;
+        for (size_t i = 0; i < n; ++i) {
+            const auto& sample = groupSamples_[i];
+            xs[i] = sample.time - groupSamples_.back().time;
+            std::vector<double> perBand(bandCount, 0.0);
+            for (const auto& g : sample.groups) {
+                const auto it = std::find(bands.begin(), bands.end(), g.label);
+                perBand[it == bands.end() ? bands.size() : static_cast<size_t>(it - bands.begin())] += static_cast<double>(g.bytes);
+            }
+            for (size_t b = 0; b < bandCount; ++b) {
+                cumulative[b + 1][i] = cumulative[b][i] + perBand[b];
+            }
+            usage[i] = static_cast<double>(sample.usageBytes);
+            budget[i] = static_cast<double>(sample.budgetBytes);
+            hasHeaps = hasHeaps || sample.usageBytes != 0;
+            maxBytes = std::max({ maxBytes, cumulative[bandCount][i], usage[i], budget[i] });
+        }
+
+        const ByteUnit unit = ChooseUnitForRange(maxBytes);
+        const double div = UnitDiv(unit);
+        for (auto& series : cumulative) {
+            for (auto& v : series) {
+                v /= div;
+            }
+        }
+        for (size_t i = 0; i < n; ++i) {
+            usage[i] /= div;
+            budget[i] /= div;
+        }
+
+        char yLabel[32];
+        std::snprintf(yLabel, sizeof(yLabel), "Bytes (%s)", UnitLabel(unit));
+        if (ImPlot::BeginPlot("##MemoryTimelineStacked", ImVec2(-1.0f, -1.0f), ImPlotFlags_NoTitle)) {
+            ImPlot::SetupAxes("Time (s)", yLabel, ImPlotAxisFlags_None, ImPlotAxisFlags_None);
+            ImPlot::SetupAxisLimits(ImAxis_X1, -static_cast<double>(rt_.maxSeconds), 0.0, ImGuiCond_Always);
+            ImPlot::SetupAxisLimits(ImAxis_Y1, 0.0, maxBytes / div * 1.08, ImGuiCond_Always);
+
+            const int count = static_cast<int>(n);
+            for (size_t b = 0; b < bandCount; ++b) {
+                const char* label = b < bands.size() ? bands[b].c_str() : "Other";
+                ImPlot::PlotShaded(label, xs.data(), cumulative[b].data(), cumulative[b + 1].data(), count);
+            }
+            if (hasHeaps) {
+                ImPlot::PlotLine("Heap usage", xs.data(), usage.data(), count);
+                ImPlot::PlotLine("Budget", xs.data(), budget.data(), count);
+            }
+            ImPlot::EndPlot();
+        }
+    }
 
     // ----------------- Frame-graph timeline rendering -----------------
 

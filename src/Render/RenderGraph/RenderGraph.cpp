@@ -1338,6 +1338,8 @@ void RenderGraph::WriteVramUsageDebugDump(uint8_t frameIndex) const
 		uint64_t totalBytes = 0;
 
 		for (const auto& record : memoryRecords) {
+			// Placements in an aliasing pool are in the pool's own record.
+			if (!record.CountsTowardTotal()) continue;
 			totalBytes += record.bytes;
 			const char* usage = record.usage.empty() ? "Unspecified" : record.usage.c_str();
 			std::string categoryLabel = std::string(majorCategory(record.resourceType)) + "/" + usage;

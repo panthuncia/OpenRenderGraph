@@ -56,6 +56,9 @@ GpuBufferBacking::GpuBufferBacking(
     if (aliasPlacement && aliasPlacement->poolID.has_value()) {
         allocationBundle.Set<MemoryStatisticsComponents::AliasingPool>({ aliasPlacement->poolID });
     }
+    if (aliasPlacement) {
+        allocationBundle.Set<MemoryStatisticsComponents::PlacedInAliasPool>({ aliasPlacement->poolID.value_or(0) });
+    }
     trackDesc.attach = allocationBundle;
 
     if (aliasPlacement) {

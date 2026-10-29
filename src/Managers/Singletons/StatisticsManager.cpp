@@ -135,9 +135,16 @@ void StatisticsManager::BeginFrame() {
     memoryBudgetStats.sampleFrameSerial = m_frameSerial;
     if (auto* allocator = DeviceManager::GetInstance().GetAllocator()) {
         rhi::ma::Budget localBudget{};
-        allocator->GetBudget(&localBudget, nullptr);
+        rhi::ma::Budget nonLocalBudget{};
+        allocator->GetBudget(&localBudget, &nonLocalBudget);
         memoryBudgetStats.usageBytes = localBudget.usageBytes;
         memoryBudgetStats.budgetBytes = localBudget.budgetBytes;
+        memoryBudgetStats.localBlockBytes = localBudget.stats.blockBytes;
+        memoryBudgetStats.localAllocationBytes = localBudget.stats.allocationBytes;
+        memoryBudgetStats.localBlockCount = localBudget.stats.blockCount;
+        memoryBudgetStats.localAllocationCount = localBudget.stats.allocationCount;
+        memoryBudgetStats.nonLocalBlockBytes = nonLocalBudget.stats.blockBytes;
+        memoryBudgetStats.nonLocalAllocationBytes = nonLocalBudget.stats.allocationBytes;
         memoryBudgetStats.valid = true;
         LogMemoryIntrospectionAccounting(m_frameSerial, localBudget);
     }
