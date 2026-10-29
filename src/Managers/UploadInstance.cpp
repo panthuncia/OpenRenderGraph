@@ -154,6 +154,7 @@ UploadInstance::UploadPagePtr UploadInstance::CreatePage(size_t size, bool dedic
 	page->dedicated = dedicated;
 	page->index = m_nextPageIndex++;
 	page->buffer = Buffer::CreateShared(rhi::HeapType::Upload, page->capacity, false);
+	page->buffer->SetName(m_debugName + " page");
 	{
 		std::lock_guard lock(m_pageLifetimeTraceMutex);
 		m_pageLifetimeTraces.push_back({ page->buffer, page->capacity, page->index, dedicated });
