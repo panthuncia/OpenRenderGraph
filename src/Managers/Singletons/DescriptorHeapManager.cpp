@@ -910,6 +910,24 @@ rhi::DescriptorSlot DescriptorHeapManager::ResolveDescriptorSlot(BackendInstance
 		: rhi::DescriptorSlot{};
 }
 
+rhi::DescriptorSlot DescriptorHeapManager::TranslateDescriptorSlot(rhi::DescriptorSlot slot,
+	BackendInstanceId backendInstance) const {
+	if (backendInstance == BackendInstanceId::Primary || !slot.heap.valid()) return slot;
+	const auto* primary = FindBackendHeaps(BackendInstanceId::Primary);
+	const auto* target = FindBackendHeaps(backendInstance);
+	if (!primary || !target) return slot;
+	const std::pair<const std::shared_ptr<DescriptorHeap>*, const std::shared_ptr<DescriptorHeap>*> kinds[] = {
+		{&primary->cbvSrvUav, &target->cbvSrvUav}, {&primary->sampler, &target->sampler}, {&primary->rtv, &target->rtv},
+		{&primary->dsv, &target->dsv}, {&primary->nonShaderVisible, &target->nonShaderVisible}};
+	for (const auto& [from, to] : kinds) {
+		if (!*from || !*to || !(*from)->GetHeap() || !(*to)->GetHeap()) continue;
+		const auto handle = (*from)->GetHeap().GetHandle();
+		if (handle.index == slot.heap.index && handle.generation == slot.heap.generation)
+			return {(*to)->GetHeap().GetHandle(), slot.index};
+	}
+	return slot;
+}
+
 UINT DescriptorHeapManager::CreateIndexedSampler(const rhi::SamplerDesc& samplerDesc) {
     std::scoped_lock lock(m_descriptorMutationMutex);
 

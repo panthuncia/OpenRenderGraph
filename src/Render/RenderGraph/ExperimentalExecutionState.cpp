@@ -157,6 +157,21 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
     }
     uint64_t entrySteps = 0, intraBatchSteps = 0, crossQueueSteps = 0;
     std::vector<rhi::ResourceHandle> authoritativeSeeded;
+    // Multi-device resources: a queue's barriers name its device's representation, and a handoff between devices is an
+    // external ownership transfer rather than a queue-family one.
+    const auto deviceOfQueue = [&](uint32_t queue) -> uint32_t {
+        return queue < graph.structure->queues.size() ? graph.structure->queues[queue].backendInstance : 0u;
+    };
+    const auto handleOn = [&](const PreparedBackingState& captured, uint32_t queue) {
+        const auto device = deviceOfQueue(queue);
+        return device < captured.deviceHandles.size() && captured.deviceHandles[device].valid()
+            ? captured.deviceHandles[device] : captured.resource;
+    };
+    const auto toExternal = [](auto& barrier, rhi::QueueOwnership direction) {
+        using External = std::remove_cvref_t<decltype(barrier.externalOwnership)>;
+        barrier.queueOwnership = rhi::QueueOwnership::None;
+        barrier.externalOwnership = direction == rhi::QueueOwnership::Release ? External::Release : External::Acquire;
+    };
     for (const auto& step : graph.states.steps) {
         if (step.resource >= ordered.size() || step.batch >= result.batches.size())
             throw std::invalid_argument("Invalid symbolic state step");
@@ -186,6 +201,11 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
         ++entrySteps;
         intraBatchSteps += step.previousBatch == step.batch;
         const auto handle = captured.resource;
+        const auto consumerHandle = handleOn(captured, graph.batches[step.batch].queue);
+        const bool multiDevice = !captured.deviceHandles.empty();
+        const bool crossDevice = crossQueue
+            && deviceOfQueue(graph.batches[step.previousBatch].queue) != deviceOfQueue(graph.batches[step.batch].queue);
+        const auto producerHandle = crossQueue ? handleOn(captured, graph.batches[step.previousBatch].queue) : handle;
         const bool boundaryStep = step.previousBatch == UINT32_MAX;
         const bool authoritativeState = boundaryStep && captured.authoritativeIncoming;
         const bool invalidatedState = boundaryStep && wasInvalidated(handle) && !authoritativeState;
@@ -215,7 +235,7 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
             const auto previousQueue = graph.batches[step.previousBatch].queue;
             if (captured.shape.hasLayout) {
                 rhi::TextureBarrier barrier{};
-                barrier.texture = handle;
+                barrier.texture = consumerHandle;
                 barrier.range = {step.range.mip, step.range.mips,
                     step.range.slice, step.range.slices};
                 barrier.beforeAccess = crossQueue ? rhi::ResourceAccessType::Common
@@ -230,6 +250,7 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
                 barrier.discard = barrier.beforeLayout == rhi::ResourceLayout::Undefined;
                 if (crossQueue) {
                     auto release = barrier;
+                    release.texture = producerHandle;
                     release.beforeAccess = static_cast<rhi::ResourceAccessType>(step.before.access);
                     release.afterAccess = rhi::ResourceAccessType::Common;
                     release.beforeLayout = static_cast<rhi::ResourceLayout>(step.before.layout);
@@ -239,9 +260,10 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
                     release.discard = release.beforeLayout == rhi::ResourceLayout::Undefined;
                     release.queueOwnership = rhi::QueueOwnership::Release;
                     release.ownershipPeer = OwnershipPeerForQueue(consumerQueue);
-                    afterProducer->textures.push_back(release);
                     barrier.queueOwnership = rhi::QueueOwnership::Acquire;
                     barrier.ownershipPeer = OwnershipPeerForQueue(previousQueue);
+                    if (crossDevice) { toExternal(release, rhi::QueueOwnership::Release); toExternal(barrier, rhi::QueueOwnership::Acquire); }
+                    afterProducer->textures.push_back(release);
                 }
                 if (NeedsTextureBarrier(barrier)) beforePass.textures.push_back(barrier);
             } else {
@@ -255,15 +277,16 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
                     // Queue-family ownership handoff for exclusive buffers. The RHI
                     // drops the pair on D3D12 and on Vulkan when families match or the
                     // buffer is QueueSharing::Concurrent.
-                    auto release = MakeWholeBufferBarrier(handle, beforeAccess,
+                    auto release = MakeWholeBufferBarrier(producerHandle, beforeAccess,
                         rhi::ResourceAccessType::Common, beforeSync, rhi::ResourceSyncState::All);
                     release.queueOwnership = rhi::QueueOwnership::Release;
                     release.ownershipPeer = OwnershipPeerForQueue(consumerQueue);
-                    afterProducer->buffers.push_back(release);
-                    auto acquire = MakeWholeBufferBarrier(handle, rhi::ResourceAccessType::Common,
+                    auto acquire = MakeWholeBufferBarrier(consumerHandle, rhi::ResourceAccessType::Common,
                         afterAccess, rhi::ResourceSyncState::All, afterSync);
                     acquire.queueOwnership = rhi::QueueOwnership::Acquire;
                     acquire.ownershipPeer = OwnershipPeerForQueue(previousQueue);
+                    if (crossDevice) { toExternal(release, rhi::QueueOwnership::Release); toExternal(acquire, rhi::QueueOwnership::Acquire); }
+                    afterProducer->buffers.push_back(release);
                     beforePass.buffers.push_back(acquire);
                 }
                 if (!fixedHeapState && previousQueue == consumerQueue
@@ -272,7 +295,7 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
                     && afterAccess != rhi::ResourceAccessType::None
                     && afterAccess != rhi::ResourceAccessType::Common
                     && NeedsWholeBufferBarrier(beforeAccess, afterAccess, beforeSync, afterSync))
-                    beforePass.buffers.push_back(MakeWholeBufferBarrier(handle,
+                    beforePass.buffers.push_back(MakeWholeBufferBarrier(consumerHandle,
                         beforeAccess, afterAccess, beforeSync, afterSync));
             }
             output.committedResources.push_back(handle);
@@ -280,6 +303,8 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
             output.committedQueues.push_back(consumerQueue);
             continue;
         }
+        // A multi-device resource enters every execution released to COMMON (see the end of Prepare): its first use acquires it.
+        const bool externalAcquire = multiDevice && useSubmittedState;
         std::optional<CompileResourceState> uniformBefore;
         uint32_t uniformPreviousQueue = UINT32_MAX;
         if (useSubmittedState) {
@@ -315,9 +340,10 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
             const auto consumerQueue = graph.batches[step.batch].queue;
             if (captured.shape.hasLayout) {
                 rhi::TextureBarrier barrier{};
-                barrier.texture = handle;
+                barrier.texture = consumerHandle;
                 barrier.range = {step.range.mip, step.range.mips,
                     step.range.slice, step.range.slices};
+                if (externalAcquire) toExternal(barrier, rhi::QueueOwnership::Acquire);
                 barrier.beforeAccess = static_cast<rhi::ResourceAccessType>(uniformBefore->access);
                 barrier.afterAccess = static_cast<rhi::ResourceAccessType>(step.after.access);
                 barrier.beforeLayout = static_cast<rhi::ResourceLayout>(uniformBefore->layout);
@@ -338,13 +364,18 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
                 const bool copyCompatible = consumerQueue != 2
                     || beforeSync == rhi::ResourceSyncState::None
                     || beforeSync == rhi::ResourceSyncState::Copy;
-                if (!fixedHeapState && copyCompatible && !queueHandoff
+                if (externalAcquire) {
+                    auto acquire = MakeWholeBufferBarrier(consumerHandle, rhi::ResourceAccessType::Common,
+                        afterAccess, rhi::ResourceSyncState::All, afterSync);
+                    toExternal(acquire, rhi::QueueOwnership::Acquire);
+                    beforePass.buffers.push_back(acquire);
+                } else if (!fixedHeapState && copyCompatible && !queueHandoff
                     && beforeAccess != rhi::ResourceAccessType::None
                     && beforeAccess != rhi::ResourceAccessType::Common
                     && afterAccess != rhi::ResourceAccessType::None
                     && afterAccess != rhi::ResourceAccessType::Common
                     && NeedsWholeBufferBarrier(beforeAccess, afterAccess, beforeSync, afterSync))
-                    beforePass.buffers.push_back(MakeWholeBufferBarrier(handle,
+                    beforePass.buffers.push_back(MakeWholeBufferBarrier(consumerHandle,
                         beforeAccess, afterAccess, beforeSync, afterSync));
             }
             output.committedResources.push_back(handle);
@@ -379,7 +410,7 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
                 && previousQueue != consumerQueue;
             if (captured.shape.hasLayout) {
                 rhi::TextureBarrier barrier{};
-                barrier.texture = handle;
+                barrier.texture = consumerHandle;
                 barrier.range = {mip, 1, slice, 1};
                 barrier.beforeAccess = crossQueue ? rhi::ResourceAccessType::Common
                     : static_cast<rhi::ResourceAccessType>(before.access);
@@ -393,6 +424,7 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
                 barrier.discard = barrier.beforeLayout == rhi::ResourceLayout::Undefined;
                 if (crossQueue) {
                     auto release = barrier;
+                    release.texture = producerHandle;
                     release.beforeAccess = static_cast<rhi::ResourceAccessType>(before.access);
                     release.afterAccess = rhi::ResourceAccessType::Common;
                     release.beforeLayout = static_cast<rhi::ResourceLayout>(before.layout);
@@ -402,9 +434,12 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
                     release.discard = release.beforeLayout == rhi::ResourceLayout::Undefined;
                     release.queueOwnership = rhi::QueueOwnership::Release;
                     release.ownershipPeer = OwnershipPeerForQueue(consumerQueue);
-                    afterProducer->textures.push_back(release);
                     barrier.queueOwnership = rhi::QueueOwnership::Acquire;
                     barrier.ownershipPeer = OwnershipPeerForQueue(previousQueue);
+                    if (crossDevice) { toExternal(release, rhi::QueueOwnership::Release); toExternal(barrier, rhi::QueueOwnership::Acquire); }
+                    afterProducer->textures.push_back(release);
+                } else if (externalAcquire) {
+                    toExternal(barrier, rhi::QueueOwnership::Acquire);
                 } else if (submittedQueueHandoff) {
                     // The producer ran in an earlier submission on another queue and
                     // cannot record a release here. Counted so cross-frame exclusive
@@ -437,18 +472,24 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
                 // state; subsequent and cross-queue accesses use the common
                 // helper shared with the synchronous recorder.
                 if (!fixedHeapState && crossQueue) {
-                    auto release = MakeWholeBufferBarrier(handle, beforeAccess,
+                    auto release = MakeWholeBufferBarrier(producerHandle, beforeAccess,
                         rhi::ResourceAccessType::Common, beforeSync, rhi::ResourceSyncState::All);
                     release.queueOwnership = rhi::QueueOwnership::Release;
                     release.ownershipPeer = OwnershipPeerForQueue(graph.batches[step.batch].queue);
-                    afterProducer->buffers.push_back(release);
-                    auto acquire = MakeWholeBufferBarrier(handle, rhi::ResourceAccessType::Common,
+                    auto acquire = MakeWholeBufferBarrier(consumerHandle, rhi::ResourceAccessType::Common,
                         afterAccess, rhi::ResourceSyncState::All, afterSync);
                     acquire.queueOwnership = rhi::QueueOwnership::Acquire;
                     acquire.ownershipPeer = OwnershipPeerForQueue(previousQueue);
+                    if (crossDevice) { toExternal(release, rhi::QueueOwnership::Release); toExternal(acquire, rhi::QueueOwnership::Acquire); }
+                    afterProducer->buffers.push_back(release);
+                    beforePass.buffers.push_back(acquire);
+                } else if (!fixedHeapState && externalAcquire) {
+                    auto acquire = MakeWholeBufferBarrier(consumerHandle, rhi::ResourceAccessType::Common,
+                        afterAccess, rhi::ResourceSyncState::All, afterSync);
+                    toExternal(acquire, rhi::QueueOwnership::Acquire);
                     beforePass.buffers.push_back(acquire);
                 }
-                if (!fixedHeapState
+                if (!fixedHeapState && !externalAcquire
                     && copyQueueCompatibleBefore
                     && !submittedQueueHandoff
                     && beforeAccess != rhi::ResourceAccessType::None
@@ -456,13 +497,64 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
                     && afterAccess != rhi::ResourceAccessType::None
                     && afterAccess != rhi::ResourceAccessType::Common
                     && NeedsWholeBufferBarrier(beforeAccess, afterAccess, beforeSync, afterSync))
-                    beforePass.buffers.push_back(MakeWholeBufferBarrier(handle,
+                    beforePass.buffers.push_back(MakeWholeBufferBarrier(consumerHandle,
                         beforeAccess, afterAccess, beforeSync, afterSync));
             }
         });
         output.committedResources.push_back(handle);
         output.committedStates.push_back({step.range, step.after});
         output.committedQueues.push_back(graph.batches[step.batch].queue);
+    }
+    {
+        // A multi-device resource leaves every execution released to COMMON on the device of its last use, so the next one may
+        // acquire it on any device (the timeline orders the two).
+        // Per resource: the last step of each cell (a texture's mips and slices may leave in different states).
+        std::unordered_map<uint32_t, std::vector<uint32_t>> lastSteps;
+        for (uint32_t index = 0; index < graph.states.steps.size(); ++index) {
+            const auto& step = graph.states.steps[index];
+            const auto& captured = ordered[step.resource];
+            if (captured.deviceHandles.empty() || !captured.resource.valid()) continue;
+            auto& cells = lastSteps[step.resource];
+            if (cells.empty()) cells.assign(size_t{captured.shape.mips} * captured.shape.slices, UINT32_MAX);
+            Visit(captured.shape, step.range, [&](uint32_t mip, uint32_t slice) { cells[CellIndex(captured.shape, mip, slice)] = index; });
+        }
+        const CompileResourceState common{static_cast<uint64_t>(rhi::ResourceAccessType::Common),
+            static_cast<uint64_t>(rhi::ResourceLayout::Common), static_cast<uint64_t>(rhi::ResourceSyncState::All), false};
+        for (const auto& [resource, cells] : lastSteps) {
+            const auto& captured = ordered[resource];
+            for (uint32_t mip = 0; mip < captured.shape.mips; ++mip)
+                for (uint32_t slice = 0; slice < captured.shape.slices; ++slice) {
+                    const auto index = cells[CellIndex(captured.shape, mip, slice)];
+                    if (index == UINT32_MAX) continue;
+                    // A buffer (one cell) or each texture cell, released after its own last use.
+                    const auto& last = graph.states.steps[index];
+                    const auto queue = graph.batches[last.batch].queue;
+                    auto& output = result.batches[last.batch];
+                    auto& after = output.afterPass[graph.positionByPass[last.pass]];
+                    if (captured.shape.hasLayout) {
+                        rhi::TextureBarrier barrier{};
+                        barrier.texture = handleOn(captured, queue);
+                        barrier.range = {mip, 1, slice, 1};
+                        barrier.beforeAccess = static_cast<rhi::ResourceAccessType>(last.after.access);
+                        barrier.afterAccess = rhi::ResourceAccessType::Common;
+                        barrier.beforeLayout = static_cast<rhi::ResourceLayout>(last.after.layout);
+                        barrier.afterLayout = rhi::ResourceLayout::Common;
+                        barrier.beforeSync = static_cast<rhi::ResourceSyncState>(last.after.sync);
+                        barrier.afterSync = rhi::ResourceSyncState::All;
+                        toExternal(barrier, rhi::QueueOwnership::Release);
+                        after.textures.push_back(barrier);
+                    } else {
+                        auto barrier = MakeWholeBufferBarrier(handleOn(captured, queue),
+                            static_cast<rhi::ResourceAccessType>(last.after.access), rhi::ResourceAccessType::Common,
+                            static_cast<rhi::ResourceSyncState>(last.after.sync), rhi::ResourceSyncState::All);
+                        toExternal(barrier, rhi::QueueOwnership::Release);
+                        after.buffers.push_back(barrier);
+                    }
+                    output.committedResources.push_back(captured.resource);
+                    output.committedStates.push_back({CompileRange{mip, 1, slice, 1}, common});
+                    output.committedQueues.push_back(queue);
+                }
+        }
     }
     if (closeToHome) {
         // Per resource and cell: the first step (its entry state is home when the backing seeds nothing

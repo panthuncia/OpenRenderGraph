@@ -1427,8 +1427,10 @@ FrameAdmission SynchronousAdmission::Prepare(std::shared_ptr<const SelectedPubli
         Require(completion.timeline && completion.value, "Invalid frame producer completion");
         const auto consumerQueue = graph.batches.at(batch).queue;
         const auto producerQueue = std::ranges::find(queues,completion.timeline,&experimental::ExecutionTimelinePoint::timeline);
-        if (producerQueue != queues.end())
-            Require(completion.value <= producerQueue->value, "Frame producer wait depends on future graph-queue work");
+        if (producerQueue != queues.end() && completion.value > producerQueue->value)
+            throw std::logic_error("Frame producer wait depends on future graph-queue work: timeline="
+                + std::to_string(completion.timeline) + " value=" + std::to_string(completion.value)
+                + " queueValue=" + std::to_string(producerQueue->value));
         if (completion.timeline == queues[consumerQueue].timeline) return;
         auto& waits = frame.incomingWaits[batch];
         const auto found = std::ranges::find(waits,completion.timeline,&experimental::ExecutionTimelinePoint::timeline);

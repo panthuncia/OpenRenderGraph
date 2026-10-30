@@ -37,6 +37,9 @@ struct PreparedBackingState {
     // Frame-only report from an external producer. Its complete incoming states
     // supersede the last graph submission, transactionally at batch commit.
     bool authoritativeIncoming = false;
+    // A resource shared across devices: its handle on each device instance (by index; [0] is resource). Barriers on a queue use
+    // its device's handle, and a use on another device than the last is an external ownership handoff. Empty: one device.
+    std::vector<rhi::ResourceHandle> deviceHandles;
 };
 
 struct PreparedBatchBarriers {

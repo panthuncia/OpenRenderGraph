@@ -17,6 +17,8 @@ struct FrameRecordingJob {
     // An external epoch's late batch (CompilePass::recordAtExecution): no list; its packet keeps the recording for the host's
     // execution (PreparedRhiExecutionBatch::RecordDeferred).
     bool deferred = false;
+    // Non-empty: the plan's timelines as this job's device sees them (a peer device waits on its imported copies).
+    std::vector<PreparedTimelineBinding> timelines;
 };
 
 // Everything the recorder may read is frozen before dispatch. It has no graph,

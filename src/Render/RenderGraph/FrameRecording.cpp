@@ -22,9 +22,10 @@ RecordedFrame RecordFrame(PlannedFrame plan,
             AnnotateFrameTrace(frame);
             auto& job = plan.jobs[batch];
             auto& recording = job.recording;
+            const auto& timelines = job.timelines.empty() ? plan.timelines : job.timelines;
             if (job.deferred) {
                 result.m_batches[batch] = std::make_shared<const PreparedRhiExecutionBatch>(job.slot, job.queue,
-                    std::move(recording), plan.timelines, plan.snapshot);
+                    std::move(recording), timelines, plan.snapshot);
                 return;
             }
             if (!job.pool || !recording.allocation->pair.list)
@@ -32,7 +33,7 @@ RecordedFrame RecordFrame(PlannedFrame plan,
             std::vector<OwnedRecordingList> recordings;
             recordings.push_back(std::move(recording));
             result.m_batches[batch] = RecordPreparedRhiExecutionBatch(job.slot, job.queue,
-                std::move(recordings), plan.timelines, plan.snapshot);
+                std::move(recordings), timelines, plan.snapshot);
         };
         // ParallelForLimited joins all children, including when a child throws.
         if (tasks && concurrency > 1)

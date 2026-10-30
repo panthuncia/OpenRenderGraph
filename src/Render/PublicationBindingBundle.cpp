@@ -122,7 +122,22 @@ PublicationBindingBundle::Snapshot PublicationBindingBundle::Capture(Resource& r
     auto result = std::make_shared<ResourceBindingSnapshot>();
     result->resourceID = resource.GetGlobalResourceID();
     resource.TryGetRHIResourceDesc(result->description);
-    if (auto* backed = dynamic_cast<BackedResource*>(&resource)) {
+    if (auto primary = resource.AcquireAPIRepresentation(BackendInstanceId::Primary); primary && primary->resource) {
+        // Explicit representations (multi-device) replace the backing: the primary's is the resource, and the owner keeps every
+        // device's alive.
+        auto owned = std::make_shared<std::vector<Resource::APIRepresentationPtr>>();
+        for (const auto instance : resource.GetRepresentationInstances()) {
+            auto representation = resource.AcquireAPIRepresentation(instance);
+            if (!representation || !representation->resource) continue;
+            const auto index = static_cast<uint8_t>(instance);
+            if (result->representations.size() <= index) result->representations.resize(index + 1);
+            result->representations[index] = representation->resource.Get();
+            owned->push_back(std::move(representation));
+        }
+        result->resource = primary->resource.Get();
+        result->backingGeneration = primary->backingGeneration;
+        result->allocationOwner = std::move(owned);
+    } else if (auto* backed = dynamic_cast<BackedResource*>(&resource)) {
         auto allocation = backed->CapturePublishedBackingAllocation();
         if (!allocation) return {};
         result->resource = allocation->resource;

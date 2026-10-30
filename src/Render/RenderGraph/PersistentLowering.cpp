@@ -198,14 +198,40 @@ LoweredPass LowerPass(RenderGraph& graph, ResourceRegistry& registry, const Queu
 			const bool automatic = resources.queueAssignmentPolicy == QueueAssignmentPolicy::Automatic && kindCompatible(kind);
 			if (automatic || kind == resources.preferredQueueKind) compatible.push_back(static_cast<uint32_t>(slot));
 		}
+		// The pass's device: the primary unless its backend affinity names another; a preferred one falls back to the primary.
+		const auto& affinity = resources.backendAffinity;
+		auto onDevice = [&](auto&& accept) {
+			std::vector<uint32_t> kept;
+			for (const auto slot : compatible) if (accept(static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot)))) kept.push_back(slot);
+			return kept;
+		};
+		auto primary = [&](QueueSlotIndex slot) { return queues.GetBackendInstance(slot) == BackendInstanceId::Primary; };
+		if (affinity.strength == BackendAffinityStrength::Primary) compatible = onDevice(primary);
+		else {
+			auto kept = onDevice([&](QueueSlotIndex slot) {
+				return affinity.device ? queues.GetBackendInstance(slot) == *affinity.device : queues.GetBackend(slot) == affinity.backend;
+			});
+			if (kept.empty() && affinity.strength == BackendAffinityStrength::Required)
+				throw std::runtime_error("Persistent lowering: pass '" + pass.name + "' requires an unavailable backend");
+			compatible = kept.empty() ? onDevice(primary) : std::move(kept);
+		}
 		if (compatible.empty()) compatible.push_back(static_cast<uint32_t>(resources.preferredQueueKind));
 	}
+	const auto device = queues.SlotCount() != 0
+		? queues.GetBackendInstance(static_cast<QueueSlotIndex>(static_cast<uint8_t>(compatible.front()))) : BackendInstanceId::Primary;
+	result.device = device;
+	// The device's graphics slot: the route of a pass that may not leave graphics.
+	uint32_t graphicsSlot = 0;
+	for (size_t slot = 0; slot < queues.SlotCount(); ++slot) {
+		const auto index = static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot));
+		if (queues.GetBackendInstance(index) == device && queues.GetKind(index) == QueueKind::Graphics) { graphicsSlot = static_cast<uint32_t>(slot); break; }
+	}
 	const bool d3d12OwnedQueueTransfers = queues.SlotCount() != 0
-		&& queues.GetBackend(static_cast<QueueSlotIndex>(0)) == rhi::Backend::D3D12;
+		&& queues.GetBackend(static_cast<QueueSlotIndex>(static_cast<uint8_t>(graphicsSlot))) == rhi::Backend::D3D12;
 	declaration.compatibleQueueSlots = compatible;
 	declaration.preferredQueueSlot = compatible.front();
-	declaration.backend = static_cast<uint32_t>(resources.backendAffinity.strength == BackendAffinityStrength::Primary
-		? primaryBackend : resources.backendAffinity.backend);
+	declaration.backend = static_cast<uint32_t>(queues.SlotCount() != 0
+		? queues.GetBackend(static_cast<QueueSlotIndex>(static_cast<uint8_t>(graphicsSlot))) : primaryBackend);
 	// A pass recorded at execution is a batch of its own: the batch is recorded by the host's execution, the rest ahead.
 	declaration.recordAtExecution = pass.recordAtExecution;
 	declaration.forceBatchIsolation = !resources.externalWaitsBeforeTransitions.empty()
@@ -290,8 +316,8 @@ LoweredPass LowerPass(RenderGraph& graph, ResourceRegistry& registry, const Queu
 		for (const auto& group : result.groups)
 			for (const auto& [id, member] : group.members) concurrent = concurrent && member && ConcurrentlyShared(*member);
 		if (!concurrent) {
-			declaration.compatibleQueueSlots.assign(1, 0u);
-			declaration.preferredQueueSlot = 0u;
+			declaration.compatibleQueueSlots.assign(1, graphicsSlot);
+			declaration.preferredQueueSlot = graphicsSlot;
 		}
 	}
 	return result;

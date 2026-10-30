@@ -31,6 +31,9 @@
 #include "Render/FrameGraphSnapshot.h"
 #include "Managers/Singletons/DeviceManager.h"
 #include "Managers/Singletons/DeletionManager.h"
+#include "Managers/Singletons/DescriptorHeapManager.h"
+#include "Render/RenderGraph/InteropAllocator.h"
+#include <rhi_interop_vulkan.h>
 #include <thread>
 
 #include <algorithm>
@@ -107,6 +110,18 @@ std::optional<persistent::BindingVersion> CaptureSlotBinding(Resource& resource,
 	initial.resource = snapshot->resource.GetHandle();
 	initial.shape = shape;
 	initial.regions = CaptureRegions(*concrete, shape);
+	if (!snapshot->representations.empty()) {
+		for (const auto& representation : snapshot->representations) initial.deviceHandles.push_back(representation.GetHandle());
+		// A new representation pair starts undefined (a texture) or common (a buffer) on every device; the implicit backing's
+		// tracker describes another resource.
+		auto regions = std::make_shared<std::vector<PreparedStateRegion>>();
+		regions->push_back({{0, shape.mips, 0, shape.slices}, shape.hasLayout
+			? CompileResourceState{static_cast<uint64_t>(rhi::ResourceAccessType::None), static_cast<uint64_t>(rhi::ResourceLayout::Undefined),
+				static_cast<uint64_t>(rhi::ResourceSyncState::None), false}
+			: CompileResourceState{static_cast<uint64_t>(rhi::ResourceAccessType::Common), static_cast<uint64_t>(rhi::ResourceLayout::Common),
+				static_cast<uint64_t>(rhi::ResourceSyncState::All), false}});
+		initial.regions = std::move(regions);
+	}
 	rhi::ResourceDesc description{};
 	if (concrete->TryGetRHIResourceDesc(description)) initial.heapType = description.heapType;
 	initial.aliasHeap = snapshot->aliasHeap;
@@ -245,6 +260,7 @@ struct RenderGraph::PersistentExecutionState {
 		bool isBound = false;
 		bool direct = false;               // Shared by direct declarations; never a group member.
 		bool swapchain = false;            // Rebound per frame at admission.
+		bool multiDevice = false;          // A pass on another device than the primary uses it: bound with representations.
 		bool retired = false;              // Slot removed from the program; the index may be reclaimed.
 		std::vector<uint32_t> subscribers; // Main pass indices resolving this slot.
 	};
@@ -281,6 +297,7 @@ struct RenderGraph::PersistentExecutionState {
         std::shared_ptr<const ResourceUseLayout> resourceUses;
         std::vector<std::vector<persistent::ViewToken>> declaredViews;
         std::vector<persistent::BindingToken> declaredBindings;
+        BackendInstanceId device = BackendInstanceId::Primary; // The pass's device (its lowering's).
         struct GroupViews { uint32_t group; std::vector<BindlessViewRequest> views; };
         std::vector<GroupViews> groupViews;
 		uint64_t fingerprint = 0; // Structural identity of the lowered declaration (membership excluded).
@@ -408,6 +425,7 @@ struct RenderGraph::PersistentExecutionState {
 	// A structural build in flight on a worker. Frames keep using the selected
 	// publication; the slot directory already describes the new structure, so
 	// subscriber slot maps are frozen (no rebuild) until the install.
+	std::function<void(Resource&)> ensureRepresentations; // RenderGraph::EnsurePersistentRepresentations
 	struct PendingStructural {
 		std::unique_ptr<persistent::GraphEditTransaction> edit;
 		std::shared_ptr<const persistent::SelectedPublication> base;
@@ -479,6 +497,11 @@ RotationKey RotationKeyOf(State::SlotEntry& entry) {
 	}
 	if (entry.indexed) key.views = entry.indexed->CaptureBindlessViews().get();
 	return key;
+}
+
+// Handles are per device: a timeline is its device's implementation and its handle there.
+bool SameTimeline(const rhi::Timeline& a, const rhi::Timeline& b) noexcept {
+	return a.impl == b.impl && a.GetHandle().index == b.GetHandle().index && a.GetHandle().generation == b.GetHandle().generation;
 }
 
 std::vector<experimental::CompileQueue> RegistryQueues(const QueueRegistry& registry) {
@@ -582,6 +605,7 @@ void UnbindSlot(State& state, persistent::GraphEditTransaction& edit, const Stat
 bool BindEntryOnly(State& state, persistent::GraphEditTransaction& edit, uint32_t index, uint64_t* identity = nullptr) {
 	auto& entry = state.entries[index];
 	if (entry.swapchain || !entry.resource) return false;
+	if (entry.multiDevice && state.ensureRepresentations) state.ensureRepresentations(*entry.resource);
 	auto binding = CaptureSlotBinding(*entry.resource, entry.slot.index, entry.shape);
 	if (binding && identity) *identity = binding->identity;
 	if (!binding) {
@@ -677,6 +701,7 @@ static void InstallMainPass(RenderGraph& graph, State& state, persistent::GraphE
 	for (const auto& group : lowered.groups) main.loweredGroupKeys.push_back(group.key.get());
 	main.explicitWaits = std::move(lowered.explicitWaits);
 	main.directResolvers = std::move(lowered.directResolvers);
+	main.device = lowered.device;
 	main.slotsDirty = true;
 	std::unordered_map<uint64_t, persistent::BindingToken> tokens;
 	auto declare = [&](const LoweredUse& use, bool entry) {
@@ -686,6 +711,10 @@ static void InstallMainPass(RenderGraph& graph, State& state, persistent::GraphE
 		auto& slotEntry = state.entries[index];
 		if (std::find(slotEntry.subscribers.begin(), slotEntry.subscribers.end(), mainIndex) == slotEntry.subscribers.end())
 			slotEntry.subscribers.push_back(mainIndex);
+		if (main.device != BackendInstanceId::Primary && !slotEntry.multiDevice) {
+			slotEntry.multiDevice = true;
+			if (slotEntry.isBound) BindEntry(state, edit, index); // Rebound with its representations.
+		}
 		if (std::find(main.directEntries.begin(), main.directEntries.end(), index) == main.directEntries.end())
 			main.directEntries.push_back(index);
 		if (entry) {
@@ -913,6 +942,7 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 					basic_telemetry::AddCounter("ORG.Ownership.RetirementRejected");
 			});
 		state.admission->SetClosedExecutions(m_persistentClosedExecutions);
+		state.ensureRepresentations = [this](Resource& resource) { EnsurePersistentRepresentations(resource); };
 		// Tickets record their uploads on the graphics queue, or on the queue that first uses them (RecordPendingUploads).
 		if (m_queueRegistry.SlotCount())
 			state.admission->SetUploadQueue(static_cast<uint32_t>(ToUnderlying(m_queueRegistry.FindGraphicsSlot())));
@@ -1527,8 +1557,12 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 			}
 			pass.hostedPrepared = static_cast<bool>(pass.hosted);
 			passPreparation.resourceSlots = pass.slots;
+			passPreparation.backendInstance = pass.device;
+			if (const auto* entry = m_backendDevices.Find(pass.device)) passPreparation.device = entry->device;
             passPreparation.resolveDeclaredView = [&pass, selected](uint32_t use, uint32_t view) {
-                return selected->Resolve(pass.declaredViews.at(use).at(view));
+                const auto slot = selected->Resolve(pass.declaredViews.at(use).at(view));
+                return pass.device == BackendInstanceId::Primary ? slot
+                    : DescriptorHeapManager::GetInstance().TranslateDescriptorSlot(slot, pass.device);
             };
             passPreparation.resolveDeclaredResource = [&pass, selected](uint32_t use) {
                 return selected->ResolveNative(pass.declaredBindings.at(use));
@@ -1573,10 +1607,8 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 				uint64_t identity = 0;
 				for (const auto& binding : main.foreignTimelines)
 					if (binding.handle.index == handle.index && binding.handle.generation == handle.generation) identity = binding.identity;
-				for (size_t slot = 0; slot < m_queueRegistry.SlotCount() && !identity; ++slot) {
-					const auto fence = m_queueRegistry.GetFence(static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot))).GetHandle();
-					if (fence.index == handle.index && fence.generation == handle.generation) identity = slot + 1;
-				}
+				for (size_t slot = 0; slot < m_queueRegistry.SlotCount() && !identity; ++slot)
+					if (SameTimeline(m_queueRegistry.GetFence(static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot))), wait.timeline)) identity = slot + 1;
 				if (!identity) {
 					identity = m_queueRegistry.SlotCount() + 1 + main.foreignTimelines.size();
 					main.foreignTimelines.push_back({identity, handle});
@@ -1761,10 +1793,8 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 					uint64_t identity = 0;
 					for (const auto& binding : segment.foreignTimelines)
 						if (binding.handle.index == handle.index && binding.handle.generation == handle.generation) identity = binding.identity;
-					for (size_t slot = 0; slot < m_queueRegistry.SlotCount() && !identity; ++slot) {
-						const auto fence = m_queueRegistry.GetFence(static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot))).GetHandle();
-						if (fence.index == handle.index && fence.generation == handle.generation) identity = slot + 1;
-					}
+					for (size_t slot = 0; slot < m_queueRegistry.SlotCount() && !identity; ++slot)
+						if (SameTimeline(m_queueRegistry.GetFence(static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot))), wait.timeline)) identity = slot + 1;
 					if (!identity) {
 						identity = m_queueRegistry.SlotCount() + 1 + segment.foreignTimelines.size();
 						segment.foreignTimelines.push_back({identity, handle});
@@ -2166,6 +2196,107 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 	}
 	BT_PLOT("ORG.Persistent.StructuralBuildsTotal", static_cast<int64_t>(state.structuralBuilds));
 	BT_PLOT("ORG.Persistent.BindingBuildsTotal", static_cast<int64_t>(state.bindingBuilds));
+}
+
+void RenderGraph::EnsurePersistentRepresentations(Resource& resource) {
+	auto* concrete = UnwrapDynamic(&resource);
+	if (!concrete) return;
+	DeviceRegistryEntry* d3d12 = nullptr;
+	DeviceRegistryEntry* vulkan = nullptr;
+	for (auto& entry : m_backendDevices) {
+		if (entry.backend == rhi::Backend::D3D12 && !d3d12) d3d12 = &entry;
+		if (entry.backend == rhi::Backend::Vulkan && !vulkan) vulkan = &entry;
+	}
+	if (!d3d12 || !vulkan) throw std::runtime_error("Multi-device resource '" + concrete->GetName() + "' needs one D3D12 and one Vulkan device");
+	if (concrete->HasAPIRepresentation(d3d12->id) && concrete->HasAPIRepresentation(vulkan->id)) return;
+	if (!concrete->IsRenderGraphManaged())
+		throw std::runtime_error("Multi-device resource '" + concrete->GetName() + "' is externally managed");
+	rhi::ResourceDesc desc{};
+	if (!concrete->TryGetRHIResourceDesc(desc) || desc.heapType != rhi::HeapType::DeviceLocal
+		|| (desc.type != rhi::ResourceType::Buffer && desc.type != rhi::ResourceType::Texture2D))
+		throw std::runtime_error("Multi-device resource '" + concrete->GetName() + "' is not a device-local buffer or 2D texture");
+	desc.heapFlags |= rhi::HeapFlags::Shared;
+	if (desc.type == rhi::ResourceType::Texture2D && !rhi::vulkan::query_d3d12_texture_support(vulkan->device, desc).supported)
+		throw std::runtime_error("Multi-device texture '" + concrete->GetName() + "' is unsupported for its format and usage");
+	InteropResourcePair pair;
+	if (rhi::Failed(InteropAllocator::CreateCommittedD3D12Vulkan(*d3d12, *vulkan, desc, pair)))
+		throw std::runtime_error("Failed to create the shared representations of '" + concrete->GetName() + "'");
+	// D3D12 requires an RT or DS texture it did not zero to be initialized by D3D12 before any use, even when Vulkan produces
+	// it first: one enhanced discard into RENDER_TARGET, an empty pass, and back to COMMON, waited for here.
+	if (desc.type == rhi::ResourceType::Texture2D && (desc.resourceFlags & rhi::ResourceFlags::RF_AllowDepthStencil) != 0)
+		throw std::runtime_error("Multi-device depth-stencil texture '" + concrete->GetName() + "' is unsupported");
+	if (desc.type == rhi::ResourceType::Texture2D && (desc.resourceFlags & rhi::ResourceFlags::RF_AllowRenderTarget) != 0) {
+		rhi::CommandAllocatorPtr allocator;
+		rhi::CommandListPtr list;
+		rhi::DescriptorHeapPtr rtvHeap;
+		rhi::TimelinePtr completion;
+		auto result = d3d12->device.CreateCommandAllocator(rhi::QueueKind::Graphics, allocator);
+		if (rhi::IsOk(result)) result = d3d12->device.CreateCommandList(rhi::QueueKind::Graphics, allocator.Get(), list);
+		if (rhi::IsOk(result)) {
+			rhi::DescriptorHeapDesc heapDesc{};
+			heapDesc.type = rhi::DescriptorHeapType::RTV;
+			heapDesc.capacity = 1;
+			heapDesc.debugName = "ORG multi-device texture initialization RTV";
+			result = d3d12->device.CreateDescriptorHeap(heapDesc, rtvHeap);
+		}
+		if (rhi::IsOk(result)) result = d3d12->device.CreateRenderTargetView({rtvHeap->GetHandle(), 0}, pair.canonical->GetHandle(), {});
+		if (rhi::IsOk(result)) result = d3d12->device.CreateTimeline(completion, 0, "ORG multi-device texture initialization");
+		if (rhi::IsOk(result)) {
+			rhi::TextureBarrier initialize{
+				.texture = pair.canonical->GetHandle(),
+				.range = {.baseMip = 0, .mipCount = desc.texture.mipLevels, .baseLayer = 0, .layerCount = desc.texture.depthOrLayers,
+					.basePlane = 0, .planeCount = 1},
+				.beforeSync = rhi::ResourceSyncState::None,
+				.afterSync = rhi::ResourceSyncState::All,
+				.beforeAccess = rhi::ResourceAccessType::None,
+				.afterAccess = rhi::ResourceAccessType::RenderTarget,
+				.beforeLayout = rhi::ResourceLayout::Undefined,
+				.afterLayout = rhi::ResourceLayout::RenderTarget,
+				.discard = true,
+			};
+			list->Barriers(rhi::BarrierBatch{.textures = {&initialize, 1}});
+			rhi::ColorAttachment attachment{};
+			attachment.rtv = {rtvHeap->GetHandle(), 0};
+			attachment.loadOp = rhi::LoadOp::DontCare;
+			attachment.resource = pair.canonical->GetHandle();
+			attachment.mipSlice = -1;
+			rhi::PassBeginInfo begin{};
+			begin.colors = {&attachment, 1};
+			begin.width = desc.texture.width;
+			begin.height = desc.texture.height;
+			list->BeginPass(begin);
+			list->EndPass();
+			auto toCommon = initialize;
+			toCommon.beforeSync = rhi::ResourceSyncState::RenderTarget;
+			toCommon.beforeAccess = rhi::ResourceAccessType::RenderTarget;
+			toCommon.afterAccess = rhi::ResourceAccessType::Common;
+			toCommon.beforeLayout = rhi::ResourceLayout::RenderTarget;
+			toCommon.afterLayout = rhi::ResourceLayout::Common;
+			toCommon.discard = false;
+			list->Barriers(rhi::BarrierBatch{.textures = {&toCommon, 1}});
+			list->End();
+			const rhi::CommandList submitted[] = {list.Get()};
+			const rhi::TimelinePoint completed{completion->GetHandle(), 1};
+			result = d3d12->device.GetQueue(rhi::QueueKind::Graphics).Submit(submitted, {.signals = {&completed, 1}});
+			if (rhi::IsOk(result)) result = completion->HostWait(1, 30000);
+		}
+		if (rhi::Failed(result)) throw std::runtime_error("Failed to initialize the D3D12 representation of '" + concrete->GetName() + "'");
+	}
+	// Textures start undefined on both APIs; buffers in the bridge-compatible COMMON state.
+	const bool texture = desc.type == rhi::ResourceType::Texture2D;
+	const ResourceState initial = texture
+		? ResourceState{rhi::ResourceAccessType::None, rhi::ResourceLayout::Undefined, rhi::ResourceSyncState::None}
+		: ResourceState{rhi::ResourceAccessType::Common, rhi::ResourceLayout::Common, rhi::ResourceSyncState::All};
+	std::vector<Resource::PendingAPIRepresentation> representations;
+	representations.push_back({d3d12->id, std::move(pair.canonical), initial});
+	representations.push_back({vulkan->id, std::move(pair.imported), initial});
+	if (auto* indexed = dynamic_cast<GloballyIndexedResource*>(concrete)) indexed->RotateDescriptorSlotsForPublication();
+	if (!concrete->PublishAPIRepresentations(std::move(representations)))
+		throw std::runtime_error("Failed to publish the shared representations of '" + concrete->GetName() + "'");
+	concrete->RefreshAPIRepresentationDescriptors(d3d12->id);
+	concrete->RefreshAPIRepresentationDescriptors(vulkan->id);
+	basic_telemetry::AddCounter("ORG.Persistent.MultiDeviceRepresentations");
+	spdlog::info("Persistent multi-device representations: '{}' ({})", concrete->GetName(), texture ? "texture" : "buffer");
 }
 
 void RenderGraph::MaterializePersistentStandalone(std::span<Resource* const> resources, bool skipAliasCandidates) {
@@ -3529,6 +3660,14 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 			job.queue = m_queueRegistry.GetQueue(index);
 			job.pool = external ? m_externalSecondaryPool : m_queueRegistry.GetSharedPool(index);
 			if (!job.pool) throw std::logic_error("Recording queue has no command-list pool");
+			const auto device = m_queueRegistry.GetBackendInstance(index);
+			if (m_backendDevices.size() > 1) {
+				// Each device waits on and signals its own copy of every queue timeline.
+				job.timelines = timelineBindings;
+				for (size_t source = 0; source < slotCount; ++source)
+					job.timelines[source].handle = m_queueRegistry.GetFenceForConsumer(
+						static_cast<QueueSlotIndex>(static_cast<uint8_t>(source)), index).GetHandle();
+			}
 			job.deferred = late;
 			job.recording = experimental::BuildPersistentRecordingList(sealed, batch);
 			job.recording.external = external;
@@ -3543,9 +3682,13 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 			job.recording.externalExitBarrier = m_externalQueueBoundary.exit
 				&& lastBatchOnSlot[slot].segment == segmentIndex && lastBatchOnSlot[slot].batch == batch;
 			job.recording.replayable = keepable;
-			if (queueKind != QueueKind::Copy) {
+			if (queueKind != QueueKind::Copy && device == BackendInstanceId::Primary) {
 				job.recording.resourceDescriptorHeap = defaultResourceHeap;
 				job.recording.samplerDescriptorHeap = defaultSamplerHeap;
+			} else if (queueKind != QueueKind::Copy) {
+				auto& heaps = DescriptorHeapManager::GetInstance();
+				job.recording.resourceDescriptorHeap = heaps.GetSRVDescriptorHeap(device).GetHandle();
+				job.recording.samplerDescriptorHeap = heaps.GetSamplerDescriptorHeap(device).GetHandle();
 			}
 			// A late batch is recorded after its ticket completes on the owner thread (which publishes the statistics): its frame
 			// slot's completion publishes its (OwnedRecordingStatistics::atCompletion). It is never kept: the shared pool's queries.

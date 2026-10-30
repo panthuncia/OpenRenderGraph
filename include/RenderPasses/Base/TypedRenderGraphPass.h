@@ -595,7 +595,7 @@ protected:
     [[nodiscard]] PreparedProgramBinding CaptureProgramBinding(
         const PassPrepareContext& preparation,
         const PipelineState& pipeline,
-        BackendInstanceId backend = BackendInstanceId::Primary) const {
+        std::optional<BackendInstanceId> backend = std::nullopt) const {
         return preparation.CaptureProgramBinding(pipeline, backend);
     }
 

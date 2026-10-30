@@ -389,6 +389,8 @@ struct FramePreparationContext {
     std::shared_ptr<PreparedInvocationArena> invocationArena;
     std::function<void(std::shared_ptr<const void>)> retireOwnership;
     rhi::Device device; // Host-owned device; valid through frame retirement.
+    // The device the pass runs on: program and pipeline captures default to its representation.
+    BackendInstanceId backendInstance = BackendInstanceId::Primary;
     uint32_t frameIndex = 0;
     // Stable CPU frame-data slot retained by this prepared request. The
     // swapchain image and execution slot are intentionally late-bound.
@@ -439,17 +441,17 @@ struct FramePreparationContext {
     std::function<unsigned int(const ResourceIdentifier&, bool optional)> captureDescriptorIndex;
 
     CapturedPipeline CapturePipeline(const PipelineState& pipeline,
-        BackendInstanceId backend = BackendInstanceId::Primary) const {
-        auto owner = pipeline.GetPayload(backend);
+        std::optional<BackendInstanceId> backend = std::nullopt) const {
+        auto owner = pipeline.GetPayload(backend.value_or(backendInstance));
         if (!owner || !owner->pso) throw std::invalid_argument("Pipeline has no immutable payload");
         const auto layout = owner->layout;
         return {owner->pso.Get().GetHandle(), std::move(owner), layout};
     }
 
     PreparedProgramReference CaptureProgram(const PipelineState& pipeline,
-        BackendInstanceId backend = BackendInstanceId::Primary) const {
+        std::optional<BackendInstanceId> backend = std::nullopt) const {
         if (!dependencyCollector) throw std::logic_error("Program capture is unavailable outside typed preparation");
-        return dependencyCollector->Capture(pipeline, backend);
+        return dependencyCollector->Capture(pipeline, backend.value_or(backendInstance));
     }
 
     PreparedProgramReference CaptureProgram(
@@ -468,10 +470,10 @@ struct FramePreparationContext {
     }
 
     PreparedProgramBinding CaptureProgramBinding(const PipelineState& pipeline,
-        BackendInstanceId backend = BackendInstanceId::Primary) const {
+        std::optional<BackendInstanceId> backend = std::nullopt) const {
         if (!dependencyCollector || !captureDescriptorIndices)
             throw std::logic_error("Program binding capture is unavailable outside typed preparation");
-        auto payload = pipeline.GetPayload(backend);
+        auto payload = pipeline.GetPayload(backend.value_or(backendInstance));
         if (!payload || !payload->pso)
             throw std::invalid_argument("Pipeline has no immutable payload");
         return CaptureProgramBinding(std::move(payload));

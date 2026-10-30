@@ -92,6 +92,9 @@ public:
 	rhi::DescriptorHeap GetNonShaderVisibleDescriptorHeap(BackendInstanceId backendInstance = BackendInstanceId::Primary) const;
 	rhi::DescriptorSlot ResolveDescriptorSlot(BackendInstanceId backendInstance, rhi::DescriptorHeapType type,
 		bool shaderVisible, uint32_t logicalIndex) const;
+	// A primary heap's slot as the same logical slot in another backend instance's heap of that kind (descriptor indices are
+	// shared across devices). Unchanged for the primary, or a slot of no primary heap.
+	rhi::DescriptorSlot TranslateDescriptorSlot(rhi::DescriptorSlot slot, BackendInstanceId backendInstance) const;
 	UINT CreateIndexedSampler(const rhi::SamplerDesc& samplerDesc);
 	rhi::DescriptorSlot AllocateDescriptorSlot(rhi::DescriptorHeapType type, bool shaderVisible);
 	void RetireDescriptorSlot(rhi::DescriptorSlot slot);

@@ -27,6 +27,9 @@ struct ResourceBindingSnapshot {
     std::shared_ptr<const BindingTableVersion> bindingTable;
     std::shared_ptr<const AliasHeapGeneration> aliasHeap;
     uint64_t aliasPoolID = 0, aliasOffset = 0, aliasSize = 0;
+    // A resource shared across devices: its representation on each device instance (by index), the primary's being resource.
+    // Empty for a resource only the primary device uses.
+    std::vector<rhi::Resource> representations;
 };
 
 class PublicationBindingBundle {

@@ -55,6 +55,7 @@ struct LoweredPass {
 	// The resolvers whose resources are among the entries (not a group), with the set they resolved to.
 	std::vector<std::pair<std::shared_ptr<const IResourceResolver>, ResolverResourceSetIdentity>> directResolvers;
 	std::vector<ExternalTimelinePoint> explicitWaits;
+	BackendInstanceId device = BackendInstanceId::Primary; // The device of every compatible queue slot.
 };
 
 // The pass's resolver group plan from its current declaration (RenderGraph::ResolverGroupPlan). Must run before the old
