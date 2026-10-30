@@ -7,7 +7,6 @@
 #include <memory>
 #include <optional>
 #include <string>
-#include <variant>
 #include <vector>
 
 #include "Render/QueueKind.h"
@@ -17,8 +16,6 @@ namespace org {
 class RenderGraph;
 class RenderGraphPass;
 class RenderPass;
-class ComputePass;
-class CopyPass;
 class ResourceRegistry;
 
 enum class ExternalInsertKind : uint8_t { Begin, End, Before, After };
@@ -49,11 +46,10 @@ struct ExternalInsertPoint {
 	ExternalInsertPoint& AlsoBefore(std::string a) { before.push_back(std::move(a)); return *this; }
 };
 
+// Every pass is a RenderPass; its queue is declaration data (ExternalPassDesc::preferredQueueKind, PassBuilder::PreferQueue).
 enum class PassType {
 	Unknown,
-	Render,
-	Compute,
-	Copy
+	Render
 };
 
 struct ExternalPassDesc {
@@ -61,8 +57,7 @@ struct ExternalPassDesc {
 	std::string name;
 	std::string techniquePath;
 	std::optional<ExternalInsertPoint> where;
-	std::variant<std::monostate, std::shared_ptr<RenderPass>, std::shared_ptr<ComputePass>, std::shared_ptr<CopyPass>> pass;
-	std::shared_ptr<RenderGraphPass> unifiedPass;
+	std::shared_ptr<RenderPass> pass;
 	std::optional<QueueKind> preferredQueueKind;
 	std::optional<QueueAssignmentPolicy> queueAssignmentPolicy;
 	std::optional<QueueSlotIndex> pinnedQueueSlot; // Target a specific queue slot, bypassing queue preference
@@ -89,32 +84,22 @@ struct ExternalPassDesc {
 		ExternalPassDesc desc{};
 		desc.type = PassType::Render;
 		desc.name = std::move(name);
-		desc.pass.emplace<std::shared_ptr<RenderPass>>(std::move(renderPass));
+		desc.pass = std::move(renderPass);
 		return desc;
 	}
 
-	static ExternalPassDesc Compute(std::string name, std::shared_ptr<ComputePass> computePass) {
-		ExternalPassDesc desc{};
-		desc.type = PassType::Compute;
-		desc.name = std::move(name);
-		desc.pass.emplace<std::shared_ptr<ComputePass>>(std::move(computePass));
+	// The same pass on the compute or copy queue: queue semantics are declaration data, not inheritance.
+	static ExternalPassDesc Compute(std::string name, std::shared_ptr<RenderPass> computePass) {
+		ExternalPassDesc desc = Render(std::move(name), std::move(computePass));
+		desc.preferredQueueKind = QueueKind::Compute;
 		return desc;
 	}
 
-	// Queue semantics are declaration data, not inheritance. This overload lets
-	// unified/typed passes request compute without entering the legacy compute
-	// pass container or deriving from ComputePass.
-	static ExternalPassDesc Compute(std::string name, std::shared_ptr<RenderPass> computePass);
-
-	static ExternalPassDesc Copy(std::string name, std::shared_ptr<CopyPass> copyPass) {
-		ExternalPassDesc desc{};
-		desc.type = PassType::Copy;
-		desc.name = std::move(name);
-		desc.pass.emplace<std::shared_ptr<CopyPass>>(std::move(copyPass));
+	static ExternalPassDesc Copy(std::string name, std::shared_ptr<RenderPass> copyPass) {
+		ExternalPassDesc desc = Render(std::move(name), std::move(copyPass));
+		desc.preferredQueueKind = QueueKind::Copy;
 		return desc;
 	}
-
-	static ExternalPassDesc Copy(std::string name, std::shared_ptr<RenderPass> copyPass);
 
 	ExternalPassDesc& At(ExternalInsertPoint insertPoint) & {
 		where = std::move(insertPoint);

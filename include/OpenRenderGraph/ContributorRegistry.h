@@ -23,9 +23,16 @@ public:
 		std::string id;
 		ORGResourceDesc desc{};
 	};
+	// A host resource contributors may access (ContributorHost's exports).
+	struct Export
+	{
+		std::string id;
+		ORGExportDescriptor desc{};
+	};
 	struct Access
 	{
-		uint64_t resource{};
+		uint64_t resource{};  // the contributor resource's handle; 0 for an export
+		uint32_t exportIndex{ UINT32_MAX };
 		std::string resourceId;
 		ORGBinding binding{};
 		ORGAccessKind kind{};
@@ -38,6 +45,7 @@ public:
 		uint32_t elementCount{};
 		uint32_t structureByteStride{};
 		ORGBinding counterBinding{};
+		float clearValue[4]{};
 	};
 	struct Pass
 	{
@@ -52,10 +60,9 @@ public:
 		std::vector<std::string> after;
 		std::vector<std::string> before;
 		std::vector<Access> accesses;
+		std::string epoch;  // empty: every epoch
 		ORGPrepareCallback prepare{};
-		ORGUpdateCallback update{};
-		ORGExecuteCallback execute{};
-		ORGCleanupCallback cleanup{};
+		ORGRevisionCallback invocationRevision{};
 		void* userData{};
 	};
 	struct Candidate
@@ -68,7 +75,9 @@ public:
 
 	ContributorRegistry();
 	~ContributorRegistry();
-	void SetAnchors(std::vector<std::string> anchors);
+	// The host's anchors, epochs and exports, which passes may name. Set before the first build.
+	void SetHostSymbols(std::vector<std::string> anchors, std::vector<std::string> epochs, std::vector<Export> exports);
+	const std::vector<Export>& Exports() const noexcept { return exports_; }
 	ORGStatus Register(const ORGContributorDesc*, ORGRegistrationHandle*) noexcept;
 	ORGStatus BeginUnregister(ORGRegistrationHandle) noexcept;
 	ORGStatus GetRegistrationState(ORGRegistrationHandle, ORGRegistrationState*) const noexcept;
@@ -77,6 +86,8 @@ public:
 	ORGStatus RequestRebuild(ORGRegistrationHandle) noexcept;
 	ORGStatus GetDiagnostic(ORGRegistrationHandle, ORGDiagnostic*) const noexcept;
 	bool HasPendingRebuild() const noexcept;
+	// Whether the last successful compile sized a resource against the render or output extent.
+	bool HasRelativeResources() const noexcept { return relativeResources_; }
 	ORGStatus Compile(uint64_t generation, uint32_t renderWidth, uint32_t renderHeight,
 		uint32_t outputWidth, uint32_t outputHeight, Candidate&) noexcept;
 	void Activate(const Candidate&) noexcept;
@@ -101,8 +112,11 @@ private:
 	std::atomic_uint64_t nextHandle_{ 1 };
 	uint64_t diagnosticSequence_{};
 	bool rebuildRequested_{ true };
+	bool relativeResources_{};
 	bool open_{ true };
 	std::vector<std::string> anchors_;
+	std::vector<std::string> epochs_;
+	std::vector<Export> exports_;
 };
 
 } // namespace org::contributor

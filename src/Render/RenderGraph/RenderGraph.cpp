@@ -59,26 +59,6 @@ namespace {
 thread_local ResolverCaptureScope* t_resolverCaptures = nullptr;
 }
 
-ExternalPassDesc ExternalPassDesc::Compute(std::string name, std::shared_ptr<RenderPass> computePass) {
-	ExternalPassDesc desc{};
-	// PassType remains an ingestion/compiler shape tag during the migration;
-	// actual execution queue is selected independently below.
-	desc.type = PassType::Render;
-	desc.name = std::move(name);
-	desc.unifiedPass = std::move(computePass);
-	desc.preferredQueueKind = QueueKind::Compute;
-	return desc;
-}
-
-ExternalPassDesc ExternalPassDesc::Copy(std::string name, std::shared_ptr<RenderPass> copyPass) {
-	ExternalPassDesc desc{};
-	desc.type = PassType::Render;
-	desc.name = std::move(name);
-	desc.unifiedPass = std::move(copyPass);
-	desc.preferredQueueKind = QueueKind::Copy;
-	return desc;
-}
-
 ResolverCaptureScope::ResolverCaptureScope() : m_previous(t_resolverCaptures) { t_resolverCaptures = this; }
 ResolverCaptureScope::~ResolverCaptureScope() { t_resolverCaptures = m_previous; }
 
@@ -261,47 +241,9 @@ namespace {
 		return hash;
 	}
 
-	constexpr QueueKind DefaultPreferredQueueKind(RenderGraph::PassType type) noexcept {
-		switch (type) {
-		case RenderGraph::PassType::Render:
-			return QueueKind::Graphics;
-		case RenderGraph::PassType::Compute:
-			return QueueKind::Compute;
-		case RenderGraph::PassType::Copy:
-			return QueueKind::Copy;
-		default:
-			return QueueKind::Graphics;
-		}
-	}
-
-	constexpr QueueAssignmentPolicy DefaultQueueAssignmentPolicy(RenderGraph::PassType type) noexcept {
-		switch (type) {
-		case RenderGraph::PassType::Compute:
-			return QueueAssignmentPolicy::Automatic;
-		case RenderGraph::PassType::Render:
-		case RenderGraph::PassType::Copy:
-		case RenderGraph::PassType::Unknown:
-		default:
-			return QueueAssignmentPolicy::ForcePreferred;
-		}
-	}
-
-	constexpr bool IsPreferredQueueKindCompatible(RenderGraph::PassType type, QueueKind kind) noexcept {
-		switch (type) {
-		case RenderGraph::PassType::Render:
-			return IsQueueKindSupportedByRenderPass(kind);
-		case RenderGraph::PassType::Compute:
-			return IsQueueKindSupportedByComputePass(kind);
-		case RenderGraph::PassType::Copy:
-			return IsQueueKindSupportedByCopyPass(kind);
-		default:
-			return false;
-		}
-	}
-
 	QueueKind ResolveExternalPreferredQueueKind(const RenderGraph::ExternalPassDesc& desc) {
-		const QueueKind preferredQueueKind = desc.preferredQueueKind.value_or(DefaultPreferredQueueKind(desc.type));
-		if (!IsPreferredQueueKindCompatible(desc.type, preferredQueueKind)) {
+		const QueueKind preferredQueueKind = desc.preferredQueueKind.value_or(QueueKind::Graphics);
+		if (!IsQueueKindSupportedByRenderPass(preferredQueueKind)) {
 			throw std::runtime_error("External pass '" + desc.name + "' requested an incompatible queue kind");
 		}
 		return preferredQueueKind;
@@ -316,7 +258,7 @@ namespace {
 			return QueueAssignmentPolicy::ForcePreferred;
 		}
 
-		return DefaultQueueAssignmentPolicy(desc.type);
+		return QueueAssignmentPolicy::ForcePreferred;
 	}
 
 	// Insert into a sorted vector, maintaining sorted order. No-op if already present.
@@ -332,8 +274,6 @@ namespace {
 	const char* PassTypeToString(RenderGraph::PassType type) noexcept {
 		switch (type) {
 		case RenderGraph::PassType::Render: return "Render";
-		case RenderGraph::PassType::Compute: return "Compute";
-		case RenderGraph::PassType::Copy: return "Copy";
 		default: return "Unknown";
 		}
 	}
@@ -390,11 +330,9 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 	}
 
 	if (d.type == PassType::Render) {
-		auto rp = d.unifiedPass
-			? std::dynamic_pointer_cast<RenderPass>(d.unifiedPass)
-			: std::get<std::shared_ptr<RenderPass>>(d.pass);
+		auto rp = d.pass;
 		if (!rp) {
-			throw std::logic_error("Unified pass does not implement the unified render-graph pass contract");
+			throw std::logic_error("External pass '" + d.name + "' has no pass object");
 		}
 		RenderPassAndResources par;
 		par.pass = rp;
@@ -470,150 +408,6 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 
 		any.pass = std::move(par);
 	}
-	else if (d.type == PassType::Compute) {
-		auto cp = std::get<std::shared_ptr<ComputePass>>(d.pass);
-		ComputePassAndResources par;
-		par.pass = cp;
-		par.name = d.name;
-		par.techniquePath = d.techniquePath;
-		par.collectStatistics = d.collectStatistics;
-		par.epoch = d.epoch;
-		par.recordAtExecution = d.recordAtExecution;
-		{
-			ComputePassBuilder b(this, d.name);
-			b.pass = cp;
-			b.built_ = true;
-			b.params = {};
-			b._declaredIds.clear();
-			if (traceLifecycle) {
-				spdlog::info("RG materialize external compute pass '{}' declare begin", d.name);
-			}
-			EnsureProviderRegistered(par.pass.get());
-			{ const ResolverCaptureScope captures; cp->DeclareResourceUsages(&b); }
-			if (logStructuralMaterialize) {
-				spdlog::info(
-					"RG structural materialize compute pass='{}' declare complete requirements={} transitions={} identifiers={}",
-					d.name,
-					b.GatherResourceRequirements().size(),
-					b.params.internalTransitions.size(),
-					b.DeclaredResourceIds().size());
-			}
-			par.resources.staticResourceRequirements = b.GatherResourceRequirements();
-			par.resources.internalTransitions = b.params.internalTransitions;
-			par.resources.identifierSet = b.DeclaredResourceIds();
-			par.resources.autoDescriptorShaderResources = b.params.autoDescriptorShaderResources;
-			par.resources.autoDescriptorConstantBuffers = b.params.autoDescriptorConstantBuffers;
-			par.resources.autoDescriptorUnorderedAccessViews = b.params.autoDescriptorUnorderedAccessViews;
-			par.resources.activeFeatureDomains = b.params.activeFeatureDomains;
-			par.resources.externalWaitsBeforeTransitions = b.params.externalWaitsBeforeTransitions;
-			par.resources.externalWaitBindingsBeforeTransitions = b.params.externalWaitBindingsBeforeTransitions;
-			par.resources.preferredQueueKind = ResolveExternalPreferredQueueKind(d);
-			par.resources.queueAssignmentPolicy = ResolveExternalQueueAssignmentPolicy(d);
-			par.resources.pinnedQueueSlot = d.pinnedQueueSlot;
-			if (materializeReferencedResources) {
-				if (traceLifecycle) {
-					spdlog::info("RG materialize external compute pass '{}' materialize referenced resources begin", d.name);
-				}
-				if (logStructuralMaterialize) {
-					spdlog::info("RG structural materialize compute pass='{}' referenced resources begin", d.name);
-				}
-				MaterializeReferencedResources(par.resources.staticResourceRequirements, par.resources.internalTransitions, d.name);
-				if (logStructuralMaterialize) {
-					spdlog::info("RG structural materialize compute pass='{}' referenced resources complete", d.name);
-				}
-			}
-			par.retainedAnonymousKeepAlive = CaptureRetainedAnonymousKeepAlive(
-				par.resources.staticResourceRequirements,
-				par.resources.internalTransitions);
-			par.resolverSnapshots = b.TakeResolverSnapshots();
-			par.resolverGroupPlan = lowering::PlanResolverGroups(par);
-		}
-
-		if (callSetup) {
-			par.pass->ConfigureRuntimeServices(m_uploadService, m_descriptorService);
-			par.pass->ConfigureResourceRegistryView(
-				MakePassResourceRegistryView(_registry, par.resources), par.resources);
-			if (traceLifecycle) {
-				spdlog::info("RG materialize external compute pass '{}' setup begin", d.name);
-			}
-			par.pass->Setup();
-			if (traceLifecycle) {
-				spdlog::info("RG materialize external compute pass '{}' setup complete", d.name);
-			}
-		}
-
-		any.pass = std::move(par);
-	}
-	else if (d.type == PassType::Copy) {
-		auto cp = std::get<std::shared_ptr<CopyPass>>(d.pass);
-		CopyPassAndResources par;
-		par.pass = cp;
-		par.name = d.name;
-		par.techniquePath = d.techniquePath;
-		par.collectStatistics = d.collectStatistics;
-		par.epoch = d.epoch;
-		par.recordAtExecution = d.recordAtExecution;
-		{
-			CopyPassBuilder b(this, d.name);
-			b.pass = cp;
-			b.built_ = true;
-			b.params = {};
-			b._declaredIds.clear();
-			if (traceLifecycle) {
-				spdlog::info("RG materialize external copy pass '{}' declare begin", d.name);
-			}
-			EnsureProviderRegistered(par.pass.get());
-			{ const ResolverCaptureScope captures; cp->DeclareResourceUsages(&b); }
-			if (logStructuralMaterialize) {
-				spdlog::info(
-					"RG structural materialize copy pass='{}' declare complete requirements={} transitions={} identifiers={}",
-					d.name,
-					b.GatherResourceRequirements().size(),
-					b.params.internalTransitions.size(),
-					b.DeclaredResourceIds().size());
-			}
-			par.resources.staticResourceRequirements = b.GatherResourceRequirements();
-			par.resources.internalTransitions = b.params.internalTransitions;
-			par.resources.identifierSet = b.DeclaredResourceIds();
-			par.resources.externalWaitsBeforeTransitions = b.params.externalWaitsBeforeTransitions;
-			par.resources.externalWaitBindingsBeforeTransitions = b.params.externalWaitBindingsBeforeTransitions;
-			par.resources.preferredQueueKind = ResolveExternalPreferredQueueKind(d);
-			par.resources.queueAssignmentPolicy = ResolveExternalQueueAssignmentPolicy(d);
-			par.resources.pinnedQueueSlot = d.pinnedQueueSlot;
-			if (materializeReferencedResources) {
-				if (traceLifecycle) {
-					spdlog::info("RG materialize external copy pass '{}' materialize referenced resources begin", d.name);
-				}
-				if (logStructuralMaterialize) {
-					spdlog::info("RG structural materialize copy pass='{}' referenced resources begin", d.name);
-				}
-				MaterializeReferencedResources(par.resources.staticResourceRequirements, par.resources.internalTransitions, d.name);
-				if (logStructuralMaterialize) {
-					spdlog::info("RG structural materialize copy pass='{}' referenced resources complete", d.name);
-				}
-			}
-			par.retainedAnonymousKeepAlive = CaptureRetainedAnonymousKeepAlive(
-				par.resources.staticResourceRequirements,
-				par.resources.internalTransitions);
-			par.resolverSnapshots = b.TakeResolverSnapshots();
-			par.resolverGroupPlan = lowering::PlanResolverGroups(par);
-		}
-
-		if (callSetup) {
-			par.pass->ConfigureRuntimeServices(m_uploadService, m_descriptorService);
-			par.pass->ConfigureResourceRegistryView(
-				MakePassResourceRegistryView(_registry, par.resources), par.resources);
-			if (traceLifecycle) {
-				spdlog::info("RG materialize external copy pass '{}' setup begin", d.name);
-			}
-			par.pass->Setup();
-			if (traceLifecycle) {
-				spdlog::info("RG materialize external copy pass '{}' setup complete", d.name);
-			}
-		}
-
-		any.pass = std::move(par);
-	}
 
 	if (logStructuralMaterialize) {
 		spdlog::info("RG structural materialize complete pass='{}' type={}", d.name, PassTypeToString(d.type));
@@ -637,12 +431,6 @@ void RenderGraph::RegisterExternalPassName(const ExternalPassDesc& d, AnyPassAnd
 		auto& rp = std::get<RenderPassAndResources>(any.pass);
 		if (!d.name.empty()) {
 			renderPassesByName[d.name] = std::dynamic_pointer_cast<RenderPass>(rp.pass);
-		}
-	}
-	else if (d.type == PassType::Compute) {
-		auto& cp = std::get<ComputePassAndResources>(any.pass);
-		if (!d.name.empty()) {
-			computePassesByName[d.name] = std::dynamic_pointer_cast<ComputePass>(cp.pass);
 		}
 	}
 }
@@ -901,18 +689,8 @@ void RenderGraph::WriteVramUsageDebugDump(uint8_t frameIndex) const
 
 RenderGraph::PassView RenderGraph::GetPassView(const AnyPassAndResources& pr) {
 	PassView v{};
-	if (pr.type == PassType::Compute) {
-		const auto& p = std::get<ComputePassAndResources>(pr.pass);
-		v.reqs = GetFrameRequirementsSpan(p.resources);
-		v.internalTransitions = &p.resources.internalTransitions;
-	}
-	else if (pr.type == PassType::Render) {
+	if (pr.type == PassType::Render) {
 		const auto& p = std::get<RenderPassAndResources>(pr.pass);
-		v.reqs = GetFrameRequirementsSpan(p.resources);
-		v.internalTransitions = &p.resources.internalTransitions;
-	}
-	else if (pr.type == PassType::Copy) {
-		const auto& p = std::get<CopyPassAndResources>(pr.pass);
 		v.reqs = GetFrameRequirementsSpan(p.resources);
 		v.internalTransitions = &p.resources.internalTransitions;
 	}
@@ -1071,7 +849,6 @@ void RenderGraph::ShutdownOwnedState() {
 	m_masterPassList.clear();
 	m_compilerState->frameExtensions.clear();
 	renderPassesByName.clear();
-	computePassesByName.clear();
 	resourcesByID.clear();
 	resourcesByName.clear();
 	m_transientFrameResourcesByID.clear();
@@ -1281,7 +1058,6 @@ void RenderGraph::ResetForRebuild()
 	// Queue slots, their command-list pools, and timelines are runtime-owned and
 	// survive structural graph generations. They are released only at shutdown.
 	renderPassesByName.clear();
-	computePassesByName.clear();
 
 	_providerMap.clear();
 	_providers.clear();
@@ -1442,7 +1218,7 @@ void RenderGraph::CompileStructural() {
 			BT_ZONE_SCOPE("RenderGraph::CompileStructural::MaterializeExtensionPass");
 			BT_ZONE_TEXT(d.name.data(), d.name.size());
 			if (d.type == PassType::Unknown) continue;
-			if (std::holds_alternative<std::monostate>(d.pass) && !d.unifiedPass) continue;
+			if (!d.pass) continue;
 
 			ExtItem it;
 			if (m_getRenderGraphBatchTraceEnabled && m_getRenderGraphBatchTraceEnabled()) {
@@ -1782,12 +1558,10 @@ void RenderGraph::RedeclarePass(PassAndResources& p, PassType type)
 		resources.mergedFrameRequirementsDirty = true;
 		resources.internalTransitions = std::move(b.params.internalTransitions);
 		resources.identifierSet = std::move(b._declaredIds);
-		if constexpr (!std::is_same_v<Builder, CopyPassBuilder>) {
-			resources.autoDescriptorShaderResources = std::move(b.params.autoDescriptorShaderResources);
-			resources.autoDescriptorConstantBuffers = std::move(b.params.autoDescriptorConstantBuffers);
-			resources.autoDescriptorUnorderedAccessViews = std::move(b.params.autoDescriptorUnorderedAccessViews);
-			resources.activeFeatureDomains = std::move(b.params.activeFeatureDomains);
-		}
+		resources.autoDescriptorShaderResources = std::move(b.params.autoDescriptorShaderResources);
+		resources.autoDescriptorConstantBuffers = std::move(b.params.autoDescriptorConstantBuffers);
+		resources.autoDescriptorUnorderedAccessViews = std::move(b.params.autoDescriptorUnorderedAccessViews);
+		resources.activeFeatureDomains = std::move(b.params.activeFeatureDomains);
 		p.explicitExternalWaitsBeforeTransitions = b.params.externalWaitsBeforeTransitions;
 		resources.externalWaitsBeforeTransitions = std::move(b.params.externalWaitsBeforeTransitions);
 		resources.externalWaitBindingsBeforeTransitions = std::move(b.params.externalWaitBindingsBeforeTransitions);
@@ -1803,7 +1577,7 @@ void RenderGraph::RedeclarePass(PassAndResources& p, PassType type)
 		// rebuilt so automatic descriptor bindings follow it. Immediate-only upload and readback passes consume the
 		// resources captured in their bytecode and opt out.
 		const auto* dynamic = dynamic_cast<IDynamicDeclaredResources*>(p.pass.get());
-		const bool rebind = (!std::is_same_v<Builder, CopyPassBuilder> && !p.resolverSnapshots.empty())
+		const bool rebind = !p.resolverSnapshots.empty()
 			|| !dynamic || dynamic->RequiresPassRebindAfterDeclarationRefresh();
 		if (rebind) {
 			BT_ZONE_SCOPE("RenderGraph::RedeclarePass::Rebind");
@@ -1815,8 +1589,6 @@ void RenderGraph::RedeclarePass(PassAndResources& p, PassType type)
 	p.resolverGroupPlan.reset();
 	switch (type) {
 	case PassType::Render: redeclare(std::type_identity<RenderPassBuilder>{}, std::type_identity<RenderPass>{}, "Render"); break;
-	case PassType::Compute: redeclare(std::type_identity<ComputePassBuilder>{}, std::type_identity<ComputePass>{}, "Compute"); break;
-	case PassType::Copy: redeclare(std::type_identity<CopyPassBuilder>{}, std::type_identity<CopyPass>{}, "Copy"); break;
 	default: throw std::logic_error("Pass '" + p.name + "' has no declaration interface");
 	}
 }
@@ -2002,34 +1774,6 @@ void RenderGraph::Setup() {
 			}
 			break;
 		}
-		case PassType::Compute: {
-			auto& computePass = std::get<ComputePassAndResources>(pass.pass);
-			computePass.pass->ConfigureRuntimeServices(m_uploadService, m_descriptorService);
-			if (traceLifecycle) {
-				spdlog::info("RG setup compute pass '{}' begin", computePass.name);
-			}
-			computePass.pass->ConfigureResourceRegistryView(
-				MakePassResourceRegistryView(_registry, computePass.resources), computePass.resources);
-			computePass.pass->Setup();
-			if (traceLifecycle) {
-				spdlog::info("RG setup compute pass '{}' complete", computePass.name);
-			}
-			break;
-		}
-		case PassType::Copy: {
-			auto& copyPass = std::get<CopyPassAndResources>(pass.pass);
-			copyPass.pass->ConfigureRuntimeServices(m_uploadService, m_descriptorService);
-			if (traceLifecycle) {
-				spdlog::info("RG setup copy pass '{}' begin", copyPass.name);
-			}
-			copyPass.pass->ConfigureResourceRegistryView(
-				MakePassResourceRegistryView(_registry, copyPass.resources), copyPass.resources);
-			copyPass.pass->Setup();
-			if (traceLifecycle) {
-				spdlog::info("RG setup copy pass '{}' complete", copyPass.name);
-			}
-			break;
-		}
 		}
 	}, true);
 }
@@ -2055,49 +1799,6 @@ void RenderGraph::AddRenderPass(std::shared_ptr<RenderPass> pass, RenderPassPara
 	if (name != "") {
 		renderPassesByName[name] = std::move(pass);
 	}
-}
-
-void RenderGraph::AddComputePass(std::shared_ptr<ComputePass> pass, ComputePassParameters& resources, std::string name, std::vector<ResolverSnapshot> resolverSnapshots) {
-	ComputePassAndResources passAndResources;
-	passAndResources.pass = pass;
-	passAndResources.resources = resources;
-	passAndResources.name = name;
-	passAndResources.techniquePath = GetTechniquePathForPassName(name);
-	passAndResources.retainedAnonymousKeepAlive = CaptureRetainedAnonymousKeepAlive(
-		passAndResources.resources.staticResourceRequirements,
-		passAndResources.resources.internalTransitions);
-	passAndResources.resolverSnapshots = std::move(resolverSnapshots);
-	passAndResources.explicitExternalWaitsBeforeTransitions = resources.externalWaitsBeforeTransitions;
-	MergeResolverWaits(passAndResources.resources.externalWaitsBeforeTransitions, passAndResources.resolverSnapshots);
-	passAndResources.resolverGroupPlan = lowering::PlanResolverGroups(passAndResources);
-	AnyPassAndResources passAndResourcesAny;
-	passAndResourcesAny.type = PassType::Compute;
-	passAndResourcesAny.pass = std::move(passAndResources);
-	passAndResourcesAny.name = name;
-	m_masterPassList.push_back(std::move(passAndResourcesAny));
-	if (name != "") {
-		computePassesByName[name] = std::move(pass);
-	}
-}
-
-void RenderGraph::AddCopyPass(std::shared_ptr<CopyPass> pass, CopyPassParameters& resources, std::string name, std::vector<ResolverSnapshot> resolverSnapshots) {
-	CopyPassAndResources passAndResources;
-	passAndResources.pass = pass;
-	passAndResources.resources = resources;
-	passAndResources.name = name;
-	passAndResources.techniquePath = GetTechniquePathForPassName(name);
-	passAndResources.retainedAnonymousKeepAlive = CaptureRetainedAnonymousKeepAlive(
-		passAndResources.resources.staticResourceRequirements,
-		passAndResources.resources.internalTransitions);
-	passAndResources.resolverSnapshots = std::move(resolverSnapshots);
-	passAndResources.explicitExternalWaitsBeforeTransitions = resources.externalWaitsBeforeTransitions;
-	MergeResolverWaits(passAndResources.resources.externalWaitsBeforeTransitions, passAndResources.resolverSnapshots);
-	passAndResources.resolverGroupPlan = lowering::PlanResolverGroups(passAndResources);
-	AnyPassAndResources passAndResourcesAny;
-	passAndResourcesAny.type = PassType::Copy;
-	passAndResourcesAny.pass = std::move(passAndResources);
-	passAndResourcesAny.name = name;
-	m_masterPassList.push_back(std::move(passAndResourcesAny));
 }
 
 void RenderGraph::SetPassTechnique(std::string passName, std::string techniquePath) {
@@ -2244,15 +1945,6 @@ std::shared_ptr<Resource> RenderGraph::GetResourceByID(const uint64_t id) {
 std::shared_ptr<RenderPass> RenderGraph::GetRenderPassByName(const std::string& name) {
 	if (renderPassesByName.find(name) != renderPassesByName.end()) {
 		return renderPassesByName[name];
-	}
-	else {
-		return nullptr;
-	}
-}
-
-std::shared_ptr<ComputePass> RenderGraph::GetComputePassByName(const std::string& name) {
-	if (computePassesByName.find(name) != computePassesByName.end()) {
-		return computePassesByName[name];
 	}
 	else {
 		return nullptr;
@@ -2692,23 +2384,6 @@ RenderGraph::RequestResolverResourceHandles(const ResolverDeclarationState& stat
 }
 
 
-ComputePassBuilder& RenderGraph::GetOrCreateComputePassBuilder(std::string const& name) {
-	if (auto it = m_passBuildersByName.find(name); it != m_passBuildersByName.end()) {
-		if (m_passNamesSeenThisReset.contains(name)) {
-			throw std::runtime_error("Pass names must be unique.");
-		}
-		if (it->second->Kind() != PassBuilderKind::Compute) {
-			throw std::runtime_error("Pass builder name collision (render/compute/copy): " + name);
-		}
-		m_passBuilderOrder.push_back(it->second.get());
-		return static_cast<ComputePassBuilder&>(*(it->second));
-	}
-	m_passNamesSeenThisReset.insert(name);
-	auto ptr = std::unique_ptr<ComputePassBuilder>(new ComputePassBuilder(this, name));
-	m_passBuilderOrder.push_back(ptr.get());
-	m_passBuildersByName.emplace(name, std::move(ptr));
-	return static_cast<ComputePassBuilder&>(*(m_passBuildersByName[name]));
-}
 RenderPassBuilder& RenderGraph::GetOrCreateRenderPassBuilder(std::string const& name) {
 	if (auto it = m_passBuildersByName.find(name); it != m_passBuildersByName.end()) {
 		if (m_passNamesSeenThisReset.contains(name)) {
@@ -2726,31 +2401,6 @@ RenderPassBuilder& RenderGraph::GetOrCreateRenderPassBuilder(std::string const& 
 	m_passBuildersByName.emplace(name, std::move(ptr));
 	return static_cast<RenderPassBuilder&>(*(m_passBuildersByName[name]));
 }
-
-CopyPassBuilder& RenderGraph::GetOrCreateCopyPassBuilder(std::string const& name) {
-	if (auto it = m_passBuildersByName.find(name); it != m_passBuildersByName.end()) {
-		if (m_passNamesSeenThisReset.contains(name)) {
-			throw std::runtime_error("Pass names must be unique.");
-		}
-		if (it->second->Kind() != PassBuilderKind::Copy) {
-			throw std::runtime_error("Pass builder name collision (render/compute/copy): " + name);
-		}
-		m_passBuilderOrder.push_back(it->second.get());
-		return static_cast<CopyPassBuilder&>(*(it->second));
-	}
-	m_passNamesSeenThisReset.insert(name);
-	auto ptr = std::unique_ptr<CopyPassBuilder>(new CopyPassBuilder(this, name));
-	m_passBuilderOrder.push_back(ptr.get());
-	m_passBuildersByName.emplace(name, std::move(ptr));
-	return static_cast<CopyPassBuilder&>(*(m_passBuildersByName[name]));
-}
-
-//void RenderGraph::RegisterPassBuilder(RenderPassBuilder&& builder) {
-//	m_passBuildersByName[builder.passName] = std::move(builder);
-//}
-//void RenderGraph::RegisterPassBuilder(ComputePassBuilder&& builder) {
-//	m_passBuildersByName[builder.passName] = std::move(builder);
-//}
 
 QueueSlotIndex RenderGraph::CreateQueue(QueueKind kind, const char* name, QueueAutoAssignmentPolicy autoAssignmentPolicy) {
 	const char* logicalName = name ? name : "UserQueue";

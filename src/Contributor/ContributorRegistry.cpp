@@ -13,7 +13,7 @@ namespace org::contributor {
 
 namespace
 {
-	constexpr uint32_t kKnownUsageMask = (ORG_RG_USAGE_LEGACY_INTEROP << 1) - 1;
+	constexpr uint32_t kKnownUsageMask = (ORG_RG_USAGE_INDEX_BUFFER << 1) - 1;
 	constexpr uint32_t kKnownViewFlags = ORG_RG_VIEW_FLAG_RAW_BUFFER | ORG_RG_VIEW_FLAG_READ_ONLY_DEPTH |
 		ORG_RG_VIEW_FLAG_READ_ONLY_STENCIL;
 
@@ -41,7 +41,6 @@ namespace
 		case ORG_RG_ACCESS_COPY_DESTINATION: return ORG_RG_USAGE_COPY_DESTINATION;
 		case ORG_RG_ACCESS_INDIRECT_ARGUMENT: return ORG_RG_USAGE_INDIRECT_ARGUMENT;
 		case ORG_RG_ACCESS_INDEX_BUFFER: return ORG_RG_USAGE_INDEX_BUFFER;
-		case ORG_RG_ACCESS_LEGACY_INTEROP: return ORG_RG_USAGE_LEGACY_INTEROP;
 		default: return 0;
 		}
 	}
@@ -63,7 +62,7 @@ namespace
 		if (kind == ORG_RG_PASS_COMPUTE)
 			return access == ORG_RG_ACCESS_SHADER_RESOURCE || access == ORG_RG_ACCESS_CONSTANT_BUFFER ||
 				access == ORG_RG_ACCESS_UNORDERED_ACCESS || access == ORG_RG_ACCESS_UNORDERED_ACCESS_CLEAR ||
-				access == ORG_RG_ACCESS_INDIRECT_ARGUMENT || access == ORG_RG_ACCESS_LEGACY_INTEROP;
+				access == ORG_RG_ACCESS_INDIRECT_ARGUMENT;
 		return true;
 	}
 
@@ -82,6 +81,43 @@ namespace
 		default: return ORG_RG_VIEW_NONE;
 		}
 	}
+
+	bool WritesResource(ORGAccessKind access) noexcept
+	{
+		switch (access) {
+		case ORG_RG_ACCESS_UNORDERED_ACCESS:
+		case ORG_RG_ACCESS_UNORDERED_ACCESS_CLEAR:
+		case ORG_RG_ACCESS_RENDER_TARGET:
+		case ORG_RG_ACCESS_RENDER_TARGET_CLEAR:
+		case ORG_RG_ACCESS_DEPTH_READ_WRITE:
+		case ORG_RG_ACCESS_DEPTH_STENCIL_CLEAR:
+		case ORG_RG_ACCESS_COPY_DESTINATION: return true;
+		default: return false;
+		}
+	}
+
+	// An export as a resource description, so accesses to it validate like accesses to the contributor's own.
+	ORGResourceDesc ExportResourceDesc(const ORGExportDescriptor& source) noexcept
+	{
+		ORGResourceDesc desc{};
+		desc.structSize = sizeof(desc);
+		desc.apiVersion = ORG_RENDER_GRAPH_API_CURRENT;
+		desc.lifetime = ORG_RG_RESOURCE_PERSISTENT;
+		desc.dimension = source.dimension;
+		desc.format = source.format;
+		desc.byteSize = source.byteSize;
+		desc.structureByteStride = source.structureByteStride;
+		desc.width = source.width;
+		desc.height = source.height;
+		desc.depthOrArraySize = source.depthOrArraySize ? source.depthOrArraySize : 1;
+		desc.mipLevels = source.mipLevels ? source.mipLevels : 1;
+		desc.sampleCount = 1;
+		desc.allowedUsages = source.allowedUsages;
+		return desc;
+	}
+
+	// A contributor's resources and passes are named in its namespace: its id's first segment ("sarp." for "sarp.producer").
+	std::string Namespace(const std::string& contributor) { return contributor.substr(0, contributor.find('.') + 1); }
 
 	uint32_t ResolveExtent(float scale, uint32_t reference) noexcept
 	{
@@ -117,10 +153,12 @@ struct ContributorRegistry::Build
 ContributorRegistry::ContributorRegistry() = default;
 ContributorRegistry::~ContributorRegistry() = default;
 
-void ContributorRegistry::SetAnchors(std::vector<std::string> anchors)
+void ContributorRegistry::SetHostSymbols(std::vector<std::string> anchors, std::vector<std::string> epochs, std::vector<Export> exports)
 {
 	std::unique_lock lock(mutex_);
 	anchors_ = std::move(anchors);
+	epochs_ = std::move(epochs);
+	exports_ = std::move(exports);
 }
 
 bool ContributorRegistry::IsNamespaced(const char* value) noexcept
@@ -209,7 +247,7 @@ ORGStatus ContributorRegistry::DeclareResource(ORGBuildHandle buildHandle, const
 		desc->format >= ORG_RG_FORMAT_COUNT || (desc->allowedUsages & ~kKnownUsageMask) || desc->allowAlias > 1)
 		return ORG_RG_E_INVALID_ARGUMENT;
 	const std::string id(desc->id);
-	if (!id.starts_with(currentBuild_->contributor.id + ".") || id.starts_with("org.") ||
+	if (!id.starts_with(Namespace(currentBuild_->contributor.id)) || id.starts_with("org.") ||
 		std::ranges::find(anchors_, id) != anchors_.end()) return ORG_RG_E_RESERVED_ID;
 	if (std::ranges::any_of(currentBuild_->resources, [&](const Resource& r) { return r.id == id; }))
 		return ORG_RG_E_DUPLICATE_ID;
@@ -253,21 +291,23 @@ ORGStatus ContributorRegistry::DeclarePass(ORGBuildHandle buildHandle, const ORG
 	std::scoped_lock lock(buildMutex_);
 	if (!currentBuild_ || currentBuild_->handle != buildHandle) return ORG_RG_E_STALE_HANDLE;
 	if (buildThread_ != std::this_thread::get_id()) return ORG_RG_E_WRONG_THREAD;
-	constexpr uint32_t knownFlags = ORG_RG_PASS_PARALLEL_RECORDING_SAFE | ORG_RG_PASS_DISABLE_STATISTICS | ORG_RG_PASS_GEOMETRY;
-	if (!ValidHeader(desc) || !IsNamespaced(desc->id) || !desc->execute || !ValidPassQueue(desc->kind, desc->queue) ||
+	constexpr uint32_t knownFlags = ORG_RG_PASS_DISABLE_STATISTICS | ORG_RG_PASS_GEOMETRY;
+	if (!ValidHeader(desc) || !IsNamespaced(desc->id) || !desc->prepare || !ValidPassQueue(desc->kind, desc->queue) ||
 		(desc->flags & ~knownFlags) || !ValidCount(desc->featureDomains, desc->featureDomainCount) ||
 		!ValidCount(desc->after, desc->afterCount) || !ValidCount(desc->before, desc->beforeCount) ||
 		!ValidCount(desc->accesses, desc->accessCount)) return ORG_RG_E_INVALID_ARGUMENT;
 	const std::string id(desc->id);
-	if (!id.starts_with(currentBuild_->contributor.id + ".") || id.starts_with("org.") ||
+	if (!id.starts_with(Namespace(currentBuild_->contributor.id)) || id.starts_with("org.") ||
 		std::ranges::find(anchors_, id) != anchors_.end()) return ORG_RG_E_RESERVED_ID;
 	if (std::ranges::any_of(currentBuild_->passes, [&](const Pass& p) { return p.id == id; })) return ORG_RG_E_DUPLICATE_ID;
+	if (desc->epoch && std::ranges::find(epochs_, std::string_view(desc->epoch)) == epochs_.end()) return ORG_RG_E_MISSING_DEPENDENCY;
 	Pass pass{};
 	pass.contributor = currentBuild_->contributor.handle;
 	pass.id = id; pass.kind = desc->kind; pass.queue = desc->queue; pass.flags = desc->flags;
 	pass.priority = desc->priority; pass.technique = desc->techniquePath ? desc->techniquePath : "";
-	pass.prepare = desc->prepare; pass.update = desc->update; pass.execute = desc->execute;
-	pass.cleanup = desc->cleanup; pass.userData = currentBuild_->contributor.userData;
+	pass.epoch = desc->epoch ? desc->epoch : "";
+	pass.prepare = desc->prepare; pass.invocationRevision = desc->invocationRevision;
+	pass.userData = currentBuild_->contributor.userData;
 	std::unordered_set<uint32_t> bindings;
 	for (uint32_t i = 0; i < desc->featureDomainCount; ++i) {
 		if (!desc->featureDomains[i] || !*desc->featureDomains[i]) return ORG_RG_E_INVALID_ARGUMENT;
@@ -299,6 +339,7 @@ ORGStatus ContributorRegistry::DeclarePass(ORGBuildHandle buildHandle, const ORG
 		access.viewFlags = source.viewFlags; access.firstElement = source.firstElement;
 		access.elementCount = source.elementCount; access.structureByteStride = source.structureByteStride;
 		access.counterBinding = source.counterBinding;
+		std::copy(std::begin(source.clearValue), std::end(source.clearValue), access.clearValue);
 		pass.accesses.push_back(std::move(access));
 	}
 	currentBuild_->passes.push_back(std::move(pass));
@@ -332,6 +373,8 @@ bool ContributorRegistry::HasPendingRebuild() const noexcept
 ORGStatus ContributorRegistry::Compile(uint64_t generation, uint32_t renderWidth, uint32_t renderHeight,
 	uint32_t outputWidth, uint32_t outputHeight, Candidate& output) noexcept
 {
+	// A failed compile does not request another: the next registration, unregistration or RequestRebuild does, so a
+	// host that builds whenever one is requested does not rebuild every frame over a broken declaration.
 	std::vector<Contributor> snapshot;
 	{
 		std::unique_lock lock(mutex_);
@@ -361,7 +404,7 @@ ORGStatus ContributorRegistry::Compile(uint64_t generation, uint32_t renderWidth
 		if (status != ORG_RG_OK) {
 			SetDiagnostic(contributor.handle, status, 1, generation, "Contributor declaration callback failed");
 			if (contributor.kind == ORG_RG_CONTRIBUTOR_REQUIRED) {
-				std::unique_lock lock(mutex_); rebuildRequested_ = true; return status;
+				return status;
 			}
 			continue;
 		}
@@ -371,20 +414,31 @@ ORGStatus ContributorRegistry::Compile(uint64_t generation, uint32_t renderWidth
 		included.emplace(contributor.handle, contributor);
 	}
 
+	// Exports resolve like contributor resources (handle 0, no contributor: never omitted).
+	std::vector<Resource> exports;
+	for (const auto& source : exports_) exports.push_back({0, 0, source.id, ExportResourceDesc(source.desc)});
 	std::unordered_map<std::string, Resource*> resources;
+	for (auto& resource : exports) resources.emplace(resource.id, &resource);
+	bool relative = false;
 	for (auto& resource : candidate.resources) {
+		relative = relative || resource.desc.sizing != ORG_RG_SIZE_ABSOLUTE;
 		if (!resources.emplace(resource.id, &resource).second) {
 			SetDiagnostic(resource.contributor, ORG_RG_E_DUPLICATE_ID, 2, generation, "Duplicate resource identifier: " + resource.id);
-			std::unique_lock lock(mutex_); rebuildRequested_ = true; return ORG_RG_E_DUPLICATE_ID;
+			return ORG_RG_E_DUPLICATE_ID;
 		}
-		if (resource.desc.dimension != ORG_RG_RESOURCE_BUFFER && resource.desc.sizing != ORG_RG_SIZE_ABSOLUTE) {
+		if (resource.desc.dimension == ORG_RG_RESOURCE_BUFFER && resource.desc.sizing != ORG_RG_SIZE_ABSOLUTE) {
+			const uint64_t pixels = resource.desc.sizing == ORG_RG_SIZE_RENDER_RELATIVE
+				? uint64_t{renderWidth} * renderHeight : uint64_t{outputWidth} * outputHeight;
+			resource.desc.byteSize *= (std::max)(pixels, uint64_t{1});
+			resource.desc.sizing = ORG_RG_SIZE_ABSOLUTE;
+		} else if (resource.desc.dimension != ORG_RG_RESOURCE_BUFFER && resource.desc.sizing != ORG_RG_SIZE_ABSOLUTE) {
 			const auto referenceWidth = resource.desc.sizing == ORG_RG_SIZE_RENDER_RELATIVE ? renderWidth : outputWidth;
 			const auto referenceHeight = resource.desc.sizing == ORG_RG_SIZE_RENDER_RELATIVE ? renderHeight : outputHeight;
 			resource.desc.width = ResolveExtent(resource.desc.widthScale, referenceWidth);
 			resource.desc.height = ResolveExtent(resource.desc.heightScale, referenceHeight);
 			resource.desc.sizing = ORG_RG_SIZE_ABSOLUTE;
 			if (!resource.desc.width || !resource.desc.height) {
-				std::unique_lock lock(mutex_); rebuildRequested_ = true; return ORG_RG_E_INVALID_ARGUMENT;
+				return ORG_RG_E_INVALID_ARGUMENT;
 			}
 		}
 	}
@@ -408,7 +462,7 @@ ORGStatus ContributorRegistry::Compile(uint64_t generation, uint32_t renderWidth
 				if (contributor.kind == ORG_RG_CONTRIBUTOR_REQUIRED) {
 					SetDiagnostic(pass.contributor, ORG_RG_E_MISSING_DEPENDENCY, 2, generation,
 						"Missing required ordering dependency: " + missingOrder);
-					std::unique_lock lock(mutex_); rebuildRequested_ = true; return ORG_RG_E_MISSING_DEPENDENCY;
+					return ORG_RG_E_MISSING_DEPENDENCY;
 				}
 				omitted.insert(pass.contributor); changed = true;
 				SetDiagnostic(pass.contributor, ORG_RG_E_MISSING_DEPENDENCY, 2, generation,
@@ -421,7 +475,7 @@ ORGStatus ContributorRegistry::Compile(uint64_t generation, uint32_t renderWidth
 					const auto& contributor = included.at(pass.contributor);
 					if (contributor.kind == ORG_RG_CONTRIBUTOR_REQUIRED) {
 						SetDiagnostic(pass.contributor, ORG_RG_E_MISSING_DEPENDENCY, 2, generation, "Missing required resource: " + access.resourceId);
-						std::unique_lock lock(mutex_); rebuildRequested_ = true; return ORG_RG_E_MISSING_DEPENDENCY;
+						return ORG_RG_E_MISSING_DEPENDENCY;
 					}
 					omitted.insert(pass.contributor); changed = true;
 					SetDiagnostic(pass.contributor, ORG_RG_E_MISSING_DEPENDENCY, 2, generation, "Optional contributor omitted; resource unavailable: " + access.resourceId);
@@ -434,82 +488,100 @@ ORGStatus ContributorRegistry::Compile(uint64_t generation, uint32_t renderWidth
 	std::erase_if(candidate.passes, [&](const Pass& pass) { return omitted.contains(pass.contributor); });
 	std::erase_if(candidate.contributors, [&](uint64_t handle) { return omitted.contains(handle); });
 	resources.clear();
+	for (auto& resource : exports) resources.emplace(resource.id, &resource);
 	for (auto& resource : candidate.resources) resources.emplace(resource.id, &resource);
 	for (auto& pass : candidate.passes) for (auto& access : pass.accesses) {
 		auto* resource = resources.at(access.resourceId);
+		if (!resource->handle) {
+			const auto exportIt = std::ranges::find(exports_, access.resourceId, &Export::id);
+			const auto flags = exportIt->desc.flags;
+			if (!(flags & (WritesResource(access.kind) ? ORG_RG_EXPORT_WRITABLE : ORG_RG_EXPORT_READABLE))) {
+				SetDiagnostic(pass.contributor, ORG_RG_E_INCOMPATIBLE_RESOURCE, 2, generation,
+					std::string(WritesResource(access.kind) ? "Export is not writable: " : "Export is not readable: ") + access.resourceId);
+				return ORG_RG_E_INCOMPATIBLE_RESOURCE;
+			}
+			access.exportIndex = static_cast<uint32_t>(exportIt - exports_.begin());
+		}
 		if ((resource->desc.allowedUsages & UsageForAccess(access.kind)) == 0) {
 			SetDiagnostic(pass.contributor, ORG_RG_E_INCOMPATIBLE_RESOURCE, 2, generation, "Resource usage was not declared: " + access.resourceId);
-			std::unique_lock lock(mutex_); rebuildRequested_ = true; return ORG_RG_E_INCOMPATIBLE_RESOURCE;
+			return ORG_RG_E_INCOMPATIBLE_RESOURCE;
 		}
 		const uint32_t mipCount = access.range.mipCount == UINT32_MAX ? resource->desc.mipLevels - access.range.firstMip : access.range.mipCount;
 		const uint32_t slices = resource->desc.dimension == ORG_RG_RESOURCE_BUFFER ? 1u : resource->desc.depthOrArraySize;
 		const uint32_t sliceCount = access.range.arraySize == UINT32_MAX ? slices - access.range.firstArraySlice : access.range.arraySize;
 		if (access.range.firstMip >= resource->desc.mipLevels || mipCount > resource->desc.mipLevels - access.range.firstMip ||
 			access.range.firstArraySlice >= slices || sliceCount > slices - access.range.firstArraySlice) {
-			std::unique_lock lock(mutex_); rebuildRequested_ = true; return ORG_RG_E_INVALID_ARGUMENT;
+			return ORG_RG_E_INVALID_ARGUMENT;
 		}
 		const auto expectedView = DefaultViewKind(access.kind);
 		if (access.viewKind != expectedView) {
 			SetDiagnostic(pass.contributor, ORG_RG_E_INCOMPATIBLE_RESOURCE, 2, generation,
 				"View kind does not match access for resource: " + access.resourceId);
-			std::unique_lock lock(mutex_); rebuildRequested_ = true; return ORG_RG_E_INCOMPATIBLE_RESOURCE;
+			return ORG_RG_E_INCOMPATIBLE_RESOURCE;
 		}
 		if (resource->desc.dimension == ORG_RG_RESOURCE_BUFFER) {
 			if (access.range.firstMip != 0 || (access.range.mipCount != 1 && access.range.mipCount != UINT32_MAX) ||
 				access.range.firstArraySlice != 0 || (access.range.arraySize != 1 && access.range.arraySize != UINT32_MAX) ||
 				(access.viewDimension != ORG_RG_VIEW_DIMENSION_DEFAULT && access.viewDimension != ORG_RG_VIEW_DIMENSION_BUFFER) ||
 				(access.viewFlags & (ORG_RG_VIEW_FLAG_READ_ONLY_DEPTH | ORG_RG_VIEW_FLAG_READ_ONLY_STENCIL))) {
-				std::unique_lock lock(mutex_); rebuildRequested_ = true; return ORG_RG_E_INCOMPATIBLE_RESOURCE;
+				return ORG_RG_E_INCOMPATIBLE_RESOURCE;
 			}
 			access.viewDimension = ORG_RG_VIEW_DIMENSION_BUFFER;
 			if (expectedView == ORG_RG_VIEW_NONE) {
 				if (access.viewFormat != ORG_RG_FORMAT_UNKNOWN || access.viewFlags || access.firstElement ||
 					access.elementCount != UINT32_MAX || access.structureByteStride) {
-					std::unique_lock lock(mutex_); rebuildRequested_ = true; return ORG_RG_E_INVALID_ARGUMENT;
+					return ORG_RG_E_INVALID_ARGUMENT;
 				}
 			} else if (expectedView == ORG_RG_VIEW_CONSTANT_BUFFER) {
 				const uint64_t bytes = access.elementCount == UINT32_MAX ? resource->desc.byteSize - access.firstElement : access.elementCount;
 				if (access.viewFormat != ORG_RG_FORMAT_UNKNOWN || access.viewFlags || access.structureByteStride ||
 					access.firstElement > resource->desc.byteSize || bytes > resource->desc.byteSize - access.firstElement ||
 					bytes > UINT32_MAX || (access.firstElement & 255u) || (bytes & 255u)) {
-					std::unique_lock lock(mutex_); rebuildRequested_ = true; return ORG_RG_E_INCOMPATIBLE_RESOURCE;
+					return ORG_RG_E_INCOMPATIBLE_RESOURCE;
 				}
 			} else {
 				const bool raw = (access.viewFlags & ORG_RG_VIEW_FLAG_RAW_BUFFER) != 0;
+				// The host binds each buffer's whole default view: raw for unstructured buffers, structured otherwise.
+				if (access.firstElement || access.elementCount != UINT32_MAX || access.viewFormat != ORG_RG_FORMAT_UNKNOWN
+					|| raw != (resource->desc.structureByteStride == 0)) {
+					SetDiagnostic(pass.contributor, ORG_RG_E_UNSUPPORTED_CAPABILITY, 2, generation,
+						"Buffer views cover the whole buffer, raw or with its structure stride: " + access.resourceId);
+					return ORG_RG_E_UNSUPPORTED_CAPABILITY;
+				}
 				if (access.counterBinding && (expectedView != ORG_RG_VIEW_UNORDERED_ACCESS || raw ||
 					!resource->desc.structureByteStride)) {
-					std::unique_lock lock(mutex_); rebuildRequested_ = true; return ORG_RG_E_INCOMPATIBLE_RESOURCE;
+					return ORG_RG_E_INCOMPATIBLE_RESOURCE;
 				}
 				if (raw && (access.structureByteStride || access.viewFormat != ORG_RG_FORMAT_UNKNOWN || (resource->desc.byteSize & 3u))) {
-					std::unique_lock lock(mutex_); rebuildRequested_ = true; return ORG_RG_E_INCOMPATIBLE_RESOURCE;
+					return ORG_RG_E_INCOMPATIBLE_RESOURCE;
 				}
 				if (!raw) {
 					if (!access.structureByteStride) access.structureByteStride = resource->desc.structureByteStride;
 					if (resource->desc.structureByteStride && access.structureByteStride != resource->desc.structureByteStride) {
-						std::unique_lock lock(mutex_); rebuildRequested_ = true; return ORG_RG_E_INCOMPATIBLE_RESOURCE;
+						return ORG_RG_E_INCOMPATIBLE_RESOURCE;
 					}
 					if (!access.structureByteStride && access.viewFormat == ORG_RG_FORMAT_UNKNOWN) {
-						std::unique_lock lock(mutex_); rebuildRequested_ = true; return ORG_RG_E_INCOMPATIBLE_RESOURCE;
+						return ORG_RG_E_INCOMPATIBLE_RESOURCE;
 					}
 				}
 				const uint64_t stride = raw ? 4u : access.structureByteStride ? access.structureByteStride : 1u;
 				const uint64_t elements = resource->desc.byteSize / stride;
 				const uint64_t count = access.elementCount == UINT32_MAX ? elements - access.firstElement : access.elementCount;
 				if (access.firstElement > elements || count > elements - access.firstElement || count > UINT32_MAX) {
-					std::unique_lock lock(mutex_); rebuildRequested_ = true; return ORG_RG_E_INVALID_ARGUMENT;
+					return ORG_RG_E_INVALID_ARGUMENT;
 				}
 			}
 		} else {
 			if (access.firstElement || access.elementCount != UINT32_MAX || access.structureByteStride ||
 				(access.viewFlags & ORG_RG_VIEW_FLAG_RAW_BUFFER) || access.counterBinding) {
-				std::unique_lock lock(mutex_); rebuildRequested_ = true; return ORG_RG_E_INCOMPATIBLE_RESOURCE;
+				return ORG_RG_E_INCOMPATIBLE_RESOURCE;
 			}
 			if (expectedView == ORG_RG_VIEW_NONE && (access.viewFormat != ORG_RG_FORMAT_UNKNOWN || access.viewFlags)) {
-				std::unique_lock lock(mutex_); rebuildRequested_ = true; return ORG_RG_E_INVALID_ARGUMENT;
+				return ORG_RG_E_INVALID_ARGUMENT;
 			}
 			if (expectedView != ORG_RG_VIEW_DEPTH_STENCIL &&
 				(access.viewFlags & (ORG_RG_VIEW_FLAG_READ_ONLY_DEPTH | ORG_RG_VIEW_FLAG_READ_ONLY_STENCIL))) {
-				std::unique_lock lock(mutex_); rebuildRequested_ = true; return ORG_RG_E_INCOMPATIBLE_RESOURCE;
+				return ORG_RG_E_INCOMPATIBLE_RESOURCE;
 			}
 			if (access.viewDimension == ORG_RG_VIEW_DIMENSION_DEFAULT) {
 				if (resource->desc.dimension == ORG_RG_RESOURCE_TEXTURE_1D)
@@ -529,32 +601,32 @@ ORGStatus ContributorRegistry::Compile(uint64_t generation, uint32_t renderWidth
 					 access.viewDimension == ORG_RG_VIEW_DIMENSION_TEXTURE_CUBE || access.viewDimension == ORG_RG_VIEW_DIMENSION_TEXTURE_CUBE_ARRAY)) ||
 				(resource->desc.dimension == ORG_RG_RESOURCE_TEXTURE_3D && access.viewDimension == ORG_RG_VIEW_DIMENSION_TEXTURE_3D);
 			if (!validDimension) {
-				std::unique_lock lock(mutex_); rebuildRequested_ = true; return ORG_RG_E_INCOMPATIBLE_RESOURCE;
+				return ORG_RG_E_INCOMPATIBLE_RESOURCE;
 			}
 			if (resource->desc.sampleCount > 1 && access.viewDimension != ORG_RG_VIEW_DIMENSION_TEXTURE_2D_MS &&
 				access.viewDimension != ORG_RG_VIEW_DIMENSION_TEXTURE_2D_MS_ARRAY) {
-				std::unique_lock lock(mutex_); rebuildRequested_ = true; return ORG_RG_E_INCOMPATIBLE_RESOURCE;
+				return ORG_RG_E_INCOMPATIBLE_RESOURCE;
 			}
 			if (resource->desc.sampleCount > 1 && expectedView == ORG_RG_VIEW_UNORDERED_ACCESS) {
-				std::unique_lock lock(mutex_); rebuildRequested_ = true; return ORG_RG_E_UNSUPPORTED_CAPABILITY;
+				return ORG_RG_E_UNSUPPORTED_CAPABILITY;
 			}
 			if ((access.viewDimension == ORG_RG_VIEW_DIMENSION_TEXTURE_CUBE ||
 				access.viewDimension == ORG_RG_VIEW_DIMENSION_TEXTURE_CUBE_ARRAY) &&
 				expectedView != ORG_RG_VIEW_SHADER_RESOURCE) {
-				std::unique_lock lock(mutex_); rebuildRequested_ = true; return ORG_RG_E_INCOMPATIBLE_RESOURCE;
+				return ORG_RG_E_INCOMPATIBLE_RESOURCE;
 			}
 			if (resource->desc.dimension == ORG_RG_RESOURCE_TEXTURE_3D && expectedView == ORG_RG_VIEW_DEPTH_STENCIL) {
-				std::unique_lock lock(mutex_); rebuildRequested_ = true; return ORG_RG_E_INCOMPATIBLE_RESOURCE;
+				return ORG_RG_E_INCOMPATIBLE_RESOURCE;
 			}
 			if ((expectedView == ORG_RG_VIEW_RENDER_TARGET || expectedView == ORG_RG_VIEW_DEPTH_STENCIL ||
 				expectedView == ORG_RG_VIEW_UNORDERED_ACCESS) && mipCount != 1) {
-				std::unique_lock lock(mutex_); rebuildRequested_ = true; return ORG_RG_E_INCOMPATIBLE_RESOURCE;
+				return ORG_RG_E_INCOMPATIBLE_RESOURCE;
 			}
 			if ((access.viewDimension == ORG_RG_VIEW_DIMENSION_TEXTURE_CUBE &&
 				(access.range.firstArraySlice != 0 || sliceCount != 6)) ||
 				(access.viewDimension == ORG_RG_VIEW_DIMENSION_TEXTURE_CUBE_ARRAY &&
 				((access.range.firstArraySlice % 6) || (sliceCount % 6)))) {
-				std::unique_lock lock(mutex_); rebuildRequested_ = true; return ORG_RG_E_INCOMPATIBLE_RESOURCE;
+				return ORG_RG_E_INCOMPATIBLE_RESOURCE;
 			}
 		}
 		access.resource = resource->handle;
@@ -562,10 +634,11 @@ ORGStatus ContributorRegistry::Compile(uint64_t generation, uint32_t renderWidth
 
 	std::unordered_set<std::string> passIds;
 	for (const auto& pass : candidate.passes) if (!passIds.insert(pass.id).second) {
-		std::unique_lock lock(mutex_); rebuildRequested_ = true; return ORG_RG_E_DUPLICATE_ID;
+		return ORG_RG_E_DUPLICATE_ID;
 	}
 	// Ordering and cycle detection intentionally remain authoritative in ORG's
 	// dependency compiler. The contributor layer only validates symbolic inputs.
+	relativeResources_ = relative;
 	output = std::move(candidate);
 	return ORG_RG_OK;
 }

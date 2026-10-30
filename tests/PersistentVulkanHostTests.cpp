@@ -409,6 +409,9 @@ bool Matches(const HostBuffer& buffer, uint32_t value) {
 } // namespace
 
 int TestFrameRetirement(rhi::Device device, rhi::Backend backend);
+int TestContributors(rhi::Device device, const std::function<std::shared_ptr<org::Resource>()>& importOutput, const uint32_t* mapped,
+	const char* spirvPath,
+	rhi::PipelineLayoutHandle layout);
 
 static int Run(int argc, char** argv) {
 	// "reuse": async epochs that keep and resubmit their recordings (GraphHost::Desc::reuseRecordings).
@@ -422,6 +425,8 @@ static int Run(int argc, char** argv) {
 	// execution, in a primary of the test's, submitted with the execution's waits and signals.
 	const bool external = externalReuse || (argc > 1 && std::strcmp(argv[1], "external") == 0);
 	const bool async = reuse || revision || external || (argc > 1 && std::strcmp(argv[1], "async") == 0);
+	// "contributor": a contributor registered through the C table (ContributorHostTests.cpp) instead of the graph scenario.
+	const bool contributor = argc > 1 && std::strcmp(argv[1], "contributor") == 0;
 	HostDevice host;
 	if (const int created = CreateHostDevice(host); created != 0) {
 		std::puts(created == 77 ? "SKIP: no Vulkan device with VK_EXT_descriptor_heap" : "FAIL: host device");
@@ -452,6 +457,15 @@ static int Run(int argc, char** argv) {
 		rhi::DevicePtr device;
 		REQUIRE(rhi::vulkan::AdoptVulkanDevice(info, device) == rhi::Result::Ok, "AdoptVulkanDevice");
 		REQUIRE(TestFrameRetirement(device.Get(), rhi::Backend::Vulkan) == 0, "descriptor and frame retirement");
+		if (contributor) {
+			auto program = CreateProgram(device.Get());
+			REQUIRE(program, "compute program");
+			const auto importOutput = [&]() -> std::shared_ptr<org::Resource> {
+				return ImportHostBuffer(device.Get(), second, "test.contributor-output");
+			};
+			REQUIRE(TestContributors(device.Get(), importOutput, second.mapped, ORG_TEST_PERSISTENT_WRITE_SPV,
+				program->layout->GetHandle()) == 0, "contributors");
+		} else {
 		// The host registers the runtime device, owns the task service and upload
 		// pass, and drives persistent execution with the external queue boundary.
 		org::GraphHost host({.device = device.Get(), .backend = rhi::Backend::Vulkan,
@@ -1090,6 +1104,7 @@ static int Run(int argc, char** argv) {
 			}
 			host.DestroyGraph();
 		}
+		}
 	}
 
 	REQUIRE(vkDeviceWaitIdle(host.device) == VK_SUCCESS, "host device survives ORG and BasicRHI shutdown");
@@ -1097,7 +1112,7 @@ static int Run(int argc, char** argv) {
 	DestroyHostBuffer(host, second);
 	vkDestroyDevice(host.device, nullptr);
 	vkDestroyInstance(host.instance, nullptr);
-	std::printf("PersistentVulkanHostTests: ok (%s, locks=%d)\n", external ? "external" : async ? "async" : "sync", counters.locks.load());
+	std::printf("PersistentVulkanHostTests: ok (%s, locks=%d)\n", contributor ? "contributor" : external ? "external" : async ? "async" : "sync", counters.locks.load());
 	return 0;
 }
 

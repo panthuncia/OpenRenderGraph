@@ -441,7 +441,7 @@ std::vector<RenderGraph::ExternalPassDesc> RenderGraph::UpdatePersistentFrameInt
 	std::unordered_map<uint32_t, uint32_t> insertedAt; // anchor main index -> passes inserted there
 	constexpr uint32_t stride = persistent::GraphEditTransaction::kAuthoredOrderStride;
 	for (auto& desc : requested) {
-		if (desc.type == PassType::Unknown || (std::holds_alternative<std::monostate>(desc.pass) && !desc.unifiedPass) || desc.name.empty()) continue;
+		if (desc.type == PassType::Unknown || !desc.pass || desc.name.empty()) continue;
 		std::vector<uint32_t> after, before;
 		if (desc.where) {
 			for (const auto& name : desc.where->after) if (const auto found = byName.find(name); found != byName.end()) after.push_back(found->second);

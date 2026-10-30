@@ -1640,7 +1640,7 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 		// as the legacy path does.
 		state.frameExtensionPasses.clear();
 		for (auto& d : frameExt) {
-			if (d.type == PassType::Unknown || (std::holds_alternative<std::monostate>(d.pass) && !d.unifiedPass) || d.name.empty()) continue;
+			if (d.type == PassType::Unknown || !d.pass || d.name.empty()) continue;
 			state.frameExtensionPasses.push_back(MaterializeExternalPass(d, true, false));
 		}
 		state.tail = buildSegment("Tail", state.tailMasterIndices, state.frameExtensionPasses, false, state.tailCache, state.tailPrograms);

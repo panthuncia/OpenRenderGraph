@@ -52,15 +52,4 @@ void BuilderGraphAccess::AddRenderPass(RenderGraph* graph, std::shared_ptr<Rende
     graph->AddRenderPass(std::move(pass), resources, std::move(name), std::move(resolverSnapshots));
 }
 
-void BuilderGraphAccess::AddComputePass(RenderGraph* graph, std::shared_ptr<ComputePass> pass, ComputePassParameters& resources, std::string name,
-    std::vector<ResolverSnapshot> resolverSnapshots) {
-    graph->AddComputePass(std::move(pass), resources, std::move(name), std::move(resolverSnapshots));
-}
-
-void BuilderGraphAccess::AddCopyPass(RenderGraph* graph, std::shared_ptr<CopyPass> pass, CopyPassParameters& resources, std::string name,
-    std::vector<ResolverSnapshot> resolverSnapshots) {
-    graph->AddCopyPass(std::move(pass), resources, std::move(name), std::move(resolverSnapshots));
-}
-
-
 } // namespace org

@@ -94,7 +94,9 @@ endif()
 
 add_library(OpenRenderGraph STATIC
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Contributor/ContributorRegistry.cpp"
-	"${CMAKE_CURRENT_SOURCE_DIR}/src/Contributor/ExtensionRegistry.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/src/Contributor/BorrowedRecorder.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/src/Contributor/ContributorHost.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/src/Contributor/DeviceTable.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Host/GraphHost.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Telemetry/NvPerfCapture.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/include/OpenRenderGraph/GraphHost.h"
@@ -115,7 +117,6 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/RenderGraph/CompileTelemetry.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/PublicationBindingBundle.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/PreparedInvocationArena.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/External/ContributorRuntime.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/CommandListPool.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/QueueRegistry.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/ImmediateExecution/ImmediateCommandList.cpp"
@@ -427,8 +428,16 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
     endif() # _org_d3d12_tests
     add_executable(OpenRenderGraphContributorHeaderC tests/ContributorHeaderCompile.c)
     set_target_properties(OpenRenderGraphContributorHeaderC PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
-    target_include_directories(OpenRenderGraphContributorHeaderC PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_include_directories(OpenRenderGraphContributorHeaderC PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        "$<TARGET_PROPERTY:BasicRHI::BasicRHI,INTERFACE_INCLUDE_DIRECTORIES>")
     add_test(NAME OpenRenderGraphContributorHeaderC COMMAND OpenRenderGraphContributorHeaderC)
+    if(WIN32)
+        # A contributor module (samples/ContributorSample.cpp), against the C header alone: a host's in-game check loads it.
+        add_library(ORGContributorSample SHARED samples/ContributorSample.cpp)
+        target_compile_features(ORGContributorSample PRIVATE cxx_std_20)
+        target_include_directories(ORGContributorSample PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "$<TARGET_PROPERTY:BasicRHI::BasicRHI,INTERFACE_INCLUDE_DIRECTORIES>")
+    endif()
     add_executable(OpenRenderGraphContributorRegistryTests tests/ContributorRegistryTests.cpp)
     target_compile_features(OpenRenderGraphContributorRegistryTests PRIVATE cxx_std_23)
     target_link_libraries(OpenRenderGraphContributorRegistryTests PRIVATE OpenRenderGraph)
@@ -445,7 +454,8 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
             basicrhi_compile_spirv(OUTPUT "${_org_persistent_write_spv}"
                 SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/PersistentHostWrite.hlsl"
                 ENTRY main PROFILE cs_6_6)
-            add_executable(OpenRenderGraphPersistentVulkanHostTests tests/PersistentVulkanHostTests.cpp tests/FrameRetirementTests.cpp tests/BindingOwnershipTests.cpp "${_org_persistent_write_spv}")
+            add_executable(OpenRenderGraphPersistentVulkanHostTests tests/PersistentVulkanHostTests.cpp tests/FrameRetirementTests.cpp tests/BindingOwnershipTests.cpp
+                tests/ContributorHostTests.cpp "${_org_persistent_write_spv}")
             target_compile_features(OpenRenderGraphPersistentVulkanHostTests PRIVATE cxx_std_23)
             target_include_directories(OpenRenderGraphPersistentVulkanHostTests PRIVATE src/include)
             target_compile_definitions(OpenRenderGraphPersistentVulkanHostTests PRIVATE NOMINMAX
@@ -476,8 +486,10 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests.Reuse COMMAND OpenRenderGraphPersistentVulkanHostTests reuse)
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests.Revision COMMAND OpenRenderGraphPersistentVulkanHostTests revision)
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests.External COMMAND OpenRenderGraphPersistentVulkanHostTests external)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.Contributor COMMAND OpenRenderGraphPersistentVulkanHostTests contributor)
             set_tests_properties(OpenRenderGraphPersistentVulkanHostTests OpenRenderGraphPersistentVulkanHostTests.Async
-                OpenRenderGraphPersistentVulkanHostTests.Reuse OpenRenderGraphPersistentVulkanHostTests.Revision PROPERTIES TIMEOUT 60)
+                OpenRenderGraphPersistentVulkanHostTests.Reuse OpenRenderGraphPersistentVulkanHostTests.Revision
+                OpenRenderGraphPersistentVulkanHostTests.Contributor PROPERTIES TIMEOUT 60)
         endif()
     endif()
     if(WIN32 AND BASICRENDERER_TEST_RUNTIME_DIR)

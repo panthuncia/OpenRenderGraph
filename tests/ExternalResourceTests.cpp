@@ -332,7 +332,7 @@ struct EmptyResolver final : org::ClonableResolver<EmptyResolver> {
 		return state;
 	}
 };
-struct DeclarationTestPass final : org::ComputePass {
+struct DeclarationTestPass final : org::RenderPass {
 	void Setup() override {}
 	void Cleanup() override {}
 };
@@ -341,9 +341,9 @@ int TestEmptyResolverDeclarations(rhi::Device device) {
 	auto resolver = std::make_shared<EmptyResolver>();
 	const org::ResourceIdentifier identifier("test.empty-resolver");
 	graph.RegisterResolver(identifier, resolver);
-	auto& direct = graph.BuildComputePass<DeclarationTestPass>("Direct");
+	auto& direct = graph.BuildRenderPass<DeclarationTestPass>("Direct");
 	direct.ShaderResource(*resolver);
-	auto& symbolic = graph.BuildComputePass<DeclarationTestPass>("Symbolic");
+	auto& symbolic = graph.BuildRenderPass<DeclarationTestPass>("Symbolic");
 	symbolic.ShaderResource(identifier);
 	auto directStates = direct.TakeResolverSnapshots();
 	auto symbolicStates = symbolic.TakeResolverSnapshots();
@@ -359,7 +359,7 @@ int TestEmptyResolverDeclarations(rhi::Device device) {
 	CHECK(a.declaredRequirementTemplates[0].state == b.declaredRequirementTemplates[0].state);
 	CHECK(a.declaredRequirementTemplates[0].state.sync == b.declaredRequirementTemplates[0].state.sync);
 	// Multiple authored uses must survive an empty initial capture, too.
-	auto& multiple = graph.BuildComputePass<DeclarationTestPass>("Multiple");
+	auto& multiple = graph.BuildRenderPass<DeclarationTestPass>("Multiple");
 	multiple.ShaderResource(*resolver);
 	multiple.UnorderedAccess(*resolver);
 	multiple.ShaderResource(*resolver);
@@ -395,7 +395,7 @@ int TestDeclarationCapturesOneSet(rhi::Device device) {
 	auto resolver = std::make_shared<RacingResolver>();
 	for (int i = 0; i < 4; ++i)
 		resolver->identity->pool.push_back(org::Buffer::CreateSharedUnmaterialized(rhi::HeapType::DeviceLocal, 256, true));
-	auto& pass = graph.BuildComputePass<DeclarationTestPass>("Racing");
+	auto& pass = graph.BuildRenderPass<DeclarationTestPass>("Racing");
 	{
 		const org::RenderGraph::ResolverCaptureScope captures;
 		pass.ShaderResource(*resolver);

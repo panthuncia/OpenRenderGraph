@@ -18,8 +18,6 @@
 #include <BasicTelemetry/Tracy.h>
 
 #include "RenderPasses/Base/RenderPass.h"
-#include "RenderPasses/Base/ComputePass.h"
-#include "RenderPasses/Base/CopyPass.h"
 #include "Resources/ResourceStateTracker.h"
 #include "Interfaces/IResourceProvider.h"
 #include "Render/ResourceRegistry.h"
@@ -48,8 +46,6 @@ namespace org {
 
 class Resource;
 class RenderPassBuilder;
-class ComputePassBuilder;
-class CopyPassBuilder;
 class ExternalEpochExecution;
 struct IPassBuilder;
 struct IDynamicDeclaredResources;
@@ -142,8 +138,6 @@ public:
 	// Transitional tags preserve the current compiler variant while all three
 	// ingestion paths now share one queue-agnostic stored representation.
 	struct RenderPassAndResources : PassAndResources {};
-	struct ComputePassAndResources : PassAndResources {};
-	struct CopyPassAndResources : PassAndResources {};
 
 	struct PresentDependency {
 		rhi::Queue queue;
@@ -169,8 +163,6 @@ public:
 		ui::FrameGraphSnapshot& out,
 		const std::vector<org::memory::ResourceMemoryRecord>& memoryRecords) const;
 	void AddRenderPass(std::shared_ptr<RenderPass> pass, RenderPassParameters& resources, std::string name = "", std::vector<ResolverSnapshot> resolverSnapshots = {});
-	void AddComputePass(std::shared_ptr<ComputePass> pass, ComputePassParameters& resources, std::string name = "", std::vector<ResolverSnapshot> resolverSnapshots = {});
-	void AddCopyPass(std::shared_ptr<CopyPass> pass, CopyPassParameters& resources, std::string name = "", std::vector<ResolverSnapshot> resolverSnapshots = {});
 	// GPU ranges around every pass this graph records (a GPU profiler's, e.g. Telemetry/NvPerfCapture): used by an
 	// execution whose context brings none of its own, which is how a host that builds the context itself
 	// (GraphHost, persistent tickets) gets them. Set before executions that should carry them.
@@ -440,7 +432,6 @@ public:
 	std::shared_ptr<Resource> GetResourceByName(const std::string& name);
 	std::shared_ptr<Resource> GetResourceByID(const uint64_t id);
 	std::shared_ptr<RenderPass> GetRenderPassByName(const std::string& name);
-	std::shared_ptr<ComputePass> GetComputePassByName(const std::string& name);
 
 	void RegisterProvider(IResourceProvider* prov);
 	void EnsureProviderRegistered(IResourceProvider* prov);
@@ -501,12 +492,6 @@ public:
 	}
 
 	template<typename PassT, org::PassInputs InputsT, typename... StableCtorArgs>
-	ComputePassBuilder& BuildComputePass(std::string const& name, InputsT&& inputs, StableCtorArgs&&... ctorArgs);
-
-	template<typename PassT, typename... StableCtorArgs>
-	ComputePassBuilder& BuildComputePass(std::string const& name, StableCtorArgs&&... ctorArgs);
-
-	template<typename PassT, org::PassInputs InputsT, typename... StableCtorArgs>
 	RenderPassBuilder& BuildRenderPass(std::string const& name, InputsT&& inputs, StableCtorArgs&&... ctorArgs);
 
 	template<typename PassT, typename... StableCtorArgs>
@@ -524,12 +509,6 @@ public:
 	RenderPassBuilder& BuildPass(std::string const& name, StableCtorArgs&&... ctorArgs) {
 		return BuildRenderPass<PassT>(name, std::forward<StableCtorArgs>(ctorArgs)...);
 	}
-
-	template<typename PassT, org::PassInputs InputsT, typename... StableCtorArgs>
-	CopyPassBuilder& BuildCopyPass(std::string const& name, InputsT&& inputs, StableCtorArgs&&... ctorArgs);
-
-	template<typename PassT, typename... StableCtorArgs>
-	CopyPassBuilder& BuildCopyPass(std::string const& name, StableCtorArgs&&... ctorArgs);
 
 	/// Create a new queue of the given kind and register it with the render graph.
 	/// Must be called after Setup() and before the first Execute().
@@ -564,7 +543,7 @@ private:
 
 	struct AnyPassAndResources {
 		PassType type = PassType::Unknown;
-		std::variant<std::monostate, RenderPassAndResources, ComputePassAndResources, CopyPassAndResources> pass;
+		std::variant<std::monostate, RenderPassAndResources> pass;
 		std::string name;
 
 		AnyPassAndResources() = default;
@@ -574,15 +553,6 @@ private:
 		explicit AnyPassAndResources(RenderPassAndResources&& rp)
 			: type(PassType::Render), pass(std::move(rp)) {}
 
-		explicit AnyPassAndResources(ComputePassAndResources const& cp)
-			: type(PassType::Compute), pass(cp) {}
-		explicit AnyPassAndResources(ComputePassAndResources&& cp)
-			: type(PassType::Compute), pass(std::move(cp)) {}
-
-		explicit AnyPassAndResources(CopyPassAndResources const& cp)
-			: type(PassType::Copy), pass(cp) {}
-		explicit AnyPassAndResources(CopyPassAndResources&& cp)
-			: type(PassType::Copy), pass(std::move(cp)) {}
 	};
 
 	
@@ -695,7 +665,6 @@ private:
 	DeviceRegistry m_backendDevices;
 	std::array<uint8_t, static_cast<size_t>(QueueKind::Count)> m_minAutomaticSchedulingQueuesByKind = { 1, 1, 1 };
 	std::unordered_map<std::string, std::shared_ptr<RenderPass>> renderPassesByName;
-	std::unordered_map<std::string, std::shared_ptr<ComputePass>> computePassesByName;
 	std::unordered_map<std::string, std::string> m_passTechniquePathsByName;
 	std::unordered_map<std::string, std::shared_ptr<Resource>> resourcesByName;
 	std::unordered_map<uint64_t, std::shared_ptr<Resource>> resourcesByID;
@@ -817,13 +786,9 @@ private:
 	std::function<void(std::string_view)> m_structuralMaterializeCheckpointCallback;
 	std::function<void(std::string_view, std::string_view)> m_structuralMaterializeResourceCheckpointCallback;
 
-	ComputePassBuilder& GetOrCreateComputePassBuilder(std::string const& name);
 	RenderPassBuilder& GetOrCreateRenderPassBuilder(std::string const& name);
-	CopyPassBuilder& GetOrCreateCopyPassBuilder(std::string const& name);
 
 	friend class RenderPassBuilder;
-	friend class ComputePassBuilder;
-	friend class CopyPassBuilder;
 	friend struct BuilderGraphAccess;
 };
 
@@ -832,22 +797,6 @@ private:
 #include "Render/PassBuilders.h"
 
 namespace org {
-
-template<typename PassT, org::PassInputs InputsT, typename... StableCtorArgs>
-ComputePassBuilder& RenderGraph::BuildComputePass(std::string const& name, InputsT&& inputs, StableCtorArgs&&... ctorArgs) {
-    static_assert(DerivedComputePass<PassT>);
-    auto& builder = GetOrCreateComputePassBuilder(name);
-    builder.template Instantiate<PassT>(std::forward<InputsT>(inputs), std::forward<StableCtorArgs>(ctorArgs)...);
-    return builder;
-}
-
-template<typename PassT, typename... StableCtorArgs>
-ComputePassBuilder& RenderGraph::BuildComputePass(std::string const& name, StableCtorArgs&&... ctorArgs) {
-    static_assert(DerivedComputePass<PassT>);
-    auto& builder = GetOrCreateComputePassBuilder(name);
-    builder.template Instantiate<PassT>(std::forward<StableCtorArgs>(ctorArgs)...);
-    return builder;
-}
 
 template<typename PassT, org::PassInputs InputsT, typename... StableCtorArgs>
 RenderPassBuilder& RenderGraph::BuildRenderPass(std::string const& name, InputsT&& inputs, StableCtorArgs&&... ctorArgs) {
@@ -861,22 +810,6 @@ template<typename PassT, typename... StableCtorArgs>
 RenderPassBuilder& RenderGraph::BuildRenderPass(std::string const& name, StableCtorArgs&&... ctorArgs) {
     static_assert(DerivedRenderPass<PassT>);
     auto& builder = GetOrCreateRenderPassBuilder(name);
-    builder.template Instantiate<PassT>(std::forward<StableCtorArgs>(ctorArgs)...);
-    return builder;
-}
-
-template<typename PassT, org::PassInputs InputsT, typename... StableCtorArgs>
-CopyPassBuilder& RenderGraph::BuildCopyPass(std::string const& name, InputsT&& inputs, StableCtorArgs&&... ctorArgs) {
-    static_assert(DerivedCopyPass<PassT>);
-    auto& builder = GetOrCreateCopyPassBuilder(name);
-    builder.template Instantiate<PassT>(std::forward<InputsT>(inputs), std::forward<StableCtorArgs>(ctorArgs)...);
-    return builder;
-}
-
-template<typename PassT, typename... StableCtorArgs>
-CopyPassBuilder& RenderGraph::BuildCopyPass(std::string const& name, StableCtorArgs&&... ctorArgs) {
-    static_assert(DerivedCopyPass<PassT>);
-    auto& builder = GetOrCreateCopyPassBuilder(name);
     builder.template Instantiate<PassT>(std::forward<StableCtorArgs>(ctorArgs)...);
     return builder;
 }

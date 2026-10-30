@@ -190,7 +190,6 @@ LoweredPass LowerPass(RenderGraph& graph, ResourceRegistry& registry, const Queu
 		auto kindCompatible = [&](QueueKind kind) {
 			switch (type) {
 			case RenderGraph::PassType::Render: return kind == QueueKind::Graphics;
-			case RenderGraph::PassType::Compute: return kind == QueueKind::Graphics || kind == QueueKind::Compute;
 			default: return true;
 			}
 		};
