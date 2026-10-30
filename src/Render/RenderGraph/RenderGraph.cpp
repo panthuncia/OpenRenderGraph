@@ -304,7 +304,7 @@ void RenderGraph::ShutdownTaskWorkers() {
 }
 
 void RenderGraph::UseRuntimeServices() {
-	if (!m_statisticsService) m_statisticsService = m_runtime->Statistics();
+	if (!m_statisticsService && m_drivesFrameServices) m_statisticsService = m_runtime->Statistics();
 	if (!m_uploadService) m_uploadService = m_runtime->Uploads();
 	if (!m_readbackService) m_readbackService = m_runtime->Readbacks();
 	if (!m_descriptorService) m_descriptorService = m_runtime->Descriptors();
@@ -928,7 +928,7 @@ void RenderGraph::UpdateOnPreparationOwner(const UpdateExecutionContext& context
 	if (!m_uploadService) m_uploadService = org::runtime::CreateDefaultUploadService();
 	if (!m_descriptorService) m_descriptorService = org::runtime::CreateDefaultDescriptorService();
 	if (!m_readbackService) m_readbackService = org::runtime::CreateDefaultReadbackService();
-	if (!m_statisticsService) m_statisticsService = org::runtime::CreateDefaultStatisticsService();
+	if (!m_statisticsService && m_drivesFrameServices) m_statisticsService = org::runtime::CreateDefaultStatisticsService();
 	// A graph rebuild may replace the service generation after passes were
 	// registered. Refresh every pass' weak service bindings before Update/Setup
 	// callbacks run so they cannot retain an expired generation.
@@ -950,7 +950,7 @@ void RenderGraph::UpdateOnPreparationOwner(const UpdateExecutionContext& context
 	// Poll readback completions early so that passes (e.g. CLod streaming)
 	// can react to GPU-produced data from the previous frame immediately,
 	// rather than waiting until post-Present.
-	if (m_readbackService) {
+	if (m_readbackService && m_drivesFrameServices) {
 		BT_ZONE_SCOPE("RenderGraph::Update::ProcessReadbacks");
 		m_readbackService->ProcessReadbackRequests();
 	}

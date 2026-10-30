@@ -401,6 +401,15 @@ public:
 	const org::memory::SnapshotProvider& GetMemorySnapshotProvider() const { return m_memorySnapshotProvider; }
 	void WriteVramUsageDebugDumpNow(uint8_t frameIndex) const { WriteVramUsageDebugDump(frameIndex); }
 	void SetStatisticsService(std::shared_ptr<org::runtime::IStatisticsService> service) { m_statisticsService = std::move(service); }
+	// Whether the graph drives the runtime's frame-indexed services: statistics query slots, persistent readback captures and
+	// readback completion polling. One graph on a runtime does (the per-frame one) until those services are per execution
+	// (docs/job-graphs.md, Phase 3); a graph executing alongside it (a job graph, on another thread) does not: it records no
+	// statistics, places no captures and leaves readback completions to that graph. Set before Setup.
+	void SetDrivesFrameServices(bool drives) {
+		m_drivesFrameServices = drives;
+		if (!drives) m_statisticsService.reset();
+	}
+	bool DrivesFrameServices() const noexcept { return m_drivesFrameServices; }
 	org::runtime::IStatisticsService* GetStatisticsService() { return m_statisticsService.get(); }
 	const org::runtime::IStatisticsService* GetStatisticsService() const { return m_statisticsService.get(); }
 	void SetUploadService(std::shared_ptr<org::runtime::IUploadService> service) { m_uploadService = std::move(service); }
@@ -669,6 +678,7 @@ private:
 	std::vector<AnyPassAndResources> m_masterPassList;
 	std::vector<std::pair<std::string, std::string>> m_structuralExplicitAfterByName;
 	std::shared_ptr<Runtime> m_runtime;
+	bool m_drivesFrameServices = true;  // SetDrivesFrameServices
 	DeviceRegistry m_backendDevices;
 	std::array<uint8_t, static_cast<size_t>(QueueKind::Count)> m_minAutomaticSchedulingQueuesByKind = { 1, 1, 1 };
 	std::unordered_map<std::string, std::shared_ptr<RenderPass>> renderPassesByName;

@@ -194,5 +194,9 @@ public:
 };
 
 std::shared_ptr<IUploadService> CreateDefaultUploadService();
+// An upload queue of a graph's own (RenderGraph::SetUploadService before Setup), for a graph that runs alongside others, on its
+// own thread: only its upload pass drains it, against its own registry and page ring. The worker (copy-queue) path stays the
+// runtime's.
+std::shared_ptr<IUploadService> CreateGraphUploadService();
 
 }

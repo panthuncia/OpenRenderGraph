@@ -632,7 +632,7 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 			interrupting.push_back(std::move(*it));
 			it = frameExt.erase(it);
 		}
-		PlacePersistentCaptures(*this, state, m_persistentTicketTarget != nullptr, frameExt, interrupting);
+		if (m_drivesFrameServices) PlacePersistentCaptures(*this, state, m_persistentTicketTarget != nullptr, frameExt, interrupting);
 	}
 	// 1. Structural and membership changes reported by legacy passes. One
 	// transaction carries both so the slot directory never diverges from the

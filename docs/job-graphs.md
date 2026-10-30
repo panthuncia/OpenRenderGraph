@@ -304,6 +304,34 @@ graphics     :                                                          wait R â
 Frame-to-frame continuity, such as history buffers, uses the same mechanism. Execution N+1 of a frame graph is simply
 the next admission on those cells.
 
+## Asset processing jobs gate readiness, not frames
+
+BasicRenderer's mip generation, BC7 compression and environment processing run as job graphs alongside the frame graph.
+Their results reach frames through the asset dependency graph, never through a frame-side wait.
+
+**The chain.** Each job gates its asset's readiness:
+- A texture is ready once its mip and BC7 jobs have completed on the GPU.
+- A material is ready once its textures are.
+- Whatever uses the material is ready once the material is.
+
+A frame only uses what has become ready. The ordering comes from the existing dependency system (ORGModuleServices'
+`StateGraph`), and no frame waits on async work, on the CPU or the GPU.
+
+**Why not a frame-side gate.** Textures are bindless: materials sample them through descriptors that no pass declares, so
+the sequencer cannot order a frame's reads against a job's writes. A frame-side "wait on this signal before these
+descriptors" primitive could still be useful for other cases. These jobs don't need it: until an asset is ready, nothing
+the frame records can reach it.
+
+**What the job graphs need from ORG.**
+- **Concurrency.** Done:
+  - `CreateGraphUploadService`: a graph's own upload queue, drained only by its own upload pass;
+  - `SetDrivesFrameServices(false)`: no statistics, persistent captures or readback polling;
+  - `BufferBase` materialization under a lock.
+- **Exit state.** A job graph leaves its textures in the state bindless sampling expects. The ledger hands that state to
+  later users.
+- **Upload pages.** The job graph's driver retires its private upload pages on its own slot ring
+  (`ProcessDeferredReleases(slot)` once the slot's work is complete).
+
 ## API sketch
 
 ```cpp

@@ -28,6 +28,10 @@ namespace {
 	}
 }
 
+UploadManager::UploadManager(UploadManager& shared) : m_shared(&shared) {
+	m_uploadPass = std::make_shared<UploadPass>(*this);
+}
+
 void UploadManager::Initialize() {
 	m_numFramesInFlight = org::runtime::GetOpenRenderGraphSettings().numFramesInFlight;
 
@@ -51,6 +55,10 @@ void UploadManager::Initialize() {
 			return IsUploadTargetValid(target, reason, file, line);
 		});
 	m_uploadInstance->SetResolveContext(m_ctx);
+	if (m_shared) {
+		MarkUploadPassDirty();
+		return;
+	}
 	if (!m_copyQueueUploads) {
 		m_copyQueueUploads = std::make_unique<org::runtime::CopyQueueUploadService>();
 	}
@@ -403,6 +411,7 @@ std::shared_ptr<TrackedUploadTicket> UploadManager::QueueTrackedStreamingUploadS
 	std::span<const StreamingUploadSegment> segments, size_t totalSize,
 	WorkerOwnedDestination destination, size_t dstOffset)
 {
+	if (m_shared) return m_shared->QueueTrackedStreamingUploadSegments(segments, totalSize, std::move(destination), dstOffset);
 	if (!m_copyQueueUploads || !m_copyQueueUploads->Initialized()) Initialize();
 	return m_copyQueueUploads->QueueBufferUpload(segments, totalSize, std::move(destination), dstOffset);
 }
@@ -410,6 +419,7 @@ std::shared_ptr<TrackedUploadTicket> UploadManager::QueueTrackedStreamingUploadS
 std::shared_ptr<TrackedUploadTicket> UploadManager::QueueTrackedStreamingUploadRanges(
 	std::span<const StreamingUploadRange> ranges, WorkerOwnedDestination destination)
 {
+	if (m_shared) return m_shared->QueueTrackedStreamingUploadRanges(ranges, std::move(destination));
 	if (!m_copyQueueUploads || !m_copyQueueUploads->Initialized()) Initialize();
 	return m_copyQueueUploads->QueueBufferUploadRanges(ranges, std::move(destination));
 }
@@ -417,6 +427,7 @@ std::shared_ptr<TrackedUploadTicket> UploadManager::QueueTrackedStreamingUploadR
 std::shared_ptr<TrackedUploadTicket> UploadManager::QueueTrackedStreamingCopyRanges(std::shared_ptr<Resource> source,
 	std::span<const StreamingCopyRange> ranges, WorkerOwnedDestination destination)
 {
+	if (m_shared) return m_shared->QueueTrackedStreamingCopyRanges(std::move(source), ranges, std::move(destination));
 	// As the signal: only on a queue of its own (the caller uploads instead).
 	if (!HasDedicatedStreamingQueue()) return {};
 	if (!m_copyQueueUploads || !m_copyQueueUploads->Initialized()) Initialize();
@@ -425,6 +436,7 @@ std::shared_ptr<TrackedUploadTicket> UploadManager::QueueTrackedStreamingCopyRan
 
 std::shared_ptr<TrackedUploadTicket> UploadManager::QueueStreamingSignal(std::shared_ptr<rhi::TimelinePtr> timeline, uint64_t value)
 {
+	if (m_shared) return m_shared->QueueStreamingSignal(std::move(timeline), value);
 	// Only from a queue of its own: the graph's copy queue may be its graphics queue, whose own waits would then wait on this.
 	if (!HasDedicatedStreamingQueue()) return {};
 	if (!m_copyQueueUploads || !m_copyQueueUploads->Initialized()) Initialize();
@@ -433,6 +445,7 @@ std::shared_ptr<TrackedUploadTicket> UploadManager::QueueStreamingSignal(std::sh
 
 bool UploadManager::QueueStreamingWait(std::span<const std::pair<std::shared_ptr<rhi::TimelinePtr>, uint64_t>> points)
 {
+	if (m_shared) return m_shared->QueueStreamingWait(points);
 	// As the signal: only from a queue of its own (a wait on the graph's queue would wait on itself).
 	if (!HasDedicatedStreamingQueue()) return false;
 	if (!m_copyQueueUploads || !m_copyQueueUploads->Initialized()) Initialize();

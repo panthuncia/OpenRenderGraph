@@ -232,6 +232,8 @@ protected:
     std::optional<uint64_t> m_aliasingPoolID;
 
 private:
+    // Two graphs may materialize a buffer they share at once (RenderGraph::MaterializeUnmaterializedResources): one backing.
+    std::mutex m_materializationMutex;
     uint64_t m_backingGeneration = 0;
     org::runtime::UploadPolicyTag m_uploadPolicyTag = org::runtime::UploadPolicyTag::Immediate;
     bool m_uploadPolicyRegistered = false;

@@ -7,35 +7,39 @@ namespace org::runtime {
 namespace {
 class DefaultUploadService final : public IUploadService {
 public:
+    DefaultUploadService() = default;
+    // A graph's own (CreateGraphUploadService).
+    explicit DefaultUploadService(std::unique_ptr<UploadManager> owned) : m_owned(std::move(owned)) {}
+
     void Initialize() override {
-        UploadManager::GetInstance().Initialize();
+        Manager().Initialize();
     }
 
     void SetOwnerThread() override {
-        UploadManager::GetInstance().SetOwnerThread();
+        Manager().SetOwnerThread();
     }
 
     void SetUploadResolveContext(UploadResolveContext context) override {
-        UploadManager::GetInstance().SetUploadResolveContext(context);
+        Manager().SetUploadResolveContext(context);
     }
 
     std::shared_ptr<RenderPass> GetUploadPass() const override {
-        return UploadManager::GetInstance().GetUploadPass();
+        return Manager().GetUploadPass();
     }
 
     void UploadData(const void* data, size_t size, UploadTarget resourceToUpdate, size_t dataBufferOffset, const char* file, int line) override {
-        UploadManager::GetInstance().UploadData(data, size, std::move(resourceToUpdate), dataBufferOffset, file, line);
+        Manager().UploadData(data, size, std::move(resourceToUpdate), dataBufferOffset, file, line);
     }
 
     void UploadDataBatch(UploadTarget resourceToUpdate, std::span<const UploadRegion> regions, const char* file, int line) override {
-        UploadManager::GetInstance().UploadDataBatch(std::move(resourceToUpdate), regions, file, line);
+        Manager().UploadDataBatch(std::move(resourceToUpdate), regions, file, line);
     }
 
     void PostTextureSubresources(UploadTarget target, rhi::Format fmt, uint32_t baseWidth, uint32_t baseHeight,
         uint32_t depthOrLayers, uint32_t mipLevels, uint32_t arraySize,
         std::shared_ptr<const std::vector<rhi::helpers::SubresourceData>> subresources,
         std::shared_ptr<const void> keepAlive, const char* file, int line) override {
-        UploadManager::GetInstance().PostTextureSubresources(std::move(target), fmt, baseWidth, baseHeight,
+        Manager().PostTextureSubresources(std::move(target), fmt, baseWidth, baseHeight,
             depthOrLayers, mipLevels, arraySize, std::move(subresources), std::move(keepAlive), file, line);
     }
 
@@ -51,7 +55,7 @@ public:
         uint32_t srcCount,
         const char* file,
         int line) override {
-        UploadManager::GetInstance().UploadTextureSubresources(
+        Manager().UploadTextureSubresources(
             std::move(target),
             fmt,
             baseWidth,
@@ -66,84 +70,92 @@ public:
     }
 
     void QueueResourceCopy(const std::shared_ptr<Resource>& destination, const std::shared_ptr<Resource>& source, size_t size) override {
-        UploadManager::GetInstance().QueueResourceCopy(destination, source, size);
+        Manager().QueueResourceCopy(destination, source, size);
     }
 
     void SubmitStagedUploads(std::shared_ptr<StagedUploadBatch> batch) override {
-        UploadManager::GetInstance().SubmitStagedUploads(std::move(batch));
+        Manager().SubmitStagedUploads(std::move(batch));
     }
 
     void SetStagedUploadsRecordedDirectly(bool direct) override {
-        UploadManager::GetInstance().SetStagedUploadsRecordedDirectly(direct);
+        Manager().SetStagedUploadsRecordedDirectly(direct);
     }
 
     size_t RecordStagedUploads(rhi::CommandList& list, uint8_t frameIndex, bool afterWork) override {
-        return UploadManager::GetInstance().RecordStagedUploads(list, frameIndex, afterWork);
+        return Manager().RecordStagedUploads(list, frameIndex, afterWork);
     }
 
     bool SubmitRecordedUploads(std::shared_ptr<StagedUploadBatch> batch) override {
-        return UploadManager::GetInstance().SubmitRecordedUploads(std::move(batch));
+        return Manager().SubmitRecordedUploads(std::move(batch));
     }
 
     size_t TakeRecordedUploads(std::vector<rhi::CommandList>& out, uint8_t frameIndex) override {
-        return UploadManager::GetInstance().TakeRecordedUploads(out, frameIndex);
+        return Manager().TakeRecordedUploads(out, frameIndex);
     }
 
     bool TakeRecordedUploadsWithDestinations(std::vector<rhi::CommandList>& out, uint8_t frameIndex,
         std::vector<rhi::ResourceHandle>& destinations) override {
-        return UploadManager::GetInstance().TakeRecordedUploadsWithDestinations(out, frameIndex, destinations);
+        return Manager().TakeRecordedUploadsWithDestinations(out, frameIndex, destinations);
     }
 
     bool StagedUploadDestinations(std::vector<rhi::ResourceHandle>& out) const override {
-        return UploadManager::GetInstance().StagedUploadDestinations(out);
+        return Manager().StagedUploadDestinations(out);
     }
 
     size_t RecordStagedUploadsRouted(rhi::CommandList& list, uint8_t frameIndex, bool afterWork,
         const std::function<rhi::CommandList*(rhi::ResourceHandle)>& route, size_t& routed) override {
-        return UploadManager::GetInstance().RecordStagedUploadsRouted(list, frameIndex, afterWork, route, routed);
+        return Manager().RecordStagedUploadsRouted(list, frameIndex, afterWork, route, routed);
     }
 
     void ProcessDeferredReleases(uint8_t frameIndex) override {
-        UploadManager::GetInstance().ProcessDeferredReleases(frameIndex);
+        Manager().ProcessDeferredReleases(frameIndex);
     }
 
     std::shared_ptr<TrackedUploadTicket> QueueTrackedStreamingUploadSegments(
         std::span<const StreamingUploadSegment> segments, size_t totalSize,
         WorkerOwnedDestination destination, size_t dstOffset) override {
-        return UploadManager::GetInstance().QueueTrackedStreamingUploadSegments(
+        return Manager().QueueTrackedStreamingUploadSegments(
             segments, totalSize, std::move(destination), dstOffset);
     }
 
     std::shared_ptr<TrackedUploadTicket> QueueTrackedStreamingUploadRanges(
         std::span<const StreamingUploadRange> ranges, WorkerOwnedDestination destination) override {
-        return UploadManager::GetInstance().QueueTrackedStreamingUploadRanges(ranges, std::move(destination));
+        return Manager().QueueTrackedStreamingUploadRanges(ranges, std::move(destination));
     }
 
     std::shared_ptr<TrackedUploadTicket> QueueTrackedStreamingCopyRanges(std::shared_ptr<Resource> source,
         std::span<const StreamingCopyRange> ranges, WorkerOwnedDestination destination) override {
-        return UploadManager::GetInstance().QueueTrackedStreamingCopyRanges(
+        return Manager().QueueTrackedStreamingCopyRanges(
             std::move(source), ranges, std::move(destination));
     }
 
     bool HasDedicatedStreamingQueue() const override {
-        return UploadManager::GetInstance().HasDedicatedStreamingQueue();
+        return Manager().HasDedicatedStreamingQueue();
     }
 
     bool QueueStreamingWait(std::span<const std::pair<std::shared_ptr<rhi::TimelinePtr>, uint64_t>> points) override {
-        return UploadManager::GetInstance().QueueStreamingWait(points);
+        return Manager().QueueStreamingWait(points);
     }
     std::shared_ptr<TrackedUploadTicket> QueueStreamingSignal(std::shared_ptr<rhi::TimelinePtr> timeline, uint64_t value) override {
-        return UploadManager::GetInstance().QueueStreamingSignal(std::move(timeline), value);
+        return Manager().QueueStreamingSignal(std::move(timeline), value);
     }
 
     void Cleanup() override {
-        UploadManager::GetInstance().Cleanup();
+        Manager().Cleanup();
     }
+
+private:
+    UploadManager& Manager() const { return m_owned ? *m_owned : UploadManager::GetInstance(); }
+    std::unique_ptr<UploadManager> m_owned;
 };
 }
 
 std::shared_ptr<IUploadService> CreateDefaultUploadService() {
     return std::make_shared<DefaultUploadService>();
+}
+
+std::shared_ptr<IUploadService> CreateGraphUploadService() {
+    return std::make_shared<DefaultUploadService>(std::make_unique<UploadManager>(UploadManager::GetInstance()));
 }
 
 }

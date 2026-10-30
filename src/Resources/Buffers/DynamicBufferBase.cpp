@@ -552,6 +552,7 @@ uint64_t BufferBase::GetBackingGeneration() const {
 
 void BufferBase::Materialize(const MaterializeOptions* options) {
 	ClearAPIRepresentations();
+    std::scoped_lock lock(m_materializationMutex);
     if (m_dataBuffer) {
         return;
     }

@@ -48,6 +48,12 @@ public:
 	using UploadTarget = org::runtime::UploadTarget;
 
 	static UploadManager& GetInstance();
+	// A graph's own upload queue (runtime::CreateGraphUploadService), for a graph that runs alongside others: what is uploaded
+	// through it is drained by its graph's upload pass alone, resolved against that graph's registry and paged on its own ring.
+	// The worker (copy-queue) upload path is shared's.
+	explicit UploadManager(UploadManager& shared);
+	UploadManager(const UploadManager&) = delete;
+	UploadManager& operator=(const UploadManager&) = delete;
 	void Initialize();
 	void UploadData(const void* data, size_t size, UploadTarget resourceToUpdate, size_t dataBufferOffset, const char* file, int line);
 	void UploadDataBatch(UploadTarget resourceToUpdate, std::span<const org::runtime::UploadRegion> regions, const char* file, int line);
@@ -94,11 +100,11 @@ public:
 	// A GPU copy between two buffers on that path (IUploadService::QueueTrackedStreamingCopyRanges); null without a queue of its own.
 	std::shared_ptr<TrackedUploadTicket> QueueTrackedStreamingCopyRanges(std::shared_ptr<Resource> source,
 		std::span<const StreamingCopyRange> ranges, WorkerOwnedDestination destination);
-	org::runtime::CopyQueueUploadService* CopyQueueUploads() { return m_copyQueueUploads.get(); }
+	org::runtime::CopyQueueUploadService* CopyQueueUploads() { return m_shared ? m_shared->CopyQueueUploads() : m_copyQueueUploads.get(); }
 	// Whether the worker upload path has a queue of its own (not the graph's copy queue, which may alias the graphics one).
-	bool HasDedicatedStreamingQueue() const { return static_cast<bool>(m_uploadQueue); }
+	bool HasDedicatedStreamingQueue() const { return m_shared ? m_shared->HasDedicatedStreamingQueue() : static_cast<bool>(m_uploadQueue); }
 	// The queue of its own the copy-queue uploader made (Initialize), if any: the runtime's frontier covers it.
-	rhi::Queue GetDedicatedUploadQueue() const { return m_uploadQueue; }
+	rhi::Queue GetDedicatedUploadQueue() const { return m_shared ? m_shared->GetDedicatedUploadQueue() : m_uploadQueue; }
 	std::shared_ptr<TrackedUploadTicket> QueueStreamingSignal(std::shared_ptr<rhi::TimelinePtr> timeline, uint64_t value);
 	bool QueueStreamingWait(std::span<const std::pair<std::shared_ptr<rhi::TimelinePtr>, uint64_t>> points);
 
@@ -107,7 +113,7 @@ private:
 
 	class UploadPass : public RenderPass, public IDynamicDeclaredResources, public IHasImmediateModeCommands {
 	public:
-		UploadPass() {
+		explicit UploadPass(UploadManager& owner) : m_owner(owner) {
 		}
 
 		void DeclareResourceUsages(RenderPassBuilder* builder) override {
@@ -119,8 +125,8 @@ private:
 		}
 
 		void RecordImmediateCommands(ImmediateExecutionContext& context) override {
-			GetInstance().ExecuteResourceCopies(context.frameIndex, context.list);// copies come before uploads to avoid overwriting data
-			GetInstance().ProcessUploads(context.frameIndex, context.list);
+			m_owner.ExecuteResourceCopies(context.frameIndex, context.list);// copies come before uploads to avoid overwriting data
+			m_owner.ProcessUploads(context.frameIndex, context.list);
 		}
 
 		PassReturn Execute(PassExecutionContext& context) override {
@@ -144,12 +150,14 @@ private:
 		}
 
 	private:
+		UploadManager& m_owner;
 		mutable std::atomic_bool m_declaredResourcesDirty = true;
 	};
-
 	UploadManager() {
-		m_uploadPass = std::make_shared<UploadPass>();
+		m_uploadPass = std::make_shared<UploadPass>(*this);
 	}
+	// The instance whose worker path a graph's own (UploadManager(UploadManager&)) uses; null for the shared one.
+	UploadManager* m_shared = nullptr;
 	void MarkUploadPassDirty();
 	void CaptureResourceCopyTelemetry(ResourceCopy& copy);
 	void RefreshQueuedCopyTelemetryLocked();
