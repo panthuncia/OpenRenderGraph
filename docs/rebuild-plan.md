@@ -1,44 +1,35 @@
-# Rebuilding ORG around the persistent compiler
+# Rebuild ORG around the persistent compiler (revised)
 
-Status: plan, 2026-10-29. Survey baseline: `backend_interop` at 9f2cf0f (CS) and 1e20651 (BasicRenderer).
+## Context
 
-## Goal
+OpenRenderGraph (ORG) runs three execution routes inside one `RenderGraph` class:
 
-Rebuild ORG so that it has one compiler and one execution model: the persistent compiler. Everything else goes,
-apart from the API surface that Community Shaders (CS) and SARP/BasicRenderer (BR) actually use. Any old-compiler
-capability that a consumer relies on is ported into the persistent compiler first, multi-backend included. The API
-gets better while it shrinks.
-
-## Where things stand
-
-### There are three execution routes
-
-The branch has three routes, all inside one `RenderGraph` class.
-
-| Route | Entered when | Used by |
+| Route | Entered through | Used by |
 |---|---|---|
-| **Persistent** (`PreparePersistentFrame` / `ExecutePersistentFrame`) | persistent enabled and a task service set | CS (only route, through `PersistentGraphHost`); BR when `SARP_PERSISTENT_GRAPH=1` (the benchmark script's default) |
-| **Owned/fresh** (`SubmitOwnedCompileRequest` → `experimental::CompileGraph`, then `TryExecuteSelectedAsyncFrame`) | not persistent, task service set | BR default; `SARP_ASYNC_COMPILE_MODE=2` |
-| **True legacy** (`AutoScheduleAndBuildBatches` + the legacy `Execute` body, RenderGraph.cpp:10116-11503) | no task service, compile diagnostics on, or more than one backend device | `ContributorGraphHost`; BR multi-RHI (unconfirmed whether its frames actually execute here) |
+| **Persistent** | `PreparePersistentFrame` / `ExecutePersistentFrame` | CS, through `PersistentGraphHost` (its only route); BasicRenderer when `SARP_PERSISTENT_GRAPH=1` |
+| **Owned/fresh** | `SubmitOwnedCompileRequest` → `experimental::CompileGraph` | BasicRenderer, by default |
+| **True legacy** | `AutoScheduleAndBuildBatches` plus the legacy `Execute` | `ContributorGraphHost`; any graph with no task service, with compile diagnostics on, or with more than one backend device |
 
-The persistent route still enters through the old dispatcher:
+The branch (`backend_interop`, 86k lines) has also collected:
+- two half-finished contributor ABIs;
+- singleton-backed service facades;
+- leaked internals in `include/`;
+- build defects.
 
-- `Update` leads to `CompileFrame`, then `PrepareAndCompileFrame`, which branches at RenderGraphCompile.cpp:2787.
-- `Execute` branches at RenderGraph.cpp:10075.
+**Goal:** one compiler (persistent) and one host. Keep only the surface CS and SARP/BasicRenderer (BR) use. Port every old-path capability they need into the persistent compiler, multi-RHI included. Improve the API as it shrinks.
 
-It also leans on old state in several places:
+**Decisions (from the user):**
+- Multi-RHI is required and gets ported.
+- `SARP_ASYNC_COMPILE_MODE` and the owned/async compile route are deleted. SARP later moves to DCLF-style async epochs.
+- SARP's grass passes are ported, and the legacy pass bases are deleted.
+- The contributor API is kept in spirit and rebuilt persistent-native. It is the seed of a CS plugin API (findings below).
+- SARP's `tesworld` branch is merged before any SARP change.
+- SARP validation always runs the preprocess script first.
 
-- `m_masterPassList` is built by `CompileStructural`.
-- The retained-declaration cache, `RefreshRetainedDeclarationsForFrame`, is read through `LowerLegacyPass`.
-- It uses `MaterializeExternalPass`, `alias::Alias*ResourceDesc` and the old alias-settings `std::function`s.
+## Surface to keep
 
-The comment at RenderGraphPersistent.cpp:8 notes that every existing pass is hosted through the legacy adapter.
-
-### What the consumers use
-
-**CS** uses `PersistentGraphHost`, Vulkan over DXVK's adopted device, and nothing else.
-
-- **Host:**
+**CS uses `PersistentGraphHost` only (Vulkan over DXVK):**
+- **Host features:**
   - async epochs and tickets;
   - closed executions;
   - revision recordings;
@@ -46,202 +37,179 @@ The comment at RenderGraphPersistent.cpp:8 notes that every existing pass is hos
   - queue-scoped and copy-queue streaming uploads;
   - frame-wait timeline;
   - retired and completed callbacks.
-- **Passes:** `TypedRenderGraphPass<D, Frame, Bindings>` with `Declare`, `InvocationRevision`, `Prepare` and `Record`, delivered as `ExternalPassDesc` from `IRenderGraphExtension::{PrepareForBuild, GatherStructuralPasses}`.
+- **Passes:** `TypedRenderGraphPass<D, Frame, Bindings>` delivered as `ExternalPassDesc` from `IRenderGraphExtension::{PrepareForBuild, GatherStructuralPasses}`.
 - **Resources:** `Buffer`, `PixelBuffer`, `ExternalTextureResource`, `VersionedBuffer`, `LatchBlock`, `PreparedTablePublisher`.
-- **Services:** upload (staged batches, tracked streaming tickets), descriptors (owned views, slots, cleanup queue), statistics (timestamps, budgets, recording sub-ranges).
-- **Debug UI:** `ScheduleInspector`, `MemoryIntrospectionWidget`, `ScheduleTrace` JSON/text, NvPerfCapture, `experimental::DiagnosticSkip*`.
-- **Not used:** aliasing, the readback service, resolvers/providers, `Add*Pass`, legacy passes, multi-backend.
+- **Services:** upload, descriptor and statistics.
+- **Debug:** `ScheduleInspector`, `ScheduleTrace`, `MemoryIntrospectionWidget`, `NvPerfCapture`, `DiagnosticSkip*`.
+- **Also needed for CS:** ORGModuleServices needs `Buffer`, `VersionedBuffer`, `IUploadService`, `StreamingUploadTypes`, `LatchBlock` and `ShaderCompilerService.h`.
 
-**BR / SARP** drive `RenderGraph` directly: `CompileStructural`, `Setup`, `Update`, `Execute` every frame.
+**BR/SARP:**
+- **Driving:** BR drives `RenderGraph` directly: `CompileStructural`, `Setup`, `Update`, `Execute`.
+- **Passes:** about 139 typed passes, using Recipe, lifecycle hooks, `CaptureProgramBinding` and `Update` overrides, plus 3 `PersistentTypedPass`es.
+- **Graph inputs:** providers, resolvers, `IDynamicDeclaredResources`, `ResourceGroup`, and extensions with `ExternalInsertPoint`/`SetPassTechnique`.
+- **Readback:** the readback service and capture passes.
+- **Uploads:** upload policy, `StreamingUploadPass`, `UploadInstance`, `FrameWorkQueue`.
+- **Aliasing:** `AutoAliasMode`/packing and the alias debug snapshot.
+- **Debug and diagnostics:** `RGInspector`, the memory frame-graph timeline, the VRAM dump.
+- **Multi-RHI:** a peer device via `RegisterBackendDevice`, and `LegacyInterop` (used by SSR and upscaling).
+- **Legacy code to port:** SARP's 13 legacy grass passes, `SARPInteropValidation` (which uses the raw builders), and the `ImmediateCommandList` in BR's `ReadbackManager`.
 
-- **Passes:** about 139 `TypedRenderGraphPass` uses, including Recipe, lifecycle hooks, `CaptureProgramBinding` and `Update` overrides. 3 `PersistentTypedPass`es.
-- **Graph inputs:** providers (11), resolvers, `IDynamicDeclaredResources`, `ResourceGroup`, and extensions with `ExternalInsertPoint` and `SetPassTechnique`.
-- **Services:** readback capture and capture passes, upload policy, `StreamingUploadPass`, `UploadInstance`, `FrameWorkQueue`.
-- **Aliasing:** `AutoAliasMode` and packing settings, plus the debug snapshot.
-- **Debug UI:** `RGInspector` (reads `GetBatches()`), `MemoryIntrospectionWidget` with the frame-graph timeline, VRAM dump.
-- **Multi-backend:** multi-RHI peer device via `RegisterBackendDevice`, and `PassBuilder::LegacyInterop` (SSR, upscaling).
-- **Legacy passes:** about 13 legacy `ComputePass`/`RenderPass` grass passes in SARP (`src/RendererHost/Grass/GrassRenderExtension.cpp`). Also `SARPInteropValidation`'s raw builders, and `ImmediateCommandList` in BR's `ReadbackManager`.
-- **Contributor ABI:** SARP produces the `org_c_*` v3 ABI (`Render/External/ContributorAPI.h`). Nothing hosts it.
-- **Backend:** in practice DX12. Vulkan is built and selectable.
+**Used by neither consumer (delete):**
+- `D3D11Interop`, `ExecutionBoundary`, `InteropAllocator`, which is re-homed under multi-RHI only if the port needs it.
+- `ResourceDescriptorIndexHelper`, `ORGUtilities` in `include/`, the `OpenRenderGraph.h`/`DebugUI.h` umbrellas for CS, and `ExternalBufferResource`.
 
-**Used by neither:**
+## Gaps to port into the persistent compiler
 
-- `ContributorGraphHost`, `ContributorRegistry`, `ExtensionRegistry`, both `ContributorRuntime`s, and the `ORG_RG_*` ABI. The only user is `my-community-shaders`, which is out of scope; see Q3.
-- `D3D11Interop`, `ExecutionBoundary`, `InteropAllocator`, `ResourceDescriptorIndexHelper`, `ORGUtilities`, `ExternalBufferResource`, `ExternalBackingResource`, `ResourceGroup` (included but dead in ORG).
-- The `OpenRenderGraph.h` umbrella as CS sees it (BR includes it 26 times), and `DebugUI.h`.
+| # | Capability | Old location (ORG `src/Render/RenderGraph/`) | Needed by |
+|---|---|---|---|
+| G1 | **Multi-RHI:**<ul><li>`DeviceRegistry` peer devices</li><li>peer queues and imported D3D12↔Vulkan timelines (`Setup` RenderGraph.cpp:7386-7421, `QueueRegistry::EnableD3D12VulkanInterop`)</li><li>per-backend representations (`MaterializeMultiBackendRepresentations` 6632-6991: committed `InteropAllocator` path, `SharedAliasPoolManager` placed pool, D3D12 discard init)</li><li>cross-API ownership transfers (`PlanMultiBackendOwnershipTransfers` 6993-7229)</li><li>batch isolation</li><li>`LegacyInterop` declarations</li></ul> | as listed | BR |
+| G2 | Queue activation and async-compute offload | `PlanActiveQueueSlots` 1689-1934 | BR |
+| G3 | Scored multi-queue scheduler | `AutoScheduleAndBuildBatches`, `IsNewBatchNeeded`, `CommitPassToBatch` | BR performance |
+| G4 | Texture same-state elision, read-only uniform elision, early placement, graphics-queue fallback | `AddTransition*` 3166-3569 | both |
+| G5 | BranchAndBound packing, idle pool retirement, alias debug snapshot | Aliasing/RenderGraphAliasingAlgorithms.cpp | BR |
+| G6 | Idle dematerialization | `ApplyIdleDematerializationPolicy` 5183 | BR |
+| G7 | Compile profile, VRAM dump, memory frame-graph timeline source, `RGInspector` source | RenderGraph.cpp:1286, 3940-4112; Algorithms.cpp:153 | BR UI |
 
-## Capability gap: old path → persistent
+Persistent already matches or exceeds the old path on the rest: admission ledgers, fence coalescing, alias activation and sync, resolvers, Tail and Pre segments, Tracy/NvPerf/statistics, copy-queue uploads, GraphReplay.
 
-**Port.** A consumer needs these, and the persistent compiler lacks them or has only part:
+## Contributor API findings
 
-| # | Capability | Old location | Persistent today | Needed by |
-|---|---|---|---|---|
-| G1 | **Multi-backend graph**, with these parts: `DeviceRegistry` peer devices; peer queues and imported D3D12↔Vulkan timelines; per-backend representations (committed `InteropAllocator`, shared-heap `SharedAliasPoolManager` placed pool, D3D12 discard init); cross-API ownership transfers (`PlanMultiBackendOwnershipTransfers`); cross-backend batch isolation; `LegacyInterop` builder declarations | RenderGraph.cpp:3721, 6632-7253, 7386-7421; Algorithms.cpp:1424, 1998-2201 | none (the alias planner rejects it, RenderGraphPersistent.cpp:3200) | BR multi-RHI, SSR, upscaling |
-| G2 | **Queue activation and async-compute offload**: level width, UAV pressure, `useAsyncCompute` | `PlanActiveQueueSlots` 1689-1934 | every queue active; passes default to graphics | BR (CS pins its queues itself) |
-| G3 | **Multi-queue batch scheduler quality**: scored scheduler with graphics bias, overlap bonus and handoff penalty | `AutoScheduleAndBuildBatches`, `IsNewBatchNeeded`, `CommitPassToBatch` | conservative topological walk, first-fit, one wait per batch | BR performance |
-| G4 | **Transition placement**: texture same-state elision, read-only uniform elision, early placement (hoist into the last-use batch), graphics-queue fallback | `AddTransition*` 3166-3569 | buffers elided only; barriers only before the pass | both (barrier count) |
-| G5 | **Aliasing extras**: BranchAndBound packing, idle pool retirement, the debug snapshot / exclusion reasons; shared multi-backend pools under G1 | Algorithms.cpp | greedy only, never shrinks, logs only | BR |
-| G6 | **Idle dematerialization** | `ApplyIdleDematerializationPolicy` 5183 | none | BR memory |
-| G7 | **Diagnostics data**: compile profile, VRAM dump, a frame-graph timeline source for memory introspection, an `RGInspector` source | 3940-4112, 1286, Algorithms.cpp:153 | `ScheduleTrace` covers part; `GetBatches()` is empty | BR UI |
-| G8 | **Legacy-pass hosting**: either native persistent support for `ComputePass`/`RenderPass`-style passes, or porting the consumers | `pr.pass->Execute` 8642/8982 | rejected ("persistent execution requires PrepareFrame") | SARP grass, `SARPInteropValidation` |
+Neither ABI is live:
+- **SARP's `ProducerCore` (v1 `org_c_`)** declares 21 resources and 2 compute marker passes, but nothing hosts it.
+- **`my-community-shaders` (v2 `ORG_RG_`)** hosts v2 for D3D11 + D3D12 only through sample DLLs; no real plugin uses it.
+- **The live CS** uses neither.
 
-**Already at parity or better in persistent, so nothing to port:**
+Each ABI got half the design right:
+- **v1 has the right per-frame shape.** Prepare returns an owned, immutable packet; record gets a borrowed, token-validated recorder; it has submitted/completed/abandoned hooks. That maps 1:1 onto `TypedRenderGraphPass` Prepare/Record. Its host still builds legacy passes, though (`src/Render/External/ContributorRuntime.cpp:438-646`).
+- **v2 has the right structure.** `ContributorRegistry` gives namespaced IDs, required/optional/diagnostic pruning, generation activation and retirement at completion, async unregister, rich access/view descriptions with exact views made by the host, `QueueBufferUpload`, `QueryService` and diagnostics. But a contributor can't record commands, and `ContributorGraphHost` runs the legacy Update/Execute.
 
-- cross-frame waits (the admission ledgers);
-- fence coalescing;
-- alias activation and alias queue sync;
-- resolvers (redesigned);
-- frame extensions (Tail);
-- immediate replay in Pre;
-- readback and streaming typed passes;
-- Tracy, NvPerf and statistics;
-- copy-queue uploads;
-- GraphReplay.
-
-**Drop without replacement:**
-
-- the owned/fresh route and `GraphCompileCoordinator` (see Q2);
-- `FramePlanning` / `FrameWorker` / `FrameContext` and the owned-path half of `FrameRecording`;
-- `CommandRecordingManager`, `ExecutionSchedule.h` and the legacy `PassBatch`.
-
-## Target architecture
-
-### One entry point: `GraphHost`
-
-- Generalize `PersistentGraphHost` into the only way to drive a graph. BR moves onto it.
-- A graph with no epoch tags is a one-epoch frame, so `ExecuteFrame()` covers BR's loop.
-- `RenderGraph::Update` / `Execute` / `CompileFrame` / `Setup` stop being public.
-- The host owns what BR currently does by hand:
-  - structural rebuild (providers, resolvers, extensions, `CompileStructural`);
-  - the settings service;
-  - the task service, which becomes mandatory. This removes the silent "no task service" fallback.
-
-### One compiler
-
-`GraphCompiler`, renamed from `experimental::CompileWorkspace`, is fed by a native lowering of `PassDeclaration`.
-
-- The legacy adapter (`LowerLegacyPass`) and the retained-declaration cache are replaced by declarations captured once at structural build.
-- Scheduling (G2, G3), transition planning (G4) and alias placement (G5) become pure stages over the compile input. This is the "pure compiler" target that `experimental-async-compile.md` already describes.
-
-### Multi-backend inside the persistent model (G1)
-
-- **Backend instances.** A program carries a set of backend instances. Each resource binding names the instances that touch it.
-- **Representations at bind time.** Representations are materialized when the binding is made, through `InteropAllocator` or a shared placed pool. They are versioned like any backing, so backing polling and revision checks cover them.
-- **Cross-API transfers.** Ownership transfers are planned at compile time as explicit release/acquire steps on the boundary between batches. The admission ledger tracks one state per backend instance and imported timeline points.
-- **Batches stay on one backend.** That is the old batch isolation, and it falls out naturally because each persistent batch is already single-queue.
-- **Aliasing.** Placement across backends uses shared-heap pools. Persistent aliasing of multi-backend resources stays off unless the pool supports it.
-
-### Services owned per runtime, not singletons
-
-- A `Runtime` (today's `RuntimeDevice`) owns one each of the device, descriptor heaps, uploads, readback, statistics, deletion and the ECS world.
-- `Default*Service` facades and `GetInstance()` go.
-- Thread-local "active service" access stays only as a scoped convenience: passes get services from their context.
-- The upload stack collapses into one `UploadService` that owns `UploadInstance` and the copy queue. Its interface does not vary with `BUILD_TYPE`.
-
-### Header split
-
-- `include/OpenRenderGraph/` holds the public API: Host, Pass, Builder, Resources, Services, DebugUI.
-- Compiler, admission, scheduling and aliasing internals move to `src/`.
-- `RenderGraph.h` becomes a pimpl, because about 60 nested implementation structs currently leak from it.
+**So the spirit is worth keeping:** build one new ABI from v1's packet and recorder plus v2's registry and descriptions, hosted as one persistent extension. Phase 6 below covers it.
 
 ## Phases
 
-Each phase lands on its own branch off `backend_interop` and ends green on the gates listed under it. **Consumers move
-in the same phase as the API they depend on.** CS and BR are bumped together, so neither is ever left pinned to a
-dead ORG.
+Each phase lands on its own ORG branch off `backend_interop`. CS and BR bump their ORG pin in the same phase as the API they depend on, so no consumer is left on a dead ORG. Every phase ends with the gates listed under Verification.
 
-### Phase 0: freeze baselines and the safety net
+### Phase 0: SARP prep, ORG safety net, baselines
 
-- Fix the CMake defects:
-  - duplicate sources (CMakeLists.txt:105-117);
-  - the `GPUBufferBacking.cpp` case mismatch;
-  - `MemoryIntrospectionWidget` compiled into two targets;
-  - the `BUILD_DEBUG` typo;
-  - the shared `OPEN_RENDER_GRAPH_CONTRIBUTOR_API_H` include guard.
-- Add a headless persistent-vs-owned parity test over the graph-replay fixtures. It compares pass order, batch and queue assignment, barrier counts and the alias footprint.
-- Record baselines:
-  - CS: tour frame report and VRAM;
-  - BR: `scripts/sarp_mo2_scene_benchmark.cmd` with persistent on and off, frame time, barrier and batch counts, VRAM.
+1. **SARP:**
+   - Set aside the uncommitted work on `main` (`GrassRuntime.cpp`, `scripts/community_shaders_mo2_launch.ps1`, the BasicRenderer submodule pointer) as a WIP commit on a side branch. No bare stash.
+   - `git fetch origin tesworld`, then merge `origin/tesworld` into SARP `main`. Resolve conflicts, update submodules (tesworld may move BasicRenderer), then re-apply the WIP if it's still wanted.
+   - Build the `vs2026-renderer-host` preset, deploy, then run `scripts\sarp_mo2_preprocess.cmd` (long: run it in the background).
+2. **ORG fixes:**
+   - duplicate CMake sources (CMakeLists.txt:105-117);
+   - the `GPUBufferBacking.cpp` case mismatch;
+   - `MemoryIntrospectionWidget` compiled into both DebugUI and MemoryUI;
+   - the `BUILD_DEBUG` typo in the GPUBacking headers;
+   - the shared `OPEN_RENDER_GRAPH_CONTRIBUTOR_API_H` guard.
+3. **Parity test:** a headless test (owned vs persistent) over `tests/fixtures/*.orggraph`. It compares pass order, queue and batch assignment, barrier counts and alias footprint.
+4. **Baselines**, recorded under `docs/baselines/`:
+   - **BR:** `scripts\sarp_mo2_scene_benchmark.cmd` with persistent on and off, and on DX12, Vulkan and multi-RHI. Capture the `GetBenchmarkSnapshot` counts (they must match exactly later), timings, barrier and batch counts, and VRAM.
+   - **CS:** tour frame report, VRAM ledger and screenshots.
 
-**Gate:** both consumers build on the fixed ORG. The baselines are committed under `docs/baselines/`.
+### Phase 1: delete unused code and async compile
 
-### Phase 1: delete what no consumer uses
-
-- **Remove:**
-  - `D3D11Interop`;
-  - `ContributorGraphHost`, `ContributorRegistry`, `ExtensionRegistry`, both contributor runtimes and the `ORG_RG_*` header (pending Q3);
-  - `ExecutionBoundary`, `StreamingUploadPass` if BR's two includes turn out to be dead, `ResourceDescriptorIndexHelper`, `ORGUtilities` from `include/`, `ResourceGroup` (BR's 104 uses are `org::ResourceGroup`; verify they're live, otherwise this item moves to Phase 3), the `OpenRenderGraph.h`/`DebugUI.h` umbrellas, and `ExternalBufferResource`/`ExternalBackingResource` (the latter only if it is not on the resize path).
-- **Keep** the `org_c_*` v3 header as a standalone C header. SARP's producer and ABI audit use it.
-- **Move** the `SARP_*` env vars read inside ORG to `ORG_*` settings fields.
-
-**Gate:** CS and BR build and their baselines are unchanged.
+- Delete the unused items listed above.
+- Delete `SARP_ASYNC_COMPILE_MODE` (BR `RendererLifecycle.cpp:337-343`) and `experimentalAsyncCompileMode`/`experimentalCompileConcurrency`.
+- Delete `GraphCompileCoordinator` (ExperimentalGraphCompiler.cpp:1088-1340) and `PrepareAsyncFrame`.
+- Move the `SARP_*` env vars read inside ORG into `ORG_*` settings fields.
+- Keep the contributor code until Phase 6 has replaced it.
 
 ### Phase 2: native persistent lowering
 
-- Lower `TypedRenderGraphPass` / `PersistentTypedPass` declarations into `persistent::PassDeclaration` at structural build, replacing `LowerLegacyPass` and the retained-declaration cache.
-- Move resolver requirement capture into persistent resolver groups. Most of this already exists, at RenderGraphPersistent.cpp:1348-1460.
+- Lower typed and `PersistentTypedPass` declarations straight into `persistent::PassDeclaration` at structural build. This replaces `LowerLegacyPass` (RenderGraphPersistent.cpp:657-776) and the retained-declaration cache it reads.
+- Move resolver requirement capture fully into persistent resolver groups (RenderGraphPersistent.cpp:1348-1460).
 - Give `PersistentGraph` its own pass storage instead of `m_masterPassList`.
-- Make the task service mandatory.
+- Make the task service mandatory, which removes the silent fallback at RenderGraphCompile.cpp:2787.
 
-**Gate:** CS tour and BR persistent benchmark at parity. The parity test passes.
+### Phase 3: BR/SARP onto persistent-only (single backend)
 
-### Phase 3: bring BR onto persistent-only
+- **Port off the legacy pass bases** (`ComputePass`/`RenderPass` with `DeclareResourceUsages`/`Setup`/`Update`/`Execute`) to `TypedRenderGraphPass` (Declare/Prepare/Record), using BR's existing typed passes as the model:
+  - SARP's grass passes (`src/RendererHost/Grass/GrassRenderExtension.cpp`);
+  - `SARPInteropValidation` (moves to typed builders; its multi-RHI checks re-enable in Phase 4).
+- Replace the `ImmediateCommandList` use in BR's `ReadbackManager` with a typed pass.
+- Port G4, G5, G6 and G7. Rebase `RGInspector` and the memory frame-graph timeline on persistent schedule snapshots (`ScheduleTrace`).
+- Make persistent the only BR mode and remove `SARP_PERSISTENT_GRAPH`. Multi-RHI builds keep running in this phase on the owned/legacy route, which is deleted in Phase 5.
 
-- Port SARP's grass passes (G8) and `SARPInteropValidation` to `TypedRenderGraphPass`.
-- Replace `ImmediateCommandList` use in BR's `ReadbackManager` with a typed pass or a host-recorded Pre segment.
-- Port G6 (idle dematerialization) and the parts of G5 BR uses (BranchAndBound behind the existing strategy setting, pool retirement).
-- Port G7:
-  - rebase `RGInspector` and the memory frame-graph timeline on `ScheduleTrace` / persistent schedule snapshots;
-  - port the compile profile and VRAM dump.
-- Port G4. Texture elision and early placement benefit CS too.
-- Flip BR to persistent by default and remove `SARP_PERSISTENT_GRAPH`. The multi-RHI build stays on the old path until Phase 4.
+### Phase 4: multi-RHI and scheduler in persistent (G1–G3)
 
-**Gate:** the BR benchmark with persistent is within noise of the Phase 0 owned-path baseline for frame time, and its barrier count and VRAM are no worse.
-
-### Phase 4: multi-backend in persistent (G1) and scheduler quality (G2, G3)
-
-- Implement the multi-backend design above. Enable BR multi-RHI and `LegacyInterop` (renamed `CrossBackend`) on it.
-- Port queue activation and the scored scheduler as a pure stage. Keep the conservative scheduler as the reference for the validator.
-
-**Gate:** the BR multi-RHI scene renders correctly. Cross-API validation (`SARPInteropValidation`) passes under GPU-based validation on both APIs. Async-compute overlap is at least the old scheduler's on the benchmark.
+- A program carries a set of backend instances, and each binding names the instances that touch it.
+- Representations are made at bind time and versioned like any backing, so backing polling and revisions cover them. Reuse the representation code from `MaterializeMultiBackendRepresentations`, `InteropAllocator` and `SharedAliasPoolManager`.
+- Cross-API transfers become compile-time release/acquire steps on batch boundaries. The admission ledgers keep one state per backend instance, plus imported timeline points.
+- Batches stay single-backend; persistent batches are already single-queue.
+- Alias placement across backends uses shared-heap pools only.
+- Rename `LegacyInterop` to `CrossBackend`.
+- Port G2 and G3 as pure compile stages. Keep the conservative scheduler as the validator's reference.
 
 ### Phase 5: delete the old compiler
 
-- **Remove** the true-legacy and owned routes:
-  - RenderGraph.cpp: about 8.1k old-only lines plus the 525-line owned path;
-  - RenderGraphCompile.cpp: about 3.5k old-only lines plus 1k owned;
-  - the `PassBatch` and old state in RenderGraph.h;
-  - the old aliasing subsystem, apart from the desc helpers, which move into persistent aliasing;
-  - `CommandRecordingManager`, `FramePlanning`, `FrameWorker`, `FrameContext`, `GraphCompileCoordinator` (Q2), `RenderGraphCompileProfile` once G7 is ported, and `ExecutionSchedule.h`.
-- `ComputePass`/`RenderPass`/`CopyPass` and the three builder classes go if Phase 3 removed every user. Otherwise they stay as thin wrappers that lower to typed passes.
+Remove the true-legacy and owned routes:
+- RenderGraph.cpp: about 8.6k lines;
+- RenderGraphCompile.cpp: about 4.5k lines;
+- `PassBatch` and the old state in RenderGraph.h;
+- the old aliasing subsystem, keeping only the `alias::Alias*ResourceDesc` helpers;
+- `CommandRecordingManager`, `FramePlanning`, `FrameWorker`, `FrameContext`, the owned half of `FrameRecording`, `RenderGraphCompileProfile` and `ExecutionSchedule.h`;
+- the `ComputePass`/`RenderPass`/`CopyPass` bases and their three builders.
 
-**Gate:** everything builds, tests pass, both consumers are at their baselines, and ORG is about 40-45k lines (from 86k).
+Make `GraphHost` (generalized from `PersistentGraphHost`) the only public way to drive a graph:
+- An untagged graph is a single-epoch frame, so BR calls `ExecuteFrame()`.
+- The host owns structural rebuild: providers, resolvers, extensions.
+- `Update`/`Execute`/`Setup`/`CompileFrame` become private.
 
-### Phase 6: API and code quality
+Target size: about 40–45k lines.
 
-- Rename the `Experimental*` files and `org::experimental` to their real roles: `GraphCompiler`, `ExecutionState`, `RhiExecution`. Keep `DiagnosticSkip*` as `org::diagnostics`.
-- Make services per-runtime, collapse the upload stack, and remove the singletons.
-- Split the code:
-  - `RenderGraph.cpp` into ingestion, structural build and host glue;
-  - `PassBuilders.h` into one header per builder over a CRTP base. This removes the 60 duplicated `&`/`&&` overloads.
-- Make `RenderGraph.h` a pimpl and move the internals to `src/`.
-- Replace the custom-`main` tests with one test framework and register `HeadlessGraphBenchmark`.
-- Rewrite the README and docs around `GraphHost`. Fold `experimental-async-compile.md` and `async-frame-implementation.md` into one design doc, and drop the history.
+### Phase 6: persistent-native contributor ABI (seed of the CS plugin API)
 
-**Gate:** both consumers build against only `include/OpenRenderGraph/**`. No public header includes a compiler internal.
+1. **One C header:** `include/OpenRenderGraph/ContributorAPI.h`, with one prefix, one include guard and versioned `structSize`/`apiVersion`.
+   - Common `ORGStatus`/`ORGDiagnostic`/call-convention go in a small shared header, so `ShaderCompilerService.h` and ORGModuleServices' `ShaderServiceAdapter` keep compiling.
+   - **From v2:** registry, resource and access descriptions, `ORGFormat` ordinals, diagnostics, `QueueBufferUpload` and `QueryService`.
+   - **From v1:** the prepare packet, the borrowed recorder and the lifecycle hooks.
+   - **New:**
+     - an `invocation_revision` callback, so async-epoch tickets can reuse invocations; it is exclusive with the lifecycle hooks, per `TypedRenderGraphPass.h:120`;
+     - epoch and insert-point naming;
+     - a host resource export table (symbolic ID, format, extent, allowed accesses, valid epochs, read/write);
+     - a pipeline service on top of `ORGShaderCompilerServiceAPI`;
+     - a per-frame host snapshot in the prepare context.
+2. **Host side:** one `ContributorPass : TypedRenderGraphPass<…>` adapter.
+   - Declare comes from the access list; Prepare wraps the packet and captures exact views; Record hands over the recorder.
+   - It is emitted by one `IRenderGraphExtension` registered with `GraphHost::AddExtension`.
+   - Generations retire on the host's completed and retired callbacks.
+   - Reuse `ContributorRegistry`'s validation, pruning and generation logic (`src/Contributor/ContributorRegistry.cpp`) and `ExtensionRegistry`'s export/import resolution, unified into one namespace with the native exports.
+   - The exact-view creation code moves over from `ContributorGraphHost.cpp:305-451`.
+3. **Delete:** `ContributorGraphHost`, both `ContributorRuntime`s, `Render/External/*`, the v2 Update/Execute callbacks, and the anchor and boundary passes.
+4. **Tests:**
+   - port SARP's `tests/ExternalContributor/DiagnosticContributor.cpp` and `ContributorLoaderTests.cpp`;
+   - port `CHeaderSmoke.c`, ORG's `ContributorHeaderCompile.c` and `ContributorRegistryTests.cpp`;
+   - update SARP's `ContributorAbiAudit.cmake` to the new header and forbidden names;
+   - add a cross-contributor resource test modelled on the `my-community-shaders` Producer/Consumer samples.
+5. **Consumers:**
+   - Port SARP's `ProducerCore` to the new ABI: exports, plus marker passes in a named epoch.
+   - On the CS side, a minimal host: export `ORG_GetRenderGraphAPI` from CommunityShaders.dll (push model) and publish CS epoch IDs (`DCLF/Schedule/Frame.cpp:154-166`) and the `diag.*` anchors under `cs.*` names.
+   - Defer a game-target export table beyond a smoke set (depth and colour imported through `ImportImage`, `DCLF/Core/Render/Passes/Common.cpp:22-53`) to a follow-up CS plugin-API project.
+   - `my-community-shaders` is not migrated.
 
-## Verification across all phases
+### Phase 7: API and code quality
 
-- **ORG tests:**
-  - the persistent graph and Vulkan host tests;
-  - the new parity test (owned vs persistent until Phase 5, then persistent vs committed golden schedules);
-  - the async compile tests, retargeted to the compiler.
-- **CS:** build plus a 60 s in-game run (Whiterun, Dragonsreach) with the DCLF frame report, VRAM ledger dump and screenshots. Compare against Phase 0.
-- **BR / SARP:** `scripts/sarp_mo2_scene_benchmark.cmd` plus the renderer host's validation scripts; DX12 and Vulkan; multi-RHI from Phase 4.
+- **Naming:** rename `Experimental*` and `org::experimental` to `GraphCompiler`, `ExecutionState`, `RhiExecution`, and `org::diagnostics` for `DiagnosticSkip*`.
+- **Services:**
+  - Services become per-runtime and owned by `RuntimeDevice`, which removes the `GetInstance()` singletons and `Default*Service` facades.
+  - Collapse the upload stack (`DefaultUploadService` → `UploadManager` → `UploadInstance`/`CopyQueueUploadService`) into one `UploadService`, with no `BUILD_TYPE`-dependent vtable.
+- **Code layout:**
+  - Split `RenderGraph.cpp`.
+  - Split `PassBuilders.h` into one header per builder over a CRTP base.
+  - Make `RenderGraph.h` a pimpl and move compiler, admission and aliasing internals to `src/`.
+- **Tests:** one test framework; register `HeadlessGraphBenchmark`.
+- **Docs:** rewrite the README and docs around `GraphHost`, and replace `extern/OpenRenderGraph/docs/rebuild-plan.md` with this plan once it's approved.
 
-## Decisions needed
+## Verification (every phase)
 
-- **Q1, multi-backend scope.** SARP runs DX12 in practice. Is BR's multi-RHI peer device (G1) a real requirement, or can it be dropped instead of ported? Phase 4 is the most expensive phase.
-- **Q2, async structural compile.** BR's `SARP_ASYNC_COMPILE_MODE` compiles off-thread every frame. Persistent compiles only on rebuild. Is off-thread compile on rebuild worth keeping, as a `GraphCompiler` job, or does it go?
-- **Q3, contributor ABIs.** CS doesn't use `ORG_RG_*` / `ContributorGraphHost`; only `my-community-shaders` does. Delete them, or move them to that consumer? And does `org_c_*` v3 stay in ORG as a header only, or move to SARP?
-- **Q4, legacy pass bases.** Should Phase 3 port SARP's grass passes so the bases can be deleted, or should ORG keep `ComputePass`/`RenderPass` as typed-lowering wrappers?
+- **ORG:**
+  - `OpenRenderGraph` tests: PersistentGraph, the persistent Vulkan host, the parity test (against golden schedules after Phase 5), and the contributor tests (Phase 6);
+  - shader and Vulkan validation layers on the Vulkan host tests.
+- **CS:**
+  - `cmake --build build/ALL --config Release --target CommunityShaders`, then deploy;
+  - one 60 s MO2 run (Whiterun or Dragonsreach), with the DCLF frame report, VRAM ledger and screenshots compared to the Phase 0 baseline.
+- **SARP/BR:**
+  - Build the renderer host and run ctest, including `SARPSourceAudit` and `SARPContributorAbiAudit`.
+  - **Then always run `scripts\sarp_mo2_preprocess.cmd` first** (long, in the background), followed by `scripts\sarp_mo2_scene_benchmark.cmd`. `GetBenchmarkSnapshot` counts must match the baseline exactly; frame time must be within noise; barrier count and VRAM must be no worse.
+  - Run on DX12 and Vulkan from Phase 3, and on multi-RHI with `SARPInteropValidation` under GPU-based validation from Phase 4.
+- **Phase 6:** a sample contributor DLL draws through CS's host in-game, and unregistering it mid-run retires it cleanly.

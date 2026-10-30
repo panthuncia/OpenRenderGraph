@@ -28,6 +28,7 @@
 #include "Resources/MemoryStatisticsComponents.h"
 #include "Managers/Singletons/DeviceManager.h"
 #include "Managers/Singletons/DeletionManager.h"
+#include <thread>
 
 #include <algorithm>
 #include <array>
@@ -559,6 +560,10 @@ struct LoweredUse {
 	Resource* resource = nullptr;
 	CompileRange range;
 	CompileResourceState state;
+	// A resolver's resource declared directly: the slot's own reference, as for a group member. The resolver may drop it (a
+	// removed group entry, a versioned buffer's old version) while the slot still names it, and every preparation polls the
+	// slots' backings.
+	std::shared_ptr<Resource> owner;
 };
 struct LoweredGroup {
 	std::shared_ptr<const void> key;
@@ -739,16 +744,21 @@ static LoweredPass LowerLegacyPass(RenderGraph& graph, ResourceRegistry& registr
 				for (const auto& request : snapshot.requirementTemplates) {
 					const auto memberShape = ShapeOf(*member);
 					const auto range = LowerRange(request.range, memberShape);
-					if (range) result.entries.push_back({id, member.get(), *range, LowerState(request.state)});
+					if (range) result.entries.push_back({id, member.get(), *range, LowerState(request.state), member});
 				}
 		}
 	} else {
 		for (const auto& requirement : GetFrameRequirementsSpan(resources)) lowerRequirement(requirement);
+		std::unordered_map<const Resource*, std::shared_ptr<Resource>> owners;
 		for (const auto& snapshot : pass.resolverSnapshots) {
 			if (!snapshot.resolver) continue;
 			const auto state = graph.CaptureResolverDeclarationState(*snapshot.resolver);
 			result.directResolvers.emplace_back(snapshot.resolver->Clone(), state ? state->resourceSetIdentity : snapshot.resourceSetIdentity);
+			if (state && state->resources)
+				for (const auto& member : *state->resources) if (member) owners.emplace(member.get(), member);
 		}
+		for (auto& use : result.entries)
+			if (const auto found = owners.find(use.resource); found != owners.end()) use.owner = found->second;
 	}
 	for (const auto& [handleAndRange, state] : resources.internalTransitions) {
 		auto* resource = resolve(handleAndRange.resource);
@@ -796,16 +806,20 @@ State::SlotEntry& ClaimEntry(State& state, persistent::ResourceSlotId slot) {
 // are shared by every pass declaring the resource directly; group member slots
 // are private to their group (see ReserveGroupMember).
 uint32_t DirectEntry(State& state, persistent::GraphEditTransaction& edit, uint64_t resourceID, Resource* resource,
-	CompileResourceShape shape, bool swapchain) {
+	CompileResourceShape shape, bool swapchain, std::shared_ptr<Resource> owner) {
 	auto& indices = state.entriesByResourceID[resourceID];
 	for (const auto index : indices) {
-		const auto& entry = state.entries[index];
-		if (entry.direct && entry.resource == resource && entry.shape == shape) return index;
+		auto& entry = state.entries[index];
+		if (entry.direct && entry.resource == resource && entry.shape == shape) {
+			if (owner && !entry.member) entry.member = std::move(owner);
+			return index;
+		}
 	}
 	const auto slot = edit.ReserveResource(shape);
 	auto& entry = ClaimEntry(state, slot);
 	entry.direct = true;
 	entry.resource = resource;
+	entry.member = std::move(owner);
 	entry.resourceID = resourceID;
 	entry.shape = shape;
 	entry.swapchain = swapchain;
@@ -896,7 +910,9 @@ void QueueSlotPatch(State& state, const State::SlotEntry& entry, uint64_t concre
 // Installs (or reinstalls) a main pass declaration into the transaction.
 static void InstallMainPass(RenderGraph& graph, State& state, persistent::GraphEditTransaction& edit,
 	State::MainPass& main, LoweredPass lowered, uint32_t mainIndex, bool replace, std::optional<uint32_t> authoredOrder = std::nullopt) {
+	std::vector<uint32_t> previousDirect;
 	if (replace) {
+		previousDirect = main.directEntries;
 		for (const auto groupIndex : main.groups) {
 			auto& group = state.groups[groupIndex];
 			edit.RemoveGroupAccess(main.id, group.group);
@@ -928,7 +944,7 @@ static void InstallMainPass(RenderGraph& graph, State& state, persistent::GraphE
 	auto declare = [&](const LoweredUse& use, bool entry) {
 		const bool swapchain = use.resource && use.resource->GetName() == "Backbuffer"
 			&& dynamic_cast<DynamicResource*>(use.resource) && !dynamic_cast<BackedResource*>(UnwrapDynamic(use.resource));
-		const auto index = DirectEntry(state, edit, use.resourceID, use.resource, ShapeOf(*use.resource), swapchain);
+		const auto index = DirectEntry(state, edit, use.resourceID, use.resource, ShapeOf(*use.resource), swapchain, use.owner);
 		auto& slotEntry = state.entries[index];
 		if (std::find(slotEntry.subscribers.begin(), slotEntry.subscribers.end(), mainIndex) == slotEntry.subscribers.end())
 			slotEntry.subscribers.push_back(mainIndex);
@@ -1049,6 +1065,20 @@ static void InstallMainPass(RenderGraph& graph, State& state, persistent::GraphE
                 main.declaredViews.back().push_back(edit.RequireView(token->second, view));
         }
     }
+	// Direct slots the new lowering no longer declares, and no other pass does: released with the pass's old declaration.
+	// Kept, they would name a resource nothing keeps alive (a resolver's old member) and still be polled every frame.
+	for (const auto entryIndex : previousDirect) {
+		auto& entry = state.entries[entryIndex];
+		if (!entry.direct || entry.retired || !entry.subscribers.empty()) continue;
+		edit.RemoveResource(entry.slot);
+		if (auto found = state.entriesByResourceID.find(entry.resourceID); found != state.entriesByResourceID.end()) {
+			std::erase(found->second, entryIndex);
+			if (found->second.empty()) state.entriesByResourceID.erase(found);
+		}
+		entry = {};
+		entry.retired = true;
+		basic_telemetry::AddCounter("ORG.Persistent.RetiredDirectSlots");
+	}
 	(void)graph;
 }
 
@@ -1105,6 +1135,26 @@ static void LogRelowerDiff(const std::string& name, const State::MainPass& main,
 	}
 	spdlog::info("Persistent structural relower: pass='{}' direct={} groups={} newGroupKeys={} added=[{}] removed=[{}]",
 		name, lowered.entries.size(), lowered.groups.size(), keyChanges, added, removed);
+}
+
+// True when the new lowering declares a direct resource or group the pass
+// did not declare before (the live publication has no slot for it).
+static bool LoweringAddsDeclarations(const State::MainPass& main, const LoweredPass& lowered) {
+    // A new view layout cannot prepare against the old publication while its
+    // structural edit is pending, even when the resource set is unchanged.
+    if (lowered.resourceUses && !lowered.resourceUses->uses.empty()
+        && lowered.resourceUses != main.resourceUses) return true;
+	for (const auto& use : lowered.entries) {
+		bool known = false;
+		for (const auto& previous : main.loweredDirect) if (previous.first == use.resourceID) { known = true; break; }
+		if (!known) return true;
+	}
+	for (const auto& group : lowered.groups) {
+		bool known = false;
+		for (const auto* key : main.loweredGroupKeys) if (key == group.key.get()) { known = true; break; }
+		if (!known) return true;
+	}
+	return false;
 }
 
 void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex, const IHostExecutionData* hostData, float deltaTime) {
@@ -1319,6 +1369,9 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 			return *edit;
 		};
 		size_t refreshed = 0;
+		// Set when a relower cannot wait for a worker build: the frame would prepare the pass against a publication that does
+		// not have its declarations.
+		bool inlineStructural = false;
 		{ BT_ZONE_SCOPE("ORG.Persistent.PollDynamicDeclared");
 		for (uint32_t mainIndex = 0; mainIndex < state.mainPasses.size(); ++mainIndex) {
 			auto& main = state.mainPasses[mainIndex];
@@ -1328,15 +1381,33 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 				using T = std::decay_t<decltype(value)>;
 				if constexpr (!std::is_same_v<T, std::monostate>) {
 					auto* dynamic = value.declarationCache.dynamicInterface;
-					if (!dynamic || !dynamic->DeclaredResourcesChanged() || dynamic->DeclarationsProvidedByImmediateCommands()) return;
+					const bool declared = dynamic && dynamic->DeclaredResourcesChanged() && !dynamic->DeclarationsProvidedByImmediateCommands();
+					// A resolver declared directly is lowered as the set it resolved to; another set means the pass is lowered
+					// again, from a fresh declaration, before it is prepared.
+					bool directStale = false;
+					for (const auto& [resolver, identity] : main.directResolvers) {
+						const auto captured = CaptureResolverDeclarationState(*resolver);
+						if (captured && !(captured->resourceSetIdentity == identity)) { directStale = true; break; }
+					}
+					if (!declared && !directStale) return;
 					BT_ZONE_SCOPE("ORG.Persistent.RefreshDeclaration");
 					BT_ZONE_TEXT(any.name.data(), any.name.size());
 					++refreshed;
-					if (!RefreshRetainedDeclarationsForFrame(value, frameIndex)) return;
+					if (!RefreshRetainedDeclarationsForFrame(value, frameIndex) && !directStale) return;
 					auto lowered = LowerLegacyPass(*this, _registry, m_queueRegistry, primaryBackend, value, any.type, mainIndex);
-					if (FingerprintLowering(lowered) == main.fingerprint) return; // Membership-only change.
+					// Membership-only change: the same structure under the same declared layout. A new layout re-issues the pass's
+					// binding tokens, which only a reinstalled lowering resolves.
+					if (FingerprintLowering(lowered) == main.fingerprint && lowered.resourceUses == main.resourceUses) {
+						main.directResolvers = std::move(lowered.directResolvers);
+						return;
+					}
 					LogRelowerDiff(any.name, main, lowered);
-					if (state.pending) { state.pending->deferredStructural.push_back(mainIndex); return; }
+					const bool mustInline = directStale || LoweringAddsDeclarations(main, lowered);
+					if (state.pending) {
+						if (!mustInline) { state.pending->deferredStructural.push_back(mainIndex); return; }
+						DrainPersistentStructuralBuild(structural);
+					}
+					inlineStructural |= mustInline;
 					relowered.emplace(mainIndex, std::move(lowered));
 					structural.push_back(mainIndex);
 				}
@@ -1442,22 +1513,6 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 			basic_telemetry::AddCounter("ORG.Persistent.MembershipEdits");
 		}
 		}
-		// Direct declarations of a resolver bind the set it resolved to when the pass was lowered. A preparation that resolves
-		// another set (a revision's version, or a new current one before the pass is lowered again) would record against
-		// resources it does not name - read past a grown buffer's old backing, say. Never silently: the pass must be lowered as
-		// a group (PrepareIncrementalResolverPatchRecipe) or lowered again first.
-		{ BT_ZONE_SCOPE("ORG.Persistent.CheckDirectResolvers");
-		for (const auto& main : state.mainPasses) {
-			if (main.hosted || main.retired) continue;
-			for (const auto& [resolver, identity] : main.directResolvers) {
-				const auto captured = CaptureResolverDeclarationState(*resolver);
-				if (captured && !(captured->resourceSetIdentity == identity))
-					throw std::logic_error("Persistent pass '" + main.name
-						+ "' binds a resolver's resources directly, as they were when it was lowered, but this preparation resolves "
-						  "another set of them");
-			}
-		}
-		}
 		std::sort(structural.begin(), structural.end());
 		structural.erase(std::unique(structural.begin(), structural.end()), structural.end());
 		// Backing rotation, in the same transaction as membership: a rotating
@@ -1517,7 +1572,22 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 		// Structural edits build on a worker against the publication that now
 		// includes this frame's binding edits.
 		if (!state.pending && (!structural.empty() || !growGroups.empty()))
-			SubmitPersistentStructuralBuild(structural, growGroups, primaryBackend);
+			SubmitPersistentStructuralBuild(structural, growGroups, primaryBackend, inlineStructural);
+		// Direct declarations of a resolver bind the set it resolved to when the pass was lowered. A preparation that resolves
+		// another set would record against resources it does not name - read past a grown buffer's old backing, say. A change
+		// is relowered inline above, so by here every pass must match; never silently.
+		{ BT_ZONE_SCOPE("ORG.Persistent.CheckDirectResolvers");
+		for (const auto& main : state.mainPasses) {
+			if (main.hosted || main.retired) continue;
+			for (const auto& [resolver, identity] : main.directResolvers) {
+				const auto captured = CaptureResolverDeclarationState(*resolver);
+				if (captured && !(captured->resourceSetIdentity == identity))
+					throw std::logic_error("Persistent pass '" + main.name
+						+ "' binds a resolver's resources directly, as they were when it was lowered, but this preparation resolves "
+						  "another set of them");
+			}
+		}
+		}
 	}
 	// 3. Select and prepare the main segment.
 	auto selected = state.program.Select();
@@ -2472,27 +2542,8 @@ void RenderGraph::RunPersistentStructuralBuildPhase(bool validated) {
 		run();
 }
 
-// True when the new lowering declares a direct resource or group the pass
-// did not declare before (the live publication has no slot for it).
-static bool LoweringAddsDeclarations(const State::MainPass& main, const LoweredPass& lowered) {
-    // A new view layout cannot prepare against the old publication while its
-    // structural edit is pending, even when the resource set is unchanged.
-    if (lowered.resourceUses && !lowered.resourceUses->uses.empty()
-        && lowered.resourceUses != main.resourceUses) return true;
-	for (const auto& use : lowered.entries) {
-		bool known = false;
-		for (const auto& previous : main.loweredDirect) if (previous.first == use.resourceID) { known = true; break; }
-		if (!known) return true;
-	}
-	for (const auto& group : lowered.groups) {
-		bool known = false;
-		for (const auto* key : main.loweredGroupKeys) if (key == group.key.get()) { known = true; break; }
-		if (!known) return true;
-	}
-	return false;
-}
-
-void RenderGraph::SubmitPersistentStructuralBuild(const std::vector<uint32_t>& structural, const std::vector<uint32_t>& growGroups, rhi::Backend primaryBackend) {
+void RenderGraph::SubmitPersistentStructuralBuild(const std::vector<uint32_t>& structural, const std::vector<uint32_t>& growGroups, rhi::Backend primaryBackend,
+	bool forceInline) {
 	BT_ZONE_SCOPE("ORG.Persistent.SubmitStructuralBuild");
 	auto& compiler = *m_compilerState;
 	auto& state = *compiler.persistent;
@@ -2500,7 +2551,7 @@ void RenderGraph::SubmitPersistentStructuralBuild(const std::vector<uint32_t>& s
 	// have cannot be prepared against it while the build is pending: such
 	// edits build inline (one frame hitch). Growth, new passes and relowers
 	// that add nothing are safe to build on the worker.
-	bool inlineRequired = false;
+	bool inlineRequired = forceInline;
 	std::unordered_map<uint32_t, LoweredPass> lowerings;
 	for (const auto mainIndex : structural) {
 		auto& main = state.mainPasses[mainIndex];
@@ -2641,6 +2692,16 @@ void RenderGraph::AdvancePersistentStructuralBuild(std::vector<uint32_t>& struct
 		std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pending->started).count(),
 		pending->bindingLog.size(), pending->deferredStructural.size());
 	state.pending.reset();
+}
+
+void RenderGraph::DrainPersistentStructuralBuild(std::vector<uint32_t>& structural) {
+	BT_ZONE_SCOPE("ORG.Persistent.DrainStructuralBuild");
+	auto& state = *m_compilerState->persistent;
+	while (state.pending) {
+		AdvancePersistentStructuralBuild(structural);
+		if (state.pending) std::this_thread::yield();
+	}
+	basic_telemetry::AddCounter("ORG.Persistent.StructuralBuildsDrained");
 }
 
 namespace {

@@ -71,7 +71,7 @@ public:
 	}
 
 private:
-#if BUILD_TYPE == BUILD_DEBUG
+#if BUILD_TYPE == BUILD_TYPE_DEBUG
 	std::stacktrace m_creation;
 #endif
 	void initialize(const TextureDescription& desc,

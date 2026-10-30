@@ -11956,6 +11956,17 @@ QueueSlotIndex RenderGraph::CreateQueue(QueueKind kind, const char* name, QueueA
 		: m_backendDevices.front().backend;
 	rhi::Queue queue;
 	auto result = device.CreateQueue(static_cast<rhi::QueueKind>(kind), logicalName, queue);
+	if (result == rhi::Result::Unsupported) {
+		// The device has no further queue of this kind (a Vulkan family's queue count): share the last one of the kind, so the
+		// work serializes there instead of failing the graph.
+		for (size_t i = m_queueRegistry.SlotCount(); i-- > 0;) {
+			const auto slot = static_cast<QueueSlotIndex>(static_cast<uint8_t>(i));
+			if (m_queueRegistry.GetKind(slot) != kind) continue;
+			spdlog::warn("Queue '{}' (kind {}): the device has no further queue of this kind; sharing queue slot {}",
+				logicalName, static_cast<int>(kind), i);
+			return slot;
+		}
+	}
 	if (result != rhi::Result::Ok) {
 		throw std::runtime_error(fmt::format(
 			"Failed to create queue '{}' for kind {}: {}",

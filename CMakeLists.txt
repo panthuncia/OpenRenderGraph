@@ -109,12 +109,6 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/BindingTable.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/Runtime/ResourceCleanupQueue.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PublicationBindingBundle.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/OwnedDescriptorBinding.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/BindingTable.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/ResourceCleanupQueue.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/OwnedDescriptorBinding.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/BindingTable.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/Runtime/ResourceCleanupQueue.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PreparedTablePublisher.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/LatchBlock.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/StagedUploadBatch.cpp"
@@ -174,13 +168,13 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Managers/Singletons/ReadbackManager.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Managers/Singletons/StatisticsManager.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/ExternalBackingResource.cpp"
-	"${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/ExternalBufferResource.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/ExternalBufferResource.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/ExternalTextureResource.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/PixelBuffer.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/Buffers/Buffer.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/Buffers/DynamicBufferBase.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/ResourceStateTracker.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/GPUBacking/GPUBufferBacking.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/GPUBacking/GpuBufferBacking.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/GPUBacking/GPUTextureBacking.cpp"
 )
 
@@ -233,9 +227,26 @@ if(ORG_ENABLE_NVPERF)
 endif()
 target_compile_definitions(OpenRenderGraph PRIVATE ORG_ENABLE_NVPERF=$<BOOL:${_org_nvperf}>)
 
+# The memory introspection widget alone: Dear ImGui and ImPlot (the host's contexts), no Slang. The host feeds it a
+# ui::MemorySnapshot built from the graph's memory snapshot provider (Render/MemoryIntrospectionAPI.h). The debug UI links it
+# rather than compiling the widget a second time.
+if(OPENRENDERGRAPH_ENABLE_MEMORY_UI OR OPENRENDERGRAPH_ENABLE_DEBUG_UI)
+    add_library(OpenRenderGraphMemoryUI STATIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/DebugUI/MemoryIntrospectionWidget.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/DebugUI/MemoryIntrospectionWidget.h")
+    add_library(OpenRenderGraph::MemoryUI ALIAS OpenRenderGraphMemoryUI)
+    target_compile_features(OpenRenderGraphMemoryUI PUBLIC cxx_std_23)
+    target_include_directories(OpenRenderGraphMemoryUI PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+    if(MSVC)
+        target_compile_options(OpenRenderGraphMemoryUI PRIVATE /utf-8)
+    endif()
+    target_link_libraries(OpenRenderGraphMemoryUI PUBLIC OpenRenderGraph::OpenRenderGraph imgui::imgui implot::implot)
+endif()
+
 if(OPENRENDERGRAPH_ENABLE_DEBUG_UI)
     add_library(OpenRenderGraphDebugUI STATIC
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/DebugUI/MemoryIntrospectionWidget.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/DebugUI/MemoryViewWidget.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/DebugUI/RenderGraphInspector.cpp")
     add_library(OpenRenderGraph::DebugUI ALIAS OpenRenderGraphDebugUI)
@@ -248,7 +259,7 @@ if(OPENRENDERGRAPH_ENABLE_DEBUG_UI)
     if(MSVC)
         target_compile_options(OpenRenderGraphDebugUI PRIVATE /utf-8)
     endif()
-    target_link_libraries(OpenRenderGraphDebugUI PUBLIC OpenRenderGraph::OpenRenderGraph
+    target_link_libraries(OpenRenderGraphDebugUI PUBLIC OpenRenderGraph::OpenRenderGraph OpenRenderGraph::MemoryUI
         imgui::imgui implot::implot slang::slang)
 endif()
 
@@ -266,23 +277,6 @@ if(OPENRENDERGRAPH_ENABLE_SCHEDULE_UI)
         target_compile_options(OpenRenderGraphScheduleUI PRIVATE /utf-8)
     endif()
     target_link_libraries(OpenRenderGraphScheduleUI PUBLIC OpenRenderGraph::OpenRenderGraph imgui::imgui)
-endif()
-
-# The memory introspection widget alone: Dear ImGui and ImPlot (the host's contexts), no Slang. The host feeds it a
-# ui::MemorySnapshot built from the graph's memory snapshot provider (Render/MemoryIntrospectionAPI.h).
-if(OPENRENDERGRAPH_ENABLE_MEMORY_UI)
-    add_library(OpenRenderGraphMemoryUI STATIC
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/DebugUI/MemoryIntrospectionWidget.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/DebugUI/MemoryIntrospectionWidget.h")
-    add_library(OpenRenderGraph::MemoryUI ALIAS OpenRenderGraphMemoryUI)
-    target_compile_features(OpenRenderGraphMemoryUI PUBLIC cxx_std_23)
-    target_include_directories(OpenRenderGraphMemoryUI PUBLIC
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
-    if(MSVC)
-        target_compile_options(OpenRenderGraphMemoryUI PRIVATE /utf-8)
-    endif()
-    target_link_libraries(OpenRenderGraphMemoryUI PUBLIC OpenRenderGraph::OpenRenderGraph imgui::imgui implot::implot)
 endif()
 
 target_compile_definitions(OpenRenderGraph
@@ -329,6 +323,12 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
     add_test(NAME OpenRenderGraphPersistentTests COMMAND OpenRenderGraphPersistentTests)
     set_tests_properties(OpenRenderGraphPersistentTests PROPERTIES
         ENVIRONMENT "ORG_GRAPH_REPLAY_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/persistent_test_snapshot.orggraph")
+    add_executable(OpenRenderGraphGoldenScheduleTests tests/GoldenScheduleTests.cpp)
+    target_compile_features(OpenRenderGraphGoldenScheduleTests PRIVATE cxx_std_23)
+    target_compile_definitions(OpenRenderGraphGoldenScheduleTests PRIVATE
+        ORG_REPLAY_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
+    target_link_libraries(OpenRenderGraphGoldenScheduleTests PRIVATE OpenRenderGraph)
+    add_test(NAME OpenRenderGraphGoldenScheduleTests COMMAND OpenRenderGraphGoldenScheduleTests)
     add_executable(OpenRenderGraphHeadlessBenchmark tests/HeadlessGraphBenchmark.cpp tests/GraphReplayRunner.h)
     target_compile_features(OpenRenderGraphHeadlessBenchmark PRIVATE cxx_std_23)
     target_link_libraries(OpenRenderGraphHeadlessBenchmark PRIVATE OpenRenderGraph)

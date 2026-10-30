@@ -1577,8 +1577,11 @@ private:
 	// its schedule/placed builds run on a task worker while frames keep the
 	// selected publication; binding edits made meanwhile are replayed onto the
 	// result before a rebased install.
-	void SubmitPersistentStructuralBuild(const std::vector<uint32_t>& structural, const std::vector<uint32_t>& growGroups, rhi::Backend primaryBackend);
+	void SubmitPersistentStructuralBuild(const std::vector<uint32_t>& structural, const std::vector<uint32_t>& growGroups, rhi::Backend primaryBackend,
+		bool forceInline = false);
 	void AdvancePersistentStructuralBuild(std::vector<uint32_t>& structural);
+	// Blocks until the pending structural build is installed (a relower that cannot be prepared against the live publication).
+	void DrainPersistentStructuralBuild(std::vector<uint32_t>& structural);
 	void RunPersistentStructuralBuildPhase(bool validated);
 	// Hosts this frame's frame-interrupting passes in the main executable and
 	// removes the previous frame's. Returns requested passes that name no main
