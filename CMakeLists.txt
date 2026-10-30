@@ -143,6 +143,7 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/PersistentGraph.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraphPersistent.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/PersistentLowering.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/AliasPacking.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/ScheduleTrace.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/ScheduleTraceBuild.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/RenderGraph/ScheduleTrace.h"
@@ -318,6 +319,9 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
     add_test(NAME OpenRenderGraphPersistentTests COMMAND OpenRenderGraphPersistentTests)
     set_tests_properties(OpenRenderGraphPersistentTests PROPERTIES
         ENVIRONMENT "ORG_GRAPH_REPLAY_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/persistent_test_snapshot.orggraph")
+    add_executable(OpenRenderGraphAliasPackingTests tests/AliasPackingTests.cpp src/Render/RenderGraph/AliasPacking.cpp)
+    target_compile_features(OpenRenderGraphAliasPackingTests PRIVATE cxx_std_23)
+    add_test(NAME OpenRenderGraphAliasPackingTests COMMAND OpenRenderGraphAliasPackingTests)
     add_executable(OpenRenderGraphGoldenScheduleTests tests/GoldenScheduleTests.cpp)
     target_compile_features(OpenRenderGraphGoldenScheduleTests PRIVATE cxx_std_23)
     target_compile_definitions(OpenRenderGraphGoldenScheduleTests PRIVATE

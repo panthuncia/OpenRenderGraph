@@ -154,9 +154,15 @@ void RenderGraph::BuildMemoryIntrospectionFrameGraphSnapshot(
 	ui::FrameGraphSnapshot& out,
 	const std::vector<org::memory::ResourceMemoryRecord>& memoryRecords) const {
 	out.batches.clear();
-	out.batches.reserve(batches.size());
-
 	const auto memIndex = BuildFrameGraphMemoryIndex(memoryRecords);
+	if (m_compilerState && m_compilerState->persistent) {
+		std::unordered_map<uint64_t, std::pair<uint64_t, std::string>> memory;
+		memory.reserve(memIndex.size());
+		for (const auto& [id, info] : memIndex) memory.emplace(id, std::pair{info.bytes, info.category});
+		BuildPersistentFrameGraphSnapshot(out, memory);
+		return;
+	}
+	out.batches.reserve(batches.size());
 
 	std::unordered_set<uint64_t> uniqueIds;
 	uniqueIds.reserve(2048);

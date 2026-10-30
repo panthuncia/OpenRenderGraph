@@ -7,6 +7,13 @@
 #include <BasicTelemetry/Telemetry.h>
 
 namespace {
+// A texture barrier between identical states on one queue orders nothing: no layout change, the same access and
+// scope, and no ownership transfer. Unordered access still orders writes (NeedsWholeBufferBarrier).
+bool NeedsTextureBarrier(const rhi::TextureBarrier& barrier) noexcept {
+    return barrier.queueOwnership != rhi::QueueOwnership::None || barrier.beforeLayout != barrier.afterLayout
+        || org::NeedsWholeBufferBarrier(barrier.beforeAccess, barrier.afterAccess, barrier.beforeSync, barrier.afterSync);
+}
+
 // Schedule queue slots map to QueueKind the same way submission does
 // (RenderGraph.cpp: 0 graphics, 1 compute, otherwise copy).
 rhi::QueueKind OwnershipPeerForQueue(uint32_t queue) noexcept {
@@ -236,7 +243,7 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
                     barrier.queueOwnership = rhi::QueueOwnership::Acquire;
                     barrier.ownershipPeer = OwnershipPeerForQueue(previousQueue);
                 }
-                beforePass.textures.push_back(barrier);
+                if (NeedsTextureBarrier(barrier)) beforePass.textures.push_back(barrier);
             } else {
                 const bool fixedHeapState = captured.heapType == rhi::HeapType::Upload
                     || captured.heapType == rhi::HeapType::Readback;
@@ -318,7 +325,7 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
                 barrier.beforeSync = static_cast<rhi::ResourceSyncState>(uniformBefore->sync);
                 barrier.afterSync = static_cast<rhi::ResourceSyncState>(step.after.sync);
                 barrier.discard = barrier.beforeLayout == rhi::ResourceLayout::Undefined;
-                beforePass.textures.push_back(barrier);
+                if (NeedsTextureBarrier(barrier)) beforePass.textures.push_back(barrier);
             } else {
                 const auto beforeAccess = static_cast<rhi::ResourceAccessType>(uniformBefore->access);
                 const auto beforeSync = static_cast<rhi::ResourceSyncState>(uniformBefore->sync);
@@ -404,7 +411,7 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
                     // texture handoffs are visible; graph buffers are Concurrent.
                     basic_telemetry::AddCounter("ORG.Execution.CrossFrameTextureQueueHandoff");
                 }
-                beforePass.textures.push_back(barrier);
+                if (NeedsTextureBarrier(barrier)) beforePass.textures.push_back(barrier);
             } else {
                 const auto heapType = captured.heapType;
                 const bool fixedHeapState = heapType == rhi::HeapType::Upload

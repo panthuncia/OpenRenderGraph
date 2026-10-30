@@ -14,6 +14,7 @@
 #include "Render/RenderGraph/RenderGraph.h"
 #include "RenderGraphCompilerState.h"
 #include "PersistentLowering.h"
+#include "AliasPacking.h"
 #include "FrameRecording.h"
 #include "ScheduleTraceBuild.h"
 #include "Render/RenderGraph/ExperimentalRhiExecution.h"
@@ -27,6 +28,7 @@
 #include "Resources/PixelBuffer.h"
 #include "Resources/Buffers/DynamicBufferBase.h"
 #include "Resources/MemoryStatisticsComponents.h"
+#include "Render/FrameGraphSnapshot.h"
 #include "Managers/Singletons/DeviceManager.h"
 #include "Managers/Singletons/DeletionManager.h"
 #include <thread>
@@ -384,6 +386,7 @@ struct RenderGraph::PersistentExecutionState {
 		std::shared_ptr<const AliasHeapGeneration> heap;
 		uint64_t capacityBytes = 0, alignment = 1, generation = 0;
 		uint8_t resourceClass = 0;
+		uint64_t idleSinceFrame = 0; // The frame the latest plan stopped placing into it; 0 while placed into.
 	};
 	struct AliasPlacementRecord {
 		uint64_t poolID = 0, offset = 0, sizeBytes = 0;
@@ -395,6 +398,7 @@ struct RenderGraph::PersistentExecutionState {
 	std::vector<std::pair<uint32_t, uint32_t>> aliasEdges;          // Installed placement orderings (logical pass slots).
 	uint64_t aliasPlans = 0, aliasRematerializations = 0;
 	bool forceNewAliasHeaps = false; // Diagnostic (ORG_PERSISTENT_FORCE_REALIAS): next plan re-places every pool.
+	AutoAliasPackingStrategy aliasPackingStrategy = AutoAliasPackingStrategy::GreedySweepLine; // The latest plan's.
 	const void* dumpedExecutable = nullptr; // Compile-dump mode: last executable written.
 	// Diagnostic: per-pass preparation cost (logged periodically).
 	std::unordered_map<std::string, std::pair<uint64_t, uint64_t>> prepareCostByPass; // lowering: name -> (ns, calls)
@@ -415,6 +419,13 @@ struct RenderGraph::PersistentExecutionState {
 		std::string error;
 		experimental::CompileWorkspace workspace;
 		std::vector<uint32_t> dirtyPasses;        // slotsDirty deferred to the install
+		// Relowered passes' declared tokens, which resolve only against the new publication: swapped in at the install.
+		struct DeclaredTokens {
+			uint32_t mainIndex;
+			std::vector<std::vector<persistent::ViewToken>> views;
+			std::vector<persistent::BindingToken> bindings;
+		};
+		std::vector<DeclaredTokens> declaredTokens;
 		std::vector<uint32_t> touchedGroups;      // grown in the transaction: not polled meanwhile
 		std::vector<uint32_t> deferredStructural; // relower requests that arrived meanwhile
 		// Binding edits installed on the live publication meanwhile, replayed
@@ -1045,6 +1056,7 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 	state.frameIndex = frameIndex;
 	state.frameNumber = ++compiler.asyncPreparationFrameNumber;
 	state.frameData = m_asyncUpdateHostData;
+	RetireIdlePersistentAliasPools(state);
 	compiler.preparingFrame.reset();
 	org::runtime::ScopedActiveGraphServices activeServices(m_uploadService.get(), m_descriptorService.get());
 	const auto primaryBackend = m_backendDevices.empty() ? rhi::Backend::Null : m_backendDevices.front().backend;
@@ -1077,7 +1089,12 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 		AdvancePersistentStructuralBuild(structural);
 		for (auto& desc : UpdatePersistentFrameInterruptingPasses(std::move(interrupting), primaryBackend))
 			frameExt.push_back(std::move(desc));
-		if (const auto interval = ForcedRealias().interval; interval && !state.pending && state.frameNumber % interval == 0) {
+		// Alias re-placement: on the ORG_PERSISTENT_FORCE_REALIAS interval, or when the packing strategy changed since the
+		// latest plan (plans run only on structural builds).
+		const auto interval = ForcedRealias().interval;
+		const bool realiasInterval = interval && state.frameNumber % interval == 0;
+		const bool packingChanged = m_getAutoAliasPackingStrategy && m_getAutoAliasPackingStrategy() != state.aliasPackingStrategy;
+		if ((realiasInterval || packingChanged) && !state.pending) {
 			BT_ZONE_SCOPE("ORG.Persistent.ForcedRealias");
 			auto forced = state.program.BeginEdit();
 			// Re-placement is only valid in a structural edit (the executable must
@@ -1090,7 +1107,7 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 			state.forceNewAliasHeaps = false;
 			if (!ready || !state.program.Install(forced, ready)) throw std::runtime_error("Persistent forced alias re-placement failed to install");
 			++state.structuralBuilds;
-			spdlog::info("Persistent forced alias re-placement: frame={}", state.frameNumber);
+			spdlog::info("Persistent alias re-placement ({}): frame={}", packingChanged ? "packing strategy changed" : "forced", state.frameNumber);
 		}
 		auto ensureEdit = [&]() -> persistent::GraphEditTransaction& {
 			if (!edit) edit.emplace(state.program.BeginEdit());
@@ -2338,7 +2355,15 @@ void RenderGraph::SubmitPersistentStructuralBuild(const std::vector<uint32_t>& s
 				for (const auto& use : lowered.entries) resources.push_back(use.resource);
 				for (const auto& group : lowered.groups) for (const auto& [id, resource] : group.members) resources.push_back(resource.get());
 				MaterializePersistentStandalone(resources, true);
+				auto views = std::move(main.declaredViews);
+				auto bindings = std::move(main.declaredBindings);
 				InstallMainPass(*this, state, transaction, main, std::move(lowered), mainIndex, true);
+				if (!inlineRequired) {
+					// Frames keep preparing against the current publication until the install.
+					std::swap(views, main.declaredViews);
+					std::swap(bindings, main.declaredBindings);
+					pending->declaredTokens.push_back({mainIndex, std::move(views), std::move(bindings)});
+				}
 				basic_telemetry::AddCounter("ORG.Persistent.StructuralPassRelowerings");
 			}
 		}, any.pass);
@@ -2413,6 +2438,11 @@ void RenderGraph::AdvancePersistentStructuralBuild(std::vector<uint32_t>& struct
 	}
 	if (!state.program.InstallRebased(ready)) throw std::runtime_error("Persistent structural build failed to install");
 	for (const auto mainIndex : pending->dirtyPasses) state.mainPasses[mainIndex].slotsDirty = true;
+	for (auto& tokens : pending->declaredTokens) {
+		auto& main = state.mainPasses[tokens.mainIndex];
+		main.declaredViews = std::move(tokens.views);
+		main.declaredBindings = std::move(tokens.bindings);
+	}
 	structural.insert(structural.end(), pending->deferredStructural.begin(), pending->deferredStructural.end());
 	++state.structuralBuilds;
 	basic_telemetry::AddCounter("ORG.Persistent.StructuralBuilds");
@@ -2599,6 +2629,73 @@ bool RenderGraph::ScheduleTraceEnabled() const noexcept { return m_scheduleTrace
 std::shared_ptr<const PersistentScheduleSnapshot> RenderGraph::GetPersistentScheduleSnapshot() const {
 	if (!m_scheduleTraceEnabled.load(std::memory_order_acquire)) return {};
 	return m_scheduleSnapshot.load(std::memory_order_acquire);
+}
+
+void RenderGraph::BuildPersistentFrameGraphSnapshot(ui::FrameGraphSnapshot& out,
+	const std::unordered_map<uint64_t, std::pair<uint64_t, std::string>>& memory) const {
+	out.batches.clear();
+	if (!m_compilerState || !m_compilerState->persistent) return;
+	const auto& state = *m_compilerState->persistent;
+	const auto selected = state.program.Select();
+	if (!selected || !selected->executable || !selected->executable->graph) return;
+	const auto& executable = *selected->executable;
+	const auto& graph = *executable.graph;
+	const auto& structure = *graph.structure;
+	const auto names = ScheduleTraceNamesOf(state, *selected, m_queueRegistry);
+	// Per compiler resource: its memory record, its alias pool (0: placed on its own) and the batches it is live across.
+	struct Use { const std::pair<uint64_t, std::string>* memory = nullptr; uint64_t pool = 0; uint32_t first = UINT32_MAX, last = 0; };
+	std::vector<Use> uses(executable.resourceSlots.size());
+	for (size_t index = 0; index < uses.size(); ++index) {
+		const auto slot = executable.resourceSlots[index].index;
+		if (slot >= state.entries.size() || state.entries[slot].retired || !state.entries[slot].resource) continue;
+		auto* resource = state.entries[slot].resource;
+		auto* concrete = UnwrapDynamic(resource);
+		auto found = concrete ? memory.find(concrete->GetGlobalResourceID()) : memory.end();
+		if (found == memory.end()) found = memory.find(resource->GetGlobalResourceID());
+		if (found == memory.end()) continue;
+		uses[index].memory = &found->second;
+		if (const auto placed = state.aliasPlaced.find(concrete); placed != state.aliasPlaced.end()) uses[index].pool = placed->second.poolID;
+	}
+	std::vector<std::vector<uint32_t>> touched(graph.batches.size());
+	for (uint32_t batch = 0; batch < graph.batches.size(); ++batch) {
+		for (const auto pass : graph.batches[batch].passes)
+			for (const auto& access : structure.passes[pass].accesses) {
+				if (access.resourceIndex >= uses.size()) continue;
+				touched[batch].push_back(access.resourceIndex);
+				auto& use = uses[access.resourceIndex];
+				use.first = (std::min)(use.first, batch);
+				use.last = (std::max)(use.last, batch);
+			}
+		std::sort(touched[batch].begin(), touched[batch].end());
+		touched[batch].erase(std::unique(touched[batch].begin(), touched[batch].end()), touched[batch].end());
+	}
+	out.batches.reserve(graph.batches.size());
+	for (uint32_t batch = 0; batch < graph.batches.size(); ++batch) {
+		ui::FrameGraphBatchRow row;
+		const auto queue = graph.batches[batch].queue;
+		row.label = "Batch " + std::to_string(batch) + (queue < names.queues.size() ? " (" + names.queues[queue] + ")" : std::string{});
+		for (const auto pass : graph.batches[batch].passes) row.passNames.push_back(names.pass(structure.passes[pass].preparedPassIndex));
+		std::map<std::string, uint64_t> categories;
+		for (const auto index : touched[batch]) {
+			if (const auto* record = uses[index].memory) {
+				row.footprintBytes += record->first;
+				categories[record->second] += record->first;
+			}
+		}
+		for (auto& [label, bytes] : categories) row.categories.push_back({label, bytes});
+		std::sort(row.categories.begin(), row.categories.end(), [](const auto& a, const auto& b) { return a.bytes > b.bytes; });
+		// Live across this batch: an aliased resource is counted through its pool's heap, once per pool.
+		std::unordered_set<uint64_t> pools;
+		for (const auto& use : uses) {
+			if (!use.memory || use.first > batch || use.last < batch) continue;
+			row.peakNaiveLiveBytes += use.memory->first;
+			if (!use.pool) row.peakLiveBytes += use.memory->first;
+			else if (pools.insert(use.pool).second)
+				if (const auto pool = state.aliasPools.find(use.pool); pool != state.aliasPools.end()) row.peakLiveBytes += pool->second.capacityBytes;
+		}
+		row.aliasSavingsBytes = row.peakNaiveLiveBytes > row.peakLiveBytes ? row.peakNaiveLiveBytes - row.peakLiveBytes : 0;
+		out.batches.push_back(std::move(row));
+	}
 }
 
 void RenderGraph::RefreshPersistentScheduleTraces(const persistent::SelectedPublication& selected) {
@@ -2838,6 +2935,19 @@ std::vector<RenderGraph::ExternalPassDesc> RenderGraph::UpdatePersistentFrameInt
 // same greedy sweep-line as the per-frame planner. Overlapping placements get
 // pairwise placement orderings between all their users, so any schedule of the
 // rebuilt executable keeps them disjoint in time (ValidateAliasOrder checks it).
+void RenderGraph::RetireIdlePersistentAliasPools(PersistentExecutionState& state) {
+	const uint64_t retireFrames = m_getAutoAliasPoolRetireIdleFrames ? (std::max)(1u, m_getAutoAliasPoolRetireIdleFrames()) : 120u;
+	for (auto it = state.aliasPools.begin(); it != state.aliasPools.end();) {
+		auto& pool = it->second;
+		if (!pool.idleSinceFrame || state.frameNumber - pool.idleSinceFrame < retireFrames) { ++it; continue; }
+		spdlog::info("Persistent alias pool retired: pool={:#x} capacity={} idleFrames={}", it->first, pool.capacityBytes,
+			state.frameNumber - pool.idleSinceFrame);
+		basic_telemetry::AddCounter("ORG.Persistent.AliasPoolRetirements");
+		if (pool.allocation) DeletionManager::GetInstance().MarkForDelete(std::move(pool.allocation));
+		it = state.aliasPools.erase(it);
+	}
+}
+
 bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction& edit, const persistent::SelectedPublication& scheduled) {
 	BT_ZONE_SCOPE("ORG.Persistent.PlanAliases");
 	auto& state = *m_compilerState->persistent;
@@ -2847,6 +2957,8 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 	const auto mode = m_getAutoAliasMode ? m_getAutoAliasMode() : AutoAliasMode::Off;
 	const bool logging = m_getAutoAliasEnableLogging && m_getAutoAliasEnableLogging();
 	const float headroom = m_getAutoAliasPoolGrowthHeadroom ? (std::max)(1.0f, m_getAutoAliasPoolGrowthHeadroom()) : 1.5f;
+	const auto packingStrategy = m_getAutoAliasPackingStrategy ? m_getAutoAliasPackingStrategy() : AutoAliasPackingStrategy::GreedySweepLine;
+	state.aliasPackingStrategy = packingStrategy;
 	++state.aliasPlans;
 
 	std::vector<uint32_t> rank(structure.passes.size(), UINT32_MAX);
@@ -2993,11 +3105,11 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 
 	// Pack per pool.
 	std::map<uint64_t, std::vector<uint32_t>> byPool;
+	std::unordered_set<uint64_t> plannedPools;
 	for (uint32_t i = 0; i < candidates.size(); ++i) if (candidates[i].pooled) byPool[candidates[i].poolID].push_back(i);
 	std::vector<std::pair<uint32_t, uint32_t>> edges; // (logical slot, logical slot)
 	uint64_t independentBytes = 0, requiredBytes = 0, reservedBytes = 0;
 	size_t overlapPairs = 0;
-	auto alignUp = [](uint64_t value, uint64_t alignment) { return alignment <= 1 ? value : (value + alignment - 1) / alignment * alignment; };
 	for (auto& [poolID, members] : byPool) {
 		std::sort(members.begin(), members.end(), [&](uint32_t l, uint32_t r) {
 			const auto& a = candidates[l]; const auto& b = candidates[r];
@@ -3006,67 +3118,33 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 			if (a.lastUse != b.lastUse) return a.lastUse < b.lastUse;
 			return a.concrete->GetGlobalResourceID() < b.concrete->GetGlobalResourceID();
 		});
-		struct Active { uint32_t lastUse; uint64_t start, end; bool operator>(const Active& o) const { return lastUse > o.lastUse; } };
-		struct Free { uint64_t start, end; };
-		std::priority_queue<Active, std::vector<Active>, std::greater<Active>> active;
-		std::vector<Free> freeRanges;
-		auto release = [&](Free range) {
-			if (range.end <= range.start) return;
-			auto it = std::lower_bound(freeRanges.begin(), freeRanges.end(), range.start, [](const Free& f, uint64_t s) { return f.start < s; });
-			size_t pos = static_cast<size_t>(it - freeRanges.begin());
-			freeRanges.insert(it, range);
-			if (pos > 0 && freeRanges[pos - 1].end >= freeRanges[pos].start) {
-				freeRanges[pos - 1].end = (std::max)(freeRanges[pos - 1].end, freeRanges[pos].end);
-				freeRanges.erase(freeRanges.begin() + static_cast<std::ptrdiff_t>(pos)); --pos;
-			}
-			while (pos + 1 < freeRanges.size() && freeRanges[pos].end >= freeRanges[pos + 1].start) {
-				freeRanges[pos].end = (std::max)(freeRanges[pos].end, freeRanges[pos + 1].end);
-				freeRanges.erase(freeRanges.begin() + static_cast<std::ptrdiff_t>(pos + 1));
-			}
-		};
-		uint64_t heapEnd = 0, poolAlignment = 1;
+		std::vector<alias::PackingItem> items;
+		items.reserve(members.size());
 		for (const auto index : members) {
-			auto& c = candidates[index];
+			const auto& c = candidates[index];
 			independentBytes += c.sizeBytes;
-			while (!active.empty() && active.top().lastUse < c.firstUse) { release({active.top().start, active.top().end}); active.pop(); }
-			bool found = false; size_t bestRange = 0; uint64_t bestStart = 0, bestSlack = UINT64_MAX;
-			for (size_t r = 0; r < freeRanges.size(); ++r) {
-				const auto start = alignUp(freeRanges[r].start, c.alignment);
-				const auto end = start + c.sizeBytes;
-				if (start < freeRanges[r].start || end > freeRanges[r].end) continue;
-				const auto slack = freeRanges[r].end - end;
-				if (!found || slack < bestSlack || (slack == bestSlack && start < bestStart)) { found = true; bestRange = r; bestStart = start; bestSlack = slack; }
-			}
-			uint64_t start;
-			if (found) {
-				const auto selected = freeRanges[bestRange];
-				start = bestStart;
-				const auto end = start + c.sizeBytes;
-				if (selected.start < start && end < selected.end) {
-					freeRanges[bestRange].end = start;
-					freeRanges.insert(freeRanges.begin() + static_cast<std::ptrdiff_t>(bestRange + 1), Free{end, selected.end});
-				} else if (selected.start < start) freeRanges[bestRange].end = start;
-				else if (end < selected.end) freeRanges[bestRange].start = end;
-				else freeRanges.erase(freeRanges.begin() + static_cast<std::ptrdiff_t>(bestRange));
-			} else {
-				start = alignUp(heapEnd, c.alignment);
-			}
-			heapEnd = (std::max)(heapEnd, start + c.sizeBytes);
-			poolAlignment = (std::max)(poolAlignment, c.alignment);
-			active.push({c.lastUse, start, start + c.sizeBytes});
-			c.offset = start;
+			items.push_back({c.sizeBytes, c.alignment, c.firstUse, c.lastUse, c.concrete->GetGlobalResourceID()});
 		}
+		const auto packed = packingStrategy == AutoAliasPackingStrategy::BranchAndBound
+			? alias::PackBeamSearch(items) : alias::PackGreedySweepLine(items);
+		for (size_t i = 0; i < members.size(); ++i) candidates[members[i]].offset = packed.offsets[i];
+		const uint64_t heapEnd = packed.heapEnd, poolAlignment = packed.alignment;
 		requiredBytes += heapEnd;
 		if (heapEnd == 0) continue;
-		// Pool heap: grow with headroom, never shrink; old generations stay alive
-		// through the leases held by in-flight publications.
+		// Pool heap: grows with headroom, and shrinks to that headroom when the plan needs less than half of it. A
+		// replaced generation stays alive through the leases held by in-flight publications.
 		auto& pool = state.aliasPools[poolID];
+		plannedPools.insert(poolID);
+		pool.idleSinceFrame = 0;
+		const auto withHeadroom = static_cast<uint64_t>(std::ceil(static_cast<double>(heapEnd) * headroom));
 		const bool initial = !static_cast<bool>(pool.allocation);
 		const bool grow = !initial && (heapEnd > pool.capacityBytes || poolAlignment > pool.alignment);
-		const bool forced = !initial && !grow && state.forceNewAliasHeaps;
-		if (initial || grow || forced) {
+		const bool shrink = !initial && !grow && pool.capacityBytes > 2 * withHeadroom;
+		const bool forced = !initial && !grow && !shrink && state.forceNewAliasHeaps;
+		if (initial || grow || shrink || forced) {
 			uint64_t capacity = heapEnd;
 			if (forced) capacity = (std::max)(capacity, pool.capacityBytes);
+			else if (shrink) capacity = withHeadroom;
 			else if (!initial && pool.capacityBytes)
 				capacity = (std::max)(capacity, static_cast<uint64_t>(std::ceil(static_cast<double>(pool.capacityBytes) * headroom)));
 			rhi::ma::AllocationDesc allocDesc{};
@@ -3094,7 +3172,7 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 			++pool.generation;
 			pool.heap = AliasHeapGeneration::Capture(pool.allocation, pool.generation);
 			spdlog::info("Persistent alias pool {}: pool={:#x} capacity={} required={} alignment={} placements={} generation={}",
-				initial ? "allocated" : forced ? "reallocated (forced)" : "grew", poolID, capacity, heapEnd, poolAlignment, members.size(), pool.generation);
+				initial ? "allocated" : forced ? "reallocated (forced)" : shrink ? "shrank" : "grew", poolID, capacity, heapEnd, poolAlignment, members.size(), pool.generation);
 			basic_telemetry::AddCounter("ORG.Persistent.AliasPoolAllocations");
 		}
 		pool.resourceClass = candidates[members.front()].resourceClass;
@@ -3114,6 +3192,9 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 	}
 	std::sort(edges.begin(), edges.end());
 	edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
+	// A pool this plan places nothing into idles; RetireIdlePersistentAliasPools frees it once it has idled long enough.
+	for (auto& [poolID, pool] : state.aliasPools)
+		if (!plannedPools.contains(poolID) && !pool.idleSinceFrame) pool.idleSinceFrame = (std::max)(state.frameNumber, uint64_t{1});
 
 	// Apply: orderings, then bindings.
 	bool changed = false;
@@ -3179,6 +3260,57 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 	BT_PLOT("ORG.Persistent.AliasReservedBytes", static_cast<int64_t>(reservedBytes));
 	BT_PLOT("ORG.Persistent.AliasIndependentBytes", static_cast<int64_t>(independentBytes));
 	basic_telemetry::AddCounter("ORG.Persistent.AliasPlans");
+	// The AutoAlias panel's snapshot (GetAutoAliasDebugSnapshot): this plan's candidates, exclusions and pool layouts.
+	// Kept for every plan, not only while autoAliasBuildDebugData is set: plans run only on structural builds, so a
+	// panel opened later would otherwise show nothing until the next one.
+	autoAliasModeLastFrame = mode;
+	autoAliasPackingStrategyLastFrame = packingStrategy;
+	{
+		AutoAliasPlannerStats stats;
+		std::map<std::string, size_t> reasons;
+		std::map<uint64_t, AutoAliasPoolDebug> pools;
+		autoAliasExcludedResources.clear();
+		for (const auto& c : candidates) {
+			++stats.candidatesSeen;
+			stats.candidateBytes += c.sizeBytes;
+			if (c.exclusion) {
+				++stats.excluded;
+				++reasons[c.exclusion];
+				autoAliasExcludedResources.push_back({c.concrete->GetGlobalResourceID(), c.concrete->GetName(), c.sizeBytes, c.exclusion});
+				continue;
+			}
+			if (!c.pooled) continue;
+			if (c.manualPool) ++stats.manuallyAssigned;
+			else { ++stats.autoAssigned; stats.autoAssignedBytes += c.sizeBytes; }
+			auto& pool = pools[c.poolID];
+			pool.poolID = c.poolID;
+			pool.requiredBytes = (std::max)(pool.requiredBytes, c.offset + c.sizeBytes);
+			pool.ranges.push_back({c.concrete->GetGlobalResourceID(), c.concrete->GetName(), c.offset, c.offset + c.sizeBytes,
+				c.sizeBytes, c.firstUse, c.lastUse, false});
+		}
+		autoAliasPoolDebug.clear();
+		for (auto& [poolID, pool] : pools) {
+			if (const auto found = state.aliasPools.find(poolID); found != state.aliasPools.end()) pool.reservedBytes = found->second.capacityBytes;
+			std::sort(pool.ranges.begin(), pool.ranges.end(), [](const auto& a, const auto& b) { return a.startByte < b.startByte; });
+			for (size_t i = 0; i < pool.ranges.size(); ++i)
+				for (size_t j = i + 1; j < pool.ranges.size() && pool.ranges[j].startByte < pool.ranges[i].endByte; ++j)
+					pool.ranges[i].overlapsByteRange = pool.ranges[j].overlapsByteRange = true;
+			autoAliasPoolDebug.push_back(std::move(pool));
+		}
+		stats.pooledIndependentBytes = independentBytes;
+		stats.pooledActualBytes = requiredBytes;
+		stats.pooledSavedBytes = independentBytes > requiredBytes ? independentBytes - requiredBytes : 0;
+		autoAliasPlannerStats = stats;
+		autoAliasExclusionReasonSummary.clear();
+		for (const auto& [reason, count] : reasons) autoAliasExclusionReasonSummary.push_back({reason, count});
+		std::sort(autoAliasExclusionReasonSummary.begin(), autoAliasExclusionReasonSummary.end(),
+			[](const auto& a, const auto& b) { return a.count > b.count; });
+	}
+	// Persistent memory changes only with a plan, so the VRAM dump is written per plan rather than per frame.
+	if (m_getRenderGraphVramDumpEnabled && m_getRenderGraphVramDumpEnabled()) {
+		BT_ZONE_SCOPE("ORG.Persistent.WriteVramUsageDebugDump");
+		WriteVramUsageDebugDump(state.frameIndex);
+	}
 	if (rematerialized) basic_telemetry::AddCounter("ORG.Persistent.AliasRematerializations", static_cast<int64_t>(rematerialized));
 	if (logging || state.aliasPlans <= 2 || rematerialized)
 		spdlog::info("Persistent alias plan #{}: candidates={} placed={} excluded={} pools={} overlapPairs={} orderings={} rematerialized={} standalone={} "

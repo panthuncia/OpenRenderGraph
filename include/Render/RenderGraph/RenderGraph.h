@@ -1568,6 +1568,12 @@ private:
 	bool IsPersistentAliasCandidate(Resource* concrete) const;
 	// Returns true when the edit changed (placement edges or bindings) and needs
 	// another build before installation.
+	// The memory widget's frame-graph timeline over the selected persistent executable: per batch, the bytes its passes touch
+	// (memory: resource ID -> bytes and category) and the live bytes with and without the alias pools.
+	void BuildPersistentFrameGraphSnapshot(ui::FrameGraphSnapshot& out,
+		const std::unordered_map<uint64_t, std::pair<uint64_t, std::string>>& memory) const;
+	// Frees the alias pools no structural plan has placed into for autoAliasPoolRetireIdleFrames frames.
+	void RetireIdlePersistentAliasPools(PersistentExecutionState& state);
 	bool PlanPersistentAliasPlacement(persistent::GraphEditTransaction& edit, const persistent::SelectedPublication& scheduled);
 	void BindUnboundPersistentEntries(persistent::GraphEditTransaction& edit);
 	// Structural build: bind, schedule, plan alias placement, rebuild if needed.
