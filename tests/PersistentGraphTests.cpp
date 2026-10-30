@@ -189,6 +189,26 @@ bool CheckStates(const CompiledGraph& graph) {
 }
 int main() {
     {
+        // A D3D12 copy queue's lists take no copy layouts (copies leave textures in Common): its copy steps leave Common, so the
+        // next use transitions from what the texture is really in. Another queue's copy steps keep CopyDest.
+        CompileWorkspace workspace; std::atomic_bool cancelled{false};
+        for (const bool copyQueue : {true, false}) {
+            GraphProgram program;
+            auto edit = program.BeginEdit();
+            edit.SetQueues({{0,true},{0,true,copyQueue}});
+            auto binding = Binding(98); binding.identity = (uint64_t{1} << 32) | 98; binding.shape = {1,1,true};
+            const auto slot = edit.AddResource(binding.shape,binding);
+            CompilePass copy; copy.compatibleQueueSlots = {1}; copy.preferredQueueSlot = 1;
+            edit.Declare(edit.AddPass(copy),slot,{},{static_cast<uint64_t>(rhi::ResourceAccessType::CopyDest),
+                static_cast<uint64_t>(rhi::ResourceLayout::CopyDest),static_cast<uint64_t>(rhi::ResourceSyncState::Copy),true});
+            auto selected = edit.Build(workspace,cancelled);
+            CHECK(selected && program.Install(selected));
+            const auto& steps = selected->executable->graph->states.steps;
+            CHECK(steps.size() == 1);
+            CHECK(steps[0].after.layout == static_cast<uint64_t>(copyQueue ? rhi::ResourceLayout::Common : rhi::ResourceLayout::CopyDest));
+        }
+    }
+    {
         // Two graphs on one runtime share its sequencer: a texture one graph writes on one queue enters the other's execution in
         // the state it left, behind a wait on the writer's signal. The reader is prepared before the writer commits and readmitted
         // at submission (Readmit), so its handoff is the writer's, not the backing's seeded state. And a timeline retired with its

@@ -530,10 +530,13 @@ inline bool SameTimeline(const rhi::Timeline& a, const rhi::Timeline& b) noexcep
 	return a.impl == b.impl && a.GetHandle().index == b.GetHandle().index && a.GetHandle().generation == b.GetHandle().generation;
 }
 
-inline std::vector<compiler::CompileQueue> RegistryQueues(const QueueRegistry& registry) {
+inline std::vector<compiler::CompileQueue> RegistryQueues(const QueueRegistry& registry, rhi::Backend backend) {
 	std::vector<compiler::CompileQueue> queues;
-	for (size_t slot = 0; slot < registry.SlotCount(); ++slot)
-		queues.push_back({static_cast<uint32_t>(registry.GetBackendInstance(static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot)))), true});
+	for (size_t slot = 0; slot < registry.SlotCount(); ++slot) {
+		const auto index = static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot));
+		queues.push_back({static_cast<uint32_t>(registry.GetBackendInstance(index)), true,
+			registry.GetKind(index) == QueueKind::Copy && backend == rhi::Backend::D3D12});
+	}
 	return queues;
 }
 

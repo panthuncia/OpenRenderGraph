@@ -88,6 +88,9 @@ struct CompilePass {
 struct CompileQueue {
     uint32_t backendInstance = 0;
     bool active = true;
+    // Copies on this queue leave textures in Common (a D3D12 copy queue: its lists take no copy layouts). The compiler records the
+    // states its copy-layout steps leave as Common, so the next use, in this execution or a later one, transitions from there.
+    bool copyLayoutsCommon = false;
     bool operator==(const CompileQueue&) const = default;
 };
 struct GraphCompileStructure {

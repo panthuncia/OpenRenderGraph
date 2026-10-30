@@ -509,7 +509,7 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 		MaterializePersistentStandalone(usedResources, true);
 		const auto primaryBackend = m_backendDevices.empty() ? rhi::Backend::Null : m_backendDevices.front().backend;
 		auto edit = state.program.BeginEdit();
-		edit.SetQueues(RegistryQueues(m_queueRegistry));
+		edit.SetQueues(RegistryQueues(m_queueRegistry, m_runtime->Backend()));
 		edit.SetEpochOrder(m_persistentEpochOrder);
 		for (uint32_t mainIndex = 0; mainIndex < state.mainPasses.size(); ++mainIndex) {
 			auto& main = state.mainPasses[mainIndex];
@@ -1390,7 +1390,7 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 					program = programs.back().get();
 					program->key = key;
 					edit.emplace(program->program.BeginEdit());
-					edit->SetQueues(RegistryQueues(m_queueRegistry));
+					edit->SetQueues(RegistryQueues(m_queueRegistry, m_runtime->Backend()));
 					for (size_t p = 0; p < loweredPasses.size(); ++p) {
 						Program::Pass pass;
 						pass.id = edit->AddPass(loweredPasses[p].declaration);
@@ -1596,7 +1596,7 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 			} else {
 			persistent::GraphProgram program;
 			auto edit = program.BeginEdit();
-			edit.SetQueues(RegistryQueues(m_queueRegistry));
+			edit.SetQueues(RegistryQueues(m_queueRegistry, m_runtime->Backend()));
 			for (auto& entry : entries) {
 				const auto slot = edit.ReserveResource(entry.shape);
 				if (slot.index != entry.slot.index) throw std::logic_error("Dynamic segment slot allocation is not dense");

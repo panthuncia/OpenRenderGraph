@@ -433,7 +433,11 @@ SymbolicStatePlan BuildStatePlan(const GraphCompileStructure& s,
             if ((written[use.resource] || use.state.write)
                 && (accessEpoch[use.resource] != epoch || !(accessFlags[use.resource] & (use.state.write ? 2u : 1u))))
                 return "State use missing required hazard access";
-            const auto state = StateForShape(use.state, s.resourceShapes[use.resource]);
+            auto state = StateForShape(use.state, s.resourceShapes[use.resource]);
+            if (s.resourceShapes[use.resource].hasLayout && batches[b].queue < s.queues.size() && s.queues[batches[b].queue].copyLayoutsCommon
+                && (state.layout == static_cast<uint64_t>(rhi::ResourceLayout::CopySource)
+                    || state.layout == static_cast<uint64_t>(rhi::ResourceLayout::CopyDest)))
+                state.layout = static_cast<uint64_t>(rhi::ResourceLayout::Common);
             next.clear();
             for (const auto& previous : regions[use.resource]) {
                 const auto overlap = Intersection(previous.range, use.range);

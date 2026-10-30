@@ -24,8 +24,8 @@
 >     barrier batch after it (`PreparedBatchBarriers::acquired`, or the pass's own) takes the texture from Common to Y.
 >     BasicRHI drops an acquire whose transfer collapsed: always on D3D12, and on Vulkan for one queue family or a
 >     concurrent image. Aliased textures and cross-device handoffs keep the old acquire.
->   - **D3D12 copy-queue exits:** copy lists keep textures in `COMMON` while the ledger records `CopySource`/`CopyDest`.
->     One option is to normalize copy-queue steps to `Common` in the compiler.
+>   - **D3D12 copy-queue exits (done).** On a D3D12 copy queue (`CompileQueue::copyLayoutsCommon`), the compiler records
+>     copy-layout steps as leaving `Common`, which is what copy lists leave textures in.
 >   - **External clients (2e).**
 >   - All of these need GPU tests on both backends with validation.
 > - `org::Runtime` (`OpenRenderGraph/Runtime.h`) owns device initialization, the services, the settings' slot count and the
