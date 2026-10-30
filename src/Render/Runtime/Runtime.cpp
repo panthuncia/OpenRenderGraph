@@ -4,6 +4,7 @@
 #include <atomic>
 #include <stdexcept>
 
+#include "Render/RenderGraph/PersistentGraph.h"
 #include "Render/Runtime/IDescriptorService.h"
 #include "Render/Runtime/IReadbackService.h"
 #include "Render/Runtime/IRenderGraphSettingsService.h"
@@ -52,7 +53,7 @@ Runtime* Runtime::Current() noexcept {
 	return g_current.load(std::memory_order_acquire);
 }
 
-Runtime::Runtime(Desc desc) : m_desc(std::move(desc)) {}
+Runtime::Runtime(Desc desc) : m_desc(std::move(desc)), m_sequencer(std::make_shared<persistent::ResourceSequencer>()) {}
 
 void Runtime::Initialize() {
 	// Slot-indexed services size themselves from the settings: the runtime's slots, set once here.
@@ -127,6 +128,14 @@ void Runtime::UnregisterQueue(rhi::Queue queue) {
 	const auto before = m_queues.size();
 	std::erase_if(m_queues, [&](const rhi::Queue& known) { return SameQueue(known, queue); });
 	if (m_queues.size() != before && progress.timeline) m_retiredTimelines.emplace_back(progress.timeline.impl, progress.timeline.GetHandle());
+}
+
+uint64_t Runtime::TimelineIdentity(const rhi::Timeline& timeline) {
+	const auto handle = timeline.GetHandle();
+	std::lock_guard lock(m_identitiesMutex);
+	auto [found, inserted] = m_identities.try_emplace({timeline.impl, handle.index, handle.generation}, m_nextIdentity);
+	if (inserted) ++m_nextIdentity;
+	return found->second;
 }
 
 bool Runtime::Reached(const runtime::SubmittedPoint& point) const {

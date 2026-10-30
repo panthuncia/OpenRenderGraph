@@ -17,6 +17,7 @@
 // RenderGraphPersistentState.h: what the persistent route's units share (the execution state, tickets and
 // recordings, and the helpers over them). Private to src/Render/RenderGraph.
 #include "Render/RenderGraph/RenderGraph.h"
+#include "OpenRenderGraph/Runtime.h"
 #include "RenderGraphCompilerState.h"
 #include "PersistentLowering.h"
 #include "AliasPacking.h"
@@ -517,6 +518,11 @@ inline RotationKey RotationKeyOf(State::SlotEntry& entry) {
 	}
 	if (entry.indexed) key.views = entry.indexed->CaptureBindlessViews().get();
 	return key;
+}
+
+// The admission identity of a queue slot's timeline (Runtime::TimelineIdentity).
+inline uint64_t QueueTimelineIdentity(Runtime& runtime, const QueueRegistry& registry, size_t slot) {
+	return runtime.TimelineIdentity(registry.GetFence(static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot))));
 }
 
 // Handles are per device: a timeline is its device's implementation and its handle there.

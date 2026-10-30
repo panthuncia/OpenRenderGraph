@@ -189,6 +189,69 @@ bool CheckStates(const CompiledGraph& graph) {
 }
 int main() {
     {
+        // Two graphs on one runtime share its sequencer: a texture one graph writes on one queue enters the other's execution in
+        // the state it left, behind a wait on the writer's signal. The reader is prepared before the writer commits and readmitted
+        // at submission (Readmit), so its handoff is the writer's, not the backing's seeded state. And a timeline retired with its
+        // graph needs no wait.
+        auto sequencer = std::make_shared<ResourceSequencer>();
+        CompileWorkspace workspace; std::atomic_bool cancelled{false};
+        const CompileResourceState home{static_cast<uint64_t>(rhi::ResourceAccessType::Common),
+            static_cast<uint64_t>(rhi::ResourceLayout::Common), static_cast<uint64_t>(rhi::ResourceSyncState::None), false};
+        auto state = std::make_shared<PreparedBackingState>();
+        state->graphResourceID = 1; state->resource = {97,1}; state->shape = {1,1,true};
+        state->regions = std::make_shared<const std::vector<PreparedStateRegion>>(std::vector<PreparedStateRegion>{{{0,1,0,1}, home}});
+        auto program = [&](CompileResourceState use) {
+            auto result = std::make_unique<GraphProgram>();
+            auto edit = result->BeginEdit();
+            auto binding = Binding(97); binding.identity = (uint64_t{1} << 32) | 97; binding.shape = state->shape;
+            binding.admission = state;
+            const auto slot = edit.AddResource(binding.shape,binding);
+            edit.Declare(edit.AddPass({}),slot,{},use);
+            auto selected = edit.Build(workspace,cancelled);
+            if (!selected || !result->Install(selected)) throw std::logic_error("Shared sequencer program did not install");
+            return std::pair{std::move(result), selected};
+        };
+        auto [writerProgram, writer] = program({static_cast<uint64_t>(rhi::ResourceAccessType::UnorderedAccess),
+            static_cast<uint64_t>(rhi::ResourceLayout::UnorderedAccess), static_cast<uint64_t>(rhi::ResourceSyncState::ComputeShading), true});
+        auto [readerProgram, reader] = program({static_cast<uint64_t>(rhi::ResourceAccessType::ShaderResource),
+            static_cast<uint64_t>(rhi::ResourceLayout::ShaderResource), static_cast<uint64_t>(rhi::ResourceSyncState::PixelShading), false});
+        SynchronousAdmission writes(4, {}, sequencer), reads(4, {}, sequencer);
+        const std::array<ExecutionTimelinePoint,1> writerQueue{{{41,0}}}, readerQueue{{{42,0}}};
+        auto entryLayout = [](const FrameAdmission& frame) {
+            for (const auto& batch : frame.barriers.batches)
+                for (const auto& barrier : batch.textures) return barrier.beforeLayout;
+            return rhi::ResourceLayout::Undefined;
+        };
+        auto read = reads.Prepare(reader,readerQueue);
+        CHECK(entryLayout(read) == rhi::ResourceLayout::Common && read.incomingWaits[0].empty());
+        auto write = writes.Prepare(writer,writerQueue);
+        GraphExecutionTimeline receipt; receipt.batches.resize(1); receipt.batches[0].signal = {41,1};
+        {
+            auto hold = writes.HoldSequencer();
+            writes.Commit(write,receipt);
+        }
+        {
+            auto hold = reads.HoldSequencer();
+            reads.Readmit(read);
+            CHECK(entryLayout(read) == rhi::ResourceLayout::UnorderedAccess);
+            CHECK(read.incomingWaits[0] == std::vector<ExecutionTimelinePoint>{ExecutionTimelinePoint(41,1)});
+            receipt.batches[0].signal = {42,1};
+            reads.Commit(read,receipt);
+        }
+        // The writer's graph goes, and its timeline with it: a later write waits on the reader alone.
+        sequencer->RetireTimeline(41);
+        auto again = writes.Prepare(writer,writerQueue);
+        CHECK(entryLayout(again) == rhi::ResourceLayout::ShaderResource);
+        CHECK(again.incomingWaits[0] == std::vector<ExecutionTimelinePoint>{ExecutionTimelinePoint(42,1)});
+        writes.Abandon(again);
+        // A closed admission is never readmitted.
+        SynchronousAdmission closed(4, {}, sequencer);
+        closed.SetClosedExecutions(true);
+        auto prepared = closed.Prepare(reader,readerQueue);
+        CHECK(Rejects([&] { closed.Readmit(prepared); }));
+        closed.Abandon(prepared);
+    }
+    {
         // Closed executions: a texture written in one epoch and read in another leaves each execution in its
         // home state, so an epoch's barrier plan does not depend on whether the other ran, is cached, and
         // admissions can be prepared ahead of commits and abandoned out of order.
@@ -230,10 +293,10 @@ int main() {
                         if (barrier.afterLayout == rhi::ResourceLayout::Common) return true;
             return false;
         };
+        // The handoff into the execution: its batches' entry barriers.
         auto entryLayout = [](const FrameAdmission& frame) {
             for (const auto& batch : frame.barriers.batches)
-                for (const auto& before : batch.beforePass)
-                    for (const auto& barrier : before.textures) return barrier.beforeLayout;
+                for (const auto& barrier : batch.textures) return barrier.beforeLayout;
             return rhi::ResourceLayout::Undefined;
         };
         auto first = admission.Prepare(readEpoch,queues);
@@ -376,7 +439,7 @@ int main() {
         CHECK(frame.publication == selected && selected->bindings.At(slot).admission->regions == backing.regions);
         CHECK(frame.backings[0].authoritativeIncoming && frame.backings[0].regions == reported.regions);
         CHECK(frame.incomingWaits[0] == std::vector<ExecutionTimelinePoint>{ExecutionTimelinePoint(90,5)});
-        CHECK(frame.barriers.batches[0].beforePass[0].textures[0].beforeLayout == rhi::ResourceLayout::CopyDest);
+        CHECK(frame.barriers.batches[0].textures[0].beforeLayout == rhi::ResourceLayout::CopyDest);
         persistent.Abandon(frame);
         for (uint32_t failure = 0; failure < 4; ++failure) {
             auto invalid = report;
@@ -395,10 +458,10 @@ int main() {
         invalidBinding.admission = std::make_shared<const PreparedBackingState>(reported);
         CHECK(Rejects([&] { invalidPublication.ReplaceBinding(slot,invalidBinding); }));
         const auto incoming = ledger.Prepare(*selected->executable->graph,std::span{&reported,1});
-        CHECK(incoming.batches[0].beforePass[0].textures[0].beforeLayout == rhi::ResourceLayout::CopyDest);
+        CHECK(incoming.batches[0].textures[0].beforeLayout == rhi::ResourceLayout::CopyDest);
         CHECK(incoming.batches[0].authoritativeSeeds.size() == 1);
         const auto abandoned = ledger.Prepare(*selected->executable->graph,std::span{&backing,1});
-        CHECK(abandoned.batches[0].beforePass[0].textures[0].beforeLayout == rhi::ResourceLayout::UnorderedAccess);
+        CHECK(abandoned.batches[0].textures[0].beforeLayout == rhi::ResourceLayout::UnorderedAccess);
         for (uint32_t failure = 0; failure < 4; ++failure) {
             auto invalid = reported;
             auto regions = std::make_shared<std::vector<PreparedStateRegion>>(*reported.regions);
@@ -417,7 +480,7 @@ int main() {
         auto expanded = addConsumer.Build(workspace,cancelled); CHECK(program.Install(expanded));
         const auto later = ledger.Prepare(*expanded->executable->graph,std::span{&backing,1});
         const auto& graph = *expanded->executable->graph;
-        CHECK(later.batches.at(graph.batchByPass.at(1)).beforePass.at(graph.positionByPass.at(1)).textures[0].beforeLayout
+        CHECK(later.batches.at(graph.batchByPass.at(1)).textures[0].beforeLayout
             == rhi::ResourceLayout::CopyDest);
         CHECK(graph.batches.size() == 2);
         const auto bothQueues = ledger.Prepare(graph,std::span{&reported,1});
@@ -426,7 +489,7 @@ int main() {
         CHECK(authoritativeSeedCount == 1);
         for (const auto& batch : bothQueues.batches) ledger.CommitBatch(batch);
         const auto committed = ledger.Prepare(graph,std::span{&backing,1});
-        CHECK(committed.batches.at(graph.batchByPass.at(0)).beforePass.at(graph.positionByPass.at(0)).textures[0].beforeLayout
+        CHECK(committed.batches.at(graph.batchByPass.at(0)).textures[0].beforeLayout
             == rhi::ResourceLayout::UnorderedAccess);
         const std::array<ExecutionTimelinePoint,2> twoQueues{{{12,0},{13,0}}};
         auto acrossQueues = persistent.Prepare(expanded,twoQueues,{},std::span{&report,1});
@@ -443,7 +506,7 @@ int main() {
         CHECK(persistent.IncomingRevisionCount() == 1);
         auto repeated = persistent.Prepare(expanded,twoQueues,{},std::span{&report,1});
         CHECK(repeated.incomingEffects.empty() && !repeated.backings[0].authoritativeIncoming);
-        CHECK(repeated.barriers.batches.at(graph.batchByPass.at(0)).beforePass.at(graph.positionByPass.at(0)).textures[0].beforeLayout
+        CHECK(repeated.barriers.batches.at(graph.batchByPass.at(0)).textures[0].beforeLayout
             == rhi::ResourceLayout::UnorderedAccess);
         persistent.Abandon(repeated);
         auto inconsistent = report; ++inconsistent.producerCompletion.value;
@@ -1116,9 +1179,8 @@ int main() {
         const std::array<ExecutionTimelinePoint,1> impossibleDone{{{1,6}}};
         CHECK(Rejects([&] { admission.RetireCompleted(impossibleDone); }));
         auto next = admission.Prepare(selected,queues);
-        CHECK(!next.incomingWaits[0].empty());
-        CHECK(next.incomingWaits[0][0].timeline == 2);
-        CHECK(next.incomingWaits[0][0].value == 7);
+        // The writer's point (2, 7) has completed (batchDone): no wait.
+        CHECK(next.incomingWaits[0].empty());
         admission.Abandon(next);
         CHECK(Rejects([&] { admission.Abandon(next); }));
         auto partial = admission.Prepare(selected,queues);

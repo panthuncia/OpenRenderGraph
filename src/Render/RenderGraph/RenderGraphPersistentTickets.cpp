@@ -75,7 +75,7 @@ void RenderGraph::AddPersistentTicketCandidate(PersistentTicket& ticket, std::sh
 		const auto next = m_queueRegistry.GetCurrentFenceValue(static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot)));
 		auto submitted = next ? next - 1 : 0;
 		if (state.pendingPresentSubmission && slot == static_cast<size_t>(ToUnderlying(presentationSlot))) submitted = next;
-		queues.push_back({slot + 1, submitted});
+		queues.push_back({QueueTimelineIdentity(*m_runtime, m_queueRegistry, slot), submitted});
 	}
 	auto* candidate = new PersistentTicket::Candidate{
 		{state.admission->Prepare(recording->publication, queues, recording->waits, {}, {}), recording, recording->bindings, recording->resourceHeap,
@@ -98,7 +98,7 @@ std::vector<std::pair<uint32_t, uint64_t>> RenderGraph::CompletePersistentTicket
 		std::vector<compiler::ExecutionTimelinePoint> signals;
 		signals.reserve(graph.batches.size());
 		for (uint32_t batch = 0; batch < graph.batches.size(); ++batch)
-			signals.push_back({uint64_t{graph.batches[batch].queue} + 1, submission.signals.at(next++)});
+			signals.push_back({segment.admission.queueTimelines.at(graph.batches[batch].queue), submission.signals.at(next++)});
 		const auto execution = state.timelines->RecordSubmitted(segment.recording->snapshot->layout->bundle,
 			segment.admission.incomingWaits, segment.recording->packets, signals);
 		state.admission->Commit(segment.admission, *execution);
@@ -290,13 +290,13 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 		for (uint32_t batch = 0; batch < graph.batches.size(); ++batch) {
 			const auto queue = graph.batches[batch].queue;
 			if (queue >= nextQueueValues.size()) throw std::logic_error("Ticket batch on an unknown queue");
-			batches[batch].signal = {uint64_t{queue} + 1, ++nextQueueValues[queue]};
+			batches[batch].signal = {segment.admission.queueTimelines.at(queue), ++nextQueueValues[queue]};
 			if (batch < incoming.size()) batches[batch].waits = incoming[batch];
 			// The uploads ahead of the ticket order only the batches on their own queue (its entry barrier): any other queue
 			// would otherwise read what this epoch's uploads write before they land. Planned by queue (RecordPendingUploads),
 			// only the batches that use what they write wait (the rest of theirs went to their own queue, ahead of them).
 			if (uploadsDone.second && queue != uploadsDone.first && (!planned.planned || planned.waitsForUploads[batch]))
-				batches[batch].waits.push_back({uint64_t{uploadsDone.first} + 1, uploadsDone.second});
+				batches[batch].waits.push_back({segment.admission.queueTimelines.at(uploadsDone.first), uploadsDone.second});
 			// The frame's values (SetFrameWaitTimeline): every packet prepared since it was set binds the timeline.
 			if (frameWait)
 				batches[batch].waits.push_back({kFrameWaitTimelineIdentity, frameWait});
@@ -477,7 +477,7 @@ bool PlanTicketUploads(const RenderGraph::PersistentTicket& ticket, uint32_t gra
 		// What a write of it on this queue, ahead of the execution, must wait for: every earlier use the ledger holds (any queue;
 		// its own queue is ordered by the list's barrier), and what each batch using it waits for at entry.
 		waits.clear();
-		const uint64_t ownTimeline = uint64_t{queue} + 1;
+		const uint64_t ownTimeline = segment.admission.queueTimelines.at(queue);
 		auto addWait = [&](compiler::ExecutionTimelinePoint point) {
 			if (!point.timeline || !point.value || point.timeline == ownTimeline) return;
 			const auto found = std::ranges::find(waits, point.timeline, &compiler::ExecutionTimelinePoint::timeline);

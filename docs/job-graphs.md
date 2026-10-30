@@ -1,6 +1,26 @@
 # Job graphs: ORG without a main graph
 
-> **Status (2026-10-30): Phase 1 implemented (uncommitted).**
+> **Status (2026-10-30): Phase 1 implemented; Phase 2 in progress (see "Phase 2 investigation").**
+> - Done:
+>   - **2a:** runtime timeline identities.
+>   - **2b:** `persistent::ResourceSequencer`, owned by the runtime and shared by every graph's admission. A graph's queue
+>     timelines are retired with it, and waits on reached points are dropped.
+>   - **2c (first part):** boundary barriers moved into batch entry lists. Aliased backings enter from Undefined.
+>   - **2d:** an open admission is readmitted at submission under the sequencer lock. Its entry barriers are recorded into a
+>     leading list submitted ahead of each batch.
+> - Verified:
+>   - ORG tests on Vulkan and D3D12, including a two-admissions-one-sequencer handoff test;
+>   - the SARP build and benchmark;
+>   - the Community Shaders build.
+> - Remaining:
+>   - **Cross-queue handoffs between executions:** release lists on the predecessor's queue. Today an exclusive texture
+>     handed across queues between executions only counts `ORG.Execution.CrossFrameTextureQueueHandoff`.
+>   - **Vulkan QFOT layout pairs:** the release and acquire halves must match. One option is X→Common in both halves plus a
+>     local Common→Y on the consumer, with the backends skipping an acquire whose transfer collapsed (D3D12 always).
+>   - **D3D12 copy-queue exits:** copy lists keep textures in `COMMON` while the ledger records `CopySource`/`CopyDest`.
+>     One option is to normalize copy-queue steps to `Common` in the compiler.
+>   - **External clients (2e).**
+>   - All of these need GPU tests on both backends with validation.
 > - `org::Runtime` (`OpenRenderGraph/Runtime.h`) owns device initialization, the services, the settings' slot count and the
 >   default task service; `RenderGraph` and `GraphHost` take it and no longer initialize, reset or shut down shared state.
 > - Retirement is by submission frontier. BasicRHI's `Queue::Progress()` is a timeline that every submission on the queue
@@ -129,6 +149,60 @@ Other changes:
 - **External submission.** An execution can be recorded into caller-provided command lists and submitted by the
   caller, who reports back with `NoteSubmitted(points)`. The handoffs go into a leading list. This generalizes
   `ExternalEpochExecution::leading`; Community Shaders uses it to submit inside DXVK's stream.
+
+## Phase 2 investigation: admission at submission
+
+This revises items 2, 3, 5, 6 and 8 of the next section, which describe the Phase 0 design.
+
+**The Phase 0 design admits at prepare, against promised exits.** Successors build their waits on points that are not yet
+submitted. That buys a little overlap (a successor could record its handoff before its predecessor submits), but it needs:
+- a submit gate that never hands an unsubmitted wait to a queue, because on one native queue it deadlocks;
+- splice or pass-through for executions that never submit, and poisoning for successors of abandoned writers;
+- signal values reserved before submission, on pooled per-execution timelines.
+
+**Revised: an execution is admitted when it submits.**
+- **Before admission, nothing touches the ledgers.** Prepare and record run on any thread, for as long as they take and in
+  any order: every pass's Prepare, the body recordings (whose barriers only use compiler-known states, item 7) and the
+  compiled graph's import tables.
+- **Admission.** Under the sequencer lock, Submit:
+  1. reads each import cell's exit state and the points of its last writer and readers;
+  2. records the per-batch handoff lists (entry and release, item 7), a few barriers each;
+  3. submits the handoff lists and the bodies with waits on those points;
+  4. commits the execution's exit states and the points it just signalled.
+- **What this removes.**
+  - No wait-before-signal: a successor's waits name only work already submitted.
+  - No submit gate: submission order is admission order, by construction.
+  - No promised exits, splice, pass-through or poison. An execution that never submits never touched the ledgers.
+- **Ordering.** Jobs that touch the same resource are ordered by the order they submit in. The async graph supplies that
+  order: a dependent submits after its producer. The ORGModuleServices adapter gates a dependent's Submit, not its Prepare
+  or Record, on its producers' submission, which its GPU submission sets already express. No new Admitted level is needed.
+- **Off the render thread.** The handoff calculation is a lookup over the import cells, and it runs on whichever thread
+  submits. Neither job's body is re-recorded or interrupted. A job that submits from a worker never blocks the render
+  thread for longer than the lock is held.
+
+**Lock.**
+- **What it covers.** One mutex in `ResourceSequencer`, held across steps 1 to 4. That includes the queue submission
+  itself, so that a predecessor's commit and its submission are seen together. The work under it is lookups over the
+  import cells, recording a handful of barriers, and one `Queue::Submit` per batch.
+- **Lock order.** Callers' locks (DXVK's queue lock, for external submission) are taken first, then the sequencer's, then
+  BasicRHI's queue and timeline locks. Nothing is called back under the sequencer lock, and ORG never calls into a host's
+  submission while holding it.
+- **Contention.** Contention is per submission, not per pass. If profiling shows it matters, striped per-resource locks
+  taken in sorted order can replace the single mutex, because admission only touches the cells of the execution's
+  imports.
+- **Closed executions.** Community Shaders' closed executions (prepared ahead, returned to home states) keep their current
+  path until Community Shaders migrates (Phase 7), then they are deleted. They use one graph and never share resources
+  with another graph.
+
+**Implementation order.**
+1. **2a:** runtime-unique timeline identities. A queue slot's identity is no longer `slot + 1`, and a foreign timeline's is
+   no longer the segment's next number.
+2. **2b:** the ledgers move into a runtime `ResourceSequencer` shared by every graph's admission.
+3. **2c:** boundary barriers move out of the bodies into per-batch entry lists, with release lists on the predecessor's
+   queue. This includes the Vulkan QFOT layout fix and the D3D12 copy-queue `COMMON` exit.
+4. **2d:** open admission moves to submission, under the lock.
+5. **2e:** external clients (uploads, swapchain).
+6. **Tests:** two graphs with write then read across queues on both backends, reader fan-out, and an abandoned execution.
 
 ## Cross-graph ordering and state handoff
 

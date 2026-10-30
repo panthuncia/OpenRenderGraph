@@ -1336,21 +1336,35 @@ SynchronousAdmission::RetirementTicket SynchronousAdmission::CaptureRetirement(c
         "Retired alias heap lacks exact ownership");
     return ticket;
 }
+void ResourceSequencer::RetireTimeline(uint64_t identity) {
+    std::lock_guard lock(mutex);
+    completed[identity] = UINT64_MAX;
+}
+bool ResourceSequencer::Reached(compiler::ExecutionTimelinePoint point) const {
+    const auto found = completed.find(point.timeline);
+    return found != completed.end() && found->second >= point.value;
+}
+size_t SynchronousAdmission::StateBackingCount() const { std::lock_guard lock(m_sequencer->mutex); return m_sequencer->states.BackingCount(); }
+size_t SynchronousAdmission::HazardBackingCount() const { std::lock_guard lock(m_sequencer->mutex); return m_sequencer->accesses.BackingCount(); }
+size_t SynchronousAdmission::AliasHeapCount() const { std::lock_guard lock(m_sequencer->mutex); return m_sequencer->aliases.HeapCount(); }
+size_t SynchronousAdmission::IncomingRevisionCount() const { std::lock_guard lock(m_sequencer->mutex); return m_sequencer->incomingRevisions.size(); }
 bool SynchronousAdmission::RetireBackingMetadata(const RetirementTicket& ticket) {
     Require(ticket.resource.valid(), "Invalid backing retirement ticket");
     Require(m_pending.empty(), "Metadata retirement during pending admission");
     if (!ticket.owner.expired() || !ticket.allocation.expired()) return false;
-    if (!m_accesses.RetireCompleted(ticket.resource, m_completed)) return false;
+    std::lock_guard lock(m_sequencer->mutex);
+    if (!m_sequencer->accesses.RetireCompleted(ticket.resource, m_sequencer->completed)) return false;
     const std::array resources{ticket.resource};
-    m_states.Invalidate(resources);
-    m_incomingRevisions.erase((uint64_t{ticket.resource.generation} << 32) | ticket.resource.index);
+    m_sequencer->states.Invalidate(resources);
+    m_sequencer->incomingRevisions.erase((uint64_t{ticket.resource.generation} << 32) | ticket.resource.index);
     return true;
 }
 bool SynchronousAdmission::RetireAliasMetadata(const RetirementTicket& ticket) {
     Require(m_pending.empty(), "Metadata retirement during pending admission");
     if (!ticket.heapIdentity) return true;
     if (!ticket.heap.expired()) return false;
-    return m_aliases.RetireCompleted(ticket.heapIdentity, ticket.heap, m_completed);
+    std::lock_guard lock(m_sequencer->mutex);
+    return m_sequencer->aliases.RetireCompleted(ticket.heapIdentity, ticket.heap, m_sequencer->completed);
 }
 BindingVersion BindingVersion::FromSnapshot(std::shared_ptr<const ResourceBindingSnapshot> snapshot,
     const compiler::PreparedBackingState& initial, uint64_t descriptorRevision, uint64_t contentRevision) {
@@ -1383,6 +1397,7 @@ FrameAdmission SynchronousAdmission::Prepare(std::shared_ptr<const SelectedPubli
     std::span<const compiler::ExecutionTimelinePoint> queues, std::span<const FrameProducerWait> producerWaits,
     std::span<const FrameIncomingState> incomingStates, std::span<const FrameRebinding> rebindings) {
     BT_ZONE_SCOPE("ORG.Persistent.PrepareAdmission");
+    std::lock_guard lock(m_sequencer->mutex);
     Require(publication && publication->executable && publication->executable->graph, "No executable publication");
     Require(m_pending.empty() || (m_closed && m_pending.size() < m_capacity), "Previous synchronous admission has not terminated");
     Require(m_nextSequence != UINT64_MAX, "Admission sequence exhausted");
@@ -1469,7 +1484,7 @@ FrameAdmission SynchronousAdmission::Prepare(std::shared_ptr<const SelectedPubli
             Require(report.revision && report.producerCompletion.timeline && report.producerCompletion.value,
                 "Incoming state has no producer revision/completion");
             const auto key = (uint64_t{report.backing.generation} << 32) | report.backing.index;
-            if (const auto previous = m_incomingRevisions.find(key); previous != m_incomingRevisions.end()) {
+            if (const auto previous = m_sequencer->incomingRevisions.find(key); previous != m_sequencer->incomingRevisions.end()) {
                 Require(report.revision >= previous->second.revision, "Incoming producer revision regressed");
                 if (report.revision == previous->second.revision) {
                     Require(report.producerCompletion == previous->second.completion, "Incoming revision has inconsistent completion");
@@ -1489,11 +1504,24 @@ FrameAdmission SynchronousAdmission::Prepare(std::shared_ptr<const SelectedPubli
             for (const auto batch : consumers) appendProducerWait(batch,report.producerCompletion);
         }
     }
-    const auto invalidated = m_aliases.ApplyInitialStates(graph, frame.backings);
+    frame.queuePoints.assign(queues.begin(), queues.end());
+    frame.ownWaits = frame.incomingWaits;
+    AdmitLedger(frame, rebindings.empty() && incomingStates.empty());
+    frame.sequence = m_nextSequence++;
+    frame.domain = m_domain;
+    m_pending.push_back(frame.sequence);
+    return frame;
+}
+void SynchronousAdmission::AdmitLedger(FrameAdmission& frame, bool cacheEligible) {
+    const auto& graph = *frame.publication->executable->graph;
+    frame.incomingWaits = frame.ownWaits;
+    frame.boundaryAccessWaits.clear();
+    frame.cachedPlan = false;
+    const auto invalidated = m_sequencer->aliases.ApplyInitialStates(graph, frame.backings);
     frame.closed = m_closed;
     // A closed execution's plan is a function of its executable and backings alone, unless the frame brings
     // states of its own (rebindings, incoming states, alias invalidation).
-    const bool cacheable = m_closed && rebindings.empty() && incomingStates.empty() && invalidated.empty();
+    const bool cacheable = m_closed && cacheEligible && invalidated.empty();
     CachedPlan* cached = nullptr;
     if (cacheable) {
         std::erase_if(m_planCache, [](const CachedPlan& entry) { return entry.executable.expired(); });
@@ -1512,7 +1540,7 @@ FrameAdmission SynchronousAdmission::Prepare(std::shared_ptr<const SelectedPubli
         frame.cachedPlan = true;
         ++m_planCacheHits;
     } else {
-        frame.barriers = m_states.Prepare(graph, frame.backings, invalidated, m_closed);
+        frame.barriers = m_sequencer->states.Prepare(graph, frame.backings, invalidated, m_closed);
         if (cacheable) {
             ++m_planCacheMisses;
             if (m_planCache.size() >= 64) m_planCache.erase(m_planCache.begin());
@@ -1526,8 +1554,11 @@ FrameAdmission SynchronousAdmission::Prepare(std::shared_ptr<const SelectedPubli
             m_planCache.push_back(std::move(entry));
         }
     }
-    m_accesses.AppendIncomingWaits(graph, frame.backings, queues, frame.incomingWaits);
-    m_aliases.AppendIncomingWaits(graph, frame.backings, queues, frame.incomingWaits);
+    m_sequencer->accesses.AppendIncomingWaits(graph, frame.backings, frame.queuePoints, frame.incomingWaits);
+    m_sequencer->aliases.AppendIncomingWaits(graph, frame.backings, frame.queuePoints, frame.incomingWaits);
+    // Points already reached (a retired timeline's among them: another graph's, destroyed since) need no wait.
+    for (auto& waits : frame.incomingWaits)
+        std::erase_if(waits, [&](compiler::ExecutionTimelinePoint point) { return m_sequencer->Reached(point); });
     // The resources a batch off the upload queue uses: what a host may record an upload into on that batch's queue.
     if (m_uploadQueue != UINT32_MAX
         && std::ranges::any_of(graph.batches, [&](const auto& batch) { return batch.queue != m_uploadQueue; })
@@ -1544,13 +1575,16 @@ FrameAdmission SynchronousAdmission::Prepare(std::shared_ptr<const SelectedPubli
         }
         if (any) {
             frame.boundaryAccessWaits.resize(graph.batches.size());
-            m_accesses.AppendBoundaryAccessWaits(graph, frame.backings, selected, frame.boundaryAccessWaits);
+            m_sequencer->accesses.AppendBoundaryAccessWaits(graph, frame.backings, selected, frame.boundaryAccessWaits);
         }
     }
-    frame.sequence = m_nextSequence++;
-    frame.domain = m_domain;
-    m_pending.push_back(frame.sequence);
-    return frame;
+}
+void SynchronousAdmission::Readmit(FrameAdmission& frame) {
+    BT_ZONE_SCOPE("ORG.Persistent.Readmit");
+    std::lock_guard lock(m_sequencer->mutex);
+    Require(frame.domain == m_domain && frame.sequence && std::ranges::find(m_pending, frame.sequence) != m_pending.end()
+        && !frame.closed, "Readmission of a stale or closed admission");
+    AdmitLedger(frame, false);
 }
 void SynchronousAdmission::SetClosedExecutions(bool closed) {
     Require(m_pending.empty(), "Closed executions changed during a pending admission");
@@ -1558,8 +1592,9 @@ void SynchronousAdmission::SetClosedExecutions(bool closed) {
     m_closed = closed;
 }
 SynchronousAdmission::SynchronousAdmission(size_t frameCapacity,
-    std::function<void(std::shared_ptr<const void>)> retireOwnership)
-    : m_capacity(frameCapacity), m_retireOwnership(std::move(retireOwnership)) {
+    std::function<void(std::shared_ptr<const void>)> retireOwnership, std::shared_ptr<ResourceSequencer> sequencer)
+    : m_sequencer(sequencer ? std::move(sequencer) : std::make_shared<ResourceSequencer>()), m_capacity(frameCapacity),
+      m_retireOwnership(std::move(retireOwnership)) {
     Require(frameCapacity, "Invalid synchronous frame capacity");
     m_retained.reserve(frameCapacity);
     static std::atomic_uint64_t nextDomain{1};
@@ -1597,14 +1632,15 @@ void SynchronousAdmission::Commit(const FrameAdmission& frame, const compiler::G
     for (const auto point : receipt.tailCompletions) appendCompletion(point);
     for (const auto point : retained.completions)
         submitted[point.timeline] = (std::max)(submitted[point.timeline],point.value);
+    std::lock_guard lock(m_sequencer->mutex);
     // Allocate retention before mutating submission-backed ledgers.
     if (!retained.completions.empty()) m_retained.push_back(std::move(retained));
-    for (uint32_t i = 0; i < count; ++i) m_states.CommitBatch(frame.barriers.batches[i]);
+    for (uint32_t i = 0; i < count; ++i) m_sequencer->states.CommitBatch(frame.barriers.batches[i]);
     for (const auto& effect : frame.incomingEffects) if (effect.firstBatch < count)
-        m_incomingRevisions.insert_or_assign((uint64_t{effect.resource.generation} << 32) | effect.resource.index,
-            IncomingRevision{effect.revision,effect.completion});
-    m_accesses.Commit(graph, frame.backings, receipt, count);
-    m_aliases.Commit(graph, frame.backings, receipt, count);
+        m_sequencer->incomingRevisions.insert_or_assign((uint64_t{effect.resource.generation} << 32) | effect.resource.index,
+            ResourceSequencer::IncomingRevision{effect.revision,effect.completion});
+    m_sequencer->accesses.Commit(graph, frame.backings, receipt, count);
+    m_sequencer->aliases.Commit(graph, frame.backings, receipt, count);
     m_submitted = std::move(submitted);
     m_pending.erase(pending);
 }
@@ -1626,7 +1662,8 @@ uint64_t SynchronousAdmission::Submitted(uint64_t timeline) const noexcept {
     return found == m_submitted.end() ? 0 : found->second;
 }
 size_t SynchronousAdmission::RetireCompleted(std::span<const compiler::ExecutionTimelinePoint> completed) {
-    auto observations = m_completed;
+    std::unique_lock lock(m_sequencer->mutex);
+    auto observations = m_sequencer->completed;
     std::map<uint64_t,bool> seen;
     for (const auto point : completed) {
         Require(point.timeline && !seen[point.timeline], "Invalid duplicate completion timeline");
@@ -1637,17 +1674,16 @@ size_t SynchronousAdmission::RetireCompleted(std::span<const compiler::Execution
         Require(point.value >= observations[point.timeline], "Completion moved backwards");
         observations[point.timeline] = point.value;
     }
-    m_completed = std::move(observations);
-    const auto before = m_retained.size();
-    std::erase_if(m_retained,[&](const RetainedFrame& frame) {
-        const bool done = std::ranges::all_of(frame.completions,[&](auto point) {
-            const auto found = m_completed.find(point.timeline);
-            return found != m_completed.end() && found->second >= point.value;
-        });
-        if (done) RetireOwnership(m_retireOwnership,frame.publication);
+    m_sequencer->completed = std::move(observations);
+    std::vector<std::shared_ptr<const SelectedPublication>> retired;
+    std::erase_if(m_retained,[&](RetainedFrame& frame) {
+        const bool done = std::ranges::all_of(frame.completions,[&](auto point) { return m_sequencer->Reached(point); });
+        if (done) retired.push_back(std::move(frame.publication));
         return done;
     });
-    return before - m_retained.size();
+    lock.unlock();  // nothing is called back under the sequencer's lock
+    for (auto& publication : retired) RetireOwnership(m_retireOwnership,publication);
+    return retired.size();
 }
 struct PublicationCoordinator::Job {
     explicit Job(GraphEditTransaction value) : transaction(std::move(value)) {}

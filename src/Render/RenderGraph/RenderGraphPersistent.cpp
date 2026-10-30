@@ -465,7 +465,7 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 				if (!m_taskService->Submit(m_compilerState->ownershipRetirementScope, runtime::TaskPriority::Background,
 					"ORG.Ownership.RetirePublication", [owner = std::move(owner)]() mutable { owner.reset(); }))
 					basic_telemetry::AddCounter("ORG.Ownership.RetirementRejected");
-			});
+			}, m_runtime->Sequencer());
 		state.admission->SetClosedExecutions(m_persistentClosedExecutions);
 		state.ensureRepresentations = [this](Resource& resource) { EnsurePersistentRepresentations(resource); };
 		// Tickets record their uploads on the graphics queue, or on the queue that first uses them (RecordPendingUploads).
@@ -1125,15 +1125,11 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 			auto appendWait = [&](const ExternalTimelinePoint& wait) {
 				if (!wait.timeline || !wait.value) return;
 				const auto handle = wait.timeline.GetHandle();
-				uint64_t identity = 0;
-				for (const auto& binding : main.foreignTimelines)
-					if (binding.handle.index == handle.index && binding.handle.generation == handle.generation) identity = binding.identity;
-				for (size_t slot = 0; slot < m_queueRegistry.SlotCount() && !identity; ++slot)
-					if (SameTimeline(m_queueRegistry.GetFence(static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot))), wait.timeline)) identity = slot + 1;
-				if (!identity) {
-					identity = m_queueRegistry.SlotCount() + 1 + main.foreignTimelines.size();
-					main.foreignTimelines.push_back({identity, handle});
-				}
+				const uint64_t identity = m_runtime->TimelineIdentity(wait.timeline);
+				bool bound = std::ranges::any_of(main.foreignTimelines, [&](const auto& binding) { return binding.identity == identity; });
+				for (size_t slot = 0; slot < m_queueRegistry.SlotCount() && !bound; ++slot)
+					bound = SameTimeline(m_queueRegistry.GetFence(static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot))), wait.timeline);
+				if (!bound) main.foreignTimelines.push_back({identity, handle});
 				main.waits.push_back({pass.id, {identity, wait.value}});
 			};
 			for (const auto& wait : pass.explicitWaits) appendWait(wait);
@@ -1311,15 +1307,11 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 				for (const auto& [passIndex, wait] : waits) {
 					if (!wait.timeline || !wait.value) continue;
 					const auto handle = wait.timeline.GetHandle();
-					uint64_t identity = 0;
-					for (const auto& binding : segment.foreignTimelines)
-						if (binding.handle.index == handle.index && binding.handle.generation == handle.generation) identity = binding.identity;
-					for (size_t slot = 0; slot < m_queueRegistry.SlotCount() && !identity; ++slot)
-						if (SameTimeline(m_queueRegistry.GetFence(static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot))), wait.timeline)) identity = slot + 1;
-					if (!identity) {
-						identity = m_queueRegistry.SlotCount() + 1 + segment.foreignTimelines.size();
-						segment.foreignTimelines.push_back({identity, handle});
-					}
+					const uint64_t identity = m_runtime->TimelineIdentity(wait.timeline);
+					bool bound = std::ranges::any_of(segment.foreignTimelines, [&](const auto& binding) { return binding.identity == identity; });
+					for (size_t slot = 0; slot < m_queueRegistry.SlotCount() && !bound; ++slot)
+						bound = SameTimeline(m_queueRegistry.GetFence(static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot))), wait.timeline);
+					if (!bound) segment.foreignTimelines.push_back({identity, handle});
 					segment.waits.push_back({passIds[passIndex], {identity, wait.value}});
 				}
 				return segment;

@@ -14,6 +14,8 @@
 #include <vector>
 
 #include "Render/Runtime/ITaskService.h"
+
+namespace rhi { class CommandList; }
 #include "Render/RenderGraph/CompilerAlgorithms.h"
 
 namespace org::compiler {
@@ -298,6 +300,9 @@ struct ExecutionTimelinePoint {
 struct ExecutionBatchTimeline {
     ExecutionTimelinePoint signal;
     std::vector<ExecutionTimelinePoint> waits;
+    // Lists submitted ahead of the batch's own in the same submission, behind its waits: the handoff into the execution recorded
+    // when it was admitted (its entry barriers). Only for the call that submits it; not retained.
+    std::span<const rhi::CommandList> leading;
 };
 class IPreparedExecutionBatch;
 // Timeline portion only, not an executable command packet. The admission owner
@@ -351,11 +356,15 @@ public:
         std::vector<std::shared_ptr<const void>> executionLeases = {},
         std::vector<std::shared_ptr<const IPreparedExecutionBatch>> preparedBatches = {},
         std::span<const ExecutionTimelinePoint> reservedSignals = {});
+    // leading: per batch, lists submitted ahead of its own (ExecutionBatchTimeline::leading); empty for none. leases: kept with the
+    // execution until it retires (the leading lists' allocations).
     std::shared_ptr<const GraphExecutionTimeline> SubmitPrepared(
         std::shared_ptr<const CompiledGraphBundle>,
         const std::vector<std::vector<ExecutionTimelinePoint>>& incomingWaits,
         const std::vector<std::shared_ptr<const IPreparedExecutionBatch>>& packets,
-        std::span<const ExecutionTimelinePoint> reservedSignals = {});
+        std::span<const ExecutionTimelinePoint> reservedSignals = {},
+        std::span<const std::span<const rhi::CommandList>> leading = {},
+        std::vector<std::shared_ptr<const void>> leases = {});
     // Call only after the backend successfully submits this batch's signal.
     void CommitBatch(uint64_t submission, uint32_t batch);
     // An execution another thread has already submitted with these signal values (async epochs: the values

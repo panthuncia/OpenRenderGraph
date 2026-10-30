@@ -26,7 +26,7 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 		std::vector<compiler::ExecutionTimelinePoint> queues;
 		for (size_t slot = 0; slot < slotCount; ++slot) {
 			const auto next = m_queueRegistry.GetCurrentFenceValue(static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot)));
-			queues.push_back({slot + 1, next ? next - 1 : 0});
+			queues.push_back({QueueTimelineIdentity(*m_runtime, m_queueRegistry, slot), next ? next - 1 : 0});
 		}
 		const size_t framesInFlight = m_renderGraphSettingsService ? m_renderGraphSettingsService->GetNumFramesInFlight() : 3;
 		state.timelines = std::make_unique<compiler::ExecutionTimelineAdmission>(std::move(queues), framesInFlight * 3 + 6);
@@ -76,8 +76,9 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 			auto submitted = next ? next - 1 : 0;
 			// A pending presentation tail owns the next graphics value.
 			if (state.pendingPresentSubmission && slot == static_cast<size_t>(ToUnderlying(presentationSlot))) submitted = next;
-			queues.push_back({slot + 1, submitted});
-			timelineBindings.push_back({slot + 1, m_queueRegistry.GetFence(index).GetHandle()});
+			const auto identity = QueueTimelineIdentity(*m_runtime, m_queueRegistry, slot);
+			queues.push_back({identity, submitted});
+			timelineBindings.push_back({identity, m_queueRegistry.GetFence(index).GetHandle()});
 		}
 		timelineBindings.insert(timelineBindings.end(), segment.foreignTimelines.begin(), segment.foreignTimelines.end());
 		if (HasFrameWaitTimeline())
@@ -96,8 +97,8 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 		}
 		// Executed now (not a ticket, which takes its wait when submitted): every batch waits for the frame's values.
 		if (!m_persistentTicketTarget && HasFrameWaitTimeline() && m_frameWaitValue)
-			for (auto& waits : admission.incomingWaits)
-				waits.push_back({kFrameWaitTimelineIdentity, m_frameWaitValue});
+			for (auto* set : {&admission.incomingWaits, &admission.ownWaits})  // ownWaits: kept by its readmission
+				for (auto& waits : *set) waits.push_back({kFrameWaitTimelineIdentity, m_frameWaitValue});
 		// Recording reuse (SetPersistentRecordingReuse): a ticket's closed execution with nothing late-bound, whose passes all
 		// report their revisions, is recorded for resubmission and kept per (epoch, slot); one prepared for what a kept
 		// recording was recorded for takes it.
@@ -201,6 +202,12 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 			}
 			job.deferred = late;
 			job.recording = compiler::BuildPersistentRecordingList(sealed, batch);
+			// An open admission's handoff into the execution (its batches' entry barriers) is recorded when it submits, against the
+			// ledger as it is then: the body has none.
+			if (!admission.closed) {
+				job.recording.textureBarriers.clear();
+				job.recording.bufferBarriers.clear();
+			}
 			job.recording.external = external;
 			job.recording.bindings = segment.legacyBindings;
 			job.recording.frameSlot = state.frameIndex;
@@ -303,6 +310,7 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 		const size_t concurrency = (std::min<size_t>)(graph.batches.size(), 4u);
 		std::shared_ptr<const compiler::GraphExecutionTimeline> execution;
 		lap(timings.acquireUs);
+		std::unique_lock<std::recursive_mutex> sequencer;
 		try {
 			auto recorded = compiler::RecordFrame(std::move(plan), m_taskService, concurrency);
 			lap(timings.recordUs);
@@ -347,7 +355,37 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 				ticket->segments.push_back({std::move(admission), std::move(recording), segment.legacyBindings, defaultResourceHeap, defaultSamplerHeap});
 				return nullptr;
 			}
-			execution = std::move(recorded).Submit(*state.timelines);
+			// Admission at submission (docs/job-graphs.md, "Phase 2 investigation"): under the sequencer, the ledger's handoff is
+			// computed again, recorded into a list ahead of each batch that has one, submitted and committed, with no other
+			// admission in between.
+			sequencer = state.admission->HoldSequencer();
+			std::vector<rhi::CommandList> handoffLists(graph.batches.size());
+			std::vector<std::span<const rhi::CommandList>> leading;
+			std::vector<std::shared_ptr<const void>> handoffLeases;
+			if (!admission.closed) {
+				state.admission->Readmit(admission);
+				leading.resize(graph.batches.size());
+				for (uint32_t batch = 0; batch < graph.batches.size(); ++batch) {
+					const auto& entry = admission.barriers.batches[batch];
+					if (entry.textures.empty() && entry.buffers.empty()) continue;
+					BT_ZONE_SCOPE("ORG.Persistent.RecordHandoff");
+					const auto index = static_cast<QueueSlotIndex>(static_cast<uint8_t>(graph.batches[batch].queue));
+					auto allocation = std::make_shared<compiler::FrameCommandAllocation>();
+					allocation->pool = m_queueRegistry.GetSharedPool(index);
+					allocation->pair = allocation->pool->Request();
+					auto list = allocation->pair.list.Get();
+					rhi::BarrierBatch barriers{};
+					barriers.textures = {entry.textures.data(), static_cast<uint32_t>(entry.textures.size())};
+					barriers.buffers = {entry.buffers.data(), static_cast<uint32_t>(entry.buffers.size())};
+					list.Barriers(barriers);
+					if (list.EndChecked() != rhi::Result::Ok) throw std::runtime_error("Handoff command list close failed");
+					allocation->closed = true;
+					handoffLists[batch] = list;
+					leading[batch] = {&handoffLists[batch], 1};
+					handoffLeases.push_back(std::move(allocation));
+				}
+			}
+			execution = std::move(recorded).Submit(*state.timelines, admission.incomingWaits, leading, std::move(handoffLeases));
 			lap(timings.submitUs);
 		} catch (...) {
 			state.admission->Abandon(admission);
@@ -357,6 +395,7 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 			BT_ZONE_SCOPE("ORG.Persistent.CommitAdmission");
 			state.admission->Commit(admission, *execution);
 		}
+		if (sequencer) sequencer.unlock();
 		if (traceSubmission) RecordPersistentScheduleSubmission(*segment.publication->executable, segment.label, state.frameNumber);
 		for (const auto& statistics : recordingStatistics) statistics->Publish();
 		for (size_t batch = 0; batch < execution->batches.size(); ++batch)

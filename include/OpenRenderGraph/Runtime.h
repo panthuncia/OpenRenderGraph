@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
+#include <tuple>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -17,6 +19,8 @@ class IDescriptorService;
 class IStatisticsService;
 class IRenderGraphSettingsService;
 }
+
+namespace org::persistent { class ResourceSequencer; }
 
 namespace org {
 
@@ -78,6 +82,13 @@ public:
 	// (the driver frees take the device's memory locks). Descriptor releases wait for the next Retire.
 	std::shared_ptr<void> RetireElsewhere();
 
+	// The process-unique identity of a timeline, what admission and the ledgers name its points by (never 0; below
+	// RenderGraph::kFrameWaitTimelineIdentity). Stable for the timeline's life; a timeline created later in its place (the same
+	// handle index, another generation) gets a new one.
+	uint64_t TimelineIdentity(const rhi::Timeline& timeline);
+	// The resource ledgers every graph's admission on the runtime shares (docs/job-graphs.md, "Phase 2 investigation").
+	const std::shared_ptr<persistent::ResourceSequencer>& Sequencer() const noexcept { return m_sequencer; }
+
 private:
 	explicit Runtime(Desc desc);
 	void Initialize();
@@ -89,11 +100,16 @@ private:
 	std::shared_ptr<runtime::IStatisticsService> m_statistics;
 	std::shared_ptr<runtime::IRenderGraphSettingsService> m_settings;
 	rhi::TimelinePtr m_readbackFence, m_copyReadbackFence;
+	std::shared_ptr<persistent::ResourceSequencer> m_sequencer;
 
 	mutable std::mutex m_queuesMutex;
 	std::vector<rhi::Queue> m_queues;
 	// The progress timelines of unregistered queues (destroyed with them): device and handle.
 	std::vector<std::pair<void*, rhi::TimelineHandle>> m_retiredTimelines;
+
+	std::mutex m_identitiesMutex;
+	std::map<std::tuple<void*, uint32_t, uint32_t>, uint64_t> m_identities;
+	uint64_t m_nextIdentity = 1;
 };
 
 } // namespace org

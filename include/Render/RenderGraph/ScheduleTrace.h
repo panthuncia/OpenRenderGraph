@@ -93,8 +93,8 @@ struct ScheduleSubmissionWaits {
             FrameValues,  // the frame values' timeline (SetFrameWaitTimeline)
         };
         Source source = Source::Incoming;
-        // The admission's timeline identity: a graph queue slot + 1, RenderGraph::kFrameWaitTimelineIdentity, or a foreign
-        // timeline a pass waits on (identities past the queue slots).
+        // The admission's timeline identity (Runtime::TimelineIdentity: a graph queue's or a foreign timeline a pass waits on) or
+        // RenderGraph::kFrameWaitTimelineIdentity. Uploads: the uploads' queue slot + 1.
         uint64_t timeline = 0, value = 0;
     };
     struct Batch {

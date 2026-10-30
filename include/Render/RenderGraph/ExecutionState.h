@@ -50,8 +50,8 @@ struct PreparedBatchBarriers {
     // Indexed in the same order as CompiledGraph::batches[i].passes.
     std::vector<BeforePass> beforePass;
     std::vector<BeforePass> afterPass;
-    // Batch-entry compatibility barriers. New symbolic transitions are always
-    // assigned to beforePass; these remain for imported/backend policy work.
+    // Batch-entry barriers: the handoff from the state an earlier execution left each backing in (the ledger's) to its first use
+    // here, for every backing but aliased ones. beforePass and afterPass depend on the compiled graph alone.
     std::vector<rhi::TextureBarrier> textures;
     std::vector<rhi::BufferBarrier> buffers;
     std::vector<PreparedStateRegion> committedStates;

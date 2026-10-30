@@ -511,7 +511,13 @@ public:
                 signals.push_back({external.timeline.GetHandle(), external.value});
             }
         signals.push_back({signal->handle, batch.signal.value});
-        const auto submitted = m_queue.Submit({m_lists.data(), static_cast<uint32_t>(m_lists.size())},
+        std::vector<rhi::CommandList> withLeading;
+        if (!batch.leading.empty()) {
+            withLeading.assign(batch.leading.begin(), batch.leading.end());
+            withLeading.insert(withLeading.end(), m_lists.begin(), m_lists.end());
+        }
+        const auto& lists = batch.leading.empty() ? m_lists : withLeading;
+        const auto submitted = m_queue.Submit({lists.data(), static_cast<uint32_t>(lists.size())},
             {{waits.data(), static_cast<uint32_t>(waits.size())}, {signals.data(), static_cast<uint32_t>(signals.size())}});
         if (submitted != rhi::Result::Ok)
             return {SubmissionState::SubmissionUncertain, SubmissionFailureStage::Submit, static_cast<uint32_t>(submitted)};

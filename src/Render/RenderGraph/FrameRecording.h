@@ -45,6 +45,11 @@ public:
     RecordedFrame(const RecordedFrame&) = delete;
     const auto& Snapshot() const noexcept { return m_snapshot; }
     std::shared_ptr<const GraphExecutionTimeline> Submit(ExecutionTimelineAdmission& admission) &&;
+    // Admitted at submission: the waits the admission computed then (replacing the plan's), the lists ahead of each batch's and
+    // what keeps them alive (ExecutionTimelineAdmission::SubmitPrepared).
+    std::shared_ptr<const GraphExecutionTimeline> Submit(ExecutionTimelineAdmission& admission,
+        const std::vector<std::vector<ExecutionTimelinePoint>>& incomingWaits,
+        std::span<const std::span<const rhi::CommandList>> leading, std::vector<std::shared_ptr<const void>> leases) &&;
     // Async epochs: hands the packets to their queues with timelines the caller assigned (one per batch),
     // touching no admission state - safe on the submitting thread while the owner prepares other work. The
     // owner records the submission afterwards (ExecutionTimelineAdmission::RecordSubmitted). False when a

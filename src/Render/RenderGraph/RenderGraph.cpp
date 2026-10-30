@@ -336,6 +336,14 @@ void RenderGraph::ShutdownOwnedState() {
 	++m_resourceRegistryGeneration;
 	m_resolverHandleCache.clear();
 
+	// Its queue timelines go with it: what was submitted on them completes first, and the runtime's ledgers stop waiting on them.
+	for (size_t i = 0; i < m_queueRegistry.SlotCount(); ++i) {
+		const auto slot = static_cast<QueueSlotIndex>(static_cast<uint8_t>(i));
+		const auto fence = m_queueRegistry.GetFenceOwner(slot);
+		if (!fence || !fence->Get()) continue;
+		if (const auto next = m_queueRegistry.GetCurrentFenceValue(slot); next > 1) fence->Get().HostWait(next - 1);
+		m_runtime->Sequencer()->RetireTimeline(m_runtime->TimelineIdentity(fence->Get()));
+	}
 	// The queues the graph made go with it: the runtime's frontier stops covering them.
 	for (size_t i = 0; i < m_queueRegistry.SlotCount(); ++i) {
 		const auto slot = static_cast<QueueSlotIndex>(static_cast<uint8_t>(i));

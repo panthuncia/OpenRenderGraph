@@ -208,7 +208,14 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
         const auto producerHandle = crossQueue ? handleOn(captured, graph.batches[step.previousBatch].queue) : handle;
         const bool boundaryStep = step.previousBatch == UINT32_MAX;
         const bool authoritativeState = boundaryStep && captured.authoritativeIncoming;
-        const bool invalidatedState = boundaryStep && wasInvalidated(handle) && !authoritativeState;
+        // An aliased (transient) backing keeps no contents across executions, and another occupant may have overwritten its
+        // memory since its last: it enters every execution from Undefined, which its body barrier (before its first pass) encodes
+        // without the ledger. Every other backing enters from the state the ledger hands off, in its batch's entry barriers: the
+        // body's own barriers then depend on the compiled graph alone (docs/job-graphs.md, "Phase 2 investigation").
+        const bool aliasedBacking = captured.aliasSize != 0;
+        const bool invalidatedState = boundaryStep && (aliasedBacking || wasInvalidated(handle)) && !authoritativeState;
+        auto& boundaryTextures = aliasedBacking ? beforePass.textures : output.textures;
+        auto& boundaryBuffers = aliasedBacking ? beforePass.buffers : output.buffers;
         if (boundaryStep
             && (!m_states.contains(Key(handle)) || invalidatedState || authoritativeState)
             && std::none_of(output.seeds.begin(), output.seeds.end(),
@@ -351,7 +358,7 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
                 barrier.beforeSync = static_cast<rhi::ResourceSyncState>(uniformBefore->sync);
                 barrier.afterSync = static_cast<rhi::ResourceSyncState>(step.after.sync);
                 barrier.discard = barrier.beforeLayout == rhi::ResourceLayout::Undefined;
-                if (NeedsTextureBarrier(barrier)) beforePass.textures.push_back(barrier);
+                if (NeedsTextureBarrier(barrier)) boundaryTextures.push_back(barrier);
             } else {
                 const auto beforeAccess = static_cast<rhi::ResourceAccessType>(uniformBefore->access);
                 const auto beforeSync = static_cast<rhi::ResourceSyncState>(uniformBefore->sync);
@@ -368,14 +375,14 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
                     auto acquire = MakeWholeBufferBarrier(consumerHandle, rhi::ResourceAccessType::Common,
                         afterAccess, rhi::ResourceSyncState::All, afterSync);
                     toExternal(acquire, rhi::QueueOwnership::Acquire);
-                    beforePass.buffers.push_back(acquire);
+                    boundaryBuffers.push_back(acquire);
                 } else if (!fixedHeapState && copyCompatible && !queueHandoff
                     && beforeAccess != rhi::ResourceAccessType::None
                     && beforeAccess != rhi::ResourceAccessType::Common
                     && afterAccess != rhi::ResourceAccessType::None
                     && afterAccess != rhi::ResourceAccessType::Common
                     && NeedsWholeBufferBarrier(beforeAccess, afterAccess, beforeSync, afterSync))
-                    beforePass.buffers.push_back(MakeWholeBufferBarrier(consumerHandle,
+                    boundaryBuffers.push_back(MakeWholeBufferBarrier(consumerHandle,
                         beforeAccess, afterAccess, beforeSync, afterSync));
             }
             output.committedResources.push_back(handle);
@@ -446,7 +453,7 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
                     // texture handoffs are visible; graph buffers are Concurrent.
                     basic_telemetry::AddCounter("ORG.Execution.CrossFrameTextureQueueHandoff");
                 }
-                if (NeedsTextureBarrier(barrier)) beforePass.textures.push_back(barrier);
+                if (NeedsTextureBarrier(barrier)) boundaryTextures.push_back(barrier);
             } else {
                 const auto heapType = captured.heapType;
                 const bool fixedHeapState = heapType == rhi::HeapType::Upload
@@ -482,12 +489,12 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
                     acquire.ownershipPeer = OwnershipPeerForQueue(previousQueue);
                     if (crossDevice) { toExternal(release, rhi::QueueOwnership::Release); toExternal(acquire, rhi::QueueOwnership::Acquire); }
                     afterProducer->buffers.push_back(release);
-                    beforePass.buffers.push_back(acquire);
+                    boundaryBuffers.push_back(acquire);
                 } else if (!fixedHeapState && externalAcquire) {
                     auto acquire = MakeWholeBufferBarrier(consumerHandle, rhi::ResourceAccessType::Common,
                         afterAccess, rhi::ResourceSyncState::All, afterSync);
                     toExternal(acquire, rhi::QueueOwnership::Acquire);
-                    beforePass.buffers.push_back(acquire);
+                    boundaryBuffers.push_back(acquire);
                 }
                 if (!fixedHeapState && !externalAcquire
                     && copyQueueCompatibleBefore
@@ -497,7 +504,7 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
                     && afterAccess != rhi::ResourceAccessType::None
                     && afterAccess != rhi::ResourceAccessType::Common
                     && NeedsWholeBufferBarrier(beforeAccess, afterAccess, beforeSync, afterSync))
-                    beforePass.buffers.push_back(MakeWholeBufferBarrier(consumerHandle,
+                    boundaryBuffers.push_back(MakeWholeBufferBarrier(consumerHandle,
                         beforeAccess, afterAccess, beforeSync, afterSync));
             }
         });

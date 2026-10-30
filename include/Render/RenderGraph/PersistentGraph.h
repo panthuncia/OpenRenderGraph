@@ -332,6 +332,10 @@ struct FrameAdmission {
     // must wait for (RenderGraph::RecordPendingUploads' queue-scoped uploads); incomingWaits gives a read only the writer.
     compiler::BackingAccessAdmissionLedger::ResourceWaits boundaryAccessWaits;
     std::vector<uint64_t> queueTimelines;
+    // As prepared: the queues' submitted points, and the frame's own waits (producer waits, incoming states) before the ledgers'.
+    // A readmission (SynchronousAdmission::Readmit) starts over from them.
+    std::vector<compiler::ExecutionTimelinePoint> queuePoints;
+    std::vector<std::vector<compiler::ExecutionTimelinePoint>> ownWaits;
     struct IncomingEffect {
         rhi::ResourceHandle resource;
         uint64_t revision;
@@ -374,6 +378,28 @@ struct FrameIncomingState {
     compiler::ExecutionTimelinePoint producerCompletion;
     uint64_t revision = 1;
 };
+// The ledgers every admission on a runtime shares (Runtime::Sequencer): resource states, accesses and alias occupancy by
+// concrete backing, the incoming-state revisions consumed, and what the GPU has completed per timeline identity. An admission
+// holds the mutex while it reads or writes them. Admissions of two graphs both prepared before either commits do not yet see
+// each other: admission moves to submission in Phase 2d (docs/job-graphs.md).
+class ResourceSequencer {
+public:
+    struct IncomingRevision { uint64_t revision = 0; compiler::ExecutionTimelinePoint completion; };
+    // Recursive: an execution holds it from its admission through its submission and commit (SynchronousAdmission::HoldSequencer),
+    // across the admission's own calls.
+    std::recursive_mutex mutex;
+    compiler::BackingStateAdmissionLedger states;
+    compiler::BackingAccessAdmissionLedger accesses;
+    compiler::AliasAccessAdmissionLedger aliases;
+    std::map<uint64_t, IncomingRevision> incomingRevisions;
+    // Observed completion per timeline identity. A retired timeline's is UINT64_MAX.
+    std::map<uint64_t, uint64_t> completed;
+    // The timeline's work has completed and it is never signalled again (its owner is destroying it): its points are reached,
+    // and waits on them are dropped.
+    void RetireTimeline(uint64_t identity);
+    // Caller holds the mutex.
+    bool Reached(compiler::ExecutionTimelinePoint point) const;
+};
 class SynchronousAdmission {
 public:
     // Capture once when a producer replaces/removes a binding. These weak
@@ -390,12 +416,15 @@ public:
     // or submitted GPU consumer still exists; retry after retirement advances.
     bool RetireBackingMetadata(const RetirementTicket& ticket);
     bool RetireAliasMetadata(const RetirementTicket& ticket);
-    size_t StateBackingCount() const noexcept { return m_states.BackingCount(); }
-    size_t HazardBackingCount() const noexcept { return m_accesses.BackingCount(); }
-    size_t AliasHeapCount() const noexcept { return m_aliases.HeapCount(); }
-    size_t IncomingRevisionCount() const noexcept { return m_incomingRevisions.size(); }
+    size_t StateBackingCount() const;
+    size_t HazardBackingCount() const;
+    size_t AliasHeapCount() const;
+    size_t IncomingRevisionCount() const;
+    // sequencer: the runtime's (shared with every other admission on it); a private one when null.
     explicit SynchronousAdmission(size_t frameCapacity = 3,
-        std::function<void(std::shared_ptr<const void>)> retireOwnership = {});
+        std::function<void(std::shared_ptr<const void>)> retireOwnership = {},
+        std::shared_ptr<ResourceSequencer> sequencer = {});
+    const std::shared_ptr<ResourceSequencer>& Sequencer() const noexcept { return m_sequencer; }
     // Closed executions: every resource an execution touches leaves it in its home state
     // (BackingStateAdmissionLedger::Prepare closeToHome) and every execution starts with a full memory
     // barrier (FrameAdmission::closed). An execution's barrier plan then depends only on its executable and
@@ -417,6 +446,12 @@ public:
         std::span<const FrameProducerWait> producerWaits = {},
         std::span<const FrameIncomingState> incomingStates = {},
         std::span<const FrameRebinding> rebindings = {});
+    // An open admission, again, at submission: the ledger's part (the batches' entry barriers and seeds, the states it commits, the
+    // waits on earlier executions) recomputed against the ledgers as they are now. The rest of the plan depends on the compiled graph
+    // alone, so what was recorded from it stands (docs/job-graphs.md, "Phase 2 investigation"). Hold the sequencer (HoldSequencer)
+    // from here through the submission and its Commit, so that no other admission comes between.
+    void Readmit(FrameAdmission& frame);
+    std::unique_lock<std::recursive_mutex> HoldSequencer() const { return std::unique_lock(m_sequencer->mutex); }
     void Commit(const FrameAdmission& frame, const compiler::GraphExecutionTimeline& receipt,
         uint32_t signaledBatches = UINT32_MAX);
     void Abandon(const FrameAdmission& frame);
@@ -427,9 +462,9 @@ public:
     size_t RetireCompleted(std::span<const compiler::ExecutionTimelinePoint> completed);
     size_t RetainedFrames() const noexcept { return m_retained.size(); }
 private:
-    compiler::BackingStateAdmissionLedger m_states;
-    compiler::BackingAccessAdmissionLedger m_accesses;
-    compiler::AliasAccessAdmissionLedger m_aliases;
+    // The ledgers' part of an admission (caller holds the sequencer). cacheEligible: nothing frame-specific feeds the plan.
+    void AdmitLedger(FrameAdmission& frame, bool cacheEligible);
+    std::shared_ptr<ResourceSequencer> m_sequencer;
     uint64_t m_nextSequence = 1;
     // Admissions prepared and not yet committed or abandoned, in sequence order (at most one unless closed).
     std::vector<uint64_t> m_pending;
@@ -444,9 +479,7 @@ private:
     std::vector<CachedPlan> m_planCache;
     uint64_t m_planCacheHits = 0, m_planCacheMisses = 0;
     uint64_t m_domain = 0;
-    std::map<uint64_t,uint64_t> m_submitted, m_completed;
-    struct IncomingRevision { uint64_t revision = 0; compiler::ExecutionTimelinePoint completion; };
-    std::map<uint64_t,IncomingRevision> m_incomingRevisions;
+    std::map<uint64_t,uint64_t> m_submitted;
     struct RetainedFrame {
         std::shared_ptr<const SelectedPublication> publication;
         std::vector<compiler::ExecutionTimelinePoint> completions;

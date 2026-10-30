@@ -162,12 +162,13 @@ std::shared_ptr<const GraphExecutionTimeline> ExecutionTimelineAdmission::Submit
     std::shared_ptr<const CompiledGraphBundle> bundle,
     const std::vector<std::vector<ExecutionTimelinePoint>>& incomingWaits,
     const std::vector<std::shared_ptr<const IPreparedExecutionBatch>>& packets,
-    std::span<const ExecutionTimelinePoint> reservedSignals) {
+    std::span<const ExecutionTimelinePoint> reservedSignals, std::span<const std::span<const rhi::CommandList>> leading,
+    std::vector<std::shared_ptr<const void>> leases) {
     BT_ZONE_SCOPE("ORG.Execution.SubmitPrepared");
     if (!bundle || !bundle->graph || packets.size() != bundle->graph->batches.size())
         throw std::invalid_argument("Prepared packet count mismatch");
-    std::vector<std::shared_ptr<const void>> leases;
-    leases.reserve(packets.size());
+    if (!leading.empty() && leading.size() != packets.size()) throw std::invalid_argument("Leading list count mismatch");
+    leases.reserve(leases.size() + packets.size());
     for (size_t i = 0; i < packets.size(); ++i) {
         const auto& packet = packets[i];
         if (!packet) throw std::invalid_argument("Missing prepared packet");
@@ -178,7 +179,9 @@ std::shared_ptr<const GraphExecutionTimeline> ExecutionTimelineAdmission::Submit
     auto execution = Prepare(std::move(bundle), incomingWaits, std::move(leases), packets,
         reservedSignals);
     for (uint32_t i = 0; i < packets.size(); ++i) {
-        const auto receipt = packets[i]->Submit(execution->batches[i]);
+        auto batch = execution->batches[i];
+        if (!leading.empty()) batch.leading = leading[i];
+        const auto receipt = packets[i]->Submit(batch);
         if (!receipt) {
             Fail(execution->submission, receipt);
             throw std::runtime_error("Prepared GPU submission failed; recovery required");
