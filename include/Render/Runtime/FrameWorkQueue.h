@@ -39,6 +39,12 @@ private:
             if constexpr (requires(const Work& value) { value.Commit(); })
                 for (const auto& entry : work) if (!entry->discarded) entry->work.Commit();
         }
+        // The GPU has completed the execution the work was submitted with: work with a Complete() learns it (a job whose result
+        // gates readiness publishes it then).
+        void Completed(CompletionContext) const override {
+            if constexpr (requires(const Work& value) { value.Complete(); })
+                for (const auto& entry : work) if (!entry->discarded) entry->work.Complete();
+        }
         void Abandoned(AbandonReason) const override { ReturnUnsubmitted(); }
         void ReturnUnsubmitted() const {
             if (resolved.exchange(true)) return;

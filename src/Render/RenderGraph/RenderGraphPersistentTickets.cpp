@@ -632,7 +632,7 @@ void RenderGraph::ConfirmPersistentPresentationTail() {
 	const auto value = m_queueRegistry.GetNextFenceValue(slot);
 	if (queue.Signal({fence.GetHandle(), value}) != rhi::Result::Ok)
 		throw std::runtime_error("Presentation tail completion signal failed");
-	const compiler::ExecutionTimelinePoint point{static_cast<uint64_t>(ToUnderlying(slot)) + 1u, value};
+	const compiler::ExecutionTimelinePoint point{QueueTimelineIdentity(*m_runtime, m_queueRegistry, ToUnderlying(slot)), value};
 	state.timelines->ExtendSubmittedExecution(state.pendingPresentSubmission, point);
 	state.admission->ExtendSubmitted(point);
 	state.pendingPresentSubmission = 0;
