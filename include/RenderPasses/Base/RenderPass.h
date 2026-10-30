@@ -67,41 +67,22 @@ class RenderPassBuilder;
 
 class RenderPass : public RenderGraphPass {
 public:
-    virtual ~RenderPass() = default;
+    ~RenderPass() override;
 
 	void SetResourceRegistryView(
 		std::shared_ptr<ResourceRegistryView> resourceRegistryView,
-		std::unordered_set<FeatureDomainIdentifier, FeatureDomainIdentifier::Hasher> activeFeatureDomains = {}) {
-		m_resourceRegistryView = resourceRegistryView;
-		m_resourceDescriptorIndexHelper = std::make_unique<ResourceDescriptorIndexHelper>(resourceRegistryView, std::move(activeFeatureDomains));
-	}
+		std::unordered_set<FeatureDomainIdentifier, FeatureDomainIdentifier::Hasher> activeFeatureDomains = {});
 
 	void SetResourceRegistryView(
 		std::shared_ptr<ResourceRegistryView> resourceRegistryView,
 		const std::unordered_set<FeatureDomainIdentifier, FeatureDomainIdentifier::Hasher>& activeFeatureDomains,
 		const std::vector<AutoDescriptorRegistration>& autoDescriptorShaderResources,
 		const std::vector<AutoDescriptorRegistration>& autoDescriptorConstantBuffers,
-		const std::vector<AutoDescriptorRegistration>& autoDescriptorUnorderedAccessViews) {
-		SetResourceRegistryView(std::move(resourceRegistryView), activeFeatureDomains);
-		for (const auto& registration : autoDescriptorShaderResources) {
-			m_resourceDescriptorIndexHelper->RegisterDescriptor(registration);
-		}
-		for (const auto& registration : autoDescriptorConstantBuffers) {
-			m_resourceDescriptorIndexHelper->RegisterDescriptor(registration);
-		}
-		for (const auto& registration : autoDescriptorUnorderedAccessViews) {
-			m_resourceDescriptorIndexHelper->RegisterDescriptor(registration);
-		}
-	}
+		const std::vector<AutoDescriptorRegistration>& autoDescriptorUnorderedAccessViews);
 
     void ConfigureResourceRegistryView(
         std::shared_ptr<ResourceRegistryView> view,
-        const PassParameters& parameters) override {
-        SetResourceRegistryView(std::move(view), parameters.activeFeatureDomains,
-            parameters.autoDescriptorShaderResources,
-            parameters.autoDescriptorConstantBuffers,
-            parameters.autoDescriptorUnorderedAccessViews);
-    }
+        const PassParameters& parameters) override;
 
 	void Setup() override = 0;
     // Preparation owner only. Empty means explicit synchronous legacy fallback.
@@ -120,21 +101,9 @@ protected:
 	bool invalidated = true;
 	virtual void DeclareResourceUsages(RenderPassBuilder* /*builder*/) {};
 
-	void BindResourceDescriptorIndices(rhi::CommandList& commandList, const PipelineResources& resources) {
-		unsigned int indices[org::shaderapi::kNumResourceDescriptorIndicesRootConstants] = {};
-		int i = 0;
-		for (auto& binding : resources.mandatoryResourceDescriptorSlots) {
-			indices[i] = m_resourceDescriptorIndexHelper->GetResourceDescriptorIndex(binding, false);
-			i++;
-		}
-		for (auto& binding : resources.optionalResourceDescriptorSlots) {
-			indices[i] = m_resourceDescriptorIndexHelper->GetResourceDescriptorIndex(binding, true);
-			i++;
-		}
-		if (i > 0) {
-			commandList.PushConstants(rhi::ShaderStage::All, 0, org::shaderapi::kResourceDescriptorIndicesRootParameter, 0, i, indices);
-		}
-	}
+	void BindResourceDescriptorIndices(rhi::CommandList& commandList, const PipelineResources& resources);
+	// The descriptor index the pass's registry view resolves for a binding (for the binders below).
+	unsigned int ResolveResourceDescriptorIndex(const ResourceIdentifier& binding, bool optional) const;
 
 	template<class CommandSink>
 	void BindResourceDescriptorIndices(CommandSink& commandList, const PipelineResources& resources) const {
@@ -145,27 +114,15 @@ protected:
 		unsigned int indices[org::shaderapi::kNumResourceDescriptorIndicesRootConstants] = {};
 		int i = 0;
 		for (auto& binding : resources.mandatoryResourceDescriptorSlots)
-			indices[i++] = m_resourceDescriptorIndexHelper->GetResourceDescriptorIndex(binding, false);
+			indices[i++] = ResolveResourceDescriptorIndex(binding, false);
 		for (auto& binding : resources.optionalResourceDescriptorSlots)
-			indices[i++] = m_resourceDescriptorIndexHelper->GetResourceDescriptorIndex(binding, true);
+			indices[i++] = ResolveResourceDescriptorIndex(binding, true);
 		if (i > 0) commandList.PushConstants(rhi::ShaderStage::Compute, 0,
 			org::shaderapi::kResourceDescriptorIndicesRootParameter, 0, i, indices);
 	}
 
 	std::vector<unsigned int> CaptureResourceDescriptorIndices(const PipelineResources& resources,
-		PreparedDescriptorIndexCache* cache = nullptr) const {
-		auto resolve = [this](const ResourceIdentifier& binding, bool optional) {
-			return m_resourceDescriptorIndexHelper->GetResourceDescriptorIndex(binding, optional);
-		};
-		std::vector<unsigned int> indices;
-		indices.reserve(resources.mandatoryResourceDescriptorSlots.size()
-			+ resources.optionalResourceDescriptorSlots.size());
-		for (const auto& binding : resources.mandatoryResourceDescriptorSlots)
-			indices.push_back(cache ? cache->Resolve(binding, false, resolve) : resolve(binding, false));
-		for (const auto& binding : resources.optionalResourceDescriptorSlots)
-			indices.push_back(cache ? cache->Resolve(binding, true, resolve) : resolve(binding, true));
-		return indices;
-	}
+		PreparedDescriptorIndexCache* cache = nullptr) const;
 
 	std::shared_ptr<Resource> ProvideResource(ResourceIdentifier const& /*key*/) override { return nullptr; }
 	std::vector<ResourceIdentifier> GetSupportedKeys() override { return {}; }

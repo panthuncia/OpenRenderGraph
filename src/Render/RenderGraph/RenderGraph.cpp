@@ -56,11 +56,31 @@
 namespace org {
 
 namespace {
-thread_local RenderGraph::ResolverCaptureScope* t_resolverCaptures = nullptr;
+thread_local ResolverCaptureScope* t_resolverCaptures = nullptr;
 }
 
-RenderGraph::ResolverCaptureScope::ResolverCaptureScope() : m_previous(t_resolverCaptures) { t_resolverCaptures = this; }
-RenderGraph::ResolverCaptureScope::~ResolverCaptureScope() { t_resolverCaptures = m_previous; }
+ExternalPassDesc ExternalPassDesc::Compute(std::string name, std::shared_ptr<RenderPass> computePass) {
+	ExternalPassDesc desc{};
+	// PassType remains an ingestion/compiler shape tag during the migration;
+	// actual execution queue is selected independently below.
+	desc.type = PassType::Render;
+	desc.name = std::move(name);
+	desc.unifiedPass = std::move(computePass);
+	desc.preferredQueueKind = QueueKind::Compute;
+	return desc;
+}
+
+ExternalPassDesc ExternalPassDesc::Copy(std::string name, std::shared_ptr<RenderPass> copyPass) {
+	ExternalPassDesc desc{};
+	desc.type = PassType::Render;
+	desc.name = std::move(name);
+	desc.unifiedPass = std::move(copyPass);
+	desc.preferredQueueKind = QueueKind::Copy;
+	return desc;
+}
+
+ResolverCaptureScope::ResolverCaptureScope() : m_previous(t_resolverCaptures) { t_resolverCaptures = this; }
+ResolverCaptureScope::~ResolverCaptureScope() { t_resolverCaptures = m_previous; }
 
 std::shared_ptr<const ResolverDeclarationState> RenderGraph::CaptureResolverDeclarationState(const IResourceResolver& resolver) const {
 	auto state = m_resolverCaptureContext ? resolver.CaptureDeclarationState(*m_resolverCaptureContext)
@@ -71,33 +91,6 @@ std::shared_ptr<const ResolverDeclarationState> RenderGraph::CaptureResolverDecl
 		if (captured->dependencyIdentity == state->dependencyIdentity) return captured;
 	scope->m_captures.push_back(state);
 	return state;
-}
-
-runtime::IUploadService& RenderGraphPass::UploadService() const {
-    auto service = m_uploadService.lock();
-    if (!service) throw std::runtime_error("Pass upload service generation is unavailable");
-    return *service;
-}
-
-runtime::IDescriptorService& RenderGraphPass::DescriptorService() const {
-    auto service = m_descriptorService.lock();
-    if (service) return *service;
-    // Pass construction can precede graph service binding during startup;
-    // retain the weak binding contract while allowing that initialization
-    // window to resolve through the graph's active generation.
-    if (auto* active = runtime::GetActiveDescriptorService()) return *active;
-    throw std::runtime_error("Pass descriptor service generation is unavailable");
-}
-
-void RenderGraphPass::UploadBufferData(const void* data, size_t size,
-    runtime::UploadTarget target, size_t offset, std::source_location source) const {
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
-    UploadService().UploadData(data, size, std::move(target), offset,
-        source.file_name(), static_cast<int>(source.line()));
-#else
-    (void)source;
-    UploadService().UploadData(data, size, std::move(target), offset);
-#endif
 }
 
 namespace {

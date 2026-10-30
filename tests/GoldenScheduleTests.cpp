@@ -80,7 +80,10 @@ std::string ReadFile(const std::filesystem::path& path)
     std::ifstream in(path, std::ios::binary);
     std::ostringstream text;
     text << in.rdbuf();
-    return text.str();
+    // A checkout may convert the golden files to CRLF; the dumps use LF.
+    auto content = text.str();
+    std::erase(content, '\r');
+    return content;
 }
 
 void CheckGolden(const std::filesystem::path& fixture, const std::string& dump, bool update)

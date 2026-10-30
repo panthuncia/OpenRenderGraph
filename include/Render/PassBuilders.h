@@ -10,7 +10,10 @@
 #include <spdlog/spdlog.h>
 
 #include "Render/FeatureDomainRegistry.h"
-#include "Render/RenderGraph/RenderGraph.h"
+#include "Render/ResourceRegistry.h"
+#include "RenderPasses/Base/RenderPass.h"
+#include "RenderPasses/Base/ComputePass.h"
+#include "RenderPasses/Base/CopyPass.h"
 #include "ResourceRequirements.h"
 #include "Resources/ResourceStateTracker.h"
 #include "Resources/ResourceIdentifier.h"
@@ -216,6 +219,26 @@ inline ResourceIdentifierAndRange Subresources(const char* r,
 }
 
 // If we have a ResourceIdentifierAndRange, ask the builder to resolve it into an actual ResourceAndRange:
+class RenderGraph;
+
+// The graph calls pass builders make (RenderGraph's, defined with it), so that declaring a pass does not need RenderGraph.h.
+struct BuilderGraphAccess {
+    static ResourceRegistry::RegistryHandle RequestResourceHandle(RenderGraph* graph, Resource* resource, bool allowFailure = false);
+    static std::shared_ptr<IResourceResolver> RequestResolver(RenderGraph* graph, ResourceIdentifier const& id, bool allowFailure = false);
+    static std::shared_ptr<const ResolverDeclarationState> CaptureResolverDeclarationState(RenderGraph* graph, const IResourceResolver& resolver);
+    static std::shared_ptr<const std::vector<ResourceHandleAndRange>> RequestResolverResourceHandles(RenderGraph* graph,
+        const ResolverDeclarationState& state);
+    static void RegisterResolvedResourceAlias(RenderGraph* graph, ResourceIdentifier const& id, std::shared_ptr<Resource> resource);
+    static void AddResource(RenderGraph* graph, std::shared_ptr<Resource> resource);
+    static Resource* Resolve(RenderGraph* graph, ResourceRegistry::RegistryHandle handle);
+    static void AddRenderPass(RenderGraph* graph, std::shared_ptr<RenderPass> pass, RenderPassParameters& resources, std::string name,
+        std::vector<ResolverSnapshot> resolverSnapshots);
+    static void AddComputePass(RenderGraph* graph, std::shared_ptr<ComputePass> pass, ComputePassParameters& resources, std::string name,
+        std::vector<ResolverSnapshot> resolverSnapshots);
+    static void AddCopyPass(RenderGraph* graph, std::shared_ptr<CopyPass> pass, CopyPassParameters& resources, std::string name,
+        std::vector<ResolverSnapshot> resolverSnapshots);
+};
+
 std::vector<ResourceHandleAndRange> expandToRanges(ResourceIdentifierAndRange const& rir, RenderGraph* graph);
 
 // If we have an initializer_list of ResourceIdentifierAndRange,
@@ -258,7 +281,7 @@ processResourceArguments(const ResourcePtrAndRange& rar,
     RenderGraph* graph)
 {
 	auto range = rar.range;
-    auto handle = graph->RequestResourceHandle(rar.resource.get());
+    auto handle = BuilderGraphAccess::RequestResourceHandle(graph, rar.resource.get());
     return { ResourceHandleAndRange{ handle, range } };
 }
 
@@ -278,9 +301,9 @@ inline std::vector<ResourceHandleAndRange>
 processResourceArguments(const ResourceResolverAndRange& rrr,
     RenderGraph* graph)
 {
-    const auto captured = graph->CaptureResolverDeclarationState(*rrr.pResolver);
+    const auto captured = BuilderGraphAccess::CaptureResolverDeclarationState(graph, *rrr.pResolver);
     if (captured && captured->resources) {
-        const auto handles = graph->RequestResolverResourceHandles(*captured);
+        const auto handles = BuilderGraphAccess::RequestResolverResourceHandles(graph, *captured);
         std::vector<ResourceHandleAndRange> out;
         out.reserve(handles->size());
         for (const auto& handle : *handles) out.emplace_back(handle.resource, rrr.range);
@@ -291,7 +314,7 @@ processResourceArguments(const ResourceResolverAndRange& rrr,
     out.reserve(resources.size());
     for (const auto& resource : resources) {
         out.push_back(ResourceHandleAndRange{
-            graph->RequestResourceHandle(resource.get()), rrr.range });
+            BuilderGraphAccess::RequestResourceHandle(graph, resource.get()), rrr.range });
     }
     return out;
 }
@@ -313,21 +336,21 @@ processResourceArguments(const ResourceIdentifierAndRange& rir,
     RenderGraph* graph)
 {
     // This could be a resolver- ask the graph.
-    if (auto resolver = graph->RequestResolver(rir.identifier, true)) {
-        const auto captured = graph->CaptureResolverDeclarationState(*resolver);
+    if (auto resolver = BuilderGraphAccess::RequestResolver(graph, rir.identifier, true)) {
+        const auto captured = BuilderGraphAccess::CaptureResolverDeclarationState(graph, *resolver);
         auto resources = captured && captured->resources ? *captured->resources : resolver->Resolve();
         // Dynamic-wrapper identifiers are explicit aliases whose concrete resource
         // may change between retained declaration revisions.  Ordinary resolvers
         // must not replace their symbolic entry: some of them intentionally expose
         // a different declaration shape (such as a resource set).
         if (resources.size() == 1u && resources.front()) {
-            graph->RegisterResolvedResourceAlias(rir.identifier, resources.front());
+            BuilderGraphAccess::RegisterResolvedResourceAlias(graph, rir.identifier, resources.front());
         }
         std::vector<ResourceHandleAndRange> resolvedRanges;
         resolvedRanges.reserve(resources.size());
         for (const auto& resource : resources) {
             resolvedRanges.push_back(ResourceHandleAndRange{
-                graph->RequestResourceHandle(resource.get()), rir.range });
+                BuilderGraphAccess::RequestResourceHandle(graph, resource.get()), rir.range });
         }
         return resolvedRanges;
     }
@@ -513,12 +536,12 @@ namespace detail
         }
 
         inline bool IsResolverBackedIdentifier(RenderGraph* graph, const ResourceIdentifier& id) {
-		return graph != nullptr && graph->RequestResolver(id, true) != nullptr;
+		return graph != nullptr && BuilderGraphAccess::RequestResolver(graph, id, true) != nullptr;
         }
 
         inline void TrackDefaultDescriptorIdentifier(RenderGraph* graph, std::vector<AutoDescriptorRegistration>& registrations, const ResourceIdentifier& id, DescriptorType type) {
             if (IsResolverBackedIdentifier(graph, id)) {
-				auto resolver = graph->RequestResolver(id, true);
+				auto resolver = BuilderGraphAccess::RequestResolver(graph, id, true);
 				if (resolver) {
 					DescriptorAccessor accessor{};
 					accessor.type = type;
@@ -641,7 +664,7 @@ namespace detail
     inline void TrackResolverDeclaration(RenderGraph* graph, std::vector<ResolverSnapshot>& snapshots,
         const T& value, ResourceState required) {
         auto capture = [&](const IResourceResolver& resolver, RangeSpec range) {
-            const auto state = graph->CaptureResolverDeclarationState(resolver);
+            const auto state = BuilderGraphAccess::CaptureResolverDeclarationState(graph, resolver);
             if (state) TrackResolverSnapshot(snapshots, resolver, state,
                 ResolverSnapshot::RequirementTemplate{range, required});
         };
@@ -649,11 +672,11 @@ namespace detail
         if constexpr (std::is_same_v<Value, ResourceResolverAndRange>) {
             capture(*value.pResolver, value.range);
         } else if constexpr (std::is_same_v<Value, ResourceIdentifierAndRange>) {
-            if (auto resolver = graph->RequestResolver(value.identifier, true)) capture(*resolver, value.range);
+            if (auto resolver = BuilderGraphAccess::RequestResolver(graph, value.identifier, true)) capture(*resolver, value.range);
         } else if constexpr (std::is_same_v<Value, ResourceIdentifier>) {
-            if (auto resolver = graph->RequestResolver(value, true)) capture(*resolver, {});
+            if (auto resolver = BuilderGraphAccess::RequestResolver(graph, value, true)) capture(*resolver, {});
         } else if constexpr (StringLike<T>) {
-            if (auto resolver = graph->RequestResolver(ResourceIdentifier{std::string_view{value}}, true)) capture(*resolver, {});
+            if (auto resolver = BuilderGraphAccess::RequestResolver(graph, ResourceIdentifier{std::string_view{value}}, true)) capture(*resolver, {});
         }
     }
 
@@ -665,8 +688,8 @@ namespace detail
         if (!graph) {
             return;
         }
-        if (auto resolver = graph->RequestResolver(id, true)) {
-            const auto state = graph->CaptureResolverDeclarationState(*resolver);
+        if (auto resolver = BuilderGraphAccess::RequestResolver(graph, id, true)) {
+            const auto state = BuilderGraphAccess::CaptureResolverDeclarationState(graph, *resolver);
             if (state) TrackResolverSnapshot(resolverSnapshots, *resolver, state);
         }
     }
@@ -901,13 +924,13 @@ private:
         const auto ranges = processResourceArguments(resource, graph);
         std::shared_ptr<const void> resolverIdentity;
         const auto captureResolver = [&](const IResourceResolver* resolver) {
-            if (resolver) if (const auto state = graph->CaptureResolverDeclarationState(*resolver); state && state->tracked)
+            if (resolver) if (const auto state = BuilderGraphAccess::CaptureResolverDeclarationState(graph, *resolver); state && state->tracked)
                 resolverIdentity = state->dependencyIdentity;
         };
         if constexpr (std::same_as<T, ResourceResolverAndRange>) captureResolver(resource.pResolver.get());
-        else if constexpr (std::same_as<T, ResourceIdentifierAndRange>) captureResolver(graph->RequestResolver(resource.identifier, true).get());
-        else if constexpr (std::same_as<T, ResourceIdentifier>) captureResolver(graph->RequestResolver(resource, true).get());
-        else if constexpr (detail::StringLike<T>) captureResolver(graph->RequestResolver(ResourceIdentifier{std::string_view{resource}}, true).get());
+        else if constexpr (std::same_as<T, ResourceIdentifierAndRange>) captureResolver(BuilderGraphAccess::RequestResolver(graph, resource.identifier, true).get());
+        else if constexpr (std::same_as<T, ResourceIdentifier>) captureResolver(BuilderGraphAccess::RequestResolver(graph, resource, true).get());
+        else if constexpr (detail::StringLike<T>) captureResolver(BuilderGraphAccess::RequestResolver(graph, ResourceIdentifier{std::string_view{resource}}, true).get());
         if (resolverIdentity) {
             auto& groups = resourceUses_->resolverViews;
             auto found = std::find_if(groups.begin(), groups.end(), [&](const auto& group) { return group.identity == resolverIdentity; });
@@ -945,7 +968,7 @@ private:
         }
         DeclaredResourceUse result;
         for (const auto& range : ranges) {
-            auto* concrete = graph->_registry.Resolve(range.resource);
+            auto* concrete = BuilderGraphAccess::Resolve(graph, range.resource);
             if (!concrete) throw std::invalid_argument("Resource declaration did not resolve");
             const auto validBound = [](Bound bound, uint32_t count) {
                 return bound.type == BoundType::All || bound.value < count;
@@ -1072,11 +1095,11 @@ public:
     }
 
     RenderPassBuilder& LegacyInterop(const IResourceResolver& resolver) & {
-        const auto state = graph->CaptureResolverDeclarationState(resolver);
+        const auto state = BuilderGraphAccess::CaptureResolverDeclarationState(graph, resolver);
         if (state && state->resources) addLegacyInterop(ResourceResolverAndRange{resolver});
         else {
             const auto resources = resolver.Resolve();
-            for (const auto& resource : resources) graph->AddResource(resource);
+            for (const auto& resource : resources) BuilderGraphAccess::AddResource(graph, resource);
             addLegacyInterop(resources);
         }
         return *this;
@@ -1196,7 +1219,7 @@ private:
             auto& registrations = view.kind == BindlessViewKind::ShaderResource ? params.autoDescriptorShaderResources
                 : view.kind == BindlessViewKind::UnorderedAccess ? params.autoDescriptorUnorderedAccessViews : params.autoDescriptorConstantBuffers;
             detail::AppendUniqueDescriptorRegistration(registrations,
-                AutoDescriptorRegistration{identifier, accessor, {}, graph->RequestResolver(identifier, true)});
+                AutoDescriptorRegistration{identifier, accessor, {}, BuilderGraphAccess::RequestResolver(graph, identifier, true)});
         }
     }
     void RegisterUseViews(const ResourceIdentifierAndRange& resource, const ResourceUseSpecification& specification) {
@@ -1266,7 +1289,7 @@ private:
         RestoreAuthorState(std::move(authorState));
 
         {
-            const RenderGraph::ResolverCaptureScope captures;
+            const ResolverCaptureScope captures;
             pass->DeclareResourceUsages(this);
         }
 
@@ -1296,7 +1319,7 @@ private:
 		if (params.preferredQueueKind == QueueKind::Copy && (hasGraphicsOnlyOperations || hasShaderOperations))
 			throw std::invalid_argument("Pass declares non-copy operations but prefers the copy queue");
 
-        graph->AddRenderPass(pass, params, passName, TakeResolverSnapshots());
+        BuilderGraphAccess::AddRenderPass(graph, pass, params, passName, TakeResolverSnapshots());
     }
 
     void Reset() override {
@@ -1818,12 +1841,12 @@ public:
 private:
     template<typename AddCallable>
     ComputePassBuilder& DeclareResolverAccess(const IResourceResolver& resolver, AddCallable&& addCallable) & {
-        const auto state = graph->CaptureResolverDeclarationState(resolver);
+        const auto state = BuilderGraphAccess::CaptureResolverDeclarationState(graph, resolver);
         if (state && state->resources) {
             addCallable(ResourceResolverAndRange{resolver});
         } else {
             const auto resources = resolver.Resolve();
-            for (const auto& resource : resources) graph->AddResource(resource);
+            for (const auto& resource : resources) BuilderGraphAccess::AddResource(graph, resource);
             addCallable(resources);
         }
         return *this;
@@ -1831,12 +1854,12 @@ private:
 
     template<typename AddCallable>
     ComputePassBuilder DeclareResolverAccess(const IResourceResolver& resolver, AddCallable&& addCallable) && {
-        const auto state = graph->CaptureResolverDeclarationState(resolver);
+        const auto state = BuilderGraphAccess::CaptureResolverDeclarationState(graph, resolver);
         if (state && state->resources) {
             addCallable(ResourceResolverAndRange{resolver});
         } else {
             const auto resources = resolver.Resolve();
-            for (const auto& resource : resources) graph->AddResource(resource);
+            for (const auto& resource : resources) BuilderGraphAccess::AddResource(graph, resource);
             addCallable(resources);
         }
         return std::move(*this);
@@ -2024,7 +2047,7 @@ private:
         RestoreAuthorState(std::move(authorState));
 
         {
-            const RenderGraph::ResolverCaptureScope captures;
+            const ResolverCaptureScope captures;
             pass->DeclareResourceUsages(this);
         }
 
@@ -2035,7 +2058,7 @@ private:
 		params.backendAffinity = m_backendAffinity;
         params.staticResourceRequirements = GatherResourceRequirements();
 
-        graph->AddComputePass(pass, params, passName, TakeResolverSnapshots());
+        BuilderGraphAccess::AddComputePass(graph, pass, params, passName, TakeResolverSnapshots());
     }
 
     void Reset() override {
@@ -2297,12 +2320,12 @@ public:
 private:
     template<typename AddCallable>
     CopyPassBuilder& DeclareResolverAccess(const IResourceResolver& resolver, AddCallable&& addCallable) & {
-        const auto state = graph->CaptureResolverDeclarationState(resolver);
+        const auto state = BuilderGraphAccess::CaptureResolverDeclarationState(graph, resolver);
         if (state && state->resources) {
             addCallable(ResourceResolverAndRange{resolver});
         } else {
             const auto resources = resolver.Resolve();
-            for (const auto& resource : resources) graph->AddResource(resource);
+            for (const auto& resource : resources) BuilderGraphAccess::AddResource(graph, resource);
             addCallable(resources);
         }
         return *this;
@@ -2310,12 +2333,12 @@ private:
 
     template<typename AddCallable>
     CopyPassBuilder DeclareResolverAccess(const IResourceResolver& resolver, AddCallable&& addCallable) && {
-        const auto state = graph->CaptureResolverDeclarationState(resolver);
+        const auto state = BuilderGraphAccess::CaptureResolverDeclarationState(graph, resolver);
         if (state && state->resources) {
             addCallable(ResourceResolverAndRange{resolver});
         } else {
             const auto resources = resolver.Resolve();
-            for (const auto& resource : resources) graph->AddResource(resource);
+            for (const auto& resource : resources) BuilderGraphAccess::AddResource(graph, resource);
             addCallable(resources);
         }
         return std::move(*this);
@@ -2466,7 +2489,7 @@ private:
         RestoreAuthorState(std::move(authorState));
 
         {
-            const RenderGraph::ResolverCaptureScope captures;
+            const ResolverCaptureScope captures;
             pass->DeclareResourceUsages(this);
         }
 
@@ -2477,7 +2500,7 @@ private:
 		params.backendAffinity = m_backendAffinity;
         params.staticResourceRequirements = GatherResourceRequirements();
 
-        graph->AddCopyPass(pass, params, passName, TakeResolverSnapshots());
+        BuilderGraphAccess::AddCopyPass(graph, pass, params, passName, TakeResolverSnapshots());
     }
 
     void Reset() override {
@@ -2564,54 +2587,5 @@ private:
 
     friend class RenderGraph;
 };
-
-template<typename PassT, org::PassInputs InputsT, typename... StableCtorArgs>
-ComputePassBuilder& RenderGraph::BuildComputePass(std::string const& name, InputsT&& inputs, StableCtorArgs&&... ctorArgs) {
-    static_assert(DerivedComputePass<PassT>);
-    auto& builder = GetOrCreateComputePassBuilder(name);
-    builder.template Instantiate<PassT>(std::forward<InputsT>(inputs), std::forward<StableCtorArgs>(ctorArgs)...);
-    return builder;
-}
-
-template<typename PassT, typename... StableCtorArgs>
-ComputePassBuilder& RenderGraph::BuildComputePass(std::string const& name, StableCtorArgs&&... ctorArgs) {
-    static_assert(DerivedComputePass<PassT>);
-    auto& builder = GetOrCreateComputePassBuilder(name);
-    builder.template Instantiate<PassT>(std::forward<StableCtorArgs>(ctorArgs)...);
-    return builder;
-}
-
-template<typename PassT, org::PassInputs InputsT, typename... StableCtorArgs>
-RenderPassBuilder& RenderGraph::BuildRenderPass(std::string const& name, InputsT&& inputs, StableCtorArgs&&... ctorArgs) {
-    static_assert(DerivedRenderPass<PassT>);
-    auto& builder = GetOrCreateRenderPassBuilder(name);
-    builder.template Instantiate<PassT>(std::forward<InputsT>(inputs), std::forward<StableCtorArgs>(ctorArgs)...);
-    return builder;
-}
-
-template<typename PassT, typename... StableCtorArgs>
-RenderPassBuilder& RenderGraph::BuildRenderPass(std::string const& name, StableCtorArgs&&... ctorArgs) {
-    static_assert(DerivedRenderPass<PassT>);
-    auto& builder = GetOrCreateRenderPassBuilder(name);
-    builder.template Instantiate<PassT>(std::forward<StableCtorArgs>(ctorArgs)...);
-    return builder;
-}
-
-template<typename PassT, org::PassInputs InputsT, typename... StableCtorArgs>
-CopyPassBuilder& RenderGraph::BuildCopyPass(std::string const& name, InputsT&& inputs, StableCtorArgs&&... ctorArgs) {
-    static_assert(DerivedCopyPass<PassT>);
-    auto& builder = GetOrCreateCopyPassBuilder(name);
-    builder.template Instantiate<PassT>(std::forward<InputsT>(inputs), std::forward<StableCtorArgs>(ctorArgs)...);
-    return builder;
-}
-
-template<typename PassT, typename... StableCtorArgs>
-CopyPassBuilder& RenderGraph::BuildCopyPass(std::string const& name, StableCtorArgs&&... ctorArgs) {
-    static_assert(DerivedCopyPass<PassT>);
-    auto& builder = GetOrCreateCopyPassBuilder(name);
-    builder.template Instantiate<PassT>(std::forward<StableCtorArgs>(ctorArgs)...);
-    return builder;
-}
-
 
 } // namespace org

@@ -2,7 +2,7 @@
 #include <Resources/ExternalBufferResource.h>
 #include <Resources/ExternalTextureResource.h>
 #include <Render/Runtime/RuntimeDevice.h>
-#include <Render/PassBuilders.h>
+#include <Render/RenderGraph/RenderGraph.h>
 #include <RenderPasses/Base/TypedRenderGraphPass.h>
 #include <Render/RenderGraph/ExperimentalRhiExecution.h>
 #include "../src/Render/RenderGraph/FrameRecording.h"

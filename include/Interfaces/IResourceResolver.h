@@ -111,7 +111,7 @@ struct ResourceResolverAndRange {
 /// tracked independently so they cannot invalidate the structural declaration.
 struct ResolverSnapshot {
     std::unique_ptr<IResourceResolver> resolver;
-    // The resolver's state as the declaration captured it (RenderGraph::ResolverCaptureScope): the declaration's uses,
+    // The resolver's state as the declaration captured it (ResolverCaptureScope): the declaration's uses,
     // its views and the group it lowers to all describe this one resource set.
     std::shared_ptr<const ResolverDeclarationState> state;
     struct RequirementTemplate {
@@ -147,5 +147,20 @@ struct ResolverSnapshot {
     }
 };
 
+
+// Open for the length of one pass declaration, on the declaring thread: every use, view and snapshot the declaration takes of
+// a resolver (RenderGraph::CaptureResolverDeclarationState) then describes one resource set, even when the resolver publishes on
+// another thread meanwhile.
+class ResolverCaptureScope {
+public:
+    ResolverCaptureScope();
+    ~ResolverCaptureScope();
+    ResolverCaptureScope(const ResolverCaptureScope&) = delete;
+    ResolverCaptureScope& operator=(const ResolverCaptureScope&) = delete;
+private:
+    friend class RenderGraph;
+    std::vector<std::shared_ptr<const ResolverDeclarationState>> m_captures;
+    ResolverCaptureScope* m_previous = nullptr;
+};
 
 } // namespace org

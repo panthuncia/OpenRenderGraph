@@ -25,7 +25,7 @@ struct PassParameters;
 // declaration and is not encoded by the pass object's C++ type.
 class RenderGraphPass : public IResourceProvider, public RenderGraphPassBase {
 public:
-    virtual ~RenderGraphPass() = default;
+    ~RenderGraphPass() override;
     std::shared_ptr<const ResourceUseLayout> ResourceUses() const { return m_resourceUses; }
     void SetResourceUses(std::shared_ptr<const ResourceUseLayout> uses) { m_resourceUses = std::move(uses); }
 

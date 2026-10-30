@@ -12,8 +12,17 @@
 #include "Resources/AliasingPlacement.h"
 
 namespace org {
-enum class AutoAliasMode : uint8_t;
-enum class AutoAliasPackingStrategy : uint8_t;
+enum class AutoAliasMode : uint8_t {
+	Off = 0,
+	Conservative = 1,
+	Balanced = 2,
+	Aggressive = 3
+};
+
+enum class AutoAliasPackingStrategy : uint8_t {
+	GreedySweepLine = 0,
+	BranchAndBound = 1,
+};
 class RenderGraph;
 struct TextureDescription;
 }
