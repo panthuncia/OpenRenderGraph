@@ -382,6 +382,32 @@ This plan is based on a survey of BasicRenderer, ORG checkout at `org-rebuild`, 
 5. **Open item.** `MaterialManager::AppendTextureDisplayRequirements` has no caller: display gates may not yet gate
    renderables. Check this before relying on them.
 
+**Progress (2026-10-30).**
+
+*Step 1 is done.*
+- `br::render::TextureJobGraph` runs the mip, mip-handoff and BC7 passes.
+- `TextureFactory::WhenMipsReady` reports a texture's handoff completing on the GPU.
+- `BR_TEXTURE_JOB_SELF_TEST=1` mips a checkerboard through the job graph and checks its 1x1 mip by readback. It passes.
+
+*Bugs the self-test found.*
+- **Waits on another graph's timeline.** A readmitted admission can wait on another graph's timeline, which its packets do
+  not bind. Fixed: `Runtime::TimelineHandleOf` resolves the identity, and `ExecutionBatchTimeline::extraTimelines` carries
+  the binding.
+- **Job constants uploaded too late.** The upload policy flushed the job's constants through the frame graph's upload
+  service, after the job graph's dispatch. Fixed: `BufferBase::PinUploadService` plus an Immediate tag on the job's buffers.
+  Any other buffer a job graph writes needs the same treatment.
+
+*Step 2, readiness gating: open.* Only non-participating textures get GPU mips: Assimp-loaded material textures (BasicRenderer
+standalone) and HDRI environments. The participating NIF material textures are mipped on the CPU and already gated through
+`TextureBinding`.
+- **Materials.** `MaterialManager` reads a non-participating texture's published image once, when it builds the material.
+  Deferring publication therefore needs those textures to go through the `TextureBinding` artifact as participating ones do,
+  with the mips-ready completion as the binding's GPU work. Otherwise a material built before its textures are ready keeps
+  the constant fallback.
+- **Environment.** `EnvironmentManager::SetFromHDRI` enqueues the HDRI's conversion at once. It has to wait for the HDRI's
+  readiness instead, which is part of step 4.
+- **Testing.** Neither path runs in the SARP benchmark; testing them needs a BasicRenderer standalone scene.
+
 ## API sketch
 
 ```cpp
