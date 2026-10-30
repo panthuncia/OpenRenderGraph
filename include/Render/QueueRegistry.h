@@ -76,6 +76,7 @@ public:
 	rhi::Device GetDevice(QueueSlotIndex i) const noexcept { return m_slots[ToUnderlying(i)].device; }
 	QueueSlot      GetSlot(QueueSlotIndex i)      const noexcept { return { m_slots[ToUnderlying(i)].kind, m_slots[ToUnderlying(i)].instance, m_slots[ToUnderlying(i)].backendInstance, m_slots[ToUnderlying(i)].backend }; }
 	rhi::Queue     GetQueue(QueueSlotIndex i)     const noexcept { return m_slots[ToUnderlying(i)].queue; }
+	bool           OwnsQueue(QueueSlotIndex i)    const noexcept { return m_slots[ToUnderlying(i)].ownsQueue; }
 	QueueAutoAssignmentPolicy GetAutoAssignmentPolicy(QueueSlotIndex i) const noexcept { return m_slots[ToUnderlying(i)].autoAssignmentPolicy; }
 	bool IsAutoAssignable(QueueSlotIndex i) const noexcept { return GetAutoAssignmentPolicy(i) == QueueAutoAssignmentPolicy::AllowAutomaticScheduling; }
 	rhi::Timeline& GetFence(QueueSlotIndex i)           noexcept { return m_slots[ToUnderlying(i)].fence->Get(); }

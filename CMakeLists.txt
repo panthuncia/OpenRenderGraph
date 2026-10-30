@@ -100,6 +100,7 @@ add_library(OpenRenderGraph STATIC
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Host/GraphHost.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Telemetry/NvPerfCapture.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/include/OpenRenderGraph/GraphHost.h"
+	"${CMAKE_CURRENT_SOURCE_DIR}/include/OpenRenderGraph/Runtime.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/DescriptorHeap.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/OwnedDescriptorBinding.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/BindingTable.cpp"
@@ -136,6 +137,7 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/Runtime/ThreadPoolTaskService.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/DefaultRenderGraphSettingsService.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/RuntimeDevice.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/Runtime.cpp"
     
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PassBuilders.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/FeatureDomainRegistry.cpp"
@@ -377,7 +379,7 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
     target_compile_definitions(OpenRenderGraphAsyncCompileTests PRIVATE NOMINMAX)
     add_test(NAME OpenRenderGraphAsyncCompileTests COMMAND OpenRenderGraphAsyncCompileTests)
     if(_org_d3d12_tests)
-    add_executable(OpenRenderGraphExternalResourceTests tests/ExternalResourceTests.cpp tests/FrameRetirementTests.cpp tests/BindingOwnershipTests.cpp tests/ProgramVersionTests.cpp tests/ReadbackCaptureTests.cpp)
+    add_executable(OpenRenderGraphExternalResourceTests tests/ExternalResourceTests.cpp tests/RuntimeTests.cpp tests/FrameRetirementTests.cpp tests/BindingOwnershipTests.cpp tests/ProgramVersionTests.cpp tests/ReadbackCaptureTests.cpp)
     target_include_directories(OpenRenderGraphExternalResourceTests PRIVATE src/include)
     target_compile_definitions(OpenRenderGraphExternalResourceTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
     if(WIN32 AND BASICRHI_ENABLE_STREAMLINE)
@@ -391,7 +393,7 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
         endif()
     endif()
     if(MSVC)
-        target_compile_options(OpenRenderGraphExternalResourceTests PRIVATE /utf-8)
+        target_compile_options(OpenRenderGraphExternalResourceTests PRIVATE /utf-8 /bigobj)
     endif()
     target_link_libraries(OpenRenderGraphExternalResourceTests PRIVATE OpenRenderGraph BasicRHI::BasicRHI d3d12 dxgi d3dcompiler)
     if(WIN32 AND TARGET Pix::headers)

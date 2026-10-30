@@ -1,6 +1,17 @@
 # Job graphs: ORG without a main graph
 
-> **Status (2026-10-30): design, Phase 0.** This document describes the target architecture and the migration plan. It
+> **Status (2026-10-30): Phase 1 implemented (uncommitted).**
+> - `org::Runtime` (`OpenRenderGraph/Runtime.h`) owns device initialization, the services, the settings' slot count and the
+>   default task service; `RenderGraph` and `GraphHost` take it and no longer initialize, reset or shut down shared state.
+> - Retirement is by submission frontier. BasicRHI's `Queue::Progress()` is a timeline that every submission on the queue
+>   signals; `DeletionManager` and descriptor releases wait for every queue's progress as of their release. This replaces the
+>   frame-count rotation.
+> - Still per graph or frame-indexed, for later phases: upload pages (single consumer), statistics query ranges, the
+>   ledgers.
+> - Verified with ORG tests (Vulkan and D3D12, including `RuntimeTests.cpp`), the SARP build, ctest and a benchmark.
+>   Community Shaders builds; its in-game smoke test is still owed.
+>
+> **Design, Phase 0.** This document describes the target architecture and the migration plan. It
 > supersedes the service-ownership items of `rebuild-plan.md` Phase 7 (per-runtime services) and replaces
 > `persistent-epochs.md` once the migration completes.
 

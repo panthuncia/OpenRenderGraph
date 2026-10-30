@@ -44,6 +44,7 @@
 
 namespace org {
 
+class Runtime;
 class Resource;
 class RenderPassBuilder;
 class ExternalEpochExecution;
@@ -147,12 +148,13 @@ public:
 		bool valid = false;
 	};
 
-	RenderGraph(rhi::Device device, rhi::Backend primaryBackend = rhi::Backend::Null);
+	// A graph on `runtime`'s device, using its services (until replaced with the Set*Service calls).
+	explicit RenderGraph(std::shared_ptr<Runtime> runtime);
+	Runtime& GetRuntime() const noexcept { return *m_runtime; }
 	DeviceInstanceId RegisterBackendDevice(rhi::Backend backend, rhi::Device device);
 	const DeviceRegistry& GetDeviceRegistry() const noexcept { return m_backendDevices; }
 	DeviceInstanceId GetPrimaryDeviceInstance() const noexcept { return m_backendDevices.PrimaryId(); }
 	~RenderGraph();
-	static void ShutdownRuntime();
 	using AutoAliasReasonCount = org::alias::AutoAliasReasonCount;
 	using AutoAliasExcludedResourceDebug = org::alias::AutoAliasExcludedResourceDebug;
 	using AutoAliasPoolRangeDebug = org::alias::AutoAliasPoolRangeDebug;
@@ -390,6 +392,8 @@ public:
 	void StopFrameProduction();
 	// Requires GPU idle. Releases frame ownership after CPU production stopped.
 	void ShutdownTaskWorkers();
+	// The runtime's services for those this graph has none of (never set, or dropped by a rebuild).
+	void UseRuntimeServices();
 	void ClearExtensions();
 	void RegisterExtension(std::unique_ptr<IRenderGraphExtension> ext, std::optional<std::string_view> id = std::nullopt);
 	std::optional<PresentDependency> GetLastPresentDependency() const noexcept { return m_lastPresentDependency; }
@@ -417,7 +421,6 @@ public:
 	const org::runtime::IRenderGraphSettingsService* GetRenderGraphSettingsService() const { return m_renderGraphSettingsService.get(); }
 	void SetTaskService(std::shared_ptr<org::runtime::ITaskService> service) {
 		m_taskService = std::move(service);
-		org::runtime::SetDefaultTaskService(m_taskService);
 	}
 	org::runtime::ITaskService* GetTaskService() { return m_taskService.get(); }
 	const org::runtime::ITaskService* GetTaskService() const { return m_taskService.get(); }
@@ -665,6 +668,7 @@ private:
 
 	std::vector<AnyPassAndResources> m_masterPassList;
 	std::vector<std::pair<std::string, std::string>> m_structuralExplicitAfterByName;
+	std::shared_ptr<Runtime> m_runtime;
 	DeviceRegistry m_backendDevices;
 	std::array<uint8_t, static_cast<size_t>(QueueKind::Count)> m_minAutomaticSchedulingQueuesByKind = { 1, 1, 1 };
 	std::unordered_map<std::string, std::shared_ptr<RenderPass>> renderPassesByName;
@@ -686,8 +690,6 @@ private:
 	uint64_t m_frameWaitValue = 0;
 	std::optional<PresentDependency> m_lastPresentDependency;
 
-	rhi::TimelinePtr m_readbackFence;
-	rhi::TimelinePtr m_copyReadbackFence;
 
 	void EnsureMinimumAutomaticSchedulingQueues();
 

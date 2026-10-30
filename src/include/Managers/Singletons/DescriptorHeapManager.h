@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -11,6 +12,7 @@
 
 #include "Render/DescriptorHeap.h"
 #include "Render/Runtime/ResourceCleanupQueue.h"
+#include "Render/Runtime/SubmissionFrontier.h"
 #include "Render/QueueKind.h"
 #include "Render/Runtime/DescriptorServiceTypes.h"
 #include "Resources/GPUBacking/GpuBufferBacking.h"
@@ -76,6 +78,9 @@ public:
 		uint64_t incompleteTimelineCount = 0;
 		std::vector<uint64_t> resourceIDs;
 	};
+	// The frontier every release waits for (the runtime's), with the points PublishQueueFenceSnapshot adds (work submitted
+	// outside the runtime's queues). Called under the descriptor mutation lock.
+	void SetFrontier(std::function<runtime::SubmissionFrontier()> frontier, runtime::PointReached reached);
 	void PublishQueueFenceSnapshot(std::vector<QueueFenceSnapshotPoint> fenceSnapshot);
 	std::vector<QueueFenceSnapshotPoint> GetQueueFenceSnapshot() const;
 	void ProcessDeferredReleases(uint8_t frameIndex);
@@ -153,6 +158,9 @@ private:
 	std::vector<DeferredRelease> m_deferredReleases;
 	std::unordered_set<const Resource*> m_deferredResourcePointers;
 	std::vector<QueueFenceSnapshotPoint> m_latestQueueFenceSnapshot;
+	std::function<runtime::SubmissionFrontier()> m_frontier;
+	runtime::PointReached m_reached;
+	std::vector<QueueFenceSnapshotPoint> ReleaseFencesUnlocked() const;
 	mutable std::mutex m_descriptorMutationMutex;
 };
 

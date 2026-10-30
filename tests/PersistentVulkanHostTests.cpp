@@ -470,8 +470,9 @@ static int Run(int argc, char** argv) {
 		} else {
 		// The host registers the runtime device, owns the task service and upload
 		// pass, and drives persistent execution with the external queue boundary.
-		org::GraphHost host({.device = device.Get(), .backend = rhi::Backend::Vulkan,
-			.tasks = std::make_shared<org::runtime::ThreadPoolTaskService>(2),
+		auto runtime = org::Runtime::Create({.device = device.Get(), .backend = rhi::Backend::Vulkan,
+			.tasks = std::make_shared<org::runtime::ThreadPoolTaskService>(2)});
+		org::GraphHost host({.runtime = runtime,
 			.queueBoundary = {.entry = true, .exit = true}, .epochOrder = {0}, .closedExecutions = async, .reuseRecordings = reuse || revision});
 		{
 			auto program = CreateProgram(device.Get());

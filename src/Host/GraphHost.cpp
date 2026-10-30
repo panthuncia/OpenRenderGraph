@@ -277,22 +277,15 @@ void GraphHost::Build(RenderGraph& graph, const std::function<void(RenderGraph&)
 
 GraphHost::GraphHost(Desc desc) : m_desc(std::move(desc)), m_recordingQueue(std::make_unique<RecordingQueue>()) {
 	m_queueScopedUploads.store(m_desc.queueScopedUploads, std::memory_order_relaxed);
-	if (!m_desc.device) throw std::invalid_argument("GraphHost requires a device");
-	if (m_desc.backend == rhi::Backend::Null) throw std::invalid_argument("GraphHost requires a device backend");
-	if (!m_desc.tasks) m_desc.tasks = std::make_shared<runtime::ThreadPoolTaskService>();
+	if (!m_desc.runtime) throw std::invalid_argument("GraphHost requires a runtime");
+	m_device = m_desc.runtime->Device();
 	// The frame slots: framesInFlight frames of every epoch in the order, so that adding an epoch keeps the CPU's lead over
 	// the GPU the same rather than shortening it (each slot's next execution waits for its last one).
 	const uint32_t epochs = (std::max)(static_cast<uint32_t>(m_desc.epochOrder.size()), 1u);
 	m_frameSlots = (std::max)(m_desc.framesInFlight, 1u) * epochs;
-	if (m_frameSlots > 255) throw std::invalid_argument("GraphHost: more than 255 frame slots (frames in flight times epochs)");
-	// The host's slot count is the runtime's frames-in-flight: upload pages, statistics query ranges, deletion
-	// and admission capacity all size themselves from the runtime settings, so they follow it.
-	{
-		auto settings = runtime::GetOpenRenderGraphSettings();
-		settings.numFramesInFlight = static_cast<uint8_t>(m_frameSlots);
-		runtime::SetOpenRenderGraphSettings(settings);
-	}
-	runtime::InitializeRuntimeDevice(m_desc.device);
+	// Upload pages, statistics query ranges and admission capacity are sized from the runtime's slots.
+	if (m_frameSlots > m_desc.runtime->Slots())
+		throw std::invalid_argument("GraphHost: more frame slots (frames in flight times epochs) than the runtime has");
 	m_slotCompletions.assign(m_frameSlots, {});
 }
 
@@ -302,7 +295,7 @@ GraphHost::~GraphHost() {
 	m_recordingQueue->accepting.store(false, std::memory_order_release);
 	StopAsync();
 	DestroyGraph();
-	runtime::ShutdownRuntimeDevice();
+	m_desc.runtime->Retire();
 	m_uncertainExecutionOwners.clear();
 	m_uncertainUploadOwners.clear();
 }
@@ -335,7 +328,7 @@ void GraphHost::DestroyGraph() {
 	if (!m_graph) return;
 	m_graph->StopFrameProduction();
 	// Adopted devices wait on their own timelines only (never the whole device).
-	(void)m_desc.device.WaitIdle();
+	(void)m_device.WaitIdle();
 	for (auto& completion : m_slotCompletions) completion = {};
 	m_slotSubmitted.clear();
 	m_externalRetired.clear();
@@ -353,8 +346,7 @@ void GraphHost::SetGpuPassRangeCallbacks(RenderGraph::GpuPassRangeBegin begin, R
 void GraphHost::Build() {
 	BT_ZONE_SCOPE("ORG.Host.Build");
 	DestroyGraph();
-	auto graph = std::make_unique<RenderGraph>(m_desc.device, m_desc.backend);
-	graph->SetTaskService(m_desc.tasks);
+	auto graph = std::make_unique<RenderGraph>(m_desc.runtime);
 	graph->RegisterExtension(std::make_unique<HostUploadExtension>(graph->GetUploadService()), "org.host.io");
 	for (const auto& entry : m_extensions)
 		if (auto extension = entry.factory()) graph->RegisterExtension(std::move(extension), entry.id);
@@ -442,7 +434,7 @@ void GraphHost::ExecuteFrame(const IHostExecutionData* hostData, const FrameCall
 		// Nothing else completes a frame's statistics on this path: without it the pass timestamps were
 		// written and resolved every frame and never read, and their pending resolves only grew.
 		if (auto* stats = m_graph->GetStatisticsService()) {
-			rhi::Queue queue = m_desc.device.GetQueue(rhi::QueueKind::Graphics);
+			rhi::Queue queue = m_device.GetQueue(rhi::QueueKind::Graphics);
 			stats->OnFrameComplete(slot, queue);
 			if (m_completedFrame) m_completedFrame(completion.frameNumber, *stats);
 		}
@@ -450,7 +442,7 @@ void GraphHost::ExecuteFrame(const IHostExecutionData* hostData, const FrameCall
 	lap(m_lastTimings.waitUs);
 	// A slot an external client's work still uses (NoteExternalSlotUse) keeps its upload pages for a later release.
 	if (auto* uploads = m_graph->GetUploadService(); uploads && !ExternalSlotInUse(slot)) uploads->ProcessDeferredReleases(static_cast<uint8_t>(slot));
-	DescriptorHeapManager::GetInstance().ProcessDeferredReleases(static_cast<uint8_t>(slot));
+	m_desc.runtime->Retire();
 	lap(m_lastTimings.releaseUs);
 	m_graph->SetPersistentEpoch(epoch);
 	m_graph->SetFrameWaitValue(m_frameWaitValue);
@@ -464,10 +456,10 @@ void GraphHost::ExecuteFrame(const IHostExecutionData* hostData, const FrameCall
 	update.preparationSlot = slot;
 	update.frameFenceValue = m_frameNumber + 1;
 	update.hostData = hostData;
-	m_graph->Update(update, m_desc.device);
+	m_graph->Update(update, m_device);
 	lap(m_lastTimings.updateUs);
 	PassExecutionContext execute{};
-	execute.device = m_desc.device;
+	execute.device = m_device;
 	execute.frameIndex = slot;
 	execute.frameFenceValue = m_frameNumber + 1;
 	execute.hostData = hostData;
@@ -555,7 +547,7 @@ void GraphHost::StartAsync() {
 	if (m_async || m_asyncEpochs.empty() || !m_graph) return;
 	auto async = std::make_unique<Async>();
 	// The host's wake, made once: a requester's Notify may reach it whenever, so no build destroys it.
-	if (!m_completionWake && m_desc.device.CreateCompletionWait(m_completionWake) != rhi::Result::Ok)
+	if (!m_completionWake && m_device.CreateCompletionWait(m_completionWake) != rhi::Result::Ok)
 		throw std::runtime_error("Async epochs require wakeable GPU completion waits");
 	async->completionWake = m_completionWake.get();
 	async->epochs = m_asyncEpochs;
@@ -596,16 +588,16 @@ void GraphHost::StartAsync() {
 	async->graphicsFence = queues.GetFence(graphics).GetHandle();
 	for (uint32_t slot = 0; slot < slotCount; ++slot) {
 		CommandListPair pair;
-		if (!rhi::IsOk(m_desc.device.CreateCommandAllocator(rhi::QueueKind::Graphics, pair.allocator))
-			|| !rhi::IsOk(m_desc.device.CreateCommandList(rhi::QueueKind::Graphics, pair.allocator.Get(), pair.list)))
+		if (!rhi::IsOk(m_device.CreateCommandAllocator(rhi::QueueKind::Graphics, pair.allocator))
+			|| !rhi::IsOk(m_device.CreateCommandList(rhi::QueueKind::Graphics, pair.allocator.Get(), pair.list)))
 			throw std::runtime_error("Async epochs could not create their upload command lists");
 		pair.list->SetName(("ORG ticket uploads #" + std::to_string(slot)).c_str());
 		pair.list->End();
 		async->uploadLists.push_back(std::move(pair));
 		CommandListPair secondary;
 		if (!m_externalEpochs.empty()) {
-			if (!rhi::IsOk(m_desc.device.CreateCommandAllocator(rhi::QueueKind::Graphics, secondary.allocator))
-				|| !rhi::IsOk(m_desc.device.CreateSecondaryCommandList(rhi::QueueKind::Graphics, secondary.allocator.Get(), secondary.list)))
+			if (!rhi::IsOk(m_device.CreateCommandAllocator(rhi::QueueKind::Graphics, secondary.allocator))
+				|| !rhi::IsOk(m_device.CreateSecondaryCommandList(rhi::QueueKind::Graphics, secondary.allocator.Get(), secondary.list)))
 				throw std::runtime_error("External epochs could not create their upload secondary lists");
 			secondary.list->SetName(("ORG external ticket uploads #" + std::to_string(slot)).c_str());
 		}
@@ -620,8 +612,8 @@ void GraphHost::StartAsync() {
 				continue;
 			const auto queueKind = kind == QueueKind::Compute ? rhi::QueueKind::Compute : rhi::QueueKind::Copy;
 			CommandListPair queuePair;
-			if (!rhi::IsOk(m_desc.device.CreateCommandAllocator(queueKind, queuePair.allocator))
-				|| !rhi::IsOk(m_desc.device.CreateCommandList(queueKind, queuePair.allocator.Get(), queuePair.list)))
+			if (!rhi::IsOk(m_device.CreateCommandAllocator(queueKind, queuePair.allocator))
+				|| !rhi::IsOk(m_device.CreateCommandList(queueKind, queuePair.allocator.Get(), queuePair.list)))
 				throw std::runtime_error("Async epochs could not create their queue upload command lists");
 			queuePair.list->SetName(("ORG ticket queue uploads #" + std::to_string(slot) + " q" + std::to_string(index)).c_str());
 			queuePair.list->End();
@@ -831,7 +823,7 @@ void GraphHost::WaitSlot(Async& state, uint32_t slot) {
 		}
 	}
 	if (auto* stats = m_graph->GetStatisticsService()) {
-		rhi::Queue queue = m_desc.device.GetQueue(rhi::QueueKind::Graphics);
+		rhi::Queue queue = m_device.GetQueue(rhi::QueueKind::Graphics);
 		stats->OnFrameComplete(slot, queue);
 		if (m_completedFrame) m_completedFrame(entry.hostFrame, *stats);
 	}
@@ -908,7 +900,7 @@ bool GraphHost::AdvanceRecordingRequests(Async& state) {
 				{
 					Async::Preparation preparation(state);
 					const auto version = state.backingVersion.load(std::memory_order_acquire);
-					auto ticket = m_graph->PreparePersistentTicket(m_desc.device, request.result->epoch, static_cast<uint8_t>(slot), state.hostFrame, version,
+					auto ticket = m_graph->PreparePersistentTicket(m_device, request.result->epoch, static_cast<uint8_t>(slot), state.hostFrame, version,
 						request.hostData);
 					recording = RenderGraph::PersistentTicketRecording(*ticket);
 					// Recorded only: its admission is abandoned, never submitted.
@@ -994,7 +986,7 @@ void GraphHost::PrepareTicket(Async& state, uint32_t epochIndex, int32_t request
 		queueUploads.allocator->Recycle();
 		queueUploads.list->Recycle(queueUploads.allocator.Get());
 	}
-	DescriptorHeapManager::GetInstance().ProcessDeferredReleases(static_cast<uint8_t>(slot));
+	m_desc.runtime->Retire();
 	entry.reserved = true;
 	std::shared_ptr<Async::Ticket> ticket;
 	if (state.revisionDriven[epochIndex]) {
@@ -1009,7 +1001,7 @@ void GraphHost::PrepareTicket(Async& state, uint32_t epochIndex, int32_t request
 		// Clear of the submitting thread's backing changes: the preparation captures every slot's backing.
 		Async::Preparation preparation(state);
 		const auto version = state.backingVersion.load(std::memory_order_acquire);
-		ticket = m_graph->PreparePersistentTicket(m_desc.device, state.epochs[epochIndex], static_cast<uint8_t>(slot), state.hostFrame++, version);
+		ticket = m_graph->PreparePersistentTicket(m_device, state.epochs[epochIndex], static_cast<uint8_t>(slot), state.hostFrame++, version);
 		RenderGraph::SetPersistentTicketHostTag(*ticket, version);
 		// The revisions' recordings still held, as alternatives the submitting thread may take instead (UseEpochRecording).
 		auto& live = state.liveRecordings[epochIndex];
@@ -1274,9 +1266,9 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 	// The host's thread waited for this slot before preparing the ticket: its upload pages are free again. What retires from
 	// the deletion queues goes to the host's thread with the submission: its driver frees take the device's memory locks,
 	// which the render thread must not wait on here.
-	std::shared_ptr<void> retired;
 	if (auto* uploads = m_graph->GetUploadService(); uploads && !ExternalSlotInUse(slot))
-		retired = uploads->ProcessDeferredReleasesRetiringElsewhere(static_cast<uint8_t>(slot));
+		uploads->ProcessDeferredReleases(static_cast<uint8_t>(slot));
+	std::shared_ptr<void> retired = m_desc.runtime->RetireElsewhere();
 	lap(m_lastTimings.releaseUs);
 	if (beforeSubmit) {
 		BT_ZONE_SCOPE("ORG.Host.CommitInputs");
@@ -1384,7 +1376,7 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 		async.queueLists[index] = queueScoped && index < queueUploadLists.size() && queueUploadLists[index].list
 			? queueUploadLists[index].list.Get() : rhi::CommandList{};
 	size_t queueCopies = 0;
-	const bool supported = m_graph->RecordPendingUploads(m_desc.device, commands, static_cast<uint8_t>(slot), keepAlive, recorded, recordedLists,
+	const bool supported = m_graph->RecordPendingUploads(m_device, commands, static_cast<uint8_t>(slot), keepAlive, recorded, recordedLists,
 		queueScoped ? ticket.get() : nullptr, queueScoped ? std::span<rhi::CommandList>(async.queueLists) : std::span<rhi::CommandList>{}, &queueCopies);
 	{
 		BT_ZONE_SCOPE("ORG.Host.CloseUploadList");
@@ -1495,11 +1487,12 @@ void GraphHost::BeginExternalFrameSlot(uint32_t slot) {
 	// the slot is left to the host's next execution taking it, or to the client's next frame at it.
 	auto* uploads = m_graph ? m_graph->GetUploadService() : nullptr;
 	if (!uploads || (m_externalSlot < m_slotSubmitted.size() && !m_slotSubmitted[m_externalSlot].Reached())) return;
+	uploads->ProcessDeferredReleases(static_cast<uint8_t>(m_externalSlot));
 	if (!m_async) {
-		uploads->ProcessDeferredReleases(static_cast<uint8_t>(m_externalSlot));
+		m_desc.runtime->Retire();
 		return;
 	}
-	if (auto retired = uploads->ProcessDeferredReleasesRetiringElsewhere(static_cast<uint8_t>(m_externalSlot))) m_externalRetired.push_back(std::move(retired));
+	if (auto retired = m_desc.runtime->RetireElsewhere()) m_externalRetired.push_back(std::move(retired));
 	// No submission came to take them for a round of slots: they are freed here rather than kept.
 	if (m_externalRetired.size() > m_frameSlots) m_externalRetired.clear();
 }

@@ -1,5 +1,6 @@
 #include "RenderGraphInternal.h"
 #include "Render/Runtime/RuntimeDevice.h"
+#include "OpenRenderGraph/Runtime.h"
 
 namespace org {
 
@@ -197,10 +198,10 @@ bool ResolveFirstMipSlice(ResourceRegistry::RegistryHandle r, RangeSpec range, u
 	return true;
 }
 
-RenderGraph::RenderGraph(rhi::Device device, rhi::Backend primaryBackend)
-	: m_compilerState(std::make_unique<CompilerState>()) {
-	DeviceManager::GetInstance().Initialize(device);
-	m_backendDevices.RegisterPrimary(primaryBackend, device);
+RenderGraph::RenderGraph(std::shared_ptr<Runtime> runtime)
+	: m_compilerState(std::make_unique<CompilerState>()), m_runtime(std::move(runtime)) {
+	if (!m_runtime) throw std::invalid_argument("RenderGraph requires a runtime");
+	m_backendDevices.RegisterPrimary(m_runtime->Backend(), m_runtime->Device());
 
 	auto MakeDefaultImmediateDispatch = [&]() noexcept -> org::imm::ImmediateDispatch
 		{
@@ -260,21 +261,7 @@ RenderGraph::RenderGraph(rhi::Device device, rhi::Backend primaryBackend)
 		};
 
 	m_immediateDispatch = MakeDefaultImmediateDispatch();
-	if (!m_statisticsService) {
-		m_statisticsService = org::runtime::CreateDefaultStatisticsService();
-	}
-	if (!m_uploadService) {
-		m_uploadService = org::runtime::CreateDefaultUploadService();
-	}
-	if (!m_readbackService) {
-		m_readbackService = org::runtime::CreateDefaultReadbackService();
-	}
-	if (!m_descriptorService) {
-		m_descriptorService = org::runtime::CreateDefaultDescriptorService();
-	}
-	if (!m_renderGraphSettingsService) {
-		m_renderGraphSettingsService = org::runtime::CreateDefaultRenderGraphSettingsService();
-	}
+	UseRuntimeServices();
 	for (auto& entry : m_masterPassList) {
 		std::visit([&](auto& obj) {
 			using T = std::decay_t<decltype(obj)>;
@@ -291,6 +278,7 @@ DeviceInstanceId RenderGraph::RegisterBackendDevice(rhi::Backend backend, rhi::D
 	}
 	const auto id = m_backendDevices.Register(backend, device);
 	DescriptorHeapManager::GetInstance().RegisterBackend(id, device);
+	m_runtime->RegisterDevice(device);
 	return id;
 }
 
@@ -313,12 +301,15 @@ void RenderGraph::ShutdownTaskWorkers() {
     StopFrameProduction();
 	m_queueRegistry.ShutdownTaskWorkers();
 	m_taskService.reset();
-	org::runtime::SetDefaultTaskService({});
 }
 
-void RenderGraph::ShutdownRuntime() {
-	StatisticsManager::GetInstance().ClearAll();
-	runtime::ShutdownRuntimeDevice();
+void RenderGraph::UseRuntimeServices() {
+	if (!m_statisticsService) m_statisticsService = m_runtime->Statistics();
+	if (!m_uploadService) m_uploadService = m_runtime->Uploads();
+	if (!m_readbackService) m_readbackService = m_runtime->Readbacks();
+	if (!m_descriptorService) m_descriptorService = m_runtime->Descriptors();
+	if (!m_renderGraphSettingsService) m_renderGraphSettingsService = m_runtime->Settings();
+	if (!m_taskService) m_taskService = m_runtime->Tasks();
 }
 
 void RenderGraph::ShutdownOwnedState() {
@@ -345,10 +336,12 @@ void RenderGraph::ShutdownOwnedState() {
 	++m_resourceRegistryGeneration;
 	m_resolverHandleCache.clear();
 
+	// The queues the graph made go with it: the runtime's frontier stops covering them.
+	for (size_t i = 0; i < m_queueRegistry.SlotCount(); ++i) {
+		const auto slot = static_cast<QueueSlotIndex>(static_cast<uint8_t>(i));
+		if (m_queueRegistry.OwnsQueue(slot)) m_runtime->UnregisterQueue(m_queueRegistry.GetQueue(slot));
+	}
 	m_queueRegistry.Clear();
-
-	m_readbackFence.Reset();
-	m_copyReadbackFence.Reset();
 
 	m_statisticsService.reset();
 	// Keep service generations alive across graph rebuilds; existing pass
@@ -635,40 +628,20 @@ void RenderGraph::EnsureMinimumAutomaticSchedulingQueues() {
 }
 
 void RenderGraph::Setup() {
-	// Establish service generations before any pass initialization or setup
-	// callback. Rebuilds may have retired the prior generation.
-	if (!m_uploadService) m_uploadService = org::runtime::CreateDefaultUploadService();
-	if (!m_descriptorService) m_descriptorService = org::runtime::CreateDefaultDescriptorService();
-	if (!m_readbackService) m_readbackService = org::runtime::CreateDefaultReadbackService();
-	if (!m_statisticsService) m_statisticsService = org::runtime::CreateDefaultStatisticsService();
+	// The runtime's services, unless replaced; the runtime initialized them. Rebuilds may have dropped the graph's references.
+	UseRuntimeServices();
 	org::runtime::ScopedActiveGraphServices activeServices(m_uploadService.get(), m_descriptorService.get());
-	DeletionManager::GetInstance().Initialize();
 
-	// Setup the statistics manager
+	// Statistics are shared by every graph on the runtime: register this graph's passes (by name) and size the query heap
+	// for them, without dropping the others'. A graph compiled before Setup (the persistent host: CompileStructural, then
+	// Setup) registers its passes here.
 	if (m_statisticsService) {
-		m_statisticsService->ClearAll();
-		m_statisticsService->Initialize();
-	}
-	auto& manager = DeviceManager::GetInstance();
-	if (m_statisticsService) {
-		m_statisticsService->RegisterQueue(manager.GetGraphicsQueue().GetKind());
-		m_statisticsService->RegisterQueue(manager.GetComputeQueue().GetKind());
-		// ClearAll above dropped every registration, but passes keep their old index. A graph compiled before
-		// Setup (the persistent host: CompileStructural, then Setup) would then never register again and record
-		// no timestamps at all - the query heap is sized from zero passes. Re-register what is compiled.
 		for (auto& any : m_masterPassList)
 			std::visit([](auto& pass) { if constexpr (!std::is_same_v<std::decay_t<decltype(pass)>, std::monostate>) pass.statisticsIndex = -1; }, any.pass);
 		m_statisticsService->SetupQueryHeap();
 	}
 
-	auto device = DeviceManager::GetInstance().GetDevice();
-
-	auto result = device.CreateTimeline(m_readbackFence);
-	result = device.CreateTimeline(m_copyReadbackFence);
-
-	if (m_readbackService) {
-		m_readbackService->Initialize(m_readbackFence.Get(), m_copyReadbackFence.Get());
-	}
+	auto device = m_runtime->Device();
 
 	// Populate the queue registry with the 3 primary queues.
 	// Each Register() call creates a CommandListPool and Timeline for the slot.
@@ -1415,6 +1388,8 @@ QueueSlotIndex RenderGraph::CreateQueue(QueueKind kind, const char* name, QueueA
 			static_cast<int>(kind),
 			rhi::ResultName(result)));
 	}
+
+	m_runtime->RegisterQueue(queue);
 
 	// Determine instance number: count existing slots of this kind.
 	uint8_t instance = 0;

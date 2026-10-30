@@ -1,3 +1,4 @@
+#include "OpenRenderGraph/Runtime.h"
 #include "TestSupport.h"
 #include <Resources/ExternalBufferResource.h>
 #include <Resources/ExternalTextureResource.h>
@@ -25,6 +26,7 @@
 #include <type_traits>
 
 int TestFrameRetirement(rhi::Device device, rhi::Backend backend);
+int TestRuntimeRetirement(rhi::Device device);
 int TestProgramVersions(rhi::Device device);
 int TestReadbackCaptures(rhi::Device device);
 
@@ -71,7 +73,7 @@ struct DirectRecordingPass : org::TypedRenderGraphPass<DirectRecordingPass> {
     static void Record(org::PassRecordContext&) { ++recordings; }
 };
 int TestUnifiedDeclarations(rhi::Device device, const std::shared_ptr<org::Resource>& resource) {
-    org::RenderGraph graph(device, rhi::Backend::D3D12);
+    org::RenderGraph graph(org::Runtime::Current()->shared_from_this());
     const org::ResourceIdentifier name("test.unified");
     graph.RegisterResource(name, resource);
     auto& builder = graph.BuildPass<DirectRecordingPass>("Unified");
@@ -336,7 +338,7 @@ struct DeclarationTestPass final : org::RenderPass {
 	void Cleanup() override {}
 };
 int TestEmptyResolverDeclarations(rhi::Device device) {
-	org::RenderGraph graph(device, rhi::Backend::D3D12);
+	org::RenderGraph graph(org::Runtime::Current()->shared_from_this());
 	auto resolver = std::make_shared<EmptyResolver>();
 	const org::ResourceIdentifier identifier("test.empty-resolver");
 	graph.RegisterResolver(identifier, resolver);
@@ -390,7 +392,7 @@ struct RacingResolver final : org::ClonableResolver<RacingResolver> {
 };
 // Every capture one declaration takes of a resolver (each use, the snapshot) describes one resource set.
 int TestDeclarationCapturesOneSet(rhi::Device device) {
-	org::RenderGraph graph(device, rhi::Backend::D3D12);
+	org::RenderGraph graph(org::Runtime::Current()->shared_from_this());
 	auto resolver = std::make_shared<RacingResolver>();
 	for (int i = 0; i < 4; ++i)
 		resolver->identity->pool.push_back(org::Buffer::CreateSharedUnmaterialized(rhi::HeapType::DeviceLocal, 256, true));
@@ -539,7 +541,7 @@ int TestPreparedGpuSubmission(rhi::Device device, ID3D12Device* nativeDevice) {
         org::PreparedPass declaredPacket;
         {
             DeclaredRecordingPass pass;
-            org::RenderGraph declarationGraph(device, rhi::Backend::D3D12);
+            org::RenderGraph declarationGraph(org::Runtime::Current()->shared_from_this());
             auto& declaration = declarationGraph.BuildRenderPass<DeclaredRecordingPass>("Declared binding lifetime");
             pass.DeclareUnified(declaration);
             auto permissions = std::make_shared<org::FramePreparationContext::ResourceSlots>();
@@ -1381,7 +1383,7 @@ int main(int argc, char** argv) {
     if (const auto failure = TestAliasHeapOwnership(create)) return failure;
 	rhi::DevicePtr device; CHECK(!rhi::Failed(rhi::CreateD3D12Device(create, device)) && device);
 	auto* nativeDevice = rhi::dx12::get_device(device.Get()); CHECK(nativeDevice);
-	org::runtime::InitializeRuntimeDevice(device.Get());
+	auto orgRuntime = org::Runtime::Create({.device = device.Get(), .backend = rhi::Backend::D3D12});
 
     {
         auto api = device.Get();
@@ -1493,6 +1495,7 @@ int main(int argc, char** argv) {
     if (const auto failure = TestProgramVersions(device.Get())) return failure;
     if (const auto failure = TestReadbackCaptures(device.Get())) return failure;
     if (const auto failure = TestFrameRetirement(device.Get(), rhi::Backend::D3D12)) return failure;
-	org::runtime::ShutdownRuntimeDevice();
+    if (const auto failure = TestRuntimeRetirement(device.Get())) return failure;
+	orgRuntime.reset();
 	return 0;
 }

@@ -146,8 +146,9 @@ int TestContributors(rhi::Device device, const std::function<std::shared_ptr<org
 	TestContributor contributor;
 	g_contributor = &contributor;
 	{
-		org::GraphHost host({.device = device, .backend = rhi::Backend::Vulkan,
-			.tasks = std::make_shared<org::runtime::ThreadPoolTaskService>(2),
+		auto runtime = org::Runtime::Create({.device = device, .backend = rhi::Backend::Vulkan,
+			.tasks = std::make_shared<org::runtime::ThreadPoolTaskService>(2)});
+		org::GraphHost host({.runtime = runtime,
 			.queueBoundary = {.entry = true, .exit = true}, .epochOrder = {0}});
 		// After the host: importing creates descriptors, which need the graph's runtime.
 		const auto output = importOutput();

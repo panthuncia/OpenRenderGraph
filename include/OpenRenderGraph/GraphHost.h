@@ -14,6 +14,7 @@
 
 #include "Render/RenderGraph/RenderGraph.h"
 #include "Render/RenderGraph/ExternalEpochExecution.h"
+#include "OpenRenderGraph/Runtime.h"
 
 namespace org::runtime {
 class ITaskService;
@@ -27,8 +28,8 @@ struct IHostExecutionData;
 
 // Drives one RenderGraph in persistent (static) execution for an application that
 // embeds ORG in its own renderer, for example a host that adopted another API's
-// device. It owns what every such embedding needs and nothing application-specific:
-//   - the runtime device registration and a task service,
+// device. It owns what every such embedding needs and nothing application-specific (the device, task service, services and
+// retirement are the Runtime's, which the host is given):
 //   - the built-in upload pass (persistent Pre segment),
 //   - persistent execution with the requested external queue boundary,
 //   - rebuilding the graph from the registered extension factories on request,
@@ -41,10 +42,9 @@ struct IHostExecutionData;
 class GraphHost {
 public:
 	struct Desc {
-		rhi::Device device;
-		rhi::Backend backend = rhi::Backend::Null;
-		// Optional; a ThreadPoolTaskService is created when absent.
-		std::shared_ptr<runtime::ITaskService> tasks;
+		// The runtime the host's graph runs on (its device, task service and services). Its slots must cover the host's frame
+		// slots (FrameSlots).
+		std::shared_ptr<Runtime> runtime;
 		RenderGraph::ExternalQueueBoundary queueBoundary{};
 		// Frames the CPU may run ahead of the GPU: whole frames of the host's epochs (each epoch of epochOrder once), or of
 		// ExecuteFrame calls without epochs. The host's frame slots - the ring every execution takes the next slot of, and waits
@@ -373,7 +373,8 @@ public:
 
 	RenderGraph* Graph() noexcept { return m_graph.get(); }
 	/** @brief The device the host was made with (Desc::device), e.g. for a producer recording its uploads ahead (StagedUploadBatch::Record). */
-	rhi::Device Device() const noexcept { return m_desc.device; }
+	rhi::Device Device() const noexcept { return m_device; }
+	Runtime& GetRuntime() const noexcept { return *m_desc.runtime; }
 	/** @brief The device-generation cleanup lane used for immutable binding roots. */
 	std::shared_ptr<runtime::ResourceCleanupQueue> ResourceCleanup() const;
 	runtime::IUploadService* Uploads() noexcept;
@@ -471,6 +472,7 @@ private:
 	bool BuildDue() const noexcept { return !m_graph || (m_rebuildRequested && !m_explicitBuilds); }
 
 	Desc m_desc;
+	rhi::Device m_device;
 	uint32_t m_frameSlots = 1;  // FrameSlots: Desc::framesInFlight times the epochs in the order
 	struct Registered {
 		std::string id;

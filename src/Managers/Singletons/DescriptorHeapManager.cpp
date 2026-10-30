@@ -173,7 +173,7 @@ void DescriptorHeapManager::RetireDescriptorSlots(std::vector<std::pair<std::sha
 
     std::scoped_lock lock(m_descriptorMutationMutex);
     DeferredRelease release{};
-    release.requiredFences = m_latestQueueFenceSnapshot;
+    release.requiredFences = ReleaseFencesUnlocked();
     release.descriptorSlots = std::move(slots);
     m_deferredReleases.push_back(std::move(release));
 }
@@ -188,7 +188,7 @@ void DescriptorHeapManager::RetireResource(std::shared_ptr<Resource> resource) {
         return;
     }
     DeferredRelease release{};
-    release.requiredFences = m_latestQueueFenceSnapshot;
+    release.requiredFences = ReleaseFencesUnlocked();
     release.resources.push_back(std::move(resource));
     m_deferredReleases.push_back(std::move(release));
 }
@@ -200,7 +200,7 @@ void DescriptorHeapManager::RetireNativeResource(rhi::ResourcePtr resource) {
 
     std::scoped_lock lock(m_descriptorMutationMutex);
     DeferredRelease release{};
-    release.requiredFences = m_latestQueueFenceSnapshot;
+    release.requiredFences = ReleaseFencesUnlocked();
     release.nativeResources.push_back(std::move(resource));
     m_deferredReleases.push_back(std::move(release));
 }
@@ -212,9 +212,23 @@ void DescriptorHeapManager::RetireBufferBacking(std::unique_ptr<GpuBufferBacking
 
     std::scoped_lock lock(m_descriptorMutationMutex);
     DeferredRelease release{};
-    release.requiredFences = m_latestQueueFenceSnapshot;
+    release.requiredFences = ReleaseFencesUnlocked();
     release.bufferBackings.push_back(std::move(backing));
     m_deferredReleases.push_back(std::move(release));
+}
+
+void DescriptorHeapManager::SetFrontier(std::function<runtime::SubmissionFrontier()> frontier, runtime::PointReached reached) {
+    std::scoped_lock lock(m_descriptorMutationMutex);
+    m_frontier = std::move(frontier);
+    m_reached = std::move(reached);
+}
+
+std::vector<DescriptorHeapManager::QueueFenceSnapshotPoint> DescriptorHeapManager::ReleaseFencesUnlocked() const {
+    std::vector<QueueFenceSnapshotPoint> fences = m_latestQueueFenceSnapshot;
+    if (m_frontier)
+        for (auto& point : m_frontier())
+            fences.push_back({ .timeline = point.timeline, .value = point.value });
+    return fences;
 }
 
 void DescriptorHeapManager::PublishQueueFenceSnapshot(std::vector<QueueFenceSnapshotPoint> fenceSnapshot) {
@@ -257,7 +271,7 @@ void DescriptorHeapManager::RetireExecutionLease(std::shared_ptr<const void> lea
     if (!lease) return;
     std::scoped_lock lock(m_descriptorMutationMutex);
     DeferredRelease release{};
-    release.requiredFences = m_latestQueueFenceSnapshot;
+    release.requiredFences = ReleaseFencesUnlocked();
     release.executionLeases.push_back(std::move(lease));
     m_deferredReleases.push_back(std::move(release));
 }
@@ -282,10 +296,14 @@ void DescriptorHeapManager::ProcessDeferredReleases(uint8_t frameIndex) {
     {
         std::scoped_lock lock(m_descriptorMutationMutex);
 
-        auto releaseIsSafe = [](DeferredRelease& release) {
+        auto releaseIsSafe = [this](DeferredRelease& release) {
             for (auto& point : release.requiredFences) {
                 if (!point.timeline.IsValid()) {
                     return false;
+                }
+                if (m_reached) {
+                    if (!m_reached({ point.timeline, point.value })) return false;
+                    continue;
                 }
                 const uint64_t completed = point.timeline.GetCompletedValue();
                 if (completed == UINT64_MAX || completed < point.value) {
@@ -1005,7 +1023,7 @@ void DescriptorHeapManager::RetireDescriptorSlotWithOwner(rhi::DescriptorSlot sl
 		const auto handle = heap->GetHeap().GetHandle();
 		if (handle.index != slot.heap.index || handle.generation != slot.heap.generation) continue;
 		DeferredRelease release{};
-		release.requiredFences = m_latestQueueFenceSnapshot;
+		release.requiredFences = ReleaseFencesUnlocked();
 		release.descriptorSlots.emplace_back(heap, slot.index);
 		release.descriptorOwner = std::move(owner);
 		m_deferredReleases.push_back(std::move(release));

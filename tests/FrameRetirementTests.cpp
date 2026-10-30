@@ -1,3 +1,4 @@
+#include "OpenRenderGraph/Runtime.h"
 #include "OpenRenderGraph/GraphHost.h"
 #include "TestSupport.h"
 #include "Managers/Singletons/DescriptorHeapManager.h"
@@ -60,7 +61,10 @@ int TestFrameRetirement(rhi::Device device, rhi::Backend backend) {
     CHECK(TestCompletionWake(device) == 0);
     CHECK(TestBindingOwnership(device) == 0);
     {
-        org::RenderGraph graph(device, backend);
+        // The caller's runtime, or one of its own for this check.
+        const auto runtime = org::Runtime::Current() ? org::Runtime::Current()->shared_from_this()
+            : org::Runtime::Create({.device = device, .backend = backend});
+        org::RenderGraph graph(runtime);
         graph.StopFrameProduction();
         graph.StopFrameProduction();
         org::UpdateExecutionContext update{};

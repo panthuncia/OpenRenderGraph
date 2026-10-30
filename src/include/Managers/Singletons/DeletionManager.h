@@ -1,18 +1,23 @@
 #pragma once
 
 #include <cstdint>
+#include <deque>
+#include <functional>
 #include <mutex>
 #include <vector>
 
 #include <rhi_allocator.h>
 #include <rhi_helpers.h>
 
-#include "Render/Runtime/OpenRenderGraphSettings.h"
+#include "Render/Runtime/SubmissionFrontier.h"
 #include "Resources/TrackedAllocation.h"
 
 
 namespace org {
 
+// Deferred destruction of GPU objects, by submission frontier. What is marked waits for every queue's progress as of
+// the next Retire (SubmissionFrontier): any work that could still use it was submitted before then. The runtime installs
+// the frontier (SetFrontier); without one nothing retires before DrainAll.
 class DeletionManager {
 public:
 	struct Stats {
@@ -21,8 +26,8 @@ public:
 		uint64_t trackedAllocationCount = 0;
 	};
 
-	// What one retirement step (Rotate) retired: safe to destroy, and destroyed wherever the owner drops it. Members are
-	// destroyed in reverse order, so the objects go first, then the allocations, then the tracked allocations.
+	// What one Retire retired: safe to destroy, and destroyed wherever the owner drops it. Members are destroyed in reverse
+	// order, so the objects go first, then the allocations, then the tracked allocations.
 	struct Retired {
 		std::vector<TrackedHandle> trackedAllocations;
 		std::vector<rhi::ma::AllocationPtr> allocations;
@@ -35,129 +40,126 @@ public:
 
 	bool IsInitialized() const {
 		std::scoped_lock lock(m_mutex);
-		return IsInitializedUnlocked();
+		return m_initialized;
 	}
 
 	void Initialize() {
 		std::scoped_lock lock(m_mutex);
-		m_numFramesInFlight = org::runtime::GetOpenRenderGraphSettings().numFramesInFlight;
-		const size_t retirementSlotCount = static_cast<size_t>(m_numFramesInFlight) + 1u;
-		m_deletionQueue.resize(retirementSlotCount);
-		m_allocationDeletionQueue.resize(retirementSlotCount);
-		m_trackedAllocationDeletionQueue.resize(retirementSlotCount);
+		m_initialized = true;
+	}
+
+	// The frontier Retire seals batches with, and when its points are reached (the runtime's). Called under this manager's
+	// lock, so they must not mark anything.
+	void SetFrontier(std::function<runtime::SubmissionFrontier()> frontier, runtime::PointReached reached) {
+		std::scoped_lock lock(m_mutex);
+		m_frontier = std::move(frontier);
+		m_reached = std::move(reached);
 	}
 
 	void MarkForDelete(rhi::helpers::AnyObjectPtr ptr) {
 		std::scoped_lock lock(m_mutex);
-		if (!IsInitializedUnlocked()) {
+		if (!m_initialized) {
 			return;
 		}
-		m_deletionQueue[0].push_back(std::move(ptr));
+		m_open.objects.push_back(std::move(ptr));
 	}
 
 	void MarkForDelete(rhi::ma::AllocationPtr ptr) {
 		std::scoped_lock lock(m_mutex);
-		if (!IsInitializedUnlocked()) {
+		if (!m_initialized) {
 			return;
 		}
-		m_allocationDeletionQueue[0].push_back(std::move(ptr));
+		m_open.allocations.push_back(std::move(ptr));
 	}
 
 	void MarkForDelete(TrackedHandle&& alloc) {
 		std::scoped_lock lock(m_mutex);
-		if (!IsInitializedUnlocked()) {
+		if (!m_initialized) {
 			alloc.Reset();
 			return;
 		}
-		m_trackedAllocationDeletionQueue[0].push_back(std::move(alloc));
+		m_open.trackedAllocations.push_back(std::move(alloc));
 	}
 
-	// One retirement step: the oldest queue retires and every other ages by one. The retired objects are returned, not
-	// destroyed: the destruction (driver frees, taking the device's memory locks) happens after this lock is released, on
-	// whichever thread the caller chooses, so MarkForDelete never waits for it.
-	Retired Rotate() {
+	// Takes every sealed batch whose frontier is reached, then seals what was marked since the last call with the frontier
+	// now. The retired objects are returned, not destroyed: the destruction (driver frees, taking the device's memory locks)
+	// happens after this lock is released, on whichever thread the caller chooses, so MarkForDelete never waits for it.
+	Retired Retire() {
 		Retired retired;
 		std::scoped_lock lock(m_mutex);
-		if (!IsInitializedUnlocked()) {
+		if (!m_initialized) {
 			return retired;
 		}
-		retired.objects.swap(m_deletionQueue.back());
-		for (int i = static_cast<int>(m_deletionQueue.size()) - 1; i >= 1; --i) {
-			m_deletionQueue[i].swap(m_deletionQueue[i - 1]);
+		// Frontiers only advance, so batches retire in order: stop at the first one still running.
+		while (!m_sealed.empty() && runtime::Reached(m_sealed.front().frontier, m_reached)) {
+			auto& batch = m_sealed.front().contents;
+			Append(retired.objects, batch.objects);
+			Append(retired.allocations, batch.allocations);
+			Append(retired.trackedAllocations, batch.trackedAllocations);
+			m_sealed.pop_front();
 		}
-
-		retired.allocations.swap(m_allocationDeletionQueue.back());
-		for (int i = static_cast<int>(m_allocationDeletionQueue.size()) - 1; i >= 1; --i) {
-			m_allocationDeletionQueue[i].swap(m_allocationDeletionQueue[i - 1]);
-		}
-
-		retired.trackedAllocations.swap(m_trackedAllocationDeletionQueue.back());
-		for (int i = static_cast<int>(m_trackedAllocationDeletionQueue.size()) - 1; i >= 1; --i) {
-			m_trackedAllocationDeletionQueue[i].swap(m_trackedAllocationDeletionQueue[i - 1]);
+		if (m_frontier && !m_open.Empty()) {
+			m_sealed.push_back({ m_frontier(), std::move(m_open) });
+			m_open = {};
 		}
 		return retired;
 	}
 
-	// One retirement step, destroying what retires on the calling thread.
+	// One Retire, destroying what retires on the calling thread.
 	void ProcessDeletions() {
-		(void)Rotate();
+		(void)Retire();
 	}
 
 	Stats GetStats() const {
 		std::scoped_lock lock(m_mutex);
 		Stats stats{};
-		for (const auto& queue : m_deletionQueue) {
-			stats.objectCount += queue.size();
-		}
-		for (const auto& queue : m_allocationDeletionQueue) {
-			stats.allocationCount += queue.size();
-		}
-		for (const auto& queue : m_trackedAllocationDeletionQueue) {
-			stats.trackedAllocationCount += queue.size();
-		}
+		auto count = [&](const Retired& batch) {
+			stats.objectCount += batch.objects.size();
+			stats.allocationCount += batch.allocations.size();
+			stats.trackedAllocationCount += batch.trackedAllocations.size();
+		};
+		count(m_open);
+		for (const auto& batch : m_sealed) count(batch.contents);
 		return stats;
 	}
 
+	// The device is idle: everything goes.
 	void DrainAll() {
 		std::scoped_lock lock(m_mutex);
-		if (!IsInitializedUnlocked()) {
-			return;
-		}
-
-		for (auto& queue : m_deletionQueue) {
-			queue.clear();
-		}
-		for (auto& queue : m_allocationDeletionQueue) {
-			queue.clear();
-		}
-		for (auto& queue : m_trackedAllocationDeletionQueue) {
-			queue.clear();
-		}
+		m_sealed.clear();
+		m_open = {};
 	}
 
 	void Cleanup() {
 		std::scoped_lock lock(m_mutex);
-		m_deletionQueue.clear();
-		m_allocationDeletionQueue.clear();
-		m_trackedAllocationDeletionQueue.clear();
-		m_numFramesInFlight = 0;
+		m_sealed.clear();
+		m_open = {};
+		m_frontier = {};
+		m_reached = {};
+		m_initialized = false;
 	}
 
 private:
-	uint8_t m_numFramesInFlight = 0;
+	struct Sealed {
+		runtime::SubmissionFrontier frontier;
+		Retired contents;
+	};
+
 	DeletionManager() = default;
 
-	bool IsInitializedUnlocked() const noexcept {
-		return m_numFramesInFlight != 0 &&
-			!m_deletionQueue.empty() &&
-			!m_allocationDeletionQueue.empty() &&
-			!m_trackedAllocationDeletionQueue.empty();
+	template <class T>
+	static void Append(std::vector<T>& to, std::vector<T>& from) {
+		if (to.empty()) { to.swap(from); return; }
+		for (auto& item : from) to.push_back(std::move(item));
+		from.clear();
 	}
 
 	mutable std::mutex m_mutex;
-	std::vector<std::vector<rhi::helpers::AnyObjectPtr>> m_deletionQueue;
-	std::vector<std::vector<rhi::ma::AllocationPtr>> m_allocationDeletionQueue;
-	std::vector<std::vector<TrackedHandle>> m_trackedAllocationDeletionQueue;
+	bool m_initialized = false;
+	std::function<runtime::SubmissionFrontier()> m_frontier;
+	runtime::PointReached m_reached;
+	Retired m_open;
+	std::deque<Sealed> m_sealed;
 };
 
 inline DeletionManager& DeletionManager::GetInstance() {

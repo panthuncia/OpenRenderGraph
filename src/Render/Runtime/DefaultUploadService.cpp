@@ -1,6 +1,5 @@
 #include "Render/Runtime/IUploadService.h"
 
-#include "Managers/Singletons/DeletionManager.h"
 #include "Managers/Singletons/UploadManager.h"
 
 namespace org::runtime {
@@ -106,14 +105,6 @@ public:
 
     void ProcessDeferredReleases(uint8_t frameIndex) override {
         UploadManager::GetInstance().ProcessDeferredReleases(frameIndex);
-        DeletionManager::GetInstance().ProcessDeletions();
-    }
-
-    std::shared_ptr<void> ProcessDeferredReleasesRetiringElsewhere(uint8_t frameIndex) override {
-        UploadManager::GetInstance().ProcessDeferredReleases(frameIndex);
-        auto retired = DeletionManager::GetInstance().Rotate();
-        if (retired.Empty()) return {};
-        return std::make_shared<DeletionManager::Retired>(std::move(retired));
     }
 
     std::shared_ptr<TrackedUploadTicket> QueueTrackedStreamingUploadSegments(
