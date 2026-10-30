@@ -1,6 +1,6 @@
 # Job graphs: ORG without a main graph
 
-> **Status (2026-10-30): Phase 1 implemented; Phase 2 in progress (see "Phase 2 investigation").**
+> **Status (2026-10-30): Phases 1 and 2 implemented (Phase 2 as revised in "Phase 2 investigation").**
 > - Done:
 >   - **2a:** runtime timeline identities.
 >   - **2b:** `persistent::ResourceSequencer`, owned by the runtime and shared by every graph's admission. A graph's queue
@@ -26,8 +26,11 @@
 >     concurrent image. Aliased textures and cross-device handoffs keep the old acquire.
 >   - **D3D12 copy-queue exits (done).** On a D3D12 copy queue (`CompileQueue::copyLayoutsCommon`), the compiler records
 >     copy-layout steps as leaving `Common`, which is what copy lists leave textures in.
->   - **External clients (2e).**
->   - All of these need GPU tests on both backends with validation.
+>   - **External clients (2e): moved to Phases 3 and 5.** There, uploads and the swapchain leave the frame graph and become
+>     the sequencer's clients. Until then, uploads are recorded inside the graphs that consume them, which already
+>     sequences them.
+>   - **A two-graph test on the GPU.** It is easier to write against Phase 3's execution API; the ledger semantics are
+>     covered by `PersistentGraphTests`.
 > - `org::Runtime` (`OpenRenderGraph/Runtime.h`) owns device initialization, the services, the settings' slot count and the
 >   default task service; `RenderGraph` and `GraphHost` take it and no longer initialize, reset or shut down shared state.
 > - Retirement is by submission frontier. BasicRHI's `Queue::Progress()` is a timeline that every submission on the queue
