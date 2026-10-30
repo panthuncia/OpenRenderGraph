@@ -3,7 +3,7 @@
 // (whose membership changes are binding edits, not structural ones), its end states and its queue, backend and wait
 // policy. Reads the pass's current declaration (RenderGraph::RedeclarePass), never the old compiler's declaration cache.
 #include "Render/RenderGraph/RenderGraph.h"
-#include "Render/RenderGraph/ExperimentalGraphCompiler.h"
+#include "Render/RenderGraph/GraphCompiler.h"
 
 #include <cstdint>
 #include <memory>
@@ -20,15 +20,15 @@ Resource* UnwrapDynamic(Resource* resource) noexcept;
 bool ConcurrentlyShared(const Resource& resource);
 // Shape from the logical description when the texture has no backing yet: an unmaterialized PixelBuffer reports default
 // mip/array counts until realized.
-experimental::CompileResourceShape ShapeOf(const Resource& resource);
-experimental::CompileResourceState LowerState(const ResourceState& state);
-std::optional<experimental::CompileRange> LowerRange(const RangeSpec& spec, experimental::CompileResourceShape shape);
+compiler::CompileResourceShape ShapeOf(const Resource& resource);
+compiler::CompileResourceState LowerState(const ResourceState& state);
+std::optional<compiler::CompileRange> LowerRange(const RangeSpec& spec, compiler::CompileResourceShape shape);
 
 struct LoweredUse {
 	uint64_t resourceID = 0; // Scheduling identity.
 	Resource* resource = nullptr;
-	experimental::CompileRange range;
-	experimental::CompileResourceState state;
+	compiler::CompileRange range;
+	compiler::CompileResourceState state;
 	// A resolver's resource declared directly: the slot's own reference, as for a group member. The resolver may drop it
 	// (a removed group entry, a versioned buffer's old version) while the slot still names it, and every preparation
 	// polls the slots' backings.
@@ -39,8 +39,8 @@ struct LoweredGroup {
 	std::shared_ptr<const void> key;
 	std::unique_ptr<IResourceResolver> resolver;
 	std::vector<std::pair<uint64_t, std::shared_ptr<Resource>>> members;
-	std::vector<std::pair<experimental::CompileRange, experimental::CompileResourceState>> templates;
-	experimental::CompileResourceShape shape;
+	std::vector<std::pair<compiler::CompileRange, compiler::CompileResourceState>> templates;
+	compiler::CompileResourceShape shape;
 	ResolverResourceSetIdentity identity{};
 	uint64_t waitRevision = 0;
 	std::vector<ExternalTimelinePoint> waits;
@@ -49,7 +49,7 @@ struct LoweredGroup {
 
 struct LoweredPass {
 	std::shared_ptr<const ResourceUseLayout> resourceUses;
-	experimental::CompilePass declaration;
+	compiler::CompilePass declaration;
 	std::vector<LoweredUse> entries, exits;
 	std::vector<LoweredGroup> groups;
 	// The resolvers whose resources are among the entries (not a group), with the set they resolved to.

@@ -4,6 +4,7 @@
 // and its generation retires.
 
 #include <OpenRenderGraph/ContributorHost.h>
+#include "TestSupport.h"
 #include <OpenRenderGraph/GraphHost.h>
 
 #include "Render/Runtime/ThreadPoolTaskService.h"
@@ -18,7 +19,6 @@
 #include <memory>
 #include <vector>
 
-#define CONTRIBUTOR_REQUIRE(condition, message) do { if (!(condition)) { std::printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, message); return 1; } } while (false)
 
 namespace {
 
@@ -141,7 +141,7 @@ int TestContributors(rhi::Device device, const std::function<std::shared_ptr<org
 	rhi::PipelineLayoutHandle layout) {
 	std::ifstream file(spirvPath, std::ios::binary);
 	const std::vector<char> spirv((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-	CONTRIBUTOR_REQUIRE(!spirv.empty(), "contributor shader");
+	REQUIRE(!spirv.empty(), "contributor shader");
 
 	TestContributor contributor;
 	g_contributor = &contributor;
@@ -151,7 +151,7 @@ int TestContributors(rhi::Device device, const std::function<std::shared_ptr<org
 			.queueBoundary = {.entry = true, .exit = true}, .epochOrder = {0}});
 		// After the host: importing creates descriptors, which need the graph's runtime.
 		const auto output = importOutput();
-		CONTRIBUTOR_REQUIRE(output, "import host buffer");
+		REQUIRE(output, "import host buffer");
 		ORGExportDescriptor exported{};
 		exported.dimension = ORG_RG_RESOURCE_BUFFER; exported.byteSize = kBytes;
 		exported.allowedUsages = ORG_RG_USAGE_COPY_DESTINATION; exported.flags = ORG_RG_EXPORT_WRITABLE;
@@ -159,8 +159,8 @@ int TestContributors(rhi::Device device, const std::function<std::shared_ptr<org
 			.device = device, .backend = rhi::Backend::Vulkan,
 			.exports = {{"test.output", "Host output", exported, [&] { return output; }}},
 			.computeLayout = layout});
-		CONTRIBUTOR_REQUIRE(org::contributor::ContributorHost::GetAPI(ORG_RENDER_GRAPH_API_CURRENT, &contributor.api) == ORG_RG_OK, "API table");
-		CONTRIBUTOR_REQUIRE(contributor.api.QueryService(ORG_PIPELINE_SERVICE_ID, ORG_PIPELINE_SERVICE_VERSION_1, &contributor.pipelines,
+		REQUIRE(org::contributor::ContributorHost::GetAPI(ORG_RENDER_GRAPH_API_CURRENT, &contributor.api) == ORG_RG_OK, "API table");
+		REQUIRE(contributor.api.QueryService(ORG_PIPELINE_SERVICE_ID, ORG_PIPELINE_SERVICE_VERSION_1, &contributor.pipelines,
 			sizeof(contributor.pipelines)) == ORG_RG_OK && contributor.pipelines.device, "pipeline service");
 		basicrhi_c_pipeline_desc_v1 pipelineDesc{};
 		pipelineDesc.structure_size = sizeof(pipelineDesc);
@@ -168,11 +168,11 @@ int TestContributors(rhi::Device device, const std::function<std::shared_ptr<org
 		pipelineDesc.layout = contributor.pipelines.computeLayout;
 		pipelineDesc.compute_shader = { spirv.data(), spirv.size() };
 		const auto* table = contributor.pipelines.device;
-		CONTRIBUTOR_REQUIRE(table->create_pipeline(table->context, &pipelineDesc, &contributor.pipeline) == BASICRHI_C_OK,
+		REQUIRE(table->create_pipeline(table->context, &pipelineDesc, &contributor.pipeline) == BASICRHI_C_OK,
 			"pipeline through the service");
 		uint32_t exports = 0;
 		ORGExportDescriptor described{ sizeof(described) };
-		CONTRIBUTOR_REQUIRE(contributor.api.GetExportCount(&exports) == ORG_RG_OK && exports == 1
+		REQUIRE(contributor.api.GetExportCount(&exports) == ORG_RG_OK && exports == 1
 			&& contributor.api.GetExport(0, &described) == ORG_RG_OK && std::strcmp(described.id, "test.output") == 0, "export table");
 
 		ORGContributorDesc desc{};
@@ -180,33 +180,33 @@ int TestContributors(rhi::Device device, const std::function<std::shared_ptr<org
 		desc.id = "test.contributor"; desc.kind = ORG_RG_CONTRIBUTOR_REQUIRED; desc.build = Build;
 		desc.generationActivated = Activated; desc.generationRetired = Retired;
 		ORGRegistrationHandle handle{};
-		CONTRIBUTOR_REQUIRE(contributor.api.RegisterContributor(&desc, &handle) == ORG_RG_OK, "register");
+		REQUIRE(contributor.api.RegisterContributor(&desc, &handle) == ORG_RG_OK, "register");
 		host.AddExtension("org.contributors", [&] { return contributors.CreateExtension(); });
 
 		for (uint32_t frame = 0; frame < 4; ++frame) {
 			contributor.value = 7000u + 10u * frame;
 			contributors.Poll(host);
 			host.ExecuteFrame();
-			if (frame == 0) CONTRIBUTOR_REQUIRE(contributor.activated.load() == 1, "the generation activates with the build");
-			CONTRIBUTOR_REQUIRE(device.WaitIdle() == rhi::Result::Ok, "wait for the frame");
+			if (frame == 0) REQUIRE(contributor.activated.load() == 1, "the generation activates with the build");
+			REQUIRE(device.WaitIdle() == rhi::Result::Ok, "wait for the frame");
 			bool matches = true;
 			for (uint32_t i = 0; i < kCount; ++i) if (mapped[i] != contributor.value + i) { matches = false; break; }
-			CONTRIBUTOR_REQUIRE(matches, "the contributor's passes write and copy every element");
+			REQUIRE(matches, "the contributor's passes write and copy every element");
 		}
-		CONTRIBUTOR_REQUIRE(contributor.completed.load() > 0, "packets complete");
+		REQUIRE(contributor.completed.load() > 0, "packets complete");
 
 		// Unregistering rebuilds without the contributor; its generation retires once nothing uses it.
-		CONTRIBUTOR_REQUIRE(contributor.api.BeginUnregister(handle) == ORG_RG_OK, "unregister");
+		REQUIRE(contributor.api.BeginUnregister(handle) == ORG_RG_OK, "unregister");
 		for (uint32_t frame = 0; frame < 4; ++frame) {
 			contributors.Poll(host);
 			host.ExecuteFrame();
 		}
 		host.DestroyGraph();
 		ORGRegistrationState state{};
-		CONTRIBUTOR_REQUIRE(contributor.api.GetRegistrationState(handle, &state) == ORG_RG_OK && state == ORG_RG_REGISTRATION_RETIRED,
+		REQUIRE(contributor.api.GetRegistrationState(handle, &state) == ORG_RG_OK && state == ORG_RG_REGISTRATION_RETIRED,
 			"the contributor retired");
-		CONTRIBUTOR_REQUIRE(contributor.retired.load() == contributor.activated.load(), "every activated generation retired");
-		CONTRIBUTOR_REQUIRE(contributor.destroyed.load() == contributor.packets.load(), "every packet destroyed");
+		REQUIRE(contributor.retired.load() == contributor.activated.load(), "every activated generation retired");
+		REQUIRE(contributor.destroyed.load() == contributor.packets.load(), "every packet destroyed");
 		table->destroy_pipeline(table->context, contributor.pipeline, 0);
 	}
 	g_contributor = nullptr;

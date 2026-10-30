@@ -2,13 +2,13 @@
 // at once post their changes, and a reader sees a consistent world. Before, every thread changed the flecs world directly,
 // and a creation on the render thread beside a destruction on a host's thread wrote through a null component.
 #include "Managers/Singletons/ECSManager.h"
+#include "TestSupport.h"
 
 #include <atomic>
 #include <cstdio>
 #include <thread>
 #include <vector>
 
-#define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "Failure at %d: %s\n", __LINE__, #x); return 1; } } while (false)
 
 int main() {
 	using namespace org;

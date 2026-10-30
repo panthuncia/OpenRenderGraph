@@ -1,6 +1,7 @@
 #include "Render/RenderGraph/PersistentGraph.h"
+#include "TestSupport.h"
 #include "Render/RenderGraph/GraphReplay.h"
-#include "Render/RenderGraph/ExperimentalRhiExecution.h"
+#include "Render/RenderGraph/RhiExecution.h"
 #include "GraphReplayRunner.h"
 #include <cstdio>
 #include <stdexcept>
@@ -10,8 +11,7 @@
 #include <algorithm>
 
 using namespace org::persistent;
-using namespace org::experimental;
-#define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "Failure at %d: %s\n", __LINE__, #x); return 1; } } while (false)
+using namespace org::compiler;
 template<class F> bool Rejects(F&& fn) { try { fn(); } catch (const std::exception&) { return true; } return false; }
 BindingVersion Binding(uint64_t id) {
     BindingVersion b;
@@ -1851,7 +1851,7 @@ int main() {
         std::vector<org::PreparedPass> invocations(rotated->logical->passSlots.size());
         invocations[consumer.index] = org::PreparedPass::NoOp();
         invocations[present.index] = org::PreparedPass::NoOp();
-        auto sealed = org::experimental::SealPersistentFrame(1,frame,std::move(invocations));
+        auto sealed = org::compiler::SealPersistentFrame(1,frame,std::move(invocations));
         CHECK(sealed && sealed->initialStates->at(swapchainIndex).resource.index == 200);
         admission.Commit(frame,receipt);
         CHECK(admission.StateBackingCount() == 3);

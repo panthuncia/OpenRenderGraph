@@ -15,8 +15,10 @@ ORG provides a pass-oriented API for building frame pipelines, tracking resource
 
 ## What ORG does
 
-- Builds and executes frame graphs from render and compute passes.
-- Tracks resource access/layout transitions and batch ordering.
+- Compiles a persistent schedule from typed passes once, and executes it every frame; only structural changes rebuild it.
+- Tracks resource access/layout transitions, batch ordering and queue synchronization, across one or more devices.
+- Runs a frame as several executions (epochs) at points of a host's own frame, prepared ahead on a host thread.
+- Hosts passes from other modules through a C ABI (`OpenRenderGraph/ContributorAPI.h`).
 - Exposes runtime services for upload, readback, statistics, and graph settings.
 - Includes memory introspection and aliasing planning/debug support.
 - Includes optional ImGui-based debug UI widgets for graph and memory inspection.
@@ -37,196 +39,105 @@ Each widget has its own header and CMake target:
 
 - `DebugUI/ScheduleInspector.h` (`OpenRenderGraph::ScheduleUI`, `OPENRENDERGRAPH_ENABLE_SCHEDULE_UI`)
 - `DebugUI/MemoryIntrospectionWidget.h` (`OpenRenderGraph::MemoryUI`, `OPENRENDERGRAPH_ENABLE_MEMORY_UI`)
-- `DebugUI/MemoryViewWidget.h` and `DebugUI/RenderGraphInspector.h` (`OpenRenderGraph::DebugUI`, `OPENRENDERGRAPH_ENABLE_DEBUG_UI`)
+- `DebugUI/MemoryViewWidget.h` (`OpenRenderGraph::DebugUI`, `OPENRENDERGRAPH_ENABLE_DEBUG_UI`)
 
 ## Basic usage
 
-### 1) Create a graph instance
+A host drives a graph through `GraphHost` (`OpenRenderGraph/GraphHost.h`). The graph's passes come from extensions, which
+the host asks for them at each structural build; every frame then runs the compiled schedule.
+
+### 1) Create a host
 
 ```cpp
-auto graph = std::make_unique<RenderGraph>();
+#include <OpenRenderGraph/GraphHost.h>
+
+org::GraphHost host({
+    .device = device,                       // a BasicRHI device the host keeps alive
+    .backend = rhi::Backend::D3D12,
+    .tasks = std::make_shared<org::runtime::ThreadPoolTaskService>(4),
+});
 ```
 
-### 2) Resource creation and registration
+`Desc` also takes the host's epochs (`epochOrder`), frames in flight, closed executions, recording reuse and the external
+queue boundary (for a host that shares its queue with another API, as Community Shaders shares DXVK's).
 
-Create resources (buffer/texture), configure descriptors and metadata, then register them with a `ResourceIdentifier`.
+### 2) Write a pass
 
-```cpp
-auto counterBuffer = Buffer::CreateUnmaterializedStructuredBuffer(
-	1,
-	sizeof(uint32_t),
-	/*unorderedAccess=*/true,
-	/*counterBuffer=*/false,
-	/*nonShaderVisibleUAV=*/false,
-	rhi::HeapType::DeviceLocal);
-
-counterBuffer->SetName("MyCounter");
-graph->RegisterResource("Builtin::Counters::MyCounter", counterBuffer);
-
-TextureDescription hdrDesc{};
-hdrDesc.format = rhi::Format::R16G16B16A16_Float;
-hdrDesc.hasRTV = true;
-hdrDesc.hasSRV = true;
-hdrDesc.imageDimensions.emplace_back(1920, 1080, 0, 0);
-
-auto hdrTarget = PixelBuffer::CreateSharedUnmaterialized(hdrDesc);
-hdrTarget->SetName("HDR Target");
-graph->RegisterResource("Builtin::Color::HDR", hdrTarget);
-```
-
-#### Materialized vs unmaterialized resources
-
-ORG resource factories commonly have both forms:
-
-- Materialized: `CreateShared(...)`
-- Unmaterialized: `CreateSharedUnmaterialized(...)` or `CreateUnmaterializedStructuredBuffer(...)`
-
-Unmaterialized means the resource object exists in the graph, but the underlying GPU allocation is deferred until the graph/runtime needs it.
-
-Use unmaterialized when:
-
-- the resource may not be used every frame,
-- the graph can alias/transiently schedule it,
-- you want lower upfront allocation pressure.
-
-Use materialized when:
-
-- you need the real GPU object immediately,
-- the resource lifetime is long-lived and always resident,
-- external code requires the backing allocation right away.
-
-Practically: default to unmaterialized for resources that the GPU will be managing, and to materialized for resources that you will be uploading data to from the CPU.
-
-### 3) Providers: what they are and why they exist
-
-A provider is any object implementing `IResourceProvider` that can supply resources/resolvers on demand for known keys. This keeps the graph decoupled from owning systems (streaming managers, scene systems, asset/runtime caches).
-
-When the graph requests a key, providers can lazily return an existing resource (or construct one), instead of forcing every resource to be eagerly registered up front.
+A pass declares what it uses once (`Declare`), prepares an owned packet each frame (`Prepare`), and records it
+(`Record`, static: it sees only the packet and the bindings).
 
 ```cpp
-class MyProvider final : public IResourceProvider {
+#include "RenderPasses/Base/TypedRenderGraphPass.h"
+#include "Render/PassBuilders.h"
+
+struct ClearBindings { org::DeclaredViewToken target; };
+struct ClearFrame { uint32_t targetIndex = 0, count = 0; };
+
+class ClearPass final : public org::TypedRenderGraphPass<ClearPass, ClearFrame, ClearBindings> {
 public:
-	std::shared_ptr<Resource> ProvideResource(ResourceIdentifier const& key) override {
-		if (key.ToString() == "Builtin::Color::HDR") {
-			return m_hdr;
-		}
-		return nullptr;
-	}
-
-	std::vector<ResourceIdentifier> GetSupportedKeys() override {
-		return { ResourceIdentifier("Builtin::Color::HDR") };
-	}
-
+    explicit ClearPass(std::shared_ptr<org::Buffer> target) : m_target(std::move(target)) {}
+    ClearBindings Declare(org::PassBuilder& builder) {
+        builder.PreferQueue(org::QueueKind::Compute).AutomaticQueueAssignment();
+        return {builder.UnorderedAccess(m_target).View()};
+    }
+    ClearFrame Prepare(const ClearBindings& bindings, const org::PassPrepareContext& preparation) const {
+        return {preparation.Resolve(bindings.target).index, 1024};
+    }
+    static void Record(const ClearBindings&, const ClearFrame& frame, org::PassRecordContext& recording) {
+        auto& commands = recording.Commands();
+        // bind the pipeline, push frame.targetIndex, dispatch
+    }
 private:
-	std::shared_ptr<PixelBuffer> m_hdr;
+    std::shared_ptr<org::Buffer> m_target;
 };
-
-graph->RegisterProvider(myProvider);
 ```
 
-### 4) Minimal pass example
+A pass that also provides `InvocationRevision` lets the framework reuse its previous packet while nothing it reads
+changed. Lifecycle hooks (`Submitted`, `Completed`, `Abandoned`) see a packet through to the GPU.
 
-A pass declares resource usages in `DeclareResourceUsages(...)` and provides work in `Execute(...)`.
+### 3) Add passes through an extension
 
 ```cpp
-struct ClearCounterInputs {
-	ResourceHandleAndRange counter;
-};
-
-inline rg::Hash64 HashValue(const ClearCounterInputs& i) {
-	return static_cast<rg::Hash64>(i.counter.resource.GetGlobalResourceID());
-}
-
-inline bool operator==(const ClearCounterInputs& a, const ClearCounterInputs& b) {
-	return a.counter.resource.GetGlobalResourceID() == b.counter.resource.GetGlobalResourceID();
-}
-
-class ClearCounterPass final : public ComputePass {
+class MyExtension final : public org::IRenderGraphExtension {
 public:
-	explicit ClearCounterPass(ClearCounterInputs in) {
-		SetInputs(std::move(in));
-	}
-
-	void DeclareResourceUsages(ComputePassBuilder* builder) override {
-		const auto& in = Inputs<ClearCounterInputs>();
-		builder->UnorderedAccess(in.counter);
-	}
-
-	void Setup() override {}
-
-	void Execute(PassExecutionContext& context) override {
-		(void)context;
-		// Record compute work here.
-	}
-
-	void Cleanup() override {}
-};
-```
-### 5) Build passes
-
-Use `BuildRenderPass(...)` / `BuildComputePass(...)` to add pass instances into the graph.
-
-```cpp
-graph->BuildComputePass<ClearCounterPass>("ClearCounter", ClearCounterInputs{
-		.counter = graph->RequestResourceHandle("Builtin::Counters::MyCounter")
-	});
-
-graph->BuildRenderPass<DeferredShadingPass>("MainLightingPass");
-```
-
-### 6) Optional: register graph extensions
-
-Where the basic pass API relies on explicit ordering to determine producers and consumers, Extensions inject structural or frame-local passes in a more flexible manner. 
-
-During render graph compile, any extension that has been registered with the graph will be queried for the passes it wishes to add, and it may inject those at any point in the graph. Beginning and end insertions are handled with explicit Begin and End markers, and pass-relative insertion references "Before" and/or "after" anchor passes by name.
-
-Passes added by extensions observe local ordering when no explicit ordering is declared- passes which do not declare an achor point will be assumed to come "after" the previous pass which was added by that extension, if one exists.
-
-Minimal custom extension example:
-
-```cpp
-class MyRenderGraphExtension final : public RenderGraph::IRenderGraphExtension {
-public:
-	void OnRegistryReset(ResourceRegistry* registry) override {
-		// Optional: refresh any resolver/provider context that depends on the registry.
-		(void)registry;
-	}
-
-	void GatherStructuralPasses(RenderGraph& rg, std::vector<RenderGraph::ExternalPassDesc>& out) override {
-		(void)rg;
-
-		out.push_back(
-			RenderGraph::ExternalPassDesc::Compute(
-				"MyExtension::SetupPass",
-				std::make_shared<MySetupComputePass>())
-				.At(RenderGraph::ExternalInsertPoint::Begin(/*priority*/10)));
-	}
-
-	void GatherFramePasses(RenderGraph& rg, std::vector<RenderGraph::ExternalPassDesc>& out) override {
-		(void)rg;
-		(void)out;
-		// Optional: emit per-frame ephemeral passes (captures, probes, etc.).
-	}
+    void PrepareForBuild(org::RenderGraph& graph) override {
+        graph.RegisterResource(org::ResourceIdentifier("my.target"), m_target);  // named resources, providers, resolvers
+    }
+    void GatherStructuralPasses(org::RenderGraph&, std::vector<org::ExternalPassDesc>& out) override {
+        out.push_back(org::ExternalPassDesc::Compute("my.clear", std::make_shared<ClearPass>(m_target))
+            .At(org::ExternalInsertPoint::Begin()));
+    }
+private:
+    std::shared_ptr<org::Buffer> m_target = org::Buffer::CreateSharedUnmaterialized(rhi::HeapType::DeviceLocal, 4096, true);
 };
 
-// Registration:
-graph->RegisterExtension(std::make_unique<MyRenderGraphExtension>());
+host.AddExtension("my.extension", [] { return std::make_unique<MyExtension>(); });
 ```
 
-### 7) Per-frame update/execute
+`ExternalPassDesc` places a pass (`At`: after or before other passes), names its queue, and tags it with an epoch.
+`GatherFramePasses` adds per-frame passes (readback captures); `InterruptsFrame` hosts one at its insert point.
+
+Resources are `Buffer`, `PixelBuffer` and the wrappers built on them (`VersionedBuffer`, `ExternalTextureResource`,
+...). They are created unmaterialized and get memory when the graph first uses them; transient ones may share memory
+with others whose lifetimes do not overlap (automatic aliasing). Providers and resolvers supply resources by name and
+resource sets that change between frames.
+
+### 4) Run frames
 
 ```cpp
-UpdateExecutionContext updateCtx{};
-updateCtx.frameIndex = frameIndex;
-updateCtx.frameFenceValue = frameFenceValue;
-updateCtx.deltaTime = deltaTime;
-
-graph->Update(updateCtx, device);
-
-PassExecutionContext execCtx{};
-// fill queue/lists/timelines as required by your backend integration
-graph->Execute(execCtx);
+host.ExecuteFrame();                      // one execution of every pass
+// or, with epochs: host.SubmitEpoch(epoch) at each of the host's points
 ```
+
+`RequestRebuild` (or a registry change an extension notices) rebuilds the schedule at the next frame. With async epochs
+(`SetAsyncEpochs`) the host's thread prepares, admits and records each epoch ahead; the frame's point only submits.
+
+### 5) Contributors from other modules
+
+`OpenRenderGraph/ContributorHost.h` hosts the C ABI in `OpenRenderGraph/ContributorAPI.h`: another module (a plugin)
+registers through the table the host exports (`ORG_GetRenderGraphAPI`), declares resources and passes at each build,
+and prepares an owned packet per pass per frame, recorded through a borrowed BasicRHI recorder. The host names its
+epochs, anchors and exported resources; `samples/ContributorSample.cpp` is a minimal contributor.
 
 ## Runtime services
 
@@ -266,10 +177,10 @@ ui::MemoryIntrospectionWidget memWidget;
 memWidget.PushFrameSample(timeSeconds, totalBytes);
 memWidget.Draw(&open, &memorySnapshot, &frameGraphSnapshot);
 
-RGInspector::Show(graph->GetBatches(), ...);
+graph->SetScheduleTraceEnabled(true);
+org::debugui::ScheduleInspectorState state;
+if (auto snapshot = graph->GetPersistentScheduleSnapshot()) org::debugui::ShowScheduleInspector(*snapshot, state);
 ```
-
-For capture requests from `RGInspector`, pass a callback that forwards to `IReadbackService::RequestReadbackCapture(...)`.
 
 ## CMake notes
 

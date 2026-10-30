@@ -1,7 +1,6 @@
 #pragma once
 #include <rhi.h>
 #include <resource_states.h>
-#include <stacktrace>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -71,9 +70,6 @@ public:
 	}
 
 private:
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
-	std::stacktrace m_creation;
-#endif
 	void initialize(const TextureDescription& desc,
 		uint64_t owningResourceID,
 		const char* name);

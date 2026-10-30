@@ -13,7 +13,6 @@
 #include <thread>
 #include <condition_variable>
 #include <deque>
-#include <stacktrace>
 
 #include "rhi_helpers.h"
 #include "Render/ResourceRegistry.h"
@@ -50,7 +49,6 @@ public:
 
 	static UploadManager& GetInstance();
 	void Initialize();
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 	void UploadData(const void* data, size_t size, UploadTarget resourceToUpdate, size_t dataBufferOffset, const char* file, int line);
 	void UploadDataBatch(UploadTarget resourceToUpdate, std::span<const org::runtime::UploadRegion> regions, const char* file, int line);
 	void PostTextureSubresources(UploadTarget target, rhi::Format fmt, uint32_t baseWidth, uint32_t baseHeight,
@@ -69,24 +67,6 @@ public:
 		uint32_t srcCount,
 		const char* file,
 		int line);
-#else
-	void UploadData(const void* data, size_t size, UploadTarget resourceToUpdate, size_t dataBufferOffset);
-	void UploadDataBatch(UploadTarget resourceToUpdate, std::span<const org::runtime::UploadRegion> regions);
-	void PostTextureSubresources(UploadTarget target, rhi::Format fmt, uint32_t baseWidth, uint32_t baseHeight,
-		uint32_t depthOrLayers, uint32_t mipLevels, uint32_t arraySize,
-		std::shared_ptr<const std::vector<rhi::helpers::SubresourceData>> subresources,
-		std::shared_ptr<const void> keepAlive);
-	void UploadTextureSubresources(
-		UploadTarget target,
-		rhi::Format fmt,
-		uint32_t baseWidth,
-		uint32_t baseHeight,
-		uint32_t depthOrLayers,
-		uint32_t mipLevels,
-		uint32_t arraySize,
-		const rhi::helpers::SubresourceData* srcSubresources,
-		uint32_t srcCount);
-#endif	
 	void ProcessUploads(uint8_t frameIndex, org::imm::ImmediateCommandList& commandList);
 	void SetOwnerThread();
 	void QueueResourceCopy(const std::shared_ptr<Resource>& destination, const std::shared_ptr<Resource>& source, size_t size);

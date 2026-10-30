@@ -29,11 +29,7 @@ inline void UploadBufferDataDispatch(
     [[maybe_unused]] const char* file,
     [[maybe_unused]] int line) {
     if (auto* service = GetActiveUploadService()) {
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
         service->UploadData(data, size, std::move(resourceToUpdate), dataBufferOffset, file, line);
-#else
-        service->UploadData(data, size, std::move(resourceToUpdate), dataBufferOffset);
-#endif
         return;
     }
 
@@ -53,7 +49,6 @@ inline void UploadTextureSubresourcesDispatch(
     [[maybe_unused]] const char* file,
     [[maybe_unused]] int line) {
     if (auto* service = GetActiveUploadService()) {
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
         service->UploadTextureSubresources(
             std::move(target),
             fmt,
@@ -66,18 +61,6 @@ inline void UploadTextureSubresourcesDispatch(
             srcCount,
             file,
             line);
-#else
-        service->UploadTextureSubresources(
-            std::move(target),
-            fmt,
-            baseWidth,
-            baseHeight,
-            depthOrLayers,
-            mipLevels,
-            arraySize,
-            srcSubresources,
-            srcCount);
-#endif
         return;
     }
 
@@ -86,14 +69,7 @@ inline void UploadTextureSubresourcesDispatch(
 
 }
 
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 #define BUFFER_UPLOAD(data,size,res,offset) \
     org::runtime::UploadBufferDataDispatch((data),(size),(res),(offset),__FILE__,__LINE__)
 #define TEXTURE_UPLOAD_SUBRESOURCES(dstTexture,fmt,baseWidth,baseHeight,depthOrLayers,mipLevels,arraySize,srcSubresources,srcCount) \
 	org::runtime::UploadTextureSubresourcesDispatch((dstTexture),(fmt),(baseWidth),(baseHeight),(depthOrLayers),(mipLevels),(arraySize),(srcSubresources),(srcCount),__FILE__,__LINE__)
-#else
-#define BUFFER_UPLOAD(data,size,res,offset) \
-    org::runtime::UploadBufferDataDispatch((data),(size),(res),(offset),nullptr,0)
-#define TEXTURE_UPLOAD_SUBRESOURCES(dstTexture,fmt,baseWidth,baseHeight,depthOrLayers,mipLevels,arraySize,srcSubresources,srcCount) \
-	org::runtime::UploadTextureSubresourcesDispatch((dstTexture),(fmt),(baseWidth),(baseHeight),(depthOrLayers),(mipLevels),(arraySize),(srcSubresources),(srcCount),nullptr,0)
-#endif

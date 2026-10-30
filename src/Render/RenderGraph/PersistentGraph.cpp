@@ -57,7 +57,7 @@ void ValidateSharedBacking(const BindingVersion& a, const BindingVersion& b) {
                 "Shared physical slots disagree on incoming state");
     }
 }
-void CanonicalizeUses(experimental::GraphCompileStructure& structure, const std::vector<uint32_t>& canonical) {
+void CanonicalizeUses(compiler::GraphCompileStructure& structure, const std::vector<uint32_t>& canonical) {
     for (auto& pass : structure.passes) {
         for (auto& access : pass.accesses) access.resourceIndex = canonical.at(access.resourceIndex);
         for (auto* uses : {&pass.entryStates,&pass.exitStates}) {
@@ -96,15 +96,15 @@ void ValidateNativeView(const rhi::ResourceDesc& desc, BindlessViewKind kind) {
     default: throw std::invalid_argument("Unsupported published view kind");
     }
 }
-std::shared_ptr<const experimental::GraphExecutionLayout> BuildPersistentExecutionLayout(
-    uint64_t revision, std::shared_ptr<const experimental::CompiledGraph> graph,
-    std::shared_ptr<const experimental::GraphCompileInput> input, size_t passCapacity) {
+std::shared_ptr<const compiler::GraphExecutionLayout> BuildPersistentExecutionLayout(
+    uint64_t revision, std::shared_ptr<const compiler::CompiledGraph> graph,
+    std::shared_ptr<const compiler::GraphCompileInput> input, size_t passCapacity) {
     BT_ZONE_SCOPE("ORG.Persistent.BuildExecutionLayout");
     Require(graph && input && graph->structure.get() == &input->structure
         && graph->scheduleValidated && graph->scheduleValidationError.empty(), "Invalid persistent execution layout");
-    auto layout = std::make_shared<experimental::GraphExecutionLayout>();
-    layout->bundle = std::make_shared<const experimental::CompiledGraphBundle>(
-        experimental::CompiledGraphBundle{revision,graph,std::move(input)});
+    auto layout = std::make_shared<compiler::GraphExecutionLayout>();
+    layout->bundle = std::make_shared<const compiler::CompiledGraphBundle>(
+        compiler::CompiledGraphBundle{revision,graph,std::move(input)});
     layout->placements.resize(passCapacity,{UINT32_MAX,UINT32_MAX,UINT32_MAX});
     size_t scheduled = 0;
     for (uint32_t batch = 0; batch != graph->batches.size(); ++batch) {
@@ -130,7 +130,7 @@ void RetireOwnership(const std::function<void(std::shared_ptr<const void>)>& sin
         basic_telemetry::AddCounter("ORG.Persistent.RetirementEnqueueFailures");
     }
 }
-void ValidateAliasOrder(const experimental::CompiledGraph& graph, const BindingTable& bindings) {
+void ValidateAliasOrder(const compiler::CompiledGraph& graph, const BindingTable& bindings) {
     const auto count = graph.structure->passes.size();
     std::vector<uint8_t> ordered(count * count);
     for (auto [from,to] : graph.schedulingEdges) ordered[from * count + to] = 1;
@@ -195,7 +195,7 @@ NativeBindingContract NativeBindingContract::Capture(const rhi::ResourceDesc& de
     }
     return contract;
 }
-bool NativeBindingContract::Matches(const rhi::ResourceDesc& desc, experimental::CompileResourceShape shape) const {
+bool NativeBindingContract::Matches(const rhi::ResourceDesc& desc, compiler::CompileResourceShape shape) const {
     if (type == rhi::ResourceType::Unknown || desc.type != type || desc.heapType != heapType || desc.heapFlags != heapFlags
         || (static_cast<uint32_t>(desc.resourceFlags) & static_cast<uint32_t>(requiredFlags)) != static_cast<uint32_t>(requiredFlags)
         || (desc.castableFormats.size && !desc.castableFormats.data)) return false;
@@ -237,17 +237,17 @@ namespace {
 // merges them, and a placeholder admission entry so compiler resource order
 // is preserved. The invalid handle is what admission and recording skip on.
 constexpr uint64_t ReservedIdentityBit = uint64_t{1} << 63;
-BindingVersion PlaceholderBinding(uint32_t index, experimental::CompileResourceShape shape) {
+BindingVersion PlaceholderBinding(uint32_t index, compiler::CompileResourceShape shape) {
     BindingVersion binding;
     binding.identity = ReservedIdentityBit | index;
     binding.backingRevision = 1;
     binding.shape = shape;
     binding.owner = std::make_shared<const uint32_t>(index);
     binding.bound = false;
-    auto state = std::make_shared<experimental::PreparedBackingState>();
+    auto state = std::make_shared<compiler::PreparedBackingState>();
     state->graphResourceID = uint64_t{index} + 1;
     state->shape = shape;
-    state->regions = std::make_shared<const std::vector<experimental::PreparedStateRegion>>();
+    state->regions = std::make_shared<const std::vector<compiler::PreparedStateRegion>>();
     binding.admission = std::move(state);
     return binding;
 }
@@ -265,7 +265,7 @@ GraphEditTransaction::GraphEditTransaction(std::shared_ptr<const SelectedPublica
     Require(m_base && m_base->executable && m_base->executable->graph, "Invalid transaction source");
 }
 uint64_t GraphEditTransaction::BaseRevision() const noexcept { return m_base->revision; }
-experimental::GraphCompileStructure& GraphEditTransaction::EditStructure() {
+compiler::GraphCompileStructure& GraphEditTransaction::EditStructure() {
     return EditLogical().declarations;
 }
 LogicalGraph& GraphEditTransaction::EditLogical(bool structural) {
@@ -273,7 +273,7 @@ LogicalGraph& GraphEditTransaction::EditLogical(bool structural) {
     if (!m_logical) m_logical = *m_base->logical;
     return *m_logical;
 }
-ResourceSlotId GraphEditTransaction::AddResource(experimental::CompileResourceShape shape, BindingVersion binding) {
+ResourceSlotId GraphEditTransaction::AddResource(compiler::CompileResourceShape shape, BindingVersion binding) {
     MutationGuard mutation{m_failed};
     Require(binding.shape == shape && ((shape.mips && shape.slices)
         || (!shape.mips && !shape.slices && !shape.hasLayout)), "Invalid resource shape");
@@ -310,7 +310,7 @@ ResourceSlotId GraphEditTransaction::AddResource(experimental::CompileResourceSh
     ReplaceBinding(slot, std::move(binding));
     return slot;
 }
-ResourceSlotId GraphEditTransaction::ReserveResource(experimental::CompileResourceShape shape,
+ResourceSlotId GraphEditTransaction::ReserveResource(compiler::CompileResourceShape shape,
     std::optional<NativeBindingContract> contract) {
     MutationGuard mutation{m_failed};
     Require(shape.mips && shape.slices, "Reserved slots require a stateful resource contract");
@@ -391,7 +391,7 @@ void GraphEditTransaction::ValidatePass(PassId pass) const {
     Require(pass.index < logical.passSlots.size() && logical.passSlots[pass.index].active
         && pass.generation == logical.passSlots[pass.index].generation, "Stale pass");
 }
-PassId GraphEditTransaction::AddPass(experimental::CompilePass pass, std::optional<uint32_t> authoredOrder) {
+PassId GraphEditTransaction::AddPass(compiler::CompilePass pass, std::optional<uint32_t> authoredOrder) {
     MutationGuard mutation{m_failed};
     auto& logical = EditLogical();
     auto& structure = logical.declarations;
@@ -461,7 +461,7 @@ void GraphEditTransaction::RemovePass(PassId pass) {
     for (auto& group : logical.groups)
         std::erase_if(group.subscribers,[&](const auto& subscription) { return subscription.pass == pass; });
 }
-void GraphEditTransaction::ReplacePass(PassId pass, experimental::CompilePass declaration) {
+void GraphEditTransaction::ReplacePass(PassId pass, compiler::CompilePass declaration) {
     MutationGuard mutation{m_failed};
     auto& structure = EditStructure();
     ValidatePass(pass);
@@ -482,7 +482,7 @@ rhi::Resource SelectedPublication::ResolveNative(BindingToken token) const {
     return version.recording->resource;
 }
 BindingToken GraphEditTransaction::Declare(PassId pass, ResourceSlotId resource,
-    experimental::CompileRange range, experimental::CompileResourceState state) {
+    compiler::CompileRange range, compiler::CompileResourceState state) {
     MutationGuard mutation{m_failed};
     ValidatePass(pass);
     const auto shape = m_bindings.At(resource).shape;
@@ -575,8 +575,8 @@ ViewToken GraphEditTransaction::RequireView(BindingToken token, BindlessViewRequ
     ReplaceBinding(resource,std::move(replacement));
     return ViewToken(token,ordinal,id);
 }
-void GraphEditTransaction::DeclarePostcondition(BindingToken token, experimental::CompileRange range,
-    experimental::CompileResourceState state) {
+void GraphEditTransaction::DeclarePostcondition(BindingToken token, compiler::CompileRange range,
+    compiler::CompileResourceState state) {
     MutationGuard mutation{m_failed};
     const auto& logical = m_logical ? *m_logical : *m_base->logical;
     Require(token.domain == logical.domain, "Foreign postcondition binding");
@@ -601,7 +601,7 @@ void GraphEditTransaction::AddOrdering(PassId before, PassId after) {
     Require(before != after, "Self ordering cycle");
     structure.explicitEdges.emplace_back(before.index, after.index);
 }
-void GraphEditTransaction::SetQueues(std::vector<experimental::CompileQueue> queues) {
+void GraphEditTransaction::SetQueues(std::vector<compiler::CompileQueue> queues) {
     MutationGuard mutation{m_failed};
     Require(!queues.empty(), "Graph has no queues");
     EditStructure().queues = std::move(queues);
@@ -618,7 +618,7 @@ void GraphEditTransaction::ClearPlacementOrderings() {
     EditStructure().placementEdges.clear();
 }
 void GraphEditTransaction::ReplaceResourceContract(ResourceSlotId slot,
-    experimental::CompileResourceShape shape, BindingVersion binding) {
+    compiler::CompileResourceShape shape, BindingVersion binding) {
     MutationGuard mutation{m_failed};
     m_bindings.At(slot);
     Require(binding.shape == shape, "Replacement contract shape mismatch");
@@ -631,12 +631,12 @@ void GraphEditTransaction::ReplaceResourceContract(ResourceSlotId slot,
     ReplaceBinding(slot,std::move(binding));
 }
 ResourceSlotId GraphEditTransaction::AddSnapshot(std::shared_ptr<const ResourceBindingSnapshot> snapshot,
-    const experimental::PreparedBackingState& initial, uint64_t descriptorRevision, uint64_t contentRevision) {
+    const compiler::PreparedBackingState& initial, uint64_t descriptorRevision, uint64_t contentRevision) {
     MutationGuard guard{m_failed};
     return AddResource(initial.shape,BindingVersion::FromSnapshot(std::move(snapshot),initial,descriptorRevision,contentRevision));
 }
 void GraphEditTransaction::ReplaceSnapshot(ResourceSlotId slot, std::shared_ptr<const ResourceBindingSnapshot> snapshot,
-    const experimental::PreparedBackingState& initial, uint64_t descriptorRevision, uint64_t contentRevision) {
+    const compiler::PreparedBackingState& initial, uint64_t descriptorRevision, uint64_t contentRevision) {
     MutationGuard guard{m_failed};
     ReplaceBinding(slot,BindingVersion::FromSnapshot(std::move(snapshot),initial,descriptorRevision,contentRevision));
 }
@@ -779,7 +779,7 @@ void GraphEditTransaction::ReplaceBinding(ResourceSlotId slot, BindingVersion bi
     page->at(slot.index % BindingTable::PageSize) = std::move(binding);
     m_bindings.m_pages[pageIndex] = page;
 }
-ResourceGroupId GraphEditTransaction::AddGroup(experimental::CompileResourceShape shape,
+ResourceGroupId GraphEditTransaction::AddGroup(compiler::CompileResourceShape shape,
     std::vector<ResourceSlotId> members) {
     MutationGuard mutation{m_failed};
     Require(shape.mips && shape.slices, "Group requires a stateful resource contract");
@@ -863,7 +863,7 @@ void GraphEditTransaction::SetGroupResourceClass(ResourceGroupId id, rhi::Resour
     if (group.memberType != type) EditLogical().groups[id.index].memberType = type;
 }
 void GraphEditTransaction::DeclareGroupAccess(PassId pass, ResourceGroupId id,
-    experimental::CompileResourceState state, uint32_t phase, std::optional<experimental::CompileRange> range) {
+    compiler::CompileResourceState state, uint32_t phase, std::optional<compiler::CompileRange> range) {
     MutationGuard mutation{m_failed};
     auto& logical = EditLogical();
     Require(id.index < logical.groups.size() && logical.groups[id.index].active
@@ -877,10 +877,10 @@ void GraphEditTransaction::DeclareGroupAccess(PassId pass, ResourceGroupId id,
     }
     auto& subscribers = logical.groups[id.index].subscribers;
     const auto shape = logical.groups[id.index].memberShape;
-    const auto requested = range.value_or(experimental::CompileRange{0,shape.mips,0,shape.slices});
+    const auto requested = range.value_or(compiler::CompileRange{0,shape.mips,0,shape.slices});
     for (const auto& value : subscribers) {
         if (value.pass != pass) continue;
-        const auto previous = value.range.value_or(experimental::CompileRange{0,shape.mips,0,shape.slices});
+        const auto previous = value.range.value_or(compiler::CompileRange{0,shape.mips,0,shape.slices});
         Require(uint64_t{requested.mip} + requested.mips <= previous.mip
             || uint64_t{previous.mip} + previous.mips <= requested.mip
             || uint64_t{requested.slice} + requested.slices <= previous.slice
@@ -911,7 +911,7 @@ void GraphEditTransaction::RemoveGroup(ResourceGroupId id) {
     group.subscribers.clear();
 }
 std::shared_ptr<const SelectedPublication> GraphEditTransaction::Build(
-    experimental::CompileWorkspace& workspace, const std::atomic_bool& cancelled, bool validateAliasOrder) {
+    compiler::CompileWorkspace& workspace, const std::atomic_bool& cancelled, bool validateAliasOrder) {
     Require(!m_failed, "Publication transaction contains a failed edit");
     Require(m_base->revision != UINT64_MAX, "Publication revision exhausted");
     if (cancelled.load(std::memory_order_relaxed)) return {};
@@ -943,7 +943,7 @@ std::shared_ptr<const SelectedPublication> GraphEditTransaction::Build(
     if (m_structuralChanged) {
         Require(executable->structuralRevision != UINT64_MAX, "Executable revision exhausted");
         BT_ZONE_SCOPE("ORG.Persistent.BuildExecutable");
-        experimental::GraphCompileInput input;
+        compiler::GraphCompileInput input;
         input.structure = m_logical->declarations;
         // Epochs execute in their declared order, so the whole-frame schedule (and the
         // alias placement planned over it) orders every pass of an epoch before every
@@ -1007,7 +1007,7 @@ std::shared_ptr<const SelectedPublication> GraphEditTransaction::Build(
                     for (const auto member : group.members) {
                         pass.accesses.push_back({member.index,subscription.state.write});
                         pass.entryStates.push_back({member.index,
-                            subscription.range.value_or(experimental::CompileRange{0,group.memberShape.mips,0,group.memberShape.slices}),subscription.state});
+                            subscription.range.value_or(compiler::CompileRange{0,group.memberShape.mips,0,group.memberShape.slices}),subscription.state});
                     }
                 }
             }
@@ -1045,8 +1045,8 @@ std::shared_ptr<const SelectedPublication> GraphEditTransaction::Build(
                         // epoch order would be a cycle. An untagged pass (AllEpochs) is in every epoch: its phases stand.
                         if (const auto eu = m_logical->passSlots.at(u.pass.index).epoch, ev = m_logical->passSlots.at(v.pass.index).epoch;
                             eu != ev && eu != AllEpochs && ev != AllEpochs) continue;
-                        const auto ur = u.range.value_or(experimental::CompileRange{0,x.memberShape.mips,0,x.memberShape.slices});
-                        const auto vr = v.range.value_or(experimental::CompileRange{0,y.memberShape.mips,0,y.memberShape.slices});
+                        const auto ur = u.range.value_or(compiler::CompileRange{0,x.memberShape.mips,0,x.memberShape.slices});
+                        const auto vr = v.range.value_or(compiler::CompileRange{0,y.memberShape.mips,0,y.memberShape.slices});
                         if (uint64_t{ur.mip} + ur.mips <= vr.mip || uint64_t{vr.mip} + vr.mips <= ur.mip
                             || uint64_t{ur.slice} + ur.slices <= vr.slice || uint64_t{vr.slice} + vr.slices <= ur.slice) continue;
                         if (u.phase == v.phase) {
@@ -1127,14 +1127,14 @@ std::shared_ptr<const SelectedPublication> GraphEditTransaction::Build(
         {
             BT_ZONE_SCOPE("ORG.Persistent.LowerPassSlots");
             std::vector<uint32_t> dense(input.structure.passes.size(),UINT32_MAX);
-            std::vector<experimental::CompilePass> active;
+            std::vector<compiler::CompilePass> active;
             for (uint32_t i = 0; i < dense.size(); ++i) {
                 if (!m_logical->passSlots.at(i).active) continue;
                 dense[i] = static_cast<uint32_t>(active.size());
                 active.push_back(std::move(input.structure.passes[i]));
                 denseEpochs.push_back(m_logical->passSlots[i].epoch);
             }
-            auto lowerEdges = [&](experimental::DependencyEdges& edges) {
+            auto lowerEdges = [&](compiler::DependencyEdges& edges) {
                 for (auto& [from,to] : edges) {
                     Require(from < dense.size() && to < dense.size()
                         && dense[from] != UINT32_MAX && dense[to] != UINT32_MAX, "Ordering references retired pass");
@@ -1144,7 +1144,7 @@ std::shared_ptr<const SelectedPublication> GraphEditTransaction::Build(
             lowerEdges(input.structure.explicitEdges);
             lowerEdges(input.structure.placementEdges);
             if (input.analyzedDependencies) {
-                auto edges = std::make_shared<experimental::DependencyEdges>(*input.analyzedDependencies);
+                auto edges = std::make_shared<compiler::DependencyEdges>(*input.analyzedDependencies);
                 lowerEdges(*edges);
                 input.analyzedDependencies = std::move(edges);
             }
@@ -1155,7 +1155,7 @@ std::shared_ptr<const SelectedPublication> GraphEditTransaction::Build(
             BT_ZONE_SCOPE("ORG.Persistent.LowerResourceSlots");
             std::vector<uint32_t> dense(input.structure.resourceIDs.size(),UINT32_MAX);
             std::vector<uint64_t> identities;
-            std::vector<experimental::CompileResourceShape> shapes;
+            std::vector<compiler::CompileResourceShape> shapes;
             for (uint32_t i = 0; i < dense.size(); ++i) {
                 if (!m_logical->resourceActive.at(i) || canonical[i] != i) continue;
                 dense[i] = static_cast<uint32_t>(identities.size());
@@ -1176,17 +1176,17 @@ std::shared_ptr<const SelectedPublication> GraphEditTransaction::Build(
             input.structure.diagnosticResourceNames.clear();
         }
         input.structure.generation = executable->structuralRevision + 1;
-        experimental::NormalizeCompileInput(input);
-        auto compileInput = std::make_shared<const experimental::GraphCompileInput>(std::move(input));
-        auto graph = experimental::CompileGraph(compileInput, workspace, cancelled);
+        compiler::NormalizeCompileInput(input);
+        auto compileInput = std::make_shared<const compiler::GraphCompileInput>(std::move(input));
+        auto graph = compiler::CompileGraph(compileInput, workspace, cancelled);
         if (!graph) return {};
         Require(graph->states.complete, "Incomplete persistent state plan");
         if (validateAliasOrder && std::ranges::any_of(m_bindings.m_pages, [](const auto& page) {
             return std::ranges::any_of(*page, [](const auto& binding) { return binding.admission && binding.admission->aliasSize; });
         })) ValidateAliasOrder(*graph, m_bindings);
         const auto revision = executable->structuralRevision + 1;
-        auto generationOf = [&](std::shared_ptr<const experimental::CompiledGraph> compiled,
-                                std::shared_ptr<const experimental::GraphCompileInput> compiledInput) {
+        auto generationOf = [&](std::shared_ptr<const compiler::CompiledGraph> compiled,
+                                std::shared_ptr<const compiler::GraphCompileInput> compiledInput) {
             std::vector<ResourceSlotId> resourceSlots;
             resourceSlots.reserve(compiled->structure->resourceIDs.size());
             for (auto identity : compiled->structure->resourceIDs) {
@@ -1217,17 +1217,17 @@ std::shared_ptr<const SelectedPublication> GraphEditTransaction::Build(
         // state comes from the ledger - whatever ran before it, or did not.
         for (const auto epoch : epochSequence) {
             BT_ZONE_SCOPE("ORG.Persistent.BuildEpochExecutable");
-            experimental::GraphCompileInput split = *compileInput;
+            compiler::GraphCompileInput split = *compileInput;
             std::vector<uint32_t> remap(split.structure.passes.size(),UINT32_MAX);
-            std::vector<experimental::CompilePass> passes;
+            std::vector<compiler::CompilePass> passes;
             for (uint32_t i = 0; i < remap.size(); ++i) {
                 if (denseEpochs[i] != epoch && denseEpochs[i] != AllEpochs) continue;
                 remap[i] = static_cast<uint32_t>(passes.size());
                 passes.push_back(split.structure.passes[i]);
             }
             if (passes.empty()) continue;
-            auto keep = [&](const experimental::DependencyEdges& edges) {
-                experimental::DependencyEdges kept;
+            auto keep = [&](const compiler::DependencyEdges& edges) {
+                compiler::DependencyEdges kept;
                 for (auto [from,to] : edges)
                     if (remap[from] != UINT32_MAX && remap[to] != UINT32_MAX) kept.emplace_back(remap[from],remap[to]);
                 return kept;
@@ -1236,11 +1236,11 @@ std::shared_ptr<const SelectedPublication> GraphEditTransaction::Build(
             split.structure.explicitEdges = keep(split.structure.explicitEdges);
             split.structure.placementEdges = keep(split.structure.placementEdges);
             if (split.analyzedDependencies)
-                split.analyzedDependencies = std::make_shared<const experimental::DependencyEdges>(keep(*split.analyzedDependencies));
+                split.analyzedDependencies = std::make_shared<const compiler::DependencyEdges>(keep(*split.analyzedDependencies));
             split.expectedEdges.reset();
             split.expectedSchedulingEdges.reset();
-            auto splitInput = std::make_shared<const experimental::GraphCompileInput>(std::move(split));
-            auto splitGraph = experimental::CompileGraph(splitInput, workspace, cancelled);
+            auto splitInput = std::make_shared<const compiler::GraphCompileInput>(std::move(split));
+            auto splitGraph = compiler::CompileGraph(splitInput, workspace, cancelled);
             if (!splitGraph) return {};
             Require(splitGraph->states.complete, "Incomplete persistent epoch state plan");
             if (validateAliasOrder && std::ranges::any_of(m_bindings.m_pages, [](const auto& page) {
@@ -1264,11 +1264,11 @@ std::shared_ptr<const SelectedPublication> GraphEditTransaction::Build(
 }
 GraphProgram::GraphProgram(std::function<void(std::shared_ptr<const void>)> retireOwnership)
     : m_retireOwnership(std::move(retireOwnership)) {
-    experimental::GraphCompileInput input;
-    experimental::CompileWorkspace workspace;
+    compiler::GraphCompileInput input;
+    compiler::CompileWorkspace workspace;
     std::atomic_bool cancelled{false};
-    auto compileInput = std::make_shared<const experimental::GraphCompileInput>(std::move(input));
-    auto graph = experimental::CompileGraph(compileInput, workspace, cancelled);
+    auto compileInput = std::make_shared<const compiler::GraphCompileInput>(std::move(input));
+    auto graph = compiler::CompileGraph(compileInput, workspace, cancelled);
     auto logical = std::make_shared<LogicalGraph>();
     logical->domain = TakeIdentity(nextProgramDomain);
     auto layout = BuildPersistentExecutionLayout(0,graph,compileInput,0);
@@ -1353,7 +1353,7 @@ bool SynchronousAdmission::RetireAliasMetadata(const RetirementTicket& ticket) {
     return m_aliases.RetireCompleted(ticket.heapIdentity, ticket.heap, m_completed);
 }
 BindingVersion BindingVersion::FromSnapshot(std::shared_ptr<const ResourceBindingSnapshot> snapshot,
-    const experimental::PreparedBackingState& initial, uint64_t descriptorRevision, uint64_t contentRevision) {
+    const compiler::PreparedBackingState& initial, uint64_t descriptorRevision, uint64_t contentRevision) {
     Require(snapshot && snapshot->allocationOwner && snapshot->backingGeneration, "Incomplete publication snapshot");
     const auto handle = snapshot->resource.GetHandle();
     Require(handle.valid() && handle.index == initial.resource.index && handle.generation == initial.resource.generation,
@@ -1376,11 +1376,11 @@ BindingVersion BindingVersion::FromSnapshot(std::shared_ptr<const ResourceBindin
     result.shape = initial.shape;
     result.owner = snapshot;
     result.recording = std::move(snapshot);
-    result.admission = std::make_shared<const experimental::PreparedBackingState>(initial);
+    result.admission = std::make_shared<const compiler::PreparedBackingState>(initial);
     return result;
 }
 FrameAdmission SynchronousAdmission::Prepare(std::shared_ptr<const SelectedPublication> publication,
-    std::span<const experimental::ExecutionTimelinePoint> queues, std::span<const FrameProducerWait> producerWaits,
+    std::span<const compiler::ExecutionTimelinePoint> queues, std::span<const FrameProducerWait> producerWaits,
     std::span<const FrameIncomingState> incomingStates, std::span<const FrameRebinding> rebindings) {
     BT_ZONE_SCOPE("ORG.Persistent.PrepareAdmission");
     Require(publication && publication->executable && publication->executable->graph, "No executable publication");
@@ -1423,17 +1423,17 @@ FrameAdmission SynchronousAdmission::Prepare(std::shared_ptr<const SelectedPubli
         }
     }
     frame.incomingWaits.resize(graph.batches.size());
-    const auto appendProducerWait = [&](uint32_t batch, experimental::ExecutionTimelinePoint completion) {
+    const auto appendProducerWait = [&](uint32_t batch, compiler::ExecutionTimelinePoint completion) {
         Require(completion.timeline && completion.value, "Invalid frame producer completion");
         const auto consumerQueue = graph.batches.at(batch).queue;
-        const auto producerQueue = std::ranges::find(queues,completion.timeline,&experimental::ExecutionTimelinePoint::timeline);
+        const auto producerQueue = std::ranges::find(queues,completion.timeline,&compiler::ExecutionTimelinePoint::timeline);
         if (producerQueue != queues.end() && completion.value > producerQueue->value)
             throw std::logic_error("Frame producer wait depends on future graph-queue work: timeline="
                 + std::to_string(completion.timeline) + " value=" + std::to_string(completion.value)
                 + " queueValue=" + std::to_string(producerQueue->value));
         if (completion.timeline == queues[consumerQueue].timeline) return;
         auto& waits = frame.incomingWaits[batch];
-        const auto found = std::ranges::find(waits,completion.timeline,&experimental::ExecutionTimelinePoint::timeline);
+        const auto found = std::ranges::find(waits,completion.timeline,&compiler::ExecutionTimelinePoint::timeline);
         if (found == waits.end()) waits.push_back(completion);
         else found->value = std::max(found->value,completion.value);
     };
@@ -1565,7 +1565,7 @@ SynchronousAdmission::SynchronousAdmission(size_t frameCapacity,
     static std::atomic_uint64_t nextDomain{1};
     m_domain = nextDomain.fetch_add(1,std::memory_order_relaxed);
 }
-void SynchronousAdmission::Commit(const FrameAdmission& frame, const experimental::GraphExecutionTimeline& receipt,
+void SynchronousAdmission::Commit(const FrameAdmission& frame, const compiler::GraphExecutionTimeline& receipt,
     uint32_t signaledBatches) {
     // Open admissions commit in the order they were prepared. Closed ones depend on nothing prepared around
     // them, so they commit in the order they were submitted, whatever order they were prepared in (the
@@ -1587,9 +1587,9 @@ void SynchronousAdmission::Commit(const FrameAdmission& frame, const experimenta
         previous = batch.signal.value;
     }
     RetainedFrame retained{frame.publication,{}};
-    auto appendCompletion = [&](experimental::ExecutionTimelinePoint point) {
+    auto appendCompletion = [&](compiler::ExecutionTimelinePoint point) {
         Require(point.timeline && point.value, "Invalid frame completion");
-        auto found = std::ranges::find(retained.completions,point.timeline,&experimental::ExecutionTimelinePoint::timeline);
+        auto found = std::ranges::find(retained.completions,point.timeline,&compiler::ExecutionTimelinePoint::timeline);
         if (found == retained.completions.end()) retained.completions.push_back(point);
         else found->value = (std::max)(found->value,point.value);
     };
@@ -1615,7 +1615,7 @@ void SynchronousAdmission::Abandon(const FrameAdmission& frame) {
     Require(m_closed || found == m_pending.begin(), "Out-of-order abandonment of an open admission");
     m_pending.erase(found);
 }
-void SynchronousAdmission::ExtendSubmitted(experimental::ExecutionTimelinePoint point) {
+void SynchronousAdmission::ExtendSubmitted(compiler::ExecutionTimelinePoint point) {
     Require(point.timeline && point.value, "Invalid submitted extension");
     auto& submitted = m_submitted[point.timeline];
     Require(point.value >= submitted, "Submitted extension is not monotonic");
@@ -1625,7 +1625,7 @@ uint64_t SynchronousAdmission::Submitted(uint64_t timeline) const noexcept {
     const auto found = m_submitted.find(timeline);
     return found == m_submitted.end() ? 0 : found->second;
 }
-size_t SynchronousAdmission::RetireCompleted(std::span<const experimental::ExecutionTimelinePoint> completed) {
+size_t SynchronousAdmission::RetireCompleted(std::span<const compiler::ExecutionTimelinePoint> completed) {
     auto observations = m_completed;
     std::map<uint64_t,bool> seen;
     for (const auto point : completed) {
@@ -1677,7 +1677,7 @@ void PublicationCoordinator::Start(const std::shared_ptr<Job>& job) {
     job->state = PublicationState::Pending;
     if (!m_tasks->Submit(m_scope,runtime::TaskPriority::Streaming,"ORG.Publication.Build",[job,&program = m_program] {
         try {
-            experimental::CompileWorkspace workspace;
+            compiler::CompileWorkspace workspace;
             if (job->author) job->transaction.emplace(program.BeginEdit());
             if (job->author) job->author(*job->transaction);
             job->ready = job->transaction->Build(workspace,job->cancelled);

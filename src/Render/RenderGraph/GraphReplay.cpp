@@ -8,7 +8,7 @@
 #include <cstdio>
 #include <mutex>
 
-namespace org::experimental {
+namespace org::compiler {
 namespace {
 constexpr size_t Limit = 2000000;
 GraphCompileStructure ReadSnapshot(std::istream&, bool requireEnd);

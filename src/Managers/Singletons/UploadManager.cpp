@@ -145,69 +145,38 @@ bool UploadManager::IsUploadTargetValid(const UploadTarget& target, const char* 
 		target.h.GetEpoch(),
 		file ? file : "<unknown>",
 		line);
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 	throw std::runtime_error("UploadManager: invalid registry handle uploads detected. This likely indicates a bug where uploads are being queued referencing registry handles that have since been released.");
-#endif
 	return false;
 }
 
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 void UploadManager::UploadData(const void* data, size_t size, UploadTarget resourceToUpdate, size_t dataBufferOffset, const char* file, int line)
-#else
-void UploadManager::UploadData(const void* data, size_t size, UploadTarget resourceToUpdate, size_t dataBufferOffset)
-#endif
 {
 	if (!m_uploadInstance) {
 		Initialize();
 	}
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 	m_uploadInstance->UploadData(data, size, std::move(resourceToUpdate), dataBufferOffset, file, line);
-#else
-	m_uploadInstance->UploadData(data, size, std::move(resourceToUpdate), dataBufferOffset);
-#endif
 }
 
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 void UploadManager::UploadDataBatch(UploadTarget resourceToUpdate, std::span<const org::runtime::UploadRegion> regions, const char* file, int line)
-#else
-void UploadManager::UploadDataBatch(UploadTarget resourceToUpdate, std::span<const org::runtime::UploadRegion> regions)
-#endif
 {
 	if (!m_uploadInstance) {
 		Initialize();
 	}
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 	m_uploadInstance->UploadDataBatch(std::move(resourceToUpdate), regions, file, line);
-#else
-	m_uploadInstance->UploadDataBatch(std::move(resourceToUpdate), regions);
-#endif
 }
 
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 void UploadManager::PostTextureSubresources(UploadTarget target, rhi::Format fmt, uint32_t baseWidth, uint32_t baseHeight,
 	uint32_t depthOrLayers, uint32_t mipLevels, uint32_t arraySize,
 	std::shared_ptr<const std::vector<rhi::helpers::SubresourceData>> subresources,
 	std::shared_ptr<const void> keepAlive, const char* file, int line)
-#else
-void UploadManager::PostTextureSubresources(UploadTarget target, rhi::Format fmt, uint32_t baseWidth, uint32_t baseHeight,
-	uint32_t depthOrLayers, uint32_t mipLevels, uint32_t arraySize,
-	std::shared_ptr<const std::vector<rhi::helpers::SubresourceData>> subresources,
-	std::shared_ptr<const void> keepAlive)
-#endif
 {
 	if (!m_uploadInstance) {
 		Initialize();
 	}
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 	m_uploadInstance->PostTextureSubresources(std::move(target), fmt, baseWidth, baseHeight, depthOrLayers,
 		mipLevels, arraySize, std::move(subresources), std::move(keepAlive), file, line);
-#else
-	m_uploadInstance->PostTextureSubresources(std::move(target), fmt, baseWidth, baseHeight, depthOrLayers,
-		mipLevels, arraySize, std::move(subresources), std::move(keepAlive));
-#endif
 }
 
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 void UploadManager::UploadTextureSubresources(
 	UploadTarget target,
 	rhi::Format fmt,
@@ -220,18 +189,6 @@ void UploadManager::UploadTextureSubresources(
 	uint32_t srcCount,
 	const char* file,
 	int line)
-#else
-void UploadManager::UploadTextureSubresources(
-	UploadTarget target,
-	rhi::Format fmt,
-	uint32_t baseWidth,
-	uint32_t baseHeight,
-	uint32_t depthOrLayers,
-	uint32_t mipLevels,
-	uint32_t arraySize,
-	const rhi::helpers::SubresourceData* srcSubresources,
-	uint32_t srcCount)
-#endif
 {
 	if (target.kind == UploadTarget::Kind::PinnedShared && target.pinned &&
 		!target.pinned->IsRenderGraphManaged()) {
@@ -242,7 +199,6 @@ void UploadManager::UploadTextureSubresources(
 	if (!m_uploadInstance) {
 		Initialize();
 	}
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 	m_uploadInstance->UploadTextureSubresources(
 		std::move(target),
 		fmt,
@@ -255,18 +211,6 @@ void UploadManager::UploadTextureSubresources(
 		srcCount,
 		file,
 		line);
-#else
-	m_uploadInstance->UploadTextureSubresources(
-		std::move(target),
-		fmt,
-		baseWidth,
-		baseHeight,
-		depthOrLayers,
-		mipLevels,
-		arraySize,
-		srcSubresources,
-		srcCount);
-#endif
 }
 
 // The instance is created on first use, like UploadData's: a frame whose uploads are all staged makes no

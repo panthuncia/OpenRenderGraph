@@ -2,8 +2,8 @@
 #include <map>
 
 #include "Render/RenderGraph/RenderGraph.h"
-#include "Render/RenderGraph/ExperimentalGraphCompiler.h"
-#include "Render/RenderGraph/ExperimentalExecutionState.h"
+#include "Render/RenderGraph/GraphCompiler.h"
+#include "Render/RenderGraph/ExecutionState.h"
 #include "FrameRecording.h"
 
 
@@ -13,7 +13,7 @@
 namespace org {
 
 struct RenderGraph::CompilerState {
-    experimental::CompileWorkspace synchronousCompileWorkspace;
+    compiler::CompileWorkspace synchronousCompileWorkspace;
     std::map<uint32_t, std::shared_ptr<PreparedInvocationArena>> invocationArenas;
     std::shared_ptr<runtime::ITaskScope> ownershipRetirementScope;
     std::shared_ptr<runtime::ITaskScope> persistentBuildScope; // worker-side structural builds

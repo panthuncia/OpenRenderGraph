@@ -140,8 +140,10 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/RenderPasses/Base/RenderPass.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PassExecutionContext.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraph.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/ExperimentalGraphCompiler.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/GraphCompiler.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/PersistentGraph.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraphDiagnostics.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraphStructural.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraphPersistent.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraphPersistentExecute.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraphPersistentStructural.cpp"
@@ -156,7 +158,7 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/RenderGraph/GraphReplay.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/RenderGraph/PersistentGraph.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/RenderPasses/Base/PersistentTypedPass.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/ExperimentalExecutionState.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/ExecutionState.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/InteropAllocator.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/FrameRecording.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/ExternalEpochExecution.cpp"
@@ -329,6 +331,10 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
     add_executable(OpenRenderGraphHeadlessBenchmark tests/HeadlessGraphBenchmark.cpp tests/GraphReplayRunner.h)
     target_compile_features(OpenRenderGraphHeadlessBenchmark PRIVATE cxx_std_23)
     target_link_libraries(OpenRenderGraphHeadlessBenchmark PRIVATE OpenRenderGraph)
+    add_test(NAME OpenRenderGraphHeadlessBenchmark COMMAND OpenRenderGraphHeadlessBenchmark)
+    add_test(NAME OpenRenderGraphHeadlessBenchmark.Sequence COMMAND OpenRenderGraphHeadlessBenchmark
+        --sequence "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/binding_rotation_tail.orgsequence")
+    set_tests_properties(OpenRenderGraphHeadlessBenchmark OpenRenderGraphHeadlessBenchmark.Sequence PROPERTIES TIMEOUT 120)
     add_executable(OpenRenderGraphRecordingRecipeTests tests/RecordingRecipeTests.cpp)
     target_compile_features(OpenRenderGraphRecordingRecipeTests PRIVATE cxx_std_23)
     target_compile_definitions(OpenRenderGraphRecordingRecipeTests PRIVATE NOMINMAX)

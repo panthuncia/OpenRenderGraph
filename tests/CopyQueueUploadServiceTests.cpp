@@ -9,6 +9,7 @@
 //    and oversize uploads take a dedicated page that is not recycled.
 
 #include <Render/Runtime/CopyQueueUploadService.h>
+#include "TestSupport.h"
 #include <Render/Runtime/RuntimeDevice.h>
 #include <Resources/ExternalBufferResource.h>
 #include <rhi.h>
@@ -24,7 +25,6 @@
 #include <thread>
 #include <vector>
 
-#define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "CHECK failed at line %d: %s\n", __LINE__, #x); return __LINE__; } } while (false)
 
 namespace {
 

@@ -26,13 +26,8 @@ runtime::IDescriptorService& RenderGraphPass::DescriptorService() const {
 
 void RenderGraphPass::UploadBufferData(const void* data, size_t size,
     runtime::UploadTarget target, size_t offset, std::source_location source) const {
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
     UploadService().UploadData(data, size, std::move(target), offset,
         source.file_name(), static_cast<int>(source.line()));
-#else
-    (void)source;
-    UploadService().UploadData(data, size, std::move(target), offset);
-#endif
 }
 
 RenderPass::~RenderPass() = default;

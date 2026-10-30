@@ -815,12 +815,7 @@ std::shared_ptr<org::runtime::IUploadService> BufferBase::RetainBufferUploadServ
 
 void BufferBase::UploadBufferData(const void* data, size_t size, org::runtime::UploadTarget target,
     size_t offset, const char* file, int line) const {
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
     RetainBufferUploadService()->UploadData(data, size, std::move(target), offset, file, line);
-#else
-    (void)file; (void)line;
-    RetainBufferUploadService()->UploadData(data, size, std::move(target), offset);
-#endif
 }
 
 void BufferBase::ApplyMetadataToBacking(const EntityComponentBundle& bundle) {

@@ -19,8 +19,8 @@ struct ReplayRunResult {
 // GPU-free fixture adapter. Only synthetic physical identities are supplied by
 // this layer; graph edits, compilation, selection and admission are production.
 // Sequence v3 includes external waits/states, but not recording workloads or authored physical aliasing.
-inline ReplayRunResult RunGraphReplaySequence(const experimental::GraphReplaySequence& sequence) {
-    using namespace experimental;
+inline ReplayRunResult RunGraphReplaySequence(const compiler::GraphReplaySequence& sequence) {
+    using namespace compiler;
     using namespace persistent;
     using Clock = std::chrono::steady_clock;
     const auto milliseconds = [](auto since) {

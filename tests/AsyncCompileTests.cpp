@@ -1,6 +1,7 @@
-#include "Render/RenderGraph/ExperimentalGraphCompiler.h"
+#include "Render/RenderGraph/GraphCompiler.h"
+#include "TestSupport.h"
 #include "Render/BindingTable.h"
-#include "Render/RenderGraph/ExperimentalExecutionState.h"
+#include "Render/RenderGraph/ExecutionState.h"
 #include <BasicTelemetry/Telemetry.h>
 #include <algorithm>
 #include <barrier>
@@ -11,9 +12,8 @@
 #include <stdexcept>
 #include <thread>
 
-using namespace org::experimental;
+using namespace org::compiler;
 using namespace org::runtime;
-#define CHECK(...) do { if (!(__VA_ARGS__)) { std::fprintf(stderr, "Check failed at %d: %s\n", __LINE__, #__VA_ARGS__); std::abort(); } } while (false)
 
 struct PayloadLifecycleProbe final : IFramePayloadLifecycle {
     mutable std::atomic_uint32_t abandonCount{0};
@@ -70,30 +70,30 @@ void DiagnosticPassAttribution() {
     for (auto& pass : input.structure.passes)
         pass.entryStates.push_back({0, {0, 1, 0, 1}, {0, 0, 0, pass.accesses.front().write}});
     NormalizeCompileInput(input);
-    CHECK(input.structure.diagnosticResourceNames == std::vector<std::string>{"unusedTexture", "frameBuffer"});
+    ENSURE(input.structure.diagnosticResourceNames == std::vector<std::string>{"unusedTexture", "frameBuffer"});
     std::atomic_bool cancelled{false};
     CompileWorkspace workspace;
     basic_telemetry::Session session({ .mode = basic_telemetry::CaptureMode::Trace,
         .traceRootScopes = {"ORG.FreshCompile.DependencyCompile"} });
     const auto graph = workspace.Compile(std::make_shared<const GraphCompileInput>(input), cancelled);
-    CHECK(graph && graph->states.complete);
+    ENSURE(graph && graph->states.complete);
     const auto snapshot = session.Snapshot();
     for (const auto stage : {"ORG.FreshCompile.Dependencies.Pass", "ORG.FreshCompile.Schedule.Pass",
         "ORG.FreshCompile.States.Pass", "ORG.FreshCompile.Boundary.Pass",
         "ORG.FreshCompile.IncomingBoundary.Pass"}) {
         const auto definition = std::ranges::find_if(snapshot.scopeDefinitions,
             [&](const auto& d) { return d.name == stage; });
-        CHECK(definition != snapshot.scopeDefinitions.end());
+        ENSURE(definition != snapshot.scopeDefinitions.end());
         for (const auto& label : input.structure.diagnosticPassNames)
-            CHECK(std::ranges::count_if(snapshot.events, [&](const auto& e) {
+            ENSURE(std::ranges::count_if(snapshot.events, [&](const auto& e) {
                 return e.scopeId == definition->id && e.text == label;
             }) == 1);
     }
     input.structure.diagnosticPassNames.clear();
     input.structure.diagnosticResourceNames.clear();
     const auto reference = workspace.Compile(std::make_shared<const GraphCompileInput>(input), cancelled);
-    CHECK(reference && reference->edges == graph->edges && reference->batches == graph->batches);
-    CHECK(reference->states.steps == graph->states.steps);
+    ENSURE(reference && reference->edges == graph->edges && reference->batches == graph->batches);
+    ENSURE(reference->states.steps == graph->states.steps);
 }
 
 int main() {
@@ -126,7 +126,7 @@ int main() {
             CompileWorkspace workspace;
             std::atomic_bool cancelled{false};
             auto graph = CompileGraph(std::make_shared<const GraphCompileInput>(std::move(input)), workspace, cancelled);
-            CHECK(graph && graph->stateValidationError.empty());
+            ENSURE(graph && graph->stateValidationError.empty());
             return *graph;
         };
         const std::array queues{ExecutionTimelinePoint{11, 0}, ExecutionTimelinePoint{22, 0}};
@@ -138,7 +138,7 @@ int main() {
         auto readMip0 = makeGraph(false, 1, 0);
         std::vector<std::vector<ExecutionTimelinePoint>> waits(1);
         ledger.AppendIncomingWaits(readMip0, std::span{&backing, size_t{1}}, queues, waits);
-        CHECK(waits[0] == std::vector<ExecutionTimelinePoint>{{11, 5}});
+        ENSURE(waits[0] == std::vector<ExecutionTimelinePoint>{{11, 5}});
         GraphExecutionTimeline second;
         second.batches = {{{22, 7}, {}}};
         ledger.Commit(readMip0, std::span{&backing, size_t{1}}, second);
@@ -146,13 +146,13 @@ int main() {
         auto writeMip0Again = makeGraph(true, 0, 0);
         waits.assign(1, {});
         ledger.AppendIncomingWaits(writeMip0Again, std::span{&backing, size_t{1}}, queues, waits);
-        CHECK(waits[0] == std::vector<ExecutionTimelinePoint>{{22, 7}});
+        ENSURE(waits[0] == std::vector<ExecutionTimelinePoint>{{22, 7}});
 
         // A disjoint mip has no dependency on mip zero.
         auto readMip1 = makeGraph(false, 1, 1);
         waits.assign(1, {});
         ledger.AppendIncomingWaits(readMip1, std::span{&backing, size_t{1}}, queues, waits);
-        CHECK(waits[0].empty());
+        ENSURE(waits[0].empty());
     }
 
     // Physical aliases are ordered by the realized heap interval even when
@@ -176,7 +176,7 @@ int main() {
             CompileWorkspace workspace;
             std::atomic_bool cancelled{false};
             auto graph = CompileGraph(std::make_shared<const GraphCompileInput>(std::move(input)), workspace, cancelled);
-            CHECK(graph && graph->stateValidationError.empty());
+            ENSURE(graph && graph->stateValidationError.empty());
             return *graph;
         };
         const auto* heap = reinterpret_cast<const org::AliasHeapGeneration*>(uintptr_t{1});
@@ -202,25 +202,25 @@ int main() {
         auto secondGraph = makeGraph(102, 1);
         std::vector<std::vector<ExecutionTimelinePoint>> waits(1);
         ledger.AppendIncomingWaits(secondGraph, std::span{&second, size_t{1}}, queues, waits);
-        CHECK(waits[0] == std::vector<ExecutionTimelinePoint>{{11, 9}});
+        ENSURE(waits[0] == std::vector<ExecutionTimelinePoint>{{11, 9}});
         GraphExecutionTimeline secondSubmitted;
         secondSubmitted.batches = {{{22, 12}, {}}};
         ledger.Commit(secondGraph, std::span{&second, size_t{1}}, secondSubmitted);
 
         std::vector firstAgain{first};
         auto activations = ledger.ApplyInitialStates(firstGraph, firstAgain);
-        CHECK(activations.size() == 1);
-        CHECK(activations[0].index == first.resource.index && activations[0].generation == first.resource.generation);
+        ENSURE(activations.size() == 1);
+        ENSURE(activations[0].index == first.resource.index && activations[0].generation == first.resource.generation);
         // Activation is returned to state admission; this ledger does not
         // rewrite the immutable selected backing snapshot.
-        CHECK(!firstAgain[0].regions);
+        ENSURE(!firstAgain[0].regions);
 
         auto disjointGraph = makeGraph(103, 1);
         waits.assign(1, {});
         ledger.AppendIncomingWaits(disjointGraph, std::span{&disjoint, size_t{1}}, queues, waits);
-        CHECK(waits[0].empty());
+        ENSURE(waits[0].empty());
         std::vector disjointCopy{disjoint};
-        CHECK(ledger.ApplyInitialStates(disjointGraph, disjointCopy).empty());
+        ENSURE(ledger.ApplyInitialStates(disjointGraph, disjointCopy).empty());
     }
 
     // Independent linear-ready selection and recursive longest-path oracle.
@@ -245,7 +245,7 @@ int main() {
                     if (!visited[i] && !remaining[i] && (best == UINT32_MAX
                         || authoredOrder[i] < authoredOrder[best]
                         || (authoredOrder[i] == authoredOrder[best] && i < best))) best = i;
-                CHECK(best != UINT32_MAX);
+                ENSURE(best != UINT32_MAX);
                 visited[best] = true; expected.push_back(best);
                 for (auto next : successors[best]) --remaining[next];
             }
@@ -266,14 +266,14 @@ int main() {
                         [&](Index i) -> const auto& { return successors[i]; },
                         [&](Index i) { return degrees[i]; }, [=] { return cancel; }, scratch, ready, order);
                 };
-                CHECK(run(true) == org::compiler::TopologyResult::Cancelled);
-                CHECK(run(false) == org::compiler::TopologyResult::Complete);
-                CHECK(std::equal(order.begin(), order.end(), expected.begin(), expected.end()));
+                ENSURE(run(true) == org::compiler::TopologyResult::Cancelled);
+                ENSURE(run(false) == org::compiler::TopologyResult::Complete);
+                ENSURE(std::equal(order.begin(), order.end(), expected.begin(), expected.end()));
                 org::compiler::ComputeCriticality(order,
                     [&](Index i) -> const auto& { return successors[i]; },
                     [&](Index i) { return criticality[i]; },
                     [&](Index i, uint32_t value) { criticality[i] = value; });
-                CHECK(criticality == longest);
+                ENSURE(criticality == longest);
             };
             check.operator()<uint32_t>();
             check.operator()<size_t>();
@@ -292,22 +292,22 @@ int main() {
         };
         auto selected = select([](uint32_t queue) { return queue == 0; },
             [](uint32_t node, uint32_t queue) { return node != 2 || queue != 0; });
-        CHECK(selected && *selected == (std::pair<size_t, uint32_t>{0, 2}));
+        ENSURE(selected && *selected == (std::pair<size_t, uint32_t>{0, 2}));
         selected = select([](uint32_t) { return false; },
             [](uint32_t node, uint32_t queue) { return node == 2 && queue == 2; });
-        CHECK(selected && *selected == (std::pair<size_t, uint32_t>{0, 2}));
+        ENSURE(selected && *selected == (std::pair<size_t, uint32_t>{0, 2}));
         selected = select([](uint32_t) { return false; },
             [](uint32_t, uint32_t) { return false; });
-        CHECK(!selected);
+        ENSURE(!selected);
     }
     std::atomic_bool cancelled{false};
     CompileWorkspace workspace;
     auto graph = CompileGraph(std::make_shared<const GraphCompileInput>(Input()), workspace, cancelled);
-    CHECK(graph->edges == *Input().expectedEdges);
-    CHECK((graph->topologicalOrder == std::vector<uint32_t>{0,1,2}));
-    CHECK((graph->criticality == std::vector<uint32_t>{2,1,0}));
-    CHECK(graph->stage == CompiledGraphStage::SymbolicSchedule);
-    CHECK(ValidateSymbolicSchedule(Input(), *graph).empty());
+    ENSURE(graph->edges == *Input().expectedEdges);
+    ENSURE((graph->topologicalOrder == std::vector<uint32_t>{0,1,2}));
+    ENSURE((graph->criticality == std::vector<uint32_t>{2,1,0}));
+    ENSURE(graph->stage == CompiledGraphStage::SymbolicSchedule);
+    ENSURE(ValidateSymbolicSchedule(Input(), *graph).empty());
     {
         auto packedInput = Input();
         packedInput.structure.resourceIDs = {1, 2};
@@ -317,35 +317,35 @@ int main() {
         packedInput.expectedEdges.reset();
         auto owned = std::make_shared<const GraphCompileInput>(packedInput);
         auto packed = workspace.Compile(owned, cancelled);
-        CHECK(packed->batches.size() == 1);
-        CHECK(packed->batches[0].passes == (std::vector<uint32_t>{0, 1}));
-        CHECK(ValidateSymbolicSchedule(packedInput, *packed).empty());
+        ENSURE(packed->batches.size() == 1);
+        ENSURE(packed->batches[0].passes == (std::vector<uint32_t>{0, 1}));
+        ENSURE(ValidateSymbolicSchedule(packedInput, *packed).empty());
         auto bundle = std::make_shared<const CompiledGraphBundle>(CompiledGraphBundle{1, packed, owned});
         auto layout = BuildExecutionLayout(bundle, *owned);
-        CHECK(layout->placements == (std::vector<ExecutionPassPlacement>{{0,0,0},{1,0,0}}));
+        ENSURE(layout->placements == (std::vector<ExecutionPassPlacement>{{0,0,0},{1,0,0}}));
     }
     {
         auto prepared = std::make_shared<const GraphCompileInput>(Input());
         auto compatibleGraph = CompileGraph(prepared, workspace, cancelled);
         CompiledGraphBundle compatible{1, compatibleGraph, prepared};
-        CHECK(IsExecutionCompatible(compatible, *prepared));
+        ENSURE(IsExecutionCompatible(compatible, *prepared));
         auto compatibleOwner = std::make_shared<const CompiledGraphBundle>(compatible);
         auto layout = BuildExecutionLayout(compatibleOwner, *prepared);
-        CHECK(layout->bundle == compatibleOwner);
-        CHECK(layout->placements == (std::vector<ExecutionPassPlacement>{
+        ENSURE(layout->bundle == compatibleOwner);
+        ENSURE(layout->placements == (std::vector<ExecutionPassPlacement>{
             {0,0,0}, {1,1,0}, {2,2,0}}));
         auto wrongGeneration = Input(2);
-        CHECK(!IsExecutionCompatible(compatible, wrongGeneration));
+        ENSURE(!IsExecutionCompatible(compatible, wrongGeneration));
         auto duplicateMap = Input();
         duplicateMap.structure.passes[2].preparedPassIndex = 1;
         auto duplicateGraph = CompileGraph(
             std::make_shared<const GraphCompileInput>(duplicateMap), workspace, cancelled);
-        CHECK(!IsExecutionCompatible(CompiledGraphBundle{2, duplicateGraph,
+        ENSURE(!IsExecutionCompatible(CompiledGraphBundle{2, duplicateGraph,
             std::make_shared<const GraphCompileInput>(duplicateMap)}, duplicateMap));
         bool rejectedLayout = false;
         try { BuildExecutionLayout(compatibleOwner, wrongGeneration); }
         catch (const std::invalid_argument&) { rejectedLayout = true; }
-        CHECK(rejectedLayout);
+        ENSURE(rejectedLayout);
     }
     // Admission reserves distinct values for each execution, but publishes only
     // batches the backend actually submitted. No compile request consumes them.
@@ -361,36 +361,36 @@ int main() {
         std::vector<std::vector<ExecutionTimelinePoint>> waits(3);
         waits[0] = {{30, 2}, {30, 7}, {30, 1}, {10, 100}};
         auto first = admission.Prepare(bundle, waits);
-        CHECK(first->batches[0].signal == (ExecutionTimelinePoint{10, 101}));
-        CHECK(first->batches[1].signal == (ExecutionTimelinePoint{20, 201}));
-        CHECK(first->batches[2].signal == (ExecutionTimelinePoint{10, 102}));
-        CHECK(first->batches[0].waits == (std::vector<ExecutionTimelinePoint>{{10,100},{30,7}}));
-        CHECK(first->batches[1].waits == (std::vector<ExecutionTimelinePoint>{{10,101}}));
+        ENSURE(first->batches[0].signal == (ExecutionTimelinePoint{10, 101}));
+        ENSURE(first->batches[1].signal == (ExecutionTimelinePoint{20, 201}));
+        ENSURE(first->batches[2].signal == (ExecutionTimelinePoint{10, 102}));
+        ENSURE(first->batches[0].waits == (std::vector<ExecutionTimelinePoint>{{10,100},{30,7}}));
+        ENSURE(first->batches[1].waits == (std::vector<ExecutionTimelinePoint>{{10,101}}));
         auto rejects = [](auto fn) { try { fn(); } catch (const std::exception&) { return true; } return false; };
-        CHECK(rejects([&] { admission.Prepare(bundle, waits); }));
-        CHECK(rejects([&] { admission.CommitBatch(first->submission, 1); }));
-        CHECK(admission.Submitted()[0].value == 100);
+        ENSURE(rejects([&] { admission.Prepare(bundle, waits); }));
+        ENSURE(rejects([&] { admission.CommitBatch(first->submission, 1); }));
+        ENSURE(admission.Submitted()[0].value == 100);
         for (uint32_t i = 0; i < 3; ++i) admission.CommitBatch(first->submission, i);
-        CHECK(admission.Submitted()[0].value == 102);
-        CHECK(rejects([&] { admission.CommitBatch(first->submission, 2); }));
+        ENSURE(admission.Submitted()[0].value == 102);
+        ENSURE(rejects([&] { admission.CommitBatch(first->submission, 2); }));
         waits[0] = {{10, 103}};
-        CHECK(rejects([&] { admission.Prepare(bundle, waits); }));
+        ENSURE(rejects([&] { admission.Prepare(bundle, waits); }));
         waits[0] = {{10, 102}};
         auto second = admission.Prepare(bundle, waits);
-        CHECK(second->submission == first->submission + 1);
-        CHECK(second->batches[0].signal.value == 103);
-        CHECK(first->batches[0].signal.value == 101);
+        ENSURE(second->submission == first->submission + 1);
+        ENSURE(second->batches[0].signal.value == 103);
+        ENSURE(first->batches[0].signal.value == 101);
         admission.CommitBatch(second->submission, 0);
         admission.Fail(second->submission);
-        CHECK(admission.Failed());
-        CHECK(admission.Submitted()[0].value == 103);
-        CHECK(admission.Submitted()[1].value == 201);
-        CHECK(rejects([&] { admission.CommitBatch(second->submission, 1); }));
-        CHECK(rejects([&] { admission.Prepare(bundle, waits); }));
-        CHECK(rejects([] { ExecutionTimelineAdmission bad({{10,0},{10,0}}); }));
+        ENSURE(admission.Failed());
+        ENSURE(admission.Submitted()[0].value == 103);
+        ENSURE(admission.Submitted()[1].value == 201);
+        ENSURE(rejects([&] { admission.CommitBatch(second->submission, 1); }));
+        ENSURE(rejects([&] { admission.Prepare(bundle, waits); }));
+        ENSURE(rejects([] { ExecutionTimelineAdmission bad({{10,0},{10,0}}); }));
         ExecutionTimelineAdmission overflow({{10,UINT64_MAX},{20,0}});
-        CHECK(rejects([&] { overflow.Prepare(bundle, std::vector<std::vector<ExecutionTimelinePoint>>(3)); }));
-        CHECK(overflow.Submitted()[0].value == UINT64_MAX);
+        ENSURE(rejects([&] { overflow.Prepare(bundle, std::vector<std::vector<ExecutionTimelinePoint>>(3)); }));
+        ENSURE(overflow.Submitted()[0].value == UINT64_MAX);
         ExecutionTimelineAdmission bounded({{10,0},{20,0}}, 1);
         auto cleanup = org::runtime::ResourceCleanupQueue::Create();
         auto sourceOwner = cleanup->Make<int>(42);
@@ -401,32 +401,32 @@ int main() {
         std::weak_ptr<const GraphExecutionTimeline> lifetime = packet;
         for (uint32_t i = 0; i < 3; ++i) bounded.CommitBatch(packet->submission, i);
         packet.reset();
-        CHECK(!lifetime.expired());
-        CHECK(bounded.InFlight() == 1);
-        CHECK(rejects([&] { bounded.Prepare(bundle, std::vector<std::vector<ExecutionTimelinePoint>>(3)); }));
+        ENSURE(!lifetime.expired());
+        ENSURE(bounded.InFlight() == 1);
+        ENSURE(rejects([&] { bounded.Prepare(bundle, std::vector<std::vector<ExecutionTimelinePoint>>(3)); }));
         std::vector<ExecutionTimelinePoint> completed{{10,1},{20,1}};
-        CHECK(bounded.RetireCompleted(completed) == 0);
-        CHECK(!lifetime.expired());
+        ENSURE(bounded.RetireCompleted(completed) == 0);
+        ENSURE(!lifetime.expired());
         cleanup->Drain();
-        CHECK(!sourceWeak.expired());
+        ENSURE(!sourceWeak.expired());
         completed[0].value = 2;
-        CHECK(bounded.RetireCompleted(completed) == 1);
+        ENSURE(bounded.RetireCompleted(completed) == 1);
         bounded.TakeRetiredGarbage().clear();
-        CHECK(lifetime.expired());
-        CHECK(bounded.InFlight() == 0);
+        ENSURE(lifetime.expired());
+        ENSURE(bounded.InFlight() == 0);
         cleanup->Drain();
-        CHECK(!sourceWeak.expired()); // GPU completion cannot revoke a replayable CPU packet.
+        ENSURE(!sourceWeak.expired()); // GPU completion cannot revoke a replayable CPU packet.
         reusable = {};
         cleanup->Drain();
-        CHECK(sourceWeak.expired());
+        ENSURE(sourceWeak.expired());
         completed[0].value = 1;
-        CHECK(rejects([&] { bounded.RetireCompleted(completed); }));
+        ENSURE(rejects([&] { bounded.RetireCompleted(completed); }));
         completed[0].value = 3;
-        CHECK(rejects([&] { bounded.RetireCompleted(completed); }));
+        ENSURE(rejects([&] { bounded.RetireCompleted(completed); }));
         auto incompatible = std::make_shared<CompiledGraphBundle>(*bundle);
         incompatible->input = std::make_shared<const GraphCompileInput>(Input(2));
         ExecutionTimelineAdmission clean({{10,0},{20,0}});
-        CHECK(rejects([&] { clean.Prepare(incompatible, waits); }));
+        ENSURE(rejects([&] { clean.Prepare(incompatible, waits); }));
         struct Packet : IPreparedExecutionBatch {
             uint32_t queueSlot = 0;
             uint32_t QueueSlot() const noexcept override { return queueSlot; }
@@ -446,14 +446,14 @@ int main() {
         ExecutionTimelineAdmission submission({{10,0},{20,0}});
         auto submitted = submission.SubmitPrepared(bundle,
             std::vector<std::vector<ExecutionTimelinePoint>>(3), packets);
-        CHECK(submission.Submitted()[0].value == 2);
-        CHECK(submission.Submitted()[1].value == 1);
+        ENSURE(submission.Submitted()[0].value == 2);
+        ENSURE(submission.Submitted()[1].value == 1);
         std::weak_ptr<const IPreparedExecutionBatch> packetLease = packets[0];
         packets.clear(); submitted.reset();
-        CHECK(!packetLease.expired());
-        CHECK(submission.RetireCompleted(std::vector<ExecutionTimelinePoint>{{10,2},{20,1}}) == 1);
+        ENSURE(!packetLease.expired());
+        ENSURE(submission.RetireCompleted(std::vector<ExecutionTimelinePoint>{{10,2},{20,1}}) == 1);
         submission.TakeRetiredGarbage().clear();
-        CHECK(packetLease.expired());
+        ENSURE(packetLease.expired());
         auto firstPacket = std::make_shared<Packet>();
         auto failedPacket = std::make_shared<Packet>(); failedPacket->succeeds = false;
         failedPacket->queueSlot = 1;
@@ -462,23 +462,23 @@ int main() {
         auto failureGraph = workspace.Compile(failureInput, cancelled);
         auto failureBundle = std::make_shared<CompiledGraphBundle>(CompiledGraphBundle{
             bundle->sequence, std::move(failureGraph), failureInput});
-        CHECK(rejects([&] { submission.SubmitPrepared(failureBundle,
+        ENSURE(rejects([&] { submission.SubmitPrepared(failureBundle,
             std::vector<std::vector<ExecutionTimelinePoint>>(3), {firstPacket, failedPacket, lastPacket}); }));
-        CHECK(submission.Failed());
-        CHECK(submission.Failure()->batch == 1);
-        CHECK(submission.Failure()->receipt.state == SubmissionState::SubmittedWithoutSignal);
-        CHECK(firstPacket->calls == 1 && failedPacket->calls == 1 && lastPacket->calls == 0);
-        CHECK(submission.Submitted()[0].value == 3 && submission.Submitted()[1].value == 1);
+        ENSURE(submission.Failed());
+        ENSURE(submission.Failure()->batch == 1);
+        ENSURE(submission.Failure()->receipt.state == SubmissionState::SubmittedWithoutSignal);
+        ENSURE(firstPacket->calls == 1 && failedPacket->calls == 1 && lastPacket->calls == 0);
+        ENSURE(submission.Submitted()[0].value == 3 && submission.Submitted()[1].value == 1);
         failureInput.reset(); failureBundle.reset();
     }
     cancelled = true;
-    CHECK(!workspace.Compile(std::make_shared<const GraphCompileInput>(Input()), cancelled));
+    ENSURE(!workspace.Compile(std::make_shared<const GraphCompileInput>(Input()), cancelled));
     cancelled = false;
     auto cyclic = Input(); cyclic.structure.explicitEdges = {{2, 0}};
     bool threw = false;
     try { workspace.Compile(std::make_shared<const GraphCompileInput>(cyclic), cancelled); }
     catch (const std::runtime_error&) { threw = true; }
-    CHECK(threw);
+    ENSURE(threw);
 
     // Capture normalization changes enumeration, not semantic resource identity.
     auto enumerated = Input();
@@ -486,25 +486,25 @@ int main() {
     enumerated.structure.passes = {{0, 0, {{0, false}, {1, false}, {0, true}}}};
     enumerated.structure.explicitEdges = {{0, 0}};
     NormalizeCompileInput(enumerated);
-    CHECK((enumerated.structure.resourceIDs == std::vector<uint64_t>{10, 20}));
-    CHECK((enumerated.structure.passes[0].accesses == std::vector<CompileAccess>{{0, false}, {1, true}}));
-    CHECK(enumerated.structure.explicitEdges.empty());
+    ENSURE((enumerated.structure.resourceIDs == std::vector<uint64_t>{10, 20}));
+    ENSURE((enumerated.structure.passes[0].accesses == std::vector<CompileAccess>{{0, false}, {1, true}}));
+    ENSURE(enumerated.structure.explicitEdges.empty());
     auto semanticSlots = enumerated;
     semanticSlots.structure.resourceIDs = {42, 42}; // Deliberate hash collision.
     semanticSlots.structure.resourceKeys = {"frame:b", "frame:a"};
     semanticSlots.structure.passes[0].accesses = {{0, false}, {1, true}};
     NormalizeCompileInput(semanticSlots);
-    CHECK((semanticSlots.structure.resourceKeys == std::vector<std::string>{"frame:a", "frame:b"}));
-    CHECK((semanticSlots.structure.passes[0].accesses == std::vector<CompileAccess>{{0, true}, {1, false}}));
+    ENSURE((semanticSlots.structure.resourceKeys == std::vector<std::string>{"frame:a", "frame:b"}));
+    ENSURE((semanticSlots.structure.passes[0].accesses == std::vector<CompileAccess>{{0, true}, {1, false}}));
     auto zeroBased = Input(1, 0);
     NormalizeCompileInput(zeroBased);
-    CHECK(zeroBased.structure.resourceIDs[0] == 0);
+    ENSURE(zeroBased.structure.resourceIDs[0] == 0);
     auto zeroGraph = workspace.Compile(std::make_shared<const GraphCompileInput>(zeroBased), cancelled);
-    CHECK(ValidateSymbolicSchedule(zeroBased, *zeroGraph).empty());
+    ENSURE(ValidateSymbolicSchedule(zeroBased, *zeroGraph).empty());
     auto invalidIDs = enumerated; invalidIDs.structure.resourceIDs = {10, 10};
     threw = false;
     try { NormalizeCompileInput(invalidIDs); } catch (const std::invalid_argument&) { threw = true; }
-    CHECK(threw);
+    ENSURE(threw);
 
     // Resource-less cross-queue dependency and read/read ownership must survive
     // queue wait coalescing. Mutation tests exercise an independent validator.
@@ -516,27 +516,27 @@ int main() {
     multiQueue.structure.placementEdges = {{0, 2}};
     multiQueue.expectedSchedulingEdges = std::make_shared<const DependencyEdges>(DependencyEdges{{0,1},{1,2},{0,2}});
     auto scheduled = workspace.Compile(std::make_shared<const GraphCompileInput>(multiQueue), cancelled);
-    CHECK(scheduled->relativeWaits.size() == 2);
-    CHECK(ValidateSymbolicSchedule(multiQueue, *scheduled).empty());
+    ENSURE(scheduled->relativeWaits.size() == 2);
+    ENSURE(ValidateSymbolicSchedule(multiQueue, *scheduled).empty());
     auto corrupted = *scheduled; corrupted.relativeWaits.clear();
-    CHECK(!ValidateSymbolicSchedule(multiQueue, corrupted).empty());
+    ENSURE(!ValidateSymbolicSchedule(multiQueue, corrupted).empty());
     corrupted = *scheduled; corrupted.batches[1].queue = 2;
-    CHECK(!ValidateSymbolicSchedule(multiQueue, corrupted).empty());
+    ENSURE(!ValidateSymbolicSchedule(multiQueue, corrupted).empty());
     corrupted = *scheduled; corrupted.batches[1].passes = corrupted.batches[0].passes;
-    CHECK(!ValidateSymbolicSchedule(multiQueue, corrupted).empty());
+    ENSURE(!ValidateSymbolicSchedule(multiQueue, corrupted).empty());
     corrupted = *scheduled; corrupted.relativeWaits.push_back({0, 1});
-    CHECK(!ValidateSymbolicSchedule(multiQueue, corrupted).empty());
+    ENSURE(!ValidateSymbolicSchedule(multiQueue, corrupted).empty());
     multiQueue.structure.passes[1].compatibleQueueSlots = {2};
     threw = false;
     try { workspace.Compile(std::make_shared<const GraphCompileInput>(multiQueue), cancelled); }
     catch (const std::runtime_error&) { threw = true; }
-    CHECK(threw);
+    ENSURE(threw);
 
     auto aliasCycle = Input(); aliasCycle.structure.placementEdges = {{2, 0}};
     threw = false;
     try { workspace.Compile(std::make_shared<const GraphCompileInput>(aliasCycle), cancelled); }
     catch (const std::runtime_error&) { threw = true; }
-    CHECK(threw);
+    ENSURE(threw);
 
     std::mt19937 rng(0x517a);
     for (int iteration = 0; iteration < 100; ++iteration) {
@@ -551,8 +551,8 @@ int main() {
         }
         input.structure.explicitEdges = {{0, 29}, {0, 29}, {2, 2}};
         auto output = workspace.Compile(std::make_shared<const GraphCompileInput>(input), cancelled);
-        CHECK(output->edges == Oracle(input.structure));
-        CHECK(ValidateSymbolicSchedule(input, *output).empty());
+        ENSURE(output->edges == Oracle(input.structure));
+        ENSURE(ValidateSymbolicSchedule(input, *output).empty());
     }
 
     // Owned state planning resolves neither first-use state nor absolute queue
@@ -565,16 +565,16 @@ int main() {
     stateInput.structure.passes[1].exitStates = {{0, {1, 1, 1, 1}, readState}};
     stateInput.structure.passes[2].entryStates = {{0, {0, 4, 0, 2}, readState}};
     auto stateGraph = workspace.Compile(std::make_shared<const GraphCompileInput>(stateInput), cancelled);
-    CHECK(stateGraph->states.complete && stateGraph->stateValidationError.empty());
-    CHECK(stateGraph->states.steps.front().previousBatch == UINT32_MAX);
-    CHECK(ValidateSymbolicStates(stateInput, *stateGraph).empty());
+    ENSURE(stateGraph->states.complete && stateGraph->stateValidationError.empty());
+    ENSURE(stateGraph->states.steps.front().previousBatch == UINT32_MAX);
+    ENSURE(ValidateSymbolicStates(stateInput, *stateGraph).empty());
     auto packedStateInput = stateInput;
     for (auto& pass : packedStateInput.structure.passes) pass.forceBatchIsolation = false;
     auto packedStateGraph = workspace.Compile(
         std::make_shared<const GraphCompileInput>(packedStateInput), cancelled);
-    CHECK(packedStateGraph->batches.size() == 1);
-    CHECK(packedStateGraph->states.complete && packedStateGraph->stateValidationError.empty());
-    CHECK(ValidateSymbolicStates(packedStateInput, *packedStateGraph).empty());
+    ENSURE(packedStateGraph->batches.size() == 1);
+    ENSURE(packedStateGraph->states.complete && packedStateGraph->stateValidationError.empty());
+    ENSURE(ValidateSymbolicStates(packedStateInput, *packedStateGraph).empty());
     auto crossQueueStateInput = stateInput;
     crossQueueStateInput.structure.queues = {{0, true}, {0, true}};
     crossQueueStateInput.structure.passes[0].compatibleQueueSlots = {0};
@@ -586,8 +586,8 @@ int main() {
         crossQueueStateGraph->states.steps.end(), [](const auto& step) {
             return step.previousBatch != UINT32_MAX && step.previousBatch != step.batch;
         });
-    CHECK(crossQueueStep != crossQueueStateGraph->states.steps.end());
-    CHECK(crossQueueStep->previousPass != UINT32_MAX);
+    ENSURE(crossQueueStep != crossQueueStateGraph->states.steps.end());
+    ENSURE(crossQueueStep->previousPass != UINT32_MAX);
     rhi::ResourceHandle crossQueueHandle{};
     crossQueueHandle.index = 51; crossQueueHandle.generation = 9;
     PreparedBackingState crossQueueBacking{
@@ -610,46 +610,46 @@ int main() {
         crossQueueStateGraph->batches[crossQueueStep->batch].passes.end(),
         crossQueueStep->pass)
         - crossQueueStateGraph->batches[crossQueueStep->batch].passes.begin();
-    CHECK(!crossQueueBarriers.batches[crossQueueStep->previousBatch]
+    ENSURE(!crossQueueBarriers.batches[crossQueueStep->previousBatch]
         .afterPass[producerPosition].textures.empty());
-    CHECK(!crossQueueBarriers.batches[crossQueueStep->batch]
+    ENSURE(!crossQueueBarriers.batches[crossQueueStep->batch]
         .beforePass[consumerPosition].textures.empty());
-    CHECK(crossQueueBarriers.batches[crossQueueStep->previousBatch]
+    ENSURE(crossQueueBarriers.batches[crossQueueStep->previousBatch]
         .afterPass[producerPosition].textures.front().afterLayout == rhi::ResourceLayout::Common);
-    CHECK(crossQueueBarriers.batches[crossQueueStep->batch]
+    ENSURE(crossQueueBarriers.batches[crossQueueStep->batch]
         .beforePass[consumerPosition].textures.front().beforeLayout == rhi::ResourceLayout::Common);
-    CHECK(crossQueueBarriers.batches[crossQueueStep->previousBatch]
+    ENSURE(crossQueueBarriers.batches[crossQueueStep->previousBatch]
         .afterPass[producerPosition].textures.front().afterSync == rhi::ResourceSyncState::All);
-    CHECK(crossQueueBarriers.batches[crossQueueStep->batch]
+    ENSURE(crossQueueBarriers.batches[crossQueueStep->batch]
         .beforePass[consumerPosition].textures.front().beforeSync == rhi::ResourceSyncState::All);
     // Queue-family ownership travels with the pair: the producer (slot 0,
     // graphics) releases to the consumer's family (slot 1, compute) and the
     // consumer acquires from graphics.
-    CHECK(crossQueueBarriers.batches[crossQueueStep->previousBatch]
+    ENSURE(crossQueueBarriers.batches[crossQueueStep->previousBatch]
         .afterPass[producerPosition].textures.front().queueOwnership == rhi::QueueOwnership::Release);
-    CHECK(crossQueueBarriers.batches[crossQueueStep->previousBatch]
+    ENSURE(crossQueueBarriers.batches[crossQueueStep->previousBatch]
         .afterPass[producerPosition].textures.front().ownershipPeer == rhi::QueueKind::Compute);
-    CHECK(crossQueueBarriers.batches[crossQueueStep->batch]
+    ENSURE(crossQueueBarriers.batches[crossQueueStep->batch]
         .beforePass[consumerPosition].textures.front().queueOwnership == rhi::QueueOwnership::Acquire);
-    CHECK(crossQueueBarriers.batches[crossQueueStep->batch]
+    ENSURE(crossQueueBarriers.batches[crossQueueStep->batch]
         .beforePass[consumerPosition].textures.front().ownershipPeer == rhi::QueueKind::Graphics);
     auto dependencyOnly = stateInput;
     dependencyOnly.structure.resourceIDs.push_back(2);
     dependencyOnly.structure.resourceShapes.push_back({0, 0, false});
     dependencyOnly.structure.passes[0].accesses.push_back({1, false});
     auto dependencyOnlyGraph = workspace.Compile(std::make_shared<const GraphCompileInput>(dependencyOnly), cancelled);
-    CHECK(dependencyOnlyGraph->states.complete && dependencyOnlyGraph->stateValidationError.empty());
+    ENSURE(dependencyOnlyGraph->states.complete && dependencyOnlyGraph->stateValidationError.empty());
     dependencyOnly.structure.passes[0].entryStates.push_back({1, {}, readState});
-    CHECK(!workspace.Compile(std::make_shared<const GraphCompileInput>(dependencyOnly), cancelled)->states.complete);
+    ENSURE(!workspace.Compile(std::make_shared<const GraphCompileInput>(dependencyOnly), cancelled)->states.complete);
     auto shapeRemap = stateInput;
     shapeRemap.structure.resourceIDs = {20, 10};
     shapeRemap.structure.resourceShapes.push_back({0, 0, false});
     NormalizeCompileInput(shapeRemap);
-    CHECK(shapeRemap.structure.resourceShapes[1].mips == 4 && shapeRemap.structure.passes[0].entryStates[0].resource == 1);
-    CHECK(workspace.Compile(std::make_shared<const GraphCompileInput>(shapeRemap), cancelled)->states.complete);
+    ENSURE(shapeRemap.structure.resourceShapes[1].mips == 4 && shapeRemap.structure.passes[0].entryStates[0].resource == 1);
+    ENSURE(workspace.Compile(std::make_shared<const GraphCompileInput>(shapeRemap), cancelled)->states.complete);
     auto missingHazard = stateInput;
     missingHazard.structure.passes[0].accesses.clear();
-    CHECK(!workspace.Compile(std::make_shared<const GraphCompileInput>(missingHazard), cancelled)->states.complete);
+    ENSURE(!workspace.Compile(std::make_shared<const GraphCompileInput>(missingHazard), cancelled)->states.complete);
     auto readOnlyStates = stateInput;
     readOnlyStates.structure.queues = {{0, true}, {0, true}};
     readOnlyStates.expectedEdges = std::make_shared<const DependencyEdges>();
@@ -659,37 +659,37 @@ int main() {
     }
     readOnlyStates.structure.passes[1].compatibleQueueSlots = {1};
     auto readOnlyGraph = workspace.Compile(std::make_shared<const GraphCompileInput>(readOnlyStates), cancelled);
-    CHECK(readOnlyGraph->edges.empty() && readOnlyGraph->relativeWaits.size() == 2);
-    CHECK(readOnlyGraph->states.complete && readOnlyGraph->stateValidationError.empty());
-    CHECK(ValidateSymbolicSchedule(readOnlyStates, *readOnlyGraph).empty());
+    ENSURE(readOnlyGraph->edges.empty() && readOnlyGraph->relativeWaits.size() == 2);
+    ENSURE(readOnlyGraph->states.complete && readOnlyGraph->stateValidationError.empty());
+    ENSURE(ValidateSymbolicSchedule(readOnlyStates, *readOnlyGraph).empty());
     auto brokenState = *stateGraph;
     brokenState.states.steps.erase(brokenState.states.steps.begin());
-    CHECK(!ValidateSymbolicStates(stateInput, brokenState).empty());
+    ENSURE(!ValidateSymbolicStates(stateInput, brokenState).empty());
     brokenState = *stateGraph; brokenState.states.steps.back().before.sync ^= 1;
-    CHECK(!ValidateSymbolicStates(stateInput, brokenState).empty());
+    ENSURE(!ValidateSymbolicStates(stateInput, brokenState).empty());
     brokenState = *stateGraph; brokenState.states.finalStates.pop_back();
-    CHECK(!ValidateSymbolicStates(stateInput, brokenState).empty());
+    ENSURE(!ValidateSymbolicStates(stateInput, brokenState).empty());
     brokenState = *stateGraph; brokenState.states.finalStates.push_back(brokenState.states.finalStates.front());
-    CHECK(!ValidateSymbolicStates(stateInput, brokenState).empty());
+    ENSURE(!ValidateSymbolicStates(stateInput, brokenState).empty());
     auto conflictInput = stateInput;
     conflictInput.structure.passes[0].entryStates.push_back({0, {1, 1, 0, 1}, writeState});
     auto conflictGraph = workspace.Compile(std::make_shared<const GraphCompileInput>(conflictInput), cancelled);
-    CHECK(!conflictGraph->states.complete && !conflictGraph->states.fallbackReason.empty());
-    CHECK(conflictGraph->states.steps.empty() && conflictGraph->states.finalStates.empty());
+    ENSURE(!conflictGraph->states.complete && !conflictGraph->states.fallbackReason.empty());
+    ENSURE(conflictGraph->states.steps.empty() && conflictGraph->states.finalStates.empty());
     auto layoutOnly = stateInput;
     auto duplicateEntry = layoutOnly.structure.passes[0].entryStates[0];
     duplicateEntry.state.layout ^= 32;
     layoutOnly.structure.passes[0].entryStates.push_back(duplicateEntry);
-    CHECK(!workspace.Compile(std::make_shared<const GraphCompileInput>(layoutOnly), cancelled)->states.complete);
+    ENSURE(!workspace.Compile(std::make_shared<const GraphCompileInput>(layoutOnly), cancelled)->states.complete);
     layoutOnly.structure.resourceShapes[0].hasLayout = false;
     auto bufferLayoutPlan = workspace.Compile(std::make_shared<const GraphCompileInput>(layoutOnly), cancelled);
-    CHECK(bufferLayoutPlan->states.complete && bufferLayoutPlan->stateValidationError.empty());
-    CHECK(bufferLayoutPlan->states.steps.front().after.layout == 0);
+    ENSURE(bufferLayoutPlan->states.complete && bufferLayoutPlan->stateValidationError.empty());
+    ENSURE(bufferLayoutPlan->states.steps.front().after.layout == 0);
     conflictInput = stateInput;
     conflictInput.structure.passes[1].exitStates[0].range = {0, 4, 0, 2};
-    CHECK(!workspace.Compile(std::make_shared<const GraphCompileInput>(conflictInput), cancelled)->states.complete);
+    ENSURE(!workspace.Compile(std::make_shared<const GraphCompileInput>(conflictInput), cancelled)->states.complete);
     conflictInput = stateInput; conflictInput.structure.passes[0].entryStates[0].range.mips = UINT32_MAX;
-    CHECK(!workspace.Compile(std::make_shared<const GraphCompileInput>(conflictInput), cancelled)->states.complete);
+    ENSURE(!workspace.Compile(std::make_shared<const GraphCompileInput>(conflictInput), cancelled)->states.complete);
     for (unsigned iteration = 0; iteration < 100; ++iteration) {
         auto randomStates = stateInput;
         randomStates.structure.passes.clear();
@@ -703,7 +703,7 @@ int main() {
             randomStates.structure.passes.push_back(std::move(pass));
         }
         auto plan = workspace.Compile(std::make_shared<const GraphCompileInput>(randomStates), cancelled);
-        CHECK(plan->states.complete && plan->stateValidationError.empty());
+        ENSURE(plan->states.complete && plan->stateValidationError.empty());
     }
     std::puts("Fresh compiler ownership, oracle, ordering and state tests passed.");
 }

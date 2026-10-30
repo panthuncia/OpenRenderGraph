@@ -23,13 +23,13 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 	context.immediateDispatch = &m_immediateDispatch;
 	const size_t slotCount = m_queueRegistry.SlotCount();
 	if (!state.timelines) {
-		std::vector<experimental::ExecutionTimelinePoint> queues;
+		std::vector<compiler::ExecutionTimelinePoint> queues;
 		for (size_t slot = 0; slot < slotCount; ++slot) {
 			const auto next = m_queueRegistry.GetCurrentFenceValue(static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot)));
 			queues.push_back({slot + 1, next ? next - 1 : 0});
 		}
 		const size_t framesInFlight = m_renderGraphSettingsService ? m_renderGraphSettingsService->GetNumFramesInFlight() : 3;
-		state.timelines = std::make_unique<experimental::ExecutionTimelineAdmission>(std::move(queues), framesInFlight * 3 + 6);
+		state.timelines = std::make_unique<compiler::ExecutionTimelineAdmission>(std::move(queues), framesInFlight * 3 + 6);
 	}
 	// Retirement runs before this frame submits: the presentation tail of the
 	// previous frame has been confirmed by now, so completed executions and
@@ -65,11 +65,11 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 		}
 	}
 
-	auto submitSegment = [&](PersistentExecutionState::PreparedSegment& segment, size_t segmentIndex) -> std::shared_ptr<const experimental::GraphExecutionTimeline> {
+	auto submitSegment = [&](PersistentExecutionState::PreparedSegment& segment, size_t segmentIndex) -> std::shared_ptr<const compiler::GraphExecutionTimeline> {
 		BT_ZONE_SCOPE("ORG.Persistent.SubmitSegment");
 		BT_ZONE_TEXT(segment.label, std::strlen(segment.label));
-		std::vector<experimental::ExecutionTimelinePoint> queues;
-		std::vector<experimental::PreparedTimelineBinding> timelineBindings;
+		std::vector<compiler::ExecutionTimelinePoint> queues;
+		std::vector<compiler::PreparedTimelineBinding> timelineBindings;
 		for (size_t slot = 0; slot < slotCount; ++slot) {
 			const auto index = static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot));
 			const auto next = m_queueRegistry.GetCurrentFenceValue(index);
@@ -142,17 +142,17 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 				return nullptr;
 			}
 		}
-		std::shared_ptr<const experimental::RenderFrameSnapshot> sealed;
+		std::shared_ptr<const compiler::RenderFrameSnapshot> sealed;
 		try {
-			sealed = experimental::SealPersistentFrame(state.frameNumber, admission, std::move(segment.invocations));
+			sealed = compiler::SealPersistentFrame(state.frameNumber, admission, std::move(segment.invocations));
 		} catch (...) { state.admission->Abandon(admission); throw; }
 		const auto& graph = *segment.publication->executable->graph;
 		timings.cachedAdmissions += admission.cachedPlan ? 1u : 0u;
 		// A closed execution starts with a full memory barrier on each of its queues.
 		std::vector<uint8_t> closedEntryDone(slotCount, 0);
-		std::vector<experimental::FrameRecordingJob> jobs(graph.batches.size());
-		std::vector<std::shared_ptr<experimental::OwnedRecordingStatistics>> recordingStatistics;
-		std::array<std::shared_ptr<const experimental::OwnedRecordingGpuRanges>, 3> gpuPassRanges;  // per rhi::QueueKind
+		std::vector<compiler::FrameRecordingJob> jobs(graph.batches.size());
+		std::vector<std::shared_ptr<compiler::OwnedRecordingStatistics>> recordingStatistics;
+		std::array<std::shared_ptr<const compiler::OwnedRecordingGpuRanges>, 3> gpuPassRanges;  // per rhi::QueueKind
 		std::vector<size_t> demand(slotCount);
 		// An external epoch's ticket (SetExternalPersistentEpochs): every batch on the graphics queue, none waiting for another,
 		// recorded into secondaries; a late batch's pass (recordAtExecution) is recorded by the host's execution.
@@ -200,7 +200,7 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 						static_cast<QueueSlotIndex>(static_cast<uint8_t>(source)), index).GetHandle();
 			}
 			job.deferred = late;
-			job.recording = experimental::BuildPersistentRecordingList(sealed, batch);
+			job.recording = compiler::BuildPersistentRecordingList(sealed, batch);
 			job.recording.external = external;
 			job.recording.bindings = segment.legacyBindings;
 			job.recording.frameSlot = state.frameIndex;
@@ -224,7 +224,7 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 			// A late batch is recorded after its ticket completes on the owner thread (which publishes the statistics): its frame
 			// slot's completion publishes its (OwnedRecordingStatistics::atCompletion). It is never kept: the shared pool's queries.
 			if (m_statisticsService) {
-				auto statistics = std::make_shared<experimental::OwnedRecordingStatistics>();
+				auto statistics = std::make_shared<compiler::OwnedRecordingStatistics>();
 				statistics->service = m_statisticsService;
 				statistics->frameIndex = state.frameIndex;
 				statistics->queueKind = rhiKind;
@@ -253,7 +253,7 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 			if (m_gpuPassRangeBegin && m_gpuPassRangeEnd) {
 				auto& ranges = gpuPassRanges[static_cast<size_t>(rhiKind)];
 				if (!ranges) {
-					ranges = std::make_shared<experimental::OwnedRecordingGpuRanges>(experimental::OwnedRecordingGpuRanges{m_gpuPassRangeBegin, m_gpuPassRangeEnd,
+					ranges = std::make_shared<compiler::OwnedRecordingGpuRanges>(compiler::OwnedRecordingGpuRanges{m_gpuPassRangeBegin, m_gpuPassRangeEnd,
 						rhiKind == rhi::QueueKind::Graphics ? "Graphics" : rhiKind == rhi::QueueKind::Compute ? "Compute" : "Copy"});
 				}
 				job.recording.gpuPassRanges = ranges;
@@ -299,12 +299,12 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 				}
 			}
 		}
-		experimental::PlannedFrame plan{sealed, std::move(jobs), std::move(timelineBindings), admission.incomingWaits};
+		compiler::PlannedFrame plan{sealed, std::move(jobs), std::move(timelineBindings), admission.incomingWaits};
 		const size_t concurrency = (std::min<size_t>)(graph.batches.size(), 4u);
-		std::shared_ptr<const experimental::GraphExecutionTimeline> execution;
+		std::shared_ptr<const compiler::GraphExecutionTimeline> execution;
 		lap(timings.acquireUs);
 		try {
-			auto recorded = experimental::RecordFrame(std::move(plan), m_taskService, concurrency);
+			auto recorded = compiler::RecordFrame(std::move(plan), m_taskService, concurrency);
 			lap(timings.recordUs);
 			if (auto* ticket = m_persistentTicketTarget) {
 				// Submitted later, by the host's submitting thread; completed (or abandoned) by the owner.
@@ -391,7 +391,7 @@ void RenderGraph::RetirePersistentExecutions() {
 	if (!compiler.persistent || !compiler.persistent->timelines) return;
 	auto& state = *compiler.persistent;
 	BT_ZONE_SCOPE("ORG.Persistent.Retire");
-	std::vector<experimental::ExecutionTimelinePoint> completed;
+	std::vector<compiler::ExecutionTimelinePoint> completed;
 	const auto submitted = state.timelines->Submitted();
 	for (size_t slot = 0; slot < submitted.size(); ++slot) {
 		const auto fence = m_queueRegistry.GetFence(static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot))).GetCompletedValue();

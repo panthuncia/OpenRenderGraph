@@ -1,10 +1,10 @@
 #pragma once
 
-#include "Render/RenderGraph/ExperimentalRhiExecution.h"
+#include "Render/RenderGraph/RhiExecution.h"
 #include "Render/Runtime/ITaskService.h"
 #include <functional>
 
-namespace org::experimental {
+namespace org::compiler {
 
 struct FrameRecordingJob {
     uint32_t slot = 0;
@@ -67,4 +67,4 @@ private:
 RecordedFrame RecordFrame(PlannedFrame plan,
     const std::shared_ptr<runtime::ITaskService>& tasks, size_t concurrency);
 
-} // namespace org::experimental
+} // namespace org::compiler

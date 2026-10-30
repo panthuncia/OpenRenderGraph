@@ -20,7 +20,7 @@ struct ScheduleTraceNames {
 };
 
 // The executable's schedule, explained (ScheduleTrace). Wait causes are reconstructed as the compiler derives its scheduling edges
-// (ExperimentalGraphCompiler.cpp, CompileWorkspace::Compile): it keeps no provenance.
+// (GraphCompiler.cpp, CompileWorkspace::Compile): it keeps no provenance.
 std::shared_ptr<const ScheduleTrace> BuildScheduleTrace(const persistent::ExecutableGeneration& executable, const ScheduleTraceNames& names,
     std::string label, uint32_t epoch);
 

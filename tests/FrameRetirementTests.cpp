@@ -1,4 +1,5 @@
 #include "OpenRenderGraph/GraphHost.h"
+#include "TestSupport.h"
 #include "Managers/Singletons/DescriptorHeapManager.h"
 #include <Render/RenderGraph/RenderGraph.h>
 #include <Render/PassExecutionContext.h>
@@ -11,7 +12,6 @@
 #include <chrono>
 #include "Render/BindingTable.h"
 
-#define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "Retirement check failed at %d: %s\n", __LINE__, #x); return __LINE__; } } while (false)
 
 namespace {
 struct RetirementChain {

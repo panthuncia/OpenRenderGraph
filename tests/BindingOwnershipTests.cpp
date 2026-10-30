@@ -1,4 +1,5 @@
 #include "Render/BindingTable.h"
+#include "TestSupport.h"
 #include "Render/DescriptorHeap.h"
 #include "Render/PublicationBindingBundle.h"
 #include <atomic>
@@ -6,7 +7,6 @@
 #include <cstring>
 #include <thread>
 
-#define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "Binding ownership check failed at %d: %s\n", __LINE__, #x); return __LINE__; } } while (false)
 
 int TestBindingOwnership(rhi::Device device) {
     auto cleanup = org::runtime::ResourceCleanupQueue::Create();

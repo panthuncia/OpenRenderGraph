@@ -1,6 +1,6 @@
 // Schedule introspection: a persistent executable's batches, passes, planned state changes and cross-queue waits, with each wait's
 // cause. The compiler keeps no provenance for its waits, so causes are reconstructed here from the same inputs and rules it orders
-// passes by (ExperimentalGraphCompiler.cpp: AnalyzeDependencies, ForEachScheduledUse, OrderUse).
+// passes by (GraphCompiler.cpp: AnalyzeDependencies, ForEachScheduledUse, OrderUse).
 #include "ScheduleTraceBuild.h"
 #include "Render/RenderGraph/PersistentGraph.h"
 
@@ -16,8 +16,8 @@ namespace org {
 
 namespace {
 
-using experimental::CompilePass;
-using experimental::GraphCompileStructure;
+using compiler::CompilePass;
+using compiler::GraphCompileStructure;
 using Cause = ScheduleTrace::WaitCause;
 using ScheduledUses = std::vector<std::pair<uint32_t, bool>>;
 

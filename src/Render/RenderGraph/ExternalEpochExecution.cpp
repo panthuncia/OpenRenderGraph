@@ -1,6 +1,6 @@
 #include "Render/RenderGraph/ExternalEpochExecution.h"
 
-#include "Render/RenderGraph/ExperimentalRhiExecution.h"
+#include "Render/RenderGraph/RhiExecution.h"
 
 #include <stdexcept>
 

@@ -5,7 +5,7 @@
 #include <vector>
 #include <rhi.h>
 
-namespace org::experimental {
+namespace org::compiler {
 class PreparedRhiExecutionBatch;
 }
 
@@ -25,7 +25,7 @@ namespace org {
 class ExternalEpochExecution {
 public:
 	struct Item {
-		std::shared_ptr<const experimental::PreparedRhiExecutionBatch> packet;
+		std::shared_ptr<const compiler::PreparedRhiExecutionBatch> packet;
 		// The heaps its lists bind (the recording's defaults): bound in the executing list before each execution of secondaries,
 		// whose own binding does not hold on every driver while the executing list has other heaps bound.
 		rhi::DescriptorHeapHandle resourceHeap{}, samplerHeap{};

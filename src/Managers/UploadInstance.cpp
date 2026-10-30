@@ -346,14 +346,12 @@ bool UploadInstance::TryCoalesceAppend(ResourceUpdate& last, const ResourceUpdat
 
 	last.size += next.size;
 	last.lastSequence = next.lastSequence;
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 	last.file = next.file;
 	last.line = next.line;
 	last.stackSize = next.stackSize;
 	for (uint8_t i = 0; i < next.stackSize && i < ResourceUpdate::MaxStack; ++i) {
 		last.stack[i] = next.stack[i];
 	}
-#endif
 	return true;
 }
 
@@ -424,13 +422,8 @@ void UploadInstance::PruneInvalidRegistryHandleUpdatesLocked(const char* reason)
 				++writeIndex;
 				continue;
 			}
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 			const char* file = update.file;
 			const int line = update.line;
-#else
-			const char* file = nullptr;
-			const int line = 0;
-#endif
 			if (!m_invalidRegistryHandle(targetAccessor(update), reason, file, line)) {
 				changed = true;
 				continue;
@@ -454,12 +447,8 @@ void UploadInstance::PruneInvalidRegistryHandleUpdatesLocked(const char* reason)
 	});
 }
 
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 void UploadInstance::UploadData(const void* data, size_t size, UploadTarget target, size_t dstOffset,
                                 const char* file, int line)
-#else
-void UploadInstance::UploadData(const void* data, size_t size, UploadTarget target, size_t dstOffset)
-#endif
 {
 	if (!data || size == 0) {
 		return;
@@ -472,10 +461,8 @@ void UploadInstance::UploadData(const void* data, size_t size, UploadTarget targ
 		posted.target = std::move(target);
 		posted.bytes.assign(static_cast<const uint8_t*>(data), static_cast<const uint8_t*>(data) + size);
 		posted.dstOffset = dstOffset;
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 		posted.file = file;
 		posted.line = line;
-#endif
 		m_postedBufferUploads.Push(std::move(posted));
 		MarkPendingWorkChangedLocked();
 		return;
@@ -487,7 +474,6 @@ void UploadInstance::UploadData(const void* data, size_t size, UploadTarget targ
 	update.size = size;
 	update.resourceToUpdate = target;
 	update.dataBufferOffset = dstOffset;
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 	update.file = file;
 	update.line = line;
 #ifdef _WIN32
@@ -495,7 +481,6 @@ void UploadInstance::UploadData(const void* data, size_t size, UploadTarget targ
 	USHORT captured = RtlCaptureStackBackTrace(1, ResourceUpdate::MaxStack, frames, nullptr);
 	update.stackSize = static_cast<uint8_t>(captured);
 	for (USHORT i = 0; i < captured; i++) update.stack[i] = frames[i];
-#endif
 #endif
 	CaptureTargetTelemetry(update.resourceToUpdate,
 		update.targetGlobalResourceId, update.targetDebugName);
@@ -518,9 +503,7 @@ void UploadInstance::UploadData(const void* data, size_t size, UploadTarget targ
 	MapUpload(uploadBuffer, &mapped);
 	if (mapped) std::memcpy(mapped + uploadOffset, data, size);
 	UnmapUpload(uploadBuffer, uploadOffset, size);
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 	if (!mapped) __debugbreak();
-#endif
 
 	{
 		const auto rfound = std::ranges::find(m_resourceUpdates.rbegin(), m_resourceUpdates.rend(),
@@ -542,12 +525,8 @@ void UploadInstance::UploadData(const void* data, size_t size, UploadTarget targ
 	}
 }
 
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 void UploadInstance::UploadDataBatch(UploadTarget target, std::span<const UploadRegion> regions,
                                      const char* file, int line)
-#else
-void UploadInstance::UploadDataBatch(UploadTarget target, std::span<const UploadRegion> regions)
-#endif
 {
 	// Contiguous runs of regions (dstOffset == previous end) share one queue
 	// entry; every entry of the batch shares one upload-heap allocation, one
@@ -564,11 +543,7 @@ void UploadInstance::UploadDataBatch(UploadTarget target, std::span<const Upload
 	if (!IsOwnerThread()) {
 		for (const auto& region : regions) {
 			if (!region.data || region.size == 0) continue;
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 			UploadData(region.data, region.size, target, region.dstOffset, file, line);
-#else
-			UploadData(region.data, region.size, target, region.dstOffset);
-#endif
 		}
 		return;
 	}
@@ -604,10 +579,8 @@ void UploadInstance::UploadDataBatch(UploadTarget target, std::span<const Upload
 				update.lastSequence = update.firstSequence;
 				update.targetGlobalResourceId = targetId;
 				update.targetDebugName = targetName;
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 				update.file = file;
 				update.line = line;
-#endif
 				if (firstSequence == 0) firstSequence = update.firstSequence;
 				m_resourceUpdates.push_back(std::move(update));
 				open = &m_resourceUpdates.back();
@@ -629,9 +602,7 @@ void UploadInstance::UploadDataBatch(UploadTarget target, std::span<const Upload
 		}
 	}
 	UnmapUpload(uploadBuffer, uploadOffset, totalBytes);
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 	if (!mapped) __debugbreak();
-#endif
 
 	{
 		// The batch's entries are the newest staging entries with sequences in
@@ -646,7 +617,6 @@ void UploadInstance::UploadDataBatch(UploadTarget target, std::span<const Upload
 	}
 }
 
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 void UploadInstance::UploadTextureSubresources(
 	UploadTarget target,
 	rhi::Format fmt,
@@ -659,18 +629,6 @@ void UploadInstance::UploadTextureSubresources(
 	uint32_t srcCount,
 	const char* file,
 	int line)
-#else
-void UploadInstance::UploadTextureSubresources(
-	UploadTarget target,
-	rhi::Format fmt,
-	uint32_t baseWidth,
-	uint32_t baseHeight,
-	uint32_t depthOrLayers,
-	uint32_t mipLevels,
-	uint32_t arraySize,
-	const rhi::helpers::SubresourceData* srcSubresources,
-	uint32_t srcCount)
-#endif
 {
 	if (!srcSubresources || srcCount == 0) return;
 	rhi::Span<const rhi::helpers::SubresourceData> srcSpan{ srcSubresources, srcCount };
@@ -684,13 +642,8 @@ void UploadInstance::UploadTextureSubresources(
 		NoteProducerCall("UploadTextureSubresources", target);
 		throw std::logic_error("UploadInstance::UploadTextureSubresources called off the owner thread; use PostTextureSubresources");
 	}
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 	UploadTextureSubresourcesPrepared(std::move(target), fmt, baseWidth, baseHeight, depthOrLayers, mipLevels, arraySize,
 		srcSubresources, srcCount, PrepareDedicatedPage(static_cast<size_t>(plan.totalSize)), file, line);
-#else
-	UploadTextureSubresourcesPrepared(std::move(target), fmt, baseWidth, baseHeight, depthOrLayers, mipLevels, arraySize,
-		srcSubresources, srcCount, PrepareDedicatedPage(static_cast<size_t>(plan.totalSize)), nullptr, 0);
-#endif
 }
 
 void UploadInstance::UploadTextureSubresourcesPrepared(UploadTarget target, rhi::Format fmt, uint32_t baseWidth, uint32_t baseHeight,
@@ -734,10 +687,8 @@ void UploadInstance::UploadTextureSubresourcesPrepared(UploadTarget target, rhi:
 			update.z = fp.zSlice;
 			update.uploadBuffer = uploadBuffer;
 			update.staging = true;
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 			update.file = file;
 			update.line = line;
-#endif
 			update.targetGlobalResourceId = targetGlobalResourceId;
 			update.targetDebugName = targetDebugName;
 			update.sequence = ++m_lastUploadSequence;
@@ -765,27 +716,15 @@ void UploadInstance::UploadTextureSubresourcesPrepared(UploadTarget target, rhi:
 	}
 }
 
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 void UploadInstance::PostTextureSubresources(UploadTarget target, rhi::Format fmt, uint32_t baseWidth, uint32_t baseHeight,
 	uint32_t depthOrLayers, uint32_t mipLevels, uint32_t arraySize,
 	std::shared_ptr<const std::vector<rhi::helpers::SubresourceData>> subresources,
 	std::shared_ptr<const void> keepAlive, const char* file, int line)
-#else
-void UploadInstance::PostTextureSubresources(UploadTarget target, rhi::Format fmt, uint32_t baseWidth, uint32_t baseHeight,
-	uint32_t depthOrLayers, uint32_t mipLevels, uint32_t arraySize,
-	std::shared_ptr<const std::vector<rhi::helpers::SubresourceData>> subresources,
-	std::shared_ptr<const void> keepAlive)
-#endif
 {
 	if (!subresources || subresources->empty()) return;
 	if (IsOwnerThread()) {
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 		UploadTextureSubresources(std::move(target), fmt, baseWidth, baseHeight, depthOrLayers, mipLevels, arraySize,
 			subresources->data(), static_cast<uint32_t>(subresources->size()), file, line);
-#else
-		UploadTextureSubresources(std::move(target), fmt, baseWidth, baseHeight, depthOrLayers, mipLevels, arraySize,
-			subresources->data(), static_cast<uint32_t>(subresources->size()));
-#endif
 		return;
 	}
 	NoteProducerCall("PostTextureSubresources", target);
@@ -826,10 +765,8 @@ void UploadInstance::PostTextureSubresources(UploadTarget target, rhi::Format fm
 		update.uploadBuffer = posted.page->buffer;
 		update.active = posted.mapped;
 		update.staging = false;
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 		update.file = file;
 		update.line = line;
-#endif
 		posted.updates.push_back(std::move(update));
 	}
 	(void)keepAlive; // bytes are staged; the caller's storage may be released
@@ -1006,11 +943,7 @@ size_t UploadInstance::RecordStagedUploadsRouted(rhi::CommandList& list, uint8_t
 void UploadInstance::DrainPostedUploads() {
 	PostedBufferUpload buffer;
 	while (m_postedBufferUploads.Pop(buffer)) {
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 		UploadData(buffer.bytes.data(), buffer.bytes.size(), buffer.target, buffer.dstOffset, buffer.file, buffer.line);
-#else
-		UploadData(buffer.bytes.data(), buffer.bytes.size(), buffer.target, buffer.dstOffset);
-#endif
 	}
 	PostedTextureUpload texture;
 	while (m_postedTextureUploads.Pop(texture)) {
@@ -1504,9 +1437,7 @@ std::string UploadInstance::DescribeQueuedTargetByGlobalResourceId(uint64_t glob
 		result
 			<< updateKind
 			<< " name='" << (update.targetDebugName.empty() ? std::string("<unknown>") : update.targetDebugName) << "'";
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 		result << " queuedAt=" << (update.file ? update.file : "<unknown>") << ":" << update.line;
-#endif
 		if (target.kind == UploadTarget::Kind::RegistryHandle) {
 			result
 				<< " handle[idx=" << target.h.GetKey().idx

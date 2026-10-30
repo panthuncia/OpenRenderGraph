@@ -1,6 +1,6 @@
 #include "FrameRecording.h"
 
-namespace org::experimental {
+namespace org::compiler {
 
 RecordedFrame RecordFrame(PlannedFrame plan,
     const std::shared_ptr<runtime::ITaskService>& tasks, size_t concurrency) {
@@ -61,4 +61,4 @@ std::shared_ptr<const GraphExecutionTimeline> RecordedFrame::Submit(ExecutionTim
     return admission.SubmitPrepared(m_snapshot->layout->bundle, m_incomingWaits, m_batches, {});
 }
 
-} // namespace org::experimental
+} // namespace org::compiler

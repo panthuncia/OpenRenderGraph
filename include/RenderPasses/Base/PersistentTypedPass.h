@@ -14,16 +14,16 @@ namespace org::persistent {
 class PassDeclaration {
 public:
     PassDeclaration(GraphEditTransaction& edit, PassId pass) : m_edit(edit), m_pass(pass) {}
-    BindingToken Resource(ResourceSlotId slot, experimental::CompileResourceState state,
-        experimental::CompileRange range = {}) {
+    BindingToken Resource(ResourceSlotId slot, compiler::CompileResourceState state,
+        compiler::CompileRange range = {}) {
         return m_edit.Declare(m_pass,slot,range,state);
     }
     BindingToken Dependency(ResourceSlotId slot, bool write) { return m_edit.DeclareDependency(m_pass,slot,write); }
     ViewToken View(BindingToken binding, BindlessViewRequest request = {}) { return m_edit.DeclareView(binding,request); }
-    void Postcondition(BindingToken binding, experimental::CompileResourceState state,
-        experimental::CompileRange range = {}) { m_edit.DeclarePostcondition(binding,range,state); }
-    void Group(ResourceGroupId group, experimental::CompileResourceState state, uint32_t phase,
-        std::optional<experimental::CompileRange> range = {}) {
+    void Postcondition(BindingToken binding, compiler::CompileResourceState state,
+        compiler::CompileRange range = {}) { m_edit.DeclarePostcondition(binding,range,state); }
+    void Group(ResourceGroupId group, compiler::CompileResourceState state, uint32_t phase,
+        std::optional<compiler::CompileRange> range = {}) {
         m_edit.DeclareGroupAccess(m_pass,group,state,phase,range);
     }
     PassId Id() const noexcept { return m_pass; }
@@ -42,7 +42,7 @@ public:
     using ProgramInterface = typename Derived::ProgramInterface;
     using Invocation = typename Derived::Invocation;
     template<class BuildContext>
-    static TypedPassExecutable Build(GraphEditTransaction& edit, experimental::CompilePass scheduling,
+    static TypedPassExecutable Build(GraphEditTransaction& edit, compiler::CompilePass scheduling,
         Derived& author, const BuildContext& context) {
         try {
             const auto pass = edit.AddPass(std::move(scheduling));

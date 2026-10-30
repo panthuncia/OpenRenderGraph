@@ -1,6 +1,6 @@
 #include <cstdlib>
 #include "Render/PublicationBindingBundle.h"
-#include "Render/RenderGraph/ExperimentalGraphCompiler.h"
+#include "Render/RenderGraph/GraphCompiler.h"
 #include "Render/RenderGraph/GraphReplay.h"
 #include "Render/RenderGraph/CompileTelemetry.h"
 
@@ -12,7 +12,7 @@
 #include <BasicTelemetry/Tracy.h>
 #include <spdlog/spdlog.h>
 
-namespace org::experimental {
+namespace org::compiler {
 
 namespace {
 std::string_view DiagnosticPassName(const GraphCompileStructure& structure, uint32_t pass) {
@@ -1033,4 +1033,4 @@ std::shared_ptr<const CompiledGraph> CompileGraph(
     return graph;
 }
 
-} // namespace org::experimental
+} // namespace org::compiler

@@ -37,8 +37,8 @@ std::string ScheduleTraceEpochLabel(uint32_t epoch) { return "epoch " + std::to_
 // values' timeline among them for a synchronous execution), and what a ticket adds at submission (SubmitPersistentTicket): the
 // uploads ahead of it, on every other queue (or, planned by queue, on the batches that use what they write, with the uploads
 // recorded on a batch's own queue noted on it), and the frame values. Zero values are no wait (submission drops them).
-void FillScheduleSubmissionWaits(ScheduleSubmissionWaits& out, const experimental::CompiledGraph& graph,
-	const std::vector<std::vector<experimental::ExecutionTimelinePoint>>& incoming, std::pair<uint32_t, uint64_t> uploadsDone, uint64_t frameWait,
+void FillScheduleSubmissionWaits(ScheduleSubmissionWaits& out, const compiler::CompiledGraph& graph,
+	const std::vector<std::vector<compiler::ExecutionTimelinePoint>>& incoming, std::pair<uint32_t, uint64_t> uploadsDone, uint64_t frameWait,
 	const RenderGraph::PersistentTicket::QueueUploads* queueUploads) {
 	using Source = ScheduleSubmissionWaits::Point::Source;
 	const bool planned = queueUploads && queueUploads->planned && queueUploads->waitsForUploads.size() == graph.batches.size();

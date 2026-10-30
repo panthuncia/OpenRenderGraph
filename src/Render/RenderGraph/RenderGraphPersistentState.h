@@ -22,7 +22,7 @@
 #include "AliasPacking.h"
 #include "FrameRecording.h"
 #include "ScheduleTraceBuild.h"
-#include "Render/RenderGraph/ExperimentalRhiExecution.h"
+#include "Render/RenderGraph/RhiExecution.h"
 #include "Render/RenderGraph/ExternalEpochExecution.h"
 #include "Render/RenderGraph/PersistentGraph.h"
 #include "Render/Runtime/ScopedActiveGraphServices.h"
@@ -68,11 +68,11 @@ namespace org {
 
 namespace persistent_impl {
 
-using experimental::CompileRange;
-using experimental::CompileResourceShape;
-using experimental::CompileResourceState;
-using experimental::PreparedBackingState;
-using experimental::PreparedStateRegion;
+using compiler::CompileRange;
+using compiler::CompileResourceShape;
+using compiler::CompileResourceState;
+using compiler::PreparedBackingState;
+using compiler::PreparedStateRegion;
 using lowering::ConcurrentlyShared;
 using lowering::LowerRange;
 using lowering::LowerState;
@@ -166,9 +166,9 @@ using namespace persistent_impl;
 // A segment's recorded packets, and what they were recorded for. Kept (RenderGraph::m_keptRecordings) when replayable: then
 // submitted by every ticket that takes it, one at a time (a frame slot's tickets follow each other's completion).
 struct RenderGraph::PersistentRecording {
-	std::shared_ptr<const experimental::RenderFrameSnapshot> snapshot;
-	std::vector<std::shared_ptr<const experimental::IPreparedExecutionBatch>> packets;
-	std::vector<std::shared_ptr<experimental::OwnedRecordingStatistics>> statistics;
+	std::shared_ptr<const compiler::RenderFrameSnapshot> snapshot;
+	std::vector<std::shared_ptr<const compiler::IPreparedExecutionBatch>> packets;
+	std::vector<std::shared_ptr<compiler::OwnedRecordingStatistics>> statistics;
 	bool replayable = false;
 	// The reuse key.
 	uint64_t hostTag = 0;
@@ -235,7 +235,7 @@ struct RenderGraph::PersistentTicket {
 			uint32_t batch = 0;
 			rhi::CommandList list{};
 			size_t copies = 0;
-			std::vector<experimental::ExecutionTimelinePoint> waits;  // against earlier executions' use of its destinations
+			std::vector<compiler::ExecutionTimelinePoint> waits;  // against earlier executions' use of its destinations
 		};
 		std::vector<Leading> leading;
 	} queueUploads;
@@ -336,7 +336,7 @@ struct RenderGraph::PersistentExecutionState {
 		std::vector<persistent::FrameRebinding> rebindings;
 		std::vector<persistent::FrameProducerWait> waits;
 		std::shared_ptr<const FrozenExecutionBindings> legacyBindings;
-		std::vector<experimental::PreparedTimelineBinding> foreignTimelines;
+		std::vector<compiler::PreparedTimelineBinding> foreignTimelines;
 		std::vector<std::shared_ptr<const void>> leases;
 	};
 
@@ -389,7 +389,7 @@ struct RenderGraph::PersistentExecutionState {
 
 	persistent::GraphProgram program;
 	std::unique_ptr<persistent::SynchronousAdmission> admission;
-	std::unique_ptr<experimental::ExecutionTimelineAdmission> timelines;
+	std::unique_ptr<compiler::ExecutionTimelineAdmission> timelines;
 	std::vector<SlotEntry> entries;                                // Index == slot index.
 	std::unordered_map<uint64_t, std::vector<uint32_t>> entriesByResourceID;
 	std::vector<MainPass> mainPasses;
@@ -448,7 +448,7 @@ struct RenderGraph::PersistentExecutionState {
 		std::atomic_bool clearedOrderings{false};
 		std::shared_ptr<const persistent::SelectedPublication> result;
 		std::string error;
-		experimental::CompileWorkspace workspace;
+		compiler::CompileWorkspace workspace;
 		std::vector<uint32_t> dirtyPasses;        // slotsDirty deferred to the install
 		// Relowered passes' declared tokens, which resolve only against the new publication: swapped in at the install.
 		struct DeclaredTokens {
@@ -517,8 +517,8 @@ inline bool SameTimeline(const rhi::Timeline& a, const rhi::Timeline& b) noexcep
 	return a.impl == b.impl && a.GetHandle().index == b.GetHandle().index && a.GetHandle().generation == b.GetHandle().generation;
 }
 
-inline std::vector<experimental::CompileQueue> RegistryQueues(const QueueRegistry& registry) {
-	std::vector<experimental::CompileQueue> queues;
+inline std::vector<compiler::CompileQueue> RegistryQueues(const QueueRegistry& registry) {
+	std::vector<compiler::CompileQueue> queues;
 	for (size_t slot = 0; slot < registry.SlotCount(); ++slot)
 		queues.push_back({static_cast<uint32_t>(registry.GetBackendInstance(static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot)))), true});
 	return queues;
@@ -535,7 +535,7 @@ inline bool IsSwapchainResource(Resource& resource) {
 	return resource.GetName() == "Backbuffer" && dynamic_cast<DynamicResource*>(&resource)
 		&& !dynamic_cast<BackedResource*>(UnwrapDynamic(&resource));
 }
-inline uint64_t FingerprintDeclaration(const experimental::CompilePass& d) {
+inline uint64_t FingerprintDeclaration(const compiler::CompilePass& d) {
 	uint64_t h = 0x9e3779b97f4a7c15ull;
 	auto mix = [&](uint64_t value) { h ^= value + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2); };
 	mix(d.backend); mix(d.preferredQueueSlot); mix(d.forceBatchIsolation ? 1 : 0); mix(d.recordAtExecution ? 1 : 0);
@@ -598,8 +598,8 @@ void InstallMainPass(RenderGraph& graph, State& state, persistent::GraphEditTran
 bool LoweringAddsDeclarations(const State::MainPass& main, const LoweredPass& lowered);
 
 // RenderGraphPersistentTrace.cpp
-void FillScheduleSubmissionWaits(ScheduleSubmissionWaits& out, const experimental::CompiledGraph& graph,
-	const std::vector<std::vector<experimental::ExecutionTimelinePoint>>& incoming, std::pair<uint32_t, uint64_t> uploadsDone, uint64_t frameWait,
+void FillScheduleSubmissionWaits(ScheduleSubmissionWaits& out, const compiler::CompiledGraph& graph,
+	const std::vector<std::vector<compiler::ExecutionTimelinePoint>>& incoming, std::pair<uint32_t, uint64_t> uploadsDone, uint64_t frameWait,
 	const RenderGraph::PersistentTicket::QueueUploads* queueUploads = nullptr);
 
 } // namespace persistent_impl

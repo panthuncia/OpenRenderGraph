@@ -1,8 +1,8 @@
 #include <RenderPasses/ReadbackCopyCapturePass.h>
+#include "TestSupport.h"
 #include <cstring>
 #include <cstdio>
 
-#define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "Readback reservation check failed at %d: %s\n", __LINE__, #x); return __LINE__; } } while (false)
 namespace {
 class CaptureService final : public org::runtime::IReadbackService {
 public:

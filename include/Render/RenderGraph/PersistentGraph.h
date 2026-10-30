@@ -1,7 +1,7 @@
 #pragma once
 
-#include "Render/RenderGraph/ExperimentalGraphCompiler.h"
-#include "Render/RenderGraph/ExperimentalExecutionState.h"
+#include "Render/RenderGraph/GraphCompiler.h"
+#include "Render/RenderGraph/ExecutionState.h"
 #include <array>
 #include <cstdint>
 #include <functional>
@@ -62,12 +62,12 @@ public:
 };
 struct GroupAccess {
     PassId pass;
-    experimental::CompileResourceState state;
+    compiler::CompileResourceState state;
     uint32_t phase = 0;
-    std::optional<experimental::CompileRange> range;
+    std::optional<compiler::CompileRange> range;
 };
 struct ResourceGroup {
-    experimental::CompileResourceShape memberShape;
+    compiler::CompileResourceShape memberShape;
     uint64_t membershipRevision = 1;
     std::vector<ResourceSlotId> members;
     // Reverse subscriptions are authored once, never reconstructed by frames.
@@ -88,7 +88,7 @@ struct NativeBindingContract {
     uint32_t width = 0, height = 0, depthOrLayers = 0, mips = 0, samples = 0;
     std::vector<rhi::Format> castableFormats;
     static NativeBindingContract Capture(const rhi::ResourceDesc& description);
-    bool Matches(const rhi::ResourceDesc& description, experimental::CompileResourceShape shape) const;
+    bool Matches(const rhi::ResourceDesc& description, compiler::CompileResourceShape shape) const;
 };
 struct LogicalGraph {
     struct PassSlot {
@@ -108,7 +108,7 @@ struct LogicalGraph {
     // follow the listed ones in ascending order.
     std::vector<uint32_t> epochOrder;
     uint64_t domain = 0;
-    experimental::GraphCompileStructure declarations;
+    compiler::GraphCompileStructure declarations;
     std::vector<ResourceGroup> groups;
     std::vector<PassSlot> passSlots;
     std::vector<uint8_t> resourceActive;
@@ -124,13 +124,13 @@ struct LogicalGraph {
 // the logical compiler. State and timeline admission remain execution-specific.
 struct BindingVersion {
     static BindingVersion FromSnapshot(std::shared_ptr<const ResourceBindingSnapshot> snapshot,
-        const experimental::PreparedBackingState& initial, uint64_t descriptorRevision = 0,
+        const compiler::PreparedBackingState& initial, uint64_t descriptorRevision = 0,
         uint64_t contentRevision = 0);
     uint64_t identity = 0, backingRevision = 0, descriptorRevision = 0;
     uint64_t contentRevision = 0, waitRevision = 0;
-    experimental::CompileResourceShape shape;
+    compiler::CompileResourceShape shape;
     std::shared_ptr<const void> owner;
-    std::shared_ptr<const experimental::PreparedBackingState> admission;
+    std::shared_ptr<const compiler::PreparedBackingState> admission;
     bool active = true;
     // A reserved slot is active and compiled but currently has no backing.
     // Admission and recording skip it; binding one later is not structural.
@@ -160,16 +160,16 @@ private:
 
 struct ExecutableGeneration {
     uint64_t structuralRevision = 0;
-    std::shared_ptr<const experimental::CompiledGraph> graph;
+    std::shared_ptr<const compiler::CompiledGraph> graph;
     // Compiler enumeration is private to this generation. Admission resolves
     // stable slots through this immutable map, never assumes table density.
     std::vector<ResourceSlotId> resourceSlots;
     // Retained once per structural generation for the production submission
     // adapter. No frame creates or reconstructs this immutable compiler input.
-    std::shared_ptr<const experimental::GraphCompileInput> compileInput;
+    std::shared_ptr<const compiler::GraphCompileInput> compileInput;
     // Production recording/submission mapping, prepared once with the executable.
     // Retired logical pass slots remain empty; active slots keep stable indices.
-    std::shared_ptr<const experimental::GraphExecutionLayout> executionLayout;
+    std::shared_ptr<const compiler::GraphExecutionLayout> executionLayout;
     std::vector<uint32_t> resourceIndexBySlot;
     std::vector<std::vector<uint32_t>> incomingBatchesByResource;
     std::vector<uint32_t> incomingStateBatchByResource;
@@ -213,11 +213,11 @@ public:
     GraphEditTransaction& operator=(const GraphEditTransaction&) = delete;
     GraphEditTransaction(GraphEditTransaction&&) noexcept = default;
     GraphEditTransaction& operator=(GraphEditTransaction&&) noexcept = default;
-    ResourceSlotId AddResource(experimental::CompileResourceShape shape, BindingVersion binding);
+    ResourceSlotId AddResource(compiler::CompileResourceShape shape, BindingVersion binding);
     // Reserved capacity: the slot participates in compilation with a placeholder
     // backing so a later BindReserved/Unbind is a binding-only edit. The optional
     // contract is checked when a real binding arrives.
-    ResourceSlotId ReserveResource(experimental::CompileResourceShape shape,
+    ResourceSlotId ReserveResource(compiler::CompileResourceShape shape,
         std::optional<NativeBindingContract> contract = {});
     void BindReserved(ResourceSlotId slot, BindingVersion binding);
     // Slot indices this transaction currently binds to one physical identity.
@@ -230,9 +230,9 @@ public:
     // default a pass is placed at index * kAuthoredOrderStride, leaving room to
     // insert passes between existing ones with an explicit order.
     static constexpr uint32_t kAuthoredOrderStride = 1024;
-    PassId AddPass(experimental::CompilePass pass, std::optional<uint32_t> authoredOrder = std::nullopt);
+    PassId AddPass(compiler::CompilePass pass, std::optional<uint32_t> authoredOrder = std::nullopt);
     uint32_t AuthoredOrder(PassId pass) const;
-    void ReplacePass(PassId pass, experimental::CompilePass declaration);
+    void ReplacePass(PassId pass, compiler::CompilePass declaration);
     void RemovePass(PassId pass);
     void SetPassRecordingInterface(PassId pass, std::shared_ptr<const void> recordingInterface);
     // Structural: the epoch the pass executes in (AllEpochs: every one).
@@ -242,13 +242,13 @@ public:
     // Structural: the order the host executes its epochs in within a frame.
     void SetEpochOrder(std::vector<uint32_t> order);
     BindingToken Declare(PassId pass, ResourceSlotId resource,
-        experimental::CompileRange range, experimental::CompileResourceState state);
+        compiler::CompileRange range, compiler::CompileResourceState state);
     BindingToken DeclareDependency(PassId pass, ResourceSlotId resource, bool write);
     // A descriptor binding for a group position. Group access supplies hazards;
     // unused reserved positions must not become mandatory direct accesses.
     BindingToken BindGroupMember(PassId pass, ResourceGroupId group, ResourceSlotId resource);
-    void DeclarePostcondition(BindingToken binding, experimental::CompileRange range,
-        experimental::CompileResourceState state);
+    void DeclarePostcondition(BindingToken binding, compiler::CompileRange range,
+        compiler::CompileResourceState state);
     ViewToken DeclareView(BindingToken binding, BindlessViewRequest view);
     // Adapter path for logical declarations preceding alias materialization.
     // Bound versions are validated immediately; placeholders are validated by ReplaceBinding.
@@ -258,35 +258,35 @@ public:
     // Drops every placement ordering (structural). Alias planning re-derives
     // them from the schedule of the new executable.
     void ClearPlacementOrderings();
-    void ReplaceResourceContract(ResourceSlotId slot, experimental::CompileResourceShape shape, BindingVersion binding);
-    void SetQueues(std::vector<experimental::CompileQueue> queues);
+    void ReplaceResourceContract(ResourceSlotId slot, compiler::CompileResourceShape shape, BindingVersion binding);
+    void SetQueues(std::vector<compiler::CompileQueue> queues);
     void ReplaceBinding(ResourceSlotId slot, BindingVersion binding);
     ResourceSlotId AddSnapshot(std::shared_ptr<const ResourceBindingSnapshot> snapshot,
-        const experimental::PreparedBackingState& initial, uint64_t descriptorRevision = 0, uint64_t contentRevision = 0);
+        const compiler::PreparedBackingState& initial, uint64_t descriptorRevision = 0, uint64_t contentRevision = 0);
     void ReplaceSnapshot(ResourceSlotId slot, std::shared_ptr<const ResourceBindingSnapshot> snapshot,
-        const experimental::PreparedBackingState& initial, uint64_t descriptorRevision = 0, uint64_t contentRevision = 0);
-    ResourceGroupId AddGroup(experimental::CompileResourceShape memberShape, std::vector<ResourceSlotId> members);
+        const compiler::PreparedBackingState& initial, uint64_t descriptorRevision = 0, uint64_t contentRevision = 0);
+    ResourceGroupId AddGroup(compiler::CompileResourceShape memberShape, std::vector<ResourceSlotId> members);
     void ReplaceGroupMembers(ResourceGroupId group, std::vector<ResourceSlotId> members);
     // Appends `count` reserved member slots (structural). Binding them later is
     // a binding-only edit; this is how streaming membership stays non-structural.
     std::vector<ResourceSlotId> ReserveGroupMembers(ResourceGroupId group, uint32_t count);
     void SetGroupResourceClass(ResourceGroupId group, rhi::ResourceType type);
     void DeclareGroupAccess(PassId pass, ResourceGroupId group,
-        experimental::CompileResourceState state, uint32_t phase,
-        std::optional<experimental::CompileRange> range = {});
+        compiler::CompileResourceState state, uint32_t phase,
+        std::optional<compiler::CompileRange> range = {});
     void RemoveGroupAccess(PassId pass, ResourceGroupId group);
     void RemoveGroup(ResourceGroupId group);
     static void UnindexGroupMember(LogicalGraph& logical, ResourceSlotId slot, uint32_t groupIndex);
     // validateAliasOrder=false builds a schedule-only publication for alias
     // planning: existing placements may be unordered against new users. Such a
     // publication must not be installed; plan, re-edit and build again.
-    std::shared_ptr<const SelectedPublication> Build(experimental::CompileWorkspace& workspace,
+    std::shared_ptr<const SelectedPublication> Build(compiler::CompileWorkspace& workspace,
         const std::atomic_bool& cancelled, bool validateAliasOrder = true);
     uint64_t BaseRevision() const noexcept;
     // Producer-side preparation failure makes the entire edit unselectable.
     void Abort() noexcept { m_failed = true; }
 private:
-    experimental::GraphCompileStructure& EditStructure();
+    compiler::GraphCompileStructure& EditStructure();
     LogicalGraph& EditLogical(bool structural = true);
     void ValidatePass(PassId pass) const;
     void ClearPassBindings(PassId pass);
@@ -323,19 +323,19 @@ private:
 struct FrameAdmission {
     uint64_t sequence = 0, domain = 0;
     std::shared_ptr<const SelectedPublication> publication;
-    std::vector<experimental::PreparedBackingState> backings;
-    experimental::PreparedExecutionBarrierPlan barriers;
-    std::vector<std::vector<experimental::ExecutionTimelinePoint>> incomingWaits;
+    std::vector<compiler::PreparedBackingState> backings;
+    compiler::PreparedExecutionBarrierPlan barriers;
+    std::vector<std::vector<compiler::ExecutionTimelinePoint>> incomingWaits;
     // Per batch, (compiler resource index, wait): every earlier access (writer and readers, any queue) the ledger holds of each
     // resource the batch uses first and that some batch off the upload queue uses (SynchronousAdmission::SetUploadQueue; empty
     // without one). What an upload into the resource recorded on another queue than the upload queue, ahead of the execution,
     // must wait for (RenderGraph::RecordPendingUploads' queue-scoped uploads); incomingWaits gives a read only the writer.
-    experimental::BackingAccessAdmissionLedger::ResourceWaits boundaryAccessWaits;
+    compiler::BackingAccessAdmissionLedger::ResourceWaits boundaryAccessWaits;
     std::vector<uint64_t> queueTimelines;
     struct IncomingEffect {
         rhi::ResourceHandle resource;
         uint64_t revision;
-        experimental::ExecutionTimelinePoint completion;
+        compiler::ExecutionTimelinePoint completion;
         uint32_t firstBatch;
     };
     std::vector<IncomingEffect> incomingEffects;
@@ -353,7 +353,7 @@ struct FrameAdmission {
 // physical identity is late-bound, so this never supersedes a pending edit.
 struct FrameRebinding {
     ResourceSlotId slot;
-    experimental::PreparedBackingState backing;
+    compiler::PreparedBackingState backing;
     std::shared_ptr<const ResourceBindingSnapshot> recording;
 };
 
@@ -361,7 +361,7 @@ struct FrameRebinding {
 // binding compatibility. Stable consumers resolve through the selected layout.
 struct FrameProducerWait {
     PassId consumer;
-    experimental::ExecutionTimelinePoint completion;
+    compiler::ExecutionTimelinePoint completion;
 };
 struct FrameIncomingState {
     // New external submission since the last committed graph state. Report
@@ -370,8 +370,8 @@ struct FrameIncomingState {
     // first state-use batch; repeated consumed reports preserve newer graph states.
     ResourceSlotId resource;
     rhi::ResourceHandle backing;
-    std::shared_ptr<const std::vector<experimental::PreparedStateRegion>> regions;
-    experimental::ExecutionTimelinePoint producerCompletion;
+    std::shared_ptr<const std::vector<compiler::PreparedStateRegion>> regions;
+    compiler::ExecutionTimelinePoint producerCompletion;
     uint64_t revision = 1;
 };
 class SynchronousAdmission {
@@ -413,23 +413,23 @@ public:
     uint64_t PlanCacheHits() const noexcept { return m_planCacheHits; }
     uint64_t PlanCacheMisses() const noexcept { return m_planCacheMisses; }
     FrameAdmission Prepare(std::shared_ptr<const SelectedPublication> publication,
-        std::span<const experimental::ExecutionTimelinePoint> queues,
+        std::span<const compiler::ExecutionTimelinePoint> queues,
         std::span<const FrameProducerWait> producerWaits = {},
         std::span<const FrameIncomingState> incomingStates = {},
         std::span<const FrameRebinding> rebindings = {});
-    void Commit(const FrameAdmission& frame, const experimental::GraphExecutionTimeline& receipt,
+    void Commit(const FrameAdmission& frame, const compiler::GraphExecutionTimeline& receipt,
         uint32_t signaledBatches = UINT32_MAX);
     void Abandon(const FrameAdmission& frame);
     // Work submitted outside a graph receipt on a graph queue (presentation
     // tails). Completion observations are clamped against this.
-    void ExtendSubmitted(experimental::ExecutionTimelinePoint point);
+    void ExtendSubmitted(compiler::ExecutionTimelinePoint point);
     uint64_t Submitted(uint64_t timeline) const noexcept;
-    size_t RetireCompleted(std::span<const experimental::ExecutionTimelinePoint> completed);
+    size_t RetireCompleted(std::span<const compiler::ExecutionTimelinePoint> completed);
     size_t RetainedFrames() const noexcept { return m_retained.size(); }
 private:
-    experimental::BackingStateAdmissionLedger m_states;
-    experimental::BackingAccessAdmissionLedger m_accesses;
-    experimental::AliasAccessAdmissionLedger m_aliases;
+    compiler::BackingStateAdmissionLedger m_states;
+    compiler::BackingAccessAdmissionLedger m_accesses;
+    compiler::AliasAccessAdmissionLedger m_aliases;
     uint64_t m_nextSequence = 1;
     // Admissions prepared and not yet committed or abandoned, in sequence order (at most one unless closed).
     std::vector<uint64_t> m_pending;
@@ -439,17 +439,17 @@ private:
         std::weak_ptr<const ExecutableGeneration> executable;
         std::vector<rhi::ResourceHandle> resources;
         std::vector<const void*> regions;
-        experimental::PreparedExecutionBarrierPlan barriers;
+        compiler::PreparedExecutionBarrierPlan barriers;
     };
     std::vector<CachedPlan> m_planCache;
     uint64_t m_planCacheHits = 0, m_planCacheMisses = 0;
     uint64_t m_domain = 0;
     std::map<uint64_t,uint64_t> m_submitted, m_completed;
-    struct IncomingRevision { uint64_t revision = 0; experimental::ExecutionTimelinePoint completion; };
+    struct IncomingRevision { uint64_t revision = 0; compiler::ExecutionTimelinePoint completion; };
     std::map<uint64_t,IncomingRevision> m_incomingRevisions;
     struct RetainedFrame {
         std::shared_ptr<const SelectedPublication> publication;
-        std::vector<experimental::ExecutionTimelinePoint> completions;
+        std::vector<compiler::ExecutionTimelinePoint> completions;
     };
     std::vector<RetainedFrame> m_retained;
     size_t m_capacity;

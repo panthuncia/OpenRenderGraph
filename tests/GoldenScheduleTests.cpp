@@ -9,7 +9,7 @@
 #include <sstream>
 #include <string>
 
-using namespace org::experimental;
+using namespace org::compiler;
 
 namespace {
 void Fail(const std::string& message)

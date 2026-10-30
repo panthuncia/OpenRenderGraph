@@ -1,8 +1,8 @@
 #include <OpenRenderGraph/ContributorRegistry.h>
+#include "TestSupport.h"
 
 #include <string_view>
 
-#define CHECK(value) do { if (!(value)) return __LINE__; } while (false)
 
 namespace {
 	org::contributor::ContributorRegistry* registry{};

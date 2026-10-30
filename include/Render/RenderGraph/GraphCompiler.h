@@ -16,7 +16,7 @@
 #include "Render/Runtime/ITaskService.h"
 #include "Render/RenderGraph/CompilerAlgorithms.h"
 
-namespace org::experimental {
+namespace org::compiler {
 
 // This extraction produces dependencies and a symbolic queue schedule. It is deliberately
 // not executable: realization, alias planning and ordered admission must be
@@ -396,4 +396,4 @@ private:
     std::optional<FailedExecutionBatch> m_failure;
 };
 
-} // namespace org::experimental
+} // namespace org::compiler

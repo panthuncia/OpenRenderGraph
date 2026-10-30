@@ -1,8 +1,8 @@
 #pragma once
 
 #include <atomic>
-#include "Render/RenderGraph/ExperimentalGraphCompiler.h"
-#include "Render/RenderGraph/ExperimentalExecutionState.h"
+#include "Render/RenderGraph/GraphCompiler.h"
+#include "Render/RenderGraph/ExecutionState.h"
 #include "Render/PreparedPass.h"
 #include "Render/RenderGraph/PersistentGraph.h"
 #include "Render/CommandListPool.h"
@@ -22,7 +22,7 @@
 #include <vector>
 #include <BasicTelemetry/Tracy.h>
 
-namespace org::experimental {
+namespace org::compiler {
 
 // Immutable realization selected with a compiled structural plan. Compilation
 // never dereferences this object; recording and retirement retain it so backing
@@ -699,6 +699,11 @@ struct OwnedRecordingList {
     bool replayable = false;
 };
 
+} // namespace org::compiler
+
+// Diagnostic switches for timing runs: they leave out parts of every recording, unsafe for ordinary rendering.
+namespace org::diagnostics {
+
 // Diagnostics: recordings made while set skip the list-start descriptor heap bind of lists holding only latched copies (which read
 // no descriptor). For timing the bind's cost only.
 inline std::atomic<bool>& DiagnosticSkipListHeapBinds() {
@@ -718,6 +723,10 @@ inline std::atomic<bool>& DiagnosticSkipPassQueries() {
     static std::atomic<bool> skip{false};
     return skip;
 }
+
+} // namespace org::diagnostics
+
+namespace org::compiler {
 
 inline OwnedRecordingList BuildPersistentRecordingList(std::shared_ptr<const RenderFrameSnapshot> sealed, uint32_t batch) {
     if (!sealed) throw std::invalid_argument("Missing persistent frame seal");
@@ -785,12 +794,12 @@ inline void RecordOwnedRecordingCommands(RecordingContext& context, const OwnedR
     };
     auto* statistics = recording.statistics.get();
     if (statistics) statistics->cpuMilliseconds.resize(recording.passes.size());
-    const bool skipQueries = DiagnosticSkipPassQueries().load(std::memory_order_relaxed);
+    const bool skipQueries = diagnostics::DiagnosticSkipPassQueries().load(std::memory_order_relaxed);
     if (skipQueries && statistics) statistics->gpuQueries = false;
     // The diagnostic skips it only for lists of copies alone (the latched copies'), which read no descriptor.
     const bool copiesOnly = std::all_of(recording.passes.begin(), recording.passes.end(),
         [](const PreparedPass& p) { return p.DebugName().ends_with("latched-copies"); });
-    if (recording.resourceDescriptorHeap.valid() && !(copiesOnly && DiagnosticSkipListHeapBinds().load(std::memory_order_relaxed))) {
+    if (recording.resourceDescriptorHeap.valid() && !(copiesOnly && diagnostics::DiagnosticSkipListHeapBinds().load(std::memory_order_relaxed))) {
         context.Commands().SetDescriptorHeaps(recording.resourceDescriptorHeap,
             recording.samplerDescriptorHeap.valid()
                 ? std::optional<rhi::DescriptorHeapHandle>{recording.samplerDescriptorHeap}
@@ -800,7 +809,7 @@ inline void RecordOwnedRecordingCommands(RecordingContext& context, const OwnedR
     const auto firstPass = recording.passes.empty() ? std::string_view{} : std::string_view(recording.passes.front().DebugName());
     // A kept recording's own queries (OwnedTimestampQueries) time its barrier batches too, under the profiler's range names.
     auto* const ownedQueries = statistics && statistics->gpuQueries && statistics->queries.owned ? &statistics->queries : nullptr;
-    const int skipBarriers = DiagnosticSkipListBarriers().load(std::memory_order_relaxed);
+    const int skipBarriers = diagnostics::DiagnosticSkipListBarriers().load(std::memory_order_relaxed);
     const auto recordBarriers = [&](const char* where, std::string_view pass, const rhi::BarrierBatch& barriers) {
         if (skipBarriers >= 2 || (skipBarriers == 1 && barriers.globals.size != 0))
             return;
@@ -1040,4 +1049,4 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
     return packet;
 }
 
-} // namespace org::experimental
+} // namespace org::compiler

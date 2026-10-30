@@ -70,7 +70,7 @@ void RenderGraph::AddPersistentTicketCandidate(PersistentTicket& ticket, std::sh
 	// The queues as submitSegment takes them: what each has submitted, a pending presentation tail owning the next graphics value.
 	const size_t slotCount = m_queueRegistry.SlotCount();
 	const auto presentationSlot = m_queueRegistry.FindGraphicsSlot();
-	std::vector<experimental::ExecutionTimelinePoint> queues;
+	std::vector<compiler::ExecutionTimelinePoint> queues;
 	for (size_t slot = 0; slot < slotCount; ++slot) {
 		const auto next = m_queueRegistry.GetCurrentFenceValue(static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot)));
 		auto submitted = next ? next - 1 : 0;
@@ -95,7 +95,7 @@ std::vector<std::pair<uint32_t, uint64_t>> RenderGraph::CompletePersistentTicket
 			state.admission->Abandon(segment.admission);
 			continue;
 		}
-		std::vector<experimental::ExecutionTimelinePoint> signals;
+		std::vector<compiler::ExecutionTimelinePoint> signals;
 		signals.reserve(graph.batches.size());
 		for (uint32_t batch = 0; batch < graph.batches.size(); ++batch)
 			signals.push_back({uint64_t{graph.batches[batch].queue} + 1, submission.signals.at(next++)});
@@ -283,7 +283,7 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 		const auto& graph = *segment.admission.publication->executable->graph;
 		// The same timeline composition the owner's RecordSubmitted will derive from these values: the
 		// execution's incoming waits plus its batches' waits on each other.
-		std::vector<experimental::ExecutionBatchTimeline> batches(graph.batches.size());
+		std::vector<compiler::ExecutionBatchTimeline> batches(graph.batches.size());
 		const auto& incoming = segment.admission.incomingWaits;
 		if (planned.planned && planned.waitsForUploads.size() != graph.batches.size())
 			throw std::logic_error("Queue-scoped uploads planned for other batches");
@@ -324,7 +324,7 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 			if (!out.external) out.external = std::make_shared<ExternalEpochExecution>();
 			auto& execution = *out.external;
 			for (size_t i = 0; i < packets.size(); ++i) {
-				auto packet = std::dynamic_pointer_cast<const experimental::PreparedRhiExecutionBatch>(packets[i]);
+				auto packet = std::dynamic_pointer_cast<const compiler::PreparedRhiExecutionBatch>(packets[i]);
 				if (!packet) throw std::logic_error("An external epoch's packet the host cannot execute");
 				for (const auto wait : batches[i].waits) {
 					const auto timeline = packet->ResolveTimeline(wait.timeline);
@@ -351,7 +351,7 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 				// closed execution's entry barrier orders it after them), with the waits their destinations need.
 				for (const auto& leading : planned.leading) {
 					if (leading.batch != i || !leading.copies) continue;
-					const auto* packet = dynamic_cast<const experimental::PreparedRhiExecutionBatch*>(packets[i].get());
+					const auto* packet = dynamic_cast<const compiler::PreparedRhiExecutionBatch*>(packets[i].get());
 					if (!packet) throw std::logic_error("Queue-scoped uploads ahead of a packet that cannot take them");
 					auto list = leading.list;
 					if (!packet->SubmitLeading({&list, 1}, leading.waits)) return false;
@@ -383,7 +383,7 @@ struct TicketUploadRouting {
 	std::vector<uint8_t> waitsForUploads;           // per batch: uses what the graphics list (or a recorded list) writes
 	std::vector<uint32_t> firstOnQueue;             // per queue slot: its first batch, UINT32_MAX for none
 	std::vector<size_t> copies;                     // per queue slot: the staged copies routed to it
-	std::vector<std::vector<experimental::ExecutionTimelinePoint>> waits;  // per queue slot: its upload list's waits
+	std::vector<std::vector<compiler::ExecutionTimelinePoint>> waits;  // per queue slot: its upload list's waits
 };
 
 // graphicsBuffers: everything the graphics list and the recorded lists touch (known). staged: the staged copies' destinations, one
@@ -465,12 +465,12 @@ bool PlanTicketUploads(const RenderGraph::PersistentTicket& ticket, uint32_t gra
 	const auto& incoming = segment.admission.incomingWaits;
 	const auto& boundary = segment.admission.boundaryAccessWaits;
 	const bool earlierUseKnown = boundary.size() == batchCount;
-	std::vector<experimental::ExecutionTimelinePoint> waits;
+	std::vector<compiler::ExecutionTimelinePoint> waits;
 	for (auto& [key, destination] : destinations) {
 		if (!destination.staged || destination.graphics || destination.aliased || destination.uses.empty() || !earlierUseKnown) continue;
 		const auto queue = graph.batches[destination.uses.front().first].queue;
 		if (queue == graphicsQueue || queue >= queueLists.size() || !queueLists[queue]) continue;
-		const auto* packet = dynamic_cast<const experimental::PreparedRhiExecutionBatch*>(packets[out.firstOnQueue[queue]].get());
+		const auto* packet = dynamic_cast<const compiler::PreparedRhiExecutionBatch*>(packets[out.firstOnQueue[queue]].get());
 		if (!packet) continue;
 		const auto& ordered = orderedAfter(queue);
 		if (!std::ranges::all_of(destination.uses, [&](const auto& use) { return ordered[use.first] != 0; })) continue;
@@ -478,9 +478,9 @@ bool PlanTicketUploads(const RenderGraph::PersistentTicket& ticket, uint32_t gra
 		// its own queue is ordered by the list's barrier), and what each batch using it waits for at entry.
 		waits.clear();
 		const uint64_t ownTimeline = uint64_t{queue} + 1;
-		auto addWait = [&](experimental::ExecutionTimelinePoint point) {
+		auto addWait = [&](compiler::ExecutionTimelinePoint point) {
 			if (!point.timeline || !point.value || point.timeline == ownTimeline) return;
-			const auto found = std::ranges::find(waits, point.timeline, &experimental::ExecutionTimelinePoint::timeline);
+			const auto found = std::ranges::find(waits, point.timeline, &compiler::ExecutionTimelinePoint::timeline);
 			if (found == waits.end()) waits.push_back(point);
 			else found->value = (std::max)(found->value, point.value);
 		};
@@ -493,7 +493,7 @@ bool PlanTicketUploads(const RenderGraph::PersistentTicket& ticket, uint32_t gra
 		out.routed.emplace(key, queue);
 		for (const auto point : waits) {
 			auto& queueWaits = out.waits[queue];
-			const auto found = std::ranges::find(queueWaits, point.timeline, &experimental::ExecutionTimelinePoint::timeline);
+			const auto found = std::ranges::find(queueWaits, point.timeline, &compiler::ExecutionTimelinePoint::timeline);
 			if (found == queueWaits.end()) queueWaits.push_back(point);
 			else found->value = (std::max)(found->value, point.value);
 		}
@@ -632,7 +632,7 @@ void RenderGraph::ConfirmPersistentPresentationTail() {
 	const auto value = m_queueRegistry.GetNextFenceValue(slot);
 	if (queue.Signal({fence.GetHandle(), value}) != rhi::Result::Ok)
 		throw std::runtime_error("Presentation tail completion signal failed");
-	const experimental::ExecutionTimelinePoint point{static_cast<uint64_t>(ToUnderlying(slot)) + 1u, value};
+	const compiler::ExecutionTimelinePoint point{static_cast<uint64_t>(ToUnderlying(slot)) + 1u, value};
 	state.timelines->ExtendSubmittedExecution(state.pendingPresentSubmission, point);
 	state.admission->ExtendSubmitted(point);
 	state.pendingPresentSubmission = 0;

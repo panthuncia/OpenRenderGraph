@@ -14,9 +14,9 @@
 
 namespace org::lowering {
 
-using experimental::CompileRange;
-using experimental::CompileResourceShape;
-using experimental::CompileResourceState;
+using compiler::CompileRange;
+using compiler::CompileResourceShape;
+using compiler::CompileResourceState;
 
 Resource* UnwrapDynamic(Resource* resource) noexcept {
 	while (resource) {

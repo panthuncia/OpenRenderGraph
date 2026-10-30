@@ -1,5 +1,30 @@
 # Rebuild ORG around the persistent compiler (revised)
 
+> **Resumed (2026-10-30).** Phase 5 is committed and pushed (ORG `org-rebuild`, BasicRenderer `dev`, SARP `org-rebuild`,
+> CS `org_integration`); its CS tour is still owed. The build-speed work (header firewall, persistent split) landed on top.
+> Phase 5's CS tour passed (Dev-Fast build: same stops, no new errors, equivalent screenshots, VRAM within 300 MiB).
+> Phase 6 implemented (uncommitted while the CS host and in-game check finish):
+> - `ContributorAPI.h` v2 (ORGTypes.h, prepare/record packets, epochs, exports, pipeline service, render-relative buffers,
+>   namespace = the contributor id's first segment); `ContributorHost` (src/Contributor: host, BorrowedRecorder, DeviceTable);
+>   v1 runtime, ExtensionRegistry and the ComputePass/CopyPass bases and builders deleted (ExternalPassDesc has one `pass`).
+> - Tests: registry, C header, end to end (PersistentVulkanHostTests contributor mode), samples/ContributorSample.cpp;
+>   SARP's ProducerCore, diagnostic contributor, loader test, C smoke and ABI audit ported.
+> - CS: ContributorHost beside GraphHost (epochs cs.<segment>, anchors cs.frame.begin/end, no exports yet), the
+>   ORG_GetRenderGraphAPI export, CS_ORG_TEST_CONTRIBUTOR loader for the sample.
+> Known: OpenRenderGraphTrackingWorldTests fails ~40% (ECS tracking-world race), unrelated to the rebuild.
+> Next: Phase 7, then 8.
+>
+> **Earlier deferral (2026-10-30)** for the build-speed plan (`sarp-build-speed.md`). State when paused:
+> - Phase 5 is uncommitted in every repo: ORG at the CS copy and mirrored to BR, plus BR, SARP and CS.
+> - In progress: the resolver-group redesign in `RenderGraphPersistent.cpp`, `PersistentLowering.cpp`, `PassBuilders.h`, `IResourceResolver.h` and `RenderGraph.h/.cpp`:
+>   - `ResolverCaptureScope` makes one capture per declaration, and `ResolverSnapshot::state` holds it;
+>   - `SyncGroupMembers`/`GrowGroup` are shared by install and poll;
+>   - lineage (`memberReplacedIDs`, `MemberPosition`), forward sync at install (`DeclarationIsAhead`);
+>   - `memberOrdinal` and `memberResourceIDs` are removed.
+>   ORG ctest passes (except the TrackingWorld flake). Not yet validated in SARP: the last build failed in `HierarchicalCullingPass1` ("unbound persistent slot"), and the fix for that, forward sync instead of add-only admission, is built but unrun.
+> - Temporary edit to revert: SARP `scripts/sarp_mo2_task.ps1` has a `SARP_CDB_SCRIPT` override.
+> - Still owed for Phase 5: grass ×3, DX12 and multi-RHI benchmarks, the CS tour, then the commits.
+
 ## Context
 
 OpenRenderGraph (ORG) runs three execution routes inside one `RenderGraph` class:
@@ -186,6 +211,22 @@ Target size: about 40–45k lines.
    - On the CS side, a minimal host: export `ORG_GetRenderGraphAPI` from CommunityShaders.dll (push model) and publish CS epoch IDs (`DCLF/Schedule/Frame.cpp:154-166`) and the `diag.*` anchors under `cs.*` names.
    - Defer a game-target export table beyond a smoke set (depth and colour imported through `ImportImage`, `DCLF/Core/Render/Passes/Common.cpp:22-53`) to a follow-up CS plugin-API project.
    - `my-community-shaders` is not migrated.
+
+**Implementation design (2026-10-30):**
+- `OpenRenderGraph/ORGTypes.h`: `ORG_RG_CALL`, `ORGStatus`, `ORGBackend`, `ORGFormat`, handles. `ShaderCompilerService.h`
+  and ORGModuleServices include it instead of the contributor header.
+- `OpenRenderGraph/ContributorAPI.h`, `ORG_RENDER_GRAPH_API_VERSION_2`, includes `rhi_c.h` for the recorder and the device
+  table. Pass callbacks: `prepare` returns an owned `ORGPreparedPass` packet (record, submitted, completed, abandoned,
+  destroy); `invocationRevision` optional and exclusive with the lifecycle hooks. Prepare and record contexts carry the
+  frame, the bindings (exact views captured by the host: descriptor index, resource handle, view handle) and the host's
+  per-frame snapshot (type id, pointer, size).
+- Host tables: anchors and epochs by name (`GetAnchor`, `GetEpoch`), exports (`GetExport`: id, dimension, format, extent,
+  allowed accesses, readable/writable). Pass accesses name a contributor resource or an export.
+- `org.pipelines` service (`QueryService`): the host's `basicrhi_c_device_api_v1` (implemented over `rhi::Device`) and its
+  bindless pipeline layout.
+- Host side, `src/Contributor/`: `ContributorHost` owns the registry, compiles a candidate per build, and contributes
+  `ContributorPass` (a `TypedRenderGraphPass` adapter) through one extension (`GraphHost::AddExtension`). Generations
+  activate on install and retire on the host's retired callback.
 
 ### Phase 7: API and code quality
 

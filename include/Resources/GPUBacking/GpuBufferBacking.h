@@ -4,7 +4,6 @@
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <stacktrace>
 #include <string>
 #include <unordered_map>
 
@@ -29,9 +28,6 @@ public:
 		const char* name = nullptr,
 		bool shared = false) {
 		auto sp = std::unique_ptr<GpuBufferBacking>(new GpuBufferBacking(accessType, bufferSize, owningResourceID, unorderedAccess, name, nullptr, shared));
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
-		//sp->m_creation = std::stacktrace::current();
-#endif
 		return sp;
 	}
 
@@ -43,9 +39,6 @@ public:
 		bool unorderedAccess = false,
 		const char* name = nullptr) {
 		auto sp = std::unique_ptr<GpuBufferBacking>(new GpuBufferBacking(accessType, bufferSize, owningResourceID, unorderedAccess, name, &placement, false));
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
-		//sp->m_creation = std::stacktrace::current();
-#endif
 		return sp;
 	}
 
@@ -73,9 +66,6 @@ public:
 	}
 
 private:
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
-	std::stacktrace m_creation;
-#endif
 	size_t m_size = 0;
 	rhi::BufferBarrier m_barrier = {};
 

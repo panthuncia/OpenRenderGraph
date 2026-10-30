@@ -1,12 +1,13 @@
 #include "RenderPasses/Base/PersistentTypedPass.h"
+#include "TestSupport.h"
 #include <Resources/ExternalBufferResource.h>
 #include <Resources/ExternalTextureResource.h>
 #include <Render/Runtime/RuntimeDevice.h>
 #include <Render/RenderGraph/RenderGraph.h>
 #include <RenderPasses/Base/TypedRenderGraphPass.h>
-#include <Render/RenderGraph/ExperimentalRhiExecution.h>
+#include <Render/RenderGraph/RhiExecution.h>
 #include "../src/Render/RenderGraph/FrameRecording.h"
-#include <Render/RenderGraph/ExperimentalExecutionState.h>
+#include <Render/RenderGraph/ExecutionState.h>
 #include <Render/RenderGraph/PersistentGraph.h>
 #include <Render/BufferBarrierHelpers.h>
 #include <Render/DescriptorSnapshots.h>
@@ -24,7 +25,6 @@
 #include <cstring>
 #include <type_traits>
 
-#define CHECK(x) do { if (!(x)) return __LINE__; } while (false)
 int TestFrameRetirement(rhi::Device device, rhi::Backend backend);
 int TestProgramVersions(rhi::Device device);
 int TestReadbackCaptures(rhi::Device device);
@@ -263,53 +263,53 @@ int TestServiceWorkReservations() {
 }
 
 int TestOwnedRenderFrameSnapshot() {
-    org::experimental::GraphCompileInput input;
+    org::compiler::GraphCompileInput input;
     input.structure.generation = input.structure.registryGeneration = 1;
     input.structure.resourceIDs = {1};
     input.structure.resourceShapes = {{1, 1, false}};
     input.structure.passes = {{0, 0, {{0, false}}}};
     input.structure.passes[0].preparedPassIndex = 0;
     std::atomic_bool cancelled{false};
-    org::experimental::CompileWorkspace workspace;
-    auto ownedInput = std::make_shared<const org::experimental::GraphCompileInput>(input);
-    auto graph = org::experimental::CompileGraph(ownedInput, workspace, cancelled);
-    auto bundle = std::make_shared<const org::experimental::CompiledGraphBundle>(
-        org::experimental::CompiledGraphBundle{1, graph, ownedInput});
-    auto layout = org::experimental::BuildExecutionLayout(bundle, *ownedInput);
+    org::compiler::CompileWorkspace workspace;
+    auto ownedInput = std::make_shared<const org::compiler::GraphCompileInput>(input);
+    auto graph = org::compiler::CompileGraph(ownedInput, workspace, cancelled);
+    auto bundle = std::make_shared<const org::compiler::CompiledGraphBundle>(
+        org::compiler::CompiledGraphBundle{1, graph, ownedInput});
+    auto layout = org::compiler::BuildExecutionLayout(bundle, *ownedInput);
     auto bindings = std::make_shared<const org::FrozenExecutionBindings>(
         std::vector<org::FrozenExecutionBindings::ResourceBinding>{});
     auto record = +[](const uint32_t&, org::RecordingContext&) {};
     auto lease = std::make_shared<int>(3);
-    auto barriers = std::make_shared<org::experimental::PreparedExecutionBarrierPlan>();
+    auto barriers = std::make_shared<org::compiler::PreparedExecutionBarrierPlan>();
     barriers->batches.resize(1);
-    auto frame = org::experimental::BuildRenderFrameSnapshot(7, layout,
+    auto frame = org::compiler::BuildRenderFrameSnapshot(7, layout,
         {org::PreparedPass::Make(uint32_t{1}, record)}, bindings,
-        std::make_shared<const std::vector<org::experimental::PreparedBackingState>>(
-            std::initializer_list<org::experimental::PreparedBackingState>{{.graphResourceID = 1}}),
+        std::make_shared<const std::vector<org::compiler::PreparedBackingState>>(
+            std::initializer_list<org::compiler::PreparedBackingState>{{.graphResourceID = 1}}),
         barriers, {lease});
     CHECK(frame->frameNumber == 7 && frame->layout == layout && frame->passes.size() == 1);
-    auto recordings = org::experimental::BuildPreparedBatchRecordings(*frame);
+    auto recordings = org::compiler::BuildPreparedBatchRecordings(*frame);
     CHECK(recordings.size() == 1 && recordings[0].queueSlot == 0
         && recordings[0].passes.size() == 1);
-    auto realized = std::make_shared<org::experimental::RealizedResourceBundle>();
+    auto realized = std::make_shared<org::compiler::RealizedResourceBundle>();
     realized->backingGenerations = {9};
     realized->bindings = bindings;
-    realized->initialStates = std::make_shared<const std::vector<org::experimental::PreparedBackingState>>(
-        std::initializer_list<org::experimental::PreparedBackingState>{{
+    realized->initialStates = std::make_shared<const std::vector<org::compiler::PreparedBackingState>>(
+        std::initializer_list<org::compiler::PreparedBackingState>{{
             .graphResourceID = 1, .resource = rhi::ResourceHandle{0, 1}}});
     realized->leases = {lease};
     std::vector<std::vector<org::ExternalTimelinePoint>> waits(1);
     waits[0].push_back({{}, 17});
-    auto payload = org::experimental::BuildPreparedFramePayload(8,
+    auto payload = org::compiler::BuildPreparedFramePayload(8,
         {org::PreparedPass::Make(uint32_t{2}, record)}, realized, waits);
-    org::experimental::BackingStateAdmissionLedger ledger;
-    auto realizedFrame = org::experimental::BuildRenderFrameSnapshot(layout, payload, ledger);
+    org::compiler::BackingStateAdmissionLedger ledger;
+    auto realizedFrame = org::compiler::BuildRenderFrameSnapshot(layout, payload, ledger);
     CHECK(realizedFrame->resources == realized);
     CHECK(realizedFrame->resources->backingGenerations == std::vector<uint64_t>{9});
     CHECK(realizedFrame->externalWaitsByPreparedPass.size() == 1
         && realizedFrame->externalWaitsByPreparedPass[0][0].value == 17);
     bool rejected = false;
-    try { org::experimental::BuildRenderFrameSnapshot(8, layout, {}, bindings, {}, barriers); }
+    try { org::compiler::BuildRenderFrameSnapshot(8, layout, {}, bindings, {}, barriers); }
     catch (const std::invalid_argument&) { rejected = true; }
     CHECK(rejected);
     return 0;
@@ -425,7 +425,7 @@ Microsoft::WRL::ComPtr<ID3D12Resource> MakeResource(ID3D12Device* device, bool t
 }
 
 int TestPreparedGpuSubmission(rhi::Device device, ID3D12Device* nativeDevice) {
-    using namespace org::experimental;
+    using namespace org::compiler;
     GraphCompileInput input;
     input.structure.generation = input.structure.registryGeneration = 1;
     input.structure.resourceIDs = {1,2,3};
@@ -896,7 +896,7 @@ struct PersistentNativeCopy {
 };
 
 int TestOwnedDescriptorGpuExecution(const rhi::DeviceCreateInfo& create) {
-    using namespace org::experimental;
+    using namespace org::compiler;
     struct Runtime {
         rhi::DevicePtr device;
         rhi::TimelinePtr timeline;
@@ -1211,7 +1211,7 @@ int TestAliasHeapOwnership(const rhi::DeviceCreateInfo& create) {
         // Use real heap ownership and placed resource identities to validate
         // the persistent publication contract, without renderer initialization.
         using namespace org::persistent;
-        using namespace org::experimental;
+        using namespace org::compiler;
         GraphProgram program;
         CompileWorkspace workspace;
         std::atomic_bool cancelled{false};

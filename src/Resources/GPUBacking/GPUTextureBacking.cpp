@@ -58,9 +58,6 @@ GpuTextureBacking::CreateUnique(const TextureDescription& desc,
 {
 	auto pb = std::make_unique<GpuTextureBacking>(CreateTag{});
 	pb->initialize(desc, owningResourceID, nullptr, name);
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
-	pb->m_creation = std::stacktrace::current();
-#endif
 	return std::move(pb);
 }
 
@@ -72,9 +69,6 @@ GpuTextureBacking::CreateUnique(const TextureDescription& desc,
 {
 	auto pb = std::make_unique<GpuTextureBacking>(CreateTag{});
 	pb->initialize(desc, owningResourceID, &placement, name);
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
-	pb->m_creation = std::stacktrace::current();
-#endif
 	return std::move(pb);
 }
 

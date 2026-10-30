@@ -1,6 +1,6 @@
 #pragma once
 
-#include "Render/RenderGraph/ExperimentalGraphCompiler.h"
+#include "Render/RenderGraph/GraphCompiler.h"
 #include "Resources/AliasingPlacement.h"
 #include <rhi.h>
 #include <span>
@@ -9,7 +9,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace org::experimental {
+namespace org::compiler {
 
 struct PreparedStateRegion {
     CompileRange range;
@@ -186,4 +186,4 @@ private:
     uint64_t m_sequence = 0;
 };
 
-} // namespace org::experimental
+} // namespace org::compiler

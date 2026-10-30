@@ -75,13 +75,11 @@ public:
 		bool staging = false;
 		uint64_t firstSequence = 0;
 		uint64_t lastSequence = 0;
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 		const char* file{};
 		int line{};
 		static constexpr int MaxStack = 8;
 		void* stack[MaxStack]{};
 		uint8_t stackSize{};
-#endif
 		uint64_t targetGlobalResourceId = 0;
 		std::string targetDebugName;
 	};
@@ -98,10 +96,8 @@ public:
 		bool active = true;
 		bool staging = false;
 		uint64_t sequence = 0;
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 		const char* file{};
 		int line{};
-#endif
 		uint64_t targetGlobalResourceId = 0;
 		std::string targetDebugName;
 	};
@@ -124,18 +120,12 @@ public:
 	UploadInstance& operator=(UploadInstance&&) = delete;
 
 	// Buffer uploads
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 	void UploadData(const void* data, size_t size, UploadTarget target, size_t dstOffset,
 	                const char* file = nullptr, int line = 0);
 	void UploadDataBatch(UploadTarget target, std::span<const UploadRegion> regions,
 	                     const char* file = nullptr, int line = 0);
-#else
-	void UploadData(const void* data, size_t size, UploadTarget target, size_t dstOffset);
-	void UploadDataBatch(UploadTarget target, std::span<const UploadRegion> regions);
-#endif
 
 	// Texture uploads
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 	void UploadTextureSubresources(
 		UploadTarget target,
 		rhi::Format fmt,
@@ -148,18 +138,6 @@ public:
 		uint32_t srcCount,
 		const char* file,
 		int line);
-#else
-	void UploadTextureSubresources(
-		UploadTarget target,
-		rhi::Format fmt,
-		uint32_t baseWidth,
-		uint32_t baseHeight,
-		uint32_t depthOrLayers,
-		uint32_t mipLevels,
-		uint32_t arraySize,
-		const rhi::helpers::SubresourceData* srcSubresources,
-		uint32_t srcCount);
-#endif
 
 	// Execution
 
@@ -167,17 +145,10 @@ public:
 	// Call from a pass's RecordImmediateCommands().
 	// Owner-thread texture upload with caller-owned bytes; from any other
 	// thread the request is posted and recorded by the owner. See IUploadService.
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 	void PostTextureSubresources(UploadTarget target, rhi::Format fmt, uint32_t baseWidth, uint32_t baseHeight,
 		uint32_t depthOrLayers, uint32_t mipLevels, uint32_t arraySize,
 		std::shared_ptr<const std::vector<rhi::helpers::SubresourceData>> subresources,
 		std::shared_ptr<const void> keepAlive, const char* file = nullptr, int line = 0);
-#else
-	void PostTextureSubresources(UploadTarget target, rhi::Format fmt, uint32_t baseWidth, uint32_t baseHeight,
-		uint32_t depthOrLayers, uint32_t mipLevels, uint32_t arraySize,
-		std::shared_ptr<const std::vector<rhi::helpers::SubresourceData>> subresources,
-		std::shared_ptr<const void> keepAlive);
-#endif
 
 	void ProcessUploads(uint8_t frameIndex, org::imm::ImmediateCommandList& commandList);
 	void ProcessUploadsThrough(uint8_t frameIndex, org::imm::ImmediateCommandList& commandList, uint64_t sequenceInclusive);

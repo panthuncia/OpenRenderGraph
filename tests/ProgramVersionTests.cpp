@@ -1,10 +1,10 @@
 #include <Render/PreparedPass.h>
+#include "TestSupport.h"
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 #include <cstring>
 #include <cstdio>
 
-#define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "Program version check failed at %d: %s\n", __LINE__, #x); return __LINE__; } } while (false)
 
 int TestProgramVersions(rhi::Device device) {
     Microsoft::WRL::ComPtr<ID3DBlob> code, errors;

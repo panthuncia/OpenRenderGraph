@@ -13,6 +13,7 @@
 //   - shutdown leaves the host's device and buffers intact.
 
 #include "rhi.h"
+#include "TestSupport.h"
 #include "rhi_helpers.h"
 #include "rhi_interop_vulkan.h"
 
@@ -52,7 +53,6 @@
 #error "ORG_TEST_PERSISTENT_WRITE_SPV must name the compiled SPIR-V of tests/shaders/PersistentHostWrite.hlsl"
 #endif
 
-#define REQUIRE(cond, msg) do { if (!(cond)) { std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, msg); return 1; } } while (0)
 
 namespace {
 constexpr uint32_t kCount = 64;

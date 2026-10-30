@@ -1,8 +1,8 @@
 #include "Render/DeclaredTableLayout.h"
+#include "TestSupport.h"
 #include "Render/RenderGraph/PersistentGraph.h"
 #include <cstdio>
 
-#define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "Failure at %d: %s\n", __LINE__, #x); return 1; } } while (false)
 template<class F> bool Rejects(F&& fn) { try { fn(); } catch (const std::exception&) { return true; } return false; }
 
 int main() {
@@ -99,7 +99,7 @@ int main() {
     version.identity = (uint64_t{1} << 32) | 10; version.backingRevision = 1;
     version.shape = {2,3,true}; version.owner = owner; version.recording = snapshot;
     edit.BindReserved(slot, version);
-    experimental::CompileWorkspace workspace;
+    compiler::CompileWorkspace workspace;
     std::atomic_bool cancelled{false};
     const auto held = edit.Build(workspace, cancelled);
     CHECK(held && program.Install(edit, held));
