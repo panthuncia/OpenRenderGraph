@@ -1,5 +1,5 @@
 #include "Render/ImmediateExecution/ImmediateCommandList.h"
-#include "Utilities/EnvironmentFlag.h"
+#include "Render/Runtime/OpenRenderGraphSettings.h"
 
 #include "Render/ResourceRegistry.h"
 #include "Render/BufferBarrierHelpers.h"
@@ -14,8 +14,7 @@ namespace org::imm {
 	namespace {
 		std::atomic_uint64_t g_keepAliveBagIdentity{0};
 		bool KeepAliveLifetimeTraceEnabled() {
-			static const bool enabled = org::detail::EnvironmentFlagEnabled("SARP_GPU_LIFETIME_TRACE");
-			return enabled;
+			return org::runtime::DiagnosticLogEnabled(org::runtime::DiagnosticLog::KeepAliveLifetime);
 		}
 	}
 

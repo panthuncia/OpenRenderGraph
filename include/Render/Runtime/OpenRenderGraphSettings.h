@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 
@@ -16,9 +17,12 @@ enum class QueueSchedulingSelectionPolicy : uint8_t {
     Scored = 1,
 };
 
-// Value 1 was the removed shadow/replay route. Preserve Async's stored value
-// so existing configuration remains compatible.
-enum class AsyncCompileMode : uint8_t { Off = 0, Async = 2 };
+// Diagnostic logs a host can switch on (BasicRenderer maps its SARP_* environment switches onto these).
+enum class DiagnosticLog : uint32_t {
+    MemoryIntrospection = 1u << 0, // per-frame memory accounting against the device budget
+    UploadTelemetry = 1u << 1,     // upload pages, staging and texture-streaming transitions
+    KeepAliveLifetime = 1u << 2,   // immediate-execution keep-alive bags: creation and release
+};
 
 struct OpenRenderGraphSettings {
     uint8_t numFramesInFlight = 3;
@@ -26,8 +30,6 @@ struct OpenRenderGraphSettings {
     bool collectPipelineStatistics = false;
 
     bool useAsyncCompute = true;
-    AsyncCompileMode experimentalAsyncCompileMode = AsyncCompileMode::Off;
-    uint8_t experimentalCompileConcurrency = 2;
     bool renderGraphCompileDumpEnabled = false;
     bool renderGraphVramDumpEnabled = false;
     bool renderGraphBatchTraceEnabled = false;
@@ -52,12 +54,14 @@ struct OpenRenderGraphSettings {
     float autoAliasPoolGrowthHeadroom = 1.5f;
     TransitionPlacementMode transitionPlacementMode = TransitionPlacementMode::InlineEarlyPlacement;
     bool heavyDebug = false;
+    uint32_t diagnosticLogs = 0; // DiagnosticLog bits
 };
 
 namespace detail {
 struct OpenRenderGraphSettingsState {
     std::mutex mutex;
     OpenRenderGraphSettings settings;
+    std::atomic<uint32_t> diagnosticLogs{0}; // read on hot paths without the mutex
 };
 
 inline OpenRenderGraphSettingsState& GetOpenRenderGraphSettingsState() {
@@ -70,7 +74,6 @@ inline void SetOpenRenderGraphSettings(const OpenRenderGraphSettings& settings) 
     auto& state = detail::GetOpenRenderGraphSettingsState();
     std::scoped_lock lock(state.mutex);
     state.settings = settings;
-    state.settings.experimentalCompileConcurrency = std::clamp(state.settings.experimentalCompileConcurrency, uint8_t{1}, uint8_t{4});
     state.settings.numFramesInFlight = (std::max)(uint8_t{ 1 }, state.settings.numFramesInFlight);
     state.settings.queueSchedulingWidthScale = (std::max)(0.0f, state.settings.queueSchedulingWidthScale);
     if (static_cast<uint8_t>(state.settings.queueSchedulingSelectionPolicy) > static_cast<uint8_t>(QueueSchedulingSelectionPolicy::Scored)) {
@@ -84,6 +87,12 @@ inline void SetOpenRenderGraphSettings(const OpenRenderGraphSettings& settings) 
     state.settings.queueSchedulingCrossQueueHandoffPenalty = (std::max)(0.0f, state.settings.queueSchedulingCrossQueueHandoffPenalty);
     state.settings.autoAliasPoolRetireIdleFrames = (std::max)(1u, state.settings.autoAliasPoolRetireIdleFrames);
     state.settings.autoAliasPoolGrowthHeadroom = (std::max)(1.0f, state.settings.autoAliasPoolGrowthHeadroom);
+    state.diagnosticLogs.store(state.settings.diagnosticLogs, std::memory_order_relaxed);
+}
+
+inline bool DiagnosticLogEnabled(DiagnosticLog log) noexcept {
+    return (detail::GetOpenRenderGraphSettingsState().diagnosticLogs.load(std::memory_order_relaxed)
+        & static_cast<uint32_t>(log)) != 0;
 }
 
 inline OpenRenderGraphSettings GetOpenRenderGraphSettings() {

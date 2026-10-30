@@ -88,21 +88,14 @@ class FrameContext {
 public:
     using Settings = runtime::OpenRenderGraphSettings;
 
-    FrameContext(uint64_t frame, uint64_t generation, std::shared_ptr<const FrameSlotLease> slot,
-        bool asynchronousScheduling = false, uint8_t compileConcurrency = 2,
-        Settings settings = {})
+    FrameContext(uint64_t frame, uint64_t generation, std::shared_ptr<const FrameSlotLease> slot, Settings settings = {})
         : m_frame(frame), m_generation(generation), m_slotIndex(slot ? slot->Index() : 0),
-          m_slot(std::move(slot)),
-          m_asynchronousScheduling(asynchronousScheduling),
-          m_compileConcurrency((std::max)(uint8_t{1}, compileConcurrency)),
-          m_settings(std::move(settings)) {
+          m_slot(std::move(slot)), m_settings(std::move(settings)) {
         if (!frame || !generation || !m_slot) throw std::invalid_argument("Incomplete frame identity");
     }
     uint64_t Number() const noexcept { return m_frame; }
     uint64_t Generation() const noexcept { return m_generation; }
     uint32_t Slot() const noexcept { return m_slotIndex; }
-    bool AsynchronousScheduling() const noexcept { return m_asynchronousScheduling; }
-    uint8_t CompileConcurrency() const noexcept { return m_compileConcurrency; }
     const Settings& AcceptedSettings() const noexcept { return m_settings; }
     FrameStage Stage() const noexcept { return m_stage.load(std::memory_order_acquire); }
     std::vector<FrameCompletionPoint> CompletionPoints() const {
@@ -161,8 +154,6 @@ private:
     const uint64_t m_generation;
     const uint32_t m_slotIndex;
     std::shared_ptr<const FrameSlotLease> m_slot;
-    const bool m_asynchronousScheduling;
-    const uint8_t m_compileConcurrency;
     const Settings m_settings;
     std::atomic<FrameStage> m_stage{FrameStage::Preparing};
     mutable std::mutex m_mutex;

@@ -747,9 +747,6 @@ public:
 	void AddComputePass(std::shared_ptr<ComputePass> pass, ComputePassParameters& resources, std::string name = "", std::vector<ResolverSnapshot> resolverSnapshots = {});
 	void AddCopyPass(std::shared_ptr<CopyPass> pass, CopyPassParameters& resources, std::string name = "", std::vector<ResolverSnapshot> resolverSnapshots = {});
 	void Update(const UpdateExecutionContext& context, rhi::Device device);
-	// Joins the single mutable preparation owner before host code touches
-	// transitional renderer state. Submission also performs this join.
-	void WaitForPreparation();
 	void Execute(PassExecutionContext& context);
 	// GPU ranges around every pass this graph records (a GPU profiler's, e.g. Telemetry/NvPerfCapture): used by an
 	// execution whose context brings none of its own, which is how a host that builds the context itself
@@ -971,9 +968,6 @@ public:
 	};
 	void SetExternalQueueBoundary(ExternalQueueBoundary boundary) noexcept { m_externalQueueBoundary = boundary; }
 	ExternalQueueBoundary GetExternalQueueBoundary() const noexcept { return m_externalQueueBoundary; }
-	// Async producer/admission handshake. True asks the host to prepare another
-	// logical frame before blocking for the exact queue head.
-	bool ShouldDeferAsyncAdmission();
 	std::optional<uint32_t> GetLastExecutedPreparationSlot() const noexcept;
 	std::shared_ptr<const IHostExecutionData> GetLastSubmittedFrameData() const noexcept;
 	void CompileStructural();
@@ -1145,11 +1139,7 @@ public:
 private:
 	GpuPassRangeBegin m_gpuPassRangeBegin;
 	GpuPassRangeEnd m_gpuPassRangeEnd;
-	void UpdateOnPreparationOwner(const UpdateExecutionContext& context, rhi::Device device,
-		bool asynchronousScheduling, const std::shared_ptr<FrameContext>& acceptedFrame);
-	std::shared_ptr<FrameContext> TryAcceptFrame(uint32_t preparationSlot,
-		bool asynchronousScheduling);
-	void JoinPreparationOwner();
+	void UpdateOnPreparationOwner(const UpdateExecutionContext& context, rhi::Device device);
 	std::string GetTechniquePathForPassName(std::string_view passName) const;
 
 	struct AnyPassAndResources {
@@ -1630,7 +1620,7 @@ private:
         std::span<const std::pair<size_t, size_t>> explicitEdges,
         std::vector<std::pair<uint32_t, uint32_t>> dependencyOracle,
         uint8_t frameIndex, float deltaTime, const IHostExecutionData* hostData);
-	bool TryExecuteSelectedAsyncFrame(PassExecutionContext& context, bool queueOnly = false);
+	bool TryExecuteSelectedAsyncFrame(PassExecutionContext& context);
 	bool TrySubmitRecordedFrame(PassExecutionContext& context);
 	bool PrepareSelectedAsyncFrame(PassExecutionContext& context);
 	std::unique_ptr<CompilerState> m_compilerState;
@@ -1968,10 +1958,8 @@ private:
 	bool RefreshRetainedDeclarationsForFrame(ComputePassAndResources& p, uint8_t frameIndex);
 	bool RefreshRetainedDeclarationsForFrame(CopyPassAndResources& p, uint8_t frameIndex);
 	void CompileFrame(rhi::Device device, uint8_t frameIndex, const IHostExecutionData* hostData);
-	void PrepareAsyncFrame(rhi::Device device, uint8_t frameIndex, float deltaTime,
-		const IHostExecutionData* hostData);
 	void PrepareAndCompileFrame(rhi::Device device, uint8_t frameIndex,
-		const IHostExecutionData* hostData, bool asyncPreparationOnly, float deltaTime = 0.0f);
+		const IHostExecutionData* hostData, float deltaTime = 0.0f);
 	void BeginCompileProfileFrame(uint8_t frameIndex);
 	void EndCompileProfileFrame();
 	void RecordCompileProfileCounters(const std::vector<Node>& nodes, std::span<const uint64_t> usedResourceIDs);

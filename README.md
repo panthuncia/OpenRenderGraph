@@ -33,15 +33,11 @@ Use this for graph composition, pass construction, resource APIs, queue/runtime 
 
 ### Debug UI widgets (ImGui)
 
-```cpp
-#include "OpenRenderGraph/DebugUI.h"
-```
+Each widget has its own header and CMake target:
 
-Provides:
-
-- `ui::MemoryViewWidget`
-- `ui::RenderGraphInspector`
-- `ui::MemoryIntrospectionWidget`
+- `DebugUI/ScheduleInspector.h` (`OpenRenderGraph::ScheduleUI`, `OPENRENDERGRAPH_ENABLE_SCHEDULE_UI`)
+- `DebugUI/MemoryIntrospectionWidget.h` (`OpenRenderGraph::MemoryUI`, `OPENRENDERGRAPH_ENABLE_MEMORY_UI`)
+- `DebugUI/MemoryViewWidget.h` and `DebugUI/RenderGraphInspector.h` (`OpenRenderGraph::DebugUI`, `OPENRENDERGRAPH_ENABLE_DEBUG_UI`)
 
 ## Basic usage
 

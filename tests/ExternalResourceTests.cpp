@@ -25,7 +25,6 @@
 #include <type_traits>
 
 #define CHECK(x) do { if (!(x)) return __LINE__; } while (false)
-int TestDelayedFrameRecording(const rhi::DeviceCreateInfo& create);
 int TestFrameRetirement(rhi::Device device, rhi::Backend backend);
 int TestProgramVersions(rhi::Device device);
 int TestReadbackCaptures(rhi::Device device);
@@ -1407,7 +1406,6 @@ int main(int argc, char** argv) {
 	rhi::DeviceCreateInfo create{}; create.backend = rhi::Backend::D3D12; create.nativeAdapter = warp.Get(); create.framesInFlight = 2;
     if (const auto failure = TestDescriptorSnapshots(create)) return failure;
     if (const auto failure = TestOwnedDescriptorGpuExecution(create)) return failure;
-    if (const auto failure = TestDelayedFrameRecording(create)) return failure;
     if (const auto failure = TestAliasHeapOwnership(create)) return failure;
 	rhi::DevicePtr device; CHECK(!rhi::Failed(rhi::CreateD3D12Device(create, device)) && device);
 	auto* nativeDevice = rhi::dx12::get_device(device.Get()); CHECK(nativeDevice);

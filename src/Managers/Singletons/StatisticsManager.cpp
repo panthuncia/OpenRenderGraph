@@ -1,5 +1,4 @@
 #include "Managers/Singletons/StatisticsManager.h"
-#include "Utilities/EnvironmentFlag.h"
 
 #include <algorithm>
 #include <atomic>
@@ -26,8 +25,7 @@ void UpdateEma(double& value, double sample) {
 }
 
 bool MemoryIntrospectionLoggingEnabled() {
-    static const bool enabled = org::detail::EnvironmentFlagEnabled("SARP_MEMORY_INTROSPECTION_LOG");
-    return enabled;
+    return org::runtime::DiagnosticLogEnabled(org::runtime::DiagnosticLog::MemoryIntrospection);
 }
 
 void LogMemoryIntrospectionAccounting(

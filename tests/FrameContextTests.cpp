@@ -18,11 +18,9 @@ int main() {
     acceptedSettings.queueSchedulingWidthScale = 7.5f;
     acceptedSettings.autoAliasPoolRetireIdleFrames = 91;
     auto second = std::make_shared<FrameContext>(
-        2, 1, slots.TryAcquire(1), true, 4, acceptedSettings);
+        2, 1, slots.TryAcquire(1), acceptedSettings);
     CHECK(slots.Active() == 2);
     CHECK(slots.Capacity() == 2);
-    CHECK(!first->AsynchronousScheduling() && first->CompileConcurrency() == 2);
-    CHECK(second->AsynchronousScheduling() && second->CompileConcurrency() == 4);
     acceptedSettings.useAsyncCompute = true;
     acceptedSettings.queueSchedulingWidthScale = 1.0f;
     acceptedSettings.autoAliasPoolRetireIdleFrames = 1;

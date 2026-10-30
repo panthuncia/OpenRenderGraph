@@ -13,8 +13,6 @@ public:
 
     virtual bool GetUseAsyncCompute() const = 0;
     virtual uint8_t GetNumFramesInFlight() const { return 3; }
-    virtual AsyncCompileMode GetExperimentalAsyncCompileMode() const { return AsyncCompileMode::Off; }
-    virtual uint8_t GetExperimentalCompileConcurrency() const { return 2; }
     virtual bool GetRenderGraphCompileDumpEnabled() const = 0;
     virtual bool GetRenderGraphVramDumpEnabled() const = 0;
     virtual bool GetRenderGraphBatchTraceEnabled() const = 0;

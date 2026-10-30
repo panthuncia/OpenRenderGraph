@@ -16,36 +16,6 @@ using namespace org::experimental;
 using namespace org::runtime;
 #define CHECK(...) do { if (!(__VA_ARGS__)) { std::fprintf(stderr, "Check failed at %d: %s\n", __LINE__, #__VA_ARGS__); std::abort(); } } while (false)
 
-// The test scheduler permits deterministic reversed completion without sleeps.
-struct ManualTasks : ITaskService {
-    struct Scope : ITaskScope {
-        ManualTasks* tasks;
-        explicit Scope(ManualTasks* t) : tasks(t) {}
-        void Cancel() noexcept override {}
-        void Wait() override { tasks->RunAll(); }
-        void CancelAndWait() override { Wait(); }
-    };
-    std::vector<std::function<void()>> queue;
-    bool reject = false;
-    void Run(size_t i) { auto task = std::move(queue.at(i)); if (task) task(); }
-    void RunAll() { for (size_t i = 0; i < queue.size(); ++i) Run(i); }
-    void ParallelFor(std::string_view, size_t n, std::function<void(size_t)> fn) override {
-        for (size_t i = 0; i < n; ++i) fn(i);
-    }
-    void ParallelForLimited(std::string_view name, size_t n, size_t, std::function<void(size_t)> fn) override {
-        ParallelFor(name, n, std::move(fn));
-    }
-    std::shared_ptr<ITaskScope> CreateScope(std::string_view) override { return std::make_shared<Scope>(this); }
-    bool Submit(const std::shared_ptr<ITaskScope>&, TaskPriority, std::string_view, std::function<void()>&& fn) override {
-        if (reject) return false;
-        queue.push_back(std::move(fn)); return true;
-    }
-    bool ScheduleAfter(const std::shared_ptr<ITaskScope>& scope, std::chrono::steady_clock::duration,
-        TaskPriority priority, std::string_view name, std::function<void()>&& fn) override {
-        return Submit(scope, priority, name, std::move(fn));
-    }
-};
-
 struct PayloadLifecycleProbe final : IFramePayloadLifecycle {
     mutable std::atomic_uint32_t abandonCount{0};
     mutable std::atomic_uint8_t reason{UINT8_MAX};
@@ -92,7 +62,6 @@ DependencyEdges Oracle(const GraphCompileStructure& s) {
     return edges;
 }
 
-void RunFramePlanningTests();
 void DiagnosticPassAttribution() {
     auto input = Input();
     input.structure.resourceIDs = {20, 10};
@@ -130,7 +99,6 @@ void DiagnosticPassAttribution() {
 
 int main() {
     DiagnosticPassAttribution();
-    RunFramePlanningTests();
     // Export after all step objects and their dynamically supplied names have
     // died. Telemetry retains callsites, so stack-local definitions are unsafe.
     {
@@ -639,7 +607,6 @@ int main() {
         CHECK(ValidateSymbolicSchedule(input, *output).empty());
     }
 
-    auto tasks = std::make_shared<ManualTasks>();
     // Owned state planning resolves neither first-use state nor absolute queue
     // values. Partial ranges and callback postconditions survive compilation.
     auto stateInput = Input();
@@ -790,277 +757,5 @@ int main() {
         auto plan = workspace.Compile(std::make_shared<const GraphCompileInput>(randomStates), cancelled);
         CHECK(plan->states.complete && plan->stateValidationError.empty());
     }
-
-    auto stateTasks = std::make_shared<ManualTasks>();
-    GraphCompileCoordinator stateCoordinator(stateTasks);
-    stateCoordinator.Request(stateInput); stateTasks->RunAll(); stateCoordinator.Pump();
-    auto ownedPlan = stateCoordinator.PeekReady(1)->graph;
-    CHECK(stateCoordinator.Statistics().stateValidations == 1 && stateCoordinator.Statistics().stateFailures == 0);
-    // Sync-only changes are structural for state plans (unlike content/waits).
-    stateInput.structure.passes[0].entryStates[0].state.sync ^= 128;
-    stateCoordinator.Request(stateInput); stateTasks->RunAll(); stateCoordinator.Pump();
-    CHECK(stateCoordinator.Statistics().started == 2);
-    ++stateInput.structure.registryGeneration;
-    stateCoordinator.Request(stateInput); stateTasks->RunAll(); stateCoordinator.Pump();
-    CHECK(stateCoordinator.Statistics().started == 3);
-    stateInput.backingGenerations = {1};
-    auto realizationLease = std::make_shared<int>(1);
-    stateInput.leases = {realizationLease};
-    const auto realizationSequence = stateCoordinator.Request(stateInput);
-    stateTasks->RunAll(); stateCoordinator.Pump();
-    CHECK(stateCoordinator.Statistics().started == 4);
-    CHECK(stateCoordinator.PeekReady(realizationSequence)->sequence == realizationSequence);
-    CHECK(stateCoordinator.PeekReady(realizationSequence)->input->backingGenerations == std::vector<uint64_t>{1});
-    ++stateInput.backingGenerations[0];
-    auto newerRealizationLease = std::make_shared<int>(2);
-    std::weak_ptr<int> oldRealization = realizationLease;
-    stateInput.leases = {newerRealizationLease}; realizationLease.reset();
-    const auto replacementSequence = stateCoordinator.Request(stateInput);
-    stateTasks->RunAll(); stateCoordinator.Pump();
-    CHECK(stateCoordinator.Statistics().started == 5);
-    CHECK(stateCoordinator.PeekReady(replacementSequence)->sequence == replacementSequence);
-    CHECK(stateCoordinator.PeekReady(replacementSequence)->input->backingGenerations == std::vector<uint64_t>{2});
-    CHECK(!oldRealization.expired()); // Every queued frame retains its own realization.
-    for (uint64_t sequence = 1; sequence <= realizationSequence; ++sequence) {
-        auto queuedFrame = stateCoordinator.WaitAndPop(sequence);
-        CHECK(queuedFrame && queuedFrame->sequence == sequence);
-    }
-    CHECK(oldRealization.expired());
-    CHECK(stateCoordinator.WaitAndPop(replacementSequence)->sequence == replacementSequence);
-    CHECK(stateCoordinator.Statistics().realizationChanges == 0);
-    stateCoordinator.Shutdown();
-    CHECK(ownedPlan->states.complete); // No pointers into the workspace/coordinator.
-
-    // Synchronous bootstrap and worker compilation call the same CompileGraph
-    // implementation. Inline bootstrap must not enqueue a duplicate job.
-    {
-        auto inlineTasks = std::make_shared<ManualTasks>();
-        GraphCompileCoordinator inlineCoordinator(inlineTasks, 2);
-        const auto receipt = inlineCoordinator.RequestOwned(Input(1, 9), true);
-        CHECK(receipt.sequence == 1);
-        CHECK(inlineCoordinator.PeekReady(receipt.sequence));
-        CHECK(inlineTasks->queue.empty());
-        CHECK(inlineCoordinator.Statistics().started == 1);
-        CHECK(inlineCoordinator.Statistics().completed == 1);
-    }
-
-    GraphCompileCoordinator coordinator(tasks, 2);
-    auto firstReceipt = coordinator.RequestOwned(Input(1, 10));
-    const auto first = firstReceipt.sequence;
-    CHECK(first && firstReceipt.input && firstReceipt.input->structure.resourceIDs == std::vector<uint64_t>{10});
-    const auto second = coordinator.Request(Input(1, 20));
-    CHECK(coordinator.Statistics().active == 2);
-    tasks->Run(1); coordinator.Pump();
-    CHECK(coordinator.PeekReady(second));
-    CHECK(!coordinator.PeekReady(first)); // Sequence one is still compiling.
-    tasks->Run(0); coordinator.Pump();
-    CHECK(coordinator.PeekReady(first) && coordinator.PeekReady(second) && second > first);
-    CHECK(coordinator.WaitAndPop(first)->sequence == first);
-    CHECK(coordinator.WaitAndPop(second)->sequence == second);
-    auto lease = std::make_shared<int>(42); std::weak_ptr<int> weakLease = lease;
-    auto coalesced = Input(1, 20); coalesced.leases.push_back(lease); lease.reset();
-    const auto third = coordinator.Request(std::move(coalesced));
-    tasks->RunAll(); coordinator.Pump();
-    CHECK(coordinator.PeekReady(third) && !weakLease.expired());
-    CHECK(coordinator.Statistics().started == 3 && coordinator.Statistics().coalesced == 0);
-    CHECK(coordinator.Statistics().scheduleFailures == 0);
-    auto retainedGraph = coordinator.PeekReady(third)->graph;
-    const auto fourth = coordinator.Request(Input(1, 20));
-    tasks->RunAll(); coordinator.Pump();
-    CHECK(!weakLease.expired()); // Queued frame retains its own content.
-    CHECK(coordinator.WaitAndPop(third)->sequence == third);
-    CHECK(!weakLease.expired()); // The compiled graph aliases its exact owned input.
-    retainedGraph.reset();
-    CHECK(weakLease.expired());
-    CHECK(coordinator.WaitAndPop(fourth)->sequence == fourth);
-    coordinator.Reset(2);
-    CHECK(weakLease.expired() && !coordinator.PeekReady(third));
-    CHECK(coordinator.Request(Input(1)) == 0);
-
-    coordinator.Request(Input(2, 30));
-    coordinator.Request(Input(2, 40));
-    coordinator.Request(Input(2, 50));
-    const auto latest = coordinator.Request(Input(2, 60));
-    CHECK(coordinator.Statistics().active == 2 && coordinator.Statistics().pending == 2);
-    tasks->RunAll(); coordinator.Pump(); tasks->RunAll(); coordinator.Pump();
-    CHECK(coordinator.PeekReady(latest));
-    CHECK(coordinator.Statistics().oracleFailures == 0);
-
-    auto badOracle = Input(2, 70); badOracle.expectedEdges = std::make_shared<const DependencyEdges>();
-    coordinator.Request(std::move(badOracle)); tasks->RunAll(); coordinator.Pump();
-    CHECK(coordinator.Statistics().oracleFailures == 1);
-    CHECK(coordinator.PeekReady(latest));
-    coordinator.Request(Input(2, 80));
-    auto cancelledPayload = std::make_shared<PayloadLifecycleProbe>();
-    auto cancelledInput = Input(2, 81);
-    cancelledInput.executionLifecycle = cancelledPayload;
-    coordinator.Request(std::move(cancelledInput));
-    coordinator.Reset(3); tasks->RunAll(); coordinator.Pump();
-    CHECK(cancelledPayload->abandonCount == 1 && cancelledPayload->reason == 1);
-    CHECK(!coordinator.PeekReady(1));
-    tasks->reject = true;
-    const auto inlineFallback = coordinator.Request(Input(3));
-    coordinator.Pump();
-    CHECK(coordinator.WaitAndPop(inlineFallback)->sequence == inlineFallback);
-    coordinator.Shutdown(); CHECK(coordinator.Request(Input(3)) == 0);
-
-    // Actual overlap on separate workers with independently owned inputs. The
-    // shared 1,000-resource/60-pass case exercises read fanout and replacements.
-    auto concurrentTasks = std::make_shared<ManualTasks>();
-    GraphCompileCoordinator concurrent(concurrentTasks, 2);
-    auto large = Input(); large.structure.resourceIDs.resize(1000);
-    large.structure.resourceShapes.resize(1000);
-    std::iota(large.structure.resourceIDs.begin(), large.structure.resourceIDs.end(), 1);
-    large.structure.passes.clear();
-    for (uint32_t p = 0; p < 60; ++p) {
-        CompilePass pass{p, 0, {}};
-        for (uint32_t r = 0; r < 1000; ++r) pass.accesses.push_back({r, p == 0 || p == 59});
-        for (uint32_t r = 0; r < 1000; ++r) pass.entryStates.push_back({r, {}, p == 0 || p == 59 ? writeState : readState});
-        large.structure.passes.push_back(std::move(pass));
-    }
-    large.expectedEdges = std::make_shared<const DependencyEdges>(Oracle(large.structure));
-    concurrent.Request(large);
-    for (uint32_t r = 0; r < 10; ++r) large.structure.resourceIDs[r] += 1000;
-    const auto newer = concurrent.Request(std::move(large));
-    std::barrier gate(3);
-    std::jthread a([&]{ gate.arrive_and_wait(); concurrentTasks->Run(0); });
-    std::jthread b([&]{ gate.arrive_and_wait(); concurrentTasks->Run(1); });
-    gate.arrive_and_wait(); a.join(); b.join(); concurrent.Pump();
-    CHECK(concurrent.PeekReady(newer));
-    CHECK(concurrent.Statistics().completed == 2);
-    CHECK(concurrent.Statistics().peakRunning == 2);
-    CHECK(concurrent.Statistics().oracleFailures == 0);
-    CHECK(concurrent.Statistics().scheduleValidations == 2);
-    CHECK(concurrent.Statistics().scheduleFailures == 0);
-    CHECK(concurrent.Statistics().stateValidations == 2 && concurrent.Statistics().stateFailures == 0);
-
-    // Even structurally identical backing-only publications compile independently.
-    auto realizationTasks = std::make_shared<ManualTasks>();
-    GraphCompileCoordinator realizationRace(realizationTasks, 2);
-    auto backingOne = std::make_shared<int>(1), backingTwo = std::make_shared<int>(2);
-    auto payloadOne = std::make_shared<int>(11), payloadTwo = std::make_shared<int>(22);
-    std::weak_ptr<int> payloadOneWeak = payloadOne, payloadTwoWeak = payloadTwo;
-    std::weak_ptr<int> backingOneWeak = backingOne, backingTwoWeak = backingTwo;
-    auto backingInput = Input(); backingInput.backingGenerations = {1};
-    backingInput.leases = {backingOne}; backingOne.reset();
-    backingInput.executionPayload = payloadOne; payloadOne.reset();
-    realizationRace.Request(backingInput);
-    backingInput.backingGenerations[0] = 2;
-    backingInput.leases = {backingTwo}; backingTwo.reset();
-    backingInput.executionPayload = payloadTwo; payloadTwo.reset();
-    const auto latestRealization = realizationRace.Request(backingInput);
-    backingInput.leases.clear();
-    backingInput.executionPayload.reset();
-    CHECK(realizationRace.Statistics().started == 2 && realizationRace.Statistics().coalesced == 0);
-    CHECK(!backingOneWeak.expired() && !backingTwoWeak.expired());
-    realizationTasks->RunAll(); realizationRace.Pump();
-    CHECK(realizationRace.PeekReady(latestRealization));
-    CHECK(realizationRace.PeekReady(latestRealization)->input->backingGenerations == std::vector<uint64_t>{2});
-    CHECK(!backingOneWeak.expired() && !backingTwoWeak.expired());
-    CHECK(!payloadOneWeak.expired() && !payloadTwoWeak.expired());
-    CHECK(realizationRace.WaitAndPop(1)->sequence == 1);
-    CHECK(backingOneWeak.expired() && payloadOneWeak.expired());
-    CHECK(realizationRace.WaitAndPop(latestRealization)->sequence == latestRealization);
-    realizationRace.Shutdown();
-    CHECK(backingTwoWeak.expired());
-    CHECK(payloadTwoWeak.expired());
-
-    // Equivalent global-ID enumerations normalize independently and still compile fresh.
-    auto canonicalTasks = std::make_shared<ManualTasks>();
-    GraphCompileCoordinator canonical(canonicalTasks, 2);
-    auto original = Input(); original.structure.resourceIDs = {10, 20};
-    original.backingGenerations = {100, 200};
-    original.structure.passes[0].accesses = {{0, false}, {1, false}};
-    original.expectedEdges.reset();
-    canonical.Request(original); canonicalTasks->RunAll(); canonical.Pump();
-    auto reordered = original; reordered.structure.resourceIDs = {20, 10};
-    for (auto& pass : reordered.structure.passes) {
-        for (auto& access : pass.accesses) access.resourceIndex = 1 - access.resourceIndex;
-        std::reverse(pass.accesses.begin(), pass.accesses.end());
-    }
-    std::reverse(reordered.backingGenerations.begin(), reordered.backingGenerations.end());
-    canonical.Request(reordered);
-    canonicalTasks->RunAll(); canonical.Pump();
-    CHECK(canonical.Statistics().started == 2 && canonical.Statistics().coalesced == 0);
-    CHECK(canonical.Statistics().membershipChanges == 0 && canonical.Statistics().passChanges == 0);
-    CHECK(canonical.PeekReady(2)->input->backingGenerations == std::vector<uint64_t>({100,200}));
-    reordered.structure.resourceIDs[0] = 30;
-    canonical.Request(reordered);
-    CHECK(canonical.Statistics().membershipChanges == 0);
-
-    auto rotationTasks = std::make_shared<ManualTasks>();
-    GraphCompileCoordinator rotation(rotationTasks, 2);
-    auto publication = std::make_shared<int>(73);
-    std::weak_ptr<int> oldPublication = publication;
-    auto firstSlot = Input(1, 100); firstSlot.leases.push_back(publication);
-    publication.reset();
-    rotation.Request(std::move(firstSlot)); rotationTasks->RunAll(); rotation.Pump();
-    auto firstPlan = rotation.PeekReady(1)->graph;
-    std::weak_ptr<const CompiledGraph> evictedPlan = firstPlan;
-    for (uint64_t id : {200, 300}) {
-        rotation.Request(Input(1, id)); rotationTasks->RunAll(); rotation.Pump();
-    }
-    CHECK(!oldPublication.expired());
-    CHECK(rotation.WaitAndPop(1)->sequence == 1);
-    CHECK(!oldPublication.expired()); // A retained compiled graph owns its exact frame input.
-    CHECK(rotation.WaitAndPop(2)->sequence == 2);
-    CHECK(rotation.WaitAndPop(3)->sequence == 3);
-    const auto revisitedSequence = rotation.Request(Input(1, 100));
-    rotationTasks->RunAll(); rotation.Pump();
-    CHECK(rotation.PeekReady(revisitedSequence)->graph != firstPlan);
-    CHECK(rotation.Statistics().completedCacheHits == 0 && rotation.Statistics().started == 4);
-    CHECK(rotation.WaitAndPop(revisitedSequence)->sequence == revisitedSequence);
-    firstPlan.reset();
-    CHECK(oldPublication.expired()); // No coordinator/cache ownership remains.
-    for (uint64_t id = 400; id < 1300; id += 100) {
-        const auto sequence = rotation.Request(Input(1, id)); rotationTasks->RunAll(); rotation.Pump();
-        CHECK(rotation.WaitAndPop(sequence)->sequence == sequence);
-    }
-    CHECK(evictedPlan.expired()); // No completed structure is retained by the coordinator.
-    rotation.Reset(2);
-    const auto beforeResetBuilds = rotation.Statistics().started;
-    rotation.Request(Input(2, 1200)); rotationTasks->RunAll(); rotation.Pump();
-    CHECK(rotation.Statistics().started == beforeResetBuilds + 1);
-    const auto goodSequence = rotation.Statistics().highestReadySequence;
-    auto invalidJob = Input(2, 1400); invalidJob.structure.placementEdges = {{2, 0}};
-    const auto invalidSequence = rotation.Request(invalidJob); rotationTasks->RunAll(); rotation.Pump();
-    CHECK(rotation.Statistics().failed == 1 && rotation.Statistics().highestReadySequence == goodSequence);
-    bool sawOrderedFailure = false;
-    try { (void)rotation.WaitAndPop(invalidSequence); }
-    catch (const std::runtime_error&) { sawOrderedFailure = true; }
-    CHECK(sawOrderedFailure);
-    // Teardown with two outstanding closures and a replaceable pending input.
-    // The scheduler outlives the coordinator: no closure may keep a dangling
-    // owner or retain publication leases after shutdown drains its scope.
-    for (unsigned iteration = 0; iteration < 32; ++iteration) {
-        auto teardownTasks = std::make_shared<ManualTasks>();
-        std::vector<std::weak_ptr<int>> publications;
-        {
-            GraphCompileCoordinator teardown(teardownTasks, 2);
-            for (uint64_t resource = 1; resource <= 4; ++resource) {
-                auto input = Input(1, resource);
-                auto publicationLease = std::make_shared<int>(static_cast<int>(resource));
-                publications.push_back(publicationLease);
-                input.leases.push_back(std::move(publicationLease));
-                teardown.Request(std::move(input));
-            }
-            CHECK(teardown.Statistics().active == 2 && teardown.Statistics().pending == 2);
-            CHECK(!publications[2].expired() && !publications[3].expired());
-            if (iteration % 2 == 0) {
-                teardown.Reset(2);
-                CHECK(publications[3].expired());
-                teardown.Request(Input(2, 5));
-            }
-            if (iteration % 3 == 0) {
-                teardown.Shutdown();
-                teardown.Shutdown(); // Explicit shutdown followed by destruction.
-                CHECK(teardown.Statistics().active == 0 && teardown.Statistics().pending == 0);
-                CHECK(teardown.Request(Input(2, 6)) == 0);
-            }
-        }
-        for (const auto& publicationLease : publications) CHECK(publicationLease.expired());
-        for (const auto& queued : teardownTasks->queue) CHECK(!queued);
-        teardownTasks->RunAll(); // No late callbacks after owner destruction.
-    }
-    std::puts("Async compiler ownership, oracle, ordering, cancellation and overlap tests passed.");
+    std::puts("Fresh compiler ownership, oracle, ordering and state tests passed.");
 }

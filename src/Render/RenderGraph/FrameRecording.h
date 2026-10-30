@@ -3,10 +3,7 @@
 #include "Render/RenderGraph/ExperimentalRhiExecution.h"
 #include "Render/Runtime/ITaskService.h"
 #include "FramePlanning.h"
-#include <condition_variable>
 #include <functional>
-#include <mutex>
-#include <thread>
 
 namespace org::experimental {
 
@@ -31,36 +28,13 @@ struct PlannedFrame {
     PlannedFrame(const PlannedFrame&) = delete;
     PlannedFrame& operator=(const PlannedFrame&) = delete;
     PlannedFrame(std::shared_ptr<const RenderFrameSnapshot> frame, std::vector<FrameRecordingJob> work,
-        std::vector<PreparedTimelineBinding> bindings, std::vector<std::vector<ExecutionTimelinePoint>> waits,
-        std::shared_ptr<const PlannedFrameState> state = {})
+        std::vector<PreparedTimelineBinding> bindings, std::vector<std::vector<ExecutionTimelinePoint>> waits)
         : snapshot(std::move(frame)), jobs(std::move(work)), timelines(std::move(bindings)),
-          incomingWaits(std::move(waits)), planning(std::move(state)) {}
+          incomingWaits(std::move(waits)) {}
     std::shared_ptr<const RenderFrameSnapshot> snapshot;
     std::vector<FrameRecordingJob> jobs;
     std::vector<PreparedTimelineBinding> timelines;
     std::vector<std::vector<ExecutionTimelinePoint>> incomingWaits;
-    std::shared_ptr<const PlannedFrameState> planning;
-};
-
-class DispatchedFrameRecording;
-
-// Long-lived recording workers. Per-frame dispatch only enqueues small work
-// closures; it does not create tasks, futures, scopes, or threads.
-class PersistentRecordingLanes {
-public:
-    explicit PersistentRecordingLanes(size_t laneCount);
-    ~PersistentRecordingLanes();
-    PersistentRecordingLanes(const PersistentRecordingLanes&) = delete;
-    PersistentRecordingLanes& operator=(const PersistentRecordingLanes&) = delete;
-    void Submit(std::function<void()> work);
-    size_t LaneCount() const noexcept { return m_threads.size(); }
-private:
-    void Run();
-    std::mutex m_mutex;
-    std::condition_variable m_ready;
-    std::deque<std::function<void()>> m_work;
-    std::vector<std::thread> m_threads;
-    bool m_stopping = false;
 };
 
 class RecordedFrame {
@@ -79,41 +53,17 @@ public:
     const auto& IncomingWaits() const noexcept { return m_incomingWaits; }
 private:
     friend RecordedFrame RecordFrame(PlannedFrame, const std::shared_ptr<runtime::ITaskService>&, size_t);
-    friend class DispatchedFrameRecording;
-    friend DispatchedFrameRecording DispatchFrameRecording(PlannedFrame,
-        PersistentRecordingLanes&, size_t);
     RecordedFrame() = default;
     std::shared_ptr<const RenderFrameSnapshot> m_snapshot;
     std::vector<std::vector<ExecutionTimelinePoint>> m_incomingWaits;
     std::vector<std::shared_ptr<const IPreparedExecutionBatch>> m_batches;
-    std::shared_ptr<const PlannedFrameState> m_planning;
     bool m_submitted = false;
 };
 
 // Owns peer recording workers for one logical frame. No worker waits for
 // another worker: collection is a non-blocking readiness probe followed by a
 // FIFO join on the submission thread.
-class DispatchedFrameRecording {
-public:
-    DispatchedFrameRecording() = default;
-    DispatchedFrameRecording(DispatchedFrameRecording&&) noexcept = default;
-    DispatchedFrameRecording& operator=(DispatchedFrameRecording&&) noexcept = default;
-    DispatchedFrameRecording(const DispatchedFrameRecording&) = delete;
-    DispatchedFrameRecording& operator=(const DispatchedFrameRecording&) = delete;
-
-    bool Valid() const noexcept { return static_cast<bool>(m_state); }
-    bool Ready() const;
-    RecordedFrame Join();
-private:
-    friend DispatchedFrameRecording DispatchFrameRecording(PlannedFrame,
-        PersistentRecordingLanes&, size_t);
-    struct State;
-    std::shared_ptr<State> m_state;
-};
-
 RecordedFrame RecordFrame(PlannedFrame plan,
     const std::shared_ptr<runtime::ITaskService>& tasks, size_t concurrency);
-DispatchedFrameRecording DispatchFrameRecording(PlannedFrame plan,
-    PersistentRecordingLanes& lanes, size_t concurrency);
 
 } // namespace org::experimental

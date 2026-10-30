@@ -69,25 +69,15 @@ struct RenderGraph::CompilerState {
     struct RecordingFrameOwner {
         uint64_t sequence = 0;
         std::shared_ptr<const experimental::RenderFrameSnapshot> snapshot;
-        std::shared_ptr<const experimental::PlannedFrameState> planning;
         std::shared_ptr<const experimental::SynchronousFramePlan> synchronousPlanning;
         std::vector<std::shared_ptr<experimental::OwnedRecordingStatistics>> statistics;
         std::optional<experimental::RecordedFrame> inlineResult;
-        experimental::DispatchedFrameRecording workerRecording;
-
-        bool Ready() const {
-            if (inlineResult) return true;
-            return workerRecording.Valid() && workerRecording.Ready();
-        }
 
         experimental::RecordedFrame Join() {
-            if (inlineResult) {
-                auto result = std::move(*inlineResult);
-                inlineResult.reset();
-                return result;
-            }
-            if (!workerRecording.Valid()) throw std::logic_error("Recording owner has no completion");
-            return workerRecording.Join();
+            if (!inlineResult) throw std::logic_error("Recording owner has no completion");
+            auto result = std::move(*inlineResult);
+            inlineResult.reset();
+            return result;
         }
     };
 
@@ -125,26 +115,16 @@ struct RenderGraph::CompilerState {
             garbage->clear();
         }
     }
-    std::unique_ptr<experimental::GraphCompileCoordinator> compileCoordinator;
-    // Direct fresh result for BorrowedSynchronous compilation. It never enters
-    // the async coordinator/reorder mailbox.
+    // The fresh compile result, consumed by the next owned execution.
     std::shared_ptr<const experimental::CompiledGraphBundle> synchronousBundle;
     std::shared_ptr<const experimental::RenderFrameSnapshot> selectedAsyncFrame;
     std::shared_ptr<const experimental::GraphCompileInput> currentAsyncInput;
-    std::unique_ptr<experimental::FramePlanningState> framePlanner;
     std::unique_ptr<experimental::SynchronousPlanningState> synchronousPlanner;
-    std::shared_ptr<const experimental::PlannedFrameState> selectedPlanning;
     std::shared_ptr<const experimental::SynchronousFramePlan> selectedSynchronousPlanning;
-    // BorrowedSynchronous submits directly; it never enters the asynchronous
-    // recording FIFO or consumes a retained frame slot.
     std::optional<RecordingFrameOwner> synchronousRecording;
-    std::deque<RecordingFrameOwner> recordingFrames;
-    std::unique_ptr<experimental::PersistentRecordingLanes> recordingLanes;
     std::shared_ptr<FrameContext> pendingPresentationFrame;
     uint64_t pendingPresentationSequence = 0;
     std::shared_ptr<runtime::ITaskScope> frameWorkerScope;
-    std::shared_ptr<runtime::ITaskScope> preparationWorkerScope;
-    std::future<void> preparationWorker;
     bool frameProductionStopped = false;
     std::unique_ptr<experimental::ExecutionTimelineAdmission> asyncTimelineAdmission;
     uint64_t lastRequestedAsyncSequence = 0;

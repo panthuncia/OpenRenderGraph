@@ -120,11 +120,6 @@ public:
 };
 
 struct GraphCompileInput {
-    enum class ExecutionPolicy : uint8_t {
-        BorrowedSynchronous,
-        OwnedAsynchronous,
-    };
-    ExecutionPolicy executionPolicy = ExecutionPolicy::BorrowedSynchronous;
     std::shared_ptr<FrameContext> frameContext;
     GraphCompileStructure structure;
     // Realization identity, ordered with structure.resourceIDs. It is excluded
@@ -398,83 +393,6 @@ private:
     uint32_t m_nextBatch = 0;
     bool m_failed = false;
     std::optional<FailedExecutionBatch> m_failure;
-};
-
-struct CompileCoordinatorStatistics {
-    uint64_t requested = 0, coalesced = 0, started = 0, completed = 0;
-    uint64_t cancelled = 0, failed = 0, oracleComparisons = 0, oracleFailures = 0;
-    uint64_t rejected = 0, highestReadySequence = 0;
-    uint64_t scheduleValidations = 0, scheduleFailures = 0;
-    uint64_t stateValidations = 0, stateFailures = 0, stateFallbacks = 0;
-    uint64_t membershipChanges = 0, passChanges = 0, constraintChanges = 0;
-    uint64_t queueChanges = 0, realizationChanges = 0;
-    uint64_t completedCacheHits = 0;
-    size_t active = 0, pending = 0, peakActive = 0, peakRunning = 0;
-    size_t retainedBytes = 0;
-    std::string lastError;
-    std::string lastStateFallback;
-};
-
-// Request/Pump/Reset/Shutdown belong to a single preparation owner. Workers
-// share only owned immutable inputs and an atomic completion mailbox per job.
-// Completion order never changes the order of publication.
-class GraphCompileCoordinator {
-public:
-    struct RequestReceipt {
-        uint64_t sequence = 0;
-        std::shared_ptr<const GraphCompileInput> input;
-    };
-    explicit GraphCompileCoordinator(std::shared_ptr<runtime::ITaskService> tasks,
-        size_t concurrency = 2);
-    ~GraphCompileCoordinator();
-    GraphCompileCoordinator(const GraphCompileCoordinator&) = delete;
-    GraphCompileCoordinator& operator=(const GraphCompileCoordinator&) = delete;
-    uint64_t Request(GraphCompileInput input);
-    // Bootstrap may compile inline, but invokes the same CompileGraph entry
-    // point and workspace type as worker jobs. No alternate compiler exists.
-    RequestReceipt RequestOwned(GraphCompileInput input, bool compileInline = false);
-    void Pump();
-	void WaitForSequence(uint64_t sequence);
-    // Waits for, and consumes, exactly sequence. Later completed requests stay
-    // in the reorder buffer. Compilation failure for sequence is reported by
-    // exception rather than leaving an unfillable queue hole.
-    std::shared_ptr<const CompiledGraphBundle> WaitAndPop(uint64_t sequence);
-    void SetConcurrency(size_t concurrency);
-    void Reset(uint64_t generation);
-    void Shutdown();
-    // Non-consuming exact-sequence inspection for tests and diagnostics. This
-    // never selects a frame and cannot skip over a queue hole.
-    std::shared_ptr<const CompiledGraphBundle> PeekReady(uint64_t sequence) const;
-    CompileCoordinatorStatistics Statistics() const;
-private:
-    struct RequestState {
-        uint64_t sequence;
-        std::shared_ptr<const GraphCompileInput> input;
-        std::chrono::steady_clock::time_point queued;
-    };
-    struct Job;
-    struct RunningStatistics {
-        std::atomic_size_t running{0}, peak{0};
-    };
-    struct CompletionSignal {
-        std::mutex mutex;
-        std::condition_variable changed;
-        uint64_t revision = 0;
-    };
-    void StartPending();
-    void Accept(const RequestState&, std::shared_ptr<const CompiledGraph>);
-    std::shared_ptr<runtime::ITaskService> m_tasks;
-    std::shared_ptr<runtime::ITaskScope> m_scope;
-    std::shared_ptr<RunningStatistics> m_running = std::make_shared<RunningStatistics>();
-    std::shared_ptr<CompletionSignal> m_completion = std::make_shared<CompletionSignal>();
-    size_t m_concurrency;
-    bool m_stopped = false;
-    uint64_t m_generation = 0, m_sequence = 0;
-    std::vector<std::shared_ptr<Job>> m_jobs;
-    std::deque<RequestState> m_pending;
-    std::map<uint64_t, std::shared_ptr<const CompiledGraphBundle>> m_ready;
-    std::map<uint64_t, std::string> m_failures;
-    CompileCoordinatorStatistics m_stats;
 };
 
 } // namespace org::experimental

@@ -1,5 +1,5 @@
 #include "Managers/UploadInstance.h"
-#include "Utilities/EnvironmentFlag.h"
+#include "Render/Runtime/OpenRenderGraphSettings.h"
 #include <unordered_map>
 #include "Render/Runtime/StagedUploadBatch.h"
 
@@ -30,15 +30,7 @@ namespace {
 	}
 
 	bool UploadTelemetryLoggingEnabled() {
-		static const bool enabled = [] {
-			for (const char* name : {
-				"SARP_UPLOAD_TELEMETRY_LOG",
-				"SARP_TEXTURE_STREAMING_TRANSITION_LOG" }) {
-				if (org::detail::EnvironmentFlagEnabled(name)) return true;
-			}
-			return false;
-		}();
-		return enabled;
+		return org::runtime::DiagnosticLogEnabled(org::runtime::DiagnosticLog::UploadTelemetry);
 	}
 }
 
