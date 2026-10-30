@@ -180,6 +180,15 @@ submitted. That buys a little overlap (a successor could record its handoff befo
   submits. Neither job's body is re-recorded or interrupted. A job that submits from a worker never blocks the render
   thread for longer than the lock is held.
 
+**Later improvement.** Admission at submission is the simplest correct model, and it is the one to revisit when profiling or
+latency asks for it. Things to reconsider:
+- A successor cannot record its handoff until its predecessor has submitted. Prepare and body recording still overlap; only
+  the handoff list and the submission itself wait.
+- One lock serializes every submission on the runtime.
+- The Phase 0 promised-exit design (admission at prepare, with a submit gate) buys back that overlap at the cost of the
+  machinery listed above. Per-resource locks or optimistic admission (record the handoff outside the lock, then validate
+  the ledger version under it and retry on a change) are intermediate options.
+
 **Lock.**
 - **What it covers.** One mutex in `ResourceSequencer`, held across steps 1 to 4. That includes the queue submission
   itself, so that a predecessor's commit and its submission are seen together. The work under it is lookups over the
