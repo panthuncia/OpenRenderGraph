@@ -54,6 +54,9 @@ struct PreparedBatchBarriers {
     // here, for every backing but aliased ones. beforePass and afterPass depend on the compiled graph alone.
     std::vector<rhi::TextureBarrier> textures;
     std::vector<rhi::BufferBarrier> buffers;
+    // Entry barriers that take a texture on from Common after its queue-family acquire (in textures): a barrier batch of their own,
+    // after the entry's, since barriers in one batch are unordered against each other.
+    std::vector<rhi::TextureBarrier> acquired;
     std::vector<PreparedStateRegion> committedStates;
     std::vector<rhi::ResourceHandle> committedResources;
     // Queue slot that performed each committed state update. Kept parallel to

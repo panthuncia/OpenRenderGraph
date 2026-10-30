@@ -20,8 +20,10 @@
 >   It still only counts `ORG.Execution.CrossFrameTextureQueueHandoff` for closed executions, across devices, and for
 >   queues the graph lacks.
 > - Remaining:
->   - **Vulkan QFOT layout pairs:** the release and acquire halves must match. One option is X→Common in both halves plus a
->     local Common→Y on the consumer, with the backends skipping an acquire whose transfer collapsed (D3D12 always).
+>   - **Vulkan QFOT layout pairs (done).** The acquire repeats its release (X to Common), at the consuming batch's entry. A
+>     barrier batch after it (`PreparedBatchBarriers::acquired`, or the pass's own) takes the texture from Common to Y.
+>     BasicRHI drops an acquire whose transfer collapsed: always on D3D12, and on Vulkan for one queue family or a
+>     concurrent image. Aliased textures and cross-device handoffs keep the old acquire.
 >   - **D3D12 copy-queue exits:** copy lists keep textures in `COMMON` while the ledger records `CopySource`/`CopyDest`.
 >     One option is to normalize copy-queue steps to `Common` in the compiler.
 >   - **External clients (2e).**

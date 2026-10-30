@@ -188,11 +188,16 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
         release.afterSync = rhi::ResourceSyncState::All;
         release.queueOwnership = rhi::QueueOwnership::Release;
         release.ownershipPeer = OwnershipPeerForQueue(consumerQueue);
+        // The acquire repeats the release (Vulkan pairs them exactly), in the entry batch; the caller's barrier then takes the
+        // texture on from Common, in the batch after it (PreparedBatchBarriers::acquired).
+        auto acquire = release;
+        acquire.texture = barrier.texture;
+        acquire.queueOwnership = rhi::QueueOwnership::Acquire;
+        acquire.ownershipPeer = OwnershipPeerForQueue(previousQueue);
+        result.batches[batch].textures.push_back(acquire);
         barrier.beforeAccess = rhi::ResourceAccessType::Common;
         barrier.beforeLayout = rhi::ResourceLayout::Common;
         barrier.beforeSync = rhi::ResourceSyncState::All;
-        barrier.queueOwnership = rhi::QueueOwnership::Acquire;
-        barrier.ownershipPeer = OwnershipPeerForQueue(previousQueue);
         auto found = std::ranges::find(result.releases, previousQueue, &PreparedExecutionBarrierPlan::Release::queue);
         if (found == result.releases.end()) {
             result.releases.push_back({});
@@ -302,6 +307,18 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
                     barrier.ownershipPeer = OwnershipPeerForQueue(previousQueue);
                     if (crossDevice) { toExternal(release, rhi::QueueOwnership::Release); toExternal(barrier, rhi::QueueOwnership::Acquire); }
                     afterProducer->textures.push_back(release);
+                    // Vulkan pairs the halves of a queue-family transfer exactly: the acquire repeats the release (to Common), at the
+                    // batch's entry, and the pass's own barrier takes the texture on from Common. A backend whose transfer collapses
+                    // (D3D12; one family; a concurrent resource) drops the acquire. An aliased texture keeps the acquire in its pass:
+                    // another occupant may use its memory earlier in the batch.
+                    if (!crossDevice && !captured.aliasSize) {
+                        auto acquire = release;
+                        acquire.texture = consumerHandle;
+                        acquire.queueOwnership = rhi::QueueOwnership::Acquire;
+                        acquire.ownershipPeer = OwnershipPeerForQueue(previousQueue);
+                        output.textures.push_back(acquire);
+                        barrier.queueOwnership = rhi::QueueOwnership::None;
+                    }
                 }
                 if (NeedsTextureBarrier(barrier)) beforePass.textures.push_back(barrier);
             } else {
@@ -389,8 +406,9 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
                 barrier.beforeSync = static_cast<rhi::ResourceSyncState>(uniformBefore->sync);
                 barrier.afterSync = static_cast<rhi::ResourceSyncState>(step.after.sync);
                 barrier.discard = barrier.beforeLayout == rhi::ResourceLayout::Undefined;
-                if (!externalAcquire && useSubmittedState) handOff(barrier, captured, uniformPreviousQueue, consumerQueue, step.batch);
-                if (NeedsTextureBarrier(barrier)) boundaryTextures.push_back(barrier);
+                const bool handedOff = !externalAcquire && useSubmittedState
+                    && handOff(barrier, captured, uniformPreviousQueue, consumerQueue, step.batch);
+                if (NeedsTextureBarrier(barrier)) (handedOff ? output.acquired : boundaryTextures).push_back(barrier);
             } else {
                 const auto beforeAccess = static_cast<rhi::ResourceAccessType>(uniformBefore->access);
                 const auto beforeSync = static_cast<rhi::ResourceSyncState>(uniformBefore->sync);
@@ -448,6 +466,7 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
             const bool submittedQueueHandoff = previousQueue != UINT32_MAX
                 && previousQueue != consumerQueue;
             if (captured.shape.hasLayout) {
+                bool handedOff = false;
                 rhi::TextureBarrier barrier{};
                 barrier.texture = consumerHandle;
                 barrier.range = {mip, 1, slice, 1};
@@ -479,12 +498,13 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
                     afterProducer->textures.push_back(release);
                 } else if (externalAcquire) {
                     toExternal(barrier, rhi::QueueOwnership::Acquire);
-                } else if (submittedQueueHandoff && !handOff(barrier, captured, previousQueue, consumerQueue, step.batch)) {
+                } else if (submittedQueueHandoff) {
+                    handedOff = handOff(barrier, captured, previousQueue, consumerQueue, step.batch);
                     // An earlier execution left it on a queue whose release cannot be planned (handOff). Counted so these
                     // handoffs are visible; graph buffers are Concurrent.
-                    basic_telemetry::AddCounter("ORG.Execution.CrossFrameTextureQueueHandoff");
+                    if (!handedOff) basic_telemetry::AddCounter("ORG.Execution.CrossFrameTextureQueueHandoff");
                 }
-                if (NeedsTextureBarrier(barrier)) boundaryTextures.push_back(barrier);
+                if (NeedsTextureBarrier(barrier)) (handedOff ? output.acquired : boundaryTextures).push_back(barrier);
             } else {
                 const auto heapType = captured.heapType;
                 const bool fixedHeapState = heapType == rhi::HeapType::Upload

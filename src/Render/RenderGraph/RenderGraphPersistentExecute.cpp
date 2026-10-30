@@ -207,6 +207,7 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 			if (!admission.closed) {
 				job.recording.textureBarriers.clear();
 				job.recording.bufferBarriers.clear();
+				job.recording.acquiredBarriers.clear();
 			}
 			job.recording.external = external;
 			job.recording.bindings = segment.legacyBindings;
@@ -394,7 +395,7 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 				leading.resize(graph.batches.size());
 				for (uint32_t batch = 0; batch < graph.batches.size(); ++batch) {
 					const auto& entry = admission.barriers.batches[batch];
-					if (entry.textures.empty() && entry.buffers.empty()) continue;
+					if (entry.textures.empty() && entry.buffers.empty() && entry.acquired.empty()) continue;
 					BT_ZONE_SCOPE("ORG.Persistent.RecordHandoff");
 					const auto index = static_cast<QueueSlotIndex>(static_cast<uint8_t>(graph.batches[batch].queue));
 					auto allocation = std::make_shared<compiler::FrameCommandAllocation>();
@@ -405,6 +406,11 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 					barriers.textures = {entry.textures.data(), static_cast<uint32_t>(entry.textures.size())};
 					barriers.buffers = {entry.buffers.data(), static_cast<uint32_t>(entry.buffers.size())};
 					list.Barriers(barriers);
+					if (!entry.acquired.empty()) {
+						rhi::BarrierBatch acquired{};
+						acquired.textures = {entry.acquired.data(), static_cast<uint32_t>(entry.acquired.size())};
+						list.Barriers(acquired);
+					}
 					if (list.EndChecked() != rhi::Result::Ok) throw std::runtime_error("Handoff command list close failed");
 					allocation->closed = true;
 					handoffLists[batch] = list;

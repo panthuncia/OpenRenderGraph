@@ -262,9 +262,13 @@ int main() {
         const auto& released = across.barriers.releases[0].textures.at(0);
         CHECK(released.beforeLayout == rhi::ResourceLayout::ShaderResource && released.afterLayout == rhi::ResourceLayout::Common
             && released.queueOwnership == rhi::QueueOwnership::Release && released.ownershipPeer == rhi::QueueKind::Compute);
-        const auto& acquired = across.barriers.batches[0].textures.at(0);
+        // The acquire repeats the release (Vulkan pairs them exactly); the barrier after it takes the texture on from Common.
+        const auto& acquire = across.barriers.batches[0].textures.at(0);
+        CHECK(acquire.beforeLayout == rhi::ResourceLayout::ShaderResource && acquire.afterLayout == rhi::ResourceLayout::Common
+            && acquire.queueOwnership == rhi::QueueOwnership::Acquire && acquire.ownershipPeer == rhi::QueueKind::Graphics);
+        const auto& acquired = across.barriers.batches[0].acquired.at(0);
         CHECK(acquired.beforeLayout == rhi::ResourceLayout::Common && acquired.afterLayout == rhi::ResourceLayout::ShaderResource
-            && acquired.queueOwnership == rhi::QueueOwnership::Acquire && acquired.ownershipPeer == rhi::QueueKind::Graphics);
+            && acquired.queueOwnership == rhi::QueueOwnership::None);
         reads.Abandon(across);
         // A closed admission is never readmitted.
         SynchronousAdmission closed(4, {}, sequencer);

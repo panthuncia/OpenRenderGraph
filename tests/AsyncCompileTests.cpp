@@ -624,15 +624,19 @@ int main() {
         .beforePass[consumerPosition].textures.front().beforeSync == rhi::ResourceSyncState::All);
     // Queue-family ownership travels with the pair: the producer (slot 0,
     // graphics) releases to the consumer's family (slot 1, compute) and the
-    // consumer acquires from graphics.
-    ENSURE(crossQueueBarriers.batches[crossQueueStep->previousBatch]
-        .afterPass[producerPosition].textures.front().queueOwnership == rhi::QueueOwnership::Release);
-    ENSURE(crossQueueBarriers.batches[crossQueueStep->previousBatch]
-        .afterPass[producerPosition].textures.front().ownershipPeer == rhi::QueueKind::Compute);
+    // consumer acquires from graphics, at its batch's entry, with the release's
+    // own layouts; the pass's barrier then takes it on from Common.
+    const auto& crossQueueRelease = crossQueueBarriers.batches[crossQueueStep->previousBatch]
+        .afterPass[producerPosition].textures.front();
+    ENSURE(crossQueueRelease.queueOwnership == rhi::QueueOwnership::Release);
+    ENSURE(crossQueueRelease.ownershipPeer == rhi::QueueKind::Compute);
+    const auto& crossQueueAcquire = crossQueueBarriers.batches[crossQueueStep->batch].textures.front();
+    ENSURE(crossQueueAcquire.queueOwnership == rhi::QueueOwnership::Acquire);
+    ENSURE(crossQueueAcquire.ownershipPeer == rhi::QueueKind::Graphics);
+    ENSURE(crossQueueAcquire.beforeLayout == crossQueueRelease.beforeLayout
+        && crossQueueAcquire.afterLayout == crossQueueRelease.afterLayout);
     ENSURE(crossQueueBarriers.batches[crossQueueStep->batch]
-        .beforePass[consumerPosition].textures.front().queueOwnership == rhi::QueueOwnership::Acquire);
-    ENSURE(crossQueueBarriers.batches[crossQueueStep->batch]
-        .beforePass[consumerPosition].textures.front().ownershipPeer == rhi::QueueKind::Graphics);
+        .beforePass[consumerPosition].textures.front().queueOwnership == rhi::QueueOwnership::None);
     auto dependencyOnly = stateInput;
     dependencyOnly.structure.resourceIDs.push_back(2);
     dependencyOnly.structure.resourceShapes.push_back({0, 0, false});

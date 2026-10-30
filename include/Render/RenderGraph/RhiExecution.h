@@ -684,6 +684,7 @@ struct OwnedRecordingList {
     rhi::DescriptorHeapHandle samplerDescriptorHeap{};
     std::vector<rhi::TextureBarrier> textureBarriers;
     std::vector<rhi::BufferBarrier> bufferBarriers;
+    std::vector<rhi::TextureBarrier> acquiredBarriers;  // PreparedBatchBarriers::acquired
     std::vector<PreparedBatchBarriers::BeforePass> barriersBeforePass;
     std::vector<PreparedBatchBarriers::BeforePass> barriersAfterPass;
     std::vector<PreparedPass> passes;
@@ -751,6 +752,7 @@ inline OwnedRecordingList BuildPersistentRecordingList(std::shared_ptr<const Ren
     result.publication = frame.publication;
     result.textureBarriers = barriers.textures;
     result.bufferBarriers = barriers.buffers;
+    result.acquiredBarriers = barriers.acquired;
     result.barriersBeforePass = barriers.beforePass;
     result.barriersAfterPass = barriers.afterPass;
     for (auto pass : compiled.passes) {
@@ -841,6 +843,11 @@ inline void RecordOwnedRecordingCommands(RecordingContext& context, const OwnedR
         rhi::BarrierBatch barriers{};
         barriers.textures = {recording.textureBarriers.data(), static_cast<uint32_t>(recording.textureBarriers.size())};
         barriers.buffers = {recording.bufferBarriers.data(), static_cast<uint32_t>(recording.bufferBarriers.size())};
+        recordBarriers("entry", firstPass, barriers);
+    }
+    if (!recording.acquiredBarriers.empty()) {
+        rhi::BarrierBatch barriers{};
+        barriers.textures = {recording.acquiredBarriers.data(), static_cast<uint32_t>(recording.acquiredBarriers.size())};
         recordBarriers("entry", firstPass, barriers);
     }
     for (size_t passIndex = 0; passIndex < recording.passes.size(); ++passIndex) {
