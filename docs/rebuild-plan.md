@@ -230,6 +230,9 @@ Target size: about 40–45k lines.
 
 ### Phase 7: API and code quality
 
+> **Superseded in part (2026-10-30):** per-runtime service ownership moves to `job-graphs.md` (ORG without a main
+> graph), Phase 1 there.
+
 - **Naming:** rename `Experimental*` and `org::experimental` to `GraphCompiler`, `ExecutionState`, `RhiExecution`, and `org::diagnostics` for `DiagnosticSkip*`.
 - **Services:**
   - Services become per-runtime and owned by `RuntimeDevice`, which removes the `GetInstance()` singletons and `Default*Service` facades.
