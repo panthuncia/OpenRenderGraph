@@ -25,6 +25,9 @@ struct ReadbackCaptureInfo {
     RangeSpec range{};
     ReadbackCaptureCallback callback;
     QueueKind preferredQueueKind = QueueKind::Graphics;
+    // resourceId is a scheduling identity (ScheduleTrace::Resource::id), resolved by the graph that places the capture
+    // (RenderGraph::GetScheduledResource), not a resource's global ID.
+    bool scheduledID = false;
 };
 
 struct ReadbackCaptureToken {
@@ -46,6 +49,10 @@ public:
     void RequestReadbackCaptureAfterGraph(Resource* resource, const RangeSpec& range, ReadbackCaptureCallback callback, QueueKind preferredQueueKind = QueueKind::Graphics) {
         RequestReadbackCapture(kReadbackAfterGraph, resource, range, std::move(callback), preferredQueueKind);
     }
+    // A capture of the resource a persistent schedule names (ScheduleTrace::Resource::id) after a pass: what a debug UI on
+    // another thread than the graph's can request, without the resource object.
+    virtual void RequestScheduledReadbackCapture(const std::string& passName, uint64_t schedulingID, const RangeSpec& range,
+        ReadbackCaptureCallback callback) = 0;
     virtual std::vector<ReadbackCaptureInfo> ConsumeCaptureRequests() = 0;
     virtual std::shared_ptr<Resource> AcquireReadbackBuffer(uint64_t byteSize, const char* debugName) = 0;
     virtual ReadbackCaptureToken EnqueueCapture(ReadbackCaptureRequest&& request) = 0;

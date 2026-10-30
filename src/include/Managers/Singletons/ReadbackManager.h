@@ -8,6 +8,7 @@
 
 #include "Render/QueueKind.h"
 #include "Resources/ReadbackRequest.h"
+#include "Render/Runtime/IReadbackService.h"
 #include "Render/Runtime/ITaskService.h"
 
 
@@ -15,14 +16,7 @@ namespace org {
 
 class Resource;
 
-struct ReadbackCaptureInfo {
-	std::string passName;
-	std::weak_ptr<Resource> resource;
-	uint64_t resourceId = 0;
-	RangeSpec range{};
-	ReadbackCaptureCallback callback;
-	QueueKind preferredQueueKind = QueueKind::Graphics;
-};
+using ReadbackCaptureInfo = runtime::ReadbackCaptureInfo;
 
 struct ReadbackCaptureToken {
 	uint64_t id = 0;
@@ -47,6 +41,9 @@ public:
 		const RangeSpec& range,
 		ReadbackCaptureCallback callback,
 		QueueKind preferredQueueKind = QueueKind::Graphics);
+
+	void RequestScheduledReadbackCapture(const std::string& passName, uint64_t schedulingID, const RangeSpec& range,
+		ReadbackCaptureCallback callback);
 
 	std::vector<ReadbackCaptureInfo> ConsumeCaptureRequests();
 

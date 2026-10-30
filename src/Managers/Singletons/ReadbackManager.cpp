@@ -223,6 +223,13 @@ void ReadbackManager::RequestReadbackCapture(
     BT_PLOT("Readback.QueuedCaptures", static_cast<int64_t>(m_queuedCaptures.size()));
 }
 
+void ReadbackManager::RequestScheduledReadbackCapture(const std::string& passName, uint64_t schedulingID, const RangeSpec& range,
+    ReadbackCaptureCallback callback)
+{
+    std::scoped_lock lock(m_captureQueueMutex);
+    m_queuedCaptures.push_back(ReadbackCaptureInfo{passName, {}, schedulingID, range, std::move(callback), QueueKind::Graphics, true});
+}
+
 std::vector<ReadbackCaptureInfo> ReadbackManager::ConsumeCaptureRequests() {
     std::lock_guard<std::mutex> lock(m_captureQueueMutex);
     auto out = std::move(m_queuedCaptures);

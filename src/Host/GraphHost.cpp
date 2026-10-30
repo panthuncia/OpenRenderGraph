@@ -1212,6 +1212,7 @@ bool GraphHost::TrySubmitReservedEpoch(FrameTicketReservation& reservation, uint
 	m_lastTimings = {};
 	m_lastTimings.async = true;
 	SubmitTicket(*m_async, index, std::move(ticket), beforeSubmit, false, &reservation);
+	if (auto* readback = m_graph->GetReadbackService()) readback->ProcessReadbackRequests();
 	return true;
 }
 
@@ -1244,6 +1245,8 @@ void GraphHost::SubmitEpoch(uint32_t epoch, const FrameCallback& beforeSubmit, s
 	}
 	lap(m_lastTimings.ticketWaitUs);
 	SubmitTicket(async, index, std::move(ticket), beforeSubmit, true, nullptr, std::move(resourceOwner), std::move(recording));
+	// Completed readback captures reach their callbacks here: a ticket's frame never runs Update, which polls them.
+	if (auto* readback = m_graph->GetReadbackService()) readback->ProcessReadbackRequests();
 }
 
 void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<RenderGraph::PersistentTicket> ticket,

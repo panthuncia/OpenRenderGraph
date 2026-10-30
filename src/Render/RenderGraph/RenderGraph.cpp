@@ -1,4 +1,5 @@
 #include "RenderGraphInternal.h"
+#include "Render/Runtime/RuntimeDevice.h"
 
 namespace org {
 
@@ -317,14 +318,7 @@ void RenderGraph::ShutdownTaskWorkers() {
 
 void RenderGraph::ShutdownRuntime() {
 	StatisticsManager::GetInstance().ClearAll();
-	UploadManager::GetInstance().Cleanup(); // its pages and copy queue must not outlive the device (see ShutdownRuntimeDevice)
-	DeletionManager::GetInstance().DrainAll();
-	// Resource destruction above and during host teardown can enqueue further
-	// descriptor/backing owners. Global arenas outlive all of those owners.
-	DescriptorHeapManager::GetInstance().Cleanup();
-	DeletionManager::GetInstance().DrainAll();
-	DeletionManager::GetInstance().Cleanup();
-	DeviceManager::GetInstance().Cleanup();
+	runtime::ShutdownRuntimeDevice();
 }
 
 void RenderGraph::ShutdownOwnedState() {

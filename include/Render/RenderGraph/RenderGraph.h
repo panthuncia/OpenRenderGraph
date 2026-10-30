@@ -431,6 +431,9 @@ public:
 	//void CreateResource(std::wstring name);
 	std::shared_ptr<Resource> GetResourceByName(const std::string& name);
 	std::shared_ptr<Resource> GetResourceByID(const uint64_t id);
+	// The resource a persistent executable schedules under this identity (ScheduleTrace::Resource::id), for a debug capture;
+	// null when none does.
+	std::shared_ptr<Resource> GetScheduledResource(uint64_t schedulingID) const;
 	std::shared_ptr<RenderPass> GetRenderPassByName(const std::string& name);
 
 	void RegisterProvider(IResourceProvider* prov);

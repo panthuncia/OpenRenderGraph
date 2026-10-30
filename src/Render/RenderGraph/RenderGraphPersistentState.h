@@ -469,6 +469,13 @@ struct RenderGraph::PersistentExecutionState {
 	uint64_t pendingPresentSubmission = 0;
 	uint64_t structuralBuilds = 0, bindingBuilds = 0;
 	std::vector<uint8_t> tracyFrameBegun;
+	// Readback captures anchored after a main pass (RenderGraphPersistentCaptures.cpp), by pass name: appended to the
+	// pass's own packet when it is next prepared, so a capture never changes the executable.
+	struct PendingCapture { runtime::ReadbackCaptureInfo info; uint64_t requestedFrame = 0; };
+	std::unordered_map<std::string, std::vector<PendingCapture>> pendingCaptures;
+	// Captures the anchor pass could not take (it does not bind the resource, or not over the whole range): inserted
+	// next frame as frame-interrupting capture passes.
+	std::vector<runtime::ReadbackCaptureInfo> capturesToInsert;
 	// Schedule introspection (RenderGraph::SetScheduleTraceEnabled), owner thread.
 	struct ScheduleTraces {
 		const void* executable = nullptr;  // the traced whole-frame executable (not retained), with its revision
@@ -596,6 +603,15 @@ void InstallMainPass(RenderGraph& graph, State& state, persistent::GraphEditTran
 	State::MainPass& main, LoweredPass lowered, uint32_t mainIndex, bool replace, std::optional<uint32_t> authoredOrder = std::nullopt,
 	std::vector<uint32_t>* touchedGroups = nullptr);
 bool LoweringAddsDeclarations(const State::MainPass& main, const LoweredPass& lowered);
+
+// RenderGraphPersistentCaptures.cpp
+// Takes the readback service's new capture requests: after-graph captures become per-frame passes at the end (frameExt),
+// anchored ones wait for their pass's next preparation; the ones a pass could not take last frame become interrupting passes.
+void PlacePersistentCaptures(RenderGraph& graph, State& state, bool ticket, std::vector<ExternalPassDesc>& frameExt,
+	std::vector<ExternalPassDesc>& interrupting);
+// The pass's packet with the captures waiting for it recorded after its own commands.
+PreparedPass AppendPersistentCaptures(RenderGraph& graph, State& state, const State::MainPass& pass, const std::string& name,
+	PreparedPass packet, const FramePreparationContext& preparation, const persistent::SelectedPublication& publication);
 
 // RenderGraphPersistentTrace.cpp
 void FillScheduleSubmissionWaits(ScheduleSubmissionWaits& out, const compiler::CompiledGraph& graph,

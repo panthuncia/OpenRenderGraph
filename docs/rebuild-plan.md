@@ -243,6 +243,16 @@ Target size: about 40–45k lines.
 
 ### Phase 8: per-pass resource readback capture
 
+> **Status (2026-10-30): implemented.** A capture anchored after a main pass is appended to that pass's packet
+> (`PreparedPass::WithTrailer`: barrier to copy source from the pass's final compiled state, copy, barrier back), so the
+> executable is not rebuilt (`RenderGraphPersistentCaptures.cpp`); a pass that does not bind the resource, or not over the
+> whole range, falls back to an interrupting capture pass next frame, and after-graph captures run at the end. The graph
+> consumes the readback service's requests itself (BasicRenderer's `ReadbackCaptureExtension` is gone). The schedule
+> inspector takes a capture callback (`ScheduleCaptureFn`); requests by scheduling ID
+> (`IReadbackService::RequestScheduledReadbackCapture`) resolve on the render thread. Viewer: BR opens `MemoryViewWidget`;
+> CS has a byte/u32/f32 view. Test: `PersistentVulkanHostTests` sync mode captures after `test.write` with the structural
+> revision unchanged.
+
 Phase 5 deleted the old `RGInspector` (`DebugUI/RenderGraphInspector`), which read the old compiler's `PassBatch` list. With it went per-pass resource readback capture: pick a pass in the inspector, pick a resource it touches, and see that resource's contents as they were right after the pass. Bring this forward onto the persistent schedule.
 
 What still exists:

@@ -259,23 +259,36 @@ namespace ui {
     }
 
     void MemoryViewWidget::Open(const std::string& passName, Resource* resource, const RangeSpec& range, MemoryViewRequestCaptureFn requestCapture) {
+        if (!resource) {
+            std::scoped_lock lock(mutex_);
+            result_.reset();
+            waiting_ = false;
+            status_ = "Missing pass or resource selection.";
+            return;
+        }
+        Open(passName, resource->GetGlobalResourceID(), resource->GetName(), range,
+            requestCapture ? [=](ReadbackCaptureCallback callback) { requestCapture(passName, resource, range, std::move(callback)); }
+                           : std::function<void(ReadbackCaptureCallback)>{});
+    }
+
+    void MemoryViewWidget::Open(const std::string& passName, uint64_t resourceId, const std::string& resourceName, const RangeSpec& range,
+        std::function<void(ReadbackCaptureCallback)> requestCapture) {
         std::scoped_lock lock(mutex_);
 
         result_.reset();
         waiting_ = false;
         status_.clear();
 
-        if (!resource || passName.empty()) {
+        if (passName.empty()) {
             status_ = "Missing pass or resource selection.";
             return;
         }
 
         PendingRequest req{};
         req.passName = passName;
-        req.resource = resource;
         req.range = range;
-        req.resourceId = resource->GetGlobalResourceID();
-        req.resourceName = resource->GetName();
+        req.resourceId = resourceId;
+        req.resourceName = resourceName;
         pending_ = req;
 
         if (currentResourceId_ != 0 && currentResourceId_ != req.resourceId) {
@@ -298,17 +311,13 @@ namespace ui {
         }
 
         // Schedule capture. Callback may run later when GPU completes + ProcessReadbackRequests() copies data.
-        requestCapture(
-            passName,
-            resource,
-            range,
-            [this](ReadbackCaptureResult&& r) {
-                std::scoped_lock cbLock(mutex_);
-                result_ = std::move(r);
-                waiting_ = false;
-                previewDirty_ = true;
-                status_ = "Readback complete.";
-            });
+        requestCapture([this](ReadbackCaptureResult&& r) {
+            std::scoped_lock cbLock(mutex_);
+            result_ = std::move(r);
+            waiting_ = false;
+            previewDirty_ = true;
+            status_ = "Readback complete.";
+        });
     }
 
     void MemoryViewWidget::Draw(bool* pOpen) {

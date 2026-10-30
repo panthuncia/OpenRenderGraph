@@ -632,6 +632,7 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 			interrupting.push_back(std::move(*it));
 			it = frameExt.erase(it);
 		}
+		PlacePersistentCaptures(*this, state, m_persistentTicketTarget != nullptr, frameExt, interrupting);
 	}
 	// 1. Structural and membership changes reported by legacy passes. One
 	// transaction carries both so the slot directory never diverges from the
@@ -751,6 +752,12 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 			}
 			if (!uniform) {
 				// Shape contract broken: subscribers re-lower (direct declarations).
+				{
+					static std::atomic<uint32_t> reported{0};
+					if (reported.fetch_add(1) < 8)
+						spdlog::info("Persistent group shape changed: subscriber='{}' members={} capacity={}", state.mainPasses[group.subscribers.front()].name,
+							members.size(), group.capacity);
+				}
 				if (state.pending) { group.versionHint = 0; for (const auto subscriber : group.subscribers) state.pending->deferredStructural.push_back(subscriber); continue; }
 				for (const auto subscriber : group.subscribers) structural.push_back(subscriber);
 				continue;
@@ -833,8 +840,21 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 		}
 		// Structural edits build on a worker against the publication that now
 		// includes this frame's binding edits.
-		if (!state.pending && (!structural.empty() || !growGroups.empty()))
+		if (!state.pending && (!structural.empty() || !growGroups.empty())) {
+			// What asked for the build: the first builds, then every 256th, so a build every frame names its cause.
+			static std::atomic<uint64_t> submitted{0};
+			if (const auto count = submitted.fetch_add(1); count < 16 || count % 256 == 0) {
+				std::string passes, groups;
+				for (const auto index : structural) passes += state.mainPasses[index].name + " ";
+				for (const auto index : growGroups) {
+					const auto& group = state.groups[index];
+					groups += (group.subscribers.empty() ? std::string("?") : state.mainPasses[group.subscribers.front()].name)
+						+ "(capacity=" + std::to_string(group.capacity) + ") ";
+				}
+				spdlog::info("Persistent structural build #{} requested: frame={} relower=[{}] grow=[{}]", count, state.frameNumber, passes, groups);
+			}
 			SubmitPersistentStructuralBuild(structural, growGroups, primaryBackend, inlineStructural);
+		}
 		// Direct declarations of a resolver bind the set it resolved to when the pass was lowered. A preparation that resolves
 		// another set would record against resources it does not name - read past a grown buffer's old backing, say. A change
 		// is relowered inline above, so by here every pass must match; never silently.
@@ -1064,6 +1084,13 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 				cost.first += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - prepareStarted).count());
 				++cost.second;
 			}
+			// A capture anchored after this pass records in its packet: the packet is this frame's only.
+			bool captured = false;
+			if (!state.pendingCaptures.empty() && state.pendingCaptures.contains(any.name)) {
+				packet = AppendPersistentCaptures(*this, state, pass, any.name, std::move(packet), passPreparation,
+					executing ? *executing : *selected);
+				captured = true;
+			}
 			packet.SetDebugName(any.name);
 			main.invocations[pass.id.index] = std::move(packet);
 			if (auto* ticket = m_persistentTicketTarget) {
@@ -1073,7 +1100,7 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 					else return value.pass.get();
 				}, any.pass);
 				uint64_t hash = 0;
-				if (object && !pass.hosted && object->InvocationRevisionHash(hash)) ticket->revisions.emplace_back(object, hash);
+				if (object && !pass.hosted && !captured && object->InvocationRevisionHash(hash)) ticket->revisions.emplace_back(object, hash);
 				else ticket->uncheckable = true;
 			}
 			if (namesDirty) (*mainNames)[pass.id.index] = any.name;

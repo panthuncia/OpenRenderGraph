@@ -10,6 +10,7 @@ public:
     void Initialize(rhi::Timeline, rhi::Timeline) override {}
     void RequestReadbackCapture(const std::string&, org::Resource*, const org::RangeSpec&,
         org::ReadbackCaptureCallback, org::QueueKind) override {}
+    void RequestScheduledReadbackCapture(const std::string&, uint64_t, const org::RangeSpec&, org::ReadbackCaptureCallback) override {}
     std::vector<org::runtime::ReadbackCaptureInfo> ConsumeCaptureRequests() override { return {}; }
     std::shared_ptr<org::Resource> AcquireReadbackBuffer(uint64_t size, const char*) override {
         return org::Buffer::CreateShared(rhi::HeapType::Readback, size);

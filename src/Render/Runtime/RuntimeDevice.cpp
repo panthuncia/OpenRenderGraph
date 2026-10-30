@@ -4,6 +4,7 @@
 #include "Managers/Singletons/DescriptorHeapManager.h"
 #include "Managers/Singletons/DeletionManager.h"
 #include "Managers/Singletons/ECSManager.h"
+#include "Managers/Singletons/ReadbackManager.h"
 #include "Managers/Singletons/UploadManager.h"
 
 namespace org::runtime {
@@ -23,7 +24,9 @@ void ShutdownRuntimeDevice() noexcept
 	// Callers have joined CPU work and completed GPU work before shutdown.
 	// Deferred allocations must be destroyed while their allocator is alive;
 	// releasing descriptor owners can enqueue another wave of backing releases. The upload manager's pages and copy queue
-	// go first: left to static destruction, they would outlive the device and wait on its destroyed timelines.
+	// go first: left to static destruction, they would outlive the device and wait on its destroyed timelines. So do the
+	// readback manager's pooled buffers and the requests it still holds.
+	ReadbackManager::GetInstance().Cleanup();
 	UploadManager::GetInstance().Cleanup();
 	DeletionManager::GetInstance().DrainAll();
 	DescriptorHeapManager::GetInstance().Cleanup();

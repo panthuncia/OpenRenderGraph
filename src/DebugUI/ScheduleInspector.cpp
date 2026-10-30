@@ -150,7 +150,7 @@ void TextRange(const Trace::StateChange& change) {
     ImGui::TextDisabled("    range: mips %u+%u, slices %u+%u", change.firstMip, change.mipCount, change.firstSlice, change.sliceCount);
 }
 
-void DrawPassDetails(const Trace& trace, const Filter& filter, uint32_t passIndex, size_t limit) {
+void DrawPassDetails(const Trace& trace, const Filter& filter, uint32_t passIndex, size_t limit, const ScheduleCaptureFn* capture = nullptr) {
     const Names names{ trace };
     if (passIndex >= trace.passes.size()) {
         ImGui::TextDisabled("(no such pass)");
@@ -174,6 +174,18 @@ void DrawPassDetails(const Trace& trace, const Filter& filter, uint32_t passInde
         }
         const auto& access = pass.accesses[i];
         const char* name = names.Resource(access.resource);
+        if (capture && *capture && access.resource < trace.resources.size()) {
+            ImGui::PushID(static_cast<int>(i));
+            if (ImGui::SmallButton("Capture")) {
+                const auto& resource = trace.resources[access.resource];
+                (*capture)(pass.name, resource.id, resource.name);
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Read back this resource as the pass leaves it (next frame)");
+            }
+            ImGui::PopID();
+            ImGui::SameLine();
+        }
         if (filter.Resource(access.resource)) {
             ImGui::TextColored(kMatchText, "%s  %s", access.write ? "W" : "R", name);
         } else {
@@ -578,7 +590,7 @@ void DrawCausesTable(const Trace& trace, const Filter& filter, ScheduleInspector
 
 }  // namespace
 
-void ShowScheduleInspector(const PersistentScheduleSnapshot& snapshot, ScheduleInspectorState& state) {
+void ShowScheduleInspector(const PersistentScheduleSnapshot& snapshot, ScheduleInspectorState& state, const ScheduleCaptureFn& capture) {
     // The selected executable, by label (indices move as epochs come and go).
     const Trace* trace = nullptr;
     for (const auto& executable : snapshot.executables) {
@@ -695,7 +707,7 @@ void ShowScheduleInspector(const PersistentScheduleSnapshot& snapshot, ScheduleI
         if (ImGui::BeginTabItem("Selection")) {
             if (ImGui::BeginChild("##scheduleSelection", ImVec2(0.0f, 0.0f))) {
                 if (state.selectedPass < trace->passes.size()) {
-                    DrawPassDetails(*trace, filter, state.selectedPass, SIZE_MAX);
+                    DrawPassDetails(*trace, filter, state.selectedPass, SIZE_MAX, &capture);
                 } else if (state.selectedBatch < trace->batches.size()) {
                     DrawBatchDetails(*trace, submission, state.selectedBatch, SIZE_MAX);
                     for (const auto& wait : trace->waits) {

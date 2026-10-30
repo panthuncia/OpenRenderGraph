@@ -14,6 +14,7 @@
 
 #include "rhi.h"
 #include "TestSupport.h"
+#include "Render/RenderGraph/ScheduleTrace.h"
 #include "rhi_helpers.h"
 #include "rhi_interop_vulkan.h"
 
@@ -1046,6 +1047,37 @@ static int Run(int argc, char** argv) {
 				value = 6500u;
 				host.SubmitEpoch(0, upload);
 				REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(second, value), "replacement ticket recovers after stale reservation");
+			}
+
+			// A readback capture after a mid-frame pass: the write pass's target as the pass left it, copied in the pass's own
+			// recording, so the executable is not built again.
+			if (!async && !revision) {
+				auto* graph = host.Graph();
+				graph->SetScheduleTraceEnabled(true);
+				value = 6600u;
+				host.ExecuteFrame(nullptr, upload);
+				REQUIRE(device->WaitIdle() == rhi::Result::Ok, "wait before the capture");
+				const auto traced = graph->GetPersistentScheduleSnapshot();
+				REQUIRE(traced && !traced->executables.empty(), "a traced executable");
+				const auto revisionBefore = traced->executables.front()->structuralRevision;
+				std::vector<uint32_t> captured;
+				graph->GetReadbackService()->RequestReadbackCapture("test.write", scratch.get(), {},
+					[&](org::ReadbackCaptureResult&& result) {
+						captured.resize(result.data.size() / sizeof(uint32_t));
+						std::memcpy(captured.data(), result.data.data(), captured.size() * sizeof(uint32_t));
+					});
+				value = 6700u;
+				host.ExecuteFrame(nullptr, upload);
+				REQUIRE(device->WaitIdle() == rhi::Result::Ok, "wait for the captured frame");
+				graph->GetReadbackService()->ProcessReadbackRequests();
+				REQUIRE(captured.size() >= kCount, "the capture completes");
+				bool matches = true;
+				for (uint32_t i = 0; i < kCount; ++i) matches = matches && captured[i] == value + i;
+				REQUIRE(matches, "the capture holds what the pass wrote");
+				const auto after = graph->GetPersistentScheduleSnapshot();
+				REQUIRE(after && !after->executables.empty() && after->executables.front()->structuralRevision == revisionBefore,
+					"the capture did not build the executable again");
+				graph->SetScheduleTraceEnabled(false);
 			}
 
 			// A rebuild (e.g. on resize) retires the old graph and keeps rendering.
