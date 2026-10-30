@@ -332,6 +332,56 @@ the frame records can reach it.
 - **Upload pages.** The job graph's driver retires its private upload pages on its own slot ring
   (`ProcessDeferredReleases(slot)` once the slot's work is complete).
 
+### BasicRenderer: where the gates go
+
+This plan is based on a survey of BasicRenderer, ORG checkout at `org-rebuild`, 2026-10-30.
+
+**Today.**
+
+*Material textures.*
+- They are mipped on the CPU (`CreateMaterialResidentPixelBuffer`).
+- `MaterialTextureTransferService` uploads them on the graphics queue.
+- They reach materials through the `TextureBinding` artifact. `QueueBindingChanged` submits it, and its `AwaitExact(...,
+  UploadSubmitted)` callback calls `PublishPreparedImage`.
+- Material rows require `TextureBinding` at `UploadSubmitted`.
+
+*Always-resident textures.*
+- `CreateAlwaysResidentPixelBuffer` posts mip 0 and enqueues `MipmappingPass`.
+- The texture is published at once (`m_publishedImage = m_image`).
+- That is correct only because the mip pass runs inside the same frame graph, ahead of its consumers.
+
+*BC7.*
+- `SubmitBC7CompressionJob` makes a working texture and enqueues three passes.
+- The pass guesses when the source upload has completed by counting four frame executions.
+- Results come back through a readback, then `CompleteGpuProcessing` (cache write) and the `Ready` state, and reach
+  materials through the binding path.
+
+*Environment.*
+- Work goes through `FrameWorkQueue`s, and the prefiltered cubemap is published immediately.
+- It has no completion gate at all.
+
+**Plan.**
+1. **Texture job graph.** Add a `RenderGraph` of BasicRenderer's own with:
+   - `CreateGraphUploadService()`;
+   - `SetDrivesFrameServices(false)`;
+   - an extension carrying its upload pass and the mip and BC7 passes, removed from `RenderGraphIOService`.
+
+   It executes only when work is pending, at first on the render thread ahead of the frame graph and later on a worker.
+   Its rebuilds never touch the frame graph. Each execution yields a `GpuSubmissionSet`, the job graph's queue points as
+   in `MakeGpuSubmissionSet`, which is handed to the jobs it ran.
+2. **Gate texture readiness on the job's set.** A texture whose mips or BC7 compression are pending is not published:
+   - Remove the early `m_publishedImage = m_image` (Texture.cpp `uploadSourceDataThroughFactory`, `AdoptUploadedImage`).
+   - Bring those textures through the `TextureBinding` boundary, merging the job's set into the binding's.
+   - The binding awaits **`GpuReady`**, not `UploadSubmitted`. The job graph runs on its own queues and timelines, so a
+     binding published at submission would still leave the frame to wait on the GPU. At `GpuReady`, no frame waits on a
+     job at all.
+3. **BC7.** Replace the four-execution source-upload guess with the upload's real completion. The readback completion
+   stays the CPU-side gate, as today.
+4. **Environment.** One job per environment set (conversion, prefilter, SH), published through an artifact at `GpuReady`
+   in place of the `FrameWorkQueue` entries.
+5. **Open item.** `MaterialManager::AppendTextureDisplayRequirements` has no caller: display gates may not yet gate
+   renderables. Check this before relying on them.
+
 ## API sketch
 
 ```cpp
