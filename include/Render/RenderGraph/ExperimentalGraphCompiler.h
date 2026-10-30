@@ -15,7 +15,6 @@
 
 #include "Render/Runtime/ITaskService.h"
 #include "Render/RenderGraph/CompilerAlgorithms.h"
-#include "Render/RenderGraph/FrameContext.h"
 
 namespace org::experimental {
 
@@ -120,7 +119,6 @@ public:
 };
 
 struct GraphCompileInput {
-    std::shared_ptr<FrameContext> frameContext;
     GraphCompileStructure structure;
     // Realization identity, ordered with structure.resourceIDs. It is excluded
     // from symbolic compilation equality: same layout/new backing reuses a plan.
@@ -289,7 +287,14 @@ std::shared_ptr<const GraphExecutionLayout> BuildExecutionLayout(
     std::shared_ptr<const CompiledGraphBundle>, const GraphCompileInput& prepared);
 
 
-using ExecutionTimelinePoint = FrameCompletionPoint;
+// A point on a queue's (or a foreign) timeline, by admission identity.
+struct ExecutionTimelinePoint {
+    uint64_t timeline = 0;
+    uint64_t value = 0;
+    // Written out, not defaulted: the MSVC STL treats a defaulted == on a 16-byte type as bitwise-comparable under Clang
+    // and routes std::find to a vectorized path that only takes 1-8 byte elements.
+    bool operator==(const ExecutionTimelinePoint& other) const { return timeline == other.timeline && value == other.value; }
+};
 struct ExecutionBatchTimeline {
     ExecutionTimelinePoint signal;
     std::vector<ExecutionTimelinePoint> waits;
@@ -364,10 +369,6 @@ public:
     // A partial failure preserves committed values and permanently closes this
     // admission owner until device/error recovery constructs a fresh owner.
     void Fail(uint64_t submission, SubmissionReceipt receipt = {});
-    void ExtendSubmittedFrame(const std::shared_ptr<FrameContext>& frame,
-        ExecutionTimelinePoint completion);
-    void ExtendSubmittedFrame(uint64_t frameSequence,
-        ExecutionTimelinePoint completion);
     // Keyed by the unique submission id rather than the bundle sequence, which
     // persistent executables share across frames.
     void ExtendSubmittedExecution(uint64_t submission, ExecutionTimelinePoint completion);

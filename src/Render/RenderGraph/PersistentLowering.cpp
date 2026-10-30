@@ -80,19 +80,22 @@ std::optional<RenderGraph::ResolverGroupPlan> PlanResolverGroups(const RenderGra
 			{.range = requirement.resourceHandleAndRange.range, .state = requirement.state});
 	RenderGraph::ResolverGroupPlan plan;
 	for (const auto& snapshot : pass.resolverSnapshots) {
+		std::vector<uint64_t> resourceIDs;
+		if (snapshot.state && snapshot.state->resources)
+			for (const auto& resource : *snapshot.state->resources) resourceIDs.push_back(resource ? resource->GetGlobalResourceID() : 0u);
 		if (snapshot.hasUnclassifiedDeclaration) return std::nullopt;
 		auto templates = snapshot.declaredRequirementTemplates;
 		if (std::ranges::any_of(templates, [](const Template& t) { return t.state.access == rhi::ResourceAccessType::Common; }))
 			return std::nullopt;
-		if (snapshot.resourceIDs.empty()) {
+		if (resourceIDs.empty()) {
 			// Without concrete subresource dimensions, several authored uses may overlap or merge.
 			if (templates.size() != 1) return std::nullopt;
 			plan.templates.push_back(std::move(templates));
 			continue;
 		}
-		for (const auto id : snapshot.resourceIDs)
+		for (const auto id : resourceIDs)
 			if (!plan.memberIDs.insert(id).second) return std::nullopt; // A resource of two resolvers.
-		const auto first = templatesByResource.find(snapshot.resourceIDs.front());
+		const auto first = templatesByResource.find(resourceIDs.front());
 		if (first == templatesByResource.end() || first->second.empty()) return std::nullopt;
 		// The pass's requirements for the resolver's resources are what its declarations of them came to: several uses of
 		// one resolver (indirect arguments and a shader read, say) merge into fewer requirements than they were declared
@@ -100,7 +103,7 @@ std::optional<RenderGraph::ResolverGroupPlan> PlanResolverGroups(const RenderGra
 		// preparation under its own capture context) rather than direct, where a preparation for another version - a
 		// revision's - would bind the version current when the pass was lowered.
 		if (templates.size() != first->second.size()) templates = first->second;
-		for (const auto id : snapshot.resourceIDs) {
+		for (const auto id : resourceIDs) {
 			const auto found = templatesByResource.find(id);
 			if (found == templatesByResource.end() || found->second.size() != templates.size()) return std::nullopt;
 			for (size_t i = 0; i < templates.size(); ++i)
@@ -166,7 +169,7 @@ uint64_t FingerprintLowering(const LoweredPass& lowered) {
 	}
 	if (lowered.resourceUses) for (const auto& use : lowered.resourceUses->uses) {
 		fold(use.resolverIdentity ? reinterpret_cast<uintptr_t>(use.resolverIdentity.get()) : use.binding.registryResourceID);
-		fold(use.memberOrdinal); fold(static_cast<uint64_t>(use.state.access));
+		fold(static_cast<uint64_t>(use.state.access));
 		for (const auto view : use.requiredViews) {
 			fold(static_cast<uint64_t>(view.kind)); fold(view.variant); fold(view.mip); fold(view.slice);
 		}
@@ -257,12 +260,15 @@ LoweredPass LowerPass(RenderGraph& graph, ResourceRegistry& registry, const Queu
 		for (size_t i = 0; i < pass.resolverSnapshots.size(); ++i) {
 			const auto& snapshot = pass.resolverSnapshots[i];
 			LoweredGroup group;
-			group.key = snapshot.dependencyIdentity;
+			// The declaration's own capture: its uses name these members.
+			const auto& state = snapshot.state;
+			group.key = snapshot.DependencyIdentity();
 			group.resolver = snapshot.resolver ? snapshot.resolver->Clone() : nullptr;
-			group.identity = snapshot.resourceSetIdentity;
-			group.waitRevision = snapshot.waitRevision;
-			group.waits = snapshot.waits;
-			const auto state = snapshot.resolver ? graph.CaptureResolverDeclarationState(*snapshot.resolver) : nullptr;
+			if (state) {
+				group.identity = state->resourceSetIdentity;
+				group.waitRevision = state->waitRevision;
+				if (state->waits) group.waits = *state->waits;
+			}
 			std::optional<CompileResourceShape> shape;
 			if (state && state->resources) for (const auto& member : *state->resources) {
 				if (!member) continue;
@@ -280,7 +286,7 @@ LoweredPass LowerPass(RenderGraph& graph, ResourceRegistry& registry, const Queu
 			if (group.uniform && group.key && group.resolver && !group.templates.empty()) { result.groups.push_back(std::move(group)); continue; }
 			// Mixed shapes: this resolver's members are declared directly, and the resolver is polled for a new set.
 			if (snapshot.resolver)
-				result.directResolvers.emplace_back(snapshot.resolver->Clone(), state ? state->resourceSetIdentity : snapshot.resourceSetIdentity);
+				result.directResolvers.emplace_back(snapshot.resolver->Clone(), state ? state->resourceSetIdentity : ResolverResourceSetIdentity{});
 			for (const auto& [id, member] : group.members)
 				for (const auto& request : plan->templates[i]) {
 					const auto range = LowerRange(request.range, ShapeOf(*member));
@@ -292,8 +298,8 @@ LoweredPass LowerPass(RenderGraph& graph, ResourceRegistry& registry, const Queu
 		std::unordered_map<const Resource*, std::shared_ptr<Resource>> owners;
 		for (const auto& snapshot : pass.resolverSnapshots) {
 			if (!snapshot.resolver) continue;
-			const auto state = graph.CaptureResolverDeclarationState(*snapshot.resolver);
-			result.directResolvers.emplace_back(snapshot.resolver->Clone(), state ? state->resourceSetIdentity : snapshot.resourceSetIdentity);
+			const auto& state = snapshot.state;
+			result.directResolvers.emplace_back(snapshot.resolver->Clone(), state ? state->resourceSetIdentity : ResolverResourceSetIdentity{});
 			if (state && state->resources)
 				for (const auto& member : *state->resources) if (member) owners.emplace(member.get(), member);
 		}

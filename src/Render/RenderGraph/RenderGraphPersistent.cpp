@@ -201,7 +201,7 @@ struct RenderGraph::PersistentTicket {
 	// What each prepared pass's preparation depended on (RenderGraphPass::InvocationRevisionHash).
 	std::vector<std::pair<const RenderGraphPass*, uint64_t>> revisions;
 	bool uncheckable = false;  // a pass that cannot report its revision: never current
-	uint64_t hostTag = 0;      // the host's, for its own currency checks (PersistentGraphHost: the backing version)
+	uint64_t hostTag = 0;      // the host's, for its own currency checks (GraphHost: the backing version)
 	bool external = false;     // an external epoch's (SetExternalPersistentEpochs): its submission is the host's execution
 	// A revision ticket (PrepareRevisionTicket), or a live one with alternatives to its own segment: its candidates, pushed by the
 	// owner thread (newest first) and read by the bind on the submitting thread; the one the bind took. Completion abandons every
@@ -273,7 +273,9 @@ struct RenderGraph::PersistentExecutionState {
 		CompileResourceShape shape;
 		uint32_t capacity = 0;
 		std::vector<uint32_t> memberEntries;      // Reserved member slots (entry indices).
-		std::vector<uint64_t> memberResourceIDs;  // Bound scheduling ID per member slot, 0 = free.
+		// Per member slot: the scheduling ID its member replaced in place (a rotated publication). A declaration captured
+		// before the rotation names the old ID; it resolves here (MemberPosition).
+		std::vector<std::optional<uint64_t>> memberReplacedIDs;
 		std::unordered_map<uint64_t, uint32_t> memberIndexByID; // Scheduling ID -> member position.
 		std::vector<uint32_t> freeMembers;        // Member positions with no bound resource.
 		ResolverResourceSetIdentity identity{};
@@ -297,6 +299,10 @@ struct RenderGraph::PersistentExecutionState {
         std::shared_ptr<const ResourceUseLayout> resourceUses;
         std::vector<std::vector<persistent::ViewToken>> declaredViews;
         std::vector<persistent::BindingToken> declaredBindings;
+        // Per declared use: the group member entry a resolver use names (UINT32_MAX for a direct use). Resolved once, at
+        // install, against the declaration's own capture; a rotated publication replaces the member in place, so the
+        // entry keeps naming the logical resource the pass declared.
+        std::vector<uint32_t> resolverUseEntries;
         BackendInstanceId device = BackendInstanceId::Primary; // The pass's device (its lowering's).
         struct GroupViews { uint32_t group; std::vector<BindlessViewRequest> views; };
         std::vector<GroupViews> groupViews;
@@ -667,11 +673,114 @@ void QueueSlotPatch(State& state, const State::SlotEntry& entry, uint64_t concre
 	QueueSlotPatchIDs(state, entry, {entry.resourceID, entry.resource ? entry.resource->GetGlobalResourceID() : 0, concreteID}, add);
 }
 
+// Reserves member positions for a group (a structural edit), doubling its capacity until `needed` fit. The new
+// positions start free and carry every subscriber's group views.
+void GrowGroup(State& state, persistent::GraphEditTransaction& edit, uint32_t groupIndex, size_t needed) {
+	auto& group = state.groups[groupIndex];
+	while (group.capacity < needed) {
+		const auto more = edit.ReserveGroupMembers(group.group, group.capacity);
+		for (const auto slot : more) {
+			auto& entry = ClaimEntry(state, slot);
+			entry.slot = slot;
+			entry.shape = group.shape;
+			entry.subscribers = group.subscribers;
+			group.memberEntries.push_back(slot.index);
+			group.memberReplacedIDs.emplace_back();
+			group.freeMembers.push_back(static_cast<uint32_t>(group.memberEntries.size() - 1));
+		}
+		for (const auto subscriber : group.subscribers) {
+			const auto& main = state.mainPasses[subscriber];
+			for (const auto& requirement : main.groupViews) if (requirement.group == groupIndex)
+				for (const auto slot : more) {
+					const auto binding = edit.BindGroupMember(main.id, group.group, slot);
+					for (const auto view : requirement.views) edit.RequireView(binding, view);
+				}
+		}
+		group.capacity *= 2;
+		basic_telemetry::AddCounter("ORG.Persistent.GroupCapacityGrowth");
+	}
+}
+
+struct GroupSyncCounts { size_t added = 0, removed = 0; };
+// Brings a group's bound members to `members`, one resolver capture; the caller has made room (GrowGroup). A member
+// that stays keeps its position. Members that left keep their positions bound until the arrivals are placed, so a
+// member arriving in the same capture (a rotated publication of the same logical resource: a VersionedBuffer's next
+// version) replaces the binding in place, and the passes whose uses name that position follow it. Positions are reused
+// lowest-first in resolver order, so a set republished every frame lands on the same positions each time; a physical
+// backing shared with another group then keeps its equivalence class (a position swap would be a structural change).
+// Positions nobody refilled are unbound. An unmaterialized arrival is left unbound for BindUnboundPersistentEntries.
+GroupSyncCounts SyncGroupMembers(State& state, persistent::GraphEditTransaction& edit, State::ResolverGroup& group,
+	const std::vector<std::pair<uint64_t, std::shared_ptr<Resource>>>& members) {
+	GroupSyncCounts counts;
+	std::unordered_set<uint64_t> wanted;
+	wanted.reserve(members.size());
+	for (const auto& [id, member] : members) if (member) wanted.insert(id);
+	std::vector<uint32_t> vacated;
+	for (auto it = group.memberIndexByID.begin(); it != group.memberIndexByID.end();) {
+		const auto [id, i] = *it;
+		if (wanted.contains(id)) { ++it; continue; }
+		std::erase(state.entriesByResourceID[id], group.memberEntries[i]);
+		group.memberReplacedIDs[i] = id;
+		vacated.push_back(i);
+		it = group.memberIndexByID.erase(it);
+	}
+	std::sort(vacated.begin(), vacated.end(), std::greater<>());
+	std::sort(group.freeMembers.begin(), group.freeMembers.end(), std::greater<>());
+	for (const auto& [id, member] : members) {
+		if (!member || group.memberIndexByID.contains(id)) continue;
+		Resource* const resource = member.get();
+		uint32_t i;
+		if (!vacated.empty()) { i = vacated.back(); vacated.pop_back(); }
+		else if (!group.freeMembers.empty()) { i = group.freeMembers.back(); group.freeMembers.pop_back(); group.memberReplacedIDs[i].reset(); }
+		else throw std::logic_error("Persistent group capacity accounting mismatch");
+		auto& entry = state.entries[group.memberEntries[i]];
+		const bool replacing = entry.isBound;
+		const std::array<uint64_t, 3> previousIDs = replacing && entry.resource
+			? std::array<uint64_t, 3>{entry.resourceID, entry.resource->GetGlobalResourceID(), entry.bound.concreteID} : std::array<uint64_t, 3>{};
+		entry.resource = resource; entry.resourceID = id; entry.member = member;
+		state.entriesByResourceID[id].push_back(group.memberEntries[i]);
+		group.memberIndexByID.emplace(id, i);
+		if (replacing) { QueueSlotPatchIDs(state, entry, previousIDs, false); ++counts.removed; }
+		auto* concrete = UnwrapDynamic(resource);
+		auto* backed = concrete ? dynamic_cast<BackedResource*>(concrete) : nullptr;
+		if (backed && !backed->IsMaterialized()) {
+			if (replacing) { UnbindSlot(state, edit, entry); entry.isBound = false; entry.bound = {}; }
+			continue;
+		}
+		BT_ZONE_SCOPE("ORG.Persistent.PollGroups.Diff.Bind");
+		if (BindEntry(state, edit, group.memberEntries[i])) { QueueSlotPatch(state, entry, entry.bound.concreteID, true); ++counts.added; }
+	}
+	for (const auto i : vacated) {
+		auto& entry = state.entries[group.memberEntries[i]];
+		if (entry.isBound) { UnbindSlot(state, edit, entry); QueueSlotPatch(state, entry, entry.bound.concreteID, false); ++counts.removed; }
+		entry.isBound = false; entry.bound = {}; entry.resource = nullptr; entry.resourceID = 0; entry.member.reset();
+		group.memberReplacedIDs[i].reset(); // The logical member left.
+		group.freeMembers.push_back(i);
+	}
+	return counts;
+}
+
+// The member slot that names `id`: its current member, or the one that replaced it in place.
+std::optional<uint32_t> MemberPosition(const State::ResolverGroup& group, uint64_t id) {
+	if (const auto found = group.memberIndexByID.find(id); found != group.memberIndexByID.end()) return found->second;
+	for (uint32_t i = 0; i < group.memberReplacedIDs.size(); ++i)
+		if (group.memberReplacedIDs[i] == id) return i;
+	return std::nullopt;
+}
+
+// Whether a pass's declaration (one resolver capture) names a member the group has not seen: a publication newer than
+// the group's, which the poll would bind a frame later. A declaration the group has rotated past names its members'
+// predecessors, which MemberPosition still resolves.
+bool DeclarationIsAhead(const State::ResolverGroup& group, const std::vector<std::pair<uint64_t, std::shared_ptr<Resource>>>& members) {
+	return std::any_of(members.begin(), members.end(), [&](const auto& member) { return member.second && !MemberPosition(group, member.first); });
+}
+
 } // namespace
 
 // Installs (or reinstalls) a main pass declaration into the transaction.
 static void InstallMainPass(RenderGraph& graph, State& state, persistent::GraphEditTransaction& edit,
-	State::MainPass& main, LoweredPass lowered, uint32_t mainIndex, bool replace, std::optional<uint32_t> authoredOrder = std::nullopt) {
+	State::MainPass& main, LoweredPass lowered, uint32_t mainIndex, bool replace, std::optional<uint32_t> authoredOrder = std::nullopt,
+	std::vector<uint32_t>* touchedGroups = nullptr) {
 	std::vector<uint32_t> previousDirect;
 	if (replace) {
 		previousDirect = main.directEntries;
@@ -693,6 +802,7 @@ static void InstallMainPass(RenderGraph& graph, State& state, persistent::GraphE
     main.resourceUses = lowered.resourceUses;
     main.declaredViews.clear();
     main.declaredBindings.clear();
+    main.resolverUseEntries.clear();
     main.groupViews.clear();
 	main.fingerprint = FingerprintLowering(lowered);
 	main.loweredDirect.clear();
@@ -731,12 +841,12 @@ static void InstallMainPass(RenderGraph& graph, State& state, persistent::GraphE
 		uint32_t groupIndex = UINT32_MAX;
 		for (uint32_t i = 0; i < state.groups.size(); ++i)
 			if (state.groups[i].key == loweredGroup.key && state.groups[i].shape == loweredGroup.shape) { groupIndex = i; break; }
-		if (groupIndex == UINT32_MAX) {
+		const bool created = groupIndex == UINT32_MAX;
+		if (created) {
 			State::ResolverGroup group;
 			group.key = loweredGroup.key;
 			group.resolver = std::move(loweredGroup.resolver);
 			group.shape = loweredGroup.shape;
-			group.identity = loweredGroup.identity;
 			group.waitRevision = loweredGroup.waitRevision;
 			group.waits = std::move(loweredGroup.waits);
 			// Exact published selections have one member that rotates in place;
@@ -749,29 +859,21 @@ static void InstallMainPass(RenderGraph& graph, State& state, persistent::GraphE
 				auto& entry = ClaimEntry(state, slot);
 				entry.slot = slot;
 				entry.shape = loweredGroup.shape;
+				group.freeMembers.push_back(static_cast<uint32_t>(group.memberEntries.size()));
 				group.memberEntries.push_back(slot.index);
-				group.memberResourceIDs.push_back(0);
-			}
-			for (uint32_t i = static_cast<uint32_t>(group.memberEntries.size()); i-- > loweredGroup.members.size();)
-				group.freeMembers.push_back(i);
-			for (size_t i = 0; i < loweredGroup.members.size(); ++i) {
-				const auto& [id, member] = loweredGroup.members[i];
-				Resource* const resource = member.get();
-				auto& entry = state.entries[group.memberEntries[i]];
-				entry.resource = resource;
-				entry.member = member;
-				entry.resourceID = id;
-				state.entriesByResourceID[id].push_back(group.memberEntries[i]);
-				group.memberResourceIDs[i] = id;
-				group.memberIndexByID.emplace(id, static_cast<uint32_t>(i));
-				// Unmaterialized members are realized and bound by
-				// BindUnboundPersistentEntries before the structural build.
-				auto* concrete = UnwrapDynamic(resource);
-				auto* backed = concrete ? dynamic_cast<BackedResource*>(concrete) : nullptr;
-				if (!backed || backed->IsMaterialized()) BindEntry(state, edit, group.memberEntries[i]);
+			group.memberReplacedIDs.emplace_back();
 			}
 			groupIndex = static_cast<uint32_t>(state.groups.size());
 			state.groups.push_back(std::move(group));
+		}
+		// The pass's uses name the members of its own capture; each needs a member slot before its tokens are made. A new
+		// group starts as that capture, in its order; a group behind it moves forward to it, as the poll would have (a
+		// rotated member replaced in place). The poll moves it on from there.
+		if (created || DeclarationIsAhead(state.groups[groupIndex], loweredGroup.members)) {
+			GrowGroup(state, edit, groupIndex, loweredGroup.members.size());
+			SyncGroupMembers(state, edit, state.groups[groupIndex], loweredGroup.members);
+			state.groups[groupIndex].identity = loweredGroup.identity;
+			if (!created && touchedGroups) touchedGroups->push_back(groupIndex);
 		}
 		auto& group = state.groups[groupIndex];
 		group.subscribers.push_back(mainIndex);
@@ -799,26 +901,25 @@ static void InstallMainPass(RenderGraph& graph, State& state, persistent::GraphE
         for (const auto& use : main.resourceUses->uses) {
             main.declaredViews.emplace_back();
             main.declaredBindings.emplace_back();
-            if (use.requiredViews.empty()) continue;
             uint32_t index = UINT32_MAX;
             if (use.resolverIdentity) for (const auto groupIndex : main.groups) {
                 const auto& group = state.groups[groupIndex];
-                if (group.key == use.resolverIdentity) { index = group.memberEntries.at(use.memberOrdinal); break; }
+                if (group.key != use.resolverIdentity) continue;
+                if (const auto position = MemberPosition(group, use.binding.globalResourceID)) index = group.memberEntries[*position];
+                break;
             }
-            if (index == UINT32_MAX) for (const auto candidate : main.directEntries) {
+            main.resolverUseEntries.push_back(index);
+            if (use.requiredViews.empty()) continue;
+            // A direct use, or a resolver lowered direct (mixed member shapes): its members are direct entries. A resource
+            // declared by pointer may also be another resolver's member.
+            const auto names = [&](uint32_t candidate) {
                 const auto& entry = state.entries[candidate];
-                if (entry.resourceID == use.binding.globalResourceID ||
-                    (entry.resource && entry.resource->GetGlobalResourceID() == use.binding.registryResourceID)) { index = candidate; break; }
-            }
+                return entry.resourceID == use.binding.globalResourceID
+                    || (entry.resource && entry.resource->GetGlobalResourceID() == use.binding.registryResourceID);
+            };
+            if (index == UINT32_MAX) for (const auto candidate : main.directEntries) if (names(candidate)) { index = candidate; break; }
             if (index == UINT32_MAX) for (const auto groupIndex : main.groups) {
-                for (const auto candidate : state.groups[groupIndex].memberEntries) {
-                    const auto& entry = state.entries[candidate];
-                    if (entry.resourceID == use.binding.globalResourceID ||
-                        (entry.resource && entry.resource->GetGlobalResourceID() == use.binding.registryResourceID)) {
-                        index = candidate;
-                        break;
-                    }
-                }
+                for (const auto candidate : state.groups[groupIndex].memberEntries) if (names(candidate)) { index = candidate; break; }
                 if (index != UINT32_MAX) break;
             }
             if (index == UINT32_MAX) throw std::logic_error("Declared view has no lowered resource slot: pass='"
@@ -1028,14 +1129,15 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 			// group later is structural. Report the overlapping groups once.
 			std::unordered_map<uint64_t, std::vector<uint32_t>> groupsByResource;
 			for (uint32_t g = 0; g < state.groups.size(); ++g)
-				for (const auto id : state.groups[g].memberResourceIDs) if (id) groupsByResource[id].push_back(g);
+				for (const auto& [id, position] : state.groups[g].memberIndexByID) groupsByResource[id].push_back(g);
 			std::map<std::vector<uint32_t>, uint32_t> sharedSets;
 			for (const auto& [id, groups] : groupsByResource) if (groups.size() > 1) ++sharedSets[groups];
 			for (const auto& [groups, count] : sharedSets) {
 				std::string names;
 				for (const auto g : groups) {
 					const auto& group = state.groups[g];
-					names += (names.empty() ? "" : " | ") + std::string(group.resolver ? typeid(*group.resolver).name() : "?")
+					const IResourceResolver* resolver = group.resolver.get();
+					names += (names.empty() ? "" : " | ") + std::string(resolver ? typeid(*resolver).name() : "?")
 						+ "#" + std::to_string(g) + "(members=" + std::to_string(group.memberIndexByID.size()) + ",subs=" + std::to_string(group.subscribers.size())
 						+ (group.subscribers.empty() ? "" : ",first=" + state.mainPasses[group.subscribers.front()].name) + ")";
 				}
@@ -1071,8 +1173,10 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 				std::string subs; for (const auto sub : entry.subscribers) subs += state.mainPasses[sub].name + ",";
 				std::string groupName = "-";
 				for (uint32_t g = 0; g < state.groups.size(); ++g)
-					if (std::find(state.groups[g].memberEntries.begin(), state.groups[g].memberEntries.end(), index) != state.groups[g].memberEntries.end())
-						groupName = std::to_string(g) + ":" + (state.groups[g].resolver ? typeid(*state.groups[g].resolver).name() : "?") + "(members=" + std::to_string(state.groups[g].memberIndexByID.size()) + ")";
+					if (std::find(state.groups[g].memberEntries.begin(), state.groups[g].memberEntries.end(), index) != state.groups[g].memberEntries.end()) {
+						const IResourceResolver* resolver = state.groups[g].resolver.get();
+						groupName = std::to_string(g) + ":" + (resolver ? typeid(*resolver).name() : "?") + "(members=" + std::to_string(state.groups[g].memberIndexByID.size()) + ")";
+					}
 				spdlog::info("Persistent slot {}: resource='{}' id={} direct={} group={} subs=[{}]", index,
 					entry.resource ? entry.resource->GetName() : "-", entry.resourceID, entry.direct, groupName, subs);
 			}
@@ -1087,7 +1191,6 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 	state.frameNumber = ++compiler.asyncPreparationFrameNumber;
 	state.frameData = m_asyncUpdateHostData;
 	RetireIdlePersistentAliasPools(state);
-	compiler.preparingFrame.reset();
 	org::runtime::ScopedActiveGraphServices activeServices(m_uploadService.get(), m_descriptorService.get());
 	const auto primaryBackend = m_backendDevices.empty() ? rhi::Backend::Null : m_backendDevices.front().backend;
 
@@ -1234,55 +1337,15 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 				continue;
 			}
 			auto& transaction = ensureEdit();
-			// Diff against the bound set: O(members) with the per-group index.
-			std::unordered_set<uint64_t> wanted;
-			wanted.reserve(members.size());
-			for (const auto& [id, member] : members) wanted.insert(id);
-			// Members that left: their positions stay bound for now so that a
-			// member arriving in the same poll (a rotated publication of the same
-			// logical resource) replaces the binding in place. Positions are
-			// reused lowest-first in resolver order so a resource set that is
-			// republished every frame lands on the same member slots each time;
-			// a physical backing shared with another group then keeps its
-			// equivalence class (a position swap would be a structural change).
-			std::vector<uint32_t> vacated;
-			for (auto it = group.memberIndexByID.begin(); it != group.memberIndexByID.end();) {
-				const auto [id, i] = *it;
-				if (wanted.contains(id)) { ++it; continue; }
-				std::erase(state.entriesByResourceID[id], group.memberEntries[i]);
-				group.memberResourceIDs[i] = 0;
-				vacated.push_back(i);
-				it = group.memberIndexByID.erase(it);
+			{
+				BT_ZONE_SCOPE("ORG.Persistent.PollGroups.Diff.Materialize");
+				std::vector<Resource*> arriving;
+				for (const auto& [id, member] : members) if (!group.memberIndexByID.contains(id)) arriving.push_back(member.get());
+				MaterializePersistentStandalone(arriving);
 			}
-			std::sort(vacated.begin(), vacated.end(), std::greater<>());
-			std::sort(group.freeMembers.begin(), group.freeMembers.end(), std::greater<>());
-			for (const auto& [id, member] : members) {
-				if (group.memberIndexByID.contains(id)) continue;
-				Resource* const resource = member.get();
-				uint32_t i;
-				if (!vacated.empty()) { i = vacated.back(); vacated.pop_back(); }
-				else if (!group.freeMembers.empty()) { i = group.freeMembers.back(); group.freeMembers.pop_back(); }
-				else throw std::logic_error("Persistent group capacity accounting mismatch");
-				auto& entry = state.entries[group.memberEntries[i]];
-				const bool replacing = entry.isBound;
-				const std::array<uint64_t, 3> previousIDs = replacing && entry.resource
-					? std::array<uint64_t, 3>{entry.resourceID, entry.resource->GetGlobalResourceID(), entry.bound.concreteID} : std::array<uint64_t, 3>{};
-				entry.resource = resource; entry.resourceID = id; entry.member = member;
-				state.entriesByResourceID[id].push_back(group.memberEntries[i]);
-				group.memberResourceIDs[i] = id;
-				group.memberIndexByID.emplace(id, i);
-				{ BT_ZONE_SCOPE("ORG.Persistent.PollGroups.Diff.Materialize"); MaterializePersistentStandalone(std::span<Resource* const>{&resource, 1}); }
-				BT_ZONE_SCOPE("ORG.Persistent.PollGroups.Diff.Bind");
-				if (replacing) { QueueSlotPatchIDs(state, entry, previousIDs, false); ++removed; }
-				if (BindEntry(state, transaction, group.memberEntries[i])) { QueueSlotPatch(state, entry, entry.bound.concreteID, true); ++added; }
-			}
-			// Positions nobody refilled are unbound.
-			for (const auto i : vacated) {
-				auto& entry = state.entries[group.memberEntries[i]];
-				if (entry.isBound) { UnbindSlot(state, transaction, entry); QueueSlotPatch(state, entry, entry.bound.concreteID, false); ++removed; }
-				entry.isBound = false; entry.bound = {}; entry.resource = nullptr; entry.resourceID = 0; entry.member.reset();
-				group.freeMembers.push_back(i);
-			}
+			const auto counts = SyncGroupMembers(state, transaction, group, members);
+			added = counts.added;
+			removed = counts.removed;
 			group.identity = captured->resourceSetIdentity;
 			BT_ZONE_VALUE(static_cast<int64_t>(added + removed));
 			basic_telemetry::AddCounter("ORG.Persistent.MembershipEdits");
@@ -1462,29 +1525,19 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 			for (const auto& pass : state.mainPasses)
 				if (!pass.retired && pass.id.index < mainNames->size())
 					(*mainNames)[pass.id.index] = (pass.hosted ? *pass.hosted : m_masterPassList[pass.masterIndex]).name;
-		// A resolver use's resource tokens name the member it had when the pass declared it. They resolve by position, as its views
-		// do: to the member bound now at the use's ordinal (a versioned buffer's version: VersionedBuffer), so a membership change
-		// stays a binding edit.
-		auto addDeclaredOrdinals = [&](const auto& a_pass, FramePreparationContext::ResourceSlots& a_slots) {
+		// A resolver use's resource tokens name the member it had when the pass declared it. They resolve as its views do: to
+		// the resource bound now at that member's position (a versioned buffer's current version: VersionedBuffer), so a
+		// membership change stays a binding edit.
+		auto addResolverUses = [&](const auto& a_pass, FramePreparationContext::ResourceSlots& a_slots) {
 			if (!a_pass.resourceUses) return;
-			for (const auto& use : a_pass.resourceUses->uses) {
-				if (!use.resolverIdentity) continue;
-				for (const auto groupIndex : a_pass.groups) {
-					const auto& group = state.groups[groupIndex];
-					if (group.key != use.resolverIdentity) continue;
-					uint32_t ordinal = 0;
-					for (const auto entryIndex : group.memberEntries) {
-						const auto& entry = state.entries[entryIndex];
-						if (!entry.resource || !entry.isBound) continue;
-						if (ordinal++ != use.memberOrdinal) continue;
-						if (entry.slot.index < selected->bindings.Size()) {
-							a_slots.emplace_back(use.binding.registryResourceID, entry.slot.index);
-							a_slots.emplace_back(use.binding.globalResourceID, entry.slot.index);
-						}
-						break;
-					}
-					break;
-				}
+			const auto& uses = a_pass.resourceUses->uses;
+			for (size_t u = 0; u < uses.size() && u < a_pass.resolverUseEntries.size(); ++u) {
+				const auto index = a_pass.resolverUseEntries[u];
+				if (index == UINT32_MAX) continue;
+				const auto& entry = state.entries[index];
+				if (!entry.resource || !entry.isBound || entry.slot.index >= selected->bindings.Size()) continue;
+				a_slots.emplace_back(uses[u].binding.registryResourceID, entry.slot.index);
+				a_slots.emplace_back(uses[u].binding.globalResourceID, entry.slot.index);
 			}
 		};
 		for (uint32_t mainIndex = 0; mainIndex < state.mainPasses.size() && executing; ++mainIndex) {
@@ -1517,7 +1570,7 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 						if (std::find(pass.directEntries.begin(), pass.directEntries.end(), entryIndex) != pass.directEntries.end())
 							slots->emplace_back(requirement.resourceHandleAndRange.resource.GetGlobalResourceID(), state.entries[entryIndex].slot.index);
 				}
-				addDeclaredOrdinals(pass, *slots);
+				addResolverUses(pass, *slots);
 				std::sort(slots->begin(), slots->end());
 				slots->erase(std::unique(slots->begin(), slots->end()), slots->end());
 				slots->sorted = true;
@@ -1540,7 +1593,7 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 				for (const auto& add : pass.slotAdds)
 					if (add.second < selected->bindings.Size()) slots->push_back(add);
 				// A removed member's own pair may have been a declared token's: map those again.
-				addDeclaredOrdinals(pass, *slots);
+				addResolverUses(pass, *slots);
 				std::sort(slots->begin(), slots->end());
 				slots->erase(std::unique(slots->begin(), slots->end()), slots->end());
 				slots->sorted = true;
@@ -2451,29 +2504,9 @@ void RenderGraph::SubmitPersistentStructuralBuild(const std::vector<uint32_t>& s
 	persistent::GraphEditTransaction* const transactionPtr = inlineRequired ? &*inlineEdit : pending->edit.get();
 	auto& transaction = *transactionPtr;
 	for (const auto groupIndex : growGroups) {
-		auto& group = state.groups[groupIndex];
-		const auto more = transaction.ReserveGroupMembers(group.group, group.capacity);
-		for (const auto slot : more) {
-			auto& entry = ClaimEntry(state, slot);
-			entry.slot = slot;
-			entry.shape = group.shape;
-			entry.subscribers = group.subscribers;
-			group.memberEntries.push_back(slot.index);
-			group.memberResourceIDs.push_back(0);
-			group.freeMembers.push_back(static_cast<uint32_t>(group.memberEntries.size() - 1));
-		}
-        for (const auto subscriber : group.subscribers) {
-            const auto& main = state.mainPasses[subscriber];
-            for (const auto& requirement : main.groupViews) if (requirement.group == groupIndex)
-                for (const auto slot : more) {
-                    const auto binding = transaction.BindGroupMember(main.id, group.group, slot);
-                    for (const auto view : requirement.views) transaction.RequireView(binding, view);
-                }
-        }
-		group.capacity *= 2;
-		group.identity = {}; // Re-syncs (binding-only) after the install.
+		GrowGroup(state, transaction, groupIndex, state.groups[groupIndex].capacity + 1);
+		state.groups[groupIndex].identity = {}; // Re-syncs (binding-only) after the install.
 		pending->touchedGroups.push_back(groupIndex);
-		basic_telemetry::AddCounter("ORG.Persistent.GroupCapacityGrowth");
 	}
 	for (const auto mainIndex : structural) {
 		auto& main = state.mainPasses[mainIndex];
@@ -2488,7 +2521,8 @@ void RenderGraph::SubmitPersistentStructuralBuild(const std::vector<uint32_t>& s
 				MaterializePersistentStandalone(resources, true);
 				auto views = std::move(main.declaredViews);
 				auto bindings = std::move(main.declaredBindings);
-				InstallMainPass(*this, state, transaction, main, std::move(lowered), mainIndex, true);
+				InstallMainPass(*this, state, transaction, main, std::move(lowered), mainIndex, true, std::nullopt,
+					inlineRequired ? nullptr : &pending->touchedGroups);
 				if (!inlineRequired) {
 					// Frames keep preparing against the current publication until the install.
 					std::swap(views, main.declaredViews);

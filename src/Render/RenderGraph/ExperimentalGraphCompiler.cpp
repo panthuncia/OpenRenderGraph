@@ -2,7 +2,6 @@
 #include "Render/PublicationBindingBundle.h"
 #include "Render/RenderGraph/ExperimentalGraphCompiler.h"
 #include "Render/RenderGraph/GraphReplay.h"
-#include "FrameTrace.h"
 #include "Render/RenderGraph/CompileTelemetry.h"
 
 #include <algorithm>
@@ -178,8 +177,6 @@ std::shared_ptr<const GraphExecutionTimeline> ExecutionTimelineAdmission::Submit
     }
     auto execution = Prepare(std::move(bundle), incomingWaits, std::move(leases), packets,
         reservedSignals);
-    CompletionSet completion;
-    for (const auto& batch : execution->batches) completion.Include(batch.signal);
     for (uint32_t i = 0; i < packets.size(); ++i) {
         const auto receipt = packets[i]->Submit(execution->batches[i]);
         if (!receipt) {
@@ -188,8 +185,6 @@ std::shared_ptr<const GraphExecutionTimeline> ExecutionTimelineAdmission::Submit
         }
         CommitBatch(execution->submission, i);
     }
-    if (execution->bundle->input->frameContext)
-        execution->bundle->input->frameContext->MarkSubmitted(std::move(completion));
     return execution;
 }
 
@@ -203,11 +198,7 @@ std::shared_ptr<const GraphExecutionTimeline> ExecutionTimelineAdmission::Record
         throw std::invalid_argument("Recorded packet count mismatch");
     std::vector<std::shared_ptr<const void>> leases(packets.begin(), packets.end());
     auto execution = Prepare(std::move(bundle), incomingWaits, std::move(leases), packets, signals);
-    CompletionSet completion;
-    for (const auto& batch : execution->batches) completion.Include(batch.signal);
     for (uint32_t i = 0; i < packets.size(); ++i) CommitBatch(execution->submission, i);
-    if (execution->bundle->input->frameContext)
-        execution->bundle->input->frameContext->MarkSubmitted(std::move(completion));
     return execution;
 }
 
@@ -227,7 +218,6 @@ void ExecutionTimelineAdmission::Fail(uint64_t submission, SubmissionReceipt rec
     if (m_failed || !m_pending || submission != m_pending->submission || receipt)
         throw std::logic_error("Unknown failed execution");
     m_failed = true;
-    if (const auto& frame = m_pending->bundle->input->frameContext) frame->EnterRecovery();
     m_failure = FailedExecutionBatch{submission, m_nextBatch, receipt};
     basic_telemetry::AddCounter(receipt.state == SubmissionState::SubmittedWithoutSignal
         ? "ORG.Execution.SubmittedWithoutSignal"
@@ -235,32 +225,6 @@ void ExecutionTimelineAdmission::Fail(uint64_t submission, SubmissionReceipt rec
             ? "ORG.Execution.SubmissionUncertain" : "ORG.Execution.FailedBeforeSubmit");
     // Retain the pending bundle: it may own partially submitted GPU work. Only
     // recovery/retirement can release the admission owner after GPU completion.
-}
-
-void ExecutionTimelineAdmission::ExtendSubmittedFrame(
-    const std::shared_ptr<FrameContext>& frame, ExecutionTimelinePoint completion) {
-    if (!frame)
-        throw std::invalid_argument("Invalid submitted-frame completion extension");
-    auto found = std::ranges::find_if(m_retained, [&](const auto& execution) {
-        return execution && execution->bundle && execution->bundle->input
-            && execution->bundle->input->frameContext == frame;
-    });
-    if (found == m_retained.end())
-        throw std::logic_error("Submitted frame is no longer retained");
-    ExtendSubmittedFrame((*found)->bundle->sequence, completion);
-}
-
-void ExecutionTimelineAdmission::ExtendSubmittedFrame(
-    uint64_t frameSequence, ExecutionTimelinePoint completion) {
-    if (!frameSequence || !completion.timeline || !completion.value)
-        throw std::invalid_argument("Invalid submitted-frame completion extension");
-    auto found = std::ranges::find_if(m_retained, [&](const auto& execution) {
-        return execution && execution->bundle
-            && execution->bundle->sequence == frameSequence;
-    });
-    if (found == m_retained.end())
-        throw std::logic_error("Submitted frame is no longer retained");
-    ExtendSubmittedExecution((*found)->submission, completion);
 }
 
 void ExecutionTimelineAdmission::ExtendSubmittedExecution(
@@ -283,8 +247,6 @@ void ExecutionTimelineAdmission::ExtendSubmittedExecution(
     submitted->value = completion.value;
     reserved->value = completion.value;
     (*found)->tailCompletions.push_back(completion);
-    if (const auto& frame = (*found)->bundle->input->frameContext)
-        frame->IncludeSubmittedCompletion(completion);
 }
 
 size_t ExecutionTimelineAdmission::RetireCompleted(std::span<const ExecutionTimelinePoint> completed) {
@@ -311,11 +273,8 @@ size_t ExecutionTimelineAdmission::RetireCompleted(std::span<const ExecutionTime
         }
         if (!complete) { ++iterator; continue; }
         BT_ZONE_SCOPE("ORG.Frame.Retire");
-        AnnotateFrameTrace(execution->bundle->input->frameContext);
         for (const auto& packet : execution->preparedBatches)
             if (packet) packet->Complete(execution->submission);
-        if (const auto& frame = execution->bundle->input->frameContext)
-            if (!frame->Retire(completed)) throw std::logic_error("Frame completion disagrees with admission");
         TraceBindingHolderFromOwner(execution->bundle->input->executionPayload.get(), execution, "RetiredExecution");
         m_retiredGarbage.push_back(std::move(*iterator));
         iterator = m_retained.erase(iterator);

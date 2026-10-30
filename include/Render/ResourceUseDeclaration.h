@@ -61,7 +61,6 @@ struct ResourceUseDeclaration {
     ResourceBindingToken binding;
     std::vector<BindlessViewRequest> requiredViews;
     std::shared_ptr<const void> resolverIdentity;
-    uint32_t memberOrdinal = 0;
 };
 
 // One immutable layout per pass declaration. Tokens retain identity, never live descriptors.

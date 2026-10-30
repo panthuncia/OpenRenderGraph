@@ -1,7 +1,6 @@
 #include "Render/RenderGraph/ExperimentalGraphCompiler.h"
 #include "Render/BindingTable.h"
 #include "Render/RenderGraph/ExperimentalExecutionState.h"
-#include "Render/RenderGraph/RenderGraphCompileProfile.h"
 #include <BasicTelemetry/Telemetry.h>
 #include <algorithm>
 #include <barrier>
@@ -99,22 +98,6 @@ void DiagnosticPassAttribution() {
 
 int main() {
     DiagnosticPassAttribution();
-    // Export after all step objects and their dynamically supplied names have
-    // died. Telemetry retains callsites, so stack-local definitions are unsafe.
-    {
-        basic_telemetry::Session session({.mode = basic_telemetry::CaptureMode::Trace});
-        for (unsigned i = 0; i < 32; ++i) {
-            std::string name = "compile-step-lifetime-" + std::to_string(i);
-            org::profile::ScopedCompileProfileStep step(name.c_str());
-        }
-        const auto snapshot = session.Snapshot();
-        CHECK(snapshot.events.size() == 32);
-        for (unsigned i = 0; i < 32; ++i) {
-            const auto name = "compile-step-lifetime-" + std::to_string(i);
-            CHECK(std::ranges::any_of(snapshot.scopeDefinitions,
-                [&](const auto& definition) { return definition.name == name; }));
-        }
-    }
     // Cross-frame hazards are derived from concrete backing/subresource access
     // and actual submitted signals, never from compile-request order.
     {
@@ -471,43 +454,11 @@ int main() {
         CHECK(submission.RetireCompleted(std::vector<ExecutionTimelinePoint>{{10,2},{20,1}}) == 1);
         submission.TakeRetiredGarbage().clear();
         CHECK(packetLease.expired());
-        org::FrameSlotPool tailSlots(1);
-        auto tailFrame = std::make_shared<org::FrameContext>(2, 1, tailSlots.TryAcquire(0));
-        for (auto stage : {org::FrameStage::Preparing,
-            org::FrameStage::Compiling, org::FrameStage::Planned, org::FrameStage::Recording})
-            tailFrame->Advance(stage, static_cast<org::FrameStage>(static_cast<unsigned>(stage) + 1));
-        auto tailInput = std::make_shared<GraphCompileInput>(*bundle->input);
-        tailInput->frameContext = tailFrame;
-        auto tailGraph = workspace.Compile(tailInput, cancelled);
-        auto tailBundle = std::make_shared<CompiledGraphBundle>(CompiledGraphBundle{
-            bundle->sequence, std::move(tailGraph), tailInput});
-        std::vector<std::shared_ptr<const IPreparedExecutionBatch>> tailPackets;
-        for (int i = 0; i < 3; ++i) {
-            auto packet = std::make_shared<Packet>(); packet->queueSlot = i == 1 ? 1 : 0;
-            tailPackets.push_back(packet);
-        }
-        ExecutionTimelineAdmission presentation({{10,0},{20,0}});
-        presentation.SubmitPrepared(tailBundle,
-            std::vector<std::vector<ExecutionTimelinePoint>>(3), tailPackets);
-        presentation.ExtendSubmittedFrame(tailFrame, {10,3});
-        CHECK(tailFrame->CompletionPoints() ==
-            (std::vector<ExecutionTimelinePoint>{{10,3},{20,1}}));
-        CHECK(presentation.RetireCompleted(
-            std::vector<ExecutionTimelinePoint>{{10,2},{20,1}}) == 0);
-        CHECK(presentation.RetireCompleted(
-            std::vector<ExecutionTimelinePoint>{{10,3},{20,1}}) == 1);
-        CHECK(tailFrame->Stage() == org::FrameStage::Retired);
         auto firstPacket = std::make_shared<Packet>();
         auto failedPacket = std::make_shared<Packet>(); failedPacket->succeeds = false;
         failedPacket->queueSlot = 1;
         auto lastPacket = std::make_shared<Packet>();
-        org::FrameSlotPool failureSlots(1);
-        auto failureFrame = std::make_shared<org::FrameContext>(1, 1, failureSlots.TryAcquire(0));
-        for (auto stage : {org::FrameStage::Preparing, org::FrameStage::Compiling,
-            org::FrameStage::Planned, org::FrameStage::Recording})
-            failureFrame->Advance(stage, static_cast<org::FrameStage>(static_cast<unsigned>(stage) + 1));
         auto failureInput = std::make_shared<GraphCompileInput>(*bundle->input);
-        failureInput->frameContext = failureFrame;
         auto failureGraph = workspace.Compile(failureInput, cancelled);
         auto failureBundle = std::make_shared<CompiledGraphBundle>(CompiledGraphBundle{
             bundle->sequence, std::move(failureGraph), failureInput});
@@ -518,10 +469,7 @@ int main() {
         CHECK(submission.Failure()->receipt.state == SubmissionState::SubmittedWithoutSignal);
         CHECK(firstPacket->calls == 1 && failedPacket->calls == 1 && lastPacket->calls == 0);
         CHECK(submission.Submitted()[0].value == 3 && submission.Submitted()[1].value == 1);
-        CHECK(failureFrame->Stage() == org::FrameStage::Recovery);
-        CHECK(rejects([&] { failureFrame->CancelAfterJoin(); }));
-        failureFrame.reset(); failureInput.reset(); failureBundle.reset();
-        CHECK(!failureSlots.TryAcquire(0));
+        failureInput.reset(); failureBundle.reset();
     }
     cancelled = true;
     CHECK(!workspace.Compile(std::make_shared<const GraphCompileInput>(Input()), cancelled));

@@ -1,5 +1,4 @@
 #include "FrameRecording.h"
-#include "FrameTrace.h"
 
 namespace org::experimental {
 
@@ -9,17 +8,13 @@ RecordedFrame RecordFrame(PlannedFrame plan,
     if (!plan.snapshot || !plan.snapshot->layout || !plan.snapshot->layout->bundle
         || plan.jobs.empty() || !concurrency)
         throw std::invalid_argument("Incomplete planned frame");
-    const auto& frame = plan.snapshot->layout->bundle->input->frameContext;
-    AnnotateFrameTrace(frame);
     RecordedFrame result;
     result.m_snapshot = plan.snapshot;
     result.m_incomingWaits = std::move(plan.incomingWaits);
     result.m_batches.resize(plan.jobs.size());
-    if (frame) frame->Advance(FrameStage::Planned, FrameStage::Recording);
     try {
         auto record = [&](size_t batch) {
             BT_ZONE_SCOPE("ORG.Frame.RecordBatch");
-            AnnotateFrameTrace(frame);
             auto& job = plan.jobs[batch];
             auto& recording = job.recording;
             const auto& timelines = job.timelines.empty() ? plan.timelines : job.timelines;
@@ -40,9 +35,7 @@ RecordedFrame RecordFrame(PlannedFrame plan,
             tasks->ParallelForLimited("ORG.Frame.RecordBatches", plan.jobs.size(), concurrency, record);
         else
             for (size_t batch = 0; batch < plan.jobs.size(); ++batch) record(batch);
-        if (frame) frame->Advance(FrameStage::Recording, FrameStage::Ready);
     } catch (...) {
-        if (frame) frame->CancelAfterJoin();
         basic_telemetry::AddCounter("ORG.Frame.RecordingFailures");
         throw;
     }
@@ -65,7 +58,6 @@ std::shared_ptr<const GraphExecutionTimeline> RecordedFrame::Submit(ExecutionTim
         throw std::logic_error("Recorded frame already consumed or incomplete");
     // Set before touching the API: even an uncertain submission is single-use.
     m_submitted = true;
-    AnnotateFrameTrace(m_snapshot->layout->bundle->input->frameContext);
     return admission.SubmitPrepared(m_snapshot->layout->bundle, m_incomingWaits, m_batches, {});
 }
 

@@ -15,9 +15,9 @@ empty work. Every epoch therefore paid for every pass.
     (`persistent::AllEpochs`, the default) belong to every epoch. A graph with no tags behaves exactly as it did
     before.
 -   **Order.** The host names the order of its epochs within one frame once, with
-    `RenderGraph::SetPersistentEpochOrder` (or `PersistentGraphHost::Desc::epochOrder`). Epochs not listed
+    `RenderGraph::SetPersistentEpochOrder` (or `GraphHost::Desc::epochOrder`). Epochs not listed
     follow the listed ones, in ascending order. The order is structural.
--   **Execution.** `PersistentGraphHost::ExecuteFrame(hostData, beforePrepare, epoch)`, or
+-   **Execution.** `GraphHost::ExecuteFrame(hostData, beforePrepare, epoch)`, or
     `RenderGraph::SetPersistentEpoch` before `Update`/`Execute`, runs one epoch.
 -   **What an epoch runs.** Only that epoch's passes and the untagged ones are updated, prepared, admitted,
     recorded and submitted. The dynamic Pre and Tail segments (the upload pass, per-frame passes) run in every
@@ -72,7 +72,7 @@ one program, one set of bindings and one alias plan, and needs only a compile-ti
 
 ## Closed executions
 
-With `PersistentGraphHost::Desc::closedExecutions` (`RenderGraph::SetPersistentClosedExecutions`), every
+With `GraphHost::Desc::closedExecutions` (`RenderGraph::SetPersistentClosedExecutions`), every
 execution of an epoch is **closed**: it starts from, and returns to, a fixed home state for everything it
 touches.
 
@@ -91,7 +91,7 @@ A program that is not closed keeps the ordered, ledger-chained admission describ
 
 ## Async epochs: tickets
 
-`PersistentGraphHost::SetAsyncEpochs(epochs)` requires closed executions. It moves everything except submission
+`GraphHost::SetAsyncEpochs(epochs)` requires closed executions. It moves everything except submission
 onto a host thread of ORG's own. The render thread then calls `SubmitEpoch(epoch, beforeSubmit)` at each point
 instead of `ExecuteFrame`. `ExecuteFrame` throws while async epochs are on.
 
@@ -138,7 +138,7 @@ instead of `ExecuteFrame`. `ExecuteFrame` throws while async epochs are on.
     two must not overlap (`BackedResource`: capture and backing mutation are serialized by the preparation
     owner). `Buffer::ResizeBytes` and `ResizeStructured` release the old backing before creating the new one; a
     capture between the two binds nothing, or materializes the buffer from the host thread. So the render
-    thread changes a backing only inside `PersistentGraphHost::MutateBackings()`:
+    thread changes a backing only inside `GraphHost::MutateBackings()`:
     -   the scope waits for a preparation in progress to end (never for the slot's GPU wait, which comes
         before it) and holds the next one off until it closes;
     -   it advances the host's backing version: a ticket prepared under an older one is stale at submission,
@@ -151,7 +151,7 @@ instead of `ExecuteFrame`. `ExecuteFrame` throws while async epochs are on.
 
 ## Recording reuse
 
-With `PersistentGraphHost::Desc::reuseRecordings` (`RenderGraph::SetPersistentRecordingReuse`), a ticket's recording is kept
+With `GraphHost::Desc::reuseRecordings` (`RenderGraph::SetPersistentRecordingReuse`), a ticket's recording is kept
 and submitted again while what it was recorded for holds, so an epoch is prepared and executed as it is and never prepared
 again.
 
@@ -177,7 +177,7 @@ again.
     therefore record no profiler GPU zones or ranges (Tracy), and no GPU statistics queries: the statistics service recreates
     its query pools and readback buffers as passes register, and a resubmitted list resolved into freed ones (a GPU page
     fault). Turn reuse off to profile an epoch's passes on the GPU with Tracy.
--   **Timestamps of their own.** With `PersistentGraphHost::SetRecordingTimestamps` (`RenderGraph::SetPersistentRecordingTimestamps`,
+-   **Timestamps of their own.** With `GraphHost::SetRecordingTimestamps` (`RenderGraph::SetPersistentRecordingTimestamps`,
     off by default; a change rebuilds the graph so every kept list is recorded again) a kept list owns its queries
     (`IStatisticsService::CreateOwnedTimestamps`: a query pool and readback buffer per list, released with it through deferred
     deletion). The list resets them, writes a begin/end pair around each pass and each barrier batch (named
@@ -267,7 +267,7 @@ thing holding it does: a revision, a recording's bindings, a frame in flight.
 -   **Declared as a resolver.** Passes declare the `VersionedBuffer` itself. A preparation resolves the version its host data
     names (`IResourceVersions::Find`), else the current one. Each version has its own declaration state, made once.
 -   **The live path.** An epoch that is not revision-driven resolves the current version, and a growth is followed by
-    `PersistentGraphHost::NoteNewVersions`: a ticket prepared before resolved the old version, so it is no longer current
+    `GraphHost::NoteNewVersions`: a ticket prepared before resolved the old version, so it is no longer current
     (it is prepared again, or takes a kept recording). Nothing waits, unlike `MutateBackings`, because nothing changed in
     place.
 -   **Thread contract.** `Publish` and `Grow*` on the owner's thread; `Current`, `Get` and the resolver from any thread (the
@@ -277,7 +277,7 @@ thing holding it does: a revision, a recording's bindings, a frame in flight.
 
 ## External epochs
 
-`PersistentGraphHost::SetExternalEpochs(epochs)` (`RenderGraph::SetExternalPersistentEpochs`) marks async epochs the host
+`GraphHost::SetExternalEpochs(epochs)` (`RenderGraph::SetExternalPersistentEpochs`) marks async epochs the host
 executes itself, in a command buffer of its own: CS's DCLF CPU pipeline runs them inside DXVK's command buffer (an
 external-commands callback), so ORG records the passes and their barriers and DXVK's list is never split for them.
 

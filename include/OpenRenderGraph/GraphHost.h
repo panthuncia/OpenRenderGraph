@@ -38,7 +38,7 @@ struct IHostExecutionData;
 //   - an orderly shutdown that waits only for the graph's own work.
 // Not thread-safe: all calls come from the host's render thread. With async epochs (SetAsyncEpochs) the host
 // runs one thread of its own that owns the graph from then on; the render thread only submits.
-class PersistentGraphHost {
+class GraphHost {
 public:
 	struct Desc {
 		rhi::Device device;
@@ -73,10 +73,23 @@ public:
 
 	using ExtensionFactory = std::function<std::unique_ptr<RenderGraph::IRenderGraphExtension>()>;
 
-	explicit PersistentGraphHost(Desc desc);
-	~PersistentGraphHost();
-	PersistentGraphHost(const PersistentGraphHost&) = delete;
-	PersistentGraphHost& operator=(const PersistentGraphHost&) = delete;
+	explicit GraphHost(Desc desc);
+
+	// Declared graphs: a renderer that declares a graph itself (its passes, resources, providers and extensions) and keeps its
+	// own frame slots, uploads and readbacks (BasicRenderer) drives it through these. A host instance's own graph is driven
+	// by its frames instead.
+	//
+	// Rebuilds `graph` for a new structure: drops the previous one (every device idle), lets `declare` add passes,
+	// resources and providers, then runs the structural build and Setup.
+	static void Build(RenderGraph& graph, const std::function<void(RenderGraph&)>& declare);
+	// One frame: PrepareFrame (Update, on the preparation owner) and then ExecuteFrame (records and submits).
+	static void PrepareFrame(RenderGraph& graph, const UpdateExecutionContext& context, rhi::Device device) { graph.Update(context, device); }
+	static void ExecuteFrame(RenderGraph& graph, PassExecutionContext& context) { graph.Execute(context); }
+	// The presentation tail the frame left pending was submitted (its swapchain present).
+	static void ConfirmPresentation(RenderGraph& graph) { graph.ConfirmPresentationTailSubmission(); }
+	~GraphHost();
+	GraphHost(const GraphHost&) = delete;
+	GraphHost& operator=(const GraphHost&) = delete;
 
 	// Extensions are instantiated from their factories each time the graph is
 	// (re)built, so they may size resources from current host state.
@@ -257,7 +270,7 @@ public:
 	// a ticket does not reserve a future graph rebuild or make arbitrary
 	// beforeSubmit mutations compatible.
 	class FrameTicketReservation {
-		friend class PersistentGraphHost;
+		friend class GraphHost;
 	public:
 		FrameTicketReservation() = default;
 		~FrameTicketReservation() { Clear(); }
@@ -325,9 +338,9 @@ public:
 		~BackingMutation();
 
 	private:
-		friend class PersistentGraphHost;
-		explicit BackingMutation(PersistentGraphHost* host);
-		PersistentGraphHost* m_host = nullptr;
+		friend class GraphHost;
+		explicit BackingMutation(GraphHost* host);
+		GraphHost* m_host = nullptr;
 	};
 	[[nodiscard]] BackingMutation MutateBackings();
 	// Submitting thread: a versioned buffer (VersionedBuffer) published a new version. Nothing changed in place, so nothing waits;

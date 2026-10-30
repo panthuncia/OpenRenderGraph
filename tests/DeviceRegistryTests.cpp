@@ -1,5 +1,4 @@
 #include <Render/DeviceRegistry.h>
-#include <Render/RenderGraph/SharedAliasPoolManager.h>
 
 #include <cassert>
 #include <stdexcept>
@@ -33,14 +32,5 @@ int main() {
 	}
 	assert(rejectedInvalid);
 
-	org::SharedAliasPoolManager pools;
-	assert(pools.Find(17) == nullptr);
-	std::vector<rhi::HeapPtr> retired;
-	org::DeviceRegistryEntry d3dEntry{ primaryId, rhi::Backend::D3D12, primary };
-	org::DeviceRegistryEntry vkEntry{ secondId, rhi::Backend::Vulkan, second };
-	assert(pools.EnsureD3D12VulkanPool(17, 1, 65536, 65536, 0, d3dEntry, vkEntry, retired)
-		== rhi::Result::InvalidArgument);
-	assert(pools.Find(17) == nullptr);
-	pools.Clear();
 	return 0;
 }

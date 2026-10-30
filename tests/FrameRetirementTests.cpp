@@ -1,3 +1,4 @@
+#include "OpenRenderGraph/GraphHost.h"
 #include "Managers/Singletons/DescriptorHeapManager.h"
 #include <Render/RenderGraph/RenderGraph.h>
 #include <Render/PassExecutionContext.h>
@@ -65,8 +66,8 @@ int TestFrameRetirement(rhi::Device device, rhi::Backend backend) {
         org::UpdateExecutionContext update{};
         org::PassExecutionContext execute{};
         bool rejectedUpdate = false, rejectedExecute = false;
-        try { graph.Update(update, device); } catch (const std::logic_error&) { rejectedUpdate = true; }
-        try { graph.Execute(execute); } catch (const std::logic_error&) { rejectedExecute = true; }
+        try { org::GraphHost::PrepareFrame(graph, update, device); } catch (const std::logic_error&) { rejectedUpdate = true; }
+        try { org::GraphHost::ExecuteFrame(graph, execute); } catch (const std::logic_error&) { rejectedExecute = true; }
         CHECK(rejectedUpdate && rejectedExecute);
 
         auto& retirement = org::DescriptorHeapManager::GetInstance();

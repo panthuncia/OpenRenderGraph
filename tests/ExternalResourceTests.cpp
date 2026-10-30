@@ -336,84 +336,6 @@ struct DeclarationTestPass final : org::ComputePass {
 	void Setup() override {}
 	void Cleanup() override {}
 };
-struct RefreshTestPass final : org::ComputePass {
-	std::shared_ptr<EmptyResolver> resolver;
-	std::shared_ptr<EmptyResolver> secondResolver;
-	bool symbolic;
-	int declarations = 0, setups = 0;
-	RefreshTestPass(std::shared_ptr<EmptyResolver> r, bool s, std::shared_ptr<EmptyResolver> second = {})
-		: resolver(std::move(r)), secondResolver(std::move(second)), symbolic(s) {}
-	void Setup() override { ++setups; }
-	void Cleanup() override {}
-	org::ResourceRegistryView* View() const { return m_resourceRegistryView.get(); }
-	void DeclareResourceUsages(org::ComputePassBuilder* builder) override {
-		++declarations;
-		if (symbolic) builder->ShaderResource(org::ResourceIdentifier("test.empty-resolver"));
-		else builder->ShaderResource(*resolver);
-		if (secondResolver) builder->ShaderResource(*secondResolver);
-	}
-};
-
-int TestEmptyResolverRefresh(rhi::Device device, const std::shared_ptr<org::Resource>& resource) {
-	org::RenderGraph graph(device, rhi::Backend::D3D12);
-	auto resolver = std::make_shared<EmptyResolver>();
-	graph.RegisterResolver(org::ResourceIdentifier("test.empty-resolver"), resolver);
-	graph.BuildComputePass<RefreshTestPass>("Direct", resolver, false);
-	graph.BuildComputePass<RefreshTestPass>("Symbolic", resolver, true);
-	graph.CompileStructural();
-	graph.Setup();
-	auto direct = std::dynamic_pointer_cast<RefreshTestPass>(graph.GetComputePassByName("Direct"));
-	auto symbolic = std::dynamic_pointer_cast<RefreshTestPass>(graph.GetComputePassByName("Symbolic"));
-	CHECK(direct && symbolic && direct->declarations == 1 && symbolic->declarations == 1);
-	auto* directView = direct->View();
-	auto* symbolicView = symbolic->View();
-	const auto setupCount = direct->setups;
-	for (unsigned step = 0; step != 3; ++step) {
-		resolver->identity->resources = std::make_shared<const org::ResolverResourceList>(
-			step == 1 ? org::ResolverResourceList{} : org::ResolverResourceList{resource});
-		++resolver->identity->setRevision;
-		org::UpdateExecutionContext context{};
-		context.frameIndex = step % 2;
-		context.frameFenceValue = step + 1;
-		graph.Update(context, device);
-		CHECK(direct->declarations == 1 && symbolic->declarations == 1);
-		CHECK(direct->setups == setupCount + step + 1);
-		CHECK(direct->View() == directView && symbolic->View() == symbolicView);
-		const org::ResourceIdentifier numericID(std::to_string(resource->GetGlobalResourceID()));
-		if (step != 1) {
-			CHECK(directView->RequestHandle(numericID).GetGlobalResourceID() == resource->GetGlobalResourceID());
-			CHECK(symbolicView->RequestHandle(numericID).GetGlobalResourceID() == resource->GetGlobalResourceID());
-		} else {
-			bool denied = false;
-			try { directView->RequestHandle(numericID); } catch (const std::runtime_error&) { denied = true; }
-			CHECK(denied);
-		}
-	}
-	++resolver->identity->contentRevision;
-	graph.Update(org::UpdateExecutionContext{}, device);
-	CHECK(direct->declarations == 1 && direct->setups == setupCount + 3);
-	return 0;
-}
-
-int TestMixedResolverCollision(rhi::Device device, const std::shared_ptr<org::Resource>& resource) {
-	org::RenderGraph graph(device, rhi::Backend::D3D12);
-	auto initiallyEmpty = std::make_shared<EmptyResolver>();
-	auto populated = std::make_shared<EmptyResolver>();
-	populated->identity->resources = std::make_shared<const org::ResolverResourceList>(org::ResolverResourceList{resource});
-	graph.BuildComputePass<RefreshTestPass>("Mixed", initiallyEmpty, false, populated);
-	graph.CompileStructural();
-	graph.Setup();
-	auto pass = std::dynamic_pointer_cast<RefreshTestPass>(graph.GetComputePassByName("Mixed"));
-	CHECK(pass && pass->declarations == 1);
-	initiallyEmpty->identity->resources = populated->identity->resources;
-	++initiallyEmpty->identity->setRevision;
-	graph.Update(org::UpdateExecutionContext{}, device);
-	// A new set overlapping an unchanged resolver must use the full merge path,
-	// not silently duplicate accesses after discarding unchanged membership IDs.
-	CHECK(pass->declarations == 2);
-	return 0;
-}
-
 int TestEmptyResolverDeclarations(rhi::Device device) {
 	org::RenderGraph graph(device, rhi::Backend::D3D12);
 	auto resolver = std::make_shared<EmptyResolver>();
@@ -428,8 +350,8 @@ int TestEmptyResolverDeclarations(rhi::Device device) {
 	CHECK(directStates.size() == 1 && symbolicStates.size() == 1);
 	const auto& a = directStates.front();
 	const auto& b = symbolicStates.front();
-	CHECK(a.resourceIDs.empty() && b.resourceIDs.empty());
-	CHECK(a.dependencyIdentity == b.dependencyIdentity);
+	CHECK(a.state && a.state->resources->empty() && b.state && b.state->resources->empty());
+	CHECK(a.DependencyIdentity() == b.DependencyIdentity());
 	CHECK(a.resolver.get() != resolver.get());
 	CHECK(!a.hasUnclassifiedDeclaration && !b.hasUnclassifiedDeclaration);
 	CHECK(a.declaredRequirementTemplates.size() == 1 && b.declaredRequirementTemplates.size() == 1);
@@ -444,6 +366,49 @@ int TestEmptyResolverDeclarations(rhi::Device device) {
 	auto multiStates = multiple.TakeResolverSnapshots();
 	CHECK(multiStates.size() == 1);
 	CHECK(multiStates[0].declaredRequirementTemplates.size() == 2);
+	return 0;
+}
+
+// A resolver that publishes a new resource set between any two captures (another thread's publication, made
+// deterministic).
+struct RacingResolver final : org::ClonableResolver<RacingResolver> {
+	struct State {
+		std::vector<std::shared_ptr<org::Resource>> pool;
+		mutable uint64_t captures = 0;
+	};
+	std::shared_ptr<State> identity = std::make_shared<State>();
+	std::vector<std::shared_ptr<org::Resource>> Resolve() const override { return *CaptureDeclarationState()->resources; }
+	std::shared_ptr<const org::ResolverDeclarationState> CaptureDeclarationState() const override {
+		// Capture n holds the first n + 1 resources of the pool (capped).
+		const auto count = (std::min<size_t>)(identity->pool.size(), ++identity->captures);
+		auto state = std::make_shared<org::ResolverDeclarationState>();
+		state->tracked = true;
+		state->dependencyIdentity = identity;
+		state->resourceSetIdentity = {count, 0};
+		state->resources = std::make_shared<const org::ResolverResourceList>(identity->pool.begin(), identity->pool.begin() + count);
+		return state;
+	}
+};
+// Every capture one declaration takes of a resolver (each use, the snapshot) describes one resource set.
+int TestDeclarationCapturesOneSet(rhi::Device device) {
+	org::RenderGraph graph(device, rhi::Backend::D3D12);
+	auto resolver = std::make_shared<RacingResolver>();
+	for (int i = 0; i < 4; ++i)
+		resolver->identity->pool.push_back(org::Buffer::CreateSharedUnmaterialized(rhi::HeapType::DeviceLocal, 256, true));
+	auto& pass = graph.BuildComputePass<DeclarationTestPass>("Racing");
+	{
+		const org::RenderGraph::ResolverCaptureScope captures;
+		pass.ShaderResource(*resolver);
+		pass.UnorderedAccess(*resolver);
+	}
+	const auto inScope = resolver->identity->captures;
+	auto snapshots = pass.TakeResolverSnapshots();
+	CHECK(snapshots.size() == 1 && snapshots[0].state);
+	// The scope's first capture held one member; later captures in the scope returned it again.
+	CHECK(snapshots[0].state->resources->size() == 1);
+	CHECK(inScope > 1);
+	// Outside a scope, every capture is fresh.
+	CHECK(graph.CaptureResolverDeclarationState(*resolver)->resources->size() == (std::min<size_t>)(4, inScope + 1));
 	return 0;
 }
 
@@ -1442,6 +1407,7 @@ int main(int argc, char** argv) {
     }
 	if (const auto failure = TestPreparedGpuSubmission(device.Get(), nativeDevice)) return failure;
 	if (const auto failure = TestEmptyResolverDeclarations(device.Get())) return failure;
+	if (const auto failure = TestDeclarationCapturesOneSet(device.Get())) return failure;
 
 	auto bufferA = MakeResource(nativeDevice, false, 4096), bufferB = MakeResource(nativeDevice, false, 4096);
     {
@@ -1492,8 +1458,6 @@ int main(int argc, char** argv) {
 		CHECK(registry.MakeHandle(bufferID).GetGeneration() == 0);
 	}
 	if (const auto failure = TestUnifiedDeclarations(device.Get(), buffer)) return failure;
-	if (const auto failure = TestEmptyResolverRefresh(device.Get(), buffer)) return failure;
-	if (const auto failure = TestMixedResolverCollision(device.Get(), buffer)) return failure;
 
 	org::TextureDescription description{}; description.imageDimensions = { { 64, 64 } };
 	description.channels = 4; description.format = rhi::Format::R8G8B8A8_UNorm; description.hasSRV = true;

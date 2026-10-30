@@ -200,6 +200,22 @@ Target size: about 40–45k lines.
 - **Tests:** one test framework; register `HeadlessGraphBenchmark`.
 - **Docs:** rewrite the README and docs around `GraphHost`, and replace `extern/OpenRenderGraph/docs/rebuild-plan.md` with this plan once it's approved.
 
+### Phase 8: per-pass resource readback capture
+
+Phase 5 deleted the old `RGInspector` (`DebugUI/RenderGraphInspector`), which read the old compiler's `PassBatch` list. With it went per-pass resource readback capture: pick a pass in the inspector, pick a resource it touches, and see that resource's contents as they were right after the pass. Bring this forward onto the persistent schedule.
+
+What still exists:
+- `IReadbackService::RequestReadbackCapture(passName, resource, range, callback)`, `ReadbackCapturePass` and `ReadbackCaptureTests`.
+- Persistent hosting of frame-interrupting passes (`UpdatePersistentFrameInterruptingPasses`): an inserted pass observes resources at its insert point.
+- `ScheduleInspector` and its `PersistentScheduleSnapshot`, used by both CS and BR.
+
+Work:
+1. **Capture on the persistent route.** A capture requested for a pass inserts a `ReadbackCapturePass` right after that pass for one frame, through the frame-interrupting path. The insert must not force a structural rebuild of the main executable, and the capture must see the pass's output state. Cover textures (any mip or slice) and buffers, and resources a resolver group provides as well as direct ones.
+2. **Inspector UI.** `ScheduleInspector` lists, for the selected pass, the resources it declares, with access, state and range from the snapshot. It offers a capture action through an optional host callback, so the inspector itself stays free of service dependencies.
+3. **Viewer.** Port the old inspector's preview: textures shown through the host's ImGui descriptor allocator (the callbacks `RGInspectorOptions` took), with mip and slice selection and basic channel and range controls. Buffers shown as a hex and typed-value dump.
+4. **Consumers.** BR wires the callback to its readback service in the RG Inspector window. CS wires it in its schedule window, if CS's readback path supports it; otherwise it states in the UI that capture is unavailable.
+5. **Tests.** Extend `ReadbackCaptureTests` with a persistent graph: capture after a mid-frame pass that writes a known pattern, and check the bytes and that the main executable was not rebuilt.
+
 ## Verification (every phase)
 
 - **ORG:**
@@ -213,3 +229,4 @@ Target size: about 40–45k lines.
   - **Then always run `scripts\sarp_mo2_preprocess.cmd` first** (long, in the background), followed by `scripts\sarp_mo2_scene_benchmark.cmd`. `GetBenchmarkSnapshot` counts must match the baseline exactly; frame time must be within noise; barrier count and VRAM must be no worse.
   - Run on DX12 and Vulkan from Phase 3, and on multi-RHI with `SARPInteropValidation` under GPU-based validation from Phase 4.
 - **Phase 6:** a sample contributor DLL draws through CS's host in-game, and unregistering it mid-run retires it cleanly.
+- **Phase 8:** in BR (and CS if supported), capturing a texture and a buffer after a mid-frame pass in-game shows the expected contents, with no structural rebuild logged.

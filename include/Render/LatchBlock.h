@@ -19,7 +19,7 @@ class Buffer;
 //
 // Contract:
 //  - The host writes slot s only while no submitted work that reads slot s is incomplete. With a
-//    PersistentGraphHost that holds from the slot wait of the execution using s (inside ExecuteFrame, so
+//    GraphHost that holds from the slot wait of the execution using s (inside ExecuteFrame, so
 //    from beforePrepare on) until that execution is submitted; its slot is CurrentFrameSlot().
 //  - Readers see host writes made before the submission (host-coherent memory; queue submission makes
 //    them available). Nothing about the block goes through the graph's state tracking: it is not a graph

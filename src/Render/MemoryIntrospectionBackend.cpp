@@ -11,6 +11,14 @@ namespace org::memory {
 
 namespace {
 class ECSMemorySnapshotProvider final : public IMemorySnapshotProvider {
+    // Defined before the constructor that calls it: a deduced return type is only known after its definition.
+    template <class F>
+    static decltype(auto) WithWorld(flecs::world* a_world, F&& a_use) {
+        if (a_world)
+            return std::forward<F>(a_use)(*a_world);
+        return ECSManager::GetInstance().Access(std::forward<F>(a_use));
+    }
+
 public:
     // a_world: a host's own world, which the host keeps from being changed while a snapshot reads it; null for ORG's
     // tracking world, which has one owner at a time (ECSManager): the query is built, and read, only while owning it.
@@ -110,13 +118,6 @@ public:
     }
 
 private:
-    template <class F>
-    static decltype(auto) WithWorld(flecs::world* a_world, F&& a_use) {
-        if (a_world)
-            return std::forward<F>(a_use)(*a_world);
-        return ECSManager::GetInstance().Access(std::forward<F>(a_use));
-    }
-
     flecs::world* m_hostWorld;  // null: ORG's tracking world
     flecs::query<const MemoryStatisticsComponents::MemSizeBytes> m_memoryQuery;
 };

@@ -12,7 +12,7 @@ class PreparedRhiExecutionBatch;
 namespace org {
 
 /**
- * @brief An external epoch's execution (RenderGraph::SetExternalPersistentEpochs; PersistentGraphHost::TakeExternalExecution):
+ * @brief An external epoch's execution (RenderGraph::SetExternalPersistentEpochs; GraphHost::TakeExternalExecution):
  * what its ticket's submission would have submitted, for the host to execute in a command buffer of its own (DXVK's, inside an
  * external-commands callback) and to submit with that buffer. In order:
  * - the lists recorded ahead of it (the uploads, a secondary);
@@ -20,7 +20,7 @@ namespace org {
  *
  * The host's submission of that buffer waits for `waits` and signals `signals`, among them the graph's own value for the
  * execution on its graphics timeline. The graph's later work on that timeline cannot complete until it does. A host that cannot
- * execute it signals it unexecuted (PersistentGraphHost::SignalExternalExecutionUnexecuted).
+ * execute it signals it unexecuted (GraphHost::SignalExternalExecutionUnexecuted).
  */
 class ExternalEpochExecution {
 public:

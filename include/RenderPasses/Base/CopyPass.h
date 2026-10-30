@@ -42,13 +42,13 @@ public:
         SetResourceRegistryView(std::move(view));
     }
 
-	virtual void Setup() = 0;
+	void Setup() override = 0;
     // Preparation owner only. Empty means explicit synchronous legacy fallback.
-    virtual PreparedPass PrepareFrame(FramePreparationContext&) { return {}; }
+    PreparedPass PrepareFrame(FramePreparationContext&) override { return {}; }
 
-	virtual void Update(const UpdateExecutionContext& /*context*/) {};
-	virtual PassReturn Execute(PassExecutionContext& /*context*/) { return {}; };
-	virtual void Cleanup() = 0;
+	void Update(const UpdateExecutionContext& /*context*/) override {};
+	PassReturn Execute(PassExecutionContext& /*context*/) override { return {}; };
+	void Cleanup() override = 0;
 
 	void Invalidate() override { invalidated = true; }
 	bool IsInvalidated() const override { return invalidated; }
@@ -57,8 +57,8 @@ protected:
 	bool invalidated = true;
 	virtual void DeclareResourceUsages(CopyPassBuilder* /*builder*/) {};
 
-	virtual std::shared_ptr<Resource> ProvideResource(ResourceIdentifier const& /*key*/) { return nullptr; }
-	virtual std::vector<ResourceIdentifier> GetSupportedKeys() { return {}; }
+	std::shared_ptr<Resource> ProvideResource(ResourceIdentifier const& /*key*/) override { return nullptr; }
+	std::vector<ResourceIdentifier> GetSupportedKeys() override { return {}; }
 
 	std::unique_ptr<ResourceDescriptorIndexHelper> m_resourceDescriptorIndexHelper;
 	std::shared_ptr<ResourceRegistryView> m_resourceRegistryView;

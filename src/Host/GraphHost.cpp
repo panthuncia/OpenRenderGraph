@@ -1,4 +1,4 @@
-#include "OpenRenderGraph/PersistentGraphHost.h"
+#include "OpenRenderGraph/GraphHost.h"
 
 #include <BasicTelemetry/Tracy.h>
 #include <algorithm>
@@ -51,7 +51,7 @@ private:
 
 // Defined before the constructor: a throwing constructor destroys m_async, and clang instantiates
 // ~unique_ptr<Async> there.
-struct PersistentGraphHost::Async {
+struct GraphHost::Async {
 	using Ticket = RenderGraph::PersistentTicket;
 	struct Message {
 		enum class Kind : uint8_t { Submitted, Discard, OwnedPrepare, Stop } kind = Kind::Stop;
@@ -76,14 +76,14 @@ struct PersistentGraphHost::Async {
 	struct RecordingRequest {
 		uint32_t epochIndex = 0;
 		std::shared_ptr<const IHostExecutionData> hostData;
-		PersistentGraphHost::EpochRecordingCallback done;
-		std::shared_ptr<PersistentGraphHost::EpochRecording> result;
+		GraphHost::EpochRecordingCallback done;
+		std::shared_ptr<GraphHost::EpochRecording> result;
 		std::vector<uint8_t> recorded;  // by ring position
 	};
 	std::deque<std::unique_ptr<RecordingRequest>> pendingRequests;  // host thread; StopAsync drops what is left
 	// Host thread, per epoch index: the revision recordings made (admitted by each ticket while their callers hold them), and the
 	// ticket prepared and not yet submitted or discarded, which a recording finished meanwhile is added to before its callback.
-	std::vector<std::vector<std::weak_ptr<const PersistentGraphHost::EpochRecording>>> liveRecordings;
+	std::vector<std::vector<std::weak_ptr<const GraphHost::EpochRecording>>> liveRecordings;
 	std::vector<std::shared_ptr<RenderGraph::PersistentTicket>> outstanding;
 	std::atomic<uint64_t> revisionSlotsRecorded{0}, revisionRecordings{0};
 	// One ticket cell per epoch: stored by the host's thread, taken by the render thread.
@@ -236,11 +236,11 @@ struct PersistentGraphHost::Async {
 
 // The host's recording requests (RequestEpochRecording): any thread pushes onto a Treiber stack, the host's thread takes it whole
 // and reverses it into posting order. It and the wake live as long as the host, so a request never meets a build's teardown.
-struct PersistentGraphHost::RecordingQueue {
+struct GraphHost::RecordingQueue {
 	struct Request {
 		uint32_t epoch = 0;
 		std::shared_ptr<const IHostExecutionData> hostData;
-		PersistentGraphHost::EpochRecordingCallback done;
+		GraphHost::EpochRecordingCallback done;
 		Request* next = nullptr;
 	};
 	std::atomic<Request*> head{nullptr};
@@ -268,16 +268,23 @@ struct PersistentGraphHost::RecordingQueue {
 	}
 };
 
-PersistentGraphHost::PersistentGraphHost(Desc desc) : m_desc(std::move(desc)), m_recordingQueue(std::make_unique<RecordingQueue>()) {
+void GraphHost::Build(RenderGraph& graph, const std::function<void(RenderGraph&)>& declare) {
+	graph.ResetForRebuild();
+	if (declare) declare(graph);
+	graph.CompileStructural();
+	graph.Setup();
+}
+
+GraphHost::GraphHost(Desc desc) : m_desc(std::move(desc)), m_recordingQueue(std::make_unique<RecordingQueue>()) {
 	m_queueScopedUploads.store(m_desc.queueScopedUploads, std::memory_order_relaxed);
-	if (!m_desc.device) throw std::invalid_argument("PersistentGraphHost requires a device");
-	if (m_desc.backend == rhi::Backend::Null) throw std::invalid_argument("PersistentGraphHost requires a device backend");
+	if (!m_desc.device) throw std::invalid_argument("GraphHost requires a device");
+	if (m_desc.backend == rhi::Backend::Null) throw std::invalid_argument("GraphHost requires a device backend");
 	if (!m_desc.tasks) m_desc.tasks = std::make_shared<runtime::ThreadPoolTaskService>();
 	// The frame slots: framesInFlight frames of every epoch in the order, so that adding an epoch keeps the CPU's lead over
 	// the GPU the same rather than shortening it (each slot's next execution waits for its last one).
 	const uint32_t epochs = (std::max)(static_cast<uint32_t>(m_desc.epochOrder.size()), 1u);
 	m_frameSlots = (std::max)(m_desc.framesInFlight, 1u) * epochs;
-	if (m_frameSlots > 255) throw std::invalid_argument("PersistentGraphHost: more than 255 frame slots (frames in flight times epochs)");
+	if (m_frameSlots > 255) throw std::invalid_argument("GraphHost: more than 255 frame slots (frames in flight times epochs)");
 	// The host's slot count is the runtime's frames-in-flight: upload pages, statistics query ranges, deletion
 	// and admission capacity all size themselves from the runtime settings, so they follow it.
 	{
@@ -289,7 +296,7 @@ PersistentGraphHost::PersistentGraphHost(Desc desc) : m_desc(std::move(desc)), m
 	m_slotCompletions.assign(m_frameSlots, {});
 }
 
-PersistentGraphHost::~PersistentGraphHost() {
+GraphHost::~GraphHost() {
 	// Nothing queued is completed from here on: its callers may be torn down before the host.
 	m_ending = true;
 	m_recordingQueue->accepting.store(false, std::memory_order_release);
@@ -300,30 +307,30 @@ PersistentGraphHost::~PersistentGraphHost() {
 	m_uncertainUploadOwners.clear();
 }
 
-void PersistentGraphHost::AddExtension(std::string id, ExtensionFactory factory) {
+void GraphHost::AddExtension(std::string id, ExtensionFactory factory) {
 	RemoveExtension(id);
 	m_extensions.push_back({std::move(id), std::move(factory)});
 	m_rebuildRequested = true;
 }
 
-void PersistentGraphHost::RemoveExtension(const std::string& id) {
+void GraphHost::RemoveExtension(const std::string& id) {
 	const auto erased = std::erase_if(m_extensions, [&](const Registered& entry) { return entry.id == id; });
 	if (erased) m_rebuildRequested = true;
 }
 
-runtime::IUploadService* PersistentGraphHost::Uploads() noexcept {
+runtime::IUploadService* GraphHost::Uploads() noexcept {
 	return m_graph ? m_graph->GetUploadService() : nullptr;
 }
 
-runtime::IDescriptorService* PersistentGraphHost::Descriptors() noexcept {
+runtime::IDescriptorService* GraphHost::Descriptors() noexcept {
 	return m_graph ? m_graph->GetDescriptorService() : nullptr;
 }
 
-std::shared_ptr<runtime::IUploadService> PersistentGraphHost::RetainUploads() noexcept {
+std::shared_ptr<runtime::IUploadService> GraphHost::RetainUploads() noexcept {
 	return m_graph ? m_graph->RetainUploadService() : nullptr;
 }
 
-void PersistentGraphHost::DestroyGraph() {
+void GraphHost::DestroyGraph() {
 	StopAsync();
 	if (!m_graph) return;
 	m_graph->StopFrameProduction();
@@ -337,13 +344,13 @@ void PersistentGraphHost::DestroyGraph() {
 	m_graph.reset();
 }
 
-void PersistentGraphHost::SetGpuPassRangeCallbacks(RenderGraph::GpuPassRangeBegin begin, RenderGraph::GpuPassRangeEnd end) {
+void GraphHost::SetGpuPassRangeCallbacks(RenderGraph::GpuPassRangeBegin begin, RenderGraph::GpuPassRangeEnd end) {
 	m_gpuPassRangeBegin = std::move(begin);
 	m_gpuPassRangeEnd = std::move(end);
 	if (m_graph) m_graph->SetGpuPassRangeCallbacks(m_gpuPassRangeBegin, m_gpuPassRangeEnd);
 }
 
-void PersistentGraphHost::Build() {
+void GraphHost::Build() {
 	BT_ZONE_SCOPE("ORG.Host.Build");
 	DestroyGraph();
 	auto graph = std::make_unique<RenderGraph>(m_desc.device, m_desc.backend);
@@ -363,7 +370,6 @@ void PersistentGraphHost::Build() {
 	graph->SetPersistentRecordingReuse(m_desc.reuseRecordings && m_desc.closedExecutions);
 	graph->SetPersistentRecordingTimestamps(m_recordingTimestamps.load(std::memory_order_acquire));
 	graph->SetScheduleTraceEnabled(m_scheduleTrace.load(std::memory_order_acquire));
-	graph->SetPersistentExecutionEnabled(true);
 	{
 		auto boundary = m_desc.queueBoundary;
 		if (m_boundaryOverridden.load(std::memory_order_acquire)) {
@@ -380,13 +386,13 @@ void PersistentGraphHost::Build() {
 	++m_buildGeneration;
 }
 
-void PersistentGraphHost::SetFrameWaitTimeline(std::shared_ptr<rhi::TimelinePtr> timeline) {
+void GraphHost::SetFrameWaitTimeline(std::shared_ptr<rhi::TimelinePtr> timeline) {
 	m_frameWaitTimeline = std::move(timeline);
 	// Every packet binds its timelines when it is prepared: the graph's present ones cannot wait on it.
 	if (m_graph) m_rebuildRequested = true;
 }
 
-PersistentGraphHost::GpuPoint PersistentGraphHost::SubmittedPoint() const {
+GraphHost::GpuPoint GraphHost::SubmittedPoint() const {
 	GpuPoint point;
 	if (!m_graph) return point;
 	const auto& queues = m_graph->GetQueueRegistry();
@@ -401,7 +407,7 @@ PersistentGraphHost::GpuPoint PersistentGraphHost::SubmittedPoint() const {
 	return point;
 }
 
-bool PersistentGraphHost::BuildIfRequested() {
+bool GraphHost::BuildIfRequested() {
 	if (m_graph && !m_rebuildRequested) return false;
 	const bool async = static_cast<bool>(m_async);
 	StopAsync();
@@ -410,7 +416,7 @@ bool PersistentGraphHost::BuildIfRequested() {
 	return true;
 }
 
-void PersistentGraphHost::ExecuteFrame(const IHostExecutionData* hostData, const FrameCallback& beforePrepare,
+void GraphHost::ExecuteFrame(const IHostExecutionData* hostData, const FrameCallback& beforePrepare,
 	uint32_t epoch, std::shared_ptr<const void> resourceOwner) {
 	BT_ZONE_SCOPE("ORG.Host.ExecuteFrame");
 	if (m_async) throw std::logic_error("ExecuteFrame while async epochs run: the host's thread owns the graph (use SubmitEpoch)");
@@ -507,7 +513,7 @@ void PersistentGraphHost::ExecuteFrame(const IHostExecutionData* hostData, const
 // ---- async epochs ----
 
 
-void PersistentGraphHost::SetAsyncEpochs(std::vector<uint32_t> epochs, std::vector<uint32_t> revisionEpochs) {
+void GraphHost::SetAsyncEpochs(std::vector<uint32_t> epochs, std::vector<uint32_t> revisionEpochs) {
 	StopAsync();
 	m_asyncEpochs = std::move(epochs);
 	for (const auto epoch : revisionEpochs)
@@ -525,7 +531,7 @@ void PersistentGraphHost::SetAsyncEpochs(std::vector<uint32_t> epochs, std::vect
 	StartAsync();
 }
 
-void PersistentGraphHost::SetExternalEpochs(std::vector<uint32_t> epochs) {
+void GraphHost::SetExternalEpochs(std::vector<uint32_t> epochs) {
 	StopAsync();
 	m_externalEpochs = std::move(epochs);
 	if (m_graph) m_graph->SetExternalPersistentEpochs(m_externalEpochs);
@@ -535,7 +541,7 @@ void PersistentGraphHost::SetExternalEpochs(std::vector<uint32_t> epochs) {
 	}
 }
 
-void PersistentGraphHost::SignalExternalExecutionUnexecuted(const ExternalEpochExecution& execution) {
+void GraphHost::SignalExternalExecutionUnexecuted(const ExternalEpochExecution& execution) {
 	if (!m_async) throw std::logic_error("An external execution without async epochs");
 	auto waits = execution.waits;
 	auto signals = execution.signals;
@@ -545,7 +551,7 @@ void PersistentGraphHost::SignalExternalExecutionUnexecuted(const ExternalEpochE
 		throw std::runtime_error(std::string("An unexecuted external execution could not be signalled (rhi::Result ") + rhi::ResultName(result) + ")");
 }
 
-void PersistentGraphHost::StartAsync() {
+void GraphHost::StartAsync() {
 	if (m_async || m_asyncEpochs.empty() || !m_graph) return;
 	auto async = std::make_unique<Async>();
 	// The host's wake, made once: a requester's Notify may reach it whenever, so no build destroys it.
@@ -794,11 +800,11 @@ void PersistentGraphHost::StartAsync() {
 	(void)m_completionWake->Notify();
 }
 
-std::shared_ptr<runtime::ResourceCleanupQueue> PersistentGraphHost::ResourceCleanup() const {
+std::shared_ptr<runtime::ResourceCleanupQueue> GraphHost::ResourceCleanup() const {
 	return DescriptorHeapManager::GetInstance().GetResourceCleanupQueue();
 }
 
-void PersistentGraphHost::WaitSlot(Async& state, uint32_t slot) {
+void GraphHost::WaitSlot(Async& state, uint32_t slot) {
 	// The slot's previous execution must be done before its command lists, statistics range and latch region are reused, or
 	// before it is recorded for again: the wait happens here, on this thread, never on the render thread.
 	auto& entry = state.slots[slot];
@@ -833,7 +839,7 @@ void PersistentGraphHost::WaitSlot(Async& state, uint32_t slot) {
 	entry.resourceOwner.reset();
 }
 
-bool PersistentGraphHost::ReleaseEpochTicket(uint32_t epoch) {
+bool GraphHost::ReleaseEpochTicket(uint32_t epoch) {
 	if (!m_async) return false;
 	auto& async = *m_async;
 	const auto found = std::ranges::find(async.epochs, epoch);
@@ -852,7 +858,7 @@ bool PersistentGraphHost::ReleaseEpochTicket(uint32_t epoch) {
 	return false;
 }
 
-bool PersistentGraphHost::RequestEpochRecording(uint32_t epoch, std::shared_ptr<const IHostExecutionData> hostData, EpochRecordingCallback done) {
+bool GraphHost::RequestEpochRecording(uint32_t epoch, std::shared_ptr<const IHostExecutionData> hostData, EpochRecordingCallback done) {
 	// The host's queue alone (never m_async, which a build moves out from under any other thread): the host's thread validates the
 	// epoch when it takes it, and a build drops what it did not take (StopAsync), each completed.
 	auto& queue = *m_recordingQueue;
@@ -865,7 +871,7 @@ bool PersistentGraphHost::RequestEpochRecording(uint32_t epoch, std::shared_ptr<
 	return true;
 }
 
-bool PersistentGraphHost::AdvanceRecordingRequests(Async& state) {
+bool GraphHost::AdvanceRecordingRequests(Async& state) {
 	bool advanced = false;
 	for (auto it = state.pendingRequests.begin(); it != state.pendingRequests.end();) {
 		auto& request = **it;
@@ -947,7 +953,7 @@ bool PersistentGraphHost::AdvanceRecordingRequests(Async& state) {
 	return advanced;
 }
 
-void PersistentGraphHost::PrepareTicket(Async& state, uint32_t epochIndex, int32_t requestedSlot) {
+void GraphHost::PrepareTicket(Async& state, uint32_t epochIndex, int32_t requestedSlot) {
 	BT_ZONE_SCOPE("ORG.Host.PrepareTicket.Worker");
 	const uint32_t slotCount = static_cast<uint32_t>(state.slots.size());
 	uint32_t slot = 0;
@@ -1018,7 +1024,7 @@ void PersistentGraphHost::PrepareTicket(Async& state, uint32_t epochIndex, int32
 	state.ticketWake.notify_all();
 }
 
-void PersistentGraphHost::AddRevisionCandidate(Async& state, RenderGraph::PersistentTicket& ticket, const EpochRecording& recording) {
+void GraphHost::AddRevisionCandidate(Async& state, RenderGraph::PersistentTicket& ticket, const EpochRecording& recording) {
 	const uint32_t slot = RenderGraph::PersistentTicketSlot(ticket);
 	if (slot < recording.firstSlot || slot - recording.firstSlot >= recording.slots.size())
 		throw std::logic_error("A revision recording does not cover its epoch's ticket slot");
@@ -1026,7 +1032,7 @@ void PersistentGraphHost::AddRevisionCandidate(Async& state, RenderGraph::Persis
 	m_graph->AddPersistentTicketCandidate(ticket, recording.slots[slot - recording.firstSlot]);
 }
 
-PersistentGraphHost::BackingMutation::BackingMutation(PersistentGraphHost* host) : m_host(host) {
+GraphHost::BackingMutation::BackingMutation(GraphHost* host) : m_host(host) {
 	BufferBase::EnterBackingMutation();
 	if (m_host->m_backingMutationDepth++ || !m_host->m_async) return;
 	auto& async = *m_host->m_async;
@@ -1044,9 +1050,9 @@ PersistentGraphHost::BackingMutation::BackingMutation(PersistentGraphHost* host)
 	async.backingVersion.fetch_add(1, std::memory_order_acq_rel);
 }
 
-PersistentGraphHost::BackingMutation::BackingMutation(BackingMutation&& other) noexcept : m_host(std::exchange(other.m_host, nullptr)) {}
+GraphHost::BackingMutation::BackingMutation(BackingMutation&& other) noexcept : m_host(std::exchange(other.m_host, nullptr)) {}
 
-PersistentGraphHost::BackingMutation::~BackingMutation() {
+GraphHost::BackingMutation::~BackingMutation() {
 	if (!m_host) return;
 	if (!--m_host->m_backingMutationDepth && m_host->m_async) {
 		auto& async = *m_host->m_async;
@@ -1056,11 +1062,11 @@ PersistentGraphHost::BackingMutation::~BackingMutation() {
 	BufferBase::LeaveBackingMutation();
 }
 
-PersistentGraphHost::BackingMutation PersistentGraphHost::MutateBackings() {
+GraphHost::BackingMutation GraphHost::MutateBackings() {
 	return BackingMutation(this);
 }
 
-bool PersistentGraphHost::CanUseEpochRecording(const EpochRecording& recording, std::string* why) const {
+bool GraphHost::CanUseEpochRecording(const EpochRecording& recording, std::string* why) const {
 	auto fail = [&](const char* reason) {
 		if (why) *why = reason;
 		return false;
@@ -1076,12 +1082,12 @@ bool PersistentGraphHost::CanUseEpochRecording(const EpochRecording& recording, 
 		async.backingVersion.load(std::memory_order_acquire), why);
 }
 
-void PersistentGraphHost::NoteNewVersions() noexcept {
+void GraphHost::NoteNewVersions() noexcept {
 	// After the version's publication (release), so a preparation that reads the new value resolves the new version.
 	if (m_async) m_async->backingVersion.fetch_add(1, std::memory_order_acq_rel);
 }
 
-void PersistentGraphHost::StopAsync() {
+void GraphHost::StopAsync() {
 	BT_ZONE_SCOPE("ORG.Host.StopAsync");
 	if (!m_async) return;
 	auto async = std::move(m_async);
@@ -1134,7 +1140,7 @@ void PersistentGraphHost::StopAsync() {
 		m_uncertainUploadOwners.push_back(std::move(async->uncertainUploadOwner));
 }
 
-PersistentGraphHost::AsyncStats PersistentGraphHost::TakeAsyncStats() noexcept {
+GraphHost::AsyncStats GraphHost::TakeAsyncStats() noexcept {
 	if (m_graph) {
 		const auto recordings = m_graph->TakePersistentRecordingStats();
 		m_asyncStats.recorded = recordings.recorded;
@@ -1153,7 +1159,7 @@ PersistentGraphHost::AsyncStats PersistentGraphHost::TakeAsyncStats() noexcept {
 	return std::exchange(m_asyncStats, {});
 }
 
-bool PersistentGraphHost::TryPostOwnedPreparation(FrameCallback& request) {
+bool GraphHost::TryPostOwnedPreparation(FrameCallback& request) {
 	if (!request || !m_async || BuildDue())
 		return false;
 	Async::Message message;
@@ -1165,7 +1171,7 @@ bool PersistentGraphHost::TryPostOwnedPreparation(FrameCallback& request) {
 	return false;
 }
 
-bool PersistentGraphHost::TryReserveReadyEpochs(std::span<const uint32_t> epochs, FrameTicketReservation& destination) {
+bool GraphHost::TryReserveReadyEpochs(std::span<const uint32_t> epochs, FrameTicketReservation& destination) {
 	BT_ZONE_SCOPE("ORG.Host.TryReserveReadyEpochs");
 	if (!destination.Empty() || epochs.empty() || !m_async || BuildDue() || m_async->failed.load(std::memory_order_acquire))
 		return false;
@@ -1193,7 +1199,7 @@ bool PersistentGraphHost::TryReserveReadyEpochs(std::span<const uint32_t> epochs
 	return true;
 }
 
-bool PersistentGraphHost::TrySubmitReservedEpoch(FrameTicketReservation& reservation, uint32_t epoch, const FrameCallback& beforeSubmit) {
+bool GraphHost::TrySubmitReservedEpoch(FrameTicketReservation& reservation, uint32_t epoch, const FrameCallback& beforeSubmit) {
 	BT_ZONE_SCOPE("ORG.Host.TrySubmitReservedEpoch");
 	if (!m_async || BuildDue() || reservation.generation != m_ticketGeneration
 		|| m_async->failed.load(std::memory_order_acquire)) return false;
@@ -1209,7 +1215,7 @@ bool PersistentGraphHost::TrySubmitReservedEpoch(FrameTicketReservation& reserva
 	return true;
 }
 
-void PersistentGraphHost::SubmitEpoch(uint32_t epoch, const FrameCallback& beforeSubmit, std::shared_ptr<const void> resourceOwner,
+void GraphHost::SubmitEpoch(uint32_t epoch, const FrameCallback& beforeSubmit, std::shared_ptr<const void> resourceOwner,
 	std::shared_ptr<const EpochRecording> recording) {
 	BT_ZONE_SCOPE("ORG.Host.SubmitEpoch");
 	m_lastTimings = {};
@@ -1240,7 +1246,7 @@ void PersistentGraphHost::SubmitEpoch(uint32_t epoch, const FrameCallback& befor
 	SubmitTicket(async, index, std::move(ticket), beforeSubmit, true, nullptr, std::move(resourceOwner), std::move(recording));
 }
 
-void PersistentGraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<RenderGraph::PersistentTicket> ticket,
+void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<RenderGraph::PersistentTicket> ticket,
 	const FrameCallback& beforeSubmit, bool allowReprepare, FrameTicketReservation* reservation,
 	std::shared_ptr<const void> resourceOwner, std::shared_ptr<const EpochRecording> recording) {
 	// A submission's completion message wakes the host's thread lazily (wakesOnGpu); a discard always wakes it.
@@ -1272,7 +1278,7 @@ void PersistentGraphHost::SubmitTicket(Async& async, uint32_t index, std::shared
 	if (beforeSubmit) {
 		BT_ZONE_SCOPE("ORG.Host.CommitInputs");
 		struct Submitting {
-			PersistentGraphHost& host;
+			GraphHost& host;
 			~Submitting() { host.m_submittingTicket = nullptr; }
 		} submitting{*this};
 		m_submittingTicket = ticket.get();
@@ -1471,7 +1477,7 @@ void PersistentGraphHost::SubmitTicket(Async& async, uint32_t index, std::shared
 	if (!ok) throw std::runtime_error("Async epoch submission failed");
 }
 
-void PersistentGraphHost::NoteExternalSlotUse(uint32_t slot, std::shared_ptr<rhi::TimelinePtr> timeline, uint64_t value) {
+void GraphHost::NoteExternalSlotUse(uint32_t slot, std::shared_ptr<rhi::TimelinePtr> timeline, uint64_t value) {
 	if (!timeline || !*timeline || !value || !m_frameSlots) return;
 	slot %= m_frameSlots;
 	if (m_externalSlotValues.size() != m_frameSlots) m_externalSlotValues.assign(m_frameSlots, 0);
@@ -1480,7 +1486,7 @@ void PersistentGraphHost::NoteExternalSlotUse(uint32_t slot, std::shared_ptr<rhi
 	DescriptorHeapManager::GetInstance().PublishQueueFenceSnapshot({ DescriptorHeapManager::QueueFenceSnapshotPoint{ .timeline = timeline->Get(), .value = value } });
 }
 
-void PersistentGraphHost::BeginExternalFrameSlot(uint32_t slot) {
+void GraphHost::BeginExternalFrameSlot(uint32_t slot) {
 	m_externalSlot = m_frameSlots ? slot % m_frameSlots : 0u;
 	// The client waited out its own last work at the slot (the contract above). The host's last work there must be done too, or
 	// the slot is left to the host's next execution taking it, or to the client's next frame at it.
@@ -1495,12 +1501,12 @@ void PersistentGraphHost::BeginExternalFrameSlot(uint32_t slot) {
 	if (m_externalRetired.size() > m_frameSlots) m_externalRetired.clear();
 }
 
-void PersistentGraphHost::NoteSlotSubmitted(uint32_t slot) {
+void GraphHost::NoteSlotSubmitted(uint32_t slot) {
 	if (m_slotSubmitted.size() != m_frameSlots) m_slotSubmitted.resize(m_frameSlots);
 	m_slotSubmitted[slot % m_frameSlots] = SubmittedPoint();
 }
 
-bool PersistentGraphHost::ExternalSlotInUse(uint32_t slot) const noexcept {
+bool GraphHost::ExternalSlotInUse(uint32_t slot) const noexcept {
 	if (!m_externalTimeline || !*m_externalTimeline || m_frameSlots == 0 || m_externalSlotValues.size() != m_frameSlots) return false;
 	const uint64_t value = m_externalSlotValues[slot % m_frameSlots];
 	if (!value) return false;

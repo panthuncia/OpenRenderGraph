@@ -22,7 +22,7 @@
 #include "Render/Runtime/ScopedActiveGraphServices.h"
 #include "Render/Runtime/DescriptorServiceAccess.h"
 #include "Render/Runtime/ThreadPoolTaskService.h"
-#include "OpenRenderGraph/PersistentGraphHost.h"
+#include "OpenRenderGraph/GraphHost.h"
 #include "Managers/Singletons/DescriptorHeapManager.h"
 #include "RenderPasses/Base/TypedRenderGraphPass.h"
 #include "Resources/Buffers/Buffer.h"
@@ -411,14 +411,14 @@ bool Matches(const HostBuffer& buffer, uint32_t value) {
 int TestFrameRetirement(rhi::Device device, rhi::Backend backend);
 
 static int Run(int argc, char** argv) {
-	// "reuse": async epochs that keep and resubmit their recordings (PersistentGraphHost::Desc::reuseRecordings).
+	// "reuse": async epochs that keep and resubmit their recordings (GraphHost::Desc::reuseRecordings).
 	// "external-reuse": "external" with its recordings kept: the late pass, replayable, recorded again by each execution of a kept one.
 	const bool externalReuse = argc > 1 && std::strcmp(argv[1], "external-reuse") == 0;
 	const bool reuse = externalReuse || (argc > 1 && std::strcmp(argv[1], "reuse") == 0);
 	// "revision": a revision-driven epoch (SetAsyncEpochs' revisionEpochs), recorded ahead for each revision
 	// (RequestEpochRecording) and submitted with that recording.
 	const bool revision = argc > 1 && std::strcmp(argv[1], "revision") == 0;
-	// "external": an async epoch the test executes itself (PersistentGraphHost::SetExternalEpochs), its copy pass recorded at
+	// "external": an async epoch the test executes itself (GraphHost::SetExternalEpochs), its copy pass recorded at
 	// execution, in a primary of the test's, submitted with the execution's waits and signals.
 	const bool external = externalReuse || (argc > 1 && std::strcmp(argv[1], "external") == 0);
 	const bool async = reuse || revision || external || (argc > 1 && std::strcmp(argv[1], "async") == 0);
@@ -454,7 +454,7 @@ static int Run(int argc, char** argv) {
 		REQUIRE(TestFrameRetirement(device.Get(), rhi::Backend::Vulkan) == 0, "descriptor and frame retirement");
 		// The host registers the runtime device, owns the task service and upload
 		// pass, and drives persistent execution with the external queue boundary.
-		org::PersistentGraphHost host({.device = device.Get(), .backend = rhi::Backend::Vulkan,
+		org::GraphHost host({.device = device.Get(), .backend = rhi::Backend::Vulkan,
 			.tasks = std::make_shared<org::runtime::ThreadPoolTaskService>(2),
 			.queueBoundary = {.entry = true, .exit = true}, .epochOrder = {0}, .closedExecutions = async, .reuseRecordings = reuse || revision});
 		{
@@ -501,22 +501,22 @@ static int Run(int argc, char** argv) {
 				versions = org::VersionedBuffer::Create(scratch);
 			}
 			host.AddExtension("test.host", [&] { return std::make_unique<HostExtension>(input, scratch, output, program, outputRevision, versions, external); });
-			org::PersistentGraphHost::FrameCallback premature = [](org::RenderGraph&) {};
+			org::GraphHost::FrameCallback premature = [](org::RenderGraph&) {};
 			REQUIRE(!host.TryPostOwnedPreparation(premature) && premature, "pre-build request stays with caller");
-			org::PersistentGraphHost::FrameTicketReservation reservation;
+			org::GraphHost::FrameTicketReservation reservation;
 			const uint32_t requiredEpoch = 0;
 			REQUIRE(!host.TryReserveReadyEpochs({&requiredEpoch, 1}, reservation), "no reservation before async start");
 			if (revision) {
 				host.SetAsyncEpochs({0}, {0});
 				// Records the epoch for a revision of `count` elements; the callback runs on the host's thread.
-				auto record = [&](uint32_t count, std::shared_ptr<const org::BufferVersion> target) -> std::shared_ptr<const org::PersistentGraphHost::EpochRecording> {
+				auto record = [&](uint32_t count, std::shared_ptr<const org::BufferVersion> target) -> std::shared_ptr<const org::GraphHost::EpochRecording> {
 					auto data = std::make_shared<TestRevision>();
 					data->count = count;
 					data->versioned = versions->Key();
 					data->target = std::move(target);
 					std::atomic<int> state{0};
-					std::shared_ptr<const org::PersistentGraphHost::EpochRecording> result;
-					const bool posted = host.RequestEpochRecording(0, data, [&](std::shared_ptr<const org::PersistentGraphHost::EpochRecording> a_recording,
+					std::shared_ptr<const org::GraphHost::EpochRecording> result;
+					const bool posted = host.RequestEpochRecording(0, data, [&](std::shared_ptr<const org::GraphHost::EpochRecording> a_recording,
 						std::exception_ptr a_error) {
 						result = std::move(a_recording);
 						state.store(a_error ? 2 : 1, std::memory_order_release);
@@ -647,8 +647,8 @@ static int Run(int argc, char** argv) {
 					data->versioned = versions->Key();
 					data->target = versions->Current();
 					std::atomic<int> state{0};
-					std::shared_ptr<const org::PersistentGraphHost::EpochRecording> live;
-					REQUIRE(host.RequestEpochRecording(0, data, [&](std::shared_ptr<const org::PersistentGraphHost::EpochRecording> a_recording, std::exception_ptr a_error) {
+					std::shared_ptr<const org::GraphHost::EpochRecording> live;
+					REQUIRE(host.RequestEpochRecording(0, data, [&](std::shared_ptr<const org::GraphHost::EpochRecording> a_recording, std::exception_ptr a_error) {
 						live = std::move(a_recording);
 						state.store(a_error ? 2 : 1, std::memory_order_release);
 					}), "a live async epoch takes a recording request");
@@ -669,12 +669,14 @@ static int Run(int argc, char** argv) {
 					// The commit chooses it (UseEpochRecording): the ticket takes it instead of its own preparation, for every slot.
 					for (uint32_t frame = 0; frame < 4; ++frame) {
 						value = 71000u + 10u * frame;
+						bool usable = false;
 						host.SubmitEpoch(0, [&](org::RenderGraph& a_graph) {
 							upload(a_graph);
 							std::string why;
-							REQUIRE(host.CanUseEpochRecording(*live, &why), "the ticket being submitted takes the revision's recording");
+							usable = host.CanUseEpochRecording(*live, &why);
 							host.UseEpochRecording(live);
 						});
+						REQUIRE(usable, "the ticket being submitted takes the revision's recording");
 						REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "a live epoch submits the revision's recording it chose");
 					}
 					// And its own preparation again when it chooses none.
@@ -700,9 +702,9 @@ static int Run(int argc, char** argv) {
 					// Explicit builds: an extension added waits for the build point (BuildIfRequested). Until then the graph as built runs,
 					// and a recording of it stays its tickets'; the build point builds, and the recording is the build before's.
 					host.SetExplicitBuilds(true);
-					std::shared_ptr<const org::PersistentGraphHost::EpochRecording> held;
+					std::shared_ptr<const org::GraphHost::EpochRecording> held;
 					state.store(0, std::memory_order_relaxed);
-					REQUIRE(host.RequestEpochRecording(0, data, [&](std::shared_ptr<const org::PersistentGraphHost::EpochRecording> a_recording, std::exception_ptr a_error) {
+					REQUIRE(host.RequestEpochRecording(0, data, [&](std::shared_ptr<const org::GraphHost::EpochRecording> a_recording, std::exception_ptr a_error) {
 						held = std::move(a_recording);
 						state.store(a_error ? 2 : 1, std::memory_order_release);
 					}), "a recording request of the current build");
@@ -740,12 +742,12 @@ static int Run(int argc, char** argv) {
 					host.SetExplicitBuilds(false);
 					// An epoch the caller does not submit: its ready ticket holds a slot of its ring, so a recording requested for it
 					// waits for that slot until the caller gives the ticket back (ReleaseEpochTicket); then it completes, unsubmitted.
-					std::shared_ptr<const org::PersistentGraphHost::EpochRecording> idle;
+					std::shared_ptr<const org::GraphHost::EpochRecording> idle;
 					state.store(0, std::memory_order_relaxed);
 					const auto readyDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
 					while (!host.ReleaseEpochTicket(0) && std::chrono::steady_clock::now() < readyDeadline)
 						std::this_thread::yield();
-					REQUIRE(host.RequestEpochRecording(0, data, [&](std::shared_ptr<const org::PersistentGraphHost::EpochRecording> a_recording, std::exception_ptr a_error) {
+					REQUIRE(host.RequestEpochRecording(0, data, [&](std::shared_ptr<const org::GraphHost::EpochRecording> a_recording, std::exception_ptr a_error) {
 						idle = std::move(a_recording);
 						state.store(a_error ? 2 : 1, std::memory_order_release);
 					}), "a recording request for an epoch not submitted");
@@ -880,7 +882,7 @@ static int Run(int argc, char** argv) {
 				auto ownedValue = std::make_shared<int>(42);
 				ownedWeak = ownedValue;
 				const auto renderThread = std::this_thread::get_id();
-				org::PersistentGraphHost::FrameCallback request = [ownedValue, renderThread, &ownedRequests, &ownedServices](org::RenderGraph&) {
+				org::GraphHost::FrameCallback request = [ownedValue, renderThread, &ownedRequests, &ownedServices](org::RenderGraph&) {
 					ownedServices.store(*ownedValue == 42 && std::this_thread::get_id() != renderThread &&
 						org::runtime::GetActiveDescriptorService() != nullptr && org::runtime::GetActiveUploadService() != nullptr);
 					ownedRequests.fetch_add(1);
@@ -897,7 +899,7 @@ static int Run(int argc, char** argv) {
 				std::promise<void> releaseConsumer;
 				auto gate = releaseConsumer.get_future().share();
 				std::atomic<bool> entered{false};
-				org::PersistentGraphHost::FrameCallback blocker = [gate, &entered](org::RenderGraph&) {
+				org::GraphHost::FrameCallback blocker = [gate, &entered](org::RenderGraph&) {
 					entered.store(true);
 					gate.wait();
 				};
@@ -908,10 +910,10 @@ static int Run(int argc, char** argv) {
 				bool filled = entered.load();
 				if (filled)
 					for (uint32_t i = 0; i < 63; ++i) {
-						org::PersistentGraphHost::FrameCallback filler = [](org::RenderGraph&) {};
+						org::GraphHost::FrameCallback filler = [](org::RenderGraph&) {};
 						filled &= host.TryPostOwnedPreparation(filler);
 					}
-				org::PersistentGraphHost::FrameCallback overflow = [](org::RenderGraph&) {};
+				org::GraphHost::FrameCallback overflow = [](org::RenderGraph&) {};
 				const bool refused = filled && !host.TryPostOwnedPreparation(overflow) && static_cast<bool>(overflow);
 				// The worker is still blocked and the mailbox has exactly one free
 				// cell: the reserved frame must spend that cell without waiting.
@@ -1082,7 +1084,7 @@ static int Run(int argc, char** argv) {
 				host.SetAsyncEpochs({});
 				REQUIRE(ownedRequests.load() == 1 && ownedServices.load(), "owned preparation ran on host thread with services");
 				REQUIRE(ownedWeak.expired(), "owned request released after completion");
-				org::PersistentGraphHost::FrameCallback afterStop = [](org::RenderGraph&) {};
+				org::GraphHost::FrameCallback afterStop = [](org::RenderGraph&) {};
 				REQUIRE(!host.TryPostOwnedPreparation(afterStop) && afterStop, "post-stop request stays with caller");
 			}
 			}

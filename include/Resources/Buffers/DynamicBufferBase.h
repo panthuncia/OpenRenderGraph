@@ -183,10 +183,10 @@ public:
 
     bool IsUploadPolicyImmediate() const;
     static bool IsBackingMutationAllowedOnThisThread();
-    // The ScopedBackingMutation depth of this thread, for scopes that cannot hold one (PersistentGraphHost::BackingMutation).
+    // The ScopedBackingMutation depth of this thread, for scopes that cannot hold one (GraphHost::BackingMutation).
     static void EnterBackingMutation();
     static void LeaveBackingMutation();
-    // An owner that captures backings on a thread of its own while other threads run (PersistentGraphHost's async epochs)
+    // An owner that captures backings on a thread of its own while other threads run (GraphHost's async epochs)
     // registers for as long as it does. Meanwhile a buffer's backing changes (ResizeBytes, ResizeStructured) only inside a
     // ScopedBackingMutation, which that owner serializes against its captures (BackedResource): anywhere else they throw.
     static void RegisterConcurrentBackingCapture();

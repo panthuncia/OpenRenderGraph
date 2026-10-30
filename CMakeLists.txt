@@ -95,11 +95,9 @@ endif()
 add_library(OpenRenderGraph STATIC
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Contributor/ContributorRegistry.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Contributor/ExtensionRegistry.cpp"
-	"${CMAKE_CURRENT_SOURCE_DIR}/src/Contributor/ContributorGraphHost.cpp"
-	"${CMAKE_CURRENT_SOURCE_DIR}/src/Contributor/ContributorRuntime.cpp"
-	"${CMAKE_CURRENT_SOURCE_DIR}/src/Host/PersistentGraphHost.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/src/Host/GraphHost.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Telemetry/NvPerfCapture.cpp"
-	"${CMAKE_CURRENT_SOURCE_DIR}/include/OpenRenderGraph/PersistentGraphHost.h"
+	"${CMAKE_CURRENT_SOURCE_DIR}/include/OpenRenderGraph/GraphHost.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/DescriptorHeap.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/OwnedDescriptorBinding.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/BindingTable.cpp"
@@ -153,15 +151,9 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include/RenderPasses/Base/PersistentTypedPass.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/ExperimentalExecutionState.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/InteropAllocator.cpp"
-	"${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/SharedAliasPoolManager.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraphCompile.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/FrameRecording.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/ExternalEpochExecution.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/FramePlanning.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraphCompileProfile.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/Aliasing/RenderGraphAliasingSubsystem.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/Aliasing/RenderGraphAliasingAlgorithms.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/Managers/CommandRecordingManager.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Managers/Singletons/DeviceManager.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Managers/Singletons/DescriptorHeapManager.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Managers/Singletons/UploadManager.cpp"
@@ -248,8 +240,7 @@ endif()
 
 if(OPENRENDERGRAPH_ENABLE_DEBUG_UI)
     add_library(OpenRenderGraphDebugUI STATIC
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/DebugUI/MemoryViewWidget.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/DebugUI/RenderGraphInspector.cpp")
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/DebugUI/MemoryViewWidget.cpp")
     add_library(OpenRenderGraph::DebugUI ALIAS OpenRenderGraphDebugUI)
     target_compile_features(OpenRenderGraphDebugUI PUBLIC cxx_std_23)
     target_include_directories(OpenRenderGraphDebugUI PUBLIC
@@ -360,13 +351,8 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
         set(_org_d3d12_tests ON)
     endif()
     add_custom_target(OpenRenderGraphAsyncFrameTests DEPENDS
-        OpenRenderGraphFrameContextTests OpenRenderGraphAsyncCompileTests
+        OpenRenderGraphAsyncCompileTests
         $<$<BOOL:${_org_d3d12_tests}>:OpenRenderGraphExternalResourceTests>)
-    add_executable(OpenRenderGraphFrameContextTests tests/FrameContextTests.cpp)
-    target_compile_features(OpenRenderGraphFrameContextTests PRIVATE cxx_std_23)
-    target_include_directories(OpenRenderGraphFrameContextTests PRIVATE include)
-    target_compile_definitions(OpenRenderGraphFrameContextTests PRIVATE NOMINMAX)
-    add_test(NAME OpenRenderGraphFrameContextTests COMMAND OpenRenderGraphFrameContextTests)
     add_executable(OpenRenderGraphAsyncCompileTests tests/AsyncCompileTests.cpp)
     target_compile_features(OpenRenderGraphAsyncCompileTests PRIVATE cxx_std_23)
     target_include_directories(OpenRenderGraphAsyncCompileTests PRIVATE include)

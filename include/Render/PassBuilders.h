@@ -617,21 +617,16 @@ namespace detail
     inline constexpr bool dependent_false_v = false;
 
     inline void TrackResolverSnapshot(std::vector<ResolverSnapshot>& snapshots,
-        const IResourceResolver& resolver, const ResolverDeclarationState& state,
+        const IResourceResolver& resolver, const std::shared_ptr<const ResolverDeclarationState>& state,
         std::optional<ResolverSnapshot::RequirementTemplate> binding = std::nullopt) {
-        const auto identity = state.dependencyIdentity.get();
-        if (!state.tracked || !identity) return;
+        const auto identity = state->dependencyIdentity.get();
+        if (!state->tracked || !identity) return;
         auto found = std::find_if(snapshots.begin(), snapshots.end(), [identity](const auto& snapshot) {
-            return snapshot.dependencyIdentity.get() == identity;
+            return snapshot.DependencyIdentity().get() == identity;
         });
         if (found == snapshots.end()) {
             snapshots.emplace_back(resolver.Clone(), state);
             found = std::prev(snapshots.end());
-            if (state.resources) {
-                found->resourceIDs.reserve(state.resources->size());
-                for (const auto& resource : *state.resources)
-                    found->resourceIDs.push_back(resource ? resource->GetGlobalResourceID() : 0u);
-            }
         }
         if (!binding) {
             found->hasUnclassifiedDeclaration = true;
@@ -647,7 +642,7 @@ namespace detail
         const T& value, ResourceState required) {
         auto capture = [&](const IResourceResolver& resolver, RangeSpec range) {
             const auto state = graph->CaptureResolverDeclarationState(resolver);
-            if (state) TrackResolverSnapshot(snapshots, resolver, *state,
+            if (state) TrackResolverSnapshot(snapshots, resolver, state,
                 ResolverSnapshot::RequirementTemplate{range, required});
         };
         using Value = std::remove_cvref_t<T>;
@@ -672,7 +667,7 @@ namespace detail
         }
         if (auto resolver = graph->RequestResolver(id, true)) {
             const auto state = graph->CaptureResolverDeclarationState(*resolver);
-            if (state) TrackResolverSnapshot(resolverSnapshots, *resolver, *state);
+            if (state) TrackResolverSnapshot(resolverSnapshots, *resolver, state);
         }
     }
 
@@ -949,7 +944,6 @@ private:
         default: throw std::invalid_argument("Unsupported resource use access");
         }
         DeclaredResourceUse result;
-        uint32_t memberOrdinal = 0;
         for (const auto& range : ranges) {
             auto* concrete = graph->_registry.Resolve(range.resource);
             if (!concrete) throw std::invalid_argument("Resource declaration did not resolve");
@@ -971,9 +965,8 @@ private:
                 return use.resolverIdentity == resolverIdentity && use.binding.registryResourceID == binding.registryResourceID && use.resource.range == range.range
                     && use.state == state && use.state.sync == state.sync;
             });
-            if (found == uses.end()) { uses.push_back({range, state, binding, {}, resolverIdentity, memberOrdinal}); found = std::prev(uses.end()); }
+            if (found == uses.end()) { uses.push_back({range, state, binding, {}, resolverIdentity}); found = std::prev(uses.end()); }
             const auto ordinal = static_cast<uint32_t>(found - uses.begin());
-            ++memberOrdinal;
             result.resources.push_back(binding);
             for (const auto view : specification.views) {
                 auto& views = found->requiredViews;
@@ -1272,7 +1265,10 @@ private:
 
         RestoreAuthorState(std::move(authorState));
 
-        pass->DeclareResourceUsages(this);
+        {
+            const RenderGraph::ResolverCaptureScope captures;
+            pass->DeclareResourceUsages(this);
+        }
 
         params.isGeometryPass = m_isGeometryPass;
         params.preferredQueueKind = m_preferredQueueKind;
@@ -2027,7 +2023,10 @@ private:
 
         RestoreAuthorState(std::move(authorState));
 
-        pass->DeclareResourceUsages(this);
+        {
+            const RenderGraph::ResolverCaptureScope captures;
+            pass->DeclareResourceUsages(this);
+        }
 
         params.identifierSet = _declaredIds;
         params.preferredQueueKind = m_preferredQueueKind;
@@ -2466,7 +2465,10 @@ private:
 
         RestoreAuthorState(std::move(authorState));
 
-        pass->DeclareResourceUsages(this);
+        {
+            const RenderGraph::ResolverCaptureScope captures;
+            pass->DeclareResourceUsages(this);
+        }
 
         params.identifierSet = _declaredIds;
         params.preferredQueueKind = m_preferredQueueKind;

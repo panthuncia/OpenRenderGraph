@@ -106,17 +106,14 @@ struct ResourceResolverAndRange {
     RangeSpec range;
 };
 
-/// Snapshot of a resolver taken during DeclareResourceUsages. Resource-set
-/// identity drives retained re-declaration; content and wait revisions are
+/// Snapshot of a resolver taken during DeclareResourceUsages. The captured state's
+/// resource-set identity drives re-declaration; its content and wait revisions are
 /// tracked independently so they cannot invalidate the structural declaration.
 struct ResolverSnapshot {
     std::unique_ptr<IResourceResolver> resolver;
-    std::shared_ptr<const void> dependencyIdentity;
-    ResolverResourceSetIdentity resourceSetIdentity{};
-    uint64_t contentRevision = 0;
-    uint64_t waitRevision = 0;
-    std::vector<ExternalTimelinePoint> waits;
-    std::vector<uint64_t> resourceIDs;
+    // The resolver's state as the declaration captured it (RenderGraph::ResolverCaptureScope): the declaration's uses,
+    // its views and the group it lowers to all describe this one resource set.
+    std::shared_ptr<const ResolverDeclarationState> state;
     struct RequirementTemplate {
         RangeSpec range{};
         ResourceState state{};
@@ -128,39 +125,25 @@ struct ResolverSnapshot {
     std::shared_ptr<const ResolverRequirementBlock> requirementBlock;
 
     ResolverSnapshot() = default;
-    ResolverSnapshot(std::unique_ptr<IResourceResolver> r, const ResolverDeclarationState& state)
-        : resolver(std::move(r)), dependencyIdentity(state.dependencyIdentity)
-        , resourceSetIdentity(state.resourceSetIdentity)
-        , contentRevision(state.contentRevision), waitRevision(state.waitRevision)
-        , waits(state.waits ? *state.waits : std::vector<ExternalTimelinePoint>{}) {}
+    ResolverSnapshot(std::unique_ptr<IResourceResolver> r, std::shared_ptr<const ResolverDeclarationState> captured)
+        : resolver(std::move(r)), state(std::move(captured)) {}
     ResolverSnapshot(ResolverSnapshot&&) = default;
     ResolverSnapshot& operator=(ResolverSnapshot&&) = default;
 
     // Deep-copy via Clone() so that PassAndResources structs remain copyable.
     ResolverSnapshot(const ResolverSnapshot& other)
-        : resolver(other.resolver ? other.resolver->Clone() : nullptr)
-        , dependencyIdentity(other.dependencyIdentity)
-        , resourceSetIdentity(other.resourceSetIdentity)
-        , contentRevision(other.contentRevision), waitRevision(other.waitRevision)
-        , waits(other.waits), resourceIDs(other.resourceIDs)
+        : resolver(other.resolver ? other.resolver->Clone() : nullptr), state(other.state)
         , requirementTemplates(other.requirementTemplates)
         , declaredRequirementTemplates(other.declaredRequirementTemplates)
         , hasUnclassifiedDeclaration(other.hasUnclassifiedDeclaration), requirementBlock(other.requirementBlock) {}
     ResolverSnapshot& operator=(const ResolverSnapshot& other) {
-        if (this != &other) {
-            resolver = other.resolver ? other.resolver->Clone() : nullptr;
-            dependencyIdentity = other.dependencyIdentity;
-            resourceSetIdentity = other.resourceSetIdentity;
-            contentRevision = other.contentRevision;
-            waitRevision = other.waitRevision;
-            waits = other.waits;
-            resourceIDs = other.resourceIDs;
-            requirementTemplates = other.requirementTemplates;
-            declaredRequirementTemplates = other.declaredRequirementTemplates;
-            hasUnclassifiedDeclaration = other.hasUnclassifiedDeclaration;
-            requirementBlock = other.requirementBlock;
-        }
+        if (this != &other) *this = ResolverSnapshot(other);
         return *this;
+    }
+
+    const std::shared_ptr<const void>& DependencyIdentity() const noexcept {
+        static const std::shared_ptr<const void> none;
+        return state ? state->dependencyIdentity : none;
     }
 };
 
