@@ -86,6 +86,9 @@ public:
 	// RenderGraph::kFrameWaitTimelineIdentity). Stable for the timeline's life; a timeline created later in its place (the same
 	// handle index, another generation) gets a new one.
 	uint64_t TimelineIdentity(const rhi::Timeline& timeline);
+	// The timeline an identity names, for a submission that waits on another graph's (its packets bind only their own).
+	// Invalid for an unknown identity.
+	rhi::TimelineHandle TimelineHandleOf(uint64_t identity) const;
 	// The resource ledgers every graph's admission on the runtime shares (docs/job-graphs.md, "Phase 2 investigation").
 	const std::shared_ptr<persistent::ResourceSequencer>& Sequencer() const noexcept { return m_sequencer; }
 
@@ -107,8 +110,9 @@ private:
 	// The progress timelines of unregistered queues (destroyed with them): device and handle.
 	std::vector<std::pair<void*, rhi::TimelineHandle>> m_retiredTimelines;
 
-	std::mutex m_identitiesMutex;
+	mutable std::mutex m_identitiesMutex;
 	std::map<std::tuple<void*, uint32_t, uint32_t>, uint64_t> m_identities;
+	std::map<uint64_t, rhi::TimelineHandle> m_handles;
 	uint64_t m_nextIdentity = 1;
 };
 

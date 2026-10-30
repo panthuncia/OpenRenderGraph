@@ -483,6 +483,7 @@ public:
         if (!m_replayable && m_consumed.exchange(true)) return {SubmissionState::NotSubmitted, SubmissionFailureStage::Replay};
         auto find = [&](uint64_t identity) -> const PreparedTimelineBinding* {
             for (const auto& item : m_timelines) if (item.identity == identity) return &item;
+            for (const auto& item : batch.extraTimelines) if (item.identity == identity) return &item;
             return nullptr;
         };
         const auto* signal = find(batch.signal.timeline);

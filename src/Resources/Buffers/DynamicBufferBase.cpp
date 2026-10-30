@@ -809,6 +809,7 @@ void BufferBase::QueueResourceCopyFromOldBacking(uint64_t bytesToCopy) {
 }
 
 std::shared_ptr<org::runtime::IUploadService> BufferBase::RetainBufferUploadService() const {
+    if (auto pinned = m_pinnedUploadService.lock()) return pinned;
     auto service = RetainUploadService();
     if (!service) throw std::runtime_error("Buffer upload service generation is unavailable");
     return service;

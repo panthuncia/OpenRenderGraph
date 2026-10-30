@@ -163,7 +163,7 @@ std::shared_ptr<const GraphExecutionTimeline> ExecutionTimelineAdmission::Submit
     const std::vector<std::vector<ExecutionTimelinePoint>>& incomingWaits,
     const std::vector<std::shared_ptr<const IPreparedExecutionBatch>>& packets,
     std::span<const ExecutionTimelinePoint> reservedSignals, std::span<const std::span<const rhi::CommandList>> leading,
-    std::vector<std::shared_ptr<const void>> leases) {
+    std::vector<std::shared_ptr<const void>> leases, std::span<const PreparedTimelineBinding> extraTimelines) {
     BT_ZONE_SCOPE("ORG.Execution.SubmitPrepared");
     if (!bundle || !bundle->graph || packets.size() != bundle->graph->batches.size())
         throw std::invalid_argument("Prepared packet count mismatch");
@@ -181,6 +181,7 @@ std::shared_ptr<const GraphExecutionTimeline> ExecutionTimelineAdmission::Submit
     for (uint32_t i = 0; i < packets.size(); ++i) {
         auto batch = execution->batches[i];
         if (!leading.empty()) batch.leading = leading[i];
+        batch.extraTimelines = extraTimelines;
         const auto receipt = packets[i]->Submit(batch);
         if (!receipt) {
             Fail(execution->submission, receipt);

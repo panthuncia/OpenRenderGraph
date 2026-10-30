@@ -63,12 +63,14 @@ std::shared_ptr<const GraphExecutionTimeline> RecordedFrame::Submit(ExecutionTim
 
 std::shared_ptr<const GraphExecutionTimeline> RecordedFrame::Submit(ExecutionTimelineAdmission& admission,
     const std::vector<std::vector<ExecutionTimelinePoint>>& incomingWaits,
-    std::span<const std::span<const rhi::CommandList>> leading, std::vector<std::shared_ptr<const void>> leases) && {
+    std::span<const std::span<const rhi::CommandList>> leading, std::vector<std::shared_ptr<const void>> leases,
+    std::span<const PreparedTimelineBinding> extraTimelines) && {
     BT_ZONE_SCOPE("ORG.Frame.Submit");
     if (m_submitted || !m_snapshot || m_batches.empty())
         throw std::logic_error("Recorded frame already consumed or incomplete");
     m_submitted = true;
-    return admission.SubmitPrepared(m_snapshot->layout->bundle, incomingWaits, m_batches, {}, leading, std::move(leases));
+    return admission.SubmitPrepared(m_snapshot->layout->bundle, incomingWaits, m_batches, {}, leading, std::move(leases),
+        extraTimelines);
 }
 
 } // namespace org::compiler

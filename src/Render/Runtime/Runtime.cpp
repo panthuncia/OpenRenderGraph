@@ -134,8 +134,14 @@ uint64_t Runtime::TimelineIdentity(const rhi::Timeline& timeline) {
 	const auto handle = timeline.GetHandle();
 	std::lock_guard lock(m_identitiesMutex);
 	auto [found, inserted] = m_identities.try_emplace({timeline.impl, handle.index, handle.generation}, m_nextIdentity);
-	if (inserted) ++m_nextIdentity;
+	if (inserted) m_handles.emplace(m_nextIdentity++, handle);
 	return found->second;
+}
+
+rhi::TimelineHandle Runtime::TimelineHandleOf(uint64_t identity) const {
+	std::lock_guard lock(m_identitiesMutex);
+	const auto found = m_handles.find(identity);
+	return found == m_handles.end() ? rhi::TimelineHandle{} : found->second;
 }
 
 bool Runtime::Reached(const runtime::SubmittedPoint& point) const {

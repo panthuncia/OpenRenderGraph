@@ -307,7 +307,7 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 				}
 			}
 		}
-		compiler::PlannedFrame plan{sealed, std::move(jobs), std::move(timelineBindings), admission.incomingWaits};
+		compiler::PlannedFrame plan{sealed, std::move(jobs), timelineBindings, admission.incomingWaits};
 		const size_t concurrency = (std::min<size_t>)(graph.batches.size(), 4u);
 		std::shared_ptr<const compiler::GraphExecutionTimeline> execution;
 		lap(timings.acquireUs);
@@ -418,7 +418,20 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 					handoffLeases.push_back(std::move(allocation));
 				}
 			}
-			execution = std::move(recorded).Submit(*state.timelines, admission.incomingWaits, leading, std::move(handoffLeases));
+			// Waits the readmission found on timelines the packets do not bind: another graph's, on the runtime.
+			std::vector<compiler::PreparedTimelineBinding> extraTimelines;
+			for (const auto& waits : admission.incomingWaits)
+				for (const auto wait : waits) {
+					const auto bound = [&](uint64_t identity) {
+						return std::ranges::any_of(timelineBindings, [&](const auto& binding) { return binding.identity == identity; })
+							|| std::ranges::any_of(extraTimelines, [&](const auto& binding) { return binding.identity == identity; });
+					};
+					if (bound(wait.timeline)) continue;
+					const auto handle = m_runtime->TimelineHandleOf(wait.timeline);
+					if (handle.valid()) extraTimelines.push_back({wait.timeline, handle});
+				}
+			execution = std::move(recorded).Submit(*state.timelines, admission.incomingWaits, leading, std::move(handoffLeases),
+				extraTimelines);
 			lap(timings.submitUs);
 		} catch (...) {
 			state.admission->Abandon(admission);

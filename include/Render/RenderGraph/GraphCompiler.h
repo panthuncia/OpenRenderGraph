@@ -16,6 +16,7 @@
 #include "Render/Runtime/ITaskService.h"
 
 namespace rhi { class CommandList; }
+namespace org::compiler { struct PreparedTimelineBinding; }
 #include "Render/RenderGraph/CompilerAlgorithms.h"
 
 namespace org::compiler {
@@ -306,6 +307,9 @@ struct ExecutionBatchTimeline {
     // Lists submitted ahead of the batch's own in the same submission, behind its waits: the handoff into the execution recorded
     // when it was admitted (its entry barriers). Only for the call that submits it; not retained.
     std::span<const rhi::CommandList> leading;
+    // Timelines the batch waits on beyond those its packet binds (another graph's, from its admission). Only for the call that
+    // submits it.
+    std::span<const PreparedTimelineBinding> extraTimelines;
 };
 class IPreparedExecutionBatch;
 // Timeline portion only, not an executable command packet. The admission owner
@@ -367,7 +371,8 @@ public:
         const std::vector<std::shared_ptr<const IPreparedExecutionBatch>>& packets,
         std::span<const ExecutionTimelinePoint> reservedSignals = {},
         std::span<const std::span<const rhi::CommandList>> leading = {},
-        std::vector<std::shared_ptr<const void>> leases = {});
+        std::vector<std::shared_ptr<const void>> leases = {},
+        std::span<const PreparedTimelineBinding> extraTimelines = {});
     // Call only after the backend successfully submits this batch's signal.
     void CommitBatch(uint64_t submission, uint32_t batch);
     // A submission of the owner's own on a queue between executions (a queue handoff's release): the value it signals, recorded as

@@ -178,6 +178,10 @@ public:
     bool IsAliasingAllowed() const;
 
     void SetUploadPolicyTag(org::runtime::UploadPolicyTag tag);
+    // This buffer's uploads go to service, whatever upload service the upload policy configures (the frame graph's): a buffer a
+    // job graph owns uploads through that graph, whose upload pass lands them ahead of its passes. Pair with an Immediate tag, so
+    // that writes are not held for the policy's flush. Expires with the service.
+    void PinUploadService(const std::shared_ptr<org::runtime::IUploadService>& service) { m_pinnedUploadService = service; }
 
     org::runtime::UploadPolicyTag GetUploadPolicyTag() const;
 
@@ -235,6 +239,7 @@ private:
     // Two graphs may materialize a buffer they share at once (RenderGraph::MaterializeUnmaterializedResources): one backing.
     std::mutex m_materializationMutex;
     uint64_t m_backingGeneration = 0;
+    std::weak_ptr<org::runtime::IUploadService> m_pinnedUploadService;  // PinUploadService
     org::runtime::UploadPolicyTag m_uploadPolicyTag = org::runtime::UploadPolicyTag::Immediate;
     bool m_uploadPolicyRegistered = false;
 };
