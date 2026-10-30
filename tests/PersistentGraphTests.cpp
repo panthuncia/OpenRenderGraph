@@ -200,13 +200,18 @@ int main() {
         auto state = std::make_shared<PreparedBackingState>();
         state->graphResourceID = 1; state->resource = {97,1}; state->shape = {1,1,true};
         state->regions = std::make_shared<const std::vector<PreparedStateRegion>>(std::vector<PreparedStateRegion>{{{0,1,0,1}, home}});
-        auto program = [&](CompileResourceState use) {
+        auto program = [&](CompileResourceState use, uint32_t queue = 0) {
             auto result = std::make_unique<GraphProgram>();
             auto edit = result->BeginEdit();
+            CompilePass pass;
+            if (queue) {
+                edit.SetQueues({{0,true},{0,true}});
+                pass.compatibleQueueSlots = {queue}; pass.preferredQueueSlot = queue;
+            }
             auto binding = Binding(97); binding.identity = (uint64_t{1} << 32) | 97; binding.shape = state->shape;
             binding.admission = state;
             const auto slot = edit.AddResource(binding.shape,binding);
-            edit.Declare(edit.AddPass({}),slot,{},use);
+            edit.Declare(edit.AddPass(pass),slot,{},use);
             auto selected = edit.Build(workspace,cancelled);
             if (!selected || !result->Install(selected)) throw std::logic_error("Shared sequencer program did not install");
             return std::pair{std::move(result), selected};
@@ -244,6 +249,23 @@ int main() {
         CHECK(entryLayout(again) == rhi::ResourceLayout::ShaderResource);
         CHECK(again.incomingWaits[0] == std::vector<ExecutionTimelinePoint>{ExecutionTimelinePoint(42,1)});
         writes.Abandon(again);
+        // A reader on another queue: the texture is released on the queue it was left on, to Common, and acquired from Common by
+        // the reader's entry barrier, which waits for the release (RenderGraph submits it ahead and adds the wait).
+        auto [computeProgram, computeReader] = program({static_cast<uint64_t>(rhi::ResourceAccessType::ShaderResource),
+            static_cast<uint64_t>(rhi::ResourceLayout::ShaderResource), static_cast<uint64_t>(rhi::ResourceSyncState::ComputeShading), false}, 1);
+        const std::array<ExecutionTimelinePoint,2> twoQueues{{{43,0},{44,0}}};
+        auto across = reads.Prepare(computeReader,twoQueues);
+        const auto& acrossGraph = *computeReader->executable->graph;
+        CHECK(acrossGraph.batches.size() == 1 && acrossGraph.batches[0].queue == 1);
+        CHECK(across.barriers.releases.size() == 1 && across.barriers.releases[0].queue == 0);
+        CHECK(across.barriers.releases[0].consumers == std::vector<uint32_t>{0});
+        const auto& released = across.barriers.releases[0].textures.at(0);
+        CHECK(released.beforeLayout == rhi::ResourceLayout::ShaderResource && released.afterLayout == rhi::ResourceLayout::Common
+            && released.queueOwnership == rhi::QueueOwnership::Release && released.ownershipPeer == rhi::QueueKind::Compute);
+        const auto& acquired = across.barriers.batches[0].textures.at(0);
+        CHECK(acquired.beforeLayout == rhi::ResourceLayout::Common && acquired.afterLayout == rhi::ResourceLayout::ShaderResource
+            && acquired.queueOwnership == rhi::QueueOwnership::Acquire && acquired.ownershipPeer == rhi::QueueKind::Graphics);
+        reads.Abandon(across);
         // A closed admission is never readmitted.
         SynchronousAdmission closed(4, {}, sequencer);
         closed.SetClosedExecutions(true);

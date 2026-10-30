@@ -12,9 +12,14 @@
 >   - ORG tests on Vulkan and D3D12, including a two-admissions-one-sequencer handoff test;
 >   - the SARP build and benchmark;
 >   - the Community Shaders build.
+> - **Cross-queue handoffs between executions (done).** When an earlier execution left a texture on another queue:
+>   - the texture is released there, from its state to Common, by a list the admission submits on that queue with its own
+>     signal (`PreparedExecutionBarrierPlan::releases`, `ExecutionTimelineAdmission::SubmitOutside`);
+>   - the consumers acquire it from Common and wait for that signal.
+>
+>   It still only counts `ORG.Execution.CrossFrameTextureQueueHandoff` for closed executions, across devices, and for
+>   queues the graph lacks.
 > - Remaining:
->   - **Cross-queue handoffs between executions:** release lists on the predecessor's queue. Today an exclusive texture
->     handed across queues between executions only counts `ORG.Execution.CrossFrameTextureQueueHandoff`.
 >   - **Vulkan QFOT layout pairs:** the release and acquire halves must match. One option is X→Common in both halves plus a
 >     local Common→Y on the consumer, with the backends skipping an acquire whose transfer collapsed (D3D12 always).
 >   - **D3D12 copy-queue exits:** copy lists keep textures in `COMMON` while the ledger records `CopySource`/`CopyDest`.

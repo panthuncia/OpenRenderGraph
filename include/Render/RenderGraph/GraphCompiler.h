@@ -367,6 +367,9 @@ public:
         std::vector<std::shared_ptr<const void>> leases = {});
     // Call only after the backend successfully submits this batch's signal.
     void CommitBatch(uint64_t submission, uint32_t batch);
+    // A submission of the owner's own on a queue between executions (a queue handoff's release): the value it signals, recorded as
+    // submitted.
+    ExecutionTimelinePoint SubmitOutside(uint32_t queue);
     // An execution another thread has already submitted with these signal values (async epochs: the values
     // are assigned at submission, in submission order, and recorded here by the ordered owner in the same
     // order). Values above the reserved ones may skip - timelines only need to rise.

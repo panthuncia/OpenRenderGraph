@@ -205,6 +205,15 @@ std::shared_ptr<const GraphExecutionTimeline> ExecutionTimelineAdmission::Record
     return execution;
 }
 
+ExecutionTimelinePoint ExecutionTimelineAdmission::SubmitOutside(uint32_t queue) {
+    if (m_failed || m_pending) throw std::logic_error("Submission between executions during one");
+    auto& reserved = m_reserved.at(queue);
+    if (reserved.value >= UINT64_MAX - 1) throw std::overflow_error("Queue timeline exhausted");
+    ++reserved.value;
+    m_submitted.at(queue) = reserved;
+    return reserved;
+}
+
 void ExecutionTimelineAdmission::CommitBatch(uint64_t submission, uint32_t batch) {
     BT_ZONE_SCOPE("ORG.Execution.CommitTimeline");
     if (m_failed || !m_pending || submission != m_pending->submission || batch != m_nextBatch)

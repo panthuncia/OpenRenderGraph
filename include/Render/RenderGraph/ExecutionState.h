@@ -66,6 +66,14 @@ struct PreparedBatchBarriers {
 
 struct PreparedExecutionBarrierPlan {
     std::vector<PreparedBatchBarriers> batches;
+    // Textures an earlier execution left on another queue (an open admission's): released on that queue, by a list submitted there
+    // ahead of the execution, and acquired from Common by the entry barriers of the consumers, which wait for the release.
+    struct Release {
+        uint32_t queue = 0;
+        std::vector<rhi::TextureBarrier> textures;
+        std::vector<uint32_t> consumers;
+    };
+    std::vector<Release> releases;
 };
 
 // Ordered admission state. Compile workers never access this object. Prepare is

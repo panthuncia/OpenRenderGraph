@@ -172,6 +172,37 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
         barrier.queueOwnership = rhi::QueueOwnership::None;
         barrier.externalOwnership = direction == rhi::QueueOwnership::Release ? External::Release : External::Acquire;
     };
+    // A texture an earlier execution left on another queue of this graph's: released there (result.releases) from the state it left
+    // in to Common, and acquired here from Common. Not for a closed execution (its textures stay on one queue), across devices
+    // (the external ownership handoff covers it) or from a queue this graph does not have. The ledger names queues by slot, the same
+    // native queue in every graph on the runtime.
+    const auto handOff = [&](rhi::TextureBarrier& barrier, const PreparedBackingState& captured, uint32_t previousQueue,
+        uint32_t consumerQueue, uint32_t batch) {
+        if (closeToHome || barrier.discard || previousQueue == UINT32_MAX || previousQueue == consumerQueue
+            || previousQueue >= graph.structure->queues.size() || deviceOfQueue(previousQueue) != deviceOfQueue(consumerQueue))
+            return false;
+        auto release = barrier;
+        release.texture = handleOn(captured, previousQueue);
+        release.afterAccess = rhi::ResourceAccessType::Common;
+        release.afterLayout = rhi::ResourceLayout::Common;
+        release.afterSync = rhi::ResourceSyncState::All;
+        release.queueOwnership = rhi::QueueOwnership::Release;
+        release.ownershipPeer = OwnershipPeerForQueue(consumerQueue);
+        barrier.beforeAccess = rhi::ResourceAccessType::Common;
+        barrier.beforeLayout = rhi::ResourceLayout::Common;
+        barrier.beforeSync = rhi::ResourceSyncState::All;
+        barrier.queueOwnership = rhi::QueueOwnership::Acquire;
+        barrier.ownershipPeer = OwnershipPeerForQueue(previousQueue);
+        auto found = std::ranges::find(result.releases, previousQueue, &PreparedExecutionBarrierPlan::Release::queue);
+        if (found == result.releases.end()) {
+            result.releases.push_back({});
+            result.releases.back().queue = previousQueue;
+            found = result.releases.end() - 1;
+        }
+        found->textures.push_back(release);
+        if (std::ranges::find(found->consumers, batch) == found->consumers.end()) found->consumers.push_back(batch);
+        return true;
+    };
     for (const auto& step : graph.states.steps) {
         if (step.resource >= ordered.size() || step.batch >= result.batches.size())
             throw std::invalid_argument("Invalid symbolic state step");
@@ -358,6 +389,7 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
                 barrier.beforeSync = static_cast<rhi::ResourceSyncState>(uniformBefore->sync);
                 barrier.afterSync = static_cast<rhi::ResourceSyncState>(step.after.sync);
                 barrier.discard = barrier.beforeLayout == rhi::ResourceLayout::Undefined;
+                if (!externalAcquire && useSubmittedState) handOff(barrier, captured, uniformPreviousQueue, consumerQueue, step.batch);
                 if (NeedsTextureBarrier(barrier)) boundaryTextures.push_back(barrier);
             } else {
                 const auto beforeAccess = static_cast<rhi::ResourceAccessType>(uniformBefore->access);
@@ -447,10 +479,9 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
                     afterProducer->textures.push_back(release);
                 } else if (externalAcquire) {
                     toExternal(barrier, rhi::QueueOwnership::Acquire);
-                } else if (submittedQueueHandoff) {
-                    // The producer ran in an earlier submission on another queue and
-                    // cannot record a release here. Counted so cross-frame exclusive
-                    // texture handoffs are visible; graph buffers are Concurrent.
+                } else if (submittedQueueHandoff && !handOff(barrier, captured, previousQueue, consumerQueue, step.batch)) {
+                    // An earlier execution left it on a queue whose release cannot be planned (handOff). Counted so these
+                    // handoffs are visible; graph buffers are Concurrent.
                     basic_telemetry::AddCounter("ORG.Execution.CrossFrameTextureQueueHandoff");
                 }
                 if (NeedsTextureBarrier(barrier)) boundaryTextures.push_back(barrier);

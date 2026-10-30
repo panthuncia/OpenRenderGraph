@@ -364,6 +364,33 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 			std::vector<std::shared_ptr<const void>> handoffLeases;
 			if (!admission.closed) {
 				state.admission->Readmit(admission);
+				// Textures an earlier execution left on another queue: released there first, the consumers waiting for it.
+				for (const auto& release : admission.barriers.releases) {
+					BT_ZONE_SCOPE("ORG.Persistent.RecordHandoffRelease");
+					const auto index = static_cast<QueueSlotIndex>(static_cast<uint8_t>(release.queue));
+					// A pending presentation tail owns that queue's next value.
+					if (release.queue >= slotCount || (state.pendingPresentSubmission && index == presentationSlot))
+						throw std::logic_error("A queue handoff's release has no queue value to signal");
+					auto allocation = std::make_shared<compiler::FrameCommandAllocation>();
+					allocation->pool = m_queueRegistry.GetSharedPool(index);
+					allocation->pair = allocation->pool->Request();
+					auto list = allocation->pair.list.Get();
+					rhi::BarrierBatch barriers{};
+					barriers.textures = {release.textures.data(), static_cast<uint32_t>(release.textures.size())};
+					list.Barriers(barriers);
+					if (list.EndChecked() != rhi::Result::Ok) throw std::runtime_error("Handoff release list close failed");
+					allocation->closed = true;
+					const auto signal = state.timelines->SubmitOutside(release.queue);
+					const rhi::TimelinePoint point{m_queueRegistry.GetFence(index).GetHandle(), signal.value};
+					rhi::SubmitDesc submit{};
+					submit.signals = {&point, 1u};
+					if (m_queueRegistry.GetQueue(index).Submit({&list, 1u}, submit) != rhi::Result::Ok)
+						throw std::runtime_error("Handoff release submission failed");
+					m_queueRegistry.EnsureNextFenceValueAtLeast(index, signal.value + 1);
+					for (const auto consumer : release.consumers) admission.incomingWaits.at(consumer).push_back(signal);
+					handoffLeases.push_back(std::move(allocation));
+					basic_telemetry::AddCounter("ORG.Persistent.HandoffReleases");
+				}
 				leading.resize(graph.batches.size());
 				for (uint32_t batch = 0; batch < graph.batches.size(); ++batch) {
 					const auto& entry = admission.barriers.batches[batch];
