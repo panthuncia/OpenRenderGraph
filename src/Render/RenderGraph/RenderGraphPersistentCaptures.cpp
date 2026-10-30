@@ -35,7 +35,12 @@ std::optional<ExternalPassDesc> MakeCapturePass(RenderGraph& graph, runtime::Rea
 		return std::nullopt;
 	}
 	// A resolver's backing may not be a named graph resource; the capture pass declares it like any other.
-	const auto handle = graph.RequestResourceHandle(resource.get(), /*allowFailure=*/true);
+	// Registers a resource the graph does not name yet (a published version's backing), as the capture pass must declare it.
+	ResourceRegistry::RegistryHandle handle;
+	try {
+		handle = graph.RequestResourceHandle(resource.get(), /*allowFailure=*/false);
+	} catch (const std::exception&) {
+	}
 	if (handle.GetGeneration() == 0) {
 		spdlog::warn("Readback capture after '{}': resource {} has no graph handle", capture.passName, capture.resourceId);
 		return std::nullopt;
@@ -192,6 +197,12 @@ PreparedPass AppendPersistentCaptures(RenderGraph& graph, State& state, const St
 		effects.push_back(std::move(plan.reservation));
 		leases->push_back(std::move(plan.destinationLease));
 		copies->push_back({handle, std::move(plan)});
+	}
+	{
+		static std::atomic<uint32_t> reported{0};
+		if (reported.fetch_add(1) < 32)
+			spdlog::info("Readback captures after '{}': {} in its recording, {} to an inserted pass", name, copies->size(),
+				captures.size() - copies->size());
 	}
 	if (copies->empty()) return packet;
 	auto trailer = [copies, textureBarriers, bufferBarriers](RecordingContext& context) {

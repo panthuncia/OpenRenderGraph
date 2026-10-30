@@ -630,7 +630,7 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 	constexpr uint64_t kAutoPoolGlobal = 0xA171000000000000ull;
 	const float threshold = mode == AutoAliasMode::Conservative ? 1.0f : mode == AutoAliasMode::Balanced ? 0.25f
 		: mode == AutoAliasMode::Aggressive ? -0.5f : std::numeric_limits<float>::infinity();
-	// Diagnostic bisection: comma-separated name substrings kept out of the pools.
+	// Diagnostic bisection: comma-separated name substrings kept out of the pools ("*": every resource).
 	static const std::vector<std::string> diagnosticExclusions = [] {
 		std::vector<std::string> out;
 		if (const char* list = std::getenv("ORG_PERSISTENT_ALIAS_EXCLUDE")) {
@@ -650,7 +650,7 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		c.users.erase(std::unique(c.users.begin(), c.users.end()), c.users.end());
 		const auto& name = c.concrete->GetName();
 		if (std::any_of(diagnosticExclusions.begin(), diagnosticExclusions.end(),
-				[&](const std::string& token) { return name.find(token) != std::string::npos; }))
+				[&](const std::string& token) { return token == "*" || name.find(token) != std::string::npos; }))
 			c.exclusion = "ORG_PERSISTENT_ALIAS_EXCLUDE";
 		else if (c.firstUse == UINT32_MAX) { c.exclusion = "unused"; }
 		else if (!c.direct) { c.exclusion = "group member"; }
