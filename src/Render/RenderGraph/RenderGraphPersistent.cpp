@@ -5,14 +5,15 @@
 // order through one SynchronousAdmission, so cross-segment hazards are ordinary
 // previous-submission waits and barriers.
 //
-// Migration status: every existing pass is hosted through the legacy adapter
-// below (declaration lowered once, PrepareFrame per frame). Structural rebuilds
-// run inline on the owner thread. Alias placement is planned inside the
+// Every pass's declaration is lowered (PersistentLowering.h) when it is installed
+// and again when it redeclares; it is prepared through PrepareFrame every frame.
+// Structural rebuilds run inline on the owner thread or on a worker. Alias placement is planned inside the
 // structural build (PlanPersistentAliasPlacement): the executable is scheduled
 // once, transient lifetimes are packed into persistent pool heaps, placement
 // orderings are added, and the executable is rebuilt over the placed bindings.
 #include "Render/RenderGraph/RenderGraph.h"
 #include "RenderGraphCompilerState.h"
+#include "PersistentLowering.h"
 #include "FrameRecording.h"
 #include "ScheduleTraceBuild.h"
 #include "Render/RenderGraph/ExperimentalRhiExecution.h"
@@ -62,68 +63,17 @@ using experimental::CompileResourceShape;
 using experimental::CompileResourceState;
 using experimental::PreparedBackingState;
 using experimental::PreparedStateRegion;
+using lowering::ConcurrentlyShared;
+using lowering::LowerRange;
+using lowering::LowerState;
+using lowering::ShapeOf;
+using lowering::UnwrapDynamic;
 
 ResourceRegistry::RegistryHandle PersistentResolveByIdThunk(void* user, ResourceIdentifier const& id, bool allowFailure) {
 	return static_cast<RenderGraph*>(user)->RequestResourceHandle(id, allowFailure);
 }
 ResourceRegistry::RegistryHandle PersistentResolveByPtrThunk(void* user, Resource* ptr, bool allowFailure) {
 	return static_cast<RenderGraph*>(user)->RequestResourceHandle(ptr, allowFailure);
-}
-
-Resource* UnwrapDynamic(Resource* resource) noexcept {
-	while (resource) {
-		if (auto* dynamic = dynamic_cast<DynamicResource*>(resource)) {
-			auto backing = dynamic->GetResource();
-			if (!backing) return nullptr;
-			resource = backing.get();
-			continue;
-		}
-		if (auto* dynamic = dynamic_cast<DynamicGloballyIndexedResource*>(resource)) {
-			auto backing = dynamic->GetResource();
-			if (!backing) return nullptr;
-			resource = backing.get();
-			continue;
-		}
-		return resource;
-	}
-	return nullptr;
-}
-
-// Whether moving the resource between queues of different families needs no ownership transfer: it was created
-// QueueSharing::Concurrent (every graph buffer is). Unknown resources answer no.
-bool ConcurrentlyShared(const Resource& resource) {
-	rhi::ResourceDesc description{};
-	return resource.TryGetRHIResourceDesc(description) && description.queueSharing == rhi::QueueSharing::Concurrent;
-}
-
-// Shape from the logical description when the texture has no backing yet: an
-// unmaterialized PixelBuffer reports default mip/array counts until realized.
-CompileResourceShape ShapeOf(const Resource& resource) {
-	const auto* concrete = UnwrapDynamic(const_cast<Resource*>(&resource));
-	if (const auto* texture = dynamic_cast<const PixelBuffer*>(concrete); texture && !texture->IsMaterialized()) {
-		const auto& desc = texture->GetDescription();
-		const uint32_t slices = desc.isCubemap ? 6u * desc.arraySize : (desc.isArray ? desc.arraySize : 1u);
-		uint32_t mips = 1;
-		if (!desc.imageDimensions.empty()) {
-			if (slices > 0 && desc.imageDimensions.size() > slices && desc.imageDimensions.size() % slices == 0)
-				mips = static_cast<uint32_t>(desc.imageDimensions.size() / slices);
-			else if (desc.generateMipMaps)
-				mips = static_cast<uint32_t>(std::floor(std::log2((std::max)(desc.imageDimensions[0].width, desc.imageDimensions[0].height)))) + 1;
-		}
-		return {(std::max)(1u, mips), (std::max)(1u, slices), resource.HasLayout(), resource.CommonLayoutOnly()};
-	}
-	return {(std::max)(1u, resource.GetMipLevels()), (std::max)(1u, resource.GetArraySize()), resource.HasLayout(), resource.CommonLayoutOnly()};
-}
-
-CompileResourceState LowerState(const ResourceState& state) {
-	return {static_cast<uint64_t>(state.access), static_cast<uint64_t>(state.layout),
-		static_cast<uint64_t>(state.sync), rhi::AccessTypeIsWriteType(state.access)};
-}
-
-std::optional<CompileRange> LowerRange(const RangeSpec& spec, CompileResourceShape shape) {
-	const auto resolved = ResolveRangeSpec(spec, shape.mips, shape.slices);
-	if (resolved.isEmpty()) return std::nullopt;
-	return CompileRange{resolved.firstMip, resolved.mipCount, resolved.firstSlice, resolved.sliceCount};
 }
 
 std::shared_ptr<const std::vector<PreparedStateRegion>> CaptureRegions(Resource& resource, CompileResourceShape shape) {
@@ -530,7 +480,7 @@ std::vector<experimental::CompileQueue> RegistryQueues(const QueueRegistry& regi
 } // namespace
 
 // ---------------------------------------------------------------------------
-// Declaration lowering (legacy adapter)
+// Lowered-declaration helpers
 
 namespace {
 
@@ -546,6 +496,10 @@ uint64_t FingerprintDeclaration(const experimental::CompilePass& d) {
 	for (const auto slot : slots) mix(0x100 + slot);
 	return h;
 }
+using lowering::FingerprintLowering;
+using lowering::LoweredGroup;
+using lowering::LoweredPass;
+using lowering::LoweredUse;
 uint64_t HashSegmentTemplate(const State::SegmentProgram::Template& t) {
 	uint64_t h = 0x7f4a7c159e3779b9ull;
 	auto mix = [&](uint64_t value) { h ^= value + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2); };
@@ -555,235 +509,8 @@ uint64_t HashSegmentTemplate(const State::SegmentProgram::Template& t) {
 	return h ? h : 1;
 }
 
-struct LoweredUse {
-	uint64_t resourceID = 0;         // Scheduling identity.
-	Resource* resource = nullptr;
-	CompileRange range;
-	CompileResourceState state;
-	// A resolver's resource declared directly: the slot's own reference, as for a group member. The resolver may drop it (a
-	// removed group entry, a versioned buffer's old version) while the slot still names it, and every preparation polls the
-	// slots' backings.
-	std::shared_ptr<Resource> owner;
-};
-struct LoweredGroup {
-	std::shared_ptr<const void> key;
-	std::unique_ptr<IResourceResolver> resolver;
-	std::vector<std::pair<uint64_t, std::shared_ptr<Resource>>> members;
-	std::vector<std::pair<CompileRange, CompileResourceState>> templates;
-	CompileResourceShape shape;
-	ResolverResourceSetIdentity identity{};
-	uint64_t waitRevision = 0;
-	std::vector<ExternalTimelinePoint> waits;
-	bool uniform = true;
-};
-struct LoweredPass {
-    std::shared_ptr<const ResourceUseLayout> resourceUses;
-	experimental::CompilePass declaration;
-	std::vector<LoweredUse> entries, exits;
-	std::vector<LoweredGroup> groups;
-	// The resolvers whose resources are among the entries (not a group), with the set they resolved to.
-	std::vector<std::pair<std::shared_ptr<const IResourceResolver>, ResolverResourceSetIdentity>> directResolvers;
-	std::vector<ExternalTimelinePoint> explicitWaits;
-};
-
-// Structural identity of a lowering. Group membership is deliberately absent:
-// it is a binding edit. A pass whose refreshed declaration hashes equal needs no
-// executable rebuild even though it reported DeclaredResourcesChanged().
-// Order-independent: a refreshed declaration may enumerate the same
-// requirements in a different order (resolver blocks are re-interned).
-uint64_t FingerprintLowering(const LoweredPass& lowered) {
-	auto hashUse = [](const LoweredUse& use) {
-		uint64_t h = 0x9e3779b97f4a7c15ull;
-		auto mix = [&](uint64_t value) { h ^= value + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2); };
-		mix(use.resourceID); mix(use.range.mip); mix(use.range.mips); mix(use.range.slice); mix(use.range.slices);
-		mix(use.state.access); mix(use.state.layout); mix(use.state.sync); mix(use.state.write);
-		return h;
-	};
-	auto hashTemplate = [](const std::pair<CompileRange, CompileResourceState>& request) {
-		uint64_t h = 0x7f4a7c159e3779b9ull;
-		auto mix = [&](uint64_t value) { h ^= value + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2); };
-		const auto& [range, state] = request;
-		mix(range.mip); mix(range.mips); mix(range.slice); mix(range.slices);
-		mix(state.access); mix(state.layout); mix(state.sync); mix(state.write);
-		return h;
-	};
-	std::vector<uint64_t> parts;
-	const auto& d = lowered.declaration;
-	parts.push_back(d.backend); parts.push_back(d.preferredQueueSlot); parts.push_back(d.forceBatchIsolation ? 1 : 0);
-	parts.push_back(d.recordAtExecution ? 1 : 0);
-	{
-		auto slots = d.compatibleQueueSlots; std::sort(slots.begin(), slots.end());
-		for (auto slot : slots) parts.push_back(0x100 + slot);
-	}
-	std::vector<uint64_t> entries, exits, groups;
-	for (const auto& use : lowered.entries) entries.push_back(hashUse(use));
-	for (const auto& use : lowered.exits) exits.push_back(hashUse(use));
-	for (const auto& group : lowered.groups) {
-		std::vector<uint64_t> templates;
-		for (const auto& request : group.templates) templates.push_back(hashTemplate(request));
-		std::sort(templates.begin(), templates.end());
-		uint64_t h = reinterpret_cast<uintptr_t>(group.key.get());
-		h ^= (uint64_t{group.shape.mips} << 40) ^ (uint64_t{group.shape.slices} << 20) ^ (group.shape.hasLayout ? 1 : 0);
-		for (auto t : templates) h ^= t + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
-		groups.push_back(h);
-	}
-	std::sort(entries.begin(), entries.end()); std::sort(exits.begin(), exits.end()); std::sort(groups.begin(), groups.end());
-	entries.erase(std::unique(entries.begin(), entries.end()), entries.end());
-	uint64_t h = 0xcbf29ce484222325ull;
-	auto fold = [&](uint64_t value) { h ^= value; h *= 0x100000001b3ull; h ^= h >> 29; };
-	for (auto v : parts) fold(v);
-	fold(0xE1); for (auto v : entries) fold(v);
-	fold(0xE2); for (auto v : exits) fold(v);
-	fold(0xE3); for (auto v : groups) fold(v);
-    if (lowered.resourceUses) for (const auto& group : lowered.resourceUses->resolverViews) {
-        fold(reinterpret_cast<uintptr_t>(group.identity.get()));
-        for (const auto view : group.views) {
-            fold(static_cast<uint64_t>(view.kind)); fold(view.variant); fold(view.mip); fold(view.slice);
-        }
-        fold(UINT64_MAX);
-    }
-    if (lowered.resourceUses) for (const auto& use : lowered.resourceUses->uses) {
-        fold(use.resolverIdentity ? reinterpret_cast<uintptr_t>(use.resolverIdentity.get()) : use.binding.registryResourceID);
-        fold(use.memberOrdinal); fold(static_cast<uint64_t>(use.state.access));
-        for (const auto view : use.requiredViews) {
-            fold(static_cast<uint64_t>(view.kind)); fold(view.variant); fold(view.mip); fold(view.slice);
-        }
-        fold(UINT64_MAX);
-    }
-
-	return h;
-}
 
 } // namespace
-
-// Lowers one pass's current declaration state. Resolver snapshots become
-// reserved-capacity groups only when the pass keeps them separately (patchable);
-// otherwise their members are already merged into the static requirements.
-static LoweredPass LowerLegacyPass(RenderGraph& graph, ResourceRegistry& registry, const QueueRegistry& queues,
-	rhi::Backend primaryBackend, const RenderGraph::PassAndResources& pass, RenderGraph::PassType type, uint32_t phase) {
-	LoweredPass result;
-    result.resourceUses = pass.pass->ResourceUses();
-	auto& declaration = result.declaration;
-	// Queue compatibility mirrors BuildNodes for the retained path.
-	const auto& resources = pass.resources;
-	std::vector<uint32_t> compatible;
-	if (resources.pinnedQueueSlot) compatible.push_back(static_cast<uint32_t>(static_cast<uint8_t>(*resources.pinnedQueueSlot)));
-	else {
-		auto kindCompatible = [&](QueueKind kind) {
-			switch (type) {
-			case RenderGraph::PassType::Render: return kind == QueueKind::Graphics;
-			case RenderGraph::PassType::Compute: return kind == QueueKind::Graphics || kind == QueueKind::Compute;
-			default: return true;
-			}
-		};
-		for (size_t slot = 0; slot < queues.SlotCount(); ++slot) {
-			const auto index = static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot));
-			if (!queues.IsAutoAssignable(index)) continue;
-			const auto kind = queues.GetKind(index);
-			const bool automatic = resources.queueAssignmentPolicy == QueueAssignmentPolicy::Automatic && kindCompatible(kind);
-			if (automatic || kind == resources.preferredQueueKind) compatible.push_back(static_cast<uint32_t>(slot));
-		}
-		if (compatible.empty()) compatible.push_back(static_cast<uint32_t>(resources.preferredQueueKind));
-	}
-	const bool d3d12OwnedQueueTransfers = queues.SlotCount() != 0
-		&& queues.GetBackend(static_cast<QueueSlotIndex>(0)) == rhi::Backend::D3D12;
-	declaration.compatibleQueueSlots = compatible;
-	declaration.preferredQueueSlot = compatible.front();
-	declaration.backend = static_cast<uint32_t>(resources.backendAffinity.strength == BackendAffinityStrength::Primary
-		? primaryBackend : resources.backendAffinity.backend);
-	// A pass recorded at execution is a batch of its own: the batch is recorded by the host's execution, the rest ahead.
-	declaration.recordAtExecution = pass.recordAtExecution;
-	declaration.forceBatchIsolation = !resources.externalWaitsBeforeTransitions.empty()
-		|| !resources.externalWaitBindingsBeforeTransitions.empty() || pass.recordAtExecution;
-	result.explicitWaits = resources.externalWaitsBeforeTransitions;
-
-	auto resolve = [&](const ResourceRegistry::RegistryHandle& handle) -> Resource* {
-		return handle.IsEphemeral() ? handle.GetEphemeralPtr() : registry.Resolve(handle);
-	};
-	auto lowerRequirement = [&](const ResourceRequirement& requirement) {
-		auto* resource = resolve(requirement.resourceHandleAndRange.resource);
-		if (!resource) throw std::runtime_error("Persistent lowering: pass '" + pass.name + "' declares an unresolvable resource");
-		const auto shape = ShapeOf(*resource);
-		const auto range = LowerRange(requirement.resourceHandleAndRange.range, shape);
-		if (!range) return;
-		result.entries.push_back({resource->GetSchedulingResourceID(), resource, *range, LowerState(requirement.state)});
-	};
-	const bool grouped = pass.declarationCache.incrementalResolverPatchable
-		&& !resources.resolverRequirementBlocks.empty()
-		&& resources.resolverRequirementBlocks.size() == pass.resolverSnapshots.size();
-	if (grouped) {
-		for (const auto& requirement : resources.staticResourceRequirements) lowerRequirement(requirement);
-		for (size_t i = 0; i < pass.resolverSnapshots.size(); ++i) {
-			const auto& snapshot = pass.resolverSnapshots[i];
-			LoweredGroup group;
-			group.key = snapshot.dependencyIdentity;
-			group.resolver = snapshot.resolver ? snapshot.resolver->Clone() : nullptr;
-			group.identity = snapshot.resourceSetIdentity;
-			group.waitRevision = snapshot.waitRevision;
-			group.waits = snapshot.waits;
-			const auto state = graph.CaptureResolverDeclarationState(*snapshot.resolver);
-			std::optional<CompileResourceShape> shape;
-			if (state && state->resources) for (const auto& member : *state->resources) {
-				if (!member) continue;
-				const auto memberShape = ShapeOf(*member);
-				if (!shape) shape = memberShape;
-				else if (*shape != memberShape) group.uniform = false;
-				group.members.emplace_back(member->GetSchedulingResourceID(), member);
-			}
-			group.shape = shape.value_or(CompileResourceShape{1, 1, false});
-			for (const auto& request : snapshot.requirementTemplates) {
-				const auto range = LowerRange(request.range, group.shape);
-				if (!range) { group.uniform = false; continue; }
-				group.templates.emplace_back(*range, LowerState(request.state));
-			}
-			if (group.uniform && group.key && group.resolver && !group.templates.empty()) { result.groups.push_back(std::move(group)); continue; }
-			// Mixed shapes: fall back to direct declarations for this resolver.
-			if (snapshot.resolver)
-				result.directResolvers.emplace_back(snapshot.resolver->Clone(), state ? state->resourceSetIdentity : snapshot.resourceSetIdentity);
-			for (const auto& [id, member] : group.members)
-				for (const auto& request : snapshot.requirementTemplates) {
-					const auto memberShape = ShapeOf(*member);
-					const auto range = LowerRange(request.range, memberShape);
-					if (range) result.entries.push_back({id, member.get(), *range, LowerState(request.state), member});
-				}
-		}
-	} else {
-		for (const auto& requirement : GetFrameRequirementsSpan(resources)) lowerRequirement(requirement);
-		std::unordered_map<const Resource*, std::shared_ptr<Resource>> owners;
-		for (const auto& snapshot : pass.resolverSnapshots) {
-			if (!snapshot.resolver) continue;
-			const auto state = graph.CaptureResolverDeclarationState(*snapshot.resolver);
-			result.directResolvers.emplace_back(snapshot.resolver->Clone(), state ? state->resourceSetIdentity : snapshot.resourceSetIdentity);
-			if (state && state->resources)
-				for (const auto& member : *state->resources) if (member) owners.emplace(member.get(), member);
-		}
-		for (auto& use : result.entries)
-			if (const auto found = owners.find(use.resource); found != owners.end()) use.owner = found->second;
-	}
-	for (const auto& [handleAndRange, state] : resources.internalTransitions) {
-		auto* resource = resolve(handleAndRange.resource);
-		if (!resource) throw std::runtime_error("Persistent lowering: pass '" + pass.name + "' transitions an unresolvable resource");
-		const auto shape = ShapeOf(*resource);
-		const auto range = LowerRange(handleAndRange.range, shape);
-		if (!range) continue;
-		result.exits.push_back({resource->GetSchedulingResourceID(), resource, *range, LowerState(state)});
-	}
-	// D3D12 admission emits the producer's release and the consumer's acquire around a cross-queue wait. Elsewhere a
-	// pass leaves the graphics route only when nothing it touches needs a queue-family ownership transfer.
-	if (!d3d12OwnedQueueTransfers) {
-		bool concurrent = true;
-		for (const auto& use : result.entries) concurrent = concurrent && use.resource && ConcurrentlyShared(*use.resource);
-		for (const auto& use : result.exits) concurrent = concurrent && use.resource && ConcurrentlyShared(*use.resource);
-		for (const auto& group : result.groups)
-			for (const auto& [id, member] : group.members) concurrent = concurrent && member && ConcurrentlyShared(*member);
-		if (!concurrent) {
-			declaration.compatibleQueueSlots.assign(1, 0u);
-			declaration.preferredQueueSlot = 0u;
-		}
-	}
-	(void)phase;
-	return result;
-}
 
 // ---------------------------------------------------------------------------
 // Program editing helpers (owner thread)
@@ -1223,9 +950,10 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 			auto& any = m_masterPassList[main.masterIndex];
 			std::visit([&](auto& value) {
 				using T = std::decay_t<decltype(value)>;
-				if constexpr (!std::is_same_v<T, std::monostate>)
+				if constexpr (!std::is_same_v<T, std::monostate>) {
 					InstallMainPass(*this, state, edit, main,
-						LowerLegacyPass(*this, _registry, m_queueRegistry, primaryBackend, value, any.type, mainIndex), mainIndex, false);
+						lowering::LowerPass(*this, _registry, m_queueRegistry, primaryBackend, value, any.type), mainIndex, false);
+				}
 			}, any.pass);
 		}
 		// Explicit structural ordering: the master list is already topologically
@@ -1380,7 +1108,7 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 			std::visit([&](auto& value) {
 				using T = std::decay_t<decltype(value)>;
 				if constexpr (!std::is_same_v<T, std::monostate>) {
-					auto* dynamic = value.declarationCache.dynamicInterface;
+					auto* dynamic = dynamic_cast<IDynamicDeclaredResources*>(value.pass.get());
 					const bool declared = dynamic && dynamic->DeclaredResourcesChanged() && !dynamic->DeclarationsProvidedByImmediateCommands();
 					// A resolver declared directly is lowered as the set it resolved to; another set means the pass is lowered
 					// again, from a fresh declaration, before it is prepared.
@@ -1393,8 +1121,8 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 					BT_ZONE_SCOPE("ORG.Persistent.RefreshDeclaration");
 					BT_ZONE_TEXT(any.name.data(), any.name.size());
 					++refreshed;
-					if (!RefreshRetainedDeclarationsForFrame(value, frameIndex) && !directStale) return;
-					auto lowered = LowerLegacyPass(*this, _registry, m_queueRegistry, primaryBackend, value, any.type, mainIndex);
+					RedeclarePass(value, any.type);
+					auto lowered = lowering::LowerPass(*this, _registry, m_queueRegistry, primaryBackend, value, any.type);
 					// Membership-only change: the same structure under the same declared layout. A new layout re-issues the pass's
 					// binding tokens, which only a reinstalled lowering resolves.
 					if (FingerprintLowering(lowered) == main.fingerprint && lowered.resourceUses == main.resourceUses) {
@@ -1943,11 +1671,11 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 								}, +[](const ReplayData& data) { if (data.commit) data.commit(); },
 								effect ? std::move(effect->completionSignals) : std::vector<ExternalTimelinePoint>{});
 						} else {
-							if (auto* dynamic = value.declarationCache.dynamicInterface; dynamic && dynamic->DeclaredResourcesChanged()) {
+							if (auto* dynamic = dynamic_cast<IDynamicDeclaredResources*>(value.pass.get()); dynamic && dynamic->DeclaredResourcesChanged()) {
 								BT_ZONE_SCOPE("ORG.Persistent.DynamicSegment.RefreshDeclarations");
-								RefreshRetainedDeclarationsForFrame(value, frameIndex);
+								RedeclarePass(value, any.type);
 							}
-							{ BT_ZONE_SCOPE("ORG.Persistent.DynamicSegment.LowerLegacyPass"); lowered = LowerLegacyPass(*this, _registry, m_queueRegistry, primaryBackend, value, any.type, passIndex); }
+							{ BT_ZONE_SCOPE("ORG.Persistent.DynamicSegment.LowerPass"); lowered = lowering::LowerPass(*this, _registry, m_queueRegistry, primaryBackend, value, any.type); }
 							// Groups are meaningless for one-frame programs: declare members directly.
 							for (auto& group : lowered.groups)
 								for (const auto& [id, resource] : group.members)
@@ -2559,7 +2287,7 @@ void RenderGraph::SubmitPersistentStructuralBuild(const std::vector<uint32_t>& s
 		std::visit([&](auto& value) {
 			using T = std::decay_t<decltype(value)>;
 			if constexpr (!std::is_same_v<T, std::monostate>) {
-				auto lowered = LowerLegacyPass(*this, _registry, m_queueRegistry, primaryBackend, value, any.type, mainIndex);
+				auto lowered = lowering::LowerPass(*this, _registry, m_queueRegistry, primaryBackend, value, any.type);
 				if (LoweringAddsDeclarations(main, lowered)) inlineRequired = true;
 				lowerings.emplace(mainIndex, std::move(lowered));
 			}
@@ -3075,7 +2803,7 @@ std::vector<RenderGraph::ExternalPassDesc> RenderGraph::UpdatePersistentFrameInt
 		std::visit([&](auto& value) {
 			using T = std::decay_t<decltype(value)>;
 			if constexpr (!std::is_same_v<T, std::monostate>) {
-				auto lowered = LowerLegacyPass(*this, _registry, m_queueRegistry, primaryBackend, value, any.type, mainIndex);
+				auto lowered = lowering::LowerPass(*this, _registry, m_queueRegistry, primaryBackend, value, any.type);
 				std::vector<Resource*> resources;
 				for (const auto& use : lowered.entries) resources.push_back(use.resource);
 				for (const auto& group : lowered.groups) for (const auto& [id, resource] : group.members) resources.push_back(resource.get());

@@ -398,6 +398,14 @@ public:
 		bool initialFromUndefined = false;
 	};
 
+	// How a pass's resolvers lower as persistent groups, decided when the pass declares (while its resolver snapshots
+	// still list their declared members): one requirement template list per resolver snapshot, and the declared members
+	// the groups cover. Absent when one of the resolvers is not patchable; they then lower as direct entries.
+	struct ResolverGroupPlan {
+		std::vector<std::vector<ResolverSnapshot::RequirementTemplate>> templates;
+		std::unordered_set<uint64_t> memberIDs;
+	};
+
 	struct PassAndResources {
 		std::shared_ptr<RenderGraphPass> pass;
 		bool unifiedDeclaration = false;
@@ -416,6 +424,7 @@ public:
 		std::vector<ResolverSnapshot> resolverSnapshots; // Versioned resolver snapshots for auto-invalidation
 		std::vector<ExternalTimelinePoint> explicitExternalWaitsBeforeTransitions;
 		RetainedDeclarationCache declarationCache;
+		std::optional<ResolverGroupPlan> resolverGroupPlan;
 		std::vector<ResourceTransition> backendPreTransitions;
 		std::vector<ResourceTransition> backendPostTransitions;
 		std::vector<ExternalOwnershipBarrier> externalAcquires;
@@ -1954,6 +1963,10 @@ public: // Internal builder/compiler bridge; not part of the fluent declaration 
 
 private:
 
+	// Re-runs the pass's declaration against current per-frame state: requirements, transitions, waits, resolver
+	// snapshots, referenced resources and (when they depend on it) its registry view and Setup. Persistent execution
+	// lowers from this directly; the old compiler's RefreshRetainedDeclarationsForFrame also updates its declaration cache.
+	void RedeclarePass(PassAndResources& p, PassType type);
 	bool RefreshRetainedDeclarationsForFrame(RenderPassAndResources& p, uint8_t frameIndex);
 	bool RefreshRetainedDeclarationsForFrame(ComputePassAndResources& p, uint8_t frameIndex);
 	bool RefreshRetainedDeclarationsForFrame(CopyPassAndResources& p, uint8_t frameIndex);

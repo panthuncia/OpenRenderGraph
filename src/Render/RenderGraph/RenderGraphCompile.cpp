@@ -2,6 +2,7 @@
 #include "FrameTrace.h"
 #include "Render/RenderGraph/CompileTelemetry.h"
 #include "RenderGraphCompilerState.h"
+#include "PersistentLowering.h"
 #include "Render/RenderGraph/ExperimentalRhiExecution.h"
 #include "Render/Runtime/ScopedActiveGraphServices.h"
 
@@ -669,16 +670,19 @@ void FinalizeResolverRequirementSegments(RenderGraph& graph, const ResourceRegis
 }
 
 void RenderGraph::UpdateRetainedDeclarationCache(PassType type, std::string_view name, RenderPassAndResources& passAndResources) {
+	passAndResources.resolverGroupPlan = lowering::PlanResolverGroups(passAndResources);
 	UpdateRetainedDeclarationCacheImpl(_registry, type, name, passAndResources);
 	FinalizeResolverRequirementSegments(*this, _registry, passAndResources);
 }
 
 void RenderGraph::UpdateRetainedDeclarationCache(PassType type, std::string_view name, ComputePassAndResources& passAndResources) {
+	passAndResources.resolverGroupPlan = lowering::PlanResolverGroups(passAndResources);
 	UpdateRetainedDeclarationCacheImpl(_registry, type, name, passAndResources);
 	FinalizeResolverRequirementSegments(*this, _registry, passAndResources);
 }
 
 void RenderGraph::UpdateRetainedDeclarationCache(PassType type, std::string_view name, CopyPassAndResources& passAndResources) {
+	passAndResources.resolverGroupPlan = lowering::PlanResolverGroups(passAndResources);
 	UpdateRetainedDeclarationCacheImpl(_registry, type, name, passAndResources);
 	FinalizeResolverRequirementSegments(*this, _registry, passAndResources);
 }
@@ -2606,7 +2610,10 @@ void RenderGraph::PrepareAndCompileFrame(rhi::Device device, uint8_t frameIndex,
     BT_ZONE_SCOPE("ORG.Frame.PrepareAndCompile");
     if (m_compilerState->frameProductionStopped)
         throw std::logic_error("Frame production has stopped");
-    if (m_persistentExecution && m_taskService) {
+    if (m_persistentExecution) {
+        // Persistent structural builds, preparation and ownership retirement run on the task service; there is no
+        // inline fallback.
+        if (!m_taskService) throw std::logic_error("Persistent execution requires a task service");
         PreparePersistentFrame(device, frameIndex, hostData, deltaTime);
         return;
     }

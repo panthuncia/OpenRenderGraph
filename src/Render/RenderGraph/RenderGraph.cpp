@@ -1,6 +1,7 @@
 #include "Render/RenderGraph/RenderGraph.h"
 #include "Render/Runtime/OpenRenderGraphSettings.h"
 #include "RenderGraphCompilerState.h"
+#include "PersistentLowering.h"
 #include "FrameRecording.h"
 #include "FrameTrace.h"
 #include "Render/RenderGraph/InteropAllocator.h"
@@ -8,6 +9,7 @@
 
 #include <span>
 #include <algorithm>
+#include <type_traits>
 #include <atomic>
 #include <cmath>
 #include <map>
@@ -5911,313 +5913,90 @@ static bool RequirementsConflict(
 }
 
 
-bool RenderGraph::RefreshRetainedDeclarationsForFrame(RenderPassAndResources& p, uint8_t frameIndex)
+void RenderGraph::RedeclarePass(PassAndResources& p, PassType type)
 {
-	BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Render)");
-	const bool traceLifecycle = m_getRenderGraphBatchTraceEnabled && m_getRenderGraphBatchTraceEnabled();
-	const uint64_t previousDeclarationFingerprint = p.declarationCache.declarationFingerprint;
-	if (!p.name.empty()) {
-		BT_ZONE_TEXT(p.name.data(), p.name.size());
-	}
-	if (traceLifecycle) {
-		spdlog::info("RG frame {} refresh render pass '{}' declare begin", frameIndex, p.name);
-	}
-	RenderPassBuilder b(this, p.name);
-	auto renderPass = std::dynamic_pointer_cast<RenderPass>(p.pass);
-	if (!renderPass) {
-		throw std::logic_error("Render-tagged pass does not implement the legacy render declaration interface");
-	}
-
-	// Make it look like a normal builder enough for any pass code that queries ResourceProvider()
-	b.pass = renderPass;
-	b.built_ = true;
-
-	// Clear any previous declarations
-	b.params = {};
-	b._declaredIds.clear();
-
-	// Let the pass declare based on current per-frame state (queued mip jobs etc.)
-	{
-		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Render)::EnsureProviderRegistered");
+	BT_ZONE_SCOPE("RenderGraph::RedeclarePass");
+	if (!p.name.empty()) { BT_ZONE_TEXT(p.name.data(), p.name.size()); }
+	auto redeclare = [&]<class Builder, class Pass>(std::type_identity<Builder>, std::type_identity<Pass>, const char* kind) {
+		auto pass = std::dynamic_pointer_cast<Pass>(p.pass);
+		if (!pass)
+			throw std::logic_error(std::string(kind) + "-tagged pass '" + p.name + "' does not implement its declaration interface");
+		// Enough of a built builder for pass code that queries ResourceProvider().
+		Builder b(this, p.name);
+		b.pass = pass;
+		b.built_ = true;
 		EnsureProviderRegistered(p.pass.get());
-	}
-	{
-		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Render)::DeclareResourceUsages");
-		if (!p.name.empty()) {
-			BT_ZONE_TEXT(p.name.data(), p.name.size());
+		{
+			BT_ZONE_SCOPE("RenderGraph::RedeclarePass::DeclareResourceUsages");
+			pass->DeclareResourceUsages(&b);
 		}
-		renderPass->DeclareResourceUsages(&b);
-	}
-	if (traceLifecycle) {
-		spdlog::info("RG frame {} refresh render pass '{}' declare complete requirements={} transitions={}", frameIndex, p.name, b.GatherResourceRequirements().size(), b.params.internalTransitions.size());
-	}
-	auto refreshedRequirements = b.GatherResourceRequirements();
-	BT_PLOT("ORG.RefreshRetained.Render.Requirements", static_cast<int64_t>(refreshedRequirements.size()));
-	BT_PLOT("ORG.RefreshRetained.Render.InternalTransitions", static_cast<int64_t>(b.params.internalTransitions.size()));
-	BT_PLOT("ORG.RefreshRetained.Render.DeclaredIds", static_cast<int64_t>(b.DeclaredResourceIds().size()));
-
-	// Update the frame view used by scheduling
-	{
-		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Render)::StoreRequirements");
-		p.resources.staticResourceRequirements = std::move(refreshedRequirements);
-		p.resources.resolverRequirementBlocks.clear();
-		p.resources.mergedFrameRequirementsDirty = true;
-
-		// Internal transitions also affect scheduling
-		p.resources.internalTransitions = std::move(b.params.internalTransitions);
-
-		p.resources.identifierSet = std::move(b._declaredIds);
-		p.resources.autoDescriptorShaderResources = std::move(b.params.autoDescriptorShaderResources);
-		p.resources.autoDescriptorConstantBuffers = std::move(b.params.autoDescriptorConstantBuffers);
-		p.resources.autoDescriptorUnorderedAccessViews = std::move(b.params.autoDescriptorUnorderedAccessViews);
-		p.resources.activeFeatureDomains = std::move(b.params.activeFeatureDomains);
+		auto& resources = p.resources;
+		resources.staticResourceRequirements = b.GatherResourceRequirements();
+		resources.resolverRequirementBlocks.clear();
+		resources.mergedFrameRequirementsDirty = true;
+		resources.internalTransitions = std::move(b.params.internalTransitions);
+		resources.identifierSet = std::move(b._declaredIds);
+		if constexpr (!std::is_same_v<Builder, CopyPassBuilder>) {
+			resources.autoDescriptorShaderResources = std::move(b.params.autoDescriptorShaderResources);
+			resources.autoDescriptorConstantBuffers = std::move(b.params.autoDescriptorConstantBuffers);
+			resources.autoDescriptorUnorderedAccessViews = std::move(b.params.autoDescriptorUnorderedAccessViews);
+			resources.activeFeatureDomains = std::move(b.params.activeFeatureDomains);
+		}
 		p.explicitExternalWaitsBeforeTransitions = b.params.externalWaitsBeforeTransitions;
-		p.resources.externalWaitsBeforeTransitions = std::move(b.params.externalWaitsBeforeTransitions);
-		p.resources.externalWaitBindingsBeforeTransitions = std::move(b.params.externalWaitBindingsBeforeTransitions);
-	}
-	if (traceLifecycle) {
-		spdlog::info("RG frame {} refresh render pass '{}' materialize referenced resources begin", frameIndex, p.name);
-	}
-	{
-		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Render)::MaterializeReferencedResources");
-		MaterializeReferencedResources(p.resources.staticResourceRequirements, p.resources.internalTransitions);
-	}
-
-	// Transfer resolver snapshots for auto-invalidation tracking
-	{
-		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Render)::CaptureResolverSnapshots");
+		resources.externalWaitsBeforeTransitions = std::move(b.params.externalWaitsBeforeTransitions);
+		resources.externalWaitBindingsBeforeTransitions = std::move(b.params.externalWaitBindingsBeforeTransitions);
+		{
+			BT_ZONE_SCOPE("RenderGraph::RedeclarePass::MaterializeReferencedResources");
+			MaterializeReferencedResources(resources.staticResourceRequirements, resources.internalTransitions);
+		}
 		p.resolverSnapshots = b.TakeResolverSnapshots();
-		MergeResolverWaits(p.resources.externalWaitsBeforeTransitions, p.resolverSnapshots);
-		p.retainedAnonymousKeepAlive = CaptureRetainedAnonymousKeepAlive(
-			p.resources.staticResourceRequirements,
-			p.resources.internalTransitions);
+		MergeResolverWaits(resources.externalWaitsBeforeTransitions, p.resolverSnapshots);
+		p.retainedAnonymousKeepAlive = CaptureRetainedAnonymousKeepAlive(resources.staticResourceRequirements, resources.internalTransitions);
+		p.resolverGroupPlan = lowering::PlanResolverGroups(p);
+		// A versioned resolver can replace the concrete resource behind an unchanged identifier: the view and Setup are
+		// rebuilt so automatic descriptor bindings follow it. Immediate-only upload and readback passes consume the
+		// resources captured in their bytecode and opt out.
+		const auto* dynamic = dynamic_cast<IDynamicDeclaredResources*>(p.pass.get());
+		const bool rebind = (!std::is_same_v<Builder, CopyPassBuilder> && !p.resolverSnapshots.empty())
+			|| !dynamic || dynamic->RequiresPassRebindAfterDeclarationRefresh();
+		if (rebind) {
+			BT_ZONE_SCOPE("RenderGraph::RedeclarePass::Rebind");
+			p.pass->ConfigureRuntimeServices(m_uploadService, m_descriptorService);
+			p.pass->ConfigureResourceRegistryView(MakePassResourceRegistryView(_registry, resources), resources);
+			p.pass->Setup();
+		}
+	};
+	p.resolverGroupPlan.reset();
+	switch (type) {
+	case PassType::Render: redeclare(std::type_identity<RenderPassBuilder>{}, std::type_identity<RenderPass>{}, "Render"); break;
+	case PassType::Compute: redeclare(std::type_identity<ComputePassBuilder>{}, std::type_identity<ComputePass>{}, "Compute"); break;
+	case PassType::Copy: redeclare(std::type_identity<CopyPassBuilder>{}, std::type_identity<CopyPass>{}, "Copy"); break;
+	default: throw std::logic_error("Pass '" + p.name + "' has no declaration interface");
 	}
-	{
-		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Render)::UpdateRetainedDeclarationCache");
-		UpdateRetainedDeclarationCache(PassType::Render, p.name, p);
-	}
-
-	// A versioned resolver can replace the concrete resource behind an otherwise
-	// unchanged identifier.  Rebuild the pass view/setup in that case so automatic
-	// descriptor bindings follow the newly resolved resource instead of retaining
-	// the descriptor captured from the previous resolver version.
-	const bool requiresPassRebind = !p.resolverSnapshots.empty() ||
-		!p.declarationCache.dynamicInterface ||
-		p.declarationCache.dynamicInterface->RequiresPassRebindAfterDeclarationRefresh();
-	// Only retained passes that resolve through their view or perform declaration-
-	// dependent setup need these execution helpers rebuilt. Immediate-only upload
-	// and readback passes consume the resources captured in their bytecode.
-	if (requiresPassRebind) {
-		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Render)::SetResourceRegistryView");
-		p.pass->ConfigureRuntimeServices(m_uploadService, m_descriptorService);
-		p.pass->ConfigureResourceRegistryView(MakePassResourceRegistryView(_registry, p.resources), p.resources);
-	}
-	if (traceLifecycle) {
-		spdlog::info("RG frame {} refresh render pass '{}' setup begin", frameIndex, p.name);
-	}
-	if (requiresPassRebind) {
-		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Render)::Setup");
-		p.pass->Setup();
-	}
-	if (traceLifecycle) {
-		spdlog::info("RG frame {} refresh render pass '{}' setup complete", frameIndex, p.name);
-	}
-	return previousDeclarationFingerprint != p.declarationCache.declarationFingerprint;
 }
 
-bool RenderGraph::RefreshRetainedDeclarationsForFrame(ComputePassAndResources& p, uint8_t frameIndex)
+bool RenderGraph::RefreshRetainedDeclarationsForFrame(RenderPassAndResources& p, uint8_t)
 {
-	BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Compute)");
-	const bool traceLifecycle = m_getRenderGraphBatchTraceEnabled && m_getRenderGraphBatchTraceEnabled();
-	const uint64_t previousDeclarationFingerprint = p.declarationCache.declarationFingerprint;
-	if (!p.name.empty()) {
-		BT_ZONE_TEXT(p.name.data(), p.name.size());
-	}
-	if (traceLifecycle) {
-		spdlog::info("RG frame {} refresh compute pass '{}' declare begin", frameIndex, p.name);
-	}
-	ComputePassBuilder b(this, p.name);
-	auto computePass = std::dynamic_pointer_cast<ComputePass>(p.pass);
-	if (!computePass) {
-		throw std::logic_error("Compute-tagged pass does not implement the legacy compute declaration interface");
-	}
-	b.pass = computePass;
-	b.built_ = true;
-
-	b.params = {};
-	b._declaredIds.clear();
-
-	{
-		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Compute)::EnsureProviderRegistered");
-		EnsureProviderRegistered(p.pass.get());
-	}
-	{
-		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Compute)::DeclareResourceUsages");
-		if (!p.name.empty()) {
-			BT_ZONE_TEXT(p.name.data(), p.name.size());
-		}
-		computePass->DeclareResourceUsages(&b);
-	}
-	if (traceLifecycle) {
-		spdlog::info("RG frame {} refresh compute pass '{}' declare complete requirements={} transitions={}", frameIndex, p.name, b.GatherResourceRequirements().size(), b.params.internalTransitions.size());
-	}
-	auto refreshedRequirements = b.GatherResourceRequirements();
-	BT_PLOT("ORG.RefreshRetained.Compute.Requirements", static_cast<int64_t>(refreshedRequirements.size()));
-	BT_PLOT("ORG.RefreshRetained.Compute.InternalTransitions", static_cast<int64_t>(b.params.internalTransitions.size()));
-	BT_PLOT("ORG.RefreshRetained.Compute.DeclaredIds", static_cast<int64_t>(b.DeclaredResourceIds().size()));
-
-	{
-		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Compute)::StoreRequirements");
-		p.resources.staticResourceRequirements = std::move(refreshedRequirements);
-		p.resources.resolverRequirementBlocks.clear();
-		p.resources.mergedFrameRequirementsDirty = true;
-		p.resources.internalTransitions = std::move(b.params.internalTransitions);
-		p.resources.identifierSet = std::move(b._declaredIds);
-		p.resources.autoDescriptorShaderResources = std::move(b.params.autoDescriptorShaderResources);
-		p.resources.autoDescriptorConstantBuffers = std::move(b.params.autoDescriptorConstantBuffers);
-		p.resources.autoDescriptorUnorderedAccessViews = std::move(b.params.autoDescriptorUnorderedAccessViews);
-		p.resources.activeFeatureDomains = std::move(b.params.activeFeatureDomains);
-		p.explicitExternalWaitsBeforeTransitions = b.params.externalWaitsBeforeTransitions;
-		p.resources.externalWaitsBeforeTransitions = std::move(b.params.externalWaitsBeforeTransitions);
-		p.resources.externalWaitBindingsBeforeTransitions = std::move(b.params.externalWaitBindingsBeforeTransitions);
-	}
-	if (traceLifecycle) {
-		spdlog::info("RG frame {} refresh compute pass '{}' materialize referenced resources begin", frameIndex, p.name);
-	}
-	{
-		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Compute)::MaterializeReferencedResources");
-		MaterializeReferencedResources(p.resources.staticResourceRequirements, p.resources.internalTransitions);
-	}
-
-	// Transfer resolver snapshots for auto-invalidation tracking
-	{
-		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Compute)::CaptureResolverSnapshots");
-		p.resolverSnapshots = b.TakeResolverSnapshots();
-		MergeResolverWaits(p.resources.externalWaitsBeforeTransitions, p.resolverSnapshots);
-		p.retainedAnonymousKeepAlive = CaptureRetainedAnonymousKeepAlive(
-			p.resources.staticResourceRequirements,
-			p.resources.internalTransitions);
-	}
-	{
-		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Compute)::UpdateRetainedDeclarationCache");
-		UpdateRetainedDeclarationCache(PassType::Compute, p.name, p);
-	}
-
-	const bool requiresPassRebind = !p.resolverSnapshots.empty() ||
-		!p.declarationCache.dynamicInterface ||
-		p.declarationCache.dynamicInterface->RequiresPassRebindAfterDeclarationRefresh();
-	if (requiresPassRebind) {
-		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Compute)::SetResourceRegistryView");
-		p.pass->ConfigureRuntimeServices(m_uploadService, m_descriptorService);
-		p.pass->ConfigureResourceRegistryView(MakePassResourceRegistryView(_registry, p.resources), p.resources);
-	}
-	if (traceLifecycle) {
-		spdlog::info("RG frame {} refresh compute pass '{}' setup begin", frameIndex, p.name);
-	}
-
-	if (requiresPassRebind) {
-		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Compute)::Setup");
-		p.pass->Setup();
-	}
-	if (traceLifecycle) {
-		spdlog::info("RG frame {} refresh compute pass '{}' setup complete", frameIndex, p.name);
-	}
-	return previousDeclarationFingerprint != p.declarationCache.declarationFingerprint;
+	const uint64_t previous = p.declarationCache.declarationFingerprint;
+	RedeclarePass(p, PassType::Render);
+	UpdateRetainedDeclarationCache(PassType::Render, p.name, p);
+	return previous != p.declarationCache.declarationFingerprint;
 }
 
-bool RenderGraph::RefreshRetainedDeclarationsForFrame(CopyPassAndResources& p, uint8_t frameIndex)
+bool RenderGraph::RefreshRetainedDeclarationsForFrame(ComputePassAndResources& p, uint8_t)
 {
-	BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Copy)");
-	const bool traceLifecycle = m_getRenderGraphBatchTraceEnabled && m_getRenderGraphBatchTraceEnabled();
-	const uint64_t previousDeclarationFingerprint = p.declarationCache.declarationFingerprint;
-	if (!p.name.empty()) {
-		BT_ZONE_TEXT(p.name.data(), p.name.size());
-	}
-	if (traceLifecycle) {
-		spdlog::info("RG frame {} refresh copy pass '{}' declare begin", frameIndex, p.name);
-	}
-	CopyPassBuilder b(this, p.name);
-	auto copyPass = std::dynamic_pointer_cast<CopyPass>(p.pass);
-	if (!copyPass) {
-		throw std::logic_error("Copy-tagged pass does not implement the legacy copy declaration interface");
-	}
-	b.pass = copyPass;
-	b.built_ = true;
+	const uint64_t previous = p.declarationCache.declarationFingerprint;
+	RedeclarePass(p, PassType::Compute);
+	UpdateRetainedDeclarationCache(PassType::Compute, p.name, p);
+	return previous != p.declarationCache.declarationFingerprint;
+}
 
-	b.params = {};
-	b._declaredIds.clear();
-
-	{
-		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Copy)::EnsureProviderRegistered");
-		EnsureProviderRegistered(p.pass.get());
-	}
-	{
-		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Copy)::DeclareResourceUsages");
-		if (!p.name.empty()) {
-			BT_ZONE_TEXT(p.name.data(), p.name.size());
-		}
-		copyPass->DeclareResourceUsages(&b);
-	}
-	if (traceLifecycle) {
-		spdlog::info("RG frame {} refresh copy pass '{}' declare complete requirements={} transitions={}", frameIndex, p.name, b.GatherResourceRequirements().size(), b.params.internalTransitions.size());
-	}
-	auto refreshedRequirements = b.GatherResourceRequirements();
-	BT_PLOT("ORG.RefreshRetained.Copy.Requirements", static_cast<int64_t>(refreshedRequirements.size()));
-	BT_PLOT("ORG.RefreshRetained.Copy.InternalTransitions", static_cast<int64_t>(b.params.internalTransitions.size()));
-	BT_PLOT("ORG.RefreshRetained.Copy.DeclaredIds", static_cast<int64_t>(b.DeclaredResourceIds().size()));
-
-	{
-		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Copy)::StoreRequirements");
-		p.resources.staticResourceRequirements = std::move(refreshedRequirements);
-		p.resources.resolverRequirementBlocks.clear();
-		p.resources.mergedFrameRequirementsDirty = true;
-		p.resources.internalTransitions = std::move(b.params.internalTransitions);
-		p.resources.identifierSet = std::move(b._declaredIds);
-		p.explicitExternalWaitsBeforeTransitions = b.params.externalWaitsBeforeTransitions;
-		p.resources.externalWaitsBeforeTransitions = std::move(b.params.externalWaitsBeforeTransitions);
-		p.resources.externalWaitBindingsBeforeTransitions = std::move(b.params.externalWaitBindingsBeforeTransitions);
-	}
-	if (traceLifecycle) {
-		spdlog::info("RG frame {} refresh copy pass '{}' materialize referenced resources begin", frameIndex, p.name);
-	}
-	{
-		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Copy)::MaterializeReferencedResources");
-		MaterializeReferencedResources(p.resources.staticResourceRequirements, p.resources.internalTransitions);
-	}
-
-	// Transfer resolver snapshots for auto-invalidation tracking
-	{
-		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Copy)::CaptureResolverSnapshots");
-		p.resolverSnapshots = b.TakeResolverSnapshots();
-		MergeResolverWaits(p.resources.externalWaitsBeforeTransitions, p.resolverSnapshots);
-		p.retainedAnonymousKeepAlive = CaptureRetainedAnonymousKeepAlive(
-			p.resources.staticResourceRequirements,
-			p.resources.internalTransitions);
-	}
-	{
-		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Copy)::UpdateRetainedDeclarationCache");
-		UpdateRetainedDeclarationCache(PassType::Copy, p.name, p);
-	}
-
-	const bool requiresPassRebind = !p.declarationCache.dynamicInterface ||
-		p.declarationCache.dynamicInterface->RequiresPassRebindAfterDeclarationRefresh();
-	if (requiresPassRebind) {
-		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Copy)::SetResourceRegistryView");
-		p.pass->ConfigureRuntimeServices(m_uploadService, m_descriptorService);
-		p.pass->ConfigureResourceRegistryView(MakePassResourceRegistryView(_registry, p.resources), p.resources);
-	}
-	if (traceLifecycle) {
-		spdlog::info("RG frame {} refresh copy pass '{}' setup begin", frameIndex, p.name);
-	}
-
-	if (requiresPassRebind) {
-		BT_ZONE_SCOPE("RenderGraph::RefreshRetainedDeclarationsForFrame(Copy)::Setup");
-		p.pass->Setup();
-	}
-	if (traceLifecycle) {
-		spdlog::info("RG frame {} refresh copy pass '{}' setup complete", frameIndex, p.name);
-	}
-	return previousDeclarationFingerprint != p.declarationCache.declarationFingerprint;
+bool RenderGraph::RefreshRetainedDeclarationsForFrame(CopyPassAndResources& p, uint8_t)
+{
+	const uint64_t previous = p.declarationCache.declarationFingerprint;
+	RedeclarePass(p, PassType::Copy);
+	UpdateRetainedDeclarationCache(PassType::Copy, p.name, p);
+	return previous != p.declarationCache.declarationFingerprint;
 }
 
 std::tuple<int, int, int> RenderGraph::GetBatchesToWaitOn(
