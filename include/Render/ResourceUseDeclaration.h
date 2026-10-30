@@ -68,6 +68,37 @@ struct ResourceUseLayout {
     struct ResolverViews { std::shared_ptr<const void> identity; std::vector<BindlessViewRequest> views; };
     std::vector<ResolverViews> resolverViews;
     std::vector<ResourceUseDeclaration> uses;
+    // Shader-visible views declared by resource name (builder.ShaderResource(Builtin::X) and friends): what a
+    // pipeline's ResourceDescriptorIndex(Builtin::X) slots are filled from at record time. A name declared both
+    // ways resolves to its unordered-access view. A name whose resolver had no member when the pass declared it
+    // names its resolver group instead (resolverViews[resolverGroup]): each frame resolves `request` on the
+    // group's first bound member.
+    struct NamedView {
+        size_t nameHash = 0;
+        uint32_t use = UINT32_MAX, view = UINT32_MAX;
+        BindlessViewKind kind{};
+        uint32_t resolverGroup = UINT32_MAX;
+        BindlessViewRequest request{};
+    };
+    std::vector<NamedView> namedViews;
+    // Hashes of the feature domains (FeatureDomainRegistry) the declarations named a resource of.
+    std::vector<size_t> activeFeatureDomains;
+    const NamedView* FindNamedView(size_t nameHash) const noexcept {
+        for (const auto& named : namedViews) if (named.nameHash == nameHash) return &named;
+        return nullptr;
+    }
+    // Position of (use, view) in a pass's frozen view table: the views of every use, in declaration order.
+    uint32_t ViewCount() const noexcept {
+        uint32_t count = 0;
+        for (const auto& use : uses) count += static_cast<uint32_t>(use.requiredViews.size());
+        return count;
+    }
+    uint32_t FlatView(uint32_t use, uint32_t view) const {
+        if (use >= uses.size() || view >= uses[use].requiredViews.size()) throw std::invalid_argument("Invalid declared view ordinal");
+        uint32_t flat = 0;
+        for (uint32_t i = 0; i < use; ++i) flat += static_cast<uint32_t>(uses[i].requiredViews.size());
+        return flat + view;
+    }
 };
 struct DeclaredViewToken {
     std::shared_ptr<const ResourceUseLayout> layout;

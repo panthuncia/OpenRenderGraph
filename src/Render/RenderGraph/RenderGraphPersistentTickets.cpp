@@ -148,7 +148,7 @@ bool RenderGraph::AdoptKeptPersistentRecording(PersistentTicket& ticket, uint64_
 	now.reserve(ticket.revisions.size());
 	for (const auto& [pass, recorded] : ticket.revisions) {
 		uint64_t hash = 0;
-		if (!pass->InvocationRevisionHash(hash)) return false;
+		if (!pass->RevisionHash(hash)) return false;
 		now.emplace_back(pass, hash);
 	}
 	const auto& current = *segment.recording;
@@ -265,7 +265,7 @@ bool RenderGraph::PersistentTicketCurrent(const PersistentTicket& ticket) {
 	if (ticket.uncheckable) return false;
 	for (const auto& [pass, hash] : ticket.revisions) {
 		uint64_t now = 0;
-		if (!pass->InvocationRevisionHash(now) || now != hash) return false;
+		if (!pass->RevisionHash(now) || now != hash) return false;
 	}
 	return true;
 }

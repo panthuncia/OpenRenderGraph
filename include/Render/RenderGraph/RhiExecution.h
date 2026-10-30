@@ -684,6 +684,9 @@ struct OwnedRecordingList {
     std::shared_ptr<OwnedRecordingStatistics> statistics;
     std::shared_ptr<const OwnedRecordingGpuRanges> gpuPassRanges;
     std::shared_ptr<FrameCommandAllocation> allocation = std::make_shared<FrameCommandAllocation>();
+    // What the passes' commands name at record time (RecordingContext::Retain): released with the list's lease, after
+    // its last submission retires.
+    std::shared_ptr<RecordingRetention> retention = std::make_shared<RecordingRetention>();
     // RecordingContext::FrameSlot for the passes of this list.
     uint32_t frameSlot = 0;
     // RenderGraph::ExternalQueueBoundary: full memory barrier before the first
@@ -761,6 +764,8 @@ inline RecordingContext MakeOwnedRecordingContext(rhi::CommandList list, const O
     if (recording.bindings && recording.publication)
         context = context.WithPersistentBindings(recording.publication);
     context.SetFrameSlot(recording.frameSlot);
+    context.SetRetention(recording.retention);
+    context.SetDescriptorHeaps(recording.resourceDescriptorHeap, recording.samplerDescriptorHeap);
     return context;
 }
 

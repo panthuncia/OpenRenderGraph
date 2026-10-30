@@ -11,7 +11,6 @@
 #include "Resources/ResourceStateTracker.h"
 #include "Resources/ResourceIdentifier.h"
 #include "Render/ResourceRegistry.h"
-#include "ResourceDescriptorIndexHelper.h"
 #include "Render/PipelineState.h"
 #include "Interfaces/IResourceProvider.h"
 #include "Render/PassInputs.h"
@@ -46,9 +45,6 @@ struct PassParameters {
 	std::vector<ExternalTimelineBinding> externalWaitBindingsBeforeTransitions;
 
 	std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> identifierSet;
-	std::vector<AutoDescriptorRegistration> autoDescriptorShaderResources;
-	std::vector<AutoDescriptorRegistration> autoDescriptorConstantBuffers;
-	std::vector<AutoDescriptorRegistration> autoDescriptorUnorderedAccessViews;
 	std::unordered_set<FeatureDomainIdentifier, FeatureDomainIdentifier::Hasher> activeFeatureDomains;
 	std::vector<ResourceRequirement> staticResourceRequirements; // Static resource requirements for the pass
 	std::vector<std::shared_ptr<const ResolverRequirementBlock>> resolverRequirementBlocks;
@@ -69,16 +65,10 @@ class RenderPass : public RenderGraphPass {
 public:
     ~RenderPass() override;
 
-	void SetResourceRegistryView(
-		std::shared_ptr<ResourceRegistryView> resourceRegistryView,
-		std::unordered_set<FeatureDomainIdentifier, FeatureDomainIdentifier::Hasher> activeFeatureDomains = {});
-
-	void SetResourceRegistryView(
-		std::shared_ptr<ResourceRegistryView> resourceRegistryView,
-		const std::unordered_set<FeatureDomainIdentifier, FeatureDomainIdentifier::Hasher>& activeFeatureDomains,
-		const std::vector<AutoDescriptorRegistration>& autoDescriptorShaderResources,
-		const std::vector<AutoDescriptorRegistration>& autoDescriptorConstantBuffers,
-		const std::vector<AutoDescriptorRegistration>& autoDescriptorUnorderedAccessViews);
+	// Declare and Setup may look resources up by name; recording never does.
+	void SetResourceRegistryView(std::shared_ptr<ResourceRegistryView> resourceRegistryView) {
+		m_resourceRegistryView = std::move(resourceRegistryView);
+	}
 
     void ConfigureResourceRegistryView(
         std::shared_ptr<ResourceRegistryView> view,
@@ -101,33 +91,9 @@ protected:
 	bool invalidated = true;
 	virtual void DeclareResourceUsages(RenderPassBuilder* /*builder*/) {};
 
-	void BindResourceDescriptorIndices(rhi::CommandList& commandList, const PipelineResources& resources);
-	// The descriptor index the pass's registry view resolves for a binding (for the binders below).
-	unsigned int ResolveResourceDescriptorIndex(const ResourceIdentifier& binding, bool optional) const;
-
-	template<class CommandSink>
-	void BindResourceDescriptorIndices(CommandSink& commandList, const PipelineResources& resources) const {
-		if constexpr (requires { commandList.BindDescriptorIndices(resources); }) {
-			commandList.BindDescriptorIndices(resources);
-			return;
-		}
-		unsigned int indices[org::shaderapi::kNumResourceDescriptorIndicesRootConstants] = {};
-		int i = 0;
-		for (auto& binding : resources.mandatoryResourceDescriptorSlots)
-			indices[i++] = ResolveResourceDescriptorIndex(binding, false);
-		for (auto& binding : resources.optionalResourceDescriptorSlots)
-			indices[i++] = ResolveResourceDescriptorIndex(binding, true);
-		if (i > 0) commandList.PushConstants(rhi::ShaderStage::Compute, 0,
-			org::shaderapi::kResourceDescriptorIndicesRootParameter, 0, i, indices);
-	}
-
-	std::vector<unsigned int> CaptureResourceDescriptorIndices(const PipelineResources& resources,
-		PreparedDescriptorIndexCache* cache = nullptr) const;
-
 	std::shared_ptr<Resource> ProvideResource(ResourceIdentifier const& /*key*/) override { return nullptr; }
 	std::vector<ResourceIdentifier> GetSupportedKeys() override { return {}; }
 
-	std::unique_ptr<ResourceDescriptorIndexHelper> m_resourceDescriptorIndexHelper;
 	std::shared_ptr<ResourceRegistryView> m_resourceRegistryView;
 	friend class RenderPassBuilder;
 	friend class RenderGraph;

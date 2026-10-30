@@ -63,37 +63,48 @@ queue boundary (for a host that shares its queue with another API, as Community 
 
 ### 2) Write a pass
 
-A pass declares what it uses once (`Declare`), prepares an owned packet each frame (`Prepare`), and records it
-(`Record`, static: it sees only the packet and the bindings).
+A pass declares what it uses once (`Declare`), prepares an owned packet of this frame's values (`Prepare`, optional),
+and records it (`Record`, static: it sees only its bindings, the packet and the context). `Record` resolves declared views,
+resources and pipelines through the context, against the frame the packet was prepared for.
 
 ```cpp
 #include "RenderPasses/Base/TypedRenderGraphPass.h"
 #include "Render/PassBuilders.h"
 
-struct ClearBindings { org::DeclaredViewToken target; };
-struct ClearFrame { uint32_t targetIndex = 0, count = 0; };
+struct ClearBindings { org::DeclaredViewToken target; std::shared_ptr<const org::PipelineState> pipeline; };
+struct ClearFrame { uint32_t count = 0; };
 
 class ClearPass final : public org::TypedRenderGraphPass<ClearPass, ClearFrame, ClearBindings> {
 public:
-    explicit ClearPass(std::shared_ptr<org::Buffer> target) : m_target(std::move(target)) {}
+    ClearPass(std::shared_ptr<org::Buffer> target, std::shared_ptr<const org::PipelineState> pipeline)
+        : m_target(std::move(target)), m_pipeline(std::move(pipeline)) {}
     ClearBindings Declare(org::PassBuilder& builder) {
         builder.PreferQueue(org::QueueKind::Compute).AutomaticQueueAssignment();
-        return {builder.UnorderedAccess(m_target).View()};
+        return {builder.UnorderedAccess(m_target).View(), m_pipeline};
     }
-    ClearFrame Prepare(const ClearBindings& bindings, const org::PassPrepareContext& preparation) const {
-        return {preparation.Resolve(bindings.target).index, 1024};
+    ClearFrame Prepare(const ClearBindings&, const org::PassPrepareContext&) const { return {1024}; }
+    static void Record(const ClearBindings& bindings, const ClearFrame& frame, org::PassRecordContext& recording) {
+        recording.BindComputePipeline(*bindings.pipeline);  // retained by the recording; descriptor slots filled by name
+        const uint32_t constants[] = {recording.Index(bindings.target), frame.count};
+        recording.PushConstants(1, constants);
+        recording.Commands().Dispatch((frame.count + 63) / 64, 1, 1);
     }
-    static void Record(const ClearBindings&, const ClearFrame& frame, org::PassRecordContext& recording) {
-        auto& commands = recording.Commands();
-        // bind the pipeline, push frame.targetIndex, dispatch
-    }
+    void Revision(std::vector<uint64_t>& out) const { out.push_back(m_pipeline->GetPayload()->generation); }
 private:
     std::shared_ptr<org::Buffer> m_target;
+    std::shared_ptr<const org::PipelineState> m_pipeline;
 };
 ```
 
-A pass that also provides `InvocationRevision` lets the framework reuse its previous packet while nothing it reads
-changed. Lifecycle hooks (`Submitted`, `Completed`, `Abandoned`) see a packet through to the GPU.
+`Revision` (optional) appends what the recording depends on beyond its bindings and the frame's resources (settings,
+pipeline generations). It only drives kept-recording reuse: while it stays equal, a kept recording of the pass may be
+submitted again instead of recorded anew; a pass without it is never part of a kept recording. Lifecycle hooks
+(`Submitted`, `Completed`, `Abandoned`) see a packet through to the GPU.
+
+Declarations are the pass's access contract. A pipeline's `ResourceDescriptorIndex` slots are filled from the views the
+pass declared under the same name (`builder.ShaderResource(Builtin::X)` and friends; a name declared for unordered access
+wins). An undeclared slot gets `UINT32_MAX` only when it is optional, belongs to a feature domain the pass names nothing
+of, or matches `BindOptions::absentPrefixes`; otherwise binding throws. The BRSL macro scan only names the slots.
 
 ### 3) Add passes through an extension
 
@@ -104,11 +115,12 @@ public:
         graph.RegisterResource(org::ResourceIdentifier("my.target"), m_target);  // named resources, providers, resolvers
     }
     void GatherStructuralPasses(org::RenderGraph&, std::vector<org::ExternalPassDesc>& out) override {
-        out.push_back(org::ExternalPassDesc::Compute("my.clear", std::make_shared<ClearPass>(m_target))
+        out.push_back(org::ExternalPassDesc::Compute("my.clear", std::make_shared<ClearPass>(m_target, m_pipeline))
             .At(org::ExternalInsertPoint::Begin()));
     }
 private:
     std::shared_ptr<org::Buffer> m_target = org::Buffer::CreateSharedUnmaterialized(rhi::HeapType::DeviceLocal, 4096, true);
+    std::shared_ptr<const org::PipelineState> m_pipeline;  // the clear shader, compiled by the host
 };
 
 host.AddExtension("my.extension", [] { return std::make_unique<MyExtension>(); });

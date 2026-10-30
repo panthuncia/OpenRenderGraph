@@ -317,7 +317,7 @@ public:
 	// After RecordPendingUploads planned the ticket's uploads by queue: its batches off the graphics queue that will not wait for
 	// the graphics queue's uploads (statistics); 0 when not planned.
 	static uint32_t PersistentTicketSparedUploadWaits(const PersistentTicket& ticket) noexcept;
-	// Every pass it prepared would still prepare the same invocation (RenderGraphPass::InvocationRevisionHash).
+	// Every pass it prepared would still prepare the same invocation (RenderGraphPass::RevisionHash).
 	static bool PersistentTicketCurrent(const PersistentTicket& ticket);
 	// Submits the packets with values from nextQueueValues (the last value assigned per queue slot, advanced
 	// here). Returns false when a packet failed.
@@ -622,7 +622,7 @@ private:
 	PersistentTicket* m_persistentTicketTarget = nullptr;
 	uint64_t m_persistentTicketHostTag = 0;
 	bool m_persistentTicketAdmissionOnly = false;
-	// The ticket prepares for host data (a revision): its passes' revision hashes do not see it (InvocationRevisionHash reads
+	// The ticket prepares for host data (a revision): its passes' revision hashes do not see it (RevisionHash reads
 	// live state), so its recording is neither taken from nor added to the kept sets.
 	bool m_persistentTicketHostData = false;
 	bool m_persistentRecordingReuse = false;

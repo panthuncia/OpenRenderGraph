@@ -70,7 +70,7 @@ The branch (`backend_interop`, 86k lines) has also collected:
 
 **BR/SARP:**
 - **Driving:** BR drives `RenderGraph` directly: `CompileStructural`, `Setup`, `Update`, `Execute`.
-- **Passes:** about 139 typed passes, using Recipe, lifecycle hooks, `CaptureProgramBinding` and `Update` overrides, plus 3 `PersistentTypedPass`es.
+- **Passes:** about 139 typed passes, using lifecycle hooks and `Update` overrides. Recipes, `CaptureProgramBinding` and the 3 `PersistentTypedPass`es are gone: a pass's `Revision` drives kept-recording reuse only, and `Record` binds pipelines (`RecordingContext::BindComputePipeline`/`BindGraphicsPipeline`, retained by the recording) and resolves declared views and resources at record time.
 - **Graph inputs:** providers, resolvers, `IDynamicDeclaredResources`, `ResourceGroup`, and extensions with `ExternalInsertPoint`/`SetPassTechnique`.
 - **Readback:** the readback service and capture passes.
 - **Uploads:** upload policy, `StreamingUploadPass`, `UploadInstance`, `FrameWorkQueue`.
@@ -81,7 +81,7 @@ The branch (`backend_interop`, 86k lines) has also collected:
 
 **Used by neither consumer (delete):**
 - `D3D11Interop`, `ExecutionBoundary`, `InteropAllocator`, which is re-homed under multi-RHI only if the port needs it.
-- `ResourceDescriptorIndexHelper`, `ORGUtilities` in `include/`, the `OpenRenderGraph.h`/`DebugUI.h` umbrellas for CS, and `ExternalBufferResource`.
+- `ResourceDescriptorIndexHelper` (deleted: descriptor slots are filled from declarations at bind), `ORGUtilities` in `include/`, the `OpenRenderGraph.h`/`DebugUI.h` umbrellas for CS, and `ExternalBufferResource`.
 
 ## Gaps to port into the persistent compiler
 
@@ -141,7 +141,7 @@ Each phase lands on its own ORG branch off `backend_interop`. CS and BR bump the
 
 ### Phase 2: native persistent lowering
 
-- Lower typed and `PersistentTypedPass` declarations straight into `persistent::PassDeclaration` at structural build. This replaces `LowerLegacyPass` (RenderGraphPersistent.cpp:657-776) and the retained-declaration cache it reads.
+- Lower typed pass declarations straight into persistent graph declarations (`GraphEditTransaction::Declare`/`DeclareView`) at structural build. This replaces `LowerLegacyPass` (RenderGraphPersistent.cpp:657-776) and the retained-declaration cache it reads.
 - Move resolver requirement capture fully into persistent resolver groups (RenderGraphPersistent.cpp:1348-1460).
 - Give `PersistentGraph` its own pass storage instead of `m_masterPassList`.
 - Make the task service mandatory, which removes the silent fallback at RenderGraphCompile.cpp:2787.

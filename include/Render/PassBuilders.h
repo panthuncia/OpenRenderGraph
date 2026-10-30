@@ -498,101 +498,6 @@ namespace detail
 			&& range.sliceLower == Bound{ BoundType::All, 0 }
 			&& range.sliceUpper == Bound{ BoundType::All, 0 };
         }
-
-        inline void AppendUniqueDescriptorRegistration(std::vector<AutoDescriptorRegistration>& registrations, const AutoDescriptorRegistration& registration) {
-        if (std::find(registrations.begin(), registrations.end(), registration) == registrations.end()) {
-            registrations.push_back(registration);
-        }
-        }
-
-        inline bool TryResolveAutoDescriptorRange(const RangeSpec& range, unsigned int& mip, unsigned int& slice) {
-            if (IsWholeRange(range)) {
-                mip = 0;
-                slice = 0;
-                return true;
-            }
-
-            const bool exactMip = range.mipLower.type == BoundType::Exact && range.mipUpper.type == BoundType::Exact;
-            const bool wholeMip = range.mipLower == Bound{ BoundType::All, 0 } && range.mipUpper == Bound{ BoundType::All, 0 };
-            const bool exactSlice = range.sliceLower.type == BoundType::Exact && range.sliceUpper.type == BoundType::Exact;
-            const bool wholeSlice = range.sliceLower == Bound{ BoundType::All, 0 } && range.sliceUpper == Bound{ BoundType::All, 0 };
-
-            if (!(wholeMip || (exactMip && range.mipLower.value == range.mipUpper.value))) {
-                return false;
-            }
-            if (!(wholeSlice || (exactSlice && range.sliceLower.value == range.sliceUpper.value))) {
-                return false;
-            }
-
-            mip = exactMip ? range.mipLower.value : 0;
-            slice = exactSlice ? range.sliceLower.value : 0;
-            return true;
-        }
-
-        inline bool IsResolverBackedIdentifier(RenderGraph* graph, const ResourceIdentifier& id) {
-		return graph != nullptr && BuilderGraphAccess::RequestResolver(graph, id, true) != nullptr;
-        }
-
-        inline void TrackDefaultDescriptorIdentifier(RenderGraph* graph, std::vector<AutoDescriptorRegistration>& registrations, const ResourceIdentifier& id, DescriptorType type) {
-            if (IsResolverBackedIdentifier(graph, id)) {
-				auto resolver = BuilderGraphAccess::RequestResolver(graph, id, true);
-				if (resolver) {
-					DescriptorAccessor accessor{};
-					accessor.type = type;
-					accessor.mip = 0;
-					accessor.slice = 0;
-					AppendUniqueDescriptorRegistration(registrations,
-						AutoDescriptorRegistration{ id, accessor, {}, std::move(resolver) });
-				}
-                return;
-            }
-
-            DescriptorAccessor accessor{};
-            accessor.type = type;
-            accessor.mip = 0;
-            accessor.slice = 0;
-            AppendUniqueDescriptorRegistration(registrations, AutoDescriptorRegistration{ id, accessor });
-        }
-
-        inline void TrackDefaultDescriptorIdentifier(RenderGraph* graph, std::vector<AutoDescriptorRegistration>& registrations, const ResourceIdentifierAndRange& idAndRange, DescriptorType type) {
-            if (IsResolverBackedIdentifier(graph, idAndRange.identifier)) {
-                return;
-            }
-
-            unsigned int mip = 0;
-            unsigned int slice = 0;
-            if (!TryResolveAutoDescriptorRange(idAndRange.range, mip, slice)) {
-                return;
-            }
-
-            DescriptorAccessor accessor{};
-            accessor.type = type;
-            accessor.mip = mip;
-            accessor.slice = slice;
-            AppendUniqueDescriptorRegistration(registrations, AutoDescriptorRegistration{ idAndRange.identifier, accessor });
-        }
-
-        inline void TrackDefaultDescriptorIdentifier(RenderGraph* graph, std::vector<AutoDescriptorRegistration>& registrations, const char* id, DescriptorType type) {
-        TrackDefaultDescriptorIdentifier(graph, registrations, ResourceIdentifier{ id }, type);
-        }
-
-        inline void TrackDefaultDescriptorIdentifier(RenderGraph* graph, std::vector<AutoDescriptorRegistration>& registrations, std::string_view id, DescriptorType type) {
-        TrackDefaultDescriptorIdentifier(graph, registrations, ResourceIdentifier{ id }, type);
-        }
-
-        template<class S>
-		requires (StringLike<S> && !std::is_same_v<std::remove_cvref_t<S>, const char*> && !std::is_same_v<std::remove_cvref_t<S>, char*>)
-        inline void TrackDefaultDescriptorIdentifier(RenderGraph* graph, std::vector<AutoDescriptorRegistration>& registrations, S&& id, DescriptorType type) {
-        TrackDefaultDescriptorIdentifier(graph, registrations, ResourceIdentifier{ std::string_view{ std::forward<S>(id) } }, type);
-	}
-
-        template<typename T>
-        inline void TrackDefaultDescriptorIdentifier(RenderGraph*, std::vector<AutoDescriptorRegistration>&, const std::shared_ptr<T>&, DescriptorType) {}
-
-        inline void TrackDefaultDescriptorIdentifier(RenderGraph*, std::vector<AutoDescriptorRegistration>&, const ResourcePtrAndRange&, DescriptorType) {}
-        inline void TrackDefaultDescriptorIdentifier(RenderGraph*, std::vector<AutoDescriptorRegistration>&, const ResourceHandleAndRange&, DescriptorType) {}
-        inline void TrackDefaultDescriptorIdentifier(RenderGraph*, std::vector<AutoDescriptorRegistration>&, const ResourceResolverAndRange&, DescriptorType) {}
-        inline void TrackDefaultDescriptorIdentifier(RenderGraph*, std::vector<AutoDescriptorRegistration>&, const IResourceResolver&, DescriptorType) {}
 }
 
 template<class S>
@@ -902,7 +807,12 @@ class RenderPassBuilder : public IPassBuilder {
 public:
     PassBuilderKind Kind() const noexcept override { return PassBuilderKind::Render; }
     IResourceProvider* ResourceProvider() noexcept override { return pass.get(); }
-    std::shared_ptr<const ResourceUseLayout> ResourceUses() const { return resourceUses_; }
+    // The layout as declared so far, with the feature domains the declarations activated.
+    std::shared_ptr<const ResourceUseLayout> ResourceUses() const {
+        resourceUses_->activeFeatureDomains.clear();
+        for (const auto& domain : params.activeFeatureDomains) resourceUses_->activeFeatureDomains.push_back(domain.hash);
+        return resourceUses_;
+    }
 
 private:
     template<class T>
@@ -992,8 +902,42 @@ private:
                 result.views.push_back({resourceUses_, ordinal, static_cast<uint32_t>(existing - views.begin())});
             }
         }
-        RegisterUseViews(resource, specification);
+        if constexpr (std::same_as<T, ResourceIdentifier>) NameUseViews(resource, result, resolverIdentity, specification);
+        else if constexpr (std::same_as<T, ResourceIdentifierAndRange>) NameUseViews(resource.identifier, result, resolverIdentity, specification);
+        else if constexpr (detail::StringLike<T>) NameUseViews(ResourceIdentifier{std::string_view{resource}}, result, resolverIdentity, specification);
         return result;
+    }
+    // A pipeline's ResourceDescriptorIndex(name) slot resolves to the first shader-visible view declared under that name;
+    // an unordered-access view replaces a shader-resource or constant-buffer one.
+    void NameUseViews(const ResourceIdentifier& identifier, const DeclaredResourceUse& declared,
+        const std::shared_ptr<const void>& resolverIdentity, const ResourceUseSpecification& specification) {
+        auto& layout = *resourceUses_;
+        const auto shaderVisible = [](BindlessViewKind kind) {
+            return kind == BindlessViewKind::ShaderResource || kind == BindlessViewKind::UnorderedAccess
+                || kind == BindlessViewKind::ConstantBuffer;
+        };
+        std::optional<ResourceUseLayout::NamedView> named;
+        for (const auto& token : declared.views) {
+            const auto kind = layout.uses[token.use].requiredViews[token.view].kind;
+            if (!shaderVisible(kind)) continue;
+            named = ResourceUseLayout::NamedView{identifier.hash, token.use, token.view, kind};
+            break;
+        }
+        // A resolver with no member yet: the name follows the group, whatever members it has when a frame records.
+        if (!named && resolverIdentity) {
+            const auto& groups = layout.resolverViews;
+            const auto group = std::find_if(groups.begin(), groups.end(), [&](const auto& g) { return g.identity == resolverIdentity; });
+            const auto view = std::find_if(specification.views.begin(), specification.views.end(),
+                [&](const auto& v) { return shaderVisible(v.kind); });
+            if (group != groups.end() && view != specification.views.end())
+                named = ResourceUseLayout::NamedView{identifier.hash, UINT32_MAX, UINT32_MAX, view->kind,
+                    static_cast<uint32_t>(group - groups.begin()), *view};
+        }
+        if (!named) return;
+        auto found = std::find_if(layout.namedViews.begin(), layout.namedViews.end(),
+            [&](const auto& entry) { return entry.nameHash == identifier.hash; });
+        if (found == layout.namedViews.end()) layout.namedViews.push_back(*named);
+        else if (named->kind == BindlessViewKind::UnorderedAccess && found->kind != BindlessViewKind::UnorderedAccess) *found = *named;
     }
     DeclaredResourceUse DeclareResourceUse(const IResourceResolver& resolver, ResourceUseSpecification specification) {
         return DeclareResourceUse(ResourceResolverAndRange{resolver}, std::move(specification));
@@ -1194,32 +1138,6 @@ public:
 
 private:
     std::shared_ptr<ResourceUseLayout> resourceUses_ = std::make_shared<ResourceUseLayout>();
-    template<class T> void RegisterUseViews(const T& resource, const ResourceUseSpecification& specification) {
-        if constexpr (detail::StringLike<T>)
-            RegisterUseViews(ResourceIdentifier{std::string_view{resource}}, specification);
-    }
-    void RegisterUseViews(const ResourceIdentifier& identifier, const ResourceUseSpecification& specification) {
-        for (const auto view : specification.views) {
-            if (view.kind != BindlessViewKind::ShaderResource && view.kind != BindlessViewKind::UnorderedAccess
-                && view.kind != BindlessViewKind::ConstantBuffer) continue;
-            DescriptorAccessor accessor{};
-            accessor.type = view.kind == BindlessViewKind::ShaderResource ? DescriptorType::SRV
-                : view.kind == BindlessViewKind::UnorderedAccess ? DescriptorType::UAV : DescriptorType::CBV;
-            accessor.mip = view.mip; accessor.slice = view.slice;
-            accessor.hasSRVViewType = view.kind == BindlessViewKind::ShaderResource && view.variant != UINT32_MAX;
-            accessor.SRVType = static_cast<SRVViewType>(view.variant);
-            accessor.hasUAVViewType = view.kind == BindlessViewKind::UnorderedAccess && view.variant != UINT32_MAX;
-            accessor.UAVType = static_cast<UAVViewType>(view.variant);
-            auto& registrations = view.kind == BindlessViewKind::ShaderResource ? params.autoDescriptorShaderResources
-                : view.kind == BindlessViewKind::UnorderedAccess ? params.autoDescriptorUnorderedAccessViews : params.autoDescriptorConstantBuffers;
-            detail::AppendUniqueDescriptorRegistration(registrations,
-                AutoDescriptorRegistration{identifier, accessor, {}, BuilderGraphAccess::RequestResolver(graph, identifier, true)});
-        }
-    }
-    void RegisterUseViews(const ResourceIdentifierAndRange& resource, const ResourceUseSpecification& specification) {
-        RegisterUseViews(resource.identifier, specification);
-    }
-
     struct AuthorState {
         RenderPassParameters params;
         std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> declaredIds;
@@ -1336,7 +1254,6 @@ private:
 	RenderPassBuilder& addShaderResource(T&& x) {
     detail::TrackResolverDeclaration(graph, resolverSnapshots_, x,
             ResourceState{rhi::ResourceAccessType::ShaderResource, AccessToLayout(rhi::ResourceAccessType::ShaderResource, true), RenderSyncFromAccess(rhi::ResourceAccessType::ShaderResource)});
-    detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorShaderResources, x, DescriptorType::SRV);
         detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.shaderResources, std::forward<T>(x));
 		return *this;
@@ -1454,7 +1371,6 @@ private:
 	RenderPassBuilder& addConstantBuffer(T&& x) {
     detail::TrackResolverDeclaration(graph, resolverSnapshots_, x,
             ResourceState{rhi::ResourceAccessType::ConstantBuffer, AccessToLayout(rhi::ResourceAccessType::ConstantBuffer, true), RenderSyncFromAccess(rhi::ResourceAccessType::ConstantBuffer)});
-    detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorConstantBuffers, x, DescriptorType::CBV);
         detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.constantBuffers, std::forward<T>(x));
 		return *this;
@@ -1475,7 +1391,6 @@ private:
 	RenderPassBuilder& addUnorderedAccess(T&& x) {
     detail::TrackResolverDeclaration(graph, resolverSnapshots_, x,
             ResourceState{rhi::ResourceAccessType::UnorderedAccess, AccessToLayout(rhi::ResourceAccessType::UnorderedAccess, true), RenderSyncFromAccess(rhi::ResourceAccessType::UnorderedAccess)});
-    detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorUnorderedAccessViews, x, DescriptorType::UAV);
         detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.unorderedAccessViews, std::forward<T>(x));
 		return *this;
@@ -1495,7 +1410,6 @@ private:
     RenderPassBuilder& addUnorderedAccessClear(T&& x) {
         detail::TrackResolverDeclaration(graph, resolverSnapshots_, x,
             ResourceState{rhi::ResourceAccessType::UnorderedAccessClear, AccessToLayout(rhi::ResourceAccessType::UnorderedAccessClear, true), RenderSyncFromAccess(rhi::ResourceAccessType::UnorderedAccessClear)});
-        detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorUnorderedAccessViews, x, DescriptorType::UAV);
         detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.unorderedAccessClearViews, std::forward<T>(x));
         return *this;

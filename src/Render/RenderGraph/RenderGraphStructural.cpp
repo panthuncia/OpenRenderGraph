@@ -86,9 +86,6 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 			par.resources.staticResourceRequirements = b.GatherResourceRequirements();
 			par.resources.internalTransitions = b.params.internalTransitions;
 			par.resources.identifierSet = b.DeclaredResourceIds();
-			par.resources.autoDescriptorShaderResources = b.params.autoDescriptorShaderResources;
-			par.resources.autoDescriptorConstantBuffers = b.params.autoDescriptorConstantBuffers;
-			par.resources.autoDescriptorUnorderedAccessViews = b.params.autoDescriptorUnorderedAccessViews;
 			par.resources.activeFeatureDomains = b.params.activeFeatureDomains;
 			par.resources.externalWaitsBeforeTransitions = b.params.externalWaitsBeforeTransitions;
 			par.resources.externalWaitBindingsBeforeTransitions = b.params.externalWaitBindingsBeforeTransitions;
@@ -623,9 +620,6 @@ void RenderGraph::RedeclarePass(PassAndResources& p, PassType type)
 		resources.mergedFrameRequirementsDirty = true;
 		resources.internalTransitions = std::move(b.params.internalTransitions);
 		resources.identifierSet = std::move(b._declaredIds);
-		resources.autoDescriptorShaderResources = std::move(b.params.autoDescriptorShaderResources);
-		resources.autoDescriptorConstantBuffers = std::move(b.params.autoDescriptorConstantBuffers);
-		resources.autoDescriptorUnorderedAccessViews = std::move(b.params.autoDescriptorUnorderedAccessViews);
 		resources.activeFeatureDomains = std::move(b.params.activeFeatureDomains);
 		p.explicitExternalWaitsBeforeTransitions = b.params.externalWaitsBeforeTransitions;
 		resources.externalWaitsBeforeTransitions = std::move(b.params.externalWaitsBeforeTransitions);

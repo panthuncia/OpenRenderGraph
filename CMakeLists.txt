@@ -109,6 +109,7 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/Runtime/ResourceCleanupQueue.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PublicationBindingBundle.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PreparedTablePublisher.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RecordingContext.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/LatchBlock.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/StagedUploadBatch.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/PreparedTablePublisher.h"
@@ -159,7 +160,6 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/GraphReplay.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/RenderGraph/GraphReplay.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/RenderGraph/PersistentGraph.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/include/RenderPasses/Base/PersistentTypedPass.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/ExecutionState.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/InteropAllocator.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/FrameRecording.cpp"
@@ -337,29 +337,29 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
     add_test(NAME OpenRenderGraphHeadlessBenchmark.Sequence COMMAND OpenRenderGraphHeadlessBenchmark
         --sequence "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/binding_rotation_tail.orgsequence")
     set_tests_properties(OpenRenderGraphHeadlessBenchmark OpenRenderGraphHeadlessBenchmark.Sequence PROPERTIES TIMEOUT 120)
-    add_executable(OpenRenderGraphRecordingRecipeTests tests/RecordingRecipeTests.cpp)
-    target_compile_features(OpenRenderGraphRecordingRecipeTests PRIVATE cxx_std_23)
-    target_compile_definitions(OpenRenderGraphRecordingRecipeTests PRIVATE NOMINMAX)
+    add_executable(OpenRenderGraphRecordingTests tests/RecordingTests.cpp)
+    target_compile_features(OpenRenderGraphRecordingTests PRIVATE cxx_std_23)
+    target_compile_definitions(OpenRenderGraphRecordingTests PRIVATE NOMINMAX)
     if(MSVC)
-        target_compile_options(OpenRenderGraphRecordingRecipeTests PRIVATE /utf-8)
+        target_compile_options(OpenRenderGraphRecordingTests PRIVATE /utf-8)
     endif()
-    target_link_libraries(OpenRenderGraphRecordingRecipeTests PRIVATE OpenRenderGraph)
-    # Typed recipe fixtures instantiate graph declarations and pull the D3D12 backend.
+    target_link_libraries(OpenRenderGraphRecordingTests PRIVATE OpenRenderGraph)
+    # Typed recording fixtures instantiate graph declarations and pull the D3D12 backend.
     if(WIN32 AND TARGET Streamline::headers)
-        target_sources(OpenRenderGraphRecordingRecipeTests PRIVATE
+        target_sources(OpenRenderGraphRecordingTests PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/../BasicRHI/tests/StreamlineStubs.cpp")
-        target_link_libraries(OpenRenderGraphRecordingRecipeTests PRIVATE Streamline::headers)
+        target_link_libraries(OpenRenderGraphRecordingTests PRIVATE Streamline::headers)
     endif()
     if(WIN32 AND TARGET Pix::headers)
         find_library(OPENRENDERGRAPH_PIX_RUNTIME NAMES WinPixEventRuntime
             HINTS "${CMAKE_CURRENT_SOURCE_DIR}/../BasicRenderer" REQUIRED)
-        target_link_libraries(OpenRenderGraphRecordingRecipeTests PRIVATE "${OPENRENDERGRAPH_PIX_RUNTIME}")
-        add_custom_command(TARGET OpenRenderGraphRecordingRecipeTests POST_BUILD
+        target_link_libraries(OpenRenderGraphRecordingTests PRIVATE "${OPENRENDERGRAPH_PIX_RUNTIME}")
+        add_custom_command(TARGET OpenRenderGraphRecordingTests POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "${CMAKE_CURRENT_SOURCE_DIR}/../BasicRenderer/WinPixEventRuntime.dll"
-                "$<TARGET_FILE_DIR:OpenRenderGraphRecordingRecipeTests>")
+                "$<TARGET_FILE_DIR:OpenRenderGraphRecordingTests>")
     endif()
-    add_test(NAME OpenRenderGraphRecordingRecipeTests COMMAND OpenRenderGraphRecordingRecipeTests)
+    add_test(NAME OpenRenderGraphRecordingTests COMMAND OpenRenderGraphRecordingTests)
     # Offscreen suites that create D3D12 (WARP) devices exist only when the D3D12 backend is built.
     set(_org_d3d12_tests OFF)
     if(NOT DEFINED BASICRHI_ENABLE_D3D12 OR BASICRHI_ENABLE_D3D12) # packaged BasicRHI: assume D3D12

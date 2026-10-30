@@ -298,9 +298,10 @@ public:
 		return {m_program, preparation.Resolve(bindings.input).index,
 			preparation.Resolve(bindings.target).index, RevisionCount(preparation)};
 	}
-	void InvocationRevision(const org::PassPrepareContext& preparation, std::vector<uint64_t>& out) const {
+	// Revision sees no frame: it names the pass's own state, so the host-data count is the default here.
+	void Revision(std::vector<uint64_t>& out) const {
 		out.push_back(reinterpret_cast<uintptr_t>(m_program.get()));
-		out.push_back(RevisionCount(preparation));
+		out.push_back(kCount);
 	}
 	static void Record(const WriteBindings&, const WriteFrame& frame, org::PassRecordContext& recording) {
 		auto& commands = recording.Commands();
@@ -336,7 +337,7 @@ public:
 		}
 		return {builder.CopySource(m_source), builder.CopyDestination(m_destination)};
 	}
-	void InvocationRevision(const org::PassPrepareContext&, std::vector<uint64_t>& out) const {
+	void Revision(std::vector<uint64_t>& out) const {
 		out.push_back(m_destinationRevision->load(std::memory_order_acquire));
 	}
 	static void Record(const CopyBindings& bindings, org::PassRecordContext& recording) {

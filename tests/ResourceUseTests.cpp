@@ -35,24 +35,42 @@ int main() {
         return context;
     };
     auto old = makeContext(7), fresh = makeContext(19);
-    old.ValidateDeclaredViews(); fresh.ValidateDeclaredViews();
     CHECK(old.Resolve(first).index == 7 && fresh.Resolve(first).index == 19);
     CHECK(old.Resolve(variant).index == 8 && fresh.Resolve(variant).index == 20);
-    (void)old.Capture(first);
+    // What a recording of each frame sees: the frame's view table, read through RecordingContext::View.
+    rhi::CommandListVTable commandTable{};
+    commandTable.abi_version = rhi::RHI_CL_ABI_MIN;
+    rhi::CommandList commands{rhi::CommandListHandle{1,1}};
+    commands.impl = &commandTable;
+    commands.vt = &commandTable;
+    auto recordingOf = [&](const FramePreparationContext& frame) {
+        auto scope = std::make_shared<DeclaredRecordingScope>();
+        scope->layout = layout;
+        scope->views = frame.ResolveDeclaredViewTable();
+        return RecordingContext(commands, frame.bindings).WithDeclaredResources(frame.bindings, frame.resourceSlots, scope);
+    };
+    CHECK(old.ResolveDeclaredViewTable().size() == 2);
+    const auto oldRecording = recordingOf(old), freshRecording = recordingOf(fresh);
+    CHECK(oldRecording.View(first).index == 7 && oldRecording.Index(variant) == 8);
+    CHECK(freshRecording.View(first).index == 19 && freshRecording.Index(variant) == 20);
+    CHECK(oldRecording.Resolve(first).GetHandle().index == 10);
     // A resolver republishes under a new global ID without redeclaring the pass.
     auto rotated = fresh;
     rotated.resourceSlots = std::make_shared<FramePreparationContext::ResourceSlots>(
         FramePreparationContext::ResourceSlots{{99,0}});
     rotated.resolveDeclaredResource = [](uint32_t) { return rhi::Resource({10,1}); };
     rotated.resolveDeclaredView = [](uint32_t, uint32_t view) { return rhi::DescriptorSlot({3,1}, 19 + view); };
-    rotated.ValidateDeclaredViews();
     CHECK(rotated.Resolve(first).index == 19 && rotated.Resolve(variant).index == 20);
-    (void)rotated.Capture(first);
+    const auto rotatedTable = rotated.ResolveDeclaredViewTable();
+    CHECK(rotatedTable.size() == 2 && rotatedTable[0].index == 19 && rotatedTable[1].index == 20);
+    CHECK(recordingOf(rotated).Index(first) == 19);
 
     auto foreign = first; foreign.layout = std::make_shared<ResourceUseLayout>(*layout);
     CHECK(Rejects([&] { old.Resolve(foreign); }));
+    CHECK(Rejects([&] { (void)oldRecording.View(foreign); }));
     auto invalid = first; invalid.view = 2;
     CHECK(Rejects([&] { old.Resolve(invalid); }));
+    CHECK(Rejects([&] { (void)oldRecording.View(invalid); }));
     auto stale = old; stale.resourceUses = foreign.layout;
     CHECK(Rejects([&] { stale.Resolve(first); }));
     struct Row { uint32_t value = 1, a = UINT32_MAX, b = UINT32_MAX; };

@@ -207,7 +207,7 @@ struct PrepareScope {
 };
 thread_local PrepareScope* t_prepareScope = nullptr;
 
-// Reusable: the contributor gave invocationRevision, so the framework may reuse the previous packet.
+// Reusable: the contributor gave invocationRevision, so a kept recording of the pass may be submitted again.
 template<bool Reusable>
 class ContributorPass final : public TypedRenderGraphPass<ContributorPass<Reusable>, ContributorFrame, ContributorBindings> {
 public:
@@ -452,7 +452,7 @@ public:
 		if (renderPass) commands.EndPass();
 	}
 
-	void InvocationRevision(const PassPrepareContext&, std::vector<uint64_t>& out) const requires Reusable {
+	void Revision(std::vector<uint64_t>& out) const requires Reusable {
 		const auto& pass = m_source->pass;
 		uint64_t revision = 0;
 		if (pass.invocationRevision(pass.userData, &revision) != ORG_RG_OK)

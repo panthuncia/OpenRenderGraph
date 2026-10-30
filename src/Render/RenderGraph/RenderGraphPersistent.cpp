@@ -903,7 +903,7 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 	FramePreparationContext preparation{
 		.invocationArena = invocationArena,
 		.retireOwnership = [tasks = m_taskService, scope = compiler.ownershipRetirementScope](std::shared_ptr<const void> owner) {
-			if (!tasks->Submit(scope, runtime::TaskPriority::Background, "ORG.Ownership.RetireRecipe",
+			if (!tasks->Submit(scope, runtime::TaskPriority::Background, "ORG.Ownership.Retire",
 				[owner = std::move(owner)]() mutable { owner.reset(); }))
 				basic_telemetry::AddCounter("ORG.Ownership.RetirementRejected");
 		},
@@ -916,7 +916,6 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 		.preparationData = m_asyncUpdateHostData ? m_asyncUpdateHostData.get() : hostData,
 		.admissionData = m_asyncUpdateHostData ? m_asyncUpdateHostData.get() : hostData,
 		.frameData = m_asyncUpdateHostData,
-		.borrowedDependencies = true,
 	};
 	// Swapchain slots are rebound per frame from the wrapper's current backing.
 	std::vector<persistent::FrameRebinding> rebindings;
@@ -1064,6 +1063,24 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
             passPreparation.resolveDeclaredResource = [&pass, selected](uint32_t use) {
                 return selected->ResolveNative(pass.declaredBindings.at(use));
             };
+            // A name declared through a resolver group: its first member bound this frame, in capture order.
+            passPreparation.resolveResolverView = [&pass, &state, bindings = passPreparation.bindings](
+                uint32_t resolverGroup, BindlessViewRequest request) -> rhi::DescriptorSlot {
+                if (!pass.resourceUses || resolverGroup >= pass.resourceUses->resolverViews.size() || !bindings) return {};
+                const auto& identity = pass.resourceUses->resolverViews[resolverGroup].identity;
+                for (const auto groupIndex : pass.groups) {
+                    const auto& group = state.groups[groupIndex];
+                    if (group.key != identity) continue;
+                    for (const auto entryIndex : group.memberEntries) {
+                        const auto& entry = state.entries[entryIndex];
+                        if (!entry.resource || !entry.isBound || entry.slot.index >= bindings->Resources().size()) continue;
+                        const auto slot = bindings->Views(PreparedResourceReference{entry.slot.index}).Resolve(request);
+                        return pass.device == BackendInstanceId::Primary ? slot
+                            : DescriptorHeapManager::GetInstance().TranslateDescriptorSlot(slot, pass.device);
+                    }
+                }
+                return {};
+            };
 
 			PreparedPass packet;
 			const auto prepareStarted = std::chrono::steady_clock::now();
@@ -1100,7 +1117,7 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 					else return value.pass.get();
 				}, any.pass);
 				uint64_t hash = 0;
-				if (object && !pass.hosted && !captured && object->InvocationRevisionHash(hash)) ticket->revisions.emplace_back(object, hash);
+				if (object && !pass.hosted && !captured && object->RevisionHash(hash)) ticket->revisions.emplace_back(object, hash);
 				else ticket->uncheckable = true;
 			}
 			if (namesDirty) (*mainNames)[pass.id.index] = any.name;
@@ -1681,22 +1698,6 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 		for (size_t i = 0; i < rows.size() && i < 48; ++i)
 			text += rows[i].first + "=" + std::to_string(rows[i].second.first / (std::max<uint64_t>)(1, rows[i].second.second) / 1000) + "us x" + std::to_string(rows[i].second.second) + "; ";
 		spdlog::info("Persistent preparation cost top passes (mean per call): {}", text);
-		std::string reuse;
-		{
-			std::lock_guard<std::mutex> lock(InvocationReuseRegistryMutex());
-			for (const auto* stats : InvocationReuseRegistry()) {
-				const uint64_t hits = stats->hits.load();
-				const uint64_t misses = stats->misses.load();
-				reuse += std::string(stats->name) + " hits=" + std::to_string(hits) + " misses=" + std::to_string(misses)
-					+ " check=" + std::to_string(stats->checkNs.load() / (std::max<uint64_t>)(1, hits + misses) / 1000) + "us"
-					+ " build=" + std::to_string(stats->buildNs.load() / (std::max<uint64_t>)(1, misses) / 1000) + "us"
-					+ " package=" + std::to_string(stats->packageNs.load() / (std::max<uint64_t>)(1, hits) / 1000) + "us"
-					+ " [rev=" + std::to_string(stats->revisionNs.load() / (std::max<uint64_t>)(1, hits + misses)) + "ns"
-					+ " bind=" + std::to_string(stats->bindingNs.load() / (std::max<uint64_t>)(1, hits + misses)) + "ns"
-					+ " desc=" + std::to_string(stats->descriptorNs.load() / (std::max<uint64_t>)(1, hits + misses)) + "ns]; ";
-			}
-		}
-		spdlog::info("Invocation reuse: {}", reuse);
 	}
 	BT_PLOT("ORG.Persistent.StructuralBuildsTotal", static_cast<int64_t>(state.structuralBuilds));
 	BT_PLOT("ORG.Persistent.BindingBuildsTotal", static_cast<int64_t>(state.bindingBuilds));

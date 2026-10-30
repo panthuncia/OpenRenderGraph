@@ -1,4 +1,3 @@
-#include "RenderPasses/Base/PersistentTypedPass.h"
 #include "TestSupport.h"
 #include <Resources/ExternalBufferResource.h>
 #include <Resources/ExternalTextureResource.h>
@@ -851,26 +850,25 @@ int TestDescriptorSnapshots(const rhi::DeviceCreateInfo& create) {
     return 0;
 }
 
+// Persistent passes declared straight into a graph edit. Their packets name the publication they were prepared
+// for by identity only (the frame recorder roots it) and resolve every token through the recording context.
 struct PersistentNativeClear {
     struct Bindings { org::persistent::BindingToken resource; org::persistent::ViewToken shader, cpu; };
-    struct ProgramInterface { uint32_t multiplier; };
-    using Invocation = uint32_t;
-    org::persistent::ResourceSlotId resource;
-    unsigned declarationCalls = 0;
-    Bindings Declare(org::persistent::PassDeclaration& declaration) {
-        ++declarationCalls;
-        auto token = declaration.Resource(resource,
+    struct Invocation { Bindings bindings; uint32_t value = 0; const org::persistent::SelectedPublication* selected = nullptr; };
+    static Bindings Declare(org::persistent::GraphEditTransaction& edit, org::persistent::PassId pass,
+        org::persistent::ResourceSlotId resource) {
+        auto token = edit.Declare(pass,resource,{},
             {static_cast<uint64_t>(rhi::ResourceAccessType::UnorderedAccessClear),0,
              static_cast<uint64_t>(rhi::ResourceSyncState::ClearUnorderedAccessView),true});
-        return {token,declaration.View(token,{org::BindlessViewKind::UnorderedAccess}),
-            declaration.View(token,{org::BindlessViewKind::NonShaderVisibleUnorderedAccess})};
+        return {token,edit.DeclareView(token,{org::BindlessViewKind::UnorderedAccess}),
+            edit.DeclareView(token,{org::BindlessViewKind::NonShaderVisibleUnorderedAccess})};
     }
-    ProgramInterface BuildProgramInterface(const Bindings&, uint32_t multiplier) const { return {multiplier}; }
-    static Invocation PrepareInvocation(const ProgramInterface&, const Bindings&, uint32_t value) { return value; }
-    static void Record(const ProgramInterface& program, const Bindings& bindings, const Invocation& value,
-        org::RecordingContext& context) {
+    static void Record(const Invocation& invocation, org::RecordingContext& context) {
+        if (context.PersistentPublication() != invocation.selected)
+            throw std::logic_error("Persistent invocation recorded against a different publication");
+        const auto& bindings = invocation.bindings;
         const auto shader = context.Resolve(bindings.shader);
-        const auto clear = value * program.multiplier;
+        const auto clear = invocation.value;
         context.Commands().SetDescriptorHeaps(shader.heap,{});
         context.Commands().ClearUavUint({shader,context.Resolve(bindings.cpu),context.Resolve(bindings.resource)},
             rhi::UavClearUint(std::array<uint32_t,4>{clear,clear,clear,clear}));
@@ -878,20 +876,19 @@ struct PersistentNativeClear {
 };
 struct PersistentNativeCopy {
     struct Bindings { org::persistent::BindingToken source, destination; };
-    struct ProgramInterface {};
-    using Invocation = uint8_t;
-    org::persistent::ResourceSlotId source, destination;
-    Bindings Declare(org::persistent::PassDeclaration& declaration) {
-        return {declaration.Resource(source,{static_cast<uint64_t>(rhi::ResourceAccessType::CopySource),0,
+    struct Invocation { Bindings bindings; const org::persistent::SelectedPublication* selected = nullptr; };
+    static Bindings Declare(org::persistent::GraphEditTransaction& edit, org::persistent::PassId pass,
+        org::persistent::ResourceSlotId source, org::persistent::ResourceSlotId destination) {
+        return {edit.Declare(pass,source,{},{static_cast<uint64_t>(rhi::ResourceAccessType::CopySource),0,
                     static_cast<uint64_t>(rhi::ResourceSyncState::Copy),false}),
-                declaration.Resource(destination,{static_cast<uint64_t>(rhi::ResourceAccessType::CopyDest),0,
+                edit.Declare(pass,destination,{},{static_cast<uint64_t>(rhi::ResourceAccessType::CopyDest),0,
                     static_cast<uint64_t>(rhi::ResourceSyncState::Copy),true})};
     }
-    ProgramInterface BuildProgramInterface(const Bindings&, uint8_t) const { return {}; }
-    static Invocation PrepareInvocation(const ProgramInterface&, const Bindings&, uint8_t value) { return value; }
-    static void Record(const ProgramInterface&, const Bindings& bindings, const Invocation&, org::RecordingContext& context) {
-        context.Commands().CopyBufferRegion(context.Resolve(bindings.destination).GetHandle(),0,
-            context.Resolve(bindings.source).GetHandle(),0,4096);
+    static void Record(const Invocation& invocation, org::RecordingContext& context) {
+        if (context.PersistentPublication() != invocation.selected)
+            throw std::logic_error("Persistent invocation recorded against a different publication");
+        context.Commands().CopyBufferRegion(context.Resolve(invocation.bindings.destination).GetHandle(),0,
+            context.Resolve(invocation.bindings.source).GetHandle(),0,4096);
     }
 };
 
@@ -1024,8 +1021,9 @@ int TestOwnedDescriptorGpuExecution(const rhi::DeviceCreateInfo& create) {
         // Exercise stable logical tokens through the production prepared-pass
         // executor, using real native resources and exact publication ownership.
         std::shared_ptr<const org::persistent::SelectedPublication> selected;
-        std::optional<org::persistent::TypedPassExecutable<PersistentNativeClear>> clearExecutable;
-        std::optional<org::persistent::TypedPassExecutable<PersistentNativeCopy>> copyExecutable;
+        org::persistent::PassId clearPass{}, copyPass{};
+        PersistentNativeClear::Bindings clearBindings{};
+        PersistentNativeCopy::Bindings copyBindings{};
         {
             org::persistent::GraphProgram persistentProgram;
             auto edit = persistentProgram.BeginEdit();
@@ -1058,20 +1056,19 @@ int TestOwnedDescriptorGpuExecution(const rhi::DeviceCreateInfo& create) {
             // backing. Compilation must still synchronize clear before copy.
             auto aliasInitial = initial[0]; aliasInitial.graphResourceID = 3;
             const auto copySource = edit.AddSnapshot(sourceSnapshot,aliasInitial);
-            PersistentNativeClear clearAuthor{slots[0]};
-            PersistentNativeCopy copyAuthor{copySource,slots[1]};
-            clearExecutable.emplace(org::persistent::TypedPassExecutable<PersistentNativeClear>::Build(edit,{},clearAuthor,uint32_t{1}));
-            copyExecutable.emplace(org::persistent::TypedPassExecutable<PersistentNativeCopy>::Build(edit,{},copyAuthor,uint8_t{}));
+            clearPass = edit.AddPass({});
+            clearBindings = PersistentNativeClear::Declare(edit,clearPass,slots[0]);
+            copyPass = edit.AddPass({});
+            copyBindings = PersistentNativeCopy::Declare(edit,copyPass,copySource,slots[1]);
             selected = edit.Build(workspace,cancelled);
             CHECK(persistentProgram.Install(selected));
             CHECK(selected->bindings.Size() == 3 && selected->executable->resourceSlots.size() == 2);
+            // A non-structural edit of a pass (its recording interface) keeps the executable.
             auto programEdit = persistentProgram.BeginEdit();
-            auto changedExecutable = clearExecutable->RebuildProgramInterface(programEdit,clearAuthor,iteration);
+            programEdit.SetPassRecordingInterface(clearPass,std::make_shared<const uint32_t>(iteration));
             auto changed = programEdit.Build(workspace,cancelled);
             CHECK(changed->executable == selected->executable);
             CHECK(persistentProgram.Install(changed));
-            CHECK(clearAuthor.declarationCalls == 1);
-            clearExecutable.emplace(std::move(changedExecutable));
             selected = std::move(changed);
         }
         auto frame = persistentAdmission.Prepare(selected,std::array<ExecutionTimelinePoint,1>{{{1,iteration-1}}});
@@ -1086,11 +1083,13 @@ int TestOwnedDescriptorGpuExecution(const rhi::DeviceCreateInfo& create) {
         CHECK(barrierPlan.batches[0].beforePass[0].buffers.empty());
         CHECK(!barrierPlan.batches[0].beforePass[1].buffers.empty());
         std::vector<org::PreparedPass> invocations(selectedLayout->placements.size());
-        invocations[clearExecutable->Id().index] = clearExecutable->PrepareInvocation(*selected,uint32_t{1});
+        invocations[clearPass.index] = org::PreparedPass::FromTyped<PersistentNativeClear>(
+            PersistentNativeClear::Invocation{clearBindings,iteration,selected.get()});
         const auto step = std::find_if(graph->states.steps.begin(),graph->states.steps.end(),
             [](const auto& s) { return s.resource == 0 && s.batch == 0 && s.pass == 1; });
         CHECK(step != graph->states.steps.end() && step->previousBatch == 0);
-        invocations[copyExecutable->Id().index] = copyExecutable->PrepareInvocation(*selected,uint8_t{});
+        invocations[copyPass.index] = org::PreparedPass::FromTyped<PersistentNativeCopy>(
+            PersistentNativeCopy::Invocation{copyBindings,selected.get()});
         auto rejectSeal = [&](const org::persistent::FrameAdmission& invalid) {
             try { SealPersistentFrame(iteration,invalid,invocations); }
             catch (const std::invalid_argument&) { return true; }
@@ -1138,7 +1137,7 @@ int TestOwnedDescriptorGpuExecution(const rhi::DeviceCreateInfo& create) {
         CHECK(timingProbe->cpuSamples == 0 && timingProbe->merges == 0);
         std::weak_ptr<const void> bindingLease = descriptorOwner;
         std::weak_ptr<const org::persistent::SelectedPublication> publicationLease = selected;
-        selected.reset(); clearExecutable.reset(); copyExecutable.reset();
+        selected.reset();
         gpu.reset(); cpu.reset(); backing.reset(); descriptorOwner.reset();
         auto execution = std::move(*recorded).Submit(admission);
         persistentAdmission.Commit(frame,*execution);
@@ -1343,13 +1342,21 @@ int main(int argc, char** argv) {
         graph.vt = &table;
         auto owner = std::make_shared<rhi::WorkGraphPtr>(rhi::Device{}, graph,
             +[](rhi::Device&, rhi::WorkGraph& value) noexcept { *static_cast<bool*>(value.impl) = true; });
-        org::PreparedDependencyCollector collector;
-        const auto reference = collector.CaptureWorkGraph(owner);
-        auto dependencies = std::move(collector).Freeze();
+        // A recording retains what it names until its retention is released.
+        rhi::CommandListVTable commandTable{};
+        commandTable.abi_version = rhi::RHI_CL_ABI_MIN;
+        rhi::CommandList commands{rhi::CommandListHandle{1,1}};
+        commands.impl = &commandTable; commands.vt = &commandTable;
+        auto retention = std::make_shared<org::RecordingRetention>();
+        {
+            org::RecordingContext recording(commands, std::make_shared<const org::FrozenExecutionBindings>(
+                std::vector<org::FrozenExecutionBindings::ResourceBinding>{}));
+            recording.SetRetention(retention);
+            recording.Retain(owner);
+        }
         owner.reset();
-        CHECK(dependencies && !dependencies->empty() && !destroyed);
-        CHECK(dependencies->Resolve(reference).index == 1);
-        dependencies.reset();
+        CHECK(!destroyed);
+        retention.reset();
         CHECK(destroyed);
     }
 	if (const auto failure = TestOwnedRenderFrameSnapshot()) return failure;

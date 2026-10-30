@@ -22,9 +22,8 @@ class Buffer;
 // graph gives a resource fresh slots whenever it realizes it on a new backing
 // (for example when the persistent graph re-places an aliased resource). Tables
 // uploaded ahead of preparation therefore go stale on exactly the frame a
-// resource moves. Built in Prepare (or BuildRecipe), the indices come from the
-// frame's frozen bindings, and the framework's invocation/recipe reuse rebuilds
-// the table only when a binding it resolved changes.
+// resource moves. Built in Prepare, the indices come from the
+// frame's frozen bindings, checked every frame the pass prepares.
 //
 // Publish() creates an immutable upload-heap structured buffer only when the
 // bytes differ from the previous publication, retains it in the packet (or

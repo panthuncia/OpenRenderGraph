@@ -205,7 +205,7 @@ struct RenderGraph::PersistentTicket {
 	std::vector<Segment> segments;
 	// Recordings a kept one replaced (AdoptKeptPersistentRecording): released by the owner thread, with the ticket.
 	std::vector<std::shared_ptr<const PersistentRecording>> replaced;
-	// What each prepared pass's preparation depended on (RenderGraphPass::InvocationRevisionHash).
+	// What each prepared pass's preparation depended on (RenderGraphPass::RevisionHash).
 	std::vector<std::pair<const RenderGraphPass*, uint64_t>> revisions;
 	bool uncheckable = false;  // a pass that cannot report its revision: never current
 	uint64_t hostTag = 0;      // the host's, for its own currency checks (GraphHost: the backing version)

@@ -103,7 +103,8 @@ instead of `ExecuteFrame`. `ExecuteFrame` throws while async epochs are on.
 -   **Submission.** `SubmitEpoch` on the render thread:
     1.  takes the ticket from the cell (waiting only if it is not ready);
     2.  runs `beforeSubmit`, the feature's commit;
-    3.  checks the passes' revision hashes against the ticket (`InvocationRevisionHash`), and that no backing
+    3.  checks the passes' revision hashes against the ticket (`RenderGraphPass::RevisionHash`, a typed pass's
+        `Revision`), and that no backing
         changed since it was prepared (below); a stale ticket is prepared again for the same slot;
     4.  records the pending uploads into the slot's upload list, which the host thread has already reset and
         begun;
@@ -156,9 +157,12 @@ and submitted again while what it was recorded for holds, so an epoch is prepare
 again.
 
 -   **What is kept.** A ticket's segment is recorded for resubmission when its execution is closed, nothing is late-bound
-    (no rebound slot, no incoming effect), every pass reports its revision, and every pass is replayable
+    (no rebound slot, no incoming effect), every pass reports its revision (`void Revision(std::vector<uint64_t>&) const`:
+    what its recording depends on beyond its bindings and the frame's resources; it drives nothing but this reuse), and
+    every pass is replayable
     (`PreparedPass::IsReplayable`: no submission, completion or abandonment callback, no external signal, no dependency
-    lifecycle effect). Its packets are then replayable (`PreparedRhiExecutionBatch`, `IPreparedExecutionBatch::Replayable`):
+    lifecycle effect). Pipelines and other objects a recording binds are retained by the recording itself
+    (`RecordingRetention`, on `OwnedRecordingList`), for every resubmission. Its packets are then replayable (`PreparedRhiExecutionBatch`, `IPreparedExecutionBatch::Replayable`):
     a submission commits nothing but the commands, completion releases nothing, and the lists return to their pool when the
     last owner lets the packet go.
 -   **The key.** Per (epoch, frame slot), up to `RenderGraph::kKeptRecordingVariants` recordings, the most recently used
@@ -246,8 +250,8 @@ a scene revision recorded by a dependency graph (CS's DCLF: the scene revision, 
     Completion commits it and abandons the other candidates (closed executions allow several admissions pending, abandoned
     in any order). A recording no candidate admits is an error: the ticket is discarded and the call throws. A
     revision-driven epoch is never prepared again, and its currency check and adoption do not apply.
--   **Not kept.** A recording made for host data is neither taken from nor added to the reuse sets. A pass's revision hash
-    (`InvocationRevisionHash`) reads live state, not the host data, so the key could not tell two revisions apart.
+-   **Not kept.** A recording made for host data is neither taken from nor added to the reuse sets. A pass's `Revision`
+    reads its own state and sees no frame, not the host data, so the key could not tell two revisions apart.
 -   **Statistics.** `AsyncStats::revisionSlotsRecorded`, `revisionRecordings` and `revisionSubmissions`.
 -   **Test.** `PersistentVulkanHostTests revision`:
     -   a revision of the full count recorded for the 3 ring slots and submitted 6 times;
