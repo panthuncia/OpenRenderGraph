@@ -76,7 +76,7 @@ public:
     }
 
     PreparedPass PrepareFrame(FramePreparationContext& context) final {
-        context.resourceUses = this->ResourceUses();
+        context.resourceUses = context.preparedResourceUses ? context.preparedResourceUses : this->ResourceUses();
         auto collector = std::make_shared<PreparedDependencyCollector>();
         auto typedContext = context;
         typedContext.dependencyCollector = collector;
@@ -91,11 +91,13 @@ public:
         }
         if constexpr (!std::same_as<Bindings, NoPassBindings>) {
             static_assert(std::copy_constructible<Bindings>, "Declared bindings must be values");
-            if (!m_declaredBindings || !scope) throw std::logic_error("Declared pass prepared without resolved declarations");
+            const auto declaredBindings = context.preparedBindings
+                ? std::static_pointer_cast<const Bindings>(context.preparedBindings) : m_declaredBindings;
+            if (!declaredBindings || !scope) throw std::logic_error("Declared pass prepared without resolved declarations");
             FrameData data = [&]() -> FrameData {
                 if constexpr (requires(Derived& pass, const Bindings& bindings, const PassPrepareContext& prepare) {
                     { pass.Prepare(bindings, prepare) } -> std::same_as<FrameData>;
-                }) return static_cast<Derived*>(this)->Prepare(*m_declaredBindings, typedContext);
+                }) return static_cast<Derived*>(this)->Prepare(*declaredBindings, typedContext);
                 else {
                     static_assert(std::same_as<FrameData, EmptyPassFrameData>,
                         "Declared passes with frame data require FrameData Prepare(const Bindings&, const PassPrepareContext&)");
@@ -103,7 +105,7 @@ public:
                 }
             }();
             return PreparedPass::FromTyped<DeclaredRecorder>(
-                DeclaredFrame{*m_declaredBindings, std::move(data), context.bindings, context.resourceSlots, std::move(scope)},
+                DeclaredFrame{*declaredBindings, std::move(data), context.bindings, context.resourceSlots, std::move(scope)},
                 std::move(*collector).Freeze(), context.invocationArena);
         } else {
             FrameData data = [&]() -> FrameData {
@@ -140,7 +142,7 @@ public:
     }
 
 private:
-    std::optional<Bindings> m_declaredBindings;
+    std::shared_ptr<const Bindings> m_declaredBindings;
 
     // A recording failure names the pass in the log - Record runs on a worker, away from anything that could tell
     // which - and propagates unchanged.
@@ -211,7 +213,8 @@ protected:
             static_assert(requires(Derived& pass, PassBuilder& declaration) {
                 { pass.Declare(declaration) } -> std::same_as<Bindings>;
             }, "Declared passes require Bindings Declare(PassBuilder&)");
-            m_declaredBindings = static_cast<Derived*>(this)->Declare(*builder);
+            m_declaredBindings = std::make_shared<const Bindings>(static_cast<Derived*>(this)->Declare(*builder));
+            this->SetDeclaredBindings(m_declaredBindings);
         }
         this->SetResourceUses(GetResourceUses(*builder));
     }

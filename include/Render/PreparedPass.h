@@ -210,6 +210,10 @@ private:
 
 struct FramePreparationContext {
     std::shared_ptr<const ResourceUseLayout> resourceUses;
+    // The declaration to prepare against: in a persistent graph, the one its selected executable was built from (a pending
+    // structural build's relowering takes effect at its install). Unset, the pass's latest declaration.
+    std::shared_ptr<const ResourceUseLayout> preparedResourceUses;
+    std::shared_ptr<const void> preparedBindings;
     std::function<rhi::DescriptorSlot(uint32_t, uint32_t)> resolveDeclaredView;
     std::function<rhi::Resource(uint32_t)> resolveDeclaredResource;
     // The view of a resolver group's first bound member this frame (ResourceUseLayout::resolverViews ordinal); an

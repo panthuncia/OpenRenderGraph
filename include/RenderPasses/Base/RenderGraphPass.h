@@ -28,6 +28,10 @@ public:
     ~RenderGraphPass() override;
     std::shared_ptr<const ResourceUseLayout> ResourceUses() const { return m_resourceUses; }
     void SetResourceUses(std::shared_ptr<const ResourceUseLayout> uses) { m_resourceUses = std::move(uses); }
+    // A declared pass's typed bindings from the same declaration as ResourceUses (TypedRenderGraphPass), type-erased so a
+    // graph can keep the declaration a compiled executable was built from; null for undeclared passes.
+    std::shared_ptr<const void> DeclaredBindings() const { return m_declaredBindingsSnapshot; }
+    void SetDeclaredBindings(std::shared_ptr<const void> bindings) { m_declaredBindingsSnapshot = std::move(bindings); }
 
     // Nonvirtual to preserve contributor vtables. The graph installs its exact
     // service generation before Setup; accepted frames retain the same owners.
@@ -69,6 +73,7 @@ protected:
         size_t offset, std::source_location source = std::source_location::current()) const;
 private:
     std::shared_ptr<const ResourceUseLayout> m_resourceUses;
+    std::shared_ptr<const void> m_declaredBindingsSnapshot;
     std::weak_ptr<runtime::IUploadService> m_uploadService;
     std::weak_ptr<runtime::IDescriptorService> m_descriptorService;
 };

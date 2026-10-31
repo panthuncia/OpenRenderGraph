@@ -49,6 +49,7 @@ struct LoweredGroup {
 
 struct LoweredPass {
 	std::shared_ptr<const ResourceUseLayout> resourceUses;
+	std::shared_ptr<const void> declaredBindings; // The typed bindings of the same declaration (RenderGraphPass::DeclaredBindings).
 	compiler::CompilePass declaration;
 	std::vector<LoweredUse> entries, exits;
 	std::vector<LoweredGroup> groups;

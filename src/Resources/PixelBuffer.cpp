@@ -188,9 +188,8 @@ bool PixelBuffer::TryGetRHIResourceDesc(rhi::ResourceDesc& outDesc) const {
 	outDesc.texture.width = width;
 	outDesc.texture.height = height;
 	outDesc.texture.depthOrLayers = static_cast<uint16_t>(arraySize);
-	outDesc.texture.mipLevels = static_cast<uint16_t>(m_desc.generateMipMaps
-		? org::util::CalculateMipLevels(width, height)
-		: (m_desc.imageDimensions.size() > arraySize ? m_desc.imageDimensions.size() / arraySize : 1));
+	// The backing's own count (ResolveTextureMipLevels: authored levels take precedence over generateMipMaps).
+	outDesc.texture.mipLevels = static_cast<uint16_t>(m_mipLevels);
 	outDesc.texture.sampleCount = 1;
 	outDesc.texture.initialLayout = rhi::ResourceLayout::Undefined;
 	if (m_desc.hasRTV) outDesc.resourceFlags |= rhi::ResourceFlags::RF_AllowRenderTarget;

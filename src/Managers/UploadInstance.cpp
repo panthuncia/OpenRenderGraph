@@ -67,11 +67,20 @@ void UploadInstance::SetOwnerThread() {
 
 bool UploadInstance::IsOwnerThread() const noexcept {
 	const auto owner = m_ownerThreadHash.load(std::memory_order_acquire);
-	return owner == 0 || owner == std::hash<std::thread::id>{}(std::this_thread::get_id());
+	return owner != 0 && owner == std::hash<std::thread::id>{}(std::this_thread::get_id());
+}
+
+bool UploadInstance::ClaimOwnerThread() noexcept {
+	const auto self = std::hash<std::thread::id>{}(std::this_thread::get_id());
+	std::size_t owner = 0;
+	if (m_ownerThreadHash.compare_exchange_strong(owner, self, std::memory_order_acq_rel, std::memory_order_acquire)) {
+		return true;
+	}
+	return owner == self;
 }
 
 void UploadInstance::NoteOffOwnerCall(const char* api) {
-	if (IsOwnerThread()) return;
+	if (ClaimOwnerThread()) return;
 	basic_telemetry::AddCounter("ORG.Upload.FrameInstance.OffThreadCalls");
 	basic_telemetry::AddCounter(std::string("ORG.Upload.FrameInstance.OffThreadCalls.") + api);
 	const auto logged = m_offThreadCallsLogged.fetch_add(1, std::memory_order_relaxed);
@@ -81,18 +90,10 @@ void UploadInstance::NoteOffOwnerCall(const char* api) {
 	}
 }
 
-void UploadInstance::NoteProducerCall(const char* api, const UploadTarget& target) {
-	if (IsOwnerThread()) return;
-	basic_telemetry::AddCounter("ORG.Upload.FrameInstance.OffThreadCalls");
-	basic_telemetry::AddCounter(std::string("ORG.Upload.FrameInstance.OffThreadCalls.") + api);
-	const auto logged = m_offThreadCallsLogged.fetch_add(1, std::memory_order_relaxed);
-	if (logged < 32u) {
-		const std::string name = target.kind == UploadTarget::Kind::PinnedShared && target.pinned
-			? target.pinned->GetName()
-			: std::string("registry-handle");
-		spdlog::warn("UploadInstance '{}': {} called off the owner thread target='{}' (frame upload instance is render-thread owned)",
-			m_debugName, api, name);
-	}
+// A posted (mailbox) upload: the supported producer path, counted, not misuse.
+void UploadInstance::NoteProducerCall(const char* api) {
+	basic_telemetry::AddCounter("ORG.Upload.FrameInstance.PostedCalls");
+	basic_telemetry::AddCounter(std::string("ORG.Upload.FrameInstance.PostedCalls.") + api);
 }
 
 void UploadInstance::SetResolveContext(UploadResolveContext ctx) {
@@ -456,7 +457,7 @@ void UploadInstance::UploadData(const void* data, size_t size, UploadTarget targ
 	if (!IsOwnerThread()) {
 		// Producers never touch the owner's queue: the bytes are copied and the
 		// owner applies the upload before its next upload pass records.
-		NoteProducerCall("UploadData", target);
+		NoteProducerCall("UploadData");
 		PostedBufferUpload posted;
 		posted.target = std::move(target);
 		posted.bytes.assign(static_cast<const uint8_t*>(data), static_cast<const uint8_t*>(data) + size);
@@ -635,11 +636,11 @@ void UploadInstance::UploadTextureSubresources(
 	const auto plan = rhi::helpers::PlanTextureUploadSubresources(
 		fmt, baseWidth, baseHeight, depthOrLayers, mipLevels, arraySize, srcSpan);
 	if (plan.totalSize == 0 || plan.footprints.empty()) return;
-	if (!IsOwnerThread()) {
+	if (!ClaimOwnerThread()) {
 		// The raw entry cannot outlive the caller's source pointers, so an
 		// off-owner call has no safe way to post; PostTextureSubresources is the
 		// producer-side API (caller-owned bytes).
-		NoteProducerCall("UploadTextureSubresources", target);
+		NoteOffOwnerCall("UploadTextureSubresources");
 		throw std::logic_error("UploadInstance::UploadTextureSubresources called off the owner thread; use PostTextureSubresources");
 	}
 	UploadTextureSubresourcesPrepared(std::move(target), fmt, baseWidth, baseHeight, depthOrLayers, mipLevels, arraySize,
@@ -727,7 +728,7 @@ void UploadInstance::PostTextureSubresources(UploadTarget target, rhi::Format fm
 			subresources->data(), static_cast<uint32_t>(subresources->size()), file, line);
 		return;
 	}
-	NoteProducerCall("PostTextureSubresources", target);
+	NoteProducerCall("PostTextureSubresources");
 	rhi::Span<const rhi::helpers::SubresourceData> srcSpan{ subresources->data(),
 		static_cast<uint32_t>(subresources->size()) };
 	const auto plan = rhi::helpers::PlanTextureUploadSubresources(

@@ -1390,8 +1390,17 @@ BindingVersion BindingVersion::FromSnapshot(std::shared_ptr<const ResourceBindin
         && snapshot->aliasSize == initial.aliasSize, "Publication snapshot placement disagrees with admission");
     Require(bool(initial.regions), "Publication snapshot has no initial state regions");
     if (snapshot->description.type != rhi::ResourceType::Unknown) {
-        Require(NativeBindingContract::Capture(snapshot->description).Matches(snapshot->description,initial.shape),
-            "Publication snapshot shape disagrees with admission");
+        if (!NativeBindingContract::Capture(snapshot->description).Matches(snapshot->description, initial.shape)) {
+            const auto& desc = snapshot->description;
+            const bool texture = desc.type != rhi::ResourceType::Buffer && desc.type != rhi::ResourceType::AccelerationStructure;
+            throw std::logic_error(std::string("Publication snapshot shape disagrees with admission: resource=")
+                + (desc.debugName ? desc.debugName : "<unnamed>") + " id=" + std::to_string(snapshot->resourceID)
+                + " type=" + std::to_string(static_cast<uint32_t>(desc.type))
+                + (texture ? " mips=" + std::to_string(desc.texture.mipLevels) + " layers=" + std::to_string(desc.texture.depthOrLayers)
+                    : " bytes=" + std::to_string(desc.buffer.sizeBytes))
+                + " admitted(mips=" + std::to_string(initial.shape.mips) + " slices=" + std::to_string(initial.shape.slices)
+                + " layout=" + std::to_string(initial.shape.hasLayout) + ")");
+        }
         Require(snapshot->description.heapType == initial.heapType, "Publication snapshot heap disagrees with admission");
     }
     BindingVersion result;
@@ -1695,8 +1704,9 @@ size_t SynchronousAdmission::RetireCompleted(std::span<const compiler::Execution
         const auto submitted = m_submitted.find(point.timeline);
         Require((submitted != m_submitted.end() && point.value <= submitted->second) || !point.value,
             "Completion exceeds submitted work");
-        Require(point.value >= observations[point.timeline], "Completion moved backwards");
-        observations[point.timeline] = point.value;
+        // Completion only advances, but the sequencer is shared: a graph built later (after a resize, say) can
+        // report a timeline it sampled before another graph's newer observation. Keep the furthest.
+        observations[point.timeline] = (std::max)(observations[point.timeline], point.value);
     }
     m_sequencer->completed = std::move(observations);
     std::vector<std::shared_ptr<const SelectedPublication>> retired;

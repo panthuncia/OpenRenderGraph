@@ -42,12 +42,15 @@ class Buffer;
 //   3. Call ProcessUploads() from a pass's RecordImmediateCommands() to emit GPU copies.
 //   4. Call ProcessDeferredReleases() once per frame (after GPU retire) to reclaim pages.
 //
-// Threading: the instance is owned by one thread (SetOwnerThread, the render
-// thread). Every queue operation runs on that thread and there is no queue
-// mutex. Other threads reach it only through lock-free mailboxes: posted
-// uploads (PostTextureSubresources, off-owner UploadData) drained by the owner
-// before it records, and pages prepared by the background task. Off-owner
-// producer calls are counted (ORG.Upload.FrameInstance.OffThreadCalls).
+// Threading: the instance is owned by one thread: the one named by
+// SetOwnerThread, or else the first to run a queue operation (recording,
+// retiring, raw UploadTextureSubresources). Every queue operation runs on that
+// thread and there is no queue mutex. Other threads reach it only through
+// lock-free mailboxes: posted uploads (PostTextureSubresources, off-owner
+// UploadData) drained by the owner before it records, and pages prepared by the
+// background task. An unowned instance posts too, so a producer never writes
+// the queue of an instance whose owner has yet to run. Queue operations off the
+// owner are misuse and are logged (ORG.Upload.FrameInstance.OffThreadCalls).
 class UploadInstance {
 public:
 	using UploadTarget        = org::runtime::UploadTarget;
@@ -174,11 +177,9 @@ public:
 	// Configuration
 
 	void SetResolveContext(UploadResolveContext ctx);
-	// The frame upload instance is owned by the render thread. Producer calls
-	// from any other thread are counted (ORG.Upload.FrameInstance.OffThreadCalls
-	// and per-API) so they can be routed to the worker upload service; once the
-	// count is zero the queue mutex can be removed.
+	// Names the owner thread (see the class comment); without it the first queue operation claims ownership.
 	void SetOwnerThread();
+	// Whether the calling thread is the owner; false while the instance is unowned.
 	bool IsOwnerThread() const noexcept;
 	void SetPendingWorkChangedCallback(PendingWorkChangedCallback callback);
 	void SetTargetTelemetryCallback(TargetTelemetryCallback callback);
@@ -312,7 +313,10 @@ private:
 	TargetTelemetryCallback m_targetTelemetry;
 	InvalidRegistryHandleCallback m_invalidRegistryHandle;
 
-	void NoteProducerCall(const char* api, const UploadTarget& target);
+	// The calling thread owns the instance, claiming it when unowned.
+	bool ClaimOwnerThread() noexcept;
+	void NoteProducerCall(const char* api);
+	// Queue operations: claims ownership when unowned; logs a call off the owner.
 	void NoteOffOwnerCall(const char* api);
 	// Owner-thread: apply uploads other threads posted.
 	void DrainPostedUploads();

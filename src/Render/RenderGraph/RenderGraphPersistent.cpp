@@ -253,6 +253,8 @@ void persistent_impl::InstallMainPass(RenderGraph& graph, State& state, persiste
 	edit.SetPassEpoch(main.id, main.epoch);
 	edit.SetPassDebugName(main.id, main.name);
     main.resourceUses = lowered.resourceUses;
+    main.preparedResourceUses = lowered.resourceUses;
+    main.preparedBindings = lowered.declaredBindings;
     main.declaredViews.clear();
     main.declaredBindings.clear();
     main.resolverUseEntries.clear();
@@ -694,6 +696,10 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 						if (captured && !(captured->resourceSetIdentity == identity)) { directStale = true; break; }
 					}
 					if (!declared && !directStale) return;
+					// A build in flight lowers the pass's current declaration, and frames keep preparing against the publication
+					// that has it until that build installs. Redeclaring now would hand the pass declarations that publication
+					// lacks; the pass still reports the change, so it is redeclared once the build installs.
+					if (state.pending && !directStale) return;
 					BT_ZONE_SCOPE("ORG.Persistent.RefreshDeclaration");
 					BT_ZONE_TEXT(any.name.data(), any.name.size());
 					++refreshed;
@@ -703,6 +709,8 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 					// binding tokens, which only a reinstalled lowering resolves.
 					if (FingerprintLowering(lowered) == main.fingerprint && lowered.resourceUses == main.resourceUses) {
 						main.directResolvers = std::move(lowered.directResolvers);
+						// Same layout, so the installed executable resolves the new bindings' tokens.
+						main.preparedBindings = std::move(lowered.declaredBindings);
 						return;
 					}
 					LogRelowerDiff(any.name, main, lowered);
@@ -798,6 +806,22 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 				const auto key = RotationKeyOf(entry);
 				if (entry.isBound && key == entry.bound) continue;
 				if (!entry.isBound && !key.concreteID) continue;
+				// A backing of another shape (a texture swapped for one with more mips, say) is a new declaration, not a
+				// binding edit: the slot was admitted with its shape. Its subscribers re-lower, which gives the resource a
+				// slot of the new shape; until that installs they keep the bound backing.
+				if (const auto shape = ShapeOf(*entry.resource); shape != entry.shape) {
+					{
+						static std::atomic<uint32_t> reported{0};
+						if (reported.fetch_add(1) < 8)
+							spdlog::info("Persistent backing shape changed: resource='{}' mips={}->{} slices={}->{}",
+								entry.resource->GetName(), entry.shape.mips, shape.mips, entry.shape.slices, shape.slices);
+					}
+					basic_telemetry::AddCounter("ORG.Persistent.BackingShapeChanges");
+					auto& relower = state.pending ? state.pending->deferredStructural : structural;
+					for (const auto subscriber : entry.subscribers)
+						if (std::find(relower.begin(), relower.end(), subscriber) == relower.end()) relower.push_back(subscriber);
+					continue;
+				}
 				auto& transaction = ensureEdit();
 				// Rotated backings may not be materialized yet (per-frame presentation
 				// targets are realized lazily by the legacy path).
@@ -1055,6 +1079,8 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 			}
 			pass.hostedPrepared = static_cast<bool>(pass.hosted);
 			passPreparation.resourceSlots = pass.slots;
+			passPreparation.preparedResourceUses = pass.preparedResourceUses;
+			passPreparation.preparedBindings = pass.preparedBindings;
 			passPreparation.backendInstance = pass.device;
 			if (const auto* entry = m_backendDevices.Find(pass.device)) passPreparation.device = entry->device;
             passPreparation.resolveDeclaredView = [&pass, selected](uint32_t use, uint32_t view) {
@@ -1068,8 +1094,8 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
             // A name declared through a resolver group: its first member bound this frame, in capture order.
             passPreparation.resolveResolverView = [&pass, &state, bindings = passPreparation.bindings](
                 uint32_t resolverGroup, BindlessViewRequest request) -> rhi::DescriptorSlot {
-                if (!pass.resourceUses || resolverGroup >= pass.resourceUses->resolverViews.size() || !bindings) return {};
-                const auto& identity = pass.resourceUses->resolverViews[resolverGroup].identity;
+                if (!pass.preparedResourceUses || resolverGroup >= pass.preparedResourceUses->resolverViews.size() || !bindings) return {};
+                const auto& identity = pass.preparedResourceUses->resolverViews[resolverGroup].identity;
                 for (const auto groupIndex : pass.groups) {
                     const auto& group = state.groups[groupIndex];
                     if (group.key != identity) continue;

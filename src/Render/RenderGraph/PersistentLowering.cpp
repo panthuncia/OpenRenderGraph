@@ -182,6 +182,7 @@ LoweredPass LowerPass(RenderGraph& graph, ResourceRegistry& registry, const Queu
 	rhi::Backend primaryBackend, const RenderGraph::PassAndResources& pass, RenderGraph::PassType type) {
 	LoweredPass result;
 	result.resourceUses = pass.pass->ResourceUses();
+	result.declaredBindings = pass.pass->DeclaredBindings();
 	auto& declaration = result.declaration;
 	const auto& resources = pass.resources;
 	std::vector<uint32_t> compatible;

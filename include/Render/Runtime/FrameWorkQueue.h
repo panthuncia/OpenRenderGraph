@@ -102,6 +102,27 @@ public:
         // If publication throws, destruction returns the removed nodes without allocation.
         preparation.Reserve(std::move(reservation));
     }
+        // Reserves the entries of `selected` that are still pending, in order, and returns them. A declaration's snapshot
+    // outlives the execution that takes its work: every execution of the compiled graph prepares against it until a new
+    // declaration installs, so each takes what no earlier one has (work an abandoned execution returned included).
+    Snapshot ReserveAvailable(const Snapshot& selected, const FramePreparationContext& preparation) const {
+        Snapshot taken;
+        if (selected.empty()) return taken;
+        auto reservation = std::make_shared<Reservation>(m_state);
+        {
+            std::lock_guard lock(m_state->mutex);
+            for (const auto& entry : selected) {
+                if (!entry) continue;
+                const auto found = std::find(m_state->pending.begin(), m_state->pending.end(), entry);
+                if (found == m_state->pending.end()) continue;
+                reservation->work.splice(reservation->work.end(), m_state->pending, found);
+                taken.push_back(entry);
+            }
+            m_state->counters.reserved += taken.size();
+        }
+        if (!taken.empty()) preparation.Reserve(std::move(reservation));
+        return taken;
+    }
     // Prevent obsolete jobs from returning after a frame is cancelled. This
     // does not revoke already recorded GPU work; callers still drain/join it.
     template<class Predicate>

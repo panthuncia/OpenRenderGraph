@@ -137,8 +137,15 @@ inline std::optional<persistent::BindingVersion> CaptureSlotBinding(Resource& re
 	initial.aliasPoolID = snapshot->aliasPoolID;
 	initial.aliasOffset = snapshot->aliasOffset;
 	initial.aliasSize = snapshot->aliasSize;
-	return persistent::BindingVersion::FromSnapshot(std::move(snapshot), initial,
-		reinterpret_cast<uintptr_t>(initial.regions.get()), initial.resource.generation);
+	try {
+		return persistent::BindingVersion::FromSnapshot(std::move(snapshot), initial,
+			reinterpret_cast<uintptr_t>(initial.regions.get()), initial.resource.generation);
+	} catch (const std::exception& error) {
+		const auto live = ShapeOf(resource);
+		throw std::logic_error(std::string(error.what()) + " (slot " + std::to_string(slotIndex) + " '" + resource.GetName()
+			+ "': live mips=" + std::to_string(live.mips) + " slices=" + std::to_string(live.slices)
+			+ ", captured with mips=" + std::to_string(shape.mips) + " slices=" + std::to_string(shape.slices) + ")");
+	}
 }
 
 struct RotationKey {
@@ -307,6 +314,10 @@ struct RenderGraph::PersistentExecutionState {
 		// applied copy-on-write before preparation instead of a full rebuild.
 		std::vector<std::pair<uint64_t, uint32_t>> slotAdds, slotRemoves;
         std::shared_ptr<const ResourceUseLayout> resourceUses;
+        // The declaration the selected executable was built from, which preparation hands the pass: a relowering joins
+        // it when its executable installs, with declaredViews and declaredBindings.
+        std::shared_ptr<const ResourceUseLayout> preparedResourceUses;
+        std::shared_ptr<const void> preparedBindings;
         std::vector<std::vector<persistent::ViewToken>> declaredViews;
         std::vector<persistent::BindingToken> declaredBindings;
         // Per declared use: the group member entry a resolver use names (UINT32_MAX for a direct use). Resolved once, at
@@ -458,6 +469,8 @@ struct RenderGraph::PersistentExecutionState {
 			uint32_t mainIndex;
 			std::vector<std::vector<persistent::ViewToken>> views;
 			std::vector<persistent::BindingToken> bindings;
+			std::shared_ptr<const ResourceUseLayout> preparedResourceUses;
+			std::shared_ptr<const void> preparedBindings;
 		};
 		std::vector<DeclaredTokens> declaredTokens;
 		std::vector<uint32_t> touchedGroups;      // grown in the transaction: not polled meanwhile

@@ -274,13 +274,18 @@ void RenderGraph::SubmitPersistentStructuralBuild(const std::vector<uint32_t>& s
 				MaterializePersistentStandalone(resources, true);
 				auto views = std::move(main.declaredViews);
 				auto bindings = std::move(main.declaredBindings);
+				auto preparedUses = main.preparedResourceUses;
+				auto preparedBindings = main.preparedBindings;
 				InstallMainPass(*this, state, transaction, main, std::move(lowered), mainIndex, true, std::nullopt,
 					inlineRequired ? nullptr : &pending->touchedGroups);
 				if (!inlineRequired) {
 					// Frames keep preparing against the current publication until the install.
 					std::swap(views, main.declaredViews);
 					std::swap(bindings, main.declaredBindings);
-					pending->declaredTokens.push_back({mainIndex, std::move(views), std::move(bindings)});
+					std::swap(preparedUses, main.preparedResourceUses);
+					std::swap(preparedBindings, main.preparedBindings);
+					pending->declaredTokens.push_back({mainIndex, std::move(views), std::move(bindings),
+						std::move(preparedUses), std::move(preparedBindings)});
 				}
 				basic_telemetry::AddCounter("ORG.Persistent.StructuralPassRelowerings");
 			}
@@ -360,6 +365,8 @@ void RenderGraph::AdvancePersistentStructuralBuild(std::vector<uint32_t>& struct
 		auto& main = state.mainPasses[tokens.mainIndex];
 		main.declaredViews = std::move(tokens.views);
 		main.declaredBindings = std::move(tokens.bindings);
+		main.preparedResourceUses = std::move(tokens.preparedResourceUses);
+		main.preparedBindings = std::move(tokens.preparedBindings);
 	}
 	structural.insert(structural.end(), pending->deferredStructural.begin(), pending->deferredStructural.end());
 	++state.structuralBuilds;

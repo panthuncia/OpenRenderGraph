@@ -25,9 +25,24 @@ namespace org::runtime {
 
 class StagedUploadBatch;
 
-class IUploadService {
+// The any-thread half of an upload service: what code that creates resources off the owner thread (asset jobs, graph
+// workers) is handed, so it cannot reach the owner-only queue operations of IUploadService.
+class IUploadProducer {
 public:
-    virtual ~IUploadService() = default;
+    virtual ~IUploadProducer() = default;
+
+    // Texture upload whose source bytes are owned by the caller through `keepAlive`. On the owner thread this queues the
+    // upload directly; from any other thread (or while the service has no owner yet) the bytes are staged on the calling
+    // thread and posted to the owner's mailbox, recorded by the owner's next upload pass.
+    virtual void PostTextureSubresources(UploadTarget target, rhi::Format fmt, uint32_t baseWidth, uint32_t baseHeight,
+        uint32_t depthOrLayers, uint32_t mipLevels, uint32_t arraySize,
+        std::shared_ptr<const std::vector<rhi::helpers::SubresourceData>> subresources,
+        std::shared_ptr<const void> keepAlive, const char* file = nullptr, int line = 0) = 0;
+};
+
+class IUploadService : public IUploadProducer {
+public:
+    ~IUploadService() override = default;
 
     virtual void Initialize() = 0;
     // Marks the calling thread as the owner of the frame (in-graph) upload path.
@@ -49,16 +64,12 @@ public:
         const char* file = nullptr,
         int line = 0) = 0;
 
-    // Texture upload whose source bytes are owned by the caller through
-    // `keepAlive`. On the owner (render) thread this is UploadTextureSubresources;
-    // from any other thread the request is posted to the owner's mailbox and
-    // recorded by the next frame's upload pass, so producers never touch the
-    // frame upload queue. Live textures published to consumers are graph-ordered
-    // this way; only never-used, concurrent textures may use the worker service.
-    virtual void PostTextureSubresources(UploadTarget target, rhi::Format fmt, uint32_t baseWidth, uint32_t baseHeight,
+    // IUploadProducer::PostTextureSubresources. This default, for services without a mailbox, uploads directly and so
+    // is owner-thread only.
+    void PostTextureSubresources(UploadTarget target, rhi::Format fmt, uint32_t baseWidth, uint32_t baseHeight,
         uint32_t depthOrLayers, uint32_t mipLevels, uint32_t arraySize,
         std::shared_ptr<const std::vector<rhi::helpers::SubresourceData>> subresources,
-        std::shared_ptr<const void> keepAlive, const char* file = nullptr, int line = 0) {
+        std::shared_ptr<const void> keepAlive, const char* file = nullptr, int line = 0) override {
         (void)keepAlive;
         if (!subresources) return;
         UploadTextureSubresources(std::move(target), fmt, baseWidth, baseHeight, depthOrLayers, mipLevels, arraySize,
