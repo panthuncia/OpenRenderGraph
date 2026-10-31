@@ -16,9 +16,11 @@ struct ReplayRunResult {
     double bootstrapMs = 0, publicationMs = 0, criticalPathMs = 0;
     std::vector<double> admissionMs;
 };
-// GPU-free fixture adapter. Only synthetic physical identities are supplied by
-// this layer; graph edits, compilation, selection and admission are production.
-// Sequence v3 includes external waits/states, but not recording workloads or authored physical aliasing.
+// GPU-free fixture adapter. This layer supplies only synthetic physical
+// identities. Graph edits, compilation, selection and admission all run the
+// production code.
+// Sequence v3 includes external waits and states. It does not include recording workloads or authored physical
+// aliasing.
 inline ReplayRunResult RunGraphReplaySequence(const compiler::GraphReplaySequence& sequence) {
     using namespace compiler;
     using namespace persistent;

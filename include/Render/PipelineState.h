@@ -57,9 +57,10 @@ public:
 	std::shared_ptr<PipelineStatePayload> Load() const {
 		return m_active.load(std::memory_order_acquire);
 	}
-	// Non-owning identity of the active payload for revision checks: no
-	// atomic shared_ptr load, no refcount traffic. Retired payloads stay alive
-	// through the packets that captured them, so the pointer is only compared.
+	// A non-owning identity of the active payload, for revision checks. Reading
+	// it needs no atomic shared_ptr load and no reference count traffic. Retired
+	// payloads stay alive through the packets that captured them, so the pointer
+	// is only compared.
 	PipelineStatePayload* Peek() const noexcept { return m_peek.load(std::memory_order_acquire); }
 
 	std::shared_ptr<PipelineStatePayload> Exchange(std::shared_ptr<PipelineStatePayload> payload) {

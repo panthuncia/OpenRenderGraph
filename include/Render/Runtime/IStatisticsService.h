@@ -20,18 +20,22 @@ enum class TimestampRangeKind : uint8_t {
     Sub,      // a range a pass recorded inside itself (BeginRecordingSubRange), nested in its pass's
 };
 
-// The timestamp queries of one recording kept for resubmission (CreateOwnedTimestamps). A kept recording replays the same
-// commands every submission, so it cannot take the frame-indexed slots of the shared pool (which is also recreated as
-// passes register, under recordings that outlive it): it owns its pool and readback buffer instead. Its list resets them,
-// writes a begin/end pair per range and resolves them into the buffer; a recording belongs to one frame slot, whose
-// submissions follow each other's completion, so the buffer holds the last submission's values when that slot completes
-// (OnFrameComplete reads it then). Recorded once, on the recording's thread; read after submissions, by the completion.
+// The timestamp queries of one recording that is kept for resubmission (CreateOwnedTimestamps).
+// A kept recording replays the same commands at every submission. So it cannot use the frame-indexed slots of the
+// shared pool. That pool is also recreated as passes register, while recordings can outlive it. Instead, a kept
+// recording owns its pool and readback buffer. Its list does the following:
+// - resets the queries,
+// - writes a begin/end pair per range,
+// - resolves them into the buffer.
+// A recording belongs to one frame slot. Each submission on that slot starts only after the previous one completed.
+// So when the slot completes, the buffer holds the last submission's values. OnFrameComplete reads them then.
+// The queries are recorded once, on the recording's thread. They are read after submissions, by the completion.
 struct OwnedTimestampQueries {
     struct Entry {
         std::string name;
-        int passIndex = -1;  // GetPassNames()'s, or -1 (a barrier batch)
+        int passIndex = -1;  // index into GetPassNames(), or -1 for a barrier batch
         TimestampRangeKind kind = TimestampRangeKind::Pass;
-        uint32_t occurrence = 0;  // ranges of this name before it in the list
+        uint32_t occurrence = 0;  // number of ranges with this name before it in the list
     };
     rhi::QueryPoolPtr pool;
     rhi::ResourcePtr readback;
@@ -41,7 +45,7 @@ struct OwnedTimestampQueries {
     uint32_t capacity = 0;             // ranges; each takes queries 2i (begin) and 2i + 1 (end)
     std::vector<Entry> entries;        // the ranges recorded, in recording order
     std::vector<int> open;             // recording: the ranges begun and not yet ended, innermost last
-    bool resolved = false;             // recording: the resolve is recorded; nothing more is
+    bool resolved = false;             // recording: the resolve is recorded, and nothing more can be
     uint32_t overflow = 0;             // ranges past capacity, not timed
 
     OwnedTimestampQueries() = default;
@@ -50,11 +54,13 @@ struct OwnedTimestampQueries {
     ~OwnedTimestampQueries();  // the pool and buffer go to deferred deletion
 };
 
-// One timestamp pair read back by OnFrameComplete: a pass's (from the shared pool or a kept recording's own queries), or a
-// barrier batch's (kept recordings only). Every queue's: a consumer computing time along a queue keeps them apart.
+// One timestamp pair read back by OnFrameComplete. It is one of:
+// - a pass's pair, from the shared pool or from a kept recording's own queries,
+// - a barrier batch's pair, from kept recordings only.
+// Pairs come from every queue. A consumer that computes time along a queue must keep the queues apart.
 struct CompletedTimestamp {
     std::string_view name;  // valid until the next OnFrameComplete or RegisterPass
-    int passIndex = -1;     // GetPassNames()'s, or -1
+    int passIndex = -1;     // index into GetPassNames(), or -1
     uint32_t occurrence = 0;
     rhi::QueueKind queueKind = rhi::QueueKind::Graphics;
     TimestampRangeKind kind = TimestampRangeKind::Pass;
@@ -99,9 +105,12 @@ public:
     virtual uint64_t GetFrameSerial() const = 0;
     virtual double GetGpuTicksToMilliseconds() const = 0;
 
-    // Queries of a recording kept for resubmission, for this many ranges on that queue (QueryRecordingContext::owned): the
-    // context's BeginQuery/EndQuery/ResolveQueries then use them, BeginRangeQuery/EndRangeQuery time its barrier batches,
-    // and each MergePendingResolves (a submission) has the frame slot's OnFrameComplete read them. Null: not collected.
+    // Creates the queries of a recording that is kept for resubmission, for this many ranges on that queue
+    // (QueryRecordingContext::owned). Then:
+    // - the context's BeginQuery, EndQuery and ResolveQueries use them,
+    // - BeginRangeQuery and EndRangeQuery time the recording's barrier batches,
+    // - each MergePendingResolves (a submission) makes the frame slot's OnFrameComplete read them.
+    // Returns null when they are not collected.
     virtual std::shared_ptr<OwnedTimestampQueries> CreateOwnedTimestamps(rhi::QueueKind queueKind, uint32_t ranges) {
         (void)queueKind; (void)ranges;
         return nullptr;
@@ -111,14 +120,16 @@ public:
         (void)name; (void)cmdList; (void)ctx;
     }
     virtual void EndRangeQuery(rhi::CommandList& cmdList, QueryRecordingContext& ctx) { (void)cmdList; (void)ctx; }
-    // A named range a pass records inside itself (nested in the pass's), in a context with owned queries. False: not timed
-    // (no owned queries, or past their capacity); only a true one is ended.
+    // A named range that a pass records inside itself, nested in the pass's range, in a context with owned queries.
+    // Returns false when the range is not timed: there are no owned queries, or they are past capacity.
+    // End only a range that returned true.
     virtual bool BeginSubRangeQuery(std::string_view name, rhi::CommandList& cmdList, QueryRecordingContext& ctx) {
         (void)name; (void)cmdList; (void)ctx;
         return false;
     }
-    // A publication (MergePendingResolves and the CPU samples of a recording made after its submission: a late batch of an external
-    // epoch) run by the frame slot's next OnFrameComplete, before it reads the slot's queries, on the thread that calls both.
+    // Queues a publication for the frame slot's next OnFrameComplete. It runs before that call reads the slot's queries,
+    // on the thread that calls both. This is for MergePendingResolves and the CPU samples of a recording made after its
+    // submission, such as a late batch of an external epoch.
     virtual void PublishAtCompletion(unsigned frameIndex, std::function<void()> publish) { (void)frameIndex; (void)publish; }
     // Every timestamp pair the latest OnFrameComplete read, in reading order.
     virtual const std::vector<CompletedTimestamp>& GetCompletedTimestamps() const {
@@ -129,10 +140,10 @@ public:
 
 std::shared_ptr<IStatisticsService> CreateDefaultStatisticsService();
 
-// The queries of the kept recording a pass is being recorded into: set around the pass's Record by the persistent graph's
-// recorder (RecordingRangeScope), on the recording thread, while timestamps are collected for it. A pass times parts of itself
-// through BeginRecordingSubRange / EndRecordingSubRange (e.g. a draw pass's views or draw groups), with no access to the
-// recording's statistics of its own.
+// The queries of the kept recording that a pass is being recorded into. The persistent graph's recorder sets them
+// around the pass's Record (RecordingRangeScope), on the recording thread, while timestamps are collected for it.
+// A pass times parts of itself through BeginRecordingSubRange and EndRecordingSubRange, for example a draw pass's
+// views or draw groups. The pass needs no access of its own to the recording's statistics.
 struct RecordingRanges {
     IStatisticsService* service = nullptr;
     QueryRecordingContext* context = nullptr;
@@ -153,7 +164,8 @@ private:
 
 // Whether the pass being recorded on this thread can time sub-ranges.
 inline bool RecordingSubRangesActive() noexcept { return t_recordingRanges != nullptr; }
-// A sub-range of the pass being recorded on this thread, into its own command list. False: not timed; end only a true one.
+// Begins a sub-range of the pass being recorded on this thread, in its own command list. Returns false when the
+// range is not timed. End only a range that returned true.
 inline bool BeginRecordingSubRange(std::string_view name) {
     auto* ranges = t_recordingRanges;
     return ranges && ranges->service->BeginSubRangeQuery(name, *ranges->commands, *ranges->context);

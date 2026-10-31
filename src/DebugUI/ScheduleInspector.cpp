@@ -26,7 +26,7 @@ constexpr float kBatchHeader = 14.0f;  // the batch's own label inside its box
 constexpr float kBatchGap = 30.0f;     // room for the wait arrows between batch columns
 constexpr float kPassGap = 2.0f;
 constexpr float kWaitHandle = 5.0f;    // the hover target on a wait arrow
-constexpr size_t kTooltipLines = 40;   // per list in a tooltip; the selection panel lists everything
+constexpr size_t kTooltipLines = 40;   // Lines per list in a tooltip. The selection panel lists everything.
 
 ImU32 QueueColor(uint32_t queue) {
     static constexpr ImU32 colors[] = {
@@ -122,7 +122,7 @@ struct Names {
     }
 };
 
-// The resources whose names contain the filter (empty: no filter).
+// Matches the resources whose names contain the filter text. An empty filter matches every resource.
 struct Filter {
     bool active = false;
     std::vector<char> resources;
@@ -323,7 +323,8 @@ ImVec2 Bezier(ImVec2 p0, ImVec2 c0, ImVec2 c1, ImVec2 p1, float t) {
     return ImVec2(w0 * p0.x + w1 * c0.x + w2 * c1.x + w3 * p1.x, w0 * p0.y + w1 * c0.y + w2 * c1.y + w3 * p1.y);
 }
 
-// A wait arrow, producer (left) to consumer (right); returns its midpoint (the hover handle).
+// Draws a wait arrow from the producer on the left to the consumer on the right. Returns the arrow's midpoint, which
+// is its hover handle.
 ImVec2 DrawArrow(ImDrawList* drawList, ImVec2 from, ImVec2 to, ImU32 color, float thickness) {
     if (to.x <= from.x) {
         to.x = from.x + 1.0f;
@@ -332,7 +333,8 @@ ImVec2 DrawArrow(ImDrawList* drawList, ImVec2 from, ImVec2 to, ImU32 color, floa
     const ImVec2 c0(from.x + handle, from.y);
     const ImVec2 c1(to.x - handle, to.y);
     drawList->AddBezierCubic(from, c0, c1, to, color, thickness);
-    // The head along the end tangent (c1 -> to points right by construction).
+    // Point the arrow head along the curve's end tangent. The tangent from c1 to `to` always points right by
+    // construction.
     float tx = to.x - c1.x, ty = to.y - c1.y;
     const float length = std::sqrt(tx * tx + ty * ty);
     if (length < 1e-4f) {
@@ -358,7 +360,8 @@ struct Hover {
     uint32_t index = UINT32_MAX;
 };
 
-// The lanes: one per queue slot, the batches in batch order along x, the waits as arrows. Returns what the mouse is over.
+// Draws the lanes, one per queue slot. Batches are laid out in batch order along x. Waits are drawn as arrows.
+// Returns what the mouse is over.
 Hover DrawLanes(const Trace& trace, const Filter& filter, ScheduleInspectorState& state, float height) {
     const Names names{ trace };
     uint32_t queueCount = static_cast<uint32_t>(trace.queueNames.size());
@@ -455,7 +458,7 @@ Hover DrawLanes(const Trace& trace, const Filter& filter, ScheduleInspectorState
         }
     }
 
-    // Waits: producer batch's right edge to consumer batch's left edge, lane centre to lane centre.
+    // Draw each wait from the producer batch's right edge to the consumer batch's left edge, between lane centres.
     for (size_t w = 0; w < trace.waits.size(); ++w) {
         const auto& wait = trace.waits[w];
         if (wait.consumerBatch >= trace.batches.size() || wait.producerBatch >= trace.batches.size()) {
@@ -514,7 +517,7 @@ void DrawCausesTable(const Trace& trace, const Filter& filter, ScheduleInspector
     const Names names{ trace };
     struct Row {
         uint32_t wait = 0;
-        uint32_t cause = UINT32_MAX;  // UINT32_MAX: a wait without causes
+        uint32_t cause = UINT32_MAX;  // UINT32_MAX means the wait has no causes.
     };
     std::vector<Row> rows;
     for (size_t w = 0; w < trace.waits.size(); ++w) {
@@ -591,7 +594,7 @@ void DrawCausesTable(const Trace& trace, const Filter& filter, ScheduleInspector
 }  // namespace
 
 void ShowScheduleInspector(const PersistentScheduleSnapshot& snapshot, ScheduleInspectorState& state, const ScheduleCaptureFn& capture) {
-    // The selected executable, by label (indices move as epochs come and go).
+    // Find the selected executable by its label. Indices change as epochs come and go.
     const Trace* trace = nullptr;
     for (const auto& executable : snapshot.executables) {
         if (executable && executable->label == state.selectedLabel) {

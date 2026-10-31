@@ -56,7 +56,7 @@ std::shared_ptr<const GraphExecutionTimeline> RecordedFrame::Submit(ExecutionTim
     BT_ZONE_SCOPE("ORG.Frame.Submit");
     if (m_submitted || !m_snapshot || m_batches.empty())
         throw std::logic_error("Recorded frame already consumed or incomplete");
-    // Set before touching the API: even an uncertain submission is single-use.
+    // Set this before calling the API. A submission whose outcome is uncertain still counts as used.
     m_submitted = true;
     return admission.SubmitPrepared(m_snapshot->layout->bundle, m_incomingWaits, m_batches, {});
 }

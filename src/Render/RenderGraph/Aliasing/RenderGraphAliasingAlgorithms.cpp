@@ -26,7 +26,7 @@
 namespace org {
 
 RenderGraph::AutoAliasDebugSnapshot RenderGraph::GetAutoAliasDebugSnapshot() const {
-	// The latest persistent alias plan's (PlanPersistentAliasPlacement).
+	// Reports the latest persistent alias plan, made by PlanPersistentAliasPlacement.
 	AutoAliasDebugSnapshot out{};
 	out.mode = autoAliasModeLastFrame;
 	out.packingStrategy = autoAliasPackingStrategyLastFrame;

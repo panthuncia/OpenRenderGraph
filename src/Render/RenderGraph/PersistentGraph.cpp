@@ -5,6 +5,9 @@
 #include <exception>
 #include <algorithm>
 #include <iterator>
+#include <atomic>
+#include <cstdlib>
+#include <unordered_map>
 #include <BasicTelemetry/Tracy.h>
 #include <spdlog/spdlog.h>
 #include <BasicTelemetry/Telemetry.h>
@@ -98,14 +101,14 @@ void ValidateNativeView(const rhi::ResourceDesc& desc, BindlessViewKind kind) {
     }
 }
 std::shared_ptr<const compiler::GraphExecutionLayout> BuildPersistentExecutionLayout(
-    uint64_t revision, std::shared_ptr<const compiler::CompiledGraph> graph,
+    uint64_t revision, std::shared_ptr<const compiler::Schedule> graph,
     std::shared_ptr<const compiler::GraphCompileInput> input, size_t passCapacity) {
     BT_ZONE_SCOPE("ORG.Persistent.BuildExecutionLayout");
     Require(graph && input && graph->structure.get() == &input->structure
         && graph->scheduleValidated && graph->scheduleValidationError.empty(), "Invalid persistent execution layout");
     auto layout = std::make_shared<compiler::GraphExecutionLayout>();
-    layout->bundle = std::make_shared<const compiler::CompiledGraphBundle>(
-        compiler::CompiledGraphBundle{revision,graph,std::move(input)});
+    layout->bundle = std::make_shared<const compiler::ScheduleBundle>(
+        compiler::ScheduleBundle{revision,graph,std::move(input)});
     layout->placements.resize(passCapacity,{UINT32_MAX,UINT32_MAX,UINT32_MAX});
     size_t scheduled = 0;
     for (uint32_t batch = 0; batch != graph->batches.size(); ++batch) {
@@ -131,7 +134,7 @@ void RetireOwnership(const std::function<void(std::shared_ptr<const void>)>& sin
         basic_telemetry::AddCounter("ORG.Persistent.RetirementEnqueueFailures");
     }
 }
-void ValidateAliasOrder(const compiler::CompiledGraph& graph, const BindingTable& bindings) {
+void ValidateAliasOrder(const compiler::Schedule& graph, const BindingTable& bindings) {
     const auto count = graph.structure->passes.size();
     std::vector<uint8_t> ordered(count * count);
     for (auto [from,to] : graph.schedulingEdges) ordered[from * count + to] = 1;
@@ -266,6 +269,91 @@ GraphEditTransaction::GraphEditTransaction(std::shared_ptr<const SelectedPublica
     Require(m_base && m_base->executable && m_base->executable->graph, "Invalid transaction source");
 }
 uint64_t GraphEditTransaction::BaseRevision() const noexcept { return m_base->revision; }
+std::vector<uint32_t> GraphEditTransaction::SharingChanges() const {
+    std::vector<uint32_t> changed;
+    if (m_structuralChanged) return changed;
+    // Only identities this transaction rebound can have a different set; each slot in them is compared with the
+    // set its base binding's identity had.
+    for (const auto& [index,bucket] : m_changedIdentities)
+        for (const auto& [identity,members] : *bucket)
+            for (const auto slot : members) {
+                const auto& old = m_base->bindings.At(m_base->bindings.CurrentSlot(slot));
+                const auto& previous = m_base->bindings.m_identities[old.identity % BindingTable::IdentityBuckets]->at(old.identity);
+                if (previous != members) changed.push_back(slot);
+            }
+    std::sort(changed.begin(),changed.end());
+    changed.erase(std::unique(changed.begin(),changed.end()),changed.end());
+    return changed;
+}
+std::optional<std::vector<std::pair<ResourceSlotId,BindingVersion>>> GraphEditTransaction::SplitSharingChanges() {
+    Require(!m_failed, "Publication transaction contains a failed edit");
+    if (m_structuralChanged) return std::nullopt;
+    std::vector<std::pair<ResourceSlotId,BindingVersion>> taken;
+    // Putting a slot back can change another slot's set: a slot that moved alone onto a backing the slot put back
+    // had. So repeat until no set differs. Each round puts back at least one slot, and with every slot put back the
+    // table is the base's, so it ends.
+    const auto restore = [&] {
+        // Puts back what was taken out, so a refused split leaves the transaction unchanged.
+        for (auto it = taken.rbegin(); it != taken.rend(); ++it) ReplaceBinding(it->first,it->second);
+    };
+    for (auto changed = SharingChanges(); !changed.empty(); changed = SharingChanges()) {
+        size_t putBack = 0;
+        for (const auto index : changed) {
+            const auto* base = index < m_base->bindings.Size() ? m_base->bindings.TryAt(index) : nullptr;
+            const auto slot = m_bindings.CurrentSlot(index);
+            const auto& current = m_bindings.At(slot);
+            // A slot this edit didn't rebind is in a changed set only because a partner moved.
+            if (base && base->slotGeneration == slot.generation && current.bound == base->bound
+                && current.identity == base->identity && current.backingRevision == base->backingRevision
+                && current.recording == base->recording && current.admission == base->admission) continue;
+            if (!base || !base->bound || base->slotGeneration != slot.generation) { restore(); return std::nullopt; }
+            taken.emplace_back(slot,current);
+            ReplaceBinding(slot,*base);
+            ++putBack;
+        }
+        if (!putBack) { restore(); return std::nullopt; }  // a set differs, yet no slot of it was rebound
+    }
+    return taken;
+}
+namespace {
+std::atomic<int> g_sharingValidation{-1};
+}
+void SetSharingValidation(bool enabled) noexcept { g_sharingValidation.store(enabled ? 1 : 0, std::memory_order_relaxed); }
+bool SharingValidationEnabled() noexcept {
+    auto value = g_sharingValidation.load(std::memory_order_relaxed);
+    if (value < 0) {
+#ifdef NDEBUG
+        const char* env = std::getenv("ORG_VALIDATE_SHARING");
+        value = env && env[0] == '1' ? 1 : 0;
+#else
+        value = 1;
+#endif
+        g_sharingValidation.store(value, std::memory_order_relaxed);
+    }
+    return value != 0;
+}
+void ValidateSharedBackings(const ExecutableGeneration& executable, const BindingTable& bindings) {
+    BT_ZONE_SCOPE("ORG.Persistent.ValidateSharedBackings");
+    // Compiled resource -> the identity of the first bound slot found for it, and identity -> its compiled resource.
+    std::unordered_map<uint32_t,std::pair<uint64_t,uint32_t>> identityByResource;
+    std::unordered_map<uint64_t,std::pair<uint32_t,uint32_t>> resourceByIdentity;
+    const auto& indices = executable.resourceIndexBySlot;
+    for (uint32_t slot = 0; slot < bindings.Size() && slot < indices.size(); ++slot) {
+        const auto* binding = bindings.TryAt(slot);
+        const auto resource = indices[slot];
+        if (!binding || !binding->bound || resource == UINT32_MAX) continue;
+        const auto [byIdentity,newIdentity] = resourceByIdentity.try_emplace(binding->identity,resource,slot);
+        if (!newIdentity && byIdentity->second.first != resource)
+            throw std::logic_error("Slots " + std::to_string(byIdentity->second.second) + " and " + std::to_string(slot)
+                + " share a backing but are different resources in the executable");
+        const auto [byResource,newResource] = identityByResource.try_emplace(resource,binding->identity,slot);
+        if (!newResource && byResource->second.first != binding->identity)
+            throw std::logic_error("Slots " + std::to_string(byResource->second.second) + " and " + std::to_string(slot)
+                + " are one resource in the executable but have different backings");
+    }
+    for (const auto& [epoch,split] : executable.epochs)
+        if (split) ValidateSharedBackings(*split,bindings);
+}
 compiler::GraphCompileStructure& GraphEditTransaction::EditStructure() {
     return EditLogical().declarations;
 }
@@ -501,6 +589,27 @@ rhi::DescriptorSlot SelectedPublication::Resolve(ViewToken token) const {
     Require(bool(version.preparedViews), "Binding has no prepared descriptor layout");
     return version.preparedViews->at(token.binding.declarationId).at(token.ordinal);
 }
+std::optional<std::pair<BindingToken, std::vector<ViewToken>>> SelectedPublication::FindBinding(PassId pass,
+    ResourceSlotId resource, std::span<const BindlessViewRequest> views) const {
+    if (!logical || pass.index >= logical->passSlots.size()) return std::nullopt;
+    const auto& layout = logical->passSlots[pass.index];
+    if (!layout.active || layout.generation != pass.generation) return std::nullopt;
+    for (uint32_t ordinal = 0; ordinal < layout.bindingSlots.size(); ++ordinal) {
+        const auto& entry = layout.bindingSlots[ordinal];
+        if (!(entry.resource == resource)) continue;
+        const BindingToken token(logical->domain, layout.layoutRevision, pass, ordinal, entry.declarationId);
+        std::vector<ViewToken> found;
+        for (const auto view : views) {
+            const auto required = std::find_if(entry.requiredViews.begin(), entry.requiredViews.end(),
+                [&](const auto& candidate) { return SameView(candidate.request, view); });
+            if (required == entry.requiredViews.end()) break;
+            found.push_back(ViewToken(token, static_cast<uint32_t>(required - entry.requiredViews.begin()), required->declarationId));
+        }
+        if (found.size() == views.size()) return std::pair{token, std::move(found)};
+    }
+    return std::nullopt;
+}
+
 BindingToken GraphEditTransaction::DeclareDependency(PassId pass, ResourceSlotId resource, bool write) {
     return DeclareBinding(pass, resource, write);
 }
@@ -735,6 +844,9 @@ void GraphEditTransaction::ReplaceBinding(ResourceSlotId slot, BindingVersion bi
         if (binding.admission->aliasSize) {
             Require(binding.admission->aliasHeap && binding.admission->aliasHeapIdentity == binding.admission->aliasHeap.get(),
                 "Alias placement has no exact heap owner");
+            // Only ORG's alias pools place resources into shared memory: their overlaps are planned and ordered. A
+            // backing placed by anyone else may overlap another backing the graph knows nothing about.
+            Require(binding.admission->aliasPoolID != 0, "Aliased backing was not placed by an ORG alias pool");
             Require(binding.admission->aliasOffset <= UINT64_MAX - binding.admission->aliasSize, "Alias range overflow");
         }
     }
@@ -916,20 +1028,16 @@ std::shared_ptr<const SelectedPublication> GraphEditTransaction::Build(
     Require(!m_failed, "Publication transaction contains a failed edit");
     Require(m_base->revision != UINT64_MAX, "Publication revision exhausted");
     if (cancelled.load(std::memory_order_relaxed)) return {};
-    // Inspect final equivalence classes, not transient intermediate replacements.
-    // Rotating every slot of a shared backing atomically preserves the executable.
-    if (!m_structuralChanged) for (const auto& [index,bucket] : m_changedIdentities) {
-        for (const auto& [identity,members] : *bucket) for (const auto slot : members) {
-            const auto& old = m_base->bindings.At(m_base->bindings.CurrentSlot(slot));
-            const auto& previous = m_base->bindings.m_identities[old.identity % BindingTable::IdentityBuckets]->at(old.identity);
-            if (previous != members) {
-                basic_telemetry::AddCounter("ORG.Persistent.EquivalenceClassRebuilds");
-                static std::atomic<uint32_t> reported{0};
-                if (reported.fetch_add(1) < 8)
-                    spdlog::info("Persistent binding edit changed an equivalence class: slot={} identity={:#x} oldIdentity={:#x} previousMembers={} members={}",
-                        slot, identity, old.identity, previous.size(), members.size());
-                EditLogical(); break;
-            }
+    // A binding-only edit that changes which slots share a backing changes which passes use the same memory, so it
+    // compiles a new schedule. Rotating every slot of a shared backing together keeps the sets, and the executable.
+    if (!m_structuralChanged) {
+        if (const auto changed = SharingChanges(); !changed.empty()) {
+            basic_telemetry::AddCounter("ORG.Persistent.EquivalenceClassRebuilds");
+            static std::atomic<uint32_t> reported{0};
+            if (reported.fetch_add(1) < 8)
+                spdlog::info("Persistent binding edit changed which slots share a backing: slots={} (first {})",
+                    changed.size(), changed.front());
+            EditLogical();
         }
     }
     // Validate only changed identity buckets on a binding-only publication.
@@ -1190,14 +1298,14 @@ std::shared_ptr<const SelectedPublication> GraphEditTransaction::Build(
         input.structure.generation = executable->structuralRevision + 1;
         compiler::NormalizeCompileInput(input);
         auto compileInput = std::make_shared<const compiler::GraphCompileInput>(std::move(input));
-        auto graph = compiler::CompileGraph(compileInput, workspace, cancelled);
+        auto graph = compiler::CompileGraphCached(compileInput, workspace, cancelled);
         if (!graph) return {};
         Require(graph->states.complete, "Incomplete persistent state plan");
         if (validateAliasOrder && std::ranges::any_of(m_bindings.m_pages, [](const auto& page) {
             return std::ranges::any_of(*page, [](const auto& binding) { return binding.admission && binding.admission->aliasSize; });
         })) ValidateAliasOrder(*graph, m_bindings);
         const auto revision = executable->structuralRevision + 1;
-        auto generationOf = [&](std::shared_ptr<const compiler::CompiledGraph> compiled,
+        auto generationOf = [&](std::shared_ptr<const compiler::Schedule> compiled,
                                 std::shared_ptr<const compiler::GraphCompileInput> compiledInput) {
             std::vector<ResourceSlotId> resourceSlots;
             resourceSlots.reserve(compiled->structure->resourceIDs.size());
@@ -1252,7 +1360,7 @@ std::shared_ptr<const SelectedPublication> GraphEditTransaction::Build(
             split.expectedEdges.reset();
             split.expectedSchedulingEdges.reset();
             auto splitInput = std::make_shared<const compiler::GraphCompileInput>(std::move(split));
-            auto splitGraph = compiler::CompileGraph(splitInput, workspace, cancelled);
+            auto splitGraph = compiler::CompileGraphCached(splitInput, workspace, cancelled);
             if (!splitGraph) return {};
             Require(splitGraph->states.complete, "Incomplete persistent epoch state plan");
             if (validateAliasOrder && std::ranges::any_of(m_bindings.m_pages, [](const auto& page) {
@@ -1280,7 +1388,7 @@ GraphProgram::GraphProgram(std::function<void(std::shared_ptr<const void>)> reti
     compiler::CompileWorkspace workspace;
     std::atomic_bool cancelled{false};
     auto compileInput = std::make_shared<const compiler::GraphCompileInput>(std::move(input));
-    auto graph = compiler::CompileGraph(compileInput, workspace, cancelled);
+    auto graph = compiler::CompileGraphCached(compileInput, workspace, cancelled);
     auto logical = std::make_shared<LogicalGraph>();
     logical->domain = TakeIdentity(nextProgramDomain);
     auto layout = BuildPersistentExecutionLayout(0,graph,compileInput,0);
@@ -1288,6 +1396,40 @@ GraphProgram::GraphProgram(std::function<void(std::shared_ptr<const void>)> reti
         std::make_shared<const ExecutableGeneration>(ExecutableGeneration{0, std::move(graph),{},std::move(compileInput),std::move(layout)}), {},
         std::move(logical)));
 }
+std::shared_ptr<const SelectedPublication> BuildExternalPublication(const GraphProgram& base,
+    std::span<const compiler::CompileQueue> queues, uint32_t queue, std::span<const ExternalAccess> accesses,
+    compiler::CompileWorkspace& workspace) {
+    BT_ZONE_SCOPE("ORG.Persistent.BuildExternalPublication");
+    Require(queue < queues.size(), "External client queue is not one of the graph's");
+    auto edit = base.BeginEdit();
+    edit.SetQueues({queues.begin(), queues.end()});
+    compiler::CompilePass pass;
+    pass.compatibleQueueSlots = {queue};
+    pass.preferredQueueSlot = queue;
+    pass.backend = queues[queue].backendInstance;
+    const auto id = edit.AddPass(std::move(pass));
+    // One slot per backing: several ranges of one backing are several declarations of its slot.
+    std::vector<std::pair<uint64_t, ResourceSlotId>> slots;
+    for (const auto& access : accesses) {
+        auto found = std::ranges::find(slots, access.binding.identity, &std::pair<uint64_t, ResourceSlotId>::first);
+        if (found == slots.end()) {
+            // Slots are numbered in order of first use, and a binding's admission state must carry its slot's ID.
+            auto binding = access.binding;
+            const uint64_t id = slots.size() + 1;
+            if (binding.admission && binding.admission->graphResourceID != id) {
+                auto admission = std::make_shared<compiler::PreparedBackingState>(*binding.admission);
+                admission->graphResourceID = id;
+                binding.admission = std::move(admission);
+            }
+            slots.emplace_back(access.binding.identity, edit.AddResource(binding.shape, std::move(binding)));
+            found = std::prev(slots.end());
+        }
+        edit.Declare(id, found->second, access.range, access.state);
+    }
+    const std::atomic_bool cancelled{false};
+    return edit.Build(workspace, cancelled);
+}
+
 std::shared_ptr<const SelectedPublication> SelectedPublication::ForEpoch(uint32_t epoch) const {
     if (!HasEpochs()) return {};
     std::lock_guard lock(m_epochMutex);
@@ -1423,6 +1565,7 @@ FrameAdmission SynchronousAdmission::Prepare(std::shared_ptr<const SelectedPubli
     Require(m_pending.empty() || (m_closed && m_pending.size() < m_capacity), "Previous synchronous admission has not terminated");
     Require(m_nextSequence != UINT64_MAX, "Admission sequence exhausted");
     Require(m_retained.size() < m_capacity, "Synchronous frame capacity exhausted");
+    if (SharingValidationEnabled()) ValidateSharedBackings(*publication->executable, publication->bindings);
     FrameAdmission frame;
     frame.publication = std::move(publication);
     const auto& graph = *frame.publication->executable->graph;
@@ -1454,6 +1597,12 @@ FrameAdmission SynchronousAdmission::Prepare(std::shared_ptr<const SelectedPubli
             Require(rebinding.recording && rebinding.recording->resource.GetHandle().index == rebinding.backing.resource.index
                 && rebinding.recording->resource.GetHandle().generation == rebinding.backing.resource.generation,
                 "Frame rebinding recording disagrees with admission");
+            // A frame rebinding names its own resource. A backing another resource already has would be two resources
+            // to the schedule, with no ordering between their users.
+            for (uint32_t other = 0; other < frame.backings.size(); ++other)
+                Require(other == index || frame.backings[other].resource.index != rebinding.backing.resource.index
+                    || frame.backings[other].resource.generation != rebinding.backing.resource.generation,
+                    "Frame rebinding uses a backing another resource of the graph is bound to");
             frame.backings[index] = rebinding.backing;
             frame.rebound.push_back(index);
         }

@@ -6,7 +6,7 @@
 
 namespace {
 	org::contributor::ContributorRegistry* registry{};
-	// What Build declares: its pass's access target and epoch.
+	// What Build declares: the access target and the epoch of its pass.
 	const char* accessTarget = "sample.contributor.buffer";
 	ORGAccessKind accessKind = ORG_RG_ACCESS_SHADER_RESOURCE;
 	const char* passEpoch = nullptr;

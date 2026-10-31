@@ -1,6 +1,7 @@
-// The resource-tracking world (ECSManager) has one owner at a time: resources created, named and destroyed on many threads
-// at once post their changes, and a reader sees a consistent world. Before, every thread changed the flecs world directly,
-// and a creation on the render thread beside a destruction on a host's thread wrote through a null component.
+// The resource-tracking world (ECSManager) has one owner at a time. Resources are created, named and destroyed on many
+// threads at once. They post their changes, and a reader sees a consistent world.
+// Before this design, every thread changed the flecs world directly. A creation on the render thread next to a
+// destruction on a host's thread then wrote through a null component.
 #include "Managers/Singletons/ECSManager.h"
 #include "TestSupport.h"
 
@@ -18,8 +19,9 @@ int main() {
 
 	constexpr int kThreads = 8;
 	constexpr int kPerThread = 4000;
-	// Each thread keeps every fourth token alive to the end; the rest it resets, half at once (often before the entity
-	// exists) and half after attaching a second bundle.
+	// Each thread keeps every fourth token alive to the end. It resets the rest:
+	// - half at once, often before the entity exists,
+	// - half after attaching a second bundle.
 	std::vector<std::vector<TrackedEntityToken>> kept(kThreads);
 	std::atomic<bool> producing{ true };
 	std::atomic<int> snapshots{ 0 };

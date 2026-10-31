@@ -8,20 +8,24 @@
 #include <variant>
 #include <vector>
 
-// ORG's decision trace: a stream of the decisions the graph makes while it compiles, admits, plans barriers for, submits and
-// retires executions, each with the inputs that decided it. It is for diagnosing scheduling and synchronization problems:
-// which queue a pass went to and why, which barrier a resource got and from which path (in-batch, cross-queue, the ledger's
-// handoff, an invalidated or seeded backing), why a handoff was or was not planned, what each execution waited on and
-// committed.
+// ORG's decision trace. It is a stream of the decisions the graph makes while it compiles, admits, plans barriers for,
+// submits and retires executions. Each event carries the inputs that decided it. Use it to diagnose scheduling and
+// synchronization problems, for example:
+// - which queue a pass went to, and why,
+// - which barrier a resource got, and from which path: in-batch, cross-queue, the ledger's handoff, or an invalidated
+//   or seeded backing,
+// - why a handoff was or was not planned,
+// - what each execution waited on and committed.
 //
-// Off by default; when off a trace point costs one relaxed atomic load. Enable categories with SetCategories (or the
-// ORG_TRACE environment variable, read by ConfigureFromEnvironment) and give it a sink: a JSON-lines file
-// (MakeJsonLinesSink, ORG_TRACE_FILE) or a MemorySink for tests. ORG_TRACE_RESOURCE (SetResourceFilter) keeps only events
-// that name no resource or a resource whose name contains the filter.
+// The trace is off by default. When it is off, a trace point costs one relaxed atomic load. To use it:
+// - enable categories with SetCategories, or with the ORG_TRACE environment variable (read by ConfigureFromEnvironment),
+// - give it a sink: a JSON-lines file (MakeJsonLinesSink, ORG_TRACE_FILE) or a MemorySink for tests.
+// ORG_TRACE_RESOURCE (SetResourceFilter) keeps only the events that name no resource, or that name a resource whose
+// name contains the filter.
 //
-// Names: an event names passes and resources by the labels the graph captured while tracing was on, so enable tracing
-// before the graphs of interest build (the environment is read when the runtime is created). Events are emitted from
-// whichever thread made the decision; a sink must be thread-safe (both provided ones are).
+// Names: an event names passes and resources by the labels the graph captured while tracing was on. So enable tracing
+// before the graphs of interest build. The environment is read when the runtime is created. Events are emitted from
+// whichever thread made the decision. A sink must be thread-safe. Both provided sinks are.
 namespace org::trace {
 
 enum class Category : uint32_t {
@@ -88,20 +92,20 @@ inline std::atomic<uint32_t> g_categories{0};
 inline bool Enabled(Category category) noexcept {
 	return (detail::g_categories.load(std::memory_order_relaxed) & uint32_t(category)) != 0;
 }
-// Whether any category is on: the graph captures names for events while it is.
+// Whether any category is on. While one is, the graph captures names for events.
 inline bool Any() noexcept { return detail::g_categories.load(std::memory_order_relaxed) != 0; }
 
-// Null turns the trace off whatever the categories.
+// A null sink turns the trace off, whatever the categories.
 void SetSink(std::shared_ptr<Sink> sink);
 void SetCategories(Category categories);
 void SetResourceFilter(std::string substring);
 void Flush();
-// ORG_TRACE (comma-separated category names, or "all"), ORG_TRACE_FILE (default "org_trace.jsonl"), ORG_TRACE_RESOURCE.
-// Does nothing when ORG_TRACE is unset or empty.
+// Reads ORG_TRACE (comma-separated category names, or "all"), ORG_TRACE_FILE (default "org_trace.jsonl") and
+// ORG_TRACE_RESOURCE. Does nothing when ORG_TRACE is unset or empty.
 void ConfigureFromEnvironment();
 
-// Builds one event and emits it when it goes out of scope. Only construct one where Enabled(category) holds (the ORG_TRACE
-// macro checks first).
+// Builds one event and emits it when it goes out of scope. Only construct one where Enabled(category) is true.
+// The ORG_TRACE macro checks this first.
 class Builder {
 public:
 	Builder(Category category, std::string_view decision);
@@ -119,7 +123,8 @@ public:
 	Builder& Add(std::string_view key, int64_t value) { return Add(key, Value{value}); }
 	Builder& Add(std::string_view key, double value) { return Add(key, Value{value}); }
 	Builder& Add(std::string_view key, bool value) { return Add(key, Value{value}); }
-	// A resource the event concerns: a "resource" field (or key) holding its name, which the resource filter matches.
+	// Marks a resource the event concerns. It adds a field named `key` ("resource" by default) that holds the resource's
+	// name. The resource filter matches against that name.
 	Builder& Resource(std::string_view name, std::string_view key = "resource");
 	// Drops the event instead of emitting it.
 	void Cancel() { m_cancelled = true; }
@@ -131,7 +136,8 @@ private:
 
 } // namespace org::trace
 
-// ORG_TRACE(Barriers, "state-step").Add("pass", name)...; emitted at the end of the full expression, and only
-// when the category is enabled (the arguments are not evaluated otherwise).
+// Usage: ORG_TRACE(Barriers, "state-step").Add("pass", name)...
+// The event is emitted at the end of the full expression. It is built only when the category is enabled.
+// Otherwise the arguments are not evaluated.
 #define ORG_TRACE(category, decision) \
 	if (!::org::trace::Enabled(::org::trace::Category::category)) {} else ::org::trace::Builder(::org::trace::Category::category, decision)

@@ -29,8 +29,8 @@
 >   - **External clients (2e): moved to Phases 3 and 5.** There, uploads and the swapchain leave the frame graph and become
 >     the sequencer's clients. Until then, uploads are recorded inside the graphs that consume them, which already
 >     sequences them.
->   - **A two-graph test on the GPU.** It is easier to write against Phase 3's execution API; the ledger semantics are
->     covered by `PersistentGraphTests`.
+>   - **A two-graph test on the GPU (done, 2026-10-31).** `RunGraphDescScenario`: two compiled graphs, write then read
+>     across queues, on D3D12 and Vulkan.
 > - `org::Runtime` (`OpenRenderGraph/Runtime.h`) owns device initialization, the services, the settings' slot count and the
 >   default task service; `RenderGraph` and `GraphHost` take it and no longer initialize, reset or shut down shared state.
 > - Retirement is by submission frontier. BasicRHI's `Queue::Progress()` is a timeline that every submission on the queue
@@ -139,8 +139,37 @@ Compilation reuses `GraphEditTransaction::Build` and `CompileWorkspace`.
 
 **`GraphCache`** keys compiled graphs by structure: the passes and their lowering fingerprints, plus the parameter
 descriptions. A structural change means building another desc. The old compiled graph keeps executing until the new
-one is ready. Nothing compiles inline, and `IDynamicDeclaredResources`, inline structural builds and frame-interrupting
-rebuilds are removed.
+one is ready.
+
+*Update (2026-10-31).* `IDynamicDeclaredResources` stays, narrowed. A redeclaration builds on a worker by default
+(`PreparesOnlyDeclaredWork`). One with the same content, or with the same structure over existing slots, builds
+nothing (the README's "Declarations that change"). Inline builds remain a mechanism the app controls: bootstrap,
+`DrainPersistentStructuralBuild`, and passes that opt out.
+
+#### Graph descs (implemented, 2026-10-31)
+
+`OpenRenderGraph/GraphDesc.h` has the public API. The internals are a first version over the existing graph.
+
+- **`GraphDesc`** holds passes, in the order added, and named parameters. `Parameter(name, initial)` returns a
+  `DynamicResource` wrapper that the passes declare. A desc carries a key that the caller gives. Descs with the same key
+  must be interchangeable: their passes take everything that changes per execution from parameters and host data.
+- **`CompiledGraph::Compile(runtime, desc)`** builds a `RenderGraph` of its own on a `GraphHost`. `Execute(bindings,
+  hostData)` binds the parameters, then prepares, records and submits one execution, and returns its
+  `ExecutionHandle`. Rebinding a parameter to a resource of the same shape is a binding edit, so the schedule, barriers
+  and alias plan are reused. Any thread may call it; one compiled graph runs one execution at a time.
+- **Ordering across graphs** comes from the runtime's sequencer, as for any two graphs on one runtime. A consumer
+  executed after a producer waits for it on the GPU, across queues too.
+- **`GraphCache`** maps keys to compiled graphs, so a repeated desc reuses the whole executable, alias plan included.
+  Measurements showed the schedule cache alone was not worth much (2 hits in 17).
+- **Limits of this version:**
+  - an execution past the frames in flight waits on the CPU for the oldest one (the GraphHost slot ring);
+  - completion is noticed when the graph next executes or `Retire()` is called, not on a runtime thread;
+  - compiling builds the graph, and the first execution lowers its passes.
+
+  The split that lets a compiled graph run without a `RenderGraph` comes when `GraphHost` goes (Phases 7 and 8).
+- Tested in `RebindingGpuTests.cpp` (`RunGraphDescScenario`) on D3D12 and Vulkan. A producer graph on the graphics
+  queue and a consumer graph on the copy queue share a buffer, with no CPU wait between them. They rebind to a second
+  buffer with no rebuild, and the cache returns the compiled graph for a known key.
 
 ### Execution
 

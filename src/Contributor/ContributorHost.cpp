@@ -85,7 +85,7 @@ bool WholeResource(const ORGSubresourceRange& range) noexcept {
 }
 
 std::mutex g_hostMutex;
-ContributorHost::Impl* g_host = nullptr; // the process's host: the C table has no context
+ContributorHost::Impl* g_host = nullptr; // The one host in the process. The C table has no context pointer.
 
 } // namespace
 
@@ -98,7 +98,7 @@ struct GenerationLease;
 struct PassSource {
 	ContributorRegistry::Pass pass;
 	std::vector<std::shared_ptr<Resource>> resources; // per access
-	std::vector<ORGResourceDesc> shapes;              // per access: the declared shape (extents resolved), or the export's
+	std::vector<ORGResourceDesc> shapes;              // Per access. The declared shape with extents resolved, or the export's shape.
 	std::shared_ptr<GenerationLease> lease;
 	ContributorHost::Impl* host = nullptr; // outlives the lease
 	ORGBackend backend = ORG_RG_BACKEND_NONE;
@@ -113,7 +113,7 @@ struct ContributorHost::Impl : std::enable_shared_from_this<Impl> {
 	std::vector<ORGEpochDescriptor> epochs;
 	std::vector<ORGExportDescriptor> exports;
 
-	// Owner thread (structural builds).
+	// Used only on the owner thread, which runs the structural builds.
 	std::shared_ptr<GenerationLease> current;
 	std::vector<std::shared_ptr<const PassSource>> currentPasses;
 	std::unordered_map<std::string, std::pair<ORGResourceDesc, std::shared_ptr<Resource>>> resources;
@@ -198,7 +198,7 @@ private:
 	std::shared_ptr<PacketOwner> m_owner;
 };
 
-// The pass being prepared on this thread, for QueueBufferUpload (which receives only the prepare context).
+// The pass being prepared on this thread. QueueBufferUpload receives only the prepare context, so it finds the pass here.
 struct PrepareScope {
 	ORGPrepareContext context{};
 	const PassSource* source = nullptr;
@@ -207,7 +207,8 @@ struct PrepareScope {
 };
 thread_local PrepareScope* t_prepareScope = nullptr;
 
-// Reusable: the contributor gave invocationRevision, so a kept recording of the pass may be submitted again.
+// Reusable is true when the contributor gave an invocationRevision. Then a kept recording of the pass may be submitted
+// again.
 template<bool Reusable>
 class ContributorPass final : public TypedRenderGraphPass<ContributorPass<Reusable>, ContributorFrame, ContributorBindings> {
 public:
@@ -403,7 +404,8 @@ public:
 				commands.ClearUavFloat(info, value);
 			}
 		}
-		// Bindings as they resolve now (a recording kept for resubmission may record against rebound backings).
+		// Resolve the bindings again now. A recording kept for resubmission may record against backings that were rebound
+		// since preparation.
 		auto bindings = data.bindings;
 		for (size_t i = 0; i < bindings.size(); ++i)
 			if (data.resources[i]) bindings[i].resource = ConvertHandle<basicrhi_c_resource>(recording.Resolve(*data.resources[i]).GetHandle());
@@ -456,7 +458,7 @@ public:
 		const auto& pass = m_source->pass;
 		uint64_t revision = 0;
 		if (pass.invocationRevision(pass.userData, &revision) != ORG_RG_OK)
-			revision = s_nextBorrowToken.fetch_add(1, std::memory_order_relaxed); // a fresh value: never reused
+			revision = s_nextBorrowToken.fetch_add(1, std::memory_order_relaxed); // A fresh value, so the recording is never reused.
 		out.push_back(revision);
 	}
 
@@ -476,7 +478,8 @@ std::shared_ptr<Resource> CreateContributorResource(const std::string& id, const
 		const auto heap = desc.heapClass == ORG_RG_HEAP_UPLOAD ? rhi::HeapType::Upload
 			: desc.heapClass == ORG_RG_HEAP_READBACK ? rhi::HeapType::Readback : rhi::HeapType::DeviceLocal;
 		auto buffer = Buffer::CreateSharedUnmaterialized(heap, desc.byteSize, unordered);
-		// Whole-buffer views (the registry admits no others): raw without a structure stride, structured with it.
+		// Only whole-buffer views exist, because the registry admits no others. A buffer without a structure stride gets a
+		// raw view. A buffer with one gets a structured view.
 		const bool structured = desc.structureByteStride != 0;
 		const uint32_t elements = static_cast<uint32_t>(desc.byteSize / (structured ? desc.structureByteStride : 4u));
 		BufferBase::DescriptorRequirements views{};
@@ -659,7 +662,7 @@ private:
 
 namespace {
 
-// Holds the host while a table call runs: unregistration and destruction may race with a contributor's calls.
+// Keeps the host alive while a table call runs. Unregistration and destruction may race with a contributor's calls.
 template<class F>
 ORGStatus WithHost(F&& call) noexcept {
 	std::shared_ptr<ContributorHost::Impl> host;

@@ -83,7 +83,7 @@ PackingResult PackBeamSearch(std::span<const PackingItem> items) {
 		double score = 0.0;
 	};
 	auto best = PackGreedySweepLine(items);
-	// Heaviest (size x lifetime) first: those constrain the layout most.
+	// Place the heaviest items first, by size times lifetime. They constrain the layout the most.
 	std::vector<size_t> order(items.size());
 	for (size_t i = 0; i < order.size(); ++i) order[i] = i;
 	std::sort(order.begin(), order.end(), [&](size_t l, size_t r) {
@@ -109,7 +109,8 @@ PackingResult PackBeamSearch(std::span<const PackingItem> items) {
 			if (pending == order.end()) { finish(state); continue; }
 			const auto index = *pending;
 			const auto& item = items[index];
-			// Candidate starts: the heap start and the end of every placed item whose lifetime overlaps this one.
+			// The candidate start offsets are the heap start and the end of every placed item whose lifetime
+			// overlaps this one.
 			std::vector<uint64_t> starts{0};
 			for (const auto& placed : state.placed)
 				if (LifetimesOverlap(item, items[placed.item])) starts.push_back(placed.end);

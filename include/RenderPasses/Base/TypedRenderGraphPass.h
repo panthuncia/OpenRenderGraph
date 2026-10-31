@@ -41,9 +41,9 @@ struct NoPassBindings {};
 //   void Revision(std::vector<uint64_t>&) const;                     // optional: opts into kept-recording reuse
 //
 // Update and Prepare run on the preparation owner, one frame at a time, and may change the pass. Record runs
-// later, possibly on a worker and possibly replayed. It reads only its arguments and resolves
-// everything else - declared views and resources, pipelines - through the context, against the frame the
-// packet was prepared for. A pass without declared bindings writes `void Declare(PassBuilder&)`,
+// later, possibly on a worker, and may be replayed. It reads only its arguments. It resolves everything else
+// through the context, against the frame the packet was prepared for. That includes declared views, resources and
+// pipelines. A pass without declared bindings writes `void Declare(PassBuilder&)`,
 // `FrameData Prepare(const PassPrepareContext&)` and `static void Record(const FrameData&, PassRecordContext&)`
 // (or `static void Record(PassRecordContext&)` without frame data).
 //
@@ -144,8 +144,8 @@ public:
 private:
     std::shared_ptr<const Bindings> m_declaredBindings;
 
-    // A recording failure names the pass in the log - Record runs on a worker, away from anything that could tell
-    // which - and propagates unchanged.
+    // A recording failure names the pass in the log, then propagates unchanged. Record runs on a worker, where
+    // nothing else could tell which pass failed.
     template<class Fn>
     static void Named(Fn&& record) {
         try { record(); }

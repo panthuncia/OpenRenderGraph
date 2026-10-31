@@ -1,7 +1,7 @@
 #pragma once
 
-// The BasicRHI borrowed recorder (rhi_c.h) a contributor's record callback records through: valid while its BorrowState
-// is active, for the one call the host makes.
+// The BasicRHI borrowed recorder from rhi_c.h. A contributor's record callback records its commands through it.
+// The recorder is valid only while its BorrowState is active, which lasts for the one call the host makes.
 
 #include <rhi.h>
 #include <rhi_c.h>

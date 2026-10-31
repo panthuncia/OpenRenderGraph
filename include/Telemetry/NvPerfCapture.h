@@ -11,20 +11,24 @@
 #include <string>
 
 /**
- * @brief GPU hardware counters per named range through NVIDIA's Nsight Perf SDK (NVPW's range profiler), on D3D12 or
- * Vulkan.
+ * @brief GPU hardware counters per named range, through NVIDIA's Nsight Perf SDK (the NVPW range profiler), on D3D12
+ * or Vulkan.
  *
- * A capture is configured (the metrics, the ranges to measure), armed, and then collected over as many frames as the
- * metrics need replay passes: each frame is one profiler pass, bracketed on the queue by BeginFrameCapture and
- * EndFrameCapture, and the selected ranges in it are pushed and popped in the command buffers around the work they
- * name. Once every pass is submitted the counters are decoded into a CaptureResult.
+ * A capture goes through these steps:
+ * 1. It is configured with the metrics and the ranges to measure.
+ * 2. It is armed.
+ * 3. It is collected over as many frames as the metrics need replay passes. Each frame is one profiler pass,
+ *    bracketed on the queue by BeginFrameCapture and EndFrameCapture. The selected ranges in the frame are pushed and
+ *    popped in the command buffers around the work they name.
+ * 4. Once every pass is submitted, the counters are decoded into a CaptureResult.
  *
- * Queue-level calls (sessions, passes, decoding) submit to the queue, so a host makes them only where it may use the
- * queue. A host that owns its queue can let a range start the frame's pass itself (QueueControl::Inline); a host that
- * shares another's queue (a D3D11 translation layer's) makes them only at its frame boundaries, on the thread that
- * submits, and ranges then only record (QueueControl::Boundaries).
+ * Queue-level calls (sessions, passes, decoding) submit to the queue. So a host makes them only where it may use the
+ * queue.
+ * - A host that owns its queue can let a range start the frame's pass itself (QueueControl::Inline).
+ * - A host that shares another's queue, such as a D3D11 translation layer's, makes queue calls only at its frame
+ *   boundaries, on the thread that submits. Ranges then only record (QueueControl::Boundaries).
  *
- * Built only with ORG_ENABLE_NVPERF; otherwise every call reports that it is unavailable.
+ * Built only with ORG_ENABLE_NVPERF. Otherwise every call reports that it is unavailable.
  */
 namespace org::telemetry::nvperf
 {
@@ -85,15 +89,16 @@ void BeginFrameCapture(const QueueTarget& queue, std::uint64_t frameNumber);
 void EndFrameCapture(const QueueTarget& queue, std::uint64_t frameNumber);
 
 // Whether a range of that name on that queue is one the capture measures.
-// Ranges pushed (recorded into command buffers) since ArmCapture: a host whose command buffers are recorded ahead of
-// the frame they execute in (re-recorded at arming) begins the first pass only once these exist.
+// The number of ranges pushed (recorded into command buffers) since ArmCapture. Some hosts record their command
+// buffers ahead of the frame they execute in, and record them again at arming. Such a host begins the first pass
+// only once this is nonzero.
 std::uint64_t RangesRecordedSinceArm();
 bool RangeSelected(const char* queueName, const char* rangeName);
 
-// A range in a native command buffer (ID3D12GraphicsCommandList* / VkCommandBuffer) that will execute on the queue,
-// when it is selected. It records while a capture is armed, whenever the command buffer executes: only the ranges that
-// execute inside a pass are counted (under QueueControl::Inline, a range begins the frame's pass). True when it was
-// pushed: the caller pops it in the same command buffer.
+// Pushes a range in a native command buffer (ID3D12GraphicsCommandList* / VkCommandBuffer) that will execute on the
+// queue, if the range is selected. It records while a capture is armed, whenever the command buffer executes. Only
+// the ranges that execute inside a pass are counted. Under QueueControl::Inline, a range begins the frame's pass.
+// Returns true when the range was pushed. The caller then pops it in the same command buffer.
 bool PushRange(const QueueTarget& queue, void* commandBuffer, const char* queueName, const char* rangeName);
 // False when no range is open in that command buffer (e.g. it was opened in another one).
 bool PopRange(rhi::Backend backend, void* commandBuffer);

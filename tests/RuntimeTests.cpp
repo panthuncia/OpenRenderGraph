@@ -4,8 +4,9 @@
 
 #include <rhi_helpers.h>
 
-// Retirement by submission frontier: an object released while earlier GPU work is still pending outlives that work, and goes
-// at the first Retire after it completes - whichever queue the work and the release are on.
+// Tests retirement by submission frontier. An object released while earlier GPU work is still pending outlives that
+// work. It is destroyed at the first Retire after the work completes. This holds whichever queue the work and the
+// release are on.
 int TestRuntimeRetirement(rhi::Device device) {
     auto* runtime = org::Runtime::Current();
     CHECK(runtime);

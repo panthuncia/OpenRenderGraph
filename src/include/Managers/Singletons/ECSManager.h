@@ -17,17 +17,22 @@
 namespace org {
 
 /**
- * The resource-tracking world (memory statistics), and its one rule: flecs is not thread-safe, so the world has a single
- * owner at a time, and nothing outside that ownership touches it.
+ * The resource-tracking world, which holds the memory statistics.
  *
- * Resources are created and destroyed on any thread: the render thread, a graph host's thread, task workers, whoever
- * releases a retired backing. None of them mutates the world. Each posts a command (Post), which a wait-free queue keeps
- * in order, and then offers to drain the queue (Drain): it applies the commands only if no one else is applying them
- * already, and never waits. A reader (Access) does wait for ownership, then drains and reads. Readers are tools (the
- * memory view), never a frame's work.
+ * It has one rule. flecs is not thread-safe, so the world has a single owner at a time. Nothing outside that ownership
+ * touches it.
  *
- * Tracking tokens are therefore created deferred (CreateTrackedToken): the entity is made when the creation command is
- * applied, and what was attached before that is applied with it. A token destroyed first never gets an entity.
+ * Resources are created and destroyed on any thread. That includes the render thread, a graph host's thread, task
+ * workers, and whichever thread releases a retired backing. None of them changes the world directly. Instead each one:
+ * - posts a command (Post). A wait-free queue keeps the commands in order.
+ * - then offers to drain the queue (Drain). It applies the commands only if no other thread is applying them already.
+ *   It never waits.
+ * A reader (Access) does wait for ownership. Then it drains the queue and reads. Readers are tools such as the memory
+ * view. They are never part of a frame's work.
+ *
+ * This is why tracking tokens are created deferred (CreateTrackedToken). The entity is made when the creation command
+ * is applied. Anything attached to the token before then is applied together with it. A token destroyed before that
+ * never gets an entity.
  */
 class ECSManager {
 public:
@@ -36,15 +41,16 @@ public:
 	/** Applies a_command to the world in posting order, on whichever thread drains next. Never waits. */
 	void Post(std::function<void(flecs::world&)> a_command) {
 		m_commands.Push(std::move(a_command));
-		// After the push, so a drainer that sees the count can pop the command (see Drain).
+		// Count the command after the push. Then a drainer that sees the count can also pop the command (see Drain).
 		m_pending.fetch_add(1, std::memory_order_seq_cst);
 		Drain();
 	}
 
 	/**
-	 * Applies the posted commands if no other thread is; otherwise returns at once, and that thread applies them. When it
-	 * releases ownership it looks at the count again (both sides sequentially consistent), so a command posted while it held
-	 * ownership is never stranded: either its poster takes ownership after the release, or the drainer sees its count.
+	 * Applies the posted commands if no other thread is applying them. Otherwise returns at once, and that other thread
+	 * applies them. When the draining thread releases ownership, it checks the count again. Both sides use sequentially
+	 * consistent operations. So a command posted while ownership was held is never stranded. Either its poster takes
+	 * ownership after the release, or the drainer sees its count.
 	 */
 	void Drain() {
 		while (m_pending.load(std::memory_order_seq_cst) > 0) {
@@ -52,9 +58,9 @@ public:
 				return;
 			const bool progressed = ApplyPosted();
 			m_owned.store(false, std::memory_order_seq_cst);
-			// Nothing popped although commands are counted: a push still linking its node holds the counted ones behind it.
-			// Returning could strand them (their posters found ownership taken), so look again; the window is the two
-			// instructions of that push.
+			// Nothing was popped, but commands are counted. A push that is still linking its node holds the counted
+			// commands behind it. Returning now could strand them, because their posters found ownership taken. So look
+			// again. The window is only the two instructions of that push.
 			if (!progressed)
 				std::this_thread::yield();
 		}
@@ -78,8 +84,9 @@ public:
 	}
 
 	/**
-	 * A tracking token whose entity the creation command makes: a_existing's entity when that is alive, else a new one.
-	 * Bundles attached before then are applied with it; a token reset before then never gets one.
+	 * Creates a tracking token whose entity is made by the creation command. The entity is a_existing's entity when that
+	 * is alive, or a new one otherwise. Bundles attached before then are applied with it. A token reset before then never
+	 * gets an entity.
 	 */
 	TrackedEntityToken CreateTrackedToken(flecs::entity_t a_existing = 0) {
 		auto token = TrackedEntityToken::CreateDeferred();
@@ -100,10 +107,10 @@ public:
 	}
 
 	/**
-	 * Registers the tracking components and installs ORG's TrackedEntityToken hooks (InitializeRuntimeDevice). Every hook
-	 * posts and none touches the world: tokens are deferred, and a resolved token's attachments go through
-	 * enqueueAttachBundle (isMainThread is false for every thread). A host with a world of its own installs its own hooks
-	 * after this.
+	 * Registers the tracking components and installs ORG's TrackedEntityToken hooks. InitializeRuntimeDevice calls it.
+	 * Every hook posts a command, and none touches the world directly. Tokens are deferred. A resolved token's
+	 * attachments go through enqueueAttachBundle, with isMainThread false for every thread. A host with a world of its
+	 * own installs its own hooks after this.
 	 */
 	void InstallTrackingHooks() {
 		Access([](flecs::world& world) {
@@ -162,8 +169,8 @@ private:
 
 	flecs::world m_world;
 	runtime::MpscQueue<std::function<void(flecs::world&)>> m_commands;
-	// Commands posted and not yet applied. Signed: a command can be popped between its push and its count, so the count
-	// dips below zero for that moment and its poster's increment brings it back.
+	// The number of commands posted and not yet applied. It is signed because a command can be popped between its push
+	// and its count. The count then dips below zero for a moment, and the poster's increment brings it back.
 	std::atomic<std::int64_t> m_pending{ 0 };
 	std::atomic<bool> m_owned{ false };
 };

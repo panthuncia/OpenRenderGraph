@@ -74,8 +74,9 @@ private:
     AbandonedFn m_abandoned;
 };
 
-// What a packet keeps alive and commits with its lifecycle: ownership of what its recording names
-// (Retain) and framework reservations (Reserve).
+// What a packet keeps alive and commits with its lifecycle:
+// - ownership of what its recording names (Retain),
+// - framework reservations (Reserve).
 class PreparedDependencySnapshot {
 public:
     bool HasLifecycleEffects() const noexcept { return !m_effects.empty(); }
@@ -210,25 +211,29 @@ private:
 
 struct FramePreparationContext {
     std::shared_ptr<const ResourceUseLayout> resourceUses;
-    // The declaration to prepare against: in a persistent graph, the one its selected executable was built from (a pending
-    // structural build's relowering takes effect at its install). Unset, the pass's latest declaration.
+    // The declaration to prepare against. In a persistent graph, this is the declaration the selected executable was
+    // built from. A pending structural build's relowering takes effect only when that build installs.
+    // When unset, the pass's latest declaration is used.
     std::shared_ptr<const ResourceUseLayout> preparedResourceUses;
     std::shared_ptr<const void> preparedBindings;
     std::function<rhi::DescriptorSlot(uint32_t, uint32_t)> resolveDeclaredView;
     std::function<rhi::Resource(uint32_t)> resolveDeclaredResource;
-    // The view of a resolver group's first bound member this frame (ResourceUseLayout::resolverViews ordinal); an
-    // invalid slot when the group has no bound member.
+    // Returns the view of a resolver group's first bound member this frame. The group is a
+    // ResourceUseLayout::resolverViews ordinal. Returns an invalid slot when the group has no bound member.
     std::function<rhi::DescriptorSlot(uint32_t resolverGroup, BindlessViewRequest)> resolveResolverView;
     std::shared_ptr<PreparedInvocationArena> invocationArena;
     std::function<void(std::shared_ptr<const void>)> retireOwnership;
     rhi::Device device; // Host-owned device; valid through frame retirement.
     // The device the pass runs on: program and pipeline captures default to its representation.
     BackendInstanceId backendInstance = BackendInstanceId::Primary;
+    // The ring slot this execution prepares into. Not a count: use executionIndex for that.
     uint32_t frameIndex = 0;
     // Stable CPU frame-data slot retained by this prepared request. The
     // swapchain image and execution slot are intentionally late-bound.
     uint32_t preparationSlot = 0;
-    uint64_t frameNumber = 0;
+    // The graph's count of its executions, from 1; this one's. ExecutionHandle::Index of the execution it prepares.
+    uint64_t executionIndex = 0;
+    uint64_t frameNumber = 0; // The same value, under its old name.
     float deltaTime = 0;
     std::shared_ptr<const FrozenExecutionBindings> bindings;
     // Valid only for the duration of PrepareFrame. Implementations copy the
@@ -241,8 +246,8 @@ struct FramePreparationContext {
     // Preparation-only access. Providers must contain owned/value snapshots,
     // not legacy RenderContext wrappers with mutable manager pointers.
     std::shared_ptr<const IHostExecutionData> frameData;
-    // Installed by TypedRenderGraphPass for this one packet: ownership the packet keeps (Retain) and
-    // lifecycle reservations it commits (Reserve).
+    // Installed by TypedRenderGraphPass for this one packet. It holds the ownership the packet keeps (Retain) and the
+    // lifecycle reservations the packet commits (Reserve).
     std::shared_ptr<PreparedDependencyCollector> dependencyCollector;
     // Per-pass permission map assembled from that pass's declarations. This
     // lets preparation capture a stable binding slot without retaining a
@@ -326,9 +331,9 @@ struct FramePreparationContext {
         if (!reference) throw std::invalid_argument("Declared view backing is absent from frozen pass bindings");
         return *reference;
     }
-    // Every declared view of the pass, resolved once against this frame's bindings, in
-    // ResourceUseLayout::FlatView order: what RecordingContext::Index reads. A view that cannot be resolved is
-    // left invalid and fails when a recording asks for it.
+    // Every declared view of the pass, resolved once against this frame's bindings. They are in
+    // ResourceUseLayout::FlatView order. RecordingContext::Index reads from here. A view that cannot be resolved is left
+    // invalid, and fails when a recording asks for it.
     std::vector<rhi::DescriptorSlot> ResolveDeclaredViewTable() const {
         std::vector<rhi::DescriptorSlot> table;
         if (!resourceUses) return table;
@@ -343,8 +348,8 @@ struct FramePreparationContext {
             }
         return table;
     }
-    // The views of the pass's names declared through a resolver group, parallel to ResourceUseLayout::namedViews
-    // (invalid for the other names, and for a group without a bound member).
+    // The views of the pass's names that were declared through a resolver group, parallel to
+    // ResourceUseLayout::namedViews. An entry is invalid for the other names, and for a group without a bound member.
     std::vector<rhi::DescriptorSlot> ResolveNamedGroupViews() const {
         std::vector<rhi::DescriptorSlot> views;
         if (!resourceUses || !resolveResolverView) return views;
@@ -411,9 +416,9 @@ struct FramePreparationContext {
 
 };
 
-// Ownership of what one recording's commands name (the pipelines it bound, the command signatures and work
-// graphs it used), kept until the recording's GPU work retires - including every resubmission of a kept
-// recording. A late batch recorded again appends to the same retention.
+// Ownership of the objects one recording's commands name: the pipelines it bound, and the command signatures and
+// work graphs it used. It is kept until the recording's GPU work retires, including every resubmission of a kept
+// recording. A late batch that is recorded again appends to the same retention.
 class RecordingRetention {
 public:
     void Retain(std::shared_ptr<const void> owner) {
@@ -436,7 +441,8 @@ struct DeclaredRecordingScope {
     BackendInstanceId backendInstance = BackendInstanceId::Primary;
 };
 
-// RecordingContext::Bind*Pipeline: ResourceDescriptorIndex names (prefixes) that may be undeclared and read UINT32_MAX.
+// Options for RecordingContext::Bind*Pipeline. absentPrefixes lists ResourceDescriptorIndex name prefixes that may be
+// undeclared. Their slots read UINT32_MAX.
 struct PipelineBindOptions { std::span<const std::string_view> absentPrefixes{}; };
 
 class RecordingContext {
@@ -445,8 +451,8 @@ public:
         std::shared_ptr<const persistent::SelectedPublication> publication);
     RecordingContext WithPersistentBindings(std::shared_ptr<const persistent::SelectedPublication> publication) const;
     const persistent::SelectedPublication* PersistentPublication() const noexcept { return m_persistentPublication.get(); }
-    // The frame slot of the execution being recorded (the host's frames-in-flight index). A recording
-    // may depend on it - a LatchBlock region is per slot - but on nothing else about the frame.
+    // The frame slot of the execution being recorded. This is the host's frames-in-flight index. A recording may
+    // depend on it, because a LatchBlock region is per slot. It must not depend on anything else about the frame.
     uint32_t FrameSlot() const noexcept { return m_frameSlot; }
     void SetFrameSlot(uint32_t slot) noexcept { m_frameSlot = slot; }
     rhi::Resource Resolve(persistent::BindingToken token) const;
@@ -467,8 +473,9 @@ public:
     // The frame's descriptor of a declared view, and its bindless index.
     rhi::DescriptorSlot View(const DeclaredViewToken& token) const;
     uint32_t Index(const DeclaredViewToken& token) const { return View(token).index; }
-    // Any bindless view of a declared resource, for a pass that moves it between access kinds with barriers of its
-    // own (declared for unordered access, read through its shader-resource view after an in-pass barrier).
+    // Any bindless view of a declared resource. This is for a pass that moves the resource between access kinds with its
+    // own barriers. For example, the pass declares it for unordered access, then reads it through its shader-resource
+    // view after an in-pass barrier.
     rhi::DescriptorSlot View(ResourceBindingToken resource, BindlessViewRequest request) const;
     uint32_t Index(ResourceBindingToken resource, BindlessViewRequest request) const { return View(resource, request).index; }
     rhi::DescriptorSlot Resolve(ExternalBindingKey key) const {
@@ -481,10 +488,13 @@ public:
     // Keeps `owner` alive until this recording's GPU work retires.
     void Retain(std::shared_ptr<const void> owner);
 
-    // Binds the pipeline's current payload (retained by the recording) and its layout, then fills its
-    // ResourceDescriptorIndex slots from the pass's declarations by resource name. A slot whose name the pass did
-    // not declare gets UINT32_MAX when it is optional, belongs to a feature domain the pass names nothing of, or
-    // starts with one of `absentPrefixes`; otherwise binding throws.
+    // Binds the pipeline's current payload and its layout. The recording retains the payload. Then fills the pipeline's
+    // ResourceDescriptorIndex slots from the pass's declarations, by resource name. A slot whose name the pass did not
+    // declare gets UINT32_MAX when:
+    // - the slot is optional,
+    // - it belongs to a feature domain that the pass names no resource of,
+    // - or its name starts with one of `absentPrefixes`.
+    // Otherwise binding throws.
     using BindOptions = PipelineBindOptions;
     void BindComputePipeline(const PipelineState& pipeline, BindOptions options = {});
     void BindGraphicsPipeline(const PipelineState& pipeline, BindOptions options = {});
@@ -495,7 +505,7 @@ public:
     void BindGraphicsPipeline(std::shared_ptr<const rhi::PipelinePtr> pipeline, rhi::PipelineLayoutHandle layout);
     // Root constants for the stages of the last bound pipeline.
     void PushConstants(uint32_t rootParameter, std::span<const uint32_t> values, uint32_t destinationOffset = 0);
-    // The indices a pipeline's ResourceDescriptorIndex slots resolve to (what binding it pushes).
+    // The indices that a pipeline's ResourceDescriptorIndex slots resolve to. This is what binding the pipeline pushes.
     std::vector<uint32_t> DescriptorSlotIndices(const PipelineStatePayload& payload, BindOptions options = {}) const;
 
     // Buffer barriers on declared resources, as one batch.
@@ -526,9 +536,9 @@ public:
         return result;
     }
     void SetRetention(std::shared_ptr<RecordingRetention> retention) noexcept { m_retention = std::move(retention); }
-    // The descriptor heaps the list binds before its first pass (the admitted frame's). A pass that hands the list to
-    // code binding heaps of its own (a vendor SDK, an overlay) calls RestoreDescriptorHeaps afterwards, so the passes
-    // after it read the frame's heaps again.
+    // The descriptor heaps the list binds before its first pass. These are the admitted frame's heaps. Some passes hand
+    // the list to code that binds heaps of its own, such as a vendor SDK or an overlay. Such a pass calls
+    // RestoreDescriptorHeaps afterwards, so the passes after it read the frame's heaps again.
     void SetDescriptorHeaps(rhi::DescriptorHeapHandle resources, rhi::DescriptorHeapHandle samplers) noexcept {
         m_resourceHeap = resources;
         m_samplerHeap = samplers;
@@ -680,9 +690,10 @@ public:
         result.m_storage = std::move(storage);
         return result;
     }
-    // The packet followed by commands of its own and lifecycle effects of its own, as one packet: a copy of a resource
-    // the pass wrote, recorded right after it in the same executable (a readback capture), with no new pass to schedule.
-    // The trailer records into the pass's list after the pass; the effects commit after the pass's own. Never replayable.
+    // Combines the packet with extra commands and extra lifecycle effects into one packet. An example is a readback
+    // capture: a copy of a resource the pass wrote, recorded right after the pass in the same executable, with no new
+    // pass to schedule. The trailer records into the pass's list after the pass. Its effects commit after the pass's
+    // own. The result is never replayable.
     static PreparedPass WithTrailer(PreparedPass inner, std::function<void(RecordingContext&)> trailer,
         std::vector<std::shared_ptr<const PreparedLifecycleEffect>> effects, std::shared_ptr<const void> keepAlive = {}) {
         if (!inner.m_storage || inner.IsConsumed()) throw std::invalid_argument("A trailer needs an unconsumed packet");
@@ -705,10 +716,10 @@ public:
     explicit operator bool() const { return static_cast<bool>(m_storage); }
     bool IsConsumed() const { return m_storage && m_storage->state.load(std::memory_order_acquire) != LifecycleState::Prepared; }
     bool IsWorkerSafe() const noexcept { return m_storage && m_storage->workerSafe; }
-    // Its recording may be submitted again and again (a replayable packet, OwnedRecordingList::replayable): it has no
-    // submission, completion or abandonment callback, no external signal and no dependency lifecycle effect, so a submission
-    // has nothing to commit but the commands themselves. A replayed pass is recorded once and never transitions further;
-    // its data lives as long as the recording.
+    // Whether its recording may be submitted again and again (a replayable packet, see OwnedRecordingList::replayable).
+    // That is the case when it has no submission, completion or abandonment callback, no external signal and no
+    // dependency lifecycle effect. Then a submission has nothing to commit but the commands themselves. A replayed pass
+    // is recorded once and never transitions further. Its data lives as long as the recording.
     bool IsReplayable() const noexcept {
         return m_storage && !m_storage->HasCallbacks() && m_storage->externalSignals.empty()
             && (!m_storage->dependencies || !m_storage->dependencies->HasLifecycleEffects());
@@ -736,9 +747,10 @@ public:
             throw;
         }
     }
-    // A replayable pass recorded again (after Record), into another list, with the same data: a late batch of a kept recording,
-    // which each execution records into its host's list (PreparedRhiExecutionBatch::RecordDeferred). No transition: a replayable
-    // pass has no lifecycle to advance.
+    // Records a replayable pass again, after Record, into another list and with the same data. This is for a late batch
+    // of a kept recording. Each execution records that batch into its host's list
+    // (PreparedRhiExecutionBatch::RecordDeferred). There is no state transition, because a replayable pass has no
+    // lifecycle to advance.
     void RecordAgain(RecordingContext& context) const {
         if (!m_storage) throw std::logic_error("Legacy pass has no owned recording packet");
         if (!IsReplayable() || m_storage->state.load(std::memory_order_acquire) != LifecycleState::Recorded)

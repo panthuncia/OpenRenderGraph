@@ -5,6 +5,7 @@
 #include <memory>
 #include <functional>
 #include <mutex>
+#include <stdexcept>
 #include <unordered_map>
 
 #include <resource_states.h>
@@ -335,8 +336,9 @@ public:
 		return { .buffers = { &bufferBarrier, 1 } };
 	}
 	bool HasLayout() const { return m_hasLayout; }
-	// Textures with the simultaneous-access contract (shared with another API that uses them between
-	// the graph's commands) stay in layout Common: the graph changes only their access and sync.
+	// Some textures have the simultaneous-access contract. They are shared with another API that uses them
+	// between the graph's commands. Such textures stay in layout Common, and the graph changes only their
+	// access and sync.
 	virtual bool CommonLayoutOnly() const noexcept { return false; }
 	void AddAliasedResource(Resource* resource) {
 		m_aliasedResources.push_back(resource);
@@ -409,5 +411,15 @@ private:
     friend class UploadManager; // Kinda a hack, for deduplicating transition lists
 };
 
+
+// A resource that shaders read through a descriptor index the graph never sees (a bindless table, say) has no
+// declaration: the graph neither transitions it nor orders it against its writers. Such a resource must not change
+// while shaders can read it, and must already be in its shader-read state: GraphOwnership::
+// ExternalImmutableShaderResource. Throws std::logic_error naming the resource when it isn't.
+inline void RequireUndeclaredShaderRead(const Resource& resource) {
+	if (resource.GetGraphOwnership() == Resource::GraphOwnership::ExternalImmutableShaderResource) return;
+	throw std::logic_error("Resource '" + resource.GetName() + "' is graph-managed, so shaders can't read it through a "
+		"descriptor the graph doesn't know about: the graph would not transition it or order its writes");
+}
 
 } // namespace org

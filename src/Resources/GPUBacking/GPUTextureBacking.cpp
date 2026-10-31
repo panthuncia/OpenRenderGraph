@@ -167,10 +167,10 @@ void GpuTextureBacking::initialize(const TextureDescription& desc,
 	}
 
 	auto device = DeviceManager::GetInstance().GetDevice();
-	// Vulkan images are born in UNDEFINED (the only other legal initial layout is
-	// PREINITIALIZED for linear host-written images).  ResourceLayout::Common is
-	// a useful D3D12 creation state, but treating it as GENERAL in Vulkan's
-	// symbolic tracker skips the first real layout transition and makes uploads
+	// Vulkan images start in UNDEFINED. The only other legal initial layout is
+	// PREINITIALIZED, for linear images that the host writes. ResourceLayout::Common
+	// is a useful creation state on D3D12. But if Vulkan's symbolic tracker treats it
+	// as GENERAL, the tracker skips the first real layout transition. Uploads then
 	// submit an image that validation still knows is UNDEFINED.
 	rhi::VulkanDeviceInfo vulkanDeviceInfo{};
 	const bool vulkanInitialUndefined = rhi::QueryNativeDevice(

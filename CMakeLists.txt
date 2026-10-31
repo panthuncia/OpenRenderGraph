@@ -98,6 +98,7 @@ add_library(OpenRenderGraph STATIC
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Contributor/ContributorHost.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Contributor/DeviceTable.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Host/GraphHost.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/src/Host/CompiledGraph.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Telemetry/NvPerfCapture.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/include/OpenRenderGraph/GraphHost.h"
 	"${CMAKE_CURRENT_SOURCE_DIR}/include/OpenRenderGraph/Runtime.h"
@@ -168,6 +169,8 @@ add_library(OpenRenderGraph STATIC
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/InteropAllocator.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/FrameRecording.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/ExternalEpochExecution.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/ExternalClient.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/ExecutionHandle.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/Aliasing/RenderGraphAliasingAlgorithms.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Managers/Singletons/DeviceManager.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Managers/Singletons/DescriptorHeapManager.cpp"
@@ -317,7 +320,7 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
     target_include_directories(OpenRenderGraphTrackingWorldTests PRIVATE src/include)
     target_link_libraries(OpenRenderGraphTrackingWorldTests PRIVATE OpenRenderGraph)
     add_test(NAME OpenRenderGraphTrackingWorldTests COMMAND OpenRenderGraphTrackingWorldTests)
-    add_executable(OpenRenderGraphPersistentTests tests/PersistentGraphTests.cpp tests/GraphReplayRunner.h)
+    add_executable(OpenRenderGraphPersistentTests tests/PersistentGraphTests.cpp tests/GraphReplayRunner.h tests/ScheduleChecks.h)
     target_compile_features(OpenRenderGraphPersistentTests PRIVATE cxx_std_23)
     target_compile_definitions(OpenRenderGraphPersistentTests PRIVATE
         ORG_REPLAY_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
@@ -325,6 +328,16 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
     add_test(NAME OpenRenderGraphPersistentTests COMMAND OpenRenderGraphPersistentTests)
     set_tests_properties(OpenRenderGraphPersistentTests PROPERTIES
         ENVIRONMENT "ORG_GRAPH_REPLAY_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/persistent_test_snapshot.orggraph")
+    # Rebinding safety: which slots share a backing, at the persistent layer (no device).
+    add_executable(OpenRenderGraphRebindingTests tests/RebindingTests.cpp tests/ScheduleChecks.h)
+    target_compile_features(OpenRenderGraphRebindingTests PRIVATE cxx_std_23)
+    target_link_libraries(OpenRenderGraphRebindingTests PRIVATE OpenRenderGraph)
+    add_test(NAME OpenRenderGraphRebindingTests COMMAND OpenRenderGraphRebindingTests)
+    # Declaration layouts compared by content (no device).
+    add_executable(OpenRenderGraphTokenTests tests/TokenTests.cpp)
+    target_compile_features(OpenRenderGraphTokenTests PRIVATE cxx_std_23)
+    target_link_libraries(OpenRenderGraphTokenTests PRIVATE OpenRenderGraph)
+    add_test(NAME OpenRenderGraphTokenTests COMMAND OpenRenderGraphTokenTests)
     add_executable(OpenRenderGraphAliasPackingTests tests/AliasPackingTests.cpp src/Render/RenderGraph/AliasPacking.cpp)
     target_compile_features(OpenRenderGraphAliasPackingTests PRIVATE cxx_std_23)
     add_test(NAME OpenRenderGraphAliasPackingTests COMMAND OpenRenderGraphAliasPackingTests)
@@ -381,7 +394,7 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
     target_compile_definitions(OpenRenderGraphAsyncCompileTests PRIVATE NOMINMAX)
     add_test(NAME OpenRenderGraphAsyncCompileTests COMMAND OpenRenderGraphAsyncCompileTests)
     if(_org_d3d12_tests)
-    add_executable(OpenRenderGraphExternalResourceTests tests/ExternalResourceTests.cpp tests/RuntimeTests.cpp tests/FrameRetirementTests.cpp tests/BindingOwnershipTests.cpp tests/ProgramVersionTests.cpp tests/ReadbackCaptureTests.cpp)
+    add_executable(OpenRenderGraphExternalResourceTests tests/ExternalResourceTests.cpp tests/RuntimeTests.cpp tests/ExternalClientTests.cpp tests/FrameRetirementTests.cpp tests/BindingOwnershipTests.cpp tests/ProgramVersionTests.cpp tests/ReadbackCaptureTests.cpp tests/RebindingGpuTests.cpp)
     target_include_directories(OpenRenderGraphExternalResourceTests PRIVATE src/include)
     target_compile_definitions(OpenRenderGraphExternalResourceTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
     if(WIN32 AND BASICRHI_ENABLE_STREAMLINE)
@@ -467,7 +480,7 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
                 SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/PersistentHostWrite.hlsl"
                 ENTRY main PROFILE cs_6_6)
             add_executable(OpenRenderGraphPersistentVulkanHostTests tests/PersistentVulkanHostTests.cpp tests/FrameRetirementTests.cpp tests/BindingOwnershipTests.cpp
-                tests/ContributorHostTests.cpp "${_org_persistent_write_spv}")
+                tests/ContributorHostTests.cpp tests/RebindingGpuTests.cpp "${_org_persistent_write_spv}")
             target_compile_features(OpenRenderGraphPersistentVulkanHostTests PRIVATE cxx_std_23)
             target_include_directories(OpenRenderGraphPersistentVulkanHostTests PRIVATE src/include)
             target_compile_definitions(OpenRenderGraphPersistentVulkanHostTests PRIVATE NOMINMAX
@@ -499,9 +512,10 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests.Revision COMMAND OpenRenderGraphPersistentVulkanHostTests revision)
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests.External COMMAND OpenRenderGraphPersistentVulkanHostTests external)
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests.Contributor COMMAND OpenRenderGraphPersistentVulkanHostTests contributor)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.Rebinding COMMAND OpenRenderGraphPersistentVulkanHostTests rebinding)
             set_tests_properties(OpenRenderGraphPersistentVulkanHostTests OpenRenderGraphPersistentVulkanHostTests.Async
                 OpenRenderGraphPersistentVulkanHostTests.Reuse OpenRenderGraphPersistentVulkanHostTests.Revision
-                OpenRenderGraphPersistentVulkanHostTests.Contributor PROPERTIES TIMEOUT 60)
+                OpenRenderGraphPersistentVulkanHostTests.Contributor OpenRenderGraphPersistentVulkanHostTests.Rebinding PROPERTIES TIMEOUT 60)
         endif()
     endif()
     if(WIN32 AND BASICRENDERER_TEST_RUNTIME_DIR)

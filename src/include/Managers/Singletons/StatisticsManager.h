@@ -143,10 +143,12 @@ private:
 	std::unordered_map<rhi::QueueKind,
 		std::unordered_map<unsigned, std::vector<std::pair<unsigned,unsigned>>>> m_pendingResolves;
 
-	// Kept recordings' queries submitted per frame slot, read when the slot completes; what the latest completion read (its
-	// owned queries kept alive with it, for the names the timestamps view).
+	// The queries of kept recordings submitted for each frame slot. They are read when the slot completes.
+	// m_completedOwned and m_completedTimestamps hold what the latest completion read. Its owned queries stay alive with
+	// it, because the timestamps view their names.
 	std::unordered_map<unsigned, std::vector<std::shared_ptr<OwnedTimestampQueries>>> m_pendingOwned;
-	// PublishAtCompletion's, by frame slot: run first by the slot's next OnFrameComplete (bounded, as m_pendingOwned).
+	// The callbacks given to PublishAtCompletion, by frame slot. The slot's next OnFrameComplete runs them first. Each
+	// list has a size limit, like m_pendingOwned.
 	std::unordered_map<unsigned, std::vector<std::function<void()>>> m_publishAtCompletion;
 	std::vector<std::shared_ptr<OwnedTimestampQueries>> m_completedOwned;
 	std::vector<CompletedTimestamp> m_completedTimestamps;

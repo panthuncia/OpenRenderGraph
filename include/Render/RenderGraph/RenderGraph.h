@@ -12,6 +12,7 @@
 #include <utility>
 #include <array>
 #include <atomic>
+#include <mutex>
 #include <algorithm>
 #include <spdlog/spdlog.h>
 #include <rhi.h>
@@ -30,6 +31,7 @@
 #include "Render/Runtime/IDescriptorService.h"
 #include "Render/Runtime/IRenderGraphSettingsService.h"
 #include "Render/Runtime/ITaskService.h"
+#include "OpenRenderGraph/ExecutionHandle.h"
 #include "Render/Runtime/TaskServiceAccess.h"
 #include "Render/QueueKind.h"
 #include "Render/QueueRegistry.h"
@@ -48,6 +50,7 @@ class Runtime;
 class Resource;
 class RenderPassBuilder;
 class ExternalEpochExecution;
+class ExternalClient;
 struct IPassBuilder;
 struct IDynamicDeclaredResources;
 
@@ -174,11 +177,8 @@ public:
 		m_gpuPassRangeBegin = std::move(begin);
 		m_gpuPassRangeEnd = std::move(end);
 	}
-	// Persistent execution: the main graph runs from a selected persistent
-	// publication rebuilt only by explicit structural edits; truly dynamic passes
-	// run in per-frame Pre/Tail segments admitted through the same ledgers.
-	// Requires synchronous scheduling during migration.
-	enum class PersistentSegmentKind : uint8_t { Main, Pre, Tail };
+	// Persistent execution: the graph runs from a selected persistent publication, rebuilt only by structural edits.
+	// Upload passes (immediate-mode commands) are submitted through the external client before it.
 	struct PersistentExecutionState; // Defined in RenderGraphPersistent.cpp; opaque elsewhere.
 
 	// The calling thread's CPU time in the last persistent Execute, by phase. Diagnostics: a host that
@@ -203,9 +203,6 @@ public:
 	bool ScheduleTraceEnabled() const noexcept;
 	// Any thread: the latest published snapshot; null while off, or before anything executed with it on.
 	std::shared_ptr<const PersistentScheduleSnapshot> GetPersistentScheduleSnapshot() const;
-	void SetPersistentSegment(std::string passName, PersistentSegmentKind kind) {
-		m_persistentSegmentKinds[std::move(passName)] = kind;
-	}
 	// Host epochs (persistent execution). A host that submits the graph at several
 	// points of its own frame tags each pass with its epoch (ExternalPassDesc::Epoch)
 	// and names the execution order once. The graph compiles over the whole frame, so
@@ -225,7 +222,7 @@ public:
 	// still current, records the uploads queued since (RecordPendingUploads) and submits the ticket's
 	// packets, assigning their timeline values then, in submission order. The owner completes every ticket
 	// in that order, with those values, or abandons it. Requires closed executions (a ticket's admission
-	// must not depend on the executions around it) and no Pre/Tail passes other than the host's uploads.
+	// must not depend on the executions around it) and no upload passes other than the host's.
 	struct PersistentTicket;
 	struct PersistentTicketSubmission {
 		bool submitted = false;
@@ -283,6 +280,19 @@ public:
 	// statistics queries in the shared pool (recreated as passes register, and frame-indexed): with
 	// SetPersistentRecordingTimestamps, each records into queries of its own instead.
 	static constexpr size_t kKeptRecordingVariants = 4;
+	// What happens when a frame's binding edits change which slots share a backing (a resource swapped onto a backing
+	// another slot already uses, say). The compiler treats slots that share a backing as one resource, so this needs a
+	// new schedule, with the passes of both slots ordered and transitioned against each other.
+	// - Inline (default): the frame builds the new schedule before it prepares. The swap takes effect this frame.
+	// - Deferred: the frame keeps those slots' current bindings, and a worker builds the new schedule with the new ones.
+	//   They take effect when it installs, a frame or more later. Until then the graph still binds and orders the old
+	//   backings: a pass that reads its resources through declared views sees the old ones, consistently. A pass that
+	//   reads a resource's live descriptors directly would see the new backing without its barriers, and data written
+	//   into the new backing on the CPU isn't read until the install.
+	// Either way, edits replayed onto a worker build at its install that change these sets build inline.
+	enum class SharingChangePolicy : uint8_t { Inline, Deferred };
+	void SetSharingChangePolicy(SharingChangePolicy policy) noexcept { m_sharingChangePolicy = policy; }
+	SharingChangePolicy GetSharingChangePolicy() const noexcept { return m_sharingChangePolicy; }
 	void SetPersistentRecordingReuse(bool reuse) noexcept { m_persistentRecordingReuse = reuse; }
 	bool PersistentRecordingReuse() const noexcept { return m_persistentRecordingReuse; }
 	// Pass and barrier-batch timestamps in recordings kept for resubmission (off by default): each such list records into
@@ -312,6 +322,8 @@ public:
 	static uint32_t PersistentTicketEpoch(const PersistentTicket& ticket) noexcept;
 	static uint8_t PersistentTicketSlot(const PersistentTicket& ticket) noexcept;
 	static uint64_t PersistentTicketHostFrame(const PersistentTicket& ticket) noexcept;
+	// The execution the ticket prepared. It is submitted, or poisoned, when the ticket completes (CompletePersistentTicket).
+	static ExecutionHandle PersistentTicketExecution(const PersistentTicket& ticket) noexcept;
 	// A value the host keeps with the ticket for its own currency checks (GraphHost: the backing version it was
 	// prepared under). Set by the owner thread before the ticket is published.
 	static uint64_t PersistentTicketHostTag(const PersistentTicket& ticket) noexcept;
@@ -397,6 +409,16 @@ public:
 	void ClearExtensions();
 	void RegisterExtension(std::unique_ptr<IRenderGraphExtension> ext, std::optional<std::string_view> id = std::nullopt);
 	std::optional<PresentDependency> GetLastPresentDependency() const noexcept { return m_lastPresentDependency; }
+	// The latest execution (Execute, or the one a ticket prepared). Empty before the first. Owner thread.
+	ExecutionHandle LastExecution() const;
+	// The pass that leaves the swapchain image ready to present. The signal of its batch is the present dependency
+	// (GetLastPresentDependency). Passes that must run after it anchor on GetPresentPass().
+	void SetPresentPass(std::string name) { m_presentPass = std::move(name); }
+	const std::string& GetPresentPass() const noexcept { return m_presentPass; }
+	// The swapchain image. It must be a DynamicResource that points at the image being rendered. The graph binds
+	// its current image every frame instead of keeping a persistent binding for it.
+	void SetSwapchainResource(std::shared_ptr<Resource> resource);
+	bool IsSwapchainResource(const Resource* resource) const noexcept { return resource && resource == m_swapchain.get(); }
 	org::memory::SnapshotProvider& GetMemorySnapshotProvider() { return m_memorySnapshotProvider; }
 	const org::memory::SnapshotProvider& GetMemorySnapshotProvider() const { return m_memorySnapshotProvider; }
 	void WriteVramUsageDebugDumpNow(uint8_t frameIndex) const { WriteVramUsageDebugDump(frameIndex); }
@@ -540,6 +562,12 @@ public:
 	const QueueRegistry& GetQueueRegistry() const noexcept { return m_queueRegistry; }
 	QueueRegistry& GetQueueRegistry() noexcept { return m_queueRegistry; }
 
+	/// The graph's external client (OpenRenderGraph/ExternalClient.h). Use it to submit GPU work recorded outside the
+	/// graph, such as uploads and readbacks. It uses this graph's queue slots, and its work is ordered with the graph's
+	/// executions in submission order. The graph's own uploads go through it too.
+	/// Created on first use. Call it after Setup. Any thread.
+	ExternalClient& GetExternalClient();
+
 private:
 	// Driving the graph is GraphHost's: its declared-graph calls (Build, PrepareFrame, ExecuteFrame, ConfirmPresentation)
 	// or its own frames.
@@ -579,6 +607,12 @@ private:
 	struct CompilerState;
 	void PreparePersistentFrame(rhi::Device device, uint8_t frameIndex, const IHostExecutionData* hostData, float deltaTime);
 	void ExecutePersistentFrame(PassExecutionContext& context);
+	// One execution of the prepared segment, in phases (RenderGraphPersistentExecute.cpp). Admit returns false when the
+	// segment needs nothing more: it was empty, admission-only, or took a kept recording.
+	struct PersistentSegmentRun;
+	bool AdmitPersistentSegment(PersistentSegmentRun& run);
+	void PlanPersistentSegmentRecording(PersistentSegmentRun& run);
+	void SubmitPersistentSegment(PersistentSegmentRun& run);
 	void ConfirmPersistentPresentationTail();
 	// skipAliasCandidates leaves alias-eligible transients unmaterialized so the
 	// structural build can place them (see PlanPersistentAliasPlacement).
@@ -611,16 +645,16 @@ private:
 	void DrainPersistentStructuralBuild(std::vector<uint32_t>& structural);
 	void RunPersistentStructuralBuildPhase(bool validated);
 	// Hosts this frame's frame-interrupting passes in the main executable and
-	// removes the previous frame's. Returns requested passes that name no main
-	// pass to insert against; they run in the Tail segment instead.
-	std::vector<ExternalPassDesc> UpdatePersistentFrameInterruptingPasses(std::vector<ExternalPassDesc> requested, rhi::Backend primaryBackend);
+	// removes the previous frame's. Passes that name no main pass to insert
+	// against are dropped.
+	void UpdatePersistentFrameInterruptingPasses(std::vector<ExternalPassDesc> requested, rhi::Backend primaryBackend);
 	// Compile-dump mode for the persistent graph: written once per selected executable.
 	void WritePersistentGraphDebugDump(const persistent::SelectedPublication& selected) const;
 	// Schedule introspection, owner thread. Traces the selected executable and its epochs' when it is not the traced one.
 	void RefreshPersistentScheduleTraces(const persistent::SelectedPublication& selected);
 	// Records the submission waits filled into the persistent state's scratch for one execution of `executable` (a segment
 	// labelled segmentLabel), and publishes a snapshot once per round of executions.
-	void RecordPersistentScheduleSubmission(const persistent::ExecutableGeneration& executable, const char* segmentLabel, uint64_t frame);
+	void RecordPersistentScheduleSubmission(const persistent::ExecutableGeneration& executable, uint64_t frame);
 	void RecordPersistentTicketScheduleSubmissions(const PersistentTicket& ticket);
 	void PublishPersistentScheduleSnapshot();
 	std::atomic<bool> m_scheduleTraceEnabled{false};
@@ -638,19 +672,32 @@ private:
 	// live state), so its recording is neither taken from nor added to the kept sets.
 	bool m_persistentTicketHostData = false;
 	bool m_persistentRecordingReuse = false;
+	SharingChangePolicy m_sharingChangePolicy = SharingChangePolicy::Inline;
 	bool m_persistentRecordingTimestamps = false;
-	// Kept recordings per (epoch, frame slot): replaced whole by the owner thread, read by the submitting thread. A host's frame
-	// slots are its frames in flight of every epoch (GraphHost::FrameSlots), so an epoch meets several.
-	// Slots: every frame slot a host can have (GraphHost refuses more than 255): a host with frames in flight times epochs past
-	// 32 (Community Shaders' 4 x 9 since DCLF's first-person epochs) had its last epoch's slots unkeepable, so a revision-driven epoch's
-	// recording there was refused as not replayable.
-	static constexpr size_t kKeptRecordingEpochs = 32, kKeptRecordingSlots = 255;
+	// Kept recordings per (epoch, frame slot). Each set is replaced whole by the owner thread and read by the submitting
+	// thread. A host's frame slots are its frames in flight of every epoch (GraphHost::FrameSlots), so an epoch meets
+	// several. Any epoch and slot can keep recordings.
 	using KeptRecordingSet = std::vector<std::shared_ptr<const PersistentRecording>>;
-	std::unique_ptr<std::array<std::array<std::atomic<std::shared_ptr<const KeptRecordingSet>>, kKeptRecordingSlots>, kKeptRecordingEpochs>> m_keptRecordings;
+	class KeptRecordingStore {
+	public:
+		std::shared_ptr<const KeptRecordingSet> Load(uint32_t epoch, uint8_t slot) const {
+			std::scoped_lock lock(m_mutex);
+			const auto found = m_sets.find(Key(epoch, slot));
+			return found == m_sets.end() ? nullptr : found->second;
+		}
+		void Store(uint32_t epoch, uint8_t slot, std::shared_ptr<const KeptRecordingSet> set) {
+			std::scoped_lock lock(m_mutex);
+			m_sets[Key(epoch, slot)] = std::move(set);
+		}
+	private:
+		static uint64_t Key(uint32_t epoch, uint8_t slot) noexcept { return (static_cast<uint64_t>(epoch) << 8) | slot; }
+		mutable std::mutex m_mutex;
+		std::unordered_map<uint64_t, std::shared_ptr<const KeptRecordingSet>> m_sets;
+	};
+	std::unique_ptr<KeptRecordingStore> m_keptRecordings;
 	std::atomic<uint64_t> m_recordingsRecorded{0}, m_recordingsKept{0}, m_recordingsReused{0}, m_recordingsAdopted{0};
 	uint32_t m_persistentEpoch = UINT32_MAX;
 	PersistentExecuteTimings m_lastPersistentExecuteTimings{};
-	std::unordered_map<std::string, PersistentSegmentKind> m_persistentSegmentKinds;
 	ExternalQueueBoundary m_externalQueueBoundary{};
 	std::unique_ptr<CompilerState> m_compilerState;
     std::shared_ptr<const ResolverCaptureContext> m_resolverCaptureContext;
@@ -696,9 +743,14 @@ private:
 	std::shared_ptr<org::runtime::IRenderGraphSettingsService> m_renderGraphSettingsService;
 	std::shared_ptr<org::runtime::ITaskService> m_taskService;
 	QueueRegistry m_queueRegistry;
+	// Declared after the queue registry, so it is destroyed before the queues it submits to.
+	std::mutex m_externalClientMutex;
+	std::unique_ptr<ExternalClient> m_externalClient;
 	std::shared_ptr<rhi::TimelinePtr> m_frameWaitTimeline;  // SetFrameWaitTimeline
 	uint64_t m_frameWaitValue = 0;
 	std::optional<PresentDependency> m_lastPresentDependency;
+	std::string m_presentPass;              // SetPresentPass
+	std::shared_ptr<Resource> m_swapchain;  // SetSwapchainResource
 
 
 	void EnsureMinimumAutomaticSchedulingQueues();

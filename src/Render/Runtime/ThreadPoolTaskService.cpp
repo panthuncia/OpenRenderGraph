@@ -206,7 +206,7 @@ void ThreadPoolTaskService::ParallelForLimited(std::string_view, size_t itemCoun
     // Helpers still queued would find nothing to do; retract them rather than wait
     // for a worker (all workers may be blocked in nested ParallelFor calls).
     m_impl->Retract(scope);
-    scope->Wait(); // func is borrowed by reference: started helpers must finish first
+    scope->Wait(); // func is borrowed by reference, so started helpers must finish first
     if (shared->failure) std::rethrow_exception(shared->failure);
 }
 

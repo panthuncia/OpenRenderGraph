@@ -29,7 +29,7 @@ namespace org {
 
 namespace {
     thread_local uint32_t g_backingMutationScopeDepth = 0;
-    // BufferBase::RegisterConcurrentBackingCapture: owners capturing backings on threads of their own.
+    // The number of owners that capture backings on their own threads. See BufferBase::RegisterConcurrentBackingCapture.
     std::atomic<uint32_t> g_concurrentBackingCaptures{0};
     // BufferBase::BackingReleaseSerial.
     std::atomic<uint64_t> g_backingReleases{0};
@@ -294,10 +294,9 @@ void AsyncBufferBackingResizeState::Schedule(
             return;
         }
 
-        // Submission can be rejected transiently while a task domain is at
-        // capacity.  Undo only this request's in-flight marker so the next
-        // level-triggered reserve request can submit it again.  The desired
-        // byte size and request recipe remain intact.
+        // Submission can fail for a moment while a task domain is at capacity. Undo only this request's in-flight
+        // marker, so the next reserve request can submit it again. Reserve requests are level-triggered. The desired
+        // byte size and the request recipe stay intact.
         {
             std::lock_guard<std::mutex> lock(state->mutex);
             if (token == state->inFlightToken && !state->readyValid) {
@@ -310,9 +309,9 @@ void AsyncBufferBackingResizeState::Schedule(
         return;
     }
 
-    // The renderer installs the unified scheduler before deferred resize clients
-    // become active.  During startup/shutdown there is no safe detached fallback:
-    // complete the request inline so its state remains owned and observable.
+    // The renderer installs the unified scheduler before deferred resize clients become active. During startup and
+    // shutdown there is no safe way to run the request detached. So complete it inline, which keeps its state owned and
+    // observable.
     spdlog::warn("Unified task scheduler unavailable for '{}'; executing safe backing creation inline", taskName);
     task();
 }
@@ -399,7 +398,8 @@ void BufferBase::UnregisterConcurrentBackingCapture() {
 }
 
 void BufferBase::RequireBackingMutationAllowed(const char* operation, uint64_t newSize) const {
-    // A buffer without a backing (a new version being sized, VersionedBuffer) has nothing a capture could see.
+    // A buffer without a backing has nothing a capture could see. One example is a new VersionedBuffer version that is
+    // still being sized.
     if (g_concurrentBackingCaptures.load(std::memory_order_acquire) == 0u || IsBackingMutationAllowedOnThisThread() || !IsMaterialized()) {
         return;
     }
@@ -485,12 +485,11 @@ bool BufferBase::TryGetBufferByteSize(uint64_t& outByteSize) const {
 
 bool BufferBase::TryGetRHIResourceDesc(rhi::ResourceDesc& outDesc) const {
 	outDesc = rhi::helpers::ResourceDesc::Buffer(m_bufferSize, m_accessType);
-	// As the backing creates it (GpuBufferBacking): every graph buffer is shared concurrently by all queue families.
+	// Match how GpuBufferBacking creates the buffer. Every graph buffer is shared concurrently by all queue families.
 	outDesc.queueSharing = rhi::QueueSharing::Concurrent;
-	// Some dynamic-buffer implementations install a pre-created backing through
-	// SetBacking rather than ConfigureBacking. Their descriptor requirements are
-	// authoritative too; otherwise peer materialization can omit the UAV flag
-	// while still recreating a UAV descriptor for that representation.
+	// Some dynamic-buffer implementations install a pre-created backing through SetBacking instead of
+	// ConfigureBacking. Their descriptor requirements count too. Otherwise peer materialization can leave out the UAV
+	// flag but still recreate a UAV descriptor for that representation.
 	if (m_unorderedAccess || (m_descriptorRequirements && m_descriptorRequirements->createUAV)) {
 		outDesc.resourceFlags |= rhi::ResourceFlags::RF_AllowUnorderedAccess;
 	}
@@ -498,9 +497,8 @@ bool BufferBase::TryGetRHIResourceDesc(rhi::ResourceDesc& outDesc) const {
 }
 
 void BufferBase::RefreshAPIRepresentationDescriptors(BackendInstanceId backendInstance) {
-	// As with textures, an explicit primary representation supersedes the
-	// resource's original backing in multi-RHI mode. Refresh the primary arena as
-	// well so descriptor accesses and graph-resolved resource handles agree.
+	// In multi-RHI mode, an explicit primary representation replaces the resource's original backing. Textures work
+	// the same way. Refresh the primary arena too, so descriptor accesses and graph-resolved resource handles agree.
 	if (!m_descriptorRequirements.has_value()) return;
 	auto resource = Resource::GetAPIResource(backendInstance);
 	if (!resource) return;

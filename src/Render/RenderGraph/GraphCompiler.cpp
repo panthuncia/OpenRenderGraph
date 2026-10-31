@@ -26,7 +26,7 @@ std::string_view DiagnosticResourceName(const GraphCompileStructure& structure, 
 }
 }
 
-bool IsExecutionCompatible(const CompiledGraphBundle& bundle,
+bool IsExecutionCompatible(const ScheduleBundle& bundle,
     const GraphCompileInput& prepared) noexcept {
     if (!bundle.graph || !bundle.input || !bundle.graph->structure
         || !bundle.graph->scheduleValidated || !bundle.graph->scheduleValidationError.empty()
@@ -44,12 +44,12 @@ bool IsExecutionCompatible(const CompiledGraphBundle& bundle,
 }
 
 std::shared_ptr<const GraphExecutionLayout> BuildExecutionLayout(
-    std::shared_ptr<const CompiledGraphBundle> bundle,
+    std::shared_ptr<const ScheduleBundle> bundle,
     const GraphCompileInput& prepared) {
     BT_ZONE_SCOPE("ORG.Execution.BuildLayout");
     const bool exactDirect = bundle && bundle->graph && bundle->input.get() == &prepared
         && bundle->graph->structure.get() == &prepared.structure && bundle->graph->scheduleValidated
-        && bundle->graph->stage == CompiledGraphStage::SymbolicSchedule && bundle->graph->scheduleValidationError.empty();
+        && bundle->graph->stage == ScheduleStage::SymbolicSchedule && bundle->graph->scheduleValidationError.empty();
     if (!bundle || !exactDirect)
         throw std::invalid_argument("Compiled graph is incompatible with prepared frame");
     auto result = std::make_shared<GraphExecutionLayout>();
@@ -88,7 +88,7 @@ ExecutionTimelineAdmission::ExecutionTimelineAdmission(std::vector<ExecutionTime
 }
 
 std::shared_ptr<const GraphExecutionTimeline> ExecutionTimelineAdmission::Prepare(
-    std::shared_ptr<const CompiledGraphBundle> bundle,
+    std::shared_ptr<const ScheduleBundle> bundle,
     const std::vector<std::vector<ExecutionTimelinePoint>>& incomingWaits,
     std::vector<std::shared_ptr<const void>> executionLeases,
     std::vector<std::shared_ptr<const IPreparedExecutionBatch>> preparedBatches,
@@ -160,7 +160,7 @@ std::shared_ptr<const GraphExecutionTimeline> ExecutionTimelineAdmission::Prepar
 }
 
 std::shared_ptr<const GraphExecutionTimeline> ExecutionTimelineAdmission::SubmitPrepared(
-    std::shared_ptr<const CompiledGraphBundle> bundle,
+    std::shared_ptr<const ScheduleBundle> bundle,
     const std::vector<std::vector<ExecutionTimelinePoint>>& incomingWaits,
     const std::vector<std::shared_ptr<const IPreparedExecutionBatch>>& packets,
     std::span<const ExecutionTimelinePoint> reservedSignals, std::span<const std::span<const rhi::CommandList>> leading,
@@ -204,7 +204,7 @@ std::shared_ptr<const GraphExecutionTimeline> ExecutionTimelineAdmission::Submit
 }
 
 std::shared_ptr<const GraphExecutionTimeline> ExecutionTimelineAdmission::RecordSubmitted(
-    std::shared_ptr<const CompiledGraphBundle> bundle,
+    std::shared_ptr<const ScheduleBundle> bundle,
     const std::vector<std::vector<ExecutionTimelinePoint>>& incomingWaits,
     const std::vector<std::shared_ptr<const IPreparedExecutionBatch>>& packets,
     std::span<const ExecutionTimelinePoint> signals) {
@@ -558,12 +558,12 @@ void NormalizeCompileInput(GraphCompileInput& input) {
     normalizeEdges(s.placementEdges);
 }
 
-std::string ValidateSymbolicSchedule(const GraphCompileInput& input, const CompiledGraph& graph) {
+std::string ValidateSymbolicSchedule(const GraphCompileInput& input, const Schedule& graph) {
     BT_ZONE_SCOPE("ORG.FreshCompile.ValidateSchedule");
     const auto& s = input.structure;
     const size_t count = s.passes.size(), batchCount = graph.batches.size();
     const size_t words = (batchCount + 63) / 64;
-    if (graph.stage != CompiledGraphStage::SymbolicSchedule)
+    if (graph.stage != ScheduleStage::SymbolicSchedule)
         return "Missing complete symbolic schedule";
     if (!count)
         return graph.batches.empty() && graph.relativeWaits.empty() && graph.edges.empty() && graph.schedulingEdges.empty()
@@ -630,7 +630,7 @@ std::string ValidateSymbolicSchedule(const GraphCompileInput& input, const Compi
     return {};
 }
 
-std::string ValidateSymbolicStates(const GraphCompileInput& input, const CompiledGraph& graph) {
+std::string ValidateSymbolicStates(const GraphCompileInput& input, const Schedule& graph) {
     BT_ZONE_SCOPE("ORG.FreshCompile.ValidateStates");
     // Independent dense-cell oracle; it does not share the planner's rectangle
     // splitting algorithm. Only the worker invokes this on captured host inputs.
@@ -773,7 +773,7 @@ std::shared_ptr<const DependencyEdges> CompileWorkspace::AnalyzeDependencies(
     return std::make_shared<const DependencyEdges>(std::move(edges));
 }
 
-std::shared_ptr<const CompiledGraph> CompileWorkspace::Compile(
+std::shared_ptr<const Schedule> CompileWorkspace::Compile(
     std::shared_ptr<const GraphCompileInput> input, const std::atomic_bool& cancelled) {
     BT_ZONE_SCOPE("ORG.FreshCompile.DependencyCompile");
     basic_telemetry::AddCounter("ORG.FreshCompile.Compiles");
@@ -781,7 +781,7 @@ std::shared_ptr<const CompiledGraph> CompileWorkspace::Compile(
     const auto& structure = input->structure;
     if (structure.passes.size() >= UINT32_MAX || structure.resourceIDs.size() >= UINT32_MAX)
         throw std::invalid_argument("Graph exceeds dependency index capacity");
-    auto result = std::make_shared<CompiledGraph>();
+    auto result = std::make_shared<Schedule>();
     result->structure = std::shared_ptr<const GraphCompileStructure>(input, &input->structure);
     const auto passCount = static_cast<uint32_t>(structure.passes.size());
     const auto dependencies = input->analyzedDependencies
@@ -931,7 +931,7 @@ std::shared_ptr<const CompiledGraph> CompileWorkspace::Compile(
         }
         for (uint32_t b = 0; b < result->batches.size(); ++b) for (auto producer : latestProducer[b])
             if (producer != UINT32_MAX) result->relativeWaits.push_back({b, producer});
-        result->stage = CompiledGraphStage::SymbolicSchedule;
+        result->stage = ScheduleStage::SymbolicSchedule;
     }
     if (!structure.resourceShapes.empty() || structure.resourceIDs.empty()) {
         result->states = BuildStatePlan(structure, result->batches, cancelled);
@@ -1068,12 +1068,125 @@ std::shared_ptr<const CompiledGraph> CompileWorkspace::Compile(
     return cancelled.load(std::memory_order_relaxed) ? nullptr : result;
 }
 
-std::shared_ptr<const CompiledGraph> CompileGraph(
+std::shared_ptr<const Schedule> CompileGraph(
     std::shared_ptr<const GraphCompileInput> input,
     CompileWorkspace& workspace,
     const std::atomic_bool& cancelled) {
     auto graph = workspace.Compile(std::move(input), cancelled);
     if (graph) ObserveGraphReplay(graph->structure);
+    return graph;
+}
+
+namespace {
+// Hashes a structure for the schedule cache. Covers every field except the generation number.
+uint64_t HashCacheStructure(const GraphCompileStructure& s) {
+    uint64_t h = 0xcbf29ce484222325ull;
+    auto mix = [&](uint64_t value) { h ^= value + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2); };
+    auto mixRange = [&](const CompileRange& r) { mix(r.mip); mix(r.mips); mix(r.slice); mix(r.slices); };
+    auto mixState = [&](const CompileResourceState& state) { mix(state.access); mix(state.layout); mix(state.sync); mix(state.write); };
+    auto mixUses = [&](const std::vector<CompileStateUse>& uses) {
+        mix(uses.size());
+        for (const auto& use : uses) {
+            mix(use.resource); mixRange(use.range); mixState(use.state);
+            mix(use.byteOffset); mix(use.byteSize); mix(use.aspects);
+        }
+    };
+    auto mixEdges = [&](const DependencyEdges& edges) {
+        mix(edges.size());
+        for (const auto [from, to] : edges) { mix(from); mix(to); }
+    };
+    mix(s.registryGeneration);
+    mix(s.resourceIDs.size());
+    for (const auto id : s.resourceIDs) mix(id);
+    mix(s.resourceKeys.size());
+    for (const auto& key : s.resourceKeys) mix(std::hash<std::string>{}(key));
+    mix(s.resourceShapes.size());
+    for (const auto& shape : s.resourceShapes) { mix(shape.mips); mix(shape.slices); mix(shape.hasLayout); mix(shape.commonLayoutOnly); }
+    mix(s.passes.size());
+    for (const auto& pass : s.passes) {
+        mix(pass.originalOrder); mix(pass.backend); mix(pass.preferredQueueSlot); mix(pass.preparedPassIndex);
+        mix(pass.forceBatchIsolation); mix(pass.recordAtExecution);
+        mix(pass.accesses.size());
+        for (const auto& access : pass.accesses) { mix(access.resourceIndex); mix(access.write); }
+        mix(pass.compatibleQueueSlots.size());
+        for (const auto slot : pass.compatibleQueueSlots) mix(slot);
+        mixUses(pass.entryStates);
+        mixUses(pass.exitStates);
+    }
+    mixEdges(s.explicitEdges);
+    mixEdges(s.placementEdges);
+    mix(s.queues.size());
+    for (const auto& queue : s.queues) { mix(queue.backendInstance); mix(queue.active); mix(queue.copyLayoutsCommon); }
+    return h;
+}
+bool SameCacheStructure(const GraphCompileStructure& a, const GraphCompileStructure& b) {
+    return a.registryGeneration == b.registryGeneration && a.resourceIDs == b.resourceIDs && a.resourceKeys == b.resourceKeys
+        && a.passes == b.passes && a.diagnosticPassNames == b.diagnosticPassNames
+        && a.diagnosticResourceNames == b.diagnosticResourceNames && a.explicitEdges == b.explicitEdges
+        && a.placementEdges == b.placementEdges && a.queues == b.queues && a.resourceShapes == b.resourceShapes;
+}
+bool SameAnalyzedDependencies(const std::shared_ptr<const DependencyEdges>& a, const std::shared_ptr<const DependencyEdges>& b) {
+    return a == b || (a && b && *a == *b);
+}
+}
+
+bool ScheduleCache::Cacheable(const GraphCompileInput& input) noexcept {
+    return input.leases.empty() && !input.executionPayload && !input.executionLifecycle
+        && !input.expectedEdges && !input.expectedSchedulingEdges;
+}
+
+std::optional<ScheduleCache::Hit> ScheduleCache::Find(const GraphCompileInput& input) {
+    BT_ZONE_SCOPE("ORG.Compile.ScheduleCacheFind");
+    const auto hash = HashCacheStructure(input.structure);
+    std::lock_guard lock(m_mutex);
+    for (auto& entry : m_entries) {
+        if (entry.hash != hash || !SameCacheStructure(entry.compiled.input->structure, input.structure)
+            || !SameAnalyzedDependencies(entry.compiled.input->analyzedDependencies, input.analyzedDependencies)) continue;
+        entry.lastUse = ++m_clock;
+        ++m_hits;
+        return entry.compiled;
+    }
+    ++m_misses;
+    return std::nullopt;
+}
+
+void ScheduleCache::Insert(std::shared_ptr<const GraphCompileInput> input, std::shared_ptr<const Schedule> schedule) {
+    if (!input || !schedule || !Cacheable(*input)) return;
+    const auto hash = HashCacheStructure(input->structure);
+    std::lock_guard lock(m_mutex);
+    for (const auto& entry : m_entries)
+        if (entry.hash == hash && SameCacheStructure(entry.compiled.input->structure, input->structure)
+            && SameAnalyzedDependencies(entry.compiled.input->analyzedDependencies, input->analyzedDependencies)) return;
+    if (m_capacity == 0) return;
+    if (m_entries.size() >= m_capacity)
+        m_entries.erase(std::ranges::min_element(m_entries, {}, &Entry::lastUse));
+    m_entries.push_back({hash, {std::move(input), std::move(schedule)}, ++m_clock});
+}
+
+void ScheduleCache::Clear() {
+    std::lock_guard lock(m_mutex);
+    m_entries.clear();
+}
+
+ScheduleCache::Stats ScheduleCache::GetStats() const {
+    std::lock_guard lock(m_mutex);
+    return {m_hits, m_misses, m_entries.size()};
+}
+
+std::shared_ptr<const Schedule> CompileGraphCached(
+    std::shared_ptr<const GraphCompileInput>& input,
+    CompileWorkspace& workspace,
+    const std::atomic_bool& cancelled) {
+    auto* cache = workspace.GetScheduleCache();
+    if (!cache || !input || !ScheduleCache::Cacheable(*input)) return CompileGraph(input, workspace, cancelled);
+    if (auto hit = cache->Find(*input)) {
+        basic_telemetry::AddCounter("ORG.Compile.ScheduleCacheHits");
+        input = std::move(hit->input);
+        return std::move(hit->schedule);
+    }
+    basic_telemetry::AddCounter("ORG.Compile.ScheduleCacheMisses");
+    auto graph = CompileGraph(input, workspace, cancelled);
+    if (graph) cache->Insert(input, graph);
     return graph;
 }
 

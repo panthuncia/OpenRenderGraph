@@ -52,8 +52,8 @@ std::shared_ptr<const void> DescriptorHeap::CaptureDescriptorLease(UINT index) {
         throw std::logic_error("Cannot capture an unallocated or retired descriptor slot");
     auto& slot = m_slots[index];
     if (auto existing = slot.lease.lock()) return existing;
-    // A distinct control block per slot; aliasing the heap's control block
-    // would make the lease live for the entire heap lifetime.
+    // Each slot gets its own control block. Aliasing the heap's control block
+    // would keep the lease alive for the whole lifetime of the heap.
     auto lease = std::make_shared<Lease>(shared_from_this(), index, ++slot.leaseGeneration);
     slot.lease = lease;
     return lease;

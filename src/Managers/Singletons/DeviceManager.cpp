@@ -144,7 +144,7 @@ void DeviceManager::Initialize(rhi::Device device) {
                 return token;
             }
 
-            // Never the world directly: it has one owner at a time (ECSManager).
+            // Never create the entity in the world directly. The world has one owner at a time (see ECSManager).
             return ECSManager::GetInstance().CreateTrackedToken(existing.id());
         };
     }

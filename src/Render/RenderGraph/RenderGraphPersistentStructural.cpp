@@ -242,13 +242,20 @@ void RenderGraph::SubmitPersistentStructuralBuild(const std::vector<uint32_t>& s
 			using T = std::decay_t<decltype(value)>;
 			if constexpr (!std::is_same_v<T, std::monostate>) {
 				auto lowered = lowering::LowerPass(*this, _registry, m_queueRegistry, primaryBackend, value, any.type);
-				if (LoweringAddsDeclarations(main, lowered)) inlineRequired = true;
+				const auto* dynamic = dynamic_cast<const IDynamicDeclaredResources*>(value.pass.get());
+				UseRebindSlots(*this, main, lowered, dynamic);
+				if (!(dynamic && dynamic->PreparesOnlyDeclaredWork()) && LoweringAddsDeclarations(main, lowered)) {
+					// Name the pass, so an app can find what makes it rebuild inline.
+					spdlog::info("Persistent structural build inline: pass '{}' declares resources the live executable lacks", main.name);
+					inlineRequired = true;
+				}
 				lowerings.emplace(mainIndex, std::move(lowered));
 			}
 		}, any.pass);
 	}
 	auto pending = std::make_shared<State::PendingStructural>();
 	pending->started = std::chrono::steady_clock::now();
+	pending->workspace.SetScheduleCache(m_runtime->Schedules());
 	pending->base = state.program.Select();
 	pending->baseSlotCount = pending->base->bindings.Size();
 	std::optional<persistent::GraphEditTransaction> inlineEdit;
@@ -256,6 +263,7 @@ void RenderGraph::SubmitPersistentStructuralBuild(const std::vector<uint32_t>& s
 	else pending->edit = std::make_unique<persistent::GraphEditTransaction>(pending->base);
 	persistent::GraphEditTransaction* const transactionPtr = inlineRequired ? &*inlineEdit : pending->edit.get();
 	auto& transaction = *transactionPtr;
+	ApplyDeferredSharing(state, transaction);
 	for (const auto groupIndex : growGroups) {
 		GrowGroup(state, transaction, groupIndex, state.groups[groupIndex].capacity + 1);
 		state.groups[groupIndex].identity = {}; // Re-syncs (binding-only) after the install.
@@ -390,26 +398,25 @@ void RenderGraph::DrainPersistentStructuralBuild(std::vector<uint32_t>& structur
 
 // Frame-interrupting per-frame passes (ExternalPassDesc::interruptsFrame, e.g.
 // mid-frame debug readbacks) must observe resources at their insert point, so
-// they cannot run in the Tail segment. Each frame that has them, or had them the
+// they run inside the main executable. Each frame that has them, or had them the
 // frame before, pays one inline structural build: the previous set is removed
 // and the new set is added at authored orders just after (or before) their
 // anchors. Hazards follow the authored order, so a capture after a pass reads
 // the state that pass left, and alias placement treats it as a user.
-std::vector<RenderGraph::ExternalPassDesc> RenderGraph::UpdatePersistentFrameInterruptingPasses(
+void RenderGraph::UpdatePersistentFrameInterruptingPasses(
 	std::vector<ExternalPassDesc> requested, rhi::Backend primaryBackend) {
 	auto& state = *m_compilerState->persistent;
-	std::vector<ExternalPassDesc> unhosted;
 	if (!state.deferredInterrupting.empty()) {
 		requested.insert(requested.begin(), std::make_move_iterator(state.deferredInterrupting.begin()),
 			std::make_move_iterator(state.deferredInterrupting.end()));
 		state.deferredInterrupting.clear();
 	}
-	if (requested.empty() && state.hostedMainPasses.empty()) return unhosted;
+	if (requested.empty() && state.hostedMainPasses.empty()) return;
 	if (state.pending) {
 		// The program cannot be edited inline under an in-flight structural
 		// build. Installed passes keep recording nothing; new ones wait.
 		state.deferredInterrupting = std::move(requested);
-		return unhosted;
+		return;
 	}
 	BT_ZONE_SCOPE("ORG.Persistent.FrameInterruptingPasses");
 	const auto started = std::chrono::steady_clock::now();
@@ -457,8 +464,7 @@ std::vector<RenderGraph::ExternalPassDesc> RenderGraph::UpdatePersistentFrameInt
 		if (after.empty() && before.empty()) {
 			static std::atomic<uint32_t> reported{0};
 			if (reported.fetch_add(1) < 8)
-				spdlog::warn("Frame-interrupting pass '{}' names no main pass to insert against; running it after the main executable", desc.name);
-			unhosted.push_back(std::move(desc));
+				spdlog::warn("Frame-interrupting pass '{}' names no main pass to insert against; dropped", desc.name);
 			continue;
 		}
 		// Latest 'after' anchor, else earliest 'before' anchor; consecutive
@@ -509,7 +515,6 @@ std::vector<RenderGraph::ExternalPassDesc> RenderGraph::UpdatePersistentFrameInt
 	}
 	spdlog::info("Persistent frame-interrupting passes: added={} removed={} build_ms={:.2f} [{}]", state.hostedMainPasses.size(), removed,
 		std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(), names);
-	return unhosted;
 }
 
 // Alias placement over the scheduled executable. Lifetimes are ranks in batch

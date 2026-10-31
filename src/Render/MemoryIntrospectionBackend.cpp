@@ -11,7 +11,7 @@ namespace org::memory {
 
 namespace {
 class ECSMemorySnapshotProvider final : public IMemorySnapshotProvider {
-    // Defined before the constructor that calls it: a deduced return type is only known after its definition.
+    // Defined before the constructor that calls it. A deduced return type is only known after its definition.
     template <class F>
     static decltype(auto) WithWorld(flecs::world* a_world, F&& a_use) {
         if (a_world)
@@ -20,8 +20,9 @@ class ECSMemorySnapshotProvider final : public IMemorySnapshotProvider {
     }
 
 public:
-    // a_world: a host's own world, which the host keeps from being changed while a snapshot reads it; null for ORG's
-    // tracking world, which has one owner at a time (ECSManager): the query is built, and read, only while owning it.
+    // a_world is a host's own world. The host keeps it from changing while a snapshot reads it.
+    // a_world is null for ORG's tracking world. ECSManager gives that world one owner at a time.
+    // The query is built and read only while holding that ownership.
     explicit ECSMemorySnapshotProvider(flecs::world* a_world)
         : m_hostWorld(a_world)
         , m_memoryQuery(WithWorld(a_world, [](flecs::world& world) {
@@ -84,11 +85,11 @@ public:
         else
             ECSManager::GetInstance().Access(read);
 
-		// Replacement resources and deferred-deletion backings retain the stable
-		// owner ResourceID, but metadata applied after materialization can exist on
-		// only the current backing. Inherit semantic ownership across all records
-		// for that owner so retired generations do not become "Unspecified" while
-		// they wait for their GPU fence.
+		// Replacement resources and deferred-deletion backings keep the stable
+		// owner ResourceID. Metadata applied after materialization may exist only
+		// on the current backing. So every record for that owner inherits its
+		// semantic ownership. This keeps retired generations from showing as
+		// "Unspecified" while they wait for their GPU fence.
 		struct OwnerMetadata {
 			std::string usage;
 			std::string name;
@@ -118,7 +119,7 @@ public:
     }
 
 private:
-    flecs::world* m_hostWorld;  // null: ORG's tracking world
+    flecs::world* m_hostWorld;  // null means ORG's tracking world
     flecs::query<const MemoryStatisticsComponents::MemSizeBytes> m_memoryQuery;
 };
 }

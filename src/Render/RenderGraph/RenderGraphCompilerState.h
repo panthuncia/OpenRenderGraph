@@ -24,7 +24,6 @@ struct RenderGraph::CompilerState {
     std::shared_ptr<const IHostExecutionData> lastSubmittedFrameData;
     // Owned by RenderGraphPersistent.cpp; shared_ptr keeps the type opaque here.
     std::shared_ptr<PersistentExecutionState> persistent;
-    std::vector<ExternalPassDesc> frameExtensions;
 };
 
 

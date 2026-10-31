@@ -186,8 +186,10 @@ int TestPageReuseAndCancel(Harness& h) {
     return 0;
 }
 
-// Signal entries (QueueSignal): a consumer submitted before the copies waits on the external timeline's value (wait before
-// signal) and reads every copy the producer queued ahead of it; a signal with nothing to copy goes out in a batch of its own.
+// Tests signal entries (QueueSignal). It checks that:
+// - a consumer submitted before the copies waits on the external timeline's value. The wait comes before the signal.
+// - the consumer reads every copy the producer queued ahead of the signal.
+// - a signal with nothing to copy goes out in a batch of its own.
 int TestSignalEntries(Harness& h) {
     constexpr uint64_t kBytes = 96 * 1024;
     auto destination = MakeDeviceBuffer(h.device.Get(), kBytes, "CopyQueueUploadSignalled");

@@ -27,8 +27,10 @@
 
 int TestFrameRetirement(rhi::Device device, rhi::Backend backend);
 int TestRuntimeRetirement(rhi::Device device);
+int TestExternalClient(rhi::Device device);
 int TestProgramVersions(rhi::Device device);
 int TestReadbackCaptures(rhi::Device device);
+int TestRebindingGpu(rhi::Device device, const std::shared_ptr<org::Runtime>& runtime);
 
 namespace {
 struct RecordingStatisticsProbe final : org::runtime::IStatisticsService {
@@ -274,8 +276,8 @@ int TestOwnedRenderFrameSnapshot() {
     org::compiler::CompileWorkspace workspace;
     auto ownedInput = std::make_shared<const org::compiler::GraphCompileInput>(input);
     auto graph = org::compiler::CompileGraph(ownedInput, workspace, cancelled);
-    auto bundle = std::make_shared<const org::compiler::CompiledGraphBundle>(
-        org::compiler::CompiledGraphBundle{1, graph, ownedInput});
+    auto bundle = std::make_shared<const org::compiler::ScheduleBundle>(
+        org::compiler::ScheduleBundle{1, graph, ownedInput});
     auto layout = org::compiler::BuildExecutionLayout(bundle, *ownedInput);
     auto bindings = std::make_shared<const org::FrozenExecutionBindings>(
         std::vector<org::FrozenExecutionBindings::ResourceBinding>{});
@@ -456,7 +458,7 @@ int TestPreparedGpuSubmission(rhi::Device device, ID3D12Device* nativeDevice) {
     });
     auto compiled = job.get();
     CHECK(compiled && compiled->states.complete && compiled->stateValidationError.empty());
-    auto bundle = std::make_shared<const CompiledGraphBundle>(CompiledGraphBundle{1,compiled,owned});
+    auto bundle = std::make_shared<const ScheduleBundle>(ScheduleBundle{1,compiled,owned});
     rhi::TimelinePtr timeline;
     CHECK(device.CreateTimeline(timeline, 0, "Experimental submission test") == rhi::Result::Ok);
     ExecutionTimelineAdmission admission({{1,0}});
@@ -1019,6 +1021,7 @@ int TestOwnedDescriptorGpuExecution(const rhi::DeviceCreateInfo& create) {
         initial[0].aliasHeap = backing->heapGeneration;
         initial[0].aliasHeapIdentity = backing->heapGeneration.get();
         initial[0].aliasSize = backing->aliasSize;
+        initial[0].aliasPoolID = 1;  // as an ORG alias pool places it
         initial[1].heapType = rhi::HeapType::Readback;
         // Exercise stable logical tokens through the production prepared-pass
         // executor, using real native resources and exact publication ownership.
@@ -1228,6 +1231,7 @@ int TestAliasHeapOwnership(const rhi::DeviceCreateInfo& create) {
             state->aliasHeap = generation;
             state->aliasHeapIdentity = generation.get();
             state->aliasSize = info.sizeInBytes;
+            state->aliasPoolID = 1;  // as an ORG alias pool places it
             BindingVersion binding;
             binding.identity = (uint64_t{handle.generation} << 32) | handle.index;
             binding.backingRevision = 1;
@@ -1241,6 +1245,7 @@ int TestAliasHeapOwnership(const rhi::DeviceCreateInfo& create) {
             snapshot->allocationOwner = binding.owner;
             snapshot->aliasHeap = generation;
             snapshot->aliasSize = info.sizeInBytes;
+            snapshot->aliasPoolID = 1;
             binding.recording = snapshot;
             const auto slot = edit.AddResource(binding.shape,std::move(binding));
             CompilePass pass;
@@ -1496,6 +1501,8 @@ int main(int argc, char** argv) {
     if (const auto failure = TestReadbackCaptures(device.Get())) return failure;
     if (const auto failure = TestFrameRetirement(device.Get(), rhi::Backend::D3D12)) return failure;
     if (const auto failure = TestRuntimeRetirement(device.Get())) return failure;
+    if (const auto failure = TestExternalClient(device.Get())) return failure;
+    if (const auto failure = TestRebindingGpu(device.Get(), orgRuntime)) return failure;
 	orgRuntime.reset();
 	return 0;
 }

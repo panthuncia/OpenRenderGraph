@@ -1,7 +1,9 @@
-// A contributor driven through the C table end to end (the "contributor" mode of PersistentVulkanHostTests): its compute
-// pass writes value + index into a buffer it owns, through a pipeline made by the pipeline service and an input value it
-// uploads while preparing; its copy pass copies the result into a host export the test reads back. Then it unregisters,
-// and its generation retires.
+// Drives a contributor through the C table from end to end. This is the "contributor" mode of
+// PersistentVulkanHostTests. The contributor has two passes:
+// - Its compute pass writes value + index into a buffer it owns. The pass uses a pipeline made by the pipeline service,
+//   and an input value the contributor uploads while preparing.
+// - Its copy pass copies the result into a host export that the test reads back.
+// Then the contributor unregisters, and its generation retires.
 
 #include <OpenRenderGraph/ContributorHost.h>
 #include "TestSupport.h"
@@ -22,7 +24,7 @@
 
 namespace {
 
-constexpr uint32_t kCount = 64;  // the host buffer PersistentVulkanHostTests imports
+constexpr uint32_t kCount = 64;  // The element count of the host buffer that PersistentVulkanHostTests imports.
 constexpr uint64_t kBytes = kCount * sizeof(uint32_t);
 
 struct TestContributor {
@@ -150,7 +152,7 @@ int TestContributors(rhi::Device device, const std::function<std::shared_ptr<org
 			.tasks = std::make_shared<org::runtime::ThreadPoolTaskService>(2)});
 		org::GraphHost host({.runtime = runtime,
 			.queueBoundary = {.entry = true, .exit = true}, .epochOrder = {0}});
-		// After the host: importing creates descriptors, which need the graph's runtime.
+		// Import only after creating the host. Importing creates descriptors, and those need the graph's runtime.
 		const auto output = importOutput();
 		REQUIRE(output, "import host buffer");
 		ORGExportDescriptor exported{};

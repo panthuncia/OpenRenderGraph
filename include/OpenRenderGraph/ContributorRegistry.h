@@ -60,7 +60,7 @@ public:
 		std::vector<std::string> after;
 		std::vector<std::string> before;
 		std::vector<Access> accesses;
-		std::string epoch;  // empty: every epoch
+		std::string epoch;  // empty means every epoch
 		ORGPrepareCallback prepare{};
 		ORGRevisionCallback invocationRevision{};
 		void* userData{};

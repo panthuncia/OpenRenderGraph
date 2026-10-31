@@ -1,5 +1,6 @@
-// Golden schedules: each replay fixture is compiled and its schedule (order, batches, waits, state steps) compared with a
-// checked-in text dump, so a compiler refactor that changes a schedule fails here and its diff reads in review.
+// Golden schedules. Each replay fixture is compiled, and its schedule is compared with a checked-in text dump. The
+// schedule covers order, batches, waits and state steps. A compiler refactor that changes a schedule fails here, and
+// the diff of the dump can be read in review.
 // ORG_UPDATE_GOLDEN=1 rewrites the dumps instead of comparing.
 #include "Render/RenderGraph/GraphReplay.h"
 #include <cstdio>

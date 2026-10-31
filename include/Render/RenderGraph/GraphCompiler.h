@@ -24,7 +24,7 @@ namespace org::compiler {
 // This extraction produces dependencies and a symbolic queue schedule. It is deliberately
 // not executable: realization, alias planning and ordered admission must be
 // extracted before a candidate can replace a live execution graph.
-enum class CompiledGraphStage : uint8_t { Dependencies, SymbolicSchedule };
+enum class ScheduleStage : uint8_t { Dependencies, SymbolicSchedule };
 
 // Numeric, owned metadata only. Unlike the legacy ResourceState comparison,
 // synchronization scopes are part of the fresh frame-owned compiler input.
@@ -187,8 +187,8 @@ struct SymbolicStatePlan {
     std::vector<SymbolicFinalState> finalStates;
 };
 
-struct CompiledGraph {
-    CompiledGraphStage stage = CompiledGraphStage::Dependencies;
+struct Schedule {
+    ScheduleStage stage = ScheduleStage::Dependencies;
     // Structural reuse must not pin the first content publication indefinitely.
     // Publication leases belong to bundles/execution instances, not this plan.
     std::shared_ptr<const GraphCompileStructure> structure;
@@ -234,17 +234,54 @@ struct CompiledGraph {
 void NormalizeCompileInput(GraphCompileInput&);
 // Independent schedule legality check, including same-queue order and actual
 // wait reachability. Does not require the live scheduler's exact batch choices.
-std::string ValidateSymbolicSchedule(const GraphCompileInput&, const CompiledGraph&);
-std::string ValidateSymbolicStates(const GraphCompileInput&, const CompiledGraph&);
+std::string ValidateSymbolicSchedule(const GraphCompileInput&, const Schedule&);
+std::string ValidateSymbolicStates(const GraphCompileInput&, const Schedule&);
+
+// A cache of compiled schedules, shared by every graph on a runtime (docs/job-graphs.md, Phase 3).
+// If a compile input matches an earlier one, the earlier schedule is reused instead of compiling again.
+// Two inputs match when their structures are equal (ignoring the generation number) and their analyzed
+// dependencies are equal.
+// Inputs with leases, an execution payload or expected edges are never cached.
+// When full, the least recently used entry is dropped. Safe to use from any thread.
+// A hit also returns the original input, because a schedule must stay paired with the exact input it was
+// compiled from (BuildPersistentExecutionLayout checks this).
+class ScheduleCache {
+public:
+    explicit ScheduleCache(size_t capacity = 64) : m_capacity(capacity) {}
+    static bool Cacheable(const GraphCompileInput& input) noexcept;
+    struct Hit {
+        std::shared_ptr<const GraphCompileInput> input;
+        std::shared_ptr<const Schedule> schedule;
+    };
+    std::optional<Hit> Find(const GraphCompileInput& input);
+    void Insert(std::shared_ptr<const GraphCompileInput> input, std::shared_ptr<const Schedule> schedule);
+    void Clear();
+    struct Stats { uint64_t hits = 0, misses = 0; size_t entries = 0; };
+    Stats GetStats() const;
+private:
+    struct Entry {
+        uint64_t hash = 0;
+        Hit compiled;
+        uint64_t lastUse = 0;
+    };
+    mutable std::mutex m_mutex;
+    std::vector<Entry> m_entries;
+    size_t m_capacity;
+    uint64_t m_clock = 0, m_hits = 0, m_misses = 0;
+};
 
 class CompileWorkspace {
 public:
     std::shared_ptr<const DependencyEdges> AnalyzeDependencies(
         const GraphCompileStructure&, const std::atomic_bool& cancelled,
         std::span<const uint32_t> accessOrder = {});
-    std::shared_ptr<const CompiledGraph> Compile(
+    std::shared_ptr<const Schedule> Compile(
         std::shared_ptr<const GraphCompileInput> input, const std::atomic_bool& cancelled);
+    // The schedule cache that CompileGraphCached checks before compiling. None by default.
+    void SetScheduleCache(std::shared_ptr<ScheduleCache> cache) noexcept { m_scheduleCache = std::move(cache); }
+    ScheduleCache* GetScheduleCache() const noexcept { return m_scheduleCache.get(); }
 private:
+    std::shared_ptr<ScheduleCache> m_scheduleCache;
     std::vector<compiler::DependencySequence<uint32_t>> m_resources;
     std::vector<std::vector<uint32_t>> m_successors;
     std::vector<uint32_t> m_indegrees;
@@ -253,14 +290,21 @@ private:
 
 // Single owned-input compiler entry point used by both workers and synchronous
 // validation tools. Keep alternate compiler routes out of call sites.
-std::shared_ptr<const CompiledGraph> CompileGraph(
+std::shared_ptr<const Schedule> CompileGraph(
     std::shared_ptr<const GraphCompileInput> input,
     CompileWorkspace& workspace,
     const std::atomic_bool& cancelled);
+// Like CompileGraph, but checks the workspace's schedule cache first, if it has one.
+// On a hit, `input` is replaced with the input the cached schedule was compiled from. It is equal to the
+// given input except for its generation number.
+std::shared_ptr<const Schedule> CompileGraphCached(
+    std::shared_ptr<const GraphCompileInput>& input,
+    CompileWorkspace& workspace,
+    const std::atomic_bool& cancelled);
 
-struct CompiledGraphBundle {
+struct ScheduleBundle {
     uint64_t sequence = 0;
-    std::shared_ptr<const CompiledGraph> graph;
+    std::shared_ptr<const Schedule> graph;
     // Exact input that produced this fresh graph; never substituted by a
     // structurally equivalent request.
     std::shared_ptr<const GraphCompileInput> input;
@@ -270,13 +314,13 @@ struct CompiledGraphBundle {
 // that produced it. No structural result is shared between frame requests.
 struct ExecutableCompiledFrame {
     uint64_t sequence = 0;
-    std::shared_ptr<const CompiledGraphBundle> bundle;
+    std::shared_ptr<const ScheduleBundle> bundle;
 };
 
 // Admission-side compatibility check. This is intentionally independent of
 // coordinator publication order: a completed candidate is selectable only for
 // the exact freshly prepared structure, with an unambiguous prepared-pass map.
-bool IsExecutionCompatible(const CompiledGraphBundle&, const GraphCompileInput&) noexcept;
+bool IsExecutionCompatible(const ScheduleBundle&, const GraphCompileInput&) noexcept;
 
 struct ExecutionPassPlacement {
     uint32_t preparedPass = 0;
@@ -285,12 +329,12 @@ struct ExecutionPassPlacement {
     bool operator==(const ExecutionPassPlacement&) const = default;
 };
 struct GraphExecutionLayout {
-    std::shared_ptr<const CompiledGraphBundle> bundle;
+    std::shared_ptr<const ScheduleBundle> bundle;
     // Indexed by prepared pass, so recording never consults compiler scratch.
     std::vector<ExecutionPassPlacement> placements;
 };
 std::shared_ptr<const GraphExecutionLayout> BuildExecutionLayout(
-    std::shared_ptr<const CompiledGraphBundle>, const GraphCompileInput& prepared);
+    std::shared_ptr<const ScheduleBundle>, const GraphCompileInput& prepared);
 
 
 // A point on a queue's (or a foreign) timeline, by admission identity.
@@ -317,7 +361,7 @@ class IPreparedExecutionBatch;
 // backing/ownership resolution. Workers never construct absolute fence values.
 struct GraphExecutionTimeline {
     uint64_t submission = 0;
-    std::shared_ptr<const CompiledGraphBundle> bundle;
+    std::shared_ptr<const ScheduleBundle> bundle;
     std::vector<ExecutionBatchTimeline> batches;
     std::vector<std::shared_ptr<const void>> executionLeases;
     // Kept separately from opaque leases so lifecycle completion can be
@@ -358,7 +402,7 @@ public:
     ExecutionTimelineAdmission(const ExecutionTimelineAdmission&) = delete;
     ExecutionTimelineAdmission& operator=(const ExecutionTimelineAdmission&) = delete;
     std::shared_ptr<const GraphExecutionTimeline> Prepare(
-        std::shared_ptr<const CompiledGraphBundle>,
+        std::shared_ptr<const ScheduleBundle>,
         const std::vector<std::vector<ExecutionTimelinePoint>>& incomingWaits,
         std::vector<std::shared_ptr<const void>> executionLeases = {},
         std::vector<std::shared_ptr<const IPreparedExecutionBatch>> preparedBatches = {},
@@ -366,7 +410,7 @@ public:
     // leading: per batch, lists submitted ahead of its own (ExecutionBatchTimeline::leading); empty for none. leases: kept with the
     // execution until it retires (the leading lists' allocations).
     std::shared_ptr<const GraphExecutionTimeline> SubmitPrepared(
-        std::shared_ptr<const CompiledGraphBundle>,
+        std::shared_ptr<const ScheduleBundle>,
         const std::vector<std::vector<ExecutionTimelinePoint>>& incomingWaits,
         const std::vector<std::shared_ptr<const IPreparedExecutionBatch>>& packets,
         std::span<const ExecutionTimelinePoint> reservedSignals = {},
@@ -382,7 +426,7 @@ public:
     // are assigned at submission, in submission order, and recorded here by the ordered owner in the same
     // order). Values above the reserved ones may skip - timelines only need to rise.
     std::shared_ptr<const GraphExecutionTimeline> RecordSubmitted(
-        std::shared_ptr<const CompiledGraphBundle>,
+        std::shared_ptr<const ScheduleBundle>,
         const std::vector<std::vector<ExecutionTimelinePoint>>& incomingWaits,
         const std::vector<std::shared_ptr<const IPreparedExecutionBatch>>& packets,
         std::span<const ExecutionTimelinePoint> signals);

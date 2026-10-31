@@ -37,7 +37,7 @@ std::string ScheduleTraceEpochLabel(uint32_t epoch) { return "epoch " + std::to_
 // values' timeline among them for a synchronous execution), and what a ticket adds at submission (SubmitPersistentTicket): the
 // uploads ahead of it, on every other queue (or, planned by queue, on the batches that use what they write, with the uploads
 // recorded on a batch's own queue noted on it), and the frame values. Zero values are no wait (submission drops them).
-void FillScheduleSubmissionWaits(ScheduleSubmissionWaits& out, const compiler::CompiledGraph& graph,
+void FillScheduleSubmissionWaits(ScheduleSubmissionWaits& out, const compiler::Schedule& graph,
 	const std::vector<std::vector<compiler::ExecutionTimelinePoint>>& incoming, std::pair<uint32_t, uint64_t> uploadsDone, uint64_t frameWait,
 	const RenderGraph::PersistentTicket::QueueUploads* queueUploads) {
 	using Source = ScheduleSubmissionWaits::Point::Source;
@@ -108,7 +108,7 @@ void RenderGraph::WritePersistentGraphDebugDump(const persistent::SelectedPublic
 			<< " alias_plans=" << state.aliasPlans << "\n"
 			<< "passes=" << structure.passes.size() << " batches=" << graph.batches.size() << " resources=" << structure.resourceIDs.size()
 			<< " explicit_edges=" << structure.explicitEdges.size() << " placement_edges=" << structure.placementEdges.size()
-			<< " pre_passes=" << state.preMasterIndices.size() << " tail_passes=" << state.tailMasterIndices.size()
+			<< " upload_passes=" << state.uploadMasterIndices.size()
 			<< " hosted_frame_interrupting=" << state.hostedMainPasses.size() << "\n\n[Batches]\n";
 		for (uint32_t batchIndex = 0; batchIndex < graph.batches.size(); ++batchIndex) {
 			const auto& batch = graph.batches[batchIndex];
@@ -258,7 +258,7 @@ void RenderGraph::RefreshPersistentScheduleTraces(const persistent::SelectedPubl
 	PublishPersistentScheduleSnapshot();
 }
 
-void RenderGraph::RecordPersistentScheduleSubmission(const persistent::ExecutableGeneration& executable, const char* segmentLabel, uint64_t frame) {
+void RenderGraph::RecordPersistentScheduleSubmission(const persistent::ExecutableGeneration& executable, uint64_t frame) {
 	auto& state = *m_compilerState->persistent;
 	auto& traces = state.scheduleTraces;
 	auto traceOf = [&]() -> const ScheduleTrace* {
@@ -266,17 +266,15 @@ void RenderGraph::RecordPersistentScheduleSubmission(const persistent::Executabl
 			if (key == &executable) return value.get();
 		return nullptr;
 	};
-	const std::string_view segment = segmentLabel;
-	const bool dynamic = segment == "Pre" || segment == "Tail";
 	const auto* trace = traceOf();
-	if (!trace && !dynamic) {
+	if (!trace) {
 		// Selected since this graph last prepared a frame (a ticket prepared from a revision's recording).
 		RefreshPersistentScheduleTraces(*state.program.Select());
 		trace = traceOf();
 	}
 	// An executable no longer selected (an older revision's recording) matches no trace: not recorded.
-	if (!trace && !dynamic) return;
-	const std::string_view label = trace ? std::string_view(trace->label) : segment == "Pre" ? std::string_view("pre") : std::string_view("tail");
+	if (!trace) return;
+	const std::string_view label = trace->label;
 	size_t index = 0;
 	while (index < traces.submissions.size() && traces.submissions[index].label != label) ++index;
 	if (index == traces.submissions.size()) {
@@ -295,7 +293,7 @@ void RenderGraph::RecordPersistentScheduleSubmission(const persistent::Executabl
 void RenderGraph::RecordPersistentTicketScheduleSubmissions(const PersistentTicket& ticket) {
 	auto& state = *m_compilerState->persistent;
 	const size_t slotCount = m_queueRegistry.SlotCount();
-	// The boundary barriers ExecutePersistentFrame records a ticket's segments with (a ticket has no Pre/Tail segments, so they are
+	// The boundary barriers ExecutePersistentFrame records a ticket's segments with (a ticket has only its main segments, so they are
 	// its execution's only ones; a kept or revision recording was recorded as a ticket's too): the host's queue boundary at each
 	// queue's first and last batch across them, and a closed execution's full barrier at each queue's first batch of a segment.
 	using Position = std::pair<size_t, uint32_t>;
@@ -333,7 +331,7 @@ void RenderGraph::RecordPersistentTicketScheduleSubmissions(const PersistentTick
 			waits.batches[batch].externalEntryBarrier = entry;
 			waits.batches[batch].externalExitBarrier = m_externalQueueBoundary.exit && last[slot] == position;
 		}
-		RecordPersistentScheduleSubmission(executable, "Main", ticket.hostFrame);
+		RecordPersistentScheduleSubmission(executable, ticket.hostFrame);
 	}
 }
 

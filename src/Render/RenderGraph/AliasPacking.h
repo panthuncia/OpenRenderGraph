@@ -1,6 +1,6 @@
 #pragma once
-// Packing one alias pool: byte offsets for resources whose lifetimes (inclusive pass ranges) may share memory when they
-// do not overlap. Pure; the persistent alias planner calls it per pool.
+// Packs one alias pool. It assigns byte offsets so that resources whose lifetimes do not overlap can share memory.
+// A lifetime is an inclusive range of passes. The packing is pure. The persistent alias planner calls it once per pool.
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -19,10 +19,11 @@ struct PackingResult {
 	bool truncated = false; // The search was cut short; the result is the best found, not proven minimal.
 };
 
-// Sweep in item order (callers sort by first use), placing each item in the smallest free range that fits.
+// Sweeps the items in order. Callers sort them by first use. Each item goes in the smallest free range that fits it.
 PackingResult PackGreedySweepLine(std::span<const PackingItem> items);
 
-// Beam search over placements (heaviest size x lifetime first), seeded and bounded by the greedy result: never larger.
+// Beam search over placements, heaviest items first by size times lifetime. The greedy result seeds and bounds the
+// search, so the result is never larger than the greedy one.
 PackingResult PackBeamSearch(std::span<const PackingItem> items);
 
 } // namespace org::alias

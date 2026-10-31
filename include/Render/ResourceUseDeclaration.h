@@ -68,11 +68,11 @@ struct ResourceUseLayout {
     struct ResolverViews { std::shared_ptr<const void> identity; std::vector<BindlessViewRequest> views; };
     std::vector<ResolverViews> resolverViews;
     std::vector<ResourceUseDeclaration> uses;
-    // Shader-visible views declared by resource name (builder.ShaderResource(Builtin::X) and friends): what a
-    // pipeline's ResourceDescriptorIndex(Builtin::X) slots are filled from at record time. A name declared both
-    // ways resolves to its unordered-access view. A name whose resolver had no member when the pass declared it
-    // names its resolver group instead (resolverViews[resolverGroup]): each frame resolves `request` on the
-    // group's first bound member.
+    // Shader-visible views declared by resource name, with builder.ShaderResource(Builtin::X) and similar calls.
+    // At record time, a pipeline's ResourceDescriptorIndex(Builtin::X) slots are filled from these. A name declared
+    // both ways resolves to its unordered-access view. A name's resolver may have had no member when the pass declared
+    // it. Such a name refers to its resolver group instead (resolverViews[resolverGroup]). Each frame then resolves
+    // `request` on the group's first bound member.
     struct NamedView {
         size_t nameHash = 0;
         uint32_t use = UINT32_MAX, view = UINT32_MAX;
@@ -81,7 +81,7 @@ struct ResourceUseLayout {
         BindlessViewRequest request{};
     };
     std::vector<NamedView> namedViews;
-    // Hashes of the feature domains (FeatureDomainRegistry) the declarations named a resource of.
+    // Hashes of the feature domains (FeatureDomainRegistry) that the declarations named a resource from.
     std::vector<size_t> activeFeatureDomains;
     const NamedView* FindNamedView(size_t nameHash) const noexcept {
         for (const auto& named : namedViews) if (named.nameHash == nameHash) return &named;
@@ -100,6 +100,38 @@ struct ResourceUseLayout {
         return flat + view;
     }
 };
+
+// True when two layouts declare the same uses, views, names and feature domains. With `resources` false, the
+// resources the uses name may differ: the second layout swapped resources for others, use for use.
+inline bool SameLayoutContent(const ResourceUseLayout& a, const ResourceUseLayout& b, bool resources) {
+    const auto sameViews = [](const std::vector<BindlessViewRequest>& x, const std::vector<BindlessViewRequest>& y) {
+        if (x.size() != y.size()) return false;
+        for (size_t i = 0; i < x.size(); ++i) if (!SameView(x[i], y[i])) return false;
+        return true;
+    };
+    if (a.uses.size() != b.uses.size() || a.resolverViews.size() != b.resolverViews.size()
+        || a.namedViews.size() != b.namedViews.size() || a.activeFeatureDomains != b.activeFeatureDomains) return false;
+    for (size_t i = 0; i < a.uses.size(); ++i) {
+        const auto& x = a.uses[i];
+        const auto& y = b.uses[i];
+        if (!(x.resource.range == y.resource.range) || !(x.state == y.state) || x.state.sync != y.state.sync
+            || x.resolverIdentity != y.resolverIdentity || !sameViews(x.requiredViews, y.requiredViews)) return false;
+        if (resources && (!(x.resource.resource == y.resource.resource)
+            || x.binding.globalResourceID != y.binding.globalResourceID
+            || x.binding.registryResourceID != y.binding.registryResourceID)) return false;
+    }
+    for (size_t i = 0; i < a.resolverViews.size(); ++i)
+        if (a.resolverViews[i].identity != b.resolverViews[i].identity
+            || !sameViews(a.resolverViews[i].views, b.resolverViews[i].views)) return false;
+    for (size_t i = 0; i < a.namedViews.size(); ++i) {
+        const auto& x = a.namedViews[i];
+        const auto& y = b.namedViews[i];
+        if (x.nameHash != y.nameHash || x.use != y.use || x.view != y.view || x.kind != y.kind
+            || x.resolverGroup != y.resolverGroup || !SameView(x.request, y.request)) return false;
+    }
+    return true;
+}
+
 struct DeclaredViewToken {
     std::shared_ptr<const ResourceUseLayout> layout;
     uint32_t use = UINT32_MAX, view = UINT32_MAX;

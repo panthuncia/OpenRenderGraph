@@ -24,11 +24,11 @@ GpuBufferBacking::GpuBufferBacking(
     if (aliasPlacement && !aliasPlacement->heap) throw std::invalid_argument("Missing alias heap owner");
 
     rhi::ResourceDesc desc = rhi::helpers::ResourceDesc::Buffer(bufferSize);
-    // Buffers are routinely touched from more than one queue (frame uploads,
-    // copy-queue streaming, readbacks) and carry no compression metadata that
-    // concurrent sharing could cost, so every graph buffer is concurrent: no
-    // Vulkan queue-family ownership transfers are needed for buffers, and D3D12
-    // ignores the flag.
+    // Buffers are often used from more than one queue, for example by frame
+    // uploads, copy-queue streaming and readbacks. They carry no compression
+    // metadata that concurrent sharing could cost. So every graph buffer is
+    // concurrent, and buffers need no Vulkan queue-family ownership transfers.
+    // D3D12 ignores the flag.
     desc.queueSharing = rhi::QueueSharing::Concurrent;
     if (unorderedAccess) {
         desc.resourceFlags |= rhi::ResourceFlags::RF_AllowUnorderedAccess;

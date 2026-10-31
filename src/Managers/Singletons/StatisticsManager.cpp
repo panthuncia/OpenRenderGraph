@@ -293,7 +293,7 @@ void StatisticsManager::SetupQueryHeap() {
         }
     }
 
-    // Timestamp heap: 2 queries/pass/frame. The pass timings need nothing else.
+    // The timestamp heap holds 2 queries per pass per frame. The pass timings need nothing else.
     rhi::QueryPoolDesc tq;
     tq.type = rhi::QueryType::Timestamp;
     tq.count = m_queryPoolPassCapacity * 2 * m_numFramesInFlight;
@@ -304,9 +304,9 @@ void StatisticsManager::SetupQueryHeap() {
         return;
     }
 
-    // Mesh-shader pipeline statistics are optional. A device without mesh-shader queries (or an adopted
-    // device that did not enable them) fails this pool, and until now the null pool was dereferenced right
-    // after; the timestamps must not go down with it.
+    // Mesh-shader pipeline statistics are optional. Creating this pool fails on a device without mesh-shader
+    // queries, or on an adopted device that did not enable them. Older code dereferenced the null pool right
+    // after that. A failure here must not turn off the timestamps too.
     if (m_collectPipelineStatistics) {
         rhi::QueryPoolDesc sq;
         sq.type = rhi::QueryType::PipelineStatistics;
@@ -548,7 +548,7 @@ void StatisticsManager::ResolveQueries(
 {
     if (!m_collectPassStatistics) return;
     if (ctx.owned) {
-        // Every range the list recorded, into the recording's own buffer: each submission resolves them again.
+        // Resolve every range the list recorded into the recording's own buffer. Each submission resolves them again.
         auto& owned = *ctx.owned;
         EndOwnedRange(owned, cmd);
         if (!owned.resolved && !owned.entries.empty())
@@ -625,8 +625,9 @@ void StatisticsManager::MergePendingResolves(
     QueryRecordingContext& ctx)
 {
     if (ctx.owned) {
-        // A submission of a kept recording: its slot's completion reads what this one wrote. Never cleared from the
-        // context; a slot's pending list is bounded in case a build stopped its completion from coming.
+        // This is a submission of a kept recording. The completion of its frame slot reads what this submission
+        // wrote. The recording is never cleared from the context. Each slot's pending list has a size limit, in case
+        // a build stopped the slot's completion from ever arriving.
         if (ctx.owned->resolved && !ctx.owned->entries.empty()) {
             auto& pending = m_pendingOwned[frameIndex];
             if (std::ranges::find(pending, ctx.owned) == pending.end() && pending.size() < 256)
@@ -648,7 +649,8 @@ void StatisticsManager::OnFrameComplete(
     unsigned frameIndex,
     rhi::Queue& queue)
 {
-    // The slot's recordings made after their submission (late batches) merge their queries before the slot's are read.
+    // Some of the slot's recordings were made after their submission, for late batches. They merge their queries
+    // first, before the slot's queries are read.
     if (const auto found = m_publishAtCompletion.find(frameIndex); found != m_publishAtCompletion.end()) {
         auto publications = std::move(found->second);
         m_publishAtCompletion.erase(found);
@@ -819,13 +821,14 @@ std::shared_ptr<OwnedTimestampQueries> StatisticsManager::CreateOwnedTimestamps(
 
 bool StatisticsManager::BeginOwnedRange(OwnedTimestampQueries& owned, std::string_view name, int passIndex,
     org::runtime::TimestampRangeKind kind, rhi::CommandList& cmd) {
-    // Ranges nest (a pass's sub-ranges inside it); a pass or barrier range opens only at the top level.
+    // Ranges nest. A pass's sub-ranges sit inside the pass range. A pass range or barrier range opens only at the
+    // top level.
     if (owned.resolved || (kind != org::runtime::TimestampRangeKind::Sub && !owned.open.empty())) return false;
     if (owned.entries.size() >= owned.capacity) {
         ++owned.overflow;
         return false;
     }
-    // The list's first range resets them all: one reset per submission, outside any render pass.
+    // The list's first range resets all the queries. That gives one reset per submission, outside any render pass.
     if (owned.entries.empty()) cmd.ResetQueries(owned.pool->GetHandle(), 0, owned.capacity * 2u);
     uint32_t occurrence = 0;
     for (const auto& entry : owned.entries) occurrence += entry.name == name;
@@ -838,11 +841,15 @@ bool StatisticsManager::BeginOwnedRange(OwnedTimestampQueries& owned, std::strin
 
 void StatisticsManager::EndOwnedRange(OwnedTimestampQueries& owned, rhi::CommandList& cmd) {
     if (owned.open.empty()) return;
-    // A pass's or barrier batch's end waits for its work. NVIDIA's Blackwell driver stamps a timestamp (bottom-of-pipe or
-    // all-commands) before a preceding generated-commands execution (ExecuteIndirect) has run, and an execution-only or
-    // writes-only barrier does not wait for it either; one whose second scope reads indirect arguments does. Without it that work's
-    // time lands in a later range. The wait costs each range ~4 us and the epoch its overlap between passes: only kept recordings'
-    // own queries (a trace's recording timestamps). A sub-range may be inside a render pass, which a barrier would end.
+    // The end of a pass range or barrier-batch range waits for that work to finish. The reasons:
+    // - NVIDIA's Blackwell driver writes a bottom-of-pipe or all-commands timestamp before a preceding
+    //   generated-commands execution (ExecuteIndirect) has run.
+    // - An execution-only or writes-only barrier does not wait for that execution either.
+    // - A barrier whose second scope reads indirect arguments does wait for it.
+    // Without this barrier, the time of that work lands in a later range.
+    // The wait costs about 4 us per range, and the epoch loses its overlap between passes. So only the own queries of
+    // kept recordings use it. Those are a trace's recording timestamps.
+    // Sub-ranges get no barrier. A sub-range may be inside a render pass, and a barrier would end that render pass.
     if (owned.entries[static_cast<size_t>(owned.open.back())].kind != org::runtime::TimestampRangeKind::Sub) {
         const rhi::GlobalBarrier wait{ rhi::ResourceSyncState::All, rhi::ResourceSyncState::All, rhi::FullMemoryBarrier().beforeAccess,
             rhi::ResourceAccessType::IndirectArgument };
@@ -938,8 +945,8 @@ void StatisticsManager::ClearAll() {
 namespace org::runtime {
 
 OwnedTimestampQueries::~OwnedTimestampQueries() {
-    // A recording is released once its submissions are complete; the deferred deletion keeps the destruction off the thread that
-    // drops it, as for the shared pool.
+    // A recording is released once its submissions are complete. Deferred deletion keeps the destruction off the thread
+    // that drops the recording. The shared pool is handled the same way.
     auto& deletion = org::DeletionManager::GetInstance();
     if (pool) deletion.MarkForDelete(std::move(pool));
     if (readback) deletion.MarkForDelete(std::move(readback));

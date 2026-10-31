@@ -14,11 +14,13 @@ struct SubmittedPoint {
 	uint64_t value = 0;
 };
 
-// Every queue's progress at one moment. Anything released then (no longer reachable by work recorded later) is safe to
-// destroy once each point is reached: whatever GPU work could still use it was submitted before.
+// Every queue's progress at one moment. Something released at that moment is no longer reachable by work recorded
+// later. It is safe to destroy once each point is reached, because any GPU work that could still use it was
+// submitted before.
 using SubmissionFrontier = std::vector<SubmittedPoint>;
 
-// Whether the GPU reached a point: the runtime's (Runtime::Reached), which also knows the points of queues it no longer has.
+// Whether the GPU reached a point. It uses the runtime's check (Runtime::Reached), which also knows the points of
+// queues the runtime no longer has.
 using PointReached = std::function<bool(const SubmittedPoint&)>;
 
 inline bool TimelineReached(SubmittedPoint point) noexcept {

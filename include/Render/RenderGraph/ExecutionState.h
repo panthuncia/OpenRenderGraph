@@ -49,7 +49,7 @@ struct PreparedBatchBarriers {
         std::vector<rhi::TextureBarrier> textures;
         std::vector<rhi::BufferBarrier> buffers;
     };
-    // Indexed in the same order as CompiledGraph::batches[i].passes.
+    // Indexed in the same order as Schedule::batches[i].passes.
     std::vector<BeforePass> beforePass;
     std::vector<BeforePass> afterPass;
     // Batch-entry barriers: the handoff from the state an earlier execution left each backing in (the ledger's) to its first use
@@ -92,7 +92,7 @@ public:
     // executions provide their own memory visibility (a full barrier at entry, see FrameAdmission::closed),
     // so buffers need no exit barrier. Every resource must be used from a single queue.
     PreparedExecutionBarrierPlan Prepare(
-        const CompiledGraph& graph, std::span<const PreparedBackingState> initial,
+        const Schedule& graph, std::span<const PreparedBackingState> initial,
         std::span<const rhi::ResourceHandle> invalidated = {}, bool closeToHome = false) const;
     void CommitBatch(const PreparedBatchBarriers&);
     void Invalidate(std::span<const rhi::ResourceHandle> resources);
@@ -113,7 +113,7 @@ private:
 // unrelated resources/ranges and queues remain independent.
 class BackingAccessAdmissionLedger {
 public:
-    void AppendIncomingWaits(const CompiledGraph& graph,
+    void AppendIncomingWaits(const Schedule& graph,
         std::span<const PreparedBackingState> resources,
         std::span<const ExecutionTimelinePoint> queues,
         std::vector<std::vector<ExecutionTimelinePoint>>& incoming) const;
@@ -123,11 +123,11 @@ public:
     // resource), every earlier access the ledger holds - its writer and all its readers, on every queue, the consumer's own
     // included: what a write into the resource on any queue ahead of the execution must wait for (RenderGraph's queue-scoped
     // ticket uploads), where AppendIncomingWaits gives a read only the writer, and nothing on its own queue. out: one list per batch.
-    void AppendBoundaryAccessWaits(const CompiledGraph& graph,
+    void AppendBoundaryAccessWaits(const Schedule& graph,
         std::span<const PreparedBackingState> resources,
         std::span<const uint8_t> selected,
         ResourceWaits& out) const;
-    void Commit(const CompiledGraph& graph,
+    void Commit(const Schedule& graph,
         std::span<const PreparedBackingState> resources,
         const GraphExecutionTimeline& execution, uint32_t batchCount = UINT32_MAX);
     void Reset() { m_accesses.clear(); }
@@ -160,13 +160,13 @@ private:
 class AliasAccessAdmissionLedger {
 public:
     std::vector<rhi::ResourceHandle> ApplyInitialStates(
-        const CompiledGraph& graph,
+        const Schedule& graph,
         std::span<const PreparedBackingState> resources) const;
-    void AppendIncomingWaits(const CompiledGraph& graph,
+    void AppendIncomingWaits(const Schedule& graph,
         std::span<const PreparedBackingState> resources,
         std::span<const ExecutionTimelinePoint> queues,
         std::vector<std::vector<ExecutionTimelinePoint>>& incoming) const;
-    void Commit(const CompiledGraph& graph,
+    void Commit(const Schedule& graph,
         std::span<const PreparedBackingState> resources,
         const GraphExecutionTimeline& execution, uint32_t batchCount = UINT32_MAX);
     void Reset() { m_heaps.clear(); m_heapOwners.clear(); }

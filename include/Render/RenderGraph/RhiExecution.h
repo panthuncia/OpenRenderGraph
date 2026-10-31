@@ -395,9 +395,9 @@ struct OwnedRecordingList;
 
 class PreparedRhiExecutionBatch final : public IPreparedExecutionBatch {
 public:
-    // replayable: every pass is (PreparedPass::IsReplayable) and the lists were recorded for resubmission. Such a packet has
-    // no submission effects; each submission (after the previous one completed) submits the same lists, and its lists go
-    // back to their pool when its last owner lets it go, not at a completion.
+    // replayable: every pass is replayable (PreparedPass::IsReplayable), and the lists were recorded for resubmission.
+    // Such a packet has no submission effects. Each submission, after the previous one completed, submits the same lists.
+    // Its lists go back to their pool when its last owner releases it, not at a completion.
     PreparedRhiExecutionBatch(uint32_t queueSlot, rhi::Queue queue, std::vector<rhi::CommandList> lists,
         std::vector<PreparedTimelineBinding> timelines, std::shared_ptr<const void> lease,
         std::vector<PreparedPass> submissionEffects = {}, std::function<void()> retireCommandLists = {}, bool replayable = false)
@@ -416,12 +416,13 @@ public:
                     throw std::invalid_argument("Duplicate timeline identity");
         }
     }
-    // A late batch of an external epoch (its pass recorded at execution, CompilePass::recordAtExecution): no lists, its recording
-    // kept for RecordDeferred, which the host's execution calls once, into the host's list. Never submitted by the graph.
+    // Makes a late batch of an external epoch, whose pass is recorded at execution (CompilePass::recordAtExecution).
+    // It has no lists. Its recording is kept for RecordDeferred, which the host's execution calls once, into the host's
+    // list. The graph never submits it.
     PreparedRhiExecutionBatch(uint32_t queueSlot, rhi::Queue queue, OwnedRecordingList deferred,
         std::vector<PreparedTimelineBinding> timelines, std::shared_ptr<const void> lease);
     ~PreparedRhiExecutionBatch() override { Abandon(); }
-    // Its lists, for a host that executes them (an external epoch's secondaries); none for a deferred batch.
+    // Its lists, for a host that executes them, such as an external epoch's secondaries. A deferred batch has none.
     std::span<rhi::CommandList> Lists() const noexcept { return {m_lists.data(), m_lists.size()}; }
     bool Deferred() const noexcept { return static_cast<bool>(m_deferred); }
     // The timeline an identity binds (a null handle: none).
@@ -429,10 +430,12 @@ public:
         for (const auto& item : m_timelines) if (item.identity == identity) return item.handle;
         return {};
     }
-    // An external epoch's: the host executes the packet in its own submission, which waits for and signals what the batch would
-    // have (ExternalEpochExecution). Consumes the packet as Submit does, commits its passes as submitted with a_signal (a deferred
-    // batch's once RecordDeferred recorded them), and adds their external signals to a_signals. False when consumed, or when a
-    // pass's external signal is invalid.
+    // For an external epoch. The host executes the packet in its own submission (ExternalEpochExecution). That submission
+    // waits for and signals what the batch would have. This call:
+    // - consumes the packet, as Submit does,
+    // - commits its passes as submitted with a_signal. For a deferred batch, this happens once RecordDeferred records them.
+    // - adds the passes' external signals to a_signals.
+    // Returns false when the packet was already consumed, or when a pass's external signal is invalid.
     bool CommitExternal(uint64_t a_signal, std::vector<rhi::TimelinePoint>& a_signals) const noexcept {
         if (!m_replayable && m_consumed.exchange(true)) return false;
         for (const auto& pass : m_submissionEffects)
@@ -449,17 +452,19 @@ public:
         }
         return CommitEffectsSubmitted(a_signal);
     }
-    // A deferred batch's recording into the host's list (outside any pass), on the host's thread; once.
+    // Records a deferred batch into the host's list, outside any pass. Call it once, on the host's thread.
     void RecordDeferred(rhi::CommandList a_list) const;
     uint32_t QueueSlot() const noexcept override { return m_queueSlot; }
     bool Replayable() const noexcept override { return m_replayable; }
-    // Whether a timeline identity resolves through this packet's bindings (a wait SubmitLeading may take).
+    // Whether a timeline identity resolves through this packet's bindings. Only such an identity can be a wait for
+    // SubmitLeading.
     bool BindsTimeline(uint64_t identity) const noexcept {
         return std::any_of(m_timelines.begin(), m_timelines.end(), [&](const auto& item) { return item.identity == identity; });
     }
-    // Submits `lists` on this packet's queue ahead of it, waiting for `waits` (identities it binds) and signalling nothing: work a
-    // host orders before the batch on its queue (RenderGraph's queue-scoped ticket uploads). The batch's own Submit follows it, in
-    // queue order; the batch's signal then covers it too. Consumes nothing: the packet is submitted as usual afterwards.
+    // Submits `lists` on this packet's queue, ahead of the packet. It waits for `waits`, which must be identities the
+    // packet binds, and signals nothing. This is for work a host orders before the batch on its queue, such as
+    // RenderGraph's queue-scoped ticket uploads. The batch's own Submit follows in queue order, so the batch's signal
+    // covers this work too. It consumes nothing. The packet is submitted as usual afterwards.
     SubmissionReceipt SubmitLeading(std::span<rhi::CommandList> lists, std::span<const ExecutionTimelinePoint> waits) const noexcept {
         if (lists.empty()) return {SubmissionState::Signaled};
         std::vector<rhi::TimelinePoint> points;
@@ -479,7 +484,8 @@ public:
     SubmissionReceipt Submit(const ExecutionBatchTimeline& batch) const noexcept override {
         // A deferred batch has no lists: only its host's execution records it.
         if (m_deferred) return {SubmissionState::NotSubmitted, SubmissionFailureStage::Validation};
-        // Single-consumption even after failure: uploads/readbacks cannot replay. A replayable packet has neither.
+        // The packet is consumed once, even after a failure, because uploads and readbacks cannot replay.
+        // A replayable packet has neither.
         if (!m_replayable && m_consumed.exchange(true)) return {SubmissionState::NotSubmitted, SubmissionFailureStage::Replay};
         auto find = [&](uint64_t identity) -> const PreparedTimelineBinding* {
             for (const auto& item : m_timelines) if (item.identity == identity) return &item;
@@ -495,10 +501,10 @@ public:
             AbandonEffects();
             return {SubmissionState::NotSubmitted, SubmissionFailureStage::Validation};
         }
-        // One queue submission: the waits, the lists, the passes' external signals and the batch's own
-        // signal. The external signals are fixed at preparation, so they can travel with the lists; a host
-        // that orders submissions in its own stream (DXVK) then takes one entry per batch instead of one
-        // per wait and per signal.
+        // One queue submission holds the waits, the lists, the passes' external signals and the batch's
+        // own signal. The external signals are fixed at preparation, so they can travel with the lists.
+        // A host that orders submissions in its own stream (DXVK) then takes one entry per batch, instead
+        // of one per wait and one per signal.
         std::vector<rhi::TimelinePoint> waits;
         waits.reserve(batch.waits.size());
         for (auto wait : batch.waits) waits.push_back({find(wait.timeline)->handle, wait.value});
@@ -536,8 +542,9 @@ public:
         return {SubmissionState::Signaled};
     }
     void Complete(uint64_t submission) const noexcept override {
-        if (m_replayable) return;  // the lists are submitted again: they go when the last owner lets the packet go
-        // A deferred batch its host never recorded (its execution signalled unexecuted): its passes did nothing.
+        if (m_replayable) return;  // the lists are reused. They are released when the last owner releases the packet.
+        // A deferred batch that its host never recorded, because its execution was signalled unexecuted.
+        // Its passes did nothing.
         if (m_deferred && !m_deferredRecorded.load(std::memory_order_acquire)) {
             AbandonEffects();
             return;
@@ -588,7 +595,7 @@ private:
     bool m_replayable = false;
     std::shared_ptr<OwnedRecordingList> m_deferred;
     mutable std::atomic_bool m_deferredRecorded{false};
-    mutable uint64_t m_deferredSignal = 0;  // CommitExternal's, which RecordDeferred commits its passes with
+    mutable uint64_t m_deferredSignal = 0;  // set by CommitExternal. RecordDeferred commits its passes with it.
 };
 
 // One owned recording packet. The binding table transitively owns descriptor
@@ -614,10 +621,11 @@ struct FrameCommandAllocation {
 };
 
 // Framework service state for one recording job. Workers produce query ranges
-// and CPU samples locally; the submission owner publishes them after success.
-// A late batch's (an external epoch's pass recorded at execution, atCompletion) is recorded after that: its publication is left to
-// its frame slot's completion (IStatisticsService::PublishAtCompletion), when the execution that records it has run on the GPU, and
-// is dropped when it did not record it (an execution signalled unexecuted).
+// and CPU samples locally. The submission owner publishes them after success.
+// A late batch is different. It belongs to an external epoch's pass that is recorded at execution (atCompletion), so
+// it is recorded after the submission. Its publication is left to its frame slot's completion
+// (IStatisticsService::PublishAtCompletion), once the execution that records it has run on the GPU. The publication
+// is dropped when the execution did not record it, because the execution was signalled unexecuted.
 struct OwnedRecordingStatistics : std::enable_shared_from_this<OwnedRecordingStatistics> {
     std::shared_ptr<runtime::IStatisticsService> service;
     unsigned frameIndex = 0;
@@ -653,8 +661,8 @@ struct OwnedRecordingGpuRanges {
     const char* queueName = "Graphics";
 };
 
-// A range name for the barriers recorded around a pass ("cs.org.barrier.<where>.<pass>"), interned for the process: the
-// pass ranges cover only a pass's own commands, so a profiler sees a list's barrier batches only through these.
+// A range name for the barriers recorded around a pass ("cs.org.barrier.<where>.<pass>"), interned for the process.
+// The pass ranges cover only a pass's own commands. So a profiler sees a list's barrier batches only through these.
 inline const char* OwnedRecordingBarrierRangeName(std::string_view where, std::string_view pass) {
     static std::mutex mutex;
     static std::set<std::string, std::less<>> names;
@@ -701,12 +709,14 @@ struct OwnedRecordingList {
     // pass / after the last pass of this command list.
     bool externalEntryBarrier = false;
     bool externalExitBarrier = false;
-    // An external epoch's (RenderGraph::SetExternalPersistentEpochs): recorded into a secondary list (its pool's), or at execution
-    // into the host's list (a late batch), never submitted by the graph; no Tracy GPU zones (their queue-scoped state).
+    // Set for an external epoch (RenderGraph::SetExternalPersistentEpochs). The list is recorded into a secondary list
+    // from its pool, or at execution into the host's list (a late batch). The graph never submits it. It has no Tracy
+    // GPU zones, because their state is queue-scoped.
     bool external = false;
-    // Record for resubmission (PreparedRhiExecutionBatch's replayable packets), when every pass of the packet is replayable:
-    // with no profiler GPU zones or ranges, whose queries a resubmission would write again. Nothing a list records may name a
-    // resource its recording does not own: its statistics queries, if any, are its own (QueryRecordingContext::owned).
+    // Record for resubmission, when every pass of the packet is replayable (PreparedRhiExecutionBatch's replayable
+    // packets). The list then has no profiler GPU zones or ranges, because a resubmission would write their queries
+    // again. Nothing a list records may name a resource its recording does not own. Its statistics queries, if any, are
+    // its own (QueryRecordingContext::owned).
     bool replayable = false;
 };
 
@@ -715,15 +725,17 @@ struct OwnedRecordingList {
 // Diagnostic switches for timing runs: they leave out parts of every recording, unsafe for ordinary rendering.
 namespace org::diagnostics {
 
-// Diagnostics: recordings made while set skip the list-start descriptor heap bind of lists holding only latched copies (which read
-// no descriptor). For timing the bind's cost only.
+// Diagnostics. While set, recordings skip the descriptor heap bind at the start of a list that holds only latched
+// copies. Those copies read no descriptor. Use it only to time the cost of the bind.
 inline std::atomic<bool>& DiagnosticSkipListHeapBinds() {
     static std::atomic<bool> skip{false};
     return skip;
 }
 
-// Diagnostics: recordings made while set leave out their full external entry and exit barriers, the closed execution's included (1), or
-// every barrier batch (2). Unsafe: timing runs whose lists access nothing only.
+// Diagnostics. While set, recordings leave out:
+// - 1: their full external entry and exit barriers, including the closed execution's,
+// - 2: every barrier batch.
+// Unsafe. Use it only for timing runs whose lists access nothing.
 inline std::atomic<int>& DiagnosticSkipListBarriers() {
     static std::atomic<int> skip{0};
     return skip;
@@ -778,10 +790,15 @@ inline RecordingContext MakeOwnedRecordingContext(rhi::CommandList list, const O
     return context;
 }
 
-// One owned recording's commands into the context's list: its heaps, its entry, per-pass and exit barriers, its passes and its
-// queries' resolve. Not the list's begin or end: RecordPreparedRhiExecutionBatch's for its own lists; a late batch of an external
-// epoch records into the host's list (PreparedRhiExecutionBatch::RecordDeferred), which the host ends.
-// a_again: a replayable recording's passes recorded again (PreparedPass::RecordAgain), a late batch of a kept recording.
+// Records one owned recording's commands into the context's list:
+// - its heaps,
+// - its entry, per-pass and exit barriers,
+// - its passes,
+// - the resolve of its queries.
+// It does not begin or end the list. RecordPreparedRhiExecutionBatch does that for its own lists. A late batch of an
+// external epoch records into the host's list (PreparedRhiExecutionBatch::RecordDeferred), and the host ends it.
+// a_again records a replayable recording's passes again (PreparedPass::RecordAgain). This is for a late batch of a
+// kept recording.
 inline void RecordOwnedRecordingCommands(RecordingContext& context, const OwnedRecordingList& recording, rhi::Queue queue, bool replayable,
     bool a_again = false) {
     struct TracyGpuZoneScope {
@@ -889,8 +906,9 @@ inline void RecordOwnedRecordingCommands(RecordingContext& context, const OwnedR
                 queue, context.Commands(), statistics->queries);
         const auto cpuStart = statisticsIndex >= 0 ? std::chrono::steady_clock::now()
             : std::chrono::steady_clock::time_point{};
-        // A replayable list carries its ranges too (the callbacks push one only while a capture is armed): a host that
-        // keeps lists across frames records them again when a capture arms and when it ends, so none outlives its session.
+        // A replayable list carries its ranges too. The callbacks push a range only while a capture is armed. A host
+        // that keeps lists across frames records them again when a capture arms and when it ends. So no range outlives
+        // its session.
         const auto* ranges = recording.gpuPassRanges.get();
         if (ranges) ranges->begin(context.Commands(), queue, ranges->queueName, debugName.empty() ? "<unnamed>" : debugName.data());
         {
@@ -939,7 +957,8 @@ inline PreparedRhiExecutionBatch::PreparedRhiExecutionBatch(uint32_t queueSlot, 
       m_deferred(std::make_shared<OwnedRecordingList>(std::move(deferred))) {
     if (!m_queue || !m_lease || m_deferred->passes.empty())
         throw std::invalid_argument("Incomplete deferred RHI packet");
-    // A kept recording's late batch (its passes replayable): recorded by every execution that takes the recording, no effects to commit.
+    // A kept recording's late batch, whose passes are replayable. Every execution that takes the recording records it.
+    // There are no effects to commit.
     m_replayable = m_deferred->replayable
         && std::all_of(m_deferred->passes.begin(), m_deferred->passes.end(), [](const PreparedPass& pass) { return pass.IsReplayable(); });
     if (!m_replayable) m_submissionEffects = m_deferred->passes;
@@ -949,7 +968,8 @@ inline void PreparedRhiExecutionBatch::RecordDeferred(rhi::CommandList a_list) c
     if (!m_deferred) throw std::logic_error("Not a deferred packet");
     const bool again = m_deferredRecorded.exchange(true);
     if (again && !m_replayable) throw std::logic_error("A deferred packet is recorded once, unless it is replayable");
-    // A kept recording's own queries start over in each list that records it (the last execution's were read at its completion).
+    // A kept recording's own queries start over in each list that records it. The last execution's queries were read
+    // at its completion.
     if (auto* statistics = m_deferred->statistics.get(); again && statistics && statistics->queries.owned) {
         auto& owned = *statistics->queries.owned;
         owned.entries.clear();
@@ -959,7 +979,7 @@ inline void PreparedRhiExecutionBatch::RecordDeferred(rhi::CommandList a_list) c
     }
     auto context = MakeOwnedRecordingContext(a_list, *m_deferred);
     RecordOwnedRecordingCommands(context, *m_deferred, m_queue, false, again);
-    // Its queries are in a_list now: its frame slot's completion publishes them (OwnedRecordingStatistics::atCompletion).
+    // Its queries are in a_list now. Its frame slot's completion publishes them (OwnedRecordingStatistics::atCompletion).
     if (m_deferred->statistics) m_deferred->statistics->recorded.store(true, std::memory_order_release);
     if (!m_replayable && !CommitEffectsSubmitted(m_deferredSignal)) throw std::logic_error("A deferred packet's passes could not be committed as submitted");
 }
@@ -1025,7 +1045,8 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
     for (const auto& recording : ownership->recordings) {
         BT_ZONE_SCOPE("ORG.Execution.RecordOwned.List");
         auto list = recording.allocation->pair.list.Get();
-        // A secondary pool's list (an external epoch's) is handed out recycled, not begun: begun here, for work outside any pass.
+        // A list from a secondary pool (an external epoch's) is handed out recycled but not begun. Begin it here, for
+        // work outside any pass.
         if (recording.allocation->pool && recording.allocation->pool->Secondary()) {
             rhi::SecondaryInheritance outside{};
             outside.insideRendering = false;

@@ -1,7 +1,8 @@
 #pragma once
 
-// The pipeline service's device table (basicrhi_c_device_api_v1 over rhi::Device): pipelines and command signatures for
-// contributors. Destruction is deferred until the GPU can no longer use them.
+// The device table of the pipeline service. It implements basicrhi_c_device_api_v1 on top of rhi::Device.
+// Contributors use it to create pipelines and command signatures. Their destruction is deferred until the GPU can no
+// longer use them.
 
 #include <rhi.h>
 #include <rhi_c.h>

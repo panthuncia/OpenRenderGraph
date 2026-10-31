@@ -35,8 +35,8 @@ struct MemoryBudgetStats {
     uint64_t budgetBytes = 0;
     uint64_t sampleFrameSerial = 0;
     bool valid = false;
-    // ORG's allocator, device-local (local) and host (nonLocal) segments: memory in its blocks, and the part of it
-    // that allocations use. Block bytes past allocation bytes are its slack.
+    // ORG's allocator, split into device-local (local) and host (nonLocal) segments. For each segment: the memory in its
+    // blocks, and the part of that memory that allocations use. Block bytes beyond allocation bytes are its slack.
     uint64_t localBlockBytes = 0;
     uint64_t localAllocationBytes = 0;
     uint32_t localBlockCount = 0;
@@ -53,9 +53,9 @@ struct OwnedTimestampQueries;
 struct QueryRecordingContext {
     std::vector<uint32_t> recordedIndices;
     std::vector<std::pair<uint32_t, uint32_t>> pendingRanges;
-    // A recording kept for resubmission: its own queries (IStatisticsService::CreateOwnedTimestamps) instead of the
-    // frame-indexed shared ones, which the service recreates as passes register. Kept across merges, so every
-    // submission of the recording publishes them again.
+    // For a recording kept for resubmission: its own queries (IStatisticsService::CreateOwnedTimestamps). They replace
+    // the frame-indexed shared queries, which the service recreates as passes register. They are kept across merges,
+    // so every submission of the recording publishes them again.
     std::shared_ptr<OwnedTimestampQueries> owned;
 };
 

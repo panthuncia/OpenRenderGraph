@@ -121,10 +121,11 @@ PublicationBindingBundle::Snapshot PublicationBindingBundle::Capture(Resource& r
     }
     auto result = std::make_shared<ResourceBindingSnapshot>();
     result->resourceID = resource.GetGlobalResourceID();
+    result->externallyImmutable = resource.GetGraphOwnership() == Resource::GraphOwnership::ExternalImmutableShaderResource;
     resource.TryGetRHIResourceDesc(result->description);
     if (auto primary = resource.AcquireAPIRepresentation(BackendInstanceId::Primary); primary && primary->resource) {
-        // Explicit representations (multi-device) replace the backing: the primary's is the resource, and the owner keeps every
-        // device's alive.
+        // Explicit per-device representations (multi-device) replace the backing. The primary device's representation is the
+        // resource. The owner keeps every device's representation alive.
         auto owned = std::make_shared<std::vector<Resource::APIRepresentationPtr>>();
         for (const auto instance : resource.GetRepresentationInstances()) {
             auto representation = resource.AcquireAPIRepresentation(instance);

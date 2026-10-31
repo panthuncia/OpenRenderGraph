@@ -1,4 +1,4 @@
-// volk (through BasicRHI's Vulkan interop) must precede every Vulkan header in this translation unit.
+// volk must come before every Vulkan header in this translation unit. It is included through BasicRHI's Vulkan interop.
 #include <rhi_interop_vulkan.h>
 #if BASICRHI_ENABLE_D3D12
 #include <rhi_interop_dx12.h>
@@ -226,7 +226,8 @@ struct Backend {
         return image;
     }
 
-    // A metrics evaluator for the chip, or (with a counter data image) for the device that produced the image.
+    // Creates a metrics evaluator for the chip. When a counter data image is given, the evaluator is for the device
+    // that produced the image instead.
     NVPW_MetricsEvaluator* CreateEvaluator(std::vector<uint8_t>& scratch, const char* chipName, const std::vector<uint8_t>* image) const
     {
         if (api == rhi::Backend::Vulkan) {
@@ -624,8 +625,9 @@ struct QueueCapture {
     QueueTarget target;
     std::vector<uint8_t> counterDataImage;
     std::vector<uint8_t> counterDataScratch;
-    // The session's pending GPU operations (the queue waits on them between passes), serviced until EndSession returns
-    // it: nothing the host's threads wait on may service them, since those waits are what they block.
+    // Services the session's pending GPU operations until EndSession returns this thread. The queue waits on these
+    // operations between passes. No thread that the host waits on may service them, because the operations are
+    // what block those waits.
     std::thread service;
     bool sessionActive = false;
     bool passActive = false;
@@ -658,12 +660,12 @@ struct Profiler {
     std::vector<uint8_t> counterDataPrefix;
     size_t configPassCount = 0;
     size_t traceBufferSize = 0;
-    size_t maxRangesPerPass = 2048;  // the D3D11 backend's; a frame with barrier ranges (cs.org.barrier.*) passes 512
+    size_t maxRangesPerPass = 2048;  // The D3D11 backend's value. A frame with barrier ranges (cs.org.barrier.*) passes 512.
     size_t traceBufferCount = 8;
     uint32_t syncTimeoutMs = 10000;
     uint64_t framesWithoutRange = 0;
     uint64_t rangesPushed = 0;
-    uint64_t rangesSinceArm = 0;  // RangesRecordedSinceArm: every range pushed since ArmCapture
+    uint64_t rangesSinceArm = 0;  // Every range pushed since ArmCapture. RangesRecordedSinceArm reports it.
     uint64_t droppedRanges = 0;
     uint64_t droppedTraceBytes = 0;
     std::string error;
@@ -688,8 +690,8 @@ bool InitializeLibrary()
     if (initialized)
         return available;
     initialized = true;
-    // A delay-loading host must have loaded the library by path first (LoadLibraryFrom): an unresolved delay-loaded
-    // import would raise rather than fail.
+    // A host that delay-loads the library must first load it by path, with LoadLibraryFrom. An unresolved
+    // delay-loaded import would raise an exception instead of failing.
     if (!g_library && !::GetModuleHandleW(L"nvperf_grfx_host.dll") && !::LoadLibraryW(L"nvperf_grfx_host.dll")) {
         spdlog::warn("NVPerf: nvperf_grfx_host.dll is not available");
         return false;
@@ -734,8 +736,8 @@ void DestroyRawConfig(NVPW_RawCounterConfig* config)
     (void)NVPW_RawCounterConfig_Destroy(&destroy);
 }
 
-// The metrics the chip has, the raw counters behind them, and the configuration and counter data prefix that collect
-// them.
+// Finds the metrics the chip has and the raw counters behind them. Then builds the configuration and the counter data
+// prefix that collect those counters.
 bool BuildConfig(Profiler& profiler, const std::vector<uint8_t>& availability)
 {
     profiler.metrics.clear();
@@ -901,7 +903,7 @@ bool BuildConfig(Profiler& profiler, const std::vector<uint8_t>& availability)
     return true;
 }
 
-// The first time an armed capture reaches a queue: the chip, the configuration. Queue calls.
+// Runs the first time an armed capture reaches a queue. Sets up the chip and the configuration. Makes queue calls.
 bool Prepare(Profiler& profiler, const QueueTarget& target, uint64_t frameNumber)
 {
     if (!profiler.armed || profiler.failed || profiler.finished)
@@ -961,7 +963,8 @@ QueueCapture& CaptureOf(Profiler& profiler, const QueueTarget& target)
     return capture;
 }
 
-// Ends the queue's session, its open pass first, and retires the service thread EndSession releases. Queue calls.
+// Ends the queue's session. Any open pass ends first. Then retires the service thread that EndSession releases.
+// Makes queue calls.
 bool CloseSession(Profiler& profiler, QueueCapture& capture)
 {
     if (capture.passActive) {
@@ -981,13 +984,13 @@ bool CloseSession(Profiler& profiler, QueueCapture& capture)
         if (ended)
             capture.service.join();
         else
-            capture.service.detach();  // it holds only copies; it returns when the profiler lets go of the queue
+            capture.service.detach();  // It holds only copies. It returns when the profiler lets go of the queue.
     }
     return ended;
 }
 
-// Every finished or failed capture closed its sessions; a thread still running here belongs to a session the host
-// abandoned, and it holds only copies.
+// Every finished or failed capture has closed its sessions. A thread still running here belongs to a session the host
+// abandoned. It holds only copies, so it is safe to detach.
 void ForgetQueues(Profiler& profiler)
 {
     for (auto& [queue, capture] : profiler.queues)
@@ -996,7 +999,8 @@ void ForgetQueues(Profiler& profiler)
     profiler.queues.clear();
 }
 
-// A failure mid-capture: the session must still end, or the queue keeps waiting on operations no one services.
+// Handles a failure in the middle of a capture. The session must still end. Otherwise the queue keeps waiting on
+// operations that no one services.
 void Fail(Profiler& profiler, QueueCapture& capture, const char* error)
 {
     profiler.failed = true;
@@ -1004,7 +1008,7 @@ void Fail(Profiler& profiler, QueueCapture& capture, const char* error)
     (void)CloseSession(profiler, capture);
 }
 
-// The session, then the pass, on the queue. Queue calls.
+// Begins the session on the queue if needed, then the pass. Makes queue calls.
 bool EnsurePass(Profiler& profiler, QueueCapture& capture)
 {
     if (capture.allPassesSubmitted || capture.decoded)
@@ -1450,8 +1454,8 @@ void EndFrameCapture(const QueueTarget& queue, uint64_t frameNumber)
         return;
     auto& capture = found->second;
     if (capture.passActive) {
-        // Ranges recorded since arming count: a host's kept command buffers (recorded once with their ranges) execute in
-        // later frames' passes without pushing anything on the CPU.
+        // Ranges recorded since arming also count. A host's kept command buffers are recorded once, with their ranges.
+        // They then execute in the passes of later frames without pushing anything on the CPU.
         if (!profiler.rangesPushed && !profiler.rangesSinceArm && ++profiler.framesWithoutRange >= 8) {
             Fail(profiler, capture, "no selected NVPerf range was recorded within 8 frames");
             return;
@@ -1520,9 +1524,10 @@ bool PushRange(const QueueTarget& queue, void* commandBuffer, const char* queueN
     const char* name = rangeName && rangeName[0] ? rangeName : "<unnamed>";
     if (resolvedQueue != profiler.controllerQueueName || !Selected(profiler, resolvedQueue, name))
         return false;
-    // Inline: the range begins the frame's pass. Boundaries: the range records whenever a capture is armed, since
-    // its command buffer may be recorded frames ahead of the pass it executes in (a host's prepared epochs); one
-    // executed outside a pass is not counted.
+    // How the range records depends on the queue control mode:
+    // - Inline: the range begins the frame's pass.
+    // - Boundaries: the range records whenever a capture is armed. Its command buffer may be recorded frames ahead of
+    //   the pass it executes in, as with a host's prepared epochs. A range that executes outside a pass is not counted.
     if (profiler.queueControl == QueueControl::Inline && (!profiler.initialized || !EnsurePass(profiler, CaptureOf(profiler, queue))))
         return false;
     if (Backend{ queue.backend }.PushRange(commandBuffer, name)) {

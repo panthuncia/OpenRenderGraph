@@ -78,8 +78,8 @@ public:
 		uint64_t incompleteTimelineCount = 0;
 		std::vector<uint64_t> resourceIDs;
 	};
-	// The frontier every release waits for (the runtime's), with the points PublishQueueFenceSnapshot adds (work submitted
-	// outside the runtime's queues). Called under the descriptor mutation lock.
+	// Installs the runtime's frontier, which every release waits for. PublishQueueFenceSnapshot adds more points for work
+	// submitted outside the runtime's queues. The frontier is called under the descriptor mutation lock.
 	void SetFrontier(std::function<runtime::SubmissionFrontier()> frontier, runtime::PointReached reached);
 	void PublishQueueFenceSnapshot(std::vector<QueueFenceSnapshotPoint> fenceSnapshot);
 	std::vector<QueueFenceSnapshotPoint> GetQueueFenceSnapshot() const;
@@ -97,8 +97,9 @@ public:
 	rhi::DescriptorHeap GetNonShaderVisibleDescriptorHeap(BackendInstanceId backendInstance = BackendInstanceId::Primary) const;
 	rhi::DescriptorSlot ResolveDescriptorSlot(BackendInstanceId backendInstance, rhi::DescriptorHeapType type,
 		bool shaderVisible, uint32_t logicalIndex) const;
-	// A primary heap's slot as the same logical slot in another backend instance's heap of that kind (descriptor indices are
-	// shared across devices). Unchanged for the primary, or a slot of no primary heap.
+	// Translates a slot in a primary heap to the same logical slot in another backend instance's heap of the same kind.
+	// This works because descriptor indices are shared across devices. Returns the slot unchanged for the primary
+	// instance, or when the slot is in no primary heap.
 	rhi::DescriptorSlot TranslateDescriptorSlot(rhi::DescriptorSlot slot, BackendInstanceId backendInstance) const;
 	UINT CreateIndexedSampler(const rhi::SamplerDesc& samplerDesc);
 	rhi::DescriptorSlot AllocateDescriptorSlot(rhi::DescriptorHeapType type, bool shaderVisible);

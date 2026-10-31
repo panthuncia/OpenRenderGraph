@@ -1,11 +1,9 @@
 #pragma once
 
-// Persistent execution mode: the main graph runs from a selected persistent
-// publication that is rebuilt only by explicit structural edits. Truly dynamic
-// passes (immediate-mode uploads, per-frame readbacks) run in Pre/Tail segments
-// built per frame from tiny throwaway programs. All segments are admitted in
-// order through one SynchronousAdmission, so cross-segment hazards are ordinary
-// previous-submission waits and barriers.
+// Persistent execution mode: the graph runs from a selected persistent publication. It is rebuilt only by
+// structural edits. Upload passes (immediate-mode commands) and per-frame readbacks are not part of it: they are
+// submitted through the graph's external client, before and after the main execution. The client and the graph
+// share the runtime's resource ledgers, so the GPU work stays ordered.
 //
 // Every pass's declaration is lowered (PersistentLowering.h) when it is installed
 // and again when it redeclares; it is prepared through PrepareFrame every frame.
@@ -26,6 +24,7 @@
 #include "ScheduleTraceBuild.h"
 #include "Render/RenderGraph/RhiExecution.h"
 #include "Render/RenderGraph/ExternalEpochExecution.h"
+#include "OpenRenderGraph/ExternalClient.h"
 #include "Render/RenderGraph/PersistentGraph.h"
 #include "Render/Runtime/ScopedActiveGraphServices.h"
 #include "Interfaces/IDynamicDeclaredResources.h"
@@ -203,6 +202,7 @@ struct RenderGraph::PersistentRecording {
 // An epoch's main execution, prepared and recorded ahead of its submission (RenderGraph::PreparePersistentTicket).
 struct RenderGraph::PersistentTicket {
 	uint32_t epoch = 0;
+	std::shared_ptr<detail::ExecutionRecord> execution;  // made by its preparation
 	uint8_t slot = 0;
 	uint64_t hostFrame = 0;
 	struct Segment {
@@ -328,12 +328,18 @@ struct RenderGraph::PersistentExecutionState {
         struct GroupViews { uint32_t group; std::vector<BindlessViewRequest> views; };
         std::vector<GroupViews> groupViews;
 		uint64_t fingerprint = 0; // Structural identity of the lowered declaration (membership excluded).
+		uint64_t structuralFingerprint = 0; // The same without the declared layout's uses (FingerprintLowering).
+		std::array<uint64_t, 5> structuralParts{}; // Its parts (FingerprintParts), to log which one a relower changed.
+		std::string declarationSummary; // DescribeDeclaration of the installed lowering, for the relower log.
 		std::vector<std::pair<uint64_t, std::string>> loweredDirect; // Diagnostic: (scheduling ID, name).
 		std::vector<const void*> loweredGroupKeys;
 		std::vector<ExternalTimelinePoint> explicitWaits;
 		// Resolvers lowered as direct declarations, with the resource set they were lowered with: their slots hold those
 		// resources until the pass is lowered again, so every preparation checks that it resolves the same set.
 		std::vector<std::pair<std::shared_ptr<const IResourceResolver>, ResolverResourceSetIdentity>> directResolvers;
+		// RebindsConcreteResources: the wrappers its pointer declarations go through, one per distinct resource in
+		// declaration order (UseRebindSlots). Each is the pass's own slot; its backing is the resource declared there last.
+		std::vector<std::shared_ptr<DynamicResource>> rebindSlots;
 		// Frame-interrupting per-frame pass hosted in the main executable (not in
 		// the master list). It is prepared once and records nothing afterwards
 		// until its removal is installed.
@@ -354,53 +360,6 @@ struct RenderGraph::PersistentExecutionState {
 		std::vector<std::shared_ptr<const void>> leases;
 	};
 
-	// A dynamic segment whose lowered structure and bound backings match the
-	// previous frame's reuses that publication: no binding capture, no build.
-	struct SegmentCache {
-		std::vector<uint64_t> key;
-		std::shared_ptr<const persistent::SelectedPublication> publication;
-		std::shared_ptr<const FrozenExecutionBindings> legacyBindings;
-		std::vector<persistent::PassId> ids;
-	};
-	SegmentCache preCache, tailCache;
-	// Persistent program for a dynamic segment: the passes are lowered once per
-	// structure; each frame's resource set is bound into reserved-capacity
-	// groups (one per pass and access template) by diff. A frame whose set and
-	// backings repeat does no edit and no build. Capacity overflow and
-	// structure changes rebuild the program (rare); postconditions, swapchain
-	// images and a backing wanted by two pools fall back to a fresh build.
-	struct SegmentProgram {
-		struct Template {
-			CompileResourceShape shape; CompileRange range; CompileResourceState state;
-			bool operator==(const Template&) const = default;
-		};
-		struct Pool {
-			uint32_t pass = 0;
-			uint64_t templateHash = 0;
-			Template request;
-			persistent::ResourceGroupId group;
-			uint32_t capacity = 0;
-			std::vector<persistent::ResourceSlotId> slots;    // member slots (positions)
-			std::vector<uint64_t> physical;                   // wanted physical identity per position, 0 = none
-			std::vector<Resource*> resources;
-			std::vector<RotationKey> bound;
-			std::vector<uint8_t> isBound;                     // position holds a binding (kept until refilled or unbound)
-			std::unordered_map<uint64_t, uint32_t> positionByPhysical;
-			std::vector<uint32_t> free, vacated;
-			std::vector<uint8_t> wanted;                      // per-frame scratch
-		};
-		struct Pass { persistent::PassId id; std::vector<uint32_t> pools; };
-		std::vector<uint64_t> key;                            // structure: pass names, declarations, templates
-		persistent::GraphProgram program;
-		std::vector<Pool> pools;
-		std::vector<Pass> passes;
-		std::vector<FrozenExecutionBindings::ResourceBinding> table; // per slot
-		std::shared_ptr<const persistent::SelectedPublication> publication;
-		std::shared_ptr<const FrozenExecutionBindings> legacyBindings;
-		uint64_t frames = 0;
-	};
-	std::vector<std::unique_ptr<SegmentProgram>> prePrograms, tailPrograms;
-
 	persistent::GraphProgram program;
 	std::unique_ptr<persistent::SynchronousAdmission> admission;
 	std::unique_ptr<compiler::ExecutionTimelineAdmission> timelines;
@@ -408,20 +367,33 @@ struct RenderGraph::PersistentExecutionState {
 	std::unordered_map<uint64_t, std::vector<uint32_t>> entriesByResourceID;
 	std::vector<MainPass> mainPasses;
 	std::vector<ResolverGroup> groups;
-	std::vector<size_t> preMasterIndices, tailMasterIndices;
+	std::vector<size_t> uploadMasterIndices;                        // Passes with immediate-mode commands.
 	std::vector<uint32_t> mainPassByMaster;                        // UINT32_MAX when not main.
 	std::vector<uint8_t> masterHostedInMain;
 	// Per-publication legacy binding table cache.
 	const persistent::SelectedPublication* bindingsFor = nullptr;
 	std::shared_ptr<const FrozenExecutionBindings> bindings;
 	// Frame in preparation.
-	std::optional<PreparedSegment> pre, main, tail;
+	std::optional<PreparedSegment> main;
+	// Uploads recorded by the upload passes this frame. ExecutePersistentFrame submits them through the graph's external
+	// client (RenderGraph::GetExternalClient) before the main execution.
+	struct PendingUpload {
+		std::string name;
+		std::vector<ExternalClient::Access> accesses;
+		std::vector<std::byte> bytecode;
+		std::shared_ptr<const void> keepAlive;
+		std::function<void()> commit;  // called once the upload is submitted
+		std::vector<ExternalTimelinePoint> signals;  // signalled when the upload finishes
+	};
+	std::vector<PendingUpload> uploads;
 	// A frame was prepared; main may still be empty (an epoch with no main passes).
 	bool framePrepared = false;
-	std::vector<AnyPassAndResources> frameExtensionPasses;
 	std::vector<uint32_t> hostedMainPasses;             // Main indices of installed frame-interrupting passes.
 	std::vector<ExternalPassDesc> deferredInterrupting; // Requested while a structural build was pending.
 	uint64_t frameNumber = 0;
+	// The latest execution (its index is frameNumber), and the submitted ones not yet seen complete.
+	std::shared_ptr<detail::ExecutionRecord> lastExecution;
+	std::vector<std::shared_ptr<detail::ExecutionRecord>> pendingExecutions;
 	uint8_t frameIndex = 0;
 	std::shared_ptr<const IHostExecutionData> frameData;
 	// Alias planning (structural builds only).
@@ -484,6 +456,10 @@ struct RenderGraph::PersistentExecutionState {
 	// Submitted this frame.
 	uint64_t pendingPresentSubmission = 0;
 	uint64_t structuralBuilds = 0, bindingBuilds = 0;
+	// Bindings taken out of frames' edits because they change which slots share a backing (SharingChangePolicy::
+	// Deferred), by slot index. The next structural build applies them. A newer edit of the slot drops its entry.
+	std::unordered_map<uint32_t, persistent::BindingVersion> deferredSharing;
+	uint64_t deferredSharingBuilds = 0;
 	std::vector<uint8_t> tracyFrameBegun;
 	// Readback captures anchored after a main pass (RenderGraphPersistentCaptures.cpp), by pass name: appended to the
 	// pass's own packet when it is next prepared, so a capture never changes the executable.
@@ -492,6 +468,9 @@ struct RenderGraph::PersistentExecutionState {
 	// Captures the anchor pass could not take (it does not bind the resource, or not over the whole range): inserted
 	// next frame as frame-interrupting capture passes.
 	std::vector<runtime::ReadbackCaptureInfo> capturesToInsert;
+	// Captures requested after the graph (runtime::kReadbackAfterGraph). Submitted through the graph's external client
+	// after the execution.
+	std::vector<runtime::ReadbackCaptureInfo> afterGraphCaptures;
 	// Schedule introspection (RenderGraph::SetScheduleTraceEnabled), owner thread.
 	struct ScheduleTraces {
 		const void* executable = nullptr;  // the traced whole-frame executable (not retained), with its revision
@@ -502,6 +481,36 @@ struct RenderGraph::PersistentExecutionState {
 		ScheduleSubmissionWaits scratch;                   // one execution's, filled before it is recorded (capacity reused)
 	};
 	ScheduleTraces scheduleTraces;
+};
+
+// What the phases of one segment execution share (RenderGraph::AdmitPersistentSegment and the ones after it).
+struct RenderGraph::PersistentSegmentRun {
+	PersistentExecutionState::PreparedSegment& segment;
+	PersistentExecuteTimings& timings;
+	std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+	// Adds the time since the previous lap to a timing.
+	void Lap(double& into) {
+		const auto now = std::chrono::steady_clock::now();
+		into += std::chrono::duration<double, std::micro>(now - last).count();
+		last = now;
+	}
+	bool traceSchedule = false;
+	size_t slotCount = 0;
+	QueueSlotIndex presentationSlot{};
+	rhi::DescriptorHeapHandle resourceHeap{}, samplerHeap{};
+	const std::unordered_map<std::string_view, unsigned>* statisticsIndices = nullptr;
+	// Each queue's first and last batch, for ExternalQueueBoundary. UINT32_MAX when the queue has none.
+	std::vector<uint32_t> firstBatchOnSlot, lastBatchOnSlot;
+
+	// Set by admission.
+	std::vector<compiler::PreparedTimelineBinding> timelineBindings;
+	persistent::FrameAdmission admission;
+	bool keepable = false;
+	bool external = false;
+	// Set by planning.
+	std::shared_ptr<const compiler::RenderFrameSnapshot> sealed;
+	std::vector<compiler::FrameRecordingJob> jobs;
+	std::vector<std::shared_ptr<compiler::OwnedRecordingStatistics>> recordingStatistics;
 };
 
 namespace persistent_impl {
@@ -562,10 +571,6 @@ inline std::vector<compiler::CompileQueue> RegistryQueues(const QueueRegistry& r
 
 namespace persistent_impl {
 
-inline bool IsSwapchainResource(Resource& resource) {
-	return resource.GetName() == "Backbuffer" && dynamic_cast<DynamicResource*>(&resource)
-		&& !dynamic_cast<BackedResource*>(UnwrapDynamic(&resource));
-}
 inline uint64_t FingerprintDeclaration(const compiler::CompilePass& d) {
 	uint64_t h = 0x9e3779b97f4a7c15ull;
 	auto mix = [&](uint64_t value) { h ^= value + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2); };
@@ -575,19 +580,12 @@ inline uint64_t FingerprintDeclaration(const compiler::CompilePass& d) {
 	return h;
 }
 using lowering::FingerprintLowering;
+using lowering::FingerprintParts;
+using lowering::FingerprintPartName;
+using lowering::DescribeDeclaration;
 using lowering::LoweredGroup;
 using lowering::LoweredPass;
 using lowering::LoweredUse;
-inline uint64_t HashSegmentTemplate(const State::SegmentProgram::Template& t) {
-	uint64_t h = 0x7f4a7c159e3779b9ull;
-	auto mix = [&](uint64_t value) { h ^= value + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2); };
-	mix(t.shape.mips); mix(t.shape.slices); mix(t.shape.hasLayout ? 1 : 0);
-	mix(t.range.mip); mix(t.range.mips); mix(t.range.slice); mix(t.range.slices);
-	mix(t.state.access); mix(t.state.layout); mix(t.state.sync); mix(t.state.write ? 1 : 0);
-	return h ? h : 1;
-}
-
-
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -627,18 +625,45 @@ void InstallMainPass(RenderGraph& graph, State& state, persistent::GraphEditTran
 	State::MainPass& main, LoweredPass lowered, uint32_t mainIndex, bool replace, std::optional<uint32_t> authoredOrder = std::nullopt,
 	std::vector<uint32_t>* touchedGroups = nullptr);
 bool LoweringAddsDeclarations(const State::MainPass& main, const LoweredPass& lowered);
+// For a pass that RebindsConcreteResources: points the lowering's uses of resources declared by pointer at the pass's
+// rebind slots, and gives each slot the resource now declared in its place. Resolver members, the swapchain, passes on
+// another device and resources that already are wrappers keep their own entries. Does nothing for other passes.
+// A relower against the installed executable. When the pass declares the same direct uses and groups, and every use and
+// view of its new layout maps onto a slot and view `live` already has (a group member that arrived within the group's
+// capacity, say), the pass takes the new layout, bindings and tokens with no build. Returns null then; otherwise, changing
+// nothing, why it doesn't map (for the relower log).
+const char* RemapDeclaration(State& state, const persistent::SelectedPublication& live, State::MainPass& main, LoweredPass& lowered);
+void UseRebindSlots(const RenderGraph& graph, State::MainPass& main, LoweredPass& lowered, const IDynamicDeclaredResources* dynamic);
+// Why a pass's new declaration differs from the one installed:
+// - NoOp: the same declaration again;
+// - Rebind: the same uses with other resources of the same shape;
+// - Shape: uses, views, groups or names added, removed or changed;
+// - DirectResolver: a resolver declared directly resolves to another set;
+// - Remapped: not a cause, an outcome: a Shape relower that RemapDeclaration took with no build.
+enum class RelowerCause : uint8_t { NoOp, Rebind, Shape, DirectResolver, Remapped };
+RelowerCause ClassifyRelower(const State::MainPass& main, const LoweredPass& lowered, bool directStale);
+const char* RelowerCauseName(RelowerCause cause) noexcept;
+// Adds the relower to the ORG.Persistent.Relower.* counters.
+void CountRelower(RelowerCause cause, bool inlineBuild);
+// SharingChangePolicy::Deferred: takes the edits of `edit` that change which slots share a backing into
+// state.deferredSharing, so `edit` builds binding-only. Leaves `edit` alone when it can't be split.
+void DeferSharingChanges(State& state, persistent::GraphEditTransaction& edit);
+// Applies state.deferredSharing to `edit` (a structural build's transaction) and clears it.
+void ApplyDeferredSharing(State& state, persistent::GraphEditTransaction& edit);
 
 // RenderGraphPersistentCaptures.cpp
-// Takes the readback service's new capture requests: after-graph captures become per-frame passes at the end (frameExt),
-// anchored ones wait for their pass's next preparation; the ones a pass could not take last frame become interrupting passes.
-void PlacePersistentCaptures(RenderGraph& graph, State& state, bool ticket, std::vector<ExternalPassDesc>& frameExt,
-	std::vector<ExternalPassDesc>& interrupting);
+// Takes the readback service's new capture requests. Captures after the graph are queued for SubmitAfterGraphCaptures.
+// Captures after a pass wait for that pass's next preparation. The ones a pass could not take last frame become
+// frame-interrupting passes.
+void PlacePersistentCaptures(RenderGraph& graph, State& state, bool ticket, std::vector<ExternalPassDesc>& interrupting);
 // The pass's packet with the captures waiting for it recorded after its own commands.
+// Submits the captures requested after the graph, through the graph's external client. Call it after the execution.
+void SubmitAfterGraphCaptures(RenderGraph& graph, State& state);
 PreparedPass AppendPersistentCaptures(RenderGraph& graph, State& state, const State::MainPass& pass, const std::string& name,
 	PreparedPass packet, const FramePreparationContext& preparation, const persistent::SelectedPublication& publication);
 
 // RenderGraphPersistentTrace.cpp
-void FillScheduleSubmissionWaits(ScheduleSubmissionWaits& out, const compiler::CompiledGraph& graph,
+void FillScheduleSubmissionWaits(ScheduleSubmissionWaits& out, const compiler::Schedule& graph,
 	const std::vector<std::vector<compiler::ExecutionTimelinePoint>>& incoming, std::pair<uint32_t, uint64_t> uploadsDone, uint64_t frameWait,
 	const RenderGraph::PersistentTicket::QueueUploads* queueUploads = nullptr);
 

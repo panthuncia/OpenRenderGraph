@@ -17,7 +17,8 @@ namespace ui {
         MemoryRowFlag_None = 0,
         // Placed in an aliasing pool, whose own row carries the bytes.
         MemoryRowFlag_Aliased = 1u << 0,
-        // Shown, but its bytes are counted by another row (aliased placements, shared memory): left out of totals.
+        // Shown, but left out of totals because another row counts its bytes. Examples are aliased placements and shared
+        // memory.
         MemoryRowFlag_NotCounted = 1u << 1,
         // Memory another allocator owns, wrapped by this one.
         MemoryRowFlag_Imported = 1u << 2,

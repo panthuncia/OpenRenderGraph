@@ -56,7 +56,9 @@ Runtime* Runtime::Current() noexcept {
 	return g_current.load(std::memory_order_acquire);
 }
 
-Runtime::Runtime(Desc desc) : m_desc(std::move(desc)), m_sequencer(std::make_shared<persistent::ResourceSequencer>()) {}
+Runtime::Runtime(Desc desc)
+	: m_desc(std::move(desc)), m_sequencer(std::make_shared<persistent::ResourceSequencer>()),
+	  m_schedules(std::make_shared<compiler::ScheduleCache>()) {}
 
 void Runtime::Initialize() {
 	// Slot-indexed services size themselves from the settings: the runtime's slots, set once here.
@@ -131,6 +133,12 @@ void Runtime::UnregisterQueue(rhi::Queue queue) {
 	const auto before = m_queues.size();
 	std::erase_if(m_queues, [&](const rhi::Queue& known) { return SameQueue(known, queue); });
 	if (m_queues.size() != before && progress.timeline) m_retiredTimelines.emplace_back(progress.timeline.impl, progress.timeline.GetHandle());
+}
+
+void Runtime::NoteTimelineDestroyed(const rhi::Timeline& timeline) {
+	if (!timeline.IsValid()) return;
+	std::scoped_lock lock(m_queuesMutex);
+	m_retiredTimelines.emplace_back(timeline.impl, timeline.GetHandle());
 }
 
 uint64_t Runtime::TimelineIdentity(const rhi::Timeline& timeline) {

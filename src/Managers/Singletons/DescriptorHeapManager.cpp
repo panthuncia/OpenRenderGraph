@@ -32,8 +32,9 @@ namespace {
 		UINT samplers = 0;
 	};
 
-	// The shader-visible heap capacities the device was set up with (ShaderFeatureInfo; a backend may hold fewer than the preferred
-	// 1,000,000 / 2048). Defaults where the backend does not report them. Logged once per device.
+	// The shader-visible heap capacities the device was set up with, from ShaderFeatureInfo. A backend may hold fewer
+	// than the preferred 1,000,000 / 2048. Defaults are used where the backend does not report them. Logged once per
+	// device.
 	ShaderVisibleCapacities QueryShaderVisibleCapacities(rhi::Device device) {
 		const rhi::DescriptorHeapCapacities defaults{};
 		ShaderVisibleCapacities capacities{ defaults.preferredResources, defaults.preferredSamplers };
@@ -151,8 +152,9 @@ const DescriptorHeapManager::BackendHeaps* DescriptorHeapManager::FindBackendHea
 }
 
 void DescriptorHeapManager::Cleanup() {
-    // Destruction can recursively retire other owners, not just one final
-    // wave of descriptor slots. Quiescent cleanup must reach a fixed point.
+    // Destroying an owner can retire other owners in turn, so there can be more
+    // than one final wave of descriptor slots. Cleanup on an idle device must
+    // repeat until nothing more is released.
     DrainDeferredReleasesAfterDeviceIdle();
     if (m_resourceCleanup) m_resourceCleanup->Drain();
     DrainDeferredReleasesAfterDeviceIdle();
@@ -241,10 +243,10 @@ void DescriptorHeapManager::PublishQueueFenceSnapshot(std::vector<QueueFenceSnap
                 return !point.timeline.IsValid() || point.value == 0 || point.value == UINT64_MAX;
             }),
         fenceSnapshot.end());
-    // Callers publish only values that were actually submitted. Preserve the
-    // last known signal for queues that were idle this frame so a transiently
-    // idle queue cannot make its previous in-flight work disappear from the
-    // retirement dependency set.
+    // Callers publish only values that were actually submitted. Keep the last
+    // known signal for queues that were idle this frame. Otherwise a queue that
+    // is idle for one frame would drop its earlier in-flight work from the set
+    // of work that retirement waits for.
     for (auto& published : fenceSnapshot) {
         const auto publishedHandle = published.timeline.GetHandle();
         auto existing = std::find_if(
@@ -956,9 +958,9 @@ UINT DescriptorHeapManager::CreateIndexedSampler(const rhi::SamplerDesc& sampler
 
     auto device = DeviceManager::GetInstance().GetDevice();
     UINT index = m_samplerHeap->AllocateDescriptor();
-    // A slot whose sampler was not created holds no descriptor: a shader sampling through it reads with whatever
-    // the heap memory decodes to (no filtering, no mips, and on some hardware no sRGB conversion). Never hand
-    // one out.
+    // A slot whose sampler was not created holds no descriptor. A shader that samples through it reads with whatever
+    // the heap memory decodes to. That means no filtering, no mips, and on some hardware no sRGB conversion. Never
+    // hand out such a slot.
     if (const auto result = device.CreateSampler({ m_samplerHeap->GetHeap().GetHandle(), index }, samplerDesc); rhi::Failed(result)) {
         m_samplerHeap->ReleaseDescriptor(index);
         spdlog::error("DescriptorHeapManager::CreateIndexedSampler: the backend could not create the sampler (result {})", static_cast<int>(result));

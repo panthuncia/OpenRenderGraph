@@ -58,7 +58,8 @@
 namespace {
 constexpr uint32_t kCount = 64;
 constexpr uint64_t kBytes = kCount * sizeof(uint32_t);
-// CopyToHostPass's recordings ("external": the pass is recorded at execution, so each execution records it once more).
+// Counts the recordings of CopyToHostPass. In "external" mode the pass is recorded at execution, so each execution
+// records it once more.
 std::atomic<uint32_t> g_copyRecords{0};
 
 struct HostDevice {
@@ -66,14 +67,15 @@ struct HostDevice {
 	VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
 	VkDevice device = VK_NULL_HANDLE;
 	VkQueue queue = VK_NULL_HANDLE;
-	VkQueue spare = VK_NULL_HANDLE;  // a second queue of the family, when it has one: offered to BasicRHI as a spare queue
+	VkQueue spare = VK_NULL_HANDLE;  // A second queue of the family, if it has one. It is offered to BasicRHI as a spare queue.
 	uint32_t family = 0;
 	std::vector<const char*> extensions;
 	VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
 	VkPhysicalDeviceVulkan12Features vulkan12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
 	VkPhysicalDeviceVulkan13Features vulkan13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
 	VkPhysicalDeviceDescriptorHeapFeaturesEXT descriptorHeap{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_FEATURES_EXT};
-	// Without descriptor heaps: BasicRHI's descriptor-buffer model (descriptor buffers with mutable descriptors).
+	// Without descriptor heaps, BasicRHI uses its descriptor-buffer model. That model uses descriptor buffers with mutable
+	// descriptors.
 	VkPhysicalDeviceDescriptorBufferFeaturesEXT descriptorBuffer{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT};
 	VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT mutableDescriptors{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT};
 	bool bufferModel = false;
@@ -110,7 +112,7 @@ bool HasDeviceExtension(VkPhysicalDevice device, const char* name) {
 	return false;
 }
 
-// 0 ok, 77 skip, 1 failure.
+// Returns 0 on success, 77 to skip the test, and 1 on failure.
 int CreateHostDevice(HostDevice& host) {
 	if (volkInitialize() != VK_SUCCESS) return 77;
 	VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
@@ -127,7 +129,8 @@ int CreateHostDevice(HostDevice& host) {
 	for (VkPhysicalDevice candidate : devices)
 		if (HasDeviceExtension(candidate, VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME) &&
 			HasDeviceExtension(candidate, VK_KHR_MAINTENANCE_5_EXTENSION_NAME)) { host.physicalDevice = candidate; break; }
-	// Else the first with descriptor buffers and mutable descriptors (ORG_TEST_DEVICE=<name substring> picks among them).
+	// Otherwise take the first device with descriptor buffers and mutable descriptors. ORG_TEST_DEVICE=<name substring>
+	// picks among them.
 	if (!host.physicalDevice) {
 		const char* wanted = std::getenv("ORG_TEST_DEVICE");
 		for (VkPhysicalDevice candidate : devices) {
@@ -263,8 +266,10 @@ struct WriteFrame {
 	uint32_t count = kCount;
 };
 
-// A scene revision, as host data (the "revision" mode): how many elements the write pass writes, baked into its recording, and
-// the version of its target it writes (immutable inputs: a grown target is a new version, named by the revisions after it).
+// A scene revision, passed as host data. Used by the "revision" mode. It holds:
+// - how many elements the write pass writes. This count is baked into the pass's recording.
+// - the version of the target that the pass writes. Inputs are immutable, so a grown target is a new version. The
+//   revisions after the growth name that new version.
 struct TestRevision final : org::IHostExecutionData, org::IResourceVersions {
 	uint32_t count = kCount;
 	const void* versioned = nullptr;  // VersionedBuffer::Key
@@ -298,7 +303,7 @@ public:
 		return {m_program, preparation.Resolve(bindings.input).index,
 			preparation.Resolve(bindings.target).index, RevisionCount(preparation)};
 	}
-	// Revision sees no frame: it names the pass's own state, so the host-data count is the default here.
+	// Revision sees no frame. It names only the pass's own state, so here the host-data count is the default.
 	void Revision(std::vector<uint64_t>& out) const {
 		out.push_back(reinterpret_cast<uintptr_t>(m_program.get()));
 		out.push_back(kCount);
@@ -328,8 +333,9 @@ public:
 	CopyBindings Declare(org::PassBuilder& builder) {
 		builder.PreferQueue(org::QueueKind::Graphics);
 		if (m_versions) {
-			// Declared two ways, as a pass reading a buffer both as indirect arguments and through its address does: the
-			// declarations merge into one requirement, and the pass is still lowered as a group (re-resolved per preparation).
+			// Declare the buffer two ways, like a pass that reads a buffer both as indirect arguments and through its
+			// address. The declarations merge into one requirement. The pass is still lowered as a group, which is
+			// resolved again for each preparation.
 			const std::span<const org::SrvView> noViews{};
 			CopyBindings bindings{builder.CopySource(*m_versions), builder.CopyDestination(m_destination)};
 			builder.ShaderResource(*m_versions, noViews);
@@ -371,7 +377,8 @@ public:
 		auto copy = org::RenderGraph::ExternalPassDesc::Copy("test.copy-to-host",
 			std::static_pointer_cast<org::RenderPass>(std::make_shared<CopyToHostPass>(m_scratch, m_output, m_outputRevision, m_versions)))
 			.PreferQueue(org::QueueKind::Graphics);
-		// "external": recorded by the host's execution of the epoch, after the write pass's secondary.
+		// In "external" mode, the host's execution of the epoch records this pass, after the write pass's secondary command
+		// buffer.
 		if (m_lateCopy) copy.RecordAtExecution();
 		out.push_back(std::move(copy));
 	}
@@ -411,24 +418,29 @@ bool Matches(const HostBuffer& buffer, uint32_t value) {
 } // namespace
 
 int TestFrameRetirement(rhi::Device device, rhi::Backend backend);
+int TestRebindingGpu(rhi::Device device, const std::shared_ptr<org::Runtime>& runtime);
 int TestContributors(rhi::Device device, const std::function<std::shared_ptr<org::Resource>()>& importOutput, const uint32_t* mapped,
 	const char* spirvPath,
 	rhi::PipelineLayoutHandle layout);
 
 static int Run(int argc, char** argv) {
 	// "reuse": async epochs that keep and resubmit their recordings (GraphHost::Desc::reuseRecordings).
-	// "external-reuse": "external" with its recordings kept: the late pass, replayable, recorded again by each execution of a kept one.
+	// "external-reuse": "external" with its recordings kept. The late pass is replayable. Each execution of a kept
+	// recording records the late pass again.
 	const bool externalReuse = argc > 1 && std::strcmp(argv[1], "external-reuse") == 0;
 	const bool reuse = externalReuse || (argc > 1 && std::strcmp(argv[1], "reuse") == 0);
-	// "revision": a revision-driven epoch (SetAsyncEpochs' revisionEpochs), recorded ahead for each revision
-	// (RequestEpochRecording) and submitted with that recording.
+	// "revision": a revision-driven epoch, set through the revisionEpochs of SetAsyncEpochs. It is recorded ahead for
+	// each revision (RequestEpochRecording) and submitted with that recording.
 	const bool revision = argc > 1 && std::strcmp(argv[1], "revision") == 0;
-	// "external": an async epoch the test executes itself (GraphHost::SetExternalEpochs), its copy pass recorded at
-	// execution, in a primary of the test's, submitted with the execution's waits and signals.
+	// "external": an async epoch that the test executes itself (GraphHost::SetExternalEpochs). Its copy pass is
+	// recorded at execution, into a primary command buffer the test owns. It is submitted with the execution's waits
+	// and signals.
 	const bool external = externalReuse || (argc > 1 && std::strcmp(argv[1], "external") == 0);
 	const bool async = reuse || revision || external || (argc > 1 && std::strcmp(argv[1], "async") == 0);
 	// "contributor": a contributor registered through the C table (ContributorHostTests.cpp) instead of the graph scenario.
 	const bool contributor = argc > 1 && std::strcmp(argv[1], "contributor") == 0;
+	// "rebinding": slots that start or stop sharing a backing (RebindingGpuTests.cpp) instead of the graph scenario.
+	const bool rebinding = argc > 1 && std::strcmp(argv[1], "rebinding") == 0;
 	HostDevice host;
 	if (const int created = CreateHostDevice(host); created != 0) {
 		std::puts(created == 77 ? "SKIP: no Vulkan device with VK_EXT_descriptor_heap" : "FAIL: host device");
@@ -459,7 +471,14 @@ static int Run(int argc, char** argv) {
 		rhi::DevicePtr device;
 		REQUIRE(rhi::vulkan::AdoptVulkanDevice(info, device) == rhi::Result::Ok, "AdoptVulkanDevice");
 		REQUIRE(TestFrameRetirement(device.Get(), rhi::Backend::Vulkan) == 0, "descriptor and frame retirement");
-		if (contributor) {
+		if (rebinding) {
+			auto runtime = org::Runtime::Create({.device = device.Get(), .backend = rhi::Backend::Vulkan,
+				.tasks = std::make_shared<org::runtime::ThreadPoolTaskService>(2)});
+			const int line = TestRebindingGpu(device.Get(), runtime);
+			runtime.reset();
+			if (line) std::printf("FAIL: rebinding (line %d)\n", line);
+			REQUIRE(line == 0, "rebinding");
+		} else if (contributor) {
 			auto program = CreateProgram(device.Get());
 			REQUIRE(program, "compute program");
 			const auto importOutput = [&]() -> std::shared_ptr<org::Resource> {
@@ -554,10 +573,11 @@ static int Run(int argc, char** argv) {
 					host.SubmitEpoch(0, upload, {}, full);
 					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "a revision's recording writes every element");
 				}
-				// Growth as a new version: a revision naming the grown target, recorded while the frames submit the old one. Each
-				// recording resolved its own version (its own publication and bindings), and each ticket admits both: the old one
-				// still submits after the new one was recorded, and the new one after it, with nothing prepared again.
-				// The growth: the next version, current from now on; the old revision still names the first.
+				// Growth as a new version. A revision names the grown target. It is recorded while the frames still submit the old
+				// one. Each recording resolved its own version, with its own publication and bindings. Each ticket admits both
+				// recordings. The old one still submits after the new one was recorded, and the new one submits after it. Nothing
+				// is prepared again.
+				// The growth: the next version is current from now on. The old revision still names the first version.
 				const auto grown = versions->GrowBytes(kBytes * 2);
 				REQUIRE(grown->buffer != firstVersion->buffer && versions->Get() == grown->buffer, "growth is a new version");
 				auto grownRecording = record(kCount, grown);
@@ -583,9 +603,9 @@ static int Run(int argc, char** argv) {
 					std::fprintf(stderr, "half revision: [0] %u [half-1] %u [half] %u [last] %u; expected %u, %u, %u, %u\n", first.mapped[0], first.mapped[half - 1],
 						first.mapped[half], first.mapped[kCount - 1], value, value + half - 1, before + half, before + kCount - 1);
 				REQUIRE(halfOk, "the new revision's recording writes its elements, and leaves the rest");
-				// A pending version (made, not adopted), named by a revision: its recording writes and copies that version, every
-				// pass resolving it through the revision - the copy pass's two declarations of it included - while the current one
-				// stays what live work uses.
+				// A pending version, made but not adopted, and named by a revision. Its recording writes and copies that version.
+				// Every pass resolves it through the revision, including both of the copy pass's declarations of it. Meanwhile the
+				// current version stays the one that live work uses.
 				{
 					const auto pending = versions->MakeBytes(kBytes * 2);
 					REQUIRE(pending->buffer != grown->buffer && versions->Get() == grown->buffer, "a pending version is not current");
@@ -614,9 +634,9 @@ static int Run(int argc, char** argv) {
 				REQUIRE(stats.revisionSubmissions == 13 && stats.stale == 0 && stats.revisionRecordings == 3 && stats.revisionSlotsRecorded == 9,
 					"every submission bound a revision's recording; nothing prepared again");
 				REQUIRE(!counters.unbalanced && counters.locks.load() == counters.unlocks.load(), "balanced host queue locks");
-				// Growth as graph work: a version made on a producer's thread and filled through the dedicated uploader (the worker
-				// upload path, on the queue the device offered spare when it has one), ready once its copy completes; no queue uses it
-				// before then, and its owner adopts it after.
+				// Growth as graph work. A version is made on a producer's thread and filled through the dedicated uploader. That is
+				// the worker upload path. It runs on the spare queue the device offered, when it has one. The version is ready once
+				// its copy completes. No queue uses it before then, and its owner adopts it after.
 				{
 					auto readable = org::Buffer::CreateShared(rhi::HeapType::Readback, kBytes);
 					auto growing = org::VersionedBuffer::Create(readable);
@@ -650,8 +670,9 @@ static int Run(int argc, char** argv) {
 					std::printf("growth as graph work: %s uploader queue\n", uploads->HasDedicatedStreamingQueue() ? "a dedicated" : "the shared");
 					REQUIRE(!spareQueue || uploads->HasDedicatedStreamingQueue(), "the spare queue is the uploader's");
 				}
-				// A live epoch recorded for a revision ahead of the switch to revision-driven submission: recorded only, never admitted.
-				// The slot its live ticket holds is recorded once that ticket is submitted, and one with work in flight once that completes.
+				// A live epoch recorded for a revision, before the switch to revision-driven submission. It is only recorded, never
+				// admitted. The slot that its live ticket holds is recorded once that ticket is submitted. A slot with work in
+				// flight is recorded once that work completes.
 				host.SetAsyncEpochs({0});
 				{
 					// The restarted host's first ticket (the first submission waits for it).
@@ -681,9 +702,10 @@ static int Run(int argc, char** argv) {
 					std::printf("live revision recording: %llu recordings, %llu revision submissions, %llu submitted, %llu waited\n",
 						static_cast<unsigned long long>(liveStats.revisionRecordings), static_cast<unsigned long long>(liveStats.revisionSubmissions),
 						static_cast<unsigned long long>(liveStats.submitted), static_cast<unsigned long long>(liveStats.waited));
-					// (This loop submits right after the GPU is idle, ahead of the host's next ticket, so its frames wait either way.)
+					// This loop submits right after the GPU is idle, before the host's next ticket. So its frames wait either way.
 					REQUIRE(liveStats.revisionRecordings == 1 && liveStats.revisionSubmissions == 0, "admitted, not submitted until chosen");
-					// The commit chooses it (UseEpochRecording): the ticket takes it instead of its own preparation, for every slot.
+					// The commit chooses the recording with UseEpochRecording. For every slot, the ticket then takes it instead of its
+					// own preparation.
 					for (uint32_t frame = 0; frame < 4; ++frame) {
 						value = 71000u + 10u * frame;
 						bool usable = false;
@@ -702,8 +724,9 @@ static int Run(int argc, char** argv) {
 					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "a live epoch's own preparation after a chosen recording");
 					const auto chosenStats = host.TakeAsyncStats();
 					REQUIRE(chosenStats.revisionSubmissions == 4 && chosenStats.stale == 0, "every chosen recording submitted, nothing prepared again");
-					// The graph built again (its extension replaced): the recording is the build before's. The commit asks before it
-					// chooses it, and the rebuilt graph's ticket would not take it; the epoch draws its own preparation.
+					// Build the graph again by replacing its extension. The recording now belongs to the previous build. The commit
+					// asks before it chooses the recording, and the rebuilt graph's ticket would not take it. So the epoch uses its
+					// own preparation.
 					const auto builds = host.BuildGeneration();
 					host.AddExtension("test.host", [&] { return std::make_unique<HostExtension>(input, scratch, output, program, outputRevision, versions, external); });
 					value = 73000u;
@@ -716,8 +739,9 @@ static int Run(int argc, char** argv) {
 					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "the rebuilt graph's own preparation");
 					std::printf("after a rebuild: %s\n", why.c_str());
 					REQUIRE(host.BuildGeneration() != builds && !usable && !why.empty(), "a recording of the build before is not the rebuilt graph's ticket's");
-					// Explicit builds: an extension added waits for the build point (BuildIfRequested). Until then the graph as built runs,
-					// and a recording of it stays its tickets'; the build point builds, and the recording is the build before's.
+					// Explicit builds. An added extension waits for the build point (BuildIfRequested). Until then the graph runs as
+					// it was built, and its tickets can still take a recording of it. The build point builds the graph. The recording
+					// then belongs to the previous build.
 					host.SetExplicitBuilds(true);
 					std::shared_ptr<const org::GraphHost::EpochRecording> held;
 					state.store(0, std::memory_order_relaxed);
@@ -757,8 +781,9 @@ static int Run(int argc, char** argv) {
 					});
 					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value) && !usable, "the rebuilt graph's own preparation");
 					host.SetExplicitBuilds(false);
-					// An epoch the caller does not submit: its ready ticket holds a slot of its ring, so a recording requested for it
-					// waits for that slot until the caller gives the ticket back (ReleaseEpochTicket); then it completes, unsubmitted.
+					// An epoch that the caller does not submit. Its ready ticket holds a slot of its ring. So a recording requested for
+					// it waits for that slot until the caller gives the ticket back (ReleaseEpochTicket). Then the recording completes,
+					// without being submitted.
 					std::shared_ptr<const org::GraphHost::EpochRecording> idle;
 					state.store(0, std::memory_order_relaxed);
 					const auto readyDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
@@ -820,7 +845,8 @@ static int Run(int argc, char** argv) {
 						static_cast<unsigned long long>(kept.kept), static_cast<unsigned long long>(kept.reused));
 					REQUIRE(kept.kept > 0 && kept.reused > 0, "an external epoch with a replayable late pass is kept and taken again");
 				}
-				// Not executed: signalled without its work. The output keeps its last value, and the next execution goes on.
+				// An execution that is not executed. It is signalled without running its work. The output keeps its last value, and
+				// the next execution goes on.
 				const uint32_t kept = value;
 				value = 95000u;
 				host.SubmitEpoch(0, upload);
@@ -832,7 +858,8 @@ static int Run(int argc, char** argv) {
 				host.SubmitEpoch(0, upload);
 				auto next = host.TakeExternalExecution();
 				REQUIRE(next && execute(*next) && device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "the epoch after a skipped execution");
-				// Pass timestamps of an external epoch, its late pass's included: the completed frames' (the host's thread), by name.
+				// Collect the pass timestamps of an external epoch by name, including its late pass. They come from the completed
+				// frames, on the host's thread.
 				std::mutex timedMutex;
 				std::set<std::string> timed;
 				host.SetCompletedFrameCallback([&](uint64_t, const org::runtime::IStatisticsService& a_stats) {
@@ -854,7 +881,7 @@ static int Run(int argc, char** argv) {
 						REQUIRE(execution && execute(*execution), "a timed external execution");
 					}
 					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "the timed executions write and copy");
-					// Completions are read on the host's thread: until both passes are, or a second.
+					// Completions are read on the host's thread. Wait until both passes are read, or until one second passes.
 					const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
 					do {
 						std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -869,7 +896,8 @@ static int Run(int argc, char** argv) {
 				std::set<std::string> timedOff, timedOn;
 				if (const int failed = timedPasses(false, timedOff)) return failed;
 				if (const int failed = timedPasses(true, timedOn)) return failed;
-				// Kept recordings (external-reuse) are timed with recording timestamps only, as every kept recording.
+				// Kept recordings, as in external-reuse, are timed only with recording timestamps. This is true of every kept
+				// recording.
 				for (const auto* timedSet : {&timedOff, &timedOn})
 					if (timedSet == &timedOn || !externalReuse)
 						REQUIRE(timedSet->contains("test.write") && timedSet->contains("test.copy-to-host"),
@@ -996,8 +1024,8 @@ static int Run(int argc, char** argv) {
 			}
 			REQUIRE(!counters.unbalanced && counters.locks.load() == counters.unlocks.load(), "balanced host queue locks");
 			if (reuse) {
-				// Steady frames: the slots' tickets take their kept recordings, and each submission of the same lists reads that
-				// frame's upload.
+				// Steady frames. The slots' tickets take their kept recordings. Each submission of the same command lists reads the
+				// upload of its own frame.
 				(void)host.TakeAsyncStats();
 				for (uint32_t frame = 0; frame < 12; ++frame) {
 					value = 20000u + 10u * frame;
@@ -1010,9 +1038,9 @@ static int Run(int argc, char** argv) {
 					static_cast<unsigned long long>(steady.reused), static_cast<unsigned long long>(steady.adopted),
 					static_cast<unsigned long long>(steady.stale));
 				REQUIRE(steady.reused >= 9 && steady.stale == 0, "steady frames take kept recordings");
-				// A pass's revision alternating inside the commit (beforeSubmit), as a view's state does: each slot's ticket,
-				// prepared for the other variant, is stale at submission. Once every slot has kept both variants, a stale ticket
-				// adopts the kept recording, and nothing is prepared again.
+				// A pass's revision alternates inside the commit (beforeSubmit), as a view's state does. Each slot's ticket was
+				// prepared for the other variant, so it is stale at submission. Once every slot has kept both variants, a stale
+				// ticket adopts the kept recording, and nothing is prepared again.
 				const uint64_t base = outputRevision->load() + 100;
 				uint64_t warmStale = 0;
 				for (uint32_t frame = 0; frame < 24; ++frame) {
@@ -1051,8 +1079,8 @@ static int Run(int argc, char** argv) {
 				REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(second, value), "replacement ticket recovers after stale reservation");
 			}
 
-			// A readback capture after a mid-frame pass: the write pass's target as the pass left it, copied in the pass's own
-			// recording, so the executable is not built again.
+			// A readback capture after a mid-frame pass. It captures the write pass's target as the pass left it. The copy is
+			// recorded in the pass's own recording, so the executable is not built again.
 			if (!async && !revision) {
 				auto* graph = host.Graph();
 				graph->SetScheduleTraceEnabled(true);
@@ -1091,8 +1119,9 @@ static int Run(int argc, char** argv) {
 			REQUIRE(device->WaitIdle() == rhi::Result::Ok, "wait after rebuild");
 			REQUIRE(Matches(second, 7000u), "frame after rebuild");
 
-			// The frame-wait timeline: a frame's batches wait on the GPU for the value its producer of per-frame values signals
-			// (the render thread never waits); the producer signals it from the dedicated uploader, after its copies.
+			// The frame-wait timeline. A frame's batches wait on the GPU for the value that the producer of per-frame values
+			// signals. The render thread never waits. The producer signals the value from the dedicated uploader, after its
+			// copies.
 			{
 				auto frameValues = std::make_shared<rhi::TimelinePtr>();
 				REQUIRE(device->CreateTimeline(*frameValues, 0, "test.frame-values") == rhi::Result::Ok && *frameValues, "frame-wait timeline");
@@ -1113,7 +1142,8 @@ static int Run(int argc, char** argv) {
 						REQUIRE(!submitted.Reached() && !Matches(second, value), "the frame waits for its values");
 						REQUIRE(uploads->QueueStreamingSignal(frameValues, frame), "the producer's signal");
 					} else {
-						// No queue of its own to signal from (QueueStreamingSignal refuses): the test signals it from the graphics queue.
+						// There is no dedicated queue to signal from, so QueueStreamingSignal refuses. The test signals the value from the
+						// compute queue instead.
 						REQUIRE(!uploads || !uploads->QueueStreamingSignal(frameValues, frame), "no signal without a dedicated queue");
 						const rhi::TimelinePoint signal{(*frameValues)->GetHandle(), frame};
 						REQUIRE(device->GetQueue(rhi::QueueKind::Compute).Submit({}, {{}, {&signal, 1}}) == rhi::Result::Ok, "signal from another queue");

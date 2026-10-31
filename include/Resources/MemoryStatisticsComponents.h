@@ -45,7 +45,8 @@ namespace MemoryStatisticsComponents
 		uint64_t poolID = 0;
 	};
 
-	// The heap an allocation was made in (a buffer's access type); an allocation without one is device-local (textures).
+	// The heap an allocation was made in, which is a buffer's access type. An allocation without one is device-local,
+	// as textures are.
 	struct HeapKind {
 		rhi::HeapType type = rhi::HeapType::DeviceLocal;
 	};

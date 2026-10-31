@@ -23,16 +23,17 @@ namespace org { class Resource; }
 
 namespace org::runtime {
 
-// Copy-queue upload service shared by every worker thread. Producers stage
-// their bytes into a persistently mapped upload page (one active page per
-// producer thread, bump allocated, no lock) and push a copy descriptor onto a
-// lock-free MPSC queue. One submitter thread batches descriptors into copy
-// lists, submits them on the copy queue with its own timeline, keeps several
-// batches in flight, and completes tickets by polling the timeline. Pages
-// recycle when every region they carried has completed on the GPU. The same
-// barriers are recorded on every backend (Common -> CopyDest -> Common, and
-// Common -> CopySource -> Common for buffer copy sources); cross-family
-// correctness comes from QueueSharing::Concurrent destinations and sources.
+// A copy-queue upload service shared by every worker thread.
+// - Producers stage their bytes into a persistently mapped upload page. Each
+//   producer thread has one active page, bump allocated, with no lock. Then
+//   the producer pushes a copy descriptor onto a lock-free MPSC queue.
+// - One submitter thread batches the descriptors into copy lists. It submits
+//   them on the copy queue with its own timeline, keeps several batches in
+//   flight, and completes tickets by polling the timeline.
+// - A page is recycled when every region it carried has completed on the GPU.
+// Every backend records the same barriers: Common -> CopyDest -> Common, and
+// Common -> CopySource -> Common for buffer copy sources. Correctness across
+// queue families comes from QueueSharing::Concurrent destinations and sources.
 class CopyQueueUploadService {
 public:
     struct Config {
@@ -71,41 +72,47 @@ public:
     bool Initialized() const noexcept { return m_initialized.load(std::memory_order_acquire); }
 
     // Copies `totalSize` bytes gathered from `segments` to `destination` at
-    // `dstOffset`. Returns a ticket that reaches Submitted when the copy list is
-    // on the queue and Completed when the timeline passes it; null when the
-    // service is not initialized or the arguments are invalid.
+    // `dstOffset`. Returns a ticket. The ticket reaches Submitted when the copy
+    // list is on the queue, and Completed when the timeline passes it. Returns
+    // null when the service is not initialized or the arguments are invalid.
     std::shared_ptr<TrackedUploadTicket> QueueBufferUpload(
         std::span<const StreamingUploadSegment> segments, size_t totalSize,
         org::WorkerOwnedDestination destination, size_t dstOffset);
 
-    // Copies every range to `destination` at its own dstOffset, as one entry per staging page: the page is mapped once for
-    // the ranges it takes, one intake push and one wake for the call, one copy region recorded per range (a range larger than
-    // a page is split as QueueBufferUpload splits). The bytes are staged before it returns. One ticket for the batch, on the
-    // last entry (batches complete in order). Zero-sized ranges are skipped; null when the service is not initialized, the
-    // arguments are invalid or nothing is to be copied.
+    // Copies every range to `destination` at the range's own dstOffset. It makes one entry per staging page:
+    // - each page is mapped once for the ranges it takes,
+    // - the call makes one intake push and one wake,
+    // - one copy region is recorded per range. A range larger than a page is split the way QueueBufferUpload splits.
+    // The bytes are staged before it returns. The batch gets one ticket, on the last entry, since batches complete in
+    // order. Zero-sized ranges are skipped. Returns null when the service is not initialized, the arguments are invalid,
+    // or there is nothing to copy.
     std::shared_ptr<TrackedUploadTicket> QueueBufferUploadRanges(
         std::span<const StreamingUploadRange> ranges, org::WorkerOwnedDestination destination);
 
-    // Copies every range from `source` to `destination` on the GPU, as one entry with no staging page: one copy region per
-    // range, the source held until the batch carrying it retires. It is ordered after every entry the calling thread queued
-    // before it: the batch ends before a copy whose source an earlier entry of the batch writes (or whose destination an
-    // earlier entry reads), since one batch has no barriers between its copies. The source must not be written while the copy
-    // is queued and, like the destination, be rhi::QueueSharing::Concurrent. One ticket for the ranges. Zero-sized ranges are
-    // skipped; with none left the ticket rides a copy-less entry and completes with its batch, in order. Null when the service
-    // is not initialized or the arguments are invalid (the source is the destination).
+    // Copies every range from `source` to `destination` on the GPU, as one entry with no staging page. It records one
+    // copy region per range. The source is held until the batch carrying it retires.
+    // The copy is ordered after every entry the calling thread queued before it. One batch has no barriers between its
+    // copies. So the batch ends before this copy when an earlier entry of the batch writes its source, or reads its
+    // destination.
+    // The source must not be written while the copy is queued. Like the destination, it must be
+    // rhi::QueueSharing::Concurrent. The ranges share one ticket. Zero-sized ranges are skipped. With no ranges left, the
+    // ticket rides a copy-less entry and completes with its batch, in order. Returns null when the service is not
+    // initialized or the arguments are invalid (for example, the source is the destination).
     std::shared_ptr<TrackedUploadTicket> QueueBufferCopyRanges(std::shared_ptr<Resource> source,
         std::span<const StreamingCopyRange> ranges, org::WorkerOwnedDestination destination);
 
-    // Signals `timeline` to `value` from the copy queue once every copy the calling thread queued before it is done (the
-    // intake is FIFO per producer and batches go to the one queue in order; the batch carrying it signals it with its own
-    // timeline). Another queue can wait on that value for those copies - before it is signalled, too (wait-before-signal), so
-    // a producer that announced one must always queue it: with nothing to copy it goes out in a batch of its own. Its ticket is
-    // Submitted once the signal is on the copy queue (Cancelled if its batch failed): a waiter submitted to a queue whose own
-    // progress the copy queue's submission depends on (a host lock held across a blocking present) waits for that first. Null
-    // when the service is not initialized or the arguments are invalid.
+    // Signals `timeline` to `value` from the copy queue, once every copy the calling thread queued before this call is
+    // done. This works because the intake is FIFO per producer, and batches go to the one queue in order. The batch
+    // carrying the signal signals it with its own timeline.
+    // Another queue can wait on that value for those copies, even before it is signalled (wait-before-signal). So a
+    // producer that announced a signal must always queue it. With nothing to copy, the signal goes out in a batch of its
+    // own. Its ticket is Submitted once the signal is on the copy queue, or Cancelled if its batch failed. Some waiters
+    // are submitted to a queue that the copy queue's submission depends on, for example through a host lock held across a
+    // blocking present. Such a waiter waits for the ticket first.
+    // Returns null when the service is not initialized or the arguments are invalid.
     std::shared_ptr<TrackedUploadTicket> QueueSignal(std::shared_ptr<rhi::TimelinePtr> timeline, uint64_t value);
-    // Any thread: the batch holding the uploads the calling thread queues next waits, on the GPU, for each timeline to reach its
-    // value (IUploadService::QueueStreamingWait). False without the queue.
+    // Callable from any thread. The batch that holds the next uploads the calling thread queues waits on the GPU for
+    // each timeline to reach its value (IUploadService::QueueStreamingWait). Returns false when there is no queue.
     bool QueueWait(std::span<const std::pair<std::shared_ptr<rhi::TimelinePtr>, uint64_t>> points);
 
     // Blocks until nothing is queued or in flight (tests and shutdown).
@@ -128,8 +135,9 @@ private:
         std::atomic<bool> closed{ false };
     };
 
-    // One copy region of a ranges entry (QueueBufferUploadRanges): page bytes at srcOffset to the destination at dstOffset.
-    // Of a buffer copy entry (QueueBufferCopyRanges): source bytes at srcOffset.
+    // One copy region of an entry.
+    // - For a ranges entry (QueueBufferUploadRanges), it copies page bytes at srcOffset to the destination at dstOffset.
+    // - For a buffer copy entry (QueueBufferCopyRanges), it copies source bytes at srcOffset.
     struct CopyRegion {
         size_t srcOffset = 0;
         size_t dstOffset = 0;
@@ -141,10 +149,11 @@ private:
         size_t srcOffset = 0;
         std::shared_ptr<Resource> destination;
         size_t dstOffset = 0;
-        size_t size = 0; // a ranges entry: the sum of its regions
-        // A ranges entry: its regions on `page` (srcOffset/dstOffset unused); empty: the one copy above.
+        size_t size = 0; // for a ranges entry, the sum of its regions
+        // For a ranges entry: its regions on `page`, with srcOffset and dstOffset unused. When empty, the entry is the one
+        // copy above.
         std::vector<CopyRegion> regions;
-        // A buffer copy entry (QueueBufferCopyRanges): its regions read this, not a page (`page` is null).
+        // For a buffer copy entry (QueueBufferCopyRanges): its regions read this instead of a page, and `page` is null.
         std::shared_ptr<Resource> source;
         std::shared_ptr<TrackedUploadTicket> ticket;
         std::chrono::steady_clock::time_point queued{};
@@ -200,8 +209,8 @@ private:
 
     // Lock-free MPSC intake: producers push, the submitter pops.
     MpscQueue<PendingCopy> m_intake;
-    // Submitter-owned: the entry that ended the last batch on a read/write hazard, first in the next one. The flag mirrors it
-    // for WaitIdle.
+    // Owned by the submitter. The entry that ended the last batch because of a read/write hazard. It goes first in the
+    // next batch. The flag mirrors it for WaitIdle.
     std::optional<PendingCopy> m_carried;
     std::atomic<bool> m_hasCarried{ false };
 

@@ -76,7 +76,7 @@ namespace ui {
         // Feed the real-time total (seconds, bytes).
         void PushFrameSample(double timeSeconds, uint64_t totalBytes);
 
-        // Draw the window. `frameGraph` is optional; if nullptr/empty we show a dummy.
+        // Draws the window. `frameGraph` is optional. If it is null or empty, the window shows a placeholder.
         void Draw(bool* pOpen,
             const MemorySnapshot* snapshot = nullptr,
             const FrameGraphSnapshot* frameGraph = nullptr);
@@ -84,7 +84,7 @@ namespace ui {
     private:
         enum class ViewMode : int { Pie = 0, List = 1, Timeline = 2, BatchTimeline = 3, Heaps = 4, Reconciliation = 5 };
         enum class TimelineMode : int { RealTime = 0, FrameGraph = 1 };
-        // What the pie and the stacked timeline group by: the snapshot's categories, or a field of its rows.
+        // What the pie chart and the stacked timeline group by: the snapshot's categories, or a field of its rows.
         enum class GroupBy : int { Category = 0, Owner = 1, Source = 2, Heap = 3, Type = 4 };
 
         struct PieSettings {
@@ -167,8 +167,8 @@ namespace ui {
         void DrawHeapsView(const MemorySnapshot& s);
         void DrawReconciliationView(const MemorySnapshot& s);
 
-        // The snapshot's rows summed by a_groupBy (its categories for GroupBy::Category); rows flagged
-        // MemoryRowFlag_NotCounted are left out.
+        // Sums the snapshot's rows by a_groupBy. GroupBy::Category uses the snapshot's categories.
+        // Rows flagged MemoryRowFlag_NotCounted are left out.
         static std::vector<MemoryCategorySlice> GroupRows(const MemorySnapshot& s, GroupBy a_groupBy);
         static uint64_t CountedBytes(const MemorySnapshot& s);
         void PushGroupSample(const MemorySnapshot& s);

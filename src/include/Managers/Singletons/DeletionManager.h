@@ -15,9 +15,10 @@
 
 namespace org {
 
-// Deferred destruction of GPU objects, by submission frontier. What is marked waits for every queue's progress as of
-// the next Retire (SubmissionFrontier): any work that could still use it was submitted before then. The runtime installs
-// the frontier (SetFrontier); without one nothing retires before DrainAll.
+// Defers the destruction of GPU objects by submission frontier. A marked object waits until every queue reaches the
+// progress it had at the next Retire. That progress is a SubmissionFrontier. Any work that could still use the object
+// was submitted before then. The runtime installs the frontier with SetFrontier. Without a frontier, nothing retires
+// before DrainAll.
 class DeletionManager {
 public:
 	struct Stats {
@@ -26,8 +27,9 @@ public:
 		uint64_t trackedAllocationCount = 0;
 	};
 
-	// What one Retire retired: safe to destroy, and destroyed wherever the owner drops it. Members are destroyed in reverse
-	// order, so the objects go first, then the allocations, then the tracked allocations.
+	// The objects that one Retire retired. They are safe to destroy, and they are destroyed wherever the owner drops this
+	// struct. Members are destroyed in reverse order. So the objects go first, then the allocations, then the tracked
+	// allocations.
 	struct Retired {
 		std::vector<TrackedHandle> trackedAllocations;
 		std::vector<rhi::ma::AllocationPtr> allocations;
@@ -48,8 +50,8 @@ public:
 		m_initialized = true;
 	}
 
-	// The frontier Retire seals batches with, and when its points are reached (the runtime's). Called under this manager's
-	// lock, so they must not mark anything.
+	// Installs the runtime's frontier, which Retire seals batches with, and the check for when its points are reached.
+	// Both are called under this manager's lock, so they must not mark anything.
 	void SetFrontier(std::function<runtime::SubmissionFrontier()> frontier, runtime::PointReached reached) {
 		std::scoped_lock lock(m_mutex);
 		m_frontier = std::move(frontier);
@@ -81,16 +83,18 @@ public:
 		m_open.trackedAllocations.push_back(std::move(alloc));
 	}
 
-	// Takes every sealed batch whose frontier is reached, then seals what was marked since the last call with the frontier
-	// now. The retired objects are returned, not destroyed: the destruction (driver frees, taking the device's memory locks)
-	// happens after this lock is released, on whichever thread the caller chooses, so MarkForDelete never waits for it.
+	// Takes every sealed batch whose frontier is reached. Then seals everything marked since the last call with the
+	// current frontier.
+	// The retired objects are returned, not destroyed. Destroying them frees driver objects and takes the device's memory
+	// locks. That happens after this lock is released, on whichever thread the caller chooses. So MarkForDelete never
+	// waits for it.
 	Retired Retire() {
 		Retired retired;
 		std::scoped_lock lock(m_mutex);
 		if (!m_initialized) {
 			return retired;
 		}
-		// Frontiers only advance, so batches retire in order: stop at the first one still running.
+		// Frontiers only move forward, so batches retire in order. Stop at the first batch whose work is still running.
 		while (!m_sealed.empty() && runtime::Reached(m_sealed.front().frontier, m_reached)) {
 			auto& batch = m_sealed.front().contents;
 			Append(retired.objects, batch.objects);
@@ -105,7 +109,7 @@ public:
 		return retired;
 	}
 
-	// One Retire, destroying what retires on the calling thread.
+	// Runs one Retire and destroys what it retired on the calling thread.
 	void ProcessDeletions() {
 		(void)Retire();
 	}

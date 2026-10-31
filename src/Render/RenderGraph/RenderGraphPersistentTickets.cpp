@@ -112,6 +112,22 @@ std::vector<std::pair<uint32_t, uint64_t>> RenderGraph::CompletePersistentTicket
 		}
 	}
 	if (submission.submitted && m_scheduleTraceEnabled.load(std::memory_order_relaxed)) RecordPersistentTicketScheduleSubmissions(ticket);
+	if (ticket.execution) {
+		if (submission.submitted) {
+			std::vector<ExecutionSignal> signals;
+			for (const auto& segment : ticket.segments) {
+				if (!segment.recording) continue;
+				const auto& graph = *segment.admission.publication->executable->graph;
+				for (uint32_t batch = 0; batch < graph.batches.size(); ++batch)
+					signals.push_back({segment.admission.queueTimelines.at(graph.batches[batch].queue), 0});
+			}
+			for (size_t i = 0; i < signals.size(); ++i) signals[i].value = submission.signals.at(i);
+			ticket.execution->MarkSubmitted(std::move(signals));
+			state.pendingExecutions.push_back(ticket.execution);
+		} else {
+			ticket.execution->Finish(true);
+		}
+	}
 	for (auto* candidate = ticket.candidates.load(std::memory_order_acquire); candidate; candidate = candidate->next)
 		if (candidate != ticket.chosen) state.admission->Abandon(candidate->segment.admission);
 	for (auto& segment : ticket.displaced) state.admission->Abandon(segment.admission);
@@ -129,6 +145,7 @@ std::vector<std::pair<uint32_t, uint64_t>> RenderGraph::CompletePersistentTicket
 uint32_t RenderGraph::PersistentTicketEpoch(const PersistentTicket& ticket) noexcept { return ticket.epoch; }
 uint8_t RenderGraph::PersistentTicketSlot(const PersistentTicket& ticket) noexcept { return ticket.slot; }
 uint64_t RenderGraph::PersistentTicketHostFrame(const PersistentTicket& ticket) noexcept { return ticket.hostFrame; }
+ExecutionHandle RenderGraph::PersistentTicketExecution(const PersistentTicket& ticket) noexcept { return ExecutionHandle(ticket.execution); }
 uint64_t RenderGraph::PersistentTicketHostTag(const PersistentTicket& ticket) noexcept { return ticket.hostTag; }
 void RenderGraph::SetPersistentTicketHostTag(PersistentTicket& ticket, uint64_t tag) noexcept { ticket.hostTag = tag; }
 uint32_t RenderGraph::PersistentTicketSparedUploadWaits(const PersistentTicket& ticket) noexcept {
@@ -137,11 +154,10 @@ uint32_t RenderGraph::PersistentTicketSparedUploadWaits(const PersistentTicket& 
 
 bool RenderGraph::AdoptKeptPersistentRecording(PersistentTicket& ticket, uint64_t hostTag) {
 	BT_ZONE_SCOPE("ORG.Persistent.AdoptKeptRecording");
-	if (!m_keptRecordings || ticket.uncheckable || ticket.segments.size() != 1 || ticket.epoch >= kKeptRecordingEpochs || ticket.slot >= kKeptRecordingSlots)
-		return false;
+	if (!m_keptRecordings || ticket.uncheckable || ticket.segments.size() != 1) return false;
 	auto& segment = ticket.segments.front();
 	if (!segment.recording) return false;
-	const auto set = (*m_keptRecordings)[ticket.epoch][ticket.slot].load(std::memory_order_acquire);
+	const auto set = m_keptRecordings->Load(ticket.epoch, ticket.slot);
 	if (!set || set->empty()) return false;
 	// What the ticket's passes depend on now: the same passes (the same publication), their revisions as they are.
 	std::vector<std::pair<const RenderGraphPass*, uint64_t>> now;

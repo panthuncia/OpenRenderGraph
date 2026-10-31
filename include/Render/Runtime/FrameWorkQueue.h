@@ -39,8 +39,8 @@ private:
             if constexpr (requires(const Work& value) { value.Commit(); })
                 for (const auto& entry : work) if (!entry->discarded) entry->work.Commit();
         }
-        // The GPU has completed the execution the work was submitted with: work with a Complete() learns it (a job whose result
-        // gates readiness publishes it then).
+        // The GPU has completed the execution the work was submitted with. Work that has a Complete() is told about it.
+        // For example, a job whose result gates readiness publishes the result then.
         void Completed(CompletionContext) const override {
             if constexpr (requires(const Work& value) { value.Complete(); })
                 for (const auto& entry : work) if (!entry->discarded) entry->work.Complete();
@@ -103,8 +103,9 @@ public:
         preparation.Reserve(std::move(reservation));
     }
         // Reserves the entries of `selected` that are still pending, in order, and returns them. A declaration's snapshot
-    // outlives the execution that takes its work: every execution of the compiled graph prepares against it until a new
-    // declaration installs, so each takes what no earlier one has (work an abandoned execution returned included).
+    // outlives the execution that takes its work. Every execution of the compiled graph prepares against the snapshot
+    // until a new declaration installs. So each execution takes only what no earlier one took. This includes work that
+    // an abandoned execution returned.
     Snapshot ReserveAvailable(const Snapshot& selected, const FramePreparationContext& preparation) const {
         Snapshot taken;
         if (selected.empty()) return taken;

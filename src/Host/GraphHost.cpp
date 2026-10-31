@@ -355,7 +355,6 @@ void GraphHost::Build() {
 	// The graph's memory snapshots (its VRAM dump, a host's memory UI): ORG's tracking world, as the contributor host's.
 	graph->GetMemorySnapshotProvider().SetProvider(memory::CreateECSMemorySnapshotProvider());
 	graph->CompileStructural();
-	graph->SetPersistentSegment(kUploadPassName, RenderGraph::PersistentSegmentKind::Pre);
 	graph->SetPersistentEpochOrder(m_desc.epochOrder);
 	graph->SetPersistentClosedExecutions(m_desc.closedExecutions);
 	graph->SetExternalPersistentEpochs(m_externalEpochs);

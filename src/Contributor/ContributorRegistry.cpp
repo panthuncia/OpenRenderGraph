@@ -96,7 +96,8 @@ namespace
 		}
 	}
 
-	// An export as a resource description, so accesses to it validate like accesses to the contributor's own.
+	// Describes an export as a resource. Accesses to it then validate the same way as accesses to the contributor's own
+	// resources.
 	ORGResourceDesc ExportResourceDesc(const ORGExportDescriptor& source) noexcept
 	{
 		ORGResourceDesc desc{};
@@ -116,7 +117,8 @@ namespace
 		return desc;
 	}
 
-	// A contributor's resources and passes are named in its namespace: its id's first segment ("sarp." for "sarp.producer").
+	// A contributor's resources and passes are named in its namespace. The namespace is the first segment of its id, for
+	// example "sarp." for "sarp.producer".
 	std::string Namespace(const std::string& contributor) { return contributor.substr(0, contributor.find('.') + 1); }
 
 	uint32_t ResolveExtent(float scale, uint32_t reference) noexcept
@@ -373,8 +375,8 @@ bool ContributorRegistry::HasPendingRebuild() const noexcept
 ORGStatus ContributorRegistry::Compile(uint64_t generation, uint32_t renderWidth, uint32_t renderHeight,
 	uint32_t outputWidth, uint32_t outputHeight, Candidate& output) noexcept
 {
-	// A failed compile does not request another: the next registration, unregistration or RequestRebuild does, so a
-	// host that builds whenever one is requested does not rebuild every frame over a broken declaration.
+	// A failed compile does not request another compile. The next registration, unregistration or RequestRebuild does.
+	// This way a host that builds whenever a build is requested does not rebuild every frame over a broken declaration.
 	std::vector<Contributor> snapshot;
 	{
 		std::unique_lock lock(mutex_);
@@ -414,7 +416,8 @@ ORGStatus ContributorRegistry::Compile(uint64_t generation, uint32_t renderWidth
 		included.emplace(contributor.handle, contributor);
 	}
 
-	// Exports resolve like contributor resources (handle 0, no contributor: never omitted).
+	// Exports resolve like contributor resources. They use handle 0 and belong to no contributor, so they are never
+	// omitted.
 	std::vector<Resource> exports;
 	for (const auto& source : exports_) exports.push_back({0, 0, source.id, ExportResourceDesc(source.desc)});
 	std::unordered_map<std::string, Resource*> resources;
@@ -541,7 +544,8 @@ ORGStatus ContributorRegistry::Compile(uint64_t generation, uint32_t renderWidth
 				}
 			} else {
 				const bool raw = (access.viewFlags & ORG_RG_VIEW_FLAG_RAW_BUFFER) != 0;
-				// The host binds each buffer's whole default view: raw for unstructured buffers, structured otherwise.
+				// The host binds the whole default view of each buffer. That view is raw for unstructured buffers and
+				// structured for the rest.
 				if (access.firstElement || access.elementCount != UINT32_MAX || access.viewFormat != ORG_RG_FORMAT_UNKNOWN
 					|| raw != (resource->desc.structureByteStride == 0)) {
 					SetDiagnostic(pass.contributor, ORG_RG_E_UNSUPPORTED_CAPABILITY, 2, generation,

@@ -160,7 +160,7 @@ private:
 
 struct ExecutableGeneration {
     uint64_t structuralRevision = 0;
-    std::shared_ptr<const compiler::CompiledGraph> graph;
+    std::shared_ptr<const compiler::Schedule> graph;
     // Compiler enumeration is private to this generation. Admission resolves
     // stable slots through this immutable map, never assumes table density.
     std::vector<ResourceSlotId> resourceSlots;
@@ -188,6 +188,11 @@ public:
     const BindingVersion& Resolve(BindingToken token) const;
     rhi::Resource ResolveNative(BindingToken token) const;
     rhi::DescriptorSlot Resolve(ViewToken token) const;
+    // The pass's existing binding of `resource` that requires every view in `views`, from this publication's logical
+    // graph, with those views' tokens in the same order. A pass that declares again with the same slots takes these
+    // instead of editing the graph. Nullopt when no binding of the pass has them all.
+    std::optional<std::pair<BindingToken, std::vector<ViewToken>>> FindBinding(PassId pass, ResourceSlotId resource,
+        std::span<const BindlessViewRequest> views) const;
     const uint64_t revision;
     const std::shared_ptr<const ExecutableGeneration> executable;
     const BindingTable bindings;
@@ -224,6 +229,20 @@ public:
     // Every such slot must carry the same admission state when the edit builds.
     std::vector<uint32_t> SlotsSharingIdentity(uint64_t identity) const;
     void Unbind(ResourceSlotId slot);
+    // Slots that share one backing (one physical identity) are one resource to the compiler: their passes are
+    // ordered and transitioned as users of the same memory. A binding-only edit that changes which slots share a
+    // backing therefore needs a new schedule, and Build compiles one. SharingChanges lists the slots whose set of
+    // sharing slots differs from the base publication's. Empty for an edit that is already structural.
+    std::vector<uint32_t> SharingChanges() const;
+    // The binding this transaction has for a slot index. Null for a retired slot.
+    const BindingVersion* BindingAt(uint32_t index) const noexcept { return m_bindings.TryAt(index); }
+    // Takes the edits that change which slots share a backing out of this transaction, so the rest builds as a
+    // binding-only edit. Each such slot goes back to its base binding, and the bindings taken out are returned for a
+    // structural build of their own (on a worker, say). Slots are taken out in whole sharing sets: after the split,
+    // no slot's sharing set differs from the base. Returns nothing and leaves the transaction unchanged when a
+    // split isn't possible: the edit is structural, or a slot to take out has no bound base binding (a new slot, or
+    // a reserved slot being bound).
+    std::optional<std::vector<std::pair<ResourceSlotId, BindingVersion>>> SplitSharingChanges();
     void RemoveResource(ResourceSlotId slot);
     void SetNativeBindingContract(ResourceSlotId slot, NativeBindingContract contract);
     // Passes are ordered by authored order (hazard direction, tie-breaks). By
@@ -300,6 +319,14 @@ private:
     bool m_structuralChanged = false;
 };
 
+// Checks that `executable` merges exactly the bound slots of `bindings` that share a backing: slots of one backing
+// are one compiled resource, and one compiled resource is one backing. Also checks each epoch executable. Throws
+// std::logic_error naming the slots when not. SynchronousAdmission::Prepare runs it while sharing validation is on.
+void ValidateSharedBackings(const ExecutableGeneration& executable, const BindingTable& bindings);
+// Sharing validation at admission. On by default in debug builds, or with ORG_VALIDATE_SHARING=1 in the environment.
+void SetSharingValidation(bool enabled) noexcept;
+bool SharingValidationEnabled() noexcept;
+
 class GraphProgram {
 public:
     explicit GraphProgram(std::function<void(std::shared_ptr<const void>)> retireOwnership = {});
@@ -317,6 +344,23 @@ private:
     std::shared_ptr<const SelectedPublication> m_selected;
     std::function<void(std::shared_ptr<const void>)> m_retireOwnership;
 };
+
+// One resource used by an external client. An external client is GPU work recorded outside any graph, such as
+// uploads or readbacks. It is ordered against graph executions through the same admission.
+// See docs/job-graphs.md, "External clients".
+struct ExternalAccess {
+    BindingVersion binding;  // the backing, with its admission state
+    compiler::CompileRange range;
+    compiler::CompileResourceState state;
+};
+// Builds the publication for an external client: a graph with a single pass on `queue` that makes every access.
+// `base` is an empty program the caller keeps; nothing is installed into it.
+// Admit the result like any execution (SynchronousAdmission::Prepare, Readmit, Commit). Its entry barriers and waits
+// hand each resource over from its previous user; record them before the client's own commands.
+// The structure only depends on the shapes and states of the accesses, so repeated shapes hit the schedule cache.
+std::shared_ptr<const SelectedPublication> BuildExternalPublication(const GraphProgram& base,
+    std::span<const compiler::CompileQueue> queues, uint32_t queue, std::span<const ExternalAccess> accesses,
+    compiler::CompileWorkspace& workspace);
 
 // Adapter into the existing production state/hazard ledgers. Recording payloads
 // remain caller-owned; this view roots the exact selected publication.

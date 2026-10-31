@@ -219,7 +219,8 @@ inline ResourceIdentifierAndRange Subresources(const char* r,
 // If we have a ResourceIdentifierAndRange, ask the builder to resolve it into an actual ResourceAndRange:
 class RenderGraph;
 
-// The graph calls pass builders make (RenderGraph's, defined with it), so that declaring a pass does not need RenderGraph.h.
+// The calls that pass builders make into the graph. RenderGraph defines them alongside itself, so declaring a pass
+// does not need RenderGraph.h.
 struct BuilderGraphAccess {
     static ResourceRegistry::RegistryHandle RequestResourceHandle(RenderGraph* graph, Resource* resource, bool allowFailure = false);
     static std::shared_ptr<IResourceResolver> RequestResolver(RenderGraph* graph, ResourceIdentifier const& id, bool allowFailure = false);
@@ -907,8 +908,8 @@ private:
         else if constexpr (detail::StringLike<T>) NameUseViews(ResourceIdentifier{std::string_view{resource}}, result, resolverIdentity, specification);
         return result;
     }
-    // A pipeline's ResourceDescriptorIndex(name) slot resolves to the first shader-visible view declared under that name;
-    // an unordered-access view replaces a shader-resource or constant-buffer one.
+    // A pipeline's ResourceDescriptorIndex(name) slot resolves to the first shader-visible view declared under that name.
+    // An unordered-access view replaces a shader-resource or constant-buffer view.
     void NameUseViews(const ResourceIdentifier& identifier, const DeclaredResourceUse& declared,
         const std::shared_ptr<const void>& resolverIdentity, const ResourceUseSpecification& specification) {
         auto& layout = *resourceUses_;
@@ -923,7 +924,7 @@ private:
             named = ResourceUseLayout::NamedView{identifier.hash, token.use, token.view, kind};
             break;
         }
-        // A resolver with no member yet: the name follows the group, whatever members it has when a frame records.
+        // The resolver has no member yet. The name follows the group, whatever members it has when a frame records.
         if (!named && resolverIdentity) {
             const auto& groups = layout.resolverViews;
             const auto group = std::find_if(groups.begin(), groups.end(), [&](const auto& g) { return g.identity == resolverIdentity; });
@@ -944,6 +945,12 @@ private:
     }
 
 public:
+    // Names a use declared by pointer, so a pipeline's ResourceDescriptorIndex(name) slot resolves to its first
+    // shader-visible view, as when the resource is declared by that name. For a graph with no provider of the name, such
+    // as a job graph whose passes reuse a shader written for the frame graph.
+    void NameUse(const ResourceIdentifier& identifier, const DeclaredResourceUse& use) {
+        NameUseViews(identifier, use, nullptr, {});
+    }
     template<class T> DeclaredResourceUse ShaderResource(const T& resource, SrvView view = {}) {
         return DeclareResourceUse(resource, {rhi::ResourceAccessType::ShaderResource, {view}});
     }

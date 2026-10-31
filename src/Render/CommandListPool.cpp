@@ -97,7 +97,7 @@ CommandListPair CommandListPool::CreateReadyPair() {
     std::string debugName = std::string("ORG ") + QueueKindDebugName(m_type) + (m_secondary ? " Secondary" : "") + " CommandList #" + std::to_string(nameId);
     pair.list->SetName(debugName.c_str());
 
-    // A primary is created recording; a secondary is not (it begins in BeginSecondary).
+    // A primary list is created in the recording state. A secondary list is not. It starts recording in BeginSecondary.
     if (!m_secondary) pair.list->End();
     PreparePairForReuse(pair);
     const auto duration = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(

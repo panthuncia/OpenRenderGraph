@@ -61,8 +61,8 @@ namespace ui {
         DrawToolbar();
         ImGui::Separator();
 
-        // Dummy data only for a host that passes none (a preview of the widget); a host's empty snapshot or missing frame graph
-        // is shown as such, never as made-up rows.
+        // Dummy data is shown only when the host passes no snapshot, as a preview of the widget. An empty snapshot or a
+        // missing frame graph from the host is shown as empty. It is never filled with made-up rows.
         if (snapshot && snapshot->categories.empty() && snapshot->resources.empty() && snapshot->heaps.empty()
             && snapshot->reconciliation.empty()) {
             ImGui::TextUnformatted("No tracked allocations.");
@@ -219,7 +219,7 @@ namespace ui {
 
         GroupSample sample;
         sample.time = now;
-        // The top level of each group ("CS/Feature" -> "CS") keeps the stack readable.
+        // Use only the top level of each group, for example "CS" for "CS/Feature". This keeps the stack readable.
         for (auto& slice : GroupRows(s, groupBy_)) {
             std::string label = slice.label;
             if (const auto slash = label.find('/'); slash != std::string::npos && groupBy_ != GroupBy::Category) {
@@ -947,7 +947,8 @@ namespace ui {
             ImGui::TextDisabled("usage %s, budget %s, attributed %s, unattributed %s", FormatBytes(heap.usageBytes).c_str(),
                 FormatBytes(heap.budgetBytes).c_str(), FormatBytes(heap.attributedBytes).c_str(), FormatBytes(residual).c_str());
 
-            // One bar on the scale of max(usage, budget): attributed, then the rest of usage, and the budget as a mark.
+            // Draw one bar, scaled to the larger of usage and budget. It shows the attributed bytes first, then the rest of
+            // the usage. The budget is drawn as a mark.
             const double scale = static_cast<double>(std::max<uint64_t>({ heap.usageBytes, heap.budgetBytes, heap.attributedBytes, 1 }));
             const float width = std::max(1.0f, ImGui::GetContentRegionAvail().x);
             const float height = ImGui::GetFrameHeight();
@@ -1187,7 +1188,7 @@ namespace ui {
             return;
         }
 
-        // The groups largest in the latest sample get a band each; the rest are summed into "Other".
+        // The largest groups in the latest sample each get their own band. The rest are summed into "Other".
         std::vector<std::string> bands;
         {
             auto latest = groupSamples_.back().groups;
@@ -1404,7 +1405,7 @@ namespace ui {
                 // Stack segments bottom-up
                 double y0 = 0.0;
 
-                // Optional: keep a deterministic order by sorting per batch (largest on top/bottom, your call)
+                // Sort each batch's slices by size, largest first, so the stacking order is deterministic.
                 std::vector<MemoryCategorySlice> slices = b.categories;
                 std::sort(slices.begin(), slices.end(),
                     [](const auto& a, const auto& b) { return a.bytes > b.bytes; });

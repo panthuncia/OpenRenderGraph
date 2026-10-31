@@ -1,6 +1,7 @@
-// Schedule introspection: a persistent executable's batches, passes, planned state changes and cross-queue waits, with each wait's
-// cause. The compiler keeps no provenance for its waits, so causes are reconstructed here from the same inputs and rules it orders
-// passes by (GraphCompiler.cpp: AnalyzeDependencies, ForEachScheduledUse, OrderUse).
+// Schedule introspection. It reports a persistent executable's batches, passes, planned state changes and
+// cross-queue waits, with the cause of each wait. The compiler does not record why it adds a wait. So this file
+// reconstructs the causes from the same inputs and rules the compiler uses to order passes. See AnalyzeDependencies,
+// ForEachScheduledUse and OrderUse in GraphCompiler.cpp.
 #include "ScheduleTraceBuild.h"
 #include "Render/RenderGraph/PersistentGraph.h"
 
@@ -21,8 +22,9 @@ using compiler::GraphCompileStructure;
 using Cause = ScheduleTrace::WaitCause;
 using ScheduledUses = std::vector<std::pair<uint32_t, bool>>;
 
-// A pass's scheduled uses, once per resource and sorted by it: its accesses, entry and exit states, a write when any of them
-// writes (ForEachScheduledUse).
+// Collects a pass's scheduled uses, as ForEachScheduledUse sees them. These are its accesses and its entry and exit
+// states. The result has one use per resource, sorted by resource. A use counts as a write when any of its sources
+// writes.
 void CollectScheduledUses(const CompilePass& pass, ScheduledUses& out) {
     out.clear();
     out.reserve(pass.accesses.size() + pass.entryStates.size() + pass.exitStates.size());
@@ -39,9 +41,11 @@ void CollectScheduledUses(const CompilePass& pass, ScheduledUses& out) {
     out.resize(count);
 }
 
-// The hazards that order `to` after `from` on the resources both use. A write orders against every use (RAW, WAR, WAW). Two reads
-// are ordered only for a texture, whose uses OrderUse serializes (its layout is planned state), or across backends, which
-// AppendDependencyAccess orders for API ownership; two reads of a buffer on one backend are not ordered at all.
+// The hazards that order `to` after `from` on the resources both passes use. A write is ordered against every use (RAW,
+// WAR, WAW). Two reads are ordered only in these cases:
+// - on a texture, because OrderUse serializes texture uses. A texture's layout is planned state.
+// - across backends, because AppendDependencyAccess orders them for API ownership.
+// Two reads of a buffer on one backend are not ordered at all.
 void AppendResourceCauses(const GraphCompileStructure& structure, uint32_t from, uint32_t to, const ScheduledUses& fromUses,
     const ScheduledUses& toUses, std::vector<Cause>& causes) {
     const bool crossBackend = structure.passes[from].backend != structure.passes[to].backend;
@@ -137,7 +141,7 @@ public:
     void WriteNumber(uint64_t value) { Separate(); out += std::to_string(value); }
     void WriteBool(bool value) { Separate(); out += value ? "true" : "false"; }
     void WriteNull() { Separate(); out += "null"; }
-    // UINT32_MAX (no batch, no pass, the whole frame) as null.
+    // Writes UINT32_MAX as null. It means no batch, no pass, or the whole frame.
     void WriteIndex(uint32_t value) { if (value == UINT32_MAX) WriteNull(); else WriteNumber(value); }
 private:
     void Separate() {
@@ -314,8 +318,9 @@ std::shared_ptr<const ScheduleTrace> BuildScheduleTrace(const persistent::Execut
     }
     if (!graph.states.complete) trace->stateFallbackReason = graph.states.fallbackReason;
 
-    // A relative wait {consumer, producer} is the latest producer batch on its queue that any scheduling edge into the consumer
-    // comes from (Compile's latestProducer): it covers every edge into the consumer from that queue's batches up to it.
+    // A relative wait {consumer, producer} names one batch on the producer's queue. It is the latest batch on that
+    // queue that any scheduling edge into the consumer comes from (latestProducer in Compile). So it covers every edge
+    // into the consumer from that queue's batches, up to and including the producer.
     std::vector<std::vector<uint32_t>> edgesByConsumer(batchCount);
     for (uint32_t index = 0; index < graph.schedulingEdges.size(); ++index) {
         const auto to = graph.schedulingEdges[index].second;

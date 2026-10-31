@@ -29,8 +29,9 @@ std::shared_ptr<ExternalBufferResource> ExternalBufferResource::CreateShared(
 }
 
 namespace {
-	// Field-wise: the descriptors contain unions and padding, whose bytes are not
-	// preserved by member-wise copies, so memcmp would reject identical views.
+	// Compare field by field. The descriptors contain unions and padding, and
+	// member-wise copies do not preserve those bytes. So memcmp would reject
+	// identical views.
 	bool SameBufferViews(const ExternalBufferResource::ViewRequirements& a, const ExternalBufferResource::ViewRequirements& b) {
 		const auto sameSrv = [](const rhi::SrvDesc& x, const rhi::SrvDesc& y) {
 			return x.dimension == y.dimension && x.formatOverride == y.formatOverride && x.componentMapping == y.componentMapping

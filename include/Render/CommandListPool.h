@@ -42,17 +42,19 @@ public:
         uint64_t recycleQueuedCount = 0;
     };
 
-    // secondary: secondary lists (Device::CreateSecondaryCommandList), handed out recycled but not begun: the recorder begins
-    // each with CommandList::BeginSecondary (an external epoch's, ExternalEpochExecution).
+    // secondary: the pool makes secondary lists (Device::CreateSecondaryCommandList). They are handed out recycled but not
+    // begun. The recorder begins each one with CommandList::BeginSecondary. External epochs use these
+    // (ExternalEpochExecution).
     CommandListPool(rhi::Device& device, rhi::QueueKind type, bool secondary = false);
     ~CommandListPool();
     void ShutdownBackgroundReset();
 
     // Acquire a command allocator / list pair ready for recording.
     CommandListPair Request();
-    // Acquire a complete recording generation, then asynchronously replenish
-    // the ready reserve for the next frame. Only startup, demand growth, or an
-    // unavailable preparation worker may create or wait on the calling thread.
+    // Acquire a complete recording generation, then refill the ready reserve for
+    // the next frame in the background. Lists are created or waited for on the
+    // calling thread only at startup, when demand grows, or when no preparation
+    // worker is available.
     std::vector<CommandListPair> AcquireBatch(size_t count, uint64_t completedFenceValue);
 
     // Publish known future demand without waiting. Compilation/planning may use
@@ -64,8 +66,9 @@ public:
     // RecycleCompleted is called with a sufficiently large fence value.
     void Recycle(CommandListPair&& pair, uint64_t fenceValue);
 
-    // Frame ownership already proves GPU completion. Reset on the next
-    // recording worker, without scheduling work from the retirement thread.
+    // The frame's ownership already proves that the GPU is done with the pair.
+    // The pair is reset on the next recording worker. No work is scheduled from
+    // the retirement thread.
     void RecycleForNextRequest(CommandListPair&& pair);
     void Discard(CommandListPair&& pair) noexcept;
 

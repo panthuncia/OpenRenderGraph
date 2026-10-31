@@ -82,7 +82,8 @@ public:
 	rhi::Timeline& GetFence(QueueSlotIndex i)           noexcept { return m_slots[ToUnderlying(i)].fence->Get(); }
 	const rhi::Timeline& GetFence(QueueSlotIndex i) const noexcept { return m_slots[ToUnderlying(i)].fence->Get(); }
 	rhi::TimelinePtr& GetFencePtr(QueueSlotIndex i)     noexcept { return *m_slots[ToUnderlying(i)].fence; }
-	/// The slot's fence, shared: valid for its holder after the registry is cleared (a graph rebuild).
+	/// The slot's fence, as a shared pointer. It stays valid for its holder after the registry is cleared, for example by
+	/// a graph rebuild.
 	std::shared_ptr<rhi::TimelinePtr> GetFenceOwner(QueueSlotIndex i) const noexcept { return m_slots[ToUnderlying(i)].fence; }
 	CommandListPool* GetPool(QueueSlotIndex i)    const noexcept { return m_slots[ToUnderlying(i)].pool.get(); }
 	std::shared_ptr<CommandListPool> GetSharedPool(QueueSlotIndex i) const noexcept { return m_slots[ToUnderlying(i)].pool; }

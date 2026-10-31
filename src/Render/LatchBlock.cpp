@@ -12,8 +12,9 @@
 namespace org {
 
 namespace {
-// Device-local where the host can write it (ReBAR, D3D12's GPU upload heap): every dispatch reading its region reads video memory,
-// not the host's over the bus. Else the host's memory.
+// Use device-local memory that the host can write, when the device has it (ReBAR, or D3D12's GPU upload heap).
+// Then every dispatch that reads its region reads video memory instead of host memory over the bus.
+// Otherwise use host memory.
 rhi::HeapType LatchHeap() {
     static const rhi::HeapType heap = [] {
         ResourceAllocationFeatureInfo allocation{};
@@ -29,8 +30,9 @@ rhi::HeapType LatchHeap() {
 LatchBlock::LatchBlock(std::string name, uint32_t bytesPerSlot, uint32_t slots)
     : m_name(std::move(name)), m_stride((bytesPerSlot + 255u) & ~255u), m_slots(slots) {
     if (!bytesPerSlot || !slots) throw std::invalid_argument("Latch block '" + m_name + "' needs a size and slots");
-    // Words, read as a ByteAddressBuffer; host-visible and coherent, written by the host every execution (never read back: device-local
-    // host-visible memory is write-combined).
+    // The buffer holds 32-bit words and is read as a ByteAddressBuffer. It is host-visible and coherent.
+    // The host writes it every execution. The host never reads it back, because device-local host-visible memory is
+    // write-combined.
     const uint64_t bytes = uint64_t(m_stride) * m_slots;
     m_buffer = Buffer::CreateUnmaterializedStructuredBuffer(static_cast<uint32_t>(bytes / 4), 4, false, false, false, LatchHeap());
     m_buffer->SetName(m_name);

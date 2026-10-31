@@ -106,6 +106,31 @@ pass declared under the same name (`builder.ShaderResource(Builtin::X)` and frie
 wins). An undeclared slot gets `UINT32_MAX` only when it is optional, belongs to a feature domain the pass names nothing
 of, or matches `BindOptions::absentPrefixes`; otherwise binding throws. The BRSL macro scan only names the slots.
 
+#### Declarations that change
+
+A pass whose declaration changes at run time implements `org::IDynamicDeclaredResources`. `DeclaredResourcesChanged()`
+asks the graph to call `Declare` again. What the graph does then depends on what changed:
+
+- **Nothing:** a declaration with the same content as before builds nothing. The pass takes the new bindings.
+- **The same structure:** when every use and view maps onto slots the executable already has (a resolver group member
+  that arrived within the group's capacity, say), the pass is remapped with no build.
+- **Anything else:** a structural build. By default it runs on a worker (`PreparesOnlyDeclaredWork()` is true), and
+  frames keep preparing against the old declaration until it installs. So `Prepare` and `Record` must use only what
+  their bindings declare:
+  - snapshot work in `Declare`, keep the snapshot in the bindings, and reserve from it (`FrameWorkQueue::ReserveAvailable`);
+  - publish tables through the layout and row count the bindings carry;
+  - run only the views the bindings declare.
+
+  A pass that can't do this says `PreparesOnlyDeclaredWork()` false, and its new declarations then build inline, which
+  stalls that frame.
+- **The same resources in other places:** a pass whose pointer declarations are places, not identities (a texture
+  recreated on resize takes the old one's place), says `RebindsConcreteResources()` true. Swapping in a resource of the
+  same shape is then a binding edit. It must say `PreparesOnlyDeclaredWork()` false.
+
+Resources rebound without a build are still ordered correctly: when a rebinding makes two slots share a backing (or stop
+sharing one), the graph builds the new dependencies first (`RenderGraph::SetSharingChangePolicy`). Prefer declaring
+by name a resource a provider or resolver supplies: a resolver's set changes in place, as a binding edit.
+
 ### 3) Add passes through an extension
 
 ```cpp

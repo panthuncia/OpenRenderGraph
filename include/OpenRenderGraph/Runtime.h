@@ -21,6 +21,7 @@ class IRenderGraphSettingsService;
 }
 
 namespace org::persistent { class ResourceSequencer; }
+namespace org::compiler { class ScheduleCache; }
 
 namespace org {
 
@@ -69,6 +70,10 @@ public:
 	void RegisterQueue(rhi::Queue queue);
 	// The queue is about to be destroyed: its submissions have completed, or are covered by whoever destroys it.
 	void UnregisterQueue(rhi::Queue queue);
+	// A timeline its owner is about to destroy, after waiting for everything signalled on it (a graph's queue fence, an
+	// external client's slot timeline). Points on it read as reached from now on, as an unregistered queue's do: a
+	// destroyed timeline would read as never reached.
+	void NoteTimelineDestroyed(const rhi::Timeline& timeline);
 	void RegisterDevice(rhi::Device device);
 
 	// Every registered queue's progress now.
@@ -91,6 +96,8 @@ public:
 	rhi::TimelineHandle TimelineHandleOf(uint64_t identity) const;
 	// The resource ledgers every graph's admission on the runtime shares (docs/job-graphs.md, "Phase 2 investigation").
 	const std::shared_ptr<persistent::ResourceSequencer>& Sequencer() const noexcept { return m_sequencer; }
+	// The schedule cache shared by every graph on this runtime (compiler::ScheduleCache).
+	const std::shared_ptr<compiler::ScheduleCache>& Schedules() const noexcept { return m_schedules; }
 
 private:
 	explicit Runtime(Desc desc);
@@ -104,10 +111,11 @@ private:
 	std::shared_ptr<runtime::IRenderGraphSettingsService> m_settings;
 	rhi::TimelinePtr m_readbackFence, m_copyReadbackFence;
 	std::shared_ptr<persistent::ResourceSequencer> m_sequencer;
+	std::shared_ptr<compiler::ScheduleCache> m_schedules;
 
 	mutable std::mutex m_queuesMutex;
 	std::vector<rhi::Queue> m_queues;
-	// The progress timelines of unregistered queues (destroyed with them): device and handle.
+	// The progress timelines of unregistered queues (destroyed with them), and timelines noted destroyed: device and handle.
 	std::vector<std::pair<void*, rhi::TimelineHandle>> m_retiredTimelines;
 
 	mutable std::mutex m_identitiesMutex;

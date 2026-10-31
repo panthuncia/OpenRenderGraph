@@ -8,7 +8,7 @@ namespace {
 class DefaultUploadService final : public IUploadService {
 public:
     DefaultUploadService() = default;
-    // A graph's own (CreateGraphUploadService).
+    // A graph's own upload service, which owns its UploadManager (CreateGraphUploadService).
     explicit DefaultUploadService(std::unique_ptr<UploadManager> owned) : m_owned(std::move(owned)) {}
 
     void Initialize() override {

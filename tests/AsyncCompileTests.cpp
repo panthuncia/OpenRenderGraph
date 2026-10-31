@@ -306,7 +306,7 @@ int main() {
     ENSURE(graph->edges == *Input().expectedEdges);
     ENSURE((graph->topologicalOrder == std::vector<uint32_t>{0,1,2}));
     ENSURE((graph->criticality == std::vector<uint32_t>{2,1,0}));
-    ENSURE(graph->stage == CompiledGraphStage::SymbolicSchedule);
+    ENSURE(graph->stage == ScheduleStage::SymbolicSchedule);
     ENSURE(ValidateSymbolicSchedule(Input(), *graph).empty());
     {
         auto packedInput = Input();
@@ -320,16 +320,16 @@ int main() {
         ENSURE(packed->batches.size() == 1);
         ENSURE(packed->batches[0].passes == (std::vector<uint32_t>{0, 1}));
         ENSURE(ValidateSymbolicSchedule(packedInput, *packed).empty());
-        auto bundle = std::make_shared<const CompiledGraphBundle>(CompiledGraphBundle{1, packed, owned});
+        auto bundle = std::make_shared<const ScheduleBundle>(ScheduleBundle{1, packed, owned});
         auto layout = BuildExecutionLayout(bundle, *owned);
         ENSURE(layout->placements == (std::vector<ExecutionPassPlacement>{{0,0,0},{1,0,0}}));
     }
     {
         auto prepared = std::make_shared<const GraphCompileInput>(Input());
         auto compatibleGraph = CompileGraph(prepared, workspace, cancelled);
-        CompiledGraphBundle compatible{1, compatibleGraph, prepared};
+        ScheduleBundle compatible{1, compatibleGraph, prepared};
         ENSURE(IsExecutionCompatible(compatible, *prepared));
-        auto compatibleOwner = std::make_shared<const CompiledGraphBundle>(compatible);
+        auto compatibleOwner = std::make_shared<const ScheduleBundle>(compatible);
         auto layout = BuildExecutionLayout(compatibleOwner, *prepared);
         ENSURE(layout->bundle == compatibleOwner);
         ENSURE(layout->placements == (std::vector<ExecutionPassPlacement>{
@@ -340,7 +340,7 @@ int main() {
         duplicateMap.structure.passes[2].preparedPassIndex = 1;
         auto duplicateGraph = CompileGraph(
             std::make_shared<const GraphCompileInput>(duplicateMap), workspace, cancelled);
-        ENSURE(!IsExecutionCompatible(CompiledGraphBundle{2, duplicateGraph,
+        ENSURE(!IsExecutionCompatible(ScheduleBundle{2, duplicateGraph,
             std::make_shared<const GraphCompileInput>(duplicateMap)}, duplicateMap));
         bool rejectedLayout = false;
         try { BuildExecutionLayout(compatibleOwner, wrongGeneration); }
@@ -356,7 +356,7 @@ int main() {
         input.structure.passes[1].preferredQueueSlot = 1;
         auto owned = std::make_shared<const GraphCompileInput>(input);
         auto compiled = workspace.Compile(owned, cancelled);
-        auto bundle = std::make_shared<const CompiledGraphBundle>(CompiledGraphBundle{1, compiled, owned});
+        auto bundle = std::make_shared<const ScheduleBundle>(ScheduleBundle{1, compiled, owned});
         ExecutionTimelineAdmission admission({{10, 100}, {20, 200}});
         std::vector<std::vector<ExecutionTimelinePoint>> waits(3);
         waits[0] = {{30, 2}, {30, 7}, {30, 1}, {10, 100}};
@@ -423,7 +423,7 @@ int main() {
         ENSURE(rejects([&] { bounded.RetireCompleted(completed); }));
         completed[0].value = 3;
         ENSURE(rejects([&] { bounded.RetireCompleted(completed); }));
-        auto incompatible = std::make_shared<CompiledGraphBundle>(*bundle);
+        auto incompatible = std::make_shared<ScheduleBundle>(*bundle);
         incompatible->input = std::make_shared<const GraphCompileInput>(Input(2));
         ExecutionTimelineAdmission clean({{10,0},{20,0}});
         ENSURE(rejects([&] { clean.Prepare(incompatible, waits); }));
@@ -460,7 +460,7 @@ int main() {
         auto lastPacket = std::make_shared<Packet>();
         auto failureInput = std::make_shared<GraphCompileInput>(*bundle->input);
         auto failureGraph = workspace.Compile(failureInput, cancelled);
-        auto failureBundle = std::make_shared<CompiledGraphBundle>(CompiledGraphBundle{
+        auto failureBundle = std::make_shared<ScheduleBundle>(ScheduleBundle{
             bundle->sequence, std::move(failureGraph), failureInput});
         ENSURE(rejects([&] { submission.SubmitPrepared(failureBundle,
             std::vector<std::vector<ExecutionTimelinePoint>>(3), {firstPacket, failedPacket, lastPacket}); }));

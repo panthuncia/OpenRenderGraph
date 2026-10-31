@@ -3,6 +3,7 @@
 #include <fstream>
 #include "Render/RenderGraph/PersistentGraph.h"
 #include "TestSupport.h"
+#include "ScheduleChecks.h"
 #include "Render/RenderGraph/GraphReplay.h"
 #include "Render/RenderGraph/RhiExecution.h"
 #include "GraphReplayRunner.h"
@@ -16,12 +17,6 @@
 using namespace org::persistent;
 using namespace org::compiler;
 template<class F> bool Rejects(F&& fn) { try { fn(); } catch (const std::exception&) { return true; } return false; }
-BindingVersion Binding(uint64_t id) {
-    BindingVersion b;
-    b.identity = id; b.backingRevision = id; b.shape = {1,1,false};
-    b.owner = std::make_shared<const uint64_t>(id);
-    return b;
-}
 struct ManualTasks final : org::runtime::ITaskService {
     struct Scope final : org::runtime::ITaskScope {
         ManualTasks& owner;
@@ -52,145 +47,102 @@ struct ManualTasks final : org::runtime::ITaskService {
     }
 };
 
-// Independent small reference check: each conflicting authored access must
-// precede its later user in execution order. No compiler helpers are called.
-bool CheckConflicts(const CompiledGraph& graph) {
-    if (!graph.structure) return false;
-    std::vector<uint32_t> position(graph.structure->passes.size(), UINT32_MAX);
-    uint32_t n = 0;
-    for (const auto& batch : graph.batches)
-        for (auto pass : batch.passes) {
-            if (pass >= position.size() || position[pass] != UINT32_MAX) return false;
-            position[pass] = n++;
-        }
-    if (n != position.size()) return false;
-    const auto count = position.size();
-    std::vector<uint8_t> happensBefore(count * count);
-    std::vector<uint8_t> authored(count * count);
-    for (const auto* edges : {&graph.structure->explicitEdges,&graph.structure->placementEdges})
-        for (auto [from,to] : *edges) {
-            if (from >= count || to >= count) return false;
-            authored[from * count + to] = 1;
-        }
-    for (size_t k = 0; k < count; ++k)
-        for (size_t i = 0; i < count; ++i)
-            for (size_t j = 0; j < count; ++j)
-                if (authored[i * count + k] && authored[k * count + j]) authored[i * count + j] = 1;
-    std::vector<uint32_t> lastOnQueue(graph.structure->queues.size(),UINT32_MAX);
-    for (const auto& batch : graph.batches) {
-        if (batch.queue >= lastOnQueue.size()) return false;
-        const auto& queue = graph.structure->queues[batch.queue];
-        if (!queue.active) return false;
-        auto& previous = lastOnQueue[batch.queue];
-        for (auto pass : batch.passes) {
-            const auto& declaration = graph.structure->passes[pass];
-            // Pass backend affinity and queue backend-instance identity are
-            // different domains; authored compatibility is the numeric contract.
-            if (std::find(declaration.compatibleQueueSlots.begin(),declaration.compatibleQueueSlots.end(),batch.queue)
-                    == declaration.compatibleQueueSlots.end()) return false;
-            if (previous != UINT32_MAX) happensBefore[previous * count + pass] = 1;
-            previous = pass;
-        }
-    }
-    for (const auto& wait : graph.relativeWaits) {
-        if (wait.producerBatch >= graph.batches.size() || wait.consumerBatch >= graph.batches.size()) return false;
-        const auto& producer = graph.batches[wait.producerBatch];
-        const auto& consumer = graph.batches[wait.consumerBatch];
-        if (producer.passes.empty() || consumer.passes.empty()) return false;
-        happensBefore[producer.passes.back() * count + consumer.passes.front()] = 1;
-    }
-    for (size_t k = 0; k < count; ++k)
-        for (size_t i = 0; i < count; ++i)
-            for (size_t j = 0; j < count; ++j)
-                if (happensBefore[i * count + k] && happensBefore[k * count + j]) happensBefore[i * count + j] = 1;
-    for (auto [from,to] : graph.structure->explicitEdges)
-        if (from >= count || to >= count || !happensBefore[from * count + to]) return false;
-    for (auto [from,to] : graph.structure->placementEdges)
-        if (from >= count || to >= count || !happensBefore[from * count + to]) return false;
-    for (uint32_t a = 0; a < position.size(); ++a)
-        for (uint32_t b = a + 1; b < position.size(); ++b)
-            for (const auto& x : graph.structure->passes[a].accesses)
-                for (const auto& y : graph.structure->passes[b].accesses)
-                    if (x.resourceIndex == y.resourceIndex && (x.write || y.write)
-                        && !happensBefore[a * count + b]
-                        && !(authored[b * count + a] && happensBefore[b * count + a])) return false;
-    return true;
-}
-// Test-only full-cell simulation, deliberately independent of production range
-// partitioning, dense placement maps and symbolic-state validation helpers.
-bool CheckStates(const CompiledGraph& graph) {
-    if (!graph.structure || !graph.states.complete) return false;
-    const auto& structure = *graph.structure;
-    if (structure.resourceShapes.size() != structure.resourceIDs.size()) return false;
-    struct Cell {
-        CompileResourceState state;
-        uint32_t pass = UINT32_MAX, batch = UINT32_MAX;
-        bool terminal = false;
-    };
-    std::vector<std::vector<Cell>> cells;
-    for (const auto shape : structure.resourceShapes) {
-        if (uint64_t{shape.mips} * shape.slices > 2'000'000) return false;
-        cells.emplace_back(size_t{shape.mips} * shape.slices);
-    }
-    auto visit = [&](uint32_t resource, CompileRange range, auto&& fn) {
-        if (resource >= cells.size()) return false;
-        const auto shape = structure.resourceShapes[resource];
-        if (!range.mips || !range.slices || range.mip >= shape.mips || range.slice >= shape.slices
-            || range.mips > shape.mips - range.mip || range.slices > shape.slices - range.slice) return false;
-        for (uint32_t slice = range.slice; slice < range.slice + range.slices; ++slice)
-            for (uint32_t mip = range.mip; mip < range.mip + range.mips; ++mip)
-                if (!fn(cells[resource][size_t{slice} * shape.mips + mip])) return false;
-        return true;
-    };
-    auto normalized = [&](uint32_t resource, CompileResourceState state) {
-        if (!structure.resourceShapes[resource].hasLayout) state.layout = 0;
-        return state;
-    };
-    std::vector<bool> consumed(graph.states.steps.size());
-    for (uint32_t batch = 0; batch < graph.batches.size(); ++batch) {
-        for (const auto passIndex : graph.batches[batch].passes) {
-            if (passIndex >= structure.passes.size()) return false;
-            for (size_t i = 0; i < graph.states.steps.size(); ++i) {
-                const auto& step = graph.states.steps[i];
-                if (step.pass != passIndex || step.batch != batch) continue;
-                if (!visit(step.resource, step.range, [&](Cell& cell) {
-                    if (cell.pass != step.previousPass || cell.batch != step.previousBatch
-                        || cell.state != step.before || cell.pass == passIndex) return false;
-                    cell = {step.after,passIndex,batch,false};
-                    return true;
-                })) return false;
-                consumed[i] = true;
-            }
-            const auto& pass = structure.passes[passIndex];
-            for (const auto& use : pass.entryStates) {
-                if (!visit(use.resource,use.range,[&](Cell& cell) {
-                    return cell.pass == passIndex && cell.batch == batch
-                        && cell.state == normalized(use.resource,use.state);
-                })) return false;
-            }
-            for (const auto& use : pass.exitStates) {
-                if (!visit(use.resource,use.range,[&](Cell& cell) {
-                    if (cell.pass != passIndex || cell.batch != batch) return false;
-                    cell.state = normalized(use.resource,use.state);
-                    return true;
-                })) return false;
-            }
-        }
-    }
-    if (std::find(consumed.begin(),consumed.end(),false) != consumed.end()) return false;
-    for (const auto& final : graph.states.finalStates) {
-        if (!visit(final.resource,final.range,[&](Cell& cell) {
-            if (cell.terminal || cell.batch != final.batch || cell.state != final.state) return false;
-            cell.terminal = true;
-            return true;
-        })) return false;
-    }
-    for (const auto& resource : cells)
-        for (const auto& cell : resource)
-            if ((cell.pass != UINT32_MAX) != cell.terminal) return false;
-    return true;
-}
 int main() {
+    {
+        // Schedule cache: a build with the same compile input as an earlier one (from another program, at another
+        // generation) reuses its schedule and input. A different structure compiles a new schedule.
+        auto cache = std::make_shared<ScheduleCache>();
+        CompileWorkspace workspace; std::atomic_bool cancelled{false};
+        workspace.SetScheduleCache(cache);
+        auto build = [&](bool write) {
+            GraphProgram program;
+            auto edit = program.BeginEdit();
+            auto binding = Binding(77); binding.shape = {1,1,true};
+            const auto slot = edit.AddResource(binding.shape,binding);
+            const CompileResourceState state{static_cast<uint64_t>(write ? rhi::ResourceAccessType::UnorderedAccess : rhi::ResourceAccessType::ShaderResource),
+                static_cast<uint64_t>(write ? rhi::ResourceLayout::UnorderedAccess : rhi::ResourceLayout::ShaderResource),
+                static_cast<uint64_t>(rhi::ResourceSyncState::ComputeShading), write};
+            edit.Declare(edit.AddPass({}),slot,{},state);
+            edit.Declare(edit.AddPass({}),slot,{},state);
+            auto selected = edit.Build(workspace,cancelled);
+            if (!selected || !program.Install(selected)) throw std::logic_error("Schedule cache program did not install");
+            return selected;
+        };
+        const auto first = build(true);
+        const auto second = build(true);
+        CHECK(second->executable->graph == first->executable->graph);
+        CHECK(second->executable->compileInput == first->executable->compileInput);
+        CHECK(second->executable->graph->structure.get() == &second->executable->compileInput->structure);
+        CHECK(second->executable != first->executable);
+        const auto other = build(false);
+        CHECK(other->executable->graph != first->executable->graph);
+        const auto stats = cache->GetStats();
+        CHECK(stats.hits == 1 && stats.misses == 2 && stats.entries == 2);
+        // Leased or validated inputs are never cached.
+        GraphCompileInput leased; leased.leases.push_back(std::make_shared<const int>(0));
+        CHECK(!ScheduleCache::Cacheable(leased));
+    }
+    {
+        // An external client (for example an upload's copies) goes through the shared sequencer like a graph execution:
+        // - the copy starts from the texture's current state,
+        // - a graph that samples the texture next starts from CopyDest and waits for the copy's signal,
+        // - a second client of the same shape reuses the cached schedule.
+        auto sequencer = std::make_shared<ResourceSequencer>();
+        auto cache = std::make_shared<ScheduleCache>();
+        CompileWorkspace workspace; std::atomic_bool cancelled{false};
+        workspace.SetScheduleCache(cache);
+        const CompileResourceState home{static_cast<uint64_t>(rhi::ResourceAccessType::Common),
+            static_cast<uint64_t>(rhi::ResourceLayout::Common), static_cast<uint64_t>(rhi::ResourceSyncState::None), false};
+        const CompileResourceState copyDest{static_cast<uint64_t>(rhi::ResourceAccessType::CopyDest),
+            static_cast<uint64_t>(rhi::ResourceLayout::CopyDest), static_cast<uint64_t>(rhi::ResourceSyncState::Copy), true};
+        const CompileResourceState sampled{static_cast<uint64_t>(rhi::ResourceAccessType::ShaderResource),
+            static_cast<uint64_t>(rhi::ResourceLayout::ShaderResource), static_cast<uint64_t>(rhi::ResourceSyncState::PixelShading), false};
+        auto backing = [&](uint32_t index) {
+            auto state = std::make_shared<PreparedBackingState>();
+            state->graphResourceID = 1; state->resource = {index,1}; state->shape = {1,1,true};
+            state->regions = std::make_shared<const std::vector<PreparedStateRegion>>(std::vector<PreparedStateRegion>{{{0,1,0,1}, home}});
+            auto binding = Binding(index); binding.identity = (uint64_t{1} << 32) | index; binding.shape = state->shape;
+            binding.admission = state;
+            return binding;
+        };
+        auto entryBefore = [](const FrameAdmission& frame) {
+            for (const auto& batch : frame.barriers.batches)
+                for (const auto& barrier : batch.textures) return barrier.beforeLayout;
+            return rhi::ResourceLayout::Undefined;
+        };
+        GraphProgram empty;
+        const std::vector<CompileQueue> queues{{}};
+        const std::array<ExecutionTimelinePoint,1> queue{{{51,0}}};
+        SynchronousAdmission external(4, {}, sequencer), frames(4, {}, sequencer);
+        const std::array<ExternalAccess,1> upload{{{backing(95), {0,1,0,1}, copyDest}}};
+        auto client = BuildExternalPublication(empty, queues, 0, upload, workspace);
+        CHECK(client && client->executable->graph->batches.size() == 1);
+        auto copy = external.Prepare(client, queue);
+        CHECK(entryBefore(copy) == rhi::ResourceLayout::Common);
+        GraphExecutionTimeline receipt; receipt.batches.resize(1); receipt.batches[0].signal = {51,1};
+        {
+            auto hold = external.HoldSequencer();
+            external.Readmit(copy);
+            external.Commit(copy, receipt);
+        }
+        // The frame graph that samples it, on another timeline.
+        GraphProgram frameProgram;
+        auto edit = frameProgram.BeginEdit();
+        auto binding = backing(95);
+        const auto slot = edit.AddResource(binding.shape, binding);
+        edit.Declare(edit.AddPass({}), slot, {}, sampled);
+        auto frame = edit.Build(workspace, cancelled);
+        CHECK(frame && frameProgram.Install(frame));
+        const std::array<ExecutionTimelinePoint,1> frameQueue{{{52,0}}};
+        auto read = frames.Prepare(frame, frameQueue);
+        CHECK(entryBefore(read) == rhi::ResourceLayout::CopyDest);
+        CHECK(read.incomingWaits[0] == std::vector<ExecutionTimelinePoint>{ExecutionTimelinePoint(51,1)});
+        frames.Abandon(read);
+        // Another upload of the same shape into another texture: the same schedule.
+        const std::array<ExternalAccess,1> second{{{backing(96), {0,1,0,1}, copyDest}}};
+        auto again = BuildExternalPublication(empty, queues, 0, second, workspace);
+        CHECK(again && again->executable->graph == client->executable->graph);
+    }
     {
         // A D3D12 copy queue's lists take no copy layouts (copies leave textures in Common): its copy steps leave Common, so the
         // next use transitions from what the texture is really in. Another queue's copy steps keep CopyDest.
@@ -2110,7 +2062,7 @@ int main() {
             backing.regions = std::make_shared<const std::vector<PreparedStateRegion>>(
                 std::initializer_list<PreparedStateRegion>{{{0,1,0,1},{0,0,0,false}}});
             backing.aliasHeap = heap; backing.aliasHeapIdentity = heap.get();
-            backing.aliasOffset = offset; backing.aliasSize = 256;
+            backing.aliasOffset = offset; backing.aliasSize = 256; backing.aliasPoolID = 1;
             binding.admission = std::make_shared<const PreparedBackingState>(backing);
             return binding;
         };

@@ -85,8 +85,8 @@ PixelBuffer::PixelBuffer(const TextureDescription& desc, bool materialize)
 {
     m_hasLayout = true;
     m_desc = desc;
-    // Graph declarations can precede backing allocation. Keep range validation
-    // tied to the logical texture description from construction onward.
+    // Graph declarations can come before the backing is allocated. So from
+    // construction on, range validation uses the logical texture description.
     m_mipLevels = ResolveTextureMipLevels(desc);
     m_arraySize = desc.isCubemap ? 6u * desc.arraySize : (desc.isArray ? desc.arraySize : 1u);
     if (materialize) {
@@ -188,7 +188,7 @@ bool PixelBuffer::TryGetRHIResourceDesc(rhi::ResourceDesc& outDesc) const {
 	outDesc.texture.width = width;
 	outDesc.texture.height = height;
 	outDesc.texture.depthOrLayers = static_cast<uint16_t>(arraySize);
-	// The backing's own count (ResolveTextureMipLevels: authored levels take precedence over generateMipMaps).
+	// Use the same mip count as the backing. ResolveTextureMipLevels prefers authored levels over generateMipMaps.
 	outDesc.texture.mipLevels = static_cast<uint16_t>(m_mipLevels);
 	outDesc.texture.sampleCount = 1;
 	outDesc.texture.initialLayout = rhi::ResourceLayout::Undefined;
@@ -206,9 +206,9 @@ void PixelBuffer::RefreshAPIRepresentationDescriptors(BackendInstanceId backendI
 	// render passes continue to access the superseded primary-only backing.
 	auto resource = Resource::GetAPIResource(backendInstance);
 	if (!resource) return;
-	// An attached representation replaces (and may be created before) the normal
-	// GpuTextureBacking.  Do not inherit cached dimensions from that superseded
-	// backing: the logical description is authoritative for every representation.
+	// An attached representation replaces the normal GpuTextureBacking, and may
+	// be created before it. Do not take cached dimensions from that replaced
+	// backing. The logical description sets the dimensions of every representation.
 	const uint16_t resolvedMipLevels = ResolveTextureMipLevels(m_desc);
 	const uint32_t resolvedArraySize = m_desc.isCubemap
 		? 6u * m_desc.arraySize : (m_desc.isArray ? m_desc.arraySize : 1u);

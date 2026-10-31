@@ -51,7 +51,8 @@ DeviceTable::DeviceTable(rhi::Device device) : m_device(device) {
 }
 
 DeviceTable::~DeviceTable() {
-	// Whatever the contributors did not destroy goes with the host, after the graph (no GPU work can still use it).
+	// Destroy whatever the contributors did not destroy themselves. This runs with the host, after the graph is gone, so
+	// no GPU work can still use these objects.
 	std::scoped_lock lock(m_mutex);
 	for (auto& [_, pipeline] : m_pipelines) DeletionManager::GetInstance().MarkForDelete(std::move(pipeline));
 	for (auto& [_, signature] : m_signatures) DeletionManager::GetInstance().MarkForDelete(std::move(signature));

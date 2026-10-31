@@ -43,9 +43,9 @@ std::byte* StagedUploadBatch::Stage(UploadTarget target, size_t dstOffset, size_
     auto& page = m_pages[m_current];
     const size_t offset = page.used;
     page.used += aligned;
-    // Consecutive array/journal ranges are commonly staged one element at a time. Keep them as one copy when
-    // both source and destination are contiguous; this substantially reduces command-recording work without
-    // changing ordering or merging across the alignment padding between non-aligned writes.
+    // Consecutive array or journal ranges are often staged one element at a time. Keep them as one copy when
+    // both the source and the destination are contiguous. This greatly reduces command-recording work. It does
+    // not change ordering, and it never merges across the alignment padding between non-aligned writes.
     if (!m_entries.empty()) {
         auto& previous = m_entries.back();
         if (previous.target == target && previous.page == page.buffer &&
@@ -83,9 +83,10 @@ bool StagedUploadBatch::Record(rhi::Device device) {
     BT_ZONE_SCOPE("ORG.Upload.RecordBatch");
     m_recorded = false;
     if (m_entries.empty() || !device) return false;
-    // Before resolving any target: a release after this point moves the serial, and the owner then refuses the list.
+    // Read the serial before resolving any target. A release after this point moves the serial, and the owner then
+    // refuses the list.
     const uint64_t serial = BufferBase::BackingReleaseSerial();
-    // A target without a backing (GetAPIResource throws) leaves the batch to the owner's recording.
+    // GetAPIResource throws for a target without a backing. Then the batch is left to the owner's recording.
     try {
         for (const auto& entry : m_entries)
             if (entry.target.kind != UploadTarget::Kind::PinnedShared || !entry.target.pinned || !entry.page ||
@@ -140,9 +141,10 @@ size_t StagedUploadBatch::RecordCopies(rhi::CommandList& a_list, std::span<const
     const std::function<bool(rhi::ResourceHandle)>& a_include) {
     BT_ZONE_SCOPE("ORG.Upload.RecordCopies");
     size_t copies = 0;
-    // Copies in one list are unordered without a barrier, and batches can overlap (a producer's batch whose submission
-    // never went out, then its replacement): the later write has to win. Per backing, the ranges written since the last
-    // barrier, disjoint (begin -> end); an overlap takes a barrier and starts them again.
+    // Copies in one list are unordered without a barrier. Batches can also overlap. For example, a producer's batch
+    // that was never submitted can be followed by its replacement. The later write has to win. So for each backing,
+    // track the ranges written since the last barrier, kept disjoint as begin -> end. An overlap records a barrier and
+    // starts tracking again.
     std::unordered_map<uint64_t, std::map<uint64_t, uint64_t>> written;
     written.reserve(32);
     auto ordered = [&] {
@@ -169,8 +171,8 @@ size_t StagedUploadBatch::RecordCopies(rhi::CommandList& a_list, std::span<const
                 ranges = &written[key];
             }
             ranges->emplace(begin, end);
-            // A copy past the target's current backing is the producer's defect (staged against another size): the RHI
-            // rejects it and the submission fails, so name it here, where the target's name is known.
+            // A copy past the end of the target's current backing is a bug in the producer, which staged it against another
+            // size. The RHI rejects it and the submission fails. So report it here, where the target's name is known.
             if (const auto* buffer = dynamic_cast<const Buffer*>(entry.target.pinned.get()); buffer && end > buffer->GetSize())
                 spdlog::error("{}: staged upload of {} bytes at {} into '{}' is past its {} bytes", a_owner, entry.size, entry.dstOffset,
                     buffer->GetName(), buffer->GetSize());

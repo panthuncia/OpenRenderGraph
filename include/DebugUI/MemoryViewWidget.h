@@ -37,8 +37,9 @@ namespace ui {
     public:
         // Schedules a readback capture and opens the window.
         void Open(const std::string& passName, Resource* resource, const RangeSpec& range, MemoryViewRequestCaptureFn requestCapture);
-        // The same by identity (a schedule inspector's selection, ScheduleTrace::Resource): requestCapture schedules the readback
-        // with the callback the widget passes (IReadbackService::RequestScheduledReadbackCapture).
+        // Same as above, but takes the resource by identity (ScheduleTrace::Resource), as a schedule inspector selects it.
+        // requestCapture schedules the readback with the callback the widget passes, through
+        // IReadbackService::RequestScheduledReadbackCapture.
         void Open(const std::string& passName, uint64_t resourceId, const std::string& resourceName, const RangeSpec& range,
             std::function<void(ReadbackCaptureCallback)> requestCapture);
 

@@ -27,8 +27,10 @@ struct ResourceBindingSnapshot {
     std::shared_ptr<const BindingTableVersion> bindingTable;
     std::shared_ptr<const AliasHeapGeneration> aliasHeap;
     uint64_t aliasPoolID = 0, aliasOffset = 0, aliasSize = 0;
-    // A resource shared across devices: its representation on each device instance (by index), the primary's being resource.
-    // Empty for a resource only the primary device uses.
+    // The resource is GraphOwnership::ExternalImmutableShaderResource: safe to read through an undeclared descriptor.
+    bool externallyImmutable = false;
+    // For a resource shared across devices: its representation on each device instance, by index. The primary device's
+    // representation is `resource`. Empty for a resource that only the primary device uses.
     std::vector<rhi::Resource> representations;
 };
 

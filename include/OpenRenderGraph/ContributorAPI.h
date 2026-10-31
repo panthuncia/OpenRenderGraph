@@ -1,20 +1,27 @@
 #ifndef OPEN_RENDER_GRAPH_CONTRIBUTOR_API_H
 #define OPEN_RENDER_GRAPH_CONTRIBUTOR_API_H
 
-/* The contributor ABI: how a module outside the host (a DLL) adds resources and passes to the host's render graph.
+/* The contributor ABI. A module outside the host (a DLL) uses it to add resources and passes to the host's render graph.
  *
- * A contributor registers once (RegisterContributor) and is asked to declare its resources and passes whenever the host
- * builds its graph (the build callback, with DeclareResource and DeclarePass). Each build makes a generation of the
- * declarations; the host activates it when its graph is installed and retires it once no frame can still use it.
+ * A contributor registers once (RegisterContributor). Whenever the host builds its graph, it calls the contributor's
+ * build callback, which declares resources and passes with DeclareResource and DeclarePass. Each build makes a new
+ * generation of the declarations. The host activates a generation when its graph is installed. It retires the
+ * generation once no frame can still use it.
  *
- * Every frame, each declared pass is prepared on the host's preparation thread: `prepare` returns an owned packet
- * (ORGPreparedPass) built from the frame, the pass's bindings (resolved views and resources) and the host's per-frame
- * snapshot. The packet is recorded later, possibly after the next frame was prepared, on a recording thread, through a
- * borrowed BasicRHI recorder valid only for that call; it is then submitted, and completed or abandoned, and destroyed.
+ * Every frame, each declared pass is prepared on the host's preparation thread. `prepare` returns an owned packet
+ * (ORGPreparedPass). It builds the packet from the frame, the pass's bindings (resolved views and resources) and the
+ * host's per-frame snapshot. Then the packet goes through these steps:
+ * 1. It is recorded later on a recording thread, possibly after the next frame was prepared. Recording goes through a
+ *    borrowed BasicRHI recorder that is valid only for that call.
+ * 2. It is submitted.
+ * 3. It is completed or abandoned.
+ * 4. It is destroyed.
  *
- * Structures start with structSize and apiVersion; the host rejects a structure smaller than this header's or of another
- * version. Identifiers are namespaced: a contributor's id has at least two segments ("sarp.producer"), and its resources and
- * passes are named in its namespace, the first segment ("sarp.surface.motion"); "org." is reserved. */
+ * Every structure starts with structSize and apiVersion. The host rejects a structure that is smaller than this
+ * header's version of it, or that has another version. Identifiers are namespaced:
+ * - a contributor's id has at least two segments ("sarp.producer"),
+ * - its resources and passes are named in its namespace, which is the id's first segment ("sarp.surface.motion"),
+ * - "org." is reserved. */
 
 #include <stddef.h>
 #include <stdint.h>
@@ -29,7 +36,8 @@ extern "C" {
 #define ORG_RENDER_GRAPH_API_VERSION_2 2u
 #define ORG_RENDER_GRAPH_API_CURRENT ORG_RENDER_GRAPH_API_VERSION_2
 #define ORG_SHADER_COMPILER_SERVICE_ID "org.shader-compiler"
-/* QueryService(ORG_PIPELINE_SERVICE_ID, ORG_PIPELINE_SERVICE_VERSION_1, ORGPipelineService*, sizeof): the host's device. */
+/* The host's device. Query it with QueryService(ORG_PIPELINE_SERVICE_ID, ORG_PIPELINE_SERVICE_VERSION_1,
+ * ORGPipelineService*, sizeof). */
 #define ORG_PIPELINE_SERVICE_ID "org.pipelines"
 #define ORG_PIPELINE_SERVICE_VERSION_1 1u
 
@@ -86,13 +94,15 @@ typedef enum ORGCapabilityBits {
 	ORG_RG_CAP_SERVICE_QUERY = 1ull << 8, ORG_RG_CAP_PIPELINES = 1ull << 9
 } ORGCapabilityBits;
 
-/* mipCount / arraySize: UINT32_MAX for the rest of the resource. */
+/* A mipCount or arraySize of UINT32_MAX covers the rest of the resource. */
 typedef struct ORGSubresourceRange { uint32_t firstMip, mipCount, firstArraySlice, arraySize; } ORGSubresourceRange;
 
-/* A resource the contributor owns. Transient resources may share memory with others whose lifetimes do not overlap
- * (allowAlias); persistent ones keep their contents across frames and builds while their description is unchanged.
- * Render- and output-relative textures are widthScale x heightScale of the reference extent; such a buffer holds byteSize
- * bytes per pixel of it (a whole number of structures when structured). */
+/* A resource the contributor owns.
+ * - A transient resource may share memory with other resources whose lifetimes do not overlap (allowAlias).
+ * - A persistent resource keeps its contents across frames and builds while its description is unchanged.
+ * A render- or output-relative texture is widthScale x heightScale of the reference extent. A render- or
+ * output-relative buffer holds byteSize bytes per pixel of that extent. For a structured buffer, this must be a whole
+ * number of structures. */
 typedef struct ORGResourceDesc {
 	uint32_t structSize, apiVersion; const char* id; ORGResourceLifetime lifetime;
 	ORGResourceDimension dimension; ORGHeapClass heapClass; ORGSizingMode sizing; ORGFormat format;
@@ -100,11 +110,14 @@ typedef struct ORGResourceDesc {
 	float widthScale, heightScale; uint32_t allowedUsages, allowAlias; uint64_t aliasingPool;
 } ORGResourceDesc;
 
-/* One access of a pass: resourceId names a contributor resource or a host export. A buffer's views cover the whole buffer
- * (firstElement 0, elementCount UINT32_MAX): raw (ORG_RG_VIEW_FLAG_RAW_BUFFER) for a buffer without a structure stride,
- * structured for one with it; constant buffers whole too.
- * The *_CLEAR accesses are cleared by the host before the pass records, to clearValue: RGBA for render targets and
- * unordered access (as integers for integer formats and buffers), depth in [0] and stencil in [1] for depth. */
+/* One access of a pass. resourceId names a contributor resource or a host export.
+ * A buffer's views cover the whole buffer (firstElement 0, elementCount UINT32_MAX):
+ * - a buffer without a structure stride gets raw views (ORG_RG_VIEW_FLAG_RAW_BUFFER),
+ * - a buffer with a structure stride gets structured views,
+ * - constant buffer views also cover the whole buffer.
+ * The host clears the *_CLEAR accesses to clearValue before the pass records:
+ * - render targets and unordered access take RGBA, as integers for integer formats and buffers,
+ * - depth takes depth in [0] and stencil in [1]. */
 typedef struct ORGResourceAccessDesc {
 	uint32_t structSize, apiVersion; const char* resourceId; ORGBinding binding; ORGAccessKind access;
 	ORGSubresourceRange range; ORGViewKind viewKind; ORGViewDimension viewDimension; ORGFormat viewFormat;
@@ -112,10 +125,12 @@ typedef struct ORGResourceAccessDesc {
 	float clearValue[4];
 } ORGResourceAccessDesc;
 
-/* An access as it resolved for one frame. descriptorIndex is the bindless index of the access's view in the host's
- * resource heap (shader resource, constant buffer and unordered access views; UINT32_MAX otherwise); resource is the
- * resource itself, for copies, indirect arguments and index buffers. Render-target and depth accesses are bound by the
- * host: a render pass's record callback runs inside a render pass over them. */
+/* An access as it resolved for one frame.
+ * - descriptorIndex is the bindless index of the access's view in the host's resource heap. It is set for shader
+ *   resource, constant buffer and unordered access views, and is UINT32_MAX otherwise.
+ * - resource is the resource itself, for copies, indirect arguments and index buffers.
+ * The host binds render-target and depth accesses itself. A render pass's record callback runs inside a render pass
+ * over them. */
 typedef struct ORGBindingInfo {
 	uint32_t structSize, apiVersion; ORGBinding binding; ORGAccessKind access; ORGViewKind viewKind;
 	ORGResourceDimension dimension; ORGFormat resourceFormat, viewFormat; uint32_t width, height,
@@ -123,13 +138,15 @@ typedef struct ORGBindingInfo {
 	basicrhi_c_resource resource;
 } ORGBindingInfo;
 
-/* The frame being prepared. epoch: the host epoch it executes in (GetEpoch's index), UINT32_MAX for a whole frame. */
+/* The frame being prepared. epoch is the host epoch it executes in, as the index GetEpoch takes. It is UINT32_MAX for
+ * a whole frame. */
 typedef struct ORGFrameInfo {
 	uint32_t structSize, apiVersion; uint64_t frameIndex; ORGGenerationHandle generation;
 	uint32_t frameSlot, framesInFlight, renderWidth, renderHeight, outputWidth, outputHeight, epoch, reserved;
 } ORGFrameInfo;
 
-/* The host's per-frame data (view matrices, timing, ...): a host-defined structure, named by typeId. Valid during prepare. */
+/* The host's per-frame data, such as view matrices and timing. The host defines its structure and names it by typeId.
+ * Valid during prepare. */
 typedef struct ORGHostSnapshot { const char* typeId; const void* data; uint64_t size; } ORGHostSnapshot;
 
 typedef struct ORGPrepareContext {
@@ -145,8 +162,9 @@ typedef struct ORGRecordContext {
 	const ORGFrameInfo* frame; const ORGBindingInfo* bindings; basicrhi_c_borrowed_recorder_v1 recorder;
 } ORGRecordContext;
 
-/* An owned packet for one frame. `data` stays the contributor's until destroy. record is required; submitted, completed
- * and abandoned are optional and are not allowed for a pass with invocationRevision. Callbacks may run on any thread. */
+/* An owned packet for one frame. The contributor owns `data` until destroy runs. record is required.
+ * submitted, completed and abandoned are optional. A pass with invocationRevision must not set them.
+ * Callbacks may run on any thread. */
 typedef struct ORGPreparedPass {
 	uint32_t structSize, apiVersion; void* data;
 	void(ORG_RG_CALL* record)(const void* data, const ORGRecordContext* context);
@@ -157,13 +175,15 @@ typedef struct ORGPreparedPass {
 } ORGPreparedPass;
 
 typedef ORGStatus(ORG_RG_CALL* ORGPrepareCallback)(void* userData, const ORGPrepareContext* context, ORGPreparedPass* out);
-/* A hash of everything prepare reads apart from the bindings (settings, pipelines, contributor state). With it, the host
- * may reuse the previous packet while the revision and the bindings are unchanged, and check a packet prepared ahead
- * against the pass's current state. Must not depend on the frame. */
+/* A hash of everything prepare reads except the bindings, such as settings, pipelines and contributor state.
+ * With it, the host may:
+ * - reuse the previous packet while the revision and the bindings are unchanged,
+ * - check a packet prepared ahead against the pass's current state.
+ * It must not depend on the frame. */
 typedef ORGStatus(ORG_RG_CALL* ORGRevisionCallback)(void* userData, uint64_t* revision);
 
-/* after/before: host anchors (GetAnchor) or other passes' ids. epoch: the host epoch (GetEpoch's id) the pass runs in;
- * NULL for every epoch. */
+/* after and before list host anchors (GetAnchor) or the ids of other passes.
+ * epoch is the id of the host epoch the pass runs in (GetEpoch). NULL means every epoch. */
 typedef struct ORGPassDesc {
 	uint32_t structSize, apiVersion; const char* id; ORGPassKind kind; ORGQueueAssignment queue;
 	uint32_t flags; int32_t priority; const char* techniquePath; const char* const* featureDomains;
@@ -176,7 +196,7 @@ typedef ORGStatus(ORG_RG_CALL* ORGBuildCallback)(void* userData, ORGBuildHandle 
 typedef void(ORG_RG_CALL* ORGGenerationCallback)(void* userData, ORGGenerationHandle generation);
 typedef void(ORG_RG_CALL* ORGDeviceLostCallback)(void* userData, uint32_t reason);
 typedef void(ORG_RG_CALL* ORGShutdownCallback)(void* userData);
-/* generationRetired may run on any thread; the generation's packets are all destroyed by then. */
+/* generationRetired may run on any thread. By then, all of the generation's packets are destroyed. */
 typedef struct ORGContributorDesc {
 	uint32_t structSize, apiVersion; const char* id; ORGContributorKind kind; void* userData;
 	ORGBuildCallback build; ORGGenerationCallback generationActivated, generationRetired;
@@ -207,16 +227,18 @@ typedef struct ORGBufferUpload {
 	uint32_t structSize, apiVersion; ORGBinding destination; uint64_t destinationOffset;
 	const void* data; uint64_t dataSize;
 } ORGBufferUpload;
-/* basicrhi_c_pipeline_desc_v1::raster_flags through the pipeline service. Without depth flags, depth is off; without
- * culling, both faces draw. */
+/* Flags for basicrhi_c_pipeline_desc_v1::raster_flags, used through the pipeline service. Without depth flags, depth is
+ * off. Without culling flags, both faces draw. */
 typedef enum ORGRasterFlags {
 	ORG_RG_RASTER_DEPTH_TEST = 1u << 0, ORG_RG_RASTER_DEPTH_WRITE = 1u << 1, ORG_RG_RASTER_DEPTH_GREATER = 1u << 2,
 	ORG_RG_RASTER_CULL_BACK = 1u << 3, ORG_RG_RASTER_CULL_FRONT = 1u << 4, ORG_RG_RASTER_ALPHA_BLEND = 1u << 5,
 	ORG_RG_RASTER_FRONT_CCW = 1u << 6
 } ORGRasterFlags;
-/* The host's device and its bindless pipeline layouts. Through `device`: create_pipeline and create_command_signature
- * (resources come from DeclareResource; the other entries return BASICRHI_C_UNSUPPORTED). primitive_topology is
- * BasicRHI's PrimitiveTopology ordinal; command-signature argument kinds are its IndirectArgKind ordinals. */
+/* The host's device and its bindless pipeline layouts.
+ * `device` supports only create_pipeline and create_command_signature. Resources come from DeclareResource instead.
+ * The other entries return BASICRHI_C_UNSUPPORTED.
+ * primitive_topology is an ordinal of BasicRHI's PrimitiveTopology. Command-signature argument kinds are ordinals of
+ * its IndirectArgKind. */
 typedef struct ORGPipelineService {
 	uint32_t structSize, apiVersion; ORGBackend backend; uint32_t reserved;
 	const basicrhi_c_device_api_v1* device; basicrhi_c_pipeline_layout graphicsLayout, computeLayout;

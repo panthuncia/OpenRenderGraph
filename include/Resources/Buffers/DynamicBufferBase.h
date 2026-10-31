@@ -178,9 +178,10 @@ public:
     bool IsAliasingAllowed() const;
 
     void SetUploadPolicyTag(org::runtime::UploadPolicyTag tag);
-    // This buffer's uploads go to service, whatever upload service the upload policy configures (the frame graph's): a buffer a
-    // job graph owns uploads through that graph, whose upload pass lands them ahead of its passes. Pair with an Immediate tag, so
-    // that writes are not held for the policy's flush. Expires with the service.
+    // Sends this buffer's uploads to `service`, whatever upload service the upload policy configures (the frame
+    // graph's). A buffer that a job graph owns uploads through that graph, whose upload pass lands them ahead of its
+    // passes. Pair it with an Immediate tag, so that writes are not held for the policy's flush. The pin expires with the
+    // service.
     void PinUploadService(const std::shared_ptr<org::runtime::IUploadService>& service) { m_pinnedUploadService = service; }
 
     org::runtime::UploadPolicyTag GetUploadPolicyTag() const;
@@ -190,15 +191,16 @@ public:
     // The ScopedBackingMutation depth of this thread, for scopes that cannot hold one (GraphHost::BackingMutation).
     static void EnterBackingMutation();
     static void LeaveBackingMutation();
-    // An owner that captures backings on a thread of its own while other threads run (GraphHost's async epochs)
-    // registers for as long as it does. Meanwhile a buffer's backing changes (ResizeBytes, ResizeStructured) only inside a
-    // ScopedBackingMutation, which that owner serializes against its captures (BackedResource): anywhere else they throw.
+    // An owner that captures backings on its own thread while other threads run (GraphHost's async epochs) registers
+    // for as long as it does so. While it is registered, a buffer's backing may change (ResizeBytes, ResizeStructured)
+    // only inside a ScopedBackingMutation. The owner serializes these scopes against its captures (BackedResource).
+    // Backing changes anywhere else throw.
     static void RegisterConcurrentBackingCapture();
     static void UnregisterConcurrentBackingCapture();
     // Throws when a concurrent capture owner is registered and this thread is outside a backing mutation scope.
     void RequireBackingMutationAllowed(const char* operation, uint64_t newSize) const;
-    // How many backings any buffer has released, process-wide. A copy recorded ahead (StagedUploadBatch::Record) names its
-    // targets' backings as they were: it stays valid while this has not moved.
+    // How many backings all buffers have released, process-wide. A copy recorded ahead (StagedUploadBatch::Record)
+    // names its targets' backings as they were then. It stays valid while this number has not changed.
     static uint64_t BackingReleaseSerial() noexcept;
 
     virtual ~BufferBase();
@@ -236,7 +238,8 @@ protected:
     std::optional<uint64_t> m_aliasingPoolID;
 
 private:
-    // Two graphs may materialize a buffer they share at once (RenderGraph::MaterializeUnmaterializedResources): one backing.
+    // Two graphs that share a buffer may materialize it at the same time (RenderGraph::MaterializeUnmaterializedResources).
+    // This mutex makes sure the buffer gets only one backing.
     std::mutex m_materializationMutex;
     uint64_t m_backingGeneration = 0;
     std::weak_ptr<org::runtime::IUploadService> m_pinnedUploadService;  // PinUploadService

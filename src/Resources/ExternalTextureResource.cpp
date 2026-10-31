@@ -18,7 +18,7 @@ bool ExternalTextureResource::TryGetRHIResourceDesc(rhi::ResourceDesc& outDesc) 
 	outDesc.texture.depthOrLayers = m_arraySize;
 	outDesc.texture.mipLevels = m_mipLevels;
 	outDesc.texture.sampleCount = 1;
-	// The views the description asks for are the ones the imported image supports; persistent
+	// The description asks for exactly the views the imported image supports. Persistent
 	// graphs validate each declared view against these flags.
 	auto flags = static_cast<uint32_t>(rhi::ResourceFlags::RF_None);
 	if (m_description.hasRTV) flags |= rhi::ResourceFlags::RF_AllowRenderTarget;
@@ -68,10 +68,11 @@ std::shared_ptr<ExternalTextureResource> ExternalTextureResource::CreateShared(
     result->m_mipLevels = static_cast<uint16_t>((std::max)(size_t{ 1 }, description.imageDimensions.size()));
     result->m_arraySize = static_cast<uint16_t>(description.isCubemap ? 6u * description.arraySize :
         (description.isArray ? description.arraySize : 1u));
-    // CreateShared is the retained cross-API import path. Such resources have
-    // the simultaneous-access contract even on proxy devices that do not
-    // faithfully expose every native creation flag through GetDesc(). The
-    // legacy constructor remains available for ordinary external textures.
+    // CreateShared is the cross-API import path, and it retains the imported
+    // resource. Such resources always allow simultaneous access. This holds even
+    // on proxy devices whose GetDesc() does not report every native creation
+    // flag. The legacy constructor is still available for ordinary external
+    // textures.
 	result->m_commonLayoutOnly = commonLayoutOnly;
 	auto views = BuildExternalTextureViews(description, result->m_mipLevels, result->m_arraySize);
 	auto apiResource = result->m_resource.Get();

@@ -97,11 +97,11 @@ std::optional<RenderGraph::ResolverGroupPlan> PlanResolverGroups(const RenderGra
 			if (!plan.memberIDs.insert(id).second) return std::nullopt; // A resource of two resolvers.
 		const auto first = templatesByResource.find(resourceIDs.front());
 		if (first == templatesByResource.end() || first->second.empty()) return std::nullopt;
-		// The pass's requirements for the resolver's resources are what its declarations of them came to: several uses of
-		// one resolver (indirect arguments and a shader read, say) merge into fewer requirements than they were declared
-		// as. The members' requirements are the recipe, so such a pass is still lowered as a group (re-resolved by every
-		// preparation under its own capture context) rather than direct, where a preparation for another version - a
-		// revision's - would bind the version current when the pass was lowered.
+		// The pass's requirements for the resolver's resources are the result of merging its declarations of them. Several
+		// uses of one resolver can merge into fewer requirements than were declared. An example is indirect arguments plus a
+		// shader read. The members' requirements are the recipe. So such a pass is still lowered as a group, and every
+		// preparation re-resolves it under its own capture context. If it were lowered as direct entries, a preparation for
+		// another version, such as a revision's, would bind the version that was current when the pass was lowered.
 		if (templates.size() != first->second.size()) templates = first->second;
 		for (const auto id : resourceIDs) {
 			const auto found = templatesByResource.find(id);
@@ -116,7 +116,7 @@ std::optional<RenderGraph::ResolverGroupPlan> PlanResolverGroups(const RenderGra
 	return plan;
 }
 
-uint64_t FingerprintLowering(const LoweredPass& lowered) {
+std::array<uint64_t, 5> FingerprintParts(const LoweredPass& lowered) {
 	auto hashUse = [](const LoweredUse& use) {
 		uint64_t h = 0x9e3779b97f4a7c15ull;
 		auto mix = [&](uint64_t value) { h ^= value + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2); };
@@ -154,21 +154,43 @@ uint64_t FingerprintLowering(const LoweredPass& lowered) {
 	}
 	std::sort(entries.begin(), entries.end()); std::sort(exits.begin(), exits.end()); std::sort(groups.begin(), groups.end());
 	entries.erase(std::unique(entries.begin(), entries.end()), entries.end());
+	const auto hashAll = [](uint64_t seed, const std::vector<uint64_t>& values) {
+		uint64_t h = 0xcbf29ce484222325ull ^ seed;
+		for (auto v : values) { h ^= v; h *= 0x100000001b3ull; h ^= h >> 29; }
+		return h;
+	};
+	std::vector<uint64_t> views;
+	if (lowered.resourceUses) for (const auto& group : lowered.resourceUses->resolverViews) {
+		views.push_back(reinterpret_cast<uintptr_t>(group.identity.get()));
+		for (const auto view : group.views) {
+			views.push_back(static_cast<uint64_t>(view.kind)); views.push_back(view.variant);
+			views.push_back(view.mip); views.push_back(view.slice);
+		}
+		views.push_back(UINT64_MAX);
+	}
+	return {hashAll(0xE0, parts), hashAll(0xE1, entries), hashAll(0xE2, exits), hashAll(0xE3, groups), hashAll(0xE4, views)};
+}
+
+std::string DescribeDeclaration(const LoweredPass& lowered) {
+	const auto& d = lowered.declaration;
+	std::string slots;
+	for (const auto slot : d.compatibleQueueSlots) slots += std::to_string(slot) + ",";
+	return "backend=" + std::to_string(d.backend) + " preferred=" + std::to_string(d.preferredQueueSlot) + " slots=" + slots
+		+ " isolated=" + std::to_string(d.forceBatchIsolation) + " atExecution=" + std::to_string(d.recordAtExecution);
+}
+
+const char* FingerprintPartName(size_t part) noexcept {
+	static constexpr const char* names[] = {"declaration", "entries", "exits", "groups", "group views"};
+	return part < std::size(names) ? names[part] : "?";
+}
+
+uint64_t FingerprintLowering(const LoweredPass& lowered, bool layoutUses) {
 	uint64_t h = 0xcbf29ce484222325ull;
 	auto fold = [&](uint64_t value) { h ^= value; h *= 0x100000001b3ull; h ^= h >> 29; };
-	for (auto v : parts) fold(v);
-	fold(0xE1); for (auto v : entries) fold(v);
-	fold(0xE2); for (auto v : exits) fold(v);
-	fold(0xE3); for (auto v : groups) fold(v);
-	if (lowered.resourceUses) for (const auto& group : lowered.resourceUses->resolverViews) {
-		fold(reinterpret_cast<uintptr_t>(group.identity.get()));
-		for (const auto view : group.views) {
-			fold(static_cast<uint64_t>(view.kind)); fold(view.variant); fold(view.mip); fold(view.slice);
-		}
-		fold(UINT64_MAX);
-	}
-	if (lowered.resourceUses) for (const auto& use : lowered.resourceUses->uses) {
-		fold(use.resolverIdentity ? reinterpret_cast<uintptr_t>(use.resolverIdentity.get()) : use.binding.registryResourceID);
+	for (const auto part : FingerprintParts(lowered)) fold(part);
+	if (lowered.resourceUses && layoutUses) for (const auto& use : lowered.resourceUses->uses) {
+		fold(use.resolverIdentity ? reinterpret_cast<uintptr_t>(use.resolverIdentity.get())
+			: lowered.rebindable ? 0 : use.binding.registryResourceID);
 		fold(static_cast<uint64_t>(use.state.access));
 		for (const auto view : use.requiredViews) {
 			fold(static_cast<uint64_t>(view.kind)); fold(view.variant); fold(view.mip); fold(view.slice);
@@ -201,7 +223,8 @@ LoweredPass LowerPass(RenderGraph& graph, ResourceRegistry& registry, const Queu
 			const bool automatic = resources.queueAssignmentPolicy == QueueAssignmentPolicy::Automatic && kindCompatible(kind);
 			if (automatic || kind == resources.preferredQueueKind) compatible.push_back(static_cast<uint32_t>(slot));
 		}
-		// The pass's device: the primary unless its backend affinity names another; a preferred one falls back to the primary.
+		// Pick the pass's device. It is the primary device unless the pass's backend affinity names another one. A preferred
+		// device falls back to the primary when it is not available.
 		const auto& affinity = resources.backendAffinity;
 		auto onDevice = [&](auto&& accept) {
 			std::vector<uint32_t> kept;
@@ -223,7 +246,7 @@ LoweredPass LowerPass(RenderGraph& graph, ResourceRegistry& registry, const Queu
 	const auto device = queues.SlotCount() != 0
 		? queues.GetBackendInstance(static_cast<QueueSlotIndex>(static_cast<uint8_t>(compatible.front()))) : BackendInstanceId::Primary;
 	result.device = device;
-	// The device's graphics slot: the route of a pass that may not leave graphics.
+	// Find the device's graphics slot. A pass that may not leave graphics is routed there.
 	uint32_t graphicsSlot = 0;
 	for (size_t slot = 0; slot < queues.SlotCount(); ++slot) {
 		const auto index = static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot));
@@ -235,11 +258,16 @@ LoweredPass LowerPass(RenderGraph& graph, ResourceRegistry& registry, const Queu
 	declaration.preferredQueueSlot = compatible.front();
 	declaration.backend = static_cast<uint32_t>(queues.SlotCount() != 0
 		? queues.GetBackend(static_cast<QueueSlotIndex>(static_cast<uint8_t>(graphicsSlot))) : primaryBackend);
-	// A pass recorded at execution is a batch of its own: the batch is recorded by the host's execution, the rest ahead.
+	// A pass recorded at execution gets a batch of its own. The host's execution records that batch. The other batches
+	// are recorded ahead of time.
 	declaration.recordAtExecution = pass.recordAtExecution;
-	declaration.forceBatchIsolation = !resources.externalWaitsBeforeTransitions.empty()
-		|| !resources.externalWaitBindingsBeforeTransitions.empty() || pass.recordAtExecution;
-	result.explicitWaits = resources.externalWaitsBeforeTransitions;
+	// The pass's own waits. A resolver group's waits are not part of the declaration: every preparation takes the group's
+	// current ones. A resolver lowered as direct uses has no group, so its waits at declaration are added below.
+	result.explicitWaits = pass.explicitExternalWaitsBeforeTransitions;
+	const auto addSnapshotWaits = [&](const ResolverSnapshot& snapshot) {
+		if (snapshot.state && snapshot.state->waits)
+			result.explicitWaits.insert(result.explicitWaits.end(), snapshot.state->waits->begin(), snapshot.state->waits->end());
+	};
 
 	auto resolve = [&](const ResourceRegistry::RegistryHandle& handle) -> Resource* {
 		return handle.IsEphemeral() ? handle.GetEphemeralPtr() : registry.Resolve(handle);
@@ -251,7 +279,7 @@ LoweredPass LowerPass(RenderGraph& graph, ResourceRegistry& registry, const Queu
 		if (!range) return;
 		result.entries.push_back({resource->GetSchedulingResourceID(), resource, *range, LowerState(requirement.state)});
 	};
-	// Every requirement the pass declared, resolver members included (the old compiler's requirement blocks too).
+	// Every requirement the pass declared, including resolver members and the old compiler's requirement blocks.
 	const auto requirements = GetFrameRequirementsSpan(resources);
 	const auto& plan = pass.resolverGroupPlan;
 	if (plan && plan->templates.size() == pass.resolverSnapshots.size()) {
@@ -260,7 +288,7 @@ LoweredPass LowerPass(RenderGraph& graph, ResourceRegistry& registry, const Queu
 		for (size_t i = 0; i < pass.resolverSnapshots.size(); ++i) {
 			const auto& snapshot = pass.resolverSnapshots[i];
 			LoweredGroup group;
-			// The declaration's own capture: its uses name these members.
+			// The declaration's own capture. Its uses name these members.
 			const auto& state = snapshot.state;
 			group.key = snapshot.DependencyIdentity();
 			group.resolver = snapshot.resolver ? snapshot.resolver->Clone() : nullptr;
@@ -284,9 +312,11 @@ LoweredPass LowerPass(RenderGraph& graph, ResourceRegistry& registry, const Queu
 				group.templates.emplace_back(*range, LowerState(request.state));
 			}
 			if (group.uniform && group.key && group.resolver && !group.templates.empty()) { result.groups.push_back(std::move(group)); continue; }
-			// Mixed shapes: this resolver's members are declared directly, and the resolver is polled for a new set.
+			// The members have mixed shapes. So they are declared as direct entries, and the resolver is polled for a
+			// new set.
 			if (snapshot.resolver)
 				result.directResolvers.emplace_back(snapshot.resolver->Clone(), state ? state->resourceSetIdentity : ResolverResourceSetIdentity{});
+			addSnapshotWaits(snapshot);
 			for (const auto& [id, member] : group.members)
 				for (const auto& request : plan->templates[i]) {
 					const auto range = LowerRange(request.range, ShapeOf(*member));
@@ -299,6 +329,7 @@ LoweredPass LowerPass(RenderGraph& graph, ResourceRegistry& registry, const Queu
 		for (const auto& snapshot : pass.resolverSnapshots) {
 			if (!snapshot.resolver) continue;
 			const auto& state = snapshot.state;
+			addSnapshotWaits(snapshot);
 			result.directResolvers.emplace_back(snapshot.resolver->Clone(), state ? state->resourceSetIdentity : ResolverResourceSetIdentity{});
 			if (state && state->resources)
 				for (const auto& member : *state->resources) if (member) owners.emplace(member.get(), member);
@@ -313,8 +344,10 @@ LoweredPass LowerPass(RenderGraph& graph, ResourceRegistry& registry, const Queu
 		if (!range) continue;
 		result.exits.push_back({resource->GetSchedulingResourceID(), resource, *range, LowerState(state)});
 	}
-	// D3D12 admission emits the producer's release and the consumer's acquire around a cross-queue wait. Elsewhere a pass
-	// leaves the graphics route only when nothing it touches needs a queue-family ownership transfer.
+	declaration.forceBatchIsolation = !result.explicitWaits.empty()
+		|| !resources.externalWaitBindingsBeforeTransitions.empty() || pass.recordAtExecution;
+	// On D3D12, admission emits the producer's release and the consumer's acquire around a cross-queue wait. On other
+	// backends, a pass leaves the graphics route only when nothing it touches needs a queue-family ownership transfer.
 	if (!d3d12OwnedQueueTransfers) {
 		bool concurrent = true;
 		for (const auto& use : result.entries) concurrent = concurrent && use.resource && ConcurrentlyShared(*use.resource);

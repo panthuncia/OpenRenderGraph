@@ -98,7 +98,8 @@ namespace ui {
             const uint32_t bits = node.numeric.bits;
             const uint32_t lanes = std::max(1u, node.numeric.lanes);
 
-            // Use reflected byte size first (important for bool, which often reports bits=1 but occupies 4 bytes in HLSL layouts).
+            // Prefer the reflected byte size. This matters for bool, which often reports bits=1 but takes 4 bytes in HLSL
+            // layouts.
             size_t elemBytes = 0;
             if (node.sizeBytes > 0 && lanes > 0 && (node.sizeBytes % lanes) == 0) {
                 elemBytes = node.sizeBytes / lanes;
@@ -310,7 +311,8 @@ namespace ui {
             return;
         }
 
-        // Schedule capture. Callback may run later when GPU completes + ProcessReadbackRequests() copies data.
+        // Schedule the capture. The callback may run later, once the GPU completes and ProcessReadbackRequests() copies
+        // the data.
         requestCapture([this](ReadbackCaptureResult&& r) {
             std::scoped_lock cbLock(mutex_);
             result_ = std::move(r);

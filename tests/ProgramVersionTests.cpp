@@ -34,8 +34,8 @@ int TestProgramVersions(rhi::Device device) {
         oldHandle, *signature) == rhi::Result::Ok);
     std::weak_ptr<const rhi::CommandSignaturePtr> oldSignature = signature;
 
-    // A recording retains the pipeline payload it bound (and what else it names) until its retention is released:
-    // replacing the pipeline's payload while the recording is in flight leaves the recorded program alive.
+    // A recording retains the pipeline payload it bound, and everything else it names, until its retention is
+    // released. So replacing the pipeline's payload while the recording is in flight leaves the recorded program alive.
     rhi::CommandAllocatorPtr allocator;
     rhi::CommandListPtr list;
     CHECK(device.CreateCommandAllocator(rhi::QueueKind::Graphics, allocator) == rhi::Result::Ok);

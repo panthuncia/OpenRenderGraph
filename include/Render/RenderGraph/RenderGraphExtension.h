@@ -66,12 +66,13 @@ struct ExternalPassDesc {
 	bool registerName = true;
 	bool isGeometryPass = false; // Optional: opts pass into statistics tracking for rasterization
 	bool collectStatistics = true;
-	// Persistent execution: the host epoch the pass runs in (persistent::AllEpochs:
-	// every one). See SetPersistentEpochOrder.
+	// Persistent execution: the host epoch the pass runs in. persistent::AllEpochs
+	// means every epoch. See SetPersistentEpochOrder.
 	uint32_t epoch = UINT32_MAX;
-	// Persistent execution, an external epoch's pass (SetExternalPersistentEpochs): recorded when the host executes the epoch
-	// (ExternalEpochExecution::Execute, on the host's thread, into its command buffer), not ahead with the rest. Alone in its
-	// batch; its barriers are the admission's, recorded around it. For work only known then (a CPU cull's draws).
+	// Persistent execution only, for a pass of an external epoch (SetExternalPersistentEpochs). The pass is recorded when
+	// the host executes the epoch, not ahead with the other passes. Recording happens in ExternalEpochExecution::Execute,
+	// on the host's thread, into the host's command buffer. The pass is alone in its batch. Its barriers come from
+	// admission and are recorded around it. Use it for work that is only known at that point, such as a CPU cull's draws.
 	bool recordAtExecution = false;
 	// Per-frame passes only. A frame-interrupting pass must run at its insert
 	// point even under the persistent graph, which hosts it in the main
@@ -231,9 +232,10 @@ struct IRenderGraphExtension {
 	// main hook: inject passes
 	virtual void GatherStructuralPasses(RenderGraph& rg, std::vector<ExternalPassDesc>& out) = 0;
 
-	// per-frame hook: inject ephemeral passes (e.g. readback captures)
-	// Default: no per-frame passes.
-	virtual void GatherFramePasses(RenderGraph& rg, std::vector<ExternalPassDesc>& out) { (void)rg; (void)out; }
+	// Called after each execution of the graph, on the thread that executed it. Submit GPU work recorded outside the
+	// graph here, through rg.GetExternalClient(). It runs after the execution, so it can read what the execution wrote.
+	// Not called for tickets (GraphHost's async epochs).
+	virtual void AfterExecute(RenderGraph& rg) { (void)rg; }
 };
 
 } // namespace org

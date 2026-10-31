@@ -13,10 +13,10 @@ struct FrameRecordingJob {
     rhi::Queue queue;
     std::shared_ptr<CommandListPool> pool;
     OwnedRecordingList recording;
-    // An external epoch's late batch (CompilePass::recordAtExecution): no list; its packet keeps the recording for the host's
-    // execution (PreparedRhiExecutionBatch::RecordDeferred).
+    // A late batch of an external epoch (CompilePass::recordAtExecution). It has no command list. Its packet keeps the
+    // recording for later, and the host's execution records it (PreparedRhiExecutionBatch::RecordDeferred).
     bool deferred = false;
-    // Non-empty: the plan's timelines as this job's device sees them (a peer device waits on its imported copies).
+    // When non-empty, the plan's timelines as this job's device sees them. A peer device waits on its imported copies.
     std::vector<PreparedTimelineBinding> timelines;
 };
 
@@ -45,16 +45,18 @@ public:
     RecordedFrame(const RecordedFrame&) = delete;
     const auto& Snapshot() const noexcept { return m_snapshot; }
     std::shared_ptr<const GraphExecutionTimeline> Submit(ExecutionTimelineAdmission& admission) &&;
-    // Admitted at submission: the waits the admission computed then (replacing the plan's), the lists ahead of each batch's and
-    // what keeps them alive (ExecutionTimelineAdmission::SubmitPrepared).
+    // Admits the frame at submission time (ExecutionTimelineAdmission::SubmitPrepared). The caller passes:
+    // - the waits the admission computed at submission, which replace the plan's waits,
+    // - the lists that go ahead of each batch's own lists,
+    // - the leases that keep those lists alive.
     std::shared_ptr<const GraphExecutionTimeline> Submit(ExecutionTimelineAdmission& admission,
         const std::vector<std::vector<ExecutionTimelinePoint>>& incomingWaits,
         std::span<const std::span<const rhi::CommandList>> leading, std::vector<std::shared_ptr<const void>> leases,
         std::span<const PreparedTimelineBinding> extraTimelines = {}) &&;
-    // Async epochs: hands the packets to their queues with timelines the caller assigned (one per batch),
-    // touching no admission state - safe on the submitting thread while the owner prepares other work. The
-    // owner records the submission afterwards (ExecutionTimelineAdmission::RecordSubmitted). False when a
-    // packet failed; the frame is consumed either way.
+    // For async epochs. Hands the packets to their queues with the timelines the caller assigned, one per batch.
+    // It touches no admission state. So it is safe on the submitting thread while the owner prepares other work.
+    // The owner records the submission afterwards (ExecutionTimelineAdmission::RecordSubmitted).
+    // Returns false when a packet failed. The frame is consumed either way.
     bool SubmitPackets(std::span<const ExecutionBatchTimeline> batches);
     const auto& Packets() const noexcept { return m_batches; }
     const auto& IncomingWaits() const noexcept { return m_incomingWaits; }
@@ -68,8 +70,8 @@ private:
 };
 
 // Owns peer recording workers for one logical frame. No worker waits for
-// another worker: collection is a non-blocking readiness probe followed by a
-// FIFO join on the submission thread.
+// another worker. To collect them, the submission thread first checks
+// readiness without blocking, then joins the workers in FIFO order.
 RecordedFrame RecordFrame(PlannedFrame plan,
     const std::shared_ptr<runtime::ITaskService>& tasks, size_t concurrency);
 

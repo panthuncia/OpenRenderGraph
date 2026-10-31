@@ -1,6 +1,7 @@
 #include "RenderGraphInternal.h"
 #include "Render/Runtime/RuntimeDevice.h"
 #include "OpenRenderGraph/Runtime.h"
+#include "OpenRenderGraph/ExternalClient.h"
 
 namespace org {
 
@@ -201,6 +202,7 @@ bool ResolveFirstMipSlice(ResourceRegistry::RegistryHandle r, RangeSpec range, u
 RenderGraph::RenderGraph(std::shared_ptr<Runtime> runtime)
 	: m_compilerState(std::make_unique<CompilerState>()), m_runtime(std::move(runtime)) {
 	if (!m_runtime) throw std::invalid_argument("RenderGraph requires a runtime");
+	m_compilerState->synchronousCompileWorkspace.SetScheduleCache(m_runtime->Schedules());
 	m_backendDevices.RegisterPrimary(m_runtime->Backend(), m_runtime->Device());
 
 	auto MakeDefaultImmediateDispatch = [&]() noexcept -> org::imm::ImmediateDispatch
@@ -299,6 +301,7 @@ void RenderGraph::StopFrameProduction() {
 
 void RenderGraph::ShutdownTaskWorkers() {
     StopFrameProduction();
+	if (m_externalClient) m_externalClient->ShutdownTaskWorkers();
 	m_queueRegistry.ShutdownTaskWorkers();
 	m_taskService.reset();
 }
@@ -312,11 +315,38 @@ void RenderGraph::UseRuntimeServices() {
 	if (!m_taskService) m_taskService = m_runtime->Tasks();
 }
 
+void RenderGraph::SetSwapchainResource(std::shared_ptr<Resource> resource) {
+	if (resource && !dynamic_cast<DynamicResource*>(resource.get()))
+		throw std::invalid_argument("The swapchain resource must be a DynamicResource");
+	m_swapchain = std::move(resource);
+}
+
+ExternalClient& RenderGraph::GetExternalClient() {
+	std::lock_guard lock(m_externalClientMutex);
+	if (!m_externalClient) {
+		if (!m_queueRegistry.SlotCount()) throw std::logic_error("RenderGraph::GetExternalClient called before Setup");
+		ExternalClient::Desc desc;
+		desc.runtime = m_runtime;
+		desc.name = "ORG.External";
+		desc.closed = m_persistentClosedExecutions;
+		desc.entryFullBarrier = m_externalQueueBoundary.entry;
+		for (size_t slot = 0; slot < m_queueRegistry.SlotCount(); ++slot) {
+			const auto index = static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot));
+			const auto kind = m_queueRegistry.GetKind(index);
+			desc.queues.push_back({m_queueRegistry.GetQueue(index), kind == QueueKind::Graphics ? rhi::QueueKind::Graphics
+				: kind == QueueKind::Compute ? rhi::QueueKind::Compute : rhi::QueueKind::Copy});
+		}
+		m_externalClient = std::make_unique<ExternalClient>(std::move(desc));
+	}
+	return *m_externalClient;
+}
+
 void RenderGraph::ShutdownOwnedState() {
 	ShutdownTaskWorkers();
+	// It waits for its submissions and retires its timelines.
+	m_externalClient.reset();
     m_resolverCaptureContext.reset();
 	m_masterPassList.clear();
-	m_compilerState->frameExtensions.clear();
 	renderPassesByName.clear();
 	resourcesByID.clear();
 	resourcesByName.clear();
@@ -343,6 +373,7 @@ void RenderGraph::ShutdownOwnedState() {
 		if (!fence || !fence->Get()) continue;
 		if (const auto next = m_queueRegistry.GetCurrentFenceValue(slot); next > 1) fence->Get().HostWait(next - 1);
 		m_runtime->Sequencer()->RetireTimeline(m_runtime->TimelineIdentity(fence->Get()));
+		m_runtime->NoteTimelineDestroyed(fence->Get());
 	}
 	// The queues the graph made go with it: the runtime's frontier stops covering them.
 	for (size_t i = 0; i < m_queueRegistry.SlotCount(); ++i) {

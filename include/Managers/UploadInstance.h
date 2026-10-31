@@ -32,9 +32,12 @@ class Buffer;
 
 // A standalone, non-singleton upload-heap primitive.
 //
-// Encapsulates the core upload-page ring buffer, CPU staging, coalescing,
-// GPU copy emission, and frame-based page retirement that UploadManager
-// provides, but as a reusable instance that can be scheduled on any queue.
+// It provides the same core features as UploadManager:
+// - the upload-page ring buffer,
+// - CPU staging and coalescing,
+// - emitting GPU copies,
+// - retiring pages per frame.
+// Unlike UploadManager, it is a reusable instance that can be scheduled on any queue.
 //
 // Usage:
 //   1. Create an UploadInstance (one per subsystem / queue that needs uploads).
@@ -42,15 +45,18 @@ class Buffer;
 //   3. Call ProcessUploads() from a pass's RecordImmediateCommands() to emit GPU copies.
 //   4. Call ProcessDeferredReleases() once per frame (after GPU retire) to reclaim pages.
 //
-// Threading: the instance is owned by one thread: the one named by
-// SetOwnerThread, or else the first to run a queue operation (recording,
-// retiring, raw UploadTextureSubresources). Every queue operation runs on that
-// thread and there is no queue mutex. Other threads reach it only through
-// lock-free mailboxes: posted uploads (PostTextureSubresources, off-owner
-// UploadData) drained by the owner before it records, and pages prepared by the
-// background task. An unowned instance posts too, so a producer never writes
-// the queue of an instance whose owner has yet to run. Queue operations off the
-// owner are misuse and are logged (ORG.Upload.FrameInstance.OffThreadCalls).
+// Threading: one thread owns the instance. The owner is the thread named by
+// SetOwnerThread. Without one, the owner is the first thread to run a queue
+// operation. Queue operations are recording, retiring and raw
+// UploadTextureSubresources. Every queue operation runs on the owner thread,
+// so there is no queue mutex. Other threads reach the instance only through
+// lock-free mailboxes:
+// - posted uploads (PostTextureSubresources, and UploadData called off the
+//   owner), which the owner drains before it records,
+// - pages prepared by the background task.
+// An unowned instance also posts. This way a producer never writes the queue
+// of an instance whose owner has not run yet. Queue operations off the owner
+// thread are misuse. They are logged (ORG.Upload.FrameInstance.OffThreadCalls).
 class UploadInstance {
 public:
 	using UploadTarget        = org::runtime::UploadTarget;
@@ -144,15 +150,15 @@ public:
 
 	// Execution
 
-	// Emit GPU copy commands for all queued buffer and texture uploads.
-	// Call from a pass's RecordImmediateCommands().
-	// Owner-thread texture upload with caller-owned bytes; from any other
-	// thread the request is posted and recorded by the owner. See IUploadService.
+	// Texture upload with caller-owned bytes, on the owner thread. From any other
+	// thread, the request is posted and the owner records it. See IUploadService.
 	void PostTextureSubresources(UploadTarget target, rhi::Format fmt, uint32_t baseWidth, uint32_t baseHeight,
 		uint32_t depthOrLayers, uint32_t mipLevels, uint32_t arraySize,
 		std::shared_ptr<const std::vector<rhi::helpers::SubresourceData>> subresources,
 		std::shared_ptr<const void> keepAlive, const char* file = nullptr, int line = 0);
 
+	// Emit GPU copy commands for all queued buffer and texture uploads.
+	// Call from a pass's RecordImmediateCommands().
 	void ProcessUploads(uint8_t frameIndex, org::imm::ImmediateCommandList& commandList);
 	void ProcessUploadsThrough(uint8_t frameIndex, org::imm::ImmediateCommandList& commandList, uint64_t sequenceInclusive);
 
@@ -164,11 +170,12 @@ public:
 	void SubmitStagedUploads(std::shared_ptr<org::runtime::StagedUploadBatch> batch);
 	void SetStagedUploadsRecordedDirectly(bool direct);
 	size_t RecordStagedUploads(rhi::CommandList& list, uint8_t frameIndex, bool afterWork);
-	// IUploadService::SubmitRecordedUploads / TakeRecordedUploads (direct mode). a_nothingQueued: the manager's own queue
-	// (resource copies) is empty.
+	// IUploadService::SubmitRecordedUploads and TakeRecordedUploads (direct mode). a_nothingQueued tells whether the
+	// manager's own queue of resource copies is empty.
 	bool SubmitRecordedUploads(std::shared_ptr<org::runtime::StagedUploadBatch> batch, bool a_nothingQueued);
 	size_t TakeRecordedUploads(std::vector<rhi::CommandList>& out, uint8_t frameIndex);
-	// The IUploadService queue-split calls (TakeRecordedUploadsWithDestinations, StagedUploadDestinations, RecordStagedUploadsRouted).
+	// The IUploadService calls that split uploads between queues: TakeRecordedUploadsWithDestinations,
+	// StagedUploadDestinations and RecordStagedUploadsRouted.
 	bool TakeRecordedUploadsWithDestinations(std::vector<rhi::CommandList>& out, uint8_t frameIndex, std::vector<rhi::ResourceHandle>& destinations);
 	bool StagedUploadDestinations(std::vector<rhi::ResourceHandle>& out) const;
 	size_t RecordStagedUploadsRouted(rhi::CommandList& list, uint8_t frameIndex, bool afterWork,
@@ -213,9 +220,9 @@ private:
 
 	// Internal helpers
 
-	// A region larger than a page needs a dedicated page; callers create it with
-	// PrepareDedicatedPage so GPU allocation
-	// never runs under the lock the render thread drains through.
+	// A region larger than a page needs a dedicated page. Callers create it with
+	// PrepareDedicatedPage. This keeps GPU allocation out of the lock that the
+	// render thread drains through.
 	UploadPagePtr PrepareDedicatedPage(size_t size);
 	// Owner-thread texture upload with an optional pre-created dedicated page.
 	void UploadTextureSubresourcesPrepared(UploadTarget target, rhi::Format fmt, uint32_t baseWidth, uint32_t baseHeight,
@@ -267,8 +274,8 @@ private:
 	std::vector<UploadPagePtr> m_openPages;
 	std::unordered_set<UploadPage*> m_openPageSet;
 	std::vector<std::vector<UploadPagePtr>> m_framePages;
-	// Staged batches submitted since the last upload pass, and those the pass of each frame slot recorded
-	// (released with the slot).
+	// Staged batches submitted since the last upload pass. Also, per frame slot, the batches that the slot's pass
+	// recorded. Those are released with the slot.
 	std::vector<std::shared_ptr<org::runtime::StagedUploadBatch>> m_pendingStaged;
 	// Direct mode: submitted batches waiting for RecordStagedUploads.
 	bool m_stagedDirect = false;
@@ -316,7 +323,7 @@ private:
 	// The calling thread owns the instance, claiming it when unowned.
 	bool ClaimOwnerThread() noexcept;
 	void NoteProducerCall(const char* api);
-	// Queue operations: claims ownership when unowned; logs a call off the owner.
+	// Called by queue operations. Claims ownership when the instance is unowned. Logs a call made off the owner thread.
 	void NoteOffOwnerCall(const char* api);
 	// Owner-thread: apply uploads other threads posted.
 	void DrainPostedUploads();

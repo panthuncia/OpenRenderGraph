@@ -22,10 +22,11 @@ void InitializeRuntimeDevice(rhi::Device device)
 void ShutdownRuntimeDevice() noexcept
 {
 	// Callers have joined CPU work and completed GPU work before shutdown.
-	// Deferred allocations must be destroyed while their allocator is alive;
-	// releasing descriptor owners can enqueue another wave of backing releases. The upload manager's pages and copy queue
-	// go first: left to static destruction, they would outlive the device and wait on its destroyed timelines. So do the
-	// readback manager's pooled buffers and the requests it still holds.
+	// The order below matters:
+	// - Deferred allocations must be destroyed while their allocator is alive.
+	// - Releasing descriptor owners can enqueue another wave of backing releases.
+	// - The readback manager's pooled buffers and pending requests, and the upload manager's pages and copy queue, go first.
+	//   Left to static destruction, they would outlive the device and wait on its destroyed timelines.
 	ReadbackManager::GetInstance().Cleanup();
 	UploadManager::GetInstance().Cleanup();
 	DeletionManager::GetInstance().DrainAll();
@@ -34,7 +35,7 @@ void ShutdownRuntimeDevice() noexcept
 	DeletionManager::GetInstance().Cleanup();
 	DeviceManager::GetInstance().Cleanup();
 	TrackedEntityToken::ResetHooks();
-	// What the releases above posted.
+	// Drain what the releases above posted.
 	ECSManager::GetInstance().Drain();
 }
 

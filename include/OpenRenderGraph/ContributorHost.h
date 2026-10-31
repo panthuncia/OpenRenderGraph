@@ -22,17 +22,19 @@ struct FramePreparationContext;
 namespace org::contributor {
 
 /**
- * @brief The graph side of the contributor ABI (ContributorAPI.h): the registry, the C table, and the extension that adds
- * every registered contributor's resources and passes to the host's graph.
+ * @brief The graph side of the contributor ABI (ContributorAPI.h). It holds the registry and the C table. It also
+ * makes the extension that adds every registered contributor's resources and passes to the host's graph.
  *
- * One per process (the C table has no context). The hosting module exports ORG_GetRenderGraphAPI by forwarding to GetAPI,
- * registers CreateExtension() with its GraphHost, and calls Poll once per frame on the graph's owner thread. Destroy it
- * after the graph: contributor packets in flight call into their modules until the graph lets them go.
+ * There is one per process, because the C table has no context. The hosting module:
+ * - exports ORG_GetRenderGraphAPI by forwarding to GetAPI,
+ * - registers CreateExtension() with its GraphHost,
+ * - calls Poll once per frame on the graph's owner thread.
+ * Destroy it after the graph. Contributor packets in flight call into their modules until the graph releases them.
  */
 class ContributorHost {
 public:
-	/// A point in the host's frame contributors order passes against: `pass` is the graph pass (or the frame's ends,
-	/// "__rg_begin__" / "__rg_end__") it stands for.
+	/// A point in the host's frame that contributors order passes against. `pass` is the graph pass it stands for.
+	/// It can also be the start or the end of the frame: "__rg_begin__" or "__rg_end__".
 	struct Anchor { std::string id, displayName, pass; };
 	/// One of the host's persistent epochs (RenderGraph::SetPersistentEpochOrder).
 	struct Epoch { std::string id, displayName; uint32_t epoch = 0; };
@@ -55,9 +57,11 @@ public:
 		std::vector<Export> exports;
 		/// The bindless layouts contributor pipelines are created against (the pipeline service).
 		rhi::PipelineLayoutHandle graphicsLayout{}, computeLayout{};
-		/// Owner thread, at each structural build: what render- and output-relative resources are sized against.
+		/// Called on the owner thread at each structural build. Returns the extents that render- and output-relative
+		/// resources are sized against.
 		std::function<Extents()> extents;
-		/// Preparation thread: the frame the graph prepares for. Without it, frames carry only the generation.
+		/// Called on the preparation thread. Returns the frame the graph prepares for. Without it, frames carry only the
+		/// generation.
 		std::function<FrameView(const FramePreparationContext&)> frame;
 	};
 
@@ -67,14 +71,16 @@ public:
 	ContributorHost(const ContributorHost&) = delete;
 	ContributorHost& operator=(const ContributorHost&) = delete;
 
-	/// The table ORG_GetRenderGraphAPI returns; ORG_RG_E_RUNTIME_UNAVAILABLE while no host exists.
+	/// The table that ORG_GetRenderGraphAPI returns. While no host exists, the call returns ORG_RG_E_RUNTIME_UNAVAILABLE.
 	static ORGStatus GetAPI(uint32_t version, ORGRenderGraphAPI* out) noexcept;
 
-	/// The extension that adds the contributors' passes (GraphHost::AddExtension's factory; one graph at a time).
+	/// Creates the extension that adds the contributors' passes. Pass it to GraphHost::AddExtension as the factory.
+	/// It serves one graph at a time.
 	std::unique_ptr<IRenderGraphExtension> CreateExtension();
 
-	/// Owner thread, once per frame: requests a structural build when contributors registered, unregistered or asked
-	/// for one, or when the extents render-relative resources were sized against changed.
+	/// Call on the owner thread once per frame. Requests a structural build when:
+	/// - a contributor registered, unregistered or asked for a build,
+	/// - the extents that render-relative resources were sized against changed.
 	void Poll(GraphHost& host);
 
 	ContributorRegistry& Registry() noexcept;

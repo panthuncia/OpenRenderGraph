@@ -26,9 +26,9 @@ namespace org::imm {
     using ResolveByIdFn = ResourceRegistry::RegistryHandle(*)(void* user, ResourceIdentifier const& id, bool allowFailure);
 	using ResolveByPtrFn = ResourceRegistry::RegistryHandle(*)(void* user, Resource* res, bool allowFailure);
     
-	// "Dispatch" that lives on RenderGraph so immediate replay can
-    // turn a RegistryHandle into low-level RHI handles/descriptor slots after
-    // frame materialization has completed.
+	// Dispatch functions that live on RenderGraph. Immediate replay uses them to
+    // turn a RegistryHandle into low-level RHI handles and descriptor slots, after
+    // the frame's resources are materialized.
 
     struct ImmediateDispatch {
         RenderGraph* user = nullptr;

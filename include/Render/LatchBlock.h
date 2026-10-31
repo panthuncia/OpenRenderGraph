@@ -10,31 +10,32 @@ namespace org {
 
 class Buffer;
 
-// Late latching: the per-execution values a pass would otherwise bake into its recording (matrices,
-// counts, dispatch sizes, frame stamps) live in a small host-visible block with one region per frame
-// slot, and the pass records only where its region is. That location is a function of the slot, not of
-// the values, so the pass's invocation and its recorded commands stay the same from one execution to the
-// next - which is what lets them be reused, or prepared ahead of the values - while the host writes the
-// values into the slot just before submission.
+// Late latching. Some per-execution values would otherwise be baked into a pass's recording: matrices, counts,
+// dispatch sizes, frame stamps. Instead, they live in a small host-visible block with one region per frame slot.
+// The pass records only where its region is. That location depends on the slot, not on the values. So the pass's
+// invocation and its recorded commands stay the same from one execution to the next. This is what lets them be
+// reused, or prepared before the values are known. The host writes the values into the slot just before submission.
 //
 // Contract:
-//  - The host writes slot s only while no submitted work that reads slot s is incomplete. With a
-//    GraphHost that holds from the slot wait of the execution using s (inside ExecuteFrame, so
-//    from beforePrepare on) until that execution is submitted; its slot is CurrentFrameSlot().
-//  - Readers see host writes made before the submission (host-coherent memory; queue submission makes
-//    them available). Nothing about the block goes through the graph's state tracking: it is not a graph
-//    resource and needs no declaration, barriers or transitions.
-//  - Shaders read it as a ByteAddressBuffer through SrvIndex(), at Offset(slot); it is also valid as an
+//  - The host writes slot s only while no submitted work that reads slot s is incomplete. With a GraphHost, this
+//    holds from the slot wait of the execution that uses s until that execution is submitted. The slot wait happens
+//    inside ExecuteFrame, so the window starts at beforePrepare. The execution's slot is CurrentFrameSlot().
+//  - Readers see the host writes made before the submission. The memory is host-coherent, and queue submission makes
+//    the writes available.
+//  - The graph's state tracking ignores the block. It is not a graph resource, and it needs no declaration, barriers
+//    or transitions.
+//  - Shaders read it as a ByteAddressBuffer through SrvIndex(), at Offset(slot). It is also valid as an
 //    indirect-argument buffer (Resource()) and as a copy source.
 class LatchBlock {
 public:
-    // bytesPerSlot is rounded up to 256 so every region is aligned for any use. Its buffer is registered with the host's world as
-    // any resource made on the owner's thread is; Create makes one on any thread.
+    // bytesPerSlot is rounded up to 256, so every region is aligned for any use. The buffer is registered with the
+    // host's world, like any resource made on the owner's thread. Use Create to make a block on any thread.
     LatchBlock(std::string name, uint32_t bytesPerSlot, uint32_t slots);
-    // Any thread: a block made without an ECS entity (Resource::ScopedECSRegistrationSuppression), as a versioned buffer's pending
-    // version is (VersionedBuffer::MakeStructured): it is no graph resource (nothing declares it), so nothing of the host's world
-    // needs it, and a producer's thread may not touch that world. Its last reference may drop on any thread: its buffer goes
-    // through ORG's deletion path as any other.
+    // Callable from any thread. Makes a block without an ECS entity (Resource::ScopedECSRegistrationSuppression), the
+    // same way a versioned buffer's pending version is made (VersionedBuffer::MakeStructured). The block is not a graph
+    // resource, since nothing declares it. So nothing in the host's world needs it, and a producer's thread may not touch
+    // that world. Its last reference may drop on any thread. Its buffer then goes through ORG's deletion path like any
+    // other.
     static std::shared_ptr<LatchBlock> Create(std::string name, uint32_t bytesPerSlot, uint32_t slots);
     ~LatchBlock();
     LatchBlock(const LatchBlock&) = delete;

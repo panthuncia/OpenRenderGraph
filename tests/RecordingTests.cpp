@@ -41,7 +41,7 @@ struct PersistentProbe {
     }
 };
 
-// A pass without declared bindings whose layout the test installs directly (SetResourceUses): its recording reads
+// A pass without declared bindings. The test installs its layout directly with SetResourceUses. Its recording reads
 // the frame's declared views through the context, never through values captured at preparation.
 struct ViewFrame {
     std::vector<DeclaredViewToken> views;
@@ -79,9 +79,9 @@ struct DeclaredFixture {
     DeclaredFixture() {
         using A = rhi::ResourceAccessType;
         using V = BindlessViewKind;
-        // Resource 41 is declared both as a shader resource and for unordered access under one name; resource 42
-        // only as a shader resource. namedViews is what RenderPassBuilder::NameUseViews leaves for those
-        // declarations: the unordered-access view wins the shared name.
+        // Resource 41 is declared both as a shader resource and for unordered access, under one name. Resource 42
+        // is declared only as a shader resource. namedViews is what RenderPassBuilder::NameUseViews produces for
+        // those declarations. The unordered-access view wins the shared name.
         layout->uses.push_back({{}, {A::UnorderedAccess, rhi::ResourceLayout::Common, rhi::ResourceSyncState::All},
             {41, 41}, {{V::ShaderResource, UINT32_MAX, 0, 0}, {V::UnorderedAccess, UINT32_MAX, 0, 0}}});
         layout->uses.push_back({{}, {A::ShaderResource, rhi::ResourceLayout::Common, rhi::ResourceSyncState::All},
@@ -173,7 +173,7 @@ int main() {
         ENSURE(Rejects<std::out_of_range>([&] { (void)truncated.View({fixture.layout, 1, 0}); }));
     }
 
-    // A typed pass prepares per frame; Record resolves against the frame its packet was prepared for.
+    // A typed pass prepares once per frame. Record resolves against the frame that its packet was prepared for.
     {
         ViewProbe probe;
         probe.layout = fixture.layout;
@@ -185,7 +185,7 @@ int main() {
         auto newPacket = probe.PrepareFrame(newFrame);
         auto abandoned = probe.PrepareFrame(newFrame);
         ENSURE(probe.prepares == 3 && oldPacket.IsWorkerSafe());
-        // A packet that reserved an effect has a lifecycle to commit: never replayed.
+        // A packet that reserved an effect has a lifecycle to commit, so it is never replayed.
         ENSURE(!oldPacket.IsReplayable());
         RecordingContext recording(commands, oldFrame.bindings);
         newPacket.Record(recording);
@@ -198,7 +198,8 @@ int main() {
         ENSURE(abandoned.Abandon(AbandonReason::Shutdown) && !abandoned.Abandon(AbandonReason::Shutdown));
         ENSURE(probe.effect->submitted == 2 && probe.effect->completed == 2 && probe.effect->abandoned == 1);
 
-        // Revision opts a pass into kept-recording reuse; without it the pass cannot say and is never current.
+        // Revision opts a pass into reuse of kept recordings. Without it, the pass has no way to state its
+        // revision, so it is never current.
         uint64_t hash = 0;
         ENSURE(!probe.RevisionHash(hash));
         RevisionProbe revision;
@@ -219,7 +220,10 @@ int main() {
         const auto frame = fixture.Frame(7);
         RecordingContext base(commands, frame.bindings);
         const auto scoped = base.WithDeclaredResources(frame.bindings, frame.resourceSlots, fixture.Scope(frame));
-        // Declared shader resource; a name declared as SRV and UAV resolves to the UAV; optional undeclared.
+        // Three cases:
+        // - a declared shader resource,
+        // - a name declared as both SRV and UAV, which resolves to the UAV,
+        // - an optional name that is not declared.
         ENSURE((scoped.DescriptorSlotIndices(*Payload({"Test::Depth", "Test::Color"}, {"Test::Missing", "Test::Depth"}))
             == std::vector<uint32_t>{9, 8, UINT32_MAX, 9}));
         // A mandatory undeclared name throws, naming the pipeline and the resource.
@@ -255,7 +259,8 @@ int main() {
         }));
     }
 
-    // RecordingRetention: what a recording names lives until the recording retires, once per owner.
+    // RecordingRetention keeps everything a recording names alive until the recording retires. Each owner is retained
+    // once.
     {
         auto bindings = fixture.Frame(7).bindings;
         auto retention = std::make_shared<RecordingRetention>();

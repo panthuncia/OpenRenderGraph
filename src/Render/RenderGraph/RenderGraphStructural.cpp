@@ -87,6 +87,7 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 			par.resources.internalTransitions = b.params.internalTransitions;
 			par.resources.identifierSet = b.DeclaredResourceIds();
 			par.resources.activeFeatureDomains = b.params.activeFeatureDomains;
+			par.explicitExternalWaitsBeforeTransitions = b.params.externalWaitsBeforeTransitions;
 			par.resources.externalWaitsBeforeTransitions = b.params.externalWaitsBeforeTransitions;
 			par.resources.externalWaitBindingsBeforeTransitions = b.params.externalWaitBindingsBeforeTransitions;
 			par.resources.isGeometryPass = b.params.isGeometryPass;
@@ -316,9 +317,10 @@ void RenderGraph::CompileStructural() {
 			it.extIndex = ei;
 			it.extLocalOrder = localOrder++;
 
-			// Store prevKey for later chaining edges (we apply chaining even if explicit where)
-			// (We don't add edges here because we haven't built node indices yet.)
-			// We'll reconstruct chaining using extIndex/extLocalOrder + keepExtensionOrder below.
+			// Keep prevKey for the chaining edges added later. Chaining applies even when the pass has an explicit
+			// insert point.
+			// Edges are not added here because the node indices do not exist yet.
+			// The chaining is rebuilt below from extIndex, extLocalOrder and keepExtensionOrder.
 			extItems.push_back(std::move(it));
 			prevKey = extItems.back().key;
 		}
@@ -632,9 +634,9 @@ void RenderGraph::RedeclarePass(PassAndResources& p, PassType type)
 		MergeResolverWaits(resources.externalWaitsBeforeTransitions, p.resolverSnapshots);
 		p.retainedAnonymousKeepAlive = CaptureRetainedAnonymousKeepAlive(resources.staticResourceRequirements, resources.internalTransitions);
 		p.resolverGroupPlan = lowering::PlanResolverGroups(p);
-		// A versioned resolver can replace the concrete resource behind an unchanged identifier: the view and Setup are
-		// rebuilt so automatic descriptor bindings follow it. Immediate-only upload and readback passes consume the
-		// resources captured in their bytecode and opt out.
+		// A versioned resolver can replace the concrete resource behind an unchanged identifier. So the view and Setup are
+		// rebuilt, and automatic descriptor bindings follow the new resource. Immediate-only upload and readback passes opt
+		// out. They use the resources captured in their bytecode.
 		const auto* dynamic = dynamic_cast<IDynamicDeclaredResources*>(p.pass.get());
 		const bool rebind = !p.resolverSnapshots.empty()
 			|| !dynamic || dynamic->RequiresPassRebindAfterDeclarationRefresh();

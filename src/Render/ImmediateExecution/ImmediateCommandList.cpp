@@ -510,10 +510,10 @@ namespace org::imm {
                 continue;
 
             // Buffer copies and the common single-subresource texture case do not
-            // need the general rectangle merger.  Immediate upload/readback passes
-            // touch many such resources, and constructing two hash tables plus a
-            // scratch vector for each one was the dominant per-frame materialization
-            // allocation cost.
+            // need the general rectangle merger. Immediate upload and readback passes
+            // touch many such resources. Building two hash tables and a scratch vector
+            // for each one was the largest per-frame allocation cost during
+            // materialization.
             if (acc.totalMips == 1u && acc.perMip.size() == 1u && acc.perMip.front().size() == 1u) {
                 const auto& interval = acc.perMip.front().front();
                 ResourceRequirement rr{ itH->second };
@@ -572,7 +572,7 @@ namespace org::imm {
                         open.emplace(k, Rect{ mip, mip, in.lo, in.hi });
                     }
                     else {
-                        // if it was open, extend only if consecutive; otherwise close & restart
+                        // It was open. Extend it only if this mip is the next one. Otherwise close it and start a new one.
                         if (it->second.mip1 + 1 == mip) {
                             it->second.mip1 = mip;
                         }
@@ -668,7 +668,7 @@ namespace org::imm {
             layout = AccessToLayout(access, /*isRender=*/false);
             break;
         case ImmediatePassKind::Copy:
-            // Copy queue only supports copy-class access; always use Copy sync.
+            // The copy queue only supports copy-class access, so always use Copy sync.
             if ((access & (rhi::ResourceAccessType::CopySource | rhi::ResourceAccessType::CopyDest)) != rhi::ResourceAccessType(0)) {
                 sync = rhi::ResourceSyncState::Copy;
                 layout = rhi::ResourceLayout::Common;
@@ -714,7 +714,7 @@ namespace org::imm {
             }
         }
 
-        // Mark union-of-touched (exact, no unused coverage).
+        // Mark the union of the touched subresources. It is exact, with no unused coverage.
         const uint32_t mip0 = sr.firstMip;
         const uint32_t mip1 = sr.firstMip + sr.mipCount - 1;
         const uint32_t sl0 = sr.firstSlice;

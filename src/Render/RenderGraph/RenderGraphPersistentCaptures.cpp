@@ -1,8 +1,10 @@
-// Readback captures on the persistent route. A capture anchored after a main pass is recorded in that pass's own packet,
-// right after its commands (PreparedPass::WithTrailer): a transition from the pass's final state to copy source, the copy into
-// a readback buffer, and the transition back, so the executable and its barriers are unchanged. A capture the pass cannot
-// take (a resource it does not bind, or a range its uses do not cover) falls back to a frame-interrupting capture pass, and an
-// after-graph capture to a per-frame pass at the end.
+// Readback captures on the persistent route. There are three cases:
+// - A capture anchored after a main pass is recorded in that pass's own command list, right after its commands
+//   (PreparedPass::WithTrailer). It moves the resource to copy source, copies it into a readback buffer, and moves it back.
+//   The executable and its barriers don't change.
+// - If the pass can't take the capture (it doesn't bind the resource, or its uses don't cover the range), the capture
+//   becomes a frame-interrupting capture pass.
+// - A capture after the graph is submitted through the graph's external client after the execution.
 
 #include "RenderGraphPersistentState.h"
 
@@ -87,8 +89,7 @@ std::shared_ptr<Resource> RenderGraph::GetScheduledResource(uint64_t schedulingI
 
 namespace persistent_impl {
 
-void PlacePersistentCaptures(RenderGraph& graph, State& state, bool ticket, std::vector<ExternalPassDesc>& frameExt,
-	std::vector<ExternalPassDesc>& interrupting) {
+void PlacePersistentCaptures(RenderGraph& graph, State& state, bool ticket, std::vector<ExternalPassDesc>& interrupting) {
 	const auto service = graph.GetReadbackServiceOwner();
 	if (!service) return;
 	std::unordered_map<std::string, uint32_t> slots;
@@ -101,7 +102,11 @@ void PlacePersistentCaptures(RenderGraph& graph, State& state, bool ticket, std:
 	};
 	for (auto& capture : std::exchange(state.capturesToInsert, {})) insert(capture, interrupting);
 	for (auto& capture : service->ConsumeCaptureRequests()) {
-		if (capture.passName == runtime::kReadbackAfterGraph) insert(capture, frameExt);
+		if (capture.passName == runtime::kReadbackAfterGraph) {
+			// Submitted through the graph's external client after the execution (SubmitAfterGraphCaptures).
+			if (ticket) spdlog::warn("Readback capture after the graph is not supported with tickets; dropped");
+			else state.afterGraphCaptures.push_back(std::move(capture));
+		}
 		else state.pendingCaptures[capture.passName].push_back({std::move(capture), state.frameNumber});
 	}
 	for (auto it = state.pendingCaptures.begin(); it != state.pendingCaptures.end();) {
@@ -112,6 +117,48 @@ void PlacePersistentCaptures(RenderGraph& graph, State& state, bool ticket, std:
 			return true;
 		});
 		it = captures.empty() ? state.pendingCaptures.erase(it) : std::next(it);
+	}
+}
+
+void SubmitAfterGraphCaptures(RenderGraph& graph, State& state) {
+	if (state.afterGraphCaptures.empty()) return;
+	BT_ZONE_SCOPE("ORG.Persistent.SubmitAfterGraphCaptures");
+	const auto service = graph.GetReadbackServiceOwner();
+	auto& client = graph.GetExternalClient();
+	const auto& queues = graph.GetQueueRegistry();
+	const auto graphicsSlot = ToUnderlying(queues.FindGraphicsSlot());
+	const auto copyIndex = queues.FindSlot({QueueKind::Copy, 0});
+	const auto copySlot = ToUnderlying(copyIndex) == 0xFF ? graphicsSlot : ToUnderlying(copyIndex);
+	const ResourceState copySource{rhi::ResourceAccessType::CopySource,
+		rhi::AccessToLayout(rhi::ResourceAccessType::CopySource, true), rhi::RenderSyncFromAccess(rhi::ResourceAccessType::CopySource)};
+	for (auto& capture : std::exchange(state.afterGraphCaptures, {})) {
+		if (!service) break;
+		auto resource = ResolveCaptureResource(graph, capture);
+		if (!resource) {
+			spdlog::warn("Readback capture after the graph: resource {} is gone", capture.resourceId);
+			continue;
+		}
+		const bool copyQueue = capture.preferredQueueKind == QueueKind::Copy;
+		const auto source = resource->GetAPIResource();
+		auto plan = runtime::PlanReadbackCapture(graph.GetRuntime().Device(), service, *resource, source, capture.range,
+			std::move(capture.callback), copyQueue ? QueueKind::Copy : QueueKind::Graphics, "ReadbackCapture::AfterGraph");
+		if (!plan) continue;
+		std::vector<rhi::TimelinePoint> signals;
+		if (plan.reservation)
+			for (const auto& signal : plan.reservation->SignalsAfterCompletion())
+				signals.push_back({signal.timeline.GetHandle(), signal.value});
+		const std::array<ExternalClient::Access, 1> accesses{{{resource.get(), capture.range, copySource}}};
+		const auto handle = source.GetHandle();
+		try {
+			client.Submit(copyQueue ? copySlot : graphicsSlot, accesses, [&](rhi::CommandList& list) {
+				runtime::RecordReadbackCapture(plan, list, handle);
+			}, signals, std::make_shared<std::pair<std::shared_ptr<const void>, std::shared_ptr<Resource>>>(plan.destinationLease, resource));
+		} catch (const std::exception& error) {
+			spdlog::error("Readback capture after the graph failed to submit: {}", error.what());
+			if (plan.reservation) plan.reservation->Abandoned(AbandonReason::AdmissionFailed);
+			continue;
+		}
+		if (plan.reservation) plan.reservation->Submitted({});
 	}
 }
 

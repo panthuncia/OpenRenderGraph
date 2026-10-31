@@ -49,8 +49,8 @@ public:
     void RequestReadbackCaptureAfterGraph(Resource* resource, const RangeSpec& range, ReadbackCaptureCallback callback, QueueKind preferredQueueKind = QueueKind::Graphics) {
         RequestReadbackCapture(kReadbackAfterGraph, resource, range, std::move(callback), preferredQueueKind);
     }
-    // A capture of the resource a persistent schedule names (ScheduleTrace::Resource::id) after a pass: what a debug UI on
-    // another thread than the graph's can request, without the resource object.
+    // Captures the resource that a persistent schedule names (ScheduleTrace::Resource::id), after a pass. A debug UI on a
+    // thread other than the graph's can request it without the resource object.
     virtual void RequestScheduledReadbackCapture(const std::string& passName, uint64_t schedulingID, const RangeSpec& range,
         ReadbackCaptureCallback callback) = 0;
     virtual std::vector<ReadbackCaptureInfo> ConsumeCaptureRequests() = 0;

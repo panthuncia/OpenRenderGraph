@@ -18,8 +18,9 @@ namespace org::runtime {
 
 class IReadbackService;
 
-// One capture's copy into a readback buffer, planned against the source's bound backing: what both the capture pass
-// (ReadbackCapturePass) and a capture appended to a pass's own recording (RenderGraph's persistent route) record.
+// One capture's copy into a readback buffer, planned against the source's bound backing. Two places record it:
+// - the capture pass (ReadbackCapturePass),
+// - a capture appended to a pass's own recording (RenderGraph's persistent route).
 struct ReadbackCapturePlan {
     rhi::ResourceHandle destination{};
     uint64_t bytes = 0;
@@ -32,8 +33,8 @@ struct ReadbackCapturePlan {
     explicit operator bool() const noexcept { return bytes != 0; }
 };
 
-// Plans a capture of source (bound this frame as boundSource) over range. An empty plan when the range is empty or the
-// service has no readback buffer to give; throws when the source cannot describe itself.
+// Plans a capture of source over range. source is bound this frame as boundSource. Returns an empty plan when the
+// range is empty or the service has no readback buffer to give. Throws when the source cannot describe itself.
 ReadbackCapturePlan PlanReadbackCapture(rhi::Device device, const std::shared_ptr<IReadbackService>& service, Resource& source,
     rhi::Resource boundSource, const RangeSpec& range, ReadbackCaptureCallback callback, QueueKind queue, const std::string& debugName);
 

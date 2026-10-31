@@ -17,8 +17,8 @@ struct ResolverRequirementBlock;
 
 using ResolverResourceList = std::vector<std::shared_ptr<Resource>>;
 
-// An owned, typed publication token supplied by the preparation owner. Workers
-// consume captured declaration states, never a live process publication source.
+// An owned, typed publication token. The preparation owner supplies it.
+// Workers read captured declaration states. They never read a live publication source of the process.
 class ResolverCaptureContext {
 public:
     template<class T>
@@ -61,10 +61,14 @@ class IResourceResolver {
     virtual std::shared_ptr<const ResolverDeclarationState> CaptureDeclarationState() const = 0;
     virtual std::shared_ptr<const ResolverDeclarationState> CaptureDeclarationState(
         const ResolverCaptureContext&) const { return CaptureDeclarationState(); }
-    // Cheap change hint for per-frame polling: while the returned value is
+    // A cheap change hint for per-frame polling. While the returned value is
     // nonzero and unchanged, CaptureDeclarationState() would return an
-    // equivalent state. Zero means "unknown, capture to find out".
+    // equivalent state. Zero means the state is unknown, and the caller must capture it to find out.
     virtual uint64_t DeclarationVersionHint() const noexcept { return 0; }
+    // How many members the graph should reserve slots for when it first declares this resolver. Going past the
+    // reserved count needs a structural build, so a resolver whose set grows over time should return its expected
+    // size. Zero leaves it to the graph. It must depend only on the resolver's configuration, so clones agree.
+    virtual uint32_t CapacityHint() const noexcept { return 0; }
 
     template<typename T>
     std::vector<std::shared_ptr<T>> ResolveAs(bool require_all_casts = true) const {
@@ -106,12 +110,12 @@ struct ResourceResolverAndRange {
     RangeSpec range;
 };
 
-/// Snapshot of a resolver taken during DeclareResourceUsages. The captured state's
-/// resource-set identity drives re-declaration; its content and wait revisions are
-/// tracked independently so they cannot invalidate the structural declaration.
+/// A snapshot of a resolver, taken during DeclareResourceUsages. A change in the
+/// identity of the captured resource set triggers re-declaration. Content and wait
+/// revisions are tracked separately, so they cannot invalidate the structural declaration.
 struct ResolverSnapshot {
     std::unique_ptr<IResourceResolver> resolver;
-    // The resolver's state as the declaration captured it (ResolverCaptureScope): the declaration's uses,
+    // The resolver's state as the declaration captured it (see ResolverCaptureScope). The declaration's uses,
     // its views and the group it lowers to all describe this one resource set.
     std::shared_ptr<const ResolverDeclarationState> state;
     struct RequirementTemplate {
@@ -148,9 +152,10 @@ struct ResolverSnapshot {
 };
 
 
-// Open for the length of one pass declaration, on the declaring thread: every use, view and snapshot the declaration takes of
-// a resolver (RenderGraph::CaptureResolverDeclarationState) then describes one resource set, even when the resolver publishes on
-// another thread meanwhile.
+// Held open for the length of one pass declaration, on the declaring thread. While it is open, every use, view and
+// snapshot the declaration takes of a resolver describes the same resource set
+// (RenderGraph::CaptureResolverDeclarationState). This holds even when the resolver publishes on another thread in the
+// meantime.
 class ResolverCaptureScope {
 public:
     ResolverCaptureScope();

@@ -29,7 +29,7 @@ namespace org::compiler {
 
 namespace {
 // Decision-trace labels (OpenRenderGraph/Trace.h).
-std::string TracePassName(const CompiledGraph& graph, uint32_t pass) {
+std::string TracePassName(const Schedule& graph, uint32_t pass) {
     if (pass == UINT32_MAX) return "<entry>";
     const auto& names = graph.structure->diagnosticPassNames;
     if (pass < names.size() && !names[pass].empty()) return names[pass];
@@ -122,7 +122,7 @@ std::span<const PreparedBackingState> ValidatePreparedBackings(
 }
 
 PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
-    const CompiledGraph& graph, std::span<const PreparedBackingState> initial,
+    const Schedule& graph, std::span<const PreparedBackingState> initial,
     std::span<const rhi::ResourceHandle> invalidated, bool closeToHome) const {
     BT_ZONE_SCOPE("ORG.Execution.ResolveBackingStates");
     if (!graph.structure || !graph.states.complete || initial.size() != graph.structure->resourceIDs.size())
@@ -830,7 +830,7 @@ void BackingStateAdmissionLedger::Invalidate(std::span<const rhi::ResourceHandle
 
 namespace {
 template<class Fn>
-void VisitPassAccesses(const CompiledGraph& graph, uint32_t passIndex, Fn&& fn) {
+void VisitPassAccesses(const Schedule& graph, uint32_t passIndex, Fn&& fn) {
     const auto& pass = graph.structure->passes.at(passIndex);
     if (!pass.entryStates.empty()) {
         for (const auto& use : pass.entryStates) fn(use.resource, use.range, use.state.write);
@@ -845,7 +845,7 @@ void VisitPassAccesses(const CompiledGraph& graph, uint32_t passIndex, Fn&& fn) 
 }
 
 std::span<const PreparedBackingState> OrderBackings(
-    const CompiledGraph& graph, std::span<const PreparedBackingState> resources) {
+    const Schedule& graph, std::span<const PreparedBackingState> resources) {
     if (!graph.structure)
         throw std::invalid_argument("Incomplete backing access input");
     if (resources.size() != graph.structure->resourceIDs.size())
@@ -865,7 +865,7 @@ void AppendWait(std::vector<ExecutionTimelinePoint>& waits, ExecutionTimelinePoi
 }
 }
 
-void BackingAccessAdmissionLedger::AppendIncomingWaits(const CompiledGraph& graph,
+void BackingAccessAdmissionLedger::AppendIncomingWaits(const Schedule& graph,
     std::span<const PreparedBackingState> resources,
     std::span<const ExecutionTimelinePoint> queues,
     std::vector<std::vector<ExecutionTimelinePoint>>& incoming) const {
@@ -904,7 +904,7 @@ void BackingAccessAdmissionLedger::AppendIncomingWaits(const CompiledGraph& grap
         "ORG.Execution.CrossFrameHazardWaits", static_cast<int64_t>(waitsAdded));
 }
 
-void BackingAccessAdmissionLedger::AppendBoundaryAccessWaits(const CompiledGraph& graph,
+void BackingAccessAdmissionLedger::AppendBoundaryAccessWaits(const Schedule& graph,
     std::span<const PreparedBackingState> resources, std::span<const uint8_t> selected, ResourceWaits& out) const {
     BT_ZONE_SCOPE("ORG.Execution.ResolveBoundaryAccessWaits");
     const auto ordered = OrderBackings(graph, resources);
@@ -936,7 +936,7 @@ void BackingAccessAdmissionLedger::AppendBoundaryAccessWaits(const CompiledGraph
     }
 }
 
-void BackingAccessAdmissionLedger::Commit(const CompiledGraph& graph,
+void BackingAccessAdmissionLedger::Commit(const Schedule& graph,
     std::span<const PreparedBackingState> resources,
     const GraphExecutionTimeline& execution, uint32_t batchCount) {
     BT_ZONE_SCOPE("ORG.Execution.CommitCrossFrameHazards");
@@ -1013,7 +1013,7 @@ void AliasAccessAdmissionLedger::ForEachConflict(const PreparedBackingState& res
 }
 
 std::vector<rhi::ResourceHandle> AliasAccessAdmissionLedger::ApplyInitialStates(
-    const CompiledGraph& graph,
+    const Schedule& graph,
     std::span<const PreparedBackingState> resources) const {
     BT_ZONE_SCOPE("ORG.Execution.ResolveAliasActivations");
     const auto ordered = OrderBackings(graph, resources);
@@ -1033,7 +1033,7 @@ std::vector<rhi::ResourceHandle> AliasAccessAdmissionLedger::ApplyInitialStates(
     return activated;
 }
 
-void AliasAccessAdmissionLedger::AppendIncomingWaits(const CompiledGraph& graph,
+void AliasAccessAdmissionLedger::AppendIncomingWaits(const Schedule& graph,
     std::span<const PreparedBackingState> resources,
     std::span<const ExecutionTimelinePoint> queues,
     std::vector<std::vector<ExecutionTimelinePoint>>& incoming) const {
@@ -1064,7 +1064,7 @@ void AliasAccessAdmissionLedger::AppendIncomingWaits(const CompiledGraph& graph,
         "ORG.Execution.AliasHazardWaits", static_cast<int64_t>(waitsAdded));
 }
 
-void AliasAccessAdmissionLedger::Commit(const CompiledGraph& graph,
+void AliasAccessAdmissionLedger::Commit(const Schedule& graph,
     std::span<const PreparedBackingState> resources,
     const GraphExecutionTimeline& execution, uint32_t batchCount) {
     BT_ZONE_SCOPE("ORG.Execution.CommitAliasHazards");

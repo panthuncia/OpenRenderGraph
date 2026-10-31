@@ -17,9 +17,8 @@ runtime::IUploadService& RenderGraphPass::UploadService() const {
 runtime::IDescriptorService& RenderGraphPass::DescriptorService() const {
     auto service = m_descriptorService.lock();
     if (service) return *service;
-    // Pass construction can precede graph service binding during startup;
-    // retain the weak binding contract while allowing that initialization
-    // window to resolve through the graph's active generation.
+    // During startup, a pass can be constructed before the graph binds its services. The pass still holds only a weak
+    // binding. In that startup window, resolve through the graph's active generation instead.
     if (auto* active = runtime::GetActiveDescriptorService()) return *active;
     throw std::runtime_error("Pass descriptor service generation is unavailable");
 }
