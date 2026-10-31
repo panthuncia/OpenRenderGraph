@@ -1,5 +1,6 @@
 // Persistent execution, frame preparation: installing passes into the program, polling declarations, resolver groups and
 // backings, and preparing the frame's invocations and dynamic segments. See RenderGraphPersistentState.h.
+#include "OpenRenderGraph/Trace.h"
 #include "RenderGraphPersistentState.h"
 
 namespace org {
@@ -929,6 +930,7 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 		persistent::FrameRebinding rebinding;
 		rebinding.slot = entry.slot;
 		rebinding.backing.graphResourceID = uint64_t{entry.slot.index} + 1;
+		if (trace::Any()) rebinding.backing.debugName = entry.resource->GetName();
 		rebinding.backing.resource = snapshot->resource.GetHandle();
 		rebinding.backing.shape = entry.shape;
 		rebinding.backing.regions = CaptureRegions(*concrete, entry.shape);
@@ -1628,6 +1630,7 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 					persistent::FrameRebinding rebinding;
 					rebinding.slot = entry.slot;
 					rebinding.backing.graphResourceID = uint64_t{entry.slot.index} + 1;
+					if (trace::Any()) rebinding.backing.debugName = entry.resource->GetName();
 					rebinding.backing.resource = snapshot->resource.GetHandle();
 					rebinding.backing.shape = entry.shape;
 					rebinding.backing.regions = CaptureRegions(*concrete, entry.shape);

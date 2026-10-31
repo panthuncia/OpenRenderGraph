@@ -1,7 +1,10 @@
 #include "Render/RenderGraph/ExecutionState.h"
 #include "Render/BufferBarrierHelpers.h"
+#include "OpenRenderGraph/Trace.h"
+#include <rhi_helpers.h>
 
 #include <algorithm>
+#include <unordered_map>
 #include <stdexcept>
 #include <BasicTelemetry/Tracy.h>
 #include <BasicTelemetry/Telemetry.h>
@@ -23,6 +26,34 @@ rhi::QueueKind OwnershipPeerForQueue(uint32_t queue) noexcept {
 }
 
 namespace org::compiler {
+
+namespace {
+// Decision-trace labels (OpenRenderGraph/Trace.h).
+std::string TracePassName(const CompiledGraph& graph, uint32_t pass) {
+    if (pass == UINT32_MAX) return "<entry>";
+    const auto& names = graph.structure->diagnosticPassNames;
+    if (pass < names.size() && !names[pass].empty()) return names[pass];
+    return "pass#" + std::to_string(pass);
+}
+std::string TraceResourceName(const PreparedBackingState& backing) {
+    if (!backing.debugName.empty()) return backing.debugName;
+    if (!backing.graphResourceKey.empty()) return backing.graphResourceKey;
+    return "resource#" + std::to_string(backing.graphResourceID);
+}
+const char* TraceLayout(uint64_t layout) {
+    return rhi::helpers::ResourceLayoutToString(static_cast<rhi::ResourceLayout>(layout));
+}
+const char* TraceLayout(rhi::ResourceLayout layout) { return rhi::helpers::ResourceLayoutToString(layout); }
+const char* TraceOwnership(rhi::QueueOwnership ownership) {
+    switch (ownership) {
+    case rhi::QueueOwnership::Acquire: return "acquire";
+    case rhi::QueueOwnership::Release: return "release";
+    default: return "none";
+    }
+}
+uint64_t TraceHandle(rhi::ResourceHandle handle) { return (uint64_t{handle.generation} << 32) | handle.index; }
+}
+
 namespace {
 bool PointCompleted(ExecutionTimelinePoint point, const std::map<uint64_t, uint64_t>& completed) {
     if (!point.timeline && !point.value) return true;
@@ -178,9 +209,21 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
     // native queue in every graph on the runtime.
     const auto handOff = [&](rhi::TextureBarrier& barrier, const PreparedBackingState& captured, uint32_t previousQueue,
         uint32_t consumerQueue, uint32_t batch) {
-        if (closeToHome || barrier.discard || previousQueue == UINT32_MAX || previousQueue == consumerQueue
-            || previousQueue >= graph.structure->queues.size() || deviceOfQueue(previousQueue) != deviceOfQueue(consumerQueue))
+        const char* skipped = closeToHome ? "closed-execution"
+            : barrier.discard ? "discarded"
+            : previousQueue == UINT32_MAX ? "previous-queue-unknown"
+            : previousQueue == consumerQueue ? "same-queue"
+            : previousQueue >= graph.structure->queues.size() ? "previous-queue-not-in-graph"
+            : deviceOfQueue(previousQueue) != deviceOfQueue(consumerQueue) ? "other-device" : nullptr;
+        if (skipped) {
+            ORG_TRACE(Handoff, "handoff-skipped").Resource(TraceResourceName(captured)).Add("reason", skipped)
+                .Add("previousQueue", previousQueue).Add("consumerQueue", consumerQueue).Add("batch", batch)
+                .Add("beforeLayout", TraceLayout(barrier.beforeLayout)).Add("afterLayout", TraceLayout(barrier.afterLayout));
             return false;
+        }
+        ORG_TRACE(Handoff, "handoff-planned").Resource(TraceResourceName(captured))
+            .Add("fromQueue", previousQueue).Add("toQueue", consumerQueue).Add("consumerBatch", batch)
+            .Add("releaseFromLayout", TraceLayout(barrier.beforeLayout)).Add("afterLayout", TraceLayout(barrier.afterLayout));
         auto release = barrier;
         release.texture = handleOn(captured, previousQueue);
         release.afterAccess = rhi::ResourceAccessType::Common;
@@ -271,6 +314,29 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
         const auto existing = boundaryStep ? m_states.find(stateKey) : m_states.end();
         const bool useSubmittedState = boundaryStep
             && existing != m_states.end() && !invalidatedState && !authoritativeState;
+        if (trace::Enabled(trace::Category::Barriers)) {
+            const auto consumerQueue = graph.batches[step.batch].queue;
+            const char* path = !boundaryStep ? (crossQueue ? "body-cross-queue" : step.previousBatch == step.batch
+                    ? "body-same-batch" : "body-same-queue")
+                : authoritativeState ? "entry-authoritative"
+                : invalidatedState ? (aliasedBacking ? "entry-aliased" : "entry-invalidated")
+                : useSubmittedState ? "entry-ledger" : "entry-seeded";
+            trace::Builder event(trace::Category::Barriers, "state-step");
+            event.Resource(TraceResourceName(captured)).Add("handle", TraceHandle(handle)).Add("path", path)
+                .Add("pass", TracePassName(graph, step.pass)).Add("batch", step.batch).Add("queue", consumerQueue)
+                .Add("previousPass", TracePassName(graph, step.previousPass))
+                .Add("previousBatch", step.previousBatch)
+                .Add("previousQueue", step.previousBatch == UINT32_MAX ? UINT32_MAX : graph.batches[step.previousBatch].queue)
+                .Add("mips", std::to_string(step.range.mip) + "+" + std::to_string(step.range.mips))
+                .Add("slices", std::to_string(step.range.slice) + "+" + std::to_string(step.range.slices))
+                .Add("compiledBeforeLayout", TraceLayout(step.before.layout)).Add("afterLayout", TraceLayout(step.after.layout))
+                .Add("aliased", aliasedBacking).Add("closeToHome", closeToHome);
+            if (useSubmittedState && !existing->second.cells.empty()) {
+                const auto cell = CellIndex(existing->second.shape, step.range.mip, step.range.slice);
+                event.Add("ledgerLayout", TraceLayout(existing->second.cells[cell].layout))
+                    .Add("ledgerQueue", existing->second.queues[cell]);
+            }
+        }
         // Intra-frame state is compiler-invariant. Encode its complete range
         // once instead of replaying one identical barrier per mip/slice cell.
         if (!boundaryStep) {
@@ -685,6 +751,40 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
     if (intraBatchSteps)
         basic_telemetry::AddCounter("ORG.Execution.IntraBatchStateBarrierSteps",
             static_cast<int64_t>(intraBatchSteps));
+    if (trace::Enabled(trace::Category::Barriers)) {
+        // Every texture barrier the plan holds, where it is recorded.
+        std::unordered_map<uint64_t, std::string> names;
+        for (const auto& backing : ordered) {
+            if (!backing.resource.valid()) continue;
+            names.emplace(TraceHandle(backing.resource), TraceResourceName(backing));
+            for (const auto device : backing.deviceHandles) names.emplace(TraceHandle(device), TraceResourceName(backing));
+        }
+        const auto emit = [&](const rhi::TextureBarrier& barrier, const char* list, uint32_t batch, uint32_t queue,
+                              uint32_t pass) {
+            const auto name = names.find(TraceHandle(barrier.texture));
+            ORG_TRACE(Barriers, "barrier").Resource(name == names.end() ? std::string("<unknown>") : name->second)
+                .Add("handle", TraceHandle(barrier.texture)).Add("list", list).Add("batch", batch).Add("queue", queue)
+                .Add("pass", TracePassName(graph, pass))
+                .Add("beforeLayout", TraceLayout(barrier.beforeLayout)).Add("afterLayout", TraceLayout(barrier.afterLayout))
+                .Add("beforeAccess", static_cast<uint64_t>(barrier.beforeAccess))
+                .Add("afterAccess", static_cast<uint64_t>(barrier.afterAccess))
+                .Add("ownership", TraceOwnership(barrier.queueOwnership)).Add("discard", barrier.discard)
+                .Add("mips", std::to_string(barrier.range.baseMip) + "+" + std::to_string(barrier.range.mipCount));
+        };
+        for (const auto& release : result.releases)
+            for (const auto& barrier : release.textures) emit(barrier, "release-list", UINT32_MAX, release.queue, UINT32_MAX);
+        for (uint32_t batch = 0; batch < result.batches.size(); ++batch) {
+            const auto& out = result.batches[batch];
+            const auto queue = graph.batches[batch].queue;
+            for (const auto& barrier : out.textures) emit(barrier, "entry", batch, queue, UINT32_MAX);
+            for (const auto& barrier : out.acquired) emit(barrier, "entry-acquired", batch, queue, UINT32_MAX);
+            for (uint32_t position = 0; position < out.beforePass.size(); ++position) {
+                const auto pass = graph.batches[batch].passes[position];
+                for (const auto& barrier : out.beforePass[position].textures) emit(barrier, "before-pass", batch, queue, pass);
+                for (const auto& barrier : out.afterPass[position].textures) emit(barrier, "after-pass", batch, queue, pass);
+            }
+        }
+    }
     return result;
 }
 
@@ -718,6 +818,9 @@ void BackingStateAdmissionLedger::CommitBatch(const PreparedBatchBarriers& batch
             found->second.cells[cellIndex] = update.state;
             found->second.queues[cellIndex] = batch.committedQueues[i];
         });
+        ORG_TRACE(Admission, "ledger-commit").Add("handle", TraceHandle(batch.committedResources[i]))
+            .Add("layout", TraceLayout(update.state.layout)).Add("queue", batch.committedQueues[i])
+            .Add("mips", std::to_string(update.range.mip) + "+" + std::to_string(update.range.mips));
     }
 }
 

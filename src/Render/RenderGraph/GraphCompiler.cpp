@@ -1,3 +1,4 @@
+#include "OpenRenderGraph/Trace.h"
 #include <cstdlib>
 #include "Render/PublicationBindingBundle.h"
 #include "Render/RenderGraph/GraphCompiler.h"
@@ -182,6 +183,16 @@ std::shared_ptr<const GraphExecutionTimeline> ExecutionTimelineAdmission::Submit
         auto batch = execution->batches[i];
         if (!leading.empty()) batch.leading = leading[i];
         batch.extraTimelines = extraTimelines;
+        if (trace::Enabled(trace::Category::Submission)) {
+            std::string waits;
+            for (const auto point : batch.waits)
+                waits += (waits.empty() ? "" : ",") + std::to_string(point.timeline) + "@" + std::to_string(point.value);
+            ORG_TRACE(Submission, "batch-submitted").Add("submission", execution->submission).Add("batch", i)
+                .Add("queue", execution->bundle->graph->batches[i].queue)
+                .Add("signal", std::to_string(batch.signal.timeline) + "@" + std::to_string(batch.signal.value))
+                .Add("waits", waits).Add("leadingLists", static_cast<uint64_t>(batch.leading.size()))
+                .Add("extraTimelines", static_cast<uint64_t>(batch.extraTimelines.size()));
+        }
         const auto receipt = packets[i]->Submit(batch);
         if (!receipt) {
             Fail(execution->submission, receipt);
@@ -885,6 +896,22 @@ std::shared_ptr<const CompiledGraph> CompileWorkspace::Compile(
             for (size_t q = 0; q < passWaits.size(); ++q)
                 if (passWaits[q] != UINT32_MAX && (openWaits[q] == UINT32_MAX || passWaits[q] > openWaits[q])) openWaits[q] = passWaits[q];
             batchByPass[passIndex] = static_cast<uint32_t>(result->batches.size() - 1);
+            if (trace::Enabled(trace::Category::Schedule)) {
+                std::string compatible, waits;
+                for (const auto slot : pass.compatibleQueueSlots) compatible += (compatible.empty() ? "" : ",") + std::to_string(slot);
+                for (size_t q = 0; q < passWaits.size(); ++q)
+                    if (passWaits[q] != UINT32_MAX) waits += (waits.empty() ? "" : ",") + std::to_string(q) + ":" + std::to_string(passWaits[q]);
+                const char* batching = extendPrevious ? "extends-previous"
+                    : result->batches.size() == 1 ? "first-batch"
+                    : pass.forceBatchIsolation ? "isolated"
+                    : result->batches[result->batches.size() - 2].queue != queue ? "queue-change"
+                    : structure.passes[result->batches[result->batches.size() - 2].passes.back()].forceBatchIsolation ? "after-isolated"
+                    : "new-wait";
+                ORG_TRACE(Schedule, "pass-scheduled").Add("pass", std::string(DiagnosticPassName(structure, passIndex)))
+                    .Add("passIndex", passIndex).Add("queue", queue).Add("preferredQueue", pass.preferredQueueSlot)
+                    .Add("compatibleQueues", compatible).Add("batch", batchByPass[passIndex]).Add("batching", batching)
+                    .Add("waitsOnBatches", waits);
+            }
         }
         result->batchByPass = batchByPass;
         result->positionByPass.assign(passCount, UINT32_MAX);

@@ -1,3 +1,4 @@
+#include "OpenRenderGraph/Trace.h"
 #include "Render/RenderGraph/PersistentGraph.h"
 #include "Render/PreparedPass.h"
 #include <stdexcept>
@@ -945,6 +946,17 @@ std::shared_ptr<const SelectedPublication> GraphEditTransaction::Build(
         BT_ZONE_SCOPE("ORG.Persistent.BuildExecutable");
         compiler::GraphCompileInput input;
         input.structure = m_logical->declarations;
+        // The decision trace names passes and resources by these labels (OpenRenderGraph/Trace.h).
+        if (trace::Any()) {
+            auto& structure = input.structure;
+            structure.diagnosticPassNames.assign(structure.passes.size(), {});
+            for (size_t i = 0; i < structure.passes.size() && i < m_logical->passSlots.size(); ++i)
+                structure.diagnosticPassNames[i] = m_logical->passSlots[i].debugName;
+            structure.diagnosticResourceNames.assign(structure.resourceIDs.size(), {});
+            for (size_t i = 0; i < structure.resourceIDs.size(); ++i)
+                if (const auto* binding = m_bindings.TryAt(static_cast<uint32_t>(i)); binding && binding->admission)
+                    structure.diagnosticResourceNames[i] = binding->admission->debugName;
+        }
         // Epochs execute in their declared order, so the whole-frame schedule (and the
         // alias placement planned over it) orders every pass of an epoch before every
         // pass of the next one that has passes. Untagged passes are left free.
@@ -1559,6 +1571,18 @@ void SynchronousAdmission::AdmitLedger(FrameAdmission& frame, bool cacheEligible
     // Points already reached (a retired timeline's among them: another graph's, destroyed since) need no wait.
     for (auto& waits : frame.incomingWaits)
         std::erase_if(waits, [&](compiler::ExecutionTimelinePoint point) { return m_sequencer->Reached(point); });
+    if (trace::Enabled(trace::Category::Admission)) {
+        trace::Builder admitted(trace::Category::Admission, "admitted");
+        admitted.Add("sequence", frame.sequence).Add("closed", frame.closed).Add("cachedPlan", frame.cachedPlan)
+            .Add("invalidatedBackings", static_cast<uint64_t>(invalidated.size())).Add("batches", static_cast<uint64_t>(graph.batches.size()));
+        for (uint32_t batch = 0; batch < frame.incomingWaits.size(); ++batch) {
+            std::string waits;
+            for (const auto point : frame.incomingWaits[batch])
+                waits += (waits.empty() ? "" : ",") + std::to_string(point.timeline) + "@" + std::to_string(point.value);
+            ORG_TRACE(Admission, "incoming-waits").Add("sequence", frame.sequence).Add("batch", batch)
+                .Add("queue", batch < graph.batches.size() ? graph.batches[batch].queue : UINT32_MAX).Add("waits", waits);
+        }
+    }
     // The resources a batch off the upload queue uses: what a host may record an upload into on that batch's queue.
     if (m_uploadQueue != UINT32_MAX
         && std::ranges::any_of(graph.batches, [&](const auto& batch) { return batch.queue != m_uploadQueue; })

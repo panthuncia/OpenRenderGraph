@@ -1,4 +1,5 @@
 // Persistent execution, the synchronous route: admission, recording and submission of a frame's segments, and retirement.
+#include "OpenRenderGraph/Trace.h"
 #include "RenderGraphPersistentState.h"
 
 namespace org {
@@ -389,6 +390,13 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 						throw std::runtime_error("Handoff release submission failed");
 					m_queueRegistry.EnsureNextFenceValueAtLeast(index, signal.value + 1);
 					for (const auto consumer : release.consumers) admission.incomingWaits.at(consumer).push_back(signal);
+					if (trace::Enabled(trace::Category::Submission)) {
+						std::string consumers;
+						for (const auto consumer : release.consumers) consumers += (consumers.empty() ? "" : ",") + std::to_string(consumer);
+						ORG_TRACE(Submission, "release-list-submitted").Add("queue", release.queue)
+							.Add("signal", std::to_string(signal.timeline) + "@" + std::to_string(signal.value))
+							.Add("textures", static_cast<uint64_t>(release.textures.size())).Add("consumerBatches", consumers);
+					}
 					handoffLeases.push_back(std::move(allocation));
 					basic_telemetry::AddCounter("ORG.Persistent.HandoffReleases");
 				}

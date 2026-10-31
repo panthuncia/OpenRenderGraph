@@ -16,6 +16,7 @@
 //
 // RenderGraphPersistentState.h: what the persistent route's units share (the execution state, tickets and
 // recordings, and the helpers over them). Private to src/Render/RenderGraph.
+#include "OpenRenderGraph/Trace.h"
 #include "Render/RenderGraph/RenderGraph.h"
 #include "OpenRenderGraph/Runtime.h"
 #include "RenderGraphCompilerState.h"
@@ -113,6 +114,7 @@ inline std::optional<persistent::BindingVersion> CaptureSlotBinding(Resource& re
 	if (!concrete) return std::nullopt;
 	PreparedBackingState initial;
 	initial.graphResourceID = uint64_t{slotIndex} + 1;
+	if (trace::Any()) initial.debugName = resource.GetName();
 	initial.resource = snapshot->resource.GetHandle();
 	initial.shape = shape;
 	initial.regions = CaptureRegions(*concrete, shape);

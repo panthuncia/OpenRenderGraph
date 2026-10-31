@@ -40,6 +40,8 @@ struct PreparedBackingState {
     // A resource shared across devices: its handle on each device instance (by index; [0] is resource). Barriers on a queue use
     // its device's handle, and a use on another device than the last is an external ownership handoff. Empty: one device.
     std::vector<rhi::ResourceHandle> deviceHandles;
+    // The resource's name, captured while the decision trace (OpenRenderGraph/Trace.h) is on: diagnostics only.
+    std::string debugName;
 };
 
 struct PreparedBatchBarriers {

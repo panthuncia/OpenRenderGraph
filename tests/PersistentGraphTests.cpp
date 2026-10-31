@@ -1,3 +1,6 @@
+#include "OpenRenderGraph/Trace.h"
+#include <filesystem>
+#include <fstream>
 #include "Render/RenderGraph/PersistentGraph.h"
 #include "TestSupport.h"
 #include "Render/RenderGraph/GraphReplay.h"
@@ -296,6 +299,123 @@ int main() {
         auto prepared = closed.Prepare(reader,readerQueue);
         CHECK(Rejects([&] { closed.Readmit(prepared); }));
         closed.Abandon(prepared);
+    }
+    {
+        // A texture alternating queues within each execution (written on graphics, read on compute, twice), and across
+        // executions (the next one's first writer is on graphics, the last reader on compute): every queue change is a release
+        // to Common on the producer's queue and a barrier from Common on the consumer's, in the body and at entry alike.
+        auto sequencer = std::make_shared<ResourceSequencer>();
+        CompileWorkspace workspace; std::atomic_bool cancelled{false};
+        const CompileResourceState home{static_cast<uint64_t>(rhi::ResourceAccessType::Common),
+            static_cast<uint64_t>(rhi::ResourceLayout::Common), static_cast<uint64_t>(rhi::ResourceSyncState::None), false};
+        auto state = std::make_shared<PreparedBackingState>();
+        state->graphResourceID = 1; state->resource = {95,1}; state->shape = {1,1,true}; state->debugName = "Alternating";
+        state->regions = std::make_shared<const std::vector<PreparedStateRegion>>(std::vector<PreparedStateRegion>{{{0,1,0,1}, home}});
+        GraphProgram program;
+        auto edit = program.BeginEdit();
+        edit.SetQueues({{0,true},{0,true}});
+        auto binding = Binding(95); binding.identity = (uint64_t{1} << 32) | 95; binding.shape = state->shape;
+        binding.admission = state;
+        const auto slot = edit.AddResource(binding.shape,binding);
+        const CompileResourceState uav{static_cast<uint64_t>(rhi::ResourceAccessType::UnorderedAccess),
+            static_cast<uint64_t>(rhi::ResourceLayout::UnorderedAccess), static_cast<uint64_t>(rhi::ResourceSyncState::PixelShading), true};
+        const CompileResourceState srv{static_cast<uint64_t>(rhi::ResourceAccessType::ShaderResource),
+            static_cast<uint64_t>(rhi::ResourceLayout::ShaderResource), static_cast<uint64_t>(rhi::ResourceSyncState::ComputeShading), false};
+        for (uint32_t i = 0; i < 4; ++i) {
+            CompilePass pass; const uint32_t queue = i % 2;
+            pass.compatibleQueueSlots = {queue}; pass.preferredQueueSlot = queue;
+            edit.Declare(edit.AddPass(pass),slot,{},queue ? srv : uav);
+        }
+        auto selected = edit.Build(workspace,cancelled);
+        CHECK(selected && program.Install(selected));
+        const auto& graph = *selected->executable->graph;
+        CHECK(graph.batches.size() == 4);
+        SynchronousAdmission admission(4, {}, sequencer);
+        const std::array<ExecutionTimelinePoint,2> queues{{{51,0},{52,0}}};
+        // The decision trace records why each barrier is what it is.
+        auto sink = std::make_shared<org::trace::MemorySink>();
+        org::trace::SetSink(sink);
+        org::trace::SetCategories(org::trace::Category::Barriers | org::trace::Category::Handoff
+            | org::trace::Category::Admission);
+        const auto layoutOf = [](const CompileResourceState& use) { return static_cast<rhi::ResourceLayout>(use.layout); };
+        for (uint64_t frame = 1; frame <= 3; ++frame) {
+            auto admitted = admission.Prepare(selected,queues);
+            for (uint32_t i = 0; i < 4; ++i) {
+                const auto& out = admitted.barriers.batches[i];
+                CHECK(graph.batches[i].queue == i % 2);
+                // The batch's own barrier takes the texture on from Common (from the state it is created in, the first time).
+                const bool fromEntry = i == 0;
+                const auto& taken = fromEntry ? (frame == 1 ? out.textures : out.acquired) : out.beforePass.at(0).textures;
+                CHECK(taken.size() == 1 && taken[0].beforeLayout == rhi::ResourceLayout::Common
+                    && taken[0].afterLayout == layoutOf(i % 2 ? srv : uav) && taken[0].queueOwnership == rhi::QueueOwnership::None);
+                // Every batch but the last releases it to Common for the next, on the other queue.
+                const auto& released = out.afterPass.at(0).textures;
+                if (i < 3) CHECK(released.size() == 1 && released[0].afterLayout == rhi::ResourceLayout::Common
+                    && released[0].beforeLayout == layoutOf(i % 2 ? srv : uav) && released[0].queueOwnership == rhi::QueueOwnership::Release);
+                else CHECK(released.empty());
+            }
+            // From the second execution, the last reader's queue releases it ahead of the first writer.
+            if (frame > 1)
+                CHECK(admitted.barriers.releases.size() == 1 && admitted.barriers.releases[0].queue == 1
+                    && admitted.barriers.releases[0].textures.size() == 1
+                    && admitted.barriers.releases[0].textures[0].beforeLayout == layoutOf(srv)
+                    && admitted.barriers.releases[0].textures[0].afterLayout == rhi::ResourceLayout::Common);
+            else CHECK(admitted.barriers.releases.empty());
+            GraphExecutionTimeline receipt; receipt.batches.resize(graph.batches.size());
+            for (size_t i = 0; i < graph.batches.size(); ++i) receipt.batches[i].signal = {graph.batches[i].queue ? 52u : 51u, frame * 10 + i};
+            auto hold = admission.HoldSequencer();
+            admission.Readmit(admitted);
+            admission.Commit(admitted,receipt);
+        }
+        org::trace::SetSink(nullptr);
+        // Per execution, Prepare and Readmit each plan the four steps: the in-batch steps cross queues, and the entry step takes
+        // the ledger's state from the second execution on, which hands off from the compute queue it was left on.
+        const auto steps = sink->Of("state-step");
+        CHECK(steps.size() == 3 * 2 * 4);
+        for (size_t i = 0; i < steps.size(); ++i) {
+            const auto& step = steps[i];
+            const auto position = i % 4;
+            const bool firstExecution = i < 8;
+            CHECK(step.Text("resource") == "Alternating");
+            CHECK(step.Text("path") == (position == 0 ? (firstExecution ? "entry-seeded" : "entry-ledger") : "body-cross-queue"));
+            if (position == 0 && !firstExecution) CHECK(step.Text("ledgerQueue") == "1");
+        }
+        const auto planned = sink->Of("handoff-planned");
+        CHECK(planned.size() == 2 * 2);
+        for (const auto& handoff : planned) CHECK(handoff.Text("fromQueue") == "1" && handoff.Text("toQueue") == "0");
+        CHECK(sink->Of("ledger-commit").size() == 3 * 4);
+        // Every barrier the plan holds is traced where it is recorded; a body barrier on the consumer's queue never names
+        // the producer queue's layout.
+        for (const auto& barrier : sink->Of("barrier"))
+            if (barrier.Text("list") == "before-pass") CHECK(barrier.Text("beforeLayout") == "COMMON");
+    }
+    {
+        // The decision trace: off without a sink, the resource filter, and JSON lines.
+        auto sink = std::make_shared<org::trace::MemorySink>();
+        org::trace::SetCategories(org::trace::Category::Barriers);
+        CHECK(!org::trace::Enabled(org::trace::Category::Barriers));
+        org::trace::SetSink(sink);
+        CHECK(org::trace::Enabled(org::trace::Category::Barriers) && !org::trace::Enabled(org::trace::Category::Handoff));
+        org::trace::SetResourceFilter("Visibility");
+        ORG_TRACE(Barriers, "kept").Resource("Visibility Buffer").Add("n", uint32_t{1});
+        ORG_TRACE(Barriers, "filtered").Resource("GTAO Output");
+        ORG_TRACE(Barriers, "unnamed").Add("n", uint32_t{2});
+        ORG_TRACE(Handoff, "off").Resource("Visibility Buffer");
+        const auto events = sink->Take();
+        CHECK(events.size() == 2 && events[0].decision == "kept" && events[1].decision == "unnamed");
+        CHECK(events[0].Text("n") == "1" && events[0].Text("resource") == "Visibility Buffer");
+        org::trace::SetResourceFilter({});
+        const auto path = (std::filesystem::temp_directory_path() / "org_trace_test.jsonl").string();
+        org::trace::SetSink(org::trace::MakeJsonLinesSink(path));
+        ORG_TRACE(Barriers, "line").Resource("A \"quoted\" name").Add("flag", true).Add("value", int32_t{-3});
+        org::trace::SetSink(nullptr);
+        std::ifstream file(path);
+        std::string line;
+        std::getline(file, line);
+        CHECK(line.find("\"decision\":\"line\"") != std::string::npos
+            && line.find("\"resource\":\"A \\\"quoted\\\" name\"") != std::string::npos
+            && line.find("\"flag\":true") != std::string::npos && line.find("\"value\":-3") != std::string::npos);
+        org::trace::SetCategories(org::trace::Category::None);
     }
     {
         // Closed executions: a texture written in one epoch and read in another leaves each execution in its
