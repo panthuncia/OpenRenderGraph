@@ -11,7 +11,11 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 	BT_ZONE_SCOPE("ORG.Persistent.Execute");
 	auto& compiler = *m_compilerState;
 	auto& state = *compiler.persistent;
-	if (!state.framePrepared) throw std::logic_error("Persistent execution has no prepared frame");
+	if (!state.prepared) throw std::logic_error("Persistent execution has no prepared frame");
+	// Taken out of the state now: whatever happens below, it is not executed twice.
+	auto execution = std::move(*state.prepared);
+	state.prepared.reset();
+	const auto* const ticket = execution.options.ticket;
 	auto& timings = m_lastPersistentExecuteTimings;
 	timings = {};
 	m_lastPresentDependency.reset();
@@ -40,32 +44,17 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 	state.tracyFrameBegun.assign(slotCount, 0);
 	const auto presentationSlot = m_queueRegistry.FindGraphicsSlot();
 
-	// The frame's uploads go first, each through the graph's external client. The main execution's admission comes after
-	// them, so it starts from the states they leave.
-	if (!state.uploads.empty()) {
-		BT_ZONE_SCOPE("ORG.Persistent.SubmitUploads");
-		auto& client = GetExternalClient();
-		const auto graphics = static_cast<uint32_t>(ToUnderlying(presentationSlot));
-		for (auto& upload : state.uploads) {
-			std::vector<rhi::TimelinePoint> signals;
-			for (const auto& signal : upload.signals) signals.push_back({signal.timeline.GetHandle(), signal.value});
-			const auto& bytecode = upload.bytecode;
-			client.Submit(graphics, upload.accesses, [&](rhi::CommandList& list) {
-				if (!bytecode.empty()) org::imm::Replay(bytecode, list, m_immediateDispatch);
-			}, signals, std::move(upload.keepAlive));
-			if (upload.commit) upload.commit();
-		}
-		state.uploads.clear();
-	}
+	// The uploads go first. The main segment's admission comes after them, so it starts from the states they leave.
+	SubmitPersistentUploads(execution);
 
-	auto record = std::make_shared<detail::ExecutionRecord>(state.frameNumber);
+	auto record = std::make_shared<detail::ExecutionRecord>(execution.number);
 	state.lastExecution = record;
-	if (m_persistentTicketTarget) m_persistentTicketTarget->execution = record;
-	if (state.main) {
+	if (ticket) execution.options.ticket->execution = record;
+	if (execution.main) {
 		BT_ZONE_SCOPE("ORG.Persistent.SubmitSegment");
-		auto& segment = *state.main;
+		auto& segment = *execution.main;
 		BT_ZONE_TEXT(segment.label, std::strlen(segment.label));
-		PersistentSegmentRun run{.segment = segment, .timings = timings};
+		PersistentSegmentRun run{.execution = execution, .segment = segment, .timings = timings};
 		run.traceSchedule = m_scheduleTraceEnabled.load(std::memory_order_relaxed);
 		run.slotCount = slotCount;
 		run.presentationSlot = presentationSlot;
@@ -83,7 +72,7 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 		}
 		try {
 			if (AdmitPersistentSegment(run)) {
-				PlanPersistentSegmentRecording(run);
+				RecordPersistentSegment(run);
 				SubmitPersistentSegment(run);
 			}
 		} catch (...) {
@@ -93,18 +82,34 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 	}
 	// A ticket's execution is submitted when the ticket completes. One with nothing submitted here is complete now.
 	record->MarkAdmitted();
-	if (!m_persistentTicketTarget && record->milestone.load(std::memory_order_acquire) == ExecutionMilestone::Admitted) record->Finish(false);
-	state.main.reset();
-	state.framePrepared = false;
-	compiler.lastExecutedPreparationSlot = state.frameIndex;
-	if (!m_persistentTicketTarget) {
+	if (!ticket && record->milestone.load(std::memory_order_acquire) == ExecutionMilestone::Admitted) record->Finish(false);
+	compiler.lastExecutedPreparationSlot = execution.frameIndex;
+	if (!ticket) {
 		SubmitAfterGraphCaptures(*this, state);
 		BT_ZONE_SCOPE("ORG.Persistent.AfterExecute");
 		for (auto& extension : m_extensions)
 			if (extension) extension->AfterExecute(*this);
 	}
-	compiler.lastSubmittedFrameData = state.frameData;
+	compiler.lastSubmittedFrameData = execution.frameData;
 	basic_telemetry::AddCounter("ORG.Persistent.SubmittedFrames");
+}
+
+// Each upload goes through the graph's external client, on the graphics queue.
+void RenderGraph::SubmitPersistentUploads(PersistentExecution& execution) {
+	if (execution.uploads.empty()) return;
+	BT_ZONE_SCOPE("ORG.Persistent.SubmitUploads");
+	auto& client = GetExternalClient();
+	const auto graphics = static_cast<uint32_t>(ToUnderlying(m_queueRegistry.FindGraphicsSlot()));
+	for (auto& upload : execution.uploads) {
+		std::vector<rhi::TimelinePoint> signals;
+		for (const auto& signal : upload.signals) signals.push_back({signal.timeline.GetHandle(), signal.value});
+		const auto& bytecode = upload.bytecode;
+		client.Submit(graphics, upload.accesses, [&](rhi::CommandList& list) {
+			if (!bytecode.empty()) org::imm::Replay(bytecode, list, m_immediateDispatch);
+		}, signals, std::move(upload.keepAlive));
+		if (upload.commit) upload.commit();
+	}
+	execution.uploads.clear();
 }
 
 // Prepares the segment's admission against the ledgers, and settles the cases that need nothing more: an empty segment, a
@@ -117,9 +122,7 @@ bool RenderGraph::AdmitPersistentSegment(PersistentSegmentRun& run) {
 	for (size_t slot = 0; slot < slotCount; ++slot) {
 		const auto index = static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot));
 		const auto next = m_queueRegistry.GetCurrentFenceValue(index);
-		auto submitted = next ? next - 1 : 0;
-		// A pending presentation tail owns the next graphics value.
-		if (state.pendingPresentSubmission && slot == static_cast<size_t>(ToUnderlying(run.presentationSlot))) submitted = next;
+		const auto submitted = next ? next - 1 : 0;
 		const auto identity = QueueTimelineIdentity(*m_runtime, m_queueRegistry, slot);
 		queues.push_back({identity, submitted});
 		run.timelineBindings.push_back({identity, m_queueRegistry.GetFence(index).GetHandle()});
@@ -140,15 +143,16 @@ bool RenderGraph::AdmitPersistentSegment(PersistentSegmentRun& run) {
 		state.admission->Abandon(admission);
 		return false;
 	}
+	const auto& options = run.execution.options;
 	// Executed now (not a ticket, which takes its wait when submitted): every batch waits for the frame's values.
-	if (!m_persistentTicketTarget && HasFrameWaitTimeline() && m_frameWaitValue)
+	if (!options.ticket && HasFrameWaitTimeline() && m_frameWaitValue)
 		for (auto* set : {&admission.incomingWaits, &admission.ownWaits})  // ownWaits: kept by its readmission
 			for (auto& waits : *set) waits.push_back({kFrameWaitTimelineIdentity, m_frameWaitValue});
 	// Recording reuse (SetPersistentRecordingReuse): a ticket's closed execution with nothing late-bound, whose passes all
 	// report their revisions, is recorded for resubmission and kept per (epoch, slot); one prepared for what a kept
 	// recording was recorded for takes it.
-	auto* const ticketTarget = m_persistentTicketTarget;
-	if (ticketTarget && m_persistentTicketAdmissionOnly) {
+	auto* const ticketTarget = options.ticket;
+	if (ticketTarget && options.admissionOnly) {
 		// Recorded ahead (BindPersistentTicketRecording): this preparation's invocations are never recorded.
 		for (const auto& invocation : segment.invocations)
 			if (invocation) invocation.Abandon(AbandonReason::AdmissionFailed);
@@ -171,10 +175,10 @@ bool RenderGraph::AdmitPersistentSegment(PersistentSegmentRun& run) {
 		&& admission.incomingEffects.empty() && !ticketTarget->uncheckable
 		&& !(run.external && lateUnreplayable);
 	if (run.keepable && !m_keptRecordings) m_keptRecordings = std::make_unique<KeptRecordingStore>();
-	if (run.keepable && !m_persistentTicketHostData) {
-		const auto set = m_keptRecordings->Load(ticketTarget->epoch, state.frameIndex);
+	if (run.keepable && !options.hostData) {
+		const auto set = m_keptRecordings->Load(ticketTarget->epoch, run.execution.frameIndex);
 		for (const auto& kept : set ? *set : KeptRecordingSet{}) {
-			if (!kept->Recorded(m_persistentTicketHostTag, segment.publication.get(), segment.legacyBindings.get(), run.resourceHeap, run.samplerHeap,
+			if (!kept->Recorded(options.hostTag, segment.publication.get(), segment.legacyBindings.get(), run.resourceHeap, run.samplerHeap,
 					ticketTarget->revisions))
 				continue;
 			BT_ZONE_SCOPE("ORG.Persistent.ReuseRecording");
@@ -191,18 +195,19 @@ bool RenderGraph::AdmitPersistentSegment(PersistentSegmentRun& run) {
 	return true;
 }
 
-// Seals the admitted invocations and sets up one recording job per batch, with its command list.
-void RenderGraph::PlanPersistentSegmentRecording(PersistentSegmentRun& run) {
+// Seals the admitted invocations, sets up one recording job per batch with its command list, and records them.
+void RenderGraph::RecordPersistentSegment(PersistentSegmentRun& run) {
 	auto& state = *m_compilerState->persistent;
+	const auto frameIndex = run.execution.frameIndex;
 	auto& segment = run.segment;
 	auto& admission = run.admission;
 	auto& timings = run.timings;
 	const size_t slotCount = run.slotCount;
 	const bool keepable = run.keepable;
 	const bool external = run.external;
-	auto* const ticketTarget = m_persistentTicketTarget;
+	auto* const ticketTarget = run.execution.options.ticket;
 	try {
-		run.sealed = compiler::SealPersistentFrame(state.frameNumber, admission, std::move(segment.invocations));
+		run.sealed = compiler::SealPersistentFrame(run.execution.number, admission, std::move(segment.invocations));
 	} catch (...) { state.admission->Abandon(admission); throw; }
 	const auto& graph = *segment.publication->executable->graph;
 	timings.cachedAdmissions += admission.cachedPlan ? 1u : 0u;
@@ -267,7 +272,7 @@ void RenderGraph::PlanPersistentSegmentRecording(PersistentSegmentRun& run) {
 		}
 		job.recording.external = external;
 		job.recording.bindings = segment.legacyBindings;
-		job.recording.frameSlot = state.frameIndex;
+		job.recording.frameSlot = frameIndex;
 		job.recording.externalEntryBarrier = m_externalQueueBoundary.entry && run.firstBatchOnSlot[slot] == batch;
 		if (admission.closed && !closedEntryDone[slot]) {
 			job.recording.externalEntryBarrier = true;
@@ -288,7 +293,7 @@ void RenderGraph::PlanPersistentSegmentRecording(PersistentSegmentRun& run) {
 		if (m_statisticsService) {
 			auto statistics = std::make_shared<compiler::OwnedRecordingStatistics>();
 			statistics->service = m_statisticsService;
-			statistics->frameIndex = state.frameIndex;
+			statistics->frameIndex = frameIndex;
 			statistics->queueKind = rhiKind;
 			statistics->atCompletion = late;
 			// A recording kept for resubmission records no queries of the shared pool: the statistics service recreates it and
@@ -361,10 +366,16 @@ void RenderGraph::PlanPersistentSegmentRecording(PersistentSegmentRun& run) {
 		}
 	}
 	run.Lap(timings.acquireUs);
+	compiler::PlannedFrame plan{run.sealed, std::move(jobs), run.timelineBindings, admission.incomingWaits};
+	const size_t concurrency = (std::min<size_t>)(graph.batches.size(), 4u);
+	try {
+		run.recorded.emplace(compiler::RecordFrame(std::move(plan), m_taskService, concurrency));
+	} catch (...) { state.admission->Abandon(admission); throw; }
+	run.Lap(timings.recordUs);
 }
 
-// Records the batches. A ticket keeps the recording for its host to submit; otherwise the handoff is recorded under the
-// sequencer, and the execution is submitted and committed.
+// A ticket keeps the recording for its host to submit. Otherwise the handoff is recorded under the sequencer, and the
+// execution is submitted and committed.
 void RenderGraph::SubmitPersistentSegment(PersistentSegmentRun& run) {
 	auto& state = *m_compilerState->persistent;
 	auto& segment = run.segment;
@@ -372,15 +383,13 @@ void RenderGraph::SubmitPersistentSegment(PersistentSegmentRun& run) {
 	auto& timings = run.timings;
 	const size_t slotCount = run.slotCount;
 	const bool keepable = run.keepable;
+	const auto& options = run.execution.options;
 	const auto& graph = *segment.publication->executable->graph;
-	compiler::PlannedFrame plan{run.sealed, std::move(run.jobs), run.timelineBindings, admission.incomingWaits};
-	const size_t concurrency = (std::min<size_t>)(graph.batches.size(), 4u);
 	std::shared_ptr<const compiler::GraphExecutionTimeline> execution;
 	std::unique_lock<std::recursive_mutex> sequencer;
 	try {
-		auto recorded = compiler::RecordFrame(std::move(plan), m_taskService, concurrency);
-		run.Lap(timings.recordUs);
-		if (auto* ticket = m_persistentTicketTarget) {
+		auto& recorded = *run.recorded;
+		if (auto* ticket = options.ticket) {
 			// Submitted later, by the host's submitting thread; completed (or abandoned) by the owner.
 			auto recording = std::make_shared<PersistentRecording>();
 			recording->snapshot = recorded.Snapshot();
@@ -389,7 +398,7 @@ void RenderGraph::SubmitPersistentSegment(PersistentSegmentRun& run) {
 			recording->replayable = keepable && std::ranges::all_of(recording->packets, [](const auto& packet) { return packet->Replayable(); });
 			m_recordingsRecorded.fetch_add(1, std::memory_order_relaxed);
 			if (recording->replayable) {
-				recording->hostTag = m_persistentTicketHostTag;
+				recording->hostTag = options.hostTag;
 				recording->publication = segment.publication;
 				recording->bindings = segment.legacyBindings;
 				recording->resourceHeap = run.resourceHeap;
@@ -400,10 +409,10 @@ void RenderGraph::SubmitPersistentSegment(PersistentSegmentRun& run) {
 				recording->leases = segment.leases;
 			}
 			// A recording made for host data is its caller's (BindPersistentTicketRecording), never kept here.
-			if (recording->replayable && !m_persistentTicketHostData) {
+			if (recording->replayable && !options.hostData) {
 				// Kept with the others recorded under the same publication, bindings and host tag (any other can never be
 				// taken again), the most recently used first.
-				const auto previous = m_keptRecordings->Load(ticket->epoch, state.frameIndex);
+				const auto previous = m_keptRecordings->Load(ticket->epoch, run.execution.frameIndex);
 				auto next = std::make_shared<KeptRecordingSet>();
 				next->push_back(recording);
 				for (const auto& kept : previous ? *previous : KeptRecordingSet{})
@@ -414,7 +423,7 @@ void RenderGraph::SubmitPersistentSegment(PersistentSegmentRun& run) {
 					return a->lastUse.load(std::memory_order_relaxed) > b->lastUse.load(std::memory_order_relaxed);
 				});
 				if (next->size() > kKeptRecordingVariants) next->resize(kKeptRecordingVariants);
-				m_keptRecordings->Store(ticket->epoch, state.frameIndex, std::move(next));
+				m_keptRecordings->Store(ticket->epoch, run.execution.frameIndex, std::move(next));
 				m_recordingsKept.fetch_add(1, std::memory_order_relaxed);
 			}
 			ticket->segments.push_back({std::move(admission), std::move(recording), segment.legacyBindings, run.resourceHeap, run.samplerHeap});
@@ -433,8 +442,7 @@ void RenderGraph::SubmitPersistentSegment(PersistentSegmentRun& run) {
 			for (const auto& release : admission.barriers.releases) {
 				BT_ZONE_SCOPE("ORG.Persistent.RecordHandoffRelease");
 				const auto index = static_cast<QueueSlotIndex>(static_cast<uint8_t>(release.queue));
-				// A pending presentation tail owns that queue's next value.
-				if (release.queue >= slotCount || (state.pendingPresentSubmission && index == run.presentationSlot))
+				if (release.queue >= slotCount)
 					throw std::logic_error("A queue handoff's release has no queue value to signal");
 				auto allocation = std::make_shared<compiler::FrameCommandAllocation>();
 				allocation->pool = m_queueRegistry.GetSharedPool(index);
@@ -520,7 +528,7 @@ void RenderGraph::SubmitPersistentSegment(PersistentSegmentRun& run) {
 		state.lastExecution->MarkSubmitted(std::move(signals));
 		state.pendingExecutions.push_back(state.lastExecution);
 	}
-	if (run.traceSchedule) RecordPersistentScheduleSubmission(*segment.publication->executable, state.frameNumber);
+	if (run.traceSchedule) RecordPersistentScheduleSubmission(*segment.publication->executable, run.execution.number);
 	for (const auto& statistics : run.recordingStatistics) statistics->Publish();
 	for (size_t batch = 0; batch < execution->batches.size(); ++batch)
 		m_queueRegistry.EnsureNextFenceValueAtLeast(static_cast<QueueSlotIndex>(static_cast<uint8_t>(graph.batches[batch].queue)),
@@ -535,9 +543,14 @@ void RenderGraph::SubmitPersistentSegment(PersistentSegmentRun& run) {
 				.queue = m_queueRegistry.GetQueue(slot),
 				.wait = {m_queueRegistry.GetFence(slot).GetHandle(), execution->batches[batch].signal.value},
 				.queueSlot = slot, .batchIndex = batch, .valid = execution->batches[batch].signal.value != 0};
-			state.pendingPresentSubmission = execution->submission;
 		}
 	run.Lap(timings.commitUs);
+}
+
+std::shared_ptr<const persistent::ExecutableGeneration> RenderGraph::SelectedExecutable() const {
+	if (!m_compilerState || !m_compilerState->persistent) return nullptr;
+	const auto selected = m_compilerState->persistent->program.Select();
+	return selected ? selected->executable : nullptr;
 }
 
 ExecutionHandle RenderGraph::LastExecution() const {
@@ -555,7 +568,7 @@ void RenderGraph::RetirePersistentExecutions() {
 		const auto fence = m_queueRegistry.GetFence(static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot))).GetCompletedValue();
 		completed.push_back({submitted[slot].timeline, (std::min)(submitted[slot].value, fence)});
 	}
-	if (!state.pendingPresentSubmission) state.timelines->RetireCompleted(completed);
+	state.timelines->RetireCompleted(completed);
 	const auto reached = completed;  // what the queues finished, before the admission's limit below
 	for (auto& point : completed) point.value = (std::min)(point.value, state.admission->Submitted(point.timeline));
 	state.admission->RetireCompleted(completed);

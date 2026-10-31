@@ -179,7 +179,11 @@ public:
 	}
 	// Persistent execution: the graph runs from a selected persistent publication, rebuilt only by structural edits.
 	// Upload passes (immediate-mode commands) are submitted through the external client before it.
-	struct PersistentExecutionState; // Defined in RenderGraphPersistent.cpp; opaque elsewhere.
+	// Its state (RenderGraphPersistentState.h, opaque elsewhere): the instance, the layout and the executions.
+	struct PersistentInstanceState;
+	struct PersistentLayoutState;
+	struct PersistentExecutionsState;
+	struct PersistentExecutionState;
 
 	// The calling thread's CPU time in the last persistent Execute, by phase. Diagnostics: a host that
 	// reports where an epoch's time goes reads it after Execute returns.
@@ -412,7 +416,8 @@ public:
 	// The latest execution (Execute, or the one a ticket prepared). Empty before the first. Owner thread.
 	ExecutionHandle LastExecution() const;
 	// The pass that leaves the swapchain image ready to present. The signal of its batch is the present dependency
-	// (GetLastPresentDependency). Passes that must run after it anchor on GetPresentPass().
+	// (GetLastPresentDependency). Passes that must run after it anchor on GetPresentPass(). Work after the graph that
+	// reads its output (a presentation copy) submits through GetExternalClient(), which orders it after the frame.
 	void SetPresentPass(std::string name) { m_presentPass = std::move(name); }
 	const std::string& GetPresentPass() const noexcept { return m_presentPass; }
 	// The swapchain image. It must be a DynamicResource that points at the image being rendered. The graph binds
@@ -569,19 +574,32 @@ public:
 	ExternalClient& GetExternalClient();
 
 private:
-	// Driving the graph is GraphHost's: its declared-graph calls (Build, PrepareFrame, ExecuteFrame, ConfirmPresentation)
+	// Driving the graph is GraphHost's: its declared-graph calls (Build, PrepareFrame, ExecuteFrame)
 	// or its own frames.
 	friend class GraphHost;
+	friend class GraphInstance;
+	// The executable of the selected publication. Null before the first preparation. Owner thread.
+	std::shared_ptr<const persistent::ExecutableGeneration> SelectedExecutable() const;
 	void CompileStructural();
 	void ResetForFrame();
 	void ResetForRebuild();
 	void Setup();
-	void Update(const UpdateExecutionContext& context, rhi::Device device);
+	// How the next execution runs (RenderGraphPersistentState.h, PersistentExecution::Options). Plain executions use the
+	// defaults; a ticket's set its ticket.
+	struct PersistentExecutionOptions {
+		PersistentTicket* ticket = nullptr;
+		uint64_t hostTag = 0;
+		bool admissionOnly = false;
+		bool hostData = false;
+	};
+	void Update(const UpdateExecutionContext& context, rhi::Device device) { Update(context, device, PersistentExecutionOptions{}); }
+	void Update(const UpdateExecutionContext& context, rhi::Device device, const PersistentExecutionOptions& options);
 	void Execute(PassExecutionContext& context);
-	void ConfirmPresentationTailSubmission();
 	GpuPassRangeBegin m_gpuPassRangeBegin;
 	GpuPassRangeEnd m_gpuPassRangeEnd;
-	void UpdateOnPreparationOwner(const UpdateExecutionContext& context, rhi::Device device);
+	// Update: the passes' own updates, then the next execution's preparation (PreparePersistentFrame).
+	void UpdateOnPreparationOwner(const UpdateExecutionContext& context, rhi::Device device,
+		const PersistentExecutionOptions& options);
 	std::string GetTechniquePathForPassName(std::string_view passName) const;
 
 	struct AnyPassAndResources {
@@ -605,15 +623,26 @@ private:
 	// This keeps compiler algorithm/layout changes from rebuilding all ORG clients.
 	struct Node;
 	struct CompilerState;
-	void PreparePersistentFrame(rhi::Device device, uint8_t frameIndex, const IHostExecutionData* hostData, float deltaTime);
+	// Preparation, on the owner thread: BindPersistentFrame polls the passes' declarations and backings and installs the
+	// edits they make (a structural one builds on a worker); PreparePersistentExecution then prepares an execution
+	// against the selected publication.
+	struct PersistentExecution;
+	void PreparePersistentFrame(rhi::Device device, uint8_t frameIndex, const IHostExecutionData* hostData, float deltaTime,
+		const PersistentExecutionOptions& options);
+	void BootstrapPersistentGraph();
+	// bootstrap: the first, whose passes were all just declared.
+	void BindPersistentFrame(bool ticket, bool bootstrap);
+	PersistentExecution PreparePersistentExecution(rhi::Device device, uint8_t frameIndex, const IHostExecutionData* hostData,
+		float deltaTime, const PersistentExecutionOptions& options);
+	// Execution of the prepared one: its uploads, then its main segment's admission, recording and submission.
 	void ExecutePersistentFrame(PassExecutionContext& context);
+	void SubmitPersistentUploads(PersistentExecution& execution);
 	// One execution of the prepared segment, in phases (RenderGraphPersistentExecute.cpp). Admit returns false when the
 	// segment needs nothing more: it was empty, admission-only, or took a kept recording.
 	struct PersistentSegmentRun;
 	bool AdmitPersistentSegment(PersistentSegmentRun& run);
-	void PlanPersistentSegmentRecording(PersistentSegmentRun& run);
+	void RecordPersistentSegment(PersistentSegmentRun& run);
 	void SubmitPersistentSegment(PersistentSegmentRun& run);
-	void ConfirmPersistentPresentationTail();
 	// skipAliasCandidates leaves alias-eligible transients unmaterialized so the
 	// structural build can place them (see PlanPersistentAliasPlacement).
 	void MaterializePersistentStandalone(std::span<Resource* const> resources, bool skipAliasCandidates = false);
@@ -664,13 +693,6 @@ private:
 	// SetExternalPersistentEpochs; and the secondary lists their tickets record into (graphics, made at their first ticket).
 	std::vector<uint32_t> m_externalPersistentEpochs;
 	std::shared_ptr<CommandListPool> m_externalSecondaryPool;
-	// Set while PreparePersistentTicket runs: Update skips the dynamic segments, Execute stops after recording.
-	PersistentTicket* m_persistentTicketTarget = nullptr;
-	uint64_t m_persistentTicketHostTag = 0;
-	bool m_persistentTicketAdmissionOnly = false;
-	// The ticket prepares for host data (a revision): its passes' revision hashes do not see it (RevisionHash reads
-	// live state), so its recording is neither taken from nor added to the kept sets.
-	bool m_persistentTicketHostData = false;
 	bool m_persistentRecordingReuse = false;
 	SharingChangePolicy m_sharingChangePolicy = SharingChangePolicy::Inline;
 	bool m_persistentRecordingTimestamps = false;
@@ -818,9 +840,6 @@ private:
 	// snapshots, referenced resources and (when they depend on it) its registry view and Setup. Persistent execution
 	// lowers from this directly; the old compiler's RefreshRetainedDeclarationsForFrame also updates its declaration cache.
 	void RedeclarePass(PassAndResources& p, PassType type);
-	void CompileFrame(rhi::Device device, uint8_t frameIndex, const IHostExecutionData* hostData);
-	void PrepareAndCompileFrame(rhi::Device device, uint8_t frameIndex,
-		const IHostExecutionData* hostData, float deltaTime = 0.0f);
 	void WriteVramUsageDebugDump(uint8_t frameIndex) const;
 	AnyPassAndResources MaterializeExternalPass(const ExternalPassDesc& desc, bool callSetup, bool materializeReferencedResources);
 	void RegisterExternalPassName(const ExternalPassDesc& desc, AnyPassAndResources& any);

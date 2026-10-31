@@ -69,6 +69,13 @@ public:
 		// RecordPendingUploads' queue-scoped uploads). Off: every upload on the graphics queue, and every batch on another queue
 		// waits for them. SetQueueScopedUploads changes it at run time.
 		bool queueScopedUploads = true;
+		// The graph uploads through a service of its own (runtime::CreateGraphUploadService) instead of the runtime's. For a
+		// graph that runs alongside another (a compiled job graph): sharing the service would point its uploads' registry at
+		// whichever graph was built last.
+		bool privateUploads = false;
+		// RenderGraph::SetDrivesFrameServices: the graph polls readbacks and begins statistics frames. Off for a graph that
+		// runs alongside the one that does (a compiled job graph).
+		bool drivesFrameServices = true;
 	};
 
 	using ExtensionFactory = std::function<std::unique_ptr<RenderGraph::IRenderGraphExtension>()>;
@@ -85,8 +92,6 @@ public:
 	// One frame: PrepareFrame (Update, on the preparation owner) and then ExecuteFrame (records and submits).
 	static void PrepareFrame(RenderGraph& graph, const UpdateExecutionContext& context, rhi::Device device) { graph.Update(context, device); }
 	static void ExecuteFrame(RenderGraph& graph, PassExecutionContext& context) { graph.Execute(context); }
-	// The presentation tail the frame left pending was submitted (its swapchain present).
-	static void ConfirmPresentation(RenderGraph& graph) { graph.ConfirmPresentationTailSubmission(); }
 	~GraphHost();
 	GraphHost(const GraphHost&) = delete;
 	GraphHost& operator=(const GraphHost&) = delete;
@@ -480,6 +485,7 @@ private:
 	};
 	std::vector<Registered> m_extensions;
 	std::unique_ptr<RenderGraph> m_graph;
+	std::shared_ptr<runtime::IUploadService> m_privateUploads;  // Desc::privateUploads
 	// A slot's last frame: the value each queue's own timeline reached with that frame's last batch.
 	// Waiting on those gates the slot's reuse; the host adds no submission of its own. Queue timelines
 	// belong to the graph, so a rebuild (which waits for the device) clears them.

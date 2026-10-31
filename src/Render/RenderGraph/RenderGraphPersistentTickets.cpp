@@ -13,18 +13,8 @@ std::shared_ptr<RenderGraph::PersistentTicket> RenderGraph::PreparePersistentTic
 	ticket->hostFrame = hostFrame;
 	ticket->hostTag = hostTag;
 	ticket->external = IsExternalPersistentEpoch(epoch);
-	m_persistentTicketHostTag = hostTag;
-	m_persistentTicketAdmissionOnly = admissionOnly;
-	m_persistentTicketHostData = static_cast<bool>(hostData);
-	struct TargetScope {
-		RenderGraph& graph;
-		~TargetScope() {
-			graph.m_persistentTicketTarget = nullptr;
-			graph.m_persistentTicketAdmissionOnly = false;
-			graph.m_persistentTicketHostData = false;
-		}
-	} scope{*this};
-	m_persistentTicketTarget = ticket.get();
+	const PersistentExecutionOptions options{.ticket = ticket.get(), .hostTag = hostTag, .admissionOnly = admissionOnly,
+		.hostData = static_cast<bool>(hostData)};
 	SetPersistentEpoch(epoch);
 	UpdateExecutionContext update{};
 	update.frameIndex = slot;
@@ -34,7 +24,7 @@ std::shared_ptr<RenderGraph::PersistentTicket> RenderGraph::PreparePersistentTic
 	update.ownedHostData = hostData;
 	// What it prepares for resolves the resolvers too: a revision names its resources (its versions of them), never the live ones.
 	if (hostData) update.resolverCaptureContext = std::make_shared<const ResolverCaptureContext>(hostData);
-	Update(update, device);
+	Update(update, device, options);
 	PassExecutionContext execute{};
 	execute.device = device;
 	execute.frameIndex = slot;
@@ -67,14 +57,12 @@ void RenderGraph::AddPersistentTicketCandidate(PersistentTicket& ticket, std::sh
 		if (candidate->segment.recording == recording) return;
 	auto& state = *m_compilerState->persistent;
 	if (!state.timelines || !state.admission) throw std::logic_error("A revision ticket's candidate before the graph executed");
-	// The queues as submitSegment takes them: what each has submitted, a pending presentation tail owning the next graphics value.
+	// The queues as submitSegment takes them: what each has submitted.
 	const size_t slotCount = m_queueRegistry.SlotCount();
-	const auto presentationSlot = m_queueRegistry.FindGraphicsSlot();
 	std::vector<compiler::ExecutionTimelinePoint> queues;
 	for (size_t slot = 0; slot < slotCount; ++slot) {
 		const auto next = m_queueRegistry.GetCurrentFenceValue(static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot)));
-		auto submitted = next ? next - 1 : 0;
-		if (state.pendingPresentSubmission && slot == static_cast<size_t>(ToUnderlying(presentationSlot))) submitted = next;
+		const auto submitted = next ? next - 1 : 0;
 		queues.push_back({QueueTimelineIdentity(*m_runtime, m_queueRegistry, slot), submitted});
 	}
 	auto* candidate = new PersistentTicket::Candidate{
@@ -637,22 +625,6 @@ bool RenderGraph::RecordPendingUploads(rhi::Device device, rhi::CommandList& lis
 		spdlog::error("Ticket uploads could not be recorded: {}", e.what());
 		return false;
 	}
-}
-
-void RenderGraph::ConfirmPersistentPresentationTail() {
-	auto& state = *m_compilerState->persistent;
-	if (!state.pendingPresentSubmission || !state.timelines) return;
-	const auto slot = m_queueRegistry.FindGraphicsSlot();
-	auto queue = m_queueRegistry.GetQueue(slot);
-	auto& fence = m_queueRegistry.GetFence(slot);
-	const auto value = m_queueRegistry.GetNextFenceValue(slot);
-	if (queue.Signal({fence.GetHandle(), value}) != rhi::Result::Ok)
-		throw std::runtime_error("Presentation tail completion signal failed");
-	const compiler::ExecutionTimelinePoint point{QueueTimelineIdentity(*m_runtime, m_queueRegistry, ToUnderlying(slot)), value};
-	state.timelines->ExtendSubmittedExecution(state.pendingPresentSubmission, point);
-	state.admission->ExtendSubmitted(point);
-	state.pendingPresentSubmission = 0;
-	basic_telemetry::AddCounter("ORG.PresentationTail.RetirementReceipts");
 }
 
 } // namespace org

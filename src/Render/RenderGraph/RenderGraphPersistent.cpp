@@ -648,12 +648,29 @@ bool persistent_impl::LoweringAddsDeclarations(const State::MainPass& main, cons
 	return false;
 }
 
-void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex, const IHostExecutionData* hostData, float deltaTime) {
+void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex, const IHostExecutionData* hostData, float deltaTime,
+	const PersistentExecutionOptions& options) {
 	BT_ZONE_SCOPE("ORG.Persistent.PrepareFrame");
+	if (m_compilerState->frameProductionStopped) throw std::logic_error("Frame production has stopped");
+	// Persistent structural builds, preparation and ownership retirement run on the task service; there is no inline fallback.
+	if (!m_taskService) throw std::logic_error("Persistent execution requires a task service");
 	auto& compiler = *m_compilerState;
 	const bool bootstrap = !compiler.persistent;
-	if (bootstrap) {
-		BT_ZONE_SCOPE("ORG.Persistent.Bootstrap");
+	if (bootstrap) BootstrapPersistentGraph();
+	auto& state = *compiler.persistent;
+	state.frameIndex = frameIndex;
+	state.frameNumber = ++compiler.asyncPreparationFrameNumber;
+	RetireIdlePersistentAliasPools(state);
+	org::runtime::ScopedActiveGraphServices activeServices(m_uploadService.get(), m_descriptorService.get());
+	BindPersistentFrame(options.ticket != nullptr, bootstrap);
+	state.prepared = PreparePersistentExecution(device, frameIndex, hostData, deltaTime, options);
+}
+
+// The first preparation's: the passes are lowered and the first publication is built inline.
+void RenderGraph::BootstrapPersistentGraph() {
+	BT_ZONE_SCOPE("ORG.Persistent.Bootstrap");
+	auto& compiler = *m_compilerState;
+	{
 		compiler.persistent = std::make_shared<PersistentExecutionState>();
 		auto& state = *compiler.persistent;
 		const size_t framesInFlight = m_renderGraphSettingsService ? m_renderGraphSettingsService->GetNumFramesInFlight() : 3;
@@ -813,17 +830,17 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 			ready->executable->graph->batches.size(),
 			std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
 	}
+}
+
+// Steps 0-2 of a preparation: captures, the passes' declarations, group memberships and backings, and the edits they make.
+void RenderGraph::BindPersistentFrame(bool ticket, bool bootstrap) {
+	auto& compiler = *m_compilerState;
 	auto& state = *compiler.persistent;
-	state.frameIndex = frameIndex;
-	state.frameNumber = ++compiler.asyncPreparationFrameNumber;
-	state.frameData = m_asyncUpdateHostData;
-	RetireIdlePersistentAliasPools(state);
-	org::runtime::ScopedActiveGraphServices activeServices(m_uploadService.get(), m_descriptorService.get());
 	const auto primaryBackend = m_backendDevices.empty() ? rhi::Backend::Null : m_backendDevices.front().backend;
 
 	// 0. Readback captures. Captures after a pass become passes inserted into the main graph (step 1).
 	std::vector<ExternalPassDesc> interrupting;
-	if (m_drivesFrameServices) PlacePersistentCaptures(*this, state, m_persistentTicketTarget != nullptr, interrupting);
+	if (m_drivesFrameServices) PlacePersistentCaptures(*this, state, ticket, interrupting);
 	// 1. Structural and membership changes reported by legacy passes. One
 	// transaction carries both so the slot directory never diverges from the
 	// installed program: a directory change is only made against an edit that
@@ -1143,6 +1160,18 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 		}
 		}
 	}
+}
+
+// Steps 3-4 of a preparation: the main segment's invocations against the selected publication, and the uploads.
+RenderGraph::PersistentExecution RenderGraph::PreparePersistentExecution(rhi::Device device, uint8_t frameIndex,
+	const IHostExecutionData* hostData, float deltaTime, const PersistentExecutionOptions& options) {
+	auto& compiler = *m_compilerState;
+	auto& state = *compiler.persistent;
+	PersistentExecution execution;
+	execution.options = options;
+	execution.number = state.frameNumber;
+	execution.frameIndex = frameIndex;
+	execution.frameData = m_asyncUpdateHostData;
 	// 3. Select and prepare the main segment.
 	auto selected = state.program.Select();
 	if (m_getRenderGraphCompileDumpEnabled && m_getRenderGraphCompileDumpEnabled() && state.dumpedExecutable != selected->executable.get()) {
@@ -1218,7 +1247,7 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 	// passes has no main segment at all (its uploads still run).
 	std::shared_ptr<const persistent::SelectedPublication> executing = selected;
 	if (m_persistentEpoch != persistent::AllEpochs && selected->HasEpochs()) executing = selected->ForEpoch(m_persistentEpoch);
-	PersistentExecutionState::PreparedSegment main;
+	PersistentExecution::PreparedSegment main;
 	main.label = "Main";
 	main.publication = executing;
 	main.rebindings = std::move(rebindings);
@@ -1386,7 +1415,7 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 			}
 			packet.SetDebugName(any.name);
 			main.invocations[pass.id.index] = std::move(packet);
-			if (auto* ticket = m_persistentTicketTarget) {
+			if (auto* ticket = options.ticket) {
 				const RenderGraphPass* object = std::visit([](auto& value) -> const RenderGraphPass* {
 					using T = std::decay_t<decltype(value)>;
 					if constexpr (std::is_same_v<T, std::monostate>) return nullptr;
@@ -1412,14 +1441,11 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 			for (const auto groupIndex : pass.groups) for (const auto& wait : state.groups[groupIndex].waits) appendWait(wait);
 		}
 	}
-	if (executing) state.main = std::move(main);
-	else state.main.reset();
-	state.framePrepared = true;
+	if (executing) execution.main = std::move(main);
 	// 4. Uploads.
 	// Tickets have none: the host records its uploads itself when it submits the ticket, and tickets don't
 	// support any other upload pass.
-	state.uploads.clear();
-	if (m_persistentTicketTarget) {
+	if (options.ticket) {
 		for (const auto index : state.uploadMasterIndices)
 			if (m_masterPassList[index].name != "org.host.uploads")
 				throw std::logic_error("Tickets do not support the upload pass '" + m_masterPassList[index].name + "'");
@@ -1443,7 +1469,7 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 					auto frame = context.list.Finalize();
 					auto effect = immediate->TakeOwnedImmediateSubmissionEffect();
 					if (!hasWork && !effect) return;
-					PersistentExecutionState::PendingUpload upload;
+					PersistentExecution::PendingUpload upload;
 					upload.name = any.name;
 					std::vector<Resource*> resources;
 					for (const auto& requirement : frame.requirements) {
@@ -1460,7 +1486,7 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 						upload.commit = std::move(effect->commit);
 						upload.signals = std::move(effect->completionSignals);
 					}
-					state.uploads.push_back(std::move(upload));
+					execution.uploads.push_back(std::move(upload));
 				}
 			}, any.pass);
 		}
@@ -1477,6 +1503,7 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 	}
 	BT_PLOT("ORG.Persistent.StructuralBuildsTotal", static_cast<int64_t>(state.structuralBuilds));
 	BT_PLOT("ORG.Persistent.BindingBuildsTotal", static_cast<int64_t>(state.bindingBuilds));
+	return execution;
 }
 
 } // namespace org

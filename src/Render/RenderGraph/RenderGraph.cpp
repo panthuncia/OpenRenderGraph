@@ -604,11 +604,7 @@ void RenderGraph::ResetForFrame() {
 
 void RenderGraph::MaterializeUnmaterializedResources() {
 	BT_ZONE_SCOPE("RenderGraph::MaterializeUnmaterializedResources");
-	// Rebuilds may have retired the prior service generation before structural
-	// materialization runs. Establish the successor generation before any pass
-	// Setup/configuration callback can resolve descriptor or upload services.
-	if (!m_uploadService) m_uploadService = org::runtime::CreateDefaultUploadService();
-	if (!m_descriptorService) m_descriptorService = org::runtime::CreateDefaultDescriptorService();
+	UseRuntimeServices();
 	// Every registered and transient resource; an alias-eligible one waits for the persistent alias plan, which places it.
 	auto materialize = [](Resource* resource) {
 		resource = UnwrapDynamicResource(resource);
@@ -940,37 +936,21 @@ std::shared_ptr<RenderPass> RenderGraph::GetRenderPassByName(const std::string& 
 	}
 }
 
-void RenderGraph::Update(const UpdateExecutionContext& context, rhi::Device device) {
+void RenderGraph::Update(const UpdateExecutionContext& context, rhi::Device device, const PersistentExecutionOptions& options) {
     // A task service without a settings service is a structural/unit host: it admits no executable frames.
     if (m_taskService && !m_renderGraphSettingsService) return;
-    UpdateOnPreparationOwner(context, device);
+    UpdateOnPreparationOwner(context, device, options);
 }
 
-void RenderGraph::UpdateOnPreparationOwner(const UpdateExecutionContext& context, rhi::Device device) {
+void RenderGraph::UpdateOnPreparationOwner(const UpdateExecutionContext& context, rhi::Device device,
+	const PersistentExecutionOptions& options) {
 	BT_ZONE_SCOPE("RenderGraph::Update");
     if (m_compilerState->frameProductionStopped)
         throw std::logic_error("Frame production has stopped");
     m_resolverCaptureContext = context.resolverCaptureContext;
 	m_asyncUpdateHostData = context.ownedHostData;
-	// Graph replacement tears down the previous generation's services before the
-	// next frame is admitted. Recreate the generation here before pass setup so
-	// every pass receives a live owned service pair; otherwise a rebuilt graph can
-	// enter Setup with empty weak service references.
-	if (!m_uploadService) m_uploadService = org::runtime::CreateDefaultUploadService();
-	if (!m_descriptorService) m_descriptorService = org::runtime::CreateDefaultDescriptorService();
-	if (!m_readbackService) m_readbackService = org::runtime::CreateDefaultReadbackService();
-	if (!m_statisticsService && m_drivesFrameServices) m_statisticsService = org::runtime::CreateDefaultStatisticsService();
-	// A graph rebuild may replace the service generation after passes were
-	// registered. Refresh every pass' weak service bindings before Update/Setup
-	// callbacks run so they cannot retain an expired generation.
-	for (auto& pr : m_masterPassList) {
-		std::visit([&](auto& obj) {
-			using T = std::decay_t<decltype(obj)>;
-			if constexpr (!std::is_same_v<T, std::monostate>) {
-				if (obj.pass) obj.pass->ConfigureRuntimeServices(m_uploadService, m_descriptorService);
-			}
-		}, pr.pass);
-	}
+	// The services are the runtime's (or ones set on the graph), taken at Setup; passes were configured with them there.
+	UseRuntimeServices();
 	org::runtime::ScopedActiveGraphServices activeServices(m_uploadService.get(), m_descriptorService.get());
 	const bool traceLifecycle = m_getRenderGraphBatchTraceEnabled && m_getRenderGraphBatchTraceEnabled();
 	{
@@ -1052,27 +1032,10 @@ void RenderGraph::UpdateOnPreparationOwner(const UpdateExecutionContext& context
 
 	{
 		BT_ZONE_SCOPE("RenderGraph::Update::CompileFrame");
-		CompileFrame(device, static_cast<uint8_t>(context.preparationSlot), context.hostData);
+		PreparePersistentFrame(device, static_cast<uint8_t>(context.preparationSlot), context.hostData, 0.0f, options);
 	}
 }
 
-void RenderGraph::CompileFrame(rhi::Device device, uint8_t frameIndex, const IHostExecutionData* hostData) {
-	PrepareAndCompileFrame(device, frameIndex, hostData);
-}
-
-void RenderGraph::PrepareAndCompileFrame(rhi::Device device, uint8_t frameIndex,
-	const IHostExecutionData* hostData, float deltaTime) {
-	BT_ZONE_SCOPE("ORG.Frame.PrepareAndCompile");
-	if (m_compilerState->frameProductionStopped)
-		throw std::logic_error("Frame production has stopped");
-	// Persistent structural builds, preparation and ownership retirement run on the task service; there is no inline fallback.
-	if (!m_taskService) throw std::logic_error("Persistent execution requires a task service");
-	PreparePersistentFrame(device, frameIndex, hostData, deltaTime);
-}
-
-void RenderGraph::ConfirmPresentationTailSubmission() {
-	if (m_compilerState->persistent) ConfirmPersistentPresentationTail();
-}
 
 void RenderGraph::Execute(PassExecutionContext& context) {
 	if (!context.beginGpuPassRange && !context.endGpuPassRange && m_gpuPassRangeBegin && m_gpuPassRangeEnd) {

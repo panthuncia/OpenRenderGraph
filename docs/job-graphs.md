@@ -119,7 +119,7 @@ genuinely shared:
 - **Retirement:** retirement is by timeline points throughout. The `DeletionManager` frame rotation,
   `ProcessDeferredReleases(frameIndex)` and frame-indexed upload pages are removed.
 
-### `GraphDesc` and `CompiledGraph`
+### `GraphDesc`, `GraphInstance` and `CompiledGraph`
 
 **A desc** contains:
 - passes, as `TypedRenderGraphPass` objects with Declare / Update / Prepare / Record (unchanged);
@@ -146,30 +146,55 @@ one is ready.
 nothing (the README's "Declarations that change"). Inline builds remain a mechanism the app controls: bootstrap,
 `DrainPersistentStructuralBuild`, and passes that opt out.
 
-#### Graph descs (implemented, 2026-10-31)
+#### Graph descs and instances (implemented, 2026-10-31)
 
-`OpenRenderGraph/GraphDesc.h` has the public API. The internals are a first version over the existing graph.
+`OpenRenderGraph/GraphDesc.h` and `OpenRenderGraph/GraphInstance.h` have the public API. The internals are a first
+version over the existing graph: an instance wraps a `RenderGraph`.
 
 - **`GraphDesc`** holds passes, in the order added, and named parameters. `Parameter(name, initial)` returns a
   `DynamicResource` wrapper that the passes declare. A desc carries a key that the caller gives. Descs with the same key
   must be interchangeable: their passes take everything that changes per execution from parameters and host data.
-- **`CompiledGraph::Compile(runtime, desc)`** builds a `RenderGraph` of its own on a `GraphHost`. `Execute(bindings,
-  hostData)` binds the parameters, then prepares, records and submits one execution, and returns its
-  `ExecutionHandle`. Rebinding a parameter to a resource of the same shape is a binding edit, so the schedule, barriers
-  and alias plan are reused. Any thread may call it; one compiled graph runs one execution at a time.
+- **`GraphInstance::Create(runtime, desc)`** builds the desc's graph, with no `GraphHost`. The owner thread drives it:
+  - `Bind(bindings)` sets parameters;
+  - `Prepare(hostData)` runs the passes' updates, polls their declarations and installs the edits (a structural one
+    builds on a worker), and prepares the invocations and uploads. It returns an **`Execution`**;
+  - `Execution::Submit()` submits the uploads, then admits, records and submits the main segment, and returns its
+    `ExecutionHandle`. One execution is prepared at a time; one dropped without `Submit` is submitted by its
+    destructor, because its preparation already recorded uploads and advanced the passes.
+- **Slots, not a ring.** An instance has `framesInFlight` preparation slots. A slot is free once its last execution
+  has completed. `Prepare` waits on the CPU only when none is free; `CanPrepare()` tells. Completion is noticed by
+  `Retire()` (which never waits) or the next `Prepare`.
+- **`CompiledGraph`** is what an instance's executions run: the selected publication's schedule. `Compiled()` returns
+  it; binding edits keep it (`SameSchedule`), a structural edit replaces it. Sharing it between instances by key is
+  later work (the async compile, plan Phase 5 step 7).
+- **`JobGraph::Create(runtime, desc)`** is the convenience over an instance: `Execute(bindings, hostData)` binds,
+  prepares and submits one execution under a lock. Any thread may call it; one job graph runs one execution at a
+  time. `TryRetire()` never blocks, for pollers such as a StateGraph's completion pump.
+- **Uploads:** an instance uploads through a service of its own. A shared service resolves its queued uploads against
+  the registry of the graph built last, so a job graph built while the frame graph was being built broke the frame's
+  uploads.
+- **Frame services:** an instance polls no readbacks, begins no statistics frames and takes no captures. The frame
+  graph does those.
 - **Ordering across graphs** comes from the runtime's sequencer, as for any two graphs on one runtime. A consumer
   executed after a producer waits for it on the GPU, across queues too.
-- **`GraphCache`** maps keys to compiled graphs, so a repeated desc reuses the whole executable, alias plan included.
+- **`GraphCache`** maps keys to job graphs, so a repeated desc reuses the whole executable, alias plan included.
   Measurements showed the schedule cache alone was not worth much (2 hits in 17).
 - **Limits of this version:**
-  - an execution past the frames in flight waits on the CPU for the oldest one (the GraphHost slot ring);
-  - completion is noticed when the graph next executes or `Retire()` is called, not on a runtime thread;
-  - compiling builds the graph, and the first execution lowers its passes.
-
-  The split that lets a compiled graph run without a `RenderGraph` comes when `GraphHost` goes (Phases 7 and 8).
-- Tested in `RebindingGpuTests.cpp` (`RunGraphDescScenario`) on D3D12 and Vulkan. A producer graph on the graphics
-  queue and a consumer graph on the copy queue share a buffer, with no CPU wait between them. They rebind to a second
-  buffer with no rebuild, and the cache returns the compiled graph for a known key.
+  - creating an instance builds the graph, and the first `Prepare` lowers the passes and builds the first schedule
+    inline;
+  - an instance's destructor waits for the device as `GraphHost` does (an adopted device waits for its own timelines
+    only).
+- **Inside `RenderGraph`** the persistent state has three parts (`RenderGraphPersistentState.h`): the instance (passes,
+  slot directory, groups, alias pools, edits in flight), the layout (tables built from the selected publication), and
+  the executions (admission, the one prepared, the submitted ones). Preparation is `BindPersistentFrame` (polls and
+  edits) then `PreparePersistentExecution`; execution is `SubmitPersistentUploads`, then `AdmitPersistentSegment`,
+  `RecordPersistentSegment` and `SubmitPersistentSegment`. A ticket's flags are the execution's options.
+- Tested in `RebindingGpuTests.cpp` on D3D12 and Vulkan:
+  - `RunGraphDescScenario`: a producer job graph on the graphics queue and a consumer on the copy queue share a buffer,
+    with no CPU wait between them. They rebind to a second buffer with no rebuild, and the cache returns the job graph
+    for a known key.
+  - `RunGraphInstanceScenario`: `Prepare` and `Submit` as separate calls, a second `Prepare` refused, the compiled
+    graph kept across rebinding, two slots reused with no device wait, a dropped execution submitted.
 
 ### Execution
 

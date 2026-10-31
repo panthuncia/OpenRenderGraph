@@ -14,6 +14,7 @@
 
 #include "OpenRenderGraph/GraphDesc.h"
 #include "OpenRenderGraph/GraphHost.h"
+#include "OpenRenderGraph/GraphInstance.h"
 #include "OpenRenderGraph/Runtime.h"
 #include "Render/RenderGraph/PersistentGraph.h"
 #include "Render/RenderGraph/RenderGraph.h"
@@ -735,7 +736,7 @@ int RunGraphDescScenario(rhi::Device device, const std::shared_ptr<org::Runtime>
     auto first = org::Buffer::CreateShared(rhi::HeapType::DeviceLocal, kBytes);
     auto second = org::Buffer::CreateShared(rhi::HeapType::DeviceLocal, kBytes);
     source->SetName("desc.source"); readback->SetName("desc.readback"); first->SetName("desc.first"); second->SetName("desc.second");
-    const auto revision = [](org::CompiledGraph& graph) -> uint64_t {
+    const auto revision = [](org::JobGraph& graph) -> uint64_t {
         const auto snapshot = graph.Graph() ? graph.Graph()->GetPersistentScheduleSnapshot() : nullptr;
         return snapshot && !snapshot->executables.empty() ? snapshot->executables.front()->structuralRevision : 0;
     };
@@ -765,8 +766,8 @@ int RunGraphDescScenario(rhi::Device device, const std::shared_ptr<org::Runtime>
             const auto& target = (i % 2) ? second : first;
             ++value;
             ENSURE(Write(*source, value));
-            const org::CompiledGraph::Binding out[] = {{"out", target}};
-            const org::CompiledGraph::Binding inBinding[] = {{"in", target}};
+            const org::JobGraph::Binding out[] = {{"out", target}};
+            const org::JobGraph::Binding inBinding[] = {{"in", target}};
             const auto produced = producer->Execute(out);
             const auto consumed = consumer->Execute(inBinding);
             CHECK(produced.Submitted() && consumed.Submitted());
@@ -780,10 +781,66 @@ int RunGraphDescScenario(rhi::Device device, const std::shared_ptr<org::Runtime>
         }
         bool refused = false;
         try {
-            const org::CompiledGraph::Binding unknown[] = {{"missing", first}};
+            const org::JobGraph::Binding unknown[] = {{"missing", first}};
             producer->Execute(unknown);
         } catch (const std::invalid_argument&) { refused = true; }
         CHECK(refused);
+    }
+    CHECK(device.WaitIdle() == rhi::Result::Ok);
+    return 0;
+}
+// A graph instance driven directly: Prepare and Submit are separate calls, the execution's index is its handle's,
+// rebinding keeps the compiled graph, a second Prepare before Submit is refused, and with two slots a third execution
+// reuses the first slot once the GPU has finished it (no device wait between executions).
+int RunGraphInstanceScenario(rhi::Device device, const std::shared_ptr<org::Runtime>& runtime) {
+    auto source = org::Buffer::CreateShared(rhi::HeapType::Upload, kBytes);
+    auto readback = org::Buffer::CreateShared(rhi::HeapType::Readback, kBytes);
+    auto first = org::Buffer::CreateShared(rhi::HeapType::DeviceLocal, kBytes);
+    auto second = org::Buffer::CreateShared(rhi::HeapType::DeviceLocal, kBytes);
+    source->SetName("instance.source"); readback->SetName("instance.readback");
+    first->SetName("instance.first"); second->SetName("instance.second");
+    {
+        org::GraphDesc desc("test.instance");
+        desc.SetFramesInFlight(2);
+        auto through = desc.Parameter("through", first);
+        desc.Add(org::RenderGraph::ExternalPassDesc::Copy("instance.in",
+            std::make_shared<CopyPass>(source, through, org::QueueKind::Graphics)).PreferQueue(org::QueueKind::Graphics));
+        desc.Add(org::RenderGraph::ExternalPassDesc::Copy("instance.out",
+            std::make_shared<CopyPass>(through, readback, org::QueueKind::Graphics)).PreferQueue(org::QueueKind::Graphics));
+        auto instance = org::GraphInstance::Create(runtime, std::move(desc));
+        CHECK(instance->FramesInFlight() == 2);
+        CHECK(!instance->Compiled());
+        uint32_t value = 0x7100u;
+        std::shared_ptr<const org::CompiledGraph> compiled;
+        org::ExecutionHandle previous;
+        for (int i = 0; i < 6; ++i) {
+            ++value;
+            ENSURE(Write(*source, value));
+            const org::GraphBinding bindings[] = {{"through", (i % 2) ? second : first}};
+            instance->Bind(bindings);
+            auto execution = instance->Prepare();
+            CHECK(!execution.Submitted());
+            bool refused = false;
+            try { (void)instance->Prepare(); } catch (const std::logic_error&) { refused = true; }
+            CHECK(refused);
+            const auto handle = execution.Submit();
+            CHECK(execution.Submitted() && handle.Submitted() && handle.Index() == execution.Index());
+            CHECK(instance->LastExecution().Index() == handle.Index());
+            // After the first execution, which lowers the passes: rebinding keeps the schedule.
+            if (i == 1) compiled = instance->Compiled();
+            if (i > 1) CHECK(compiled && instance->Compiled()->SameSchedule(*compiled));
+            // The previous execution wrote the same readback: the GPU orders this one after it, so only the latest is read.
+            previous = handle;
+        }
+        ENSURE(device.WaitIdle() == rhi::Result::Ok);
+        CHECK(Read(*readback) == value);
+        instance->Retire();
+        CHECK(previous.Completed());
+        CHECK(instance->CanPrepare());
+        CHECK(compiled && compiled->BatchCount() > 0);
+        // A dropped execution is submitted by its destructor.
+        { auto dropped = instance->Prepare(); }
+        CHECK(instance->LastExecution().Index() == previous.Index() + 1);
     }
     CHECK(device.WaitIdle() == rhi::Result::Ok);
     return 0;
@@ -805,6 +862,7 @@ int TestRebindingGpu(rhi::Device device, const std::shared_ptr<org::Runtime>& ru
     if (const int line = RunRemapScenario(device, runtime)) return line;
     if (const int line = RunExecutionHandleScenario(device, runtime)) return line;
     if (const int line = RunGraphDescScenario(device, runtime)) return line;
+    if (const int line = RunGraphInstanceScenario(device, runtime)) return line;
     org::persistent::SetSharingValidation(validation);
     return 0;
 }

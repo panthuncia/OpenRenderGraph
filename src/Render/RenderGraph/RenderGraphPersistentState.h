@@ -258,7 +258,13 @@ struct RenderGraph::PersistentTicket {
 	}
 };
 
-struct RenderGraph::PersistentExecutionState {
+// The persistent graph has three parts, each a base of PersistentExecutionState:
+// - the instance: its passes, slot directory, resolver groups, alias pools and the edits in flight (owner thread);
+// - the layout: what follows from the selected publication, rebuilt only when another is selected;
+// - the executions: admission, the one prepared and the submitted ones not yet complete.
+
+// The instance.
+struct RenderGraph::PersistentInstanceState {
 	struct SlotEntry {
 		persistent::ResourceSlotId slot;
 		Resource* resource = nullptr;      // Registry object (wrapper for dynamic resources).
@@ -348,21 +354,8 @@ struct RenderGraph::PersistentExecutionState {
 		bool retired = false; // Hosted pass removed; the main index may be reused.
 		uint32_t epoch = persistent::AllEpochs; // Host epoch (ExternalPassDesc::Epoch).
 	};
-	struct PreparedSegment {
-		const char* label = "";
-		std::shared_ptr<const persistent::SelectedPublication> publication;
-		std::vector<PreparedPass> invocations;
-		std::shared_ptr<const std::vector<std::string>> names; // Per logical pass slot, for statistics/present detection.
-		std::vector<persistent::FrameRebinding> rebindings;
-		std::vector<persistent::FrameProducerWait> waits;
-		std::shared_ptr<const FrozenExecutionBindings> legacyBindings;
-		std::vector<compiler::PreparedTimelineBinding> foreignTimelines;
-		std::vector<std::shared_ptr<const void>> leases;
-	};
 
 	persistent::GraphProgram program;
-	std::unique_ptr<persistent::SynchronousAdmission> admission;
-	std::unique_ptr<compiler::ExecutionTimelineAdmission> timelines;
 	std::vector<SlotEntry> entries;                                // Index == slot index.
 	std::unordered_map<uint64_t, std::vector<uint32_t>> entriesByResourceID;
 	std::vector<MainPass> mainPasses;
@@ -370,32 +363,8 @@ struct RenderGraph::PersistentExecutionState {
 	std::vector<size_t> uploadMasterIndices;                        // Passes with immediate-mode commands.
 	std::vector<uint32_t> mainPassByMaster;                        // UINT32_MAX when not main.
 	std::vector<uint8_t> masterHostedInMain;
-	// Per-publication legacy binding table cache.
-	const persistent::SelectedPublication* bindingsFor = nullptr;
-	std::shared_ptr<const FrozenExecutionBindings> bindings;
-	// Frame in preparation.
-	std::optional<PreparedSegment> main;
-	// Uploads recorded by the upload passes this frame. ExecutePersistentFrame submits them through the graph's external
-	// client (RenderGraph::GetExternalClient) before the main execution.
-	struct PendingUpload {
-		std::string name;
-		std::vector<ExternalClient::Access> accesses;
-		std::vector<std::byte> bytecode;
-		std::shared_ptr<const void> keepAlive;
-		std::function<void()> commit;  // called once the upload is submitted
-		std::vector<ExternalTimelinePoint> signals;  // signalled when the upload finishes
-	};
-	std::vector<PendingUpload> uploads;
-	// A frame was prepared; main may still be empty (an epoch with no main passes).
-	bool framePrepared = false;
 	std::vector<uint32_t> hostedMainPasses;             // Main indices of installed frame-interrupting passes.
 	std::vector<ExternalPassDesc> deferredInterrupting; // Requested while a structural build was pending.
-	uint64_t frameNumber = 0;
-	// The latest execution (its index is frameNumber), and the submitted ones not yet seen complete.
-	std::shared_ptr<detail::ExecutionRecord> lastExecution;
-	std::vector<std::shared_ptr<detail::ExecutionRecord>> pendingExecutions;
-	uint8_t frameIndex = 0;
-	std::shared_ptr<const IHostExecutionData> frameData;
 	// Alias planning (structural builds only).
 	struct AliasPool {
 		TrackedHandle allocation;
@@ -415,12 +384,8 @@ struct RenderGraph::PersistentExecutionState {
 	uint64_t aliasPlans = 0, aliasRematerializations = 0;
 	bool forceNewAliasHeaps = false; // Diagnostic (ORG_PERSISTENT_FORCE_REALIAS): next plan re-places every pool.
 	AutoAliasPackingStrategy aliasPackingStrategy = AutoAliasPackingStrategy::GreedySweepLine; // The latest plan's.
-	const void* dumpedExecutable = nullptr; // Compile-dump mode: last executable written.
 	// Diagnostic: per-pass preparation cost (logged periodically).
 	std::unordered_map<std::string, std::pair<uint64_t, uint64_t>> prepareCostByPass; // lowering: name -> (ns, calls)
-	std::vector<std::pair<uint64_t, uint64_t>> prepareCostByMain;                    // main pass index -> (ns, calls)
-	std::shared_ptr<const std::vector<std::string>> mainNames;
-	const void* mainNamesExecutable = nullptr;
 	// A structural build in flight on a worker. Frames keep using the selected
 	// publication; the slot directory already describes the new structure, so
 	// subscriber slot maps are frozen (no rebuild) until the install.
@@ -454,13 +419,11 @@ struct RenderGraph::PersistentExecutionState {
 	};
 	std::shared_ptr<PendingStructural> pending;
 	// Submitted this frame.
-	uint64_t pendingPresentSubmission = 0;
 	uint64_t structuralBuilds = 0, bindingBuilds = 0;
 	// Bindings taken out of frames' edits because they change which slots share a backing (SharingChangePolicy::
 	// Deferred), by slot index. The next structural build applies them. A newer edit of the slot drops its entry.
 	std::unordered_map<uint32_t, persistent::BindingVersion> deferredSharing;
 	uint64_t deferredSharingBuilds = 0;
-	std::vector<uint8_t> tracyFrameBegun;
 	// Readback captures anchored after a main pass (RenderGraphPersistentCaptures.cpp), by pass name: appended to the
 	// pass's own packet when it is next prepared, so a capture never changes the executable.
 	struct PendingCapture { runtime::ReadbackCaptureInfo info; uint64_t requestedFrame = 0; };
@@ -471,6 +434,17 @@ struct RenderGraph::PersistentExecutionState {
 	// Captures requested after the graph (runtime::kReadbackAfterGraph). Submitted through the graph's external client
 	// after the execution.
 	std::vector<runtime::ReadbackCaptureInfo> afterGraphCaptures;
+};
+
+// The layout: tables built from the selected publication.
+struct RenderGraph::PersistentLayoutState {
+	// The legacy binding table, per publication.
+	const persistent::SelectedPublication* bindingsFor = nullptr;
+	std::shared_ptr<const FrozenExecutionBindings> bindings;
+	// Pass names per logical pass slot, per executable.
+	std::shared_ptr<const std::vector<std::string>> mainNames;
+	const void* mainNamesExecutable = nullptr;
+	const void* dumpedExecutable = nullptr; // Compile-dump mode: last executable written.
 	// Schedule introspection (RenderGraph::SetScheduleTraceEnabled), owner thread.
 	struct ScheduleTraces {
 		const void* executable = nullptr;  // the traced whole-frame executable (not retained), with its revision
@@ -483,9 +457,69 @@ struct RenderGraph::PersistentExecutionState {
 	ScheduleTraces scheduleTraces;
 };
 
-// What the phases of one segment execution share (RenderGraph::AdmitPersistentSegment and the ones after it).
+// One execution, from its preparation (PreparePersistentExecution) to its submission (ExecutePersistentFrame).
+struct RenderGraph::PersistentExecution {
+	// How it executes. A ticket's (PreparePersistentTicket) is recorded for the ticket's host to submit, not submitted.
+	// - hostTag: the host's tag, which a kept recording must have been recorded under too;
+	// - admissionOnly: it only admits, and the ticket binds a recording made ahead (BindPersistentTicketRecording);
+	// - hostData: prepared for host data (a revision). Its passes' revision hashes do not see that data (RevisionHash reads
+	//   live state), so its recording is neither taken from nor added to the kept sets.
+	using Options = PersistentExecutionOptions;
+	struct PreparedSegment {
+		const char* label = "";
+		std::shared_ptr<const persistent::SelectedPublication> publication;
+		std::vector<PreparedPass> invocations;
+		std::shared_ptr<const std::vector<std::string>> names; // Per logical pass slot, for statistics/present detection.
+		std::vector<persistent::FrameRebinding> rebindings;
+		std::vector<persistent::FrameProducerWait> waits;
+		std::shared_ptr<const FrozenExecutionBindings> legacyBindings;
+		std::vector<compiler::PreparedTimelineBinding> foreignTimelines;
+		std::vector<std::shared_ptr<const void>> leases;
+	};
+	// An upload recorded by an upload pass. Submitted through the graph's external client (RenderGraph::GetExternalClient)
+	// before the main segment.
+	struct PendingUpload {
+		std::string name;
+		std::vector<ExternalClient::Access> accesses;
+		std::vector<std::byte> bytecode;
+		std::shared_ptr<const void> keepAlive;
+		std::function<void()> commit;  // called once the upload is submitted
+		std::vector<ExternalTimelinePoint> signals;  // signalled when the upload finishes
+	};
+
+	Options options;
+	uint64_t number = 0;     // its index (PassPrepareContext::executionIndex)
+	uint8_t frameIndex = 0;  // its preparation slot
+	std::shared_ptr<const IHostExecutionData> frameData;
+	// Empty for an epoch with no main passes.
+	std::optional<PreparedSegment> main;
+	std::vector<PendingUpload> uploads;
+};
+
+// The executions.
+struct RenderGraph::PersistentExecutionsState {
+	std::unique_ptr<persistent::SynchronousAdmission> admission;
+	std::unique_ptr<compiler::ExecutionTimelineAdmission> timelines;
+	// The latest preparation's execution index and slot.
+	uint64_t frameNumber = 0;
+	uint8_t frameIndex = 0;
+	// The execution prepared and not yet executed.
+	std::optional<PersistentExecution> prepared;
+	// The latest execution (its index is frameNumber), and the submitted ones not yet seen complete.
+	std::shared_ptr<detail::ExecutionRecord> lastExecution;
+	std::vector<std::shared_ptr<detail::ExecutionRecord>> pendingExecutions;
+	std::vector<uint8_t> tracyFrameBegun;
+	// Diagnostic: preparation cost per main pass index (ns, calls).
+	std::vector<std::pair<uint64_t, uint64_t>> prepareCostByMain;
+};
+
+struct RenderGraph::PersistentExecutionState : PersistentInstanceState, PersistentLayoutState, PersistentExecutionsState {};
+
+// What the phases of one segment execution share (RenderGraph::AdmitPersistentSegment, RecordPersistentSegment and
+// SubmitPersistentSegment).
 struct RenderGraph::PersistentSegmentRun {
-	PersistentExecutionState::PreparedSegment& segment;
+	PersistentExecution& execution;
+	PersistentExecution::PreparedSegment& segment;
 	PersistentExecuteTimings& timings;
 	std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
 	// Adds the time since the previous lap to a timing.
@@ -507,10 +541,11 @@ struct RenderGraph::PersistentSegmentRun {
 	persistent::FrameAdmission admission;
 	bool keepable = false;
 	bool external = false;
-	// Set by planning.
+	// Set by recording.
 	std::shared_ptr<const compiler::RenderFrameSnapshot> sealed;
 	std::vector<compiler::FrameRecordingJob> jobs;
 	std::vector<std::shared_ptr<compiler::OwnedRecordingStatistics>> recordingStatistics;
+	std::optional<compiler::RecordedFrame> recorded;
 };
 
 namespace persistent_impl {

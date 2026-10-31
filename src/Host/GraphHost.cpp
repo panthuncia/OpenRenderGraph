@@ -21,31 +21,13 @@
 #include "Render/Runtime/RuntimeDevice.h"
 #include "Render/Runtime/ScopedActiveGraphServices.h"
 #include "Render/Runtime/ThreadPoolTaskService.h"
+#include "HostUploadExtension.h"
 
 namespace org {
 
 namespace {
 
-constexpr const char* kUploadPassName = "org.host.uploads";
-
-// The built-in upload pass: graph-ordered buffer/texture uploads requested with
-// BUFFER_UPLOAD and friends. It records immediate-mode copies, so it runs in the
-// persistent Pre segment ahead of the main executable.
-class HostUploadExtension final : public RenderGraph::IRenderGraphExtension {
-public:
-	explicit HostUploadExtension(runtime::IUploadService* uploads) : m_uploads(uploads) {}
-	void OnRegistryReset(ResourceRegistry* registry) override {
-		if (m_uploads) m_uploads->SetUploadResolveContext({registry, 0});
-	}
-	void GatherStructuralPasses(RenderGraph&, std::vector<RenderGraph::ExternalPassDesc>& out) override {
-		if (!m_uploads) return;
-		if (auto pass = m_uploads->GetUploadPass())
-			out.push_back(RenderGraph::ExternalPassDesc::Render(kUploadPassName, std::move(pass))
-				.At(RenderGraph::ExternalInsertPoint::Begin(-1000)).CollectStatistics(false));
-	}
-private:
-	runtime::IUploadService* m_uploads;
-};
+using detail::HostUploadExtension;
 
 } // namespace
 
@@ -295,6 +277,7 @@ GraphHost::~GraphHost() {
 	m_recordingQueue->accepting.store(false, std::memory_order_release);
 	StopAsync();
 	DestroyGraph();
+	if (m_privateUploads) m_privateUploads->Cleanup();
 	m_desc.runtime->Retire();
 	m_uncertainExecutionOwners.clear();
 	m_uncertainUploadOwners.clear();
@@ -347,6 +330,14 @@ void GraphHost::Build() {
 	BT_ZONE_SCOPE("ORG.Host.Build");
 	DestroyGraph();
 	auto graph = std::make_unique<RenderGraph>(m_desc.runtime);
+	if (m_desc.privateUploads) {
+		if (!m_privateUploads) {
+			m_privateUploads = runtime::CreateGraphUploadService();
+			m_privateUploads->Initialize();
+		}
+		graph->SetUploadService(m_privateUploads);
+	}
+	graph->SetDrivesFrameServices(m_desc.drivesFrameServices);
 	graph->RegisterExtension(std::make_unique<HostUploadExtension>(graph->GetUploadService()), "org.host.io");
 	for (const auto& entry : m_extensions)
 		if (auto extension = entry.factory()) graph->RegisterExtension(std::move(extension), entry.id);
