@@ -107,6 +107,23 @@ std::shared_ptr<const GraphExecutionTimeline> ExecutionTimelineAdmission::Prepar
         throw std::invalid_argument("Invalid execution schedule");
     if (m_sequence == UINT64_MAX) throw std::overflow_error("Submission sequence exhausted");
     auto reserved = m_reserved; // Transactional: errors never consume values.
+    // What the waits may reference. With signals given (assigned at submission, in submission order, the waits found then in the
+    // ledgers of work committed before), everything below an execution's first signal on a timeline was submitted before it, by
+    // this owner or by another on a shared timeline; and on a timeline it does not signal, whatever the ledgers named.
+    auto submittedFloor = m_submitted;
+    if (!reservedSignals.empty() && reservedSignals.size() == graph.batches.size()) {
+        for (auto& floor : submittedFloor) floor.value = UINT64_MAX;
+        std::vector<uint8_t> lifted(m_reserved.size());
+        for (size_t i = 0; i < graph.batches.size(); ++i) {
+            const auto queue = graph.batches[i].queue;
+            auto& floor = submittedFloor.at(queue);
+            if (lifted.at(queue) || reservedSignals[i].timeline != floor.timeline || !reservedSignals[i].value) continue;
+            lifted[queue] = 1;  // the queue's first batch here: everything below its signal is submitted
+            floor.value = reservedSignals[i].value - 1;
+            auto& point = reserved.at(queue);
+            point.value = (std::max)(point.value, reservedSignals[i].value - 1);
+        }
+    }
     auto result = std::make_shared<GraphExecutionTimeline>();
     result->submission = m_sequence + 1;
     result->bundle = std::move(bundle);
@@ -119,7 +136,10 @@ std::shared_ptr<const GraphExecutionTimeline> ExecutionTimelineAdmission::Prepar
             if (reservedSignals.size() != graph.batches.size()
                 || reservedSignals[i].timeline != point.timeline
                 || reservedSignals[i].value <= point.value)
-                throw std::invalid_argument("Invalid concrete queue-signal reservation");
+                throw std::invalid_argument("Invalid concrete queue-signal reservation: batch " + std::to_string(i) + " of "
+                    + std::to_string(graph.batches.size()) + " on queue " + std::to_string(graph.batches[i].queue) + ", signal "
+                    + std::to_string(reservedSignals[i].timeline) + "@" + std::to_string(reservedSignals[i].value) + " after "
+                    + std::to_string(point.timeline) + "@" + std::to_string(point.value));
             point.value = reservedSignals[i].value;
             result->batches[i].signal = reservedSignals[i];
         } else {
@@ -131,7 +151,7 @@ std::shared_ptr<const GraphExecutionTimeline> ExecutionTimelineAdmission::Prepar
             if (!wait.timeline) throw std::invalid_argument("Missing wait timeline");
             // Cross-frame waits on our exclusive timelines cannot reference
             // reserved-but-unsubmitted work, including this execution itself.
-            for (auto submitted : m_submitted)
+            for (auto submitted : submittedFloor)
                 if (wait.timeline == submitted.timeline && wait.value > submitted.value)
                     throw std::invalid_argument("Incoming wait references unsubmitted work");
         }
@@ -215,6 +235,14 @@ std::shared_ptr<const GraphExecutionTimeline> ExecutionTimelineAdmission::Record
     auto execution = Prepare(std::move(bundle), incomingWaits, std::move(leases), packets, signals);
     for (uint32_t i = 0; i < packets.size(); ++i) CommitBatch(execution->submission, i);
     return execution;
+}
+
+void ExecutionTimelineAdmission::AdvanceTo(uint32_t queue, uint64_t value) {
+    if (m_failed || m_pending) throw std::logic_error("Timeline advance during a submission");
+    auto& reserved = m_reserved.at(queue);
+    auto& submitted = m_submitted.at(queue);
+    reserved.value = (std::max)(reserved.value, value);
+    submitted.value = (std::max)(submitted.value, value);
 }
 
 ExecutionTimelinePoint ExecutionTimelineAdmission::SubmitOutside(uint32_t queue) {
@@ -481,6 +509,25 @@ SymbolicStatePlan BuildStatePlan(const GraphCompileStructure& s,
     }
     for (uint32_t r = 0; r < regions.size(); ++r) for (const auto& region : regions[r])
         if (region.batch != UINT32_MAX) plan.finalStates.push_back({r, region.batch, region.range, region.state});
+    // The entry steps, and the exit steps: walking back, a step is the last of every cell of its range not yet seen.
+    std::vector<std::vector<uint8_t>> seen(s.resourceShapes.size());
+    for (uint32_t index = static_cast<uint32_t>(plan.steps.size()); index-- > 0;) {
+        const auto& step = plan.steps[index];
+        const auto& shape = s.resourceShapes[step.resource];
+        auto& cells = seen[step.resource];
+        if (cells.empty()) cells.assign(size_t{shape.mips} * shape.slices, 0);
+        bool last = false;
+        for (uint32_t slice = step.range.slice; slice < step.range.slice + step.range.slices; ++slice)
+            for (uint32_t mip = step.range.mip; mip < step.range.mip + step.range.mips; ++mip) {
+                auto& cell = cells[size_t{slice} * shape.mips + mip];
+                if (!cell) last = true;
+                cell = 1;
+            }
+        if (last) plan.exitSteps.push_back(index);
+    }
+    std::reverse(plan.exitSteps.begin(), plan.exitSteps.end());
+    for (uint32_t index = 0; index < plan.steps.size(); ++index)
+        if (plan.steps[index].previousBatch == UINT32_MAX) plan.entrySteps.push_back(index);
     plan.complete = true;
     return plan;
 }

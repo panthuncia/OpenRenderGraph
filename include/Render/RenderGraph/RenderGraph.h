@@ -238,6 +238,8 @@ public:
 	struct PersistentTicketSubmission {
 		bool submitted = false;
 		std::vector<uint64_t> signals;  // per batch of every segment, in order: the value it signalled
+		// The handoff and release lists the submission recorded: the host keeps them until its slot completes.
+		std::vector<std::shared_ptr<const void>> leases;
 		// An external epoch's ticket (SetExternalPersistentEpochs): nothing was submitted; its packets are the host's to execute,
 		// with these waits and signals (the values above among them).
 		std::shared_ptr<ExternalEpochExecution> external;
@@ -260,12 +262,14 @@ private:
 	bool PersistentClosedExecutions() const noexcept { return m_persistentClosedExecutions; }
 
 	// Tickets (async epochs, GraphHost::EnableAsyncEpochs). The graph's owner thread prepares an
-	// epoch's main execution ahead of its epoch point - Update, invocations, admission, recording - into a
-	// ticket, for a frame slot it has waited for. The host's submitting thread later checks the ticket is
-	// still current, records the uploads queued since (RecordPendingUploads) and submits the ticket's
-	// packets, assigning their timeline values then, in submission order. The owner completes every ticket
-	// in that order, with those values, or abandons it. Requires closed executions (a ticket's admission
-	// must not depend on the executions around it) and no upload passes other than the host's.
+	// epoch's main execution ahead of its epoch point - Update, invocations, recording - into a ticket, for a
+	// frame slot it has waited for; its body is recorded from a plan (SynchronousAdmission::PreparePlan), not an
+	// admission. The host's submitting thread later checks the ticket is still current, admits it
+	// (AdmitPersistentTicket: against the ledgers as they are then, under the sequencer, which it holds through
+	// the submission), records the uploads queued since (RecordPendingUploads) and submits the ticket
+	// (SubmitPersistentTicket: an open execution's handoff and release lists, then its packets, then the commit),
+	// assigning timeline values in submission order. The owner then completes the ticket (its statistics and
+	// retirement). Closed and open executions both work; no upload pass but the host's.
 	/**
 	 * @brief Owner thread, while no ticket is prepared (the host's async epochs stopped): the persistent epochs the host executes
 	 * itself, in a command buffer of its own (ExternalEpochExecution). Their tickets record into secondary lists, and a pass of
@@ -330,6 +334,9 @@ private:
 		uint64_t kept = 0;        // of them, kept for reuse
 		uint64_t reused = 0;      // tickets that took a kept recording instead of recording (owner thread)
 		uint64_t adopted = 0;     // stale tickets made current by a kept recording (submitting thread)
+		// Tickets admitted at submission with their prediction's plan (the ledger held what the executable found last), and those
+		// planned against the ledger (SynchronousAdmission::TakePredictionCounts).
+		uint64_t predicted = 0, planned = 0;
 	};
 	// Since the last call (any thread).
 	PersistentRecordingStats TakePersistentRecordingStats() noexcept;
@@ -359,12 +366,18 @@ private:
 	// batch, unless RecordPendingUploads planned the ticket's uploads by queue (queueLists), and then only a batch that uses
 	// what they write. The uploads it recorded on another queue go to that queue just ahead of its first batch there.
 	// frameWait: the frame-wait timeline's value (SetFrameWaitTimeline) every batch waits for; 0 for none.
-	static bool SubmitPersistentTicket(PersistentTicket& ticket, std::span<uint64_t> nextQueueValues, PersistentTicketSubmission& out,
+	bool SubmitPersistentTicket(PersistentTicket& ticket, std::span<uint64_t> nextQueueValues, PersistentTicketSubmission& out,
 		std::pair<uint32_t, uint64_t> uploadsDone = {UINT32_MAX, 0}, uint64_t frameWait = 0);
+	// Submitting thread, holding the sequencer (HoldPersistentSequencer) until the ticket is submitted: admits each of the
+	// ticket's segments against the ledgers as they are now. queueValues: what the host has submitted on each queue slot.
+	void AdmitPersistentTicket(PersistentTicket& ticket, std::span<const uint64_t> queueValues);
+	// An admitted ticket that will not be submitted: its admissions go (holding the sequencer).
+	void AbandonPersistentTicketAdmission(PersistentTicket& ticket);
+	std::unique_lock<std::recursive_mutex> HoldPersistentSequencer() const;
 	// Submitting thread (the upload service's owner): records the uploads queued since the last call into
 	// `list` as plain buffer copies, without the graph's registry or admission: a full barrier (against the
 	// work before them), then the copies, whose destinations are left for the next execution's entry
-	// barrier - so the list must precede a closed execution on its queue.
+	// barrier. The list ends with a full barrier, so the execution after it on its queue sees the copies.
 	// keepAlive owns the staging they read until the GPU is done with the slot. False when an upload is not
 	// a pointer-targeted buffer copy (the caller must use the synchronous path).
 	// recordedLists receives, first, the lists of batches their producers recorded (IUploadService::SubmitRecordedUploads),
@@ -574,6 +587,16 @@ public:
 	/// Access the queue registry (read-only).
 	const QueueRegistry& GetQueueRegistry() const noexcept { return m_queueRegistry; }
 	QueueRegistry& GetQueueRegistry() noexcept { return m_queueRegistry; }
+	// Before Setup: the primary queues' timelines (graphics, compute, copy, in that order) come from another registry
+	// (QueueRegistry::SharedTimelineOf), so this graph's work and the other graph's share them. Executions of graphs on one
+	// queue's timeline need no waits on each other there; the ledger drops a wait on the consumer's own timeline. The graph
+	// neither waits on nor retires shared timelines when it goes. Empty: timelines of its own.
+	void SetSharedQueueTimelines(std::vector<SharedQueueTimeline> timelines) { m_sharedQueueTimelines = std::move(timelines); }
+	// Before CompileStructural: the graph takes only the passes of this host epoch (ExternalPassDesc::epoch) and the untagged
+	// ones from its extensions, so it compiles, admits and executes that epoch alone (GraphHost: one graph per epoch).
+	// persistent::AllEpochs (the default) takes every pass.
+	void SetPassEpochFilter(uint32_t epoch) noexcept { m_passEpochFilter = epoch; }
+	uint32_t PassEpochFilter() const noexcept { return m_passEpochFilter; }
 
 	/// The graph's external client (OpenRenderGraph/ExternalClient.h). Use it to submit GPU work recorded outside the
 	/// graph, such as uploads and readbacks. It uses this graph's queue slots, and its work is ordered with the graph's
@@ -777,6 +800,8 @@ private:
 	std::mutex m_externalClientMutex;
 	std::unique_ptr<ExternalClient> m_externalClient;
 	std::shared_ptr<rhi::TimelinePtr> m_frameWaitTimeline;  // SetFrameWaitTimeline
+	std::vector<SharedQueueTimeline> m_sharedQueueTimelines;  // SetSharedQueueTimelines
+	uint32_t m_passEpochFilter = UINT32_MAX;  // SetPassEpochFilter (persistent::AllEpochs)
 	uint64_t m_frameWaitValue = 0;
 	std::optional<PresentDependency> m_lastPresentDependency;
 	std::string m_presentPass;              // SetPresentPass

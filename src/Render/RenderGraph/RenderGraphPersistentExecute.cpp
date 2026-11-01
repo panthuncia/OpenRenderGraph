@@ -30,6 +30,13 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 		const size_t framesInFlight = m_renderGraphSettingsService ? m_renderGraphSettingsService->GetNumFramesInFlight() : 3;
 		state.timelines = std::make_unique<compiler::ExecutionTimelineAdmission>(std::move(queues), framesInFlight * 3 + 6);
 	}
+	// A timeline other graphs share (SetSharedQueueTimelines): a synchronous execution's values come after theirs. A ticket's are
+	// assigned at its submission, after everything submitted before it, and recorded in that order (CompletePersistentTicket).
+	if (!ticket) for (size_t slot = 0; slot < slotCount; ++slot) {
+		const auto index = static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot));
+		if (!m_queueRegistry.SharesTimeline(index)) continue;
+		if (const auto next = m_queueRegistry.GetCurrentFenceValue(index); next > 1) state.timelines->AdvanceTo(static_cast<uint32_t>(slot), next - 1);
+	}
 	// Retirement runs before this frame submits: the presentation tail of the
 	// previous frame has been confirmed by now, so completed executions and
 	// their publications can be released.
@@ -132,6 +139,9 @@ bool RenderGraph::AdmitPersistentSegment(PersistentSegmentRun& run) {
 		run.timelineBindings.push_back({kFrameWaitTimelineIdentity, (*m_frameWaitTimeline)->GetHandle()});
 	run.admission = [&] {
 		BT_ZONE_SCOPE("ORG.Persistent.PrepareAdmission");
+		// A ticket's body is recorded from a plan: it is admitted when it is submitted (AdmitPersistentTicket).
+		if (run.execution.options.ticket)
+			return state.admission->PreparePlan(segment.publication, queues, segment.waits, segment.rebindings);
 		return state.admission->Prepare(segment.publication, queues, segment.waits, {}, segment.rebindings);
 	}();
 	auto& admission = run.admission;
@@ -156,7 +166,8 @@ bool RenderGraph::AdmitPersistentSegment(PersistentSegmentRun& run) {
 		// Recorded ahead (BindPersistentTicketRecording): this preparation's invocations are never recorded.
 		for (const auto& invocation : segment.invocations)
 			if (invocation) invocation.Abandon(AbandonReason::AdmissionFailed);
-		ticketTarget->segments.push_back({std::move(admission), nullptr, segment.bindings, run.resourceHeap, run.samplerHeap});
+		ticketTarget->segments.push_back({std::move(admission), nullptr, segment.bindings, run.resourceHeap, run.samplerHeap,
+			segment.waits, segment.rebindings});
 		return false;
 	}
 	// An external epoch's recording is kept as any other's (its secondaries executed again by each ticket that takes it); a late
@@ -171,7 +182,9 @@ bool RenderGraph::AdmitPersistentSegment(PersistentSegmentRun& run) {
 			lateUnreplayable = lateUnreplayable || prepared >= segment.invocations.size() || !segment.invocations[prepared].IsReplayable();
 		}
 	run.external = ticketTarget && ticketTarget->external;
-	run.keepable = ticketTarget && m_persistentRecordingReuse && admission.closed && admission.rebound.empty()
+	// A body depends only on the compiled graph (open: its entry barriers are recorded at submission) or on the executable and
+	// backings (closed), so a ticket's recording can be kept, open or closed.
+	run.keepable = ticketTarget && m_persistentRecordingReuse && admission.rebound.empty()
 		&& admission.incomingEffects.empty() && !ticketTarget->uncheckable
 		&& !(run.external && lateUnreplayable);
 	if (run.keepable && !m_keptRecordings) m_keptRecordings = std::make_unique<KeptRecordingStore>();
@@ -186,7 +199,8 @@ bool RenderGraph::AdmitPersistentSegment(PersistentSegmentRun& run) {
 			for (const auto& invocation : segment.invocations)
 				if (invocation) invocation.Abandon(AbandonReason::AdmissionFailed);
 			kept->lastUse.store(ticketTarget->hostFrame, std::memory_order_relaxed);
-			ticketTarget->segments.push_back({std::move(admission), kept, segment.bindings, run.resourceHeap, run.samplerHeap});
+			ticketTarget->segments.push_back({std::move(admission), kept, segment.bindings, run.resourceHeap, run.samplerHeap,
+				segment.waits, segment.rebindings});
 			m_recordingsReused.fetch_add(1, std::memory_order_relaxed);
 			run.Lap(run.timings.recordUs);
 			return false;
@@ -426,7 +440,8 @@ void RenderGraph::SubmitPersistentSegment(PersistentSegmentRun& run) {
 				m_keptRecordings->Store(ticket->epoch, run.execution.frameIndex, std::move(next));
 				m_recordingsKept.fetch_add(1, std::memory_order_relaxed);
 			}
-			ticket->segments.push_back({std::move(admission), std::move(recording), segment.bindings, run.resourceHeap, run.samplerHeap});
+			ticket->segments.push_back({std::move(admission), std::move(recording), segment.bindings, run.resourceHeap, run.samplerHeap,
+				segment.waits, segment.rebindings});
 			return;
 		}
 		// Admission at submission (docs/job-graphs.md, "Phase 2 investigation"): under the sequencer, the ledger's handoff is

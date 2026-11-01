@@ -153,6 +153,52 @@ int main() {
         waits.assign(1, {});
         ledger.AppendIncomingWaits(readMip1, std::span{&backing, size_t{1}}, queues, waits);
         ENSURE(waits[0].empty());
+
+        // Streams: a stream's cells name its batches' producers, and a capture's waits follow their latest signals. A writer and a
+        // reader on two queues, frame after frame: the predicted waits are a full resolution's. From the second frame on, neither
+        // commit changes the cell (the same writer keeps the reader since), so both captures hold from the third.
+        BackingAccessAdmissionLedger streams;
+        handle.index = 42;
+        PreparedBackingState streamed{.graphResourceID = 99, .resource = handle, .shape = {2, 1, false}};
+        const auto one = std::span{&streamed, size_t{1}};
+        const auto writes = streams.OpenStream(1), reads = streams.OpenStream(1);
+        AccessPrediction writerCapture, readerCapture;
+        uint32_t predicted = 0;
+        auto admit = [&](const Schedule& graph, AccessPrediction& capture) {
+            std::vector<std::vector<ExecutionTimelinePoint>> full(1), fromCapture(1);
+            streams.AppendIncomingWaits(graph, one, queues, full);
+            if (streams.PredictedWaits(capture, graph, one, queues, fromCapture, 7)) ++predicted;
+            else streams.AppendIncomingWaits(graph, one, queues, fromCapture, 7, &capture);
+            ENSURE(fromCapture == full);
+            return full[0];
+        };
+        for (uint64_t frame = 1; frame <= 5; ++frame) {
+            const auto writerWaits = admit(writeMip0, writerCapture);
+            ENSURE(frame == 1 ? writerWaits.empty() : writerWaits == std::vector<ExecutionTimelinePoint>{{22, 10 * (frame - 1) + 5}});
+            GraphExecutionTimeline written;
+            written.batches = {{{11, 10 * frame}, {}}};
+            streams.Commit(writeMip0, one, written, UINT32_MAX, 7, writes);
+            ENSURE(admit(readMip0, readerCapture) == std::vector<ExecutionTimelinePoint>{{11, 10 * frame}});
+            GraphExecutionTimeline read;
+            read.batches = {{{22, 10 * frame + 5}, {}}};
+            streams.Commit(readMip0, one, read, UINT32_MAX, 7, reads);
+        }
+        ENSURE(predicted == 6);  // frames 3 to 5, both streams
+        // A commit of fixed points in between: the writer's capture no longer holds, and the full resolution sees the new reader.
+        GraphExecutionTimeline other;
+        other.batches = {{{22, 100}, {}}};
+        streams.Commit(readMip0, one, other);
+        predicted = 0;
+        ENSURE(admit(writeMip0, writerCapture) == std::vector<ExecutionTimelinePoint>{{22, 100}});
+        ENSURE(predicted == 0);
+        // A closed stream's producers keep their last signals, also once they are fixed into points and reused.
+        GraphExecutionTimeline written;
+        written.batches = {{{11, 200}, {}}};
+        streams.Commit(writeMip0, one, written, UINT32_MAX, 7, writes);
+        streams.CloseStream(writes);
+        for (int i = 0; i < 1100; ++i) streams.CloseStream(streams.OpenStream(1));
+        ENSURE(admit(readMip0, readerCapture) == std::vector<ExecutionTimelinePoint>{{11, 200}});
+        streams.CloseStream(reads);
     }
 
     // Physical aliases are ordered by the realized heap interval even when

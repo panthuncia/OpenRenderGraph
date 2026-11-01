@@ -1100,17 +1100,17 @@ int TestOwnedDescriptorGpuExecution(const rhi::DeviceCreateInfo& create) {
             catch (const std::invalid_argument&) { return true; }
             return false;
         };
-        auto invalidSeal = frame; invalidSeal.backings.pop_back();
+        auto invalidSeal = frame; invalidSeal.backings.Mutable().pop_back();
         CHECK(rejectSeal(invalidSeal));
-        invalidSeal = frame; std::swap(invalidSeal.backings[0],invalidSeal.backings[1]);
+        invalidSeal = frame; std::swap(invalidSeal.backings.Mutable()[0],invalidSeal.backings.Mutable()[1]);
         CHECK(rejectSeal(invalidSeal));
-        invalidSeal = frame; invalidSeal.backings[0].regions.reset();
+        invalidSeal = frame; invalidSeal.backings.Mutable()[0].regions.reset();
         CHECK(rejectSeal(invalidSeal));
         // An aliasing shared_ptr may retain the right control block while
         // pointing at the wrong heap. Ownership equality alone is insufficient.
         CHECK(frame.backings[0].aliasHeap.get() != nullptr);
         invalidSeal = frame;
-        invalidSeal.backings[0].aliasHeap = std::shared_ptr<const org::AliasHeapGeneration>(frame.backings[0].aliasHeap,nullptr);
+        invalidSeal.backings.Mutable()[0].aliasHeap = std::shared_ptr<const org::AliasHeapGeneration>(frame.backings[0].aliasHeap,nullptr);
         CHECK(rejectSeal(invalidSeal));
         CHECK(!invocations[0].IsConsumed() && !invocations[1].IsConsumed());
         invalidSeal = {};

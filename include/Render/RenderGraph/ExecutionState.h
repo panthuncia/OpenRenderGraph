@@ -4,6 +4,7 @@
 #include "Resources/AliasingPlacement.h"
 #include <rhi.h>
 #include <span>
+#include <deque>
 #include <map>
 #include <string>
 #include <unordered_map>
@@ -61,6 +62,9 @@ struct PreparedBatchBarriers {
     std::vector<rhi::TextureBarrier> acquired;
     std::vector<PreparedStateRegion> committedStates;
     std::vector<rhi::ResourceHandle> committedResources;
+    // The compiler resource index of each committed backing (parallel to committedResources): where an indexed commit finds its
+    // ledger entry (BackingStateAdmissionLedger::CommitBatch with backings).
+    std::vector<uint32_t> committedIndices;
     // Queue slot that performed each committed state update. Kept parallel to
     // committedStates/resources so the admission ledger can distinguish a
     // same-queue memory dependency from a timeline-ordered queue handoff.
@@ -81,6 +85,123 @@ struct PreparedExecutionBarrierPlan {
     std::vector<Release> releases;
 };
 
+// An entry-only plan (BackingStateAdmissionLedger::Prepare's entryOnly) and what the ledger held of each resource its entry steps
+// name when it was made: per resource, whether it had an entry and its fingerprint (its cells and queues). While the ledger holds
+// the same (BackingStateAdmissionLedger::Predicts), Prepare would make this plan again: a frame repeats, so an execution mostly
+// finds what the same executable found the frame before.
+struct StatePrediction {
+    std::shared_ptr<const PreparedExecutionBarrierPlan> plan;
+    struct Entry {
+        uint32_t resource = 0;  // compiler resource index
+        bool present = false;
+        uint64_t fingerprint = 0;
+    };
+    std::vector<Entry> entries;
+};
+
+// An earlier access the access ledger holds: a producer's (a stream's batch, BackingAccessAdmissionLedger::OpenStream), which is
+// that batch's latest signal, or a fixed point.
+struct AccessRef {
+    uint32_t producer = 0;  // 0: `point`
+    ExecutionTimelinePoint point{};
+    bool operator==(const AccessRef& other) const { return producer == other.producer && (producer || point == other.point); }
+};
+
+// The same for the access ledger (BackingAccessAdmissionLedger::AppendIncomingWaits): what it held of each resource the batches use
+// first (its writers and readers, as references), and the earlier accesses each batch's waits came from. While the ledger holds the
+// same references, the waits are those accesses' points now.
+struct AccessPrediction {
+    bool valid = false;
+    std::vector<StatePrediction::Entry> entries;
+    std::vector<std::vector<AccessRef>> waits;  // per batch, each once
+};
+
+namespace detail {
+// Ledger entries by backing key, in storage whose addresses hold until the entry is erased. A backing set's entries are found by
+// key once (Resolve, by the set's id: AdmissionBackingSet::Id) and from then on by compiler resource index, so an admission's
+// per-resource work needs no lookup. Not thread-safe: the ledgers are used under the sequencer's lock.
+template<class T>
+class BackingTable {
+public:
+    T* Find(uint64_t key) noexcept {
+        const auto found = m_index.find(key);
+        return found == m_index.end() ? nullptr : &m_entries[found->second];
+    }
+    const T* Find(uint64_t key) const noexcept {
+        const auto found = m_index.find(key);
+        return found == m_index.end() ? nullptr : &m_entries[found->second];
+    }
+    bool Contains(uint64_t key) const noexcept { return m_index.contains(key); }
+    T& Emplace(uint64_t key, bool* inserted = nullptr) {
+        if (const auto found = m_index.find(key); found != m_index.end()) {
+            if (inserted) *inserted = false;
+            return m_entries[found->second];
+        }
+        uint32_t slot = 0;
+        if (!m_free.empty()) {
+            slot = m_free.back();
+            m_free.pop_back();
+            m_entries[slot] = T{};
+        } else {
+            slot = static_cast<uint32_t>(m_entries.size());
+            m_entries.emplace_back();
+        }
+        m_index.emplace(key, slot);
+        if (inserted) *inserted = true;
+        return m_entries[slot];
+    }
+    bool Erase(uint64_t key) {
+        const auto found = m_index.find(key);
+        if (found == m_index.end()) return false;
+        m_entries[found->second] = T{};
+        m_free.push_back(found->second);
+        m_index.erase(found);
+        ++m_generation;
+        return true;
+    }
+    void Clear() {
+        m_index.clear();
+        m_entries.clear();
+        m_free.clear();
+        m_resolved.clear();
+        ++m_generation;
+    }
+    size_t Size() const noexcept { return m_index.size(); }
+    template<class Fn> void ForEach(Fn&& fn) { for (auto& [key, slot] : m_index) fn(key, m_entries[slot]); }
+    // Per resource of the backing set, its entry (null: none when resolved; the caller finds it by key then, and keeps what it
+    // finds here). backingSet 0: no set to remember, resolved for this call.
+    std::vector<T*>& Resolve(std::span<const PreparedBackingState> backings, uint64_t backingSet) const {
+        auto& resolved = backingSet ? m_resolved[backingSet] : m_scratch;
+        if (!backingSet || resolved.generation != m_generation || resolved.entries.size() != backings.size()) {
+            if (m_resolved.size() > 512) {
+                m_resolved.clear();
+                return Resolve(backings, backingSet);
+            }
+            resolved.generation = m_generation;
+            resolved.entries.assign(backings.size(), nullptr);
+            for (size_t i = 0; i < backings.size(); ++i)
+                if (backings[i].resource.valid())
+                    resolved.entries[i] = const_cast<T*>(Find((uint64_t{backings[i].resource.generation} << 32) | backings[i].resource.index));
+        }
+        return resolved.entries;
+    }
+private:
+    std::unordered_map<uint64_t, uint32_t> m_index;
+    mutable std::deque<T> m_entries;  // stable addresses
+    std::vector<uint32_t> m_free;
+    uint64_t m_generation = 1;  // moves when an entry goes (Erase, Clear): an address resolved before may be another's now
+    struct Resolved {
+        uint64_t generation = 0;
+        std::vector<T*> entries;
+    };
+    mutable std::unordered_map<uint64_t, Resolved> m_resolved;
+    mutable Resolved m_scratch;
+};
+}
+
+// Throws unless the backings are the structure's resources, in its order (what every ledger's Prepare expects).
+void ValidatePreparedBackingOrder(const GraphCompileStructure& structure, std::span<const PreparedBackingState> backings);
+
 // Ordered admission state. Compile workers never access this object. Prepare is
 // transactional; CommitBatch is called only for work known to have submitted.
 class BackingStateAdmissionLedger {
@@ -91,20 +212,35 @@ public:
     // a layout transition after their last access; the ledger records home as their final state. Closed
     // executions provide their own memory visibility (a full barrier at entry, see FrameAdmission::closed),
     // so buffers need no exit barrier. Every resource must be used from a single queue.
+    // entryOnly: for an execution whose body is recorded already (from an earlier plan of the same executable and backings): the
+    // entry barriers, releases, seeds and committed states alone, from the plan's entry and exit steps (SymbolicStatePlan); the
+    // body's barriers (beforePass, afterPass) are left out. validated: the backings were checked against the graph's resource order
+    // (ValidatePreparedBackingOrder) when they were made.
+    // backingSet: the backings' set (AdmissionBackingSet::Id), whose ledger entries are found once; 0 for none.
     PreparedExecutionBarrierPlan Prepare(
         const Schedule& graph, std::span<const PreparedBackingState> initial,
-        std::span<const rhi::ResourceHandle> invalidated = {}, bool closeToHome = false) const;
+        std::span<const rhi::ResourceHandle> invalidated = {}, bool closeToHome = false, bool entryOnly = false,
+        bool validated = false, uint64_t backingSet = 0) const;
     void CommitBatch(const PreparedBatchBarriers&);
+    // The same, each commit's entry found by its compiler resource index (PreparedBatchBarriers::committedIndices) in the backings'
+    // set (backingSet as for Prepare).
+    void CommitBatch(const PreparedBatchBarriers& batch, std::span<const PreparedBackingState> backings, uint64_t backingSet);
+    // The prediction's entries taken anew: what the ledger holds now of each resource the graph's entry steps name.
+    void Capture(StatePrediction& prediction, const Schedule& graph, std::span<const PreparedBackingState> initial,
+        uint64_t backingSet = 0) const;
+    // Whether the ledger still holds what the prediction's entries took (its plan stands).
+    bool Predicts(const StatePrediction& prediction, std::span<const PreparedBackingState> initial, uint64_t backingSet = 0) const;
     void Invalidate(std::span<const rhi::ResourceHandle> resources);
-    size_t BackingCount() const noexcept { return m_states.size(); }
-    void Reset() { m_states.clear(); }
+    size_t BackingCount() const noexcept { return m_states.Size(); }
+    void Reset() { m_states.Clear(); }
 private:
     struct StateGrid {
         CompileResourceShape shape{};
         std::vector<CompileResourceState> cells;
         std::vector<uint32_t> queues;
+        uint64_t fingerprint = 0;  // of cells and queues, kept by every change (StatePrediction)
     };
-    std::unordered_map<uint64_t, StateGrid> m_states;
+    detail::BackingTable<StateGrid> m_states;
 };
 
 // Ordered, submission-backed cross-frame hazard state. Unlike symbolic graph
@@ -113,10 +249,24 @@ private:
 // unrelated resources/ranges and queues remain independent.
 class BackingAccessAdmissionLedger {
 public:
+    // A stream: the executions of one executable with one backing set (the same accesses to the same backings each time). Each of
+    // its batches is a producer: the cells it touches name the producer instead of a point, and its commit sets the producer's
+    // latest signal once, so a cell changes only when who touched it last changes. A closed stream's producers keep their last
+    // signals (fixed points from then on). Returns the stream's id (never 0).
+    uint64_t OpenStream(uint32_t batches);
+    void CloseStream(uint64_t stream);
+    // backingSet: as for BackingStateAdmissionLedger::Prepare. capture: filled with what the waits came from, for PredictedWaits.
     void AppendIncomingWaits(const Schedule& graph,
         std::span<const PreparedBackingState> resources,
         std::span<const ExecutionTimelinePoint> queues,
-        std::vector<std::vector<ExecutionTimelinePoint>>& incoming) const;
+        std::vector<std::vector<ExecutionTimelinePoint>>& incoming, uint64_t backingSet = 0,
+        AccessPrediction* capture = nullptr) const;
+    // AppendIncomingWaits from a capture, when the ledger still holds what it was captured from: the same waits, at the points
+    // their producers have reached since. False (incoming untouched) when it does not.
+    bool PredictedWaits(const AccessPrediction& prediction, const Schedule& graph,
+        std::span<const PreparedBackingState> resources,
+        std::span<const ExecutionTimelinePoint> queues,
+        std::vector<std::vector<ExecutionTimelinePoint>>& incoming, uint64_t backingSet) const;
     // Per batch, (compiler resource index, wait).
     using ResourceWaits = std::vector<std::vector<std::pair<uint32_t, ExecutionTimelinePoint>>>;
     // For each boundary access (incomingBoundaryAccessesByBatch) to a selected resource (selected: one flag per compiler
@@ -126,24 +276,42 @@ public:
     void AppendBoundaryAccessWaits(const Schedule& graph,
         std::span<const PreparedBackingState> resources,
         std::span<const uint8_t> selected,
-        ResourceWaits& out) const;
+        ResourceWaits& out, uint64_t backingSet = 0) const;
+    // stream: the execution's (OpenStream), or 0 for none: its cells then hold its signals as fixed points.
     void Commit(const Schedule& graph,
         std::span<const PreparedBackingState> resources,
-        const GraphExecutionTimeline& execution, uint32_t batchCount = UINT32_MAX);
-    void Reset() { m_accesses.clear(); }
+        const GraphExecutionTimeline& execution, uint32_t batchCount = UINT32_MAX, uint64_t backingSet = 0, uint64_t stream = 0);
+    void Reset() { m_accesses.Clear(); }
     void ResolvePlannedPoints(const std::unordered_map<uint64_t, ExecutionTimelinePoint>& points);
     bool RetireCompleted(rhi::ResourceHandle resource, const std::map<uint64_t, uint64_t>& completed);
-    size_t BackingCount() const noexcept { return m_accesses.size(); }
+    size_t BackingCount() const noexcept { return m_accesses.Size(); }
 private:
     struct Cell {
-        ExecutionTimelinePoint writer{};
-        std::vector<ExecutionTimelinePoint> readers;
+        AccessRef writer{};
+        std::vector<AccessRef> readers;  // at most one per timeline
     };
     struct AccessGrid {
         CompileResourceShape shape{};
         std::vector<Cell> cells;
+        uint64_t fingerprint = 0;  // of the cells' references, kept by every change (AccessPrediction)
     };
-    std::unordered_map<uint64_t, AccessGrid> m_accesses;
+    struct Producer {
+        ExecutionTimelinePoint signal{};  // the latest; its timeline is set by the first commit
+        bool closed = false;
+    };
+    ExecutionTimelinePoint PointOf(const AccessRef& ref) const noexcept {
+        return ref.producer ? m_producers[ref.producer].signal : ref.point;
+    }
+    uint64_t TimelineOf(const AccessRef& ref) const noexcept { return PointOf(ref).timeline; }
+    static uint64_t Fingerprint(const AccessGrid& grid);
+    // Closed producers' references become their points, and the producers are reused (after enough have closed).
+    void FixClosedProducers();
+    detail::BackingTable<AccessGrid> m_accesses;
+    std::vector<Producer> m_producers{1};  // [0] unused: AccessRef::producer 0 is a point
+    std::vector<uint32_t> m_freeProducers;
+    size_t m_closedProducers = 0;
+    std::unordered_map<uint64_t, std::vector<uint32_t>> m_streams;  // id -> its batches' producers
+    uint64_t m_nextStream = 1;
 };
 
 // Tracks submitted use of physical placed-resource ranges. Different graph

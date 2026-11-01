@@ -512,10 +512,18 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests.Reuse COMMAND OpenRenderGraphPersistentVulkanHostTests reuse)
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests.Revision COMMAND OpenRenderGraphPersistentVulkanHostTests revision)
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests.External COMMAND OpenRenderGraphPersistentVulkanHostTests external)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.AsyncOpen COMMAND OpenRenderGraphPersistentVulkanHostTests async open)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.Split COMMAND OpenRenderGraphPersistentVulkanHostTests split)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.SplitOpen COMMAND OpenRenderGraphPersistentVulkanHostTests split open)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.ReuseOpen COMMAND OpenRenderGraphPersistentVulkanHostTests reuse open)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.RevisionOpen COMMAND OpenRenderGraphPersistentVulkanHostTests revision open)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.ExternalOpen COMMAND OpenRenderGraphPersistentVulkanHostTests external open)
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests.Contributor COMMAND OpenRenderGraphPersistentVulkanHostTests contributor)
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests.Rebinding COMMAND OpenRenderGraphPersistentVulkanHostTests rebinding)
             set_tests_properties(OpenRenderGraphPersistentVulkanHostTests OpenRenderGraphPersistentVulkanHostTests.Async
                 OpenRenderGraphPersistentVulkanHostTests.Reuse OpenRenderGraphPersistentVulkanHostTests.Revision
+                OpenRenderGraphPersistentVulkanHostTests.AsyncOpen OpenRenderGraphPersistentVulkanHostTests.ReuseOpen
+                OpenRenderGraphPersistentVulkanHostTests.RevisionOpen OpenRenderGraphPersistentVulkanHostTests.ExternalOpen
                 OpenRenderGraphPersistentVulkanHostTests.Contributor OpenRenderGraphPersistentVulkanHostTests.Rebinding PROPERTIES TIMEOUT 60)
         endif()
     endif()

@@ -370,7 +370,7 @@ void RenderGraph::ShutdownOwnedState() {
 	for (size_t i = 0; i < m_queueRegistry.SlotCount(); ++i) {
 		const auto slot = static_cast<QueueSlotIndex>(static_cast<uint8_t>(i));
 		const auto fence = m_queueRegistry.GetFenceOwner(slot);
-		if (!fence || !fence->Get()) continue;
+		if (!fence || !fence->Get() || m_queueRegistry.SharesTimeline(slot)) continue;
 		if (const auto next = m_queueRegistry.GetCurrentFenceValue(slot); next > 1) fence->Get().HostWait(next - 1);
 		m_runtime->Sequencer()->RetireTimeline(m_runtime->TimelineIdentity(fence->Get()));
 		m_runtime->NoteTimelineDestroyed(fence->Get());
@@ -685,9 +685,15 @@ void RenderGraph::Setup() {
 		auto& compQ = DeviceManager::GetInstance().GetComputeQueue();
 		auto& copyQ = DeviceManager::GetInstance().GetCopyQueue();
 		const auto primaryBackend = m_backendDevices.empty() ? rhi::Backend::Null : m_backendDevices.front().backend;
-		m_queueRegistry.Register({ QueueKind::Graphics, 0, BackendInstanceId::Primary, primaryBackend }, gfxQ, device);
-		m_queueRegistry.Register({ QueueKind::Compute, 0, BackendInstanceId::Primary, primaryBackend }, compQ, device);
-		m_queueRegistry.Register({ QueueKind::Copy,    0, BackendInstanceId::Primary, primaryBackend }, copyQ, device);
+		if (!m_sharedQueueTimelines.empty() && (m_sharedQueueTimelines.size() != 3 || m_backendDevices.size() > 1))
+			throw std::invalid_argument("Shared queue timelines are the three primary queues' of a single-device graph");
+		const QueueSlot primary[] = {{ QueueKind::Graphics, 0, BackendInstanceId::Primary, primaryBackend },
+			{ QueueKind::Compute, 0, BackendInstanceId::Primary, primaryBackend }, { QueueKind::Copy, 0, BackendInstanceId::Primary, primaryBackend }};
+		rhi::Queue primaryQueues[] = {gfxQ, compQ, copyQ};
+		for (size_t i = 0; i < 3; ++i) {
+			if (m_sharedQueueTimelines.empty()) m_queueRegistry.Register(primary[i], primaryQueues[i], device);
+			else m_queueRegistry.Register(primary[i], primaryQueues[i], m_sharedQueueTimelines[i], device);
+		}
 		for (size_t i = 1; i < m_backendDevices.size(); ++i) {
 			const auto& peer = m_backendDevices[i];
 			auto peerDevice = peer.device;

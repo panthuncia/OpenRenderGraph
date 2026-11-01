@@ -186,7 +186,8 @@ ExternalClient::Signal ExternalClient::Submit(uint32_t slotIndex, std::span<cons
 	auto admission = [&] { BT_ZONE_SCOPE("ORG.ExternalClient.Prepare"); return m_admission->Prepare(publication, points); }();
 	try {
 		auto hold = m_admission->HoldSequencer();
-		{ BT_ZONE_SCOPE("ORG.ExternalClient.Readmit"); m_admission->Readmit(admission); }
+		// A closed admission depends on nothing admitted before it: there is nothing to readmit.
+		if (!admission.closed) { BT_ZONE_SCOPE("ORG.ExternalClient.Readmit"); m_admission->Readmit(admission); }
 		auto& waits = admission.incomingWaits.at(0);
 		// A texture last used on another queue must be released on that queue first.
 		// We submit the release there with its own signal, and this submission waits for it.

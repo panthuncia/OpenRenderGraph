@@ -185,6 +185,10 @@ struct SymbolicStatePlan {
     // may later be elided only after queue/API-specific validation.
     std::vector<SymbolicStateStep> steps;
     std::vector<SymbolicFinalState> finalStates;
+    // Indices into steps, in step order: the execution-boundary ones (previousBatch UINT32_MAX, what admission resolves from the
+    // ledger), and the last step of each mip/slice cell of each resource (what an execution leaves in the ledger). An admission
+    // whose body is recorded already walks these alone (BackingStateAdmissionLedger::Prepare's entryOnly).
+    std::vector<uint32_t> entrySteps, exitSteps;
 };
 
 struct Schedule {
@@ -422,6 +426,9 @@ public:
     // A submission of the owner's own on a queue between executions (a queue handoff's release): the value it signals, recorded as
     // submitted.
     ExecutionTimelinePoint SubmitOutside(uint32_t queue);
+    // A queue's timeline shared with other owners (RenderGraph::SetSharedQueueTimelines): their submissions reached `value`, so this
+    // owner's next signal there comes after it, and waits up to it reference submitted work. Never lowers; not during a submission.
+    void AdvanceTo(uint32_t queue, uint64_t value);
     // An execution another thread has already submitted with these signal values (async epochs: the values
     // are assigned at submission, in submission order, and recorded here by the ordered owner in the same
     // order). Values above the reserved ones may skip - timelines only need to rise.

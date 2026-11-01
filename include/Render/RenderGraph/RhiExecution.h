@@ -76,7 +76,8 @@ inline std::shared_ptr<const RenderFrameSnapshot> SealPersistentFrame(
     uint64_t frameNumber, const persistent::FrameAdmission& admission,
     std::vector<PreparedPass> invocations) {
     const auto selected = admission.publication;
-    if (!frameNumber || !admission.sequence || !admission.domain || !selected || !selected->executable
+    // A plan (SynchronousAdmission::PreparePlan, a ticket's body) has no sequence: it is sealed the same way.
+    if (!frameNumber || !admission.domain || !selected || !selected->executable
         || !selected->executable->executionLayout)
         throw std::invalid_argument("Incomplete persistent frame seal");
     const auto layout = selected->executable->executionLayout;
@@ -117,7 +118,7 @@ inline std::shared_ptr<const RenderFrameSnapshot> SealPersistentFrame(
     result->incomingWaits = admission.incomingWaits;
     result->layout = layout;
     result->passes = std::move(invocations);
-    result->initialStates = std::make_shared<const std::vector<PreparedBackingState>>(admission.backings);
+    result->initialStates = admission.backings.Shared();
     result->barrierPlan = std::make_shared<const PreparedExecutionBarrierPlan>(admission.barriers);
     // Arm lifecycle ownership only after every fallible allocation succeeds.
     // A pending packet still owns these handles if sealing fails partway through.

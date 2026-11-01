@@ -206,11 +206,18 @@ struct RenderGraph::PersistentTicket {
 	uint8_t slot = 0;
 	uint64_t hostFrame = 0;
 	struct Segment {
+		// Until the ticket is admitted (AdmitPersistentTicket): the plan its body was recorded from (PreparePlan; for a
+		// candidate, only its publication). Then: the admission made at submission, which SubmitPersistentTicket commits.
 		persistent::FrameAdmission admission;
 		std::shared_ptr<const PersistentRecording> recording;
 		// What the segment was prepared with, which a recording bound later must have been recorded for.
 		std::shared_ptr<const FrozenExecutionBindings> bindings;
 		rhi::DescriptorHeapHandle resourceHeap{}, samplerHeap{};
+		// What the admission at submission is prepared with: the producers' waits and the frame's rebindings (the swapchain).
+		std::vector<persistent::FrameProducerWait> waits;
+		std::vector<persistent::FrameRebinding> rebindings;
+		bool admitted = false;   // admission is the submission's, pending
+		bool committed = false;  // and committed
 	};
 	std::vector<Segment> segments;
 	// Recordings a kept one replaced (AdoptKeptPersistentRecording): released by the owner thread, with the ticket.
@@ -221,8 +228,8 @@ struct RenderGraph::PersistentTicket {
 	uint64_t hostTag = 0;      // the host's, for its own currency checks (GraphHost: the backing version)
 	bool external = false;     // an external epoch's (SetExternalPersistentEpochs): its submission is the host's execution
 	// A revision ticket (PrepareRevisionTicket), or a live one with alternatives to its own segment: its candidates, pushed by the
-	// owner thread (newest first) and read by the bind on the submitting thread; the one the bind took. Completion abandons every
-	// other candidate's admission, and a live ticket's own segment when a candidate displaced it.
+	// owner thread (newest first) and read by the bind on the submitting thread; the one the bind took. A candidate is a recording
+	// only: the ticket is admitted at submission, whichever it takes.
 	struct Candidate {
 		Segment segment;
 		Candidate* next = nullptr;

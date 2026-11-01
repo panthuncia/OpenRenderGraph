@@ -26,23 +26,28 @@ namespace org {
 
 struct IHostExecutionData;
 
-// Drives one RenderGraph in persistent (static) execution for an application that
-// embeds ORG in its own renderer, for example a host that adopted another API's
-// device. It owns what every such embedding needs and nothing application-specific (the device, task service, services and
-// retirement are the Runtime's, which the host is given):
+// Drives persistent (static) execution for an application that embeds ORG in its own renderer, for example a host that
+// adopted another API's device. It owns what every such embedding needs and nothing application-specific (the device,
+// task service, services and retirement are the Runtime's, which the host is given):
+//   - one graph per host epoch (Desc::epochOrder), or one graph without epochs. Each is built from the registered
+//     extension factories and takes only its epoch's passes and the untagged ones (RenderGraph::SetPassEpochFilter), so
+//     it compiles, admits and executes that epoch alone, and one epoch's rebuild leaves the others running,
+//   - one timeline per queue, shared by every graph (RenderGraph::SetSharedQueueTimelines): an epoch's work on a queue
+//     needs no wait on an earlier epoch's work there, as with one graph,
 //   - the built-in upload pass (submitted through the graph's external client ahead of each execution),
 //   - persistent execution with the requested external queue boundary,
-//   - rebuilding the graph from the registered extension factories on request,
+//   - rebuilding graphs from the registered extension factories on request,
 //   - synchronous per-frame Update + Execute (Execute submits before returning),
 //   - per-frame-slot retirement: before a slot is reused, its previous frame's GPU work is
 //     waited for and the upload pages and descriptors it retired are released,
-//   - an orderly shutdown that waits only for the graph's own work.
+//   - an orderly shutdown that waits only for the graphs' own work.
 // Not thread-safe: all calls come from the host's render thread. With async epochs (SetAsyncEpochs) the host
-// runs one thread of its own that owns the graph from then on; the render thread only submits.
+// runs one thread of its own that owns the graphs from then on; the render thread submits, and builds a graph only
+// while the host's thread has let go of it.
 class GraphHost {
 public:
 	struct Desc {
-		// The runtime the host's graph runs on (its device, task service and services). Its slots must cover the host's frame
+		// The runtime the host's graphs run on (their device, task service and services). Its slots must cover the host's frame
 		// slots (FrameSlots).
 		std::shared_ptr<Runtime> runtime;
 		RenderGraph::ExternalQueueBoundary queueBoundary{};
@@ -51,12 +56,13 @@ public:
 		// for that slot's previous execution before reusing - number framesInFlight times the epochs (FrameSlots), so the ring
 		// covers the same frames however many epochs there are.
 		uint32_t framesInFlight = 3;
-		// Host epochs: the order the host runs them in within its own frame (see
-		// RenderGraph::SetPersistentEpochOrder). Passes declare theirs with
-		// ExternalPassDesc::Epoch; ExecuteFrame names the one to run.
+		// Host epochs: the order the host runs them in within its own frame. Each is a graph of its own. Passes declare
+		// theirs with ExternalPassDesc::Epoch (untagged ones run in every epoch); ExecuteFrame and SubmitEpoch name the one
+		// to run.
 		std::vector<uint32_t> epochOrder;
-		// RenderGraph::SetPersistentClosedExecutions: every execution leaves its resources in their home
-		// states and starts with a full barrier, so its admission is independent of what ran before.
+		// RenderGraph::SetPersistentClosedExecutions, an interop option: every execution leaves its resources in their home
+		// states and starts with a full barrier, so its admission is independent of what ran before. Nothing in the host
+		// requires it: async epochs and recording reuse work with open executions, admitted at submission.
 		bool closedExecutions = false;
 		// Async epochs: keep an epoch's replayable recordings per frame slot and submit them again
 		// (RenderGraph::SetPersistentRecordingReuse). A ticket prepared for what a kept recording was recorded for takes it
@@ -67,7 +73,7 @@ public:
 		// are recorded on that queue, just ahead of the ticket's first batch there, instead of on the graphics queue; and a batch
 		// on another queue waits for the graphics queue's uploads only when it uses what they write (RenderGraph::
 		// RecordPendingUploads' queue-scoped uploads). Off: every upload on the graphics queue, and every batch on another queue
-		// waits for them. SetQueueScopedUploads changes it at run time.
+		// waits for them.
 		bool queueScopedUploads = true;
 	};
 
@@ -79,13 +85,18 @@ public:
 	GraphHost(const GraphHost&) = delete;
 	GraphHost& operator=(const GraphHost&) = delete;
 
-	// Extensions are instantiated from their factories each time the graph is
-	// (re)built, so they may size resources from current host state.
+	// Extensions are instantiated from their factories each time a graph is (re)built, once per graph, so they may size
+	// resources from current host state. Each graph takes the passes of its own epoch from them. Adding or removing one
+	// rebuilds every graph.
 	void AddExtension(std::string id, ExtensionFactory factory);
 	void RemoveExtension(const std::string& id);
 
-	// The next ExecuteFrame builds a new graph (after retiring the current one).
-	void RequestRebuild() noexcept { m_rebuildRequested = true; }
+	// Every graph is built again before its next execution or submission.
+	void RequestRebuild() noexcept;
+	// The epoch's graph alone is built again; the others keep running as built. With async epochs, the epoch's ticket is given
+	// back and its graph replaced at its next submission (or BuildIfRequested), and the old graph is released once its own
+	// submitted work completes, without waiting for it. An epoch the host does not have is ignored.
+	void RequestRebuild(uint32_t epoch) noexcept;
 	// Pass and barrier-batch timestamps in the recordings kept across frames (RenderGraph::SetPersistentRecordingTimestamps),
 	// off by default: read back with the other pass timestamps (IStatisticsService::GetCompletedTimestamps, in the completed
 	// frame callback). A change requests a rebuild, so every kept recording (a revision's epochs) is recorded again with them,
@@ -95,37 +106,35 @@ public:
 	}
 	bool RecordingTimestamps() const noexcept { return m_recordingTimestamps.load(std::memory_order_acquire); }
 	// Diagnostics: the external queue boundary's entry and exit barriers in place of Desc::queueBoundary's, from the next build
-	// (dropping them is unsafe: the graph's first and last accesses are then unordered against the host's work).
+	// (dropping them is unsafe: the graphs' first and last accesses are then unordered against the host's work).
 	void SetQueueBoundary(RenderGraph::ExternalQueueBoundary boundary) noexcept {
 		m_boundaryEntry.store(boundary.entry, std::memory_order_release);
 		m_boundaryExit.store(boundary.exit, std::memory_order_release);
 		m_boundaryOverridden.store(true, std::memory_order_release);
 		RequestRebuild();
 	}
-	// Schedule introspection (RenderGraph::SetScheduleTraceEnabled) on the graph and on every graph built after it, so it
-	// survives rebuilds. Host thread (it reads the current graph); read the snapshots through Graph().
+	// Schedule introspection (RenderGraph::SetScheduleTraceEnabled) on every graph and on every graph built after, so it
+	// survives rebuilds. Host thread (it reads the current graphs); read the snapshots through Graph(epoch).
 	void SetScheduleTraceEnabled(bool enabled) noexcept {
 		m_scheduleTrace.store(enabled, std::memory_order_release);
-		if (m_graph) m_graph->SetScheduleTraceEnabled(enabled);
+		for (auto& instance : m_instances)
+			if (instance.graph) instance.graph->SetScheduleTraceEnabled(enabled);
 	}
 	bool ScheduleTraceEnabled() const noexcept { return m_scheduleTrace.load(std::memory_order_acquire); }
-	// Desc::queueScopedUploads, from the next SubmitEpoch on (any thread; for A/B comparisons).
-	void SetQueueScopedUploads(bool enabled) noexcept { m_queueScopedUploads.store(enabled, std::memory_order_release); }
-	bool QueueScopedUploads() const noexcept { return m_queueScopedUploads.load(std::memory_order_acquire); }
 
 	// Explicit builds: a rebuild requested (an extension added or removed, RequestRebuild) waits for the caller's build point,
-	// BuildIfRequested; until then every execution, submission and preparation runs the graph as built, whose extensions keep
+	// BuildIfRequested; until then every execution, submission and preparation runs the graphs as built, whose extensions keep
 	// the state they were made with. For a caller that decides once a frame what its recordings cover (RequestEpochRecording,
 	// UseEpochRecording): a recording of the current build stays its tickets' until that point. Without, the next execution or
-	// submission builds (the default). A graph is built whenever there is none.
+	// submission of an epoch builds its graph (the default). A graph is built whenever there is none.
 	void SetExplicitBuilds(bool explicitBuilds) noexcept { m_explicitBuilds = explicitBuilds; }
-	// Owner thread: builds the graph again when a rebuild was requested (or there is none), async epochs stopped and restarted
-	// around it; true when it built.
+	// Owner thread: builds every graph whose rebuild was requested (or that has none); true when it built one. With async epochs,
+	// the other epochs keep their tickets.
 	bool BuildIfRequested();
 	// A rebuild was requested and has not been built (with explicit builds, until BuildIfRequested).
-	bool RebuildRequested() const noexcept { return m_rebuildRequested; }
+	bool RebuildRequested() const noexcept;
 
-	// Runs after any rebuild and before the frame is prepared, with the graph's upload
+	// Runs after any rebuild and before the frame is prepared, with the graphs' upload
 	// and descriptor services active: the place to queue this frame's uploads
 	// (BUFFER_UPLOAD) into graph resources.
 	using FrameCallback = std::function<void(RenderGraph&)>;
@@ -148,21 +157,19 @@ public:
 
 	// Builds if needed, then prepares and submits one frame. hostData is visible to
 	// passes through PassPrepareContext::preparationData for this frame only.
-	// With an epoch, only that epoch's passes (and untagged ones) are prepared,
-	// admitted, recorded and submitted: the graph was compiled once for the whole
-	// host frame, and this is one execution split of it.
+	// With an epoch, that epoch's graph runs (its passes and the untagged ones); without, the first graph.
 	void ExecuteFrame(const IHostExecutionData* hostData = nullptr, const FrameCallback& beforePrepare = {},
 		uint32_t epoch = UINT32_MAX, std::shared_ptr<const void> resourceOwner = {});  // persistent::AllEpochs
 
-	// Retires the current graph: stops frame production and waits for its work.
+	// Retires every graph: stops frame production and waits for their work.
 	void DestroyGraph();
 
 	// Async epochs. The host prepares each listed epoch's execution ahead of time, as a ticket
 	// (RenderGraph::PreparePersistentTicket), on a thread of its own - which from then on is the only thread
-	// that touches the graph: it waits for frame slots, prepares, admits and records tickets, completes them
+	// that touches the graphs: it waits for frame slots, prepares, admits and records tickets, completes them
 	// in submission order and retires finished work. The render thread calls SubmitEpoch instead of
-	// ExecuteFrame. Requires Desc::closedExecutions. Empty stops it (and waits for the thread); a rebuild
-	// stops and restarts it.
+	// ExecuteFrame. Each ticket is admitted when it is submitted, open or closed. Empty stops it (and waits for the thread); an
+	// epoch's rebuild pauses that epoch alone.
 	// revisionEpochs (a subset of epochs): recorded ahead for a revision (RequestEpochRecording) and submitted with that
 	// recording (SubmitEpoch's recording). Their tickets carry the admission alone; nothing about them is recorded or prepared
 	// again at submission. They need Desc::reuseRecordings' replayable recordings.
@@ -173,13 +180,13 @@ public:
 	 * SubmitEpoch submits nothing for them. Their uploads are recorded into a secondary list, the execution is taken with
 	 * TakeExternalExecution, and the caller's submission of its buffer waits for and signals what the execution names. Every
 	 * pass of theirs runs on the graphics queue, and their uploads must be plain copies (no producer-recorded lists, no
-	 * queue-scoped uploads). Stops and restarts the async epochs; kept across rebuilds.
+	 * queue-scoped uploads). The epochs that change are built again (RequestRebuild(epoch)); kept across rebuilds.
 	 */
 	void SetExternalEpochs(std::vector<uint32_t> epochs);
 	/**
 	 * @brief Submitting thread, after SubmitEpoch of an external epoch: its execution (null: none since the last call). The caller
 	 * must execute it (ExternalEpochExecution::Execute) in a command buffer whose submission waits for its waits and signals its
-	 * signals, or signal it unexecuted: the graph's later work on its timelines waits for those signals.
+	 * signals, or signal it unexecuted: the graphs' later work on their timelines waits for those signals.
 	 */
 	std::shared_ptr<ExternalEpochExecution> TakeExternalExecution() noexcept { return std::move(m_externalExecution); }
 	/**
@@ -197,15 +204,15 @@ public:
 		uint32_t firstSlot = 0;
 		std::vector<std::shared_ptr<const RenderGraph::PersistentRecording>> slots;  // by ring position
 		std::shared_ptr<const IHostExecutionData> revision;  // what it was recorded for
-		uint64_t buildGeneration = 0;  // the build it was recorded on (BuildGeneration): no later build's tickets take it
+		uint64_t buildGeneration = 0;  // its epoch's build it was recorded on (BuildGeneration(epoch)): no later build's tickets take it
 	};
 	using EpochRecordingCallback = std::function<void(std::shared_ptr<const EpochRecording>, std::exception_ptr)>;
-	// The error a request's done gets when it was dropped unrecorded: a build stopped the host's thread first (BuildIfRequested,
-	// SetAsyncEpochs, DestroyGraph). Nothing was recorded for it; the caller asks again for the graph as built now, once.
+	// The error a request's done gets when it was dropped unrecorded: its epoch's graph was built again, or the host's thread stopped
+	// (SetAsyncEpochs, DestroyGraph). Nothing was recorded for it; the caller asks again for the graph as built now, once.
 	struct EpochRecordingDropped : std::runtime_error {
 		explicit EpochRecordingDropped(uint64_t generation)
 			: std::runtime_error("an epoch recording request was dropped by a graph build"), buildGeneration(generation) {}
-		uint64_t buildGeneration = 0;  // the build current when it was dropped (BuildGeneration)
+		uint64_t buildGeneration = 0;  // its epoch's build current when it was dropped (BuildGeneration(epoch))
 	};
 	// Any thread, lock-free, safe across a build: records the revision-driven epoch for hostData (what its passes prepare for: the
 	// revision) on the host's thread, into every slot of its ring once the slot's last work is done (the host's thread waits for
@@ -213,7 +220,7 @@ public:
 	// host's own lifetime, never through the async state a build replaces; the host's thread takes it whole, in posting order.
 	// done runs exactly once: on the host's thread once every slot is recorded (the recording carries the build it was recorded on,
 	// EpochRecording::buildGeneration), or with the error that stopped it (an epoch that is not an async one is one), or with
-	// EpochRecordingDropped when a build stopped the host's thread before it was recorded (on the thread that built). False only
+	// EpochRecordingDropped when its epoch's graph was built again, or the host's thread stopped, before it was recorded. False only
 	// when async epochs were never started or are off (SetAsyncEpochs with none): done is not called then. A live (not
 	// revision-driven) async epoch's is made the same way (a slot its live ticket holds once that ticket is submitted, a slot with
 	// work in flight once it completes) and admitted beside its tickets' own preparations, while held: the submitting thread may
@@ -224,9 +231,9 @@ public:
 	// holds, so one requested for an epoch the caller stopped submitting completes only once the caller gives that ticket back. False
 	// when no ticket was ready (or the mailbox is full: it stays).
 	bool ReleaseEpochTicket(uint32_t epoch);
-	// Submits the epoch at the current point of the host's queue stream. Waits for its ticket if the host's
-	// thread has not finished it; runs beforeSubmit with the graph's services active and CurrentFrameSlot()
-	// the ticket's slot (write latches and queue uploads there); has the ticket prepared again (and waits)
+	// Submits the epoch at the current point of the host's queue stream. Builds the epoch's graph first when its rebuild is due.
+	// Waits for its ticket if the host's thread has not finished it; runs beforeSubmit with the graphs' services active and
+	// CurrentFrameSlot() the ticket's slot (write latches and queue uploads there); has the ticket prepared again (and waits)
 	// if a pass would now prepare differently; records the uploads queued since the last submission; and
 	// hands both to the queue - timeline values are assigned here, in submission order. Throws when the
 	// graph failed (on either thread).
@@ -245,92 +252,14 @@ public:
 	// for one recorded for a graph since rebuilt, other bindings, or another backing version. A caller that writes values into what
 	// the recording reads decides by this before writing, so SubmitEpoch never throws for it.
 	bool CanUseEpochRecording(const EpochRecording& recording, std::string* why = nullptr) const;
-	// Owner thread: moves with every graph build (an extension added or removed, applied at the next submission): a recording
-	// (RequestEpochRecording) is of the build it was made on, and no later one's tickets take it.
+	// Owner thread: moves with every graph build, of any epoch.
 	uint64_t BuildGeneration() const noexcept { return m_buildGeneration; }
-	// Owner thread: whether a recording is of the graph as built now - with explicit builds, what decides before a frame's
+	// Owner thread: moves with every build of the epoch's graph: a recording (RequestEpochRecording) is of the build it was made on,
+	// and no later one's tickets take it. 0 for an epoch the host does not have.
+	uint64_t BuildGeneration(uint32_t epoch) const noexcept;
+	// Owner thread: whether a recording is of its epoch's graph as built now - with explicit builds, what decides before a frame's
 	// submissions whether they can take it (until the next BuildIfRequested).
-	bool EpochRecordingCurrent(const EpochRecording& recording) const noexcept { return m_graph && recording.buildGeneration == m_buildGeneration; }
-	// A render-thread snapshot of complete, current tickets for all required
-	// epochs. The async worker never removes ticket cells; only this render
-	// thread can consume them. It also retains one control-mailbox credit per
-	// unsubmitted epoch; Clear (or destruction) releases unused credits. Retaining
-	// a ticket does not reserve a future graph rebuild or make arbitrary
-	// beforeSubmit mutations compatible.
-	class FrameTicketReservation {
-		friend class GraphHost;
-	public:
-		FrameTicketReservation() = default;
-		~FrameTicketReservation() { Clear(); }
-		FrameTicketReservation(const FrameTicketReservation&) = delete;
-		FrameTicketReservation& operator=(const FrameTicketReservation&) = delete;
-		FrameTicketReservation(FrameTicketReservation&& other) noexcept { *this = std::move(other); }
-		FrameTicketReservation& operator=(FrameTicketReservation&& other) noexcept {
-			if (this != &other) {
-				Clear();
-				tickets = std::move(other.tickets);
-				generation = std::exchange(other.generation, 0);
-				controlCredits = std::move(other.controlCredits);
-				heldCredits = std::exchange(other.heldCredits, 0);
-				resourceOwner = std::move(other.resourceOwner);
-			}
-			return *this;
-		}
-		void Clear() {
-			if (controlCredits && heldCredits) controlCredits->fetch_sub(heldCredits, std::memory_order_relaxed);
-			controlCredits.reset();
-			heldCredits = 0;
-			tickets.clear();
-			resourceOwner.reset();
-			generation = 0;
-		}
-		bool Empty() const { return tickets.empty(); }
-		// Retain immutable resource bindings from ownership selection through every
-		// submitted ticket. The owner itself handles cleanup-lane final release.
-		void HoldResources(std::shared_ptr<const void> owner) { resourceOwner = std::move(owner); }
-	private:
-		struct Entry { uint32_t epoch = 0; std::shared_ptr<RenderGraph::PersistentTicket> ticket; };
-		std::vector<Entry> tickets;
-		uint64_t generation = 0;
-		std::shared_ptr<std::atomic<uint32_t>> controlCredits;
-		uint32_t heldCredits = 0;
-		std::shared_ptr<const void> resourceOwner;
-	};
-	// Returns false immediately when any ticket is absent/stale, a rebuild is
-	// pending, or the async host is unavailable. Leaves destination empty on
-	// failure; no graph build, ticket wait, or inline preparation occurs.
-	bool TryReserveReadyEpochs(std::span<const uint32_t> epochs, FrameTicketReservation& destination);
-	// Consumes one exact ticket from the reservation, with no ticket wait or
-	// reprepare. BeforeSubmit may patch latches/uploads but must not invalidate
-	// ticket invocation revisions; doing so throws instead of skipping a draw.
-	bool TrySubmitReservedEpoch(FrameTicketReservation& reservation, uint32_t epoch, const FrameCallback& beforeSubmit = {});
-	// Render-thread producer, nonblocking admission. The callback must own every
-	// input it uses; it runs on the graph-owning async thread with upload and
-	// descriptor services active, outside an epoch callback. False means the
-	// bounded mailbox is full or async epochs are unavailable; the caller retains
-	// its request for retry. A callback exception faults the async host.
-	bool TryPostOwnedPreparation(FrameCallback& request);
-	// A change of graph resources' backings (Buffer::ResizeBytes, ResizeStructured) from the submitting thread. With async
-	// epochs the host's thread captures every slot's backing as it prepares a ticket, and capture and backing mutation must
-	// not overlap (BackedResource): a resize has no backing between releasing the old one and creating the new one, and a
-	// capture then binds nothing, or materializes the buffer itself. The scope waits for a preparation in progress to end,
-	// holds the next one off until it closes, and lets this thread change backings (BufferBase::ScopedBackingMutation);
-	// every ticket prepared before it is prepared again when submitted. Without async epochs it only opens the mutation
-	// scope. Held around the change itself, never across a ticket wait; nests.
-	class BackingMutation {
-	public:
-		BackingMutation(BackingMutation&& other) noexcept;
-		BackingMutation& operator=(BackingMutation&&) = delete;
-		BackingMutation(const BackingMutation&) = delete;
-		BackingMutation& operator=(const BackingMutation&) = delete;
-		~BackingMutation();
-
-	private:
-		friend class GraphHost;
-		explicit BackingMutation(GraphHost* host);
-		GraphHost* m_host = nullptr;
-	};
-	[[nodiscard]] BackingMutation MutateBackings();
+	bool EpochRecordingCurrent(const EpochRecording& recording) const noexcept;
 	// Submitting thread: a versioned buffer (VersionedBuffer) published a new version. Nothing changed in place, so nothing waits;
 	// a ticket prepared before resolved the old version and is not current (it is prepared again, or takes a kept recording).
 	// Revision-driven epochs need no call: their recordings resolve the versions their revisions name.
@@ -346,27 +275,35 @@ public:
 		// and batches off the graphics queue spared the wait for the graphics queue's uploads (they use nothing those write).
 		uint64_t queueUploadCopies = 0, sparedUploadWaits = 0;
 		uint64_t wakesSkipped = 0;  // submissions whose completion the host's thread took at a GPU wake-up instead of a signal
-		uint64_t backingMutations = 0;  // BackingMutation scopes opened while async epochs ran
-		uint64_t backingWaits = 0;      // of them, those that found a ticket preparation in progress and waited it out
-		uint64_t preparationWaits = 0;  // ticket preparations the host's thread held off for a scope
-		uint64_t staleBacking = 0;      // tickets prepared again only because a backing changed since their preparation
+		uint64_t staleBacking = 0;  // tickets prepared again only because a new version was published since their preparation
+		uint64_t rebuilds = 0;      // epoch graphs built again (an epoch's rebuild, or every graph's)
 		// Desc::reuseRecordings: tickets recorded, recordings kept, tickets that took a kept recording instead of recording,
 		// and stale tickets made current by a kept recording (not prepared again).
 		uint64_t recorded = 0, kept = 0, reused = 0, adopted = 0;
+		// Tickets admitted with their prediction's plan, and those planned against the ledgers (RenderGraph::PersistentRecordingStats).
+		uint64_t predicted = 0, planned = 0;
 		// Revision-driven epochs: slots recorded for requests (RequestEpochRecording), requests completed, and submissions of a
 		// revision's recording.
 		uint64_t revisionSlotsRecorded = 0, revisionRecordings = 0, revisionSubmissions = 0;
 	};
 	AsyncStats TakeAsyncStats() noexcept;
 
-	RenderGraph* Graph() noexcept { return m_graph.get(); }
+	// The first epoch's graph (the only one without epochs), null before the first build. Services (uploads, descriptors,
+	// readbacks, statistics) are the runtime's, the same in every graph.
+	RenderGraph* Graph() noexcept { return m_instances.empty() ? nullptr : m_instances.front().graph.get(); }
+	// The epoch's graph, null for an epoch the host does not have or before its build. Diagnostics and schedule snapshots.
+	RenderGraph* Graph(uint32_t epoch) noexcept;
+	// Every graph, in epoch order (null entries before their builds), and the epoch of each.
+	size_t GraphCount() const noexcept { return m_instances.size(); }
+	RenderGraph* GraphAt(size_t index) noexcept { return index < m_instances.size() ? m_instances[index].graph.get() : nullptr; }
+	uint32_t EpochAt(size_t index) const noexcept { return index < m_instances.size() ? m_instances[index].epoch : UINT32_MAX; }
 	/** @brief The device the host was made with (Desc::device), e.g. for a producer recording its uploads ahead (StagedUploadBatch::Record). */
 	rhi::Device Device() const noexcept { return m_device; }
 	Runtime& GetRuntime() const noexcept { return *m_desc.runtime; }
 	/** @brief The device-generation cleanup lane used for immutable binding roots. */
 	std::shared_ptr<runtime::ResourceCleanupQueue> ResourceCleanup() const;
 	runtime::IUploadService* Uploads() noexcept;
-	// Owner thread: the graph's descriptor service (its resource and sampler heaps: what a recording binds), null without a graph.
+	// Owner thread: the graphs' descriptor service (its resource and sampler heaps: what a recording binds), null without a graph.
 	runtime::IDescriptorService* Descriptors() noexcept;
 	// The same, kept alive by the caller: a producer on another thread (growth as graph work, its worker upload path).
 	std::shared_ptr<runtime::IUploadService> RetainUploads() noexcept;
@@ -424,7 +361,7 @@ public:
 
 	// The frame-wait timeline (RenderGraph::SetFrameWaitTimeline): a host producer of per-frame values signals it once per frame,
 	// after the values it wrote for that frame, and every batch submitted from then on waits for SetFrameWaitValue's value. Set
-	// once, before the frames that wait; set on a built graph, the graph is built again (packets prepared before cannot wait).
+	// once, before the frames that wait; set on built graphs, they are built again (packets prepared before cannot wait).
 	void SetFrameWaitTimeline(std::shared_ptr<rhi::TimelinePtr> timeline);
 	// Submitting thread: what every batch submitted from now on waits for (0: nothing). The producer must signal it: the waits
 	// are on the GPU, and a value never signalled stalls the queue.
@@ -446,8 +383,8 @@ public:
 		bool async = false;
 		double ticketWaitUs = 0.0;     // waiting for the ticket (zero when it was ready)
 		double checkUs = 0.0;          // checking it is current, and preparing it again when not
-		double uploadsUs = 0.0;        // recording the queued uploads
-		double submitUs = 0.0;         // handing the uploads and the ticket to the queue
+		double uploadsUs = 0.0;        // admitting the ticket and recording the queued uploads
+		double submitUs = 0.0;         // handing the uploads and the ticket to the queue, and committing it
 		double postUs = 0.0;           // handing the submitted ticket back to the host's thread (its completion)
 		RenderGraph::PersistentExecuteTimings execute{};
 	};
@@ -455,9 +392,38 @@ public:
 	const Desc& GetDesc() const noexcept { return m_desc; }
 
 private:
-	void Build();
-	// The graph is to be built before an execution or submission: there is none, or a rebuild was requested without explicit builds.
-	bool BuildDue() const noexcept { return !m_graph || (m_rebuildRequested && !m_explicitBuilds); }
+	// One epoch's graph (the only one, of every pass, without epochs).
+	struct Instance {
+		uint32_t epoch = UINT32_MAX;  // persistent::AllEpochs without epochs
+		std::unique_ptr<RenderGraph> graph;
+		bool rebuildRequested = true;
+		uint64_t buildGeneration = 0;  // BuildGeneration(epoch)
+	};
+	// A graph an epoch's rebuild replaced, released once the work it submitted is done.
+	struct RetiredGraph {
+		std::unique_ptr<RenderGraph> graph;
+		GpuPoint done;
+	};
+	static constexpr size_t kNoInstance = ~size_t{0};
+	size_t InstanceOf(uint32_t epoch) const noexcept;
+	// The first graph built, null with none: what the runtime's services are reached through on the owner thread.
+	RenderGraph* AnyGraph() const noexcept;
+	// The epoch's graph is to be built before an execution or submission: there is none, or a rebuild was requested without
+	// explicit builds.
+	bool BuildDue(size_t index) const noexcept {
+		const auto& instance = m_instances[index];
+		return !instance.graph || (instance.rebuildRequested && !m_explicitBuilds);
+	}
+	bool AnyBuildDue() const noexcept;
+	// Owner thread, the instance not in the host's thread's hands (async epochs stopped, or the host's thread holding): builds its graph
+	// anew. The one it replaces goes to the retired graphs (wait: or is released here, after its own slots' work).
+	void BuildInstance(size_t index, bool wait);
+	// Owner thread: builds every instance BuildDue names (all: every one requested, explicit builds or not).
+	bool BuildDueInstances(bool all);
+	// Releases the retired graphs whose work is done (all: waits for the rest).
+	void ReleaseRetiredGraphs(bool all);
+	// Host-owned queue timelines, made at the first build: graphics, compute, copy.
+	void EnsureTimelines();
 
 	Desc m_desc;
 	rhi::Device m_device;
@@ -467,22 +433,21 @@ private:
 		ExtensionFactory factory;
 	};
 	std::vector<Registered> m_extensions;
-	std::unique_ptr<RenderGraph> m_graph;
-	// A slot's last frame: the value each queue's own timeline reached with that frame's last batch.
-	// Waiting on those gates the slot's reuse; the host adds no submission of its own. Queue timelines
-	// belong to the graph, so a rebuild (which waits for the device) clears them.
+	std::vector<Instance> m_instances;  // by Desc::epochOrder (one without epochs)
+	std::vector<RetiredGraph> m_retiredGraphs;
+	std::vector<SharedQueueTimeline> m_timelines;  // EnsureTimelines
+	// A slot's last frame: the value each queue's timeline reached with that frame's last batch.
+	// Waiting on those gates the slot's reuse; the host adds no submission of its own.
 	struct SlotCompletion {
-		std::vector<std::pair<rhi::Timeline*, uint64_t>> points;
+		std::vector<std::pair<std::shared_ptr<rhi::TimelinePtr>, uint64_t>> points;
 		uint64_t frameNumber = 0;
 		uint64_t submission = 0;  // its number (SubmissionsMade)
 		bool pending = false;
 	};
 	std::vector<SlotCompletion> m_slotCompletions;
-	bool m_rebuildRequested = true;
 	std::atomic<bool> m_recordingTimestamps{false};
 	std::atomic<bool> m_boundaryOverridden{false}, m_boundaryEntry{false}, m_boundaryExit{false};
 	std::atomic<bool> m_scheduleTrace{false};
-	std::atomic<bool> m_queueScopedUploads{true};  // SetQueueScopedUploads; Desc::queueScopedUploads at construction
 	bool m_explicitBuilds = false;
 	uint64_t m_frameNumber = 0;
 	CompletedFrameCallback m_completedFrame;
@@ -494,7 +459,6 @@ private:
 	uint64_t m_lastHostFrame = 0;
 	std::shared_ptr<rhi::TimelinePtr> m_frameWaitTimeline;  // SetFrameWaitTimeline
 	uint64_t m_frameWaitValue = 0;
-	uint64_t m_ticketGeneration = 0;
 	uint64_t m_buildGeneration = 0;
 	struct Async;
 	std::unique_ptr<Async> m_async;
@@ -504,7 +468,6 @@ private:
 	std::unique_ptr<RecordingQueue> m_recordingQueue;
 	std::unique_ptr<rhi::CompletionWait> m_completionWake;
 	bool m_ending = false;  // the destructor: requests still queued are dropped without their callbacks
-	uint32_t m_backingMutationDepth = 0;  // submitting thread: open BackingMutation scopes
 	// A failed/uncertain GPU completion cannot release submitted owners during
 	// a graph rebuild. Keep them until device teardown has stopped execution.
 	std::vector<std::shared_ptr<const void>> m_uncertainExecutionOwners;
@@ -534,14 +497,19 @@ private:
 	AsyncStats m_asyncStats{};
 	void StartAsync();
 	void StopAsync();
+	// Owner thread, async epochs running: the instances are given back by the host's thread (their tickets abandoned, their recording
+	// requests dropped), which holds still while they are built again, and handed back. The other epochs keep their tickets.
+	void RebuildAsyncInstances(std::span<const size_t> indices);
+	// Owner thread, async epochs running: the host's thread lets go of the instances to detach and holds still while work runs on
+	// this thread (a build, a retired graph's release: both change services every graph shares).
+	void HoldAsync(std::span<const size_t> detach, const std::function<void()>& work);
 	void PrepareTicket(Async& state, uint32_t epochIndex, int32_t requestedSlot);
 	void WaitSlot(Async& state, uint32_t slot);
 	bool AdvanceRecordingRequests(Async& state);
 	// Host thread: admits the recording of the ticket's slot as one of the revision ticket's candidates.
-	void AddRevisionCandidate(Async& state, RenderGraph::PersistentTicket& ticket, const EpochRecording& recording);
+	void AddRevisionCandidate(Async& state, uint32_t epochIndex, RenderGraph::PersistentTicket& ticket, const EpochRecording& recording);
 	void SubmitTicket(Async& state, uint32_t epochIndex, std::shared_ptr<RenderGraph::PersistentTicket> ticket,
-		const FrameCallback& beforeSubmit, bool allowReprepare, FrameTicketReservation* reservation = nullptr,
-		std::shared_ptr<const void> resourceOwner = {}, std::shared_ptr<const EpochRecording> recording = {});
+		const FrameCallback& beforeSubmit, std::shared_ptr<const void> resourceOwner = {}, std::shared_ptr<const EpochRecording> recording = {});
 };
 
 } // namespace org

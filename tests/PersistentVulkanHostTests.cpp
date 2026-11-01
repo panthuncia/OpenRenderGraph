@@ -362,21 +362,29 @@ class HostExtension final : public org::RenderGraph::IRenderGraphExtension {
 public:
 	HostExtension(std::shared_ptr<org::Buffer> input, std::shared_ptr<org::Buffer> scratch,
 		std::shared_ptr<org::ExternalBufferResource> output, std::shared_ptr<const ComputeProgram> program,
-		std::shared_ptr<std::atomic<uint64_t>> outputRevision, std::shared_ptr<const org::VersionedBuffer> versions = {}, bool lateCopy = false)
+		std::shared_ptr<std::atomic<uint64_t>> outputRevision, std::shared_ptr<const org::VersionedBuffer> versions = {}, bool lateCopy = false,
+		bool splitEpochs = false)
 		: m_input(std::move(input)), m_scratch(std::move(scratch)), m_output(std::move(output)), m_program(std::move(program)),
-		m_outputRevision(std::move(outputRevision)), m_versions(std::move(versions)), m_lateCopy(lateCopy) {}
+		m_outputRevision(std::move(outputRevision)), m_versions(std::move(versions)), m_lateCopy(lateCopy), m_splitEpochs(splitEpochs) {}
 	void PrepareForBuild(org::RenderGraph& graph) override {
 		graph.RegisterResource(org::ResourceIdentifier("test.input"), m_input);
 		graph.RegisterResource(org::ResourceIdentifier("test.scratch"), m_scratch);
 		graph.RegisterResource(org::ResourceIdentifier("test.host-output"), m_output);
 	}
 	void GatherStructuralPasses(org::RenderGraph&, std::vector<org::RenderGraph::ExternalPassDesc>& out) override {
-		out.push_back(org::RenderGraph::ExternalPassDesc::Compute("test.write",
+		auto write = org::RenderGraph::ExternalPassDesc::Compute("test.write",
 			std::static_pointer_cast<org::RenderPass>(std::make_shared<WritePass>(m_input, m_scratch, m_program, m_versions)))
-			.PreferQueue(org::QueueKind::Graphics));
+			.PreferQueue(org::QueueKind::Graphics);
 		auto copy = org::RenderGraph::ExternalPassDesc::Copy("test.copy-to-host",
 			std::static_pointer_cast<org::RenderPass>(std::make_shared<CopyToHostPass>(m_scratch, m_output, m_outputRevision, m_versions)))
 			.PreferQueue(org::QueueKind::Graphics);
+		// "split": the write in epoch 0, the copy in epoch 1, so each is a graph of its own and the scratch buffer goes from one
+		// to the other through the runtime's ledgers.
+		if (m_splitEpochs) {
+			write.Epoch(0);
+			copy.Epoch(1);
+		}
+		out.push_back(std::move(write));
 		// In "external" mode, the host's execution of the epoch records this pass, after the write pass's secondary command
 		// buffer.
 		if (m_lateCopy) copy.RecordAtExecution();
@@ -390,6 +398,7 @@ private:
 	std::shared_ptr<std::atomic<uint64_t>> m_outputRevision;
 	std::shared_ptr<const org::VersionedBuffer> m_versions;
 	bool m_lateCopy = false;
+	bool m_splitEpochs = false;
 };
 
 std::shared_ptr<ComputeProgram> CreateProgram(rhi::Device device) {
@@ -441,6 +450,11 @@ static int Run(int argc, char** argv) {
 	const bool contributor = argc > 1 && std::strcmp(argv[1], "contributor") == 0;
 	// "rebinding": slots that start or stop sharing a backing (RebindingGpuTests.cpp) instead of the graph scenario.
 	const bool rebinding = argc > 1 && std::strcmp(argv[1], "rebinding") == 0;
+	// "split": a host of two epochs, each its own graph: the write pass in the first and the copy to the host buffer in the
+	// second (SplitEpochsScenario).
+	const bool split = argc > 1 && std::strcmp(argv[1], "split") == 0;
+	// "open" after the mode: async epochs on open executions, admitted at submission (no closed executions).
+	const bool open = argc > 2 && std::strcmp(argv[2], "open") == 0;
 	HostDevice host;
 	if (const int created = CreateHostDevice(host); created != 0) {
 		std::puts(created == 77 ? "SKIP: no Vulkan device with VK_EXT_descriptor_heap" : "FAIL: host device");
@@ -478,6 +492,69 @@ static int Run(int argc, char** argv) {
 			runtime.reset();
 			if (line) std::printf("FAIL: rebinding (line %d)\n", line);
 			REQUIRE(line == 0, "rebinding");
+		} else if (split) {
+			auto runtime = org::Runtime::Create({.device = device.Get(), .backend = rhi::Backend::Vulkan, .slots = 4,
+				.tasks = std::make_shared<org::runtime::ThreadPoolTaskService>(2)});
+			{
+				org::GraphHost host({.runtime = runtime, .queueBoundary = {.entry = true, .exit = true}, .framesInFlight = 2, .epochOrder = {0, 1},
+					.closedExecutions = !open});
+				auto program = CreateProgram(device.Get());
+				REQUIRE(program, "compute program");
+				auto scratch = org::Buffer::CreateSharedUnmaterialized(rhi::HeapType::DeviceLocal, kBytes, true);
+				org::BufferBase::DescriptorRequirements requirements{};
+				requirements.createUAV = true;
+				requirements.uavDesc = {.dimension = rhi::UavDim::Buffer, .formatOverride = rhi::Format::R32_Typeless,
+					.buffer = {.kind = rhi::BufferViewKind::Raw, .firstElement = 0, .numElements = kCount}};
+				scratch->SetDescriptorRequirements(requirements);
+				scratch->SetName("test.scratch");
+				auto output = ImportHostBuffer(device.Get(), first, "test.host-output.first");
+				REQUIRE(output, "import host buffer");
+				auto input = org::Buffer::CreateSharedUnmaterialized(rhi::HeapType::DeviceLocal, 16, false);
+				org::BufferBase::DescriptorRequirements inputViews{};
+				inputViews.createSRV = true;
+				inputViews.srvDesc = {.dimension = rhi::SrvDim::Buffer, .formatOverride = rhi::Format::R32_Typeless,
+					.buffer = {.kind = rhi::BufferViewKind::Raw, .firstElement = 0, .numElements = 4}};
+				input->SetDescriptorRequirements(inputViews);
+				input->SetName("test.input");
+				uint32_t value = 0;
+				const auto upload = [&](org::RenderGraph&) {
+					BUFFER_UPLOAD(&value, sizeof(value), org::runtime::UploadTarget::FromShared(input), 0);
+				};
+				auto outputRevision = std::make_shared<std::atomic<uint64_t>>(1);
+				host.AddExtension("test.host", [&] {
+					return std::make_unique<HostExtension>(input, scratch, output, program, outputRevision, nullptr, false, true);
+				});
+				// Synchronous frames: epoch 0 writes, epoch 1 copies what it wrote.
+				for (uint32_t frame = 0; frame < 4; ++frame) {
+					value = 40000u + 10u * frame;
+					host.ExecuteFrame(nullptr, upload, 0);
+					host.ExecuteFrame(nullptr, {}, 1);
+					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "split epochs, synchronous: the second copies what the first wrote");
+				}
+				REQUIRE(host.GraphCount() == 2 && host.Graph(0) && host.Graph(1) && host.Graph(0) != host.Graph(1), "a graph per epoch");
+				// Async epochs, then one epoch built again: the other keeps its graph and its build.
+				host.SetAsyncEpochs({0, 1});
+				for (uint32_t frame = 0; frame < 8; ++frame) {
+					if (frame == 4) host.RequestRebuild(1);
+					const auto builds0 = host.BuildGeneration(0), builds1 = host.BuildGeneration(1);
+					auto* graph0 = host.Graph(0);
+					value = 41000u + 10u * frame;
+					host.SubmitEpoch(0, upload);
+					host.SubmitEpoch(1);
+					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "split epochs, async: the second copies what the first wrote");
+					REQUIRE(host.BuildGeneration(0) == builds0 && host.Graph(0) == graph0, "the first epoch keeps its graph");
+					if (frame == 4) REQUIRE(host.BuildGeneration(1) == builds1 + 1, "only the second epoch was built again");
+				}
+				const auto stats = host.TakeAsyncStats();
+				std::printf("split (%s): %llu submissions, %llu waited, %llu prepared again, %llu rebuilds\n", open ? "open" : "closed",
+					static_cast<unsigned long long>(stats.submitted), static_cast<unsigned long long>(stats.waited),
+					static_cast<unsigned long long>(stats.stale), static_cast<unsigned long long>(stats.rebuilds));
+				REQUIRE(stats.rebuilds == 1, "one epoch rebuild");
+				REQUIRE(!counters.unbalanced && counters.locks.load() == counters.unlocks.load(), "balanced host queue locks");
+				host.SetAsyncEpochs({});
+				host.DestroyGraph();
+			}
+			runtime.reset();
 		} else if (contributor) {
 			auto program = CreateProgram(device.Get());
 			REQUIRE(program, "compute program");
@@ -492,7 +569,7 @@ static int Run(int argc, char** argv) {
 		auto runtime = org::Runtime::Create({.device = device.Get(), .backend = rhi::Backend::Vulkan,
 			.tasks = std::make_shared<org::runtime::ThreadPoolTaskService>(2)});
 		org::GraphHost host({.runtime = runtime,
-			.queueBoundary = {.entry = true, .exit = true}, .epochOrder = {0}, .closedExecutions = async, .reuseRecordings = reuse || revision});
+			.queueBoundary = {.entry = true, .exit = true}, .epochOrder = {0}, .closedExecutions = async && !open, .reuseRecordings = reuse || revision});
 		{
 			auto program = CreateProgram(device.Get());
 			REQUIRE(program, "compute program");
@@ -537,11 +614,6 @@ static int Run(int argc, char** argv) {
 				versions = org::VersionedBuffer::Create(scratch);
 			}
 			host.AddExtension("test.host", [&] { return std::make_unique<HostExtension>(input, scratch, output, program, outputRevision, versions, external); });
-			org::GraphHost::FrameCallback premature = [](org::RenderGraph&) {};
-			REQUIRE(!host.TryPostOwnedPreparation(premature) && premature, "pre-build request stays with caller");
-			org::GraphHost::FrameTicketReservation reservation;
-			const uint32_t requiredEpoch = 0;
-			REQUIRE(!host.TryReserveReadyEpochs({&requiredEpoch, 1}, reservation), "no reservation before async start");
 			if (revision) {
 				host.SetAsyncEpochs({0}, {0});
 				// Records the epoch for a revision of `count` elements; the callback runs on the host's thread.
@@ -913,82 +985,18 @@ static int Run(int argc, char** argv) {
 			}
 			if (!revision && !external) {
 			if (async) host.SetAsyncEpochs({0});
-			std::atomic<uint32_t> ownedRequests{0};
-			std::atomic<bool> ownedServices{false};
-			std::weak_ptr<int> ownedWeak;
 			if (async) {
-				const uint32_t unavailableEpochs[] = {0, 1};
-				REQUIRE(!host.TryReserveReadyEpochs(unavailableEpochs, reservation) && reservation.Empty(),
-					"incomplete epoch set does not consume a control credit");
-				const auto readyDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-				while (!host.TryReserveReadyEpochs({&requiredEpoch, 1}, reservation) && std::chrono::steady_clock::now() < readyDeadline)
-					std::this_thread::yield();
-				REQUIRE(!reservation.Empty(), "initial ticket and control-mailbox credit are reserved");
-				auto ownedValue = std::make_shared<int>(42);
-				ownedWeak = ownedValue;
-				const auto renderThread = std::this_thread::get_id();
-				org::GraphHost::FrameCallback request = [ownedValue, renderThread, &ownedRequests, &ownedServices](org::RenderGraph&) {
-					ownedServices.store(*ownedValue == 42 && std::this_thread::get_id() != renderThread &&
-						org::runtime::GetActiveDescriptorService() != nullptr && org::runtime::GetActiveUploadService() != nullptr);
-					ownedRequests.fetch_add(1);
-				};
-				REQUIRE(host.TryPostOwnedPreparation(request), "owned preparation admitted without a wait");
-				REQUIRE(!request, "accepted request transfers ownership");
-				ownedValue.reset();
-				// Hold the host consumer while filling its bounded mailbox. The
-				// overflow call must return promptly with the request still owned.
-				auto submittedOwner = std::make_shared<int>(73);
-				std::weak_ptr<int> submittedWeak = submittedOwner;
-				reservation.HoldResources(submittedOwner);
-				submittedOwner.reset();
-				std::promise<void> releaseConsumer;
-				auto gate = releaseConsumer.get_future().share();
-				std::atomic<bool> entered{false};
-				org::GraphHost::FrameCallback blocker = [gate, &entered](org::RenderGraph&) {
-					entered.store(true);
-					gate.wait();
-				};
-				const bool blockerAccepted = host.TryPostOwnedPreparation(blocker);
-				const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-				while (!entered.load() && std::chrono::steady_clock::now() < deadline)
-					std::this_thread::yield();
-				bool filled = entered.load();
-				if (filled)
-					for (uint32_t i = 0; i < 63; ++i) {
-						org::GraphHost::FrameCallback filler = [](org::RenderGraph&) {};
-						filled &= host.TryPostOwnedPreparation(filler);
-					}
-				org::GraphHost::FrameCallback overflow = [](org::RenderGraph&) {};
-				const bool refused = filled && !host.TryPostOwnedPreparation(overflow) && static_cast<bool>(overflow);
-				// The worker is still blocked and the mailbox has exactly one free
-				// cell: the reserved frame must spend that cell without waiting.
+				// A submission's owner retires once its work completes, without another frame. This is frame 0's.
 				value = 1000u;
-				const int firstLocksBefore = counters.locks.load();
-				const bool submittedWhileFull = refused && host.TrySubmitReservedEpoch(reservation, 0, upload);
-				releaseConsumer.set_value();
-				REQUIRE(blockerAccepted && filled && refused && submittedWhileFull,
-					"reserved submission uses its control credit while owned-request mailbox is saturated");
-				REQUIRE(counters.locks.load() > firstLocksBefore, "reserved epoch reached host queue despite blocked worker");
-				REQUIRE(!host.TrySubmitReservedEpoch(reservation, 0, upload), "reserved ticket is consumed exactly once");
-				reservation.Clear();
-				// No following frame is needed to release the exact submitted owner:
-				// the host worker observes GPU completion independently of slot reuse.
-				REQUIRE(device->WaitIdle() == rhi::Result::Ok, "wait for submitted owner completion");
+				auto owner = std::make_shared<int>(74);
+				std::weak_ptr<int> ownerWeak = owner;
+				host.SubmitEpoch(0, upload, owner);
+				owner.reset();
+				REQUIRE(device->WaitIdle() == rhi::Result::Ok, "wait for the owned submission");
 				const auto ownerDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-				while (!submittedWeak.expired() && std::chrono::steady_clock::now() < ownerDeadline)
+				while (!ownerWeak.expired() && std::chrono::steady_clock::now() < ownerDeadline)
 					std::this_thread::yield();
-				REQUIRE(submittedWeak.expired(), "submitted owner retires without another frame");
-				// DCLF still uses the legacy ticket path. It needs the same
-				// completion lifetime as a nonblocking reservation.
-				auto legacyOwner = std::make_shared<int>(74);
-				std::weak_ptr<int> legacyWeak = legacyOwner;
-				host.SubmitEpoch(0, upload, legacyOwner);
-				legacyOwner.reset();
-				REQUIRE(device->WaitIdle() == rhi::Result::Ok, "wait for legacy owned submission");
-				const auto legacyDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-				while (!legacyWeak.expired() && std::chrono::steady_clock::now() < legacyDeadline)
-					std::this_thread::yield();
-				REQUIRE(legacyWeak.expired(), "legacy submission owner retires without another frame");
+				REQUIRE(ownerWeak.expired(), "a submission's owner retires without another frame");
 			}
 			for (uint32_t frame = 0; frame < 6; ++frame) {
 				auto syncOwner = !async && frame == 0 ? std::make_shared<int>(91) : std::shared_ptr<int>{};
@@ -1060,23 +1068,14 @@ static int Run(int argc, char** argv) {
 				REQUIRE(alternating.stale == 0 && alternating.adopted >= 6, "warm alternating revisions adopt kept recordings");
 			}
 			if (async) {
-				const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-				while (!host.TryReserveReadyEpochs({&requiredEpoch, 1}, reservation) && std::chrono::steady_clock::now() < deadline)
-					std::this_thread::yield();
-				REQUIRE(!reservation.Empty(), "ticket ready for revision-change test");
-				bool rejectedStale = false;
-				try {
-					(void)host.TrySubmitReservedEpoch(reservation, 0, [&](org::RenderGraph&) {
-						outputRevision->fetch_add(1, std::memory_order_release);
-					});
-				} catch (const std::logic_error&) {
-					rejectedStale = true;
-				}
-				reservation.Clear();
-				REQUIRE(rejectedStale, "post-reservation revision change rejects instead of submitting stale work");
+				// The commit changes what the write pass depends on: the ticket is stale and prepared again, and the frame still
+				// writes its value.
 				value = 6500u;
-				host.SubmitEpoch(0, upload);
-				REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(second, value), "replacement ticket recovers after stale reservation");
+				host.SubmitEpoch(0, [&](org::RenderGraph& graph) {
+					upload(graph);
+					outputRevision->fetch_add(1, std::memory_order_release);
+				});
+				REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(second, value), "a ticket made stale by its commit is prepared again");
 			}
 
 			// A readback capture after a mid-frame pass. It captures the write pass's target as the pass left it. The copy is
@@ -1112,7 +1111,6 @@ static int Run(int argc, char** argv) {
 
 			// A rebuild (e.g. on resize) retires the old graph and keeps rendering.
 			host.RequestRebuild();
-			if (async) REQUIRE(!host.TryReserveReadyEpochs({&requiredEpoch, 1}, reservation), "pending rebuild prevents reservation");
 			value = 7000u;
 			if (async) host.SubmitEpoch(0, upload);
 			else host.ExecuteFrame(nullptr, upload);
@@ -1158,13 +1156,7 @@ static int Run(int argc, char** argv) {
 				REQUIRE(host.SubmittedPoint().Wait(5000) && Matches(second, value), "a frame without a wait");
 				std::printf("frame wait: %s\n", dedicated ? "signalled from the dedicated uploader" : "signalled from another queue");
 			}
-			if (async) {
-				host.SetAsyncEpochs({});
-				REQUIRE(ownedRequests.load() == 1 && ownedServices.load(), "owned preparation ran on host thread with services");
-				REQUIRE(ownedWeak.expired(), "owned request released after completion");
-				org::GraphHost::FrameCallback afterStop = [](org::RenderGraph&) {};
-				REQUIRE(!host.TryPostOwnedPreparation(afterStop) && afterStop, "post-stop request stays with caller");
-			}
+			if (async) host.SetAsyncEpochs({});
 			}
 			host.DestroyGraph();
 		}

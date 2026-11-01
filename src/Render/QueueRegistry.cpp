@@ -1,6 +1,7 @@
 #include "Render/QueueRegistry.h"
 #include "Render/CommandListPool.h"
 
+#include <stdexcept>
 #include <string>
 #include <spdlog/spdlog.h>
 #include <rhi_interop_dx12.h>
@@ -46,7 +47,19 @@ QueueSlotIndex QueueRegistry::Register(QueueSlot slot, rhi::Queue queue, rhi::Ti
 		const std::string fenceName = queueName + " Fence";
 		fence->SetName(fenceName.c_str());
 	}
-	m_slots.push_back({ slot.kind, slot.instance, slot.backendInstance, slot.backend, queue, device, std::make_shared<rhi::TimelinePtr>(std::move(fence)), {}, std::shared_ptr<CommandListPool>(std::move(pool)), autoAssignmentPolicy, ownsQueue, std::string(logicalName), 1 });
+	m_slots.push_back({ slot.kind, slot.instance, slot.backendInstance, slot.backend, queue, device, std::make_shared<rhi::TimelinePtr>(std::move(fence)), {}, std::shared_ptr<CommandListPool>(std::move(pool)), autoAssignmentPolicy, ownsQueue, std::string(logicalName) });
+	return idx;
+}
+
+QueueSlotIndex QueueRegistry::Register(QueueSlot slot, rhi::Queue queue, const SharedQueueTimeline& timeline, rhi::Device& device,
+	QueueAutoAssignmentPolicy autoAssignmentPolicy) {
+	if (!timeline) throw std::invalid_argument("QueueRegistry::Register: an empty shared timeline");
+	const auto idx = Register(slot, queue, rhi::TimelinePtr{}, std::make_unique<CommandListPool>(device, static_cast<rhi::QueueKind>(slot.kind)),
+		autoAssignmentPolicy, false, device);
+	auto& entry = m_slots.back();
+	entry.fence = timeline.fence;
+	entry.fenceValue = timeline.nextValue;
+	entry.sharedTimeline = true;
 	return idx;
 }
 
@@ -83,7 +96,8 @@ rhi::Result QueueRegistry::EnableD3D12VulkanInterop(rhi::Device d3d12Device, rhi
 			slot.fence = std::make_shared<rhi::TimelinePtr>(std::move(vkFence));
 			slot.peerFence = std::move(d3dFence);
 		}
-		slot.fenceValue = 1;
+		slot.fenceValue = std::make_shared<std::atomic<uint64_t>>(1);
+		slot.sharedTimeline = false;
 	}
 	return rhi::Result::Ok;
 #else

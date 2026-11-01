@@ -1270,7 +1270,7 @@ int main() {
             reinterpret_cast<const org::AliasHeapGeneration*>(heapOwner.get()));
         const auto heapIdentity = heap.get();
         const std::weak_ptr<const org::AliasHeapGeneration> heapWeak = heap;
-        auto aliasBackings = frame.backings;
+        auto aliasBackings = std::vector<org::compiler::PreparedBackingState>(frame.backings.begin(), frame.backings.end());
         aliasBackings[0].aliasHeap = heap;
         aliasBackings[0].aliasHeapIdentity = heapIdentity;
         aliasBackings[0].aliasSize = 4096;

@@ -3,6 +3,7 @@
 #include "Render/RenderGraph/GraphCompiler.h"
 #include "Render/RenderGraph/ExecutionState.h"
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -11,6 +12,8 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <tuple>
+#include <unordered_map>
 #include <vector>
 #include <utility>
 #include "Render/PublicationBindingBundle.h"
@@ -193,6 +196,10 @@ public:
     // instead of editing the graph. Nullopt when no binding of the pass has them all.
     std::optional<std::pair<BindingToken, std::vector<ViewToken>>> FindBinding(PassId pass, ResourceSlotId resource,
         std::span<const BindlessViewRequest> views) const;
+    // Its executable's resources' admission states, in compiler resource order and checked against it
+    // (compiler::ValidatePreparedBackingOrder): what every admission of it starts from, and the set's id (AdmissionBackingSet::Id).
+    // Made once, on first use.
+    std::pair<std::shared_ptr<const std::vector<compiler::PreparedBackingState>>, uint64_t> AdmissionBackings() const;
     const uint64_t revision;
     const std::shared_ptr<const ExecutableGeneration> executable;
     const BindingTable bindings;
@@ -207,6 +214,63 @@ private:
         : revision(value), executable(std::move(generation)), bindings(std::move(table)), logical(std::move(program)), source(std::move(base)) {}
     mutable std::mutex m_epochMutex;
     mutable std::vector<std::pair<uint32_t, std::shared_ptr<const SelectedPublication>>> m_epochViews;
+    mutable std::shared_ptr<const std::vector<compiler::PreparedBackingState>> m_admissionBackings;  // m_epochMutex
+    mutable uint64_t m_admissionBackingSet = 0;  // m_epochMutex
+};
+
+// An admission's backings, in compiler resource order: its publication's (SelectedPublication::AdmissionBackings, shared by every
+// admission of it), copied the first time the frame changes one (a rebinding, an incoming state: Mutable).
+class AdmissionBackingSet {
+public:
+    AdmissionBackingSet() = default;
+    AdmissionBackingSet(std::shared_ptr<const std::vector<compiler::PreparedBackingState>> shared, bool validated, uint64_t id = NewId())
+        : m_shared(std::move(shared)), m_id(id), m_validated(validated) {}
+    // A copy shares the backings until either side changes one.
+    AdmissionBackingSet(const AdmissionBackingSet& other) : m_shared(other.m_shared), m_id(other.m_id), m_validated(other.m_validated) {}
+    AdmissionBackingSet& operator=(const AdmissionBackingSet& other) {
+        if (this != &other) { m_shared = other.m_shared; m_owned.reset(); m_id = other.m_id; m_validated = other.m_validated; }
+        return *this;
+    }
+    // Names these backings, never reused: the ledgers find a set's entries once by key, then by index (compiler::detail::
+    // BackingTable::Resolve). A change gives the set a new one.
+    uint64_t Id() const noexcept { return m_id; }
+    static uint64_t NewId() noexcept {
+        static std::atomic<uint64_t> next{1};
+        return next.fetch_add(1, std::memory_order_relaxed);
+    }
+    AdmissionBackingSet(AdmissionBackingSet&&) noexcept = default;
+    AdmissionBackingSet& operator=(AdmissionBackingSet&&) noexcept = default;
+    size_t size() const noexcept { return m_shared ? m_shared->size() : 0; }
+    bool empty() const noexcept { return size() == 0; }
+    const compiler::PreparedBackingState& operator[](size_t index) const { return (*m_shared)[index]; }
+    std::span<const compiler::PreparedBackingState> Span() const noexcept {
+        return m_shared ? std::span<const compiler::PreparedBackingState>(*m_shared) : std::span<const compiler::PreparedBackingState>{};
+    }
+    operator std::span<const compiler::PreparedBackingState>() const noexcept { return Span(); }
+    auto begin() const noexcept { return Span().begin(); }
+    auto end() const noexcept { return Span().end(); }
+    // The backings to change: this set's own copy from now on (no longer checked against the graph's order).
+    std::vector<compiler::PreparedBackingState>& Mutable() {
+        if (!m_owned) {
+            m_owned = std::make_shared<std::vector<compiler::PreparedBackingState>>(
+                m_shared ? *m_shared : std::vector<compiler::PreparedBackingState>{});
+            m_shared = m_owned;
+            m_id = NewId();
+        }
+        m_validated = false;
+        return *m_owned;
+    }
+    // The backings, kept as they are: a change after this copies them again.
+    std::shared_ptr<const std::vector<compiler::PreparedBackingState>> Shared() const {
+        m_owned.reset();
+        return m_shared;
+    }
+    bool Validated() const noexcept { return m_validated; }
+private:
+    std::shared_ptr<const std::vector<compiler::PreparedBackingState>> m_shared;
+    mutable std::shared_ptr<std::vector<compiler::PreparedBackingState>> m_owned;  // m_shared, while only this set has it
+    uint64_t m_id = 0;
+    bool m_validated = false;
 };
 
 // Build may run on a worker. Installation is an O(1) revision check. A rejected
@@ -367,13 +431,19 @@ std::shared_ptr<const SelectedPublication> BuildExternalPublication(const GraphP
 struct FrameAdmission {
     uint64_t sequence = 0, domain = 0;
     std::shared_ptr<const SelectedPublication> publication;
-    std::vector<compiler::PreparedBackingState> backings;
+    AdmissionBackingSet backings;
+    // The barrier plan: its own, or (sharedBarriers) a prediction's, shared with it (Barriers).
     compiler::PreparedExecutionBarrierPlan barriers;
+    std::shared_ptr<const compiler::PreparedExecutionBarrierPlan> sharedBarriers;
+    // An entry-only admission's prediction (SynchronousAdmission's, per executable), which its commit takes the ledger's grids from.
+    std::shared_ptr<compiler::StatePrediction> prediction;
+    const compiler::PreparedExecutionBarrierPlan& Barriers() const noexcept { return sharedBarriers ? *sharedBarriers : barriers; }
     std::vector<std::vector<compiler::ExecutionTimelinePoint>> incomingWaits;
     // Per batch, (compiler resource index, wait): every earlier access (writer and readers, any queue) the ledger holds of each
     // resource the batch uses first and that some batch off the upload queue uses (SynchronousAdmission::SetUploadQueue; empty
     // without one). What an upload into the resource recorded on another queue than the upload queue, ahead of the execution,
-    // must wait for (RenderGraph::RecordPendingUploads' queue-scoped uploads); incomingWaits gives a read only the writer.
+    // must wait for (RenderGraph::RecordPendingUploads' queue-scoped uploads); incomingWaits gives a read only the writer. A resource
+    // may name a timeline more than once: its waits are the latest value per timeline.
     compiler::BackingAccessAdmissionLedger::ResourceWaits boundaryAccessWaits;
     std::vector<uint64_t> queueTimelines;
     // As prepared: the queues' submitted points, and the frame's own waits (producer waits, incoming states) before the ledgers'.
@@ -395,6 +465,11 @@ struct FrameAdmission {
     bool closed = false;
     // The barrier plan came from the admission's cache rather than the ledgers.
     bool cachedPlan = false;
+    // Admitted for a body recorded already (SynchronousAdmission::PrepareAtSubmission): the plan has the entry barriers, releases
+    // and the ledger's commits, not the body's barriers.
+    bool entryOnly = false;
+    // The access stream its commit goes to (BackingAccessAdmissionLedger::OpenStream), 0 for none.
+    uint64_t stream = 0;
 };
 // Frame-supplied backing for a slot the publication deliberately leaves
 // unbound. The executable and its state contract stay selected; only the
@@ -468,6 +543,9 @@ public:
     explicit SynchronousAdmission(size_t frameCapacity = 3,
         std::function<void(std::shared_ptr<const void>)> retireOwnership = {},
         std::shared_ptr<ResourceSequencer> sequencer = {});
+    ~SynchronousAdmission();
+    SynchronousAdmission(const SynchronousAdmission&) = delete;
+    SynchronousAdmission& operator=(const SynchronousAdmission&) = delete;
     const std::shared_ptr<ResourceSequencer>& Sequencer() const noexcept { return m_sequencer; }
     // Closed executions: every resource an execution touches leaves it in its home state
     // (BackingStateAdmissionLedger::Prepare closeToHome) and every execution starts with a full memory
@@ -485,16 +563,39 @@ public:
     size_t PendingAdmissions() const noexcept { return m_pending.size(); }
     uint64_t PlanCacheHits() const noexcept { return m_planCacheHits; }
     uint64_t PlanCacheMisses() const noexcept { return m_planCacheMisses; }
+    // Entry-only admissions (PrepareAtSubmission) whose plan was the prediction's (the ledger held what the same executable found
+    // last), and those planned against the ledger. Since the last call.
+    std::pair<uint64_t, uint64_t> TakePredictionCounts() noexcept {
+        std::lock_guard lock(m_sequencer->mutex);
+        return {std::exchange(m_predicted, 0), std::exchange(m_planned, 0)};
+    }
     FrameAdmission Prepare(std::shared_ptr<const SelectedPublication> publication,
         std::span<const compiler::ExecutionTimelinePoint> queues,
         std::span<const FrameProducerWait> producerWaits = {},
         std::span<const FrameIncomingState> incomingStates = {},
+        std::span<const FrameRebinding> rebindings = {});
+    // An admission to record an execution's body from, which is never committed: it does not count as pending, can be made
+    // while another admission is, and needs no Abandon (it is ignored). An open execution's body depends only on its compiled
+    // graph (its entry barriers are recorded at submission), and a closed one's on its executable and backings, so a body
+    // recorded from it stands when the execution is admitted with Prepare at submission. A ticket's body (prepared ahead on
+    // a host's thread) is recorded from one.
+    FrameAdmission PreparePlan(std::shared_ptr<const SelectedPublication> publication,
+        std::span<const compiler::ExecutionTimelinePoint> queues,
+        std::span<const FrameProducerWait> producerWaits = {},
+        std::span<const FrameRebinding> rebindings = {});
+    // Prepare for an execution whose body was recorded from a plan (PreparePlan) of the same publication and rebindings: the
+    // ledgers' part alone (FrameAdmission::entryOnly), which is all a submission records and commits.
+    FrameAdmission PrepareAtSubmission(std::shared_ptr<const SelectedPublication> publication,
+        std::span<const compiler::ExecutionTimelinePoint> queues,
+        std::span<const FrameProducerWait> producerWaits = {},
         std::span<const FrameRebinding> rebindings = {});
     // An open admission, again, at submission: the ledger's part (the batches' entry barriers and seeds, the states it commits, the
     // waits on earlier executions) recomputed against the ledgers as they are now. The rest of the plan depends on the compiled graph
     // alone, so what was recorded from it stands (docs/job-graphs.md, "Phase 2 investigation"). Hold the sequencer (HoldSequencer)
     // from here through the submission and its Commit, so that no other admission comes between.
     void Readmit(FrameAdmission& frame);
+    // Every call of the admission takes the sequencer's lock (recursive): a host prepares tickets on one thread and admits and
+    // commits them on another.
     std::unique_lock<std::recursive_mutex> HoldSequencer() const { return std::unique_lock(m_sequencer->mutex); }
     void Commit(const FrameAdmission& frame, const compiler::GraphExecutionTimeline& receipt,
         uint32_t signaledBatches = UINT32_MAX);
@@ -506,6 +607,10 @@ public:
     size_t RetireCompleted(std::span<const compiler::ExecutionTimelinePoint> completed);
     size_t RetainedFrames() const noexcept { return m_retained.size(); }
 private:
+    FrameAdmission PrepareFrame(std::shared_ptr<const SelectedPublication> publication,
+        std::span<const compiler::ExecutionTimelinePoint> queues, std::span<const FrameProducerWait> producerWaits,
+        std::span<const FrameIncomingState> incomingStates, std::span<const FrameRebinding> rebindings, bool pending,
+        bool entryOnly = false);
     // The ledgers' part of an admission (caller holds the sequencer). cacheEligible: nothing frame-specific feeds the plan.
     void AdmitLedger(FrameAdmission& frame, bool cacheEligible);
     std::shared_ptr<ResourceSequencer> m_sequencer;
@@ -522,6 +627,21 @@ private:
     };
     std::vector<CachedPlan> m_planCache;
     uint64_t m_planCacheHits = 0, m_planCacheMisses = 0;
+    // Per executable: the prediction of its entry-only plan (AdmitLedger), for the backings and execution kind it was made for, and
+    // of its access waits; its access stream (the publication's own backings only); the resources batches off the upload queue use.
+    struct PredictionSlot {
+        std::weak_ptr<const ExecutableGeneration> executable;
+        uint64_t backings = 0;  // AdmissionBackingSet::Id
+        bool closed = false;
+        std::shared_ptr<compiler::StatePrediction> prediction;
+        compiler::AccessPrediction access;
+        uint64_t stream = 0;  // BackingAccessAdmissionLedger::OpenStream
+        uint32_t uploadQueue = UINT32_MAX;  // the upload queue `offUploadQueue` was found for
+        std::vector<uint8_t> offUploadQueue;  // per compiler resource; empty: none
+    };
+    void ClosePrediction(PredictionSlot& slot);
+    std::unordered_map<const void*, PredictionSlot> m_predictions;
+    uint64_t m_predicted = 0, m_planned = 0;
     uint64_t m_domain = 0;
     std::map<uint64_t,uint64_t> m_submitted;
     struct RetainedFrame {

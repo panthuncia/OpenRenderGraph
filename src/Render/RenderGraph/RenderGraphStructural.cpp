@@ -282,6 +282,8 @@ void RenderGraph::CompileStructural() {
 			BT_ZONE_TEXT(d.name.data(), d.name.size());
 			if (d.type == PassType::Unknown) continue;
 			if (!d.pass) continue;
+			// Another epoch's pass, in a graph of one epoch (SetPassEpochFilter).
+			if (m_passEpochFilter != persistent::AllEpochs && d.epoch != persistent::AllEpochs && d.epoch != m_passEpochFilter) continue;
 
 			ExtItem it;
 			if (m_getRenderGraphBatchTraceEnabled && m_getRenderGraphBatchTraceEnabled()) {

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <vector>
 #include <memory>
@@ -33,6 +34,14 @@ struct QueueSlot {
 
 constexpr uint8_t ToUnderlying(QueueSlotIndex i) noexcept { return static_cast<uint8_t>(i); }
 
+/// A queue's timeline shared by several graphs: the fence and the next value to signal, which every registry holding it
+/// assigns from. Graphs that share a queue's timeline need no waits on each other's work on that queue, as one graph does.
+struct SharedQueueTimeline {
+	std::shared_ptr<rhi::TimelinePtr> fence;
+	std::shared_ptr<std::atomic<uint64_t>> nextValue;
+	explicit operator bool() const noexcept { return fence && *fence && nextValue; }
+};
+
 /// Manages the set of queues available to the render graph.
 /// Primary queues (Graphics:0, Compute:0, Copy:0) always occupy slots 0, 1, 2.
 class QueueRegistry {
@@ -53,6 +62,11 @@ public:
 		bool ownsQueue = false,
 		rhi::Device device = {},
 		std::string_view logicalName = {});
+
+	/// Register a queue slot on a timeline other registries share (SharedTimelineOf): its values come from the shared counter,
+	/// and clearing the registry neither waits on the timeline nor retires it (its owner does).
+	QueueSlotIndex Register(QueueSlot slot, rhi::Queue queue, const SharedQueueTimeline& timeline, rhi::Device& device,
+		QueueAutoAssignmentPolicy autoAssignmentPolicy = QueueAutoAssignmentPolicy::AllowAutomaticScheduling);
 
 	/// Returns a persistent, graph-owned queue registered under this logical name.
 	/// Named queues survive structural graph rebuilds, so callers must reuse them.
@@ -85,6 +99,10 @@ public:
 	/// The slot's fence, as a shared pointer. It stays valid for its holder after the registry is cleared, for example by
 	/// a graph rebuild.
 	std::shared_ptr<rhi::TimelinePtr> GetFenceOwner(QueueSlotIndex i) const noexcept { return m_slots[ToUnderlying(i)].fence; }
+	/// The slot's timeline, to register in another registry.
+	SharedQueueTimeline SharedTimelineOf(QueueSlotIndex i) const noexcept { return {m_slots[ToUnderlying(i)].fence, m_slots[ToUnderlying(i)].fenceValue}; }
+	/// Whether the slot's timeline came from another registry (Register with a SharedQueueTimeline).
+	bool SharesTimeline(QueueSlotIndex i) const noexcept { return m_slots[ToUnderlying(i)].sharedTimeline; }
 	CommandListPool* GetPool(QueueSlotIndex i)    const noexcept { return m_slots[ToUnderlying(i)].pool.get(); }
 	std::shared_ptr<CommandListPool> GetSharedPool(QueueSlotIndex i) const noexcept { return m_slots[ToUnderlying(i)].pool; }
 	rhi::Timeline& GetFenceForConsumer(QueueSlotIndex source, QueueSlotIndex consumer) noexcept {
@@ -104,17 +122,16 @@ public:
 	rhi::Result EnableD3D12VulkanInterop(rhi::Device d3d12Device, rhi::Device vulkanDevice);
 
 	/// Atomically retrieve and increment the per-slot fence value.
-	uint64_t GetNextFenceValue(QueueSlotIndex i) noexcept { return m_slots[ToUnderlying(i)].fenceValue++; }
+	uint64_t GetNextFenceValue(QueueSlotIndex i) noexcept { return m_slots[ToUnderlying(i)].fenceValue->fetch_add(1, std::memory_order_acq_rel); }
 
 	/// Current fence value for a slot (without incrementing).
-	uint64_t GetCurrentFenceValue(QueueSlotIndex i) const noexcept { return m_slots[ToUnderlying(i)].fenceValue; }
+	uint64_t GetCurrentFenceValue(QueueSlotIndex i) const noexcept { return m_slots[ToUnderlying(i)].fenceValue->load(std::memory_order_acquire); }
 
 	/// Raises the next fence value for a slot if it has fallen behind an externally observed floor.
 	void EnsureNextFenceValueAtLeast(QueueSlotIndex i, uint64_t minValue) noexcept {
-		auto& nextFenceValue = m_slots[ToUnderlying(i)].fenceValue;
-		if (nextFenceValue < minValue) {
-			nextFenceValue = minValue;
-		}
+		auto& nextFenceValue = *m_slots[ToUnderlying(i)].fenceValue;
+		for (auto current = nextFenceValue.load(std::memory_order_acquire);
+			current < minValue && !nextFenceValue.compare_exchange_weak(current, minValue, std::memory_order_acq_rel);) {}
 	}
 
 	/// Find any Graphics-kind queue slot (for transition fallback).
@@ -143,7 +160,8 @@ private:
 		QueueAutoAssignmentPolicy autoAssignmentPolicy = QueueAutoAssignmentPolicy::AllowAutomaticScheduling;
 		bool ownsQueue = false;
 		std::string logicalName;
-		uint64_t fenceValue = 1;
+		std::shared_ptr<std::atomic<uint64_t>> fenceValue = std::make_shared<std::atomic<uint64_t>>(1);
+		bool sharedTimeline = false;  // Register with a SharedQueueTimeline
 	};
 
 	std::vector<SlotEntry> m_slots;
