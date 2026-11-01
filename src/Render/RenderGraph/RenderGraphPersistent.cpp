@@ -1184,7 +1184,7 @@ RenderGraph::PersistentExecution RenderGraph::PreparePersistentExecution(rhi::De
 		m_scheduleSnapshot.store(nullptr, std::memory_order_release);
 	}
 	if (state.bindingsFor != selected.get()) {
-		BT_ZONE_SCOPE("ORG.Persistent.BuildLegacyBindingTable");
+		BT_ZONE_SCOPE("ORG.Persistent.BuildBindingTable");
 		std::vector<FrozenExecutionBindings::ResourceBinding> table(selected->bindings.Size());
 		for (uint32_t index = 0; index < selected->bindings.Size(); ++index) {
 			const auto* version = selected->bindings.TryAt(index);
@@ -1251,7 +1251,7 @@ RenderGraph::PersistentExecution RenderGraph::PreparePersistentExecution(rhi::De
 	main.label = "Main";
 	main.publication = executing;
 	main.rebindings = std::move(rebindings);
-	main.legacyBindings = preparation.bindings;
+	main.bindings = preparation.bindings;
 	main.invocations.resize(selected->logical->passSlots.size());
 	{
 		BT_ZONE_SCOPE("ORG.Persistent.PrepareInvocations");

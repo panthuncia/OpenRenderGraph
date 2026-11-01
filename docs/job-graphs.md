@@ -1,60 +1,20 @@
 # Job graphs: ORG without a main graph
 
-> **Status (2026-10-30): Phases 1 and 2 implemented (Phase 2 as revised in "Phase 2 investigation").**
-> - Done:
->   - **2a:** runtime timeline identities.
->   - **2b:** `persistent::ResourceSequencer`, owned by the runtime and shared by every graph's admission. A graph's queue
->     timelines are retired with it, and waits on reached points are dropped.
->   - **2c (first part):** boundary barriers moved into batch entry lists. Aliased backings enter from Undefined.
->   - **2d:** an open admission is readmitted at submission under the sequencer lock. Its entry barriers are recorded into a
->     leading list submitted ahead of each batch.
-> - Verified:
->   - ORG tests on Vulkan and D3D12, including a two-admissions-one-sequencer handoff test;
->   - the SARP build and benchmark;
->   - the Community Shaders build.
-> - **Cross-queue handoffs between executions (done).** When an earlier execution left a texture on another queue:
->   - the texture is released there, from its state to Common, by a list the admission submits on that queue with its own
->     signal (`PreparedExecutionBarrierPlan::releases`, `ExecutionTimelineAdmission::SubmitOutside`);
->   - the consumers acquire it from Common and wait for that signal.
+> **Status (2026-10-31).** This began as the design for ORG without one main graph. What exists now:
+> - **`org::Runtime`** owns the device, the services, the task service and retirement by timeline points (no frame
+>   rotation). Every graph and client on a runtime shares its `ResourceSequencer`, which orders executions across graphs
+>   and queues and hands resources between them (sections "Admission at submission" and "Cross-graph ordering").
+> - **`org::ExternalClient`** submits work that is not a graph (uploads, readbacks, a presentation copy) in the same order.
+> - **`org::GraphInstance`**, **`org::Execution`**, **`org::JobGraph`** and **`org::GraphCache`** run small graphs built
+>   from a `GraphDesc` (section "Graph descs and instances"). An app-built graph can be adopted by an instance
+>   (BasicRenderer's frame graph).
+> - **`org::GraphHost`** stays as the layer for embedding ORG in another renderer: epochs, tickets, external epochs and
+>   recording reuse (`persistent-epochs.md`). Community Shaders uses it.
 >
->   It still only counts `ORG.Execution.CrossFrameTextureQueueHandoff` for closed executions, across devices, and for
->   queues the graph lacks.
-> - Remaining:
->   - **Vulkan QFOT layout pairs (done).** The acquire repeats its release (X to Common), at the consuming batch's entry. A
->     barrier batch after it (`PreparedBatchBarriers::acquired`, or the pass's own) takes the texture from Common to Y.
->     BasicRHI drops an acquire whose transfer collapsed: always on D3D12, and on Vulkan for one queue family or a
->     concurrent image. Aliased textures and cross-device handoffs keep the old acquire.
->   - **D3D12 copy-queue exits (done).** On a D3D12 copy queue (`CompileQueue::copyLayoutsCommon`), the compiler records
->     copy-layout steps as leaving `Common`, which is what copy lists leave textures in.
->   - **External clients (2e): moved to Phases 3 and 5.** There, uploads and the swapchain leave the frame graph and become
->     the sequencer's clients. Until then, uploads are recorded inside the graphs that consume them, which already
->     sequences them.
->   - **A two-graph test on the GPU (done, 2026-10-31).** `RunGraphDescScenario`: two compiled graphs, write then read
->     across queues, on D3D12 and Vulkan.
-> - `org::Runtime` (`OpenRenderGraph/Runtime.h`) owns device initialization, the services, the settings' slot count and the
->   default task service; `RenderGraph` and `GraphHost` take it and no longer initialize, reset or shut down shared state.
-> - Retirement is by submission frontier. BasicRHI's `Queue::Progress()` is a timeline that every submission on the queue
->   signals; `DeletionManager` and descriptor releases wait for every queue's progress as of their release. This replaces the
->   frame-count rotation.
-> - Still per graph or frame-indexed, for later phases: upload pages (single consumer), statistics query ranges, the
->   ledgers.
-> - Verified with ORG tests (Vulkan and D3D12, including `RuntimeTests.cpp`), the SARP build, ctest and a benchmark.
->   Community Shaders builds; its in-game smoke test is still owed.
->
-> **Design, Phase 0.** This document describes the target architecture and the migration plan. It
-> supersedes the service-ownership items of `rebuild-plan.md` Phase 7 (per-runtime services) and replaces
-> `persistent-epochs.md` once the migration completes.
-
-> **WIP: cross-thread synchronization and locking.** The threading model below (one admission lock in the sequencer,
-> any-thread submit through the submit gate, completion callbacks on a runtime thread, thread-safe services) is a first
-> cut. It is not yet designed in detail, and it deserves its own investigation before Phase 2 lands:
-> - lock granularity and ordering;
-> - which structures are lock-free;
-> - contention under many concurrent jobs;
-> - interaction with the backends' own locks (Vulkan's device-wide `timelinesMutex` held across a submit, DXVK's queue lock);
-> - reentrancy of callbacks.
->
-> Treat every "under one lock" statement here as provisional.
+> Not built, from the design below: compiling on a worker and sharing compiled graphs between instances by structural
+> key; completion callbacks on a runtime thread (handles complete when their graph retires); statistics per execution;
+> executions recorded into caller lists outside `GraphHost`'s external epochs. The threading model is a first cut: one
+> admission lock in the sequencer, submissions from any thread; it has not had a dedicated review.
 
 ## Why
 
@@ -95,7 +55,7 @@ interrupting either job.
    │                │  └─────────────────────────────┘   └──────────────────────────────────────────┘ │
    │                └───────────────────────────────────────────────────────────────────────────────┘
    ▼
- GraphDesc ──compile (worker, cached by structural key)──► CompiledGraph (immutable, shareable)
+ GraphDesc ──compile (target: worker, cached by key)───► CompiledGraph (immutable)             
    passes, order edges,                                    schedule, batches, body barrier plans,
    parameters (imports)                                    per-import first/last access, transient layout
                                                                 │
@@ -107,8 +67,9 @@ interrupting either job.
 
 ### `org::Runtime`
 
-The runtime replaces `GraphHost`, the manager singletons and `InitializeRuntimeDevice`. It owns every service that is
-genuinely shared:
+The runtime replaces the manager singletons' ownership and `InitializeRuntimeDevice`. It owns every service that is
+genuinely shared (built: the device, the services, the task service and timeline-based retirement; the per-execution
+statistics, the runtime completion thread and the single upload path are design targets):
 
 - **Device resources:** devices and queues, a timeline pool whose ids are globally unique, descriptor heaps, and the
   pipeline lifetime.
@@ -167,6 +128,11 @@ version over the existing graph: an instance wraps a `RenderGraph`.
 - **`CompiledGraph`** is what an instance's executions run: the selected publication's schedule. `Compiled()` returns
   it; binding edits keep it (`SameSchedule`), a structural edit replaces it. Sharing it between instances by key is
   later work (the async compile, plan Phase 5 step 7).
+- **Adopted graphs.** `GraphInstance::Adopt(runtime, graph)` takes an app-built `RenderGraph` (BasicRenderer's frame
+  graph). The app declares it through `Rebuild(declare)` and drives it with its own frame slots and contexts:
+  `Prepare(UpdateExecutionContext)`, then `Execution::Submit(PassExecutionContext)`. It keeps the app's services and frame
+  services; an execution dropped unsubmitted is discarded, not submitted. BasicRenderer no longer uses `GraphHost`: its
+  frame graph is adopted, and its texture jobs (mips, BC7) and environment jobs run on instances of their own.
 - **`JobGraph::Create(runtime, desc)`** is the convenience over an instance: `Execute(bindings, hostData)` binds,
   prepares and submits one execution under a lock. Any thread may call it; one job graph runs one execution at a
   time. `TryRetire()` never blocks, for pollers such as a StateGraph's completion pump.
@@ -179,11 +145,8 @@ version over the existing graph: an instance wraps a `RenderGraph`.
   executed after a producer waits for it on the GPU, across queues too.
 - **`GraphCache`** maps keys to job graphs, so a repeated desc reuses the whole executable, alias plan included.
   Measurements showed the schedule cache alone was not worth much (2 hits in 17).
-- **Limits of this version:**
-  - creating an instance builds the graph, and the first `Prepare` lowers the passes and builds the first schedule
-    inline;
-  - an instance's destructor waits for the device as `GraphHost` does (an adopted device waits for its own timelines
-    only).
+- **Limit of this version:** creating an instance builds the graph, and the first `Prepare` lowers the passes and
+  builds the first schedule inline.
 - **Inside `RenderGraph`** the persistent state has three parts (`RenderGraphPersistentState.h`): the instance (passes,
   slot directory, groups, alias pools, edits in flight), the layout (tables built from the selected publication), and
   the executions (admission, the one prepared, the submitted ones). Preparation is `BindPersistentFrame` (polls and
@@ -214,7 +177,7 @@ Other changes:
   caller, who reports back with `NoteSubmitted(points)`. The handoffs go into a leading list. This generalizes
   `ExternalEpochExecution::leading`; Community Shaders uses it to submit inside DXVK's stream.
 
-## Phase 2 investigation: admission at submission
+## Admission at submission
 
 This revises items 2, 3, 5, 6 and 8 of the next section, which describe the Phase 0 design.
 
@@ -435,78 +398,3 @@ This plan is based on a survey of BasicRenderer, ORG checkout at `org-rebuild`, 
    in place of the `FrameWorkQueue` entries.
 5. **Open item.** `MaterialManager::AppendTextureDisplayRequirements` has no caller: display gates may not yet gate
    renderables. Check this before relying on them.
-
-**Progress (2026-10-30).**
-
-*Step 1 is done.*
-- `br::render::TextureJobGraph` runs the mip, mip-handoff and BC7 passes.
-- `TextureFactory::WhenMipsReady` reports a texture's handoff completing on the GPU.
-- `BR_TEXTURE_JOB_SELF_TEST=1` mips a checkerboard through the job graph and checks its 1x1 mip by readback. It passes.
-
-*Bugs the self-test found.*
-- **Waits on another graph's timeline.** A readmitted admission can wait on another graph's timeline, which its packets do
-  not bind. Fixed: `Runtime::TimelineHandleOf` resolves the identity, and `ExecutionBatchTimeline::extraTimelines` carries
-  the binding.
-- **Job constants uploaded too late.** The upload policy flushed the job's constants through the frame graph's upload
-  service, after the job graph's dispatch. Fixed: `BufferBase::PinUploadService` plus an Immediate tag on the job's buffers.
-  Any other buffer a job graph writes needs the same treatment.
-
-*Step 2, readiness gating: open.* Only non-participating textures get GPU mips: Assimp-loaded material textures (BasicRenderer
-standalone) and HDRI environments. The participating NIF material textures are mipped on the CPU and already gated through
-`TextureBinding`.
-- **Materials.** `MaterialManager` reads a non-participating texture's published image once, when it builds the material.
-  Deferring publication therefore needs those textures to go through the `TextureBinding` artifact as participating ones do,
-  with the mips-ready completion as the binding's GPU work. Otherwise a material built before its textures are ready keeps
-  the constant fallback.
-- **Environment.** `EnvironmentManager::SetFromHDRI` enqueues the HDRI's conversion at once. It has to wait for the HDRI's
-  readiness instead, which is part of step 4.
-- **Testing.** Neither path runs in the SARP benchmark; testing them needs a BasicRenderer standalone scene.
-
-## API sketch
-
-```cpp
-auto runtime = org::Runtime::Create({.devices = ..., .taskService = ...});
-
-org::GraphDesc mip;
-auto src = mip.Parameter<org::Texture>("source");
-mip.Add<MipChainPass>(src);
-std::shared_ptr<const org::CompiledGraph> g = runtime->Graphs().GetOrCompile(mip);
-
-auto exec = g->Bind({{src, texture}})
-              .Prepare(hostData)
-              .Admit({.after = {uploadHandle}})
-              .Record();
-exec.Submit();
-exec.Handle().OnCompleted([&] { /* runtime completion thread */ });
-```
-
-**ORGModuleServices adapter** (in ORGModuleServices; ORG does not depend on it):
-- `MakeGpuSubmissionSet(ExecutionHandle)`.
-- A `GraphJob` producer helper: it binds, prepares and admits on the producer's worker, posts Record and Submit, and
-  returns `Ready(payload, submissions)`.
-- A new **Admitted** readiness level between `CpuReady` and `UploadSubmitted`, so successors can start as soon as their
-  producers are sequenced.
-
-## Migration
-
-| Phase | Content |
-|---|---|
-| 0 | Baselines (BasicRenderer benchmark, Community Shaders tour) and this document. |
-| 1 | `org::Runtime`: services owned per runtime, with no singletons and no frame-indexed retirement. `GraphHost` becomes a thin client for now. |
-| 2 | `ResourceSequencer` with open executions:<br>• promised-exit admission and per-batch handoff lists<br>• the submit gate, splice/pass-through and poison<br>• external clients<br>• removal of closed executions and home states<br>• fixes for the Vulkan QFOT layout pair and D3D12 copy-queue exit layouts<br>• the synchronization investigation (see WIP note) |
-| 3 | Split `RenderGraph` into `GraphDesc` / `CompiledGraph` / `Execution`, with `GraphCache` and execution indices. Remove the Pre/Main/Tail segments, `IDynamicDeclaredResources` and inline builds. |
-| 4 | ORGModuleServices adapter. |
-| 5 | BasicRenderer's frame becomes a job; swapchain acquire and present become external clients; the rebuild-and-stall path is removed. |
-| 6 | BasicRenderer jobs: mip chain, BC7, environment set, BRDF LUT. |
-| 7 | Community Shaders: epochs become compiled graphs sharing an arena; tickets become prepared executions; external submission into DXVK. |
-| 8 | Delete `GraphHost`, epochs, tickets and the frame vocabulary. Rewrite the README. |
-
-## Top risks
-
-1. **Admission order diverging from the async graph's order** produces silently wrong data. Mitigations: the `after`
-   assertion, the Admitted readiness level, and a debug check in the ledger.
-2. **Deadlocks in the submit gate or with DXVK.** Mitigations: the gate is not FIFO, unsubmitted waits are never handed
-   to DXVK, and a randomized multi-graph stress test.
-3. **D3D12 layout legality per queue type, and the Vulkan QFOT fix.** Both are covered by cross-queue tests on both
-   backends with validation enabled.
-4. **Cross-thread synchronization** (the WIP note above).

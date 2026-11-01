@@ -156,7 +156,7 @@ bool RenderGraph::AdmitPersistentSegment(PersistentSegmentRun& run) {
 		// Recorded ahead (BindPersistentTicketRecording): this preparation's invocations are never recorded.
 		for (const auto& invocation : segment.invocations)
 			if (invocation) invocation.Abandon(AbandonReason::AdmissionFailed);
-		ticketTarget->segments.push_back({std::move(admission), nullptr, segment.legacyBindings, run.resourceHeap, run.samplerHeap});
+		ticketTarget->segments.push_back({std::move(admission), nullptr, segment.bindings, run.resourceHeap, run.samplerHeap});
 		return false;
 	}
 	// An external epoch's recording is kept as any other's (its secondaries executed again by each ticket that takes it); a late
@@ -178,7 +178,7 @@ bool RenderGraph::AdmitPersistentSegment(PersistentSegmentRun& run) {
 	if (run.keepable && !options.hostData) {
 		const auto set = m_keptRecordings->Load(ticketTarget->epoch, run.execution.frameIndex);
 		for (const auto& kept : set ? *set : KeptRecordingSet{}) {
-			if (!kept->Recorded(options.hostTag, segment.publication.get(), segment.legacyBindings.get(), run.resourceHeap, run.samplerHeap,
+			if (!kept->Recorded(options.hostTag, segment.publication.get(), segment.bindings.get(), run.resourceHeap, run.samplerHeap,
 					ticketTarget->revisions))
 				continue;
 			BT_ZONE_SCOPE("ORG.Persistent.ReuseRecording");
@@ -186,7 +186,7 @@ bool RenderGraph::AdmitPersistentSegment(PersistentSegmentRun& run) {
 			for (const auto& invocation : segment.invocations)
 				if (invocation) invocation.Abandon(AbandonReason::AdmissionFailed);
 			kept->lastUse.store(ticketTarget->hostFrame, std::memory_order_relaxed);
-			ticketTarget->segments.push_back({std::move(admission), kept, segment.legacyBindings, run.resourceHeap, run.samplerHeap});
+			ticketTarget->segments.push_back({std::move(admission), kept, segment.bindings, run.resourceHeap, run.samplerHeap});
 			m_recordingsReused.fetch_add(1, std::memory_order_relaxed);
 			run.Lap(run.timings.recordUs);
 			return false;
@@ -271,7 +271,7 @@ void RenderGraph::RecordPersistentSegment(PersistentSegmentRun& run) {
 			job.recording.acquiredBarriers.clear();
 		}
 		job.recording.external = external;
-		job.recording.bindings = segment.legacyBindings;
+		job.recording.bindings = segment.bindings;
 		job.recording.frameSlot = frameIndex;
 		job.recording.externalEntryBarrier = m_externalQueueBoundary.entry && run.firstBatchOnSlot[slot] == batch;
 		if (admission.closed && !closedEntryDone[slot]) {
@@ -400,7 +400,7 @@ void RenderGraph::SubmitPersistentSegment(PersistentSegmentRun& run) {
 			if (recording->replayable) {
 				recording->hostTag = options.hostTag;
 				recording->publication = segment.publication;
-				recording->bindings = segment.legacyBindings;
+				recording->bindings = segment.bindings;
 				recording->resourceHeap = run.resourceHeap;
 				recording->samplerHeap = run.samplerHeap;
 				recording->revisions = ticket->revisions;
@@ -426,7 +426,7 @@ void RenderGraph::SubmitPersistentSegment(PersistentSegmentRun& run) {
 				m_keptRecordings->Store(ticket->epoch, run.execution.frameIndex, std::move(next));
 				m_recordingsKept.fetch_add(1, std::memory_order_relaxed);
 			}
-			ticket->segments.push_back({std::move(admission), std::move(recording), segment.legacyBindings, run.resourceHeap, run.samplerHeap});
+			ticket->segments.push_back({std::move(admission), std::move(recording), segment.bindings, run.resourceHeap, run.samplerHeap});
 			return;
 		}
 		// Admission at submission (docs/job-graphs.md, "Phase 2 investigation"): under the sequencer, the ledger's handoff is

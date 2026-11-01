@@ -12,6 +12,7 @@
 #include "Render/PassBuilders.h"
 #include "Render/Runtime/OpenRenderGraphSettings.h"
 #include "Managers/Singletons/DeviceManager.h"
+#include "OpenRenderGraph/Runtime.h"
 
 
 namespace org {
@@ -389,6 +390,9 @@ void UploadManager::Cleanup() {
 		m_copyQueueUploads.reset();
 	}
 	if (m_uploadQueue) {
+		// The runtime registered the queue (Runtime::Create). Unregistered first, its points read as reached once it is gone;
+		// otherwise the runtime's next retirement polls a destroyed timeline.
+		if (auto* runtime = Runtime::Current()) runtime->UnregisterQueue(m_uploadQueue);
 		if (auto device = DeviceManager::GetInstance().GetDevice())
 			device.DestroyQueue(m_uploadQueue.GetQueueHandle());
 		m_uploadQueue = {};

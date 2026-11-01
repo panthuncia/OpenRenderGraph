@@ -207,6 +207,45 @@ public:
 	bool ScheduleTraceEnabled() const noexcept;
 	// Any thread: the latest published snapshot; null while off, or before anything executed with it on.
 	std::shared_ptr<const PersistentScheduleSnapshot> GetPersistentScheduleSnapshot() const;
+	// What happens when a frame's binding edits change which slots share a backing (a resource swapped onto a backing
+	// another slot already uses, say). The compiler treats slots that share a backing as one resource, so this needs a
+	// new schedule, with the passes of both slots ordered and transitioned against each other.
+	// - Inline (default): the frame builds the new schedule before it prepares. The swap takes effect this frame.
+	// - Deferred: the frame keeps those slots' current bindings, and a worker builds the new schedule with the new ones.
+	//   They take effect when it installs, a frame or more later. Until then the graph still binds and orders the old
+	//   backings: a pass that reads its resources through declared views sees the old ones, consistently. A pass that
+	//   reads a resource's live descriptors directly would see the new backing without its barriers, and data written
+	//   into the new backing on the CPU isn't read until the install.
+	// Either way, edits replayed onto a worker build at its install that change these sets build inline.
+	enum class SharingChangePolicy : uint8_t { Inline, Deferred };
+	void SetSharingChangePolicy(SharingChangePolicy policy) noexcept { m_sharingChangePolicy = policy; }
+	SharingChangePolicy GetSharingChangePolicy() const noexcept { return m_sharingChangePolicy; }
+	// The frame-wait timeline: a timeline a host's producer of per-frame values signals, once per frame, after the values it
+	// wrote for that frame; every batch of an execution waits for the value set for it (SetFrameWaitValue here, or
+	// SubmitPersistentTicket's frameWait), so a late producer costs GPU idle, never a CPU wait. Set before the first execution:
+	// every packet prepared from then on can wait on it.
+	static constexpr uint64_t kFrameWaitTimelineIdentity = UINT64_MAX - 1;
+	void SetFrameWaitTimeline(std::shared_ptr<rhi::TimelinePtr> timeline) { m_frameWaitTimeline = std::move(timeline); }
+	bool HasFrameWaitTimeline() const noexcept { return m_frameWaitTimeline && *m_frameWaitTimeline; }
+	// The synchronous executions' wait (Execute): until changed. 0: none.
+	void SetFrameWaitValue(uint64_t value) noexcept { m_frameWaitValue = value; }
+
+	// Tickets (GraphHost's async epochs) and their recordings, which the host's private calls below take and return.
+	struct PersistentTicket;
+	// A segment's recorded packets and what they were recorded for (the publication, bindings, heaps, host tag and every pass's
+	// revision). Shared, immutable once made.
+	struct PersistentRecording;
+	struct PersistentTicketSubmission {
+		bool submitted = false;
+		std::vector<uint64_t> signals;  // per batch of every segment, in order: the value it signalled
+		// An external epoch's ticket (SetExternalPersistentEpochs): nothing was submitted; its packets are the host's to execute,
+		// with these waits and signals (the values above among them).
+		std::shared_ptr<ExternalEpochExecution> external;
+	};
+
+	// Host-only (GraphHost, a friend): epochs, tickets, kept recordings and the settings they run under. An application
+	// drives graphs through GraphHost or GraphInstance, never through these.
+private:
 	// Host epochs (persistent execution). A host that submits the graph at several
 	// points of its own frame tags each pass with its epoch (ExternalPassDesc::Epoch)
 	// and names the execution order once. The graph compiles over the whole frame, so
@@ -227,14 +266,6 @@ public:
 	// packets, assigning their timeline values then, in submission order. The owner completes every ticket
 	// in that order, with those values, or abandons it. Requires closed executions (a ticket's admission
 	// must not depend on the executions around it) and no upload passes other than the host's.
-	struct PersistentTicket;
-	struct PersistentTicketSubmission {
-		bool submitted = false;
-		std::vector<uint64_t> signals;  // per batch of every segment, in order: the value it signalled
-		// An external epoch's ticket (SetExternalPersistentEpochs): nothing was submitted; its packets are the host's to execute,
-		// with these waits and signals (the values above among them).
-		std::shared_ptr<ExternalEpochExecution> external;
-	};
 	/**
 	 * @brief Owner thread, while no ticket is prepared (the host's async epochs stopped): the persistent epochs the host executes
 	 * itself, in a command buffer of its own (ExternalEpochExecution). Their tickets record into secondary lists, and a pass of
@@ -251,9 +282,6 @@ public:
 	// (BindPersistentTicketRecording) - an epoch recorded ahead, for a revision (GraphHost::RequestEpochRecording).
 	std::shared_ptr<PersistentTicket> PreparePersistentTicket(rhi::Device device, uint32_t epoch, uint8_t slot, uint64_t hostFrame,
 		uint64_t hostTag = 0, std::shared_ptr<const IHostExecutionData> hostData = {}, bool admissionOnly = false);
-	// A segment's recorded packets and what they were recorded for (the publication, bindings, heaps, host tag and every pass's
-	// revision). Shared, immutable once made.
-	struct PersistentRecording;
 	// The ticket's recording (one segment), or null; the ticket keeps it.
 	static std::shared_ptr<const PersistentRecording> PersistentTicketRecording(const PersistentTicket& ticket) noexcept;
 	// Whether it may be submitted again and again (every pass replayable, recorded for resubmission).
@@ -284,19 +312,6 @@ public:
 	// statistics queries in the shared pool (recreated as passes register, and frame-indexed): with
 	// SetPersistentRecordingTimestamps, each records into queries of its own instead.
 	static constexpr size_t kKeptRecordingVariants = 4;
-	// What happens when a frame's binding edits change which slots share a backing (a resource swapped onto a backing
-	// another slot already uses, say). The compiler treats slots that share a backing as one resource, so this needs a
-	// new schedule, with the passes of both slots ordered and transitioned against each other.
-	// - Inline (default): the frame builds the new schedule before it prepares. The swap takes effect this frame.
-	// - Deferred: the frame keeps those slots' current bindings, and a worker builds the new schedule with the new ones.
-	//   They take effect when it installs, a frame or more later. Until then the graph still binds and orders the old
-	//   backings: a pass that reads its resources through declared views sees the old ones, consistently. A pass that
-	//   reads a resource's live descriptors directly would see the new backing without its barriers, and data written
-	//   into the new backing on the CPU isn't read until the install.
-	// Either way, edits replayed onto a worker build at its install that change these sets build inline.
-	enum class SharingChangePolicy : uint8_t { Inline, Deferred };
-	void SetSharingChangePolicy(SharingChangePolicy policy) noexcept { m_sharingChangePolicy = policy; }
-	SharingChangePolicy GetSharingChangePolicy() const noexcept { return m_sharingChangePolicy; }
 	void SetPersistentRecordingReuse(bool reuse) noexcept { m_persistentRecordingReuse = reuse; }
 	bool PersistentRecordingReuse() const noexcept { return m_persistentRecordingReuse; }
 	// Pass and barrier-batch timestamps in recordings kept for resubmission (off by default): each such list records into
@@ -346,15 +361,6 @@ public:
 	// frameWait: the frame-wait timeline's value (SetFrameWaitTimeline) every batch waits for; 0 for none.
 	static bool SubmitPersistentTicket(PersistentTicket& ticket, std::span<uint64_t> nextQueueValues, PersistentTicketSubmission& out,
 		std::pair<uint32_t, uint64_t> uploadsDone = {UINT32_MAX, 0}, uint64_t frameWait = 0);
-	// The frame-wait timeline: a timeline a host's producer of per-frame values signals, once per frame, after the values it
-	// wrote for that frame; every batch of an execution waits for the value set for it (SetFrameWaitValue here, or
-	// SubmitPersistentTicket's frameWait), so a late producer costs GPU idle, never a CPU wait. Set before the first execution:
-	// every packet prepared from then on can wait on it.
-	static constexpr uint64_t kFrameWaitTimelineIdentity = UINT64_MAX - 1;
-	void SetFrameWaitTimeline(std::shared_ptr<rhi::TimelinePtr> timeline) { m_frameWaitTimeline = std::move(timeline); }
-	bool HasFrameWaitTimeline() const noexcept { return m_frameWaitTimeline && *m_frameWaitTimeline; }
-	// The synchronous executions' wait (Execute): until changed. 0: none.
-	void SetFrameWaitValue(uint64_t value) noexcept { m_frameWaitValue = value; }
 	// Submitting thread (the upload service's owner): records the uploads queued since the last call into
 	// `list` as plain buffer copies, without the graph's registry or admission: a full barrier (against the
 	// work before them), then the copies, whose destinations are left for the next execution's entry
@@ -383,6 +389,8 @@ public:
 	bool RunsInPersistentEpoch(uint32_t passEpoch) const noexcept {
 		return m_persistentEpoch == UINT32_MAX || passEpoch == UINT32_MAX || passEpoch == m_persistentEpoch;
 	}
+
+public:
 	// Hosts that share a queue with another API (for example an adopted DXVK
 	// VkQueue whose translated D3D11 work is submitted before and after the graph)
 	// order that work against the graph with full memory barriers: `entry` at the

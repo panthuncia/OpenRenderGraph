@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -19,6 +20,8 @@ namespace runtime { class IUploadService; }
 class RenderGraph;
 class Runtime;
 struct IHostExecutionData;
+struct UpdateExecutionContext;
+struct PassExecutionContext;
 class GraphInstance;
 
 // What an instance's executions run: the schedule of its selected publication (batches, barriers, alias placement).
@@ -38,7 +41,8 @@ private:
 };
 
 // One execution of an instance: prepared (GraphInstance::Prepare), then submitted. The passes' invocations and the
-// uploads were recorded when it was prepared, so an execution dropped without Submit is submitted by its destructor.
+// uploads were recorded when it was prepared, so an execution of a desc's instance dropped without Submit is submitted
+// by its destructor. One of an adopted graph's is discarded instead: the app's next Prepare replaces it.
 class Execution {
 public:
 	Execution(Execution&& other) noexcept;
@@ -50,6 +54,8 @@ public:
 	// Submits its uploads, then admits its main segment after the runtime's earlier executions, records and submits it.
 	// Once; the instance's thread. Throws if it was submitted already.
 	ExecutionHandle Submit();
+	// Submit with the app's execution context (an adopted graph's: its frame slot, descriptor heaps, profiler ranges).
+	ExecutionHandle Submit(PassExecutionContext& context);
 	bool Submitted() const noexcept { return m_submitted; }
 	// Its index among the instance's executions (PassPrepareContext::executionIndex).
 	uint64_t Index() const noexcept { return m_index; }
@@ -80,7 +86,12 @@ public:
 	// Builds the desc's graph on the runtime. The first Prepare lowers the passes and builds the first publication.
 	// Throws std::invalid_argument without a runtime, or for more frames in flight than the runtime has slots.
 	static std::unique_ptr<GraphInstance> Create(std::shared_ptr<Runtime> runtime, GraphDesc desc);
-	// Waits for its submitted executions on its own queues (not the whole device), then releases the graph.
+	// An app-built graph (BasicRenderer's frame graph), which the app declares through Rebuild and drives with its own
+	// frame slots and contexts: Prepare(UpdateExecutionContext), then Execution::Submit(PassExecutionContext). It keeps
+	// the services and frame services the app gives it, and has no parameters or slots of the instance's.
+	static std::unique_ptr<GraphInstance> Adopt(std::shared_ptr<Runtime> runtime, std::unique_ptr<RenderGraph> graph);
+	// Waits for its submitted executions on its own queues (never the whole device), then releases the graph. An adopted graph is only released: the app has waited
+	// for its work and shut it down.
 	~GraphInstance();
 	GraphInstance(const GraphInstance&) = delete;
 	GraphInstance& operator=(const GraphInstance&) = delete;
@@ -92,6 +103,12 @@ public:
 	// hostData reaches the passes' Prepare as PassPrepareContext::preparationData, for this execution only. It must
 	// live until the execution is submitted.
 	Execution Prepare(const IHostExecutionData* hostData = nullptr);
+	// An adopted graph's: rebuilds it for a new structure. Drops the previous one (the app has made every queue idle),
+	// lets `declare` add passes, resources and providers, then runs the structural build and Setup.
+	void Rebuild(const std::function<void(RenderGraph&)>& declare);
+	// An adopted graph's preparation, in the app's slot (context.preparationSlot). An execution prepared and not
+	// submitted is discarded.
+	Execution Prepare(const UpdateExecutionContext& context);
 	// Whether Prepare would find a free slot without waiting. Retires first.
 	bool CanPrepare();
 	// Notices executions the GPU finished, completing their handles. Never waits.
@@ -104,13 +121,15 @@ public:
 	const std::string& Name() const noexcept { return m_name; }
 	uint64_t Key() const noexcept { return m_key; }
 	uint32_t FramesInFlight() const noexcept { return static_cast<uint32_t>(m_slots.size()); }
+	// Its upload service, which uploads that its passes consume should go through.
+	const std::shared_ptr<runtime::IUploadService>& Uploads() const noexcept { return m_uploads; }
 	// The graph itself, for diagnostics (schedule snapshots, timings). Not for driving it.
 	RenderGraph* Graph() noexcept { return m_graph.get(); }
 
 private:
 	friend class Execution;
 	GraphInstance() = default;
-	ExecutionHandle SubmitPrepared(Execution& execution);
+	ExecutionHandle SubmitPrepared(Execution& execution, PassExecutionContext* context);
 	// A slot whose last execution completed; waits for the oldest when there is none.
 	uint32_t AcquireSlot();
 
@@ -130,6 +149,7 @@ private:
 	std::vector<Slot> m_slots;
 	uint64_t m_prepared = 0, m_submissions = 0;
 	bool m_pending = false;  // an execution prepared and not submitted
+	bool m_adopted = false;
 	ExecutionHandle m_last;
 };
 

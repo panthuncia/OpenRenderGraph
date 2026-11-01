@@ -90,7 +90,11 @@ struct ThreadPoolTaskService::Impl {
                 if (!task.scope || !task.scope->Cancelled()) {
                     try { task.work(); } catch (...) {}
                 }
-                if (task.scope) task.scope->Leave();
+                // The work's captures go before the lock is taken again, and before its scope is left: destroying them
+                // can submit more work (a released command list schedules its pool's reset), which takes the lock.
+                auto scope = std::move(task.scope);
+                task.work = nullptr;
+                if (scope) scope->Leave();
                 lock.lock();
                 continue;
             }
@@ -107,17 +111,19 @@ struct ThreadPoolTaskService::Impl {
 
     // Removes the scope's queued (not yet started) tasks. Started ones keep running.
     void Retract(const std::shared_ptr<PoolScope>& scope) {
-        size_t removed = 0;
+        std::vector<Task> removed;  // destroyed outside the lock (see Run)
         {
             std::lock_guard lock(mutex);
             for (auto& queue : queues) {
                 for (auto it = queue.begin(); it != queue.end();) {
-                    if (it->scope == scope) { it = queue.erase(it); ++removed; }
+                    if (it->scope == scope) { removed.push_back(std::move(*it)); it = queue.erase(it); }
                     else ++it;
                 }
             }
         }
-        for (size_t i = 0; i < removed; ++i) scope->Leave();
+        const auto count = removed.size();
+        removed.clear();
+        for (size_t i = 0; i < count; ++i) scope->Leave();
     }
 
     bool Enqueue(const std::shared_ptr<ITaskScope>& scope, TaskPriority priority,
@@ -154,13 +160,18 @@ ThreadPoolTaskService::ThreadPoolTaskService(size_t workerCount) : m_impl(std::m
 }
 
 ThreadPoolTaskService::~ThreadPoolTaskService() {
+    std::vector<Impl::Delayed> dropped;  // destroyed outside the lock (see Run)
     {
         std::lock_guard lock(m_impl->mutex);
         m_impl->stopping = true;
         // Delayed work that has not come due is dropped; queued work drains.
-        for (auto& entry : m_impl->delayed)
-            if (entry.task.scope) entry.task.scope->Leave();
+        dropped = std::move(m_impl->delayed);
         m_impl->delayed.clear();
+    }
+    for (auto& entry : dropped) {
+        auto scope = std::move(entry.task.scope);
+        entry.task.work = nullptr;
+        if (scope) scope->Leave();
     }
     m_impl->ready.notify_all();
     for (auto& thread : m_impl->threads)

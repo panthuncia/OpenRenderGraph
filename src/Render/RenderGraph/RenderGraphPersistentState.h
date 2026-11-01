@@ -438,7 +438,7 @@ struct RenderGraph::PersistentInstanceState {
 
 // The layout: tables built from the selected publication.
 struct RenderGraph::PersistentLayoutState {
-	// The legacy binding table, per publication.
+	// The binding table recording resolves slots through (resources, views), per publication.
 	const persistent::SelectedPublication* bindingsFor = nullptr;
 	std::shared_ptr<const FrozenExecutionBindings> bindings;
 	// Pass names per logical pass slot, per executable.
@@ -472,7 +472,7 @@ struct RenderGraph::PersistentExecution {
 		std::shared_ptr<const std::vector<std::string>> names; // Per logical pass slot, for statistics/present detection.
 		std::vector<persistent::FrameRebinding> rebindings;
 		std::vector<persistent::FrameProducerWait> waits;
-		std::shared_ptr<const FrozenExecutionBindings> legacyBindings;
+		std::shared_ptr<const FrozenExecutionBindings> bindings;
 		std::vector<compiler::PreparedTimelineBinding> foreignTimelines;
 		std::vector<std::shared_ptr<const void>> leases;
 	};

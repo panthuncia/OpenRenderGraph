@@ -41,7 +41,7 @@ Execution::Execution(Execution&& other) noexcept
 	m_hostData(other.m_hostData), m_submitted(std::exchange(other.m_submitted, true)) {}
 
 Execution::~Execution() {
-	if (!m_instance || m_submitted) return;
+	if (!m_instance || m_submitted || m_instance->m_adopted) return;
 	try { Submit(); } catch (...) {}
 }
 
@@ -49,7 +49,14 @@ ExecutionHandle Execution::Submit() {
 	if (!m_instance) throw std::logic_error("Execution::Submit on a moved-from execution");
 	if (m_submitted) throw std::logic_error("Execution::Submit: already submitted");
 	m_submitted = true;
-	return m_instance->SubmitPrepared(*this);
+	return m_instance->SubmitPrepared(*this, nullptr);
+}
+
+ExecutionHandle Execution::Submit(PassExecutionContext& context) {
+	if (!m_instance) throw std::logic_error("Execution::Submit on a moved-from execution");
+	if (m_submitted) throw std::logic_error("Execution::Submit: already submitted");
+	m_submitted = true;
+	return m_instance->SubmitPrepared(*this, &context);
 }
 
 std::unique_ptr<GraphInstance> GraphInstance::Create(std::shared_ptr<Runtime> runtime, GraphDesc desc) {
@@ -82,11 +89,51 @@ std::unique_ptr<GraphInstance> GraphInstance::Create(std::shared_ptr<Runtime> ru
 	return instance;
 }
 
+std::unique_ptr<GraphInstance> GraphInstance::Adopt(std::shared_ptr<Runtime> runtime, std::unique_ptr<RenderGraph> graph) {
+	if (!runtime || !graph) throw std::invalid_argument("GraphInstance::Adopt needs a runtime and a graph");
+	std::unique_ptr<GraphInstance> instance(new GraphInstance());
+	instance->m_runtime = std::move(runtime);
+	instance->m_name = "adopted";
+	instance->m_graph = std::move(graph);
+	instance->m_adopted = true;
+	return instance;
+}
+
+void GraphInstance::Rebuild(const std::function<void(RenderGraph&)>& declare) {
+	BT_ZONE_SCOPE("ORG.GraphInstance.Rebuild");
+	if (!m_adopted) throw std::logic_error("GraphInstance::Rebuild: only an adopted graph is rebuilt by its app");
+	m_pending = false;
+	m_graph->ResetForRebuild();
+	if (declare) declare(*m_graph);
+	m_graph->CompileStructural();
+	m_graph->Setup();
+}
+
+Execution GraphInstance::Prepare(const UpdateExecutionContext& context) {
+	BT_ZONE_SCOPE("ORG.GraphInstance.Prepare");
+	if (!m_adopted) throw std::logic_error("GraphInstance::Prepare(context): only an adopted graph takes the app's context");
+	m_graph->Update(context, m_runtime->Device());
+	m_pending = true;
+	Execution execution(*this, ++m_prepared, context.preparationSlot);
+	execution.m_hostData = context.hostData;
+	return execution;
+}
+
 GraphInstance::~GraphInstance() {
+	if (m_adopted) {
+		m_graph.reset();
+		return;
+	}
 	if (m_graph) {
 		m_graph->StopFrameProduction();
-		// As GraphHost: an adopted device waits for its own timelines only, never the whole device.
-		(void)m_runtime->Device().WaitIdle();
+		// Its own work only: what each slot's last execution submitted on its queues. Its external client (the uploads)
+		// waits for its own submissions when the graph destroys it.
+		{
+			BT_ZONE_SCOPE("ORG.GraphInstance.WaitForExecutions");
+			for (const auto& slot : m_slots)
+				if (slot.busy)
+					for (const auto& [timeline, value] : slot.points) (void)timeline->HostWait(value);
+		}
 		m_graph->RetirePersistentExecutions();
 		m_graph->ShutdownExtensions();
 		m_graph->ShutdownTaskWorkers();
@@ -144,6 +191,7 @@ bool GraphInstance::CanPrepare() {
 
 Execution GraphInstance::Prepare(const IHostExecutionData* hostData) {
 	BT_ZONE_SCOPE("ORG.GraphInstance.Prepare");
+	if (m_adopted) throw std::logic_error("GraphInstance::Prepare: an adopted graph is prepared with the app's context");
 	if (m_pending) throw std::logic_error("GraphInstance '" + m_name + "': an execution is prepared and not submitted");
 	const auto slot = AcquireSlot();
 	runtime::ScopedActiveGraphServices services(m_graph->GetUploadService(), m_graph->GetDescriptorService());
@@ -163,18 +211,25 @@ Execution GraphInstance::Prepare(const IHostExecutionData* hostData) {
 	return execution;
 }
 
-ExecutionHandle GraphInstance::SubmitPrepared(Execution& execution) {
+ExecutionHandle GraphInstance::SubmitPrepared(Execution& execution, PassExecutionContext* appContext) {
 	BT_ZONE_SCOPE("ORG.GraphInstance.Submit");
 	struct PendingScope {
 		bool& pending;
 		~PendingScope() { pending = false; }
 	} pendingScope{m_pending};
+	PassExecutionContext fallback{};
+	fallback.device = m_runtime->Device();
+	fallback.frameIndex = execution.m_slot;
+	fallback.frameFenceValue = execution.m_index;
+	fallback.hostData = execution.m_hostData;
+	auto& context = appContext ? *appContext : fallback;
+	if (m_adopted) {
+		// The app's frame slots, services and completion: nothing of the instance's to track.
+		m_graph->Execute(context);
+		m_last = m_graph->LastExecution();
+		return m_last;
+	}
 	runtime::ScopedActiveGraphServices services(m_graph->GetUploadService(), m_graph->GetDescriptorService());
-	PassExecutionContext context{};
-	context.device = m_runtime->Device();
-	context.frameIndex = execution.m_slot;
-	context.frameFenceValue = execution.m_index;
-	context.hostData = execution.m_hostData;
 	m_graph->Execute(context);
 	// Every batch signalled its queue's timeline: the value each queue has reached is the execution's completion there.
 	auto& slot = m_slots[execution.m_slot];

@@ -240,22 +240,24 @@ struct TrackedEntityToken {
     }
 
     void Reset() noexcept {
-        flecs::world* resolvedWorld = nullptr;
-        flecs::entity_t resolvedId = 0;
-        const bool hasResolvedEntity = TryGetResolved(resolvedWorld, resolvedId);
-        if (hasResolvedEntity || deferredState) {
-            if (s_hooks.isRuntimeAlive && !s_hooks.isRuntimeAlive()) {
-                Disarm();
-                return;
-            }
-
-            RequestDestroy();
-            if (hasResolvedEntity) {
-                if (s_hooks.destroyEntity) {
-					s_hooks.destroyEntity(*resolvedWorld, resolvedId);
-                }
-            }
+        if (!deferredState && !(world && id)) return;
+        if (s_hooks.isRuntimeAlive && !s_hooks.isRuntimeAlive()) {
+            Disarm();
+            return;
         }
+        // Whether the entity exists is read under the lock that requests its destruction. A creation applied before
+        // that has an entity, which is destroyed here; one applied after sees the request and makes none.
+        flecs::world* resolvedWorld = world;
+        flecs::entity_t resolvedId = id;
+        if (deferredState) {
+            std::scoped_lock lock(deferredState->mutex);
+            deferredState->destroyRequested = true;
+            deferredState->pendingOps.clear();
+            const bool resolved = deferredState->world && deferredState->id && !deferredState->destroyed;
+            resolvedWorld = resolved ? deferredState->world : nullptr;
+            resolvedId = resolved ? deferredState->id : 0;
+        }
+        if (resolvedWorld && resolvedId && s_hooks.destroyEntity) s_hooks.destroyEntity(*resolvedWorld, resolvedId);
         Disarm();
     }
 

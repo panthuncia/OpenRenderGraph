@@ -20,8 +20,8 @@ empty work. Every epoch therefore paid for every pass.
 -   **Execution.** `GraphHost::ExecuteFrame(hostData, beforePrepare, epoch)`, or
     `RenderGraph::SetPersistentEpoch` before `Update`/`Execute`, runs one epoch.
 -   **What an epoch runs.** Only that epoch's passes and the untagged ones are updated, prepared, admitted,
-    recorded and submitted. The dynamic Pre and Tail segments (the upload pass, per-frame passes) run in every
-    epoch as before. An epoch with no main passes runs only those segments.
+    recorded and submitted. The upload passes run in every epoch, submitted through the graph's external client
+    ahead of the epoch's execution. An epoch with no main passes submits only its uploads.
 
 ## One compile, per-epoch executables
 
@@ -134,7 +134,7 @@ instead of `ExecuteFrame`. `ExecuteFrame` throws while async epochs are on.
 -   **Completion.** The host thread receives the submission through a single-producer mailbox. It commits
     admission, retires, reads statistics and releases deferred resources, in submission order.
 -   **Constraints on a ticket.** Its recording may not depend on anything the render thread produces at the
-    epoch. Dynamic Pre and Tail segments may contain only the upload pass. Per-frame values come from latches.
+    epoch. The only upload pass a ticket may have is the host's. Per-frame values come from latches.
 -   **Backing changes.** Each preparation captures every slot's backing, while the render thread runs, so the
     two must not overlap (`BackedResource`: capture and backing mutation are serialized by the preparation
     owner). `Buffer::ResizeBytes` and `ResizeStructured` release the old backing before creating the new one; a
