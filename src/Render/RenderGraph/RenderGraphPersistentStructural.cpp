@@ -524,14 +524,19 @@ void RenderGraph::UpdatePersistentFrameInterruptingPasses(
 // rebuilt executable keeps them disjoint in time (ValidateAliasOrder checks it).
 void RenderGraph::RetireIdlePersistentAliasPools(PersistentExecutionState& state) {
 	const uint64_t retireFrames = m_getAutoAliasPoolRetireIdleFrames ? (std::max)(1u, m_getAutoAliasPoolRetireIdleFrames()) : 120u;
-	for (auto it = state.aliasPools.begin(); it != state.aliasPools.end();) {
+	if (!state.aliasArena) return;
+	std::lock_guard arenaLock(state.aliasArena->mutex);
+	auto& pools = state.aliasArena->pools;
+	for (auto it = pools.begin(); it != pools.end();) {
 		auto& pool = it->second;
-		if (!pool.idleSinceFrame || state.frameNumber - pool.idleSinceFrame < retireFrames) { ++it; continue; }
+		// Idle for every graph: none places into it.
+		if (!pool.required.empty() || !pool.idleSinceFrame || state.frameNumber < pool.idleSinceFrame
+			|| state.frameNumber - pool.idleSinceFrame < retireFrames) { ++it; continue; }
 		spdlog::info("Persistent alias pool retired: pool={:#x} capacity={} idleFrames={}", it->first, pool.capacityBytes,
 			state.frameNumber - pool.idleSinceFrame);
 		basic_telemetry::AddCounter("ORG.Persistent.AliasPoolRetirements");
 		if (pool.allocation) DeletionManager::GetInstance().MarkForDelete(std::move(pool.allocation));
-		it = state.aliasPools.erase(it);
+		it = pools.erase(it);
 	}
 }
 
@@ -690,7 +695,11 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		if (c.exclusion) ++excludedCount;
 	}
 
-	// Pack per pool.
+	// Pack per pool, into the arena's pools (shared with the other graphs of a host): each graph from offset 0.
+	if (!state.aliasArena) state.aliasArena = PersistentAliasArena::Create();
+	std::lock_guard arenaLock(state.aliasArena->mutex);
+	auto& aliasPools = state.aliasArena->pools;
+	state.aliasArena->stale.erase(&state);
 	std::map<uint64_t, std::vector<uint32_t>> byPool;
 	std::unordered_set<uint64_t> plannedPools;
 	for (uint32_t i = 0; i < candidates.size(); ++i) if (candidates[i].pooled) byPool[candidates[i].poolID].push_back(i);
@@ -718,18 +727,20 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		const uint64_t heapEnd = packed.heapEnd, poolAlignment = packed.alignment;
 		requiredBytes += heapEnd;
 		if (heapEnd == 0) continue;
-		// Pool heap: grows with headroom, and shrinks to that headroom when the plan needs less than half of it. A
-		// replaced generation stays alive through the leases held by in-flight publications.
-		auto& pool = state.aliasPools[poolID];
+		// Pool heap: grows with headroom, and shrinks to that headroom when the graphs placed in it need less than half of it. A
+		// replaced generation stays alive through the leases held by in-flight publications and by the placements made in it.
+		auto& pool = aliasPools[poolID];
 		plannedPools.insert(poolID);
 		pool.idleSinceFrame = 0;
-		const auto withHeadroom = static_cast<uint64_t>(std::ceil(static_cast<double>(heapEnd) * headroom));
+		pool.required[&state] = heapEnd;
+		const auto needed = PersistentAliasArena::Required(pool);
+		const auto withHeadroom = static_cast<uint64_t>(std::ceil(static_cast<double>(needed) * headroom));
 		const bool initial = !static_cast<bool>(pool.allocation);
 		const bool grow = !initial && (heapEnd > pool.capacityBytes || poolAlignment > pool.alignment);
 		const bool shrink = !initial && !grow && pool.capacityBytes > 2 * withHeadroom;
 		const bool forced = !initial && !grow && !shrink && state.forceNewAliasHeaps;
 		if (initial || grow || shrink || forced) {
-			uint64_t capacity = heapEnd;
+			uint64_t capacity = needed;
 			if (forced) capacity = (std::max)(capacity, pool.capacityBytes);
 			else if (shrink) capacity = withHeadroom;
 			else if (!initial && pool.capacityBytes)
@@ -758,6 +769,9 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 			pool.alignment = poolAlignment;
 			++pool.generation;
 			pool.heap = AliasHeapGeneration::Capture(pool.allocation, pool.generation);
+			// The other graphs placed in it keep the earlier generation until they place again.
+			for (const auto& [owner, bytes] : pool.required)
+				if (owner != &state) state.aliasArena->stale.insert(owner);
 			spdlog::info("Persistent alias pool {}: pool={:#x} capacity={} required={} alignment={} placements={} generation={}",
 				initial ? "allocated" : forced ? "reallocated (forced)" : shrink ? "shrank" : "grew", poolID, capacity, heapEnd, poolAlignment, members.size(), pool.generation);
 			basic_telemetry::AddCounter("ORG.Persistent.AliasPoolAllocations");
@@ -779,9 +793,13 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 	}
 	std::sort(edges.begin(), edges.end());
 	edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
-	// A pool this plan places nothing into idles; RetireIdlePersistentAliasPools frees it once it has idled long enough.
-	for (auto& [poolID, pool] : state.aliasPools)
-		if (!plannedPools.contains(poolID) && !pool.idleSinceFrame) pool.idleSinceFrame = (std::max)(state.frameNumber, uint64_t{1});
+	// A pool this plan places nothing into idles once no graph places into it; RetireIdlePersistentAliasPools frees it once it has
+	// idled long enough.
+	for (auto& [poolID, pool] : aliasPools) {
+		if (plannedPools.contains(poolID)) continue;
+		pool.required.erase(&state);
+		if (pool.required.empty() && !pool.idleSinceFrame) pool.idleSinceFrame = (std::max)(state.frameNumber, uint64_t{1});
+	}
 
 	// Apply: orderings, then bindings.
 	bool changed = false;
@@ -815,7 +833,7 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		if (!backed) continue;
 		if (c.pooled) {
 			++placed;
-			const auto& pool = state.aliasPools.at(c.poolID);
+			const auto& pool = aliasPools.at(c.poolID);
 			const State::AliasPlacementRecord record{c.poolID, c.offset, c.sizeBytes, pool.heap.get()};
 			const auto previous = state.aliasPlaced.find(c.concrete);
 			if (previous != state.aliasPlaced.end() && previous->second == record && backed->IsMaterialized()) continue;
@@ -877,7 +895,7 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		}
 		autoAliasPoolDebug.clear();
 		for (auto& [poolID, pool] : pools) {
-			if (const auto found = state.aliasPools.find(poolID); found != state.aliasPools.end()) pool.reservedBytes = found->second.capacityBytes;
+			if (const auto found = aliasPools.find(poolID); found != aliasPools.end()) pool.reservedBytes = found->second.capacityBytes;
 			std::sort(pool.ranges.begin(), pool.ranges.end(), [](const auto& a, const auto& b) { return a.startByte < b.startByte; });
 			for (size_t i = 0; i < pool.ranges.size(); ++i)
 				for (size_t j = i + 1; j < pool.ranges.size() && pool.ranges[j].startByte < pool.ranges[i].endByte; ++j)

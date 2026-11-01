@@ -136,7 +136,8 @@ void ValidatePreparedBackingOrder(const GraphCompileStructure& structure, std::s
 
 PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
     const Schedule& graph, std::span<const PreparedBackingState> initial,
-    std::span<const rhi::ResourceHandle> invalidated, bool closeToHome, bool entryOnly, bool validated, uint64_t backingSet) const {
+    std::span<const rhi::ResourceHandle> invalidated, bool closeToHome, bool entryOnly, bool validated, uint64_t backingSet,
+    bool externalHome) const {
     BT_ZONE_SCOPE("ORG.Execution.ResolveBackingStates");
     if (!graph.structure || !graph.states.complete || initial.size() != graph.structure->resourceIDs.size())
         throw std::invalid_argument("Incomplete symbolic state admission input");
@@ -336,6 +337,9 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
         const StateGrid* existing = boundaryStep ? gridOf(step.resource) : nullptr;
         const bool useSubmittedState = boundaryStep
             && existing && !invalidatedState && !authoritativeState;
+        // A host-owned texture under external home states that enters from its seeded (home) state is on the graphics queue.
+        const bool homeSeeded = boundaryStep && externalHome && !closeToHome && captured.hostOwned && captured.shape.hasLayout
+            && !multiDevice && !useSubmittedState && !invalidatedState;
         if (trace::Enabled(trace::Category::Barriers)) {
             const auto consumerQueue = graph.batches[step.batch].queue;
             const char* path = !boundaryStep ? (crossQueue ? "body-cross-queue" : step.previousBatch == step.batch
@@ -495,8 +499,8 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
                 barrier.beforeSync = static_cast<rhi::ResourceSyncState>(uniformBefore->sync);
                 barrier.afterSync = static_cast<rhi::ResourceSyncState>(step.after.sync);
                 barrier.discard = barrier.beforeLayout == rhi::ResourceLayout::Undefined;
-                const bool handedOff = !externalAcquire && useSubmittedState
-                    && handOff(barrier, captured, uniformPreviousQueue, consumerQueue, step.batch);
+                const bool handedOff = !externalAcquire && (useSubmittedState || homeSeeded)
+                    && handOff(barrier, captured, homeSeeded ? 0u : uniformPreviousQueue, consumerQueue, step.batch);
                 if (NeedsTextureBarrier(barrier)) (handedOff ? output.acquired : boundaryTextures).push_back(barrier);
             } else {
                 const auto beforeAccess = static_cast<rhi::ResourceAccessType>(uniformBefore->access);
@@ -551,6 +555,7 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
                         break;
                     }
                 }
+                if (homeSeeded) previousQueue = 0;
             }
             const auto consumerQueue = graph.batches[step.batch].queue;
             const bool submittedQueueHandoff = previousQueue != UINT32_MAX
@@ -719,20 +724,29 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
                 }
         }
     }
-    if (closeToHome) {
+    // A host-owned texture under external home states goes home as a closed execution's resources do, on the graphics queue.
+    const auto goesHomeExternally = [&](const PreparedBackingState& captured) {
+        return !closeToHome && externalHome && captured.hostOwned && captured.shape.hasLayout && captured.deviceHandles.empty();
+    };
+    if (closeToHome || externalHome) {
         // Per resource and cell: the first step (its entry state is home when the backing seeds nothing
         // for the cell) and the last (where the resource leaves the execution).
         //
-        // A resource without a layout (a buffer) may be used from several queues: the execution's relative waits order
+        // Closed: a resource without a layout (a buffer) may be used from several queues: the execution's relative waits order
         // its uses inside it, and the host orders whole executions against each other on every queue
         // (ExternalQueueBoundary). It goes home on the queue of its last use. A texture's home layout would need a
         // queue-family ownership transfer back, so a texture stays on one queue.
+        // External home: a host-owned texture may be used from any queue. A cell last used on another queue than graphics is
+        // released there and acquired on graphics (homeAcquires). Its body barriers (the transition and the release) are the
+        // full plan's; an entry-only plan has the commits and the acquires.
         struct Cells { std::vector<uint32_t> first, last; uint32_t queue = UINT32_MAX; };
         std::unordered_map<uint32_t, Cells> byResource;
         for (uint32_t index = 0; index < graph.states.steps.size(); ++index) {
             const auto& step = graph.states.steps[index];
             const auto& captured = ordered[step.resource];
             if (!captured.resource.valid()) continue;
+            const bool external = goesHomeExternally(captured);
+            if (!closeToHome && !external) continue;
             auto& cells = byResource[step.resource];
             if (cells.first.empty()) {
                 const size_t count = size_t{captured.shape.mips} * captured.shape.slices;
@@ -740,9 +754,9 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
                 cells.last.assign(count, UINT32_MAX);
             }
             const auto queue = graph.batches[step.batch].queue;
-            if (cells.queue != UINT32_MAX && cells.queue != queue && captured.shape.hasLayout)
+            if (!external && cells.queue != UINT32_MAX && cells.queue != queue && captured.shape.hasLayout)
                 throw std::invalid_argument("A closed execution uses a texture from more than one queue");
-            cells.queue = queue;
+            cells.queue = external ? 0u : queue;
             Visit(captured.shape, step.range, [&](uint32_t mip, uint32_t slice) {
                 const auto cell = CellIndex(captured.shape, mip, slice);
                 if (cells.first[cell] == UINT32_MAX) cells.first[cell] = index;
@@ -751,6 +765,7 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
         }
         for (const auto& [resource, cells] : byResource) {
             const auto& captured = ordered[resource];
+            const bool external = goesHomeExternally(captured);
             const bool fixedHeapState = captured.heapType == rhi::HeapType::Upload
                 || captured.heapType == rhi::HeapType::Readback;
             for (uint32_t mip = 0; mip < captured.shape.mips; ++mip)
@@ -766,7 +781,42 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
                             break;
                         }
                     auto& output = result.batches[last.batch];
-                    if (captured.shape.hasLayout && !fixedHeapState && home.layout != last.after.layout) {
+                    const auto lastQueue = graph.batches[last.batch].queue;
+                    if (external && lastQueue != 0 && !fixedHeapState) {
+                        // Released on its last use's queue to graphics, from where it was left to Common, and acquired on
+                        // graphics, repeating it (Vulkan pairs them exactly; a backend whose transfer collapses drops the acquire),
+                        // then taken to its home layout.
+                        rhi::TextureBarrier barrier{};
+                        barrier.texture = captured.resource;
+                        barrier.range = {mip, 1, slice, 1};
+                        barrier.beforeAccess = static_cast<rhi::ResourceAccessType>(last.after.access);
+                        barrier.afterAccess = rhi::ResourceAccessType::Common;
+                        barrier.beforeLayout = static_cast<rhi::ResourceLayout>(last.after.layout);
+                        barrier.afterLayout = rhi::ResourceLayout::Common;
+                        barrier.beforeSync = static_cast<rhi::ResourceSyncState>(last.after.sync);
+                        barrier.afterSync = rhi::ResourceSyncState::All;
+                        barrier.queueOwnership = rhi::QueueOwnership::Release;
+                        barrier.ownershipPeer = rhi::QueueKind::Graphics;
+                        if (!entryOnly) output.afterPass[graph.positionByPass[last.pass]].textures.push_back(barrier);
+                        barrier.queueOwnership = rhi::QueueOwnership::Acquire;
+                        barrier.ownershipPeer = OwnershipPeerForQueue(lastQueue);
+                        result.homeAcquires.textures.push_back(barrier);
+                        if (home.layout != static_cast<uint64_t>(rhi::ResourceLayout::Common)) {
+                            rhi::TextureBarrier toHome{};
+                            toHome.texture = captured.resource;
+                            toHome.range = {mip, 1, slice, 1};
+                            toHome.beforeAccess = rhi::ResourceAccessType::Common;
+                            toHome.afterAccess = rhi::ResourceAccessType::Common;
+                            toHome.beforeLayout = rhi::ResourceLayout::Common;
+                            toHome.afterLayout = static_cast<rhi::ResourceLayout>(home.layout);
+                            toHome.beforeSync = rhi::ResourceSyncState::All;
+                            toHome.afterSync = rhi::ResourceSyncState::All;
+                            result.homeAcquires.home.push_back(toHome);
+                        }
+                        if (std::ranges::find(result.homeAcquires.producers, last.batch) == result.homeAcquires.producers.end())
+                            result.homeAcquires.producers.push_back(last.batch);
+                    } else if (captured.shape.hasLayout && !fixedHeapState && home.layout != last.after.layout
+                        && !(external && entryOnly)) {
                         rhi::TextureBarrier barrier{};
                         barrier.texture = captured.resource;
                         barrier.range = {mip, 1, slice, 1};

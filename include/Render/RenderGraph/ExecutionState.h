@@ -38,6 +38,9 @@ struct PreparedBackingState {
     // Frame-only report from an external producer. Its complete incoming states
     // supersede the last graph submission, transactionally at batch commit.
     bool authoritativeIncoming = false;
+    // The host owns it (Resource::HostOwned): with external home states (Prepare's externalHome), each execution leaves it in
+    // its home state on the graphics queue.
+    bool hostOwned = false;
     // A resource shared across devices: its handle on each device instance (by index; [0] is resource). Barriers on a queue use
     // its device's handle, and a use on another device than the last is an external ownership handoff. Empty: one device.
     std::vector<rhi::ResourceHandle> deviceHandles;
@@ -83,6 +86,14 @@ struct PreparedExecutionBarrierPlan {
         std::vector<uint32_t> consumers;
     };
     std::vector<Release> releases;
+    // Host-owned textures whose last use is on another queue than the graphics queue (external home states): released there after
+    // that use to Common, and acquired on the graphics queue by these barriers (textures), then taken to their home layouts (home,
+    // a barrier batch of its own), in a list submitted after the producers (batches). The host uses them only after it.
+    struct HomeAcquires {
+        std::vector<rhi::TextureBarrier> textures;
+        std::vector<rhi::TextureBarrier> home;
+        std::vector<uint32_t> producers;
+    } homeAcquires;
 };
 
 // An entry-only plan (BackingStateAdmissionLedger::Prepare's entryOnly) and what the ledger held of each resource its entry steps
@@ -217,10 +228,14 @@ public:
     // body's barriers (beforePass, afterPass) are left out. validated: the backings were checked against the graph's resource order
     // (ValidatePreparedBackingOrder) when they were made.
     // backingSet: the backings' set (AdmissionBackingSet::Id), whose ledger entries are found once; 0 for none.
+    // externalHome: external home states, an interop option. Every host-owned texture (PreparedBackingState::hostOwned) the
+    // execution touches leaves it in its home state (as closeToHome's) on the graphics queue (slot 0), so the host finds it where
+    // it left it. A last use on another queue releases it to the graphics queue (homeAcquires). Other resources are left as the
+    // execution leaves them, for the ledger to hand off.
     PreparedExecutionBarrierPlan Prepare(
         const Schedule& graph, std::span<const PreparedBackingState> initial,
         std::span<const rhi::ResourceHandle> invalidated = {}, bool closeToHome = false, bool entryOnly = false,
-        bool validated = false, uint64_t backingSet = 0) const;
+        bool validated = false, uint64_t backingSet = 0, bool externalHome = false) const;
     void CommitBatch(const PreparedBatchBarriers&);
     // The same, each commit's entry found by its compiler resource index (PreparedBatchBarriers::committedIndices) in the backings'
     // set (backingSet as for Prepare).

@@ -1,6 +1,9 @@
 // RenderGraph's structural build: materializing the extensions' passes, CompileStructural, and redeclaration.
 #include "RenderGraphInternal.h"
 
+#include <cstdlib>
+#include <string_view>
+
 namespace org {
 
 using namespace graph_internal;
@@ -92,6 +95,14 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 			par.resources.externalWaitBindingsBeforeTransitions = b.params.externalWaitBindingsBeforeTransitions;
 			par.resources.isGeometryPass = b.params.isGeometryPass;
 			par.resources.preferredQueueKind = ResolveExternalPreferredQueueKind(d);
+			// Diagnostic (ORG_PERSISTENT_COPIES_ON_COPY_QUEUE=1): every copy pass on the copy queue whatever it prefers, to exercise
+			// that queue. Exclusive resources still route it to graphics.
+			static const bool copiesOnCopyQueue = [] {
+				const char* value = std::getenv("ORG_PERSISTENT_COPIES_ON_COPY_QUEUE");
+				return value && std::string_view(value) == "1";
+			}();
+			if (copiesOnCopyQueue && d.copyPass)
+				par.resources.preferredQueueKind = QueueKind::Copy;
 			par.resources.queueAssignmentPolicy = ResolveExternalQueueAssignmentPolicy(d);
 			par.resources.pinnedQueueSlot = d.pinnedQueueSlot;
 			if (materializeReferencedResources) {

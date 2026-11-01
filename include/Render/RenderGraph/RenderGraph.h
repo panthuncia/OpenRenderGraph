@@ -51,6 +51,7 @@ class Resource;
 class RenderPassBuilder;
 class ExternalEpochExecution;
 class ExternalClient;
+class PersistentAliasArena;
 struct IPassBuilder;
 struct IDynamicDeclaredResources;
 
@@ -240,8 +241,8 @@ public:
 		std::vector<uint64_t> signals;  // per batch of every segment, in order: the value it signalled
 		// The handoff and release lists the submission recorded: the host keeps them until its slot completes.
 		std::vector<std::shared_ptr<const void>> leases;
-		// An external epoch's ticket (SetExternalPersistentEpochs): nothing was submitted; its packets are the host's to execute,
-		// with these waits and signals (the values above among them).
+		// An external epoch's ticket (SetExternalPersistentEpochs): its graphics batches were not submitted; they are the host's
+		// to execute, segment by segment, with their waits and signals (the values above among them).
 		std::shared_ptr<ExternalEpochExecution> external;
 	};
 
@@ -260,6 +261,17 @@ private:
 	// its admission does not depend on what ran before. Set before the first frame.
 	void SetPersistentClosedExecutions(bool closed) noexcept { m_persistentClosedExecutions = closed; }
 	bool PersistentClosedExecutions() const noexcept { return m_persistentClosedExecutions; }
+	// External home states (persistent::SynchronousAdmission::SetExternalHomeStates), an interop option: every execution gives
+	// each host-owned texture it touches (Resource::HostOwned) back in its home state on the graphics queue. Set before the first
+	// frame.
+	void SetPersistentExternalHomeStates(bool externalHome) noexcept { m_persistentExternalHomeStates = externalHome; }
+	bool PersistentExternalHomeStates() const noexcept { return m_persistentExternalHomeStates; }
+	// The alias pools the graph places its transients into (PersistentAliasArena), shared with the other graphs given the same
+	// arena. Without one the graph has pools of its own. Set before the first frame.
+	void SetPersistentAliasArena(std::shared_ptr<PersistentAliasArena> arena) noexcept { m_persistentAliasArena = std::move(arena); }
+	// False while some of its placements are in a pool generation another graph has replaced (the pool grew): placed again, by a
+	// rebuild, they share the pool's memory again.
+	bool PersistentAliasPlacementsCurrent() const;
 
 	// Tickets (async epochs, GraphHost::EnableAsyncEpochs). The graph's owner thread prepares an
 	// epoch's main execution ahead of its epoch point - Update, invocations, recording - into a ticket, for a
@@ -271,14 +283,19 @@ private:
 	// assigning timeline values in submission order. The owner then completes the ticket (its statistics and
 	// retirement). Closed and open executions both work; no upload pass but the host's.
 	/**
-	 * @brief Owner thread, while no ticket is prepared (the host's async epochs stopped): the persistent epochs the host executes
-	 * itself, in a command buffer of its own (ExternalEpochExecution). Their tickets record into secondary lists, and a pass of
-	 * theirs recorded at execution (ExternalPassDesc::recordAtExecution) is recorded by the host's execution. Every pass of such an
-	 * epoch must run on the graphics queue (the host's buffer is one graphics submission), and their batches must not wait for each
-	 * other across queues; a ticket that breaks either throws. A recording of one with a pass recorded at execution is never kept for reuse.
+	 * @brief Owner thread, while no ticket is prepared (the host's async epochs stopped): the persistent epochs whose graphics
+	 * work the host executes itself, in its own command buffers (ExternalEpochExecution). Their tickets record their graphics
+	 * batches into secondary lists, and a pass of theirs recorded at execution (ExternalPassDesc::recordAtExecution) is recorded by
+	 * the host's execution; it must run on the graphics queue. Their batches on other queues are recorded and submitted as any
+	 * other ticket's. A recording of one with a pass recorded at execution is never kept for reuse.
 	 */
 	void SetExternalPersistentEpochs(std::vector<uint32_t> epochs);
 	bool IsExternalPersistentEpoch(uint32_t epoch) const noexcept;
+	// A queue slot the host's stream runs: the graphics queue's, or one on the same native queue (a kind the device aliases to it).
+	// An external epoch's batches on it are the host's to execute, in its stream's order.
+	bool InHostStream(uint32_t slot) const noexcept;
+	// The secondary lists an external epoch's batches on that slot record into.
+	std::shared_ptr<CommandListPool> ExternalSecondaryPool(uint32_t slot);
 	// Owner thread. hostFrame numbers the execution (its statistics and lifecycle). hostTag: the host's currency tag the ticket
 	// is prepared under (SetPersistentTicketHostTag), which a kept recording must have been recorded under too. hostData: what
 	// the passes prepare for (FramePreparationContext::preparationData), e.g. a scene revision; retained while it records.
@@ -366,8 +383,11 @@ private:
 	// batch, unless RecordPendingUploads planned the ticket's uploads by queue (queueLists), and then only a batch that uses
 	// what they write. The uploads it recorded on another queue go to that queue just ahead of its first batch there.
 	// frameWait: the frame-wait timeline's value (SetFrameWaitTimeline) every batch waits for; 0 for none.
+	// An external epoch's ticket (out.external) submits its batches off the graphics queue here and gives the rest to its host
+	// (ExternalEpochExecution). streamUploads: its graphics-queue uploads were recorded for the host's stream, ahead of its first
+	// segment. A batch off the graphics queue that uses them waits for a segment of their own (the first).
 	bool SubmitPersistentTicket(PersistentTicket& ticket, std::span<uint64_t> nextQueueValues, PersistentTicketSubmission& out,
-		std::pair<uint32_t, uint64_t> uploadsDone = {UINT32_MAX, 0}, uint64_t frameWait = 0);
+		std::pair<uint32_t, uint64_t> uploadsDone = {UINT32_MAX, 0}, uint64_t frameWait = 0, bool streamUploads = false);
 	// Submitting thread, holding the sequencer (HoldPersistentSequencer) until the ticket is submitted: admits each of the
 	// ticket's segments against the ledgers as they are now. queueValues: what the host has submitted on each queue slot.
 	void AdmitPersistentTicket(PersistentTicket& ticket, std::span<const uint64_t> queueValues);
@@ -721,9 +741,13 @@ private:
 	std::atomic<std::shared_ptr<const PersistentScheduleSnapshot>> m_scheduleSnapshot;
 	std::vector<uint32_t> m_persistentEpochOrder;
 	bool m_persistentClosedExecutions = false;
-	// SetExternalPersistentEpochs; and the secondary lists their tickets record into (graphics, made at their first ticket).
+	bool m_persistentExternalHomeStates = false;
+	std::shared_ptr<PersistentAliasArena> m_persistentAliasArena;
+	// SetExternalPersistentEpochs; and the secondary lists their tickets record into, per queue slot in the host's stream (graphics
+	// lists, made at their first ticket).
 	std::vector<uint32_t> m_externalPersistentEpochs;
-	std::shared_ptr<CommandListPool> m_externalSecondaryPool;
+	std::mutex m_externalSecondaryPoolsMutex;
+	std::vector<std::shared_ptr<CommandListPool>> m_externalSecondaryPools;
 	bool m_persistentRecordingReuse = false;
 	SharingChangePolicy m_sharingChangePolicy = SharingChangePolicy::Inline;
 	bool m_persistentRecordingTimestamps = false;

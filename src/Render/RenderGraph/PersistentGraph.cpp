@@ -52,7 +52,7 @@ void ValidateSharedBacking(const BindingVersion& a, const BindingVersion& b) {
             && x.heapType == y.heapType && x.aliasHeapIdentity == y.aliasHeapIdentity
             && x.aliasHeap.get() == y.aliasHeap.get() && !x.aliasHeap.owner_before(y.aliasHeap)
             && !y.aliasHeap.owner_before(x.aliasHeap) && x.aliasPoolID == y.aliasPoolID
-            && x.aliasOffset == y.aliasOffset && x.aliasSize == y.aliasSize,
+            && x.aliasOffset == y.aliasOffset && x.aliasSize == y.aliasSize && x.hostOwned == y.hostOwned,
             "Shared physical slots disagree on placement");
         Require(x.regions && y.regions && x.regions->size() == y.regions->size(),
             "Shared physical slots disagree on incoming state");
@@ -1785,14 +1785,14 @@ void SynchronousAdmission::AdmitLedger(FrameAdmission& frame, bool cacheEligible
         // Planned against the ledger, and kept as the prediction for the next admission of this executable.
         auto& prediction = *predictionSlot->prediction;
         prediction.plan = std::make_shared<const compiler::PreparedExecutionBarrierPlan>(m_sequencer->states.Prepare(graph, frame.backings,
-            invalidated, m_closed, true, frame.backings.Validated(), frame.backings.Id()));
+            invalidated, m_closed, true, frame.backings.Validated(), frame.backings.Id(), m_externalHome));
         m_sequencer->states.Capture(prediction, graph, frame.backings, frame.backings.Id());
         frame.sharedBarriers = prediction.plan;
         frame.prediction = predictionSlot->prediction;
         ++m_planned;
     } else {
         frame.barriers = m_sequencer->states.Prepare(graph, frame.backings, invalidated, m_closed, frame.entryOnly, frame.backings.Validated(),
-            frame.backings.Id());
+            frame.backings.Id(), m_externalHome);
         if (cacheable) {
             ++m_planCacheMisses;
             if (m_planCache.size() >= 64) m_planCache.erase(m_planCache.begin());
@@ -1867,6 +1867,15 @@ void SynchronousAdmission::SetClosedExecutions(bool closed) {
     Require(m_pending.empty(), "Closed executions changed during a pending admission");
     if (m_closed != closed) m_planCache.clear();
     m_closed = closed;
+}
+void SynchronousAdmission::SetExternalHomeStates(bool externalHome) {
+    std::lock_guard lock(m_sequencer->mutex);
+    Require(m_pending.empty(), "External home states changed during a pending admission");
+    if (m_externalHome != externalHome) {
+        m_planCache.clear();
+        m_predictions.clear();
+    }
+    m_externalHome = externalHome;
 }
 SynchronousAdmission::SynchronousAdmission(size_t frameCapacity,
     std::function<void(std::shared_ptr<const void>)> retireOwnership, std::shared_ptr<ResourceSequencer> sequencer)

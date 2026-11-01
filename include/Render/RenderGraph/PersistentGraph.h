@@ -556,6 +556,10 @@ public:
     // Requires every resource of an execution to be used from one queue. Set before the first Prepare.
     void SetClosedExecutions(bool closed);
     bool ClosedExecutions() const noexcept { return m_closed; }
+    // External home states, an interop option (BackingStateAdmissionLedger::Prepare externalHome): every host-owned texture an
+    // execution touches leaves it in its home state on the graphics queue. Set before the first Prepare.
+    void SetExternalHomeStates(bool externalHome);
+    bool ExternalHomeStates() const noexcept { return m_externalHome; }
     // The queue slot a host records its uploads on ahead of an execution (the graphics queue). Set, every admission fills
     // FrameAdmission::boundaryAccessWaits for the resources batches on other queues use, so a host can record their uploads
     // on those queues instead. UINT32_MAX (the default): none.
@@ -618,6 +622,7 @@ private:
     // Admissions prepared and not yet committed or abandoned, in sequence order (at most one unless closed).
     std::vector<uint64_t> m_pending;
     bool m_closed = false;
+    bool m_externalHome = false;
     uint32_t m_uploadQueue = UINT32_MAX;  // SetUploadQueue
     struct CachedPlan {
         std::weak_ptr<const ExecutableGeneration> executable;

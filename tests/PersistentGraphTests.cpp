@@ -447,6 +447,61 @@ int main() {
         open.Abandon(single);
     }
     {
+        // External home states: a host-owned texture used on the compute queue is taken from the graphics queue at entry and
+        // given back there at exit, in its home state, each execution. Without the option it stays where its last use left it.
+        GraphProgram program; CompileWorkspace workspace; std::atomic_bool cancelled{false};
+        auto edit = program.BeginEdit();
+        edit.SetQueues({{0,true},{0,true}});
+        auto binding = Binding(95); binding.identity = (uint64_t{1} << 32) | 95; binding.shape = {1,1,true};
+        auto state = std::make_shared<PreparedBackingState>();
+        state->graphResourceID = 1; state->resource = {95,1}; state->shape = binding.shape; state->hostOwned = true;
+        const CompileResourceState home{static_cast<uint64_t>(rhi::ResourceAccessType::Common),
+            static_cast<uint64_t>(rhi::ResourceLayout::Common), static_cast<uint64_t>(rhi::ResourceSyncState::None), false};
+        state->regions = std::make_shared<const std::vector<PreparedStateRegion>>(std::vector<PreparedStateRegion>{{{0,1,0,1}, home}});
+        binding.admission = state;
+        const auto slot = edit.AddResource(binding.shape,binding);
+        CompilePass pass;
+        pass.compatibleQueueSlots = {1}; pass.preferredQueueSlot = 1;
+        edit.Declare(edit.AddPass(pass),slot,{},{static_cast<uint64_t>(rhi::ResourceAccessType::UnorderedAccess),
+            static_cast<uint64_t>(rhi::ResourceLayout::UnorderedAccess),static_cast<uint64_t>(rhi::ResourceSyncState::ComputeShading),true});
+        auto selected = edit.Build(workspace,cancelled);
+        CHECK(selected && program.Install(selected));
+        const std::array<ExecutionTimelinePoint,2> queues{{{13,0},{14,0}}};
+        const auto run = [&](SynchronousAdmission& admission, uint64_t value) {
+            auto frame = admission.Prepare(selected,queues);
+            const auto& barriers = frame.barriers;
+            bool released = false;
+            for (const auto& batch : barriers.batches)
+                for (const auto& after : batch.afterPass)
+                    for (const auto& barrier : after.textures)
+                        released = released || (barrier.queueOwnership == rhi::QueueOwnership::Release && barrier.ownershipPeer == rhi::QueueKind::Graphics
+                            && barrier.afterLayout == rhi::ResourceLayout::Common);
+            uint32_t committedQueue = UINT32_MAX;
+            for (const auto& batch : barriers.batches)
+                for (const auto queue : batch.committedQueues) committedQueue = queue;
+            struct Result { bool entryRelease, released, acquired; uint32_t committedQueue; } result{
+                barriers.releases.size() == 1 && barriers.releases.front().queue == 0, released,
+                barriers.homeAcquires.textures.size() == 1 && barriers.homeAcquires.producers == std::vector<uint32_t>{0}
+                    && barriers.homeAcquires.textures.front().queueOwnership == rhi::QueueOwnership::Acquire
+                    && barriers.homeAcquires.home.empty(),
+                committedQueue};
+            GraphExecutionTimeline receipt; receipt.batches.resize(frame.publication->executable->graph->batches.size());
+            for (auto& batch : receipt.batches) batch.signal = {14,value};
+            admission.Commit(frame,receipt);
+            return result;
+        };
+        SynchronousAdmission external(8);
+        external.SetExternalHomeStates(true);
+        for (uint64_t value = 1; value <= 2; ++value) {
+            const auto result = run(external, value);
+            CHECK(result.entryRelease && result.released && result.acquired && result.committedQueue == 0);
+        }
+        SynchronousAdmission plain(8);
+        const auto first = run(plain, 1), second = run(plain, 2);
+        CHECK(!first.entryRelease && !first.released && !first.acquired && first.committedQueue == 1);
+        CHECK(!second.entryRelease && !second.acquired && second.committedQueue == 1);
+    }
+    {
         // Host epochs: one whole-frame executable, epochs in their declared order, and
         // one executable per epoch with only its passes (and the untagged ones).
         GraphProgram program; CompileWorkspace workspace; std::atomic_bool cancelled{false};

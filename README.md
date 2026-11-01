@@ -17,7 +17,10 @@ ORG provides a pass-oriented API for building frame pipelines, tracking resource
 
 - Compiles a persistent schedule from typed passes once, and executes it every frame; only structural changes rebuild it.
 - Tracks resource access/layout transitions, batch ordering and queue synchronization, across one or more devices.
-- Runs a frame as several executions (epochs) at points of a host's own frame, prepared ahead on a host thread.
+- Runs a frame as several executions (epochs) at points of a host's own frame, each a graph of its own that rebuilds
+  alone, prepared ahead on a host thread and admitted against the others at submission.
+- Lowers an epoch into the host's own command stream (in-stream execution), splitting it only where a wait on another
+  queue needs it.
 - Hosts passes from other modules through a C ABI (`OpenRenderGraph/ContributorAPI.h`).
 - Exposes runtime services for upload, readback, statistics, and graph settings.
 - Includes memory introspection and aliasing planning/debug support.
@@ -58,8 +61,10 @@ org::GraphHost host({
 });
 ```
 
-`Desc` also takes the host's epochs (`epochOrder`), frames in flight, closed executions, recording reuse and the external
-queue boundary (for a host that shares its queue with another API, as Community Shaders shares DXVK's).
+`Desc` also takes the host's epochs (`epochOrder`), frames in flight, recording reuse, the shared alias arena and the interop
+options for a host that shares its queues and resources with another API, as Community Shaders shares DXVK's: the external
+queue boundary, external home states and closed executions. [docs/persistent-epochs.md](docs/persistent-epochs.md)
+describes embedding ORG: epochs as graphs, open executions, tickets, in-stream execution and the interop options.
 
 ### 2) Write a pass
 
@@ -166,8 +171,10 @@ host.ExecuteFrame();                      // one execution of every pass
 // or, with epochs: host.SubmitEpoch(epoch) at each of the host's points
 ```
 
-`RequestRebuild` (or a registry change an extension notices) rebuilds the schedule at the next frame. With async epochs
-(`SetAsyncEpochs`) the host's thread prepares, admits and records each epoch ahead; the frame's point only submits.
+`RequestRebuild` (or a registry change an extension notices) rebuilds the schedule at the next frame; `RequestRebuild(epoch)`
+rebuilds one epoch's graph and keeps the others. With async epochs (`SetAsyncEpochs`) the host's thread prepares and records
+each epoch ahead; the frame's point admits it against the ledgers and submits. With external epochs (`SetExternalEpochs`)
+the host executes an epoch's graphics work in its own command stream (`TakeExternalExecution`).
 
 ### 5) Contributors from other modules
 

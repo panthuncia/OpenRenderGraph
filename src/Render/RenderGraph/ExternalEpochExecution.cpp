@@ -6,9 +6,12 @@
 
 namespace org {
 
-void ExternalEpochExecution::Execute(rhi::CommandList a_primary) const {
+void ExternalEpochExecution::Execute(size_t a_segment, rhi::CommandList a_primary) const {
 	BT_ZONE_SCOPE("ORG.ExternalEpoch.Execute");
-	if (m_executed.exchange(true, std::memory_order_acq_rel)) throw std::logic_error("An external epoch's execution is executed once");
+	if (a_segment >= segments.size()) throw std::out_of_range("An external epoch's execution has no such segment");
+	size_t expected = a_segment;
+	if (!m_executed.compare_exchange_strong(expected, a_segment + 1, std::memory_order_acq_rel))
+		throw std::logic_error("An external epoch's segments are executed once each, in order");
 	const auto execute = [&](std::span<rhi::CommandList> a_lists, rhi::DescriptorHeapHandle a_resources, rhi::DescriptorHeapHandle a_samplers) {
 		if (a_lists.empty()) return;
 		if (a_resources.valid())
@@ -18,9 +21,10 @@ void ExternalEpochExecution::Execute(rhi::CommandList a_primary) const {
 		for (auto& list : a_lists) pointers.push_back(&list);
 		a_primary.ExecuteCommands({pointers.data(), static_cast<uint32_t>(pointers.size())});
 	};
-	auto leadingLists = leading;
-	execute(leadingLists, leadingResourceHeap, leadingSamplerHeap);
-	for (const auto& item : items) {
+	const auto& segment = segments[a_segment];
+	auto leadingLists = segment.leading;
+	execute(leadingLists, segment.leadingResourceHeap, segment.leadingSamplerHeap);
+	for (const auto& item : segment.items) {
 		if (!item.packet) continue;
 		if (item.packet->Deferred()) {
 			BT_ZONE_SCOPE("ORG.ExternalEpoch.RecordDeferred");

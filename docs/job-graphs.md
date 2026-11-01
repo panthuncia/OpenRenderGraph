@@ -226,9 +226,9 @@ latency asks for it. Things to reconsider:
 - **Contention.** Contention is per submission, not per pass. If profiling shows it matters, striped per-resource locks
   taken in sorted order can replace the single mutex, because admission only touches the cells of the execution's
   imports.
-- **Closed executions.** Community Shaders' closed executions (prepared ahead, returned to home states) keep their current
-  path until Community Shaders migrates (Phase 7), then they are deleted. They use one graph and never share resources
-  with another graph.
+- **Closed executions.** Closed executions (every resource returned to its home state) are now an interop option, off by
+  default (`persistent-epochs.md`, "Interop options"). Community Shaders runs its epochs open, a graph each, admitted at
+  submission against the shared ledgers.
 
 **Implementation order.**
 1. **2a:** runtime-unique timeline identities. A queue slot's identity is no longer `slot + 1`, and a foreign timeline's is

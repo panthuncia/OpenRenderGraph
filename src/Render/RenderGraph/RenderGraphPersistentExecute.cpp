@@ -231,28 +231,23 @@ void RenderGraph::RecordPersistentSegment(PersistentSegmentRun& run) {
 	jobs.resize(graph.batches.size());
 	std::array<std::shared_ptr<const compiler::OwnedRecordingGpuRanges>, 3> gpuPassRanges;  // per rhi::QueueKind
 	std::vector<size_t> demand(slotCount);
-	// An external epoch's ticket (SetExternalPersistentEpochs): every batch on the graphics queue, none waiting for another,
-	// recorded into secondaries; a late batch's pass (recordAtExecution) is recorded by the host's execution.
-	const auto graphicsSlot = static_cast<uint32_t>(ToUnderlying(m_queueRegistry.FindGraphicsSlot()));
-	if (external && !graph.relativeWaits.empty())
-		throw std::logic_error("An external epoch's batches wait for each other across queues");
-	if (external && !m_externalSecondaryPool) {
-		auto device = m_queueRegistry.GetDevice(static_cast<QueueSlotIndex>(static_cast<uint8_t>(graphicsSlot)));
-		m_externalSecondaryPool = std::make_shared<CommandListPool>(device, rhi::QueueKind::Graphics, true);
-	}
+	// An external epoch's ticket (SetExternalPersistentEpochs): its batches on the graphics queue are recorded into secondaries,
+	// which the host executes in its own stream, and a late batch's pass (recordAtExecution) by the host's execution. Its batches on
+	// other queues are recorded and submitted as any other's.
 	for (uint32_t batch = 0; batch < graph.batches.size(); ++batch) {
 		const auto slot = graph.batches[batch].queue;
 		if (slot >= slotCount) throw std::runtime_error("Persistent batch queue is unavailable");
 		bool late = false;
 		for (const auto pass : graph.batches[batch].passes) late = late || graph.structure->passes[pass].recordAtExecution;
-		if (external && slot != graphicsSlot) {
+		const bool inStream = external && InHostStream(slot);
+		if (late && external && !inStream) {
 			std::string names;
 			for (const auto pass : graph.batches[batch].passes) {
 				const auto prepared = graph.structure->passes[pass].preparedPassIndex;
 				if (!names.empty()) names += ", ";
 				names += segment.names && prepared < segment.names->size() ? (*segment.names)[prepared] : std::string("<unnamed>");
 			}
-			throw std::logic_error("An external epoch's passes must run on the graphics queue: " + names);
+			throw std::logic_error("An external epoch's passes recorded at execution must run on the graphics queue: " + names);
 		}
 		if (late && !external) throw std::logic_error("A pass recorded at execution is not an external epoch's");
 		if (!late) ++demand[slot];
@@ -265,7 +260,7 @@ void RenderGraph::RecordPersistentSegment(PersistentSegmentRun& run) {
 		job.queueKind = rhiKind;
 		job.device = m_queueRegistry.GetDevice(index);
 		job.queue = m_queueRegistry.GetQueue(index);
-		job.pool = external ? m_externalSecondaryPool : m_queueRegistry.GetSharedPool(index);
+		job.pool = inStream ? ExternalSecondaryPool(slot) : m_queueRegistry.GetSharedPool(index);
 		if (!job.pool) throw std::logic_error("Recording queue has no command-list pool");
 		const auto device = m_queueRegistry.GetBackendInstance(index);
 		if (m_backendDevices.size() > 1) {
@@ -284,7 +279,7 @@ void RenderGraph::RecordPersistentSegment(PersistentSegmentRun& run) {
 			job.recording.bufferBarriers.clear();
 			job.recording.acquiredBarriers.clear();
 		}
-		job.recording.external = external;
+		job.recording.external = inStream;
 		job.recording.bindings = segment.bindings;
 		job.recording.frameSlot = frameIndex;
 		job.recording.externalEntryBarrier = m_externalQueueBoundary.entry && run.firstBatchOnSlot[slot] == batch;
@@ -359,7 +354,8 @@ void RenderGraph::RecordPersistentSegment(PersistentSegmentRun& run) {
 			if (!demand[slot]) continue;
 			const auto index = static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot));
 			// An external ticket's secondaries retire with its execution, on the graphics timeline as well.
-			auto pool = external ? m_externalSecondaryPool : m_queueRegistry.GetSharedPool(index);
+			auto pool = external && InHostStream(static_cast<uint32_t>(slot)) ? ExternalSecondaryPool(static_cast<uint32_t>(slot))
+				: m_queueRegistry.GetSharedPool(index);
 			const auto completed = m_queueRegistry.GetFence(index).GetCompletedValue();
 			pool->PublishDemand(demand[slot], completed);
 			auto ready = pool->AcquireBatch(demand[slot], completed);
@@ -535,6 +531,42 @@ void RenderGraph::SubmitPersistentSegment(PersistentSegmentRun& run) {
 		BT_ZONE_SCOPE("ORG.Persistent.CommitAdmission");
 		state.admission->Commit(admission, *execution);
 	}
+	// Host-owned textures last used off the graphics queue, acquired back on it after their producers (external home states).
+	if (const auto& home = admission.barriers.homeAcquires; !home.textures.empty()) {
+		const auto index = m_queueRegistry.FindGraphicsSlot();
+		const auto graphicsSlot = static_cast<uint32_t>(ToUnderlying(index));
+		auto allocation = std::make_shared<compiler::FrameCommandAllocation>();
+		allocation->pool = m_queueRegistry.GetSharedPool(index);
+		allocation->pair = allocation->pool->Request();
+		auto list = allocation->pair.list.Get();
+		rhi::BarrierBatch barriers{};
+		barriers.textures = {home.textures.data(), static_cast<uint32_t>(home.textures.size())};
+		list.Barriers(barriers);
+		if (!home.home.empty()) {
+			rhi::BarrierBatch toHome{};
+			toHome.textures = {home.home.data(), static_cast<uint32_t>(home.home.size())};
+			list.Barriers(toHome);
+		}
+		if (list.EndChecked() != rhi::Result::Ok) throw std::runtime_error("Home acquire list close failed");
+		allocation->closed = true;
+		std::vector<rhi::TimelinePoint> waits;
+		for (const auto producer : home.producers) {
+			if (producer >= execution->batches.size() || graph.batches[producer].queue == graphicsSlot) continue;
+			const auto producerSlot = static_cast<QueueSlotIndex>(static_cast<uint8_t>(graph.batches[producer].queue));
+			waits.push_back({m_queueRegistry.GetFence(producerSlot).GetHandle(), execution->batches[producer].signal.value});
+		}
+		const auto signal = state.timelines->SubmitOutside(graphicsSlot);
+		const rhi::TimelinePoint point{m_queueRegistry.GetFence(index).GetHandle(), signal.value};
+		rhi::SubmitDesc submit{};
+		submit.waits = {waits.data(), static_cast<uint32_t>(waits.size())};
+		submit.signals = {&point, 1u};
+		if (m_queueRegistry.GetQueue(index).Submit({&list, 1u}, submit) != rhi::Result::Ok)
+			throw std::runtime_error("Home acquire submission failed");
+		m_queueRegistry.EnsureNextFenceValueAtLeast(index, signal.value + 1);
+		state.admission->ExtendSubmitted(signal);
+		state.trailingLeases.push_back({signal, std::move(allocation)});
+		basic_telemetry::AddCounter("ORG.Persistent.HomeAcquires");
+	}
 	if (sequencer) sequencer.unlock();
 	{
 		std::vector<ExecutionSignal> signals;
@@ -587,6 +619,10 @@ void RenderGraph::RetirePersistentExecutions() {
 	const auto reached = completed;  // what the queues finished, before the admission's limit below
 	for (auto& point : completed) point.value = (std::min)(point.value, state.admission->Submitted(point.timeline));
 	state.admission->RetireCompleted(completed);
+	std::erase_if(state.trailingLeases, [&](const auto& lease) {
+		const auto found = std::ranges::find(reached, lease.first.timeline, &compiler::ExecutionTimelinePoint::timeline);
+		return found != reached.end() && found->value >= lease.first.value;
+	});
 	// Handles of executions every batch of which has completed.
 	std::erase_if(state.pendingExecutions, [&](const std::shared_ptr<detail::ExecutionRecord>& record) {
 		for (const auto& signal : record->signals) {
@@ -612,6 +648,35 @@ void RenderGraph::SetExternalPersistentEpochs(std::vector<uint32_t> epochs) {
 	std::sort(epochs.begin(), epochs.end());
 	epochs.erase(std::unique(epochs.begin(), epochs.end()), epochs.end());
 	m_externalPersistentEpochs = std::move(epochs);
+}
+
+bool RenderGraph::InHostStream(uint32_t slot) const noexcept {
+	const auto graphics = m_queueRegistry.FindGraphicsSlot();
+	if (slot == static_cast<uint32_t>(ToUnderlying(graphics))) return true;
+	if (slot >= m_queueRegistry.SlotCount()) return false;
+	const auto queue = m_queueRegistry.GetQueue(static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot))).GetQueueHandle();
+	const auto host = m_queueRegistry.GetQueue(graphics).GetQueueHandle();
+	return queue.valid() && queue.index == host.index && queue.generation == host.generation;
+}
+
+std::shared_ptr<CommandListPool> RenderGraph::ExternalSecondaryPool(uint32_t slot) {
+	// The host's thread records and the submitting thread hands off into them.
+	std::lock_guard lock(m_externalSecondaryPoolsMutex);
+	if (m_externalSecondaryPools.size() <= slot) m_externalSecondaryPools.resize(slot + 1);
+	auto& pool = m_externalSecondaryPools[slot];
+	if (!pool) {
+		auto device = m_queueRegistry.GetDevice(static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot)));
+		pool = std::make_shared<CommandListPool>(device, rhi::QueueKind::Graphics, true);
+	}
+	return pool;
+}
+
+bool RenderGraph::PersistentAliasPlacementsCurrent() const {
+	if (!m_compilerState || !m_compilerState->persistent) return true;
+	const auto& state = *m_compilerState->persistent;
+	if (!state.aliasArena) return true;
+	std::lock_guard lock(state.aliasArena->mutex);
+	return !state.aliasArena->stale.contains(&state);
 }
 
 bool RenderGraph::IsExternalPersistentEpoch(uint32_t epoch) const noexcept {

@@ -340,6 +340,9 @@ public:
 	// between the graph's commands. Such textures stay in layout Common, and the graph changes only their
 	// access and sync.
 	virtual bool CommonLayoutOnly() const noexcept { return false; }
+	// The host owns it: it allocated it and uses it between the graph's executions. With external home states
+	// (RenderGraph::SetPersistentExternalHomeStates), every execution gives it back in its home state, on the graphics queue.
+	virtual bool HostOwned() const noexcept { return false; }
 	void AddAliasedResource(Resource* resource) {
 		m_aliasedResources.push_back(resource);
 	}

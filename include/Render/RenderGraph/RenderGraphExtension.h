@@ -54,6 +54,8 @@ enum class PassType {
 
 struct ExternalPassDesc {
 	PassType type = PassType::Unknown;
+	// Made by Copy(), whatever queue it then prefers (ORG_PERSISTENT_COPIES_ON_COPY_QUEUE).
+	bool copyPass = false;
 	std::string name;
 	std::string techniquePath;
 	std::optional<ExternalInsertPoint> where;
@@ -99,6 +101,7 @@ struct ExternalPassDesc {
 	static ExternalPassDesc Copy(std::string name, std::shared_ptr<RenderPass> copyPass) {
 		ExternalPassDesc desc = Render(std::move(name), std::move(copyPass));
 		desc.preferredQueueKind = QueueKind::Copy;
+		desc.copyPass = true;
 		return desc;
 	}
 

@@ -41,6 +41,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <Resources/ExternalTextureResource.h>
+#include <Render/RenderGraph/PersistentAliasArena.h>
 #include <future>
 #include <iterator>
 #include <memory>
@@ -292,10 +294,14 @@ uint32_t RevisionCount(const org::PassPrepareContext& preparation) {
 class WritePass final : public org::TypedRenderGraphPass<WritePass, WriteFrame, WriteBindings> {
 public:
 	WritePass(std::shared_ptr<org::Buffer> input, std::shared_ptr<org::Buffer> target, std::shared_ptr<const ComputeProgram> program,
-		std::shared_ptr<const org::VersionedBuffer> versions = {})
-		: m_input(std::move(input)), m_target(std::move(target)), m_program(std::move(program)), m_versions(std::move(versions)) {}
+		std::shared_ptr<const org::VersionedBuffer> versions = {}, org::QueueKind queue = org::QueueKind::Graphics,
+		std::shared_ptr<org::ExternalTextureResource> hostTexture = {})
+		: m_input(std::move(input)), m_target(std::move(target)), m_program(std::move(program)), m_versions(std::move(versions)), m_queue(queue),
+		m_hostTexture(std::move(hostTexture)) {}
 	WriteBindings Declare(org::PassBuilder& builder) {
-		builder.PreferQueue(org::QueueKind::Graphics);
+		builder.PreferQueue(m_queue);
+		// "stream home": a host-owned texture the write reads (it only needs the declaration), so it is taken onto the write's queue.
+		if (m_hostTexture) builder.ShaderResource(m_hostTexture);
 		if (m_versions) return {builder.ShaderResource(m_input).View(), builder.UnorderedAccess(*m_versions).View()};
 		return {builder.ShaderResource(m_input).View(), builder.UnorderedAccess(m_target).View()};
 	}
@@ -321,17 +327,20 @@ private:
 	std::shared_ptr<org::Buffer> m_target;
 	std::shared_ptr<const ComputeProgram> m_program;
 	std::shared_ptr<const org::VersionedBuffer> m_versions;
+	org::QueueKind m_queue = org::QueueKind::Graphics;
+	std::shared_ptr<org::ExternalTextureResource> m_hostTexture;
 };
 
 struct CopyBindings { org::ResourceBindingToken source, destination; };
 class CopyToHostPass final : public org::TypedRenderGraphPass<CopyToHostPass, org::EmptyPassFrameData, CopyBindings> {
 public:
 	CopyToHostPass(std::shared_ptr<org::Buffer> source, std::shared_ptr<org::ExternalBufferResource> destination,
-		std::shared_ptr<std::atomic<uint64_t>> destinationRevision, std::shared_ptr<const org::VersionedBuffer> versions = {})
+		std::shared_ptr<std::atomic<uint64_t>> destinationRevision, std::shared_ptr<const org::VersionedBuffer> versions = {},
+		org::QueueKind queue = org::QueueKind::Graphics)
 		: m_source(std::move(source)), m_destination(std::move(destination)), m_destinationRevision(std::move(destinationRevision)),
-		m_versions(std::move(versions)) {}
+		m_versions(std::move(versions)), m_queue(queue) {}
 	CopyBindings Declare(org::PassBuilder& builder) {
-		builder.PreferQueue(org::QueueKind::Graphics);
+		builder.PreferQueue(m_queue);
 		if (m_versions) {
 			// Declare the buffer two ways, like a pass that reads a buffer both as indirect arguments and through its
 			// address. The declarations merge into one requirement. The pass is still lowered as a group, which is
@@ -356,6 +365,7 @@ private:
 	std::shared_ptr<org::ExternalBufferResource> m_destination;
 	std::shared_ptr<std::atomic<uint64_t>> m_destinationRevision;
 	std::shared_ptr<const org::VersionedBuffer> m_versions;
+	org::QueueKind m_queue = org::QueueKind::Graphics;
 };
 
 class HostExtension final : public org::RenderGraph::IRenderGraphExtension {
@@ -363,21 +373,27 @@ public:
 	HostExtension(std::shared_ptr<org::Buffer> input, std::shared_ptr<org::Buffer> scratch,
 		std::shared_ptr<org::ExternalBufferResource> output, std::shared_ptr<const ComputeProgram> program,
 		std::shared_ptr<std::atomic<uint64_t>> outputRevision, std::shared_ptr<const org::VersionedBuffer> versions = {}, bool lateCopy = false,
-		bool splitEpochs = false)
+		bool splitEpochs = false, bool computeWrite = false, std::shared_ptr<org::ExternalTextureResource> hostTexture = {})
 		: m_input(std::move(input)), m_scratch(std::move(scratch)), m_output(std::move(output)), m_program(std::move(program)),
-		m_outputRevision(std::move(outputRevision)), m_versions(std::move(versions)), m_lateCopy(lateCopy), m_splitEpochs(splitEpochs) {}
+		m_outputRevision(std::move(outputRevision)), m_versions(std::move(versions)), m_lateCopy(lateCopy), m_splitEpochs(splitEpochs),
+		m_computeWrite(computeWrite), m_hostTexture(std::move(hostTexture)) {}
 	void PrepareForBuild(org::RenderGraph& graph) override {
+		if (m_hostTexture) graph.RegisterResource(org::ResourceIdentifier("test.host-texture"), m_hostTexture);
 		graph.RegisterResource(org::ResourceIdentifier("test.input"), m_input);
 		graph.RegisterResource(org::ResourceIdentifier("test.scratch"), m_scratch);
 		graph.RegisterResource(org::ResourceIdentifier("test.host-output"), m_output);
 	}
 	void GatherStructuralPasses(org::RenderGraph&, std::vector<org::RenderGraph::ExternalPassDesc>& out) override {
+		// "stream": the write on the compute queue, so an external epoch's execution has a batch off the host's stream.
+		const auto writeQueue = m_computeWrite ? org::QueueKind::Compute : org::QueueKind::Graphics;
 		auto write = org::RenderGraph::ExternalPassDesc::Compute("test.write",
-			std::static_pointer_cast<org::RenderPass>(std::make_shared<WritePass>(m_input, m_scratch, m_program, m_versions)))
-			.PreferQueue(org::QueueKind::Graphics);
+			std::static_pointer_cast<org::RenderPass>(std::make_shared<WritePass>(m_input, m_scratch, m_program, m_versions, writeQueue, m_hostTexture)))
+			.PreferQueue(writeQueue);
+		// "stream": the copy on the copy queue, which the device aliases to the graphics queue (the host's stream's): in the stream.
+		const auto copyQueue = m_computeWrite ? org::QueueKind::Copy : org::QueueKind::Graphics;
 		auto copy = org::RenderGraph::ExternalPassDesc::Copy("test.copy-to-host",
-			std::static_pointer_cast<org::RenderPass>(std::make_shared<CopyToHostPass>(m_scratch, m_output, m_outputRevision, m_versions)))
-			.PreferQueue(org::QueueKind::Graphics);
+			std::static_pointer_cast<org::RenderPass>(std::make_shared<CopyToHostPass>(m_scratch, m_output, m_outputRevision, m_versions, copyQueue)))
+			.PreferQueue(copyQueue);
 		// "split": the write in epoch 0, the copy in epoch 1, so each is a graph of its own and the scratch buffer goes from one
 		// to the other through the runtime's ledgers.
 		if (m_splitEpochs) {
@@ -399,6 +415,77 @@ private:
 	std::shared_ptr<const org::VersionedBuffer> m_versions;
 	bool m_lateCopy = false;
 	bool m_splitEpochs = false;
+	bool m_computeWrite = false;
+	std::shared_ptr<org::ExternalTextureResource> m_hostTexture;
+};
+
+// "arena": an epoch's write into a scratch buffer of its own, in a manual alias pool, and its copy to a host buffer. Two
+// epochs, each a graph of its own, place their scratch buffers at the same offset of the host's shared arena's pool.
+class ArenaExtension final : public org::RenderGraph::IRenderGraphExtension {
+public:
+	struct Epoch {
+		uint32_t epoch = 0;
+		std::shared_ptr<org::Buffer> input, scratch;
+		std::shared_ptr<org::ExternalBufferResource> output;
+		org::QueueKind writeQueue = org::QueueKind::Graphics;
+	};
+	ArenaExtension(std::vector<Epoch> epochs, std::shared_ptr<const ComputeProgram> program, std::shared_ptr<std::atomic<uint64_t>> outputRevision)
+		: m_epochs(std::move(epochs)), m_program(std::move(program)), m_outputRevision(std::move(outputRevision)) {}
+	void PrepareForBuild(org::RenderGraph& graph) override {
+		for (const auto& epoch : m_epochs) {
+			const auto suffix = std::to_string(epoch.epoch);
+			graph.RegisterResource(org::ResourceIdentifier("test.arena.input." + suffix), epoch.input);
+			graph.RegisterResource(org::ResourceIdentifier("test.arena.scratch." + suffix), epoch.scratch);
+			graph.RegisterResource(org::ResourceIdentifier("test.arena.output." + suffix), epoch.output);
+		}
+	}
+	void GatherStructuralPasses(org::RenderGraph&, std::vector<org::RenderGraph::ExternalPassDesc>& out) override {
+		for (const auto& epoch : m_epochs) {
+			const auto suffix = std::to_string(epoch.epoch);
+			out.push_back(org::RenderGraph::ExternalPassDesc::Compute("test.arena.write." + suffix,
+				std::static_pointer_cast<org::RenderPass>(std::make_shared<WritePass>(epoch.input, epoch.scratch, m_program, nullptr, epoch.writeQueue)))
+				.PreferQueue(epoch.writeQueue).Epoch(epoch.epoch));
+			out.push_back(org::RenderGraph::ExternalPassDesc::Copy("test.arena.copy." + suffix,
+				std::static_pointer_cast<org::RenderPass>(std::make_shared<CopyToHostPass>(epoch.scratch, epoch.output, m_outputRevision)))
+				.Epoch(epoch.epoch));
+		}
+	}
+private:
+	std::vector<Epoch> m_epochs;
+	std::shared_ptr<const ComputeProgram> m_program;
+	std::shared_ptr<std::atomic<uint64_t>> m_outputRevision;
+};
+
+// Executes an external execution's segments, each in its own submission of a primary of its own (a submission per segment
+// meets every segment's split). The caller waits for the device before executing the next.
+struct SegmentExecutor {
+	rhi::Device device;
+	std::vector<std::pair<rhi::CommandAllocatorPtr, rhi::CommandListPtr>> primaries;
+	bool Execute(org::ExternalEpochExecution& a_execution) {
+		auto queue = device.GetQueue(rhi::QueueKind::Graphics);
+		for (size_t index = 0; index < a_execution.segments.size(); ++index) {
+			if (primaries.size() <= index) {
+				auto& [allocator, primary] = primaries.emplace_back();
+				if (device.CreateCommandAllocator(rhi::QueueKind::Graphics, allocator) != rhi::Result::Ok
+					|| device.CreateCommandList(rhi::QueueKind::Graphics, allocator.Get(), primary) != rhi::Result::Ok)
+					return false;
+				primary->End();
+			}
+			auto& [allocator, primary] = primaries[index];
+			allocator->Recycle();
+			primary->Recycle(allocator.Get());
+			a_execution.Execute(index, primary.Get());
+			if (primary->EndChecked() != rhi::Result::Ok) return false;
+			auto list = primary.Get();
+			const auto& segment = a_execution.segments[index];
+			auto waits = segment.waits;
+			auto signals = segment.signals;
+			if (queue.Submit({&list, 1}, {{waits.data(), static_cast<uint32_t>(waits.size())},
+					{signals.data(), static_cast<uint32_t>(signals.size())}}) != rhi::Result::Ok)
+				return false;
+		}
+		return true;
+	}
 };
 
 std::shared_ptr<ComputeProgram> CreateProgram(rhi::Device device) {
@@ -450,11 +537,19 @@ static int Run(int argc, char** argv) {
 	const bool contributor = argc > 1 && std::strcmp(argv[1], "contributor") == 0;
 	// "rebinding": slots that start or stop sharing a backing (RebindingGpuTests.cpp) instead of the graph scenario.
 	const bool rebinding = argc > 1 && std::strcmp(argv[1], "rebinding") == 0;
+	// "arena": two epochs whose transient scratch buffers share the host's alias arena (the second's write on the compute queue
+	// when the family has a second queue), against two of their own.
+	const bool arena = argc > 1 && std::strcmp(argv[1], "arena") == 0;
 	// "split": a host of two epochs, each its own graph: the write pass in the first and the copy to the host buffer in the
 	// second (SplitEpochsScenario).
 	const bool split = argc > 1 && std::strcmp(argv[1], "split") == 0;
+	// "stream": an external epoch with its write on the compute queue (the family's second queue): batches off the host's stream,
+	// and the stream's segments.
+	const bool stream = argc > 1 && std::strcmp(argv[1], "stream") == 0;
 	// "open" after the mode: async epochs on open executions, admitted at submission (no closed executions).
 	const bool open = argc > 2 && std::strcmp(argv[2], "open") == 0;
+	// "stream open home": the write also reads a host-owned texture, under external home states.
+	const bool home = open && argc > 3 && std::strcmp(argv[3], "home") == 0;
 	HostDevice host;
 	if (const int created = CreateHostDevice(host); created != 0) {
 		std::puts(created == 77 ? "SKIP: no Vulkan device with VK_EXT_descriptor_heap" : "FAIL: host device");
@@ -477,7 +572,15 @@ static int Run(int argc, char** argv) {
 		info.queues[0] = {host.queue, host.family, 0};
 		const bool spareQueue = host.spare != VK_NULL_HANDLE;
 		const rhi::vulkan::AdoptedQueue spare{host.spare, host.family, 1};
-		if (host.spare) {
+		if (stream) {
+			if (!host.spare) {
+				std::puts("SKIP: stream needs a second queue in the family");
+				return 77;
+			}
+			info.queues[1] = spare;  // the compute queue
+		} else if (arena && host.spare) {
+			info.queues[1] = spare;  // the compute queue
+		} else if (host.spare) {
 			info.spareQueues = &spare;
 			info.spareQueueCount = 1;
 		}
@@ -550,6 +653,180 @@ static int Run(int argc, char** argv) {
 					static_cast<unsigned long long>(stats.submitted), static_cast<unsigned long long>(stats.waited),
 					static_cast<unsigned long long>(stats.stale), static_cast<unsigned long long>(stats.rebuilds));
 				REQUIRE(stats.rebuilds == 1, "one epoch rebuild");
+				REQUIRE(!counters.unbalanced && counters.locks.load() == counters.unlocks.load(), "balanced host queue locks");
+				host.SetAsyncEpochs({});
+				host.DestroyGraph();
+			}
+			runtime.reset();
+		} else if (arena) {
+			auto runtime = org::Runtime::Create({.device = device.Get(), .backend = rhi::Backend::Vulkan, .slots = 4,
+				.tasks = std::make_shared<org::runtime::ThreadPoolTaskService>(2)});
+			const auto writeQueue = spareQueue ? org::QueueKind::Compute : org::QueueKind::Graphics;
+			for (const bool shared : {true, false}) {
+				org::GraphHost host({.runtime = runtime, .queueBoundary = {.entry = true, .exit = true}, .framesInFlight = 2, .epochOrder = {0, 1},
+					.sharedAliasArena = shared});
+				auto program = CreateProgram(device.Get());
+				REQUIRE(program, "compute program");
+				std::vector<ArenaExtension::Epoch> epochs;
+				std::array<uint32_t, 2> values{};
+				for (uint32_t epoch = 0; epoch < 2; ++epoch) {
+					auto& entry = epochs.emplace_back();
+					entry.epoch = epoch;
+					entry.writeQueue = epoch == 1 ? writeQueue : org::QueueKind::Graphics;
+					entry.scratch = org::Buffer::CreateSharedUnmaterialized(rhi::HeapType::DeviceLocal, kBytes, true);
+					org::BufferBase::DescriptorRequirements requirements{};
+					requirements.createUAV = true;
+					requirements.uavDesc = {.dimension = rhi::UavDim::Buffer, .formatOverride = rhi::Format::R32_Typeless,
+						.buffer = {.kind = rhi::BufferViewKind::Raw, .firstElement = 0, .numElements = kCount}};
+					entry.scratch->SetDescriptorRequirements(requirements);
+					entry.scratch->SetName("test.arena.scratch." + std::to_string(epoch));
+					// A manual pool: placed whatever the auto-aliasing mode. The first use is the write.
+					entry.scratch->SetAllowAlias(true);
+					entry.scratch->SetAliasingPool(0xA5);
+					entry.input = org::Buffer::CreateSharedUnmaterialized(rhi::HeapType::DeviceLocal, 16, false);
+					org::BufferBase::DescriptorRequirements inputViews{};
+					inputViews.createSRV = true;
+					inputViews.srvDesc = {.dimension = rhi::SrvDim::Buffer, .formatOverride = rhi::Format::R32_Typeless,
+						.buffer = {.kind = rhi::BufferViewKind::Raw, .firstElement = 0, .numElements = 4}};
+					entry.input->SetDescriptorRequirements(inputViews);
+					entry.input->SetName("test.arena.input." + std::to_string(epoch));
+					entry.output = ImportHostBuffer(device.Get(), epoch == 0 ? first : second, epoch == 0 ? "test.arena.output.0" : "test.arena.output.1");
+					REQUIRE(entry.output, "import host buffer");
+				}
+				const auto upload = [&](uint32_t epoch) {
+					return [&, epoch](org::RenderGraph&) {
+						BUFFER_UPLOAD(&values[epoch], sizeof(uint32_t), org::runtime::UploadTarget::FromShared(epochs[epoch].input), 0);
+					};
+				};
+				auto outputRevision = std::make_shared<std::atomic<uint64_t>>(1);
+				host.AddExtension("test.arena", [&] { return std::make_unique<ArenaExtension>(epochs, program, outputRevision); });
+				const auto run = [&](uint32_t frame, bool async) -> int {
+					values = {70000u + 10u * frame, 80000u + 10u * frame};
+					if (async) {
+						host.SubmitEpoch(0, upload(0));
+						host.SubmitEpoch(1, upload(1));
+					} else {
+						host.ExecuteFrame(nullptr, upload(0), 0);
+						host.ExecuteFrame(nullptr, upload(1), 1);
+					}
+					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, values[0]) && Matches(second, values[1]),
+						"each epoch copies what it wrote into its scratch buffer");
+					return 0;
+				};
+				for (uint32_t frame = 0; frame < 4; ++frame)
+					if (const int failed = run(frame, false)) return failed;
+				host.SetAsyncEpochs({0, 1});
+				for (uint32_t frame = 4; frame < 12; ++frame)
+					if (const int failed = run(frame, true)) return failed;
+				host.SetAsyncEpochs({});
+				// Shared: one pool both scratch buffers are placed in, as large as one of them. Not shared: none in the host's arena.
+				const auto pools = host.AliasArena();
+				size_t poolCount = 0, owners = 0;
+				uint64_t capacity = 0, required = 0;
+				if (pools) {
+					std::lock_guard lock(pools->mutex);
+					poolCount = pools->pools.size();
+					for (const auto& [id, pool] : pools->pools) {
+						owners += pool.required.size();
+						capacity += pool.capacityBytes;
+						required = (std::max)(required, org::PersistentAliasArena::Required(pool));
+					}
+				}
+				std::printf("arena (%s): %zu pools, %zu graphs placed, required %llu, capacity %llu\n", shared ? "shared" : "per graph", poolCount,
+					owners, static_cast<unsigned long long>(required), static_cast<unsigned long long>(capacity));
+				if (shared) REQUIRE(poolCount == 1 && owners == 2 && required >= kBytes && required < 2 * kBytes, "one pool, both graphs at offset 0");
+				else REQUIRE(!pools, "no shared arena");
+				REQUIRE(!counters.unbalanced && counters.locks.load() == counters.unlocks.load(), "balanced host queue locks");
+				host.DestroyGraph();
+			}
+			runtime.reset();
+		} else if (stream) {
+			auto runtime = org::Runtime::Create({.device = device.Get(), .backend = rhi::Backend::Vulkan,
+				.tasks = std::make_shared<org::runtime::ThreadPoolTaskService>(2)});
+			// Without queue-scoped uploads the write waits for the uploads, which run in the host's stream: a segment of their own,
+			// and the copy's segment split from it. With them the upload goes to the compute queue, ahead of the write.
+			for (const bool scopedUploads : {false, true}) {
+				org::GraphHost host({.runtime = runtime, .queueBoundary = {.entry = true, .exit = true}, .epochOrder = {0},
+					.closedExecutions = !open, .externalHomeStates = home, .queueScopedUploads = scopedUploads});
+				auto program = CreateProgram(device.Get());
+				REQUIRE(program, "compute program");
+				// "home": a texture the host owns, home in Common on the graphics queue.
+				std::shared_ptr<org::ExternalTextureResource> hostTexture;
+				if (home) {
+					rhi::ResourceDesc desc{};
+					desc.type = rhi::ResourceType::Texture2D;
+					desc.debugName = "test.host-texture";
+					desc.texture.format = rhi::Format::R8G8B8A8_UNorm;
+					desc.texture.width = desc.texture.height = 16;
+					desc.texture.initialLayout = rhi::ResourceLayout::Common;
+					// Concurrent: a pass that touches an exclusive resource stays on the graphics queue on Vulkan.
+					desc.queueSharing = rhi::QueueSharing::Concurrent;
+					rhi::ResourcePtr texture;
+					REQUIRE(device->CreateCommittedResource(desc, texture) == rhi::Result::Ok, "host texture");
+					org::TextureDescription description{};
+					description.imageDimensions = {{16, 16}};
+					description.channels = 4;
+					description.format = rhi::Format::R8G8B8A8_UNorm;
+					description.hasSRV = true;
+					description.initialLayout = rhi::ResourceLayout::Common;
+					description.queueSharing = rhi::QueueSharing::Concurrent;
+					hostTexture = org::ExternalTextureResource::CreateShared(std::move(texture), description, false);
+					REQUIRE(hostTexture, "host texture resource");
+					hostTexture->SetName("test.host-texture");
+				}
+				auto scratch = org::Buffer::CreateSharedUnmaterialized(rhi::HeapType::DeviceLocal, kBytes, true);
+				org::BufferBase::DescriptorRequirements requirements{};
+				requirements.createUAV = true;
+				requirements.uavDesc = {.dimension = rhi::UavDim::Buffer, .formatOverride = rhi::Format::R32_Typeless,
+					.buffer = {.kind = rhi::BufferViewKind::Raw, .firstElement = 0, .numElements = kCount}};
+				scratch->SetDescriptorRequirements(requirements);
+				scratch->SetName("test.scratch");
+				auto output = ImportHostBuffer(device.Get(), first, "test.host-output.first");
+				REQUIRE(output, "import host buffer");
+				auto input = org::Buffer::CreateSharedUnmaterialized(rhi::HeapType::DeviceLocal, 16, false);
+				org::BufferBase::DescriptorRequirements inputViews{};
+				inputViews.createSRV = true;
+				inputViews.srvDesc = {.dimension = rhi::SrvDim::Buffer, .formatOverride = rhi::Format::R32_Typeless,
+					.buffer = {.kind = rhi::BufferViewKind::Raw, .firstElement = 0, .numElements = 4}};
+				input->SetDescriptorRequirements(inputViews);
+				input->SetName("test.input");
+				uint32_t value = 0;
+				// Queue-scoped: a staged upload, which can go to the queue that first uses it (an immediate one stays on the graphics
+				// list).
+				const auto upload = [&](org::RenderGraph&) {
+					if (!scopedUploads) {
+						BUFFER_UPLOAD(&value, sizeof(value), org::runtime::UploadTarget::FromShared(input), 0);
+						return;
+					}
+					auto staged = org::runtime::StagedUploadBatch::Create(256);
+					staged->Stage(org::runtime::UploadTarget::FromShared(input), 0, &value, sizeof(value));
+					org::runtime::GetActiveUploadService()->SubmitStagedUploads(std::move(staged));
+				};
+				auto outputRevision = std::make_shared<std::atomic<uint64_t>>(1);
+				host.AddExtension("test.host", [&] {
+					return std::make_unique<HostExtension>(input, scratch, output, program, outputRevision, nullptr, false, false, true, hostTexture);
+				});
+				host.SetExternalEpochs({0});
+				host.SetAsyncEpochs({0});
+				SegmentExecutor executor{device.Get()};
+				size_t splits = 0, segments = 0;
+				for (uint32_t frame = 0; frame < 8; ++frame) {
+					value = 50000u + 10u * frame + (scopedUploads ? 5000u : 0u);
+					host.SubmitEpoch(0, upload);
+					auto execution = host.TakeExternalExecution();
+					REQUIRE(execution && !execution->segments.empty(), "a stream epoch's execution");
+					segments += execution->segments.size();
+					for (const auto& segment : execution->segments) splits += segment.split ? 1 : 0;
+					REQUIRE(executor.Execute(*execution), "the stream's segments");
+					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "the copy in the stream reads what the compute write wrote");
+				}
+				std::printf("stream (%s%s, %s uploads): %zu segments, %zu split over 8 frames\n", open ? "open" : "closed",
+					home ? ", external home" : "", scopedUploads ? "queue-scoped" : "stream", segments, splits);
+				// External home: the texture is released from the graphics queue in a segment ahead (the write waits for it, so the
+				// copy's segment is split), and acquired back in a segment after the copy's (its wait is the copy's: no split).
+				if (home) REQUIRE(splits == 8 && segments == (scopedUploads ? 24u : 32u), "the host texture's release and acquire segments");
+				else if (!scopedUploads) REQUIRE(splits == 8 && segments == 16, "the copy's segment is split from the uploads' when the write waits for them");
+				else REQUIRE(splits == 0 && segments == 8, "an upload on the write's queue needs no segment of its own, and no split");
 				REQUIRE(!counters.unbalanced && counters.locks.load() == counters.unlocks.load(), "balanced host queue locks");
 				host.SetAsyncEpochs({});
 				host.DestroyGraph();
@@ -882,29 +1159,15 @@ static int Run(int argc, char** argv) {
 			if (external) {
 				host.SetExternalEpochs({0});
 				host.SetAsyncEpochs({0});
-				auto queue = device->GetQueue(rhi::QueueKind::Graphics);
-				rhi::CommandAllocatorPtr allocator;
-				rhi::CommandListPtr primary;
-				REQUIRE(device->CreateCommandAllocator(rhi::QueueKind::Graphics, allocator) == rhi::Result::Ok
-					&& device->CreateCommandList(rhi::QueueKind::Graphics, allocator.Get(), primary) == rhi::Result::Ok, "the test's primary");
-				primary->End();
-				const auto execute = [&](org::ExternalEpochExecution& a_execution) -> bool {
-					allocator->Recycle();
-					primary->Recycle(allocator.Get());
-					a_execution.Execute(primary.Get());
-					if (primary->EndChecked() != rhi::Result::Ok) return false;
-					auto list = primary.Get();
-					auto waits = a_execution.waits;
-					auto signals = a_execution.signals;
-					return queue.Submit({&list, 1}, {{waits.data(), static_cast<uint32_t>(waits.size())},
-						{signals.data(), static_cast<uint32_t>(signals.size())}}) == rhi::Result::Ok;
-				};
+				SegmentExecutor executor{device.Get()};
+				const auto execute = [&](org::ExternalEpochExecution& a_execution) { return executor.Execute(a_execution); };
 				(void)host.TakeAsyncStats();
 				for (uint32_t frame = 0; frame < 6; ++frame) {
 					value = 90000u + 10u * frame;
 					host.SubmitEpoch(0, upload);
 					auto execution = host.TakeExternalExecution();
-					REQUIRE(execution && !execution->signals.empty() && !execution->items.empty(), "an external epoch's execution");
+					REQUIRE(execution && execution->segments.size() == 1 && !execution->segments[0].signals.empty()
+						&& !execution->segments[0].items.empty(), "an external epoch's execution, one segment");
 					REQUIRE(!host.TakeExternalExecution(), "taken once");
 					const auto before = g_copyRecords.load(std::memory_order_relaxed);
 					REQUIRE(execute(*execution), "the execution in the test's primary");

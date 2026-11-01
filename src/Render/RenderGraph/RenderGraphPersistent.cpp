@@ -673,6 +673,7 @@ void RenderGraph::BootstrapPersistentGraph() {
 	{
 		compiler.persistent = std::make_shared<PersistentExecutionState>();
 		auto& state = *compiler.persistent;
+		state.aliasArena = m_persistentAliasArena ? m_persistentAliasArena : PersistentAliasArena::Create();
 		const size_t framesInFlight = m_renderGraphSettingsService ? m_renderGraphSettingsService->GetNumFramesInFlight() : 3;
 		state.admission = std::make_unique<persistent::SynchronousAdmission>(framesInFlight * 3 + 3,
 			[this](std::shared_ptr<const void> owner) {
@@ -683,6 +684,7 @@ void RenderGraph::BootstrapPersistentGraph() {
 					basic_telemetry::AddCounter("ORG.Ownership.RetirementRejected");
 			}, m_runtime->Sequencer());
 		state.admission->SetClosedExecutions(m_persistentClosedExecutions);
+		state.admission->SetExternalHomeStates(m_persistentExternalHomeStates);
 		state.ensureRepresentations = [this](Resource& resource) { EnsurePersistentRepresentations(resource); };
 		// Tickets record their uploads on the graphics queue, or on the queue that first uses them (RecordPendingUploads).
 		if (m_queueRegistry.SlotCount())
@@ -1237,6 +1239,7 @@ RenderGraph::PersistentExecution RenderGraph::PreparePersistentExecution(rhi::De
 		rebinding.backing.regions = CaptureRegions(*concrete, entry.shape);
 		rhi::ResourceDesc description{};
 		if (concrete->TryGetRHIResourceDesc(description)) rebinding.backing.heapType = description.heapType;
+		rebinding.backing.hostOwned = concrete->HostOwned();
 		rebinding.recording = snapshot;
 		if (overlay.empty()) overlay = state.bindings->Resources();
 		overlay[entry.slot.index] = {snapshot->resource, snapshot->allocationOwner, snapshot->views, snapshot->descriptorOwner, nullptr};

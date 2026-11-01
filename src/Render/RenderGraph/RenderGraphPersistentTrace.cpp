@@ -232,7 +232,11 @@ void RenderGraph::BuildPersistentFrameGraphSnapshot(ui::FrameGraphSnapshot& out,
 			row.peakNaiveLiveBytes += use.memory->first;
 			if (!use.pool) row.peakLiveBytes += use.memory->first;
 			else if (pools.insert(use.pool).second)
-				if (const auto pool = state.aliasPools.find(use.pool); pool != state.aliasPools.end()) row.peakLiveBytes += pool->second.capacityBytes;
+				if (state.aliasArena) {
+					std::lock_guard lock(state.aliasArena->mutex);
+					if (const auto pool = state.aliasArena->pools.find(use.pool); pool != state.aliasArena->pools.end())
+						row.peakLiveBytes += pool->second.capacityBytes;
+				}
 		}
 		row.aliasSavingsBytes = row.peakNaiveLiveBytes > row.peakLiveBytes ? row.peakNaiveLiveBytes - row.peakLiveBytes : 0;
 		out.batches.push_back(std::move(row));

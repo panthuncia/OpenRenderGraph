@@ -18,6 +18,7 @@
 #include "Render/MemoryIntrospectionBackend.h"
 #include "Render/PassExecutionContext.h"
 #include "Render/RenderGraph/PersistentGraph.h"
+#include "Render/RenderGraph/PersistentAliasArena.h"
 #include "Render/Runtime/IUploadService.h"
 #include "Render/Runtime/OpenRenderGraphSettings.h"
 #include "Render/Runtime/RuntimeDevice.h"
@@ -439,6 +440,11 @@ void GraphHost::BuildInstance(size_t index, bool wait) {
 	graph->CompileStructural();
 	if (instance.epoch != persistent::AllEpochs) graph->SetPersistentEpochOrder({instance.epoch});
 	graph->SetPersistentClosedExecutions(m_desc.closedExecutions);
+	graph->SetPersistentExternalHomeStates(m_desc.externalHomeStates);
+	if (m_desc.sharedAliasArena) {
+		if (!m_aliasArena) m_aliasArena = PersistentAliasArena::Create();
+		graph->SetPersistentAliasArena(m_aliasArena);
+	}
 	graph->SetExternalPersistentEpochs(m_externalEpochs);
 	graph->SetPersistentRecordingReuse(m_desc.reuseRecordings);
 	graph->SetPersistentRecordingTimestamps(m_recordingTimestamps.load(std::memory_order_acquire));
@@ -467,7 +473,13 @@ void GraphHost::BuildInstance(size_t index, bool wait) {
 bool GraphHost::BuildDueInstances(bool all) {
 	std::vector<size_t> due;
 	for (size_t index = 0; index < m_instances.size(); ++index) {
-		const auto& instance = m_instances[index];
+		auto& instance = m_instances[index];
+		// Placements in a pool generation another epoch's graph replaced (its pool grew): placed again by a rebuild, they share
+		// the pool's memory again, and the old generation is freed.
+		if (instance.graph && !instance.rebuildRequested && !instance.graph->PersistentAliasPlacementsCurrent()) {
+			instance.rebuildRequested = true;
+			basic_telemetry::AddCounter("ORG.Host.AliasArenaRebuilds");
+		}
 		if (all ? !instance.graph || instance.rebuildRequested : BuildDue(index)) due.push_back(index);
 	}
 	if (m_async) RebuildAsyncInstances(due);
@@ -635,14 +647,19 @@ void GraphHost::SetExternalEpochs(std::vector<uint32_t> epochs) {
 	m_externalEpochs = std::move(epochs);
 }
 
-void GraphHost::SignalExternalExecutionUnexecuted(const ExternalEpochExecution& execution) {
+void GraphHost::SignalExternalExecutionUnexecuted(const ExternalEpochExecution& execution, size_t a_first) {
 	if (!m_async) throw std::logic_error("An external execution without async epochs");
-	auto waits = execution.waits;
-	auto signals = execution.signals;
-	const auto result = m_async->graphicsQueue.Submit({}, {{waits.data(), static_cast<uint32_t>(waits.size())},
-		{signals.data(), static_cast<uint32_t>(signals.size())}});
-	if (result != rhi::Result::Ok)
-		throw std::runtime_error(std::string("An unexecuted external execution could not be signalled (rhi::Result ") + rhi::ResultName(result) + ")");
+	// Each segment not executed, in its own submission: a later segment may wait for a batch on another queue that waits for an
+	// earlier one's signal.
+	for (size_t index = a_first == SIZE_MAX ? execution.ExecutedSegments() : a_first; index < execution.segments.size(); ++index) {
+		const auto& segment = execution.segments[index];
+		auto waits = segment.waits;
+		auto signals = segment.signals;
+		const auto result = m_async->graphicsQueue.Submit({}, {{waits.data(), static_cast<uint32_t>(waits.size())},
+			{signals.data(), static_cast<uint32_t>(signals.size())}});
+		if (result != rhi::Result::Ok)
+			throw std::runtime_error(std::string("An unexecuted external execution could not be signalled (rhi::Result ") + rhi::ResultName(result) + ")");
+	}
 }
 
 void GraphHost::StartAsync() {
@@ -1508,7 +1525,7 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 	// Queue-scoped uploads (Desc::queueScopedUploads): the slot's open lists of the other queues, which take the uploads their
 	// queue uses first, and go to it just ahead of the ticket's first batch there (SubmitPersistentTicket).
 	auto& queueUploadLists = async.queueUploadLists[slot];
-	const bool queueScoped = m_desc.queueScopedUploads && !external;
+	const bool queueScoped = m_desc.queueScopedUploads;
 	for (size_t queue = 0; queue < async.queueLists.size(); ++queue)
 		async.queueLists[queue] = queueScoped && queue < queueUploadLists.size() && queueUploadLists[queue].list
 			? queueUploadLists[queue].list.Get() : rhi::CommandList{};
@@ -1582,7 +1599,8 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 	try {
 		// Submits and commits, or abandons its admission itself.
 		abandonUnsubmitted.ticket = nullptr;
-		ok = graph.SubmitPersistentTicket(*ticket, async.queueValues, submitted.submission, submitted.uploadSignal, m_frameWaitValue);
+		ok = graph.SubmitPersistentTicket(*ticket, async.queueValues, submitted.submission, submitted.uploadSignal, m_frameWaitValue,
+			external && recorded);
 	} catch (...) {
 		// The queue may have accepted a prefix of this ticket. Completion is
 		// unknown, so preserve both owners until device teardown.
@@ -1605,7 +1623,11 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 		// The caller's to execute (TakeExternalExecution): the uploads first, then the handoff into the execution.
 		auto execution = submitted.submission.external;
 		if (!execution) throw std::logic_error("An external epoch's ticket gave no execution");
-		if (recorded) execution->leading.insert(execution->leading.begin(), commands);
+		if (recorded) {
+			if (execution->segments.empty()) execution->segments.emplace_back();
+			auto& leading = execution->segments.front().leading;
+			leading.insert(leading.begin(), commands);
+		}
 		m_externalExecution = std::move(execution);
 	}
 	if (submitted.uploadSignal.second) m_asyncStats.sparedUploadWaits += RenderGraph::PersistentTicketSparedUploadWaits(*ticket);

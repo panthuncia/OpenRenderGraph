@@ -64,6 +64,13 @@ public:
 		// states and starts with a full barrier, so its admission is independent of what ran before. Nothing in the host
 		// requires it: async epochs and recording reuse work with open executions, admitted at submission.
 		bool closedExecutions = false;
+		// RenderGraph::SetPersistentExternalHomeStates, an interop option: every execution gives each host-owned texture it
+		// touches (ExternalTextureResource) back in its home state on the graphics queue, so the host finds its own resources
+		// where it left them. Everything else flows through the ledgers.
+		bool externalHomeStates = false;
+		// One alias arena for every epoch's graph (RenderGraph::SetPersistentAliasArena): their transients share the same pools,
+		// ordered by the runtime's alias ledger. Off: each graph has pools of its own.
+		bool sharedAliasArena = true;
 		// Async epochs: keep an epoch's replayable recordings per frame slot and submit them again
 		// (RenderGraph::SetPersistentRecordingReuse). A ticket prepared for what a kept recording was recorded for takes it
 		// instead of recording, and a ticket the beforeSubmit callback made stale takes the kept recording of what it depends
@@ -176,24 +183,26 @@ public:
 	void SetAsyncEpochs(std::vector<uint32_t> epochs, std::vector<uint32_t> revisionEpochs = {});
 	bool AsyncEpochs() const noexcept { return static_cast<bool>(m_async); }
 	/**
-	 * @brief Async epochs the caller executes itself, in a command buffer of its own (RenderGraph::SetExternalPersistentEpochs):
-	 * SubmitEpoch submits nothing for them. Their uploads are recorded into a secondary list, the execution is taken with
-	 * TakeExternalExecution, and the caller's submission of its buffer waits for and signals what the execution names. Every
-	 * pass of theirs runs on the graphics queue, and their uploads must be plain copies (no producer-recorded lists, no
-	 * queue-scoped uploads). The epochs that change are built again (RequestRebuild(epoch)); kept across rebuilds.
+	 * @brief Async epochs whose graphics-queue work the caller executes itself, in its own command buffers
+	 * (RenderGraph::SetExternalPersistentEpochs): SubmitEpoch submits only their batches on other queues. Their graphics uploads
+	 * are recorded into a secondary list, the execution is taken with TakeExternalExecution, and the caller executes its
+	 * segments in order, each in a submission that waits for and signals what the segment names (a segment marked split in a new
+	 * one). Their uploads must be plain copies (no producer-recorded lists). The epochs that change are built again
+	 * (RequestRebuild(epoch)); kept across rebuilds.
 	 */
 	void SetExternalEpochs(std::vector<uint32_t> epochs);
 	/**
 	 * @brief Submitting thread, after SubmitEpoch of an external epoch: its execution (null: none since the last call). The caller
-	 * must execute it (ExternalEpochExecution::Execute) in a command buffer whose submission waits for its waits and signals its
-	 * signals, or signal it unexecuted: the graphs' later work on their timelines waits for those signals.
+	 * must execute its segments (ExternalEpochExecution::Execute), or signal the ones it did not unexecuted: the graphs' later
+	 * work on their timelines waits for those signals.
 	 */
 	std::shared_ptr<ExternalEpochExecution> TakeExternalExecution() noexcept { return std::move(m_externalExecution); }
 	/**
-	 * @brief Submitting thread: an external execution the caller could not execute, completed without running it (a submission on
-	 * the graphics queue of no lists, with its waits and signals). What its passes would have written is left as it was.
+	 * @brief Submitting thread: the segments of an external execution the caller will not execute, from a_first on (SIZE_MAX: from
+	 * ExecutedSegments on), completed without running them (per segment, a submission on the graphics queue of no lists, with its
+	 * waits and signals). What their passes would have written is left as it was.
 	 */
-	void SignalExternalExecutionUnexecuted(const ExternalEpochExecution& execution);
+	void SignalExternalExecutionUnexecuted(const ExternalEpochExecution& execution, size_t a_first = SIZE_MAX);
 
 	// An epoch recorded for one revision: a recording per frame slot of the epoch's ring (async epoch i uses slots
 	// i * framesInFlight .. + framesInFlight - 1, so its tickets and its recordings meet there). Immutable.
@@ -311,6 +320,8 @@ public:
 	// The frame slot of the execution ExecuteFrame is running (valid from its beforePrepare callback until
 	// it returns): the region of a LatchBlock the host may write for it. Also RecordingContext::FrameSlot.
 	bool ClosedExecutions() const noexcept { return m_desc.closedExecutions; }
+	// The epochs' graphs' shared alias pools (Desc::sharedAliasArena), made with the first graph; null without.
+	std::shared_ptr<PersistentAliasArena> AliasArena() const noexcept { return m_aliasArena; }
 	// An external frame slot set (BeginExternalFrameSlot) wins outside a ticket's beforeSubmit: the slot an epoch submitted meanwhile
 	// writes is its ticket's own.
 	uint32_t CurrentFrameSlot() const noexcept {
@@ -436,6 +447,7 @@ private:
 	std::vector<Instance> m_instances;  // by Desc::epochOrder (one without epochs)
 	std::vector<RetiredGraph> m_retiredGraphs;
 	std::vector<SharedQueueTimeline> m_timelines;  // EnsureTimelines
+	std::shared_ptr<PersistentAliasArena> m_aliasArena;  // Desc::sharedAliasArena: the epochs' graphs' alias pools
 	// A slot's last frame: the value each queue's timeline reached with that frame's last batch.
 	// Waiting on those gates the slot's reuse; the host adds no submission of its own.
 	struct SlotCompletion {

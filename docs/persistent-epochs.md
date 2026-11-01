@@ -1,381 +1,273 @@
-# Host epochs in persistent execution
+# Embedding ORG: hosts, epochs and in-stream execution
 
-A host that embeds the graph inside another engine often cannot submit it once per frame. It has to submit at
-several fixed points of its own frame, and each point's work must land between the host's own GPU work before
-and after it: the shadow maps, a depth prepass, a light-culling step, the main colour pass. Each of those
-submission points is an **epoch**.
+A host that embeds ORG inside another engine (CS inside Skyrim's D3D11 renderer, through DXVK) often cannot submit the
+graph once per frame. It submits at several fixed points of its own frame, and each point's work must land between the
+host's own GPU work before and after it: the shadow maps, a depth prepass, light culling, the main colour pass. Each
+submission point is an **epoch**.
 
-Before epochs, the only option was one graph executed once per point, in which every point prepared, admitted,
-recorded and submitted every pass of every feature. Passes that did not belong to the current point returned
-empty work. Every epoch therefore paid for every pass.
+`org::GraphHost` is ORG's embedding layer. It owns:
 
-## The contract
+-   a graph per epoch,
+-   the async machinery that prepares their executions ahead,
+-   the in-stream lowering that hands them to the host's own command stream,
+-   the interop options for what the host shares with the graphs.
 
--   **Tagging.** A pass declares its epoch with `ExternalPassDesc::Epoch(id)`. Untagged passes
-    (`persistent::AllEpochs`, the default) belong to every epoch. A graph with no tags behaves exactly as it did
-    before.
--   **Order.** The host names the order of its epochs within one frame once, with
-    `RenderGraph::SetPersistentEpochOrder` (or `GraphHost::Desc::epochOrder`). Epochs not listed
-    follow the listed ones, in ascending order. The order is structural.
--   **Execution.** `GraphHost::ExecuteFrame(hostData, beforePrepare, epoch)`, or
-    `RenderGraph::SetPersistentEpoch` before `Update`/`Execute`, runs one epoch.
--   **What an epoch runs.** Only that epoch's passes and the untagged ones are updated, prepared, admitted,
-    recorded and submitted. The upload passes run in every epoch, submitted through the graph's external client
-    ahead of the epoch's execution. An epoch with no main passes submits only its uploads.
+## Epochs as graphs
 
-## One compile, per-epoch executables
+-   **Tagging.** A pass declares its epoch with `ExternalPassDesc::Epoch(id)`. Untagged passes (`persistent::AllEpochs`,
+    the default) belong to every epoch. A host with no tags runs one graph.
+-   **Order.** `GraphHost::Desc::epochOrder` names the order of the epochs within one frame.
+-   **One graph per epoch.** `GraphHost` builds a `RenderGraph` per epoch of the order, from the same extension
+    factories. Each graph keeps its epoch's passes and the untagged ones (`RenderGraph::SetPassEpochFilter`). Its structure
+    holds only those passes' resources, so admitting an epoch costs what the epoch touches, not the whole frame.
+-   **Running an epoch.** `GraphHost::ExecuteFrame(hostData, beforePrepare, epoch)` runs one epoch synchronously.
+    `SubmitEpoch(epoch, beforeSubmit)` submits it while async epochs are on (below).
+-   **Rebuilding one epoch.** `RequestRebuild(epoch)` rebuilds that epoch's graph alone: the host thread detaches it, the
+    owner thread builds the new graph, and the old one is released once its own submitted work completes. There is no
+    device wait, and the other epochs keep their graphs and builds (`BuildGeneration(epoch)`). `RequestRebuild()`
+    rebuilds all of them.
+-   **Graph access.** `Graph(epoch)` gives an epoch's graph, `Graph()` the first one; `GraphCount`, `GraphAt`, `EpochAt`
+    enumerate them. The runtime's services (uploads, descriptors, tasks) are shared by all of them.
 
-The persistent program compiles once over the whole frame, and each epoch additionally gets an executable of
-its own.
+### What ties the graphs together
 
-**The whole-frame executable** (`ExecutableGeneration::graph`) is built from every active pass:
+-   **Shared queue timelines.** Every graph signals the same timeline per queue (`RenderGraph::SetSharedQueueTimelines`).
+    Two epochs on one queue are then ordered by the queue itself, with no wait between them. The ledger drops waits on the
+    timeline of the queue a batch runs on.
+-   **One sequencer.** Every graph on a runtime admits against the runtime's `ResourceSequencer`. Its state, access and
+    alias ledgers say, for every resource, which execution touched it last, on which queue, and in which state it left
+    it. An epoch's entry into a resource is admitted from that, whatever ran before it, including when an earlier epoch
+    was skipped that frame.
+-   **A shared alias arena.** With `Desc::sharedAliasArena` (default on), every graph places its transients into the
+    same pools (below).
 
--   Hazards are derived in **frame** order: every pass's authored order is reassigned by epoch rank first,
-    with untagged passes ahead of every epoch, and by authored order within an epoch. Registration order across
-    epochs means nothing to the host, and deriving hazards in it produces cycles against the epoch order. An
-    example is a resource the colour pass writes and the next frame's depth prepass reads.
--   Explicit edges order every pass of an epoch before every pass of the next epoch that has passes.
--   Scheduling, alias placement (`PlanPersistentAliasPlacement`) and alias-order validation all run over this
-    one timeline. Transients that live inside different epochs can therefore share memory: the transient
-    footprint is the largest epoch's peak, not the sum of all epochs. A resource that crosses epochs gets one
-    lifetime that spans them.
+### Contract for hosts
 
-**The per-epoch executables** (`ExecutableGeneration::epochs`) are built from the same lowered compile input,
-restricted to one epoch's passes plus the untagged ones:
+-   A resource read in an epoch must have been written in that epoch or an earlier one, as in any frame. An aliased
+    transient keeps no contents across executions: each execution enters it from Undefined.
+-   A pass instance belongs to one epoch. Work that runs in two epochs is registered twice, with its epoch fixed per
+    instance.
 
--   They keep the same resource enumeration, bindings and alias placements, and the same explicit and
-    placement edges between the passes they contain.
--   Each is an ordinary compiled graph, so its first use of each resource is an admission boundary. An epoch's
-    entry state comes from the admission ledger, meaning whatever actually ran before it, including when an
-    earlier epoch was skipped that frame.
--   Hazards on aliased memory across epochs are the alias ledger's, as they are across frames.
+## Open executions
 
-**Publications.** `SelectedPublication::ForEpoch(id)` returns a publication that shares the bindings and
-logical graph and carries the epoch's executable. It is cached per publication. Admission, sealing and
-recording take it like any other publication, so nothing downstream of the main segment knows about epochs.
-Binding-only edits keep the executables, epoch splits included; structural edits rebuild all of them.
+An execution is **open** by default: it leaves every resource as its last use left it, and the next execution takes it
+from there through the ledgers.
 
-## Why not one compile per epoch
-
-Compiling each epoch as a program of its own would give each its own alias plan. Transients could then only
-share memory within an epoch, and every resource crossing epochs would have to become external to both
-programs. It would also turn every binding edit into one edit per program. The single epoch-aware compile keeps
-one program, one set of bindings and one alias plan, and needs only a compile-time split per epoch.
-
-## Contract for hosts
-
--   A resource read in an epoch must have been written in that epoch or an earlier one of the same frame, as in
-    any frame. With aliasing on, a skipped producer epoch leaves an aliased consumer reading undefined contents
-    rather than last frame's. The alias ledger initialises the placement as a new occupant.
--   A pass instance belongs to one epoch. Work that runs in two epochs is registered twice, with its epoch fixed
-    per instance.
-
-## Closed executions
-
-With `GraphHost::Desc::closedExecutions` (`RenderGraph::SetPersistentClosedExecutions`), every
-execution of an epoch is **closed**: it starts from, and returns to, a fixed home state for everything it
-touches.
-
--   **Home.** Each resource's home state is its seed state, or else the before-state of its first step. The
-    admission ledger's `Prepare(..., closeToHome)` records each resource's first and last step, and adds an
-    exit barrier back to home after the last pass that uses it.
--   **Entry.** Every closed execution begins with a full barrier on each queue's first batch. Together with the
-    exit barriers, this makes an epoch's work independent of which epochs ran before it.
--   **Admission is cached.** Admission then depends only on (publication, epoch), so `SynchronousAdmission`
-    caches one plan per executable. Any number of admissions may be pending at once, and they may be committed
-    or abandoned in any order.
--   **Limit.** A resource used from more than one queue inside one closed execution is rejected. CS runs
-    everything on DXVK's graphics queue.
-
-A program that is not closed keeps the ordered, ledger-chained admission described above.
+-   **Admission at submission.** An execution's body is recorded ahead, from a plan of its publication. At submission,
+    under the sequencer (`RenderGraph::HoldPersistentSequencer`), it is admitted against the ledgers as they stand then.
+    That gives the entry barriers each batch needs, any releases on another queue, and the waits on earlier executions.
+    It is then submitted and committed with nothing admitted in between.
+-   **The body is ledger-independent.** An open plan keeps the entry barriers out of the body (`PreparedBatchBarriers`
+    `textures`/`buffers`/`acquired`). What is left (`beforePass`, `afterPass`, an aliased backing's entry from
+    Undefined) depends on the compiled graph alone, so a body can be recorded ahead and submitted again.
+-   **Handoff lists.** Each batch with entry barriers gets a short list ahead of it: a primary submitted with it, or a
+    secondary its segment runs first in the host's stream. A texture an earlier execution left on another queue is
+    released there first, by a list submitted on that queue, and the consumers wait for it.
+-   **Predicted admission.** The ledger's view of an executable's entry resources repeats from frame to frame. Each
+    executable keeps the last entry-only plan it was admitted with and the ledger's fingerprint of each entry resource
+    (`StatePrediction`). While the fingerprints hold, the admission takes that plan as it is (`FrameAdmission::
+    sharedBarriers`). The access ledger predicts the waits the same way (`AccessPrediction`). The handoff lists a ticket
+    recorded from a predicted plan are kept per frame slot and submitted again by the slot's next ticket that takes the
+    same plan.
+-   **Cost.** In steady state, admission plus commit is a few microseconds per epoch on the submitting thread.
 
 ## Async epochs: tickets
 
-`GraphHost::SetAsyncEpochs(epochs)` requires closed executions. It moves everything except submission
-onto a host thread of ORG's own. The render thread then calls `SubmitEpoch(epoch, beforeSubmit)` at each point
-instead of `ExecuteFrame`. `ExecuteFrame` throws while async epochs are on.
+`GraphHost::SetAsyncEpochs(epochs)` moves everything except submission onto a host thread of ORG's own. The render
+thread calls `SubmitEpoch(epoch, beforeSubmit)` at each point instead of `ExecuteFrame`.
 
--   **Tickets.** For each epoch, the host thread prepares a ticket (`RenderGraph::PreparePersistentTicket`)
-    about one frame ahead:
+-   **Tickets.** For each epoch, the host thread prepares a ticket (`RenderGraph::PreparePersistentTicket`) about one frame
+    ahead:
     -   it reserves a frame slot, and waits there for the slot's previous submission, never on the render thread;
-    -   it runs update, invocations and cached admission;
-    -   it records the epoch's command lists and publishes the ticket in that epoch's atomic cell.
+    -   it runs update and invocations;
+    -   it records the epoch's command lists from a plan, and publishes the ticket in that epoch's atomic cell.
 -   **Submission.** `SubmitEpoch` on the render thread:
     1.  takes the ticket from the cell (waiting only if it is not ready);
     2.  runs `beforeSubmit`, the feature's commit;
-    3.  checks the passes' revision hashes against the ticket (`RenderGraphPass::RevisionHash`, a typed pass's
-        `Revision`), and that no backing
-        changed since it was prepared (below); a stale ticket is prepared again for the same slot;
-    4.  records the pending uploads into the slot's upload list, which the host thread has already reset and
-        begun;
-    5.  submits the uploads and the ticket, with timeline values assigned at submit. The uploads go to the
-        graphics queue, where the ticket's entry barrier orders its batches after them. A batch on another queue
-        (async compute) waits for the uploads' signal instead (`SubmitPersistentTicket`'s `uploadsDone`).
-        Without that wait, a compute pass could read the epoch's uploaded inputs before they land: on the first
-        frames, never-written memory.
-    6.  **Queue-scoped uploads** (`Desc::queueScopedUploads`, default on; `SetQueueScopedUploads`). The submission
-        passes the slot's open lists of the other queues to `RecordPendingUploads` with the ticket, which plans
-        the uploads by destination backing:
-        -   A staged upload whose destination the ticket first uses on another queue is recorded into that queue's
-            list, after a full barrier. Every batch that uses the destination must be ordered after that queue's
-            first batch, and nothing in the graphics list or the recorded lists may touch it. `SubmitPersistentTicket`
-            submits the list just ahead of that first batch (`PreparedRhiExecutionBatch::SubmitLeading`), so the
-            batch needs no wait for it.
-        -   That list waits for what a write of the destination needs against earlier executions: every earlier
-            access the admission ledger holds (`FrameAdmission::boundaryAccessWaits`, readers included), and the
-            incoming waits of the batches that use it.
-        -   A batch on another queue waits for the graphics list only if it uses something written there. That
-            covers the immediate copies' destinations and sources, the recorded lists' destinations and the staged
-            copies left on graphics.
-        -   When a destination is not known, nothing is planned, and every batch waits as before. The same holds for
-            a ticket of several segments.
-        -   The schedule trace shows `Uploads` points only on the batches that wait. Each batch that a queue list
-            precedes carries its copy count and that list's waits (`queueUploadCopies`, `queueUploadWaits`).
--   **Completion.** The host thread receives the submission through a single-producer mailbox. It commits
-    admission, retires, reads statistics and releases deferred resources, in submission order.
--   **Constraints on a ticket.** Its recording may not depend on anything the render thread produces at the
-    epoch. The only upload pass a ticket may have is the host's. Per-frame values come from latches.
--   **Backing changes.** Each preparation captures every slot's backing, while the render thread runs, so the
-    two must not overlap (`BackedResource`: capture and backing mutation are serialized by the preparation
-    owner). `Buffer::ResizeBytes` and `ResizeStructured` release the old backing before creating the new one; a
-    capture between the two binds nothing, or materializes the buffer from the host thread. So the render
-    thread changes a backing only inside `GraphHost::MutateBackings()`:
-    -   the scope waits for a preparation in progress to end (never for the slot's GPU wait, which comes
-        before it) and holds the next one off until it closes;
-    -   it advances the host's backing version: a ticket prepared under an older one is stale at submission,
-        since its passes would use the old backing while the commit wrote the new one;
-    -   while async epochs run, a resize outside a mutation scope throws
-        (`BufferBase::RequireBackingMutationAllowed`).
-
-    Open it only where a backing does change, so a frame that changes none never waits. `AsyncStats` counts
-    the scopes and the ones that waited.
+    3.  checks the passes' revision hashes against the ticket (`RenderGraphPass::RevisionHash`, a typed pass's `Revision`).
+        A stale ticket takes a kept recording (below) or is prepared again for the same slot;
+    4.  admits the ticket (`AdmitPersistentTicket`), records the pending uploads into the slot's upload list, and submits
+        the uploads and the ticket with the handoff lists (`SubmitPersistentTicket`), then commits.
+-   **Uploads.** The uploads go to the graphics queue, ahead of the ticket. A batch on another queue waits for them only
+    when it uses what they write.
+    -   **Queue-scoped uploads** (`Desc::queueScopedUploads`, default on). A staged upload whose destination the ticket first
+        uses on another queue is recorded into that queue's list instead, just ahead of that queue's first batch. That list
+        waits for what a write of the destination needs against earlier executions (`FrameAdmission::boundaryAccessWaits`).
+    -   When a destination is not known, nothing is planned, and every batch off the graphics queue waits for the uploads.
+-   **Completion.** The host thread receives the submission through a single-producer mailbox. It retires, reads
+    statistics and releases deferred resources, in submission order.
+-   **Constraints on a ticket.** Its recording may not depend on anything the render thread produces at the epoch.
+    Per-frame values come from latches.
 
 ## Recording reuse
 
-With `GraphHost::Desc::reuseRecordings` (`RenderGraph::SetPersistentRecordingReuse`), a ticket's recording is kept
-and submitted again while what it was recorded for holds, so an epoch is prepared and executed as it is and never prepared
-again.
+With `Desc::reuseRecordings` (`RenderGraph::SetPersistentRecordingReuse`), a ticket's recording is kept and submitted again
+while what it was recorded for holds, so a steady epoch is never recorded again.
 
--   **What is kept.** A ticket's segment is recorded for resubmission when its execution is closed, nothing is late-bound
-    (no rebound slot, no incoming effect), every pass reports its revision (`void Revision(std::vector<uint64_t>&) const`:
-    what its recording depends on beyond its bindings and the frame's resources; it drives nothing but this reuse), and
-    every pass is replayable
-    (`PreparedPass::IsReplayable`: no submission, completion or abandonment callback, no external signal, no dependency
-    lifecycle effect). Pipelines and other objects a recording binds are retained by the recording itself
-    (`RecordingRetention`, on `OwnedRecordingList`), for every resubmission. Its packets are then replayable (`PreparedRhiExecutionBatch`, `IPreparedExecutionBatch::Replayable`):
-    a submission commits nothing but the commands, completion releases nothing, and the lists return to their pool when the
-    last owner lets the packet go.
+-   **What is kept.** A segment with nothing late-bound (no rebound slot, no incoming effect), every pass reporting its
+    revision (`void Revision(std::vector<uint64_t>&) const`: what its recording depends on beyond its bindings), and every
+    pass replayable (`PreparedPass::IsReplayable`: no submission, completion or abandonment callback, no external signal,
+    no dependency lifecycle effect). Pipelines and other objects a recording binds are retained by the recording itself
+    (`RecordingRetention`, on `OwnedRecordingList`).
 -   **The key.** Per (epoch, frame slot), up to `RenderGraph::kKeptRecordingVariants` recordings, the most recently used
-    first, each with what it was recorded for: the publication, the bindings, the descriptor heaps, the host tag (the
-    host's backing version) and every pass's revision. A set keeps only recordings of the current publication, bindings and
-    host tag.
--   **Reuse.** The owner thread, preparing a ticket for what a kept recording was recorded for, takes it instead of
-    recording (the new invocations are abandoned unrecorded).
--   **Adoption.** At submission, a ticket that `beforeSubmit` made stale takes the kept recording of what its passes depend
-    on now (`RenderGraph::AdoptKeptPersistentRecording`: a lock-free read of the set on the submitting thread), and is not
-    prepared again. Only a variant never recorded for that slot is prepared again. A reserved submission adopts too.
--   **One submission at a time.** A kept recording belongs to one frame slot, and a slot's ticket is prepared after the slot's
-    previous submission completed, so a list is never in two submissions at once. BasicRHI's Vulkan lists begin without
-    `ONE_TIME_SUBMIT` for this.
--   **What a kept recording leaves out.** Every resource a list names must be owned by its recording. Kept recordings
-    therefore record no profiler GPU zones or ranges (Tracy), and no GPU statistics queries: the statistics service recreates
-    its query pools and readback buffers as passes register, and a resubmitted list resolved into freed ones (a GPU page
-    fault). Turn reuse off to profile an epoch's passes on the GPU with Tracy.
--   **Timestamps of their own.** With `GraphHost::SetRecordingTimestamps` (`RenderGraph::SetPersistentRecordingTimestamps`,
-    off by default; a change rebuilds the graph so every kept list is recorded again) a kept list owns its queries
-    (`IStatisticsService::CreateOwnedTimestamps`: a query pool and readback buffer per list, released with it through deferred
-    deletion). The list resets them, writes a begin/end pair around each pass and each barrier batch (named
-    `cs.org.barrier.<where>.<pass>`, the profiler ranges' names) and resolves them into its buffer after its exit barrier. As
-    a list is in one submission at a time and belongs to one frame slot, fixed query indices never collide: each submission
-    (its statistics' publication) puts the list on its slot's pending set, and the slot's completion (`OnFrameComplete`) reads
-    the buffer, which holds that submission's values. `GetCompletedTimestamps` lists every pair read, with its queue: a compute
-    list's ticks are its queue's.
+    first, each with what it was recorded for: the publication, the bindings, the descriptor heaps, the host tag and every
+    pass's revision.
+-   **Reuse and adoption.** The owner thread, preparing a ticket for what a kept recording was recorded for, takes it
+    instead of recording. At submission, a ticket that `beforeSubmit` made stale takes the kept recording of what its
+    passes depend on now (`RenderGraph::AdoptKeptPersistentRecording`), and is not prepared again.
+-   **One submission at a time.** A kept recording belongs to one frame slot, and a slot's ticket is prepared after the
+    slot's previous submission completed, so a list is never in two submissions at once. BasicRHI's Vulkan lists begin
+    without `ONE_TIME_SUBMIT` for this.
+-   **What a kept recording leaves out.** Profiler GPU zones and GPU statistics queries the statistics service owns. With
+    `GraphHost::SetRecordingTimestamps` a kept list owns its timestamp queries instead
+    (`IStatisticsService::CreateOwnedTimestamps`), read at its slot's completion.
 -   **Statistics.** `AsyncStats::recorded`, `kept`, `reused` and `adopted`.
--   **Release.** `StopAsync` lets every kept recording go once the slots' work is done (`ClearKeptPersistentRecordings`).
 
-A kept recording also keeps whatever its passes' prepared data hold, for as long as it is kept. A host that versions
-resources by reference count (writing only into a version nobody holds) must therefore not cap its versions: with a fixed
-number of them, kept recordings can hold every one, and the next version waits forever (CS's DCLF pipeline sets did).
-
-For the variants to come back, a host's pass revisions must come back too: a shape that alternates should republish its
-earlier identity rather than a new one (CS's DCLF keeps its last few shapes for this).
+A kept recording keeps whatever its passes' prepared data hold. A host that versions resources by reference count must
+therefore not cap its versions. For variants to come back, a host's pass revisions must come back too: a shape that
+alternates should republish its earlier identity rather than a new one.
 
 ## Revision-driven epochs
 
 `SetAsyncEpochs(epochs, revisionEpochs)` makes the listed epochs revision-driven. Their recordings are made ahead, for a
-revision the host's scene supplies, and nothing about them is recorded or prepared at submission. This is the epochs' side of
-a scene revision recorded by a dependency graph (CS's DCLF: the scene revision, phase 6b R1–R7).
+revision the host's scene supplies (CS's DCLF scene revision), and nothing about them is recorded at submission.
 
--   **Slot rings.** Async epoch i uses frame slots `i * framesInFlight` up to `+ framesInFlight - 1` (when the host's slots
-    hold `framesInFlight` per async epoch, which `FrameSlots` does). Its tickets take the next slot of its ring, so a
-    recording per ring slot covers every ticket. Every async epoch uses its ring, revision-driven or not.
--   **`RequestEpochRecording(epoch, hostData, done)`.** Lock-free, from any thread, safe across a build: a request pushed on
-    a Treiber stack of the host's own lifetime (never the async state a build replaces) that the host's thread takes whole, in
-    posting order. `done` runs exactly once: with the recording (its `buildGeneration` the build it was recorded on), with
-    the error that stopped it, or with `EpochRecordingDropped` when a build stopped the host's thread first (on the thread that
-    built; the caller asks again for the new build's graph). The host's end drops what is queued without calling `done`.
-    -   The host's thread records the epoch for `hostData` into every slot of its ring: what the passes prepare for
-        (`FramePreparationContext::preparationData`), retained while it records.
-    -   It records a slot once the slot's last work is done; it waits for that, never the caller. A slot the epoch's
-        unsubmitted ticket holds is recorded too, since that ticket holds its admission alone.
-    -   `done(EpochRecording, error)` runs on the host's thread once every slot is recorded. A recording that is not
-        replayable is an error.
-    -   A live (not revision-driven) async epoch takes requests too: recorded the same way, never admitted. This is what a
-        revision would submit, recorded before the epoch switches to revision-driven submission. A slot its live ticket holds
-        is recorded once that ticket is submitted, and a slot with work in flight once that work completes (the loop wakes on
-        completions), so the request never waits on the GPU.
-    -   The host's thread prepares the frames' tickets before it advances requests, so recording ahead never delays a
-        submission.
-    -   A live epoch's tickets admit the recordings still held as candidates beside their own preparation. Inside
-        `SubmitEpoch`'s `beforeSubmit`, the submitting thread may choose one (`UseEpochRecording`). The bind then displaces
-        the ticket's own segment, whose admission completion abandons, and the stale check does not apply. A chosen
-        recording the ticket did not admit makes the call throw. This lets a scene take a revision's recordings frame by
-        frame, wherever its revision covers the frame, before its epochs become revision-driven.
--   **Resolver group members are owned by their slots.** A slot entry bound to a group member holds the member until the
-    slot is rebound. Every preparation polls every slot's backing, including slots another epoch's preparation bound. A
-    versioned buffer whose old version nothing else held (several growths in a row) would otherwise leave a slot naming a
-    freed resource.
--   **Immutable inputs.** A recording for a revision resolves the graph's resolvers through it: `PreparePersistentTicket`
-    passes its host data as the resolver capture context (`ResolverCaptureContext` of `IHostExecutionData`). The recording's
-    publication and bindings are the revision's own, and its frozen bindings hold the backings and descriptors it was
-    recorded with, so it stays valid whatever is published after it. A buffer that grows does so by versions
-    (`VersionedBuffer`, below), never in place.
--   **Tickets admit candidates** (`RenderGraph::PrepareRevisionTicket`). A revision-driven epoch's ticket prepares nothing
-    from live state. For its slot, the host's thread admits each revision recording still held by its caller as a candidate
-    (`AddPersistentTicketCandidate`: `SynchronousAdmission::Prepare` for the recording's publication). A recording finished
-    while a ticket waits is added to that ticket before its `done` runs, so a revision the caller publishes afterwards is
-    always admitted. Candidates are an append-only list: the host's thread pushes, the submitting thread reads, with no lock.
--   **Submission.** `SubmitEpoch(epoch, beforeSubmit, owner, recording)` binds the revision's recording for the ticket's slot
-    (`RenderGraph::BindPersistentTicketRecording`): the ticket takes the candidate admitted for exactly that recording.
-    Completion commits it and abandons the other candidates (closed executions allow several admissions pending, abandoned
-    in any order). A recording no candidate admits is an error: the ticket is discarded and the call throws. A
-    revision-driven epoch is never prepared again, and its currency check and adoption do not apply.
--   **Not kept.** A recording made for host data is neither taken from nor added to the reuse sets. A pass's `Revision`
-    reads its own state and sees no frame, not the host data, so the key could not tell two revisions apart.
+-   **Slot rings.** Async epoch i uses frame slots `i * framesInFlight` up to `+ framesInFlight - 1`. Its tickets take the
+    next slot of its ring, so a recording per ring slot covers every ticket.
+-   **`RequestEpochRecording(epoch, hostData, done)`.** Lock-free, from any thread, safe across a build. The host thread
+    records the epoch for `hostData` into every slot of its ring, each once the slot's last work is done, and calls `done`
+    once with the recording, the error that stopped it, or `EpochRecordingDropped` when a build stopped the host thread
+    first.
+-   **Candidates are recordings.** A revision-driven ticket prepares nothing from live state. The revision recordings its
+    caller still holds are its candidates, and `SubmitEpoch(epoch, beforeSubmit, owner, recording)` binds one. The
+    submission admits whichever recording it takes. A live epoch's `beforeSubmit` may choose one too
+    (`UseEpochRecording`).
+-   **Immutable inputs.** A recording for a revision resolves the graph's resolvers through it (`ResolverCaptureContext` of
+    `IHostExecutionData`), and its frozen bindings hold the backings and descriptors it was recorded with. A buffer that
+    grows does so by versions (`VersionedBuffer`), never in place.
 -   **Statistics.** `AsyncStats::revisionSlotsRecorded`, `revisionRecordings` and `revisionSubmissions`.
--   **Test.** `PersistentVulkanHostTests revision`:
-    -   a revision of the full count recorded for the 3 ring slots and submitted 6 times;
-    -   the target grown as a new version (`VersionedBuffer::GrowBytes`) and a revision naming it recorded; the old revision,
-        which names the first version, still submitted twice after it (each ticket admits both), then the new one;
-    -   a revision of half the count, on the grown version, which writes its half and leaves the rest;
-    -   an epoch submitted without its recording rejected, and the host going on;
-    -   12 submissions bound, none prepared again.
 
 ### Versioned buffers
 
-`org::VersionedBuffer` (`Resources/Buffers/VersionedBuffer.h`) is a buffer that grows by versions. `GrowStructured` and
-`GrowBytes` make the next version (`Buffer::UnmaterializedLike`: the same heap, access, structure, descriptors and name, at
-the new size), materialize it and publish it as current. The old version is untouched, and it is released when the last
-thing holding it does: a revision, a recording's bindings, a frame in flight.
+`org::VersionedBuffer` grows by versions. `GrowStructured` and `GrowBytes` make the next version, materialize it and
+publish it as current. The old version is released when the last thing holding it does: a revision, a recording's
+bindings, a frame in flight. Passes declare the `VersionedBuffer` itself; a preparation resolves the version its host
+data names (`IResourceVersions::Find`), else the current one. After a growth, `GraphHost::NoteNewVersions` makes the
+tickets prepared before it stale.
 
--   **Declared as a resolver.** Passes declare the `VersionedBuffer` itself. A preparation resolves the version its host data
-    names (`IResourceVersions::Find`), else the current one. Each version has its own declaration state, made once.
--   **The live path.** An epoch that is not revision-driven resolves the current version, and a growth is followed by
-    `GraphHost::NoteNewVersions`: a ticket prepared before resolved the old version, so it is no longer current
-    (it is prepared again, or takes a kept recording). Nothing waits, unlike `MutateBackings`, because nothing changed in
-    place.
--   **Thread contract.** `Publish` and `Grow*` on the owner's thread; `Current`, `Get` and the resolver from any thread (the
-    current version is an atomic `shared_ptr`).
--   A buffer without a backing has nothing a capture could see, so sizing an unmaterialized version needs no backing
-    mutation scope (`RequireBackingMutationAllowed`).
+## In-stream execution
 
-## External epochs
+`GraphHost::SetExternalEpochs(epochs)` (`RenderGraph::SetExternalPersistentEpochs`) marks async epochs whose graphics
+work the host executes itself, in its own command stream. CS runs them inside DXVK's command list through DXVK's
+external-commands callbacks, so ORG's work does not end DXVK's list.
 
-`GraphHost::SetExternalEpochs(epochs)` (`RenderGraph::SetExternalPersistentEpochs`) marks async epochs the host
-executes itself, in a command buffer of its own: CS's DCLF CPU pipeline runs them inside DXVK's command buffer (an
-external-commands callback), so ORG records the passes and their barriers and DXVK's list is never split for them.
+-   **The stream.** A batch is in the host's stream when its queue is the host's graphics queue or another slot on the same
+    native queue (`RenderGraph::InHostStream`: a device that aliases an unset queue kind to the graphics queue). Its batches
+    are recorded as secondaries (a pool per stream slot). Batches on other queues are recorded as primaries and submitted by
+    ORG on their queues, at the ticket's submission.
+-   **Segments.** `TakeExternalExecution` returns an `ExternalEpochExecution`: an ordered list of segments. Each holds the
+    lists recorded ahead of it, its batches (secondaries, or late batches recorded at execution), and the waits and
+    signals of the host submission that holds it. A segment's signals include the graph's values for its batches on the
+    graphics timeline, so retirement, slot waits and later tickets work as for a submitted epoch.
+-   **Where a segment starts.** A new segment starts where a stream batch waits for a batch off the stream.
+-   **When it splits.** A segment is marked `split` when that off-stream batch waits, directly or through others, for a
+    stream batch. The host must start a new submission for it, or the submission would wait for itself. DXVK attaches an
+    external command's waits to the whole submission it lands in, so a split is a DXVK flush.
+-   **Waits dropped in the stream.** Waits on a stream slot's timeline are dropped: queue order covers them.
+-   **`exitSplit`.** Set when a batch off the stream waits for the stream. The host's wait for the epoch's off-stream work
+    then starts a submission of its own.
+-   **Uploads.** With queue-scoped uploads the off-stream users' uploads go to their own queue. Otherwise the stream's
+    uploads get a segment of their own, with a value the off-stream users wait for.
+-   **Execution.** `ExternalEpochExecution::Execute(segment, primary)`, on the host's thread, once per segment and in
+    order. It binds the graph's heaps before each execution of secondaries, executes them, and records each late batch.
+    Everything the primary had bound is undefined afterwards.
+-   **Not executed.** A host that cannot execute a segment calls `SignalExternalExecutionUnexecuted(execution, first)`. That
+    is a submission of no lists with the waits and signals of each segment from `first` on, and its late passes are
+    abandoned.
+-   **Passes recorded at execution.** A pass declared with `ExternalPassDesc::RecordAtExecution()` is alone in its batch,
+    which must be in the stream. The ticket keeps its invocation and barrier plan, and the host's execution records it
+    there: for work only known then, such as a CPU cull's draws.
+-   **Test.** `PersistentVulkanHostTests`:
+    -   `external`: a late pass in the stream.
+    -   `stream` / `stream open`: a write on a compute queue and a copy on a copy queue aliased to the graphics one, with
+        stream uploads (two segments, one split) and queue-scoped uploads (one segment, no split).
+    -   `stream open home`: external home states, below.
 
--   **Recording.** A ticket of an external epoch records each batch into a secondary list (a pool of secondaries,
-    `CommandListPool(..., secondary)`), begun outside any pass. Every batch must be on the graphics queue, and none may wait
-    for another across queues; a ticket that breaks either throws. Its recording is kept for reuse like any other's (the
-    same secondaries executed again), so revision-driven epochs can be external.
--   **Passes recorded at execution.** A pass declared with `ExternalPassDesc::RecordAtExecution()` is alone in its batch
-    (`CompilePass::recordAtExecution`). The ticket records the other batches ahead and keeps this one's invocation and barrier
-    plan; the host's execution records its barriers and calls its `Record` there, on the host's thread, into the host's list.
-    For work only known then: a CPU cull's draws. A recording with such a batch is never kept, and the batch has no ORG
-    statistics (the ticket completes on the owner thread before it is recorded).
--   **Submission.** `SubmitEpoch` runs as for any async epoch (the commit, the bind, the checks), but submits nothing: the
-    uploads go into a secondary of the slot's, and `SubmitPersistentTicket` gives each batch its waits and signal as usual,
-    then commits the packets as submitted (`CommitExternal`) instead of handing them to the queue.
-    `TakeExternalExecution` returns an `ExternalEpochExecution`: the uploads' secondary, the batches in order, and the waits and
-    signals the host's submission must carry. Its signals include the graph's own value on its graphics timeline, so retirement,
-    slot waits and later tickets work as for a submitted epoch.
--   **Execution.** `ExternalEpochExecution::Execute(primary)`, on the host's thread, binds the graph's heaps in the primary before
-    each execution of secondaries, executes them, and records each late batch. Everything the primary had bound is undefined
-    afterwards. A host that cannot execute it calls `SignalExternalExecutionUnexecuted`: a submission of no lists with its waits
-    and signals, whose late passes are abandoned.
--   **Ordering.** The host submits the buffer in its stream, after the graph's earlier submissions on that queue and before its
-    later ones, so the graphics timeline's values still grow in submission order.
--   **Test.** `tests/PersistentVulkanHostTests.cpp`, run as `external`: an external epoch whose copy pass is recorded at
-    execution, executed in the test's own primary; each execution records the late pass once and writes the frame's value, and
-    one signalled unexecuted leaves the output as it was.
+## Interop options
+
+Nothing in ORG requires the following options. They are for hosts whose own GPU work shares resources or queues with
+the graphs.
+
+-   **Queue boundary** (`Desc::queueBoundary`, `RenderGraph::SetExternalQueueBoundary`). A full barrier at the entry and/or
+    exit of each execution on the queues it shares with the host. It orders the host's own work around the graph's on that
+    queue, which the graph's ledgers do not see.
+-   **External home states** (`Desc::externalHomeStates`, `RenderGraph::SetPersistentExternalHomeStates`). Every texture the
+    host owns (`Resource::HostOwned`: `ExternalTextureResource`) leaves every execution in its home state on the graphics
+    queue: its declared incoming state, or the state its first use expects. The host then finds its own resources where
+    it left them.
+    -   A last use on another queue releases the texture to the graphics queue. The plan's `homeAcquires` acquire it there,
+        after its producers: in a list submitted after them, or a trailing segment of an in-stream execution. That segment
+        is split only when no segment since the last split already waits for the same points.
+    -   An execution takes a host-owned texture from the graphics queue at entry.
+    -   On Vulkan, a pass that touches an exclusive resource stays on the graphics queue anyway. So the queue transfer
+        applies to textures the host shares concurrently, and to D3D12.
+    -   Everything else flows through the ledgers.
+-   **Closed executions** (`Desc::closedExecutions`, `RenderGraph::SetPersistentClosedExecutions`). The fallback for a host
+    that cannot tolerate any state carried between executions.
+    -   Every resource an execution touches returns to its home state after its last use.
+    -   Every execution starts with a full barrier on each queue's first batch.
+    -   An execution's admission is then independent of what ran before, and cached per executable. Several admissions may
+        be pending and committed or abandoned in any order.
+    -   A texture used from more than one queue inside one closed execution is rejected.
+
+## Shared alias arena
+
+A host's graphs place their transients into one `PersistentAliasArena` (`RenderGraph::SetPersistentAliasArena`;
+`GraphHost::AliasArena`).
+
+-   **Packing.** Each graph packs its own transients from offset 0 of a pool (`PlanPersistentAliasPlacement`, unchanged).
+    Transients of different epochs therefore overlap the same memory.
+-   **Size.** A pool is as large as the largest requirement of any graph placed in it, with headroom. It shrinks when every
+    graph needs less than half of it.
+-   **Safety.** The runtime's alias ledger, which every graph shares through the sequencer. A placement's first use waits
+    for the last use of any overlapping placement by another graph's earlier execution, and enters from Undefined.
+-   **Growth.** A graph that needs more grows the pool into a new generation. The other graphs' placements keep the
+    earlier generation alive and share nothing with the new one. `RenderGraph::PersistentAliasPlacementsCurrent` reports
+    that, and `GraphHost` rebuilds those graphs, which places them in the current generation and frees the old one.
+-   **Test.** `PersistentVulkanHostTests arena`: two epochs whose scratch buffers share one pool at offset 0 (the second's
+    write on the compute queue). Each epoch's copy reads what it wrote, synchronous and async.
 
 ## Latches
 
-`org::LatchBlock` is a host-visible buffer with one region per frame slot. A recording refers only to the slot's
-offset (`RecordingContext::FrameSlot()`), and the render thread writes the values into the region before it
-submits. A pass whose recording would otherwise bake a per-frame value, such as a count, a matrix or a dispatch
-size, reads that value from its latch. Indirect dispatches go through `ExecuteIndirect` with a dispatch command
-signature.
+`org::LatchBlock` is a host-visible buffer with one region per frame slot. A recording refers only to the slot's offset
+(`RecordingContext::FrameSlot()`), and the render thread writes the values into the region before it submits. A pass whose
+recording would otherwise bake a per-frame value (a count, a matrix, a dispatch size) reads it from its latch.
 
 ## Staged uploads
 
-`org::runtime::StagedUploadBatch` lets a producer (a worker thread, or the render thread) write upload data
-straight into mapped upload pages: `Stage(target, dstOffset, size[, data])`. `IUploadService::SubmitStagedUploads`
-hands a batch over on the owner thread.
+`org::runtime::StagedUploadBatch` lets a producer (a worker thread, or the render thread) write upload data straight into
+mapped upload pages: `Stage(target, dstOffset, size[, data])`. `IUploadService::SubmitStagedUploads` hands a batch over on
+the owner thread.
 
--   **Synchronous hosts.** The batch joins the upload pass's queue in order, with no copy of its bytes.
--   **Async epochs (direct mode).** The host records the waiting batches straight into the ticket's upload
-    list (`RecordStagedUploads`), one copy per entry, after one barrier against the work before them. The barrier
-    is recorded only when there is a copy: an epoch whose feature staged nothing records nothing.
--   **Per-frame values need no upload.** A value written whole every frame (a block, a counter to zero) can go
-    into a latch, and a pass of the epoch copy it from there: the latch region's place depends only on the frame
-    slot, so the copy is recorded with the ticket, ahead, and the submission records nothing for it.
--   **Ordering.** Copies land in submission order. A copy that overlaps an earlier one in the same list,
-    whether from an earlier batch or from the upload pass's queued copies, waits for it through a barrier.
-    This happens when a batch's epoch was never submitted and its replacement follows it into the next list.
-    Steady state has no overlaps.
--   **Lifetime.** A batch is held until the slot whose submission recorded it has retired. A producer reuses
-    a batch once it holds the only reference.
-
-### Recorded ahead by the producer
-
-Recording is a copy command per entry, on the submitting thread. A producer can record its batch itself, on its own
-thread, as soon as it has staged it: `StagedUploadBatch::Record(device)` writes the copies into a command list of the
-batch's own, starting with a full barrier against the work before it. The owner then hands it over with
-`IUploadService::SubmitRecordedUploads`, and the submission takes the list as it is (`RecordPendingUploads` returns it
-in `recordedLists`, ahead of the host's own list).
-
--   **Its place.** The list goes to the queue ahead of every copy the owner records, so the service accepts a batch only
-    when that is its place in submission order: nothing staged, queued, posted or copied (a resize) before it is still
-    waiting. Otherwise `SubmitRecordedUploads` returns false and the caller submits the batch as staged.
--   **Its targets.** A recorded copy names each target's backing as it was. `BufferBase::BackingReleaseSerial` counts
-    every backing any buffer releases; a batch recorded under another value is not accepted, and one outdated between
-    its acceptance and the submission is recorded by the owner instead, first.
--   **Recording.** `StagedUploadBatch::RecordCopies` is the one recorder, for both: copies in order, with a barrier only
-    before a copy that overlaps one since the last barrier (per backing, an interval lookup).
--   **Statistics.** `AsyncStats::recordedUploadLists` counts the lists submitted as recorded.
+-   **Async epochs.** The host records the waiting batches straight into the ticket's upload list
+    (`RecordStagedUploads`), one copy per entry. A copy that overlaps an earlier one in the same list waits for it through
+    a barrier.
+-   **Recorded ahead by the producer.** `StagedUploadBatch::Record(device)` writes the copies into a command list of the
+    batch's own, on the producer's thread. `IUploadService::SubmitRecordedUploads` hands it over when that is its place in
+    submission order. A batch whose targets' backings changed since (`BufferBase::BackingReleaseSerial`) is recorded by the
+    owner instead.
+-   **Lifetime.** A batch is held until the slot whose submission recorded it has retired.
 
 ## Tests
 
-`tests/PersistentGraphTests.cpp` builds a program whose reader and writer are registered in the opposite order
-to their epochs and checks:
-
--   the whole-frame order;
--   each epoch executable's placements: its own passes and the untagged one, and nothing else;
--   `ForEpoch` caching, and null for an absent epoch;
--   admission of both splits in sequence through one `SynchronousAdmission`;
--   that a program without tags has no epochs.
-
-`tests/PersistentVulkanHostTests.cpp`, run as `reuse` (`OpenRenderGraphPersistentVulkanHostTests.Reuse`), covers recording
-reuse: steady frames take their kept recordings (none prepared again) and each submission of the same lists writes that
-frame's uploaded value; a pass's revision alternating inside `beforeSubmit` every frame, once both variants are kept per
-slot, makes every stale ticket adopt a kept recording, with none prepared again and every frame's output right.
-
-A second test covers closed executions:
-
--   closure (the exit barriers to home);
--   plan caching;
--   several admissions pending at once;
--   out-of-order commit and abandon;
--   the error for a program that is not closed.
+-   `tests/PersistentGraphTests.cpp`:
+    -   epoch splits and their admission through one `SynchronousAdmission`;
+    -   closed executions (closure, plan caching, out-of-order commit and abandon);
+    -   graphs sharing a sequencer;
+    -   external home states: a host-owned texture used on the compute queue is taken from and given back to the graphics
+        queue each execution.
+-   `tests/PersistentVulkanHostTests.cpp` modes:
+    -   `async`, `reuse`, `revision` and `external`, each also `open`;
+    -   `split` (two epochs, two graphs, one rebuilt alone);
+    -   `stream` and `stream open home`;
+    -   `arena`.

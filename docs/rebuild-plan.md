@@ -31,7 +31,7 @@ OpenRenderGraph (ORG) runs three execution routes inside one `RenderGraph` class
 
 | Route | Entered through | Used by |
 |---|---|---|
-| **Persistent** | `PreparePersistentFrame` / `ExecutePersistentFrame` | CS, through `PersistentGraphHost` (its only route); BasicRenderer when `SARP_PERSISTENT_GRAPH=1` |
+| **Persistent** | `PreparePersistentFrame` / `ExecutePersistentFrame` | CS, through `GraphHost` (its only route); BasicRenderer when `SARP_PERSISTENT_GRAPH=1` |
 | **Owned/fresh** | `SubmitOwnedCompileRequest` → `experimental::CompileGraph` | BasicRenderer, by default |
 | **True legacy** | `AutoScheduleAndBuildBatches` plus the legacy `Execute` | `ContributorGraphHost`; any graph with no task service, with compile diagnostics on, or with more than one backend device |
 

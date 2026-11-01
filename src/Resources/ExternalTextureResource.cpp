@@ -26,6 +26,8 @@ bool ExternalTextureResource::TryGetRHIResourceDesc(rhi::ResourceDesc& outDesc) 
 	if (m_description.hasUAV || m_description.hasNonShaderVisibleUAV) flags |= rhi::ResourceFlags::RF_AllowUnorderedAccess;
 	if (m_commonLayoutOnly) flags |= rhi::ResourceFlags::RF_AllowSimultaneousAccess;
 	outDesc.resourceFlags = static_cast<rhi::ResourceFlags>(flags);
+	// What the importer says the image was created with: a concurrent one may be used from any queue without ownership transfers.
+	outDesc.queueSharing = m_description.queueSharing;
 	return outDesc.texture.format != rhi::Format::Unknown;
 }
 

@@ -26,6 +26,7 @@
 #include "Render/RenderGraph/ExternalEpochExecution.h"
 #include "OpenRenderGraph/ExternalClient.h"
 #include "Render/RenderGraph/PersistentGraph.h"
+#include "Render/RenderGraph/PersistentAliasArena.h"
 #include "Render/Runtime/ScopedActiveGraphServices.h"
 #include "Interfaces/IDynamicDeclaredResources.h"
 #include "Resources/DynamicResource.h"
@@ -131,6 +132,7 @@ inline std::optional<persistent::BindingVersion> CaptureSlotBinding(Resource& re
 	}
 	rhi::ResourceDesc description{};
 	if (concrete->TryGetRHIResourceDesc(description)) initial.heapType = description.heapType;
+	initial.hostOwned = concrete->HostOwned();
 	initial.aliasHeap = snapshot->aliasHeap;
 	initial.aliasHeapIdentity = snapshot->aliasHeap.get();
 	initial.aliasPoolID = snapshot->aliasPoolID;
@@ -372,20 +374,23 @@ struct RenderGraph::PersistentInstanceState {
 	std::vector<uint8_t> masterHostedInMain;
 	std::vector<uint32_t> hostedMainPasses;             // Main indices of installed frame-interrupting passes.
 	std::vector<ExternalPassDesc> deferredInterrupting; // Requested while a structural build was pending.
-	// Alias planning (structural builds only).
-	struct AliasPool {
-		TrackedHandle allocation;
-		std::shared_ptr<const AliasHeapGeneration> heap;
-		uint64_t capacityBytes = 0, alignment = 1, generation = 0;
-		uint8_t resourceClass = 0;
-		uint64_t idleSinceFrame = 0; // The frame the latest plan stopped placing into it; 0 while placed into.
-	};
+	// Alias planning (structural builds only), into the pools of the graph's arena (RenderGraph::SetPersistentAliasArena; one of
+	// its own without one). This state is the arena's owner key for its requirements.
+	std::shared_ptr<PersistentAliasArena> aliasArena;
+	PersistentInstanceState() = default;
+	PersistentInstanceState(const PersistentInstanceState&) = delete;
+	PersistentInstanceState& operator=(const PersistentInstanceState&) = delete;
+	~PersistentInstanceState() {
+		if (!aliasArena) return;
+		std::lock_guard lock(aliasArena->mutex);
+		for (auto& [id, pool] : aliasArena->pools) pool.required.erase(this);
+		aliasArena->stale.erase(this);
+	}
 	struct AliasPlacementRecord {
 		uint64_t poolID = 0, offset = 0, sizeBytes = 0;
 		const AliasHeapGeneration* heap = nullptr;
 		bool operator==(const AliasPlacementRecord&) const = default;
 	};
-	std::unordered_map<uint64_t, AliasPool> aliasPools;
 	std::unordered_map<Resource*, AliasPlacementRecord> aliasPlaced; // Concrete resources placed by this planner.
 	std::vector<std::pair<uint32_t, uint32_t>> aliasEdges;          // Installed placement orderings (logical pass slots).
 	uint64_t aliasPlans = 0, aliasRematerializations = 0;
@@ -515,6 +520,17 @@ struct RenderGraph::PersistentExecutionsState {
 	// The latest execution (its index is frameNumber), and the submitted ones not yet seen complete.
 	std::shared_ptr<detail::ExecutionRecord> lastExecution;
 	std::vector<std::shared_ptr<detail::ExecutionRecord>> pendingExecutions;
+	// Lists submitted after an execution's batches (its home acquires), kept until their own signal completes.
+	std::vector<std::pair<compiler::ExecutionTimelinePoint, std::shared_ptr<const void>>> trailingLeases;
+	// Per frame slot: the handoff lists a ticket recorded from a predicted plan (FrameAdmission::sharedBarriers). The next ticket in
+	// the slot whose admission takes the same plan submits them again: the slot's earlier work has completed by then.
+	struct HandoffCache {
+		std::shared_ptr<const compiler::PreparedExecutionBarrierPlan> plan;
+		bool external = false;
+		std::vector<rhi::CommandList> handoff, streamHandoff;  // per batch
+		std::vector<std::shared_ptr<const void>> allocations;
+	};
+	std::vector<HandoffCache> handoffCache;
 	std::vector<uint8_t> tracyFrameBegun;
 	// Diagnostic: preparation cost per main pass index (ns, calls).
 	std::vector<std::pair<uint64_t, uint64_t>> prepareCostByMain;
