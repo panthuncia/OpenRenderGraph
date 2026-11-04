@@ -1,5 +1,7 @@
 #include "Managers/Singletons/DeviceManager.h"
 
+#include <cstdlib>
+
 #include <spdlog/spdlog.h>
 #include <flecs.h>
 #include <rhi_interop_dx12.h>
@@ -171,6 +173,12 @@ void DeviceManager::Initialize(rhi::Device device) {
 
     rhi::ma::AllocatorDesc desc;
     desc.device = m_device.Get();
+#ifdef _WIN32
+    // ORG_BLOCK_MIB sets the allocator's block size, for tests. GetEnvironmentVariable, because a host can set it in-process.
+    char blockMib[16] = {};
+    if (GetEnvironmentVariableA("ORG_BLOCK_MIB", blockMib, sizeof(blockMib)) > 0)
+        desc.preferredBlockSize = static_cast<uint64_t>(std::atoi(blockMib)) << 20u;
+#endif
     rhi::ma::CreateAllocator(&desc, &m_allocator);
 }
 
