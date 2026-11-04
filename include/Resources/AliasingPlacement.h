@@ -14,7 +14,6 @@ public:
     static std::shared_ptr<const AliasHeapGeneration> Capture(TrackedHandle& allocation, uint64_t generation) {
         if (!allocation.GetAllocation()) throw std::invalid_argument("Missing alias heap allocation");
         auto owner = allocation.CaptureAllocationLease();
-        // Obtain the pointer AFTER capture has moved ownership to stable storage.
         return std::shared_ptr<const AliasHeapGeneration>(new AliasHeapGeneration(
             std::move(owner), allocation.GetAllocation(), generation));
     }
