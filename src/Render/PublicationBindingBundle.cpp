@@ -123,16 +123,23 @@ PublicationBindingBundle::Snapshot PublicationBindingBundle::Capture(Resource& r
     result->resourceID = resource.GetGlobalResourceID();
     result->externallyImmutable = resource.GetGraphOwnership() == Resource::GraphOwnership::ExternalImmutableShaderResource;
     resource.TryGetRHIResourceDesc(result->description);
-    if (auto set = resource.AcquireAPIRepresentationSet(); set && !set->empty() && set->front() && set->front()->resource) {
+    if (auto set = resource.AcquireAPIRepresentationSet();
+        set && !set->devices.empty() && set->devices.front() && set->devices.front()->resource) {
         // Explicit per-device representations (multi-device) replace the backing. The primary device's representation is the
         // resource. The published set owns every device's representation and is the allocation's identity: slots of one
-        // resource captured at different times must name the same owner.
-        const auto& primary = set->front();
-        result->representations.resize(set->size());
-        for (size_t index = 0; index < set->size(); ++index)
-            if ((*set)[index] && (*set)[index]->resource) result->representations[index] = (*set)[index]->resource.Get();
+        // resource captured at different times must name the same owner. Representations placed in a shared alias pool are
+        // aliased like a placed backing: they enter every execution undefined, and the alias ledger orders their range.
+        const auto& devices = set->devices;
+        const auto& primary = devices.front();
+        result->representations.resize(devices.size());
+        for (size_t index = 0; index < devices.size(); ++index)
+            if (devices[index] && devices[index]->resource) result->representations[index] = devices[index]->resource.Get();
         result->resource = primary->resource.Get();
         result->backingGeneration = primary->backingGeneration;
+        result->aliasHeap = set->placement.heap;
+        result->aliasPoolID = set->placement.poolID;
+        result->aliasOffset = set->placement.offset;
+        result->aliasSize = set->placement.size;
         result->allocationOwner = std::move(set);
     } else if (auto* backed = dynamic_cast<BackedResource*>(&resource)) {
         auto allocation = backed->CapturePublishedBackingAllocation();

@@ -2,8 +2,43 @@
 // alias placement.
 #include "RenderGraphPersistentState.h"
 #include "Render/PipelineLibrary.h"
+#include <rhi_interop_dx12.h>
 
 namespace org {
+
+namespace {
+// Publishes a D3D12 resource and its Vulkan counterpart as a resource's representations on both devices, and points its
+// descriptors on each device at them.
+void PublishRepresentationPair(Resource& concrete, const DeviceRegistryEntry& d3d12, const DeviceRegistryEntry& vulkan,
+	InteropResourcePair pair, bool texture, Resource::APIRepresentationPlacement placement) {
+	// Textures start undefined on both APIs; buffers in the bridge-compatible COMMON state.
+	const ResourceState initial = texture
+		? ResourceState{rhi::ResourceAccessType::None, rhi::ResourceLayout::Undefined, rhi::ResourceSyncState::None}
+		: ResourceState{rhi::ResourceAccessType::Common, rhi::ResourceLayout::Common, rhi::ResourceSyncState::All};
+	std::vector<Resource::PendingAPIRepresentation> representations;
+	representations.push_back({d3d12.id, std::move(pair.canonical), initial, placement.heap});
+	representations.push_back({vulkan.id, std::move(pair.imported), initial, placement.heap});
+	if (auto* indexed = dynamic_cast<GloballyIndexedResource*>(&concrete)) indexed->RotateDescriptorSlotsForPublication();
+	if (!concrete.PublishAPIRepresentations(std::move(representations), std::move(placement)))
+		throw std::runtime_error("Failed to publish the shared representations of '" + concrete.GetName() + "'");
+	concrete.RefreshAPIRepresentationDescriptors(d3d12.id);
+	concrete.RefreshAPIRepresentationDescriptors(vulkan.id);
+}
+
+size_t DescriptionKey(const rhi::ResourceDesc& desc) {
+	size_t key = 0;
+	boost::hash_combine(key, static_cast<uint32_t>(desc.type));
+	boost::hash_combine(key, desc.buffer.sizeBytes);
+	boost::hash_combine(key, static_cast<uint32_t>(desc.texture.format));
+	boost::hash_combine(key, desc.texture.width);
+	boost::hash_combine(key, desc.texture.height);
+	boost::hash_combine(key, desc.texture.depthOrLayers);
+	boost::hash_combine(key, desc.texture.mipLevels);
+	boost::hash_combine(key, desc.texture.sampleCount);
+	boost::hash_combine(key, static_cast<uint32_t>(desc.resourceFlags));
+	return key;
+}
+}
 
 void RenderGraph::EnsurePersistentRepresentations(Resource& resource) {
 	auto* concrete = UnwrapDynamic(&resource);
@@ -89,21 +124,72 @@ void RenderGraph::EnsurePersistentRepresentations(Resource& resource) {
 		}
 		if (rhi::Failed(result)) throw std::runtime_error("Failed to initialize the D3D12 representation of '" + concrete->GetName() + "'");
 	}
-	// Textures start undefined on both APIs; buffers in the bridge-compatible COMMON state.
 	const bool texture = desc.type == rhi::ResourceType::Texture2D;
-	const ResourceState initial = texture
-		? ResourceState{rhi::ResourceAccessType::None, rhi::ResourceLayout::Undefined, rhi::ResourceSyncState::None}
-		: ResourceState{rhi::ResourceAccessType::Common, rhi::ResourceLayout::Common, rhi::ResourceSyncState::All};
-	std::vector<Resource::PendingAPIRepresentation> representations;
-	representations.push_back({d3d12->id, std::move(pair.canonical), initial});
-	representations.push_back({vulkan->id, std::move(pair.imported), initial});
-	if (auto* indexed = dynamic_cast<GloballyIndexedResource*>(concrete)) indexed->RotateDescriptorSlotsForPublication();
-	if (!concrete->PublishAPIRepresentations(std::move(representations)))
-		throw std::runtime_error("Failed to publish the shared representations of '" + concrete->GetName() + "'");
-	concrete->RefreshAPIRepresentationDescriptors(d3d12->id);
-	concrete->RefreshAPIRepresentationDescriptors(vulkan->id);
+	PublishRepresentationPair(*concrete, *d3d12, *vulkan, std::move(pair), texture, Resource::APIRepresentationPlacement{});
 	basic_telemetry::AddCounter("ORG.Persistent.MultiDeviceRepresentations");
 	spdlog::info("Persistent multi-device representations: '{}' ({})", concrete->GetName(), texture ? "texture" : "buffer");
+}
+
+void RenderGraph::PlaceSharedRepresentations(Resource& concrete, const std::shared_ptr<const AliasHeapGeneration>& heap,
+	uint64_t poolID, uint64_t offset, uint64_t size) {
+	const auto* shared = heap ? heap->Shared() : nullptr;
+	if (!shared) throw std::logic_error("Shared placement of '" + concrete.GetName() + "' without a shared alias heap");
+	const DeviceRegistryEntry* d3d12 = m_backendDevices.Find(static_cast<DeviceInstanceId>(shared->d3d12Device));
+	const DeviceRegistryEntry* vulkan = m_backendDevices.Find(static_cast<DeviceInstanceId>(shared->vulkanDevice));
+	if (!d3d12 || !vulkan) throw std::runtime_error("Shared placement of '" + concrete.GetName() + "': a device of its pool is gone");
+	rhi::ResourceDesc desc{};
+	if (!concrete.TryGetRHIResourceDesc(desc)) throw std::runtime_error("Shared placement of '" + concrete.GetName() + "' has no description");
+	InteropResourcePair pair;
+	auto d3d12Device = d3d12->device;
+	auto vulkanDevice = vulkan->device;
+	if (rhi::Failed(d3d12Device.CreatePlacedResource(shared->d3d12->GetHandle(), offset, desc, pair.canonical))
+		|| rhi::Failed(vulkanDevice.CreatePlacedResource(shared->vulkan->GetHandle(), offset, desc, pair.imported)))
+		throw std::runtime_error("Failed to place '" + concrete.GetName() + "' in a shared alias pool");
+	PublishRepresentationPair(concrete, *d3d12, *vulkan, std::move(pair), desc.type == rhi::ResourceType::Texture2D,
+		{heap, poolID, offset, size});
+	basic_telemetry::AddCounter("ORG.Persistent.SharedAliasPlacements");
+	spdlog::info("Persistent shared alias placement: '{}' pool={:#x} offset={} size={}", concrete.GetName(), poolID, offset, size);
+}
+
+bool RenderGraph::IsSharedAliasEligible(Resource* concrete) const {
+	if (!concrete || !m_compilerState->persistent) return false;
+	const DeviceRegistryEntry* vulkan = nullptr;
+	bool hasD3D12 = false;
+	for (const auto& entry : m_backendDevices) {
+		hasD3D12 = hasD3D12 || entry.backend == rhi::Backend::D3D12;
+		if (entry.backend == rhi::Backend::Vulkan && !vulkan) vulkan = &entry;
+	}
+	if (!hasD3D12 || !vulkan) return false;
+	rhi::ResourceDesc desc{};
+	if (!concrete->TryGetRHIResourceDesc(desc) || desc.heapType != rhi::HeapType::DeviceLocal) return false;
+	auto& cache = m_compilerState->persistent->sharedAliasEligibility;
+	const auto key = DescriptionKey(desc);
+	if (const auto found = cache.find(concrete); found != cache.end() && found->second.first == key) return found->second.second;
+	bool eligible = false;
+	if (desc.type == rhi::ResourceType::Buffer) eligible = true;
+	else if (desc.type == rhi::ResourceType::Texture2D && desc.texture.sampleCount <= 1
+		// D3D12 requires a placed render target or depth texture to be initialized by D3D12 after each occupant switch, which a
+		// first use on the Vulkan device does not do: those stay committed.
+		&& (desc.resourceFlags & (rhi::ResourceFlags::RF_AllowRenderTarget | rhi::ResourceFlags::RF_AllowDepthStencil)) == 0)
+		eligible = rhi::vulkan::query_d3d12_heap_texture_support(vulkan->device, desc).supported;
+	cache[concrete] = {key, eligible};
+	return eligible;
+}
+
+rhi::ResourceAllocationInfo RenderGraph::SharedAliasAllocationInfo(Resource* concrete) const {
+	rhi::ResourceAllocationInfo result{};
+	result.alignment = 64ull * 1024ull; // the placement granularity of a D3D12 heap
+	rhi::ResourceDesc desc{};
+	if (!concrete || !concrete->TryGetRHIResourceDesc(desc)) return result;
+	for (const auto& entry : m_backendDevices) {
+		if (entry.backend != rhi::Backend::D3D12 && entry.backend != rhi::Backend::Vulkan) continue;
+		rhi::ResourceAllocationInfo info{};
+		entry.device.GetResourceAllocationInfo(&desc, 1, &info);
+		result.sizeInBytes = (std::max)(result.sizeInBytes, info.sizeInBytes);
+		result.alignment = (std::max)(result.alignment, info.alignment);
+	}
+	result.sizeInBytes = (result.sizeInBytes + result.alignment - 1) / result.alignment * result.alignment;
+	return result;
 }
 
 void RenderGraph::MaterializePersistentStandalone(std::span<Resource* const> resources, bool skipAliasCandidates) {
@@ -122,7 +208,9 @@ void RenderGraph::MaterializePersistentStandalone(std::span<Resource* const> res
 
 bool RenderGraph::IsPersistentAliasCandidate(Resource* concrete) const {
 	if (!concrete) return false;
-	if (m_compilerState->persistent && m_compilerState->persistent->multiDeviceResources.contains(concrete)) return false;
+	// A resource a pass on another device uses is placed only in a shared pool, and only when it qualifies for one.
+	if (m_compilerState->persistent && m_compilerState->persistent->multiDeviceResources.contains(concrete)
+		&& !IsSharedAliasEligible(concrete)) return false;
 	const auto mode = m_getAutoAliasMode ? m_getAutoAliasMode() : AutoAliasMode::Off;
 	if (auto* texture = dynamic_cast<PixelBuffer*>(concrete)) {
 		const auto& desc = texture->GetDescription();
@@ -586,6 +674,8 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		std::vector<uint32_t> users;   // Compiled pass indices.
 		uint64_t poolID = 0, offset = 0;
 		bool pooled = false;
+		// Used by passes on more than one device: placed in a shared pool (PlaceSharedRepresentations).
+		bool shared = false;
 		const char* exclusion = nullptr;
 	};
 	std::vector<Candidate> candidates;
@@ -621,8 +711,11 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 			c.manualPool = buffer->GetAliasingPoolHint();
 			desc = alias::AliasBufferResourceDesc(buffer->GetBufferSize(), buffer->IsUnorderedAccessEnabled(), buffer->GetAccessType());
 		}
+		c.shared = state.multiDeviceResources.contains(concrete);
+		if (c.shared) c.resourceClass = c.texture ? 3u : 1u; // Render targets and depth do not qualify (IsSharedAliasEligible).
 		rhi::ResourceAllocationInfo info{};
-		device.GetResourceAllocationInfo(&desc, 1, &info);
+		if (c.shared) info = SharedAliasAllocationInfo(concrete);
+		else device.GetResourceAllocationInfo(&desc, 1, &info);
 		c.sizeBytes = info.sizeInBytes;
 		c.alignment = (std::max<uint64_t>)(1, info.alignment);
 		auto* backed = dynamic_cast<BackedResource*>(concrete);
@@ -695,7 +788,11 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 			if (score < threshold) c.exclusion = "score below threshold";
 			else { c.poolID = kAutoPoolGlobal; c.pooled = true; }
 		}
-		if (c.pooled) {
+		if (c.pooled && c.shared) {
+			// One pool per class for every resource the devices share, whichever device uses it.
+			boost::hash_combine(c.poolID, 0x5A4EDu);
+			boost::hash_combine(c.poolID, c.resourceClass);
+		} else if (c.pooled) {
 			boost::hash_combine(c.poolID, c.backendMask);
 			boost::hash_combine(c.poolID, c.resourceClass);
 			if (std::popcount(c.backendMask) > 1) { c.pooled = false; c.exclusion = "multi-backend placement unsupported"; }
@@ -738,12 +835,14 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		// Pool heap: grows with headroom, and shrinks to that headroom when the graphs placed in it need less than half of it. A
 		// replaced generation stays alive through the leases held by in-flight publications and by the placements made in it.
 		auto& pool = aliasPools[poolID];
+		const bool sharedPool = candidates[members.front()].shared;
+		pool.shared = sharedPool;
 		plannedPools.insert(poolID);
 		pool.idleSinceFrame = 0;
 		pool.required[&state] = heapEnd;
 		const auto needed = PersistentAliasArena::Required(pool);
 		const auto withHeadroom = static_cast<uint64_t>(std::ceil(static_cast<double>(needed) * headroom));
-		const bool initial = !static_cast<bool>(pool.allocation);
+		const bool initial = sharedPool ? !pool.heap : !static_cast<bool>(pool.allocation);
 		const bool grow = !initial && (heapEnd > pool.capacityBytes || poolAlignment > pool.alignment);
 		const bool shrink = !initial && !grow && pool.capacityBytes > 2 * withHeadroom;
 		const bool forced = !initial && !grow && !shrink && state.forceNewAliasHeaps;
@@ -753,6 +852,40 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 			else if (shrink) capacity = withHeadroom;
 			else if (!initial && pool.capacityBytes)
 				capacity = (std::max)(capacity, static_cast<uint64_t>(std::ceil(static_cast<double>(pool.capacityBytes) * headroom)));
+			if (sharedPool) {
+				// A D3D12 heap created shared and imported on the Vulkan device. The earlier generation's memory stays alive
+				// through its heap generation, which every placement in it and every binding of one holds.
+				const DeviceRegistryEntry* d3d12 = nullptr;
+				const DeviceRegistryEntry* vulkan = nullptr;
+				for (const auto& entry : m_backendDevices) {
+					if (entry.backend == rhi::Backend::D3D12 && !d3d12) d3d12 = &entry;
+					if (entry.backend == rhi::Backend::Vulkan && !vulkan) vulkan = &entry;
+				}
+				if (!d3d12 || !vulkan) throw std::logic_error("A shared alias pool needs one D3D12 and one Vulkan device");
+				rhi::HeapDesc heapDesc{};
+				heapDesc.sizeBytes = (capacity + 65535ull) / 65536ull * 65536ull;
+				heapDesc.alignment = 64ull * 1024ull;
+				heapDesc.memory = rhi::HeapType::DeviceLocal;
+				heapDesc.flags = rhi::HeapFlags::Shared | (candidates[members.front()].resourceClass == 1u
+					? rhi::HeapFlags::AllowOnlyBuffers : rhi::HeapFlags::AllowOnlyNonRtDsTextures);
+				heapDesc.debugName = "RenderGraph shared alias pool";
+				auto heaps = std::make_shared<SharedAliasHeaps>();
+				heaps->d3d12Device = static_cast<uint8_t>(d3d12->id);
+				heaps->vulkanDevice = static_cast<uint8_t>(vulkan->id);
+				rhi::ExternalHandle handle{};
+				const bool created = [&] {
+					BT_ZONE_SCOPE("ORG.Persistent.RealizeSharedAliasPool");
+					return rhi::IsOk(d3d12->device.CreateHeap(heapDesc, heaps->d3d12))
+						&& rhi::IsOk(rhi::dx12::export_shared_heap(d3d12->device, heaps->d3d12.Get(), handle))
+						&& rhi::IsOk(rhi::vulkan::import_d3d12_heap(vulkan->device, handle, heapDesc, heaps->vulkan));
+				}();
+				if (!created) throw std::runtime_error("Failed to allocate shared persistent alias pool memory");
+				capacity = heapDesc.sizeBytes;
+				pool.capacityBytes = capacity;
+				pool.alignment = poolAlignment;
+				++pool.generation;
+				pool.heap = AliasHeapGeneration::CaptureShared(std::move(heaps), pool.generation);
+			} else {
 			rhi::ma::AllocationDesc allocDesc{};
 			allocDesc.heapType = rhi::HeapType::DeviceLocal;
 			allocDesc.flags = rhi::ma::AllocationFlagCanAlias;
@@ -777,11 +910,13 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 			pool.alignment = poolAlignment;
 			++pool.generation;
 			pool.heap = AliasHeapGeneration::Capture(pool.allocation, pool.generation);
+			}
 			// The other graphs placed in it keep the earlier generation until they place again.
 			for (const auto& [owner, bytes] : pool.required)
 				if (owner != &state) state.aliasArena->stale.insert(owner);
-			spdlog::info("Persistent alias pool {}: pool={:#x} capacity={} required={} alignment={} placements={} generation={}",
-				initial ? "allocated" : forced ? "reallocated (forced)" : shrink ? "shrank" : "grew", poolID, capacity, heapEnd, poolAlignment, members.size(), pool.generation);
+			spdlog::info("Persistent alias pool {}: pool={:#x}{} capacity={} required={} alignment={} placements={} generation={}",
+				initial ? "allocated" : forced ? "reallocated (forced)" : shrink ? "shrank" : "grew", poolID, sharedPool ? " (shared between devices)" : "",
+				capacity, heapEnd, poolAlignment, members.size(), pool.generation);
 			basic_telemetry::AddCounter("ORG.Persistent.AliasPoolAllocations");
 		}
 		pool.resourceClass = candidates[members.front()].resourceClass;
@@ -844,6 +979,17 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 			const auto& pool = aliasPools.at(c.poolID);
 			const State::AliasPlacementRecord record{c.poolID, c.offset, c.sizeBytes, pool.heap.get()};
 			const auto previous = state.aliasPlaced.find(c.concrete);
+			if (c.shared) {
+				// Placed on both devices. A new placement replaces the representations, so nothing is dematerialized first.
+				const auto set = c.concrete->AcquireAPIRepresentationSet();
+				if (previous != state.aliasPlaced.end() && previous->second == record && set && set->placement.heap == pool.heap
+					&& set->placement.offset == c.offset) continue;
+				PlaceSharedRepresentations(*c.concrete, pool.heap, c.poolID, c.offset, c.sizeBytes);
+				TrackTransientFrameResource(c.concrete);
+				state.aliasPlaced[c.concrete] = record;
+				rebind(c.concrete);
+				continue;
+			}
 			if (previous != state.aliasPlaced.end() && previous->second == record && backed->IsMaterialized()) continue;
 			if (backed->IsMaterialized()) { dematerialize(c.concrete); ++rematerialized; }
 			if (c.texture) {

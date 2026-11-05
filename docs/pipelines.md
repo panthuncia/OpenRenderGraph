@@ -89,6 +89,28 @@ ledgers, an `ExternalClient`'s, or the frame-wait timeline. For those, the graph
 
 `Runtime::RegisterDevice` must be given the device's API for this, which `RenderGraph::RegisterBackendDevice` does.
 
+## Resources shared between devices
+
+A resource that a pass on another device uses is shared: it gets a resource on each device over one allocation, and its
+descriptors on each device name that device's resource. The primary device's resource replaces the resource's own backing.
+D3D12 allocates the memory, and Vulkan imports it.
+
+- **Alias candidates** are placed in a shared alias pool, one per resource class. A pool is a D3D12 heap created shared and
+  imported on the Vulkan device (`SharedAliasHeaps`).
+  - A placement is a resource placed at the same offset on both devices (`RenderGraph::PlaceSharedRepresentations`).
+  - Its size and alignment are the larger of the two devices' requirements.
+  - Bindings record it as aliased: it enters every execution undefined, and the alias ledger orders its range against other
+    occupants on either device.
+  - Placement orderings between users on different devices become cross-device waits.
+- **Committed instead:** resources that do not qualify (`RenderGraph::IsSharedAliasEligible`) get one shared committed
+  allocation each (`EnsurePersistentRepresentations`):
+  - render-target and depth textures, which D3D12 requires to be initialized by D3D12 after each occupant switch;
+  - formats the Vulkan device cannot place in an imported heap (`rhi::vulkan::query_d3d12_heap_texture_support`);
+  - resources that are not alias candidates.
+
+`BasicRHIWin32SharedHeapAliasSmoke` checks that a driver gives both devices the same bytes for placed textures, every mip
+included, through an occupant switch.
+
 ## Reloading
 
 `PipelineLibrary::Rebuild(entry, options)` builds the pipeline again on every device it was built for:

@@ -54,6 +54,7 @@ class RenderPassBuilder;
 class ExternalEpochExecution;
 class ExternalClient;
 class PersistentAliasArena;
+class AliasHeapGeneration;
 struct IPassBuilder;
 struct IDynamicDeclaredResources;
 
@@ -713,6 +714,15 @@ private:
 	// every device (the primary's included). Its descriptors on each device name that device's representation. Kept while
 	// the backing lives; the resource's next materialization clears them and the next binding makes new ones.
 	void EnsurePersistentRepresentations(Resource& resource);
+	// A multi-device resource placed in a shared alias pool (SharedAliasHeaps): its representations are resources placed at
+	// `offset` of the pool's D3D12 heap and of its Vulkan import, published with the placement so bindings treat them as aliased.
+	void PlaceSharedRepresentations(Resource& concrete, const std::shared_ptr<const AliasHeapGeneration>& heap, uint64_t poolID,
+		uint64_t offset, uint64_t size);
+	// Whether a multi-device resource can be placed in a shared alias pool: a buffer, or a 2D texture without render target or
+	// depth use whose format the Vulkan device can place in an imported D3D12 heap.
+	bool IsSharedAliasEligible(Resource* concrete) const;
+	// A shared candidate's allocation size and alignment: the larger of the two devices'.
+	rhi::ResourceAllocationInfo SharedAliasAllocationInfo(Resource* concrete) const;
 	bool IsPersistentAliasCandidate(Resource* concrete) const;
 	// Returns true when the edit changed (placement edges or bindings) and needs
 	// another build before installation.

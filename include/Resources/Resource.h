@@ -21,6 +21,7 @@ namespace org {
 
 class SymbolicTracker;
 class BindingTableVersion;
+class AliasHeapGeneration;
 
 class Resource : public std::enable_shared_from_this<Resource> {
 public:
@@ -204,6 +205,8 @@ public:
     virtual void SetName(const std::string& newName) { this->name = newName; OnSetName(); }
 	virtual rhi::Resource GetAPIResource() = 0;
 	struct APIRepresentation {
+		// The memory a placed representation lives in. Declared first, so it outlives `resource`.
+		std::shared_ptr<const void> memoryOwner;
 		rhi::ResourcePtr resource;
 		SymbolicTracker tracker;
 		uint64_t backingGeneration = 0;
@@ -213,6 +216,12 @@ public:
 		BackendInstanceId device;
 		rhi::ResourcePtr resource;
 		ResourceState initialState{ rhi::ResourceAccessType::None, rhi::ResourceLayout::Undefined, rhi::ResourceSyncState::None };
+		std::shared_ptr<const void> memoryOwner;
+	};
+	// Representations placed in an alias pool shared between devices: the pool's heap generation and the range they occupy.
+	struct APIRepresentationPlacement {
+		std::shared_ptr<const AliasHeapGeneration> heap;
+		uint64_t poolID = 0, offset = 0, size = 0;
 	};
 	APIRepresentationPtr AcquireAPIRepresentation(BackendInstanceId backendInstance) const {
 		std::scoped_lock lock(m_representationMutex);
@@ -221,7 +230,10 @@ public:
 	}
 	// Every device's representation as one published set, indexed by device. The same object until the next publication or
 	// clear, so it identifies the allocation: bindings of one resource captured at different times share it.
-	using APIRepresentationSet = std::vector<APIRepresentationPtr>;
+	struct APIRepresentationSet {
+		std::vector<APIRepresentationPtr> devices; // By backend instance.
+		APIRepresentationPlacement placement;      // Empty unless placed in a shared alias pool.
+	};
 	std::shared_ptr<const APIRepresentationSet> AcquireAPIRepresentationSet() const {
 		std::scoped_lock lock(m_representationMutex);
 		return m_representationSet;
@@ -254,6 +266,9 @@ public:
 	// Publishes a complete set of device-local backings as one generation. No
 	// execution thread can observe only half of a cross-device resource pair.
 	bool PublishAPIRepresentations(std::vector<PendingAPIRepresentation> pending) {
+		return PublishAPIRepresentations(std::move(pending), APIRepresentationPlacement{});
+	}
+	bool PublishAPIRepresentations(std::vector<PendingAPIRepresentation> pending, APIRepresentationPlacement placement) {
 		if (pending.empty()) return true;
 		std::unordered_map<uint8_t, APIRepresentationPtr> replacements;
 		replacements.reserve(pending.size());
@@ -261,6 +276,7 @@ public:
 		for (auto& item : pending) {
 			if (!item.resource) return false;
 			auto representation = std::make_shared<APIRepresentation>();
+			representation->memoryOwner = std::move(item.memoryOwner);
 			representation->resource = std::move(item.resource);
 			representation->tracker = SymbolicTracker(RangeSpec{}, item.initialState);
 			representation->backingGeneration = generation;
@@ -272,9 +288,10 @@ public:
 		auto set = std::make_shared<APIRepresentationSet>();
 		for (const auto& [device, representation] : m_representations) {
 			if (!representation || !representation->resource) continue;
-			if (set->size() <= device) set->resize(device + 1u);
-			(*set)[device] = representation;
+			if (set->devices.size() <= device) set->devices.resize(device + 1u);
+			set->devices[device] = representation;
 		}
+		set->placement = std::move(placement);
 		m_representationSet = std::move(set);
 		m_publishedRepresentationGeneration = generation;
 		return true;

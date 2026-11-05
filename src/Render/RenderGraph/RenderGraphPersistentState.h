@@ -396,6 +396,8 @@ struct RenderGraph::PersistentInstanceState {
 	// Concrete resources a pass on another device uses. Their representations are committed allocations shared between the
 	// devices, so they are never alias candidates: a placement would be replaced by those, and rematerializing one drops them.
 	std::unordered_set<Resource*> multiDeviceResources;
+	// Shared alias eligibility (RenderGraph::IsSharedAliasEligible) by resource, with the description it was decided for.
+	std::unordered_map<Resource*, std::pair<size_t, bool>> sharedAliasEligibility;
 	std::vector<std::pair<uint32_t, uint32_t>> aliasEdges;          // Installed placement orderings (logical pass slots).
 	uint64_t aliasPlans = 0, aliasRematerializations = 0;
 	bool forceNewAliasHeaps = false; // Diagnostic (ORG_PERSISTENT_FORCE_REALIAS): next plan re-places every pool.

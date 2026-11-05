@@ -29,6 +29,9 @@ public:
 		std::shared_ptr<const AliasHeapGeneration> heap;
 		uint64_t capacityBytes = 0, alignment = 1, generation = 0;
 		uint8_t resourceClass = 0;
+		// Memory shared between a D3D12 and a Vulkan device (SharedAliasHeaps), for resources passes on both use. Its heap
+		// generations hold that memory; `allocation` stays empty.
+		bool shared = false;
 		// Each graph's latest requirement (its plan's heap end), by the graph's state.
 		std::unordered_map<const void*, uint64_t> required;
 		uint64_t idleSinceFrame = 0;  // The frame the last graph placed into it stopped placing; 0 while placed into.
