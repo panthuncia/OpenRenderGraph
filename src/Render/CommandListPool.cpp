@@ -168,8 +168,10 @@ std::vector<CommandListPair> CommandListPool::AcquireBatch(size_t count, uint64_
 
     bool waited = false;
     auto waitBegin = std::chrono::steady_clock::now();
+    // Held from the check that enough pairs are available until they are taken. Another thread could take them otherwise.
+    std::unique_lock lock(m_mutex, std::defer_lock);
     for (;;) {
-        std::unique_lock lock(m_mutex);
+        if (!lock.owns_lock()) lock.lock();
         if (m_backgroundFailure) std::rethrow_exception(m_backgroundFailure);
         if (m_available.size() >= count) break;
         if (m_stopBackgroundReset)
@@ -221,8 +223,6 @@ std::vector<CommandListPair> CommandListPool::AcquireBatch(size_t count, uint64_
         UpdateDiagnosticsCountsLocked();
     }
 
-    std::unique_lock lock(m_mutex, std::defer_lock);
-    lock.lock();
     if (waited) {
         const auto duration = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - waitBegin).count());
