@@ -690,16 +690,19 @@ void RenderGraph::Setup() {
 		const QueueSlot primary[] = {{ QueueKind::Graphics, 0, BackendInstanceId::Primary, primaryBackend },
 			{ QueueKind::Compute, 0, BackendInstanceId::Primary, primaryBackend }, { QueueKind::Copy, 0, BackendInstanceId::Primary, primaryBackend }};
 		rhi::Queue primaryQueues[] = {gfxQ, compQ, copyQ};
-		for (size_t i = 0; i < 3; ++i) {
-			if (m_sharedQueueTimelines.empty()) m_queueRegistry.Register(primary[i], primaryQueues[i], device);
-			else m_queueRegistry.Register(primary[i], primaryQueues[i], m_sharedQueueTimelines[i], device);
-		}
-		for (size_t i = 1; i < m_backendDevices.size(); ++i) {
-			const auto& peer = m_backendDevices[i];
-			auto peerDevice = peer.device;
-			m_queueRegistry.Register({ QueueKind::Graphics, 0, peer.id, peer.backend }, peerDevice.GetQueue(rhi::QueueKind::Graphics), peerDevice);
-			m_queueRegistry.Register({ QueueKind::Compute, 0, peer.id, peer.backend }, peerDevice.GetQueue(rhi::QueueKind::Compute), peerDevice);
-			m_queueRegistry.Register({ QueueKind::Copy, 0, peer.id, peer.backend }, peerDevice.GetQueue(rhi::QueueKind::Copy), peerDevice);
+		// Slots survive structural rebuilds, and Setup runs again on each: register them once.
+		if (m_queueRegistry.SlotCount() == 0) {
+			for (size_t i = 0; i < 3; ++i) {
+				if (m_sharedQueueTimelines.empty()) m_queueRegistry.Register(primary[i], primaryQueues[i], device);
+				else m_queueRegistry.Register(primary[i], primaryQueues[i], m_sharedQueueTimelines[i], device);
+			}
+			for (size_t i = 1; i < m_backendDevices.size(); ++i) {
+				const auto& peer = m_backendDevices[i];
+				auto peerDevice = peer.device;
+				m_queueRegistry.Register({ QueueKind::Graphics, 0, peer.id, peer.backend }, peerDevice.GetQueue(rhi::QueueKind::Graphics), peerDevice);
+				m_queueRegistry.Register({ QueueKind::Compute, 0, peer.id, peer.backend }, peerDevice.GetQueue(rhi::QueueKind::Compute), peerDevice);
+				m_queueRegistry.Register({ QueueKind::Copy, 0, peer.id, peer.backend }, peerDevice.GetQueue(rhi::QueueKind::Copy), peerDevice);
+			}
 		}
 	}
 	EnsureMinimumAutomaticSchedulingQueues();
@@ -1384,6 +1387,7 @@ QueueSlotIndex RenderGraph::CreateQueue(QueueKind kind, const char* name, QueueA
 		for (size_t i = m_queueRegistry.SlotCount(); i-- > 0;) {
 			const auto slot = static_cast<QueueSlotIndex>(static_cast<uint8_t>(i));
 			if (m_queueRegistry.GetKind(slot) != kind) continue;
+			if (m_queueRegistry.GetBackendInstance(slot) != BackendInstanceId::Primary) continue; // This queue is the primary device's.
 			spdlog::warn("Queue '{}' (kind {}): the device has no further queue of this kind; sharing queue slot {}",
 				logicalName, static_cast<int>(kind), i);
 			return slot;

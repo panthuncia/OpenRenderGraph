@@ -80,6 +80,9 @@ rhi::Result QueueRegistry::EnableD3D12VulkanInterop(rhi::Device d3d12Device, rhi
 	for (size_t i = 0; i < m_slots.size(); ++i) {
 		auto& slot = m_slots[i];
 		if (slot.backend != rhi::Backend::D3D12 && slot.backend != rhi::Backend::Vulkan) continue;
+		// Setup runs again on every structural rebuild, and timelines survive those: replacing one would destroy it while the
+		// runtime's ledgers still wait on it, and restart its values. Only slots added since the last Setup need converting.
+		if (slot.peerFence) continue;
 		rhi::TimelinePtr d3dFence;
 		auto result = d3d12Device.CreateTimeline(d3dFence, 0, "ORG Multi-RHI Bridge Fence", true);
 		if (rhi::Failed(result)) return result;

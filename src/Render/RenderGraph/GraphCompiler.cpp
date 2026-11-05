@@ -216,7 +216,9 @@ std::shared_ptr<const GraphExecutionTimeline> ExecutionTimelineAdmission::Submit
         const auto receipt = packets[i]->Submit(batch);
         if (!receipt) {
             Fail(execution->submission, receipt);
-            throw std::runtime_error("Prepared GPU submission failed; recovery required");
+            throw std::runtime_error("Prepared GPU submission failed; recovery required: batch " + std::to_string(i) + " queue slot " +
+                std::to_string(packets[i]->QueueSlot()) + " state " + std::to_string(static_cast<uint32_t>(receipt.state)) + " stage " +
+                std::to_string(static_cast<uint32_t>(receipt.failureStage)) + " backend result " + std::to_string(receipt.backendResult));
         }
         CommitBatch(execution->submission, i);
     }

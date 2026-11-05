@@ -270,8 +270,10 @@ ExternalClient::Signal ExternalClient::Submit(uint32_t slotIndex, std::span<cons
 		submit.signals = {signalPoints.data(), static_cast<uint32_t>(signalPoints.size())};
 		{
 		BT_ZONE_SCOPE("ORG.ExternalClient.QueueSubmit");
-		if (slot.queue.queue.Submit({lists.data(), static_cast<uint32_t>(lists.size())}, submit) != rhi::Result::Ok)
-			throw std::runtime_error("ExternalClient submission failed");
+		if (const auto submitted = slot.queue.queue.Submit({lists.data(), static_cast<uint32_t>(lists.size())}, submit); submitted != rhi::Result::Ok) {
+			--slot.next; // Nothing will signal this value, and shutdown waits for the last one taken.
+			throw std::runtime_error(std::string("ExternalClient submission failed: ") + rhi::ResultName(submitted));
+		}
 		}
 		compiler::GraphExecutionTimeline receipt;
 		receipt.batches.resize(1);

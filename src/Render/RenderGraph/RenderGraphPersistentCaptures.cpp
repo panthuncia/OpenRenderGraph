@@ -189,6 +189,8 @@ PreparedPass AppendPersistentCaptures(RenderGraph& graph, State& state, const St
 		auto& capture = pending.info;
 		auto resource = ResolveCaptureResource(graph, capture);
 		if (!resource || !service || !compiled || !preparation.resourceSlots || !preparation.bindings) {
+			spdlog::info("Readback capture after '{}' of resource {} needs an inserted pass: resource={} compiled={}", name, capture.resourceId,
+				resource != nullptr, compiled != nullptr);
 			state.capturesToInsert.push_back(std::move(capture));
 			continue;
 		}
@@ -202,13 +204,18 @@ PreparedPass AppendPersistentCaptures(RenderGraph& graph, State& state, const St
 			for (const auto& use : compiled->entryStates) if (use.resource == resourceIndex) uses.push_back(&use);
 		const auto range = ResolveRangeSpec(capture.range, resource->GetMipLevels(), resource->GetArraySize());
 		if (uses.empty() || (resource->HasLayout() && !Covers(uses, range))) {
+			spdlog::info("Readback capture after '{}' of '{}' needs an inserted pass: {} uses of {} in this pass, resource index {}", name, resource->GetName(), uses.size(),
+				compiled->exitStates.size() + compiled->entryStates.size(), resourceIndex);
 			state.capturesToInsert.push_back(std::move(capture));
 			continue;
 		}
 		const auto bound = preparation.bindings->Resolve(PreparedResourceReference{slot->second});
 		auto plan = runtime::PlanReadbackCapture(preparation.device, service, *resource, bound, capture.range,
 			std::move(capture.callback), QueueKind::Graphics, "ReadbackCapture::" + name);
-		if (!plan) continue;
+		if (!plan) {
+			spdlog::warn("Readback capture after '{}' of '{}' dropped: nothing to copy (handle valid: {})", name, resource->GetName(), bound.IsValid());
+			continue;
+		}
 		const auto handle = bound.GetHandle();
 		if (std::find(transitioned.begin(), transitioned.end(), resourceIndex) != transitioned.end()) uses.clear();
 		else transitioned.push_back(resourceIndex);
