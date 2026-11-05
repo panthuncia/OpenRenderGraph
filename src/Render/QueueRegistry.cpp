@@ -74,6 +74,32 @@ QueueSlotIndex QueueRegistry::FindNamedOwnedSlot(QueueKind kind, std::string_vie
 	return static_cast<QueueSlotIndex>(0xFF);
 }
 
+rhi::Result CreateBridgeTimelinePair(rhi::Device first, rhi::Backend firstBackend, rhi::Device second, rhi::Backend secondBackend,
+	const char* name, rhi::TimelinePtr& onFirst, rhi::TimelinePtr& onSecond) {
+#ifdef _WIN32
+	const bool firstIsD3D12 = firstBackend == rhi::Backend::D3D12 && secondBackend == rhi::Backend::Vulkan;
+	const bool firstIsVulkan = firstBackend == rhi::Backend::Vulkan && secondBackend == rhi::Backend::D3D12;
+	if (!first || !second || (!firstIsD3D12 && !firstIsVulkan)) return rhi::Result::Unsupported;
+	auto d3d12Device = firstIsD3D12 ? first : second;
+	auto vulkanDevice = firstIsD3D12 ? second : first;
+	rhi::TimelinePtr d3dFence;
+	auto result = d3d12Device.CreateTimeline(d3dFence, 0, name, true);
+	if (rhi::Failed(result)) return result;
+	rhi::ExternalHandle shared{};
+	result = rhi::dx12::export_shared_timeline(d3d12Device, d3dFence.Get(), shared);
+	if (rhi::Failed(result)) return result;
+	rhi::TimelinePtr vkFence;
+	result = rhi::vulkan::import_d3d12_timeline(vulkanDevice, shared, 0, name, vkFence);
+	if (rhi::Failed(result)) return result;
+	onFirst = firstIsD3D12 ? std::move(d3dFence) : std::move(vkFence);
+	onSecond = firstIsD3D12 ? std::move(vkFence) : std::move(d3dFence);
+	return rhi::Result::Ok;
+#else
+	(void)first; (void)firstBackend; (void)second; (void)secondBackend; (void)name; (void)onFirst; (void)onSecond;
+	return rhi::Result::Unsupported;
+#endif
+}
+
 rhi::Result QueueRegistry::EnableD3D12VulkanInterop(rhi::Device d3d12Device, rhi::Device vulkanDevice) {
 #ifdef _WIN32
 	if (!d3d12Device || !vulkanDevice) return rhi::Result::InvalidArgument;

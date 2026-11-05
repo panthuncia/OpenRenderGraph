@@ -93,7 +93,9 @@ std::vector<uint32_t> RecordingContext::DescriptorSlotIndices(const PipelineStat
 }
 
 void RecordingContext::BindPayload(std::shared_ptr<const PipelineStatePayload> payload, rhi::ShaderStage stages, BindOptions options) {
-    if (!payload || !payload->pso) throw std::invalid_argument("Pipeline has no immutable payload");
+    if (!payload || !payload->pso) throw std::invalid_argument("Pipeline has no build on the pass's device ("
+        + std::to_string(static_cast<uint8_t>(m_declaredScope ? m_declaredScope->backendInstance : BackendInstanceId::Primary))
+        + "); declare it with RenderPassBuilder::Pipeline");
     const auto indices = DescriptorSlotIndices(*payload, options);
     m_commands.BindLayout(payload->layout);
     m_commands.BindPipeline(payload->pso.Get().GetHandle());
@@ -171,6 +173,20 @@ void RecordingContext::UavBarrier() {
     rhi::BarrierBatch batch{};
     batch.globals = {&barrier, 1};
     m_commands.Barriers(batch);
+}
+
+std::shared_ptr<const rhi::CommandSignaturePtr> RecordingContext::Resolve(const CommandSignatureState& signature) {
+    const auto device = m_declaredScope ? m_declaredScope->backendInstance : BackendInstanceId::Primary;
+    auto created = signature.Get(device);
+    if (!created) throw std::invalid_argument("Command signature has no creation on device " + std::to_string(static_cast<uint8_t>(device))
+        + "; declare it with RenderPassBuilder::CommandSignature");
+    Retain(created);
+    return created;
+}
+
+void RecordingContext::ExecuteIndirect(const CommandSignatureState& signature, ResourceBindingToken arguments, uint64_t argumentOffset,
+    uint32_t maxCommandCount, std::optional<ResourceBindingToken> count, uint64_t countOffset) {
+    ExecuteIndirect(Resolve(signature), arguments, argumentOffset, maxCommandCount, count, countOffset);
 }
 
 void RecordingContext::ExecuteIndirect(const std::shared_ptr<const rhi::CommandSignaturePtr>& signature,

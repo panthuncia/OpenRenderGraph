@@ -44,6 +44,8 @@
 #include "Interfaces/IResourceResolver.h"
 #include "Render/RenderGraph/RenderGraphExtension.h"
 
+namespace org::compiler { struct ExecutionTimelinePoint; struct PreparedTimelineBinding; }
+
 namespace org {
 
 class Runtime;
@@ -592,6 +594,8 @@ public:
 	RenderPassBuilder& BuildPass(std::string const& name, StableCtorArgs&&... ctorArgs) {
 		return BuildRenderPass<PassT>(name, std::forward<StableCtorArgs>(ctorArgs)...);
 	}
+	// The builder of a pass built since the last reset, for settings applied after the fact (placement). Null if none.
+	RenderPassBuilder* FindPassBuilder(std::string const& name);
 
 	/// Create a new queue of the given kind and register it with the render graph.
 	/// Must be called after Setup() and before the first Execute().
@@ -681,6 +685,11 @@ private:
 	void PreparePersistentFrame(rhi::Device device, uint8_t frameIndex, const IHostExecutionData* hostData, float deltaTime,
 		const PersistentExecutionOptions& options);
 	void BootstrapPersistentGraph();
+	// The pass's declared pipelines for its device. Starts their builds; returns whether all are ready. Failed builds are
+	// reported in `failure`, when given, and throw otherwise.
+	bool RequestPassPipelines(const PassParameters& resources, DeviceInstanceId device, const std::string& passName, std::string* failure = nullptr);
+	// As above, and blocks until every build ended. A failed build throws.
+	void AwaitPassPipelines(const PassParameters& resources, DeviceInstanceId device, const std::string& passName);
 	// bootstrap: the first, whose passes were all just declared.
 	void BindPersistentFrame(bool ticket, bool bootstrap);
 	PersistentExecution PreparePersistentExecution(rhi::Device device, uint8_t frameIndex, const IHostExecutionData* hostData,
@@ -691,6 +700,9 @@ private:
 	// One execution of the prepared segment, in phases (RenderGraphPersistentExecute.cpp). Admit returns false when the
 	// segment needs nothing more: it was empty, admission-only, or took a kept recording.
 	struct PersistentSegmentRun;
+	// The execution's waits with those on another device's timelines relayed to the batch's device (docs/pipelines.md, "When pipelines build").
+	std::vector<std::vector<compiler::ExecutionTimelinePoint>> RelayCrossDeviceWaits(PersistentSegmentRun& run,
+		const std::vector<std::vector<compiler::ExecutionTimelinePoint>>& waits, std::vector<compiler::PreparedTimelineBinding>& extraTimelines);
 	bool AdmitPersistentSegment(PersistentSegmentRun& run);
 	void RecordPersistentSegment(PersistentSegmentRun& run);
 	void SubmitPersistentSegment(PersistentSegmentRun& run);

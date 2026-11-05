@@ -10,6 +10,7 @@
 #include <spdlog/spdlog.h>
 
 #include "Render/FeatureDomainRegistry.h"
+#include "Render/PipelineDesc.h"
 #include "Render/ResourceRegistry.h"
 #include "RenderPasses/Base/RenderPass.h"
 #include "ResourceRequirements.h"
@@ -230,6 +231,8 @@ struct BuilderGraphAccess {
     static void RegisterResolvedResourceAlias(RenderGraph* graph, ResourceIdentifier const& id, std::shared_ptr<Resource> resource);
     static void AddResource(RenderGraph* graph, std::shared_ptr<Resource> resource);
     static Resource* Resolve(RenderGraph* graph, ResourceRegistry::RegistryHandle handle);
+    static std::shared_ptr<PipelineLibraryEntry> AcquirePipeline(RenderGraph* graph, PipelineDesc desc);
+    static std::shared_ptr<CommandSignatureLibraryEntry> AcquireCommandSignature(RenderGraph* graph, CommandSignatureDesc desc);
     static void AddRenderPass(RenderGraph* graph, std::shared_ptr<RenderPass> pass, RenderPassParameters& resources, std::string name,
         std::vector<ResolverSnapshot> resolverSnapshots);
 };
@@ -1116,6 +1119,12 @@ public:
         return std::move(*this);
     }
 
+	// A pipeline of this pass, by description. The graph builds it for the device the pass lands on, before publishing the
+	// pass; bind the returned handle in Record. Declaring it again returns the same pipeline, so call this from Declare.
+	PipelineState Pipeline(PipelineDesc desc);
+	// As Pipeline, for a command signature: hand the returned handle to RecordingContext::ExecuteIndirect.
+	CommandSignatureState CommandSignature(CommandSignatureDesc desc);
+
 	RenderPassBuilder& RequireBackend(rhi::Backend backend) & { m_backendAffinity = { BackendAffinityStrength::Required, backend }; return *this; }
 	RenderPassBuilder RequireBackend(rhi::Backend backend) && { m_backendAffinity = { BackendAffinityStrength::Required, backend }; return std::move(*this); }
 	RenderPassBuilder& PreferBackend(rhi::Backend backend) & { m_backendAffinity = { BackendAffinityStrength::Preferred, backend }; return *this; }
@@ -1206,6 +1215,8 @@ private:
         resolverSnapshots_.clear();
 
         RestoreAuthorState(std::move(authorState));
+        params.declaredPipelines.clear(); // Declare names them, each time it runs.
+        params.declaredCommandSignatures.clear();
 
         {
             const ResolverCaptureScope captures;

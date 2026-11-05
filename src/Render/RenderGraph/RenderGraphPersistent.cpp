@@ -2,6 +2,7 @@
 // backings, and preparing the frame's invocations and dynamic segments. See RenderGraphPersistentState.h.
 #include "OpenRenderGraph/Trace.h"
 #include "RenderGraphPersistentState.h"
+#include "Render/PipelineLibrary.h"
 
 namespace org {
 
@@ -656,6 +657,7 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 	if (!m_taskService) throw std::logic_error("Persistent execution requires a task service");
 	auto& compiler = *m_compilerState;
 	const bool bootstrap = !compiler.persistent;
+	m_runtime->Pipelines()->PublishRebuilt();
 	if (bootstrap) BootstrapPersistentGraph();
 	auto& state = *compiler.persistent;
 	state.frameIndex = frameIndex;
@@ -664,6 +666,41 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex,
 	org::runtime::ScopedActiveGraphServices activeServices(m_uploadService.get(), m_descriptorService.get());
 	BindPersistentFrame(options.ticket != nullptr, bootstrap);
 	state.prepared = PreparePersistentExecution(device, frameIndex, hostData, deltaTime, options);
+}
+
+bool RenderGraph::RequestPassPipelines(const PassParameters& resources, DeviceInstanceId device, const std::string& passName, std::string* failure) {
+	auto& pipelines = *m_runtime->Pipelines();
+	bool ready = true;
+	for (const auto& entry : resources.declaredCommandSignatures) {
+		try {
+			pipelines.EnsureCommandSignature(entry, device);
+		} catch (const std::exception& e) {
+			const auto message = "Pass '" + passName + "' on device " + std::to_string(static_cast<uint8_t>(device)) + ": " + e.what();
+			if (!failure) throw std::runtime_error(message);
+			*failure = message;
+			return false;
+		}
+	}
+	for (const auto& entry : resources.declaredPipelines) {
+		pipelines.Request(entry, device);
+		const auto status = entry->Status(device);
+		if (status == PipelineBuildStatus::Failed) {
+			const auto message = "Pipeline '" + entry->Name() + "' of pass '" + passName + "' failed to build on device "
+				+ std::to_string(static_cast<uint8_t>(device)) + ": " + entry->Error(device);
+			if (!failure) throw std::runtime_error(message);
+			*failure = message;
+			return false;
+		}
+		ready &= status == PipelineBuildStatus::Ready;
+	}
+	return ready;
+}
+
+void RenderGraph::AwaitPassPipelines(const PassParameters& resources, DeviceInstanceId device, const std::string& passName) {
+	auto& pipelines = *m_runtime->Pipelines();
+	for (const auto& entry : resources.declaredPipelines) pipelines.Request(entry, device);
+	for (const auto& entry : resources.declaredPipelines) pipelines.Wait(entry, device);
+	RequestPassPipelines(resources, device, passName);
 }
 
 // The first preparation's: the passes are lowered and the first publication is built inline.
@@ -740,9 +777,20 @@ void RenderGraph::BootstrapPersistentGraph() {
 						RedeclarePass(value, any.type);
 					auto lowered = lowering::LowerPass(*this, _registry, m_queueRegistry, primaryBackend, value, any.type);
 					UseRebindSlots(*this, main, lowered, dynamic);
+					RequestPassPipelines(value.resources, lowered.device, main.name);
 					InstallMainPass(*this, state, edit, main, std::move(lowered), mainIndex, false);
 				}
 			}, any.pass);
+		}
+		// Every pass's pipelines build in parallel; the first publication waits for all of them.
+		{
+			BT_ZONE_SCOPE("ORG.Persistent.AwaitPipelines");
+			for (auto& main : state.mainPasses) {
+				std::visit([&](auto& value) {
+					using T = std::decay_t<decltype(value)>;
+					if constexpr (!std::is_same_v<T, std::monostate>) AwaitPassPipelines(value.resources, main.device, main.name);
+				}, m_masterPassList[main.masterIndex].pass);
+			}
 		}
 		// Explicit structural ordering: the master list is already topologically
 		// merged, so registration order is the authored order for equal phases.
@@ -897,7 +945,8 @@ void RenderGraph::BindPersistentFrame(bool ticket, bool bootstrap) {
 				if constexpr (!std::is_same_v<T, std::monostate>) {
 					auto* dynamic = dynamic_cast<IDynamicDeclaredResources*>(value.pass.get());
 					// On the bootstrap frame every pass was just declared from this frame's state.
-					const bool declared = !bootstrap && dynamic && dynamic->DeclaredResourcesChanged() && !dynamic->DeclarationsProvidedByImmediateCommands();
+					const bool declared = !bootstrap && (main.awaitingPipelines
+						|| (dynamic && dynamic->DeclaredResourcesChanged() && !dynamic->DeclarationsProvidedByImmediateCommands()));
 					// A resolver declared directly is lowered as the set it resolved to; another set means the pass is lowered
 					// again, from a fresh declaration, before it is prepared.
 					bool directStale = false;
@@ -915,6 +964,17 @@ void RenderGraph::BindPersistentFrame(bool ticket, bool bootstrap) {
 					++refreshed;
 					RedeclarePass(value, any.type);
 					auto lowered = lowering::LowerPass(*this, _registry, m_queueRegistry, primaryBackend, value, any.type);
+					// A pipeline the declaration newly names may still be building. The pass keeps preparing against the declaration it
+					// has until it is ready. A stale direct resolver cannot wait: its old declaration names resources that may be gone.
+					if (directStale) AwaitPassPipelines(value.resources, lowered.device, main.name);
+					else {
+						std::string failure;
+						const bool ready = RequestPassPipelines(value.resources, lowered.device, main.name, &failure);
+						if (!failure.empty()) spdlog::error("Pass '{}' keeps its previous declaration: {}", main.name, failure);
+						main.awaitingPipelines = !ready && failure.empty();
+						if (!ready) return;
+					}
+					main.awaitingPipelines = false;
 					// A rebindable pass's places now hold what it just declared; the backing poll below rebinds them.
 					UseRebindSlots(*this, main, lowered, dynamic);
 					// Membership-only change: the same structure under a layout with the same content. The installed executable's

@@ -23,6 +23,9 @@
 
 namespace org {
 
+class PipelineLibraryEntry;
+class CommandSignatureLibraryEntry;
+
 struct PassParameters {
 	std::vector<ResourceHandleAndRange> shaderResources;
     std::vector<ResourceHandleAndRange> renderTargets;
@@ -56,6 +59,9 @@ struct PassParameters {
 	QueueAssignmentPolicy queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
 	std::optional<QueueSlotIndex> pinnedQueueSlot; // Target a specific queue slot instead of using preferredQueueKind
 	BackendAffinity backendAffinity{};
+	// The pipelines the pass declared by description, built for its device before it is published.
+	std::vector<std::shared_ptr<PipelineLibraryEntry>> declaredPipelines;
+	std::vector<std::shared_ptr<CommandSignatureLibraryEntry>> declaredCommandSignatures;
 };
 using RenderPassParameters = PassParameters;
 

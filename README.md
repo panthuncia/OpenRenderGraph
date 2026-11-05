@@ -111,6 +111,13 @@ pass declared under the same name (`builder.ShaderResource(Builtin::X)` and frie
 wins). An undeclared slot gets `UINT32_MAX` only when it is optional, belongs to a feature domain the pass names nothing
 of, or matches `BindOptions::absentPrefixes`; otherwise binding throws. The BRSL macro scan only names the slots.
 
+#### Pipelines
+
+A pass describes its pipelines in `Declare` (`builder.Pipeline(org::ComputePipelineDesc{...})`, and
+`builder.CommandSignature` for indirect arguments), and binds the returned handle in `Record`. ORG builds each one for
+the device the pass runs on before the pass is published, so the pass runs on any device without backend code. The
+host supplies the shader compiler (`Runtime::Desc::pipelineCompiler`). [docs/pipelines.md](docs/pipelines.md)
+
 #### Declarations that change
 
 A pass whose declaration changes at run time implements `org::IDynamicDeclaredResources`. `DeclaredResourcesChanged()`

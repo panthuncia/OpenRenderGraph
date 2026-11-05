@@ -15,6 +15,7 @@
 #include <rhi.h>
 #include "RenderPasses/Base/PassReturn.h"
 #include "Render/ExternalBindings.h"
+#include "Render/PipelineDesc.h"
 #include "Render/PipelineState.h"
 #include "Render/BindlessResourceViews.h"
 #include "Render/ResourceUseDeclaration.h"
@@ -224,7 +225,7 @@ struct FramePreparationContext {
     std::shared_ptr<PreparedInvocationArena> invocationArena;
     std::function<void(std::shared_ptr<const void>)> retireOwnership;
     rhi::Device device; // Host-owned device; valid through frame retirement.
-    // The device the pass runs on: program and pipeline captures default to its representation.
+    // The device the pass runs on. Recording binds its builds of pipelines and command signatures.
     BackendInstanceId backendInstance = BackendInstanceId::Primary;
     // The ring slot this execution prepares into. Not a count: use executionIndex for that.
     uint32_t frameIndex = 0;
@@ -515,6 +516,12 @@ public:
         rhi::ResourceSyncState afterSync = rhi::ResourceSyncState::ComputeShading);
     // A full unordered-access barrier between compute dispatches.
     void UavBarrier();
+    // The signature's creation on the pass's device, retained by the recording. Throws when it has none there.
+    std::shared_ptr<const rhi::CommandSignaturePtr> Resolve(const CommandSignatureState& signature);
+    // The signature's creation on the pass's device.
+    void ExecuteIndirect(const CommandSignatureState& signature,
+        ResourceBindingToken arguments, uint64_t argumentOffset = 0, uint32_t maxCommandCount = 1,
+        std::optional<ResourceBindingToken> count = std::nullopt, uint64_t countOffset = 0);
     void ExecuteIndirect(const std::shared_ptr<const rhi::CommandSignaturePtr>& signature,
         ResourceBindingToken arguments, uint64_t argumentOffset = 0, uint32_t maxCommandCount = 1,
         std::optional<ResourceBindingToken> count = std::nullopt, uint64_t countOffset = 0);

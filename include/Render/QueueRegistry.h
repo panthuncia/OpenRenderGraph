@@ -168,4 +168,9 @@ private:
 };
 
 
+// One D3D12 fence shared with a Vulkan device: the timeline on each of the two devices (one D3D12, one Vulkan). Either signals and
+// either waits.
+rhi::Result CreateBridgeTimelinePair(rhi::Device first, rhi::Backend firstBackend, rhi::Device second, rhi::Backend secondBackend,
+	const char* name, rhi::TimelinePtr& onFirst, rhi::TimelinePtr& onSecond);
+
 } // namespace org

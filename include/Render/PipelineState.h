@@ -1,12 +1,13 @@
 #pragma once
 
 #include <rhi.h>
+#include <array>
 #include <atomic>
+#include <cstddef>
 #include <memory>
 #include <stdint.h>
 #include <stdexcept>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 #include "Resources/ResourceIdentifier.h"
@@ -14,6 +15,9 @@
 
 
 namespace org {
+
+// Devices a pipeline can have a build on: DeviceRegistry ids below this. Hosts have a primary and a peer today.
+inline constexpr size_t kMaxPipelineDevices = 4;
 
 struct PipelineResources {
 	std::vector<ResourceIdentifier> mandatoryResourceDescriptorSlots;
@@ -51,6 +55,7 @@ struct PipelineStatePayload {
 
 class PipelineStateSlot {
 public:
+	PipelineStateSlot() = default;
 	explicit PipelineStateSlot(std::shared_ptr<PipelineStatePayload> payload) :
 		m_active(payload), m_peek(payload.get()) {}
 
@@ -73,30 +78,25 @@ private:
 	std::atomic<PipelineStatePayload*> m_peek{nullptr};
 };
 
+// A handle to a pipeline's builds, one slot per device. Copies share the slots. Every slot is atomic and the set is fixed, so
+// a build can land on one device while recordings read another, without a lock.
 class PipelineState {
 public:
 	PipelineState(rhi::PipelinePtr pso,
-		uint64_t resourceIDsHash, 
+		uint64_t resourceIDsHash,
 		PipelineResources resources,
-        std::shared_ptr<const void> layoutOwner = {},
-        rhi::PipelineLayoutHandle layout = {}) :
-		m_slot(std::make_shared<PipelineStateSlot>(
-			std::make_shared<PipelineStatePayload>(
-				std::move(pso),
-				resourceIDsHash,
-				std::move(resources)))),
-		m_backendSlots(std::make_shared<BackendSlotMap>()) {
-        auto payload = m_slot->Load();
-        payload->layoutOwner = std::move(layoutOwner);
-        payload->layout = layout;
-    }
+		std::shared_ptr<const void> layoutOwner = {},
+		rhi::PipelineLayoutHandle layout = {}) :
+		m_slots(std::make_shared<Slots>()) {
+		auto payload = std::make_shared<PipelineStatePayload>(std::move(pso), resourceIDsHash, std::move(resources));
+		payload->layoutOwner = std::move(layoutOwner);
+		payload->layout = layout;
+		(*m_slots)[0].Exchange(std::move(payload));
+	}
 	PipelineState() :
-		m_slot(std::make_shared<PipelineStateSlot>(
-			std::make_shared<PipelineStatePayload>(
-				rhi::PipelinePtr{},
-				0,
-				PipelineResources{}))),
-		m_backendSlots(std::make_shared<BackendSlotMap>()) {}
+		m_slots(std::make_shared<Slots>()) {
+		(*m_slots)[0].Exchange(std::make_shared<PipelineStatePayload>(rhi::PipelinePtr{}, 0, PipelineResources{}));
+	}
 
 	const rhi::Pipeline& GetAPIPipelineState() const {
 		return RequirePayload()->pso.Get();
@@ -108,17 +108,15 @@ public:
 		const auto payload = GetPayload(backendInstance);
 		return payload && payload->pso;
 	}
-    void AttachBackendPipeline(BackendInstanceId backendInstance, rhi::PipelinePtr pipeline,
-        uint64_t resourceIDsHash, PipelineResources resources,
-        std::shared_ptr<const void> layoutOwner = {}, rhi::PipelineLayoutHandle layout = {}) const {
-        auto payload = std::make_shared<PipelineStatePayload>(
-            std::move(pipeline), resourceIDsHash, std::move(resources));
-        payload->layoutOwner = std::move(layoutOwner);
-        payload->layout = layout;
-        const auto key = static_cast<uint8_t>(backendInstance);
-        if (backendInstance == BackendInstanceId::Primary) m_slot->Exchange(std::move(payload));
-        else (*m_backendSlots)[key] = std::make_shared<PipelineStateSlot>(std::move(payload));
-    }
+	void AttachBackendPipeline(BackendInstanceId backendInstance, rhi::PipelinePtr pipeline,
+		uint64_t resourceIDsHash, PipelineResources resources,
+		std::shared_ptr<const void> layoutOwner = {}, rhi::PipelineLayoutHandle layout = {}) const {
+		auto payload = std::make_shared<PipelineStatePayload>(
+			std::move(pipeline), resourceIDsHash, std::move(resources));
+		payload->layoutOwner = std::move(layoutOwner);
+		payload->layout = layout;
+		ReplacePayload(backendInstance, std::move(payload));
+	}
 	uint64_t GetResourceIDsHash() const {
 		return RequirePayload()->resourceIDsHash;
 	}
@@ -147,20 +145,24 @@ public:
 	}
 
 	std::shared_ptr<PipelineStatePayload> GetPayload() const {
-		return m_slot ? m_slot->Load() : nullptr;
+		return m_slots ? (*m_slots)[0].Load() : nullptr;
 	}
-	PipelineStatePayload* PeekPayload() const noexcept { return m_slot ? m_slot->Peek() : nullptr; }
+	PipelineStatePayload* PeekPayload() const noexcept { return m_slots ? (*m_slots)[0].Peek() : nullptr; }
 	std::shared_ptr<PipelineStatePayload> GetPayload(BackendInstanceId backendInstance) const {
-		const auto key = static_cast<uint8_t>(backendInstance);
-		if (key == static_cast<uint8_t>(BackendInstanceId::Primary)) return GetPayload();
-		const auto it = m_backendSlots->find(key);
-		return it == m_backendSlots->end() || !it->second ? nullptr : it->second->Load();
+		const size_t index = static_cast<uint8_t>(backendInstance);
+		return m_slots && index < kMaxPipelineDevices ? (*m_slots)[index].Load() : nullptr;
 	}
+	// The primary device's slot. Its address identifies the pipeline: copies of a handle share it.
 	std::shared_ptr<PipelineStateSlot> GetSlot() const {
-		return m_slot;
+		return m_slots ? std::shared_ptr<PipelineStateSlot>(m_slots, &(*m_slots)[0]) : nullptr;
 	}
 	std::shared_ptr<PipelineStatePayload> ReplacePayload(std::shared_ptr<PipelineStatePayload> payload) const {
-		return m_slot ? m_slot->Exchange(std::move(payload)) : nullptr;
+		return m_slots ? (*m_slots)[0].Exchange(std::move(payload)) : nullptr;
+	}
+	std::shared_ptr<PipelineStatePayload> ReplacePayload(BackendInstanceId backendInstance, std::shared_ptr<PipelineStatePayload> payload) const {
+		const size_t index = static_cast<uint8_t>(backendInstance);
+		if (index >= kMaxPipelineDevices) throw std::out_of_range("PipelineState: device instance out of range");
+		return m_slots ? (*m_slots)[index].Exchange(std::move(payload)) : nullptr;
 	}
 
 private:
@@ -180,11 +182,9 @@ private:
 		return payload;
 	}
 
-	std::shared_ptr<PipelineStateSlot> m_slot;
-	using BackendSlotMap = std::unordered_map<uint8_t, std::shared_ptr<PipelineStateSlot>>;
-	std::shared_ptr<BackendSlotMap> m_backendSlots;
+	using Slots = std::array<PipelineStateSlot, kMaxPipelineDevices>;
+	std::shared_ptr<Slots> m_slots;
 };
 
 
 } // namespace org
-

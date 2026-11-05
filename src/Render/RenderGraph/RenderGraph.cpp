@@ -1,3 +1,4 @@
+#include "Render/PipelineLibrary.h"
 #include "RenderGraphInternal.h"
 #include "Render/Runtime/RuntimeDevice.h"
 #include "OpenRenderGraph/Runtime.h"
@@ -280,7 +281,8 @@ DeviceInstanceId RenderGraph::RegisterBackendDevice(rhi::Backend backend, rhi::D
 	}
 	const auto id = m_backendDevices.Register(backend, device);
 	DescriptorHeapManager::GetInstance().RegisterBackend(id, device);
-	m_runtime->RegisterDevice(device);
+	m_runtime->Pipelines()->RegisterDevice(id, backend, device);
+	m_runtime->RegisterDevice(device, backend);
 	return id;
 }
 
@@ -1344,6 +1346,14 @@ RenderGraph::RequestResolverResourceHandles(const ResolverDeclarationState& stat
 	return handles;
 }
 
+
+RenderPassBuilder* RenderGraph::FindPassBuilder(std::string const& name) {
+	const auto it = m_passBuildersByName.find(name);
+	if (it == m_passBuildersByName.end() || it->second->Kind() != PassBuilderKind::Render) return nullptr;
+	// Built since the reset: a builder kept from an earlier build joins the order again when its pass is built again.
+	if (std::ranges::find(m_passBuilderOrder, it->second.get()) == m_passBuilderOrder.end()) return nullptr;
+	return static_cast<RenderPassBuilder*>(it->second.get());
+}
 
 RenderPassBuilder& RenderGraph::GetOrCreateRenderPassBuilder(std::string const& name) {
 	if (auto it = m_passBuildersByName.find(name); it != m_passBuildersByName.end()) {

@@ -340,6 +340,7 @@ struct RenderGraph::PersistentInstanceState {
         // entry keeps naming the logical resource the pass declared.
         std::vector<uint32_t> resolverUseEntries;
         BackendInstanceId device = BackendInstanceId::Primary; // The pass's device (its lowering's).
+        bool awaitingPipelines = false; // Declared again with a pipeline still building: lowered again once it is ready.
         struct GroupViews { uint32_t group; std::vector<BindlessViewRequest> views; };
         std::vector<GroupViews> groupViews;
 		uint64_t fingerprint = 0; // Structural identity of the lowered declaration (membership excluded).
@@ -420,6 +421,7 @@ struct RenderGraph::PersistentInstanceState {
 			std::vector<persistent::BindingToken> bindings;
 			std::shared_ptr<const ResourceUseLayout> preparedResourceUses;
 			std::shared_ptr<const void> preparedBindings;
+			BackendInstanceId device = BackendInstanceId::Primary;
 		};
 		std::vector<DeclaredTokens> declaredTokens;
 		std::vector<uint32_t> touchedGroups;      // grown in the transaction: not polled meanwhile

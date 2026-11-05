@@ -90,6 +90,8 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 			par.resources.internalTransitions = b.params.internalTransitions;
 			par.resources.identifierSet = b.DeclaredResourceIds();
 			par.resources.activeFeatureDomains = b.params.activeFeatureDomains;
+			par.resources.declaredPipelines = b.params.declaredPipelines;
+			par.resources.declaredCommandSignatures = b.params.declaredCommandSignatures;
 			par.explicitExternalWaitsBeforeTransitions = b.params.externalWaitsBeforeTransitions;
 			par.resources.externalWaitsBeforeTransitions = b.params.externalWaitsBeforeTransitions;
 			par.resources.externalWaitBindingsBeforeTransitions = b.params.externalWaitBindingsBeforeTransitions;
@@ -636,6 +638,8 @@ void RenderGraph::RedeclarePass(PassAndResources& p, PassType type)
 		resources.internalTransitions = std::move(b.params.internalTransitions);
 		resources.identifierSet = std::move(b._declaredIds);
 		resources.activeFeatureDomains = std::move(b.params.activeFeatureDomains);
+		resources.declaredPipelines = std::move(b.params.declaredPipelines);
+		resources.declaredCommandSignatures = std::move(b.params.declaredCommandSignatures);
 		p.explicitExternalWaitsBeforeTransitions = b.params.externalWaitsBeforeTransitions;
 		resources.externalWaitsBeforeTransitions = std::move(b.params.externalWaitsBeforeTransitions);
 		resources.externalWaitBindingsBeforeTransitions = std::move(b.params.externalWaitBindingsBeforeTransitions);

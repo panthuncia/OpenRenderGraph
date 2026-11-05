@@ -5,6 +5,7 @@
 #include <tuple>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <vector>
 
 #include <rhi.h>
@@ -25,6 +26,9 @@ namespace org::compiler { class ScheduleCache; }
 
 namespace org {
 
+class PipelineCompiler;
+class PipelineLibrary;
+
 // The ORG runtime of a device: what every graph on it shares. One per process for now (the services behind it are still
 // process singletons); graphs and hosts take it and never initialize, reset or shut down shared state themselves.
 // - The device, and the queues whose progress bounds retirement (the device's three, plus RegisterQueue's).
@@ -43,6 +47,9 @@ public:
 		uint32_t slots = 3;
 		// Optional; a ThreadPoolTaskService is created when absent.
 		std::shared_ptr<runtime::ITaskService> tasks;
+		// Optional; passes can declare pipelines by description only with one (Render/PipelineDesc.h). Its first call comes
+		// when a graph lowers a pass, so it may rely on host state made after the runtime.
+		std::shared_ptr<PipelineCompiler> pipelineCompiler;
 	};
 
 	static std::shared_ptr<Runtime> Create(Desc desc);
@@ -64,6 +71,8 @@ public:
 	const std::shared_ptr<runtime::IDescriptorService>& Descriptors() const noexcept { return m_descriptors; }
 	const std::shared_ptr<runtime::IStatisticsService>& Statistics() const noexcept { return m_statistics; }
 	const std::shared_ptr<runtime::IRenderGraphSettingsService>& Settings() const noexcept { return m_settings; }
+	// The pipelines passes declared by description, built for the devices they run on.
+	const std::shared_ptr<PipelineLibrary>& Pipelines() const noexcept { return m_pipelines; }
 
 	// Another queue whose submissions can use ORG objects (a peer device's, one made with CreateQueue): the frontier covers it
 	// from now on. Registering twice is harmless.
@@ -74,7 +83,16 @@ public:
 	// external client's slot timeline). Points on it read as reached from now on, as an unregistered queue's do: a
 	// destroyed timeline would read as never reached.
 	void NoteTimelineDestroyed(const rhi::Timeline& timeline);
-	void RegisterDevice(rhi::Device device);
+	// Another device: its queues join the frontier, and with its API given, other devices' work can wait on its timelines
+	// (RelayWaits).
+	void RegisterDevice(rhi::Device device, rhi::Backend backend = rhi::Backend::Null);
+	// A device waits only on its own timelines. For points on timelines of the device `owner` (an rhi::Device::impl, as
+	// TimelineDeviceOf names it) that work on `consumer` must wait for: `owner` waits for them in an empty submission on its
+	// graphics queue and signals a fence it shares with `consumer`. Returned is that fence's point as `consumer` sees it, with its
+	// identity: wait on it instead. Any thread. Throws when either device is not registered with its API, or the two are not one
+	// D3D12 and one Vulkan device.
+	struct RelayedPoint { uint64_t identity = 0; rhi::TimelinePoint point{}; };
+	RelayedPoint RelayWaits(const void* owner, const void* consumer, std::span<const rhi::TimelinePoint> points);
 
 	// Every registered queue's progress now.
 	runtime::SubmissionFrontier Frontier() const;
@@ -94,6 +112,9 @@ public:
 	// The timeline an identity names, for a submission that waits on another graph's (its packets bind only their own).
 	// Invalid for an unknown identity.
 	rhi::TimelineHandle TimelineHandleOf(uint64_t identity) const;
+	// The device a timeline identity's timeline belongs to, as its rhi::Device::impl (a timeline names its device by it). Null for an
+	// unknown identity.
+	const void* TimelineDeviceOf(uint64_t identity) const;
 	// The resource ledgers every graph's admission on the runtime shares (docs/job-graphs.md, "Phase 2 investigation").
 	const std::shared_ptr<persistent::ResourceSequencer>& Sequencer() const noexcept { return m_sequencer; }
 	// The schedule cache shared by every graph on this runtime (compiler::ScheduleCache).
@@ -109,6 +130,7 @@ private:
 	std::shared_ptr<runtime::IDescriptorService> m_descriptors;
 	std::shared_ptr<runtime::IStatisticsService> m_statistics;
 	std::shared_ptr<runtime::IRenderGraphSettingsService> m_settings;
+	std::shared_ptr<PipelineLibrary> m_pipelines;
 	rhi::TimelinePtr m_readbackFence, m_copyReadbackFence;
 	std::shared_ptr<persistent::ResourceSequencer> m_sequencer;
 	std::shared_ptr<compiler::ScheduleCache> m_schedules;
@@ -118,9 +140,15 @@ private:
 	// The progress timelines of unregistered queues (destroyed with them), and timelines noted destroyed: device and handle.
 	std::vector<std::pair<void*, rhi::TimelineHandle>> m_retiredTimelines;
 
+	struct DeviceRelay;
+	std::mutex m_relaysMutex;
+	std::vector<std::pair<rhi::Device, rhi::Backend>> m_devices;  // Guarded by m_relaysMutex.
+	std::vector<std::unique_ptr<DeviceRelay>> m_relays;            // Guarded by m_relaysMutex.
+
 	mutable std::mutex m_identitiesMutex;
 	std::map<std::tuple<void*, uint32_t, uint32_t>, uint64_t> m_identities;
 	std::map<uint64_t, rhi::TimelineHandle> m_handles;
+	std::map<uint64_t, const void*> m_owners;
 	uint64_t m_nextIdentity = 1;
 };
 

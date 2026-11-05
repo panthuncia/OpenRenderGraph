@@ -1,6 +1,7 @@
 // Persistent execution, structural builds: representations, inline and worker-side builds, frame-interrupting passes and
 // alias placement.
 #include "RenderGraphPersistentState.h"
+#include "Render/PipelineLibrary.h"
 
 namespace org {
 
@@ -242,6 +243,7 @@ void RenderGraph::SubmitPersistentStructuralBuild(const std::vector<uint32_t>& s
 			using T = std::decay_t<decltype(value)>;
 			if constexpr (!std::is_same_v<T, std::monostate>) {
 				auto lowered = lowering::LowerPass(*this, _registry, m_queueRegistry, primaryBackend, value, any.type);
+				AwaitPassPipelines(value.resources, lowered.device, main.name);
 				const auto* dynamic = dynamic_cast<const IDynamicDeclaredResources*>(value.pass.get());
 				UseRebindSlots(*this, main, lowered, dynamic);
 				if (!(dynamic && dynamic->PreparesOnlyDeclaredWork()) && LoweringAddsDeclarations(main, lowered)) {
@@ -284,6 +286,7 @@ void RenderGraph::SubmitPersistentStructuralBuild(const std::vector<uint32_t>& s
 				auto bindings = std::move(main.declaredBindings);
 				auto preparedUses = main.preparedResourceUses;
 				auto preparedBindings = main.preparedBindings;
+				const auto preparedDevice = main.device;
 				InstallMainPass(*this, state, transaction, main, std::move(lowered), mainIndex, true, std::nullopt,
 					inlineRequired ? nullptr : &pending->touchedGroups);
 				if (!inlineRequired) {
@@ -292,8 +295,10 @@ void RenderGraph::SubmitPersistentStructuralBuild(const std::vector<uint32_t>& s
 					std::swap(bindings, main.declaredBindings);
 					std::swap(preparedUses, main.preparedResourceUses);
 					std::swap(preparedBindings, main.preparedBindings);
+					const auto loweredDevice = main.device;
+					main.device = preparedDevice;
 					pending->declaredTokens.push_back({mainIndex, std::move(views), std::move(bindings),
-						std::move(preparedUses), std::move(preparedBindings)});
+						std::move(preparedUses), std::move(preparedBindings), loweredDevice});
 				}
 				basic_telemetry::AddCounter("ORG.Persistent.StructuralPassRelowerings");
 			}
@@ -375,6 +380,7 @@ void RenderGraph::AdvancePersistentStructuralBuild(std::vector<uint32_t>& struct
 		main.declaredBindings = std::move(tokens.bindings);
 		main.preparedResourceUses = std::move(tokens.preparedResourceUses);
 		main.preparedBindings = std::move(tokens.preparedBindings);
+		main.device = tokens.device;
 	}
 	structural.insert(structural.end(), pending->deferredStructural.begin(), pending->deferredStructural.end());
 	++state.structuralBuilds;
@@ -489,6 +495,7 @@ void RenderGraph::UpdatePersistentFrameInterruptingPasses(
 			using T = std::decay_t<decltype(value)>;
 			if constexpr (!std::is_same_v<T, std::monostate>) {
 				auto lowered = lowering::LowerPass(*this, _registry, m_queueRegistry, primaryBackend, value, any.type);
+				AwaitPassPipelines(value.resources, lowered.device, main.name);
 				std::vector<Resource*> resources;
 				for (const auto& use : lowered.entries) resources.push_back(use.resource);
 				for (const auto& group : lowered.groups) for (const auto& [id, resource] : group.members) resources.push_back(resource.get());

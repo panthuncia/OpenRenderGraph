@@ -5,6 +5,8 @@
 #include <atomic>
 #include <stdexcept>
 
+#include "Render/PipelineLibrary.h"
+#include "Render/QueueRegistry.h"
 #include "Render/RenderGraph/PersistentGraph.h"
 #include "Render/Runtime/IDescriptorService.h"
 #include "Render/Runtime/IReadbackService.h"
@@ -23,6 +25,16 @@
 #include "Managers/Singletons/UploadManager.h"
 
 namespace org {
+
+struct Runtime::DeviceRelay {
+	const void* owner = nullptr;
+	const void* consumer = nullptr;
+	rhi::Device ownerDevice{};
+	rhi::TimelinePtr ownerSide, consumerSide;
+	uint64_t identity = 0;
+	std::mutex mutex;   // A value is taken and signalled together: a fence's signals must not go backwards.
+	uint64_t next = 1;
+};
 
 namespace {
 std::atomic<Runtime*> g_current{nullptr};
@@ -69,6 +81,12 @@ void Runtime::Initialize() {
 	runtime::InitializeRuntimeDevice(m_desc.device);
 	if (!m_desc.tasks) m_desc.tasks = std::make_shared<runtime::ThreadPoolTaskService>();
 	runtime::SetDefaultTaskService(m_desc.tasks);
+	m_pipelines = std::make_shared<PipelineLibrary>(m_desc.tasks, m_desc.pipelineCompiler);
+	m_pipelines->RegisterDevice(DeviceInstanceId::Primary, m_desc.backend, m_desc.device);
+	{
+		std::scoped_lock lock(m_relaysMutex);
+		m_devices.emplace_back(m_desc.device, m_desc.backend);
+	}
 
 	for (auto kind : { rhi::QueueKind::Graphics, rhi::QueueKind::Compute, rhi::QueueKind::Copy })
 		RegisterQueue(m_desc.device.GetQueue(kind));
@@ -97,6 +115,11 @@ void Runtime::Initialize() {
 
 Runtime::~Runtime() {
 	if (g_current.load() != this) return;  // Create failed before publishing it
+	m_pipelines.reset(); // Joins its builds, which use the device.
+	{
+		std::scoped_lock lock(m_relaysMutex);
+		m_relays.clear(); // Their last signals were waited for with the queues that consumed them.
+	}
 	DeletionManager::GetInstance().SetFrontier({}, {});
 	DescriptorHeapManager::GetInstance().SetFrontier({}, {});
 	StatisticsManager::GetInstance().ClearAll();
@@ -145,8 +168,17 @@ uint64_t Runtime::TimelineIdentity(const rhi::Timeline& timeline) {
 	const auto handle = timeline.GetHandle();
 	std::lock_guard lock(m_identitiesMutex);
 	auto [found, inserted] = m_identities.try_emplace({timeline.impl, handle.index, handle.generation}, m_nextIdentity);
-	if (inserted) m_handles.emplace(m_nextIdentity++, handle);
+	if (inserted) {
+		m_owners.emplace(m_nextIdentity, timeline.impl);
+		m_handles.emplace(m_nextIdentity++, handle);
+	}
 	return found->second;
+}
+
+const void* Runtime::TimelineDeviceOf(uint64_t identity) const {
+	std::lock_guard lock(m_identitiesMutex);
+	const auto found = m_owners.find(identity);
+	return found == m_owners.end() ? nullptr : found->second;
 }
 
 rhi::TimelineHandle Runtime::TimelineHandleOf(uint64_t identity) const {
@@ -166,8 +198,55 @@ bool Runtime::Reached(const runtime::SubmittedPoint& point) const {
 	return runtime::TimelineReached(point);
 }
 
-void Runtime::RegisterDevice(rhi::Device device) {
+Runtime::RelayedPoint Runtime::RelayWaits(const void* owner, const void* consumer, std::span<const rhi::TimelinePoint> points) {
+	if (!owner || !consumer || owner == consumer) throw std::invalid_argument("RelayWaits needs two different devices");
+	DeviceRelay* relay = nullptr;
+	{
+		std::scoped_lock lock(m_relaysMutex);
+		for (const auto& existing : m_relays)
+			if (existing->owner == owner && existing->consumer == consumer) relay = existing.get();
+		if (!relay) {
+			const std::pair<rhi::Device, rhi::Backend>* ownerEntry = nullptr;
+			const std::pair<rhi::Device, rhi::Backend>* consumerEntry = nullptr;
+			for (const auto& entry : m_devices) {
+				if (entry.first.impl == owner) ownerEntry = &entry;
+				if (entry.first.impl == consumer) consumerEntry = &entry;
+			}
+			if (!ownerEntry || !consumerEntry || ownerEntry->second == rhi::Backend::Null || consumerEntry->second == rhi::Backend::Null)
+				throw std::logic_error("RelayWaits: a device is not registered with its API");
+			auto created = std::make_unique<DeviceRelay>();
+			created->owner = owner;
+			created->consumer = consumer;
+			created->ownerDevice = ownerEntry->first;
+			if (rhi::Failed(CreateBridgeTimelinePair(ownerEntry->first, ownerEntry->second, consumerEntry->first, consumerEntry->second,
+					"ORG cross-device relay", created->ownerSide, created->consumerSide)))
+				throw std::runtime_error("RelayWaits: failed to create a fence shared by the two devices");
+			created->identity = TimelineIdentity(created->consumerSide.Get());
+			relay = created.get();
+			m_relays.push_back(std::move(created));
+		}
+	}
+	std::scoped_lock lock(relay->mutex);
+	const uint64_t value = relay->next++;
+	const rhi::TimelinePoint signal{relay->ownerSide->GetHandle(), value};
+	rhi::SubmitDesc submit{};
+	submit.waits = {points.data(), static_cast<uint32_t>(points.size())};
+	submit.signals = {&signal, 1u};
+	if (const auto result = relay->ownerDevice.GetQueue(rhi::QueueKind::Graphics).Submit({}, submit); result != rhi::Result::Ok) {
+		--relay->next;
+		throw std::runtime_error(std::string("RelayWaits: the relay submission failed: ") + rhi::ResultName(result));
+	}
+	return {relay->identity, {relay->consumerSide->GetHandle(), value}};
+}
+
+void Runtime::RegisterDevice(rhi::Device device, rhi::Backend backend) {
 	if (!device) return;
+	{
+		std::scoped_lock lock(m_relaysMutex);
+		auto found = std::ranges::find_if(m_devices, [&](const auto& entry) { return entry.first.impl == device.impl; });
+		if (found == m_devices.end()) m_devices.emplace_back(device, backend);
+		else if (found->second == rhi::Backend::Null) found->second = backend;
+	}
 	for (auto kind : { rhi::QueueKind::Graphics, rhi::QueueKind::Compute, rhi::QueueKind::Copy })
 		RegisterQueue(device.GetQueue(kind));
 }

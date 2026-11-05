@@ -384,6 +384,83 @@ void RenderGraph::RecordPersistentSegment(PersistentSegmentRun& run) {
 	run.Lap(timings.recordUs);
 }
 
+// A device waits only on its own timelines. A graph's queue timelines are shared between its devices (QueueRegistry's bridge
+// fences), but a batch can also wait on timelines the graph does not own: another graph's queues through the runtime's ledgers,
+// the frame-wait timeline, a producer's. A batch whose device is not such a timeline's gets a relay: an empty submission on the
+// timeline's device waits for the points and signals a fence shared with the batch's device, and the batch waits on that
+// (Runtime::RelayWaits).
+std::vector<std::vector<compiler::ExecutionTimelinePoint>> RenderGraph::RelayCrossDeviceWaits(PersistentSegmentRun& run,
+	const std::vector<std::vector<compiler::ExecutionTimelinePoint>>& waits, std::vector<compiler::PreparedTimelineBinding>& extraTimelines) {
+	auto result = waits;
+	if (m_backendDevices.size() < 2) return result;
+	BT_ZONE_SCOPE("ORG.Persistent.RelayCrossDeviceWaits");
+	const auto& graph = *run.segment.publication->executable->graph;
+	const size_t slotCount = run.slotCount;
+	const auto bindingOf = [&](uint64_t identity) -> rhi::TimelineHandle {
+		for (const auto& binding : run.timelineBindings) if (binding.identity == identity) return binding.handle;
+		for (const auto& binding : extraTimelines) if (binding.identity == identity) return binding.handle;
+		return m_runtime->TimelineHandleOf(identity);
+	};
+	const auto queueIdentity = [&](uint64_t identity) {
+		for (size_t slot = 0; slot < slotCount && slot < run.timelineBindings.size(); ++slot)
+			if (run.timelineBindings[slot].identity == identity) return true;  // shared between devices by the bridge fences
+		return false;
+	};
+	const auto ownerOf = [&](uint64_t identity) -> const void* {
+		if (identity == kFrameWaitTimelineIdentity) return HasFrameWaitTimeline() ? (*m_frameWaitTimeline)->impl : nullptr;
+		return m_runtime->TimelineDeviceOf(identity);
+	};
+	struct Group {
+		const void* owner = nullptr;
+		const void* consumer = nullptr;
+		std::map<uint64_t, uint64_t> points;  // identity -> highest value
+		std::vector<uint32_t> batches;
+	};
+	std::vector<Group> groups;
+	for (uint32_t batch = 0; batch < result.size() && batch < graph.batches.size(); ++batch) {
+		const auto slot = static_cast<QueueSlotIndex>(static_cast<uint8_t>(graph.batches[batch].queue));
+		const auto* consumerEntry = m_backendDevices.Find(m_queueRegistry.GetBackendInstance(slot));
+		if (!consumerEntry) continue;
+		const void* consumer = consumerEntry->device.impl;
+		for (const auto wait : result[batch]) {
+			if (!wait.value || queueIdentity(wait.timeline)) continue;
+			const auto* owner = ownerOf(wait.timeline);
+			if (!owner || owner == consumer) continue;
+			auto group = std::ranges::find_if(groups, [&](const Group& g) { return g.owner == owner && g.consumer == consumer; });
+			if (group == groups.end()) group = groups.insert(groups.end(), Group{owner, consumer, {}, {}});
+			auto& point = group->points[wait.timeline];
+			point = (std::max)(point, wait.value);
+			if (std::ranges::find(group->batches, batch) == group->batches.end()) group->batches.push_back(batch);
+		}
+	}
+	for (const auto& group : groups) {
+		std::vector<rhi::TimelinePoint> relayed;
+		relayed.reserve(group.points.size());
+		for (const auto& [identity, pointValue] : group.points) {
+			const auto handle = bindingOf(identity);
+			if (!handle.valid()) throw std::logic_error("A relayed wait's timeline has no handle");
+			relayed.push_back({handle, pointValue});
+		}
+		const auto relay = m_runtime->RelayWaits(group.owner, group.consumer, relayed);
+		if (trace::Enabled(trace::Category::Submission)) {
+			std::string waited, batches;
+			for (const auto& [identity, pointValue] : group.points) waited += (waited.empty() ? "" : ",") + std::to_string(identity) + "@" + std::to_string(pointValue);
+			for (const auto batch : group.batches) batches += (batches.empty() ? "" : ",") + std::to_string(batch);
+			ORG_TRACE(Submission, "relay-submitted").Add("waits", waited)
+				.Add("signal", std::to_string(relay.identity) + "@" + std::to_string(relay.point.value)).Add("consumerBatches", batches);
+		}
+		basic_telemetry::AddCounter("ORG.Persistent.CrossDeviceRelays");
+		for (const auto batch : group.batches) {
+			auto& batchWaits = result[batch];
+			std::erase_if(batchWaits, [&](const auto& wait) { return group.points.contains(wait.timeline) && ownerOf(wait.timeline) == group.owner; });
+			batchWaits.push_back({relay.identity, relay.point.value});
+		}
+		if (std::ranges::none_of(extraTimelines, [&](const auto& binding) { return binding.identity == relay.identity; }))
+			extraTimelines.push_back({relay.identity, relay.point.t});
+	}
+	return result;
+}
+
 // A ticket keeps the recording for its host to submit. Otherwise the handoff is recorded under the sequencer, and the
 // execution is submitted and committed.
 void RenderGraph::SubmitPersistentSegment(PersistentSegmentRun& run) {
@@ -520,7 +597,8 @@ void RenderGraph::SubmitPersistentSegment(PersistentSegmentRun& run) {
 				const auto handle = m_runtime->TimelineHandleOf(wait.timeline);
 				if (handle.valid()) extraTimelines.push_back({wait.timeline, handle});
 			}
-		execution = std::move(recorded).Submit(*state.timelines, admission.incomingWaits, leading, std::move(handoffLeases),
+		auto submitWaits = RelayCrossDeviceWaits(run, admission.incomingWaits, extraTimelines);
+		execution = std::move(recorded).Submit(*state.timelines, submitWaits, leading, std::move(handoffLeases),
 			extraTimelines);
 		run.Lap(timings.submitUs);
 	} catch (...) {

@@ -2,6 +2,7 @@
 #include "OpenRenderGraph/ExternalClient.h"
 #include "RenderGraphPersistentState.h"
 #include "Render/CommandListPool.h"
+#include "OpenRenderGraph/Trace.h"
 
 namespace org {
 
@@ -256,11 +257,31 @@ ExternalClient::Signal ExternalClient::Submit(uint32_t slotIndex, std::span<cons
 			lists.push_back(list);
 		}
 		std::vector<rhi::TimelinePoint> waitPoints;
+		// A point on another device's timeline (a graph's queue on a peer device) is relayed: the queue's device waits only
+		// on its own timelines.
+		const void* device = slot.timeline->impl;
+		std::vector<std::pair<const void*, std::vector<rhi::TimelinePoint>>> relayed;
 		for (const auto wait : waits) {
 			if (wait.timeline == slot.identity) continue;  // same queue: earlier submissions already run first
 			const auto handle = m_desc.runtime->TimelineHandleOf(wait.timeline);
 			if (!handle.valid()) throw std::runtime_error("ExternalClient waits on an unknown timeline");
-			waitPoints.push_back({handle, wait.value});
+			const auto* owner = m_desc.runtime->TimelineDeviceOf(wait.timeline);
+			if (!owner || owner == device) {
+				waitPoints.push_back({handle, wait.value});
+				continue;
+			}
+			auto group = std::ranges::find_if(relayed, [&](const auto& entry) { return entry.first == owner; });
+			if (group == relayed.end()) group = relayed.insert(relayed.end(), {owner, {}});
+			group->second.push_back({handle, wait.value});
+		}
+		for (const auto& [owner, points] : relayed) {
+			const auto relay = m_desc.runtime->RelayWaits(owner, device, points);
+			waitPoints.push_back(relay.point);
+			if (trace::Enabled(trace::Category::Submission)) {
+				ORG_TRACE(Submission, "client-relay-submitted").Add("client", m_desc.name)
+					.Add("signal", std::to_string(relay.identity) + "@" + std::to_string(relay.point.value));
+			}
+			basic_telemetry::AddCounter("ORG.ExternalClient.CrossDeviceRelays");
 		}
 		const auto value = slot.next++;
 		std::vector<rhi::TimelinePoint> signalPoints{{slot.timeline->GetHandle(), value}};
@@ -274,6 +295,14 @@ ExternalClient::Signal ExternalClient::Submit(uint32_t slotIndex, std::span<cons
 			--slot.next; // Nothing will signal this value, and shutdown waits for the last one taken.
 			throw std::runtime_error(std::string("ExternalClient submission failed: ") + rhi::ResultName(submitted));
 		}
+		}
+		if (trace::Enabled(trace::Category::Submission)) {
+			std::string waited;
+			for (const auto wait : waits)
+				if (wait.timeline != slot.identity) waited += (waited.empty() ? "" : ",") + std::to_string(wait.timeline) + "@" + std::to_string(wait.value);
+			ORG_TRACE(Submission, "client-submitted").Add("client", m_desc.name).Add("slot", static_cast<uint64_t>(slotIndex))
+				.Add("waits", waited).Add("signal", std::to_string(slot.identity) + "@" + std::to_string(value))
+				.Add("relays", static_cast<uint64_t>(relayed.size()));
 		}
 		compiler::GraphExecutionTimeline receipt;
 		receipt.batches.resize(1);

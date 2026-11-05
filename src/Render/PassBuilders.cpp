@@ -1,4 +1,6 @@
 #include "Render/RenderGraph/RenderGraph.h"
+#include "OpenRenderGraph/Runtime.h"
+#include "Render/PipelineLibrary.h"
 
 
 namespace org {
@@ -45,6 +47,30 @@ void BuilderGraphAccess::AddResource(RenderGraph* graph, std::shared_ptr<Resourc
 
 Resource* BuilderGraphAccess::Resolve(RenderGraph* graph, ResourceRegistry::RegistryHandle handle) {
     return graph->_registry.Resolve(handle);
+}
+
+std::shared_ptr<PipelineLibraryEntry> BuilderGraphAccess::AcquirePipeline(RenderGraph* graph, PipelineDesc desc) {
+    return graph->GetRuntime().Pipelines()->Acquire(std::move(desc));
+}
+
+PipelineState RenderPassBuilder::Pipeline(PipelineDesc desc) {
+    auto entry = BuilderGraphAccess::AcquirePipeline(graph, std::move(desc));
+    auto state = entry->State();
+    if (std::ranges::find(params.declaredPipelines, entry) == params.declaredPipelines.end())
+        params.declaredPipelines.push_back(std::move(entry));
+    return state;
+}
+
+std::shared_ptr<CommandSignatureLibraryEntry> BuilderGraphAccess::AcquireCommandSignature(RenderGraph* graph, CommandSignatureDesc desc) {
+    return graph->GetRuntime().Pipelines()->AcquireCommandSignature(std::move(desc));
+}
+
+CommandSignatureState RenderPassBuilder::CommandSignature(CommandSignatureDesc desc) {
+    auto entry = BuilderGraphAccess::AcquireCommandSignature(graph, std::move(desc));
+    auto state = entry->State();
+    if (std::ranges::find(params.declaredCommandSignatures, entry) == params.declaredCommandSignatures.end())
+        params.declaredCommandSignatures.push_back(std::move(entry));
+    return state;
 }
 
 void BuilderGraphAccess::AddRenderPass(RenderGraph* graph, std::shared_ptr<RenderPass> pass, RenderPassParameters& resources, std::string name,
