@@ -219,6 +219,13 @@ public:
 		const auto it = m_representations.find(static_cast<uint8_t>(backendInstance));
 		return it != m_representations.end() ? it->second : APIRepresentationPtr{};
 	}
+	// Every device's representation as one published set, indexed by device. The same object until the next publication or
+	// clear, so it identifies the allocation: bindings of one resource captured at different times share it.
+	using APIRepresentationSet = std::vector<APIRepresentationPtr>;
+	std::shared_ptr<const APIRepresentationSet> AcquireAPIRepresentationSet() const {
+		std::scoped_lock lock(m_representationMutex);
+		return m_representationSet;
+	}
 
 	[[nodiscard]] bool HasECSEntity() const noexcept { return static_cast<bool>(m_ecsEntity); }
 	// Graph-published resources are resolved from PublishedRendererState rather
@@ -262,6 +269,13 @@ public:
 		std::scoped_lock lock(m_representationMutex);
 		for (auto& [device, representation] : replacements)
 			m_representations[device] = std::move(representation);
+		auto set = std::make_shared<APIRepresentationSet>();
+		for (const auto& [device, representation] : m_representations) {
+			if (!representation || !representation->resource) continue;
+			if (set->size() <= device) set->resize(device + 1u);
+			(*set)[device] = representation;
+		}
+		m_representationSet = std::move(set);
 		m_publishedRepresentationGeneration = generation;
 		return true;
 	}
@@ -286,6 +300,7 @@ public:
 	void ClearAPIRepresentations() {
 		std::scoped_lock lock(m_representationMutex);
 		m_representations.clear();
+		m_representationSet.reset();
 	}
 	std::vector<APIRepresentationPtr> TakeAPIRepresentations() {
 		std::vector<APIRepresentationPtr> retired;
@@ -296,6 +311,7 @@ public:
 			if (representation) retired.push_back(std::move(representation));
 		}
 		m_representations.clear();
+		m_representationSet.reset();
 		return retired;
 	}
     virtual uint64_t GetGlobalResourceID() const { return m_globalResourceID; }
@@ -396,6 +412,7 @@ private:
 	inline static thread_local std::uint32_t s_ecsRegistrationSuppressionDepth = 0;
 	mutable std::mutex m_representationMutex;
 	std::unordered_map<uint8_t, APIRepresentationPtr> m_representations;
+	std::shared_ptr<const APIRepresentationSet> m_representationSet; // Guarded by m_representationMutex.
 	std::atomic<uint64_t> m_nextRepresentationGeneration{ 1 };
 	std::atomic<uint64_t> m_publishedRepresentationGeneration{ 0 };
     bool m_uploadInProgress = false;

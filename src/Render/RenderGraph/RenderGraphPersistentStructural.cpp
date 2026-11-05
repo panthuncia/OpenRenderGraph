@@ -122,6 +122,7 @@ void RenderGraph::MaterializePersistentStandalone(std::span<Resource* const> res
 
 bool RenderGraph::IsPersistentAliasCandidate(Resource* concrete) const {
 	if (!concrete) return false;
+	if (m_compilerState->persistent && m_compilerState->persistent->multiDeviceResources.contains(concrete)) return false;
 	const auto mode = m_getAutoAliasMode ? m_getAutoAliasMode() : AutoAliasMode::Off;
 	if (auto* texture = dynamic_cast<PixelBuffer*>(concrete)) {
 		const auto& desc = texture->GetDescription();

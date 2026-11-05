@@ -123,21 +123,17 @@ PublicationBindingBundle::Snapshot PublicationBindingBundle::Capture(Resource& r
     result->resourceID = resource.GetGlobalResourceID();
     result->externallyImmutable = resource.GetGraphOwnership() == Resource::GraphOwnership::ExternalImmutableShaderResource;
     resource.TryGetRHIResourceDesc(result->description);
-    if (auto primary = resource.AcquireAPIRepresentation(BackendInstanceId::Primary); primary && primary->resource) {
+    if (auto set = resource.AcquireAPIRepresentationSet(); set && !set->empty() && set->front() && set->front()->resource) {
         // Explicit per-device representations (multi-device) replace the backing. The primary device's representation is the
-        // resource. The owner keeps every device's representation alive.
-        auto owned = std::make_shared<std::vector<Resource::APIRepresentationPtr>>();
-        for (const auto instance : resource.GetRepresentationInstances()) {
-            auto representation = resource.AcquireAPIRepresentation(instance);
-            if (!representation || !representation->resource) continue;
-            const auto index = static_cast<uint8_t>(instance);
-            if (result->representations.size() <= index) result->representations.resize(index + 1);
-            result->representations[index] = representation->resource.Get();
-            owned->push_back(std::move(representation));
-        }
+        // resource. The published set owns every device's representation and is the allocation's identity: slots of one
+        // resource captured at different times must name the same owner.
+        const auto& primary = set->front();
+        result->representations.resize(set->size());
+        for (size_t index = 0; index < set->size(); ++index)
+            if ((*set)[index] && (*set)[index]->resource) result->representations[index] = (*set)[index]->resource.Get();
         result->resource = primary->resource.Get();
         result->backingGeneration = primary->backingGeneration;
-        result->allocationOwner = std::move(owned);
+        result->allocationOwner = std::move(set);
     } else if (auto* backed = dynamic_cast<BackedResource*>(&resource)) {
         auto allocation = backed->CapturePublishedBackingAllocation();
         if (!allocation) return {};

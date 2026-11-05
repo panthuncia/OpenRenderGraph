@@ -192,6 +192,7 @@ bool PixelBuffer::TryGetRHIResourceDesc(rhi::ResourceDesc& outDesc) const {
 	outDesc.texture.mipLevels = static_cast<uint16_t>(m_mipLevels);
 	outDesc.texture.sampleCount = 1;
 	outDesc.texture.initialLayout = rhi::ResourceLayout::Undefined;
+	outDesc.queueSharing = m_desc.queueSharing; // As GpuTextureBacking creates it: representations share queues the same way.
 	if (m_desc.hasRTV) outDesc.resourceFlags |= rhi::ResourceFlags::RF_AllowRenderTarget;
 	if (m_desc.hasUAV) outDesc.resourceFlags |= rhi::ResourceFlags::RF_AllowUnorderedAccess;
 	return outDesc.texture.format != rhi::Format::Unknown;

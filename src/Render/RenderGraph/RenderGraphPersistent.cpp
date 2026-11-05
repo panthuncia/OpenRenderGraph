@@ -284,6 +284,9 @@ void persistent_impl::InstallMainPass(RenderGraph& graph, State& state, persiste
 			slotEntry.subscribers.push_back(mainIndex);
 		if (main.device != BackendInstanceId::Primary && !slotEntry.multiDevice) {
 			slotEntry.multiDevice = true;
+			auto* concrete = UnwrapDynamic(slotEntry.resource);
+			state.multiDeviceResources.insert(concrete);
+			state.aliasPlaced.erase(concrete); // Its placement, if any, is left unused: the representations replace it.
 			if (slotEntry.isBound) BindEntry(state, edit, index); // Rebound with its representations.
 		}
 		if (std::find(main.directEntries.begin(), main.directEntries.end(), index) == main.directEntries.end())
