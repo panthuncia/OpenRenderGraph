@@ -501,6 +501,10 @@ public:
     void BindGraphicsPipeline(const PipelineState& pipeline, BindOptions options = {});
     void BindComputePipeline(std::shared_ptr<const PipelineStatePayload> payload, BindOptions options = {});
     void BindGraphicsPipeline(std::shared_ptr<const PipelineStatePayload> payload, BindOptions options = {});
+    // A DXR state object and its global layout. PushConstants then reach the ray stages. A shader table only works with the
+    // state object it was built from, so a pass with a table binds the table's payload rather than the pipeline's current one.
+    void BindRayTracingPipeline(const PipelineState& pipeline, BindOptions options = {});
+    void BindRayTracingPipeline(std::shared_ptr<const PipelineStatePayload> payload, BindOptions options = {});
     // A pipeline made outside PipelineState: no descriptor slots.
     void BindComputePipeline(std::shared_ptr<const rhi::PipelinePtr> pipeline, rhi::PipelineLayoutHandle layout);
     void BindGraphicsPipeline(std::shared_ptr<const rhi::PipelinePtr> pipeline, rhi::PipelineLayoutHandle layout);
@@ -509,12 +513,14 @@ public:
     // The indices that a pipeline's ResourceDescriptorIndex slots resolve to. This is what binding the pipeline pushes.
     std::vector<uint32_t> DescriptorSlotIndices(const PipelineStatePayload& payload, BindOptions options = {}) const;
 
-    // Buffer barriers on declared resources, as one batch.
+    // Buffer barriers on declared resources, as one batch. The defaults are for compute dispatches: around ray dispatches,
+    // pass rhi::ResourceSyncState::Raytracing, because COMPUTE_SHADING doesn't cover DispatchRays.
     void BufferBarriers(std::initializer_list<ResourceBindingToken> buffers,
         rhi::ResourceAccessType beforeAccess, rhi::ResourceAccessType afterAccess,
         rhi::ResourceSyncState beforeSync = rhi::ResourceSyncState::ComputeShading,
         rhi::ResourceSyncState afterSync = rhi::ResourceSyncState::ComputeShading);
-    // A full unordered-access barrier between compute dispatches.
+    // A full unordered-access barrier between dispatches of the bound kind: ray dispatches after BindRayTracingPipeline,
+    // otherwise compute dispatches.
     void UavBarrier();
     // The signature's creation on the pass's device, retained by the recording. Throws when it has none there.
     std::shared_ptr<const rhi::CommandSignaturePtr> Resolve(const CommandSignatureState& signature);
@@ -522,6 +528,11 @@ public:
     void ExecuteIndirect(const CommandSignatureState& signature,
         ResourceBindingToken arguments, uint64_t argumentOffset = 0, uint32_t maxCommandCount = 1,
         std::optional<ResourceBindingToken> count = std::nullopt, uint64_t countOffset = 0);
+    // The same barrier between work of different kinds, such as a compute step whose output rays read.
+    void UavBarrier(rhi::ResourceSyncState beforeSync, rhi::ResourceSyncState afterSync);
+    // Launches rays from dispatch arguments in a declared buffer. Declare it with IndirectArguments. `tables` is
+    // CLodRtShaderTable::IndirectDesc or equivalent; the bound pipeline must be the state object those tables came from.
+    void TraceRaysIndirect(rhi::RayTracingDispatchIndirectDesc tables, ResourceBindingToken arguments, uint64_t argumentOffset = 0);
     void ExecuteIndirect(const std::shared_ptr<const rhi::CommandSignaturePtr>& signature,
         ResourceBindingToken arguments, uint64_t argumentOffset = 0, uint32_t maxCommandCount = 1,
         std::optional<ResourceBindingToken> count = std::nullopt, uint64_t countOffset = 0);

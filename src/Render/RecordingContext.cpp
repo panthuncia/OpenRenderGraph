@@ -120,6 +120,13 @@ void RecordingContext::BindComputePipeline(std::shared_ptr<const PipelineStatePa
 void RecordingContext::BindGraphicsPipeline(std::shared_ptr<const PipelineStatePayload> payload, BindOptions options) {
     BindPayload(std::move(payload), rhi::ShaderStage::AllGraphics, options);
 }
+void RecordingContext::BindRayTracingPipeline(const PipelineState& pipeline, BindOptions options) {
+    BindPayload(pipeline.GetPayload(m_declaredScope ? m_declaredScope->backendInstance : BackendInstanceId::Primary),
+        rhi::ShaderStage::AllRayTracing, options);
+}
+void RecordingContext::BindRayTracingPipeline(std::shared_ptr<const PipelineStatePayload> payload, BindOptions options) {
+    BindPayload(std::move(payload), rhi::ShaderStage::AllRayTracing, options);
+}
 
 namespace {
 void BindRawPipeline(RecordingContext& context, rhi::CommandList& commands,
@@ -167,8 +174,15 @@ void RecordingContext::BufferBarriers(std::initializer_list<ResourceBindingToken
 }
 
 void RecordingContext::UavBarrier() {
+    const auto sync = m_boundStages == rhi::ShaderStage::AllRayTracing
+        ? rhi::ResourceSyncState::Raytracing : rhi::ResourceSyncState::ComputeShading;
+    UavBarrier(sync, sync);
+}
+
+void RecordingContext::UavBarrier(rhi::ResourceSyncState beforeSync, rhi::ResourceSyncState afterSync) {
     rhi::GlobalBarrier barrier{};
-    barrier.beforeSync = barrier.afterSync = rhi::ResourceSyncState::ComputeShading;
+    barrier.beforeSync = beforeSync;
+    barrier.afterSync = afterSync;
     barrier.beforeAccess = barrier.afterAccess = rhi::ResourceAccessType::UnorderedAccess;
     rhi::BarrierBatch batch{};
     batch.globals = {&barrier, 1};
@@ -187,6 +201,11 @@ std::shared_ptr<const rhi::CommandSignaturePtr> RecordingContext::Resolve(const 
 void RecordingContext::ExecuteIndirect(const CommandSignatureState& signature, ResourceBindingToken arguments, uint64_t argumentOffset,
     uint32_t maxCommandCount, std::optional<ResourceBindingToken> count, uint64_t countOffset) {
     ExecuteIndirect(Resolve(signature), arguments, argumentOffset, maxCommandCount, count, countOffset);
+}
+
+void RecordingContext::TraceRaysIndirect(rhi::RayTracingDispatchIndirectDesc tables, ResourceBindingToken arguments, uint64_t argumentOffset) {
+    tables.dispatchRaysDescBuffer = {Resolve(arguments).GetHandle(), argumentOffset};
+    m_commands.TraceRaysIndirect(tables);
 }
 
 void RecordingContext::ExecuteIndirect(const std::shared_ptr<const rhi::CommandSignaturePtr>& signature,
