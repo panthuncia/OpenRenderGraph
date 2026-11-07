@@ -582,6 +582,19 @@ bool CopyQueueUploadService::RecordAndSubmit(Batch& batch) {
 			else found->value = (std::max)(found->value, value);
 		}
 	}
+	// The waits are met here, on this thread, before the submission: the submission then carries only reached waits. A wait inside
+	// Submit would hold what the RHI holds there (its device's timeline lock, which every timeline query takes) for as long as the
+	// GPU takes, and a host that orders a queue it shares on the CPU waits inside Submit. The order is the same: batches go to the
+	// one queue in order, so a wait on the queue holds the later batches as this one does. Bounded: past it, the waits stay on the
+	// submission, for the GPU.
+	for (const auto& copy : batch.copies) {
+		for (const auto& [waitTimeline, value] : copy.waits) {
+			if (!waitTimeline || !*waitTimeline || (*waitTimeline)->GetCompletedValue() >= value) continue;
+			if ((*waitTimeline)->HostWait(value, 10'000) != rhi::Result::Ok) {
+				spdlog::warn("CopyQueueUploadService '{}': a wait was not reached in 10 s; it stays on the submission", m_config.debugName);
+			}
+		}
+	}
 	if (rhi::Failed(m_copyQueue.Submit(lists, { .waits = { waits.data(), static_cast<uint32_t>(waits.size()) },
 			.signals = { signals.data(), static_cast<uint32_t>(signals.size()) } }))) {
 		spdlog::error("CopyQueueUploadService '{}': copy queue submission failed{}", m_config.debugName,

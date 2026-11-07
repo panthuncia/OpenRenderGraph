@@ -196,6 +196,9 @@ public:
     // Any thread: the uploads the calling thread queues on that path from now on wait, on the GPU, until each timeline reached its
     // value (another queue's progress: a frame in flight still reading the destination they overwrite). Nothing waits on the CPU.
     // False when the path has no queue of its own.
+    // A producer whose signal later work of the same frame waits for passes only sealed points (GraphHost::SealedPoint): work
+    // submitted earlier in the frame may sit behind that later work, or reach the device only once the frame ends. On a queue
+    // shared with the host's own copies the host may hold the wait on the CPU, and every upload queued after it with it.
     virtual bool QueueStreamingWait(std::span<const std::pair<std::shared_ptr<rhi::TimelinePtr>, uint64_t>> points) {
         (void)points;
         return false;
