@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <set>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -148,6 +150,17 @@ struct RecordingRanges {
     IStatisticsService* service = nullptr;
     QueryRecordingContext* context = nullptr;
     rhi::CommandList* commands = nullptr;
+    // A profiler's GPU ranges around each pass (RenderGraph::SetGpuPassRangeCallbacks), when it has them. A sub-range
+    // then closes the pass's range, opens "<pass>/<sub-range>" and reopens the pass's range after it: the profiler's
+    // ranges do not nest, so the pass's own range covers only its commands outside its sub-ranges.
+    const std::function<void(rhi::CommandList, rhi::Queue, const char*, const char*)>* gpuRangeBegin = nullptr;
+    const std::function<void(rhi::CommandList, rhi::Queue)>* gpuRangeEnd = nullptr;
+    rhi::Queue queue{};
+    const char* queueName = nullptr;
+    const char* passName = nullptr;
+    // The open sub-range (one at a time): whether it is timed, and whether it is a profiler range.
+    bool subRangeTimed = false;
+    bool subRangeProfiled = false;
 };
 inline thread_local RecordingRanges* t_recordingRanges = nullptr;
 
@@ -162,17 +175,59 @@ private:
     RecordingRanges* m_previous;
 };
 
-// Whether the pass being recorded on this thread can time sub-ranges.
+// "<pass>/<sub-range>", interned for the process: profilers keep range names past the recording.
+inline const char* RecordingSubRangeName(std::string_view pass, std::string_view name) {
+    static std::mutex mutex;
+    static std::set<std::string, std::less<>> names;
+    std::string full(pass);
+    full.push_back('/');
+    full.append(name);
+    std::lock_guard lock(mutex);
+    return names.insert(std::move(full)).first->c_str();
+}
+
+// Whether the pass being recorded on this thread can time or profile sub-ranges.
 inline bool RecordingSubRangesActive() noexcept { return t_recordingRanges != nullptr; }
-// Begins a sub-range of the pass being recorded on this thread, in its own command list. Returns false when the
-// range is not timed. End only a range that returned true.
+// Begins a sub-range of the pass being recorded on this thread, in its own command list. Sub-ranges do not nest.
+// Returns false when the range is neither timed nor profiled. End only a range that returned true.
 inline bool BeginRecordingSubRange(std::string_view name) {
     auto* ranges = t_recordingRanges;
-    return ranges && ranges->service->BeginSubRangeQuery(name, *ranges->commands, *ranges->context);
+    if (!ranges || ranges->subRangeTimed || ranges->subRangeProfiled) return false;
+    ranges->subRangeTimed = ranges->service && ranges->context &&
+        ranges->service->BeginSubRangeQuery(name, *ranges->commands, *ranges->context);
+    if (ranges->gpuRangeBegin && ranges->gpuRangeEnd) {
+        (*ranges->gpuRangeEnd)(*ranges->commands, ranges->queue);
+        (*ranges->gpuRangeBegin)(*ranges->commands, ranges->queue, ranges->queueName,
+            RecordingSubRangeName(ranges->passName ? ranges->passName : "<unnamed>", name));
+        ranges->subRangeProfiled = true;
+    }
+    return ranges->subRangeTimed || ranges->subRangeProfiled;
 }
 inline void EndRecordingSubRange() {
-    if (auto* ranges = t_recordingRanges)
+    auto* ranges = t_recordingRanges;
+    if (!ranges) return;
+    if (ranges->subRangeTimed) {
         ranges->service->EndRangeQuery(*ranges->commands, *ranges->context);
+        ranges->subRangeTimed = false;
+    }
+    if (ranges->subRangeProfiled) {
+        (*ranges->gpuRangeEnd)(*ranges->commands, ranges->queue);
+        (*ranges->gpuRangeBegin)(*ranges->commands, ranges->queue, ranges->queueName,
+            ranges->passName ? ranges->passName : "<unnamed>");
+        ranges->subRangeProfiled = false;
+    }
 }
+
+// A sub-range for a scope (BeginRecordingSubRange).
+class RecordingSubRangeScope {
+public:
+    explicit RecordingSubRangeScope(std::string_view name) : m_open(BeginRecordingSubRange(name)) {}
+    ~RecordingSubRangeScope() { if (m_open) EndRecordingSubRange(); }
+    RecordingSubRangeScope(const RecordingSubRangeScope&) = delete;
+    RecordingSubRangeScope& operator=(const RecordingSubRangeScope&) = delete;
+
+private:
+    bool m_open;
+};
 
 }

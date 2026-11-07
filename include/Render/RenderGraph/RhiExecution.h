@@ -916,8 +916,16 @@ inline void RecordOwnedRecordingCommands(RecordingContext& context, const OwnedR
             BT_ZONE_SCOPE("ORG.Execution.RecordOwned.Record");
             BT_ZONE_TEXT(passLabel.data(), passLabel.size());
             // The pass may time parts of itself (BeginRecordingSubRange) under its own range, with the recording's queries.
+            // ...and profile them under the profiler's ranges.
             runtime::RecordingRanges subRanges{ ownedQueries ? statistics->service.get() : nullptr, ownedQueries, &context.Commands() };
-            runtime::RecordingRangeScope subRangeScope(ownedQueries ? &subRanges : nullptr);
+            if (ranges) {
+                subRanges.gpuRangeBegin = &ranges->begin;
+                subRanges.gpuRangeEnd = &ranges->end;
+                subRanges.queue = queue;
+                subRanges.queueName = ranges->queueName;
+                subRanges.passName = debugName.empty() ? "<unnamed>" : debugName.data();
+            }
+            runtime::RecordingRangeScope subRangeScope(ownedQueries || ranges ? &subRanges : nullptr);
             if (a_again) recording.passes[passIndex].RecordAgain(context);
             else recording.passes[passIndex].Record(context);
         }
