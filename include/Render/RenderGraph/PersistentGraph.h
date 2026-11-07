@@ -1,4 +1,6 @@
 #pragma once
+#include <chrono>
+#include <string>
 
 #include "Render/RenderGraph/GraphCompiler.h"
 #include "Render/RenderGraph/ExecutionState.h"
@@ -621,6 +623,16 @@ private:
     uint64_t m_nextSequence = 1;
     // Admissions prepared and not yet committed or abandoned, in sequence order (at most one unless closed).
     std::vector<uint64_t> m_pending;
+    // Who prepared each pending admission, for the error when an open one is still pending (PendingOwners).
+    struct PendingOwner {
+        uint64_t sequence = 0;
+        uint32_t thread = 0;
+        bool atSubmission = false;
+        std::chrono::steady_clock::time_point prepared{};
+    };
+    std::vector<PendingOwner> m_pendingOwners;
+    std::string PendingOwners() const;
+    void ErasePendingOwner(uint64_t sequence);
     bool m_closed = false;
     bool m_externalHome = false;
     uint32_t m_uploadQueue = UINT32_MAX;  // SetUploadQueue

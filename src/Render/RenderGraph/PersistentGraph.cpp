@@ -8,9 +8,24 @@
 #include <atomic>
 #include <cstdlib>
 #include <unordered_map>
+#include <chrono>
+#include <string>
+#include <thread>
+#include <functional>
 #include <BasicTelemetry/Tracy.h>
 #include <spdlog/spdlog.h>
 #include <BasicTelemetry/Telemetry.h>
+
+namespace {
+// The OS thread id where there is one (the logs print it), for the pending admissions' owners.
+uint32_t CurrentThreadNumber() noexcept {
+#if defined(_MSC_VER)
+    return static_cast<uint32_t>(_Thrd_id());
+#else
+    return static_cast<uint32_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+#endif
+}
+}
 
 namespace org::persistent {
 namespace {
@@ -1594,7 +1609,10 @@ FrameAdmission SynchronousAdmission::PrepareFrame(std::shared_ptr<const Selected
     BT_ZONE_SCOPE("ORG.Persistent.PrepareAdmission");
     std::lock_guard lock(m_sequencer->mutex);
     Require(publication && publication->executable && publication->executable->graph, "No executable publication");
-    Require(!pending || m_pending.empty() || (m_closed && m_pending.size() < m_capacity), "Previous synchronous admission has not terminated");
+    if (pending && !m_pending.empty() && !(m_closed && m_pending.size() < m_capacity))
+        throw std::logic_error("Previous synchronous admission has not terminated (" + PendingOwners() + "; this one on thread "
+            + std::to_string(CurrentThreadNumber()) + (entryOnly ? ", at submission" : "")
+            + ", closed " + (m_closed ? "true" : "false") + ")");
     Require(m_nextSequence != UINT64_MAX, "Admission sequence exhausted");
     Require(m_retained.size() < m_capacity, "Synchronous frame capacity exhausted");
     if (SharingValidationEnabled()) ValidateSharedBackings(*publication->executable, publication->bindings);
@@ -1716,7 +1734,23 @@ FrameAdmission SynchronousAdmission::PrepareFrame(std::shared_ptr<const Selected
     if (!pending) return frame;
     frame.sequence = m_nextSequence++;
     m_pending.push_back(frame.sequence);
+    m_pendingOwners.push_back({frame.sequence, CurrentThreadNumber(), entryOnly,
+        std::chrono::steady_clock::now()});
     return frame;
+}
+std::string SynchronousAdmission::PendingOwners() const {
+    std::string text;
+    const auto now = std::chrono::steady_clock::now();
+    for (const auto& owner : m_pendingOwners) {
+        if (!text.empty()) text += "; ";
+        text += "pending " + std::to_string(owner.sequence) + " prepared on thread " + std::to_string(owner.thread)
+            + (owner.atSubmission ? " at submission" : " for an immediate execution") + " "
+            + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(now - owner.prepared).count()) + " ms ago";
+    }
+    return text.empty() ? std::string("no owner recorded") : text;
+}
+void SynchronousAdmission::ErasePendingOwner(uint64_t sequence) {
+    std::erase_if(m_pendingOwners, [sequence](const PendingOwner& owner) { return owner.sequence == sequence; });
 }
 void SynchronousAdmission::AdmitLedger(FrameAdmission& frame, bool cacheEligible) {
     BT_ZONE_SCOPE("ORG.Persistent.AdmitLedger");
@@ -1938,6 +1972,7 @@ void SynchronousAdmission::Commit(const FrameAdmission& frame, const compiler::G
     m_sequencer->accesses.Commit(graph, frame.backings, receipt, count, frame.backings.Id(), frame.stream);
     m_sequencer->aliases.Commit(graph, frame.backings, receipt, count);
     m_submitted = std::move(submitted);
+    ErasePendingOwner(frame.sequence);
     m_pending.erase(pending);
 }
 void SynchronousAdmission::Abandon(const FrameAdmission& frame) {
@@ -1947,6 +1982,7 @@ void SynchronousAdmission::Abandon(const FrameAdmission& frame) {
     Require(frame.domain == m_domain && frame.sequence && found != m_pending.end(), "Stale synchronous abandonment");
     // Only a closed admission can be abandoned out of order: nothing prepared after it depended on it.
     Require(m_closed || found == m_pending.begin(), "Out-of-order abandonment of an open admission");
+    ErasePendingOwner(frame.sequence);
     m_pending.erase(found);
 }
 void SynchronousAdmission::ExtendSubmitted(compiler::ExecutionTimelinePoint point) {
