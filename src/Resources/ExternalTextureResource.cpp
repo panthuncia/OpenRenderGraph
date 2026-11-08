@@ -79,8 +79,7 @@ std::shared_ptr<ExternalTextureResource> ExternalTextureResource::CreateShared(
 	auto views = BuildExternalTextureViews(description, result->m_mipLevels, result->m_arraySize);
 	auto apiResource = result->m_resource.Get();
 	DescriptorHeapManager::GetInstance().AssignDescriptorSlots(*result, apiResource, views);
-    if (description.initialLayout == rhi::ResourceLayout::Common)
-        result->ResetToCommon();
+    result->SeedInitialLayout(description.initialLayout);
     return result;
 }
 
@@ -116,10 +115,7 @@ bool ExternalTextureResource::RefreshShared(
 	m_handle = m_resource.Get().GetHandle();
 	m_commonLayoutOnly = commonLayoutOnly;
 	m_description = description;
-	if (description.initialLayout == rhi::ResourceLayout::Common)
-		ResetToCommon();
-	else
-		ResetToUndefined();
+	SeedInitialLayout(description.initialLayout);
 	auto views = BuildExternalTextureViews(description, m_mipLevels, m_arraySize);
 	auto apiResource = m_resource.Get();
 	DescriptorHeapManager::GetInstance().AssignDescriptorSlots(*this, apiResource, views);
@@ -161,6 +157,27 @@ void ExternalTextureResource::ResetToUndefined()
     wholeRange.sliceUpper = { BoundType::All, 0 };
     m_stateTracker = SymbolicTracker(wholeRange, ResourceState{
         rhi::ResourceAccessType::None, rhi::ResourceLayout::Undefined, rhi::ResourceSyncState::None });
+}
+
+void ExternalTextureResource::SeedInitialLayout(rhi::ResourceLayout layout)
+{
+	// The layout the host keeps the image in: the state the graph finds it in, and with external home states the one each
+	// execution gives it back in. Undefined only when the host says its contents do not matter.
+	if (layout == rhi::ResourceLayout::Undefined) {
+		ResetToUndefined();
+		return;
+	}
+	if (layout == rhi::ResourceLayout::Common) {
+		ResetToCommon();
+		return;
+	}
+	RangeSpec wholeRange{};
+	wholeRange.mipLower = { BoundType::All, 0 };
+	wholeRange.mipUpper = { BoundType::All, 0 };
+	wholeRange.sliceLower = { BoundType::All, 0 };
+	wholeRange.sliceUpper = { BoundType::All, 0 };
+	m_stateTracker = SymbolicTracker(wholeRange, ResourceState{
+		rhi::ResourceAccessType::Common, layout, rhi::ResourceSyncState::All });
 }
 
 void ExternalTextureResource::ResetToCommon()

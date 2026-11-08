@@ -68,6 +68,8 @@ public:
 
     void ResetToUndefined();
     void ResetToCommon();
+    // Seeds the state tracker with TextureDescription::initialLayout (CreateShared, RefreshShared).
+    void SeedInitialLayout(rhi::ResourceLayout layout);
 	void ResetState(ResourceState state);
 
 private:
