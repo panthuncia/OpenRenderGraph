@@ -75,6 +75,10 @@ public:
 		TrackedHandle& outAllocation,
 		std::optional<AllocationTrackDesc> trackDesc = std::nullopt) const noexcept;
 
+	// Over the OS budget, video memory demotes lower priorities to system memory first. A placed allocation takes the
+	// priority of the heap it shares.
+	void SetResidencyPriority(TrackedHandle& allocation, rhi::ResidencyPriority priority) const noexcept;
+
 private:
 
     DeviceManager() = default;

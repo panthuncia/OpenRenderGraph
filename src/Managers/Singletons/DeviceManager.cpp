@@ -105,6 +105,21 @@ rhi::Result DeviceManager::CreateAliasingResourceTracked(
     return result;
 }
 
+void DeviceManager::SetResidencyPriority(TrackedHandle& allocation, rhi::ResidencyPriority priority) const noexcept {
+    if (!m_device) return;
+    rhi::HeapHandle heap{};
+    if (auto* placed = allocation.GetAllocation()) heap = placed->GetHeap();
+    if (heap.valid()) {
+        rhi::PageableRef pageable(heap);
+        (void)m_device.Get().SetResidencyPriority(rhi::Span<rhi::PageableRef>{ &pageable, 1u }, priority);
+        return;
+    }
+    auto& resource = allocation.GetResource();
+    if (!resource) return;
+    rhi::PageableRef pageable(resource.GetHandle());
+    (void)m_device.Get().SetResidencyPriority(rhi::Span<rhi::PageableRef>{ &pageable, 1u }, priority);
+}
+
 rhi::Result DeviceManager::AllocateMemoryTracked(
     const rhi::ma::AllocationDesc& allocDesc,
     const rhi::ResourceAllocationInfo& allocationInfo,

@@ -158,6 +158,9 @@ void GpuTextureBacking::initialize(const TextureDescription& desc,
 	if (desc.hasUAV) {
 		textureDesc.resourceFlags |= rhi::ResourceFlags::RF_AllowUnorderedAccess;
 	}
+	const auto castableCount = static_cast<UINT32>(desc.castableFormats.size());
+	const rhi::Format* castable = castableCount ? desc.castableFormats.data() : nullptr;
+	textureDesc.castableFormats = rhi::Span<rhi::Format>(castable, castableCount);
 	// Create the texture resource
 
 	AllocationTrackDesc trackDesc(static_cast<int>(owningResourceID));
@@ -218,8 +221,8 @@ void GpuTextureBacking::initialize(const TextureDescription& desc,
 			placement->heap->Allocation(),
 			placement->offset,
 			textureDesc,
-			0,
-			nullptr,
+			castableCount,
+			castable,
 			m_textureHandle,
 			trackDesc);
 		if (!rhi::IsOk(result)) {
@@ -236,13 +239,16 @@ void GpuTextureBacking::initialize(const TextureDescription& desc,
 		const auto result = DeviceManager::GetInstance().CreateResourceTracked(
 			allocationDesc,
 			textureDesc,
-			0,
-			nullptr,
+			castableCount,
+			castable,
 			m_textureHandle,
 			trackDesc);
 		if (!rhi::IsOk(result)) {
 			throw std::runtime_error("Failed to create committed texture resource backing");
 		}
+		const rhi::ResidencyPriority priority = desc.residencyPriority.value_or(
+			desc.hasRTV || desc.hasDSV || desc.hasUAV ? rhi::ResidencyPriorityHigh : rhi::ResidencyPriorityNormal);
+		if (priority != rhi::ResidencyPriorityNormal) DeviceManager::GetInstance().SetResidencyPriority(m_textureHandle, priority);
 
 		//auto result = device.CreateCommittedResource(textureDesc, textureResource);
 	}

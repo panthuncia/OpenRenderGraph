@@ -177,6 +177,15 @@ public:
 
     bool IsAliasingAllowed() const;
 
+    // Storage for ray tracing acceleration structures (RF_RaytracingAccelerationStructure): passes then reach it only
+    // through PassBuilder::AccelerationStructureBuild or AccelerationStructureRead. Set before it materializes.
+    void SetAccelerationStructureStorage(bool storage) {
+        m_extraResourceFlags = storage ? rhi::RF_RaytracingAccelerationStructure : rhi::RF_None;
+    }
+    bool IsAccelerationStructureStorage() const { return (m_extraResourceFlags & rhi::RF_RaytracingAccelerationStructure) != 0u; }
+    // Residency priority of the buffer's own allocation, set when it materializes (alias placements take their pool's).
+    void SetResidencyPriority(rhi::ResidencyPriority priority) { m_residencyPriority = priority; }
+
     void SetUploadPolicyTag(org::runtime::UploadPolicyTag tag);
     // Sends this buffer's uploads to `service`, whatever upload service the upload policy configures (the frame
     // graph's). A buffer that a job graph owns uploads through that graph, whose upload pass lands them ahead of its
@@ -236,6 +245,8 @@ protected:
     std::optional<DescriptorRequirements> m_descriptorRequirements;
     bool m_allowAlias = false;
     std::optional<uint64_t> m_aliasingPoolID;
+    rhi::ResourceFlags m_extraResourceFlags = rhi::RF_None;
+    std::optional<rhi::ResidencyPriority> m_residencyPriority;
 
 private:
     // Two graphs that share a buffer may materialize it at the same time (RenderGraph::MaterializeUnmaterializedResources).

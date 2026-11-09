@@ -682,6 +682,62 @@ ExecutionHandle RenderGraph::LastExecution() const {
 	return m_compilerState && m_compilerState->persistent ? ExecutionHandle(m_compilerState->persistent->lastExecution) : ExecutionHandle{};
 }
 
+bool RenderGraph::HasPendingStructuralBuild() const {
+	return m_compilerState && m_compilerState->persistent && m_compilerState->persistent->pending;
+}
+
+// See State::retiredPins. Owner thread.
+void RenderGraph::ReleaseRetiredPins(std::span<const compiler::ExecutionTimelinePoint> reached) {
+	auto& state = *m_compilerState->persistent;
+	// An execution prepared but not submitted may bind what the selected publication no longer does.
+	if (state.retiredPins.empty() || state.prepared) return;
+	BT_ZONE_SCOPE("ORG.Persistent.ReleaseRetiredPins");
+	const auto live = [&](uint64_t id) { return id && state.entriesByResourceID.contains(id); };
+	std::optional<std::unordered_set<uint64_t>> bound;  // Concrete IDs the selected publication binds, built once.
+	const auto boundBySelected = [&](uint64_t id) {
+		if (!bound) {
+			bound.emplace();
+			if (const auto selected = state.program.Select()) {
+				for (uint32_t index = 0; index < selected->bindings.Size(); ++index)
+					if (const auto* binding = selected->bindings.TryAt(index); binding && binding->recording)
+						bound->insert(binding->recording->resourceID);
+			}
+		}
+		return bound->contains(id);
+	};
+	const auto completed = [&](const std::vector<compiler::ExecutionTimelinePoint>& after) {
+		for (const auto& point : after) {
+			const auto found = std::ranges::find(reached, point.timeline, &compiler::ExecutionTimelinePoint::timeline);
+			if (found == reached.end() || found->value < point.value) return false;
+		}
+		return true;
+	};
+	uint64_t released = 0;
+	std::erase_if(state.retiredPins, [&](State::RetiredPin& pin) {
+		// Declared again (a new slot): pinned as before.
+		if (live(pin.registryID) || live(pin.concreteID)) return true;
+		if (!pin.unbound) {
+			if (boundBySelected(pin.concreteID)) return false;
+			pin.unbound = true;
+			const auto submitted = state.timelines->Submitted();
+			pin.after.assign(submitted.begin(), submitted.end());
+		}
+		if (!completed(pin.after)) return false;
+		for (const auto id : {pin.registryID, pin.concreteID}) {
+			if (!id || resourcesByID.contains(id)) continue;
+			const auto found = m_transientFrameResourcesByID.find(id);
+			if (found == m_transientFrameResourcesByID.end()) continue;
+			if (const auto byName = m_transientFrameResourcesByName.find(found->second->GetName());
+				byName != m_transientFrameResourcesByName.end() && byName->second == found->second)
+				m_transientFrameResourcesByName.erase(byName);
+			m_transientFrameResourcesByID.erase(found);
+			++released;
+		}
+		return true;
+	});
+	if (released) basic_telemetry::AddCounter("ORG.Persistent.ReleasedRetiredPins", released);
+}
+
 void RenderGraph::RetirePersistentExecutions() {
 	auto& compiler = *m_compilerState;
 	if (!compiler.persistent || !compiler.persistent->timelines) return;
@@ -710,6 +766,7 @@ void RenderGraph::RetirePersistentExecutions() {
 		record->Finish(false);
 		return true;
 	});
+	ReleaseRetiredPins(reached);
 	auto retired = state.timelines->TakeRetiredGarbage();
 	if (!retired.empty()) {
 		auto garbage = std::make_shared<decltype(retired)>(std::move(retired));

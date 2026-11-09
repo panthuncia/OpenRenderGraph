@@ -49,6 +49,14 @@ uint32_t DirectEntry(State& state, persistent::GraphEditTransaction& edit, uint6
 	return slot.index;
 }
 
+// A direct slot is retiring: its resource's pin can go once nothing executing binds it (State::retiredPins).
+void NoteRetiredDirectResource(State& state, const State::SlotEntry& entry) {
+	if (!entry.resource || entry.swapchain) return;
+	auto* concrete = UnwrapDynamic(entry.resource);
+	state.retiredPins.push_back({entry.resource, entry.resource->GetGlobalResourceID(),
+		concrete ? concrete->GetGlobalResourceID() : 0u});
+}
+
 // While a structural build is pending, edits against the live publication are
 // logged for replay onto the result; slots the live publication does not have
 // yet are logged only.
@@ -409,6 +417,7 @@ void persistent_impl::InstallMainPass(RenderGraph& graph, State& state, persiste
 			std::erase(found->second, entryIndex);
 			if (found->second.empty()) state.entriesByResourceID.erase(found);
 		}
+		NoteRetiredDirectResource(state, entry);
 		entry = {};
 		entry.retired = true;
 		basic_telemetry::AddCounter("ORG.Persistent.RetiredDirectSlots");

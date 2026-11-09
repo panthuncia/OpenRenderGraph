@@ -868,6 +868,12 @@ private:
 
 	void AddResource(std::shared_ptr<Resource> resource, bool transition = false);
 	void TrackTransientFrameResource(const std::shared_ptr<Resource>& resource);
+public:
+	// A structural build is in flight or waiting to be installed: executions still run the publication before it.
+	bool HasPendingStructuralBuild() const;
+private:
+	// Lets go of the transient pins of resources no execution binds any more (PersistentInstanceState::retiredPins).
+	void ReleaseRetiredPins(std::span<const compiler::ExecutionTimelinePoint> reached);
 	void TrackTransientFrameResource(Resource* resource);
 	void ShutdownOwnedState();
 

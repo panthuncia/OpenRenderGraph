@@ -25,6 +25,20 @@
 // Tag for a contiguous mip-range [first..first+count)
 namespace org {
 
+// Acceleration structure storage built into and read in one pass (cluster builds that then move what they built).
+inline constexpr rhi::ResourceAccessType kAccelerationStructureBuildAccess = static_cast<rhi::ResourceAccessType>(
+    static_cast<uint64_t>(rhi::ResourceAccessType::RaytracingAccelerationStructureWrite)
+    | static_cast<uint64_t>(rhi::ResourceAccessType::RaytracingAccelerationStructureRead));
+// Inputs, outputs and scratch of acceleration structure operations: their access at the build stage, and at every shader
+// stage, since the same pass's shaders often write a build's inputs or read its outputs.
+inline constexpr rhi::ResourceSyncState kAccelerationStructureBuildStageSync = static_cast<rhi::ResourceSyncState>(
+    static_cast<uint32_t>(rhi::ResourceSyncState::BuildRaytracingAccelerationStructure) | static_cast<uint32_t>(rhi::ResourceSyncState::AllShading));
+// Layouts as requirements derive them (AccessToLayout), so a resolver's declared uses match its members' requirements.
+inline const ResourceState kAccelerationStructureBuildInputState{
+    rhi::ResourceAccessType::ShaderResource, AccessToLayout(rhi::ResourceAccessType::ShaderResource, true), kAccelerationStructureBuildStageSync};
+inline const ResourceState kAccelerationStructureBuildOutputState{
+    rhi::ResourceAccessType::UnorderedAccess, AccessToLayout(rhi::ResourceAccessType::UnorderedAccess, true), kAccelerationStructureBuildStageSync};
+
 struct Mip {
 	Mip(uint32_t first, uint32_t count) : first(first), count(count) {}
     uint32_t first, count;
@@ -856,7 +870,12 @@ private:
         using A = rhi::ResourceAccessType;
         // Symbolic names still need their registration/domain side effects, even
         // when the same resource was previously declared by pointer.
-        if (!alreadyDeclared || !detail::SharedPtrToResource<T>) switch (specification.access) {
+        if (specification.accelerationStructureBuildStage) {
+            if (specification.access == A::ShaderResource) { if (!alreadyDeclared || !detail::SharedPtrToResource<T>) addAccelerationStructureBuildInput(resource); }
+            else if (specification.access == A::UnorderedAccess) { if (!alreadyDeclared || !detail::SharedPtrToResource<T>) addAccelerationStructureBuildOutput(resource); }
+            else throw std::invalid_argument("Acceleration structure build stage uses are shader resources or unordered access");
+        }
+        else if (!alreadyDeclared || !detail::SharedPtrToResource<T>) switch (specification.access) {
         case A::ShaderResource: addShaderResource(resource); break;
         case A::UnorderedAccess: addUnorderedAccess(resource); break;
         case A::UnorderedAccessClear: addUnorderedAccessClear(resource); break;
@@ -869,6 +888,8 @@ private:
         case A::DepthStencilClear: addDepthStencilClear(resource); break;
         case A::CopySource: addCopySource(resource); break;
         case A::CopyDest: addCopyDest(resource); break;
+        case kAccelerationStructureBuildAccess: addAccelerationStructureBuild(resource); break;
+        case A::RaytracingAccelerationStructureRead: addAccelerationStructureRead(resource); break;
         case A::VertexBuffer: addVertexBuffer(resource); break;
         case A::IndexBuffer: addIndexBuffer(resource); break;
         case A::Present: addPresent(resource); break;
@@ -890,7 +911,8 @@ private:
                 if (view.mip >= concrete->GetMipLevels() || view.slice >= concrete->GetArraySize())
                     throw std::invalid_argument("Declared view outside resource bounds");
             const ResourceBindingToken binding{concrete->GetSchedulingResourceID(), range.resource.GetGlobalResourceID()};
-            const ResourceState state{specification.access, AccessToLayout(specification.access, true), RenderSyncFromAccess(specification.access)};
+            const ResourceState state{specification.access, AccessToLayout(specification.access, true),
+                specification.accelerationStructureBuildStage ? kAccelerationStructureBuildStageSync : RenderSyncFromAccess(specification.access)};
             auto& uses = resourceUses_->uses;
             auto found = std::find_if(uses.begin(), uses.end(), [&](const auto& use) {
                 return use.resolverIdentity == resolverIdentity && use.binding.registryResourceID == binding.registryResourceID && use.resource.range == range.range
@@ -1021,6 +1043,24 @@ public:
     template<class T> requires std::derived_from<T, IResourceResolver>
     DeclaredResourceUse CopyDestination(const T& resolver) {
         return DeclareResourceUse(static_cast<const IResourceResolver&>(resolver), {rhi::ResourceAccessType::CopyDest, {}});
+    }
+    // Acceleration structure storage (BufferBase::SetAccelerationStructureStorage): built into and read back within the pass,
+    // as cluster builds and moves do, or only read. Such a buffer takes no other access and has no views.
+    template<class T> DeclaredResourceUse AccelerationStructureBuild(const T& resource) {
+        return DeclareResourceUse(resource, {kAccelerationStructureBuildAccess, {}});
+    }
+    template<class T> DeclaredResourceUse AccelerationStructureRead(const T& resource) {
+        return DeclareResourceUse(resource, {rhi::ResourceAccessType::RaytracingAccelerationStructureRead, {}});
+    }
+    // Read by acceleration structure operations (argument and address arrays, counts, instance descriptions, geometry),
+    // and possibly by the pass's shaders: a shader resource at the build stage as well as the shading stages.
+    template<class T> DeclaredResourceUse AccelerationStructureBuildInput(const T& resource) {
+        return DeclareResourceUse(resource, {rhi::ResourceAccessType::ShaderResource, {}, true});
+    }
+    // Written by acceleration structure operations (destination address and size arrays, scratch), and possibly by the
+    // pass's shaders: unordered access at the build stage as well as the shading stages.
+    template<class T> DeclaredResourceUse AccelerationStructureBuildOutput(const T& resource) {
+        return DeclareResourceUse(resource, {rhi::ResourceAccessType::UnorderedAccess, {}, true});
     }
     template<class T> ResourceBindingToken CopyDestination(const T& resource) {
         return DeclareResourceUse(resource, {rhi::ResourceAccessType::CopyDest, {}}).Resource();
@@ -1243,7 +1283,11 @@ private:
 			|| !params.constantBuffers.empty()
 			|| !params.unorderedAccessViews.empty()
 			|| !params.unorderedAccessClearViews.empty()
-			|| !params.indirectArgumentBuffers.empty();
+			|| !params.indirectArgumentBuffers.empty()
+			|| !params.accelerationStructureBuilds.empty()
+			|| !params.accelerationStructureReads.empty()
+			|| !params.accelerationStructureBuildInputs.empty()
+			|| !params.accelerationStructureBuildOutputs.empty();
 		if (params.preferredQueueKind == QueueKind::Compute && hasGraphicsOnlyOperations)
 			throw std::invalid_argument("Pass declares graphics-only operations but prefers the compute queue");
 		if (params.preferredQueueKind == QueueKind::Copy && (hasGraphicsOnlyOperations || hasShaderOperations))
@@ -1442,6 +1486,42 @@ private:
         return *this;
     }
 
+    // Acceleration structure storage
+    template<typename T>
+        requires ResourceLike<T>
+    RenderPassBuilder& addAccelerationStructureBuild(T&& x) {
+        detail::TrackResolverDeclaration(graph, resolverSnapshots_, x,
+            ResourceState{kAccelerationStructureBuildAccess, AccessToLayout(kAccelerationStructureBuildAccess, true), RenderSyncFromAccess(kAccelerationStructureBuildAccess)});
+        detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
+        detail::AppendTrackedResource(graph, _declaredIds, params.accelerationStructureBuilds, std::forward<T>(x));
+        return *this;
+    }
+    template<typename T>
+        requires ResourceLike<T>
+    RenderPassBuilder& addAccelerationStructureRead(T&& x) {
+        constexpr auto read = rhi::ResourceAccessType::RaytracingAccelerationStructureRead;
+        detail::TrackResolverDeclaration(graph, resolverSnapshots_, x, ResourceState{read, AccessToLayout(read, true), RenderSyncFromAccess(read)});
+        detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
+        detail::AppendTrackedResource(graph, _declaredIds, params.accelerationStructureReads, std::forward<T>(x));
+        return *this;
+    }
+    template<typename T>
+        requires ResourceLike<T>
+    RenderPassBuilder& addAccelerationStructureBuildInput(T&& x) {
+        detail::TrackResolverDeclaration(graph, resolverSnapshots_, x, kAccelerationStructureBuildInputState);
+        detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
+        detail::AppendTrackedResource(graph, _declaredIds, params.accelerationStructureBuildInputs, std::forward<T>(x));
+        return *this;
+    }
+    template<typename T>
+        requires ResourceLike<T>
+    RenderPassBuilder& addAccelerationStructureBuildOutput(T&& x) {
+        detail::TrackResolverDeclaration(graph, resolverSnapshots_, x, kAccelerationStructureBuildOutputState);
+        detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
+        detail::AppendTrackedResource(graph, _declaredIds, params.accelerationStructureBuildOutputs, std::forward<T>(x));
+        return *this;
+    }
+
     // Copy destination
 	template<typename T>
         requires ResourceLike<T>
@@ -1606,6 +1686,23 @@ private:
 	}
 
     std::vector<ResourceRequirement> GatherResourceRequirements() const {
+        auto requirements = GatherAccessRequirements();
+        if (params.accelerationStructureBuildInputs.empty() && params.accelerationStructureBuildOutputs.empty()) return requirements;
+        // Build stage uses carry their own sync, so they are a resource's only use in the pass.
+        auto build = detail::BuildRequirements(
+            [](rhi::ResourceAccessType) { return kAccelerationStructureBuildStageSync; },
+            std::pair{ std::cref(params.accelerationStructureBuildInputs), rhi::ResourceAccessType::ShaderResource },
+            std::pair{ std::cref(params.accelerationStructureBuildOutputs), rhi::ResourceAccessType::UnorderedAccess });
+        for (const auto& requirement : build) {
+            const uint64_t id = requirement.resourceHandleAndRange.resource.GetGlobalResourceID();
+            if (std::any_of(requirements.begin(), requirements.end(), [&](const auto& other) { return other.resourceHandleAndRange.resource.GetGlobalResourceID() == id; }))
+                throw std::invalid_argument("A resource with an acceleration structure build stage use has no other use in the pass");
+        }
+        requirements.insert(requirements.end(), build.begin(), build.end());
+        return requirements;
+    }
+
+    std::vector<ResourceRequirement> GatherAccessRequirements() const {
         return detail::BuildRequirements(
             [](rhi::ResourceAccessType access) { return RenderSyncFromAccess(access); },
             std::pair{ std::cref(params.shaderResources), rhi::ResourceAccessType::ShaderResource },
@@ -1619,6 +1716,8 @@ private:
             std::pair{ std::cref(params.unorderedAccessClearViews), rhi::ResourceAccessType::UnorderedAccessClear },
             std::pair{ std::cref(params.copySources), rhi::ResourceAccessType::CopySource },
             std::pair{ std::cref(params.copyTargets), rhi::ResourceAccessType::CopyDest },
+            std::pair{ std::cref(params.accelerationStructureBuilds), kAccelerationStructureBuildAccess },
+            std::pair{ std::cref(params.accelerationStructureReads), rhi::ResourceAccessType::RaytracingAccelerationStructureRead },
             std::pair{ std::cref(params.indirectArgumentBuffers), rhi::ResourceAccessType::IndirectArgument },
             std::pair{ std::cref(params.indexBuffers), rhi::ResourceAccessType::IndexBuffer },
             std::pair{ std::cref(params.vertexBuffers), rhi::ResourceAccessType::VertexBuffer },

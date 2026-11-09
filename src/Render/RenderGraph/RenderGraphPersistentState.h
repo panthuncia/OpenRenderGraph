@@ -368,6 +368,18 @@ struct RenderGraph::PersistentInstanceState {
 	persistent::GraphProgram program;
 	std::vector<SlotEntry> entries;                                // Index == slot index.
 	std::unordered_map<uint64_t, std::vector<uint32_t>> entriesByResourceID;
+	// Resources whose last direct slot retired. A declared resource is pinned in the graph's transient maps
+	// (TrackTransientFrameResource), which keep it alive for the executions that bind it, raw slot pointers and publication
+	// snapshots being unowned. RetirePersistentExecutions lets the pin go once the selected publication no longer binds the
+	// resource and every execution submitted until then has completed (ReleaseRetiredPins). Without it a graph keeps
+	// everything it ever declared until it is rebuilt, and a job graph, which never is, keeps it for the session.
+	struct RetiredPin {
+		Resource* resource = nullptr;  // Kept alive by the pin itself.
+		uint64_t registryID = 0, concreteID = 0;
+		bool unbound = false;          // The selected publication no longer binds it; then `after` is set.
+		std::vector<compiler::ExecutionTimelinePoint> after;
+	};
+	std::vector<RetiredPin> retiredPins;
 	std::vector<MainPass> mainPasses;
 	std::vector<ResolverGroup> groups;
 	std::vector<size_t> uploadMasterIndices;                        // Passes with immediate-mode commands.
@@ -581,6 +593,9 @@ struct RenderGraph::PersistentSegmentRun {
 namespace persistent_impl {
 
 using State = RenderGraph::PersistentExecutionState;
+
+// Queues the pin of a retiring direct slot's resource for release (State::retiredPins). RenderGraphPersistent.cpp.
+void NoteRetiredDirectResource(State& state, const State::SlotEntry& entry);
 
 // Rotation state of an entry's current backing. Type classification is cached
 // per registry object; only dynamic wrappers are unwrapped every frame.

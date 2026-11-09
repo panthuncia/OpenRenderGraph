@@ -3,6 +3,7 @@
 #include "RenderGraphPersistentState.h"
 #include "Render/PipelineLibrary.h"
 #include <rhi_interop_dx12.h>
+#include <unordered_set>
 
 namespace org {
 
@@ -536,6 +537,7 @@ void RenderGraph::UpdatePersistentFrameInterruptingPasses(
 				std::erase(found->second, entryIndex);
 				if (found->second.empty()) state.entriesByResourceID.erase(found);
 			}
+			persistent_impl::NoteRetiredDirectResource(state, entry);
 			entry = {};
 			entry.retired = true;
 		}
@@ -686,6 +688,7 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		if (entry.resource && !entry.swapchain) entriesByConcrete[UnwrapDynamic(entry.resource)].push_back(index);
 	}
 	auto device = DeviceManager::GetInstance().GetDevice();
+	std::unordered_set<Resource*> notAliasable;
 	auto candidateFor = [&](uint32_t resourceIndex) -> uint32_t {
 		if (resourceIndex >= executable.resourceSlots.size()) return UINT32_MAX;
 		const auto slot = executable.resourceSlots[resourceIndex];
@@ -693,7 +696,10 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		const auto& entry = state.entries[slot.index];
 		if (!entry.resource || entry.swapchain) return UINT32_MAX;
 		auto* concrete = UnwrapDynamic(entry.resource);
-		if (!IsPersistentAliasCandidate(concrete)) return UINT32_MAX;
+		if (!IsPersistentAliasCandidate(concrete)) {
+			if (logging) notAliasable.insert(concrete);
+			return UINT32_MAX;
+		}
 		if (const auto found = candidateByConcrete.find(concrete); found != candidateByConcrete.end()) return found->second;
 		Candidate c;
 		c.concrete = concrete;
@@ -826,8 +832,30 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 			independentBytes += c.sizeBytes;
 			items.push_back({c.sizeBytes, c.alignment, c.firstUse, c.lastUse, c.concrete->GetGlobalResourceID()});
 		}
-		const auto packed = packingStrategy == AutoAliasPackingStrategy::BranchAndBound
+		auto packed = packingStrategy == AutoAliasPackingStrategy::BranchAndBound
 			? alias::PackBeamSearch(items) : alias::PackGreedySweepLine(items);
+		if (packingStrategy == AutoAliasPackingStrategy::GreedySweepLine && members.size() > 1) {
+			// The sweep places in this order, so among resources that start together the ones placed first take the low
+			// offsets. Placing the longest-lived first keeps the memory the others free as one range rather than split around
+			// a survivor: path tracing's culling frontiers, freed before the scene build, then hold its scratch and CLAS
+			// arena. Neither order wins everywhere, so the smaller heap is kept.
+			std::vector<size_t> order(members.size());
+			for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+			std::stable_sort(order.begin(), order.end(), [&](size_t l, size_t r) {
+				const auto& a = items[l]; const auto& b = items[r];
+				if (a.firstUse != b.firstUse) return a.firstUse < b.firstUse;
+				if (a.lastUse != b.lastUse) return a.lastUse > b.lastUse;
+				return a.sizeBytes > b.sizeBytes;
+			});
+			std::vector<alias::PackingItem> reordered(items.size());
+			for (size_t i = 0; i < order.size(); ++i) reordered[i] = items[order[i]];
+			const auto longestFirst = alias::PackGreedySweepLine(reordered);
+			if (longestFirst.heapEnd < packed.heapEnd) {
+				packed.heapEnd = longestFirst.heapEnd;
+				packed.alignment = longestFirst.alignment;
+				for (size_t i = 0; i < order.size(); ++i) packed.offsets[order[i]] = longestFirst.offsets[i];
+			}
+		}
 		for (size_t i = 0; i < members.size(); ++i) candidates[members[i]].offset = packed.offsets[i];
 		const uint64_t heapEnd = packed.heapEnd, poolAlignment = packed.alignment;
 		requiredBytes += heapEnd;
@@ -904,6 +932,8 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 				return DeviceManager::GetInstance().AllocateMemoryTracked(allocDesc, allocInfo, fresh, trackDesc);
 			}();
 			if (!rhi::IsOk(result)) throw std::runtime_error("Failed to allocate persistent alias pool memory");
+			// Frame targets and per-frame working buffers: over the OS budget, the costliest to leave in system memory.
+			DeviceManager::GetInstance().SetResidencyPriority(fresh, rhi::ResidencyPriorityHigh);
 			if (pool.allocation) DeletionManager::GetInstance().MarkForDelete(std::move(pool.allocation));
 			pool.allocation = std::move(fresh);
 			pool.capacityBytes = capacity;
@@ -1078,6 +1108,17 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 			independentBytes / (1024.0 * 1024.0), requiredBytes / (1024.0 * 1024.0), reservedBytes / (1024.0 * 1024.0), changed);
 	if (logging) for (const auto& c : candidates) if (c.exclusion)
 		spdlog::info("Persistent alias exclusion: '{}' reason='{}' bytes={}", c.concrete->GetName(), c.exclusion, c.sizeBytes);
+	// Graph resources never offered to the planner: not marked aliasable, or a manual pool with auto aliasing off.
+	if (logging) for (auto* concrete : notAliasable) {
+		rhi::ResourceDesc desc{};
+		if (auto* texture = dynamic_cast<PixelBuffer*>(concrete)) desc = alias::AliasTextureResourceDesc(texture->GetDescription());
+		else if (auto* buffer = dynamic_cast<BufferBase*>(concrete))
+			desc = alias::AliasBufferResourceDesc(buffer->GetBufferSize(), buffer->IsUnorderedAccessEnabled(), buffer->GetAccessType());
+		else continue;
+		rhi::ResourceAllocationInfo info{};
+		device.GetResourceAllocationInfo(&desc, 1, &info);
+		spdlog::info("Persistent alias exclusion: '{}' reason='not aliasable' bytes={}", concrete->GetName(), info.sizeInBytes);
+	}
 	if (logging) {
 		std::unordered_map<uint32_t, const std::string*> nameBySlot;
 		for (const auto& main : state.mainPasses) if (!main.retired) nameBySlot.emplace(main.id.index, &main.name);

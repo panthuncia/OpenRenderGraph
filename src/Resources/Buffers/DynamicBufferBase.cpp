@@ -493,6 +493,7 @@ bool BufferBase::TryGetRHIResourceDesc(rhi::ResourceDesc& outDesc) const {
 	if (m_unorderedAccess || (m_descriptorRequirements && m_descriptorRequirements->createUAV)) {
 		outDesc.resourceFlags |= rhi::ResourceFlags::RF_AllowUnorderedAccess;
 	}
+	outDesc.resourceFlags |= m_extraResourceFlags;
 	return m_bufferSize != 0;
 }
 
@@ -564,14 +565,20 @@ void BufferBase::Materialize(const MaterializeOptions* options) {
             m_bufferSize,
             GetGlobalResourceID(),
             options->aliasPlacement.value(),
-            m_unorderedAccess);
+            m_unorderedAccess,
+            nullptr,
+            m_extraResourceFlags);
     }
     else {
         m_dataBuffer = GpuBufferBacking::CreateUnique(
             m_accessType,
             m_bufferSize,
             GetGlobalResourceID(),
-            m_unorderedAccess);
+            m_unorderedAccess,
+            nullptr,
+            false,
+            m_extraResourceFlags);
+        if (m_residencyPriority) DeviceManager::GetInstance().SetResidencyPriority(m_dataBuffer->m_bufferAllocation, *m_residencyPriority);
     }
 
     ProbeVirtualShadowBufferStep(GetName(), "after backing create");

@@ -118,6 +118,8 @@ public:
 	// Publishes the finished rebuilds and activations into their handles; returns how many. Recordings retain what they bound,
 	// so the old payloads go when the last one retires. Called between frames by the host or graph.
 	size_t PublishRebuilt();
+	// Builds requested and not yet finished, queued ones included: a host waits for none before calling a scene settled.
+	uint32_t BuildsPending() const noexcept { return m_buildsPending.load(std::memory_order_acquire); }
 
 private:
 	struct DeviceInfo {
@@ -144,6 +146,7 @@ private:
 	std::shared_ptr<PipelineCompiler> m_compiler;
 	std::shared_ptr<runtime::ITaskScope> m_scope;
 	std::atomic<uint32_t> m_compilesInFlight{0};
+	std::atomic<uint32_t> m_buildsPending{0};
 
 	std::mutex m_mutex; // Declarations and device registration, and the build's start. Never held across a compile.
 	std::array<DeviceInfo, kMaxPipelineDevices> m_devices;

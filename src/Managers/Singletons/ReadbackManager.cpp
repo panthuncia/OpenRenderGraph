@@ -18,6 +18,8 @@ bool ReadbackManager::initialized = false;
 namespace {
 	constexpr size_t kReadbackBufferPoolMaxBuffers = 64;
 	constexpr uint64_t kReadbackBufferPoolMaxBytes = 256ull * 1024ull * 1024ull;
+	// Larger readbacks are one-offs (a texture's capture, a compressed texture's blocks): pooled, they would only sit there.
+	constexpr uint64_t kReadbackBufferPoolMaxBufferBytes = 16ull * 1024ull * 1024ull;
 }
 
 ReadbackManager::~ReadbackManager() {
@@ -181,7 +183,7 @@ void ReadbackManager::RecycleReadbackBuffer(std::shared_ptr<Resource>&& buffer) 
 
     BT_ZONE_VALUE(byteSize);
     std::lock_guard lock(m_readbackBufferPoolMutex);
-    if (m_readbackBufferPool.size() >= kReadbackBufferPoolMaxBuffers ||
+    if (byteSize > kReadbackBufferPoolMaxBufferBytes || m_readbackBufferPool.size() >= kReadbackBufferPoolMaxBuffers ||
         m_readbackBufferPoolBytes + byteSize > kReadbackBufferPoolMaxBytes) {
         BT_PLOT("Readback.BufferPoolDrops", int64_t{1});
         return;

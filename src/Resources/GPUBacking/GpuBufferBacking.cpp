@@ -19,7 +19,8 @@ GpuBufferBacking::GpuBufferBacking(
 	const bool unorderedAccess,
     const char* name,
     const BufferAliasPlacement* aliasPlacement,
-    const bool shared) {
+    const bool shared,
+    const rhi::ResourceFlags extraFlags) {
     m_accessType = accessType;
     if (aliasPlacement && !aliasPlacement->heap) throw std::invalid_argument("Missing alias heap owner");
 
@@ -33,6 +34,7 @@ GpuBufferBacking::GpuBufferBacking(
     if (unorderedAccess) {
         desc.resourceFlags |= rhi::ResourceFlags::RF_AllowUnorderedAccess;
     }
+    desc.resourceFlags |= extraFlags;
     desc.heapType = accessType;
 	if (shared) {
 		desc.heapFlags = rhi::HeapFlags::Shared;

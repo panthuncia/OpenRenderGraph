@@ -38,6 +38,11 @@ struct PassParameters {
 	std::vector<ResourceHandleAndRange> unorderedAccessClearViews;
 	std::vector<ResourceHandleAndRange> copyTargets;
 	std::vector<ResourceHandleAndRange> copySources;
+	std::vector<ResourceHandleAndRange> accelerationStructureBuilds; // Acceleration structure storage built into (and read)
+	std::vector<ResourceHandleAndRange> accelerationStructureReads;
+	// Read (inputs) or written (outputs, scratch) by acceleration structure operations, and possibly by shaders too.
+	std::vector<ResourceHandleAndRange> accelerationStructureBuildInputs;
+	std::vector<ResourceHandleAndRange> accelerationStructureBuildOutputs;
 	std::vector<ResourceHandleAndRange> indirectArgumentBuffers;
 	std::vector<ResourceHandleAndRange> indexBuffers;
 	std::vector<ResourceHandleAndRange> vertexBuffers;

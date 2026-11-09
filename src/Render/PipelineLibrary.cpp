@@ -322,6 +322,7 @@ void PipelineLibrary::StartBuild(PipelineLibraryEntryPtr entry, DeviceInstanceId
 		m_compilesInFlight.fetch_add(1, std::memory_order_acq_rel);
 		const auto finish = [this, shared](std::shared_ptr<PipelineStatePayload> payload, std::string error) {
 			(*shared)(std::move(payload), std::move(error));
+			m_buildsPending.fetch_sub(1, std::memory_order_acq_rel);
 			if (m_compilesInFlight.fetch_sub(1, std::memory_order_acq_rel) == 1) m_compilesInFlight.notify_all();
 		};
 		std::shared_ptr<std::atomic<bool>> completed = std::make_shared<std::atomic<bool>>(false);
@@ -348,6 +349,7 @@ void PipelineLibrary::StartBuild(PipelineLibraryEntryPtr entry, DeviceInstanceId
 		}
 	};
 	auto job = std::make_shared<decltype(run)>(std::move(run));
+	m_buildsPending.fetch_add(1, std::memory_order_acq_rel); // Until finish: from here, so a queued build counts.
 	if (!m_tasks || !m_tasks->Submit(m_scope, runtime::TaskPriority::Streaming, "ORG.Pipeline.Build", [job] { (*job)(); })) (*job)();
 }
 

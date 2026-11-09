@@ -34,6 +34,9 @@ struct DsvView {
 struct ResourceUseSpecification {
     rhi::ResourceAccessType access;
     std::vector<BindlessViewRequest> views;
+    // An acceleration structure build's input (shader resource) or output or scratch (unordered access): synchronized
+    // with build operations as well as shaders, which the access alone can't say.
+    bool accelerationStructureBuildStage = false;
 };
 
 inline bool SameView(BindlessViewRequest a, BindlessViewRequest b) {
