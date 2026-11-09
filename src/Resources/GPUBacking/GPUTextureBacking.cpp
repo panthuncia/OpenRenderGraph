@@ -14,7 +14,6 @@
 
 namespace org {
 
-namespace {
 uint16_t ResolveTextureMipLevels(const TextureDescription& desc)
 {
 	if (desc.imageDimensions.empty()) {
@@ -38,6 +37,48 @@ uint16_t ResolveTextureMipLevels(const TextureDescription& desc)
 
 	return 1;
 }
+
+rhi::ResourceDesc TextureResourceDesc(const TextureDescription& desc)
+{
+	uint32_t arraySize = desc.arraySize;
+	if (!desc.isArray && !desc.isCubemap) {
+		arraySize = 1;
+	}
+	auto width = desc.imageDimensions[0].width;
+	auto height = desc.imageDimensions[0].height;
+	if (desc.type == rhi::ResourceType::Texture1D) height = 1;
+	if (desc.padInternalResolution) { // Pad the width and height to the next power of two
+		width = std::max(1u, static_cast<unsigned int>(std::pow(2, std::ceil(std::log2(width)))));
+		height = std::max(1u, static_cast<unsigned int>(std::pow(2, std::ceil(std::log2(height)))));
+	}
+	rhi::ResourceDesc textureDesc{
+		.type = desc.type,
+		.queueSharing = desc.queueSharing,
+		.texture = {
+			.format = desc.format,
+			.width = static_cast<uint32_t>(width),
+			.height = static_cast<uint32_t>(height),
+			.depthOrLayers = static_cast<uint16_t>(desc.type == rhi::ResourceType::Texture3D ?
+				desc.depth : (desc.isCubemap ? 6 * arraySize : arraySize)),
+			.mipLevels = ResolveTextureMipLevels(desc),
+			.sampleCount = desc.sampleCount,
+			.initialLayout = desc.initialLayout,
+			.optimizedClear = nullptr
+		}
+	};
+	if (desc.isCubemap) {
+		textureDesc.resourceFlags |= rhi::ResourceFlags::RF_TextureCubeCompatible;
+	}
+	if (desc.hasRTV) {
+		textureDesc.resourceFlags |= rhi::ResourceFlags::RF_AllowRenderTarget;
+	}
+	if (desc.hasDSV) {
+		textureDesc.resourceFlags |= rhi::ResourceFlags::RF_AllowDepthStencil;
+	}
+	if (desc.hasUAV) {
+		textureDesc.resourceFlags |= rhi::ResourceFlags::RF_AllowUnorderedAccess;
+	}
+	return textureDesc;
 }
 
 GpuTextureBacking::GpuTextureBacking(CreateTag)
@@ -88,28 +129,6 @@ void GpuTextureBacking::initialize(const TextureDescription& desc,
     if (placement && !placement->heap) throw std::invalid_argument("Missing alias heap owner");
 	DescriptorHeapManager& rm = DescriptorHeapManager::GetInstance();
 
-	// Honor explicit subresource chains for file-backed textures and caches.
-	uint16_t mipLevels = ResolveTextureMipLevels(desc);
-
-	// Determine the array size
-	uint32_t arraySize = desc.arraySize;
-	if (!desc.isArray && !desc.isCubemap) {
-		arraySize = 1;
-	}
-
-	// Create the texture resource description
-	auto width = desc.imageDimensions[0].width;
-	auto height = desc.imageDimensions[0].height;
-	if (desc.type == rhi::ResourceType::Texture1D) height = 1;
-	if (desc.padInternalResolution) { // Pad the width and height to the next power of two
-		width = std::max(1u, static_cast<unsigned int>(std::pow(2, std::ceil(std::log2(width)))));
-		height = std::max(1u, static_cast<unsigned int>(std::pow(2, std::ceil(std::log2(height)))));
-	}
-
-	if (width > std::numeric_limits<uint32_t>().max() || height > std::numeric_limits<uint32_t>().max()) {
-		spdlog::error("Texture dimensions above uint32_max not implemented");
-	}
-
 	// Handle clear values for RTV and DSV
 	rhi::ClearValue* clearValue = nullptr;
 	rhi::ClearValue depthClearValue = {};
@@ -131,33 +150,8 @@ void GpuTextureBacking::initialize(const TextureDescription& desc,
 		clearValue = &colorClearValue;
 	}
 
-	rhi::ResourceDesc textureDesc{
-		.type = desc.type,
-		.queueSharing = desc.queueSharing,
-		.texture = {
-			.format = desc.format,
-			.width = static_cast<uint32_t>(width),
-			.height = static_cast<uint32_t>(height),
-			.depthOrLayers = static_cast<uint16_t>(desc.type == rhi::ResourceType::Texture3D ?
-				desc.depth : (desc.isCubemap ? 6 * arraySize : arraySize)),
-			.mipLevels = mipLevels,
-			.sampleCount = desc.sampleCount,
-			.initialLayout = desc.initialLayout,
-			.optimizedClear = clearValue
-		}
-	};
-	if (desc.isCubemap) {
-		textureDesc.resourceFlags |= rhi::ResourceFlags::RF_TextureCubeCompatible;
-	}
-	if (desc.hasRTV) {
-		textureDesc.resourceFlags |= rhi::ResourceFlags::RF_AllowRenderTarget;
-	}
-	if (desc.hasDSV) {
-		textureDesc.resourceFlags |= rhi::ResourceFlags::RF_AllowDepthStencil;
-	}
-	if (desc.hasUAV) {
-		textureDesc.resourceFlags |= rhi::ResourceFlags::RF_AllowUnorderedAccess;
-	}
+	rhi::ResourceDesc textureDesc = TextureResourceDesc(desc);
+	textureDesc.texture.optimizedClear = clearValue;
 	// Create the texture resource
 
 	AllocationTrackDesc trackDesc(static_cast<int>(owningResourceID));

@@ -13,35 +13,6 @@
 namespace org {
 
 namespace {
-uint16_t ResolveTextureMipLevels(const TextureDescription& desc)
-{
-    if (desc.imageDimensions.empty()) {
-        return 1;
-    }
-
-    const uint32_t totalArraySlices = desc.isCubemap
-        ? 6u * desc.arraySize
-        : (desc.isArray ? desc.arraySize : 1u);
-
-    if (totalArraySlices > 0 &&
-        desc.imageDimensions.size() > totalArraySlices &&
-        (desc.imageDimensions.size() % totalArraySlices) == 0)
-    {
-        return static_cast<uint16_t>(desc.imageDimensions.size() / totalArraySlices);
-    }
-
-    if (desc.generateMipMaps) {
-        uint32_t width = desc.imageDimensions[0].width;
-        uint32_t height = desc.imageDimensions[0].height;
-        if (desc.padInternalResolution) {
-            width = (std::max)(1u, static_cast<uint32_t>(std::pow(2, std::ceil(std::log2(width)))));
-            height = (std::max)(1u, static_cast<uint32_t>(std::pow(2, std::ceil(std::log2(height)))));
-        }
-        return org::util::CalculateMipLevels(width, height);
-    }
-
-    return 1;
-}
 
 DescriptorHeapManager::ViewRequirements::TextureViews BuildTextureViewRequirements(
     const TextureDescription& desc,
