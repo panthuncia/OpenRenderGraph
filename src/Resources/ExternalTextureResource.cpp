@@ -40,6 +40,8 @@ DescriptorHeapManager::ViewRequirements BuildExternalTextureViews(
 	views.mipLevels = mipLevels;
 	views.isCubemap = description.isCubemap;
 	views.isArray = description.isArray;
+	views.is3D = description.type == rhi::ResourceType::Texture3D;
+	views.depth = description.depth;
 	views.arraySize = description.arraySize;
 	views.totalArraySlices = arraySize;
 	views.baseFormat = description.format;

@@ -23,6 +23,8 @@ DescriptorHeapManager::ViewRequirements::TextureViews BuildTextureViewRequiremen
     texViews.mipLevels = mipLevels;
     texViews.isCubemap = desc.isCubemap;
     texViews.isArray = desc.isArray;
+    texViews.is3D = desc.type == rhi::ResourceType::Texture3D;
+    texViews.depth = desc.depth;
     texViews.arraySize = desc.arraySize;
     texViews.totalArraySlices = totalArraySlices;
 
