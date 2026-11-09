@@ -185,7 +185,15 @@ void ValidateAliasOrder(const compiler::Schedule& graph, const BindingTable& bin
                 before &= bool(ordered[u * count + v]);
                 after &= bool(ordered[v * count + u]);
             }
-            Require(before || after, "Alias placement has overlapping unordered lifetimes");
+            if (before || after) continue;
+            // Name the pair: their pool offsets match the alias plan's placement lines, and the
+            // users' prepared pass slots its rank lines.
+            std::string usersA, usersB;
+            for (auto u : users[a]) usersA += std::to_string(graph.structure->passes[u].preparedPassIndex) + " ";
+            for (auto v : users[b]) usersB += std::to_string(graph.structure->passes[v].preparedPassIndex) + " ";
+            throw std::invalid_argument("Alias placement has overlapping unordered lifetimes: offset " + std::to_string(x->aliasOffset) + " size "
+                + std::to_string(x->aliasSize) + " (pass slots " + usersA + ") and offset " + std::to_string(y->aliasOffset) + " size "
+                + std::to_string(y->aliasSize) + " (pass slots " + usersB + ")");
         }
     }
 }
