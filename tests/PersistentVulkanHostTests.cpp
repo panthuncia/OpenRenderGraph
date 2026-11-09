@@ -515,6 +515,7 @@ bool Matches(const HostBuffer& buffer, uint32_t value) {
 
 int TestFrameRetirement(rhi::Device device, rhi::Backend backend);
 int TestRebindingGpu(rhi::Device device, const std::shared_ptr<org::Runtime>& runtime);
+int TestPipelines(rhi::Device device);
 int TestContributors(rhi::Device device, const std::function<std::shared_ptr<org::Resource>()>& importOutput, const uint32_t* mapped,
 	const char* spirvPath,
 	rhi::PipelineLayoutHandle layout);
@@ -537,6 +538,8 @@ static int Run(int argc, char** argv) {
 	const bool contributor = argc > 1 && std::strcmp(argv[1], "contributor") == 0;
 	// "rebinding": slots that start or stop sharing a backing (RebindingGpuTests.cpp) instead of the graph scenario.
 	const bool rebinding = argc > 1 && std::strcmp(argv[1], "rebinding") == 0;
+	// "pipelines": input layouts, PipelinePermutations and GenerateMipsPass (PipelineVulkanTests.cpp) instead of the graph scenario.
+	const bool pipelines = argc > 1 && std::strcmp(argv[1], "pipelines") == 0;
 	// "arena": two epochs whose transient scratch buffers share the host's alias arena (the second's write on the compute queue
 	// when the family has a second queue), against two of their own.
 	const bool arena = argc > 1 && std::strcmp(argv[1], "arena") == 0;
@@ -588,7 +591,11 @@ static int Run(int argc, char** argv) {
 		rhi::DevicePtr device;
 		REQUIRE(rhi::vulkan::AdoptVulkanDevice(info, device) == rhi::Result::Ok, "AdoptVulkanDevice");
 		REQUIRE(TestFrameRetirement(device.Get(), rhi::Backend::Vulkan) == 0, "descriptor and frame retirement");
-		if (rebinding) {
+		if (pipelines) {
+			const int line = TestPipelines(device.Get());
+			if (line) std::printf("FAIL: pipelines (line %d)\n", line);
+			REQUIRE(line == 0, "pipelines");
+		} else if (rebinding) {
 			auto runtime = org::Runtime::Create({.device = device.Get(), .backend = rhi::Backend::Vulkan,
 				.tasks = std::make_shared<org::runtime::ThreadPoolTaskService>(2)});
 			const int line = TestRebindingGpu(device.Get(), runtime);
