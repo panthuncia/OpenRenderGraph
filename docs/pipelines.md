@@ -28,6 +28,13 @@ static void Record(const LuminanceHistogramBindings& bindings, const Frame& fram
   - An absent state is not given to the device, so the backend's default applies.
   - Topology is the exception. Backends disagree about an omitted one, so vertex pipelines always get one, `TriangleList`
     unless set.
+  - `inputLayout` gives a vertex pipeline vertex buffers (`PipelineInputLayout`: bindings, and attributes that own their
+    semantic names). Without one, the vertex shader pulls its own vertices.
+    - D3D12 matches attributes to shader inputs by semantic, and Vulkan by location. An unset location counts up in
+      declaration order, which is the order DXC gives the shader's inputs.
+    - The layout must allow the input assembler on D3D12. The library refuses a custom layout without
+      `rhi::PF_AllowInputAssembler` on every backend, so a description that builds on Vulkan also builds on D3D12.
+    - It is part of the description's hash, and the compile request carries it (`PipelineCompileRequest::inputLayout`).
 - `CommandSignatureDesc`: indirect arguments, the byte stride, the layout, and the Vulkan sequencing flags.
 - `PipelineLayoutRef`:
   - `StandardCompute` and `StandardGraphics` are the host's layouts.

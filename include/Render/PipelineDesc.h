@@ -58,6 +58,28 @@ struct ComputePipelineDesc {
 	PipelineLayoutRef layout = PipelineLayoutRef::StandardCompute();
 };
 
+/// @brief One vertex attribute of a pipeline's input layout. It owns its semantic name, unlike rhi::InputAttributeDesc.
+struct PipelineInputAttribute {
+	uint32_t binding = 0;                  ///< The vertex buffer slot it reads from.
+	uint32_t offset = rhi::APPEND_ALIGNED; ///< Byte offset in the vertex. APPEND_ALIGNED places it after the previous one.
+	rhi::Format format = rhi::Format::Unknown;
+	std::string semanticName;              ///< D3D12 matches the vertex shader's inputs by semantic, such as "TEXCOORD".
+	uint32_t semanticIndex = 0;
+	/// Vulkan matches inputs by location. Unset locations count up in declaration order. That is the order DXC gives the
+	/// vertex shader's inputs.
+	uint32_t location = 0xFFFFFFFFu;
+};
+
+/// @brief The vertex buffers a pipeline reads, and how their bytes map to vertex shader inputs.
+///
+/// A pipeline with an input layout draws from vertex buffers bound with CommandList::SetVertexBuffers. Without one, the
+/// vertex shader pulls its own vertices. On D3D12 the pipeline's layout must allow the input assembler. A custom layout
+/// needs rhi::PF_AllowInputAssembler. A standard layout is the host's choice.
+struct PipelineInputLayout {
+	std::vector<rhi::InputBindingDesc> bindings;
+	std::vector<PipelineInputAttribute> attributes;
+};
+
 // An absent state is not given to the device at all, which leaves that state to the backend's defaults. Topology is the
 // exception for vertex pipelines: backends disagree about an omitted one, so it is always given (TriangleList unless set).
 struct GraphicsPipelineDesc {
@@ -75,6 +97,8 @@ struct GraphicsPipelineDesc {
 	std::optional<rhi::Format> depthFormat;
 	std::optional<rhi::SampleDesc> sample;
 	std::optional<rhi::PrimitiveTopology> topology;
+	/// Vertex pipelines only. When absent, the vertex shader pulls its own vertices.
+	std::optional<PipelineInputLayout> inputLayout;
 };
 
 using PipelineDesc = std::variant<ComputePipelineDesc, GraphicsPipelineDesc>;
@@ -120,6 +144,9 @@ struct PipelineCompileRequest {
 	};
 	std::vector<Stage> stages;
 	std::vector<PipelineShaderDefine> defines;
+	/// The input layout the pipeline is created with, for a compiler whose output depends on it. For example, a Vulkan
+	/// compiler can give the vertex shader's inputs the locations that the layout names.
+	std::optional<PipelineInputLayout> inputLayout;
 	std::string name;
 	DeviceInstanceId device = DeviceInstanceId::Primary;
 	rhi::Backend backend = rhi::Backend::Null;

@@ -95,6 +95,18 @@ void HashOptional(ContentHasher& hash, const std::optional<T>& value, Each&& eac
 	if (value) each(*value);
 }
 
+void HashInputLayout(ContentHasher& hash, const PipelineInputLayout& layout) {
+	hash.Add(layout.bindings.size());
+	for (const auto& b : layout.bindings) {
+		hash.Add(b.binding); hash.Add(b.stride); hash.Add(b.rate); hash.Add(b.instanceStepRate);
+	}
+	hash.Add(layout.attributes.size());
+	for (const auto& a : layout.attributes) {
+		hash.Add(a.binding); hash.Add(a.offset); hash.Add(a.format);
+		hash.Add(a.semanticName); hash.Add(a.semanticIndex); hash.Add(a.location);
+	}
+}
+
 std::wstring DefaultTarget(rhi::ShaderStage stage) {
 	switch (stage) {
 	case rhi::ShaderStage::Compute: return L"cs_6_6";
@@ -127,6 +139,7 @@ PipelineCompileRequest MakeRequest(const PipelineLibraryEntry& entry, DeviceInst
 			if (desc.amplification) addStage(rhi::ShaderStage::Task, *desc.amplification);
 			if (desc.mesh) addStage(rhi::ShaderStage::Mesh, *desc.mesh);
 			if (desc.pixel) addStage(rhi::ShaderStage::Pixel, *desc.pixel);
+			request.inputLayout = desc.inputLayout;
 		}
 	}, entry.Desc());
 	for (const auto& define : overrides) {
@@ -181,6 +194,7 @@ uint64_t PipelineContentHash(const PipelineDesc& desc) {
 			HashOptional(hash, value.depthFormat, [&](rhi::Format f) { hash.Add(f); });
 			HashOptional(hash, value.sample, [&](const rhi::SampleDesc& s) { hash.Add(s.count); hash.Add(s.quality); });
 			HashOptional(hash, value.topology, [&](rhi::PrimitiveTopology t) { hash.Add(t); });
+			HashOptional(hash, value.inputLayout, [&](const PipelineInputLayout& l) { HashInputLayout(hash, l); });
 		}
 	}, desc);
 	return hash.Value();
@@ -404,6 +418,7 @@ std::shared_ptr<PipelineStatePayload> PipelineLibrary::CreatePipeline(const Pipe
 	rhi::SubobjDSV depthFormat;
 	rhi::SubobjSample sample;
 	rhi::SubobjPrimitiveTopology topology;
+	rhi::SubobjInputLayout inputLayout;
 	if (const auto* graphics = std::get_if<GraphicsPipelineDesc>(&entry.Desc())) {
 		if (graphics->raster) { raster.rs = *graphics->raster; items.push_back(rhi::Make(raster)); }
 		if (graphics->blend) { blend.bs = *graphics->blend; items.push_back(rhi::Make(blend)); }
@@ -414,6 +429,24 @@ std::shared_ptr<PipelineStatePayload> PipelineLibrary::CreatePipeline(const Pipe
 		if (graphics->topology || !graphics->mesh) {
 			topology.pt = graphics->topology.value_or(rhi::PrimitiveTopology::TriangleList);
 			items.push_back(rhi::Make(topology));
+		}
+		if (graphics->inputLayout) {
+			const auto& input = *graphics->inputLayout;
+			if (graphics->mesh) throw std::invalid_argument("A mesh pipeline cannot have an input layout");
+			// D3D12 rejects input layouts on a root signature without this flag. Checking it on every backend keeps a
+			// description that works on Vulkan from failing later on D3D12.
+			if (graphics->layout.kind == PipelineLayoutKind::Custom && graphics->layout.custom
+				&& !(graphics->layout.custom->flags & rhi::PF_AllowInputAssembler))
+				throw std::invalid_argument("A pipeline with an input layout needs a layout with PF_AllowInputAssembler");
+			// The semantic names point into the description, which the entry owns.
+			std::vector<rhi::InputAttributeDesc> attributes;
+			attributes.reserve(input.attributes.size());
+			for (const auto& a : input.attributes)
+				attributes.push_back({a.binding, a.offset, a.format, a.semanticName.empty() ? nullptr : a.semanticName.c_str(),
+					a.semanticIndex, a.location});
+			inputLayout.il = rhi::Finalize(rhi::InputLayoutDesc{input.bindings.data(), static_cast<uint32_t>(input.bindings.size()),
+				attributes.data(), static_cast<uint32_t>(attributes.size())});
+			items.push_back(rhi::Make(inputLayout));
 		}
 	}
 
