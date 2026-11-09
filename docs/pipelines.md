@@ -40,6 +40,8 @@ static void Record(const LuminanceHistogramBindings& bindings, const Frame& fram
   - `StandardCompute` and `StandardGraphics` are the host's layouts.
   - `Custom` holds a `PipelineLayoutSpec`. ORG creates it on each device that needs it, and pipelines with the same spec
     share it.
+  - `RootConstants(count, stages, name)` is a custom layout of one block of root constants (b0, root parameter 0). The
+    shader reaches its resources through the descriptor heap, with indices from those constants.
 
 A description's content hash is its identity (`PipelineContentHash`). `RenderPassBuilder::Pipeline` returns the same
 `PipelineState` for the same description while any declaration holds it. So a pass that is declared again gets the same
@@ -177,11 +179,28 @@ The graph publishes finished rebuilds when it prepares a frame, and a host may a
 live-pipeline tools (`br::diagnostics::RequestRecompile`, `RequestActivation`, and the global shader reload) route
 described pipelines through these calls.
 
+## Built-in passes with shaders
+
+`GenerateMipsPass` and `ResolveMultisamplePass` (`RenderPasses/`) declare compute pipelines whose shaders are in ORG's
+`shaders` folder. Their default paths start with `org::kBuiltinShaderPrefix` (`OpenRenderGraph/`). The host's compiler
+maps that prefix to the folder: `OPENRENDERGRAPH_SHADER_DIR` in a build that adds ORG as a subdirectory, or
+`share/OpenRenderGraph/shaders` in an install. Each pass's options name another path for a host that keeps them elsewhere.
+
+- `GenerateMipsPass` builds mips 1 to N-1 from mip 0, one dispatch per mip, for 2D textures, arrays and cube maps. Each
+  texel is the area-weighted average of the texels it covers, so odd sizes are exact. Both mips are read and written
+  through unordered-access views. An sRGB texture must have UNORM unordered-access views: the shader decodes, averages in
+  linear space, and encodes.
+- `ResolveMultisamplePass` averages each texel's samples into a single-sampled texture, as a hardware resolve does for
+  float, UNORM and SNORM formats. BasicRHI has no resolve command, so it is a compute pass.
+
 ## Not covered
 
-- Pipelines picked at `Prepare` time from a permutation cache. BasicRenderer's cluster rasterization, material
-  evaluation, deep visibility resolve and deferred shading still use `PSOManager`'s per-device-unaware caches, so those
-  passes run on the primary device only.
+- BasicRenderer's cluster rasterization, material evaluation, deep visibility resolve and deferred shading still use
+  `PSOManager`'s per-device-unaware caches, so those passes run on the primary device only. `PipelinePermutations` is
+  the replacement.
+- Multisampled textures with shader-resource views. `PixelBuffer` and `ExternalTextureResource` describe themselves as
+  single-sampled, and the descriptor manager creates no `Texture2DMS` views, so `ResolveMultisamplePass` has no source it
+  can read yet.
 - Ray tracing pipelines and work graphs.
 - Shaders that differ in behaviour between APIs, and resources that cannot be shared between devices (see
   `EnsurePersistentRepresentations`). Known open problems with peer passes are in SARP's `docs/open-defects.md`.

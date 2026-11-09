@@ -31,6 +31,10 @@ struct PipelineShaderSource {
 	std::wstring target;
 };
 
+/// @brief The built-in passes' shaders are in ORG's `shaders` folder, which CMake names OPENRENDERGRAPH_SHADER_DIR. Their
+/// default paths start with this prefix. The host's PipelineCompiler maps the prefix to that folder.
+inline constexpr const wchar_t* kBuiltinShaderPrefix = L"OpenRenderGraph/";
+
 enum class PipelineLayoutKind : uint8_t { StandardCompute, StandardGraphics, Custom };
 
 // A layout the library creates on each device a pipeline needs it, shared by every pipeline with the same content.
@@ -49,6 +53,14 @@ struct PipelineLayoutRef {
 	static PipelineLayoutRef StandardCompute() { return {PipelineLayoutKind::StandardCompute, std::nullopt}; }
 	static PipelineLayoutRef StandardGraphics() { return {PipelineLayoutKind::StandardGraphics, std::nullopt}; }
 	static PipelineLayoutRef Custom(PipelineLayoutSpec spec) { return {PipelineLayoutKind::Custom, std::move(spec)}; }
+	/// @brief A custom layout of one block of root constants, register b0 space0, at root parameter 0. Shaders reach their
+	/// resources through the descriptor heap, with the indices in those constants.
+	static PipelineLayoutRef RootConstants(uint32_t count, rhi::ShaderStage visibility, std::string name) {
+		PipelineLayoutSpec spec;
+		spec.pushConstants.push_back({.visibility = visibility, .num32BitValues = count});
+		spec.name = std::move(name);
+		return Custom(std::move(spec));
+	}
 };
 
 struct ComputePipelineDesc {

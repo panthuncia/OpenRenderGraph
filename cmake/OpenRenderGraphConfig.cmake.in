@@ -20,3 +20,4 @@ endif()
 include("${CMAKE_CURRENT_LIST_DIR}/OpenRenderGraphTargets.cmake")
 
 set_and_check(OpenRenderGraph_INCLUDE_DIR "@PACKAGE_CMAKE_INSTALL_INCLUDEDIR@")
+set_and_check(OPENRENDERGRAPH_SHADER_DIR "@PACKAGE_OPENRENDERGRAPH_INSTALL_SHADER_DIR@")

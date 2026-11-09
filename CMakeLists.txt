@@ -146,6 +146,8 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PassBuilders.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/FeatureDomainRegistry.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/RenderPasses/Base/RenderPass.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/RenderPasses/GenerateMipsPass.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/RenderPasses/ResolveMultisamplePass.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PassExecutionContext.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraph.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/GraphCompiler.cpp"
@@ -200,6 +202,9 @@ set_target_properties(OpenRenderGraph PROPERTIES
     CXX_STANDARD 23
     CXX_STANDARD_REQUIRED ON
 )
+
+# The folder of the built-in passes' shaders, for hosts that build ORG as a subdirectory.
+set(OPENRENDERGRAPH_SHADER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/shaders" CACHE INTERNAL "OpenRenderGraph built-in shaders")
 
 target_include_directories(OpenRenderGraph
     PUBLIC
@@ -566,6 +571,12 @@ install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/include/"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
 )
 
+# The built-in passes' shaders (GenerateMipsPass, ResolveMultisamplePass). A host's PipelineCompiler maps
+# org::kBuiltinShaderPrefix to this folder.
+install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/shaders/"
+    DESTINATION "${CMAKE_INSTALL_DATADIR}/OpenRenderGraph/shaders"
+)
+
 install(EXPORT OpenRenderGraphTargets
     FILE OpenRenderGraphTargets.cmake
     NAMESPACE OpenRenderGraph::
@@ -573,6 +584,7 @@ install(EXPORT OpenRenderGraphTargets
 )
 
 include(CMakePackageConfigHelpers)
+set(OPENRENDERGRAPH_INSTALL_SHADER_DIR "${CMAKE_INSTALL_DATADIR}/OpenRenderGraph/shaders")
 write_basic_package_version_file(
     "${CMAKE_CURRENT_BINARY_DIR}/OpenRenderGraphConfigVersion.cmake"
     VERSION ${PROJECT_VERSION}
@@ -582,7 +594,7 @@ write_basic_package_version_file(
 configure_package_config_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/OpenRenderGraphConfig.cmake.in"
     "${CMAKE_CURRENT_BINARY_DIR}/OpenRenderGraphConfig.cmake"
-    PATH_VARS CMAKE_INSTALL_INCLUDEDIR CMAKE_INSTALL_LIBDIR
+    PATH_VARS CMAKE_INSTALL_INCLUDEDIR CMAKE_INSTALL_LIBDIR OPENRENDERGRAPH_INSTALL_SHADER_DIR
     INSTALL_DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/OpenRenderGraph"
 )
 
