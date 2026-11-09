@@ -83,6 +83,50 @@ meanwhile, and nothing is locked. A recording retains the payload it bound until
 Command signatures are created on the device when the pass is lowered. Creating one compiles nothing, so this happens
 inline. `RecordingContext::ExecuteIndirect(const CommandSignatureState&, ...)` picks the pass's device's signature.
 
+## Pipelines picked while preparing a frame
+
+Some pipelines depend on the frame's work. An engine draw picks one of many shader permutations per draw, so its passes
+cannot declare every pipeline up front. Such a pass keeps an `org::PipelinePermutations` (`Render/PipelinePermutations.h`)
+and selects from it in `Prepare`:
+
+```cpp
+WaterBindings Declare(org::PassBuilder& builder) {
+    if (!m_permutations) m_permutations = std::make_shared<org::PipelinePermutations>(builder.Pipelines(), "Water");
+    ...
+}
+WaterFrame Prepare(const WaterBindings& bindings, const org::PassPrepareContext& preparation) {
+    WaterFrame frame;
+    for (const auto& draw : m_draws) {
+        const auto selection = m_permutations->Select(draw.permutationKey, preparation.backendInstance,
+            [&] { return DescribeWater(draw.permutationKey); });
+        if (!selection) continue; // Still building: this frame skips the draw.
+        frame.draws.push_back({draw, selection.payload});
+    }
+    return frame;
+}
+static void Record(const WaterBindings&, const WaterFrame& frame, org::PassRecordContext& recording) {
+    for (const auto& draw : frame.draws) {
+        recording.BindGraphicsPipeline(draw.pipeline);
+        ...
+    }
+}
+```
+
+- **The key** is the caller's, and must identify the description. A small key (a technique id and state bits) means a hit
+  builds no description. `describe` runs on a miss only.
+- **One library.** A miss acquires the description from the runtime's `PipelineLibrary`. So passes that describe the same
+  pipeline share one build, a declared pipeline and a selected one are the same entry, and reloading rebuilds selected
+  pipelines too (`LiveEntries`, `Rebuild`, `PublishRebuilt`).
+- **Not ready.** A miss starts the build for the pass's device and returns at once. The selection is empty until the build is
+  ready, and the pass skips that work. `PipelineMiss::Wait` blocks on the build instead, for work that must not be
+  skipped. `Prewarm` starts builds ahead of their first use. A failed build stays failed, and is logged once.
+- **Lifetime.** The set holds its entries until `Clear` or its destruction. The frame data holds the selected payload, and
+  binding it retains it in the recording until the recording's GPU work retires. So dropping a pipeline never frees one
+  that recorded work still uses.
+- **The graph does not wait** for selected pipelines, unlike declared ones. A pass that keeps recordings (`Revision`) must
+  name what it selected in its revision, or a kept recording would keep skipping a draw whose pipeline became ready.
+- `Select` is thread safe.
+
 ## Waits across devices
 
 A device waits only on its own timelines. A graph's queue timelines are shared between its devices (`QueueRegistry`'s bridge

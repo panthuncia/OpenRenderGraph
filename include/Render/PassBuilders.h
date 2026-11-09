@@ -219,6 +219,7 @@ inline ResourceIdentifierAndRange Subresources(const char* r,
 
 // If we have a ResourceIdentifierAndRange, ask the builder to resolve it into an actual ResourceAndRange:
 class RenderGraph;
+class PipelineLibrary;
 
 // The calls that pass builders make into the graph. RenderGraph defines them alongside itself, so declaring a pass
 // does not need RenderGraph.h.
@@ -232,6 +233,7 @@ struct BuilderGraphAccess {
     static void AddResource(RenderGraph* graph, std::shared_ptr<Resource> resource);
     static Resource* Resolve(RenderGraph* graph, ResourceRegistry::RegistryHandle handle);
     static std::shared_ptr<PipelineLibraryEntry> AcquirePipeline(RenderGraph* graph, PipelineDesc desc);
+    static std::shared_ptr<PipelineLibrary> Pipelines(RenderGraph* graph);
     static std::shared_ptr<CommandSignatureLibraryEntry> AcquireCommandSignature(RenderGraph* graph, CommandSignatureDesc desc);
     static void AddRenderPass(RenderGraph* graph, std::shared_ptr<RenderPass> pass, RenderPassParameters& resources, std::string name,
         std::vector<ResolverSnapshot> resolverSnapshots);
@@ -1124,6 +1126,9 @@ public:
 	PipelineState Pipeline(PipelineDesc desc);
 	// As Pipeline, for a command signature: hand the returned handle to RecordingContext::ExecuteIndirect.
 	CommandSignatureState CommandSignature(CommandSignatureDesc desc);
+	/// @brief The runtime's pipeline library. A pass whose pipelines depend on the frame keeps a PipelinePermutations over
+	/// it, and selects from that in Prepare (docs/pipelines.md).
+	std::shared_ptr<PipelineLibrary> Pipelines() const;
 
 	RenderPassBuilder& RequireBackend(rhi::Backend backend) & { m_backendAffinity = { BackendAffinityStrength::Required, backend }; return *this; }
 	RenderPassBuilder RequireBackend(rhi::Backend backend) && { m_backendAffinity = { BackendAffinityStrength::Required, backend }; return std::move(*this); }

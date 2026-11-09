@@ -53,6 +53,14 @@ std::shared_ptr<PipelineLibraryEntry> BuilderGraphAccess::AcquirePipeline(Render
     return graph->GetRuntime().Pipelines()->Acquire(std::move(desc));
 }
 
+std::shared_ptr<PipelineLibrary> BuilderGraphAccess::Pipelines(RenderGraph* graph) {
+    return graph->GetRuntime().Pipelines();
+}
+
+std::shared_ptr<PipelineLibrary> RenderPassBuilder::Pipelines() const {
+    return BuilderGraphAccess::Pipelines(graph);
+}
+
 PipelineState RenderPassBuilder::Pipeline(PipelineDesc desc) {
     auto entry = BuilderGraphAccess::AcquirePipeline(graph, std::move(desc));
     auto state = entry->State();

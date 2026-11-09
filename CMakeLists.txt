@@ -169,6 +169,7 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/ExecutionState.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/InteropAllocator.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PipelineLibrary.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PipelinePermutations.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/FrameRecording.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/ExternalEpochExecution.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/ExternalClient.cpp"
