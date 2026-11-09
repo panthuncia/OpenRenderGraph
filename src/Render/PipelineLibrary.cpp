@@ -176,6 +176,7 @@ uint64_t PipelineContentHash(const PipelineDesc& desc) {
 			HashOptional(hash, value.raster, [&](const rhi::RasterState& r) {
 				hash.Add(r.fill); hash.Add(r.cull); hash.Add(r.frontCCW); hash.Add(r.depthBias);
 				hash.Add(r.depthBiasClamp); hash.Add(r.slopeScaledDepthBias); hash.Add(r.conservative);
+				hash.Add(r.depthClip); hash.Add(r.viewportCount);
 			});
 			HashOptional(hash, value.blend, [&](const rhi::BlendState& b) {
 				hash.Add(b.alphaToCoverage); hash.Add(b.independentBlend); hash.Add(b.numAttachments);
@@ -183,9 +184,14 @@ uint64_t PipelineContentHash(const PipelineDesc& desc) {
 					hash.Add(a.enable); hash.Add(a.srcColor); hash.Add(a.dstColor); hash.Add(a.colorOp);
 					hash.Add(a.srcAlpha); hash.Add(a.dstAlpha); hash.Add(a.alphaOp); hash.Add(a.writeMask);
 				}
+				hash.Add(b.logicOpEnable); hash.Add(b.logicOp); hash.Add(b.sampleMask);
 			});
 			HashOptional(hash, value.depth, [&](const rhi::DepthStencilState& d) {
 				hash.Add(d.depthEnable); hash.Add(d.depthWrite); hash.Add(d.depthFunc);
+				hash.Add(d.stencilEnable); hash.Add(d.stencilReadMask); hash.Add(d.stencilWriteMask);
+				for (const auto& face : {d.front, d.back}) {
+					hash.Add(face.failOp); hash.Add(face.depthFailOp); hash.Add(face.passOp); hash.Add(face.func);
+				}
 			});
 			HashOptional(hash, value.renderTargets, [&](const rhi::RenderTargets& t) {
 				hash.Add(t.count);

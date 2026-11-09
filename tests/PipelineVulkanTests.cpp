@@ -166,6 +166,33 @@ int TestInputLayoutIdentity() {
 	return 0;
 }
 
+// Every fixed-function field is part of a description's identity.
+int TestStateIdentity() {
+	org::GraphicsPipelineDesc base;
+	base.raster = rhi::RasterState{};
+	base.blend = rhi::BlendState{};
+	base.depth = rhi::DepthStencilState{};
+	const auto differs = [&](auto&& change) {
+		auto changed = base;
+		change(changed);
+		return org::PipelineContentHash(base) != org::PipelineContentHash(changed);
+	};
+	CHECK(differs([](auto& d) { d.depth->stencilEnable = true; }));
+	CHECK(differs([](auto& d) { d.depth->stencilReadMask = 0x0F; }));
+	CHECK(differs([](auto& d) { d.depth->stencilWriteMask = 0x0F; }));
+	CHECK(differs([](auto& d) { d.depth->front.passOp = rhi::StencilOp::Replace; }));
+	CHECK(differs([](auto& d) { d.depth->back.failOp = rhi::StencilOp::Zero; }));
+	CHECK(differs([](auto& d) { d.depth->back.depthFailOp = rhi::StencilOp::IncrSat; }));
+	CHECK(differs([](auto& d) { d.depth->front.func = rhi::CompareOp::Equal; }));
+	CHECK(differs([](auto& d) { d.blend->attachments[0].srcColor = rhi::BlendFactor::BlendFactor; }));
+	CHECK(differs([](auto& d) { d.blend->logicOpEnable = true; }));
+	CHECK(differs([](auto& d) { d.blend->logicOp = rhi::LogicOp::Xor; }));
+	CHECK(differs([](auto& d) { d.blend->sampleMask = 0x1; }));
+	CHECK(differs([](auto& d) { d.raster->depthClip = false; }));
+	CHECK(differs([](auto& d) { d.raster->viewportCount = 2; }));
+	return 0;
+}
+
 int TestInputLayoutBuild(org::PipelineLibrary& library, SpirvCompiler& compiler) {
 	constexpr auto device = org::DeviceInstanceId::Primary;
 	auto entry = library.Acquire(VertexPipeline(true));
@@ -524,6 +551,7 @@ int TestGenerateMips(rhi::Device device, const std::shared_ptr<org::Runtime>& ru
 // Runs on the host's device (PersistentVulkanHostTests "pipelines"). Returns the failing line, or 0.
 int TestPipelines(rhi::Device device) {
 	if (const int line = TestInputLayoutIdentity()) return line;
+	if (const int line = TestStateIdentity()) return line;
 	int result = 0;
 	{
 		auto compiler = std::make_shared<SpirvCompiler>(device);
