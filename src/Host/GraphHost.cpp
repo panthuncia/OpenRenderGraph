@@ -512,6 +512,17 @@ GraphHost::GpuPoint GraphHost::SubmittedPoint() const {
 	return point;
 }
 
+void GraphHost::SealSubmitted() {
+	auto point = SubmittedPoint();
+	std::scoped_lock lock(m_sealedMutex);
+	m_sealed = std::move(point);
+}
+
+GraphHost::GpuPoint GraphHost::SealedPoint() const {
+	std::scoped_lock lock(m_sealedMutex);
+	return m_sealed;
+}
+
 bool GraphHost::BuildIfRequested() {
 	ReleaseRetiredGraphs(false);
 	return BuildDueInstances(true);

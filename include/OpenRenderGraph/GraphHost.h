@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -368,7 +369,17 @@ public:
 		}
 	};
 	// Submitting thread: the point every queue reaches once everything submitted so far (ExecuteFrame, SubmitEpoch) is done.
+	// Submitted to the host, not always to the device: a host that queues its submissions behind a stream (an external queue
+	// boundary) may hold them until its next flush. So a producer whose signal later work of the same frame waits for must not
+	// wait for this point: the work it names may be queued behind that later work, or flushed only once the frame ends. It
+	// waits for SealedPoint instead.
 	GpuPoint SubmittedPoint() const;
+	// Submitting thread, at a frame boundary: everything submitted so far is on the device's queues (the host flushed its stream).
+	// Seals SubmittedPoint's current value as SealedPoint.
+	void SealSubmitted();
+	// Any thread: the point SealSubmitted last captured (none before the first). It names only work already on the device, and
+	// none of the current frame's, so a mid-frame producer may wait for it whatever the frame's later work waits for.
+	GpuPoint SealedPoint() const;
 
 	// The frame-wait timeline (RenderGraph::SetFrameWaitTimeline): a host producer of per-frame values signals it once per frame,
 	// after the values it wrote for that frame, and every batch submitted from then on waits for SetFrameWaitValue's value. Set
@@ -471,6 +482,8 @@ private:
 	uint64_t m_lastHostFrame = 0;
 	std::shared_ptr<rhi::TimelinePtr> m_frameWaitTimeline;  // SetFrameWaitTimeline
 	uint64_t m_frameWaitValue = 0;
+	mutable std::mutex m_sealedMutex;  // SealedPoint is read on other threads
+	GpuPoint m_sealed;
 	uint64_t m_buildGeneration = 0;
 	struct Async;
 	std::unique_ptr<Async> m_async;

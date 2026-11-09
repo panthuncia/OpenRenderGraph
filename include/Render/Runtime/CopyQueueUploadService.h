@@ -112,7 +112,10 @@ public:
     // Returns null when the service is not initialized or the arguments are invalid.
     std::shared_ptr<TrackedUploadTicket> QueueSignal(std::shared_ptr<rhi::TimelinePtr> timeline, uint64_t value);
     // Callable from any thread. The batch that holds the next uploads the calling thread queues waits on the GPU for
-    // each timeline to reach its value (IUploadService::QueueStreamingWait). Returns false when there is no queue.
+    // each timeline to reach its value (IUploadService::QueueStreamingWait, whose rule on sealed points applies). The submitter
+    // waits for the points on its own thread before it submits the batch, outside the RHI's submission, so no lock is held while
+    // the GPU works. Batches go to the queue in order, so a wait that is never reached also holds every later entry. Returns false
+    // when there is no queue.
     bool QueueWait(std::span<const std::pair<std::shared_ptr<rhi::TimelinePtr>, uint64_t>> points);
 
     // Blocks until nothing is queued or in flight (tests and shutdown).

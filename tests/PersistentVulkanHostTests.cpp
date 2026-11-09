@@ -1419,6 +1419,26 @@ static int Run(int argc, char** argv) {
 				REQUIRE(host.SubmittedPoint().Wait(5000) && Matches(second, value), "a frame without a wait");
 				std::printf("frame wait: %s\n", dedicated ? "signalled from the dedicated uploader" : "signalled from another queue");
 			}
+
+			// The sealed point: empty until the host seals, then what was submitted at the seal. Later submissions leave it as it was.
+			{
+				const auto values = [](const org::GraphHost::GpuPoint& a_point) {
+					std::vector<std::pair<const void*, uint64_t>> out;
+					for (const auto& [timeline, at] : a_point.points) out.emplace_back(timeline.get(), at);
+					return out;
+				};
+				REQUIRE(host.SealedPoint().points.empty(), "nothing sealed before the first seal");
+				host.SealSubmitted();
+				const auto sealed = values(host.SealedPoint());
+				REQUIRE(!sealed.empty() && sealed == values(host.SubmittedPoint()), "the seal takes what was submitted");
+				value = 8200u;
+				if (async) host.SubmitEpoch(0, upload);
+				else host.ExecuteFrame(nullptr, upload);
+				REQUIRE(values(host.SealedPoint()) == sealed && values(host.SubmittedPoint()) != sealed, "a later submission is not sealed");
+				REQUIRE(host.SubmittedPoint().Wait(5000) && Matches(second, value), "the frame after the seal");
+				host.SealSubmitted();
+				REQUIRE(values(host.SealedPoint()) == values(host.SubmittedPoint()), "the next seal takes it");
+			}
 			if (async) host.SetAsyncEpochs({});
 			}
 			host.DestroyGraph();
