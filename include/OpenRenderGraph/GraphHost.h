@@ -142,6 +142,44 @@ public:
 	// A rebuild was requested and has not been built (with explicit builds, until BuildIfRequested).
 	bool RebuildRequested() const noexcept;
 
+	// Failure isolation. A failure while one epoch's graph is built or prepared stays with that epoch: the host's thread keeps
+	// running, and every other epoch keeps its graph and its tickets. Only host-wide errors (a failed GPU completion wait, a lost
+	// device) still end the host's thread.
+	/**
+	 * @brief One epoch's graph failed to build or to prepare.
+	 *
+	 * A failed build keeps the graph the epoch had (keptGraph), which runs as before; with none, the epoch runs nothing. A failed
+	 * preparation (a pass's Prepare, a bindless view it resolves, its recording) leaves the epoch running nothing. Either way the
+	 * epoch is not built again until a rebuild is requested (RequestRebuild), and a build that succeeds clears its failure.
+	 */
+	struct EpochFailure {
+		uint32_t epoch = UINT32_MAX;  // persistent::AllEpochs without epochs
+		uint64_t buildGeneration = 0;  // the epoch's build that failed to prepare, or the build kept when a build failed
+		bool keptGraph = false;  // a build failed and the epoch still runs its previous graph
+		std::string error;
+	};
+	/** @brief Called on the owner thread by PollEpochFailures, once per failure. It must not throw. */
+	using EpochFailedCallback = std::function<void(const EpochFailure&)>;
+	/** @brief The owner's handler of epoch failures (PollEpochFailures calls it). Owner thread. */
+	void SetEpochFailedCallback(EpochFailedCallback callback) { m_epochFailed = std::move(callback); }
+	/**
+	 * @brief Owner thread: hands the failures reported since the last call to the callback, in the order they happened. A failure
+	 * of a build the epoch has since replaced is dropped. Call it where nothing of the failed epoch's is in progress, for example
+	 * before deciding what a frame's epochs run. Returns how many were handed over.
+	 */
+	size_t PollEpochFailures();
+	/** @brief Owner thread: whether the epoch runs nothing because its graph failed (until a rebuild of it succeeds). */
+	bool EpochFailed(uint32_t epoch) const noexcept;
+	/**
+	 * @brief What ExecuteFrame and SubmitEpoch throw for an epoch that runs nothing (EpochFailed). Nothing was submitted, and the
+	 * host is fine: the caller skips the epoch, and its owner learns why through PollEpochFailures.
+	 */
+	struct EpochFailedError : std::runtime_error {
+		EpochFailedError(uint32_t a_epoch, const std::string& a_error)
+			: std::runtime_error("epoch " + std::to_string(a_epoch) + "'s graph failed: " + a_error), epoch(a_epoch) {}
+		uint32_t epoch = UINT32_MAX;
+	};
+
 	// Runs after any rebuild and before the frame is prepared, with the graphs' upload
 	// and descriptor services active: the place to queue this frame's uploads
 	// (BUFFER_UPLOAD) into graph resources.
@@ -166,6 +204,8 @@ public:
 	// Builds if needed, then prepares and submits one frame. hostData is visible to
 	// passes through PassPrepareContext::preparationData for this frame only.
 	// With an epoch, that epoch's graph runs (its passes and the untagged ones); without, the first graph.
+	// Throws EpochFailedError when the epoch's graph failed to build or prepare (now or before): it is then marked failed and
+	// reported (PollEpochFailures), and the other epochs run on.
 	void ExecuteFrame(const IHostExecutionData* hostData = nullptr, const FrameCallback& beforePrepare = {},
 		uint32_t epoch = UINT32_MAX, std::shared_ptr<const void> resourceOwner = {});  // persistent::AllEpochs
 
@@ -246,7 +286,7 @@ public:
 	// CurrentFrameSlot() the ticket's slot (write latches and queue uploads there); has the ticket prepared again (and waits)
 	// if a pass would now prepare differently; records the uploads queued since the last submission; and
 	// hands both to the queue - timeline values are assigned here, in submission order. Throws when the
-	// graph failed (on either thread).
+	// graph failed (on either thread): EpochFailedError when only this epoch's did, and nothing was submitted.
 	// resourceOwner pins immutable descriptors/imports named by this execution
 	// until all accepted queue submissions complete, even without slot reuse.
 	// recording: a revision-driven epoch's (RequestEpochRecording), whose recording for the ticket's slot is submitted; it must
@@ -420,6 +460,9 @@ private:
 		std::unique_ptr<RenderGraph> graph;
 		bool rebuildRequested = true;
 		uint64_t buildGeneration = 0;  // BuildGeneration(epoch)
+		// Its graph failed to build (with none to keep) or to prepare: it runs nothing until a build of it succeeds (EpochFailed).
+		bool failed = false;
+		std::string failure;
 	};
 	// A graph an epoch's rebuild replaced, released once the work it submitted is done.
 	struct RetiredGraph {
@@ -432,14 +475,23 @@ private:
 	RenderGraph* AnyGraph() const noexcept;
 	// The epoch's graph is to be built before an execution or submission: there is none, or a rebuild was requested without
 	// explicit builds.
+	// An epoch whose build failed waits for a rebuild request: it is not built again every frame.
 	bool BuildDue(size_t index) const noexcept {
 		const auto& instance = m_instances[index];
-		return !instance.graph || (instance.rebuildRequested && !m_explicitBuilds);
+		return (!instance.graph && !instance.failed) || (instance.rebuildRequested && !m_explicitBuilds);
 	}
 	bool AnyBuildDue() const noexcept;
 	// Owner thread, the instance not in the host's thread's hands (async epochs stopped, or the host's thread holding): builds its graph
-	// anew. The one it replaces goes to the retired graphs (wait: or is released here, after its own slots' work).
-	void BuildInstance(size_t index, bool wait);
+	// anew. The one it replaces goes to the retired graphs once the new one is built. False when the build failed: the old graph is
+	// kept (or there is none), the failure is reported (PollEpochFailures), and nothing is thrown. Host-wide errors still throw.
+	bool BuildInstance(size_t index);
+	// Owner thread: whether the instance runs nothing (its own failure, or its async epoch's).
+	bool InstanceFailed(size_t index) const noexcept;
+	// Any thread: queues a failure for PollEpochFailures.
+	void ReportEpochFailure(EpochFailure failure);
+	struct Async;
+	// Host thread: the async epoch's preparation failed. It runs nothing until its instance is built again.
+	void FailAsyncEpoch(Async& state, uint32_t epochIndex, std::string error);
 	// Owner thread: builds every instance BuildDue names (all: every one requested, explicit builds or not).
 	bool BuildDueInstances(bool all);
 	// Releases the retired graphs whose work is done (all: waits for the rest).
@@ -485,8 +537,11 @@ private:
 	mutable std::mutex m_sealedMutex;  // SealedPoint is read on other threads
 	GpuPoint m_sealed;
 	uint64_t m_buildGeneration = 0;
-	struct Async;
 	std::unique_ptr<Async> m_async;
+	EpochFailedCallback m_epochFailed;
+	// Failures not handed to the callback yet: the host's thread and the owner thread both report them.
+	std::mutex m_failureMutex;
+	std::vector<EpochFailure> m_failures;
 	// Recording requests (RequestEpochRecording) and the wake of the host's thread: the host's lifetime, never a build's, so a
 	// requester on any thread never touches the async state a build replaces.
 	struct RecordingQueue;

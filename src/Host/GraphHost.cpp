@@ -112,6 +112,11 @@ struct GraphHost::Async {
 	bool holding = false;  // render thread: inside a hold
 	std::atomic<bool> failed{false};
 	std::string error;  // written before failed is set
+	// Per epoch index: its preparation failed (FailAsyncEpoch). Set by the host's thread. Cleared by the owner thread when a build of
+	// the epoch's instance succeeds, while the host's thread holds still (RebuildAsyncInstances). The error is written before the
+	// flag is set.
+	std::unique_ptr<std::atomic<bool>[]> epochFailed;
+	std::vector<std::string> epochErrors;
 	std::thread thread;
 	// Advanced by NoteNewVersions. A ticket prepared under an older value may hold a version that is not the newest: it is not
 	// current (Current).
@@ -205,6 +210,8 @@ struct GraphHost::Async {
 			const auto seen = ticketWake.load(std::memory_order_acquire);
 			if (auto ticket = cells[index].exchange(nullptr, std::memory_order_acq_rel)) return ticket;
 			ThrowIfFailed();
+			// Only this epoch failed: no ticket is coming until its graph is built again.
+			if (epochFailed[index].load(std::memory_order_acquire)) throw EpochFailedError(epochs[index], epochErrors[index]);
 			ticketWake.wait(seen, std::memory_order_acquire);
 		}
 	}
@@ -323,6 +330,48 @@ bool GraphHost::RebuildRequested() const noexcept {
 	return std::ranges::any_of(m_instances, [](const Instance& instance) { return instance.rebuildRequested; });
 }
 
+bool GraphHost::InstanceFailed(size_t index) const noexcept {
+	if (m_instances[index].failed) return true;
+	if (!m_async) return false;
+	// The host's thread may know first: its preparation failed and the owner has not polled yet.
+	for (uint32_t i = 0; i < m_async->epochs.size(); ++i)
+		if (m_async->instanceOf[i] == index && m_async->epochFailed[i].load(std::memory_order_acquire)) return true;
+	return false;
+}
+
+bool GraphHost::EpochFailed(uint32_t epoch) const noexcept {
+	const auto index = InstanceOf(epoch);
+	return index != kNoInstance && InstanceFailed(index);
+}
+
+void GraphHost::ReportEpochFailure(EpochFailure failure) {
+	std::scoped_lock lock(m_failureMutex);
+	m_failures.push_back(std::move(failure));
+}
+
+size_t GraphHost::PollEpochFailures() {
+	std::vector<EpochFailure> failures;
+	{
+		std::scoped_lock lock(m_failureMutex);
+		failures.swap(m_failures);
+	}
+	size_t delivered = 0;
+	for (auto& failure : failures) {
+		const auto index = InstanceOf(failure.epoch);
+		if (index == kNoInstance) continue;
+		auto& instance = m_instances[index];
+		// A build since replaced the graph that failed: the failure is no longer the epoch's.
+		if (failure.buildGeneration != instance.buildGeneration) continue;
+		if (!failure.keptGraph) {
+			instance.failed = true;
+			instance.failure = failure.error;
+		}
+		++delivered;
+		if (m_epochFailed) m_epochFailed(failure);
+	}
+	return delivered;
+}
+
 bool GraphHost::AnyBuildDue() const noexcept {
 	for (size_t index = 0; index < m_instances.size(); ++index)
 		if (BuildDue(index)) return true;
@@ -366,6 +415,9 @@ void GraphHost::DestroyGraph() {
 	m_slotSubmitted.clear();
 	m_externalRetired.clear();
 	for (auto& instance : m_instances) {
+		// The next build starts afresh: a failure is the old graphs'.
+		instance.failed = false;
+		instance.failure.clear();
 		if (!instance.graph) continue;
 		instance.graph->ShutdownExtensions();
 		instance.graph->ShutdownTaskWorkers();
@@ -412,62 +464,97 @@ void GraphHost::EnsureTimelines() {
 	}
 }
 
-void GraphHost::BuildInstance(size_t index, bool wait) {
+bool GraphHost::BuildInstance(size_t index) {
 	BT_ZONE_SCOPE("ORG.Host.Build");
 	const auto begin = std::chrono::steady_clock::now();
+	// Host-wide: without the timelines no epoch can run.
 	EnsureTimelines();
 	auto& instance = m_instances[index];
 	const bool replacing = static_cast<bool>(instance.graph);
+	const auto epochName = instance.epoch == persistent::AllEpochs ? std::string("(all)") : std::to_string(instance.epoch);
 	// The graph it replaces: its own submitted work is what every queue has been given so far (the timelines are shared), taken
 	// while it is still listed. It is released once that is done, the other epochs running meanwhile.
 	auto done = instance.graph ? SubmittedPoint() : GpuPoint{};
+	// The new graph is built before the old one stops: a build that fails leaves the epoch its old graph.
+	std::unique_ptr<RenderGraph> graph;
+	std::string error;
+	try {
+		graph = std::make_unique<RenderGraph>(m_desc.runtime);
+		graph->SetSharedQueueTimelines(m_timelines);
+		graph->SetPassEpochFilter(instance.epoch);
+		graph->RegisterExtension(std::make_unique<HostUploadExtension>(graph->GetUploadService()), "org.host.io");
+		for (const auto& entry : m_extensions)
+			if (auto extension = entry.factory()) graph->RegisterExtension(std::move(extension), entry.id);
+		runtime::ScopedActiveGraphServices services(graph->GetUploadService(), graph->GetDescriptorService());
+		graph->PrepareExtensionsForBuild();
+		// The graph's memory snapshots (its VRAM dump, a host's memory UI): ORG's tracking world, as the contributor host's.
+		graph->GetMemorySnapshotProvider().SetProvider(memory::CreateECSMemorySnapshotProvider());
+		graph->CompileStructural();
+		if (instance.epoch != persistent::AllEpochs) graph->SetPersistentEpochOrder({instance.epoch});
+		graph->SetPersistentClosedExecutions(m_desc.closedExecutions);
+		graph->SetPersistentExternalHomeStates(m_desc.externalHomeStates);
+		if (m_desc.sharedAliasArena) {
+			if (!m_aliasArena) m_aliasArena = PersistentAliasArena::Create();
+			graph->SetPersistentAliasArena(m_aliasArena);
+		}
+		graph->SetExternalPersistentEpochs(m_externalEpochs);
+		graph->SetPersistentRecordingReuse(m_desc.reuseRecordings);
+		graph->SetPersistentRecordingTimestamps(m_recordingTimestamps.load(std::memory_order_acquire));
+		graph->SetScheduleTraceEnabled(m_scheduleTrace.load(std::memory_order_acquire));
+		{
+			auto boundary = m_desc.queueBoundary;
+			if (m_boundaryOverridden.load(std::memory_order_acquire)) {
+				boundary.entry = m_boundaryEntry.load(std::memory_order_acquire);
+				boundary.exit = m_boundaryExit.load(std::memory_order_acquire);
+			}
+			graph->SetExternalQueueBoundary(boundary);
+		}
+		graph->SetFrameWaitTimeline(m_frameWaitTimeline);
+		graph->Setup();
+		graph->SetGpuPassRangeCallbacks(m_gpuPassRangeBegin, m_gpuPassRangeEnd);
+	} catch (const std::exception& e) {
+		error = e.what();
+	} catch (...) {
+		error = "unknown exception";
+	}
+	if (!error.empty() || !graph) {
+		if (error.empty()) error = "the graph could not be made";
+		// The half-built graph goes now: nothing was submitted with it.
+		if (graph) {
+			try {
+				graph->ShutdownExtensions();
+				graph->ShutdownTaskWorkers();
+			} catch (...) {
+			}
+			graph.reset();
+		}
+		// Not built again until a rebuild is requested: a broken declaration would fail every frame.
+		instance.rebuildRequested = false;
+		const bool kept = static_cast<bool>(instance.graph) && !InstanceFailed(index);
+		if (!kept) {
+			instance.failed = true;
+			instance.failure = error;
+		}
+		spdlog::error("GraphHost: epoch {}'s graph failed to build ({}); the other epochs keep running: {}", epochName,
+			kept ? "its previous graph is kept" : "it runs nothing", error);
+		ReportEpochFailure({instance.epoch, instance.buildGeneration, kept, std::move(error)});
+		return false;
+	}
 	if (auto old = std::move(instance.graph)) {
 		old->StopFrameProduction();
 		m_retiredGraphs.push_back({std::move(old), std::move(done)});
 		++m_asyncStats.rebuilds;
-		if (wait) ReleaseRetiredGraphs(true);
 	}
-	auto graph = std::make_unique<RenderGraph>(m_desc.runtime);
-	graph->SetSharedQueueTimelines(m_timelines);
-	graph->SetPassEpochFilter(instance.epoch);
-	graph->RegisterExtension(std::make_unique<HostUploadExtension>(graph->GetUploadService()), "org.host.io");
-	for (const auto& entry : m_extensions)
-		if (auto extension = entry.factory()) graph->RegisterExtension(std::move(extension), entry.id);
-	runtime::ScopedActiveGraphServices services(graph->GetUploadService(), graph->GetDescriptorService());
-	graph->PrepareExtensionsForBuild();
-	// The graph's memory snapshots (its VRAM dump, a host's memory UI): ORG's tracking world, as the contributor host's.
-	graph->GetMemorySnapshotProvider().SetProvider(memory::CreateECSMemorySnapshotProvider());
-	graph->CompileStructural();
-	if (instance.epoch != persistent::AllEpochs) graph->SetPersistentEpochOrder({instance.epoch});
-	graph->SetPersistentClosedExecutions(m_desc.closedExecutions);
-	graph->SetPersistentExternalHomeStates(m_desc.externalHomeStates);
-	if (m_desc.sharedAliasArena) {
-		if (!m_aliasArena) m_aliasArena = PersistentAliasArena::Create();
-		graph->SetPersistentAliasArena(m_aliasArena);
-	}
-	graph->SetExternalPersistentEpochs(m_externalEpochs);
-	graph->SetPersistentRecordingReuse(m_desc.reuseRecordings);
-	graph->SetPersistentRecordingTimestamps(m_recordingTimestamps.load(std::memory_order_acquire));
-	graph->SetScheduleTraceEnabled(m_scheduleTrace.load(std::memory_order_acquire));
-	{
-		auto boundary = m_desc.queueBoundary;
-		if (m_boundaryOverridden.load(std::memory_order_acquire)) {
-			boundary.entry = m_boundaryEntry.load(std::memory_order_acquire);
-			boundary.exit = m_boundaryExit.load(std::memory_order_acquire);
-		}
-		graph->SetExternalQueueBoundary(boundary);
-	}
-	graph->SetFrameWaitTimeline(m_frameWaitTimeline);
-	graph->Setup();
-	graph->SetGpuPassRangeCallbacks(m_gpuPassRangeBegin, m_gpuPassRangeEnd);
 	instance.graph = std::move(graph);
 	instance.rebuildRequested = false;
+	instance.failed = false;
+	instance.failure.clear();
 	++instance.buildGeneration;
 	++m_buildGeneration;
 	if (replacing)
-		spdlog::info("GraphHost: epoch {}'s graph built again (build {}) in {:.2f} ms; the other epochs' graphs kept",
-			instance.epoch == persistent::AllEpochs ? std::string("(all)") : std::to_string(instance.epoch), instance.buildGeneration,
-			std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count());
+		spdlog::info("GraphHost: epoch {}'s graph built again (build {}) in {:.2f} ms; the other epochs' graphs kept", epochName,
+			instance.buildGeneration, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count());
+	return true;
 }
 
 bool GraphHost::BuildDueInstances(bool all) {
@@ -480,10 +567,11 @@ bool GraphHost::BuildDueInstances(bool all) {
 			instance.rebuildRequested = true;
 			basic_telemetry::AddCounter("ORG.Host.AliasArenaRebuilds");
 		}
-		if (all ? !instance.graph || instance.rebuildRequested : BuildDue(index)) due.push_back(index);
+		// A failed build waits for a rebuild request (BuildDue).
+		if (all ? (!instance.graph && !instance.failed) || instance.rebuildRequested : BuildDue(index)) due.push_back(index);
 	}
 	if (m_async) RebuildAsyncInstances(due);
-	else for (const auto index : due) BuildInstance(index, false);
+	else for (const auto index : due) (void)BuildInstance(index);
 	return !due.empty();
 }
 
@@ -541,9 +629,23 @@ void GraphHost::ExecuteFrame(const IHostExecutionData* hostData, const FrameCall
 	const auto index = epoch == persistent::AllEpochs ? 0 : InstanceOf(epoch);
 	if (index == kNoInstance) throw std::invalid_argument("ExecuteFrame: epoch " + std::to_string(epoch) + " is not one of the host's");
 	ReleaseRetiredGraphs(false);
-	if (BuildDue(index)) BuildInstance(index, false);
+	if (BuildDue(index)) (void)BuildInstance(index);
 	lap(m_lastTimings.buildUs);
+	// An epoch whose graph failed runs nothing; the others are not affected.
+	if (!m_instances[index].graph || m_instances[index].failed)
+		throw EpochFailedError(m_instances[index].epoch, m_instances[index].failure);
 	auto& graph = *m_instances[index].graph;
+	// A failure preparing or recording this epoch's graph is the epoch's: it is marked failed and reported, and runs nothing until
+	// it is built again. What Execute may have submitted before it failed keeps its owner (m_uncertainExecutionOwners).
+	const auto failEpoch = [&](const std::string& error) {
+		auto& instance = m_instances[index];
+		instance.failed = true;
+		instance.failure = error;
+		spdlog::error("GraphHost: epoch {}'s graph failed to prepare (build {}); the other epochs keep running: {}",
+			instance.epoch == persistent::AllEpochs ? std::string("(all)") : std::to_string(instance.epoch), instance.buildGeneration, error);
+		ReportEpochFailure({instance.epoch, instance.buildGeneration, false, error});
+		return EpochFailedError(instance.epoch, error);
+	};
 	runtime::ScopedActiveGraphServices services(graph.GetUploadService(), graph.GetDescriptorService());
 	const auto slot = static_cast<uint32_t>(m_frameNumber % m_frameSlots);
 	// The slot's previous frame must be done on the GPU before the upload pages it used are recycled
@@ -580,7 +682,11 @@ void GraphHost::ExecuteFrame(const IHostExecutionData* hostData, const FrameCall
 	update.preparationSlot = slot;
 	update.frameFenceValue = m_frameNumber + 1;
 	update.hostData = hostData;
-	graph.Update(update, m_device);
+	try {
+		graph.Update(update, m_device);
+	} catch (const std::exception& e) {
+		throw failEpoch(e.what());
+	}
 	lap(m_lastTimings.updateUs);
 	PassExecutionContext execute{};
 	execute.device = m_device;
@@ -591,7 +697,11 @@ void GraphHost::ExecuteFrame(const IHostExecutionData* hostData, const FrameCall
 	// prefix of its batches, in which case recovery retains this owner.
 	const bool heldResources = static_cast<bool>(resourceOwner);
 	if (heldResources) m_uncertainExecutionOwners.push_back(std::move(resourceOwner));
-	graph.Execute(execute);
+	try {
+		graph.Execute(execute);
+	} catch (const std::exception& e) {
+		throw failEpoch(e.what());
+	}
 	lap(m_lastTimings.executeUs);
 	m_lastTimings.execute = graph.LastPersistentExecuteTimings();
 	// Execute submitted the frame: every batch signalled its queue's timeline, so the value each queue
@@ -675,7 +785,10 @@ void GraphHost::SignalExternalExecutionUnexecuted(const ExternalEpochExecution& 
 
 void GraphHost::StartAsync() {
 	if (m_async || m_asyncEpochs.empty()) return;
-	if (std::ranges::any_of(m_instances, [](const Instance& instance) { return !instance.graph; })) return;
+	// Every epoch built, or failed: a failed epoch starts paused and runs nothing, and the others start without it.
+	if (std::ranges::any_of(m_instances, [](const Instance& instance) { return !instance.graph && !instance.failed; })) return;
+	auto* firstGraph = AnyGraph();
+	if (!firstGraph) return;
 	auto async = std::make_unique<Async>();
 	// The host's wake, made once: a requester's Notify may reach it whenever, so no build destroys it.
 	if (!m_completionWake && m_device.CreateCompletionWait(m_completionWake) != rhi::Result::Ok)
@@ -690,6 +803,17 @@ void GraphHost::StartAsync() {
 		async->generation.push_back(m_instances[instance].buildGeneration);
 	}
 	async->paused.assign(async->epochs.size(), 0);
+	async->epochFailed = std::make_unique<std::atomic<bool>[]>(async->epochs.size());
+	async->epochErrors.assign(async->epochs.size(), {});
+	for (uint32_t index = 0; index < async->epochs.size(); ++index) {
+		const auto& instance = m_instances[async->instanceOf[index]];
+		// No graph (its build failed): nothing of it until it is built and attached.
+		if (!instance.graph) async->paused[index] = 1;
+		if (instance.failed) {
+			async->epochErrors[index] = instance.failure;
+			async->epochFailed[index].store(true, std::memory_order_release);
+		}
+	}
 	// Each epoch its own ring of framesInFlight slots, when the slots hold one per async epoch (they hold framesInFlight of every
 	// epoch in the order); otherwise one ring of all.
 	if (const uint32_t ring = (std::max)(m_desc.framesInFlight, 1u); m_frameSlots >= ring * async->epochs.size())
@@ -714,7 +838,7 @@ void GraphHost::StartAsync() {
 	async->hostFrame = m_frameNumber;
 	async->submissionsSeen = m_submissions;
 	// The queues' layout is every graph's: the primary queues first, on the host's timelines.
-	auto& queues = m_instances.front().graph->GetQueueRegistry();
+	auto& queues = firstGraph->GetQueueRegistry();
 	const auto graphics = queues.FindGraphicsSlot();
 	async->graphicsSlot = static_cast<uint32_t>(ToUnderlying(graphics));
 	async->graphicsQueue = queues.GetQueue(graphics);
@@ -754,7 +878,7 @@ void GraphHost::StartAsync() {
 	}
 	async->queueLists.resize(queues.SlotCount());
 	// Staged uploads go straight into each submission's upload list (RenderGraph::RecordPendingUploads).
-	if (auto* uploads = m_instances.front().graph->GetUploadService()) uploads->SetStagedUploadsRecordedDirectly(true);
+	if (auto* uploads = firstGraph->GetUploadService()) uploads->SetStagedUploadsRecordedDirectly(true);
 	auto* state = async.get();
 	state->thread = std::thread([this, state] {
 		const auto graphOf = [&](uint32_t epochIndex) -> RenderGraph& { return *m_instances[state->instanceOf[epochIndex]].graph; };
@@ -804,7 +928,8 @@ void GraphHost::StartAsync() {
 						// step, into the slot the render thread is recording. Marking the epoch as needing a ticket instead
 						// would let the proactive pass below prepare one into a slot of its own choosing, which the render
 						// thread would take while it records into the other slot's upload list.
-						if (message.slot >= 0)
+						// A failed epoch prepares nothing: the render thread waiting for it sees the failure (WaitTicket).
+						if (message.slot >= 0 && !state->epochFailed[message.epochIndex].load(std::memory_order_relaxed))
 							PrepareTicket(*state, message.epochIndex, message.slot);
 						else if (!state->paused[message.epochIndex])
 							state->needsTicket[message.epochIndex] = 1;
@@ -846,6 +971,7 @@ void GraphHost::StartAsync() {
 						for (const auto& [instance, generation] : message.instances)
 							for (uint32_t index = 0; index < state->epochs.size(); ++index) {
 								if (state->instanceOf[index] != instance) continue;
+								// A new build's failure was cleared while this thread held still (RebuildAsyncInstances).
 								state->paused[index] = 0;
 								state->generation[index] = generation;
 								state->needsTicket[index] = 1;
@@ -871,6 +997,12 @@ void GraphHost::StartAsync() {
 					if (state->paused[epochIndex]) {
 						// Its graph is being built again: the request is for the old one.
 						if (node->done) node->done(nullptr, std::make_exception_ptr(EpochRecordingDropped(state->generation[epochIndex])));
+						continue;
+					}
+					if (state->epochFailed[epochIndex].load(std::memory_order_acquire)) {
+						// Its graph failed: nothing is recorded on it until it is built again.
+						if (node->done)
+							node->done(nullptr, std::make_exception_ptr(EpochFailedError(node->epoch, state->epochErrors[epochIndex])));
 						continue;
 					}
 					auto request = std::make_unique<Async::RecordingRequest>();
@@ -902,7 +1034,9 @@ void GraphHost::StartAsync() {
 				// The next ticket of every epoch whose last one was submitted: one frame ahead.
 				bool prepared = false;
 				for (uint32_t index = 0; index < state->epochs.size(); ++index) {
-					if (!state->needsTicket[index] || state->paused[index] || state->cells[index].load(std::memory_order_acquire)) continue;
+					if (!state->needsTicket[index] || state->paused[index] || state->epochFailed[index].load(std::memory_order_relaxed)
+						|| state->cells[index].load(std::memory_order_acquire))
+						continue;
 					PrepareTicket(*state, index, -1);
 					prepared = true;
 				}
@@ -1010,9 +1144,18 @@ void GraphHost::RebuildAsyncInstances(std::span<const size_t> indices) {
 	Async::Message attach;
 	attach.kind = Async::Message::Kind::Attach;
 	HoldAsync(indices, [&] {
+		auto& async = *m_async;
 		for (const auto index : indices) {
-			BuildInstance(index, false);
-			attach.instances.emplace_back(index, m_instances[index].buildGeneration);
+			if (BuildInstance(index)) {
+				// Built: its async epoch's failure goes with the old graph. Written while the host's thread holds still.
+				for (uint32_t i = 0; i < async.epochs.size(); ++i) {
+					if (async.instanceOf[i] != index) continue;
+					async.epochFailed[i].store(false, std::memory_order_release);
+					async.epochErrors[i].clear();
+				}
+			}
+			// A failed build with no graph to keep stays detached: its epoch runs nothing until a build of it succeeds.
+			if (m_instances[index].graph) attach.instances.emplace_back(index, m_instances[index].buildGeneration);
 		}
 	});
 	if (!m_async->Post(attach)) m_async->ThrowIfFailed();
@@ -1098,6 +1241,9 @@ bool GraphHost::AdvanceRecordingRequests(Async& state) {
 				++it;
 				continue;
 			}
+			// Its graph failed since the request was taken: it completes with that failure.
+			if (state.epochFailed[request.epochIndex].load(std::memory_order_relaxed))
+				throw EpochFailedError(state.epochs[request.epochIndex], state.epochErrors[request.epochIndex]);
 			auto& graph = *m_instances[state.instanceOf[request.epochIndex]].graph;
 			if (!request.result) {
 				request.result = std::make_shared<EpochRecording>();
@@ -1220,28 +1366,65 @@ void GraphHost::PrepareTicket(Async& state, uint32_t epochIndex, int32_t request
 	m_desc.runtime->Retire();
 	entry.reserved = true;
 	std::shared_ptr<Async::Ticket> ticket;
-	if (state.revisionDriven[epochIndex]) {
-		// Nothing from live state: the ticket admits the revisions' recordings for its slot, the ones still held.
-		ticket = graph.PrepareRevisionTicket(state.epochs[epochIndex], static_cast<uint8_t>(slot), state.hostFrame++);
-		auto& live = state.liveRecordings[epochIndex];
-		std::erase_if(live, [](const auto& a_recording) { return a_recording.expired(); });
-		for (const auto& weak : live)
-			if (const auto recording = weak.lock()) AddRevisionCandidate(state, epochIndex, *ticket, *recording);
-		state.outstanding[epochIndex] = ticket;
-	} else {
-		Async::Preparation preparation;
-		const auto version = state.backingVersion.load(std::memory_order_acquire);
-		ticket = graph.PreparePersistentTicket(m_device, state.epochs[epochIndex], static_cast<uint8_t>(slot), state.hostFrame++, version);
-		RenderGraph::SetPersistentTicketHostTag(*ticket, version);
-		// The revisions' recordings still held, as alternatives the submitting thread may take instead (UseEpochRecording).
-		auto& live = state.liveRecordings[epochIndex];
-		std::erase_if(live, [](const auto& a_recording) { return a_recording.expired(); });
-		for (const auto& weak : live)
-			if (const auto recording = weak.lock()) AddRevisionCandidate(state, epochIndex, *ticket, *recording);
-		state.outstanding[epochIndex] = ticket;
+	// The epoch's own preparation: its passes' Prepare and recording, the bindless views they resolve. A failure here is the
+	// epoch's alone (FailAsyncEpoch); the host's thread and the other epochs go on.
+	std::string error;
+	try {
+		if (state.revisionDriven[epochIndex]) {
+			// Nothing from live state: the ticket admits the revisions' recordings for its slot, the ones still held.
+			ticket = graph.PrepareRevisionTicket(state.epochs[epochIndex], static_cast<uint8_t>(slot), state.hostFrame++);
+			auto& live = state.liveRecordings[epochIndex];
+			std::erase_if(live, [](const auto& a_recording) { return a_recording.expired(); });
+			for (const auto& weak : live)
+				if (const auto recording = weak.lock()) AddRevisionCandidate(state, epochIndex, *ticket, *recording);
+		} else {
+			Async::Preparation preparation;
+			const auto version = state.backingVersion.load(std::memory_order_acquire);
+			ticket = graph.PreparePersistentTicket(m_device, state.epochs[epochIndex], static_cast<uint8_t>(slot), state.hostFrame++, version);
+			RenderGraph::SetPersistentTicketHostTag(*ticket, version);
+			// The revisions' recordings still held, as alternatives the submitting thread may take instead (UseEpochRecording).
+			auto& live = state.liveRecordings[epochIndex];
+			std::erase_if(live, [](const auto& a_recording) { return a_recording.expired(); });
+			for (const auto& weak : live)
+				if (const auto recording = weak.lock()) AddRevisionCandidate(state, epochIndex, *ticket, *recording);
+		}
+	} catch (const std::exception& e) {
+		error = e.what();
+	} catch (...) {
+		error = "unknown exception";
 	}
+	if (!error.empty() || !ticket) {
+		// The slot is free again: no ticket holds it. A ticket made before the failure gives up what it prepared.
+		entry.reserved = false;
+		if (ticket) {
+			try {
+				(void)graph.CompletePersistentTicket(*ticket, {});
+			} catch (...) {
+			}
+		}
+		FailAsyncEpoch(state, epochIndex, error.empty() ? std::string("no ticket was prepared") : std::move(error));
+		return;
+	}
+	state.outstanding[epochIndex] = ticket;
 	state.needsTicket[epochIndex] = 0;
 	state.cells[epochIndex].store(std::move(ticket), std::memory_order_release);
+	state.ticketWake.fetch_add(1, std::memory_order_release);
+	state.ticketWake.notify_all();
+}
+
+void GraphHost::FailAsyncEpoch(Async& state, uint32_t epochIndex, std::string error) {
+	const auto epoch = state.epochs[epochIndex];
+	spdlog::error("GraphHost: epoch {}'s graph failed to prepare (build {}); the other epochs keep running: {}", epoch,
+		state.generation[epochIndex], error);
+	// Nothing more is prepared or recorded for it until its instance is attached at a new build.
+	state.needsTicket[epochIndex] = 0;
+	state.outstanding[epochIndex].reset();
+	state.liveRecordings[epochIndex].clear();
+	state.epochErrors[epochIndex] = error;
+	// The owner hears of it at its next PollEpochFailures; the render thread sees the flag first if it submits the epoch before that.
+	ReportEpochFailure({epoch, state.generation[epochIndex], false, std::move(error)});
+	state.epochFailed[epochIndex].store(true, std::memory_order_release);
+	// A render thread waiting for this epoch's ticket wakes and sees the failure.
 	state.ticketWake.fetch_add(1, std::memory_order_release);
 	state.ticketWake.notify_all();
 }
@@ -1283,6 +1466,14 @@ void GraphHost::StopAsync() {
 	(void)async->Post(stop);
 	if (async->thread.joinable()) async->thread.join();
 	BufferBase::UnregisterConcurrentBackingCapture();
+	// An epoch whose preparation failed stays failed without the host's thread: its graph is the one that failed.
+	for (uint32_t index = 0; index < async->epochs.size(); ++index) {
+		auto& instance = m_instances[async->instanceOf[index]];
+		if (async->epochFailed[index].load(std::memory_order_acquire) && async->generation[index] == instance.buildGeneration) {
+			instance.failed = true;
+			instance.failure = async->epochErrors[index];
+		}
+	}
 	// The recording requests not recorded: dropped, each completed so (EpochRecordingDropped), here, on the thread that builds -
 	// the taken ones and the ones still queued (a request posted after this goes to the next thread, on the next build's graph).
 	// The host's end drops them without their callbacks.
@@ -1375,6 +1566,10 @@ void GraphHost::SubmitEpoch(uint32_t epoch, const FrameCallback& beforeSubmit, s
 	auto& async = *m_async;
 	async.ThrowIfFailed();
 	const auto index = async.IndexOf(epoch);
+	// An epoch whose graph failed runs nothing until a build of it succeeds; the others run on.
+	if (!m_instances[instance].graph || m_instances[instance].failed)
+		throw EpochFailedError(epoch, m_instances[instance].failure);
+	if (async.epochFailed[index].load(std::memory_order_acquire)) throw EpochFailedError(epoch, async.epochErrors[index]);
 	auto ticket = async.cells[index].exchange(nullptr, std::memory_order_acq_rel);
 	if (!ticket) {
 		++m_asyncStats.waited;

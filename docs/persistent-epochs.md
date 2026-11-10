@@ -29,6 +29,25 @@ submission point is an **epoch**.
 -   **Graph access.** `Graph(epoch)` gives an epoch's graph, `Graph()` the first one; `GraphCount`, `GraphAt`, `EpochAt`
     enumerate them. The runtime's services (uploads, descriptors, tasks) are shared by all of them.
 
+### Failure isolation
+
+A failure while one epoch's graph is built or prepared stays with that epoch.
+
+-   **What counts.** An exception from the epoch's build (extension factories, `PrepareForBuild`, compile, `Setup`) or from
+    its preparation (a pass's `Prepare`, a bindless view it resolves, its recording). This covers the host thread's ticket
+    preparation and `ExecuteFrame`'s `Update` and `Execute`.
+-   **What happens.** The epoch is marked failed. A failed build keeps the epoch's previous graph when it had a working one
+    (`EpochFailure::keptGraph`); otherwise the epoch runs nothing. `SubmitEpoch` and `ExecuteFrame` then throw
+    `EpochFailedError` for it, having submitted nothing. The host thread keeps running and the other epochs keep their
+    graphs and tickets. Recording requests for the epoch complete with the failure.
+-   **How the owner hears.** `PollEpochFailures()` hands each failure to the callback set with
+    `SetEpochFailedCallback`, on the owner thread. Call it where nothing of the epoch is in progress, for example before a
+    frame decides what its epochs run. A failure of a build the epoch has since replaced is dropped.
+-   **Recovery.** A failed epoch is not built again every frame. The owner fixes the cause (for example drops the pass that
+    failed) and calls `RequestRebuild(epoch)`. A build that succeeds clears the failure.
+-   **Host-wide errors.** A failed GPU completion wait or a lost device still ends the host thread. `SubmitEpoch` then
+    throws for every epoch, as before.
+
 ### What ties the graphs together
 
 -   **Shared queue timelines.** Every graph signals the same timeline per queue (`RenderGraph::SetSharedQueueTimelines`).
