@@ -1528,6 +1528,9 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 		rhi::SecondaryInheritance outside{};
 		outside.insideRendering = false;
 		outside.debugName = "ORG external ticket uploads";
+		// Run by the host's command buffers: never chained into one, as the epoch's own secondaries
+		// (RecordPreparedRhiExecutionBatch).
+		outside.simultaneousUse = true;
 		if (!secondary.list || secondary.list->BeginSecondary(outside) != rhi::Result::Ok)
 			throw std::runtime_error("An external epoch's uploads secondary could not begin");
 	}

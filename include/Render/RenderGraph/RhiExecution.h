@@ -1060,6 +1060,10 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
             rhi::SecondaryInheritance outside{};
             outside.insideRendering = false;
             outside.debugName = "ORG external epoch";
+            // The host's command buffers run it, and a replayable one runs again in later ones. Without simultaneous use a
+            // driver may chain a secondary into the buffer that executes it (AMD patches its end to jump back there): a later
+            // execution or recording then breaks the host's commands that follow the earlier one.
+            outside.simultaneousUse = true;
             if (list.BeginSecondary(outside) != rhi::Result::Ok)
                 throw std::runtime_error("Owned secondary command list could not begin");
         }

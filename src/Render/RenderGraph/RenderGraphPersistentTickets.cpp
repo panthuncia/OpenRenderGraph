@@ -368,6 +368,9 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 			rhi::SecondaryInheritance outside{};
 			outside.insideRendering = false;
 			outside.debugName = name;
+			// Run by the host's command buffers, and again from the handoff cache: never chained into one, as the epoch's
+			// own secondaries (RecordPreparedRhiExecutionBatch).
+			outside.simultaneousUse = true;
 			if (allocation->pair.list->BeginSecondary(outside) != rhi::Result::Ok)
 				throw std::runtime_error("An external ticket's secondary could not begin");
 			return allocation;
