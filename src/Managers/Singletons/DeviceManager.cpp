@@ -105,6 +105,18 @@ rhi::Result DeviceManager::CreateAliasingResourceTracked(
     return result;
 }
 
+rhi::Result DeviceManager::CreateResourceUntracked(
+    const rhi::ma::AllocationDesc& allocDesc,
+    const rhi::ResourceDesc& resourceDesc,
+    rhi::ma::AllocationPtr& outAllocation) const noexcept
+{
+    std::scoped_lock lock(m_resourceCreationMutex);
+    if (!m_allocator) {
+        return rhi::Result::InvalidCall;
+    }
+    return m_allocator->CreateResource(&allocDesc, &resourceDesc, 0, nullptr, outAllocation);
+}
+
 rhi::Result DeviceManager::AllocateMemoryTracked(
     const rhi::ma::AllocationDesc& allocDesc,
     const rhi::ResourceAllocationInfo& allocationInfo,

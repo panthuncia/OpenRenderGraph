@@ -69,6 +69,12 @@ public:
 		TrackedHandle& out,
 		std::optional<AllocationTrackDesc> trackDesc) const noexcept;
 
+	// Create a resource the caller owns outright, with no tracking entity (org::memory::CreateAllocatedResource). Any thread.
+	rhi::Result CreateResourceUntracked(
+		const rhi::ma::AllocationDesc& allocDesc,
+		const rhi::ResourceDesc& resourceDesc,
+		rhi::ma::AllocationPtr& outAllocation) const noexcept;
+
 	rhi::Result AllocateMemoryTracked(
 		const rhi::ma::AllocationDesc& allocDesc,
 		const rhi::ResourceAllocationInfo& allocationInfo,
