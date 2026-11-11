@@ -19,7 +19,27 @@ StatisticsManager& StatisticsManager::GetInstance() {
     return inst;
 }
 
+StatisticsManager::SharedQueryObjects::~SharedQueryObjects() {
+    // The last list that named these objects is released, so its submissions are complete. The deletion queue still
+    // defers them past what ORG's own queues were given meanwhile.
+    auto& deletion = DeletionManager::GetInstance();
+    for (auto& object : replaced) deletion.MarkForDelete(std::move(object));
+}
+
 namespace {
+// A list's queries go to one set of shared query objects: the one current at its first query, which its context holds
+// from then on. When passes registered since and the set was replaced, the list writes and resolves nothing more: its
+// queries would mix two pools, and a resolve (which waits for availability) of queries the new pool never wrote would
+// wait on the GPU forever.
+bool UseSharedQueries(QueryRecordingContext& ctx, std::shared_ptr<const void> current) {
+    if (!current) return false;
+    if (!ctx.sharedQueries) {
+        ctx.sharedQueries = std::move(current);
+        return true;
+    }
+    return ctx.sharedQueries == current;
+}
+
 void UpdateEma(double& value, double sample) {
     value = value * (1.0 - PassStats::alpha) + sample * PassStats::alpha;
 }
@@ -274,23 +294,18 @@ void StatisticsManager::SetupQueryHeap() {
 
     m_queryPoolPassCapacity = m_numPasses;
 
-    // Defer destruction of old pools/buffers so the GPU can finish in-flight work.
-    auto& deletionMgr = DeletionManager::GetInstance();
-    if (m_timestampPool) {
-        deletionMgr.MarkForDelete(std::move(m_timestampPool));
-    }
-    if (m_pipelineStatsPool) {
-        deletionMgr.MarkForDelete(std::move(m_pipelineStatsPool));
-    }
-    for (auto& kv : m_timestampBuffers) {
-        if (kv.second) {
-            deletionMgr.MarkForDelete(std::move(kv.second));
-        }
-    }
-    for (auto& kv : m_meshStatsBuffers) {
-        if (kv.second) {
-            deletionMgr.MarkForDelete(std::move(kv.second));
-        }
+    // The old pools and buffers go to the set the lists recorded with them hold. Lists recorded ahead (another epoch's
+    // ticket) or in a host's stream that has not reached the GPU yet still name them. The set hands them to the
+    // deletion queue when the last of those lists is released, after its submissions completed. A new set takes the
+    // new objects.
+    {
+        auto replaced = m_sharedQueries.exchange(std::make_shared<SharedQueryObjects>(), std::memory_order_acq_rel);
+        if (m_timestampPool) replaced->replaced.emplace_back(std::move(m_timestampPool));
+        if (m_pipelineStatsPool) replaced->replaced.emplace_back(std::move(m_pipelineStatsPool));
+        for (auto& kv : m_timestampBuffers)
+            if (kv.second) replaced->replaced.emplace_back(std::move(kv.second));
+        for (auto& kv : m_meshStatsBuffers)
+            if (kv.second) replaced->replaced.emplace_back(std::move(kv.second));
     }
 
     // The timestamp heap holds 2 queries per pass per frame. The pass timings need nothing else.
@@ -496,6 +511,7 @@ void StatisticsManager::BeginQuery(
     auto queueKind = queue.GetKind();
     auto tsIt = m_timestampBuffers.find(queueKind);
     if (tsIt == m_timestampBuffers.end() || !tsIt->second) return;
+    if (!UseSharedQueries(ctx, CurrentSharedQueries())) return;
 
     const uint32_t frameBase = (frameIndex % (std::max)(1u, m_numFramesInFlight)) * m_queryPoolPassCapacity;
     const uint32_t tsIdx = (frameBase + passIndex) * 2u;
@@ -527,6 +543,7 @@ void StatisticsManager::EndQuery(
     auto queueKind = queue.GetKind();
     auto tsIt = m_timestampBuffers.find(queueKind);
     if (tsIt == m_timestampBuffers.end() || !tsIt->second) return;
+    if (!UseSharedQueries(ctx, CurrentSharedQueries())) return;
 
     const uint32_t frameBase = (frameIndex % (std::max)(1u, m_numFramesInFlight)) * m_queryPoolPassCapacity;
     const uint32_t tsIdx = (frameBase + passIndex) * 2u + 1u;
@@ -561,6 +578,7 @@ void StatisticsManager::ResolveQueries(
     auto queueKind = queue.GetKind();
     auto tsIt = m_timestampBuffers.find(queueKind);
     if (tsIt == m_timestampBuffers.end() || !tsIt->second) return;
+    if (!UseSharedQueries(ctx, CurrentSharedQueries())) return;
     auto psIt = m_meshStatsBuffers.find(queueKind);
     const bool havePipelineStats = m_collectPipelineStatistics && psIt != m_meshStatsBuffers.end() && psIt->second;
 
@@ -633,6 +651,11 @@ void StatisticsManager::MergePendingResolves(
             if (std::ranges::find(pending, ctx.owned) == pending.end() && pending.size() < 256)
                 pending.push_back(ctx.owned);
         }
+        return;
+    }
+    // Resolved into a readback buffer replaced since: the completion reads the current one, which holds none of them.
+    if (ctx.sharedQueries && ctx.sharedQueries != CurrentSharedQueries()) {
+        ctx.pendingRanges.clear();
         return;
     }
     auto& dest = m_pendingResolves[queueKind][frameIndex];
