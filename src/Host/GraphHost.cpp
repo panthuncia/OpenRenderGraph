@@ -386,12 +386,55 @@ bool GraphHost::EpochRecordingCurrent(const EpochRecording& recording) const noe
 	return index != kNoInstance && m_instances[index].graph && recording.buildGeneration == m_instances[index].buildGeneration;
 }
 
-void GraphHost::RequestRebuild() noexcept {
-	for (auto& instance : m_instances) instance.rebuildRequested = true;
+void GraphHost::MarkRebuild(Instance& instance, std::string_view reason) noexcept {
+	instance.rebuildRequested = true;
+	// The reasons are for the log line alone: a failure to record one never stops the rebuild.
+	try {
+		if (reason.empty()) reason = "unnamed request";
+		const auto known = std::ranges::find_if(instance.rebuildReasons, [&](const auto& entry) { return entry.first == reason; });
+		if (known != instance.rebuildReasons.end()) {
+			++known->second;
+			return;
+		}
+		// Bounded: a storm of distinct reasons ends in one "others" entry.
+		static constexpr size_t kMaxReasons = 12;
+		if (instance.rebuildReasons.size() < kMaxReasons) {
+			instance.rebuildReasons.emplace_back(std::string(reason), 1u);
+			return;
+		}
+		if (instance.rebuildReasons.back().first != "others") instance.rebuildReasons.emplace_back("others", 0u);
+		++instance.rebuildReasons.back().second;
+	} catch (...) {
+	}
 }
 
-void GraphHost::RequestRebuild(uint32_t epoch) noexcept {
-	if (const auto index = InstanceOf(epoch); index != kNoInstance) m_instances[index].rebuildRequested = true;
+void GraphHost::RequestRebuild(std::string_view reason) noexcept {
+	for (auto& instance : m_instances) MarkRebuild(instance, reason);
+}
+
+void GraphHost::RequestRebuild(uint32_t epoch, std::string_view reason) noexcept {
+	if (const auto index = InstanceOf(epoch); index != kNoInstance) MarkRebuild(m_instances[index], reason);
+}
+
+size_t GraphHost::RequestRebuildFor(const ResourceIdentifier& id, std::string_view reason) noexcept {
+	size_t marked = 0;
+	for (auto& instance : m_instances) {
+		// A graph's lookups are locked (RenderGraph::LookedUp): the host's thread may be preparing it.
+		if (!instance.graph || !instance.graph->LookedUp(id)) continue;
+		MarkRebuild(instance, reason);
+		++marked;
+	}
+	return marked;
+}
+
+bool GraphHost::ExtensionInEpoch(const Registered& extension, uint32_t epoch) noexcept {
+	if (extension.epochs.empty() || epoch == persistent::AllEpochs) return true;
+	return std::ranges::any_of(extension.epochs, [&](uint32_t listed) { return listed == epoch || listed == persistent::AllEpochs; });
+}
+
+void GraphHost::RequestRebuildOf(const Registered& extension, std::string_view reason) noexcept {
+	for (auto& instance : m_instances)
+		if (ExtensionInEpoch(extension, instance.epoch)) MarkRebuild(instance, reason);
 }
 
 bool GraphHost::RebuildRequested() const noexcept {
@@ -446,15 +489,24 @@ bool GraphHost::AnyBuildDue() const noexcept {
 	return false;
 }
 
-void GraphHost::AddExtension(std::string id, ExtensionFactory factory) {
-	RemoveExtension(id);
-	m_extensions.push_back({std::move(id), std::move(factory)});
-	RequestRebuild();
+void GraphHost::AddExtension(std::string id, ExtensionFactory factory, std::vector<uint32_t> epochs) {
+	// Added again: the graphs it was made into, and the ones it is now, are built again with it; the others keep theirs.
+	const auto existing = std::ranges::find(m_extensions, id, &Registered::id);
+	const bool again = existing != m_extensions.end();
+	const std::string reason = "extension '" + id + (again ? "' added again" : "' added");
+	if (again) {
+		RequestRebuildOf(*existing, reason);
+		m_extensions.erase(existing);
+	}
+	m_extensions.push_back({std::move(id), std::move(factory), std::move(epochs)});
+	RequestRebuildOf(m_extensions.back(), reason);
 }
 
 void GraphHost::RemoveExtension(const std::string& id) {
-	const auto erased = std::erase_if(m_extensions, [&](const Registered& entry) { return entry.id == id; });
-	if (erased) RequestRebuild();
+	const auto existing = std::ranges::find(m_extensions, id, &Registered::id);
+	if (existing == m_extensions.end()) return;
+	RequestRebuildOf(*existing, "extension '" + id + "' removed");
+	m_extensions.erase(existing);
 }
 
 runtime::IUploadService* GraphHost::Uploads() noexcept {
@@ -543,6 +595,12 @@ bool GraphHost::BuildInstance(size_t index) {
 	auto& instance = m_instances[index];
 	const bool replacing = static_cast<bool>(instance.graph);
 	const auto epochName = instance.epoch == persistent::AllEpochs ? std::string("(all)") : std::to_string(instance.epoch);
+	// Why this build: the requests since the last one, each with its count. This build answers them, whether it succeeds or not.
+	std::string why;
+	for (const auto& [reason, count] : instance.rebuildReasons)
+		why += (why.empty() ? "" : "; ") + reason + (count > 1 ? " (x" + std::to_string(count) + ")" : std::string());
+	instance.rebuildReasons.clear();
+	if (why.empty()) why = replacing ? "no request named" : "first build";
 	// The graph it replaces: its own submitted work is what every queue has been given so far (the timelines are shared), taken
 	// while it is still listed. It is released once that is done, the other epochs running meanwhile.
 	auto done = instance.graph ? SubmittedPoint() : GpuPoint{};
@@ -554,8 +612,10 @@ bool GraphHost::BuildInstance(size_t index) {
 		graph->SetSharedQueueTimelines(m_timelines);
 		graph->SetPassEpochFilter(instance.epoch);
 		graph->RegisterExtension(std::make_unique<HostUploadExtension>(graph->GetUploadService()), "org.host.io");
+		// Only the extensions made into this epoch's graph (AddExtension's epochs): the others are not made, and gather nothing.
 		for (const auto& entry : m_extensions)
-			if (auto extension = entry.factory()) graph->RegisterExtension(std::move(extension), entry.id);
+			if (ExtensionInEpoch(entry, instance.epoch))
+				if (auto extension = entry.factory()) graph->RegisterExtension(std::move(extension), entry.id);
 		runtime::ScopedActiveGraphServices services(graph->GetUploadService(), graph->GetDescriptorService());
 		graph->PrepareExtensionsForBuild();
 		// The graph's memory snapshots (its VRAM dump, a host's memory UI): ORG's tracking world, as the contributor host's.
@@ -606,8 +666,8 @@ bool GraphHost::BuildInstance(size_t index) {
 			instance.failed = true;
 			instance.failure = error;
 		}
-		spdlog::error("GraphHost: epoch {}'s graph failed to build ({}); the other epochs keep running: {}", epochName,
-			kept ? "its previous graph is kept" : "it runs nothing", error);
+		spdlog::error("GraphHost: epoch {}'s graph failed to build ({}); the other epochs keep running: {}; why it was built: {}", epochName,
+			kept ? "its previous graph is kept" : "it runs nothing", error, why);
 		ReportEpochFailure({instance.epoch, instance.buildGeneration, kept, std::move(error)});
 		return false;
 	}
@@ -623,8 +683,8 @@ bool GraphHost::BuildInstance(size_t index) {
 	++instance.buildGeneration;
 	++m_buildGeneration;
 	if (replacing)
-		spdlog::info("GraphHost: epoch {}'s graph built again (build {}) in {:.2f} ms; the other epochs' graphs kept", epochName,
-			instance.buildGeneration, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count());
+		spdlog::info("GraphHost: epoch {}'s graph built again (build {}) in {:.2f} ms; the other epochs' graphs kept; why: {}", epochName,
+			instance.buildGeneration, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count(), why);
 	return true;
 }
 
@@ -635,21 +695,26 @@ bool GraphHost::BuildDueInstances(bool all) {
 		// Placements in a pool generation another epoch's graph replaced (its pool grew): placed again by a rebuild, they share
 		// the pool's memory again, and the old generation is freed.
 		if (instance.graph && !instance.rebuildRequested && !instance.graph->PersistentAliasPlacementsCurrent()) {
-			instance.rebuildRequested = true;
+			MarkRebuild(instance, "its alias placements are in a pool another epoch's build grew");
 			basic_telemetry::AddCounter("ORG.Host.AliasArenaRebuilds");
 		}
 		// A failed build waits for a rebuild request (BuildDue).
 		if (all ? (!instance.graph && !instance.failed) || instance.rebuildRequested : BuildDue(index)) due.push_back(index);
 	}
+	const auto begin = std::chrono::steady_clock::now();
 	if (m_async) RebuildAsyncInstances(due);
 	else for (const auto index : due) (void)BuildInstance(index);
+	// Many graphs at one build point: one line totals them (each graph's own line names its reasons).
+	if (due.size() > 1)
+		spdlog::info("GraphHost: {} epochs' graphs built at one build point in {:.2f} ms", due.size(),
+			std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count());
 	return !due.empty();
 }
 
 void GraphHost::SetFrameWaitTimeline(std::shared_ptr<rhi::TimelinePtr> timeline) {
 	m_frameWaitTimeline = std::move(timeline);
 	// Every packet binds its timelines when it is prepared: the graphs' present ones cannot wait on it.
-	if (AnyGraph()) RequestRebuild();
+	if (AnyGraph()) RequestRebuild("frame-wait timeline set");
 }
 
 GraphHost::GpuPoint GraphHost::SubmittedPoint() const {
@@ -895,7 +960,7 @@ void GraphHost::SetExternalEpochs(std::vector<uint32_t> epochs) {
 	for (const auto& instance : m_instances) {
 		const bool was = std::ranges::find(m_externalEpochs, instance.epoch) != m_externalEpochs.end();
 		const bool is = std::ranges::find(epochs, instance.epoch) != epochs.end();
-		if (was != is) RequestRebuild(instance.epoch);
+		if (was != is) RequestRebuild(instance.epoch, is ? "its epoch made external" : "its epoch no longer external");
 	}
 	m_externalEpochs = std::move(epochs);
 }

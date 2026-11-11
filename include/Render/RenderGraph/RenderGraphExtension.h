@@ -232,7 +232,9 @@ struct IRenderGraphExtension {
 	// lets systems react to registry recreation without RenderGraph including them
 	virtual void OnRegistryReset(ResourceRegistry* /*registry*/) {}
 
-	// main hook: inject passes
+	// main hook: inject passes.
+	// In a graph of one epoch (rg.PassEpochFilter() is not persistent::AllEpochs) only that epoch's passes and the untagged ones
+	// are taken. A host builds one such graph per epoch, so an extension whose passes cost something to make should make only those.
 	virtual void GatherStructuralPasses(RenderGraph& rg, std::vector<ExternalPassDesc>& out) = 0;
 
 	// Called after each execution of the graph, on the thread that executed it. Submit GPU work recorded outside the

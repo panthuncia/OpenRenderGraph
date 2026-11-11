@@ -276,9 +276,11 @@ void RenderGraph::CompileStructural() {
 				const std::string_view extensionId = static_cast<std::size_t>(ei) < m_extensionRegistrationIds.size()
 					? std::string_view{ m_extensionRegistrationIds[static_cast<std::size_t>(ei)] }
 					: std::string_view{ "unknown" };
+				// The epoch the graph is built for: an extension made into a graph of one epoch should gather only that epoch's passes.
 				spdlog::info(
-					"RenderGraph structural extension gather: id='{}' elapsed_ms={:.3f} passes={}",
+					"RenderGraph structural extension gather: id='{}' epoch={} elapsed_ms={:.3f} passes={}",
 					extensionId,
+					m_passEpochFilter == persistent::AllEpochs ? std::string("all") : std::to_string(m_passEpochFilter),
 					gatherMs,
 					local.size());
 			}

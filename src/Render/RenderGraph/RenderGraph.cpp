@@ -1192,7 +1192,18 @@ void RenderGraph::RegisterResolvedResourceAlias(
 	}
 }
 
+void RenderGraph::NoteLookup(ResourceIdentifier const& rid) {
+	std::scoped_lock lock(m_lookupMutex);
+	m_lookedUp.insert(rid);
+}
+
+bool RenderGraph::LookedUp(ResourceIdentifier const& rid) const {
+	std::scoped_lock lock(m_lookupMutex);
+	return m_lookedUp.contains(rid);
+}
+
 std::shared_ptr<Resource> RenderGraph::RequestResourcePtr(ResourceIdentifier const& rid, bool allowFailure) {
+	NoteLookup(rid);
 	// If it's already in our registry, return it
 	auto cached = _registry.RequestShared(rid);
 	if (cached) {
@@ -1227,6 +1238,7 @@ std::shared_ptr<Resource> RenderGraph::RequestResourcePtr(ResourceIdentifier con
 }
 
 ResourceRegistry::RegistryHandle RenderGraph::RequestResourceHandle(ResourceIdentifier const& rid, bool allowFailure) {
+	NoteLookup(rid);
 	// If it's already in our registry, return it
 	auto cached = _registry.GetHandleFor(rid);
 	if (cached.has_value()) {

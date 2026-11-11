@@ -540,6 +540,11 @@ public:
 	std::shared_ptr<Resource> RequestResourcePtr(ResourceIdentifier const& rid, bool allowFailure = false);
 	ResourceRegistry::RegistryHandle RequestResourceHandle(ResourceIdentifier const& rid, bool allowFailure = false);
 	ResourceRegistry::RegistryHandle RequestResourceHandle(Resource* const& pResource, bool allowFailure = false);
+	/**
+	 * @brief Any thread: whether this graph looked rid up by name (RequestResourcePtr, RequestResourceHandle), found or not. A host
+	 * that changes what a name means rebuilds only the graphs that looked it up (GraphHost::RequestRebuildFor).
+	 */
+	bool LookedUp(ResourceIdentifier const& rid) const;
 	// Intern the concrete resources from one coherent resolver snapshot once per
 	// resource set.  Retained passes commonly share the same resolver and would
 	// otherwise repeat thousands of registry lookups during a loading frame.
@@ -816,6 +821,10 @@ private:
 	uint64_t m_resolverHandleCacheMissesThisFrame = 0;
 	std::unordered_map<ResourceIdentifier, IResourceProvider*, ResourceIdentifier::Hasher> _providerMap;
 	std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> m_resolvedResourceAliases;
+	// The names looked up (LookedUp). Locked: a pass may resolve a name while its graph is prepared on the host's thread.
+	void NoteLookup(ResourceIdentifier const& rid);
+	mutable std::mutex m_lookupMutex;
+	std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> m_lookedUp;
 
 	std::vector<IPassBuilder*> m_passBuilderOrder;
 	std::unordered_map<std::string, std::unique_ptr<IPassBuilder>> m_passBuildersByName;
