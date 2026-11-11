@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <tuple>
@@ -79,6 +80,13 @@ public:
 	void RegisterQueue(rhi::Queue queue);
 	// The queue is about to be destroyed: its submissions have completed, or are covered by whoever destroys it.
 	void UnregisterQueue(rhi::Queue queue);
+	// A timeline whose values are given out before the work that signals them reaches a queue ORG submits to: a graph host's
+	// shared queue timeline, which a host's own command stream signals for in-stream epochs (DXVK, at its submission). The
+	// frontier covers every value given out so far (nextValue - 1), so a deferred deletion or descriptor release waits for
+	// that work too. Registering twice is harmless.
+	void RegisterAssignedTimeline(std::shared_ptr<rhi::TimelinePtr> fence, std::shared_ptr<const std::atomic<uint64_t>> nextValue);
+	// The owner is about to destroy it, after waiting for every value it gave out (then call NoteTimelineDestroyed).
+	void UnregisterAssignedTimeline(const std::shared_ptr<rhi::TimelinePtr>& fence);
 	// A timeline its owner is about to destroy, after waiting for everything signalled on it (a graph's queue fence, an
 	// external client's slot timeline). Points on it read as reached from now on, as an unregistered queue's do: a
 	// destroyed timeline would read as never reached.
@@ -139,6 +147,8 @@ private:
 	std::vector<rhi::Queue> m_queues;
 	// The progress timelines of unregistered queues (destroyed with them), and timelines noted destroyed: device and handle.
 	std::vector<std::pair<void*, rhi::TimelineHandle>> m_retiredTimelines;
+	// RegisterAssignedTimeline's timelines and the next value each gives out. Guarded by m_queuesMutex.
+	std::vector<std::pair<std::shared_ptr<rhi::TimelinePtr>, std::shared_ptr<const std::atomic<uint64_t>>>> m_assignedTimelines;
 
 	struct DeviceRelay;
 	std::mutex m_relaysMutex;

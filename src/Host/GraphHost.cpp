@@ -303,6 +303,7 @@ GraphHost::~GraphHost() {
 	for (const auto& timeline : m_timelines) {
 		const auto next = timeline.nextValue->load(std::memory_order_acquire);
 		if (next > 1) (void)(*timeline.fence)->HostWait(next - 1);
+		m_desc.runtime->UnregisterAssignedTimeline(timeline.fence);
 		m_desc.runtime->Sequencer()->RetireTimeline(m_desc.runtime->TimelineIdentity(timeline.fence->Get()));
 		m_desc.runtime->NoteTimelineDestroyed(timeline.fence->Get());
 	}
@@ -513,6 +514,9 @@ void GraphHost::EnsureTimelines() {
 			throw std::runtime_error("GraphHost could not create its queue timelines");
 		m_timelines.push_back({std::move(fence), std::make_shared<std::atomic<uint64_t>>(1)});
 	}
+	// In-stream epochs' values are signalled by the host's own stream, which no ORG queue sees: the runtime's retirement
+	// frontier covers every value given out on them, so nothing an in-stream list names is freed before that list ran.
+	for (const auto& timeline : m_timelines) m_desc.runtime->RegisterAssignedTimeline(timeline.fence, timeline.nextValue);
 }
 
 bool GraphHost::BuildInstance(size_t index) {

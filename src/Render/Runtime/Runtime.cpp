@@ -134,6 +134,7 @@ Runtime::~Runtime() {
 	{
 		std::scoped_lock lock(m_queuesMutex);
 		m_queues.clear();
+		m_assignedTimelines.clear();
 	}
 	if (runtime::GetDefaultTaskService() == m_desc.tasks) runtime::SetDefaultTaskService({});
 	g_current.store(nullptr, std::memory_order_release);
@@ -156,6 +157,18 @@ void Runtime::UnregisterQueue(rhi::Queue queue) {
 	const auto before = m_queues.size();
 	std::erase_if(m_queues, [&](const rhi::Queue& known) { return SameQueue(known, queue); });
 	if (m_queues.size() != before && progress.timeline) m_retiredTimelines.emplace_back(progress.timeline.impl, progress.timeline.GetHandle());
+}
+
+void Runtime::RegisterAssignedTimeline(std::shared_ptr<rhi::TimelinePtr> fence, std::shared_ptr<const std::atomic<uint64_t>> nextValue) {
+	if (!fence || !*fence || !nextValue) return;
+	std::scoped_lock lock(m_queuesMutex);
+	if (std::ranges::any_of(m_assignedTimelines, [&](const auto& known) { return known.first == fence; })) return;
+	m_assignedTimelines.emplace_back(std::move(fence), std::move(nextValue));
+}
+
+void Runtime::UnregisterAssignedTimeline(const std::shared_ptr<rhi::TimelinePtr>& fence) {
+	std::scoped_lock lock(m_queuesMutex);
+	std::erase_if(m_assignedTimelines, [&](const auto& known) { return known.first == fence; });
 }
 
 void Runtime::NoteTimelineDestroyed(const rhi::Timeline& timeline) {
@@ -258,6 +271,11 @@ runtime::SubmissionFrontier Runtime::Frontier() const {
 	for (const auto& queue : m_queues) {
 		auto progress = queue.Progress();
 		if (progress.timeline && progress.submitted) frontier.push_back({ progress.timeline, progress.submitted });
+	}
+	// Values given out on a host's timelines: work in a host's own stream (in-stream epochs) that no queue above was given.
+	for (const auto& [fence, nextValue] : m_assignedTimelines) {
+		const auto next = nextValue->load(std::memory_order_acquire);
+		if (next > 1 && *fence) frontier.push_back({ fence->Get(), next - 1 });
 	}
 	return frontier;
 }
