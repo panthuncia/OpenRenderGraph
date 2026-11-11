@@ -117,6 +117,8 @@ struct GraphHost::Async {
 	// completion wakes the thread and it reads the mailbox then. Written by the host's thread before its last look at the
 	// mailbox, read by a poster after its write: both sequentially consistent, so one of them sees the other.
 	std::atomic<bool> wakesOnGpu{false};
+	std::atomic<uint64_t> sleepingAt{0};  // the wake version this thread sleeps on, plus one; 0 while awake
+	std::atomic<bool> nudgeLogged{false};
 	uint64_t wakesSkipped = 0;  // render thread
 	// Ticket publication and terminal failure both advance this counter. A
 	// notify on an unchanged null shared_ptr cannot release atomic::wait(nullptr).
@@ -686,6 +688,60 @@ GraphHost::GpuPoint GraphHost::SealedPoint() const {
 	return m_sealed;
 }
 
+bool GraphHost::NudgeHostThread() {
+	// A requester that waits for the host's thread wakes it again: the thread sleeping with a request queued means a wake was lost.
+	auto* async = m_async.get();
+	if (!async || !async->completionWake) return false;
+	const auto sleeping = async->sleepingAt.load(std::memory_order_acquire);
+	if (!sleeping || !m_recordingQueue->head.load(std::memory_order_acquire)) return false;
+	if (!async->nudgeLogged.exchange(true))
+		spdlog::warn("GraphHost: the host's thread slept on wake version {} with a recording request queued (version now {}): woken again", sleeping - 1,
+			async->completionWake->WakeVersion());
+	(void)async->completionWake->Notify();
+	return true;
+}
+
+std::string GraphHost::DescribeAsyncState() const {
+	// Read racily from another thread: a message for a failure, never a decision.
+	const auto* async = m_async.get();
+	if (!async) return "no async host thread";
+	const auto n = [](uint64_t a_value) { return std::to_string(a_value); };
+	const uint64_t seals = m_seals.load(std::memory_order_acquire);
+	std::string out = "host thread: failed " + n(async->failed.load()) + ", messages written " + n(async->written.load()) + " read " +
+		n(async->read.load()) + ", wakes on GPU " + n(async->wakesOnGpu.load()) + ", sleeping on " + n(async->sleepingAt.load()) + " (version + 1), wake version " +
+		n(async->completionWake ? async->completionWake->WakeVersion() : 0) + ", requests queued " + n(m_recordingQueue->head.load() != nullptr) +
+		", accepting " + n(m_recordingQueue->accepting.load()) + ", seals " + n(seals) + ", requests held " + n(async->pendingRequests.size());
+	out += "; epochs (index:epoch paused/needsTicket/ticket/failed/ringFull/generation):";
+	for (size_t i = 0; i < async->epochs.size(); ++i) {
+		const auto full = async->ringFullAt ? async->ringFullAt[i].load() : Async::kNoSeal;
+		out += " " + n(i) + ":" + n(async->epochs[i]) + " " + n(async->paused[i]) + "/" + n(i < async->needsTicket.size() ? async->needsTicket[i] : 0) +
+			"/" + n(async->cells && async->cells[i].load() != nullptr) + "/" + n(async->epochFailed && async->epochFailed[i].load()) + "/" +
+			(full == Async::kNoSeal ? std::string("-") : n(full)) + "/" + n(async->generation[i]);
+	}
+	out += "; held requests (epoch: per ring position r=recorded, R=reserved, P=pending unreached, s=its seal, .=free):";
+	for (const auto& request : async->pendingRequests) {
+		if (!request) continue;
+		out += " [" + n(async->epochs[request->epochIndex]) + " first " + n(request->result ? request->result->firstSlot : 0) + ":";
+		for (size_t p = 0; p < request->recorded.size(); ++p) {
+			const uint32_t slot = (request->result ? request->result->firstSlot : 0) + static_cast<uint32_t>(p);
+			if (request->recorded[p]) {
+				out += " r";
+				continue;
+			}
+			if (slot >= async->slots.size()) {
+				out += " ?";
+				continue;
+			}
+			const auto& entry = async->slots[slot];
+			std::string state = entry.reserved ? "R" : "";
+			if (entry.pending && !PointsReached(entry.points)) state += "P(s" + n(entry.seal) + ")";
+			out += " " + (state.empty() ? std::string(".") : state);
+		}
+		out += "]";
+	}
+	return out;
+}
+
 bool GraphHost::BuildIfRequested() {
 	ReleaseRetiredGraphs(false);
 	return BuildDueInstances(true);
@@ -1183,7 +1239,9 @@ void GraphHost::StartAsync() {
 						state->wakesOnGpu.store(false, std::memory_order_seq_cst);
 						continue;
 					}
+					state->sleepingAt.store(seen + 1, std::memory_order_release);
 					const auto waited = state->completionWake->Wait({heads.data(), count}, seen);
+					state->sleepingAt.store(0, std::memory_order_release);
 					state->wakesOnGpu.store(false, std::memory_order_seq_cst);
 					if (waited != rhi::Result::Ok)
 						throw std::runtime_error("GPU completion wait failed");
@@ -1343,7 +1401,11 @@ bool GraphHost::RequestEpochRecording(uint32_t epoch, std::shared_ptr<const IHos
 	auto* head = queue.head.load(std::memory_order_relaxed);
 	do node->next = head;
 	while (!queue.head.compare_exchange_weak(head, node, std::memory_order_release, std::memory_order_relaxed));
-	if (auto* wake = queue.wake.load(std::memory_order_acquire)) (void)wake->Notify();
+	if (auto* wake = queue.wake.load(std::memory_order_acquire)) {
+		static std::atomic<bool> logged{false};
+		if (const auto result = wake->Notify(); result != rhi::Result::Ok && !logged.exchange(true))
+			spdlog::error("GraphHost: waking the host's thread for a recording request failed ({})", static_cast<int>(result));
+	}
 	return true;
 }
 

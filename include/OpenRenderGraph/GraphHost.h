@@ -477,6 +477,12 @@ public:
 	// Any thread: the point SealSubmitted last captured (none before the first). It names only work already on the device, and
 	// none of the current frame's, so a mid-frame producer may wait for it whatever the frame's later work waits for.
 	GpuPoint SealedPoint() const;
+	// Any thread, for a failure message only: the host's thread's state (each async epoch's pause, ticket and ring, the recording
+	// requests it holds and what each waits for, the queued requests, the wake), read racily.
+	std::string DescribeAsyncState() const;
+	// A thread waiting for recording requests: wakes the host's thread when it sleeps with one queued (a lost wake, logged once).
+	// True when it did.
+	bool NudgeHostThread();
 
 	// The frame-wait timeline (RenderGraph::SetFrameWaitTimeline): a host producer of per-frame values signals it once per frame,
 	// after the values it wrote for that frame, and every batch submitted from then on waits for SetFrameWaitValue's value. Set
