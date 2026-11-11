@@ -84,6 +84,9 @@ public:
 	void PublishQueueFenceSnapshot(std::vector<QueueFenceSnapshotPoint> fenceSnapshot);
 	std::vector<QueueFenceSnapshotPoint> GetQueueFenceSnapshot() const;
 	void ProcessDeferredReleases(uint32_t frameIndex);
+	// ProcessDeferredReleases, with the released objects handed back instead of destroyed: their destruction can free driver
+	// objects, which the caller may want on another thread. The descriptor slots are released here. Null when none is ready.
+	std::shared_ptr<void> ProcessDeferredReleasesElsewhere();
 	DeferredReleaseStats GetDeferredReleaseStats();
 	// The caller must have waited for the device to become idle. Releases every
 	// pending object and forgets queue-fence snapshots before their owning queue

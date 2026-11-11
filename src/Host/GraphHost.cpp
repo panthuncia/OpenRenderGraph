@@ -10,6 +10,7 @@
 #include <deque>
 #include <exception>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <thread>
 
@@ -829,6 +830,8 @@ void GraphHost::ExecuteFrame(const IHostExecutionData* hostData, const FrameCall
 	const bool heldResources = static_cast<bool>(resourceOwner);
 	if (heldResources) m_uncertainExecutionOwners.push_back(std::move(resourceOwner));
 	try {
+		// Execute takes and publishes the queues' values: deferred deletions are not sealed meanwhile.
+		Runtime::AssignmentScope assigning(*m_desc.runtime);
 		graph.Execute(execute);
 	} catch (const std::exception& e) {
 		throw failEpoch(e.what());
@@ -1064,10 +1067,8 @@ void GraphHost::StartAsync() {
 						slot.keepAlive = std::move(state->uncertainUploadOwner);
 						slot.resourceOwner = std::move(state->uncertainResourceOwner);
 						if (!state->paused[message.epochIndex]) state->needsTicket[message.epochIndex] = 1;
-						if (message.retired) {
-							BT_ZONE_SCOPE("ORG.Host.DestroyRetired.Worker");
-							message.retired.reset();
-						}
+						// Never freed on this thread: a driver free can wait for GPU work that waits for a signal this thread prepares.
+						m_desc.runtime->DestroyDetached(std::move(message.retired));
 						break;
 					}
 					case Async::Message::Kind::Discard:
@@ -1591,7 +1592,10 @@ void GraphHost::PrepareTicket(Async& state, uint32_t epochIndex, int32_t request
 		queueUploads.allocator->Recycle();
 		queueUploads.list->Recycle(queueUploads.allocator.Get());
 	}
-	m_desc.runtime->Retire();
+	// The descriptors are released here; the objects behind them and the deferred deletions are freed on the runtime's deleter
+	// thread. A driver free can block until the GPU is done with the memory. The GPU may be waiting for a signal of work this
+	// thread prepares, so a free here could wait forever.
+	m_desc.runtime->RetireDetached();
 	entry.reserved = true;
 	std::shared_ptr<Async::Ticket> ticket;
 	// The epoch's own preparation: its passes' Prepare and recording, the bindless views they resolve. A failure here is the
@@ -1914,6 +1918,9 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 	lap(m_lastTimings.checkUs);
 	// The queues' last values, which every graph assigns from (the host's shared timelines): this submission's come after them,
 	// and go back to the registry as soon as they are assigned, before any other graph's submission.
+	// From taking them until they are published, the frontier would miss the values this submission signals: deferred
+	// deletions are not sealed meanwhile. It ends at the publish below, or with it on a throw.
+	std::optional<Runtime::AssignmentScope> assigning(std::in_place, *m_desc.runtime);
 	auto& queues = graph.GetQueueRegistry();
 	async.queueValues.resize(queues.SlotCount());
 	for (size_t queue = 0; queue < queues.SlotCount(); ++queue) {
@@ -2051,6 +2058,7 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 		throw;
 	}
 	publishQueueValues.Publish();
+	assigning.reset();
 	sequencer.unlock();
 	lap(m_lastTimings.submitUs);
 	// The handoff and release lists the submission recorded: kept until the slot completes, with the uploads' staging.
@@ -2094,6 +2102,9 @@ void GraphHost::NoteExternalSlotUse(uint32_t slot, std::shared_ptr<rhi::Timeline
 	m_externalTimeline = timeline;
 	m_externalSlotValues[slot] = (std::max)(m_externalSlotValues[slot], value);
 	DescriptorHeapManager::GetInstance().PublishQueueFenceSnapshot({ DescriptorHeapManager::QueueFenceSnapshotPoint{ .timeline = timeline->Get(), .value = value } });
+	// The client's own work at the slot may use ORG objects too (draws in its stream that read a graph's buffers). No ORG queue
+	// sees that work, so deferred deletions wait for its value as descriptor releases do.
+	m_desc.runtime->NoteExternalPoint(timeline->Get(), value);
 }
 
 void GraphHost::BeginExternalFrameSlot(uint32_t slot) {
@@ -2109,8 +2120,9 @@ void GraphHost::BeginExternalFrameSlot(uint32_t slot) {
 		return;
 	}
 	if (auto retired = m_desc.runtime->RetireElsewhere()) m_externalRetired.push_back(std::move(retired));
-	// No submission came to take them for a round of slots: they are freed here rather than kept.
-	if (m_externalRetired.size() > m_frameSlots) m_externalRetired.clear();
+	// No submission came to take them for a round of slots: they go to the runtime's deleter rather than being kept.
+	if (m_externalRetired.size() > m_frameSlots)
+		for (auto& retired : std::exchange(m_externalRetired, {})) m_desc.runtime->DestroyDetached(std::move(retired));
 }
 
 void GraphHost::NoteSlotSubmitted(uint32_t slot) {

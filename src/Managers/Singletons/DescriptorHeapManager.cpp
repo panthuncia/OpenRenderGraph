@@ -319,6 +319,12 @@ void DescriptorHeapManager::RetireExecutionLease(std::shared_ptr<const void> lea
 
 void DescriptorHeapManager::ProcessDeferredReleases(uint32_t frameIndex) {
     (void)frameIndex;
+    // Resource destruction can itself retire descriptor slots. It runs here, outside m_descriptorMutationMutex, to avoid
+    // recursive singleton entry.
+    (void)ProcessDeferredReleasesElsewhere();
+}
+
+std::shared_ptr<void> DescriptorHeapManager::ProcessDeferredReleasesElsewhere() {
     std::vector<DeferredRelease> readyReleases;
     {
         std::scoped_lock lock(m_descriptorMutationMutex);
@@ -363,9 +369,9 @@ void DescriptorHeapManager::ProcessDeferredReleases(uint32_t frameIndex) {
             m_deferredReleases.pop_back();
         }
     }
-    // Resource destruction can itself retire descriptor slots. Keep it outside
-    // m_descriptorMutationMutex to avoid recursive singleton entry.
-    readyReleases.clear();
+    // Destroyed wherever the caller drops them, never under m_descriptorMutationMutex.
+    if (readyReleases.empty()) return {};
+    return std::make_shared<std::vector<DeferredRelease>>(std::move(readyReleases));
 }
 
 DescriptorHeapManager::DeferredReleaseStats DescriptorHeapManager::GetDeferredReleaseStats() {

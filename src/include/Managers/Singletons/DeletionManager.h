@@ -19,6 +19,8 @@ namespace org {
 // progress it had at the next Retire. That progress is a SubmissionFrontier. Any work that could still use the object
 // was submitted before then. The runtime installs the frontier with SetFrontier. Without a frontier, nothing retires
 // before DrainAll.
+// A batch is sealed only while the frontier is settled: no submission is between taking its values and publishing them.
+// A frontier taken inside that window would miss the values that submission is about to signal.
 class DeletionManager {
 public:
 	struct Stats {
@@ -51,11 +53,14 @@ public:
 	}
 
 	// Installs the runtime's frontier, which Retire seals batches with, and the check for when its points are reached.
-	// Both are called under this manager's lock, so they must not mark anything.
-	void SetFrontier(std::function<runtime::SubmissionFrontier()> frontier, runtime::PointReached reached) {
+	// settled says whether the frontier is complete now (no values handed out but not yet published). Without it, it
+	// always is. All three are called under this manager's lock, so they must not mark anything.
+	void SetFrontier(std::function<runtime::SubmissionFrontier()> frontier, runtime::PointReached reached,
+		std::function<bool()> settled = {}) {
 		std::scoped_lock lock(m_mutex);
 		m_frontier = std::move(frontier);
 		m_reached = std::move(reached);
+		m_settled = std::move(settled);
 	}
 
 	void MarkForDelete(rhi::helpers::AnyObjectPtr ptr) {
@@ -102,7 +107,8 @@ public:
 			Append(retired.trackedAllocations, batch.trackedAllocations);
 			m_sealed.pop_front();
 		}
-		if (m_frontier && !m_open.Empty()) {
+		// Not settled: the open batch waits for the next Retire, whose frontier covers that submission's values.
+		if (m_frontier && !m_open.Empty() && (!m_settled || m_settled())) {
 			m_sealed.push_back({ m_frontier(), std::move(m_open) });
 			m_open = {};
 		}
@@ -140,6 +146,7 @@ public:
 		m_open = {};
 		m_frontier = {};
 		m_reached = {};
+		m_settled = {};
 		m_initialized = false;
 	}
 
@@ -162,6 +169,7 @@ private:
 	bool m_initialized = false;
 	std::function<runtime::SubmissionFrontier()> m_frontier;
 	runtime::PointReached m_reached;
+	std::function<bool()> m_settled;
 	Retired m_open;
 	std::deque<Sealed> m_sealed;
 };

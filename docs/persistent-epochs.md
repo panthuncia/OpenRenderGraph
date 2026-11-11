@@ -258,6 +258,17 @@ external-commands callbacks, so ORG's work does not end DXVK's list.
     -   A list whose set was replaced while it recorded writes and resolves no more queries. Its resolve would otherwise
         wait on the GPU for queries the new pool never wrote.
     -   Test: `TestAssignedTimelineRetirement` and `TestStatisticsPoolRetirement` (`tests/RuntimeTests.cpp`).
+    -   A host's own work outside the graphs can use ORG objects too: draws in its stream that read a graph's buffers.
+        `Runtime::NoteExternalPoint` names a value the stream signals after that work, and the frontier covers the latest one
+        per timeline. `GraphHost::NoteExternalSlotUse` notes its value there as well as with the descriptor releases. The
+        stream must signal it, or deletions wait forever.
+    -   A submission takes the queues' values, submits, then publishes them. A frontier taken in between misses them. So a
+        deletion batch is not sealed while an `org::Runtime::AssignmentScope` is open (`SubmitTicket`, `ExecuteFrame`).
+    -   No driver free on the host's thread. On Windows, freeing a GPU virtual address waits for the GPU. The GPU may wait for
+        a signal of work the host's thread prepares, so a free there can wait forever (Community Shaders deadlocked this way
+        on the RX 6600). `PrepareTicket` calls `Runtime::RetireDetached`, and a submission's retired objects go to
+        `Runtime::DestroyDetached`. Both hand the objects to the runtime's deleter thread. A free there slower than 100 ms is
+        logged, and one still running after a second is logged at the next hand-off.
 -   **Test.** `PersistentVulkanHostTests`:
     -   `external`: a late pass in the stream.
     -   `stream` / `stream open`: a write on a compute queue and a copy on a copy queue aliased to the graphics one, with
