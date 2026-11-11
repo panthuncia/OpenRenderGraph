@@ -118,6 +118,37 @@ thread calls `SubmitEpoch(epoch, beforeSubmit)` at each point instead of `Execut
 -   **Constraints on a ticket.** Its recording may not depend on anything the render thread produces at the epoch.
     Per-frame values come from latches.
 
+### Slot rings and epochs that run many times a frame
+
+Each async epoch takes the frame slots of a ring of its own, in turn: `framesInFlight` slots, after the rings of the async
+epochs before it. The host thread waits for a slot's last run on the GPU before it prepares the slot again. That wait is
+the CPU's backpressure, and it is only safe on work the device has. A host that holds submissions in a stream until the
+frame's end has not handed the current frame's runs to the device. CS, for example, puts its epochs into DXVK's command
+list, and DXVK submits it at Present. An epoch that runs more than `framesInFlight` times in one such frame makes the host
+thread wait for one of its own held runs, while the render thread waits for the host thread at the epoch's next run. That
+is a deadlock.
+
+`Desc::epochRuns` lists such epochs with the most runs a frame they are sized for:
+
+-   **Capacity.** The epoch's ring has `framesInFlight * runsPerFrame` slots. `FrameSlots()` counts them
+    (`GraphHost::FrameSlotsFor(desc)` before the host exists, to size the runtime). It is fixed when the host is made, so
+    a `LatchBlock` sized from it, and every other per-slot table, stays right.
+-   **Growth.** The ring starts with `framesInFlight` slots. The next ticket takes the least recently submitted slot in
+    use. It waits for that slot only when the slot's last run is done, or is at least `max(framesInFlight - 1, 1)` frame
+    boundaries old. Otherwise the ring grows by one slot. Frame boundaries are `SealSubmitted` calls: the host declares
+    there that everything submitted so far is on the device. So waits target only runs of earlier frames, with the same
+    lead as an epoch that runs once a frame, and the ring settles at about its runs a frame times `framesInFlight`.
+-   **Full.** At capacity, a slot whose last run is sealed is waited for: that is safe, only more backpressure. When every
+    slot holds a run the host has not sealed, the epoch's next ticket waits for the next seal. Meanwhile `SubmitEpoch`
+    throws `EpochRingFullError` (an `EpochFailedError`): nothing was submitted, the epoch has not failed, and the caller
+    skips that run. One warning is logged per epoch.
+-   **Contract.** A host that lists an epoch in `epochRuns` calls `SealSubmitted` at every frame boundary. Epochs not
+    listed keep a ring of `framesInFlight` slots and always wait, as before.
+-   **Statistics.** `AsyncStats::ringGrowths` and `ringFull`.
+-   **Test.** `PersistentVulkanHostTests rings` (and `rings open`): an external epoch run six times a frame with two
+    frames in flight, its executions held until the frame's end, runs without a deadlock; nine runs between two seals
+    skip the ninth.
+
 ## Recording reuse
 
 With `Desc::reuseRecordings` (`RenderGraph::SetPersistentRecordingReuse`), a ticket's recording is kept and submitted again
@@ -151,8 +182,8 @@ alternates should republish its earlier identity rather than a new one.
 `SetAsyncEpochs(epochs, revisionEpochs)` makes the listed epochs revision-driven. Their recordings are made ahead, for a
 revision the host's scene supplies (CS's DCLF scene revision), and nothing about them is recorded at submission.
 
--   **Slot rings.** Async epoch i uses frame slots `i * framesInFlight` up to `+ framesInFlight - 1`. Its tickets take the
-    next slot of its ring, so a recording per ring slot covers every ticket.
+-   **Slot rings.** Each async epoch has a ring of frame slots of its own (above). A recording has one per slot of the
+    ring's capacity, so it covers every ticket, also after the ring grows.
 -   **`RequestEpochRecording(epoch, hostData, done)`.** Lock-free, from any thread, safe across a build. The host thread
     records the epoch for `hostData` into every slot of its ring, each once the slot's last work is done, and calls `done`
     once with the recording, the error that stopped it, or `EpochRecordingDropped` when a build stopped the host thread
@@ -289,4 +320,5 @@ the owner thread.
     -   `async`, `reuse`, `revision` and `external`, each also `open`;
     -   `split` (two epochs, two graphs, one rebuilt alone);
     -   `stream` and `stream open home`;
-    -   `arena`.
+    -   `arena`;
+    -   `rings` and `rings open` (an epoch that runs many times a frame, `Desc::epochRuns`).
