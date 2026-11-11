@@ -549,6 +549,10 @@ static int Run(int argc, char** argv) {
 	// "stream": an external epoch with its write on the compute queue (the family's second queue): batches off the host's stream,
 	// and the stream's segments.
 	const bool stream = argc > 1 && std::strcmp(argv[1], "stream") == 0;
+	// "rings": an external async epoch that runs many times a frame (GraphHost::Desc::epochRuns), its executions held, as a host's
+	// stream holds them, and executed only at the frame's end, before SealSubmitted. Its ring grows instead of waiting for a run of
+	// the same frame, and a frame with more runs than the ring has slots skips the rest (EpochRingFullError) instead of hanging.
+	const bool rings = argc > 1 && std::strcmp(argv[1], "rings") == 0;
 	// "open" after the mode: async epochs on open executions, admitted at submission (no closed executions).
 	const bool open = argc > 2 && std::strcmp(argv[2], "open") == 0;
 	// "stream open home": the write also reads a host-owned texture, under external home states.
@@ -834,6 +838,138 @@ static int Run(int argc, char** argv) {
 				if (home) REQUIRE(splits == 8 && segments == (scopedUploads ? 24u : 32u), "the host texture's release and acquire segments");
 				else if (!scopedUploads) REQUIRE(splits == 8 && segments == 16, "the copy's segment is split from the uploads' when the write waits for them");
 				else REQUIRE(splits == 0 && segments == 8, "an upload on the write's queue needs no segment of its own, and no split");
+				REQUIRE(!counters.unbalanced && counters.locks.load() == counters.unlocks.load(), "balanced host queue locks");
+				host.SetAsyncEpochs({});
+				host.DestroyGraph();
+			}
+			runtime.reset();
+		} else if (rings) {
+			// Two frames in flight; epoch 0 sized for 4 runs a frame: a ring of 8 slots, of which it starts with 2.
+			org::GraphHost::Desc desc{.queueBoundary = {.entry = true, .exit = true}, .framesInFlight = 2, .epochOrder = {0},
+				.closedExecutions = !open};
+			desc.epochRuns = {{.epoch = 0, .runsPerFrame = 4}};
+			REQUIRE(org::GraphHost::FrameSlotsFor(desc) == 8, "frame slots: frames in flight times the epoch's runs a frame");
+			bool rejected = false;
+			try {
+				auto invalid = desc;
+				invalid.epochRuns = {{.epoch = 7, .runsPerFrame = 2}};
+				(void)org::GraphHost::FrameSlotsFor(invalid);
+			} catch (const std::invalid_argument&) {
+				rejected = true;
+			}
+			REQUIRE(rejected, "epochRuns names only epochs of the order");
+			auto runtime = org::Runtime::Create({.device = device.Get(), .backend = rhi::Backend::Vulkan, .slots = 8,
+				.tasks = std::make_shared<org::runtime::ThreadPoolTaskService>(2)});
+			desc.runtime = runtime;
+			{
+				org::GraphHost host(desc);
+				REQUIRE(host.FrameSlots() == 8, "the host's frame slots");
+				auto program = CreateProgram(device.Get());
+				REQUIRE(program, "compute program");
+				auto scratch = org::Buffer::CreateSharedUnmaterialized(rhi::HeapType::DeviceLocal, kBytes, true);
+				org::BufferBase::DescriptorRequirements requirements{};
+				requirements.createUAV = true;
+				requirements.uavDesc = {.dimension = rhi::UavDim::Buffer, .formatOverride = rhi::Format::R32_Typeless,
+					.buffer = {.kind = rhi::BufferViewKind::Raw, .firstElement = 0, .numElements = kCount}};
+				scratch->SetDescriptorRequirements(requirements);
+				scratch->SetName("test.scratch");
+				auto output = ImportHostBuffer(device.Get(), first, "test.host-output.first");
+				REQUIRE(output, "import host buffer");
+				auto input = org::Buffer::CreateSharedUnmaterialized(rhi::HeapType::DeviceLocal, 16, false);
+				org::BufferBase::DescriptorRequirements inputViews{};
+				inputViews.createSRV = true;
+				inputViews.srvDesc = {.dimension = rhi::SrvDim::Buffer, .formatOverride = rhi::Format::R32_Typeless,
+					.buffer = {.kind = rhi::BufferViewKind::Raw, .firstElement = 0, .numElements = 4}};
+				input->SetDescriptorRequirements(inputViews);
+				input->SetName("test.input");
+				uint32_t value = 0;
+				const auto upload = [&](org::RenderGraph&) {
+					BUFFER_UPLOAD(&value, sizeof(value), org::runtime::UploadTarget::FromShared(input), 0);
+				};
+				auto outputRevision = std::make_shared<std::atomic<uint64_t>>(1);
+				host.AddExtension("test.host", [&] { return std::make_unique<HostExtension>(input, scratch, output, program, outputRevision); });
+				host.SetExternalEpochs({0});
+				host.SetAsyncEpochs({0});
+				// A deadlock (the host's thread waiting for a held run while this thread waits for it) ends the test instead of hanging it.
+				std::atomic<bool> finished{false};
+				std::thread watchdog([&] {
+					const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+					while (!finished.load(std::memory_order_acquire)) {
+						if (std::chrono::steady_clock::now() > deadline) {
+							std::puts("FAIL: rings: the frame did not finish (a wait for a run of the same frame)");
+							std::fflush(stdout);
+							std::_Exit(1);
+						}
+						std::this_thread::sleep_for(std::chrono::milliseconds(20));
+					}
+				});
+				struct JoinWatchdog {
+					std::atomic<bool>& finished;
+					std::thread& thread;
+					~JoinWatchdog() {
+						finished.store(true, std::memory_order_release);
+						if (thread.joinable()) thread.join();
+					}
+				} joinWatchdog{finished, watchdog};
+				// The frame's executions, executed in order at its end (one at a time: the executor reuses its command buffers), then sealed.
+				SegmentExecutor executor{device.Get()};
+				std::vector<std::shared_ptr<org::ExternalEpochExecution>> held;
+				const auto endFrame = [&](uint32_t expected) -> int {
+					for (auto& execution : held)
+						REQUIRE(executor.Execute(*execution) && device->WaitIdle() == rhi::Result::Ok, "a held execution at the frame's end");
+					held.clear();
+					REQUIRE(Matches(first, expected), "the frame's last run wrote last");
+					host.SealSubmitted();
+					return 0;
+				};
+				(void)host.TakeAsyncStats();
+				// Six runs a frame, three times the frames in flight: the old ring of two slots waited for a run still held.
+				constexpr uint32_t kRuns = 6;
+				for (uint32_t frame = 0; frame < 6; ++frame) {
+					for (uint32_t run = 0; run < kRuns; ++run) {
+						value = 120000u + 100u * frame + 10u * run;
+						host.SubmitEpoch(0, upload);
+						auto execution = host.TakeExternalExecution();
+						REQUIRE(execution, "an external execution per run");
+						held.push_back(std::move(execution));
+					}
+					if (const int failed = endFrame(value)) return failed;
+				}
+				const auto grown = host.TakeAsyncStats();
+				std::printf("rings: %llu submissions, %llu ring growths, %llu full\n", static_cast<unsigned long long>(grown.submitted),
+					static_cast<unsigned long long>(grown.ringGrowths), static_cast<unsigned long long>(grown.ringFull));
+				REQUIRE(grown.submitted == 6 * kRuns && grown.ringGrowths > 0 && grown.ringGrowths <= 6 && grown.ringFull == 0,
+					"the ring grew instead of waiting for the frame's own runs, within its 8 slots");
+				// More runs in one frame than the ring has slots: the ninth is skipped (nothing submitted), and nothing hangs.
+				uint32_t submitted = 0;
+				bool full = false;
+				uint32_t last = 0;
+				for (uint32_t run = 0; run < 12 && !full; ++run) {
+					value = 130000u + 10u * run;
+					try {
+						host.SubmitEpoch(0, upload);
+						auto execution = host.TakeExternalExecution();
+						REQUIRE(execution, "an external execution per run");
+						held.push_back(std::move(execution));
+						last = value;
+						++submitted;
+					} catch (const org::GraphHost::EpochRingFullError& e) {
+						full = true;
+						REQUIRE(e.epoch == 0 && e.capacity == 8 && !host.EpochFailed(0), "a full ring is not a failed epoch");
+					}
+				}
+				std::printf("rings: %u runs before the ring was full\n", submitted);
+				REQUIRE(full && submitted == 8, "eight runs fit between two seals, the ninth is skipped");
+				if (const int failed = endFrame(last)) return failed;
+				REQUIRE(host.PollEpochFailures() == 0, "nothing reported");
+				// After the seal, the epoch runs again.
+				value = 140000u;
+				host.SubmitEpoch(0, upload);
+				auto after = host.TakeExternalExecution();
+				REQUIRE(after, "the run after the seal");
+				held.push_back(std::move(after));
+				if (const int failed = endFrame(value)) return failed;
+				REQUIRE(host.TakeAsyncStats().ringFull >= 1, "the full ring was counted");
 				REQUIRE(!counters.unbalanced && counters.locks.load() == counters.unlocks.load(), "balanced host queue locks");
 				host.SetAsyncEpochs({});
 				host.DestroyGraph();
