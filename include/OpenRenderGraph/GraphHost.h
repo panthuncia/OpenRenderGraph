@@ -137,6 +137,10 @@ public:
 	// rebuilds every graph.
 	void AddExtension(std::string id, ExtensionFactory factory, std::vector<uint32_t> epochs = {});
 	void RemoveExtension(const std::string& id);
+	/** @brief Whether an extension is registered under id (AddExtension). Owner thread. */
+	bool HasExtension(std::string_view id) const noexcept {
+		return std::ranges::any_of(m_extensions, [&](const Registered& entry) { return entry.id == id; });
+	}
 
 	// Every graph is built again before its next execution or submission. reason: why, named in the build's log line
 	// ("GraphHost: epoch N's graph built again ... why: ..."); requests with the same reason are counted together.
