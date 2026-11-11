@@ -25,7 +25,13 @@ submission point is an **epoch**.
 -   **Rebuilding one epoch.** `RequestRebuild(epoch)` rebuilds that epoch's graph alone: the host thread detaches it, the
     owner thread builds the new graph, and the old one is released once its own submitted work completes. There is no
     device wait, and the other epochs keep their graphs and builds (`BuildGeneration(epoch)`). `RequestRebuild()`
-    rebuilds all of them.
+    rebuilds all of them. Every request takes a reason; the build's log line names the reasons it answers, with counts
+    (`GraphHost: epoch N's graph built again ... why: ...`), and a build point that builds several graphs logs a total.
+-   **Rebuilding only what changed.** Each graph builds every extension made into it, so a rebuild costs every one of their
+    gathers. An extension that only some epochs use names them (`AddExtension(id, factory, epochs)`): the other graphs
+    never make it, and adding it again rebuilds only its epochs. An extension made into a graph of one epoch gathers only
+    that epoch's passes (`rg.PassEpochFilter()`). A name whose meaning changed (a resource registered under a new name)
+    rebuilds only the graphs that looked it up (`RequestRebuildFor(id)`, `RenderGraph::LookedUp`).
 -   **Graph access.** `Graph(epoch)` gives an epoch's graph, `Graph()` the first one; `GraphCount`, `GraphAt`, `EpochAt`
     enumerate them. The runtime's services (uploads, descriptors, tasks) are shared by all of them.
 

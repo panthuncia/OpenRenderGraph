@@ -9,6 +9,8 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #include <rhi.h>
@@ -128,23 +130,38 @@ public:
 	GraphHost& operator=(const GraphHost&) = delete;
 
 	// Extensions are instantiated from their factories each time a graph is (re)built, once per graph, so they may size
-	// resources from current host state. Each graph takes the passes of its own epoch from them. Adding or removing one
+	// resources from current host state. Each graph takes the passes of its own epoch from them.
+	// epochs: the epochs whose graphs the extension is made into (empty, or one of them persistent::AllEpochs: every graph).
+	// An extension whose passes and registered resources only some epochs use names them: the other epochs' graphs never
+	// make it, and adding it again, or removing it, rebuilds only its epochs' graphs. Adding or removing one without epochs
 	// rebuilds every graph.
-	void AddExtension(std::string id, ExtensionFactory factory);
+	void AddExtension(std::string id, ExtensionFactory factory, std::vector<uint32_t> epochs = {});
 	void RemoveExtension(const std::string& id);
+	/** @brief Whether an extension is registered under id (AddExtension). Owner thread. */
+	bool HasExtension(std::string_view id) const noexcept {
+		return std::ranges::any_of(m_extensions, [&](const Registered& entry) { return entry.id == id; });
+	}
 
-	// Every graph is built again before its next execution or submission.
-	void RequestRebuild() noexcept;
+	// Every graph is built again before its next execution or submission. reason: why, named in the build's log line
+	// ("GraphHost: epoch N's graph built again ... why: ..."); requests with the same reason are counted together.
+	void RequestRebuild(std::string_view reason = {}) noexcept;
 	// The epoch's graph alone is built again; the others keep running as built. With async epochs, the epoch's ticket is given
 	// back and its graph replaced at its next submission (or BuildIfRequested), and the old graph is released once its own
 	// submitted work completes, without waiting for it. An epoch the host does not have is ignored.
-	void RequestRebuild(uint32_t epoch) noexcept;
+	void RequestRebuild(uint32_t epoch, std::string_view reason = {}) noexcept;
+	/**
+	 * @brief The graphs that looked id up by name (RenderGraph::LookedUp, found or not) are built again; the others keep theirs.
+	 * For a name whose meaning changed without anything being dropped: a resource registered under a new name, which no graph that
+	 * never asked for it needs. A graph that still holds a resource being dropped needs RequestRebuild instead. Returns how many
+	 * epochs were marked.
+	 */
+	size_t RequestRebuildFor(const ResourceIdentifier& id, std::string_view reason = {}) noexcept;
 	// Pass and barrier-batch timestamps in the recordings kept across frames (RenderGraph::SetPersistentRecordingTimestamps),
 	// off by default: read back with the other pass timestamps (IStatisticsService::GetCompletedTimestamps, in the completed
 	// frame callback). A change requests a rebuild, so every kept recording (a revision's epochs) is recorded again with them,
 	// or without; until that build, kept recordings stay as they were recorded.
 	void SetRecordingTimestamps(bool enabled) noexcept {
-		if (m_recordingTimestamps.exchange(enabled, std::memory_order_acq_rel) != enabled) RequestRebuild();
+		if (m_recordingTimestamps.exchange(enabled, std::memory_order_acq_rel) != enabled) RequestRebuild("recording timestamps switched");
 	}
 	bool RecordingTimestamps() const noexcept { return m_recordingTimestamps.load(std::memory_order_acquire); }
 	// Diagnostics: the external queue boundary's entry and exit barriers in place of Desc::queueBoundary's, from the next build
@@ -153,7 +170,7 @@ public:
 		m_boundaryEntry.store(boundary.entry, std::memory_order_release);
 		m_boundaryExit.store(boundary.exit, std::memory_order_release);
 		m_boundaryOverridden.store(true, std::memory_order_release);
-		RequestRebuild();
+		RequestRebuild("queue boundary overridden");
 	}
 	// Schedule introspection (RenderGraph::SetScheduleTraceEnabled) on every graph and on every graph built after, so it
 	// survives rebuilds. Host thread (it reads the current graphs); read the snapshots through Graph(epoch).
@@ -523,6 +540,8 @@ private:
 		uint32_t epoch = UINT32_MAX;  // persistent::AllEpochs without epochs
 		std::unique_ptr<RenderGraph> graph;
 		bool rebuildRequested = true;
+		// Why the rebuild was requested (RequestRebuild's reasons, each with its count), logged with the build and cleared by it.
+		std::vector<std::pair<std::string, uint32_t>> rebuildReasons;
 		uint64_t buildGeneration = 0;  // BuildGeneration(epoch)
 		// Its graph failed to build (with none to keep) or to prepare: it runs nothing until a build of it succeeds (EpochFailed).
 		bool failed = false;
@@ -569,7 +588,14 @@ private:
 	struct Registered {
 		std::string id;
 		ExtensionFactory factory;
+		std::vector<uint32_t> epochs;  // AddExtension's: empty for every graph
 	};
+	// Whether the extension is made into the epoch's graph (Registered::epochs).
+	static bool ExtensionInEpoch(const Registered& extension, uint32_t epoch) noexcept;
+	// Marks the instance's graph for a rebuild and records why (Instance::rebuildReasons).
+	static void MarkRebuild(Instance& instance, std::string_view reason) noexcept;
+	// Marks the graphs the extension is made into.
+	void RequestRebuildOf(const Registered& extension, std::string_view reason) noexcept;
 	std::vector<Registered> m_extensions;
 	std::vector<Instance> m_instances;  // by Desc::epochOrder (one without epochs)
 	std::vector<RetiredGraph> m_retiredGraphs;
