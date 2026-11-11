@@ -101,7 +101,9 @@ public:
 		 * run is still unsealed (more runs since the last seal than the capacity), the epoch's next ticket is not prepared
 		 * until the next seal, and SubmitEpoch throws EpochRingFullError for it meanwhile: the caller skips that run, nothing
 		 * hangs. A host that lists an epoch here must call SealSubmitted at every frame boundary. Epochs not listed keep a ring
-		 * of framesInFlight slots and always wait, as before. Each epoch must be one of epochOrder; runsPerFrame at least 1.
+		 * of framesInFlight slots and do not grow. Once the host has sealed, they follow the same rule: a ticket takes the least
+		 * recently submitted slot whose last run is done or sealed, and when there is none the ring is full as above. A host that
+		 * never seals keeps waiting for any slot. Each epoch must be one of epochOrder; runsPerFrame at least 1.
 		 */
 		struct EpochRuns {
 			uint32_t epoch = 0;
@@ -644,10 +646,12 @@ private:
 	// this thread (a build, a retired graph's release: both change services every graph shares).
 	void HoldAsync(std::span<const size_t> detach, const std::function<void()>& work);
 	void PrepareTicket(Async& state, uint32_t epochIndex, int32_t requestedSlot);
-	// Host thread, an epoch of Desc::epochRuns: the slot of its ring its next ticket takes (the ring grown when the one it would take
-	// ran too recently), or UINT32_MAX when every slot holds a run not sealed yet (the ring is full until the next seal).
-	uint32_t GrowingRingSlot(Async& state, uint32_t epochIndex);
-	void WaitSlot(Async& state, uint32_t slot);
+	// Host thread: the slot of its ring an epoch's next ticket takes, the least recently submitted one whose last run may be waited
+	// for (done, or sealed: never a run that may still be in the host's stream). A ring of Desc::epochRuns grows instead when that run
+	// is too recent. UINT32_MAX when no slot qualifies: the ring is full until the next seal or one of its runs completes.
+	uint32_t RingSlot(Async& state, uint32_t epochIndex);
+	// Host thread: waits for the slot's last run on the GPU. Logs once per epoch if that run is neither done nor sealed.
+	void WaitSlot(Async& state, uint32_t slot, uint32_t epochIndex);
 	bool AdvanceRecordingRequests(Async& state);
 	// Host thread: admits the recording of the ticket's slot as one of the revision ticket's candidates.
 	void AddRevisionCandidate(Async& state, uint32_t epochIndex, RenderGraph::PersistentTicket& ticket, const EpochRecording& recording);

@@ -71,11 +71,10 @@ struct GraphHost::Async {
 	// Host thread, per epoch index: let go of (Detach) until its instance is attached again; and its instance's build generation.
 	std::vector<uint8_t> paused;
 	std::vector<uint64_t> generation;
-	// Per epoch index, its ring of frame slots: [ringFirst, + ringCapacity), of which the first ringActive are in use, and the next
-	// position (rings of a fixed size). rings false: one ring of every slot.
+	// Per epoch index, its ring of frame slots: [ringFirst, + ringCapacity), of which the first ringActive are in use. rings false:
+	// one ring of every slot, which the epochs share.
 	bool rings = false;
 	std::vector<uint32_t> ringFirst, ringCapacity, ringActive;
-	std::vector<uint64_t> ringNext;
 	// Per epoch index: whether its ring grows (Desc::epochRuns: a capacity above framesInFlight), and the seals a slot's last run must
 	// be behind before the slot is waited for instead of the ring growing (max(framesInFlight - 1, 1)).
 	std::vector<uint8_t> ringGrows;
@@ -89,6 +88,8 @@ struct GraphHost::Async {
 	std::unique_ptr<std::atomic<uint64_t>[]> ringFullAt;
 	std::atomic<bool> anyRingFull{false};
 	std::vector<uint8_t> ringFullLogged;
+	// Per epoch index: a wait for an unsealed run was logged (WaitSlot). It should never happen.
+	std::vector<uint8_t> unsealedWaitLogged;
 	std::atomic<uint64_t> ringGrowths{0}, ringFulls{0};
 	// Recording requests taken from the host's queue (RecordingQueue), by the host's thread, in posting order.
 	struct RecordingRequest {
@@ -151,12 +152,24 @@ struct GraphHost::Async {
 		std::shared_ptr<const void> resourceOwner;
 	};
 	std::vector<Slot> slots;
+	// Whether the host's thread may block on a slot's last run: none is pending, it is done, or a seal came after it. A run of a frame
+	// not sealed yet may still be in the host's stream, off the device, and waiting for it would deadlock: the render thread that
+	// would flush it may be waiting for this thread. A host that never sealed hands its runs to the device itself (only an epoch whose
+	// ring grows requires seals, Desc::epochRuns), so then every run is waitable.
+	bool Waitable(const Slot& entry, uint64_t sealCount, bool needsSeal) const {
+		if (!entry.pending || entry.seal < sealCount || PointsReached(entry.points)) return true;
+		return !needsSeal && sealCount == 0;
+	}
+	// The slots an epoch's next ticket may take: its ring's slots in use, or every slot (rings false).
+	std::pair<uint32_t, uint32_t> SlotRange(uint32_t epochIndex) const {
+		if (!rings) return {0, static_cast<uint32_t>(slots.size())};
+		return {ringFirst[epochIndex], ringFirst[epochIndex] + ringActive[epochIndex]};
+	}
 	// The worker stops on the first completion exception. Preserve the one
 	// submitted message it was processing until device teardown.
 	std::shared_ptr<void> uncertainUploadOwner;
 	std::shared_ptr<const void> uncertainResourceOwner;
 	std::vector<uint8_t> needsTicket;
-	uint64_t nextSlot = 0;
 	uint64_t hostFrame = 0;
 	// The highest submission number a Submitted message brought (the mailbox is in order: every one not read yet is higher), and
 	// the last value the retired callback was given.
@@ -894,11 +907,11 @@ void GraphHost::StartAsync() {
 		async->rings = first <= m_frameSlots;
 		async->ringLag = (std::max)(frames - 1, 1u);
 	}
-	async->ringNext.assign(async->epochs.size(), 0);
 	async->seals = &m_seals;
 	async->ringFullAt = std::make_unique<std::atomic<uint64_t>[]>(async->epochs.size());
 	for (uint32_t index = 0; index < async->epochs.size(); ++index) async->ringFullAt[index].store(Async::kNoSeal, std::memory_order_relaxed);
 	async->ringFullLogged.assign(async->epochs.size(), 0);
+	async->unsealedWaitLogged.assign(async->epochs.size(), 0);
 	async->cells = std::make_unique<std::atomic<std::shared_ptr<Async::Ticket>>[]>(async->epochs.size());
 	async->needsTicket.assign(async->epochs.size(), 1);
 	async->liveRecordings.assign(async->epochs.size(), {});
@@ -915,7 +928,6 @@ void GraphHost::StartAsync() {
 		async->slots[slot].pending = completion.pending;
 		completion = {};
 	}
-	async->nextSlot = m_frameNumber;
 	async->hostFrame = m_frameNumber;
 	async->submissionsSeen = m_submissions;
 	// The queues' layout is every graph's: the primary queues first, on the host's timelines.
@@ -1119,9 +1131,18 @@ void GraphHost::StartAsync() {
 					if (!state->needsTicket[index] || state->paused[index] || state->epochFailed[index].load(std::memory_order_relaxed)
 						|| state->cells[index].load(std::memory_order_acquire))
 						continue;
-					// A ring full of unsealed runs waits for the next seal (its SealSubmitted wakes this thread).
+					// A ring full of unsealed runs waits for the next seal (its SealSubmitted wakes this thread), or for one of its runs to
+					// complete (this thread sleeps on the pending slots' completions too).
 					if (const auto full = state->ringFullAt[index].load(std::memory_order_acquire); full != Async::kNoSeal) {
-						if (full == m_seals.load(std::memory_order_acquire)) continue;
+						if (full == m_seals.load(std::memory_order_acquire)) {
+							const auto [begin, end] = state->SlotRange(index);
+							bool done = false;
+							for (uint32_t slot = begin; slot < end && !done; ++slot) {
+								const auto& entry = state->slots[slot];
+								done = !entry.reserved && (!entry.pending || PointsReached(entry.points));
+							}
+							if (!done) continue;
+						}
 						state->ringFullAt[index].store(Async::kNoSeal, std::memory_order_release);
 					}
 					PrepareTicket(*state, index, -1);
@@ -1252,11 +1273,19 @@ std::shared_ptr<runtime::ResourceCleanupQueue> GraphHost::ResourceCleanup() cons
 	return DescriptorHeapManager::GetInstance().GetResourceCleanupQueue();
 }
 
-void GraphHost::WaitSlot(Async& state, uint32_t slot) {
+void GraphHost::WaitSlot(Async& state, uint32_t slot, uint32_t epochIndex) {
 	// The slot's previous execution must be done before its command lists, statistics range and latch region are reused, or
 	// before it is recorded for again: the wait happens here, on this thread, never on the render thread.
 	auto& entry = state.slots[slot];
 	if (!entry.pending) return;
+	// Every caller picks a waitable slot (RingSlot), so this does not happen. If it does, the log names the wait that may never end.
+	if (const auto seals = m_seals.load(std::memory_order_acquire);
+		!state.Waitable(entry, seals, state.rings && state.ringGrows[epochIndex]) && !state.unsealedWaitLogged[epochIndex]) {
+		state.unsealedWaitLogged[epochIndex] = 1;
+		spdlog::warn("GraphHost: the host's thread waits for slot {} of epoch {}, whose last run (submission {}, after seal {}) is neither done "
+			"nor sealed (seals now {}); if that run is still in the host's stream, this wait never ends", slot, state.epochs[epochIndex],
+			entry.submission, entry.seal, seals);
+	}
 	{
 		BT_ZONE_SCOPE("ORG.Host.WaitSlotCompletion.Worker");
 		for (const auto& [timeline, value] : entry.points) (void)(*timeline)->HostWait(value);
@@ -1359,7 +1388,7 @@ bool GraphHost::AdvanceRecordingRequests(Async& state) {
 					continue;
 				BT_ZONE_SCOPE("ORG.Host.RecordForRevision");
 				runtime::ScopedActiveGraphServices services(graph.GetUploadService(), graph.GetDescriptorService());
-				WaitSlot(state, slot);
+				WaitSlot(state, slot, request.epochIndex);
 				std::shared_ptr<const RenderGraph::PersistentRecording> recording;
 				{
 					Async::Preparation preparation;
@@ -1409,44 +1438,62 @@ bool GraphHost::AdvanceRecordingRequests(Async& state) {
 	return advanced;
 }
 
-uint32_t GraphHost::GrowingRingSlot(Async& state, uint32_t epochIndex) {
-	const uint32_t first = state.ringFirst[epochIndex];
-	const uint32_t capacity = state.ringCapacity[epochIndex];
-	auto& active = state.ringActive[epochIndex];
+uint32_t GraphHost::RingSlot(Async& state, uint32_t epochIndex) {
+	const auto range = state.SlotRange(epochIndex);
+	const uint32_t first = range.first;
+	const bool grows = state.rings && state.ringGrows[epochIndex];
 	const uint64_t seals = m_seals.load(std::memory_order_acquire);
-	// A slot is waited for only when its last run is ringLag seals old (or done): as far back as the wait of an epoch that runs once a
-	// frame. A run of a frame not sealed yet may still be in the host's stream, off the device, and waiting for it would deadlock.
-	const auto waitable = [&](const Async::Slot& entry) {
+	// A slot is never waited for while its last run may be off the device (Async::Waitable). A growing ring also waits only for a
+	// run ringLag seals old (or done): as far back as the wait of an epoch that runs once a frame.
+	const auto old = [&](const Async::Slot& entry) {
 		return !entry.pending || PointsReached(entry.points) || entry.seal + state.ringLag <= seals;
 	};
-	const auto sealed = [&](const Async::Slot& entry) { return !entry.pending || PointsReached(entry.points) || entry.seal < seals; };
-	// The least recently submitted slot in use that no unsubmitted ticket holds (one never submitted first).
-	const auto oldest = [&] {
+	const auto waitable = [&](const Async::Slot& entry) { return state.Waitable(entry, seals, grows); };
+	const auto any = [](const Async::Slot&) { return true; };
+	// The least recently submitted slot in use that no unsubmitted ticket holds and that accept takes (one never submitted first).
+	// The least recent, not the next in turn: a ticket abandoned unsubmitted (a rebuild's Detach, a released ticket) leaves its slot
+	// to be taken again, so abandoned tickets never move the ring on to a run of the current frame.
+	uint32_t last = range.second;
+	const auto oldest = [&](auto&& accept) {
 		uint32_t best = UINT32_MAX;
-		for (uint32_t position = 0; position < active; ++position) {
-			const uint32_t slot = first + position;
+		for (uint32_t slot = first; slot < last; ++slot) {
 			const auto& entry = state.slots[slot];
-			if (entry.reserved) continue;
+			if (entry.reserved || !accept(entry)) continue;
 			if (best == UINT32_MAX || entry.submission < state.slots[best].submission) best = slot;
 		}
 		return best;
 	};
-	if (const auto slot = oldest(); slot != UINT32_MAX && waitable(state.slots[slot])) return slot;
-	// Too recent: a slot more instead of the wait, up to the ring's capacity.
-	while (active < capacity) {
-		const uint32_t slot = first + active++;
-		state.ringGrowths.fetch_add(1, std::memory_order_relaxed);
-		BT_ZONE_SCOPE("ORG.Host.RingGrow");
-		if (!state.slots[slot].reserved && waitable(state.slots[slot])) return slot;
+	if (grows) {
+		if (const auto slot = oldest(old); slot != UINT32_MAX) return slot;
+		// Too recent: a slot more instead of the wait, up to the ring's capacity.
+		auto& active = state.ringActive[epochIndex];
+		while (active < state.ringCapacity[epochIndex]) {
+			const uint32_t slot = first + active++;
+			last = first + active;
+			state.ringGrowths.fetch_add(1, std::memory_order_relaxed);
+			BT_ZONE_SCOPE("ORG.Host.RingGrow");
+			if (!state.slots[slot].reserved && old(state.slots[slot])) return slot;
+		}
 	}
-	// At capacity: a slot whose run a seal flushed is waited for (more backpressure, never a deadlock).
-	if (const auto slot = oldest(); slot != UINT32_MAX && sealed(state.slots[slot])) return slot;
-	// Every slot holds a run of this frame: the ticket waits for the next seal, and the render thread skips the run meanwhile.
+	// A slot whose run a seal flushed is waited for (more backpressure, never a deadlock).
+	if (const auto slot = oldest(waitable); slot != UINT32_MAX) return slot;
+	const auto blocking = oldest(any);
+	if (blocking == UINT32_MAX && !grows)
+		throw std::logic_error(state.rings ? "Every frame slot of the epoch's ring is held by an unsubmitted ticket"
+			: "Every frame slot is held by an unsubmitted ticket");
+	// Every slot holds a run neither sealed nor done: the ticket waits for the next seal or for one of those runs to complete, and the
+	// render thread skips the epoch's runs meanwhile.
 	state.ringFulls.fetch_add(1, std::memory_order_relaxed);
 	if (!state.ringFullLogged[epochIndex]) {
 		state.ringFullLogged[epochIndex] = 1;
-		spdlog::warn("GraphHost: epoch {} ran more than its ring's {} slots before a frame boundary (Desc::epochRuns); runs past them "
-			"are skipped (EpochRingFullError) until the next SealSubmitted", state.epochs[epochIndex], capacity);
+		if (blocking != UINT32_MAX)
+			spdlog::warn("GraphHost: epoch {} has no frame slot to prepare: each of its ring's {} slots holds a run neither sealed nor done "
+				"(the oldest: slot {}, submission {}, after seal {}; seals now {}). Its runs are skipped (EpochRingFullError) until the next "
+				"SealSubmitted or until one of those runs completes", state.epochs[epochIndex], last - first, blocking,
+				state.slots[blocking].submission, state.slots[blocking].seal, seals);
+		else
+			spdlog::warn("GraphHost: epoch {} has no frame slot to prepare: each of its ring's {} slots is held by an unsubmitted ticket. Its "
+				"runs are skipped (EpochRingFullError) until the next SealSubmitted", state.epochs[epochIndex], last - first);
 	}
 	state.ringFullAt[epochIndex].store(seals, std::memory_order_release);
 	state.anyRingFull.store(true, std::memory_order_seq_cst);
@@ -1458,33 +1505,13 @@ uint32_t GraphHost::GrowingRingSlot(Async& state, uint32_t epochIndex) {
 void GraphHost::PrepareTicket(Async& state, uint32_t epochIndex, int32_t requestedSlot) {
 	BT_ZONE_SCOPE("ORG.Host.PrepareTicket.Worker");
 	auto& graph = *m_instances[state.instanceOf[epochIndex]].graph;
-	const uint32_t slotCount = static_cast<uint32_t>(state.slots.size());
-	uint32_t slot = 0;
-	if (requestedSlot >= 0) {
-		slot = static_cast<uint32_t>(requestedSlot);
-	} else if (state.rings && state.ringGrows[epochIndex]) {
-		slot = GrowingRingSlot(state, epochIndex);
-		// Every slot of the ring holds a run the host has not sealed: nothing is prepared until the next seal (EpochRingFullError).
-		if (slot == UINT32_MAX) return;
-	} else if (state.rings) {
-		// The next slot of the epoch's ring no unsubmitted ticket holds.
-		const uint32_t size = state.ringCapacity[epochIndex];
-		for (uint32_t attempt = 0;; ++attempt) {
-			if (attempt == size) throw std::logic_error("Every frame slot of the epoch's ring is held by an unsubmitted ticket");
-			slot = state.ringFirst[epochIndex] + static_cast<uint32_t>(state.ringNext[epochIndex]++ % size);
-			if (!state.slots[slot].reserved) break;
-		}
-	} else {
-		// The next slot no unsubmitted ticket holds.
-		for (uint32_t attempt = 0;; ++attempt) {
-			if (attempt == slotCount) throw std::logic_error("Every frame slot is held by an unsubmitted ticket");
-			slot = static_cast<uint32_t>(state.nextSlot++ % slotCount);
-			if (!state.slots[slot].reserved) break;
-		}
-	}
+	// A stale ticket's reprepare takes the slot it held, whose last run it already waited for. Otherwise the epoch's ring gives the
+	// slot, or none: then nothing is prepared until a seal or a completion frees one (EpochRingFullError meanwhile).
+	const uint32_t slot = requestedSlot >= 0 ? static_cast<uint32_t>(requestedSlot) : RingSlot(state, epochIndex);
+	if (slot == UINT32_MAX) return;
 	auto& entry = state.slots[slot];
 	runtime::ScopedActiveGraphServices services(graph.GetUploadService(), graph.GetDescriptorService());
-	WaitSlot(state, slot);
+	WaitSlot(state, slot, epochIndex);
 	// The render thread records this ticket's uploads into an open list: resetting and beginning it is several
 	// microseconds of driver work that belongs here.
 	auto& uploads = state.uploadLists[slot];

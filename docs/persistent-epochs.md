@@ -149,7 +149,13 @@ is a deadlock.
     throws `EpochRingFullError` (an `EpochFailedError`): nothing was submitted, the epoch has not failed, and the caller
     skips that run. One warning is logged per epoch.
 -   **Contract.** A host that lists an epoch in `epochRuns` calls `SealSubmitted` at every frame boundary. Epochs not
-    listed keep a ring of `framesInFlight` slots and always wait, as before.
+    listed keep a ring of `framesInFlight` slots that does not grow.
+-   **Never an unsealed wait.** Once the host has sealed, every ring follows one rule: a ticket takes the least recently
+    submitted free slot whose last run is done or sealed. It is the least recent one, not the next in turn, so a ticket
+    abandoned unsubmitted (a rebuild's detach, a released ticket) leaves its slot to be taken again. When no slot
+    qualifies, the ring is full as above, until the next seal or until one of its runs completes. Before the first seal
+    any slot is waited for (a host that never seals submits to the device itself). If the host's thread ever waits for
+    a run that is neither done nor sealed anyway, it logs one warning per epoch naming the epoch and the slot.
 -   **Statistics.** `AsyncStats::ringGrowths` and `ringFull`.
 -   **Test.** `PersistentVulkanHostTests rings` (and `rings open`): an external epoch run six times a frame with two
     frames in flight, its executions held until the frame's end, runs without a deadlock; nine runs between two seals
