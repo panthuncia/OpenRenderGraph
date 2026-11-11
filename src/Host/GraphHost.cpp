@@ -62,6 +62,7 @@ struct GraphHost::Async {
 		std::shared_ptr<const void> resourceOwner;
 		std::pair<uint32_t, uint64_t> uploadSignal{UINT32_MAX, 0};
 		uint64_t number = 0;  // Submitted: its number (SubmissionsMade)
+		uint64_t seal = 0;    // Submitted: the seals before it (GraphHost::Seals)
 	};
 
 	std::vector<uint32_t> epochs;
@@ -70,9 +71,25 @@ struct GraphHost::Async {
 	// Host thread, per epoch index: let go of (Detach) until its instance is attached again; and its instance's build generation.
 	std::vector<uint8_t> paused;
 	std::vector<uint64_t> generation;
-	// Per epoch index, its ring of frame slots: [index * ringSize, + ringSize), the next position. 0: one ring of every slot.
-	uint32_t ringSize = 0;
+	// Per epoch index, its ring of frame slots: [ringFirst, + ringCapacity), of which the first ringActive are in use, and the next
+	// position (rings of a fixed size). rings false: one ring of every slot.
+	bool rings = false;
+	std::vector<uint32_t> ringFirst, ringCapacity, ringActive;
 	std::vector<uint64_t> ringNext;
+	// Per epoch index: whether its ring grows (Desc::epochRuns: a capacity above framesInFlight), and the seals a slot's last run must
+	// be behind before the slot is waited for instead of the ring growing (max(framesInFlight - 1, 1)).
+	std::vector<uint8_t> ringGrows;
+	uint64_t ringLag = 1;
+	// The host's seal count (GraphHost::m_seals), written by the render thread.
+	const std::atomic<uint64_t>* seals = nullptr;
+	// Per epoch index: the seal count at which its ring was full (every slot an unsealed run's), or kNoSeal. Its next ticket is
+	// prepared once the count moves; until then WaitTicket throws EpochRingFullError. anyRingFull: one is set, so a seal wakes the
+	// host's thread.
+	static constexpr uint64_t kNoSeal = ~uint64_t{0};
+	std::unique_ptr<std::atomic<uint64_t>[]> ringFullAt;
+	std::atomic<bool> anyRingFull{false};
+	std::vector<uint8_t> ringFullLogged;
+	std::atomic<uint64_t> ringGrowths{0}, ringFulls{0};
 	// Recording requests taken from the host's queue (RecordingQueue), by the host's thread, in posting order.
 	struct RecordingRequest {
 		uint32_t epochIndex = 0;
@@ -127,6 +144,7 @@ struct GraphHost::Async {
 		TimelinePoints points;  // its last submission's completion
 		uint64_t hostFrame = 0;
 		uint64_t submission = 0;  // its last submission's number (SubmissionsMade)
+		uint64_t seal = 0;        // the seals before its last submission (GraphHost::Seals)
 		bool pending = false;   // submitted work not yet waited for
 		bool reserved = false;  // held by a ticket that has not been submitted
 		std::shared_ptr<void> keepAlive;
@@ -212,6 +230,10 @@ struct GraphHost::Async {
 			ThrowIfFailed();
 			// Only this epoch failed: no ticket is coming until its graph is built again.
 			if (epochFailed[index].load(std::memory_order_acquire)) throw EpochFailedError(epochs[index], epochErrors[index]);
+			// Its ring is full of unsealed runs: no ticket is coming before the next seal, which this thread makes. Once the count has
+			// moved past the one the ring was full at, the host's thread prepares one (the seal woke it).
+			if (const auto full = ringFullAt[index].load(std::memory_order_acquire); full != kNoSeal && full == seals->load(std::memory_order_acquire))
+				throw EpochRingFullError(epochs[index], ringCapacity[index]);
 			ticketWake.wait(seen, std::memory_order_acquire);
 		}
 	}
@@ -254,10 +276,9 @@ struct GraphHost::RecordingQueue {
 GraphHost::GraphHost(Desc desc) : m_desc(std::move(desc)), m_recordingQueue(std::make_unique<RecordingQueue>()) {
 	if (!m_desc.runtime) throw std::invalid_argument("GraphHost requires a runtime");
 	m_device = m_desc.runtime->Device();
-	// The frame slots: framesInFlight frames of every epoch in the order, so that adding an epoch keeps the CPU's lead over
-	// the GPU the same rather than shortening it (each slot's next execution waits for its last one).
-	const uint32_t epochs = (std::max)(static_cast<uint32_t>(m_desc.epochOrder.size()), 1u);
-	m_frameSlots = (std::max)(m_desc.framesInFlight, 1u) * epochs;
+	// The frame slots: framesInFlight frames of every epoch in the order (each its runs a frame), so that adding an epoch keeps
+	// the CPU's lead over the GPU the same rather than shortening it (each slot's next execution waits for its last one).
+	m_frameSlots = FrameSlotsFor(m_desc);
 	// Upload pages, statistics query ranges and admission capacity are sized from the runtime's slots.
 	if (m_frameSlots > m_desc.runtime->Slots())
 		throw std::invalid_argument("GraphHost: more frame slots (frames in flight times epochs) than the runtime has");
@@ -289,6 +310,36 @@ GraphHost::~GraphHost() {
 	m_desc.runtime->Retire();
 	m_uncertainExecutionOwners.clear();
 	m_uncertainUploadOwners.clear();
+}
+
+uint32_t GraphHost::FrameSlotsFor(const Desc& desc) {
+	for (size_t index = 0; index < desc.epochRuns.size(); ++index) {
+		const auto& entry = desc.epochRuns[index];
+		if (entry.runsPerFrame == 0) throw std::invalid_argument("GraphHost: an epoch's runs per frame (Desc::epochRuns) must be at least 1");
+		if (std::ranges::find(desc.epochOrder, entry.epoch) == desc.epochOrder.end())
+			throw std::invalid_argument("GraphHost: Desc::epochRuns names epoch " + std::to_string(entry.epoch) + ", which is not in the epoch order");
+		for (size_t other = 0; other < index; ++other)
+			if (desc.epochRuns[other].epoch == entry.epoch)
+				throw std::invalid_argument("GraphHost: Desc::epochRuns names epoch " + std::to_string(entry.epoch) + " twice");
+	}
+	uint64_t runs = 0;
+	if (desc.epochOrder.empty()) runs = 1;
+	for (const auto epoch : desc.epochOrder) {
+		uint32_t perFrame = 1;
+		for (const auto& entry : desc.epochRuns)
+			if (entry.epoch == epoch) perFrame = entry.runsPerFrame;
+		runs += perFrame;
+	}
+	const uint64_t slots = runs * (std::max)(desc.framesInFlight, 1u);
+	if (slots > UINT8_MAX)
+		throw std::invalid_argument("GraphHost: " + std::to_string(slots) + " frame slots (frames in flight times the epochs' runs a frame) is more than 255");
+	return static_cast<uint32_t>(slots);
+}
+
+uint32_t GraphHost::RunsPerFrame(uint32_t epoch) const noexcept {
+	for (const auto& entry : m_desc.epochRuns)
+		if (entry.epoch == epoch) return entry.runsPerFrame;
+	return 1;
 }
 
 size_t GraphHost::InstanceOf(uint32_t epoch) const noexcept {
@@ -602,8 +653,14 @@ GraphHost::GpuPoint GraphHost::SubmittedPoint() const {
 
 void GraphHost::SealSubmitted() {
 	auto point = SubmittedPoint();
-	std::scoped_lock lock(m_sealedMutex);
-	m_sealed = std::move(point);
+	{
+		std::scoped_lock lock(m_sealedMutex);
+		m_sealed = std::move(point);
+	}
+	m_seals.fetch_add(1, std::memory_order_seq_cst);
+	// An epoch whose ring was full of unsealed runs can take a slot again: the host's thread prepares its ticket now. The flag is
+	// set before the host's thread reads the seals again, so either it sees this count or this sees its flag.
+	if (m_async && m_async->anyRingFull.exchange(false, std::memory_order_seq_cst)) (void)m_async->completionWake->Notify();
 }
 
 GraphHost::GpuPoint GraphHost::SealedPoint() const {
@@ -717,6 +774,7 @@ void GraphHost::ExecuteFrame(const IHostExecutionData* hostData, const FrameCall
 		}
 		completion.frameNumber = m_frameNumber;
 		completion.submission = ++m_submissions;
+		completion.seal = m_seals.load(std::memory_order_relaxed);
 		completion.pending = true;
 		if (heldResources) {
 			const auto& owner = m_uncertainExecutionOwners.back();
@@ -814,11 +872,28 @@ void GraphHost::StartAsync() {
 			async->epochFailed[index].store(true, std::memory_order_release);
 		}
 	}
-	// Each epoch its own ring of framesInFlight slots, when the slots hold one per async epoch (they hold framesInFlight of every
-	// epoch in the order); otherwise one ring of all.
-	if (const uint32_t ring = (std::max)(m_desc.framesInFlight, 1u); m_frameSlots >= ring * async->epochs.size())
-		async->ringSize = ring;
+	// Each epoch its own ring of framesInFlight slots (times its runs a frame, Desc::epochRuns), when the slots hold one per async
+	// epoch (they hold that many of every epoch in the order); otherwise one ring of all. An epoch with more runs than one a frame
+	// starts on framesInFlight of its ring's slots and grows into the rest (PrepareTicket).
+	{
+		const uint32_t frames = (std::max)(m_desc.framesInFlight, 1u);
+		uint64_t first = 0;
+		for (const auto epoch : async->epochs) {
+			const uint32_t capacity = frames * RunsPerFrame(epoch);
+			async->ringFirst.push_back(static_cast<uint32_t>(first));
+			async->ringCapacity.push_back(capacity);
+			async->ringActive.push_back(frames);
+			async->ringGrows.push_back(capacity > frames ? 1 : 0);
+			first += capacity;
+		}
+		async->rings = first <= m_frameSlots;
+		async->ringLag = (std::max)(frames - 1, 1u);
+	}
 	async->ringNext.assign(async->epochs.size(), 0);
+	async->seals = &m_seals;
+	async->ringFullAt = std::make_unique<std::atomic<uint64_t>[]>(async->epochs.size());
+	for (uint32_t index = 0; index < async->epochs.size(); ++index) async->ringFullAt[index].store(Async::kNoSeal, std::memory_order_relaxed);
+	async->ringFullLogged.assign(async->epochs.size(), 0);
 	async->cells = std::make_unique<std::atomic<std::shared_ptr<Async::Ticket>>[]>(async->epochs.size());
 	async->needsTicket.assign(async->epochs.size(), 1);
 	async->liveRecordings.assign(async->epochs.size(), {});
@@ -831,6 +906,7 @@ void GraphHost::StartAsync() {
 		async->slots[slot].points = completion.points;
 		async->slots[slot].hostFrame = completion.frameNumber;
 		async->slots[slot].submission = completion.submission;
+		async->slots[slot].seal = completion.seal;
 		async->slots[slot].pending = completion.pending;
 		completion = {};
 	}
@@ -909,6 +985,7 @@ void GraphHost::StartAsync() {
 						slot.reserved = false;
 						slot.hostFrame = RenderGraph::PersistentTicketHostFrame(*message.ticket);
 						slot.submission = message.number;
+						slot.seal = message.seal;
 						state->submissionsSeen = (std::max)(state->submissionsSeen, message.number);
 						if (state->outstanding[message.epochIndex] == message.ticket) state->outstanding[message.epochIndex].reset();
 						slot.keepAlive = std::move(state->uncertainUploadOwner);
@@ -987,7 +1064,7 @@ void GraphHost::StartAsync() {
 				// is not an async one (or without rings) completes with that error now.
 				for (auto& node : m_recordingQueue->Take()) {
 					const auto found = std::ranges::find(state->epochs, node->epoch);
-					if (found == state->epochs.end() || !state->ringSize) {
+					if (found == state->epochs.end() || !state->rings) {
 						if (node->done)
 							node->done(nullptr, std::make_exception_ptr(std::invalid_argument("RequestEpochRecording: epoch " + std::to_string(node->epoch) +
 								" is not an async epoch with a slot ring")));
@@ -1037,6 +1114,11 @@ void GraphHost::StartAsync() {
 					if (!state->needsTicket[index] || state->paused[index] || state->epochFailed[index].load(std::memory_order_relaxed)
 						|| state->cells[index].load(std::memory_order_acquire))
 						continue;
+					// A ring full of unsealed runs waits for the next seal (its SealSubmitted wakes this thread).
+					if (const auto full = state->ringFullAt[index].load(std::memory_order_acquire); full != Async::kNoSeal) {
+						if (full == m_seals.load(std::memory_order_acquire)) continue;
+						state->ringFullAt[index].store(Async::kNoSeal, std::memory_order_release);
+					}
 					PrepareTicket(*state, index, -1);
 					prepared = true;
 				}
@@ -1248,13 +1330,14 @@ bool GraphHost::AdvanceRecordingRequests(Async& state) {
 			if (!request.result) {
 				request.result = std::make_shared<EpochRecording>();
 				request.result->epoch = state.epochs[request.epochIndex];
-				request.result->firstSlot = request.epochIndex * state.ringSize;
-				request.result->slots.resize(state.ringSize);
+				// Every slot the ring may grow into, so the recording covers whichever slot a ticket takes.
+				request.result->firstSlot = state.ringFirst[request.epochIndex];
+				request.result->slots.resize(state.ringCapacity[request.epochIndex]);
 				request.result->revision = request.hostData;
 				request.result->buildGeneration = state.generation[request.epochIndex];
-				request.recorded.assign(state.ringSize, 0);
+				request.recorded.assign(state.ringCapacity[request.epochIndex], 0);
 			}
-			for (uint32_t position = 0; position < state.ringSize; ++position) {
+			for (uint32_t position = 0; position < request.recorded.size(); ++position) {
 				const uint32_t slot = request.result->firstSlot + position;
 				// A slot its epoch's unsubmitted ticket holds is recorded too: a revision-driven ticket holds the admission alone (its
 				// preparation recorded nothing, and already waited out the slot's last work), and it cannot be submitted without this.
@@ -1321,6 +1404,52 @@ bool GraphHost::AdvanceRecordingRequests(Async& state) {
 	return advanced;
 }
 
+uint32_t GraphHost::GrowingRingSlot(Async& state, uint32_t epochIndex) {
+	const uint32_t first = state.ringFirst[epochIndex];
+	const uint32_t capacity = state.ringCapacity[epochIndex];
+	auto& active = state.ringActive[epochIndex];
+	const uint64_t seals = m_seals.load(std::memory_order_acquire);
+	// A slot is waited for only when its last run is ringLag seals old (or done): as far back as the wait of an epoch that runs once a
+	// frame. A run of a frame not sealed yet may still be in the host's stream, off the device, and waiting for it would deadlock.
+	const auto waitable = [&](const Async::Slot& entry) {
+		return !entry.pending || PointsReached(entry.points) || entry.seal + state.ringLag <= seals;
+	};
+	const auto sealed = [&](const Async::Slot& entry) { return !entry.pending || PointsReached(entry.points) || entry.seal < seals; };
+	// The least recently submitted slot in use that no unsubmitted ticket holds (one never submitted first).
+	const auto oldest = [&] {
+		uint32_t best = UINT32_MAX;
+		for (uint32_t position = 0; position < active; ++position) {
+			const uint32_t slot = first + position;
+			const auto& entry = state.slots[slot];
+			if (entry.reserved) continue;
+			if (best == UINT32_MAX || entry.submission < state.slots[best].submission) best = slot;
+		}
+		return best;
+	};
+	if (const auto slot = oldest(); slot != UINT32_MAX && waitable(state.slots[slot])) return slot;
+	// Too recent: a slot more instead of the wait, up to the ring's capacity.
+	while (active < capacity) {
+		const uint32_t slot = first + active++;
+		state.ringGrowths.fetch_add(1, std::memory_order_relaxed);
+		BT_ZONE_SCOPE("ORG.Host.RingGrow");
+		if (!state.slots[slot].reserved && waitable(state.slots[slot])) return slot;
+	}
+	// At capacity: a slot whose run a seal flushed is waited for (more backpressure, never a deadlock).
+	if (const auto slot = oldest(); slot != UINT32_MAX && sealed(state.slots[slot])) return slot;
+	// Every slot holds a run of this frame: the ticket waits for the next seal, and the render thread skips the run meanwhile.
+	state.ringFulls.fetch_add(1, std::memory_order_relaxed);
+	if (!state.ringFullLogged[epochIndex]) {
+		state.ringFullLogged[epochIndex] = 1;
+		spdlog::warn("GraphHost: epoch {} ran more than its ring's {} slots before a frame boundary (Desc::epochRuns); runs past them "
+			"are skipped (EpochRingFullError) until the next SealSubmitted", state.epochs[epochIndex], capacity);
+	}
+	state.ringFullAt[epochIndex].store(seals, std::memory_order_release);
+	state.anyRingFull.store(true, std::memory_order_seq_cst);
+	state.ticketWake.fetch_add(1, std::memory_order_release);
+	state.ticketWake.notify_all();
+	return UINT32_MAX;
+}
+
 void GraphHost::PrepareTicket(Async& state, uint32_t epochIndex, int32_t requestedSlot) {
 	BT_ZONE_SCOPE("ORG.Host.PrepareTicket.Worker");
 	auto& graph = *m_instances[state.instanceOf[epochIndex]].graph;
@@ -1328,11 +1457,16 @@ void GraphHost::PrepareTicket(Async& state, uint32_t epochIndex, int32_t request
 	uint32_t slot = 0;
 	if (requestedSlot >= 0) {
 		slot = static_cast<uint32_t>(requestedSlot);
-	} else if (state.ringSize) {
+	} else if (state.rings && state.ringGrows[epochIndex]) {
+		slot = GrowingRingSlot(state, epochIndex);
+		// Every slot of the ring holds a run the host has not sealed: nothing is prepared until the next seal (EpochRingFullError).
+		if (slot == UINT32_MAX) return;
+	} else if (state.rings) {
 		// The next slot of the epoch's ring no unsubmitted ticket holds.
+		const uint32_t size = state.ringCapacity[epochIndex];
 		for (uint32_t attempt = 0;; ++attempt) {
-			if (attempt == state.ringSize) throw std::logic_error("Every frame slot of the epoch's ring is held by an unsubmitted ticket");
-			slot = epochIndex * state.ringSize + static_cast<uint32_t>(state.ringNext[epochIndex]++ % state.ringSize);
+			if (attempt == size) throw std::logic_error("Every frame slot of the epoch's ring is held by an unsubmitted ticket");
+			slot = state.ringFirst[epochIndex] + static_cast<uint32_t>(state.ringNext[epochIndex]++ % size);
 			if (!state.slots[slot].reserved) break;
 		}
 	} else {
@@ -1497,6 +1631,7 @@ void GraphHost::StopAsync() {
 		completion.points = async->slots[slot].points;
 		completion.frameNumber = async->slots[slot].hostFrame;
 		completion.submission = async->slots[slot].submission;
+		completion.seal = async->slots[slot].seal;
 		completion.pending = async->slots[slot].pending;
 	}
 	m_frameNumber = (std::max)(m_frameNumber, async->hostFrame);
@@ -1538,6 +1673,8 @@ GraphHost::AsyncStats GraphHost::TakeAsyncStats() noexcept {
 		m_asyncStats.revisionSlotsRecorded = m_async->revisionSlotsRecorded.exchange(0, std::memory_order_relaxed);
 		m_asyncStats.revisionRecordings = m_async->revisionRecordings.exchange(0, std::memory_order_relaxed);
 		m_asyncStats.wakesSkipped = std::exchange(m_async->wakesSkipped, 0);
+		m_asyncStats.ringGrowths = m_async->ringGrowths.exchange(0, std::memory_order_relaxed);
+		m_asyncStats.ringFull = m_async->ringFulls.exchange(0, std::memory_order_relaxed);
 	}
 	return std::exchange(m_asyncStats, {});
 }
@@ -1772,6 +1909,8 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 	Async::Message submitted;
 	submitted.kind = Async::Message::Kind::Submitted;
 	submitted.number = ++m_submissions;
+	// The frame boundaries before it: a later seal flushed it (the epochs of Desc::epochRuns wait for its slot only then).
+	submitted.seal = m_seals.load(std::memory_order_relaxed);
 	submitted.epochIndex = index;
 	submitted.keepAlive = std::move(keepAlive);
 	if (!m_externalRetired.empty()) {

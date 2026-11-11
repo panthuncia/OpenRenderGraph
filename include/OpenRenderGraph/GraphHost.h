@@ -40,7 +40,8 @@ struct IHostExecutionData;
 //   - rebuilding graphs from the registered extension factories on request,
 //   - synchronous per-frame Update + Execute (Execute submits before returning),
 //   - per-frame-slot retirement: before a slot is reused, its previous frame's GPU work is
-//     waited for and the upload pages and descriptors it retired are released,
+//     waited for and the upload pages and descriptors it retired are released (an async epoch that runs many times a
+//     frame grows its ring of slots instead of waiting for a run of the same frame: Desc::epochRuns),
 //   - an orderly shutdown that waits only for the graphs' own work.
 // Not thread-safe: all calls come from the host's render thread. With async epochs (SetAsyncEpochs) the host
 // runs one thread of its own that owns the graphs from then on; the render thread submits, and builds a graph only
@@ -52,10 +53,10 @@ public:
 		// slots (FrameSlots).
 		std::shared_ptr<Runtime> runtime;
 		RenderGraph::ExternalQueueBoundary queueBoundary{};
-		// Frames the CPU may run ahead of the GPU: whole frames of the host's epochs (each epoch of epochOrder once), or of
-		// ExecuteFrame calls without epochs. The host's frame slots - the ring every execution takes the next slot of, and waits
-		// for that slot's previous execution before reusing - number framesInFlight times the epochs (FrameSlots), so the ring
-		// covers the same frames however many epochs there are.
+		// Frames the CPU may run ahead of the GPU: whole frames of the host's epochs (each epoch of epochOrder once, or as many
+		// times as epochRuns says), or of ExecuteFrame calls without epochs. The host's frame slots - the ring every execution
+		// takes the next slot of, and waits for that slot's previous execution before reusing - number framesInFlight times the
+		// epochs' runs (FrameSlots, FrameSlotsFor), so the ring covers the same frames however many epochs there are.
 		uint32_t framesInFlight = 3;
 		// Host epochs: the order the host runs them in within its own frame. Each is a graph of its own. Passes declare
 		// theirs with ExternalPassDesc::Epoch (untagged ones run in every epoch); ExecuteFrame and SubmitEpoch name the one
@@ -83,7 +84,38 @@ public:
 		// RecordPendingUploads' queue-scoped uploads). Off: every upload on the graphics queue, and every batch on another queue
 		// waits for them.
 		bool queueScopedUploads = true;
+		/**
+		 * @brief An async epoch that may run more than once in a host frame, and the most runs a frame it is sized for.
+		 *
+		 * An async epoch takes the slots of its own ring in turn, and the host's thread waits for a slot's last run on the GPU
+		 * before it prepares the slot again. A host that holds its submissions in a stream until the frame's end (an external
+		 * queue boundary, external epochs in another API's command list) has not handed a run of the current frame to the
+		 * device yet: waiting for it deadlocks, since the render thread is waiting for the host's thread at the epoch's next
+		 * run. An epoch listed here has a ring of framesInFlight times runsPerFrame slots (its capacity) and starts using
+		 * framesInFlight of them. When the slot it would take next ran too recently, the ring grows by one slot instead of
+		 * waiting. "Too recently" counts frame boundaries, which the host declares with SealSubmitted: a slot is waited for
+		 * only once its last run is at least max(framesInFlight - 1, 1) seals old. A seal flushed it, and the wait is
+		 * backpressure from as many frames back as an epoch that runs once a frame gets. So the ring settles at about its
+		 * runs a frame times framesInFlight, and waits only target runs of earlier frames.
+		 * At capacity, a slot whose last run was sealed is waited for (safe: it is on the device). When even the oldest slot's
+		 * run is still unsealed (more runs since the last seal than the capacity), the epoch's next ticket is not prepared
+		 * until the next seal, and SubmitEpoch throws EpochRingFullError for it meanwhile: the caller skips that run, nothing
+		 * hangs. A host that lists an epoch here must call SealSubmitted at every frame boundary. Epochs not listed keep a ring
+		 * of framesInFlight slots and always wait, as before. Each epoch must be one of epochOrder; runsPerFrame at least 1.
+		 */
+		struct EpochRuns {
+			uint32_t epoch = 0;
+			uint32_t runsPerFrame = 1;
+		};
+		std::vector<EpochRuns> epochRuns;
 	};
+
+	/**
+	 * @brief The frame slots a host made with desc has (FrameSlots): framesInFlight times the sum, over epochOrder (one epoch
+	 * without), of each epoch's runsPerFrame (Desc::epochRuns; 1 when not listed). The runtime's slots must cover it. Throws for
+	 * an invalid Desc::epochRuns (an epoch not in epochOrder, listed twice, or 0 runs).
+	 */
+	static uint32_t FrameSlotsFor(const Desc& desc);
 
 	using ExtensionFactory = std::function<std::unique_ptr<RenderGraph::IRenderGraphExtension>()>;
 
@@ -178,6 +210,22 @@ public:
 		EpochFailedError(uint32_t a_epoch, const std::string& a_error)
 			: std::runtime_error("epoch " + std::to_string(a_epoch) + "'s graph failed: " + a_error), epoch(a_epoch) {}
 		uint32_t epoch = UINT32_MAX;
+	protected:
+		struct Message {};
+		EpochFailedError(Message, uint32_t a_epoch, const std::string& a_what) : std::runtime_error(a_what), epoch(a_epoch) {}
+	};
+	/**
+	 * @brief What SubmitEpoch throws for an epoch of Desc::epochRuns whose ring is full: every slot of it holds a run the host has
+	 * not sealed yet (SealSubmitted), so its next ticket waits for the next seal. Nothing was submitted, the epoch has not failed
+	 * (nothing is reported to PollEpochFailures), and its runs go on after the next seal. The caller skips this run (does its
+	 * work another way). An EpochFailedError, so a caller that skips a failed epoch skips this too.
+	 */
+	struct EpochRingFullError : EpochFailedError {
+		EpochRingFullError(uint32_t a_epoch, uint32_t a_capacity)
+			: EpochFailedError(Message{}, a_epoch, "epoch " + std::to_string(a_epoch) + " ran more than its " + std::to_string(a_capacity)
+				+ " ring slots between two frame boundaries (Desc::epochRuns); this run is skipped until the next SealSubmitted"),
+			  capacity(a_capacity) {}
+		uint32_t capacity = 0;
 	};
 
 	// Runs after any rebuild and before the frame is prepared, with the graphs' upload
@@ -245,8 +293,9 @@ public:
 	 */
 	void SignalExternalExecutionUnexecuted(const ExternalEpochExecution& execution, size_t a_first = SIZE_MAX);
 
-	// An epoch recorded for one revision: a recording per frame slot of the epoch's ring (async epoch i uses slots
-	// i * framesInFlight .. + framesInFlight - 1, so its tickets and its recordings meet there). Immutable.
+	// An epoch recorded for one revision: a recording per frame slot of the epoch's ring (each async epoch has a run of slots of its
+	// own, firstSlot .. + its ring's capacity - 1: framesInFlight, times Desc::epochRuns' runsPerFrame for an epoch listed there; its
+	// tickets and its recordings meet there). Immutable.
 	// A revision's recordings of an epoch, one per slot of its ring. While the caller holds it, the epoch's tickets admit it as a
 	// candidate (RenderGraph::PrepareRevisionTicket), so it can be submitted at any frame; released, it is never admitted again.
 	struct EpochRecording {
@@ -335,6 +384,9 @@ public:
 		// Revision-driven epochs: slots recorded for requests (RequestEpochRecording), requests completed, and submissions of a
 		// revision's recording.
 		uint64_t revisionSlotsRecorded = 0, revisionRecordings = 0, revisionSubmissions = 0;
+		// Desc::epochRuns: slots added to an epoch's ring instead of waiting for a run too recent, and tickets held for the next seal
+		// because every slot of the ring held an unsealed run (EpochRingFullError).
+		uint64_t ringGrowths = 0, ringFull = 0;
 	};
 	AsyncStats TakeAsyncStats() noexcept;
 
@@ -415,8 +467,11 @@ public:
 	// waits for SealedPoint instead.
 	GpuPoint SubmittedPoint() const;
 	// Submitting thread, at a frame boundary: everything submitted so far is on the device's queues (the host flushed its stream).
-	// Seals SubmittedPoint's current value as SealedPoint.
+	// Seals SubmittedPoint's current value as SealedPoint, and counts a frame boundary (Seals): the epochs of Desc::epochRuns
+	// size their rings by these.
 	void SealSubmitted();
+	// Any thread: the SealSubmitted calls so far.
+	uint64_t Seals() const noexcept { return m_seals.load(std::memory_order_acquire); }
 	// Any thread: the point SealSubmitted last captured (none before the first). It names only work already on the device, and
 	// none of the current frame's, so a mid-frame producer may wait for it whatever the frame's later work waits for.
 	GpuPoint SealedPoint() const;
@@ -429,7 +484,8 @@ public:
 	// are on the GPU, and a value never signalled stalls the queue.
 	void SetFrameWaitValue(uint64_t value) noexcept { m_frameWaitValue = value; }
 	uint64_t FrameWaitValue() const noexcept { return m_frameWaitValue; }
-	// The frame slots: Desc::framesInFlight frames of every epoch in the order (one execution a frame without epochs).
+	// The frame slots: Desc::framesInFlight frames of every epoch in the order, each its runs a frame (Desc::epochRuns; one
+	// execution a frame without epochs). Fixed when the host is made (FrameSlotsFor): a LatchBlock sized from it stays right.
 	uint32_t FrameSlots() const noexcept { return m_frameSlots; }
 
 	// The calling thread's CPU time in the last ExecuteFrame, by phase. Diagnostics only.
@@ -517,6 +573,7 @@ private:
 		std::vector<std::pair<std::shared_ptr<rhi::TimelinePtr>, uint64_t>> points;
 		uint64_t frameNumber = 0;
 		uint64_t submission = 0;  // its number (SubmissionsMade)
+		uint64_t seal = 0;        // the seals before it was submitted (Seals)
 		bool pending = false;
 	};
 	std::vector<SlotCompletion> m_slotCompletions;
@@ -536,6 +593,9 @@ private:
 	uint64_t m_frameWaitValue = 0;
 	mutable std::mutex m_sealedMutex;  // SealedPoint is read on other threads
 	GpuPoint m_sealed;
+	std::atomic<uint64_t> m_seals{0};  // SealSubmitted calls (Seals); the host's thread reads it
+	// Desc::epochRuns' runsPerFrame for an epoch (1 when not listed).
+	uint32_t RunsPerFrame(uint32_t epoch) const noexcept;
 	uint64_t m_buildGeneration = 0;
 	std::unique_ptr<Async> m_async;
 	EpochFailedCallback m_epochFailed;
@@ -584,6 +644,9 @@ private:
 	// this thread (a build, a retired graph's release: both change services every graph shares).
 	void HoldAsync(std::span<const size_t> detach, const std::function<void()>& work);
 	void PrepareTicket(Async& state, uint32_t epochIndex, int32_t requestedSlot);
+	// Host thread, an epoch of Desc::epochRuns: the slot of its ring its next ticket takes (the ring grown when the one it would take
+	// ran too recently), or UINT32_MAX when every slot holds a run not sealed yet (the ring is full until the next seal).
+	uint32_t GrowingRingSlot(Async& state, uint32_t epochIndex);
 	void WaitSlot(Async& state, uint32_t slot);
 	bool AdvanceRecordingRequests(Async& state);
 	// Host thread: admits the recording of the ticket's slot as one of the revision ticket's candidates.
