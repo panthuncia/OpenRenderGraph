@@ -784,6 +784,10 @@ std::string GraphHost::DescribeAsyncState() const {
 			"/" + n(async->cells && async->cells[i].load() != nullptr) + "/" + n(async->epochFailed && async->epochFailed[i].load()) + "/" +
 			(full == Async::kNoSeal ? std::string("-") : n(full)) + "/" + n(async->generation[i]);
 	}
+	out += "; host timelines (t<index> last assigned/completed):";
+	for (const auto& timeline : m_timelines)
+		if (timeline.fence && *timeline.fence)
+			out += " t" + n((*timeline.fence)->GetHandle().index) + " " + n(timeline.nextValue->load() - 1) + "/" + n((*timeline.fence)->GetCompletedValue());
 	out += "; held requests (epoch: per ring position r=recorded, R=reserved, P=pending unreached, s=its seal, .=free):";
 	for (const auto& request : async->pendingRequests) {
 		if (!request) continue;
@@ -800,7 +804,13 @@ std::string GraphHost::DescribeAsyncState() const {
 			}
 			const auto& entry = async->slots[slot];
 			std::string state = entry.reserved ? "R" : "";
-			if (entry.pending && !PointsReached(entry.points)) state += "P(s" + n(entry.seal) + ")";
+			if (entry.pending && !PointsReached(entry.points)) {
+				state += "P(s" + n(entry.seal) + " #" + n(entry.submission) + " frame " + n(entry.hostFrame);
+				for (const auto& [timeline, value] : entry.points)
+					if (timeline && *timeline)
+						state += " t" + n((*timeline)->GetHandle().index) + " " + n(value) + "/" + n((*timeline)->GetCompletedValue());
+				state += ")";
+			}
 			out += " " + (state.empty() ? std::string(".") : state);
 		}
 		out += "]";
