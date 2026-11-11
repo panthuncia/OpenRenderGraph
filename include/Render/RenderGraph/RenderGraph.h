@@ -304,7 +304,7 @@ private:
 	// the passes prepare for (FramePreparationContext::preparationData), e.g. a scene revision; retained while it records.
 	// admissionOnly: the ticket carries the admission alone, and its recording is bound before submission
 	// (BindPersistentTicketRecording) - an epoch recorded ahead, for a revision (GraphHost::RequestEpochRecording).
-	std::shared_ptr<PersistentTicket> PreparePersistentTicket(rhi::Device device, uint32_t epoch, uint8_t slot, uint64_t hostFrame,
+	std::shared_ptr<PersistentTicket> PreparePersistentTicket(rhi::Device device, uint32_t epoch, uint32_t slot, uint64_t hostFrame,
 		uint64_t hostTag = 0, std::shared_ptr<const IHostExecutionData> hostData = {}, bool admissionOnly = false);
 	// The ticket's recording (one segment), or null; the ticket keeps it.
 	static std::shared_ptr<const PersistentRecording> PersistentTicketRecording(const PersistentTicket& ticket) noexcept;
@@ -323,7 +323,7 @@ private:
 	// it (ResolverCaptureContext of IHostExecutionData), so its publication and bindings are the revision's own, and it holds them.
 	// Owner thread: a ticket for the epoch's slot that prepares nothing from live state: its admissions are its candidates', one
 	// per recording it may be submitted with (AddPersistentTicketCandidate); the bind takes one, completion abandons the rest.
-	std::shared_ptr<PersistentTicket> PrepareRevisionTicket(uint32_t epoch, uint8_t slot, uint64_t hostFrame);
+	std::shared_ptr<PersistentTicket> PrepareRevisionTicket(uint32_t epoch, uint32_t slot, uint64_t hostFrame);
 	// Owner thread: admits the recording's publication as a candidate of the revision ticket. Lock-free against a bind on the
 	// submitting thread (an append-only list); a recording published to that thread after this call is always found.
 	void AddPersistentTicketCandidate(PersistentTicket& ticket, std::shared_ptr<const PersistentRecording> recording);
@@ -366,7 +366,7 @@ private:
 	void RetirePersistentExecutions();
 	// Submitting thread; they touch nothing the owner thread uses.
 	static uint32_t PersistentTicketEpoch(const PersistentTicket& ticket) noexcept;
-	static uint8_t PersistentTicketSlot(const PersistentTicket& ticket) noexcept;
+	static uint32_t PersistentTicketSlot(const PersistentTicket& ticket) noexcept;
 	static uint64_t PersistentTicketHostFrame(const PersistentTicket& ticket) noexcept;
 	// The execution the ticket prepared. It is submitted, or poisoned, when the ticket completes (CompletePersistentTicket).
 	static ExecutionHandle PersistentTicketExecution(const PersistentTicket& ticket) noexcept;
@@ -415,7 +415,7 @@ private:
 	// write: only they wait for uploadsDone (all of them when a destination there is not known). `recorded` then means that
 	// `list` itself took a copy; queueCopies, when given, receives the copies recorded into queueLists. Without a ticket or
 	// queueLists, everything goes into `list` and every batch on another queue waits, as before.
-	bool RecordPendingUploads(rhi::Device device, rhi::CommandList& list, uint8_t slot, std::shared_ptr<void>& keepAlive, bool& recorded,
+	bool RecordPendingUploads(rhi::Device device, rhi::CommandList& list, uint32_t slot, std::shared_ptr<void>& keepAlive, bool& recorded,
 		std::vector<rhi::CommandList>& recordedLists, PersistentTicket* ticket = nullptr, std::span<rhi::CommandList> queueLists = {},
 		size_t* queueCopies = nullptr);
 	// The epoch the next Update/Execute runs; persistent::AllEpochs runs every pass.
@@ -470,7 +470,7 @@ public:
 	bool IsSwapchainResource(const Resource* resource) const noexcept { return resource && resource == m_swapchain.get(); }
 	org::memory::SnapshotProvider& GetMemorySnapshotProvider() { return m_memorySnapshotProvider; }
 	const org::memory::SnapshotProvider& GetMemorySnapshotProvider() const { return m_memorySnapshotProvider; }
-	void WriteVramUsageDebugDumpNow(uint8_t frameIndex) const { WriteVramUsageDebugDump(frameIndex); }
+	void WriteVramUsageDebugDumpNow(uint32_t frameIndex) const { WriteVramUsageDebugDump(frameIndex); }
 	void SetStatisticsService(std::shared_ptr<org::runtime::IStatisticsService> service) { m_statisticsService = std::move(service); }
 	// Whether the graph drives the runtime's frame-indexed services: statistics query slots, persistent readback captures and
 	// readback completion polling. One graph on a runtime does (the per-frame one) until those services are per execution
@@ -683,7 +683,7 @@ private:
 	// edits they make (a structural one builds on a worker); PreparePersistentExecution then prepares an execution
 	// against the selected publication.
 	struct PersistentExecution;
-	void PreparePersistentFrame(rhi::Device device, uint8_t frameIndex, const IHostExecutionData* hostData, float deltaTime,
+	void PreparePersistentFrame(rhi::Device device, uint32_t frameIndex, const IHostExecutionData* hostData, float deltaTime,
 		const PersistentExecutionOptions& options);
 	void BootstrapPersistentGraph();
 	// The pass's declared pipelines for its device. Starts their builds; returns whether all are ready. Failed builds are
@@ -693,7 +693,7 @@ private:
 	void AwaitPassPipelines(const PassParameters& resources, DeviceInstanceId device, const std::string& passName);
 	// bootstrap: the first, whose passes were all just declared.
 	void BindPersistentFrame(bool ticket, bool bootstrap);
-	PersistentExecution PreparePersistentExecution(rhi::Device device, uint8_t frameIndex, const IHostExecutionData* hostData,
+	PersistentExecution PreparePersistentExecution(rhi::Device device, uint32_t frameIndex, const IHostExecutionData* hostData,
 		float deltaTime, const PersistentExecutionOptions& options);
 	// Execution of the prepared one: its uploads, then its main segment's admission, recording and submission.
 	void ExecutePersistentFrame(PassExecutionContext& context);
@@ -779,17 +779,17 @@ private:
 	using KeptRecordingSet = std::vector<std::shared_ptr<const PersistentRecording>>;
 	class KeptRecordingStore {
 	public:
-		std::shared_ptr<const KeptRecordingSet> Load(uint32_t epoch, uint8_t slot) const {
+		std::shared_ptr<const KeptRecordingSet> Load(uint32_t epoch, uint32_t slot) const {
 			std::scoped_lock lock(m_mutex);
 			const auto found = m_sets.find(Key(epoch, slot));
 			return found == m_sets.end() ? nullptr : found->second;
 		}
-		void Store(uint32_t epoch, uint8_t slot, std::shared_ptr<const KeptRecordingSet> set) {
+		void Store(uint32_t epoch, uint32_t slot, std::shared_ptr<const KeptRecordingSet> set) {
 			std::scoped_lock lock(m_mutex);
 			m_sets[Key(epoch, slot)] = std::move(set);
 		}
 	private:
-		static uint64_t Key(uint32_t epoch, uint8_t slot) noexcept { return (static_cast<uint64_t>(epoch) << 8) | slot; }
+		static uint64_t Key(uint32_t epoch, uint32_t slot) noexcept { return (static_cast<uint64_t>(epoch) << 32) | slot; }
 		mutable std::mutex m_mutex;
 		std::unordered_map<uint64_t, std::shared_ptr<const KeptRecordingSet>> m_sets;
 	};
@@ -919,7 +919,7 @@ private:
 	// snapshots, referenced resources and (when they depend on it) its registry view and Setup. Persistent execution
 	// lowers from this directly; the old compiler's RefreshRetainedDeclarationsForFrame also updates its declaration cache.
 	void RedeclarePass(PassAndResources& p, PassType type);
-	void WriteVramUsageDebugDump(uint8_t frameIndex) const;
+	void WriteVramUsageDebugDump(uint32_t frameIndex) const;
 	AnyPassAndResources MaterializeExternalPass(const ExternalPassDesc& desc, bool callSetup, bool materializeReferencedResources);
 	void RegisterExternalPassName(const ExternalPassDesc& desc, AnyPassAndResources& any);
 

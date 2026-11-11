@@ -332,8 +332,9 @@ uint32_t GraphHost::FrameSlotsFor(const Desc& desc) {
 		runs += perFrame;
 	}
 	const uint64_t slots = runs * (std::max)(desc.framesInFlight, 1u);
-	if (slots > UINT8_MAX)
-		throw std::invalid_argument("GraphHost: " + std::to_string(slots) + " frame slots (frames in flight times the epochs' runs a frame) is more than 255");
+	if (slots > Runtime::kMaxSlots)
+		throw std::invalid_argument("GraphHost: " + std::to_string(slots) + " frame slots (frames in flight times the epochs' runs a frame) is more than "
+			+ std::to_string(Runtime::kMaxSlots) + " (Runtime::kMaxSlots)");
 	return static_cast<uint32_t>(slots);
 }
 
@@ -728,7 +729,7 @@ void GraphHost::ExecuteFrame(const IHostExecutionData* hostData, const FrameCall
 	}
 	lap(m_lastTimings.waitUs);
 	// A slot an external client's work still uses (NoteExternalSlotUse) keeps its upload pages for a later release.
-	if (auto* uploads = graph.GetUploadService(); uploads && !ExternalSlotInUse(slot)) uploads->ProcessDeferredReleases(static_cast<uint8_t>(slot));
+	if (auto* uploads = graph.GetUploadService(); uploads && !ExternalSlotInUse(slot)) uploads->ProcessDeferredReleases(static_cast<uint32_t>(slot));
 	m_desc.runtime->Retire();
 	lap(m_lastTimings.releaseUs);
 	graph.SetPersistentEpoch(epoch);
@@ -1363,7 +1364,7 @@ bool GraphHost::AdvanceRecordingRequests(Async& state) {
 				{
 					Async::Preparation preparation;
 					const auto version = state.backingVersion.load(std::memory_order_acquire);
-					auto ticket = graph.PreparePersistentTicket(m_device, request.result->epoch, static_cast<uint8_t>(slot), state.hostFrame, version,
+					auto ticket = graph.PreparePersistentTicket(m_device, request.result->epoch, static_cast<uint32_t>(slot), state.hostFrame, version,
 						request.hostData);
 					recording = RenderGraph::PersistentTicketRecording(*ticket);
 					// Recorded only: its admission is abandoned, never submitted.
@@ -1510,7 +1511,7 @@ void GraphHost::PrepareTicket(Async& state, uint32_t epochIndex, int32_t request
 	try {
 		if (state.revisionDriven[epochIndex]) {
 			// Nothing from live state: the ticket admits the revisions' recordings for its slot, the ones still held.
-			ticket = graph.PrepareRevisionTicket(state.epochs[epochIndex], static_cast<uint8_t>(slot), state.hostFrame++);
+			ticket = graph.PrepareRevisionTicket(state.epochs[epochIndex], static_cast<uint32_t>(slot), state.hostFrame++);
 			auto& live = state.liveRecordings[epochIndex];
 			std::erase_if(live, [](const auto& a_recording) { return a_recording.expired(); });
 			for (const auto& weak : live)
@@ -1518,7 +1519,7 @@ void GraphHost::PrepareTicket(Async& state, uint32_t epochIndex, int32_t request
 		} else {
 			Async::Preparation preparation;
 			const auto version = state.backingVersion.load(std::memory_order_acquire);
-			ticket = graph.PreparePersistentTicket(m_device, state.epochs[epochIndex], static_cast<uint8_t>(slot), state.hostFrame++, version);
+			ticket = graph.PreparePersistentTicket(m_device, state.epochs[epochIndex], static_cast<uint32_t>(slot), state.hostFrame++, version);
 			RenderGraph::SetPersistentTicketHostTag(*ticket, version);
 			// The revisions' recordings still held, as alternatives the submitting thread may take instead (UseEpochRecording).
 			auto& live = state.liveRecordings[epochIndex];
@@ -1744,7 +1745,7 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 	// the deletion queues goes to the host's thread with the submission: its driver frees take the device's memory locks,
 	// which the render thread must not wait on here.
 	if (auto* uploads = graph.GetUploadService(); uploads && !ExternalSlotInUse(slot))
-		uploads->ProcessDeferredReleases(static_cast<uint8_t>(slot));
+		uploads->ProcessDeferredReleases(static_cast<uint32_t>(slot));
 	std::shared_ptr<void> retired = m_desc.runtime->RetireElsewhere();
 	lap(m_lastTimings.releaseUs);
 	if (beforeSubmit) {
@@ -1880,7 +1881,7 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 		async.queueLists[queue] = queueScoped && queue < queueUploadLists.size() && queueUploadLists[queue].list
 			? queueUploadLists[queue].list.Get() : rhi::CommandList{};
 	size_t queueCopies = 0;
-	const bool supported = graph.RecordPendingUploads(m_device, commands, static_cast<uint8_t>(slot), keepAlive, recorded, recordedLists,
+	const bool supported = graph.RecordPendingUploads(m_device, commands, static_cast<uint32_t>(slot), keepAlive, recorded, recordedLists,
 		queueScoped ? ticket.get() : nullptr, queueScoped ? std::span<rhi::CommandList>(async.queueLists) : std::span<rhi::CommandList>{}, &queueCopies);
 	{
 		BT_ZONE_SCOPE("ORG.Host.CloseUploadList");
@@ -2013,7 +2014,7 @@ void GraphHost::BeginExternalFrameSlot(uint32_t slot) {
 	auto* graph = AnyGraph();
 	auto* uploads = graph ? graph->GetUploadService() : nullptr;
 	if (!uploads || (m_externalSlot < m_slotSubmitted.size() && !m_slotSubmitted[m_externalSlot].Reached())) return;
-	uploads->ProcessDeferredReleases(static_cast<uint8_t>(m_externalSlot));
+	uploads->ProcessDeferredReleases(m_externalSlot);
 	if (!m_async) {
 		m_desc.runtime->Retire();
 		return;

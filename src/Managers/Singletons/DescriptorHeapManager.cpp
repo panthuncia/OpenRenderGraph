@@ -317,7 +317,7 @@ void DescriptorHeapManager::RetireExecutionLease(std::shared_ptr<const void> lea
     m_deferredReleases.push_back(std::move(release));
 }
 
-void DescriptorHeapManager::ProcessDeferredReleases(uint8_t frameIndex) {
+void DescriptorHeapManager::ProcessDeferredReleases(uint32_t frameIndex) {
     (void)frameIndex;
     std::vector<DeferredRelease> readyReleases;
     {

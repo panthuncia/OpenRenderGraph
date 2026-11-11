@@ -133,6 +133,12 @@ is a deadlock.
 -   **Capacity.** The epoch's ring has `framesInFlight * runsPerFrame` slots. `FrameSlots()` counts them
     (`GraphHost::FrameSlotsFor(desc)` before the host exists, to size the runtime). It is fixed when the host is made, so
     a `LatchBlock` sized from it, and every other per-slot table, stays right.
+-   **Limit.** A host has at most `Runtime::kMaxSlots` (4096) frame slots over all its epochs. Slot indices are 32-bit
+    everywhere (upload pages, kept recordings, tickets), so the bound is not a type limit. It keeps the per-slot tables
+    in check: each slot adds a range to the statistics query pools (two timestamps per pass), an upload page list, and a
+    region to every `LatchBlock` sized from `FrameSlots()`. Every run a frame of every epoch costs one slot per frame in
+    flight. A run cannot share another run's slot: it is a submission of its own, with its own latch region, its own
+    kept recording (a list cannot be pending twice) and its own slot wait.
 -   **Growth.** The ring starts with `framesInFlight` slots. The next ticket takes the least recently submitted slot in
     use. It waits for that slot only when the slot's last run is done, or is at least `max(framesInFlight - 1, 1)` frame
     boundaries old. Otherwise the ring grows by one slot. Frame boundaries are `SealSubmitted` calls: the host declares
@@ -147,7 +153,7 @@ is a deadlock.
 -   **Statistics.** `AsyncStats::ringGrowths` and `ringFull`.
 -   **Test.** `PersistentVulkanHostTests rings` (and `rings open`): an external epoch run six times a frame with two
     frames in flight, its executions held until the frame's end, runs without a deadlock; nine runs between two seals
-    skip the ninth.
+    skip the ninth. `rings-wide` does the same with 260 runs a frame in a ring of 272 slots.
 
 ## Recording reuse
 
@@ -330,4 +336,5 @@ the owner thread.
     -   `split` (two epochs, two graphs, one rebuilt alone);
     -   `stream` and `stream open home`;
     -   `arena`;
-    -   `rings` and `rings open` (an epoch that runs many times a frame, `Desc::epochRuns`).
+    -   `rings` and `rings open` (an epoch that runs many times a frame, `Desc::epochRuns`), and `rings-wide` (a ring of
+        272 slots, so slot indices pass 255, with recording reuse).

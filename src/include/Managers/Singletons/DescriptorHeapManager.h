@@ -83,7 +83,7 @@ public:
 	void SetFrontier(std::function<runtime::SubmissionFrontier()> frontier, runtime::PointReached reached);
 	void PublishQueueFenceSnapshot(std::vector<QueueFenceSnapshotPoint> fenceSnapshot);
 	std::vector<QueueFenceSnapshotPoint> GetQueueFenceSnapshot() const;
-	void ProcessDeferredReleases(uint8_t frameIndex);
+	void ProcessDeferredReleases(uint32_t frameIndex);
 	DeferredReleaseStats GetDeferredReleaseStats();
 	// The caller must have waited for the device to become idle. Releases every
 	// pending object and forgets queue-fence snapshots before their owning queue

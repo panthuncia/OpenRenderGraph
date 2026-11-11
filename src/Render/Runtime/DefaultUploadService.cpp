@@ -81,7 +81,7 @@ public:
         Manager().SetStagedUploadsRecordedDirectly(direct);
     }
 
-    size_t RecordStagedUploads(rhi::CommandList& list, uint8_t frameIndex, bool afterWork) override {
+    size_t RecordStagedUploads(rhi::CommandList& list, uint32_t frameIndex, bool afterWork) override {
         return Manager().RecordStagedUploads(list, frameIndex, afterWork);
     }
 
@@ -89,11 +89,11 @@ public:
         return Manager().SubmitRecordedUploads(std::move(batch));
     }
 
-    size_t TakeRecordedUploads(std::vector<rhi::CommandList>& out, uint8_t frameIndex) override {
+    size_t TakeRecordedUploads(std::vector<rhi::CommandList>& out, uint32_t frameIndex) override {
         return Manager().TakeRecordedUploads(out, frameIndex);
     }
 
-    bool TakeRecordedUploadsWithDestinations(std::vector<rhi::CommandList>& out, uint8_t frameIndex,
+    bool TakeRecordedUploadsWithDestinations(std::vector<rhi::CommandList>& out, uint32_t frameIndex,
         std::vector<rhi::ResourceHandle>& destinations) override {
         return Manager().TakeRecordedUploadsWithDestinations(out, frameIndex, destinations);
     }
@@ -102,12 +102,12 @@ public:
         return Manager().StagedUploadDestinations(out);
     }
 
-    size_t RecordStagedUploadsRouted(rhi::CommandList& list, uint8_t frameIndex, bool afterWork,
+    size_t RecordStagedUploadsRouted(rhi::CommandList& list, uint32_t frameIndex, bool afterWork,
         const std::function<rhi::CommandList*(rhi::ResourceHandle)>& route, size_t& routed) override {
         return Manager().RecordStagedUploadsRouted(list, frameIndex, afterWork, route, routed);
     }
 
-    void ProcessDeferredReleases(uint8_t frameIndex) override {
+    void ProcessDeferredReleases(uint32_t frameIndex) override {
         Manager().ProcessDeferredReleases(frameIndex);
     }
 

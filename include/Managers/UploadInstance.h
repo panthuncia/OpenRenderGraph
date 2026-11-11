@@ -66,7 +66,7 @@ public:
 	static constexpr size_t kDefaultPreallocateCapacity = 128 * 1024 * 1024; // 128 MB
 
 	struct Config {
-		uint8_t numFramesInFlight = 3;
+		uint32_t numFramesInFlight = 3;
 		size_t pageSizeBytes = kDefaultPageSize;
 		size_t preallocateCapacityBytes = kDefaultPreallocateCapacity;
 		std::string debugName = "UploadInstance";
@@ -119,7 +119,7 @@ public:
 	// Construct an upload instance.
 	// @param numFramesInFlight  Number of frames in flight for page retirement.
 	// @param pageSize           Size of each upload-heap page in bytes (default 16 MB).
-	explicit UploadInstance(uint8_t numFramesInFlight, size_t pageSize = kDefaultPageSize);
+	explicit UploadInstance(uint32_t numFramesInFlight, size_t pageSize = kDefaultPageSize);
 	explicit UploadInstance(Config config);
 	~UploadInstance();
 
@@ -159,26 +159,26 @@ public:
 
 	// Emit GPU copy commands for all queued buffer and texture uploads.
 	// Call from a pass's RecordImmediateCommands().
-	void ProcessUploads(uint8_t frameIndex, org::imm::ImmediateCommandList& commandList);
-	void ProcessUploadsThrough(uint8_t frameIndex, org::imm::ImmediateCommandList& commandList, uint64_t sequenceInclusive);
+	void ProcessUploads(uint32_t frameIndex, org::imm::ImmediateCommandList& commandList);
+	void ProcessUploadsThrough(uint32_t frameIndex, org::imm::ImmediateCommandList& commandList, uint64_t sequenceInclusive);
 
 	// Retire upload-heap pages that are no longer referenced by any in-flight frame.
 	// Call once per frame after the GPU has finished with the retiring frame.
-	void ProcessDeferredReleases(uint8_t frameIndex);
+	void ProcessDeferredReleases(uint32_t frameIndex);
 
 	// Owner thread: queues a producer's staged batch (IUploadService::SubmitStagedUploads).
 	void SubmitStagedUploads(std::shared_ptr<org::runtime::StagedUploadBatch> batch);
 	void SetStagedUploadsRecordedDirectly(bool direct);
-	size_t RecordStagedUploads(rhi::CommandList& list, uint8_t frameIndex, bool afterWork);
+	size_t RecordStagedUploads(rhi::CommandList& list, uint32_t frameIndex, bool afterWork);
 	// IUploadService::SubmitRecordedUploads and TakeRecordedUploads (direct mode). a_nothingQueued tells whether the
 	// manager's own queue of resource copies is empty.
 	bool SubmitRecordedUploads(std::shared_ptr<org::runtime::StagedUploadBatch> batch, bool a_nothingQueued);
-	size_t TakeRecordedUploads(std::vector<rhi::CommandList>& out, uint8_t frameIndex);
+	size_t TakeRecordedUploads(std::vector<rhi::CommandList>& out, uint32_t frameIndex);
 	// The IUploadService calls that split uploads between queues: TakeRecordedUploadsWithDestinations,
 	// StagedUploadDestinations and RecordStagedUploadsRouted.
-	bool TakeRecordedUploadsWithDestinations(std::vector<rhi::CommandList>& out, uint8_t frameIndex, std::vector<rhi::ResourceHandle>& destinations);
+	bool TakeRecordedUploadsWithDestinations(std::vector<rhi::CommandList>& out, uint32_t frameIndex, std::vector<rhi::ResourceHandle>& destinations);
 	bool StagedUploadDestinations(std::vector<rhi::ResourceHandle>& out) const;
-	size_t RecordStagedUploadsRouted(rhi::CommandList& list, uint8_t frameIndex, bool afterWork,
+	size_t RecordStagedUploadsRouted(rhi::CommandList& list, uint32_t frameIndex, bool afterWork,
 		const std::function<rhi::CommandList*(rhi::ResourceHandle)>& route, size_t& routed);
 
 	// Configuration
@@ -293,7 +293,7 @@ private:
 	};
 	std::mutex m_pageLifetimeTraceMutex;
 	std::vector<PageLifetimeTrace> m_pageLifetimeTraces;
-	uint8_t                    m_numFramesInFlight;
+	uint32_t                    m_numFramesInFlight;
 	size_t                     m_currentFrameUploadBytes = 0;
 	std::vector<size_t>        m_recentFrameBytes;
 	size_t                     m_recentFrameCursor = 0;

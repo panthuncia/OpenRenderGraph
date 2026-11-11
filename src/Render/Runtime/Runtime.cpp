@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <stdexcept>
+#include <string>
 
 #include "Render/PipelineLibrary.h"
 #include "Render/QueueRegistry.h"
@@ -48,7 +49,8 @@ bool SameQueue(const rhi::Queue& a, const rhi::Queue& b) noexcept {
 std::shared_ptr<Runtime> Runtime::Create(Desc desc) {
 	if (!desc.device) throw std::invalid_argument("Runtime requires a device");
 	if (desc.backend == rhi::Backend::Null) throw std::invalid_argument("Runtime requires a device backend");
-	if (desc.slots == 0 || desc.slots > 255) throw std::invalid_argument("Runtime slots must be 1-255");
+	if (desc.slots == 0 || desc.slots > kMaxSlots)
+		throw std::invalid_argument("Runtime slots must be 1-" + std::to_string(kMaxSlots) + ", not " + std::to_string(desc.slots));
 	static std::once_flag traceFromEnvironment;
 	std::call_once(traceFromEnvironment, [] { trace::ConfigureFromEnvironment(); });
 	Runtime* expected = nullptr;
@@ -75,7 +77,7 @@ Runtime::Runtime(Desc desc)
 void Runtime::Initialize() {
 	// Slot-indexed services size themselves from the settings: the runtime's slots, set once here.
 	auto settings = runtime::GetOpenRenderGraphSettings();
-	settings.numFramesInFlight = static_cast<uint8_t>(m_desc.slots);
+	settings.numFramesInFlight = m_desc.slots;
 	runtime::SetOpenRenderGraphSettings(settings);
 
 	runtime::InitializeRuntimeDevice(m_desc.device);

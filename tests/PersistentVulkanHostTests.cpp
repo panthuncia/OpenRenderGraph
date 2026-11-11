@@ -552,7 +552,10 @@ static int Run(int argc, char** argv) {
 	// "rings": an external async epoch that runs many times a frame (GraphHost::Desc::epochRuns), its executions held, as a host's
 	// stream holds them, and executed only at the frame's end, before SealSubmitted. Its ring grows instead of waiting for a run of
 	// the same frame, and a frame with more runs than the ring has slots skips the rest (EpochRingFullError) instead of hanging.
-	const bool rings = argc > 1 && std::strcmp(argv[1], "rings") == 0;
+	const bool rings = argc > 1 && (std::strcmp(argv[1], "rings") == 0 || std::strcmp(argv[1], "rings-wide") == 0);
+	// "rings-wide": the same, with a ring of 272 slots and 260 runs a frame, so slot indices pass 255 (they were 8-bit), and with
+	// recording reuse on, whose kept recordings are keyed by epoch and slot.
+	const bool wide = argc > 1 && std::strcmp(argv[1], "rings-wide") == 0;
 	// "open" after the mode: async epochs on open executions, admitted at submission (no closed executions).
 	const bool open = argc > 2 && std::strcmp(argv[2], "open") == 0;
 	// "stream open home": the write also reads a host-owned texture, under external home states.
@@ -844,11 +847,23 @@ static int Run(int argc, char** argv) {
 			}
 			runtime.reset();
 		} else if (rings) {
-			// Two frames in flight; epoch 0 sized for 4 runs a frame: a ring of 8 slots, of which it starts with 2.
+			// Two frames in flight; epoch 0 sized for 4 runs a frame: a ring of 8 slots, of which it starts with 2. Wide: 136 runs a
+			// frame, a ring of 272 slots.
+			const uint32_t sizedRuns = wide ? 136u : 4u;
+			const uint32_t capacity = 2u * sizedRuns;
 			org::GraphHost::Desc desc{.queueBoundary = {.entry = true, .exit = true}, .framesInFlight = 2, .epochOrder = {0},
-				.closedExecutions = !open};
-			desc.epochRuns = {{.epoch = 0, .runsPerFrame = 4}};
-			REQUIRE(org::GraphHost::FrameSlotsFor(desc) == 8, "frame slots: frames in flight times the epoch's runs a frame");
+				.closedExecutions = !open, .reuseRecordings = wide};
+			desc.epochRuns = {{.epoch = 0, .runsPerFrame = sizedRuns}};
+			REQUIRE(org::GraphHost::FrameSlotsFor(desc) == capacity, "frame slots: frames in flight times the epoch's runs a frame");
+			bool tooMany = false;
+			try {
+				auto invalid = desc;
+				invalid.epochRuns = {{.epoch = 0, .runsPerFrame = org::Runtime::kMaxSlots}};
+				(void)org::GraphHost::FrameSlotsFor(invalid);
+			} catch (const std::invalid_argument&) {
+				tooMany = true;
+			}
+			REQUIRE(tooMany, "no more frame slots than Runtime::kMaxSlots");
 			bool rejected = false;
 			try {
 				auto invalid = desc;
@@ -858,12 +873,12 @@ static int Run(int argc, char** argv) {
 				rejected = true;
 			}
 			REQUIRE(rejected, "epochRuns names only epochs of the order");
-			auto runtime = org::Runtime::Create({.device = device.Get(), .backend = rhi::Backend::Vulkan, .slots = 8,
+			auto runtime = org::Runtime::Create({.device = device.Get(), .backend = rhi::Backend::Vulkan, .slots = capacity,
 				.tasks = std::make_shared<org::runtime::ThreadPoolTaskService>(2)});
 			desc.runtime = runtime;
 			{
 				org::GraphHost host(desc);
-				REQUIRE(host.FrameSlots() == 8, "the host's frame slots");
+				REQUIRE(host.FrameSlots() == capacity, "the host's frame slots");
 				auto program = CreateProgram(device.Get());
 				REQUIRE(program, "compute program");
 				auto scratch = org::Buffer::CreateSharedUnmaterialized(rhi::HeapType::DeviceLocal, kBytes, true);
@@ -923,9 +938,11 @@ static int Run(int argc, char** argv) {
 					return 0;
 				};
 				(void)host.TakeAsyncStats();
-				// Six runs a frame, three times the frames in flight: the old ring of two slots waited for a run still held.
-				constexpr uint32_t kRuns = 6;
-				for (uint32_t frame = 0; frame < 6; ++frame) {
+				// Six runs a frame, three times the frames in flight: the old ring of two slots waited for a run still held. Wide: 260
+				// runs a frame, so the ring grows past slot 255.
+				const uint32_t kRuns = wide ? 260u : 6u;
+				const uint32_t kFrames = wide ? 3u : 6u;
+				for (uint32_t frame = 0; frame < kFrames; ++frame) {
 					for (uint32_t run = 0; run < kRuns; ++run) {
 						value = 120000u + 100u * frame + 10u * run;
 						host.SubmitEpoch(0, upload);
@@ -938,13 +955,13 @@ static int Run(int argc, char** argv) {
 				const auto grown = host.TakeAsyncStats();
 				std::printf("rings: %llu submissions, %llu ring growths, %llu full\n", static_cast<unsigned long long>(grown.submitted),
 					static_cast<unsigned long long>(grown.ringGrowths), static_cast<unsigned long long>(grown.ringFull));
-				REQUIRE(grown.submitted == 6 * kRuns && grown.ringGrowths > 0 && grown.ringGrowths <= 6 && grown.ringFull == 0,
-					"the ring grew instead of waiting for the frame's own runs, within its 8 slots");
+				REQUIRE(grown.submitted == kFrames * kRuns && grown.ringGrowths >= kRuns - 2 && grown.ringGrowths <= capacity - 2
+					&& grown.ringFull == 0, "the ring grew instead of waiting for the frame's own runs, within its slots");
 				// More runs in one frame than the ring has slots: the ninth is skipped (nothing submitted), and nothing hangs.
 				uint32_t submitted = 0;
 				bool full = false;
 				uint32_t last = 0;
-				for (uint32_t run = 0; run < 12 && !full; ++run) {
+				for (uint32_t run = 0; run < capacity + 4 && !full; ++run) {
 					value = 130000u + 10u * run;
 					try {
 						host.SubmitEpoch(0, upload);
@@ -955,11 +972,11 @@ static int Run(int argc, char** argv) {
 						++submitted;
 					} catch (const org::GraphHost::EpochRingFullError& e) {
 						full = true;
-						REQUIRE(e.epoch == 0 && e.capacity == 8 && !host.EpochFailed(0), "a full ring is not a failed epoch");
+						REQUIRE(e.epoch == 0 && e.capacity == capacity && !host.EpochFailed(0), "a full ring is not a failed epoch");
 					}
 				}
 				std::printf("rings: %u runs before the ring was full\n", submitted);
-				REQUIRE(full && submitted == 8, "eight runs fit between two seals, the ninth is skipped");
+				REQUIRE(full && submitted == capacity, "the ring's capacity of runs fits between two seals, the next is skipped");
 				if (const int failed = endFrame(last)) return failed;
 				REQUIRE(host.PollEpochFailures() == 0, "nothing reported");
 				// After the seal, the epoch runs again.

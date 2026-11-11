@@ -5,7 +5,7 @@ namespace org {
 
 using namespace graph_internal;
 
-void RenderGraph::WriteVramUsageDebugDump(uint8_t frameIndex) const
+void RenderGraph::WriteVramUsageDebugDump(uint32_t frameIndex) const
 {
 	try {
 		struct DumpCategoryRow {

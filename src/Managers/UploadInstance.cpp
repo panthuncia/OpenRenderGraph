@@ -34,7 +34,7 @@ namespace {
 	}
 }
 
-UploadInstance::UploadInstance(uint8_t numFramesInFlight, size_t pageSize)
+UploadInstance::UploadInstance(uint32_t numFramesInFlight, size_t pageSize)
 	: UploadInstance(Config{
 		.numFramesInFlight = numFramesInFlight,
 		.pageSizeBytes = pageSize,
@@ -48,7 +48,7 @@ UploadInstance::UploadInstance(Config config)
 	, m_debugName(std::move(config.debugName))
 	, m_pageNamePrefix(std::move(config.pageNamePrefix))
 	, m_usageHint(std::move(config.usageHint))
-	, m_numFramesInFlight((std::max)(uint8_t{ 1 }, config.numFramesInFlight))
+	, m_numFramesInFlight((std::max)(uint32_t{ 1 }, config.numFramesInFlight))
 {
 	m_framePages.resize(m_numFramesInFlight);
 	m_frameStaged.resize(m_numFramesInFlight);
@@ -829,7 +829,7 @@ bool UploadInstance::SubmitRecordedUploads(std::shared_ptr<org::runtime::StagedU
 	return true;
 }
 
-size_t UploadInstance::TakeRecordedUploads(std::vector<rhi::CommandList>& out, uint8_t frameIndex) {
+size_t UploadInstance::TakeRecordedUploads(std::vector<rhi::CommandList>& out, uint32_t frameIndex) {
 	NoteOffOwnerCall("TakeRecordedUploads");
 	if (m_directRecorded.empty()) return 0;
 	// A backing released since a batch was recorded: its copies name the old one. The owner records them instead, first.
@@ -849,7 +849,7 @@ size_t UploadInstance::TakeRecordedUploads(std::vector<rhi::CommandList>& out, u
 	return taken;
 }
 
-size_t UploadInstance::RecordStagedUploads(rhi::CommandList& list, uint8_t frameIndex, bool afterWork) {
+size_t UploadInstance::RecordStagedUploads(rhi::CommandList& list, uint32_t frameIndex, bool afterWork) {
 	BT_ZONE_SCOPE("ORG.Upload.RecordStagedUploads");
 	NoteOffOwnerCall("RecordStagedUploads");
 	uint64_t bytes = 0;
@@ -877,7 +877,7 @@ size_t UploadInstance::RecordStagedUploads(rhi::CommandList& list, uint8_t frame
 	return copies;
 }
 
-bool UploadInstance::TakeRecordedUploadsWithDestinations(std::vector<rhi::CommandList>& out, uint8_t frameIndex,
+bool UploadInstance::TakeRecordedUploadsWithDestinations(std::vector<rhi::CommandList>& out, uint32_t frameIndex,
 	std::vector<rhi::ResourceHandle>& destinations) {
 	// Read before the take: the batches move to the slot's retained list. A batch the take sends back to be recorded as
 	// staged (an outdated recording) returns no list, and its destinations are then the staged ones.
@@ -892,7 +892,7 @@ bool UploadInstance::StagedUploadDestinations(std::vector<rhi::ResourceHandle>& 
 	return org::runtime::StagedUploadBatch::AppendDestinations(m_directStaged, out);
 }
 
-size_t UploadInstance::RecordStagedUploadsRouted(rhi::CommandList& list, uint8_t frameIndex, bool afterWork,
+size_t UploadInstance::RecordStagedUploadsRouted(rhi::CommandList& list, uint32_t frameIndex, bool afterWork,
 	const std::function<rhi::CommandList*(rhi::ResourceHandle)>& route, size_t& routed) {
 	routed = 0;
 	if (!route || m_directStaged.empty()) return RecordStagedUploads(list, frameIndex, afterWork);
@@ -978,12 +978,12 @@ void UploadInstance::DrainReadyPageInbox() {
 	}
 }
 
-void UploadInstance::ProcessUploads(uint8_t frameIndex, org::imm::ImmediateCommandList& commandList) {
+void UploadInstance::ProcessUploads(uint32_t frameIndex, org::imm::ImmediateCommandList& commandList) {
 	ProcessUploadsThrough(frameIndex, commandList, UINT64_MAX);
 }
 
 void UploadInstance::ProcessUploadsThrough(
-	uint8_t frameIndex,
+	uint32_t frameIndex,
 	org::imm::ImmediateCommandList& commandList,
 	uint64_t sequenceInclusive) {
 	NoteOffOwnerCall("ProcessUploadsThrough");
@@ -1248,7 +1248,7 @@ void UploadInstance::RecordProcessedUploadTelemetry(
 	m_uploadTelemetryLastLog = now;
 }
 
-void UploadInstance::ProcessDeferredReleases(uint8_t frameIndex) {
+void UploadInstance::ProcessDeferredReleases(uint32_t frameIndex) {
 	BT_ZONE_SCOPE("UploadInstance::ProcessDeferredReleases");
 	NoteOffOwnerCall("ProcessDeferredReleases");
 	if (m_numFramesInFlight == 0) {

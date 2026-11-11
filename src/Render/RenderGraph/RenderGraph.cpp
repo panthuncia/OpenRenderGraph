@@ -333,7 +333,7 @@ ExternalClient& RenderGraph::GetExternalClient() {
 		desc.closed = m_persistentClosedExecutions;
 		desc.entryFullBarrier = m_externalQueueBoundary.entry;
 		for (size_t slot = 0; slot < m_queueRegistry.SlotCount(); ++slot) {
-			const auto index = static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot));
+			const auto index = static_cast<QueueSlotIndex>(static_cast<uint32_t>(slot));
 			const auto kind = m_queueRegistry.GetKind(index);
 			desc.queues.push_back({m_queueRegistry.GetQueue(index), kind == QueueKind::Graphics ? rhi::QueueKind::Graphics
 				: kind == QueueKind::Compute ? rhi::QueueKind::Compute : rhi::QueueKind::Copy});
@@ -1043,7 +1043,7 @@ void RenderGraph::UpdateOnPreparationOwner(const UpdateExecutionContext& context
 
 	{
 		BT_ZONE_SCOPE("RenderGraph::Update::CompileFrame");
-		PreparePersistentFrame(device, static_cast<uint8_t>(context.preparationSlot), context.hostData, 0.0f, options);
+		PreparePersistentFrame(device, static_cast<uint32_t>(context.preparationSlot), context.hostData, 0.0f, options);
 	}
 }
 

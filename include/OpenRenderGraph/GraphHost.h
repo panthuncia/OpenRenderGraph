@@ -113,7 +113,7 @@ public:
 	/**
 	 * @brief The frame slots a host made with desc has (FrameSlots): framesInFlight times the sum, over epochOrder (one epoch
 	 * without), of each epoch's runsPerFrame (Desc::epochRuns; 1 when not listed). The runtime's slots must cover it. Throws for
-	 * an invalid Desc::epochRuns (an epoch not in epochOrder, listed twice, or 0 runs).
+	 * an invalid Desc::epochRuns (an epoch not in epochOrder, listed twice, or 0 runs), and for more than Runtime::kMaxSlots.
 	 */
 	static uint32_t FrameSlotsFor(const Desc& desc);
 

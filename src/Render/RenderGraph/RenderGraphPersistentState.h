@@ -205,7 +205,7 @@ struct RenderGraph::PersistentRecording {
 struct RenderGraph::PersistentTicket {
 	uint32_t epoch = 0;
 	std::shared_ptr<detail::ExecutionRecord> execution;  // made by its preparation
-	uint8_t slot = 0;
+	uint32_t slot = 0;
 	uint64_t hostFrame = 0;
 	struct Segment {
 		// Until the ticket is admitted (AdmitPersistentTicket): the plan its body was recorded from (PreparePlan; for a
@@ -508,7 +508,7 @@ struct RenderGraph::PersistentExecution {
 
 	Options options;
 	uint64_t number = 0;     // its index (PassPrepareContext::executionIndex)
-	uint8_t frameIndex = 0;  // its preparation slot
+	uint32_t frameIndex = 0;  // its preparation slot
 	std::shared_ptr<const IHostExecutionData> frameData;
 	// Empty for an epoch with no main passes.
 	std::optional<PreparedSegment> main;
@@ -521,7 +521,7 @@ struct RenderGraph::PersistentExecutionsState {
 	std::unique_ptr<compiler::ExecutionTimelineAdmission> timelines;
 	// The latest preparation's execution index and slot.
 	uint64_t frameNumber = 0;
-	uint8_t frameIndex = 0;
+	uint32_t frameIndex = 0;
 	// The execution prepared and not yet executed.
 	std::optional<PersistentExecution> prepared;
 	// The latest execution (its index is frameNumber), and the submitted ones not yet seen complete.
@@ -611,7 +611,7 @@ inline RotationKey RotationKeyOf(State::SlotEntry& entry) {
 
 // The admission identity of a queue slot's timeline (Runtime::TimelineIdentity).
 inline uint64_t QueueTimelineIdentity(Runtime& runtime, const QueueRegistry& registry, size_t slot) {
-	return runtime.TimelineIdentity(registry.GetFence(static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot))));
+	return runtime.TimelineIdentity(registry.GetFence(static_cast<QueueSlotIndex>(static_cast<uint32_t>(slot))));
 }
 
 // Handles are per device: a timeline is its device's implementation and its handle there.
@@ -622,7 +622,7 @@ inline bool SameTimeline(const rhi::Timeline& a, const rhi::Timeline& b) noexcep
 inline std::vector<compiler::CompileQueue> RegistryQueues(const QueueRegistry& registry, rhi::Backend backend) {
 	std::vector<compiler::CompileQueue> queues;
 	for (size_t slot = 0; slot < registry.SlotCount(); ++slot) {
-		const auto index = static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot));
+		const auto index = static_cast<QueueSlotIndex>(static_cast<uint32_t>(slot));
 		queues.push_back({static_cast<uint32_t>(registry.GetBackendInstance(index)), true,
 			registry.GetKind(index) == QueueKind::Copy && backend == rhi::Backend::D3D12});
 	}

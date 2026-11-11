@@ -652,7 +652,7 @@ bool persistent_impl::LoweringAddsDeclarations(const State::MainPass& main, cons
 	return false;
 }
 
-void RenderGraph::PreparePersistentFrame(rhi::Device device, uint8_t frameIndex, const IHostExecutionData* hostData, float deltaTime,
+void RenderGraph::PreparePersistentFrame(rhi::Device device, uint32_t frameIndex, const IHostExecutionData* hostData, float deltaTime,
 	const PersistentExecutionOptions& options) {
 	BT_ZONE_SCOPE("ORG.Persistent.PrepareFrame");
 	if (m_compilerState->frameProductionStopped) throw std::logic_error("Frame production has stopped");
@@ -1228,7 +1228,7 @@ void RenderGraph::BindPersistentFrame(bool ticket, bool bootstrap) {
 }
 
 // Steps 3-4 of a preparation: the main segment's invocations against the selected publication, and the uploads.
-RenderGraph::PersistentExecution RenderGraph::PreparePersistentExecution(rhi::Device device, uint8_t frameIndex,
+RenderGraph::PersistentExecution RenderGraph::PreparePersistentExecution(rhi::Device device, uint32_t frameIndex,
 	const IHostExecutionData* hostData, float deltaTime, const PersistentExecutionOptions& options) {
 	auto& compiler = *m_compilerState;
 	auto& state = *compiler.persistent;
@@ -1499,7 +1499,7 @@ RenderGraph::PersistentExecution RenderGraph::PreparePersistentExecution(rhi::De
 				const uint64_t identity = m_runtime->TimelineIdentity(wait.timeline);
 				bool bound = std::ranges::any_of(main.foreignTimelines, [&](const auto& binding) { return binding.identity == identity; });
 				for (size_t slot = 0; slot < m_queueRegistry.SlotCount() && !bound; ++slot)
-					bound = SameTimeline(m_queueRegistry.GetFence(static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot))), wait.timeline);
+					bound = SameTimeline(m_queueRegistry.GetFence(static_cast<QueueSlotIndex>(static_cast<uint32_t>(slot))), wait.timeline);
 				if (!bound) main.foreignTimelines.push_back({identity, handle});
 				main.waits.push_back({pass.id, {identity, wait.value}});
 			};

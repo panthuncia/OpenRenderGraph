@@ -44,7 +44,7 @@ public:
 		rhi::Device device;
 		rhi::Backend backend = rhi::Backend::Null;
 		// Capacity of the services still indexed by a ring of slots (upload pages, statistics query ranges): the most
-		// executions any graph keeps in flight (GraphHost: frames in flight times epochs). At most 255.
+		// executions any graph keeps in flight (GraphHost: frames in flight times epochs). At most kMaxSlots.
 		uint32_t slots = 3;
 		// Optional; a ThreadPoolTaskService is created when absent.
 		std::shared_ptr<runtime::ITaskService> tasks;
@@ -52,6 +52,11 @@ public:
 		// when a graph lowers a pass, so it may rely on host state made after the runtime.
 		std::shared_ptr<PipelineCompiler> pipelineCompiler;
 	};
+
+	// The most slots a runtime can have. Slot indices are 32-bit everywhere, so this is not a type limit. It is a sanity bound.
+	// Each slot costs memory in every slot-indexed table: a range of the statistics query pools (two timestamps per pass), an
+	// upload page list, and a region in every LatchBlock a host sizes from GraphHost::FrameSlots.
+	static constexpr uint32_t kMaxSlots = 4096;
 
 	static std::shared_ptr<Runtime> Create(Desc desc);
 	// The live runtime, for code with none in reach (resource teardown). Null when there is none.
