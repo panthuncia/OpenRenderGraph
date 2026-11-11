@@ -110,9 +110,9 @@ GpuBufferBacking::GpuBufferBacking(
 }
 
 GpuBufferBacking::~GpuBufferBacking() {
-    UnregisterLiveAlloc();
+    auto name = UnregisterLiveAlloc();
     if (m_bufferAllocation) {
-        DeletionManager::GetInstance().MarkForDelete(std::move(m_bufferAllocation));
+        DeletionManager::GetInstance().MarkForDelete(std::move(m_bufferAllocation), std::move(name));
     }
 }
 
@@ -160,10 +160,15 @@ void GpuBufferBacking::RegisterLiveAlloc() {
     liveAllocs[this] = info;
 }
 
-void GpuBufferBacking::UnregisterLiveAlloc() {
+std::string GpuBufferBacking::UnregisterLiveAlloc() {
     auto& liveAllocs = LiveAllocs();
     std::scoped_lock lock(LiveAllocMutex());
-	liveAllocs.erase(this);
+    std::string name;
+    if (auto it = liveAllocs.find(this); it != liveAllocs.end()) {
+        name = std::move(it->second.name);
+        liveAllocs.erase(it);
+    }
+    return name;
 }
 
 void GpuBufferBacking::UpdateLiveAllocName(const char* name) {

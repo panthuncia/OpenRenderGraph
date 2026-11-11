@@ -1133,7 +1133,7 @@ void GraphHost::StartAsync() {
 						slot.resourceOwner = std::move(state->uncertainResourceOwner);
 						if (!state->paused[message.epochIndex]) state->needsTicket[message.epochIndex] = 1;
 						// Never freed on this thread: a driver free can wait for GPU work that waits for a signal this thread prepares.
-						m_desc.runtime->DestroyDetached(std::move(message.retired));
+						m_desc.runtime->DestroyDetached(std::move(message.retired), "a submission's deferred deletions");
 						break;
 					}
 					case Async::Message::Kind::Discard:
@@ -2187,7 +2187,7 @@ void GraphHost::BeginExternalFrameSlot(uint32_t slot) {
 	if (auto retired = m_desc.runtime->RetireElsewhere()) m_externalRetired.push_back(std::move(retired));
 	// No submission came to take them for a round of slots: they go to the runtime's deleter rather than being kept.
 	if (m_externalRetired.size() > m_frameSlots)
-		for (auto& retired : std::exchange(m_externalRetired, {})) m_desc.runtime->DestroyDetached(std::move(retired));
+		for (auto& retired : std::exchange(m_externalRetired, {})) m_desc.runtime->DestroyDetached(std::move(retired), "an external slot's deferred deletions");
 }
 
 void GraphHost::NoteSlotSubmitted(uint32_t slot) {

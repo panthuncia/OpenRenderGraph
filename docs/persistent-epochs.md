@@ -275,6 +275,10 @@ external-commands callbacks, so ORG's work does not end DXVK's list.
         on the RX 6600). `PrepareTicket` calls `Runtime::RetireDetached`, and a submission's retired objects go to
         `Runtime::DestroyDetached`. Both hand the objects to the runtime's deleter thread. A free there slower than 100 ms is
         logged, and one still running after a second is logged at the next hand-off.
+    -   A retired object whose free takes over 100 ms is logged on its own (`DeletionManager::Retired::DestroyTimed`): its
+        name and size, the `MarkForDelete`, seal and `Retire` callers (`std::source_location`), the frontier it was sealed with
+        against each timeline's completed value, and every timeline now. A sealed point not reached is a frontier gap; all
+        reached means the free waited for other GPU work or for the kernel.
 -   **Test.** `PersistentVulkanHostTests`:
     -   `external`: a late pass in the stream.
     -   `stream` / `stream open`: a write on a compute queue and a copy on a copy queue aliased to the graphics one, with

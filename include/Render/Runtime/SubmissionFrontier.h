@@ -12,6 +12,9 @@ namespace org::runtime {
 struct SubmittedPoint {
 	rhi::Timeline timeline;
 	uint64_t value = 0;
+	// What the point stands for, for logs: "queue", "host timeline" or "external", and its index among those.
+	const char* source = nullptr;
+	uint32_t sourceIndex = 0;
 };
 
 // Every queue's progress at one moment. Something released at that moment is no longer reachable by work recorded

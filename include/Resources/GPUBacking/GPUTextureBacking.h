@@ -92,7 +92,8 @@ private:
 	};
 
 	void RegisterLiveAlloc();
-	void UnregisterLiveAlloc();
+	// Returns the name it was tracked with, for the deletion it goes to.
+	std::string UnregisterLiveAlloc();
 	void UpdateLiveAllocName(const char* name);
 	static std::mutex& LiveAllocMutex();
 	static std::unordered_map<const GpuTextureBacking*, LiveAllocInfo>& LiveAllocs();

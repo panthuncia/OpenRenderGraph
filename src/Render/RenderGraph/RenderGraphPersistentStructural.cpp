@@ -631,7 +631,7 @@ void RenderGraph::RetireIdlePersistentAliasPools(PersistentExecutionState& state
 		spdlog::info("Persistent alias pool retired: pool={:#x} capacity={} idleFrames={}", it->first, pool.capacityBytes,
 			state.frameNumber - pool.idleSinceFrame);
 		basic_telemetry::AddCounter("ORG.Persistent.AliasPoolRetirements");
-		if (pool.allocation) DeletionManager::GetInstance().MarkForDelete(std::move(pool.allocation));
+		if (pool.allocation) DeletionManager::GetInstance().MarkForDelete(std::move(pool.allocation), "RenderGraph alias pool (idle)");
 		it = pools.erase(it);
 	}
 }
@@ -904,7 +904,7 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 				return DeviceManager::GetInstance().AllocateMemoryTracked(allocDesc, allocInfo, fresh, trackDesc);
 			}();
 			if (!rhi::IsOk(result)) throw std::runtime_error("Failed to allocate persistent alias pool memory");
-			if (pool.allocation) DeletionManager::GetInstance().MarkForDelete(std::move(pool.allocation));
+			if (pool.allocation) DeletionManager::GetInstance().MarkForDelete(std::move(pool.allocation), "RenderGraph alias pool (replaced)");
 			pool.allocation = std::move(fresh);
 			pool.capacityBytes = capacity;
 			pool.alignment = poolAlignment;

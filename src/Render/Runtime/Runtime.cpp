@@ -11,6 +11,7 @@
 #include <deque>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 
 #include "Render/PipelineLibrary.h"
@@ -47,6 +48,80 @@ struct Runtime::DeviceRelay {
 // Drops what it is handed on its own thread, in order. A driver free can block in the kernel until the GPU is done with
 // the memory (WDDM frees GPU virtual addresses that way). On this thread such a wait holds up nothing the GPU waits for.
 // The render thread and a graph host's thread hand their frees here.
+namespace {
+// Set on the deleter's thread, for the log.
+thread_local bool t_onDeleter = false;
+
+// A free slower than this is logged: it waited for something, the GPU or the kernel's paging.
+constexpr double kSlowFreeMs = 100.0;
+
+std::string_view FileName(const char* path) noexcept {
+	if (!path) return "?";
+	std::string_view view(path);
+	const auto slash = view.find_last_of("/\\");
+	return slash == std::string_view::npos ? view : view.substr(slash + 1);
+}
+
+std::string DescribePoint(const runtime::SubmittedPoint& point) {
+	return std::string(point.source ? point.source : "timeline") + "#" + std::to_string(point.sourceIndex);
+}
+
+// Logs one slow free of a retired object: what it was, where it was marked, sealed and retired, the frontier it waited
+// for and each of its timelines' completed values now, and every timeline's last value now. A sealed point whose timeline
+// has not completed it is the frontier gap: the object was retired before that work ran.
+void ReportSlowFree(const DeletionManager::Retired& retired, const DeletionManager::Retired::SlowFree& slow) {
+	static std::atomic<uint64_t> reported{0};
+	const auto count = reported.fetch_add(1, std::memory_order_relaxed) + 1;
+	// The first 100, then one in 100: a burst of them must not flood the log.
+	if (count > 100 && count % 100 != 0) return;
+	auto* runtime = Runtime::Current();
+	std::string sealed, now;
+	bool gap = false;
+	if (slow.batch) {
+		for (const auto& point : slow.batch->frontier) {
+			auto timeline = point.timeline;
+			const uint64_t completed = timeline.IsValid() ? timeline.GetCompletedValue() : UINT64_MAX;
+			const bool reached = completed != UINT64_MAX && completed >= point.value;
+			const bool counted = !reached && runtime && runtime->Reached(point);
+			gap = gap || (!reached && !counted);
+			sealed += (sealed.empty() ? "" : "; ") + DescribePoint(point) + " sealed " + std::to_string(point.value) + " completed " +
+				(completed == UINT64_MAX ? std::string("lost") : std::to_string(completed)) +
+				(reached ? "" : counted ? " (counted reached: its timeline is gone)" : " (NOT REACHED)");
+		}
+	}
+	if (runtime)
+		for (auto point : runtime->Frontier()) {
+			const uint64_t completed = point.timeline.GetCompletedValue();
+			now += (now.empty() ? "" : "; ") + DescribePoint(point) + " last " + std::to_string(point.value) + " completed " +
+				(completed == UINT64_MAX ? std::string("lost") : std::to_string(completed));
+		}
+	const auto* label = slow.label;
+	const double sealedAgoMs = slow.batch && slow.batch->sealedAt != std::chrono::steady_clock::time_point{}
+		? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - slow.batch->sealedAt).count() - slow.ms : -1.0;
+	spdlog::warn("ORG runtime: freeing {} '{}' ({} bytes) took {:.0f} ms on the {} thread{}. Marked at {}:{}; sealed at {}:{} {:.0f} ms "
+		"before the free, frontier [{}]; retired at {}:{}. Timelines now: [{}]{}",
+		slow.kind, label && !label->name.empty() ? label->name : std::string("unnamed"), label ? label->bytes : 0, slow.ms,
+		t_onDeleter ? "deleter" : "calling", count > 100 ? " (" + std::to_string(count) + " slow frees so far)" : std::string(),
+		FileName(label ? label->marked.file : nullptr), label ? label->marked.line : 0,
+		FileName(slow.batch ? slow.batch->sealedBy.file : nullptr), slow.batch ? slow.batch->sealedBy.line : 0, sealedAgoMs, sealed,
+		FileName(retired.retiredBy.file), retired.retiredBy.line, now,
+		gap ? ". A sealed point is not reached: the object was retired while GPU work still used it"
+		    : ". Every sealed point was reached: the free waited for something else (other queued GPU work, or the kernel's paging)");
+}
+
+// A retired batch that destroys itself entry by entry, timing each free (ReportSlowFree), wherever it is dropped.
+struct TimedRetired {
+	DeletionManager::Retired retired;
+	explicit TimedRetired(DeletionManager::Retired a_retired) : retired(std::move(a_retired)) {}
+	TimedRetired(const TimedRetired&) = delete;
+	TimedRetired& operator=(const TimedRetired&) = delete;
+	~TimedRetired() {
+		BT_ZONE_SCOPE("ORG.Runtime.DestroyRetired");
+		retired.DestroyTimed(kSlowFreeMs, [this](const DeletionManager::Retired::SlowFree& slow) { ReportSlowFree(retired, slow); });
+	}
+};
+} // namespace
+
 class Runtime::Deleter {
 public:
 	Deleter() { m_thread = std::thread([this] { Run(); }); }
@@ -61,11 +136,11 @@ public:
 	Deleter(const Deleter&) = delete;
 	Deleter& operator=(const Deleter&) = delete;
 
-	void Post(std::shared_ptr<void> objects) {
+	void Post(std::shared_ptr<void> objects, const char* what) {
 		size_t queued = 0;
 		{
 			std::scoped_lock lock(m_mutex);
-			m_queue.push_back(std::move(objects));
+			m_queue.push_back({std::move(objects), what});
 			queued = m_queue.size();
 		}
 		m_wake.notify_one();
@@ -80,18 +155,17 @@ public:
 	}
 
 private:
-	// A free slower than this is logged: it waited for the GPU.
-	static constexpr double kSlowFreeMs = 100.0;
 	// A free still running after this is logged by the next Post.
 	static constexpr double kStuckFreeMs = 1000.0;
 
 	void Run() {
+		t_onDeleter = true;
 		std::unique_lock lock(m_mutex);
 		for (;;) {
 			m_wake.wait(lock, [&] { return m_stopping || !m_queue.empty(); });
 			// Stopping drains the queue first: nothing handed over is left behind.
 			if (m_queue.empty()) return;
-			auto objects = std::move(m_queue.front());
+			auto [objects, what] = std::move(m_queue.front());
 			m_queue.pop_front();
 			const auto queued = m_queue.size();
 			lock.unlock();
@@ -104,15 +178,19 @@ private:
 			m_busySince.store(0, std::memory_order_release);
 			const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
 			if (ms >= kSlowFreeMs)
-				spdlog::warn("ORG runtime: a deferred free took {:.0f} ms on the deleter thread ({} batches queued behind it); the driver's "
-					"free waited for the GPU", ms, queued);
+				spdlog::warn("ORG runtime: freeing a batch of {} took {:.0f} ms on the deleter thread ({} batches queued behind it); a "
+					"retired object's slow free is logged above with its name", what, ms, queued);
 			lock.lock();
 		}
 	}
 
 	std::mutex m_mutex;
 	std::condition_variable m_wake;
-	std::deque<std::shared_ptr<void>> m_queue;
+	struct Entry {
+		std::shared_ptr<void> objects;
+		const char* what = "objects";
+	};
+	std::deque<Entry> m_queue;
 	bool m_stopping = false;
 	// When the free in progress started (steady clock ticks), or 0; and the start last reported as stuck.
 	std::atomic<int64_t> m_busySince{0};
@@ -376,41 +454,47 @@ runtime::SubmissionFrontier Runtime::Frontier() const {
 	runtime::SubmissionFrontier frontier;
 	std::scoped_lock lock(m_queuesMutex);
 	frontier.reserve(m_queues.size());
-	for (const auto& queue : m_queues) {
-		auto progress = queue.Progress();
-		if (progress.timeline && progress.submitted) frontier.push_back({ progress.timeline, progress.submitted });
+	for (uint32_t index = 0; index < m_queues.size(); ++index) {
+		auto progress = m_queues[index].Progress();
+		if (progress.timeline && progress.submitted) frontier.push_back({ progress.timeline, progress.submitted, "queue", index });
 	}
 	// Values given out on a host's timelines: work in a host's own stream (in-stream epochs) that no queue above was given.
-	for (const auto& [fence, nextValue] : m_assignedTimelines) {
+	for (uint32_t index = 0; index < m_assignedTimelines.size(); ++index) {
+		const auto& [fence, nextValue] = m_assignedTimelines[index];
 		const auto next = nextValue->load(std::memory_order_acquire);
-		if (next > 1 && *fence) frontier.push_back({ fence->Get(), next - 1 });
+		if (next > 1 && *fence) frontier.push_back({ fence->Get(), next - 1, "host timeline", index });
 	}
 	// Values external streams signal after their own uses of ORG objects (NoteExternalPoint).
-	for (const auto& point : m_externalPoints) frontier.push_back(point);
+	for (uint32_t index = 0; index < m_externalPoints.size(); ++index) {
+		auto point = m_externalPoints[index];
+		point.source = "external";
+		point.sourceIndex = index;
+		frontier.push_back(point);
+	}
 	return frontier;
 }
 
-void Runtime::Retire() {
+void Runtime::Retire(const std::source_location& where) {
 	DescriptorHeapManager::GetInstance().ProcessDeferredReleases(0);
-	(void)DeletionManager::GetInstance().Retire();
+	TimedRetired retired(DeletionManager::GetInstance().Retire(where));
 }
 
-std::shared_ptr<void> Runtime::RetireElsewhere() {
-	auto retired = DeletionManager::GetInstance().Retire();
+std::shared_ptr<void> Runtime::RetireElsewhere(const std::source_location& where) {
+	auto retired = DeletionManager::GetInstance().Retire(where);
 	if (retired.Empty()) return {};
-	return std::make_shared<DeletionManager::Retired>(std::move(retired));
+	return std::make_shared<TimedRetired>(std::move(retired));
 }
 
-void Runtime::RetireDetached() {
-	DestroyDetached(DescriptorHeapManager::GetInstance().ProcessDeferredReleasesElsewhere());
-	DestroyDetached(RetireElsewhere());
+void Runtime::RetireDetached(const std::source_location& where) {
+	DestroyDetached(DescriptorHeapManager::GetInstance().ProcessDeferredReleasesElsewhere(), "descriptor releases");
+	DestroyDetached(RetireElsewhere(where), "deferred deletions");
 }
 
-void Runtime::DestroyDetached(std::shared_ptr<void> objects) {
+void Runtime::DestroyDetached(std::shared_ptr<void> objects, const char* what) {
 	if (!objects) return;
 	// No deleter (the runtime is being torn down): dropped here.
 	if (!m_deleter) return;
-	m_deleter->Post(std::move(objects));
+	m_deleter->Post(std::move(objects), what ? what : "objects");
 }
 
 } // namespace org

@@ -6,6 +6,7 @@
 #include <tuple>
 #include <memory>
 #include <mutex>
+#include <source_location>
 #include <span>
 #include <vector>
 
@@ -136,18 +137,21 @@ public:
 	// drained when they went).
 	bool Reached(const runtime::SubmittedPoint& point) const;
 	// Releases the descriptors and destroys the deferred deletions whose frontier is reached.
-	void Retire();
+	// where (all three): the caller, named in the log of a slow free. A free of a retired object that takes over 100 ms is
+	// logged with the object, where it was marked, the frontier its batch was sealed with, and each timeline now.
+	void Retire(const std::source_location& where = std::source_location::current());
 	// The deferred deletions alone, handed back to be destroyed wherever the caller drops them: for a latency-critical thread
 	// (the driver frees take the device's memory locks). Descriptor releases wait for the next Retire.
-	std::shared_ptr<void> RetireElsewhere();
+	std::shared_ptr<void> RetireElsewhere(const std::source_location& where = std::source_location::current());
 	// Retire, with every driver free on the runtime's deleter thread instead of the caller's. For a thread whose work the GPU
 	// may wait on (a graph host's thread produces the signals of the work it prepares). On Windows a driver free can block
 	// until the GPU is done with the memory, and the GPU may be waiting for a signal only that thread will give. The
 	// descriptor slots are released here; only the objects behind them go to the deleter.
-	void RetireDetached();
+	void RetireDetached(const std::source_location& where = std::source_location::current());
 	// Hands objects to the runtime's deleter thread, which drops them in the order given. For what RetireElsewhere returned,
 	// on a thread that must not block on a driver free. Null is ignored. Any thread.
-	void DestroyDetached(std::shared_ptr<void> objects);
+	// what names them in the deleter's log of a slow batch.
+	void DestroyDetached(std::shared_ptr<void> objects, const char* what = "objects");
 
 	// The process-unique identity of a timeline, what admission and the ledgers name its points by (never 0; below
 	// RenderGraph::kFrameWaitTimelineIdentity). Stable for the timeline's life; a timeline created later in its place (the same

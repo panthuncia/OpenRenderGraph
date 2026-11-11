@@ -88,8 +88,8 @@ GpuTextureBacking::GpuTextureBacking(CreateTag)
 
 GpuTextureBacking::~GpuTextureBacking()
 {
-	UnregisterLiveAlloc();
-	DeletionManager::GetInstance().MarkForDelete(std::move(m_textureHandle));
+	auto name = UnregisterLiveAlloc();
+	DeletionManager::GetInstance().MarkForDelete(std::move(m_textureHandle), std::move(name));
 }
 
 std::unique_ptr<GpuTextureBacking>
@@ -348,10 +348,15 @@ void GpuTextureBacking::RegisterLiveAlloc() {
 	liveAllocs[this] = info;
 }
 
-void GpuTextureBacking::UnregisterLiveAlloc() {
+std::string GpuTextureBacking::UnregisterLiveAlloc() {
 	auto& liveAllocs = LiveAllocs();
 	std::scoped_lock lock(LiveAllocMutex());
-	liveAllocs.erase(this);
+	std::string name;
+	if (auto it = liveAllocs.find(this); it != liveAllocs.end()) {
+		name = std::move(it->second.name);
+		liveAllocs.erase(it);
+	}
+	return name;
 }
 
 void GpuTextureBacking::UpdateLiveAllocName(const char* name) {
