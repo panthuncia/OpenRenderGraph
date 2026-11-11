@@ -237,6 +237,15 @@ external-commands callbacks, so ORG's work does not end DXVK's list.
 -   **Passes recorded at execution.** A pass declared with `ExternalPassDesc::RecordAtExecution()` is alone in its batch,
     which must be in the stream. The ticket keeps its invocation and barrier plan, and the host's execution records it
     there: for work only known then, such as a CPU cull's draws.
+-   **Retirement.** No ORG queue sees the host's stream. So the runtime's deletion and descriptor-release frontier also
+    covers every value given out on the host's shared timelines (`Runtime::RegisterAssignedTimeline`). An object released
+    while an in-stream list that names it is still waiting in the host's stream outlives that list.
+    -   The statistics' shared query pool and its readback buffers are replaced when a build registers a new pass. Each
+        list holds the set it recorded with (`QueryRecordingContext::sharedQueries`), and a replaced set is deleted only
+        when the last such list is released. This also covers lists recorded ahead, which the frontier cannot cover.
+    -   A list whose set was replaced while it recorded writes and resolves no more queries. Its resolve would otherwise
+        wait on the GPU for queries the new pool never wrote.
+    -   Test: `TestAssignedTimelineRetirement` and `TestStatisticsPoolRetirement` (`tests/RuntimeTests.cpp`).
 -   **Test.** `PersistentVulkanHostTests`:
     -   `external`: a late pass in the stream.
     -   `stream` / `stream open`: a write on a compute queue and a copy on a copy queue aliased to the graphics one, with
