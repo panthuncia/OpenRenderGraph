@@ -495,6 +495,11 @@ void GraphHost::ReleaseLease(RunLease& lease, Async* state) {
 	if (const auto& arena = m_desc.runtime->Arena()) arena->ReleaseRun(lease.index, lease.generation);
 	// Its lists: the GPU is done with them, or they were never submitted. Each is reset when it is begun again.
 	const auto recycle = [](const std::shared_ptr<CommandListPool>& pool, CommandListPair& pair) {
+		// Still claimed: begun for a ticket that never reached the record step that closes it (discarded, failed, or prepared
+		// and replaced). Close it here, so its next Begin resets a closed list (D3D12 cannot reset one that records). It holds
+		// no commands: uploads are recorded only at submission.
+		// Not a secondary: a recycled one does not record until BeginSecondary, so a claimed one may be closed already.
+		if (pair.Recording() && pair.list && !(pool && pool->Secondary())) pair.list->End();
 		pair.EndRecording();
 		if (!pair.list) return;
 		if (pool) pool->RecycleForNextRequest(std::move(pair));
