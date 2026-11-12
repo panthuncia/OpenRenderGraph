@@ -807,9 +807,10 @@ inline RecordingContext MakeOwnedRecordingContext(rhi::CommandList list, const O
 // It does not begin or end the list. RecordPreparedRhiExecutionBatch does that for its own lists. A late batch of an
 // external epoch records into the host's list (PreparedRhiExecutionBatch::RecordDeferred), and the host ends it.
 // a_again records a replayable recording's passes again (PreparedPass::RecordAgain). This is for a late batch of a
-// kept recording.
+// kept recording. a_atExecution: a late batch, recorded after its run's commit, whose passes may skip the run
+// (PreparedPass::SkipsAtExecution).
 inline void RecordOwnedRecordingCommands(RecordingContext& context, const OwnedRecordingList& recording, rhi::Queue queue, bool replayable,
-    bool a_again = false) {
+    bool a_again = false, bool a_atExecution = false) {
     struct TracyGpuZoneScope {
         rhi::CommandList& commands;
         bool open = false;
@@ -877,7 +878,27 @@ inline void RecordOwnedRecordingCommands(RecordingContext& context, const OwnedR
         barriers.textures = {recording.acquiredBarriers.data(), static_cast<uint32_t>(recording.acquiredBarriers.size())};
         recordBarriers("entry", firstPass, barriers);
     }
+    const auto recordPassBarriers = [&](const std::vector<PreparedBatchBarriers::BeforePass>& all, size_t passIndex, const char* where,
+        std::string_view pass) {
+        if (all.empty()) return;
+        const auto& batch = all[passIndex];
+        if (batch.textures.empty() && batch.buffers.empty()) return;
+        rhi::BarrierBatch barriers{};
+        barriers.textures = {batch.textures.data(), static_cast<uint32_t>(batch.textures.size())};
+        barriers.buffers = {batch.buffers.data(), static_cast<uint32_t>(batch.buffers.size())};
+        recordBarriers(where, pass, barriers);
+    };
     for (size_t passIndex = 0; passIndex < recording.passes.size(); ++passIndex) {
+        // Recorded at execution, a pass with nothing to do this run (PreparedPass::SkipsAtExecution) records only its barriers:
+        // the states the admission planned still change. No label, timestamps or GPU zone for it.
+        if (a_atExecution && !a_again && recording.passes[passIndex].SkipsAtExecution(context)) {
+            BT_ZONE_SCOPE("ORG.Execution.RecordOwned.Skipped");
+            const auto passLabel = recording.passes[passIndex].DebugName();
+            recordPassBarriers(recording.barriersBeforePass, passIndex, "before", passLabel);
+            recording.passes[passIndex].RecordNothing();
+            recordPassBarriers(recording.barriersAfterPass, passIndex, "after", passLabel);
+            continue;
+        }
         BT_ZONE_SCOPE("ORG.Execution.RecordOwned.Pass");
         // A capture tool's region for the pass (PIX / VK_EXT_debug_utils), opened before the pass's entry
         // barriers so that a wait on the previous pass's output shows up inside the pass that needed it.
@@ -995,7 +1016,7 @@ inline void PreparedRhiExecutionBatch::RecordDeferred(rhi::CommandList a_list) c
         owned.overflow = 0;
     }
     auto context = MakeOwnedRecordingContext(a_list, *m_deferred);
-    RecordOwnedRecordingCommands(context, *m_deferred, m_queue, false, again);
+    RecordOwnedRecordingCommands(context, *m_deferred, m_queue, false, again, true);
     // Its queries are in a_list now. Its frame slot's completion publishes them (OwnedRecordingStatistics::atCompletion).
     if (m_deferred->statistics) m_deferred->statistics->recorded.store(true, std::memory_order_release);
     if (!m_replayable && !CommitEffectsSubmitted(m_deferredSignal)) throw std::logic_error("A deferred packet's passes could not be committed as submitted");

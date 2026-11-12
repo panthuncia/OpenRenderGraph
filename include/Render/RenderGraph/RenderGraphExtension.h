@@ -73,8 +73,10 @@ struct ExternalPassDesc {
 	uint32_t epoch = UINT32_MAX;
 	// Persistent execution only, for a pass of an external epoch (SetExternalPersistentEpochs). The pass is recorded when
 	// the host executes the epoch, not ahead with the other passes. Recording happens in ExternalEpochExecution::Execute,
-	// on the host's thread, into the host's command buffer. The pass is alone in its batch. Its barriers come from
-	// admission and are recorded around it. Use it for work that is only known at that point, such as a CPU cull's draws.
+	// on the host's thread, into the host's command buffer. Its batch holds only passes recorded at execution. Its barriers
+	// come from admission and are recorded around it. Use it for work that is only known at that point, such as a CPU cull's
+	// draws. A typed pass recorded so may also skip a run whose work it knows then to be empty (TypedRenderGraphPass's
+	// SkipsAtExecution).
 	bool recordAtExecution = false;
 	// Per-frame passes only. A frame-interrupting pass must run at its insert
 	// point even under the persistent graph, which hosts it in the main

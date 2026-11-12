@@ -85,6 +85,9 @@ from there through the ledgers.
 -   **The body is ledger-independent.** An open plan keeps the entry barriers out of the body (`PreparedBatchBarriers`
     `textures`/`buffers`/`acquired`). What is left (`beforePass`, `afterPass`, an aliased backing's entry from
     Undefined) depends on the compiled graph alone, so a body can be recorded ahead and submitted again.
+-   **Shared body plans.** Since a body's barriers depend only on the compiled graph, the backings and the execution kind,
+    `SynchronousAdmission::PreparePlan` plans them once per backing set and every later plan shares that plan
+    (`CachedBody`). The ledgers' grids are read for it once per graph build, not once per ticket.
 -   **Handoff lists.** Each batch with entry barriers gets a short list ahead of it: a primary submitted with it, or a
     secondary its segment runs first in the host's stream. A texture an earlier execution left on another queue is
     released there first, by a list submitted on that queue, and the consumers wait for it.
@@ -105,9 +108,20 @@ thread calls `SubmitEpoch(epoch, beforeSubmit)` at each point instead of `Execut
     ahead:
     -   it opens a run lease for it (below), which waits for nothing;
     -   it runs update and invocations;
-    -   it records the epoch's command lists from a plan, and publishes the ticket in that epoch's atomic cell.
+    -   it records the epoch's command lists from a plan, and publishes the ticket in that epoch's queue.
+-   **Tickets ahead.** By default an epoch has one ticket in hand: the next is prepared once the last one was submitted.
+    `GraphHost::SetEpochTicketsAhead(epoch, most)` lets a live epoch that runs several times a frame keep up to `most`,
+    as many as it ran in the last frame (counted between seals). Its back-to-back runs then find their tickets ready.
+    -   The extra tickets are prepared while the epoch's earlier tickets are submitted. So the epoch's passes' `Prepare`
+        and `Revision` must read nothing its commits write (CS's frame anchors follow that rule).
+    -   The host thread first prepares a ticket for every epoch with none in hand, then one ticket ahead per loop pass,
+        the epochs taking turns. Messages are read between them.
+    -   Only the first ticket queued has its upload lists begun on the host thread. The render thread begins the others'
+        when it submits them, so a queue of tickets does not keep a command pool open per list.
+    -   A stale ticket's replacement goes to a slot of its own, which its submission takes. The tickets queued behind it
+        that are stale too are dropped then and prepared again (`AsyncStats::staleAhead`).
 -   **Submission.** `SubmitEpoch` on the render thread:
-    1.  takes the ticket from the cell (waiting only if it is not ready);
+    1.  takes the next ticket from the epoch's queue (waiting only if none is ready);
     2.  runs `beforeSubmit`, the feature's commit;
     3.  checks the passes' revision hashes against the ticket (`RenderGraphPass::RevisionHash`, a typed pass's `Revision`).
         A stale ticket is prepared again for the same run lease, whose latch regions `beforeSubmit` just wrote;
@@ -121,6 +135,9 @@ thread calls `SubmitEpoch(epoch, beforeSubmit)` at each point instead of `Execut
     -   When a destination is not known, nothing is planned, and every batch off the graphics queue waits for the uploads.
 -   **Completion.** The host thread receives the submission through a single-producer mailbox. It retires each run's lease
     once the run's points are reached: it reads the run's statistics and frees what the lease held.
+-   **Retirement per graph.** Each loop pass reads every shared queue timeline's completed value once for all the graphs
+    (`RenderGraph::CompletedTimelineValues`). A graph returns at once while its timelines' submitted values are unchanged and
+    every queue's completed value is below the lowest value anything it holds waits for (`RetireWatch`).
 -   **Constraints on a ticket.** Its recording may not depend on anything the render thread produces at the epoch.
     Per-frame values come from latches.
 
@@ -264,9 +281,16 @@ external-commands callbacks, so ORG's work does not end DXVK's list.
 -   **Not executed.** A host that cannot execute a segment calls `SignalExternalExecutionUnexecuted(execution, first)`. That
     is a submission of no lists with the waits and signals of each segment from `first` on, and its late passes are
     abandoned.
--   **Passes recorded at execution.** A pass declared with `ExternalPassDesc::RecordAtExecution()` is alone in its batch,
-    which must be in the stream. The ticket keeps its invocation and barrier plan, and the host's execution records it
-    there: for work only known then, such as a CPU cull's draws.
+-   **Passes recorded at execution.** A pass declared with `ExternalPassDesc::RecordAtExecution()` is in a batch of such
+    passes alone, which must be in the stream. The ticket keeps their invocations and barrier plan, and the host's
+    execution records them there: for work only known then, such as a CPU cull's draws.
+    -   An extension can tell whether its graph's epoch is in the stream while it gathers its passes
+        (`RenderGraph::PassEpochInHostStream`).
+    -   **Skipped runs.** Just before such a pass is recorded, its recorder asks it whether it has nothing to do this run
+        (`PreparedPass::SkipsAtExecution`, a typed pass's static `SkipsAtExecution`). It decides from what the run's
+        commit wrote. A pass that skips records only the barriers around it, with no debug label, timestamps or
+        `Record`. CS's image-space anchor registers some 70 gated passes, of which a run opens a few: the rest cost a
+        barrier each instead of a recording on the host thread.
 -   **Retirement.** No ORG queue sees the host's stream. So the runtime's deletion and descriptor-release frontier also
     covers every value given out on the host's shared timelines (`Runtime::RegisterAssignedTimeline`). An object released
     while an in-stream list that names it is still waiting in the host's stream outlives that list.

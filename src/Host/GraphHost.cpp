@@ -860,6 +860,9 @@ bool GraphHost::BuildInstance(size_t index) {
 		graph = std::make_unique<RenderGraph>(m_desc.runtime);
 		graph->SetSharedQueueTimelines(m_timelines);
 		graph->SetPassEpochFilter(instance.epoch);
+		// Before the extensions gather their passes: one may record a pass at execution when the epoch is external
+		// (RenderGraph::PassEpochInHostStream).
+		graph->SetExternalPersistentEpochs(m_externalEpochs);
 		graph->RegisterExtension(std::make_unique<HostUploadExtension>(graph->GetUploadService()), "org.host.io");
 		// Only the extensions made into this epoch's graph (AddExtension's epochs): the others are not made, and gather nothing.
 		for (const auto& entry : m_extensions)
@@ -877,7 +880,6 @@ bool GraphHost::BuildInstance(size_t index) {
 			if (!m_aliasArena) m_aliasArena = PersistentAliasArena::Create();
 			graph->SetPersistentAliasArena(m_aliasArena);
 		}
-		graph->SetExternalPersistentEpochs(m_externalEpochs);
 		graph->SetPersistentRecordingReuse(m_desc.reuseRecordings);
 		graph->SetPersistentRecordingTimestamps(m_recordingTimestamps.load(std::memory_order_acquire));
 		graph->SetScheduleTraceEnabled(m_scheduleTrace.load(std::memory_order_acquire));
