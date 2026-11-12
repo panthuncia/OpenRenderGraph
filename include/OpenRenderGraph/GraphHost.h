@@ -432,8 +432,6 @@ public:
 	RunRef BeginExternalRun(std::shared_ptr<rhi::TimelinePtr> timeline, uint64_t value);
 	void EndExternalRun() noexcept { m_externalRun.reset(); }
 	bool ExternalRunActive() const noexcept { return m_externalRun.has_value(); }
-	// Migration shims, removed once every client names runs: the current run's lease index, and the host's frames in flight.
-	uint32_t CurrentFrameSlot() const noexcept { return CurrentRun().lease; }
 	// The host frame number of the last execution (ExecuteFrame or SubmitEpoch); the completed-frame
 	// callback reports frames by it.
 	uint64_t LastHostFrame() const noexcept { return m_lastHostFrame; }
@@ -486,8 +484,8 @@ public:
 	// are on the GPU, and a value never signalled stalls the queue.
 	void SetFrameWaitValue(uint64_t value) noexcept { m_frameWaitValue = value; }
 	uint64_t FrameWaitValue() const noexcept { return m_frameWaitValue; }
-	// Migration shim, removed once every client names runs: Desc::framesInFlight.
-	uint32_t FrameSlots() const noexcept { return (std::max)(m_desc.framesInFlight, 1u); }
+	// Desc::framesInFlight (at least 1): the frames the CPU runs ahead, and a revision-driven epoch's published copies.
+	uint32_t FramesInFlight() const noexcept { return (std::max)(m_desc.framesInFlight, 1u); }
 
 	// The calling thread's CPU time in the last ExecuteFrame, by phase. Diagnostics only.
 	struct FrameTimings {

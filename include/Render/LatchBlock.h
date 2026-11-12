@@ -68,19 +68,22 @@ public:
 		Write(run, offset, std::as_bytes(std::span<const T, 1>(&value, 1)));
 	}
 
-	// Migration shims, removed once every client names runs. A block made with a slot count is the old kind: one buffer of its own,
-	// a region per slot (taken modulo the count), and one view. Its run-named calls use the run's lease index as the slot.
-	LatchBlock(std::string name, uint32_t bytesPerSlot, uint32_t slots);
-	static std::shared_ptr<LatchBlock> Create(std::string name, uint32_t bytesPerSlot, uint32_t slots);
-	uint32_t Slots() const noexcept { return m_slots; }
-	uint64_t Offset(uint32_t slot) const noexcept { return uint64_t(slot % (m_slots ? m_slots : 1u)) * m_stride; }
-	uint32_t SrvIndex() const noexcept { return m_srvIndex; }
-	const std::shared_ptr<Buffer>& Resource() const noexcept { return m_buffer; }
-	std::span<std::byte> Slot(uint32_t slot) const noexcept { return {m_mapped + Offset(slot), m_stride}; }
-	void Write(uint32_t slot, uint32_t offset, std::span<const std::byte> bytes) const;
-	template<class T> void WriteValue(uint32_t slot, uint32_t offset, const T& value) const {
-		Write(slot, offset, std::as_bytes(std::span<const T, 1>(&value, 1)));
+	// A block with a buffer of its own and one region, which every run names: a client's own staging buffer, which the client keeps
+	// from reuse while the GPU reads it (RecordingContext::Retain). Its region is zeroed when made.
+	static std::shared_ptr<LatchBlock> CreateDedicated(std::string name, uint32_t bytes);
+	// A block from a registration that names how many regions it has (ORGModuleServices' LatchRegistration): 1 makes a dedicated
+	// block, whose one region every run reads; any other count a frame arena block, whose regions follow the runs.
+	static std::shared_ptr<LatchBlock> Create(std::string name, uint32_t bytes, uint32_t regions) {
+		return regions == 1 ? CreateDedicated(std::move(name), bytes) : Create(std::move(name), bytes);
 	}
+	bool Dedicated() const noexcept { return static_cast<bool>(m_buffer); }
+	// A dedicated block's buffer, its view and its bytes (null, 0 and empty for an arena block).
+	const std::shared_ptr<Buffer>& Resource() const noexcept { return m_buffer; }
+	uint32_t SrvIndex() const noexcept { return m_srvIndex; }
+	std::span<std::byte> Bytes() const noexcept { return {m_mapped, m_mapped ? m_stride : 0u}; }
+
+	struct DedicatedTag {};
+	LatchBlock(DedicatedTag, std::string name, uint32_t bytes);
 
 private:
 	struct RunEntry {
@@ -94,8 +97,7 @@ private:
 	mutable std::mutex m_mutex;
 	mutable std::vector<RunEntry> m_runs;    // by lease index: the leased run that last asked
 	mutable std::vector<Region> m_stable;    // by lease index: pinned for the block's life
-	// The old kind's buffer (migration shim).
-	uint32_t m_slots = 0;
+	// A dedicated block's buffer.
 	uint32_t m_srvIndex = 0;
 	std::shared_ptr<Buffer> m_buffer;
 	std::byte* m_mapped = nullptr;

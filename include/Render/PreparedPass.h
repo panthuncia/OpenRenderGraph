@@ -457,8 +457,6 @@ public:
     // LatchBlock region and a run's CPU payload are per run. It must not depend on anything else about the frame.
     const RunRef& Run() const noexcept { return m_run; }
     void SetRun(const RunRef& run) noexcept { m_run = run; }
-    // Migration shim, removed once every client names runs: the run's lease index.
-    uint32_t FrameSlot() const noexcept { return m_run.lease; }
     rhi::Resource Resolve(persistent::BindingToken token) const;
     rhi::DescriptorSlot Resolve(persistent::ViewToken token) const;
     RecordingContext(rhi::CommandList commands, std::shared_ptr<const FrozenExecutionBindings> bindings,
