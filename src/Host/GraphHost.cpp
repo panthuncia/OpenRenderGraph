@@ -1853,13 +1853,18 @@ void GraphHost::PrepareTicket(Async& state, uint32_t epochIndex, RunLease* repre
 	// with open lists would make a pool for each.
 	lease->queueUploads.resize(state.queueUploadKinds.size());
 	if (reprepare || state.inHand[epochIndex] == 0) {
+		// A reprepared lease's lists are still open from its first preparation, and nothing is recorded into them before the
+		// ticket is submitted. Each is begun only when it is not open already: D3D12 cannot reset a list that records.
 		// The render thread records an external epoch's uploads into the secondary, which its execution runs first, and any
 		// other epoch's into the primary. Only that one is begun.
-		if (graph.IsExternalPersistentEpoch(state.epochs[epochIndex])) state.uploadSecondaryPool->Begin(lease->uploadSecondary);
-		else state.uploadPool->Begin(lease->upload);
+		if (graph.IsExternalPersistentEpoch(state.epochs[epochIndex])) {
+			if (!lease->uploadSecondary.Recording()) state.uploadSecondaryPool->Begin(lease->uploadSecondary);
+		} else if (!lease->upload.Recording()) {
+			state.uploadPool->Begin(lease->upload);
+		}
 		// The run's queue upload lists likewise.
 		for (size_t queue = 0; queue < state.queueUploadKinds.size(); ++queue) {
-			if (!state.queueUploadKinds[queue]) continue;
+			if (!state.queueUploadKinds[queue] || lease->queueUploads[queue].Recording()) continue;
 			state.queueUploadPools[static_cast<size_t>(*state.queueUploadKinds[queue])]->Begin(lease->queueUploads[queue]);
 		}
 	}
