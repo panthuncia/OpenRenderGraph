@@ -1853,9 +1853,10 @@ void GraphHost::PrepareTicket(Async& state, uint32_t epochIndex, RunLease* repre
 	// with open lists would make a pool for each.
 	lease->queueUploads.resize(state.queueUploadKinds.size());
 	if (reprepare || state.inHand[epochIndex] == 0) {
-		state.uploadPool->Begin(lease->upload);
-		// An external epoch's uploads secondary: recycled with the lease, begun where it is recorded.
-		state.uploadSecondaryPool->Begin(lease->uploadSecondary);
+		// The render thread records an external epoch's uploads into the secondary, which its execution runs first, and any
+		// other epoch's into the primary. Only that one is begun.
+		if (graph.IsExternalPersistentEpoch(state.epochs[epochIndex])) state.uploadSecondaryPool->Begin(lease->uploadSecondary);
+		else state.uploadPool->Begin(lease->upload);
 		// The run's queue upload lists likewise.
 		for (size_t queue = 0; queue < state.queueUploadKinds.size(); ++queue) {
 			if (!state.queueUploadKinds[queue]) continue;
@@ -2190,11 +2191,13 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 	// The submitted ticket's frame: one prepared again above has a new number, and the completed-frame callback
 	// reports it by that one.
 	m_lastHostFrame = RenderGraph::PersistentTicketHostFrame(*ticket);
+	// An external epoch's uploads go into the slot's secondary, which its execution runs first: nothing is submitted here.
+	const bool external = graph.IsExternalPersistentEpoch(async.epochs[index]);
 	// A ticket prepared behind others of its epoch has its upload lists begun here (PrepareTicket begins only the first one's).
-	if (!lease.upload.Recording()) {
+	if (!(external ? lease.uploadSecondary : lease.upload).Recording()) {
 		BT_ZONE_SCOPE("ORG.Host.BeginUploadLists");
-		async.uploadPool->Begin(lease.upload);
-		async.uploadSecondaryPool->Begin(lease.uploadSecondary);
+		if (external) async.uploadSecondaryPool->Begin(lease.uploadSecondary);
+		else async.uploadPool->Begin(lease.upload);
 		lease.queueUploads.resize(async.queueUploadKinds.size());
 		for (size_t queue = 0; queue < async.queueUploadKinds.size(); ++queue)
 			if (async.queueUploadKinds[queue] && !lease.queueUploads[queue].Recording())
@@ -2236,11 +2239,9 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 		graph.AbandonPersistentTicketAdmission(*ticket);
 	};
 	// The uploads queued since the last submission, as plain copies ahead of the ticket (the list ends with a full barrier).
-	auto& list = lease.upload;  // begun by the host's thread (PrepareTicket)
+	auto& list = lease.upload;  // begun by the host's thread (PrepareTicket), or above; unused by an external epoch
 	std::shared_ptr<void> keepAlive;
 	bool recorded = false;
-	// An external epoch's uploads go into the slot's secondary, which its execution runs first: nothing is submitted here.
-	const bool external = graph.IsExternalPersistentEpoch(async.epochs[index]);
 	auto& secondary = lease.uploadSecondary;
 	if (external) {
 		rhi::SecondaryInheritance outside{};
@@ -2266,12 +2267,11 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 		queueScoped ? ticket.get() : nullptr, queueScoped ? std::span<rhi::CommandList>(async.queueLists) : std::span<rhi::CommandList>{}, &queueCopies);
 	{
 		BT_ZONE_SCOPE("ORG.Host.CloseUploadList");
-		list.list->End();
-		if (external) secondary.list->End();
+		(external ? secondary : list).list->End();
 		// Every one the host's thread began, used or not (they go back to their pools when the run retires).
 		for (auto& queueUploads : queueUploadLists)
 			if (queueUploads.list) queueUploads.list->End();
-		// Closed, so their allocators' claims go. The secondary was reset by the host's thread even when unused.
+		// Closed, so their allocators' claims go.
 		list.EndRecording();
 		secondary.EndRecording();
 		for (auto& queueUploads : queueUploadLists) queueUploads.EndRecording();
