@@ -995,7 +995,7 @@ std::string GraphHost::DescribeAsyncState() const {
 	return out;
 }
 
-bool GraphHost::BuildIfRequested() {bool GraphHost::BuildIfRequested() {
+bool GraphHost::BuildIfRequested() {
 	ReleaseRetiredGraphs(false);
 	return BuildDueInstances(true);
 }
