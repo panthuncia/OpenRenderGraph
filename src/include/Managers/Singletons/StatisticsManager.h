@@ -42,6 +42,10 @@ public:
 	void RegisterQueue(rhi::QueueKind queue);
 
 	void SetupQueryHeap();
+	// Query ranges for frame indices 0 .. frames - 1 (a host's run leases): the pools are made again, larger, when they hold
+	// fewer. Call it from the thread that records with the shared pools.
+	void EnsureFrameCapacity(unsigned frames);
+	unsigned FrameCapacity() const { return m_numFramesInFlight; }
 
 	// Timestamp + mesh-stats queries for any pass
 	void BeginQuery(unsigned passIndex,

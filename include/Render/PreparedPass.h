@@ -21,6 +21,7 @@
 #include "Render/ResourceUseDeclaration.h"
 #include "Render/PreparedInvocationArena.h"
 #include "Render/PublicationBindingBundle.h"
+#include "Render/RunRef.h"
 #include "Render/RenderGraph/CompileTelemetry.h"
 #include "Resources/ResourceIdentifier.h"
 
@@ -452,10 +453,12 @@ public:
         std::shared_ptr<const persistent::SelectedPublication> publication);
     RecordingContext WithPersistentBindings(std::shared_ptr<const persistent::SelectedPublication> publication) const;
     const persistent::SelectedPublication* PersistentPublication() const noexcept { return m_persistentPublication.get(); }
-    // The frame slot of the execution being recorded. This is the host's frames-in-flight index. A recording may
-    // depend on it, because a LatchBlock region is per slot. It must not depend on anything else about the frame.
-    uint32_t FrameSlot() const noexcept { return m_frameSlot; }
-    void SetFrameSlot(uint32_t slot) noexcept { m_frameSlot = slot; }
+    // The run being recorded (GraphHost's run lease, or a published copy's run). A recording may depend on it, because a
+    // LatchBlock region and a run's CPU payload are per run. It must not depend on anything else about the frame.
+    const RunRef& Run() const noexcept { return m_run; }
+    void SetRun(const RunRef& run) noexcept { m_run = run; }
+    // Migration shim, removed once every client names runs: the run's lease index.
+    uint32_t FrameSlot() const noexcept { return m_run.lease; }
     rhi::Resource Resolve(persistent::BindingToken token) const;
     rhi::DescriptorSlot Resolve(persistent::ViewToken token) const;
     RecordingContext(rhi::CommandList commands, std::shared_ptr<const FrozenExecutionBindings> bindings,
@@ -574,7 +577,7 @@ private:
     struct PersistentTag {};
     RecordingContext(rhi::CommandList commands, std::shared_ptr<const persistent::SelectedPublication> publication, PersistentTag);
     std::shared_ptr<const persistent::SelectedPublication> m_persistentPublication;
-    uint32_t m_frameSlot = 0;
+    RunRef m_run{};
     rhi::CommandList m_commands;
     std::shared_ptr<const FrozenExecutionBindings> m_bindings;
     std::shared_ptr<const std::vector<ExternalDescriptorBindingValue>> m_externalBindings;

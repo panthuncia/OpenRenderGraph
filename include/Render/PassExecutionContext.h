@@ -11,6 +11,7 @@
 #include "Render/ImmediateExecution/ImmediateCommandList.h"
 #include "Render/QueueKind.h"
 #include "Render/ExternalBindings.h"
+#include "Render/RunRef.h"
 #include "RenderPasses/Base/PassReturn.h"
 
 
@@ -40,6 +41,9 @@ struct UpdateExecutionContext {
 	// frame. It is deliberately distinct from the swapchain image acquired at
 	// ordered admission. frameIndex remains an alias during migration.
 	UINT preparationSlot = 0;
+	// The run being prepared (GraphHost's run lease), which its recording's RecordingContext::Run names. Without one, the
+	// frame index outside a lease (RunRef::Unleased).
+	std::optional<RunRef> run;
 	UINT64 frameFenceValue = 0;
 	float deltaTime = 0.0f;
 	const IHostExecutionData* hostData = nullptr;

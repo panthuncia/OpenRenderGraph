@@ -16,6 +16,7 @@
 
 #include "Managers/Singletons/DescriptorHeapManager.h"
 #include "Resources/Buffers/DynamicBufferBase.h"
+#include "Render/FrameArena.h"
 #include "Render/MemoryIntrospectionBackend.h"
 #include "Render/PassExecutionContext.h"
 #include "Render/RenderGraph/PersistentGraph.h"
@@ -41,7 +42,54 @@ bool PointsReached(const TimelinePoints& points) {
 	return true;
 }
 
+// Completed values read once per timeline, for a pass over many leases: each read is a driver call.
+struct CompletedValues {
+	std::vector<std::pair<const rhi::TimelinePtr*, uint64_t>> values;
+	uint64_t Of(const std::shared_ptr<rhi::TimelinePtr>& timeline) {
+		for (const auto& [known, value] : values)
+			if (known == timeline.get()) return value;
+		const uint64_t value = (*timeline)->GetCompletedValue();
+		values.emplace_back(timeline.get(), value);
+		return value;
+	}
+	bool Reached(const TimelinePoints& points) {
+		for (const auto& [timeline, value] : points) {
+			if (!timeline || !*timeline) continue;
+			const auto completed = Of(timeline);
+			// UINT64_MAX: a lost device, whose pending work will never read anything.
+			if (completed != UINT64_MAX && completed < value) return false;
+		}
+		return true;
+	}
+};
+
 } // namespace
+
+// One run's lease (RunRef): what the run holds beyond its recording, until its GPU work is done.
+struct GraphHost::RunLease {
+	enum class State : uint8_t {
+		Free,       // retired: on the free list, or a published copy's lease waiting for its next run
+		Open,       // opened for a run that is not submitted yet (a ticket prepared, an execution running)
+		Submitted,  // its points name the run's completion
+	};
+	uint32_t index = 0;
+	uint32_t generation = 0;  // bumped at every opening, so two runs of the index differ (RunRef::generation)
+	State state = State::Free;
+	uint32_t copy = RunRef::kNoCopy;  // a published copy's lease: never on the free list, reused by its epoch's copies alone
+	bool external = false;            // BeginExternalRun's: its client signals its point, and nothing of it is recorded here
+	TimelinePoints points;            // Submitted: every queue's value at the run's last batch
+	uint64_t hostFrame = 0;
+	uint64_t submission = 0;  // its number (SubmissionsMade), 0 for an external run
+	uint64_t seal = 0;        // the seals before it was submitted (Seals)
+	std::shared_ptr<void> keepAlive;            // the uploads' staging and the submission's handoff lists
+	std::shared_ptr<const void> resourceOwner;  // what the caller pinned for the run (SubmitEpoch's resourceOwner)
+	// Its upload lists: begun by the host's thread when it prepares the run's ticket, recorded and submitted by the render
+	// thread, recycled when the run retires. An external epoch's secondary, and a list per compute or copy queue
+	// (Desc::queueScopedUploads), likewise.
+	CommandListPair upload, uploadSecondary;
+	std::vector<CommandListPair> queueUploads;  // by queue slot
+	RunRef Ref() const noexcept { return copy != RunRef::kNoCopy ? RunRef::Copy(index, copy) : RunRef{index, generation, RunRef::kNoCopy}; }
+};
 
 // Defined before the constructor: a throwing constructor destroys m_async, and clang instantiates
 // ~unique_ptr<Async> there.
@@ -57,8 +105,8 @@ struct GraphHost::Async {
 		uint32_t epochIndex = 0;
 		std::vector<std::pair<size_t, uint64_t>> instances;  // Detach, Attach: the instances (and Attach: their new build generations)
 		uint64_t hold = 0;  // Detach: the hold it starts, which lasts until released reaches it
-		int32_t slot = -1;  // Discard: the slot to prepare the epoch's replacement ticket into, or -1 for none
-		std::shared_ptr<void> keepAlive;          // the uploads' staging, until the slot completes
+		bool reprepare = false;  // Discard: the epoch's replacement ticket is prepared into the same run lease
+		std::shared_ptr<void> keepAlive;          // the uploads' staging, until the run completes
 		std::shared_ptr<void> retired;            // Submitted: GPU objects that retired at this submission, destroyed on the host's thread
 		std::shared_ptr<const void> resourceOwner;
 		std::pair<uint32_t, uint64_t> uploadSignal{UINT32_MAX, 0};
@@ -72,40 +120,32 @@ struct GraphHost::Async {
 	// Host thread, per epoch index: let go of (Detach) until its instance is attached again; and its instance's build generation.
 	std::vector<uint8_t> paused;
 	std::vector<uint64_t> generation;
-	// Per epoch index, its ring of frame slots: [ringFirst, + ringCapacity), of which the first ringActive are in use. rings false:
-	// one ring of every slot, which the epochs share.
-	bool rings = false;
-	std::vector<uint32_t> ringFirst, ringCapacity, ringActive;
-	// Per epoch index: whether its ring grows (Desc::epochRuns: a capacity above framesInFlight), and the seals a slot's last run must
-	// be behind before the slot is waited for instead of the ring growing (max(framesInFlight - 1, 1)).
-	std::vector<uint8_t> ringGrows;
-	uint64_t ringLag = 1;
 	// The host's seal count (GraphHost::m_seals), written by the render thread.
 	const std::atomic<uint64_t>* seals = nullptr;
-	// Per epoch index: the seal count at which its ring was full (every slot an unsealed run's), or kNoSeal. Its next ticket is
-	// prepared once the count moves; until then WaitTicket throws EpochRingFullError. anyRingFull: one is set, so a seal wakes the
-	// host's thread.
+	// A revision-driven epoch's published copies (Desc::framesInFlight).
+	uint32_t copyCount = 1;
+	// Per epoch index: the seal count at which its copies were busy (every one an unsealed run's), or kNoSeal. Its next ticket is
+	// prepared once the count moves or a copy's run completes; until then WaitTicket throws EpochCopiesBusyError. anyCopiesBusy:
+	// one is set, so a seal wakes the host's thread.
 	static constexpr uint64_t kNoSeal = ~uint64_t{0};
-	std::unique_ptr<std::atomic<uint64_t>[]> ringFullAt;
-	std::atomic<bool> anyRingFull{false};
-	std::vector<uint8_t> ringFullLogged;
-	// Per epoch index: a wait for an unsealed run was logged (WaitSlot). It should never happen.
-	std::vector<uint8_t> unsealedWaitLogged;
-	std::atomic<uint64_t> ringGrowths{0}, ringFulls{0};
+	std::unique_ptr<std::atomic<uint64_t>[]> copiesBusyAt;
+	std::atomic<bool> anyCopiesBusy{false};
+	std::vector<uint8_t> copiesBusyLogged;
+	std::atomic<uint64_t> copiesBusy{0}, copyWaits{0};
 	// Recording requests taken from the host's queue (RecordingQueue), by the host's thread, in posting order.
 	struct RecordingRequest {
 		uint32_t epochIndex = 0;
 		std::shared_ptr<const IHostExecutionData> hostData;
 		GraphHost::EpochRecordingCallback done;
 		std::shared_ptr<GraphHost::EpochRecording> result;
-		std::vector<uint8_t> recorded;  // by ring position
+		std::vector<uint8_t> recorded;  // by copy index
 	};
 	std::deque<std::unique_ptr<RecordingRequest>> pendingRequests;  // host thread; StopAsync drops what is left
 	// Host thread, per epoch index: the revision recordings made (admitted by each ticket while their callers hold them), and the
 	// ticket prepared and not yet submitted or discarded, which a recording finished meanwhile is added to before its callback.
 	std::vector<std::vector<std::weak_ptr<const GraphHost::EpochRecording>>> liveRecordings;
 	std::vector<std::shared_ptr<RenderGraph::PersistentTicket>> outstanding;
-	std::atomic<uint64_t> revisionSlotsRecorded{0}, revisionRecordings{0};
+	std::atomic<uint64_t> revisionCopiesRecorded{0}, revisionRecordings{0};
 	// One ticket cell per epoch: stored by the host's thread, taken by the render thread.
 	std::unique_ptr<std::atomic<std::shared_ptr<Ticket>>[]> cells;
 	// Render thread -> host thread, single producer / single consumer, in order.
@@ -144,63 +184,31 @@ struct GraphHost::Async {
 	std::atomic<uint64_t> backingVersion{0};
 
 	// Host thread only.
-	struct Slot {
-		TimelinePoints points;  // its last submission's completion
-		uint64_t hostFrame = 0;
-		uint64_t submission = 0;  // its last submission's number (SubmissionsMade)
-		uint64_t seal = 0;        // the seals before its last submission (GraphHost::Seals)
-		bool pending = false;   // submitted work not yet waited for
-		bool reserved = false;  // held by a ticket that has not been submitted
-		std::shared_ptr<void> keepAlive;
-		std::shared_ptr<const void> resourceOwner;
-	};
-	std::vector<Slot> slots;
-	// Whether the host's thread may block on a slot's last run: none is pending, it is done, or a seal came after it. A run of a frame
-	// not sealed yet may still be in the host's stream, off the device, and waiting for it would deadlock: the render thread that
-	// would flush it may be waiting for this thread. A host that never sealed hands its runs to the device itself (only an epoch whose
-	// ring grows requires seals, Desc::epochRuns), so then every run is waitable.
-	bool Waitable(const Slot& entry, uint64_t sealCount, bool needsSeal) const {
-		if (!entry.pending || entry.seal < sealCount || PointsReached(entry.points)) return true;
-		return !needsSeal && sealCount == 0;
-	}
-	// The slots an epoch's next ticket may take: its ring's slots in use, or every slot (rings false).
-	std::pair<uint32_t, uint32_t> SlotRange(uint32_t epochIndex) const {
-		if (!rings) return {0, static_cast<uint32_t>(slots.size())};
-		return {ringFirst[epochIndex], ringFirst[epochIndex] + ringActive[epochIndex]};
-	}
 	// The worker stops on the first completion exception. Preserve the one
 	// submitted message it was processing until device teardown.
 	std::shared_ptr<void> uncertainUploadOwner;
 	std::shared_ptr<const void> uncertainResourceOwner;
 	std::vector<uint8_t> needsTicket;
 	uint64_t hostFrame = 0;
-	// The highest submission number a Submitted message brought (the mailbox is in order: every one not read yet is higher), and
-	// the last value the retired callback was given.
-	uint64_t submissionsSeen = 0, retiredReported = 0;
+	// The highest submission number a Submitted message brought (the mailbox is in order: every one not read yet is higher).
+	uint64_t submissionsSeen = 0;
 
 	// Render thread only.
 	std::vector<uint64_t> queueValues;  // SubmitTicket's: the last value assigned per queue slot of the epoch's graph
-	// The pools the upload lists below come from, shared by all frame slots. Their allocators are shared too
-	// (CommandListPool's threading rule). The host's thread begins a slot's list and so takes its allocator's claim. The
-	// render thread gives the claim up once it has closed the list. The pools are declared before the lists, but each
-	// list keeps its allocator alive by itself.
+	// The pools every run lease's upload lists come from (RunLease::upload), requested when the host's thread prepares a run's
+	// ticket and recycled when the run retires. Their allocators are shared too (CommandListPool's threading rule). The host's
+	// thread begins a run's list and so takes its allocator's claim. The render thread gives the claim up once it has closed
+	// the list. Every lease's lists go back to these pools before the state ends (StopAsync).
 	std::shared_ptr<CommandListPool> uploadPool;
+	// An external epoch's uploads secondary (SetExternalEpochs): begun by the render thread, executed first by the caller's
+	// execution (ExternalEpochExecution::leading).
 	std::shared_ptr<CommandListPool> uploadSecondaryPool;
 	std::array<std::shared_ptr<CommandListPool>, 3> queueUploadPools;  // by rhi::QueueKind (Compute and Copy only)
-	// Per queue slot: the kind of the queue that takes queue-scoped uploads, or none.
+	// Per queue slot: the kind of the queue that takes queue-scoped uploads, or none. A run has a list for each compute or copy
+	// queue of the graphics queue's device.
 	std::vector<std::optional<rhi::QueueKind>> queueUploadKinds;
-	// Per frame slot. Reset and begun by the host's thread when it prepares the slot's ticket (after the slot's
-	// wait: the slot's last upload list is done), then recorded, ended and submitted by the render thread; the
-	// ticket cell orders the two. A slot's list is made at its first ticket.
-	std::vector<CommandListPair> uploadLists;
-	// The same for an external epoch's ticket (SetExternalEpochs): a secondary, recycled by the host's thread with the slot's
-	// list and begun by the render thread, executed first by the caller's execution (ExternalEpochExecution::leading).
-	std::vector<CommandListPair> uploadSecondaries;
-	// The same, per frame slot and per queue slot, for the uploads recorded on another queue than graphics (Desc::queueScopedUploads):
-	// a list for each compute or copy queue of the graphics queue's device, none (empty) for the others.
-	std::vector<std::vector<CommandListPair>> queueUploadLists;
-	std::vector<rhi::CommandList> queueLists;     // SubmitTicket's scratch: the slot's queue upload lists, by queue slot
-	std::vector<rhi::CommandList> recordedLists;  // SubmitTicket's scratch: the producers' recorded upload lists, then the slot's
+	std::vector<rhi::CommandList> queueLists;     // SubmitTicket's scratch: the run's queue upload lists, by queue slot
+	std::vector<rhi::CommandList> recordedLists;  // SubmitTicket's scratch: the producers' recorded upload lists, then the run's
 	uint32_t graphicsSlot = 0;
 	rhi::Queue graphicsQueue;
 	rhi::TimelineHandle graphicsFence{};
@@ -255,10 +263,10 @@ struct GraphHost::Async {
 			ThrowIfFailed();
 			// Only this epoch failed: no ticket is coming until its graph is built again.
 			if (epochFailed[index].load(std::memory_order_acquire)) throw EpochFailedError(epochs[index], epochErrors[index]);
-			// Its ring is full of unsealed runs: no ticket is coming before the next seal, which this thread makes. Once the count has
-			// moved past the one the ring was full at, the host's thread prepares one (the seal woke it).
-			if (const auto full = ringFullAt[index].load(std::memory_order_acquire); full != kNoSeal && full == seals->load(std::memory_order_acquire))
-				throw EpochRingFullError(epochs[index], ringCapacity[index]);
+			// Its copies are all busy with unsealed runs: no ticket is coming before the next seal, which this thread makes. Once the
+			// count has moved past the one they were busy at, the host's thread prepares one (the seal woke it).
+			if (const auto busy = copiesBusyAt[index].load(std::memory_order_acquire); busy != kNoSeal && busy == seals->load(std::memory_order_acquire))
+				throw EpochCopiesBusyError(epochs[index], copyCount);
 			ticketWake.wait(seen, std::memory_order_acquire);
 		}
 	}
@@ -301,13 +309,7 @@ struct GraphHost::RecordingQueue {
 GraphHost::GraphHost(Desc desc) : m_desc(std::move(desc)), m_recordingQueue(std::make_unique<RecordingQueue>()) {
 	if (!m_desc.runtime) throw std::invalid_argument("GraphHost requires a runtime");
 	m_device = m_desc.runtime->Device();
-	// The frame slots: framesInFlight frames of every epoch in the order (each its runs a frame), so that adding an epoch keeps
-	// the CPU's lead over the GPU the same rather than shortening it (each slot's next execution waits for its last one).
-	m_frameSlots = FrameSlotsFor(m_desc);
-	// Upload pages, statistics query ranges and admission capacity are sized from the runtime's slots.
-	if (m_frameSlots > m_desc.runtime->Slots())
-		throw std::invalid_argument("GraphHost: more frame slots (frames in flight times epochs) than the runtime has");
-	m_slotCompletions.assign(m_frameSlots, {});
+	m_leaseTable = std::make_unique<std::atomic<RunLease*>[]>(Runtime::kMaxSlots);
 	// A graph per epoch, in the frame's order; one of every pass without epochs.
 	if (m_desc.epochOrder.empty()) m_instances.emplace_back();
 	for (const auto epoch : m_desc.epochOrder) {
@@ -338,35 +340,199 @@ GraphHost::~GraphHost() {
 	m_uncertainUploadOwners.clear();
 }
 
-uint32_t GraphHost::FrameSlotsFor(const Desc& desc) {
-	for (size_t index = 0; index < desc.epochRuns.size(); ++index) {
-		const auto& entry = desc.epochRuns[index];
-		if (entry.runsPerFrame == 0) throw std::invalid_argument("GraphHost: an epoch's runs per frame (Desc::epochRuns) must be at least 1");
-		if (std::ranges::find(desc.epochOrder, entry.epoch) == desc.epochOrder.end())
-			throw std::invalid_argument("GraphHost: Desc::epochRuns names epoch " + std::to_string(entry.epoch) + ", which is not in the epoch order");
-		for (size_t other = 0; other < index; ++other)
-			if (desc.epochRuns[other].epoch == entry.epoch)
-				throw std::invalid_argument("GraphHost: Desc::epochRuns names epoch " + std::to_string(entry.epoch) + " twice");
+// ---- run leases ----
+
+GraphHost::RunLease* GraphHost::OpenLeaseLocked(bool external) {
+	RunLease* lease = nullptr;
+	if (!m_freeLeases.empty()) {
+		lease = m_leaseStore[m_freeLeases.back()].get();
+		m_freeLeases.pop_back();
+	} else {
+		if (m_leaseStore.size() >= Runtime::kMaxSlots) return nullptr;
+		auto made = std::make_unique<RunLease>();
+		made->index = static_cast<uint32_t>(m_leaseStore.size());
+		lease = made.get();
+		m_leaseTable[made->index].store(lease, std::memory_order_release);
+		m_leaseStore.push_back(std::move(made));
 	}
-	uint64_t runs = 0;
-	if (desc.epochOrder.empty()) runs = 1;
-	for (const auto epoch : desc.epochOrder) {
-		uint32_t perFrame = 1;
-		for (const auto& entry : desc.epochRuns)
-			if (entry.epoch == epoch) perFrame = entry.runsPerFrame;
-		runs += perFrame;
-	}
-	const uint64_t slots = runs * (std::max)(desc.framesInFlight, 1u);
-	if (slots > Runtime::kMaxSlots)
-		throw std::invalid_argument("GraphHost: " + std::to_string(slots) + " frame slots (frames in flight times the epochs' runs a frame) is more than "
-			+ std::to_string(Runtime::kMaxSlots) + " (Runtime::kMaxSlots)");
-	return static_cast<uint32_t>(slots);
+	// Generation 0 means "not a leased run" (RunRef::Leased).
+	if (++lease->generation == 0) lease->generation = 1;
+	lease->state = RunLease::State::Open;
+	lease->external = external;
+	lease->points.clear();
+	lease->hostFrame = lease->submission = lease->seal = 0;
+	m_leasesPeak = (std::max)(m_leasesPeak, ++m_leasesInFlight);
+	return lease;
 }
 
-uint32_t GraphHost::RunsPerFrame(uint32_t epoch) const noexcept {
-	for (const auto& entry : m_desc.epochRuns)
-		if (entry.epoch == epoch) return entry.runsPerFrame;
-	return 1;
+GraphHost::RunLease& GraphHost::OpenLease(Async* state) {
+	for (;;) {
+		RunLease* lease = nullptr;
+		RunLease* oldest = nullptr;
+		{
+			std::scoped_lock lock(m_leaseMutex);
+			lease = OpenLeaseLocked(false);
+			// Every index is in flight: the oldest sealed run is waited for (backpressure, never a run that may still be in the
+			// host's stream). Never reached in practice: Runtime::kMaxSlots runs in flight.
+			if (!lease) {
+				const uint64_t seals = m_seals.load(std::memory_order_acquire);
+				for (auto* submitted : m_submittedLeases)
+					if (!submitted->external && (submitted->seal < seals || seals == 0)) {
+						oldest = submitted;
+						break;
+					}
+				if (!oldest)
+					throw std::runtime_error("GraphHost: " + std::to_string(Runtime::kMaxSlots) + " runs in flight and none of them sealed (SealSubmitted)");
+			}
+		}
+		if (lease) {
+			// Its statistics range: the pools grow for the most runs in flight.
+			if (const auto& stats = m_desc.runtime->Statistics()) stats->EnsureFrameCapacity(lease->index + 1);
+			return *lease;
+		}
+		BT_ZONE_SCOPE("ORG.Host.WaitOldestRun");
+		for (const auto& [timeline, value] : oldest->points) (void)(*timeline)->HostWait(value);
+		RetireLease(*oldest, state);
+	}
+}
+
+std::vector<GraphHost::RunLease*>& GraphHost::CopyLeases(uint32_t epoch) {
+	for (auto& [owner, copies] : m_copyLeases)
+		if (owner == epoch) return copies;
+	const uint32_t count = (std::max)(m_desc.framesInFlight, 1u);
+	std::vector<RunLease*> copies;
+	{
+		std::scoped_lock lock(m_leaseMutex);
+		for (uint32_t copy = 0; copy < count; ++copy) {
+			if (m_leaseStore.size() >= Runtime::kMaxSlots) throw std::runtime_error("GraphHost: no lease index left for a published copy");
+			auto made = std::make_unique<RunLease>();
+			made->index = static_cast<uint32_t>(m_leaseStore.size());
+			made->copy = copy;
+			copies.push_back(made.get());
+			m_leaseTable[made->index].store(made.get(), std::memory_order_release);
+			m_leaseStore.push_back(std::move(made));
+		}
+	}
+	if (const auto& stats = m_desc.runtime->Statistics()) stats->EnsureFrameCapacity(copies.back()->index + 1);
+	return m_copyLeases.emplace_back(epoch, std::move(copies)).second;
+}
+
+void GraphHost::RetireLease(RunLease& lease, Async* state) {
+	// The run's queries were resolved by its submission: read them back now. The runtime's statistics, which every graph shares
+	// (a graph's own pointer may be in the middle of a rebuild).
+	if (!lease.external && lease.submission)
+		if (const auto& stats = m_desc.runtime->Statistics()) {
+			rhi::Queue queue = m_device.GetQueue(rhi::QueueKind::Graphics);
+			stats->OnFrameComplete(lease.index, queue);
+			if (m_completedFrame) m_completedFrame(lease.hostFrame, *stats);
+		}
+	ReleaseLease(lease, state);
+}
+
+void GraphHost::ReleaseLease(RunLease& lease, Async* state) {
+	// Its regions in the frame arena (a published copy's are pinned, and stay).
+	if (const auto& arena = m_desc.runtime->Arena()) arena->ReleaseRun(lease.index, lease.generation);
+	// Its lists: the GPU is done with them, or they were never submitted. Each is reset when it is begun again.
+	const auto recycle = [](const std::shared_ptr<CommandListPool>& pool, CommandListPair& pair) {
+		pair.EndRecording();
+		if (!pair.list) return;
+		if (pool) pool->RecycleForNextRequest(std::move(pair));
+		else pair = {};
+	};
+	recycle(state ? state->uploadPool : nullptr, lease.upload);
+	recycle(state ? state->uploadSecondaryPool : nullptr, lease.uploadSecondary);
+	for (size_t queue = 0; queue < lease.queueUploads.size(); ++queue) {
+		const auto kind = state && queue < state->queueUploadKinds.size() ? state->queueUploadKinds[queue] : std::nullopt;
+		recycle(kind ? state->queueUploadPools[static_cast<size_t>(*kind)] : nullptr, lease.queueUploads[queue]);
+	}
+	lease.keepAlive.reset();
+	lease.resourceOwner.reset();
+	lease.points.clear();
+	std::scoped_lock lock(m_leaseMutex);
+	if (lease.state == RunLease::State::Submitted) std::erase(m_submittedLeases, &lease);
+	if (lease.state != RunLease::State::Free) --m_leasesInFlight;
+	if (lease.state != RunLease::State::Free && lease.copy == RunRef::kNoCopy) m_freeLeases.push_back(lease.index);
+	lease.state = RunLease::State::Free;
+	lease.external = false;
+}
+
+uint64_t GraphHost::RetiredSubmissionsLocked(uint64_t seen) const {
+	uint64_t retired = seen;
+	for (const auto* lease : m_submittedLeases)
+		if (lease->submission) retired = (std::min)(retired, lease->submission - 1);
+	return retired;
+}
+
+size_t GraphHost::RetireReachedLeases(Async* state) {
+	std::vector<RunLease*> reached;
+	{
+		std::scoped_lock lock(m_leaseMutex);
+		if (m_submittedLeases.empty()) return 0;
+		CompletedValues completed;
+		for (auto* lease : m_submittedLeases)
+			if (completed.Reached(lease->points)) reached.push_back(lease);
+	}
+	for (auto* lease : reached) RetireLease(*lease, state);
+	// Retired: every submission below the oldest one still running (all that were seen, with none). Runs complete in any order,
+	// so a run's own number says nothing of the ones before it.
+	uint64_t retired = 0;
+	{
+		std::scoped_lock lock(m_leaseMutex);
+		retired = RetiredSubmissionsLocked(state ? state->submissionsSeen : m_submissions);
+	}
+	if (retired > m_retiredReported) {
+		m_retiredReported = retired;
+		if (m_retired) m_retired(retired);
+	}
+	return reached.size();
+}
+
+RunRef GraphHost::BeginExternalRun(std::shared_ptr<rhi::TimelinePtr> timeline, uint64_t value) {
+	if (!timeline || !*timeline || !value) throw std::invalid_argument("BeginExternalRun needs the client's timeline and the value it signals");
+	RunLease* lease = nullptr;
+	{
+		std::scoped_lock lock(m_leaseMutex);
+		lease = OpenLeaseLocked(true);
+		if (!lease) throw std::runtime_error("GraphHost: no lease index left for an external run");
+		// Submitted at once: the client's point is its completion, whenever the client signals it.
+		lease->points.emplace_back(timeline, value);
+		lease->state = RunLease::State::Submitted;
+		m_submittedLeases.push_back(lease);
+	}
+	m_externalRun = lease->Ref();
+	// The client's own work may use ORG objects too (draws in its stream that read a graph's buffers). No ORG queue sees that
+	// work, so deferred deletions and descriptor releases wait for its value.
+	DescriptorHeapManager::GetInstance().PublishQueueFenceSnapshot({ DescriptorHeapManager::QueueFenceSnapshotPoint{ .timeline = timeline->Get(), .value = value } });
+	m_desc.runtime->NoteExternalPoint(timeline->Get(), value);
+	// The run's upload pages: what was staged since the last submission is the client's run's now. Its index's last run retired.
+	auto* graph = AnyGraph();
+	auto* uploads = graph ? graph->GetUploadService() : nullptr;
+	if (!uploads) return *m_externalRun;
+	uploads->ProcessDeferredReleases(lease->index);
+	if (!m_async) {
+		m_desc.runtime->Retire();
+		return *m_externalRun;
+	}
+	if (auto retired = m_desc.runtime->RetireElsewhere()) m_externalRetired.push_back(std::move(retired));
+	// No submission came to take them for a while: they go to the runtime's deleter rather than being kept.
+	if (m_externalRetired.size() > 16)
+		for (auto& retired : std::exchange(m_externalRetired, {})) m_desc.runtime->DestroyDetached(std::move(retired), "an external run's deferred deletions");
+	return *m_externalRun;
+}
+
+GraphHost::RunMemoryStats GraphHost::TakeRunMemoryStats() {
+	RunMemoryStats stats;
+	{
+		std::scoped_lock lock(m_leaseMutex);
+		stats.leasesInFlight = m_leasesInFlight;
+		stats.leasesPeak = std::exchange(m_leasesPeak, m_leasesInFlight);
+		stats.leaseIndices = static_cast<uint32_t>(m_leaseStore.size());
+		for (const auto* lease : m_submittedLeases) stats.externalRuns += lease->external ? 1u : 0u;
+		for (const auto& [epoch, copies] : m_copyLeases) stats.copyLeases += static_cast<uint32_t>(copies.size());
+	}
+	if (const auto& statistics = m_desc.runtime->Statistics()) stats.statisticsRanges = statistics->FrameCapacity();
+	if (const auto& arena = m_desc.runtime->Arena()) stats.arena = arena->TakeStats();
+	return stats;
 }
 
 size_t GraphHost::InstanceOf(uint32_t epoch) const noexcept {
@@ -541,8 +707,20 @@ void GraphHost::DestroyGraph() {
 		if (instance.graph) instance.graph->StopFrameProduction();
 	// Adopted devices wait on their own timelines only (never the whole device).
 	(void)m_device.WaitIdle();
-	for (auto& completion : m_slotCompletions) completion = {};
-	m_slotSubmitted.clear();
+	// Every run of the host's own is done: their leases retire. An external run waits for its client's point.
+	{
+		std::vector<RunLease*> runs;
+		{
+			std::scoped_lock lock(m_leaseMutex);
+			for (auto* lease : m_submittedLeases)
+				if (!lease->external) runs.push_back(lease);
+		}
+		for (auto* lease : runs) {
+			for (const auto& [timeline, value] : lease->points) (void)(*timeline)->HostWait(value);
+			RetireLease(*lease, nullptr);
+		}
+	}
+	m_syncLeases.clear();
 	m_externalRetired.clear();
 	for (auto& instance : m_instances) {
 		// The next build starts afresh: a failure is the old graphs'.
@@ -640,7 +818,6 @@ bool GraphHost::BuildInstance(size_t index) {
 		}
 		graph->SetExternalPersistentEpochs(m_externalEpochs);
 		graph->SetPersistentRecordingReuse(m_desc.reuseRecordings);
-		graph->SetKeepLiveRecordings(m_desc.keepLiveRecordings);
 		graph->SetPersistentRecordingTimestamps(m_recordingTimestamps.load(std::memory_order_acquire));
 		graph->SetScheduleTraceEnabled(m_scheduleTrace.load(std::memory_order_acquire));
 		{
@@ -754,9 +931,11 @@ void GraphHost::SealSubmitted() {
 		m_sealed = std::move(point);
 	}
 	m_seals.fetch_add(1, std::memory_order_seq_cst);
-	// An epoch whose ring was full of unsealed runs can take a slot again: the host's thread prepares its ticket now. The flag is
+	// An epoch whose copies were busy with unsealed runs can take one again: the host's thread prepares its ticket now. The flag is
 	// set before the host's thread reads the seals again, so either it sees this count or this sees its flag.
-	if (m_async && m_async->anyRingFull.exchange(false, std::memory_order_seq_cst)) (void)m_async->completionWake->Notify();
+	if (m_async && m_async->anyCopiesBusy.exchange(false, std::memory_order_seq_cst)) (void)m_async->completionWake->Notify();
+	// Once a frame: chunks the runs in flight have not needed for a while go.
+	if (const auto& arena = m_desc.runtime->Arena()) arena->Trim();
 }
 
 GraphHost::GpuPoint GraphHost::SealedPoint() const {
@@ -787,48 +966,36 @@ std::string GraphHost::DescribeAsyncState() const {
 		n(async->read.load()) + ", wakes on GPU " + n(async->wakesOnGpu.load()) + ", sleeping on " + n(async->sleepingAt.load()) + " (version + 1), wake version " +
 		n(async->completionWake ? async->completionWake->WakeVersion() : 0) + ", requests queued " + n(m_recordingQueue->head.load() != nullptr) +
 		", accepting " + n(m_recordingQueue->accepting.load()) + ", seals " + n(seals) + ", requests held " + n(async->pendingRequests.size());
-	out += "; epochs (index:epoch paused/needsTicket/ticket/failed/ringFull/generation):";
+	out += "; epochs (index:epoch paused/needsTicket/ticket/failed/copiesBusy/generation):";
 	for (size_t i = 0; i < async->epochs.size(); ++i) {
-		const auto full = async->ringFullAt ? async->ringFullAt[i].load() : Async::kNoSeal;
+		const auto busy = async->copiesBusyAt ? async->copiesBusyAt[i].load() : Async::kNoSeal;
 		out += " " + n(i) + ":" + n(async->epochs[i]) + " " + n(async->paused[i]) + "/" + n(i < async->needsTicket.size() ? async->needsTicket[i] : 0) +
 			"/" + n(async->cells && async->cells[i].load() != nullptr) + "/" + n(async->epochFailed && async->epochFailed[i].load()) + "/" +
-			(full == Async::kNoSeal ? std::string("-") : n(full)) + "/" + n(async->generation[i]);
+			(busy == Async::kNoSeal ? std::string("-") : n(busy)) + "/" + n(async->generation[i]);
 	}
 	out += "; host timelines (t<index> last assigned/completed):";
 	for (const auto& timeline : m_timelines)
 		if (timeline.fence && *timeline.fence)
 			out += " t" + n((*timeline.fence)->GetHandle().index) + " " + n(timeline.nextValue->load() - 1) + "/" + n((*timeline.fence)->GetCompletedValue());
-	out += "; held requests (epoch: per ring position r=recorded, R=reserved, P=pending unreached, s=its seal, .=free):";
-	for (const auto& request : async->pendingRequests) {
-		if (!request) continue;
-		out += " [" + n(async->epochs[request->epochIndex]) + " first " + n(request->result ? request->result->firstSlot : 0) + ":";
-		for (size_t p = 0; p < request->recorded.size(); ++p) {
-			const uint32_t slot = (request->result ? request->result->firstSlot : 0) + static_cast<uint32_t>(p);
-			if (request->recorded[p]) {
-				out += " r";
-				continue;
-			}
-			if (slot >= async->slots.size()) {
-				out += " ?";
-				continue;
-			}
-			const auto& entry = async->slots[slot];
-			std::string state = entry.reserved ? "R" : "";
-			if (entry.pending && !PointsReached(entry.points)) {
-				state += "P(s" + n(entry.seal) + " #" + n(entry.submission) + " frame " + n(entry.hostFrame);
-				for (const auto& [timeline, value] : entry.points)
-					if (timeline && *timeline)
-						state += " t" + n((*timeline)->GetHandle().index) + " " + n(value) + "/" + n((*timeline)->GetCompletedValue());
-				state += ")";
-			}
-			out += " " + (state.empty() ? std::string(".") : state);
+	// The runs in flight, oldest first, and what each waits for.
+	std::scoped_lock lock(m_leaseMutex);
+	out += "; leases: " + n(m_leasesInFlight) + " in flight of " + n(m_leaseStore.size()) + "; submitted (index#submission s=seal, points):";
+	size_t listed = 0;
+	for (const auto* lease : m_submittedLeases) {
+		if (++listed > 32) {
+			out += " ...";
+			break;
 		}
+		out += " [" + n(lease->index) + (lease->external ? " external" : " #" + n(lease->submission)) + " s" + n(lease->seal);
+		for (const auto& [timeline, value] : lease->points)
+			if (timeline && *timeline)
+				out += " t" + n((*timeline)->GetHandle().index) + " " + n(value) + "/" + n((*timeline)->GetCompletedValue());
 		out += "]";
 	}
 	return out;
 }
 
-bool GraphHost::BuildIfRequested() {
+bool GraphHost::BuildIfRequested() {bool GraphHost::BuildIfRequested() {
 	ReleaseRetiredGraphs(false);
 	return BuildDueInstances(true);
 }
@@ -864,27 +1031,33 @@ void GraphHost::ExecuteFrame(const IHostExecutionData* hostData, const FrameCall
 		return EpochFailedError(instance.epoch, error);
 	};
 	runtime::ScopedActiveGraphServices services(graph.GetUploadService(), graph.GetDescriptorService());
-	const auto slot = static_cast<uint32_t>(m_frameNumber % m_frameSlots);
-	// The slot's previous frame must be done on the GPU before the upload pages it used are recycled
-	// (and before this frame records uploads into the slot).
-	if (auto& completion = m_slotCompletions[slot]; completion.pending) {
-		{
-			BT_ZONE_SCOPE("ORG.Host.WaitSlotCompletion");
-			for (const auto& [timeline, value] : completion.points) (void)(*timeline)->HostWait(value);
+	// Frame pacing: this position's run of framesInFlight frames back (a frame: each epoch of the order once) is waited for and
+	// retired. It was submitted to the device by its own Execute, so the wait always ends. Every other run whose GPU work is done
+	// retires too (their statistics are read, their memory freed).
+	{
+		const size_t positions = size_t{(std::max)(m_desc.framesInFlight, 1u)} * (std::max<size_t>)(m_desc.epochOrder.size(), 1);
+		if (m_syncLeases.size() != positions) m_syncLeases.assign(positions, nullptr);
+		if (auto* previous = std::exchange(m_syncLeases[m_frameNumber % positions], nullptr); previous && previous->state == RunLease::State::Submitted) {
+			BT_ZONE_SCOPE("ORG.Host.WaitFramePacing");
+			for (const auto& [timeline, value] : previous->points) (void)(*timeline)->HostWait(value);
 		}
-		completion.pending = false;
-		if (m_retired) m_retired(completion.submission);
-		// Nothing else completes a frame's statistics on this path: without it the pass timestamps were
-		// written and resolved every frame and never read, and their pending resolves only grew.
-		if (auto* stats = graph.GetStatisticsService()) {
-			rhi::Queue queue = m_device.GetQueue(rhi::QueueKind::Graphics);
-			stats->OnFrameComplete(slot, queue);
-			if (m_completedFrame) m_completedFrame(completion.frameNumber, *stats);
-		}
+		(void)RetireReachedLeases(nullptr);
 	}
 	lap(m_lastTimings.waitUs);
-	// A slot an external client's work still uses (NoteExternalSlotUse) keeps its upload pages for a later release.
-	if (auto* uploads = graph.GetUploadService(); uploads && !ExternalSlotInUse(slot)) uploads->ProcessDeferredReleases(static_cast<uint32_t>(slot));
+	auto& lease = OpenLease(nullptr);
+	const uint32_t slot = lease.index;
+	m_syncRun = lease.Ref();
+	// A failure before submission gives the lease back: nothing of the run reached the GPU. Once Execute ran, the lease holds its
+	// points (below), and it retires with a later pacing pass.
+	struct ReleaseUnsubmitted {
+		GraphHost& host;
+		RunLease& lease;
+		~ReleaseUnsubmitted() {
+			if (lease.state == RunLease::State::Open) host.ReleaseLease(lease, nullptr);
+		}
+	} releaseUnsubmitted{*this, lease};
+	// The run's index retired before it was opened: its upload pages are free again, and what was staged since takes it.
+	if (auto* uploads = graph.GetUploadService()) uploads->ProcessDeferredReleases(slot);
 	m_desc.runtime->Retire();
 	lap(m_lastTimings.releaseUs);
 	graph.SetPersistentEpoch(epoch);
@@ -897,6 +1070,7 @@ void GraphHost::ExecuteFrame(const IHostExecutionData* hostData, const FrameCall
 	UpdateExecutionContext update{};
 	update.frameIndex = slot;
 	update.preparationSlot = slot;
+	update.run = m_syncRun;
 	update.frameFenceValue = m_frameNumber + 1;
 	update.hostData = hostData;
 	try {
@@ -919,38 +1093,54 @@ void GraphHost::ExecuteFrame(const IHostExecutionData* hostData, const FrameCall
 		Runtime::AssignmentScope assigning(*m_desc.runtime);
 		graph.Execute(execute);
 	} catch (const std::exception& e) {
+		// Some of its batches may have been accepted: the lease waits for every queue's current value.
+		auto& queues = graph.GetQueueRegistry();
+		lease.points.clear();
+		for (size_t queueIndex = 0; queueIndex < queues.SlotCount(); ++queueIndex) {
+			const auto queueSlot = static_cast<QueueSlotIndex>(static_cast<uint8_t>(queueIndex));
+			if (const auto next = queues.GetCurrentFenceValue(queueSlot); next > 1) lease.points.emplace_back(queues.GetFenceOwner(queueSlot), next - 1);
+		}
+		{
+			std::scoped_lock lock(m_leaseMutex);
+			lease.state = RunLease::State::Submitted;
+			m_submittedLeases.push_back(&lease);
+		}
 		throw failEpoch(e.what());
 	}
 	lap(m_lastTimings.executeUs);
 	m_lastTimings.execute = graph.LastPersistentExecuteTimings();
 	// Execute submitted the frame: every batch signalled its queue's timeline, so the value each queue
-	// has reached is the frame's completion on it.
+	// has reached is the run's completion on it.
 	{
-		auto& completion = m_slotCompletions[slot];
 		auto& queues = graph.GetQueueRegistry();
-		completion.points.clear();
+		lease.points.clear();
 		for (size_t queueIndex = 0; queueIndex < queues.SlotCount(); ++queueIndex) {
 			const auto queueSlot = static_cast<QueueSlotIndex>(static_cast<uint8_t>(queueIndex));
 			if (const auto next = queues.GetCurrentFenceValue(queueSlot); next > 1)
-				completion.points.emplace_back(queues.GetFenceOwner(queueSlot), next - 1);
+				lease.points.emplace_back(queues.GetFenceOwner(queueSlot), next - 1);
 		}
-		completion.frameNumber = m_frameNumber;
-		completion.submission = ++m_submissions;
-		completion.seal = m_seals.load(std::memory_order_relaxed);
-		completion.pending = true;
+		lease.hostFrame = m_frameNumber;
+		lease.submission = ++m_submissions;
+		lease.seal = m_seals.load(std::memory_order_relaxed);
 		if (heldResources) {
 			const auto& owner = m_uncertainExecutionOwners.back();
-			if (owner && !completion.points.empty()) {
+			if (owner && !lease.points.empty()) {
 				std::vector<DescriptorHeapManager::QueueFenceSnapshotPoint> points;
-				points.reserve(completion.points.size());
-				for (const auto& [timeline, value] : completion.points)
+				points.reserve(lease.points.size());
+				for (const auto& [timeline, value] : lease.points)
 					points.push_back({timeline->Get(), value});
 				DescriptorHeapManager::GetInstance().RetireExecutionLease(owner, std::move(points));
 			}
 			m_uncertainExecutionOwners.pop_back();
 		}
+		{
+			std::scoped_lock lock(m_leaseMutex);
+			lease.state = RunLease::State::Submitted;
+			m_submittedLeases.push_back(&lease);
+		}
+		const size_t positions = m_syncLeases.size();
+		m_syncLeases[m_frameNumber % positions] = &lease;
 	}
-	NoteSlotSubmitted(slot);
 	lap(m_lastTimings.signalUs);
 	m_lastHostFrame = m_frameNumber;
 	++m_frameNumber;
@@ -1034,44 +1224,18 @@ void GraphHost::StartAsync() {
 			async->epochFailed[index].store(true, std::memory_order_release);
 		}
 	}
-	// Each epoch its own ring of framesInFlight slots (times its runs a frame, Desc::epochRuns), when the slots hold one per async
-	// epoch (they hold that many of every epoch in the order); otherwise one ring of all. An epoch with more runs than one a frame
-	// starts on framesInFlight of its ring's slots and grows into the rest (PrepareTicket).
-	{
-		const uint32_t frames = (std::max)(m_desc.framesInFlight, 1u);
-		uint64_t first = 0;
-		for (const auto epoch : async->epochs) {
-			const uint32_t capacity = frames * RunsPerFrame(epoch);
-			async->ringFirst.push_back(static_cast<uint32_t>(first));
-			async->ringCapacity.push_back(capacity);
-			async->ringActive.push_back(frames);
-			async->ringGrows.push_back(capacity > frames ? 1 : 0);
-			first += capacity;
-		}
-		async->rings = first <= m_frameSlots;
-		async->ringLag = (std::max)(frames - 1, 1u);
-	}
+	async->copyCount = (std::max)(m_desc.framesInFlight, 1u);
 	async->seals = &m_seals;
-	async->ringFullAt = std::make_unique<std::atomic<uint64_t>[]>(async->epochs.size());
-	for (uint32_t index = 0; index < async->epochs.size(); ++index) async->ringFullAt[index].store(Async::kNoSeal, std::memory_order_relaxed);
-	async->ringFullLogged.assign(async->epochs.size(), 0);
-	async->unsealedWaitLogged.assign(async->epochs.size(), 0);
+	async->copiesBusyAt = std::make_unique<std::atomic<uint64_t>[]>(async->epochs.size());
+	for (uint32_t index = 0; index < async->epochs.size(); ++index) async->copiesBusyAt[index].store(Async::kNoSeal, std::memory_order_relaxed);
+	async->copiesBusyLogged.assign(async->epochs.size(), 0);
 	async->cells = std::make_unique<std::atomic<std::shared_ptr<Async::Ticket>>[]>(async->epochs.size());
 	async->needsTicket.assign(async->epochs.size(), 1);
 	async->liveRecordings.assign(async->epochs.size(), {});
 	async->outstanding.assign(async->epochs.size(), {});
-	const uint32_t slotCount = m_frameSlots;
-	async->slots.resize(slotCount);
-	// What the synchronous frames left: their slots' completions.
-	for (uint32_t slot = 0; slot < slotCount && slot < m_slotCompletions.size(); ++slot) {
-		auto& completion = m_slotCompletions[slot];
-		async->slots[slot].points = completion.points;
-		async->slots[slot].hostFrame = completion.frameNumber;
-		async->slots[slot].submission = completion.submission;
-		async->slots[slot].seal = completion.seal;
-		async->slots[slot].pending = completion.pending;
-		completion = {};
-	}
+	// The synchronous frames' runs still in flight are the host thread's to retire now, like its own. The sync path's pacing
+	// starts afresh when async epochs stop.
+	m_syncLeases.clear();
 	async->hostFrame = m_frameNumber;
 	async->submissionsSeen = m_submissions;
 	// The queues' layout is every graph's: the primary queues first, on the host's timelines.
@@ -1080,13 +1244,11 @@ void GraphHost::StartAsync() {
 	async->graphicsSlot = static_cast<uint32_t>(ToUnderlying(graphics));
 	async->graphicsQueue = queues.GetQueue(graphics);
 	async->graphicsFence = queues.GetFence(graphics).GetHandle();
-	// The upload lists come from host-wide pools, made at each slot's first ticket (PrepareTicket). The pools share their
-	// allocators between the slots, so a few command pools serve every slot.
+	// The upload lists come from host-wide pools: each run lease requests its lists when its ticket is prepared, and recycles
+	// them when it retires. The pools share their allocators between the lists, so a few command pools serve every run.
 	async->uploadPool = std::make_shared<CommandListPool>(m_device, rhi::QueueKind::Graphics);
-	// An external epoch's uploads secondaries, for every slot: an epoch may become external at any of its rebuilds.
+	// An external epoch's uploads secondaries: an epoch may become external at any of its rebuilds.
 	async->uploadSecondaryPool = std::make_shared<CommandListPool>(m_device, rhi::QueueKind::Graphics, true);
-	async->uploadLists.resize(slotCount);
-	async->uploadSecondaries.resize(slotCount);
 	// Queue-scoped uploads: one list per compute or copy queue on the graphics queue's device (a copy needs no more).
 	async->queueUploadKinds.assign(queues.SlotCount(), std::nullopt);
 	for (size_t index = 0; index < queues.SlotCount(); ++index) {
@@ -1100,8 +1262,6 @@ void GraphHost::StartAsync() {
 		auto& pool = async->queueUploadPools[static_cast<size_t>(queueKind)];
 		if (!pool) pool = std::make_shared<CommandListPool>(m_device, queueKind);
 	}
-	async->queueUploadLists.resize(slotCount);
-	for (auto& perQueue : async->queueUploadLists) perQueue.resize(queues.SlotCount());
 	async->queueLists.resize(queues.SlotCount());
 	// Staged uploads go straight into each submission's upload list (RenderGraph::RecordPendingUploads).
 	if (auto* uploads = firstGraph->GetUploadService()) uploads->SetStagedUploadsRecordedDirectly(true);
@@ -1119,7 +1279,7 @@ void GraphHost::StartAsync() {
 					switch (message.kind) {
 					case Async::Message::Kind::Submitted: {
 						auto& graph = graphOf(message.epochIndex);
-						auto& slot = state->slots[RenderGraph::PersistentTicketSlot(*message.ticket)];
+						auto& lease = *m_leaseTable[RenderGraph::PersistentTicketRun(*message.ticket).lease].load(std::memory_order_acquire);
 						state->uncertainUploadOwner = std::move(message.keepAlive);
 						state->uncertainResourceOwner = std::move(message.resourceOwner);
 						auto completion = graph.CompletePersistentTicket(*message.ticket, message.submission);
@@ -1128,40 +1288,46 @@ void GraphHost::StartAsync() {
 							if (found == completion.end()) completion.push_back(message.uploadSignal);
 							else found->second = (std::max)(found->second, message.uploadSignal.second);
 						}
-						slot.points.clear();
+						lease.points.clear();
 						for (const auto& [queue, value] : completion)
-							slot.points.emplace_back(graph.GetQueueRegistry().GetFenceOwner(static_cast<QueueSlotIndex>(static_cast<uint8_t>(queue))), value);
-						slot.pending = !slot.points.empty();
-						slot.reserved = false;
-						slot.hostFrame = RenderGraph::PersistentTicketHostFrame(*message.ticket);
-						slot.submission = message.number;
-						slot.seal = message.seal;
+							lease.points.emplace_back(graph.GetQueueRegistry().GetFenceOwner(static_cast<QueueSlotIndex>(static_cast<uint8_t>(queue))), value);
+						lease.hostFrame = RenderGraph::PersistentTicketHostFrame(*message.ticket);
+						lease.submission = message.number;
+						lease.seal = message.seal;
 						state->submissionsSeen = (std::max)(state->submissionsSeen, message.number);
 						if (state->outstanding[message.epochIndex] == message.ticket) state->outstanding[message.epochIndex].reset();
-						slot.keepAlive = std::move(state->uncertainUploadOwner);
-						slot.resourceOwner = std::move(state->uncertainResourceOwner);
+						lease.keepAlive = std::move(state->uncertainUploadOwner);
+						lease.resourceOwner = std::move(state->uncertainResourceOwner);
+						{
+							std::scoped_lock lock(m_leaseMutex);
+							lease.state = RunLease::State::Submitted;
+							m_submittedLeases.push_back(&lease);
+						}
 						if (!state->paused[message.epochIndex]) state->needsTicket[message.epochIndex] = 1;
 						// Never freed on this thread: a driver free can wait for GPU work that waits for a signal this thread prepares.
 						m_desc.runtime->DestroyDetached(std::move(message.retired), "a submission's deferred deletions");
 						break;
 					}
-					case Async::Message::Kind::Discard:
-						state->slots[RenderGraph::PersistentTicketSlot(*message.ticket)].reserved = false;
+					case Async::Message::Kind::Discard: {
+						auto& lease = *m_leaseTable[RenderGraph::PersistentTicketRun(*message.ticket).lease].load(std::memory_order_acquire);
 						if (state->outstanding[message.epochIndex] == message.ticket) state->outstanding[message.epochIndex].reset();
 						(void)graphOf(message.epochIndex).CompletePersistentTicket(*message.ticket, {});
-						// A discard naming a slot is a stale ticket's reprepare: its replacement is prepared here, in the same
-						// step, into the slot the render thread is recording. Marking the epoch as needing a ticket instead
-						// would let the proactive pass below prepare one into a slot of its own choosing, which the render
-						// thread would take while it records into the other slot's upload list.
+						// A reprepare is a stale ticket's: its replacement is prepared here, in the same step, into the run lease whose
+						// latch regions the render thread wrote and whose upload lists it records next. Marking the epoch as needing a
+						// ticket instead would let the proactive pass below prepare one into a new lease.
 						// A failed epoch prepares nothing: the render thread waiting for it sees the failure (WaitTicket).
-						if (message.slot >= 0 && !state->epochFailed[message.epochIndex].load(std::memory_order_relaxed))
-							PrepareTicket(*state, message.epochIndex, message.slot);
-						else if (!state->paused[message.epochIndex])
-							state->needsTicket[message.epochIndex] = 1;
+						if (message.reprepare && !state->epochFailed[message.epochIndex].load(std::memory_order_relaxed)) {
+							PrepareTicket(*state, message.epochIndex, &lease);
+						} else {
+							// Never submitted: nothing of it reached the GPU.
+							ReleaseLease(lease, state);
+							if (!state->paused[message.epochIndex]) state->needsTicket[message.epochIndex] = 1;
+						}
 						break;
+					}
 					case Async::Message::Kind::Detach: {
 						// The instances' epochs: their unsubmitted tickets abandoned, their recording requests dropped, and nothing prepared
-						// for them until the instances are attached again. Their submitted work completes as before (its slots keep their points).
+						// for them until the instances are attached again. Their submitted work completes as before (its leases keep their points).
 						const auto detaching = [&](size_t instance) {
 							return std::ranges::any_of(message.instances, [&](const auto& entry) { return entry.first == instance; });
 						};
@@ -1170,8 +1336,8 @@ void GraphHost::StartAsync() {
 							state->paused[index] = 1;
 							state->needsTicket[index] = 0;
 							if (auto ticket = state->cells[index].exchange(nullptr, std::memory_order_acq_rel)) {
-								state->slots[RenderGraph::PersistentTicketSlot(*ticket)].reserved = false;
 								(void)graphOf(index).CompletePersistentTicket(*ticket, {});
+								ReleaseLease(*m_leaseTable[RenderGraph::PersistentTicketRun(*ticket).lease].load(std::memory_order_acquire), state);
 							}
 							state->outstanding[index].reset();
 							state->liveRecordings[index].clear();
@@ -1208,17 +1374,18 @@ void GraphHost::StartAsync() {
 					}
 				}
 				if (stop) break;
-				// Recording requests: taken in posting order, each recording the slots of its ring that are free. One for an epoch that
-				// is not an async one (or without rings) completes with that error now.
+				// Recording requests: taken in posting order, each recording its published copies. One for an epoch that
+				// is not a revision-driven async epoch completes with that error now.
 				for (auto& node : m_recordingQueue->Take()) {
 					const auto found = std::ranges::find(state->epochs, node->epoch);
-					if (found == state->epochs.end() || !state->rings) {
+					const auto epochIndex = static_cast<uint32_t>(found - state->epochs.begin());
+					// Only a revision-driven epoch publishes recordings: a live epoch records each run afresh.
+					if (found == state->epochs.end() || !state->revisionDriven[epochIndex]) {
 						if (node->done)
 							node->done(nullptr, std::make_exception_ptr(std::invalid_argument("RequestEpochRecording: epoch " + std::to_string(node->epoch) +
-								" is not an async epoch with a slot ring")));
+								" is not a revision-driven async epoch")));
 						continue;
 					}
-					const auto epochIndex = static_cast<uint32_t>(found - state->epochs.begin());
 					if (state->paused[epochIndex]) {
 						// Its graph is being built again: the request is for the old one.
 						if (node->done) node->done(nullptr, std::make_exception_ptr(EpochRecordingDropped(state->generation[epochIndex])));
@@ -1238,45 +1405,27 @@ void GraphHost::StartAsync() {
 				}
 				for (uint32_t index = 0; index < state->epochs.size(); ++index)
 					if (!state->paused[index]) graphOf(index).RetirePersistentExecutions();
-				// A submitted upload batch owns its staging until the GPU has actually
-				// signalled every queue that used the slot. Retire it on this worker even
-				// if no later frame ever requests this slot again.
-				for (auto& slot : state->slots) {
-					if (!slot.keepAlive && !slot.resourceOwner) continue;
-					bool complete = true;
-					for (const auto& [timeline, value] : slot.points) {
-						const auto reached = (*timeline)->GetCompletedValue();
-						if (reached == UINT64_MAX || reached < value) {
-							complete = false;
-							break;
-						}
-					}
-					if (complete) {
-						slot.keepAlive.reset();
-						slot.resourceOwner.reset();
-					}
-				}
+				// Every run whose GPU work is done retires: its statistics are read, and its lists, arena regions, upload staging and
+				// owners are freed, even if no later run takes its lease again.
+				(void)RetireReachedLeases(state);
 				// The next ticket of every epoch whose last one was submitted: one frame ahead.
 				bool prepared = false;
 				for (uint32_t index = 0; index < state->epochs.size(); ++index) {
 					if (!state->needsTicket[index] || state->paused[index] || state->epochFailed[index].load(std::memory_order_relaxed)
 						|| state->cells[index].load(std::memory_order_acquire))
 						continue;
-					// A ring full of unsealed runs waits for the next seal (its SealSubmitted wakes this thread), or for one of its runs to
-					// complete (this thread sleeps on the pending slots' completions too).
-					if (const auto full = state->ringFullAt[index].load(std::memory_order_acquire); full != Async::kNoSeal) {
-						if (full == m_seals.load(std::memory_order_acquire)) {
-							const auto [begin, end] = state->SlotRange(index);
+					// Copies busy with unsealed runs wait for the next seal (its SealSubmitted wakes this thread), or for one of their runs to
+					// complete (this thread sleeps on the submitted runs' completions too).
+					if (const auto busy = state->copiesBusyAt[index].load(std::memory_order_acquire); busy != Async::kNoSeal) {
+						if (busy == m_seals.load(std::memory_order_acquire)) {
 							bool done = false;
-							for (uint32_t slot = begin; slot < end && !done; ++slot) {
-								const auto& entry = state->slots[slot];
-								done = !entry.reserved && (!entry.pending || PointsReached(entry.points));
-							}
+							for (const auto* copy : CopyLeases(state->epochs[index]))
+								done = done || copy->state == RunLease::State::Free;
 							if (!done) continue;
 						}
-						state->ringFullAt[index].store(Async::kNoSeal, std::memory_order_release);
+						state->copiesBusyAt[index].store(Async::kNoSeal, std::memory_order_release);
 					}
-					PrepareTicket(*state, index, -1);
+					PrepareTicket(*state, index, nullptr);
 					prepared = true;
 				}
 				// Then the recording requests: the frames' tickets come first, so recording ahead never delays a submission.
@@ -1286,25 +1435,30 @@ void GraphHost::StartAsync() {
 					std::array<rhi::TimelinePoint, rhi::CompletionWait::MaxTimelines> heads{};
 					uint32_t count = 0;
 					bool retireAgain = false;
-					for (const auto& slot : state->slots) if (slot.pending) {
-						bool incomplete = false;
-						for (const auto& [timeline, value] : slot.points) {
-							const auto reached = (*timeline)->GetCompletedValue();
-							if (reached == UINT64_MAX) throw std::runtime_error("GPU completion timeline failed");
-							if (reached >= value) continue;
-							incomplete = true;
-							const auto handle = (*timeline)->GetHandle();
-							uint32_t i = 0;
-							for (; i < count; ++i) if (heads[i].t.index == handle.index && heads[i].t.generation == handle.generation) break;
-							if (i < count) heads[i].value = (std::min)(heads[i].value, value);
-							else {
-								if (count == heads.size()) throw std::runtime_error("Too many GPU completion timelines");
-								heads[count++] = {handle, value};
+					{
+						std::scoped_lock lock(m_leaseMutex);
+						for (const auto* lease : m_submittedLeases) {
+							// An external run's point is its client's: it is retired at the next wake-up, never slept on.
+							if (lease->external) continue;
+							bool incomplete = false;
+							for (const auto& [timeline, value] : lease->points) {
+								const auto reached = (*timeline)->GetCompletedValue();
+								if (reached == UINT64_MAX) throw std::runtime_error("GPU completion timeline failed");
+								if (reached >= value) continue;
+								incomplete = true;
+								const auto handle = (*timeline)->GetHandle();
+								uint32_t i = 0;
+								for (; i < count; ++i) if (heads[i].t.index == handle.index && heads[i].t.generation == handle.generation) break;
+								if (i < count) heads[i].value = (std::min)(heads[i].value, value);
+								else {
+									if (count == heads.size()) throw std::runtime_error("Too many GPU completion timelines");
+									heads[count++] = {handle, value};
+								}
 							}
+							// Completion may race the retirement pass above. Do not go to sleep with a run whose final signal already
+							// arrived.
+							if (!incomplete) retireAgain = true;
 						}
-						// Completion may race the release pass above. Do not go to
-						// sleep with an owner whose final signal already arrived.
-						if (!incomplete && (slot.keepAlive || slot.resourceOwner)) retireAgain = true;
 					}
 					if (retireAgain) continue;
 					// Posters skip the wake while this sleep has GPU completions to end it; a message written before this store
@@ -1406,48 +1560,6 @@ std::shared_ptr<runtime::ResourceCleanupQueue> GraphHost::ResourceCleanup() cons
 	return DescriptorHeapManager::GetInstance().GetResourceCleanupQueue();
 }
 
-void GraphHost::WaitSlot(Async& state, uint32_t slot, uint32_t epochIndex) {
-	// The slot's previous execution must be done before its command lists, statistics range and latch region are reused, or
-	// before it is recorded for again: the wait happens here, on this thread, never on the render thread.
-	auto& entry = state.slots[slot];
-	if (!entry.pending) return;
-	// Every caller picks a waitable slot (RingSlot), so this does not happen. If it does, the log names the wait that may never end.
-	if (const auto seals = m_seals.load(std::memory_order_acquire);
-		!state.Waitable(entry, seals, state.rings && state.ringGrows[epochIndex]) && !state.unsealedWaitLogged[epochIndex]) {
-		state.unsealedWaitLogged[epochIndex] = 1;
-		spdlog::warn("GraphHost: the host's thread waits for slot {} of epoch {}, whose last run (submission {}, after seal {}) is neither done "
-			"nor sealed (seals now {}); if that run is still in the host's stream, this wait never ends", slot, state.epochs[epochIndex],
-			entry.submission, entry.seal, seals);
-	}
-	{
-		BT_ZONE_SCOPE("ORG.Host.WaitSlotCompletion.Worker");
-		for (const auto& [timeline, value] : entry.points) (void)(*timeline)->HostWait(value);
-	}
-	entry.pending = false;
-	// Retired: every submission below the oldest one still running (all that were seen, with none). Slots complete in the order the
-	// host's thread reuses them, not in submission order, so a slot's own number says nothing of the ones before it; a pending slot
-	// whose points are reached counts as done.
-	{
-		uint64_t retired = state.submissionsSeen;
-		for (const auto& other : state.slots) {
-			if (!other.pending) continue;
-			if (!PointsReached(other.points)) retired = (std::min)(retired, other.submission - 1);
-		}
-		if (retired > state.retiredReported) {
-			state.retiredReported = retired;
-			if (m_retired) m_retired(retired);
-		}
-	}
-	// The runtime's statistics, which every graph shares (a graph's own pointer may be in the middle of a rebuild).
-	if (const auto& stats = m_desc.runtime->Statistics()) {
-		rhi::Queue queue = m_device.GetQueue(rhi::QueueKind::Graphics);
-		stats->OnFrameComplete(slot, queue);
-		if (m_completedFrame) m_completedFrame(entry.hostFrame, *stats);
-	}
-	entry.keepAlive.reset();
-	entry.resourceOwner.reset();
-}
-
 bool GraphHost::ReleaseEpochTicket(uint32_t epoch) {
 	if (!m_async) return false;
 	auto& async = *m_async;
@@ -1501,47 +1613,41 @@ bool GraphHost::AdvanceRecordingRequests(Async& state) {
 			if (!request.result) {
 				request.result = std::make_shared<EpochRecording>();
 				request.result->epoch = state.epochs[request.epochIndex];
-				// Every slot the ring may grow into, so the recording covers whichever slot a ticket takes.
-				request.result->firstSlot = state.ringFirst[request.epochIndex];
-				request.result->slots.resize(state.ringCapacity[request.epochIndex]);
+				request.result->copies.resize(state.copyCount);
 				request.result->revision = request.hostData;
 				request.result->buildGeneration = state.generation[request.epochIndex];
-				request.recorded.assign(state.ringCapacity[request.epochIndex], 0);
+				request.recorded.assign(state.copyCount, 0);
 			}
-			for (uint32_t position = 0; position < request.recorded.size(); ++position) {
-				const uint32_t slot = request.result->firstSlot + position;
-				// A slot its epoch's unsubmitted ticket holds is recorded too: a revision-driven ticket holds the admission alone (its
-				// preparation recorded nothing, and already waited out the slot's last work), and it cannot be submitted without this.
-				if (request.recorded[position]) continue;
-				// A slot whose work is in flight is recorded once that completes (the loop wakes at completions), so the host's thread never
-				// waits on the GPU here and the epochs' tickets are not held up behind it. A live epoch's slot its ticket holds is recorded once
-				// the ticket is submitted.
-				const auto& entry = state.slots[slot];
-				if (!state.revisionDriven[request.epochIndex] && entry.reserved) continue;
-				if (entry.pending && std::ranges::any_of(entry.points, [](const auto& a_point) {
-						const auto reached = (*a_point.first)->GetCompletedValue();
-						return reached == UINT64_MAX || reached < a_point.second;
-					}))
-					continue;
+			auto& copies = CopyLeases(request.result->epoch);
+			for (uint32_t copy = 0; copy < request.recorded.size(); ++copy) {
+				if (request.recorded[copy]) continue;
+				// A copy whose last run is in flight is recorded once that completes (the loop wakes at completions), so the host's
+				// thread never waits on the GPU here and the epochs' tickets are not held up behind it. A copy the epoch's
+				// admission-only ticket holds is recorded too: the ticket recorded nothing, and it cannot be submitted without this.
+				auto& lease = *copies[copy];
+				if (lease.state == RunLease::State::Submitted) {
+					if (!PointsReached(lease.points)) continue;
+					RetireLease(lease, &state);
+				}
 				BT_ZONE_SCOPE("ORG.Host.RecordForRevision");
 				runtime::ScopedActiveGraphServices services(graph.GetUploadService(), graph.GetDescriptorService());
-				WaitSlot(state, slot, request.epochIndex);
 				std::shared_ptr<const RenderGraph::PersistentRecording> recording;
 				{
 					Async::Preparation preparation;
 					const auto version = state.backingVersion.load(std::memory_order_acquire);
-					auto ticket = graph.PreparePersistentTicket(m_device, request.result->epoch, static_cast<uint32_t>(slot), state.hostFrame, version,
-						request.hostData);
+					auto ticket = graph.PreparePersistentTicket(m_device, request.result->epoch, lease.Ref(), state.hostFrame, version, request.hostData);
 					recording = RenderGraph::PersistentTicketRecording(*ticket);
 					// Recorded only: its admission is abandoned, never submitted.
 					(void)graph.CompletePersistentTicket(*ticket, {});
 				}
 				if (!recording || !RenderGraph::PersistentRecordingReplayable(*recording))
 					throw std::logic_error("A revision-driven epoch's recording is not replayable (a pass with lifecycle effects, or a late-bound slot)");
-				request.result->slots[position] = std::move(recording);
-				request.recorded[position] = 1;
-				state.revisionSlotsRecorded.fetch_add(1, std::memory_order_relaxed);
+				request.result->copies[copy] = std::move(recording);
+				request.recorded[copy] = 1;
+				state.revisionCopiesRecorded.fetch_add(1, std::memory_order_relaxed);
 				advanced = true;
+				// One copy per pass: the epochs' tickets come first between copies.
+				break;
 			}
 		} catch (...) {
 			error = std::current_exception();
@@ -1575,106 +1681,88 @@ bool GraphHost::AdvanceRecordingRequests(Async& state) {
 	return advanced;
 }
 
-uint32_t GraphHost::RingSlot(Async& state, uint32_t epochIndex) {
-	const auto range = state.SlotRange(epochIndex);
-	const uint32_t first = range.first;
-	const bool grows = state.rings && state.ringGrows[epochIndex];
+GraphHost::RunLease* GraphHost::TakeCopyLease(Async& state, uint32_t epochIndex) {
+	auto& copies = CopyLeases(state.epochs[epochIndex]);
 	const uint64_t seals = m_seals.load(std::memory_order_acquire);
-	// A slot is never waited for while its last run may be off the device (Async::Waitable). A growing ring also waits only for a
-	// run ringLag seals old (or done): as far back as the wait of an epoch that runs once a frame.
-	const auto old = [&](const Async::Slot& entry) {
-		return !entry.pending || PointsReached(entry.points) || entry.seal + state.ringLag <= seals;
-	};
-	const auto waitable = [&](const Async::Slot& entry) { return state.Waitable(entry, seals, grows); };
-	const auto any = [](const Async::Slot&) { return true; };
-	// The least recently submitted slot in use that no unsubmitted ticket holds and that accept takes (one never submitted first).
-	// The least recent, not the next in turn: a ticket abandoned unsubmitted (a rebuild's Detach, a released ticket) leaves its slot
-	// to be taken again, so abandoned tickets never move the ring on to a run of the current frame.
-	uint32_t last = range.second;
-	const auto oldest = [&](auto&& accept) {
-		uint32_t best = UINT32_MAX;
-		for (uint32_t slot = first; slot < last; ++slot) {
-			const auto& entry = state.slots[slot];
-			if (entry.reserved || !accept(entry)) continue;
-			if (best == UINT32_MAX || entry.submission < state.slots[best].submission) best = slot;
+	// An idle copy first, the least recently submitted. Else the least recently submitted copy whose last run may be waited for:
+	// done, or behind a seal (never a run that may still be in the host's stream). A host that never sealed hands its runs to the
+	// device itself, so then every run may be waited for.
+	RunLease* idle = nullptr;
+	RunLease* waitable = nullptr;
+	for (auto* copy : copies) {
+		if (copy->state == RunLease::State::Open) continue;
+		if (copy->state == RunLease::State::Submitted && PointsReached(copy->points)) RetireLease(*copy, &state);
+		if (copy->state == RunLease::State::Free) {
+			if (!idle || copy->submission < idle->submission) idle = copy;
+			continue;
 		}
-		return best;
-	};
-	if (grows) {
-		if (const auto slot = oldest(old); slot != UINT32_MAX) return slot;
-		// Too recent: a slot more instead of the wait, up to the ring's capacity.
-		auto& active = state.ringActive[epochIndex];
-		while (active < state.ringCapacity[epochIndex]) {
-			const uint32_t slot = first + active++;
-			last = first + active;
-			state.ringGrowths.fetch_add(1, std::memory_order_relaxed);
-			BT_ZONE_SCOPE("ORG.Host.RingGrow");
-			if (!state.slots[slot].reserved && old(state.slots[slot])) return slot;
+		if ((copy->seal < seals || seals == 0) && (!waitable || copy->submission < waitable->submission)) waitable = copy;
+	}
+	RunLease* taken = idle ? idle : waitable;
+	if (!taken) {
+		// Every copy holds a run that is neither sealed nor done: the ticket waits for the next seal or for one of those runs to
+		// complete, and the render thread skips the epoch's runs meanwhile.
+		state.copiesBusy.fetch_add(1, std::memory_order_relaxed);
+		if (!state.copiesBusyLogged[epochIndex]) {
+			state.copiesBusyLogged[epochIndex] = 1;
+			spdlog::warn("GraphHost: epoch {} has no published copy to submit: each of its {} copies holds a run neither sealed nor done (seals "
+				"now {}). Its runs are skipped (EpochCopiesBusyError) until the next SealSubmitted or until one of those runs completes",
+				state.epochs[epochIndex], copies.size(), seals);
 		}
+		state.copiesBusyAt[epochIndex].store(seals, std::memory_order_release);
+		state.anyCopiesBusy.store(true, std::memory_order_seq_cst);
+		state.ticketWake.fetch_add(1, std::memory_order_release);
+		state.ticketWake.notify_all();
+		return nullptr;
 	}
-	// A slot whose run a seal flushed is waited for (more backpressure, never a deadlock).
-	if (const auto slot = oldest(waitable); slot != UINT32_MAX) return slot;
-	const auto blocking = oldest(any);
-	if (blocking == UINT32_MAX && !grows)
-		throw std::logic_error(state.rings ? "Every frame slot of the epoch's ring is held by an unsubmitted ticket"
-			: "Every frame slot is held by an unsubmitted ticket");
-	// Every slot holds a run neither sealed nor done: the ticket waits for the next seal or for one of those runs to complete, and the
-	// render thread skips the epoch's runs meanwhile.
-	state.ringFulls.fetch_add(1, std::memory_order_relaxed);
-	if (!state.ringFullLogged[epochIndex]) {
-		state.ringFullLogged[epochIndex] = 1;
-		if (blocking != UINT32_MAX)
-			spdlog::warn("GraphHost: epoch {} has no frame slot to prepare: each of its ring's {} slots holds a run neither sealed nor done "
-				"(the oldest: slot {}, submission {}, after seal {}; seals now {}). Its runs are skipped (EpochRingFullError) until the next "
-				"SealSubmitted or until one of those runs completes", state.epochs[epochIndex], last - first, blocking,
-				state.slots[blocking].submission, state.slots[blocking].seal, seals);
-		else
-			spdlog::warn("GraphHost: epoch {} has no frame slot to prepare: each of its ring's {} slots is held by an unsubmitted ticket. Its "
-				"runs are skipped (EpochRingFullError) until the next SealSubmitted", state.epochs[epochIndex], last - first);
+	if (taken->state == RunLease::State::Submitted) {
+		// Sealed: on the device, so the wait ends. Its lists, statistics range and pinned regions are reused next.
+		BT_ZONE_SCOPE("ORG.Host.WaitCopy");
+		state.copyWaits.fetch_add(1, std::memory_order_relaxed);
+		for (const auto& [timeline, value] : taken->points) (void)(*timeline)->HostWait(value);
+		RetireLease(*taken, &state);
 	}
-	state.ringFullAt[epochIndex].store(seals, std::memory_order_release);
-	state.anyRingFull.store(true, std::memory_order_seq_cst);
-	state.ticketWake.fetch_add(1, std::memory_order_release);
-	state.ticketWake.notify_all();
-	return UINT32_MAX;
+	std::scoped_lock lock(m_leaseMutex);
+	if (++taken->generation == 0) taken->generation = 1;
+	taken->state = RunLease::State::Open;
+	m_leasesPeak = (std::max)(m_leasesPeak, ++m_leasesInFlight);
+	return taken;
 }
 
-void GraphHost::PrepareTicket(Async& state, uint32_t epochIndex, int32_t requestedSlot) {
+void GraphHost::PrepareTicket(Async& state, uint32_t epochIndex, RunLease* reprepare) {
 	BT_ZONE_SCOPE("ORG.Host.PrepareTicket.Worker");
 	auto& graph = *m_instances[state.instanceOf[epochIndex]].graph;
-	// A stale ticket's reprepare takes the slot it held, whose last run it already waited for. Otherwise the epoch's ring gives the
-	// slot, or none: then nothing is prepared until a seal or a completion frees one (EpochRingFullError meanwhile).
-	const uint32_t slot = requestedSlot >= 0 ? static_cast<uint32_t>(requestedSlot) : RingSlot(state, epochIndex);
-	if (slot == UINT32_MAX) return;
-	auto& entry = state.slots[slot];
+	// A stale ticket's reprepare takes the lease it held: its latch regions were written for it. Otherwise a new run lease, or a
+	// published copy's for a revision-driven epoch, or none: then nothing is prepared until a seal or a completion frees a copy
+	// (EpochCopiesBusyError meanwhile).
+	RunLease* lease = reprepare;
+	if (!lease) lease = state.revisionDriven[epochIndex] ? TakeCopyLease(state, epochIndex) : &OpenLease(&state);
+	if (!lease) return;
 	runtime::ScopedActiveGraphServices services(graph.GetUploadService(), graph.GetDescriptorService());
-	WaitSlot(state, slot, epochIndex);
-	// The render thread records this ticket's uploads into an open list: resetting and beginning it is several
-	// microseconds of driver work that belongs here. Begin takes the list's allocator claim, which the render thread
-	// gives up after closing the list (SubmitTicket).
-	state.uploadPool->Begin(state.uploadLists[slot]);
-	// An external epoch's uploads secondary: recycled here, begun where it is recorded.
-	state.uploadSecondaryPool->Begin(state.uploadSecondaries[slot]);
-	// The slot's queue upload lists likewise: their last submission went ahead of a batch of the slot's last ticket on their queue,
-	// whose completion the wait above covers.
-	auto& queueUploadLists = state.queueUploadLists[slot];
-	for (size_t queue = 0; queue < queueUploadLists.size() && queue < state.queueUploadKinds.size(); ++queue) {
+	// The render thread records this ticket's uploads into an open list: resetting and beginning it is several microseconds of
+	// driver work that belongs here. Begin takes the list's allocator claim, which the render thread gives up after closing the
+	// list (SubmitTicket). A new lease's lists come from the pools; a reprepare's are begun again.
+	state.uploadPool->Begin(lease->upload);
+	// An external epoch's uploads secondary: recycled with the lease, begun where it is recorded.
+	state.uploadSecondaryPool->Begin(lease->uploadSecondary);
+	// The run's queue upload lists likewise.
+	lease->queueUploads.resize(state.queueUploadKinds.size());
+	for (size_t queue = 0; queue < state.queueUploadKinds.size(); ++queue) {
 		if (!state.queueUploadKinds[queue]) continue;
-		state.queueUploadPools[static_cast<size_t>(*state.queueUploadKinds[queue])]->Begin(queueUploadLists[queue]);
+		state.queueUploadPools[static_cast<size_t>(*state.queueUploadKinds[queue])]->Begin(lease->queueUploads[queue]);
 	}
 	// The descriptors are released here; the objects behind them and the deferred deletions are freed on the runtime's deleter
 	// thread. A driver free can block until the GPU is done with the memory. The GPU may be waiting for a signal of work this
 	// thread prepares, so a free here could wait forever.
 	m_desc.runtime->RetireDetached();
-	entry.reserved = true;
 	std::shared_ptr<Async::Ticket> ticket;
 	// The epoch's own preparation: its passes' Prepare and recording, the bindless views they resolve. A failure here is the
 	// epoch's alone (FailAsyncEpoch); the host's thread and the other epochs go on.
 	std::string error;
 	try {
 		if (state.revisionDriven[epochIndex]) {
-			// Nothing from live state: the ticket admits the revisions' recordings for its slot, the ones still held.
-			ticket = graph.PrepareRevisionTicket(state.epochs[epochIndex], static_cast<uint32_t>(slot), state.hostFrame++);
+			// Nothing from live state: the ticket admits the revisions' recordings' copies for its run, the ones still held.
+			ticket = graph.PrepareRevisionTicket(state.epochs[epochIndex], lease->Ref(), state.hostFrame++);
 			auto& live = state.liveRecordings[epochIndex];
 			std::erase_if(live, [](const auto& a_recording) { return a_recording.expired(); });
 			for (const auto& weak : live)
@@ -1682,13 +1770,8 @@ void GraphHost::PrepareTicket(Async& state, uint32_t epochIndex, int32_t request
 		} else {
 			Async::Preparation preparation;
 			const auto version = state.backingVersion.load(std::memory_order_acquire);
-			ticket = graph.PreparePersistentTicket(m_device, state.epochs[epochIndex], static_cast<uint32_t>(slot), state.hostFrame++, version);
+			ticket = graph.PreparePersistentTicket(m_device, state.epochs[epochIndex], lease->Ref(), state.hostFrame++, version);
 			RenderGraph::SetPersistentTicketHostTag(*ticket, version);
-			// The revisions' recordings still held, as alternatives the submitting thread may take instead (UseEpochRecording).
-			auto& live = state.liveRecordings[epochIndex];
-			std::erase_if(live, [](const auto& a_recording) { return a_recording.expired(); });
-			for (const auto& weak : live)
-				if (const auto recording = weak.lock()) AddRevisionCandidate(state, epochIndex, *ticket, *recording);
 		}
 	} catch (const std::exception& e) {
 		error = e.what();
@@ -1696,19 +1779,14 @@ void GraphHost::PrepareTicket(Async& state, uint32_t epochIndex, int32_t request
 		error = "unknown exception";
 	}
 	if (!error.empty() || !ticket) {
-		// The slot is free again: no ticket holds it. A ticket made before the failure gives up what it prepared.
-		entry.reserved = false;
-		// Nothing records the slot's upload lists for this ticket. Give up their allocator claims. The slot's next ticket
-		// resets them.
-		state.uploadLists[slot].EndRecording();
-		state.uploadSecondaries[slot].EndRecording();
-		for (auto& queueUploads : state.queueUploadLists[slot]) queueUploads.EndRecording();
+		// The lease is free again: no ticket holds it. A ticket made before the failure gives up what it prepared.
 		if (ticket) {
 			try {
 				(void)graph.CompletePersistentTicket(*ticket, {});
 			} catch (...) {
 			}
 		}
+		ReleaseLease(*lease, &state);
 		FailAsyncEpoch(state, epochIndex, error.empty() ? std::string("no ticket was prepared") : std::move(error));
 		return;
 	}
@@ -1737,10 +1815,10 @@ void GraphHost::FailAsyncEpoch(Async& state, uint32_t epochIndex, std::string er
 }
 
 void GraphHost::AddRevisionCandidate(Async& state, uint32_t epochIndex, RenderGraph::PersistentTicket& ticket, const EpochRecording& recording) {
-	const uint32_t slot = RenderGraph::PersistentTicketSlot(ticket);
-	if (slot < recording.firstSlot || slot - recording.firstSlot >= recording.slots.size())
-		throw std::logic_error("A revision recording does not cover its epoch's ticket slot");
-	m_instances[state.instanceOf[epochIndex]].graph->AddPersistentTicketCandidate(ticket, recording.slots[slot - recording.firstSlot]);
+	const auto run = RenderGraph::PersistentTicketRun(ticket);
+	if (!run.Published() || run.copy >= recording.copies.size() || !recording.copies[run.copy])
+		throw std::logic_error("A revision recording has no copy for its epoch's ticket");
+	m_instances[state.instanceOf[epochIndex]].graph->AddPersistentTicketCandidate(ticket, recording.copies[run.copy]);
 }
 
 bool GraphHost::CanUseEpochRecording(const EpochRecording& recording, std::string* why) const {
@@ -1748,14 +1826,13 @@ bool GraphHost::CanUseEpochRecording(const EpochRecording& recording, std::strin
 		if (why) *why = reason;
 		return false;
 	};
-	if (!m_async || !m_submittingTicket) return fail("not inside a live async epoch's submission");
+	if (!m_async || !m_submittingTicket) return fail("not inside an async epoch's submission");
 	const auto& async = *m_async;
-	if (async.revisionDriven[m_submittingIndex]) return fail("a revision-driven epoch (its recording is SubmitEpoch's)");
+	if (!async.revisionDriven[m_submittingIndex]) return fail("a live epoch records every run (it takes no revision recording)");
 	if (recording.epoch != async.epochs[m_submittingIndex]) return fail("recorded for another epoch");
-	const uint32_t slot = RenderGraph::PersistentTicketSlot(*m_submittingTicket);
-	if (slot < recording.firstSlot || slot - recording.firstSlot >= recording.slots.size() || !recording.slots[slot - recording.firstSlot])
-		return fail("no recording for the ticket's slot");
-	return RenderGraph::CanBindPersistentTicketRecording(*m_submittingTicket, *recording.slots[slot - recording.firstSlot],
+	const auto run = RenderGraph::PersistentTicketRun(*m_submittingTicket);
+	if (!run.Published() || run.copy >= recording.copies.size() || !recording.copies[run.copy]) return fail("no copy for the ticket's run");
+	return RenderGraph::CanBindPersistentTicketRecording(*m_submittingTicket, *recording.copies[run.copy],
 		async.backingVersion.load(std::memory_order_acquire), why);
 }
 
@@ -1793,36 +1870,37 @@ void GraphHost::StopAsync() {
 			if (node->done) node->done(nullptr, dropped);
 	}
 	async->pendingRequests.clear();
-	// Unsubmitted tickets are abandoned; submitted work keeps its slots' completions for the synchronous path.
-	if (!async->failed.load()) {
-		for (uint32_t index = 0; index < async->epochs.size(); ++index)
-			if (auto ticket = async->cells[index].exchange(nullptr))
+	// Unsubmitted tickets are abandoned, and their leases given back.
+	for (uint32_t index = 0; index < async->epochs.size(); ++index)
+		if (auto ticket = async->cells[index].exchange(nullptr)) {
+			if (!async->failed.load())
 				if (auto& graph = m_instances[async->instanceOf[index]].graph) (void)graph->CompletePersistentTicket(*ticket, {});
-	}
-	for (uint32_t slot = 0; slot < async->slots.size() && slot < m_slotCompletions.size(); ++slot) {
-		auto& completion = m_slotCompletions[slot];
-		completion.points = async->slots[slot].points;
-		completion.frameNumber = async->slots[slot].hostFrame;
-		completion.submission = async->slots[slot].submission;
-		completion.seal = async->slots[slot].seal;
-		completion.pending = async->slots[slot].pending;
-	}
+			ReleaseLease(*m_leaseTable[RenderGraph::PersistentTicketRun(*ticket).lease].load(std::memory_order_acquire), async.get());
+		}
 	m_frameNumber = (std::max)(m_frameNumber, async->hostFrame);
 	if (auto* graph = AnyGraph())
 		if (auto* uploads = graph->GetUploadService()) uploads->SetStagedUploadsRecordedDirectly(false);
-	// The render thread's upload lists may still be executing: wait for the queue before they go.
-	for (auto& slot : async->slots) {
-		bool complete = true;
-		for (const auto& [timeline, value] : slot.points)
-			if ((*timeline)->HostWait(value) != rhi::Result::Ok) complete = false;
-		if (!complete) {
-			if (slot.resourceOwner) m_uncertainExecutionOwners.push_back(std::move(slot.resourceOwner));
-			if (slot.keepAlive) m_uncertainUploadOwners.push_back(std::move(slot.keepAlive));
+	// Every run of the host's own: its lists came from this state's pools, which go with it. Their work is waited for, then they
+	// retire. An external run waits for its client's point: it holds no lists, and whoever retires runs next retires it.
+	{
+		std::vector<RunLease*> runs;
+		{
+			std::scoped_lock lock(m_leaseMutex);
+			for (const auto& lease : m_leaseStore)
+				if (lease->state != RunLease::State::Free && !lease->external) runs.push_back(lease.get());
+		}
+		for (auto* lease : runs) {
+			bool complete = true;
+			for (const auto& [timeline, value] : lease->points)
+				if ((*timeline)->HostWait(value) != rhi::Result::Ok) complete = false;
+			if (!complete) {
+				if (lease->resourceOwner) m_uncertainExecutionOwners.push_back(std::move(lease->resourceOwner));
+				if (lease->keepAlive) m_uncertainUploadOwners.push_back(std::move(lease->keepAlive));
+			}
+			if (lease->state == RunLease::State::Submitted) RetireLease(*lease, async.get());
+			else ReleaseLease(*lease, async.get());
 		}
 	}
-	// Every slot's work is done (or its owners kept as uncertain): the kept recordings can go.
-	for (auto& instance : m_instances)
-		if (instance.graph) instance.graph->ClearKeptPersistentRecordings();
 	if (async->uncertainResourceOwner)
 		m_uncertainExecutionOwners.push_back(std::move(async->uncertainResourceOwner));
 	if (async->uncertainUploadOwner)
@@ -1830,27 +1908,21 @@ void GraphHost::StopAsync() {
 }
 
 GraphHost::AsyncStats GraphHost::TakeAsyncStats() noexcept {
-	m_asyncStats.recorded = m_asyncStats.kept = m_asyncStats.reused = m_asyncStats.adopted = 0;
+	m_asyncStats.recorded = 0;
 	m_asyncStats.predicted = m_asyncStats.planned = 0;
-	m_asyncStats.held = m_asyncStats.heldPackets = 0;
 	for (auto& instance : m_instances) {
 		if (!instance.graph) continue;
 		const auto recordings = instance.graph->TakePersistentRecordingStats();
-		m_asyncStats.held += recordings.held;
-		m_asyncStats.heldPackets += recordings.heldPackets;
 		m_asyncStats.recorded += recordings.recorded;
-		m_asyncStats.kept += recordings.kept;
-		m_asyncStats.reused += recordings.reused;
-		m_asyncStats.adopted += recordings.adopted;
 		m_asyncStats.predicted += recordings.predicted;
 		m_asyncStats.planned += recordings.planned;
 	}
 	if (m_async) {
-		m_asyncStats.revisionSlotsRecorded = m_async->revisionSlotsRecorded.exchange(0, std::memory_order_relaxed);
+		m_asyncStats.revisionCopiesRecorded = m_async->revisionCopiesRecorded.exchange(0, std::memory_order_relaxed);
 		m_asyncStats.revisionRecordings = m_async->revisionRecordings.exchange(0, std::memory_order_relaxed);
 		m_asyncStats.wakesSkipped = std::exchange(m_async->wakesSkipped, 0);
-		m_asyncStats.ringGrowths = m_async->ringGrowths.exchange(0, std::memory_order_relaxed);
-		m_asyncStats.ringFull = m_async->ringFulls.exchange(0, std::memory_order_relaxed);
+		m_asyncStats.copiesBusy = m_async->copiesBusy.exchange(0, std::memory_order_relaxed);
+		m_asyncStats.copyWaits = m_async->copyWaits.exchange(0, std::memory_order_relaxed);
 	}
 	return std::exchange(m_asyncStats, {});
 }
@@ -1909,14 +1981,16 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 		last = now;
 	};
 	auto& graph = *m_instances[async.instanceOf[index]].graph;
-	const uint32_t slot = RenderGraph::PersistentTicketSlot(*ticket);
-	m_asyncSlot = slot;
+	const auto run = RenderGraph::PersistentTicketRun(*ticket);
+	const uint32_t slot = run.lease;
+	// The ticket's lease: published by the host's thread before the ticket, and the render thread's until it posts the ticket back.
+	auto& lease = *m_leaseTable[slot].load(std::memory_order_acquire);
+	m_asyncRun = run;
 	runtime::ScopedActiveGraphServices services(graph.GetUploadService(), graph.GetDescriptorService());
-	// The host's thread waited for this slot before preparing the ticket: its upload pages are free again. What retires from
+	// The lease's last run retired before the host's thread opened it: its upload pages are free again. What retires from
 	// the deletion queues goes to the host's thread with the submission: its driver frees take the device's memory locks,
 	// which the render thread must not wait on here.
-	if (auto* uploads = graph.GetUploadService(); uploads && !ExternalSlotInUse(slot))
-		uploads->ProcessDeferredReleases(static_cast<uint32_t>(slot));
+	if (auto* uploads = graph.GetUploadService()) uploads->ProcessDeferredReleases(slot);
 	std::shared_ptr<void> retired = m_desc.runtime->RetireElsewhere();
 	lap(m_lastTimings.releaseUs);
 	if (beforeSubmit) {
@@ -1930,65 +2004,49 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 		beforeSubmit(graph);
 	}
 	lap(m_lastTimings.beforePrepareUs);
-	// A revision-driven epoch: the revision's recording for this slot, recorded ahead. Never prepared again: a recording that
-	// does not match the ticket is the caller's error.
-	// A live epoch's alternative: the revision's recording the commit chose (UseEpochRecording), admitted as the ticket's candidate.
+	// A revision-driven epoch: the revision's copy for this run, recorded ahead. Never prepared again: a recording that does not
+	// match the ticket is the caller's error. A live epoch takes none: it records every run.
 	if (!recording) recording = std::exchange(m_chosenRecording, nullptr);
 	m_chosenRecording.reset();
 	if (!async.revisionDriven[index] && recording) {
-		std::string why;
-		const uint32_t position = slot - recording->firstSlot;
-		const bool bound = recording->epoch == async.epochs[index] && slot >= recording->firstSlot && position < recording->slots.size()
-			&& RenderGraph::BindPersistentTicketRecording(*ticket, recording->slots[position], async.backingVersion.load(std::memory_order_acquire), &why);
-		if (!bound) {
-			Async::Message discard;
-			discard.kind = Async::Message::Kind::Discard;
-			discard.epochIndex = index;
-			discard.ticket = std::move(ticket);
-			postControl(discard);
-			throw std::logic_error("A revision's recording chosen for a live epoch is not its ticket's candidate: " + why);
-		}
-		++m_asyncStats.revisionSubmissions;
+		Async::Message discard;
+		discard.kind = Async::Message::Kind::Discard;
+		discard.epochIndex = index;
+		discard.ticket = std::move(ticket);
+		postControl(discard);
+		throw std::logic_error("A revision's recording was given for a live epoch, which records every run");
 	}
-	const bool chosen = !async.revisionDriven[index] && recording;
 	if (async.revisionDriven[index]) {
 		std::string why = "no recording given";
-		const uint32_t position = recording ? slot - recording->firstSlot : 0;
-		const bool bound = recording && recording->epoch == async.epochs[index] && slot >= recording->firstSlot && position < recording->slots.size()
-			&& RenderGraph::BindPersistentTicketRecording(*ticket, recording->slots[position], async.backingVersion.load(std::memory_order_acquire), &why);
+		const bool bound = recording && recording->epoch == async.epochs[index] && run.Published() && run.copy < recording->copies.size()
+			&& RenderGraph::BindPersistentTicketRecording(*ticket, recording->copies[run.copy], async.backingVersion.load(std::memory_order_acquire), &why);
 		if (!bound) {
 			Async::Message discard;
 			discard.kind = Async::Message::Kind::Discard;
 			discard.epochIndex = index;
 			discard.ticket = std::move(ticket);
 			postControl(discard);
-			throw std::logic_error("A revision-driven epoch was submitted without its revision's recording for the slot: " + why);
+			throw std::logic_error("A revision-driven epoch was submitted without its revision's copy for the run: " + why);
 		}
 		++m_asyncStats.revisionSubmissions;
 	}
-	// Stale, but recorded before for what its passes depend on now (Desc::reuseRecordings): it takes that recording, and
-	// nothing is prepared again.
-	if (!async.revisionDriven[index] && !chosen && !async.Current(*ticket)
-		&& graph.AdoptKeptPersistentRecording(*ticket, async.backingVersion.load(std::memory_order_acquire))
-		&& !async.Current(*ticket))
-		throw std::logic_error("An adopted recording left its ticket stale");
-	if (!async.revisionDriven[index] && !chosen && !async.Current(*ticket)) {
+	if (!async.revisionDriven[index] && !async.Current(*ticket)) {
 		BT_ZONE_SCOPE("ORG.Host.ReprepareStaleTicket");
 		m_asyncStats.staleBacking += RenderGraph::PersistentTicketCurrent(*ticket);
 		// Prepared before beforeSubmit changed what a pass depends on, or a version it resolved: prepare it again, for the
-		// same slot (its latch region was just written), and wait. The new one is prepared after the change, so it is current.
+		// same run (its latch regions were just written), and wait. The new one is prepared after the change, so it is current.
 		++m_asyncStats.stale;
 		Async::Message discard;
 		discard.kind = Async::Message::Kind::Discard;
 		discard.epochIndex = index;
 		discard.ticket = std::move(ticket);
-		// The discard and the reprepare are one message, so the worker prepares the replacement into this slot before it
-		// can prepare the epoch's next ticket anywhere else (the Discard handler).
-		discard.slot = static_cast<int32_t>(slot);
+		// The discard and the reprepare are one message, so the worker prepares the replacement into this lease before it
+		// can prepare the epoch's next ticket into another (the Discard handler).
+		discard.reprepare = true;
 		postControl(discard);
 		ticket = async.WaitTicket(index);
-		if (RenderGraph::PersistentTicketSlot(*ticket) != slot)
-			throw std::logic_error("A reprepared async epoch ticket is not for the slot whose upload list the render thread records");
+		if (!(RenderGraph::PersistentTicketRun(*ticket) == run))
+			throw std::logic_error("A reprepared async epoch ticket is not for the run whose upload list the render thread records");
 	}
 	// The submitted ticket's frame: one prepared again above has a new number, and the completed-frame callback
 	// reports it by that one.
@@ -2029,12 +2087,12 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 		graph.AbandonPersistentTicketAdmission(*ticket);
 	};
 	// The uploads queued since the last submission, as plain copies ahead of the ticket (the list ends with a full barrier).
-	auto& list = async.uploadLists[slot];  // begun by the host's thread (PrepareTicket)
+	auto& list = lease.upload;  // begun by the host's thread (PrepareTicket)
 	std::shared_ptr<void> keepAlive;
 	bool recorded = false;
 	// An external epoch's uploads go into the slot's secondary, which its execution runs first: nothing is submitted here.
 	const bool external = graph.IsExternalPersistentEpoch(async.epochs[index]);
-	auto& secondary = async.uploadSecondaries[slot];
+	auto& secondary = lease.uploadSecondary;
 	if (external) {
 		rhi::SecondaryInheritance outside{};
 		outside.insideRendering = false;
@@ -2047,9 +2105,9 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 	}
 	auto commands = external ? secondary.list.Get() : list.list.Get();
 	auto& recordedLists = async.recordedLists;
-	// Queue-scoped uploads (Desc::queueScopedUploads): the slot's open lists of the other queues, which take the uploads their
+	// Queue-scoped uploads (Desc::queueScopedUploads): the run's open lists of the other queues, which take the uploads their
 	// queue uses first, and go to it just ahead of the ticket's first batch there (SubmitPersistentTicket).
-	auto& queueUploadLists = async.queueUploadLists[slot];
+	auto& queueUploadLists = lease.queueUploads;
 	const bool queueScoped = m_desc.queueScopedUploads;
 	for (size_t queue = 0; queue < async.queueLists.size(); ++queue)
 		async.queueLists[queue] = queueScoped && queue < queueUploadLists.size() && queueUploadLists[queue].list
@@ -2061,7 +2119,7 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 		BT_ZONE_SCOPE("ORG.Host.CloseUploadList");
 		list.list->End();
 		if (external) secondary.list->End();
-		// Every one the host's thread began, used or not (it begins them all again for the slot's next ticket).
+		// Every one the host's thread began, used or not (they go back to their pools when the run retires).
 		for (auto& queueUploads : queueUploadLists)
 			if (queueUploads.list) queueUploads.list->End();
 		// Closed, so their allocators' claims go. The secondary was reset by the host's thread even when unused.
@@ -2092,7 +2150,7 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 	Async::Message submitted;
 	submitted.kind = Async::Message::Kind::Submitted;
 	submitted.number = ++m_submissions;
-	// The frame boundaries before it: a later seal flushed it (the epochs of Desc::epochRuns wait for its slot only then).
+	// The frame boundaries before it: a later seal flushed it (a published copy waits for its run only then).
 	submitted.seal = m_seals.load(std::memory_order_relaxed);
 	submitted.epochIndex = index;
 	submitted.keepAlive = std::move(keepAlive);
@@ -2143,7 +2201,7 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 	assigning.reset();
 	sequencer.unlock();
 	lap(m_lastTimings.submitUs);
-	// The handoff and release lists the submission recorded: kept until the slot completes, with the uploads' staging.
+	// The handoff and release lists the submission recorded: kept until the run completes, with the uploads' staging.
 	if (!submitted.submission.leases.empty()) {
 		struct Kept {
 			std::shared_ptr<void> uploads;
@@ -2172,53 +2230,8 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 		throw;
 	}
 	lap(m_lastTimings.postUs);
-	NoteSlotSubmitted(slot);
 	++m_asyncStats.submitted;
 	if (!ok) throw std::runtime_error("Async epoch submission failed");
-}
-
-void GraphHost::NoteExternalSlotUse(uint32_t slot, std::shared_ptr<rhi::TimelinePtr> timeline, uint64_t value) {
-	if (!timeline || !*timeline || !value || !m_frameSlots) return;
-	slot %= m_frameSlots;
-	if (m_externalSlotValues.size() != m_frameSlots) m_externalSlotValues.assign(m_frameSlots, 0);
-	m_externalTimeline = timeline;
-	m_externalSlotValues[slot] = (std::max)(m_externalSlotValues[slot], value);
-	DescriptorHeapManager::GetInstance().PublishQueueFenceSnapshot({ DescriptorHeapManager::QueueFenceSnapshotPoint{ .timeline = timeline->Get(), .value = value } });
-	// The client's own work at the slot may use ORG objects too (draws in its stream that read a graph's buffers). No ORG queue
-	// sees that work, so deferred deletions wait for its value as descriptor releases do.
-	m_desc.runtime->NoteExternalPoint(timeline->Get(), value);
-}
-
-void GraphHost::BeginExternalFrameSlot(uint32_t slot) {
-	m_externalSlot = m_frameSlots ? slot % m_frameSlots : 0u;
-	// The client waited out its own last work at the slot (the contract above). The host's last work there must be done too, or
-	// the slot is left to the host's next execution taking it, or to the client's next frame at it.
-	auto* graph = AnyGraph();
-	auto* uploads = graph ? graph->GetUploadService() : nullptr;
-	if (!uploads || (m_externalSlot < m_slotSubmitted.size() && !m_slotSubmitted[m_externalSlot].Reached())) return;
-	uploads->ProcessDeferredReleases(m_externalSlot);
-	if (!m_async) {
-		m_desc.runtime->Retire();
-		return;
-	}
-	if (auto retired = m_desc.runtime->RetireElsewhere()) m_externalRetired.push_back(std::move(retired));
-	// No submission came to take them for a round of slots: they go to the runtime's deleter rather than being kept.
-	if (m_externalRetired.size() > m_frameSlots)
-		for (auto& retired : std::exchange(m_externalRetired, {})) m_desc.runtime->DestroyDetached(std::move(retired), "an external slot's deferred deletions");
-}
-
-void GraphHost::NoteSlotSubmitted(uint32_t slot) {
-	if (m_slotSubmitted.size() != m_frameSlots) m_slotSubmitted.resize(m_frameSlots);
-	m_slotSubmitted[slot % m_frameSlots] = SubmittedPoint();
-}
-
-bool GraphHost::ExternalSlotInUse(uint32_t slot) const noexcept {
-	if (!m_externalTimeline || !*m_externalTimeline || m_frameSlots == 0 || m_externalSlotValues.size() != m_frameSlots) return false;
-	const uint64_t value = m_externalSlotValues[slot % m_frameSlots];
-	if (!value) return false;
-	const uint64_t completed = (*m_externalTimeline)->GetCompletedValue();
-	// UINT64_MAX: a lost device, whose pending work will never read anything.
-	return completed != UINT64_MAX && completed < value;
 }
 
 } // namespace org

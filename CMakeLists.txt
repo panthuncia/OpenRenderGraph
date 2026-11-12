@@ -117,6 +117,7 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PreparedTablePublisher.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RecordingContext.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/LatchBlock.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/FrameArena.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/StagedUploadBatch.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/PreparedTablePublisher.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/DeclaredTableLayout.h"
@@ -553,9 +554,9 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests.StreamOpen COMMAND OpenRenderGraphPersistentVulkanHostTests stream open)
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests.StreamHome COMMAND OpenRenderGraphPersistentVulkanHostTests stream open home)
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests.Arena COMMAND OpenRenderGraphPersistentVulkanHostTests arena)
-            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.Rings COMMAND OpenRenderGraphPersistentVulkanHostTests rings)
-            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.RingsOpen COMMAND OpenRenderGraphPersistentVulkanHostTests rings open)
-            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.RingsWide COMMAND OpenRenderGraphPersistentVulkanHostTests rings-wide)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.Leases COMMAND OpenRenderGraphPersistentVulkanHostTests leases)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.LeasesOpen COMMAND OpenRenderGraphPersistentVulkanHostTests leases open)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.LeasesWide COMMAND OpenRenderGraphPersistentVulkanHostTests leases-wide)
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests.ReuseOpen COMMAND OpenRenderGraphPersistentVulkanHostTests reuse open)
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests.RevisionOpen COMMAND OpenRenderGraphPersistentVulkanHostTests revision open)
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests.ExternalOpen COMMAND OpenRenderGraphPersistentVulkanHostTests external open)

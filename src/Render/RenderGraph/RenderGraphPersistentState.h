@@ -174,8 +174,8 @@ using namespace persistent_impl;
 
 // ---------------------------------------------------------------------------
 
-// A segment's recorded packets, and what they were recorded for. Kept (RenderGraph::m_keptRecordings) when replayable: then
-// submitted by every ticket that takes it, one at a time (a frame slot's tickets follow each other's completion).
+// A segment's recorded packets, and what they were recorded for. A revision's published copy, when replayable: then submitted by
+// every ticket that takes it, one at a time (a copy's tickets follow each other's completion).
 struct RenderGraph::PersistentRecording {
 	std::shared_ptr<const compiler::RenderFrameSnapshot> snapshot;
 	std::vector<std::shared_ptr<const compiler::IPreparedExecutionBatch>> packets;
@@ -205,7 +205,8 @@ struct RenderGraph::PersistentRecording {
 struct RenderGraph::PersistentTicket {
 	uint32_t epoch = 0;
 	std::shared_ptr<detail::ExecutionRecord> execution;  // made by its preparation
-	uint32_t slot = 0;
+	uint32_t slot = 0;  // the run's lease index (its frame index)
+	RunRef run{};
 	uint64_t hostFrame = 0;
 	struct Segment {
 		// Until the ticket is admitted (AdmitPersistentTicket): the plan its body was recorded from (PreparePlan; for a
@@ -222,7 +223,7 @@ struct RenderGraph::PersistentTicket {
 		bool committed = false;  // and committed
 	};
 	std::vector<Segment> segments;
-	// Recordings a kept one replaced (AdoptKeptPersistentRecording): released by the owner thread, with the ticket.
+	// Recordings a candidate displaced: released by the owner thread, with the ticket.
 	std::vector<std::shared_ptr<const PersistentRecording>> replaced;
 	// What each prepared pass's preparation depended on (RenderGraphPass::RevisionHash).
 	std::vector<std::pair<const RenderGraphPass*, uint64_t>> revisions;

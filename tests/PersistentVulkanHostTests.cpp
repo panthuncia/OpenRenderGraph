@@ -25,6 +25,7 @@
 #include "Render/Runtime/DescriptorServiceAccess.h"
 #include "Render/Runtime/ThreadPoolTaskService.h"
 #include "OpenRenderGraph/GraphHost.h"
+#include "Render/LatchBlock.h"
 #include "Managers/Singletons/DescriptorHeapManager.h"
 #include "RenderPasses/Base/TypedRenderGraphPass.h"
 #include "Resources/Buffers/Buffer.h"
@@ -521,9 +522,9 @@ int TestContributors(rhi::Device device, const std::function<std::shared_ptr<org
 	rhi::PipelineLayoutHandle layout);
 
 static int Run(int argc, char** argv) {
-	// "reuse": async epochs that keep and resubmit their recordings (GraphHost::Desc::reuseRecordings).
-	// "external-reuse": "external" with its recordings kept. The late pass is replayable. Each execution of a kept
-	// recording records the late pass again.
+	// "reuse": async epochs that record replayable recordings (GraphHost::Desc::reuseRecordings). A live epoch's recording is
+	// still used once: every run records.
+	// "external-reuse": "external" with replayable recordings. The late pass is replayable.
 	const bool externalReuse = argc > 1 && std::strcmp(argv[1], "external-reuse") == 0;
 	const bool reuse = externalReuse || (argc > 1 && std::strcmp(argv[1], "reuse") == 0);
 	// "revision": a revision-driven epoch, set through the revisionEpochs of SetAsyncEpochs. It is recorded ahead for
@@ -549,13 +550,12 @@ static int Run(int argc, char** argv) {
 	// "stream": an external epoch with its write on the compute queue (the family's second queue): batches off the host's stream,
 	// and the stream's segments.
 	const bool stream = argc > 1 && std::strcmp(argv[1], "stream") == 0;
-	// "rings": an external async epoch that runs many times a frame (GraphHost::Desc::epochRuns), its executions held, as a host's
-	// stream holds them, and executed only at the frame's end, before SealSubmitted. Its ring grows instead of waiting for a run of
-	// the same frame, and a frame with more runs than the ring has slots skips the rest (EpochRingFullError) instead of hanging.
-	const bool rings = argc > 1 && (std::strcmp(argv[1], "rings") == 0 || std::strcmp(argv[1], "rings-wide") == 0);
-	// "rings-wide": the same, with a ring of 272 slots and 260 runs a frame, so slot indices pass 255 (they were 8-bit), and with
-	// recording reuse on, whose kept recordings are keyed by epoch and slot.
-	const bool wide = argc > 1 && std::strcmp(argv[1], "rings-wide") == 0;
+	// "leases": an external async epoch that runs many times a frame, its executions held, as a host's stream holds them, and
+	// executed only at the frame's end, before SealSubmitted. Each run takes a run lease of its own instead of waiting for a run of
+	// the same frame, and the leases retire once their runs complete. Also checks the frame arena's regions (LatchBlock).
+	const bool leases = argc > 1 && (std::strcmp(argv[1], "leases") == 0 || std::strcmp(argv[1], "leases-wide") == 0);
+	// "leases-wide": the same, with 260 runs a frame, so lease indices pass 255, and with replayable recordings.
+	const bool wide = argc > 1 && std::strcmp(argv[1], "leases-wide") == 0;
 	// "open" after the mode: async epochs on open executions, admitted at submission (no closed executions).
 	const bool open = argc > 2 && std::strcmp(argv[2], "open") == 0;
 	// "stream open home": the write also reads a host-owned texture, under external home states.
@@ -846,39 +846,40 @@ static int Run(int argc, char** argv) {
 				host.DestroyGraph();
 			}
 			runtime.reset();
-		} else if (rings) {
-			// Two frames in flight; epoch 0 sized for 4 runs a frame: a ring of 8 slots, of which it starts with 2. Wide: 136 runs a
-			// frame, a ring of 272 slots.
-			const uint32_t sizedRuns = wide ? 136u : 4u;
-			const uint32_t capacity = 2u * sizedRuns;
-			org::GraphHost::Desc desc{.queueBoundary = {.entry = true, .exit = true}, .framesInFlight = 2, .epochOrder = {0},
-				.closedExecutions = !open, .reuseRecordings = wide};
-			desc.epochRuns = {{.epoch = 0, .runsPerFrame = sizedRuns}};
-			REQUIRE(org::GraphHost::FrameSlotsFor(desc) == capacity, "frame slots: frames in flight times the epoch's runs a frame");
-			bool tooMany = false;
-			try {
-				auto invalid = desc;
-				invalid.epochRuns = {{.epoch = 0, .runsPerFrame = org::Runtime::kMaxSlots}};
-				(void)org::GraphHost::FrameSlotsFor(invalid);
-			} catch (const std::invalid_argument&) {
-				tooMany = true;
-			}
-			REQUIRE(tooMany, "no more frame slots than Runtime::kMaxSlots");
-			bool rejected = false;
-			try {
-				auto invalid = desc;
-				invalid.epochRuns = {{.epoch = 7, .runsPerFrame = 2}};
-				(void)org::GraphHost::FrameSlotsFor(invalid);
-			} catch (const std::invalid_argument&) {
-				rejected = true;
-			}
-			REQUIRE(rejected, "epochRuns names only epochs of the order");
-			auto runtime = org::Runtime::Create({.device = device.Get(), .backend = rhi::Backend::Vulkan, .slots = capacity,
+		} else if (leases) {
+			// Two frames in flight. The runtime starts with 4 statistics ranges and grows them with the leases in flight.
+			auto runtime = org::Runtime::Create({.device = device.Get(), .backend = rhi::Backend::Vulkan, .slots = 4,
 				.tasks = std::make_shared<org::runtime::ThreadPoolTaskService>(2)});
-			desc.runtime = runtime;
 			{
-				org::GraphHost host(desc);
-				REQUIRE(host.FrameSlots() == capacity, "the host's frame slots");
+				org::GraphHost host({.runtime = runtime, .queueBoundary = {.entry = true, .exit = true}, .framesInFlight = 2, .epochOrder = {0},
+					.closedExecutions = !open, .reuseRecordings = wide});
+				// The frame arena. A leased run's region is found again by every call for the run, zeroed when allocated, and freed
+				// with its lease. Two runs in flight have two regions. A published copy's region is pinned to its index.
+				{
+					auto block = org::LatchBlock::Create("test.latch", 64);
+					REQUIRE(block->Stride() == org::FrameArena::kAlignment, "a region is rounded up to the arena's alignment");
+					const org::RunRef run{3, 1, org::RunRef::kNoCopy};
+					const auto region = block->At(run);
+					bool zeroed = static_cast<bool>(region);
+					for (uint32_t i = 0; zeroed && i < region.size; ++i) zeroed = region.mapped[i] == std::byte{0};
+					REQUIRE(zeroed, "a run's region is zeroed");
+					block->WriteValue(run, 0, uint32_t{7});
+					REQUIRE(block->At(run).offset == region.offset && block->At(run).buffer == region.buffer && block->At(run).srvIndex == region.srvIndex,
+						"the writer and the recorder of a run find the same region");
+					const org::RunRef other{4, 1, org::RunRef::kNoCopy};
+					const auto otherRegion = block->At(other);
+					REQUIRE(otherRegion.offset != region.offset || otherRegion.buffer != region.buffer, "two runs in flight have two regions");
+					const auto copy = org::RunRef::Copy(9, 0);
+					const auto pinned = block->At(copy);
+					runtime->Arena()->ReleaseRun(3, 1);
+					const org::RunRef next{3, 2, org::RunRef::kNoCopy};
+					uint32_t word = 1;
+					std::memcpy(&word, block->At(next).mapped, sizeof(word));
+					REQUIRE(word == 0, "the index's next run reads zeros, not the last run's values");
+					REQUIRE(block->At(copy).offset == pinned.offset && block->At(copy).buffer == pinned.buffer, "a published copy's region stays");
+					runtime->Arena()->ReleaseRun(3, 2);
+					runtime->Arena()->ReleaseRun(4, 1);
+				}
 				auto program = CreateProgram(device.Get());
 				REQUIRE(program, "compute program");
 				auto scratch = org::Buffer::CreateSharedUnmaterialized(rhi::HeapType::DeviceLocal, kBytes, true);
@@ -898,8 +899,11 @@ static int Run(int argc, char** argv) {
 				input->SetDescriptorRequirements(inputViews);
 				input->SetName("test.input");
 				uint32_t value = 0;
+				// The runs the commits wrote for this frame (GraphHost::CurrentRun inside beforeSubmit).
+				std::vector<org::RunRef> frameRuns;
 				const auto upload = [&](org::RenderGraph&) {
 					BUFFER_UPLOAD(&value, sizeof(value), org::runtime::UploadTarget::FromShared(input), 0);
+					frameRuns.push_back(host.CurrentRun());
 				};
 				auto outputRevision = std::make_shared<std::atomic<uint64_t>>(1);
 				host.AddExtension("test.host", [&] { return std::make_unique<HostExtension>(input, scratch, output, program, outputRevision); });
@@ -911,7 +915,7 @@ static int Run(int argc, char** argv) {
 					const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
 					while (!finished.load(std::memory_order_acquire)) {
 						if (std::chrono::steady_clock::now() > deadline) {
-							std::puts("FAIL: rings: the frame did not finish (a wait for a run of the same frame)");
+							std::puts("FAIL: leases: the frame did not finish (a wait for a run of the same frame)");
 							std::fflush(stdout);
 							std::_Exit(1);
 						}
@@ -934,12 +938,19 @@ static int Run(int argc, char** argv) {
 						REQUIRE(executor.Execute(*execution) && device->WaitIdle() == rhi::Result::Ok, "a held execution at the frame's end");
 					held.clear();
 					REQUIRE(Matches(first, expected), "the frame's last run wrote last");
+					// Every run of the frame had a lease of its own.
+					for (size_t a = 0; a < frameRuns.size(); ++a) {
+						REQUIRE(frameRuns[a].Leased() && !frameRuns[a].Published(), "a live run is leased");
+						for (size_t b = 0; b < a; ++b) REQUIRE(!(frameRuns[a] == frameRuns[b]), "runs in flight have leases of their own");
+					}
+					frameRuns.clear();
 					host.SealSubmitted();
 					return 0;
 				};
 				(void)host.TakeAsyncStats();
-				// Six runs a frame, three times the frames in flight: the old ring of two slots waited for a run still held. Wide: 260
-				// runs a frame, so the ring grows past slot 255.
+				(void)host.TakeRunMemoryStats();
+				// Six runs a frame, three times the frames in flight: a ring of two slots would wait for a run still held. Wide: 260
+				// runs a frame.
 				const uint32_t kRuns = wide ? 260u : 6u;
 				const uint32_t kFrames = wide ? 3u : 6u;
 				for (uint32_t frame = 0; frame < kFrames; ++frame) {
@@ -952,43 +963,36 @@ static int Run(int argc, char** argv) {
 					}
 					if (const int failed = endFrame(value)) return failed;
 				}
-				const auto grown = host.TakeAsyncStats();
-				std::printf("rings: %llu submissions, %llu ring growths, %llu full\n", static_cast<unsigned long long>(grown.submitted),
-					static_cast<unsigned long long>(grown.ringGrowths), static_cast<unsigned long long>(grown.ringFull));
-				REQUIRE(grown.submitted == kFrames * kRuns && grown.ringGrowths >= kRuns - 2 && grown.ringGrowths <= capacity - 2
-					&& grown.ringFull == 0, "the ring grew instead of waiting for the frame's own runs, within its slots");
-				// More runs in one frame than the ring has slots: the ninth is skipped (nothing submitted), and nothing hangs.
-				uint32_t submitted = 0;
-				bool full = false;
-				uint32_t last = 0;
-				for (uint32_t run = 0; run < capacity + 4 && !full; ++run) {
-					value = 130000u + 10u * run;
-					try {
-						host.SubmitEpoch(0, upload);
-						auto execution = host.TakeExternalExecution();
-						REQUIRE(execution, "an external execution per run");
-						held.push_back(std::move(execution));
-						last = value;
-						++submitted;
-					} catch (const org::GraphHost::EpochRingFullError& e) {
-						full = true;
-						REQUIRE(e.epoch == 0 && e.capacity == capacity && !host.EpochFailed(0), "a full ring is not a failed epoch");
-					}
+				const auto stats = host.TakeAsyncStats();
+				// The host's thread retires the last frame's runs at its next wake-up.
+				const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+				while (host.TakeRunMemoryStats().leasesInFlight > 1 && std::chrono::steady_clock::now() < deadline) {
+					(void)host.NudgeHostThread();
+					std::this_thread::sleep_for(std::chrono::milliseconds(5));
 				}
-				std::printf("rings: %u runs before the ring was full\n", submitted);
-				REQUIRE(full && submitted == capacity, "the ring's capacity of runs fits between two seals, the next is skipped");
+				const auto memory = host.TakeRunMemoryStats();
+				std::printf("leases: %llu submissions, %u leases made, %u in flight now, %u statistics ranges, arena %llu chunks (%llu bytes)\n",
+					static_cast<unsigned long long>(stats.submitted), memory.leaseIndices, memory.leasesInFlight, memory.statisticsRanges,
+					static_cast<unsigned long long>(memory.arena.chunks), static_cast<unsigned long long>(memory.arena.chunkBytes));
+				REQUIRE(stats.submitted == kFrames * kRuns && stats.copiesBusy == 0, "every run submitted, none skipped");
+				REQUIRE(memory.leaseIndices >= kRuns && memory.leaseIndices <= 2 * kRuns + 4, "leases follow the runs in flight, reused once retired");
+				REQUIRE(memory.leasesInFlight <= 1, "the runs retire once they complete: only the next ticket's lease is open");
+				REQUIRE(memory.statisticsRanges >= memory.leaseIndices, "a statistics range per lease index");
+				// Four frames' worth of runs between two seals: all of them go through, nothing waits and nothing is skipped.
+				uint32_t last = 0;
+				for (uint32_t run = 0; run < 4 * kRuns; ++run) {
+					value = 130000u + 10u * run;
+					host.SubmitEpoch(0, upload);
+					auto execution = host.TakeExternalExecution();
+					REQUIRE(execution, "an external execution per run");
+					held.push_back(std::move(execution));
+					last = value;
+				}
 				if (const int failed = endFrame(last)) return failed;
 				REQUIRE(host.PollEpochFailures() == 0, "nothing reported");
-				// After the seal, the epoch runs again.
-				value = 140000u;
-				host.SubmitEpoch(0, upload);
-				auto after = host.TakeExternalExecution();
-				REQUIRE(after, "the run after the seal");
-				held.push_back(std::move(after));
-				if (const int failed = endFrame(value)) return failed;
-				REQUIRE(host.TakeAsyncStats().ringFull >= 1, "the full ring was counted");
 				REQUIRE(!counters.unbalanced && counters.locks.load() == counters.unlocks.load(), "balanced host queue locks");
 				host.SetAsyncEpochs({});
+				REQUIRE(host.TakeRunMemoryStats().leasesInFlight == 0, "stopping async epochs retires every lease");
 				host.DestroyGraph();
 			}
 			runtime.reset();
@@ -1075,7 +1079,7 @@ static int Run(int argc, char** argv) {
 				};
 				const auto firstVersion = versions->Current();
 				auto full = record(kCount, firstVersion);
-				REQUIRE(full && full->slots.size() == 3, "a revision's recording, one per slot of the epoch's ring");
+				REQUIRE(full && full->copies.size() == 3, "a revision's recording, one copy per frame in flight");
 				(void)host.TakeAsyncStats();
 				for (uint32_t frame = 0; frame < 6; ++frame) {
 					value = 40000u + 10u * frame;
@@ -1136,11 +1140,11 @@ static int Run(int argc, char** argv) {
 				host.SubmitEpoch(0, upload, {}, full);
 				REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "the host goes on after a rejected submission");
 				const auto stats = host.TakeAsyncStats();
-				std::printf("revision: %llu recordings (%llu slots), %llu submissions, %llu recorded at tickets, %llu prepared again\n",
-					static_cast<unsigned long long>(stats.revisionRecordings), static_cast<unsigned long long>(stats.revisionSlotsRecorded),
+				std::printf("revision: %llu recordings (%llu copies), %llu submissions, %llu recorded at tickets, %llu prepared again\n",
+					static_cast<unsigned long long>(stats.revisionRecordings), static_cast<unsigned long long>(stats.revisionCopiesRecorded),
 					static_cast<unsigned long long>(stats.revisionSubmissions), static_cast<unsigned long long>(stats.recorded),
 					static_cast<unsigned long long>(stats.stale));
-				REQUIRE(stats.revisionSubmissions == 13 && stats.stale == 0 && stats.revisionRecordings == 3 && stats.revisionSlotsRecorded == 9,
+				REQUIRE(stats.revisionSubmissions == 13 && stats.stale == 0 && stats.revisionRecordings == 3 && stats.revisionCopiesRecorded == 9,
 					"every submission bound a revision's recording; nothing prepared again");
 				REQUIRE(!counters.unbalanced && counters.locks.load() == counters.unlocks.load(), "balanced host queue locks");
 				// Growth as graph work. A version is made on a producer's thread and filled through the dedicated uploader. That is
@@ -1179,142 +1183,42 @@ static int Run(int argc, char** argv) {
 					std::printf("growth as graph work: %s uploader queue\n", uploads->HasDedicatedStreamingQueue() ? "a dedicated" : "the shared");
 					REQUIRE(!spareQueue || uploads->HasDedicatedStreamingQueue(), "the spare queue is the uploader's");
 				}
-				// A live epoch recorded for a revision, before the switch to revision-driven submission. It is only recorded, never
-				// admitted. The slot that its live ticket holds is recorded once that ticket is submitted. A slot with work in
-				// flight is recorded once that work completes.
+				// A live epoch publishes nothing: it records every run. A recording request for it completes with an error, and a
+				// recording given to its submission is rejected without hanging the host.
 				host.SetAsyncEpochs({0});
 				{
-					// The restarted host's first ticket (the first submission waits for it).
 					value = 69990u;
 					host.SubmitEpoch(0, upload);
 					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "the live epoch after the switch");
-					(void)host.TakeAsyncStats();
 					auto data = std::make_shared<TestRevision>();
 					data->count = kCount;
 					data->versioned = versions->Key();
 					data->target = versions->Current();
 					std::atomic<int> state{0};
-					std::shared_ptr<const org::GraphHost::EpochRecording> live;
 					REQUIRE(host.RequestEpochRecording(0, data, [&](std::shared_ptr<const org::GraphHost::EpochRecording> a_recording, std::exception_ptr a_error) {
-						live = std::move(a_recording);
-						state.store(a_error ? 2 : 1, std::memory_order_release);
-					}), "a live async epoch takes a recording request");
-					(void)host.TakeAsyncStats();
+						state.store(a_error && !a_recording ? 2 : 1, std::memory_order_release);
+					}), "the request is queued");
 					const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
 					for (uint32_t frame = 0; state.load(std::memory_order_acquire) == 0 && std::chrono::steady_clock::now() < deadline; ++frame) {
 						value = 70000u + 10u * (frame % 1000u);
 						host.SubmitEpoch(0, upload);
-						REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "the live epoch draws while it is recorded for a revision");
+						REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "the live epoch draws meanwhile");
 					}
-					REQUIRE(state.load(std::memory_order_acquire) == 1 && live && live->slots.size() == 3, "a live epoch's revision recording, one per slot of its ring");
-					const auto liveStats = host.TakeAsyncStats();
-					std::printf("live revision recording: %llu recordings, %llu revision submissions, %llu submitted, %llu waited\n",
-						static_cast<unsigned long long>(liveStats.revisionRecordings), static_cast<unsigned long long>(liveStats.revisionSubmissions),
-						static_cast<unsigned long long>(liveStats.submitted), static_cast<unsigned long long>(liveStats.waited));
-					// This loop submits right after the GPU is idle, before the host's next ticket. So its frames wait either way.
-					REQUIRE(liveStats.revisionRecordings == 1 && liveStats.revisionSubmissions == 0, "admitted, not submitted until chosen");
-					// The commit chooses the recording with UseEpochRecording. For every slot, the ticket then takes it instead of its
-					// own preparation.
-					for (uint32_t frame = 0; frame < 4; ++frame) {
-						value = 71000u + 10u * frame;
-						bool usable = false;
-						host.SubmitEpoch(0, [&](org::RenderGraph& a_graph) {
-							upload(a_graph);
-							std::string why;
-							usable = host.CanUseEpochRecording(*live, &why);
-							host.UseEpochRecording(live);
-						});
-						REQUIRE(usable, "the ticket being submitted takes the revision's recording");
-						REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "a live epoch submits the revision's recording it chose");
+					REQUIRE(state.load(std::memory_order_acquire) == 2, "a live epoch's recording request completes with an error");
+					bool rejected = false;
+					try {
+						host.SubmitEpoch(0, upload, {}, full);
+					} catch (const std::logic_error&) {
+						rejected = true;
 					}
-					// And its own preparation again when it chooses none.
-					value = 72000u;
-					host.SubmitEpoch(0, upload);
-					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "a live epoch's own preparation after a chosen recording");
-					const auto chosenStats = host.TakeAsyncStats();
-					REQUIRE(chosenStats.revisionSubmissions == 4 && chosenStats.stale == 0, "every chosen recording submitted, nothing prepared again");
-					// Build the graph again by replacing its extension. The recording now belongs to the previous build. The commit
-					// asks before it chooses the recording, and the rebuilt graph's ticket would not take it. So the epoch uses its
-					// own preparation.
-					const auto builds = host.BuildGeneration();
-					host.AddExtension("test.host", [&] { return std::make_unique<HostExtension>(input, scratch, output, program, outputRevision, versions, external); });
-					value = 73000u;
-					bool usable = true;
-					std::string why;
-					host.SubmitEpoch(0, [&](org::RenderGraph& a_graph) {
-						upload(a_graph);
-						usable = host.CanUseEpochRecording(*live, &why);
-					});
-					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "the rebuilt graph's own preparation");
-					std::printf("after a rebuild: %s\n", why.c_str());
-					REQUIRE(host.BuildGeneration() != builds && !usable && !why.empty(), "a recording of the build before is not the rebuilt graph's ticket's");
-					// Explicit builds. An added extension waits for the build point (BuildIfRequested). Until then the graph runs as
-					// it was built, and its tickets can still take a recording of it. The build point builds the graph. The recording
-					// then belongs to the previous build.
-					host.SetExplicitBuilds(true);
-					std::shared_ptr<const org::GraphHost::EpochRecording> held;
-					state.store(0, std::memory_order_relaxed);
-					REQUIRE(host.RequestEpochRecording(0, data, [&](std::shared_ptr<const org::GraphHost::EpochRecording> a_recording, std::exception_ptr a_error) {
-						held = std::move(a_recording);
-						state.store(a_error ? 2 : 1, std::memory_order_release);
-					}), "a recording request of the current build");
-					const auto heldDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-					for (uint32_t frame = 0; state.load(std::memory_order_acquire) == 0 && std::chrono::steady_clock::now() < heldDeadline; ++frame) {
-						value = 74000u + 10u * (frame % 100u);
-						host.SubmitEpoch(0, upload);
-						REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "the live epoch draws while it is recorded");
-					}
-					REQUIRE(state.load(std::memory_order_acquire) == 1 && held && host.EpochRecordingCurrent(*held), "a recording of the current build");
-					const auto explicitBuilds = host.BuildGeneration();
-					host.AddExtension("test.host", [&] { return std::make_unique<HostExtension>(input, scratch, output, program, outputRevision, versions, external); });
-					REQUIRE(host.RebuildRequested(), "the extension added is a rebuild requested");
-					for (uint32_t frame = 0; frame < 4; ++frame) {
-						value = 75000u + 10u * frame;
-						usable = false;
-						host.SubmitEpoch(0, [&](org::RenderGraph& a_graph) {
-							upload(a_graph);
-							usable = host.CanUseEpochRecording(*held, &why);
-							if (usable)
-								host.UseEpochRecording(held);
-						});
-						REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "the graph as built draws until the build point");
-						REQUIRE(usable && host.BuildGeneration() == explicitBuilds && host.EpochRecordingCurrent(*held), "its recording is its tickets' until the build point");
-					}
-					REQUIRE(host.BuildIfRequested() && !host.RebuildRequested() && host.BuildGeneration() != explicitBuilds && !host.EpochRecordingCurrent(*held),
-						"the build point builds; the recording is the build before's");
-					REQUIRE(!host.BuildIfRequested(), "nothing to build without a request");
-					value = 76000u;
-					host.SubmitEpoch(0, [&](org::RenderGraph& a_graph) {
-						upload(a_graph);
-						usable = host.CanUseEpochRecording(*held, &why);
-					});
-					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value) && !usable, "the rebuilt graph's own preparation");
-					host.SetExplicitBuilds(false);
-					// An epoch that the caller does not submit. Its ready ticket holds a slot of its ring. So a recording requested for
-					// it waits for that slot until the caller gives the ticket back (ReleaseEpochTicket). Then the recording completes,
-					// without being submitted.
-					std::shared_ptr<const org::GraphHost::EpochRecording> idle;
-					state.store(0, std::memory_order_relaxed);
-					const auto readyDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-					while (!host.ReleaseEpochTicket(0) && std::chrono::steady_clock::now() < readyDeadline)
-						std::this_thread::yield();
-					REQUIRE(host.RequestEpochRecording(0, data, [&](std::shared_ptr<const org::GraphHost::EpochRecording> a_recording, std::exception_ptr a_error) {
-						idle = std::move(a_recording);
-						state.store(a_error ? 2 : 1, std::memory_order_release);
-					}), "a recording request for an epoch not submitted");
-					std::this_thread::sleep_for(std::chrono::milliseconds(200));
-					REQUIRE(state.load(std::memory_order_acquire) == 0, "it waits for the slot the epoch's ready ticket holds");
-					const auto idleDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-					while (state.load(std::memory_order_acquire) == 0 && std::chrono::steady_clock::now() < idleDeadline) {
-						(void)host.ReleaseEpochTicket(0);
-						std::this_thread::sleep_for(std::chrono::milliseconds(5));
-					}
-					REQUIRE(state.load(std::memory_order_acquire) == 1 && idle && idle->slots.size() == 3, "given the ticket back, the recording completes unsubmitted");
+					REQUIRE(rejected, "a recording given to a live epoch is rejected");
 					value = 77000u;
 					host.SubmitEpoch(0, upload);
-					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "the epoch submits again after its ticket was given back");
+					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "the live epoch submits again after the rejection");
 				}
 				host.SetAsyncEpochs({});
+			}
+			if (external) {				host.SetAsyncEpochs({});
 			}
 			if (external) {
 				host.SetExternalEpochs({0});
@@ -1335,10 +1239,9 @@ static int Run(int argc, char** argv) {
 					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "an external execution writes and copies");
 				}
 				if (externalReuse) {
-					const auto kept = host.TakeAsyncStats();
-					std::printf("external-reuse: %llu recorded, %llu kept, %llu reused\n", static_cast<unsigned long long>(kept.recorded),
-						static_cast<unsigned long long>(kept.kept), static_cast<unsigned long long>(kept.reused));
-					REQUIRE(kept.kept > 0 && kept.reused > 0, "an external epoch with a replayable late pass is kept and taken again");
+					const auto recorded = host.TakeAsyncStats();
+					std::printf("external-reuse: %llu recorded\n", static_cast<unsigned long long>(recorded.recorded));
+					REQUIRE(recorded.recorded >= 6, "a live epoch with a replayable late pass still records every run");
 				}
 				// An execution that is not executed. It is signalled without running its work. The output keeps its last value, and
 				// the next execution goes on.
@@ -1391,12 +1294,11 @@ static int Run(int argc, char** argv) {
 				std::set<std::string> timedOff, timedOn;
 				if (const int failed = timedPasses(false, timedOff)) return failed;
 				if (const int failed = timedPasses(true, timedOn)) return failed;
-				// Kept recordings, as in external-reuse, are timed only with recording timestamps. This is true of every kept
-				// recording.
+				// Replayable recordings, as in external-reuse, are timed only with recording timestamps.
 				for (const auto* timedSet : {&timedOff, &timedOn})
 					if (timedSet == &timedOn || !externalReuse)
 						REQUIRE(timedSet->contains("test.write") && timedSet->contains("test.copy-to-host"),
-							"an external epoch's passes are timed, its late pass's too (a kept one's with recording timestamps)");
+							"an external epoch's passes are timed, its late pass's too (a replayable one's with recording timestamps)");
 				host.SetRecordingTimestamps(false);
 				host.SetCompletedFrameCallback({});
 				const auto stats = host.TakeAsyncStats();
@@ -1455,23 +1357,19 @@ static int Run(int argc, char** argv) {
 			}
 			REQUIRE(!counters.unbalanced && counters.locks.load() == counters.unlocks.load(), "balanced host queue locks");
 			if (reuse) {
-				// Steady frames. The slots' tickets take their kept recordings. Each submission of the same command lists reads the
-				// upload of its own frame.
+				// Steady frames. A live epoch records every run, replayable or not, and nothing keeps its recordings.
 				(void)host.TakeAsyncStats();
 				for (uint32_t frame = 0; frame < 12; ++frame) {
 					value = 20000u + 10u * frame;
 					host.SubmitEpoch(0, upload);
-					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(second, value), "a resubmitted recording writes its frame's value");
+					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(second, value), "a run's recording writes its frame's value");
 				}
 				const auto steady = host.TakeAsyncStats();
-				std::printf("reuse: steady %llu recorded, %llu kept, %llu reused, %llu adopted, %llu prepared again\n",
-					static_cast<unsigned long long>(steady.recorded), static_cast<unsigned long long>(steady.kept),
-					static_cast<unsigned long long>(steady.reused), static_cast<unsigned long long>(steady.adopted),
+				std::printf("reuse: steady %llu recorded, %llu prepared again\n", static_cast<unsigned long long>(steady.recorded),
 					static_cast<unsigned long long>(steady.stale));
-				REQUIRE(steady.reused >= 9 && steady.stale == 0, "steady frames take kept recordings");
-				// A pass's revision alternates inside the commit (beforeSubmit), as a view's state does. Each slot's ticket was
-				// prepared for the other variant, so it is stale at submission. Once every slot has kept both variants, a stale
-				// ticket adopts the kept recording, and nothing is prepared again.
+				REQUIRE(steady.recorded >= 12 && steady.stale == 0, "steady frames record every run");
+				// A pass's revision alternates inside the commit (beforeSubmit), as a view's state does. Each ticket was prepared for the
+				// other variant, so it is stale at submission and prepared again, for the same run.
 				const uint64_t base = outputRevision->load() + 100;
 				uint64_t warmStale = 0;
 				for (uint32_t frame = 0; frame < 24; ++frame) {
@@ -1480,15 +1378,14 @@ static int Run(int argc, char** argv) {
 						upload(graph);
 						outputRevision->store(base + (frame & 1u), std::memory_order_release);
 					});
-					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(second, value), "an adopted recording writes its frame's value");
+					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(second, value), "a prepared-again ticket writes its frame's value");
 					if (frame == 11) warmStale = host.TakeAsyncStats().stale;
 				}
 				const auto alternating = host.TakeAsyncStats();
-				std::printf("reuse: alternating (after %llu prepared again to warm up) %llu recorded, %llu reused, %llu adopted, %llu prepared again\n",
+				std::printf("reuse: alternating (%llu prepared again in the first half) %llu recorded, %llu prepared again\n",
 					static_cast<unsigned long long>(warmStale), static_cast<unsigned long long>(alternating.recorded),
-					static_cast<unsigned long long>(alternating.reused), static_cast<unsigned long long>(alternating.adopted),
 					static_cast<unsigned long long>(alternating.stale));
-				REQUIRE(alternating.stale == 0 && alternating.adopted >= 6, "warm alternating revisions adopt kept recordings");
+				REQUIRE(alternating.stale >= 6, "a ticket the commit made stale is prepared again");
 			}
 			if (async) {
 				// The commit changes what the write pass depends on: the ticket is stale and prepared again, and the frame still

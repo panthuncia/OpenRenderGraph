@@ -30,6 +30,7 @@ namespace org {
 
 class PipelineCompiler;
 class PipelineLibrary;
+class FrameArena;
 
 // The ORG runtime of a device: what every graph on it shares. One per process for now (the services behind it are still
 // process singletons); graphs and hosts take it and never initialize, reset or shut down shared state themselves.
@@ -44,8 +45,8 @@ public:
 	struct Desc {
 		rhi::Device device;
 		rhi::Backend backend = rhi::Backend::Null;
-		// Capacity of the services still indexed by a ring of slots (upload pages, statistics query ranges): the most
-		// executions any graph keeps in flight (GraphHost: frames in flight times epochs). At most kMaxSlots.
+		// The first capacity of the services indexed by run (upload pages and statistics query ranges, by GraphHost's lease
+		// index), and a graph's admission depth. They grow when more runs are in flight. At most kMaxSlots.
 		uint32_t slots = 3;
 		// Optional; a ThreadPoolTaskService is created when absent.
 		std::shared_ptr<runtime::ITaskService> tasks;
@@ -54,9 +55,9 @@ public:
 		std::shared_ptr<PipelineCompiler> pipelineCompiler;
 	};
 
-	// The most slots a runtime can have. Slot indices are 32-bit everywhere, so this is not a type limit. It is a sanity bound.
-	// Each slot costs memory in every slot-indexed table: a range of the statistics query pools (two timestamps per pass), an
-	// upload page list, and a region in every LatchBlock a host sizes from GraphHost::FrameSlots.
+	// The most runs in flight a runtime serves: a bound on GraphHost's lease indices, and on Desc::slots. Indices are 32-bit
+	// everywhere, so this is not a type limit. It is a sanity bound. A run in flight holds a range of the statistics query
+	// pools (two timestamps per pass), an upload page list, and the frame arena regions it wrote.
 	static constexpr uint32_t kMaxSlots = 4096;
 
 	static std::shared_ptr<Runtime> Create(Desc desc);
@@ -80,6 +81,8 @@ public:
 	const std::shared_ptr<runtime::IRenderGraphSettingsService>& Settings() const noexcept { return m_settings; }
 	// The pipelines passes declared by description, built for the devices they run on.
 	const std::shared_ptr<PipelineLibrary>& Pipelines() const noexcept { return m_pipelines; }
+	// The memory of every LatchBlock (per-run constants), shared by the runtime's graphs and hosts.
+	const std::shared_ptr<FrameArena>& Arena() const noexcept { return m_arena; }
 
 	// Another queue whose submissions can use ORG objects (a peer device's, one made with CreateQueue): the frontier covers it
 	// from now on. Registering twice is harmless.
@@ -109,7 +112,7 @@ public:
 	RelayedPoint RelayWaits(const void* owner, const void* consumer, std::span<const rhi::TimelinePoint> points);
 
 	// A value an external stream signals after work of its own that may use ORG objects: a host's frame timeline signalled
-	// in its command stream after the frame's last use (GraphHost::NoteExternalSlotUse). No ORG queue sees that work. The
+	// in its command stream after the frame's last use (GraphHost::BeginExternalRun). No ORG queue sees that work. The
 	// frontier covers the latest value noted per timeline, so a deferred deletion waits for it. The value may still be
 	// unsignalled, or not yet submitted: retirement waits until the GPU reaches it. So the stream must signal it (or a later
 	// value) eventually, or deferred deletions wait forever. Its owner calls NoteTimelineDestroyed before destroying the
@@ -179,6 +182,7 @@ private:
 	std::shared_ptr<runtime::IStatisticsService> m_statistics;
 	std::shared_ptr<runtime::IRenderGraphSettingsService> m_settings;
 	std::shared_ptr<PipelineLibrary> m_pipelines;
+	std::shared_ptr<FrameArena> m_arena;
 	rhi::TimelinePtr m_readbackFence, m_copyReadbackFence;
 	std::shared_ptr<persistent::ResourceSequencer> m_sequencer;
 	std::shared_ptr<compiler::ScheduleCache> m_schedules;

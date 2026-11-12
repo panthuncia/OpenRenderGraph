@@ -283,6 +283,16 @@ private:
 	// Direct mode: recorded batches accepted ahead of every other upload of the frame, waiting for TakeRecordedUploads.
 	std::vector<std::shared_ptr<org::runtime::StagedUploadBatch>> m_directRecorded;
 	std::vector<std::vector<std::shared_ptr<org::runtime::StagedUploadBatch>>> m_frameStaged;
+	// A frame index's lists. An index is a host's run lease, so the lists grow to the most runs in flight instead of
+	// being taken modulo a fixed count. Owner thread.
+	std::vector<UploadPagePtr>& FramePages(uint32_t frameIndex) {
+		if (m_framePages.size() <= frameIndex) m_framePages.resize(size_t{frameIndex} + 1);
+		return m_framePages[frameIndex];
+	}
+	std::vector<std::shared_ptr<org::runtime::StagedUploadBatch>>& FrameStaged(uint32_t frameIndex) {
+		if (m_frameStaged.size() <= frameIndex) m_frameStaged.resize(size_t{frameIndex} + 1);
+		return m_frameStaged[frameIndex];
+	}
 	UploadPagePtr             m_activePage;
 	std::atomic_size_t         m_nextPageIndex = 0;
 	struct PageLifetimeTrace {

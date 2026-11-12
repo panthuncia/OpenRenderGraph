@@ -34,6 +34,7 @@
 #include "OpenRenderGraph/ExecutionHandle.h"
 #include "Render/Runtime/TaskServiceAccess.h"
 #include "Render/QueueKind.h"
+#include "Render/RunRef.h"
 #include "Render/QueueRegistry.h"
 #include "Render/DeviceRegistry.h"
 #include "Resources/PixelBuffer.h"
@@ -299,12 +300,14 @@ private:
 	bool InHostStream(uint32_t slot) const noexcept;
 	// The secondary lists an external epoch's batches on that slot record into.
 	std::shared_ptr<CommandListPool> ExternalSecondaryPool(uint32_t slot);
-	// Owner thread. hostFrame numbers the execution (its statistics and lifecycle). hostTag: the host's currency tag the ticket
-	// is prepared under (SetPersistentTicketHostTag), which a kept recording must have been recorded under too. hostData: what
-	// the passes prepare for (FramePreparationContext::preparationData), e.g. a scene revision; retained while it records.
-	// admissionOnly: the ticket carries the admission alone, and its recording is bound before submission
-	// (BindPersistentTicketRecording) - an epoch recorded ahead, for a revision (GraphHost::RequestEpochRecording).
-	std::shared_ptr<PersistentTicket> PreparePersistentTicket(rhi::Device device, uint32_t epoch, uint32_t slot, uint64_t hostFrame,
+	// Owner thread. run: the run it is prepared for (GraphHost's run lease, or a published copy's run). Its lease index is the
+	// frame index of the run's statistics range, upload pages and preparation data, and the run is what its recording's
+	// RecordingContext::Run names. hostFrame numbers the execution (its statistics and lifecycle). hostTag: the host's currency
+	// tag the ticket is prepared under (SetPersistentTicketHostTag). hostData: what the passes prepare for
+	// (FramePreparationContext::preparationData), e.g. a scene revision; retained while it records. admissionOnly: the ticket
+	// carries the admission alone, and its recording is bound before submission (BindPersistentTicketRecording) - an epoch
+	// recorded ahead, for a revision (GraphHost::RequestEpochRecording).
+	std::shared_ptr<PersistentTicket> PreparePersistentTicket(rhi::Device device, uint32_t epoch, RunRef run, uint64_t hostFrame,
 		uint64_t hostTag = 0, std::shared_ptr<const IHostExecutionData> hostData = {}, bool admissionOnly = false);
 	// The ticket's recording (one segment), or null; the ticket keeps it.
 	static std::shared_ptr<const PersistentRecording> PersistentTicketRecording(const PersistentTicket& ticket) noexcept;
@@ -321,47 +324,30 @@ private:
 		std::string* why = nullptr);
 	// Revision-driven epochs (immutable inputs). A recording made for host data (a revision) resolves the graph's resolvers through
 	// it (ResolverCaptureContext of IHostExecutionData), so its publication and bindings are the revision's own, and it holds them.
-	// Owner thread: a ticket for the epoch's slot that prepares nothing from live state: its admissions are its candidates', one
-	// per recording it may be submitted with (AddPersistentTicketCandidate); the bind takes one, completion abandons the rest.
-	std::shared_ptr<PersistentTicket> PrepareRevisionTicket(uint32_t epoch, uint32_t slot, uint64_t hostFrame);
+	// Owner thread: a ticket for a published copy's run that prepares nothing from live state: its admissions are its candidates',
+	// one per recording it may be submitted with (AddPersistentTicketCandidate); the bind takes one, completion abandons the rest.
+	std::shared_ptr<PersistentTicket> PrepareRevisionTicket(uint32_t epoch, RunRef run, uint64_t hostFrame);
 	// Owner thread: admits the recording's publication as a candidate of the revision ticket. Lock-free against a bind on the
 	// submitting thread (an append-only list); a recording published to that thread after this call is always found.
 	void AddPersistentTicketCandidate(PersistentTicket& ticket, std::shared_ptr<const PersistentRecording> recording);
-	// Recording reuse. A ticket's recording, when every pass of it is replayable (PreparedPass::IsReplayable) and its
-	// execution closed with nothing late-bound, is kept per (epoch, frame slot) - up to kKeptRecordingVariants of them, by
-	// what they were recorded for: the publication, the bindings and descriptor heaps, the host tag, and each pass's
-	// revision. A ticket prepared for what a kept recording was recorded for takes it instead of recording (its lists are
-	// submitted again), and a ticket the commit made stale can take the kept recording of what it depends on now
-	// (AdoptKeptPersistentRecording) instead of being prepared again. Kept recordings have no profiler GPU zones, and no GPU
-	// statistics queries in the shared pool (recreated as passes register, and frame-indexed): with
-	// SetPersistentRecordingTimestamps, each records into queries of its own instead.
-	static constexpr size_t kKeptRecordingVariants = 4;
+	// Replayable recordings. A ticket's recording, when every pass of it is replayable (PreparedPass::IsReplayable) and its
+	// execution closed with nothing late-bound, is recorded for resubmission. Only a recording made for host data (a revision's
+	// published copy, GraphHost::RequestEpochRecording) is submitted again. A live ticket's recording is used once, and nothing
+	// keeps it. Replayable recordings have no profiler GPU zones, and no GPU statistics queries in the shared pool (recreated
+	// as passes register, and indexed by run): with SetPersistentRecordingTimestamps, each records into queries of its own.
 	void SetPersistentRecordingReuse(bool reuse) noexcept { m_persistentRecordingReuse = reuse; }
 	bool PersistentRecordingReuse() const noexcept { return m_persistentRecordingReuse; }
-	// Off: a live ticket's recording is never kept or taken from the store; recordings made for host data (revision recordings)
-	// are replayable as before. On by default.
-	void SetKeepLiveRecordings(bool keep) noexcept { m_keepLiveRecordings = keep; }
 	// Pass and barrier-batch timestamps in recordings kept for resubmission (off by default): each such list records into
 	// queries it owns (IStatisticsService::CreateOwnedTimestamps), resolved by every submission and read when its frame slot
 	// completes (IStatisticsService::GetCompletedTimestamps). Read when a list is recorded: set it before the graph records
 	// (GraphHost::SetRecordingTimestamps rebuilds the graph for it).
 	void SetPersistentRecordingTimestamps(bool enabled) noexcept { m_persistentRecordingTimestamps = enabled; }
 	bool PersistentRecordingTimestamps() const noexcept { return m_persistentRecordingTimestamps; }
-	// Submitting thread: swaps the ticket's recording for the kept one of what its passes depend on now and a_hostTag, and
-	// makes the ticket current. False (the ticket unchanged) when none is kept. Reads the kept sets only (lock-free).
-	bool AdoptKeptPersistentRecording(PersistentTicket& ticket, uint64_t hostTag);
-	// Owner thread, with no ticket in flight: lets every kept recording go (their lists return to their pools).
-	void ClearKeptPersistentRecordings() noexcept { m_keptRecordings.reset(); }
 	struct PersistentRecordingStats {
 		uint64_t recorded = 0;    // tickets recorded (owner thread)
-		uint64_t kept = 0;        // of them, kept for reuse
-		uint64_t reused = 0;      // tickets that took a kept recording instead of recording (owner thread)
-		uint64_t adopted = 0;     // stale tickets made current by a kept recording (submitting thread)
 		// Tickets admitted at submission with their prediction's plan (the ledger held what the executable found last), and those
 		// planned against the ledger (SynchronousAdmission::TakePredictionCounts).
 		uint64_t predicted = 0, planned = 0;
-		// Kept recordings held in the store now, and the command-list packets they hold (not reset by the call).
-		uint64_t held = 0, heldPackets = 0;
 	};
 	// Since the last call (any thread).
 	PersistentRecordingStats TakePersistentRecordingStats() noexcept;
@@ -371,7 +357,8 @@ private:
 	void RetirePersistentExecutions();
 	// Submitting thread; they touch nothing the owner thread uses.
 	static uint32_t PersistentTicketEpoch(const PersistentTicket& ticket) noexcept;
-	static uint32_t PersistentTicketSlot(const PersistentTicket& ticket) noexcept;
+	// The run it was prepared for (PreparePersistentTicket, PrepareRevisionTicket).
+	static RunRef PersistentTicketRun(const PersistentTicket& ticket) noexcept;
 	static uint64_t PersistentTicketHostFrame(const PersistentTicket& ticket) noexcept;
 	// The execution the ticket prepared. It is submitted, or poisoned, when the ticket completes (CompletePersistentTicket).
 	static ExecutionHandle PersistentTicketExecution(const PersistentTicket& ticket) noexcept;
@@ -657,6 +644,9 @@ private:
 		uint64_t hostTag = 0;
 		bool admissionOnly = false;
 		bool hostData = false;
+		// What the recording's RecordingContext::Run names. Without one: UpdateExecutionContext::run, else the execution's frame
+		// index outside a lease (RunRef::Unleased).
+		std::optional<RunRef> run;
 	};
 	void Update(const UpdateExecutionContext& context, rhi::Device device) { Update(context, device, PersistentExecutionOptions{}); }
 	void Update(const UpdateExecutionContext& context, rhi::Device device, const PersistentExecutionOptions& options);
@@ -781,33 +771,9 @@ private:
 	std::mutex m_externalSecondaryPoolsMutex;
 	std::vector<std::shared_ptr<CommandListPool>> m_externalSecondaryPools;
 	bool m_persistentRecordingReuse = false;
-	bool m_keepLiveRecordings = true;
 	SharingChangePolicy m_sharingChangePolicy = SharingChangePolicy::Inline;
 	bool m_persistentRecordingTimestamps = false;
-	// Kept recordings per (epoch, frame slot). Each set is replaced whole by the owner thread and read by the submitting
-	// thread. A host's frame slots are its frames in flight of every epoch (GraphHost::FrameSlots), so an epoch meets
-	// several. Any epoch and slot can keep recordings.
-	using KeptRecordingSet = std::vector<std::shared_ptr<const PersistentRecording>>;
-	class KeptRecordingStore {
-	public:
-		std::shared_ptr<const KeptRecordingSet> Load(uint32_t epoch, uint32_t slot) const {
-			std::scoped_lock lock(m_mutex);
-			const auto found = m_sets.find(Key(epoch, slot));
-			return found == m_sets.end() ? nullptr : found->second;
-		}
-		void Store(uint32_t epoch, uint32_t slot, std::shared_ptr<const KeptRecordingSet> set) {
-			std::scoped_lock lock(m_mutex);
-			m_sets[Key(epoch, slot)] = std::move(set);
-		}
-		// The recordings held, and their packets.
-		std::pair<uint64_t, uint64_t> Count() const;
-	private:
-		static uint64_t Key(uint32_t epoch, uint32_t slot) noexcept { return (static_cast<uint64_t>(epoch) << 32) | slot; }
-		mutable std::mutex m_mutex;
-		std::unordered_map<uint64_t, std::shared_ptr<const KeptRecordingSet>> m_sets;
-	};
-	std::unique_ptr<KeptRecordingStore> m_keptRecordings;
-	std::atomic<uint64_t> m_recordingsRecorded{0}, m_recordingsKept{0}, m_recordingsReused{0}, m_recordingsAdopted{0};
+	std::atomic<uint64_t> m_recordingsRecorded{0};
 	uint32_t m_persistentEpoch = UINT32_MAX;
 	PersistentExecuteTimings m_lastPersistentExecuteTimings{};
 	ExternalQueueBoundary m_externalQueueBoundary{};

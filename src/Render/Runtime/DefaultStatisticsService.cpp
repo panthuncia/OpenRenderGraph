@@ -31,6 +31,14 @@ public:
         StatisticsManager::GetInstance().SetupQueryHeap();
     }
 
+    void EnsureFrameCapacity(unsigned frames) override {
+        StatisticsManager::GetInstance().EnsureFrameCapacity(frames);
+    }
+
+    unsigned FrameCapacity() const override {
+        return StatisticsManager::GetInstance().FrameCapacity();
+    }
+
     void BeginQuery(unsigned passIndex, unsigned frameIndex, rhi::Queue& queue, rhi::CommandList& cmdList) override {
         StatisticsManager::GetInstance().BeginQuery(passIndex, frameIndex, queue, cmdList);
     }

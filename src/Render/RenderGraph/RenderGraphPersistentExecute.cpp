@@ -158,9 +158,8 @@ bool RenderGraph::AdmitPersistentSegment(PersistentSegmentRun& run) {
 	if (!options.ticket && HasFrameWaitTimeline() && m_frameWaitValue)
 		for (auto* set : {&admission.incomingWaits, &admission.ownWaits})  // ownWaits: kept by its readmission
 			for (auto& waits : *set) waits.push_back({kFrameWaitTimelineIdentity, m_frameWaitValue});
-	// Recording reuse (SetPersistentRecordingReuse): a ticket's closed execution with nothing late-bound, whose passes all
-	// report their revisions, is recorded for resubmission and kept per (epoch, slot); one prepared for what a kept
-	// recording was recorded for takes it.
+	// Replayable recordings (SetPersistentRecordingReuse): a ticket's closed execution with nothing late-bound, whose passes all
+	// report their revisions, is recorded for resubmission. Only a revision's published copies are submitted again.
 	auto* const ticketTarget = options.ticket;
 	if (ticketTarget && options.admissionOnly) {
 		// Recorded ahead (BindPersistentTicketRecording): this preparation's invocations are never recorded.
@@ -170,8 +169,8 @@ bool RenderGraph::AdmitPersistentSegment(PersistentSegmentRun& run) {
 			segment.waits, segment.rebindings});
 		return false;
 	}
-	// An external epoch's recording is kept as any other's (its secondaries executed again by each ticket that takes it); a late
-	// batch's passes are recorded by each execution, so it is kept only when they are replayable (PreparedPass::RecordAgain: their
+	// An external epoch's recording is replayable as any other's (its secondaries executed again by each ticket that takes it); a
+	// late batch's passes are recorded by each execution, so it is replayable only when they are (PreparedPass::RecordAgain: their
 	// invocation recorded again by each).
 	bool lateUnreplayable = false;
 	const auto& structure = *segment.publication->executable->graph->structure;
@@ -183,29 +182,10 @@ bool RenderGraph::AdmitPersistentSegment(PersistentSegmentRun& run) {
 		}
 	run.external = ticketTarget && ticketTarget->external;
 	// A body depends only on the compiled graph (open: its entry barriers are recorded at submission) or on the executable and
-	// backings (closed), so a ticket's recording can be kept, open or closed.
+	// backings (closed), so a ticket's recording can be replayable, open or closed.
 	run.keepable = ticketTarget && m_persistentRecordingReuse && admission.rebound.empty()
 		&& admission.incomingEffects.empty() && !ticketTarget->uncheckable
 		&& !(run.external && lateUnreplayable);
-	if (run.keepable && !m_keptRecordings) m_keptRecordings = std::make_unique<KeptRecordingStore>();
-	if (run.keepable && !options.hostData && m_keepLiveRecordings) {
-		const auto set = m_keptRecordings->Load(ticketTarget->epoch, run.execution.frameIndex);
-		for (const auto& kept : set ? *set : KeptRecordingSet{}) {
-			if (!kept->Recorded(options.hostTag, segment.publication.get(), segment.bindings.get(), run.resourceHeap, run.samplerHeap,
-					ticketTarget->revisions))
-				continue;
-			BT_ZONE_SCOPE("ORG.Persistent.ReuseRecording");
-			// This preparation's invocations are the kept ones' equals (the same revisions): never recorded.
-			for (const auto& invocation : segment.invocations)
-				if (invocation) invocation.Abandon(AbandonReason::AdmissionFailed);
-			kept->lastUse.store(ticketTarget->hostFrame, std::memory_order_relaxed);
-			ticketTarget->segments.push_back({std::move(admission), kept, segment.bindings, run.resourceHeap, run.samplerHeap,
-				segment.waits, segment.rebindings});
-			m_recordingsReused.fetch_add(1, std::memory_order_relaxed);
-			run.Lap(run.timings.recordUs);
-			return false;
-		}
-	}
 	return true;
 }
 
@@ -281,7 +261,7 @@ void RenderGraph::RecordPersistentSegment(PersistentSegmentRun& run) {
 		}
 		job.recording.external = inStream;
 		job.recording.bindings = segment.bindings;
-		job.recording.frameSlot = frameIndex;
+		job.recording.run = run.execution.options.run.value_or(RunRef::Unleased(frameIndex));
 		job.recording.externalEntryBarrier = m_externalQueueBoundary.entry && run.firstBatchOnSlot[slot] == batch;
 		if (admission.closed && !closedEntryDone[slot]) {
 			job.recording.externalEntryBarrier = true;
@@ -498,24 +478,8 @@ void RenderGraph::SubmitPersistentSegment(PersistentSegmentRun& run) {
 				recording->waits = segment.waits;
 				recording->leases = segment.leases;
 			}
-			// A recording made for host data is its caller's (BindPersistentTicketRecording), never kept here.
-			if (recording->replayable && !options.hostData && m_keepLiveRecordings) {
-				// Kept with the others recorded under the same publication, bindings and host tag (any other can never be
-				// taken again), the most recently used first.
-				const auto previous = m_keptRecordings->Load(ticket->epoch, run.execution.frameIndex);
-				auto next = std::make_shared<KeptRecordingSet>();
-				next->push_back(recording);
-				for (const auto& kept : previous ? *previous : KeptRecordingSet{})
-					if (kept->hostTag == recording->hostTag && kept->publication == recording->publication && kept->bindings == recording->bindings
-						&& kept->resourceHeap.index == recording->resourceHeap.index && kept->samplerHeap.index == recording->samplerHeap.index)
-						next->push_back(kept);
-				std::stable_sort(next->begin() + 1, next->end(), [](const auto& a, const auto& b) {
-					return a->lastUse.load(std::memory_order_relaxed) > b->lastUse.load(std::memory_order_relaxed);
-				});
-				if (next->size() > kKeptRecordingVariants) next->resize(kKeptRecordingVariants);
-				m_keptRecordings->Store(ticket->epoch, run.execution.frameIndex, std::move(next));
-				m_recordingsKept.fetch_add(1, std::memory_order_relaxed);
-			}
+			// A recording made for host data is its caller's (BindPersistentTicketRecording). Nothing else keeps a recording: the
+			// ticket's is used once.
 			ticket->segments.push_back({std::move(admission), std::move(recording), segment.bindings, run.resourceHeap, run.samplerHeap,
 				segment.waits, segment.rebindings});
 			return;

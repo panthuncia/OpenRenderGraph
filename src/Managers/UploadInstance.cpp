@@ -842,7 +842,7 @@ size_t UploadInstance::TakeRecordedUploads(std::vector<rhi::CommandList>& out, u
 	for (const auto& batch : m_directRecorded) out.push_back(batch->RecordedList());
 	const size_t taken = m_directRecorded.size();
 	if (m_numFramesInFlight != 0) {
-		auto& retained = m_frameStaged[frameIndex % m_numFramesInFlight];
+		auto& retained = FrameStaged(frameIndex);
 		retained.insert(retained.end(), std::make_move_iterator(m_directRecorded.begin()), std::make_move_iterator(m_directRecorded.end()));
 	}
 	m_directRecorded.clear();
@@ -866,7 +866,7 @@ size_t UploadInstance::RecordStagedUploads(rhi::CommandList& list, uint32_t fram
 	{
 		BT_ZONE_SCOPE("ORG.Upload.RecordStagedUploads.Retain");
 		if (!m_directStaged.empty() && m_numFramesInFlight != 0) {
-			auto& retained = m_frameStaged[frameIndex % m_numFramesInFlight];
+			auto& retained = FrameStaged(frameIndex);
 			retained.insert(retained.end(), std::make_move_iterator(m_directStaged.begin()), std::make_move_iterator(m_directStaged.end()));
 		}
 		m_directStaged.clear();
@@ -931,7 +931,7 @@ size_t UploadInstance::RecordStagedUploadsRouted(rhi::CommandList& list, uint32_
 		if (target != &list) routed += recorded;
 	}
 	if (m_numFramesInFlight != 0) {
-		auto& retained = m_frameStaged[frameIndex % m_numFramesInFlight];
+		auto& retained = FrameStaged(frameIndex);
 		retained.insert(retained.end(), std::make_move_iterator(m_directStaged.begin()), std::make_move_iterator(m_directStaged.end()));
 	}
 	m_directStaged.clear();
@@ -1072,7 +1072,7 @@ void UploadInstance::ProcessUploadsThrough(
 		for (const auto& page : completedPages) {
 			if (page) m_openPageSet.erase(page.get());
 		}
-		auto& submissionPages = m_framePages[frameIndex % m_numFramesInFlight];
+		auto& submissionPages = FramePages(frameIndex);
 		std::unordered_set<UploadPage*> alreadyScheduled;
 		alreadyScheduled.reserve(submissionPages.size() + completedPages.size());
 		for (const auto& page : submissionPages) {
@@ -1088,7 +1088,7 @@ void UploadInstance::ProcessUploadsThrough(
 	RecordProcessedUploadTelemetry(resourceUpdates, textureUpdates);
 	// Staged batches whose entries this pass records stay alive until its frame slot retires.
 	if (sequenceInclusive == UINT64_MAX && !m_pendingStaged.empty() && m_numFramesInFlight != 0) {
-		auto& retained = m_frameStaged[frameIndex % m_numFramesInFlight];
+		auto& retained = FrameStaged(frameIndex);
 		retained.insert(retained.end(), std::make_move_iterator(m_pendingStaged.begin()), std::make_move_iterator(m_pendingStaged.end()));
 		m_pendingStaged.clear();
 	}
@@ -1254,10 +1254,8 @@ void UploadInstance::ProcessDeferredReleases(uint32_t frameIndex) {
 	if (m_numFramesInFlight == 0) {
 		return;
 	}
-	frameIndex %= m_numFramesInFlight;
-
-	m_frameStaged[frameIndex].clear();  // the GPU is done with the slot: producers may reuse these batches
-	auto& retiringPages = m_framePages[frameIndex];
+	FrameStaged(frameIndex).clear();  // the GPU is done with the run: producers may reuse these batches
+	auto& retiringPages = FramePages(frameIndex);
 	std::unordered_set<Resource*> pendingUploadBuffers;
 	pendingUploadBuffers.reserve(m_resourceUpdates.size() + m_textureUpdates.size());
 	for (const auto& update : m_resourceUpdates) {

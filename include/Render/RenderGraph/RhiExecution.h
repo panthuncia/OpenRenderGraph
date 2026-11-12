@@ -709,8 +709,8 @@ struct OwnedRecordingList {
     // What the passes' commands name at record time (RecordingContext::Retain): released with the list's lease, after
     // its last submission retires.
     std::shared_ptr<RecordingRetention> retention = std::make_shared<RecordingRetention>();
-    // RecordingContext::FrameSlot for the passes of this list.
-    uint32_t frameSlot = 0;
+    // RecordingContext::Run for the passes of this list.
+    RunRef run{};
     // RenderGraph::ExternalQueueBoundary: full memory barrier before the first
     // pass / after the last pass of this command list.
     bool externalEntryBarrier = false;
@@ -790,7 +790,7 @@ inline RecordingContext MakeOwnedRecordingContext(rhi::CommandList list, const O
         : RecordingContext::FromPersistentBindings(list, recording.publication);
     if (recording.bindings && recording.publication)
         context = context.WithPersistentBindings(recording.publication);
-    context.SetFrameSlot(recording.frameSlot);
+    context.SetRun(recording.run);
     context.SetRetention(recording.retention);
     context.SetDescriptorHeaps(recording.resourceDescriptorHeap, recording.samplerDescriptorHeap);
     return context;

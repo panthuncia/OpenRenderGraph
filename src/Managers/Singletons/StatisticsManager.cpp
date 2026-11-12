@@ -278,6 +278,20 @@ void StatisticsManager::EnsureQueueBuffers(rhi::QueueKind queueKind) {
     (void)result;
 }
 
+void StatisticsManager::EnsureFrameCapacity(unsigned frames) {
+    if (frames <= m_numFramesInFlight) return;
+    // Doubled, so a host whose runs in flight climb makes a few pools, not one per run.
+    unsigned grown = (std::max)(m_numFramesInFlight, 1u);
+    while (grown < frames) grown *= 2;
+    spdlog::info("StatisticsManager: query ranges for {} runs in flight (was {})", grown, m_numFramesInFlight);
+    m_numFramesInFlight = grown;
+    // Made again at the new size, the old ones handed to the lists that still name them (SetupQueryHeap). Without pools yet,
+    // the first SetupQueryHeap makes them at this size.
+    if (!m_timestampPool) return;
+    m_queryPoolPassCapacity = 0;
+    SetupQueryHeap();
+}
+
 void StatisticsManager::SetupQueryHeap() {
     auto device = DeviceManager::GetInstance().GetDevice();
     if (!m_collectPassStatistics) {

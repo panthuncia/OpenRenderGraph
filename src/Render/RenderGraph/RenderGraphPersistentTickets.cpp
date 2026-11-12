@@ -3,17 +3,19 @@
 
 namespace org {
 
-std::shared_ptr<RenderGraph::PersistentTicket> RenderGraph::PreparePersistentTicket(rhi::Device device, uint32_t epoch, uint32_t slot, uint64_t hostFrame,
+std::shared_ptr<RenderGraph::PersistentTicket> RenderGraph::PreparePersistentTicket(rhi::Device device, uint32_t epoch, RunRef run, uint64_t hostFrame,
 	uint64_t hostTag, std::shared_ptr<const IHostExecutionData> hostData, bool admissionOnly) {
 	BT_ZONE_SCOPE("ORG.Persistent.PrepareTicket");
+	const uint32_t slot = run.lease;
 	auto ticket = std::make_shared<PersistentTicket>();
 	ticket->epoch = epoch;
 	ticket->slot = slot;
+	ticket->run = run;
 	ticket->hostFrame = hostFrame;
 	ticket->hostTag = hostTag;
 	ticket->external = IsExternalPersistentEpoch(epoch);
 	const PersistentExecutionOptions options{.ticket = ticket.get(), .hostTag = hostTag, .admissionOnly = admissionOnly,
-		.hostData = static_cast<bool>(hostData)};
+		.hostData = static_cast<bool>(hostData), .run = run};
 	SetPersistentEpoch(epoch);
 	UpdateExecutionContext update{};
 	update.frameIndex = slot;
@@ -34,11 +36,12 @@ std::shared_ptr<RenderGraph::PersistentTicket> RenderGraph::PreparePersistentTic
 	return ticket;
 }
 
-std::shared_ptr<RenderGraph::PersistentTicket> RenderGraph::PrepareRevisionTicket(uint32_t epoch, uint32_t slot, uint64_t hostFrame) {
+std::shared_ptr<RenderGraph::PersistentTicket> RenderGraph::PrepareRevisionTicket(uint32_t epoch, RunRef run, uint64_t hostFrame) {
 	BT_ZONE_SCOPE("ORG.Persistent.PrepareRevisionTicket");
 	auto ticket = std::make_shared<PersistentTicket>();
 	ticket->epoch = epoch;
-	ticket->slot = slot;
+	ticket->slot = run.lease;
+	ticket->run = run;
 	ticket->hostFrame = hostFrame;
 	ticket->revision = true;
 	ticket->external = IsExternalPersistentEpoch(epoch);
@@ -114,7 +117,7 @@ std::vector<std::pair<uint32_t, uint64_t>> RenderGraph::CompletePersistentTicket
 		if (segment.recording) ticket.replaced.push_back(std::move(segment.recording));
 	ticket.displaced.clear();
 	// Abandoned packets are destroyed here, never submitted: their lifecycle effects abandon and their
-	// command lists return to the pool. A kept recording stays with its set.
+	// command lists return to the pool. A revision's recording stays with its caller.
 	ticket.segments.clear();
 	ticket.replaced.clear();
 	basic_telemetry::AddCounter(submission.submitted ? "ORG.Persistent.TicketsSubmitted" : "ORG.Persistent.TicketsAbandoned");
@@ -122,43 +125,13 @@ std::vector<std::pair<uint32_t, uint64_t>> RenderGraph::CompletePersistentTicket
 }
 
 uint32_t RenderGraph::PersistentTicketEpoch(const PersistentTicket& ticket) noexcept { return ticket.epoch; }
-uint32_t RenderGraph::PersistentTicketSlot(const PersistentTicket& ticket) noexcept { return ticket.slot; }
+RunRef RenderGraph::PersistentTicketRun(const PersistentTicket& ticket) noexcept { return ticket.run; }
 uint64_t RenderGraph::PersistentTicketHostFrame(const PersistentTicket& ticket) noexcept { return ticket.hostFrame; }
 ExecutionHandle RenderGraph::PersistentTicketExecution(const PersistentTicket& ticket) noexcept { return ExecutionHandle(ticket.execution); }
 uint64_t RenderGraph::PersistentTicketHostTag(const PersistentTicket& ticket) noexcept { return ticket.hostTag; }
 void RenderGraph::SetPersistentTicketHostTag(PersistentTicket& ticket, uint64_t tag) noexcept { ticket.hostTag = tag; }
 uint32_t RenderGraph::PersistentTicketSparedUploadWaits(const PersistentTicket& ticket) noexcept {
 	return ticket.queueUploads.planned ? ticket.queueUploads.spared : 0;
-}
-
-bool RenderGraph::AdoptKeptPersistentRecording(PersistentTicket& ticket, uint64_t hostTag) {
-	BT_ZONE_SCOPE("ORG.Persistent.AdoptKeptRecording");
-	if (!m_keptRecordings || ticket.uncheckable || ticket.segments.size() != 1) return false;
-	auto& segment = ticket.segments.front();
-	if (!segment.recording) return false;
-	const auto set = m_keptRecordings->Load(ticket.epoch, ticket.slot);
-	if (!set || set->empty()) return false;
-	// What the ticket's passes depend on now: the same passes (the same publication), their revisions as they are.
-	std::vector<std::pair<const RenderGraphPass*, uint64_t>> now;
-	now.reserve(ticket.revisions.size());
-	for (const auto& [pass, recorded] : ticket.revisions) {
-		uint64_t hash = 0;
-		if (!pass->RevisionHash(hash)) return false;
-		now.emplace_back(pass, hash);
-	}
-	const auto& current = *segment.recording;
-	for (const auto& kept : *set) {
-		if (kept.get() == &current || !kept->Recorded(hostTag, segment.admission.publication.get(), current.bindings.get(), current.resourceHeap, current.samplerHeap, now))
-			continue;
-		ticket.replaced.push_back(std::move(segment.recording));
-		segment.recording = kept;
-		kept->lastUse.store(ticket.hostFrame, std::memory_order_relaxed);
-		ticket.revisions = std::move(now);
-		ticket.hostTag = hostTag;
-		m_recordingsAdopted.fetch_add(1, std::memory_order_relaxed);
-		return true;
-	}
-	return false;
 }
 
 std::shared_ptr<const RenderGraph::PersistentRecording> RenderGraph::PersistentTicketRecording(const PersistentTicket& ticket) noexcept {
@@ -246,26 +219,11 @@ bool RenderGraph::CanBindPersistentTicketRecording(const PersistentTicket& ticke
 	return true;
 }
 
-std::pair<uint64_t, uint64_t> RenderGraph::KeptRecordingStore::Count() const {
-	std::scoped_lock lock(m_mutex);
-	uint64_t recordings = 0, packets = 0;
-	for (const auto& [key, set] : m_sets)
-		for (const auto& recording : *set) {
-			++recordings;
-			packets += recording->packets.size();
-		}
-	return {recordings, packets};
-}
-
 RenderGraph::PersistentRecordingStats RenderGraph::TakePersistentRecordingStats() noexcept {
 	PersistentRecordingStats stats;
 	stats.recorded = m_recordingsRecorded.exchange(0, std::memory_order_relaxed);
-	stats.kept = m_recordingsKept.exchange(0, std::memory_order_relaxed);
-	stats.reused = m_recordingsReused.exchange(0, std::memory_order_relaxed);
-	stats.adopted = m_recordingsAdopted.exchange(0, std::memory_order_relaxed);
 	if (m_compilerState && m_compilerState->persistent && m_compilerState->persistent->admission)
 		std::tie(stats.predicted, stats.planned) = m_compilerState->persistent->admission->TakePredictionCounts();
-	if (m_keptRecordings) std::tie(stats.held, stats.heldPackets) = m_keptRecordings->Count();
 	return stats;
 }
 

@@ -950,6 +950,12 @@ std::shared_ptr<RenderPass> RenderGraph::GetRenderPassByName(const std::string& 
 void RenderGraph::Update(const UpdateExecutionContext& context, rhi::Device device, const PersistentExecutionOptions& options) {
     // A task service without a settings service is a structural/unit host: it admits no executable frames.
     if (m_taskService && !m_renderGraphSettingsService) return;
+    if (!options.run && context.run) {
+        auto withRun = options;
+        withRun.run = context.run;
+        UpdateOnPreparationOwner(context, device, withRun);
+        return;
+    }
     UpdateOnPreparationOwner(context, device, options);
 }
 

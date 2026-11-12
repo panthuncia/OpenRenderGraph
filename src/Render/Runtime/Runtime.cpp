@@ -14,6 +14,7 @@
 #include <string_view>
 #include <thread>
 
+#include "Render/FrameArena.h"
 #include "Render/PipelineLibrary.h"
 #include "Render/QueueRegistry.h"
 #include "Render/RenderGraph/PersistentGraph.h"
@@ -259,6 +260,10 @@ void Runtime::Initialize() {
 		[this] { return m_assigning.load(std::memory_order_acquire) == 0; });
 	DescriptorHeapManager::GetInstance().SetFrontier([this] { return Frontier(); }, [this](const runtime::SubmittedPoint& point) { return Reached(point); });
 
+	// Freed pinned regions wait for the GPU like deferred deletions do.
+	m_arena = std::make_shared<FrameArena>();
+	m_arena->SetFrontier([this] { return Frontier(); }, [this](const runtime::SubmittedPoint& point) { return Reached(point); });
+
 	m_descriptors = runtime::CreateDefaultDescriptorService();
 	m_settings = runtime::CreateDefaultRenderGraphSettingsService();
 	m_uploads = runtime::CreateDefaultUploadService();
@@ -288,6 +293,9 @@ Runtime::~Runtime() {
 	}
 	DeletionManager::GetInstance().SetFrontier({}, {});
 	DescriptorHeapManager::GetInstance().SetFrontier({}, {});
+	// Blocks still alive keep the arena. Its frontier is this runtime's, which is going.
+	if (m_arena) m_arena->SetFrontier({}, {});
+	m_arena.reset();
 	StatisticsManager::GetInstance().ClearAll();
 	m_readbacks.reset();
 	m_uploads.reset();
