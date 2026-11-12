@@ -1024,11 +1024,15 @@ bool GraphHost::NudgeHostThread() {
 	return true;
 }
 
-std::string GraphHost::DescribeAsyncState() const {
+std::string GraphHost::DescribeAsyncState(bool a_pollTimelines) const {
 	// Read racily from another thread: a message for a failure, never a decision.
 	const auto* async = m_async.get();
 	if (!async) return "no async host thread";
 	const auto n = [](uint64_t a_value) { return std::to_string(a_value); };
+	// A completed value takes the RHI's timeline lock. A caller inside a submission may hold it already.
+	const auto completed = [&](auto& a_timeline) {
+		return a_pollTimelines ? n(a_timeline->GetCompletedValue()) : std::string("?");
+	};
 	const uint64_t seals = m_seals.load(std::memory_order_acquire);
 	std::string out = "host thread: failed " + n(async->failed.load()) + ", messages written " + n(async->written.load()) + " read " +
 		n(async->read.load()) + ", wakes on GPU " + n(async->wakesOnGpu.load()) + ", sleeping on " + n(async->sleepingAt.load()) + " (version + 1), wake version " +
@@ -1044,9 +1048,14 @@ std::string GraphHost::DescribeAsyncState() const {
 	out += "; host timelines (t<index> last assigned/completed):";
 	for (const auto& timeline : m_timelines)
 		if (timeline.fence && *timeline.fence)
-			out += " t" + n((*timeline.fence)->GetHandle().index) + " " + n(timeline.nextValue->load() - 1) + "/" + n((*timeline.fence)->GetCompletedValue());
-	// The runs in flight, oldest first, and what each waits for.
-	std::scoped_lock lock(m_leaseMutex);
+			out += " t" + n((*timeline.fence)->GetHandle().index) + " " + n(timeline.nextValue->load() - 1) + "/" + completed(*timeline.fence);
+	// The runs in flight, oldest first, and what each waits for. Without polling, never block: the lease lock's holder may be
+	// waiting for the RHI lock the caller holds.
+	std::unique_lock lock(m_leaseMutex, std::defer_lock);
+	if (a_pollTimelines)
+		lock.lock();
+	else if (!lock.try_lock())
+		return out + "; leases: (locked)";
 	out += "; leases: " + n(m_leasesInFlight) + " in flight of " + n(m_leaseStore.size()) + "; submitted (index#submission s=seal, points):";
 	size_t listed = 0;
 	for (const auto* lease : m_submittedLeases) {
@@ -1057,7 +1066,7 @@ std::string GraphHost::DescribeAsyncState() const {
 		out += " [" + n(lease->index) + (lease->external ? " external" : " #" + n(lease->submission)) + " s" + n(lease->seal);
 		for (const auto& [timeline, value] : lease->points)
 			if (timeline && *timeline)
-				out += " t" + n((*timeline)->GetHandle().index) + " " + n(value) + "/" + n((*timeline)->GetCompletedValue());
+				out += " t" + n((*timeline)->GetHandle().index) + " " + n(value) + "/" + completed(*timeline);
 		out += "]";
 	}
 	return out;

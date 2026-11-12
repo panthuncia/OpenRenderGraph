@@ -488,7 +488,9 @@ public:
 	GpuPoint SealedPoint() const;
 	// Any thread, for a failure message only: the host's thread's state (each async epoch's pause and ticket, the run leases in
 	// flight and what each waits for, the queued requests, the wake), read racily.
-	std::string DescribeAsyncState() const;
+	// a_pollTimelines false: no RHI call and no blocking lock. Use it where the caller may hold an RHI lock, such as inside a
+	// queue submission hook (completed values then read "?").
+	std::string DescribeAsyncState(bool a_pollTimelines = true) const;
 	// A thread waiting for recording requests: wakes the host's thread when it sleeps with one queued (a lost wake, logged once).
 	// True when it did.
 	bool NudgeHostThread();
