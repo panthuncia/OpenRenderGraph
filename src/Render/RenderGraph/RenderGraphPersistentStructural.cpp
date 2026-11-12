@@ -930,6 +930,11 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 			if (!(earlier.lastUse < later.firstUse))
 				throw std::logic_error("Persistent alias plan produced overlapping lifetimes for '" + a.concrete->GetName() + "' and '" + b.concrete->GetName() + "'");
 			++overlapPairs;
+			// Which transients share memory, for checking a plan by hand (CS: CS_ORG_ALIAS_LOG=1).
+			if (logging)
+				spdlog::info("Persistent alias overlap: '{}' [{}, {}) ranks {}-{} then '{}' [{}, {}) ranks {}-{}", earlier.concrete->GetName(),
+					earlier.offset, earlier.offset + earlier.sizeBytes, earlier.firstUse, earlier.lastUse, later.concrete->GetName(), later.offset,
+					later.offset + later.sizeBytes, later.firstUse, later.lastUse);
 			for (const auto u : earlier.users) for (const auto v : later.users)
 				edges.emplace_back(structure.passes[u].preparedPassIndex, structure.passes[v].preparedPassIndex);
 		}

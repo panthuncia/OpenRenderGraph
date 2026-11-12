@@ -467,10 +467,13 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
             });
             if (!uniform) uniformBefore.reset();
         } else if (invalidatedState) {
+            // The contents are discarded, but the memory may hold another occupant whose last use came just before (an aliased
+            // backing: another transient of this graph, or of another graph on this queue). Sync All orders this first use after
+            // that work; with None the backend's discard waits for nothing, and the GPU overlaps the two uses.
             uniformBefore = {static_cast<uint64_t>(rhi::ResourceAccessType::None),
                 static_cast<uint64_t>(captured.shape.hasLayout
                     ? rhi::ResourceLayout::Undefined : rhi::ResourceLayout::Common),
-                static_cast<uint64_t>(rhi::ResourceSyncState::None), false};
+                static_cast<uint64_t>(rhi::ResourceSyncState::All), false};
         } else if (captured.regions) {
             const auto rangeEndMip = step.range.mip + step.range.mips;
             const auto rangeEndSlice = step.range.slice + step.range.slices;
@@ -543,10 +546,11 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
                 before = existing->cells[cellIndex];
                 previousQueue = existing->queues[cellIndex];
             } else if (boundaryStep && invalidatedState) {
+                // As the uniform case above: ordered after the memory's previous occupant.
                 before = {static_cast<uint64_t>(rhi::ResourceAccessType::None),
                     static_cast<uint64_t>(captured.shape.hasLayout
                         ? rhi::ResourceLayout::Undefined : rhi::ResourceLayout::Common),
-                    static_cast<uint64_t>(rhi::ResourceSyncState::None), false};
+                    static_cast<uint64_t>(rhi::ResourceSyncState::All), false};
             } else if (boundaryStep) {
                 if (captured.regions) for (const auto& region : *captured.regions) {
                     if (mip >= region.range.mip && mip < region.range.mip + region.range.mips
