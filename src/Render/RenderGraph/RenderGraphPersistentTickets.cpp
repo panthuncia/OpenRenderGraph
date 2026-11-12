@@ -246,6 +246,17 @@ bool RenderGraph::CanBindPersistentTicketRecording(const PersistentTicket& ticke
 	return true;
 }
 
+std::pair<uint64_t, uint64_t> RenderGraph::KeptRecordingStore::Count() const {
+	std::scoped_lock lock(m_mutex);
+	uint64_t recordings = 0, packets = 0;
+	for (const auto& [key, set] : m_sets)
+		for (const auto& recording : *set) {
+			++recordings;
+			packets += recording->packets.size();
+		}
+	return {recordings, packets};
+}
+
 RenderGraph::PersistentRecordingStats RenderGraph::TakePersistentRecordingStats() noexcept {
 	PersistentRecordingStats stats;
 	stats.recorded = m_recordingsRecorded.exchange(0, std::memory_order_relaxed);
@@ -254,6 +265,7 @@ RenderGraph::PersistentRecordingStats RenderGraph::TakePersistentRecordingStats(
 	stats.adopted = m_recordingsAdopted.exchange(0, std::memory_order_relaxed);
 	if (m_compilerState && m_compilerState->persistent && m_compilerState->persistent->admission)
 		std::tie(stats.predicted, stats.planned) = m_compilerState->persistent->admission->TakePredictionCounts();
+	if (m_keptRecordings) std::tie(stats.held, stats.heldPackets) = m_keptRecordings->Count();
 	return stats;
 }
 

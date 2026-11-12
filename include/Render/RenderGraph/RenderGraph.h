@@ -338,6 +338,9 @@ private:
 	static constexpr size_t kKeptRecordingVariants = 4;
 	void SetPersistentRecordingReuse(bool reuse) noexcept { m_persistentRecordingReuse = reuse; }
 	bool PersistentRecordingReuse() const noexcept { return m_persistentRecordingReuse; }
+	// Off: a live ticket's recording is never kept or taken from the store; recordings made for host data (revision recordings)
+	// are replayable as before. On by default.
+	void SetKeepLiveRecordings(bool keep) noexcept { m_keepLiveRecordings = keep; }
 	// Pass and barrier-batch timestamps in recordings kept for resubmission (off by default): each such list records into
 	// queries it owns (IStatisticsService::CreateOwnedTimestamps), resolved by every submission and read when its frame slot
 	// completes (IStatisticsService::GetCompletedTimestamps). Read when a list is recorded: set it before the graph records
@@ -357,6 +360,8 @@ private:
 		// Tickets admitted at submission with their prediction's plan (the ledger held what the executable found last), and those
 		// planned against the ledger (SynchronousAdmission::TakePredictionCounts).
 		uint64_t predicted = 0, planned = 0;
+		// Kept recordings held in the store now, and the command-list packets they hold (not reset by the call).
+		uint64_t held = 0, heldPackets = 0;
 	};
 	// Since the last call (any thread).
 	PersistentRecordingStats TakePersistentRecordingStats() noexcept;
@@ -776,6 +781,7 @@ private:
 	std::mutex m_externalSecondaryPoolsMutex;
 	std::vector<std::shared_ptr<CommandListPool>> m_externalSecondaryPools;
 	bool m_persistentRecordingReuse = false;
+	bool m_keepLiveRecordings = true;
 	SharingChangePolicy m_sharingChangePolicy = SharingChangePolicy::Inline;
 	bool m_persistentRecordingTimestamps = false;
 	// Kept recordings per (epoch, frame slot). Each set is replaced whole by the owner thread and read by the submitting
@@ -793,6 +799,8 @@ private:
 			std::scoped_lock lock(m_mutex);
 			m_sets[Key(epoch, slot)] = std::move(set);
 		}
+		// The recordings held, and their packets.
+		std::pair<uint64_t, uint64_t> Count() const;
 	private:
 		static uint64_t Key(uint32_t epoch, uint32_t slot) noexcept { return (static_cast<uint64_t>(epoch) << 32) | slot; }
 		mutable std::mutex m_mutex;

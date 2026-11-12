@@ -188,7 +188,7 @@ bool RenderGraph::AdmitPersistentSegment(PersistentSegmentRun& run) {
 		&& admission.incomingEffects.empty() && !ticketTarget->uncheckable
 		&& !(run.external && lateUnreplayable);
 	if (run.keepable && !m_keptRecordings) m_keptRecordings = std::make_unique<KeptRecordingStore>();
-	if (run.keepable && !options.hostData) {
+	if (run.keepable && !options.hostData && m_keepLiveRecordings) {
 		const auto set = m_keptRecordings->Load(ticketTarget->epoch, run.execution.frameIndex);
 		for (const auto& kept : set ? *set : KeptRecordingSet{}) {
 			if (!kept->Recorded(options.hostTag, segment.publication.get(), segment.bindings.get(), run.resourceHeap, run.samplerHeap,
@@ -496,7 +496,7 @@ void RenderGraph::SubmitPersistentSegment(PersistentSegmentRun& run) {
 				recording->leases = segment.leases;
 			}
 			// A recording made for host data is its caller's (BindPersistentTicketRecording), never kept here.
-			if (recording->replayable && !options.hostData) {
+			if (recording->replayable && !options.hostData && m_keepLiveRecordings) {
 				// Kept with the others recorded under the same publication, bindings and host tag (any other can never be
 				// taken again), the most recently used first.
 				const auto previous = m_keptRecordings->Load(ticket->epoch, run.execution.frameIndex);

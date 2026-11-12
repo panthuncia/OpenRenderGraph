@@ -80,6 +80,9 @@ public:
 		// instead of recording, and a ticket the beforeSubmit callback made stale takes the kept recording of what it depends
 		// on now instead of being prepared again (a wait). Kept recordings carry no profiler GPU zones.
 		bool reuseRecordings = false;
+		// With reuseRecordings: false keeps no live ticket's recording (RenderGraph::SetKeepLiveRecordings); revision-driven
+		// epochs' recordings are unaffected.
+		bool keepLiveRecordings = true;
 		// Async epochs: a ticket's staged uploads whose destination it first uses on another queue than graphics (async compute)
 		// are recorded on that queue, just ahead of the ticket's first batch there, instead of on the graphics queue; and a batch
 		// on another queue waits for the graphics queue's uploads only when it uses what they write (RenderGraph::
@@ -398,6 +401,8 @@ public:
 		// Desc::reuseRecordings: tickets recorded, recordings kept, tickets that took a kept recording instead of recording,
 		// and stale tickets made current by a kept recording (not prepared again).
 		uint64_t recorded = 0, kept = 0, reused = 0, adopted = 0;
+		// Kept recordings held now across every epoch graph, and their command-list packets.
+		uint64_t held = 0, heldPackets = 0;
 		// Tickets admitted with their prediction's plan, and those planned against the ledgers (RenderGraph::PersistentRecordingStats).
 		uint64_t predicted = 0, planned = 0;
 		// Revision-driven epochs: slots recorded for requests (RequestEpochRecording), requests completed, and submissions of a

@@ -631,6 +631,7 @@ bool GraphHost::BuildInstance(size_t index) {
 		}
 		graph->SetExternalPersistentEpochs(m_externalEpochs);
 		graph->SetPersistentRecordingReuse(m_desc.reuseRecordings);
+		graph->SetKeepLiveRecordings(m_desc.keepLiveRecordings);
 		graph->SetPersistentRecordingTimestamps(m_recordingTimestamps.load(std::memory_order_acquire));
 		graph->SetScheduleTraceEnabled(m_scheduleTrace.load(std::memory_order_acquire));
 		{
@@ -1832,9 +1833,12 @@ void GraphHost::StopAsync() {
 GraphHost::AsyncStats GraphHost::TakeAsyncStats() noexcept {
 	m_asyncStats.recorded = m_asyncStats.kept = m_asyncStats.reused = m_asyncStats.adopted = 0;
 	m_asyncStats.predicted = m_asyncStats.planned = 0;
+	m_asyncStats.held = m_asyncStats.heldPackets = 0;
 	for (auto& instance : m_instances) {
 		if (!instance.graph) continue;
 		const auto recordings = instance.graph->TakePersistentRecordingStats();
+		m_asyncStats.held += recordings.held;
+		m_asyncStats.heldPackets += recordings.heldPackets;
 		m_asyncStats.recorded += recordings.recorded;
 		m_asyncStats.kept += recordings.kept;
 		m_asyncStats.reused += recordings.reused;
