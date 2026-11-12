@@ -604,7 +604,8 @@ bool CopyQueueUploadService::RecordAndSubmit(Batch& batch) {
 		for (const auto& [waitTimeline, value] : copy.waits) {
 			if (!waitTimeline || !*waitTimeline || (*waitTimeline)->GetCompletedValue() >= value) continue;
 			if ((*waitTimeline)->HostWait(value, 10'000) != rhi::Result::Ok) {
-				spdlog::warn("CopyQueueUploadService '{}': a wait was not reached in 10 s; it stays on the submission", m_config.debugName);
+				spdlog::warn("CopyQueueUploadService '{}': a wait was not reached in 10 s (timeline t{} wants {}, at {}); it stays on the submission",
+					m_config.debugName, (*waitTimeline)->GetHandle().index, value, (*waitTimeline)->GetCompletedValue());
 			}
 		}
 	}
