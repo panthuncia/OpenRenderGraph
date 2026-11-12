@@ -338,6 +338,26 @@ size_t ExecutionTimelineAdmission::RetireCompleted(std::span<const ExecutionTime
     return before - m_retained.size();
 }
 
+bool ExecutionTimelineAdmission::LowestRetainedSignals(std::span<uint64_t> lowest) const {
+    if (lowest.size() != m_completed.size()) return false;
+    for (const auto& execution : m_retained) {
+        if (!execution || execution->batches.empty()) return false;
+        const auto& batches = execution->bundle->graph->batches;
+        for (size_t i = 0; i < execution->batches.size(); ++i) {
+            const auto queue = batches[i].queue;
+            if (queue >= lowest.size()) return false;
+            lowest[queue] = (std::min)(lowest[queue], execution->batches[i].signal.value);
+        }
+        for (const auto completion : execution->tailCompletions) {
+            const auto found = std::ranges::find(m_completed, completion.timeline, &ExecutionTimelinePoint::timeline);
+            if (found == m_completed.end()) return false;
+            auto& value = lowest[static_cast<size_t>(found - m_completed.begin())];
+            value = (std::min)(value, completion.value);
+        }
+    }
+    return true;
+}
+
 std::vector<std::shared_ptr<GraphExecutionTimeline>>
 ExecutionTimelineAdmission::TakeRetiredGarbage() {
     // Explicit diagnostic reproduction of the old synchronous retention bug.

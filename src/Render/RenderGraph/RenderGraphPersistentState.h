@@ -530,6 +530,15 @@ struct RenderGraph::PersistentExecutionsState {
 	std::vector<std::shared_ptr<detail::ExecutionRecord>> pendingExecutions;
 	// Lists submitted after an execution's batches (its home acquires), kept until their own signal completes.
 	std::vector<std::pair<compiler::ExecutionTimelinePoint, std::shared_ptr<const void>>> trailingLeases;
+	// What the last full retirement pass (RetirePersistentExecutions) left:
+	// - submitted: the timelines' submitted value per queue slot it saw,
+	// - lowest: per queue slot, the lowest value that anything still held waits for (UINT64_MAX for none).
+	// While the submitted values stay the same and every queue's completed value is below its lowest, nothing can be released,
+	// and retirement returns at once. skippable is false when something held waits for a timeline that is not a queue slot's.
+	struct RetireWatch {
+		bool skippable = false;
+		std::vector<uint64_t> submitted, lowest;
+	} retireWatch;
 	// Per frame slot: the handoff lists a ticket recorded from a predicted plan (FrameAdmission::sharedBarriers). The next ticket in
 	// the slot whose admission takes the same plan submits them again: the slot's earlier work has completed by then.
 	struct HandoffCache {

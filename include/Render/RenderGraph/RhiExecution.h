@@ -81,9 +81,10 @@ inline std::shared_ptr<const RenderFrameSnapshot> SealPersistentFrame(
         || !selected->executable->executionLayout)
         throw std::invalid_argument("Incomplete persistent frame seal");
     const auto layout = selected->executable->executionLayout;
+    const auto& barriers = admission.Barriers();
     if (invocations.size() != layout->placements.size()
-        || admission.barriers.batches.size() != selected->executable->graph->batches.size()
-        || admission.incomingWaits.size() != admission.barriers.batches.size())
+        || barriers.batches.size() != selected->executable->graph->batches.size()
+        || admission.incomingWaits.size() != barriers.batches.size())
         throw std::invalid_argument("Persistent frame seal dimensions mismatch");
     const auto& slots = selected->executable->resourceSlots;
     if (admission.backings.size() != slots.size())
@@ -119,7 +120,9 @@ inline std::shared_ptr<const RenderFrameSnapshot> SealPersistentFrame(
     result->layout = layout;
     result->passes = std::move(invocations);
     result->initialStates = admission.backings.Shared();
-    result->barrierPlan = std::make_shared<const PreparedExecutionBarrierPlan>(admission.barriers);
+    // A shared plan (a prediction's, or a ticket body's: SynchronousAdmission::CachedBody) is immutable, so it is kept, not copied.
+    result->barrierPlan = admission.sharedBarriers ? admission.sharedBarriers
+        : std::make_shared<const PreparedExecutionBarrierPlan>(admission.barriers);
     // Arm lifecycle ownership only after every fallible allocation succeeds.
     // A pending packet still owns these handles if sealing fails partway through.
     result->publication = selected;

@@ -649,15 +649,34 @@ ExecutionHandle RenderGraph::LastExecution() const {
 	return m_compilerState && m_compilerState->persistent ? ExecutionHandle(m_compilerState->persistent->lastExecution) : ExecutionHandle{};
 }
 
-void RenderGraph::RetirePersistentExecutions() {
+void RenderGraph::RetirePersistentExecutions(CompletedTimelineValues* known) {
 	auto& compiler = *m_compilerState;
 	if (!compiler.persistent || !compiler.persistent->timelines) return;
 	auto& state = *compiler.persistent;
+	CompletedTimelineValues local;
+	auto& values = known ? *known : local;
+	const auto submitted = state.timelines->Submitted();
+	// Per queue slot: what the GPU has completed. Nothing can be released while the timelines' submitted values are the ones
+	// the last full pass saw (no execution recorded since) and every queue is below the lowest value anything held waits for.
+	// Only the GPU's real progress is compared, so nothing another graph observed on a shared timeline can be missed: an
+	// observation is never above it.
+	std::array<uint64_t, 8> fences{};
+	const bool fewSlots = submitted.size() <= fences.size();
+	for (size_t slot = 0; slot < submitted.size() && fewSlots; ++slot)
+		fences[slot] = values.Of(m_queueRegistry.GetFence(static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot))));
+	auto& watch = state.retireWatch;
+	if (fewSlots && watch.skippable && watch.submitted.size() == submitted.size() && watch.lowest.size() == submitted.size()) {
+		bool reached = false;
+		for (size_t slot = 0; slot < submitted.size() && !reached; ++slot)
+			reached = watch.submitted[slot] != submitted[slot].value || fences[slot] >= watch.lowest[slot];
+		if (!reached) return;
+	}
 	BT_ZONE_SCOPE("ORG.Persistent.Retire");
 	std::vector<compiler::ExecutionTimelinePoint> completed;
-	const auto submitted = state.timelines->Submitted();
+	completed.reserve(submitted.size());
 	for (size_t slot = 0; slot < submitted.size(); ++slot) {
-		const auto fence = m_queueRegistry.GetFence(static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot))).GetCompletedValue();
+		const auto fence = fewSlots ? fences[slot]
+			: values.Of(m_queueRegistry.GetFence(static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot))));
 		completed.push_back({submitted[slot].timeline, (std::min)(submitted[slot].value, fence)});
 	}
 	state.timelines->RetireCompleted(completed);
@@ -685,6 +704,31 @@ void RenderGraph::RetirePersistentExecutions() {
 			[garbage] { BT_ZONE_SCOPE("ORG.Frame.DestroyRetiredOwnership"); garbage->clear(); }))
 			garbage->clear();
 	}
+	// What the next pass must see before anything can be released (RetireWatch): the lowest value per queue slot of what is
+	// still held, over the timelines' executions, the admission's frames, the trailing lists and the execution handles.
+	watch.submitted.resize(submitted.size());
+	watch.lowest.assign(submitted.size(), UINT64_MAX);
+	std::vector<uint64_t> identities(submitted.size());
+	for (size_t slot = 0; slot < submitted.size(); ++slot) {
+		watch.submitted[slot] = submitted[slot].value;
+		identities[slot] = submitted[slot].timeline;
+	}
+	const auto lower = [&](uint64_t timeline, uint64_t value) {
+		const auto found = std::ranges::find(identities, timeline);
+		if (found == identities.end()) return false;
+		auto& lowest = watch.lowest[static_cast<size_t>(found - identities.begin())];
+		lowest = (std::min)(lowest, value);
+		return true;
+	};
+	bool skippable = fewSlots && state.timelines->LowestRetainedSignals(watch.lowest)
+		&& state.admission->LowestRetainedCompletions(identities, watch.lowest);
+	for (const auto& lease : state.trailingLeases) skippable = skippable && lower(lease.first.timeline, lease.first.value);
+	for (const auto& record : state.pendingExecutions) {
+		// A handle with no signal is released by the next full pass.
+		skippable = skippable && !record->signals.empty();
+		for (const auto& signal : record->signals) skippable = skippable && lower(signal.timeline, signal.value);
+	}
+	watch.skippable = skippable;
 	BT_PLOT("ORG.Persistent.RetainedFrames", static_cast<int64_t>(state.admission->RetainedFrames()));
 	BT_PLOT("ORG.Persistent.InFlight", static_cast<int64_t>(state.timelines->InFlight()));
 }

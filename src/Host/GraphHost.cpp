@@ -1268,6 +1268,7 @@ void GraphHost::StartAsync() {
 	auto* state = async.get();
 	state->thread = std::thread([this, state] {
 		const auto graphOf = [&](uint32_t epochIndex) -> RenderGraph& { return *m_instances[state->instanceOf[epochIndex]].graph; };
+		RenderGraph::CompletedTimelineValues completedValues;
 		try {
 			for (;;) {
 				const auto seen = state->completionWake->WakeVersion();
@@ -1403,8 +1404,11 @@ void GraphHost::StartAsync() {
 					request->done = std::move(node->done);
 					state->pendingRequests.push_back(std::move(request));
 				}
+				// Each queue timeline's completed value is read once for every graph (they share the timelines). A graph none of
+				// whose work the GPU has reached returns at once.
+				completedValues.Clear();
 				for (uint32_t index = 0; index < state->epochs.size(); ++index)
-					if (!state->paused[index]) graphOf(index).RetirePersistentExecutions();
+					if (!state->paused[index]) graphOf(index).RetirePersistentExecutions(&completedValues);
 				// Every run whose GPU work is done retires: its statistics are read, and its lists, arena regions, upload staging and
 				// owners are freed, even if no later run takes its lease again.
 				(void)RetireReachedLeases(state);

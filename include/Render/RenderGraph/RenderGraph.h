@@ -353,8 +353,24 @@ private:
 	PersistentRecordingStats TakePersistentRecordingStats() noexcept;
 	// Returns the last value the submission signals on each queue slot it used (empty when abandoned).
 	std::vector<std::pair<uint32_t, uint64_t>> CompletePersistentTicket(PersistentTicket& ticket, const PersistentTicketSubmission& submission);
-	// Owner thread: releases executions the GPU has finished (the retirement Execute does before submitting).
-	void RetirePersistentExecutions();
+	// GPU completion values for one pass of retirement over several graphs. Each value is read once per timeline, because
+	// each read is a driver call and the host's graphs share their queue timelines. Clear it before each pass.
+	class CompletedTimelineValues {
+	public:
+		uint64_t Of(rhi::Timeline& timeline) {
+			for (const auto& [known, value] : m_values)
+				if (known == &timeline) return value;
+			const uint64_t value = timeline.GetCompletedValue();
+			m_values.emplace_back(&timeline, value);
+			return value;
+		}
+		void Clear() noexcept { m_values.clear(); }
+	private:
+		std::vector<std::pair<const rhi::Timeline*, uint64_t>> m_values;
+	};
+	// Owner thread: releases executions the GPU has finished (the retirement Execute does before submitting). A graph none of
+	// whose executions the GPU has reached returns at once. completed: the values read already in this pass, or null.
+	void RetirePersistentExecutions(CompletedTimelineValues* completed = nullptr);
 	// Submitting thread; they touch nothing the owner thread uses.
 	static uint32_t PersistentTicketEpoch(const PersistentTicket& ticket) noexcept;
 	// The run it was prepared for (PreparePersistentTicket, PrepareRevisionTicket).
@@ -619,6 +635,10 @@ public:
 	// persistent::AllEpochs (the default) takes every pass.
 	void SetPassEpochFilter(uint32_t epoch) noexcept { m_passEpochFilter = epoch; }
 	uint32_t PassEpochFilter() const noexcept { return m_passEpochFilter; }
+	// Whether the graph's epoch (PassEpochFilter) is an external one, whose graphics work the host runs in its own stream. Its
+	// extensions may then declare passes recorded at execution (ExternalPassDesc::RecordAtExecution). GraphHost sets this before
+	// it builds the graph, so an extension can read it while it gathers its passes.
+	bool PassEpochInHostStream() const noexcept { return IsExternalPersistentEpoch(m_passEpochFilter); }
 
 	/// The graph's external client (OpenRenderGraph/ExternalClient.h). Use it to submit GPU work recorded outside the
 	/// graph, such as uploads and readbacks. It uses this graph's queue slots, and its work is ordered with the graph's

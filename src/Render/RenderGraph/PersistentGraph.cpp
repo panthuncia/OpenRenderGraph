@@ -1736,7 +1736,7 @@ FrameAdmission SynchronousAdmission::PrepareFrame(std::shared_ptr<const Selected
     }
     frame.queuePoints.assign(queues.begin(), queues.end());
     frame.ownWaits = frame.incomingWaits;
-    AdmitLedger(frame, rebindings.empty() && incomingStates.empty());
+    AdmitLedger(frame, rebindings.empty() && incomingStates.empty(), !pending);
     frame.domain = m_domain;
     // A plan (PreparePlan) has no sequence: Commit and Readmit refuse it, Abandon ignores it.
     if (!pending) return frame;
@@ -1760,7 +1760,7 @@ std::string SynchronousAdmission::PendingOwners() const {
 void SynchronousAdmission::ErasePendingOwner(uint64_t sequence) {
     std::erase_if(m_pendingOwners, [sequence](const PendingOwner& owner) { return owner.sequence == sequence; });
 }
-void SynchronousAdmission::AdmitLedger(FrameAdmission& frame, bool cacheEligible) {
+void SynchronousAdmission::AdmitLedger(FrameAdmission& frame, bool cacheEligible, bool plan) {
     BT_ZONE_SCOPE("ORG.Persistent.AdmitLedger");
     const auto& graph = *frame.publication->executable->graph;
     frame.incomingWaits = frame.ownWaits;
@@ -1832,6 +1832,27 @@ void SynchronousAdmission::AdmitLedger(FrameAdmission& frame, bool cacheEligible
         frame.sharedBarriers = prediction.plan;
         frame.prediction = predictionSlot->prediction;
         ++m_planned;
+    } else if (plan && !m_closed && cacheEligible) {
+        // An open ticket's body plan: shared by every plan of the same backings (CachedBody).
+        BT_ZONE_SCOPE("ORG.Persistent.BodyPlan");
+        const auto& executable = frame.publication->executable;
+        const auto id = frame.backings.Id();
+        const CachedBody* found = nullptr;
+        for (const auto& entry : m_bodyCache)
+            if (entry.backings == id && entry.externalHome == m_externalHome && entry.executable.lock() == executable) {
+                found = &entry;
+                break;
+            }
+        if (found) {
+            frame.sharedBarriers = found->plan;
+        } else {
+            std::erase_if(m_bodyCache, [](const CachedBody& entry) { return entry.executable.expired(); });
+            if (m_bodyCache.size() >= 64) m_bodyCache.erase(m_bodyCache.begin());
+            auto made = std::make_shared<const compiler::PreparedExecutionBarrierPlan>(m_sequencer->states.Prepare(graph, frame.backings,
+                invalidated, m_closed, false, frame.backings.Validated(), id, m_externalHome));
+            m_bodyCache.push_back({executable, id, m_externalHome, made});
+            frame.sharedBarriers = std::move(made);
+        }
     } else {
         frame.barriers = m_sequencer->states.Prepare(graph, frame.backings, invalidated, m_closed, frame.entryOnly, frame.backings.Validated(),
             frame.backings.Id(), m_externalHome);
@@ -2007,19 +2028,24 @@ uint64_t SynchronousAdmission::Submitted(uint64_t timeline) const noexcept {
 }
 size_t SynchronousAdmission::RetireCompleted(std::span<const compiler::ExecutionTimelinePoint> completed) {
     std::unique_lock lock(m_sequencer->mutex);
-    auto observations = m_sequencer->completed;
-    std::map<uint64_t,bool> seen;
-    for (const auto point : completed) {
-        Require(point.timeline && !seen[point.timeline], "Invalid duplicate completion timeline");
-        seen[point.timeline] = true;
+    // Every observation is checked before any is applied, so a bad one changes nothing. There are a few timelines (one per
+    // queue), so the duplicate check is a scan.
+    for (size_t index = 0; index < completed.size(); ++index) {
+        const auto point = completed[index];
+        bool duplicate = !point.timeline;
+        for (size_t earlier = 0; earlier < index && !duplicate; ++earlier) duplicate = completed[earlier].timeline == point.timeline;
+        Require(!duplicate, "Invalid duplicate completion timeline");
         const auto submitted = m_submitted.find(point.timeline);
         Require((submitted != m_submitted.end() && point.value <= submitted->second) || !point.value,
             "Completion exceeds submitted work");
-        // Completion only advances, but the sequencer is shared: a graph built later (after a resize, say) can
-        // report a timeline it sampled before another graph's newer observation. Keep the furthest.
-        observations[point.timeline] = (std::max)(observations[point.timeline], point.value);
     }
-    m_sequencer->completed = std::move(observations);
+    // Completion only advances, but the sequencer is shared: a graph built later (after a resize, say) can report a timeline
+    // it sampled before another graph's newer observation. Keep the furthest.
+    for (const auto point : completed) {
+        auto& observed = m_sequencer->completed[point.timeline];
+        observed = (std::max)(observed, point.value);
+    }
+    if (m_retained.empty()) return 0;
     std::vector<std::shared_ptr<const SelectedPublication>> retired;
     std::erase_if(m_retained,[&](RetainedFrame& frame) {
         const bool done = std::ranges::all_of(frame.completions,[&](auto point) { return m_sequencer->Reached(point); });
@@ -2029,6 +2055,20 @@ size_t SynchronousAdmission::RetireCompleted(std::span<const compiler::Execution
     lock.unlock();  // nothing is called back under the sequencer's lock
     for (auto& publication : retired) RetireOwnership(m_retireOwnership,publication);
     return retired.size();
+}
+bool SynchronousAdmission::LowestRetainedCompletions(std::span<const uint64_t> timelines, std::span<uint64_t> lowest) const {
+    if (timelines.size() != lowest.size()) return false;
+    std::lock_guard lock(m_sequencer->mutex);
+    for (const auto& frame : m_retained) {
+        if (frame.completions.empty()) return false;
+        for (const auto point : frame.completions) {
+            const auto found = std::ranges::find(timelines, point.timeline);
+            if (found == timelines.end()) return false;
+            auto& value = lowest[static_cast<size_t>(found - timelines.begin())];
+            value = (std::min)(value, point.value);
+        }
+    }
+    return true;
 }
 struct PublicationCoordinator::Job {
     explicit Job(GraphEditTransaction value) : transaction(std::move(value)) {}
