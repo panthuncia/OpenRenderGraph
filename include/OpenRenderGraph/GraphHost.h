@@ -264,6 +264,21 @@ public:
 	void SetAsyncEpochs(std::vector<uint32_t> epochs, std::vector<uint32_t> revisionEpochs = {});
 	bool AsyncEpochs() const noexcept { return static_cast<bool>(m_async); }
 	/**
+	 * @brief Owner thread, before SetAsyncEpochs (it takes effect when the host's thread starts, and is kept across rebuilds): a live
+	 * async epoch that runs several times a frame keeps up to `most` tickets prepared, as many as it ran in the last frame. Its
+	 * back-to-back runs then find their tickets ready instead of each waiting for a preparation.
+	 *
+	 * - 1 (the default): the next ticket is prepared once the last one was submitted.
+	 * - The extra tickets are prepared while earlier ones of the epoch are submitted, so the epoch's passes are prepared on the
+	 *   host's thread while the render thread runs the epoch's commits and checks its passes' revisions. Enable it only for epochs
+	 *   whose passes' Prepare and Revision read nothing a commit writes.
+	 * - Each ticket holds a run lease. Only the first one queued has its upload lists begun on the host's thread; the render
+	 *   thread begins the others' when it submits them.
+	 * - When a ticket was stale at submission, the queued ones that are stale too are dropped and prepared again.
+	 * - A revision-driven epoch always keeps one.
+	 */
+	void SetEpochTicketsAhead(uint32_t epoch, uint32_t most);
+	/**
 	 * @brief Async epochs whose graphics-queue work the caller executes itself, in its own command buffers
 	 * (RenderGraph::SetExternalPersistentEpochs): SubmitEpoch submits only their batches on other queues. Their graphics uploads
 	 * are recorded into a secondary list, the execution is taken with TakeExternalExecution, and the caller executes its
@@ -373,6 +388,8 @@ public:
 		// Revision-driven tickets held for the next seal because every copy held an unsealed run (EpochCopiesBusyError), and copy
 		// waits: a submission whose copy's last run was sealed but not done, waited for on the host's thread.
 		uint64_t copiesBusy = 0, copyWaits = 0;
+		// Tickets prepared ahead (SetEpochTicketsAhead) dropped before their submission, because one before them was stale.
+		uint64_t staleAhead = 0;
 	};
 	AsyncStats TakeAsyncStats() noexcept;
 
@@ -651,6 +668,7 @@ private:
 	std::vector<std::shared_ptr<void>> m_externalRetired;
 	std::vector<uint32_t> m_asyncEpochs;  // restarted with these after a rebuild
 	std::vector<uint32_t> m_revisionEpochs;
+	std::vector<std::pair<uint32_t, uint32_t>> m_ticketsAhead;  // SetEpochTicketsAhead: (epoch, most)
 	std::vector<uint32_t> m_externalEpochs;  // SetExternalEpochs; set on every build's graph
 	std::shared_ptr<ExternalEpochExecution> m_externalExecution;  // submitting thread: the last external SubmitEpoch's
 	std::shared_ptr<const EpochRecording> m_chosenRecording;  // submitting thread: UseEpochRecording's, until SubmitEpoch takes it
@@ -669,6 +687,9 @@ private:
 	// Host thread: prepares the epoch's next ticket. reprepare: a stale ticket's run lease, prepared again (its latch regions were
 	// written); otherwise a new lease, or for a revision-driven epoch a published copy's (TakeCopyLease).
 	void PrepareTicket(Async& state, uint32_t epochIndex, RunLease* reprepare);
+	// Host thread, after a stale ticket's replacement: the epoch's queued tickets that are no longer current are abandoned and
+	// their leases freed, so the render thread does not find them stale one by one.
+	void DropStaleTickets(Async& state, uint32_t epochIndex);
 	// Host thread: the published copy a revision-driven epoch's next ticket takes: an idle one, else the least recently submitted
 	// one whose last run is done or sealed (waited for here: never a run that may still be in the host's stream). Null when every
 	// copy holds an unsealed run that is not done: the copies are busy until the next seal or one of their runs completes.

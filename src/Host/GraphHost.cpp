@@ -146,8 +146,69 @@ struct GraphHost::Async {
 	std::vector<std::vector<std::weak_ptr<const GraphHost::EpochRecording>>> liveRecordings;
 	std::vector<std::shared_ptr<RenderGraph::PersistentTicket>> outstanding;
 	std::atomic<uint64_t> revisionCopiesRecorded{0}, revisionRecordings{0};
-	// One ticket cell per epoch: stored by the host's thread, taken by the render thread.
-	std::unique_ptr<std::atomic<std::shared_ptr<Ticket>>[]> cells;
+	// Per epoch index: its prepared tickets, in the order they are submitted, and a stale ticket's replacement, which that
+	// submission takes before any other. The host's thread pushes, the render thread takes. The mutex is held only to push or
+	// take. count is ready's size, for a reader without the mutex.
+	struct TicketQueue {
+		std::mutex mutex;
+		std::deque<std::shared_ptr<Ticket>> ready;
+		std::shared_ptr<Ticket> reprepared;
+		std::atomic<uint32_t> count{0};
+	};
+	std::unique_ptr<TicketQueue[]> queues;
+	std::shared_ptr<Ticket> TakeReady(uint32_t index) {
+		auto& queue = queues[index];
+		std::scoped_lock lock(queue.mutex);
+		if (queue.ready.empty()) return nullptr;
+		auto ticket = std::move(queue.ready.front());
+		queue.ready.pop_front();
+		queue.count.store(static_cast<uint32_t>(queue.ready.size()), std::memory_order_release);
+		return ticket;
+	}
+	std::shared_ptr<Ticket> TakeReprepared(uint32_t index) {
+		auto& queue = queues[index];
+		std::scoped_lock lock(queue.mutex);
+		return std::exchange(queue.reprepared, nullptr);
+	}
+	// front: a ticket the render thread took and gives back (ReleaseEpochTicket), first again.
+	void PushReady(uint32_t index, std::shared_ptr<Ticket> ticket, bool front = false) {
+		auto& queue = queues[index];
+		std::scoped_lock lock(queue.mutex);
+		if (front) queue.ready.push_front(std::move(ticket));
+		else queue.ready.push_back(std::move(ticket));
+		queue.count.store(static_cast<uint32_t>(queue.ready.size()), std::memory_order_release);
+	}
+	void PushReprepared(uint32_t index, std::shared_ptr<Ticket> ticket) {
+		auto& queue = queues[index];
+		std::scoped_lock lock(queue.mutex);
+		queue.reprepared = std::move(ticket);
+	}
+	// Everything the epoch has prepared and not handed out: the replacement first, then the queue in order.
+	std::vector<std::shared_ptr<Ticket>> TakeAll(uint32_t index) {
+		auto& queue = queues[index];
+		std::scoped_lock lock(queue.mutex);
+		std::vector<std::shared_ptr<Ticket>> taken;
+		if (queue.reprepared) taken.push_back(std::exchange(queue.reprepared, nullptr));
+		for (auto& ticket : queue.ready) taken.push_back(std::move(ticket));
+		queue.ready.clear();
+		queue.count.store(0, std::memory_order_release);
+		return taken;
+	}
+	// Host thread, per epoch index:
+	// - inHand: tickets prepared and not yet back (submitted or discarded), queued or with the render thread,
+	// - mostAhead: the most tickets it may have in hand (GraphHost::SetEpochTicketsAhead),
+	// - runsThisFrame and runsLastFrame: its submissions since the seal count lastSeal, and in the frame before that.
+	std::vector<uint32_t> inHand, mostAhead, runsThisFrame, runsLastFrame;
+	std::vector<uint64_t> lastSeal;
+	uint32_t nextAhead = 0;  // host thread: the epoch index whose turn it is to prepare a ticket ahead
+	// How many tickets the epoch keeps in hand: as many as it ran last frame (or this frame, when more), at most mostAhead. A
+	// revision-driven epoch keeps one.
+	uint32_t Depth(uint32_t index) const {
+		if (revisionDriven[index]) return 1;
+		const auto runs = (std::max)({runsLastFrame[index], runsThisFrame[index], 1u});
+		return (std::min)(runs, (std::max)(mostAhead[index], 1u));
+	}
+	std::atomic<uint64_t> staleAhead{0};
 	// Render thread -> host thread, single producer / single consumer, in order.
 	static constexpr uint64_t kMailbox = 64;
 	std::array<Message, kMailbox> mailbox;
@@ -188,7 +249,6 @@ struct GraphHost::Async {
 	// submitted message it was processing until device teardown.
 	std::shared_ptr<void> uncertainUploadOwner;
 	std::shared_ptr<const void> uncertainResourceOwner;
-	std::vector<uint8_t> needsTicket;
 	uint64_t hostFrame = 0;
 	// The highest submission number a Submitted message brought (the mailbox is in order: every one not read yet is higher).
 	uint64_t submissionsSeen = 0;
@@ -253,13 +313,14 @@ struct GraphHost::Async {
 	void ThrowIfFailed() const {
 		if (failed.load(std::memory_order_acquire)) throw std::runtime_error("Async epochs failed: " + error);
 	}
-	std::shared_ptr<Ticket> WaitTicket(uint32_t index) {
+	// reprepared: the replacement of a stale ticket (TicketQueue::reprepared), not the next one queued.
+	std::shared_ptr<Ticket> WaitTicket(uint32_t index, bool reprepared = false) {
 		BT_ZONE_SCOPE("ORG.Host.WaitTicket");
 		// About to block on the host's thread: it must not be left asleep on GPU work that waits for this thread.
 		(void)completionWake->Notify();
 		for (;;) {
 			const auto seen = ticketWake.load(std::memory_order_acquire);
-			if (auto ticket = cells[index].exchange(nullptr, std::memory_order_acq_rel)) return ticket;
+			if (auto ticket = reprepared ? TakeReprepared(index) : TakeReady(index)) return ticket;
 			ThrowIfFailed();
 			// Only this epoch failed: no ticket is coming until its graph is built again.
 			if (epochFailed[index].load(std::memory_order_acquire)) throw EpochFailedError(epochs[index], epochErrors[index]);
@@ -966,11 +1027,11 @@ std::string GraphHost::DescribeAsyncState() const {
 		n(async->read.load()) + ", wakes on GPU " + n(async->wakesOnGpu.load()) + ", sleeping on " + n(async->sleepingAt.load()) + " (version + 1), wake version " +
 		n(async->completionWake ? async->completionWake->WakeVersion() : 0) + ", requests queued " + n(m_recordingQueue->head.load() != nullptr) +
 		", accepting " + n(m_recordingQueue->accepting.load()) + ", seals " + n(seals) + ", requests held " + n(async->pendingRequests.size());
-	out += "; epochs (index:epoch paused/needsTicket/ticket/failed/copiesBusy/generation):";
+	out += "; epochs (index:epoch paused/in hand/queued/failed/copiesBusy/generation):";
 	for (size_t i = 0; i < async->epochs.size(); ++i) {
 		const auto busy = async->copiesBusyAt ? async->copiesBusyAt[i].load() : Async::kNoSeal;
-		out += " " + n(i) + ":" + n(async->epochs[i]) + " " + n(async->paused[i]) + "/" + n(i < async->needsTicket.size() ? async->needsTicket[i] : 0) +
-			"/" + n(async->cells && async->cells[i].load() != nullptr) + "/" + n(async->epochFailed && async->epochFailed[i].load()) + "/" +
+		out += " " + n(i) + ":" + n(async->epochs[i]) + " " + n(async->paused[i]) + "/" + n(i < async->inHand.size() ? async->inHand[i] : 0) +
+			"/" + n(async->queues ? async->queues[i].count.load() : 0) + "/" + n(async->epochFailed && async->epochFailed[i].load()) + "/" +
 			(busy == Async::kNoSeal ? std::string("-") : n(busy)) + "/" + n(async->generation[i]);
 	}
 	out += "; host timelines (t<index> last assigned/completed):";
@@ -1168,6 +1229,11 @@ void GraphHost::SetAsyncEpochs(std::vector<uint32_t> epochs, std::vector<uint32_
 	StartAsync();
 }
 
+void GraphHost::SetEpochTicketsAhead(uint32_t epoch, uint32_t most) {
+	std::erase_if(m_ticketsAhead, [&](const auto& entry) { return entry.first == epoch; });
+	if (most > 1) m_ticketsAhead.emplace_back(epoch, most);
+}
+
 void GraphHost::SetExternalEpochs(std::vector<uint32_t> epochs) {
 	// An epoch whose graph becomes or stops being external is built again; the rest keep theirs.
 	for (const auto& instance : m_instances) {
@@ -1229,8 +1295,15 @@ void GraphHost::StartAsync() {
 	async->copiesBusyAt = std::make_unique<std::atomic<uint64_t>[]>(async->epochs.size());
 	for (uint32_t index = 0; index < async->epochs.size(); ++index) async->copiesBusyAt[index].store(Async::kNoSeal, std::memory_order_relaxed);
 	async->copiesBusyLogged.assign(async->epochs.size(), 0);
-	async->cells = std::make_unique<std::atomic<std::shared_ptr<Async::Ticket>>[]>(async->epochs.size());
-	async->needsTicket.assign(async->epochs.size(), 1);
+	async->queues = std::make_unique<Async::TicketQueue[]>(async->epochs.size());
+	async->inHand.assign(async->epochs.size(), 0);
+	async->mostAhead.assign(async->epochs.size(), 1);
+	for (uint32_t index = 0; index < async->epochs.size(); ++index)
+		for (const auto& [epoch, most] : m_ticketsAhead)
+			if (epoch == async->epochs[index]) async->mostAhead[index] = (std::max)(most, 1u);
+	async->runsThisFrame.assign(async->epochs.size(), 0);
+	async->runsLastFrame.assign(async->epochs.size(), 0);
+	async->lastSeal.assign(async->epochs.size(), 0);
 	async->liveRecordings.assign(async->epochs.size(), {});
 	async->outstanding.assign(async->epochs.size(), {});
 	// The synchronous frames' runs still in flight are the host thread's to retire now, like its own. The sync path's pacing
@@ -1304,7 +1377,17 @@ void GraphHost::StartAsync() {
 							lease.state = RunLease::State::Submitted;
 							m_submittedLeases.push_back(&lease);
 						}
-						if (!state->paused[message.epochIndex]) state->needsTicket[message.epochIndex] = 1;
+						{
+							const auto index = message.epochIndex;
+							if (state->inHand[index]) --state->inHand[index];
+							// The epoch's runs per frame (between seals), which set how many tickets it keeps prepared (Depth).
+							if (message.seal != state->lastSeal[index]) {
+								state->runsLastFrame[index] = state->runsThisFrame[index];
+								state->runsThisFrame[index] = 0;
+								state->lastSeal[index] = message.seal;
+							}
+							++state->runsThisFrame[index];
+						}
 						// Never freed on this thread: a driver free can wait for GPU work that waits for a signal this thread prepares.
 						m_desc.runtime->DestroyDetached(std::move(message.retired), "a submission's deferred deletions");
 						break;
@@ -1318,11 +1401,15 @@ void GraphHost::StartAsync() {
 						// ticket instead would let the proactive pass below prepare one into a new lease.
 						// A failed epoch prepares nothing: the render thread waiting for it sees the failure (WaitTicket).
 						if (message.reprepare && !state->epochFailed[message.epochIndex].load(std::memory_order_relaxed)) {
+							// The replacement takes the discarded ticket's place in hand.
 							PrepareTicket(*state, message.epochIndex, &lease);
+							// The tickets queued behind it were prepared before the same change, most likely. The ones no longer
+							// current go now, before the render thread reaches them, and others are prepared in their place.
+							DropStaleTickets(*state, message.epochIndex);
 						} else {
 							// Never submitted: nothing of it reached the GPU.
 							ReleaseLease(lease, state);
-							if (!state->paused[message.epochIndex]) state->needsTicket[message.epochIndex] = 1;
+							if (state->inHand[message.epochIndex]) --state->inHand[message.epochIndex];
 						}
 						break;
 					}
@@ -1335,11 +1422,12 @@ void GraphHost::StartAsync() {
 						for (uint32_t index = 0; index < state->epochs.size(); ++index) {
 							if (!detaching(state->instanceOf[index])) continue;
 							state->paused[index] = 1;
-							state->needsTicket[index] = 0;
-							if (auto ticket = state->cells[index].exchange(nullptr, std::memory_order_acq_rel)) {
+							// The render thread holds none of them: it waits for this detach.
+							for (const auto& ticket : state->TakeAll(index)) {
 								(void)graphOf(index).CompletePersistentTicket(*ticket, {});
 								ReleaseLease(*m_leaseTable[RenderGraph::PersistentTicketRun(*ticket).lease].load(std::memory_order_acquire), state);
 							}
+							state->inHand[index] = 0;
 							state->outstanding[index].reset();
 							state->liveRecordings[index].clear();
 							const auto dropped = std::make_exception_ptr(EpochRecordingDropped(state->generation[index]));
@@ -1366,7 +1454,7 @@ void GraphHost::StartAsync() {
 								// A new build's failure was cleared while this thread held still (RebuildAsyncInstances).
 								state->paused[index] = 0;
 								state->generation[index] = generation;
-								state->needsTicket[index] = 1;
+								state->inHand[index] = 0;
 							}
 						break;
 					case Async::Message::Kind::Stop:
@@ -1412,12 +1500,20 @@ void GraphHost::StartAsync() {
 				// Every run whose GPU work is done retires: its statistics are read, and its lists, arena regions, upload staging and
 				// owners are freed, even if no later run takes its lease again.
 				(void)RetireReachedLeases(state);
-				// The next ticket of every epoch whose last one was submitted: one frame ahead.
+				// The next tickets: an epoch keeps Async::Depth of them in hand. That is one, prepared once the last one was submitted,
+				// or up to its runs last frame (SetEpochTicketsAhead).
+				// - First, a ticket for every epoch with none in hand: the render thread may be about to wait for it.
+				// - Otherwise, one more ticket for one epoch below its depth, the epochs taking turns. Then the messages are read
+				//   again, so a submission's completion or a discard is never held up behind a queue being filled.
 				bool prepared = false;
-				for (uint32_t index = 0; index < state->epochs.size(); ++index) {
-					if (!state->needsTicket[index] || state->paused[index] || state->epochFailed[index].load(std::memory_order_relaxed)
-						|| state->cells[index].load(std::memory_order_acquire))
-						continue;
+				const auto epochCount = static_cast<uint32_t>(state->epochs.size());
+				for (uint32_t round = 0; round < 2 && !prepared; ++round)
+				for (uint32_t turn = 0; turn < epochCount; ++turn) {
+					const uint32_t index = round == 0 ? turn : (state->nextAhead + turn) % epochCount;
+					if (state->paused[index] || state->epochFailed[index].load(std::memory_order_relaxed)) continue;
+					const bool wanted = round == 0 ? state->inHand[index] == 0
+						: (state->inHand[index] != 0 && state->inHand[index] < state->Depth(index));
+					if (!wanted) continue;
 					// Copies busy with unsealed runs wait for the next seal (its SealSubmitted wakes this thread), or for one of their runs to
 					// complete (this thread sleeps on the submitted runs' completions too).
 					if (const auto busy = state->copiesBusyAt[index].load(std::memory_order_acquire); busy != Async::kNoSeal) {
@@ -1431,6 +1527,10 @@ void GraphHost::StartAsync() {
 					}
 					PrepareTicket(*state, index, nullptr);
 					prepared = true;
+					if (round == 1) {
+						state->nextAhead = (index + 1) % epochCount;
+						break;
+					}
 				}
 				// Then the recording requests: the frames' tickets come first, so recording ahead never delays a submission.
 				const bool requestsAdvanced = AdvanceRecordingRequests(*state);
@@ -1570,16 +1670,16 @@ bool GraphHost::ReleaseEpochTicket(uint32_t epoch) {
 	const auto found = std::ranges::find(async.epochs, epoch);
 	if (found == async.epochs.end()) return false;
 	const auto index = static_cast<uint32_t>(found - async.epochs.begin());
-	auto ticket = async.cells[index].exchange(nullptr, std::memory_order_acq_rel);
+	auto ticket = async.TakeReady(index);
 	if (!ticket) return false;
-	// The host's thread prepares into an empty cell only once the ticket it last put there is submitted or discarded: the cell is the
-	// render thread's until the discard is read, so a ticket the mailbox has no room for goes back.
+	// The host's thread counts the ticket in hand until it reads the discard. A ticket the mailbox has no room for goes back to
+	// the front of the queue.
 	Async::Message discard;
 	discard.kind = Async::Message::Kind::Discard;
 	discard.epochIndex = index;
 	discard.ticket = ticket;
 	if (async.TryPost(discard)) return true;
-	async.cells[index].store(std::move(ticket), std::memory_order_release);
+	async.PushReady(index, std::move(ticket), true);
 	return false;
 }
 
@@ -1746,14 +1846,19 @@ void GraphHost::PrepareTicket(Async& state, uint32_t epochIndex, RunLease* repre
 	// The render thread records this ticket's uploads into an open list: resetting and beginning it is several microseconds of
 	// driver work that belongs here. Begin takes the list's allocator claim, which the render thread gives up after closing the
 	// list (SubmitTicket). A new lease's lists come from the pools; a reprepare's are begun again.
-	state.uploadPool->Begin(lease->upload);
-	// An external epoch's uploads secondary: recycled with the lease, begun where it is recorded.
-	state.uploadSecondaryPool->Begin(lease->uploadSecondary);
-	// The run's queue upload lists likewise.
+	// A ticket prepared behind others of its epoch leaves its lists to the render thread (SubmitTicket begins them). An open list
+	// holds its allocator, and on Vulkan each allocator is a command pool with driver memory of its own, so a queue of tickets
+	// with open lists would make a pool for each.
 	lease->queueUploads.resize(state.queueUploadKinds.size());
-	for (size_t queue = 0; queue < state.queueUploadKinds.size(); ++queue) {
-		if (!state.queueUploadKinds[queue]) continue;
-		state.queueUploadPools[static_cast<size_t>(*state.queueUploadKinds[queue])]->Begin(lease->queueUploads[queue]);
+	if (reprepare || state.inHand[epochIndex] == 0) {
+		state.uploadPool->Begin(lease->upload);
+		// An external epoch's uploads secondary: recycled with the lease, begun where it is recorded.
+		state.uploadSecondaryPool->Begin(lease->uploadSecondary);
+		// The run's queue upload lists likewise.
+		for (size_t queue = 0; queue < state.queueUploadKinds.size(); ++queue) {
+			if (!state.queueUploadKinds[queue]) continue;
+			state.queueUploadPools[static_cast<size_t>(*state.queueUploadKinds[queue])]->Begin(lease->queueUploads[queue]);
+		}
 	}
 	// The descriptors are released here; the objects behind them and the deferred deletions are freed on the runtime's deleter
 	// thread. A driver free can block until the GPU is done with the memory. The GPU may be waiting for a signal of work this
@@ -1795,18 +1900,45 @@ void GraphHost::PrepareTicket(Async& state, uint32_t epochIndex, RunLease* repre
 		return;
 	}
 	state.outstanding[epochIndex] = ticket;
-	state.needsTicket[epochIndex] = 0;
-	state.cells[epochIndex].store(std::move(ticket), std::memory_order_release);
+	// A replacement goes where its submission waits for it, and takes the discarded ticket's place in hand.
+	if (reprepare) {
+		state.PushReprepared(epochIndex, std::move(ticket));
+	} else {
+		++state.inHand[epochIndex];
+		state.PushReady(epochIndex, std::move(ticket));
+	}
 	state.ticketWake.fetch_add(1, std::memory_order_release);
 	state.ticketWake.notify_all();
+}
+
+void GraphHost::DropStaleTickets(Async& state, uint32_t epochIndex) {
+	if (state.revisionDriven[epochIndex]) return;
+	auto& queue = state.queues[epochIndex];
+	std::vector<std::shared_ptr<Async::Ticket>> stale;
+	{
+		// The render thread waits for the replacement (WaitTicket's reprepared) and takes none of these meanwhile.
+		std::scoped_lock lock(queue.mutex);
+		std::erase_if(queue.ready, [&](std::shared_ptr<Async::Ticket>& ticket) {
+			if (state.Current(*ticket)) return false;
+			stale.push_back(std::move(ticket));
+			return true;
+		});
+		queue.count.store(static_cast<uint32_t>(queue.ready.size()), std::memory_order_release);
+	}
+	auto& graph = *m_instances[state.instanceOf[epochIndex]].graph;
+	for (const auto& ticket : stale) {
+		(void)graph.CompletePersistentTicket(*ticket, {});
+		ReleaseLease(*m_leaseTable[RenderGraph::PersistentTicketRun(*ticket).lease].load(std::memory_order_acquire), &state);
+		if (state.inHand[epochIndex]) --state.inHand[epochIndex];
+		state.staleAhead.fetch_add(1, std::memory_order_relaxed);
+	}
 }
 
 void GraphHost::FailAsyncEpoch(Async& state, uint32_t epochIndex, std::string error) {
 	const auto epoch = state.epochs[epochIndex];
 	spdlog::error("GraphHost: epoch {}'s graph failed to prepare (build {}); the other epochs keep running: {}", epoch,
 		state.generation[epochIndex], error);
-	// Nothing more is prepared or recorded for it until its instance is attached at a new build.
-	state.needsTicket[epochIndex] = 0;
+	// Nothing more is prepared or recorded for it until its instance is attached at a new build (epochFailed).
 	state.outstanding[epochIndex].reset();
 	state.liveRecordings[epochIndex].clear();
 	state.epochErrors[epochIndex] = error;
@@ -1876,7 +2008,7 @@ void GraphHost::StopAsync() {
 	async->pendingRequests.clear();
 	// Unsubmitted tickets are abandoned, and their leases given back.
 	for (uint32_t index = 0; index < async->epochs.size(); ++index)
-		if (auto ticket = async->cells[index].exchange(nullptr)) {
+		for (const auto& ticket : async->TakeAll(index)) {
 			if (!async->failed.load())
 				if (auto& graph = m_instances[async->instanceOf[index]].graph) (void)graph->CompletePersistentTicket(*ticket, {});
 			ReleaseLease(*m_leaseTable[RenderGraph::PersistentTicketRun(*ticket).lease].load(std::memory_order_acquire), async.get());
@@ -1927,6 +2059,7 @@ GraphHost::AsyncStats GraphHost::TakeAsyncStats() noexcept {
 		m_asyncStats.wakesSkipped = std::exchange(m_async->wakesSkipped, 0);
 		m_asyncStats.copiesBusy = m_async->copiesBusy.exchange(0, std::memory_order_relaxed);
 		m_asyncStats.copyWaits = m_async->copyWaits.exchange(0, std::memory_order_relaxed);
+		m_asyncStats.staleAhead = m_async->staleAhead.exchange(0, std::memory_order_relaxed);
 	}
 	return std::exchange(m_asyncStats, {});
 }
@@ -1959,7 +2092,7 @@ void GraphHost::SubmitEpoch(uint32_t epoch, const FrameCallback& beforeSubmit, s
 	if (!m_instances[instance].graph || m_instances[instance].failed)
 		throw EpochFailedError(epoch, m_instances[instance].failure);
 	if (async.epochFailed[index].load(std::memory_order_acquire)) throw EpochFailedError(epoch, async.epochErrors[index]);
-	auto ticket = async.cells[index].exchange(nullptr, std::memory_order_acq_rel);
+	auto ticket = async.TakeReady(index);
 	if (!ticket) {
 		++m_asyncStats.waited;
 		ticket = async.WaitTicket(index);
@@ -2048,13 +2181,23 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 		// can prepare the epoch's next ticket into another (the Discard handler).
 		discard.reprepare = true;
 		postControl(discard);
-		ticket = async.WaitTicket(index);
+		ticket = async.WaitTicket(index, true);
 		if (!(RenderGraph::PersistentTicketRun(*ticket) == run))
 			throw std::logic_error("A reprepared async epoch ticket is not for the run whose upload list the render thread records");
 	}
 	// The submitted ticket's frame: one prepared again above has a new number, and the completed-frame callback
 	// reports it by that one.
 	m_lastHostFrame = RenderGraph::PersistentTicketHostFrame(*ticket);
+	// A ticket prepared behind others of its epoch has its upload lists begun here (PrepareTicket begins only the first one's).
+	if (!lease.upload.Recording()) {
+		BT_ZONE_SCOPE("ORG.Host.BeginUploadLists");
+		async.uploadPool->Begin(lease.upload);
+		async.uploadSecondaryPool->Begin(lease.uploadSecondary);
+		lease.queueUploads.resize(async.queueUploadKinds.size());
+		for (size_t queue = 0; queue < async.queueUploadKinds.size(); ++queue)
+			if (async.queueUploadKinds[queue] && !lease.queueUploads[queue].Recording())
+				async.queueUploadPools[static_cast<size_t>(*async.queueUploadKinds[queue])]->Begin(lease.queueUploads[queue]);
+	}
 	lap(m_lastTimings.checkUs);
 	// The queues' last values, which every graph assigns from (the host's shared timelines): this submission's come after them,
 	// and go back to the registry as soon as they are assigned, before any other graph's submission.
