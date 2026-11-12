@@ -178,6 +178,7 @@ ExternalClient::Signal ExternalClient::Submit(uint32_t slotIndex, std::span<cons
 	auto bodyList = body.list.Get();
 	{ BT_ZONE_SCOPE("ORG.ExternalClient.Record"); if (record) record(bodyList); }
 	if (bodyList.EndChecked() != rhi::Result::Ok) throw std::runtime_error("ExternalClient command list close failed");
+	body.EndRecording();
 
 	std::vector<compiler::ExecutionTimelinePoint> points;
 	for (uint32_t index = 0; index < m_slots.size(); ++index) {
@@ -200,6 +201,7 @@ ExternalClient::Signal ExternalClient::Submit(uint32_t slotIndex, std::span<cons
 			barriers.textures = {release.textures.data(), static_cast<uint32_t>(release.textures.size())};
 			list.Barriers(barriers);
 			if (list.EndChecked() != rhi::Result::Ok) throw std::runtime_error("ExternalClient release list close failed");
+			pair.EndRecording();
 			const auto value = from.next++;
 			const rhi::TimelinePoint signal{from.timeline->GetHandle(), value};
 			rhi::SubmitDesc submit{};
@@ -246,6 +248,7 @@ ExternalClient::Signal ExternalClient::Submit(uint32_t slotIndex, std::span<cons
 			}
 			if (before) barriersOf(list, before->textures, before->buffers);
 			if (list.EndChecked() != rhi::Result::Ok) throw std::runtime_error("ExternalClient entry list close failed");
+			entryPair.EndRecording();
 			lists.push_back(list);
 		}
 		lists.push_back(bodyList);
@@ -254,6 +257,7 @@ ExternalClient::Signal ExternalClient::Submit(uint32_t slotIndex, std::span<cons
 			auto list = exitPair.list.Get();
 			barriersOf(list, after->textures, after->buffers);
 			if (list.EndChecked() != rhi::Result::Ok) throw std::runtime_error("ExternalClient exit list close failed");
+			exitPair.EndRecording();
 			lists.push_back(list);
 		}
 		std::vector<rhi::TimelinePoint> waitPoints;

@@ -608,6 +608,11 @@ struct FrameCommandAllocation {
     std::shared_ptr<CommandListPool> pool;
     CommandListPair pair;
     bool closed = false;
+    // Call once the list is closed. It gives up the list's allocator claim (CommandListPool's threading rule).
+    void Close() noexcept {
+        closed = true;
+        pair.EndRecording();
+    }
     void RecycleAfterCompletion() noexcept {
         if (!pool) return;
         try { pool->RecycleForNextRequest(std::move(pair)); }
@@ -1010,8 +1015,8 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
     {
     BT_ZONE_SCOPE("ORG.Execution.RecordOwned.Validate");
     for (const auto& recording : recordings) {
-        if ((!recording.bindings && !recording.publication) || !recording.allocation || !recording.allocation->pair.allocator
-            || !recording.allocation->pair.list || recording.passes.empty())
+        if ((!recording.bindings && !recording.publication) || !recording.allocation || !recording.allocation->pair.list
+            || recording.passes.empty())
             throw std::invalid_argument("Incomplete owned recording packet");
         if (!recording.allocation->pair.list.Get().SupportsCheckedEnd())
             throw std::invalid_argument("Backend lacks checked command list close");
@@ -1034,6 +1039,12 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
         for (const auto& pass : recording.passes) replayable &= pass.IsReplayable();
     }
     auto ownership = std::make_shared<Ownership>(Ownership{std::move(runtimeOwner), std::move(recordings)});
+    // A pool's list is begun here, on the recording thread, unless its acquirer began it already. Begin may trade the list
+    // for another idle one, so the list handles are read only after it.
+    for (const auto& recording : ownership->recordings) {
+        auto& allocation = *recording.allocation;
+        if (allocation.pool && !allocation.pair.Recording()) allocation.pool->Begin(allocation.pair);
+    }
     std::vector<rhi::CommandList> lists;
     std::vector<PreparedPass> submissionEffects;
     std::vector<std::shared_ptr<FrameCommandAllocation>> allocations;
@@ -1097,7 +1108,7 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
                 + " afterTextures=" + std::to_string(afterTextures)
                 + " afterBuffers=" + std::to_string(afterBuffers) + " passes=" + names);
         }
-        recording.allocation->closed = true;
+        recording.allocation->Close();
     }
     return packet;
 }

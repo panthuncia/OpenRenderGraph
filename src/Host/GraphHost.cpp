@@ -180,9 +180,18 @@ struct GraphHost::Async {
 
 	// Render thread only.
 	std::vector<uint64_t> queueValues;  // SubmitTicket's: the last value assigned per queue slot of the epoch's graph
+	// The pools the upload lists below come from, shared by all frame slots. Their allocators are shared too
+	// (CommandListPool's threading rule). The host's thread begins a slot's list and so takes its allocator's claim. The
+	// render thread gives the claim up once it has closed the list. The pools are declared before the lists, but each
+	// list keeps its allocator alive by itself.
+	std::shared_ptr<CommandListPool> uploadPool;
+	std::shared_ptr<CommandListPool> uploadSecondaryPool;
+	std::array<std::shared_ptr<CommandListPool>, 3> queueUploadPools;  // by rhi::QueueKind (Compute and Copy only)
+	// Per queue slot: the kind of the queue that takes queue-scoped uploads, or none.
+	std::vector<std::optional<rhi::QueueKind>> queueUploadKinds;
 	// Per frame slot. Reset and begun by the host's thread when it prepares the slot's ticket (after the slot's
 	// wait: the slot's last upload list is done), then recorded, ended and submitted by the render thread; the
-	// ticket cell orders the two.
+	// ticket cell orders the two. A slot's list is made at its first ticket.
 	std::vector<CommandListPair> uploadLists;
 	// The same for an external epoch's ticket (SetExternalEpochs): a secondary, recycled by the host's thread with the slot's
 	// list and begun by the render thread, executed first by the caller's execution (ExternalEpochExecution::leading).
@@ -1071,39 +1080,28 @@ void GraphHost::StartAsync() {
 	async->graphicsSlot = static_cast<uint32_t>(ToUnderlying(graphics));
 	async->graphicsQueue = queues.GetQueue(graphics);
 	async->graphicsFence = queues.GetFence(graphics).GetHandle();
-	for (uint32_t slot = 0; slot < slotCount; ++slot) {
-		CommandListPair pair;
-		if (!rhi::IsOk(m_device.CreateCommandAllocator(rhi::QueueKind::Graphics, pair.allocator))
-			|| !rhi::IsOk(m_device.CreateCommandList(rhi::QueueKind::Graphics, pair.allocator.Get(), pair.list)))
-			throw std::runtime_error("Async epochs could not create their upload command lists");
-		pair.list->SetName(("ORG ticket uploads #" + std::to_string(slot)).c_str());
-		pair.list->End();
-		async->uploadLists.push_back(std::move(pair));
-		// An external epoch's uploads secondary, for every slot: an epoch may become external at any of its rebuilds.
-		CommandListPair secondary;
-		if (!rhi::IsOk(m_device.CreateCommandAllocator(rhi::QueueKind::Graphics, secondary.allocator))
-			|| !rhi::IsOk(m_device.CreateSecondaryCommandList(rhi::QueueKind::Graphics, secondary.allocator.Get(), secondary.list)))
-			throw std::runtime_error("External epochs could not create their upload secondary lists");
-		secondary.list->SetName(("ORG external ticket uploads #" + std::to_string(slot)).c_str());
-		async->uploadSecondaries.push_back(std::move(secondary));
-		// Queue-scoped uploads: one list per compute or copy queue on the graphics queue's device (a copy needs no more).
-		auto& perQueue = async->queueUploadLists.emplace_back(queues.SlotCount());
-		for (size_t index = 0; index < queues.SlotCount(); ++index) {
-			const auto queueSlot = static_cast<QueueSlotIndex>(static_cast<uint8_t>(index));
-			const auto kind = queues.GetKind(queueSlot);
-			if (queueSlot == graphics || (kind != QueueKind::Compute && kind != QueueKind::Copy)
-				|| queues.GetBackendInstance(queueSlot) != queues.GetBackendInstance(graphics) || !queues.GetQueue(queueSlot))
-				continue;
-			const auto queueKind = kind == QueueKind::Compute ? rhi::QueueKind::Compute : rhi::QueueKind::Copy;
-			CommandListPair queuePair;
-			if (!rhi::IsOk(m_device.CreateCommandAllocator(queueKind, queuePair.allocator))
-				|| !rhi::IsOk(m_device.CreateCommandList(queueKind, queuePair.allocator.Get(), queuePair.list)))
-				throw std::runtime_error("Async epochs could not create their queue upload command lists");
-			queuePair.list->SetName(("ORG ticket queue uploads #" + std::to_string(slot) + " q" + std::to_string(index)).c_str());
-			queuePair.list->End();
-			perQueue[index] = std::move(queuePair);
-		}
+	// The upload lists come from host-wide pools, made at each slot's first ticket (PrepareTicket). The pools share their
+	// allocators between the slots, so a few command pools serve every slot.
+	async->uploadPool = std::make_shared<CommandListPool>(m_device, rhi::QueueKind::Graphics);
+	// An external epoch's uploads secondaries, for every slot: an epoch may become external at any of its rebuilds.
+	async->uploadSecondaryPool = std::make_shared<CommandListPool>(m_device, rhi::QueueKind::Graphics, true);
+	async->uploadLists.resize(slotCount);
+	async->uploadSecondaries.resize(slotCount);
+	// Queue-scoped uploads: one list per compute or copy queue on the graphics queue's device (a copy needs no more).
+	async->queueUploadKinds.assign(queues.SlotCount(), std::nullopt);
+	for (size_t index = 0; index < queues.SlotCount(); ++index) {
+		const auto queueSlot = static_cast<QueueSlotIndex>(static_cast<uint8_t>(index));
+		const auto kind = queues.GetKind(queueSlot);
+		if (queueSlot == graphics || (kind != QueueKind::Compute && kind != QueueKind::Copy)
+			|| queues.GetBackendInstance(queueSlot) != queues.GetBackendInstance(graphics) || !queues.GetQueue(queueSlot))
+			continue;
+		const auto queueKind = kind == QueueKind::Compute ? rhi::QueueKind::Compute : rhi::QueueKind::Copy;
+		async->queueUploadKinds[index] = queueKind;
+		auto& pool = async->queueUploadPools[static_cast<size_t>(queueKind)];
+		if (!pool) pool = std::make_shared<CommandListPool>(m_device, queueKind);
 	}
+	async->queueUploadLists.resize(slotCount);
+	for (auto& perQueue : async->queueUploadLists) perQueue.resize(queues.SlotCount());
 	async->queueLists.resize(queues.SlotCount());
 	// Staged uploads go straight into each submission's upload list (RenderGraph::RecordPendingUploads).
 	if (auto* uploads = firstGraph->GetUploadService()) uploads->SetStagedUploadsRecordedDirectly(true);
@@ -1652,21 +1650,17 @@ void GraphHost::PrepareTicket(Async& state, uint32_t epochIndex, int32_t request
 	runtime::ScopedActiveGraphServices services(graph.GetUploadService(), graph.GetDescriptorService());
 	WaitSlot(state, slot, epochIndex);
 	// The render thread records this ticket's uploads into an open list: resetting and beginning it is several
-	// microseconds of driver work that belongs here.
-	auto& uploads = state.uploadLists[slot];
-	uploads.allocator->Recycle();
-	uploads.list->Recycle(uploads.allocator.Get());
+	// microseconds of driver work that belongs here. Begin takes the list's allocator claim, which the render thread
+	// gives up after closing the list (SubmitTicket).
+	state.uploadPool->Begin(state.uploadLists[slot]);
 	// An external epoch's uploads secondary: recycled here, begun where it is recorded.
-	if (auto& secondary = state.uploadSecondaries[slot]; secondary.list) {
-		secondary.allocator->Recycle();
-		secondary.list->Recycle(secondary.allocator.Get());
-	}
+	state.uploadSecondaryPool->Begin(state.uploadSecondaries[slot]);
 	// The slot's queue upload lists likewise: their last submission went ahead of a batch of the slot's last ticket on their queue,
 	// whose completion the wait above covers.
-	for (auto& queueUploads : state.queueUploadLists[slot]) {
-		if (!queueUploads.list) continue;
-		queueUploads.allocator->Recycle();
-		queueUploads.list->Recycle(queueUploads.allocator.Get());
+	auto& queueUploadLists = state.queueUploadLists[slot];
+	for (size_t queue = 0; queue < queueUploadLists.size() && queue < state.queueUploadKinds.size(); ++queue) {
+		if (!state.queueUploadKinds[queue]) continue;
+		state.queueUploadPools[static_cast<size_t>(*state.queueUploadKinds[queue])]->Begin(queueUploadLists[queue]);
 	}
 	// The descriptors are released here; the objects behind them and the deferred deletions are freed on the runtime's deleter
 	// thread. A driver free can block until the GPU is done with the memory. The GPU may be waiting for a signal of work this
@@ -1704,6 +1698,11 @@ void GraphHost::PrepareTicket(Async& state, uint32_t epochIndex, int32_t request
 	if (!error.empty() || !ticket) {
 		// The slot is free again: no ticket holds it. A ticket made before the failure gives up what it prepared.
 		entry.reserved = false;
+		// Nothing records the slot's upload lists for this ticket. Give up their allocator claims. The slot's next ticket
+		// resets them.
+		state.uploadLists[slot].EndRecording();
+		state.uploadSecondaries[slot].EndRecording();
+		for (auto& queueUploads : state.queueUploadLists[slot]) queueUploads.EndRecording();
 		if (ticket) {
 			try {
 				(void)graph.CompletePersistentTicket(*ticket, {});
@@ -2065,6 +2064,10 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 		// Every one the host's thread began, used or not (it begins them all again for the slot's next ticket).
 		for (auto& queueUploads : queueUploadLists)
 			if (queueUploads.list) queueUploads.list->End();
+		// Closed, so their allocators' claims go. The secondary was reset by the host's thread even when unused.
+		list.EndRecording();
+		secondary.EndRecording();
+		for (auto& queueUploads : queueUploadLists) queueUploads.EndRecording();
 	}
 	m_asyncStats.queueUploadCopies += queueCopies;
 	if (external && !recordedLists.empty()) {

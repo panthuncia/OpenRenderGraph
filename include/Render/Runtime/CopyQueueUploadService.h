@@ -167,6 +167,7 @@ private:
         std::vector<std::pair<std::shared_ptr<rhi::TimelinePtr>, uint64_t>> waits;
     };
 
+    // allocator is set only where lists cannot share one (D3D12). Otherwise the list records from m_listAllocator.
     struct CommandPair {
         rhi::CommandAllocatorPtr allocator;
         rhi::CommandListPtr list;
@@ -228,6 +229,10 @@ private:
     std::mutex m_wakeMutex;
     std::condition_variable_any m_wake;
     std::condition_variable_any m_idle;
+    // Submitter-owned. The allocator every list shares, where the backend allows it. Only the submitter thread resets,
+    // records and frees the lists, so no further synchronization is needed. Declared before the lists so that the lists
+    // are freed first.
+    rhi::CommandAllocatorPtr m_listAllocator;
     std::deque<Batch> m_inFlight;        // submitter-owned
     std::vector<CommandPair> m_freePairs; // submitter-owned
     std::atomic<uint64_t> m_inFlightCount{ 0 };

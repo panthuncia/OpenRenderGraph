@@ -369,7 +369,10 @@ void RenderGraph::RecordPersistentSegment(PersistentSegmentRun& run) {
 			if (!state.tracyFrameBegun[slot] && !keepable && !external) {
 				const auto first = std::ranges::find_if(jobs, [slot](const auto& job) { return job.slot == slot; });
 				if (first != jobs.end()) {
-					first->queue.TracyGpuFrameBegin(first->recording.allocation->pair.list.Get());
+					// The frame mark is recorded here, so the list is begun here. Its recorder sees it begun and keeps it.
+					auto& allocation = *first->recording.allocation;
+					allocation.pool->Begin(allocation.pair);
+					first->queue.TracyGpuFrameBegin(allocation.pair.list.Get());
 					state.tracyFrameBegun[slot] = 1;
 				}
 			}
@@ -540,7 +543,7 @@ void RenderGraph::SubmitPersistentSegment(PersistentSegmentRun& run) {
 				barriers.textures = {release.textures.data(), static_cast<uint32_t>(release.textures.size())};
 				list.Barriers(barriers);
 				if (list.EndChecked() != rhi::Result::Ok) throw std::runtime_error("Handoff release list close failed");
-				allocation->closed = true;
+				allocation->Close();
 				const auto signal = state.timelines->SubmitOutside(release.queue);
 				const rhi::TimelinePoint point{m_queueRegistry.GetFence(index).GetHandle(), signal.value};
 				rhi::SubmitDesc submit{};
@@ -579,7 +582,7 @@ void RenderGraph::SubmitPersistentSegment(PersistentSegmentRun& run) {
 					list.Barriers(acquired);
 				}
 				if (list.EndChecked() != rhi::Result::Ok) throw std::runtime_error("Handoff command list close failed");
-				allocation->closed = true;
+				allocation->Close();
 				handoffLists[batch] = list;
 				leading[batch] = {&handoffLists[batch], 1};
 				handoffLeases.push_back(std::move(allocation));
@@ -626,7 +629,7 @@ void RenderGraph::SubmitPersistentSegment(PersistentSegmentRun& run) {
 			list.Barriers(toHome);
 		}
 		if (list.EndChecked() != rhi::Result::Ok) throw std::runtime_error("Home acquire list close failed");
-		allocation->closed = true;
+		allocation->Close();
 		std::vector<rhi::TimelinePoint> waits;
 		for (const auto producer : home.producers) {
 			if (producer >= execution->batches.size() || graph.batches[producer].queue == graphicsSlot) continue;

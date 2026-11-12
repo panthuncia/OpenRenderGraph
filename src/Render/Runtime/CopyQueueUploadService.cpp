@@ -377,9 +377,15 @@ CopyQueueUploadService::CommandPair CopyQueueUploadService::AcquireCommandPair()
 	}
 	CommandPair pair;
 	// Create the allocator for the queue the lists are submitted to. A dedicated upload queue may be in a different family
-	// than the device's copy queue.
-	if (rhi::Failed(m_device.CreateCommandAllocator(m_copyQueue, pair.allocator)) ||
-		rhi::Failed(m_device.CreateCommandList(rhi::QueueKind::Copy, pair.allocator.Get(), pair.list))) {
+	// than the device's copy queue. One allocator serves every list, because each command pool costs driver memory.
+	if (!m_listAllocator && rhi::Failed(m_device.CreateCommandAllocator(m_copyQueue, m_listAllocator))) {
+		m_listAllocator = {};
+		spdlog::error("CopyQueueUploadService '{}': copy command allocator creation failed", m_config.debugName);
+		return {};
+	}
+	const bool shared = m_listAllocator->SupportsSharedLists();
+	if ((!shared && rhi::Failed(m_device.CreateCommandAllocator(m_copyQueue, pair.allocator))) ||
+		rhi::Failed(m_device.CreateCommandList(rhi::QueueKind::Copy, shared ? m_listAllocator.Get() : pair.allocator.Get(), pair.list))) {
 		spdlog::error("CopyQueueUploadService '{}': copy command list creation failed", m_config.debugName);
 		return {};
 	}
@@ -387,9 +393,16 @@ CopyQueueUploadService::CommandPair CopyQueueUploadService::AcquireCommandPair()
 }
 
 void CopyQueueUploadService::RecycleCommandPair(CommandPair&& pair) {
-	if (!pair.allocator || !pair.list) return;
-	pair.allocator->Recycle();
-	pair.list->Recycle(pair.allocator.Get());
+	if (!pair.list) return;
+	if (pair.allocator) {
+		pair.allocator->Recycle();
+		pair.list->Recycle(pair.allocator.Get());
+	} else if (m_listAllocator) {
+		// Resets only this list. The others of the shared allocator may still run on the GPU.
+		pair.list->Recycle(m_listAllocator.Get());
+	} else {
+		return;
+	}
 	if (m_freePairs.size() < m_config.maxInFlightBatches + 1) {
 		m_freePairs.push_back(std::move(pair));
 	}
@@ -758,6 +771,7 @@ void CopyQueueUploadService::Cleanup() {
 		if (last != 0) (void)(*m_timeline)->HostWait(last);
 	}
 	m_freePairs.clear();
+	m_listAllocator = {};
 	m_epoch.fetch_add(1, std::memory_order_acq_rel); // invalidate every thread's open page
 	{
 		std::lock_guard lock(m_pageMutex);

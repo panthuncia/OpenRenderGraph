@@ -350,6 +350,38 @@ the owner thread.
     owner instead.
 -   **Lifetime.** A batch is held until the slot whose submission recorded it has retired.
 
+## Command lists and allocators
+
+`CommandListPool` hands out command lists. Many lists share one command allocator, called a shard. On Vulkan each
+allocator is a `VkCommandPool`, and each pool costs driver memory once one of its buffers is recorded: about 2 MB of VRAM
+on the AMD driver. One allocator per list made thousands of pools. Shared allocators keep the count near the number of
+lists that record at the same time.
+
+Vulkan requires external synchronization of a pool for every reset, begin, recorded command, end and free of any buffer
+in it. The pool follows these rules:
+
+-   **One claim per shard.** A thread records into a list only while the list's pair holds its shard's claim.
+-   **Begin claims.** `CommandListPool::Begin` resets the list and takes the claim. `Request` begins the list it returns.
+    `AcquireBatch` returns lists that are not begun. The recorder begins each one on its own thread
+    (`RecordPreparedRhiExecutionBatch`), unless the acquirer began it already to record the Tracy frame mark.
+-   **The claim travels.** A list begun on one thread may be recorded on another, when the hand-over orders the two. The
+    host's thread begins a slot's upload lists in `PrepareTicket`, and the render thread records them in `SubmitTicket`.
+-   **Closing releases.** `CommandListPair::EndRecording` (`FrameCommandAllocation::Close`) gives up the claim once the
+    list is closed. Recycling, discarding or destroying a pair releases it too.
+-   **Claims never wait.** Begin takes the list's own shard when it is free. Otherwise it trades the list for an idle one
+    of a free shard, or makes a list in a free or new shard.
+-   **Frees happen under the claim.** A list dropped without its claim goes to its shard's orphans. The shard's next
+    claimant frees it.
+-   **No whole-allocator reset.** Each list is reset on its own when it is begun. Kept recordings and lists still on the
+    GPU stay valid while other lists of their shard are reset. The background worker frees idle lists over the targets,
+    then trims the shards nobody holds (`CommandAllocator::Trim`).
+-   **Submission needs no claim.** Neither does executing a closed secondary from another list (an external epoch's
+    secondaries in the host's command buffer, on DXVK's thread).
+
+The pool keeps idle lists for one generation's high water plus two. Lists still in flight raise the capacity when an
+acquisition runs short. D3D12 allocators cannot share lists (`CommandAllocator::SupportsSharedLists`): there each list
+keeps a shard of its own, and Begin resets the whole allocator.
+
 ## Tests
 
 -   `tests/PersistentGraphTests.cpp`:

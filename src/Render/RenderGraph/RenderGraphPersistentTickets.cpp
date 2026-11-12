@@ -399,7 +399,7 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 					barriers.textures = {release.textures.data(), static_cast<uint32_t>(release.textures.size())};
 					list.Barriers(barriers);
 					if (list.EndChecked() != rhi::Result::Ok) throw std::runtime_error("A ticket's release list could not close");
-					allocation->closed = true;
+					allocation->Close();
 					streamReleases.push_back(list);
 					for (const auto consumer : release.consumers)
 						if (std::ranges::find(streamReleaseConsumers, consumer) == streamReleaseConsumers.end()) streamReleaseConsumers.push_back(consumer);
@@ -415,7 +415,7 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 				barriers.textures = {release.textures.data(), static_cast<uint32_t>(release.textures.size())};
 				list.Barriers(barriers);
 				if (list.EndChecked() != rhi::Result::Ok) throw std::runtime_error("A ticket's release list could not close");
-				allocation->closed = true;
+				allocation->Close();
 				const auto value = ++nextQueueValues[release.queue];
 				const rhi::TimelinePoint point{m_queueRegistry.GetFence(index).GetHandle(), value};
 				rhi::SubmitDesc submit{};
@@ -463,7 +463,7 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 					list.Barriers(acquired);
 				}
 				if (list.EndChecked() != rhi::Result::Ok) throw std::runtime_error("A ticket's handoff list could not close");
-				allocation->closed = true;
+				allocation->Close();
 				(inStream(batch) ? streamHandoff : handoff)[batch] = list;
 				if (cache) cache->allocations.push_back(allocation);
 				out.leases.push_back(std::move(allocation));
@@ -635,7 +635,7 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 					list.Barriers(toHome);
 				}
 				if (list.EndChecked() != rhi::Result::Ok) throw std::runtime_error("A ticket's home acquires could not close");
-				allocation->closed = true;
+				allocation->Close();
 				bool split = false;
 				std::vector<rhi::TimelinePoint> waits;
 				for (const auto producer : home.producers) {
@@ -698,7 +698,7 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 				list.Barriers(toHome);
 			}
 			if (list.EndChecked() != rhi::Result::Ok) throw std::runtime_error("A ticket's home acquires could not close");
-			allocation->closed = true;
+			allocation->Close();
 			if (graphicsSlot >= nextQueueValues.size()) throw std::logic_error("A ticket's home acquires have no graphics queue value to signal");
 			const auto value = ++nextQueueValues[graphicsSlot];
 			std::vector<rhi::TimelinePoint> waits;
