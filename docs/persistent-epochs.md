@@ -255,6 +255,8 @@ declared resource gets another backing". Passes declare the versioned resource i
     thread, and `Publish` does both. `owner` is kept alive with the version, such as the lease of a pooled backing.
     `VersionedBuffer::GrowStructured` and `GrowBytes` make, materialize and adopt a buffer at another size. After a growth,
     `GraphHost::NoteNewVersions` makes the tickets prepared before it stale.
+-   **Image versions.** `VersionedTexture::CreateImage`, `PublishImage` and `MakeImage` take any texture resource, such as an
+    imported or exported image (`ExternalTextureResource`), under the same rules. Such a version's `texture` is null.
 -   **Shape class.** Every version must have the first one's shape class. For a texture that is its format, mip count and
     slice count. A buffer has none, since its size is not part of its graph slot. `Make` rejects a version of another shape
     class. A resource of another shape is a new resource: its passes are declared again, which rebuilds.

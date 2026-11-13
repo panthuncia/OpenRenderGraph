@@ -2,6 +2,7 @@
 
 #include <memory>
 
+#include "Resources/GloballyIndexedResource.h"
 #include "Resources/PixelBuffer.h"
 #include "Resources/VersionedResource.h"
 
@@ -9,7 +10,7 @@ namespace org {
 
 // One version of a VersionedTexture. It is immutable once made.
 struct TextureVersion : ResourceVersion {
-    std::shared_ptr<PixelBuffer> texture;  // the same object as `resource`
+    std::shared_ptr<PixelBuffer> texture;  // the same object as `resource`; null for an image version (MakeImage)
 };
 
 // A texture whose backing changes by versions (VersionedResource). Every version has the first one's format, mip count
@@ -42,6 +43,19 @@ public:
     std::shared_ptr<const TextureVersion> Make(std::shared_ptr<PixelBuffer> next, std::shared_ptr<const void> owner = {});
     // Owner thread: a pending version (Make, of this texture) becomes the current one.
     void Adopt(const std::shared_ptr<const TextureVersion>& version) { AdoptVersion(version); }
+
+    // Image versions: a texture the graph does not make, such as an imported or exported image (ExternalTextureResource).
+    // The same rules hold: one shape class, immutable versions. Such a version's `texture` is null; `resource` holds it.
+    static std::shared_ptr<VersionedTexture> CreateImage(std::shared_ptr<GloballyIndexedResource> first, std::shared_ptr<const void> owner = {});
+    // Owner thread: installs `next` as the current version.
+    std::shared_ptr<const TextureVersion> PublishImage(std::shared_ptr<GloballyIndexedResource> next, std::shared_ptr<const void> owner = {});
+    // Any thread. Makes `next` the next version. It is not current until its owner adopts it.
+    std::shared_ptr<const TextureVersion> MakeImage(std::shared_ptr<GloballyIndexedResource> next, std::shared_ptr<const void> owner = {});
+    // The current version's resource, a PixelBuffer or an image.
+    [[nodiscard]] std::shared_ptr<Resource> CurrentResource() const noexcept {
+        const auto version = CurrentVersion();
+        return version ? version->resource : nullptr;
+    }
 
     // A copy shares the versions (Key), as a clone does.
     VersionedTexture(const VersionedTexture&) = default;

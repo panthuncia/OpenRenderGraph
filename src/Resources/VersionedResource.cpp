@@ -182,4 +182,24 @@ std::shared_ptr<const TextureVersion> VersionedTexture::Make(std::shared_ptr<Pix
     return version;
 }
 
+std::shared_ptr<VersionedTexture> VersionedTexture::CreateImage(std::shared_ptr<GloballyIndexedResource> first, std::shared_ptr<const void> owner) {
+    auto versioned = std::shared_ptr<VersionedTexture>(new VersionedTexture());
+    versioned->PublishImage(std::move(first), std::move(owner));
+    return versioned;
+}
+
+std::shared_ptr<const TextureVersion> VersionedTexture::PublishImage(std::shared_ptr<GloballyIndexedResource> next, std::shared_ptr<const void> owner) {
+    auto version = MakeImage(std::move(next), std::move(owner));
+    Adopt(version);
+    return version;
+}
+
+std::shared_ptr<const TextureVersion> VersionedTexture::MakeImage(std::shared_ptr<GloballyIndexedResource> next, std::shared_ptr<const void> owner) {
+    if (!next || !next->HasLayout()) throw std::invalid_argument("VersionedTexture: an image version needs a texture");
+    auto version = std::make_shared<TextureVersion>();
+    version->texture = std::dynamic_pointer_cast<PixelBuffer>(next);
+    MakeVersion(*version, std::move(next), std::move(owner));
+    return version;
+}
+
 } // namespace org
