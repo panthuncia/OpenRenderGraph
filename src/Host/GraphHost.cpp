@@ -897,6 +897,7 @@ bool GraphHost::BuildInstance(size_t index) {
 			graph->SetExternalQueueBoundary(boundary);
 		}
 		graph->SetFrameWaitTimeline(m_frameWaitTimeline);
+		graph->SetScopedFrameWait(m_desc.scopedFrameWait);
 		graph->Setup();
 		graph->SetGpuPassRangeCallbacks(m_gpuPassRangeBegin, m_gpuPassRangeEnd);
 	} catch (const std::exception& e) {

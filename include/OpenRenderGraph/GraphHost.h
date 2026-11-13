@@ -91,6 +91,9 @@ public:
 		// RecordPendingUploads' queue-scoped uploads). Off: every upload on the graphics queue, and every batch on another queue
 		// waits for them.
 		bool queueScopedUploads = true;
+		// A batch waits for the frame wait (SetFrameWaitValue) only when one of its passes declares a late-bound buffer whose
+		// versions are ready at the frame wait (VersionedBuffer::LateReady::FrameWait). Off: every batch waits for it.
+		bool scopedFrameWait = false;
 	};
 
 	using ExtensionFactory = std::function<std::unique_ptr<RenderGraph::IRenderGraphExtension>()>;

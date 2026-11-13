@@ -32,9 +32,13 @@ namespace detail {
 //   replaces its stand-in, and releasing the older token then keeps the newer entry. Invalid handles bind nothing (null).
 // - LateStandInOf: the stand-in `backing` is bound to, or an invalid handle.
 // - AnyLateBacking: whether anything is bound, so the planner can skip the lookups.
+// - MarkFrameWaitStandIn, IsFrameWaitStandIn: the stand-ins of late-bound buffers whose versions are ready at the frame wait
+//   (LateReady::FrameWait). With scoped frame waits, only the batches that declare one wait for it.
 [[nodiscard]] std::shared_ptr<void> BindLateBacking(rhi::ResourceHandle backing, rhi::ResourceHandle standIn);
 [[nodiscard]] rhi::ResourceHandle LateStandInOf(rhi::ResourceHandle backing) noexcept;
 [[nodiscard]] bool AnyLateBacking() noexcept;
+void MarkFrameWaitStandIn(rhi::ResourceHandle standIn);
+[[nodiscard]] bool IsFrameWaitStandIn(rhi::ResourceHandle standIn) noexcept;
 }  // namespace detail
 
 // What a revision names as its immutable inputs: the version of each versioned buffer its passes use. A preparation
@@ -66,6 +70,8 @@ struct IResourceVersions {
 // costs no binding edit and no lowering. While a version lives, the upload planner takes each batch that declares the
 // buffer as a user of the version's backing: an upload into it goes to that batch's queue, or the batch waits for it.
 // Barriers come from the upload lists' own barriers, so the readers must only read.
+// A host that fills its versions some other way and signals the frame-wait timeline after (RenderGraph::SetFrameWaitTimeline)
+// makes the buffer with LateReady::FrameWait: then the batches that declare it wait for the frame wait.
 //
 // Thread contract:
 // - Make* and PublishLate may run on any thread.
@@ -74,6 +80,9 @@ struct IResourceVersions {
 //   whole.
 class VersionedBuffer final : public ClonableResolver<VersionedBuffer> {
 public:
+    // When a late-bound version is ready for its readers: when its staged uploads land (the upload planner orders them), or at
+    // the frame wait.
+    enum class LateReady : uint8_t { Uploads, FrameWait };
     static std::shared_ptr<VersionedBuffer> Create(std::shared_ptr<Buffer> first) {
         auto versioned = std::shared_ptr<VersionedBuffer>(new VersionedBuffer());
         versioned->Publish(std::move(first));
@@ -81,7 +90,7 @@ public:
     }
     // A late-bound buffer. `standIn` is what its readers' declarations resolve to: any small materialized buffer that lives as
     // long as this one. It has no version until the first PublishLate.
-    static std::shared_ptr<VersionedBuffer> CreateLateBound(std::shared_ptr<Buffer> standIn) {
+    static std::shared_ptr<VersionedBuffer> CreateLateBound(std::shared_ptr<Buffer> standIn, LateReady ready = LateReady::Uploads) {
         if (!standIn) throw std::invalid_argument("VersionedBuffer: a late-bound buffer needs a stand-in");
         auto versioned = std::shared_ptr<VersionedBuffer>(new VersionedBuffer());
         auto declaration = std::make_shared<ResolverDeclarationState>();
@@ -91,6 +100,7 @@ public:
         declaration->resources = std::make_shared<const ResolverResourceList>(ResolverResourceList{standIn});
         versioned->m_state->lateDeclaration = std::move(declaration);
         versioned->m_state->standIn = std::move(standIn);
+        versioned->m_state->ready = ready;
         return versioned;
     }
     [[nodiscard]] bool LateBound() const noexcept { return m_state->standIn != nullptr; }
@@ -103,8 +113,9 @@ public:
         auto version = std::make_shared<BufferVersion>();
         version->number = m_state->published.fetch_add(1, std::memory_order_relaxed) + 1;
         version->declaration = m_state->lateDeclaration;
-        version->publication = detail::BindLateBacking(backing->GetAPIResource().GetHandle(),
-            m_state->standIn->GetAPIResource().GetHandle());
+        const auto standIn = m_state->standIn->GetAPIResource().GetHandle();
+        version->publication = detail::BindLateBacking(backing->GetAPIResource().GetHandle(), standIn);
+        if (m_state->ready == LateReady::FrameWait) detail::MarkFrameWaitStandIn(standIn);
         if (!version->publication) throw std::runtime_error("VersionedBuffer: a late version's backing or stand-in is not materialized");
         version->owner = std::move(owner);
         version->buffer = std::move(backing);
@@ -213,6 +224,7 @@ private:
         // A late-bound buffer only: what its declarations resolve to, set once at creation.
         std::shared_ptr<Buffer> standIn;
         std::shared_ptr<const ResolverDeclarationState> lateDeclaration;
+        LateReady ready = LateReady::Uploads;
     };
     std::shared_ptr<State> m_state;
 };

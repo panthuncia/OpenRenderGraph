@@ -457,6 +457,10 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 					if (graphicsSlot >= nextQueueValues.size()) throw std::logic_error("A ticket's uploads have no graphics queue value to signal");
 					streamUploadsSignal = ++nextQueueValues[graphicsSlot];
 				}
+		// Scoped frame wait: only the batches that read the frame's values wait for it.
+		std::vector<uint8_t> frameReaders;
+		if (frameWait && m_scopedFrameWait) frameReaders = persistent::FrameWaitReaders(graph, admission.backings);
+		uint32_t frameWaitsSpared = 0;
 		for (uint32_t batch = 0; batch < batchCount; ++batch) {
 			const auto queue = graph.batches[batch].queue;
 			if (queue >= nextQueueValues.size()) throw std::logic_error("Ticket batch on an unknown queue");
@@ -472,10 +476,13 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 			if (streamReleasesSignal && !inStream(batch) && std::ranges::find(streamReleaseConsumers, batch) != streamReleaseConsumers.end())
 				batches[batch].waits.push_back({admission.queueTimelines.at(graphicsSlot), streamReleasesSignal});
 			// The frame's values (SetFrameWaitTimeline): every packet prepared since it was set binds the timeline.
-			if (frameWait)
+			if (frameWait && (frameReaders.empty() || frameReaders[batch]))
 				batches[batch].waits.push_back({kFrameWaitTimelineIdentity, frameWait});
+			else if (frameWait)
+				++frameWaitsSpared;
 			out.signals.push_back(batches[batch].signal.value);
 		}
+		if (frameWaitsSpared) basic_telemetry::AddCounter("ORG.Persistent.FrameWaitsSpared", frameWaitsSpared);
 		for (const auto wait : graph.relativeWaits)
 			batches.at(wait.consumerBatch).waits.push_back(batches.at(wait.producerBatch).signal);
 		for (auto& batch : batches) {

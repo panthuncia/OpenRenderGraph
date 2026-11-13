@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace org::detail {
 namespace {
@@ -65,5 +66,33 @@ rhi::ResourceHandle LateStandInOf(rhi::ResourceHandle backing) noexcept {
 }
 
 bool AnyLateBacking() noexcept { return Get().count.load(std::memory_order_acquire) != 0; }
+
+namespace {
+struct FrameWaitStandIns {
+    std::mutex mutex;
+    std::unordered_set<uint64_t> keys;
+    std::atomic<bool> any{false};
+};
+
+FrameWaitStandIns& StandIns() {
+    static FrameWaitStandIns standIns;
+    return standIns;
+}
+} // namespace
+
+void MarkFrameWaitStandIn(rhi::ResourceHandle standIn) {
+    if (!standIn.valid()) return;
+    auto& standIns = StandIns();
+    std::lock_guard lock(standIns.mutex);
+    standIns.keys.insert(Key(standIn));
+    standIns.any.store(true, std::memory_order_release);
+}
+
+bool IsFrameWaitStandIn(rhi::ResourceHandle standIn) noexcept {
+    auto& standIns = StandIns();
+    if (!standIns.any.load(std::memory_order_acquire)) return false;
+    std::lock_guard lock(standIns.mutex);
+    return standIns.keys.contains(Key(standIn));
+}
 
 } // namespace org::detail

@@ -34,6 +34,7 @@
 #include "Resources/GloballyIndexedResource.h"
 #include "Resources/PixelBuffer.h"
 #include "Resources/Buffers/DynamicBufferBase.h"
+#include "Resources/Buffers/VersionedBuffer.h"
 #include "Resources/MemoryStatisticsComponents.h"
 #include "Render/FrameGraphSnapshot.h"
 #include "Managers/Singletons/DeviceManager.h"
@@ -765,3 +766,28 @@ void FillScheduleSubmissionWaits(ScheduleSubmissionWaits& out, const compiler::S
 } // namespace persistent_impl
 
 } // namespace org
+
+namespace org::persistent {
+// Per batch of `graph`: whether one of its passes declares a late-bound buffer whose versions are ready at the frame wait
+// (VersionedBuffer::LateReady::FrameWait), through `backings` (an admission's, by compiler resource). Every batch counts when
+// the graph does not say what each batch accesses.
+template <class Graph, class Backings>
+std::vector<uint8_t> FrameWaitReaders(const Graph& graph, const Backings& backings) {
+	const auto batchCount = graph.batches.size();
+	std::vector<uint8_t> reads(batchCount, 0);
+	if (graph.boundaryAccessesByBatch.size() != batchCount) {
+		reads.assign(batchCount, 1);
+		return reads;
+	}
+	for (size_t batch = 0; batch < batchCount; ++batch)
+		for (const auto& access : graph.boundaryAccessesByBatch[batch]) {
+			if (access.resource >= backings.size()) continue;
+			const auto& backing = backings[access.resource];
+			if (backing.resource.valid() && detail::IsFrameWaitStandIn(backing.resource)) {
+				reads[batch] = 1;
+				break;
+			}
+		}
+	return reads;
+}
+}  // namespace org::persistent

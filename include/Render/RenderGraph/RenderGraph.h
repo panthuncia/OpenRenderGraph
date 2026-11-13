@@ -234,6 +234,10 @@ public:
 	bool HasFrameWaitTimeline() const noexcept { return m_frameWaitTimeline && *m_frameWaitTimeline; }
 	// The synchronous executions' wait (Execute): until changed. 0: none.
 	void SetFrameWaitValue(uint64_t value) noexcept { m_frameWaitValue = value; }
+	// Only the batches that declare a late-bound buffer ready at the frame wait (VersionedBuffer::LateReady::FrameWait) wait for
+	// it (GraphHost::Desc::scopedFrameWait). Off: every batch does.
+	void SetScopedFrameWait(bool scoped) noexcept { m_scopedFrameWait = scoped; }
+	bool ScopedFrameWait() const noexcept { return m_scopedFrameWait; }
 
 	// Tickets (GraphHost's async epochs) and their recordings, which the host's private calls below take and return.
 	struct PersistentTicket;
@@ -860,6 +864,7 @@ private:
 	std::vector<SharedQueueTimeline> m_sharedQueueTimelines;  // SetSharedQueueTimelines
 	uint32_t m_passEpochFilter = UINT32_MAX;  // SetPassEpochFilter (persistent::AllEpochs)
 	uint64_t m_frameWaitValue = 0;
+	bool m_scopedFrameWait = false;  // SetScopedFrameWait
 	std::optional<PresentDependency> m_lastPresentDependency;
 	std::string m_presentPass;              // SetPresentPass
 	std::shared_ptr<Resource> m_swapchain;  // SetSwapchainResource

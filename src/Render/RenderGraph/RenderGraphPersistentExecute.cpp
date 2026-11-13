@@ -154,10 +154,15 @@ bool RenderGraph::AdmitPersistentSegment(PersistentSegmentRun& run) {
 		return false;
 	}
 	const auto& options = run.execution.options;
-	// Executed now (not a ticket, which takes its wait when submitted): every batch waits for the frame's values.
-	if (!options.ticket && HasFrameWaitTimeline() && m_frameWaitValue)
+	// Executed now (not a ticket, which takes its wait when submitted): every batch waits for the frame's values, or with a
+	// scoped frame wait only the batches that read them.
+	if (!options.ticket && HasFrameWaitTimeline() && m_frameWaitValue) {
+		std::vector<uint8_t> readers;
+		if (m_scopedFrameWait) readers = persistent::FrameWaitReaders(*segment.publication->executable->graph, admission.backings);
 		for (auto* set : {&admission.incomingWaits, &admission.ownWaits})  // ownWaits: kept by its readmission
-			for (auto& waits : *set) waits.push_back({kFrameWaitTimelineIdentity, m_frameWaitValue});
+			for (size_t batch = 0; batch < set->size(); ++batch)
+				if (readers.empty() || (batch < readers.size() && readers[batch])) (*set)[batch].push_back({kFrameWaitTimelineIdentity, m_frameWaitValue});
+	}
 	// Replayable recordings (SetPersistentRecordingReuse): a ticket's closed execution with nothing late-bound, whose passes all
 	// report their revisions, is recorded for resubmission. Only a revision's published copies are submitted again.
 	auto* const ticketTarget = options.ticket;
