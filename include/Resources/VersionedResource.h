@@ -35,7 +35,8 @@ struct ResourceVersion {
 class IVersionedResource {
 public:
     virtual ~IVersionedResource() = default;
-    // Identifies the resource across its versions and its clones.
+    // Identifies the resource across its versions and its clones. It is the dependency identity its declarations name:
+    // lowering finds the slot of a use by it.
     virtual const void* Key() const noexcept = 0;
     // The scheduling identity of the resource's slot. It stays the same across versions.
     virtual uint64_t SlotID() const noexcept = 0;
@@ -80,7 +81,7 @@ struct IResourceVersions {
 //   shared_ptr, read whole.
 class VersionedResource : public IResourceResolver, public IVersionedResource {
 public:
-    const void* Key() const noexcept final { return m_state.get(); }
+    const void* Key() const noexcept final { return m_state->identity.get(); }
     uint64_t SlotID() const noexcept final { return m_state->slotID; }
     bool LateBound() const noexcept final { return m_state->standIn != nullptr; }
     std::shared_ptr<const ResourceVersion> SelectVersion(const ResolverCaptureContext* context) const final;
