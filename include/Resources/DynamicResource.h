@@ -131,21 +131,20 @@ public:
     }
 
     rhi::BarrierBatch GetEnhancedBarrierGroup(RangeSpec range, rhi::ResourceAccessType prevAccessType, rhi::ResourceAccessType newAccessType, rhi::ResourceLayout prevLayout, rhi::ResourceLayout newLayout, rhi::ResourceSyncState prevSyncState, rhi::ResourceSyncState newSyncState) override {
-		if (m_resource) {
-			//SetState(newState); // Keep the wrapper's state in sync
-			return m_resource->GetEnhancedBarrierGroup(range, prevAccessType, newAccessType, prevLayout, newLayout, prevSyncState, newSyncState);
-		}
+		// SetResource may run on another thread: read the resource under the lock, as every reader here does.
+		if (const auto resource = GetResource())
+			return resource->GetEnhancedBarrierGroup(range, prevAccessType, newAccessType, prevLayout, newLayout, prevSyncState, newSyncState);
         return {};
     }
 
     rhi::Resource GetAPIResource() override {
-        return m_resource->GetAPIResource();
+        return GetResource()->GetAPIResource();
     }
     bool HasResource() const {
-        return m_resource != nullptr;
+        return GetResource() != nullptr;
     }
     SymbolicTracker* GetStateTracker() override {
-        return m_resource->GetStateTracker();
+        return GetResource()->GetStateTracker();
     }
 protected:
     void OnSetName() override {
