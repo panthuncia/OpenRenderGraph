@@ -377,7 +377,6 @@ private:
 		return m_SRVViews[static_cast<unsigned int>(m_primaryViewType)].infos;
 	}
 
-	friend class DynamicGloballyIndexedResource;
 	friend class BufferBase;
 };
 

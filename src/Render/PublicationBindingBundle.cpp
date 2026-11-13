@@ -115,10 +115,6 @@ PublicationBindingBundle::Snapshot PublicationBindingBundle::Capture(Resource& r
         auto concrete = dynamic->GetResource();
         return concrete ? Capture(*concrete) : Snapshot{};
     }
-    if (auto* dynamic = dynamic_cast<DynamicGloballyIndexedResource*>(&resource)) {
-        auto concrete = dynamic->GetResource();
-        return concrete ? Capture(*concrete) : Snapshot{};
-    }
     auto result = std::make_shared<ResourceBindingSnapshot>();
     result->resourceID = resource.GetGlobalResourceID();
     result->externallyImmutable = resource.GetGraphOwnership() == Resource::GraphOwnership::ExternalImmutableShaderResource;

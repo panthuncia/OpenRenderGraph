@@ -1208,8 +1208,7 @@ void RenderGraph::RegisterResolvedResourceAlias(
 	if (!resource) return;
 
 	const auto existing = RequestResourcePtr(id, true);
-	const bool dynamicAlias = dynamic_cast<DynamicResource*>(existing.get()) != nullptr ||
-		dynamic_cast<DynamicGloballyIndexedResource*>(existing.get()) != nullptr;
+	const bool dynamicAlias = dynamic_cast<DynamicResource*>(existing.get()) != nullptr;
 	if (dynamicAlias) {
 		m_resolvedResourceAliases.insert(id);
 		spdlog::info(

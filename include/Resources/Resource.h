@@ -446,7 +446,6 @@ private:
     friend class ResourceGroup;
     friend class ::ResourceManager;
     friend class DynamicResource;
-    friend class DynamicGloballyIndexedResource;
     friend class DynamicBuffer;
     friend class UploadManager; // Kinda a hack, for deduplicating transition lists
 };

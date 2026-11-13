@@ -666,7 +666,7 @@ void persistent_impl::UseRebindSlots(State::MainPass& main, LoweredPass& lowered
 	std::vector<Resource*> places; // Distinct resources, in the order the lowering names them.
 	const auto rebind = [&](LoweredUse& use) {
 		if (!use.resource || use.owner || use.versioned) return;
-		if (dynamic_cast<DynamicResource*>(use.resource) || dynamic_cast<DynamicGloballyIndexedResource*>(use.resource)) return;
+		if (dynamic_cast<DynamicResource*>(use.resource)) return;
 		auto concrete = use.resource->weak_from_this().lock();
 		if (!concrete) return; // Not owned by a shared_ptr: nothing a slot could hold.
 		const auto place = static_cast<size_t>(std::find(places.begin(), places.end(), use.resource) - places.begin());

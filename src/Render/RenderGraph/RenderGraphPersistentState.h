@@ -653,7 +653,7 @@ inline RotationKey RotationKeyOf(State::SlotEntry& entry) {
 	if (!entry.resource) return key;
 	if (entry.classified != entry.resource) {
 		entry.classified = entry.resource;
-		entry.wrapper = dynamic_cast<DynamicResource*>(entry.resource) || dynamic_cast<DynamicGloballyIndexedResource*>(entry.resource);
+		entry.wrapper = dynamic_cast<DynamicResource*>(entry.resource) != nullptr;
 		entry.concrete = nullptr;
 	}
 	auto* concrete = entry.wrapper ? UnwrapDynamic(entry.resource) : entry.resource;

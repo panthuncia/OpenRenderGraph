@@ -26,12 +26,6 @@ Resource* UnwrapDynamic(Resource* resource) noexcept {
 			resource = backing.get();
 			continue;
 		}
-		if (auto* dynamic = dynamic_cast<DynamicGloballyIndexedResource*>(resource)) {
-			auto backing = dynamic->GetResource();
-			if (!backing) return nullptr;
-			resource = backing.get();
-			continue;
-		}
 		return resource;
 	}
 	return nullptr;
