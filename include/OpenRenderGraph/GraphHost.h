@@ -228,8 +228,9 @@ public:
 	 *
 	 * It does everything the host's own build does: the extensions made for the epoch, the shared queue timelines, the epoch
 	 * filter, external epochs, the alias arena, the settings, CompileStructural and Setup. It also does the work the first
-	 * preparation would do inline. It lowers every pass, waits for the passes' pipelines, and builds and installs the first schedule
-	 * with its alias placements. So AttachEpochGraph only swaps. The steps that touch objects every graph shares (the statistics
+	 * preparation would do inline. It lowers every pass, waits for the passes' pipelines, and builds and installs the first schedule.
+	 * So AttachEpochGraph only swaps. The alias placement waits for the graph's first preparation (on the host's thread with async
+	 * epochs): it re-materializes transients the epoch's running graph shares. The steps that touch objects every graph shares (the statistics
 	 * query heap, the host's upload pass, the upload service's registry) wait for the attach.
 	 *
 	 * The extension factories run on the calling thread (see "Extension factories" in persistent-epochs.md). Builds of different

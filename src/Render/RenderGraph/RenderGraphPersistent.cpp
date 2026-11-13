@@ -720,6 +720,7 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint32_t frameIndex
 	state.frameNumber = ++compiler.asyncPreparationFrameNumber;
 	RetireIdlePersistentAliasPools(state);
 	org::runtime::ScopedActiveGraphServices activeServices(m_uploadService.get(), m_descriptorService.get());
+	PlaceDeferredPersistentAliases();
 	BindPersistentFrame(options.ticket != nullptr, bootstrap);
 	state.prepared = PreparePersistentExecution(device, frameIndex, hostData, deltaTime, options);
 }
@@ -732,7 +733,34 @@ void RenderGraph::PrepareFirstPersistentBuild() {
 	// The same bootstrap the first preparation runs. The first preparation then finds the graph built, and only polls the
 	// passes' declarations: a pass whose declaration its first Update changes is lowered again then, like any later change.
 	org::runtime::ScopedActiveGraphServices activeServices(m_uploadService.get(), m_descriptorService.get());
-	BootstrapPersistentGraph();
+	m_deferFirstAliasPlacement = true;
+	try {
+		BootstrapPersistentGraph();
+	} catch (...) {
+		m_deferFirstAliasPlacement = false;
+		throw;
+	}
+	m_deferFirstAliasPlacement = false;
+}
+
+void RenderGraph::PlaceDeferredPersistentAliases() {
+	auto& compiler = *m_compilerState;
+	if (!compiler.persistent || !compiler.persistent->aliasPlacementDeferred) return;
+	BT_ZONE_SCOPE("ORG.Persistent.DeferredAliasPlacement");
+	auto& state = *compiler.persistent;
+	state.aliasPlacementDeferred = false;
+	auto edit = state.program.BeginEdit();
+	// A structural edit, as every placement is: the executable re-validates the new overlaps (and the bindings the planner
+	// replaces may carry another graph's placement, which only a structural edit may change). There are no orderings yet.
+	edit.ClearPlacementOrderings();
+	state.aliasEdges.clear();
+	const auto live = state.program.Select();
+	if (!live || !PlanPersistentAliasPlacement(edit, *live)) return;
+	std::atomic_bool cancelled{false};
+	auto ready = edit.Build(compiler.synchronousCompileWorkspace, cancelled);
+	if (!ready || !state.program.Install(edit, ready)) throw std::runtime_error("Persistent deferred alias placement failed to install");
+	++state.structuralBuilds;
+	basic_telemetry::AddCounter("ORG.Persistent.DeferredAliasPlacements");
 }
 
 bool RenderGraph::RequestPassPipelines(const PassParameters& resources, DeviceInstanceId device, const std::string& passName, std::string* failure) {
@@ -790,6 +818,7 @@ void RenderGraph::BootstrapPersistentGraph() {
 		state.admission->SetClosedExecutions(m_persistentClosedExecutions);
 		state.admission->SetExternalHomeStates(m_persistentExternalHomeStates);
 		state.ensureRepresentations = [this](Resource& resource) { EnsurePersistentRepresentations(resource); };
+		state.deferAliasPlacement = m_deferFirstAliasPlacement;
 		// Tickets record their uploads on the graphics queue, or on the queue that first uses them (RecordPendingUploads).
 		if (m_queueRegistry.SlotCount())
 			state.admission->SetUploadQueue(static_cast<uint32_t>(ToUnderlying(m_queueRegistry.FindGraphicsSlot())));
@@ -883,7 +912,8 @@ void RenderGraph::BootstrapPersistentGraph() {
 			if (!entry.resource || entry.versioned || entry.isBound) continue;
 			if (unbound++ < 8) unboundNames += (unboundNames.empty() ? "" : ", ") + entry.resource->GetName();
 		}
-		if (unbound) spdlog::warn("Persistent graph bootstrap left {} declared slots unbound (first: {})", unbound, unboundNames);
+		// Alias candidates are bound by the deferred placement (PlaceDeferredPersistentAliases).
+		if (unbound && !state.aliasPlacementDeferred) spdlog::warn("Persistent graph bootstrap left {} declared slots unbound (first: {})", unbound, unboundNames);
 		{
 			// Diagnostic: physical resources bound in several groups (or a group
 			// and a direct slot) share one equivalence class; joining another

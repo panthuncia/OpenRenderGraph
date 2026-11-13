@@ -36,8 +36,13 @@ submission point is an **epoch**.
         does (the extensions made for the epoch, the shared timelines, the epoch filter, external epochs, the alias arena,
         the settings, `CompileStructural`, `Setup`). It also does what the first preparation would do inline
         (`RenderGraph::PrepareFirstPersistentBuild`): it lowers every pass, waits for their pipelines, and builds and
-        installs the first schedule with its alias placements. It touches no instance, ticket or host-thread state, so the
-        old graph keeps preparing and submitting meanwhile. A failure is returned in the handle (`Built()`, `Error()`).
+        installs the first schedule. It touches no instance, ticket or host-thread state, so the old graph keeps preparing
+        and submitting meanwhile. A failure is returned in the handle (`Built()`, `Error()`).
+    -   The alias placement waits for the graph's first preparation, after the attach (`PlaceDeferredPersistentAliases`: a
+        plan against the installed schedule, one validated build, an install). Placing re-materializes the transients, and
+        those resource objects are the ones the epoch's running graph (and any other build of it in flight) binds: placed
+        during the build, they moved under that graph, whose next preparation then failed with "Binding replacement requires
+        a structural alias edit".
     -   The build blocks while its pipelines compile, and they compile on the runtime's task service. So build on a thread
         of the application's own, or on a pool with workers to spare: a build on the last free worker of a small pool waits
         for pipeline jobs that have nowhere to run.
@@ -470,7 +475,7 @@ A host's graphs place their transients into one `PersistentAliasArena` (`RenderG
     rebuilds those graphs at the next build point, which places them in the current generation and frees the old one.
 -   **Reported instead of rebuilt.** With `Desc::reportStaleAliasPlacements`, the build point leaves those graphs alone.
     `StaleAliasPlacementEpochs()` lists their epochs, and the application rebuilds them through `BuildEpochGraph`. A detached
-    build places its transients when it is built, so it can grow a pool before it is attached.
+    build places its transients at its first preparation after the attach, where it may grow a pool.
 -   **Test.** `PersistentVulkanHostTests arena`: two epochs whose scratch buffers share one pool at offset 0 (the second's
     write on the compute queue). Each epoch's copy reads what it wrote, synchronous and async.
 

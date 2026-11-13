@@ -1738,6 +1738,9 @@ void GraphHost::StartAsync() {
 					}
 					PrepareTicket(*state, index, nullptr);
 					prepared = true;
+					// A message waits (an attach holding for this thread, say): read it before the next epoch's first ticket. The
+					// epochs still without one come first again on the next pass.
+					if (round == 0 && state->read.load(std::memory_order_relaxed) != state->written.load(std::memory_order_acquire)) break;
 					if (round == 1) {
 						state->nextAhead = (index + 1) % epochCount;
 						break;
@@ -1918,6 +1921,9 @@ bool GraphHost::RequestEpochRecording(uint32_t epoch, std::shared_ptr<const IHos
 bool GraphHost::AdvanceRecordingRequests(Async& state) {
 	bool advanced = false;
 	for (auto it = state.pendingRequests.begin(); it != state.pendingRequests.end();) {
+		// A message from the render thread waits (an attach holding for this thread, a submission): it is read before the next copy, so
+		// a hold never waits behind every pending request's copy (a load posts one per revision-driven epoch).
+		if (advanced && state.read.load(std::memory_order_relaxed) != state.written.load(std::memory_order_acquire)) break;
 		auto& request = **it;
 		std::exception_ptr error;
 		try {

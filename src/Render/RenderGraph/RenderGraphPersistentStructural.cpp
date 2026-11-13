@@ -271,6 +271,12 @@ std::shared_ptr<const persistent::SelectedPublication> RenderGraph::BuildPersist
 		}
 	}
 	if (!scheduled) throw std::runtime_error("Persistent structural build failed (schedule)");
+	// A first build off the owner thread installs the schedule alone; its first preparation places (PlaceDeferredPersistentAliases).
+	if (state.deferAliasPlacement) {
+		state.deferAliasPlacement = false;
+		state.aliasPlacementDeferred = true;
+		return scheduled;
+	}
 	// Unchanged orderings and bindings mean every overlapping pair is still
 	// ordered between all of its users, so the scheduled publication is valid.
 	if (!PlanPersistentAliasPlacement(edit, *scheduled)) return scheduled;

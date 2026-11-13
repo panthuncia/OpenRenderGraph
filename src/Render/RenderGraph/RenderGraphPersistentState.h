@@ -444,6 +444,9 @@ struct RenderGraph::PersistentInstanceState {
 	std::vector<std::pair<uint32_t, uint32_t>> aliasEdges;          // Installed placement orderings (logical pass slots).
 	uint64_t aliasPlans = 0, aliasRematerializations = 0;
 	bool forceNewAliasHeaps = false; // Diagnostic (ORG_PERSISTENT_FORCE_REALIAS): next plan re-places every pool.
+	// Built off the owner thread (PrepareFirstPersistentBuild) without its alias placement: the first preparation places.
+	bool deferAliasPlacement = false;
+	bool aliasPlacementDeferred = false;
 	AutoAliasPackingStrategy aliasPackingStrategy = AutoAliasPackingStrategy::GreedySweepLine; // The latest plan's.
 	// Diagnostic: per-pass preparation cost (logged periodically).
 	std::unordered_map<std::string, std::pair<uint64_t, uint64_t>> prepareCostByPass; // lowering: name -> (ns, calls)

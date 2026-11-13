@@ -684,8 +684,11 @@ private:
 	}
 	void FinishSharedSetup();
 	// The work the first preparation would otherwise do inline: lower every pass, request its pipelines and wait for them, and
-	// build and install the first publication (schedule and alias placement). After Setup, before the first preparation. Any
-	// thread that owns the graph alone. A graph already prepared is left as it is.
+	// build and install the first publication (its schedule). After Setup, before the first preparation. Any thread that owns the
+	// graph alone. A graph already prepared is left as it is.
+	// The alias placement is left to the first preparation (PlaceDeferredPersistentAliases): placing re-materializes the transients,
+	// and those resource objects are shared with the graph the epoch still runs (and with any other build of it in flight), whose
+	// next preparation would then find its bindings moved under it.
 	void PrepareFirstPersistentBuild();
 	// How the next execution runs (RenderGraphPersistentState.h, PersistentExecution::Options). Plain executions use the
 	// defaults; a ticket's set its ticket.
@@ -785,6 +788,9 @@ private:
 	// Frees the alias pools no structural plan has placed into for autoAliasPoolRetireIdleFrames frames.
 	void RetireIdlePersistentAliasPools(PersistentExecutionState& state);
 	bool PlanPersistentAliasPlacement(persistent::GraphEditTransaction& edit, const persistent::SelectedPublication& scheduled);
+	// The first preparation of a graph PrepareFirstPersistentBuild built: its alias placement, planned against the installed
+	// schedule, built and installed (a structural edit). Nothing otherwise.
+	void PlaceDeferredPersistentAliases();
 	void BindUnboundPersistentEntries(persistent::GraphEditTransaction& edit);
 	// Structural build: bind, schedule, plan alias placement, rebuild if needed.
 	std::shared_ptr<const persistent::SelectedPublication> BuildPersistentStructural(persistent::GraphEditTransaction& edit);
@@ -861,6 +867,7 @@ private:
 	std::shared_ptr<Runtime> m_runtime;
 	bool m_drivesFrameServices = true;  // SetDrivesFrameServices
 	bool m_sharedSetupDeferred = false;  // DeferSharedSetup, until FinishSharedSetup
+	bool m_deferFirstAliasPlacement = false;  // PrepareFirstPersistentBuild: its bootstrap leaves the alias placement to the first preparation
 	std::vector<std::string> m_sharedSetupPasses;
 	DeviceRegistry m_backendDevices;
 	std::array<uint8_t, static_cast<size_t>(QueueKind::Count)> m_minAutomaticSchedulingQueuesByKind = { 1, 1, 1 };
