@@ -724,6 +724,17 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint32_t frameIndex
 	state.prepared = PreparePersistentExecution(device, frameIndex, hostData, deltaTime, options);
 }
 
+void RenderGraph::PrepareFirstPersistentBuild() {
+	BT_ZONE_SCOPE("ORG.Persistent.PrepareFirstBuild");
+	if (m_compilerState->frameProductionStopped) throw std::logic_error("Frame production has stopped");
+	if (!m_taskService) throw std::logic_error("Persistent execution requires a task service");
+	if (m_compilerState->persistent) return;
+	// The same bootstrap the first preparation runs. The first preparation then finds the graph built, and only polls the
+	// passes' declarations: a pass whose declaration its first Update changes is lowered again then, like any later change.
+	org::runtime::ScopedActiveGraphServices activeServices(m_uploadService.get(), m_descriptorService.get());
+	BootstrapPersistentGraph();
+}
+
 bool RenderGraph::RequestPassPipelines(const PassParameters& resources, DeviceInstanceId device, const std::string& passName, std::string* failure) {
 	auto& pipelines = *m_runtime->Pipelines();
 	bool ready = true;

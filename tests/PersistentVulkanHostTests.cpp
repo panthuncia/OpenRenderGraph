@@ -547,6 +547,10 @@ static int Run(int argc, char** argv) {
 	// "split": a host of two epochs, each its own graph: the write pass in the first and the copy to the host buffer in the
 	// second (SplitEpochsScenario).
 	const bool split = argc > 1 && std::strcmp(argv[1], "split") == 0;
+	// "built": application-driven builds (GraphHost::BuildEpochGraph, AttachEpochGraph): a build on a worker thread while both
+	// epochs submit, attached between frames; a failed build; stale builds rejected; and stale alias placements reported
+	// (Desc::reportStaleAliasPlacements) instead of rebuilt.
+	const bool built = argc > 1 && std::strcmp(argv[1], "built") == 0;
 	// "stream": an external epoch with its write on the compute queue (the family's second queue): batches off the host's stream,
 	// and the stream's segments.
 	const bool stream = argc > 1 && std::strcmp(argv[1], "stream") == 0;
@@ -667,6 +671,219 @@ static int Run(int argc, char** argv) {
 					static_cast<unsigned long long>(stats.submitted), static_cast<unsigned long long>(stats.waited),
 					static_cast<unsigned long long>(stats.stale), static_cast<unsigned long long>(stats.rebuilds));
 				REQUIRE(stats.rebuilds == 1, "one epoch rebuild");
+				REQUIRE(!counters.unbalanced && counters.locks.load() == counters.unlocks.load(), "balanced host queue locks");
+				host.SetAsyncEpochs({});
+				host.DestroyGraph();
+			}
+			runtime.reset();
+		} else if (built) {
+			// "built": application-driven builds (GraphHost::BuildEpochGraph, AttachEpochGraph) on a host of two async epochs.
+			auto runtime = org::Runtime::Create({.device = device.Get(), .backend = rhi::Backend::Vulkan, .slots = 4,
+				.tasks = std::make_shared<org::runtime::ThreadPoolTaskService>(2)});
+			{
+				org::GraphHost host({.runtime = runtime, .queueBoundary = {.entry = true, .exit = true}, .framesInFlight = 2, .epochOrder = {0, 1},
+					.closedExecutions = !open, .reportStaleAliasPlacements = true});
+				// Only the test's attaches change graphs: a request alone builds nothing.
+				host.SetExplicitBuilds(true);
+				auto program = CreateProgram(device.Get());
+				REQUIRE(program, "compute program");
+				auto scratch = org::Buffer::CreateSharedUnmaterialized(rhi::HeapType::DeviceLocal, kBytes, true);
+				org::BufferBase::DescriptorRequirements requirements{};
+				requirements.createUAV = true;
+				requirements.uavDesc = {.dimension = rhi::UavDim::Buffer, .formatOverride = rhi::Format::R32_Typeless,
+					.buffer = {.kind = rhi::BufferViewKind::Raw, .firstElement = 0, .numElements = kCount}};
+				scratch->SetDescriptorRequirements(requirements);
+				scratch->SetName("test.scratch");
+				auto output = ImportHostBuffer(device.Get(), first, "test.host-output.first");
+				REQUIRE(output, "import host buffer");
+				auto input = org::Buffer::CreateSharedUnmaterialized(rhi::HeapType::DeviceLocal, 16, false);
+				org::BufferBase::DescriptorRequirements inputViews{};
+				inputViews.createSRV = true;
+				inputViews.srvDesc = {.dimension = rhi::SrvDim::Buffer, .formatOverride = rhi::Format::R32_Typeless,
+					.buffer = {.kind = rhi::BufferViewKind::Raw, .firstElement = 0, .numElements = 4}};
+				input->SetDescriptorRequirements(inputViews);
+				input->SetName("test.input");
+				uint32_t value = 0;
+				const auto upload = [&](org::RenderGraph&) {
+					BUFFER_UPLOAD(&value, sizeof(value), org::runtime::UploadTarget::FromShared(input), 0);
+				};
+				auto outputRevision = std::make_shared<std::atomic<uint64_t>>(1);
+				// The factory runs on whichever thread builds. What it reads is set up before and never changes.
+				host.AddExtension("test.host", [=] {
+					return std::make_unique<HostExtension>(input, scratch, output, program, outputRevision, nullptr, false, true);
+				});
+				REQUIRE(host.BuildIfRequested(), "the first builds, synchronous");
+				host.SetAsyncEpochs({0, 1});
+				uint32_t frame = 0;
+				const auto run = [&]() -> int {
+					value = 43000u + 10u * frame++;
+					host.SubmitEpoch(0, upload);
+					host.SubmitEpoch(1);
+					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "built: the second epoch copies what the first wrote");
+					return 0;
+				};
+				for (int i = 0; i < 3; ++i)
+					if (const int failed = run()) return failed;
+
+				// 1. A build on a worker thread while both epochs keep submitting, attached at a build point between frames.
+				{
+					auto* graph0 = host.Graph(0);
+					auto* graph1 = host.Graph(1);
+					const auto builds0 = host.BuildGeneration(0), builds1 = host.BuildGeneration(1);
+					host.RequestRebuild(1, "test: built on a worker");
+					std::atomic<bool> done{false};
+					std::unique_ptr<org::GraphHost::EpochGraph> next;
+					std::thread worker([&] {
+						next = host.BuildEpochGraph(1, "test: built on a worker");
+						done.store(true, std::memory_order_release);
+					});
+					uint32_t framesDuring = 0;
+					while (!done.load(std::memory_order_acquire)) {
+						if (const int failed = run()) {
+							worker.join();
+							return failed;
+						}
+						++framesDuring;
+					}
+					worker.join();
+					REQUIRE(next && next->Built(), "the worker's build succeeded");
+					REQUIRE(host.Graph(1) == graph1 && host.BuildGeneration(1) == builds1, "the epoch runs its old graph until the attach");
+					const auto attached = host.AttachEpochGraph(next);
+					REQUIRE(attached.attached && !next, "the built graph is attached");
+					REQUIRE(host.Graph(1) != graph1 && host.BuildGeneration(1) == builds1 + 1, "the epoch runs the new graph");
+					REQUIRE(host.Graph(0) == graph0 && host.BuildGeneration(0) == builds0, "the other epoch keeps its graph");
+					REQUIRE(!host.RebuildRequested(1), "the attach answers the request made before its build");
+					std::printf("built: %u frames submitted during the worker's build\n", framesDuring);
+					for (int i = 0; i < 3; ++i)
+						if (const int failed = run()) return failed;
+				}
+
+				// 2. A failed build: nothing to attach, and the epoch keeps its graph.
+				{
+					auto* graph1 = host.Graph(1);
+					host.AddExtension("test.fails", []() -> std::unique_ptr<org::RenderGraph::IRenderGraphExtension> {
+						throw std::runtime_error("test: this extension cannot be made");
+					}, {1});
+					std::unique_ptr<org::GraphHost::EpochGraph> failed;
+					std::thread worker([&] { failed = host.BuildEpochGraph(1, "test: a failing build"); });
+					for (int i = 0; i < 2; ++i)
+						if (const int error = run()) {
+							worker.join();
+							return error;
+						}
+					worker.join();
+					REQUIRE(failed && !failed->Built() && !failed->Error().empty(), "the build reports its failure");
+					const auto attached = host.AttachEpochGraph(failed);
+					REQUIRE(!attached.attached && !attached.reason.empty() && failed, "a failed build is not attached");
+					failed.reset();
+					REQUIRE(host.Graph(1) == graph1 && !host.EpochFailed(1), "the epoch keeps its old graph");
+					host.RemoveExtension("test.fails");
+					for (int i = 0; i < 2; ++i)
+						if (const int error = run()) return error;
+				}
+
+				// 3. Stale builds are rejected: one whose epoch's extensions changed since it started, and one older than the graph attached.
+				{
+					auto stale = host.BuildEpochGraph(1, "test: built before a change");
+					host.AddExtension("test.nothing", [] { return std::unique_ptr<org::RenderGraph::IRenderGraphExtension>{}; }, {1});
+					auto rejected = host.AttachEpochGraph(stale);
+					REQUIRE(!rejected.attached && stale, "a graph built before its epoch's extensions changed is rejected");
+					std::printf("built: rejected: %s\n", rejected.reason.c_str());
+					stale.reset();
+					auto older = host.BuildEpochGraph(1, "test: the older build");
+					auto newer = host.BuildEpochGraph(1, "test: the newer build");
+					REQUIRE(older->Built() && newer->Built(), "two builds of one epoch");
+					REQUIRE(host.AttachEpochGraph(newer).attached, "the newer build is attached");
+					rejected = host.AttachEpochGraph(older);
+					REQUIRE(!rejected.attached && older, "the older build is rejected after the newer one");
+					std::printf("built: rejected: %s\n", rejected.reason.c_str());
+					older.reset();
+					for (int i = 0; i < 2; ++i)
+						if (const int error = run()) return error;
+				}
+				const auto stats = host.TakeAsyncStats();
+				std::printf("built (%s): %llu submissions, %llu waited, %llu prepared again, %llu replaced graphs\n", open ? "open" : "closed",
+					static_cast<unsigned long long>(stats.submitted), static_cast<unsigned long long>(stats.waited),
+					static_cast<unsigned long long>(stats.stale), static_cast<unsigned long long>(stats.rebuilds));
+				REQUIRE(stats.rebuilds == 2, "two graphs replaced by attaches");
+				REQUIRE(!counters.unbalanced && counters.locks.load() == counters.unlocks.load(), "balanced host queue locks");
+				host.SetAsyncEpochs({});
+				host.DestroyGraph();
+			}
+
+			// 4. Desc::reportStaleAliasPlacements: a pool another epoch's build grew is reported, not rebuilt at the build point.
+			{
+				org::GraphHost host({.runtime = runtime, .queueBoundary = {.entry = true, .exit = true}, .framesInFlight = 2, .epochOrder = {0, 1},
+					.reportStaleAliasPlacements = true});
+				auto program = CreateProgram(device.Get());
+				REQUIRE(program, "compute program");
+				const auto makeScratch = [&](uint32_t epoch, uint64_t bytes) {
+					auto scratch = org::Buffer::CreateSharedUnmaterialized(rhi::HeapType::DeviceLocal, bytes, true);
+					org::BufferBase::DescriptorRequirements requirements{};
+					requirements.createUAV = true;
+					requirements.uavDesc = {.dimension = rhi::UavDim::Buffer, .formatOverride = rhi::Format::R32_Typeless,
+						.buffer = {.kind = rhi::BufferViewKind::Raw, .firstElement = 0, .numElements = kCount}};
+					scratch->SetDescriptorRequirements(requirements);
+					scratch->SetName("test.arena.scratch." + std::to_string(epoch));
+					scratch->SetAllowAlias(true);
+					scratch->SetAliasingPool(0xA5);
+					return scratch;
+				};
+				std::vector<ArenaExtension::Epoch> epochs;
+				std::array<uint32_t, 2> values{};
+				for (uint32_t epoch = 0; epoch < 2; ++epoch) {
+					auto& entry = epochs.emplace_back();
+					entry.epoch = epoch;
+					entry.scratch = makeScratch(epoch, kBytes);
+					entry.input = org::Buffer::CreateSharedUnmaterialized(rhi::HeapType::DeviceLocal, 16, false);
+					org::BufferBase::DescriptorRequirements inputViews{};
+					inputViews.createSRV = true;
+					inputViews.srvDesc = {.dimension = rhi::SrvDim::Buffer, .formatOverride = rhi::Format::R32_Typeless,
+						.buffer = {.kind = rhi::BufferViewKind::Raw, .firstElement = 0, .numElements = 4}};
+					entry.input->SetDescriptorRequirements(inputViews);
+					entry.input->SetName("test.arena.input." + std::to_string(epoch));
+					entry.output = ImportHostBuffer(device.Get(), epoch == 0 ? first : second, epoch == 0 ? "test.arena.output.0" : "test.arena.output.1");
+					REQUIRE(entry.output, "import host buffer");
+				}
+				const auto upload = [&](uint32_t epoch) {
+					return [&, epoch](org::RenderGraph&) {
+						BUFFER_UPLOAD(&values[epoch], sizeof(uint32_t), org::runtime::UploadTarget::FromShared(epochs[epoch].input), 0);
+					};
+				};
+				auto outputRevision = std::make_shared<std::atomic<uint64_t>>(1);
+				// The factory copies the epochs as they are when a build starts.
+				host.AddExtension("test.arena", [&] { return std::make_unique<ArenaExtension>(epochs, program, outputRevision); });
+				uint32_t frame = 0;
+				const auto run = [&]() -> int {
+					values = {90000u + 10u * frame, 95000u + 10u * frame};
+					++frame;
+					host.SubmitEpoch(0, upload(0));
+					host.SubmitEpoch(1, upload(1));
+					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, values[0]) && Matches(second, values[1]),
+						"each epoch copies what it wrote into its scratch buffer");
+					return 0;
+				};
+				host.SetAsyncEpochs({0, 1});
+				for (int i = 0; i < 3; ++i)
+					if (const int failed = run()) return failed;
+				REQUIRE(host.StaleAliasPlacementEpochs().empty(), "every placement current");
+				// Epoch 1's scratch buffer grows: its new graph grows the shared pool, and epoch 0's placement is in the old generation.
+				epochs[1].scratch = makeScratch(1, 4 * kBytes);
+				auto grown = host.BuildEpochGraph(1, "test: a larger scratch buffer");
+				REQUIRE(grown->Built() && host.AttachEpochGraph(grown).attached, "the larger graph is attached");
+				const auto stale = host.StaleAliasPlacementEpochs();
+				REQUIRE(stale.size() == 1 && stale.front() == 0, "the other epoch's placements are reported");
+				const auto builds0 = host.BuildGeneration(0);
+				(void)host.BuildIfRequested();
+				REQUIRE(host.BuildGeneration(0) == builds0 && !host.RebuildRequested(0), "the build point does not rebuild the reported epoch");
+				for (int i = 0; i < 2; ++i)
+					if (const int failed = run()) return failed;
+				auto placed = host.BuildEpochGraph(0, "test: placed again in the grown pool");
+				REQUIRE(placed->Built() && host.AttachEpochGraph(placed).attached, "the reported epoch is built again by the application");
+				REQUIRE(host.StaleAliasPlacementEpochs().empty(), "every placement current again");
+				for (int i = 0; i < 2; ++i)
+					if (const int failed = run()) return failed;
+				std::puts("built: stale alias placements reported and placed again");
 				REQUIRE(!counters.unbalanced && counters.locks.load() == counters.unlocks.load(), "balanced host queue locks");
 				host.SetAsyncEpochs({});
 				host.DestroyGraph();

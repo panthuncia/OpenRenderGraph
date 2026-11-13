@@ -28,6 +28,10 @@ class IUploadService;
 class ResourceCleanupQueue;
 }
 
+namespace org::detail {
+class HostUploadExtension;
+}
+
 namespace org {
 
 struct IHostExecutionData;
@@ -94,6 +98,10 @@ public:
 		// A batch waits for the frame wait (SetFrameWaitValue) only when one of its passes declares a late-bound buffer whose
 		// versions are ready at the frame wait (VersionedBuffer::LateReady::FrameWait). Off: every batch waits for it.
 		bool scopedFrameWait = false;
+		// Alias placements that are no longer current (another graph's build grew a pool they are in) are reported by
+		// StaleAliasPlacementEpochs instead of being rebuilt at the next build point. For an application that builds its epochs'
+		// graphs itself (BuildEpochGraph, AttachEpochGraph). Off: the build point rebuilds those graphs.
+		bool reportStaleAliasPlacements = false;
 	};
 
 	using ExtensionFactory = std::function<std::unique_ptr<RenderGraph::IRenderGraphExtension>()>;
@@ -136,7 +144,9 @@ public:
 	// frame callback). A change requests a rebuild, so every kept recording (a revision's epochs) is recorded again with them,
 	// or without; until that build, kept recordings stay as they were recorded.
 	void SetRecordingTimestamps(bool enabled) noexcept {
-		if (m_recordingTimestamps.exchange(enabled, std::memory_order_acq_rel) != enabled) RequestRebuild("recording timestamps switched");
+		if (m_recordingTimestamps.exchange(enabled, std::memory_order_acq_rel) == enabled) return;
+		m_hostConfiguration.fetch_add(1, std::memory_order_acq_rel);
+		RequestRebuild("recording timestamps switched");
 	}
 	bool RecordingTimestamps() const noexcept { return m_recordingTimestamps.load(std::memory_order_acquire); }
 	// Diagnostics: the external queue boundary's entry and exit barriers in place of Desc::queueBoundary's, from the next build
@@ -145,6 +155,7 @@ public:
 		m_boundaryEntry.store(boundary.entry, std::memory_order_release);
 		m_boundaryExit.store(boundary.exit, std::memory_order_release);
 		m_boundaryOverridden.store(true, std::memory_order_release);
+		m_hostConfiguration.fetch_add(1, std::memory_order_acq_rel);
 		RequestRebuild("queue boundary overridden");
 	}
 	// Schedule introspection (RenderGraph::SetScheduleTraceEnabled) on every graph and on every graph built after, so it
@@ -167,6 +178,86 @@ public:
 	bool BuildIfRequested();
 	// A rebuild was requested and has not been built (with explicit builds, until BuildIfRequested).
 	bool RebuildRequested() const noexcept;
+	/** @brief Owner thread: a rebuild of the epoch's graph was requested, and no build or attach has answered it yet. */
+	bool RebuildRequested(uint32_t epoch) const noexcept;
+
+	// Application-driven builds. The two primitives below let an application build an epoch's graph wherever it likes (a worker
+	// thread of its own) while the host keeps running the old one, and attach it at a point it chooses. The policy is the
+	// application's: which thread builds, when, what supersedes what, and what a failure does. RequestRebuild and
+	// BuildIfRequested stay the synchronous path.
+	/**
+	 * @brief A graph built for one epoch and not attached yet (BuildEpochGraph). Dropping it destroys the graph on the dropping
+	 * thread. It never ran, so that touches nothing the running graphs use. Drop or attach it before the host is destroyed.
+	 */
+	class EpochGraph {
+	public:
+		~EpochGraph();
+		EpochGraph(const EpochGraph&) = delete;
+		EpochGraph& operator=(const EpochGraph&) = delete;
+		uint32_t Epoch() const noexcept { return m_epoch; }
+		/** @brief False when the build failed. Error says why, and there is nothing to attach. */
+		bool Built() const noexcept { return static_cast<bool>(m_graph); }
+		const std::string& Error() const noexcept { return m_error; }
+		/** @brief The build's CPU time, on the thread that built it. */
+		double BuildMilliseconds() const noexcept { return m_buildMs; }
+		/** @brief The graph, for diagnostics before it is attached (its schedule trace, say). Null when the build failed. */
+		RenderGraph* Graph() noexcept { return m_graph.get(); }
+	private:
+		friend class GraphHost;
+		EpochGraph() = default;
+		uint32_t m_epoch = UINT32_MAX;
+		size_t m_index = 0;
+		std::unique_ptr<RenderGraph> m_graph;
+		detail::HostUploadExtension* m_uploads = nullptr;  // owned by m_graph
+		// The host's state the build saw. AttachEpochGraph compares it with the state at the attach.
+		uint64_t m_hostConfiguration = 0, m_epochConfiguration = 0, m_requests = 0, m_serial = 0;
+		std::string m_reason, m_error;
+		double m_buildMs = 0.0;
+	};
+	/**
+	 * @brief Any thread: builds a new graph for the epoch and returns it detached. The host and its graphs are not touched: the old
+	 * graph keeps running, preparing and submitting meanwhile.
+	 *
+	 * It does everything the host's own build does: the extensions made for the epoch, the shared queue timelines, the epoch
+	 * filter, external epochs, the alias arena, the settings, CompileStructural and Setup. It also does the work the first
+	 * preparation would do inline. It lowers every pass, waits for the passes' pipelines, and builds and installs the first schedule
+	 * with its alias placements. So AttachEpochGraph only swaps. The steps that touch objects every graph shares (the statistics
+	 * query heap, the host's upload pass, the upload service's registry) wait for the attach.
+	 *
+	 * The extension factories run on the calling thread (see "Extension factories" in persistent-epochs.md). Builds of different
+	 * epochs may run in parallel. Two builds of one epoch may run in parallel too, each making a graph of its own. A graph can be
+	 * attached only if its build started after the build of the graph the epoch runs. A build that throws returns a graph that
+	 * is not Built(), with the error. Throws std::invalid_argument for an epoch the host does not have. The host must outlive
+	 * the call. The build blocks while its pipelines compile on the runtime's task service, so call it from a thread of your own
+	 * (or a pool with workers to spare), never from the last free worker of a small pool.
+	 */
+	std::unique_ptr<EpochGraph> BuildEpochGraph(uint32_t epoch, std::string_view reason = {});
+	struct AttachResult {
+		bool attached = false;
+		std::string reason;  // why it was rejected
+	};
+	/**
+	 * @brief Owner thread, where the epoch is not being submitted: attaches a graph BuildEpochGraph made. On success `graph` is
+	 * taken. Otherwise it stays with the caller, who drops it or builds again.
+	 *
+	 * The swap is small. The old graph stops and is released once the work it submitted completes (no device wait). The epoch's
+	 * failure is cleared and its build generation moves (BuildGeneration). With async epochs the host's thread drops its
+	 * unsubmitted tickets of the old graph. The host's thread is held only for the swap and the shared setup steps, never for a
+	 * build. A rebuild requested before the build started is answered. One requested since stays requested.
+	 *
+	 * Rejected, with a reason, when:
+	 * - the build failed,
+	 * - the host's configuration changed since the build started: an extension of the epoch added or removed, its epoch made
+	 *   external or not, the frame-wait timeline, the queue boundary, recording timestamps, DestroyGraph,
+	 * - the epoch runs a graph whose build started after this one's.
+	 */
+	AttachResult AttachEpochGraph(std::unique_ptr<EpochGraph>& graph);
+	/**
+	 * @brief Owner thread: the epochs whose graph has alias placements in a pool generation another graph replaced (the pool
+	 * grew). With Desc::reportStaleAliasPlacements the application rebuilds them (BuildEpochGraph). Otherwise the next build point
+	 * does.
+	 */
+	std::vector<uint32_t> StaleAliasPlacementEpochs() const;
 
 	// Failure isolation. A failure while one epoch's graph is built or prepared stays with that epoch: the host's thread keeps
 	// running, and every other epoch keeps its graph and its tickets. Only host-wide errors (a failed GPU completion wait, a lost
@@ -547,6 +638,11 @@ private:
 		// Its graph failed to build (with none to keep) or to prepare: it runs nothing until a build of it succeeds (EpochFailed).
 		bool failed = false;
 		std::string failure;
+		// Read by BuildEpochGraph on any thread. requests counts rebuild requests (MarkRebuild). configuration counts changes to
+		// what the epoch's graph is built from (its extensions, whether its epoch is external), moved under m_configMutex.
+		std::shared_ptr<std::atomic<uint64_t>> requests = std::make_shared<std::atomic<uint64_t>>(0);
+		std::shared_ptr<std::atomic<uint64_t>> configuration = std::make_shared<std::atomic<uint64_t>>(0);
+		uint64_t attachedSerial = 0;  // the build serial of the graph it runs (AttachEpochGraph refuses older ones)
 	};
 	// A graph an epoch's rebuild replaced, released once the work it submitted is done.
 	struct RetiredGraph {
@@ -569,6 +665,15 @@ private:
 	// anew. The one it replaces goes to the retired graphs once the new one is built. False when the build failed: the old graph is
 	// kept (or there is none), the failure is reported (PollEpochFailures), and nothing is thrown. Host-wide errors still throw.
 	bool BuildInstance(size_t index);
+	// What a build of one instance is made from, taken under m_configMutex (any thread).
+	struct BuildInputs;
+	BuildInputs SnapshotBuildInputs(size_t index);
+	// Any thread: makes the instance's graph from a snapshot, through Setup. With detached it also runs the first build
+	// (RenderGraph::PrepareFirstPersistentBuild) and defers the shared setup steps. Throws on failure.
+	std::unique_ptr<RenderGraph> MakeGraph(const BuildInputs& inputs, bool detached, detail::HostUploadExtension** uploads);
+	// Owner thread, the instance not in the host's thread's hands: the graph replaces the instance's. The old one is retired by
+	// the work submitted so far.
+	void InstallGraph(size_t index, std::unique_ptr<RenderGraph> graph, uint64_t serial);
 	// Owner thread: whether the instance runs nothing (its own failure, or its async epoch's).
 	bool InstanceFailed(size_t index) const noexcept;
 	// Any thread: queues a failure for PollEpochFailures.
@@ -596,6 +701,13 @@ private:
 	static void MarkRebuild(Instance& instance, std::string_view reason) noexcept;
 	// Marks the graphs the extension is made into.
 	void RequestRebuildOf(const Registered& extension, std::string_view reason) noexcept;
+	// Moves the configuration of the instances the extension is made into. With m_configMutex held.
+	void NoteConfigurationOf(const Registered& extension) noexcept;
+	// Guards what a build on another thread reads: m_extensions, m_externalEpochs, m_frameWaitTimeline, the GPU pass range
+	// callbacks, m_timelines and m_aliasArena. The owner thread writes them under it, and reads them without it.
+	mutable std::mutex m_configMutex;
+	std::atomic<uint64_t> m_hostConfiguration{0};  // host-wide changes that a graph is built with (EpochGraph)
+	std::atomic<uint64_t> m_buildSerial{0};        // every build of any instance takes the next
 	std::vector<Registered> m_extensions;
 	std::vector<Instance> m_instances;  // by Desc::epochOrder (one without epochs)
 	std::vector<RetiredGraph> m_retiredGraphs;
@@ -691,6 +803,8 @@ private:
 	// Owner thread, async epochs running: the instances are given back by the host's thread (their tickets abandoned, their recording
 	// requests dropped), which holds still while they are built again, and handed back. The other epochs keep their tickets.
 	void RebuildAsyncInstances(std::span<const size_t> indices);
+	// The same, with replace(index) in place of BuildInstance. replace returns true when the instance's graph was replaced.
+	void ReplaceAsyncInstances(std::span<const size_t> indices, const std::function<bool(size_t)>& replace);
 	// Owner thread, async epochs running: the host's thread lets go of the instances to detach and holds still while work runs on
 	// this thread (a build, a retired graph's release: both change services every graph shares).
 	void HoldAsync(std::span<const size_t> detach, const std::function<void()>& work);

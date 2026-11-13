@@ -1,3 +1,5 @@
+#include <algorithm>
+
 #include "Render/PipelineLibrary.h"
 #include "RenderGraphInternal.h"
 #include "Render/Runtime/RuntimeDevice.h"
@@ -698,7 +700,8 @@ void RenderGraph::Setup() {
 	if (m_statisticsService) {
 		for (auto& any : m_masterPassList)
 			std::visit([](auto& pass) { if constexpr (!std::is_same_v<std::decay_t<decltype(pass)>, std::monostate>) pass.statisticsIndex = -1; }, any.pass);
-		m_statisticsService->SetupQueryHeap();
+		// Another graph may be recording with the shared query heap now: FinishSharedSetup sizes it.
+		if (!m_sharedSetupDeferred) m_statisticsService->SetupQueryHeap();
 	}
 
 	auto device = m_runtime->Device();
@@ -776,25 +779,32 @@ void RenderGraph::Setup() {
 	// and singleton managers during Setup(), and iterating flecs queries from our task
 	// worker threads can corrupt flecs iterator stack state.
 	ParallelForOptional("PassSetup", m_masterPassList.size(), [this](size_t i) {
-		const bool traceLifecycle = m_getRenderGraphBatchTraceEnabled && m_getRenderGraphBatchTraceEnabled();
 		auto& pass = m_masterPassList[i];
-		switch (pass.type) {
-		case PassType::Render: {
-			auto& renderPass = std::get<RenderPassAndResources>(pass.pass);
-			renderPass.pass->ConfigureRuntimeServices(m_uploadService, m_descriptorService);
-			if (traceLifecycle) {
-				spdlog::info("RG setup render pass '{}' begin", renderPass.name);
-			}
-			renderPass.pass->ConfigureResourceRegistryView(
-				MakePassResourceRegistryView(_registry, renderPass.resources), renderPass.resources);
-			renderPass.pass->Setup();
-			if (traceLifecycle) {
-				spdlog::info("RG setup render pass '{}' complete", renderPass.name);
-			}
-			break;
-		}
-		}
+		// A pass object other graphs share is set up by FinishSharedSetup.
+		if (m_sharedSetupDeferred && std::ranges::find(m_sharedSetupPasses, pass.name) != m_sharedSetupPasses.end()) return;
+		SetupRenderPass(pass);
 	}, true);
+}
+
+void RenderGraph::SetupRenderPass(AnyPassAndResources& pass) {
+	if (pass.type != PassType::Render) return;
+	const bool traceLifecycle = m_getRenderGraphBatchTraceEnabled && m_getRenderGraphBatchTraceEnabled();
+	auto& renderPass = std::get<RenderPassAndResources>(pass.pass);
+	renderPass.pass->ConfigureRuntimeServices(m_uploadService, m_descriptorService);
+	if (traceLifecycle) spdlog::info("RG setup render pass '{}' begin", renderPass.name);
+	renderPass.pass->ConfigureResourceRegistryView(MakePassResourceRegistryView(_registry, renderPass.resources), renderPass.resources);
+	renderPass.pass->Setup();
+	if (traceLifecycle) spdlog::info("RG setup render pass '{}' complete", renderPass.name);
+}
+
+void RenderGraph::FinishSharedSetup() {
+	if (!m_sharedSetupDeferred) return;
+	m_sharedSetupDeferred = false;
+	org::runtime::ScopedActiveGraphServices activeServices(m_uploadService.get(), m_descriptorService.get());
+	if (m_statisticsService) m_statisticsService->SetupQueryHeap();
+	for (auto& pass : m_masterPassList)
+		if (std::ranges::find(m_sharedSetupPasses, pass.name) != m_sharedSetupPasses.end()) SetupRenderPass(pass);
+	m_sharedSetupPasses.clear();
 }
 
 void RenderGraph::AddRenderPass(std::shared_ptr<RenderPass> pass, RenderPassParameters& resources, std::string name, std::vector<ResolverSnapshot> resolverSnapshots) {

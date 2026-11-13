@@ -27,6 +27,38 @@ submission point is an **epoch**.
     device wait, and the other epochs keep their graphs and builds (`BuildGeneration(epoch)`). `RequestRebuild()`
     rebuilds all of them. Every request takes a reason; the build's log line names the reasons it answers, with counts
     (`GraphHost: epoch N's graph built again ... why: ...`), and a build point that builds several graphs logs a total.
+    This path is synchronous: the build runs on the owner thread at the build point, and with async epochs the host's thread
+    holds still while it runs.
+-   **Building off the owner thread.** Two primitives let an application build an epoch's graph where it likes and attach
+    it when it likes. The policy is the application's: which thread builds, when, what supersedes what, and what a failure
+    does.
+    -   `BuildEpochGraph(epoch, reason)`, any thread, returns a detached `EpochGraph`. It does what the host's own build
+        does (the extensions made for the epoch, the shared timelines, the epoch filter, external epochs, the alias arena,
+        the settings, `CompileStructural`, `Setup`). It also does what the first preparation would do inline
+        (`RenderGraph::PrepareFirstPersistentBuild`): it lowers every pass, waits for their pipelines, and builds and
+        installs the first schedule with its alias placements. It touches no instance, ticket or host-thread state, so the
+        old graph keeps preparing and submitting meanwhile. A failure is returned in the handle (`Built()`, `Error()`).
+    -   The build blocks while its pipelines compile, and they compile on the runtime's task service. So build on a thread
+        of the application's own, or on a pool with workers to spare: a build on the last free worker of a small pool waits
+        for pipeline jobs that have nowhere to run.
+    -   Three steps touch objects every graph shares, so the build leaves them for the attach (`RenderGraph::
+        DeferSharedSetup`, `FinishSharedSetup`): sizing the statistics query heap, setting up the host's upload pass, and
+        pointing the upload service at the new graph's registry.
+    -   `AttachEpochGraph(graph)`, owner thread, swaps it in. It runs the deferred steps, retires the old graph by the work
+        submitted so far, clears the epoch's failure, moves `BuildGeneration(epoch)`, and tells the host's thread, which
+        drops its unsubmitted tickets of the old graph. The host's thread holds still only for this swap, never for a build.
+        A rebuild requested before the build started is answered by the attach; one requested since stays requested
+        (`RebuildRequested(epoch)`).
+    -   The attach is rejected, with a reason, when the build failed, when the host's configuration changed since the build
+        started, or when the epoch runs a graph whose build started later. Configuration means: an extension of the epoch
+        added or removed, the epoch made external or not, the frame-wait timeline, the queue boundary, recording timestamps,
+        `DestroyGraph`. The caller drops the graph and builds again.
+    -   Builds of different epochs may run in parallel, and so may two builds of one epoch. Each makes a graph of its own;
+        only one that started after the attached graph's build can be attached.
+    -   A dropped `EpochGraph` is destroyed on the dropping thread. It never ran, so its teardown waits for nothing. Drop or
+        attach every one, and finish every build, before the host is destroyed.
+    -   An application that drives its builds this way calls `SetExplicitBuilds(true)` and does not call `BuildIfRequested`
+        for those epochs, or that build point rebuilds whatever is still requested, synchronously.
 -   **Rebuilding only what changed.** Each graph builds every extension made into it, so a rebuild costs every one of their
     gathers. An extension that only some epochs use names them (`AddExtension(id, factory, epochs)`): the other graphs
     never make it, and adding it again rebuilds only its epochs. An extension made into a graph of one epoch gathers only
@@ -34,6 +66,21 @@ submission point is an **epoch**.
     rebuilds only the graphs that looked it up (`RequestRebuildFor(id)`, `RenderGraph::LookedUp`).
 -   **Graph access.** `Graph(epoch)` gives an epoch's graph, `Graph()` the first one; `GraphCount`, `GraphAt`, `EpochAt`
     enumerate them. The runtime's services (uploads, descriptors, tasks) are shared by all of them.
+
+### Extension factories
+
+A factory (`AddExtension`) runs on the thread that builds: the owner thread for `RequestRebuild` builds, and whatever
+thread calls `BuildEpochGraph` otherwise. The extension it makes is then used on that thread too: `PrepareForBuild`,
+`GatherStructuralPasses`, `Initialize`, and its passes' declarations and `Setup`. With builds off the owner thread they
+run while the owner thread and the host's thread keep running. So a factory and its extension must either:
+
+-   read only inputs snapshotted ahead (an immutable snapshot published atomically, like Community Shaders' frame anchors),
+    or values captured by copy when the factory was added, or
+-   read only state that is safe to read concurrently with its writers.
+
+They must not write state the running graphs or the owner thread read. A resource a build registers that another graph
+uses must already be materialized; a new transient belongs to the graph that registers it. `AddExtension` and
+`RemoveExtension` themselves stay on the owner thread; a build takes a consistent copy of the registered factories.
 
 ### Failure isolation
 
@@ -417,9 +464,13 @@ A host's graphs place their transients into one `PersistentAliasArena` (`RenderG
     graph needs less than half of it.
 -   **Safety.** The runtime's alias ledger, which every graph shares through the sequencer. A placement's first use waits
     for the last use of any overlapping placement by another graph's earlier execution, and enters from Undefined.
--   **Growth.** A graph that needs more grows the pool into a new generation. The other graphs' placements keep the
-    earlier generation alive and share nothing with the new one. `RenderGraph::PersistentAliasPlacementsCurrent` reports
-    that, and `GraphHost` rebuilds those graphs, which places them in the current generation and frees the old one.
+-   **Growth.** A graph that needs more grows the pool into a new generation, with headroom (the settings' pool growth
+    headroom, 1.5 times by default), so growth stays rare. The other graphs' placements keep the earlier generation alive
+    and share nothing with the new one. `RenderGraph::PersistentAliasPlacementsCurrent` reports that, and `GraphHost`
+    rebuilds those graphs at the next build point, which places them in the current generation and frees the old one.
+-   **Reported instead of rebuilt.** With `Desc::reportStaleAliasPlacements`, the build point leaves those graphs alone.
+    `StaleAliasPlacementEpochs()` lists their epochs, and the application rebuilds them through `BuildEpochGraph`. A detached
+    build places its transients when it is built, so it can grow a pool before it is attached.
 -   **Test.** `PersistentVulkanHostTests arena`: two epochs whose scratch buffers share one pool at offset 0 (the second's
     write on the compute queue). Each epoch's copy reads what it wrote, synchronous and async.
 
@@ -487,6 +538,9 @@ keeps a shard of its own, and Begin resets the whole allocator.
 -   `tests/PersistentVulkanHostTests.cpp` modes:
     -   `async`, `reuse`, `revision` and `external`, each also `open`;
     -   `split` (two epochs, two graphs, one rebuilt alone);
+    -   `built` and `built open`: application-driven builds. A build on a worker thread while both epochs submit, attached
+        between frames; a failed build that leaves the old graph; a build rejected after its epoch's extensions changed, and
+        an older build rejected after a newer one; and stale alias placements reported, not rebuilt, then built again;
     -   `stream` and `stream open home`;
     -   `arena`;
     -   `leases` and `leases open` (an epoch that runs many times a frame, each run with a lease of its own, and the frame
