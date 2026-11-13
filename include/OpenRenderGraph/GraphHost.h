@@ -180,6 +180,14 @@ public:
 	bool RebuildRequested() const noexcept;
 	/** @brief Owner thread: a rebuild of the epoch's graph was requested, and no build or attach has answered it yet. */
 	bool RebuildRequested(uint32_t epoch) const noexcept;
+	/**
+	 * @brief Owner thread: how many rebuilds of the epoch's graph were requested so far (0 for an epoch the host does not have). It only
+	 * grows. An application that builds with BuildEpochGraph compares it across a build: a request made after the build started is not
+	 * answered by attaching it.
+	 */
+	uint64_t RebuildRequests(uint32_t epoch) const noexcept;
+	/** @brief Owner thread: the reasons of the epoch's rebuild requests not answered yet, each with its count ("" with none). */
+	std::string RebuildReasons(uint32_t epoch) const;
 
 	// Application-driven builds. The two primitives below let an application build an epoch's graph wherever it likes (a worker
 	// thread of its own) while the host keeps running the old one, and attach it at a point it chooses. The policy is the

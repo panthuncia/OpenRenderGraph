@@ -694,6 +694,20 @@ bool GraphHost::RebuildRequested(uint32_t epoch) const noexcept {
 	return index != kNoInstance && m_instances[index].rebuildRequested;
 }
 
+uint64_t GraphHost::RebuildRequests(uint32_t epoch) const noexcept {
+	const auto index = InstanceOf(epoch);
+	return index == kNoInstance ? 0 : m_instances[index].requests->load(std::memory_order_acquire);
+}
+
+std::string GraphHost::RebuildReasons(uint32_t epoch) const {
+	const auto index = InstanceOf(epoch);
+	std::string why;
+	if (index == kNoInstance) return why;
+	for (const auto& [reason, count] : m_instances[index].rebuildReasons)
+		why += (why.empty() ? "" : "; ") + reason + (count > 1 ? " (x" + std::to_string(count) + ")" : std::string());
+	return why;
+}
+
 bool GraphHost::InstanceFailed(size_t index) const noexcept {
 	if (m_instances[index].failed) return true;
 	if (!m_async) return false;
