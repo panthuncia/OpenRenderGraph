@@ -877,6 +877,8 @@ private:
             else if (specification.access == A::UnorderedAccess) { if (!alreadyDeclared || !detail::SharedPtrToResource<T>) addAccelerationStructureBuildOutput(resource); }
             else throw std::invalid_argument("Acceleration structure build stage uses are shader resources or unordered access");
         }
+        // The build access combines two flags, so it is no enumerator a switch may name (MSVC C4063).
+        else if (specification.access == kAccelerationStructureBuildAccess) { if (!alreadyDeclared || !detail::SharedPtrToResource<T>) addAccelerationStructureBuild(resource); }
         else if (!alreadyDeclared || !detail::SharedPtrToResource<T>) switch (specification.access) {
         case A::ShaderResource: addShaderResource(resource); break;
         case A::UnorderedAccess: addUnorderedAccess(resource); break;
@@ -890,7 +892,6 @@ private:
         case A::DepthStencilClear: addDepthStencilClear(resource); break;
         case A::CopySource: addCopySource(resource); break;
         case A::CopyDest: addCopyDest(resource); break;
-        case kAccelerationStructureBuildAccess: addAccelerationStructureBuild(resource); break;
         case A::RaytracingAccelerationStructureRead: addAccelerationStructureRead(resource); break;
         case A::VertexBuffer: addVertexBuffer(resource); break;
         case A::IndexBuffer: addIndexBuffer(resource); break;
