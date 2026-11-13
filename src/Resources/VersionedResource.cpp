@@ -57,7 +57,7 @@ void VersionedResource::MakeVersion(ResourceVersion& version, std::shared_ptr<Re
     version.number = m_state->published.fetch_add(1, std::memory_order_relaxed) + 1;
     auto declaration = std::make_shared<ResolverDeclarationState>();
     declaration->tracked = true;
-    declaration->dependencyIdentity = m_state;
+    declaration->dependencyIdentity = m_state->identity;
     declaration->resourceSetIdentity = {resource->GetSchedulingResourceID(), version.number};
     declaration->resources = std::make_shared<const ResolverResourceList>(ResolverResourceList{resource});
     version.declaration = std::move(declaration);
@@ -66,7 +66,7 @@ void VersionedResource::MakeVersion(ResourceVersion& version, std::shared_ptr<Re
 }
 
 void VersionedResource::AdoptVersion(const std::shared_ptr<const ResourceVersion>& version) {
-    if (!version || !version->declaration || version->declaration->dependencyIdentity != m_state)
+    if (!version || !version->declaration || version->declaration->dependencyIdentity != m_state->identity)
         throw std::invalid_argument("VersionedResource: adopting another resource's version");
     if (!m_state->shaped && version->resource) {
         m_state->shape = ShapeClassOf(*version->resource);
@@ -79,7 +79,7 @@ void VersionedResource::MakeLateBound(std::shared_ptr<Resource> standIn, bool fr
     if (!standIn) throw std::invalid_argument("VersionedResource: a late-bound resource needs a stand-in");
     auto declaration = std::make_shared<ResolverDeclarationState>();
     declaration->tracked = true;
-    declaration->dependencyIdentity = m_state;
+    declaration->dependencyIdentity = m_state->identity;
     declaration->resourceSetIdentity = {standIn->GetSchedulingResourceID(), 0};
     declaration->resources = std::make_shared<const ResolverResourceList>(ResolverResourceList{standIn});
     m_state->lateDeclaration = std::move(declaration);

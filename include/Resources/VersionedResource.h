@@ -106,6 +106,10 @@ protected:
     struct State {
         std::atomic<std::shared_ptr<const ResourceVersion>> current;
         std::atomic<uint64_t> published{0};  // number of the last version made, on any thread
+        // The dependency identity of every declaration this resource makes. It is a token of its own, not the state.
+        // The state holds the current version, and the version holds its declaration. If the declaration held the state,
+        // the three would keep each other alive, and the last version would never be released.
+        std::shared_ptr<const void> identity = std::make_shared<char>('\0');
         uint64_t slotID = Resource::ReserveGlobalResourceID();
         // The shape class every version must have. The first adopted version sets it, before anything else sees the resource.
         ShapeClass shape;
