@@ -385,6 +385,14 @@ private:
 	// After RecordPendingUploads planned the ticket's uploads by queue: its batches off the graphics queue that will not wait for
 	// the graphics queue's uploads (statistics); 0 when not planned.
 	static uint32_t PersistentTicketSparedUploadWaits(const PersistentTicket& ticket) noexcept;
+	// After RecordPendingUploads planned the ticket's uploads by queue (statistics; zeros when not planned):
+	// - channelRouted, channelWaits: its destinations bound to a publication channel (runtime::PublicationChannels) that went to a
+	//   declaring batch's queue, and those a batch off the graphics queue waits for;
+	// - undeclared: its destinations no batch declares. Each one made every batch off the graphics queue wait.
+	struct TicketUploadStats {
+		uint32_t channelRouted = 0, channelWaits = 0, undeclared = 0;
+	};
+	static TicketUploadStats PersistentTicketUploadStats(const PersistentTicket& ticket) noexcept;
 	// Every pass it prepared would still prepare the same invocation (RenderGraphPass::RevisionHash).
 	static bool PersistentTicketCurrent(const PersistentTicket& ticket);
 	// Submits the packets with values from nextQueueValues (the last value assigned per queue slot, advanced

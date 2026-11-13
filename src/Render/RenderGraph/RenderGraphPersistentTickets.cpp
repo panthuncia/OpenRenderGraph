@@ -1,5 +1,6 @@
 // Persistent execution, tickets (async epochs): preparation, kept recordings, submission and pending uploads.
 #include "RenderGraphPersistentState.h"
+#include "Render/Runtime/PublicationChannels.h"
 
 namespace org {
 
@@ -132,6 +133,11 @@ uint64_t RenderGraph::PersistentTicketHostTag(const PersistentTicket& ticket) no
 void RenderGraph::SetPersistentTicketHostTag(PersistentTicket& ticket, uint64_t tag) noexcept { ticket.hostTag = tag; }
 uint32_t RenderGraph::PersistentTicketSparedUploadWaits(const PersistentTicket& ticket) noexcept {
 	return ticket.queueUploads.planned ? ticket.queueUploads.spared : 0;
+}
+RenderGraph::TicketUploadStats RenderGraph::PersistentTicketUploadStats(const PersistentTicket& ticket) noexcept {
+	const auto& plan = ticket.queueUploads;
+	if (!plan.planned) return {};
+	return {plan.channelRouted, plan.channelWaits, plan.undeclared};
 }
 
 std::shared_ptr<const RenderGraph::PersistentRecording> RenderGraph::PersistentTicketRecording(const PersistentTicket& ticket) noexcept {
@@ -700,6 +706,9 @@ struct TicketUploadRouting {
 	std::vector<uint32_t> firstOnQueue;             // per queue slot: its first batch, UINT32_MAX for none
 	std::vector<size_t> copies;                     // per queue slot: the staged copies routed to it
 	std::vector<std::vector<compiler::ExecutionTimelinePoint>> waits;  // per queue slot: its upload list's waits
+	// Destinations bound to a publication channel (statistics): routed to a declaring batch's queue, or waited for off graphics.
+	uint32_t channelRouted = 0, channelWaits = 0;
+	uint32_t undeclared = 0;  // destinations no batch declares (statistics)
 };
 
 // graphicsBuffers: everything the graphics list and the recorded lists touch (known). staged: the staged copies' destinations, one
@@ -741,16 +750,37 @@ bool PlanTicketUploads(const RenderGraph::PersistentTicket& ticket, uint32_t gra
 	destinations.reserve(graphicsBuffers.size() + staged.size());
 	for (const auto handle : graphicsBuffers) destinations[UploadBufferKey(handle)].graphics = true;
 	for (const auto handle : staged) destinations[UploadBufferKey(handle)].staged = true;
+	// Publication channels (runtime::PublicationChannels): a destination bound to a channel is used by every batch that declares
+	// the channel's resource, as if that batch declared the destination itself. By the channel's backing: its destinations.
+	std::unordered_map<uint64_t, std::vector<uint64_t>> channelDestinations;
+	if (runtime::PublicationChannels::Any()) {
+		auto bindChannel = [&](rhi::ResourceHandle handle) {
+			const auto channel = runtime::PublicationChannels::ChannelOf(handle);
+			if (!channel.valid()) return;
+			auto& members = channelDestinations[UploadBufferKey(channel)];
+			const auto key = UploadBufferKey(handle);
+			if (std::ranges::find(members, key) == members.end()) members.push_back(key);
+		};
+		for (const auto handle : graphicsBuffers) bindChannel(handle);
+		for (const auto handle : staged) bindChannel(handle);
+	}
+	auto addUse = [](Destination& destination, uint32_t batch, uint32_t resource) {
+		auto& uses = destination.uses;
+		if (uses.empty() || uses.back() != std::pair{batch, resource}) uses.push_back({batch, resource});
+	};
 	for (uint32_t batch = 0; batch < batchCount; ++batch)
 		for (const auto& access : graph.boundaryAccessesByBatch[batch]) {
 			if (access.resource >= backings.size()) continue;
 			const auto& backing = backings[access.resource];
 			if (!backing.resource.valid()) continue;
-			const auto found = destinations.find(UploadBufferKey(backing.resource));
-			if (found == destinations.end()) continue;
-			auto& uses = found->second.uses;
-			if (uses.empty() || uses.back() != std::pair{batch, access.resource}) uses.push_back({batch, access.resource});
-			if (backing.aliasSize || backing.aliasHeapIdentity || backing.aliasHeap) found->second.aliased = true;
+			const auto key = UploadBufferKey(backing.resource);
+			if (const auto found = destinations.find(key); found != destinations.end()) {
+				addUse(found->second, batch, access.resource);
+				if (backing.aliasSize || backing.aliasHeapIdentity || backing.aliasHeap) found->second.aliased = true;
+			}
+			// The channel's own aliasing says nothing of its destinations' memory.
+			if (const auto channel = channelDestinations.find(key); channel != channelDestinations.end())
+				for (const auto member : channel->second) addUse(destinations.at(member), batch, access.resource);
 		}
 
 	// Whether each batch is ordered after a queue's first batch: on that queue, or behind a batch that is (its queue's order,
@@ -823,6 +853,23 @@ bool PlanTicketUploads(const RenderGraph::PersistentTicket& ticket, uint32_t gra
 		for (const auto& use : destination.uses)
 			if (graph.batches[use.first].queue != graphicsQueue) out.waitsForUploads[use.first] = 1;
 	}
+	// A destination that no batch declares has no known reader. A shader can still read it through a bindless index, on any
+	// queue. So no batch off the graphics queue may skip the wait.
+	for (const auto& [key, destination] : destinations)
+		if (destination.uses.empty()) ++out.undeclared;
+	if (out.undeclared)
+		for (uint32_t batch = 0; batch < batchCount; ++batch)
+			if (graph.batches[batch].queue != graphicsQueue) out.waitsForUploads[batch] = 1;
+	// Statistics: the destinations bound to a channel that a declaring batch took to its own queue, and those that made a batch off
+	// the graphics queue wait for the graphics list.
+	for (const auto& [channel, members] : channelDestinations)
+		for (const auto member : members) {
+			const auto& destination = destinations.at(member);
+			if (destination.uses.empty()) continue;
+			if (out.routed.contains(member)) ++out.channelRouted;
+			else if (std::ranges::any_of(destination.uses, [&](const auto& use) { return graph.batches[use.first].queue != graphicsQueue; }))
+				++out.channelWaits;
+		}
 	return true;
 }
 }
@@ -893,6 +940,9 @@ bool RenderGraph::RecordPendingUploads(rhi::Device device, rhi::CommandList& lis
 		auto& plan = ticket->queueUploads;
 		plan.planned = true;
 		plan.waitsForUploads = std::move(routing.waitsForUploads);
+		plan.channelRouted = routing.channelRouted;
+		plan.channelWaits = routing.channelWaits;
+		plan.undeclared = routing.undeclared;
 		const auto& planGraph = *ticket->segments.front().admission.publication->executable->graph;
 		for (uint32_t batch = 0; batch < plan.waitsForUploads.size(); ++batch)
 			if (planGraph.batches[batch].queue != graphicsQueue && !plan.waitsForUploads[batch]) ++plan.spared;

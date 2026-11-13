@@ -119,6 +119,8 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/LatchBlock.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/FrameArena.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/StagedUploadBatch.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/PublicationChannels.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/Runtime/PublicationChannels.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/PreparedTablePublisher.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/DeclaredTableLayout.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/ResourceUseDeclaration.h"
