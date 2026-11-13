@@ -296,8 +296,17 @@ What stays separate:
 -   **A version's backing is the versioned slot's alone.** A frame rebinding may not use a backing another slot of the
     graph binds, so a version must not also be declared directly or through another resolver.
 
-`DynamicResource`, `DynamicGloballyIndexedResource` and in-place `BufferBase::SetBacking` still work for existing users, but are
-deprecated for graph resources.
+What is left of the older mechanisms:
+
+-   `DynamicResource` stays. It is the swapchain's wrapper, and rebind slots and job graph parameters use it. It is deprecated
+    for anything else.
+-   `BufferBase::SetBacking` (protected) still replaces a buffer's backing in place. BasicRenderer's growable buffer classes
+    (`DynamicBuffer` and the structured buffers built on `BufferBase`) still grow this way. It is deprecated for graph
+    resources.
+-   `Buffer::ResizeBytes` and `ResizeStructured` change an unmaterialized buffer's size, such as a transient's or a pooled
+    backing's before it materializes. On a materialized buffer they replace the backing in place, which is deprecated for
+    graph resources.
+-   `DynamicGloballyIndexedResource` is gone.
 
 ## In-stream execution
 
