@@ -26,7 +26,7 @@ ORG grew out of a synchronous, one-graph-per-frame design, and that design still
 - **Compile mixed into execution.** `Update` interleaves compile work with per-execution work: resolver and backing
   polling, binding edits, structural builds and pass preparation all happen there. A pass that adds declarations forces
   an inline structural build on the calling (render) thread.
-- **`GraphHost` defines the frame.** It fixes "a frame is one pass over the epoch order", owns the frame slots, and
+- **`GraphHost` defines the frame.** It fixes "a frame is one pass over the epoch order", owns the run leases, and
   re-initializes and shuts down the process runtime.
 - **Process singletons.** Upload, readback, statistics, deletion (rotated by frame count), descriptor deferred
   release, settings and the default task service are all singletons. Whichever graph or host set them up last owns

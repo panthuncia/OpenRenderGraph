@@ -9,7 +9,10 @@
 #include <functional>
 #include <limits>
 #include <mutex>
+#include <atomic>
+#include <memory>
 #include <rhi.h>
+#include <rhi_helpers.h>
 #include "Render/Runtime/IStatisticsService.h"
 
 
@@ -39,6 +42,10 @@ public:
 	void RegisterQueue(rhi::QueueKind queue);
 
 	void SetupQueryHeap();
+	// Query ranges for frame indices 0 .. frames - 1 (a host's run leases): the pools are made again, larger, when they hold
+	// fewer. Call it from the thread that records with the shared pools.
+	void EnsureFrameCapacity(unsigned frames);
+	unsigned FrameCapacity() const { return m_numFramesInFlight; }
 
 	// Timestamp + mesh-stats queries for any pass
 	void BeginQuery(unsigned passIndex,
@@ -104,6 +111,17 @@ private:
 	bool m_collectPipelineStatistics = false;
 	std::function<bool()> m_getCollectPipelineStatistics;
 	std::mutex m_cpuStatsMutex;
+
+	// The shared pools and readback buffers of one query heap size. Every list that writes or resolves them holds the
+	// current one (QueryRecordingContext::sharedQueries). SetupQueryHeap moves the objects it replaces into it, and it
+	// hands them to the deletion queue when the last list holding it is released. A deletion queue's frontier covers
+	// only the queues ORG submits to, not a host's command stream (in-stream epochs), so it cannot be the only guard.
+	struct SharedQueryObjects {
+		std::vector<rhi::helpers::AnyObjectPtr> replaced;
+		~SharedQueryObjects();
+	};
+	std::shared_ptr<const void> CurrentSharedQueries() const { return m_sharedQueries.load(std::memory_order_acquire); }
+	std::atomic<std::shared_ptr<SharedQueryObjects>> m_sharedQueries{std::make_shared<SharedQueryObjects>()};
 
 	rhi::QueryPoolPtr m_timestampPool;
 	rhi::QueryPoolPtr m_pipelineStatsPool;

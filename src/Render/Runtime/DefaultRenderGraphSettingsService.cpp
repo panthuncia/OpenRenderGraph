@@ -10,7 +10,7 @@ public:
     bool GetUseAsyncCompute() const override {
         return GetOpenRenderGraphSettings().useAsyncCompute;
     }
-    uint8_t GetNumFramesInFlight() const override {
+    uint32_t GetNumFramesInFlight() const override {
         return GetOpenRenderGraphSettings().numFramesInFlight;
     }
 

@@ -338,6 +338,26 @@ size_t ExecutionTimelineAdmission::RetireCompleted(std::span<const ExecutionTime
     return before - m_retained.size();
 }
 
+bool ExecutionTimelineAdmission::LowestRetainedSignals(std::span<uint64_t> lowest) const {
+    if (lowest.size() != m_completed.size()) return false;
+    for (const auto& execution : m_retained) {
+        if (!execution || execution->batches.empty()) return false;
+        const auto& batches = execution->bundle->graph->batches;
+        for (size_t i = 0; i < execution->batches.size(); ++i) {
+            const auto queue = batches[i].queue;
+            if (queue >= lowest.size()) return false;
+            lowest[queue] = (std::min)(lowest[queue], execution->batches[i].signal.value);
+        }
+        for (const auto completion : execution->tailCompletions) {
+            const auto found = std::ranges::find(m_completed, completion.timeline, &ExecutionTimelinePoint::timeline);
+            if (found == m_completed.end()) return false;
+            auto& value = lowest[static_cast<size_t>(found - m_completed.begin())];
+            value = (std::min)(value, completion.value);
+        }
+    }
+    return true;
+}
+
 std::vector<std::shared_ptr<GraphExecutionTimeline>>
 ExecutionTimelineAdmission::TakeRetiredGarbage() {
     // Explicit diagnostic reproduction of the old synchronous retention bug.
@@ -932,9 +952,11 @@ std::shared_ptr<const Schedule> CompileWorkspace::Compile(
             bool newWait = false;
             for (size_t q = 0; q < passWaits.size(); ++q)
                 if (passWaits[q] != UINT32_MAX && (openWaits[q] == UINT32_MAX || passWaits[q] > openWaits[q])) newWait = true;
+            // A batch is recorded either ahead or at execution (recordAtExecution), so the two kinds never share one.
             const bool extendPrevious = !pass.forceBatchIsolation && !result->batches.empty()
                 && result->batches.back().queue == queue
                 && !structure.passes[result->batches.back().passes.back()].forceBatchIsolation
+                && structure.passes[result->batches.back().passes.back()].recordAtExecution == pass.recordAtExecution
                 && !newWait;
             if (!extendPrevious) {
                 result->batches.push_back({passIndex, queue});
@@ -955,6 +977,8 @@ std::shared_ptr<const Schedule> CompileWorkspace::Compile(
                     : pass.forceBatchIsolation ? "isolated"
                     : result->batches[result->batches.size() - 2].queue != queue ? "queue-change"
                     : structure.passes[result->batches[result->batches.size() - 2].passes.back()].forceBatchIsolation ? "after-isolated"
+                    : structure.passes[result->batches[result->batches.size() - 2].passes.back()].recordAtExecution != pass.recordAtExecution
+                        ? "recording-kind"
                     : "new-wait";
                 ORG_TRACE(Schedule, "pass-scheduled").Add("pass", std::string(DiagnosticPassName(structure, passIndex)))
                     .Add("passIndex", passIndex).Add("queue", queue).Add("preferredQueue", pass.preferredQueueSlot)

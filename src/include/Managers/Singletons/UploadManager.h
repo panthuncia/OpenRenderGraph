@@ -73,19 +73,19 @@ public:
 		uint32_t srcCount,
 		const char* file,
 		int line);
-	void ProcessUploads(uint8_t frameIndex, org::imm::ImmediateCommandList& commandList);
+	void ProcessUploads(uint32_t frameIndex, org::imm::ImmediateCommandList& commandList);
 	void SetOwnerThread();
 	void QueueResourceCopy(const std::shared_ptr<Resource>& destination, const std::shared_ptr<Resource>& source, size_t size);
-	void ExecuteResourceCopies(uint8_t frameIndex, org::imm::ImmediateCommandList& commandList);
-	void ProcessDeferredReleases(uint8_t frameIndex);
+	void ExecuteResourceCopies(uint32_t frameIndex, org::imm::ImmediateCommandList& commandList);
+	void ProcessDeferredReleases(uint32_t frameIndex);
 	void SubmitStagedUploads(std::shared_ptr<org::runtime::StagedUploadBatch> batch);
 	void SetStagedUploadsRecordedDirectly(bool direct);
-	size_t RecordStagedUploads(rhi::CommandList& list, uint8_t frameIndex, bool afterWork);
+	size_t RecordStagedUploads(rhi::CommandList& list, uint32_t frameIndex, bool afterWork);
 	bool SubmitRecordedUploads(std::shared_ptr<org::runtime::StagedUploadBatch> batch);
-	size_t TakeRecordedUploads(std::vector<rhi::CommandList>& out, uint8_t frameIndex);
-	bool TakeRecordedUploadsWithDestinations(std::vector<rhi::CommandList>& out, uint8_t frameIndex, std::vector<rhi::ResourceHandle>& destinations);
+	size_t TakeRecordedUploads(std::vector<rhi::CommandList>& out, uint32_t frameIndex);
+	bool TakeRecordedUploadsWithDestinations(std::vector<rhi::CommandList>& out, uint32_t frameIndex, std::vector<rhi::ResourceHandle>& destinations);
 	bool StagedUploadDestinations(std::vector<rhi::ResourceHandle>& out) const;
-	size_t RecordStagedUploadsRouted(rhi::CommandList& list, uint8_t frameIndex, bool afterWork,
+	size_t RecordStagedUploadsRouted(rhi::CommandList& list, uint32_t frameIndex, bool afterWork,
 		const std::function<rhi::CommandList*(rhi::ResourceHandle)>& route, size_t& routed);
 	void SetUploadResolveContext(UploadResolveContext ctx);
 	std::shared_ptr<RenderPass> GetUploadPass() const { return m_uploadPass; }
@@ -164,7 +164,7 @@ private:
 	bool IsUploadTargetValid(const UploadTarget& target, const char* reason, const char* file, int line);
 	void CaptureUploadTargetTelemetry(const UploadTarget& target, uint64_t& outId, std::string& outName);
 
-	uint8_t m_numFramesInFlight = 0;
+	uint32_t m_numFramesInFlight = 0;
 
 	std::vector<ResourceCopy> queuedResourceCopies;
 	std::mutex m_uploadQueueMutex;

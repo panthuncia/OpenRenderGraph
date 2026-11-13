@@ -13,6 +13,14 @@
 
 namespace org {
 
+/// The mip count a texture of this description is created with: its explicit subresource chain, else a full chain
+/// when generateMipMaps is set, else 1.
+uint16_t ResolveTextureMipLevels(const TextureDescription& desc);
+
+/// The RHI description a texture of this description is created with, without a clear value. Alias placement sizes
+/// textures from it, so a placement always covers the allocation.
+rhi::ResourceDesc TextureResourceDesc(const TextureDescription& desc);
+
 class GpuTextureBacking {
 public:
 	// Don't use this.
@@ -84,7 +92,8 @@ private:
 	};
 
 	void RegisterLiveAlloc();
-	void UnregisterLiveAlloc();
+	// Returns the name it was tracked with, for the deletion it goes to.
+	std::string UnregisterLiveAlloc();
 	void UpdateLiveAllocName(const char* name);
 	static std::mutex& LiveAllocMutex();
 	static std::unordered_map<const GpuTextureBacking*, LiveAllocInfo>& LiveAllocs();

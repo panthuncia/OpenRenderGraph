@@ -612,13 +612,18 @@ public:
     uint64_t Submitted(uint64_t timeline) const noexcept;
     size_t RetireCompleted(std::span<const compiler::ExecutionTimelinePoint> completed);
     size_t RetainedFrames() const noexcept { return m_retained.size(); }
+    // Lowers lowest[i] to the lowest completion any retained frame waits for on timelines[i]. RetireCompleted releases no frame
+    // while each timeline's completed value is below its entry. False when a frame has no completion, or waits for a timeline
+    // that is not in `timelines`: then nothing can be ruled out.
+    bool LowestRetainedCompletions(std::span<const uint64_t> timelines, std::span<uint64_t> lowest) const;
 private:
     FrameAdmission PrepareFrame(std::shared_ptr<const SelectedPublication> publication,
         std::span<const compiler::ExecutionTimelinePoint> queues, std::span<const FrameProducerWait> producerWaits,
         std::span<const FrameIncomingState> incomingStates, std::span<const FrameRebinding> rebindings, bool pending,
         bool entryOnly = false);
     // The ledgers' part of an admission (caller holds the sequencer). cacheEligible: nothing frame-specific feeds the plan.
-    void AdmitLedger(FrameAdmission& frame, bool cacheEligible);
+    // plan: a PreparePlan admission, whose body barriers alone are used.
+    void AdmitLedger(FrameAdmission& frame, bool cacheEligible, bool plan = false);
     std::shared_ptr<ResourceSequencer> m_sequencer;
     uint64_t m_nextSequence = 1;
     // Admissions prepared and not yet committed or abandoned, in sequence order (at most one unless closed).
@@ -644,6 +649,17 @@ private:
     };
     std::vector<CachedPlan> m_planCache;
     uint64_t m_planCacheHits = 0, m_planCacheMisses = 0;
+    // The barrier plans that open plan admissions (PreparePlan) recorded bodies from, by backing set. A body uses only the plan's
+    // barriers before and after each pass. Those depend on the compiled graph, the backings and the execution kind, never on
+    // the ledgers, so every ticket of an unchanged graph shares one plan. Its entry barriers are the ledger's of the first
+    // ticket and are not used: a ticket takes them from its admission at submission.
+    struct CachedBody {
+        std::weak_ptr<const ExecutableGeneration> executable;
+        uint64_t backings = 0;  // AdmissionBackingSet::Id
+        bool externalHome = false;
+        std::shared_ptr<const compiler::PreparedExecutionBarrierPlan> plan;
+    };
+    std::vector<CachedBody> m_bodyCache;
     // Per executable: the prediction of its entry-only plan (AdmitLedger), for the backings and execution kind it was made for, and
     // of its access waits; its access stream (the publication's own backings only); the resources batches off the upload queue use.
     struct PredictionSlot {

@@ -100,8 +100,10 @@ add_library(OpenRenderGraph STATIC
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Host/GraphHost.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Host/JobGraph.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Host/GraphInstance.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/src/Host/DeviceMemory.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Telemetry/NvPerfCapture.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/include/OpenRenderGraph/GraphHost.h"
+	"${CMAKE_CURRENT_SOURCE_DIR}/include/OpenRenderGraph/DeviceMemory.h"
 	"${CMAKE_CURRENT_SOURCE_DIR}/include/OpenRenderGraph/Runtime.h"
 	"${CMAKE_CURRENT_SOURCE_DIR}/include/OpenRenderGraph/Trace.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/DescriptorHeap.cpp"
@@ -115,7 +117,10 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PreparedTablePublisher.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RecordingContext.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/LatchBlock.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/FrameArena.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/StagedUploadBatch.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/PublicationChannels.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/Runtime/PublicationChannels.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/PreparedTablePublisher.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/DeclaredTableLayout.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/ResourceUseDeclaration.h"
@@ -146,6 +151,8 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PassBuilders.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/FeatureDomainRegistry.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/RenderPasses/Base/RenderPass.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/RenderPasses/GenerateMipsPass.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/RenderPasses/ResolveMultisamplePass.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PassExecutionContext.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraph.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/GraphCompiler.cpp"
@@ -169,6 +176,7 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/ExecutionState.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/InteropAllocator.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PipelineLibrary.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PipelinePermutations.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/FrameRecording.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/ExternalEpochExecution.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/ExternalClient.cpp"
@@ -199,6 +207,9 @@ set_target_properties(OpenRenderGraph PROPERTIES
     CXX_STANDARD 23
     CXX_STANDARD_REQUIRED ON
 )
+
+# The folder of the built-in passes' shaders, for hosts that build ORG as a subdirectory.
+set(OPENRENDERGRAPH_SHADER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/shaders" CACHE INTERNAL "OpenRenderGraph built-in shaders")
 
 target_include_directories(OpenRenderGraph
     PUBLIC
@@ -481,12 +492,37 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
             basicrhi_compile_spirv(OUTPUT "${_org_persistent_write_spv}"
                 SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/PersistentHostWrite.hlsl"
                 ENTRY main PROFILE cs_6_6)
+            # Input layouts, keyed pipelines and the built-in utility passes (the "pipelines" mode).
+            set(_org_pipeline_spv_dir "${CMAKE_CURRENT_BINARY_DIR}/test_shaders/pipelines")
+            set(_org_pipeline_spvs)
+            foreach(_shader IN ITEMS
+                    "GenerateMips2D|${CMAKE_CURRENT_SOURCE_DIR}/shaders/GenerateMips.hlsl|main|cs_6_6|"
+                    "GenerateMipsArray|${CMAKE_CURRENT_SOURCE_DIR}/shaders/GenerateMips.hlsl|main|cs_6_6|ORG_GENERATE_MIPS_ARRAY=1"
+                    "ResolveMultisample|${CMAKE_CURRENT_SOURCE_DIR}/shaders/ResolveMultisample.hlsl|main|cs_6_6|"
+                    "InputLayoutVS|${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/InputLayout.hlsl|VSMain|vs_6_6|"
+                    "InputLayoutPS|${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/InputLayout.hlsl|PSMain|ps_6_6|"
+                    "PermutationWrite0|${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/PermutationWrite.hlsl|main|cs_6_6|WRITE_BIAS=0"
+                    "PermutationWrite100|${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/PermutationWrite.hlsl|main|cs_6_6|WRITE_BIAS=100")
+                string(REPLACE "|" ";" _parts "${_shader}")
+                list(GET _parts 0 _name)
+                list(GET _parts 1 _source)
+                list(GET _parts 2 _entry)
+                list(GET _parts 3 _profile)
+                list(GET _parts 4 _defines)
+                basicrhi_compile_spirv(OUTPUT "${_org_pipeline_spv_dir}/${_name}.spv" SOURCE "${_source}"
+                    ENTRY ${_entry} PROFILE ${_profile} DEFINES ${_defines}
+                    INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/shaders"
+                    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/ColorSpace.hlsli")
+                list(APPEND _org_pipeline_spvs "${_org_pipeline_spv_dir}/${_name}.spv")
+            endforeach()
             add_executable(OpenRenderGraphPersistentVulkanHostTests tests/PersistentVulkanHostTests.cpp tests/FrameRetirementTests.cpp tests/BindingOwnershipTests.cpp
-                tests/ContributorHostTests.cpp tests/RebindingGpuTests.cpp "${_org_persistent_write_spv}")
+                tests/ContributorHostTests.cpp tests/RebindingGpuTests.cpp tests/PipelineVulkanTests.cpp "${_org_persistent_write_spv}"
+                ${_org_pipeline_spvs})
             target_compile_features(OpenRenderGraphPersistentVulkanHostTests PRIVATE cxx_std_23)
             target_include_directories(OpenRenderGraphPersistentVulkanHostTests PRIVATE src/include)
             target_compile_definitions(OpenRenderGraphPersistentVulkanHostTests PRIVATE NOMINMAX
-                ORG_TEST_PERSISTENT_WRITE_SPV="${_org_persistent_write_spv}")
+                ORG_TEST_PERSISTENT_WRITE_SPV="${_org_persistent_write_spv}"
+                ORG_TEST_PIPELINE_SPV_DIR="${_org_pipeline_spv_dir}")
             if(MSVC)
                 target_compile_options(OpenRenderGraphPersistentVulkanHostTests PRIVATE /utf-8)
             endif()
@@ -520,16 +556,22 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests.StreamOpen COMMAND OpenRenderGraphPersistentVulkanHostTests stream open)
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests.StreamHome COMMAND OpenRenderGraphPersistentVulkanHostTests stream open home)
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests.Arena COMMAND OpenRenderGraphPersistentVulkanHostTests arena)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.Leases COMMAND OpenRenderGraphPersistentVulkanHostTests leases)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.LeasesOpen COMMAND OpenRenderGraphPersistentVulkanHostTests leases open)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.LeasesWide COMMAND OpenRenderGraphPersistentVulkanHostTests leases-wide)
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests.ReuseOpen COMMAND OpenRenderGraphPersistentVulkanHostTests reuse open)
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests.RevisionOpen COMMAND OpenRenderGraphPersistentVulkanHostTests revision open)
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests.ExternalOpen COMMAND OpenRenderGraphPersistentVulkanHostTests external open)
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests.Contributor COMMAND OpenRenderGraphPersistentVulkanHostTests contributor)
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests.Rebinding COMMAND OpenRenderGraphPersistentVulkanHostTests rebinding)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.Pipelines COMMAND OpenRenderGraphPersistentVulkanHostTests pipelines)
             set_tests_properties(OpenRenderGraphPersistentVulkanHostTests OpenRenderGraphPersistentVulkanHostTests.Async
                 OpenRenderGraphPersistentVulkanHostTests.Reuse OpenRenderGraphPersistentVulkanHostTests.Revision
                 OpenRenderGraphPersistentVulkanHostTests.AsyncOpen OpenRenderGraphPersistentVulkanHostTests.ReuseOpen
                 OpenRenderGraphPersistentVulkanHostTests.RevisionOpen OpenRenderGraphPersistentVulkanHostTests.ExternalOpen
-                OpenRenderGraphPersistentVulkanHostTests.Contributor OpenRenderGraphPersistentVulkanHostTests.Rebinding PROPERTIES TIMEOUT 60)
+                OpenRenderGraphPersistentVulkanHostTests.Contributor OpenRenderGraphPersistentVulkanHostTests.Rebinding
+                OpenRenderGraphPersistentVulkanHostTests.Pipelines PROPERTIES TIMEOUT 60)
+
         endif()
     endif()
     if(WIN32 AND BASICRENDERER_TEST_RUNTIME_DIR)
@@ -565,6 +607,12 @@ install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/include/"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
 )
 
+# The built-in passes' shaders (GenerateMipsPass, ResolveMultisamplePass). A host's PipelineCompiler maps
+# org::kBuiltinShaderPrefix to this folder.
+install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/shaders/"
+    DESTINATION "${CMAKE_INSTALL_DATADIR}/OpenRenderGraph/shaders"
+)
+
 install(EXPORT OpenRenderGraphTargets
     FILE OpenRenderGraphTargets.cmake
     NAMESPACE OpenRenderGraph::
@@ -572,6 +620,7 @@ install(EXPORT OpenRenderGraphTargets
 )
 
 include(CMakePackageConfigHelpers)
+set(OPENRENDERGRAPH_INSTALL_SHADER_DIR "${CMAKE_INSTALL_DATADIR}/OpenRenderGraph/shaders")
 write_basic_package_version_file(
     "${CMAKE_CURRENT_BINARY_DIR}/OpenRenderGraphConfigVersion.cmake"
     VERSION ${PROJECT_VERSION}
@@ -581,7 +630,7 @@ write_basic_package_version_file(
 configure_package_config_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/OpenRenderGraphConfig.cmake.in"
     "${CMAKE_CURRENT_BINARY_DIR}/OpenRenderGraphConfig.cmake"
-    PATH_VARS CMAKE_INSTALL_INCLUDEDIR CMAKE_INSTALL_LIBDIR
+    PATH_VARS CMAKE_INSTALL_INCLUDEDIR CMAKE_INSTALL_LIBDIR OPENRENDERGRAPH_INSTALL_SHADER_DIR
     INSTALL_DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/OpenRenderGraph"
 )
 

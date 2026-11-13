@@ -174,8 +174,8 @@ using namespace persistent_impl;
 
 // ---------------------------------------------------------------------------
 
-// A segment's recorded packets, and what they were recorded for. Kept (RenderGraph::m_keptRecordings) when replayable: then
-// submitted by every ticket that takes it, one at a time (a frame slot's tickets follow each other's completion).
+// A segment's recorded packets, and what they were recorded for. A revision's published copy, when replayable: then submitted by
+// every ticket that takes it, one at a time (a copy's tickets follow each other's completion).
 struct RenderGraph::PersistentRecording {
 	std::shared_ptr<const compiler::RenderFrameSnapshot> snapshot;
 	std::vector<std::shared_ptr<const compiler::IPreparedExecutionBatch>> packets;
@@ -205,7 +205,8 @@ struct RenderGraph::PersistentRecording {
 struct RenderGraph::PersistentTicket {
 	uint32_t epoch = 0;
 	std::shared_ptr<detail::ExecutionRecord> execution;  // made by its preparation
-	uint8_t slot = 0;
+	uint32_t slot = 0;  // the run's lease index (its frame index)
+	RunRef run{};
 	uint64_t hostFrame = 0;
 	struct Segment {
 		// Until the ticket is admitted (AdmitPersistentTicket): the plan its body was recorded from (PreparePlan; for a
@@ -222,7 +223,7 @@ struct RenderGraph::PersistentTicket {
 		bool committed = false;  // and committed
 	};
 	std::vector<Segment> segments;
-	// Recordings a kept one replaced (AdoptKeptPersistentRecording): released by the owner thread, with the ticket.
+	// Recordings a candidate displaced: released by the owner thread, with the ticket.
 	std::vector<std::shared_ptr<const PersistentRecording>> replaced;
 	// What each prepared pass's preparation depended on (RenderGraphPass::RevisionHash).
 	std::vector<std::pair<const RenderGraphPass*, uint64_t>> revisions;
@@ -249,6 +250,11 @@ struct RenderGraph::PersistentTicket {
 		bool planned = false;  // false: every batch off the uploads' queue waits for them
 		std::vector<uint8_t> waitsForUploads;  // per batch of segments.front(): it uses what the graphics uploads write
 		uint32_t spared = 0;  // batches off the graphics queue that do not (statistics)
+		// Destinations bound to a publication channel (statistics): routed to a declaring batch's queue, or waited for off graphics.
+		uint32_t channelRouted = 0, channelWaits = 0;
+		// Destinations no batch declares (statistics). Shaders may still read them through a bindless index, so every batch off
+		// the graphics queue waited for the graphics list.
+		uint32_t undeclared = 0;
 		// A list of uploads recorded on a batch's queue, submitted just ahead of that batch (its queue's first in the ticket).
 		struct Leading {
 			uint32_t batch = 0;
@@ -520,7 +526,7 @@ struct RenderGraph::PersistentExecution {
 
 	Options options;
 	uint64_t number = 0;     // its index (PassPrepareContext::executionIndex)
-	uint8_t frameIndex = 0;  // its preparation slot
+	uint32_t frameIndex = 0;  // its preparation slot
 	std::shared_ptr<const IHostExecutionData> frameData;
 	// Empty for an epoch with no main passes.
 	std::optional<PreparedSegment> main;
@@ -533,7 +539,7 @@ struct RenderGraph::PersistentExecutionsState {
 	std::unique_ptr<compiler::ExecutionTimelineAdmission> timelines;
 	// The latest preparation's execution index and slot.
 	uint64_t frameNumber = 0;
-	uint8_t frameIndex = 0;
+	uint32_t frameIndex = 0;
 	// The execution prepared and not yet executed.
 	std::optional<PersistentExecution> prepared;
 	// The latest execution (its index is frameNumber), and the submitted ones not yet seen complete.
@@ -541,6 +547,15 @@ struct RenderGraph::PersistentExecutionsState {
 	std::vector<std::shared_ptr<detail::ExecutionRecord>> pendingExecutions;
 	// Lists submitted after an execution's batches (its home acquires), kept until their own signal completes.
 	std::vector<std::pair<compiler::ExecutionTimelinePoint, std::shared_ptr<const void>>> trailingLeases;
+	// What the last full retirement pass (RetirePersistentExecutions) left:
+	// - submitted: the timelines' submitted value per queue slot it saw,
+	// - lowest: per queue slot, the lowest value that anything still held waits for (UINT64_MAX for none).
+	// While the submitted values stay the same and every queue's completed value is below its lowest, nothing can be released,
+	// and retirement returns at once. skippable is false when something held waits for a timeline that is not a queue slot's.
+	struct RetireWatch {
+		bool skippable = false;
+		std::vector<uint64_t> submitted, lowest;
+	} retireWatch;
 	// Per frame slot: the handoff lists a ticket recorded from a predicted plan (FrameAdmission::sharedBarriers). The next ticket in
 	// the slot whose admission takes the same plan submits them again: the slot's earlier work has completed by then.
 	struct HandoffCache {
@@ -626,7 +641,7 @@ inline RotationKey RotationKeyOf(State::SlotEntry& entry) {
 
 // The admission identity of a queue slot's timeline (Runtime::TimelineIdentity).
 inline uint64_t QueueTimelineIdentity(Runtime& runtime, const QueueRegistry& registry, size_t slot) {
-	return runtime.TimelineIdentity(registry.GetFence(static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot))));
+	return runtime.TimelineIdentity(registry.GetFence(static_cast<QueueSlotIndex>(static_cast<uint32_t>(slot))));
 }
 
 // Handles are per device: a timeline is its device's implementation and its handle there.
@@ -637,7 +652,7 @@ inline bool SameTimeline(const rhi::Timeline& a, const rhi::Timeline& b) noexcep
 inline std::vector<compiler::CompileQueue> RegistryQueues(const QueueRegistry& registry, rhi::Backend backend) {
 	std::vector<compiler::CompileQueue> queues;
 	for (size_t slot = 0; slot < registry.SlotCount(); ++slot) {
-		const auto index = static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot));
+		const auto index = static_cast<QueueSlotIndex>(static_cast<uint32_t>(slot));
 		queues.push_back({static_cast<uint32_t>(registry.GetBackendInstance(index)), true,
 			registry.GetKind(index) == QueueKind::Copy && backend == rhi::Backend::D3D12});
 	}

@@ -28,11 +28,20 @@ static void Record(const LuminanceHistogramBindings& bindings, const Frame& fram
   - An absent state is not given to the device, so the backend's default applies.
   - Topology is the exception. Backends disagree about an omitted one, so vertex pipelines always get one, `TriangleList`
     unless set.
+  - `inputLayout` gives a vertex pipeline vertex buffers (`PipelineInputLayout`: bindings, and attributes that own their
+    semantic names). Without one, the vertex shader pulls its own vertices.
+    - D3D12 matches attributes to shader inputs by semantic, and Vulkan by location. An unset location counts up in
+      declaration order, which is the order DXC gives the shader's inputs.
+    - The layout must allow the input assembler on D3D12. The library refuses a custom layout without
+      `rhi::PF_AllowInputAssembler` on every backend, so a description that builds on Vulkan also builds on D3D12.
+    - It is part of the description's hash, and the compile request carries it (`PipelineCompileRequest::inputLayout`).
 - `CommandSignatureDesc`: indirect arguments, the byte stride, the layout, and the Vulkan sequencing flags.
 - `PipelineLayoutRef`:
   - `StandardCompute` and `StandardGraphics` are the host's layouts.
   - `Custom` holds a `PipelineLayoutSpec`. ORG creates it on each device that needs it, and pipelines with the same spec
     share it.
+  - `RootConstants(count, stages, name)` is a custom layout of one block of root constants (b0, root parameter 0). The
+    shader reaches its resources through the descriptor heap, with indices from those constants.
 
 A description's content hash is its identity (`PipelineContentHash`). `RenderPassBuilder::Pipeline` returns the same
 `PipelineState` for the same description while any declaration holds it. So a pass that is declared again gets the same
@@ -75,6 +84,50 @@ meanwhile, and nothing is locked. A recording retains the payload it bound until
 
 Command signatures are created on the device when the pass is lowered. Creating one compiles nothing, so this happens
 inline. `RecordingContext::ExecuteIndirect(const CommandSignatureState&, ...)` picks the pass's device's signature.
+
+## Pipelines picked while preparing a frame
+
+Some pipelines depend on the frame's work. An engine draw picks one of many shader permutations per draw, so its passes
+cannot declare every pipeline up front. Such a pass keeps an `org::PipelinePermutations` (`Render/PipelinePermutations.h`)
+and selects from it in `Prepare`:
+
+```cpp
+WaterBindings Declare(org::PassBuilder& builder) {
+    if (!m_permutations) m_permutations = std::make_shared<org::PipelinePermutations>(builder.Pipelines(), "Water");
+    ...
+}
+WaterFrame Prepare(const WaterBindings& bindings, const org::PassPrepareContext& preparation) {
+    WaterFrame frame;
+    for (const auto& draw : m_draws) {
+        const auto selection = m_permutations->Select(draw.permutationKey, preparation.backendInstance,
+            [&] { return DescribeWater(draw.permutationKey); });
+        if (!selection) continue; // Still building: this frame skips the draw.
+        frame.draws.push_back({draw, selection.payload});
+    }
+    return frame;
+}
+static void Record(const WaterBindings&, const WaterFrame& frame, org::PassRecordContext& recording) {
+    for (const auto& draw : frame.draws) {
+        recording.BindGraphicsPipeline(draw.pipeline);
+        ...
+    }
+}
+```
+
+- **The key** is the caller's, and must identify the description. A small key (a technique id and state bits) means a hit
+  builds no description. `describe` runs on a miss only.
+- **One library.** A miss acquires the description from the runtime's `PipelineLibrary`. So passes that describe the same
+  pipeline share one build, a declared pipeline and a selected one are the same entry, and reloading rebuilds selected
+  pipelines too (`LiveEntries`, `Rebuild`, `PublishRebuilt`).
+- **Not ready.** A miss starts the build for the pass's device and returns at once. The selection is empty until the build is
+  ready, and the pass skips that work. `PipelineMiss::Wait` blocks on the build instead, for work that must not be
+  skipped. `Prewarm` starts builds ahead of their first use. A failed build stays failed, and is logged once.
+- **Lifetime.** The set holds its entries until `Clear` or its destruction. The frame data holds the selected payload, and
+  binding it retains it in the recording until the recording's GPU work retires. So dropping a pipeline never frees one
+  that recorded work still uses.
+- **The graph does not wait** for selected pipelines, unlike declared ones. A pass that keeps recordings (`Revision`) must
+  name what it selected in its revision, or a kept recording would keep skipping a draw whose pipeline became ready.
+- `Select` is thread safe.
 
 ## Waits across devices
 
@@ -126,11 +179,28 @@ The graph publishes finished rebuilds when it prepares a frame, and a host may a
 live-pipeline tools (`br::diagnostics::RequestRecompile`, `RequestActivation`, and the global shader reload) route
 described pipelines through these calls.
 
+## Built-in passes with shaders
+
+`GenerateMipsPass` and `ResolveMultisamplePass` (`RenderPasses/`) declare compute pipelines whose shaders are in ORG's
+`shaders` folder. Their default paths start with `org::kBuiltinShaderPrefix` (`OpenRenderGraph/`). The host's compiler
+maps that prefix to the folder: `OPENRENDERGRAPH_SHADER_DIR` in a build that adds ORG as a subdirectory, or
+`share/OpenRenderGraph/shaders` in an install. Each pass's options name another path for a host that keeps them elsewhere.
+
+- `GenerateMipsPass` builds mips 1 to N-1 from mip 0, one dispatch per mip, for 2D textures, arrays and cube maps. Each
+  texel is the area-weighted average of the texels it covers, so odd sizes are exact. Both mips are read and written
+  through unordered-access views. An sRGB texture must have UNORM unordered-access views: the shader decodes, averages in
+  linear space, and encodes.
+- `ResolveMultisamplePass` averages each texel's samples into a single-sampled texture, as a hardware resolve does for
+  float, UNORM and SNORM formats. BasicRHI has no resolve command, so it is a compute pass.
+
 ## Not covered
 
-- Pipelines picked at `Prepare` time from a permutation cache. BasicRenderer's cluster rasterization, material
-  evaluation, deep visibility resolve and deferred shading still use `PSOManager`'s per-device-unaware caches, so those
-  passes run on the primary device only.
+- BasicRenderer's cluster rasterization, material evaluation, deep visibility resolve and deferred shading still use
+  `PSOManager`'s per-device-unaware caches, so those passes run on the primary device only. `PipelinePermutations` is
+  the replacement.
+- Multisampled textures with shader-resource views. `PixelBuffer` and `ExternalTextureResource` describe themselves as
+  single-sampled, and the descriptor manager creates no `Texture2DMS` views, so `ResolveMultisamplePass` has no source it
+  can read yet.
 - Ray tracing pipelines and work graphs.
 - Shaders that differ in behaviour between APIs, and resources that cannot be shared between devices (see
   `EnsurePersistentRepresentations`). Known open problems with peer passes are in SARP's `docs/open-defects.md`.

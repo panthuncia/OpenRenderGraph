@@ -82,6 +82,10 @@ public:
     virtual unsigned RegisterPass(const std::string& passName, bool isGeometryPass, std::string_view techniquePath = {}) = 0;
     virtual void RegisterQueue(rhi::QueueKind queueKind) = 0;
     virtual void SetupQueryHeap() = 0;
+    // Query ranges for frame indices 0 .. frames - 1 (a host's run leases, by index): grown when there are fewer. The
+    // ranges held now.
+    virtual void EnsureFrameCapacity(unsigned frames) { (void)frames; }
+    virtual unsigned FrameCapacity() const { return 0; }
 
     virtual void BeginQuery(unsigned passIndex, unsigned frameIndex, rhi::Queue& queue, rhi::CommandList& cmdList) = 0;
     virtual void EndQuery(unsigned passIndex, unsigned frameIndex, rhi::Queue& queue, rhi::CommandList& cmdList) = 0;

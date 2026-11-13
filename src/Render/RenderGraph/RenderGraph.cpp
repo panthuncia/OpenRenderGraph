@@ -333,7 +333,7 @@ ExternalClient& RenderGraph::GetExternalClient() {
 		desc.closed = m_persistentClosedExecutions;
 		desc.entryFullBarrier = m_externalQueueBoundary.entry;
 		for (size_t slot = 0; slot < m_queueRegistry.SlotCount(); ++slot) {
-			const auto index = static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot));
+			const auto index = static_cast<QueueSlotIndex>(static_cast<uint32_t>(slot));
 			const auto kind = m_queueRegistry.GetKind(index);
 			desc.queues.push_back({m_queueRegistry.GetQueue(index), kind == QueueKind::Graphics ? rhi::QueueKind::Graphics
 				: kind == QueueKind::Compute ? rhi::QueueKind::Compute : rhi::QueueKind::Copy});
@@ -950,6 +950,12 @@ std::shared_ptr<RenderPass> RenderGraph::GetRenderPassByName(const std::string& 
 void RenderGraph::Update(const UpdateExecutionContext& context, rhi::Device device, const PersistentExecutionOptions& options) {
     // A task service without a settings service is a structural/unit host: it admits no executable frames.
     if (m_taskService && !m_renderGraphSettingsService) return;
+    if (!options.run && context.run) {
+        auto withRun = options;
+        withRun.run = context.run;
+        UpdateOnPreparationOwner(context, device, withRun);
+        return;
+    }
     UpdateOnPreparationOwner(context, device, options);
 }
 
@@ -1043,7 +1049,7 @@ void RenderGraph::UpdateOnPreparationOwner(const UpdateExecutionContext& context
 
 	{
 		BT_ZONE_SCOPE("RenderGraph::Update::CompileFrame");
-		PreparePersistentFrame(device, static_cast<uint8_t>(context.preparationSlot), context.hostData, 0.0f, options);
+		PreparePersistentFrame(device, static_cast<uint32_t>(context.preparationSlot), context.hostData, 0.0f, options);
 	}
 }
 
@@ -1192,7 +1198,18 @@ void RenderGraph::RegisterResolvedResourceAlias(
 	}
 }
 
+void RenderGraph::NoteLookup(ResourceIdentifier const& rid) {
+	std::scoped_lock lock(m_lookupMutex);
+	m_lookedUp.insert(rid);
+}
+
+bool RenderGraph::LookedUp(ResourceIdentifier const& rid) const {
+	std::scoped_lock lock(m_lookupMutex);
+	return m_lookedUp.contains(rid);
+}
+
 std::shared_ptr<Resource> RenderGraph::RequestResourcePtr(ResourceIdentifier const& rid, bool allowFailure) {
+	NoteLookup(rid);
 	// If it's already in our registry, return it
 	auto cached = _registry.RequestShared(rid);
 	if (cached) {
@@ -1227,6 +1244,7 @@ std::shared_ptr<Resource> RenderGraph::RequestResourcePtr(ResourceIdentifier con
 }
 
 ResourceRegistry::RegistryHandle RenderGraph::RequestResourceHandle(ResourceIdentifier const& rid, bool allowFailure) {
+	NoteLookup(rid);
 	// If it's already in our registry, return it
 	auto cached = _registry.GetHandleFor(rid);
 	if (cached.has_value()) {

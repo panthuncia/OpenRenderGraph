@@ -39,6 +39,7 @@ struct NoPassBindings {};
 //   FrameData Prepare(const Bindings&, const PassPrepareContext&);        // optional: this frame's values
 //   static void Record(const Bindings&, const FrameData&, PassRecordContext&);
 //   void Revision(std::vector<uint64_t>&) const;                     // optional: opts into kept-recording reuse
+//   static bool SkipsAtExecution(const Bindings&, const FrameData&, const PassRecordContext&);  // optional, see below
 //
 // Update and Prepare run on the preparation owner, one frame at a time, and may change the pass. Record runs
 // later, possibly on a worker, and may be replayed. It reads only its arguments. It resolves everything else
@@ -50,6 +51,11 @@ struct NoPassBindings {};
 // Revision appends what Record's output depends on beyond its bindings and the frame's resources: settings,
 // pass state, pipeline generations. While it stays equal, a kept recording of the pass may be submitted again
 // instead of recording anew. A pass without it is never part of a kept recording.
+//
+// SkipsAtExecution is asked only when the pass is recorded at execution (ExternalPassDesc::RecordAtExecution), after the run's
+// commit. True means the pass has nothing to do this run: its recorder records the barriers around it and nothing else (no
+// Record, no debug label, no timestamps). A pass without declared bindings writes
+// `static bool SkipsAtExecution(const FrameData&, const PassRecordContext&)`.
 template<class Derived, OwnedPassFrameData FrameData = EmptyPassFrameData, class Bindings = NoPassBindings>
 class TypedRenderGraphPass : public RenderPass {
 public:
@@ -180,6 +186,12 @@ private:
                 }
             });
         }
+        static bool SkipsAtExecution(const DeclaredFrame& frame, const PassRecordContext& context) {
+            if constexpr (requires(const PassRecordContext& record) {
+                { Derived::SkipsAtExecution(frame.bindings, frame.data, record) } -> std::convertible_to<bool>;
+            }) return Derived::SkipsAtExecution(frame.bindings, frame.data, context);
+            else return false;
+        }
     };
     struct UndeclaredFrame {
         FrameData data;
@@ -199,6 +211,12 @@ private:
                     Derived::Record(scoped);
                 }
             });
+        }
+        static bool SkipsAtExecution(const UndeclaredFrame& frame, const PassRecordContext& context) {
+            if constexpr (requires(const PassRecordContext& record) {
+                { Derived::SkipsAtExecution(frame.data, record) } -> std::convertible_to<bool>;
+            }) return Derived::SkipsAtExecution(frame.data, context);
+            else return false;
         }
     };
 

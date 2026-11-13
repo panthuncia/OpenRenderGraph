@@ -101,7 +101,7 @@ public:
     // these batches waits for it. afterWork: the copies follow work they must wait for (copies earlier in the
     // list, or the previous execution's): one full barrier ahead of the first, recorded only when there is a
     // copy, so an epoch with no batch pays nothing. Returns the number of copies.
-    virtual size_t RecordStagedUploads(rhi::CommandList& list, uint8_t frameIndex, bool afterWork) {
+    virtual size_t RecordStagedUploads(rhi::CommandList& list, uint32_t frameIndex, bool afterWork) {
         (void)list; (void)frameIndex; (void)afterWork;
         return 0;
     }
@@ -116,14 +116,14 @@ public:
     // Owner thread: the accepted recorded batches' lists, in order, for frame slot frameIndex (the batches live until it
     // retires). Call before RecordStagedUploads: a batch whose recording a backing release has since outdated goes back
     // to be recorded there, first, and none is returned.
-    virtual size_t TakeRecordedUploads(std::vector<rhi::CommandList>& out, uint8_t frameIndex) {
+    virtual size_t TakeRecordedUploads(std::vector<rhi::CommandList>& out, uint32_t frameIndex) {
         (void)out; (void)frameIndex;
         return 0;
     }
     // Where the uploads go, for a host that splits them between queues (RenderGraph::RecordPendingUploads' queue-scoped uploads).
     // TakeRecordedUploads, also appending to `destinations` every buffer backing the taken lists write. False when that is not
     // known (the default, unless nothing was taken): the caller then treats the lists as writing anything.
-    virtual bool TakeRecordedUploadsWithDestinations(std::vector<rhi::CommandList>& out, uint8_t frameIndex,
+    virtual bool TakeRecordedUploadsWithDestinations(std::vector<rhi::CommandList>& out, uint32_t frameIndex,
         std::vector<rhi::ResourceHandle>& destinations) {
         (void)destinations;
         const size_t before = out.size();
@@ -140,7 +140,7 @@ public:
     // the copies of one destination all go to the same list, in order. Each list that takes a copy starts with afterWork's barrier.
     // Returns the copies recorded in all; routed counts those that went elsewhere than `list`. Only a service whose
     // StagedUploadDestinations answers routes (the default records everything into `list`).
-    virtual size_t RecordStagedUploadsRouted(rhi::CommandList& list, uint8_t frameIndex, bool afterWork,
+    virtual size_t RecordStagedUploadsRouted(rhi::CommandList& list, uint32_t frameIndex, bool afterWork,
         const std::function<rhi::CommandList*(rhi::ResourceHandle)>& route, size_t& routed) {
         (void)route;
         routed = 0;
@@ -148,7 +148,7 @@ public:
     }
     // Owner thread: the slot's previous execution completed, so its upload pages are reused. GPU objects retire through the
     // runtime (Runtime::Retire), not here.
-    virtual void ProcessDeferredReleases(uint8_t frameIndex) = 0;
+    virtual void ProcessDeferredReleases(uint32_t frameIndex) = 0;
 
     // ── Worker upload path (copy queue, CopyQueueUploadService) ──────
     // Never touches the frame upload instance: bytes are staged into the

@@ -196,7 +196,7 @@ Execution GraphInstance::Prepare(const IHostExecutionData* hostData) {
 	const auto slot = AcquireSlot();
 	runtime::ScopedActiveGraphServices services(m_graph->GetUploadService(), m_graph->GetDescriptorService());
 	// The slot's last execution is done on the GPU, so the upload pages it used can be recycled.
-	m_uploads->ProcessDeferredReleases(static_cast<uint8_t>(slot));
+	m_uploads->ProcessDeferredReleases(static_cast<uint32_t>(slot));
 	m_runtime->Retire();
 	const auto index = ++m_prepared;
 	UpdateExecutionContext update{};

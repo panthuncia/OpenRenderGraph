@@ -21,6 +21,7 @@
 #include "Render/ResourceUseDeclaration.h"
 #include "Render/PreparedInvocationArena.h"
 #include "Render/PublicationBindingBundle.h"
+#include "Render/RunRef.h"
 #include "Render/RenderGraph/CompileTelemetry.h"
 #include "Resources/ResourceIdentifier.h"
 
@@ -452,10 +453,10 @@ public:
         std::shared_ptr<const persistent::SelectedPublication> publication);
     RecordingContext WithPersistentBindings(std::shared_ptr<const persistent::SelectedPublication> publication) const;
     const persistent::SelectedPublication* PersistentPublication() const noexcept { return m_persistentPublication.get(); }
-    // The frame slot of the execution being recorded. This is the host's frames-in-flight index. A recording may
-    // depend on it, because a LatchBlock region is per slot. It must not depend on anything else about the frame.
-    uint32_t FrameSlot() const noexcept { return m_frameSlot; }
-    void SetFrameSlot(uint32_t slot) noexcept { m_frameSlot = slot; }
+    // The run being recorded (GraphHost's run lease, or a published copy's run). A recording may depend on it, because a
+    // LatchBlock region and a run's CPU payload are per run. It must not depend on anything else about the frame.
+    const RunRef& Run() const noexcept { return m_run; }
+    void SetRun(const RunRef& run) noexcept { m_run = run; }
     rhi::Resource Resolve(persistent::BindingToken token) const;
     rhi::DescriptorSlot Resolve(persistent::ViewToken token) const;
     RecordingContext(rhi::CommandList commands, std::shared_ptr<const FrozenExecutionBindings> bindings,
@@ -574,7 +575,7 @@ private:
     struct PersistentTag {};
     RecordingContext(rhi::CommandList commands, std::shared_ptr<const persistent::SelectedPublication> publication, PersistentTag);
     std::shared_ptr<const persistent::SelectedPublication> m_persistentPublication;
-    uint32_t m_frameSlot = 0;
+    RunRef m_run{};
     rhi::CommandList m_commands;
     std::shared_ptr<const FrozenExecutionBindings> m_bindings;
     std::shared_ptr<const std::vector<ExternalDescriptorBindingValue>> m_externalBindings;
@@ -765,6 +766,20 @@ public:
             throw;
         }
     }
+    // For a pass recorded at execution (ExternalPassDesc::recordAtExecution), asked just before its recording: whether it has
+    // nothing to do this run. Its recorder then records only the barriers around it and calls RecordNothing instead of Record.
+    // A pass decides from what the run's commit wrote by then (a typed pass's static SkipsAtExecution). It is never asked when
+    // recorded ahead, before the commit.
+    bool SkipsAtExecution(const RecordingContext& context) const {
+        return m_storage && m_storage->state.load(std::memory_order_acquire) == LifecycleState::Prepared && m_storage->SkipsAtExecution(context);
+    }
+    // Consumes the packet as Record does, recording nothing (SkipsAtExecution). Its submission and completion follow as usual.
+    void RecordNothing() const {
+        if (!m_storage) throw std::logic_error("Legacy pass has no owned recording packet");
+        auto expected = LifecycleState::Prepared;
+        if (!m_storage->state.compare_exchange_strong(expected, LifecycleState::Recorded))
+            throw std::logic_error("Prepared pass already consumed");
+    }
     // Records a replayable pass again, after Record, into another list and with the same data. This is for a late batch
     // of a kept recording. Each execution records that batch into its host's list
     // (PreparedRhiExecutionBatch::RecordDeferred). There is no state transition, because a replayable pass has no
@@ -822,6 +837,7 @@ private:
         virtual void CommitCompleted(CompletionContext) const {}
         virtual void Abandon(AbandonReason) const {}
         virtual bool HasCallbacks() const noexcept { return false; }
+        virtual bool SkipsAtExecution(const RecordingContext&) const { return false; }
         mutable std::atomic<LifecycleState> state{LifecycleState::Prepared};
         mutable std::shared_ptr<const PreparedDependencySnapshot> dependencies;
         std::vector<ExternalTimelinePoint> externalSignals;
@@ -858,6 +874,12 @@ private:
             return requires(const Data& value, SubmissionContext submitted) { Derived::Submitted(value, submitted); }
                 || requires(const Data& value, CompletionContext completed) { Derived::Completed(value, completed); }
                 || requires(const Data& value, AbandonReason reason) { Derived::Abandoned(value, reason); };
+        }
+        bool SkipsAtExecution(const RecordingContext& context) const override {
+            if constexpr (requires(const Data& value, const RecordingContext& recording) {
+                { Derived::SkipsAtExecution(value, recording) } -> std::convertible_to<bool>;
+            }) return data && Derived::SkipsAtExecution(*data, context);
+            else return false;
         }
 		mutable std::optional<Data> data;
     };

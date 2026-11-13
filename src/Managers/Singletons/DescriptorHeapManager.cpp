@@ -27,6 +27,31 @@ void RetireDescriptorSlotsForDeferredRelease(
 }
 
 namespace {
+	// A texture's UAV of one mip and slice: every depth slice of a 3D texture, one array slice of an array or cube, else the 2D mip.
+	rhi::UavDesc TextureUav(const DescriptorHeapManager::ViewRequirements::TextureViews& tex, rhi::Format format, uint32_t mip, uint32_t slice) {
+		rhi::UavDesc uavDesc{};
+		uavDesc.formatOverride = format;
+		if (tex.is3D) {
+			uavDesc.dimension = rhi::UavDim::Texture3D;
+			uavDesc.texture3D.mipSlice = mip + tex.uavFirstMip;
+			uavDesc.texture3D.firstWSlice = 0;
+			uavDesc.texture3D.wSize = (std::max)(tex.depth >> (mip + tex.uavFirstMip), 1u);
+		}
+		else if (tex.isArray || tex.isCubemap) {
+			uavDesc.dimension = rhi::UavDim::Texture2DArray;
+			uavDesc.texture2DArray.mipSlice = mip + tex.uavFirstMip;
+			uavDesc.texture2DArray.firstArraySlice = slice;
+			uavDesc.texture2DArray.arraySize = 1;
+			uavDesc.texture2DArray.planeSlice = 0;
+		}
+		else {
+			uavDesc.dimension = rhi::UavDim::Texture2D;
+			uavDesc.texture2D.mipSlice = mip + tex.uavFirstMip;
+			uavDesc.texture2D.planeSlice = 0;
+		}
+		return uavDesc;
+	}
+
 	struct ShaderVisibleCapacities {
 		UINT resources = 0;
 		UINT samplers = 0;
@@ -292,8 +317,14 @@ void DescriptorHeapManager::RetireExecutionLease(std::shared_ptr<const void> lea
     m_deferredReleases.push_back(std::move(release));
 }
 
-void DescriptorHeapManager::ProcessDeferredReleases(uint8_t frameIndex) {
+void DescriptorHeapManager::ProcessDeferredReleases(uint32_t frameIndex) {
     (void)frameIndex;
+    // Resource destruction can itself retire descriptor slots. It runs here, outside m_descriptorMutationMutex, to avoid
+    // recursive singleton entry.
+    (void)ProcessDeferredReleasesElsewhere();
+}
+
+std::shared_ptr<void> DescriptorHeapManager::ProcessDeferredReleasesElsewhere() {
     std::vector<DeferredRelease> readyReleases;
     {
         std::scoped_lock lock(m_descriptorMutationMutex);
@@ -338,9 +369,9 @@ void DescriptorHeapManager::ProcessDeferredReleases(uint8_t frameIndex) {
             m_deferredReleases.pop_back();
         }
     }
-    // Resource destruction can itself retire descriptor slots. Keep it outside
-    // m_descriptorMutationMutex to avoid recursive singleton entry.
-    readyReleases.clear();
+    // Destroyed wherever the caller drops them, never under m_descriptorMutationMutex.
+    if (readyReleases.empty()) return {};
+    return std::make_shared<std::vector<DeferredRelease>>(std::move(readyReleases));
 }
 
 DescriptorHeapManager::DeferredReleaseStats DescriptorHeapManager::GetDeferredReleaseStats() {
@@ -627,7 +658,12 @@ void DescriptorHeapManager::UpdateDescriptorContentsUnlocked(
                     rhi::SrvDesc srvDesc{};
                     srvDesc.formatOverride = srvFormat;
 
-                    if (tex->isCubemap) {
+                    if (tex->is3D) {
+                        srvDesc.dimension = rhi::SrvDim::Texture3D;
+                        srvDesc.tex3D.mostDetailedMip = mip;
+                        srvDesc.tex3D.mipLevels = mipLevelsForView;
+                    }
+                    else if (tex->isCubemap) {
                         if (tex->isArray) {
                             srvDesc.dimension = rhi::SrvDim::TextureCubeArray;
                             srvDesc.cubeArray.mostDetailedMip = mip;
@@ -738,21 +774,7 @@ void DescriptorHeapManager::UpdateDescriptorContentsUnlocked(
             const uint32_t uavSlices = (tex->isArray || tex->isCubemap) ? tex->totalArraySlices : 1u;
             for (uint32_t slice = 0; slice < uavSlices; ++slice) {
                 for (uint32_t mip = 0; mip < tex->mipLevels; ++mip) {
-                    rhi::UavDesc uavDesc{};
-                    uavDesc.formatOverride = uavFormat;
-                    if (tex->isArray || tex->isCubemap) {
-                        uavDesc.dimension = rhi::UavDim::Texture2DArray;
-                        uavDesc.texture2DArray.mipSlice = mip + tex->uavFirstMip;
-                        uavDesc.texture2DArray.firstArraySlice = slice;
-                        uavDesc.texture2DArray.arraySize = 1;
-                        uavDesc.texture2DArray.planeSlice = 0;
-                    }
-                    else {
-                        uavDesc.dimension = rhi::UavDim::Texture2D;
-                        uavDesc.texture2D.mipSlice = mip + tex->uavFirstMip;
-                        uavDesc.texture2D.planeSlice = 0;
-                    }
-
+                    rhi::UavDesc uavDesc = TextureUav(*tex, uavFormat, mip, slice);
                     const auto& slot = target.GetUAVShaderVisibleInfo(mip, slice).slot;
                     device.CreateUnorderedAccessView({ shaderHeap, slot.index }, apiResource.GetHandle(), uavDesc);
                 }
@@ -779,21 +801,7 @@ void DescriptorHeapManager::UpdateDescriptorContentsUnlocked(
             const uint32_t uavSlices = (tex->isArray || tex->isCubemap) ? tex->totalArraySlices : 1u;
             for (uint32_t slice = 0; slice < uavSlices; ++slice) {
                 for (uint32_t mip = 0; mip < tex->mipLevels; ++mip) {
-                    rhi::UavDesc uavDesc{};
-                    uavDesc.formatOverride = uavFormat;
-                    if (tex->isArray || tex->isCubemap) {
-                        uavDesc.dimension = rhi::UavDim::Texture2DArray;
-                        uavDesc.texture2DArray.mipSlice = mip + tex->uavFirstMip;
-                        uavDesc.texture2DArray.firstArraySlice = slice;
-                        uavDesc.texture2DArray.arraySize = 1;
-                        uavDesc.texture2DArray.planeSlice = 0;
-                    }
-                    else {
-                        uavDesc.dimension = rhi::UavDim::Texture2D;
-                        uavDesc.texture2D.mipSlice = mip + tex->uavFirstMip;
-                        uavDesc.texture2D.planeSlice = 0;
-                    }
-
+                    rhi::UavDesc uavDesc = TextureUav(*tex, uavFormat, mip, slice);
                     const auto& slot = target.GetUAVNonShaderVisibleInfo(mip, slice).slot;
                     device.CreateUnorderedAccessView({ cpuHeap, slot.index }, apiResource.GetHandle(), uavDesc);
                 }

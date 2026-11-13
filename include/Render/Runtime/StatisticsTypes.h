@@ -57,6 +57,11 @@ struct QueryRecordingContext {
     // the frame-indexed shared queries, which the service recreates as passes register. They are kept across merges,
     // so every submission of the recording publishes them again.
     std::shared_ptr<OwnedTimestampQueries> owned;
+    // The set of shared query pools and readback buffers this context's list writes: the one current at its first
+    // query. The service replaces the set when passes register, and destroys a replaced one only after every context
+    // holding it is released. A recording holds its context until its last submission completes, so a list in flight
+    // never names a destroyed pool. A list whose set was replaced while it recorded writes and resolves no more queries.
+    std::shared_ptr<const void> sharedQueries;
 };
 
 }

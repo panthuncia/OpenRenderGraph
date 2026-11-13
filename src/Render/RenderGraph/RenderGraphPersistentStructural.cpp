@@ -633,7 +633,7 @@ void RenderGraph::RetireIdlePersistentAliasPools(PersistentExecutionState& state
 		spdlog::info("Persistent alias pool retired: pool={:#x} capacity={} idleFrames={}", it->first, pool.capacityBytes,
 			state.frameNumber - pool.idleSinceFrame);
 		basic_telemetry::AddCounter("ORG.Persistent.AliasPoolRetirements");
-		if (pool.allocation) DeletionManager::GetInstance().MarkForDelete(std::move(pool.allocation));
+		if (pool.allocation) DeletionManager::GetInstance().MarkForDelete(std::move(pool.allocation), "RenderGraph alias pool (idle)");
 		it = pools.erase(it);
 	}
 }
@@ -768,6 +768,16 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		}
 		return out;
 	}();
+	// Each epoch's graph packs its transients from offset 0, so two epochs placed in one pool overlap in memory. That is safe only
+	// if their GPU work never interleaves, which nothing here can check: an epoch's runs are submitted on their own timeline (in
+	// the host's stream or on the graph's queues, prepared ahead), and the alias ledger adds no wait on the same queue. So each
+	// epoch gets pools of its own: transients alias only within their epoch's graph, whose order the planner sets.
+	// ORG_PERSISTENT_ALIAS_SHARE_EPOCHS=1 shares the pools across epochs again (the old layout, for VRAM comparisons).
+	static const bool shareAcrossEpochs = [] {
+		const char* value = std::getenv("ORG_PERSISTENT_ALIAS_SHARE_EPOCHS");
+		return value && value[0] == '1';
+	}();
+	const uint64_t aliasDomain = shareAcrossEpochs ? 0 : uint64_t{m_passEpochFilter} + 1;
 	size_t excludedCount = 0;
 	for (auto& c : candidates) {
 		std::sort(c.users.begin(), c.users.end());
@@ -803,6 +813,7 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 			boost::hash_combine(c.poolID, c.resourceClass);
 			if (std::popcount(c.backendMask) > 1) { c.pooled = false; c.exclusion = "multi-backend placement unsupported"; }
 		}
+		if (c.pooled && aliasDomain) boost::hash_combine(c.poolID, aliasDomain);
 		if (c.exclusion) ++excludedCount;
 	}
 
@@ -934,7 +945,7 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 			if (!rhi::IsOk(result)) throw std::runtime_error("Failed to allocate persistent alias pool memory");
 			// Frame targets and per-frame working buffers: over the OS budget, the costliest to leave in system memory.
 			DeviceManager::GetInstance().SetResidencyPriority(fresh, rhi::ResidencyPriorityHigh);
-			if (pool.allocation) DeletionManager::GetInstance().MarkForDelete(std::move(pool.allocation));
+			if (pool.allocation) DeletionManager::GetInstance().MarkForDelete(std::move(pool.allocation), "RenderGraph alias pool (replaced)");
 			pool.allocation = std::move(fresh);
 			pool.capacityBytes = capacity;
 			pool.alignment = poolAlignment;
@@ -960,6 +971,11 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 			if (!(earlier.lastUse < later.firstUse))
 				throw std::logic_error("Persistent alias plan produced overlapping lifetimes for '" + a.concrete->GetName() + "' and '" + b.concrete->GetName() + "'");
 			++overlapPairs;
+			// Which transients share memory, for checking a plan by hand (CS: CS_ORG_ALIAS_LOG=1).
+			if (logging)
+				spdlog::info("Persistent alias overlap: '{}' [{}, {}) ranks {}-{} then '{}' [{}, {}) ranks {}-{}", earlier.concrete->GetName(),
+					earlier.offset, earlier.offset + earlier.sizeBytes, earlier.firstUse, earlier.lastUse, later.concrete->GetName(), later.offset,
+					later.offset + later.sizeBytes, later.firstUse, later.lastUse);
 			for (const auto u : earlier.users) for (const auto v : later.users)
 				edges.emplace_back(structure.passes[u].preparedPassIndex, structure.passes[v].preparedPassIndex);
 		}
@@ -1102,10 +1118,21 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 	}
 	if (rematerialized) basic_telemetry::AddCounter("ORG.Persistent.AliasRematerializations", static_cast<int64_t>(rematerialized));
 	if (logging || state.aliasPlans <= 2 || rematerialized)
-		spdlog::info("Persistent alias plan #{}: candidates={} placed={} excluded={} pools={} overlapPairs={} orderings={} rematerialized={} standalone={} "
-			"independentMB={:.2f} requiredMB={:.2f} reservedMB={:.2f} rebuild={}",
-			state.aliasPlans, candidates.size(), placed, excludedCount, byPool.size(), overlapPairs, edges.size(), rematerialized, standalone,
-			independentBytes / (1024.0 * 1024.0), requiredBytes / (1024.0 * 1024.0), reservedBytes / (1024.0 * 1024.0), changed);
+		spdlog::info("Persistent alias plan #{}: epoch={} inHostStream={} poolsPerEpoch={} candidates={} placed={} excluded={} pools={} overlapPairs={} "
+			"orderings={} rematerialized={} standalone={} independentMB={:.2f} requiredMB={:.2f} reservedMB={:.2f} rebuild={}",
+			state.aliasPlans, m_passEpochFilter, PassEpochInHostStream(), aliasDomain != 0, candidates.size(), placed, excludedCount, byPool.size(),
+			overlapPairs, edges.size(), rematerialized, standalone, independentBytes / (1024.0 * 1024.0), requiredBytes / (1024.0 * 1024.0),
+			reservedBytes / (1024.0 * 1024.0), changed);
+	// Which queue slots this epoch's batches use, once per plan under logging: with inHostStream, which of them are in the host's stream.
+	if (logging) {
+		std::vector<uint32_t> queues;
+		for (const auto& batch : graph.batches)
+			if (std::ranges::find(queues, batch.queue) == queues.end()) queues.push_back(batch.queue);
+		std::string list;
+		for (const auto queue : queues) list += (list.empty() ? "" : ",") + std::to_string(queue);
+		spdlog::info("Persistent alias epoch {}: batches={} queue slots={} inHostStream={}", m_passEpochFilter, graph.batches.size(), list,
+			PassEpochInHostStream());
+	}
 	if (logging) for (const auto& c : candidates) if (c.exclusion)
 		spdlog::info("Persistent alias exclusion: '{}' reason='{}' bytes={}", c.concrete->GetName(), c.exclusion, c.sizeBytes);
 	// Graph resources never offered to the planner: not marked aliasable, or a manual pool with auto aliasing off.

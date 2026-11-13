@@ -240,7 +240,7 @@ void UploadManager::SetStagedUploadsRecordedDirectly(bool direct)
 	}
 }
 
-size_t UploadManager::RecordStagedUploads(rhi::CommandList& list, uint8_t frameIndex, bool afterWork)
+size_t UploadManager::RecordStagedUploads(rhi::CommandList& list, uint32_t frameIndex, bool afterWork)
 {
 	return m_uploadInstance ? m_uploadInstance->RecordStagedUploads(list, frameIndex, afterWork) : 0;
 }
@@ -258,12 +258,12 @@ bool UploadManager::SubmitRecordedUploads(std::shared_ptr<org::runtime::StagedUp
 	return m_uploadInstance->SubmitRecordedUploads(std::move(batch), nothingQueued);
 }
 
-size_t UploadManager::TakeRecordedUploads(std::vector<rhi::CommandList>& out, uint8_t frameIndex)
+size_t UploadManager::TakeRecordedUploads(std::vector<rhi::CommandList>& out, uint32_t frameIndex)
 {
 	return m_uploadInstance ? m_uploadInstance->TakeRecordedUploads(out, frameIndex) : 0;
 }
 
-bool UploadManager::TakeRecordedUploadsWithDestinations(std::vector<rhi::CommandList>& out, uint8_t frameIndex,
+bool UploadManager::TakeRecordedUploadsWithDestinations(std::vector<rhi::CommandList>& out, uint32_t frameIndex,
 	std::vector<rhi::ResourceHandle>& destinations)
 {
 	return m_uploadInstance ? m_uploadInstance->TakeRecordedUploadsWithDestinations(out, frameIndex, destinations) : true;
@@ -274,14 +274,14 @@ bool UploadManager::StagedUploadDestinations(std::vector<rhi::ResourceHandle>& o
 	return m_uploadInstance ? m_uploadInstance->StagedUploadDestinations(out) : true;
 }
 
-size_t UploadManager::RecordStagedUploadsRouted(rhi::CommandList& list, uint8_t frameIndex, bool afterWork,
+size_t UploadManager::RecordStagedUploadsRouted(rhi::CommandList& list, uint32_t frameIndex, bool afterWork,
 	const std::function<rhi::CommandList*(rhi::ResourceHandle)>& route, size_t& routed)
 {
 	routed = 0;
 	return m_uploadInstance ? m_uploadInstance->RecordStagedUploadsRouted(list, frameIndex, afterWork, route, routed) : 0;
 }
 
-void UploadManager::ProcessDeferredReleases(uint8_t frameIndex)
+void UploadManager::ProcessDeferredReleases(uint32_t frameIndex)
 {
 	if (m_uploadInstance) {
 		m_uploadInstance->ProcessDeferredReleases(frameIndex);
@@ -341,7 +341,7 @@ void UploadManager::SetOwnerThread() {
 	m_uploadInstance->SetOwnerThread();
 }
 
-void UploadManager::ProcessUploads(uint8_t frameIndex, org::imm::ImmediateCommandList& commandList) {
+void UploadManager::ProcessUploads(uint32_t frameIndex, org::imm::ImmediateCommandList& commandList) {
 	if (m_uploadInstance) {
 		m_uploadInstance->ProcessUploads(frameIndex, commandList);
 	}
@@ -358,7 +358,7 @@ void UploadManager::QueueResourceCopy(const std::shared_ptr<Resource>& destinati
 	MarkUploadPassDirty();
 }
 
-void UploadManager::ExecuteResourceCopies(uint8_t frameIndex, org::imm::ImmediateCommandList& commandList) {
+void UploadManager::ExecuteResourceCopies(uint32_t frameIndex, org::imm::ImmediateCommandList& commandList) {
 	(void)frameIndex;
 	std::vector<ResourceCopy> resourceCopies;
 	{

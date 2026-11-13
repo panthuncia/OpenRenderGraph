@@ -377,9 +377,15 @@ CopyQueueUploadService::CommandPair CopyQueueUploadService::AcquireCommandPair()
 	}
 	CommandPair pair;
 	// Create the allocator for the queue the lists are submitted to. A dedicated upload queue may be in a different family
-	// than the device's copy queue.
-	if (rhi::Failed(m_device.CreateCommandAllocator(m_copyQueue, pair.allocator)) ||
-		rhi::Failed(m_device.CreateCommandList(rhi::QueueKind::Copy, pair.allocator.Get(), pair.list))) {
+	// than the device's copy queue. One allocator serves every list, because each command pool costs driver memory.
+	if (!m_listAllocator && rhi::Failed(m_device.CreateCommandAllocator(m_copyQueue, m_listAllocator))) {
+		m_listAllocator = {};
+		spdlog::error("CopyQueueUploadService '{}': copy command allocator creation failed", m_config.debugName);
+		return {};
+	}
+	const bool shared = m_listAllocator->SupportsSharedLists();
+	if ((!shared && rhi::Failed(m_device.CreateCommandAllocator(m_copyQueue, pair.allocator))) ||
+		rhi::Failed(m_device.CreateCommandList(rhi::QueueKind::Copy, shared ? m_listAllocator.Get() : pair.allocator.Get(), pair.list))) {
 		spdlog::error("CopyQueueUploadService '{}': copy command list creation failed", m_config.debugName);
 		return {};
 	}
@@ -387,9 +393,16 @@ CopyQueueUploadService::CommandPair CopyQueueUploadService::AcquireCommandPair()
 }
 
 void CopyQueueUploadService::RecycleCommandPair(CommandPair&& pair) {
-	if (!pair.allocator || !pair.list) return;
-	pair.allocator->Recycle();
-	pair.list->Recycle(pair.allocator.Get());
+	if (!pair.list) return;
+	if (pair.allocator) {
+		pair.allocator->Recycle();
+		pair.list->Recycle(pair.allocator.Get());
+	} else if (m_listAllocator) {
+		// Resets only this list. The others of the shared allocator may still run on the GPU.
+		pair.list->Recycle(m_listAllocator.Get());
+	} else {
+		return;
+	}
 	if (m_freePairs.size() < m_config.maxInFlightBatches + 1) {
 		m_freePairs.push_back(std::move(pair));
 	}
@@ -428,7 +441,8 @@ bool CopyQueueUploadService::CollectBatch(Batch& batch) {
 	// A batch records no barriers between its copies. So it must never hold both a write and a read of one resource.
 	// These entries end the batch:
 	// - a buffer copy whose source an earlier entry writes,
-	// - an entry that writes a resource an earlier copy reads.
+	// - an entry that writes a resource an earlier copy reads,
+	// - a wait entry (it holds only what was queued after it).
 	// That entry is carried over, unclaimed, and opens the next batch. The check uses whole resources, not byte ranges.
 	// That is conservative and cheap.
 	std::unordered_set<Resource*> written;
@@ -442,7 +456,9 @@ bool CopyQueueUploadService::CollectBatch(Batch& batch) {
 			if (!batch.copies.empty() && m_intake.Count() == 0) break;
 			if (!m_intake.Pop(copy)) break;
 		}
-		if (!batch.copies.empty() && ((copy.source && written.contains(copy.source.get())) ||
+		// A wait also ends the batch: the whole batch waits for it, and the entries queued before it must not. Graph work may wait
+		// for those (their signals, the batch's value) and the wait may be for that graph work: a cycle (copy-queue-sealed-stall).
+		if (!batch.copies.empty() && (!copy.waits.empty() || (copy.source && written.contains(copy.source.get())) ||
 				(copy.destination && read.contains(copy.destination.get())))) {
 			m_carried = std::move(copy);
 			m_hasCarried.store(true, std::memory_order_release);
@@ -591,7 +607,8 @@ bool CopyQueueUploadService::RecordAndSubmit(Batch& batch) {
 		for (const auto& [waitTimeline, value] : copy.waits) {
 			if (!waitTimeline || !*waitTimeline || (*waitTimeline)->GetCompletedValue() >= value) continue;
 			if ((*waitTimeline)->HostWait(value, 10'000) != rhi::Result::Ok) {
-				spdlog::warn("CopyQueueUploadService '{}': a wait was not reached in 10 s; it stays on the submission", m_config.debugName);
+				spdlog::warn("CopyQueueUploadService '{}': a wait was not reached in 10 s (timeline t{} wants {}, at {}); it stays on the submission",
+					m_config.debugName, (*waitTimeline)->GetHandle().index, value, (*waitTimeline)->GetCompletedValue());
 			}
 		}
 	}
@@ -758,6 +775,7 @@ void CopyQueueUploadService::Cleanup() {
 		if (last != 0) (void)(*m_timeline)->HostWait(last);
 	}
 	m_freePairs.clear();
+	m_listAllocator = {};
 	m_epoch.fetch_add(1, std::memory_order_acq_rel); // invalidate every thread's open page
 	{
 		std::lock_guard lock(m_pageMutex);

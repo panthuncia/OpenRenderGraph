@@ -120,6 +120,18 @@ void DeviceManager::SetResidencyPriority(TrackedHandle& allocation, rhi::Residen
     (void)m_device.Get().SetResidencyPriority(rhi::Span<rhi::PageableRef>{ &pageable, 1u }, priority);
 }
 
+rhi::Result DeviceManager::CreateResourceUntracked(
+    const rhi::ma::AllocationDesc& allocDesc,
+    const rhi::ResourceDesc& resourceDesc,
+    rhi::ma::AllocationPtr& outAllocation) const noexcept
+{
+    std::scoped_lock lock(m_resourceCreationMutex);
+    if (!m_allocator) {
+        return rhi::Result::InvalidCall;
+    }
+    return m_allocator->CreateResource(&allocDesc, &resourceDesc, 0, nullptr, outAllocation);
+}
+
 rhi::Result DeviceManager::AllocateMemoryTracked(
     const rhi::ma::AllocationDesc& allocDesc,
     const rhi::ResourceAllocationInfo& allocationInfo,

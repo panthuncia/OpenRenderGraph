@@ -18,6 +18,7 @@
 
 #include "Managers/Singletons/DeviceManager.h"
 #include "Managers/Singletons/DeletionManager.h"
+#include "Resources/GPUBacking/GPUTextureBacking.h"
 #include "Resources/PixelBuffer.h"
 #include "Resources/Buffers/DynamicBufferBase.h"
 #include "Resources/MemoryStatisticsComponents.h"
@@ -177,58 +178,6 @@ void RenderGraph::BuildMemoryIntrospectionFrameGraphSnapshot(
 }
 
 namespace {
-	uint16_t CalculateMipLevels(uint16_t width, uint16_t height) {
-		return static_cast<uint16_t>(std::floor(std::log2((std::max)(width, height)))) + 1;
-	}
-
-	rhi::ResourceDesc BuildAliasTextureResourceDesc(const TextureDescription& desc) {
-		const uint16_t mipLevels = desc.generateMipMaps
-			? CalculateMipLevels(desc.imageDimensions[0].width, desc.imageDimensions[0].height)
-			: 1;
-
-		uint32_t arraySize = desc.arraySize;
-		if (!desc.isArray && !desc.isCubemap) {
-			arraySize = 1;
-		}
-
-		auto width = desc.imageDimensions[0].width;
-		auto height = desc.imageDimensions[0].height;
-		if (desc.padInternalResolution) {
-			width = std::max(1u, static_cast<unsigned int>(std::pow(2, std::ceil(std::log2(width)))));
-			height = std::max(1u, static_cast<unsigned int>(std::pow(2, std::ceil(std::log2(height)))));
-		}
-
-		rhi::ResourceDesc textureDesc{
-			.type = rhi::ResourceType::Texture2D,
-			.texture = {
-				.format = desc.format,
-				.width = static_cast<uint32_t>(width),
-				.height = static_cast<uint32_t>(height),
-				.depthOrLayers = static_cast<uint16_t>(desc.isCubemap ? 6 * arraySize : arraySize),
-				.mipLevels = mipLevels,
-				.sampleCount = 1,
-				.initialLayout = rhi::ResourceLayout::Common,
-				.optimizedClear = nullptr
-			}
-		};
-
-		if (desc.isCubemap) {
-			textureDesc.resourceFlags |= rhi::ResourceFlags::RF_TextureCubeCompatible;
-		}
-
-		if (desc.hasRTV) {
-			textureDesc.resourceFlags |= rhi::ResourceFlags::RF_AllowRenderTarget;
-		}
-		if (desc.hasDSV) {
-			textureDesc.resourceFlags |= rhi::ResourceFlags::RF_AllowDepthStencil;
-		}
-		if (desc.hasUAV) {
-			textureDesc.resourceFlags |= rhi::ResourceFlags::RF_AllowUnorderedAccess;
-		}
-
-		return textureDesc;
-	}
-
 	rhi::ResourceDesc BuildAliasBufferResourceDesc(uint64_t sizeBytes, bool unorderedAccess, rhi::HeapType heapType) {
 		auto desc = rhi::helpers::ResourceDesc::Buffer(sizeBytes);
 		desc.heapType = heapType;
@@ -241,7 +190,8 @@ namespace {
 
 
 rhi::ResourceDesc org::alias::AliasTextureResourceDesc(const TextureDescription& desc) {
-	return BuildAliasTextureResourceDesc(desc);
+	// The creation description, so a placement covers the whole allocation (every mip, slice and depth).
+	return TextureResourceDesc(desc);
 }
 rhi::ResourceDesc org::alias::AliasBufferResourceDesc(uint64_t sizeBytes, bool unorderedAccess, rhi::HeapType heapType) {
 	return BuildAliasBufferResourceDesc(sizeBytes, unorderedAccess, heapType);

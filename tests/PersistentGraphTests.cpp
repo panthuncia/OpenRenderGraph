@@ -502,6 +502,63 @@ int main() {
         CHECK(!second.entryRelease && !second.acquired && second.committedQueue == 1);
     }
     {
+        // External home states with a home that is not Common: a host keeps the texture in DepthRead (an imported depth buffer). It
+        // is written on the graphics queue and read on the compute queue. Each execution enters it from DepthRead without
+        // discarding it, and gives it back on the graphics queue in DepthRead.
+        GraphProgram program; CompileWorkspace workspace; std::atomic_bool cancelled{false};
+        auto edit = program.BeginEdit();
+        edit.SetQueues({{0,true},{0,true}});
+        auto binding = Binding(96); binding.identity = (uint64_t{1} << 32) | 96; binding.shape = {1,1,true};
+        auto state = std::make_shared<PreparedBackingState>();
+        state->graphResourceID = 1; state->resource = {96,1}; state->shape = binding.shape; state->hostOwned = true;
+        const CompileResourceState home{static_cast<uint64_t>(rhi::ResourceAccessType::Common),
+            static_cast<uint64_t>(rhi::ResourceLayout::DepthRead), static_cast<uint64_t>(rhi::ResourceSyncState::All), false};
+        state->regions = std::make_shared<const std::vector<PreparedStateRegion>>(std::vector<PreparedStateRegion>{{{0,1,0,1}, home}});
+        binding.admission = state;
+        const auto slot = edit.AddResource(binding.shape,binding);
+        CompilePass writer;
+        writer.compatibleQueueSlots = {0}; writer.preferredQueueSlot = 0;
+        edit.Declare(edit.AddPass(writer),slot,{},{static_cast<uint64_t>(rhi::ResourceAccessType::DepthReadWrite),
+            static_cast<uint64_t>(rhi::ResourceLayout::DepthReadWrite),static_cast<uint64_t>(rhi::ResourceSyncState::DepthStencil),true});
+        CompilePass reader;
+        reader.compatibleQueueSlots = {1}; reader.preferredQueueSlot = 1;
+        edit.Declare(edit.AddPass(reader),slot,{},{static_cast<uint64_t>(rhi::ResourceAccessType::ShaderResource),
+            static_cast<uint64_t>(rhi::ResourceLayout::ShaderResource),static_cast<uint64_t>(rhi::ResourceSyncState::ComputeShading),false});
+        auto selected = edit.Build(workspace,cancelled);
+        CHECK(selected && program.Install(selected));
+        const std::array<ExecutionTimelinePoint,2> queues{{{15,0},{16,0}}};
+        SynchronousAdmission admission(8);
+        admission.SetExternalHomeStates(true);
+        for (uint64_t value = 1; value <= 2; ++value) {
+            auto frame = admission.Prepare(selected,queues);
+            const auto& barriers = frame.barriers;
+            bool discarded = false, enteredFromHome = false, fromUndefined = false;
+            const auto visit = [&](const rhi::TextureBarrier& barrier) {
+                discarded = discarded || barrier.discard;
+                fromUndefined = fromUndefined || barrier.beforeLayout == rhi::ResourceLayout::Undefined;
+                enteredFromHome = enteredFromHome || (barrier.beforeLayout == rhi::ResourceLayout::DepthRead
+                    && barrier.afterLayout == rhi::ResourceLayout::DepthReadWrite);
+            };
+            for (const auto& batch : barriers.batches) {
+                for (const auto& barrier : batch.textures) visit(barrier);
+                for (const auto& barrier : batch.acquired) visit(barrier);
+                for (const auto& pass : batch.beforePass) for (const auto& barrier : pass.textures) visit(barrier);
+                for (const auto& pass : batch.afterPass) for (const auto& barrier : pass.textures) visit(barrier);
+            }
+            for (const auto& release : barriers.releases) for (const auto& barrier : release.textures) visit(barrier);
+            for (const auto& barrier : barriers.homeAcquires.textures) visit(barrier);
+            for (const auto& barrier : barriers.homeAcquires.home) visit(barrier);
+            const bool wentHome = barriers.homeAcquires.home.size() == 1
+                && barriers.homeAcquires.home.front().afterLayout == rhi::ResourceLayout::DepthRead;
+            CHECK(!discarded && !fromUndefined && enteredFromHome && wentHome);
+            const auto& graphBatches = frame.publication->executable->graph->batches;
+            GraphExecutionTimeline receipt; receipt.batches.resize(graphBatches.size());
+            for (size_t i = 0; i < graphBatches.size(); ++i)
+                receipt.batches[i].signal = {graphBatches[i].queue == 0 ? 15u : 16u, value};
+            admission.Commit(frame,receipt);
+        }
+    }
+    {
         // Host epochs: one whole-frame executable, epochs in their declared order, and
         // one executable per epoch with only its passes (and the untagged ones).
         GraphProgram program; CompileWorkspace workspace; std::atomic_bool cancelled{false};

@@ -771,6 +771,8 @@ void BufferBase::SetBacking(std::unique_ptr<GpuBufferBacking> backing, uint64_t 
             DescriptorHeapManager::GetInstance().RetireDescriptorSlots(DetachDescriptorSlotsForDeferredRelease());
         }
         DescriptorHeapManager::GetInstance().RetireBufferBacking(std::move(m_dataBuffer));
+        // A staged-upload batch recorded before this names the retired backing (StagedUploadBatch::RecordedSerial).
+        g_backingReleases.fetch_add(1u, std::memory_order_acq_rel);
     }
     m_dataBuffer = std::move(backing);
     m_bufferSize = bufferSize;

@@ -81,9 +81,10 @@ inline std::shared_ptr<const RenderFrameSnapshot> SealPersistentFrame(
         || !selected->executable->executionLayout)
         throw std::invalid_argument("Incomplete persistent frame seal");
     const auto layout = selected->executable->executionLayout;
+    const auto& barriers = admission.Barriers();
     if (invocations.size() != layout->placements.size()
-        || admission.barriers.batches.size() != selected->executable->graph->batches.size()
-        || admission.incomingWaits.size() != admission.barriers.batches.size())
+        || barriers.batches.size() != selected->executable->graph->batches.size()
+        || admission.incomingWaits.size() != barriers.batches.size())
         throw std::invalid_argument("Persistent frame seal dimensions mismatch");
     const auto& slots = selected->executable->resourceSlots;
     if (admission.backings.size() != slots.size())
@@ -119,7 +120,9 @@ inline std::shared_ptr<const RenderFrameSnapshot> SealPersistentFrame(
     result->layout = layout;
     result->passes = std::move(invocations);
     result->initialStates = admission.backings.Shared();
-    result->barrierPlan = std::make_shared<const PreparedExecutionBarrierPlan>(admission.barriers);
+    // A shared plan (a prediction's, or a ticket body's: SynchronousAdmission::CachedBody) is immutable, so it is kept, not copied.
+    result->barrierPlan = admission.sharedBarriers ? admission.sharedBarriers
+        : std::make_shared<const PreparedExecutionBarrierPlan>(admission.barriers);
     // Arm lifecycle ownership only after every fallible allocation succeeds.
     // A pending packet still owns these handles if sealing fails partway through.
     result->publication = selected;
@@ -608,6 +611,11 @@ struct FrameCommandAllocation {
     std::shared_ptr<CommandListPool> pool;
     CommandListPair pair;
     bool closed = false;
+    // Call once the list is closed. It gives up the list's allocator claim (CommandListPool's threading rule).
+    void Close() noexcept {
+        closed = true;
+        pair.EndRecording();
+    }
     void RecycleAfterCompletion() noexcept {
         if (!pool) return;
         try { pool->RecycleForNextRequest(std::move(pair)); }
@@ -704,8 +712,8 @@ struct OwnedRecordingList {
     // What the passes' commands name at record time (RecordingContext::Retain): released with the list's lease, after
     // its last submission retires.
     std::shared_ptr<RecordingRetention> retention = std::make_shared<RecordingRetention>();
-    // RecordingContext::FrameSlot for the passes of this list.
-    uint32_t frameSlot = 0;
+    // RecordingContext::Run for the passes of this list.
+    RunRef run{};
     // RenderGraph::ExternalQueueBoundary: full memory barrier before the first
     // pass / after the last pass of this command list.
     bool externalEntryBarrier = false;
@@ -785,7 +793,7 @@ inline RecordingContext MakeOwnedRecordingContext(rhi::CommandList list, const O
         : RecordingContext::FromPersistentBindings(list, recording.publication);
     if (recording.bindings && recording.publication)
         context = context.WithPersistentBindings(recording.publication);
-    context.SetFrameSlot(recording.frameSlot);
+    context.SetRun(recording.run);
     context.SetRetention(recording.retention);
     context.SetDescriptorHeaps(recording.resourceDescriptorHeap, recording.samplerDescriptorHeap);
     return context;
@@ -799,9 +807,10 @@ inline RecordingContext MakeOwnedRecordingContext(rhi::CommandList list, const O
 // It does not begin or end the list. RecordPreparedRhiExecutionBatch does that for its own lists. A late batch of an
 // external epoch records into the host's list (PreparedRhiExecutionBatch::RecordDeferred), and the host ends it.
 // a_again records a replayable recording's passes again (PreparedPass::RecordAgain). This is for a late batch of a
-// kept recording.
+// kept recording. a_atExecution: a late batch, recorded after its run's commit, whose passes may skip the run
+// (PreparedPass::SkipsAtExecution).
 inline void RecordOwnedRecordingCommands(RecordingContext& context, const OwnedRecordingList& recording, rhi::Queue queue, bool replayable,
-    bool a_again = false) {
+    bool a_again = false, bool a_atExecution = false) {
     struct TracyGpuZoneScope {
         rhi::CommandList& commands;
         bool open = false;
@@ -869,7 +878,27 @@ inline void RecordOwnedRecordingCommands(RecordingContext& context, const OwnedR
         barriers.textures = {recording.acquiredBarriers.data(), static_cast<uint32_t>(recording.acquiredBarriers.size())};
         recordBarriers("entry", firstPass, barriers);
     }
+    const auto recordPassBarriers = [&](const std::vector<PreparedBatchBarriers::BeforePass>& all, size_t passIndex, const char* where,
+        std::string_view pass) {
+        if (all.empty()) return;
+        const auto& batch = all[passIndex];
+        if (batch.textures.empty() && batch.buffers.empty()) return;
+        rhi::BarrierBatch barriers{};
+        barriers.textures = {batch.textures.data(), static_cast<uint32_t>(batch.textures.size())};
+        barriers.buffers = {batch.buffers.data(), static_cast<uint32_t>(batch.buffers.size())};
+        recordBarriers(where, pass, barriers);
+    };
     for (size_t passIndex = 0; passIndex < recording.passes.size(); ++passIndex) {
+        // Recorded at execution, a pass with nothing to do this run (PreparedPass::SkipsAtExecution) records only its barriers:
+        // the states the admission planned still change. No label, timestamps or GPU zone for it.
+        if (a_atExecution && !a_again && recording.passes[passIndex].SkipsAtExecution(context)) {
+            BT_ZONE_SCOPE("ORG.Execution.RecordOwned.Skipped");
+            const auto passLabel = recording.passes[passIndex].DebugName();
+            recordPassBarriers(recording.barriersBeforePass, passIndex, "before", passLabel);
+            recording.passes[passIndex].RecordNothing();
+            recordPassBarriers(recording.barriersAfterPass, passIndex, "after", passLabel);
+            continue;
+        }
         BT_ZONE_SCOPE("ORG.Execution.RecordOwned.Pass");
         // A capture tool's region for the pass (PIX / VK_EXT_debug_utils), opened before the pass's entry
         // barriers so that a wait on the previous pass's output shows up inside the pass that needed it.
@@ -987,7 +1016,7 @@ inline void PreparedRhiExecutionBatch::RecordDeferred(rhi::CommandList a_list) c
         owned.overflow = 0;
     }
     auto context = MakeOwnedRecordingContext(a_list, *m_deferred);
-    RecordOwnedRecordingCommands(context, *m_deferred, m_queue, false, again);
+    RecordOwnedRecordingCommands(context, *m_deferred, m_queue, false, again, true);
     // Its queries are in a_list now. Its frame slot's completion publishes them (OwnedRecordingStatistics::atCompletion).
     if (m_deferred->statistics) m_deferred->statistics->recorded.store(true, std::memory_order_release);
     if (!m_replayable && !CommitEffectsSubmitted(m_deferredSignal)) throw std::logic_error("A deferred packet's passes could not be committed as submitted");
@@ -1010,8 +1039,8 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
     {
     BT_ZONE_SCOPE("ORG.Execution.RecordOwned.Validate");
     for (const auto& recording : recordings) {
-        if ((!recording.bindings && !recording.publication) || !recording.allocation || !recording.allocation->pair.allocator
-            || !recording.allocation->pair.list || recording.passes.empty())
+        if ((!recording.bindings && !recording.publication) || !recording.allocation || !recording.allocation->pair.list
+            || recording.passes.empty())
             throw std::invalid_argument("Incomplete owned recording packet");
         if (!recording.allocation->pair.list.Get().SupportsCheckedEnd())
             throw std::invalid_argument("Backend lacks checked command list close");
@@ -1034,6 +1063,12 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
         for (const auto& pass : recording.passes) replayable &= pass.IsReplayable();
     }
     auto ownership = std::make_shared<Ownership>(Ownership{std::move(runtimeOwner), std::move(recordings)});
+    // A pool's list is begun here, on the recording thread, unless its acquirer began it already. Begin may trade the list
+    // for another idle one, so the list handles are read only after it.
+    for (const auto& recording : ownership->recordings) {
+        auto& allocation = *recording.allocation;
+        if (allocation.pool && !allocation.pair.Recording()) allocation.pool->Begin(allocation.pair);
+    }
     std::vector<rhi::CommandList> lists;
     std::vector<PreparedPass> submissionEffects;
     std::vector<std::shared_ptr<FrameCommandAllocation>> allocations;
@@ -1060,6 +1095,10 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
             rhi::SecondaryInheritance outside{};
             outside.insideRendering = false;
             outside.debugName = "ORG external epoch";
+            // The host's command buffers run it, and a replayable one runs again in later ones. Without simultaneous use a
+            // driver may chain a secondary into the buffer that executes it (AMD patches its end to jump back there): a later
+            // execution or recording then breaks the host's commands that follow the earlier one.
+            outside.simultaneousUse = true;
             if (list.BeginSecondary(outside) != rhi::Result::Ok)
                 throw std::runtime_error("Owned secondary command list could not begin");
         }
@@ -1093,7 +1132,7 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
                 + " afterTextures=" + std::to_string(afterTextures)
                 + " afterBuffers=" + std::to_string(afterBuffers) + " passes=" + names);
         }
-        recording.allocation->closed = true;
+        recording.allocation->Close();
     }
     return packet;
 }

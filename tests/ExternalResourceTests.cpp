@@ -27,6 +27,8 @@
 
 int TestFrameRetirement(rhi::Device device, rhi::Backend backend);
 int TestRuntimeRetirement(rhi::Device device);
+int TestAssignedTimelineRetirement(rhi::Device device);
+int TestStatisticsPoolRetirement(rhi::Device device);
 int TestExternalClient(rhi::Device device);
 int TestProgramVersions(rhi::Device device);
 int TestPipelineLibrary(rhi::Device device);
@@ -1503,6 +1505,8 @@ int main(int argc, char** argv) {
     if (const auto failure = TestReadbackCaptures(device.Get())) return failure;
     if (const auto failure = TestFrameRetirement(device.Get(), rhi::Backend::D3D12)) return failure;
     if (const auto failure = TestRuntimeRetirement(device.Get())) return failure;
+    if (const auto failure = TestAssignedTimelineRetirement(device.Get())) return failure;
+    if (const auto failure = TestStatisticsPoolRetirement(device.Get())) return failure;
     if (const auto failure = TestExternalClient(device.Get())) return failure;
     if (const auto failure = TestRebindingGpu(device.Get(), orgRuntime)) return failure;
 	orgRuntime.reset();

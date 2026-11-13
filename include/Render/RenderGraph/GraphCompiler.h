@@ -81,8 +81,8 @@ struct CompilePass {
     // batch boundary. This is authored preparation metadata, not worker access
     // to the mutable pass object.
     bool forceBatchIsolation = false;
-    // Recorded at execution (ExternalPassDesc::recordAtExecution): alone in its batch, which an external epoch's host records
-    // when it executes the epoch (ExternalEpochExecution), not ahead.
+    // Recorded at execution (ExternalPassDesc::recordAtExecution): in a batch of such passes alone, which an external epoch's
+    // host records when it executes the epoch (ExternalEpochExecution), not ahead.
     bool recordAtExecution = false;
     bool operator==(const CompilePass&) const = default;
 };
@@ -446,6 +446,10 @@ public:
     // Called by the ordered owner with observed GPU completion values, in the
     // same queue order as construction. Releases only fully completed bundles.
     size_t RetireCompleted(std::span<const ExecutionTimelinePoint> completed);
+    // Lowers lowest[queue] to the lowest signal any retained execution waits for on that queue, in the queue order of
+    // construction. RetireCompleted releases nothing while each queue's completed value is below its entry. False when an
+    // execution waits for a timeline that is not one of the queues', or has no batch: then nothing can be ruled out.
+    bool LowestRetainedSignals(std::span<uint64_t> lowest) const;
     // Transfers already-retired ownership so destruction may run on a
     // non-critical cleanup lane after owner-thread completion callbacks.
     std::vector<std::shared_ptr<GraphExecutionTimeline>> TakeRetiredGarbage();
