@@ -871,6 +871,8 @@ static int Run(int argc, char** argv) {
 				epochs[1].scratch = makeScratch(1, 4 * kBytes);
 				auto grown = host.BuildEpochGraph(1, "test: a larger scratch buffer");
 				REQUIRE(grown->Built() && host.AttachEpochGraph(grown).attached, "the larger graph is attached");
+				// A detached build places its transients at its first preparation after the attach.
+				if (const int failed = run()) return failed;
 				const auto stale = host.StaleAliasPlacementEpochs();
 				REQUIRE(stale.size() == 1 && stale.front() == 0, "the other epoch's placements are reported");
 				const auto builds0 = host.BuildGeneration(0);
@@ -880,6 +882,7 @@ static int Run(int argc, char** argv) {
 					if (const int failed = run()) return failed;
 				auto placed = host.BuildEpochGraph(0, "test: placed again in the grown pool");
 				REQUIRE(placed->Built() && host.AttachEpochGraph(placed).attached, "the reported epoch is built again by the application");
+				if (const int failed = run()) return failed;
 				REQUIRE(host.StaleAliasPlacementEpochs().empty(), "every placement current again");
 				for (int i = 0; i < 2; ++i)
 					if (const int failed = run()) return failed;
