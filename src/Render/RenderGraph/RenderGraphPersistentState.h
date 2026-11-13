@@ -106,22 +106,17 @@ inline std::shared_ptr<const std::vector<PreparedStateRegion>> CaptureRegions(Re
 	return regions;
 }
 
-// Exact binding for one slot from the live resource. Null when the resource has
-// no backing yet (unmaterialized) — the slot stays reserved for that frame.
-inline std::optional<persistent::BindingVersion> CaptureSlotBinding(Resource& resource, uint32_t slotIndex, CompileResourceShape shape,
-	PublicationBindingBundle::Snapshot snapshot = nullptr) {
-	if (!snapshot) { BT_ZONE_SCOPE("ORG.Persistent.CaptureSlotBinding.Snapshot"); snapshot = PublicationBindingBundle::Capture(resource); }
-	if (!snapshot || !snapshot->resource.GetHandle().valid()) return std::nullopt;
-	auto* concrete = UnwrapDynamic(&resource);
-	if (!concrete) return std::nullopt;
+// The admission state of a slot's backing, from a snapshot of `concrete`. It has no alias placement.
+inline PreparedBackingState BackingStateOf(Resource& concrete, const ResourceBindingSnapshot& snapshot, uint32_t slotIndex,
+	CompileResourceShape shape) {
 	PreparedBackingState initial;
 	initial.graphResourceID = uint64_t{slotIndex} + 1;
-	if (trace::Any()) initial.debugName = resource.GetName();
-	initial.resource = snapshot->resource.GetHandle();
+	if (trace::Any()) initial.debugName = concrete.GetName();
+	initial.resource = snapshot.resource.GetHandle();
 	initial.shape = shape;
-	initial.regions = CaptureRegions(*concrete, shape);
-	if (!snapshot->representations.empty()) {
-		for (const auto& representation : snapshot->representations) initial.deviceHandles.push_back(representation.GetHandle());
+	initial.regions = CaptureRegions(concrete, shape);
+	if (!snapshot.representations.empty()) {
+		for (const auto& representation : snapshot.representations) initial.deviceHandles.push_back(representation.GetHandle());
 		// A new representation pair starts undefined (a texture) or common (a buffer) on every device; the implicit backing's
 		// tracker describes another resource.
 		auto regions = std::make_shared<std::vector<PreparedStateRegion>>();
@@ -133,8 +128,20 @@ inline std::optional<persistent::BindingVersion> CaptureSlotBinding(Resource& re
 		initial.regions = std::move(regions);
 	}
 	rhi::ResourceDesc description{};
-	if (concrete->TryGetRHIResourceDesc(description)) initial.heapType = description.heapType;
-	initial.hostOwned = concrete->HostOwned();
+	if (concrete.TryGetRHIResourceDesc(description)) initial.heapType = description.heapType;
+	initial.hostOwned = concrete.HostOwned();
+	return initial;
+}
+
+// Exact binding for one slot from the live resource. Null when the resource has
+// no backing yet (unmaterialized) — the slot stays reserved for that frame.
+inline std::optional<persistent::BindingVersion> CaptureSlotBinding(Resource& resource, uint32_t slotIndex, CompileResourceShape shape,
+	PublicationBindingBundle::Snapshot snapshot = nullptr) {
+	if (!snapshot) { BT_ZONE_SCOPE("ORG.Persistent.CaptureSlotBinding.Snapshot"); snapshot = PublicationBindingBundle::Capture(resource); }
+	if (!snapshot || !snapshot->resource.GetHandle().valid()) return std::nullopt;
+	auto* concrete = UnwrapDynamic(&resource);
+	if (!concrete) return std::nullopt;
+	auto initial = BackingStateOf(*concrete, *snapshot, slotIndex, shape);
 	initial.aliasHeap = snapshot->aliasHeap;
 	initial.aliasHeapIdentity = snapshot->aliasHeap.get();
 	initial.aliasPoolID = snapshot->aliasPoolID;

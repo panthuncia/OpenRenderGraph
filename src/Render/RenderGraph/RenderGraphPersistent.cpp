@@ -270,15 +270,7 @@ State::SlotEntry::FrameBinding BindVersion(State::SlotEntry& entry, std::shared_
 			"slices) than the slot. Every version of a versioned resource must share its shape class");
 	State::SlotEntry::FrameBinding made;
 	made.rebinding.slot = entry.slot;
-	auto& backing = made.rebinding.backing;
-	backing.graphResourceID = uint64_t{entry.slot.index} + 1;
-	if (trace::Any()) backing.debugName = resource.GetName();
-	backing.resource = snapshot->resource.GetHandle();
-	backing.shape = entry.shape;
-	backing.regions = CaptureRegions(*concrete, entry.shape);
-	rhi::ResourceDesc description{};
-	if (concrete->TryGetRHIResourceDesc(description)) backing.heapType = description.heapType;
-	backing.hostOwned = concrete->HostOwned();
+	made.rebinding.backing = BackingStateOf(*concrete, *snapshot, entry.slot.index, entry.shape);
 	made.rebinding.recording = snapshot;
 	made.rebinding.perFrame = entry.versioned->PerFrame();
 	auto owner = std::make_shared<const std::pair<std::shared_ptr<const ResourceVersion>, PublicationBindingBundle::Snapshot>>(version, snapshot);
@@ -1375,6 +1367,10 @@ RenderGraph::PersistentExecution RenderGraph::PreparePersistentExecution(rhi::De
 				entry.member = version->resource;
 				entry.resource = entry.member.get();
 			}
+			// A pass on another device binds the version's representation there. A per-frame resource's versions (swapchain
+			// images) belong to the host and get none, as before.
+			if (entry.multiDevice && !entry.versioned->PerFrame() && state.ensureRepresentations)
+				state.ensureRepresentations(*version->resource);
 			auto binding = BindVersion(entry, std::move(version));
 			rebindings.push_back(std::move(binding.rebinding));
 			overlay.emplace_back(index, std::move(binding.binding));

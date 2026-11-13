@@ -290,6 +290,11 @@ What stays separate:
 -   **Re-import and rebuild**, for a change of shape or format: a new resource and a structural build.
 -   **Transient aliasing**: alias pools place transient resources; their placements are planned by structural builds.
 -   **Other resolvers** with several members keep resolver groups, whose membership changes are binding edits.
+-   **Rebind slots** (`IDynamicDeclaredResources::RebindsConcreteResources`) and **job graph parameters**
+    (`GraphDesc::Parameter`). Pointing one at another resource may make two slots share a backing, or stop sharing one,
+    which changes the schedule. A frame rebinding may not do that, so these stay binding edits.
+-   **A version's backing is the versioned slot's alone.** A frame rebinding may not use a backing another slot of the
+    graph binds, so a version must not also be declared directly or through another resolver.
 
 `DynamicResource`, `DynamicGloballyIndexedResource` and in-place `BufferBase::SetBacking` still work for existing users, but are
 deprecated for graph resources.
