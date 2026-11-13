@@ -673,6 +673,20 @@ private:
 	void ResetForFrame();
 	void ResetForRebuild();
 	void Setup();
+	// Builds off the owner thread (GraphHost::BuildEpochGraph). Setup leaves out the steps that touch objects other graphs share
+	// while those graphs run:
+	// - sizing the shared statistics query heap,
+	// - setting up the named passes, whose pass objects every graph of the runtime shares (the host's upload pass).
+	// FinishSharedSetup runs them later, on the owner thread, while nothing else uses those objects. Call before Setup.
+	void DeferSharedSetup(std::vector<std::string> sharedPasses) {
+		m_sharedSetupDeferred = true;
+		m_sharedSetupPasses = std::move(sharedPasses);
+	}
+	void FinishSharedSetup();
+	// The work the first preparation would otherwise do inline: lower every pass, request its pipelines and wait for them, and
+	// build and install the first publication (schedule and alias placement). After Setup, before the first preparation. Any
+	// thread that owns the graph alone. A graph already prepared is left as it is.
+	void PrepareFirstPersistentBuild();
 	// How the next execution runs (RenderGraphPersistentState.h, PersistentExecution::Options). Plain executions use the
 	// defaults; a ticket's set its ticket.
 	struct PersistentExecutionOptions {
@@ -707,6 +721,8 @@ private:
 			: type(PassType::Render), pass(std::move(rp)) {}
 
 	};
+	// Sets up one render pass: its runtime services, its registry view, then its own Setup.
+	void SetupRenderPass(AnyPassAndResources& pass);
 
 	
 
@@ -844,6 +860,8 @@ private:
 	std::vector<std::pair<std::string, std::string>> m_structuralExplicitAfterByName;
 	std::shared_ptr<Runtime> m_runtime;
 	bool m_drivesFrameServices = true;  // SetDrivesFrameServices
+	bool m_sharedSetupDeferred = false;  // DeferSharedSetup, until FinishSharedSetup
+	std::vector<std::string> m_sharedSetupPasses;
 	DeviceRegistry m_backendDevices;
 	std::array<uint8_t, static_cast<size_t>(QueueKind::Count)> m_minAutomaticSchedulingQueuesByKind = { 1, 1, 1 };
 	std::unordered_map<std::string, std::shared_ptr<RenderPass>> renderPassesByName;
