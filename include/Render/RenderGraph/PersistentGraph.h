@@ -472,6 +472,9 @@ struct FrameAdmission {
     bool closed = false;
     // The barrier plan came from the admission's cache rather than the ledgers.
     bool cachedPlan = false;
+    // The aliased backings the alias ledger made enter from Undefined (AliasAccessAdmissionLedger::ApplyInitialStates) when it
+    // was admitted. ORG_VALIDATE_ALIAS_ADMISSION=1 checks at commit that no other commit since added one.
+    std::vector<rhi::ResourceHandle> aliasActivations;
     // Admitted for a body recorded already (SynchronousAdmission::PrepareAtSubmission): the plan has the entry barriers, releases
     // and the ledger's commits, not the body's barriers.
     bool entryOnly = false;

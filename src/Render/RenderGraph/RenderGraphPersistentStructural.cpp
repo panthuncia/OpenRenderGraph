@@ -768,14 +768,17 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		}
 		return out;
 	}();
-	// Each epoch's graph packs its transients from offset 0, so two epochs placed in one pool overlap in memory. That is safe only
-	// if their GPU work never interleaves, which nothing here can check: an epoch's runs are submitted on their own timeline (in
-	// the host's stream or on the graph's queues, prepared ahead), and the alias ledger adds no wait on the same queue. So each
-	// epoch gets pools of its own: transients alias only within their epoch's graph, whose order the planner sets.
-	// ORG_PERSISTENT_ALIAS_SHARE_EPOCHS=1 shares the pools across epochs again (the old layout, for VRAM comparisons).
+	// Each epoch's graph packs its transients from offset 0, so the epochs sharing an arena overlap in memory. The alias ledger
+	// orders that: a run whose transient overlaps another epoch's committed use enters it from Undefined, after that use (a wait
+	// on another timeline, sync All on its own queue). ORG_VALIDATE_ALIAS_ADMISSION=1 checks at each commit that the ledger still
+	// agrees with what the run was admitted with.
+	// A transient holds nothing from one run to the next, and with shared pools its memory holds another epoch's data in between.
+	// A pass that reads texels no pass wrote in that run shows the other epoch's data. CS's Screen Space GI did (its radiance
+	// prefilter read past the frame), which gave the green streaks once blamed on sharing.
+	// ORG_PERSISTENT_ALIAS_SHARE_EPOCHS=0 gives each epoch pools of its own (more memory; for A/B runs).
 	static const bool shareAcrossEpochs = [] {
 		const char* value = std::getenv("ORG_PERSISTENT_ALIAS_SHARE_EPOCHS");
-		return value && value[0] == '1';
+		return !(value && value[0] == '0');
 	}();
 	const uint64_t aliasDomain = shareAcrossEpochs ? 0 : uint64_t{m_passEpochFilter} + 1;
 	size_t excludedCount = 0;
