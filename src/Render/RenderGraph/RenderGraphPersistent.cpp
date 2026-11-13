@@ -25,13 +25,15 @@ State::SlotEntry& ClaimEntry(State& state, persistent::ResourceSlotId slot) {
 
 // Finds or creates the directory slot for a scheduling identity. Direct slots
 // are shared by every pass declaring the resource directly; group member slots
-// are private to their group (see ReserveGroupMember).
+// are private to their group (see ReserveGroupMember). A versioned resource has
+// one slot whatever version a declaration names.
 uint32_t DirectEntry(State& state, persistent::GraphEditTransaction& edit, uint64_t resourceID, Resource* resource,
-	CompileResourceShape shape, bool swapchain, std::shared_ptr<Resource> owner) {
+	CompileResourceShape shape, std::shared_ptr<const IVersionedResource> versioned, std::shared_ptr<Resource> owner) {
 	auto& indices = state.entriesByResourceID[resourceID];
 	for (const auto index : indices) {
 		auto& entry = state.entries[index];
-		if (entry.direct && entry.resource == resource && entry.shape == shape) {
+		const bool same = versioned ? entry.versioned && entry.versioned->Key() == versioned->Key() : entry.resource == resource;
+		if (entry.direct && same && entry.shape == shape) {
 			if (owner && !entry.member) entry.member = std::move(owner);
 			return index;
 		}
@@ -43,7 +45,7 @@ uint32_t DirectEntry(State& state, persistent::GraphEditTransaction& edit, uint6
 	entry.member = std::move(owner);
 	entry.resourceID = resourceID;
 	entry.shape = shape;
-	entry.swapchain = swapchain;
+	entry.versioned = std::move(versioned);
 	entry.slot = slot;
 	indices.push_back(slot.index);
 	return slot.index;
@@ -51,7 +53,7 @@ uint32_t DirectEntry(State& state, persistent::GraphEditTransaction& edit, uint6
 
 // A direct slot is retiring: its resource's pin can go once nothing executing binds it (State::retiredPins).
 void NoteRetiredDirectResource(State& state, const State::SlotEntry& entry) {
-	if (!entry.resource || entry.swapchain) return;
+	if (!entry.resource || entry.versioned) return;
 	auto* concrete = UnwrapDynamic(entry.resource);
 	state.retiredPins.push_back({entry.resource, entry.resource->GetGlobalResourceID(),
 		concrete ? concrete->GetGlobalResourceID() : 0u});
@@ -73,7 +75,7 @@ void UnbindSlot(State& state, persistent::GraphEditTransaction& edit, const Stat
 }
 bool BindEntryOnly(State& state, persistent::GraphEditTransaction& edit, uint32_t index, uint64_t* identity = nullptr) {
 	auto& entry = state.entries[index];
-	if (entry.swapchain || !entry.resource) return false;
+	if (entry.versioned || !entry.resource) return false;
 	if (entry.multiDevice && state.ensureRepresentations) state.ensureRepresentations(*entry.resource);
 	state.deferredSharing.erase(entry.slot.index); // superseded
 	auto binding = CaptureSlotBinding(*entry.resource, entry.slot.index, entry.shape);
@@ -115,7 +117,7 @@ bool BindEntry(State& state, persistent::GraphEditTransaction& edit, uint32_t in
 	for (const auto sibling : edit.SlotsSharingIdentity(identity)) {
 		if (sibling == state.entries[index].slot.index || sibling >= state.entries.size()) continue;
 		const auto& other = state.entries[sibling];
-		if (other.retired || !other.isBound || other.swapchain || !other.resource || other.slot.index != sibling) continue;
+		if (other.retired || !other.isBound || other.versioned || !other.resource || other.slot.index != sibling) continue;
 		basic_telemetry::AddCounter("ORG.Persistent.SharedBackingRecaptures");
 		BindEntryOnly(state, edit, sibling);
 	}
@@ -239,6 +241,55 @@ bool DeclarationIsAhead(const State::ResolverGroup& group, const std::vector<std
 	return std::any_of(members.begin(), members.end(), [&](const auto& member) { return member.second && !MemberPosition(group, member.first); });
 }
 
+// The pass's slot for the versioned resource `key` (IVersionedResource::Key), or UINT32_MAX.
+uint32_t VersionedEntry(const State& state, const State::MainPass& main, const void* key) {
+	for (const auto index : main.directEntries) {
+		const auto& entry = state.entries[index];
+		if (entry.versioned && entry.versioned->Key() == key) return index;
+	}
+	return UINT32_MAX;
+}
+
+// A versioned slot's binding of `version`. It has two parts:
+// - the frame rebinding that admission takes, so barriers and state tracking follow the version's backing,
+// - the binding that the overlay gives preparation and recording.
+// The binding owns the version. So the version and its backing live while a preparation, a recording or an execution
+// holds the bindings. The slot keeps the binding for the next preparation that selects the same version, unless the
+// resource is per frame.
+State::SlotEntry::FrameBinding BindVersion(State::SlotEntry& entry, std::shared_ptr<const ResourceVersion> version) {
+	auto& resource = *version->resource;
+	const auto key = RotationKeyOfResource(resource);
+	if (entry.frameBinding && entry.frameBinding->version == version && entry.frameBinding->key == key) return *entry.frameBinding;
+	auto* concrete = UnwrapDynamic(&resource);
+	auto snapshot = concrete ? PublicationBindingBundle::Capture(resource) : nullptr;
+	if (!snapshot || !snapshot->resource.GetHandle().valid())
+		throw std::runtime_error("Persistent slot of '" + resource.GetName() + "' selected a version with no backing. A version "
+			"must be materialized before a preparation binds it");
+	if (ShapeOf(resource) != entry.shape)
+		throw std::logic_error("Persistent slot of '" + resource.GetName() + "' selected a version of another shape (mips or "
+			"slices) than the slot. Every version of a versioned resource must share its shape class");
+	State::SlotEntry::FrameBinding made;
+	made.rebinding.slot = entry.slot;
+	auto& backing = made.rebinding.backing;
+	backing.graphResourceID = uint64_t{entry.slot.index} + 1;
+	if (trace::Any()) backing.debugName = resource.GetName();
+	backing.resource = snapshot->resource.GetHandle();
+	backing.shape = entry.shape;
+	backing.regions = CaptureRegions(*concrete, entry.shape);
+	rhi::ResourceDesc description{};
+	if (concrete->TryGetRHIResourceDesc(description)) backing.heapType = description.heapType;
+	backing.hostOwned = concrete->HostOwned();
+	made.rebinding.recording = snapshot;
+	made.rebinding.perFrame = entry.versioned->PerFrame();
+	auto owner = std::make_shared<const std::pair<std::shared_ptr<const ResourceVersion>, PublicationBindingBundle::Snapshot>>(version, snapshot);
+	made.binding = {snapshot->resource, std::move(owner), snapshot->views, snapshot->descriptorOwner, nullptr};
+	made.version = std::move(version);
+	made.key = key;
+	if (entry.versioned->PerFrame()) entry.frameBinding.reset();
+	else entry.frameBinding = made;
+	return made;
+}
+
 } // namespace
 
 // Installs (or reinstalls) a main pass declaration into the transaction.
@@ -285,8 +336,7 @@ void persistent_impl::InstallMainPass(RenderGraph& graph, State& state, persiste
 	main.slotsDirty = true;
 	std::unordered_map<uint64_t, persistent::BindingToken> tokens;
 	auto declare = [&](const LoweredUse& use, bool entry) {
-		const bool swapchain = graph.IsSwapchainResource(use.resource);
-		const auto index = DirectEntry(state, edit, use.resourceID, use.resource, ShapeOf(*use.resource), swapchain, use.owner);
+		const auto index = DirectEntry(state, edit, use.resourceID, use.resource, ShapeOf(*use.resource), use.versioned, use.owner);
 		auto& slotEntry = state.entries[index];
 		if (std::find(slotEntry.subscribers.begin(), slotEntry.subscribers.end(), mainIndex) == slotEntry.subscribers.end())
 			slotEntry.subscribers.push_back(mainIndex);
@@ -382,6 +432,7 @@ void persistent_impl::InstallMainPass(RenderGraph& graph, State& state, persiste
                 if (const auto position = MemberPosition(group, use.binding.globalResourceID)) index = group.memberEntries[*position];
                 break;
             }
+            if (use.resolverIdentity && index == UINT32_MAX) index = VersionedEntry(state, main, use.resolverIdentity.get());
             main.resolverUseEntries.push_back(index);
             if (use.requiredViews.empty()) continue;
             // A direct use, or a resolver lowered direct (mixed member shapes): its members are direct entries. A resource
@@ -581,6 +632,7 @@ const char* persistent_impl::RemapDeclaration(State& state, const persistent::Se
 			index = group.memberEntries[*position];
 			break;
 		}
+		if (use.resolverIdentity && index == UINT32_MAX) index = VersionedEntry(state, main, use.resolverIdentity.get());
 		resolverEntries.push_back(index);
 		if (use.requiredViews.empty()) continue;
 		const auto names = [&](uint32_t candidate) {
@@ -612,7 +664,7 @@ const char* persistent_impl::RemapDeclaration(State& state, const persistent::Se
 	return nullptr;
 }
 
-void persistent_impl::UseRebindSlots(const RenderGraph& graph, State::MainPass& main, LoweredPass& lowered,
+void persistent_impl::UseRebindSlots(State::MainPass& main, LoweredPass& lowered,
 	const IDynamicDeclaredResources* dynamic) {
 	if (!dynamic || !dynamic->RebindsConcreteResources()) return;
 	if (dynamic->PreparesOnlyDeclaredWork())
@@ -621,7 +673,7 @@ void persistent_impl::UseRebindSlots(const RenderGraph& graph, State::MainPass& 
 	lowered.rebindable = true;
 	std::vector<Resource*> places; // Distinct resources, in the order the lowering names them.
 	const auto rebind = [&](LoweredUse& use) {
-		if (!use.resource || use.owner || graph.IsSwapchainResource(use.resource)) return;
+		if (!use.resource || use.owner || use.versioned) return;
 		if (dynamic_cast<DynamicResource*>(use.resource) || dynamic_cast<DynamicGloballyIndexedResource*>(use.resource)) return;
 		auto concrete = use.resource->weak_from_this().lock();
 		if (!concrete) return; // Not owned by a shared_ptr: nothing a slot could hold.
@@ -788,7 +840,7 @@ void RenderGraph::BootstrapPersistentGraph() {
 					if (dynamic && dynamic->DeclaredResourcesChanged() && !dynamic->DeclarationsProvidedByImmediateCommands())
 						RedeclarePass(value, any.type);
 					auto lowered = lowering::LowerPass(*this, _registry, m_queueRegistry, primaryBackend, value, any.type);
-					UseRebindSlots(*this, main, lowered, dynamic);
+					UseRebindSlots(main, lowered, dynamic);
 					RequestPassPipelines(value.resources, lowered.device, main.name);
 					InstallMainPass(*this, state, edit, main, std::move(lowered), mainIndex, false);
 				}
@@ -825,7 +877,7 @@ void RenderGraph::BootstrapPersistentGraph() {
 		basic_telemetry::AddCounter("ORG.Persistent.StructuralBuilds");
 		size_t unbound = 0; std::string unboundNames;
 		for (const auto& entry : state.entries) {
-			if (!entry.resource || entry.swapchain || entry.isBound) continue;
+			if (!entry.resource || entry.versioned || entry.isBound) continue;
 			if (unbound++ < 8) unboundNames += (unboundNames.empty() ? "" : ", ") + entry.resource->GetName();
 		}
 		if (unbound) spdlog::warn("Persistent graph bootstrap left {} declared slots unbound (first: {})", unbound, unboundNames);
@@ -988,7 +1040,7 @@ void RenderGraph::BindPersistentFrame(bool ticket, bool bootstrap) {
 					}
 					main.awaitingPipelines = false;
 					// A rebindable pass's places now hold what it just declared; the backing poll below rebinds them.
-					UseRebindSlots(*this, main, lowered, dynamic);
+					UseRebindSlots(main, lowered, dynamic);
 					// Membership-only change: the same structure under a layout with the same content. The installed executable's
 					// view and binding tokens are per (use, view), which an equal layout keeps. So the pass takes the new layout
 					// and bindings without a build; their tokens name the new layout. For a rebindable pass, the content may
@@ -1113,7 +1165,7 @@ void RenderGraph::BindPersistentFrame(bool ticket, bool bootstrap) {
 			BT_ZONE_SCOPE("ORG.Persistent.PollBackings");
 			for (uint32_t index = 0; index < state.entries.size(); ++index) {
 				auto& entry = state.entries[index];
-				if (!entry.resource || entry.swapchain) continue;
+				if (!entry.resource || entry.versioned) continue;
 				const auto key = RotationKeyOf(entry);
 				if (entry.isBound && key == entry.bound) continue;
 				if (!entry.isBound && !key.concreteID) continue;
@@ -1293,39 +1345,63 @@ RenderGraph::PersistentExecution RenderGraph::PreparePersistentExecution(rhi::De
 		.admissionData = m_asyncUpdateHostData ? m_asyncUpdateHostData.get() : hostData,
 		.frameData = m_asyncUpdateHostData,
 	};
-	// Swapchain slots are rebound per frame from the wrapper's current backing.
-	std::vector<persistent::FrameRebinding> rebindings;
-	std::vector<FrozenExecutionBindings::ResourceBinding> overlay;
-	for (const auto& entry : state.entries) {
-		if (!entry.swapchain || !entry.resource) continue;
-		auto* concrete = UnwrapDynamic(entry.resource);
-		if (!concrete) throw std::runtime_error("Persistent frame has no swapchain backing");
-		auto snapshot = PublicationBindingBundle::Capture(*entry.resource);
-		if (!snapshot) throw std::runtime_error("Persistent frame could not capture the swapchain backing");
-		persistent::FrameRebinding rebinding;
-		rebinding.slot = entry.slot;
-		rebinding.backing.graphResourceID = uint64_t{entry.slot.index} + 1;
-		if (trace::Any()) rebinding.backing.debugName = entry.resource->GetName();
-		rebinding.backing.resource = snapshot->resource.GetHandle();
-		rebinding.backing.shape = entry.shape;
-		rebinding.backing.regions = CaptureRegions(*concrete, entry.shape);
-		rhi::ResourceDesc description{};
-		if (concrete->TryGetRHIResourceDesc(description)) rebinding.backing.heapType = description.heapType;
-		rebinding.backing.hostOwned = concrete->HostOwned();
-		rebinding.recording = snapshot;
-		if (overlay.empty()) overlay = state.bindings->Resources();
-		overlay[entry.slot.index] = {snapshot->resource, snapshot->allocationOwner, snapshot->views, snapshot->descriptorOwner, nullptr};
-		rebindings.push_back(std::move(rebinding));
-	}
-	if (!overlay.empty()) preparation.bindings = FrozenExecutionBindings::Sparse(std::move(overlay));
 	// The epoch's own executable when the program has epochs; an epoch with none of its
 	// passes has no main segment at all (its uploads still run).
 	std::shared_ptr<const persistent::SelectedPublication> executing = selected;
 	if (m_persistentEpoch != persistent::AllEpochs && selected->HasEpochs()) executing = selected->ForEpoch(m_persistentEpoch);
+	// Versioned slots, the swapchain among them. No publication binds them. Each preparation binds the version it selects:
+	// the one its host data's revision names (IResourceVersions), or else the current one. Admission takes that version as a
+	// frame rebinding. Preparation and recording take it through an overlay of the bindings.
+	std::vector<persistent::FrameRebinding> rebindings;
+	bool perFrame = false;
+	if (executing) {
+		BT_ZONE_SCOPE("ORG.Persistent.BindVersions");
+		const auto& compiled = executing->executable->resourceIndexBySlot;
+		std::vector<std::pair<uint32_t, FrozenExecutionBindings::ResourceBinding>> overlay;
+		for (auto& entry : state.entries) {
+			if (!entry.versioned) continue;
+			const auto index = entry.slot.index;
+			// Only the slots this execution compiled. A slot that a pending structural build added is not compiled yet.
+			if (index >= selected->bindings.Size() || index >= compiled.size() || compiled[index] == UINT32_MAX) continue;
+			auto version = entry.versioned->SelectVersion(m_resolverCaptureContext.get());
+			if (!version || !version->resource)
+				throw std::runtime_error("Persistent slot of '" + (entry.resource ? entry.resource->GetName() : std::string("?"))
+					+ "' has no version to bind");
+			// A versioned resource's slot names the version it binds now, so a pass that looks the version up by its own ID finds
+			// the slot. The swapchain's slot names its wrapper, which never changes.
+			if (entry.member && entry.member != version->resource) {
+				QueueSlotPatchIDs(state, entry, {entry.member->GetGlobalResourceID(), 0, 0}, false);
+				QueueSlotPatchIDs(state, entry, {version->resource->GetGlobalResourceID(), 0, 0}, true);
+				entry.member = version->resource;
+				entry.resource = entry.member.get();
+			}
+			auto binding = BindVersion(entry, std::move(version));
+			rebindings.push_back(std::move(binding.rebinding));
+			overlay.emplace_back(index, std::move(binding.binding));
+			perFrame = perFrame || entry.versioned->PerFrame();
+		}
+		if (!overlay.empty()) {
+			auto& last = state.versionedOverlay;
+			bool same = !perFrame && last.base == state.bindings && last.bound.size() == overlay.size();
+			for (size_t i = 0; same && i < overlay.size(); ++i)
+				same = last.bound[i].first == overlay[i].first && last.bound[i].second == overlay[i].second.owner.get();
+			if (same) {
+				preparation.bindings = last.bindings;
+			} else {
+				std::vector<std::pair<uint32_t, const void*>> bound;
+				bound.reserve(overlay.size());
+				for (const auto& [slot, binding] : overlay) bound.emplace_back(slot, binding.owner.get());
+				preparation.bindings = FrozenExecutionBindings::Overlay(state.bindings, std::move(overlay));
+				if (perFrame) last = {};
+				else last = {state.bindings, preparation.bindings, std::move(bound)};
+			}
+		}
+	}
 	PersistentExecution::PreparedSegment main;
 	main.label = "Main";
 	main.publication = executing;
 	main.rebindings = std::move(rebindings);
+	main.perFrame = perFrame;
 	main.bindings = preparation.bindings;
 	main.invocations.resize(selected->logical->passSlots.size());
 	{
@@ -1356,7 +1432,7 @@ RenderGraph::PersistentExecution RenderGraph::PreparePersistentExecution(rhi::De
 				const auto index = a_pass.resolverUseEntries[u];
 				if (index == UINT32_MAX) continue;
 				const auto& entry = state.entries[index];
-				if (!entry.resource || !entry.isBound || entry.slot.index >= selected->bindings.Size()) continue;
+				if (!entry.resource || (!entry.isBound && !entry.versioned) || entry.slot.index >= selected->bindings.Size()) continue;
 				a_slots.emplace_back(uses[u].binding.registryResourceID, entry.slot.index);
 				a_slots.emplace_back(uses[u].binding.globalResourceID, entry.slot.index);
 			}
@@ -1370,7 +1446,7 @@ RenderGraph::PersistentExecution RenderGraph::PreparePersistentExecution(rhi::De
 				auto slots = std::make_shared<FramePreparationContext::ResourceSlots>();
 				auto expose = [&](uint32_t entryIndex) {
 					const auto& entry = state.entries[entryIndex];
-					if (!entry.resource || (!entry.isBound && !entry.swapchain)) return;
+					if (!entry.resource || (!entry.isBound && !entry.versioned)) return;
 					const auto slot = entry.slot.index;
 					if (slot >= selected->bindings.Size()) return; // reserved by a pending structural build
 					slots->emplace_back(entry.resourceID, slot);
@@ -1435,29 +1511,47 @@ RenderGraph::PersistentExecution RenderGraph::PreparePersistentExecution(rhi::De
 			passPreparation.preparedBindings = pass.preparedBindings;
 			passPreparation.backendInstance = pass.device;
 			if (const auto* entry = m_backendDevices.Find(pass.device)) passPreparation.device = entry->device;
-            passPreparation.resolveDeclaredView = [&pass, selected](uint32_t use, uint32_t view) {
-                const auto slot = selected->Resolve(pass.declaredViews.at(use).at(view));
+            // A declared use of a slot the publication leaves unbound (a versioned slot) resolves through this preparation's
+            // bindings, which hold the version it binds.
+            passPreparation.resolveDeclaredView = [&pass, selected, bindings = passPreparation.bindings](uint32_t use, uint32_t view) {
+                const auto& token = pass.declaredViews.at(use).at(view);
+                const auto resource = selected->SlotOf(token);
+                const auto* version = selected->bindings.TryAt(resource.index);
+                const auto slot = version && !version->bound
+                    ? bindings->Views(PreparedResourceReference{resource.index}).Resolve(selected->RequestOf(token))
+                    : selected->Resolve(token);
                 return pass.device == BackendInstanceId::Primary ? slot
                     : DescriptorHeapManager::GetInstance().TranslateDescriptorSlot(slot, pass.device);
             };
-            passPreparation.resolveDeclaredResource = [&pass, selected](uint32_t use) {
-                return selected->ResolveNative(pass.declaredBindings.at(use));
+            passPreparation.resolveDeclaredResource = [&pass, selected, bindings = passPreparation.bindings](uint32_t use) {
+                const auto& token = pass.declaredBindings.at(use);
+                const auto resource = selected->SlotOf(token);
+                const auto* version = selected->bindings.TryAt(resource.index);
+                return version && !version->bound ? bindings->Resolve(PreparedResourceReference{resource.index}) : selected->ResolveNative(token);
             };
-            // A name declared through a resolver group: its first member bound this frame, in capture order.
+            // A name declared through a resolver: a group's first member bound this frame, in capture order, or the version of a
+            // versioned resource bound this frame.
             passPreparation.resolveResolverView = [&pass, &state, bindings = passPreparation.bindings](
                 uint32_t resolverGroup, BindlessViewRequest request) -> rhi::DescriptorSlot {
                 if (!pass.preparedResourceUses || resolverGroup >= pass.preparedResourceUses->resolverViews.size() || !bindings) return {};
                 const auto& identity = pass.preparedResourceUses->resolverViews[resolverGroup].identity;
+                const auto translate = [&](rhi::DescriptorSlot slot) {
+                    return pass.device == BackendInstanceId::Primary ? slot
+                        : DescriptorHeapManager::GetInstance().TranslateDescriptorSlot(slot, pass.device);
+                };
                 for (const auto groupIndex : pass.groups) {
                     const auto& group = state.groups[groupIndex];
                     if (group.key != identity) continue;
                     for (const auto entryIndex : group.memberEntries) {
                         const auto& entry = state.entries[entryIndex];
-                        if (!entry.resource || !entry.isBound || entry.slot.index >= bindings->Resources().size()) continue;
-                        const auto slot = bindings->Views(PreparedResourceReference{entry.slot.index}).Resolve(request);
-                        return pass.device == BackendInstanceId::Primary ? slot
-                            : DescriptorHeapManager::GetInstance().TranslateDescriptorSlot(slot, pass.device);
+                        if (!entry.resource || !entry.isBound || entry.slot.index >= bindings->Size()) continue;
+                        return translate(bindings->Views(PreparedResourceReference{entry.slot.index}).Resolve(request));
                     }
+                }
+                if (const auto entryIndex = VersionedEntry(state, pass, identity.get()); entryIndex != UINT32_MAX) {
+                    const auto& entry = state.entries[entryIndex];
+                    if (entry.slot.index < bindings->Size())
+                        return translate(bindings->Views(PreparedResourceReference{entry.slot.index}).Resolve(request));
                 }
                 return {};
             };

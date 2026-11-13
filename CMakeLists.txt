@@ -120,6 +120,7 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/FrameArena.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/StagedUploadBatch.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/Buffers/LateBackings.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/VersionedResource.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/PreparedTablePublisher.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/DeclaredTableLayout.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/ResourceUseDeclaration.h"

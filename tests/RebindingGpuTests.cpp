@@ -22,7 +22,10 @@
 #include "Render/PassBuilders.h"
 #include "RenderPasses/Base/TypedRenderGraphPass.h"
 #include "Resources/Buffers/Buffer.h"
+#include "Resources/Buffers/VersionedBuffer.h"
 #include "Resources/DynamicResource.h"
+#include "Resources/PixelBuffer.h"
+#include "Resources/VersionedTexture.h"
 #include "Render/OwnedDescriptorBinding.h"
 #include "Render/PublicationBindingBundle.h"
 #include "Managers/Singletons/DescriptorHeapManager.h"
@@ -676,6 +679,129 @@ int RunRemapScenario(rhi::Device device, const std::shared_ptr<org::Runtime>& ru
     return 0;
 }
 
+// Versioned resources: a copy from a versioned buffer into a readback, and a versioned texture filled from a buffer and
+// copied back. Every frame publishes a new version of each. A preparation binds the current version through the overlay,
+// so the executable never changes, and each frame copies its own version.
+class VersionedBufferCopyPass final : public org::TypedRenderGraphPass<VersionedBufferCopyPass, org::EmptyPassFrameData, CopyBindings> {
+public:
+    VersionedBufferCopyPass(std::shared_ptr<const org::VersionedBuffer> source, std::shared_ptr<org::Resource> destination)
+        : m_source(std::move(source)), m_destination(std::move(destination)) {}
+    CopyBindings Declare(org::PassBuilder& builder) {
+        builder.PreferQueue(org::QueueKind::Graphics);
+        return {builder.CopySource(*m_source), builder.CopyDestination(m_destination)};
+    }
+    static void Record(const CopyBindings& bindings, org::PassRecordContext& recording) {
+        CopyPass::Record(bindings, recording);
+    }
+private:
+    std::shared_ptr<const org::VersionedBuffer> m_source;
+    std::shared_ptr<org::Resource> m_destination;
+};
+
+// A row of kCount 32-bit texels: one 256-byte row, which meets D3D12's row pitch alignment.
+rhi::BufferTextureCopyFootprint RowCopy(rhi::ResourceHandle texture, rhi::ResourceHandle buffer) {
+    rhi::BufferTextureCopyFootprint copy{};
+    copy.texture = texture;
+    copy.buffer = buffer;
+    copy.mip = 0;
+    copy.arraySlice = 0;
+    copy.footprint = {0, static_cast<uint32_t>(kBytes), kCount, 1, 1};
+    return copy;
+}
+
+struct TextureCopyBindings { org::ResourceBindingToken buffer, texture; bool fill = false; };
+// Copies a buffer into the versioned texture (fill), or the texture into a buffer (read back).
+class VersionedTextureCopyPass final
+    : public org::TypedRenderGraphPass<VersionedTextureCopyPass, org::EmptyPassFrameData, TextureCopyBindings> {
+public:
+    VersionedTextureCopyPass(std::shared_ptr<const org::VersionedTexture> texture, std::shared_ptr<org::Resource> buffer, bool fill)
+        : m_texture(std::move(texture)), m_buffer(std::move(buffer)), m_fill(fill) {}
+    TextureCopyBindings Declare(org::PassBuilder& builder) {
+        builder.PreferQueue(org::QueueKind::Graphics);
+        if (m_fill) return {builder.CopySource(m_buffer), builder.CopyDestination(*m_texture).Resource(), true};
+        return {builder.CopyDestination(m_buffer), builder.CopySource(*m_texture), false};
+    }
+    static void Record(const TextureCopyBindings& bindings, org::PassRecordContext& recording) {
+        const auto copy = RowCopy(recording.Resolve(bindings.texture).GetHandle(), recording.Resolve(bindings.buffer).GetHandle());
+        if (bindings.fill) recording.Commands().CopyBufferToTexture(copy);
+        else recording.Commands().CopyTextureToBuffer(copy);
+    }
+private:
+    std::shared_ptr<const org::VersionedTexture> m_texture;
+    std::shared_ptr<org::Resource> m_buffer;
+    bool m_fill = false;
+};
+
+class VersionedExtension final : public org::RenderGraph::IRenderGraphExtension {
+public:
+    explicit VersionedExtension(std::vector<std::pair<const char*, std::shared_ptr<org::RenderPass>>> passes) : m_passes(std::move(passes)) {}
+    void GatherStructuralPasses(org::RenderGraph&, std::vector<org::RenderGraph::ExternalPassDesc>& out) override {
+        for (const auto& [name, pass] : m_passes)
+            out.push_back(org::RenderGraph::ExternalPassDesc::Copy(name, pass).PreferQueue(org::QueueKind::Graphics));
+    }
+private:
+    std::vector<std::pair<const char*, std::shared_ptr<org::RenderPass>>> m_passes;
+};
+
+int RunVersionedScenario(rhi::Device device, const std::shared_ptr<org::Runtime>& runtime) {
+    const auto valueOf = [](uint32_t frame) { return 0x9100u + frame; };
+    const auto makeSource = [](uint32_t value) {
+        auto buffer = org::Buffer::CreateShared(rhi::HeapType::Upload, kBytes);
+        buffer->SetName("versioned.source");
+        ENSURE(Write(*buffer, value));
+        return buffer;
+    };
+    org::TextureDescription description{};
+    description.imageDimensions = {{kCount, 1, 0, 0}};
+    description.format = rhi::Format::R32_UInt;
+    description.channels = 1;
+    std::weak_ptr<const org::BufferVersion> firstVersion;
+    {
+        auto source = org::VersionedBuffer::Create(makeSource(valueOf(0)));
+        firstVersion = source->Current();
+        auto readback = org::Buffer::CreateShared(rhi::HeapType::Readback, kBytes);
+        auto texture = org::VersionedTexture::Create(org::PixelBuffer::CreateShared(description));
+        auto upload = org::Buffer::CreateShared(rhi::HeapType::Upload, kBytes);
+        auto textureReadback = org::Buffer::CreateShared(rhi::HeapType::Readback, kBytes);
+        readback->SetName("versioned.readback"); upload->SetName("versioned.upload"); textureReadback->SetName("versioned.texture-readback");
+        org::GraphHost host({.runtime = runtime});
+        host.AddExtension("test.versioned", [&] {
+            return std::make_unique<VersionedExtension>(std::vector<std::pair<const char*, std::shared_ptr<org::RenderPass>>>{
+                {"versioned.copy", std::make_shared<VersionedBufferCopyPass>(source, readback)},
+                {"versioned.fill", std::make_shared<VersionedTextureCopyPass>(texture, upload, true)},
+                {"versioned.read", std::make_shared<VersionedTextureCopyPass>(texture, textureReadback, false)}});
+        });
+        Buffers unused;
+        Run run{device, host, unused, org::RenderGraph::SharingChangePolicy::Inline};
+        uint64_t revision = 0;
+        for (uint32_t frame = 0; frame < 12; ++frame) {
+            const auto value = valueOf(frame);
+            if (frame) {
+                source->Publish(makeSource(value));
+                texture->Publish(org::PixelBuffer::CreateShared(description));
+            }
+            ENSURE(Write(*upload, value ^ 0xFFFFu));
+            host.ExecuteFrame(nullptr, [](org::RenderGraph& graph) { graph.SetScheduleTraceEnabled(true); });
+            ENSURE(device.WaitIdle() == rhi::Result::Ok);
+            CHECK(Read(*readback) == value);
+            CHECK(Read(*textureReadback) == (value ^ 0xFFFFu));
+            // A new version builds nothing: the executable of the first frames stays.
+            if (frame == 1) revision = run.Revision();
+            else if (frame > 1) CHECK(run.Revision() == revision);
+        }
+        // The first version is released once the frames that bound it retired. Nothing holds old versions for the session.
+        CHECK(firstVersion.expired());
+        // A texture of another format is a new resource, not a version.
+        auto other = description;
+        other.format = rhi::Format::R32_Float;
+        bool rejected = false;
+        try { texture->Make(org::PixelBuffer::CreateShared(other)); } catch (const std::invalid_argument&) { rejected = true; }
+        CHECK(rejected);
+    }
+    CHECK(device.WaitIdle() == rhi::Result::Ok);
+    return 0;
+}
+
 // Both opt-ins at once is refused: rebinding applies new backings at once, while declared-work passes keep old work.
 int TestRebindOptInsExclusive(const std::shared_ptr<org::Runtime>& runtime) {
     auto value = org::Buffer::CreateShared(rhi::HeapType::Upload, kBytes);
@@ -860,6 +986,7 @@ int TestRebindingGpu(rhi::Device device, const std::shared_ptr<org::Runtime>& ru
     if (const int line = RunRebindSlotScenario(device, runtime, org::RenderGraph::SharingChangePolicy::Deferred)) return line;
     if (const int line = TestRebindOptInsExclusive(runtime)) return line;
     if (const int line = RunRemapScenario(device, runtime)) return line;
+    if (const int line = RunVersionedScenario(device, runtime)) return line;
     if (const int line = RunExecutionHandleScenario(device, runtime)) return line;
     if (const int line = RunGraphDescScenario(device, runtime)) return line;
     if (const int line = RunGraphInstanceScenario(device, runtime)) return line;

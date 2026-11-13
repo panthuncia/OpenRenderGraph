@@ -7,6 +7,7 @@
 // It reads the pass's current declaration (RenderGraph::RedeclarePass). It never reads the old compiler's declaration cache.
 #include "Render/RenderGraph/RenderGraph.h"
 #include "Render/RenderGraph/GraphCompiler.h"
+#include "Resources/VersionedResource.h"
 
 #include <cstdint>
 #include <memory>
@@ -35,9 +36,12 @@ struct LoweredUse {
 	compiler::CompileRange range;
 	compiler::CompileResourceState state;
 	// For a resolver's resource that is declared directly, the slot's own reference, as for a group member. The resolver
-	// may drop the resource while the slot still names it. Examples are a removed group entry or the old version of a
-	// versioned buffer. Every preparation polls the slots' backings.
+	// may drop the resource while the slot still names it, as with a removed group entry. Every preparation polls the
+	// slots' backings.
 	std::shared_ptr<Resource> owner;
+	// A versioned resource's use (IVersionedResource, or the swapchain). Its slot is the versioned resource's: resourceID
+	// is the resource's SlotID, and no publication binds it. Each preparation binds the version it selects.
+	std::shared_ptr<const IVersionedResource> versioned;
 };
 
 struct LoweredGroup {
@@ -85,10 +89,14 @@ const char* FingerprintPartName(size_t part) noexcept;
 // The lowered declaration's queue and batch fields, as text (the fingerprint's "declaration" part).
 std::string DescribeDeclaration(const LoweredPass& lowered);
 
-// Lowers one pass's current declaration. A resolver becomes a group when both of these hold:
-// - the pass's resolver group plan says so,
-// - the group's members share one shape.
-// Otherwise its members are lowered as direct entries, and the resolver is polled for a new set.
+// The versioned resource a resolver is, when the graph binds its versions per preparation. Null for any other resolver,
+// and for a late-bound one, which the graph treats as an ordinary resolver of its stand-in.
+const IVersionedResource* PreparedVersions(const IResourceResolver* resolver) noexcept;
+
+// Lowers one pass's current declaration.
+// - A versioned resource's uses (PreparedVersions) become direct uses of its own slot. They never become a group.
+// - Another resolver becomes a group when the pass's resolver group plan says so and the group's members share one shape.
+//   Otherwise its members are lowered as direct entries, and the resolver is polled for a new set.
 LoweredPass LowerPass(RenderGraph& graph, ResourceRegistry& registry, const QueueRegistry& queues,
 	rhi::Backend primaryBackend, const RenderGraph::PassAndResources& pass, RenderGraph::PassType type);
 

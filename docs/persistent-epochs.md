@@ -240,17 +240,59 @@ revision the host's scene supplies (CS's DCLF scene revision), and nothing about
     recording)` binds one, or the one `beforeSubmit` chose (`UseEpochRecording`, checked with `CanUseEpochRecording`).
 -   **Immutable inputs.** A recording for a revision resolves the graph's resolvers through it (`ResolverCaptureContext` of
     `IHostExecutionData`), and its frozen bindings hold the backings and descriptors it was recorded with. A buffer that
-    grows does so by versions (`VersionedBuffer`), never in place.
+    grows does so by versions (`VersionedBuffer`, below), never in place.
 -   **Statistics.** `AsyncStats::revisionCopiesRecorded`, `revisionRecordings`, `revisionSubmissions`, `copyWaits` and
     `copiesBusy`.
 
-### Versioned buffers
+### Versioned resources
 
-`org::VersionedBuffer` grows by versions. `GrowStructured` and `GrowBytes` make the next version, materialize it and
-publish it as current. The old version is released when the last thing holding it does: a revision, a recording's
-bindings, a frame in flight. Passes declare the `VersionedBuffer` itself; a preparation resolves the version its host
-data names (`IResourceVersions::Find`), else the current one. After a growth, `GraphHost::NoteNewVersions` makes the
-tickets prepared before it stale.
+A versioned resource (`org::VersionedBuffer`, `org::VersionedTexture`, both built on `org::VersionedResource`) changes its
+backing by versions. A version is immutable. A new allocation is a new version, and the old version stays alive until the
+last thing holding it lets go: a revision, a recording's bindings, a frame in flight. This is the one runtime model for "a
+declared resource gets another backing". Passes declare the versioned resource itself, since it is a resolver.
+
+-   **Making versions.** `Make(next, owner)` makes a pending version on any thread. `Adopt` makes it current on the owner
+    thread, and `Publish` does both. `owner` is kept alive with the version, such as the lease of a pooled backing.
+    `VersionedBuffer::GrowStructured` and `GrowBytes` make, materialize and adopt a buffer at another size. After a growth,
+    `GraphHost::NoteNewVersions` makes the tickets prepared before it stale.
+-   **Shape class.** Every version must have the first one's shape class. For a texture that is its format, mip count and
+    slice count. A buffer has none, since its size is not part of its graph slot. `Make` rejects a version of another shape
+    class. A resource of another shape is a new resource: its passes are declared again, which rebuilds.
+-   **Revisions.** A preparation for host data binds the version the data names (`IResourceVersions::Find` for a buffer,
+    `FindTexture` for a texture), or else the current one.
+
+A versioned resource has two binding times.
+
+-   **Prepare-time binding, the normal mode.** The graph gives the resource one slot, keyed by its `SlotID`, whatever version a
+    declaration names. No publication binds that slot, so a new version is never a binding edit, a group membership change or
+    a relowering. Each preparation, a plain frame or a ticket, selects the version and binds it twice:
+    -   as a frame rebinding (`persistent::FrameRebinding`), so admission, barriers and the state ledgers follow the version's
+        backing, and the upload planner sees it among the admission's backings;
+    -   as an overlay of the publication's bindings (`FrozenExecutionBindings::Overlay`), which preparation and recording read.
+        The overlay copies nothing of the base. Its binding owns the version, so whoever holds the bindings holds the version.
+
+    Admission interns the backing sets that rebindings make (`SynchronousAdmission`'s rebound sets): a frame that rebinds the
+    same backings gets the same set, so plans, predictions and access streams are shared as for the publication's own set. The
+    graph also keeps the latest overlay, so preparations that bind the same versions get the same bindings object and a kept
+    recording made with them still matches. A recording keeps its frame rebindings, and a revision ticket admits it with them
+    again. A recording that binds a per-frame resource (`IVersionedResource::PerFrame`, the swapchain) is never kept.
+-   **Late binding** (`VersionedBuffer::CreateLateBound`, `PublishLate`). For data a host publishes after the recordings that
+    read it. Shaders read it through a bindless index, so no recording binds it. Declarations always resolve to a fixed
+    stand-in, which the graph binds like any resource. The upload planner takes each batch that declares the stand-in as a
+    user of the live version's backing. Readiness is either the staged uploads (`LateReady::Uploads`) or the frame wait
+    (`LateReady::FrameWait`; with scoped frame waits only the batches that declare it wait).
+
+The swapchain (`RenderGraph::SetSwapchainResource`, still a `DynamicResource`) uses prepare-time binding: an adapter makes it a
+per-frame versioned resource whose version is the image the wrapper points at.
+
+What stays separate:
+
+-   **Re-import and rebuild**, for a change of shape or format: a new resource and a structural build.
+-   **Transient aliasing**: alias pools place transient resources; their placements are planned by structural builds.
+-   **Other resolvers** with several members keep resolver groups, whose membership changes are binding edits.
+
+`DynamicResource`, `DynamicGloballyIndexedResource` and in-place `BufferBase::SetBacking` still work for existing users, but are
+deprecated for graph resources.
 
 ## In-stream execution
 

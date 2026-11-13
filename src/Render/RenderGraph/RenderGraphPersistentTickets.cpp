@@ -65,6 +65,7 @@ void RenderGraph::AddPersistentTicketCandidate(PersistentTicket& ticket, std::sh
 	candidate->segment.resourceHeap = recording->resourceHeap;
 	candidate->segment.samplerHeap = recording->samplerHeap;
 	candidate->segment.waits = recording->waits;
+	candidate->segment.rebindings = recording->rebindings;
 	candidate->next = ticket.candidates.load(std::memory_order_relaxed);
 	ticket.candidates.store(candidate, std::memory_order_release);  // the owner thread is the only writer
 }

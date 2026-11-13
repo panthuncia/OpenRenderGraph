@@ -188,7 +188,9 @@ bool RenderGraph::AdmitPersistentSegment(PersistentSegmentRun& run) {
 	run.external = ticketTarget && ticketTarget->external;
 	// A body depends only on the compiled graph (open: its entry barriers are recorded at submission) or on the executable and
 	// backings (closed), so a ticket's recording can be replayable, open or closed.
-	run.keepable = ticketTarget && m_persistentRecordingReuse && admission.rebound.empty()
+	// A recording made with versions keeps its frame rebindings and is admitted with them again. A per-frame resource's
+	// version (a swapchain image) must be the frame's own, so such a recording is never kept.
+	run.keepable = ticketTarget && m_persistentRecordingReuse && !segment.perFrame
 		&& admission.incomingEffects.empty() && !ticketTarget->uncheckable
 		&& !(run.external && lateUnreplayable);
 	return true;
@@ -481,6 +483,7 @@ void RenderGraph::SubmitPersistentSegment(PersistentSegmentRun& run) {
 				recording->revisions = ticket->revisions;
 				recording->lastUse.store(ticket->hostFrame, std::memory_order_relaxed);
 				recording->waits = segment.waits;
+				recording->rebindings = segment.rebindings;
 				recording->leases = segment.leases;
 			}
 			// A recording made for host data is its caller's (BindPersistentTicketRecording). Nothing else keeps a recording: the

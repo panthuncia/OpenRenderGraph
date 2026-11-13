@@ -223,6 +223,8 @@ protected:
     std::shared_ptr<org::runtime::IUploadService> RetainBufferUploadService() const;
     void UploadBufferData(const void* data, size_t size, org::runtime::UploadTarget target, size_t offset,
         const char* file = nullptr, int line = 0) const;
+    // Replaces the backing in place. Deprecated for a buffer a graph declares: make a new version of a VersionedBuffer
+    // instead, which old work keeps using until it retires (docs/persistent-epochs.md, "Versioned resources").
     void SetBacking(std::unique_ptr<GpuBufferBacking> backing, uint64_t bufferSize);
     void CreateAndSetBacking(rhi::HeapType accessType, uint64_t bufferSize, bool unorderedAccess);
     void SetBackingName(const std::string& baseName, const std::string& suffix);

@@ -1,7 +1,5 @@
 #pragma once
 
-#pragma once
-
 #include <atomic>
 #include <memory>
 #include <shared_mutex>
@@ -13,6 +11,9 @@
 
 namespace org {
 
+// A wrapper whose backing resource can be swapped (SetResource). Deprecated: use a versioned resource (VersionedBuffer,
+// VersionedTexture) instead. A graph binds a versioned resource's version per preparation and keeps old versions alive
+// while the work using them runs. Kept for existing users, and as the swapchain's wrapper (RenderGraph::SetSwapchainResource).
 class DynamicResource : public Resource {
 public:
     DynamicResource(std::shared_ptr<Resource> initialResource)
@@ -95,6 +96,8 @@ private:
     std::shared_ptr<Resource> resource; // T actual resource
 };
 
+// A globally indexed wrapper whose backing can be swapped (SetResource). Deprecated: use a versioned resource
+// (VersionedBuffer, VersionedTexture) instead. Kept for existing users.
 class DynamicGloballyIndexedResource : public GloballyIndexedResourceBase {
 public:
     DynamicGloballyIndexedResource(std::shared_ptr<GloballyIndexedResource> initialResource)

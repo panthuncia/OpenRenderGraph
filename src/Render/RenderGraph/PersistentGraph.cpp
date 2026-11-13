@@ -280,12 +280,7 @@ BindingVersion PlaceholderBinding(uint32_t index, compiler::CompileResourceShape
 }
 }
 const BindingVersion& SelectedPublication::Resolve(BindingToken token) const {
-    Require(token.domain == logical->domain && token.pass.index < logical->passSlots.size(), "Foreign binding token");
-    const auto& pass = logical->passSlots[token.pass.index];
-    Require(pass.active && pass.generation == token.pass.generation && pass.layoutRevision == token.layoutRevision
-        && token.ordinal < pass.bindingSlots.size()
-        && pass.bindingSlots[token.ordinal].declarationId == token.declarationId, "Stale or undeclared binding token");
-    return bindings.At(pass.bindingSlots[token.ordinal].resource);
+    return bindings.At(SlotOf(token));
 }
 GraphEditTransaction::GraphEditTransaction(std::shared_ptr<const SelectedPublication> base)
     : m_base(std::move(base)), m_bindings(m_base ? m_base->bindings : BindingTable{}) {
@@ -611,6 +606,21 @@ rhi::DescriptorSlot SelectedPublication::Resolve(ViewToken token) const {
         "Stale or undeclared descriptor token");
     Require(bool(version.preparedViews), "Binding has no prepared descriptor layout");
     return version.preparedViews->at(token.binding.declarationId).at(token.ordinal);
+}
+ResourceSlotId SelectedPublication::SlotOf(BindingToken token) const {
+    Require(token.domain == logical->domain && token.pass.index < logical->passSlots.size(), "Foreign binding token");
+    const auto& pass = logical->passSlots[token.pass.index];
+    Require(pass.active && pass.generation == token.pass.generation && pass.layoutRevision == token.layoutRevision
+        && token.ordinal < pass.bindingSlots.size()
+        && pass.bindingSlots[token.ordinal].declarationId == token.declarationId, "Stale or undeclared binding token");
+    return pass.bindingSlots[token.ordinal].resource;
+}
+BindlessViewRequest SelectedPublication::RequestOf(ViewToken token) const {
+    SlotOf(token.binding);
+    const auto& required = logical->passSlots[token.binding.pass.index].bindingSlots[token.binding.ordinal].requiredViews;
+    Require(token.ordinal < required.size() && required[token.ordinal].declarationId == token.declarationId,
+        "Stale or undeclared descriptor token");
+    return required[token.ordinal].request;
 }
 std::optional<std::pair<BindingToken, std::vector<ViewToken>>> SelectedPublication::FindBinding(PassId pass,
     ResourceSlotId resource, std::span<const BindlessViewRequest> views) const {
@@ -1641,9 +1651,11 @@ FrameAdmission SynchronousAdmission::PrepareFrame(std::shared_ptr<const Selected
         frame.backings = AdmissionBackingSet(std::move(backings), true, id);
     }
     frame.entryOnly = entryOnly;
+    bool perFrame = false;
     if (!rebindings.empty()) {
         BT_ZONE_SCOPE("ORG.Persistent.ApplyFrameRebindings");
-        auto& backings = frame.backings.Mutable();
+        std::vector<std::pair<uint32_t, rhi::ResourceHandle>> rebound;
+        rebound.reserve(rebindings.size());
         for (const auto& rebinding : rebindings) {
             const auto& binding = frame.publication->bindings.At(rebinding.slot);
             Require(!binding.bound, "Frame rebinding targets a publication-owned slot");
@@ -1656,14 +1668,39 @@ FrameAdmission SynchronousAdmission::PrepareFrame(std::shared_ptr<const Selected
             Require(rebinding.recording && rebinding.recording->resource.GetHandle().index == rebinding.backing.resource.index
                 && rebinding.recording->resource.GetHandle().generation == rebinding.backing.resource.generation,
                 "Frame rebinding recording disagrees with admission");
-            // A frame rebinding names its own resource. A backing another resource already has would be two resources
-            // to the schedule, with no ordering between their users.
-            for (uint32_t other = 0; other < backings.size(); ++other)
-                Require(other == index || backings[other].resource.index != rebinding.backing.resource.index
-                    || backings[other].resource.generation != rebinding.backing.resource.generation,
-                    "Frame rebinding uses a backing another resource of the graph is bound to");
-            backings[index] = rebinding.backing;
             frame.rebound.push_back(index);
+            rebound.emplace_back(index, rebinding.backing.resource);
+            perFrame = perFrame || rebinding.perFrame;
+        }
+        const auto base = frame.backings.Id();
+        const auto same = [&](const ReboundSet& entry) {
+            if (entry.base != base || entry.rebound.size() != rebound.size()) return false;
+            for (size_t i = 0; i < rebound.size(); ++i)
+                if (entry.rebound[i].first != rebound[i].first || entry.rebound[i].second.index != rebound[i].second.index
+                    || entry.rebound[i].second.generation != rebound[i].second.generation) return false;
+            return true;
+        };
+        const auto found = perFrame ? m_reboundSets.end() : std::ranges::find_if(m_reboundSets, same);
+        if (found != m_reboundSets.end()) {
+            // These backings were rebound into this set before, and checked then.
+            frame.backings = AdmissionBackingSet(found->backings, false, found->id);
+        } else {
+            auto& backings = frame.backings.Mutable();
+            for (size_t i = 0; i < rebindings.size(); ++i) {
+                const auto index = rebound[i].first;
+                const auto& rebinding = rebindings[i];
+                // A frame rebinding names its own resource. A backing another resource already has would be two resources
+                // to the schedule, with no ordering between their users.
+                for (uint32_t other = 0; other < backings.size(); ++other)
+                    Require(other == index || backings[other].resource.index != rebinding.backing.resource.index
+                        || backings[other].resource.generation != rebinding.backing.resource.generation,
+                        "Frame rebinding uses a backing another resource of the graph is bound to");
+                backings[index] = rebinding.backing;
+            }
+            if (!perFrame) {
+                if (m_reboundSets.size() >= 16) m_reboundSets.erase(m_reboundSets.begin());
+                m_reboundSets.push_back({base, std::move(rebound), frame.backings.Shared(), frame.backings.Id()});
+            }
         }
     }
     frame.incomingWaits.resize(graph.batches.size());
@@ -1736,7 +1773,9 @@ FrameAdmission SynchronousAdmission::PrepareFrame(std::shared_ptr<const Selected
     }
     frame.queuePoints.assign(queues.begin(), queues.end());
     frame.ownWaits = frame.incomingWaits;
-    AdmitLedger(frame, rebindings.empty() && incomingStates.empty(), !pending);
+    // Interned rebound sets (m_reboundSets) are as stable as the publication's own set, so only per-frame rebindings and incoming
+    // states keep the frame's plan its own.
+    AdmitLedger(frame, !perFrame && incomingStates.empty(), !pending);
     frame.domain = m_domain;
     // A plan (PreparePlan) has no sequence: Commit and Readmit refuse it, Abandon ignores it.
     if (!pending) return frame;

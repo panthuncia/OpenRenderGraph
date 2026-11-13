@@ -3,6 +3,7 @@
 #include "Render/Runtime/RuntimeDevice.h"
 #include "OpenRenderGraph/Runtime.h"
 #include "OpenRenderGraph/ExternalClient.h"
+#include "Resources/VersionedResource.h"
 
 namespace org {
 
@@ -317,9 +318,31 @@ void RenderGraph::UseRuntimeServices() {
 	if (!m_taskService) m_taskService = m_runtime->Tasks();
 }
 
+namespace {
+// The swapchain wrapper as a versioned resource. Its version for a preparation is the image the wrapper points at then. It
+// keeps no image itself, so the host can release the images when it resizes the swapchain.
+class SwapchainVersions final : public IVersionedResource {
+public:
+	explicit SwapchainVersions(std::shared_ptr<DynamicResource> wrapper) : m_wrapper(std::move(wrapper)) {}
+	const void* Key() const noexcept override { return m_wrapper.get(); }
+	uint64_t SlotID() const noexcept override { return m_wrapper->GetSchedulingResourceID(); }
+	std::shared_ptr<const ResourceVersion> SelectVersion(const ResolverCaptureContext*) const override {
+		auto image = m_wrapper->GetResource();
+		if (!image) return nullptr;
+		auto version = std::make_shared<ResourceVersion>();
+		version->resource = std::move(image);
+		return version;
+	}
+	bool PerFrame() const noexcept override { return true; }
+private:
+	std::shared_ptr<DynamicResource> m_wrapper;
+};
+}
+
 void RenderGraph::SetSwapchainResource(std::shared_ptr<Resource> resource) {
-	if (resource && !dynamic_cast<DynamicResource*>(resource.get()))
-		throw std::invalid_argument("The swapchain resource must be a DynamicResource");
+	auto wrapper = std::dynamic_pointer_cast<DynamicResource>(resource);
+	if (resource && !wrapper) throw std::invalid_argument("The swapchain resource must be a DynamicResource");
+	m_swapchainVersions = wrapper ? std::make_shared<const SwapchainVersions>(std::move(wrapper)) : nullptr;
 	m_swapchain = std::move(resource);
 }
 

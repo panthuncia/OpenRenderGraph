@@ -193,6 +193,11 @@ public:
     const BindingVersion& Resolve(BindingToken token) const;
     rhi::Resource ResolveNative(BindingToken token) const;
     rhi::DescriptorSlot Resolve(ViewToken token) const;
+    // The slot a pass's binding names, and the view a view token requests. A slot this publication leaves unbound (a
+    // versioned slot) has no prepared views here: its views come from the preparation's bindings.
+    ResourceSlotId SlotOf(BindingToken token) const;
+    ResourceSlotId SlotOf(ViewToken token) const { return SlotOf(token.binding); }
+    BindlessViewRequest RequestOf(ViewToken token) const;
     // The pass's existing binding of `resource` that requires every view in `views`, from this publication's logical
     // graph, with those views' tokens in the same order. A pass that declares again with the same slots takes these
     // instead of editing the graph. Nullopt when no binding of the pass has them all.
@@ -474,12 +479,16 @@ struct FrameAdmission {
     uint64_t stream = 0;
 };
 // Frame-supplied backing for a slot the publication deliberately leaves
-// unbound. The executable and its state contract stay selected; only the
-// physical identity is late-bound, so this never supersedes a pending edit.
+// unbound: a versioned slot's version for this frame. The executable and its
+// state contract stay selected; only the physical identity is late-bound, so
+// this never supersedes a pending edit.
 struct FrameRebinding {
     ResourceSlotId slot;
     compiler::PreparedBackingState backing;
     std::shared_ptr<const ResourceBindingSnapshot> recording;
+    // The backing changes every frame (a swapchain image). Admission then plans the frame afresh, as for incoming states,
+    // instead of sharing plans and predictions with earlier frames that rebound the same backings.
+    bool perFrame = false;
 };
 
 // Producer completion requirements are invocation data, not graph structure or
@@ -660,6 +669,16 @@ private:
         std::shared_ptr<const compiler::PreparedExecutionBarrierPlan> plan;
     };
     std::vector<CachedBody> m_bodyCache;
+    // Backing sets made by frame rebindings, by the publication's set and the backings rebound in it. A frame that rebinds the
+    // same backings takes the same set, with the same id. So it shares plans, predictions and access streams, as frames of the
+    // publication's own set do. Per-frame rebindings (FrameRebinding::perFrame) make no entry. The oldest goes first.
+    struct ReboundSet {
+        uint64_t base = 0;  // AdmissionBackingSet::Id of the publication's set
+        std::vector<std::pair<uint32_t, rhi::ResourceHandle>> rebound;  // (compiler resource, backing)
+        std::shared_ptr<const std::vector<compiler::PreparedBackingState>> backings;
+        uint64_t id = 0;
+    };
+    std::vector<ReboundSet> m_reboundSets;
     // Per executable: the prediction of its entry-only plan (AdmitLedger), for the backings and execution kind it was made for, and
     // of its access waits; its access stream (the publication's own backings only); the resources batches off the upload queue use.
     struct PredictionSlot {

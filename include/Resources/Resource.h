@@ -335,6 +335,9 @@ public:
 	// Identity used by render-graph scheduling. Dynamic wrappers override this so
 	// dependency identity remains stable when their backing resource changes.
 	virtual uint64_t GetSchedulingResourceID() const { return GetGlobalResourceID(); }
+	// A new identity from the counter resources take theirs from. It names no resource. A versioned resource takes one for the
+	// graph slot that stands for it across its versions.
+	static uint64_t ReserveGlobalResourceID() noexcept { return globalResourceCount.fetch_add(1, std::memory_order_relaxed); }
 	GraphOwnership GetGraphOwnership() const noexcept { return m_graphOwnership; }
 	void SetGraphOwnership(GraphOwnership ownership) noexcept { m_graphOwnership = ownership; }
 	bool IsRenderGraphManaged() const noexcept { return m_graphOwnership == GraphOwnership::GraphManaged; }

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <concepts>
 #include <functional>
@@ -174,21 +175,49 @@ public:
         result->m_resources = std::move(resources);
         return result;
     }
+    // One preparation's bindings: `base`, with `overrides` in place of the base's bindings at those slots. The overrides are
+    // the frame-bound slots, such as a versioned resource's version for this preparation. Nothing of the base is copied.
+    static std::shared_ptr<const FrozenExecutionBindings> Overlay(std::shared_ptr<const FrozenExecutionBindings> base,
+        std::vector<std::pair<uint32_t, ResourceBinding>> overrides) {
+        if (!base) throw std::invalid_argument("An overlay needs base bindings");
+        if (overrides.empty()) return base;
+        std::sort(overrides.begin(), overrides.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        for (size_t i = 0; i < overrides.size(); ++i) {
+            const auto& [slot, binding] = overrides[i];
+            if (slot >= base->Size() || (i && overrides[i - 1].first == slot)) throw std::invalid_argument("Invalid overlay slot");
+            if (binding.resource.GetHandle().valid() && !binding.owner) throw std::invalid_argument("Unowned overlay resource");
+        }
+        auto result = std::make_shared<FrozenExecutionBindings>(std::vector<ResourceBinding>{});
+        result->m_descriptors = base->m_descriptors;
+        result->m_publicationRoot = base->m_publicationRoot;
+        result->m_overrides = std::move(overrides);
+        result->m_base = std::move(base);
+        return result;
+    }
+    // The binding at `slot`.
+    const ResourceBinding& Binding(uint32_t slot) const {
+        if (!m_base) return m_resources.at(slot);
+        const auto found = std::lower_bound(m_overrides.begin(), m_overrides.end(), slot,
+            [](const auto& entry, uint32_t key) { return entry.first < key; });
+        return found != m_overrides.end() && found->first == slot ? found->second : m_base->Binding(slot);
+    }
+    // How many slots there are.
+    uint32_t Size() const noexcept { return m_base ? m_base->Size() : static_cast<uint32_t>(m_resources.size()); }
     rhi::Resource Resolve(PreparedResourceReference ref) const {
-        const auto& resource = m_resources.at(ref.slot).resource;
+        const auto& resource = Binding(ref.slot).resource;
         if (!resource.GetHandle().valid()) throw std::logic_error("Recording resolved an unbound persistent slot");
         return resource;
     }
     // Reverse lookup by native handle.
     std::optional<PreparedResourceReference> FindByHandle(rhi::ResourceHandle handle) const {
-        for (uint32_t slot = 0; slot < m_resources.size(); ++slot) {
-            const auto candidate = m_resources[slot].resource.GetHandle();
+        for (uint32_t slot = 0; slot < Size(); ++slot) {
+            const auto candidate = Binding(slot).resource.GetHandle();
             if (candidate.index == handle.index && candidate.generation == handle.generation) return PreparedResourceReference{slot};
         }
         return std::nullopt;
     }
     std::shared_ptr<const void> Owner(PreparedResourceReference ref) const {
-        const auto& binding = m_resources.at(ref.slot);
+        const auto& binding = Binding(ref.slot);
         if (binding.publicationBinding)
             return binding.publicationBinding->recordingOwner
                 ? binding.publicationBinding->recordingOwner : binding.publicationBinding->allocationOwner;
@@ -198,17 +227,24 @@ public:
         return binding.descriptorOwner ? binding.descriptorOwner : binding.owner ? binding.owner : m_publicationRoot;
     }
     const BindlessResourceViews& Views(PreparedResourceReference ref) const {
-        const auto& views = m_resources.at(ref.slot).views;
+        const auto& views = Binding(ref.slot).views;
         if (!views) throw std::out_of_range("Resource has no captured bindless views");
         return *views;
     }
-    const std::vector<ResourceBinding>& Resources() const { return m_resources; }
+    // The flat binding list. An overlay has none: read Binding(slot) instead.
+    const std::vector<ResourceBinding>& Resources() const {
+        if (m_base) throw std::logic_error("Overlay bindings have no flat list");
+        return m_resources;
+    }
     const std::vector<DescriptorBinding>& Descriptors() const { return m_descriptors; }
     const std::shared_ptr<const PublicationBindingBundle>& PublicationRoot() const noexcept { return m_publicationRoot; }
 private:
     std::vector<ResourceBinding> m_resources;
     std::vector<DescriptorBinding> m_descriptors;
     std::shared_ptr<const PublicationBindingBundle> m_publicationRoot;
+    // An overlay's (Overlay): the bindings it overrides, and its own bindings by slot, sorted.
+    std::shared_ptr<const FrozenExecutionBindings> m_base;
+    std::vector<std::pair<uint32_t, ResourceBinding>> m_overrides;
 };
 
 struct FramePreparationContext {

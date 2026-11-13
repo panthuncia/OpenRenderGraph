@@ -35,6 +35,7 @@
 #include "Resources/PixelBuffer.h"
 #include "Resources/Buffers/DynamicBufferBase.h"
 #include "Resources/Buffers/VersionedBuffer.h"
+#include "Resources/VersionedResource.h"
 #include "Resources/MemoryStatisticsComponents.h"
 #include "Render/FrameGraphSnapshot.h"
 #include "Managers/Singletons/DeviceManager.h"
@@ -189,8 +190,10 @@ struct RenderGraph::PersistentRecording {
 	rhi::DescriptorHeapHandle resourceHeap{}, samplerHeap{};
 	std::vector<std::pair<const RenderGraphPass*, uint64_t>> revisions;
 	mutable std::atomic<uint64_t> lastUse{0};  // the host frame that last took it
-	// What a revision ticket admits it with (AddPersistentTicketCandidate): its producer waits, and the leases its preparation held.
+	// What a revision ticket admits it with (AddPersistentTicketCandidate): its producer waits, the versions it bound (its frame
+	// rebindings), and the leases its preparation held.
 	std::vector<persistent::FrameProducerWait> waits;
+	std::vector<persistent::FrameRebinding> rebindings;
 	std::vector<std::shared_ptr<const void>> leases;
 
 	bool Recorded(uint64_t a_hostTag, const persistent::SelectedPublication* a_publication, const FrozenExecutionBindings* a_bindings,
@@ -217,7 +220,8 @@ struct RenderGraph::PersistentTicket {
 		// What the segment was prepared with, which a recording bound later must have been recorded for.
 		std::shared_ptr<const FrozenExecutionBindings> bindings;
 		rhi::DescriptorHeapHandle resourceHeap{}, samplerHeap{};
-		// What the admission at submission is prepared with: the producers' waits and the frame's rebindings (the swapchain).
+		// What the admission at submission is prepared with: the producers' waits and the frame's rebindings (the versions of its
+		// versioned slots).
 		std::vector<persistent::FrameProducerWait> waits;
 		std::vector<persistent::FrameRebinding> rebindings;
 		bool admitted = false;   // admission is the submission's, pending
@@ -284,8 +288,9 @@ struct RenderGraph::PersistentInstanceState {
 	struct SlotEntry {
 		persistent::ResourceSlotId slot;
 		Resource* resource = nullptr;      // Registry object (wrapper for dynamic resources).
-		// A resolver group member's own reference: the resolver may drop the member (a versioned buffer's old version) while the
-		// slot still names it, and every preparation polls the slots' backings (PollBackings). Released when the slot is rebound.
+		// A resolver group member's own reference: the resolver may drop the member while the slot still names it, and every
+		// preparation polls the slots' backings (PollBackings). Released when the slot is rebound. A versioned slot's: the version
+		// the latest preparation bound.
 		std::shared_ptr<Resource> member;
 		uint64_t resourceID = 0;           // Scheduling identity.
 		CompileResourceShape shape;
@@ -298,7 +303,18 @@ struct RenderGraph::PersistentInstanceState {
 		bool wrapper = false;
 		bool isBound = false;
 		bool direct = false;               // Shared by direct declarations; never a group member.
-		bool swapchain = false;            // Rebound per frame at admission.
+		// A versioned resource's slot (LoweredUse::versioned, the swapchain among them). No publication binds it. Each preparation
+		// binds the version it selects, as a frame rebinding and an overlay of the bindings (PrepareVersionedBindings).
+		std::shared_ptr<const IVersionedResource> versioned;
+		// The latest preparation's binding of a versioned slot, kept for the next one that selects the same version. Not kept for
+		// a per-frame resource (IVersionedResource::PerFrame), whose versions must not outlive the frames that bind them.
+		struct FrameBinding {
+			std::shared_ptr<const ResourceVersion> version;
+			RotationKey key;
+			persistent::FrameRebinding rebinding;
+			FrozenExecutionBindings::ResourceBinding binding;
+		};
+		std::optional<FrameBinding> frameBinding;
 		bool multiDevice = false;          // A pass on another device than the primary uses it: bound with representations.
 		bool retired = false;              // Slot removed from the program; the index may be reclaimed.
 		std::vector<uint32_t> subscribers; // Main pass indices resolving this slot.
@@ -358,7 +374,8 @@ struct RenderGraph::PersistentInstanceState {
 		std::vector<const void*> loweredGroupKeys;
 		std::vector<ExternalTimelinePoint> explicitWaits;
 		// Resolvers lowered as direct declarations, with the resource set they were lowered with: their slots hold those
-		// resources until the pass is lowered again, so every preparation checks that it resolves the same set.
+		// resources until the pass is lowered again, so every preparation checks that it resolves the same set. A versioned
+		// resource is never one: its slot takes each preparation's version.
 		std::vector<std::pair<std::shared_ptr<const IResourceResolver>, ResolverResourceSetIdentity>> directResolvers;
 		// RebindsConcreteResources: the wrappers its pointer declarations go through, one per distinct resource in
 		// declaration order (UseRebindSlots). Each is the pass's own slot; its backing is the resource declared there last.
@@ -479,6 +496,14 @@ struct RenderGraph::PersistentLayoutState {
 	// The binding table recording resolves slots through (resources, views), per publication.
 	const persistent::SelectedPublication* bindingsFor = nullptr;
 	std::shared_ptr<const FrozenExecutionBindings> bindings;
+	// The latest preparation's overlay of the versioned slots on `bindings`, with what it bound in each slot (the binding's
+	// owner). A preparation that binds the same versions takes the same object, so a kept recording made with them still
+	// matches (PersistentRecording::Recorded compares bindings by identity).
+	struct VersionedOverlay {
+		std::shared_ptr<const FrozenExecutionBindings> base, bindings;
+		std::vector<std::pair<uint32_t, const void*>> bound;
+	};
+	VersionedOverlay versionedOverlay;
 	// Pass names per logical pass slot, per executable.
 	std::shared_ptr<const std::vector<std::string>> mainNames;
 	const void* mainNamesExecutable = nullptr;
@@ -509,6 +534,7 @@ struct RenderGraph::PersistentExecution {
 		std::vector<PreparedPass> invocations;
 		std::shared_ptr<const std::vector<std::string>> names; // Per logical pass slot, for statistics/present detection.
 		std::vector<persistent::FrameRebinding> rebindings;
+		bool perFrame = false;  // a rebinding is a per-frame resource's (IVersionedResource::PerFrame): never kept
 		std::vector<persistent::FrameProducerWait> waits;
 		std::shared_ptr<const FrozenExecutionBindings> bindings;
 		std::vector<compiler::PreparedTimelineBinding> foreignTimelines;
@@ -722,14 +748,15 @@ void InstallMainPass(RenderGraph& graph, State& state, persistent::GraphEditTran
 	std::vector<uint32_t>* touchedGroups = nullptr);
 bool LoweringAddsDeclarations(const State::MainPass& main, const LoweredPass& lowered);
 // For a pass that RebindsConcreteResources: points the lowering's uses of resources declared by pointer at the pass's
-// rebind slots, and gives each slot the resource now declared in its place. Resolver members, the swapchain, passes on
-// another device and resources that already are wrappers keep their own entries. Does nothing for other passes.
+// rebind slots, and gives each slot the resource now declared in its place. Resolver members, versioned resources (the
+// swapchain among them), passes on another device and resources that already are wrappers keep their own entries. Does
+// nothing for other passes.
 // A relower against the installed executable. When the pass declares the same direct uses and groups, and every use and
 // view of its new layout maps onto a slot and view `live` already has (a group member that arrived within the group's
 // capacity, say), the pass takes the new layout, bindings and tokens with no build. Returns null then; otherwise, changing
 // nothing, why it doesn't map (for the relower log).
 const char* RemapDeclaration(State& state, const persistent::SelectedPublication& live, State::MainPass& main, LoweredPass& lowered);
-void UseRebindSlots(const RenderGraph& graph, State::MainPass& main, LoweredPass& lowered, const IDynamicDeclaredResources* dynamic);
+void UseRebindSlots(State::MainPass& main, LoweredPass& lowered, const IDynamicDeclaredResources* dynamic);
 // Why a pass's new declaration differs from the one installed:
 // - NoOp: the same declaration again;
 // - Rebind: the same uses with other resources of the same shape;

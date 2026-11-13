@@ -37,6 +37,11 @@ Resource* UnwrapDynamic(Resource* resource) noexcept {
 	return nullptr;
 }
 
+const IVersionedResource* PreparedVersions(const IResourceResolver* resolver) noexcept {
+	const auto* versioned = dynamic_cast<const IVersionedResource*>(resolver);
+	return versioned && !versioned->LateBound() ? versioned : nullptr;
+}
+
 bool ConcurrentlyShared(const Resource& resource) {
 	rhi::ResourceDesc description{};
 	return resource.TryGetRHIResourceDesc(description) && description.queueSharing == rhi::QueueSharing::Concurrent;
@@ -80,6 +85,11 @@ std::optional<RenderGraph::ResolverGroupPlan> PlanResolverGroups(const RenderGra
 			{.range = requirement.resourceHandleAndRange.range, .state = requirement.state});
 	RenderGraph::ResolverGroupPlan plan;
 	for (const auto& snapshot : pass.resolverSnapshots) {
+		// A versioned resource's uses are lowered as direct uses of its own slot, never as a group.
+		if (PreparedVersions(snapshot.resolver.get())) {
+			plan.templates.emplace_back();
+			continue;
+		}
 		std::vector<uint64_t> resourceIDs;
 		if (snapshot.state && snapshot.state->resources)
 			for (const auto& resource : *snapshot.state->resources) resourceIDs.push_back(resource ? resource->GetGlobalResourceID() : 0u);
@@ -272,12 +282,32 @@ LoweredPass LowerPass(RenderGraph& graph, ResourceRegistry& registry, const Queu
 	auto resolve = [&](const ResourceRegistry::RegistryHandle& handle) -> Resource* {
 		return handle.IsEphemeral() ? handle.GetEphemeralPtr() : registry.Resolve(handle);
 	};
+	// The versioned resources the pass declares, by the version this declaration resolved each one to.
+	std::unordered_map<const Resource*, std::pair<std::shared_ptr<const IVersionedResource>, std::shared_ptr<Resource>>> versionedByMember;
+	for (const auto& snapshot : pass.resolverSnapshots) {
+		if (!PreparedVersions(snapshot.resolver.get()) || !snapshot.state || !snapshot.state->resources) continue;
+		const std::shared_ptr<const IResourceResolver> clone = snapshot.resolver->Clone();
+		const std::shared_ptr<const IVersionedResource> versioned(clone, PreparedVersions(clone.get()));
+		for (const auto& member : *snapshot.state->resources) if (member) versionedByMember.emplace(member.get(), std::pair{versioned, member});
+	}
+	// A use of a versioned resource, or of the swapchain, goes to the resource's own slot.
+	const auto makeUse = [&](Resource* resource, CompileRange range, CompileResourceState state) {
+		LoweredUse lowered{resource->GetSchedulingResourceID(), resource, range, state};
+		if (const auto found = versionedByMember.find(resource); found != versionedByMember.end()) {
+			lowered.versioned = found->second.first;
+			lowered.owner = found->second.second;
+		} else if (graph.IsSwapchainResource(resource)) {
+			lowered.versioned = graph.SwapchainVersions();
+		}
+		if (lowered.versioned) lowered.resourceID = lowered.versioned->SlotID();
+		return lowered;
+	};
 	auto lowerRequirement = [&](const ResourceRequirement& requirement) {
 		auto* resource = resolve(requirement.resourceHandleAndRange.resource);
 		if (!resource) throw std::runtime_error("Persistent lowering: pass '" + pass.name + "' declares an unresolvable resource");
 		const auto range = LowerRange(requirement.resourceHandleAndRange.range, ShapeOf(*resource));
 		if (!range) return;
-		result.entries.push_back({resource->GetSchedulingResourceID(), resource, *range, LowerState(requirement.state)});
+		result.entries.push_back(makeUse(resource, *range, LowerState(requirement.state)));
 	};
 	// Every requirement the pass declared, including resolver members and the old compiler's requirement blocks.
 	const auto requirements = GetFrameRequirementsSpan(resources);
@@ -287,6 +317,7 @@ LoweredPass LowerPass(RenderGraph& graph, ResourceRegistry& registry, const Queu
 			if (!plan->memberIDs.contains(requirement.resourceHandleAndRange.resource.GetGlobalResourceID())) lowerRequirement(requirement);
 		for (size_t i = 0; i < pass.resolverSnapshots.size(); ++i) {
 			const auto& snapshot = pass.resolverSnapshots[i];
+			if (PreparedVersions(snapshot.resolver.get())) continue;  // its requirements were lowered above
 			LoweredGroup group;
 			// The declaration's own capture. Its uses name these members.
 			const auto& state = snapshot.state;
@@ -327,22 +358,22 @@ LoweredPass LowerPass(RenderGraph& graph, ResourceRegistry& registry, const Queu
 		for (const auto& requirement : requirements) lowerRequirement(requirement);
 		std::unordered_map<const Resource*, std::shared_ptr<Resource>> owners;
 		for (const auto& snapshot : pass.resolverSnapshots) {
-			if (!snapshot.resolver) continue;
+			if (!snapshot.resolver || PreparedVersions(snapshot.resolver.get())) continue;
 			const auto& state = snapshot.state;
 			addSnapshotWaits(snapshot);
 			result.directResolvers.emplace_back(snapshot.resolver->Clone(), state ? state->resourceSetIdentity : ResolverResourceSetIdentity{});
 			if (state && state->resources)
 				for (const auto& member : *state->resources) if (member) owners.emplace(member.get(), member);
 		}
-		for (auto& use : result.entries)
-			if (const auto found = owners.find(use.resource); found != owners.end()) use.owner = found->second;
+		for (auto& entry : result.entries)
+			if (const auto found = owners.find(entry.resource); !entry.versioned && found != owners.end()) entry.owner = found->second;
 	}
 	for (const auto& [handleAndRange, state] : resources.internalTransitions) {
 		auto* resource = resolve(handleAndRange.resource);
 		if (!resource) throw std::runtime_error("Persistent lowering: pass '" + pass.name + "' transitions an unresolvable resource");
 		const auto range = LowerRange(handleAndRange.range, ShapeOf(*resource));
 		if (!range) continue;
-		result.exits.push_back({resource->GetSchedulingResourceID(), resource, *range, LowerState(state)});
+		result.exits.push_back(makeUse(resource, *range, LowerState(state)));
 	}
 	// A pass recorded at execution shares its batch only with others recorded at execution (GraphCompiler's batching).
 	declaration.forceBatchIsolation = !result.explicitWaits.empty()

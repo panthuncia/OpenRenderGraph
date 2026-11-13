@@ -223,7 +223,7 @@ bool RenderGraph::IsPersistentAliasCandidate(Resource* concrete) const {
 	return false;
 }
 
-// Binds every declared, unbound, non-swapchain slot before a structural build.
+// Binds every declared, unbound slot that is not a versioned slot before a structural build.
 // Direct alias candidates stay unbound so the planner can place them, unless
 // several unbound slots share one concrete backing: unbound slots carry unique
 // placeholder identities and would not canonicalize, so the schedule would miss
@@ -233,10 +233,10 @@ void RenderGraph::BindUnboundPersistentEntries(persistent::GraphEditTransaction&
 	auto& state = *m_compilerState->persistent;
 	std::unordered_map<Resource*, uint32_t> unboundSlotsByConcrete;
 	for (const auto& entry : state.entries)
-		if (entry.resource && !entry.swapchain && !entry.isBound) ++unboundSlotsByConcrete[UnwrapDynamic(entry.resource)];
+		if (entry.resource && !entry.versioned && !entry.isBound) ++unboundSlotsByConcrete[UnwrapDynamic(entry.resource)];
 	for (uint32_t index = 0; index < state.entries.size(); ++index) {
 		auto& entry = state.entries[index];
-		if (!entry.resource || entry.swapchain || entry.isBound) continue;
+		if (!entry.resource || entry.versioned || entry.isBound) continue;
 		auto* concrete = UnwrapDynamic(entry.resource);
 		auto* backed = concrete ? dynamic_cast<BackedResource*>(concrete) : nullptr;
 		if (backed && !backed->IsMaterialized()) {
@@ -335,7 +335,7 @@ void RenderGraph::SubmitPersistentStructuralBuild(const std::vector<uint32_t>& s
 				auto lowered = lowering::LowerPass(*this, _registry, m_queueRegistry, primaryBackend, value, any.type);
 				AwaitPassPipelines(value.resources, lowered.device, main.name);
 				const auto* dynamic = dynamic_cast<const IDynamicDeclaredResources*>(value.pass.get());
-				UseRebindSlots(*this, main, lowered, dynamic);
+				UseRebindSlots(main, lowered, dynamic);
 				if (!(dynamic && dynamic->PreparesOnlyDeclaredWork()) && LoweringAddsDeclarations(main, lowered)) {
 					// Name the pass, so an app can find what makes it rebuild inline.
 					spdlog::info("Persistent structural build inline: pass '{}' declares resources the live executable lacks", main.name);
@@ -685,7 +685,7 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 	std::unordered_map<Resource*, std::vector<uint32_t>> entriesByConcrete;
 	for (uint32_t index = 0; index < state.entries.size(); ++index) {
 		const auto& entry = state.entries[index];
-		if (entry.resource && !entry.swapchain) entriesByConcrete[UnwrapDynamic(entry.resource)].push_back(index);
+		if (entry.resource && !entry.versioned) entriesByConcrete[UnwrapDynamic(entry.resource)].push_back(index);
 	}
 	auto device = DeviceManager::GetInstance().GetDevice();
 	std::unordered_set<Resource*> notAliasable;
@@ -694,7 +694,7 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		const auto slot = executable.resourceSlots[resourceIndex];
 		if (slot.index >= state.entries.size()) return UINT32_MAX;
 		const auto& entry = state.entries[slot.index];
-		if (!entry.resource || entry.swapchain) return UINT32_MAX;
+		if (!entry.resource || entry.versioned) return UINT32_MAX;
 		auto* concrete = UnwrapDynamic(entry.resource);
 		if (!IsPersistentAliasCandidate(concrete)) {
 			if (logging) notAliasable.insert(concrete);

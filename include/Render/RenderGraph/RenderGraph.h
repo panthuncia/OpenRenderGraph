@@ -56,6 +56,7 @@ class ExternalEpochExecution;
 class ExternalClient;
 class PersistentAliasArena;
 class AliasHeapGeneration;
+class IVersionedResource;
 struct IPassBuilder;
 struct IDynamicDeclaredResources;
 
@@ -484,10 +485,13 @@ public:
 	// reads its output (a presentation copy) submits through GetExternalClient(), which orders it after the frame.
 	void SetPresentPass(std::string name) { m_presentPass = std::move(name); }
 	const std::string& GetPresentPass() const noexcept { return m_presentPass; }
-	// The swapchain image. It must be a DynamicResource that points at the image being rendered. The graph binds
-	// its current image every frame instead of keeping a persistent binding for it.
+	// The swapchain image. It must be a DynamicResource that points at the image being rendered. The graph treats it as a
+	// versioned resource whose version for each preparation is the image the wrapper points at then (SwapchainVersions).
+	// Recordings that bind it are never kept for reuse (IVersionedResource::PerFrame).
 	void SetSwapchainResource(std::shared_ptr<Resource> resource);
 	bool IsSwapchainResource(const Resource* resource) const noexcept { return resource && resource == m_swapchain.get(); }
+	// The swapchain as a versioned resource. Null without one.
+	const std::shared_ptr<const IVersionedResource>& SwapchainVersions() const noexcept { return m_swapchainVersions; }
 	org::memory::SnapshotProvider& GetMemorySnapshotProvider() { return m_memorySnapshotProvider; }
 	const org::memory::SnapshotProvider& GetMemorySnapshotProvider() const { return m_memorySnapshotProvider; }
 	void WriteVramUsageDebugDumpNow(uint32_t frameIndex) const { WriteVramUsageDebugDump(frameIndex); }
@@ -868,6 +872,7 @@ private:
 	std::optional<PresentDependency> m_lastPresentDependency;
 	std::string m_presentPass;              // SetPresentPass
 	std::shared_ptr<Resource> m_swapchain;  // SetSwapchainResource
+	std::shared_ptr<const IVersionedResource> m_swapchainVersions;
 
 
 	void EnsureMinimumAutomaticSchedulingQueues();
