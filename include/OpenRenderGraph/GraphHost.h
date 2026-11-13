@@ -376,9 +376,9 @@ public:
 		// Desc::queueScopedUploads: staged copies recorded on another queue than graphics, ahead of the batch that first uses them;
 		// and batches off the graphics queue spared the wait for the graphics queue's uploads (they use nothing those write).
 		uint64_t queueUploadCopies = 0, sparedUploadWaits = 0;
-		// Of the staged destinations bound to a publication channel (runtime::PublicationChannels): those recorded on a declaring
+		// Of the staged destinations that are a late-bound version's backing (VersionedBuffer::CreateLateBound): those recorded on a declaring
 		// batch's queue, and those a batch off the graphics queue waited for.
-		uint64_t channelRoutedUploads = 0, channelUploadWaits = 0;
+		uint64_t lateRoutedUploads = 0, lateUploadWaits = 0;
 		// Upload destinations no batch declared. Each made every batch of its ticket off the graphics queue wait for the uploads.
 		uint64_t undeclaredUploads = 0;
 		uint64_t wakesSkipped = 0;  // submissions whose completion the host's thread took at a GPU wake-up instead of a signal

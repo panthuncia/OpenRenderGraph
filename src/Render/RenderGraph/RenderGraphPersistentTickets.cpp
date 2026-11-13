@@ -1,6 +1,6 @@
 // Persistent execution, tickets (async epochs): preparation, kept recordings, submission and pending uploads.
 #include "RenderGraphPersistentState.h"
-#include "Render/Runtime/PublicationChannels.h"
+#include "Resources/Buffers/VersionedBuffer.h"
 
 namespace org {
 
@@ -137,7 +137,7 @@ uint32_t RenderGraph::PersistentTicketSparedUploadWaits(const PersistentTicket& 
 RenderGraph::TicketUploadStats RenderGraph::PersistentTicketUploadStats(const PersistentTicket& ticket) noexcept {
 	const auto& plan = ticket.queueUploads;
 	if (!plan.planned) return {};
-	return {plan.channelRouted, plan.channelWaits, plan.undeclared};
+	return {plan.lateRouted, plan.lateWaits, plan.undeclared};
 }
 
 std::shared_ptr<const RenderGraph::PersistentRecording> RenderGraph::PersistentTicketRecording(const PersistentTicket& ticket) noexcept {
@@ -706,8 +706,8 @@ struct TicketUploadRouting {
 	std::vector<uint32_t> firstOnQueue;             // per queue slot: its first batch, UINT32_MAX for none
 	std::vector<size_t> copies;                     // per queue slot: the staged copies routed to it
 	std::vector<std::vector<compiler::ExecutionTimelinePoint>> waits;  // per queue slot: its upload list's waits
-	// Destinations bound to a publication channel (statistics): routed to a declaring batch's queue, or waited for off graphics.
-	uint32_t channelRouted = 0, channelWaits = 0;
+	// Destinations that are a late-bound version's backing (statistics): routed to a declaring batch's queue, or waited for off graphics.
+	uint32_t lateRouted = 0, lateWaits = 0;
 	uint32_t undeclared = 0;  // destinations no batch declares (statistics)
 };
 
@@ -750,19 +750,20 @@ bool PlanTicketUploads(const RenderGraph::PersistentTicket& ticket, uint32_t gra
 	destinations.reserve(graphicsBuffers.size() + staged.size());
 	for (const auto handle : graphicsBuffers) destinations[UploadBufferKey(handle)].graphics = true;
 	for (const auto handle : staged) destinations[UploadBufferKey(handle)].staged = true;
-	// Publication channels (runtime::PublicationChannels): a destination bound to a channel is used by every batch that declares
-	// the channel's resource, as if that batch declared the destination itself. By the channel's backing: its destinations.
-	std::unordered_map<uint64_t, std::vector<uint64_t>> channelDestinations;
-	if (runtime::PublicationChannels::Any()) {
-		auto bindChannel = [&](rhi::ResourceHandle handle) {
-			const auto channel = runtime::PublicationChannels::ChannelOf(handle);
-			if (!channel.valid()) return;
-			auto& members = channelDestinations[UploadBufferKey(channel)];
+	// Late-bound versions (VersionedBuffer::CreateLateBound): a destination that is a live version's backing is used by every
+	// batch that declares the buffer (its stand-in), as if that batch declared the destination itself. By the stand-in's
+	// backing: its destinations.
+	std::unordered_map<uint64_t, std::vector<uint64_t>> lateDestinations;
+	if (detail::AnyLateBacking()) {
+		auto bindLate = [&](rhi::ResourceHandle handle) {
+			const auto standIn = detail::LateStandInOf(handle);
+			if (!standIn.valid()) return;
+			auto& members = lateDestinations[UploadBufferKey(standIn)];
 			const auto key = UploadBufferKey(handle);
 			if (std::ranges::find(members, key) == members.end()) members.push_back(key);
 		};
-		for (const auto handle : graphicsBuffers) bindChannel(handle);
-		for (const auto handle : staged) bindChannel(handle);
+		for (const auto handle : graphicsBuffers) bindLate(handle);
+		for (const auto handle : staged) bindLate(handle);
 	}
 	auto addUse = [](Destination& destination, uint32_t batch, uint32_t resource) {
 		auto& uses = destination.uses;
@@ -778,9 +779,9 @@ bool PlanTicketUploads(const RenderGraph::PersistentTicket& ticket, uint32_t gra
 				addUse(found->second, batch, access.resource);
 				if (backing.aliasSize || backing.aliasHeapIdentity || backing.aliasHeap) found->second.aliased = true;
 			}
-			// The channel's own aliasing says nothing of its destinations' memory.
-			if (const auto channel = channelDestinations.find(key); channel != channelDestinations.end())
-				for (const auto member : channel->second) addUse(destinations.at(member), batch, access.resource);
+			// The stand-in's own aliasing says nothing of its destinations' memory.
+			if (const auto standIn = lateDestinations.find(key); standIn != lateDestinations.end())
+				for (const auto member : standIn->second) addUse(destinations.at(member), batch, access.resource);
 		}
 
 	// Whether each batch is ordered after a queue's first batch: on that queue, or behind a batch that is (its queue's order,
@@ -860,15 +861,15 @@ bool PlanTicketUploads(const RenderGraph::PersistentTicket& ticket, uint32_t gra
 	if (out.undeclared)
 		for (uint32_t batch = 0; batch < batchCount; ++batch)
 			if (graph.batches[batch].queue != graphicsQueue) out.waitsForUploads[batch] = 1;
-	// Statistics: the destinations bound to a channel that a declaring batch took to its own queue, and those that made a batch off
+	// Statistics: the late-bound versions' backings that a declaring batch took to its own queue, and those that made a batch off
 	// the graphics queue wait for the graphics list.
-	for (const auto& [channel, members] : channelDestinations)
+	for (const auto& [standIn, members] : lateDestinations)
 		for (const auto member : members) {
 			const auto& destination = destinations.at(member);
 			if (destination.uses.empty()) continue;
-			if (out.routed.contains(member)) ++out.channelRouted;
+			if (out.routed.contains(member)) ++out.lateRouted;
 			else if (std::ranges::any_of(destination.uses, [&](const auto& use) { return graph.batches[use.first].queue != graphicsQueue; }))
-				++out.channelWaits;
+				++out.lateWaits;
 		}
 	return true;
 }
@@ -940,8 +941,8 @@ bool RenderGraph::RecordPendingUploads(rhi::Device device, rhi::CommandList& lis
 		auto& plan = ticket->queueUploads;
 		plan.planned = true;
 		plan.waitsForUploads = std::move(routing.waitsForUploads);
-		plan.channelRouted = routing.channelRouted;
-		plan.channelWaits = routing.channelWaits;
+		plan.lateRouted = routing.lateRouted;
+		plan.lateWaits = routing.lateWaits;
 		plan.undeclared = routing.undeclared;
 		const auto& planGraph = *ticket->segments.front().admission.publication->executable->graph;
 		for (uint32_t batch = 0; batch < plan.waitsForUploads.size(); ++batch)

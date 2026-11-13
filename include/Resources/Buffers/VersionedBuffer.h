@@ -19,7 +19,23 @@ struct BufferVersion {
     uint64_t number = 0;
     std::shared_ptr<Buffer> buffer;
     std::shared_ptr<const ResolverDeclarationState> declaration;  // what a preparation resolving this version declares
+    // A late-bound version only (VersionedBuffer::PublishLate): what keeps its backing (a pooled lease, say), and its entry in
+    // the upload planner's map. Both are released with the version.
+    std::shared_ptr<const void> owner;
+    std::shared_ptr<void> publication;
 };
+
+namespace detail {
+// Late-bound versions' backings, by the stand-in their readers declare (VersionedBuffer::CreateLateBound). The upload planner
+// (RenderGraph::RecordPendingUploads' queue-scoped uploads) reads it. Any thread.
+// - BindLateBacking: names `backing` as content of `standIn` until the returned token is released. Binding a backing again
+//   replaces its stand-in, and releasing the older token then keeps the newer entry. Invalid handles bind nothing (null).
+// - LateStandInOf: the stand-in `backing` is bound to, or an invalid handle.
+// - AnyLateBacking: whether anything is bound, so the planner can skip the lookups.
+[[nodiscard]] std::shared_ptr<void> BindLateBacking(rhi::ResourceHandle backing, rhi::ResourceHandle standIn);
+[[nodiscard]] rhi::ResourceHandle LateStandInOf(rhi::ResourceHandle backing) noexcept;
+[[nodiscard]] bool AnyLateBacking() noexcept;
+}  // namespace detail
 
 // What a revision names as its immutable inputs: the version of each versioned buffer its passes use. A preparation
 // made for host data (the hostData of RenderGraph::PreparePersistentTicket) resolves every VersionedBuffer through
@@ -44,8 +60,15 @@ struct IResourceVersions {
 // 3. The version is ready once those copies complete.
 // 4. The owner adopts it when the revision that names it is selected.
 //
+// Late-bound versions (CreateLateBound) are for data a host publishes after the recordings that read it, such as a fresh
+// pooled backing each frame. Shaders read it through the bindless index the host writes into frame data, so no recording
+// binds it. Passes declare the buffer as usual, but it always resolves to a stand-in that never changes. So a new version
+// costs no binding edit and no lowering. While a version lives, the upload planner takes each batch that declares the
+// buffer as a user of the version's backing: an upload into it goes to that batch's queue, or the batch waits for it.
+// Barriers come from the upload lists' own barriers, so the readers must only read.
+//
 // Thread contract:
-// - Make* may run on any thread.
+// - Make* and PublishLate may run on any thread.
 // - Publish, Adopt and Grow* run on the owner thread.
 // - Current, Key and the resolver calls may run on any thread. The current version is an atomic shared_ptr, read
 //   whole.
@@ -55,6 +78,38 @@ public:
         auto versioned = std::shared_ptr<VersionedBuffer>(new VersionedBuffer());
         versioned->Publish(std::move(first));
         return versioned;
+    }
+    // A late-bound buffer. `standIn` is what its readers' declarations resolve to: any small materialized buffer that lives as
+    // long as this one. It has no version until the first PublishLate.
+    static std::shared_ptr<VersionedBuffer> CreateLateBound(std::shared_ptr<Buffer> standIn) {
+        if (!standIn) throw std::invalid_argument("VersionedBuffer: a late-bound buffer needs a stand-in");
+        auto versioned = std::shared_ptr<VersionedBuffer>(new VersionedBuffer());
+        auto declaration = std::make_shared<ResolverDeclarationState>();
+        declaration->tracked = true;
+        declaration->dependencyIdentity = versioned->m_state;
+        declaration->resourceSetIdentity = {standIn->GetSchedulingResourceID(), 0};
+        declaration->resources = std::make_shared<const ResolverResourceList>(ResolverResourceList{standIn});
+        versioned->m_state->lateDeclaration = std::move(declaration);
+        versioned->m_state->standIn = std::move(standIn);
+        return versioned;
+    }
+    [[nodiscard]] bool LateBound() const noexcept { return m_state->standIn != nullptr; }
+    // Late-bound only, any thread: `backing` becomes the current version. `owner` is kept alive with the version (the lease
+    // of a pooled backing, say). Hold the version while an upload into `backing` may still be recorded, and while the GPU
+    // may read it.
+    std::shared_ptr<const BufferVersion> PublishLate(std::shared_ptr<Buffer> backing, std::shared_ptr<const void> owner = {}) {
+        if (!LateBound()) throw std::logic_error("VersionedBuffer: PublishLate needs a late-bound buffer");
+        if (!backing) throw std::invalid_argument("VersionedBuffer: a version needs a buffer");
+        auto version = std::make_shared<BufferVersion>();
+        version->number = m_state->published.fetch_add(1, std::memory_order_relaxed) + 1;
+        version->declaration = m_state->lateDeclaration;
+        version->publication = detail::BindLateBacking(backing->GetAPIResource().GetHandle(),
+            m_state->standIn->GetAPIResource().GetHandle());
+        if (!version->publication) throw std::runtime_error("VersionedBuffer: a late version's backing or stand-in is not materialized");
+        version->owner = std::move(owner);
+        version->buffer = std::move(backing);
+        m_state->current.store(version, std::memory_order_release);
+        return version;
     }
 
     [[nodiscard]] std::shared_ptr<const BufferVersion> Current() const noexcept {
@@ -69,7 +124,7 @@ public:
     // Identifies the buffer across its versions (and the resolver's clones).
     [[nodiscard]] const void* Key() const noexcept { return m_state.get(); }
 
-    // Owner thread: installs `next` as the current version.
+    // Owner thread: installs `next` as the current version. Not for a late-bound buffer (PublishLate).
     std::shared_ptr<const BufferVersion> Publish(std::shared_ptr<Buffer> next) {
         auto version = Make(std::move(next));
         Adopt(version);
@@ -79,6 +134,7 @@ public:
     // its owner makes it current (Adopt) when that revision is selected. Until then, writes and live preparations use the
     // current version.
     std::shared_ptr<const BufferVersion> Make(std::shared_ptr<Buffer> next) {
+        if (LateBound()) throw std::logic_error("VersionedBuffer: a late-bound buffer's versions come from PublishLate");
         if (!next) throw std::invalid_argument("VersionedBuffer: a version needs a buffer");
         auto version = std::make_shared<BufferVersion>();
         version->number = m_state->published.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -129,10 +185,17 @@ public:
         return version;
     }
 
-    // IResourceResolver: the current version, or the one the preparation's revision names.
-    std::vector<std::shared_ptr<Resource>> Resolve() const override { return {Get()}; }
-    std::shared_ptr<const ResolverDeclarationState> CaptureDeclarationState() const override { return Current()->declaration; }
+    // IResourceResolver: the current version, or the one the preparation's revision names. A late-bound buffer: its stand-in.
+    std::vector<std::shared_ptr<Resource>> Resolve() const override {
+        if (LateBound()) return {m_state->standIn};
+        return {Get()};
+    }
+    std::shared_ptr<const ResolverDeclarationState> CaptureDeclarationState() const override {
+        if (LateBound()) return m_state->lateDeclaration;
+        return Current()->declaration;
+    }
     std::shared_ptr<const ResolverDeclarationState> CaptureDeclarationState(const ResolverCaptureContext& context) const override {
+        if (LateBound()) return m_state->lateDeclaration;
         if (const auto data = context.Get<IHostExecutionData>())
             if (const auto* versions = data->Get<IResourceVersions>())
                 if (const auto version = versions->Find(*this)) return version->declaration;
@@ -147,6 +210,9 @@ private:
     struct State {
         std::atomic<std::shared_ptr<const BufferVersion>> current;
         std::atomic<uint64_t> published{ 0 };  // number of the last version made (by Make, on any thread)
+        // A late-bound buffer only: what its declarations resolve to, set once at creation.
+        std::shared_ptr<Buffer> standIn;
+        std::shared_ptr<const ResolverDeclarationState> lateDeclaration;
     };
     std::shared_ptr<State> m_state;
 };

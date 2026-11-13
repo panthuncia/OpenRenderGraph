@@ -2391,8 +2391,8 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 	if (submitted.uploadSignal.second) m_asyncStats.sparedUploadWaits += RenderGraph::PersistentTicketSparedUploadWaits(*ticket);
 	{
 		const auto uploads = RenderGraph::PersistentTicketUploadStats(*ticket);
-		m_asyncStats.channelRoutedUploads += uploads.channelRouted;
-		m_asyncStats.channelUploadWaits += uploads.channelWaits;
+		m_asyncStats.lateRoutedUploads += uploads.lateRouted;
+		m_asyncStats.lateUploadWaits += uploads.lateWaits;
 		m_asyncStats.undeclaredUploads += uploads.undeclared;
 	}
 	submitted.ticket = std::move(ticket);

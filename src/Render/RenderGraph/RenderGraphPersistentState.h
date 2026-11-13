@@ -250,8 +250,8 @@ struct RenderGraph::PersistentTicket {
 		bool planned = false;  // false: every batch off the uploads' queue waits for them
 		std::vector<uint8_t> waitsForUploads;  // per batch of segments.front(): it uses what the graphics uploads write
 		uint32_t spared = 0;  // batches off the graphics queue that do not (statistics)
-		// Destinations bound to a publication channel (statistics): routed to a declaring batch's queue, or waited for off graphics.
-		uint32_t channelRouted = 0, channelWaits = 0;
+		// Destinations that are a late-bound version's backing (statistics): routed to a declaring batch's queue, or waited for off graphics.
+		uint32_t lateRouted = 0, lateWaits = 0;
 		// Destinations no batch declares (statistics). Shaders may still read them through a bindless index, so every batch off
 		// the graphics queue waited for the graphics list.
 		uint32_t undeclared = 0;

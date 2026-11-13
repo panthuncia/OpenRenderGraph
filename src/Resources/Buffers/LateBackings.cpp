@@ -1,17 +1,19 @@
-#include "Render/Runtime/PublicationChannels.h"
+// The late-bound versions' backings by stand-in (VersionedBuffer::CreateLateBound, detail::BindLateBacking).
+
+#include "Resources/Buffers/VersionedBuffer.h"
 
 #include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <unordered_map>
 
-namespace org::runtime {
+namespace org::detail {
 namespace {
 
 uint64_t Key(rhi::ResourceHandle handle) noexcept { return (uint64_t{handle.generation} << 32) | handle.index; }
 
 struct Entry {
-    rhi::ResourceHandle channel;
+    rhi::ResourceHandle standIn;
     uint64_t serial = 0;  // the binding that made it, so releasing an older one keeps a newer one
 };
 
@@ -42,26 +44,26 @@ struct Binding {
 
 } // namespace
 
-std::shared_ptr<void> PublicationChannels::Bind(rhi::ResourceHandle backing, rhi::ResourceHandle channel) {
-    if (!backing.valid() || !channel.valid()) return nullptr;
+std::shared_ptr<void> BindLateBacking(rhi::ResourceHandle backing, rhi::ResourceHandle standIn) {
+    if (!backing.valid() || !standIn.valid()) return nullptr;
     auto& registry = Get();
     auto binding = std::make_shared<Binding>();
     binding->backing = Key(backing);
     std::lock_guard lock(registry.mutex);
     binding->serial = ++registry.nextSerial;
-    registry.byBacking[binding->backing] = {channel, binding->serial};
+    registry.byBacking[binding->backing] = {standIn, binding->serial};
     registry.count.store(registry.byBacking.size(), std::memory_order_release);
     return binding;
 }
 
-rhi::ResourceHandle PublicationChannels::ChannelOf(rhi::ResourceHandle backing) noexcept {
+rhi::ResourceHandle LateStandInOf(rhi::ResourceHandle backing) noexcept {
     auto& registry = Get();
     if (registry.count.load(std::memory_order_acquire) == 0) return {};
     std::lock_guard lock(registry.mutex);
     const auto found = registry.byBacking.find(Key(backing));
-    return found == registry.byBacking.end() ? rhi::ResourceHandle{} : found->second.channel;
+    return found == registry.byBacking.end() ? rhi::ResourceHandle{} : found->second.standIn;
 }
 
-bool PublicationChannels::Any() noexcept { return Get().count.load(std::memory_order_acquire) != 0; }
+bool AnyLateBacking() noexcept { return Get().count.load(std::memory_order_acquire) != 0; }
 
-} // namespace org::runtime
+} // namespace org::detail
