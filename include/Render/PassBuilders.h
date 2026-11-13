@@ -902,6 +902,10 @@ private:
         for (const auto& range : ranges) {
             auto* concrete = BuilderGraphAccess::Resolve(graph, range.resource);
             if (!concrete) throw std::invalid_argument("Resource declaration did not resolve");
+            // The graph does not track an externally immutable resource, so a pass may only read it.
+            if (concrete->GetGraphOwnership() == Resource::GraphOwnership::ExternalImmutableShaderResource
+                && specification.access != rhi::ResourceAccessType::ShaderResource)
+                throw std::invalid_argument("Resource '" + concrete->GetName() + "' is externally immutable: a pass may only read it");
             const auto validBound = [](Bound bound, uint32_t count) {
                 return bound.type == BoundType::All || bound.value < count;
             };

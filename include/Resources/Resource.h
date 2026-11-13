@@ -379,6 +379,13 @@ public:
 	// The host owns it: it allocated it and uses it between the graph's executions. With external home states
 	// (RenderGraph::SetPersistentExternalHomeStates), every execution gives it back in its home state, on the graphics queue.
 	virtual bool HostOwned() const noexcept { return false; }
+	// A graph-owned resource the host still touches between the graph's executions (an interop bridge, until the host's own
+	// uses become passes). With external home states it goes home as a host-owned texture does: every execution gives it back
+	// in the state its tracker held when it was captured (its home), on the graphics queue. Set it before any graph captures it.
+	void SetHostHome(bool hostHome) noexcept { m_hostHome = hostHome; }
+	bool HostHome() const noexcept { return m_hostHome; }
+	// Whether every execution gives it back in its home state under external home states: host-owned, or graph-owned with a host home.
+	bool GoesHome() const noexcept { return HostOwned() || m_hostHome; }
 	void AddAliasedResource(Resource* resource) {
 		m_aliasedResources.push_back(resource);
 	}
@@ -440,6 +447,7 @@ private:
 	inline static ECSEntityHooks s_ecsEntityHooks{};
     uint64_t m_globalResourceID;
 	GraphOwnership m_graphOwnership = GraphOwnership::GraphManaged;
+	bool m_hostHome = false;
 	ECSEntityHandle m_ecsEntity; // For access through ECS queries without dereferencing Flecs during teardown
 
     //friend class RenderGraph;

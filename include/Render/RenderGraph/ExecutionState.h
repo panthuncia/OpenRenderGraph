@@ -41,6 +41,9 @@ struct PreparedBackingState {
     // The host owns it (Resource::HostOwned): with external home states (Prepare's externalHome), each execution leaves it in
     // its home state on the graphics queue.
     bool hostOwned = false;
+    // Externally immutable (Resource::GraphOwnership::ExternalImmutableShaderResource): already in its shader-read state, and
+    // never written while the graph reads it. The graph plans no barriers, seeds or commits for it, and keeps no ledger entry.
+    bool exempt = false;
     // A resource shared across devices: its handle on each device instance (by index; [0] is resource). Barriers on a queue use
     // its device's handle, and a use on another device than the last is an external ownership handoff. Empty: one device.
     std::vector<rhi::ResourceHandle> deviceHandles;

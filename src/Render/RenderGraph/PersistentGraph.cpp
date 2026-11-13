@@ -67,7 +67,8 @@ void ValidateSharedBacking(const BindingVersion& a, const BindingVersion& b) {
             && x.heapType == y.heapType && x.aliasHeapIdentity == y.aliasHeapIdentity
             && x.aliasHeap.get() == y.aliasHeap.get() && !x.aliasHeap.owner_before(y.aliasHeap)
             && !y.aliasHeap.owner_before(x.aliasHeap) && x.aliasPoolID == y.aliasPoolID
-            && x.aliasOffset == y.aliasOffset && x.aliasSize == y.aliasSize && x.hostOwned == y.hostOwned,
+            && x.aliasOffset == y.aliasOffset && x.aliasSize == y.aliasSize && x.hostOwned == y.hostOwned
+            && x.exempt == y.exempt,
             "Shared physical slots disagree on placement");
         Require(x.regions && y.regions && x.regions->size() == y.regions->size(),
             "Shared physical slots disagree on incoming state");

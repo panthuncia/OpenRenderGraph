@@ -129,7 +129,8 @@ inline PreparedBackingState BackingStateOf(Resource& concrete, const ResourceBin
 	}
 	rhi::ResourceDesc description{};
 	if (concrete.TryGetRHIResourceDesc(description)) initial.heapType = description.heapType;
-	initial.hostOwned = concrete.HostOwned();
+	initial.hostOwned = concrete.GoesHome();
+	initial.exempt = concrete.GetGraphOwnership() == Resource::GraphOwnership::ExternalImmutableShaderResource;
 	return initial;
 }
 

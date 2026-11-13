@@ -867,11 +867,9 @@ void RenderGraph::AddResource(std::shared_ptr<Resource> resource, bool transitio
 	if (!resource) {
 		throw std::invalid_argument("RenderGraph::AddResource received a null resource");
 	}
-	if (!resource->IsRenderGraphManaged()) {
-		throw std::runtime_error(
-			"RenderGraph::AddResource rejected externally managed shader resource '" +
-			resource->GetName() + "' (id=" + std::to_string(resource->GetGlobalResourceID()) + ")");
-	}
+	// An externally immutable shader resource (GraphOwnership::ExternalImmutableShaderResource) is accepted so that passes can name
+	// it and read it through its views, but the graph does not track it: admission plans no barriers, seeds or commits for it
+	// (PreparedBackingState::exempt), and a pass may only read it (RenderPassBuilder's DeclareResourceUse refuses a write).
 	const uint64_t resourceID = resource->GetGlobalResourceID();
 	if (auto dynamicResource = std::dynamic_pointer_cast<DynamicResource>(resource)) {
 		m_dynamicResourcesByStableID[dynamicResource->GetDynamicWrapperGlobalResourceID()] = resource;

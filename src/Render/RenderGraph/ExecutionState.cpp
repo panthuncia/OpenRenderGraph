@@ -282,6 +282,8 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
         if (step.pass >= graph.batchByPass.size() || graph.batchByPass[step.pass] != step.batch)
             throw std::invalid_argument("Symbolic state step has no consuming pass placement");
         if (!captured.resource.valid()) continue; // Reserved slot: no barriers, seeds or commits.
+        // Externally immutable: it rests in its shader-read state and nothing writes it, so nothing to plan.
+        if (captured.exempt) continue;
         auto& output = result.batches[step.batch];
         auto& beforePass = output.beforePass[graph.positionByPass[step.pass]];
         const bool crossQueue = step.previousBatch != UINT32_MAX
@@ -748,7 +750,7 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
         for (uint32_t index = 0; index < graph.states.steps.size(); ++index) {
             const auto& step = graph.states.steps[index];
             const auto& captured = ordered[step.resource];
-            if (!captured.resource.valid()) continue;
+            if (!captured.resource.valid() || captured.exempt) continue;
             const bool external = goesHomeExternally(captured);
             if (!closeToHome && !external) continue;
             auto& cells = byResource[step.resource];
