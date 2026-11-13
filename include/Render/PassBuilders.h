@@ -549,6 +549,14 @@ std::is_same_v<std::remove_cvref_t<T>, IResourceResolver>;
 template<typename T>
 concept NotIResourceResolver = !std::derived_from<std::decay_t<T>, IResourceResolver>; // annoying
 
+// A client's handle that picks what a use declares: a resolver (such as a versioned slot) when DeclaredResolver is not
+// null, else the resource DeclaredResource returns. A client keeps one handle type for both kinds this way.
+template<typename T>
+concept SelfDeclaringResource = requires(const T& value) {
+    { value.DeclaredResolver() } -> std::convertible_to<const IResourceResolver*>;
+    { value.DeclaredResource() } -> std::convertible_to<std::shared_ptr<Resource>>;
+};
+
 template<typename T>
 concept DerivedRenderPass = std::derived_from<T, RenderPass>;
 
@@ -836,7 +844,7 @@ public:
 
 private:
     template<class T>
-        requires (!std::derived_from<T, IResourceResolver>)
+        requires (!std::derived_from<T, IResourceResolver> && !SelfDeclaringResource<T>)
     DeclaredResourceUse DeclareResourceUse(const T& resource, ResourceUseSpecification specification) {
         ValidateResourceUse(specification);
         if constexpr (detail::SharedPtrToResource<T>) {
@@ -970,6 +978,14 @@ private:
     }
     DeclaredResourceUse DeclareResourceUse(const IResourceResolver& resolver, ResourceUseSpecification specification) {
         return DeclareResourceUse(ResourceResolverAndRange{resolver}, std::move(specification));
+    }
+    // A self-declaring handle: its resolver, or else its resource.
+    template<class T>
+        requires SelfDeclaringResource<T>
+    DeclaredResourceUse DeclareResourceUse(const T& value, ResourceUseSpecification specification) {
+        if (const IResourceResolver* resolver = value.DeclaredResolver())
+            return DeclareResourceUse(*resolver, std::move(specification));
+        return DeclareResourceUse(std::shared_ptr<Resource>(value.DeclaredResource()), std::move(specification));
     }
 
 public:
