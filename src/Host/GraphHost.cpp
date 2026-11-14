@@ -347,6 +347,49 @@ struct GraphHost::Async {
 	}
 };
 
+// What CommitTicket hands to FinishTicket: the ticket, checked current after the caller's commit, and the values of the
+// render thread's state that the rest of the submission needs.
+struct GraphHost::TicketCommit {
+	uint32_t index = 0;  // the epoch's index in the async state
+	std::shared_ptr<RenderGraph::PersistentTicket> ticket;
+	RunRef run{};
+	bool external = false;  // an external epoch's ticket (RenderGraph::IsExternalPersistentEpoch)
+	// What retired at the commit (the runtime's deletion queues, external runs' releases), destroyed on the host's thread once
+	// the submission completes.
+	std::shared_ptr<void> retired;
+	std::shared_ptr<const void> resourceOwner;
+	uint64_t number = 0;     // the submission's number (SubmissionsMade)
+	uint64_t seal = 0;       // the seals before it (Seals)
+	uint64_t frameWait = 0;  // what its batches wait for (SetFrameWaitValue), as it was at the commit
+};
+
+// The submission thread's queue (Desc::submissionThread). The render thread pushes an entry after each commit. The thread
+// finishes the entries in order.
+struct GraphHost::SubmitQueue {
+	struct Entry {
+		enum class Kind : uint8_t { Ticket, Closure, Stop } kind = Kind::Stop;
+		Async* async = nullptr;  // a ticket's async state
+		std::optional<TicketCommit> commit;
+		std::function<void()> closure;
+	};
+	// The most entries queued at once. A full queue makes the render thread wait for room (backpressure), so the render thread
+	// never runs further ahead of the queue than this.
+	static constexpr size_t kCapacity = 64;
+	std::mutex mutex;
+	std::condition_variable work;      // the thread waits here for entries
+	std::condition_variable progress;  // a full push waits here for room, a drain for the thread to pass its entries
+	std::deque<Entry> entries;
+	uint64_t pushed = 0;  // entries pushed so far
+	uint64_t passed = 0;  // entries the thread has finished
+	std::atomic<bool> failed{false};
+	std::string error;  // the first failure, written under the mutex before failed is set
+	std::thread thread;
+	std::thread::id threadId;
+	// Statistics, under the mutex.
+	GraphHost::SubmitThreadStats stats;
+	std::map<std::string, std::pair<uint64_t, double>> drains;  // by caller
+};
+
 // The host's recording requests (RequestEpochRecording): any thread pushes onto a Treiber stack, the host's thread takes it whole
 // and reverses it into posting order. It and the wake live as long as the host, so a request never meets a build's teardown.
 struct GraphHost::RecordingQueue {
@@ -393,12 +436,19 @@ GraphHost::GraphHost(Desc desc) : m_desc(std::move(desc)), m_recordingQueue(std:
 			throw std::invalid_argument("GraphHost: an epoch order names an epoch twice");
 		m_instances.emplace_back().epoch = epoch;
 	}
+	// Made with the host, so the queue's pointer never changes while another thread drains it.
+	if (m_desc.submissionThread) {
+		m_submitQueue = std::make_unique<SubmitQueue>();
+		m_submitQueue->thread = std::thread([this] { RunSubmitThread(); });
+	}
 }
 
 GraphHost::~GraphHost() {
 	// Nothing queued is completed from here on: its callers may be torn down before the host.
 	m_ending = true;
 	m_recordingQueue->accepting.store(false, std::memory_order_release);
+	// What the submission thread still holds is finished first: it submits on the async state that StopAsync ends.
+	StopSubmitThread();
 	StopAsync();
 	DestroyGraph();
 	// The host's queue timelines go last: what was submitted on them completes first, and the runtime's ledgers stop waiting on them.
@@ -1858,6 +1908,8 @@ void GraphHost::StartAsync() {
 }
 
 void GraphHost::HoldAsync(std::span<const size_t> detach, const std::function<void()>& work) {
+	// The work changes graphs that tickets still on the submission thread were prepared on: they are submitted first.
+	DrainSubmissions("a hold of the host's thread (a build)");
 	auto& async = *m_async;
 	async.ThrowIfFailed();
 	// The host's thread lets go of the instances to detach and holds still while the work runs: whatever it was given before
@@ -2401,6 +2453,8 @@ void GraphHost::NoteNewVersions() noexcept {
 void GraphHost::StopAsync() {
 	BT_ZONE_SCOPE("ORG.Host.StopAsync");
 	if (!m_async) return;
+	// Tickets still on the submission thread submit on this async state: they go first.
+	DrainSubmissions("async epochs stopping");
 	auto async = std::move(m_async);
 	Async::Message stop;
 	stop.kind = Async::Message::Kind::Stop;
@@ -2469,6 +2523,19 @@ void GraphHost::StopAsync() {
 }
 
 GraphHost::AsyncStats GraphHost::TakeAsyncStats() noexcept {
+	{
+		// What the submission thread counted (FinishTicket's counts there).
+		std::scoped_lock lock(m_threadStatsMutex);
+		m_asyncStats.submitted += m_threadStats.submitted;
+		m_asyncStats.uploads += m_threadStats.uploads;
+		m_asyncStats.recordedUploadLists += m_threadStats.recordedUploadLists;
+		m_asyncStats.queueUploadCopies += m_threadStats.queueUploadCopies;
+		m_asyncStats.sparedUploadWaits += m_threadStats.sparedUploadWaits;
+		m_asyncStats.lateRoutedUploads += m_threadStats.lateRoutedUploads;
+		m_asyncStats.lateUploadWaits += m_threadStats.lateUploadWaits;
+		m_asyncStats.undeclaredUploads += m_threadStats.undeclaredUploads;
+		m_threadStats = {};
+	}
 	m_asyncStats.recorded = 0;
 	m_asyncStats.predicted = m_asyncStats.planned = 0;
 	for (auto& instance : m_instances) {
@@ -2496,6 +2563,8 @@ GraphHost::AsyncStats GraphHost::TakeAsyncStats() noexcept {
 void GraphHost::SubmitEpoch(uint32_t epoch, const FrameCallback& beforeSubmit, std::shared_ptr<const void> resourceOwner,
 	std::shared_ptr<const EpochRecording> recording) {
 	BT_ZONE_SCOPE("ORG.Host.SubmitEpoch");
+	// A failed submission thread submits nothing more. The caller hears of it here, as of a failed submission on this thread.
+	ThrowIfSubmitThreadFailed();
 	m_lastTimings = {};
 	m_lastTimings.async = true;
 	auto lap = [last = std::chrono::steady_clock::now()](double& a_into) mutable {
@@ -2530,26 +2599,186 @@ void GraphHost::SubmitEpoch(uint32_t epoch, const FrameCallback& beforeSubmit, s
 		ticket = async.WaitTicket(index);
 	}
 	lap(m_lastTimings.ticketWaitUs);
-	SubmitTicket(async, index, std::move(ticket), beforeSubmit, std::move(resourceOwner), std::move(recording));
+	if (m_submitQueue && !m_instances[instance].graph->IsExternalPersistentEpoch(epoch)) {
+		// The commit here; the rest on the submission thread, in order after the tickets before it.
+		auto commit = CommitTicket(async, index, std::move(ticket), beforeSubmit, std::move(resourceOwner), std::move(recording));
+		EnqueueTicket(async, std::move(commit));
+	} else {
+		// An external epoch's submission stays on this thread: it comes after every ticket the thread still holds.
+		DrainSubmissions("a submission on the calling thread");
+		SubmitTicket(async, index, std::move(ticket), beforeSubmit, std::move(resourceOwner), std::move(recording));
+	}
 	// Completed readback captures reach their callbacks here: a ticket's frame never runs Update, which polls them.
 	if (auto* readback = m_instances[instance].graph->GetReadbackService()) readback->ProcessReadbackRequests();
 }
 
-// What CommitTicket hands to FinishTicket: the ticket, checked current after the caller's commit, and the values of the
-// render thread's state that the rest of the submission needs.
-struct GraphHost::TicketCommit {
-	uint32_t index = 0;  // the epoch's index in the async state
-	std::shared_ptr<RenderGraph::PersistentTicket> ticket;
-	RunRef run{};
-	bool external = false;  // an external epoch's ticket (RenderGraph::IsExternalPersistentEpoch)
-	// What retired at the commit (the runtime's deletion queues, external runs' releases), destroyed on the host's thread once
-	// the submission completes.
-	std::shared_ptr<void> retired;
-	std::shared_ptr<const void> resourceOwner;
-	uint64_t number = 0;     // the submission's number (SubmissionsMade)
-	uint64_t seal = 0;       // the seals before it (Seals)
-	uint64_t frameWait = 0;  // what its batches wait for (SetFrameWaitValue), as it was at the commit
-};
+void GraphHost::RunSubmitThread() {
+	auto& queue = *m_submitQueue;
+	{
+		std::scoped_lock lock(queue.mutex);
+		queue.threadId = std::this_thread::get_id();
+	}
+	for (;;) {
+		SubmitQueue::Entry entry;
+		{
+			std::unique_lock lock(queue.mutex);
+			queue.work.wait(lock, [&] { return !queue.entries.empty(); });
+			entry = std::move(queue.entries.front());
+			queue.entries.pop_front();
+		}
+		// A push that waited for room can go on.
+		queue.progress.notify_all();
+		const auto kind = entry.kind;
+		if (kind == SubmitQueue::Entry::Kind::Stop) {
+			{
+				std::scoped_lock lock(queue.mutex);
+				++queue.passed;
+			}
+			queue.progress.notify_all();
+			return;
+		}
+		const auto start = std::chrono::steady_clock::now();
+		bool discarded = false;
+		if (kind == SubmitQueue::Entry::Kind::Ticket) {
+			BT_ZONE_SCOPE("ORG.Host.SubmitThread.Ticket");
+			auto& async = *entry.async;
+			auto& commit = *entry.commit;
+			if (queue.failed.load(std::memory_order_acquire)) {
+				// After a failure nothing more is submitted. The ticket goes back to the host's thread unadmitted, which frees its lease.
+				if (commit.ticket) {
+					Async::Message discard;
+					discard.kind = Async::Message::Kind::Discard;
+					discard.epochIndex = commit.index;
+					discard.ticket = std::move(commit.ticket);
+					(void)async.TryPost(discard);
+				}
+				discarded = true;
+			} else {
+				AsyncStats stats{};
+				FrameTimings timings{};
+				try {
+					FinishTicket(async, commit, timings, stats);
+				} catch (const std::exception& e) {
+					FailSubmitThread(async, commit.index, e.what());
+				} catch (...) {
+					FailSubmitThread(async, commit.index, "an unknown exception");
+				}
+				std::scoped_lock lock(m_threadStatsMutex);
+				m_threadStats.submitted += stats.submitted;
+				m_threadStats.uploads += stats.uploads;
+				m_threadStats.recordedUploadLists += stats.recordedUploadLists;
+				m_threadStats.queueUploadCopies += stats.queueUploadCopies;
+				m_threadStats.sparedUploadWaits += stats.sparedUploadWaits;
+				m_threadStats.lateRoutedUploads += stats.lateRoutedUploads;
+				m_threadStats.lateUploadWaits += stats.lateUploadWaits;
+				m_threadStats.undeclaredUploads += stats.undeclaredUploads;
+			}
+		} else if (kind == SubmitQueue::Entry::Kind::Closure && entry.closure) {
+			BT_ZONE_SCOPE("ORG.Host.SubmitThread.Closure");
+			try {
+				entry.closure();
+			} catch (const std::exception& e) {
+				spdlog::error("GraphHost: a closure on the submission thread threw: {}", e.what());
+			} catch (...) {
+				spdlog::error("GraphHost: a closure on the submission thread threw");
+			}
+		}
+		// The entry's objects (the ticket, the closure's captures) go before a drain that waits for it returns.
+		entry = {};
+		{
+			std::scoped_lock lock(queue.mutex);
+			++queue.passed;
+			queue.stats.busyUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+			if (discarded) ++queue.stats.discarded;
+			else if (kind == SubmitQueue::Entry::Kind::Ticket) ++queue.stats.tickets;
+		}
+		queue.progress.notify_all();
+	}
+}
+
+void GraphHost::StopSubmitThread() {
+	if (!m_submitQueue || !m_submitQueue->thread.joinable()) return;
+	DrainSubmissions("the host's end");
+	{
+		std::scoped_lock lock(m_submitQueue->mutex);
+		m_submitQueue->entries.emplace_back();  // Kind::Stop
+		++m_submitQueue->pushed;
+	}
+	m_submitQueue->work.notify_one();
+	m_submitQueue->thread.join();
+}
+
+void GraphHost::EnqueueTicket(Async& async, TicketCommit commit) {
+	BT_ZONE_SCOPE("ORG.Host.EnqueueTicket");
+	auto& queue = *m_submitQueue;
+	SubmitQueue::Entry entry;
+	entry.kind = SubmitQueue::Entry::Kind::Ticket;
+	entry.async = &async;
+	entry.commit.emplace(std::move(commit));
+	std::unique_lock lock(queue.mutex);
+	if (queue.entries.size() >= SubmitQueue::kCapacity) {
+		// The thread is this far behind. Waiting here keeps the render thread from running further ahead. The thread never waits
+		// for the render thread, so the wait ends.
+		BT_ZONE_SCOPE("ORG.Host.SubmitBackpressure");
+		const auto start = std::chrono::steady_clock::now();
+		queue.progress.wait(lock, [&] { return queue.entries.size() < SubmitQueue::kCapacity; });
+		++queue.stats.backpressureWaits;
+		queue.stats.backpressureUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+	}
+	queue.entries.push_back(std::move(entry));
+	++queue.pushed;
+	queue.stats.peakDepth = (std::max)(queue.stats.peakDepth, queue.pushed - queue.passed);
+	lock.unlock();
+	queue.work.notify_one();
+}
+
+void GraphHost::DrainSubmissions(const char* why) {
+	auto* queue = m_submitQueue.get();
+	if (!queue) return;
+	std::unique_lock lock(queue->mutex);
+	// The thread's own work (a pass recorded there that reaches a drain) is already in order.
+	if (std::this_thread::get_id() == queue->threadId) return;
+	const auto target = queue->pushed;
+	if (queue->passed >= target) return;
+	BT_ZONE_SCOPE("ORG.Host.DrainSubmissions");
+	const auto start = std::chrono::steady_clock::now();
+	queue->progress.wait(lock, [&] { return queue->passed >= target; });
+	const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+	++queue->stats.drains;
+	queue->stats.drainUs += us;
+	auto& caller = queue->drains[why ? why : "unnamed"];
+	++caller.first;
+	caller.second += us;
+}
+
+GraphHost::SubmitThreadStats GraphHost::TakeSubmitThreadStats() {
+	if (!m_submitQueue) return {};
+	std::scoped_lock lock(m_submitQueue->mutex);
+	auto stats = std::exchange(m_submitQueue->stats, {});
+	for (auto& [why, counts] : m_submitQueue->drains) stats.drainsByCaller.emplace_back(why, counts);
+	m_submitQueue->drains.clear();
+	return stats;
+}
+
+void GraphHost::FailSubmitThread(Async& async, uint32_t epochIndex, const std::string& error) {
+	auto& queue = *m_submitQueue;
+	{
+		std::scoped_lock lock(queue.mutex);
+		if (queue.failed.load(std::memory_order_relaxed)) return;
+		queue.error = error;
+		queue.failed.store(true, std::memory_order_release);
+	}
+	spdlog::error("GraphHost: the submission thread failed, and submits nothing more: {}", error);
+	// Builds drain the thread first, so the instance's build generation is stable here.
+	const auto& instance = m_instances[async.instanceOf[epochIndex]];
+	ReportEpochFailure({async.epochs[epochIndex], instance.buildGeneration, false, "The submission thread failed: " + error});
+}
+
+void GraphHost::ThrowIfSubmitThreadFailed() const {
+	if (!m_submitQueue || !m_submitQueue->failed.load(std::memory_order_acquire)) return;
+	std::scoped_lock lock(m_submitQueue->mutex);
+	throw std::runtime_error("The submission thread failed: " + m_submitQueue->error);
+}
 
 void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<RenderGraph::PersistentTicket> ticket,
 	const FrameCallback& beforeSubmit, std::shared_ptr<const void> resourceOwner, std::shared_ptr<const EpochRecording> recording) {

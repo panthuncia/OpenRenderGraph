@@ -117,6 +117,11 @@ public:
 		// StaleAliasPlacementEpochs instead of being rebuilt at the next build point. For an application that builds its epochs'
 		// graphs itself (BuildEpochGraph, AttachEpochGraph). Off: the build point rebuilds those graphs.
 		bool reportStaleAliasPlacements = false;
+		// Async epochs: SubmitEpoch runs the caller's commit and the revision check on the calling thread, then hands the rest of
+		// the submission to a submission thread of the host's, in order. That rest is the upload lists, the admission, the passes
+		// recorded at execution and the queue submissions. External epochs still submit on the calling thread. A queue user that
+		// must come after the epochs submitted so far drains the thread first (DrainSubmissions).
+		bool submissionThread = false;
 	};
 
 	using ExtensionFactory = std::function<std::unique_ptr<RenderGraph::IRenderGraphExtension>()>;
@@ -688,6 +693,27 @@ public:
 	const FrameTimings& LastFrameTimings() const noexcept { return m_lastTimings; }
 	const Desc& GetDesc() const noexcept { return m_desc; }
 
+	// The submission thread (Desc::submissionThread).
+	// Any thread: whether the host has one.
+	bool SubmissionThreadOn() const noexcept { return static_cast<bool>(m_submitQueue); }
+	// Blocks until every submission handed to the thread so far is on its queue. Call it before work that must reach the GPU after
+	// those submissions: another queue user's submission, a present, a host wait on the GPU. why names the caller in the
+	// statistics. It returns at once when nothing is queued, without the thread, and on the thread itself.
+	void DrainSubmissions(const char* why = "unnamed");
+	// Diagnostics since the last call. Any thread.
+	struct SubmitThreadStats {
+		uint64_t tickets = 0;             // tickets the thread finished
+		uint64_t discarded = 0;           // tickets it gave back unsubmitted after a failure
+		uint64_t peakDepth = 0;           // the most entries queued or in progress at once
+		uint64_t backpressureWaits = 0;   // pushes that waited for room
+		double backpressureUs = 0.0;      // the time those waited
+		uint64_t drains = 0;              // drains that had to wait for the thread
+		double drainUs = 0.0;             // the time those waited
+		double busyUs = 0.0;              // the thread's time on entries
+		std::vector<std::pair<std::string, std::pair<uint64_t, double>>> drainsByCaller;  // why -> (waits, us)
+	};
+	SubmitThreadStats TakeSubmitThreadStats();
+
 private:
 	// One epoch's graph (the only one, of every pass, without epochs).
 	struct Instance {
@@ -901,6 +927,20 @@ private:
 		const FrameCallback& beforeSubmit, std::shared_ptr<const void> resourceOwner, std::shared_ptr<const EpochRecording> recording);
 	// timings and stats: where its times and counts go (the render thread's own, or the submission thread's).
 	void FinishTicket(Async& state, TicketCommit& commit, FrameTimings& timings, AsyncStats& stats);
+	// The submission thread (Desc::submissionThread): its queue, made with the host and stopped first by its destructor.
+	struct SubmitQueue;
+	std::unique_ptr<SubmitQueue> m_submitQueue;
+	// The thread's counts (FinishTicket's stats there), added to TakeAsyncStats.
+	std::mutex m_threadStatsMutex;
+	AsyncStats m_threadStats{};
+	void RunSubmitThread();
+	void StopSubmitThread();
+	// Render owner: hands a committed ticket to the thread. Waits for room when the queue is full.
+	void EnqueueTicket(Async& state, TicketCommit commit);
+	// Submission thread: records the first failure. SubmitEpoch throws it from then on, and PollEpochFailures reports it.
+	void FailSubmitThread(Async& state, uint32_t epochIndex, const std::string& error);
+	// Throws the thread's failure, if it failed.
+	void ThrowIfSubmitThreadFailed() const;
 };
 
 } // namespace org
