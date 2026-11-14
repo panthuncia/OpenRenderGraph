@@ -156,6 +156,9 @@ struct GraphHost::Async {
 		std::atomic<uint32_t> count{0};
 	};
 	std::unique_ptr<TicketQueue[]> queues;
+	// Render thread, per epoch index: the ticket HoldEpochTicket took and the next SubmitEpoch submits. Counted in hand by the host's
+	// thread like any ticket it handed out, until it is submitted or discarded.
+	std::vector<std::shared_ptr<Ticket>> held;
 	std::shared_ptr<Ticket> TakeReady(uint32_t index) {
 		auto& queue = queues[index];
 		std::scoped_lock lock(queue.mutex);
@@ -1507,6 +1510,7 @@ void GraphHost::StartAsync() {
 	for (uint32_t index = 0; index < async->epochs.size(); ++index) async->copiesBusyAt[index].store(Async::kNoSeal, std::memory_order_relaxed);
 	async->copiesBusyLogged.assign(async->epochs.size(), 0);
 	async->queues = std::make_unique<Async::TicketQueue[]>(async->epochs.size());
+	async->held.assign(async->epochs.size(), {});
 	async->inHand.assign(async->epochs.size(), 0);
 	async->mostAhead.assign(async->epochs.size(), 1);
 	for (uint32_t index = 0; index < async->epochs.size(); ++index)
@@ -1835,6 +1839,17 @@ void GraphHost::HoldAsync(std::span<const size_t> detach, const std::function<vo
 			async.released.notify_all();
 		}
 	} release{async, hold};
+	// A ticket the render thread holds (HoldEpochTicket) goes back first: the Detach below takes only the queued ones, and the host's
+	// thread reads the discard before it.
+	for (uint32_t index = 0; index < async.epochs.size(); ++index) {
+		if (!async.held[index] || std::ranges::find(detach, async.instanceOf[index]) == detach.end()) continue;
+		Async::Message discard;
+		discard.kind = Async::Message::Kind::Discard;
+		discard.epochIndex = index;
+		discard.ticket = std::exchange(async.held[index], nullptr);
+		if (!async.Post(discard)) async.ThrowIfFailed();
+	}
+	m_heldRun.reset();
 	Async::Message message;
 	message.kind = Async::Message::Kind::Detach;
 	message.hold = hold;
@@ -1899,6 +1914,65 @@ bool GraphHost::ReleaseEpochTicket(uint32_t epoch) {
 	if (async.TryPost(discard)) return true;
 	async.PushReady(index, std::move(ticket), true);
 	return false;
+}
+
+RunRef GraphHost::HoldEpochTicket(uint32_t epoch) {
+	BT_ZONE_SCOPE("ORG.Host.HoldEpochTicket");
+	const auto instance = InstanceOf(epoch);
+	if (instance == kNoInstance) throw std::invalid_argument("HoldEpochTicket: epoch " + std::to_string(epoch) + " is not one of the host's");
+	if (!m_async && !m_asyncEpochs.empty()) {
+		BuildDueInstances(false);
+		StartAsync();
+	}
+	if (!m_async) throw std::logic_error("HoldEpochTicket requires async epochs");
+	// Built again here when due, as SubmitEpoch would: the held ticket is of the graph that submits it.
+	if (BuildDue(instance)) RebuildAsyncInstances({&instance, 1});
+	auto& async = *m_async;
+	async.ThrowIfFailed();
+	const auto index = async.IndexOf(epoch);
+	if (async.revisionDriven[index]) throw std::logic_error("HoldEpochTicket: a revision-driven epoch's tickets carry no run values to write ahead");
+	if (const auto& held = async.held[index]) return RenderGraph::PersistentTicketRun(*held);
+	if (!m_instances[instance].graph || m_instances[instance].failed) throw EpochFailedError(epoch, m_instances[instance].failure);
+	if (async.epochFailed[index].load(std::memory_order_acquire)) throw EpochFailedError(epoch, async.epochErrors[index]);
+	auto ticket = async.TakeReady(index);
+	if (!ticket) {
+		++m_asyncStats.waited;
+		ticket = async.WaitTicket(index);
+	}
+	const auto run = RenderGraph::PersistentTicketRun(*ticket);
+	async.held[index] = std::move(ticket);
+	return run;
+}
+
+bool GraphHost::HoldsEpochTicket(uint32_t epoch) const noexcept {
+	if (!m_async) return false;
+	const auto found = std::ranges::find(m_async->epochs, epoch);
+	return found != m_async->epochs.end() && m_async->held[static_cast<size_t>(found - m_async->epochs.begin())] != nullptr;
+}
+
+void GraphHost::UseHeldRun(uint32_t epoch) noexcept {
+	m_heldRun.reset();
+	if (!m_async) return;
+	const auto found = std::ranges::find(m_async->epochs, epoch);
+	if (found == m_async->epochs.end()) return;
+	if (const auto& held = m_async->held[static_cast<size_t>(found - m_async->epochs.begin())]) m_heldRun = RenderGraph::PersistentTicketRun(*held);
+}
+
+bool GraphHost::ReleaseHeldEpochTicket(uint32_t epoch) {
+	m_heldRun.reset();
+	if (!m_async) return false;
+	auto& async = *m_async;
+	const auto found = std::ranges::find(async.epochs, epoch);
+	if (found == async.epochs.end()) return false;
+	const auto index = static_cast<uint32_t>(found - async.epochs.begin());
+	if (!async.held[index]) return false;
+	// Never submitted and never admitted: the host's thread completes it and frees its lease.
+	Async::Message discard;
+	discard.kind = Async::Message::Kind::Discard;
+	discard.epochIndex = index;
+	discard.ticket = std::exchange(async.held[index], nullptr);
+	if (!async.Post(discard)) async.ThrowIfFailed();
+	return true;
 }
 
 bool GraphHost::RequestEpochRecording(uint32_t epoch, std::shared_ptr<const IHostExecutionData> hostData, EpochRecordingCallback done) {
@@ -2233,13 +2307,17 @@ void GraphHost::StopAsync() {
 			if (node->done) node->done(nullptr, dropped);
 	}
 	async->pendingRequests.clear();
-	// Unsubmitted tickets are abandoned, and their leases given back.
-	for (uint32_t index = 0; index < async->epochs.size(); ++index)
-		for (const auto& ticket : async->TakeAll(index)) {
+	// Unsubmitted tickets are abandoned, and their leases given back: the queued ones and the ones the render thread held.
+	m_heldRun.reset();
+	for (uint32_t index = 0; index < async->epochs.size(); ++index) {
+		auto tickets = async->TakeAll(index);
+		if (async->held[index]) tickets.push_back(std::exchange(async->held[index], nullptr));
+		for (const auto& ticket : tickets) {
 			if (!async->failed.load())
 				if (auto& graph = m_instances[async->instanceOf[index]].graph) (void)graph->CompletePersistentTicket(*ticket, {});
 			ReleaseLease(*m_leaseTable[RenderGraph::PersistentTicketRun(*ticket).lease].load(std::memory_order_acquire), async.get());
 		}
+	}
 	m_frameNumber = (std::max)(m_frameNumber, async->hostFrame);
 	if (auto* graph = AnyGraph())
 		if (auto* uploads = graph->GetUploadService()) uploads->SetStagedUploadsRecordedDirectly(false);
@@ -2319,7 +2397,10 @@ void GraphHost::SubmitEpoch(uint32_t epoch, const FrameCallback& beforeSubmit, s
 	if (!m_instances[instance].graph || m_instances[instance].failed)
 		throw EpochFailedError(epoch, m_instances[instance].failure);
 	if (async.epochFailed[index].load(std::memory_order_acquire)) throw EpochFailedError(epoch, async.epochErrors[index]);
-	auto ticket = async.TakeReady(index);
+	// The ticket HoldEpochTicket took, whose run's values the caller wrote already; else the next one.
+	m_heldRun.reset();
+	auto ticket = std::exchange(async.held[index], nullptr);
+	if (!ticket) ticket = async.TakeReady(index);
 	if (!ticket) {
 		++m_asyncStats.waited;
 		ticket = async.WaitTicket(index);

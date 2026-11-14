@@ -179,6 +179,13 @@ thread calls `SubmitEpoch(epoch, beforeSubmit)` at each point instead of `Execut
         A stale ticket is prepared again for the same run lease, whose latch regions `beforeSubmit` just wrote;
     4.  admits the ticket (`AdmitPersistentTicket`), records the pending uploads into the lease's upload list, and submits
         the uploads and the ticket with the handoff lists (`SubmitPersistentTicket`), then commits.
+-   **Held tickets.** `HoldEpochTicket(epoch)` takes a live epoch's next ticket ahead of its `SubmitEpoch`, so a host can write
+    one run's values at several points of its frame and submit them once. Inside `UseHeldRun(epoch)` ... `EndHeldRun()`,
+    `CurrentRun()` is the held ticket's run. The next `SubmitEpoch` of the epoch submits the held ticket (its revisions are
+    checked then, as always). Uploads queued meanwhile go with the next submission of any epoch, so a host submits the held
+    epoch before other work that must follow it. A build of the epoch's graph gives the held ticket back first (what was
+    written for its run is dropped; `HoldsEpochTicket` turns false), and `ReleaseHeldEpochTicket` gives it back on purpose.
+    Community Shaders' frame regions use this: consecutive anchor runs share one execution of their region's epoch.
 -   **Uploads.** The uploads go to the graphics queue, ahead of the ticket. A batch on another queue waits for them only
     when it uses what they write.
     -   **Queue-scoped uploads** (`Desc::queueScopedUploads`, default on). A staged upload whose destination the ticket first

@@ -436,6 +436,29 @@ public:
 	// host's thread (abandoned, its run lease freed, a new one prepared). False when no ticket was ready (or the mailbox is full: it
 	// stays).
 	bool ReleaseEpochTicket(uint32_t epoch);
+	/**
+	 * @brief Render thread, for an async live epoch: takes its next ticket now and keeps it for the epoch's next SubmitEpoch. The
+	 * caller can then write the run's values (LatchBlock regions, run gates) at several points before the submission, each inside
+	 * UseHeldRun. Waits for the ticket as SubmitEpoch does and throws as it does (EpochFailedError when the epoch failed). Returns the
+	 * held ticket's run. A second call before the submission returns the same run.
+	 *
+	 * Uploads queued meanwhile are recorded by the next submission of any epoch, as always: submit the held epoch before another
+	 * epoch's work that must come after what its run uploads.
+	 *
+	 * A build of the epoch's graph (RequestRebuild's, AttachEpochGraph) first gives the held ticket back unsubmitted. What was written
+	 * for its run is dropped, and HoldsEpochTicket turns false: the next SubmitEpoch takes a new ticket. Build only where nothing is held.
+	 */
+	RunRef HoldEpochTicket(uint32_t epoch);
+	/** @brief Render thread: whether the epoch holds a ticket (HoldEpochTicket) that was not submitted or given back. */
+	bool HoldsEpochTicket(uint32_t epoch) const noexcept;
+	/**
+	 * @brief Render thread: CurrentRun() is the epoch's held ticket's run from now until EndHeldRun, outside a ticket's
+	 * beforeSubmit. Nothing when the epoch holds no ticket.
+	 */
+	void UseHeldRun(uint32_t epoch) noexcept;
+	void EndHeldRun() noexcept { m_heldRun.reset(); }
+	/** @brief Render thread: gives the held ticket back unsubmitted (its lease freed, what was written for its run dropped). */
+	bool ReleaseHeldEpochTicket(uint32_t epoch);
 	// Submits the epoch at the current point of the host's queue stream. Builds the epoch's graph first when its rebuild is due.
 	// Waits for its ticket if the host's thread has not finished it; runs beforeSubmit with the graphs' services active and
 	// CurrentRun() the ticket's run (write latches and queue uploads there); has the ticket prepared again (and waits)
@@ -538,10 +561,12 @@ public:
 	std::shared_ptr<PersistentAliasArena> AliasArena() const noexcept { return m_aliasArena; }
 	/**
 	 * @brief Submitting thread: the run the host may write per-run data for now (LatchBlock regions, CPU payloads). Inside
-	 * SubmitEpoch's beforeSubmit, the ticket's run; inside ExecuteFrame's beforePrepare, the execution's run; otherwise the external
-	 * run (BeginExternalRun) when one is active; otherwise the last run submitted. RecordingContext::Run names the same run.
+	 * SubmitEpoch's beforeSubmit, the ticket's run; inside ExecuteFrame's beforePrepare, the execution's run; otherwise the held
+	 * ticket's run (UseHeldRun); otherwise the external run (BeginExternalRun) when one is active; otherwise the last run submitted.
+	 * RecordingContext::Run names the same run.
 	 */
 	RunRef CurrentRun() const noexcept {
+		if (m_heldRun && !m_submittingTicket) return *m_heldRun;
 		if (m_externalRun && !m_submittingTicket) return *m_externalRun;
 		return m_async ? m_asyncRun : m_syncRun;
 	}
@@ -794,6 +819,7 @@ private:
 	// Submitting thread: CurrentRun's sources.
 	RunRef m_syncRun{}, m_asyncRun{};
 	std::optional<RunRef> m_externalRun;
+	std::optional<RunRef> m_heldRun;  // UseHeldRun's, until EndHeldRun
 	// Submitting thread, with async epochs: what releases at an external run's start retired, handed to the host's thread with the
 	// next submission (its driver frees take the device's memory locks).
 	std::vector<std::shared_ptr<void>> m_externalRetired;
