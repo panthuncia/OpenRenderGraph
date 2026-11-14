@@ -2535,17 +2535,36 @@ void GraphHost::SubmitEpoch(uint32_t epoch, const FrameCallback& beforeSubmit, s
 	if (auto* readback = m_instances[instance].graph->GetReadbackService()) readback->ProcessReadbackRequests();
 }
 
+// What CommitTicket hands to FinishTicket: the ticket, checked current after the caller's commit, and the values of the
+// render thread's state that the rest of the submission needs.
+struct GraphHost::TicketCommit {
+	uint32_t index = 0;  // the epoch's index in the async state
+	std::shared_ptr<RenderGraph::PersistentTicket> ticket;
+	RunRef run{};
+	bool external = false;  // an external epoch's ticket (RenderGraph::IsExternalPersistentEpoch)
+	// What retired at the commit (the runtime's deletion queues, external runs' releases), destroyed on the host's thread once
+	// the submission completes.
+	std::shared_ptr<void> retired;
+	std::shared_ptr<const void> resourceOwner;
+	uint64_t number = 0;     // the submission's number (SubmissionsMade)
+	uint64_t seal = 0;       // the seals before it (Seals)
+	uint64_t frameWait = 0;  // what its batches wait for (SetFrameWaitValue), as it was at the commit
+};
+
 void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<RenderGraph::PersistentTicket> ticket,
 	const FrameCallback& beforeSubmit, std::shared_ptr<const void> resourceOwner, std::shared_ptr<const EpochRecording> recording) {
 	BT_ZONE_SCOPE("ORG.Host.SubmitTicket");
 	BT_ZONE_VALUE(async.epochs[index]);
-	using Census = diagnostics::SubmissionCensus;
-	auto& census = diagnostics::Census();
-	census.BeginTicket();
-	// A submission's completion message wakes the host's thread lazily (wakesOnGpu); a discard always wakes it.
-	auto postControl = [&](Async::Message& message) {
-		const bool lazy = message.kind == Async::Message::Kind::Submitted;
-		if (!async.Post(message, lazy)) throw std::runtime_error("Async epoch host stopped before accepting its completion");
+	auto commit = CommitTicket(async, index, std::move(ticket), beforeSubmit, std::move(resourceOwner), std::move(recording));
+	FinishTicket(async, commit, m_lastTimings, m_asyncStats);
+}
+
+GraphHost::TicketCommit GraphHost::CommitTicket(Async& async, uint32_t index, std::shared_ptr<RenderGraph::PersistentTicket> ticket,
+	const FrameCallback& beforeSubmit, std::shared_ptr<const void> resourceOwner, std::shared_ptr<const EpochRecording> recording) {
+	BT_ZONE_SCOPE("ORG.Host.CommitTicket");
+	// A discard always wakes the host's thread.
+	auto postDiscard = [&](Async::Message& message) {
+		if (!async.Post(message)) throw std::runtime_error("Async epoch host stopped before accepting its completion");
 	};
 	auto lap = [last = std::chrono::steady_clock::now()](double& a_into) mutable {
 		const auto now = std::chrono::steady_clock::now();
@@ -2555,8 +2574,6 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 	auto& graph = *m_instances[async.instanceOf[index]].graph;
 	const auto run = RenderGraph::PersistentTicketRun(*ticket);
 	const uint32_t slot = run.lease;
-	// The ticket's lease: published by the host's thread before the ticket, and the render thread's until it posts the ticket back.
-	auto& lease = *m_leaseTable[slot].load(std::memory_order_acquire);
 	m_asyncRun = run;
 	runtime::ScopedActiveGraphServices services(graph.GetUploadService(), graph.GetDescriptorService());
 	// The lease's last run retired before the host's thread opened it: its upload pages are free again. What retires from
@@ -2585,7 +2602,7 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 		discard.kind = Async::Message::Kind::Discard;
 		discard.epochIndex = index;
 		discard.ticket = std::move(ticket);
-		postControl(discard);
+		postDiscard(discard);
 		throw std::logic_error("A revision's recording was given for a live epoch, which records every run");
 	}
 	if (async.revisionDriven[index]) {
@@ -2597,11 +2614,13 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 			discard.kind = Async::Message::Kind::Discard;
 			discard.epochIndex = index;
 			discard.ticket = std::move(ticket);
-			postControl(discard);
+			postDiscard(discard);
 			throw std::logic_error("A revision-driven epoch was submitted without its revision's copy for the run: " + why);
 		}
 		++m_asyncStats.revisionSubmissions;
 	}
+	// The revision check stays with the commit. Each pass's revision reads the caller's state, and so does the preparation of a
+	// replacement. Both must see that state as the commit left it, before the render thread moves on to the next run.
 	if (!async.revisionDriven[index] && !async.Current(*ticket)) {
 		BT_ZONE_SCOPE("ORG.Host.ReprepareStaleTicket");
 		m_asyncStats.staleBacking += RenderGraph::PersistentTicketCurrent(*ticket);
@@ -2630,7 +2649,7 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 		// The discard and the reprepare are one message, so the worker prepares the replacement into this lease before it
 		// can prepare the epoch's next ticket into another (the Discard handler).
 		discard.reprepare = true;
-		postControl(discard);
+		postDiscard(discard);
 		ticket = async.WaitTicket(index, true);
 		if (!(RenderGraph::PersistentTicketRun(*ticket) == run))
 			throw std::logic_error("A reprepared async epoch ticket is not for the run whose upload list the render thread records");
@@ -2638,8 +2657,49 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 	// The submitted ticket's frame: one prepared again above has a new number, and the completed-frame callback
 	// reports it by that one.
 	m_lastHostFrame = RenderGraph::PersistentTicketHostFrame(*ticket);
+	TicketCommit commit;
+	commit.index = index;
+	commit.run = run;
+	commit.external = graph.IsExternalPersistentEpoch(async.epochs[index]);
+	if (!m_externalRetired.empty()) {
+		m_externalRetired.push_back(std::move(retired));
+		retired = std::make_shared<std::vector<std::shared_ptr<void>>>(std::exchange(m_externalRetired, {}));
+	}
+	commit.retired = std::move(retired);
+	commit.resourceOwner = std::move(resourceOwner);
+	commit.number = ++m_submissions;
+	// The frame boundaries before it: a later seal flushed it (a published copy waits for its run only then).
+	commit.seal = m_seals.load(std::memory_order_relaxed);
+	commit.frameWait = m_frameWaitValue;
+	commit.ticket = std::move(ticket);
+	lap(m_lastTimings.checkUs);
+	return commit;
+}
+
+void GraphHost::FinishTicket(Async& async, TicketCommit& commit, FrameTimings& timings, AsyncStats& stats) {
+	BT_ZONE_SCOPE("ORG.Host.FinishTicket");
+	using Census = diagnostics::SubmissionCensus;
+	auto& census = diagnostics::Census();
+	census.BeginTicket();
+	const auto index = commit.index;
+	auto& ticket = commit.ticket;
+	// A submission's completion message wakes the host's thread lazily (wakesOnGpu); a discard always wakes it.
+	auto postControl = [&](Async::Message& message) {
+		const bool lazy = message.kind == Async::Message::Kind::Submitted;
+		if (!async.Post(message, lazy)) throw std::runtime_error("Async epoch host stopped before accepting its completion");
+	};
+	auto lap = [last = std::chrono::steady_clock::now()](double& a_into) mutable {
+		const auto now = std::chrono::steady_clock::now();
+		a_into += std::chrono::duration<double, std::micro>(now - last).count();
+		last = now;
+	};
+	auto& graph = *m_instances[async.instanceOf[index]].graph;
+	const uint32_t slot = commit.run.lease;
+	// The ticket's lease: published by the host's thread before the ticket, and the submitter's until it posts the ticket back.
+	auto& lease = *m_leaseTable[slot].load(std::memory_order_acquire);
+	runtime::ScopedActiveGraphServices services(graph.GetUploadService(), graph.GetDescriptorService());
 	// An external epoch's uploads go into the slot's secondary, which its execution runs first: nothing is submitted here.
-	const bool external = graph.IsExternalPersistentEpoch(async.epochs[index]);
+	const bool external = commit.external;
 	// Asked once, after the commit staged its uploads: a ticket without uploads begins, records and closes no list.
 	const bool hasUploads = external || graph.HasPendingUploads();
 	// An external epoch's ticket prepared behind others of its epoch has its upload lists begun here (PrepareTicket begins only
@@ -2653,7 +2713,7 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 			if (async.queueUploadKinds[queue] && !lease.queueUploads[queue].Recording())
 				async.queueUploadPools[static_cast<size_t>(*async.queueUploadKinds[queue])]->Begin(lease.queueUploads[queue]);
 	}
-	lap(m_lastTimings.checkUs);
+	lap(timings.checkUs);
 	// The queues' last values, which every graph assigns from (the host's shared timelines): this submission's come after them,
 	// and go back to the registry as soon as they are assigned, before any other graph's submission.
 	// From taking them until they are published, the frontier would miss the values this submission signals: deferred
@@ -2728,7 +2788,7 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 		secondary.EndRecording();
 		for (auto& queueUploads : queueUploadLists) queueUploads.EndRecording();
 	}
-	m_asyncStats.queueUploadCopies += queueCopies;
+	stats.queueUploadCopies += queueCopies;
 	if (census.On() && !external && hasUploads) {
 		census.Add(Census::List::Upload);
 		if (!recorded && recordedLists.empty()) census.Add(Census::List::UploadEmpty);
@@ -2758,21 +2818,16 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 	}
 	Async::Message submitted;
 	submitted.kind = Async::Message::Kind::Submitted;
-	submitted.number = ++m_submissions;
-	// The frame boundaries before it: a later seal flushed it (a published copy waits for its run only then).
-	submitted.seal = m_seals.load(std::memory_order_relaxed);
+	submitted.number = commit.number;
+	submitted.seal = commit.seal;
 	submitted.epochIndex = index;
 	submitted.keepAlive = std::move(keepAlive);
-	if (!m_externalRetired.empty()) {
-		m_externalRetired.push_back(std::move(retired));
-		retired = std::make_shared<std::vector<std::shared_ptr<void>>>(std::exchange(m_externalRetired, {}));
-	}
-	submitted.retired = std::move(retired);
-	submitted.resourceOwner = std::move(resourceOwner);
+	submitted.retired = std::move(commit.retired);
+	submitted.resourceOwner = std::move(commit.resourceOwner);
 	if (!external && (recorded || !recordedLists.empty())) {
 		BT_ZONE_SCOPE("ORG.Host.EnqueueUploads");
-		++m_asyncStats.uploads;
-		m_asyncStats.recordedUploadLists += recordedLists.size();
+		++stats.uploads;
+		stats.recordedUploadLists += recordedLists.size();
 		const auto value = ++async.queueValues.at(async.graphicsSlot);
 		const rhi::TimelinePoint signal{async.graphicsFence, value};
 		// The producers' recorded lists, then this thread's (an empty one costs nothing but its begin and end).
@@ -2793,12 +2848,12 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 		submitted.uploadSignal = {async.graphicsSlot, value};
 		census.Submitted(Census::Submission::Uploads, async.graphicsSlot, static_cast<uint32_t>(recordedLists.size()), {});
 	}
-	lap(m_lastTimings.uploadsUs);
+	lap(timings.uploadsUs);
 	bool ok = false;
 	try {
 		// Submits and commits, or abandons its admission itself.
 		abandonUnsubmitted.ticket = nullptr;
-		ok = graph.SubmitPersistentTicket(*ticket, async.queueValues, submitted.submission, submitted.uploadSignal, m_frameWaitValue,
+		ok = graph.SubmitPersistentTicket(*ticket, async.queueValues, submitted.submission, submitted.uploadSignal, commit.frameWait,
 			external && recorded);
 	} catch (...) {
 		// The queue may have accepted a prefix of this ticket. Completion is
@@ -2813,7 +2868,7 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 	if (census.On())
 		census.sequencerHeldNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
 			std::chrono::steady_clock::now() - heldFrom).count()), std::memory_order_relaxed);
-	lap(m_lastTimings.submitUs);
+	lap(timings.submitUs);
 	// The handoff and release lists the submission recorded: kept until the run completes, with the uploads' staging.
 	if (!submitted.submission.leases.empty()) {
 		struct Kept {
@@ -2833,12 +2888,12 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 		}
 		m_externalExecution = std::move(execution);
 	}
-	if (submitted.uploadSignal.second) m_asyncStats.sparedUploadWaits += RenderGraph::PersistentTicketSparedUploadWaits(*ticket);
+	if (submitted.uploadSignal.second) stats.sparedUploadWaits += RenderGraph::PersistentTicketSparedUploadWaits(*ticket);
 	{
 		const auto uploads = RenderGraph::PersistentTicketUploadStats(*ticket);
-		m_asyncStats.lateRoutedUploads += uploads.lateRouted;
-		m_asyncStats.lateUploadWaits += uploads.lateWaits;
-		m_asyncStats.undeclaredUploads += uploads.undeclared;
+		stats.lateRoutedUploads += uploads.lateRouted;
+		stats.lateUploadWaits += uploads.lateWaits;
+		stats.undeclaredUploads += uploads.undeclared;
 	}
 	submitted.ticket = std::move(ticket);
 	try {
@@ -2848,8 +2903,8 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 		if (submitted.keepAlive) m_uncertainUploadOwners.push_back(std::move(submitted.keepAlive));
 		throw;
 	}
-	lap(m_lastTimings.postUs);
-	++m_asyncStats.submitted;
+	lap(timings.postUs);
+	++stats.submitted;
 	if (!ok) throw std::runtime_error("Async epoch submission failed");
 }
 

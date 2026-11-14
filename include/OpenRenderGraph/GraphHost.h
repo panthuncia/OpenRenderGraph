@@ -893,6 +893,14 @@ private:
 	void AddRevisionCandidate(Async& state, uint32_t epochIndex, RenderGraph::PersistentTicket& ticket, const EpochRecording& recording);
 	void SubmitTicket(Async& state, uint32_t epochIndex, std::shared_ptr<RenderGraph::PersistentTicket> ticket,
 		const FrameCallback& beforeSubmit, std::shared_ptr<const void> resourceOwner = {}, std::shared_ptr<const EpochRecording> recording = {});
+	// A submission in two parts. CommitTicket runs on the render thread: the caller's commit (beforeSubmit), the recording
+	// choice, and the revision check with its re-preparation, which all read the caller's state. FinishTicket does the rest, in
+	// the same order as before: the upload lists, the admission, the submission and the post to the host's thread.
+	struct TicketCommit;
+	TicketCommit CommitTicket(Async& state, uint32_t epochIndex, std::shared_ptr<RenderGraph::PersistentTicket> ticket,
+		const FrameCallback& beforeSubmit, std::shared_ptr<const void> resourceOwner, std::shared_ptr<const EpochRecording> recording);
+	// timings and stats: where its times and counts go (the render thread's own, or the submission thread's).
+	void FinishTicket(Async& state, TicketCommit& commit, FrameTimings& timings, AsyncStats& stats);
 };
 
 } // namespace org
