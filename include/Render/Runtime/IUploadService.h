@@ -146,6 +146,9 @@ public:
         routed = 0;
         return RecordStagedUploads(list, frameIndex, afterWork);
     }
+    // Owner thread: whether a host's upload list would record anything now (queued or posted uploads, copies, staged or
+    // recorded batches). False lets a host skip the list. A post from another thread after the call goes with the next one.
+    virtual bool HasPendingUploads() const { return true; }
     // Owner thread: the slot's previous execution completed, so its upload pages are reused. GPU objects retire through the
     // runtime (Runtime::Retire), not here.
     virtual void ProcessDeferredReleases(uint32_t frameIndex) = 0;

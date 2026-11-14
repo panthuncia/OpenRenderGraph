@@ -269,6 +269,15 @@ bool UploadManager::TakeRecordedUploadsWithDestinations(std::vector<rhi::Command
 	return m_uploadInstance ? m_uploadInstance->TakeRecordedUploadsWithDestinations(out, frameIndex, destinations) : true;
 }
 
+bool UploadManager::HasPendingUploads() const
+{
+	{
+		std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(m_uploadQueueMutex));
+		if (!queuedResourceCopies.empty()) return true;
+	}
+	return m_uploadInstance && m_uploadInstance->HasPendingUploads();
+}
+
 bool UploadManager::StagedUploadDestinations(std::vector<rhi::ResourceHandle>& out) const
 {
 	return m_uploadInstance ? m_uploadInstance->StagedUploadDestinations(out) : true;

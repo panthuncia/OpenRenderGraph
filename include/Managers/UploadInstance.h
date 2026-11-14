@@ -194,6 +194,8 @@ public:
 
 	// Returns true if there are any pending buffer or texture uploads.
 	bool HasPendingWork() const;
+	// HasPendingWork, or staged and recorded batches waiting (IUploadService::HasPendingUploads).
+	bool HasPendingUploads() const;
 	uint64_t CapturePendingUploadSequence();
 
 	// Collect the destination resources that pending uploads will write to.

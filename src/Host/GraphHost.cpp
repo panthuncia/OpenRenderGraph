@@ -2229,16 +2229,13 @@ void GraphHost::PrepareTicket(Async& state, uint32_t epochIndex, RunLease* repre
 	// holds its allocator, and on Vulkan each allocator is a command pool with driver memory of its own, so a queue of tickets
 	// with open lists would make a pool for each.
 	lease->queueUploads.resize(state.queueUploadKinds.size());
-	if (reprepare || state.inHand[epochIndex] == 0) {
+	// Only an external epoch's: any other epoch's lists are begun by SubmitTicket, and only for a ticket with uploads (most
+	// have none).
+	if ((reprepare || state.inHand[epochIndex] == 0) && graph.IsExternalPersistentEpoch(state.epochs[epochIndex])) {
 		// A reprepared lease's lists are still open from its first preparation, and nothing is recorded into them before the
 		// ticket is submitted. Each is begun only when it is not open already: D3D12 cannot reset a list that records.
-		// The render thread records an external epoch's uploads into the secondary, which its execution runs first, and any
-		// other epoch's into the primary. Only that one is begun.
-		if (graph.IsExternalPersistentEpoch(state.epochs[epochIndex])) {
-			if (!lease->uploadSecondary.Recording()) state.uploadSecondaryPool->Begin(lease->uploadSecondary);
-		} else if (!lease->upload.Recording()) {
-			state.uploadPool->Begin(lease->upload);
-		}
+		// The render thread records an external epoch's uploads into the secondary, which its execution runs first.
+		if (!lease->uploadSecondary.Recording()) state.uploadSecondaryPool->Begin(lease->uploadSecondary);
 		// The run's queue upload lists likewise.
 		for (size_t queue = 0; queue < state.queueUploadKinds.size(); ++queue) {
 			if (!state.queueUploadKinds[queue] || lease->queueUploads[queue].Recording()) continue;
@@ -2643,8 +2640,11 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 	m_lastHostFrame = RenderGraph::PersistentTicketHostFrame(*ticket);
 	// An external epoch's uploads go into the slot's secondary, which its execution runs first: nothing is submitted here.
 	const bool external = graph.IsExternalPersistentEpoch(async.epochs[index]);
-	// A ticket prepared behind others of its epoch has its upload lists begun here (PrepareTicket begins only the first one's).
-	if (!(external ? lease.uploadSecondary : lease.upload).Recording()) {
+	// Asked once, after the commit staged its uploads: a ticket without uploads begins, records and closes no list.
+	const bool hasUploads = external || graph.HasPendingUploads();
+	// An external epoch's ticket prepared behind others of its epoch has its upload lists begun here (PrepareTicket begins only
+	// the first one's); any other epoch's are begun here when it has uploads.
+	if (hasUploads && !(external ? lease.uploadSecondary : lease.upload).Recording()) {
 		BT_ZONE_SCOPE("ORG.Host.BeginUploadLists");
 		if (external) async.uploadSecondaryPool->Begin(lease.uploadSecondary);
 		else async.uploadPool->Begin(lease.upload);
@@ -2714,9 +2714,10 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 		async.queueLists[queue] = queueScoped && queue < queueUploadLists.size() && queueUploadLists[queue].list
 			? queueUploadLists[queue].list.Get() : rhi::CommandList{};
 	size_t queueCopies = 0;
-	const bool supported = graph.RecordPendingUploads(m_device, commands, static_cast<uint32_t>(slot), keepAlive, recorded, recordedLists,
+	recordedLists.clear();
+	const bool supported = !hasUploads || graph.RecordPendingUploads(m_device, commands, static_cast<uint32_t>(slot), keepAlive, recorded, recordedLists,
 		queueScoped ? ticket.get() : nullptr, queueScoped ? std::span<rhi::CommandList>(async.queueLists) : std::span<rhi::CommandList>{}, &queueCopies);
-	{
+	if (hasUploads) {
 		BT_ZONE_SCOPE("ORG.Host.CloseUploadList");
 		(external ? secondary : list).list->End();
 		// Every one the host's thread began, used or not (they go back to their pools when the run retires).
@@ -2728,7 +2729,7 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 		for (auto& queueUploads : queueUploadLists) queueUploads.EndRecording();
 	}
 	m_asyncStats.queueUploadCopies += queueCopies;
-	if (census.On() && !external) {
+	if (census.On() && !external && hasUploads) {
 		census.Add(Census::List::Upload);
 		if (!recorded && recordedLists.empty()) census.Add(Census::List::UploadEmpty);
 		// By ticket: a ticket with no routed copy left every queue list empty.

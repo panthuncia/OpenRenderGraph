@@ -107,6 +107,10 @@ public:
         return Manager().RecordStagedUploadsRouted(list, frameIndex, afterWork, route, routed);
     }
 
+    bool HasPendingUploads() const override {
+        return Manager().HasPendingUploads();
+    }
+
     void ProcessDeferredReleases(uint32_t frameIndex) override {
         Manager().ProcessDeferredReleases(frameIndex);
     }

@@ -1029,6 +1029,10 @@ bool PlanTicketUploads(const RenderGraph::PersistentTicket& ticket, uint32_t gra
 }
 }
 
+bool RenderGraph::HasPendingUploads() const {
+	return m_uploadService && m_uploadService->HasPendingUploads();
+}
+
 bool RenderGraph::RecordPendingUploads(rhi::Device device, rhi::CommandList& list, uint32_t slot, std::shared_ptr<void>& keepAlive, bool& recorded,
 	std::vector<rhi::CommandList>& recordedLists, PersistentTicket* ticket, std::span<rhi::CommandList> queueLists, size_t* queueCopies) {
 	BT_ZONE_SCOPE("ORG.Persistent.RecordPendingUploads");

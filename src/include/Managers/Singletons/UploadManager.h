@@ -85,6 +85,8 @@ public:
 	size_t TakeRecordedUploads(std::vector<rhi::CommandList>& out, uint32_t frameIndex);
 	bool TakeRecordedUploadsWithDestinations(std::vector<rhi::CommandList>& out, uint32_t frameIndex, std::vector<rhi::ResourceHandle>& destinations);
 	bool StagedUploadDestinations(std::vector<rhi::ResourceHandle>& out) const;
+	// IUploadService::HasPendingUploads: queued copies, or anything the instance holds.
+	bool HasPendingUploads() const;
 	size_t RecordStagedUploadsRouted(rhi::CommandList& list, uint32_t frameIndex, bool afterWork,
 		const std::function<rhi::CommandList*(rhi::ResourceHandle)>& route, size_t& routed);
 	void SetUploadResolveContext(UploadResolveContext ctx);

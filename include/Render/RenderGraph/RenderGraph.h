@@ -281,6 +281,9 @@ private:
 	// False while some of its placements are in a pool generation another graph has replaced (the pool grew): placed again, by a
 	// rebuild, they share the pool's memory again.
 	bool PersistentAliasPlacementsCurrent() const;
+	// Owner thread: whether RecordPendingUploads would record anything now (IUploadService::HasPendingUploads). A host that
+	// gets false skips its upload lists and RecordPendingUploads for the ticket.
+	bool HasPendingUploads() const;
 
 	// Tickets (async epochs, GraphHost::EnableAsyncEpochs). The graph's owner thread prepares an
 	// epoch's main execution ahead of its epoch point - Update, invocations, recording - into a ticket, for a

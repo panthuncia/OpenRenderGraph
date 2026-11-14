@@ -1384,6 +1384,10 @@ bool UploadInstance::HasPendingWork() const {
 		!m_postedTextureUploads.Empty() || !m_postedBufferUploads.Empty();
 }
 
+bool UploadInstance::HasPendingUploads() const {
+	return HasPendingWork() || !m_directStaged.empty() || !m_directRecorded.empty() || !m_pendingStaged.empty();
+}
+
 uint64_t UploadInstance::CapturePendingUploadSequence() {
 	NoteOffOwnerCall("CapturePendingUploadSequence");
 	DrainPostedUploads();
