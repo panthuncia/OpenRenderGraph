@@ -407,23 +407,33 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 				out.leases.push_back(std::move(allocation));
 				basic_telemetry::AddCounter("ORG.Persistent.HandoffReleases");
 			}
-			// The lists the slot's last ticket recorded from the same predicted plan, again; otherwise recorded, and kept for the slot's
-			// next ticket.
+			// The lists a ticket of the slot recorded from the same predicted plan, again; otherwise recorded, and kept for the slot's
+			// later tickets.
 			PersistentExecutionsState::HandoffCache* cache = nullptr;
 			auto miss = !admission.sharedBarriers ? Census::HandoffMiss::Planned
 				: ticket.segments.size() != 1 ? Census::HandoffMiss::Segments : Census::HandoffMiss::NewPlan;
 			uint32_t recordedHandoffs = 0;
 			if (admission.sharedBarriers && ticket.segments.size() == 1) {
 				if (state.handoffCache.size() <= ticket.slot) state.handoffCache.resize(size_t{ticket.slot} + 1);
-				cache = &state.handoffCache[ticket.slot];
-				if (cache->plan == admission.sharedBarriers && cache->external == ticket.external && cache->handoff.size() == batchCount) {
+				auto& entries = state.handoffCache[ticket.slot];
+				const auto found = std::ranges::find_if(entries, [&](const auto& entry) {
+					return entry.plan == admission.sharedBarriers && entry.external == ticket.external && entry.handoff.size() == batchCount;
+				});
+				// The one used goes first; a new one replaces the least recent when the slot keeps as many as it may.
+				const bool hit = found != entries.end();
+				if (hit) {
+					std::rotate(entries.begin(), found, found + 1);
+				} else {
+					if (entries.size() >= PersistentExecutionsState::kHandoffCacheEntries) entries.pop_back();
+					entries.insert(entries.begin(), PersistentExecutionsState::HandoffCache{});
+				}
+				cache = &entries.front();
+				if (hit) {
 					handoff = cache->handoff;
 					streamHandoff = cache->streamHandoff;
 					out.leases.insert(out.leases.end(), cache->allocations.begin(), cache->allocations.end());
 					basic_telemetry::AddCounter("ORG.Persistent.HandoffListsReused");
 					census.Add(Census::List::HandoffReused, static_cast<uint64_t>(std::ranges::count_if(handoff, [](rhi::CommandList list) { return static_cast<bool>(list); })));
-				} else {
-					*cache = {};
 				}
 			}
 			for (uint32_t batch = 0; batch < batchCount && !(cache && cache->plan); ++batch) {

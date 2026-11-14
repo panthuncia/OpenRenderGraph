@@ -597,15 +597,17 @@ struct RenderGraph::PersistentExecutionsState {
 		bool skippable = false;
 		std::vector<uint64_t> submitted, lowest;
 	} retireWatch;
-	// Per frame slot: the handoff lists a ticket recorded from a predicted plan (FrameAdmission::sharedBarriers). The next ticket in
-	// the slot whose admission takes the same plan submits them again: the slot's earlier work has completed by then.
+	// Per frame slot: the handoff lists tickets recorded from predicted plans (FrameAdmission::sharedBarriers), the most recent
+	// first, kHandoffCacheEntries at most. A later ticket in the slot whose admission takes one of these plans submits its lists
+	// again: the slot's earlier work has completed by then. Several, for an executable whose plans alternate.
 	struct HandoffCache {
 		std::shared_ptr<const compiler::PreparedExecutionBarrierPlan> plan;
 		bool external = false;
 		std::vector<rhi::CommandList> handoff, streamHandoff;  // per batch
 		std::vector<std::shared_ptr<const void>> allocations;
 	};
-	std::vector<HandoffCache> handoffCache;
+	static constexpr size_t kHandoffCacheEntries = 4;
+	std::vector<std::vector<HandoffCache>> handoffCache;
 	std::vector<uint8_t> tracyFrameBegun;
 	// Diagnostic: preparation cost per main pass index (ns, calls).
 	std::vector<std::pair<uint64_t, uint64_t>> prepareCostByMain;
