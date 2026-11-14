@@ -391,6 +391,16 @@ public:
 	 */
 	void SetExternalEpochs(std::vector<uint32_t> epochs);
 	/**
+	 * @brief Passes recorded at execution (ExternalPassDesc::RecordAtExecution) of the epochs that are not external are recorded
+	 * inline (RenderGraph::SetInlineAtExecution): SubmitEpoch records each such batch on the calling thread, after the commit
+	 * (beforeSubmit), into a primary list of its own, and submits it in its place in the graph's order with the graph's barriers.
+	 * Nothing is taken or executed by the caller. For a host that owns its queues; external epochs keep their behaviour. Every epoch
+	 * whose setting changes is built again; kept across rebuilds.
+	 */
+	void SetInlineAtExecution(bool enabled);
+	/** @brief Whether SetInlineAtExecution is on. */
+	bool InlineAtExecution() const;
+	/**
 	 * @brief Submitting thread, after SubmitEpoch of an external epoch: its execution (null: none since the last call). The caller
 	 * must execute its segments (ExternalEpochExecution::Execute), or signal the ones it did not unexecuted: the graphs' later
 	 * work on their timelines waits for those signals.
@@ -737,8 +747,8 @@ private:
 	void RequestRebuildOf(const Registered& extension, std::string_view reason) noexcept;
 	// Moves the configuration of the instances the extension is made into. With m_configMutex held.
 	void NoteConfigurationOf(const Registered& extension) noexcept;
-	// Guards what a build on another thread reads: m_extensions, m_externalEpochs, m_frameWaitTimeline, the GPU pass range
-	// callbacks, m_timelines and m_aliasArena. The owner thread writes them under it, and reads them without it.
+	// Guards what a build on another thread reads: m_extensions, m_externalEpochs, m_inlineAtExecution, m_frameWaitTimeline,
+	// the GPU pass range callbacks, m_timelines and m_aliasArena. The owner thread writes them under it, and reads them without it.
 	mutable std::mutex m_configMutex;
 	std::atomic<uint64_t> m_hostConfiguration{0};  // host-wide changes that a graph is built with (EpochGraph)
 	std::atomic<uint64_t> m_buildSerial{0};        // every build of any instance takes the next
@@ -827,6 +837,7 @@ private:
 	std::vector<uint32_t> m_revisionEpochs;
 	std::vector<std::pair<uint32_t, uint32_t>> m_ticketsAhead;  // SetEpochTicketsAhead: (epoch, most)
 	std::vector<uint32_t> m_externalEpochs;  // SetExternalEpochs; set on every build's graph
+	bool m_inlineAtExecution = false;        // SetInlineAtExecution; set on every build's graph
 	std::shared_ptr<ExternalEpochExecution> m_externalExecution;  // submitting thread: the last external SubmitEpoch's
 	std::shared_ptr<const EpochRecording> m_chosenRecording;  // submitting thread: UseEpochRecording's, until SubmitEpoch takes it
 	// Submitting thread, during SubmitTicket's beforeSubmit: the ticket being submitted and its epoch's index (CanUseEpochRecording).

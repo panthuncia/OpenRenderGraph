@@ -550,6 +550,11 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests.Revision COMMAND OpenRenderGraphPersistentVulkanHostTests revision)
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests.External COMMAND OpenRenderGraphPersistentVulkanHostTests external)
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests.AsyncOpen COMMAND OpenRenderGraphPersistentVulkanHostTests async open)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.Inline COMMAND OpenRenderGraphPersistentVulkanHostTests inline)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.AsyncInline COMMAND OpenRenderGraphPersistentVulkanHostTests async inline)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.AsyncOpenInline COMMAND OpenRenderGraphPersistentVulkanHostTests async open inline)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.ReuseInline COMMAND OpenRenderGraphPersistentVulkanHostTests reuse inline)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.RevisionInline COMMAND OpenRenderGraphPersistentVulkanHostTests revision inline)
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests.Split COMMAND OpenRenderGraphPersistentVulkanHostTests split)
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests.SplitOpen COMMAND OpenRenderGraphPersistentVulkanHostTests split open)
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests.Stream COMMAND OpenRenderGraphPersistentVulkanHostTests stream)
@@ -572,7 +577,9 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
                 OpenRenderGraphPersistentVulkanHostTests.AsyncOpen OpenRenderGraphPersistentVulkanHostTests.ReuseOpen
                 OpenRenderGraphPersistentVulkanHostTests.RevisionOpen OpenRenderGraphPersistentVulkanHostTests.ExternalOpen
                 OpenRenderGraphPersistentVulkanHostTests.Contributor OpenRenderGraphPersistentVulkanHostTests.Rebinding
-                OpenRenderGraphPersistentVulkanHostTests.Pipelines PROPERTIES TIMEOUT 60)
+                OpenRenderGraphPersistentVulkanHostTests.Pipelines OpenRenderGraphPersistentVulkanHostTests.Inline
+                OpenRenderGraphPersistentVulkanHostTests.AsyncInline OpenRenderGraphPersistentVulkanHostTests.AsyncOpenInline
+                OpenRenderGraphPersistentVulkanHostTests.ReuseInline OpenRenderGraphPersistentVulkanHostTests.RevisionInline PROPERTIES TIMEOUT 60)
 
         endif()
     endif()

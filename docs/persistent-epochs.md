@@ -438,6 +438,32 @@ external-commands callbacks, so ORG's work does not end DXVK's list.
         stream uploads (two segments, one split) and queue-scoped uploads (one segment, no split).
     -   `stream open home`: external home states, below.
 
+## Inline execution
+
+`GraphHost::SetInlineAtExecution(true)` (`RenderGraph::SetInlineAtExecution`) is for a host that owns its queues and has no
+stream to run external epochs in. A pass declared with `RecordAtExecution()` in an epoch that is not external is then
+recorded inline: at its place in the graph's order, in a primary list of the graph's, with the graph's barriers.
+
+-   **When.** The late batch's packet records it in its own `Submit` (`PreparedRhiExecutionBatch::RecordInline`), on the
+    submitting thread, just before the queue submission. For a ticket that is after the run's commit (`SubmitEpoch`'s
+    `beforeSubmit`), so the pass reads what the commit wrote, as it would in the host's stream. A synchronous execution
+    records it at its own submission.
+-   **Into what.** A primary list from the batch's queue's shared pool (`OwnedRecordingList::inlineAtExecution`), begun,
+    recorded and closed there, then submitted as any batch's: the batch's waits, its handoff list ahead of it, its
+    external signals and its own signal. No secondary list, no extra submission, no full barriers. Any queue.
+-   **Barriers.** The admission's, recorded around the passes as for any batch (`RecordOwnedRecordingCommands`). A pass that
+    skips the run (`SkipsAtExecution`) records only its barriers.
+-   **Reuse.** A recording with a late pass that is not replayable is never kept. A kept one (a revision's copies) records its
+    late batch again at each submission (`PreparedPass::RecordAgain`), into the same list, which `Begin` resets: a copy is
+    submitted only once its last run completed, so the list is never pending twice.
+-   **Not here.** Tracy GPU zones (the submitting thread records while workers record other lists for the queue). Statistics
+    are published at the frame slot's completion, as for an external epoch's late batch.
+-   **External epochs** keep their behaviour: their late batches are their host's to record.
+-   **Extensions** ask `RenderGraph::PassEpochRecordsAtExecution()` (in the stream, or inline) before they set
+    `RecordAtExecution`. Without either the graph refuses the pass.
+-   **Test.** `PersistentVulkanHostTests <mode> inline`: the copy pass of `sync`, `async`, `reuse` and `revision` recorded
+    inline, once per submission.
+
 ## Interop options
 
 Nothing in ORG requires the following options. They are for hosts whose own GPU work shares resources or queues with
@@ -549,6 +575,7 @@ keeps a shard of its own, and Begin resets the whole allocator.
         queue each execution.
 -   `tests/PersistentVulkanHostTests.cpp` modes:
     -   `async`, `reuse`, `revision` and `external`, each also `open`;
+    -   `inline` after any of `sync`, `async`, `reuse` and `revision` (or alone): the late copy pass recorded inline;
     -   `split` (two epochs, two graphs, one rebuilt alone);
     -   `built` and `built open`: application-driven builds. A build on a worker thread while both epochs submit, attached
         between frames; a failed build that leaves the old graph; a build rejected after its epoch's extensions changed, and

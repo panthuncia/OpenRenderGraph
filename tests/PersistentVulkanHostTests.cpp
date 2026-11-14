@@ -564,6 +564,11 @@ static int Run(int argc, char** argv) {
 	const bool open = argc > 2 && std::strcmp(argv[2], "open") == 0;
 	// "stream open home": the write also reads a host-owned texture, under external home states.
 	const bool home = open && argc > 3 && std::strcmp(argv[3], "home") == 0;
+	// "inline" anywhere (alone: the synchronous frames): the copy pass is recorded at execution, inline (GraphHost::
+	// SetInlineAtExecution). Each submission records it into a primary list of the graph's and submits it in its place. Nothing
+	// is taken or executed by the test.
+	bool inlineLate = false;
+	for (int arg = 1; arg < argc; ++arg) inlineLate = inlineLate || std::strcmp(argv[arg], "inline") == 0;
 	HostDevice host;
 	if (const int created = CreateHostDevice(host); created != 0) {
 		std::puts(created == 77 ? "SKIP: no Vulkan device with VK_EXT_descriptor_heap" : "FAIL: host device");
@@ -1231,6 +1236,7 @@ static int Run(int argc, char** argv) {
 			.tasks = std::make_shared<org::runtime::ThreadPoolTaskService>(2)});
 		org::GraphHost host({.runtime = runtime,
 			.queueBoundary = {.entry = true, .exit = true}, .epochOrder = {0}, .closedExecutions = async && !open, .reuseRecordings = reuse || revision});
+		if (inlineLate) host.SetInlineAtExecution(true);
 		{
 			auto program = CreateProgram(device.Get());
 			REQUIRE(program, "compute program");
@@ -1274,7 +1280,7 @@ static int Run(int argc, char** argv) {
 				scratch->Materialize();
 				versions = org::VersionedBuffer::Create(scratch);
 			}
-			host.AddExtension("test.host", [&] { return std::make_unique<HostExtension>(input, scratch, output, program, outputRevision, versions, external); });
+			host.AddExtension("test.host", [&] { return std::make_unique<HostExtension>(input, scratch, output, program, outputRevision, versions, external || inlineLate); });
 			if (revision) {
 				host.SetAsyncEpochs({0}, {0});
 				// Records the epoch for a revision of `count` elements; the callback runs on the host's thread.
@@ -1303,8 +1309,12 @@ static int Run(int argc, char** argv) {
 				(void)host.TakeAsyncStats();
 				for (uint32_t frame = 0; frame < 6; ++frame) {
 					value = 40000u + 10u * frame;
+					const auto copies = g_copyRecords.load(std::memory_order_relaxed);
 					host.SubmitEpoch(0, upload, {}, full);
 					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "a revision's recording writes every element");
+					REQUIRE(!inlineLate || g_copyRecords.load(std::memory_order_relaxed) == copies + 1,
+						"a kept recording's inline late pass is recorded again at each submission");
+					REQUIRE(!host.TakeExternalExecution(), "an inline epoch hands no execution back");
 				}
 				// Growth as a new version. A revision names the grown target. It is recorded while the frames still submit the old
 				// one. Each recording resolved its own version, with its own publication and bindings. Each ticket admits both
@@ -1553,9 +1563,14 @@ static int Run(int argc, char** argv) {
 				}
 				value = 1000u * (frame + 1);
 				const int locksBefore = counters.locks.load();
+				const auto copies = g_copyRecords.load(std::memory_order_relaxed);
 				if (async) {
 					if (frame != 0) host.SubmitEpoch(0, upload);
 				} else host.ExecuteFrame(nullptr, upload, UINT32_MAX, syncOwner);
+				if (inlineLate && (!async || frame != 0)) {
+					REQUIRE(g_copyRecords.load(std::memory_order_relaxed) == copies + 1, "the inline late copy is recorded once per submission");
+					REQUIRE(!host.TakeExternalExecution(), "an inline epoch hands no execution back");
+				}
 				syncOwner.reset();
 				if (!async || frame != 0)
 					REQUIRE(counters.locks.load() > locksBefore, "Execute submitted the current frame before returning");
@@ -1728,7 +1743,8 @@ static int Run(int argc, char** argv) {
 	DestroyHostBuffer(host, second);
 	vkDestroyDevice(host.device, nullptr);
 	vkDestroyInstance(host.instance, nullptr);
-	std::printf("PersistentVulkanHostTests: ok (%s, locks=%d)\n", contributor ? "contributor" : external ? "external" : async ? "async" : "sync", counters.locks.load());
+	std::printf("PersistentVulkanHostTests: ok (%s%s, locks=%d)\n", contributor ? "contributor" : external ? "external" : async ? "async" : "sync",
+		inlineLate ? ", inline" : "", counters.locks.load());
 	return 0;
 }
 

@@ -887,6 +887,7 @@ struct GraphHost::BuildInputs {
 	std::vector<std::pair<std::string, ExtensionFactory>> factories;  // the extensions made into the epoch's graph
 	std::vector<SharedQueueTimeline> timelines;
 	std::vector<uint32_t> externalEpochs;
+	bool inlineAtExecution = false;
 	std::shared_ptr<PersistentAliasArena> aliasArena;
 	std::shared_ptr<rhi::TimelinePtr> frameWaitTimeline;
 	RenderGraph::GpuPassRangeBegin gpuPassRangeBegin;
@@ -908,6 +909,7 @@ GraphHost::BuildInputs GraphHost::SnapshotBuildInputs(size_t index) {
 		if (ExtensionInEpoch(entry, instance.epoch)) inputs.factories.emplace_back(entry.id, entry.factory);
 	inputs.timelines = m_timelines;
 	inputs.externalEpochs = m_externalEpochs;
+	inputs.inlineAtExecution = m_inlineAtExecution;
 	if (m_desc.sharedAliasArena) inputs.aliasArena = m_aliasArena;
 	inputs.frameWaitTimeline = m_frameWaitTimeline;
 	inputs.gpuPassRangeBegin = m_gpuPassRangeBegin;
@@ -927,6 +929,8 @@ std::unique_ptr<RenderGraph> GraphHost::MakeGraph(const BuildInputs& inputs, boo
 		// Before the extensions gather their passes: one may record a pass at execution when the epoch is external
 		// (RenderGraph::PassEpochInHostStream).
 		graph->SetExternalPersistentEpochs(inputs.externalEpochs);
+		// Likewise for a pass recorded at execution inline (RenderGraph::PassEpochRecordsAtExecution).
+		graph->SetInlineAtExecution(inputs.inlineAtExecution);
 		// A detached graph sets up nothing other graphs share until it is attached (RenderGraph::DeferSharedSetup): the upload
 		// service's registry, the shared upload pass and the statistics query heap.
 		auto hostUploads = std::make_unique<HostUploadExtension>(graph->GetUploadService(), detached);
@@ -1456,6 +1460,23 @@ void GraphHost::SetExternalEpochs(std::vector<uint32_t> epochs) {
 		}
 	}
 	m_externalEpochs = std::move(epochs);
+}
+
+void GraphHost::SetInlineAtExecution(bool enabled) {
+	std::scoped_lock lock(m_configMutex);
+	if (m_inlineAtExecution == enabled) return;
+	// Every external epoch keeps its graph: its passes recorded at execution are its host's either way.
+	for (const auto& instance : m_instances) {
+		if (std::ranges::find(m_externalEpochs, instance.epoch) != m_externalEpochs.end()) continue;
+		RequestRebuild(instance.epoch, enabled ? "passes recorded at execution made inline" : "passes recorded at execution no longer inline");
+		instance.configuration->fetch_add(1, std::memory_order_acq_rel);
+	}
+	m_inlineAtExecution = enabled;
+}
+
+bool GraphHost::InlineAtExecution() const {
+	std::scoped_lock lock(m_configMutex);
+	return m_inlineAtExecution;
 }
 
 void GraphHost::SignalExternalExecutionUnexecuted(const ExternalEpochExecution& execution, size_t a_first) {

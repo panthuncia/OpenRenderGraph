@@ -300,6 +300,17 @@ private:
 	 */
 	void SetExternalPersistentEpochs(std::vector<uint32_t> epochs);
 	bool IsExternalPersistentEpoch(uint32_t epoch) const noexcept;
+	/**
+	 * @brief Before CompileStructural: a pass recorded at execution (ExternalPassDesc::recordAtExecution) of an epoch that is not
+	 * external is recorded inline. Its late batch is recorded when the execution submits it, on the submitting thread (a ticket's:
+	 * after the run's commit), into a primary list of its queue's shared pool, with the admission's barriers before and after it,
+	 * and that list is submitted in the batch's place, with the batch's waits and signals. No secondary list, no extra submission,
+	 * any queue. For a host that owns its queues (no DXVK stream to run external epochs in). A kept recording's late batch is
+	 * recorded again at each submission (PreparedPass::RecordAgain), into the same list. Off (the default): such a pass must be an
+	 * external epoch's. GraphHost::SetInlineAtExecution sets it on every graph it builds.
+	 */
+	void SetInlineAtExecution(bool enabled) noexcept;
+	bool InlineAtExecution() const noexcept { return m_inlineAtExecution; }
 	// A queue slot the host's stream runs: the graphics queue's, or one on the same native queue (a kind the device aliases to it).
 	// An external epoch's batches on it are the host's to execute, in its stream's order.
 	bool InHostStream(uint32_t slot) const noexcept;
@@ -655,6 +666,9 @@ public:
 	// extensions may then declare passes recorded at execution (ExternalPassDesc::RecordAtExecution). GraphHost sets this before
 	// it builds the graph, so an extension can read it while it gathers its passes.
 	bool PassEpochInHostStream() const noexcept { return IsExternalPersistentEpoch(m_passEpochFilter); }
+	// Whether a pass of the graph's epoch declared RecordAtExecution is recorded at execution: in the host's stream (an external
+	// epoch) or inline at submission (SetInlineAtExecution). Otherwise an extension records it ahead, as any other pass.
+	bool PassEpochRecordsAtExecution() const noexcept { return PassEpochInHostStream() || m_inlineAtExecution; }
 
 	/// The graph's external client (OpenRenderGraph/ExternalClient.h). Use it to submit GPU work recorded outside the
 	/// graph, such as uploads and readbacks. It uses this graph's queue slots, and its work is ordered with the graph's
@@ -826,6 +840,7 @@ private:
 	// SetExternalPersistentEpochs; and the secondary lists their tickets record into, per queue slot in the host's stream (graphics
 	// lists, made at their first ticket).
 	std::vector<uint32_t> m_externalPersistentEpochs;
+	bool m_inlineAtExecution = false;  // SetInlineAtExecution
 	std::mutex m_externalSecondaryPoolsMutex;
 	std::vector<std::shared_ptr<CommandListPool>> m_externalSecondaryPools;
 	bool m_persistentRecordingReuse = false;

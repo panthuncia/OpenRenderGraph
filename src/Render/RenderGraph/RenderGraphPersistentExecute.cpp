@@ -175,8 +175,8 @@ bool RenderGraph::AdmitPersistentSegment(PersistentSegmentRun& run) {
 		return false;
 	}
 	// An external epoch's recording is replayable as any other's (its secondaries executed again by each ticket that takes it); a
-	// late batch's passes are recorded by each execution, so it is replayable only when they are (PreparedPass::RecordAgain: their
-	// invocation recorded again by each).
+	// late batch's passes are recorded by each execution (the host's, or the submission's when inline), so it is replayable only
+	// when they are (PreparedPass::RecordAgain: their invocation recorded again by each).
 	bool lateUnreplayable = false;
 	const auto& structure = *segment.publication->executable->graph->structure;
 	for (const auto& batch : segment.publication->executable->graph->batches)
@@ -192,7 +192,7 @@ bool RenderGraph::AdmitPersistentSegment(PersistentSegmentRun& run) {
 	// version (a swapchain image) must be the frame's own, so such a recording is never kept.
 	run.keepable = ticketTarget && m_persistentRecordingReuse && !segment.perFrame
 		&& admission.incomingEffects.empty() && !ticketTarget->uncheckable
-		&& !(run.external && lateUnreplayable);
+		&& !lateUnreplayable;
 	return true;
 }
 
@@ -221,6 +221,8 @@ void RenderGraph::RecordPersistentSegment(PersistentSegmentRun& run) {
 	// An external epoch's ticket (SetExternalPersistentEpochs): its batches on the graphics queue are recorded into secondaries,
 	// which the host executes in its own stream, and a late batch's pass (recordAtExecution) by the host's execution. Its batches on
 	// other queues are recorded and submitted as any other's.
+	// Any other epoch's late batch, under SetInlineAtExecution: recorded by its packet's submission, into a primary list of the
+	// queue's shared pool, in the batch's place (OwnedRecordingList::inlineAtExecution).
 	for (uint32_t batch = 0; batch < graph.batches.size(); ++batch) {
 		const auto slot = graph.batches[batch].queue;
 		if (slot >= slotCount) throw std::runtime_error("Persistent batch queue is unavailable");
@@ -236,7 +238,8 @@ void RenderGraph::RecordPersistentSegment(PersistentSegmentRun& run) {
 			}
 			throw std::logic_error("An external epoch's passes recorded at execution must run on the graphics queue: " + names);
 		}
-		if (late && !external) throw std::logic_error("A pass recorded at execution is not an external epoch's");
+		if (late && !external && !m_inlineAtExecution)
+			throw std::logic_error("A pass recorded at execution is not an external epoch's, and the graph records none inline (SetInlineAtExecution)");
 		if (!late) ++demand[slot];
 		const auto index = static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot));
 		const auto queueKind = m_queueRegistry.GetKind(index);
@@ -267,6 +270,9 @@ void RenderGraph::RecordPersistentSegment(PersistentSegmentRun& run) {
 			job.recording.acquiredBarriers.clear();
 		}
 		job.recording.external = inStream;
+		// Inline: the packet records the batch when it submits it, from the queue's shared pool (AcquireCommandLists skips it).
+		job.recording.inlineAtExecution = late && !external;
+		if (job.recording.inlineAtExecution) job.recording.allocation->pool = job.pool;
 		job.recording.bindings = segment.bindings;
 		job.recording.run = run.execution.options.run.value_or(RunRef::Unleased(frameIndex));
 		job.recording.externalEntryBarrier = m_externalQueueBoundary.entry && run.firstBatchOnSlot[slot] == batch;
@@ -354,7 +360,8 @@ void RenderGraph::RecordPersistentSegment(PersistentSegmentRun& run) {
 			}
 			if (readyIndex != ready.size()) throw std::logic_error("Command-list batch demand did not match recording jobs");
 			if (!state.tracyFrameBegun[slot] && !keepable && !external) {
-				const auto first = std::ranges::find_if(jobs, [slot](const auto& job) { return job.slot == slot; });
+				// A late batch has no list yet, so the mark goes in the slot's first list recorded ahead.
+				const auto first = std::ranges::find_if(jobs, [slot](const auto& job) { return job.slot == slot && !job.deferred; });
 				if (first != jobs.end()) {
 					// The frame mark is recorded here, so the list is begun here. Its recorder sees it begun and keeps it.
 					auto& allocation = *first->recording.allocation;
@@ -832,6 +839,8 @@ bool RenderGraph::PersistentAliasPlacementsCurrent() const {
 	std::lock_guard lock(state.aliasArena->mutex);
 	return !state.aliasArena->stale.contains(&state);
 }
+
+void RenderGraph::SetInlineAtExecution(bool enabled) noexcept { m_inlineAtExecution = enabled; }
 
 bool RenderGraph::IsExternalPersistentEpoch(uint32_t epoch) const noexcept {
 	return std::binary_search(m_externalPersistentEpochs.begin(), m_externalPersistentEpochs.end(), epoch);

@@ -71,12 +71,16 @@ struct ExternalPassDesc {
 	// Persistent execution: the host epoch the pass runs in. persistent::AllEpochs
 	// means every epoch. See SetPersistentEpochOrder.
 	uint32_t epoch = UINT32_MAX;
-	// Persistent execution only, for a pass of an external epoch (SetExternalPersistentEpochs). The pass is recorded when
-	// the host executes the epoch, not ahead with the other passes. Recording happens in ExternalEpochExecution::Execute,
-	// on the host's thread, into the host's command buffer. Its batch holds only passes recorded at execution. Its barriers
-	// come from admission and are recorded around it. Use it for work that is only known at that point, such as a CPU cull's
-	// draws. A typed pass recorded so may also skip a run whose work it knows then to be empty (TypedRenderGraphPass's
-	// SkipsAtExecution).
+	// Persistent execution only. The pass is recorded when the epoch executes, not ahead with the other passes:
+	// - of an external epoch (SetExternalPersistentEpochs): in ExternalEpochExecution::Execute, on the host's thread, into the
+	//   host's command buffer. It must run on the graphics queue.
+	// - of any other epoch, when the graph records such passes inline (RenderGraph::SetInlineAtExecution): when the execution
+	//   submits its batch, on the submitting thread (a ticket's: after the run's commit), into a primary list of the graph's,
+	//   submitted in the batch's place.
+	// Its batch holds only passes recorded at execution. Its barriers come from admission and are recorded around it. Use it for
+	// work that is only known at that point, such as a CPU cull's draws. A typed pass recorded so may also skip a run whose work
+	// it knows then to be empty (TypedRenderGraphPass's SkipsAtExecution). An extension should ask
+	// RenderGraph::PassEpochRecordsAtExecution before it sets this: otherwise the graph refuses the pass.
 	bool recordAtExecution = false;
 	// Per-frame passes only. A frame-interrupting pass must run at its insert
 	// point even under the persistent graph, which hosts it in the main

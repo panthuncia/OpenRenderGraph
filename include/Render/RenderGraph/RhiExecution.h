@@ -420,15 +420,20 @@ public:
                     throw std::invalid_argument("Duplicate timeline identity");
         }
     }
-    // Makes a late batch of an external epoch, whose pass is recorded at execution (CompilePass::recordAtExecution).
-    // It has no lists. Its recording is kept for RecordDeferred, which the host's execution calls once, into the host's
-    // list. The graph never submits it.
+    // Makes a late batch, whose passes are recorded at execution (CompilePass::recordAtExecution). It has no lists yet.
+    // - Of an external epoch: its recording is kept for RecordDeferred, which the host's execution calls once, into the
+    //   host's list. The graph never submits it.
+    // - Inline (OwnedRecordingList::inlineAtExecution, RenderGraph::SetInlineAtExecution): Submit records it into a
+    //   primary list of the recording's pool, then submits that list as it submits any other batch's.
     PreparedRhiExecutionBatch(uint32_t queueSlot, rhi::Queue queue, OwnedRecordingList deferred,
         std::vector<PreparedTimelineBinding> timelines, std::shared_ptr<const void> lease);
     ~PreparedRhiExecutionBatch() override { Abandon(); }
     // Its lists, for a host that executes them, such as an external epoch's secondaries. A deferred batch has none.
     std::span<rhi::CommandList> Lists() const noexcept { return {m_lists.data(), m_lists.size()}; }
+    // A late batch: an external epoch's (its host records it) or an inline one (Submit records it).
     bool Deferred() const noexcept { return static_cast<bool>(m_deferred); }
+    // A late batch that Submit records itself, into a primary list of its own (RenderGraph::SetInlineAtExecution).
+    bool Inline() const noexcept { return m_inline; }
     // The timeline an identity binds (a null handle: none).
     rhi::TimelineHandle ResolveTimeline(uint64_t identity) const noexcept {
         for (const auto& item : m_timelines) if (item.identity == identity) return item.handle;
@@ -456,7 +461,7 @@ public:
         }
         return CommitEffectsSubmitted(a_signal);
     }
-    // Records a deferred batch into the host's list, outside any pass. Call it once, on the host's thread.
+    // Records an external epoch's late batch into the host's list, outside any pass. Call it once, on the host's thread.
     void RecordDeferred(rhi::CommandList a_list) const;
     uint32_t QueueSlot() const noexcept override { return m_queueSlot; }
     bool Replayable() const noexcept override { return m_replayable; }
@@ -486,8 +491,8 @@ public:
         return {SubmissionState::Signaled};
     }
     SubmissionReceipt Submit(const ExecutionBatchTimeline& batch) const noexcept override {
-        // A deferred batch has no lists: only its host's execution records it.
-        if (m_deferred) return {SubmissionState::NotSubmitted, SubmissionFailureStage::Validation};
+        // An external epoch's late batch has no lists: only its host's execution records it.
+        if (m_deferred && !m_inline) return {SubmissionState::NotSubmitted, SubmissionFailureStage::Validation};
         // The packet is consumed once, even after a failure, because uploads and readbacks cannot replay.
         // A replayable packet has neither.
         if (!m_replayable && m_consumed.exchange(true)) return {SubmissionState::NotSubmitted, SubmissionFailureStage::Replay};
@@ -522,12 +527,23 @@ public:
                 signals.push_back({external.timeline.GetHandle(), external.value});
             }
         signals.push_back({signal->handle, batch.signal.value});
-        std::vector<rhi::CommandList> withLeading;
-        if (!batch.leading.empty()) {
-            withLeading.assign(batch.leading.begin(), batch.leading.end());
-            withLeading.insert(withLeading.end(), m_lists.begin(), m_lists.end());
+        // An inline late batch is recorded now, after its run's commit, into a primary list of its own. Its barriers are the
+        // admission's, as any batch's, and it is submitted where a batch recorded ahead would be.
+        rhi::CommandList recorded{};
+        if (m_inline) {
+            recorded = RecordInline();
+            if (!recorded) {
+                AbandonEffects();
+                return {SubmissionState::NotSubmitted, SubmissionFailureStage::Lifecycle};
+            }
         }
-        const auto& lists = batch.leading.empty() ? m_lists : withLeading;
+        std::vector<rhi::CommandList> withLeading;
+        if (!batch.leading.empty() || m_inline) {
+            withLeading.assign(batch.leading.begin(), batch.leading.end());
+            if (m_inline) withLeading.push_back(recorded);
+            else withLeading.insert(withLeading.end(), m_lists.begin(), m_lists.end());
+        }
+        const auto& lists = withLeading.empty() ? m_lists : withLeading;
         const auto submitted = m_queue.Submit({lists.data(), static_cast<uint32_t>(lists.size())},
             {{waits.data(), static_cast<uint32_t>(waits.size())}, {signals.data(), static_cast<uint32_t>(signals.size())}});
         if (submitted != rhi::Result::Ok)
@@ -560,9 +576,12 @@ public:
         // Admission has observed every queue completion for this execution.
         // Return command allocators immediately instead of waiting for the
         // retired execution's diagnostic/resource garbage to be destroyed.
-        if (!m_commandListsRetired.exchange(true) && m_retireCommandLists) {
-            try { m_retireCommandLists(); }
-            catch (...) { basic_telemetry::AddCounter("ORG.CommandListPool.RetirementFailures"); }
+        if (!m_commandListsRetired.exchange(true)) {
+            if (m_retireCommandLists) {
+                try { m_retireCommandLists(); }
+                catch (...) { basic_telemetry::AddCounter("ORG.CommandListPool.RetirementFailures"); }
+            }
+            if (m_inline) RetireInlineList();
         }
     }
     void Abandon() const noexcept override {
@@ -570,6 +589,13 @@ public:
         AbandonEffects();
     }
 private:
+    // Records the late batch's barriers and passes into a_list (again, for a replayable packet). Commits nothing.
+    void RecordDeferredCommands(rhi::CommandList a_list) const;
+    // An inline late batch: begins its own list (again, for a replayable packet), records it and closes it. A null list
+    // when that failed.
+    rhi::CommandList RecordInline() const noexcept;
+    // An inline late batch's list goes back to its pool, once its submission completed.
+    void RetireInlineList() const noexcept;
     bool CommitEffectsSubmitted(uint64_t a_signal) const noexcept {
         bool lifecycleFailed = false;
         for (const auto& pass : m_submissionEffects) {
@@ -598,6 +624,7 @@ private:
     mutable std::atomic_bool m_commandListsRetired{false};
     bool m_replayable = false;
     std::shared_ptr<OwnedRecordingList> m_deferred;
+    bool m_inline = false;  // m_deferred->inlineAtExecution
     mutable std::atomic_bool m_deferredRecorded{false};
     mutable uint64_t m_deferredSignal = 0;  // set by CommitExternal. RecordDeferred commits its passes with it.
 };
@@ -722,6 +749,11 @@ struct OwnedRecordingList {
     // from its pool, or at execution into the host's list (a late batch). The graph never submits it. It has no Tracy
     // GPU zones, because their state is queue-scoped.
     bool external = false;
+    // A late batch of an epoch that is not external, under RenderGraph::SetInlineAtExecution. Its packet records it at
+    // submission, on the submitting thread, into a primary list from allocation->pool, and submits that list in the
+    // batch's place. It has no Tracy GPU zones: the submitting thread records it while the recording workers may record
+    // other lists for the same queue.
+    bool inlineAtExecution = false;
     // Record for resubmission, when every pass of the packet is replayable (PreparedRhiExecutionBatch's replayable
     // packets). The list then has no profiler GPU zones or ranges, because a resubmission would write their queries
     // again. Nothing a list records may name a resource its recording does not own. Its statistics queries, if any, are
@@ -925,7 +957,7 @@ inline void RecordOwnedRecordingCommands(RecordingContext& context, const OwnedR
         // can report that earlier instrumentation error only when a later
         // command list closes, obscuring the actual pass. Keep GPU zones on
         // graphics/compute queues and leave copy lists instrumentation-free.
-        const bool allowTracyGpuZone = !replayable && !skipQueries && !recording.external && (!statistics ||
+        const bool allowTracyGpuZone = !replayable && !skipQueries && !recording.external && !recording.inlineAtExecution && (!statistics ||
             statistics->queueKind != rhi::QueueKind::Copy);
         TracyGpuZoneScope tracyGpuZone(context.Commands(), queue,
             allowTracyGpuZone
@@ -995,6 +1027,9 @@ inline PreparedRhiExecutionBatch::PreparedRhiExecutionBatch(uint32_t queueSlot, 
       m_deferred(std::make_shared<OwnedRecordingList>(std::move(deferred))) {
     if (!m_queue || !m_lease || m_deferred->passes.empty())
         throw std::invalid_argument("Incomplete deferred RHI packet");
+    m_inline = m_deferred->inlineAtExecution;
+    if (m_inline && (!m_deferred->allocation || !m_deferred->allocation->pool || m_deferred->allocation->pool->Secondary()))
+        throw std::invalid_argument("An inline late batch needs a pool of primary command lists");
     // A kept recording's late batch, whose passes are replayable. Every execution that takes the recording records it.
     // There are no effects to commit.
     m_replayable = m_deferred->replayable
@@ -1002,8 +1037,7 @@ inline PreparedRhiExecutionBatch::PreparedRhiExecutionBatch(uint32_t queueSlot, 
     if (!m_replayable) m_submissionEffects = m_deferred->passes;
 }
 
-inline void PreparedRhiExecutionBatch::RecordDeferred(rhi::CommandList a_list) const {
-    if (!m_deferred) throw std::logic_error("Not a deferred packet");
+inline void PreparedRhiExecutionBatch::RecordDeferredCommands(rhi::CommandList a_list) const {
     const bool again = m_deferredRecorded.exchange(true);
     if (again && !m_replayable) throw std::logic_error("A deferred packet is recorded once, unless it is replayable");
     // A kept recording's own queries start over in each list that records it. The last execution's queries were read
@@ -1019,7 +1053,42 @@ inline void PreparedRhiExecutionBatch::RecordDeferred(rhi::CommandList a_list) c
     RecordOwnedRecordingCommands(context, *m_deferred, m_queue, false, again, true);
     // Its queries are in a_list now. Its frame slot's completion publishes them (OwnedRecordingStatistics::atCompletion).
     if (m_deferred->statistics) m_deferred->statistics->recorded.store(true, std::memory_order_release);
+}
+
+inline void PreparedRhiExecutionBatch::RecordDeferred(rhi::CommandList a_list) const {
+    if (!m_deferred) throw std::logic_error("Not a deferred packet");
+    if (m_inline) throw std::logic_error("An inline late batch is recorded by its own submission");
+    RecordDeferredCommands(a_list);
     if (!m_replayable && !CommitEffectsSubmitted(m_deferredSignal)) throw std::logic_error("A deferred packet's passes could not be committed as submitted");
+}
+
+inline rhi::CommandList PreparedRhiExecutionBatch::RecordInline() const noexcept {
+    BT_ZONE_SCOPE("ORG.Execution.RecordInline");
+    try {
+        auto& allocation = *m_deferred->allocation;
+        // A new list at the first submission. A replayable packet records again at each one, into the same list: its last
+        // submission is done by then (a list is never pending twice; GraphHost submits a kept recording's copy only once
+        // that copy's last run completed), so Begin resets it.
+        allocation.pool->Begin(allocation.pair);
+        allocation.closed = false;
+        auto list = allocation.pair.list.Get();
+        RecordDeferredCommands(list);
+        if (list.EndChecked() != rhi::Result::Ok) {
+            basic_telemetry::AddCounter("ORG.Execution.RecordingCloseFailures");
+            return {};
+        }
+        allocation.Close();
+        return list;
+    } catch (...) {
+        basic_telemetry::AddCounter("ORG.Execution.InlineRecordingFailures");
+        return {};
+    }
+}
+
+inline void PreparedRhiExecutionBatch::RetireInlineList() const noexcept {
+    auto& allocation = *m_deferred->allocation;
+    // A list left open by a failed recording is discarded with the packet instead.
+    if (allocation.closed) allocation.RecycleAfterCompletion();
 }
 
 // Called only after admission freezes bindings and barriers. It may run on a
