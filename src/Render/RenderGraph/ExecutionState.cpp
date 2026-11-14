@@ -786,6 +786,11 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
                             home = region.state;
                             break;
                         }
+                    // A texture first seen with no contents (a new graph-owned texture) has no home to go back to: Undefined is not
+                    // a layout a barrier can end in. It rests in Common, as the host's other textures do between executions.
+                    if (captured.shape.hasLayout && home.layout == static_cast<uint64_t>(rhi::ResourceLayout::Undefined))
+                        home = {static_cast<uint64_t>(rhi::ResourceAccessType::Common), static_cast<uint64_t>(rhi::ResourceLayout::Common),
+                            static_cast<uint64_t>(rhi::ResourceSyncState::All), false};
                     auto& output = result.batches[last.batch];
                     const auto lastQueue = graph.batches[last.batch].queue;
                     if (external && lastQueue != 0 && !fixedHeapState) {
