@@ -37,7 +37,7 @@ std::shared_ptr<RenderGraph::PersistentTicket> RenderGraph::PreparePersistentTic
 	return ticket;
 }
 
-std::shared_ptr<RenderGraph::PersistentTicket> RenderGraph::PrepareRevisionTicket(uint32_t epoch, RunRef run, uint64_t hostFrame) {
+std::shared_ptr<RenderGraph::PersistentTicket> RenderGraph::PrepareRevisionTicket(uint32_t epoch, RunRef run, uint64_t hostFrame, bool retire) {
 	BT_ZONE_SCOPE("ORG.Persistent.PrepareRevisionTicket");
 	auto ticket = std::make_shared<PersistentTicket>();
 	ticket->epoch = epoch;
@@ -47,7 +47,7 @@ std::shared_ptr<RenderGraph::PersistentTicket> RenderGraph::PrepareRevisionTicke
 	ticket->revision = true;
 	ticket->external = IsExternalPersistentEpoch(epoch);
 	// What Execute does before it admits: release the executions the GPU has finished.
-	RetirePersistentExecutions();
+	if (retire) RetirePersistentExecutions();
 	return ticket;
 }
 
@@ -659,7 +659,80 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 			}
 			continue;
 		}
-		{
+		if (m_coalesceSubmissions) {
+			BT_ZONE_SCOPE("ORG.Frame.SubmitPacketsCoalesced");
+			// Consecutive batches on one queue share one queue submission (SetCoalescedSubmissions). A batch with queue-scoped
+			// uploads ahead of it, or a packet of another kind, is submitted on its own.
+			compiler::PreparedRhiExecutionBatch::GatheredSubmission gathered;
+			std::vector<uint32_t> group;
+			uint32_t groupQueue = UINT32_MAX;
+			rhi::Queue groupRhiQueue{};
+			const auto flush = [&]() -> bool {
+				if (group.empty()) return true;
+				// The batches' own queue timeline: a wait on a value one of them signals is covered by queue order. Every
+				// signal on one timeline collapses to its highest value, which covers the lower ones.
+				const auto own = m_queueRegistry.GetFence(static_cast<QueueSlotIndex>(static_cast<uint8_t>(groupQueue))).GetHandle();
+				const uint64_t firstSignal = batches[group.front()].signal.value;
+				const auto merge = [](std::vector<rhi::TimelinePoint>& points) {
+					std::vector<rhi::TimelinePoint> merged;
+					for (const auto& point : points) {
+						auto found = std::ranges::find_if(merged, [&](const rhi::TimelinePoint& other) {
+							return other.t.index == point.t.index && other.t.generation == point.t.generation;
+						});
+						if (found == merged.end()) merged.push_back(point);
+						else found->value = (std::max)(found->value, point.value);
+					}
+					points = std::move(merged);
+				};
+				std::erase_if(gathered.waits, [&](const rhi::TimelinePoint& wait) {
+					return wait.t.index == own.index && wait.t.generation == own.generation && wait.value >= firstSignal;
+				});
+				merge(gathered.waits);
+				merge(gathered.signals);
+				const auto submitted = groupRhiQueue.Submit({gathered.lists.data(), static_cast<uint32_t>(gathered.lists.size())},
+					{{gathered.waits.data(), static_cast<uint32_t>(gathered.waits.size())},
+					 {gathered.signals.data(), static_cast<uint32_t>(gathered.signals.size())}});
+				basic_telemetry::AddCounter("ORG.Persistent.CoalescedSubmissions");
+				basic_telemetry::AddCounter("ORG.Persistent.CoalescedBatches", group.size());
+				const bool ok = submitted == rhi::Result::Ok;
+				// Each batch the queue accepted commits its passes, even when another one's commit failed.
+				bool committed = true;
+				for (const auto batch : group) {
+					if (!ok) break;
+					const auto* packet = static_cast<const compiler::PreparedRhiExecutionBatch*>(packets[batch].get());
+					committed = static_cast<bool>(packet->CommitGathered(batches[batch])) && committed;
+				}
+				group.clear();
+				gathered.Clear();
+				return ok && committed;
+			};
+			for (uint32_t i = 0; i < batchCount; ++i) {
+				const auto* packet = dynamic_cast<const compiler::PreparedRhiExecutionBatch*>(packets[i].get());
+				const bool leadingUploads = std::ranges::any_of(planned.leading, [&](const auto& leading) { return leading.batch == i && leading.copies; });
+				if (!packet || leadingUploads) {
+					if (!flush() || !submitPacket(i)) return false;
+					continue;
+				}
+				const auto queue = graph.batches[i].queue;
+				if (queue != groupQueue && !flush()) return false;
+				groupQueue = queue;
+				groupRhiQueue = packet->SubmitQueue();
+				for (const auto wait : batches[i].waits) {
+					if (packet->BindsTimeline(wait.timeline)) continue;
+					const auto handle = m_runtime->TimelineHandleOf(wait.timeline);
+					if (handle.valid()) extra[i].push_back({wait.timeline, handle});
+				}
+				batches[i].extraTimelines = extra[i];
+				if (handoff[i]) batches[i].leading = {&handoff[i], 1};
+				if (!packet->Gather(batches[i], gathered)) {
+					// Its effects are abandoned. The batches gathered before it still go to the queue.
+					(void)flush();
+					return false;
+				}
+				group.push_back(i);
+			}
+			if (!flush()) return false;
+		} else {
 			BT_ZONE_SCOPE("ORG.Frame.SubmitPackets");
 			for (uint32_t i = 0; i < batchCount; ++i)
 				if (!submitPacket(i)) return false;

@@ -809,6 +809,11 @@ public:
     bool SkipsAtExecution(const RecordingContext& context) const {
         return m_storage && m_storage->state.load(std::memory_order_acquire) == LifecycleState::Prepared && m_storage->SkipsAtExecution(context);
     }
+    // The same question for a kept recording's pass recorded again at a later submission (RecordAgain). The pass was recorded
+    // (or skipped) once already, and it decides from what this run's commit wrote.
+    bool SkipsAgain(const RecordingContext& context) const {
+        return m_storage && m_storage->state.load(std::memory_order_acquire) == LifecycleState::Recorded && m_storage->SkipsAtExecution(context);
+    }
     // Consumes the packet as Record does, recording nothing (SkipsAtExecution). Its submission and completion follow as usual.
     void RecordNothing() const {
         if (!m_storage) throw std::logic_error("Legacy pass has no owned recording packet");

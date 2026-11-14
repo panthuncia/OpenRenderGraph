@@ -1,5 +1,6 @@
 #include "Render/LatchBlock.h"
 
+#include <algorithm>
 #include <cstring>
 #include <stdexcept>
 
@@ -11,12 +12,34 @@
 
 namespace org {
 
+namespace {
+// Every arena block alive, so a stable run's regions can be cleared in all of them (ZeroStableRun).
+std::mutex& RegistryMutex() {
+	static std::mutex mutex;
+	return mutex;
+}
+std::vector<const LatchBlock*>& Registry() {
+	static std::vector<const LatchBlock*> blocks;
+	return blocks;
+}
+}
+
+void LatchBlock::ZeroStableRun(uint32_t lease) {
+	std::scoped_lock registry(RegistryMutex());
+	for (const auto* block : Registry()) {
+		std::scoped_lock lock(block->m_mutex);
+		if (lease < block->m_stable.size() && block->m_stable[lease]) std::memset(block->m_stable[lease].mapped, 0, block->m_stable[lease].size);
+	}
+}
+
 LatchBlock::LatchBlock(std::string name, uint32_t bytesPerRun)
 	: m_name(std::move(name)), m_stride((bytesPerRun + FrameArena::kAlignment - 1) & ~(FrameArena::kAlignment - 1)) {
 	if (!bytesPerRun) throw std::invalid_argument("Latch block '" + m_name + "' needs a size");
 	auto* runtime = Runtime::Current();
 	if (!runtime || !runtime->Arena()) throw std::logic_error("Latch block '" + m_name + "' needs a runtime and its frame arena");
 	m_arena = runtime->Arena();
+	std::scoped_lock registry(RegistryMutex());
+	Registry().push_back(this);
 }
 
 std::shared_ptr<LatchBlock> LatchBlock::Create(std::string name, uint32_t bytesPerRun) {
@@ -48,6 +71,10 @@ std::shared_ptr<LatchBlock> LatchBlock::CreateDedicated(std::string name, uint32
 }
 
 LatchBlock::~LatchBlock() {
+	if (!m_buffer) {
+		std::scoped_lock registry(RegistryMutex());
+		std::erase(Registry(), this);
+	}
 	if (m_buffer && m_mapped) m_buffer->GetAPIResource().Unmap(0, m_stride);
 	// A leased run's region belongs to its lease, which frees it when the run retires. The pinned ones are the block's: they
 	// are reused once the GPU is past what was submitted so far.

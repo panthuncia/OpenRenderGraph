@@ -490,7 +490,21 @@ public:
             return {SubmissionState::SubmissionUncertain, SubmissionFailureStage::Submit, static_cast<uint32_t>(submitted)};
         return {SubmissionState::Signaled};
     }
-    SubmissionReceipt Submit(const ExecutionBatchTimeline& batch) const noexcept override {
+    // What one queue submission of one or more batches holds. Gather adds a batch's part to it; the caller submits it on the
+    // batches' queue and then calls CommitGathered for each batch, in order.
+    struct GatheredSubmission {
+        std::vector<rhi::TimelinePoint> waits;
+        std::vector<rhi::CommandList> lists;
+        std::vector<rhi::TimelinePoint> signals;
+        void Clear() noexcept {
+            waits.clear();
+            lists.clear();
+            signals.clear();
+        }
+    };
+    // Adds this batch's waits, lists (its leading lists first) and signals to a_into, without submitting. An inline late batch
+    // is recorded here. On failure the batch's effects are abandoned, as Submit's would be, and a_into is unchanged.
+    SubmissionReceipt Gather(const ExecutionBatchTimeline& batch, GatheredSubmission& a_into) const noexcept {
         // An external epoch's late batch has no lists: only its host's execution records it.
         if (m_deferred && !m_inline) return {SubmissionState::NotSubmitted, SubmissionFailureStage::Validation};
         // The packet is consumed once, even after a failure, because uploads and readbacks cannot replay.
@@ -514,9 +528,6 @@ public:
         // own signal. The external signals are fixed at preparation, so they can travel with the lists.
         // A host that orders submissions in its own stream (DXVK) then takes one entry per batch, instead
         // of one per wait and one per signal.
-        std::vector<rhi::TimelinePoint> waits;
-        waits.reserve(batch.waits.size());
-        for (auto wait : batch.waits) waits.push_back({find(wait.timeline)->handle, wait.value});
         std::vector<rhi::TimelinePoint> signals;
         for (const auto& pass : m_submissionEffects)
             for (const auto& external : pass.ExternalSignalsAfterCompletion()) {
@@ -537,17 +548,17 @@ public:
                 return {SubmissionState::NotSubmitted, SubmissionFailureStage::Lifecycle};
             }
         }
-        std::vector<rhi::CommandList> withLeading;
-        if (!batch.leading.empty() || m_inline) {
-            withLeading.assign(batch.leading.begin(), batch.leading.end());
-            if (m_inline) withLeading.push_back(recorded);
-            else withLeading.insert(withLeading.end(), m_lists.begin(), m_lists.end());
-        }
-        const auto& lists = withLeading.empty() ? m_lists : withLeading;
-        const auto submitted = m_queue.Submit({lists.data(), static_cast<uint32_t>(lists.size())},
-            {{waits.data(), static_cast<uint32_t>(waits.size())}, {signals.data(), static_cast<uint32_t>(signals.size())}});
-        if (submitted != rhi::Result::Ok)
-            return {SubmissionState::SubmissionUncertain, SubmissionFailureStage::Submit, static_cast<uint32_t>(submitted)};
+        for (auto wait : batch.waits) a_into.waits.push_back({find(wait.timeline)->handle, wait.value});
+        a_into.lists.insert(a_into.lists.end(), batch.leading.begin(), batch.leading.end());
+        if (m_inline) a_into.lists.push_back(recorded);
+        else a_into.lists.insert(a_into.lists.end(), m_lists.begin(), m_lists.end());
+        a_into.signals.insert(a_into.signals.end(), signals.begin(), signals.end());
+        return {SubmissionState::Signaled};
+    }
+    // The queue this packet submits on.
+    rhi::Queue SubmitQueue() const noexcept { return m_queue; }
+    // After the submission that held this batch (Gather) was accepted: commits its passes as submitted with the batch's signal.
+    SubmissionReceipt CommitGathered(const ExecutionBatchTimeline& batch) const noexcept {
         bool lifecycleFailed = false;
         for (const auto& pass : m_submissionEffects) {
             try { pass.CommitSubmitted({batch.signal.value}); }
@@ -560,6 +571,16 @@ public:
         if (lifecycleFailed)
             return {SubmissionState::SubmittedWithoutSignal, SubmissionFailureStage::Lifecycle};
         return {SubmissionState::Signaled};
+    }
+    SubmissionReceipt Submit(const ExecutionBatchTimeline& batch) const noexcept override {
+        GatheredSubmission gathered;
+        if (const auto receipt = Gather(batch, gathered); !receipt) return receipt;
+        const auto submitted = m_queue.Submit({gathered.lists.data(), static_cast<uint32_t>(gathered.lists.size())},
+            {{gathered.waits.data(), static_cast<uint32_t>(gathered.waits.size())},
+             {gathered.signals.data(), static_cast<uint32_t>(gathered.signals.size())}});
+        if (submitted != rhi::Result::Ok)
+            return {SubmissionState::SubmissionUncertain, SubmissionFailureStage::Submit, static_cast<uint32_t>(submitted)};
+        return CommitGathered(batch);
     }
     void Complete(uint64_t submission) const noexcept override {
         if (m_replayable) return;  // the lists are reused. They are released when the last owner releases the packet.
@@ -922,12 +943,14 @@ inline void RecordOwnedRecordingCommands(RecordingContext& context, const OwnedR
     };
     for (size_t passIndex = 0; passIndex < recording.passes.size(); ++passIndex) {
         // Recorded at execution, a pass with nothing to do this run (PreparedPass::SkipsAtExecution) records only its barriers:
-        // the states the admission planned still change. No label, timestamps or GPU zone for it.
-        if (a_atExecution && !a_again && recording.passes[passIndex].SkipsAtExecution(context)) {
+        // the states the admission planned still change. No label, timestamps or GPU zone for it. A kept recording's pass
+        // recorded again asks the same for its new run (SkipsAgain).
+        const auto& pass = recording.passes[passIndex];
+        if (a_atExecution && (a_again ? pass.SkipsAgain(context) : pass.SkipsAtExecution(context))) {
             BT_ZONE_SCOPE("ORG.Execution.RecordOwned.Skipped");
-            const auto passLabel = recording.passes[passIndex].DebugName();
+            const auto passLabel = pass.DebugName();
             recordPassBarriers(recording.barriersBeforePass, passIndex, "before", passLabel);
-            recording.passes[passIndex].RecordNothing();
+            if (!a_again) pass.RecordNothing();
             recordPassBarriers(recording.barriersAfterPass, passIndex, "after", passLabel);
             continue;
         }

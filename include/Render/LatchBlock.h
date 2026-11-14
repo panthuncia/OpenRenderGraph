@@ -77,6 +77,10 @@ public:
 		return regions == 1 ? CreateDedicated(std::move(name), bytes) : Create(std::move(name), bytes);
 	}
 	bool Dedicated() const noexcept { return static_cast<bool>(m_buffer); }
+	// Clears the pinned region of the stable run at lease index `lease` in every arena block. A host calls it before a stable
+	// run's lease is reused for a new run whose writer may skip some blocks: those blocks then read zeros, as a leased run's
+	// fresh region would. The GPU must be done with the lease's last run.
+	static void ZeroStableRun(uint32_t lease);
 	// A dedicated block's buffer, its view and its bytes (null, 0 and empty for an arena block).
 	const std::shared_ptr<Buffer>& Resource() const noexcept { return m_buffer; }
 	uint32_t SrvIndex() const noexcept { return m_srvIndex; }

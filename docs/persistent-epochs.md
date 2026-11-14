@@ -179,6 +179,17 @@ thread calls `SubmitEpoch(epoch, beforeSubmit)` at each point instead of `Execut
         A stale ticket is prepared again for the same run lease, whose latch regions `beforeSubmit` just wrote;
     4.  admits the ticket (`AdmitPersistentTicket`), records the pending uploads into the lease's upload list, and submits
         the uploads and the ticket with the handoff lists (`SubmitPersistentTicket`), then commits.
+-   **Coalesced submissions** (`Desc::coalesceSubmissions`, `RenderGraph::SetCoalescedSubmissions`). Without it each batch is a
+    queue submission of its own. With it, a ticket's consecutive batches on one queue go to the queue in one submission:
+    -   the lists in batch order, each batch's handoff list ahead of its own lists;
+    -   the waits of all of them, without the waits on values the group itself signals (queue order covers those);
+    -   the passes' external signals, and the queue timeline's highest value, which covers the lower ones.
+
+    Barriers between the batches are unchanged: they are recorded in the lists, and the lists run in the same order. A batch
+    with queue-scoped uploads ahead of it is submitted on its own. Same-queue batches have no waits on each other
+    (`relativeWaits` are only between queues), so nothing that synchronized before is lost.
+    -   Each batch's passes are committed as submitted once the queue accepted the group
+        (`PreparedRhiExecutionBatch::Gather`, `CommitGathered`).
 -   **Held tickets.** `HoldEpochTicket(epoch)` takes a live epoch's next ticket ahead of its `SubmitEpoch`, so a host can write
     one run's values at several points of its frame and submit them once. Inside `UseHeldRun(epoch)` ... `EndHeldRun()`,
     `CurrentRun()` is the held ticket's run. The next `SubmitEpoch` of the epoch submits the held ticket (its revisions are
@@ -270,6 +281,18 @@ effect). Pipelines and other objects a recording binds are retained by the recor
 
 -   **Live epochs record every run.** A live ticket's recording is used once and nothing keeps it. A ticket that
     `beforeSubmit` made stale is prepared again, for the same run lease. A live epoch takes no revision recording.
+-   **Kept live recordings** (`Desc::reuseLiveRecordings`). A live epoch's runs take kept copies instead of new leases.
+    -   A kept copy is a lease whose LatchBlock regions are pinned to its index, like a published copy's. The epoch makes
+        copies as its runs need them, up to `Desc::liveCopiesMost`. A run that finds none free takes a lease of its own and
+        records as before (`AsyncStats::liveSpilled`).
+    -   Each copy keeps the last replayable recording made for it. The next ticket of the copy binds that recording when it
+        is still current: the same build of the graph, no version published since (`NoteNewVersions`), and every pass's
+        revision unchanged. Nothing is prepared or recorded for it. The submission checks the revisions again after the
+        commit, and a stale one is prepared again for the same copy, as for any live ticket.
+    -   Before a copy is reused, its regions are cleared in every arena block (`LatchBlock::ZeroStableRun`). A block that the
+        run's commit does not write then reads zeros, as a new lease's would.
+    -   Passes recorded at execution are still recorded at each submission (`PreparedPass::RecordAgain`).
+    -   Statistics: `AsyncStats::liveReused`, `liveKept`, `liveUnkeepable` and `liveSpilled`.
 -   **Published recordings** are a revision-driven epoch's (below): recorded once, submitted many times.
 -   **What a replayable recording leaves out.** Profiler GPU zones and GPU statistics queries the statistics service owns.
     With `GraphHost::SetRecordingTimestamps` a replayable list owns its timestamp queries instead

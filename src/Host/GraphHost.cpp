@@ -18,6 +18,7 @@
 #include "Managers/Singletons/DescriptorHeapManager.h"
 #include "Resources/Buffers/DynamicBufferBase.h"
 #include "Render/FrameArena.h"
+#include "Render/LatchBlock.h"
 #include "Render/MemoryIntrospectionBackend.h"
 #include "Render/PassExecutionContext.h"
 #include "Render/RenderGraph/PersistentGraph.h"
@@ -147,6 +148,15 @@ struct GraphHost::Async {
 	std::vector<std::vector<std::weak_ptr<const GraphHost::EpochRecording>>> liveRecordings;
 	std::vector<std::shared_ptr<RenderGraph::PersistentTicket>> outstanding;
 	std::atomic<uint64_t> revisionCopiesRecorded{0}, revisionRecordings{0};
+	// Host thread, per live epoch index and kept copy (RunLease::copy): the last replayable recording made for the copy, and the
+	// build generation of the graph it was recorded on (Desc::reuseLiveRecordings).
+	struct LiveCopy {
+		std::shared_ptr<const RenderGraph::PersistentRecording> recording;
+		uint64_t generation = 0;
+		uint64_t version = 0;  // the backing version it was recorded under (NoteNewVersions)
+	};
+	std::vector<std::vector<LiveCopy>> liveKept;
+	std::atomic<uint64_t> liveReused{0}, liveKeptCount{0}, liveUnkeepable{0}, liveSpilled{0};
 	// Per epoch index: its prepared tickets, in the order they are submitted, and a stale ticket's replacement, which that
 	// submission takes before any other. The host's thread pushes, the render thread takes. The mutex is held only to push or
 	// take. count is ready's size, for a reader without the mutex.
@@ -932,6 +942,7 @@ std::unique_ptr<RenderGraph> GraphHost::MakeGraph(const BuildInputs& inputs, boo
 		graph->SetExternalPersistentEpochs(inputs.externalEpochs);
 		// Likewise for a pass recorded at execution inline (RenderGraph::PassEpochRecordsAtExecution).
 		graph->SetInlineAtExecution(inputs.inlineAtExecution);
+		graph->SetCoalescedSubmissions(m_desc.coalesceSubmissions);
 		// A detached graph sets up nothing other graphs share until it is attached (RenderGraph::DeferSharedSetup): the upload
 		// service's registry, the shared upload pass and the statistics query heap.
 		auto hostUploads = std::make_unique<HostUploadExtension>(graph->GetUploadService(), detached);
@@ -1542,6 +1553,7 @@ void GraphHost::StartAsync() {
 	async->runsLastFrame.assign(async->epochs.size(), 0);
 	async->lastSeal.assign(async->epochs.size(), 0);
 	async->liveRecordings.assign(async->epochs.size(), {});
+	async->liveKept.assign(async->epochs.size(), {});
 	async->outstanding.assign(async->epochs.size(), {});
 	// The synchronous frames' runs still in flight are the host thread's to retire now, like its own. The sync path's pacing
 	// starts afresh when async epochs stop.
@@ -1667,6 +1679,7 @@ void GraphHost::StartAsync() {
 							state->inHand[index] = 0;
 							state->outstanding[index].reset();
 							state->liveRecordings[index].clear();
+							state->liveKept[index].clear();
 							const auto dropped = std::make_exception_ptr(EpochRecordingDropped(state->generation[index]));
 							std::erase_if(state->pendingRequests, [&](const std::unique_ptr<Async::RecordingRequest>& request) {
 								if (request->epochIndex != index) return false;
@@ -2150,6 +2163,44 @@ GraphHost::RunLease* GraphHost::TakeCopyLease(Async& state, uint32_t epochIndex)
 	return taken;
 }
 
+GraphHost::RunLease* GraphHost::TakeLiveCopy(Async& state, uint32_t epochIndex) {
+	const uint32_t epoch = state.epochs[epochIndex];
+	auto found = std::ranges::find(m_liveCopyLeases, epoch, &std::pair<uint32_t, std::vector<RunLease*>>::first);
+	if (found == m_liveCopyLeases.end()) found = m_liveCopyLeases.insert(m_liveCopyLeases.end(), std::pair<uint32_t, std::vector<RunLease*>>{epoch, {}});
+	auto& copies = found->second;
+	const auto& kept = state.liveKept[epochIndex];
+	// An idle copy with a recording of the epoch's current graph first, so the run can bind it. Then any idle copy. Among
+	// equals, the least recently submitted one.
+	RunLease* idleKept = nullptr;
+	RunLease* idle = nullptr;
+	for (auto* copy : copies) {
+		if (copy->state == RunLease::State::Open) continue;
+		if (copy->state == RunLease::State::Submitted && PointsReached(copy->points)) RetireLease(*copy, &state);
+		if (copy->state != RunLease::State::Free) continue;
+		const bool hasRecording = copy->copy < kept.size() && kept[copy->copy].recording && kept[copy->copy].generation == state.generation[epochIndex];
+		auto& pick = hasRecording ? idleKept : idle;
+		if (!pick || copy->submission < pick->submission) pick = copy;
+	}
+	RunLease* taken = idleKept ? idleKept : idle;
+	std::scoped_lock lock(m_leaseMutex);
+	if (!taken) {
+		// Every copy is in use: a new one, until the epoch has the most it may make. The caller then takes a lease of its own.
+		if (copies.size() >= (std::max)(m_desc.liveCopiesMost, 1u) || m_leaseStore.size() >= Runtime::kMaxSlots) return nullptr;
+		auto made = std::make_unique<RunLease>();
+		made->index = static_cast<uint32_t>(m_leaseStore.size());
+		made->copy = static_cast<uint32_t>(copies.size());
+		taken = made.get();
+		copies.push_back(taken);
+		m_leaseTable[made->index].store(taken, std::memory_order_release);
+		m_leaseStore.push_back(std::move(made));
+		if (const auto& stats = m_desc.runtime->Statistics()) stats->EnsureFrameCapacity(taken->index + 1);
+	}
+	if (++taken->generation == 0) taken->generation = 1;
+	taken->state = RunLease::State::Open;
+	m_leasesPeak = (std::max)(m_leasesPeak, ++m_leasesInFlight);
+	return taken;
+}
+
 void GraphHost::PrepareTicket(Async& state, uint32_t epochIndex, RunLease* reprepare) {
 	BT_ZONE_SCOPE("ORG.Host.PrepareTicket.Worker");
 	auto& graph = *m_instances[state.instanceOf[epochIndex]].graph;
@@ -2157,7 +2208,18 @@ void GraphHost::PrepareTicket(Async& state, uint32_t epochIndex, RunLease* repre
 	// published copy's for a revision-driven epoch, or none: then nothing is prepared until a seal or a completion frees a copy
 	// (EpochCopiesBusyError meanwhile).
 	RunLease* lease = reprepare;
-	if (!lease) lease = state.revisionDriven[epochIndex] ? TakeCopyLease(state, epochIndex) : &OpenLease(&state);
+	const bool keepsLive = !state.revisionDriven[epochIndex] && m_desc.reuseLiveRecordings && m_desc.reuseRecordings;
+	if (!lease && state.revisionDriven[epochIndex]) {
+		lease = TakeCopyLease(state, epochIndex);
+	} else if (!lease && keepsLive) {
+		lease = TakeLiveCopy(state, epochIndex);
+		if (!lease) {
+			state.liveSpilled.fetch_add(1, std::memory_order_relaxed);
+			lease = &OpenLease(&state);
+		}
+	} else if (!lease) {
+		lease = &OpenLease(&state);
+	}
 	if (!lease) return;
 	runtime::ScopedActiveGraphServices services(graph.GetUploadService(), graph.GetDescriptorService());
 	// The render thread records this ticket's uploads into an open list: resetting and beginning it is several microseconds of
@@ -2200,10 +2262,48 @@ void GraphHost::PrepareTicket(Async& state, uint32_t epochIndex, RunLease* repre
 			for (const auto& weak : live)
 				if (const auto recording = weak.lock()) AddRevisionCandidate(state, epochIndex, *ticket, *recording);
 		} else {
-			Async::Preparation preparation;
 			const auto version = state.backingVersion.load(std::memory_order_acquire);
-			ticket = graph.PreparePersistentTicket(m_device, state.epochs[epochIndex], lease->Ref(), state.hostFrame++, version);
-			RenderGraph::SetPersistentTicketHostTag(*ticket, version);
+			// A live epoch's kept copy (Desc::reuseLiveRecordings).
+			const bool liveCopy = keepsLive && lease->copy != RunRef::kNoCopy;
+			if (liveCopy && !reprepare) {
+				// The copy's regions still hold its last run's values. A new lease's would be zeros, and a client whose commit does
+				// not write its block this run relies on that.
+				LatchBlock::ZeroStableRun(lease->index);
+				auto& kept = state.liveKept[epochIndex];
+				if (lease->copy < kept.size() && kept[lease->copy].recording) {
+					auto& entry = kept[lease->copy];
+					// The kept recording, bound now. It is checked again at submission, after the commit, like any ticket.
+					if (entry.generation == state.generation[epochIndex] && entry.version == version) {
+						// The host's loop retires every graph's finished executions on each pass: no retirement here.
+						auto reuse = graph.PrepareRevisionTicket(state.epochs[epochIndex], lease->Ref(), state.hostFrame++, false);
+						graph.AddPersistentTicketCandidate(*reuse, entry.recording);
+						if (RenderGraph::BindPersistentTicketRecording(*reuse, entry.recording, version, nullptr)) {
+							RenderGraph::SetPersistentTicketHostTag(*reuse, version);
+							if (state.Current(*reuse)) ticket = std::move(reuse);
+						}
+						if (reuse) (void)graph.CompletePersistentTicket(*reuse, {});
+					}
+					if (ticket) state.liveReused.fetch_add(1, std::memory_order_relaxed);
+					else entry = {};
+				}
+			}
+			if (!ticket) {
+				Async::Preparation preparation;
+				ticket = graph.PreparePersistentTicket(m_device, state.epochs[epochIndex], lease->Ref(), state.hostFrame++, version);
+				RenderGraph::SetPersistentTicketHostTag(*ticket, version);
+				if (liveCopy) {
+					auto& kept = state.liveKept[epochIndex];
+					if (kept.size() <= lease->copy) kept.resize(size_t{lease->copy} + 1);
+					auto recording = RenderGraph::PersistentTicketRecording(*ticket);
+					if (recording && RenderGraph::PersistentRecordingReplayable(*recording)) {
+						kept[lease->copy] = {std::move(recording), state.generation[epochIndex], version};
+						state.liveKeptCount.fetch_add(1, std::memory_order_relaxed);
+					} else {
+						kept[lease->copy] = {};
+						state.liveUnkeepable.fetch_add(1, std::memory_order_relaxed);
+					}
+				}
+			}
 		}
 	} catch (const std::exception& e) {
 		error = e.what();
@@ -2264,6 +2364,7 @@ void GraphHost::FailAsyncEpoch(Async& state, uint32_t epochIndex, std::string er
 	// Nothing more is prepared or recorded for it until its instance is attached at a new build (epochFailed).
 	state.outstanding[epochIndex].reset();
 	state.liveRecordings[epochIndex].clear();
+	state.liveKept[epochIndex].clear();
 	state.epochErrors[epochIndex] = error;
 	// The owner hears of it at its next PollEpochFailures; the render thread sees the flag first if it submits the epoch before that.
 	ReportEpochFailure({epoch, state.generation[epochIndex], false, std::move(error)});
@@ -2387,6 +2488,10 @@ GraphHost::AsyncStats GraphHost::TakeAsyncStats() noexcept {
 		m_asyncStats.copiesBusy = m_async->copiesBusy.exchange(0, std::memory_order_relaxed);
 		m_asyncStats.copyWaits = m_async->copyWaits.exchange(0, std::memory_order_relaxed);
 		m_asyncStats.staleAhead = m_async->staleAhead.exchange(0, std::memory_order_relaxed);
+		m_asyncStats.liveReused = m_async->liveReused.exchange(0, std::memory_order_relaxed);
+		m_asyncStats.liveKept = m_async->liveKeptCount.exchange(0, std::memory_order_relaxed);
+		m_asyncStats.liveUnkeepable = m_async->liveUnkeepable.exchange(0, std::memory_order_relaxed);
+		m_asyncStats.liveSpilled = m_async->liveSpilled.exchange(0, std::memory_order_relaxed);
 	}
 	return std::exchange(m_asyncStats, {});
 }

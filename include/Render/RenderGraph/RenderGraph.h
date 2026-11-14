@@ -310,6 +310,12 @@ private:
 	 * external epoch's. GraphHost::SetInlineAtExecution sets it on every graph it builds.
 	 */
 	void SetInlineAtExecution(bool enabled) noexcept;
+	/**
+	 * @brief A ticket's consecutive batches on one queue go to that queue in one submission. The submission waits for all
+	 * their waits and signals the last batch's value. Their order in the queue and the barriers between them are unchanged.
+	 * GraphHost::Desc::coalesceSubmissions sets it on every graph it builds.
+	 */
+	void SetCoalescedSubmissions(bool enabled) noexcept { m_coalesceSubmissions = enabled; }
 	bool InlineAtExecution() const noexcept { return m_inlineAtExecution; }
 	// A queue slot the host's stream runs: the graphics queue's, or one on the same native queue (a kind the device aliases to it).
 	// An external epoch's batches on it are the host's to execute, in its stream's order.
@@ -342,7 +348,8 @@ private:
 	// it (ResolverCaptureContext of IHostExecutionData), so its publication and bindings are the revision's own, and it holds them.
 	// Owner thread: a ticket for a published copy's run that prepares nothing from live state: its admissions are its candidates',
 	// one per recording it may be submitted with (AddPersistentTicketCandidate); the bind takes one, completion abandons the rest.
-	std::shared_ptr<PersistentTicket> PrepareRevisionTicket(uint32_t epoch, RunRef run, uint64_t hostFrame);
+	// retire: release the executions the GPU has finished first. A host whose own loop retires them already passes false.
+	std::shared_ptr<PersistentTicket> PrepareRevisionTicket(uint32_t epoch, RunRef run, uint64_t hostFrame, bool retire = true);
 	// Owner thread: admits the recording's publication as a candidate of the revision ticket. Lock-free against a bind on the
 	// submitting thread (an append-only list); a recording published to that thread after this call is always found.
 	void AddPersistentTicketCandidate(PersistentTicket& ticket, std::shared_ptr<const PersistentRecording> recording);
@@ -843,6 +850,7 @@ private:
 	// lists, made at their first ticket).
 	std::vector<uint32_t> m_externalPersistentEpochs;
 	bool m_inlineAtExecution = false;  // SetInlineAtExecution
+	bool m_coalesceSubmissions = false;  // SetCoalescedSubmissions
 	std::mutex m_externalSecondaryPoolsMutex;
 	std::vector<std::shared_ptr<CommandListPool>> m_externalSecondaryPools;
 	bool m_persistentRecordingReuse = false;
