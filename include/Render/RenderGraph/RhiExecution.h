@@ -949,6 +949,7 @@ inline void RecordOwnedRecordingCommands(RecordingContext& context, const OwnedR
         if (a_atExecution && (a_again ? pass.SkipsAgain(context) : pass.SkipsAtExecution(context))) {
             BT_ZONE_SCOPE("ORG.Execution.RecordOwned.Skipped");
             const auto passLabel = pass.DebugName();
+            BT_ZONE_TEXT(passLabel.data(), passLabel.size());
             recordPassBarriers(recording.barriersBeforePass, passIndex, "before", passLabel);
             if (!a_again) pass.RecordNothing();
             recordPassBarriers(recording.barriersAfterPass, passIndex, "after", passLabel);
