@@ -1602,7 +1602,9 @@ static int Run(int argc, char** argv) {
 				const auto steady = host.TakeAsyncStats();
 				std::printf("reuse: steady %llu recorded, %llu prepared again\n", static_cast<unsigned long long>(steady.recorded),
 					static_cast<unsigned long long>(steady.stale));
-				REQUIRE(steady.recorded >= 12 && steady.stale == 0, "steady frames record every run");
+				// The window's first ticket is recorded ahead, on the host's thread, after the last submission before the window: it may be
+				// counted before the window opens.
+				REQUIRE(steady.recorded >= 11 && steady.stale == 0, "steady frames record every run");
 				// A pass's revision alternates inside the commit (beforeSubmit), as a view's state does. Each ticket was prepared for the
 				// other variant, so it is stale at submission and prepared again, for the same run.
 				const uint64_t base = outputRevision->load() + 100;
