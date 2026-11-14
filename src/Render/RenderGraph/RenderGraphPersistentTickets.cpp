@@ -234,6 +234,18 @@ RenderGraph::PersistentRecordingStats RenderGraph::TakePersistentRecordingStats(
 	return stats;
 }
 
+std::string RenderGraph::PersistentTicketStaleReason(const PersistentTicket& ticket) {
+	if (ticket.uncheckable) return "uncheckable: " + ticket.uncheckableBy;
+	for (size_t i = 0; i < ticket.revisions.size(); ++i) {
+		const auto& [pass, hash] = ticket.revisions[i];
+		const std::string name = i < ticket.revisionNames.size() ? ticket.revisionNames[i] : std::string("?");
+		uint64_t now = 0;
+		if (!pass->RevisionHash(now)) return "revision hash gone: " + name;
+		if (now != hash) return "revision changed: " + name;
+	}
+	return "current";
+}
+
 bool RenderGraph::PersistentTicketCurrent(const PersistentTicket& ticket) {
 	BT_ZONE_SCOPE("ORG.Persistent.CheckTicket");
 	if (ticket.uncheckable) return false;

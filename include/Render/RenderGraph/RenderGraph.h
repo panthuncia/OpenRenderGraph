@@ -411,6 +411,8 @@ private:
 	static TicketUploadStats PersistentTicketUploadStats(const PersistentTicket& ticket) noexcept;
 	// Every pass it prepared would still prepare the same invocation (RenderGraphPass::RevisionHash).
 	static bool PersistentTicketCurrent(const PersistentTicket& ticket);
+	// Why a ticket is not current (diagnostics): the first unchecked pass, or the first pass whose revision changed.
+	static std::string PersistentTicketStaleReason(const PersistentTicket& ticket);
 	// Submits the packets with values from nextQueueValues (the last value assigned per queue slot, advanced
 	// here). Returns false when a packet failed.
 	// uploadsDone: the queue slot and value that signal the uploads recorded ahead of the ticket (RecordPendingUploads), when

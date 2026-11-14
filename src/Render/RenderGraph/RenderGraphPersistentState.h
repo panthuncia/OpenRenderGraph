@@ -236,6 +236,9 @@ struct RenderGraph::PersistentTicket {
 		bool committed = false;  // and committed
 	};
 	std::vector<Segment> segments;
+	// The first pass whose preparation cannot be checked (no revision hash, hosted or captured): diagnostics for a stale ticket.
+	std::string uncheckableBy;
+	std::vector<std::string> revisionNames;  // the pass name of each entry of revisions (diagnostics)
 	// Recordings a candidate displaced: released by the owner thread, with the ticket.
 	std::vector<std::shared_ptr<const PersistentRecording>> replaced;
 	// What each prepared pass's preparation depended on (RenderGraphPass::RevisionHash).

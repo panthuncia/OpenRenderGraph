@@ -1628,8 +1628,14 @@ RenderGraph::PersistentExecution RenderGraph::PreparePersistentExecution(rhi::De
 					else return value.pass.get();
 				}, any.pass);
 				uint64_t hash = 0;
-				if (object && !pass.hosted && !captured && object->RevisionHash(hash)) ticket->revisions.emplace_back(object, hash);
-				else ticket->uncheckable = true;
+				if (object && !pass.hosted && !captured && object->RevisionHash(hash)) {
+					ticket->revisions.emplace_back(object, hash);
+					ticket->revisionNames.push_back(any.name);
+				}
+				else {
+					if (!ticket->uncheckable) ticket->uncheckableBy = any.name + (!object ? " (no pass object)" : pass.hosted ? " (hosted)" : captured ? " (captured)" : " (no revision hash)");
+					ticket->uncheckable = true;
+				}
 			}
 			if (namesDirty) (*mainNames)[pass.id.index] = any.name;
 			// External waits (explicit + resolver-provided) become per-frame producer waits.

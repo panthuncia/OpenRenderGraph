@@ -9,6 +9,7 @@
 #include <condition_variable>
 #include <deque>
 #include <exception>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -2499,6 +2500,21 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 	if (!async.revisionDriven[index] && !async.Current(*ticket)) {
 		BT_ZONE_SCOPE("ORG.Host.ReprepareStaleTicket");
 		m_asyncStats.staleBacking += RenderGraph::PersistentTicketCurrent(*ticket);
+		{
+			// Why tickets were stale, by epoch and reason: the counts are logged every 500 stale tickets.
+			static std::mutex reasonsLock;
+			static std::map<std::string, uint32_t> reasons;
+			static uint32_t seen = 0;
+			auto reason = "epoch " + std::to_string(async.epochs[index]) + ": " + RenderGraph::PersistentTicketStaleReason(*ticket);
+			std::lock_guard guard(reasonsLock);
+			++reasons[reason];
+			if (++seen % 500 == 0) {
+				std::string text;
+				for (const auto& [why, count] : reasons) text += "; " + std::to_string(count) + " " + why;
+				spdlog::info("GraphHost: the last 500 stale tickets, by reason:{}", text);
+				reasons.clear();
+			}
+		}
 		// Prepared before beforeSubmit changed what a pass depends on, or a version it resolved: prepare it again, for the
 		// same run (its latch regions were just written), and wait. The new one is prepared after the change, so it is current.
 		++m_asyncStats.stale;
