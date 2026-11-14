@@ -5,6 +5,7 @@
 #include "Render/RenderGraph/ExecutionState.h"
 #include "Render/PreparedPass.h"
 #include "Render/RenderGraph/PersistentGraph.h"
+#include "Render/RenderGraph/SubmissionCensus.h"
 #include "Render/CommandListPool.h"
 #include "Render/Runtime/IStatisticsService.h"
 #include <algorithm>
@@ -610,8 +611,9 @@ public:
         AbandonEffects();
     }
 private:
-    // Records the late batch's barriers and passes into a_list (again, for a replayable packet). Commits nothing.
-    void RecordDeferredCommands(rhi::CommandList a_list) const;
+    // Records the late batch's barriers and passes into a_list (again, for a replayable packet). Commits nothing. Returns the
+    // passes recorded (not skipped).
+    size_t RecordDeferredCommands(rhi::CommandList a_list) const;
     // An inline late batch: begins its own list (again, for a replayable packet), records it and closes it. A null list
     // when that failed.
     rhi::CommandList RecordInline() const noexcept;
@@ -861,8 +863,8 @@ inline RecordingContext MakeOwnedRecordingContext(rhi::CommandList list, const O
 // external epoch records into the host's list (PreparedRhiExecutionBatch::RecordDeferred), and the host ends it.
 // a_again records a replayable recording's passes again (PreparedPass::RecordAgain). This is for a late batch of a
 // kept recording. a_atExecution: a late batch, recorded after its run's commit, whose passes may skip the run
-// (PreparedPass::SkipsAtExecution).
-inline void RecordOwnedRecordingCommands(RecordingContext& context, const OwnedRecordingList& recording, rhi::Queue queue, bool replayable,
+// (PreparedPass::SkipsAtExecution). Returns the passes recorded, not counting the skipped ones.
+inline size_t RecordOwnedRecordingCommands(RecordingContext& context, const OwnedRecordingList& recording, rhi::Queue queue, bool replayable,
     bool a_again = false, bool a_atExecution = false) {
     struct TracyGpuZoneScope {
         rhi::CommandList& commands;
@@ -886,6 +888,7 @@ inline void RecordOwnedRecordingCommands(RecordingContext& context, const OwnedR
             open = false;
         }
     };
+    size_t recordedPasses = 0;
     auto* statistics = recording.statistics.get();
     if (statistics) statistics->cpuMilliseconds.resize(recording.passes.size());
     const bool skipQueries = diagnostics::DiagnosticSkipPassQueries().load(std::memory_order_relaxed);
@@ -956,6 +959,7 @@ inline void RecordOwnedRecordingCommands(RecordingContext& context, const OwnedR
             continue;
         }
         BT_ZONE_SCOPE("ORG.Execution.RecordOwned.Pass");
+        ++recordedPasses;
         // A capture tool's region for the pass (PIX / VK_EXT_debug_utils), opened before the pass's entry
         // barriers so that a wait on the previous pass's output shows up inside the pass that needed it.
         // The legacy recorder labels its passes; without this, persistent graphs recorded none at all.
@@ -1043,6 +1047,7 @@ inline void RecordOwnedRecordingCommands(RecordingContext& context, const OwnedR
     // After the exit barrier, so a kept recording's own queries time it too.
     if (statistics && statistics->gpuQueries)
         statistics->service->ResolveQueries(statistics->frameIndex, queue, context.Commands(), statistics->queries);
+    return recordedPasses;
 }
 
 inline PreparedRhiExecutionBatch::PreparedRhiExecutionBatch(uint32_t queueSlot, rhi::Queue queue, OwnedRecordingList deferred,
@@ -1061,7 +1066,7 @@ inline PreparedRhiExecutionBatch::PreparedRhiExecutionBatch(uint32_t queueSlot, 
     if (!m_replayable) m_submissionEffects = m_deferred->passes;
 }
 
-inline void PreparedRhiExecutionBatch::RecordDeferredCommands(rhi::CommandList a_list) const {
+inline size_t PreparedRhiExecutionBatch::RecordDeferredCommands(rhi::CommandList a_list) const {
     const bool again = m_deferredRecorded.exchange(true);
     if (again && !m_replayable) throw std::logic_error("A deferred packet is recorded once, unless it is replayable");
     // A kept recording's own queries start over in each list that records it. The last execution's queries were read
@@ -1074,9 +1079,10 @@ inline void PreparedRhiExecutionBatch::RecordDeferredCommands(rhi::CommandList a
         owned.overflow = 0;
     }
     auto context = MakeOwnedRecordingContext(a_list, *m_deferred);
-    RecordOwnedRecordingCommands(context, *m_deferred, m_queue, false, again, true);
+    const size_t recorded = RecordOwnedRecordingCommands(context, *m_deferred, m_queue, false, again, true);
     // Its queries are in a_list now. Its frame slot's completion publishes them (OwnedRecordingStatistics::atCompletion).
     if (m_deferred->statistics) m_deferred->statistics->recorded.store(true, std::memory_order_release);
+    return recorded;
 }
 
 inline void PreparedRhiExecutionBatch::RecordDeferred(rhi::CommandList a_list) const {
@@ -1096,8 +1102,15 @@ inline rhi::CommandList PreparedRhiExecutionBatch::RecordInline() const noexcept
         allocation.pool->Begin(allocation.pair);
         allocation.closed = false;
         auto list = allocation.pair.list.Get();
-        RecordDeferredCommands(list);
-        if (list.EndChecked() != rhi::Result::Ok) {
+        const size_t recorded = RecordDeferredCommands(list);
+        auto& census = diagnostics::Census();
+        census.Add(diagnostics::SubmissionCensus::List::Inline);
+        if (!recorded) census.Add(diagnostics::SubmissionCensus::List::InlineBarriersOnly);
+        const auto closed = [&] {
+            BT_ZONE_SCOPE("ORG.Execution.RecordInline.End");
+            return list.EndChecked();
+        }();
+        if (closed != rhi::Result::Ok) {
             basic_telemetry::AddCounter("ORG.Execution.RecordingCloseFailures");
             return {};
         }

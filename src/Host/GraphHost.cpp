@@ -2542,6 +2542,9 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 	const FrameCallback& beforeSubmit, std::shared_ptr<const void> resourceOwner, std::shared_ptr<const EpochRecording> recording) {
 	BT_ZONE_SCOPE("ORG.Host.SubmitTicket");
 	BT_ZONE_VALUE(async.epochs[index]);
+	using Census = diagnostics::SubmissionCensus;
+	auto& census = diagnostics::Census();
+	census.BeginTicket();
 	// A submission's completion message wakes the host's thread lazily (wakesOnGpu); a discard always wakes it.
 	auto postControl = [&](Async::Message& message) {
 		const bool lazy = message.kind == Async::Message::Kind::Submitted;
@@ -2674,6 +2677,7 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 	// Admitted now, against the ledgers as they are: the upload plan by queue and the submission's handoff read it. The sequencer
 	// stays held until the ticket is submitted and committed, so no other admission comes between.
 	auto sequencer = graph.HoldPersistentSequencer();
+	const auto heldFrom = census.On() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 	graph.AdmitPersistentTicket(*ticket, async.queueValues);
 	struct AbandonUnsubmitted {
 		RenderGraph& graph;
@@ -2724,6 +2728,14 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 		for (auto& queueUploads : queueUploadLists) queueUploads.EndRecording();
 	}
 	m_asyncStats.queueUploadCopies += queueCopies;
+	if (census.On() && !external) {
+		census.Add(Census::List::Upload);
+		if (!recorded && recordedLists.empty()) census.Add(Census::List::UploadEmpty);
+		// By ticket: a ticket with no routed copy left every queue list empty.
+		const auto queueLists = static_cast<uint64_t>(std::ranges::count_if(queueUploadLists, [](const auto& queueUploads) { return static_cast<bool>(queueUploads.list); }));
+		census.Add(Census::List::QueueUpload, queueLists);
+		if (!queueCopies) census.Add(Census::List::QueueUploadEmpty, queueLists);
+	}
 	if (external && !recordedLists.empty()) {
 		recordedLists.clear();
 		abandonBeforeDiscard();
@@ -2778,6 +2790,7 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 			throw std::runtime_error(std::string("Async epochs could not submit their uploads (rhi::Result ") + rhi::ResultName(uploadResult) + ")");
 		}
 		submitted.uploadSignal = {async.graphicsSlot, value};
+		census.Submitted(Census::Submission::Uploads, async.graphicsSlot, static_cast<uint32_t>(recordedLists.size()), {});
 	}
 	lap(m_lastTimings.uploadsUs);
 	bool ok = false;
@@ -2796,6 +2809,9 @@ void GraphHost::SubmitTicket(Async& async, uint32_t index, std::shared_ptr<Rende
 	publishQueueValues.Publish();
 	assigning.reset();
 	sequencer.unlock();
+	if (census.On())
+		census.sequencerHeldNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+			std::chrono::steady_clock::now() - heldFrom).count()), std::memory_order_relaxed);
 	lap(m_lastTimings.submitUs);
 	// The handoff and release lists the submission recorded: kept until the run completes, with the uploads' staging.
 	if (!submitted.submission.leases.empty()) {
