@@ -1871,6 +1871,10 @@ void SynchronousAdmission::AdmitLedger(FrameAdmission& frame, bool cacheEligible
     // An entry-only admission of an executable admitted before: its plan stands while the ledger holds what that one found (a frame
     // repeats). Otherwise planned below and kept as the prediction for the next.
     PredictionSlot* predictionSlot = nullptr;
+    using Census = diagnostics::SubmissionCensus;
+    auto& census = diagnostics::Census();
+    if (!frame.entryOnly) census.Admitted(Census::Admission::NotEntryOnly);
+    else if (!invalidated.empty()) census.Admitted(Census::Admission::AliasInvalidated);
     if (frame.entryOnly && invalidated.empty()) {
         const auto& executable = frame.publication->executable;
         if (m_predictions.size() > 256 && !m_predictions.contains(executable.get()))
@@ -1882,6 +1886,7 @@ void SynchronousAdmission::AdmitLedger(FrameAdmission& frame, bool cacheEligible
         auto& slot = m_predictions[executable.get()];
         if (slot.executable.lock() != executable || slot.backings != frame.backings.Id() || slot.closed != m_closed
             || !slot.prediction) {
+            census.Admitted(Census::Admission::NewSlot);
             ClosePrediction(slot);
             slot = {executable, frame.backings.Id(), m_closed, std::make_shared<compiler::StatePrediction>()};
         }
@@ -1891,10 +1896,25 @@ void SynchronousAdmission::AdmitLedger(FrameAdmission& frame, bool cacheEligible
             if (!slot.stream) slot.stream = m_sequencer->accesses.OpenStream(static_cast<uint32_t>(graph.batches.size()));
             frame.stream = slot.stream;
         }
-        if (m_sequencer->states.Predicts(*predictionSlot->prediction, frame.backings, frame.backings.Id())) {
-            frame.sharedBarriers = predictionSlot->prediction->plan;
-            frame.prediction = predictionSlot->prediction;
+        // The last plan first, then the earlier ones the slot keeps: a frame whose states alternate (an executable that runs
+        // after different work on alternate frames) finds its plan again.
+        auto& states = m_sequencer->states;
+        if (states.Predicts(*slot.prediction, frame.backings, frame.backings.Id())) {
+            frame.sharedBarriers = slot.prediction->plan;
+            frame.prediction = slot.prediction;
             ++m_predicted;
+            census.Admitted(Census::Admission::Predicted);
+        } else {
+            for (auto& earlier : slot.earlier) {
+                if (!states.Predicts(*earlier, frame.backings, frame.backings.Id())) continue;
+                std::swap(earlier, slot.prediction);
+                frame.sharedBarriers = slot.prediction->plan;
+                frame.prediction = slot.prediction;
+                ++m_predicted;
+                census.Admitted(Census::Admission::PredictedEarlier);
+                break;
+            }
+            if (!frame.sharedBarriers && slot.prediction->plan) census.Admitted(Census::Admission::StatesDiffer);
         }
     }
     // A closed execution's plan is a function of its executable and backings alone, unless the frame brings
@@ -1922,6 +1942,13 @@ void SynchronousAdmission::AdmitLedger(FrameAdmission& frame, bool cacheEligible
         ++m_planCacheHits;
     } else if (predictionSlot) {
         // Planned against the ledger, and kept as the prediction for the next admission of this executable.
+        // The last plan is kept among the earlier ones (PredictionSlot::earlier).
+        if (predictionSlot->prediction->plan) {
+            auto& earlier = predictionSlot->earlier;
+            earlier.insert(earlier.begin(), std::move(predictionSlot->prediction));
+            if (earlier.size() > PredictionSlot::kEarlier) earlier.pop_back();
+            predictionSlot->prediction = std::make_shared<compiler::StatePrediction>();
+        }
         auto& prediction = *predictionSlot->prediction;
         prediction.plan = std::make_shared<const compiler::PreparedExecutionBarrierPlan>(m_sequencer->states.Prepare(graph, frame.backings,
             invalidated, m_closed, true, frame.backings.Validated(), frame.backings.Id(), m_externalHome));

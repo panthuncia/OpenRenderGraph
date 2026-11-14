@@ -55,6 +55,16 @@ struct SubmissionCensus {
 		uint64_t value = 0;
 		WaitKind kind = WaitKind::Other;
 	};
+	// How an open execution's admission found its barrier plan (SynchronousAdmission::AdmitLedger).
+	enum class Admission : uint8_t {
+		Predicted,         // the prediction's plan held
+		PredictedEarlier,  // an earlier plan the slot kept held
+		NotEntryOnly,      // not an entry-only admission: no prediction is looked for
+		AliasInvalidated,  // alias activations invalidated states
+		NewSlot,           // the executable's prediction was for other backings (or none yet)
+		StatesDiffer,      // the ledger's states differ from the prediction's
+		Count
+	};
 	enum class HandoffMiss : uint8_t {
 		Planned,     // admitted against the ledgers, not a prediction's plan: nothing to key a cache on
 		Segments,    // a ticket of several segments
@@ -67,6 +77,7 @@ struct SubmissionCensus {
 	std::array<std::array<std::atomic<uint64_t>, size_t(Split::Count)>, size_t(Submission::Count)> submissions{};
 	std::array<std::atomic<uint64_t>, size_t(Submission::Count)> submittedLists{};
 	std::array<std::atomic<uint64_t>, size_t(HandoffMiss::Count)> handoffMisses{};
+	std::array<std::atomic<uint64_t>, size_t(Admission::Count)> admissions{};
 	std::atomic<uint64_t> tickets{0};
 	std::atomic<uint64_t> sequencerWaits{0};    // HoldSequencer found the sequencer held by another thread
 	std::atomic<uint64_t> sequencerWaitNs{0};
@@ -81,6 +92,9 @@ struct SubmissionCensus {
 	bool On() const noexcept { return enabled.load(std::memory_order_relaxed); }
 	void Add(List kind, uint64_t count = 1) noexcept {
 		if (On() && count) lists[size_t(kind)].fetch_add(count, std::memory_order_relaxed);
+	}
+	void Admitted(Admission how) noexcept {
+		if (On()) admissions[size_t(how)].fetch_add(1, std::memory_order_relaxed);
 	}
 	void Miss(HandoffMiss reason) noexcept {
 		if (On()) handoffMisses[size_t(reason)].fetch_add(1, std::memory_order_relaxed);
@@ -123,6 +137,7 @@ struct SubmissionCensus {
 		std::array<uint64_t, size_t(Submission::Count)> submittedLists{};
 		std::array<uint64_t, size_t(HandoffMiss::Count)> handoffMisses{};
 		std::array<uint64_t, size_t(WaitKind::Count)> uncoveredWaits{};
+		std::array<uint64_t, size_t(Admission::Count)> admissions{};
 		uint64_t sequencerWaits = 0, sequencerWaitNs = 0, sequencerHeldNs = 0;
 	};
 	Snapshot Take() noexcept {
@@ -133,6 +148,7 @@ struct SubmissionCensus {
 			out.submittedLists[k] = submittedLists[k].exchange(0, std::memory_order_relaxed);
 		}
 		for (size_t i = 0; i < handoffMisses.size(); ++i) out.handoffMisses[i] = handoffMisses[i].exchange(0, std::memory_order_relaxed);
+		for (size_t i = 0; i < admissions.size(); ++i) out.admissions[i] = admissions[i].exchange(0, std::memory_order_relaxed);
 		for (size_t i = 0; i < uncoveredWaits.size(); ++i) out.uncoveredWaits[i] = uncoveredWaits[i].exchange(0, std::memory_order_relaxed);
 		out.sequencerWaits = sequencerWaits.exchange(0, std::memory_order_relaxed);
 		out.sequencerWaitNs = sequencerWaitNs.exchange(0, std::memory_order_relaxed);

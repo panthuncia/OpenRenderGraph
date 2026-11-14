@@ -703,6 +703,9 @@ private:
         uint64_t backings = 0;  // AdmissionBackingSet::Id
         bool closed = false;
         std::shared_ptr<compiler::StatePrediction> prediction;
+        // Earlier plans, most recent first: tried when the last one does not hold.
+        static constexpr size_t kEarlier = 3;
+        std::vector<std::shared_ptr<compiler::StatePrediction>> earlier;
         compiler::AccessPrediction access;
         uint64_t stream = 0;  // BackingAccessAdmissionLedger::OpenStream
         uint32_t uploadQueue = UINT32_MAX;  // the upload queue `offUploadQueue` was found for
