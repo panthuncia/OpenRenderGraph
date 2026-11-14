@@ -9,6 +9,21 @@
 
 namespace org {
 
+namespace {
+// Whether a use in newState after one in before needs a barrier: a different state, or a hazard the state does not show. Two
+// unordered-access uses (a write and a read or another write of the same memory) and two copy-destination uses keep their state
+// but still need a barrier: D3D12 lets dispatches and copies overlap without one (a UAV barrier), and Vulkan needs a memory dependency.
+bool NeedsTransition(const ResourceState& before, const ResourceState& after) noexcept {
+    if (!(before == after))
+        return true;
+    constexpr uint64_t uav = static_cast<uint64_t>(rhi::ResourceAccessType::UnorderedAccess);
+    constexpr uint64_t copyDest = static_cast<uint64_t>(rhi::ResourceAccessType::CopyDest);
+    const uint64_t a = static_cast<uint64_t>(before.access), b = static_cast<uint64_t>(after.access);
+    return ((a & uav) && (b & uav)) || ((a & copyDest) && (b & copyDest));
+}
+}
+
+
 SubresourceRange ResolveRangeSpec(const RangeSpec& spec,
     const uint32_t totalMips,
     const uint32_t totalSlices)
@@ -309,7 +324,7 @@ void SymbolicTracker::Apply(const RangeSpec& want,
             }
 
             // record a transition over 'cut' if state differs
-            if (!(seg.state == newState)) {
+            if (NeedsTransition(seg.state, newState)) {
                 out.push_back({
                     pRes, // resource
                     cut,
@@ -335,14 +350,14 @@ void SymbolicTracker::Apply(const RangeSpec& want,
 bool SymbolicTracker::WouldModify(const RangeSpec& want, const ResourceState& newState) const {
     for (auto const &seg : _segs) {
         auto cut = intersect(seg.rangeSpec, want);
-        if (!isEmpty(cut) && !(seg.state == newState))
+        if (!isEmpty(cut) && NeedsTransition(seg.state, newState))
             return true;
     }
     return false;
 }
 
 bool SymbolicTracker::WouldModifyWholeResourceFast(const ResourceState& newState) const noexcept {
-    return _segs.size() != 1 || !(_segs.front().state == newState);
+    return _segs.size() != 1 || NeedsTransition(_segs.front().state, newState);
 }
 
 bool SymbolicTracker::ApplyWholeResourceFast(
@@ -356,7 +371,7 @@ bool SymbolicTracker::ApplyWholeResourceFast(
     }
 
     auto& segment = _segs.front();
-    if (!(segment.state == newState)) {
+    if (NeedsTransition(segment.state, newState)) {
         out.push_back({
             pRes,
             wholeRange,
