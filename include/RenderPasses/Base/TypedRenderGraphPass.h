@@ -56,6 +56,10 @@ struct NoPassBindings {};
 // commit. True means the pass has nothing to do this run: its recorder records the barriers around it and nothing else (no
 // Record, no debug label, no timestamps). A pass without declared bindings writes
 // `static bool SkipsAtExecution(const FrameData&, const PassRecordContext&)`.
+//
+// `static constexpr bool kRecordKeyedBySkip = true;` (optional, with SkipsAtExecution): Record's commands for a run depend on
+// the run only through SkipsAtExecution's answer. A gated copy or clear is such a pass. A kept recording's late batch made only
+// of such passes keeps its list while the answers stay the same (PreparedPass::KeyedBySkip).
 template<class Derived, OwnedPassFrameData FrameData = EmptyPassFrameData, class Bindings = NoPassBindings>
 class TypedRenderGraphPass : public RenderPass {
 public:
@@ -173,6 +177,11 @@ private:
         std::shared_ptr<const FramePreparationContext::ResourceSlots> slots;
         std::shared_ptr<const DeclaredRecordingScope> scope;
     };
+    // Whether the pass declares kRecordKeyedBySkip (see the contract above).
+    static consteval bool KeyedBySkipOf() {
+        if constexpr (requires { Derived::kRecordKeyedBySkip; }) return Derived::kRecordKeyedBySkip;
+        else return false;
+    }
     struct DeclaredRecorder {
         static void Record(const DeclaredFrame& frame, PassRecordContext& context) {
             auto scoped = Scoped(context, frame.resources, frame.slots, frame.scope);
@@ -192,6 +201,7 @@ private:
             }) return Derived::SkipsAtExecution(frame.bindings, frame.data, context);
             else return false;
         }
+        static constexpr bool kKeyedBySkip = KeyedBySkipOf();
     };
     struct UndeclaredFrame {
         FrameData data;
@@ -218,6 +228,7 @@ private:
             }) return Derived::SkipsAtExecution(frame.data, context);
             else return false;
         }
+        static constexpr bool kKeyedBySkip = KeyedBySkipOf();
     };
 
 protected:

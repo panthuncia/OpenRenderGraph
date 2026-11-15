@@ -1016,6 +1016,7 @@ std::unique_ptr<RenderGraph> GraphHost::MakeGraph(const BuildInputs& inputs, boo
 		// Likewise for a pass recorded at execution inline (RenderGraph::PassEpochRecordsAtExecution).
 		graph->SetInlineAtExecution(inputs.inlineAtExecution);
 		graph->SetCoalescedSubmissions(m_desc.coalesceSubmissions);
+		graph->SetKeptGatedInline(m_desc.keepGatedInline);
 		// A detached graph sets up nothing other graphs share until it is attached (RenderGraph::DeferSharedSetup): the upload
 		// service's registry, the shared upload pass and the statistics query heap.
 		auto hostUploads = std::make_unique<HostUploadExtension>(graph->GetUploadService(), detached);

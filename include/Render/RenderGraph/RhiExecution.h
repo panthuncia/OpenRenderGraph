@@ -648,6 +648,11 @@ private:
     bool m_replayable = false;
     std::shared_ptr<OwnedRecordingList> m_deferred;
     bool m_inline = false;  // m_deferred->inlineAtExecution
+    // An inline replayable batch whose passes are all keyed by their skip answers (OwnedRecordingList::keepBySkips). Its list
+    // is recorded again only when the answers differ from those it was recorded with (m_keptSkips). Submitting thread only.
+    bool m_keyedBySkips = false;
+    mutable bool m_keptList = false;
+    mutable std::vector<uint8_t> m_keptSkips;
     mutable std::atomic_bool m_deferredRecorded{false};
     mutable uint64_t m_deferredSignal = 0;  // set by CommitExternal. RecordDeferred commits its passes with it.
 };
@@ -777,6 +782,9 @@ struct OwnedRecordingList {
     // batch's place. It has no Tracy GPU zones: the submitting thread records it while the recording workers may record
     // other lists for the same queue.
     bool inlineAtExecution = false;
+    // With inlineAtExecution, under RenderGraph::SetKeptGatedInline: a replayable packet whose passes are all keyed by their
+    // skip answers (PreparedPass::KeyedBySkip) submits its list again, without recording, while the answers are unchanged.
+    bool keepBySkips = false;
     // Record for resubmission, when every pass of the packet is replayable (PreparedRhiExecutionBatch's replayable
     // packets). The list then has no profiler GPU zones or ranges, because a resubmission would write their queries
     // again. Nothing a list records may name a resource its recording does not own. Its statistics queries, if any, are
@@ -1064,6 +1072,8 @@ inline PreparedRhiExecutionBatch::PreparedRhiExecutionBatch(uint32_t queueSlot, 
     m_replayable = m_deferred->replayable
         && std::all_of(m_deferred->passes.begin(), m_deferred->passes.end(), [](const PreparedPass& pass) { return pass.IsReplayable(); });
     if (!m_replayable) m_submissionEffects = m_deferred->passes;
+    m_keyedBySkips = m_inline && m_replayable && m_deferred->keepBySkips
+        && std::all_of(m_deferred->passes.begin(), m_deferred->passes.end(), [](const PreparedPass& pass) { return pass.KeyedBySkip(); });
 }
 
 inline size_t PreparedRhiExecutionBatch::RecordDeferredCommands(rhi::CommandList a_list) const {
@@ -1096,16 +1106,48 @@ inline rhi::CommandList PreparedRhiExecutionBatch::RecordInline() const noexcept
     BT_ZONE_SCOPE("ORG.Execution.RecordInline");
     try {
         auto& allocation = *m_deferred->allocation;
+        auto& census = diagnostics::Census();
+        // A batch keyed by its passes' skip answers: the list recorded for the same answers is submitted again as it is. Its
+        // last submission is done (see below), and nothing else in it depends on the run.
+        // The answers are asked before the passes are recorded: SkipsAtExecution only before a pass's first recording,
+        // SkipsAgain after it.
+        std::vector<uint8_t> skips;
+        const auto askSkips = [&](rhi::CommandList a_list) {
+            auto context = MakeOwnedRecordingContext(a_list, *m_deferred);
+            const bool again = m_deferredRecorded.load(std::memory_order_relaxed);
+            skips.reserve(m_deferred->passes.size());
+            for (const auto& pass : m_deferred->passes)
+                skips.push_back(static_cast<uint8_t>(again ? pass.SkipsAgain(context) : pass.SkipsAtExecution(context)));
+        };
+        if (m_keyedBySkips && m_keptList && allocation.closed && allocation.pool && allocation.pair.list) {
+            askSkips(allocation.pair.list.Get());
+            if (skips == m_keptSkips) {
+                census.Add(diagnostics::SubmissionCensus::List::InlineKept);
+                return allocation.pair.list.Get();
+            }
+        }
+        m_keptList = false;
         // A new list at the first submission. A replayable packet records again at each one, into the same list: its last
         // submission is done by then (a list is never pending twice; GraphHost submits a kept recording's copy only once
         // that copy's last run completed), so Begin resets it.
         allocation.pool->Begin(allocation.pair);
         allocation.closed = false;
         auto list = allocation.pair.list.Get();
+        if (m_keyedBySkips && skips.empty()) askSkips(list);
         const size_t recorded = RecordDeferredCommands(list);
-        auto& census = diagnostics::Census();
         census.Add(diagnostics::SubmissionCensus::List::Inline);
         if (!recorded) census.Add(diagnostics::SubmissionCensus::List::InlineBarriersOnly);
+        if (census.On()) {
+            // Why this one was recorded: its first pass not keyed by its skip answer, else the answers changed.
+            std::string_view why = !m_replayable ? std::string_view("not replayable") : !m_deferred->keepBySkips ? std::string_view("keeping off") : std::string_view();
+            if (why.empty())
+                for (const auto& pass : m_deferred->passes)
+                    if (!pass.KeyedBySkip()) {
+                        why = pass.DebugName();
+                        break;
+                    }
+            census.NoteInlineRecorded(why.empty() ? std::string_view(m_keptSkips.empty() ? "keyed: first recording" : "keyed: answers changed") : why);
+        }
         const auto closed = [&] {
             BT_ZONE_SCOPE("ORG.Execution.RecordInline.End");
             return list.EndChecked();
@@ -1115,6 +1157,10 @@ inline rhi::CommandList PreparedRhiExecutionBatch::RecordInline() const noexcept
             return {};
         }
         allocation.Close();
+        if (m_keyedBySkips) {
+            m_keptSkips = std::move(skips);
+            m_keptList = true;
+        }
         return list;
     } catch (...) {
         basic_telemetry::AddCounter("ORG.Execution.InlineRecordingFailures");

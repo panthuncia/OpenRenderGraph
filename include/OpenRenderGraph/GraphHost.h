@@ -106,6 +106,9 @@ public:
 		// A ticket's consecutive batches on one queue are submitted together, in one queue submission
 		// (RenderGraph::SetCoalescedSubmissions). Off: one submission per batch.
 		bool coalesceSubmissions = false;
+		// With inline recording at execution: a kept recording's late batch made only of passes keyed by their skip answers
+		// (gated copies and clears) keeps its list while the answers are unchanged (RenderGraph::SetKeptGatedInline).
+		bool keepGatedInline = false;
 		// Async epochs: a ticket's staged uploads whose destination it first uses on another queue than graphics (async compute)
 		// are recorded on that queue, just ahead of the ticket's first batch there, instead of on the graphics queue; and a batch
 		// on another queue waits for the graphics queue's uploads only when it uses what they write (RenderGraph::

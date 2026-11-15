@@ -3,8 +3,11 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <map>
 #include <mutex>
 #include <span>
+#include <string>
+#include <string_view>
 #include <vector>
 
 namespace org::diagnostics {
@@ -17,6 +20,7 @@ struct SubmissionCensus {
 		Batch,               // recorded ahead, in a packet
 		Inline,              // a late batch recorded at submission (RecordInline)
 		InlineBarriersOnly,  // of those, every pass skipped: only barriers
+		InlineKept,          // a kept late batch's list submitted again: its passes' skip answers had not changed
 		Handoff,             // entry barriers, recorded at submission
 		HandoffReused,       // entry barriers, from the slot's cache
 		Release,             // releases to another queue
@@ -84,6 +88,9 @@ struct SubmissionCensus {
 	std::atomic<uint64_t> sequencerHeldNs{0};   // GraphHost::SubmitTicket's hold, admission to commit
 	// Waits that a submission following an earlier ticket's on its queue had and the one before did not, by kind.
 	std::array<std::atomic<uint64_t>, size_t(WaitKind::Count)> uncoveredWaits{};
+	// Why late batches were recorded at submission, by reason (NoteInlineRecorded).
+	std::mutex inlineLock;
+	std::map<std::string, uint64_t, std::less<>> inlineRecorded;
 	std::mutex lastLock;  // the last submission's queue, ticket and waits
 	uint32_t lastQueue = UINT32_MAX;
 	uint64_t lastTicket = 0;
@@ -92,6 +99,17 @@ struct SubmissionCensus {
 	bool On() const noexcept { return enabled.load(std::memory_order_relaxed); }
 	void Add(List kind, uint64_t count = 1) noexcept {
 		if (On() && count) lists[size_t(kind)].fetch_add(count, std::memory_order_relaxed);
+	}
+	// A late batch was recorded at submission. why: its first pass that is not keyed by its skip answer, or another reason.
+	void NoteInlineRecorded(std::string_view why) noexcept {
+		if (!On()) return;
+		try {
+			std::lock_guard lock(inlineLock);
+			auto found = inlineRecorded.find(why);
+			if (found == inlineRecorded.end()) found = inlineRecorded.emplace(std::string(why), 0).first;
+			++found->second;
+		} catch (...) {
+		}
 	}
 	void Admitted(Admission how) noexcept {
 		if (On()) admissions[size_t(how)].fetch_add(1, std::memory_order_relaxed);
@@ -139,6 +157,7 @@ struct SubmissionCensus {
 		std::array<uint64_t, size_t(WaitKind::Count)> uncoveredWaits{};
 		std::array<uint64_t, size_t(Admission::Count)> admissions{};
 		uint64_t sequencerWaits = 0, sequencerWaitNs = 0, sequencerHeldNs = 0;
+		std::vector<std::pair<std::string, uint64_t>> inlineRecorded;
 	};
 	Snapshot Take() noexcept {
 		Snapshot out;
@@ -153,6 +172,12 @@ struct SubmissionCensus {
 		out.sequencerWaits = sequencerWaits.exchange(0, std::memory_order_relaxed);
 		out.sequencerWaitNs = sequencerWaitNs.exchange(0, std::memory_order_relaxed);
 		out.sequencerHeldNs = sequencerHeldNs.exchange(0, std::memory_order_relaxed);
+		try {
+			std::lock_guard lock(inlineLock);
+			out.inlineRecorded.assign(inlineRecorded.begin(), inlineRecorded.end());
+			inlineRecorded.clear();
+		} catch (...) {
+		}
 		return out;
 	}
 };

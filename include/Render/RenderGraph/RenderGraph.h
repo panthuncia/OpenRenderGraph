@@ -319,6 +319,12 @@ private:
 	 * GraphHost::Desc::coalesceSubmissions sets it on every graph it builds.
 	 */
 	void SetCoalescedSubmissions(bool enabled) noexcept { m_coalesceSubmissions = enabled; }
+	/**
+	 * @brief Under SetInlineAtExecution: a kept recording's late batch whose passes are all keyed by their skip answers
+	 * (PreparedPass::KeyedBySkip: gated copies and clears) submits its list again while those answers are unchanged, instead of
+	 * recording it at each submission. GraphHost::Desc::keepGatedInline sets it on every graph it builds.
+	 */
+	void SetKeptGatedInline(bool enabled) noexcept { m_keepGatedInline = enabled; }
 	bool InlineAtExecution() const noexcept { return m_inlineAtExecution; }
 	// A queue slot the host's stream runs: the graphics queue's, or one on the same native queue (a kind the device aliases to it).
 	// An external epoch's batches on it are the host's to execute, in its stream's order.
@@ -885,6 +891,7 @@ private:
 	std::vector<uint32_t> m_externalPersistentEpochs;
 	bool m_inlineAtExecution = false;  // SetInlineAtExecution
 	bool m_coalesceSubmissions = false;  // SetCoalescedSubmissions
+	bool m_keepGatedInline = false;      // SetKeptGatedInline
 	std::mutex m_externalSecondaryPoolsMutex;
 	std::vector<std::shared_ptr<CommandListPool>> m_externalSecondaryPools;
 	bool m_persistentRecordingReuse = false;

@@ -814,6 +814,9 @@ public:
     bool SkipsAgain(const RecordingContext& context) const {
         return m_storage && m_storage->state.load(std::memory_order_acquire) == LifecycleState::Recorded && m_storage->SkipsAtExecution(context);
     }
+    // Whether the pass's commands for a run depend on the run only through SkipsAtExecution's answer (a typed pass's
+    // kRecordKeyedBySkip). Then a list recorded for one answer can be submitted again for a run with the same answer.
+    bool KeyedBySkip() const noexcept { return m_storage && m_storage->KeyedBySkip(); }
     // Consumes the packet as Record does, recording nothing (SkipsAtExecution). Its submission and completion follow as usual.
     void RecordNothing() const {
         if (!m_storage) throw std::logic_error("Legacy pass has no owned recording packet");
@@ -879,6 +882,7 @@ private:
         virtual void Abandon(AbandonReason) const {}
         virtual bool HasCallbacks() const noexcept { return false; }
         virtual bool SkipsAtExecution(const RecordingContext&) const { return false; }
+        virtual bool KeyedBySkip() const noexcept { return false; }
         mutable std::atomic<LifecycleState> state{LifecycleState::Prepared};
         mutable std::shared_ptr<const PreparedDependencySnapshot> dependencies;
         std::vector<ExternalTimelinePoint> externalSignals;
@@ -920,6 +924,10 @@ private:
             if constexpr (requires(const Data& value, const RecordingContext& recording) {
                 { Derived::SkipsAtExecution(value, recording) } -> std::convertible_to<bool>;
             }) return data && Derived::SkipsAtExecution(*data, context);
+            else return false;
+        }
+        bool KeyedBySkip() const noexcept override {
+            if constexpr (requires { Derived::kKeyedBySkip; }) return Derived::kKeyedBySkip;
             else return false;
         }
 		mutable std::optional<Data> data;
