@@ -1,4 +1,5 @@
 #include "OpenRenderGraph/GraphHost.h"
+#include "OpenRenderGraph/Trace.h"
 
 #include <BasicTelemetry/Tracy.h>
 #include <spdlog/spdlog.h>
@@ -62,6 +63,19 @@ struct CompletedValues {
 			if (completed != UINT64_MAX && completed < value) return false;
 		}
 		return true;
+	}
+};
+
+// Names the epoch, and a serial, in every trace event made while it lives (decision-trace.md, "Events"). Costs nothing while
+// the trace is off.
+struct TraceTicketScope {
+	std::optional<trace::ContextScope> epoch;
+	std::optional<trace::ContextScope> ticket;
+	explicit TraceTicketScope(uint32_t epochId) {
+		if (!trace::Any()) return;
+		static std::atomic<uint64_t> serial{0};
+		epoch.emplace("epoch", uint64_t{epochId});
+		ticket.emplace("ticket", serial.fetch_add(1, std::memory_order_relaxed) + 1);
 	}
 };
 
@@ -2377,6 +2391,7 @@ bool GraphHost::AdvanceRecordingRequests(Async& state) {
 					RetireLease(lease, &state);
 				}
 				BT_ZONE_SCOPE("ORG.Host.RecordForRevision");
+				const TraceTicketScope traceScope(request.result->epoch);
 				runtime::ScopedActiveGraphServices services(graph.GetUploadService(), graph.GetDescriptorService());
 				std::shared_ptr<const RenderGraph::PersistentRecording> recording;
 				{
@@ -2519,6 +2534,7 @@ GraphHost::RunLease* GraphHost::TakeLiveCopy(Async& state, uint32_t epochIndex) 
 
 void GraphHost::PrepareTicket(Async& state, uint32_t epochIndex, RunLease* reprepare) {
 	BT_ZONE_SCOPE("ORG.Host.PrepareTicket.Worker");
+	const TraceTicketScope traceScope(state.epochs[epochIndex]);
 	auto& graph = *m_instances[state.instanceOf[epochIndex]].graph;
 	// A stale ticket's reprepare takes the lease it held: its latch regions were written for it. Otherwise a new run lease, or a
 	// published copy's for a revision-driven epoch, or none: then nothing is prepared until a seal or a completion frees a copy
@@ -3276,6 +3292,7 @@ void GraphHost::FinishTicket(Async& async, TicketCommit& commit, FrameTimings& t
 	BT_ZONE_SCOPE("ORG.Host.FinishTicket");
 	// The epoch, so a capture can attribute the submission thread's time to it.
 	BT_ZONE_VALUE(async.epochs[commit.index]);
+	const TraceTicketScope traceScope(async.epochs[commit.index]);
 	using Census = diagnostics::SubmissionCensus;
 	auto& census = diagnostics::Census();
 	census.BeginTicket();

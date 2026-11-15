@@ -24,6 +24,12 @@ build. Events from a graph built earlier name passes `pass#<index>` and resource
 
 Every line has `t` (steady clock, ns), `thread`, `category` and `decision`, then the decision's fields.
 
+Context fields come next, before the decision's own. A host adds them with `trace::ContextScope` for the events made on its thread while
+the scope lives. `GraphHost` names the execution: `epoch` (the host's epoch id) and `ticket` (a serial, one per scope) around a
+ticket's preparation (host thread), its submission (`FinishTicket`, the submission thread or the render thread) and a revision recording.
+So the barrier plan and the ledger commits of one execution share a `ticket`, and the `admission` category's `ledger-commit` events
+say what state each execution left every resource in, every frame, even when its admission took a predicted plan and traced no barriers.
+
 | Category | Decision | Fields |
 |---|---|---|
 | schedule | `pass-scheduled` | pass, queue, preferred and compatible queues, batch, `batching` (first-batch, extends-previous, queue-change, isolated, after-isolated, new-wait), the batches it waits on per queue |

@@ -204,12 +204,29 @@ void ConfigureFromEnvironment() {
 	SetCategories(Category(mask));
 }
 
+namespace {
+// The fields of the ContextScopes alive on this thread, outermost first.
+std::vector<Field>& ContextFields() {
+	thread_local std::vector<Field> fields;
+	return fields;
+}
+}
+
+ContextScope::ContextScope(std::string_view key, Value value) {
+	ContextFields().push_back({std::string(key), std::move(value)});
+}
+
+ContextScope::~ContextScope() {
+	ContextFields().pop_back();
+}
+
 Builder::Builder(Category category, std::string_view decision) {
 	m_event.category = category;
 	m_event.decision = decision;
 	m_event.timestampNs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
 		std::chrono::steady_clock::now().time_since_epoch()).count());
 	m_event.thread = ThreadNumber();
+	m_event.fields = ContextFields();
 }
 
 Builder& Builder::Add(std::string_view key, Value value) {

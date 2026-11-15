@@ -104,6 +104,17 @@ void Flush();
 // ORG_TRACE_RESOURCE. Does nothing when ORG_TRACE is unset or empty.
 void ConfigureFromEnvironment();
 
+// Fields every event built on this thread carries while the scope lives. A host uses it to name the execution its
+// decisions belong to: GraphHost adds "epoch" and "ticket" (a serial per preparation, submission or recording) around
+// the work that plans an epoch's barriers. Scopes nest; the inner one's fields come after the outer one's.
+class ContextScope {
+public:
+	ContextScope(std::string_view key, Value value);
+	ContextScope(const ContextScope&) = delete;
+	ContextScope& operator=(const ContextScope&) = delete;
+	~ContextScope();
+};
+
 // Builds one event and emits it when it goes out of scope. Only construct one where Enabled(category) is true.
 // The ORG_TRACE macro checks this first.
 class Builder {
