@@ -17,6 +17,21 @@ bool NeedsTextureBarrier(const rhi::TextureBarrier& barrier) noexcept {
         || org::NeedsWholeBufferBarrier(barrier.beforeAccess, barrier.afterAccess, barrier.beforeSync, barrier.afterSync);
 }
 
+// An access that writes the resource.
+bool Writes(rhi::ResourceAccessType access) noexcept {
+    using A = rhi::ResourceAccessType;
+    constexpr uint64_t writes = uint64_t{A::RenderTarget} | A::UnorderedAccess | A::DepthReadWrite | A::CopyDest
+        | A::RaytracingAccelerationStructureWrite | A::DepthStencilClear | A::RenderTargetClear | A::UnorderedAccessClear;
+    return (static_cast<uint64_t>(access) & writes) != 0;
+}
+
+// An execution's entry barrier from the state an earlier execution left. Between identical states it still orders a write
+// after the earlier one: two render passes on one target, or two copies into one buffer, are not ordered by queue order alone.
+// Separate queue submissions hid this on some drivers; one submission of several executions does not.
+bool NeedsEntryTextureBarrier(const rhi::TextureBarrier& barrier) noexcept {
+    return NeedsTextureBarrier(barrier) || Writes(barrier.beforeAccess) || Writes(barrier.afterAccess);
+}
+
 // Schedule queue slots map to QueueKind the same way submission does
 // (RenderGraph.cpp: 0 graphics, 1 compute, otherwise copy).
 rhi::QueueKind OwnershipPeerForQueue(uint32_t queue) noexcept {
@@ -506,7 +521,7 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
                 barrier.discard = barrier.beforeLayout == rhi::ResourceLayout::Undefined;
                 const bool handedOff = !externalAcquire && (useSubmittedState || homeSeeded)
                     && handOff(barrier, captured, homeSeeded ? 0u : uniformPreviousQueue, consumerQueue, step.batch);
-                if (NeedsTextureBarrier(barrier)) (handedOff ? output.acquired : boundaryTextures).push_back(barrier);
+                if (NeedsEntryTextureBarrier(barrier)) (handedOff ? output.acquired : boundaryTextures).push_back(barrier);
             } else {
                 const auto beforeAccess = static_cast<rhi::ResourceAccessType>(uniformBefore->access);
                 const auto beforeSync = static_cast<rhi::ResourceSyncState>(uniformBefore->sync);
@@ -529,7 +544,7 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
                     && beforeAccess != rhi::ResourceAccessType::Common
                     && afterAccess != rhi::ResourceAccessType::None
                     && afterAccess != rhi::ResourceAccessType::Common
-                    && NeedsWholeBufferBarrier(beforeAccess, afterAccess, beforeSync, afterSync))
+                    && (NeedsWholeBufferBarrier(beforeAccess, afterAccess, beforeSync, afterSync) || Writes(beforeAccess) || Writes(afterAccess)))
                     boundaryBuffers.push_back(MakeWholeBufferBarrier(consumerHandle,
                         beforeAccess, afterAccess, beforeSync, afterSync));
             }
@@ -605,7 +620,7 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
                     // handoffs are visible; graph buffers are Concurrent.
                     if (!handedOff) basic_telemetry::AddCounter("ORG.Execution.CrossFrameTextureQueueHandoff");
                 }
-                if (NeedsTextureBarrier(barrier)) (handedOff ? output.acquired : boundaryTextures).push_back(barrier);
+                if (NeedsEntryTextureBarrier(barrier)) (handedOff ? output.acquired : boundaryTextures).push_back(barrier);
             } else {
                 const auto heapType = captured.heapType;
                 const bool fixedHeapState = heapType == rhi::HeapType::Upload
@@ -655,7 +670,7 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
                     && beforeAccess != rhi::ResourceAccessType::Common
                     && afterAccess != rhi::ResourceAccessType::None
                     && afterAccess != rhi::ResourceAccessType::Common
-                    && NeedsWholeBufferBarrier(beforeAccess, afterAccess, beforeSync, afterSync))
+                    && (NeedsWholeBufferBarrier(beforeAccess, afterAccess, beforeSync, afterSync) || Writes(beforeAccess) || Writes(afterAccess)))
                     boundaryBuffers.push_back(MakeWholeBufferBarrier(consumerHandle,
                         beforeAccess, afterAccess, beforeSync, afterSync));
             }
