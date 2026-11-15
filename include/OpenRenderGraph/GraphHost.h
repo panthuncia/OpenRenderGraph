@@ -536,7 +536,9 @@ public:
 	// stays).
 	bool ReleaseEpochTicket(uint32_t epoch);
 	/**
-	 * @brief Render thread, for an async live epoch: takes its next ticket now and keeps it for the epoch's next SubmitEpoch. The
+	 * @brief Render thread, for an async live epoch, or a revision-driven one whose copy is pinned (SetEpochCopy): takes its next
+	 * ticket now and keeps it for the epoch's next SubmitEpoch. A revision-driven epoch's held ticket is the pinned copy's: its run
+	 * is EpochCopyRun of that copy, and the copy's last run is done once the ticket is held. The
 	 * caller can then write the run's values (LatchBlock regions, run gates) at several points before the submission, each inside
 	 * UseHeldRun. Waits for the ticket as SubmitEpoch does and throws as it does (EpochFailedError when the epoch failed). Returns the
 	 * held ticket's run. A second call before the submission returns the same run.

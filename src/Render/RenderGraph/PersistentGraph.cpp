@@ -1875,7 +1875,14 @@ void SynchronousAdmission::AdmitLedger(FrameAdmission& frame, bool cacheEligible
     auto& census = diagnostics::Census();
     if (!frame.entryOnly) census.Admitted(Census::Admission::NotEntryOnly);
     else if (!invalidated.empty()) census.Admitted(Census::Admission::AliasInvalidated);
-    if (frame.entryOnly && invalidated.empty()) {
+    // A plan stands only for the activations it was made with: an executable whose transients share memory activates the same
+    // backings at every execution, which its prediction then covers.
+    const auto sameActivations = [&](const compiler::StatePrediction& a_prediction) {
+        return a_prediction.activations.size() == invalidated.size()
+            && std::ranges::equal(a_prediction.activations, invalidated, [](rhi::ResourceHandle a, rhi::ResourceHandle b) {
+                   return a.index == b.index && a.generation == b.generation; });
+    };
+    if (frame.entryOnly) {
         const auto& executable = frame.publication->executable;
         if (m_predictions.size() > 256 && !m_predictions.contains(executable.get()))
             std::erase_if(m_predictions, [&](auto& entry) {
@@ -1899,7 +1906,7 @@ void SynchronousAdmission::AdmitLedger(FrameAdmission& frame, bool cacheEligible
         // The last plan first, then the earlier ones the slot keeps: a frame whose states alternate (an executable that runs
         // after different work on alternate frames) finds its plan again.
         auto& states = m_sequencer->states;
-        if (states.Predicts(*slot.prediction, frame.backings, frame.backings.Id())) {
+        if (sameActivations(*slot.prediction) && states.Predicts(*slot.prediction, frame.backings, frame.backings.Id())) {
             frame.sharedBarriers = slot.prediction->plan;
             frame.prediction = slot.prediction;
             frame.predicted = true;
@@ -1907,7 +1914,7 @@ void SynchronousAdmission::AdmitLedger(FrameAdmission& frame, bool cacheEligible
             census.Admitted(Census::Admission::Predicted);
         } else {
             for (auto& earlier : slot.earlier) {
-                if (!states.Predicts(*earlier, frame.backings, frame.backings.Id())) continue;
+                if (!sameActivations(*earlier) || !states.Predicts(*earlier, frame.backings, frame.backings.Id())) continue;
                 std::swap(earlier, slot.prediction);
                 frame.sharedBarriers = slot.prediction->plan;
                 frame.prediction = slot.prediction;
@@ -1955,6 +1962,7 @@ void SynchronousAdmission::AdmitLedger(FrameAdmission& frame, bool cacheEligible
         prediction.plan = std::make_shared<const compiler::PreparedExecutionBarrierPlan>(m_sequencer->states.Prepare(graph, frame.backings,
             invalidated, m_closed, true, frame.backings.Validated(), frame.backings.Id(), m_externalHome, m_restAtLastUse));
         m_sequencer->states.Capture(prediction, graph, frame.backings, frame.backings.Id());
+        prediction.activations = invalidated;
         frame.sharedBarriers = prediction.plan;
         frame.prediction = predictionSlot->prediction;
         ++m_planned;

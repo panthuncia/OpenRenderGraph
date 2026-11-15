@@ -105,6 +105,10 @@ struct PreparedExecutionBarrierPlan {
 // finds what the same executable found the frame before.
 struct StatePrediction {
     std::shared_ptr<const PreparedExecutionBarrierPlan> plan;
+    // The aliased backings the plan was made with entering from Undefined (AliasAccessAdmissionLedger::ApplyInitialStates). A graph
+    // whose transients share memory activates the same ones at every execution: the plan stands for an admission that activates
+    // the same backings.
+    std::vector<rhi::ResourceHandle> activations;
     struct Entry {
         uint32_t resource = 0;  // compiler resource index
         bool present = false;
@@ -246,6 +250,8 @@ public:
     // The same, each commit's entry found by its compiler resource index (PreparedBatchBarriers::committedIndices) in the backings'
     // set (backingSet as for Prepare).
     void CommitBatch(const PreparedBatchBarriers& batch, std::span<const PreparedBackingState> backings, uint64_t backingSet);
+    // A batch's seeds: the grids of backings the ledger does not hold yet, and of those whose state the batch makes again.
+    void SeedBatch(const PreparedBatchBarriers& batch);
     // The prediction's entries taken anew: what the ledger holds now of each resource the graph's entry steps name.
     void Capture(StatePrediction& prediction, const Schedule& graph, std::span<const PreparedBackingState> initial,
         uint64_t backingSet = 0) const;

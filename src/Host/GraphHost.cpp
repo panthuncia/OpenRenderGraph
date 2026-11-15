@@ -2258,13 +2258,28 @@ RunRef GraphHost::HoldEpochTicket(uint32_t epoch) {
 	auto& async = *m_async;
 	async.ThrowIfFailed();
 	const auto index = async.IndexOf(epoch);
-	if (async.revisionDriven[index]) throw std::logic_error("HoldEpochTicket: a revision-driven epoch's tickets carry no run values to write ahead");
 	if (const auto& held = async.held[index]) return RenderGraph::PersistentTicketRun(*held);
+	// A revision-driven epoch's run is known ahead only when its copy is pinned (SetEpochCopy): the held ticket is then the
+	// pinned copy's, and its run is EpochCopyRun of that copy.
+	const uint32_t pinned = async.revisionDriven[index] ? async.pinnedCopy[index].load(std::memory_order_acquire) : RunRef::kNoCopy;
+	if (async.revisionDriven[index] && pinned == RunRef::kNoCopy)
+		throw std::logic_error("HoldEpochTicket: a revision-driven epoch's run is known ahead only with a pinned copy (SetEpochCopy)");
 	if (!m_instances[instance].graph || m_instances[instance].failed) throw EpochFailedError(epoch, m_instances[instance].failure);
 	if (async.epochFailed[index].load(std::memory_order_acquire)) throw EpochFailedError(epoch, async.epochErrors[index]);
 	auto ticket = async.TakeReady(index);
 	if (!ticket) {
 		++m_asyncStats.waited;
+		ticket = async.WaitTicket(index);
+	}
+	// A ticket of another copy goes back, and one for the pinned copy takes its place, as SubmitEpoch does. SubmitEpoch moves the
+	// pinned copy on when it submits the held ticket.
+	if (pinned != RunRef::kNoCopy && RenderGraph::PersistentTicketRun(*ticket).copy != pinned) {
+		++m_asyncStats.copyRepins;
+		Async::Message discard;
+		discard.kind = Async::Message::Kind::Discard;
+		discard.epochIndex = index;
+		discard.ticket = std::move(ticket);
+		if (!async.Post(discard)) async.ThrowIfFailed();
 		ticket = async.WaitTicket(index);
 	}
 	const auto run = RenderGraph::PersistentTicketRun(*ticket);

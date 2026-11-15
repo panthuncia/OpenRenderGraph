@@ -789,10 +789,26 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
             const bool external = goesHomeExternally(captured);
             const bool fixedHeapState = captured.heapType == rhi::HeapType::Upload
                 || captured.heapType == rhi::HeapType::Readback;
-            for (uint32_t mip = 0; mip < captured.shape.mips; ++mip)
-                for (uint32_t slice = 0; slice < captured.shape.slices; ++slice) {
+            // The commits of neighbouring mips of a slice that end in the same state in the same batch are one range: a texture with
+            // a mip chain (a cubemap's six faces of them) would otherwise commit, and its admission ledger visit, every cell on its own.
+            struct PendingCommit { bool active = false; uint32_t mip = 0, mips = 0, slice = 0, batch = 0; CompileResourceState state{}; };
+            PendingCommit pending;
+            const auto flush = [&] {
+                if (!pending.active) return;
+                auto& into = result.batches[pending.batch];
+                into.committedResources.push_back(captured.resource);
+                into.committedIndices.push_back(resource);
+                into.committedStates.push_back({CompileRange{pending.mip, pending.mips, pending.slice, 1}, pending.state});
+                into.committedQueues.push_back(cells.queue);
+                pending.active = false;
+            };
+            for (uint32_t slice = 0; slice < captured.shape.slices; ++slice, flush())
+                for (uint32_t mip = 0; mip < captured.shape.mips; ++mip) {
                     const auto cell = CellIndex(captured.shape, mip, slice);
-                    if (cells.last[cell] == UINT32_MAX) continue;
+                    if (cells.last[cell] == UINT32_MAX) {
+                        flush();
+                        continue;
+                    }
                     const auto& last = graph.states.steps[cells.last[cell]];
                     CompileResourceState home = graph.states.steps[cells.first[cell]].before;
                     // Resting at last use: the cell stays as its last use left it. No exit barrier, and the ledger records that state.
@@ -857,10 +873,13 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
                         barrier.afterSync = rhi::ResourceSyncState::All;
                         output.afterPass[graph.positionByPass[last.pass]].textures.push_back(barrier);
                     }
-                    output.committedResources.push_back(captured.resource);
-                    output.committedIndices.push_back(resource);
-                    output.committedStates.push_back({CompileRange{mip, 1, slice, 1}, home});
-                    output.committedQueues.push_back(cells.queue);
+                    if (pending.active && pending.batch == last.batch && pending.slice == slice && pending.mip + pending.mips == mip
+                        && pending.state == home) {
+                        ++pending.mips;
+                    } else {
+                        flush();
+                        pending = {true, mip, 1, slice, last.batch, home};
+                    }
                 }
         }
     }
@@ -953,10 +972,7 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
     return result;
 }
 
-void BackingStateAdmissionLedger::CommitBatch(const PreparedBatchBarriers& batch) {
-    if (batch.committedResources.size() != batch.committedStates.size()
-        || batch.committedQueues.size() != batch.committedStates.size())
-        throw std::invalid_argument("Invalid backing-state commit");
+void BackingStateAdmissionLedger::SeedBatch(const PreparedBatchBarriers& batch) {
     for (const auto& seed : batch.seeds) {
         const auto key = Key(seed.resource);
         const bool authoritative = std::ranges::any_of(batch.authoritativeSeeds,
@@ -973,6 +989,13 @@ void BackingStateAdmissionLedger::CommitBatch(const PreparedBatchBarriers& batch
             });
         grid.fingerprint = Fingerprint(grid);
     }
+}
+
+void BackingStateAdmissionLedger::CommitBatch(const PreparedBatchBarriers& batch) {
+    if (batch.committedResources.size() != batch.committedStates.size()
+        || batch.committedQueues.size() != batch.committedStates.size())
+        throw std::invalid_argument("Invalid backing-state commit");
+    SeedBatch(batch);
     for (size_t i = 0; i < batch.committedStates.size(); ++i) {
         const auto key = Key(batch.committedResources[i]);
         auto* grid = m_states.Find(key);
@@ -1038,11 +1061,13 @@ void BackingStateAdmissionLedger::CommitBatch(const PreparedBatchBarriers& batch
         || batch.committedQueues.size() != batch.committedStates.size()
         || batch.committedIndices.size() != batch.committedStates.size())
         throw std::invalid_argument("Invalid backing-state commit");
-    if (!batch.seeds.empty()) {
-        // Seeding inserts grids (the first executions of a backing): every grid found by its key.
+    // Seeds first: the first executions of a backing, and the aliased backings that enter from Undefined, whose grids are made
+    // again. Making a grid moves no address (the table's entries stay put), so the commits below still find them by index.
+    if (!batch.seeds.empty() && batch.committedIndices.size() != batch.committedStates.size()) {
         CommitBatch(batch);
         return;
     }
+    SeedBatch(batch);
     auto& resolved = m_states.Resolve(backings, backingSet);
     for (size_t i = 0; i < batch.committedStates.size(); ++i) {
         const auto index = batch.committedIndices[i];

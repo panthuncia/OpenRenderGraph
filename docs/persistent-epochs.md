@@ -357,11 +357,27 @@ recording per frame slot. These options serve it; each is independent of the oth
 -   **Passes the host data turns off.** `RenderGraphPass::SetSkipWhen(predicate)` is asked at each preparation with the
     preparation's host data. True marks the prepared pass skipped ahead (`PreparedPass::SkippedAhead`): its recorder records
     only the barriers around it, whether it is recorded ahead or at execution. The answer must depend on the host data alone.
+-   **Held tickets of pinned copies.** `HoldEpochTicket` takes a revision-driven epoch's ticket when its copy is pinned
+    (`SetEpochCopy` first). The held ticket is the pinned copy's: its run is `EpochCopyRun` of that copy, and holding it means
+    the copy's last run is done. A host that commits at several points of its frame before the submission (Community Shaders'
+    segments with several taps) writes the run's latch regions and gates inside `UseHeldRun` at each point, and the next
+    `SubmitEpoch` takes the held ticket. Without a pinned copy the hold throws: the run is not known ahead.
+-   **Repeated alias activations are predicted.** A graph whose transients share memory activates the same aliased backings at
+    each execution (the last transient of one execution occupies what the first of the next one takes). Such an admission used
+    to plan against the ledger every time. A prediction now keeps the activations it was made with
+    (`StatePrediction::activations`), and stands for an admission that activates the same backings. Community Shaders' deferred
+    segment: admission 103 us a run before, 8 us after.
+-   **A closed execution commits ranges.** Its exit commits (the ledger's record of where each cell rests) are made per cell. The
+    commits of neighbouring mips of a slice that end in the same state in the same batch are now one range, and seeds no longer
+    send a batch's commits to the slower keyed path (`BackingStateAdmissionLedger::SeedBatch`). The deferred segment's commits:
+    71 us a run before, 15 us after.
 -   **Barrier census.** With the segment census on, `SegmentStats::barriers` counts, per epoch, its tickets, the entry barriers
     their admissions planned, the barriers their recordings' bodies hold (`PersistentRecording::bodyBarriers`) and a closed
     execution's full barriers.
 -   **Test.** `PersistentVulkanHostTests segment`: a revision-driven epoch closed by `SetClosedEpochs` in an open host, runs
-    pinned to their slots, a re-pin after a skipped slot, a revision that turns the write off, and a one-copy recording.
+    pinned to their slots, a re-pin after a skipped slot, a revision that turns the write off, a one-copy recording, and held
+    tickets of pinned copies (the held run is the copy's, a second hold returns it, the submission takes it, and a hold given
+    back leaves the copy free).
 
 ### Versioned resources
 
