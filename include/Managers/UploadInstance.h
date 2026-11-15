@@ -178,6 +178,8 @@ public:
 	// StagedUploadDestinations and RecordStagedUploadsRouted.
 	bool TakeRecordedUploadsWithDestinations(std::vector<rhi::CommandList>& out, uint32_t frameIndex, std::vector<rhi::ResourceHandle>& destinations);
 	bool StagedUploadDestinations(std::vector<rhi::ResourceHandle>& out) const;
+	// IUploadService::TakeStagedUploads (direct mode).
+	bool TakeStagedUploads(uint32_t frameIndex, std::vector<std::shared_ptr<org::runtime::StagedUploadBatch>>& out);
 	size_t RecordStagedUploadsRouted(rhi::CommandList& list, uint32_t frameIndex, bool afterWork,
 		const std::function<rhi::CommandList*(rhi::ResourceHandle)>& route, size_t& routed);
 

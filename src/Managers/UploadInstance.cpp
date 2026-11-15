@@ -888,6 +888,19 @@ bool UploadInstance::TakeRecordedUploadsWithDestinations(std::vector<rhi::Comman
 	return known;
 }
 
+bool UploadInstance::TakeStagedUploads(uint32_t frameIndex, std::vector<std::shared_ptr<org::runtime::StagedUploadBatch>>& out) {
+	NoteOffOwnerCall("TakeStagedUploads");
+	if (m_directStaged.empty()) return true;
+	out.insert(out.end(), m_directStaged.begin(), m_directStaged.end());
+	// Kept with the slot until it retires, as RecordStagedUploads keeps the batches it records.
+	if (m_numFramesInFlight != 0) {
+		auto& retained = FrameStaged(frameIndex);
+		retained.insert(retained.end(), std::make_move_iterator(m_directStaged.begin()), std::make_move_iterator(m_directStaged.end()));
+	}
+	m_directStaged.clear();
+	return true;
+}
+
 bool UploadInstance::StagedUploadDestinations(std::vector<rhi::ResourceHandle>& out) const {
 	return org::runtime::StagedUploadBatch::AppendDestinations(m_directStaged, out);
 }

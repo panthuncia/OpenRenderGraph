@@ -146,6 +146,14 @@ public:
         routed = 0;
         return RecordStagedUploads(list, frameIndex, afterWork);
     }
+    // Owner thread, direct mode: hands the waiting staged batches over to `out` instead of recording them, for a host that records
+    // them on another thread (RenderGraph::TakePendingUploads). They live until frame slot frameIndex retires, as recorded ones do.
+    // Batches staged after this call wait for the next one. False when the service cannot hand them over (the default, unless
+    // none are waiting).
+    virtual bool TakeStagedUploads(uint32_t frameIndex, std::vector<std::shared_ptr<StagedUploadBatch>>& out) {
+        (void)frameIndex; (void)out;
+        return !HasPendingUploads();
+    }
     // Owner thread: whether a host's upload list would record anything now (queued or posted uploads, copies, staged or
     // recorded batches). False lets a host skip the list. A post from another thread after the call goes with the next one.
     virtual bool HasPendingUploads() const { return true; }

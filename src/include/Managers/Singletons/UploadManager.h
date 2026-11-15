@@ -84,6 +84,7 @@ public:
 	bool SubmitRecordedUploads(std::shared_ptr<org::runtime::StagedUploadBatch> batch);
 	size_t TakeRecordedUploads(std::vector<rhi::CommandList>& out, uint32_t frameIndex);
 	bool TakeRecordedUploadsWithDestinations(std::vector<rhi::CommandList>& out, uint32_t frameIndex, std::vector<rhi::ResourceHandle>& destinations);
+	bool TakeStagedUploads(uint32_t frameIndex, std::vector<std::shared_ptr<org::runtime::StagedUploadBatch>>& out);
 	bool StagedUploadDestinations(std::vector<rhi::ResourceHandle>& out) const;
 	// IUploadService::HasPendingUploads: queued copies, or anything the instance holds.
 	bool HasPendingUploads() const;

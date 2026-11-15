@@ -1,6 +1,7 @@
 // Persistent execution, tickets (async epochs): preparation, kept recordings, submission and pending uploads.
 #include "RenderGraphPersistentState.h"
 #include "Resources/Buffers/VersionedBuffer.h"
+#include "Render/Runtime/StagedUploadBatch.h"
 
 namespace org {
 
@@ -1046,65 +1047,144 @@ bool RenderGraph::HasPendingUploads() const {
 bool RenderGraph::RecordPendingUploads(rhi::Device device, rhi::CommandList& list, uint32_t slot, std::shared_ptr<void>& keepAlive, bool& recorded,
 	std::vector<rhi::CommandList>& recordedLists, PersistentTicket* ticket, std::span<rhi::CommandList> queueLists, size_t* queueCopies) {
 	BT_ZONE_SCOPE("ORG.Persistent.RecordPendingUploads");
+	auto taken = TakePendingUploads(device, slot);
+	return RecordTakenUploads(taken, list, keepAlive, recorded, recordedLists, ticket, queueLists, queueCopies);
+}
+
+RenderGraph::TakenUploads RenderGraph::TakePendingUploads(rhi::Device device, uint32_t slot) {
+	BT_ZONE_SCOPE("ORG.Persistent.TakePendingUploads");
+	TakenUploads taken;
+	if (!m_uploadService) return taken;
+	// Before the staged batches: an outdated recording goes back among them, first. What the lists write is taken too, in case
+	// the ticket's uploads are planned by queue.
+	if (m_queueRegistry.SlotCount()) taken.graphicsKnown = m_uploadService->TakeRecordedUploadsWithDestinations(taken.recordedLists, slot, taken.graphicsBuffers);
+	else m_uploadService->TakeRecordedUploads(taken.recordedLists, slot);
+	const auto pass = m_uploadService->GetUploadPass();
+	if (auto* immediate = dynamic_cast<IHasImmediateModeCommands*>(pass.get())) {
+		try {
+			ImmediateExecutionContext context{device, {org::imm::ImmediatePassKind::Copy, m_immediateDispatch,
+				&TicketUploadResolveById, &TicketUploadResolveByPtr, nullptr}, slot, nullptr};
+			{
+				BT_ZONE_SCOPE("ORG.Upload.DrainImmediateCommands");
+				immediate->RecordImmediateCommands(context);
+			}
+			auto effect = immediate->TakeOwnedImmediateSubmissionEffect();
+			auto frame = context.list.Finalize();
+			if (effect) {
+				taken.supported = false;  // tracked uploads signal their completion: the synchronous path's job
+				return taken;
+			}
+			if (!frame.bytecode.empty()) {
+				// The copies' destinations are captured now, with the backings the commit left.
+				auto copies = org::imm::PreparedBufferCopies::Capture(frame.bytecode, [](ResourceRegistry::RegistryHandle handle) -> BackingAllocationSnapshot {
+					if (!handle.IsEphemeral()) return {};
+					auto* resource = handle.GetEphemeralPtr();
+					if (!resource || resource->HasLayout()) return {};
+					auto* backed = dynamic_cast<BackedResource*>(UnwrapDynamic(resource));
+					return backed ? backed->CaptureBackingAllocation() : BackingAllocationSnapshot{};
+				});
+				if (!copies) {
+					taken.supported = false;
+					return taken;
+				}
+				copies->AppendBuffers(taken.graphicsBuffers);
+				struct Owned {
+					std::shared_ptr<const org::imm::PreparedBufferCopies> copies;
+					std::unique_ptr<org::imm::KeepAliveBag> bag;
+				};
+				auto owned = std::make_shared<Owned>(Owned{std::move(copies), std::move(frame.keepAlive)});
+				taken.recordCopies = [copies = owned->copies](rhi::CommandList& target) { copies->Record(target); };
+				taken.keepAlive = std::move(owned);
+			}
+		} catch (const std::exception& e) {
+			spdlog::error("Ticket uploads could not be taken: {}", e.what());
+			taken.supported = false;
+			return taken;
+		}
+	}
+	if (!m_uploadService->TakeStagedUploads(slot, taken.staged)) taken.supported = false;
+	return taken;
+}
+
+bool RenderGraph::RecordTakenUploads(TakenUploads& taken, rhi::CommandList& list, std::shared_ptr<void>& keepAlive, bool& recorded,
+	std::vector<rhi::CommandList>& recordedLists, PersistentTicket* ticket, std::span<rhi::CommandList> queueLists, size_t* queueCopies) {
+	BT_ZONE_SCOPE("ORG.Persistent.RecordTakenUploads");
 	recorded = false;
-	recordedLists.clear();
+	recordedLists = std::move(taken.recordedLists);
+	taken.recordedLists.clear();
 	if (queueCopies) *queueCopies = 0;
 	if (ticket) ticket->queueUploads = {};
-	if (!m_uploadService) return true;
-	// Queue-scoped (see the declaration): everything the graphics list and the recorded lists touch, while it is known.
+	if (!taken.supported) return false;
+	// Queue-scoped (see RecordPendingUploads' declaration): everything the graphics list and the recorded lists touch is known.
 	const bool scoped = ticket && !queueLists.empty() && m_queueRegistry.SlotCount();
-	std::vector<rhi::ResourceHandle> graphicsBuffers;
-	bool graphicsKnown = true;
-	// Before the staged batches: an outdated recording goes back among them, first.
-	if (scoped) graphicsKnown = m_uploadService->TakeRecordedUploadsWithDestinations(recordedLists, slot, graphicsBuffers);
-	else m_uploadService->TakeRecordedUploads(recordedLists, slot);
-	// Every copy follows one full barrier against the work before them (see the declaration).
-	bool barrier = false;
-	auto orderAfterPreviousWork = [&] {
-		if (barrier) return;
+	constexpr std::string_view kOwner = "ORG ticket uploads";
+	// A list of copies starts with one full barrier against the work before it on its queue, and only when it has a copy.
+	auto orderAfterPreviousWork = [](rhi::CommandList& target) {
 		const auto full = rhi::FullMemoryBarrier();
 		rhi::BarrierBatch barriers{};
 		barriers.globals = {&full, 1u};
-		list.Barriers(barriers);
-		barrier = true;
+		target.Barriers(barriers);
 	};
-	const auto pass = m_uploadService->GetUploadPass();
-	auto* immediate = dynamic_cast<IHasImmediateModeCommands*>(pass.get());
-	auto recordStaged = [&]() -> bool {
-		// Direct staged batches carry resolved destinations: one copy each, after the queued uploads, so a
-		// producer's payload replaces what was queued before it. The service orders them after the work before them
-		// (the queued copies, or the previous execution) with one barrier, and records none when it has no batch.
+	// Every list of copies ends with a full barrier, so the execution after it on its queue sees them (an open execution's
+	// handoff does not know of them: they bypass the ledgers).
+	auto orderBeforeLaterWork = orderAfterPreviousWork;
+	try {
+		if (taken.recordCopies) {
+			// The copies overwrite buffers the previous execution may still be reading: nothing else orders them
+			// after it (the next execution's full barrier comes after them), so they start with one of their own.
+			orderAfterPreviousWork(list);
+			taken.recordCopies(list);
+			keepAlive = std::move(taken.keepAlive);
+			recorded = true;
+		}
+		// Direct staged batches carry resolved destinations: one copy each, after the queued uploads, so a producer's payload
+		// replaces what was queued before it. They follow the work before them (the queued copies, or the previous execution)
+		// after one barrier, and none is recorded without a batch.
+		auto recordAllInto = [&](rhi::CommandList& target) -> size_t {
+			if (taken.staged.empty()) return 0;
+			orderAfterPreviousWork(target);
+			return org::runtime::StagedUploadBatch::RecordCopies(target, taken.staged, kOwner);
+		};
 		std::vector<rhi::ResourceHandle> staged;
 		TicketUploadRouting routing;
-		// Every list of copies ends with a full barrier, so the execution after it on its queue sees them (an open execution's
-		// handoff does not know of them: they bypass the ledgers).
-		auto orderBeforeLaterWork = [](rhi::CommandList& target) {
-			const auto full = rhi::FullMemoryBarrier();
-			rhi::BarrierBatch barriers{};
-			barriers.globals = {&full, 1u};
-			target.Barriers(barriers);
-		};
 		const auto graphicsQueue = scoped ? static_cast<uint32_t>(ToUnderlying(m_queueRegistry.FindGraphicsSlot())) : UINT32_MAX;
-		if (!scoped || !graphicsKnown || !m_uploadService->StagedUploadDestinations(staged)
-			|| !PlanTicketUploads(*ticket, graphicsQueue, queueLists, graphicsBuffers, staged, routing)) {
+		if (!scoped || !taken.graphicsKnown || !org::runtime::StagedUploadBatch::AppendDestinations(taken.staged, staged)
+			|| !PlanTicketUploads(*ticket, graphicsQueue, queueLists, taken.graphicsBuffers, staged, routing)) {
 			// Not planned: every batch off the graphics queue waits for the uploads.
-			if (m_uploadService->RecordStagedUploads(list, slot, true)) recorded = true;
+			if (recordAllInto(list)) recorded = true;
 			if (recorded || !recordedLists.empty()) orderBeforeLaterWork(list);
 			return true;
 		}
 		// Planned by queue: each routed destination's copies into its queue's list (behind that list's own barrier against the
-		// work before it on that queue), the rest into `list`.
-		size_t routed = 0;
-		const size_t copies = m_uploadService->RecordStagedUploadsRouted(list, slot, true,
-			[&](rhi::ResourceHandle destination) -> rhi::CommandList* {
-				const auto found = routing.routed.find(UploadBufferKey(destination));
-				return found == routing.routed.end() ? nullptr : &queueLists[found->second];
-			}, routed);
+		// work before it on that queue), the rest into `list`. Every copy of one destination goes to the same list, in order, so
+		// the batches' order between overlapping copies (the later write wins) holds within it.
+		size_t routed = 0, copies = 0;
+		if (!taken.staged.empty()) {
+			std::unordered_map<uint64_t, rhi::CommandList*> byDestination;
+			std::vector<rhi::CommandList*> targets;
+			for (const auto destination : staged) {
+				const auto key = UploadBufferKey(destination);
+				if (byDestination.contains(key)) continue;
+				const auto found = routing.routed.find(key);
+				auto* target = found == routing.routed.end() ? &list : &queueLists[found->second];
+				byDestination.emplace(key, target);
+				if (std::ranges::find(targets, target) == targets.end()) targets.push_back(target);
+			}
+			for (auto* target : targets) {
+				orderAfterPreviousWork(*target);
+				const size_t count = org::runtime::StagedUploadBatch::RecordCopies(*target, taken.staged, kOwner,
+					[&](rhi::ResourceHandle destination) {
+						const auto found = byDestination.find(UploadBufferKey(destination));
+						return found != byDestination.end() && found->second == target;
+					});
+				copies += count;
+				if (target != &list) routed += count;
+			}
+		}
 		size_t expected = 0;
 		for (const auto count : routing.copies) expected += count;
-		// The batches that use a routed destination do not wait for the graphics list: a service that kept a copy there would
-		// race them.
-		if (routed != expected) throw std::logic_error("The upload service did not record the staged uploads on the queues asked");
+		// The batches that use a routed destination do not wait for the graphics list: a copy kept there would race them.
+		if (routed != expected) throw std::logic_error("The staged uploads were not recorded on the queues their plan named");
 		if (copies > routed) recorded = true;
 		auto& plan = ticket->queueUploads;
 		plan.planned = true;
@@ -1124,46 +1204,6 @@ bool RenderGraph::RecordPendingUploads(rhi::Device device, rhi::CommandList& lis
 		for (uint32_t queue = 0; queue < routing.copies.size(); ++queue)
 			if (routing.copies[queue] && queue < queueLists.size() && queueLists[queue]) orderBeforeLaterWork(queueLists[queue]);
 		return true;
-	};
-	if (!immediate) {
-		try {
-			return recordStaged();
-		} catch (const std::exception& e) {
-			spdlog::error("Ticket uploads could not be recorded: {}", e.what());
-			return false;
-		}
-	}
-	try {
-		ImmediateExecutionContext context{device, {org::imm::ImmediatePassKind::Copy, m_immediateDispatch,
-			&TicketUploadResolveById, &TicketUploadResolveByPtr, nullptr}, slot, nullptr};
-		{
-			BT_ZONE_SCOPE("ORG.Upload.DrainImmediateCommands");
-			immediate->RecordImmediateCommands(context);
-		}
-		auto effect = immediate->TakeOwnedImmediateSubmissionEffect();
-		auto frame = context.list.Finalize();
-		if (effect) return false;  // tracked uploads signal their completion: the synchronous path's job
-		if (frame.bytecode.empty()) return recordStaged();
-		auto copies = org::imm::PreparedBufferCopies::Capture(frame.bytecode, [](ResourceRegistry::RegistryHandle handle) -> BackingAllocationSnapshot {
-			if (!handle.IsEphemeral()) return {};
-			auto* resource = handle.GetEphemeralPtr();
-			if (!resource || resource->HasLayout()) return {};
-			auto* backed = dynamic_cast<BackedResource*>(UnwrapDynamic(resource));
-			return backed ? backed->CaptureBackingAllocation() : BackingAllocationSnapshot{};
-		});
-		if (!copies) return false;
-		// The copies overwrite buffers the previous execution may still be reading: nothing else orders them
-		// after it (the next execution's full barrier comes after them), so they start with one of their own.
-		orderAfterPreviousWork();
-		copies->Record(list);
-		if (scoped) copies->AppendBuffers(graphicsBuffers);
-		struct Owned {
-			std::shared_ptr<const org::imm::PreparedBufferCopies> copies;
-			std::unique_ptr<org::imm::KeepAliveBag> bag;
-		};
-		keepAlive = std::make_shared<Owned>(Owned{std::move(copies), std::move(frame.keepAlive)});
-		recorded = true;
-		return recordStaged();
 	} catch (const std::exception& e) {
 		spdlog::error("Ticket uploads could not be recorded: {}", e.what());
 		return false;

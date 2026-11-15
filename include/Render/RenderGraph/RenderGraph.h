@@ -462,6 +462,24 @@ private:
 	bool RecordPendingUploads(rhi::Device device, rhi::CommandList& list, uint32_t slot, std::shared_ptr<void>& keepAlive, bool& recorded,
 		std::vector<rhi::CommandList>& recordedLists, PersistentTicket* ticket = nullptr, std::span<rhi::CommandList> queueLists = {},
 		size_t* queueCopies = nullptr);
+	// RecordPendingUploads in two parts, for a host whose submissions run on another thread than the commits that queue uploads.
+	// TakePendingUploads runs on the upload service's owner thread, right after the commit: it takes everything the service holds
+	// for the next submission. Uploads queued later wait for the next take. RecordTakenUploads records what was taken, later and
+	// on any thread, by RecordPendingUploads' rules.
+	struct TakenUploads {
+		std::vector<rhi::CommandList> recordedLists;       // the producers' recorded lists
+		std::vector<rhi::ResourceHandle> graphicsBuffers;  // what those lists and the upload pass's copies write
+		bool graphicsKnown = true;                         // false: those lists may write anything
+		std::function<void(rhi::CommandList&)> recordCopies;  // records the upload pass's copies; null when it queued none
+		std::shared_ptr<void> keepAlive;                      // the staging those copies read
+		std::vector<std::shared_ptr<runtime::StagedUploadBatch>> staged;  // the staged batches, in order
+		bool supported = true;  // false: an upload is not a pointer-targeted buffer copy
+		bool Any() const noexcept { return !recordedLists.empty() || recordCopies || !staged.empty(); }
+	};
+	TakenUploads TakePendingUploads(rhi::Device device, uint32_t slot);
+	bool RecordTakenUploads(TakenUploads& taken, rhi::CommandList& list, std::shared_ptr<void>& keepAlive, bool& recorded,
+		std::vector<rhi::CommandList>& recordedLists, PersistentTicket* ticket = nullptr, std::span<rhi::CommandList> queueLists = {},
+		size_t* queueCopies = nullptr);
 	// The epoch the next Update/Execute runs; persistent::AllEpochs runs every pass.
 	void SetPersistentEpoch(uint32_t epoch) noexcept { m_persistentEpoch = epoch; }
 	uint32_t PersistentEpoch() const noexcept { return m_persistentEpoch; }

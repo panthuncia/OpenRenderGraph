@@ -223,10 +223,13 @@ struct GraphHost::Async {
 		return (std::min)(runs, (std::max)(mostAhead[index], 1u));
 	}
 	std::atomic<uint64_t> staleAhead{0};
-	// Render thread -> host thread, single producer / single consumer, in order.
+	// Render thread and submission thread -> host thread, single consumer, in order. Two threads post (the submission thread
+	// its tickets' completions, the render thread discards and holds), so a post takes postLock around its slot and the write
+	// count. The host's thread reads without it.
 	static constexpr uint64_t kMailbox = 64;
 	std::array<Message, kMailbox> mailbox;
 	std::atomic<uint64_t> written{0}, read{0};
+	std::mutex postLock;
 	rhi::CompletionWait* completionWake = nullptr;  // the host's (m_completionWake): requesters wake the thread through it too
 	// Whether the host's thread, if it sleeps, sleeps on GPU completions as well as on completionWake: then a submission's
 	// message needs no wake of its own (vkSignalSemaphore, several microseconds on the render thread), because the next GPU
@@ -235,7 +238,7 @@ struct GraphHost::Async {
 	std::atomic<bool> wakesOnGpu{false};
 	std::atomic<uint64_t> sleepingAt{0};  // the wake version this thread sleeps on, plus one; 0 while awake
 	std::atomic<bool> nudgeLogged{false};
-	uint64_t wakesSkipped = 0;  // render thread
+	uint64_t wakesSkipped = 0;  // posters, under postLock
 	// Ticket publication and terminal failure both advance this counter. A
 	// notify on an unchanged null shared_ptr cannot release atomic::wait(nullptr).
 	std::atomic<uint32_t> ticketWake{0};
@@ -293,6 +296,7 @@ struct GraphHost::Async {
 	}
 	// lazyWake: a submission's completion, which the host's thread can take at its next GPU wake-up (wakesOnGpu).
 	bool TryPost(Message& message, bool lazyWake = false) {
+		std::scoped_lock lock(postLock);
 		const auto index = written.load(std::memory_order_relaxed);
 		if (failed.load(std::memory_order_acquire) || index - read.load(std::memory_order_acquire) >= kMailbox) return false;
 		mailbox[index % kMailbox] = std::move(message);
@@ -361,16 +365,24 @@ struct GraphHost::TicketCommit {
 	uint64_t number = 0;     // the submission's number (SubmissionsMade)
 	uint64_t seal = 0;       // the seals before it (Seals)
 	uint64_t frameWait = 0;  // what its batches wait for (SetFrameWaitValue), as it was at the commit
+	// The uploads the commit queued, taken from the upload service at its end (RenderGraph::TakePendingUploads). Uploads the render
+	// thread queues later belong to later tickets, so a ticket finished on the submission thread records only its own.
+	RenderGraph::TakenUploads uploads;
+	// Open from the commit until FinishTicket publishes the ticket's queue values. Meanwhile the frontier misses the ticket's work,
+	// so deferred deletions, descriptor releases and freed pinned regions made on the render thread wait for a settled frontier
+	// (Runtime::AssignmentScope).
+	std::unique_ptr<Runtime::AssignmentScope> assigned;
 };
 
 // The submission thread's queue (Desc::submissionThread). The render thread pushes an entry after each commit. The thread
 // finishes the entries in order.
 struct GraphHost::SubmitQueue {
 	struct Entry {
-		enum class Kind : uint8_t { Ticket, Closure, Stop } kind = Kind::Stop;
+		enum class Kind : uint8_t { Ticket, Closure, Marker, Stop } kind = Kind::Stop;
 		Async* async = nullptr;  // a ticket's async state
 		std::optional<TicketCommit> commit;
 		std::function<void()> closure;
+		std::shared_ptr<GpuPoint::Pending> marker;  // SubmittedPoint's pending part, filled in when the thread gets here
 	};
 	// The most entries queued at once. A full queue makes the render thread wait for room (backpressure), so the render thread
 	// never runs further ahead of the queue than this.
@@ -1234,6 +1246,33 @@ void GraphHost::SetFrameWaitTimeline(std::shared_ptr<rhi::TimelinePtr> timeline)
 }
 
 GraphHost::GpuPoint GraphHost::SubmittedPoint() const {
+	if (auto* queue = m_submitQueue.get()) {
+		std::unique_lock lock(queue->mutex);
+		// Tickets still queued have no values yet. The point waits for the thread to get past them: a marker behind them, which
+		// the thread fills in with the values then. The thread's own calls are in order already.
+		if (std::this_thread::get_id() != queue->threadId && queue->passed < queue->pushed) {
+			std::shared_ptr<GpuPoint::Pending> marker;
+			if (!queue->entries.empty() && queue->entries.back().kind == SubmitQueue::Entry::Kind::Marker) {
+				marker = queue->entries.back().marker;
+			} else {
+				marker = std::make_shared<GpuPoint::Pending>();
+				SubmitQueue::Entry entry;
+				entry.kind = SubmitQueue::Entry::Kind::Marker;
+				entry.marker = marker;
+				queue->entries.push_back(std::move(entry));
+				++queue->pushed;
+				lock.unlock();
+				queue->work.notify_one();
+			}
+			GpuPoint point;
+			point.pending = std::move(marker);
+			return point;
+		}
+	}
+	return SubmittedPointNow();
+}
+
+GraphHost::GpuPoint GraphHost::SubmittedPointNow() const {
 	// Every queue of every graph, each timeline once: the shared ones' values are the host's, the same in each registry.
 	GpuPoint point;
 	for (const auto& instance : m_instances) {
@@ -1253,7 +1292,9 @@ GraphHost::GpuPoint GraphHost::SubmittedPoint() const {
 }
 
 void GraphHost::SealSubmitted() {
-	auto point = SubmittedPoint();
+	// Sealed means on the device's queues: what the submission thread still holds goes first.
+	DrainSubmissions("a seal (the frame's end)");
+	auto point = SubmittedPointNow();
 	{
 		std::scoped_lock lock(m_sealedMutex);
 		m_sealed = std::move(point);
@@ -2548,7 +2589,10 @@ GraphHost::AsyncStats GraphHost::TakeAsyncStats() noexcept {
 	if (m_async) {
 		m_asyncStats.revisionCopiesRecorded = m_async->revisionCopiesRecorded.exchange(0, std::memory_order_relaxed);
 		m_asyncStats.revisionRecordings = m_async->revisionRecordings.exchange(0, std::memory_order_relaxed);
-		m_asyncStats.wakesSkipped = std::exchange(m_async->wakesSkipped, 0);
+		{
+			std::scoped_lock lock(m_async->postLock);
+			m_asyncStats.wakesSkipped = std::exchange(m_async->wakesSkipped, 0);
+		}
 		m_asyncStats.copiesBusy = m_async->copiesBusy.exchange(0, std::memory_order_relaxed);
 		m_asyncStats.copyWaits = m_async->copyWaits.exchange(0, std::memory_order_relaxed);
 		m_asyncStats.staleAhead = m_async->staleAhead.exchange(0, std::memory_order_relaxed);
@@ -2673,6 +2717,11 @@ void GraphHost::RunSubmitThread() {
 				m_threadStats.lateUploadWaits += stats.lateUploadWaits;
 				m_threadStats.undeclaredUploads += stats.undeclaredUploads;
 			}
+		} else if (kind == SubmitQueue::Entry::Kind::Marker && entry.marker) {
+			// Every ticket before the marker is on its queue: the point's values are the queues' last ones now.
+			entry.marker->points = SubmittedPointNow().points;
+			entry.marker->passed.store(true, std::memory_order_release);
+			entry.marker->passed.notify_all();
 		} else if (kind == SubmitQueue::Entry::Kind::Closure && entry.closure) {
 			BT_ZONE_SCOPE("ORG.Host.SubmitThread.Closure");
 			try {
@@ -2900,6 +2949,9 @@ GraphHost::TicketCommit GraphHost::CommitTicket(Async& async, uint32_t index, st
 	// The frame boundaries before it: a later seal flushed it (a published copy waits for its run only then).
 	commit.seal = m_seals.load(std::memory_order_relaxed);
 	commit.frameWait = m_frameWaitValue;
+	// What the commit queued goes with this ticket, wherever it is finished.
+	commit.uploads = graph.TakePendingUploads(m_device, slot);
+	commit.assigned = std::make_unique<Runtime::AssignmentScope>(*m_desc.runtime);
 	commit.ticket = std::move(ticket);
 	lap(m_lastTimings.checkUs);
 	return commit;
@@ -2929,8 +2981,8 @@ void GraphHost::FinishTicket(Async& async, TicketCommit& commit, FrameTimings& t
 	runtime::ScopedActiveGraphServices services(graph.GetUploadService(), graph.GetDescriptorService());
 	// An external epoch's uploads go into the slot's secondary, which its execution runs first: nothing is submitted here.
 	const bool external = commit.external;
-	// Asked once, after the commit staged its uploads: a ticket without uploads begins, records and closes no list.
-	const bool hasUploads = external || graph.HasPendingUploads();
+	// Taken at the commit: a ticket without uploads begins, records and closes no list.
+	const bool hasUploads = external || commit.uploads.Any() || !commit.uploads.supported;
 	// An external epoch's ticket prepared behind others of its epoch has its upload lists begun here (PrepareTicket begins only
 	// the first one's); any other epoch's are begun here when it has uploads.
 	if (hasUploads && !(external ? lease.uploadSecondary : lease.upload).Recording()) {
@@ -3004,7 +3056,7 @@ void GraphHost::FinishTicket(Async& async, TicketCommit& commit, FrameTimings& t
 			? queueUploadLists[queue].list.Get() : rhi::CommandList{};
 	size_t queueCopies = 0;
 	recordedLists.clear();
-	const bool supported = !hasUploads || graph.RecordPendingUploads(m_device, commands, static_cast<uint32_t>(slot), keepAlive, recorded, recordedLists,
+	const bool supported = !hasUploads || graph.RecordTakenUploads(commit.uploads, commands, keepAlive, recorded, recordedLists,
 		queueScoped ? ticket.get() : nullptr, queueScoped ? std::span<rhi::CommandList>(async.queueLists) : std::span<rhi::CommandList>{}, &queueCopies);
 	if (hasUploads) {
 		BT_ZONE_SCOPE("ORG.Host.CloseUploadList");
@@ -3093,6 +3145,8 @@ void GraphHost::FinishTicket(Async& async, TicketCommit& commit, FrameTimings& t
 	}
 	publishQueueValues.Publish();
 	assigning.reset();
+	// Published: the frontier covers this ticket's work from here on.
+	commit.assigned.reset();
 	sequencer.unlock();
 	if (census.On())
 		census.sequencerHeldNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(

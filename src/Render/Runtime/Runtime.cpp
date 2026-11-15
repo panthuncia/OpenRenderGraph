@@ -258,11 +258,15 @@ void Runtime::Initialize() {
 	DeletionManager::GetInstance().Initialize();
 	DeletionManager::GetInstance().SetFrontier([this] { return Frontier(); }, [this](const runtime::SubmittedPoint& point) { return Reached(point); },
 		[this] { return m_assigning.load(std::memory_order_acquire) == 0; });
-	DescriptorHeapManager::GetInstance().SetFrontier([this] { return Frontier(); }, [this](const runtime::SubmittedPoint& point) { return Reached(point); });
+	// Descriptor releases and freed pinned regions wait for a settled frontier too: a submission still queued on a host's
+	// submission thread holds an AssignmentScope until its values are published (GraphHost::TicketCommit).
+	DescriptorHeapManager::GetInstance().SetFrontier([this] { return Frontier(); }, [this](const runtime::SubmittedPoint& point) { return Reached(point); },
+		[this] { return m_assigning.load(std::memory_order_acquire) == 0; });
 
 	// Freed pinned regions wait for the GPU like deferred deletions do.
 	m_arena = std::make_shared<FrameArena>();
-	m_arena->SetFrontier([this] { return Frontier(); }, [this](const runtime::SubmittedPoint& point) { return Reached(point); });
+	m_arena->SetFrontier([this] { return Frontier(); }, [this](const runtime::SubmittedPoint& point) { return Reached(point); },
+		[this] { return m_assigning.load(std::memory_order_acquire) == 0; });
 
 	m_descriptors = runtime::CreateDefaultDescriptorService();
 	m_settings = runtime::CreateDefaultRenderGraphSettingsService();

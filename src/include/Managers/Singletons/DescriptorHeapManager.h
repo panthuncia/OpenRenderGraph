@@ -80,7 +80,11 @@ public:
 	};
 	// Installs the runtime's frontier, which every release waits for. PublishQueueFenceSnapshot adds more points for work
 	// submitted outside the runtime's queues. The frontier is called under the descriptor mutation lock.
-	void SetFrontier(std::function<runtime::SubmissionFrontier()> frontier, runtime::PointReached reached);
+	// settled says whether the frontier is complete now: no values are handed out but not yet published, and no submission is
+	// still queued on a host's submission thread. A release made while it is not waits for the first processing that finds
+	// it settled, and takes the frontier then. Without it, the frontier always is complete.
+	void SetFrontier(std::function<runtime::SubmissionFrontier()> frontier, runtime::PointReached reached,
+		std::function<bool()> settled = {});
 	void PublishQueueFenceSnapshot(std::vector<QueueFenceSnapshotPoint> fenceSnapshot);
 	std::vector<QueueFenceSnapshotPoint> GetQueueFenceSnapshot() const;
 	void ProcessDeferredReleases(uint32_t frameIndex);
@@ -158,13 +162,17 @@ private:
 		std::vector<rhi::ResourcePtr> nativeResources;
         std::vector<std::shared_ptr<const void>> executionLeases;
 		std::vector<QueueFenceSnapshotPoint> requiredFences;
+		bool open = false;  // made while the frontier was not settled: requiredFences is not taken yet
 	};
 	std::vector<DeferredRelease> m_deferredReleases;
 	std::unordered_set<const Resource*> m_deferredResourcePointers;
 	std::vector<QueueFenceSnapshotPoint> m_latestQueueFenceSnapshot;
 	std::function<runtime::SubmissionFrontier()> m_frontier;
 	runtime::PointReached m_reached;
+	std::function<bool()> m_settled;
 	std::vector<QueueFenceSnapshotPoint> ReleaseFencesUnlocked() const;
+	// Takes the release's frontier now, or leaves it open while the frontier is not settled. With the lock held.
+	void CaptureFencesUnlocked(DeferredRelease& release) const;
 	mutable std::mutex m_descriptorMutationMutex;
 };
 

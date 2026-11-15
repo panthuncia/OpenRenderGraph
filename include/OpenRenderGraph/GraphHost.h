@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -11,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -624,16 +626,64 @@ public:
 
 	// A point of the GPU's progress: per queue, its timeline (shared: valid after a rebuild) and a value it reaches. Any thread.
 	struct GpuPoint {
-		std::vector<std::pair<std::shared_ptr<rhi::TimelinePtr>, uint64_t>> points;
+		using Points = std::vector<std::pair<std::shared_ptr<rhi::TimelinePtr>, uint64_t>>;
+		// With a submission thread (Desc::submissionThread), the part of the point that is still in the thread's queue. Its values
+		// are not handed out yet. The thread fills them in when it passes the point's place in its queue, then sets passed.
+		struct Pending {
+			std::atomic<bool> passed{false};
+			Points points;  // written before passed is set
+		};
+		Points points;
+		std::shared_ptr<const Pending> pending;
+		// Whether the thread has passed the pending part (true without one). Until then the point names work that is not on the
+		// device's queues yet.
+		bool Passed() const noexcept { return !pending || pending->passed.load(std::memory_order_acquire); }
 		bool Reached() const noexcept {
-			for (const auto& [timeline, value] : points)
+			if (!Passed()) return false;
+			if (pending && !Reached(pending->points)) return false;
+			return Reached(points);
+		}
+		// False on a timeout or a failed wait. A pending part is waited for first: the thread passes it without waiting for
+		// anything this thread does, so the wait ends.
+		bool Wait(uint32_t timeoutMs = UINT32_MAX) const noexcept {
+			if (pending) {
+				if (!WaitPassed(timeoutMs)) return false;
+				if (!Wait(pending->points, timeoutMs)) return false;
+			}
+			return Wait(points, timeoutMs);
+		}
+		// Every timeline value of the point, the pending part's included. Waits for the thread to pass the pending part first.
+		Points Resolve() const {
+			Points all = points;
+			if (pending) {
+				(void)WaitPassed(UINT32_MAX);
+				all.insert(all.end(), pending->points.begin(), pending->points.end());
+			}
+			return all;
+		}
+
+	private:
+		static bool Reached(const Points& a_points) noexcept {
+			for (const auto& [timeline, value] : a_points)
 				if (timeline && *timeline && (*timeline)->GetCompletedValue() < value) return false;
 			return true;
 		}
-		// False on a timeout or a failed wait.
-		bool Wait(uint32_t timeoutMs = UINT32_MAX) const noexcept {
-			for (const auto& [timeline, value] : points)
+		static bool Wait(const Points& a_points, uint32_t timeoutMs) noexcept {
+			for (const auto& [timeline, value] : a_points)
 				if (timeline && *timeline && (*timeline)->HostWait(value, timeoutMs) != rhi::Result::Ok) return false;
+			return true;
+		}
+		bool WaitPassed(uint32_t timeoutMs) const noexcept {
+			if (Passed()) return true;
+			if (timeoutMs == UINT32_MAX) {
+				while (!pending->passed.load(std::memory_order_acquire)) pending->passed.wait(false, std::memory_order_acquire);
+				return true;
+			}
+			const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+			while (!pending->passed.load(std::memory_order_acquire)) {
+				if (std::chrono::steady_clock::now() >= until) return false;
+				std::this_thread::yield();
+			}
 			return true;
 		}
 	};
@@ -642,8 +692,11 @@ public:
 	// boundary) may hold them until its next flush. So a producer whose signal later work of the same frame waits for must not
 	// wait for this point: the work it names may be queued behind that later work, or flushed only once the frame ends. It
 	// waits for SealedPoint instead.
+	// With a submission thread, a point taken while tickets are still queued there has a pending part (GpuPoint::Pending): it is not
+	// reached, and its waits wait, until the thread has submitted them.
 	GpuPoint SubmittedPoint() const;
 	// Submitting thread, at a frame boundary: everything submitted so far is on the device's queues (the host flushed its stream).
+	// With a submission thread, it drains the thread first, so the sealed point is complete.
 	// Seals SubmittedPoint's current value as SealedPoint, and counts a frame boundary (Seals): a run is waited for only once a seal
 	// came after it. Also trims the frame arena's idle chunks.
 	void SealSubmitted();
@@ -930,6 +983,8 @@ private:
 	// The submission thread (Desc::submissionThread): its queue, made with the host and stopped first by its destructor.
 	struct SubmitQueue;
 	std::unique_ptr<SubmitQueue> m_submitQueue;
+	// SubmittedPoint's values now: every queue's last value handed out.
+	GpuPoint SubmittedPointNow() const;
 	// The thread's counts (FinishTicket's stats there), added to TakeAsyncStats.
 	std::mutex m_threadStatsMutex;
 	AsyncStats m_threadStats{};

@@ -263,6 +263,11 @@ size_t UploadManager::TakeRecordedUploads(std::vector<rhi::CommandList>& out, ui
 	return m_uploadInstance ? m_uploadInstance->TakeRecordedUploads(out, frameIndex) : 0;
 }
 
+bool UploadManager::TakeStagedUploads(uint32_t frameIndex, std::vector<std::shared_ptr<org::runtime::StagedUploadBatch>>& out)
+{
+	return m_uploadInstance ? m_uploadInstance->TakeStagedUploads(frameIndex, out) : true;
+}
+
 bool UploadManager::TakeRecordedUploadsWithDestinations(std::vector<rhi::CommandList>& out, uint32_t frameIndex,
 	std::vector<rhi::ResourceHandle>& destinations)
 {

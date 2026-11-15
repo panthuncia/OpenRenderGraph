@@ -93,6 +93,9 @@ public:
         return Manager().TakeRecordedUploads(out, frameIndex);
     }
 
+    bool TakeStagedUploads(uint32_t frameIndex, std::vector<std::shared_ptr<StagedUploadBatch>>& out) override {
+        return Manager().TakeStagedUploads(frameIndex, out);
+    }
     bool TakeRecordedUploadsWithDestinations(std::vector<rhi::CommandList>& out, uint32_t frameIndex,
         std::vector<rhi::ResourceHandle>& destinations) override {
         return Manager().TakeRecordedUploadsWithDestinations(out, frameIndex, destinations);

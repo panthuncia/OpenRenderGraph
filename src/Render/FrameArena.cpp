@@ -57,10 +57,12 @@ FrameArena::~FrameArena() {
 	m_chunks.clear();
 }
 
-void FrameArena::SetFrontier(std::function<runtime::SubmissionFrontier()> frontier, runtime::PointReached reached) {
+void FrameArena::SetFrontier(std::function<runtime::SubmissionFrontier()> frontier, runtime::PointReached reached,
+	std::function<bool()> settled) {
 	std::scoped_lock lock(m_mutex);
 	m_frontier = std::move(frontier);
 	m_reached = std::move(reached);
+	m_settled = std::move(settled);
 	if (!m_frontier) RetirePendingLocked(true);
 }
 
@@ -167,6 +169,12 @@ void FrameArena::FreePinned(const Region& region) {
 		FreeLocked(*chunk, region.size);
 		return;
 	}
+	// A submission still queued on a host's submission thread may read the region. Its values are not handed out yet, so the
+	// frontier now would miss it: the free waits for a frontier taken once nothing is queued.
+	if (m_settled && !m_settled()) {
+		m_pending.push_back({chunk, region.size, {}, true});
+		return;
+	}
 	m_pending.push_back({chunk, region.size, m_frontier()});
 }
 
@@ -184,7 +192,13 @@ void FrameArena::ReleaseRun(uint32_t lease, uint32_t generation) {
 }
 
 void FrameArena::RetirePendingLocked(bool all) {
+	const bool settled = !m_settled || m_settled();
 	std::erase_if(m_pending, [&](PendingFree& pending) {
+		if (!all && pending.open) {
+			if (!settled || !m_frontier) return false;
+			pending.frontier = m_frontier();
+			pending.open = false;
+		}
 		if (!all && !runtime::Reached(pending.frontier, m_reached)) return false;
 		FreeLocked(*pending.chunk, pending.size);
 		return true;

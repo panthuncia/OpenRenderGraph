@@ -200,7 +200,7 @@ void DescriptorHeapManager::RetireDescriptorSlots(std::vector<std::pair<std::sha
 
     std::scoped_lock lock(m_descriptorMutationMutex);
     DeferredRelease release{};
-    release.requiredFences = ReleaseFencesUnlocked();
+    CaptureFencesUnlocked(release);
     release.descriptorSlots = std::move(slots);
     m_deferredReleases.push_back(std::move(release));
 }
@@ -215,7 +215,7 @@ void DescriptorHeapManager::RetireResource(std::shared_ptr<Resource> resource) {
         return;
     }
     DeferredRelease release{};
-    release.requiredFences = ReleaseFencesUnlocked();
+    CaptureFencesUnlocked(release);
     release.resources.push_back(std::move(resource));
     m_deferredReleases.push_back(std::move(release));
 }
@@ -227,7 +227,7 @@ void DescriptorHeapManager::RetireNativeResource(rhi::ResourcePtr resource) {
 
     std::scoped_lock lock(m_descriptorMutationMutex);
     DeferredRelease release{};
-    release.requiredFences = ReleaseFencesUnlocked();
+    CaptureFencesUnlocked(release);
     release.nativeResources.push_back(std::move(resource));
     m_deferredReleases.push_back(std::move(release));
 }
@@ -239,15 +239,27 @@ void DescriptorHeapManager::RetireBufferBacking(std::unique_ptr<GpuBufferBacking
 
     std::scoped_lock lock(m_descriptorMutationMutex);
     DeferredRelease release{};
-    release.requiredFences = ReleaseFencesUnlocked();
+    CaptureFencesUnlocked(release);
     release.bufferBackings.push_back(std::move(backing));
     m_deferredReleases.push_back(std::move(release));
 }
 
-void DescriptorHeapManager::SetFrontier(std::function<runtime::SubmissionFrontier()> frontier, runtime::PointReached reached) {
+void DescriptorHeapManager::SetFrontier(std::function<runtime::SubmissionFrontier()> frontier, runtime::PointReached reached,
+    std::function<bool()> settled) {
     std::scoped_lock lock(m_descriptorMutationMutex);
     m_frontier = std::move(frontier);
     m_reached = std::move(reached);
+    m_settled = std::move(settled);
+}
+
+void DescriptorHeapManager::CaptureFencesUnlocked(DeferredRelease& release) const {
+    // A submission still queued on a host's submission thread may use what is released here. Its values are not handed out
+    // yet, so the frontier now would miss it. The release waits for a frontier taken once nothing is queued.
+    if (m_settled && !m_settled()) {
+        release.open = true;
+        return;
+    }
+    release.requiredFences = ReleaseFencesUnlocked();
 }
 
 std::vector<DescriptorHeapManager::QueueFenceSnapshotPoint> DescriptorHeapManager::ReleaseFencesUnlocked() const {
@@ -298,7 +310,7 @@ void DescriptorHeapManager::RetireExecutionLease(std::shared_ptr<const void> lea
     if (!lease) return;
     std::scoped_lock lock(m_descriptorMutationMutex);
     DeferredRelease release{};
-    release.requiredFences = ReleaseFencesUnlocked();
+    CaptureFencesUnlocked(release);
     release.executionLeases.push_back(std::move(lease));
     m_deferredReleases.push_back(std::move(release));
 }
@@ -329,7 +341,15 @@ std::shared_ptr<void> DescriptorHeapManager::ProcessDeferredReleasesElsewhere() 
     {
         std::scoped_lock lock(m_descriptorMutationMutex);
 
+        // Open releases take their frontier now, when it is settled.
+        if (!m_settled || m_settled())
+            for (auto& release : m_deferredReleases)
+                if (release.open) {
+                    release.requiredFences = ReleaseFencesUnlocked();
+                    release.open = false;
+                }
         auto releaseIsSafe = [this](DeferredRelease& release) {
+            if (release.open) return false;
             for (auto& point : release.requiredFences) {
                 if (!point.timeline.IsValid()) {
                     return false;
@@ -389,7 +409,7 @@ DescriptorHeapManager::DeferredReleaseStats DescriptorHeapManager::GetDeferredRe
             }
         }
 
-        bool blocked = false;
+        bool blocked = release.open;
         for (auto& point : release.requiredFences) {
             if (!point.timeline.IsValid()) {
                 stats.invalidTimelineCount++;
@@ -1033,7 +1053,7 @@ void DescriptorHeapManager::RetireDescriptorSlotWithOwner(rhi::DescriptorSlot sl
 		const auto handle = heap->GetHeap().GetHandle();
 		if (handle.index != slot.heap.index || handle.generation != slot.heap.generation) continue;
 		DeferredRelease release{};
-		release.requiredFences = ReleaseFencesUnlocked();
+		CaptureFencesUnlocked(release);
 		release.descriptorSlots.emplace_back(heap, slot.index);
 		release.descriptorOwner = std::move(owner);
 		m_deferredReleases.push_back(std::move(release));
