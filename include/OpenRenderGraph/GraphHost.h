@@ -128,6 +128,10 @@ public:
 		// ticket's first queue submission joins the one the ticket before it left held, when both are on one queue and it waits
 		// for nothing new (RenderGraph::SubmitCarry). Only what is already queued is grouped: the thread never waits for more.
 		bool mergeTicketSubmissions = false;
+		// With a submission thread: SealSubmitted does not drain the thread. It queues the seal behind the tickets queued so far,
+		// and the thread passes it in order. Until then SealedPoint has a pending part (GpuPoint::Pending), and Seals counts the
+		// seal already. Off: SealSubmitted drains the thread first.
+		bool queuedSeals = false;
 	};
 
 	using ExtensionFactory = std::function<std::unique_ptr<RenderGraph::IRenderGraphExtension>()>;
@@ -700,15 +704,23 @@ public:
 	// reached, and its waits wait, until the thread has submitted them.
 	GpuPoint SubmittedPoint() const;
 	// Submitting thread, at a frame boundary: everything submitted so far is on the device's queues (the host flushed its stream).
-	// With a submission thread, it drains the thread first, so the sealed point is complete.
+	// With a submission thread, it drains the thread first, so the sealed point is complete. With Desc::queuedSeals it queues the
+	// seal on the thread instead, behind the tickets queued so far.
 	// Seals SubmittedPoint's current value as SealedPoint, and counts a frame boundary (Seals): a run is waited for only once a seal
 	// came after it. Also trims the frame arena's idle chunks.
 	void SealSubmitted();
-	// Any thread: the SealSubmitted calls so far.
-	uint64_t Seals() const noexcept { return m_seals.load(std::memory_order_acquire); }
+	// Any thread: the SealSubmitted calls so far, queued seals included.
+	uint64_t Seals() const noexcept { return m_sealsPushed.load(std::memory_order_acquire); }
 	// Any thread: the point SealSubmitted last captured (none before the first). It names only work already on the device, and
 	// none of the current frame's, so a mid-frame producer may wait for it whatever the frame's later work waits for.
+	// With a queued seal the point has a pending part until the thread passes the seal. Its waits wait for the thread first.
 	GpuPoint SealedPoint() const;
+	// Any thread: the last seal the thread has passed. It never has a pending part, so its values can be read at once. It may be
+	// a frame older than SealedPoint. Use it to ask whether a point is sealed, not to wait for the frame boundary.
+	GpuPoint PassedSealedPoint() const;
+	// Render owner: runs a_closure on the submission thread, in order after everything queued so far. Without a submission thread
+	// it runs at once on the calling thread. A closure that throws is logged. Waits for room when the queue is full.
+	void EnqueueOnSubmitThread(std::function<void()> a_closure);
 	// Any thread, for a failure message only: the host's thread's state (each async epoch's pause and ticket, the run leases in
 	// flight and what each waits for, the queued requests, the wake), read racily.
 	// a_pollTimelines false: no RHI call and no blocking lock. Use it where the caller may hold an RHI lock, such as inside a
@@ -914,7 +926,13 @@ private:
 	uint64_t m_frameWaitValue = 0;
 	mutable std::mutex m_sealedMutex;  // SealedPoint is read on other threads
 	GpuPoint m_sealed;
-	std::atomic<uint64_t> m_seals{0};  // SealSubmitted calls (Seals); the host's thread reads it
+	GpuPoint m_sealedPassed;  // the last seal the submission thread passed (PassedSealedPoint)
+	// Seals the submission thread has passed. The lease logic reads it: a run is flushed once a seal after it was passed.
+	std::atomic<uint64_t> m_seals{0};
+	// SealSubmitted calls, queued seals included (Seals). The render owner's commits take it: the seals queued before them.
+	std::atomic<uint64_t> m_sealsPushed{0};
+	// Where a seal is passed: on the submission thread for a queued seal (a_marker set), else on the calling thread.
+	void PassSeal(const std::shared_ptr<GpuPoint::Pending>& a_marker);
 	uint64_t m_buildGeneration = 0;
 	std::unique_ptr<Async> m_async;
 	EpochFailedCallback m_epochFailed;

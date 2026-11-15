@@ -122,8 +122,9 @@ struct GraphHost::Async {
 	// Host thread, per epoch index: let go of (Detach) until its instance is attached again; and its instance's build generation.
 	std::vector<uint8_t> paused;
 	std::vector<uint64_t> generation;
-	// The host's seal count (GraphHost::m_seals), written by the render thread.
+	// The host's seal counts: the seals passed (GraphHost::m_seals) and the seals made, queued ones included (m_sealsPushed).
 	const std::atomic<uint64_t>* seals = nullptr;
+	const std::atomic<uint64_t>* sealsPushed = nullptr;
 	// A revision-driven epoch's published copies (Desc::framesInFlight).
 	uint32_t copyCount = 1;
 	// Per epoch index: the seal count at which its copies were busy (every one an unsealed run's), or kNoSeal. Its next ticket is
@@ -343,8 +344,10 @@ struct GraphHost::Async {
 			// Only this epoch failed: no ticket is coming until its graph is built again.
 			if (epochFailed[index].load(std::memory_order_acquire)) throw EpochFailedError(epochs[index], epochErrors[index]);
 			// Its copies are all busy with unsealed runs: no ticket is coming before the next seal, which this thread makes. Once the
-			// count has moved past the one they were busy at, the host's thread prepares one (the seal woke it).
-			if (const auto busy = copiesBusyAt[index].load(std::memory_order_acquire); busy != kNoSeal && busy == seals->load(std::memory_order_acquire))
+			// count has moved past the one they were busy at, the host's thread prepares one (the seal woke it). A seal this thread
+			// queued already is passed by the submission thread without this thread, so then the wait ends.
+			if (const auto busy = copiesBusyAt[index].load(std::memory_order_acquire);
+				busy != kNoSeal && busy == seals->load(std::memory_order_acquire) && busy == sealsPushed->load(std::memory_order_acquire))
 				throw EpochCopiesBusyError(epochs[index], copyCount);
 			ticketWake.wait(seen, std::memory_order_acquire);
 		}
@@ -1300,19 +1303,51 @@ GraphHost::GpuPoint GraphHost::SubmittedPointNow() const {
 }
 
 void GraphHost::SealSubmitted() {
-	// Sealed means on the device's queues: what the submission thread still holds goes first.
-	DrainSubmissions("a seal (the frame's end)");
+	auto* queue = m_submitQueue.get();
+	if (queue && m_desc.queuedSeals && std::this_thread::get_id() != queue->threadId) {
+		// The seal goes behind the tickets queued so far. Until the thread passes it, the sealed point is that pending part: its
+		// waits wait for the thread first, which never waits for this thread.
+		auto marker = std::make_shared<GpuPoint::Pending>();
+		{
+			std::scoped_lock lock(m_sealedMutex);
+			m_sealed = {};
+			m_sealed.pending = marker;
+		}
+		// Counted now: the commits after this one are behind the seal in the queue.
+		m_sealsPushed.fetch_add(1, std::memory_order_seq_cst);
+		EnqueueOnSubmitThread([this, marker] { PassSeal(marker); });
+	} else {
+		// Sealed means on the device's queues: what the submission thread still holds goes first.
+		DrainSubmissions("a seal (the frame's end)");
+		m_sealsPushed.fetch_add(1, std::memory_order_seq_cst);
+		PassSeal(nullptr);
+	}
+	// Once a frame: chunks the runs in flight have not needed for a while go.
+	if (const auto& arena = m_desc.runtime->Arena()) arena->Trim();
+}
+
+void GraphHost::PassSeal(const std::shared_ptr<GpuPoint::Pending>& a_marker) {
 	auto point = SubmittedPointNow();
+	if (a_marker) {
+		a_marker->points = point.points;
+		a_marker->passed.store(true, std::memory_order_release);
+		a_marker->passed.notify_all();
+	}
 	{
 		std::scoped_lock lock(m_sealedMutex);
-		m_sealed = std::move(point);
+		m_sealedPassed = point;
+		// A later seal may be queued already. Then the sealed point stays that one.
+		if (!a_marker || m_sealed.pending == a_marker) m_sealed = std::move(point);
 	}
 	m_seals.fetch_add(1, std::memory_order_seq_cst);
 	// An epoch whose copies were busy with unsealed runs can take one again: the host's thread prepares its ticket now. The flag is
 	// set before the host's thread reads the seals again, so either it sees this count or this sees its flag.
 	if (m_async && m_async->anyCopiesBusy.exchange(false, std::memory_order_seq_cst)) (void)m_async->completionWake->Notify();
-	// Once a frame: chunks the runs in flight have not needed for a while go.
-	if (const auto& arena = m_desc.runtime->Arena()) arena->Trim();
+}
+
+GraphHost::GpuPoint GraphHost::PassedSealedPoint() const {
+	std::scoped_lock lock(m_sealedMutex);
+	return m_sealedPassed;
 }
 
 GraphHost::GpuPoint GraphHost::SealedPoint() const {
@@ -1507,7 +1542,7 @@ void GraphHost::ExecuteFrame(const IHostExecutionData* hostData, const FrameCall
 		}
 		lease.hostFrame = m_frameNumber;
 		lease.submission = ++m_submissions;
-		lease.seal = m_seals.load(std::memory_order_relaxed);
+		lease.seal = m_sealsPushed.load(std::memory_order_relaxed);
 		if (heldResources) {
 			const auto& owner = m_uncertainExecutionOwners.back();
 			if (owner && !lease.points.empty()) {
@@ -1638,6 +1673,7 @@ void GraphHost::StartAsync() {
 	}
 	async->copyCount = (std::max)(m_desc.framesInFlight, 1u);
 	async->seals = &m_seals;
+	async->sealsPushed = &m_sealsPushed;
 	async->copiesBusyAt = std::make_unique<std::atomic<uint64_t>[]>(async->epochs.size());
 	for (uint32_t index = 0; index < async->epochs.size(); ++index) async->copiesBusyAt[index].store(Async::kNoSeal, std::memory_order_relaxed);
 	async->copiesBusyLogged.assign(async->epochs.size(), 0);
@@ -2831,6 +2867,31 @@ void GraphHost::EnqueueTicket(Async& async, TicketCommit commit) {
 	queue.work.notify_one();
 }
 
+void GraphHost::EnqueueOnSubmitThread(std::function<void()> a_closure) {
+	auto* queue = m_submitQueue.get();
+	if (!queue) {
+		a_closure();
+		return;
+	}
+	SubmitQueue::Entry entry;
+	entry.kind = SubmitQueue::Entry::Kind::Closure;
+	entry.closure = std::move(a_closure);
+	std::unique_lock lock(queue->mutex);
+	if (queue->entries.size() >= SubmitQueue::kCapacity) {
+		// As for a ticket (EnqueueTicket): the thread never waits for this thread, so the wait ends.
+		BT_ZONE_SCOPE("ORG.Host.SubmitBackpressure");
+		const auto start = std::chrono::steady_clock::now();
+		queue->progress.wait(lock, [&] { return queue->entries.size() < SubmitQueue::kCapacity; });
+		++queue->stats.backpressureWaits;
+		queue->stats.backpressureUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+	}
+	queue->entries.push_back(std::move(entry));
+	++queue->pushed;
+	queue->stats.peakDepth = (std::max)(queue->stats.peakDepth, queue->pushed - queue->passed);
+	lock.unlock();
+	queue->work.notify_one();
+}
+
 void GraphHost::DrainSubmissions(const char* why) {
 	auto* queue = m_submitQueue.get();
 	if (!queue) return;
@@ -2996,8 +3057,8 @@ GraphHost::TicketCommit GraphHost::CommitTicket(Async& async, uint32_t index, st
 	commit.retired = std::move(retired);
 	commit.resourceOwner = std::move(resourceOwner);
 	commit.number = ++m_submissions;
-	// The frame boundaries before it: a later seal flushed it (a published copy waits for its run only then).
-	commit.seal = m_seals.load(std::memory_order_relaxed);
+	// The frame boundaries before it, queued seals included: a later seal flushed it (a published copy waits for its run only then).
+	commit.seal = m_sealsPushed.load(std::memory_order_relaxed);
 	commit.frameWait = m_frameWaitValue;
 	// What the commit queued goes with this ticket, wherever it is finished.
 	commit.uploads = graph.TakePendingUploads(m_device, slot);
