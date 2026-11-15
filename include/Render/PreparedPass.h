@@ -814,6 +814,10 @@ public:
     bool SkipsAgain(const RecordingContext& context) const {
         return m_storage && m_storage->state.load(std::memory_order_acquire) == LifecycleState::Recorded && m_storage->SkipsAtExecution(context);
     }
+    // A pass its host turned off for this execution (RenderGraphPass::SetSkipWhen, asked at preparation). Its recorder records
+    // only the barriers around it and calls RecordNothing instead of Record, whether it is recorded ahead or at execution.
+    void MarkSkippedAhead() const noexcept { if (m_storage) m_storage->skippedAhead = true; }
+    bool SkippedAhead() const noexcept { return m_storage && m_storage->skippedAhead; }
     // Whether the pass's commands for a run depend on the run only through SkipsAtExecution's answer (a typed pass's
     // kRecordKeyedBySkip). Then a list recorded for one answer can be submitted again for a run with the same answer.
     bool KeyedBySkip() const noexcept { return m_storage && m_storage->KeyedBySkip(); }
@@ -888,6 +892,7 @@ private:
         std::vector<ExternalTimelinePoint> externalSignals;
         mutable std::string debugName;
         bool workerSafe = false;
+        mutable bool skippedAhead = false;
     };
     template<class Data> struct Storage final : StorageBase {
         Storage(Data value, void (*fn)(const Data&, RecordingContext&), void (*onSubmitted)(const Data&) = nullptr)

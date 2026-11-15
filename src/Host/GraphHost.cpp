@@ -135,9 +135,13 @@ struct GraphHost::Async {
 	std::atomic<bool> anyCopiesBusy{false};
 	std::vector<uint8_t> copiesBusyLogged;
 	std::atomic<uint64_t> copiesBusy{0}, copyWaits{0};
+	// Per epoch index: the published copy its next ticket takes (GraphHost::SetEpochCopy), or RunRef::kNoCopy to take any. The
+	// submitting thread writes it, the host's thread reads it when it prepares the epoch's ticket.
+	std::unique_ptr<std::atomic<uint32_t>[]> pinnedCopy;
 	// Recording requests taken from the host's queue (RecordingQueue), by the host's thread, in posting order.
 	struct RecordingRequest {
 		uint32_t epochIndex = 0;
+		uint32_t copy = RunRef::kNoCopy;  // the one copy to record, or every copy
 		std::shared_ptr<const IHostExecutionData> hostData;
 		GraphHost::EpochRecordingCallback done;
 		std::shared_ptr<GraphHost::EpochRecording> result;
@@ -420,6 +424,7 @@ struct GraphHost::RecordingQueue {
 		uint32_t epoch = 0;
 		std::shared_ptr<const IHostExecutionData> hostData;
 		GraphHost::EpochRecordingCallback done;
+		uint32_t copy = RunRef::kNoCopy;  // the one copy to record, or every copy
 		Request* next = nullptr;
 	};
 	std::atomic<Request*> head{nullptr};
@@ -1014,7 +1019,7 @@ GraphHost::BuildInputs GraphHost::SnapshotBuildInputs(size_t index) {
 	inputs.timelines = m_timelines;
 	inputs.externalEpochs = m_externalEpochs;
 	inputs.inlineAtExecution = m_inlineAtExecution;
-	if (m_desc.sharedAliasArena) inputs.aliasArena = m_aliasArena;
+	if (m_desc.sharedAliasArena && std::ranges::find(m_privateAliasEpochs, instance.epoch) == m_privateAliasEpochs.end()) inputs.aliasArena = m_aliasArena;
 	inputs.frameWaitTimeline = m_frameWaitTimeline;
 	inputs.gpuPassRangeBegin = m_gpuPassRangeBegin;
 	inputs.gpuPassRangeEnd = m_gpuPassRangeEnd;
@@ -1052,7 +1057,7 @@ std::unique_ptr<RenderGraph> GraphHost::MakeGraph(const BuildInputs& inputs, boo
 		graph->GetMemorySnapshotProvider().SetProvider(memory::CreateECSMemorySnapshotProvider());
 		graph->CompileStructural();
 		if (inputs.epoch != persistent::AllEpochs) graph->SetPersistentEpochOrder({inputs.epoch});
-		graph->SetPersistentClosedExecutions(m_desc.closedExecutions);
+		graph->SetPersistentClosedExecutions(ClosedEpoch(inputs.epoch));
 		graph->SetPersistentExternalHomeStates(m_desc.externalHomeStates);
 		if (inputs.aliasArena) graph->SetPersistentAliasArena(inputs.aliasArena);
 		graph->SetPersistentRecordingReuse(m_desc.reuseRecordings);
@@ -1376,6 +1381,14 @@ void GraphHost::NoteSegmentTicket(uint32_t a_segment, uint32_t a_epoch, const Re
 		census.open = {1469598103934665603ull, 1469598103934665603ull, 1469598103934665603ull, 0, 0, true};
 	}
 	const auto& key = a_key;
+	if (a_epoch < census.stats.barriers.size()) {
+		std::scoped_lock lock(census.statsMutex);
+		auto& barriers = census.stats.barriers[a_epoch];
+		++barriers.tickets;
+		barriers.entry += a_key.entryBarriers;
+		barriers.body += a_key.bodyBarriers;
+		barriers.full += a_key.bodyFullBarriers;
+	}
 	if (a_epoch < census.epochRecordings.size()) {
 		auto& recent = census.epochRecordings[a_epoch];
 		const auto same = std::ranges::find(recent, key.recordings);
@@ -1679,12 +1692,45 @@ void GraphHost::SetAsyncEpochs(std::vector<uint32_t> epochs, std::vector<uint32_
 	if (!revisionEpochs.empty() && !m_desc.reuseRecordings)
 		throw std::logic_error("Revision-driven epochs need Desc::reuseRecordings (replayable recordings)");
 	m_revisionEpochs = std::move(revisionEpochs);
+	// Their copies' leases are made now, on the owner thread before the host's thread starts. EpochCopyRun then reads them on any
+	// thread, and nothing adds to the list afterwards.
+	for (const auto epoch : m_revisionEpochs) (void)CopyLeases(epoch);
 	if (m_asyncEpochs.empty()) {
 		m_recordingQueue->accepting.store(false, std::memory_order_release);
 		return;
 	}
 	BuildDueInstances(false);
 	StartAsync();
+}
+
+void GraphHost::SetClosedEpochs(std::vector<uint32_t> epochs) {
+	m_closedEpochs = std::move(epochs);
+}
+
+void GraphHost::SetPrivateAliasEpochs(std::vector<uint32_t> epochs) {
+	std::scoped_lock lock(m_configMutex);
+	m_privateAliasEpochs = std::move(epochs);
+}
+
+bool GraphHost::ClosedEpoch(uint32_t epoch) const noexcept {
+	return m_desc.closedExecutions || std::ranges::find(m_closedEpochs, epoch) != m_closedEpochs.end();
+}
+
+void GraphHost::SetEpochCopy(uint32_t epoch, uint32_t copy) {
+	if (!m_async) return;
+	auto& async = *m_async;
+	const auto index = async.IndexOf(epoch);
+	if (!async.revisionDriven[index]) throw std::invalid_argument("SetEpochCopy: epoch " + std::to_string(epoch) + " is not revision-driven");
+	async.pinnedCopy[index].store(copy % async.copyCount, std::memory_order_release);
+}
+
+RunRef GraphHost::EpochCopyRun(uint32_t epoch, uint32_t copy) const {
+	for (const auto& [owner, copies] : m_copyLeases)
+		if (owner == epoch) {
+			if (copy >= copies.size()) break;
+			return copies[copy]->Ref();
+		}
+	throw std::invalid_argument("EpochCopyRun: epoch " + std::to_string(epoch) + " has no published copy " + std::to_string(copy));
 }
 
 void GraphHost::SetEpochTicketsAhead(uint32_t epoch, uint32_t most) {
@@ -1775,6 +1821,8 @@ void GraphHost::StartAsync() {
 	async->copiesBusyAt = std::make_unique<std::atomic<uint64_t>[]>(async->epochs.size());
 	for (uint32_t index = 0; index < async->epochs.size(); ++index) async->copiesBusyAt[index].store(Async::kNoSeal, std::memory_order_relaxed);
 	async->copiesBusyLogged.assign(async->epochs.size(), 0);
+	async->pinnedCopy = std::make_unique<std::atomic<uint32_t>[]>(async->epochs.size());
+	for (uint32_t index = 0; index < async->epochs.size(); ++index) async->pinnedCopy[index].store(RunRef::kNoCopy, std::memory_order_relaxed);
 	async->queues = std::make_unique<Async::TicketQueue[]>(async->epochs.size());
 	async->held.assign(async->epochs.size(), {});
 	async->inHand.assign(async->epochs.size(), 0);
@@ -1971,6 +2019,7 @@ void GraphHost::StartAsync() {
 					}
 					auto request = std::make_unique<Async::RecordingRequest>();
 					request->epochIndex = epochIndex;
+					request->copy = node->copy;
 					request->hostData = std::move(node->hostData);
 					request->done = std::move(node->done);
 					state->pendingRequests.push_back(std::move(request));
@@ -2245,12 +2294,12 @@ bool GraphHost::ReleaseHeldEpochTicket(uint32_t epoch) {
 	return true;
 }
 
-bool GraphHost::RequestEpochRecording(uint32_t epoch, std::shared_ptr<const IHostExecutionData> hostData, EpochRecordingCallback done) {
+bool GraphHost::RequestEpochRecording(uint32_t epoch, std::shared_ptr<const IHostExecutionData> hostData, EpochRecordingCallback done, uint32_t copy) {
 	// The host's queue alone (never m_async, which a build moves out from under any other thread): the host's thread validates the
 	// epoch when it takes it, and a build drops what it did not take (StopAsync, an epoch's Detach), each completed.
 	auto& queue = *m_recordingQueue;
 	if (!done || !queue.accepting.load(std::memory_order_acquire)) return false;
-	auto* node = new RecordingQueue::Request{epoch, std::move(hostData), std::move(done), nullptr};
+	auto* node = new RecordingQueue::Request{epoch, std::move(hostData), std::move(done), copy, nullptr};
 	auto* head = queue.head.load(std::memory_order_relaxed);
 	do node->next = head;
 	while (!queue.head.compare_exchange_weak(head, node, std::memory_order_release, std::memory_order_relaxed));
@@ -2286,6 +2335,11 @@ bool GraphHost::AdvanceRecordingRequests(Async& state) {
 				request.result->revision = request.hostData;
 				request.result->buildGeneration = state.generation[request.epochIndex];
 				request.recorded.assign(state.copyCount, 0);
+				// One copy only: the others count as done and stay empty.
+				if (request.copy != RunRef::kNoCopy) {
+					std::fill(request.recorded.begin(), request.recorded.end(), uint8_t{1});
+					request.recorded[request.copy % state.copyCount] = 0;
+				}
 			}
 			auto& copies = CopyLeases(request.result->epoch);
 			for (uint32_t copy = 0; copy < request.recorded.size(); ++copy) {
@@ -2358,7 +2412,10 @@ GraphHost::RunLease* GraphHost::TakeCopyLease(Async& state, uint32_t epochIndex)
 	// device itself, so then every run may be waited for.
 	RunLease* idle = nullptr;
 	RunLease* waitable = nullptr;
+	// A pinned epoch (SetEpochCopy) takes the copy its caller named, under the same rules: idle, or its last run waitable.
+	const uint32_t pinned = state.pinnedCopy[epochIndex].load(std::memory_order_acquire);
 	for (auto* copy : copies) {
+		if (pinned < copies.size() && copy != copies[pinned]) continue;
 		if (copy->state == RunLease::State::Open) continue;
 		if (copy->state == RunLease::State::Submitted && PointsReached(copy->points)) RetireLease(*copy, &state);
 		if (copy->state == RunLease::State::Free) {
@@ -2608,8 +2665,10 @@ void GraphHost::FailAsyncEpoch(Async& state, uint32_t epochIndex, std::string er
 
 void GraphHost::AddRevisionCandidate(Async& state, uint32_t epochIndex, RenderGraph::PersistentTicket& ticket, const EpochRecording& recording) {
 	const auto run = RenderGraph::PersistentTicketRun(ticket);
-	if (!run.Published() || run.copy >= recording.copies.size() || !recording.copies[run.copy])
+	if (!run.Published() || run.copy >= recording.copies.size())
 		throw std::logic_error("A revision recording has no copy for its epoch's ticket");
+	// A recording of some copies only (RequestEpochRecording's copy) is no candidate for a run of another copy.
+	if (!recording.copies[run.copy]) return;
 	m_instances[state.instanceOf[epochIndex]].graph->AddPersistentTicketCandidate(ticket, recording.copies[run.copy]);
 }
 
@@ -2631,6 +2690,10 @@ bool GraphHost::CanUseEpochRecording(const EpochRecording& recording, std::strin
 void GraphHost::NoteNewVersions() noexcept {
 	// After the version's publication (release), so a preparation that reads the new value resolves the new version.
 	if (m_async) m_async->backingVersion.fetch_add(1, std::memory_order_acq_rel);
+}
+
+bool GraphHost::EpochRecordingVersionsCurrent(const EpochRecording& recording, uint32_t copy) const noexcept {
+	return copy < recording.copies.size() && recording.copies[copy] && RenderGraph::PersistentRecordingVersionsCurrent(*recording.copies[copy]);
 }
 
 void GraphHost::StopAsync() {
@@ -2783,6 +2846,23 @@ void GraphHost::SubmitEpoch(uint32_t epoch, const FrameCallback& beforeSubmit, s
 	if (!ticket) {
 		++m_asyncStats.waited;
 		ticket = async.WaitTicket(index);
+	}
+	// A pinned epoch (SetEpochCopy): a ticket of another copy goes back, and one for the named copy takes its place. Then the
+	// next ticket is prepared for the copy after it, which is what a caller that names its frame slots asks for next.
+	if (async.revisionDriven[index]) {
+		const uint32_t pinned = async.pinnedCopy[index].load(std::memory_order_acquire);
+		if (pinned != RunRef::kNoCopy) {
+			if (RenderGraph::PersistentTicketRun(*ticket).copy != pinned) {
+				++m_asyncStats.copyRepins;
+				Async::Message discard;
+				discard.kind = Async::Message::Kind::Discard;
+				discard.epochIndex = index;
+				discard.ticket = std::move(ticket);
+				if (!async.Post(discard)) async.ThrowIfFailed();
+				ticket = async.WaitTicket(index);
+			}
+			async.pinnedCopy[index].store((pinned + 1) % async.copyCount, std::memory_order_release);
+		}
 	}
 	lap(m_lastTimings.ticketWaitUs);
 	if (m_submitQueue && !m_instances[instance].graph->IsExternalPersistentEpoch(epoch)) {
@@ -3170,6 +3250,8 @@ GraphHost::TicketCommit GraphHost::CommitTicket(Async& async, uint32_t index, st
 void GraphHost::FinishTicket(Async& async, TicketCommit& commit, FrameTimings& timings, AsyncStats& stats, RenderGraph::SubmitCarry* carry,
 	bool carryOut, DeferredPosts* posts) {
 	BT_ZONE_SCOPE("ORG.Host.FinishTicket");
+	// The epoch, so a capture can attribute the submission thread's time to it.
+	BT_ZONE_VALUE(async.epochs[commit.index]);
 	using Census = diagnostics::SubmissionCensus;
 	auto& census = diagnostics::Census();
 	census.BeginTicket();

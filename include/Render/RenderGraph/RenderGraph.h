@@ -344,6 +344,8 @@ private:
 	static std::shared_ptr<const PersistentRecording> PersistentTicketRecording(const PersistentTicket& ticket) noexcept;
 	// Whether it may be submitted again and again (every pass replayable, recorded for resubmission).
 	static bool PersistentRecordingReplayable(const PersistentRecording& recording) noexcept;
+	// Any thread: whether every versioned slot it bound still has the version it was recorded with as its current one.
+	static bool PersistentRecordingVersionsCurrent(const PersistentRecording& recording) noexcept;
 	// Submitting thread: binds a recording made ahead (PreparePersistentTicket for the same epoch and slot) to an admission-only
 	// ticket. It must have been recorded for the ticket's publication, bindings, descriptor heaps and hostTag (the host's backing
 	// version now); otherwise false, with why, and the ticket unchanged. A revision ticket (PrepareRevisionTicket) instead takes the
@@ -434,6 +436,9 @@ private:
 		uint64_t recordings = 0;
 		uint64_t plans = 0;
 		bool planned = true;
+		// Barriers (diagnostics): the entry barriers its admission planned (handoffs, releases and acquires), and the barriers its
+		// recordings' bodies record (PersistentRecording::bodyBarriers, bodyFullBarriers).
+		uint64_t entryBarriers = 0, bodyBarriers = 0, bodyFullBarriers = 0;
 	};
 	static PersistentTicketKey PersistentTicketKeyOf(const PersistentTicket& ticket) noexcept;
 	// Why a ticket is not current (diagnostics): the first unchecked pass, or the first pass whose revision changed.

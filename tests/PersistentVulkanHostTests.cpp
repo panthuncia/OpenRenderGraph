@@ -275,6 +275,7 @@ struct WriteFrame {
 //   revisions after the growth name that new version.
 struct TestRevision final : org::IHostExecutionData, org::IResourceVersions {
 	uint32_t count = kCount;
+	bool skipWrite = false;  // "segment": the write pass is turned off for this revision (RenderGraphPass::SetSkipWhen)
 	const void* versioned = nullptr;  // VersionedBuffer::Key
 	std::shared_ptr<const org::BufferVersion> target;
 	const void* TryGet(std::type_index type) const noexcept override {
@@ -387,9 +388,13 @@ public:
 	void GatherStructuralPasses(org::RenderGraph&, std::vector<org::RenderGraph::ExternalPassDesc>& out) override {
 		// "stream": the write on the compute queue, so an external epoch's execution has a batch off the host's stream.
 		const auto writeQueue = m_computeWrite ? org::QueueKind::Compute : org::QueueKind::Graphics;
-		auto write = org::RenderGraph::ExternalPassDesc::Compute("test.write",
-			std::static_pointer_cast<org::RenderPass>(std::make_shared<WritePass>(m_input, m_scratch, m_program, m_versions, writeQueue, m_hostTexture)))
-			.PreferQueue(writeQueue);
+		auto writePass = std::make_shared<WritePass>(m_input, m_scratch, m_program, m_versions, writeQueue, m_hostTexture);
+		// A revision may turn the write off: it then records only its barriers.
+		writePass->SetSkipWhen([](const org::IHostExecutionData* data) {
+			const auto* revision = data ? data->Get<TestRevision>() : nullptr;
+			return revision && revision->skipWrite;
+		});
+		auto write = org::RenderGraph::ExternalPassDesc::Compute("test.write", std::static_pointer_cast<org::RenderPass>(writePass)).PreferQueue(writeQueue);
 		// "stream": the copy on the copy queue, which the device aliases to the graphics queue (the host's stream's): in the stream.
 		const auto copyQueue = m_computeWrite ? org::QueueKind::Copy : org::QueueKind::Graphics;
 		auto copy = org::RenderGraph::ExternalPassDesc::Copy("test.copy-to-host",
@@ -529,7 +534,10 @@ static int Run(int argc, char** argv) {
 	const bool reuse = externalReuse || (argc > 1 && std::strcmp(argv[1], "reuse") == 0);
 	// "revision": a revision-driven epoch, set through the revisionEpochs of SetAsyncEpochs. It is recorded ahead for
 	// each revision (RequestEpochRecording) and submitted with that recording.
-	const bool revision = argc > 1 && std::strcmp(argv[1], "revision") == 0;
+	// "segment": "revision" with the epoch closed by SetClosedEpochs (the host's other executions open), its copies taken by the
+	// caller's frame slot (SetEpochCopy, EpochCopyRun), and a revision that turns the write pass off (SetSkipWhen).
+	const bool segment = argc > 1 && std::strcmp(argv[1], "segment") == 0;
+	const bool revision = segment || (argc > 1 && std::strcmp(argv[1], "revision") == 0);
 	// "external": an async epoch that the test executes itself (GraphHost::SetExternalEpochs). Its copy pass is
 	// recorded at execution, into a primary command buffer the test owns. It is submitted with the execution's waits
 	// and signals.
@@ -1235,7 +1243,8 @@ static int Run(int argc, char** argv) {
 		auto runtime = org::Runtime::Create({.device = device.Get(), .backend = rhi::Backend::Vulkan,
 			.tasks = std::make_shared<org::runtime::ThreadPoolTaskService>(2)});
 		org::GraphHost host({.runtime = runtime,
-			.queueBoundary = {.entry = true, .exit = true}, .epochOrder = {0}, .closedExecutions = async && !open, .reuseRecordings = reuse || revision});
+			.queueBoundary = {.entry = true, .exit = true}, .epochOrder = {0}, .closedExecutions = async && !open && !segment, .reuseRecordings = reuse || revision});
+		if (segment) host.SetClosedEpochs({0});
 		if (inlineLate) host.SetInlineAtExecution(true);
 		{
 			auto program = CreateProgram(device.Get());
@@ -1284,9 +1293,11 @@ static int Run(int argc, char** argv) {
 			if (revision) {
 				host.SetAsyncEpochs({0}, {0});
 				// Records the epoch for a revision of `count` elements; the callback runs on the host's thread.
-				auto record = [&](uint32_t count, std::shared_ptr<const org::BufferVersion> target) -> std::shared_ptr<const org::GraphHost::EpochRecording> {
+				auto record = [&](uint32_t count, std::shared_ptr<const org::BufferVersion> target, bool skipWrite = false,
+					uint32_t onlyCopy = org::RunRef::kNoCopy) -> std::shared_ptr<const org::GraphHost::EpochRecording> {
 					auto data = std::make_shared<TestRevision>();
 					data->count = count;
+					data->skipWrite = skipWrite;
 					data->versioned = versions->Key();
 					data->target = std::move(target);
 					std::atomic<int> state{0};
@@ -1296,7 +1307,7 @@ static int Run(int argc, char** argv) {
 						result = std::move(a_recording);
 						state.store(a_error ? 2 : 1, std::memory_order_release);
 						state.notify_all();
-					});
+					}, onlyCopy);
 					if (!posted) return nullptr;
 					const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
 					while (state.load(std::memory_order_acquire) == 0 && std::chrono::steady_clock::now() < deadline)
@@ -1376,6 +1387,71 @@ static int Run(int argc, char** argv) {
 					static_cast<unsigned long long>(stats.stale));
 				REQUIRE(stats.revisionSubmissions == 13 && stats.stale == 0 && stats.revisionRecordings == 3 && stats.revisionCopiesRecorded == 9,
 					"every submission bound a revision's recording; nothing prepared again");
+				if (segment) {
+					REQUIRE(host.ClosedEpoch(0), "SetClosedEpochs closes the epoch while the host's executions are open");
+					// Pinned copies: each submission names its frame slot, and its run is that slot's copy.
+					const auto current = versions->Current();
+					auto slotted = record(kCount, current);
+					REQUIRE(slotted, "the slotted revision's recording");
+					const uint32_t copies = static_cast<uint32_t>(slotted->copies.size());
+					for (uint32_t frame = 0; frame < 3 * copies; ++frame) {
+						const uint32_t slot = frame % copies;
+						value = 70000u + 10u * frame;
+						host.SetEpochCopy(0, slot);
+						org::RunRef seen{};
+						host.SubmitEpoch(0, [&](org::RenderGraph& graph) {
+							upload(graph);
+							seen = host.CurrentRun();
+						}, {}, slotted);
+						REQUIRE(seen == host.EpochCopyRun(0, slot), "a pinned run is its frame slot's copy");
+						REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "a pinned copy's recording writes every element");
+					}
+					// A frame without the epoch: the next slot is not the copy predicted. A ticket already prepared for the predicted copy
+					// goes back once. One the host's thread prepares after the call takes the named copy at once.
+					const auto before = host.TakeAsyncStats();
+					value = 71000u;
+					host.SetEpochCopy(0, 1);
+					org::RunRef seen{};
+					host.SubmitEpoch(0, [&](org::RenderGraph& graph) {
+						upload(graph);
+						seen = host.CurrentRun();
+					}, {}, slotted);
+					REQUIRE(seen == host.EpochCopyRun(0, 1), "a re-pinned run is the named copy");
+					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "a re-pinned copy's recording writes every element");
+					const auto repinned = host.TakeAsyncStats();
+					std::printf("segment: %llu copy re-pins over %u slotted frames, %llu after a skipped slot\n",
+						static_cast<unsigned long long>(before.copyRepins), 3 * copies, static_cast<unsigned long long>(repinned.copyRepins));
+					REQUIRE(before.copyRepins <= 1 && repinned.copyRepins <= 1, "only the first pin and the skipped slot may give a ticket back");
+					// A revision that turns the write pass off: the copy runs, the write records only its barriers, so the host buffer
+					// keeps what the last write made.
+					auto skipped = record(kCount, current, true);
+					REQUIRE(skipped, "the skipped write's recording");
+					const uint32_t kept = value;
+					value = 72000u;
+					host.SetEpochCopy(0, 2);
+					host.SubmitEpoch(0, upload, {}, skipped);
+					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, kept), "a pass the host data turns off writes nothing");
+					value = 73000u;
+					host.SetEpochCopy(0, 0);
+					host.SubmitEpoch(0, upload, {}, slotted);
+					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "the next revision writes again");
+					// One copy only: recorded for the slot the next run takes, and submitted with it. Its other copies stay empty.
+					auto single = record(kCount, current, false, 1);
+					REQUIRE(single && single->copies[1] && !single->copies[0], "a recording of one copy has that copy alone");
+					value = 74000u;
+					host.SetEpochCopy(0, 1);
+					host.SubmitEpoch(0, upload, {}, single);
+					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "a one-copy recording writes every element");
+					// The next slot's run takes the full recording again: the one-copy recording is no candidate for it.
+					value = 75000u;
+					host.SetEpochCopy(0, 2);
+					host.SubmitEpoch(0, upload, {}, slotted);
+					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "the other slots go on with their recordings");
+					// Versions: the slotted recording bound the current version; the first one bound the version before the growth.
+					REQUIRE(host.EpochRecordingVersionsCurrent(*slotted, 0), "a recording of the current versions is current");
+					REQUIRE(!host.EpochRecordingVersionsCurrent(*full, 0), "a recording of a replaced version is not");
+					REQUIRE(!host.EpochRecordingVersionsCurrent(*single, 0), "a recording has no versions for a copy it does not have");
+				}
 				REQUIRE(!counters.unbalanced && counters.locks.load() == counters.unlocks.load(), "balanced host queue locks");
 				// Growth as graph work. A version is made on a producer's thread and filled through the dedicated uploader. That is
 				// the worker upload path. It runs on the spare queue the device offered, when it has one. The version is ready once

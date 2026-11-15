@@ -1386,6 +1386,7 @@ RenderGraph::PersistentExecution RenderGraph::PreparePersistentExecution(rhi::De
 	// the one its host data's revision names (IResourceVersions), or else the current one. Admission takes that version as a
 	// frame rebinding. Preparation and recording take it through an overlay of the bindings.
 	std::vector<persistent::FrameRebinding> rebindings;
+	std::vector<std::pair<std::shared_ptr<const IVersionedResource>, uint64_t>> versionStamps;
 	bool perFrame = false;
 	if (executing) {
 		BT_ZONE_SCOPE("ORG.Persistent.BindVersions");
@@ -1397,6 +1398,7 @@ RenderGraph::PersistentExecution RenderGraph::PreparePersistentExecution(rhi::De
 			// Only the slots this execution compiled. A slot that a pending structural build added is not compiled yet.
 			if (index >= selected->bindings.Size() || index >= compiled.size() || compiled[index] == UINT32_MAX) continue;
 			auto version = entry.versioned->SelectVersion(m_resolverCaptureContext.get());
+			if (version) versionStamps.emplace_back(entry.versioned, version->number);
 			if (!version || !version->resource)
 				throw std::runtime_error("Persistent slot of '" + (entry.resource ? entry.resource->GetName() : std::string("?"))
 					+ "' has no version to bind");
@@ -1438,6 +1440,7 @@ RenderGraph::PersistentExecution RenderGraph::PreparePersistentExecution(rhi::De
 	main.label = "Main";
 	main.publication = executing;
 	main.rebindings = std::move(rebindings);
+	main.versions = std::move(versionStamps);
 	main.perFrame = perFrame;
 	main.bindings = preparation.bindings;
 	main.invocations.resize(selected->logical->passSlots.size());
@@ -1620,6 +1623,14 @@ RenderGraph::PersistentExecution RenderGraph::PreparePersistentExecution(rhi::De
 				captured = true;
 			}
 			packet.SetDebugName(any.name);
+			// A pass the host turned off for this execution by its host data (RenderGraphPass::SetSkipWhen) records only its barriers.
+			if (const RenderGraphPass* object = std::visit([](auto& value) -> const RenderGraphPass* {
+					using T = std::decay_t<decltype(value)>;
+					if constexpr (std::is_same_v<T, std::monostate>) return nullptr;
+					else return value.pass.get();
+				}, any.pass);
+				object && object->SkipsFor(passPreparation.preparationData))
+				packet.MarkSkippedAhead();
 			main.invocations[pass.id.index] = std::move(packet);
 			if (auto* ticket = options.ticket) {
 				const RenderGraphPass* object = std::visit([](auto& value) -> const RenderGraphPass* {

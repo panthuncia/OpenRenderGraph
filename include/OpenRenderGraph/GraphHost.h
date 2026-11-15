@@ -416,6 +416,46 @@ public:
 	 */
 	void SetEpochTicketsAhead(uint32_t epoch, uint32_t most);
 	/**
+	 * @brief Owner thread, before the listed epochs' graphs are built: their executions are closed
+	 * (RenderGraph::SetPersistentClosedExecutions), whatever Desc::closedExecutions says for the other epochs.
+	 *
+	 * A closed execution starts with a full memory barrier and leaves every resource it touches in its home state. Its entry
+	 * barriers still come from the ledgers, so it may follow open executions. The epochs after it find each resource at home.
+	 * A host that closes a fixed set of its epochs gets the same entry plan for each of them every frame, once the work before
+	 * them settles. Every resource of a closed epoch must be used from one queue. Kept across rebuilds.
+	 */
+	void SetClosedEpochs(std::vector<uint32_t> epochs);
+	/** @brief Whether the epoch's executions are closed: Desc::closedExecutions, or listed by SetClosedEpochs. */
+	bool ClosedEpoch(uint32_t epoch) const noexcept;
+	/**
+	 * @brief Owner thread, before the listed epochs' graphs are built: their transients get pools of their own instead of the shared
+	 * alias arena (Desc::sharedAliasArena). Another epoch's transient then never takes their memory between two of their
+	 * executions, so their admissions find no alias activation and can take a predicted plan. Kept across rebuilds.
+	 */
+	void SetPrivateAliasEpochs(std::vector<uint32_t> epochs);
+	/**
+	 * @brief Submitting thread, for a revision-driven async epoch: its runs take their published copies by the caller's index
+	 * from now on, starting with copy `copy` for the next SubmitEpoch.
+	 *
+	 * A host that keys per-run data by its own frame slot (a slot is the frame number modulo Desc::framesInFlight) calls this
+	 * before each submission with the slot. The copy's LatchBlock regions then belong to that slot, so the host can write them
+	 * by slot (EpochCopyRun) and a slot's recording always reads the same place.
+	 *
+	 * - The ticket prepared ahead takes the copy after the one submitted last. When the caller names another copy, the ready
+	 *   ticket is given back and one for the named copy is prepared, and SubmitEpoch waits for it (AsyncStats::copyRepins).
+	 * - Taking a copy waits for its last run as for any copy: a run behind a seal is waited for on the host's thread, and a
+	 *   run neither sealed nor done makes SubmitEpoch throw EpochCopiesBusyError.
+	 * Throws std::invalid_argument for an epoch that is not a revision-driven async epoch. Nothing before async epochs start.
+	 */
+	void SetEpochCopy(uint32_t epoch, uint32_t copy);
+	/**
+	 * @brief Any thread, after SetAsyncEpochs listed the epoch as revision-driven: the run of its published copy `copy`
+	 * (RunRef::Copy of the copy's lease). Every submission of that copy names this run, so what a host writes for it
+	 * (LatchBlock::Write, run gates) is what the copy's recording reads at its next submission. Write it only while the
+	 * copy's last run is done: inside SubmitEpoch's beforeSubmit for that copy. Throws std::invalid_argument otherwise.
+	 */
+	RunRef EpochCopyRun(uint32_t epoch, uint32_t copy) const;
+	/**
 	 * @brief Async epochs whose graphics-queue work the caller executes itself, in its own command buffers
 	 * (RenderGraph::SetExternalPersistentEpochs): SubmitEpoch submits only their batches on other queues. Their graphics uploads
 	 * are recorded into a secondary list, the execution is taken with TakeExternalExecution, and the caller executes its
@@ -475,7 +515,11 @@ public:
 	// epoch's graph was built again, or the host's thread stopped, before it was recorded. False only when async epochs were never
 	// started or are off (SetAsyncEpochs with none): done is not called then. The host's end drops what is queued without calling
 	// done (its callers may be gone).
-	bool RequestEpochRecording(uint32_t epoch, std::shared_ptr<const IHostExecutionData> hostData, EpochRecordingCallback done);
+	// copy: record that published copy alone (a host that pins its runs to copies, SetEpochCopy). The recording's other copies stay
+	// null, and it is a candidate only for runs of that copy. A copy whose last run is done is recorded at once, so a host that asks
+	// for the copy it submits next waits for no GPU work.
+	bool RequestEpochRecording(uint32_t epoch, std::shared_ptr<const IHostExecutionData> hostData, EpochRecordingCallback done,
+		uint32_t copy = RunRef::kNoCopy);
 	// Render thread, for an async epoch it did not submit this frame: its ready ticket, prepared and not submitted, goes back to the
 	// host's thread (abandoned, its run lease freed, a new one prepared). False when no ticket was ready (or the mailbox is full: it
 	// stays).
@@ -532,6 +576,11 @@ public:
 	// Owner thread: whether a recording is of its epoch's graph as built now - with explicit builds, what decides before a frame's
 	// submissions whether they can take it (until the next BuildIfRequested).
 	bool EpochRecordingCurrent(const EpochRecording& recording) const noexcept;
+	// Any thread: whether copy `copy` of the recording was recorded with the versions its versioned slots have now (a recording
+	// for host data that names no versions binds the current ones). False for a copy it does not have. A host whose revision does
+	// not name versions checks this instead of counting NoteNewVersions: a version of a resource the epoch does not use leaves it
+	// true.
+	bool EpochRecordingVersionsCurrent(const EpochRecording& recording, uint32_t copy) const noexcept;
 	// Submitting thread: a versioned buffer (VersionedBuffer) published a new version. Nothing changed in place, so nothing waits;
 	// a ticket prepared before resolved the old version and is not current (it is prepared again, or takes a kept recording).
 	// Revision-driven epochs need no call: their recordings resolve the versions their revisions name.
@@ -563,6 +612,9 @@ public:
 		// Revision-driven tickets held for the next seal because every copy held an unsealed run (EpochCopiesBusyError), and copy
 		// waits: a submission whose copy's last run was sealed but not done, waited for on the host's thread.
 		uint64_t copiesBusy = 0, copyWaits = 0;
+		// Revision-driven tickets given back at submission because they held another copy than the one the caller named
+		// (SetEpochCopy), each replaced by a ticket for the named copy.
+		uint64_t copyRepins = 0;
 		// Tickets prepared ahead (SetEpochTicketsAhead) dropped before their submission, because one before them was stale.
 		uint64_t staleAhead = 0;
 		// Desc::reuseLiveRecordings: live tickets that bound a kept recording (nothing prepared or recorded), live recordings
@@ -809,6 +861,12 @@ public:
 		// Per epoch (the first 64): submissions whose recordings were none of the epoch's last four, so a segment list holding
 		// it would be recorded again.
 		std::array<uint64_t, 64> newRecordings{};
+		// Per epoch (the first 64): its submissions, and the barriers they recorded: the entry barriers each admission planned, and
+		// the barriers in their recordings' bodies, with a closed execution's full memory barriers apart.
+		struct EpochBarriers {
+			uint64_t tickets = 0, entry = 0, body = 0, full = 0;
+		};
+		std::array<EpochBarriers, 64> barriers{};
 	};
 	// Any thread. Since the last call.
 	SegmentStats TakeSegmentStats();
@@ -995,6 +1053,8 @@ private:
 	std::vector<uint32_t> m_asyncEpochs;  // restarted with these after a rebuild
 	std::vector<uint32_t> m_revisionEpochs;
 	std::vector<std::pair<uint32_t, uint32_t>> m_ticketsAhead;  // SetEpochTicketsAhead: (epoch, most)
+	std::vector<uint32_t> m_closedEpochs;  // SetClosedEpochs: read by builds on any thread, written only before them
+	std::vector<uint32_t> m_privateAliasEpochs;  // SetPrivateAliasEpochs, under m_configMutex
 	std::vector<uint32_t> m_externalEpochs;  // SetExternalEpochs; set on every build's graph
 	bool m_inlineAtExecution = false;        // SetInlineAtExecution; set on every build's graph
 	std::shared_ptr<ExternalEpochExecution> m_externalExecution;  // submitting thread: the last external SubmitEpoch's

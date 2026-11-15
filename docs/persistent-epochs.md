@@ -326,6 +326,37 @@ revision the host's scene supplies (CS's DCLF scene revision), and nothing about
 -   **Statistics.** `AsyncStats::revisionCopiesRecorded`, `revisionRecordings`, `revisionSubmissions`, `copyWaits` and
     `copiesBusy`.
 
+### Segments: copies by frame slot, closed epochs, host-data skips
+
+A host that declares its frame (Community Shaders' declared frame) records an epoch once per description of it and keeps the
+recording per frame slot. These options serve it; each is independent of the others.
+
+-   **Copies by frame slot.** `SetEpochCopy(epoch, copy)` names the published copy the epoch's next run takes. The ticket
+    prepared ahead takes the copy after the one submitted last. When the caller names another, that ticket is given back and
+    one for the named copy is prepared (`AsyncStats::copyRepins`). `EpochCopyRun(epoch, copy)` is that copy's run, so the
+    host can address the copy's LatchBlock regions and run gates by its own slot. The copies' leases are made by
+    `SetAsyncEpochs`, so the call is safe on any thread.
+-   **One copy at a time.** `RequestEpochRecording(epoch, hostData, done, copy)` records that copy alone. The other copies of
+    the recording stay null, and it is a candidate only for runs of that copy. A host that asks for the copy its next run
+    takes waits for no GPU work: the copy's last run is a whole cycle of slots old.
+-   **Closed epochs.** `SetClosedEpochs(epochs)` closes the listed epochs alone (`RenderGraph::SetPersistentClosedExecutions`).
+    A closed execution still takes its entry barriers from the ledgers, so it may follow open ones. It leaves every resource
+    at home, which costs exit barriers in its body.
+-   **Private alias pools.** `SetPrivateAliasEpochs(epochs)` keeps the listed epochs' transients out of the shared alias
+    arena. In the shared arena another epoch's transients took their memory between two of their executions, so every
+    admission found alias activations and planned against the ledgers instead of taking its predicted plan.
+-   **Current versions.** A revision's recording binds the versions it was recorded with. `EpochRecordingVersionsCurrent(recording,
+    copy)` says whether every versioned slot that copy bound still has that version as its current one, so a host whose revision
+    names no versions records again only when a slot its epoch uses moved, not at every `NoteNewVersions`.
+-   **Passes the host data turns off.** `RenderGraphPass::SetSkipWhen(predicate)` is asked at each preparation with the
+    preparation's host data. True marks the prepared pass skipped ahead (`PreparedPass::SkippedAhead`): its recorder records
+    only the barriers around it, whether it is recorded ahead or at execution. The answer must depend on the host data alone.
+-   **Barrier census.** With the segment census on, `SegmentStats::barriers` counts, per epoch, its tickets, the entry barriers
+    their admissions planned, the barriers their recordings' bodies hold (`PersistentRecording::bodyBarriers`) and a closed
+    execution's full barriers.
+-   **Test.** `PersistentVulkanHostTests segment`: a revision-driven epoch closed by `SetClosedEpochs` in an open host, runs
+    pinned to their slots, a re-pin after a skipped slot, a revision that turns the write off, and a one-copy recording.
+
 ### Versioned resources
 
 A versioned resource (`org::VersionedBuffer`, `org::VersionedTexture`, both built on `org::VersionedResource`) changes its

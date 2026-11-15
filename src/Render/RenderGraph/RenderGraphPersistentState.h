@@ -191,6 +191,9 @@ struct RenderGraph::PersistentRecording {
 	std::vector<std::shared_ptr<const compiler::IPreparedExecutionBatch>> packets;
 	std::vector<std::shared_ptr<compiler::OwnedRecordingStatistics>> statistics;
 	bool replayable = false;
+	// The barriers its body records (diagnostics, the segment census): the barriers before and after its passes, and the full
+	// memory barriers a closed execution starts each batch with.
+	uint64_t bodyBarriers = 0, bodyFullBarriers = 0;
 	// The reuse key.
 	uint64_t hostTag = 0;
 	std::shared_ptr<const persistent::SelectedPublication> publication;
@@ -203,6 +206,8 @@ struct RenderGraph::PersistentRecording {
 	std::vector<persistent::FrameProducerWait> waits;
 	std::vector<persistent::FrameRebinding> rebindings;
 	std::vector<std::shared_ptr<const void>> leases;
+	// The version number each versioned slot bound when it was recorded (RenderGraph::PersistentRecordingVersionsCurrent).
+	std::vector<std::pair<std::shared_ptr<const IVersionedResource>, uint64_t>> versions;
 
 	bool Recorded(uint64_t a_hostTag, const persistent::SelectedPublication* a_publication, const FrozenExecutionBindings* a_bindings,
 		rhi::DescriptorHeapHandle a_resourceHeap, rhi::DescriptorHeapHandle a_samplerHeap,
@@ -548,6 +553,8 @@ struct RenderGraph::PersistentExecution {
 		std::vector<PreparedPass> invocations;
 		std::shared_ptr<const std::vector<std::string>> names; // Per logical pass slot, for statistics/present detection.
 		std::vector<persistent::FrameRebinding> rebindings;
+		// The version each versioned slot bound (its number), for a recording's VersionsCurrent check.
+		std::vector<std::pair<std::shared_ptr<const IVersionedResource>, uint64_t>> versions;
 		bool perFrame = false;  // a rebinding is a per-frame resource's (IVersionedResource::PerFrame): never kept
 		std::vector<persistent::FrameProducerWait> waits;
 		std::shared_ptr<const FrozenExecutionBindings> bindings;

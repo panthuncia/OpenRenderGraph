@@ -956,8 +956,9 @@ inline size_t RecordOwnedRecordingCommands(RecordingContext& context, const Owne
         // Recorded at execution, a pass with nothing to do this run (PreparedPass::SkipsAtExecution) records only its barriers:
         // the states the admission planned still change. No label, timestamps or GPU zone for it. A kept recording's pass
         // recorded again asks the same for its new run (SkipsAgain).
+        // A pass its host turned off for this execution (PreparedPass::SkippedAhead) is skipped the same way, recorded ahead or not.
         const auto& pass = recording.passes[passIndex];
-        if (a_atExecution && (a_again ? pass.SkipsAgain(context) : pass.SkipsAtExecution(context))) {
+        if (pass.SkippedAhead() || (a_atExecution && (a_again ? pass.SkipsAgain(context) : pass.SkipsAtExecution(context)))) {
             BT_ZONE_SCOPE("ORG.Execution.RecordOwned.Skipped");
             const auto passLabel = pass.DebugName();
             BT_ZONE_TEXT(passLabel.data(), passLabel.size());

@@ -247,6 +247,14 @@ std::string RenderGraph::PersistentTicketStaleReason(const PersistentTicket& tic
 	return "current";
 }
 
+bool RenderGraph::PersistentRecordingVersionsCurrent(const PersistentRecording& recording) noexcept {
+	for (const auto& [versioned, number] : recording.versions) {
+		const auto current = versioned ? versioned->SelectVersion(nullptr) : nullptr;
+		if (!current || current->number != number) return false;
+	}
+	return true;
+}
+
 RenderGraph::PersistentTicketKey RenderGraph::PersistentTicketKeyOf(const PersistentTicket& ticket) noexcept {
 	PersistentTicketKey key;
 	const auto mix = [](uint64_t a_hash, const void* a_pointer) {
@@ -257,6 +265,13 @@ RenderGraph::PersistentTicketKey RenderGraph::PersistentTicketKeyOf(const Persis
 		key.recordings = mix(key.recordings, a_segment.recording.get());
 		key.plans = mix(key.plans, a_segment.admission.sharedBarriers.get());
 		key.planned = key.planned && a_segment.admission.predicted;
+		const auto& plan = a_segment.admission.Barriers();
+		for (const auto& batch : plan.batches) key.entryBarriers += batch.textures.size() + batch.buffers.size() + batch.acquired.size();
+		for (const auto& release : plan.releases) key.entryBarriers += release.textures.size();
+		if (a_segment.recording) {
+			key.bodyBarriers += a_segment.recording->bodyBarriers;
+			key.bodyFullBarriers += a_segment.recording->bodyFullBarriers;
+		}
 	};
 	// A bound candidate's segment is in segments by now (its own went to displaced).
 	for (const auto& segment : ticket.segments) add(segment);
