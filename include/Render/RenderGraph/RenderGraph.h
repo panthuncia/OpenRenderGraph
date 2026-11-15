@@ -433,8 +433,21 @@ private:
 	// An external epoch's ticket (out.external) submits its batches off the graphics queue here and gives the rest to its host
 	// (ExternalEpochExecution). streamUploads: its graphics-queue uploads were recorded for the host's stream, ahead of its first
 	// segment. A batch off the graphics queue that uses them waits for a segment of their own (the first).
+	// carry (coalesced submissions only): several tickets submitted back to back, holding the sequencer across them, share queue
+	// submissions. This ticket's first group of batches joins the group the carry holds when both are on one queue and the new group
+	// waits for nothing the held one does not. Any other submission of this ticket submits the held group first. carryOut: this
+	// ticket's last group is held in the carry instead of submitted, for the next ticket to join. FlushSubmitCarry submits it.
+	struct SubmitCarry;
 	bool SubmitPersistentTicket(PersistentTicket& ticket, std::span<uint64_t> nextQueueValues, PersistentTicketSubmission& out,
-		std::pair<uint32_t, uint64_t> uploadsDone = {UINT32_MAX, 0}, uint64_t frameWait = 0, bool streamUploads = false);
+		std::pair<uint32_t, uint64_t> uploadsDone = {UINT32_MAX, 0}, uint64_t frameWait = 0, bool streamUploads = false,
+		SubmitCarry* carry = nullptr, bool carryOut = false);
+	// A carry for SubmitPersistentTicket, and its submission. FlushSubmitCarry submits the group the carry holds (nothing when it
+	// holds none). Its batches were committed as submitted when they were held. False when the queue refused it. merged: how many
+	// tickets' groups it held.
+	static std::shared_ptr<SubmitCarry> MakeSubmitCarry();
+	static bool FlushSubmitCarry(SubmitCarry& carry, uint32_t* merged = nullptr);
+	// The tickets whose held group the next ticket's joined, since the last call.
+	static uint64_t TakeSubmitCarryJoins(SubmitCarry& carry) noexcept;
 	// Submitting thread, holding the sequencer (HoldPersistentSequencer) until the ticket is submitted: admits each of the
 	// ticket's segments against the ledgers as they are now. queueValues: what the host has submitted on each queue slot.
 	void AdmitPersistentTicket(PersistentTicket& ticket, std::span<const uint64_t> queueValues);

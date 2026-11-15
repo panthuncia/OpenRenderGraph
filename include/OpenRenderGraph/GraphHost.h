@@ -124,6 +124,10 @@ public:
 		// recorded at execution and the queue submissions. External epochs still submit on the calling thread. A queue user that
 		// must come after the epochs submitted so far drains the thread first (DrainSubmissions).
 		bool submissionThread = false;
+		// With a submission thread and coalesced submissions: the tickets queued together are finished as one group, and a
+		// ticket's first queue submission joins the one the ticket before it left held, when both are on one queue and it waits
+		// for nothing new (RenderGraph::SubmitCarry). Only what is already queued is grouped: the thread never waits for more.
+		bool mergeTicketSubmissions = false;
 	};
 
 	using ExtensionFactory = std::function<std::unique_ptr<RenderGraph::IRenderGraphExtension>()>;
@@ -756,6 +760,8 @@ public:
 	// Diagnostics since the last call. Any thread.
 	struct SubmitThreadStats {
 		uint64_t tickets = 0;             // tickets the thread finished
+		uint64_t groups = 0;              // groups of tickets finished together (those queued at once)
+		uint64_t joined = 0;              // tickets whose last queue submission the next ticket's first joined
 		uint64_t discarded = 0;           // tickets it gave back unsubmitted after a failure
 		uint64_t peakDepth = 0;           // the most entries queued or in progress at once
 		uint64_t backpressureWaits = 0;   // pushes that waited for room
@@ -979,10 +985,17 @@ private:
 	TicketCommit CommitTicket(Async& state, uint32_t epochIndex, std::shared_ptr<RenderGraph::PersistentTicket> ticket,
 		const FrameCallback& beforeSubmit, std::shared_ptr<const void> resourceOwner, std::shared_ptr<const EpochRecording> recording);
 	// timings and stats: where its times and counts go (the render thread's own, or the submission thread's).
-	void FinishTicket(Async& state, TicketCommit& commit, FrameTimings& timings, AsyncStats& stats);
+	// carry and carryOut: the submission thread's group of tickets (RenderGraph::SubmitPersistentTicket's). posts: the ticket's
+	// completion message goes there instead of to the host's thread, for the caller to post once the group's held submission is
+	// on its queue.
+	struct DeferredPosts;
+	void FinishTicket(Async& state, TicketCommit& commit, FrameTimings& timings, AsyncStats& stats, RenderGraph::SubmitCarry* carry = nullptr,
+		bool carryOut = false, DeferredPosts* posts = nullptr);
 	// The submission thread (Desc::submissionThread): its queue, made with the host and stopped first by its destructor.
 	struct SubmitQueue;
 	std::unique_ptr<SubmitQueue> m_submitQueue;
+	// The submission thread's held group of batches (RenderGraph::SubmitCarry), across the tickets of one group.
+	std::shared_ptr<RenderGraph::SubmitCarry> m_submitCarry;
 	// SubmittedPoint's values now: every queue's last value handed out.
 	GpuPoint SubmittedPointNow() const;
 	// The thread's counts (FinishTicket's stats there), added to TakeAsyncStats.

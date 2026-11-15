@@ -374,6 +374,11 @@ struct GraphHost::TicketCommit {
 	std::unique_ptr<Runtime::AssignmentScope> assigned;
 };
 
+// FinishTicket's completion messages, held until the group's last submission is on its queue (FinishTicket's posts).
+struct GraphHost::DeferredPosts {
+	std::vector<Async::Message> messages;
+};
+
 // The submission thread's queue (Desc::submissionThread). The render thread pushes an entry after each commit. The thread
 // finishes the entries in order.
 struct GraphHost::SubmitQueue {
@@ -387,6 +392,8 @@ struct GraphHost::SubmitQueue {
 	// The most entries queued at once. A full queue makes the render thread wait for room (backpressure), so the render thread
 	// never runs further ahead of the queue than this.
 	static constexpr size_t kCapacity = 64;
+	// The most tickets the thread finishes as one group (RunSubmitThread).
+	static constexpr size_t kMostGrouped = 16;
 	std::mutex mutex;
 	std::condition_variable work;      // the thread waits here for entries
 	std::condition_variable progress;  // a full push waits here for room, a drain for the thread to pass its entries
@@ -450,6 +457,7 @@ GraphHost::GraphHost(Desc desc) : m_desc(std::move(desc)), m_recordingQueue(std:
 	}
 	// Made with the host, so the queue's pointer never changes while another thread drains it.
 	if (m_desc.submissionThread) {
+		if (m_desc.mergeTicketSubmissions && m_desc.coalesceSubmissions) m_submitCarry = RenderGraph::MakeSubmitCarry();
 		m_submitQueue = std::make_unique<SubmitQueue>();
 		m_submitQueue->thread = std::thread([this] { RunSubmitThread(); });
 	}
@@ -2658,6 +2666,7 @@ void GraphHost::SubmitEpoch(uint32_t epoch, const FrameCallback& beforeSubmit, s
 
 void GraphHost::RunSubmitThread() {
 	auto& queue = *m_submitQueue;
+	constexpr size_t kMostGrouped = SubmitQueue::kMostGrouped;
 	{
 		std::scoped_lock lock(queue.mutex);
 		queue.threadId = std::this_thread::get_id();
@@ -2682,41 +2691,80 @@ void GraphHost::RunSubmitThread() {
 			return;
 		}
 		const auto start = std::chrono::steady_clock::now();
-		bool discarded = false;
+		uint64_t discarded = 0, finished = 0, joined = 0, entries = 1;
 		if (kind == SubmitQueue::Entry::Kind::Ticket) {
 			BT_ZONE_SCOPE("ORG.Host.SubmitThread.Ticket");
-			auto& async = *entry.async;
-			auto& commit = *entry.commit;
-			if (queue.failed.load(std::memory_order_acquire)) {
-				// After a failure nothing more is submitted. The ticket goes back to the host's thread unadmitted, which frees its lease.
-				if (commit.ticket) {
-					Async::Message discard;
-					discard.kind = Async::Message::Kind::Discard;
-					discard.epochIndex = commit.index;
-					discard.ticket = std::move(commit.ticket);
-					(void)async.TryPost(discard);
+			// The tickets queued right behind it go with it, as one group: their queue submissions may share a vkQueueSubmit
+			// (RenderGraph::SubmitCarry). Only what is queued now: the thread never waits for more.
+			std::vector<SubmitQueue::Entry> group;
+			group.push_back(std::move(entry));
+			if (m_submitCarry) {
+				{
+					std::scoped_lock lock(queue.mutex);
+					while (!queue.entries.empty() && queue.entries.front().kind == SubmitQueue::Entry::Kind::Ticket && group.size() < kMostGrouped) {
+						group.push_back(std::move(queue.entries.front()));
+						queue.entries.pop_front();
+					}
 				}
-				discarded = true;
-			} else {
-				AsyncStats stats{};
+				queue.progress.notify_all();
+			}
+			entries = group.size();
+			const bool merge = group.size() > 1;
+			// The sequencer stays held across the group: no other submitter's work comes between a held submission and the ticket
+			// that joins it (a wait on a value the held one signals would then never end).
+			std::unique_lock<std::recursive_mutex> sequencer;
+			if (merge && !queue.failed.load(std::memory_order_acquire)) {
+				auto& first = *group.front().async;
+				sequencer = m_instances[first.instanceOf[group.front().commit->index]].graph->HoldPersistentSequencer();
+			}
+			DeferredPosts posts;
+			AsyncStats stats{};
+			for (size_t i = 0; i < group.size(); ++i) {
+				auto& async = *group[i].async;
+				auto& commit = *group[i].commit;
+				if (queue.failed.load(std::memory_order_acquire)) {
+					// After a failure nothing more is submitted. The ticket goes back to the host's thread unadmitted, which frees its lease.
+					if (commit.ticket) {
+						Async::Message discard;
+						discard.kind = Async::Message::Kind::Discard;
+						discard.epochIndex = commit.index;
+						discard.ticket = std::move(commit.ticket);
+						(void)async.TryPost(discard);
+					}
+					++discarded;
+					continue;
+				}
 				FrameTimings timings{};
+				const bool carryOut = merge && i + 1 < group.size();
 				try {
-					FinishTicket(async, commit, timings, stats);
+					FinishTicket(async, commit, timings, stats, merge ? m_submitCarry.get() : nullptr, carryOut, merge ? &posts : nullptr);
+					++finished;
 				} catch (const std::exception& e) {
 					FailSubmitThread(async, commit.index, e.what());
 				} catch (...) {
 					FailSubmitThread(async, commit.index, "an unknown exception");
 				}
-				std::scoped_lock lock(m_threadStatsMutex);
-				m_threadStats.submitted += stats.submitted;
-				m_threadStats.uploads += stats.uploads;
-				m_threadStats.recordedUploadLists += stats.recordedUploadLists;
-				m_threadStats.queueUploadCopies += stats.queueUploadCopies;
-				m_threadStats.sparedUploadWaits += stats.sparedUploadWaits;
-				m_threadStats.lateRoutedUploads += stats.lateRoutedUploads;
-				m_threadStats.lateUploadWaits += stats.lateUploadWaits;
-				m_threadStats.undeclaredUploads += stats.undeclaredUploads;
 			}
+			if (merge) {
+				// The group's last held submission, then the completions, in order, once the sequencer is free (the host's thread
+				// takes it to retire runs).
+				uint32_t held = 0;
+				if (!RenderGraph::FlushSubmitCarry(*m_submitCarry, &held))
+					FailSubmitThread(*group.back().async, group.back().commit->index, "a held queue submission was refused");
+				if (sequencer.owns_lock()) sequencer.unlock();
+				for (auto& message : posts.messages)
+					(void)group.front().async->Post(message, message.kind == Async::Message::Kind::Submitted);
+				joined = RenderGraph::TakeSubmitCarryJoins(*m_submitCarry);
+			}
+			std::scoped_lock lock(m_threadStatsMutex);
+			m_threadStats.submitted += stats.submitted;
+			m_threadStats.uploads += stats.uploads;
+			m_threadStats.recordedUploadLists += stats.recordedUploadLists;
+			m_threadStats.queueUploadCopies += stats.queueUploadCopies;
+			m_threadStats.sparedUploadWaits += stats.sparedUploadWaits;
+			m_threadStats.lateRoutedUploads += stats.lateRoutedUploads;
+			m_threadStats.lateUploadWaits += stats.lateUploadWaits;
+			m_threadStats.undeclaredUploads += stats.undeclaredUploads;
 		} else if (kind == SubmitQueue::Entry::Kind::Marker && entry.marker) {
 			// Every ticket before the marker is on its queue: the point's values are the queues' last ones now.
 			entry.marker->points = SubmittedPointNow().points;
@@ -2736,10 +2784,12 @@ void GraphHost::RunSubmitThread() {
 		entry = {};
 		{
 			std::scoped_lock lock(queue.mutex);
-			++queue.passed;
+			queue.passed += entries;
 			queue.stats.busyUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
-			if (discarded) ++queue.stats.discarded;
-			else if (kind == SubmitQueue::Entry::Kind::Ticket) ++queue.stats.tickets;
+			queue.stats.discarded += discarded;
+			queue.stats.tickets += finished;
+			queue.stats.joined += joined;
+			if (kind == SubmitQueue::Entry::Kind::Ticket) ++queue.stats.groups;
 		}
 		queue.progress.notify_all();
 	}
@@ -2957,7 +3007,8 @@ GraphHost::TicketCommit GraphHost::CommitTicket(Async& async, uint32_t index, st
 	return commit;
 }
 
-void GraphHost::FinishTicket(Async& async, TicketCommit& commit, FrameTimings& timings, AsyncStats& stats) {
+void GraphHost::FinishTicket(Async& async, TicketCommit& commit, FrameTimings& timings, AsyncStats& stats, RenderGraph::SubmitCarry* carry,
+	bool carryOut, DeferredPosts* posts) {
 	BT_ZONE_SCOPE("ORG.Host.FinishTicket");
 	using Census = diagnostics::SubmissionCensus;
 	auto& census = diagnostics::Census();
@@ -3113,6 +3164,8 @@ void GraphHost::FinishTicket(Async& async, TicketCommit& commit, FrameTimings& t
 		const rhi::TimelinePoint signal{async.graphicsFence, value};
 		// The producers' recorded lists, then this thread's (an empty one costs nothing but its begin and end).
 		recordedLists.push_back(commands);
+		// After the group an earlier ticket left held (the submission thread's carry).
+		if (carry && !RenderGraph::FlushSubmitCarry(*carry)) throw std::runtime_error("A held queue submission was refused");
 		rhi::Result uploadResult = rhi::Result::Ok;
 		try {
 			uploadResult = async.graphicsQueue.Submit({recordedLists.data(), static_cast<uint32_t>(recordedLists.size())}, {{}, {&signal, 1}});
@@ -3135,7 +3188,7 @@ void GraphHost::FinishTicket(Async& async, TicketCommit& commit, FrameTimings& t
 		// Submits and commits, or abandons its admission itself.
 		abandonUnsubmitted.ticket = nullptr;
 		ok = graph.SubmitPersistentTicket(*ticket, async.queueValues, submitted.submission, submitted.uploadSignal, commit.frameWait,
-			external && recorded);
+			external && recorded, carry, carryOut);
 	} catch (...) {
 		// The queue may have accepted a prefix of this ticket. Completion is
 		// unknown, so preserve both owners until device teardown.
@@ -3179,6 +3232,15 @@ void GraphHost::FinishTicket(Async& async, TicketCommit& commit, FrameTimings& t
 		stats.undeclaredUploads += uploads.undeclared;
 	}
 	submitted.ticket = std::move(ticket);
+	if (posts) {
+		// Posted by the caller once the group's held submission is on its queue: the host's thread then never handles a ticket
+		// whose batches are still held.
+		++stats.submitted;
+		posts->messages.push_back(std::move(submitted));
+		lap(timings.postUs);
+		if (!ok) throw std::runtime_error("Async epoch submission failed");
+		return;
+	}
 	try {
 		postControl(submitted);
 	} catch (...) {

@@ -307,8 +307,56 @@ void RenderGraph::AbandonPersistentTicketAdmission(PersistentTicket& ticket) {
 	}
 }
 
+// A group of batches held back for the next ticket to join (SubmitPersistentTicket's carry). Its batches are committed as
+// submitted when they are held. It keeps the recordings that own its lists.
+struct RenderGraph::SubmitCarry {
+	rhi::Queue queue{};
+	rhi::TimelineHandle own{};  // the queue's timeline
+	uint32_t queueSlot = UINT32_MAX;
+	uint64_t firstSignal = 0;   // the held group's first signal on its own timeline
+	compiler::PreparedRhiExecutionBatch::GatheredSubmission gathered;
+	std::vector<std::shared_ptr<const void>> keep;  // the tickets' recordings
+	uint32_t tickets = 0;  // the tickets whose groups it holds
+	uint64_t joins = 0;    // statistics: groups joined since the last TakeSubmitCarryJoins
+	bool Active() const noexcept { return !gathered.lists.empty(); }
+	void Clear() {
+		gathered.Clear();
+		keep.clear();
+		tickets = 0;
+		firstSignal = 0;
+		queueSlot = UINT32_MAX;
+	}
+};
+
+std::shared_ptr<RenderGraph::SubmitCarry> RenderGraph::MakeSubmitCarry() { return std::make_shared<SubmitCarry>(); }
+
+uint64_t RenderGraph::TakeSubmitCarryJoins(SubmitCarry& carry) noexcept { return std::exchange(carry.joins, 0); }
+
+bool RenderGraph::FlushSubmitCarry(SubmitCarry& carry, uint32_t* merged) {
+	if (merged) *merged = carry.tickets;
+	if (!carry.Active()) return true;
+	BT_ZONE_SCOPE("ORG.Persistent.FlushSubmitCarry");
+	auto& census = diagnostics::Census();
+	const auto submitted = carry.queue.Submit({carry.gathered.lists.data(), static_cast<uint32_t>(carry.gathered.lists.size())},
+		{{carry.gathered.waits.data(), static_cast<uint32_t>(carry.gathered.waits.size())},
+		 {carry.gathered.signals.data(), static_cast<uint32_t>(carry.gathered.signals.size())}});
+	const bool ok = submitted == rhi::Result::Ok;
+	if (ok) {
+		basic_telemetry::AddCounter("ORG.Persistent.CoalescedSubmissions");
+		if (census.On()) {
+			// Its waits are all on other timelines than its queue's (the held group's own were dropped), so they count as such.
+			std::vector<diagnostics::SubmissionCensus::Wait> waits;
+			for (const auto& wait : carry.gathered.waits)
+				waits.push_back({(uint64_t{wait.t.index} << 32) | wait.t.generation, wait.value, diagnostics::SubmissionCensus::WaitKind::Other});
+			census.Submitted(diagnostics::SubmissionCensus::Submission::Batches, carry.queueSlot, static_cast<uint32_t>(carry.gathered.lists.size()), waits);
+		}
+	}
+	carry.Clear();
+	return ok;
+}
+
 bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uint64_t> nextQueueValues, PersistentTicketSubmission& out,
-	std::pair<uint32_t, uint64_t> uploadsDone, uint64_t frameWait, bool streamUploads) {
+	std::pair<uint32_t, uint64_t> uploadsDone, uint64_t frameWait, bool streamUploads, SubmitCarry* carry, bool carryOut) {
 	BT_ZONE_SCOPE("ORG.Persistent.SubmitTicket");
 	out = {};
 	auto& state = *m_compilerState->persistent;
@@ -400,6 +448,8 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 				const rhi::TimelinePoint point{m_queueRegistry.GetFence(index).GetHandle(), value};
 				rhi::SubmitDesc submit{};
 				submit.signals = {&point, 1u};
+				// Every submission of this ticket comes after the group an earlier ticket left held.
+				if (carry && !FlushSubmitCarry(*carry)) return false;
 				if (m_queueRegistry.GetQueue(index).Submit({&list, 1u}, submit) != rhi::Result::Ok) return false;
 				census.Add(Census::List::Release);
 				census.Submitted(Census::Submission::Release, release.queue, 1, {});
@@ -558,6 +608,7 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 			censusWaits.push_back({(uint64_t{handle.index} << 32) | handle.generation, value, kind});
 		};
 		const auto submitPacket = [&](uint32_t i) -> bool {
+			if (carry && !FlushSubmitCarry(*carry)) return false;
 			const auto* packet = dynamic_cast<const compiler::PreparedRhiExecutionBatch*>(packets[i].get());
 			for (const auto wait : batches[i].waits) {
 				if (!packet || packet->BindsTimeline(wait.timeline)) continue;
@@ -596,6 +647,7 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 			// The batches on the graphics queue are not submitted: the host executes them in its own stream, segment by segment
 			// (ExternalEpochExecution). A segment's submission waits for its batches' waits and signals their values.
 			BT_ZONE_SCOPE("ORG.Persistent.ExternalExecution");
+			if (carry && !FlushSubmitCarry(*carry)) return false;
 			if (!out.external) out.external = std::make_shared<ExternalEpochExecution>();
 			auto& execution = *out.external;
 			const auto graphicsTimeline = admission.queueTimelines.at(graphicsSlot);
@@ -727,12 +779,64 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 			std::vector<uint32_t> group;
 			uint32_t groupQueue = UINT32_MAX;
 			rhi::Queue groupRhiQueue{};
-			const auto flush = [&]() -> bool {
+			// The ticket's last group may be held for the next ticket (carryOut): only when nothing of this ticket is submitted after it
+			// (no home acquires; the last segment).
+			const bool holdLast = carry && carryOut && &segment == &ticket.segments.back() && admission.Barriers().homeAcquires.textures.empty();
+			const auto flush = [&](bool last) -> bool {
 				if (group.empty()) return true;
 				// The batches' own queue timeline: a wait on a value one of them signals is covered by queue order. Every
 				// signal on one timeline collapses to its highest value, which covers the lower ones.
 				const auto own = m_queueRegistry.GetFence(static_cast<QueueSlotIndex>(static_cast<uint8_t>(groupQueue))).GetHandle();
-				const uint64_t firstSignal = batches[group.front()].signal.value;
+				uint64_t firstSignal = batches[group.front()].signal.value;
+				// The group an earlier ticket left held: this group joins it when both are on one queue and timeline, and this group
+				// waits for nothing the held one did not. A wait on a value the held group signals is then covered by queue order, as
+				// within a ticket. Otherwise the held group is submitted on its own first.
+				bool joined = false;
+				if (carry && carry->Active()) {
+					// One queue: each queue signals its own timeline (the host's, shared by every graph), so the same timeline means
+					// the same queue.
+					const bool sameTimeline = carry->own.index == own.index && carry->own.generation == own.generation;
+					bool covered = sameTimeline;
+					bool waitsOnHeld = false;
+					for (const auto& wait : gathered.waits) {
+						if (!covered) break;
+						if (wait.t.index == own.index && wait.t.generation == own.generation && wait.value >= carry->firstSignal) {
+							waitsOnHeld = true;
+							continue;
+						}
+						covered = std::ranges::any_of(carry->gathered.waits, [&](const rhi::TimelinePoint& held) {
+							return held.t.index == wait.t.index && held.t.generation == wait.t.generation && held.value >= wait.value;
+						});
+					}
+					if (covered) {
+						joined = true;
+						firstSignal = carry->firstSignal;
+						// Between the held lists and this group's, when this group waited for a value the held group signals: a full
+						// memory barrier. Apart, that wait ordered this group's work after the held group's and made its writes
+						// visible. In one submission the wait goes, and the barrier takes its place.
+						if (waitsOnHeld) {
+							auto allocation = std::make_shared<compiler::FrameCommandAllocation>();
+							allocation->pool = m_queueRegistry.GetSharedPool(static_cast<QueueSlotIndex>(static_cast<uint8_t>(groupQueue)));
+							allocation->pair = allocation->pool->Request();
+							auto barrierList = allocation->pair.list.Get();
+							const auto full = rhi::FullMemoryBarrier();
+							rhi::BarrierBatch barriers{};
+							barriers.globals = {&full, 1u};
+							barrierList.Barriers(barriers);
+							if (barrierList.EndChecked() != rhi::Result::Ok) throw std::runtime_error("A joined submission's barrier list could not close");
+							allocation->Close();
+							out.leases.push_back(std::move(allocation));
+							gathered.lists.insert(gathered.lists.begin(), barrierList);
+						}
+						gathered.waits.insert(gathered.waits.begin(), carry->gathered.waits.begin(), carry->gathered.waits.end());
+						gathered.lists.insert(gathered.lists.begin(), carry->gathered.lists.begin(), carry->gathered.lists.end());
+						gathered.signals.insert(gathered.signals.begin(), carry->gathered.signals.begin(), carry->gathered.signals.end());
+						++carry->joins;
+						basic_telemetry::AddCounter("ORG.Persistent.CarriedSubmissionsJoined");
+					} else if (!FlushSubmitCarry(*carry)) {
+						return false;
+					}
+				}
 				const auto merge = [](std::vector<rhi::TimelinePoint>& points) {
 					std::vector<rhi::TimelinePoint> merged;
 					for (const auto& point : points) {
@@ -749,6 +853,30 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 				});
 				merge(gathered.waits);
 				merge(gathered.signals);
+				// Held for the next ticket instead of submitted: the joined group's batches and this one's, with their recordings.
+				if (last && holdLast) {
+					if (!joined) {
+						carry->Clear();
+						carry->queue = groupRhiQueue;
+						carry->own = own;
+						carry->queueSlot = groupQueue;
+					}
+					carry->firstSignal = firstSignal;
+					carry->gathered = std::move(gathered);
+					carry->keep.push_back(segment.recording);
+					carry->tickets = joined ? carry->tickets + 1 : 1;
+					// Committed as submitted now, not when the held submission reaches the queue: the next ticket's preparation and
+					// recording read what these passes publish at their submission (a new version, for one), and the queue takes the
+					// held submission before any other submitter's, under the same hold of the sequencer.
+					bool committed = true;
+					for (const auto batch : group) {
+						const auto* packet = static_cast<const compiler::PreparedRhiExecutionBatch*>(packets[batch].get());
+						committed = static_cast<bool>(packet->CommitGathered(batches[batch])) && committed;
+					}
+					group.clear();
+					gathered.Clear();
+					return committed;
+				}
 				if (census.On()) {
 					censusWaits.clear();
 					for (const auto& wait : gathered.waits) censusWait(wait.t, wait.value, groupQueue);
@@ -762,6 +890,11 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 				if (ok) census.Submitted(Census::Submission::Batches, groupQueue, static_cast<uint32_t>(gathered.lists.size()), censusWaits);
 				// Each batch the queue accepted commits its passes, even when another one's commit failed.
 				bool committed = true;
+				if (joined) {
+					// The held batches were committed when they were held.
+					if (ok) basic_telemetry::AddCounter("ORG.Persistent.CarriedTicketsSubmitted", carry->tickets);
+					carry->Clear();
+				}
 				for (const auto batch : group) {
 					if (!ok) break;
 					const auto* packet = static_cast<const compiler::PreparedRhiExecutionBatch*>(packets[batch].get());
@@ -775,11 +908,11 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 				const auto* packet = dynamic_cast<const compiler::PreparedRhiExecutionBatch*>(packets[i].get());
 				const bool leadingUploads = std::ranges::any_of(planned.leading, [&](const auto& leading) { return leading.batch == i && leading.copies; });
 				if (!packet || leadingUploads) {
-					if (!flush() || !submitPacket(i)) return false;
+					if (!flush(false) || !submitPacket(i)) return false;
 					continue;
 				}
 				const auto queue = graph.batches[i].queue;
-				if (queue != groupQueue && !flush()) return false;
+				if (queue != groupQueue && !flush(false)) return false;
 				groupQueue = queue;
 				groupRhiQueue = packet->SubmitQueue();
 				for (const auto wait : batches[i].waits) {
@@ -789,15 +922,18 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 				}
 				batches[i].extraTimelines = extra[i];
 				if (handoff[i]) batches[i].leading = {&handoff[i], 1};
+				// An inline late batch is recorded here, and a pass recorded at execution may submit work of its own on the queue (an
+				// external client's, after a drain). The held group goes first, so nothing comes ahead of it on the queue.
+				if (packet->Inline() && carry && !FlushSubmitCarry(*carry)) return false;
 				if (!packet->Gather(batches[i], gathered)) {
 					// Its effects are abandoned. The batches gathered before it still go to the queue.
-					(void)flush();
+					(void)flush(false);
 					return false;
 				}
 				if (!packet->Inline()) census.Add(Census::List::Batch, packet->Lists().size());
 				group.push_back(i);
 			}
-			if (!flush()) return false;
+			if (!flush(true)) return false;
 		} else {
 			BT_ZONE_SCOPE("ORG.Frame.SubmitPackets");
 			for (uint32_t i = 0; i < batchCount; ++i)
@@ -834,6 +970,7 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 			rhi::SubmitDesc submit{};
 			submit.waits = {waits.data(), static_cast<uint32_t>(waits.size())};
 			submit.signals = {&point, 1u};
+			if (carry && !FlushSubmitCarry(*carry)) return false;
 			if (m_queueRegistry.GetQueue(index).Submit({&list, 1u}, submit) != rhi::Result::Ok) return false;
 			census.Add(Census::List::HomeAcquire);
 			if (census.On()) {
