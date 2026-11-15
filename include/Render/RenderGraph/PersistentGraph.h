@@ -573,6 +573,11 @@ public:
     // Requires every resource of an execution to be used from one queue. Set before the first Prepare.
     void SetClosedExecutions(bool closed);
     bool ClosedExecutions() const noexcept { return m_closed; }
+    // Resting at last use, for closed executions (BackingStateAdmissionLedger::Prepare restAtLastUse): each resource rests in the
+    // state its last use in the execution left it, instead of its home state. The closed plan cache is not used then: its entry
+    // barriers assume every closed execution before it left its resources at home. Set before the first Prepare.
+    void SetRestAtLastUse(bool rest);
+    bool RestAtLastUse() const noexcept { return m_restAtLastUse; }
     // External home states, an interop option (BackingStateAdmissionLedger::Prepare externalHome): every host-owned texture an
     // execution touches leaves it in its home state on the graphics queue. Set before the first Prepare.
     void SetExternalHomeStates(bool externalHome);
@@ -668,6 +673,7 @@ private:
     void ErasePendingOwner(uint64_t sequence);
     bool m_closed = false;
     bool m_externalHome = false;
+    bool m_restAtLastUse = false;
     uint32_t m_uploadQueue = UINT32_MAX;  // SetUploadQueue
     struct CachedPlan {
         std::weak_ptr<const ExecutableGeneration> executable;

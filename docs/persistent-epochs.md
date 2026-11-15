@@ -342,6 +342,12 @@ recording per frame slot. These options serve it; each is independent of the oth
 -   **Closed epochs.** `SetClosedEpochs(epochs)` closes the listed epochs alone (`RenderGraph::SetPersistentClosedExecutions`).
     A closed execution still takes its entry barriers from the ledgers, so it may follow open ones. It leaves every resource
     at home, which costs exit barriers in its body.
+-   **Resting at last use.** `SetRestAtLastUseEpochs(epochs)` makes the listed closed epochs leave each resource in the state its
+    last use in the execution left it, instead of at home (`RenderGraph::SetPersistentRestAtLastUse`, the ledger's
+    `restAtLastUse`). The resting state then depends on the epoch's graph alone, so the execution after it finds the same states
+    whenever the same graph ran before it, and closing costs no exit barriers (Community Shaders' pre-depth segment: 279 body
+    barriers a run going home, 43 resting). The closed plan cache is off for such an epoch: its entry barriers assume every closed
+    execution before it went home. Test: `PersistentGraphTests`, "Resting at last use".
 -   **Private alias pools.** `SetPrivateAliasEpochs(epochs)` keeps the listed epochs' transients out of the shared alias
     arena. In the shared arena another epoch's transients took their memory between two of their executions, so every
     admission found alias activations and planned against the ledgers instead of taking its predicted plan.

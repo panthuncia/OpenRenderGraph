@@ -270,6 +270,10 @@ private:
 	// its admission does not depend on what ran before. Set before the first frame.
 	void SetPersistentClosedExecutions(bool closed) noexcept { m_persistentClosedExecutions = closed; }
 	bool PersistentClosedExecutions() const noexcept { return m_persistentClosedExecutions; }
+	// Resting at last use (persistent::SynchronousAdmission::SetRestAtLastUse), for closed executions: each resource rests in the
+	// state its last use left it, not at home. Set before the first persistent preparation.
+	void SetPersistentRestAtLastUse(bool rest) noexcept { m_persistentRestAtLastUse = rest; }
+	bool PersistentRestAtLastUse() const noexcept { return m_persistentRestAtLastUse; }
 	// External home states (persistent::SynchronousAdmission::SetExternalHomeStates), an interop option: every execution gives
 	// each host-owned texture it touches (Resource::HostOwned) back in its home state on the graphics queue. Set before the first
 	// frame.
@@ -898,6 +902,7 @@ private:
 	std::atomic<std::shared_ptr<const PersistentScheduleSnapshot>> m_scheduleSnapshot;
 	std::vector<uint32_t> m_persistentEpochOrder;
 	bool m_persistentClosedExecutions = false;
+	bool m_persistentRestAtLastUse = false;
 	bool m_persistentExternalHomeStates = false;
 	std::shared_ptr<PersistentAliasArena> m_persistentAliasArena;
 	// SetExternalPersistentEpochs; and the secondary lists their tickets record into, per queue slot in the host's stream (graphics

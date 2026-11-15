@@ -235,10 +235,13 @@ public:
     // execution touches leaves it in its home state (as closeToHome's) on the graphics queue (slot 0), so the host finds it where
     // it left it. A last use on another queue releases it to the graphics queue (homeAcquires). Other resources are left as the
     // execution leaves them, for the ledger to hand off.
+    // restAtLastUse: with closeToHome, each resource rests in the state its last use in the execution left it, instead of its home
+    // state. Its resting state then depends on the graph alone, and closing costs no exit barriers. It stays on the queue of its
+    // last use, as a closed execution's resources always do.
     PreparedExecutionBarrierPlan Prepare(
         const Schedule& graph, std::span<const PreparedBackingState> initial,
         std::span<const rhi::ResourceHandle> invalidated = {}, bool closeToHome = false, bool entryOnly = false,
-        bool validated = false, uint64_t backingSet = 0, bool externalHome = false) const;
+        bool validated = false, uint64_t backingSet = 0, bool externalHome = false, bool restAtLastUse = false) const;
     void CommitBatch(const PreparedBatchBarriers&);
     // The same, each commit's entry found by its compiler resource index (PreparedBatchBarriers::committedIndices) in the backings'
     // set (backingSet as for Prepare).

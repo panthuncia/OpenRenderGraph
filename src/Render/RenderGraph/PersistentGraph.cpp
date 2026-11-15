@@ -1922,7 +1922,7 @@ void SynchronousAdmission::AdmitLedger(FrameAdmission& frame, bool cacheEligible
     // A closed execution's plan is a function of its executable and backings alone, unless the frame brings
     // states of its own (rebindings, incoming states, alias invalidation). An entry-only admission never takes a cached plan (it has the
     // body's barriers): none is looked for.
-    const bool cacheable = m_closed && cacheEligible && invalidated.empty() && !frame.entryOnly;
+    const bool cacheable = m_closed && !m_restAtLastUse && cacheEligible && invalidated.empty() && !frame.entryOnly;
     CachedPlan* cached = nullptr;
     if (cacheable) {
         std::erase_if(m_planCache, [](const CachedPlan& entry) { return entry.executable.expired(); });
@@ -1953,7 +1953,7 @@ void SynchronousAdmission::AdmitLedger(FrameAdmission& frame, bool cacheEligible
         }
         auto& prediction = *predictionSlot->prediction;
         prediction.plan = std::make_shared<const compiler::PreparedExecutionBarrierPlan>(m_sequencer->states.Prepare(graph, frame.backings,
-            invalidated, m_closed, true, frame.backings.Validated(), frame.backings.Id(), m_externalHome));
+            invalidated, m_closed, true, frame.backings.Validated(), frame.backings.Id(), m_externalHome, m_restAtLastUse));
         m_sequencer->states.Capture(prediction, graph, frame.backings, frame.backings.Id());
         frame.sharedBarriers = prediction.plan;
         frame.prediction = predictionSlot->prediction;
@@ -1975,13 +1975,13 @@ void SynchronousAdmission::AdmitLedger(FrameAdmission& frame, bool cacheEligible
             std::erase_if(m_bodyCache, [](const CachedBody& entry) { return entry.executable.expired(); });
             if (m_bodyCache.size() >= 64) m_bodyCache.erase(m_bodyCache.begin());
             auto made = std::make_shared<const compiler::PreparedExecutionBarrierPlan>(m_sequencer->states.Prepare(graph, frame.backings,
-                invalidated, m_closed, false, frame.backings.Validated(), id, m_externalHome));
+                invalidated, m_closed, false, frame.backings.Validated(), id, m_externalHome, m_restAtLastUse));
             m_bodyCache.push_back({executable, id, m_externalHome, made});
             frame.sharedBarriers = std::move(made);
         }
     } else {
         frame.barriers = m_sequencer->states.Prepare(graph, frame.backings, invalidated, m_closed, frame.entryOnly, frame.backings.Validated(),
-            frame.backings.Id(), m_externalHome);
+            frame.backings.Id(), m_externalHome, m_restAtLastUse);
         if (cacheable) {
             ++m_planCacheMisses;
             if (m_planCache.size() >= 64) m_planCache.erase(m_planCache.begin());
@@ -2057,6 +2057,15 @@ void SynchronousAdmission::SetClosedExecutions(bool closed) {
     if (m_closed != closed) m_planCache.clear();
     m_closed = closed;
 }
+void SynchronousAdmission::SetRestAtLastUse(bool rest) {
+    std::lock_guard lock(m_sequencer->mutex);
+    if (m_restAtLastUse != rest) {
+        m_planCache.clear();
+        m_bodyCache.clear();
+    }
+    m_restAtLastUse = rest;
+}
+
 void SynchronousAdmission::SetExternalHomeStates(bool externalHome) {
     std::lock_guard lock(m_sequencer->mutex);
     Require(m_pending.empty(), "External home states changed during a pending admission");

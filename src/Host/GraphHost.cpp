@@ -1058,6 +1058,7 @@ std::unique_ptr<RenderGraph> GraphHost::MakeGraph(const BuildInputs& inputs, boo
 		graph->CompileStructural();
 		if (inputs.epoch != persistent::AllEpochs) graph->SetPersistentEpochOrder({inputs.epoch});
 		graph->SetPersistentClosedExecutions(ClosedEpoch(inputs.epoch));
+		graph->SetPersistentRestAtLastUse(ClosedEpoch(inputs.epoch) && RestsAtLastUse(inputs.epoch));
 		graph->SetPersistentExternalHomeStates(m_desc.externalHomeStates);
 		if (inputs.aliasArena) graph->SetPersistentAliasArena(inputs.aliasArena);
 		graph->SetPersistentRecordingReuse(m_desc.reuseRecordings);
@@ -1714,6 +1715,14 @@ void GraphHost::SetPrivateAliasEpochs(std::vector<uint32_t> epochs) {
 
 bool GraphHost::ClosedEpoch(uint32_t epoch) const noexcept {
 	return m_desc.closedExecutions || std::ranges::find(m_closedEpochs, epoch) != m_closedEpochs.end();
+}
+
+void GraphHost::SetRestAtLastUseEpochs(std::vector<uint32_t> epochs) {
+	m_restEpochs = std::move(epochs);
+}
+
+bool GraphHost::RestsAtLastUse(uint32_t epoch) const noexcept {
+	return std::ranges::find(m_restEpochs, epoch) != m_restEpochs.end();
 }
 
 void GraphHost::SetEpochCopy(uint32_t epoch, uint32_t copy) {

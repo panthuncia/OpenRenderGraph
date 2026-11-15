@@ -816,6 +816,7 @@ void RenderGraph::BootstrapPersistentGraph() {
 					basic_telemetry::AddCounter("ORG.Ownership.RetirementRejected");
 			}, m_runtime->Sequencer());
 		state.admission->SetClosedExecutions(m_persistentClosedExecutions);
+		state.admission->SetRestAtLastUse(m_persistentRestAtLastUse);
 		state.admission->SetExternalHomeStates(m_persistentExternalHomeStates);
 		state.ensureRepresentations = [this](Resource& resource) { EnsurePersistentRepresentations(resource); };
 		state.deferAliasPlacement = m_deferFirstAliasPlacement;

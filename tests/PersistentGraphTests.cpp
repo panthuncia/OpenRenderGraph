@@ -445,6 +445,34 @@ int main() {
         try { (void)open.Prepare(writeEpoch,queues); } catch (const std::exception&) { threw = true; }
         CHECK(threw && !single.closed);
         open.Abandon(single);
+        // Resting at last use (SetRestAtLastUse): the same epochs closed, but each texture rests where its last use left it. No
+        // execution has an exit barrier, the next execution enters from that state, and the closed plan cache is not used.
+        SynchronousAdmission resting(8);
+        resting.SetClosedExecutions(true);
+        resting.SetRestAtLastUse(true);
+        auto commitResting = [&](const FrameAdmission& frame, uint64_t value) {
+            GraphExecutionTimeline receipt; receipt.batches.resize(frame.publication->executable->graph->batches.size());
+            for (auto& batch : receipt.batches) batch.signal = {12,value};
+            resting.Commit(frame,receipt);
+        };
+        auto exitBarriers = [](const FrameAdmission& frame) {
+            size_t count = 0;
+            for (const auto& batch : frame.Barriers().batches)
+                for (const auto& after : batch.afterPass) count += after.textures.size();
+            return count;
+        };
+        auto restWrite = resting.Prepare(writeEpoch,queues);
+        CHECK(restWrite.closed && exitBarriers(restWrite) == 0 && entryLayout(restWrite) == rhi::ResourceLayout::Common);
+        commitResting(restWrite,10);
+        // The reader finds the texture as the writer left it, in UnorderedAccess.
+        auto restRead = resting.Prepare(readEpoch,queues);
+        CHECK(exitBarriers(restRead) == 0 && !restRead.cachedPlan && entryLayout(restRead) == rhi::ResourceLayout::UnorderedAccess);
+        commitResting(restRead,11);
+        // And the next writer finds it in ShaderResource, where the reader left it.
+        auto restAgain = resting.Prepare(writeEpoch,queues);
+        CHECK(!restAgain.cachedPlan && entryLayout(restAgain) == rhi::ResourceLayout::ShaderResource);
+        commitResting(restAgain,12);
+        CHECK(resting.PlanCacheHits() == 0 && resting.PlanCacheMisses() == 0);
     }
     {
         // External home states: a host-owned texture used on the compute queue is taken from the graphics queue at entry and

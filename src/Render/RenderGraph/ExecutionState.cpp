@@ -152,7 +152,7 @@ void ValidatePreparedBackingOrder(const GraphCompileStructure& structure, std::s
 PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
     const Schedule& graph, std::span<const PreparedBackingState> initial,
     std::span<const rhi::ResourceHandle> invalidated, bool closeToHome, bool entryOnly, bool validated, uint64_t backingSet,
-    bool externalHome) const {
+    bool externalHome, bool restAtLastUse) const {
     BT_ZONE_SCOPE("ORG.Execution.ResolveBackingStates");
     if (!graph.structure || !graph.states.complete || initial.size() != graph.structure->resourceIDs.size())
         throw std::invalid_argument("Incomplete symbolic state admission input");
@@ -795,7 +795,10 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
                     if (cells.last[cell] == UINT32_MAX) continue;
                     const auto& last = graph.states.steps[cells.last[cell]];
                     CompileResourceState home = graph.states.steps[cells.first[cell]].before;
-                    if (captured.regions) for (const auto& region : *captured.regions)
+                    // Resting at last use: the cell stays as its last use left it. No exit barrier, and the ledger records that state.
+                    const bool rests = restAtLastUse && closeToHome && !external;
+                    if (rests) home = last.after;
+                    if (captured.regions && !rests) for (const auto& region : *captured.regions)
                         if (mip >= region.range.mip && mip < region.range.mip + region.range.mips
                             && slice >= region.range.slice && slice < region.range.slice + region.range.slices) {
                             home = region.state;
