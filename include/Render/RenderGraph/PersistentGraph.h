@@ -445,6 +445,8 @@ struct FrameAdmission {
     std::shared_ptr<const compiler::PreparedExecutionBarrierPlan> sharedBarriers;
     // An entry-only admission's prediction (SynchronousAdmission's, per executable), which its commit takes the ledger's grids from.
     std::shared_ptr<compiler::StatePrediction> prediction;
+    // The plan came from a prediction whose states held (the last one or an earlier one the slot kept), not from planning.
+    bool predicted = false;
     const compiler::PreparedExecutionBarrierPlan& Barriers() const noexcept { return sharedBarriers ? *sharedBarriers : barriers; }
     std::vector<std::vector<compiler::ExecutionTimelinePoint>> incomingWaits;
     // Per batch, (compiler resource index, wait): every earlier access (writer and readers, any queue) the ledger holds of each

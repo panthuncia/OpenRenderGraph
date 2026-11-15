@@ -1902,6 +1902,7 @@ void SynchronousAdmission::AdmitLedger(FrameAdmission& frame, bool cacheEligible
         if (states.Predicts(*slot.prediction, frame.backings, frame.backings.Id())) {
             frame.sharedBarriers = slot.prediction->plan;
             frame.prediction = slot.prediction;
+            frame.predicted = true;
             ++m_predicted;
             census.Admitted(Census::Admission::Predicted);
         } else {
@@ -1910,6 +1911,7 @@ void SynchronousAdmission::AdmitLedger(FrameAdmission& frame, bool cacheEligible
                 std::swap(earlier, slot.prediction);
                 frame.sharedBarriers = slot.prediction->plan;
                 frame.prediction = slot.prediction;
+                frame.predicted = true;
                 ++m_predicted;
                 census.Admitted(Census::Admission::PredictedEarlier);
                 break;

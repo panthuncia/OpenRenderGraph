@@ -247,6 +247,22 @@ std::string RenderGraph::PersistentTicketStaleReason(const PersistentTicket& tic
 	return "current";
 }
 
+RenderGraph::PersistentTicketKey RenderGraph::PersistentTicketKeyOf(const PersistentTicket& ticket) noexcept {
+	PersistentTicketKey key;
+	const auto mix = [](uint64_t a_hash, const void* a_pointer) {
+		return (a_hash ^ reinterpret_cast<uintptr_t>(a_pointer)) * 1099511628211ull;
+	};
+	key.recordings = key.plans = 1469598103934665603ull;
+	const auto add = [&](const PersistentTicket::Segment& a_segment) {
+		key.recordings = mix(key.recordings, a_segment.recording.get());
+		key.plans = mix(key.plans, a_segment.admission.sharedBarriers.get());
+		key.planned = key.planned && a_segment.admission.predicted;
+	};
+	// A bound candidate's segment is in segments by now (its own went to displaced).
+	for (const auto& segment : ticket.segments) add(segment);
+	return key;
+}
+
 bool RenderGraph::PersistentTicketCurrent(const PersistentTicket& ticket) {
 	BT_ZONE_SCOPE("ORG.Persistent.CheckTicket");
 	if (ticket.uncheckable) return false;

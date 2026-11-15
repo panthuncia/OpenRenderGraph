@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -788,6 +789,30 @@ public:
 	};
 	SubmitThreadStats TakeSubmitThreadStats();
 
+	// The segment census (diagnostics, off by default). The host names the frame segment its next submissions belong to
+	// (SetSubmissionSegment, render owner, before SubmitEpoch). The submission thread groups each frame's admitted tickets by
+	// segment, in order, and compares each segment's signature with the last frame's: the ordered epochs, each ticket's
+	// recordings and its admission plans. A segment whose signature changed would have to be recorded again as one list.
+	static constexpr uint32_t kCensusSegments = 16;
+	void SetSegmentCensus(bool enabled) noexcept { m_segmentCensusOn.store(enabled, std::memory_order_relaxed); }
+	void SetSubmissionSegment(uint32_t segment) noexcept { m_submissionSegment = segment < kCensusSegments ? segment : kCensusSegments - 1; }
+	struct SegmentStats {
+		uint64_t frames = 0;
+		struct PerSegment {
+			uint64_t runs = 0;        // times the segment closed (more than one a frame: its tickets were not contiguous)
+			uint64_t executions = 0;  // tickets in it
+			uint64_t changed = 0;     // runs whose signature was not among the segment's last four (a list kept per signature would miss)
+			uint64_t order = 0, recordings = 0, plans = 0;  // of those, what differed (several may)
+			uint64_t unplanned = 0;   // tickets admitted against the ledgers, without a predicted plan
+		};
+		std::array<PerSegment, kCensusSegments> segments{};
+		// Per epoch (the first 64): submissions whose recordings were none of the epoch's last four, so a segment list holding
+		// it would be recorded again.
+		std::array<uint64_t, 64> newRecordings{};
+	};
+	// Any thread. Since the last call.
+	SegmentStats TakeSegmentStats();
+
 private:
 	// One epoch's graph (the only one, of every pass, without epochs).
 	struct Instance {
@@ -936,6 +961,14 @@ private:
 	std::atomic<uint64_t> m_sealsPushed{0};
 	// Where a seal is passed: on the submission thread for a queued seal (a_marker set), else on the calling thread.
 	void PassSeal(const std::shared_ptr<GpuPoint::Pending>& a_marker);
+	// The segment census (SetSegmentCensus). The segment is the render owner's; the rest is the submitting thread's.
+	std::atomic<bool> m_segmentCensusOn{false};
+	uint32_t m_submissionSegment = 0;
+	struct SegmentCensusState;
+	std::unique_ptr<SegmentCensusState> m_segmentCensus;
+	// Submitting thread: an admitted ticket of a_segment, and the frame's end (the seal).
+	void NoteSegmentTicket(uint32_t a_segment, uint32_t a_epoch, const RenderGraph::PersistentTicketKey& a_key);
+	void CloseSegment(bool a_frameEnd);
 	uint64_t m_buildGeneration = 0;
 	std::unique_ptr<Async> m_async;
 	EpochFailedCallback m_epochFailed;
