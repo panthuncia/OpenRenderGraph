@@ -341,7 +341,10 @@ recording per frame slot. These options serve it; each is independent of the oth
     takes waits for no GPU work: the copy's last run is a whole cycle of slots old.
 -   **Closed epochs.** `SetClosedEpochs(epochs)` closes the listed epochs alone (`RenderGraph::SetPersistentClosedExecutions`).
     A closed execution still takes its entry barriers from the ledgers, so it may follow open ones. It leaves every resource
-    at home, which costs exit barriers in its body.
+    at home, which costs exit barriers in its body. A closed execution's recording holds its entry barriers, made from the
+    ledgers when it was recorded: a kept recording of a closed epoch next to open ones goes stale when a neighbour leaves a
+    resource in another state, and its submission then enters from the wrong layout (Community Shaders saw it at the first
+    frame its DCLF epochs drew). Keep such epochs open until every neighbour is closed too.
 -   **Resting at last use.** `SetRestAtLastUseEpochs(epochs)` makes the listed closed epochs leave each resource in the state its
     last use in the execution left it, instead of at home (`RenderGraph::SetPersistentRestAtLastUse`, the ledger's
     `restAtLastUse`). The resting state then depends on the epoch's graph alone, so the execution after it finds the same states
