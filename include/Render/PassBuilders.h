@@ -898,6 +898,7 @@ private:
         case A::DepthRead: addDepthRead(resource); break;
         case A::DepthReadWrite: addDepthReadWrite(resource); break;
         case A::DepthStencilClear: addDepthStencilClear(resource); break;
+        case A::Common: addLegacyInterop(resource); break;
         case A::CopySource: addCopySource(resource); break;
         case A::CopyDest: addCopyDest(resource); break;
         case A::RaytracingAccelerationStructureRead: addAccelerationStructureRead(resource); break;
@@ -1009,6 +1010,11 @@ public:
     }
     template<class T> DeclaredResourceUse UnorderedAccess(const T& resource, UavView view = {}) {
         return DeclareResourceUse(resource, {rhi::ResourceAccessType::UnorderedAccess, {view}});
+    }
+    // A legacy interop use (the common state) with a token, for code outside the graph that records into the pass's list, such as
+    // a vendor SDK: Record resolves the token to this frame's backing (RecordingContext::Resolve). No view is declared.
+    template<class T> DeclaredResourceUse LegacyInteropUse(const T& resource) {
+        return DeclareResourceUse(resource, {rhi::ResourceAccessType::Common, {}});
     }
     template<class T> DeclaredResourceUse UnorderedAccess(const T& resource, std::span<const UavView> views) {
         ResourceUseSpecification specification{rhi::ResourceAccessType::UnorderedAccess, {}};
