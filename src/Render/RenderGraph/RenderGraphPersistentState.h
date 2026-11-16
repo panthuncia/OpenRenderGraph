@@ -651,6 +651,8 @@ struct RenderGraph::PersistentSegmentRun {
 	// Set by recording.
 	std::shared_ptr<const compiler::RenderFrameSnapshot> sealed;
 	std::vector<compiler::FrameRecordingJob> jobs;
+	// The body barriers the jobs record (their lists' per-pass batches, after FoldSkippedPassBarriers).
+	uint64_t bodyBarriers = 0;
 	std::vector<std::shared_ptr<compiler::OwnedRecordingStatistics>> recordingStatistics;
 	std::optional<compiler::RecordedFrame> recorded;
 };

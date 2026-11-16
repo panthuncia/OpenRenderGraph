@@ -6,6 +6,7 @@
 #include "Render/PreparedPass.h"
 #include "Render/RenderGraph/PersistentGraph.h"
 #include "Render/RenderGraph/SubmissionCensus.h"
+#include "Render/BufferBarrierHelpers.h"
 #include "Render/CommandListPool.h"
 #include "Render/Runtime/IStatisticsService.h"
 #include <algorithm>
@@ -819,9 +820,119 @@ inline std::atomic<bool>& DiagnosticSkipPassQueries() {
     return skip;
 }
 
+// Diagnostics: lists built while set keep the barriers of the passes their host turned off ahead where the plan put them
+// (FoldSkippedPassBarriers is not applied). For A/B timing runs.
+inline std::atomic<bool>& DiagnosticKeepSkippedPassBarriers() {
+    static std::atomic<bool> keep{false};
+    return keep;
+}
+
 } // namespace org::diagnostics
 
 namespace org::compiler {
+
+// Folds the barriers of the passes its host turned off ahead (PreparedPass::SkippedAhead) into the next pass that runs.
+// A run of skipped passes does no work, so the transitions it plans on one subresource compose into one: from the state
+// before the run to the state after it. They go into the before batch of the next pass that runs, composed with that
+// pass's own where they name the same subresource. A run at the end of the list goes into the last pass's after batch.
+// A composed transition between equal states is dropped. Each backing ends in the state the plan gives it, so the
+// ledger's commits stay true.
+// The list is left as it is when a skipped pass's barrier transfers ownership, or when two barriers of one batch name
+// overlapping but different ranges of a resource: barriers of one batch are unordered against each other.
+// Returns the barriers removed.
+inline size_t FoldSkippedPassBarriers(OwnedRecordingList& recording) {
+    const size_t count = recording.passes.size();
+    if (!count || recording.barriersBeforePass.size() != count || recording.barriersAfterPass.size() != count) return 0;
+    if (std::none_of(recording.passes.begin(), recording.passes.end(), [](const PreparedPass& p) { return p.SkippedAhead(); })) return 0;
+    const auto sameHandle = [](rhi::ResourceHandle a, rhi::ResourceHandle b) { return a.index == b.index && a.generation == b.generation; };
+    const auto sameRange = [](const rhi::TextureSubresourceRange& a, const rhi::TextureSubresourceRange& b) {
+        return a.baseMip == b.baseMip && a.mipCount == b.mipCount && a.baseLayer == b.baseLayer && a.layerCount == b.layerCount
+            && a.basePlane == b.basePlane && a.planeCount == b.planeCount;
+    };
+    const auto overlaps = [](uint32_t a, uint32_t an, uint32_t b, uint32_t bn) {
+        const uint64_t ae = an == ~0u ? ~0ull : uint64_t{a} + an, be = bn == ~0u ? ~0ull : uint64_t{b} + bn;
+        return a < be && b < ae;
+    };
+    const auto rangesOverlap = [&](const rhi::TextureSubresourceRange& a, const rhi::TextureSubresourceRange& b) {
+        return overlaps(a.baseMip, a.mipCount, b.baseMip, b.mipCount) && overlaps(a.baseLayer, a.layerCount, b.baseLayer, b.layerCount)
+            && overlaps(a.basePlane, a.planeCount, b.basePlane, b.planeCount);
+    };
+    const auto transfers = [](const auto& barrier) {
+        return barrier.queueOwnership != rhi::QueueOwnership::None
+            || barrier.externalOwnership != std::remove_cvref_t<decltype(barrier)>::ExternalOwnership::None;
+    };
+    using Batch = PreparedBatchBarriers::BeforePass;
+    // Folds a_barriers into a_into, in order. False when one cannot be folded.
+    const auto fold = [&](Batch& into, const Batch& barriers) {
+        for (const auto& barrier : barriers.textures) {
+            bool placed = false;
+            for (auto& held : into.textures) {
+                if (!sameHandle(held.texture, barrier.texture)) continue;
+                if (sameRange(held.range, barrier.range) && !transfers(held) && !transfers(barrier)) {
+                    held.afterSync = barrier.afterSync;
+                    held.afterAccess = barrier.afterAccess;
+                    held.afterLayout = barrier.afterLayout;
+                    placed = true;
+                    break;
+                }
+                if (rangesOverlap(held.range, barrier.range)) return false;
+            }
+            if (!placed) into.textures.push_back(barrier);
+        }
+        for (const auto& barrier : barriers.buffers) {
+            bool placed = false;
+            for (auto& held : into.buffers) {
+                if (!sameHandle(held.buffer, barrier.buffer)) continue;
+                if (held.offset == barrier.offset && held.size == barrier.size && !transfers(held) && !transfers(barrier)) {
+                    held.afterSync = barrier.afterSync;
+                    held.afterAccess = barrier.afterAccess;
+                    placed = true;
+                    break;
+                }
+                const uint64_t heldEnd = held.size == ~0ull ? ~0ull : held.offset + held.size;
+                const uint64_t end = barrier.size == ~0ull ? ~0ull : barrier.offset + barrier.size;
+                if (held.offset < end && barrier.offset < heldEnd) return false;
+            }
+            if (!placed) into.buffers.push_back(barrier);
+        }
+        return true;
+    };
+    std::vector<Batch> before(count), after(count);
+    Batch pending;
+    for (size_t i = 0; i < count; ++i) {
+        if (recording.passes[i].SkippedAhead()) {
+            if (!fold(pending, recording.barriersBeforePass[i]) || !fold(pending, recording.barriersAfterPass[i])) return 0;
+            continue;
+        }
+        if (!fold(pending, recording.barriersBeforePass[i])) return 0;
+        before[i] = std::move(pending);
+        pending = {};
+        after[i] = recording.barriersAfterPass[i];
+    }
+    // The list ends in skipped passes: the last one's after batch holds the run.
+    if (!pending.textures.empty() || !pending.buffers.empty()) after[count - 1] = std::move(pending);
+    // A composed transition between equal states orders nothing.
+    const auto drop = [&](Batch& batch) {
+        std::erase_if(batch.textures, [&](const rhi::TextureBarrier& b) {
+            return !transfers(b) && b.beforeLayout == b.afterLayout && !org::NeedsWholeBufferBarrier(b.beforeAccess, b.afterAccess, b.beforeSync, b.afterSync);
+        });
+        std::erase_if(batch.buffers, [&](const rhi::BufferBarrier& b) {
+            return !transfers(b) && !org::NeedsWholeBufferBarrier(b.beforeAccess, b.afterAccess, b.beforeSync, b.afterSync);
+        });
+    };
+    size_t was = 0, now = 0;
+    for (size_t i = 0; i < count; ++i) {
+        was += recording.barriersBeforePass[i].textures.size() + recording.barriersBeforePass[i].buffers.size()
+            + recording.barriersAfterPass[i].textures.size() + recording.barriersAfterPass[i].buffers.size();
+        if (recording.passes[i].SkippedAhead() && i + 1 < count) continue;
+        drop(before[i]);
+        drop(after[i]);
+        now += before[i].textures.size() + before[i].buffers.size() + after[i].textures.size() + after[i].buffers.size();
+    }
+    recording.barriersBeforePass = std::move(before);
+    recording.barriersAfterPass = std::move(after);
+    return was > now ? was - now : 0;
+}
 
 inline OwnedRecordingList BuildPersistentRecordingList(std::shared_ptr<const RenderFrameSnapshot> sealed, uint32_t batch) {
     if (!sealed) throw std::invalid_argument("Missing persistent frame seal");
@@ -845,6 +956,10 @@ inline OwnedRecordingList BuildPersistentRecordingList(std::shared_ptr<const Ren
         if (!invocation || invocation.IsConsumed() || !invocation.IsWorkerSafe())
             throw std::invalid_argument("Persistent recording list requires fresh worker-safe invocations");
         result.passes.push_back(invocation);
+    }
+    if (!diagnostics::DiagnosticKeepSkippedPassBarriers().load(std::memory_order_relaxed)) {
+        const auto folded = FoldSkippedPassBarriers(result);
+        if (folded) basic_telemetry::AddCounter("ORG.Execution.FoldedSkippedBarriers", static_cast<int64_t>(folded));
     }
     return result;
 }

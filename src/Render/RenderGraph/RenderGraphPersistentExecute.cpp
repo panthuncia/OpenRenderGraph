@@ -374,6 +374,11 @@ void RenderGraph::RecordPersistentSegment(PersistentSegmentRun& run) {
 		}
 	}
 	run.Lap(timings.acquireUs);
+	run.bodyBarriers = 0;
+	for (const auto& job : jobs) {
+		for (const auto& pass : job.recording.barriersBeforePass) run.bodyBarriers += pass.textures.size() + pass.buffers.size();
+		for (const auto& pass : job.recording.barriersAfterPass) run.bodyBarriers += pass.textures.size() + pass.buffers.size();
+	}
 	compiler::PlannedFrame plan{run.sealed, std::move(jobs), run.timelineBindings, admission.incomingWaits};
 	const size_t concurrency = (std::min<size_t>)(graph.batches.size(), 4u);
 	try {
@@ -482,12 +487,10 @@ void RenderGraph::SubmitPersistentSegment(PersistentSegmentRun& run) {
 			recording->statistics = std::move(run.recordingStatistics);
 			recording->replayable = keepable && std::ranges::all_of(recording->packets, [](const auto& packet) { return packet->Replayable(); });
 			{
-				// The body's barriers, for the segment census: what each replay of this recording records besides its entry barriers.
+				// The body's barriers, for the segment census: what each replay of this recording records besides its entry barriers
+				// (its lists' own, after the skipped passes' were folded).
 				const auto& plan = admission.Barriers();
-				for (const auto& batch : plan.batches) {
-					for (const auto& pass : batch.beforePass) recording->bodyBarriers += pass.textures.size() + pass.buffers.size();
-					for (const auto& pass : batch.afterPass) recording->bodyBarriers += pass.textures.size() + pass.buffers.size();
-				}
+				recording->bodyBarriers = run.bodyBarriers;
 				recording->bodyFullBarriers = admission.closed ? plan.batches.size() : 0;
 			}
 			m_recordingsRecorded.fetch_add(1, std::memory_order_relaxed);
