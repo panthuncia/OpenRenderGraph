@@ -73,7 +73,9 @@ public:
 
     bool RevisionHash(uint64_t& hash) const final {
         if constexpr (kHasRevision) {
-            std::vector<uint64_t> revision;
+            // Kept per thread: asked for every pass of a stage each frame, so it allocates nothing once it has grown.
+            thread_local std::vector<uint64_t> revision;
+            revision.clear();
             static_cast<const Derived*>(this)->Revision(revision);
             uint64_t value = 1469598103934665603ull;
             for (const auto word : revision) value = (value ^ word) * 1099511628211ull;

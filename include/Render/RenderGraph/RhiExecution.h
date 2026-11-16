@@ -731,11 +731,14 @@ struct OwnedRecordingGpuRanges {
 inline const char* OwnedRecordingBarrierRangeName(std::string_view where, std::string_view pass) {
     static std::mutex mutex;
     static std::set<std::string, std::less<>> names;
-    std::string name = "cs.org.barrier.";
+    // Built in a buffer kept per thread and looked up by view: a name seen before allocates nothing.
+    thread_local std::string name;
+    name.assign("cs.org.barrier.");
     name.append(where);
     if (!pass.empty()) { name.push_back('.'); name.append(pass); }
     std::lock_guard lock(mutex);
-    return names.insert(std::move(name)).first->c_str();
+    if (const auto found = names.find(std::string_view(name)); found != names.end()) return found->c_str();
+    return names.insert(name).first->c_str();
 }
 
 struct OwnedRecordingList {
@@ -907,21 +910,36 @@ inline bool FoldBarriersOfSkipped(const std::vector<PreparedBatchBarriers::Befor
         }
         return true;
     };
-    outBefore.assign(count, {});
-    outAfter.assign(count, {});
-    Batch pending;
+    // The outputs keep their batches' storage, and the pending run is a per-thread buffer: a caller that reuses its outputs
+    // allocates nothing once they have grown.
+    const auto clear = [](Batch& batch) {
+        batch.textures.clear();
+        batch.buffers.clear();
+    };
+    const auto copy = [](Batch& into, const Batch& from) {
+        into.textures.assign(from.textures.begin(), from.textures.end());
+        into.buffers.assign(from.buffers.begin(), from.buffers.end());
+    };
+    outBefore.resize(count);
+    outAfter.resize(count);
+    for (size_t i = 0; i < count; ++i) {
+        clear(outBefore[i]);
+        clear(outAfter[i]);
+    }
+    thread_local Batch pending;
+    clear(pending);
     for (size_t i = 0; i < count; ++i) {
         if (skipped[i]) {
             if (!fold(pending, before[i]) || !fold(pending, after[i])) return false;
             continue;
         }
         if (!fold(pending, before[i])) return false;
-        outBefore[i] = std::move(pending);
-        pending = {};
-        outAfter[i] = after[i];
+        copy(outBefore[i], pending);
+        clear(pending);
+        copy(outAfter[i], after[i]);
     }
     // The list ends in skipped passes: the last one's after batch holds the run.
-    if (!pending.textures.empty() || !pending.buffers.empty()) outAfter[count - 1] = std::move(pending);
+    if (!pending.textures.empty() || !pending.buffers.empty()) copy(outAfter[count - 1], pending);
     // A composed transition between equal states orders nothing.
     const auto drop = [&](Batch& batch) {
         std::erase_if(batch.textures, [&](const rhi::TextureBarrier& b) {
@@ -1084,12 +1102,29 @@ inline size_t RecordOwnedRecordingCommands(RecordingContext& context, const Owne
     // A late batch asks each pass first whether it skips this run. The barriers of the passes that skip fold into the next
     // pass that runs, as a list built with passes skipped ahead does (FoldSkippedPassBarriers): a pass with nothing to do
     // costs no barrier batch of its own. Every backing still ends in the state the plan gives it.
-    std::vector<uint8_t> skips;
-    std::vector<PreparedBatchBarriers::BeforePass> foldedBefore, foldedAfter;
+    // Kept per thread, so a late batch allocates nothing here once they have grown. A recording recorded inside another one's pass
+    // on the same thread (none does today) takes its own.
+    struct FoldScratch {
+        std::vector<uint8_t> skips;
+        std::vector<PreparedBatchBarriers::BeforePass> before, after;
+        bool busy = false;
+    };
+    thread_local FoldScratch kept;
+    FoldScratch own;
+    FoldScratch& scratch = kept.busy ? own : kept;
+    scratch.busy = true;
+    struct Release {
+        FoldScratch& scratch;
+        ~Release() { scratch.busy = false; }
+    } release{scratch};
+    auto& skips = scratch.skips;
+    auto& foldedBefore = scratch.before;
+    auto& foldedAfter = scratch.after;
+    skips.clear();
     const auto* beforeBatches = &recording.barriersBeforePass;
     const auto* afterBatches = &recording.barriersAfterPass;
     if (a_atExecution) {
-        skips.resize(recording.passes.size());
+        skips.assign(recording.passes.size(), 0);
         bool late = false;
         for (size_t i = 0; i < recording.passes.size(); ++i) {
             const auto& pass = recording.passes[i];
