@@ -827,23 +827,33 @@ inline std::atomic<bool>& DiagnosticKeepSkippedPassBarriers() {
     return keep;
 }
 
+// Barriers a late batch left out at execution: those of passes that skipped the run (PreparedPass::SkipsAtExecution),
+// folded into the next pass that ran (FoldBarriersOfSkipped). A running count; readers take differences.
+inline std::atomic<uint64_t>& FoldedAtExecutionBarriers() {
+    static std::atomic<uint64_t> count{0};
+    return count;
+}
+
 } // namespace org::diagnostics
 
 namespace org::compiler {
 
-// Folds the barriers of the passes its host turned off ahead (PreparedPass::SkippedAhead) into the next pass that runs.
+// Folds the barriers of the passes skipped[i] marks into the next pass that runs, writing the result to outBefore and
+// outAfter (one batch per pass, as before and after hold them).
 // A run of skipped passes does no work, so the transitions it plans on one subresource compose into one: from the state
 // before the run to the state after it. They go into the before batch of the next pass that runs, composed with that
 // pass's own where they name the same subresource. A run at the end of the list goes into the last pass's after batch.
 // A composed transition between equal states is dropped. Each backing ends in the state the plan gives it, so the
 // ledger's commits stay true.
-// The list is left as it is when a skipped pass's barrier transfers ownership, or when two barriers of one batch name
-// overlapping but different ranges of a resource: barriers of one batch are unordered against each other.
-// Returns the barriers removed.
-inline size_t FoldSkippedPassBarriers(OwnedRecordingList& recording) {
-    const size_t count = recording.passes.size();
-    if (!count || recording.barriersBeforePass.size() != count || recording.barriersAfterPass.size() != count) return 0;
-    if (std::none_of(recording.passes.begin(), recording.passes.end(), [](const PreparedPass& p) { return p.SkippedAhead(); })) return 0;
+// False, with the outputs unspecified, when a skipped pass's barrier transfers ownership, or when two barriers of one batch
+// would name overlapping but different ranges of a resource (barriers of one batch are unordered against each other): the
+// caller keeps the barriers as they are. removed gets the barriers the fold took out.
+inline bool FoldBarriersOfSkipped(const std::vector<PreparedBatchBarriers::BeforePass>& before,
+    const std::vector<PreparedBatchBarriers::BeforePass>& after, const std::vector<uint8_t>& skipped,
+    std::vector<PreparedBatchBarriers::BeforePass>& outBefore, std::vector<PreparedBatchBarriers::BeforePass>& outAfter, size_t& removed) {
+    removed = 0;
+    const size_t count = skipped.size();
+    if (!count || before.size() != count || after.size() != count) return false;
     const auto sameHandle = [](rhi::ResourceHandle a, rhi::ResourceHandle b) { return a.index == b.index && a.generation == b.generation; };
     const auto sameRange = [](const rhi::TextureSubresourceRange& a, const rhi::TextureSubresourceRange& b) {
         return a.baseMip == b.baseMip && a.mipCount == b.mipCount && a.baseLayer == b.baseLayer && a.layerCount == b.layerCount
@@ -897,20 +907,21 @@ inline size_t FoldSkippedPassBarriers(OwnedRecordingList& recording) {
         }
         return true;
     };
-    std::vector<Batch> before(count), after(count);
+    outBefore.assign(count, {});
+    outAfter.assign(count, {});
     Batch pending;
     for (size_t i = 0; i < count; ++i) {
-        if (recording.passes[i].SkippedAhead()) {
-            if (!fold(pending, recording.barriersBeforePass[i]) || !fold(pending, recording.barriersAfterPass[i])) return 0;
+        if (skipped[i]) {
+            if (!fold(pending, before[i]) || !fold(pending, after[i])) return false;
             continue;
         }
-        if (!fold(pending, recording.barriersBeforePass[i])) return 0;
-        before[i] = std::move(pending);
+        if (!fold(pending, before[i])) return false;
+        outBefore[i] = std::move(pending);
         pending = {};
-        after[i] = recording.barriersAfterPass[i];
+        outAfter[i] = after[i];
     }
     // The list ends in skipped passes: the last one's after batch holds the run.
-    if (!pending.textures.empty() || !pending.buffers.empty()) after[count - 1] = std::move(pending);
+    if (!pending.textures.empty() || !pending.buffers.empty()) outAfter[count - 1] = std::move(pending);
     // A composed transition between equal states orders nothing.
     const auto drop = [&](Batch& batch) {
         std::erase_if(batch.textures, [&](const rhi::TextureBarrier& b) {
@@ -922,16 +933,29 @@ inline size_t FoldSkippedPassBarriers(OwnedRecordingList& recording) {
     };
     size_t was = 0, now = 0;
     for (size_t i = 0; i < count; ++i) {
-        was += recording.barriersBeforePass[i].textures.size() + recording.barriersBeforePass[i].buffers.size()
-            + recording.barriersAfterPass[i].textures.size() + recording.barriersAfterPass[i].buffers.size();
-        if (recording.passes[i].SkippedAhead() && i + 1 < count) continue;
-        drop(before[i]);
-        drop(after[i]);
-        now += before[i].textures.size() + before[i].buffers.size() + after[i].textures.size() + after[i].buffers.size();
+        was += before[i].textures.size() + before[i].buffers.size() + after[i].textures.size() + after[i].buffers.size();
+        drop(outBefore[i]);
+        drop(outAfter[i]);
+        now += outBefore[i].textures.size() + outBefore[i].buffers.size() + outAfter[i].textures.size() + outAfter[i].buffers.size();
     }
+    removed = was > now ? was - now : 0;
+    return true;
+}
+
+// Folds the barriers of the passes its host turned off ahead (PreparedPass::SkippedAhead) into the next pass that runs
+// (FoldBarriersOfSkipped). The list is left as it is when they cannot be folded. Returns the barriers removed.
+inline size_t FoldSkippedPassBarriers(OwnedRecordingList& recording) {
+    const size_t count = recording.passes.size();
+    if (!count || recording.barriersBeforePass.size() != count || recording.barriersAfterPass.size() != count) return 0;
+    if (std::none_of(recording.passes.begin(), recording.passes.end(), [](const PreparedPass& p) { return p.SkippedAhead(); })) return 0;
+    std::vector<uint8_t> skipped(count);
+    for (size_t i = 0; i < count; ++i) skipped[i] = recording.passes[i].SkippedAhead() ? 1 : 0;
+    std::vector<PreparedBatchBarriers::BeforePass> before, after;
+    size_t removed = 0;
+    if (!FoldBarriersOfSkipped(recording.barriersBeforePass, recording.barriersAfterPass, skipped, before, after, removed)) return 0;
     recording.barriersBeforePass = std::move(before);
     recording.barriersAfterPass = std::move(after);
-    return was > now ? was - now : 0;
+    return removed;
 }
 
 inline OwnedRecordingList BuildPersistentRecordingList(std::shared_ptr<const RenderFrameSnapshot> sealed, uint32_t batch) {
@@ -1057,6 +1081,30 @@ inline size_t RecordOwnedRecordingCommands(RecordingContext& context, const Owne
         barriers.textures = {recording.acquiredBarriers.data(), static_cast<uint32_t>(recording.acquiredBarriers.size())};
         recordBarriers("entry", firstPass, barriers);
     }
+    // A late batch asks each pass first whether it skips this run. The barriers of the passes that skip fold into the next
+    // pass that runs, as a list built with passes skipped ahead does (FoldSkippedPassBarriers): a pass with nothing to do
+    // costs no barrier batch of its own. Every backing still ends in the state the plan gives it.
+    std::vector<uint8_t> skips;
+    std::vector<PreparedBatchBarriers::BeforePass> foldedBefore, foldedAfter;
+    const auto* beforeBatches = &recording.barriersBeforePass;
+    const auto* afterBatches = &recording.barriersAfterPass;
+    if (a_atExecution) {
+        skips.resize(recording.passes.size());
+        bool late = false;
+        for (size_t i = 0; i < recording.passes.size(); ++i) {
+            const auto& pass = recording.passes[i];
+            const bool ahead = pass.SkippedAhead();
+            skips[i] = static_cast<uint8_t>(ahead || (a_again ? pass.SkipsAgain(context) : pass.SkipsAtExecution(context)));
+            late = late || (skips[i] && !ahead);
+        }
+        size_t removed = 0;
+        if (late && !diagnostics::DiagnosticKeepSkippedPassBarriers().load(std::memory_order_relaxed)
+            && FoldBarriersOfSkipped(recording.barriersBeforePass, recording.barriersAfterPass, skips, foldedBefore, foldedAfter, removed)) {
+            beforeBatches = &foldedBefore;
+            afterBatches = &foldedAfter;
+            if (removed) diagnostics::FoldedAtExecutionBarriers().fetch_add(removed, std::memory_order_relaxed);
+        }
+    }
     const auto recordPassBarriers = [&](const std::vector<PreparedBatchBarriers::BeforePass>& all, size_t passIndex, const char* where,
         std::string_view pass) {
         if (all.empty()) return;
@@ -1073,13 +1121,13 @@ inline size_t RecordOwnedRecordingCommands(RecordingContext& context, const Owne
         // recorded again asks the same for its new run (SkipsAgain).
         // A pass its host turned off for this execution (PreparedPass::SkippedAhead) is skipped the same way, recorded ahead or not.
         const auto& pass = recording.passes[passIndex];
-        if (pass.SkippedAhead() || (a_atExecution && (a_again ? pass.SkipsAgain(context) : pass.SkipsAtExecution(context)))) {
+        if (a_atExecution ? skips[passIndex] != 0 : pass.SkippedAhead()) {
             BT_ZONE_SCOPE("ORG.Execution.RecordOwned.Skipped");
             const auto passLabel = pass.DebugName();
             BT_ZONE_TEXT(passLabel.data(), passLabel.size());
-            recordPassBarriers(recording.barriersBeforePass, passIndex, "before", passLabel);
+            recordPassBarriers(*beforeBatches, passIndex, "before", passLabel);
             if (!a_again) pass.RecordNothing();
-            recordPassBarriers(recording.barriersAfterPass, passIndex, "after", passLabel);
+            recordPassBarriers(*afterBatches, passIndex, "after", passLabel);
             continue;
         }
         BT_ZONE_SCOPE("ORG.Execution.RecordOwned.Pass");
@@ -1090,9 +1138,9 @@ inline size_t RecordOwnedRecordingCommands(RecordingContext& context, const Owne
         const auto passLabel = recording.passes[passIndex].DebugName();
         BT_ZONE_TEXT(passLabel.data(), passLabel.size());
         rhi::debug::Scope captureScope(context.Commands(), rhi::colors::Mint, passLabel.empty() ? "<unnamed>" : passLabel.data());
-        if (!recording.barriersBeforePass.empty()) {
+        if (!beforeBatches->empty()) {
             BT_ZONE_SCOPE("ORG.Execution.RecordOwned.BeforeBarriers");
-            const auto& before = recording.barriersBeforePass[passIndex];
+            const auto& before = (*beforeBatches)[passIndex];
             if (!before.textures.empty() || !before.buffers.empty()) {
                 rhi::BarrierBatch barriers{};
                 barriers.textures = {before.textures.data(), static_cast<uint32_t>(before.textures.size())};
@@ -1150,9 +1198,9 @@ inline size_t RecordOwnedRecordingCommands(RecordingContext& context, const Owne
                 statistics->service->EndQuery(static_cast<unsigned>(statisticsIndex), statistics->frameIndex,
                     queue, context.Commands(), statistics->queries);
         }
-        if (!recording.barriersAfterPass.empty()) {
+        if (!afterBatches->empty()) {
             BT_ZONE_SCOPE("ORG.Execution.RecordOwned.AfterBarriers");
-            const auto& after = recording.barriersAfterPass[passIndex];
+            const auto& after = (*afterBatches)[passIndex];
             if (!after.textures.empty() || !after.buffers.empty()) {
                 rhi::BarrierBatch barriers{};
                 barriers.textures = {after.textures.data(), static_cast<uint32_t>(after.textures.size())};

@@ -503,5 +503,52 @@ int main() {
         ENSURE(Rejects<std::logic_error>([&] { (void)recording.Resolve(resourceToken); }));
         ENSURE(recording.Resolve(PreparedResourceReference{0}).GetHandle().index == 11);
     }
+    {
+        // FoldBarriersOfSkipped: a late batch's passes that skip the run (render target, then shader read, on one texture) fold
+        // their barriers into the next pass that runs, composed from the state before the run to the state after it.
+        using Batch = compiler::PreparedBatchBarriers::BeforePass;
+        const auto barrier = [](uint32_t texture, rhi::ResourceLayout before, rhi::ResourceLayout after) {
+            rhi::TextureBarrier b{};
+            b.texture.index = texture;
+            b.texture.generation = 1;
+            b.range.mipCount = 1;
+            b.range.layerCount = 1;
+            b.range.planeCount = 1;
+            b.beforeLayout = before;
+            b.afterLayout = after;
+            b.beforeAccess = before == rhi::ResourceLayout::RenderTarget ? rhi::ResourceAccessType::RenderTarget : rhi::ResourceAccessType::ShaderResource;
+            b.afterAccess = after == rhi::ResourceLayout::RenderTarget ? rhi::ResourceAccessType::RenderTarget : rhi::ResourceAccessType::ShaderResource;
+            b.beforeSync = before == rhi::ResourceLayout::RenderTarget ? rhi::ResourceSyncState::RenderTarget : rhi::ResourceSyncState::PixelShading;
+            b.afterSync = after == rhi::ResourceLayout::RenderTarget ? rhi::ResourceSyncState::RenderTarget : rhi::ResourceSyncState::PixelShading;
+            return b;
+        };
+        constexpr auto rt = rhi::ResourceLayout::RenderTarget, sr = rhi::ResourceLayout::ShaderResource;
+        // Pass 0 writes texture 7 (shader read -> target), pass 1 reads it (target -> shader read), pass 2 writes texture 8.
+        std::vector<Batch> before(3), after(3);
+        before[0].textures = {barrier(7, sr, rt)};
+        before[1].textures = {barrier(7, rt, sr)};
+        before[2].textures = {barrier(8, sr, rt)};
+        after[2].textures = {barrier(8, rt, sr)};
+        std::vector<Batch> foldedBefore, foldedAfter;
+        size_t removed = 0;
+        // Passes 0 and 1 skip: texture 7 goes from shader read back to shader read, which orders nothing.
+        ENSURE(compiler::FoldBarriersOfSkipped(before, after, {1, 1, 0}, foldedBefore, foldedAfter, removed));
+        ENSURE(removed == 2);
+        ENSURE(foldedBefore[0].textures.empty() && foldedBefore[1].textures.empty());
+        ENSURE(foldedBefore[2].textures.size() == 1 && foldedBefore[2].textures[0].texture.index == 8);
+        ENSURE(foldedAfter[2].textures.size() == 1);
+        // Only pass 1 skips: its transition moves into pass 2's batch, and texture 7 still ends in shader read.
+        ENSURE(compiler::FoldBarriersOfSkipped(before, after, {0, 1, 0}, foldedBefore, foldedAfter, removed));
+        ENSURE(removed == 0);
+        ENSURE(foldedBefore[0].textures.size() == 1 && foldedBefore[1].textures.empty() && foldedBefore[2].textures.size() == 2);
+        ENSURE(foldedBefore[2].textures[0].texture.index == 7 && foldedBefore[2].textures[0].afterLayout == sr);
+        // Every pass skips: the run ends in the last pass's after batch, and the composed transitions between equal states drop.
+        ENSURE(compiler::FoldBarriersOfSkipped(before, after, {1, 1, 1}, foldedBefore, foldedAfter, removed));
+        ENSURE(removed == 4);
+        ENSURE(foldedAfter[2].textures.empty());
+        // A transfer of ownership that would compose with another skipped pass's barrier leaves the batches as they are.
+        before[1].textures[0].queueOwnership = rhi::QueueOwnership::Release;
+        ENSURE(!compiler::FoldBarriersOfSkipped(before, after, {1, 1, 0}, foldedBefore, foldedAfter, removed));
+    }
     std::puts("Recording tests passed");
 }
