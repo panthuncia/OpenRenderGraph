@@ -845,6 +845,10 @@ public:
 	// A thread waiting for recording requests: wakes the host's thread when it sleeps with one queued (a lost wake, logged once).
 	// True when it did.
 	bool NudgeHostThread();
+	// For a profiler that samples the host's own threads: their native handles (std::thread::native_handle, a HANDLE on
+	// Windows). Null when the thread does not run. Read them after the host's threads started; the host keeps them.
+	void* SubmitThreadNativeHandle() noexcept;
+	void* HostThreadNativeHandle() noexcept;
 
 	// The frame-wait timeline (RenderGraph::SetFrameWaitTimeline): a host producer of per-frame values signals it once per frame,
 	// after the values it wrote for that frame, and every batch submitted from then on waits for SetFrameWaitValue's value. Set

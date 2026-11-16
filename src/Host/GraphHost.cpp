@@ -1691,6 +1691,16 @@ bool GraphHost::NudgeHostThread() {
 	return true;
 }
 
+void* GraphHost::SubmitThreadNativeHandle() noexcept {
+	if (!m_submitQueue || !m_submitQueue->thread.joinable()) return nullptr;
+	return reinterpret_cast<void*>(m_submitQueue->thread.native_handle());
+}
+
+void* GraphHost::HostThreadNativeHandle() noexcept {
+	if (!m_async || !m_async->thread.joinable()) return nullptr;
+	return reinterpret_cast<void*>(m_async->thread.native_handle());
+}
+
 std::string GraphHost::DescribeAsyncState(bool a_pollTimelines) const {
 	// Read racily from another thread: a message for a failure, never a decision.
 	const auto* async = m_async.get();
