@@ -644,6 +644,26 @@ void RenderGraph::RetireIdlePersistentAliasPools(PersistentExecutionState& state
 	}
 }
 
+namespace {
+// The resources some graph placed in an alias pool and has not made standalone since, across every arena (private pools included). A
+// planner counts them as ORG transients, not as materialized by someone else: a later build of the same epoch (a staged graph) places
+// them again rather than keep the placement of the graph it replaces, whose pools go with it.
+std::mutex g_aliasPlacedMutex;
+std::unordered_set<const void*> g_aliasPlaced;
+
+bool AliasPlacedAnywhere(const void* resource) {
+	std::lock_guard lock(g_aliasPlacedMutex);
+	return g_aliasPlaced.contains(resource);
+}
+
+// Placed: recorded. Not placed: forgotten; returns whether it was recorded.
+bool NoteAliasPlaced(const void* resource, bool placed) {
+	std::lock_guard lock(g_aliasPlacedMutex);
+	if (placed) return g_aliasPlaced.insert(resource).second;
+	return g_aliasPlaced.erase(resource) != 0;
+}
+}
+
 bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction& edit, const persistent::SelectedPublication& scheduled) {
 	BT_ZONE_SCOPE("ORG.Persistent.PlanAliases");
 	auto& state = *m_compilerState->persistent;
@@ -732,6 +752,9 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		c.alignment = (std::max<uint64_t>)(1, info.alignment);
 		auto* backed = dynamic_cast<BackedResource*>(concrete);
 		c.materialized = backed && backed->IsMaterialized() && !state.aliasPlaced.contains(concrete);
+		// Placed by another graph's alias pool (the graph this one replaces, whatever its arena): an ORG transient all the same.
+		if (c.materialized)
+			c.materialized = !AliasPlacedAnywhere(concrete);
 		const auto index = static_cast<uint32_t>(candidates.size());
 		candidateByConcrete.emplace(concrete, index);
 		candidates.push_back(std::move(c));
@@ -1058,9 +1081,12 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 			}
 			TrackTransientFrameResource(c.concrete);
 			state.aliasPlaced[c.concrete] = record;
+			NoteAliasPlaced(c.concrete, true);
 			rebind(c.concrete);
 		} else {
 			if (state.aliasPlaced.erase(c.concrete) && backed->IsMaterialized()) { dematerialize(c.concrete); ++rematerialized; }
+			// Placed by another graph of the arena and standalone in this one: it leaves that placement for a backing of its own.
+			if (NoteAliasPlaced(c.concrete, false) && backed->IsMaterialized()) { dematerialize(c.concrete); ++rematerialized; }
 			if (!backed->IsMaterialized()) {
 				MaterializePersistentStandalone(std::span<Resource* const>{&c.concrete, 1});
 				++standalone;

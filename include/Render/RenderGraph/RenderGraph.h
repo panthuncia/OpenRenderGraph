@@ -290,6 +290,11 @@ private:
 	// False while some of its placements are in a pool generation another graph has replaced (the pool grew): placed again, by a
 	// rebuild, they share the pool's memory again.
 	bool PersistentAliasPlacementsCurrent() const;
+	// From now on the graph keeps the backings it bound for the transients it placed, even when a resource now points at another backing.
+	// For a graph about to be replaced while its successor is recorded (GraphHost::StageEpochGraph): the successor's alias placement
+	// may move those transients, and this graph's kept recordings still bind the old backings. Its new preparations would read the
+	// moved resources' descriptors, so it records nothing new after this. Any thread that does not prepare the graph meanwhile.
+	void FreezeAliasedBindings();
 	// Owner thread: whether RecordPendingUploads would record anything now (IUploadService::HasPendingUploads). A host that
 	// gets false skips its upload lists and RecordPendingUploads for the ticket.
 	bool HasPendingUploads() const;

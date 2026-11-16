@@ -456,6 +456,9 @@ struct RenderGraph::PersistentInstanceState {
 	// Built off the owner thread (PrepareFirstPersistentBuild) without its alias placement: the first preparation places.
 	bool deferAliasPlacement = false;
 	bool aliasPlacementDeferred = false;
+	// RenderGraph::FreezeAliasedBindings: the graph keeps the backings it bound for the transients it placed, whatever they point at
+	// now (a staged build of the same epoch placed them elsewhere).
+	std::atomic<bool> freezeAliased{false};
 	AutoAliasPackingStrategy aliasPackingStrategy = AutoAliasPackingStrategy::GreedySweepLine; // The latest plan's.
 	// Diagnostic: per-pass preparation cost (logged periodically).
 	std::unordered_map<std::string, std::pair<uint64_t, uint64_t>> prepareCostByPass; // lowering: name -> (ns, calls)

@@ -64,6 +64,38 @@ submission point is an **epoch**.
         attach every one, and finish every build, before the host is destroyed.
     -   An application that drives its builds this way calls `SetExplicitBuilds(true)` and does not call `BuildIfRequested`
         for those epochs, or that build point rebuilds whatever is still requested, synchronously.
+-   **Staged graphs: recorded before they run.** An attach replaces the epoch's graph, so a revision-driven epoch has no recording
+    of the new graph until the host's thread makes one, and a host that runs only on kept recordings has nothing to submit for a frame or
+    more. `StageEpochGraph(graph)` takes a built graph instead of attaching it.
+    -   The checks are the attach's. The graph's shared setup runs (the statistics heap, the upload pass), but the upload service keeps
+        resolving against the graphs that run. The host's thread holds still only for the hand-over; nothing is detached, so the attached
+        graph keeps its tickets.
+    -   The staged graph gets the next build generation at once (`StageResult::generation`, `StagedGeneration(epoch)`). A recording
+        request that names it (`RequestEpochRecording(..., copy, generation)`) is recorded on the staged graph. Its recording carries that
+        generation, so it is not current until the attach.
+    -   `AttachStagedEpochGraph(epoch)` swaps the staged graph in at a point the caller picks (a frame boundary). The recordings made on it
+        become the epoch's candidates, and requests still queued for it go on as requests for the attached graph. A caller that waits
+        until every copy it needs is recorded switches graph and recordings in one step: the epoch is never without a recording.
+    -   The staged graph's first recording places its transients. That may move a transient the attached graph binds. So staging
+        freezes the attached graph (`RenderGraph::FreezeAliasedBindings`): it keeps the backings it bound for the transients it placed, and
+        its kept recordings still submit. It records nothing new: a request for the attached generation while a graph is staged completes
+        with `EpochRecordingDropped`. A frozen graph is only ever replaced.
+    -   A transient another graph placed in an alias pool (the graph being replaced, a staged graph replaced in its turn, private pools
+        included) counts as an ORG transient in the next plan, not as materialized by someone else: the new graph places it again in
+        its own plan and binds that placement in the same structural edit. Before, such a transient kept the other graph's placement, and
+        a build that bootstrapped while that graph placed it found its binding moved at its first preparation ("Binding replacement
+        requires a structural alias edit").
+    -   A second staging replaces the first (its graph is retired by the work submitted so far). `AttachEpochGraph` on the epoch drops a
+        staged graph too, and so does `StopAsync`, which then asks for a rebuild. An epoch with a staged graph is never reported stale
+        (`StaleAliasPlacementEpochs`): the staged graph's placement is what grew the pool.
+    -   Requests made before the build started are answered at the staging, not at the attach, so an application's build loop does not
+        build the epoch again while its staged graph waits.
+    -   Without async epochs, or for an epoch with no graph yet, staging attaches at once (`StageResult::attached`).
+    -   Generations stay unique: every attach and every staging takes one above the highest given out (`Instance::lastGeneration`), so a
+        recording of a dropped staged graph never matches a later build.
+    -   Test: `PersistentVulkanHostTests segment` stages a build, records for it while the attached graph's recording still submits, checks
+        that the attached graph records nothing meanwhile, attaches it and submits its recording, and replaces one staged graph with a later
+        one.
 -   **Rebuilding only what changed.** Each graph builds every extension made into it, so a rebuild costs every one of their
     gathers. An extension that only some epochs use names them (`AddExtension(id, factory, epochs)`): the other graphs
     never make it, and adding it again rebuilds only its epochs. An extension made into a graph of one epoch gathers only

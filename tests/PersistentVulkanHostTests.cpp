@@ -1294,7 +1294,7 @@ static int Run(int argc, char** argv) {
 				host.SetAsyncEpochs({0}, {0});
 				// Records the epoch for a revision of `count` elements; the callback runs on the host's thread.
 				auto record = [&](uint32_t count, std::shared_ptr<const org::BufferVersion> target, bool skipWrite = false,
-					uint32_t onlyCopy = org::RunRef::kNoCopy) -> std::shared_ptr<const org::GraphHost::EpochRecording> {
+					uint32_t onlyCopy = org::RunRef::kNoCopy, uint64_t generation = 0) -> std::shared_ptr<const org::GraphHost::EpochRecording> {
 					auto data = std::make_shared<TestRevision>();
 					data->count = count;
 					data->skipWrite = skipWrite;
@@ -1307,7 +1307,7 @@ static int Run(int argc, char** argv) {
 						result = std::move(a_recording);
 						state.store(a_error ? 2 : 1, std::memory_order_release);
 						state.notify_all();
-					}, onlyCopy);
+					}, onlyCopy, generation);
 					if (!posted) return nullptr;
 					const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
 					while (state.load(std::memory_order_acquire) == 0 && std::chrono::steady_clock::now() < deadline)
@@ -1502,6 +1502,47 @@ static int Run(int argc, char** argv) {
 					host.SetEpochCopy(0, 1);
 					host.SubmitEpoch(0, upload, {}, slotted);
 					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "the copy runs again after a given-back hold");
+					// A staged graph (StageEpochGraph): recorded for before it runs, while the attached graph's recordings still submit, then
+					// swapped in with its recordings at one point.
+					{
+						auto next = host.BuildEpochGraph(0, "test: a staged build");
+						REQUIRE(next && next->Built(), "the staged build");
+						const auto before = host.BuildGeneration(0);
+						const auto staging = host.StageEpochGraph(next);
+						REQUIRE(staging.staged && !next && staging.generation > before && host.StagedGeneration(0) == staging.generation,
+							"the build is staged with a new generation");
+						REQUIRE(host.BuildGeneration(0) == before, "the attached graph keeps running");
+						auto stagedRecording = record(kCount, versions->Current(), false, org::RunRef::kNoCopy, staging.generation);
+						REQUIRE(stagedRecording && stagedRecording->buildGeneration == staging.generation, "a recording made on the staged graph");
+						REQUIRE(!host.EpochRecordingCurrent(*stagedRecording), "not current before its attach");
+						REQUIRE(!record(kCount, versions->Current()), "the attached graph records nothing while a graph is staged");
+						value = 78000u;
+						host.SetEpochCopy(0, 2);
+						host.SubmitEpoch(0, upload, {}, slotted);
+						REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "the attached graph's recording submits while staged");
+						REQUIRE(host.AttachStagedEpochGraph(0).attached, "the staged graph is attached");
+						REQUIRE(host.BuildGeneration(0) == staging.generation && host.StagedGeneration(0) == 0, "the epoch runs the staged build");
+						REQUIRE(host.EpochRecordingCurrent(*stagedRecording) && !host.EpochRecordingCurrent(*slotted), "its recordings are current, the old ones not");
+						for (uint32_t frame = 0; frame < 3; ++frame) {
+							value = 79000u + frame;
+							host.SetEpochCopy(0, frame);
+							host.SubmitEpoch(0, upload, {}, stagedRecording);
+							REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "the staged graph's recording submits after the attach");
+						}
+						// A second staging replaces the first; the replaced one's recording request is dropped.
+						auto one = host.BuildEpochGraph(0, "test: staged, then replaced");
+						auto two = host.BuildEpochGraph(0, "test: staged last");
+						const auto stagedOne = host.StageEpochGraph(one);
+						const auto stagedTwo = host.StageEpochGraph(two);
+						REQUIRE(stagedOne.staged && stagedTwo.staged && stagedTwo.generation > stagedOne.generation, "a later staging replaces an earlier one");
+						REQUIRE(!record(kCount, versions->Current(), false, org::RunRef::kNoCopy, stagedOne.generation), "a replaced staged graph records nothing");
+						auto last = record(kCount, versions->Current(), false, org::RunRef::kNoCopy, stagedTwo.generation);
+						REQUIRE(last && host.AttachStagedEpochGraph(0).attached, "the last staged graph is attached");
+						value = 79500u;
+						host.SetEpochCopy(0, 0);
+						host.SubmitEpoch(0, upload, {}, last);
+						REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "the last staged graph's recording submits");
+					}
 					// Versions: the slotted recording bound the current version; the first one bound the version before the growth.
 					REQUIRE(host.EpochRecordingVersionsCurrent(*slotted, 0), "a recording of the current versions is current");
 					REQUIRE(!host.EpochRecordingVersionsCurrent(*full, 0), "a recording of a replaced version is not");

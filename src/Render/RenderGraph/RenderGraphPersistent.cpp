@@ -725,6 +725,10 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint32_t frameIndex
 	state.prepared = PreparePersistentExecution(device, frameIndex, hostData, deltaTime, options);
 }
 
+void RenderGraph::FreezeAliasedBindings() {
+	if (m_compilerState && m_compilerState->persistent) m_compilerState->persistent->freezeAliased.store(true, std::memory_order_release);
+}
+
 void RenderGraph::PrepareFirstPersistentBuild() {
 	BT_ZONE_SCOPE("ORG.Persistent.PrepareFirstBuild");
 	if (m_compilerState->frameProductionStopped) throw std::logic_error("Frame production has stopped");
@@ -1202,6 +1206,8 @@ void RenderGraph::BindPersistentFrame(bool ticket, bool bootstrap) {
 				if (!entry.resource || entry.versioned) continue;
 				const auto key = RotationKeyOf(entry);
 				if (entry.isBound && key == entry.bound) continue;
+				// Frozen (FreezeAliasedBindings): a transient this graph placed keeps the backing it bound.
+				if (entry.isBound && state.freezeAliased.load(std::memory_order_acquire) && state.aliasPlaced.contains(UnwrapDynamic(entry.resource))) continue;
 				if (!entry.isBound && !key.concreteID) continue;
 				// A backing of another shape (a texture swapped for one with more mips, say) is a new declaration, not a
 				// binding edit: the slot was admitted with its shape. Its subscribers re-lower, which gives the resource a

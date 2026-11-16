@@ -296,6 +296,38 @@ public:
 	 */
 	AttachResult AttachEpochGraph(std::unique_ptr<EpochGraph>& graph);
 	/**
+	 * @brief Staged builds: a built graph the host's thread records for before it runs (persistent-epochs.md, "Staged graphs").
+	 *
+	 * Owner thread, where the epoch is not being submitted. The graph is checked as AttachEpochGraph checks it, then handed to the host's
+	 * thread as the epoch's staged graph. The attached graph keeps preparing and submitting. A recording request that names the staged
+	 * generation (RequestEpochRecording's generation) is recorded on the staged graph. Its recording is current once
+	 * AttachStagedEpochGraph swaps the graph in, so a caller can switch graph and recordings in one step at a frame boundary.
+	 *
+	 * From the staged graph's first recording, its alias placement may move transients the attached graph binds. So while a graph is
+	 * staged, the attached graph keeps the backings it bound (RenderGraph::FreezeAliasedBindings) and takes no new recording: a request
+	 * for it is dropped (EpochRecordingDropped). Its kept recordings still submit.
+	 *
+	 * A second staging replaces the first, whose graph is retired. AttachEpochGraph on the epoch drops a staged graph too. Without async
+	 * epochs, or for an epoch with no graph, the graph is attached at once (StageResult::attached).
+	 */
+	struct StageResult {
+		bool staged = false;      // the host's thread records it for the staged generation from now on
+		bool attached = false;    // no staging was needed: it was attached (no async epochs, or the epoch had no graph)
+		uint64_t generation = 0;  // the build generation it runs at once attached
+		std::string reason;       // why it was rejected (neither staged nor attached)
+	};
+	StageResult StageEpochGraph(std::unique_ptr<EpochGraph>& graph);
+	/**
+	 * @brief Owner thread, at a frame boundary where the epoch is not being submitted: swaps the staged graph in. The recordings made for it
+	 * since it was staged become the epoch's current ones. Rejected, and the staged graph dropped, when the host's configuration changed
+	 * since its build started.
+	 */
+	AttachResult AttachStagedEpochGraph(uint32_t epoch);
+	/** @brief Owner thread: the staged graph's build generation (0 with none). */
+	uint64_t StagedGeneration(uint32_t epoch) const noexcept;
+	/** @brief Owner thread: drops the epoch's staged graph (retired). The attached graph stays frozen until a graph replaces it. */
+	void DropStagedEpochGraph(uint32_t epoch);
+	/**
 	 * @brief Owner thread: the epochs whose graph has alias placements in a pool generation another graph replaced (the pool
 	 * grew). With Desc::reportStaleAliasPlacements the application rebuilds them (BuildEpochGraph). Otherwise the next build point
 	 * does.
@@ -537,8 +569,10 @@ public:
 	// copy: record that published copy alone (a host that pins its runs to copies, SetEpochCopy). The recording's other copies stay
 	// null, and it is a candidate only for runs of that copy. A copy whose last run is done is recorded at once, so a host that asks
 	// for the copy it submits next waits for no GPU work.
+	// generation: the build to record on (0: the attached one). The staged graph's generation (StageEpochGraph) records on the staged
+	// graph. Any other generation that is not the attached one completes with EpochRecordingDropped.
 	bool RequestEpochRecording(uint32_t epoch, std::shared_ptr<const IHostExecutionData> hostData, EpochRecordingCallback done,
-		uint32_t copy = RunRef::kNoCopy);
+		uint32_t copy = RunRef::kNoCopy, uint64_t generation = 0);
 	// Render thread, for an async epoch it did not submit this frame: its ready ticket, prepared and not submitted, goes back to the
 	// host's thread (abandoned, its run lease freed, a new one prepared). False when no ticket was ready (or the mailbox is full: it
 	// stays).
@@ -914,7 +948,14 @@ private:
 		std::shared_ptr<std::atomic<uint64_t>> requests = std::make_shared<std::atomic<uint64_t>>(0);
 		std::shared_ptr<std::atomic<uint64_t>> configuration = std::make_shared<std::atomic<uint64_t>>(0);
 		uint64_t attachedSerial = 0;  // the build serial of the graph it runs (AttachEpochGraph refuses older ones)
+		// StageEpochGraph: the graph staged for the epoch and the generation it takes at its attach. lastGeneration is the highest
+		// generation given out, attached or staged, so every build's generation is new.
+		std::unique_ptr<EpochGraph> staged;
+		uint64_t stagedGeneration = 0;
+		uint64_t lastGeneration = 0;
 	};
+	// Owner thread, the host's thread holding or stopped: retires the instance's staged graph and clears the host thread's view of it.
+	void RetireStaged(size_t index);
 	// A graph an epoch's rebuild replaced, released once the work it submitted is done.
 	struct RetiredGraph {
 		std::unique_ptr<RenderGraph> graph;
@@ -944,7 +985,7 @@ private:
 	std::unique_ptr<RenderGraph> MakeGraph(const BuildInputs& inputs, bool detached, detail::HostUploadExtension** uploads);
 	// Owner thread, the instance not in the host's thread's hands: the graph replaces the instance's. The old one is retired by
 	// the work submitted so far.
-	void InstallGraph(size_t index, std::unique_ptr<RenderGraph> graph, uint64_t serial);
+	void InstallGraph(size_t index, std::unique_ptr<RenderGraph> graph, uint64_t serial, uint64_t generation = 0);
 	// Owner thread: whether the instance runs nothing (its own failure, or its async epoch's).
 	bool InstanceFailed(size_t index) const noexcept;
 	// Any thread: queues a failure for PollEpochFailures.

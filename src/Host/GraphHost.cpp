@@ -156,6 +156,7 @@ struct GraphHost::Async {
 	struct RecordingRequest {
 		uint32_t epochIndex = 0;
 		uint32_t copy = RunRef::kNoCopy;  // the one copy to record, or every copy
+		uint64_t generation = 0;          // the build to record on (0: the attached one)
 		std::shared_ptr<const IHostExecutionData> hostData;
 		GraphHost::EpochRecordingCallback done;
 		std::shared_ptr<GraphHost::EpochRecording> result;
@@ -167,6 +168,15 @@ struct GraphHost::Async {
 	std::vector<std::vector<std::weak_ptr<const GraphHost::EpochRecording>>> liveRecordings;
 	std::vector<std::shared_ptr<RenderGraph::PersistentTicket>> outstanding;
 	std::atomic<uint64_t> revisionCopiesRecorded{0}, revisionRecordings{0};
+	// Per epoch index: its staged graph (GraphHost::StageEpochGraph) and the generation it takes at its attach (0: none), and the
+	// recordings made on it, which become liveRecordings at the attach. Written by the owner thread while this thread holds still.
+	std::vector<RenderGraph*> stagedGraph;
+	std::vector<uint64_t> stagedGeneration;
+	std::vector<std::vector<std::weak_ptr<const GraphHost::EpochRecording>>> stagedRecordings;
+	// Whether a request records on the epoch's staged graph.
+	bool RecordsStaged(uint32_t index, uint64_t requestGeneration) const {
+		return requestGeneration && stagedGraph[index] && requestGeneration == stagedGeneration[index];
+	}
 	// Host thread, per live epoch index and kept copy (RunLease::copy): the last replayable recording made for the copy, and the
 	// build generation of the graph it was recorded on (Desc::reuseLiveRecordings).
 	struct LiveCopy {
@@ -439,6 +449,7 @@ struct GraphHost::RecordingQueue {
 		std::shared_ptr<const IHostExecutionData> hostData;
 		GraphHost::EpochRecordingCallback done;
 		uint32_t copy = RunRef::kNoCopy;  // the one copy to record, or every copy
+		uint64_t generation = 0;          // the build to record on (0: the attached one)
 		Request* next = nullptr;
 	};
 	std::atomic<Request*> head{nullptr};
@@ -1120,7 +1131,7 @@ std::unique_ptr<RenderGraph> GraphHost::MakeGraph(const BuildInputs& inputs, boo
 	return graph;
 }
 
-void GraphHost::InstallGraph(size_t index, std::unique_ptr<RenderGraph> graph, uint64_t serial) {
+void GraphHost::InstallGraph(size_t index, std::unique_ptr<RenderGraph> graph, uint64_t serial, uint64_t generation) {
 	auto& instance = m_instances[index];
 	// The graph it replaces: its own submitted work is what every queue has been given so far (the timelines are shared), taken
 	// while it is still listed. It is released once that is done, the other epochs running meanwhile.
@@ -1134,7 +1145,9 @@ void GraphHost::InstallGraph(size_t index, std::unique_ptr<RenderGraph> graph, u
 	instance.failed = false;
 	instance.failure.clear();
 	instance.attachedSerial = serial;
-	++instance.buildGeneration;
+	// Every build's generation is new, staged builds included: a staged graph's is the one it was given (StageEpochGraph).
+	instance.buildGeneration = generation ? generation : (std::max)(instance.buildGeneration, instance.lastGeneration) + 1;
+	instance.lastGeneration = (std::max)(instance.lastGeneration, instance.buildGeneration);
 	++m_buildGeneration;
 }
 
@@ -1252,6 +1265,8 @@ GraphHost::AttachResult GraphHost::AttachEpochGraph(std::unique_ptr<EpochGraph>&
 		graph.SetGpuPassRangeCallbacks(m_gpuPassRangeBegin, m_gpuPassRangeEnd);
 		graph.SetScheduleTraceEnabled(m_scheduleTrace.load(std::memory_order_acquire));
 		built->m_uploads = nullptr;
+		// A graph staged for the epoch is older than this attach's (or would have been rejected below): it goes.
+		RetireStaged(index);
 		InstallGraph(index, std::move(built->m_graph), built->m_serial);
 		// Requests made before the build started are answered by it. A later one stays.
 		if (instance.requests->load(std::memory_order_acquire) == built->m_requests) {
@@ -1272,9 +1287,176 @@ GraphHost::AttachResult GraphHost::AttachEpochGraph(std::unique_ptr<EpochGraph>&
 
 std::vector<uint32_t> GraphHost::StaleAliasPlacementEpochs() const {
 	std::vector<uint32_t> stale;
+	// An epoch with a staged graph is not stale: the staged graph's placement grew the pool, and it replaces the attached one.
 	for (const auto& instance : m_instances)
-		if (instance.graph && !instance.graph->PersistentAliasPlacementsCurrent()) stale.push_back(instance.epoch);
+		if (instance.graph && !instance.staged && !instance.graph->PersistentAliasPlacementsCurrent()) stale.push_back(instance.epoch);
 	return stale;
+}
+
+void GraphHost::RetireStaged(size_t index) {
+	auto& instance = m_instances[index];
+	if (m_async)
+		for (uint32_t i = 0; i < m_async->epochs.size(); ++i) {
+			if (m_async->instanceOf[i] != index) continue;
+			m_async->stagedGraph[i] = nullptr;
+			m_async->stagedGeneration[i] = 0;
+			m_async->stagedRecordings[i].clear();
+		}
+	if (instance.staged && instance.staged->m_graph) {
+		// Never submitted: it is released once the work submitted so far is done, like a replaced graph.
+		instance.staged->m_uploads = nullptr;
+		auto graph = std::move(instance.staged->m_graph);
+		graph->StopFrameProduction();
+		m_retiredGraphs.push_back({std::move(graph), SubmittedPoint()});
+	}
+	instance.staged.reset();
+	instance.stagedGeneration = 0;
+}
+
+GraphHost::StageResult GraphHost::StageEpochGraph(std::unique_ptr<EpochGraph>& built) {
+	BT_ZONE_SCOPE("ORG.Host.StageEpochGraph");
+	StageResult result;
+	if (!built) {
+		result.reason = "no graph";
+		return result;
+	}
+	if (built->m_index >= m_instances.size() || m_instances[built->m_index].epoch != built->m_epoch) {
+		result.reason = "the graph is not one of this host's epochs";
+		return result;
+	}
+	const auto index = built->m_index;
+	auto& instance = m_instances[index];
+	// Nothing runs that a staging would keep: attached at once.
+	if (!m_async || m_async->holding || !instance.graph) {
+		const auto attached = AttachEpochGraph(built);
+		result.attached = attached.attached;
+		result.reason = attached.reason;
+		result.generation = instance.buildGeneration;
+		return result;
+	}
+	if (!built->m_graph) {
+		result.reason = "its build failed: " + built->m_error;
+		return result;
+	}
+	if (built->m_hostConfiguration != m_hostConfiguration.load(std::memory_order_acquire)) {
+		result.reason = "the host's configuration changed since its build started";
+		return result;
+	}
+	if (built->m_epochConfiguration != instance.configuration->load(std::memory_order_acquire)) {
+		result.reason = "the epoch's extensions or external state changed since its build started";
+		return result;
+	}
+	if (built->m_serial < instance.attachedSerial) {
+		result.reason = "the epoch runs a graph whose build started later";
+		return result;
+	}
+	if (instance.staged && built->m_serial < instance.staged->m_serial) {
+		result.reason = "a graph whose build started later is staged";
+		return result;
+	}
+	const auto epochName = instance.epoch == persistent::AllEpochs ? std::string("(all)") : std::to_string(instance.epoch);
+	const auto begin = std::chrono::steady_clock::now();
+	const auto generation = (std::max)(instance.buildGeneration, instance.lastGeneration) + 1;
+	std::string failure;
+	// The host's thread holds still while its view of the epoch changes. Nothing is detached: the attached graph keeps its tickets.
+	HoldAsync({}, [&] {
+		auto& graph = *built->m_graph;
+		// The shared setup steps but the upload service's registry, which the attach points at the new graph: the running graphs'
+		// uploads keep resolving as before until then.
+		try {
+			graph.FinishSharedSetup();
+		} catch (const std::exception& e) {
+			failure = std::string("its shared setup failed: ") + e.what();
+			return;
+		}
+		graph.SetGpuPassRangeCallbacks(m_gpuPassRangeBegin, m_gpuPassRangeEnd);
+		graph.SetScheduleTraceEnabled(m_scheduleTrace.load(std::memory_order_acquire));
+		RetireStaged(index);
+		// The staged graph's first recording places its transients, which may move ones the attached graph binds: from here the
+		// attached graph keeps what it bound, and records nothing new.
+		instance.graph->FreezeAliasedBindings();
+		auto* raw = built->m_graph.get();
+		instance.staged = std::move(built);
+		instance.stagedGeneration = generation;
+		instance.lastGeneration = generation;
+		for (uint32_t i = 0; i < m_async->epochs.size(); ++i) {
+			if (m_async->instanceOf[i] != index) continue;
+			m_async->stagedGraph[i] = raw;
+			m_async->stagedGeneration[i] = generation;
+			m_async->stagedRecordings[i].clear();
+		}
+		// Requests made before the build started are answered by it. A later one stays.
+		if (instance.requests->load(std::memory_order_acquire) == instance.staged->m_requests) {
+			instance.rebuildRequested = false;
+			instance.rebuildReasons.clear();
+		}
+	});
+	if (!failure.empty()) {
+		result.reason = std::move(failure);
+		return result;
+	}
+	result.staged = true;
+	result.generation = generation;
+	spdlog::info("GraphHost: epoch {}'s graph staged (build {}): built in {:.2f} ms off the host, staged in {:.3f} ms; why: {}", epochName, generation,
+		instance.staged->m_buildMs, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count(), instance.staged->m_reason);
+	return result;
+}
+
+GraphHost::AttachResult GraphHost::AttachStagedEpochGraph(uint32_t epoch) {
+	BT_ZONE_SCOPE("ORG.Host.AttachStagedEpochGraph");
+	const auto index = InstanceOf(epoch);
+	if (index == kNoInstance) return {false, "the epoch is not one of the host's"};
+	auto& instance = m_instances[index];
+	if (!instance.staged) return {false, "no graph is staged"};
+	auto& built = instance.staged;
+	if (built->m_hostConfiguration != m_hostConfiguration.load(std::memory_order_acquire)
+		|| built->m_epochConfiguration != instance.configuration->load(std::memory_order_acquire)) {
+		if (m_async && !m_async->holding) HoldAsync({}, [&] { RetireStaged(index); });
+		else RetireStaged(index);
+		MarkRebuild(instance, "its staged graph was dropped (the host's configuration changed)");
+		return {false, "the host's configuration changed since its build started"};
+	}
+	const auto epochName = instance.epoch == persistent::AllEpochs ? std::string("(all)") : std::to_string(instance.epoch);
+	const auto begin = std::chrono::steady_clock::now();
+	const auto generation = instance.stagedGeneration;
+	const auto replace = [&](size_t) {
+		if (built->m_uploads) built->m_uploads->ApplyResolveContext();
+		built->m_uploads = nullptr;
+		std::vector<std::weak_ptr<const EpochRecording>> recordings;
+		if (m_async)
+			for (uint32_t i = 0; i < m_async->epochs.size(); ++i) {
+				if (m_async->instanceOf[i] != index) continue;
+				recordings = std::move(m_async->stagedRecordings[i]);
+				m_async->stagedRecordings[i].clear();
+				m_async->stagedGraph[i] = nullptr;
+				m_async->stagedGeneration[i] = 0;
+			}
+		InstallGraph(index, std::move(built->m_graph), built->m_serial, generation);
+		// The recordings made on it are its tickets' candidates from now on.
+		if (m_async)
+			for (uint32_t i = 0; i < m_async->epochs.size(); ++i)
+				if (m_async->instanceOf[i] == index) m_async->liveRecordings[i] = recordings;
+		instance.staged.reset();
+		instance.stagedGeneration = 0;
+		return true;
+	};
+	if (m_async && !m_async->holding) ReplaceAsyncInstances({&index, 1}, replace);
+	else (void)replace(index);
+	spdlog::info("GraphHost: epoch {}'s staged graph attached (build {}) in {:.3f} ms", epochName, generation,
+		std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count());
+	return {true, {}};
+}
+
+uint64_t GraphHost::StagedGeneration(uint32_t epoch) const noexcept {
+	const auto index = InstanceOf(epoch);
+	return index == kNoInstance || !m_instances[index].staged ? 0 : m_instances[index].stagedGeneration;
+}
+
+void GraphHost::DropStagedEpochGraph(uint32_t epoch) {
+	const auto index = InstanceOf(epoch);
+	if (index == kNoInstance || !m_instances[index].staged) return;
+	if (m_async && !m_async->holding) HoldAsync({}, [&] { RetireStaged(index); });
+	else RetireStaged(index);
 }
 
 bool GraphHost::BuildDueInstances(bool all) {
@@ -1284,7 +1466,7 @@ bool GraphHost::BuildDueInstances(bool all) {
 		// Placements in a pool generation another epoch's graph replaced (its pool grew): placed again by a rebuild, they share
 		// the pool's memory again, and the old generation is freed.
 		// With Desc::reportStaleAliasPlacements the application rebuilds them instead (StaleAliasPlacementEpochs).
-		if (!m_desc.reportStaleAliasPlacements && instance.graph && !instance.rebuildRequested
+		if (!m_desc.reportStaleAliasPlacements && instance.graph && !instance.rebuildRequested && !instance.staged
 			&& !instance.graph->PersistentAliasPlacementsCurrent()) {
 			MarkRebuild(instance, "its alias placements are in a pool another epoch's build grew");
 			basic_telemetry::AddCounter("ORG.Host.AliasArenaRebuilds");
@@ -1882,6 +2064,9 @@ void GraphHost::StartAsync() {
 	async->runsLastFrame.assign(async->epochs.size(), 0);
 	async->lastSeal.assign(async->epochs.size(), 0);
 	async->liveRecordings.assign(async->epochs.size(), {});
+	async->stagedGraph.assign(async->epochs.size(), nullptr);
+	async->stagedGeneration.assign(async->epochs.size(), 0);
+	async->stagedRecordings.assign(async->epochs.size(), {});
 	async->liveKept.assign(async->epochs.size(), {});
 	async->outstanding.assign(async->epochs.size(), {});
 	// The synchronous frames' runs still in flight are the host thread's to retire now, like its own. The sync path's pacing
@@ -2012,6 +2197,8 @@ void GraphHost::StartAsync() {
 							const auto dropped = std::make_exception_ptr(EpochRecordingDropped(state->generation[index]));
 							std::erase_if(state->pendingRequests, [&](const std::unique_ptr<Async::RecordingRequest>& request) {
 								if (request->epochIndex != index) return false;
+								// A request for the staged graph survives: the attach that follows makes it the epoch's graph.
+								if (state->RecordsStaged(index, request->generation)) return false;
 								if (!m_ending && request->done) request->done(nullptr, dropped);
 								return true;
 							});
@@ -2054,12 +2241,15 @@ void GraphHost::StartAsync() {
 								" is not a revision-driven async epoch")));
 						continue;
 					}
-					if (state->paused[epochIndex]) {
-						// Its graph is being built again: the request is for the old one.
+					const bool staged = state->RecordsStaged(epochIndex, node->generation);
+					// Its graph is being built again (the request is for the old one), it names a build that is neither attached nor staged,
+					// or a staged graph froze the attached one: dropped.
+					if (!staged && (state->paused[epochIndex] || (node->generation && node->generation != state->generation[epochIndex])
+						|| state->stagedGraph[epochIndex])) {
 						if (node->done) node->done(nullptr, std::make_exception_ptr(EpochRecordingDropped(state->generation[epochIndex])));
 						continue;
 					}
-					if (state->epochFailed[epochIndex].load(std::memory_order_acquire)) {
+					if (!staged && state->epochFailed[epochIndex].load(std::memory_order_acquire)) {
 						// Its graph failed: nothing is recorded on it until it is built again.
 						if (node->done)
 							node->done(nullptr, std::make_exception_ptr(EpochFailedError(node->epoch, state->epochErrors[epochIndex])));
@@ -2068,6 +2258,7 @@ void GraphHost::StartAsync() {
 					auto request = std::make_unique<Async::RecordingRequest>();
 					request->epochIndex = epochIndex;
 					request->copy = node->copy;
+					request->generation = node->generation;
 					request->hostData = std::move(node->hostData);
 					request->done = std::move(node->done);
 					state->pendingRequests.push_back(std::move(request));
@@ -2357,12 +2548,13 @@ bool GraphHost::ReleaseHeldEpochTicket(uint32_t epoch) {
 	return true;
 }
 
-bool GraphHost::RequestEpochRecording(uint32_t epoch, std::shared_ptr<const IHostExecutionData> hostData, EpochRecordingCallback done, uint32_t copy) {
+bool GraphHost::RequestEpochRecording(uint32_t epoch, std::shared_ptr<const IHostExecutionData> hostData, EpochRecordingCallback done, uint32_t copy,
+	uint64_t generation) {
 	// The host's queue alone (never m_async, which a build moves out from under any other thread): the host's thread validates the
 	// epoch when it takes it, and a build drops what it did not take (StopAsync, an epoch's Detach), each completed.
 	auto& queue = *m_recordingQueue;
 	if (!done || !queue.accepting.load(std::memory_order_acquire)) return false;
-	auto* node = new RecordingQueue::Request{epoch, std::move(hostData), std::move(done), copy, nullptr};
+	auto* node = new RecordingQueue::Request{epoch, std::move(hostData), std::move(done), copy, generation, nullptr};
 	auto* head = queue.head.load(std::memory_order_relaxed);
 	do node->next = head;
 	while (!queue.head.compare_exchange_weak(head, node, std::memory_order_release, std::memory_order_relaxed));
@@ -2382,21 +2574,26 @@ bool GraphHost::AdvanceRecordingRequests(Async& state) {
 		if (advanced && state.read.load(std::memory_order_relaxed) != state.written.load(std::memory_order_acquire)) break;
 		auto& request = **it;
 		std::exception_ptr error;
+		const bool staged = state.RecordsStaged(request.epochIndex, request.generation);
 		try {
-			if (state.paused[request.epochIndex]) {
+			if (!staged && state.paused[request.epochIndex]) {
 				++it;
 				continue;
 			}
+			// For a build that is neither attached nor staged now (a staged graph dropped), or for an attached graph a staged one froze:
+			// dropped.
+			if (!staged && ((request.generation && request.generation != state.generation[request.epochIndex]) || state.stagedGraph[request.epochIndex]))
+				throw EpochRecordingDropped(state.generation[request.epochIndex]);
 			// Its graph failed since the request was taken: it completes with that failure.
-			if (state.epochFailed[request.epochIndex].load(std::memory_order_relaxed))
+			if (!staged && state.epochFailed[request.epochIndex].load(std::memory_order_relaxed))
 				throw EpochFailedError(state.epochs[request.epochIndex], state.epochErrors[request.epochIndex]);
-			auto& graph = *m_instances[state.instanceOf[request.epochIndex]].graph;
+			auto& graph = staged ? *state.stagedGraph[request.epochIndex] : *m_instances[state.instanceOf[request.epochIndex]].graph;
 			if (!request.result) {
 				request.result = std::make_shared<EpochRecording>();
 				request.result->epoch = state.epochs[request.epochIndex];
 				request.result->copies.resize(state.copyCount);
 				request.result->revision = request.hostData;
-				request.result->buildGeneration = state.generation[request.epochIndex];
+				request.result->buildGeneration = staged ? state.stagedGeneration[request.epochIndex] : state.generation[request.epochIndex];
 				request.recorded.assign(state.copyCount, 0);
 				// One copy only: the others count as done and stay empty.
 				if (request.copy != RunRef::kNoCopy) {
@@ -2448,7 +2645,11 @@ bool GraphHost::AdvanceRecordingRequests(Async& state) {
 		auto result = error ? nullptr : std::shared_ptr<const EpochRecording>(std::move(request.result));
 		const auto epochIndex = request.epochIndex;
 		it = state.pendingRequests.erase(it);
-		if (!error) {
+		if (!error && staged) {
+			// The staged graph's: its tickets take it once the attach makes it the epoch's graph.
+			state.revisionRecordings.fetch_add(1, std::memory_order_relaxed);
+			state.stagedRecordings[epochIndex].push_back(result);
+		} else if (!error) {
 			state.revisionRecordings.fetch_add(1, std::memory_order_relaxed);
 			// Admitted from now on: by every ticket prepared next, and by the one waiting for submission, before the caller can
 			// publish it to the submitting thread.
@@ -2792,6 +2993,12 @@ void GraphHost::StopAsync() {
 			if (node->done) node->done(nullptr, dropped);
 	}
 	async->pendingRequests.clear();
+	// Staged graphs go with the host's thread that recorded for them (m_async is gone, so only the instances' views are cleared).
+	for (size_t index = 0; index < m_instances.size(); ++index)
+		if (m_instances[index].staged) {
+			RetireStaged(index);
+			MarkRebuild(m_instances[index], "its staged graph was dropped with the host's thread");
+		}
 	// Unsubmitted tickets are abandoned, and their leases given back: the queued ones and the ones the render thread held.
 	m_heldRun.reset();
 	for (uint32_t index = 0; index < async->epochs.size(); ++index) {
