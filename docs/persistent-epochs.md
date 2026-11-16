@@ -336,6 +336,13 @@ recording per frame slot. These options serve it; each is independent of the oth
     one for the named copy is prepared (`AsyncStats::copyRepins`). `EpochCopyRun(epoch, copy)` is that copy's run, so the
     host can address the copy's LatchBlock regions and run gates by its own slot. The copies' leases are made by
     `SetAsyncEpochs`, so the call is safe on any thread.
+-   **Staging runs.** `EpochStagingRun(epoch, copy)` is a lease index of its own per published copy, made with the copies and
+    never opened for a run, so no recording reads it. A host that gathers a copy's values at several points before it takes
+    the copy writes them there (`UseRun(run)` makes it `CurrentRun()` until `EndHeldRun`). Inside the copy's `beforeSubmit`,
+    `LatchBlock::CopyStableRun(staging, copy)` makes the copy's regions an exact copy of the staging ones (a block with nothing
+    staged reads zero). No ticket is held while the values are gathered. A staging run's regions are plain host memory
+    (`LatchBlock::MarkHostOnlyRun`): the arena's GPU-visible memory is write-combined, and reading it back for the copy cost about
+    0.8 ms a stage.
 -   **One copy at a time.** `RequestEpochRecording(epoch, hostData, done, copy)` records that copy alone. The other copies of
     the recording stay null, and it is a candidate only for runs of that copy. A host that asks for the copy its next run
     takes waits for no GPU work: the copy's last run is a whole cycle of slots old.

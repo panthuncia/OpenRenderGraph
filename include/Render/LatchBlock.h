@@ -81,6 +81,15 @@ public:
 	// run's lease is reused for a new run whose writer may skip some blocks: those blocks then read zeros, as a leased run's
 	// fresh region would. The GPU must be done with the lease's last run.
 	static void ZeroStableRun(uint32_t lease);
+	// Makes the pinned regions of the stable run at lease index `to` a copy of those at `from`, in every arena block. A block with a
+	// region at `from` is copied (the region at `to` is made if needed). A block with a region only at `to` is zeroed. So `to` reads
+	// exactly what was written for `from`. For a host that gathers a run's values in a staging run before it takes the run
+	// (GraphHost::EpochStagingRun). The GPU must be done with `to`'s last run.
+	static void CopyStableRun(uint32_t from, uint32_t to);
+	// The stable run at lease index `lease` is only ever written and read by the host (a staging run, GraphHost::EpochStagingRun): its
+	// regions are plain cached host memory, not the arena's GPU-visible memory, so reading them back (CopyStableRun) is cheap. Such a
+	// region has no buffer or view; nothing may record GPU work that reads it. Call before any region of the index is made.
+	static void MarkHostOnlyRun(uint32_t lease);
 	// A dedicated block's buffer, its view and its bytes (null, 0 and empty for an arena block).
 	const std::shared_ptr<Buffer>& Resource() const noexcept { return m_buffer; }
 	uint32_t SrvIndex() const noexcept { return m_srvIndex; }

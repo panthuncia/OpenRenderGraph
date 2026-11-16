@@ -172,6 +172,19 @@ std::shared_ptr<const PersistentScheduleSnapshot> RenderGraph::GetPersistentSche
 	return m_scheduleSnapshot.load(std::memory_order_acquire);
 }
 
+std::shared_ptr<const ScheduleTrace> RenderGraph::TraceSelectedSchedule(uint32_t epoch) const {
+	if (!m_compilerState || !m_compilerState->persistent) return {};
+	const auto& state = *m_compilerState->persistent;
+	const auto selected = state.program.Select();
+	if (!selected || !selected->executable) return {};
+	const auto& executable = *selected->executable;
+	const auto names = ScheduleTraceNamesOf(state, *selected, m_queueRegistry);
+	if (epoch == UINT32_MAX) return BuildScheduleTrace(executable, names, "frame", UINT32_MAX);
+	for (const auto& [owner, split] : executable.epochs)
+		if (owner == epoch && split) return BuildScheduleTrace(*split, names, ScheduleTraceEpochLabel(epoch), epoch);
+	return {};
+}
+
 void RenderGraph::BuildPersistentFrameGraphSnapshot(ui::FrameGraphSnapshot& out,
 	const std::unordered_map<uint64_t, std::pair<uint64_t, std::string>>& memory) const {
 	out.batches.clear();

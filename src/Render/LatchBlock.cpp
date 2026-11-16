@@ -22,13 +22,77 @@ std::vector<const LatchBlock*>& Registry() {
 	static std::vector<const LatchBlock*> blocks;
 	return blocks;
 }
+// By stable lease index: the arena blocks with a pinned region there, so a stable run's regions are found without walking every
+// block. A leaf lock: taken inside a block's own mutex (At) and inside RegistryMutex, never around either.
+std::mutex& StableMutex() {
+	static std::mutex mutex;
+	return mutex;
+}
+std::vector<std::vector<const LatchBlock*>>& StableBlocks() {
+	static std::vector<std::vector<const LatchBlock*>> blocks;
+	return blocks;
+}
+void NoteStable(const LatchBlock* block, uint32_t lease) {
+	std::scoped_lock lock(StableMutex());
+	auto& lists = StableBlocks();
+	if (lists.size() <= lease) lists.resize(size_t{lease} + 1);
+	lists[lease].push_back(block);
+}
+// The stable lease indices whose regions are host memory (MarkHostOnlyRun). Read in At under a block's mutex: a leaf lock.
+std::mutex& HostOnlyMutex() {
+	static std::mutex mutex;
+	return mutex;
+}
+std::vector<bool>& HostOnly() {
+	static std::vector<bool> leases;
+	return leases;
+}
+bool IsHostOnly(uint32_t lease) {
+	std::scoped_lock lock(HostOnlyMutex());
+	return lease < HostOnly().size() && HostOnly()[lease];
+}
+std::vector<const LatchBlock*> StableAt(uint32_t lease) {
+	std::scoped_lock lock(StableMutex());
+	const auto& lists = StableBlocks();
+	return lease < lists.size() ? lists[lease] : std::vector<const LatchBlock*>{};
+}
 }
 
 void LatchBlock::ZeroStableRun(uint32_t lease) {
 	std::scoped_lock registry(RegistryMutex());
-	for (const auto* block : Registry()) {
+	for (const auto* block : StableAt(lease)) {
 		std::scoped_lock lock(block->m_mutex);
 		if (lease < block->m_stable.size() && block->m_stable[lease]) std::memset(block->m_stable[lease].mapped, 0, block->m_stable[lease].size);
+	}
+}
+
+void LatchBlock::MarkHostOnlyRun(uint32_t lease) {
+	std::scoped_lock lock(HostOnlyMutex());
+	if (HostOnly().size() <= lease) HostOnly().resize(size_t{lease} + 1);
+	HostOnly()[lease] = true;
+}
+
+void LatchBlock::CopyStableRun(uint32_t from, uint32_t to) {
+	if (from == to) return;
+	std::scoped_lock registry(RegistryMutex());
+	// A block with a region at `to` and none at `from` is zeroed; one with a region at `from` is copied.
+	auto blocks = StableAt(to);
+	const auto staged = StableAt(from);
+	blocks.insert(blocks.end(), staged.begin(), staged.end());
+	std::sort(blocks.begin(), blocks.end());
+	blocks.erase(std::unique(blocks.begin(), blocks.end()), blocks.end());
+	for (const auto* block : blocks) {
+		const Region source = [&] {
+			std::scoped_lock lock(block->m_mutex);
+			return from < block->m_stable.size() ? block->m_stable[from] : Region{};
+		}();
+		if (!source) {
+			std::scoped_lock lock(block->m_mutex);
+			if (to < block->m_stable.size() && block->m_stable[to]) std::memset(block->m_stable[to].mapped, 0, block->m_stable[to].size);
+			continue;
+		}
+		const Region target = block->At(RunRef{to, 0, RunRef::kNoCopy});
+		std::memcpy(target.mapped, source.mapped, (std::min)(target.size, source.size));
 	}
 }
 
@@ -74,12 +138,17 @@ LatchBlock::~LatchBlock() {
 	if (!m_buffer) {
 		std::scoped_lock registry(RegistryMutex());
 		std::erase(Registry(), this);
+		std::scoped_lock stable(StableMutex());
+		for (auto& list : StableBlocks()) std::erase(list, this);
 	}
 	if (m_buffer && m_mapped) m_buffer->GetAPIResource().Unmap(0, m_stride);
 	// A leased run's region belongs to its lease, which frees it when the run retires. The pinned ones are the block's: they
 	// are reused once the GPU is past what was submitted so far.
-	for (const auto& region : m_stable)
-		if (region) m_arena->FreePinned(region);
+	for (const auto& region : m_stable) {
+		if (!region) continue;
+		if (region.buffer) m_arena->FreePinned(region);
+		else delete[] region.mapped;
+	}
 }
 
 LatchBlock::Region LatchBlock::At(const RunRef& run) const {
@@ -89,7 +158,15 @@ LatchBlock::Region LatchBlock::At(const RunRef& run) const {
 	if (run.Stable()) {
 		if (m_stable.size() <= run.lease) m_stable.resize(size_t{run.lease} + 1);
 		auto& region = m_stable[run.lease];
-		if (!region) region = m_arena->AllocatePinned(m_stride);
+		if (!region) {
+			if (IsHostOnly(run.lease)) {
+				// Plain zeroed host memory, freed with the block (no buffer: the destructor knows it by that).
+				region = Region{nullptr, 0, 0, new std::byte[m_stride]{}, m_stride};
+			} else {
+				region = m_arena->AllocatePinned(m_stride);
+			}
+			NoteStable(this, run.lease);
+		}
 		return region;
 	}
 	if (m_runs.size() <= run.lease) m_runs.resize(size_t{run.lease} + 1);

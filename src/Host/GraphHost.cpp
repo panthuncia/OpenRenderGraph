@@ -601,6 +601,21 @@ std::vector<GraphHost::RunLease*>& GraphHost::CopyLeases(uint32_t epoch) {
 		}
 	}
 	if (const auto& stats = m_desc.runtime->Statistics()) stats->EnsureFrameCapacity(copies.back()->index + 1);
+	// A staging lease per copy: an index no run takes, for the values a host gathers before it takes the copy (EpochStagingRun).
+	std::vector<RunLease*> staging;
+	{
+		std::scoped_lock lock(m_leaseMutex);
+		for (uint32_t copy = 0; copy < count; ++copy) {
+			if (m_leaseStore.size() >= Runtime::kMaxSlots) throw std::runtime_error("GraphHost: no lease index left for a staging run");
+			auto made = std::make_unique<RunLease>();
+			made->index = static_cast<uint32_t>(m_leaseStore.size());
+			LatchBlock::MarkHostOnlyRun(made->index);
+			staging.push_back(made.get());
+			m_leaseTable[made->index].store(made.get(), std::memory_order_release);
+			m_leaseStore.push_back(std::move(made));
+		}
+	}
+	m_stagingLeases.emplace_back(epoch, std::move(staging));
 	return m_copyLeases.emplace_back(epoch, std::move(copies)).second;
 }
 
@@ -1754,6 +1769,16 @@ RunRef GraphHost::EpochCopyRun(uint32_t epoch, uint32_t copy) const {
 			return copies[copy]->Ref();
 		}
 	throw std::invalid_argument("EpochCopyRun: epoch " + std::to_string(epoch) + " has no published copy " + std::to_string(copy));
+}
+
+RunRef GraphHost::EpochStagingRun(uint32_t epoch, uint32_t copy) const {
+	for (const auto& [owner, leases] : m_stagingLeases)
+		if (owner == epoch) {
+			if (copy >= leases.size()) break;
+			// Generation 0 and no copy: a stable run (RunRef::Stable) that no lease ever opens.
+			return RunRef{leases[copy]->index, 0, RunRef::kNoCopy};
+		}
+	throw std::invalid_argument("EpochStagingRun: epoch " + std::to_string(epoch) + " has no staging run " + std::to_string(copy));
 }
 
 void GraphHost::SetEpochTicketsAhead(uint32_t epoch, uint32_t most) {

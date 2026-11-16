@@ -467,6 +467,14 @@ public:
 	 */
 	RunRef EpochCopyRun(uint32_t epoch, uint32_t copy) const;
 	/**
+	 * @brief Any thread, after SetAsyncEpochs listed the epoch as revision-driven: the staging run of its published copy `copy`. It
+	 * is a lease index of its own, never handed to a run and never read by a recording. A host that gathers a copy's per-run values
+	 * at several points before it takes the copy (its frame's hooks) writes them here (UseRun), then copies them into the copy's run
+	 * inside the copy's beforeSubmit (LatchBlock::CopyStableRun). No GPU work reads the staging regions, so they can be written at
+	 * any time. Throws std::invalid_argument for an epoch without published copies.
+	 */
+	RunRef EpochStagingRun(uint32_t epoch, uint32_t copy) const;
+	/**
 	 * @brief Async epochs whose graphics-queue work the caller executes itself, in its own command buffers
 	 * (RenderGraph::SetExternalPersistentEpochs): SubmitEpoch submits only their batches on other queues. Their graphics uploads
 	 * are recorded into a secondary list, the execution is taken with TakeExternalExecution, and the caller executes its
@@ -557,6 +565,11 @@ public:
 	 * beforeSubmit. Nothing when the epoch holds no ticket.
 	 */
 	void UseHeldRun(uint32_t epoch) noexcept;
+	/**
+	 * @brief Render thread: CurrentRun() is `run` from now until EndHeldRun, outside a ticket's beforeSubmit. For a staging run
+	 * (EpochStagingRun): what is written for CurrentRun() meanwhile goes to its regions.
+	 */
+	void UseRun(const RunRef& run) noexcept { m_heldRun = run; }
 	void EndHeldRun() noexcept { m_heldRun.reset(); }
 	/** @brief Render thread: gives the held ticket back unsubmitted (its lease freed, what was written for its run dropped). */
 	bool ReleaseHeldEpochTicket(uint32_t epoch);
@@ -986,6 +999,8 @@ private:
 	// Each revision-driven epoch's published copies' leases, framesInFlight of them, made at the epoch's first use and kept for
 	// the host's life, so a copy's LatchBlock regions stay at its index (RunRef::Copy).
 	std::vector<std::pair<uint32_t, std::vector<RunLease*>>> m_copyLeases;
+	// Each revision-driven epoch's staging leases, one per published copy (EpochStagingRun), made with the copies and never run.
+	std::vector<std::pair<uint32_t, std::vector<RunLease*>>> m_stagingLeases;
 	// Each live epoch's kept copies' leases (Desc::reuseLiveRecordings), made as its runs need them and kept for the host's life.
 	std::vector<std::pair<uint32_t, std::vector<RunLease*>>> m_liveCopyLeases;
 	// The sync path's frame pacing: its runs of the last framesInFlight frames, by position.

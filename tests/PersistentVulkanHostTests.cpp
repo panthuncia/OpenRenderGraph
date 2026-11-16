@@ -1466,6 +1466,34 @@ static int Run(int argc, char** argv) {
 						REQUIRE(seen == held && !host.HoldsEpochTicket(0), "the submission takes the held ticket");
 						REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "a held pinned copy's recording writes every element");
 					}
+					// A staging run per copy (a host that gathers its values at several points and takes the copy once): its own lease
+					// index, CurrentRun while it is used, and copied whole into the copy's run inside the copy's beforeSubmit.
+					{
+						auto staged = org::LatchBlock::Create("staged values", 16);
+						const auto staging = host.EpochStagingRun(0, 2);
+						const auto copyRun = host.EpochCopyRun(0, 2);
+						REQUIRE(staging.Stable() && !staging.Published() && staging.lease != copyRun.lease, "a staging run is a stable run of its own index");
+						REQUIRE(!(host.EpochStagingRun(0, 1) == staging), "each copy has its own staging run");
+						host.UseRun(staging);
+						REQUIRE(host.CurrentRun() == staging, "the staging run is CurrentRun while it is used");
+						staged->WriteValue(host.CurrentRun(), 0, 0x5EEDu);
+						REQUIRE(!staged->At(staging).buffer, "a staging run's region is host memory, not the arena's");
+						host.EndHeldRun();
+						// A block written for the copy's run before, and not staged: zero after the copy.
+						auto stale = org::LatchBlock::Create("stale values", 16);
+						stale->WriteValue(copyRun, 0, 0xBADu);
+						value = 76500u;
+						host.SetEpochCopy(0, 2);
+						uint32_t copied = 0, cleared = 1;
+						host.SubmitEpoch(0, [&](org::RenderGraph& graph) {
+							upload(graph);
+							org::LatchBlock::CopyStableRun(staging.lease, host.CurrentRun().lease);
+							std::memcpy(&copied, staged->Bytes(host.CurrentRun()).data(), sizeof(copied));
+							std::memcpy(&cleared, stale->Bytes(host.CurrentRun()).data(), sizeof(cleared));
+						}, {}, slotted);
+						REQUIRE(copied == 0x5EEDu && cleared == 0u, "the copy's run reads what was staged, and zero where nothing was");
+						REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "a staged copy's recording writes every element");
+					}
 					// A held ticket given back unsubmitted: the next submission of the copy takes a new one.
 					host.SetEpochCopy(0, 1);
 					(void)host.HoldEpochTicket(0);

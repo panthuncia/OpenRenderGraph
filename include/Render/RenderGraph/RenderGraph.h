@@ -213,6 +213,11 @@ public:
 	bool ScheduleTraceEnabled() const noexcept;
 	// Any thread: the latest published snapshot; null while off, or before anything executed with it on.
 	std::shared_ptr<const PersistentScheduleSnapshot> GetPersistentScheduleSnapshot() const;
+	// The schedule of one epoch of the selected executable (UINT32_MAX: the whole frame's), traced now whether introspection is on
+	// or not: its passes in order with what each reads and writes. Null before the graph selected an executable, or for an epoch it
+	// has no split for. For an application that checks what its graphs read and write against each other once a graph is built
+	// (a graph from GraphHost::BuildEpochGraph has its first schedule). Any thread that owns the graph or holds it unattached.
+	std::shared_ptr<const ScheduleTrace> TraceSelectedSchedule(uint32_t epoch) const;
 	// What happens when a frame's binding edits change which slots share a backing (a resource swapped onto a backing
 	// another slot already uses, say). The compiler treats slots that share a backing as one resource, so this needs a
 	// new schedule, with the passes of both slots ordered and transitioned against each other.
