@@ -10,6 +10,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <exception>
+#include <span>
 #include <rhi.h>
 #include "Render/Runtime/ITaskService.h"
 
@@ -53,11 +54,13 @@ public:
     bool Shared() const noexcept { return m_shared; }
 
     bool TryClaim() noexcept {
-        bool expected = false;
-        return m_claimed.compare_exchange_strong(expected, true, std::memory_order_acquire, std::memory_order_relaxed);
+        uint32_t expected = 0;
+        return m_claims.compare_exchange_strong(expected, 1, std::memory_order_acquire, std::memory_order_relaxed);
     }
-    void Release() noexcept { m_claimed.store(false, std::memory_order_release); }
-    bool Claimed() const noexcept { return m_claimed.load(std::memory_order_acquire); }
+    // One more claim by the thread that holds the shard (CommandListPool::BeginGroup): its lists are recorded in turn.
+    void AddClaim() noexcept { m_claims.fetch_add(1, std::memory_order_relaxed); }
+    void Release() noexcept { m_claims.fetch_sub(1, std::memory_order_release); }
+    bool Claimed() const noexcept { return m_claims.load(std::memory_order_acquire) != 0; }
 
     // Frees the list now if the shard is free. Otherwise the shard's next claimant frees it.
     void Orphan(rhi::CommandListPtr&& list) noexcept;
@@ -71,7 +74,8 @@ public:
 private:
     rhi::CommandAllocatorPtr m_allocator;
     bool m_shared = false;
-    std::atomic<bool> m_claimed{false};
+    // Claims held, all by one thread (TryClaim takes a free shard only).
+    std::atomic<uint32_t> m_claims{0};
     std::mutex m_orphanMutex;
     std::vector<rhi::CommandListPtr> m_orphans;
     std::atomic<size_t> m_orphanCount{0};
@@ -148,6 +152,9 @@ public:
     // must be done with the list. A pair that already holds its claim is reset again under it. An empty pair gets a new
     // list. The pair's list may be swapped for another idle list of the pool, so read pair.list only after this call.
     void Begin(CommandListPair& pair);
+    // Begin for pairs that the calling thread records one after another: they share one shard's claim where allocators
+    // share lists, so a batch takes one command pool instead of one each. Each pair still calls EndRecording.
+    void BeginGroup(std::span<CommandListPair* const> pairs);
 
     // Publish known future demand without waiting. Compilation/planning may use
     // this as soon as a recording layout is available.
@@ -182,7 +189,8 @@ private:
     // Resets the pair's list under the claim the pair holds.
     void ResetClaimed(CommandListPair& pair);
     // Makes idle lists, for the background worker or the inline fallback.
-    std::vector<CommandListPair> CreateIdlePairs(size_t count);
+    // mayCreateShard false: only a free shard is used, and fewer pairs (or none) are made when there is none.
+    std::vector<CommandListPair> CreateIdlePairs(size_t count, bool mayCreateShard = true);
     // Frees idle lists over the targets, frees orphans and trims the shards. Then drops shards with no lists.
     void ShedIdle();
     bool SheddableLocked() const noexcept;

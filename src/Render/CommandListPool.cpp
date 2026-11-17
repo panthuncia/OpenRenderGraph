@@ -261,11 +261,95 @@ void CommandListPool::Begin(CommandListPair& pair) {
     ResetClaimed(pair);
 }
 
-std::vector<CommandListPair> CommandListPool::CreateIdlePairs(size_t count) {
+void CommandListPool::BeginGroup(std::span<CommandListPair* const> pairs) {
+    BT_ZONE_SCOPE("CommandListPool::BeginGroup");
+    bool shared = false;
+    {
+        std::lock_guard lock(m_mutex);
+        shared = m_sharedLists == 1;
+    }
+    if (!shared || pairs.size() < 2) {
+        for (auto* pair : pairs) Begin(*pair);
+        return;
+    }
+    // A free shard that one of the lists is in, else any free or new one.
+    std::shared_ptr<CommandAllocatorShard> shard;
+    for (auto* pair : pairs) {
+        if (pair->m_claimed || !pair->list || !pair->shard || !pair->shard->TryClaim()) continue;
+        shard = pair->shard;
+        break;
+    }
+    if (!shard) shard = ClaimAnyShard();
+    // The first pair that joins takes the claim made above. Each later one adds a claim.
+    bool claimUsed = false;
+    for (auto* pairPointer : pairs) {
+        auto& pair = *pairPointer;
+        if (pair.allocator) throw std::logic_error("A command list with its own allocator is not a pool's");
+        if (pair.m_claimed) {
+            ResetClaimed(pair);
+            continue;
+        }
+        if (claimUsed) shard->AddClaim();
+        claimUsed = true;
+        try {
+            if (!(pair.list && pair.shard == shard)) {
+                // An idle list of the shard, else a new one in it. The pair's old list goes back to the idle ones.
+                bool traded = false;
+                {
+                    std::lock_guard lock(m_mutex);
+                    for (auto it = m_available.rbegin(); it != m_available.rend(); ++it) {
+                        if (!it->list || it->shard != shard) continue;
+                        std::swap(pair.list, it->list);
+                        std::swap(pair.shard, it->shard);
+                        if (!it->list) m_available.erase(std::next(it).base());
+                        traded = true;
+                        UpdateDiagnosticsCountsLocked();
+                        break;
+                    }
+                }
+                if (!traded) {
+                    auto list = CreateList(*shard);
+                    if (pair.list) {
+                        CommandListPair old;
+                        old.list = std::move(pair.list);
+                        old.shard = std::move(pair.shard);
+                        std::lock_guard lock(m_mutex);
+                        m_available.emplace_back(std::move(old));
+                        UpdateDiagnosticsCountsLocked();
+                    }
+                    pair.list = std::move(list);
+                    pair.shard = shard;
+                }
+            }
+        } catch (...) {
+            shard->Release();
+            throw;
+        }
+        pair.m_claimed = true;
+        basic_telemetry::AddCounter(m_telemetryPrefix + "GroupBegins");
+        ResetClaimed(pair);
+    }
+    if (!claimUsed) shard->Release();
+}
+
+std::vector<CommandListPair> CommandListPool::CreateIdlePairs(size_t count, bool mayCreateShard) {
     BT_ZONE_SCOPE("CommandListPool::CreateIdlePairs");
     std::vector<CommandListPair> created;
     created.reserve(count);
     std::shared_ptr<CommandAllocatorShard> shard;
+    if (!mayCreateShard) {
+        // Warming only: a free shard of a pool that has one. Every new pool costs the driver about 2 MB (RX 6600), and
+        // the shards are all claimed only while lists are being recorded.
+        std::lock_guard lock(m_mutex);
+        if (m_sharedLists == 1 && !m_shards.empty()) {
+            for (const auto& candidate : m_shards)
+                if (candidate->TryClaim()) {
+                    shard = candidate;
+                    break;
+                }
+            if (!shard) return created;
+        }
+    }
     try {
         for (size_t i = 0; i < count; ++i) {
             // One claim serves every list made in a shared shard. A shard of one list is released after its list.
@@ -600,7 +684,7 @@ void CommandListPool::BackgroundResetDrain() {
     try {
         if (createWarmCount) {
             BT_ZONE_SCOPE("CommandListPool::BackgroundResetDrain::CreateWarmPair");
-            warmPairs = CreateIdlePairs(createWarmCount);
+            warmPairs = CreateIdlePairs(createWarmCount, false);
         } else {
             ShedIdle();
         }

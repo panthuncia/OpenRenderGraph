@@ -1,8 +1,11 @@
 #include "Render/QueueRegistry.h"
 #include "Render/CommandListPool.h"
 
+#include <map>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <spdlog/spdlog.h>
 #include <rhi_interop_dx12.h>
 #include <rhi_interop_vulkan.h>
@@ -19,6 +22,20 @@ namespace {
 		default: return "Unknown";
 		}
 	}
+
+	// The command list pools of slots on shared timelines, one per device and queue kind: every graph of a host records from
+	// them. A pool keeps at least one command pool, and each costs the driver about 2 MB (RX 6600), so one pool per graph made
+	// one per epoch. The pools are thread-safe. Held weakly: the last graph or recording that holds one frees it.
+	std::shared_ptr<CommandListPool> SharedPoolFor(rhi::Device& device, rhi::QueueKind kind) {
+		static std::mutex mutex;
+		static std::map<std::pair<const void*, int>, std::weak_ptr<CommandListPool>> pools;
+		std::lock_guard lock(mutex);
+		auto& entry = pools[{ device.impl, static_cast<int>(kind) }];
+		if (auto pool = entry.lock()) return pool;
+		auto pool = std::make_shared<CommandListPool>(device, kind);
+		entry = pool;
+		return pool;
+	}
 }
 
 QueueSlotIndex QueueRegistry::Register(QueueSlot slot, rhi::Queue queue, rhi::Device& device, QueueAutoAssignmentPolicy autoAssignmentPolicy, bool ownsQueue, std::string_view logicalName) {
@@ -29,6 +46,10 @@ QueueSlotIndex QueueRegistry::Register(QueueSlot slot, rhi::Queue queue, rhi::De
 }
 
 QueueSlotIndex QueueRegistry::Register(QueueSlot slot, rhi::Queue queue, rhi::TimelinePtr fence, std::unique_ptr<CommandListPool> pool, QueueAutoAssignmentPolicy autoAssignmentPolicy, bool ownsQueue, rhi::Device device, std::string_view logicalName) {
+	return RegisterWithPool(slot, queue, std::move(fence), std::shared_ptr<CommandListPool>(std::move(pool)), autoAssignmentPolicy, ownsQueue, device, logicalName);
+}
+
+QueueSlotIndex QueueRegistry::RegisterWithPool(QueueSlot slot, rhi::Queue queue, rhi::TimelinePtr fence, std::shared_ptr<CommandListPool> pool, QueueAutoAssignmentPolicy autoAssignmentPolicy, bool ownsQueue, rhi::Device device, std::string_view logicalName) {
 	auto idx = static_cast<QueueSlotIndex>(static_cast<uint8_t>(m_slots.size()));
 	const std::string queueName = "ORG QueueSlot " + std::to_string(static_cast<uint8_t>(idx)) +
 		" backend=" + std::to_string(static_cast<uint8_t>(slot.backendInstance)) +
@@ -47,16 +68,17 @@ QueueSlotIndex QueueRegistry::Register(QueueSlot slot, rhi::Queue queue, rhi::Ti
 		const std::string fenceName = queueName + " Fence";
 		fence->SetName(fenceName.c_str());
 	}
-	m_slots.push_back({ slot.kind, slot.instance, slot.backendInstance, slot.backend, queue, device, std::make_shared<rhi::TimelinePtr>(std::move(fence)), {}, std::shared_ptr<CommandListPool>(std::move(pool)), autoAssignmentPolicy, ownsQueue, std::string(logicalName) });
+	m_slots.push_back({ slot.kind, slot.instance, slot.backendInstance, slot.backend, queue, device, std::make_shared<rhi::TimelinePtr>(std::move(fence)), {}, std::move(pool), autoAssignmentPolicy, ownsQueue, std::string(logicalName) });
 	return idx;
 }
 
 QueueSlotIndex QueueRegistry::Register(QueueSlot slot, rhi::Queue queue, const SharedQueueTimeline& timeline, rhi::Device& device,
 	QueueAutoAssignmentPolicy autoAssignmentPolicy) {
 	if (!timeline) throw std::invalid_argument("QueueRegistry::Register: an empty shared timeline");
-	const auto idx = Register(slot, queue, rhi::TimelinePtr{}, std::make_unique<CommandListPool>(device, static_cast<rhi::QueueKind>(slot.kind)),
-		autoAssignmentPolicy, false, device);
+	const auto idx = RegisterWithPool(slot, queue, rhi::TimelinePtr{}, SharedPoolFor(device, static_cast<rhi::QueueKind>(slot.kind)),
+		autoAssignmentPolicy, false, device, {});
 	auto& entry = m_slots.back();
+	entry.sharedPool = true;
 	entry.fence = timeline.fence;
 	entry.fenceValue = timeline.nextValue;
 	entry.sharedTimeline = true;
@@ -170,7 +192,8 @@ void QueueRegistry::Clear() {
 
 void QueueRegistry::ShutdownTaskWorkers() {
 	for (auto& slot : m_slots) {
-		if (slot.pool) {
+		// Other graphs still record from a shared pool: it stops when its last holder frees it.
+		if (slot.pool && !slot.sharedPool) {
 			slot.pool->ShutdownBackgroundReset();
 		}
 	}

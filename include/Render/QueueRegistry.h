@@ -63,6 +63,9 @@ public:
 		rhi::Device device = {},
 		std::string_view logicalName = {});
 
+	QueueSlotIndex RegisterWithPool(QueueSlot slot, rhi::Queue queue, rhi::TimelinePtr fence, std::shared_ptr<CommandListPool> pool,
+		QueueAutoAssignmentPolicy autoAssignmentPolicy, bool ownsQueue, rhi::Device device, std::string_view logicalName);
+
 	/// Register a queue slot on a timeline other registries share (SharedTimelineOf): its values come from the shared counter,
 	/// and clearing the registry neither waits on the timeline nor retires it (its owner does).
 	QueueSlotIndex Register(QueueSlot slot, rhi::Queue queue, const SharedQueueTimeline& timeline, rhi::Device& device,
@@ -162,6 +165,7 @@ private:
 		std::string logicalName;
 		std::shared_ptr<std::atomic<uint64_t>> fenceValue = std::make_shared<std::atomic<uint64_t>>(1);
 		bool sharedTimeline = false;  // Register with a SharedQueueTimeline
+		bool sharedPool = false;      // its pool is the device's for its queue kind (SharedPoolFor), which other registries use too
 	};
 
 	std::vector<SlotEntry> m_slots;

@@ -1432,9 +1432,18 @@ inline std::shared_ptr<const PreparedRhiExecutionBatch> RecordPreparedRhiExecuti
     auto ownership = std::make_shared<Ownership>(Ownership{std::move(runtimeOwner), std::move(recordings)});
     // A pool's list is begun here, on the recording thread, unless its acquirer began it already. Begin may trade the list
     // for another idle one, so the list handles are read only after it.
-    for (const auto& recording : ownership->recordings) {
-        auto& allocation = *recording.allocation;
-        if (allocation.pool && !allocation.pair.Recording()) allocation.pool->Begin(allocation.pair);
+    // This thread records the batch's lists one after another, so each pool's lists share one allocator claim: one
+    // command pool for the batch instead of one per list.
+    {
+        std::vector<std::pair<CommandListPool*, std::vector<CommandListPair*>>> groups;
+        for (const auto& recording : ownership->recordings) {
+            auto& allocation = *recording.allocation;
+            if (!allocation.pool || allocation.pair.Recording()) continue;
+            auto group = std::find_if(groups.begin(), groups.end(), [&](const auto& g) { return g.first == allocation.pool.get(); });
+            if (group == groups.end()) group = groups.insert(groups.end(), { allocation.pool.get(), {} });
+            group->second.push_back(&allocation.pair);
+        }
+        for (auto& [pool, pairs] : groups) pool->BeginGroup(pairs);
     }
     std::vector<rhi::CommandList> lists;
     std::vector<PreparedPass> submissionEffects;
