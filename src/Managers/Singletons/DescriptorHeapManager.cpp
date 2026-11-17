@@ -27,6 +27,24 @@ void RetireDescriptorSlotsForDeferredRelease(
 }
 
 namespace {
+	// A depth format with a stencil plane: its 2D textures also get a stencil SRV (SRVViewType::Texture2DStencil).
+	bool HasStencilPlane(rhi::Format format) {
+		switch (format) {
+		case rhi::Format::R24G8_Typeless:
+		case rhi::Format::D24_UNorm_S8_UInt:
+		case rhi::Format::R32G8X24_Typeless:
+		case rhi::Format::D32_Float_S8X24_UInt:
+			return true;
+		default:
+			return false;
+		}
+	}
+
+	bool WantsStencilSrv(const DescriptorHeapManager::ViewRequirements::TextureViews& tex) {
+		return tex.createSRV && !tex.isArray && !tex.isCubemap && !tex.is3D &&
+			(HasStencilPlane(tex.baseFormat) || HasStencilPlane(tex.dsvFormat));
+	}
+
 	// A texture's UAV of one mip and slice: every depth slice of a 3D texture, one array slice of an array or cube, else the 2D mip.
 	rhi::UavDesc TextureUav(const DescriptorHeapManager::ViewRequirements::TextureViews& tex, rhi::Format format, uint32_t mip, uint32_t slice) {
 		rhi::UavDesc uavDesc{};
@@ -557,6 +575,9 @@ void DescriptorHeapManager::ReserveDescriptorSlotsUnlocked(
             if (tex->createCubemapAsArraySRV && tex->isCubemap) {
                 target.SetSRVView(SRVViewType::Texture2DArray, m_cbvSrvUavHeap, makeShaderVisibleGrid(6u, tex->mipLevels, m_cbvSrvUavHeap));
             }
+            if (WantsStencilSrv(*tex)) {
+                target.SetSRVView(SRVViewType::Texture2DStencil, m_cbvSrvUavHeap, makeShaderVisibleGrid(1u, tex->mipLevels, m_cbvSrvUavHeap));
+            }
         }
 
         if (tex->createUAV) {
@@ -757,6 +778,18 @@ void DescriptorHeapManager::UpdateDescriptorContentsUnlocked(
                     srvDesc.cubeArray.numCubes = tex->arraySize;
 
                     const auto& slot = target.GetSRVInfo(SRVViewType::TextureCubeArrayFull, mip, 0u).slot;
+                    device.CreateShaderResourceView({ shaderHeap, slot.index }, apiResource.GetHandle(), srvDesc);
+                }
+            }
+
+            if (WantsStencilSrv(*tex)) {
+                for (uint32_t mip = 0; mip < tex->mipLevels; ++mip) {
+                    rhi::SrvDesc srvDesc{};
+                    srvDesc.dimension = rhi::SrvDim::Texture2D;
+                    srvDesc.tex2D.mostDetailedMip = mip;
+                    srvDesc.tex2D.mipLevels = 1u;
+                    srvDesc.tex2D.planeSlice = 1u;
+                    const auto& slot = target.GetSRVInfo(SRVViewType::Texture2DStencil, mip, 0u).slot;
                     device.CreateShaderResourceView({ shaderHeap, slot.index }, apiResource.GetHandle(), srvDesc);
                 }
             }
