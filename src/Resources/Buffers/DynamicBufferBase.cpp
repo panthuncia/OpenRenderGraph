@@ -617,6 +617,7 @@ void BufferBase::Dematerialize() {
 	RotateDescriptorSlotsForPublication();
     m_dataBuffer.reset();
     ++m_backingGeneration;
+    ForgetPublishedAllocation();
     g_backingReleases.fetch_add(1u, std::memory_order_acq_rel);
 }
 

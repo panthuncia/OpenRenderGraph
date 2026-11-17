@@ -193,7 +193,12 @@ rhi::ResourceAllocationInfo RenderGraph::SharedAliasAllocationInfo(Resource* con
 	return result;
 }
 
-void RenderGraph::MaterializePersistentStandalone(std::span<Resource* const> resources, bool skipAliasCandidates) {
+void RenderGraph::MaterializePersistentStandalone(std::span<Resource* const> resources, bool skipAliasCandidates, const char* site) {
+	// ORG_TRACE_STANDALONE=<name part>: each standalone backing of a matching resource is logged with its graph and call site.
+	static const std::string trace = [] {
+		const char* value = std::getenv("ORG_TRACE_STANDALONE");
+		return std::string(value ? value : "");
+	}();
 	for (auto* resource : resources) {
 		auto* concrete = UnwrapDynamic(resource);
 		auto* backed = concrete ? dynamic_cast<BackedResource*>(concrete) : nullptr;
@@ -202,6 +207,9 @@ void RenderGraph::MaterializePersistentStandalone(std::span<Resource* const> res
 		if (auto* texture = dynamic_cast<PixelBuffer*>(concrete)) texture->Materialize();
 		else if (auto* buffer = dynamic_cast<BufferBase*>(concrete)) buffer->Materialize();
 		else continue;
+		if (!trace.empty() && (trace == "*" || concrete->GetName().find(trace) != std::string::npos))
+			spdlog::info("Persistent standalone backing: '{}' epoch={} graph={} site={}", concrete->GetName(), m_passEpochFilter,
+				static_cast<const void*>(this), site ? site : "?");
 		TrackTransientFrameResource(concrete);
 		basic_telemetry::AddCounter("ORG.Persistent.StandaloneMaterializations");
 	}
@@ -241,7 +249,7 @@ void RenderGraph::BindUnboundPersistentEntries(persistent::GraphEditTransaction&
 		auto* backed = concrete ? dynamic_cast<BackedResource*>(concrete) : nullptr;
 		if (backed && !backed->IsMaterialized()) {
 			if (entry.direct && unboundSlotsByConcrete[concrete] <= 1 && IsPersistentAliasCandidate(concrete)) continue;
-			MaterializePersistentStandalone(std::span<Resource* const>{&entry.resource, 1});
+			MaterializePersistentStandalone(std::span<Resource* const>{&entry.resource, 1}, false, "bind unbound");
 		}
 		BindEntry(state, edit, index);
 	}
@@ -377,7 +385,7 @@ void RenderGraph::SubmitPersistentStructuralBuild(const std::vector<uint32_t>& s
 				std::vector<Resource*> resources;
 				for (const auto& use : lowered.entries) resources.push_back(use.resource);
 				for (const auto& group : lowered.groups) for (const auto& [id, resource] : group.members) resources.push_back(resource.get());
-				MaterializePersistentStandalone(resources, true);
+				MaterializePersistentStandalone(resources, true, "structural relower");
 				auto views = std::move(main.declaredViews);
 				auto bindings = std::move(main.declaredBindings);
 				auto preparedUses = main.preparedResourceUses;
@@ -596,7 +604,7 @@ void RenderGraph::UpdatePersistentFrameInterruptingPasses(
 				std::vector<Resource*> resources;
 				for (const auto& use : lowered.entries) resources.push_back(use.resource);
 				for (const auto& group : lowered.groups) for (const auto& [id, resource] : group.members) resources.push_back(resource.get());
-				MaterializePersistentStandalone(resources, true);
+				MaterializePersistentStandalone(resources, true, "install main pass");
 				InstallMainPass(*this, state, edit, main, std::move(lowered), mainIndex, false, order);
 			}
 		}, any.pass);
@@ -1110,7 +1118,7 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 			// Placed by another graph of the arena and standalone in this one: it leaves that placement for a backing of its own.
 			if (NoteAliasPlaced(c.concrete, false) && backed->IsMaterialized()) { dematerialize(c.concrete); ++rematerialized; }
 			if (!backed->IsMaterialized()) {
-				MaterializePersistentStandalone(std::span<Resource* const>{&c.concrete, 1});
+				MaterializePersistentStandalone(std::span<Resource* const>{&c.concrete, 1}, false, "alias plan (not pooled)");
 				++standalone;
 				rebind(c.concrete);
 			}

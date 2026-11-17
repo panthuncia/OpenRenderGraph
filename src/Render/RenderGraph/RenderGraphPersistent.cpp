@@ -860,7 +860,7 @@ void RenderGraph::BootstrapPersistentGraph() {
 		}
 		std::sort(usedResources.begin(), usedResources.end());
 		usedResources.erase(std::unique(usedResources.begin(), usedResources.end()), usedResources.end());
-		MaterializePersistentStandalone(usedResources, true);
+		MaterializePersistentStandalone(usedResources, true, "first build");
 		const auto primaryBackend = m_backendDevices.empty() ? rhi::Backend::Null : m_backendDevices.front().backend;
 		auto edit = state.program.BeginEdit();
 		edit.SetQueues(RegistryQueues(m_queueRegistry, m_runtime->Backend()));
@@ -1182,7 +1182,7 @@ void RenderGraph::BindPersistentFrame(bool ticket, bool bootstrap) {
 				BT_ZONE_SCOPE("ORG.Persistent.PollGroups.Diff.Materialize");
 				std::vector<Resource*> arriving;
 				for (const auto& [id, member] : members) if (!group.memberIndexByID.contains(id)) arriving.push_back(member.get());
-				MaterializePersistentStandalone(arriving);
+				MaterializePersistentStandalone(arriving, false, "group members");
 			}
 			const auto counts = SyncGroupMembers(state, transaction, group, members);
 			added = counts.added;
@@ -1228,7 +1228,7 @@ void RenderGraph::BindPersistentFrame(bool ticket, bool bootstrap) {
 				auto& transaction = ensureEdit();
 				// Rotated backings may not be materialized yet (per-frame presentation
 				// targets are realized lazily by the legacy path).
-				MaterializePersistentStandalone(std::span<Resource* const>{&entry.resource, 1});
+				MaterializePersistentStandalone(std::span<Resource* const>{&entry.resource, 1}, false, "poll backings");
 				// Slot maps are keyed by resource IDs: only a wrapper whose concrete
 				// backing object changed exposes a new ID to its subscribers.
 				const bool concreteChanged = key.concreteID != entry.bound.concreteID;
@@ -1709,7 +1709,7 @@ RenderGraph::PersistentExecution RenderGraph::PreparePersistentExecution(rhi::De
 						resources.push_back(resource);
 						upload.accesses.push_back({resource, requirement.resourceHandleAndRange.range, requirement.state});
 					}
-					MaterializePersistentStandalone(resources);
+					MaterializePersistentStandalone(resources, false, "pre pass");
 					upload.bytecode = std::move(frame.bytecode);
 					upload.keepAlive = std::shared_ptr<org::imm::KeepAliveBag>(std::move(frame.keepAlive));
 					if (effect) {

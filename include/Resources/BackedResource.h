@@ -61,6 +61,15 @@ public:
         m_publishedGeneration = generation;
         return m_publishedAllocation;
     }
+protected:
+    // A dematerialized resource lets go of its cached publication snapshot. The snapshot holds a lease on the old allocation, so
+    // keeping it would keep the memory of a backing given back until the next publication, which a resource no graph uses never
+    // gets. Publications already captured keep their own reference.
+    void ForgetPublishedAllocation() {
+        std::scoped_lock lock(m_publicationMutex);
+        m_publishedAllocation.reset();
+        m_publishedGeneration = UINT64_MAX;
+    }
 private:
     std::mutex m_publicationMutex;
     uint64_t m_publishedGeneration = UINT64_MAX;

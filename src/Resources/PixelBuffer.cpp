@@ -3,7 +3,11 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
+#include <string>
+
+#include <spdlog/spdlog.h>
 
 #include "Managers/Singletons/DescriptorHeapManager.h"
 #include "Resources/GPUBacking/GPUTextureBacking.h"
@@ -197,6 +201,17 @@ void PixelBuffer::RefreshAPIRepresentationDescriptors(BackendInstanceId backendI
 	DescriptorHeapManager::GetInstance().UpdateDescriptorContents(*this, resource, views, backendInstance);
 }
 
+namespace {
+// ORG_TRACE_STANDALONE=<name part>: each backing a matching texture takes or gives back is logged (a diagnostic).
+bool TraceBacking(const std::string& name) {
+	static const std::string trace = [] {
+		const char* value = std::getenv("ORG_TRACE_STANDALONE");
+		return std::string(value ? value : "");
+	}();
+	return !trace.empty() && (trace == "*" || name.find(trace) != std::string::npos);
+}
+}
+
 void PixelBuffer::Materialize(const MaterializeOptions* options) {
 	ClearAPIRepresentations();
     std::scoped_lock lock(m_materializationMutex);
@@ -241,6 +256,8 @@ void PixelBuffer::Materialize(const MaterializeOptions* options) {
     }
 
     ++m_backingGeneration;
+    if (TraceBacking(name))
+        spdlog::info("Texture backing taken: '{}' ({}, generation {})", name, options && options->aliasPlacement ? "alias placement" : "own memory", m_backingGeneration);
 }
 
 BackingAllocationSnapshot PixelBuffer::CaptureBackingAllocation(bool retain) {
@@ -272,6 +289,9 @@ void PixelBuffer::Dematerialize() {
 	RotateDescriptorSlotsForPublication();
     m_backing.reset();
     ++m_backingGeneration;
+    ForgetPublishedAllocation();
+    if (TraceBacking(name))
+        spdlog::info("Texture backing given back: '{}' (generation {})", name, m_backingGeneration);
 }
 
 void PixelBuffer::EnsureVirtualDescriptorSlotsAllocated() {
