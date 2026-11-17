@@ -60,9 +60,16 @@ std::vector<const LatchBlock*> StableAt(uint32_t lease) {
 
 void LatchBlock::ZeroStableRun(uint32_t lease) {
 	std::scoped_lock registry(RegistryMutex());
+	// A host-only run's region is cleared only as far as anything was written to it (m_stableHigh). Any other run's whole region: its
+	// recordings may write through the region's pointer.
+	const bool hostOnly = IsHostOnly(lease);
 	for (const auto* block : StableAt(lease)) {
 		std::scoped_lock lock(block->m_mutex);
-		if (lease < block->m_stable.size() && block->m_stable[lease]) std::memset(block->m_stable[lease].mapped, 0, block->m_stable[lease].size);
+		if (lease >= block->m_stable.size() || !block->m_stable[lease]) continue;
+		auto& high = block->m_stableHigh[lease];
+		const uint32_t bytes = hostOnly ? high : block->m_stable[lease].size;
+		if (bytes) std::memset(block->m_stable[lease].mapped, 0, bytes);
+		high = 0;
 	}
 }
 
@@ -75,24 +82,27 @@ void LatchBlock::MarkHostOnlyRun(uint32_t lease) {
 void LatchBlock::CopyStableRun(uint32_t from, uint32_t to) {
 	if (from == to) return;
 	std::scoped_lock registry(RegistryMutex());
-	// A block with a region at `to` and none at `from` is zeroed; one with a region at `from` is copied.
+	// A block with a region at `to` and none at `from` is zeroed; one with a region at `from` is copied. Only the bytes that can differ
+	// move: the source's written part (all of it unless `from` is host-only), and the target's part a write or an earlier copy left
+	// non-zero. A block written at neither costs nothing, so a stage's clients that staged nothing this frame cost nothing.
+	const bool hostOnly = IsHostOnly(from);
 	auto blocks = StableAt(to);
 	const auto staged = StableAt(from);
 	blocks.insert(blocks.end(), staged.begin(), staged.end());
 	std::sort(blocks.begin(), blocks.end());
 	blocks.erase(std::unique(blocks.begin(), blocks.end()), blocks.end());
 	for (const auto* block : blocks) {
-		const Region source = [&] {
-			std::scoped_lock lock(block->m_mutex);
-			return from < block->m_stable.size() ? block->m_stable[from] : Region{};
-		}();
-		if (!source) {
-			std::scoped_lock lock(block->m_mutex);
-			if (to < block->m_stable.size() && block->m_stable[to]) std::memset(block->m_stable[to].mapped, 0, block->m_stable[to].size);
-			continue;
-		}
-		const Region target = block->At(RunRef{to, 0, RunRef::kNoCopy});
-		std::memcpy(target.mapped, source.mapped, (std::min)(target.size, source.size));
+		std::scoped_lock lock(block->m_mutex);
+		const bool hasSource = from < block->m_stable.size() && block->m_stable[from];
+		const uint32_t written = !hasSource ? 0u : hostOnly ? block->m_stableHigh[from] : block->m_stable[from].size;
+		const bool hasTarget = to < block->m_stable.size() && block->m_stable[to];
+		const uint32_t left = hasTarget ? block->m_stableHigh[to] : 0u;
+		if (!written && !left) continue;
+		const Region target = block->StableRegion(to);
+		const uint32_t copied = (std::min)(written, target.size);
+		if (copied) std::memcpy(target.mapped, block->m_stable[from].mapped, copied);
+		if (left > copied) std::memset(target.mapped + copied, 0, (std::min)(left, target.size) - copied);
+		block->m_stableHigh[to] = copied;
 	}
 }
 
@@ -151,22 +161,33 @@ LatchBlock::~LatchBlock() {
 	}
 }
 
+LatchBlock::Region LatchBlock::StableRegion(uint32_t lease) const {
+	if (m_stable.size() <= lease) {
+		m_stable.resize(size_t{lease} + 1);
+		m_stableHigh.resize(size_t{lease} + 1);
+	}
+	auto& region = m_stable[lease];
+	if (!region) {
+		if (IsHostOnly(lease)) {
+			// Plain zeroed host memory, freed with the block (no buffer: the destructor knows it by that).
+			region = Region{nullptr, 0, 0, new std::byte[m_stride]{}, m_stride};
+		} else {
+			region = m_arena->AllocatePinned(m_stride);
+		}
+		m_stableHigh[lease] = 0;
+		NoteStable(this, lease);
+	}
+	return region;
+}
+
 LatchBlock::Region LatchBlock::At(const RunRef& run) const {
 	// A dedicated block has one region, which every run names.
 	if (m_buffer) return Region{m_buffer.get(), m_srvIndex, 0, m_mapped, m_stride};
 	std::scoped_lock lock(m_mutex);
 	if (run.Stable()) {
-		if (m_stable.size() <= run.lease) m_stable.resize(size_t{run.lease} + 1);
-		auto& region = m_stable[run.lease];
-		if (!region) {
-			if (IsHostOnly(run.lease)) {
-				// Plain zeroed host memory, freed with the block (no buffer: the destructor knows it by that).
-				region = Region{nullptr, 0, 0, new std::byte[m_stride]{}, m_stride};
-			} else {
-				region = m_arena->AllocatePinned(m_stride);
-			}
-			NoteStable(this, run.lease);
-		}
+		const auto region = StableRegion(run.lease);
+		// A host-only run's region handed out: whoever asked may write any of it.
+		if (IsHostOnly(run.lease)) m_stableHigh[run.lease] = region.size;
 		return region;
 	}
 	if (m_runs.size() <= run.lease) m_runs.resize(size_t{run.lease} + 1);
@@ -181,8 +202,16 @@ LatchBlock::Region LatchBlock::At(const RunRef& run) const {
 void LatchBlock::Write(const RunRef& run, uint32_t offset, std::span<const std::byte> bytes) const {
 	if (uint64_t(offset) + bytes.size() > m_stride)
 		throw std::out_of_range("Latch block '" + m_name + "' write past its region");
-	const auto region = At(run);
+	if (m_buffer || !run.Stable()) {
+		const auto region = At(run);
+		std::memcpy(region.mapped + offset, bytes.data(), bytes.size());
+		return;
+	}
+	std::scoped_lock lock(m_mutex);
+	const auto region = StableRegion(run.lease);
 	std::memcpy(region.mapped + offset, bytes.data(), bytes.size());
+	auto& high = m_stableHigh[run.lease];
+	high = (std::max)(high, offset + static_cast<uint32_t>(bytes.size()));
 }
 
 } // namespace org

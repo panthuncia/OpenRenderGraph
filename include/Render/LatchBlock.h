@@ -85,6 +85,9 @@ public:
 	// region at `from` is copied (the region at `to` is made if needed). A block with a region only at `to` is zeroed. So `to` reads
 	// exactly what was written for `from`. For a host that gathers a run's values in a staging run before it takes the run
 	// (GraphHost::EpochStagingRun). The GPU must be done with `to`'s last run.
+	// Only bytes that can differ move. From a host-only run (MarkHostOnlyRun), only the part written since its last ZeroStableRun is
+	// copied: Write's range, or the whole region once At or Bytes handed it out. At `to`, only the part Write or an earlier copy left
+	// non-zero is cleared. So nothing may write `to`'s regions through At's or Bytes' pointer: Write and this copy only.
 	static void CopyStableRun(uint32_t from, uint32_t to);
 	// The stable run at lease index `lease` is only ever written and read by the host (a staging run, GraphHost::EpochStagingRun): its
 	// regions are plain cached host memory, not the arena's GPU-visible memory, so reading them back (CopyStableRun) is cheap. Such a
@@ -110,6 +113,11 @@ private:
 	mutable std::mutex m_mutex;
 	mutable std::vector<RunEntry> m_runs;    // by lease index: the leased run that last asked
 	mutable std::vector<Region> m_stable;    // by lease index: pinned for the block's life
+	// By lease index, with m_stable: how many bytes from the region's start may be non-zero. Kept by Write, CopyStableRun and
+	// ZeroStableRun, and the whole region once At or Bytes hand out a host-only run's region (CopyStableRun).
+	mutable std::vector<uint32_t> m_stableHigh;
+	// The stable run's region at lease index `lease`, made (zeroed) if needed. Under m_mutex.
+	Region StableRegion(uint32_t lease) const;
 	// A dedicated block's buffer.
 	uint32_t m_srvIndex = 0;
 	std::shared_ptr<Buffer> m_buffer;

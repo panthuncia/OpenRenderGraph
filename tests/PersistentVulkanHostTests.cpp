@@ -1493,6 +1493,24 @@ static int Run(int argc, char** argv) {
 						}, {}, slotted);
 						REQUIRE(copied == 0x5EEDu && cleared == 0u, "the copy's run reads what was staged, and zero where nothing was");
 						REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "a staged copy's recording writes every element");
+						// The staging run cleared and staged again further in only: the copy moves the written part, and clears what the last copy
+						// left before it. Then nothing staged at all: the copy's run reads zeros again.
+						org::LatchBlock::ZeroStableRun(staging.lease);
+						staged->WriteValue(staging, 8, 0xF00Du);
+						uint32_t words[4] = {1, 1, 1, 1};
+						for (const uint32_t round : {0u, 1u}) {
+							if (round == 1) org::LatchBlock::ZeroStableRun(staging.lease);
+							value = 76600u + round;
+							host.SetEpochCopy(0, 2);
+							host.SubmitEpoch(0, [&](org::RenderGraph& graph) {
+								upload(graph);
+								org::LatchBlock::CopyStableRun(staging.lease, host.CurrentRun().lease);
+								std::memcpy(words, staged->Bytes(host.CurrentRun()).data(), sizeof(words));
+							}, {}, slotted);
+							REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "a staged copy's recording writes every element");
+							REQUIRE(words[0] == 0u && words[1] == 0u && words[2] == (round == 0 ? 0xF00Du : 0u) && words[3] == 0u,
+								"the copy's run reads exactly what was staged since the staging run was cleared");
+						}
 					}
 					// A held ticket given back unsubmitted: the next submission of the copy takes a new one.
 					host.SetEpochCopy(0, 1);
