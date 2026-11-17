@@ -1144,8 +1144,9 @@ std::shared_ptr<const SelectedPublication> GraphEditTransaction::Build(
         BT_ZONE_SCOPE("ORG.Persistent.BuildExecutable");
         compiler::GraphCompileInput input;
         input.structure = m_logical->declarations;
-        // The decision trace names passes and resources by these labels (OpenRenderGraph/Trace.h).
-        if (trace::Any()) {
+        // The decision trace names passes and resources by these labels (OpenRenderGraph/Trace.h), and so does BasicRHI's command
+        // census (a handoff list is labelled with its batch's first pass).
+        if (trace::Any() || rhi::census::Enabled()) {
             auto& structure = input.structure;
             structure.diagnosticPassNames.assign(structure.passes.size(), {});
             for (size_t i = 0; i < structure.passes.size() && i < m_logical->passSlots.size(); ++i)
@@ -1359,7 +1360,13 @@ std::shared_ptr<const SelectedPublication> GraphEditTransaction::Build(
                 input.analyzedDependencies = std::move(edges);
             }
             input.structure.passes = std::move(active);
-            input.structure.diagnosticPassNames.clear();
+            // The names follow their passes to the dense indices.
+            if (!input.structure.diagnosticPassNames.empty()) {
+                std::vector<std::string> names(input.structure.passes.size());
+                for (uint32_t i = 0; i < dense.size() && i < input.structure.diagnosticPassNames.size(); ++i)
+                    if (dense[i] != UINT32_MAX) names[dense[i]] = std::move(input.structure.diagnosticPassNames[i]);
+                input.structure.diagnosticPassNames = std::move(names);
+            }
         }
         {
             BT_ZONE_SCOPE("ORG.Persistent.LowerResourceSlots");

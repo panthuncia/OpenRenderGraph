@@ -603,7 +603,14 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 				}
 				auto list = allocation->pair.list.Get();
 				// BasicRHI's command census names the list (diagnostics).
-				if (rhi::census::Enabled()) rhi::census::SetLabel("handoff");
+				if (rhi::census::Enabled()) {
+					// Named after its batch's first pass, so a barrier's cost can be placed.
+					std::string label = "handoff";
+					const auto& passes = graph.batches[batch].passes;
+					const auto& names = graph.structure->diagnosticPassNames;
+					if (!passes.empty() && passes.front() < names.size() && !names[passes.front()].empty()) label += " > " + names[passes.front()];
+					rhi::census::SetLabel(label.c_str());
+				}
 				rhi::BarrierBatch barriers{};
 				barriers.textures = {entry.textures.data(), static_cast<uint32_t>(entry.textures.size())};
 				barriers.buffers = {entry.buffers.data(), static_cast<uint32_t>(entry.buffers.size())};
