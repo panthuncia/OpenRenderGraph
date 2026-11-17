@@ -456,7 +456,8 @@ struct FramePreparationContext {
 
 // Ownership of the objects one recording's commands name: the pipelines it bound, and the command signatures and
 // work graphs it used. It is kept until the recording's GPU work retires, including every resubmission of a kept
-// recording. A late batch that is recorded again appends to the same retention.
+// recording. A late batch that is recorded again appends to the same retention, unless its list's last submission is
+// done: an inline late batch releases it before it records again (see Release).
 class RecordingRetention {
 public:
     void Retain(std::shared_ptr<const void> owner) {
@@ -464,6 +465,16 @@ public:
         std::lock_guard lock(m_mutex);
         for (const auto& existing : m_owners) if (existing == owner) return;
         m_owners.push_back(std::move(owner));
+    }
+    // Lets go of everything retained so far. Only for a list whose every submission is done and that is about to be
+    // recorded again: the new recording retains what its commands name. Without this, a late batch recorded every frame
+    // kept each frame's owners (staging buffers, frame data) until the batch itself went away.
+    void Release() {
+        std::vector<std::shared_ptr<const void>> released;
+        {
+            std::lock_guard lock(m_mutex);
+            released.swap(m_owners);
+        }
     }
 private:
     std::mutex m_mutex;

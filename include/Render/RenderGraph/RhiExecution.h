@@ -1344,6 +1344,9 @@ inline rhi::CommandList PreparedRhiExecutionBatch::RecordInline() const noexcept
         // that copy's last run completed), so Begin resets it.
         allocation.pool->Begin(allocation.pair);
         allocation.closed = false;
+        // Recorded before: the list's last submission is done (above), so what that recording retained is no longer named
+        // by pending work. It goes now; the new recording retains its own.
+        if (m_deferredRecorded.load(std::memory_order_relaxed) && m_deferred->retention) m_deferred->retention->Release();
         auto list = allocation.pair.list.Get();
         if (m_keyedBySkips && skips.empty()) askSkips(list);
         const size_t recorded = RecordDeferredCommands(list);
