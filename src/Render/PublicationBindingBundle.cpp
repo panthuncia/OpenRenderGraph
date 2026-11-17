@@ -116,6 +116,7 @@ PublicationBindingBundle::Snapshot PublicationBindingBundle::Capture(Resource& r
         return concrete ? Capture(*concrete) : Snapshot{};
     }
     auto result = std::make_shared<ResourceBindingSnapshot>();
+    std::unique_lock<std::recursive_mutex> backingLock;
     result->resourceID = resource.GetGlobalResourceID();
     result->externallyImmutable = resource.GetGraphOwnership() == Resource::GraphOwnership::ExternalImmutableShaderResource;
     resource.TryGetRHIResourceDesc(result->description);
@@ -138,6 +139,9 @@ PublicationBindingBundle::Snapshot PublicationBindingBundle::Capture(Resource& r
         result->aliasSize = set->placement.size;
         result->allocationOwner = std::move(set);
     } else if (auto* backed = dynamic_cast<BackedResource*>(&resource)) {
+        // Held until the views are captured: a re-placement between the two would pair this allocation with no views, or
+        // with the next backing's.
+        if (auto* mutex = backed->BackingMutex()) backingLock = std::unique_lock(*mutex);
         auto allocation = backed->CapturePublishedBackingAllocation();
         if (!allocation) return {};
         result->resource = allocation->resource;

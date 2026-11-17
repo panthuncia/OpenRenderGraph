@@ -40,6 +40,9 @@ public:
     // must not manufacture an ownership lease. Async publication requests the
     // default retained form.
     virtual BackingAllocationSnapshot CaptureBackingAllocation(bool /*retain*/ = true) { return {}; }
+    // The lock that (de)materialization holds. A publication capture holds it across the allocation and the descriptor
+    // views, so both come from one backing: another graph of the arena can re-place this resource on its own thread.
+    virtual std::recursive_mutex* BackingMutex() noexcept { return nullptr; }
     // Resource-version publication. A stable backing generation returns the
     // same immutable token; this is allocation ownership, not graph caching.
     std::shared_ptr<const BackingAllocationSnapshot> CapturePublishedBackingAllocation() {

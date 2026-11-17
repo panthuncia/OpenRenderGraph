@@ -154,6 +154,7 @@ public:
 
     uint64_t GetBackingGeneration() const override;
     BackingAllocationSnapshot CaptureBackingAllocation(bool retain = true) override;
+    std::recursive_mutex* BackingMutex() noexcept override { return &m_materializationMutex; }
 
     void Materialize(const MaterializeOptions* options = nullptr);
 
@@ -253,7 +254,7 @@ protected:
 private:
     // Two graphs that share a buffer may materialize it at the same time (RenderGraph::MaterializeUnmaterializedResources).
     // This mutex makes sure the buffer gets only one backing.
-    std::mutex m_materializationMutex;
+    std::recursive_mutex m_materializationMutex;
     uint64_t m_backingGeneration = 0;
     std::weak_ptr<org::runtime::IUploadService> m_pinnedUploadService;  // PinUploadService
     org::runtime::UploadPolicyTag m_uploadPolicyTag = org::runtime::UploadPolicyTag::Immediate;

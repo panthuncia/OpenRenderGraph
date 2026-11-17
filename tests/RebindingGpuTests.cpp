@@ -38,6 +38,8 @@
 #include <optional>
 #include <string>
 #include <vector>
+#include <thread>
+#include <atomic>
 
 namespace {
 constexpr uint32_t kCount = 64;
@@ -971,6 +973,40 @@ int RunGraphInstanceScenario(rhi::Device device, const std::shared_ptr<org::Runt
     CHECK(device.WaitIdle() == rhi::Result::Ok);
     return 0;
 }
+// Another graph of a shared alias arena re-places a resource (dematerialize, then materialize) on its own thread while a build
+// captures the resource's binding on another. Each capture must take its allocation and its descriptor views from one backing: a
+// capture between the two halves of a re-placement once paired a live allocation with no views ("Replacement lost a required
+// descriptor snapshot").
+int RunCaptureDuringReplacementScenario() {
+    org::TextureDescription description{};
+    description.imageDimensions = {{64, 64, 0, 0}};
+    description.format = rhi::Format::R8G8B8A8_UNorm;
+    description.channels = 4;
+    description.hasSRV = true;
+    description.hasRTV = true;
+    auto texture = org::PixelBuffer::CreateShared(description);
+    texture->SetName("capture.replaced");
+    texture->Materialize();
+    std::atomic<bool> done{false};
+    std::atomic<uint32_t> torn{0}, captured{0};
+    std::thread capturer([&] {
+        while (!done.load(std::memory_order_acquire)) {
+            const auto snapshot = org::PublicationBindingBundle::Capture(*texture);
+            if (!snapshot || !snapshot->resource.GetHandle().valid()) continue;
+            captured.fetch_add(1, std::memory_order_relaxed);
+            if (!snapshot->views || !snapshot->descriptorOwner) torn.fetch_add(1, std::memory_order_relaxed);
+        }
+    });
+    for (int i = 0; i < 400; ++i) {
+        texture->Dematerialize();
+        texture->Materialize();
+    }
+    done.store(true, std::memory_order_release);
+    capturer.join();
+    CHECK(captured.load() > 0);
+    CHECK(torn.load() == 0);
+    return 0;
+}
 } // namespace
 
 int TestRebindingGpu(rhi::Device device, const std::shared_ptr<org::Runtime>& runtime) {
@@ -990,6 +1026,7 @@ int TestRebindingGpu(rhi::Device device, const std::shared_ptr<org::Runtime>& ru
     if (const int line = RunExecutionHandleScenario(device, runtime)) return line;
     if (const int line = RunGraphDescScenario(device, runtime)) return line;
     if (const int line = RunGraphInstanceScenario(device, runtime)) return line;
+    if (const int line = RunCaptureDuringReplacementScenario()) return line;
     org::persistent::SetSharingValidation(validation);
     return 0;
 }

@@ -170,8 +170,12 @@ inline RotationKey RotationKeyOfResource(Resource& resource) {
 	auto* concrete = UnwrapDynamic(&resource);
 	if (!concrete) return key;
 	key.concreteID = concrete->GetGlobalResourceID();
-	if (auto* backed = dynamic_cast<BackedResource*>(concrete)) key.backingGeneration = backed->GetBackingGeneration();
-	else {
+	// The generation and the views come from one backing (BackedResource::BackingMutex).
+	std::unique_lock<std::recursive_mutex> backingLock;
+	if (auto* backed = dynamic_cast<BackedResource*>(concrete)) {
+		if (auto* mutex = backed->BackingMutex()) backingLock = std::unique_lock(*mutex);
+		key.backingGeneration = backed->GetBackingGeneration();
+	} else {
 		const auto handle = concrete->GetAPIResource().GetHandle();
 		key.apiIndex = handle.index; key.apiGeneration = handle.generation;
 	}
@@ -685,8 +689,11 @@ inline RotationKey RotationKeyOf(State::SlotEntry& entry) {
 		entry.indexed = dynamic_cast<GloballyIndexedResource*>(concrete);
 	}
 	key.concreteID = concrete->GetGlobalResourceID();
-	if (entry.backed) key.backingGeneration = entry.backed->GetBackingGeneration();
-	else {
+	std::unique_lock<std::recursive_mutex> backingLock;
+	if (entry.backed) {
+		if (auto* mutex = entry.backed->BackingMutex()) backingLock = std::unique_lock(*mutex);
+		key.backingGeneration = entry.backed->GetBackingGeneration();
+	} else {
 		const auto handle = concrete->GetAPIResource().GetHandle();
 		key.apiIndex = handle.index; key.apiGeneration = handle.generation;
 	}

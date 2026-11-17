@@ -590,6 +590,7 @@ void BufferBase::Materialize(const MaterializeOptions* options) {
 }
 
 BackingAllocationSnapshot BufferBase::CaptureBackingAllocation(bool retain) {
+    std::scoped_lock lock(m_materializationMutex);
     if (!m_dataBuffer || GetAttachedAPIRepresentation(BackendInstanceId::Primary).IsValid()) return {};
     auto lease = retain ? m_dataBuffer->CaptureAllocationLease() : std::shared_ptr<const void>{};
     if (retain && !lease) return {};
@@ -605,6 +606,7 @@ BackingAllocationSnapshot BufferBase::CaptureBackingAllocation(bool retain) {
 void BufferBase::Dematerialize() {
 	const bool hadAttachedPrimary = GetAttachedAPIRepresentation(BackendInstanceId::Primary).IsValid();
 	ClearAPIRepresentations();
+    std::scoped_lock lock(m_materializationMutex);
     if (!m_dataBuffer) {
 		if (hadAttachedPrimary) {
 			RotateDescriptorSlotsForPublication();
