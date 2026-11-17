@@ -131,6 +131,9 @@ public:
         return StatisticsManager::GetInstance().BeginSubRangeQuery(name, cmdList, ctx);
     }
 
+    void BeginListRangeQuery(std::string_view name, rhi::CommandList& cmdList, QueryRecordingContext& ctx) override {
+        StatisticsManager::GetInstance().BeginListRangeQuery(name, cmdList, ctx);
+    }
     void EndRangeQuery(rhi::CommandList& cmdList, QueryRecordingContext& ctx) override {
         StatisticsManager::GetInstance().EndRangeQuery(cmdList, ctx);
     }

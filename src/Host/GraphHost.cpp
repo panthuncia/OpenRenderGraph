@@ -1102,7 +1102,7 @@ std::unique_ptr<RenderGraph> GraphHost::MakeGraph(const BuildInputs& inputs, boo
 		graph->SetPersistentExternalHomeStates(m_desc.externalHomeStates);
 		if (inputs.aliasArena) graph->SetPersistentAliasArena(inputs.aliasArena);
 		graph->SetPersistentRecordingReuse(m_desc.reuseRecordings);
-		graph->SetPersistentRecordingTimestamps(m_recordingTimestamps.load(std::memory_order_acquire));
+		graph->SetPersistentRecordingTimestampMode(m_recordingTimestamps.load(std::memory_order_acquire));
 		graph->SetScheduleTraceEnabled(m_scheduleTrace.load(std::memory_order_acquire));
 		{
 			auto boundary = m_desc.queueBoundary;

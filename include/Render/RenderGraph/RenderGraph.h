@@ -105,6 +105,8 @@ namespace persistent { class GraphEditTransaction; class SelectedPublication; st
 
 class RenderGraph {
 public:
+	// Timestamps in recordings kept for resubmission (SetPersistentRecordingTimestampMode).
+	enum class RecordingTimestampMode : uint8_t { Off, Passes, Lists };
 	// Declared at namespace scope (RenderGraphExtension.h), so extension headers need not include the graph.
 	using ExternalInsertKind = org::ExternalInsertKind;
 	using ExternalInsertPoint = org::ExternalInsertPoint;
@@ -389,8 +391,14 @@ private:
 	// queries it owns (IStatisticsService::CreateOwnedTimestamps), resolved by every submission and read when its frame slot
 	// completes (IStatisticsService::GetCompletedTimestamps). Read when a list is recorded: set it before the graph records
 	// (GraphHost::SetRecordingTimestamps rebuilds the graph for it).
-	void SetPersistentRecordingTimestamps(bool enabled) noexcept { m_persistentRecordingTimestamps = enabled; }
-	bool PersistentRecordingTimestamps() const noexcept { return m_persistentRecordingTimestamps; }
+	// Lists: one range per kept list (its entry barriers to its exit), no pass or barrier ranges: a stage's GPU time at about
+	// one drain per list instead of one per range.
+	void SetPersistentRecordingTimestamps(bool enabled) noexcept {
+		m_persistentRecordingTimestamps = enabled ? RecordingTimestampMode::Passes : RecordingTimestampMode::Off;
+	}
+	void SetPersistentRecordingTimestampMode(RecordingTimestampMode mode) noexcept { m_persistentRecordingTimestamps = mode; }
+	bool PersistentRecordingTimestamps() const noexcept { return m_persistentRecordingTimestamps != RecordingTimestampMode::Off; }
+	RecordingTimestampMode PersistentRecordingTimestampMode() const noexcept { return m_persistentRecordingTimestamps; }
 	struct PersistentRecordingStats {
 		uint64_t recorded = 0;    // tickets recorded (owner thread)
 		// Tickets admitted at submission with their prediction's plan (the ledger held what the executable found last), and those
@@ -925,7 +933,7 @@ private:
 	std::vector<std::shared_ptr<CommandListPool>> m_externalSecondaryPools;
 	bool m_persistentRecordingReuse = false;
 	SharingChangePolicy m_sharingChangePolicy = SharingChangePolicy::Inline;
-	bool m_persistentRecordingTimestamps = false;
+	RecordingTimestampMode m_persistentRecordingTimestamps = RecordingTimestampMode::Off;
 	std::atomic<uint64_t> m_recordingsRecorded{0};
 	uint32_t m_persistentEpoch = UINT32_MAX;
 	PersistentExecuteTimings m_lastPersistentExecuteTimings{};

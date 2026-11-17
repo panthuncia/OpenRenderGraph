@@ -178,11 +178,17 @@ public:
 	// frame callback). A change requests a rebuild, so every kept recording (a revision's epochs) is recorded again with them,
 	// or without; until that build, kept recordings stay as they were recorded.
 	void SetRecordingTimestamps(bool enabled) noexcept {
-		if (m_recordingTimestamps.exchange(enabled, std::memory_order_acq_rel) == enabled) return;
+		SetRecordingTimestampMode(enabled ? RenderGraph::RecordingTimestampMode::Passes : RenderGraph::RecordingTimestampMode::Off);
+	}
+	// Per pass (Passes) or one range per kept list (Lists; RenderGraph::SetPersistentRecordingTimestampMode).
+	void SetRecordingTimestampMode(RenderGraph::RecordingTimestampMode mode) noexcept {
+		if (m_recordingTimestamps.exchange(mode, std::memory_order_acq_rel) == mode) return;
 		m_hostConfiguration.fetch_add(1, std::memory_order_acq_rel);
 		RequestRebuild("recording timestamps switched");
 	}
-	bool RecordingTimestamps() const noexcept { return m_recordingTimestamps.load(std::memory_order_acquire); }
+	bool RecordingTimestamps() const noexcept {
+		return m_recordingTimestamps.load(std::memory_order_acquire) != RenderGraph::RecordingTimestampMode::Off;
+	}
 	// Diagnostics: the external queue boundary's entry and exit barriers in place of Desc::queueBoundary's, from the next build
 	// (dropping them is unsafe: the graphs' first and last accesses are then unordered against the host's work).
 	void SetQueueBoundary(RenderGraph::ExternalQueueBoundary boundary) noexcept {
@@ -1069,7 +1075,7 @@ private:
 	// (the newest submission retirement knows of) when there is none. With m_leaseMutex held.
 	uint64_t RetiredSubmissionsLocked(uint64_t seen) const;
 	uint64_t m_retiredReported = 0;
-	std::atomic<bool> m_recordingTimestamps{false};
+	std::atomic<RenderGraph::RecordingTimestampMode> m_recordingTimestamps{RenderGraph::RecordingTimestampMode::Off};
 	std::atomic<bool> m_boundaryOverridden{false}, m_boundaryEntry{false}, m_boundaryExit{false};
 	std::atomic<bool> m_scheduleTrace{false};
 	bool m_explicitBuilds = false;

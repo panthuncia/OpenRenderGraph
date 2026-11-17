@@ -581,7 +581,7 @@ void StatisticsManager::ResolveQueries(
     if (ctx.owned) {
         // Resolve every range the list recorded into the recording's own buffer. Each submission resolves them again.
         auto& owned = *ctx.owned;
-        EndOwnedRange(owned, cmd);
+        EndOwnedRange(owned, cmd, true);
         if (!owned.resolved && !owned.entries.empty())
             cmd.ResolveQueryData(owned.pool->GetHandle(), 0, static_cast<uint32_t>(owned.entries.size() * 2u), owned.readback->GetHandle(), 0);
         owned.resolved = true;
@@ -861,6 +861,8 @@ bool StatisticsManager::BeginOwnedRange(OwnedTimestampQueries& owned, std::strin
     // Ranges nest. A pass's sub-ranges sit inside the pass range. A pass range or barrier range opens only at the
     // top level.
     if (owned.resolved || (kind != org::runtime::TimestampRangeKind::Sub && !owned.open.empty())) return false;
+    // List mode times the list alone.
+    if (owned.listOnly != (kind == org::runtime::TimestampRangeKind::List)) return false;
     if (owned.entries.size() >= owned.capacity) {
         ++owned.overflow;
         return false;
@@ -876,8 +878,10 @@ bool StatisticsManager::BeginOwnedRange(OwnedTimestampQueries& owned, std::strin
     return true;
 }
 
-void StatisticsManager::EndOwnedRange(OwnedTimestampQueries& owned, rhi::CommandList& cmd) {
+void StatisticsManager::EndOwnedRange(OwnedTimestampQueries& owned, rhi::CommandList& cmd, bool closingList) {
     if (owned.open.empty()) return;
+    // In list mode a pass's or barrier batch's end has no range of its own: only the resolve closes the list's range.
+    if (owned.listOnly && !closingList) return;
     // The end of a pass range or barrier-batch range waits for that work to finish. The reasons:
     // - NVIDIA's Blackwell driver writes a bottom-of-pipe or all-commands timestamp before a preceding
     //   generated-commands execution (ExecuteIndirect) has run.
@@ -904,6 +908,11 @@ void StatisticsManager::BeginRangeQuery(std::string_view name, rhi::CommandList&
 bool StatisticsManager::BeginSubRangeQuery(std::string_view name, rhi::CommandList& cmdList, QueryRecordingContext& ctx) {
     return m_collectPassStatistics && ctx.owned && !ctx.owned->open.empty() &&
            BeginOwnedRange(*ctx.owned, name, -1, org::runtime::TimestampRangeKind::Sub, cmdList);
+}
+
+void StatisticsManager::BeginListRangeQuery(std::string_view name, rhi::CommandList& cmdList, QueryRecordingContext& ctx) {
+    if (m_collectPassStatistics && ctx.owned && ctx.owned->listOnly)
+        BeginOwnedRange(*ctx.owned, name, -1, org::runtime::TimestampRangeKind::List, cmdList);
 }
 
 void StatisticsManager::EndRangeQuery(rhi::CommandList& cmdList, QueryRecordingContext& ctx) {

@@ -1071,6 +1071,14 @@ inline size_t RecordOwnedRecordingCommands(RecordingContext& context, const Owne
     const auto firstPass = recording.passes.empty() ? std::string_view{} : std::string_view(recording.passes.front().DebugName());
     // A kept recording's own queries (OwnedTimestampQueries) time its barrier batches too, under the profiler's range names.
     auto* const ownedQueries = statistics && statistics->gpuQueries && statistics->queries.owned ? &statistics->queries : nullptr;
+    // BasicRHI's command census (rhi::census) labels the list with its first pass.
+    if (rhi::census::Enabled()) rhi::census::SetLabel(firstPass.empty() ? "<unnamed>" : std::string(firstPass).c_str());
+    // List mode: one range for the whole list, from before its entry barriers to after its exit barrier (the resolve).
+    if (ownedQueries && ownedQueries->owned->listOnly) {
+        thread_local std::string listName;
+        listName.assign("list: ").append(firstPass.empty() ? std::string_view("<unnamed>") : firstPass);
+        statistics->service->BeginListRangeQuery(listName, context.Commands(), *ownedQueries);
+    }
     const int skipBarriers = diagnostics::DiagnosticSkipListBarriers().load(std::memory_order_relaxed);
     const auto recordBarriers = [&](const char* where, std::string_view pass, const rhi::BarrierBatch& barriers) {
         if (skipBarriers >= 2 || (skipBarriers == 1 && barriers.globals.size != 0))

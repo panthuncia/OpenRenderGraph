@@ -74,6 +74,7 @@ public:
 	std::shared_ptr<OwnedTimestampQueries> CreateOwnedTimestamps(rhi::QueueKind queueKind, uint32_t ranges);
 	void BeginRangeQuery(std::string_view name, rhi::CommandList& cmdList, QueryRecordingContext& ctx);
 	void EndRangeQuery(rhi::CommandList& cmdList, QueryRecordingContext& ctx);
+	void BeginListRangeQuery(std::string_view name, rhi::CommandList& cmdList, QueryRecordingContext& ctx);
 	bool BeginSubRangeQuery(std::string_view name, rhi::CommandList& cmdList, QueryRecordingContext& ctx);
 	const std::vector<CompletedTimestamp>& GetCompletedTimestamps() const { return m_completedTimestamps; }
 
@@ -102,7 +103,7 @@ private:
 
 	void EnsureQueueBuffers(rhi::QueueKind queueKind);
 	bool BeginOwnedRange(OwnedTimestampQueries& owned, std::string_view name, int passIndex, org::runtime::TimestampRangeKind kind, rhi::CommandList& cmd);
-	void EndOwnedRange(OwnedTimestampQueries& owned, rhi::CommandList& cmd);
+	void EndOwnedRange(OwnedTimestampQueries& owned, rhi::CommandList& cmd, bool closingList = false);
 	void ReadOwnedTimestamps(unsigned frameIndex);
 	void RecordCpuTimeSample(unsigned passIndex, double milliseconds, bool isUpdate);
 

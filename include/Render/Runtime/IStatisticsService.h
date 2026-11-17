@@ -20,6 +20,7 @@ enum class TimestampRangeKind : uint8_t {
     Pass,
     Barrier,  // a barrier batch recorded around a pass (OwnedRecordingBarrierRangeName's "cs.org.barrier.<where>.<pass>")
     Sub,      // a range a pass recorded inside itself (BeginRecordingSubRange), nested in its pass's
+    List,     // a whole kept list, in list mode (OwnedTimestampQueries::listOnly)
 };
 
 // The timestamp queries of one recording that is kept for resubmission (CreateOwnedTimestamps).
@@ -49,6 +50,7 @@ struct OwnedTimestampQueries {
     std::vector<int> open;             // recording: the ranges begun and not yet ended, innermost last
     bool resolved = false;             // recording: the resolve is recorded, and nothing more can be
     uint32_t overflow = 0;             // ranges past capacity, not timed
+    bool listOnly = false;             // list mode: one List range around the whole list, nothing else timed
 
     OwnedTimestampQueries() = default;
     OwnedTimestampQueries(const OwnedTimestampQueries&) = delete;
@@ -126,6 +128,10 @@ public:
         (void)name; (void)cmdList; (void)ctx;
     }
     virtual void EndRangeQuery(rhi::CommandList& cmdList, QueryRecordingContext& ctx) { (void)cmdList; (void)ctx; }
+    // List mode: opens the list's one range; the resolve at the list's end closes it.
+    virtual void BeginListRangeQuery(std::string_view name, rhi::CommandList& cmdList, QueryRecordingContext& ctx) {
+        (void)name; (void)cmdList; (void)ctx;
+    }
     // A named range that a pass records inside itself, nested in the pass's range, in a context with owned queries.
     // Returns false when the range is not timed: there are no owned queries, or they are past capacity.
     // End only a range that returned true.

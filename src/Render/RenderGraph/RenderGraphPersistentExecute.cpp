@@ -303,7 +303,8 @@ void RenderGraph::RecordPersistentSegment(PersistentSegmentRun& run) {
 			// its readback buffers as passes register (a resubmitted list would resolve into the freed ones), and its slots are
 			// frame-indexed. With recording timestamps it owns its own instead: a range per pass, per barrier batch around one
 			// (before and after it) and for the list's entry and exit barriers.
-			statistics->gpuQueries = queueKind != QueueKind::Copy && (!keepable || m_persistentRecordingTimestamps)
+			const bool listTimestamps = m_persistentRecordingTimestamps == RecordingTimestampMode::Lists;
+			statistics->gpuQueries = queueKind != QueueKind::Copy && (!keepable || m_persistentRecordingTimestamps != RecordingTimestampMode::Off)
 				&& m_queueRegistry.GetBackendInstance(index) == BackendInstanceId::Primary;
 			for (const auto& pass : job.recording.passes) {
 				const auto found = run.statisticsIndices->find(pass.DebugName());
@@ -313,8 +314,9 @@ void RenderGraph::RecordPersistentSegment(PersistentSegmentRun& run) {
 				// Each pass's range and barrier batches, plus sub-ranges the passes time inside themselves (a draw pass's views
 				// or draw groups: BeginRecordingSubRange).
 				constexpr uint32_t kSubRanges = 256;
-				const auto ranges = static_cast<uint32_t>(job.recording.passes.size() * 3 + 3) + kSubRanges;
+				const auto ranges = listTimestamps ? 1u : static_cast<uint32_t>(job.recording.passes.size() * 3 + 3) + kSubRanges;
 				statistics->queries.owned = m_statisticsService->CreateOwnedTimestamps(rhiKind, ranges);
+				if (statistics->queries.owned) statistics->queries.owned->listOnly = listTimestamps;
 				statistics->gpuQueries = static_cast<bool>(statistics->queries.owned);
 			}
 			job.recording.statistics = statistics;
