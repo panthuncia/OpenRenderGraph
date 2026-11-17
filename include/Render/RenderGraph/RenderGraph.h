@@ -336,6 +336,20 @@ private:
 	 */
 	void SetCoalescedSubmissions(bool enabled) noexcept { m_coalesceSubmissions = enabled; }
 	/**
+	 * @brief With coalesced submissions: the entry barriers of a queue submission's batches go into one handoff list, ahead of the
+	 * submission's first batch, instead of one list ahead of each batch. A batch's entry barriers touch only resources the batches
+	 * before it in the ticket do not use, and every wait of the submission comes before all of its lists, so moving them ahead is
+	 * safe. Barriers for a queue-family transfer, and those that discard or start from Undefined, stay ahead of their own batch.
+	 * GraphHost::Desc::mergeHandoffs sets it on every graph it builds.
+	 */
+	void SetMergedHandoffs(bool enabled) noexcept { m_mergeHandoffs = enabled; }
+	/**
+	 * @brief With coalesced submissions: a ticket's upload lists (SubmitPersistentTicket's TicketUploads) go in the ticket's first
+	 * queue submission when every batch of the ticket is on the uploads' queue, instead of in a submission of their own.
+	 * GraphHost::Desc::uploadsWithBatches sets it on every graph it builds.
+	 */
+	void SetUploadsWithBatches(bool enabled) noexcept { m_uploadsWithBatches = enabled; }
+	/**
 	 * @brief Under SetInlineAtExecution: a kept recording's late batch whose passes are all keyed by their skip answers
 	 * (PreparedPass::KeyedBySkip: gated copies and clears) submits its list again while those answers are unchanged, instead of
 	 * recording it at each submission. GraphHost::Desc::keepGatedInline sets it on every graph it builds.
@@ -480,9 +494,19 @@ private:
 	// waits for nothing the held one does not. Any other submission of this ticket submits the held group first. carryOut: this
 	// ticket's last group is held in the carry instead of submitted, for the next ticket to join. FlushSubmitCarry submits it.
 	struct SubmitCarry;
+	// The ticket's upload lists, recorded by the caller, for SubmitPersistentTicket to submit before its batches. They signal `signal`
+	// on their queue's timeline. With SetUploadsWithBatches they go in the ticket's first queue submission when they can; otherwise
+	// in a submission of their own, before anything else of the ticket.
+	struct TicketUploads {
+		std::span<const rhi::CommandList> lists;
+		rhi::Queue queue{};
+		uint32_t queueSlot = UINT32_MAX;
+		rhi::TimelinePoint signal{};
+		bool withBatches = false;  // set when they went in the ticket's first submission
+	};
 	bool SubmitPersistentTicket(PersistentTicket& ticket, std::span<uint64_t> nextQueueValues, PersistentTicketSubmission& out,
 		std::pair<uint32_t, uint64_t> uploadsDone = {UINT32_MAX, 0}, uint64_t frameWait = 0, bool streamUploads = false,
-		SubmitCarry* carry = nullptr, bool carryOut = false);
+		SubmitCarry* carry = nullptr, bool carryOut = false, TicketUploads* uploads = nullptr);
 	// A carry for SubmitPersistentTicket, and its submission. FlushSubmitCarry submits the group the carry holds (nothing when it
 	// holds none). Its batches were committed as submitted when they were held. False when the queue refused it. merged: how many
 	// tickets' groups it held.
@@ -928,6 +952,8 @@ private:
 	std::vector<uint32_t> m_externalPersistentEpochs;
 	bool m_inlineAtExecution = false;  // SetInlineAtExecution
 	bool m_coalesceSubmissions = false;  // SetCoalescedSubmissions
+	bool m_mergeHandoffs = false;        // SetMergedHandoffs
+	bool m_uploadsWithBatches = false;   // SetUploadsWithBatches
 	bool m_keepGatedInline = false;      // SetKeptGatedInline
 	std::mutex m_externalSecondaryPoolsMutex;
 	std::vector<std::shared_ptr<CommandListPool>> m_externalSecondaryPools;

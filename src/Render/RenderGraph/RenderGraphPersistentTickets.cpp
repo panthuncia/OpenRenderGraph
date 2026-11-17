@@ -387,7 +387,7 @@ bool RenderGraph::FlushSubmitCarry(SubmitCarry& carry, uint32_t* merged) {
 }
 
 bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uint64_t> nextQueueValues, PersistentTicketSubmission& out,
-	std::pair<uint32_t, uint64_t> uploadsDone, uint64_t frameWait, bool streamUploads, SubmitCarry* carry, bool carryOut) {
+	std::pair<uint32_t, uint64_t> uploadsDone, uint64_t frameWait, bool streamUploads, SubmitCarry* carry, bool carryOut, TicketUploads* uploads) {
 	BT_ZONE_SCOPE("ORG.Persistent.SubmitTicket");
 	out = {};
 	auto& state = *m_compilerState->persistent;
@@ -405,6 +405,30 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 	const auto& planned = ticket.queueUploads;
 	if (planned.planned && ticket.segments.size() != 1) throw std::logic_error("Queue-scoped uploads planned for a ticket of several segments");
 	const auto graphicsSlot = static_cast<uint32_t>(ToUnderlying(m_queueRegistry.FindGraphicsSlot()));
+	// The caller's upload lists. They ride in the ticket's first queue submission when every batch is on their queue, the ticket has
+	// one segment and no release, and its first batch can be gathered. Otherwise they are submitted on their own, before anything
+	// else of the ticket, as the caller did before.
+	bool uploadsPending = uploads && !uploads->lists.empty();
+	if (uploadsPending) {
+		bool ride = m_uploadsWithBatches && m_coalesceSubmissions && !ticket.external && ticket.segments.size() == 1;
+		if (ride) {
+			const auto& segment = ticket.segments.front();
+			const auto& graph = *segment.admission.publication->executable->graph;
+			const auto& packets = segment.recording->packets;
+			ride = !graph.batches.empty() && packets.size() == graph.batches.size() && segment.admission.Barriers().releases.empty()
+				&& std::ranges::all_of(graph.batches, [&](const auto& batch) { return batch.queue == uploads->queueSlot; })
+				&& dynamic_cast<const compiler::PreparedRhiExecutionBatch*>(packets.front().get()) != nullptr
+				&& !std::ranges::any_of(planned.leading, [](const auto& leading) { return leading.batch == 0 && leading.copies; });
+		}
+		if (!ride) {
+			uploadsPending = false;
+			if (carry && !FlushSubmitCarry(*carry)) return false;
+			rhi::SubmitDesc submit{};
+			submit.signals = {&uploads->signal, 1u};
+			if (uploads->queue.Submit({uploads->lists.data(), static_cast<uint32_t>(uploads->lists.size())}, submit) != rhi::Result::Ok) return false;
+			census.Submitted(Census::Submission::Uploads, uploads->queueSlot, static_cast<uint32_t>(uploads->lists.size()), {});
+		}
+	}
 	for (auto& segment : ticket.segments) {
 		if (!segment.admitted) throw std::logic_error("A ticket submitted before it was admitted (AdmitPersistentTicket)");
 		auto& admission = segment.admission;
@@ -491,6 +515,53 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 			}
 			// The lists a ticket of the slot recorded from the same predicted plan, again; otherwise recorded, and kept for the slot's
 			// later tickets.
+			// Merged handoffs: per batch, the first batch of the queue submission the coalescing below gives it. A batch submitted on
+			// its own (not a gatherable packet, or queue-scoped uploads ahead of it) keeps its own list, and the next batch starts a
+			// new submission.
+			std::vector<uint32_t> targets(batchCount);
+			for (uint32_t batch = 0; batch < batchCount; ++batch) targets[batch] = batch;
+			if (m_mergeHandoffs && m_coalesceSubmissions && !ticket.external) {
+				const auto& packets = segment.recording->packets;
+				uint32_t first = UINT32_MAX, firstQueue = UINT32_MAX;
+				for (uint32_t batch = 0; batch < batchCount && batch < packets.size(); ++batch) {
+					const bool gatherable = dynamic_cast<const compiler::PreparedRhiExecutionBatch*>(packets[batch].get()) != nullptr
+						&& !std::ranges::any_of(planned.leading, [&](const auto& leading) { return leading.batch == batch && leading.copies; });
+					if (!gatherable) {
+						first = UINT32_MAX;
+						continue;
+					}
+					if (first == UINT32_MAX || graph.batches[batch].queue != firstQueue) {
+						first = batch;
+						firstQueue = graph.batches[batch].queue;
+					}
+					targets[batch] = first;
+				}
+			}
+			// The barriers each handoff list records. A barrier that discards, starts from Undefined, or transfers a queue family stays
+			// with its own batch, and so does every barrier of a batch with acquired textures.
+			struct HandoffBarriers {
+				std::vector<rhi::TextureBarrier> textures;
+				std::vector<rhi::BufferBarrier> buffers;
+				std::vector<rhi::TextureBarrier> acquired;
+				bool Empty() const noexcept { return textures.empty() && buffers.empty() && acquired.empty(); }
+			};
+			std::vector<HandoffBarriers> lists(batchCount);
+			for (uint32_t batch = 0; batch < batchCount; ++batch) {
+				const auto& entry = admission.Barriers().batches[batch];
+				const bool own = targets[batch] == batch || !entry.acquired.empty();
+				auto& local = lists[batch];
+				auto& merged = lists[own ? batch : targets[batch]];
+				for (const auto& texture : entry.textures) {
+					const bool movable = !texture.discard && texture.beforeLayout != rhi::ResourceLayout::Undefined
+						&& texture.queueOwnership == rhi::QueueOwnership::None && texture.externalOwnership == rhi::TextureBarrier::ExternalOwnership::None;
+					(movable ? merged : local).textures.push_back(texture);
+				}
+				for (const auto& buffer : entry.buffers) {
+					const bool movable = buffer.queueOwnership == rhi::QueueOwnership::None && buffer.externalOwnership == rhi::BufferBarrier::ExternalOwnership::None;
+					(movable ? merged : local).buffers.push_back(buffer);
+				}
+				local.acquired.insert(local.acquired.end(), entry.acquired.begin(), entry.acquired.end());
+			}
 			PersistentExecutionsState::HandoffCache* cache = nullptr;
 			auto miss = !admission.sharedBarriers ? Census::HandoffMiss::Planned
 				: ticket.segments.size() != 1 ? Census::HandoffMiss::Segments : Census::HandoffMiss::NewPlan;
@@ -499,7 +570,8 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 				if (state.handoffCache.size() <= ticket.slot) state.handoffCache.resize(size_t{ticket.slot} + 1);
 				auto& entries = state.handoffCache[ticket.slot];
 				const auto found = std::ranges::find_if(entries, [&](const auto& entry) {
-					return entry.plan == admission.sharedBarriers && entry.external == ticket.external && entry.handoff.size() == batchCount;
+					return entry.plan == admission.sharedBarriers && entry.external == ticket.external && entry.handoff.size() == batchCount
+						&& entry.targets == targets;
 				});
 				// The one used goes first; a new one replaces the least recent when the slot keeps as many as it may.
 				const bool hit = found != entries.end();
@@ -519,8 +591,8 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 				}
 			}
 			for (uint32_t batch = 0; batch < batchCount && !(cache && cache->plan); ++batch) {
-				const auto& entry = admission.Barriers().batches[batch];
-				if (entry.textures.empty() && entry.buffers.empty() && entry.acquired.empty()) continue;
+				const auto& entry = lists[batch];
+				if (entry.Empty()) continue;
 				std::shared_ptr<compiler::FrameCommandAllocation> allocation;
 				if (inStream(batch)) {
 					allocation = streamSecondary(graph.batches[batch].queue, "ORG external ticket handoff");
@@ -559,6 +631,7 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 				cache->external = ticket.external;
 				cache->handoff = handoff;
 				cache->streamHandoff = streamHandoff;
+				cache->targets = targets;
 			}
 		}
 		if (planned.planned && planned.waitsForUploads.size() != batchCount)
@@ -817,6 +890,14 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 			const bool holdLast = carry && carryOut && &segment == &ticket.segments.back() && admission.Barriers().homeAcquires.textures.empty();
 			const auto flush = [&](bool last) -> bool {
 				if (group.empty()) return true;
+				// The ticket's uploads ahead of its first group's lists. Their signal is below the group's own values on the same
+				// timeline, so the group's highest signal covers it.
+				if (uploadsPending) {
+					uploadsPending = false;
+					uploads->withBatches = true;
+					gathered.lists.insert(gathered.lists.begin(), uploads->lists.begin(), uploads->lists.end());
+					gathered.signals.push_back(uploads->signal);
+				}
 				// The batches' own queue timeline: a wait on a value one of them signals is covered by queue order. Every
 				// signal on one timeline collapses to its highest value, which covers the lower ones.
 				const auto own = m_queueRegistry.GetFence(static_cast<QueueSlotIndex>(static_cast<uint8_t>(groupQueue))).GetHandle();

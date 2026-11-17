@@ -618,6 +618,7 @@ struct RenderGraph::PersistentExecutionsState {
 		std::shared_ptr<const compiler::PreparedExecutionBarrierPlan> plan;
 		bool external = false;
 		std::vector<rhi::CommandList> handoff, streamHandoff;  // per batch
+		std::vector<uint32_t> targets;  // per batch, the batch whose handoff list holds its entry barriers (SetMergedHandoffs)
 		std::vector<std::shared_ptr<const void>> allocations;
 	};
 	static constexpr size_t kHandoffCacheEntries = 4;

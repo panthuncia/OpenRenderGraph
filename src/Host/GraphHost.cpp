@@ -1081,6 +1081,8 @@ std::unique_ptr<RenderGraph> GraphHost::MakeGraph(const BuildInputs& inputs, boo
 		// Likewise for a pass recorded at execution inline (RenderGraph::PassEpochRecordsAtExecution).
 		graph->SetInlineAtExecution(inputs.inlineAtExecution);
 		graph->SetCoalescedSubmissions(m_desc.coalesceSubmissions);
+		graph->SetMergedHandoffs(m_desc.mergeHandoffs);
+		graph->SetUploadsWithBatches(m_desc.uploadsWithBatches);
 		graph->SetKeptGatedInline(m_desc.keepGatedInline);
 		// A detached graph sets up nothing other graphs share until it is attached (RenderGraph::DeferSharedSetup): the upload
 		// service's registry, the shared upload pass and the statistics query heap.
@@ -3678,6 +3680,8 @@ void GraphHost::FinishTicket(Async& async, TicketCommit& commit, FrameTimings& t
 		postControl(discard);
 		throw std::runtime_error("Async epochs cannot record these uploads (only pointer-targeted buffer copies)");
 	}
+	// The ticket's uploads, for SubmitPersistentTicket to submit (none when it recorded nothing).
+	RenderGraph::TicketUploads uploads;
 	Async::Message submitted;
 	submitted.kind = Async::Message::Kind::Submitted;
 	submitted.number = commit.number;
@@ -3694,23 +3698,13 @@ void GraphHost::FinishTicket(Async& async, TicketCommit& commit, FrameTimings& t
 		const rhi::TimelinePoint signal{async.graphicsFence, value};
 		// The producers' recorded lists, then this thread's (an empty one costs nothing but its begin and end).
 		recordedLists.push_back(commands);
-		// After the group an earlier ticket left held (the submission thread's carry).
-		if (carry && !RenderGraph::FlushSubmitCarry(*carry)) throw std::runtime_error("A held queue submission was refused");
-		rhi::Result uploadResult = rhi::Result::Ok;
-		try {
-			uploadResult = async.graphicsQueue.Submit({recordedLists.data(), static_cast<uint32_t>(recordedLists.size())}, {{}, {&signal, 1}});
-		} catch (...) {
-			if (submitted.resourceOwner) m_uncertainExecutionOwners.push_back(std::move(submitted.resourceOwner));
-			if (submitted.keepAlive) m_uncertainUploadOwners.push_back(std::move(submitted.keepAlive));
-			throw;
-		}
-		if (uploadResult != rhi::Result::Ok) {
-			if (submitted.resourceOwner) m_uncertainExecutionOwners.push_back(std::move(submitted.resourceOwner));
-			if (submitted.keepAlive) m_uncertainUploadOwners.push_back(std::move(submitted.keepAlive));
-			throw std::runtime_error(std::string("Async epochs could not submit their uploads (rhi::Result ") + rhi::ResultName(uploadResult) + ")");
-		}
+		// SubmitPersistentTicket submits them, after the group an earlier ticket left held (the submission thread's carry): in the
+		// ticket's first queue submission when it can (Desc::uploadsWithBatches), otherwise on their own first.
+		uploads.lists = {recordedLists.data(), recordedLists.size()};
+		uploads.queue = async.graphicsQueue;
+		uploads.queueSlot = async.graphicsSlot;
+		uploads.signal = signal;
 		submitted.uploadSignal = {async.graphicsSlot, value};
-		census.Submitted(Census::Submission::Uploads, async.graphicsSlot, static_cast<uint32_t>(recordedLists.size()), {});
 	}
 	lap(timings.uploadsUs);
 	bool ok = false;
@@ -3718,7 +3712,7 @@ void GraphHost::FinishTicket(Async& async, TicketCommit& commit, FrameTimings& t
 		// Submits and commits, or abandons its admission itself.
 		abandonUnsubmitted.ticket = nullptr;
 		ok = graph.SubmitPersistentTicket(*ticket, async.queueValues, submitted.submission, submitted.uploadSignal, commit.frameWait,
-			external && recorded, carry, carryOut);
+			external && recorded, carry, carryOut, uploads.lists.empty() ? nullptr : &uploads);
 	} catch (...) {
 		// The queue may have accepted a prefix of this ticket. Completion is
 		// unknown, so preserve both owners until device teardown.

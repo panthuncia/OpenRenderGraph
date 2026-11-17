@@ -107,6 +107,12 @@ public:
 		// A ticket's consecutive batches on one queue are submitted together, in one queue submission
 		// (RenderGraph::SetCoalescedSubmissions). Off: one submission per batch.
 		bool coalesceSubmissions = false;
+		// With coalesced submissions: one handoff list of entry barriers per queue submission, ahead of its first batch, instead of
+		// one per batch (RenderGraph::SetMergedHandoffs).
+		bool mergeHandoffs = false;
+		// With coalesced submissions: a ticket's uploads on the graphics queue go in its first queue submission when all its batches
+		// are on that queue, instead of in a submission of their own (RenderGraph::SetUploadsWithBatches).
+		bool uploadsWithBatches = false;
 		// With inline recording at execution: a kept recording's late batch made only of passes keyed by their skip answers
 		// (gated copies and clears) keeps its list while the answers are unchanged (RenderGraph::SetKeptGatedInline).
 		bool keepGatedInline = false;
