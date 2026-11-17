@@ -664,6 +664,26 @@ bool NoteAliasPlaced(const void* resource, bool placed) {
 }
 }
 
+void persistent_impl::ReleaseOwnAliasPlacements(const std::unordered_map<Resource*, AliasPlacementOwner>& owners) noexcept {
+	size_t released = 0;
+	for (const auto& [concrete, owner] : owners) {
+		const auto resource = owner.resource.lock();
+		auto* backed = resource ? dynamic_cast<BackedResource*>(resource.get()) : nullptr;
+		if (!backed || !backed->IsMaterialized() || backed->GetBackingGeneration() != owner.generation) continue;
+		try {
+			if (auto* texture = dynamic_cast<PixelBuffer*>(resource.get())) texture->Dematerialize();
+			else if (auto* buffer = dynamic_cast<BufferBase*>(resource.get())) buffer->Dematerialize();
+			else continue;
+		} catch (const std::exception& error) {
+			spdlog::error("Persistent alias placement of '{}' not given back: {}", resource->GetName(), error.what());
+			continue;
+		}
+		NoteAliasPlaced(concrete, false);
+		++released;
+	}
+	if (released) spdlog::info("Persistent alias placements given back at a graph's end: {}", released);
+}
+
 bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction& edit, const persistent::SelectedPublication& scheduled) {
 	BT_ZONE_SCOPE("ORG.Persistent.PlanAliases");
 	auto& state = *m_compilerState->persistent;
@@ -1082,8 +1102,10 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 			TrackTransientFrameResource(c.concrete);
 			state.aliasPlaced[c.concrete] = record;
 			NoteAliasPlaced(c.concrete, true);
+			state.aliasPlacementOwners[c.concrete] = {c.concrete->weak_from_this(), backed->GetBackingGeneration()};
 			rebind(c.concrete);
 		} else {
+			state.aliasPlacementOwners.erase(c.concrete);
 			if (state.aliasPlaced.erase(c.concrete) && backed->IsMaterialized()) { dematerialize(c.concrete); ++rematerialized; }
 			// Placed by another graph of the arena and standalone in this one: it leaves that placement for a backing of its own.
 			if (NoteAliasPlaced(c.concrete, false) && backed->IsMaterialized()) { dematerialize(c.concrete); ++rematerialized; }

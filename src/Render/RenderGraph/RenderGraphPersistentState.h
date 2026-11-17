@@ -159,6 +159,16 @@ inline std::optional<persistent::BindingVersion> CaptureSlotBinding(Resource& re
 	}
 }
 
+// A transient a graph placed in its alias memory: the resource, and its backing generation right after the placement. A later
+// placement by another graph, or a standalone backing, moves the generation.
+struct AliasPlacementOwner {
+	std::weak_ptr<Resource> resource;
+	uint64_t generation = 0;
+};
+// A graph's end: each transient it placed that no other graph placed since is given back (dematerialized). Otherwise the
+// placement stayed bound with no graph that uses it, and kept its pool's memory alive.
+void ReleaseOwnAliasPlacements(const std::unordered_map<Resource*, AliasPlacementOwner>& owners) noexcept;
+
 struct RotationKey {
 	uint64_t concreteID = 0, backingGeneration = 0;
 	const void* views = nullptr;
@@ -438,6 +448,7 @@ struct RenderGraph::PersistentInstanceState {
 	PersistentInstanceState(const PersistentInstanceState&) = delete;
 	PersistentInstanceState& operator=(const PersistentInstanceState&) = delete;
 	~PersistentInstanceState() {
+		ReleaseOwnAliasPlacements(aliasPlacementOwners);
 		if (!aliasArena) return;
 		std::lock_guard lock(aliasArena->mutex);
 		for (auto& [id, pool] : aliasArena->pools) pool.required.erase(this);
@@ -449,6 +460,7 @@ struct RenderGraph::PersistentInstanceState {
 		bool operator==(const AliasPlacementRecord&) const = default;
 	};
 	std::unordered_map<Resource*, AliasPlacementRecord> aliasPlaced; // Concrete resources placed by this planner.
+	std::unordered_map<Resource*, AliasPlacementOwner> aliasPlacementOwners; // The same, for this state's end (ReleaseOwnAliasPlacements).
 	// Concrete resources a pass on another device uses. Their representations are committed allocations shared between the
 	// devices, so they are never alias candidates: a placement would be replaced by those, and rematerializing one drops them.
 	std::unordered_set<Resource*> multiDeviceResources;
