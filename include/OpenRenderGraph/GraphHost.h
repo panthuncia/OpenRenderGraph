@@ -489,14 +489,52 @@ public:
 	 * executions, so their admissions find no alias activation and can take a predicted plan. Kept across rebuilds.
 	 */
 	void SetPrivateAliasEpochs(std::vector<uint32_t> epochs);
+	/** @brief An epoch's place in the frame (SetFramePositions). */
+	struct FramePosition {
+		uint32_t epoch = 0;
+		uint32_t position = 0;  // the stage's place in the frame; epochs of one stage share it
+		bool ownTransients = false;  // the epoch's own transients go in the frame alias arena, in a range for its position
+	};
 	/**
-	 * @brief Owner thread, before the listed epochs' graphs are built: each epoch's transients go in the host's frame alias arena
-	 * (FrameAliasArena, made by the first call), reserved for the epoch's span of the frame. Epochs whose spans do not overlap share
-	 * memory. An epoch listed here leaves the shared alias arena and SetPrivateAliasEpochs. Kept across rebuilds.
+	 * @brief Owner thread, before the listed epochs' graphs are built: each epoch's place in the frame, and the host's frame alias
+	 * arena (FrameAliasArena, made by the first call).
+	 * - An epoch with ownTransients puts its transients in the arena, reserved for its position. Epochs whose positions differ
+	 *   share memory. It leaves the shared alias arena and SetPrivateAliasEpochs.
+	 * - Every listed epoch's graphs count for the frame transients' spans (AddFrameTransients): a resource's span is the
+	 *   positions of the graphs that use it, first to last. An epoch that runs several times a frame keeps one position.
+	 * Kept across rebuilds.
 	 */
-	void SetFrameAliasSpans(std::vector<std::pair<uint32_t, AliasSpan>> spans);
-	/** @brief The frame alias arena SetFrameAliasSpans made, for resources the application places in it (FrameAliasArena::ReserveTextures); null before. */
+	void SetFramePositions(std::vector<FramePosition> positions);
+	/** @brief The frame alias arena SetFramePositions made; null before. */
 	std::shared_ptr<FrameAliasArena> FrameArena() const;
+	/**
+	 * @brief Frame transients: textures several epochs' graphs use within a frame, placed together in the frame alias arena. Their
+	 * span is derived, never declared: each graph's alias plan (before it runs) reports the resources its passes use, and a
+	 * texture's span grows to cover that graph's position (a graph of an epoch with no position: the whole frame). It starts empty
+	 * (nothing uses it yet), so it may sit over other ranges' bytes, and only grows, in place: a placement never moves. Ranges
+	 * placed later avoid it where its span conflicts with theirs. A growth into bytes another range holds at those positions fails
+	 * that graph's plan, with both named (its content would not survive there).
+	 *
+	 * Textures made again under the same label (a resize) start with the span the last ones reached.
+	 *
+	 * The textures must be unmaterialized; they are materialized at their places now. The placement lasts as long as the
+	 * returned object. Null when the host has no frame arena (SetFramePositions was not called): the caller materializes them.
+	 * Throws when the memory cannot be allocated. Any thread.
+	 */
+	std::shared_ptr<const void> AddFrameTransients(std::span<const std::shared_ptr<PixelBuffer>> textures, std::string label);
+	/** @brief A frame transient's label and its span now, by its resource name; empty for anything else. Any thread. */
+	struct FrameTransientInfo {
+		std::string label;
+		AliasSpan span = AliasSpan::None();
+	};
+	std::optional<FrameTransientInfo> FrameTransientOf(std::string_view name) const;
+	/** @brief Every frame transient group: its label, span and member names. Any thread. */
+	struct FrameTransientGroup {
+		std::string label;
+		AliasSpan span = AliasSpan::None();
+		std::vector<std::string> members;
+	};
+	std::vector<FrameTransientGroup> FrameTransientGroups() const;
 	/**
 	 * @brief Submitting thread, for a revision-driven async epoch: its runs take their published copies by the caller's index
 	 * from now on, starting with copy `copy` for the next SubmitEpoch.
@@ -1150,8 +1188,15 @@ private:
 	std::vector<uint32_t> m_closedEpochs;  // SetClosedEpochs: read by builds on any thread, written only before them
 	std::vector<uint32_t> m_restEpochs;    // SetRestAtLastUseEpochs: the same
 	std::vector<uint32_t> m_privateAliasEpochs;  // SetPrivateAliasEpochs, under m_configMutex
-	std::vector<std::pair<uint32_t, AliasSpan>> m_frameAliasSpans;  // SetFrameAliasSpans, under m_configMutex
-	std::shared_ptr<FrameAliasArena> m_frameAliasArena;           // made by SetFrameAliasSpans, under m_configMutex
+	std::vector<FramePosition> m_framePositions;         // SetFramePositions, under m_configMutex
+	std::shared_ptr<FrameAliasArena> m_frameAliasArena;  // made by SetFramePositions, under m_configMutex
+	// AddFrameTransients: the groups, their derived spans and reservations. Shared with each placement's owner, which removes its
+	// group when it goes.
+	struct FrameTransients;
+	std::shared_ptr<FrameTransients> m_frameTransients;  // made by SetFramePositions, under m_configMutex
+	// A graph's plan reports what its passes use (RenderGraph::SetFrameTransientObserver). lane: the epoch's lane in the frame
+	// arena (its own transients' ranges), 0 for none.
+	void NoteFrameTransientUses(uint32_t epoch, uint32_t position, uint32_t lane, std::span<Resource* const> resources);
 	std::vector<uint32_t> m_externalEpochs;  // SetExternalEpochs; set on every build's graph
 	bool m_inlineAtExecution = false;        // SetInlineAtExecution; set on every build's graph
 	std::shared_ptr<ExternalEpochExecution> m_externalExecution;  // submitting thread: the last external SubmitEpoch's

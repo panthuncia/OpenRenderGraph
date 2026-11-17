@@ -30,6 +30,10 @@
 #include "Render/Runtime/ScopedActiveGraphServices.h"
 #include "Render/Runtime/ThreadPoolTaskService.h"
 #include "HostUploadExtension.h"
+#include "Resources/PixelBuffer.h"
+#include "../Render/RenderGraph/AliasPacking.h"
+
+#include <unordered_map>
 
 namespace org {
 
@@ -1038,8 +1042,11 @@ struct GraphHost::BuildInputs {
 	std::vector<uint32_t> externalEpochs;
 	bool inlineAtExecution = false;
 	std::shared_ptr<PersistentAliasArena> aliasArena;
-	std::shared_ptr<FrameAliasArena> frameArena;  // with frameSpan: SetFrameAliasSpans listed the epoch
+	std::shared_ptr<FrameAliasArena> frameArena;  // with frameSpan: SetFramePositions listed the epoch with its own transients
 	AliasSpan frameSpan{};
+	// The epoch's frame position (SetFramePositions), for the frame transients' spans; kNoPosition when it has none.
+	uint32_t framePosition = alias::FrameSpans::kNoPosition;
+	bool frameTransients = false;  // the host has frame transients: the graph reports what its passes use
 	std::shared_ptr<rhi::TimelinePtr> frameWaitTimeline;
 	RenderGraph::GpuPassRangeBegin gpuPassRangeBegin;
 	RenderGraph::GpuPassRangeEnd gpuPassRangeEnd;
@@ -1062,12 +1069,16 @@ GraphHost::BuildInputs GraphHost::SnapshotBuildInputs(size_t index) {
 	inputs.externalEpochs = m_externalEpochs;
 	inputs.inlineAtExecution = m_inlineAtExecution;
 	if (m_desc.sharedAliasArena && std::ranges::find(m_privateAliasEpochs, instance.epoch) == m_privateAliasEpochs.end()) inputs.aliasArena = m_aliasArena;
-	for (const auto& [epoch, span] : m_frameAliasSpans)
-		if (epoch == instance.epoch) {
+	for (const auto& entry : m_framePositions) {
+		if (entry.epoch != instance.epoch) continue;
+		inputs.framePosition = entry.position;
+		if (entry.ownTransients) {
 			inputs.frameArena = m_frameAliasArena;
-			inputs.frameSpan = span;
+			inputs.frameSpan = {entry.position, entry.position};
 			inputs.aliasArena = nullptr;
 		}
+	}
+	inputs.frameTransients = static_cast<bool>(m_frameTransients);
 	inputs.frameWaitTimeline = m_frameWaitTimeline;
 	inputs.gpuPassRangeBegin = m_gpuPassRangeBegin;
 	inputs.gpuPassRangeEnd = m_gpuPassRangeEnd;
@@ -1113,6 +1124,10 @@ std::unique_ptr<RenderGraph> GraphHost::MakeGraph(const BuildInputs& inputs, boo
 		if (inputs.aliasArena) graph->SetPersistentAliasArena(inputs.aliasArena);
 		// Lane: the epoch plus one, so the epoch's builds may share bytes (lane 0 shares with nothing whose span overlaps).
 		if (inputs.frameArena) graph->SetFrameAliasRegion(inputs.frameArena, inputs.frameSpan, inputs.epoch + 1);
+		// The frame transients' spans grow to this graph's position before it runs (its alias plan reports its resources).
+		if (inputs.frameTransients)
+			graph->SetFrameTransientObserver([this, epoch = inputs.epoch, position = inputs.framePosition, lane = inputs.frameArena ? inputs.epoch + 1 : 0u](
+												 std::span<Resource* const> resources) { NoteFrameTransientUses(epoch, position, lane, resources); });
 		graph->SetPersistentRecordingReuse(m_desc.reuseRecordings);
 		graph->SetPersistentRecordingTimestampMode(m_recordingTimestamps.load(std::memory_order_acquire));
 		graph->SetScheduleTraceEnabled(m_scheduleTrace.load(std::memory_order_acquire));
@@ -1946,15 +1961,166 @@ void GraphHost::SetPrivateAliasEpochs(std::vector<uint32_t> epochs) {
 	m_privateAliasEpochs = std::move(epochs);
 }
 
-void GraphHost::SetFrameAliasSpans(std::vector<std::pair<uint32_t, AliasSpan>> spans) {
+struct GraphHost::FrameTransients {
+	std::mutex mutex;
+	alias::FrameSpans spans;
+	struct Group {
+		std::vector<std::shared_ptr<FrameAliasArena::Reservation>> reservations;
+		std::vector<std::weak_ptr<PixelBuffer>> members;
+	};
+	std::unordered_map<uint64_t, Group> groups;             // by FrameSpans group id
+	std::unordered_map<std::string, uint64_t> groupByName;  // member resource name -> group
+	std::shared_ptr<FrameAliasArena> arena;
+};
+
+namespace {
+AliasSpan ToAliasSpan(alias::FrameSpans::Span span) { return span.Empty() ? AliasSpan::None() : AliasSpan{span.first, span.last}; }
+std::string DescribeSpan(alias::FrameSpans::Span span) {
+	return span.Empty() ? std::string("none") : std::to_string(span.first) + "-" + std::to_string(span.last);
+}
+}
+
+void GraphHost::SetFramePositions(std::vector<FramePosition> positions) {
 	std::scoped_lock lock(m_configMutex);
 	if (!m_frameAliasArena) m_frameAliasArena = FrameAliasArena::Create();
-	m_frameAliasSpans = std::move(spans);
+	if (!m_frameTransients) {
+		m_frameTransients = std::make_shared<FrameTransients>();
+		m_frameTransients->arena = m_frameAliasArena;
+	}
+	uint32_t last = 0;
+	for (const auto& entry : positions) last = (std::max)(last, entry.position);
+	{
+		std::scoped_lock spans(m_frameTransients->mutex);
+		m_frameTransients->spans.SetLastPosition(last);
+	}
+	m_framePositions = std::move(positions);
 }
 
 std::shared_ptr<FrameAliasArena> GraphHost::FrameArena() const {
 	std::scoped_lock lock(m_configMutex);
 	return m_frameAliasArena;
+}
+
+std::shared_ptr<const void> GraphHost::AddFrameTransients(std::span<const std::shared_ptr<PixelBuffer>> textures, std::string label) {
+	std::shared_ptr<FrameTransients> state;
+	{
+		std::scoped_lock lock(m_configMutex);
+		state = m_frameTransients;
+	}
+	if (!state || !state->arena) return nullptr;
+	std::scoped_lock lock(state->mutex);
+	std::vector<uint64_t> ids;
+	for (const auto& texture : textures)
+		if (texture) ids.push_back(texture->GetGlobalResourceID());
+	const auto group = state->spans.AddGroup(label, ids);
+	// The span its label reached before (a resize), else none: nothing uses the textures yet.
+	const auto span = state->spans.SpanOf(group);
+	std::vector<std::shared_ptr<FrameAliasArena::Reservation>> reservations;
+	try {
+		reservations = state->arena->ReserveTextures(ToAliasSpan(span), textures, label);
+	} catch (...) {
+		state->spans.RemoveGroup(group);
+		throw;
+	}
+	auto& entry = state->groups[group];
+	entry.reservations = reservations;
+	for (const auto& texture : textures)
+		if (texture) {
+			entry.members.push_back(texture);
+			state->groupByName[texture->GetName()] = group;
+		}
+	spdlog::info("GraphHost: frame transients '{}' placed ({} textures), span {}: derived from the graphs that use them", label, ids.size(),
+		DescribeSpan(span));
+	// The owner keeps the reservations; when it goes, the group leaves the derivation.
+	struct Owner {
+		std::weak_ptr<FrameTransients> state;
+		uint64_t group = 0;
+		std::vector<std::shared_ptr<FrameAliasArena::Reservation>> reservations;
+		~Owner() {
+			if (const auto locked = state.lock()) {
+				std::scoped_lock lock(locked->mutex);
+				locked->spans.RemoveGroup(group);
+				std::erase_if(locked->groupByName, [&](const auto& byName) { return byName.second == group; });
+				locked->groups.erase(group);
+			}
+		}
+	};
+	auto owner = std::make_shared<Owner>();
+	owner->state = state;
+	owner->group = group;
+	owner->reservations = std::move(reservations);
+	return owner;
+}
+
+void GraphHost::NoteFrameTransientUses(uint32_t epoch, uint32_t position, uint32_t lane, std::span<Resource* const> resources) {
+	std::shared_ptr<FrameTransients> state;
+	{
+		std::scoped_lock lock(m_configMutex);
+		state = m_frameTransients;
+	}
+	if (!state) return;
+	std::scoped_lock lock(state->mutex);
+	if (state->groups.empty()) return;
+	std::vector<uint64_t> ids;
+	ids.reserve(resources.size());
+	for (auto* resource : resources)
+		if (resource) ids.push_back(resource->GetGlobalResourceID());
+	const auto grown = state->spans.NoteUses(position, ids);
+	const auto where = position == alias::FrameSpans::kNoPosition ? std::string("none (the whole frame)") : std::to_string(position);
+	for (const auto& growth : grown) {
+		const auto& label = state->spans.LabelOf(growth.group);
+		auto& entry = state->groups.at(growth.group);
+		std::string blocker;
+		bool widened = true;
+		// The epoch's earlier builds' ranges do not block: this build replaces them, and its own plan places its transients after this.
+		for (const auto& reservation : entry.reservations)
+			if (!state->arena->Widen(*reservation, ToAliasSpan(growth.to), &blocker, lane)) {
+				widened = false;
+				break;
+			}
+		if (!widened) {
+			// All or nothing per group: the reservations already widened go back.
+			for (const auto& reservation : entry.reservations) state->arena->Widen(*reservation, ToAliasSpan(growth.from));
+			state->spans.SetSpan(growth.group, growth.from);
+			throw std::runtime_error("Frame transients '" + label + "' are used by epoch " + std::to_string(epoch) + " at position " + where
+				+ ", outside their span " + DescribeSpan(growth.from) + ", where '" + blocker
+				+ "' holds their bytes: their content would not survive there");
+		}
+		spdlog::info("GraphHost: frame transients '{}' span {} (was {}): epoch {}'s graph uses them at position {}", label, DescribeSpan(growth.to),
+			DescribeSpan(growth.from), epoch, where);
+	}
+}
+
+std::optional<GraphHost::FrameTransientInfo> GraphHost::FrameTransientOf(std::string_view name) const {
+	std::shared_ptr<FrameTransients> state;
+	{
+		std::scoped_lock lock(m_configMutex);
+		state = m_frameTransients;
+	}
+	if (!state) return std::nullopt;
+	std::scoped_lock lock(state->mutex);
+	const auto found = state->groupByName.find(std::string(name));
+	if (found == state->groupByName.end()) return std::nullopt;
+	return FrameTransientInfo{state->spans.LabelOf(found->second), ToAliasSpan(state->spans.SpanOf(found->second))};
+}
+
+std::vector<GraphHost::FrameTransientGroup> GraphHost::FrameTransientGroups() const {
+	std::shared_ptr<FrameTransients> state;
+	{
+		std::scoped_lock lock(m_configMutex);
+		state = m_frameTransients;
+	}
+	std::vector<FrameTransientGroup> out;
+	if (!state) return out;
+	std::scoped_lock lock(state->mutex);
+	for (const auto group : state->spans.Groups()) {
+		FrameTransientGroup info{state->spans.LabelOf(group), ToAliasSpan(state->spans.SpanOf(group)), {}};
+		if (const auto found = state->groups.find(group); found != state->groups.end())
+			for (const auto& member : found->second.members)
+				if (const auto texture = member.lock()) info.members.push_back(texture->GetName());
+		out.push_back(std::move(info));
+	}
+	return out;
 }
 
 bool GraphHost::ClosedEpoch(uint32_t epoch) const noexcept {

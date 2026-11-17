@@ -130,7 +130,36 @@ void FrameAliasArena::Release(uint64_t id) noexcept {
 	}
 }
 
-std::shared_ptr<const void> FrameAliasArena::ReserveTextures(AliasSpan span, std::span<const std::shared_ptr<PixelBuffer>> textures, std::string name) {
+bool FrameAliasArena::Widen(Reservation& reservation, AliasSpan span, std::string* blocker, uint32_t replacedLane) {
+	auto& impl = *m_impl;
+	std::lock_guard lock(impl.mutex);
+	for (auto& block : impl.blocks) {
+		const auto found = std::find_if(block.ranges.begin(), block.ranges.end(), [&](const auto& range) { return range.id == reservation.m_id; });
+		if (found == block.ranges.end()) continue;
+		std::vector<alias::SpannedRange> ranges;
+		ranges.reserve(block.ranges.size());
+		for (const auto& range : block.ranges) ranges.push_back(range.range);
+		const auto index = static_cast<size_t>(found - block.ranges.begin());
+		if (const auto in = alias::WidenBlocker(ranges, index, span.first, span.last, replacedLane); in != SIZE_MAX) {
+			if (blocker) *blocker = block.ranges[in].name;
+			return false;
+		}
+		if (const auto in = alias::WidenBlocker(ranges, index, span.first, span.last); in != SIZE_MAX)
+			spdlog::info("Frame alias arena: '{}' grows over '{}', a range of the build its new build replaces (lane {}); that build places its "
+				"transients beside it",
+				found->name, block.ranges[in].name, replacedLane);
+		found->range.first = span.first;
+		found->range.last = span.last;
+		spdlog::info("Frame alias arena: '{}' in block {:#x} at [{}, {}) now spans positions {}-{}", found->name, block.poolID, found->range.begin,
+			found->range.end, span.first, span.last);
+		return true;
+	}
+	if (blocker) *blocker = "(the reservation is not in the arena)";
+	return false;
+}
+
+std::vector<std::shared_ptr<FrameAliasArena::Reservation>> FrameAliasArena::ReserveTextures(AliasSpan span,
+	std::span<const std::shared_ptr<PixelBuffer>> textures, std::string name) {
 	auto device = DeviceManager::GetInstance().GetDevice();
 	struct Member {
 		PixelBuffer* texture = nullptr;
@@ -147,7 +176,7 @@ std::shared_ptr<const void> FrameAliasArena::ReserveTextures(AliasSpan span, std
 		device.GetResourceAllocationInfo(&resourceDesc, 1, &info);
 		byClass[(desc.hasRTV || desc.hasDSV) ? 2u : 3u].push_back({texture.get(), info.sizeInBytes, (std::max<uint64_t>)(info.alignment, 1)});
 	}
-	auto kept = std::make_shared<std::vector<std::shared_ptr<Reservation>>>();
+	std::vector<std::shared_ptr<Reservation>> kept;
 	for (auto& [resourceClass, members] : byClass) {
 		uint64_t end = 0, alignment = 1;
 		for (auto& member : members) {
@@ -161,7 +190,7 @@ std::shared_ptr<const void> FrameAliasArena::ReserveTextures(AliasSpan span, std
 			options.aliasPlacement = TextureAliasPlacement{reservation->Heap(), reservation->Offset() + member.offset, reservation->PoolID()};
 			member.texture->Materialize(&options);
 		}
-		kept->push_back(std::move(reservation));
+		kept.push_back(std::move(reservation));
 	}
 	return kept;
 }

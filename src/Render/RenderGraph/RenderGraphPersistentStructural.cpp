@@ -279,6 +279,8 @@ std::shared_ptr<const persistent::SelectedPublication> RenderGraph::BuildPersist
 		}
 	}
 	if (!scheduled) throw std::runtime_error("Persistent structural build failed (schedule)");
+	// The frame transients' spans cover this schedule's uses before anyone can trace it or run it.
+	ReportFrameTransientUses(*scheduled);
 	// A first build off the owner thread installs the schedule alone; its first preparation places (PlaceDeferredPersistentAliases).
 	if (state.deferAliasPlacement) {
 		state.deferAliasPlacement = false;
@@ -692,6 +694,39 @@ void persistent_impl::ReleaseOwnAliasPlacements(const std::unordered_map<Resourc
 	if (released) spdlog::info("Persistent alias placements given back at a graph's end: {}", released);
 }
 
+void RenderGraph::ReportFrameTransientUses(const persistent::SelectedPublication& scheduled) {
+	if (!m_frameTransientObserver || !scheduled.executable) return;
+	const auto& state = *m_compilerState->persistent;
+	const auto& executable = *scheduled.executable;
+	const auto& structure = *executable.graph->structure;
+	// Every resource the passes use, once each.
+	std::vector<Resource*> used;
+	std::unordered_set<Resource*> seen;
+	const auto note = [&](uint32_t resourceIndex) {
+		if (resourceIndex >= executable.resourceSlots.size()) return;
+		const auto slot = executable.resourceSlots[resourceIndex];
+		if (slot.index >= state.entries.size()) return;
+		const auto& entry = state.entries[slot.index];
+		Resource* concrete = nullptr;
+		if (entry.versioned) {
+			// A versioned slot (an imported image's): its current version's backing. A frame transient's slot has one version.
+			if (entry.versioned->PerFrame()) return;
+			const auto version = entry.versioned->SelectVersion(nullptr);
+			if (!version || !version->resource) return;
+			concrete = UnwrapDynamic(version->resource.get());
+		} else if (entry.resource) {
+			concrete = UnwrapDynamic(entry.resource);
+		}
+		if (concrete && seen.insert(concrete).second) used.push_back(concrete);
+	};
+	for (const auto& pass : structure.passes) {
+		for (const auto& use : pass.entryStates) note(use.resource);
+		for (const auto& use : pass.exitStates) note(use.resource);
+		for (const auto& access : pass.accesses) note(access.resourceIndex);
+	}
+	m_frameTransientObserver(used);
+}
+
 bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction& edit, const persistent::SelectedPublication& scheduled) {
 	BT_ZONE_SCOPE("ORG.Persistent.PlanAliases");
 	auto& state = *m_compilerState->persistent;
@@ -714,6 +749,9 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 	}
 	uint32_t maxCriticality = 1;
 	for (const auto c : graph.criticality) maxCriticality = (std::max)(maxCriticality, c);
+
+	// The host's frame transients: their spans grow to this graph's position before it runs. A throw fails the plan.
+	ReportFrameTransientUses(scheduled);
 
 	struct Candidate {
 		Resource* concrete = nullptr;

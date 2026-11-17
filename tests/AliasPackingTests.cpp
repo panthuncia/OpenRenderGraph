@@ -76,5 +76,48 @@ int main() {
 			placed.push_back(range);
 		}
 	}
+	// Widening in place: a range may take a wider span when no range that shares its bytes conflicts with it then.
+	{
+		const std::vector<SpannedRange> block{{0, 400, 4, 6, 0}, {0, 300, 11, 11, 0}, {0, 100, 10, 10, 7}, {400, 600, 5, 5, 0}};
+		ENSURE(WidenBlocker(block, 0, 3, 9) == SIZE_MAX);   // the others' bytes there are at 10, 11, or elsewhere
+		ENSURE(WidenBlocker(block, 0, 3, 10) == 2);         // the post stage's range at 10 shares its bytes
+		ENSURE(WidenBlocker(block, 1, 0, 11) == 0);         // the first range holds those bytes at 4 to 6
+		ENSURE(WidenBlocker(block, 3, 0, 11) == SIZE_MAX);  // bytes nobody else holds
+		ENSURE(WidenBlocker(block, 0, 3, 10, 7) == SIZE_MAX);  // the range at 10 is an earlier build of the epoch that asks
+	}
+	// Derived spans: a group spans its users' positions, first to last. It starts empty and only grows.
+	{
+		FrameSpans spans(11);
+		const auto gbuffer = spans.AddGroup("G-buffer", {101, 102});
+		const auto scratch = spans.AddGroup("scratch", {201});
+		ENSURE(spans.SpanOf(gbuffer).Empty());
+		const uint64_t preMain[] = {101, 999};
+		auto grown = spans.NoteUses(4, preMain);
+		ENSURE(grown.size() == 1 && grown[0].group == gbuffer && grown[0].from.Empty() && grown[0].to == (FrameSpans::Span{4, 4}));
+		const uint64_t deferred[] = {102};
+		grown = spans.NoteUses(6, deferred);
+		ENSURE(grown.size() == 1 && grown[0].to == (FrameSpans::Span{4, 6}));
+		ENSURE(spans.NoteUses(5, deferred).empty());  // inside the span: nothing grows
+		const uint64_t depth[] = {101, 102};
+		grown = spans.NoteUses(3, depth);
+		ENSURE(grown.size() == 1 && grown[0].to == (FrameSpans::Span{3, 6}));  // one growth for the group, however many members
+		const uint64_t ui[] = {201};
+		grown = spans.NoteUses(11, ui);
+		ENSURE(grown.size() == 1 && grown[0].group == scratch && spans.SpanOf(scratch) == (FrameSpans::Span{11, 11}));
+		// A graph with no position spans the whole frame.
+		const uint64_t unpositioned[] = {201};
+		grown = spans.NoteUses(FrameSpans::kNoPosition, unpositioned);
+		ENSURE(grown.size() == 1 && spans.SpanOf(scratch) == (FrameSpans::Span{0, 11}));
+		// A caller that cannot place the new span sets the old one back.
+		spans.SetSpan(scratch, grown[0].from);
+		ENSURE(spans.SpanOf(scratch) == (FrameSpans::Span{11, 11}));
+		ENSURE(spans.GroupOf(102) == gbuffer && spans.GroupOf(999) == 0);
+		// The textures made again under the same label start where the last ones reached.
+		spans.RemoveGroup(gbuffer);
+		ENSURE(spans.GroupOf(101) == 0);
+		const auto again = spans.AddGroup("G-buffer", {301});
+		ENSURE(spans.SpanOf(again) == (FrameSpans::Span{3, 6}));
+		ENSURE(spans.Groups().size() == 2);
+	}
 	std::puts("Alias packing tests passed.");
 }

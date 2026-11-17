@@ -9,6 +9,7 @@
 #include <memory>
 #include <optional>
 #include <variant>
+#include <functional>
 #include <span>
 #include <utility>
 #include <array>
@@ -297,6 +298,11 @@ private:
 		m_frameAliasSpan = span;
 		m_frameAliasLane = lane;
 	}
+	// Frame transients (GraphHost::AddFrameTransients): called at each alias plan with every resource the graph's passes use,
+	// before the plan places or binds anything, so before the graph executes. The host derives the frame transients' spans from
+	// it. It may throw: the plan fails then. Set before the first frame.
+	using FrameTransientObserver = std::function<void(std::span<Resource* const>)>;
+	void SetFrameTransientObserver(FrameTransientObserver observer) { m_frameTransientObserver = std::move(observer); }
 	// False while some of its placements are in a pool generation another graph has replaced (the pool grew): placed again, by a
 	// rebuild, they share the pool's memory again.
 	bool PersistentAliasPlacementsCurrent() const;
@@ -919,6 +925,8 @@ private:
 	// Frees the alias pools no structural plan has placed into for autoAliasPoolRetireIdleFrames frames.
 	void RetireIdlePersistentAliasPools(PersistentExecutionState& state);
 	bool PlanPersistentAliasPlacement(persistent::GraphEditTransaction& edit, const persistent::SelectedPublication& scheduled);
+	// Gives the frame transient observer (SetFrameTransientObserver) every resource the schedule's passes use.
+	void ReportFrameTransientUses(const persistent::SelectedPublication& scheduled);
 	// The first preparation of a graph PrepareFirstPersistentBuild built: its alias placement, planned against the installed
 	// schedule, built and installed (a structural edit). Nothing otherwise.
 	void PlaceDeferredPersistentAliases();
@@ -958,6 +966,7 @@ private:
 	std::shared_ptr<FrameAliasArena> m_frameAliasArena;  // SetFrameAliasRegion
 	AliasSpan m_frameAliasSpan{};
 	uint32_t m_frameAliasLane = 0;
+	FrameTransientObserver m_frameTransientObserver;  // SetFrameTransientObserver
 	// SetExternalPersistentEpochs; and the secondary lists their tickets record into, per queue slot in the host's stream (graphics
 	// lists, made at their first ticket).
 	std::vector<uint32_t> m_externalPersistentEpochs;

@@ -177,4 +177,95 @@ uint64_t PlaceSpanned(std::span<const SpannedRange> occupied, uint64_t capacity,
 	return candidate;
 }
 
+size_t WidenBlocker(std::span<const SpannedRange> ranges, size_t index, uint32_t first, uint32_t last, uint32_t replacedLane) {
+	if (index >= ranges.size()) return SIZE_MAX;
+	auto widened = ranges[index];
+	widened.first = first;
+	widened.last = last;
+	for (size_t i = 0; i < ranges.size(); ++i) {
+		if (i == index) continue;
+		const auto& other = ranges[i];
+		if (replacedLane != 0 && other.lane == replacedLane) continue;
+		const bool bytes = widened.begin < other.end && other.begin < widened.end;
+		if (bytes && SpansConflict(widened, other)) return i;
+	}
+	return SIZE_MAX;
+}
+
+FrameSpans::Span FrameSpans::Hull(Span span, uint32_t position) noexcept {
+	if (span.Empty()) return {position, position};
+	return {(std::min)(span.first, position), (std::max)(span.last, position)};
+}
+
+uint64_t FrameSpans::AddGroup(std::string label, std::vector<uint64_t> members) {
+	const auto id = m_next++;
+	Group group;
+	group.span = Remembered(label);
+	group.label = std::move(label);
+	group.members = std::move(members);
+	for (const auto member : group.members) m_groupOf[member] = id;
+	m_groups.emplace(id, std::move(group));
+	return id;
+}
+
+void FrameSpans::RemoveGroup(uint64_t group) {
+	const auto found = m_groups.find(group);
+	if (found == m_groups.end()) return;
+	for (const auto member : found->second.members)
+		if (const auto of = m_groupOf.find(member); of != m_groupOf.end() && of->second == group) m_groupOf.erase(of);
+	m_groups.erase(found);
+}
+
+std::vector<FrameSpans::Growth> FrameSpans::NoteUses(uint32_t position, std::span<const uint64_t> resources) {
+	std::vector<Growth> grown;
+	for (const auto resource : resources) {
+		const auto of = m_groupOf.find(resource);
+		if (of == m_groupOf.end()) continue;
+		auto& group = m_groups.at(of->second);
+		auto span = position == kNoPosition ? Hull(Hull(group.span, 0), m_lastPosition) : Hull(group.span, position);
+		if (span == group.span) continue;
+		const auto existing = std::find_if(grown.begin(), grown.end(), [&](const Growth& g) { return g.group == of->second; });
+		if (existing != grown.end()) existing->to = span;
+		else grown.push_back({of->second, group.span, span});
+		group.span = span;
+		m_remembered[group.label] = span;
+	}
+	return grown;
+}
+
+void FrameSpans::SetSpan(uint64_t group, Span span) {
+	const auto found = m_groups.find(group);
+	if (found == m_groups.end()) return;
+	found->second.span = span;
+	m_remembered[found->second.label] = span;
+}
+
+FrameSpans::Span FrameSpans::SpanOf(uint64_t group) const {
+	const auto found = m_groups.find(group);
+	return found == m_groups.end() ? Span{} : found->second.span;
+}
+
+const std::string& FrameSpans::LabelOf(uint64_t group) const {
+	static const std::string none;
+	const auto found = m_groups.find(group);
+	return found == m_groups.end() ? none : found->second.label;
+}
+
+uint64_t FrameSpans::GroupOf(uint64_t resource) const {
+	const auto found = m_groupOf.find(resource);
+	return found == m_groupOf.end() ? 0 : found->second;
+}
+
+FrameSpans::Span FrameSpans::Remembered(const std::string& label) const {
+	const auto found = m_remembered.find(label);
+	return found == m_remembered.end() ? Span{} : found->second;
+}
+
+std::vector<uint64_t> FrameSpans::Groups() const {
+	std::vector<uint64_t> out;
+	for (const auto& [id, group] : m_groups) out.push_back(id);
+	std::sort(out.begin(), out.end());
+	return out;
+}
+
 } // namespace org::alias

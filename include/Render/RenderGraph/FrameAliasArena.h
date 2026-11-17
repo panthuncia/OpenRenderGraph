@@ -19,6 +19,9 @@ class PixelBuffer;
 struct AliasSpan {
 	uint32_t first = 0, last = 0;
 	bool operator==(const AliasSpan&) const = default;
+	// No position at all (first after last): a range nothing uses yet. It shares bytes with anything.
+	static constexpr AliasSpan None() noexcept { return {UINT32_MAX, 0}; }
+	bool Empty() const noexcept { return first > last; }
 };
 
 /**
@@ -28,7 +31,8 @@ struct AliasSpan {
  * bytes for a span of those stages:
  * - a graph reserves one range per alias pool for its own transients (RenderGraph::SetFrameAliasRegion). Its planner packs
  *   them inside the range, as it packs a pool.
- * - the application reserves a range for resources that several stages use (ReserveTextures). Their placement never moves.
+ * - the host reserves a range for resources that several stages use (GraphHost::AddFrameTransients, ReserveTextures). Their
+ *   placement never moves. Their span is derived from the graphs that use them and grows in place (Widen).
  *
  * Ranges whose spans overlap get disjoint bytes. Ranges whose spans do not overlap share bytes. So the frame's memory is set by
  * the stage where the most bytes are live, not by the sum of each stage's own peak.
@@ -77,9 +81,20 @@ public:
 
 	/**
 	 * @brief Places unmaterialized textures for a span: one reservation per memory class, the textures one after another inside
-	 * it, each materialized at its place. The textures' placements last as long as the returned object. Throws on failure.
+	 * it, each materialized at its place. The textures' placements last as long as the returned reservations. Throws on failure.
+	 * An empty span (AliasSpan::None) places them where nothing is reserved yet, or over ranges they may later grow beside
+	 * (Widen).
 	 */
-	std::shared_ptr<const void> ReserveTextures(AliasSpan span, std::span<const std::shared_ptr<PixelBuffer>> textures, std::string name);
+	std::vector<std::shared_ptr<Reservation>> ReserveTextures(AliasSpan span, std::span<const std::shared_ptr<PixelBuffer>> textures,
+		std::string name);
+
+	/**
+	 * @brief Gives a reservation a wider span in place: its bytes stay. Possible when no other range that shares its bytes has
+	 * a span that conflicts with the new one. False otherwise, with the range in the way named in blocker; the span stays.
+	 * replacedLane (not 0): the lane of the epoch whose new build asks; its earlier builds' ranges do not block (the new build
+	 * replaces them and places its own ranges after this).
+	 */
+	bool Widen(Reservation& reservation, AliasSpan span, std::string* blocker = nullptr, uint32_t replacedLane = 0);
 
 	struct RangeInfo {
 		std::string name;
