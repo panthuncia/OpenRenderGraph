@@ -884,6 +884,12 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 	state.aliasArena->stale.erase(&state);
 	std::map<uint64_t, std::vector<uint32_t>> byPool;
 	std::unordered_set<uint64_t> plannedPools;
+	// The frame alias arena's ranges this plan reserves (SetFrameAliasRegion), by pool id. They replace the previous plan's at the end.
+	std::unordered_map<uint64_t, std::shared_ptr<FrameAliasArena::Reservation>> newFrameRegions;
+	auto heapOf = [&](uint64_t poolID) -> const std::shared_ptr<const AliasHeapGeneration>& {
+		if (const auto found = newFrameRegions.find(poolID); found != newFrameRegions.end()) return found->second->Heap();
+		return aliasPools.at(poolID).heap;
+	};
 	for (uint32_t i = 0; i < candidates.size(); ++i) if (candidates[i].pooled) byPool[candidates[i].poolID].push_back(i);
 	std::vector<std::pair<uint32_t, uint32_t>> edges; // (logical slot, logical slot)
 	uint64_t independentBytes = 0, requiredBytes = 0, reservedBytes = 0;
@@ -931,10 +937,20 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		const uint64_t heapEnd = packed.heapEnd, poolAlignment = packed.alignment;
 		requiredBytes += heapEnd;
 		if (heapEnd == 0) continue;
+		const bool sharedPool = candidates[members.front()].shared;
+		if (m_frameAliasArena && !sharedPool) {
+			// A range of the frame alias arena for this pool's transients, reserved for the graph's span. The packing above stays;
+			// it moves to the range's start. A forced re-placement takes bytes apart from the graph's current ones (lane 0).
+			const uint32_t lane = state.forceNewAliasHeaps ? 0u : m_frameAliasLane;
+			auto region = m_frameAliasArena->Reserve(candidates[members.front()].resourceClass, m_frameAliasSpan, lane, heapEnd, poolAlignment,
+				"epoch " + std::to_string(m_passEpochFilter) + " pool " + std::to_string(poolID & 0xFFFF));
+			for (const auto index : members) candidates[index].offset += region->Offset();
+			reservedBytes += heapEnd;
+			newFrameRegions[poolID] = std::move(region);
+		} else {
 		// Pool heap: grows with headroom, and shrinks to that headroom when the graphs placed in it need less than half of it. A
 		// replaced generation stays alive through the leases held by in-flight publications and by the placements made in it.
 		auto& pool = aliasPools[poolID];
-		const bool sharedPool = candidates[members.front()].shared;
 		pool.shared = sharedPool;
 		plannedPools.insert(poolID);
 		pool.idleSinceFrame = 0;
@@ -1022,6 +1038,7 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		}
 		pool.resourceClass = candidates[members.front()].resourceClass;
 		reservedBytes += pool.capacityBytes;
+		}
 		// Placement orderings between byte-overlapping occupants.
 		for (size_t i = 0; i < members.size(); ++i) for (size_t j = i + 1; j < members.size(); ++j) {
 			const auto& a = candidates[members[i]]; const auto& b = candidates[members[j]];
@@ -1082,15 +1099,15 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		if (!backed) continue;
 		if (c.pooled) {
 			++placed;
-			const auto& pool = aliasPools.at(c.poolID);
-			const State::AliasPlacementRecord record{c.poolID, c.offset, c.sizeBytes, pool.heap.get()};
+			const auto& heap = heapOf(c.poolID);
+			const State::AliasPlacementRecord record{c.poolID, c.offset, c.sizeBytes, heap.get()};
 			const auto previous = state.aliasPlaced.find(c.concrete);
 			if (c.shared) {
 				// Placed on both devices. A new placement replaces the representations, so nothing is dematerialized first.
 				const auto set = c.concrete->AcquireAPIRepresentationSet();
-				if (previous != state.aliasPlaced.end() && previous->second == record && set && set->placement.heap == pool.heap
+				if (previous != state.aliasPlaced.end() && previous->second == record && set && set->placement.heap == heap
 					&& set->placement.offset == c.offset) continue;
-				PlaceSharedRepresentations(*c.concrete, pool.heap, c.poolID, c.offset, c.sizeBytes);
+				PlaceSharedRepresentations(*c.concrete, heap, c.poolID, c.offset, c.sizeBytes);
 				TrackTransientFrameResource(c.concrete);
 				state.aliasPlaced[c.concrete] = record;
 				rebind(c.concrete);
@@ -1100,11 +1117,11 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 			if (backed->IsMaterialized()) { dematerialize(c.concrete); ++rematerialized; }
 			if (c.texture) {
 				PixelBuffer::MaterializeOptions options{};
-				options.aliasPlacement = TextureAliasPlacement{pool.heap, c.offset, c.poolID};
+				options.aliasPlacement = TextureAliasPlacement{heap, c.offset, c.poolID};
 				static_cast<PixelBuffer*>(c.concrete)->Materialize(&options);
 			} else {
 				BufferBase::MaterializeOptions options{};
-				options.aliasPlacement = BufferAliasPlacement{pool.heap, c.offset, c.poolID};
+				options.aliasPlacement = BufferAliasPlacement{heap, c.offset, c.poolID};
 				static_cast<BufferBase*>(c.concrete)->Materialize(&options);
 			}
 			TrackTransientFrameResource(c.concrete);
@@ -1125,6 +1142,8 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		}
 	}
 	state.aliasRematerializations += rematerialized;
+	// The previous plan's ranges go. Its placements that this plan did not replace keep their memory through their leases.
+	state.frameRegions = std::move(newFrameRegions);
 	BT_PLOT("ORG.Persistent.AliasPlacements", static_cast<int64_t>(placed));
 	BT_PLOT("ORG.Persistent.AliasRequiredBytes", static_cast<int64_t>(requiredBytes));
 	BT_PLOT("ORG.Persistent.AliasReservedBytes", static_cast<int64_t>(reservedBytes));

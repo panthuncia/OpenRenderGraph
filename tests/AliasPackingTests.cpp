@@ -51,5 +51,30 @@ int main() {
 		CheckValid(items, beam);
 		ENSURE(beam.heapEnd <= greedy.heapEnd);
 	}
+	// Frame arena ranges: spans that do not overlap share bytes; overlapping spans stack; one lane shares whatever its span.
+	{
+		const std::vector<SpannedRange> occupied{{0, 400, 3, 9, 0}, {0, 200, 10, 10, 7}};
+		ENSURE(PlaceSpanned(occupied, 1024, 300, 64, 11, 12, 0) == 0);      // after both spans
+		ENSURE(PlaceSpanned(occupied, 1024, 100, 64, 6, 6, 0) == 448);      // inside the first span: above it, aligned
+		ENSURE(PlaceSpanned(occupied, 1024, 300, 64, 10, 10, 7) == 0);      // the same lane as the second range
+		ENSURE(PlaceSpanned(occupied, 1024, 300, 64, 10, 10, 8) == 256);    // another lane at the second range's position
+		ENSURE(PlaceSpanned(occupied, 512, 300, 64, 5, 10, 0) == UINT64_MAX); // conflicts with both, and 400 + 300 > 512
+	}
+	// Random blocks: every placement keeps conflicting ranges apart.
+	for (int run = 0; run < 200; ++run) {
+		std::vector<SpannedRange> placed;
+		for (int i = 0; i < 16; ++i) {
+			const uint32_t first = rng() % 12;
+			const uint32_t last = first + rng() % 4;
+			const uint32_t lane = rng() % 3;
+			const uint64_t size = uint64_t{64} * (1 + rng() % 32);
+			const auto offset = PlaceSpanned(placed, 1u << 20, size, 256, first, last, lane);
+			ENSURE(offset != UINT64_MAX && offset % 256 == 0);
+			const SpannedRange range{offset, offset + size, first, last, lane};
+			for (const auto& other : placed)
+				ENSURE(!(SpansConflict(range, other) && range.begin < other.end && other.begin < range.end));
+			placed.push_back(range);
+		}
+	}
 	std::puts("Alias packing tests passed.");
 }

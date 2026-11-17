@@ -461,6 +461,9 @@ struct RenderGraph::PersistentInstanceState {
 	};
 	std::unordered_map<Resource*, AliasPlacementRecord> aliasPlaced; // Concrete resources placed by this planner.
 	std::unordered_map<Resource*, AliasPlacementOwner> aliasPlacementOwners; // The same, for this state's end (ReleaseOwnAliasPlacements).
+	// With a frame alias arena (RenderGraph::SetFrameAliasRegion): the range reserved for each pool's transients, by pool id. Each
+	// plan reserves its ranges again and gives back the previous ones. The state's end gives back the last ones.
+	std::unordered_map<uint64_t, std::shared_ptr<FrameAliasArena::Reservation>> frameRegions;
 	// Concrete resources a pass on another device uses. Their representations are committed allocations shared between the
 	// devices, so they are never alias candidates: a placement would be replaced by those, and rematerializing one drops them.
 	std::unordered_set<Resource*> multiDeviceResources;

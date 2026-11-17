@@ -167,6 +167,7 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraphPersistentTrace.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/PersistentLowering.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/AliasPacking.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/FrameAliasArena.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/ScheduleTrace.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/ScheduleTraceBuild.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/RenderGraph/ScheduleTrace.h"

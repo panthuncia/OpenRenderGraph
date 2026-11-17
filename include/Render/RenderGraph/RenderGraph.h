@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Render/RenderGraph/FrameAliasArena.h"
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
@@ -289,6 +290,13 @@ private:
 	// The alias pools the graph places its transients into (PersistentAliasArena), shared with the other graphs given the same
 	// arena. Without one the graph has pools of its own. Set before the first frame.
 	void SetPersistentAliasArena(std::shared_ptr<PersistentAliasArena> arena) noexcept { m_persistentAliasArena = std::move(arena); }
+	// The graph's transients go in ranges of a frame alias arena reserved for span (FrameAliasArena), one range per pool, instead
+	// of the persistent alias arena's pools. lane: the graph's epoch, so its builds may share bytes. Set before the first frame.
+	void SetFrameAliasRegion(std::shared_ptr<FrameAliasArena> arena, AliasSpan span, uint32_t lane) noexcept {
+		m_frameAliasArena = std::move(arena);
+		m_frameAliasSpan = span;
+		m_frameAliasLane = lane;
+	}
 	// False while some of its placements are in a pool generation another graph has replaced (the pool grew): placed again, by a
 	// rebuild, they share the pool's memory again.
 	bool PersistentAliasPlacementsCurrent() const;
@@ -947,6 +955,9 @@ private:
 	bool m_persistentRestAtLastUse = false;
 	bool m_persistentExternalHomeStates = false;
 	std::shared_ptr<PersistentAliasArena> m_persistentAliasArena;
+	std::shared_ptr<FrameAliasArena> m_frameAliasArena;  // SetFrameAliasRegion
+	AliasSpan m_frameAliasSpan{};
+	uint32_t m_frameAliasLane = 0;
 	// SetExternalPersistentEpochs; and the secondary lists their tickets record into, per queue slot in the host's stream (graphics
 	// lists, made at their first ticket).
 	std::vector<uint32_t> m_externalPersistentEpochs;

@@ -26,4 +26,22 @@ PackingResult PackGreedySweepLine(std::span<const PackingItem> items);
 // search, so the result is never larger than the greedy one.
 PackingResult PackBeamSearch(std::span<const PackingItem> items);
 
+// A range of a memory block that a frame alias arena gave out (FrameAliasArena). Its span is a range of frame positions
+// (the stages of a frame, in order), inclusive. Two ranges may share bytes only when their spans do not overlap.
+// A lane other than 0 marks ranges that never run in the same frame: the builds of one epoch. Ranges of the same lane may
+// share bytes whatever their spans.
+struct SpannedRange {
+	uint64_t begin = 0, end = 0;
+	uint32_t first = 0, last = 0;
+	uint32_t lane = 0;
+};
+
+// Whether two ranges may not share bytes: their spans overlap and they are not in the same lane.
+bool SpansConflict(const SpannedRange& a, const SpannedRange& b);
+
+// The lowest aligned offset in a block of capacity bytes where a range of size bytes with this span and lane overlaps no
+// conflicting range. occupied: the block's ranges, in any order. Returns UINT64_MAX when nothing fits.
+uint64_t PlaceSpanned(std::span<const SpannedRange> occupied, uint64_t capacity, uint64_t size, uint64_t alignment,
+	uint32_t first, uint32_t last, uint32_t lane);
+
 } // namespace org::alias

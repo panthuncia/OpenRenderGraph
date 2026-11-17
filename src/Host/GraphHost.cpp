@@ -1038,6 +1038,8 @@ struct GraphHost::BuildInputs {
 	std::vector<uint32_t> externalEpochs;
 	bool inlineAtExecution = false;
 	std::shared_ptr<PersistentAliasArena> aliasArena;
+	std::shared_ptr<FrameAliasArena> frameArena;  // with frameSpan: SetFrameAliasSpans listed the epoch
+	AliasSpan frameSpan{};
 	std::shared_ptr<rhi::TimelinePtr> frameWaitTimeline;
 	RenderGraph::GpuPassRangeBegin gpuPassRangeBegin;
 	RenderGraph::GpuPassRangeEnd gpuPassRangeEnd;
@@ -1060,6 +1062,12 @@ GraphHost::BuildInputs GraphHost::SnapshotBuildInputs(size_t index) {
 	inputs.externalEpochs = m_externalEpochs;
 	inputs.inlineAtExecution = m_inlineAtExecution;
 	if (m_desc.sharedAliasArena && std::ranges::find(m_privateAliasEpochs, instance.epoch) == m_privateAliasEpochs.end()) inputs.aliasArena = m_aliasArena;
+	for (const auto& [epoch, span] : m_frameAliasSpans)
+		if (epoch == instance.epoch) {
+			inputs.frameArena = m_frameAliasArena;
+			inputs.frameSpan = span;
+			inputs.aliasArena = nullptr;
+		}
 	inputs.frameWaitTimeline = m_frameWaitTimeline;
 	inputs.gpuPassRangeBegin = m_gpuPassRangeBegin;
 	inputs.gpuPassRangeEnd = m_gpuPassRangeEnd;
@@ -1103,6 +1111,8 @@ std::unique_ptr<RenderGraph> GraphHost::MakeGraph(const BuildInputs& inputs, boo
 		graph->SetPersistentRestAtLastUse(ClosedEpoch(inputs.epoch) && RestsAtLastUse(inputs.epoch));
 		graph->SetPersistentExternalHomeStates(m_desc.externalHomeStates);
 		if (inputs.aliasArena) graph->SetPersistentAliasArena(inputs.aliasArena);
+		// Lane: the epoch plus one, so the epoch's builds may share bytes (lane 0 shares with nothing whose span overlaps).
+		if (inputs.frameArena) graph->SetFrameAliasRegion(inputs.frameArena, inputs.frameSpan, inputs.epoch + 1);
 		graph->SetPersistentRecordingReuse(m_desc.reuseRecordings);
 		graph->SetPersistentRecordingTimestampMode(m_recordingTimestamps.load(std::memory_order_acquire));
 		graph->SetScheduleTraceEnabled(m_scheduleTrace.load(std::memory_order_acquire));
@@ -1934,6 +1944,17 @@ void GraphHost::SetClosedEpochs(std::vector<uint32_t> epochs) {
 void GraphHost::SetPrivateAliasEpochs(std::vector<uint32_t> epochs) {
 	std::scoped_lock lock(m_configMutex);
 	m_privateAliasEpochs = std::move(epochs);
+}
+
+void GraphHost::SetFrameAliasSpans(std::vector<std::pair<uint32_t, AliasSpan>> spans) {
+	std::scoped_lock lock(m_configMutex);
+	if (!m_frameAliasArena) m_frameAliasArena = FrameAliasArena::Create();
+	m_frameAliasSpans = std::move(spans);
+}
+
+std::shared_ptr<FrameAliasArena> GraphHost::FrameArena() const {
+	std::scoped_lock lock(m_configMutex);
+	return m_frameAliasArena;
 }
 
 bool GraphHost::ClosedEpoch(uint32_t epoch) const noexcept {

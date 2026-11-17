@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Render/RenderGraph/FrameAliasArena.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -488,6 +489,14 @@ public:
 	 * executions, so their admissions find no alias activation and can take a predicted plan. Kept across rebuilds.
 	 */
 	void SetPrivateAliasEpochs(std::vector<uint32_t> epochs);
+	/**
+	 * @brief Owner thread, before the listed epochs' graphs are built: each epoch's transients go in the host's frame alias arena
+	 * (FrameAliasArena, made by the first call), reserved for the epoch's span of the frame. Epochs whose spans do not overlap share
+	 * memory. An epoch listed here leaves the shared alias arena and SetPrivateAliasEpochs. Kept across rebuilds.
+	 */
+	void SetFrameAliasSpans(std::vector<std::pair<uint32_t, AliasSpan>> spans);
+	/** @brief The frame alias arena SetFrameAliasSpans made, for resources the application places in it (FrameAliasArena::ReserveTextures); null before. */
+	std::shared_ptr<FrameAliasArena> FrameArena() const;
 	/**
 	 * @brief Submitting thread, for a revision-driven async epoch: its runs take their published copies by the caller's index
 	 * from now on, starting with copy `copy` for the next SubmitEpoch.
@@ -1141,6 +1150,8 @@ private:
 	std::vector<uint32_t> m_closedEpochs;  // SetClosedEpochs: read by builds on any thread, written only before them
 	std::vector<uint32_t> m_restEpochs;    // SetRestAtLastUseEpochs: the same
 	std::vector<uint32_t> m_privateAliasEpochs;  // SetPrivateAliasEpochs, under m_configMutex
+	std::vector<std::pair<uint32_t, AliasSpan>> m_frameAliasSpans;  // SetFrameAliasSpans, under m_configMutex
+	std::shared_ptr<FrameAliasArena> m_frameAliasArena;           // made by SetFrameAliasSpans, under m_configMutex
 	std::vector<uint32_t> m_externalEpochs;  // SetExternalEpochs; set on every build's graph
 	bool m_inlineAtExecution = false;        // SetInlineAtExecution; set on every build's graph
 	std::shared_ptr<ExternalEpochExecution> m_externalExecution;  // submitting thread: the last external SubmitEpoch's

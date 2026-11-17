@@ -153,4 +153,28 @@ PackingResult PackBeamSearch(std::span<const PackingItem> items) {
 	return best;
 }
 
+bool SpansConflict(const SpannedRange& a, const SpannedRange& b) {
+	if (a.lane != 0 && a.lane == b.lane) return false;
+	return !(a.last < b.first || b.last < a.first);
+}
+
+uint64_t PlaceSpanned(std::span<const SpannedRange> occupied, uint64_t capacity, uint64_t size, uint64_t alignment,
+	uint32_t first, uint32_t last, uint32_t lane) {
+	const SpannedRange query{0, 0, first, last, lane};
+	// Only the ranges this one may not share bytes with matter. Sorted by start, they leave gaps; take the first that fits.
+	std::vector<SpannedRange> blocking;
+	for (const auto& range : occupied)
+		if (range.end > range.begin && SpansConflict(range, query)) blocking.push_back(range);
+	std::sort(blocking.begin(), blocking.end(), [](const auto& a, const auto& b) { return a.begin < b.begin; });
+	uint64_t candidate = 0;
+	for (const auto& range : blocking) {
+		candidate = AlignUp(candidate, alignment);
+		if (candidate + size <= range.begin) break;
+		candidate = (std::max)(candidate, range.end);
+	}
+	candidate = AlignUp(candidate, alignment);
+	if (candidate + size > capacity) return UINT64_MAX;
+	return candidate;
+}
+
 } // namespace org::alias
