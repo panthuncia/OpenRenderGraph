@@ -436,6 +436,9 @@ public:
     bool Deferred() const noexcept { return static_cast<bool>(m_deferred); }
     // A late batch that Submit records itself, into a primary list of its own (RenderGraph::SetInlineAtExecution).
     bool Inline() const noexcept { return m_inline; }
+    // An inline late batch: its passes' answers to SkipsAtExecution for this run (SkipsAgain once recorded; 1 for a pass skipped
+    // ahead), asked before its list is begun. Its submission asks them once and passes them on (ExecutionBatchTimeline::skips).
+    void AskSkips(std::vector<uint8_t>& a_out) const;
     // The timeline an identity binds (a null handle: none).
     rhi::TimelineHandle ResolveTimeline(uint64_t identity) const noexcept {
         for (const auto& item : m_timelines) if (item.identity == identity) return item.handle;
@@ -544,7 +547,7 @@ public:
         // admission's, as any batch's, and it is submitted where a batch recorded ahead would be.
         rhi::CommandList recorded{};
         if (m_inline) {
-            recorded = RecordInline();
+            recorded = RecordInline(batch.skips, batch.untouched);
             if (!recorded) {
                 AbandonEffects();
                 return {SubmissionState::NotSubmitted, SubmissionFailureStage::Lifecycle};
@@ -614,10 +617,10 @@ public:
 private:
     // Records the late batch's barriers and passes into a_list (again, for a replayable packet). Commits nothing. Returns the
     // passes recorded (not skipped).
-    size_t RecordDeferredCommands(rhi::CommandList a_list) const;
+    size_t RecordDeferredCommands(rhi::CommandList a_list, std::span<const uint8_t> a_skips = {}, const UntouchedResources* a_untouched = nullptr) const;
     // An inline late batch: begins its own list (again, for a replayable packet), records it and closes it. A null list
     // when that failed.
-    rhi::CommandList RecordInline() const noexcept;
+    rhi::CommandList RecordInline(std::span<const uint8_t> a_skips, const UntouchedResources* a_untouched) const noexcept;
     // An inline late batch's list goes back to its pool, once its submission completed.
     void RetireInlineList() const noexcept;
     bool CommitEffectsSubmitted(uint64_t a_signal) const noexcept {
@@ -654,6 +657,7 @@ private:
     bool m_keyedBySkips = false;
     mutable bool m_keptList = false;
     mutable std::vector<uint8_t> m_keptSkips;
+    mutable uint64_t m_keptUntouched = 0;  // the untouched resources' signature the kept list was recorded with
     mutable std::atomic_bool m_deferredRecorded{false};
     mutable uint64_t m_deferredSignal = 0;  // set by CommitExternal. RecordDeferred commits its passes with it.
 };
@@ -837,6 +841,13 @@ inline std::atomic<uint64_t>& FoldedAtExecutionBarriers() {
     return count;
 }
 
+// Entry barriers (and releases) an execution's submission left out because no running pass touched their resource
+// (compiler::UntouchedResources). A running count; readers take differences.
+inline std::atomic<uint64_t>& UntouchedEntryBarriers() {
+    static std::atomic<uint64_t> count{0};
+    return count;
+}
+
 } // namespace org::diagnostics
 
 namespace org::compiler {
@@ -850,11 +861,15 @@ namespace org::compiler {
 // ledger's commits stay true.
 // False, with the outputs unspecified, when a skipped pass's barrier transfers ownership, or when two barriers of one batch
 // would name overlapping but different ranges of a resource (barriers of one batch are unordered against each other): the
-// caller keeps the barriers as they are. removed gets the barriers the fold took out.
+// caller keeps the barriers as they are (DropUntouchedBarriers still applies). removed gets the barriers the fold took out.
+// untouched: resources no running pass of the execution touches. Their barriers are left out, not composed: they stay in
+// the state the execution found them in, and the ledger keeps that state (UntouchedResources).
 inline bool FoldBarriersOfSkipped(const std::vector<PreparedBatchBarriers::BeforePass>& before,
     const std::vector<PreparedBatchBarriers::BeforePass>& after, const std::vector<uint8_t>& skipped,
-    std::vector<PreparedBatchBarriers::BeforePass>& outBefore, std::vector<PreparedBatchBarriers::BeforePass>& outAfter, size_t& removed) {
+    std::vector<PreparedBatchBarriers::BeforePass>& outBefore, std::vector<PreparedBatchBarriers::BeforePass>& outAfter, size_t& removed,
+    const UntouchedResources* untouched = nullptr) {
     removed = 0;
+    if (untouched && untouched->Empty()) untouched = nullptr;
     const size_t count = skipped.size();
     if (!count || before.size() != count || after.size() != count) return false;
     const auto sameHandle = [](rhi::ResourceHandle a, rhi::ResourceHandle b) { return a.index == b.index && a.generation == b.generation; };
@@ -878,6 +893,7 @@ inline bool FoldBarriersOfSkipped(const std::vector<PreparedBatchBarriers::Befor
     // Folds a_barriers into a_into, in order. False when one cannot be folded.
     const auto fold = [&](Batch& into, const Batch& barriers) {
         for (const auto& barrier : barriers.textures) {
+            if (untouched && untouched->Holds(barrier.texture)) continue;
             bool placed = false;
             for (auto& held : into.textures) {
                 if (!sameHandle(held.texture, barrier.texture)) continue;
@@ -893,6 +909,7 @@ inline bool FoldBarriersOfSkipped(const std::vector<PreparedBatchBarriers::Befor
             if (!placed) into.textures.push_back(barrier);
         }
         for (const auto& barrier : barriers.buffers) {
+            if (untouched && untouched->Holds(barrier.buffer)) continue;
             bool placed = false;
             for (auto& held : into.buffers) {
                 if (!sameHandle(held.buffer, barrier.buffer)) continue;
@@ -916,9 +933,13 @@ inline bool FoldBarriersOfSkipped(const std::vector<PreparedBatchBarriers::Befor
         batch.textures.clear();
         batch.buffers.clear();
     };
-    const auto copy = [](Batch& into, const Batch& from) {
+    const auto copy = [&](Batch& into, const Batch& from) {
         into.textures.assign(from.textures.begin(), from.textures.end());
         into.buffers.assign(from.buffers.begin(), from.buffers.end());
+        if (untouched) {
+            std::erase_if(into.textures, [&](const rhi::TextureBarrier& b) { return untouched->Holds(b.texture); });
+            std::erase_if(into.buffers, [&](const rhi::BufferBarrier& b) { return untouched->Holds(b.buffer); });
+        }
     };
     outBefore.resize(count);
     outAfter.resize(count);
@@ -960,23 +981,42 @@ inline bool FoldBarriersOfSkipped(const std::vector<PreparedBatchBarriers::Befor
     return true;
 }
 
+// Leaves out every barrier on a resource no running pass touches (UntouchedResources). Returns the barriers removed.
+inline size_t DropUntouchedBarriers(std::vector<PreparedBatchBarriers::BeforePass>& batches, const UntouchedResources& untouched) {
+    if (untouched.Empty()) return 0;
+    size_t removed = 0;
+    for (auto& batch : batches) {
+        removed += std::erase_if(batch.textures, [&](const rhi::TextureBarrier& b) { return untouched.Holds(b.texture); });
+        removed += std::erase_if(batch.buffers, [&](const rhi::BufferBarrier& b) { return untouched.Holds(b.buffer); });
+    }
+    return removed;
+}
+
 // Folds the barriers of the passes its host turned off ahead (PreparedPass::SkippedAhead) into the next pass that runs
-// (FoldBarriersOfSkipped). The list is left as it is when they cannot be folded. Returns the barriers removed.
-inline size_t FoldSkippedPassBarriers(OwnedRecordingList& recording) {
+// (FoldBarriersOfSkipped). ahead: the resources every use of which in the execution was skipped ahead. Their barriers go
+// (UntouchedResources), even where the rest cannot be folded. Returns the barriers removed.
+inline size_t FoldSkippedPassBarriers(OwnedRecordingList& recording, const UntouchedResources* ahead = nullptr) {
     const size_t count = recording.passes.size();
     if (!count || recording.barriersBeforePass.size() != count || recording.barriersAfterPass.size() != count) return 0;
+    if (ahead && ahead->Empty()) ahead = nullptr;
     if (std::none_of(recording.passes.begin(), recording.passes.end(), [](const PreparedPass& p) { return p.SkippedAhead(); })) return 0;
     std::vector<uint8_t> skipped(count);
     for (size_t i = 0; i < count; ++i) skipped[i] = recording.passes[i].SkippedAhead() ? 1 : 0;
     std::vector<PreparedBatchBarriers::BeforePass> before, after;
     size_t removed = 0;
-    if (!FoldBarriersOfSkipped(recording.barriersBeforePass, recording.barriersAfterPass, skipped, before, after, removed)) return 0;
+    if (!FoldBarriersOfSkipped(recording.barriersBeforePass, recording.barriersAfterPass, skipped, before, after, removed, ahead)) {
+        if (!ahead) return 0;
+        return DropUntouchedBarriers(recording.barriersBeforePass, *ahead) + DropUntouchedBarriers(recording.barriersAfterPass, *ahead);
+    }
     recording.barriersBeforePass = std::move(before);
     recording.barriersAfterPass = std::move(after);
     return removed;
 }
 
-inline OwnedRecordingList BuildPersistentRecordingList(std::shared_ptr<const RenderFrameSnapshot> sealed, uint32_t batch) {
+// ahead: the resources every use of which in the execution is skipped ahead (FindUntouched over the passes' SkippedAhead). The
+// list leaves out their barriers, and every execution of it must leave them unmoved (FrameAdmission::unmoved).
+inline OwnedRecordingList BuildPersistentRecordingList(std::shared_ptr<const RenderFrameSnapshot> sealed, uint32_t batch,
+    const UntouchedResources* ahead = nullptr) {
     if (!sealed) throw std::invalid_argument("Missing persistent frame seal");
     const auto& frame = *sealed;
     if (!frame.publication || !frame.barrierPlan
@@ -1000,7 +1040,7 @@ inline OwnedRecordingList BuildPersistentRecordingList(std::shared_ptr<const Ren
         result.passes.push_back(invocation);
     }
     if (!diagnostics::DiagnosticKeepSkippedPassBarriers().load(std::memory_order_relaxed)) {
-        const auto folded = FoldSkippedPassBarriers(result);
+        const auto folded = FoldSkippedPassBarriers(result, ahead);
         if (folded) basic_telemetry::AddCounter("ORG.Execution.FoldedSkippedBarriers", static_cast<int64_t>(folded));
     }
     return result;
@@ -1029,8 +1069,10 @@ inline RecordingContext MakeOwnedRecordingContext(rhi::CommandList list, const O
 // a_again records a replayable recording's passes again (PreparedPass::RecordAgain). This is for a late batch of a
 // kept recording. a_atExecution: a late batch, recorded after its run's commit, whose passes may skip the run
 // (PreparedPass::SkipsAtExecution). Returns the passes recorded, not counting the skipped ones.
+// a_skips: with a_atExecution, the passes' answers, asked by the submission already (empty: asked here). a_untouched: with
+// a_atExecution, the resources no running pass of the execution touches; their barriers are left out (UntouchedResources).
 inline size_t RecordOwnedRecordingCommands(RecordingContext& context, const OwnedRecordingList& recording, rhi::Queue queue, bool replayable,
-    bool a_again = false, bool a_atExecution = false) {
+    bool a_again = false, bool a_atExecution = false, std::span<const uint8_t> a_skips = {}, const UntouchedResources* a_untouched = nullptr) {
     struct TracyGpuZoneScope {
         rhi::CommandList& commands;
         bool open = false;
@@ -1137,19 +1179,35 @@ inline size_t RecordOwnedRecordingCommands(RecordingContext& context, const Owne
     const auto* beforeBatches = &recording.barriersBeforePass;
     const auto* afterBatches = &recording.barriersAfterPass;
     if (a_atExecution) {
-        skips.assign(recording.passes.size(), 0);
         bool late = false;
-        for (size_t i = 0; i < recording.passes.size(); ++i) {
-            const auto& pass = recording.passes[i];
-            const bool ahead = pass.SkippedAhead();
-            skips[i] = static_cast<uint8_t>(ahead || (a_again ? pass.SkipsAgain(context) : pass.SkipsAtExecution(context)));
-            late = late || (skips[i] && !ahead);
+        if (a_skips.size() == recording.passes.size()) {
+            skips.assign(a_skips.begin(), a_skips.end());
+            for (size_t i = 0; i < recording.passes.size(); ++i) late = late || (skips[i] && !recording.passes[i].SkippedAhead());
+        } else {
+            skips.assign(recording.passes.size(), 0);
+            for (size_t i = 0; i < recording.passes.size(); ++i) {
+                const auto& pass = recording.passes[i];
+                const bool ahead = pass.SkippedAhead();
+                skips[i] = static_cast<uint8_t>(ahead || (a_again ? pass.SkipsAgain(context) : pass.SkipsAtExecution(context)));
+                late = late || (skips[i] && !ahead);
+            }
         }
+        const bool keep = diagnostics::DiagnosticKeepSkippedPassBarriers().load(std::memory_order_relaxed);
+        const bool untouched = a_untouched && !a_untouched->Empty();
         size_t removed = 0;
-        if (late && !diagnostics::DiagnosticKeepSkippedPassBarriers().load(std::memory_order_relaxed)
-            && FoldBarriersOfSkipped(recording.barriersBeforePass, recording.barriersAfterPass, skips, foldedBefore, foldedAfter, removed)) {
-            beforeBatches = &foldedBefore;
-            afterBatches = &foldedAfter;
+        if ((late || untouched) && !keep) {
+            if (FoldBarriersOfSkipped(recording.barriersBeforePass, recording.barriersAfterPass, skips, foldedBefore, foldedAfter, removed,
+                    a_untouched)) {
+                beforeBatches = &foldedBefore;
+                afterBatches = &foldedAfter;
+            } else if (untouched) {
+                // Not folded: the barriers stay where the plan put them, but those on the untouched resources go all the same.
+                foldedBefore = recording.barriersBeforePass;
+                foldedAfter = recording.barriersAfterPass;
+                removed = DropUntouchedBarriers(foldedBefore, *a_untouched) + DropUntouchedBarriers(foldedAfter, *a_untouched);
+                beforeBatches = &foldedBefore;
+                afterBatches = &foldedAfter;
+            }
             if (removed) diagnostics::FoldedAtExecutionBarriers().fetch_add(removed, std::memory_order_relaxed);
         }
     }
@@ -1288,7 +1346,18 @@ inline PreparedRhiExecutionBatch::PreparedRhiExecutionBatch(uint32_t queueSlot, 
         && std::all_of(m_deferred->passes.begin(), m_deferred->passes.end(), [](const PreparedPass& pass) { return pass.KeyedBySkip(); });
 }
 
-inline size_t PreparedRhiExecutionBatch::RecordDeferredCommands(rhi::CommandList a_list) const {
+inline void PreparedRhiExecutionBatch::AskSkips(std::vector<uint8_t>& a_out) const {
+    a_out.clear();
+    if (!m_deferred) return;
+    const auto context = RecordingContext::ForSkipQuestions(m_deferred->run);
+    const bool again = m_deferredRecorded.load(std::memory_order_relaxed);
+    a_out.reserve(m_deferred->passes.size());
+    for (const auto& pass : m_deferred->passes)
+        a_out.push_back(static_cast<uint8_t>(pass.SkippedAhead() || (again ? pass.SkipsAgain(context) : pass.SkipsAtExecution(context))));
+}
+
+inline size_t PreparedRhiExecutionBatch::RecordDeferredCommands(rhi::CommandList a_list, std::span<const uint8_t> a_skips,
+    const UntouchedResources* a_untouched) const {
     const bool again = m_deferredRecorded.exchange(true);
     if (again && !m_replayable) throw std::logic_error("A deferred packet is recorded once, unless it is replayable");
     // A kept recording's own queries start over in each list that records it. The last execution's queries were read
@@ -1301,7 +1370,7 @@ inline size_t PreparedRhiExecutionBatch::RecordDeferredCommands(rhi::CommandList
         owned.overflow = 0;
     }
     auto context = MakeOwnedRecordingContext(a_list, *m_deferred);
-    const size_t recorded = RecordOwnedRecordingCommands(context, *m_deferred, m_queue, false, again, true);
+    const size_t recorded = RecordOwnedRecordingCommands(context, *m_deferred, m_queue, false, again, true, a_skips, a_untouched);
     // Its queries are in a_list now. Its frame slot's completion publishes them (OwnedRecordingStatistics::atCompletion).
     if (m_deferred->statistics) m_deferred->statistics->recorded.store(true, std::memory_order_release);
     return recorded;
@@ -1314,7 +1383,7 @@ inline void PreparedRhiExecutionBatch::RecordDeferred(rhi::CommandList a_list) c
     if (!m_replayable && !CommitEffectsSubmitted(m_deferredSignal)) throw std::logic_error("A deferred packet's passes could not be committed as submitted");
 }
 
-inline rhi::CommandList PreparedRhiExecutionBatch::RecordInline() const noexcept {
+inline rhi::CommandList PreparedRhiExecutionBatch::RecordInline(std::span<const uint8_t> a_skips, const UntouchedResources* a_untouched) const noexcept {
     BT_ZONE_SCOPE("ORG.Execution.RecordInline");
     try {
         auto& allocation = *m_deferred->allocation;
@@ -1323,17 +1392,13 @@ inline rhi::CommandList PreparedRhiExecutionBatch::RecordInline() const noexcept
         // last submission is done (see below), and nothing else in it depends on the run.
         // The answers are asked before the passes are recorded: SkipsAtExecution only before a pass's first recording,
         // SkipsAgain after it.
-        std::vector<uint8_t> skips;
-        const auto askSkips = [&](rhi::CommandList a_list) {
-            auto context = MakeOwnedRecordingContext(a_list, *m_deferred);
-            const bool again = m_deferredRecorded.load(std::memory_order_relaxed);
-            skips.reserve(m_deferred->passes.size());
-            for (const auto& pass : m_deferred->passes)
-                skips.push_back(static_cast<uint8_t>(again ? pass.SkipsAgain(context) : pass.SkipsAtExecution(context)));
-        };
+        // The answers the submission asked, or asked here once. A kept list also depends on the untouched resources, whose
+        // barriers it leaves out.
+        std::vector<uint8_t> skips(a_skips.begin(), a_skips.end());
+        if (skips.size() != m_deferred->passes.size()) AskSkips(skips);
+        const uint64_t untouched = a_untouched ? a_untouched->signature : 0;
         if (m_keyedBySkips && m_keptList && allocation.closed && allocation.pool && allocation.pair.list) {
-            askSkips(allocation.pair.list.Get());
-            if (skips == m_keptSkips) {
+            if (skips == m_keptSkips && untouched == m_keptUntouched) {
                 census.Add(diagnostics::SubmissionCensus::List::InlineKept);
                 return allocation.pair.list.Get();
             }
@@ -1348,8 +1413,7 @@ inline rhi::CommandList PreparedRhiExecutionBatch::RecordInline() const noexcept
         // by pending work. It goes now; the new recording retains its own.
         if (m_deferredRecorded.load(std::memory_order_relaxed) && m_deferred->retention) m_deferred->retention->Release();
         auto list = allocation.pair.list.Get();
-        if (m_keyedBySkips && skips.empty()) askSkips(list);
-        const size_t recorded = RecordDeferredCommands(list);
+        const size_t recorded = RecordDeferredCommands(list, skips, a_untouched);
         census.Add(diagnostics::SubmissionCensus::List::Inline);
         if (!recorded) census.Add(diagnostics::SubmissionCensus::List::InlineBarriersOnly);
         if (census.On()) {
@@ -1374,6 +1438,7 @@ inline rhi::CommandList PreparedRhiExecutionBatch::RecordInline() const noexcept
         allocation.Close();
         if (m_keyedBySkips) {
             m_keptSkips = std::move(skips);
+            m_keptUntouched = untouched;
             m_keptList = true;
         }
         return list;

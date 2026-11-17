@@ -216,6 +216,25 @@ void RenderGraph::RecordPersistentSegment(PersistentSegmentRun& run) {
 	std::vector<uint8_t> closedEntryDone(slotCount, 0);
 	auto& jobs = run.jobs;
 	jobs.resize(graph.batches.size());
+	// An open ticket's resources every use of which is skipped ahead: no list records their barriers, and every execution of the
+	// recording leaves them where it found them (SubmitPersistentTicket's untouched resources hold them).
+	run.ahead.reset();
+	if (ticketTarget && !external && !admission.closed && !state.admission->ExternalHomeStates()
+		&& !diagnostics::DiagnosticKeepSkippedPassBarriers().load(std::memory_order_relaxed)) {
+		std::vector<std::vector<uint8_t>> skippedAhead(graph.batches.size());
+		bool any = false;
+		for (uint32_t batch = 0; batch < graph.batches.size(); ++batch)
+			for (const auto pass : graph.batches[batch].passes) {
+				const auto prepared = graph.structure->passes.at(pass).preparedPassIndex;
+				const bool skipped = prepared < run.sealed->passes.size() && run.sealed->passes[prepared].SkippedAhead();
+				skippedAhead[batch].push_back(skipped ? 1 : 0);
+				any = any || skipped;
+			}
+		if (any) {
+			auto ahead = std::make_shared<compiler::UntouchedResources>(compiler::FindUntouched(graph, admission.backings, skippedAhead));
+			if (!ahead->Empty()) run.ahead = std::move(ahead);
+		}
+	}
 	std::array<std::shared_ptr<const compiler::OwnedRecordingGpuRanges>, 3> gpuPassRanges;  // per rhi::QueueKind
 	std::vector<size_t> demand(slotCount);
 	// An external epoch's ticket (SetExternalPersistentEpochs): its batches on the graphics queue are recorded into secondaries,
@@ -261,7 +280,7 @@ void RenderGraph::RecordPersistentSegment(PersistentSegmentRun& run) {
 					static_cast<QueueSlotIndex>(static_cast<uint8_t>(source)), index).GetHandle();
 		}
 		job.deferred = late;
-		job.recording = compiler::BuildPersistentRecordingList(run.sealed, batch);
+		job.recording = compiler::BuildPersistentRecordingList(run.sealed, batch, run.ahead.get());
 		// An open admission's handoff into the execution (its batches' entry barriers) is recorded when it submits, against the
 		// ledger as it is then: the body has none.
 		if (!admission.closed) {
@@ -488,6 +507,7 @@ void RenderGraph::SubmitPersistentSegment(PersistentSegmentRun& run) {
 			recording->packets = recorded.Packets();
 			recording->statistics = std::move(run.recordingStatistics);
 			recording->replayable = keepable && std::ranges::all_of(recording->packets, [](const auto& packet) { return packet->Replayable(); });
+			recording->ahead = run.ahead;
 			{
 				// The body's barriers, for the segment census: what each replay of this recording records besides its entry barriers
 				// (its lists' own, after the skipped passes' were folded).

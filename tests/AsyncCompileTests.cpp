@@ -683,6 +683,79 @@ int main() {
         && crossQueueAcquire.afterLayout == crossQueueRelease.afterLayout);
     ENSURE(crossQueueBarriers.batches[crossQueueStep->batch]
         .beforePass[consumerPosition].textures.front().queueOwnership == rhi::QueueOwnership::None);
+    {
+        // An execution that leaves a resource untouched commits nothing for it (CommitBatch's unmoved): the ledger keeps the state
+        // the execution found it in, and the next execution's entry barriers start from there.
+        rhi::ResourceHandle handle{};
+        handle.index = 52; handle.generation = 3;
+        PreparedBackingState backing{
+            .graphResourceID = 1,
+            .resource = handle,
+            .shape = {4, 2, true},
+            .regions = std::make_shared<const std::vector<PreparedStateRegion>>(
+                std::initializer_list<PreparedStateRegion>{{{0, 4, 0, 2}, writeState}}),
+        };
+        const std::span<const PreparedBackingState> backings{&backing, size_t{1}};
+        BackingStateAdmissionLedger moved, kept;
+        for (auto* ledger : {&moved, &kept}) {
+            const auto plan = ledger->Prepare(*stateGraph, backings);
+            // The first execution enters from the seeded state.
+            bool fromSeed = false;
+            for (const auto& batch : plan.batches)
+                for (const auto& texture : batch.textures) fromSeed = fromSeed || static_cast<uint64_t>(texture.beforeLayout) == writeState.layout;
+            ENSURE(fromSeed);
+            const std::vector<uint32_t> unmoved = ledger == &kept ? std::vector<uint32_t>{0} : std::vector<uint32_t>{};
+            for (const auto& batch : plan.batches) ledger->CommitBatch(batch, backings, 0, unmoved);
+        }
+        const auto entryFrom = [&](const BackingStateAdmissionLedger& ledger, uint64_t layout) {
+            const auto plan = ledger.Prepare(*stateGraph, backings);
+            size_t count = 0;
+            for (const auto& batch : plan.batches)
+                for (const auto& texture : batch.textures) count += static_cast<uint64_t>(texture.beforeLayout) == layout ? 1 : 0;
+            return count;
+        };
+        // Committed: the next execution enters from the states the last one left (shader read), not the seed.
+        ENSURE(entryFrom(moved, writeState.layout) == 0);
+        // Left unmoved: it still enters from the seeded state.
+        ENSURE(entryFrom(kept, writeState.layout) > 0);
+    }
+    {
+        // FindUntouched: a resource every pass of which skips is untouched. A pass of a batch recorded ahead counts as running,
+        // unless the resource is one every use of which was skipped ahead (`ahead`).
+        auto structure = std::make_shared<GraphCompileStructure>();
+        structure->passes.resize(3);
+        structure->passes[0].accesses = {{0, true}};
+        structure->passes[1].accesses = {{0, false}, {1, true}};
+        structure->passes[2].accesses = {{2, true}};
+        Schedule schedule;
+        schedule.structure = structure;
+        SymbolicBatch first(0, 0), second(2, 0);
+        first.passes.push_back(1);
+        schedule.batches = {first, second};
+        std::vector<PreparedBackingState> backings(4);
+        for (uint32_t i = 0; i < backings.size(); ++i) {
+            backings[i].graphResourceID = i + 1;
+            backings[i].resource.index = 70 + i;
+            backings[i].resource.generation = 1;
+        }
+        backings[1].deviceHandles = {backings[1].resource, rhi::ResourceHandle{90, 2}};
+        using Skips = std::vector<std::vector<uint8_t>>;
+        // Both passes of the first batch skip: resources 0 and 1 are untouched; 2 has a running pass, 3 none at all.
+        auto untouched = FindUntouched(schedule, backings, Skips{{1, 1}, {0}});
+        ENSURE((untouched.indices == std::vector<uint32_t>{0, 1}) && untouched.signature != 0);
+        ENSURE(untouched.Holds(backings[0].resource) && untouched.Holds(rhi::ResourceHandle{90, 2}) && !untouched.Holds(backings[2].resource));
+        // One running pass touches it.
+        ENSURE((FindUntouched(schedule, backings, Skips{{1, 0}, {0}}).indices.empty()));
+        // The second batch recorded ahead, its pass skipped ahead: it keeps resource 2's barriers unless 2 is in `ahead`.
+        const std::vector<uint8_t> late{1, 0};
+        ENSURE((FindUntouched(schedule, backings, Skips{{1, 1}, {1}}, late).indices == std::vector<uint32_t>{0, 1}));
+        const auto ahead = FindUntouched(schedule, backings, Skips{{0, 0}, {1}});
+        ENSURE((ahead.indices == std::vector<uint32_t>{2}));
+        ENSURE((FindUntouched(schedule, backings, Skips{{1, 1}, {1}}, late, &ahead).indices == std::vector<uint32_t>{0, 1, 2}));
+        // An exempt backing (nothing planned for it) is never untouched.
+        backings[1].exempt = true;
+        ENSURE((FindUntouched(schedule, backings, Skips{{1, 1}, {0}}).indices == std::vector<uint32_t>{0}));
+    }
     auto dependencyOnly = stateInput;
     dependencyOnly.structure.resourceIDs.push_back(2);
     dependencyOnly.structure.resourceShapes.push_back({0, 0, false});

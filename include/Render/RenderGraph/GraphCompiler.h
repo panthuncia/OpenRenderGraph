@@ -16,7 +16,7 @@
 #include "Render/Runtime/ITaskService.h"
 
 namespace rhi { class CommandList; }
-namespace org::compiler { struct PreparedTimelineBinding; }
+namespace org::compiler { struct PreparedTimelineBinding; struct UntouchedResources; }
 #include "Render/RenderGraph/CompilerAlgorithms.h"
 
 namespace org::compiler {
@@ -358,6 +358,10 @@ struct ExecutionBatchTimeline {
     // Timelines the batch waits on beyond those its packet binds (another graph's, from its admission). Only for the call that
     // submits it.
     std::span<const PreparedTimelineBinding> extraTimelines;
+    // A late batch recorded by its submission: its passes' skip answers, asked once by the submission (empty: the recording asks),
+    // and the resources no running pass of the execution touches, whose barriers it leaves out. Only for the call that submits it.
+    std::span<const uint8_t> skips;
+    const UntouchedResources* untouched = nullptr;
 };
 class IPreparedExecutionBatch;
 // Timeline portion only, not an executable command packet. The admission owner

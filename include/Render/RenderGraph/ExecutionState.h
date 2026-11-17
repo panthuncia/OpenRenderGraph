@@ -3,6 +3,7 @@
 #include "Render/RenderGraph/GraphCompiler.h"
 #include "Resources/AliasingPlacement.h"
 #include <rhi.h>
+#include <algorithm>
 #include <span>
 #include <deque>
 #include <map>
@@ -220,6 +221,29 @@ private:
 // Throws unless the backings are the structure's resources, in its order (what every ledger's Prepare expects).
 void ValidatePreparedBackingOrder(const GraphCompileStructure& structure, std::span<const PreparedBackingState> backings);
 
+// The resources no running pass of an execution touches: every pass that uses one skips this execution (skipped ahead, or
+// skipped at execution). Such a resource stays as the execution found it. Its barriers (entry, body, releases) are left out,
+// and the ledger keeps the state it had (BackingStateAdmissionLedger::CommitBatch's unmoved).
+struct UntouchedResources {
+    std::vector<uint32_t> indices;  // compiler resource indices, ascending
+    std::vector<uint64_t> keys;     // their backings' handles on every device, (generation << 32) | index, ascending
+    uint64_t signature = 0;         // of the indices; 0 when there are none
+    bool Empty() const noexcept { return indices.empty(); }
+    bool Holds(rhi::ResourceHandle handle) const noexcept {
+        if (keys.empty()) return false;
+        const uint64_t key = (uint64_t{handle.generation} << 32) | handle.index;
+        return std::binary_search(keys.begin(), keys.end(), key);
+    }
+    bool HoldsIndex(uint32_t index) const noexcept { return std::binary_search(indices.begin(), indices.end(), index); }
+};
+
+// The resources no running pass of an execution touches. skips[batch][position]: the pass at that position of the batch
+// skips this execution. late[batch]: the batch is recorded at execution; empty: every batch is. A pass of a batch recorded
+// ahead counts as running for every resource but those in `ahead`: the resources whose every use was skipped ahead, which
+// the lists recorded ahead left out. Reserved and exempt backings are never in the result.
+UntouchedResources FindUntouched(const Schedule& graph, std::span<const PreparedBackingState> backings,
+    std::span<const std::vector<uint8_t>> skips, std::span<const uint8_t> late = {}, const UntouchedResources* ahead = nullptr);
+
 // Ordered admission state. Compile workers never access this object. Prepare is
 // transactional; CommitBatch is called only for work known to have submitted.
 class BackingStateAdmissionLedger {
@@ -248,8 +272,10 @@ public:
         bool validated = false, uint64_t backingSet = 0, bool externalHome = false, bool restAtLastUse = false) const;
     void CommitBatch(const PreparedBatchBarriers&);
     // The same, each commit's entry found by its compiler resource index (PreparedBatchBarriers::committedIndices) in the backings'
-    // set (backingSet as for Prepare).
-    void CommitBatch(const PreparedBatchBarriers& batch, std::span<const PreparedBackingState> backings, uint64_t backingSet);
+    // set (backingSet as for Prepare). unmoved: compiler resource indices (ascending) no running pass touched
+    // (UntouchedResources). Their commits are left out, so the ledger keeps the state the execution found them in.
+    void CommitBatch(const PreparedBatchBarriers& batch, std::span<const PreparedBackingState> backings, uint64_t backingSet,
+        std::span<const uint32_t> unmoved = {});
     // A batch's seeds: the grids of backings the ledger does not hold yet, and of those whose state the batch makes again.
     void SeedBatch(const PreparedBatchBarriers& batch);
     // The prediction's entries taken anew: what the ledger holds now of each resource the graph's entry steps name.

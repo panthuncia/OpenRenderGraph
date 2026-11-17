@@ -205,6 +205,15 @@ struct RenderGraph::PersistentRecording {
 	std::vector<std::shared_ptr<const compiler::IPreparedExecutionBatch>> packets;
 	std::vector<std::shared_ptr<compiler::OwnedRecordingStatistics>> statistics;
 	bool replayable = false;
+	// The resources every use of which is skipped ahead: its lists left their barriers out, so every execution of it leaves them
+	// unmoved (FindUntouched's ahead). Null for none.
+	std::shared_ptr<const compiler::UntouchedResources> ahead;
+	// The untouched resources its last submission found (SubmitPersistentTicket), with the skip answers (every batch's, in order)
+	// and the backing set it found them for: a submission with the same answers takes them as they are. The submitting thread's,
+	// under the sequencer.
+	mutable std::vector<uint8_t> untouchedSkips;
+	mutable uint64_t untouchedBackings = 0;
+	mutable compiler::UntouchedResources untouched;
 	// The barriers its body records (diagnostics, the segment census): the barriers before and after its passes, and the full
 	// memory barriers a closed execution starts each batch with.
 	uint64_t bodyBarriers = 0, bodyFullBarriers = 0;
@@ -634,6 +643,7 @@ struct RenderGraph::PersistentExecutionsState {
 		bool external = false;
 		std::vector<rhi::CommandList> handoff, streamHandoff;  // per batch
 		std::vector<uint32_t> targets;  // per batch, the batch whose handoff list holds its entry barriers (SetMergedHandoffs)
+		uint64_t untouched = 0;  // the untouched resources' signature (compiler::UntouchedResources): their entry barriers are left out
 		std::vector<std::shared_ptr<const void>> allocations;
 	};
 	static constexpr size_t kHandoffCacheEntries = 4;
@@ -676,6 +686,8 @@ struct RenderGraph::PersistentSegmentRun {
 	std::vector<compiler::FrameRecordingJob> jobs;
 	// The body barriers the jobs record (their lists' per-pass batches, after FoldSkippedPassBarriers).
 	uint64_t bodyBarriers = 0;
+	// An open ticket's resources every use of which is skipped ahead: its lists leave out their barriers (compiler::UntouchedResources).
+	std::shared_ptr<const compiler::UntouchedResources> ahead;
 	std::vector<std::shared_ptr<compiler::OwnedRecordingStatistics>> recordingStatistics;
 	std::optional<compiler::RecordedFrame> recorded;
 };

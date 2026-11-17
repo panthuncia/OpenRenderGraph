@@ -550,5 +550,53 @@ int main() {
         before[1].textures[0].queueOwnership = rhi::QueueOwnership::Release;
         ENSURE(!compiler::FoldBarriersOfSkipped(before, after, {1, 1, 0}, foldedBefore, foldedAfter, removed));
     }
+    {
+        // A resource no running pass touches (UntouchedResources) stays as the execution found it: its barriers are left out,
+        // not composed into the next pass that runs, and the other resources fold as before.
+        using Batch = compiler::PreparedBatchBarriers::BeforePass;
+        constexpr auto rt = rhi::ResourceLayout::RenderTarget, sr = rhi::ResourceLayout::ShaderResource;
+        const auto barrier = [](uint32_t texture, rhi::ResourceLayout before, rhi::ResourceLayout after) {
+            rhi::TextureBarrier b{};
+            b.texture.index = texture;
+            b.texture.generation = 1;
+            b.range.mipCount = 1;
+            b.range.layerCount = 1;
+            b.range.planeCount = 1;
+            b.beforeLayout = before;
+            b.afterLayout = after;
+            b.beforeAccess = before == rt ? rhi::ResourceAccessType::RenderTarget : rhi::ResourceAccessType::ShaderResource;
+            b.afterAccess = after == rt ? rhi::ResourceAccessType::RenderTarget : rhi::ResourceAccessType::ShaderResource;
+            b.beforeSync = before == rt ? rhi::ResourceSyncState::RenderTarget : rhi::ResourceSyncState::PixelShading;
+            b.afterSync = after == rt ? rhi::ResourceSyncState::RenderTarget : rhi::ResourceSyncState::PixelShading;
+            return b;
+        };
+        // Pass 0 writes texture 9 (its only use) and texture 7, pass 1 reads 7, pass 2 writes texture 8.
+        std::vector<Batch> before(3), after(3);
+        before[0].textures = {barrier(9, sr, rt), barrier(7, sr, rt)};
+        before[1].textures = {barrier(7, rt, sr)};
+        before[2].textures = {barrier(8, sr, rt)};
+        std::vector<Batch> foldedBefore, foldedAfter;
+        size_t removed = 0;
+        // Pass 0 skips. Without the untouched set, texture 9's transition moves into pass 1's batch: it still ends as a target.
+        ENSURE(compiler::FoldBarriersOfSkipped(before, after, {1, 0, 0}, foldedBefore, foldedAfter, removed));
+        ENSURE(foldedBefore[1].textures.size() == 1 && foldedBefore[1].textures[0].texture.index == 9);
+        // Texture 9 untouched: no barrier names it. Texture 7's two transitions compose to nothing (shader read to shader read).
+        compiler::UntouchedResources untouched;
+        untouched.indices = {0};
+        untouched.keys = {(uint64_t{1} << 32) | 9};
+        untouched.signature = 1;
+        ENSURE(untouched.Holds(before[0].textures[0].texture) && !untouched.Holds(before[0].textures[1].texture));
+        ENSURE(compiler::FoldBarriersOfSkipped(before, after, {1, 0, 0}, foldedBefore, foldedAfter, removed, &untouched));
+        ENSURE(removed == 3);
+        for (const auto& batch : foldedBefore)
+            for (const auto& b : batch.textures) ENSURE(b.texture.index != 9);
+        ENSURE(foldedBefore[0].textures.empty() && foldedBefore[1].textures.empty() && foldedBefore[2].textures.size() == 1);
+        // Where the fold cannot apply, the untouched resources' barriers still go, and the rest stay where the plan put them.
+        auto dropped = before;
+        ENSURE(compiler::DropUntouchedBarriers(dropped, untouched) == 1);
+        ENSURE(dropped[0].textures.size() == 1 && dropped[0].textures[0].texture.index == 7 && dropped[1].textures.size() == 1);
+        // An empty set changes nothing.
+        ENSURE(compiler::DropUntouchedBarriers(dropped, compiler::UntouchedResources{}) == 0);
+    }
     std::puts("Recording tests passed");
 }

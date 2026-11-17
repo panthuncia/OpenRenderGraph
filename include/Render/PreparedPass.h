@@ -504,6 +504,13 @@ public:
     // LatchBlock region and a run's CPU payload are per run. It must not depend on anything else about the frame.
     const RunRef& Run() const noexcept { return m_run; }
     void SetRun(const RunRef& run) noexcept { m_run = run; }
+    // A context to ask passes whether they skip a run (PreparedPass::SkipsAtExecution) before their list is begun. It has the
+    // run and nothing else: a SkipsAtExecution may read only Run().
+    static RecordingContext ForSkipQuestions(const RunRef& run) {
+        RecordingContext context{SkipQuestionsTag{}};
+        context.m_run = run;
+        return context;
+    }
     rhi::Resource Resolve(persistent::BindingToken token) const;
     rhi::DescriptorSlot Resolve(persistent::ViewToken token) const;
     RecordingContext(rhi::CommandList commands, std::shared_ptr<const FrozenExecutionBindings> bindings,
@@ -621,6 +628,8 @@ private:
     void BindPayload(std::shared_ptr<const PipelineStatePayload> payload, rhi::ShaderStage stages, BindOptions options);
     struct PersistentTag {};
     RecordingContext(rhi::CommandList commands, std::shared_ptr<const persistent::SelectedPublication> publication, PersistentTag);
+    struct SkipQuestionsTag {};
+    explicit RecordingContext(SkipQuestionsTag) {}
     std::shared_ptr<const persistent::SelectedPublication> m_persistentPublication;
     RunRef m_run{};
     rhi::CommandList m_commands;

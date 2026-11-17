@@ -483,6 +483,9 @@ struct FrameAdmission {
     bool entryOnly = false;
     // The access stream its commit goes to (BackingAccessAdmissionLedger::OpenStream), 0 for none.
     uint64_t stream = 0;
+    // Compiler resource indices (ascending) no running pass of the execution touched (compiler::UntouchedResources), set by its
+    // submission. Its commit leaves their ledger states as they were.
+    std::vector<uint32_t> unmoved;
 };
 // Frame-supplied backing for a slot the publication deliberately leaves
 // unbound: a versioned slot's version for this frame. The executable and its

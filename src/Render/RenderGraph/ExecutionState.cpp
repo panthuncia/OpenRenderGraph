@@ -1014,6 +1014,52 @@ void BackingStateAdmissionLedger::CommitBatch(const PreparedBatchBarriers& batch
     }
 }
 
+UntouchedResources FindUntouched(const Schedule& graph, std::span<const PreparedBackingState> backings,
+    std::span<const std::vector<uint8_t>> skips, std::span<const uint8_t> late, const UntouchedResources* ahead) {
+    UntouchedResources result;
+    if (!graph.structure) return result;
+    const auto& passes = graph.structure->passes;
+    const size_t count = backings.size();
+    // Per resource: 0 no pass uses it, 1 every pass that uses it skips, 2 a running pass uses it.
+    thread_local std::vector<uint8_t> state;
+    state.assign(count, 0);
+    for (size_t batch = 0; batch < graph.batches.size(); ++batch) {
+        const auto& order = graph.batches[batch].passes;
+        const bool atExecution = late.empty() || (batch < late.size() && late[batch] != 0);
+        const std::vector<uint8_t>* answers = batch < skips.size() ? &skips[batch] : nullptr;
+        for (size_t position = 0; position < order.size(); ++position) {
+            if (order[position] >= passes.size()) continue;
+            const bool skipped = answers && position < answers->size() && (*answers)[position] != 0;
+            const auto mark = [&](uint32_t resource) {
+                if (resource >= count) return;
+                // A list recorded ahead keeps its barriers on every resource but those every use of which was skipped ahead.
+                const bool running = atExecution ? !skipped : !(skipped && ahead && ahead->HoldsIndex(resource));
+                if (running) state[resource] = 2;
+                else if (state[resource] == 0) state[resource] = 1;
+            };
+            const auto& pass = passes[order[position]];
+            for (const auto& access : pass.accesses) mark(access.resourceIndex);
+            for (const auto& use : pass.entryStates) mark(use.resource);
+            for (const auto& use : pass.exitStates) mark(use.resource);
+        }
+    }
+    uint64_t signature = 1469598103934665603ull;
+    for (uint32_t resource = 0; resource < count; ++resource) {
+        if (state[resource] != 1) continue;
+        const auto& backing = backings[resource];
+        if (!backing.resource.valid() || backing.exempt) continue;
+        result.indices.push_back(resource);
+        result.keys.push_back(Key(backing.resource));
+        for (const auto handle : backing.deviceHandles)
+            if (handle.valid()) result.keys.push_back(Key(handle));
+        signature = (signature ^ resource) * 1099511628211ull;
+    }
+    std::sort(result.keys.begin(), result.keys.end());
+    result.keys.erase(std::unique(result.keys.begin(), result.keys.end()), result.keys.end());
+    result.signature = result.indices.empty() ? 0 : signature;
+    return result;
+}
+
 void BackingStateAdmissionLedger::Invalidate(std::span<const rhi::ResourceHandle> resources) {
     for (const auto resource : resources) if (resource.valid()) m_states.Erase(Key(resource));
 }
@@ -1055,7 +1101,7 @@ bool BackingStateAdmissionLedger::Predicts(const StatePrediction& prediction, st
 }
 
 void BackingStateAdmissionLedger::CommitBatch(const PreparedBatchBarriers& batch, std::span<const PreparedBackingState> backings,
-    uint64_t backingSet) {
+    uint64_t backingSet, std::span<const uint32_t> unmoved) {
     BT_ZONE_SCOPE("ORG.Execution.CommitStates");
     if (batch.committedResources.size() != batch.committedStates.size()
         || batch.committedQueues.size() != batch.committedStates.size()
@@ -1071,6 +1117,8 @@ void BackingStateAdmissionLedger::CommitBatch(const PreparedBatchBarriers& batch
     auto& resolved = m_states.Resolve(backings, backingSet);
     for (size_t i = 0; i < batch.committedStates.size(); ++i) {
         const auto index = batch.committedIndices[i];
+        // No running pass touched it: it stays as the execution found it.
+        if (!unmoved.empty() && std::binary_search(unmoved.begin(), unmoved.end(), index)) continue;
         StateGrid* grid = index < resolved.size() ? resolved[index] : nullptr;
         if (!grid) {
             grid = m_states.Find(Key(batch.committedResources[i]));
