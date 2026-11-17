@@ -1077,6 +1077,11 @@ inline size_t RecordOwnedRecordingCommands(RecordingContext& context, const Owne
     if (ownedQueries && ownedQueries->owned->listOnly) {
         thread_local std::string listName;
         listName.assign("list: ").append(firstPass.empty() ? std::string_view("<unnamed>") : firstPass);
+        // With BasicRHI's submission trace on, the name carries the list's handle, so a reader can match the range to its submission.
+        if (rhi::submittrace::Enabled()) {
+            const auto handle = context.Commands().GetHandle();
+            listName.append(" #").append(std::to_string(uint64_t{handle.index} | (uint64_t{handle.generation} << 32)));
+        }
         statistics->service->BeginListRangeQuery(listName, context.Commands(), *ownedQueries);
     }
     const int skipBarriers = diagnostics::DiagnosticSkipListBarriers().load(std::memory_order_relaxed);

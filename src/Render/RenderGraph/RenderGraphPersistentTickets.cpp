@@ -530,6 +530,8 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 					allocation->pair = allocation->pool->Request();
 				}
 				auto list = allocation->pair.list.Get();
+				// BasicRHI's command census names the list (diagnostics).
+				if (rhi::census::Enabled()) rhi::census::SetLabel("handoff");
 				rhi::BarrierBatch barriers{};
 				barriers.textures = {entry.textures.data(), static_cast<uint32_t>(entry.textures.size())};
 				barriers.buffers = {entry.buffers.data(), static_cast<uint32_t>(entry.buffers.size())};
@@ -850,6 +852,7 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 							allocation->pool = m_queueRegistry.GetSharedPool(static_cast<QueueSlotIndex>(static_cast<uint8_t>(groupQueue)));
 							allocation->pair = allocation->pool->Request();
 							auto barrierList = allocation->pair.list.Get();
+							if (rhi::census::Enabled()) rhi::census::SetLabel("joined barrier");
 							const auto full = rhi::FullMemoryBarrier();
 							rhi::BarrierBatch barriers{};
 							barriers.globals = {&full, 1u};

@@ -3635,6 +3635,8 @@ void GraphHost::FinishTicket(Async& async, TicketCommit& commit, FrameTimings& t
 			? queueUploadLists[queue].list.Get() : rhi::CommandList{};
 	size_t queueCopies = 0;
 	recordedLists.clear();
+	// BasicRHI's command census names the upload lists (diagnostics).
+	if (rhi::census::Enabled()) rhi::census::SetLabel("upload");
 	const bool supported = !hasUploads || graph.RecordTakenUploads(commit.uploads, commands, keepAlive, recorded, recordedLists,
 		queueScoped ? ticket.get() : nullptr, queueScoped ? std::span<rhi::CommandList>(async.queueLists) : std::span<rhi::CommandList>{}, &queueCopies);
 	if (hasUploads) {
