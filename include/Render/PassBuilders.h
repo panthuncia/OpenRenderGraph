@@ -1063,6 +1063,11 @@ public:
     template<class T> DeclaredResourceUse DepthReadWrite(const T& resource, DsvView view = {}) {
         return DeclareResourceUse(resource, {rhi::ResourceAccessType::DepthReadWrite, {view}});
     }
+    template<class T> DeclaredResourceUse DepthReadWrite(const T& resource, std::span<const DsvView> views) {
+        ResourceUseSpecification specification{rhi::ResourceAccessType::DepthReadWrite, {}};
+        for (const auto view : views) specification.views.push_back(view);
+        return DeclareResourceUse(resource, std::move(specification));
+    }
     template<class T> DeclaredResourceUse DepthStencilClear(const T& resource, DsvView view = {}) {
         return DeclareResourceUse(resource, {rhi::ResourceAccessType::DepthStencilClear, {view}});
     }
